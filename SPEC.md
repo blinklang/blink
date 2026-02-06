@@ -14,7 +14,7 @@ Design phase. 7 sections by domain experts. All blocking decisions resolved (5-0
 ## Key decisions (detail in DECISIONS.md)
 fn keyword|{ } braces|no semicolons|"double quotes" only|List[T] generics|keyword args (-- separator)|struct field defaults
 Result[T,E]+?|Option[T]+??|no null|no exceptions|no inheritance
-Effects ! IO,DB|fine-grained capabilities|green threads|structured concurrency
+Effects ! IO,DB|fine-grained capabilities|green threads|structured concurrency|Closeable trait + with...as scoped resources
 Annotations standalone|15 types|canonical order in §11.1 of section 7
 
 ## Rejected (detail in DECISIONS.md)

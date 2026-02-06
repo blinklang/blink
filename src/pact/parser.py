@@ -157,6 +157,10 @@ class Parser:
             if self.at(TT.COLON):
                 self.advance()
                 type_ann = self.parse_type_annotation()
+                if self.at(TT.EQUALS):
+                    self.advance()
+                    self.skip_newlines()
+                    self.parse_expr()  # skip default value
                 fields.append(ast.TypeField(ident, type_ann))
             elif self.at(TT.LPAREN):
                 self.advance()
@@ -293,13 +297,20 @@ class Parser:
         return fn
 
     def parse_params(self):
+        self._skip_double_minus()
         params = [self.parse_param()]
         while self.at(TT.COMMA):
             self.advance()
+            self._skip_double_minus()
             if self.at(TT.RPAREN):
                 break
             params.append(self.parse_param())
         return params
+
+    def _skip_double_minus(self):
+        if self.at(TT.MINUS) and self.pos + 1 < len(self.tokens) and self.tokens[self.pos + 1].type == TT.MINUS:
+            self.advance()
+            self.advance()
 
     def parse_param(self):
         if self.at(TT.SELF):
@@ -679,10 +690,24 @@ class Parser:
         return ast.ListLit(elements)
 
     def parse_block_expr(self):
+        if self._looks_like_anon_struct():
+            return self.parse_struct_lit("_Anon")
         block = self.parse_block()
         if len(block.stmts) == 1 and isinstance(block.stmts[0], ast.ExprStmt):
             return block.stmts[0].expr
         return block
+
+    def _looks_like_anon_struct(self):
+        saved = self.pos
+        try:
+            self.expect(TT.LBRACE)
+            self.skip_newlines()
+            if not self.at(TT.IDENT):
+                return False
+            self.advance()
+            return self.at(TT.COLON)
+        finally:
+            self.pos = saved
 
     def parse_closure(self):
         self.expect(TT.FN)
@@ -829,24 +854,34 @@ class Parser:
 
     def parse_args(self):
         self.skip_newlines()
+        self._skip_named_arg_label()
         args = [self.parse_expr()]
         while self.at(TT.COMMA):
             self.advance()
             self.skip_newlines()
             if self.at(TT.RPAREN):
                 break
+            self._skip_named_arg_label()
             args.append(self.parse_expr())
         self.skip_newlines()
         if not self.at(TT.RPAREN):
+            self._skip_named_arg_label()
             args.append(self.parse_expr())
             while self.at(TT.COMMA):
                 self.advance()
                 self.skip_newlines()
                 if self.at(TT.RPAREN):
                     break
+                self._skip_named_arg_label()
                 args.append(self.parse_expr())
             self.skip_newlines()
         return args
+
+    def _skip_named_arg_label(self):
+        if self.at(TT.IDENT) and self.pos + 1 < len(self.tokens) and self.tokens[self.pos + 1].type == TT.COLON:
+            self.advance()
+            self.advance()
+            self.skip_newlines()
 
 
 def parse(token_list: list[tokens.Token]) -> ast.Program:

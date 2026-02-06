@@ -341,6 +341,37 @@ def test_annotation_capabilities():
     assert td.annotations[0].name == "capabilities"
 
 
+def test_annotation_i():
+    prog = parse_src('@i("Adds two numbers")\nfn add(a: Int, b: Int) -> Int {\n    a + b\n}')
+    fn = prog.functions[0]
+    assert len(fn.annotations) == 1
+    assert fn.annotations[0].name == "i"
+
+
+def test_annotation_src():
+    prog = parse_src('@src("math.pact")\nfn add(a: Int) {\n    a\n}')
+    fn = prog.functions[0]
+    assert fn.annotations[0].name == "src"
+
+
+def test_annotation_where_on_fn():
+    prog = parse_src("@where(T: Display)\nfn show(x: T) {\n    x\n}")
+    fn = prog.functions[0]
+    assert fn.annotations[0].name == "where"
+
+
+def test_annotation_invariant():
+    prog = parse_src("@invariant(self.len() >= 0)\ntype Stack {\n    items: List[Int]\n}")
+    td = prog.types[0]
+    assert td.annotations[0].name == "invariant"
+
+
+def test_annotation_ensures():
+    prog = parse_src("@ensures(result >= 0)\nfn abs(x: Int) -> Int {\n    if x >= 0 { x\n } else { -x\n }\n}")
+    fn = prog.functions[0]
+    assert fn.annotations[0].name == "ensures"
+
+
 # --- Expressions ---
 
 def test_if_expr():
@@ -465,6 +496,130 @@ def test_closure():
     assert len(c.body.stmts) == 1
 
 
+def test_closure_with_return_type():
+    prog = parse_src("fn main() { fn(x: Int) -> Int { x + 1\n }\n}")
+    stmt = prog.functions[0].body.stmts[0]
+    c = stmt.expr
+    assert isinstance(c, ast.Closure)
+    assert c.params == [ast.Param("x", "Int")]
+
+
+def test_let_mut():
+    prog = parse_src("fn main() { let mut x = 0\n}")
+    stmt = prog.functions[0].body.stmts[0]
+    assert isinstance(stmt, ast.LetBinding)
+    assert stmt.is_mut is True
+    assert stmt.name == "x"
+
+
+def test_pub_fn():
+    prog = parse_src("pub fn greet() {\n    42\n}")
+    fn = prog.functions[0]
+    assert fn.is_pub is True
+    assert fn.name == "greet"
+
+
+def test_chained_method_calls():
+    prog = parse_src("fn main() { a.b().c()\n}")
+    stmt = prog.functions[0].body.stmts[0]
+    mc = stmt.expr
+    assert isinstance(mc, ast.MethodCall)
+    assert mc.method == "c"
+    assert isinstance(mc.obj, ast.MethodCall)
+    assert mc.obj.method == "b"
+
+
+def test_nested_field_access():
+    prog = parse_src("fn main() { a.b.c\n}")
+    stmt = prog.functions[0].body.stmts[0]
+    fa = stmt.expr
+    assert isinstance(fa, ast.FieldAccess)
+    assert fa.field == "c"
+    assert isinstance(fa.obj, ast.FieldAccess)
+    assert fa.obj.field == "b"
+
+
+def test_empty_list():
+    prog = parse_src("fn main() { []\n}")
+    stmt = prog.functions[0].body.stmts[0]
+    assert isinstance(stmt.expr, ast.ListLit)
+    assert stmt.expr.elements == []
+
+
+def test_empty_struct_lit():
+    prog = parse_src("fn main() { Foo {}\n}")
+    stmt = prog.functions[0].body.stmts[0]
+    sl = stmt.expr
+    assert isinstance(sl, ast.StructLit)
+    assert sl.type_name == "Foo"
+    assert sl.fields == []
+
+
+def test_if_else_if():
+    src = "fn main() {\n    if x > 0 { 1\n } else if x < 0 { -1\n } else { 0\n }\n}"
+    prog = parse_src(src)
+    stmt = prog.functions[0].body.stmts[0]
+    assert isinstance(stmt, ast.IfExpr)
+    assert isinstance(stmt.else_body, ast.Block)
+    inner = stmt.else_body.stmts[0]
+    assert isinstance(inner, ast.IfExpr)
+    assert isinstance(inner.else_body, ast.Block)
+
+
+def test_field_access_assignment():
+    prog = parse_src("fn main() { self.x = 42\n}")
+    stmt = prog.functions[0].body.stmts[0]
+    assert isinstance(stmt, ast.Assignment)
+    assert isinstance(stmt.target, ast.FieldAccess)
+    assert stmt.target.field == "x"
+
+
+def test_with_block():
+    src = """fn main() {
+    with handler IO {
+        fn println(msg: Str) {
+            42
+        }
+    }
+    {
+        io.println("hi")
+    }
+}"""
+    prog = parse_src(src)
+    stmt = prog.functions[0].body.stmts[0]
+    assert isinstance(stmt, ast.WithBlock)
+    assert isinstance(stmt.body, ast.Block)
+
+
+def test_handler_expr():
+    src = """fn main() {
+    handler IO {
+        fn println(msg: Str) {
+            42
+        }
+    }
+}"""
+    prog = parse_src(src)
+    stmt = prog.functions[0].body.stmts[0]
+    he = stmt.expr
+    assert isinstance(he, ast.HandlerExpr)
+    assert he.effect == "IO"
+    assert len(he.methods) == 1
+    assert he.methods[0].name == "println"
+
+
+def test_multiple_effects():
+    prog = parse_src("fn foo() ! IO, DB {\n    42\n}")
+    fn = prog.functions[0]
+    assert fn.effects == ["IO", "DB"]
+
+
+def test_dotted_effect():
+    prog = parse_src("fn foo() ! DB.Read {\n    42\n}")
+    fn = prog.functions[0]
+    assert fn.effects == ["DB.Read"]
+
+
 # --- Patterns ---
 
 def test_enum_pattern():
@@ -532,6 +687,41 @@ def test_precedence_or_and():
     assert e.right.op == "&&"
 
 
+def test_precedence_equality():
+    prog = parse_src("fn main() { a == b && c != d\n}")
+    e = prog.functions[0].body.stmts[0].expr
+    assert e.op == "&&"
+    assert isinstance(e.left, ast.BinOp)
+    assert e.left.op == "=="
+    assert isinstance(e.right, ast.BinOp)
+    assert e.right.op == "!="
+
+
+def test_precedence_coalesce_lowest():
+    prog = parse_src("fn main() { a || b ?? c\n}")
+    e = prog.functions[0].body.stmts[0].expr
+    assert e.op == "??"
+    assert isinstance(e.left, ast.BinOp)
+    assert e.left.op == "||"
+
+
+def test_precedence_sub_div():
+    prog = parse_src("fn main() { a - b / c\n}")
+    e = prog.functions[0].body.stmts[0].expr
+    assert e.op == "-"
+    assert e.left == ast.Ident("a")
+    assert isinstance(e.right, ast.BinOp)
+    assert e.right.op == "/"
+
+
+def test_precedence_unary_over_mul():
+    prog = parse_src("fn main() { -a * b\n}")
+    e = prog.functions[0].body.stmts[0].expr
+    assert e.op == "*"
+    assert isinstance(e.left, ast.UnaryOp)
+    assert e.left.op == "-"
+
+
 # --- Type annotations ---
 
 def test_generic_type_annotation():
@@ -548,6 +738,106 @@ def test_tuple_type_annotation():
     assert isinstance(fn.return_type, ast.TypeAnnotation)
     assert fn.return_type.name == "Tuple"
     assert len(fn.return_type.params) == 2
+
+
+def test_optional_type_annotation():
+    prog = parse_src("fn foo(x: Int?) {\n    x\n}")
+    fn = prog.functions[0]
+    assert fn.params[0].type_name == "Int"
+
+
+def test_qualified_type_annotation():
+    prog = parse_src("type Foo {\n    x: Http.Response\n}")
+    td = prog.types[0]
+    assert td.fields[0].type_ann.name == "Http.Response"
+
+
+def test_nested_generic_type():
+    prog = parse_src("fn foo(x: Map[Str, List[Int]]) {\n    x\n}")
+    fn = prog.functions[0]
+    assert fn.params[0].type_name == "Map"
+
+
+def test_result_type_annotation():
+    prog = parse_src("fn foo() -> Result[Int, Err] {\n    42\n}")
+    fn = prog.functions[0]
+    assert fn.return_type.name == "Result"
+    assert len(fn.return_type.params) == 2
+    assert fn.return_type.params[0].name == "Int"
+    assert fn.return_type.params[1].name == "Err"
+
+
+def test_trait_with_super_traits():
+    src = "trait Printable : Display + Debug {\n    fn print(self)\n}"
+    prog = parse_src(src)
+    tr = prog.traits[0]
+    assert tr.name == "Printable"
+    assert tr.super_traits == ["Display", "Debug"]
+
+
+def test_trait_with_type_params():
+    src = "trait Container[T] {\n    fn get(self) -> T\n}"
+    prog = parse_src(src)
+    tr = prog.traits[0]
+    assert tr.type_params == ["T"]
+
+
+def test_type_def_with_type_params():
+    prog = parse_src("type Pair[A, B] {\n    first: A\n    second: B\n}")
+    td = prog.types[0]
+    assert td.type_params == ["A", "B"]
+    assert len(td.fields) == 2
+
+
+def test_let_tuple_destructuring():
+    prog = parse_src("fn main() { let (a, b) = (1, 2)\n}")
+    stmt = prog.functions[0].body.stmts[0]
+    assert isinstance(stmt, ast.LetBinding)
+    assert stmt.name == "_tuple"
+    assert stmt.pattern is not None
+
+
+def test_enum_pattern_multi_field():
+    src = """fn main() {
+    match x {
+        Pair(a, b) => a
+        _ => 0
+    }
+}"""
+    prog = parse_src(src)
+    m = prog.functions[0].body.stmts[0].expr
+    p = m.arms[0].pattern
+    assert isinstance(p, ast.EnumPattern)
+    assert p.variant == "Pair"
+    assert len(p.fields) == 2
+
+
+def test_string_pattern_in_match():
+    src = """fn main() {
+    match x {
+        "hello" => 1
+        _ => 0
+    }
+}"""
+    prog = parse_src(src)
+    m = prog.functions[0].body.stmts[0].expr
+    assert isinstance(m.arms[0].pattern, ast.IdentPattern)
+
+
+def test_match_with_block_body():
+    src = """fn main() {
+    match x {
+        1 => {
+            let y = 2
+            y
+        }
+        _ => 0
+    }
+}"""
+    prog = parse_src(src)
+    m = prog.functions[0].body.stmts[0].expr
+    assert isinstance(m, ast.MatchExpr)
+    assert len(m.arms) == 2
 
 
 # --- Smoke tests (parse all example files) ---
@@ -582,14 +872,12 @@ def test_smoke_fetch():
     assert isinstance(prog, ast.Program)
 
 
-@pytest.mark.xfail(reason="parser doesn't support named arg separator (--) yet")
 def test_smoke_bank():
     src = (EXAMPLES_DIR / "bank.pact").read_text()
     prog = parse_src(src)
     assert isinstance(prog, ast.Program)
 
 
-@pytest.mark.xfail(reason="parser doesn't support field defaults yet")
 def test_smoke_web_api():
     src = (EXAMPLES_DIR / "web_api.pact").read_text()
     prog = parse_src(src)

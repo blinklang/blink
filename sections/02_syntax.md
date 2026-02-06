@@ -53,6 +53,7 @@ All decided through independent design and cross-team voting. None are revisitab
 | Option defaulting | `??` | `val ?? default` desugars to match on `Some`/`None`. Borrowed from Swift's nil-coalescing. |
 | Type names | `Str`, `Int`, `Bool`, `Float` | Short PascalCase. One casing rule for builtins and user types. Token-efficient — `Str` saves 3 chars over `String`, thousands of times per codebase. |
 | Visibility | `pub` keyword | Public items use `pub`. Everything else is module-private. See [2.10](#210-visibility). |
+| Scoped resources | `with expr as name { }` | Deterministic resource cleanup. `Closeable` trait + LIFO close order. Reuses `with` from effect handlers; `as` disambiguates. 3-0 over `defer`. |
 
 ### 2.3 Contested: Braces vs Indentation
 
@@ -453,3 +454,57 @@ pub fn login(email: Str, pwd: Str) -> Result[Session, AuthError] ! DB, Crypto {
 ```
 
 The canonical ordering enforced by `pact fmt` is: `@capabilities` first (permissions), then `@i` (intent), then `@requires`/`@ensures` (contracts), then `@where` (type constraints), then `@perf` (performance). See section 11.1 for the complete ordering across all 14 annotation types.
+
+### 2.15 Scoped Resources (`with...as`)
+
+The `with...as` construct binds a `Closeable` value to a name and guarantees cleanup when the block exits — whether by normal completion, `?` early return, or any other exit path.
+
+```pact
+// Single resource
+with fs.open("data.txt")? as file {
+    let data = fs.read(file)?
+    transform(data)
+}
+
+// Multiple resources — LIFO cleanup order
+with fs.open("in.txt")? as src, fs.create("out.txt")? as dst {
+    let data = fs.read(src)?
+    fs.write(dst, data)?
+}
+```
+
+`with...as` is an expression. The block's value is its last expression, same as any other block.
+
+```pact
+let data = with fs.open("cache.dat")? as f {
+    fs.read(f)?
+}
+```
+
+#### Disambiguation with effect handlers
+
+The `with` keyword serves two roles. The compiler distinguishes them by the presence of `as`:
+
+| Form | Meaning |
+|------|---------|
+| `with handler_expr { }` | Effect handler — no `as`, expression type is `Handler[E]` |
+| `with expr as name { }` | Scoped resource — has `as`, expression type implements `Closeable` |
+
+Both forms compose in the same `with` statement via comma:
+
+```pact
+with mock_db(fixtures), fs.open("data.txt")? as f {
+    let data = fs.read(f)?
+    process(data)
+}
+```
+
+Here `mock_db(fixtures)` is an effect handler (no `as`) and `f` is a scoped `Closeable` resource.
+
+#### Rules
+
+- The `?` in `with expr? as name` propagates BEFORE the scope — if acquisition fails, no cleanup needed
+- `Closeable` bindings cannot escape the `with` block (compile error E0601)
+- `Closeable` bindings cannot be stored in fields or collections within the block (compile error E0602)
+- Multiple resources clean up in LIFO order (reverse declaration order)
+- Partial acquisition: if `expr2` fails via `?`, only resources from earlier bindings are cleaned up

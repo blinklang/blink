@@ -384,6 +384,45 @@ Traits also support retroactive implementation -- you can implement a trait for 
 
 ---
 
+#### Compiler-Known Traits
+
+Certain traits have special meaning to the compiler. They are defined in the standard library but the compiler understands their semantics and can generate or enforce behavior based on them.
+
+| Trait | Compiler behavior |
+|-------|------------------|
+| `Eq` | Enables `==` and `!=` operators. `@derive(Eq)` auto-generates structural equality. |
+| `Ord` | Enables `<`, `>`, `<=`, `>=` and `cmp`. Requires `Eq`. |
+| `Hash` | Enables use as `Map` key or `Set` element. Requires `Eq`. |
+| `Display` | Enables string interpolation (`"{value}"`). |
+| `Closeable` | Signals non-memory resources needing deterministic cleanup. Enables `with...as` scoped resource blocks. |
+
+The `Closeable` trait is the simplest:
+
+```pact
+trait Closeable {
+    fn close(self)
+}
+```
+
+A type implementing `Closeable` holds resources (file handles, sockets, locks, database cursors) that must be released deterministically — not when the GC gets around to it, but at a specific point in the program. The `with...as` construct (section 2.15, section 5.5) guarantees `close()` is called on all exit paths.
+
+```pact
+type FileHandle {
+    fd: Int
+    path: Str
+}
+
+impl Closeable for FileHandle {
+    fn close(self) ! FS {
+        fs.close_fd(self.fd)
+    }
+}
+```
+
+The compiler uses `Closeable` to power lint W0600 (warn when a `Closeable` value is used outside a `with...as` block) and errors E0601/E0602 (closeable escapes scope). See section 5.5 for the full mechanism.
+
+---
+
 ### 3.7 No Null, No Exceptions
 
 These are not restrictions. They are the elimination of two categories of bugs that account for more production incidents than any other.

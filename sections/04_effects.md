@@ -472,6 +472,97 @@ test "integration test with shared environment" {
 }
 ```
 
+#### Scoped resources: `with...as`
+
+Effect handlers manage long-lived, framework-level resources — connection pools, capability providers, test doubles. But functions also acquire short-lived, individual resources: a file handle for one read, a lock held for one critical section, a temp file for one transformation.
+
+The `with...as` construct handles this second tier:
+
+```pact
+fn copy_file(src_path: Str, dst_path: Str) -> Result[(), IOError] ! FS {
+    with fs.open(src_path)? as src, fs.create(dst_path)? as dst {
+        let data = fs.read(src)?
+        fs.write(dst, data)?
+    }
+}
+```
+
+Both `src` and `dst` implement the `Closeable` trait. When the block exits — normally or via `?` — their `close()` methods run in LIFO order (dst first, then src).
+
+#### Two-tier resource model
+
+| Tier | Mechanism | Lifetime | Examples |
+|------|-----------|----------|----------|
+| Framework resources | `with handler { }` | Application/request scope | Connection pools, capability providers, test mocks |
+| Individual resources | `with expr as name { }` | Block scope | File handles, locks, temp files, cursors |
+
+The tiers compose naturally:
+
+```pact
+fn export_data(query: Str, path: Str) -> Result[(), AppError] ! DB.Read, FS {
+    with fs.create(path)? as out {
+        let rows = db.query(query)?
+        for row in rows {
+            fs.write(out, row.to_csv())?
+        }
+    }
+}
+
+test "export_data writes CSV" {
+    with mock_db(fixtures), temp_fs() {
+        with fs.create("test_out.csv")? as f {
+            export_data("SELECT *", "test_out.csv")?
+        }
+        let content = fs.read("test_out.csv")?
+        assert(content.contains("Alice"))
+    }
+}
+```
+
+The outer `with mock_db(fixtures), temp_fs()` installs effect handlers (no `as`). The inner `with fs.create(...)? as f` is a scoped resource (`as` present). The compiler distinguishes them by the presence of `as`.
+
+#### Disambiguation rules
+
+| Syntax | `as` present? | Type check | Meaning |
+|--------|--------------|------------|---------|
+| `with expr { }` | No | `expr: Handler[E]` | Effect handler |
+| `with expr as name { }` | Yes | `expr: T where T: Closeable` | Scoped resource |
+
+Both can appear in the same comma-separated `with`:
+
+```pact
+with mock_db(fixtures), fs.open("x.txt")? as f {
+    // mock_db provides DB handler, f is a Closeable file handle
+}
+```
+
+#### Interaction with structured concurrency
+
+Scoped resources respect structured concurrency boundaries. A `Closeable` bound in a `with...as` cannot be sent to a spawned task (it would escape the scope):
+
+```pact
+fn bad_example() ! FS, Async {
+    with fs.open("data.txt")? as file {
+        async.spawn(fn() {
+            fs.read(file)  // COMPILE ERROR E0601: closeable `file` escapes scope
+        })
+    }
+}
+```
+
+If concurrent tasks need the resource, open it outside or pass the data:
+
+```pact
+fn good_example() ! FS, Async {
+    let data = with fs.open("data.txt")? as file {
+        fs.read(file)?
+    }
+    async.scope {
+        async.spawn(fn() { process(data) })
+    }
+}
+```
+
 ---
 
 ### 4.8 Module Capability Budgets

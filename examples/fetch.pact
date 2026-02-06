@@ -1,6 +1,7 @@
-// fetch.pact — Effects, handlers, testing
+// fetch.pact — Effects, handlers, scoped resources, testing
 //
 // Demonstrates: effect declarations, handlers, with blocks,
+//               with...as scoped resources (Closeable),
 //               mock handlers for testing, DI via effects
 
 type WeatherError {
@@ -53,6 +54,26 @@ fn mock_net(responses: Map[Str, Str]) -> Handler[Net.Connect] {
                 Some(body) => Ok(Response.new(200, body))
                 None => Err(NetError.ConnectionRefused("mock: no response for {url}"))
             }
+        }
+    }
+}
+
+/// Fetch forecast with file-based caching.
+fn fetch_cached(city: Str, cache_dir: Str) -> Result[Forecast, WeatherError] ! Net.Connect, FS, IO.Log {
+    let cache_path = "{cache_dir}/{city}.json"
+    match fs.exists(cache_path) {
+        true => {
+            with fs.open(cache_path)? as file {
+                let body = fs.read(file)?
+                parse_forecast(city, body)
+            }
+        }
+        false => {
+            let forecast = fetch_forecast(city)?
+            with fs.create(cache_path)? as file {
+                fs.write(file, json.serialize(forecast))?
+            }
+            Ok(forecast)
         }
     }
 }

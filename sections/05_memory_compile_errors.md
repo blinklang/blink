@@ -28,7 +28,7 @@ No annotation on `summary`. No `Box`, `Rc`, `Arc`. No `&'a`. It just works.
 
 4. **GC is proven at scale.** Go serves millions of RPS with sub-millisecond GC pauses. Discord moved from Go to Rust for specific tail-latency reasons -- most services never hit that bar. Java runs the world's financial infrastructure. The "GC is slow" argument died somewhere around 2015.
 
-5. **Deterministic resource cleanup is orthogonal to GC.** File handles, sockets, database connections -- these are managed through the effect system and `defer`/drop semantics, not GC finalization. The GC manages memory. Effects manage resources.
+5. **Deterministic resource cleanup is orthogonal to GC.** File handles, sockets, database connections -- these are managed through the `Closeable` trait and `with...as` scoped resource blocks, not GC finalization. The GC manages memory. `Closeable` manages resources. See section 5.5.
 
 ### 5.2 Opt-in Arenas via the Arena Effect
 
@@ -117,7 +117,112 @@ fn process_all(items: List[Item]) -> List[Result] {
 
 **Generational hypothesis:** Short-lived objects (most objects) are collected cheaply in the young generation. Long-lived objects are promoted to old generation and collected infrequently. The effect system provides scope information that helps the GC tune generation boundaries.
 
-### 5.4 Future: Compiler Optimization Improvements
+### 5.5 Deterministic Resource Cleanup: `Closeable` + `with...as`
+
+The GC handles memory. But file handles, sockets, locks, database cursors, and temp files need deterministic cleanup — released at a specific program point, not whenever the GC runs a finalizer.
+
+Pact solves this with two pieces: the `Closeable` trait (section 3.6) and the `with...as` syntax (section 2.15).
+
+#### The `Closeable` trait
+
+```pact
+trait Closeable {
+    fn close(self)
+}
+```
+
+Any type holding non-memory resources implements `Closeable`. The compiler knows this trait and uses it to power diagnostics and the `with...as` construct.
+
+#### `with...as` desugaring
+
+```pact
+with expr as name { body }
+```
+
+Desugars to:
+
+```pact
+{
+    let name = expr
+    let __result = { body }
+    name.close()
+    __result
+}
+```
+
+The compiler inserts `name.close()` on **all** exit paths: normal completion, `?` early return, and any other control flow that leaves the block.
+
+#### Multiple resources
+
+```pact
+with expr1 as a, expr2 as b { body }
+```
+
+Cleanup is LIFO — `b.close()` runs before `a.close()`. If `expr2` fails (via `?`), only `a` is cleaned up. The `?` in the expression propagates **before** the scope is entered — if acquisition fails, no cleanup is needed for that binding.
+
+#### Compiler diagnostics
+
+**W0600: `Closeable` value used outside `with...as`**
+
+```
+warning[W0600]: `Closeable` value used without `with...as`
+ --> data.pact:5:9
+  |
+5 |     let file = fs.open("data.txt")?
+  |         ^^^^ `file` implements `Closeable` but is not in a `with...as` block
+  |
+  = help: wrap in `with...as` to ensure cleanup:
+  |
+5 |     with fs.open("data.txt")? as file {
+6 |         // use file here
+7 |     }
+  = note: suppress with `@trusted` for manual resource management
+  = note: upgrade to error in pact.toml: [lints] W0600 = "error"
+```
+
+This is a warning by default, upgradeable to a hard error via `pact.toml`. Suppressible with `@trusted` for framework code (connection pools, resource managers) that deliberately manages `Closeable` lifetimes manually.
+
+**E0601: closeable escapes scope**
+
+```
+error[E0601]: `Closeable` value escapes `with...as` scope
+ --> handler.pact:8:12
+  |
+6 |     with fs.open("data.txt")? as file {
+  |                                   ---- `file` is scoped here
+7 |         cache.store(file)
+  |                     ^^^^ `file` cannot escape this scope
+  |
+  = note: `file.close()` will run when this block exits
+  = fix: extract the data you need instead of storing the handle:
+  |
+7 |         cache.store(fs.read(file)?)
+  |                     ++++++++++++++
+```
+
+Analogous to arena escape (E0700 in section 5.2). A `Closeable` binding cannot be returned from its `with` block or stored anywhere that outlives the block.
+
+**E0602: closeable stored in field or collection**
+
+```
+error[E0602]: `Closeable` value stored in collection
+ --> pool.pact:12:9
+  |
+10|     with db.open_cursor(query)? as cursor {
+   |                                    ------ `cursor` is scoped here
+11|         let results = []
+12|         results.push(cursor)
+   |                      ^^^^^^ cannot store `Closeable` in collection
+   |
+   = note: storing in a collection could allow the value to escape
+   = fix: extract data from the cursor instead:
+   |
+12|         results.push(cursor.next()?)
+```
+
+These three diagnostics form a closed net: W0600 catches forgotten `with...as`, E0601 catches escape via return or assignment, E0602 catches escape via collections. Together they ensure `Closeable` values are always scoped and always cleaned up.
+
+### 5.6 Future: Compiler Optimization Improvements
 
 The GC-first design leaves room for the compiler to get smarter over time without changing the language:
 
