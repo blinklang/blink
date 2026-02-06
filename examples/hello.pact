@@ -1,0 +1,15 @@
+// hello.pact — Hello World + CLI arguments
+//
+// Demonstrates: fn main, io.println, string interpolation,
+//               env.args(), ?? default operator
+
+/// Greet someone by name.
+fn greet(name: Str) ! IO {
+    io.println("Hello, {name}!")
+}
+
+fn main() {
+    let name = env.args().get(1) ?? "world"
+    greet(name)
+    io.println("Welcome to Pact.")
+}

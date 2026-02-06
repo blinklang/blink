@@ -1,0 +1,109 @@
+// bank.pact — Modules, capabilities, invariants, keyword args
+//
+// Demonstrates: @invariant, @capabilities, @i, @src,
+//               @requires, @ensures, old(), module system,
+//               declaration-site keyword args (--)
+
+@capabilities(DB.Read, DB.Write, IO.Log)
+
+type AccountError {
+    InsufficientFunds(available: Int, requested: Int)
+    NotFound(id: Int)
+    InvalidAmount
+}
+
+type Account {
+    id: Int
+    owner: Str
+    balance: Int
+    @invariant(self.balance >= 0)
+}
+
+/// Create a new account with zero balance.
+@i("Open a new bank account for a customer")
+@src(req: "BANK-001")
+@ensures(result.balance == 0)
+pub fn open_account(id: Int, owner: Str) -> Account {
+    Account { id: id, owner: owner, balance: 0 }
+}
+
+/// Deposit funds into an account.
+@i("Add money to a customer's account")
+@src(req: "BANK-002")
+@requires(amount > 0)
+@ensures(result.is_ok() => result.unwrap().balance == old(acct.balance) + amount)
+pub fn deposit(acct: Account, amount: Int) -> Result[Account, AccountError] {
+    if amount <= 0 {
+        return Err(AccountError.InvalidAmount)
+    }
+    Ok(Account { id: acct.id, owner: acct.owner, balance: acct.balance + amount })
+}
+
+/// Withdraw funds from an account.
+@i("Remove money from a customer's account, rejecting if insufficient")
+@src(req: "BANK-003")
+@requires(amount > 0)
+@ensures(result.is_ok() => result.unwrap().balance == old(acct.balance) - amount)
+pub fn withdraw(acct: Account, amount: Int) -> Result[Account, AccountError] {
+    if amount <= 0 {
+        return Err(AccountError.InvalidAmount)
+    }
+    if acct.balance < amount {
+        return Err(AccountError.InsufficientFunds(acct.balance, amount))
+    }
+    Ok(Account { id: acct.id, owner: acct.owner, balance: acct.balance - amount })
+}
+
+/// Transfer between two accounts.
+@i("Move money from one account to another atomically")
+@src(req: "BANK-004")
+@requires(amount > 0)
+pub fn transfer(amount: Int, -- from: Account, to: Account) -> Result[(Account, Account), AccountError] {
+    let updated_from = withdraw(from, amount)?
+    let updated_to = deposit(to, amount)?
+    Ok((updated_from, updated_to))
+}
+
+/// Look up an account by ID.
+fn find_account(id: Int) -> Result[Account, AccountError] ! DB.Read {
+    db.query_one("SELECT * FROM accounts WHERE id = {id}")
+        ?? Err(AccountError.NotFound(id))
+}
+
+/// Persist account state.
+fn save_account(acct: Account) ! DB.Write, IO.Log {
+    db.execute("UPDATE accounts SET balance = {acct.balance} WHERE id = {acct.id}")
+    io.log("Account {acct.id} updated: balance={acct.balance}")
+}
+
+fn main() {
+    let alice = open_account(1, "Alice")
+    let bob = open_account(2, "Bob")
+
+    let alice = deposit(alice, 1000).unwrap()
+    let (alice, bob) = transfer(250, from: alice, to: bob).unwrap()
+
+    io.println("{alice.owner}: {alice.balance}")
+    io.println("{bob.owner}: {bob.balance}")
+}
+
+test "deposit increases balance" {
+    let acct = open_account(1, "Test")
+    let result = deposit(acct, 500)
+    assert(result.is_ok())
+    assert_eq(result.unwrap().balance, 500)
+}
+
+test "withdraw insufficient funds" {
+    let acct = open_account(1, "Test")
+    let result = withdraw(acct, 100)
+    assert(result.is_err())
+}
+
+test "transfer moves funds" {
+    let a = deposit(open_account(1, "A"), 1000).unwrap()
+    let b = open_account(2, "B")
+    let (a, b) = transfer(300, from: a, to: b).unwrap()
+    assert_eq(a.balance, 700)
+    assert_eq(b.balance, 300)
+}

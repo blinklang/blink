@@ -1,0 +1,19 @@
+// fizzbuzz.pact — Control flow + pattern matching
+//
+// Demonstrates: match, guards, for-in loops, string interpolation
+
+/// Classify a number as Fizz, Buzz, FizzBuzz, or itself.
+fn fizzbuzz(n: Int) -> Str {
+    match (n % 3, n % 5) {
+        (0, 0) => "FizzBuzz"
+        (0, _) => "Fizz"
+        (_, 0) => "Buzz"
+        _ => "{n}"
+    }
+}
+
+fn main() {
+    for n in 1..101 {
+        io.println(fizzbuzz(n))
+    }
+}
