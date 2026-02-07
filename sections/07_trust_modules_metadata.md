@@ -135,6 +135,15 @@ FFI Summary: 7 bindings across 3 modules
 
 Audit coverage: 6/7 (85.7%)
 Unaudited: net/curl.pact:curl_easy_init
+
+Raw Query Summary: 2 raw queries across 1 module
+
+  db/legacy.pact:
+    Raw()           line 42    UNAUDITED
+  db/migration.pact:
+    Raw()           line 8     audit: MIG-001  OK
+
+Raw query audit coverage: 1/2 (50%)
 ```
 
 This output is structured JSON when `--json` is passed. CI pipelines can enforce `pact audit --require-all` to block merges with unaudited FFI.
@@ -175,9 +184,42 @@ At these boundaries, `@requires` violations produce structured error responses (
 
 For internal function calls (Pact calling Pact), the compiler still attempts static proof. If it can prove the caller always satisfies the callee's `@requires`, no runtime check is emitted. If it cannot prove it, a warning is emitted and a runtime assertion is inserted — same as the standard contract behavior described in the contracts section.
 
-### 9.3 Information Flow Tracking (Future Roadmap)
+### 9.3 Injection Safety — `Query[C]` Parameterized Queries
 
-**Status: v2+ roadmap. Not in v1.**
+**Status: v1. Resolved by unanimous panel vote (3-0).**
+
+Pact's universal string interpolation creates an injection risk when interpolated strings flow to databases, shells, or HTML renderers. The `Query[C]` type solves this at the type boundary without taint tracking.
+
+**v1 mechanism:** Effect handle methods that execute interpreted strings accept `Query[C]` instead of `Str`. When an interpolated string literal appears where `Query[C]` is expected, the compiler constructs a parameterized query — `{expr}` becomes a bound parameter, not string concatenation.
+
+```pact
+// Developer writes this — identical to a normal interpolated string:
+fn get_user(id: Int) -> User? ! DB.Read {
+    db.query_one("SELECT * FROM users WHERE id = {id}")
+    // Compiler sees: Query.param("SELECT * FROM users WHERE id = $1", [id])
+}
+
+// Str → Query is a compile error:
+let q: Str = "SELECT * FROM users WHERE id = {id}"
+db.query_one(q)  // ERROR: expected Query[DB], got Str
+```
+
+**Escape hatch:** `Raw(expr)` is a compiler-known marker type that bypasses parameterization for individual interpolated expressions within `Query[C]` strings. It emits a compiler warning and is tracked by `pact audit --raw-queries` alongside FFI.
+
+```pact
+// Auditable escape hatch for dynamic SQL:
+db.query_one("SELECT * FROM {Raw(table)} WHERE id = {id}")
+// WARNING: Raw() bypasses parameterization for {Raw(table)}
+// Note: {id} is still safely parameterized
+```
+
+**Extensibility:** The phantom type `C` in `Query[C]` enables the same mechanism for shell commands (`Query[Shell]`), HTML templates (`Query[HTML]`), and other injection contexts. See section 3.12 for the full type specification.
+
+See [DECISIONS.md](../DECISIONS.md) for the full deliberation record.
+
+### 9.4 Information Flow Tracking (v2+ Roadmap)
+
+**Status: v2+ roadmap. Deferred — `Query[C]` covers 95% of injection cases for v1.**
 
 The eventual goal is taint tracking via effect provenance. Values originating from certain effects would carry their provenance through the program, and the compiler would enforce sanitization policies:
 
@@ -198,7 +240,7 @@ This requires tracking effect provenance on values — a significant type system
 - **Performance** — provenance tracking must not impose runtime cost in production builds. It should be a compile-time-only analysis.
 - **Granularity** — which effects produce tainted values? All of them? Only `Net`? Configurable per project?
 
-This is flagged for research, not committed to a timeline. The FFI boundary and system boundary mechanisms in v1 cover the most critical trust boundary cases.
+This is deferred to v2+. The `Query[C]` mechanism in v1 covers the most critical injection cases (SQL, shell, HTML) at the type boundary. Full information flow tracking would catch additional categories (reflected XSS through non-handle paths, data flow between unrelated effects) but at significantly higher implementation cost.
 
 ---
 

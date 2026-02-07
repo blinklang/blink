@@ -176,7 +176,7 @@ Declaring an effect in a function signature brings a **handle** into scope. The 
 fn example() ! IO.Print, FS.Read, DB.Read, Net.Connect, Crypto.Hash {
     io.print("Starting...")          // IO.Print handle
     let data = fs.read("input.txt")  // FS.Read handle
-    let rows = db.read("SELECT *..") // DB.Read handle
+    let rows = db.read("SELECT *..") // DB.Read handle — string literal auto-parameterized to Query[DB]
     let resp = net.connect(url)      // Net.Connect handle
     let hash = crypto.hash(data)     // Crypto.Hash handle
 }
@@ -418,17 +418,17 @@ Handlers implement the operations for an effect:
 ```pact
 fn mock_db(data: List[Row]) -> Handler[DB] {
     handler DB {
-        fn read(query: Str) -> Result[List[Row], DBError] {
-            // Simple in-memory filter based on query
+        fn read(query: Query[DB]) -> Result[List[Row], DBError] {
+            // query.template = "SELECT ...", query.params = [...]
             Ok(data.filter(fn(row) { matches_query(row, query) }))
         }
 
-        fn write(query: Str, params: Any) -> Result[(), DBError] {
+        fn write(query: Query[DB]) -> Result[(), DBError] {
             // No-op for tests, or append to a log
             Ok(())
         }
 
-        fn admin(query: Str) -> Result[(), DBError] {
+        fn admin(query: Query[DB]) -> Result[(), DBError] {
             Err(DBError.PermissionDenied("admin operations disabled in mock"))
         }
     }
@@ -989,16 +989,16 @@ fn place_order(order: Order) -> Result[Receipt, OrderError] ! DB.Read, DB.Write,
 
 fn mock_inventory(stock: Map[Int, Int]) -> Handler[DB] {
     handler DB {
-        fn read(query: Str) -> Result[Any, DBError] {
-            // Parse item_id from query, return stock level
+        fn read(query: Query[DB]) -> Result[Any, DBError] {
+            // query.template and query.params available for matching
             let item_id = parse_item_id(query)
             match stock.get(item_id) {
                 Some(qty) => Ok(qty)
                 None => Err(DBError.NotFound)
             }
         }
-        fn write(query: Str) -> Result[(), DBError] { Ok(()) }
-        fn admin(query: Str) -> Result[(), DBError] {
+        fn write(query: Query[DB]) -> Result[(), DBError] { Ok(()) }
+        fn admin(query: Query[DB]) -> Result[(), DBError] {
             Err(DBError.PermissionDenied("not in test scope"))
         }
     }

@@ -32,6 +32,8 @@ impl From[DBError] for ApiError {
 }
 
 /// Look up a user by ID. The @requires becomes a 400 at the system boundary.
+/// db.query_one accepts Query[DB] — {id} auto-parameterizes.
+/// The Err string is Str context — {id} concatenates normally.
 @i("Fetch a user from the database by ID")
 @requires(id > 0)
 pub fn get_user(id: Int) -> Result[User, ApiError] ! DB.Read {
@@ -40,6 +42,8 @@ pub fn get_user(id: Int) -> Result[User, ApiError] ! DB.Read {
 }
 
 /// Create a new user. Inputs are validated by contracts.
+/// {name} and {email} in db.execute become bound parameters (Query[DB] context).
+/// {id} and {name} in io.log are concatenated (Str context).
 @i("Insert a new user into the database")
 @requires(name.len() > 0)
 @requires(email.len() > 0)
@@ -92,11 +96,11 @@ fn main() {
 
 fn mock_db_with_users(users: List[User]) -> Handler[DB] {
     handler DB {
-        fn query_one(query: Str) -> Result[User?, DBError] {
+        fn query_one(query: Query[DB]) -> Result[User?, DBError] {
             let id = extract_id_from_query(query)
             Ok(users.find(fn(u) { u.id == id }))
         }
-        fn execute(query: Str) -> Result[Int, DBError] {
+        fn execute(query: Query[DB]) -> Result[Int, DBError] {
             Ok(users.len() + 1)
         }
     }

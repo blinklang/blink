@@ -13,7 +13,7 @@ Design phase. 7 sections by domain experts. All blocking decisions resolved (5-0
 
 ## Key decisions (detail in DECISIONS.md)
 fn keyword|{ } braces|no semicolons|"double quotes" only|List[T] generics|keyword args (-- separator)|struct field defaults
-Result[T,E]+?|Option[T]+??|no null|no exceptions|no inheritance
+Result[T,E]+?|Option[T]+??|no null|no exceptions|no inheritance|Query[C] injection safety
 Effects ! IO,DB|fine-grained capabilities|green threads|structured concurrency|Closeable trait + with...as scoped resources
 Annotations standalone|15 types|canonical order in §11.1 of section 7
 
@@ -23,7 +23,7 @@ Operator overloading|macros|significant whitespace|multiple string delimiters|op
 Semicolons|structural typing|full dependent types|JIT|coarse effects|sigils|:= bindings|:: return|<> generics
 
 ## Open (v2+ deferrals)
-Information flow tracking|row polymorphism|higher-kinded types
+Information flow tracking (taint; Query[C] covers injection for v1)|row polymorphism|higher-kinded types
 
 ## References
 - [Design decisions & rationale](DECISIONS.md)

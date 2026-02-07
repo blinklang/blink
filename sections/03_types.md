@@ -899,3 +899,140 @@ The safe default is to reject code the compiler can't verify. This ensures that 
 | **Unknown** (default) | SMT can't decide | N/A (won't compile) | Simplify, add fallback, or trust |
 | **Unknown** + `runtime` | Runtime assertion inserted | Assertion cost | Monitor for violations |
 | **Unknown** + `trust` | Accepted on faith | Zero | Document why, audit manually |
+
+---
+
+### 3.12 Context-Sensitive Query Types
+
+Pact's universal string interpolation (`"Hello, {name}!"`) is safe for display strings — but dangerous when interpolated strings flow to injection-sensitive contexts like databases, shells, or HTML templates. The `Query[C]` type makes the obvious code the safe code without changing developer syntax.
+
+#### The Problem
+
+```pact
+fn get_user(id: Int) -> User? ! DB.Read {
+    // Looks like string interpolation — but this goes to a database
+    db.query_one("SELECT * FROM users WHERE id = {id}")
+}
+```
+
+In most languages, this is textbook SQL injection. In Pact, it's safe — because `db.query_one` accepts `Query[DB]`, not `Str`.
+
+#### How `Query[C]` Works
+
+`Query[C]` is a compiler-known type parameterized by a phantom type `C` that identifies the injection context (DB, Shell, HTML, etc.). When an interpolated string literal appears where `Query[C]` is expected, the compiler automatically extracts `{expr}` interpolations as bound parameters instead of concatenating them into the string.
+
+```pact
+// What the developer writes:
+db.query_one("SELECT * FROM users WHERE id = {id}")
+
+// What the compiler sees:
+db.query_one(Query.param("SELECT * FROM users WHERE id = $1", [id]))
+
+// The second interpolation in the same function is Str context — normal concat:
+Err(ApiError.NotFound("User {id} not found"))
+```
+
+The *receiving type* determines the behavior. The same `{id}` syntax means parameterization in a `Query[DB]` context and concatenation in a `Str` context.
+
+#### Compile Errors for `Str` → `Query` Mismatch
+
+A pre-built `Str` variable cannot be passed where `Query[C]` is expected. This prevents laundering tainted data through a string variable:
+
+```pact
+let q: Str = "SELECT * FROM users WHERE id = {id}"
+db.query_one(q)  // COMPILE ERROR: expected Query[DB], got Str
+```
+
+```
+error[E0310]: type mismatch
+ --> user.pact:5:18
+  |
+5 |     db.query_one(q)
+  |                  ^ expected `Query[DB]`, found `Str`
+  |
+  = note: string variables cannot be implicitly converted to Query
+  = hint: pass the string literal directly, or wrap values in Raw() for dynamic SQL
+```
+
+This is intentional. The auto-parameterization only works on string *literals* at the call site, where the compiler can see the template structure. A `Str` variable is opaque — the compiler cannot extract parameters from it.
+
+#### `Raw(expr)` — The Escape Hatch
+
+For dynamic SQL (table names, column lists, generated clauses), wrapping an interpolated expression in `Raw()` bypasses parameterization for that specific value. `Raw[T]` is a compiler-known marker type — when `Query[C]` coercion encounters `{Raw(expr)}`, it concatenates instead of parameterizing.
+
+```pact
+fn dynamic_report(table: Str, id: Int) -> Result[Row, DBError] ! DB.Read {
+    // Only table is concatenated; id is still a bound parameter
+    db.query_one("SELECT * FROM {Raw(table)} WHERE id = {id}")
+    // Compiler: Query.param("SELECT * FROM users WHERE id = $1", [id])
+    //           with "users" concatenated from table
+}
+
+// Fully dynamic (all raw) — still works, just verbose
+db.query_one("{Raw(whole_query)}")
+```
+
+`Raw()` usage emits a compiler warning:
+
+```
+warning[W0310]: Raw() bypasses parameterization
+ --> report.pact:3:42
+  |
+3 |     db.query_one("SELECT * FROM {Raw(table)} WHERE id = {id}")
+  |                                  ^^^^^^^^^^ concatenated, not parameterized
+  |
+  = help: add @trusted(audit: "AUDIT-ID") to suppress this warning
+  = help: use `pact audit --raw-queries` to review all Raw() usage
+```
+
+The warning is suppressed by `@trusted`, creating an auditable trail — the same mechanism used for FFI.
+
+**Why `Raw(expr)` instead of format specs or `Query.raw()`:**
+
+- **Per-interpolation granularity.** Unlike `Query.raw()` which disables parameterization for the entire string, `Raw()` affects only the wrapped expression. Mixed safe/unsafe queries work naturally.
+- **No string grammar extension.** `Raw(expr)` is just an expression inside `{...}` — zero new parser productions. No `:modifier` syntax that invites format specs (`:.2f`, `:>20`).
+- **Type-system native.** Consistent with Pact's "types are the mechanism" philosophy. `Raw[T]` is a compiler-known type like `Option[T]` or `Result[T,E]`.
+- **Proven pattern.** Django's `mark_safe()`, Rails' `raw()`, Jinja2's `Markup()` — the industry consensus is to mark the VALUE, not the template slot.
+
+#### Phantom Type Extensibility
+
+The phantom type `C` in `Query[C]` enables the same mechanism for other injection contexts:
+
+```pact
+// Shell injection protection
+fn run(cmd: Query[Shell]) -> Result[Output, ShellError]
+process.run("ls -la {path}")  // path is escaped/parameterized
+
+// HTML/XSS protection (future)
+fn render(template: Query[HTML]) -> SafeHtml
+html.render("<div>{user_content}</div>")  // auto-escaped
+
+// LDAP injection protection (future)
+fn search(filter: Query[LDAP]) -> Result[List[Entry], LDAPError]
+```
+
+Each context defines its own parameterization/escaping strategy. The developer writes the same interpolation syntax everywhere — the receiving type ensures safety.
+
+#### `pact audit` Integration
+
+`pact audit --raw-queries` tracks all `Raw()` usage alongside FFI:
+
+```
+$ pact audit --raw-queries
+
+Raw() usage (bypasses parameterization):
+  db/legacy.pact:42    {Raw(table)} in Query[DB]     UNAUDITED
+  db/migration.pact:8  {Raw(name)} in Query[DB]      audit: MIG-001
+
+1 of 2 raw interpolations unaudited.
+```
+
+CI can enforce `pact audit --no-unaudited-raw` to block merges with unreviewed raw queries.
+
+#### Design Rationale
+
+**Why not taint tracking:** Full information flow tracking (Section 9.3) requires tracking provenance on every value through inference, generics, and closures. `Query[C]` with `Raw[T]` achieves 95% of the safety at the type boundary with minimal type system extension — two compiler-known types that enable per-interpolation safety control.
+
+**Why not a new string syntax:** Adding `sql"..."` or `q"..."` prefixes violates the "one string syntax" principle (Section 2.2). The receiving type determines behavior, not a prefix on the literal.
+
+**Why phantom types:** `Query[DB]` and `Query[Shell]` are distinct types. You cannot pass a `Query[Shell]` to a function expecting `Query[DB]`. The phantom parameter prevents cross-context confusion with zero runtime cost.

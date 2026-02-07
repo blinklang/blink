@@ -14,8 +14,10 @@
 | 2.3 For-loop/chaining | **Ratified** | 5-0 |
 | 2.4 Range syntax | **Ratified** — `Range[T: Ord]` | 5-0 |
 | 2.5 Await semantics | **A: `handle.await`** — method on `Handle[T]` | 5-0 |
+| 3.1 Injection safety | **A: `Query[C]` parameterized queries** — auto-parameterize in Query context | 3-0 |
+| 3.2 Query escape hatch | **D: `Raw(expr)` marker type** — replaces `Query.raw()` with per-interpolation type wrapper | 2-1 |
 
-**All blocking questions resolved.** Remaining open items are v2+ deferrals (see SPEC.md).
+**All blocking questions resolved.** 3.2 is non-blocking (refines 3.1's escape hatch). Remaining open items are v2+ deferrals (see SPEC.md).
 
 ---
 
@@ -282,6 +284,141 @@ let bad: U8 = 300        // COMPILE ERROR: 300 exceeds U8 range (0..255)
 
 ---
 
+### 3.1 Interpolation Injection Safety
+
+**Context:** Pact's universal string interpolation passes interpolated strings directly to `db.query_one()`, `db.execute()`, etc. — textbook SQL injection. The effect system tracks *who* can touch the database but not *what data* flows into it.
+
+**Option A: `Query[C]` phantom-typed parameterized queries (recommended)**
+
+DB handle methods accept `Query[DB]` not `Str`. When an interpolated string literal is passed where `Query[DB]` is expected, the compiler auto-constructs a parameterized query. `Query.raw()` is the escape hatch for dynamic SQL.
+
+```pact
+// Developer writes (unchanged syntax):
+db.query_one("SELECT * FROM users WHERE id = {id}")
+// Compiler sees: Query.param("SELECT * FROM users WHERE id = $1", [id])
+
+// Str → Query is a compile error:
+let q: Str = "SELECT * FROM users WHERE id = {id}"
+db.query_one(q)  // ERROR: expected Query[DB], got Str
+```
+
+**Option B: Taint tracking (deferred to v2)**
+Full information flow tracking via effect provenance. More powerful but significantly more complex.
+
+**Option C: Lint-only (rejected)**
+Warn on interpolation in DB calls. No type safety. Violates "if it compiles, it's safe."
+
+**Vote: A — 3-0 unanimous. B deferred to v2. C rejected.**
+
+---
+
+### 3.2 Query Escape Hatch Mechanism (RESOLVED)
+
+**Context:** Section 3.1 established `Query[C]` with `Query.raw()` as the escape hatch for dynamic SQL. But `Query.raw()` is all-or-nothing — it disables parameterization for the *entire* string. Mixed cases (dynamic table name + safe value) force the whole query unsafe.
+
+**Problem:**
+
+```pact
+// Current: Query.raw() makes EVERYTHING unsafe
+db.query_one(Query.raw("SELECT * FROM {table} WHERE id = {id}"))
+// Both {table} and {id} are concatenated. {id} is unnecessarily unsafe.
+```
+
+**Option A: Per-interpolation `:raw` modifier (recommended)**
+
+Add a format-spec-style `:raw` modifier. In `Query[C]` context, `{expr}` is parameterized by default; `{expr:raw}` is concatenated. Replaces `Query.raw()` entirely — one mechanism, not two.
+
+```pact
+// Only table is concatenated; id is still a bound parameter
+db.query_one("SELECT * FROM {table:raw} WHERE id = {id}")
+// Compiler: Query.param("SELECT * FROM users WHERE id = $1", [id])
+//           with "users" concatenated from table
+
+// Fully dynamic (all raw) — still works, just verbose
+db.query_one("{whole_query:raw}")
+```
+
+- Granular: unsafe only where you need it
+- Visible at exact point of danger inside the string
+- Auditable: `pact audit` can flag individual `{expr:raw}` sites
+- Kills `Query.raw()` — one escape mechanism, not two
+- Generalizes: `:raw` in `Query[HTML]` = "don't escape", `Query[Shell]` = "don't quote"
+- Risk: 4 characters is easy to type — less of a speed bump than `Query.raw()`
+
+**Option B: Keep `Query.raw()`, no format spec**
+
+Current design. `Query.raw()` wraps the entire string. For mixed cases, construct the query in parts:
+
+```pact
+// Workaround for mixed safe/unsafe:
+let table_part = Query.raw("SELECT * FROM {table}")
+let where_part = "WHERE id = {id}"  // parameterized
+db.query_one(Query.join(table_part, where_part))
+```
+
+- Simpler string grammar — no `:` modifier syntax inside interpolation
+- `Query.raw()` is intentionally ugly/verbose (speed bump)
+- Mixed cases are awkward but rare
+- No format spec means no temptation to add `:.2f` etc. later
+
+**Option C: Both `Query.raw()` and `:raw` modifier**
+
+Keep `Query.raw()` for fully-dynamic queries, add `:raw` for mixed cases.
+
+```pact
+// Fully dynamic — Query.raw() (existing)
+db.query_one(Query.raw("{dynamic_sql:raw}"))
+
+// Mixed — :raw modifier (new)
+db.query_one("SELECT * FROM {table:raw} WHERE id = {id}")
+```
+
+- Two mechanisms for the same concept (violates Principle 2?)
+- But each covers its natural use case well
+- `Query.raw()` for "I know what I'm doing, the whole thing is dynamic"
+- `:raw` for "one piece is dynamic, the rest is safe"
+
+**Option D: Marker type `Raw(expr)` instead of format spec**
+
+Use the type system instead of string syntax. A `Raw[T]` wrapper tells the compiler "concatenate, don't parameterize":
+
+```pact
+db.query_one("SELECT * FROM {Raw(table)} WHERE id = {id}")
+// Raw-wrapped → concatenated, unwrapped → parameterized
+```
+
+- No new string grammar — uses existing expression syntax
+- Type-system native — consistent with Pact's "types are the mechanism" philosophy
+- Greppable: `Raw(` is as easy to audit as `:raw`
+- Slightly more verbose than `:raw` (good speed bump? or annoying noise?)
+- `Raw` needs to be a compiler-known type
+
+**Sub-question: General format specs (`:>20`, `:.2f`) for v1?**
+
+All options above only address the `:raw` modifier in `Query[C]` context. Should Pact support Python-style format specs for display formatting in `Str` context?
+
+- **No (recommended for v1):** Format specs are a mini-language. `{price.format(2)}` works today via method calls. YAGNI.
+- **Yes:** Convenient for formatted output. But adds parser complexity, another thing LLMs must learn.
+
+**Recommendation: A.** One escape mechanism, granular, visible at the danger point. No general format specs for v1.
+
+**Vote: A / B / C / D**
+**Sub-vote: format specs — No (v1) / Yes**
+
+**Vote: D — 2-1. PLT and Security voted D; AI/DX voted A. No format specs — 3-0 unanimous.**
+
+**Key arguments for D over A:**
+- No string grammar extension — `Raw(expr)` is just an expression inside `{...}`, zero new parser productions
+- No format spec slippery slope — `:raw` creates `{expr:modifier}` grammar that invites `:.2f`, `:>20` etc.
+- Type-system native — consistent with Pact's "types are the mechanism" philosophy; `Raw[T]` is a compiler-known type like `Option[T]`
+- Proven industry pattern — Django's `mark_safe()`, Rails' `raw()`, Jinja2's `Markup()` all mark the VALUE, not the template slot
+- Long-term safety signal — `Raw()` stays visually distinctive even if format specs are added later
+
+**AI/DX dissent (A):** Cold-start LLM accuracy — `{x:raw}` maps to existing Python format spec training data; `Raw(expr)` is novel. Counter: `Raw(x)` inside `{...}` is just a function call inside interpolation, which LLMs handle reliably (cf. Python's `f"{str(x)}"`).
+
+
+---
+
 ## Part 3: DEFERRED
 
 Not blocking v1. Revisit after core language is stable.
@@ -290,7 +427,7 @@ Not blocking v1. Revisit after core language is stable.
 |----------|-------------|--------------|
 | Comprehensions | For-in + method chaining covers use cases | v1 usage data shows pain points |
 | While loops | `loop { }` + `break` may suffice; need iterator design first | Iterator trait finalized |
-| Information flow tracking | Taint tracking via effect provenance | v2 roadmap |
+| Information flow tracking | Taint tracking via effect provenance. `Query[C]` covers injection for v1 | v2 roadmap |
 | Row polymorphism | May be needed for effect internals | Effect system battle-tested |
 | Higher-kinded types | Only if needed for effect abstractions | v2 if at all |
 
@@ -310,3 +447,5 @@ Not blocking v1. Revisit after core language is stable.
 | For-loop/chaining | sections/02_syntax.md | 2.7-2.9 |
 | Range syntax | sections/02_syntax.md | 2.9 |
 | Await semantics | sections/04_effects.md | 4.13 |
+| Injection safety | sections/03_types.md | 3.12 |
+| Query escape hatch | OPEN_QUESTIONS.md | 3.2 |

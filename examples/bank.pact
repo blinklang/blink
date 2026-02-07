@@ -65,12 +65,15 @@ pub fn transfer(amount: Int, -- from: Account, to: Account) -> Result[(Account, 
 }
 
 /// Look up an account by ID.
+/// The string literal auto-parameterizes: {id} becomes a bound parameter, not concatenation.
 fn find_account(id: Int) -> Result[Account, AccountError] ! DB.Read {
     db.query_one("SELECT * FROM accounts WHERE id = {id}")
         ?? Err(AccountError.NotFound(id))
 }
 
 /// Persist account state.
+/// db.execute receives Query[DB] — {acct.balance} and {acct.id} are bound parameters.
+/// The io.log call receives Str — normal interpolation (concatenation).
 fn save_account(acct: Account) ! DB.Write, IO.Log {
     db.execute("UPDATE accounts SET balance = {acct.balance} WHERE id = {acct.id}")
     io.log("Account {acct.id} updated: balance={acct.balance}")
