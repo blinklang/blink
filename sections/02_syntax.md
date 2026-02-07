@@ -52,8 +52,11 @@ All decided through independent design and cross-team voting. None are revisitab
 | Option sugar | `T?` for `Option[T]` | `Str?` means `Option[Str]`. Short in type position, universally understood. |
 | Option defaulting | `??` | `val ?? default` desugars to match on `Some`/`None`. Borrowed from Swift's nil-coalescing. |
 | Type names | `Str`, `Int`, `Bool`, `Float` | Short PascalCase. One casing rule for builtins and user types. Token-efficient — `Str` saves 3 chars over `String`, thousands of times per codebase. |
-| Visibility | `pub` keyword | Public items use `pub`. Everything else is module-private. See [2.10](#210-visibility). |
+| If/else | Expression, no parens | Always an expression. No parentheses around condition. Else mandatory when value is used. No `if let`. See [2.9](#29-ifelse-expressions). |
+| While/loop | `while` and `loop` | `while cond { }` for conditional, `loop { }` for unconditional. Plain `break`/`continue`. No labels, no `while let`. See [2.11](#211-whileloop). |
+| Visibility | `pub` keyword | Public items use `pub`. Everything else is module-private. See [2.12](#212-visibility). |
 | Scoped resources | `with expr as name { }` | Deterministic resource cleanup. `Closeable` trait + LIFO close order. Reuses `with` from effect handlers; `as` disambiguates. 3-0 over `defer`. |
+| Tests | `test "name" { }` | First-class syntax. Pure by default (no implicit effects). Three built-in assertions. Module-scoped tests access private items. `@tags(...)` for filtering. See [2.19](#219-test-blocks). |
 
 ### 2.3 Contested: Braces vs Indentation
 
@@ -189,7 +192,53 @@ async.spawn(fn() {
 })
 ```
 
-### 2.9 For-Loops
+### 2.9 If/Else Expressions
+
+`if`/`else` is an expression — it evaluates to a value, like `match` and `with...as`. No parentheses around the condition (consistent with `for` loops). Braces required.
+
+```pact
+// Expression — both branches must return the same type
+let status = if user.active { "online" } else { "offline" }
+
+// Statement — value discarded, type is (), else optional
+if amount <= 0 {
+    return Err(AccountError.InvalidAmount)
+}
+
+// Else-if chains
+let tier = if score >= 90 { "gold" }
+    else if score >= 70 { "silver" }
+    else { "bronze" }
+
+// As the last expression in a function (implicit return)
+fn abs(n: Int) -> Int {
+    if n < 0 { -n } else { n }
+}
+
+// Inside match arms
+match expr {
+    Div(l, r) => {
+        let divisor = eval(r)?
+        if divisor == 0.0 {
+            Err(CalcError.DivisionByZero)
+        } else {
+            Ok(eval(l)? / divisor)
+        }
+    }
+}
+```
+
+#### Rules
+
+- **Expression context** (let binding, return, argument): `else` is required. Both branches must unify to the same type. Missing `else` is a compile error.
+- **Statement context** (value discarded): `else` is optional. The expression type is `()`. If `else` is present, both branches must be `()`.
+- **No parentheses** around the condition. The condition is delimited by `if` and `{`. Sub-expression grouping with `()` inside the condition is normal expression syntax, not part of `if`.
+- **No truthiness.** The condition must be `Bool`. `if 0 { }` and `if items { }` are compile errors. See [2.18](#218-operator-precedence--semantics).
+- **No `if let`** for v1. Use `match` for pattern-based control flow, `??` for Option defaulting. Revisitable in v2 if `match` with single-arm + wildcard proves painful in practice.
+
+**Panel vote: 5-0 unanimous** on all four sub-questions — if/else as expression, else required in expression context, no if-let for v1, parentheses forbidden. See [DECISIONS.md](../DECISIONS.md) for full deliberation.
+
+### 2.10 For-Loops
 
 ```pact
 for x in collection {
@@ -197,7 +246,21 @@ for x in collection {
 }
 ```
 
-Standard for-in over any iterable. No parentheses around the header. Braces required.
+Iterates over any type implementing `IntoIterator` (§3c.1). No parentheses around the header. Braces required.
+
+The compiler desugars `for x in expr { body }` to:
+
+```pact
+let mut __iter = expr.into_iter()
+loop {
+    match __iter.next() {
+        Some(x) => { body }
+        None => break
+    }
+}
+```
+
+`break` exits the loop. `continue` skips to the next `__iter.next()` call.
 
 **Ranges:**
 
@@ -206,13 +269,87 @@ for i in 0..100 { }      // exclusive: 0 to 99
 for n in 1..=100 { }     // inclusive: 1 to 100
 ```
 
-`..` is exclusive upper bound, `..=` is inclusive. Ranges are lazy iterables of type `Range[T: Ord]`.
+`..` is exclusive upper bound, `..=` is inclusive. Ranges are lazy iterables of type `Range[T: Ord]` which implements `IntoIterator`.
 
-No comprehensions in v1 — `for` loops and method chaining (`.map()`, `.filter()`, `.collect()`) cover the same use cases.
+No comprehensions in v1 — `for` loops and method chaining (`.map()`, `.filter()`, `.collect()`) cover the same use cases. See §3c.1 for the full iterator protocol.
 
 **Panel vote: 5-0 ratified.** See [OPEN_QUESTIONS.md](../OPEN_QUESTIONS.md) 2.3, 2.4.
 
-### 2.10 Visibility
+### 2.11 While/Loop
+
+Two loop constructs for two distinct intents. `while` for conditional looping — keep going until the condition is false. `loop` for unconditional looping — run forever unless explicitly broken out of. No parentheses around the condition (consistent with `if` and `for`). Braces required.
+
+```pact
+// Conditional loop — checks before each iteration
+while queue.has_next() {
+    let item = queue.pop()?
+    process(item)
+}
+
+// Retry with backoff
+let mut attempts = 0
+while attempts < max_retries {
+    match try_connect(host) {
+        Ok(conn) => return Ok(conn)
+        Err(_) => {
+            attempts += 1
+            async.sleep(backoff(attempts))
+        }
+    }
+}
+
+// Infinite loop — event loop, server accept, REPL
+loop {
+    let event = events.next()
+    match event {
+        Event.Shutdown => break
+        Event.Request(req) => handle(req)
+    }
+}
+
+// Polling until a condition
+let mut result = None
+loop {
+    let status = check_status()?
+    if status.is_ready() {
+        result = Some(status)
+        break
+    }
+    async.sleep(poll_interval)
+}
+```
+
+#### `break` and `continue`
+
+`break` exits the innermost loop. `continue` skips to the next iteration. Both are statements — no break-with-value for v1.
+
+```pact
+for item in items {
+    if item.is_skip() {
+        continue
+    }
+    if item.is_done() {
+        break
+    }
+    process(item)
+}
+```
+
+`break` and `continue` work identically in `for`, `while`, and `loop`.
+
+#### Rules
+
+- **No parentheses** around the `while` condition. Delimited by `while` and `{`.
+- **No truthiness.** The condition must be `Bool`. `while 1 { }` is a compile error.
+- **Statement semantics.** Both `while` and `loop` evaluate to `()`. They are not expressions — you cannot `let x = while ... { }` or `let x = loop { }`. This is consistent with `for` loops.
+- **No break-with-value** for v1. Use `let mut` + assign + `break` pattern. Revisitable in v2 if expression-oriented loops prove necessary.
+- **No labeled breaks.** Nested loop exit uses extracted functions with early `return`. Labels are a backward-compatible addition if demand materializes.
+- **No `while let`.** Consistent with `if let` rejection (5-0). Use `loop { match ... { P => body, _ => break } }` for pattern-based looping.
+- **Linter recommendation:** `while true { }` should be written as `loop { }`. The linter warns and auto-fixes.
+
+**Panel vote:** Both constructs 3-2. Plain break/continue 3-2. No labels 4-1. No while-let 5-0. See [DECISIONS.md](../DECISIONS.md).
+
+### 2.12 Visibility
 
 All items (functions, types, constants, modules) are **private by default**. The `pub` keyword makes an item visible outside its module.
 
@@ -245,7 +382,7 @@ type HashedPassword {
 
 **Why default private:** Locality of reasoning. A private function can be changed without considering external callers. The public surface of a module is explicitly opted-into, making API boundaries clear to both humans and AI agents. An AI scanning a module's API only needs to read `pub` items — everything else is implementation detail it can skip, saving context window space.
 
-### 2.11 Declaration-Site Keyword Arguments
+### 2.13 Declaration-Site Keyword Arguments
 
 Functions use a `--` separator to divide positional parameters from keyword parameters. Positional params come before `--`, keyword params come after. The function author decides which params are keyword — the caller has no choice. Principle 2 preserved.
 
@@ -307,7 +444,7 @@ transfer(300, from: bob, to: alice)   // still explicit, reviewer sees intent
 
 LLMs swap same-typed positional args at measurable rates (3-8% per call site with 3+ same-typed params). Keyword labels eliminate this class of bug structurally.
 
-### 2.12 Struct Field Defaults
+### 2.14 Struct Field Defaults
 
 Struct fields can declare default values. When constructing a struct, fields with defaults may be omitted — the default is used.
 
@@ -337,7 +474,7 @@ Function parameter defaults interact with closures (does `fn(Int) -> Int` match 
 
 Struct defaults also serve as the primary **API evolution mechanism**: adding a new field with a default is always backwards-compatible. Existing construction sites continue to compile unchanged.
 
-### 2.13 Struct Construction Shorthand
+### 2.15 Struct Construction Shorthand
 
 When a function takes a single struct argument, the type name can be omitted at the call site. The compiler infers it from the parameter type.
 
@@ -362,7 +499,7 @@ The shorthand applies only when:
 
 When the type is ambiguous (e.g., the parameter is a trait object or generic), the full form is required.
 
-### 2.14 Annotations
+### 2.16 Annotations
 
 Annotations use the `@` prefix and are **compiler-checked** — they are not comments, not decorators, not optional metadata. They participate in type checking, verification, and optimization.
 
@@ -457,7 +594,7 @@ pub fn login(email: Str, pwd: Str) -> Result[Session, AuthError] ! DB, Crypto {
 
 The canonical ordering enforced by `pact fmt` is: `@capabilities` first (permissions), then `@i` (intent), then `@requires`/`@ensures` (contracts), then `@where` (type constraints), then `@perf` (performance). See section 11.1 for the complete ordering across all 14 annotation types.
 
-### 2.15 Scoped Resources (`with...as`)
+### 2.17 Scoped Resources (`with...as`)
 
 The `with...as` construct binds a `Closeable` value to a name and guarantees cleanup when the block exits — whether by normal completion, `?` early return, or any other exit path.
 
@@ -510,3 +647,315 @@ Here `mock_db(fixtures)` is an effect handler (no `as`) and `f` is a scoped `Clo
 - `Closeable` bindings cannot be stored in fields or collections within the block (compile error E0602)
 - Multiple resources clean up in LIFO order (reverse declaration order)
 - Partial acquisition: if `expr2` fails via `?`, only resources from earlier bindings are cleaned up
+
+---
+
+### 2.18 Operator Precedence & Semantics
+
+#### Precedence Table
+
+From lowest to highest binding:
+
+| Precedence | Operators | Associativity | Category |
+|:----------:|-----------|:-------------:|----------|
+| 1 (lowest) | `\|>` | left | pipe |
+| 2 | `??` | right | coalesce |
+| 3 | `\|\|` | left | logical or (short-circuit) |
+| 4 | `&&` | left | logical and (short-circuit) |
+| 5 | `==` `!=` | left | equality |
+| 6 | `<` `>` `<=` `>=` | left | comparison |
+| 7 | `+` `-` | left | additive |
+| 8 | `*` `/` `%` | left | multiplicative |
+| 9 | `-` `!` | right | unary prefix |
+| 10 | `?` | left | postfix unwrap |
+| 11 (highest) | `.` `()` | left | member access, call |
+
+**Non-chaining comparisons.** `a < b < c` is a compile error. The compiler suggests `a < b && b < c`. Chained comparisons introduce context-sensitive operator semantics that contradict Pact's unambiguous-parsing priority. (Vote: 4-1)
+
+#### Operator Desugaring
+
+All operators either desugar to trait method calls or are language primitives.
+
+**Arithmetic** — `+`, `-`, `*`, `/`, `%`, and unary `-` desugar to trait methods (Add, Sub, Mul, Div, Rem, Neg). Arithmetic traits are sealed — only built-in numeric types implement them. Full trait definitions in §3.6.
+
+```pact
+// x + y  desugars to  Add.add(x, y)
+// x - y  desugars to  Sub.sub(x, y)
+// x * y  desugars to  Mul.mul(x, y)
+// x / y  desugars to  Div.div(x, y)
+// x % y  desugars to  Rem.rem(x, y)
+// -x     desugars to  Neg.neg(x)
+```
+
+Operands must be the same type. Mixed-type arithmetic (`Int + Float`) is a compile error — use explicit conversion: `x.to_float() + y`. (Vote: 5-0)
+
+**Equality** — `==` and `!=` desugar to `Eq.eq` and `Eq.ne`. Any type can implement `Eq`. See §3.6.
+
+**Comparison** — `<`, `>`, `<=`, `>=` desugar via `Ord.cmp` returning `Ordering`. Any type can implement `Ord`. See §3.6.
+
+**Boolean operators** — `&&`, `||`, `!` are language primitives, not trait-dispatched. They require `Bool` operands. Short-circuit: the right operand of `&&` is only evaluated when the left is `true`; the right operand of `||` is only evaluated when the left is `false`. (Vote: 5-0)
+
+```pact
+if user.is_admin() || expensive_check(user) {
+    grant_access()
+}
+```
+
+**`?` and `??`** are language primitives for `Result`/`Option`. Already specified in §3.5.
+
+**`|>`** is the pipe operator. Already specified in §2.10.
+
+#### No Truthiness
+
+Only `true` and `false` are `Bool` values. There is no implicit conversion to `Bool`.
+
+```pact
+if 0 { }           // compile error: expected Bool, got Int
+if items { }       // compile error: expected Bool, got List[T]
+
+if items.len() > 0 { }    // correct: explicit Bool expression
+if name.is_empty() { }    // correct: method returns Bool
+```
+
+Every language defines truthiness differently — Python, JS, and Ruby all disagree on what's falsy. LLMs cross-contaminate these rules at high rates. Requiring explicit `Bool` eliminates the bug class. (Vote: 5-0)
+
+#### Assignment Operators
+
+`+=`, `-=`, `*=`, `/=`, `%=` are syntactic sugar for reassignment with the corresponding operator:
+
+```pact
+let mut count = 0
+count += 1       // desugars to: count = count + 1
+count *= 2       // desugars to: count = count * 2
+```
+
+Only valid on `let mut` bindings. Desugaring is purely syntactic — `x += rhs` becomes `x = x + rhs` before type checking. (Vote: 5-0)
+
+#### String Concatenation
+
+`+` does **not** work on `Str`. Use interpolation or `.concat()`.
+
+```pact
+let full = first + " " + last   // compile error: Str does not implement Add
+
+let full = "{first} {last}"              // interpolation (preferred)
+let full = first.concat(" ").concat(last) // .concat() for dynamic cases
+```
+
+String `+` encourages O(n²) loops, creates ambiguity with numeric `+`, and violates Principle 2 when interpolation already exists. (Vote: 5-0)
+
+### 2.19 Test Blocks
+
+Tests are first-class syntax — `test` blocks are part of the grammar, understood by the parser, type-checked by the compiler, and run by the built-in test runner. No test framework to import.
+
+```pact
+test "add returns sum" {
+    assert_eq(add(1, 2), 3)
+    assert_eq(add(-1, 1), 0)
+    assert_eq(add(0, 0), 0)
+}
+
+test "add is commutative" {
+    prop_check(fn(a: Int, b: Int) {
+        assert_eq(add(a, b), add(b, a))
+    })
+}
+```
+
+#### Syntax
+
+```
+test "description string" { body }
+```
+
+- `test` is a keyword. The description is a `Str` literal (no interpolation — must be a static string for test discovery).
+- The body is a block expression evaluated by the test runner.
+- `test` blocks are top-level declarations (peers of `fn`, `type`, etc.) or may appear inside `mod { }` blocks.
+- Test names must be unique within their module scope. Duplicate names are a compile error.
+- Tests are stripped from release builds. They exist only when compiled with `pact test`.
+
+#### Effect Model: Pure by Default
+
+Test blocks have **no implicit effects**. A test that calls an effectful function without a handler is a compile error — the same rule as any other function with an empty effect row. Effect handlers within the body introduce effects locally.
+
+```pact
+// Pure test — no effects needed
+test "deposit increases balance" {
+    let acct = open_account(1, "Test")
+    let result = deposit(acct, 500)
+    assert(result.is_ok())
+    assert_eq(result.unwrap().balance, 500)
+}
+
+// Effectful test — handlers provide effects explicitly
+test "fetch with mock" {
+    with mock_net(responses) {
+        let result = fetch_data("https://example.com")
+        assert_eq(result.unwrap(), "ok")
+    }
+}
+
+// Multiple effect handlers compose via with
+test "integration test with shared environment" {
+    with mock_db(fixtures), capture_log([]) {
+        run_migration()
+        assert_eq(get_user(1).unwrap().name, "Alice")
+    }
+}
+```
+
+This is consistent with Pact's effect system design — effects are explicit, never hidden. The compiler produces actionable errors when a test calls effectful code without a handler:
+
+```
+error[E0310]: unhandled effect `Net` in test "fetch data"
+  --> src/api.pact:45:9
+   |
+45 |     let result = fetch_data(url)
+   |                  ^^^^^^^^^^ `fetch_data` requires `! Net`
+   |
+   = hint: wrap in `with mock_net(...) { ... }` to provide a handler
+```
+
+Pure-by-default enables the compiler to safely parallelize test execution — tests with no effect handlers are guaranteed side-effect-free.
+
+**Panel vote: 5-0 unanimous** for pure by default. See [DECISIONS.md](../DECISIONS.md).
+
+#### Built-in Assertions
+
+Three assertion functions are compiler built-ins, available in any test block without import:
+
+| Function | Signature | On failure |
+|----------|-----------|------------|
+| `assert(expr)` | `fn assert(cond: Bool)` | Panics with source location |
+| `assert_eq(a, b)` | `fn assert_eq[T: Eq + Display](left: T, right: T)` | Panics with both values displayed |
+| `assert_ne(a, b)` | `fn assert_ne[T: Eq + Display](left: T, right: T)` | Panics with the duplicated value displayed |
+
+```pact
+test "assertions demo" {
+    assert(user.is_active())
+    assert_eq(account.balance, 500)
+    assert_ne(token_a, token_b)
+}
+```
+
+Assertion failure panics — unwinding to the test runner, which marks the test as failed and continues running other tests. This is the one context where Pact uses panic semantics, since tests are controlled environments where unwinding is safe.
+
+For pattern-based assertions, use `match` + `assert`:
+
+```pact
+test "returns specific error" {
+    let result = withdraw(acct, 9999)
+    match result {
+        Err(BankError.InsufficientFunds) => assert(true)
+        _ => assert(false)
+    }
+}
+```
+
+**Panel vote: 4-1** for three built-ins. PLT dissented (assert_ne is `assert(a != b)` — Principle 2 violation; compiler could special-case `assert(a != b)` for better messages). Majority: `assert_ne` has dedicated diagnostic value and is universal across test frameworks. See [DECISIONS.md](../DECISIONS.md).
+
+#### Property-Based Testing
+
+`prop_check` is a built-in for property-based testing. It generates random inputs based on the closure's parameter types and runs the body repeatedly.
+
+```pact
+test "sort is idempotent" {
+    prop_check(fn(list: List[Int]) {
+        assert_eq(sort(sort(list)), sort(list))
+    })
+}
+```
+
+`prop_check` is available in test blocks without import. The compiler infers generator strategies from parameter types. Run property tests specifically with `pact test --prop`.
+
+#### Test Scope
+
+Test blocks can appear at the top level of a file or inside `mod { }` blocks. Tests inside a module see that module's private items — enabling verification of internal invariants without exposing implementation details.
+
+```pact
+mod auth {
+    fn hash_password(pwd: Str) -> Str {
+        // private implementation detail
+    }
+
+    pub fn verify(pwd: Str, hash: Str) -> Bool {
+        hash_password(pwd) == hash
+    }
+
+    test "hash_password produces consistent output" {
+        let h1 = hash_password("secret")
+        let h2 = hash_password("secret")
+        assert_eq(h1, h2)
+    }
+}
+
+// Top-level test — can only access pub items
+test "verify rejects wrong password" {
+    assert(!auth.verify("wrong", "expected_hash"))
+}
+```
+
+The scoping rule is uniform: a `test` block inside `mod M` sees `M`'s private namespace, same as any `fn` inside `M`. No special visibility modifiers needed.
+
+**Panel vote: 4-1** for module-scoped tests. AI/ML dissented (flat is more reliable for LLM generation; nested placement adds decision point). Majority: testing private invariants is critical and the alternative — making internals `pub` or adding `pub(test)` — is worse. See [DECISIONS.md](../DECISIONS.md).
+
+#### Discovery & Filtering
+
+Tests are discovered at compile time — the compiler knows every `test` block's name, module path, file location, and tags.
+
+```pact
+@tags("slow", "integration")
+test "full order flow" {
+    with mock_db(fixtures), mock_payment() {
+        let result = place_order(sample_order())
+        assert(result.is_ok())
+    }
+}
+```
+
+The `@tags(...)` annotation attaches string tags to a test block for structured filtering. Tags are compile-time metadata — zero runtime cost, stripped with test bodies in release builds.
+
+**CLI filtering:**
+
+```sh
+pact test                           # run all tests
+pact test --filter "deposit"        # name substring match
+pact test auth/                     # run tests in auth/ module path
+pact test --tag unit                # run tests tagged "unit"
+pact test --tag slow --exclude      # run all tests EXCEPT tagged "slow"
+pact test --prop                    # run property tests only
+pact test --json                    # structured JSON output
+```
+
+**Panel vote: 4-1** for annotation tags. AI/ML dissented (tags are metadata LLMs forget; name conventions suffice). Majority: structured tag filtering is day-one CI infrastructure; without it, teams hack naming conventions. See [DECISIONS.md](../DECISIONS.md).
+
+#### Doc-Tests
+
+Code examples in `///` doc comments are compiled and run as tests:
+
+```pact
+/// Parses a string to an integer.
+///
+/// ```
+/// assert_eq(parse_int("42"), Ok(42))
+/// assert_eq(parse_int("nope"), Err(ParseError))
+/// ```
+fn parse_int(s: Str) -> Result[Int, ParseError] {
+    // ...
+}
+```
+
+Doc-tests verify that documentation stays in sync with implementation. They are run by `pact test` alongside regular test blocks.
+
+#### Rules Summary
+
+- `test` is a keyword — first-class syntax, not a macro or library
+- Test names are static `Str` literals (no interpolation)
+- Pure by default — no implicit effects. Use `with` handlers for effectful tests
+- Three built-in assertions: `assert`, `assert_eq`, `assert_ne`
+- Assertion failure panics (unwind to test runner)
+- `prop_check` built-in for property-based testing
+- Tests can appear top-level or inside `mod { }` (private access)
+- `@tags(...)` annotation for structured filtering
+- Stripped from release builds
+- JSON structured output via `pact test --json`

@@ -480,6 +480,192 @@ Links:
 
 **Why provenance in the language:** Compliance-heavy environments (healthcare, finance, government) require traceability from requirements to code. Currently this lives in spreadsheets, Jira queries, and tribal knowledge. Embedding it in the source makes it versionable, verifiable, and impossible to lose. For AI agents, provenance provides context about _why_ code exists — not just what it does.
 
+### 10.5 Import Resolution
+
+This section specifies how the compiler resolves `import` declarations to source files, handles dependency versions, detects cycles, and supports re-exports.
+
+#### Resolution Algorithm
+
+Import resolution is a deterministic function from module path to file path. No search path lists, no environment variables, no `PACT_PATH`.
+
+**Local modules** (project source):
+
+```
+resolve("auth.token") → <project>/src/auth/token.pact
+resolve("auth")       → <project>/src/auth.pact (if @mod("auth"))
+                        OR <project>/src/auth/ (package — exposes pub items)
+```
+
+The compiler resolves module paths relative to the project's `src/` directory. The path segment separator `.` maps to the filesystem `/`. The file extension `.pact` is implicit and must not appear in the import.
+
+```pact
+import auth.token           // resolves to src/auth/token.pact
+import auth.token.{Token}   // resolves to src/auth/token.pact, imports Token
+import db.connection        // resolves to src/db/connection.pact
+```
+
+**External dependencies** (from `pact.lock`):
+
+```pact
+import pact.http            // dependency declared in pact.toml
+import pact.json.{parse}    // specific item from dependency
+```
+
+External packages are namespaced by their package name as declared in `pact.toml`. The compiler resolves them from the lockfile's content-addressed store. The resolution order:
+
+1. Check local `src/` for a matching path
+2. Check dependencies declared in `pact.toml` (resolved via `pact.lock`)
+3. No match → compile error
+
+Local modules shadow dependencies with the same name. This is intentional — it allows wrapping a dependency without changing consumer imports. The compiler emits a warning when shadowing occurs:
+
+```
+warning[W1000]: local module shadows dependency
+ --> src/http.pact:1:1
+  |
+1 | @mod("http")
+  | ^^^^^^^^^^^^ shadows package `pact.http` from pact.toml
+  |
+  = help: this is allowed but may confuse consumers expecting the library
+```
+
+#### `@mod` Resolution
+
+When a file declares `@mod("parent_package")`, its public items merge into the parent package namespace. The compiler validates that `@mod` only refers to the immediate parent:
+
+```
+src/auth/
+  auth.pact         @mod("auth") — items available as auth.X
+  token.pact        items available as auth.token.X
+  rate_limit.pact   items available as auth.rate_limit.X
+```
+
+If two files in the same directory both declare `@mod` with the same name, or if `@mod` conflicts with a sibling module name, the compiler rejects it:
+
+```
+error[E1001]: duplicate module name
+ --> src/auth/helpers.pact:1:1
+  |
+1 | @mod("auth")
+  | ^^^^^^^^^^^^ module name `auth` already claimed by src/auth/auth.pact
+```
+
+#### Cycle Detection
+
+**Intra-package cycles are allowed.** Modules within the same package (directory) may import each other freely. The compiler resolves all declarations within a package before type-checking bodies — the same approach used by ML-family languages.
+
+```pact
+// src/auth/login.pact
+import auth.types.{AuthError}    // sibling — allowed
+
+// src/auth/types.pact
+import auth.login.{LoginEvent}   // sibling — allowed (intra-package cycle)
+```
+
+Within a package, the compiler:
+1. Collects all declarations (function signatures, types, traits) from all modules in the package
+2. Builds a unified symbol table for the package
+3. Type-checks all function bodies against the unified table
+
+**Cross-package cycles are compile errors.** If package `auth` imports from package `billing` and `billing` imports from `auth`, the compiler rejects it:
+
+```
+error[E1002]: circular package dependency
+  |
+  = note: auth → billing → auth
+  = help: extract shared types into a common package
+```
+
+Cross-package cycles indicate an architectural boundary violation. The fix is always to extract shared types into a third package that both depend on.
+
+#### Diamond Dependencies
+
+**Exactly one version per package.** If two dependencies require different versions of the same transitive dependency, the compiler reports a conflict:
+
+```
+error: dependency version conflict
+  myapp depends on http 0.5
+  auth 1.0 depends on http 0.6
+
+  resolution: only one version of `http` allowed in the dependency graph
+
+  help: run `pact update http` to find a compatible version
+        or pin auth to a version compatible with http 0.5
+```
+
+One-version-per-package is required for type identity. If `auth` produces an `http.Response` from http 0.6 and `myapp` expects `http.Response` from http 0.5, these are incompatible types. Allowing both silently would violate Pact's explicit-over-implicit philosophy.
+
+The `pact update` command uses minimum version selection: it picks the lowest version that satisfies all constraints. This makes builds reproducible — adding a dependency never upgrades unrelated transitive deps.
+
+#### Re-exports (`pub import`)
+
+A module can re-export items from other modules using `pub import`. This decouples a package's public API from its internal file structure.
+
+```pact
+// src/auth/auth.pact
+@mod("auth")
+pub import auth.token.{Token, verify}
+pub import auth.login.{login, AuthError}
+pub import auth.rate_limit.{RateLimiter}
+
+// Consumers import from the package directly:
+// import auth.{Token, login, AuthError}
+// instead of knowing the internal module structure
+```
+
+`pub import` rules:
+- Re-exported items must be `pub` in their source module
+- Re-exports are transitive — `pub import` of a `pub import` works
+- The compiler tracks the original declaration for go-to-definition (LSP lands on the source, not the re-export)
+- `pub import` of an entire module re-exports all its `pub` items: `pub import auth.token` makes `auth.Token`, `auth.verify` etc. available
+- Circular re-exports are detected and rejected at compile time
+
+Re-exports enable API evolution: moving a type from `auth.token` to `auth.session` internally only requires updating the `pub import` in the package root — downstream consumers' imports don't change.
+
+#### Import Errors
+
+| Code | Error | Cause |
+|------|-------|-------|
+| E1000 | Module not found | No file at resolved path, no matching dependency |
+| E1001 | Duplicate module name | Two files claim same `@mod` name |
+| E1002 | Circular package dependency | Cross-package import cycle |
+| E1003 | Item not found | Named item doesn't exist or isn't `pub` in the target module |
+| E1004 | Version conflict | Diamond dependency with incompatible versions |
+| E1005 | Ambiguous import | Item name exists in multiple imported modules (use qualified path) |
+
+```
+error[E1003]: item `Token` is private in module `auth.internal`
+ --> src/api/handler.pact:2:1
+  |
+2 | import auth.internal.{Token}
+  |                       ^^^^^ not visible — `Token` is not `pub`
+  |
+  = help: import from the public API: `import auth.{Token}`
+```
+
+```
+error[E1005]: ambiguous import `Error`
+ --> src/main.pact:4:1
+  |
+2 | import auth.{Error}
+3 | import db.{Error}
+  |
+  = note: `Error` exists in both `auth` and `db`
+  = help: use qualified names: `auth.Error` and `db.Error`
+         or rename: `import auth.{Error as AuthError}`
+```
+
+#### Import Aliases
+
+Imports can be renamed at the import site to resolve ambiguity or improve local clarity:
+
+```pact
+import auth.{AuthError as LoginError}
+import db.connection.{Connection as DbConn}
+```
+
+Aliases are local to the importing file. They do not affect the imported module or any other consumers.
+
 ---
 
 ## 11. Metadata & Annotations

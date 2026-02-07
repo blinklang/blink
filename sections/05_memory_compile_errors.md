@@ -121,7 +121,7 @@ fn process_all(items: List[Item]) -> List[Result] {
 
 The GC handles memory. But file handles, sockets, locks, database cursors, and temp files need deterministic cleanup — released at a specific program point, not whenever the GC runs a finalizer.
 
-Pact solves this with two pieces: the `Closeable` trait (section 3.6) and the `with...as` syntax (section 2.15).
+Pact solves this with two pieces: the `Closeable` trait (section 3.6) and the `with...as` syntax (section 2.17).
 
 #### The `Closeable` trait
 
@@ -463,11 +463,11 @@ The `?` operator desugars to:
 // `let text = io.read_file(path)?` becomes:
 let text = match io.read_file(path) {
     Ok(val) => val
-    Err(e) => return Err(e.into())
+    Err(e) => return Err(e)
 }
 ```
 
-The `.into()` call converts between error types via the `From` trait, so `?` works when the inner error type differs from the function's declared error type:
+The `?` operator requires the error type to **match exactly** — there is no implicit conversion. When the callee's error type differs from the function's declared error type, convert explicitly with `.map_err()` and `From`:
 
 ```pact
 type ConfigError {
@@ -488,11 +488,14 @@ impl From[ValidationError] for ConfigError {
     fn from(e: ValidationError) -> ConfigError { ConfigError.Validation(e) }
 }
 
-// Now `?` automatically wraps each sub-error into ConfigError
+// Explicit error conversion at each ? site
 fn read_config(path: Str) -> Result[Config, ConfigError] ! IO {
-    let text = io.read_file(path)?         // IOError -> ConfigError.IO
-    let parsed = toml.parse(text)?         // ParseError -> ConfigError.Parse
-    validate(parsed)?                       // ValidationError -> ConfigError.Validation
+    let text = io.read_file(path)
+        .map_err(fn(e) { ConfigError.from(e) })?
+    let parsed = toml.parse(text)
+        .map_err(fn(e) { ConfigError.from(e) })?
+    validate(parsed)
+        .map_err(fn(e) { ConfigError.from(e) })?
     Ok(parsed)
 }
 ```
