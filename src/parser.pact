@@ -60,6 +60,7 @@ pub let mut np_type_params: List[Int] = []
 pub let mut np_effects: List[Int] = []
 pub let mut np_captures: List[Int] = []
 pub let mut np_type_ann: List[Int] = []
+pub let mut np_handlers: List[Int] = []
 
 pub fn new_node(kind: Int) -> Int {
     let id = np_kind.len()
@@ -103,6 +104,7 @@ pub fn new_node(kind: Int) -> Int {
     np_effects.push(-1)
     np_captures.push(-1)
     np_type_ann.push(-1)
+    np_handlers.push(-1)
     id
 }
 
@@ -957,6 +959,52 @@ pub fn parse_handler_expr() -> Int {
     nd
 }
 
+// ── With blocks ─────────────────────────────────────────────────────
+
+pub fn parse_with_block() -> Int {
+    expect(TokenKind.With)
+    let mut handler_nodes: List[Int] = []
+    let expr0 = parse_expr()
+    if at(TokenKind.As) {
+        advance()
+        let binding = expect_value(TokenKind.Ident)
+        let wr = new_node(NodeKind.WithResource)
+        np_value.set(wr, expr0)
+        np_name.set(wr, binding)
+        handler_nodes.push(wr)
+    } else {
+        handler_nodes.push(expr0)
+    }
+    while at(TokenKind.Comma) {
+        advance()
+        skip_newlines()
+        let expr_n = parse_expr()
+        if at(TokenKind.As) {
+            advance()
+            let binding_n = expect_value(TokenKind.Ident)
+            let wr_n = new_node(NodeKind.WithResource)
+            np_value.set(wr_n, expr_n)
+            np_name.set(wr_n, binding_n)
+            handler_nodes.push(wr_n)
+        } else {
+            handler_nodes.push(expr_n)
+        }
+    }
+    skip_newlines()
+    let body = parse_block()
+    let handlers_sl = new_sublist()
+    let mut i = 0
+    while i < handler_nodes.len() {
+        sublist_push(handlers_sl, handler_nodes.get(i))
+        i = i + 1
+    }
+    finalize_sublist(handlers_sl)
+    let nd = new_node(NodeKind.WithBlock)
+    np_handlers.set(nd, handlers_sl)
+    np_body.set(nd, body)
+    nd
+}
+
 // ── Block ───────────────────────────────────────────────────────────
 
 pub fn parse_block() -> Int {
@@ -1011,6 +1059,11 @@ pub fn parse_stmt() -> Int {
     }
     if at(TokenKind.If) {
         let nd = parse_if_expr()
+        maybe_newline()
+        return nd
+    }
+    if at(TokenKind.With) {
+        let nd = parse_with_block()
         maybe_newline()
         return nd
     }
@@ -1192,7 +1245,25 @@ pub fn parse_for_in() -> Int {
 // ── Expressions (precedence climbing) ───────────────────────────────
 
 pub fn parse_expr() -> Int {
-    parse_or()
+    parse_nullcoalesce()
+}
+
+pub fn parse_nullcoalesce() -> Int {
+    let mut left = parse_or()
+    while at(TokenKind.DoubleQuestion) {
+        advance()
+        skip_newlines()
+        let right = parse_or()
+        let nd = new_node(NodeKind.BinOp)
+        np_op.pop()
+        np_op.push("??")
+        np_left.pop()
+        np_left.push(left)
+        np_right.pop()
+        np_right.push(right)
+        left = nd
+    }
+    left
 }
 
 pub fn parse_or() -> Int {
@@ -1428,6 +1499,14 @@ pub fn parse_postfix() -> Int {
             np_obj.push(node)
             np_index.pop()
             np_index.push(idx)
+            node = nd
+        } else if at(TokenKind.Question) {
+            advance()
+            let nd = new_node(NodeKind.UnaryOp)
+            np_op.pop()
+            np_op.push("?")
+            np_left.pop()
+            np_left.push(node)
             node = nd
         } else {
             running = 0

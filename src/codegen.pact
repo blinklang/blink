@@ -21,6 +21,8 @@ pub let CT_STRING = 3
 pub let CT_LIST = 4
 pub let CT_VOID = 5
 pub let CT_CLOSURE = 6
+pub let CT_OPTION = 7
+pub let CT_RESULT = 8
 
 
 // ── Codegen state ───────────────────────────────────────────────────
@@ -44,8 +46,17 @@ pub let mut cg_closure_counter: Int = 0
 
 // Capture analysis: per-closure capture info (flat list with start/count indexes)
 pub let mut closure_capture_names: List[Str] = []
+pub let mut closure_capture_types: List[Int] = []
+pub let mut closure_capture_muts: List[Int] = []
 pub let mut closure_capture_starts: List[Int] = []
 pub let mut closure_capture_counts: List[Int] = []
+
+// Active closure context: set while emitting a closure body, -1 otherwise
+pub let mut cg_closure_cap_start: Int = -1
+pub let mut cg_closure_cap_count: Int = 0
+
+// Variables in the outer scope that are heap-boxed because a closure captures them mutably
+pub let mut mut_captured_vars: List[Str] = []
 
 // Trait registry: maps trait name -> method names
 pub let mut trait_reg_names: List[Str] = []
@@ -88,6 +99,18 @@ pub let mut mono_base_names: List[Str] = []
 pub let mut mono_concrete_args: List[Str] = []
 pub let mut mono_c_names: List[Str] = []
 
+// Option/Result type tracking
+pub let mut var_option_names: List[Str] = []
+pub let mut var_option_inner: List[Int] = []
+pub let mut var_result_names: List[Str] = []
+pub let mut var_result_ok: List[Int] = []
+pub let mut var_result_err: List[Int] = []
+pub let mut emitted_option_types: List[Int] = []
+pub let mut emitted_result_types: List[Str] = []
+
+// Assignment context for .into() type inference
+pub let mut cg_let_target_type: Int = 0
+
 // Scope: parallel lists for variable names, types, and mutability.
 // Each scope is a "frame" delimited by frame_starts.
 pub let mut scope_names: List[Str] = []
@@ -98,6 +121,15 @@ pub let mut scope_frame_starts: List[Int] = []
 // Function registry: parallel lists (fn name -> return type, param count)
 pub let mut fn_reg_names: List[Str] = []
 pub let mut fn_reg_ret: List[Int] = []
+pub let mut fn_reg_effect_sl: List[Int] = []
+
+// Effect registry: name -> parent index (-1 = top-level)
+pub let mut effect_reg_names: List[Str] = []
+pub let mut effect_reg_parent: List[Int] = []
+
+// Current function being emitted (for effect propagation checking)
+pub let mut cg_current_fn_name: Str = ""
+
 pub let mut var_list_elem_names: List[Str] = []
 pub let mut var_list_elem_types: List[Int] = []
 
@@ -139,9 +171,190 @@ pub fn get_var_type(name: Str) -> Int {
     CT_INT
 }
 
+pub fn get_var_mut(name: Str) -> Int {
+    let mut i = scope_names.len() - 1
+    while i >= 0 {
+        if scope_names.get(i) == name {
+            return scope_muts.get(i)
+        }
+        i = i - 1
+    }
+    0
+}
+
+pub fn is_mut_captured(name: Str) -> Int {
+    let mut i = 0
+    while i < mut_captured_vars.len() {
+        if mut_captured_vars.get(i) == name {
+            return 1
+        }
+        i = i + 1
+    }
+    0
+}
+
+pub fn get_capture_index(name: Str) -> Int {
+    if cg_closure_cap_start < 0 {
+        return -1
+    }
+    let mut i = 0
+    while i < cg_closure_cap_count {
+        if closure_capture_names.get(cg_closure_cap_start + i) == name {
+            return i
+        }
+        i = i + 1
+    }
+    -1
+}
+
+pub fn capture_cast_expr(idx: Int) -> Str {
+    let ct = closure_capture_types.get(cg_closure_cap_start + idx)
+    if ct == CT_INT {
+        "(int64_t)(intptr_t)pact_closure_get_capture(__self, {idx})"
+    } else if ct == CT_FLOAT {
+        "*(double*)pact_closure_get_capture(__self, {idx})"
+    } else if ct == CT_STRING {
+        "(const char*)pact_closure_get_capture(__self, {idx})"
+    } else if ct == CT_BOOL {
+        "(int)(intptr_t)pact_closure_get_capture(__self, {idx})"
+    } else if ct == CT_LIST {
+        "(pact_list*)pact_closure_get_capture(__self, {idx})"
+    } else if ct == CT_CLOSURE {
+        "(pact_closure*)pact_closure_get_capture(__self, {idx})"
+    } else {
+        "pact_closure_get_capture(__self, {idx})"
+    }
+}
+
 pub fn reg_fn(name: Str, ret: Int) {
     fn_reg_names.push(name)
     fn_reg_ret.push(ret)
+    fn_reg_effect_sl.push(-1)
+}
+
+pub fn reg_fn_with_effects(name: Str, ret: Int, effects_sl: Int) {
+    fn_reg_names.push(name)
+    fn_reg_ret.push(ret)
+    fn_reg_effect_sl.push(effects_sl)
+}
+
+pub fn get_fn_effect_sl(name: Str) -> Int {
+    let mut i = 0
+    while i < fn_reg_names.len() {
+        if fn_reg_names.get(i) == name {
+            return fn_reg_effect_sl.get(i)
+        }
+        i = i + 1
+    }
+    -1
+}
+
+pub fn reg_effect(name: Str, parent: Int) -> Int {
+    let idx = effect_reg_names.len()
+    effect_reg_names.push(name)
+    effect_reg_parent.push(parent)
+    idx
+}
+
+pub fn get_effect_idx(name: Str) -> Int {
+    let mut i = 0
+    while i < effect_reg_names.len() {
+        if effect_reg_names.get(i) == name {
+            return i
+        }
+        i = i + 1
+    }
+    -1
+}
+
+pub fn effect_satisfies(caller_effect: Str, callee_effect: Str) -> Int {
+    if caller_effect == callee_effect {
+        return 1
+    }
+    let callee_idx = get_effect_idx(callee_effect)
+    if callee_idx == -1 {
+        return 0
+    }
+    let parent_idx = effect_reg_parent.get(callee_idx)
+    if parent_idx == -1 {
+        return 0
+    }
+    let parent_name = effect_reg_names.get(parent_idx)
+    if parent_name == caller_effect {
+        return 1
+    }
+    0
+}
+
+pub fn check_effect_propagation(callee_name: Str) {
+    if cg_current_fn_name == "main" {
+        return
+    }
+    let callee_sl = get_fn_effect_sl(callee_name)
+    if callee_sl == -1 {
+        return
+    }
+    let callee_count = sublist_length(callee_sl)
+    if callee_count == 0 {
+        return
+    }
+    let caller_sl = get_fn_effect_sl(cg_current_fn_name)
+    let mut ci = 0
+    while ci < callee_count {
+        let callee_eff_node = sublist_get(callee_sl, ci)
+        let callee_eff = np_name.get(callee_eff_node)
+        let mut satisfied = 0
+        if caller_sl != -1 {
+            let caller_count = sublist_length(caller_sl)
+            let mut ki = 0
+            while ki < caller_count {
+                let caller_eff_node = sublist_get(caller_sl, ki)
+                let caller_eff = np_name.get(caller_eff_node)
+                if effect_satisfies(caller_eff, callee_eff) != 0 {
+                    satisfied = 1
+                }
+                ki = ki + 1
+            }
+        }
+        if satisfied == 0 {
+            io.println("error E0500: function '{callee_name}' requires effect '{callee_eff}' but caller '{cg_current_fn_name}' does not declare it")
+        }
+        ci = ci + 1
+    }
+}
+
+pub fn init_builtin_effects() {
+    let io_idx = reg_effect("IO", -1)
+    reg_effect("IO.Print", io_idx)
+    reg_effect("IO.Log", io_idx)
+    let fs_idx = reg_effect("FS", -1)
+    reg_effect("FS.Read", fs_idx)
+    reg_effect("FS.Write", fs_idx)
+    reg_effect("FS.Delete", fs_idx)
+    reg_effect("FS.Watch", fs_idx)
+    let net_idx = reg_effect("Net", -1)
+    reg_effect("Net.Connect", net_idx)
+    reg_effect("Net.Listen", net_idx)
+    reg_effect("Net.DNS", net_idx)
+    let db_idx = reg_effect("DB", -1)
+    reg_effect("DB.Read", db_idx)
+    reg_effect("DB.Write", db_idx)
+    reg_effect("DB.Admin", db_idx)
+    let env_idx = reg_effect("Env", -1)
+    reg_effect("Env.Read", env_idx)
+    reg_effect("Env.Write", env_idx)
+    let time_idx = reg_effect("Time", -1)
+    reg_effect("Time.Read", time_idx)
+    reg_effect("Time.Sleep", time_idx)
+    reg_effect("Rand", -1)
+    let crypto_idx = reg_effect("Crypto", -1)
+    reg_effect("Crypto.Hash", crypto_idx)
+    reg_effect("Crypto.Sign", crypto_idx)
+    reg_effect("Crypto.Encrypt", crypto_idx)
+    reg_effect("Crypto.Decrypt", crypto_idx)
+    let proc_idx = reg_effect("Process", -1)
+    reg_effect("Process.Spawn", proc_idx)
+    reg_effect("Process.Signal", proc_idx)
 }
 
 pub fn get_fn_ret(name: Str) -> Int {
@@ -284,16 +497,13 @@ pub fn build_closure_sig_from_type_ann(ta: Int) -> Str {
     let ret_name = np_return_type.get(ta)
     let ret_type = type_from_name(ret_name)
     let elems_sl = np_elements.get(ta)
-    let mut sig_params = "void"
+    let mut sig_params = "pact_closure*"
     if elems_sl != -1 && sublist_length(elems_sl) > 0 {
-        sig_params = ""
         let mut i = 0
         while i < sublist_length(elems_sl) {
             let elem = sublist_get(elems_sl, i)
             let ename = np_name.get(elem)
-            if i > 0 {
-                sig_params = sig_params.concat(", ")
-            }
+            sig_params = sig_params.concat(", ")
             if is_enum_type(ename) != 0 {
                 sig_params = sig_params.concat("pact_{ename}")
             } else if is_struct_type(ename) != 0 {
@@ -559,7 +769,147 @@ pub fn type_from_name(name: Str) -> Int {
         "Float" => CT_FLOAT
         "Bool" => CT_BOOL
         "List" => CT_LIST
+        "Option" => CT_OPTION
+        "Result" => CT_RESULT
         _ => CT_VOID
+    }
+}
+
+pub fn option_c_type(inner: Int) -> Str {
+    "pact_Option_{c_type_tag(inner)}"
+}
+
+pub fn result_c_type(ok_t: Int, err_t: Int) -> Str {
+    "pact_Result_{c_type_tag(ok_t)}_{c_type_tag(err_t)}"
+}
+
+pub fn c_type_tag(ct: Int) -> Str {
+    if ct == CT_INT { "int" }
+    else if ct == CT_FLOAT { "double" }
+    else if ct == CT_BOOL { "bool" }
+    else if ct == CT_STRING { "str" }
+    else if ct == CT_LIST { "list" }
+    else { "void" }
+}
+
+pub fn ensure_option_type(inner: Int) {
+    let mut i = 0
+    while i < emitted_option_types.len() {
+        if emitted_option_types.get(i) == inner {
+            return
+        }
+        i = i + 1
+    }
+    emitted_option_types.push(inner)
+}
+
+pub fn ensure_result_type(ok_t: Int, err_t: Int) {
+    let key = "{ok_t}_{err_t}"
+    let mut i = 0
+    while i < emitted_result_types.len() {
+        if emitted_result_types.get(i) == key {
+            return
+        }
+        i = i + 1
+    }
+    emitted_result_types.push(key)
+}
+
+pub fn set_var_option(name: Str, inner: Int) {
+    var_option_names.push(name)
+    var_option_inner.push(inner)
+}
+
+pub fn get_var_option_inner(name: Str) -> Int {
+    let mut i = var_option_names.len() - 1
+    while i >= 0 {
+        if var_option_names.get(i) == name {
+            return var_option_inner.get(i)
+        }
+        i = i - 1
+    }
+    -1
+}
+
+pub fn set_var_result(name: Str, ok_t: Int, err_t: Int) {
+    var_result_names.push(name)
+    var_result_ok.push(ok_t)
+    var_result_err.push(err_t)
+}
+
+pub fn get_var_result_ok(name: Str) -> Int {
+    let mut i = var_result_names.len() - 1
+    while i >= 0 {
+        if var_result_names.get(i) == name {
+            return var_result_ok.get(i)
+        }
+        i = i - 1
+    }
+    -1
+}
+
+pub fn get_var_result_err(name: Str) -> Int {
+    let mut i = var_result_names.len() - 1
+    while i >= 0 {
+        if var_result_names.get(i) == name {
+            return var_result_err.get(i)
+        }
+        i = i - 1
+    }
+    -1
+}
+
+pub fn emit_option_typedef(inner: Int) {
+    let tag = c_type_tag(inner)
+    let tname = "pact_Option_{tag}"
+    let c_inner = c_type_str(inner)
+    emit_line("typedef struct \{ int tag; {c_inner} value; } {tname};")
+    emit_line("")
+}
+
+pub fn emit_result_typedef(ok_t: Int, err_t: Int) {
+    let ok_tag = c_type_tag(ok_t)
+    let err_tag = c_type_tag(err_t)
+    let tname = "pact_Result_{ok_tag}_{err_tag}"
+    let c_ok = c_type_str(ok_t)
+    let c_err = c_type_str(err_t)
+    emit_line("typedef struct \{ int tag; union \{ {c_ok} ok; {c_err} err; }; } {tname};")
+    emit_line("")
+}
+
+pub fn emit_all_option_result_types() {
+    let mut i = 0
+    while i < emitted_option_types.len() {
+        emit_option_typedef(emitted_option_types.get(i))
+        i = i + 1
+    }
+    i = 0
+    while i < emitted_result_types.len() {
+        let key = emitted_result_types.get(i)
+        let mut sep = 0
+        let mut j = 0
+        while j < key.len() {
+            if key.char_at(j) == 95 {
+                sep = j
+            }
+            j = j + 1
+        }
+        let ok_str = key.substring(0, sep)
+        let err_str = key.substring(sep + 1, key.len() - sep - 1)
+        let mut ok_t = CT_INT
+        let mut err_t = CT_INT
+        if ok_str == "0" { ok_t = CT_INT }
+        else if ok_str == "1" { ok_t = CT_FLOAT }
+        else if ok_str == "2" { ok_t = CT_BOOL }
+        else if ok_str == "3" { ok_t = CT_STRING }
+        else if ok_str == "4" { ok_t = CT_LIST }
+        if err_str == "0" { err_t = CT_INT }
+        else if err_str == "1" { err_t = CT_FLOAT }
+        else if err_str == "2" { err_t = CT_BOOL }
+        else if err_str == "3" { err_t = CT_STRING }
+        else if err_str == "4" { err_t = CT_LIST }
+        emit_result_typedef(ok_t, err_t)
+        i = i + 1
     }
 }
 
@@ -603,6 +953,9 @@ pub fn join_lines() -> Str {
 pub let mut expr_result_str: Str = ""
 pub let mut expr_result_type: Int = 0
 pub let mut expr_closure_sig: Str = ""
+pub let mut expr_option_inner: Int = -1
+pub let mut expr_result_ok_type: Int = -1
+pub let mut expr_result_err_type: Int = -1
 
 pub fn emit_expr(node: Int) {
     let kind = np_kind.get(node)
@@ -636,14 +989,40 @@ pub fn emit_expr(node: Int) {
 
     if kind == NodeKind.Ident {
         let name = np_name.get(node)
+        if name == "None" {
+            ensure_option_type(CT_INT)
+            let opt_type = option_c_type(CT_INT)
+            expr_result_str = "({opt_type})\{.tag = 0}"
+            expr_result_type = CT_OPTION
+            expr_option_inner = CT_INT
+            return
+        }
         let variant_enum = resolve_variant(name)
         if variant_enum != "" {
             expr_result_str = "pact_{variant_enum}_{name}"
             expr_result_type = CT_INT
             return
         }
+        let cap_idx = get_capture_index(name)
+        if cap_idx >= 0 {
+            expr_result_str = capture_cast_expr(cap_idx)
+            expr_result_type = closure_capture_types.get(cg_closure_cap_start + cap_idx)
+            return
+        }
+        if is_mut_captured(name) != 0 {
+            expr_result_str = "(*{name}_cell)"
+            expr_result_type = get_var_type(name)
+            return
+        }
         expr_result_str = name
         expr_result_type = get_var_type(name)
+        if expr_result_type == CT_OPTION {
+            expr_option_inner = get_var_option_inner(name)
+        }
+        if expr_result_type == CT_RESULT {
+            expr_result_ok_type = get_var_result_ok(name)
+            expr_result_err_type = get_var_result_err(name)
+        }
         return
     }
 
@@ -769,13 +1148,32 @@ pub fn emit_expr(node: Int) {
 }
 
 pub fn emit_binop(node: Int) {
+    let op = np_op.get(node)
+    if op == "??" {
+        emit_expr(np_left.get(node))
+        let left_str = expr_result_str
+        let left_type = expr_result_type
+        let opt_inner = expr_option_inner
+        emit_expr(np_right.get(node))
+        let right_str = expr_result_str
+        let right_type = expr_result_type
+        let tmp = fresh_temp("__opt")
+        if opt_inner >= 0 {
+            let opt_c = option_c_type(opt_inner)
+            emit_line("{opt_c} {tmp} = {left_str};")
+        } else {
+            emit_line("const int64_t {tmp} = (int64_t){left_str};")
+        }
+        expr_result_str = "({tmp}.tag == 1 ? {tmp}.value : {right_str})"
+        expr_result_type = right_type
+        return
+    }
     emit_expr(np_left.get(node))
     let left_str = expr_result_str
     let left_type = expr_result_type
     emit_expr(np_right.get(node))
     let right_str = expr_result_str
     let right_type = expr_result_type
-    let op = np_op.get(node)
 
     if op == "==" && left_type == CT_STRING && right_type == CT_STRING {
         expr_result_str = "pact_str_eq({left_str}, {right_str})"
@@ -812,6 +1210,21 @@ pub fn emit_unaryop(node: Int) {
     } else if op == "!" {
         expr_result_str = "(!{operand_str})"
         expr_result_type = CT_BOOL
+    } else if op == "?" {
+        let tmp = fresh_temp("__res")
+        if operand_type == CT_RESULT {
+            let rok = expr_result_ok_type
+            let rerr = expr_result_err_type
+            let res_c = result_c_type(rok, rerr)
+            emit_line("{res_c} {tmp} = {operand_str};")
+            emit_line("if ({tmp}.tag == 1) return ({res_c})\{.tag = 1, .err = {tmp}.err};")
+            expr_result_str = "{tmp}.ok"
+            expr_result_type = rok
+        } else {
+            emit_line("int64_t {tmp} = (int64_t){operand_str};")
+            expr_result_str = "{tmp}"
+            expr_result_type = operand_type
+        }
     } else {
         expr_result_str = "({op}{operand_str})"
         expr_result_type = operand_type
@@ -823,17 +1236,61 @@ pub fn emit_call(node: Int) {
     let func_kind = np_kind.get(func_node)
     if func_kind == NodeKind.Ident {
         let fn_name = np_name.get(func_node)
+        if fn_name == "Some" {
+            let args_sl = np_args.get(node)
+            if args_sl != -1 && sublist_length(args_sl) > 0 {
+                emit_expr(sublist_get(args_sl, 0))
+                let inner_str = expr_result_str
+                let inner_type = expr_result_type
+                ensure_option_type(inner_type)
+                let opt_type = option_c_type(inner_type)
+                expr_result_str = "({opt_type})\{.tag = 1, .value = {inner_str}}"
+                expr_result_type = CT_OPTION
+                expr_option_inner = inner_type
+                return
+            }
+        }
+        if fn_name == "Ok" {
+            let args_sl = np_args.get(node)
+            if args_sl != -1 && sublist_length(args_sl) > 0 {
+                emit_expr(sublist_get(args_sl, 0))
+                let ok_str = expr_result_str
+                let ok_type = expr_result_type
+                let err_type = CT_STRING
+                ensure_result_type(ok_type, err_type)
+                let res_type = result_c_type(ok_type, err_type)
+                expr_result_str = "({res_type})\{.tag = 0, .ok = {ok_str}}"
+                expr_result_type = CT_RESULT
+                expr_result_ok_type = ok_type
+                expr_result_err_type = err_type
+                return
+            }
+        }
+        if fn_name == "Err" {
+            let args_sl = np_args.get(node)
+            if args_sl != -1 && sublist_length(args_sl) > 0 {
+                emit_expr(sublist_get(args_sl, 0))
+                let err_str = expr_result_str
+                let err_type = expr_result_type
+                let ok_type = CT_INT
+                ensure_result_type(ok_type, err_type)
+                let res_type = result_c_type(ok_type, err_type)
+                expr_result_str = "({res_type})\{.tag = 1, .err = {err_str}}"
+                expr_result_type = CT_RESULT
+                expr_result_ok_type = ok_type
+                expr_result_err_type = err_type
+                return
+            }
+        }
         // Check if this is a closure-typed variable
         let closure_sig = get_var_closure_sig(fn_name)
         if closure_sig != "" {
             let args_sl = np_args.get(node)
-            let mut args_str = ""
+            let mut args_str = fn_name
             if args_sl != -1 {
                 let mut i = 0
                 while i < sublist_length(args_sl) {
-                    if i > 0 {
-                        args_str = args_str.concat(", ")
-                    }
+                    args_str = args_str.concat(", ")
                     emit_expr(sublist_get(args_sl, i))
                     args_str = args_str.concat(expr_result_str)
                     i = i + 1
@@ -874,6 +1331,7 @@ pub fn emit_call(node: Int) {
                 i = i + 1
             }
         }
+        check_effect_propagation(fn_name)
         // Check for generic function call
         if is_generic_fn(fn_name) != 0 {
             let gfn_node = get_generic_fn_node(fn_name)
@@ -1035,6 +1493,50 @@ pub fn emit_method_call(node: Int) {
     emit_expr(obj_node)
     let obj_str = expr_result_str
     let obj_type = expr_result_type
+
+    // .into() dispatch — infer target type from assignment context
+    if method == "into" {
+        let target = cg_let_target_type
+        if target == CT_FLOAT && obj_type == CT_INT {
+            expr_result_str = "(double){obj_str}"
+            expr_result_type = CT_FLOAT
+            return
+        }
+        if target == CT_INT && obj_type == CT_FLOAT {
+            expr_result_str = "(int64_t){obj_str}"
+            expr_result_type = CT_INT
+            return
+        }
+        if target == CT_STRING && obj_type == CT_INT {
+            expr_result_str = "pact_int_to_str({obj_str})"
+            expr_result_type = CT_STRING
+            return
+        }
+        if target == CT_STRING && obj_type == CT_FLOAT {
+            expr_result_str = "pact_float_to_str({obj_str})"
+            expr_result_type = CT_STRING
+            return
+        }
+        let mut src_name = type_name_from_ct(obj_type)
+        let src_struct = get_var_struct(obj_str)
+        if src_struct != "" {
+            src_name = src_struct
+        }
+        let tgt_name = type_name_from_ct(target)
+        let from_methods = find_from_impl(src_name, tgt_name)
+        if from_methods != -1 && sublist_length(from_methods) > 0 {
+            let from_fn = sublist_get(from_methods, 0)
+            let from_name = np_name.get(from_fn)
+            let mangled = "{tgt_name}_{from_name}"
+            expr_result_str = "pact_{mangled}({obj_str})"
+            expr_result_type = target
+            return
+        }
+        emit_line("/* into() conversion not found */")
+        expr_result_str = obj_str
+        expr_result_type = obj_type
+        return
+    }
 
     // String methods
     if obj_type == CT_STRING {
@@ -1677,6 +2179,29 @@ pub fn collect_free_vars(node: Int, params: List[Str], locals: List[Str], result
         collect_free_vars(np_end.get(node), params, locals, result)
         return
     }
+
+    if kind == NodeKind.WithBlock {
+        let wh_sl = np_handlers.get(node)
+        if wh_sl != -1 {
+            let mut hi = 0
+            while hi < sublist_length(wh_sl) {
+                let hitem = sublist_get(wh_sl, hi)
+                if np_kind.get(hitem) == NodeKind.WithResource {
+                    collect_free_vars(np_value.get(hitem), params, locals, result)
+                } else {
+                    collect_free_vars(hitem, params, locals, result)
+                }
+                hi = hi + 1
+            }
+        }
+        collect_free_vars_block(np_body.get(node), params, locals, result)
+        return
+    }
+
+    if kind == NodeKind.WithResource {
+        collect_free_vars(np_value.get(node), params, locals, result)
+        return
+    }
 }
 
 pub fn collect_free_vars_block(block: Int, params: List[Str], locals: List[Str], result: List[Str]) {
@@ -1733,20 +2258,26 @@ pub fn emit_closure(node: Int) {
         closure_capture_names.push(captures.get(cap_i))
         cap_i = cap_i + 1
     }
+    cap_i = 0
+    while cap_i < captures.len() {
+        let cname_lookup = closure_capture_names.get(cap_start + cap_i)
+        let cap_ct = get_var_type(cname_lookup)
+        closure_capture_types.push(cap_ct)
+        cap_i = cap_i + 1
+    }
     closure_capture_starts.push(cap_start)
     closure_capture_counts.push(captures.len())
 
-    let mut params_c = "void"
+    // Build C parameter list: __self first if captures, then user params
+    let has_caps = captures.len() > 0
+    let mut params_c = "pact_closure* __self"
     if params_sl != -1 && sublist_length(params_sl) > 0 {
-        params_c = ""
         let mut i = 0
         while i < sublist_length(params_sl) {
             let p = sublist_get(params_sl, i)
             let pname = np_name.get(p)
             let ptype = np_type_name.get(p)
-            if i > 0 {
-                params_c = params_c.concat(", ")
-            }
+            params_c = params_c.concat(", ")
             if ptype == "Fn" {
                 params_c = params_c.concat("pact_closure* {pname}")
             } else if is_enum_type(ptype) != 0 {
@@ -1764,9 +2295,13 @@ pub fn emit_closure(node: Int) {
     let saved_lines = cg_lines
     let saved_indent = cg_indent
     let saved_temp = cg_temp_counter
+    let saved_cap_start = cg_closure_cap_start
+    let saved_cap_count = cg_closure_cap_count
     cg_lines = []
     cg_indent = 0
     cg_temp_counter = 0
+    cg_closure_cap_start = cap_start
+    cg_closure_cap_count = captures.len()
 
     push_scope()
     if params_sl != -1 {
@@ -1809,6 +2344,8 @@ pub fn emit_closure(node: Int) {
     cg_lines = saved_lines
     cg_indent = saved_indent
     cg_temp_counter = saved_temp
+    cg_closure_cap_start = saved_cap_start
+    cg_closure_cap_count = saved_cap_count
 
     let mut ci = 0
     while ci < closure_lines.len() {
@@ -1817,16 +2354,13 @@ pub fn emit_closure(node: Int) {
     }
 
     // Build C function pointer signature for closure calls
-    let mut sig_params = "void"
+    let mut sig_params = "pact_closure*"
     if params_sl != -1 && sublist_length(params_sl) > 0 {
-        sig_params = ""
         let mut si = 0
         while si < sublist_length(params_sl) {
             let sp = sublist_get(params_sl, si)
             let sptype = np_type_name.get(sp)
-            if si > 0 {
-                sig_params = sig_params.concat(", ")
-            }
+            sig_params = sig_params.concat(", ")
             if sptype == "Fn" {
                 sig_params = sig_params.concat("pact_closure*")
             } else if is_enum_type(sptype) != 0 {
@@ -1841,7 +2375,29 @@ pub fn emit_closure(node: Int) {
     }
     expr_closure_sig = "{c_type_str(ret_type)}(*)({sig_params})"
 
-    expr_result_str = "pact_closure_new((void*){cname}, NULL, 0)"
+    // Build captures array if needed
+    if captures.len() > 0 {
+        let caps_var = "__caps_{closure_idx}"
+        emit_line("void** {caps_var} = (void**)pact_alloc(sizeof(void*) * {captures.len()});")
+        let mut ci2 = 0
+        while ci2 < captures.len() {
+            let cap_name = closure_capture_names.get(cap_start + ci2)
+            let cap_type = closure_capture_types.get(cap_start + ci2)
+            if cap_type == CT_INT {
+                emit_line("{caps_var}[{ci2}] = (void*)(intptr_t){cap_name};")
+            } else if cap_type == CT_FLOAT {
+                emit_line("\{double* __fp_{closure_idx}_{ci2} = (double*)pact_alloc(sizeof(double)); *__fp_{closure_idx}_{ci2} = {cap_name}; {caps_var}[{ci2}] = (void*)__fp_{closure_idx}_{ci2};}")
+            } else if cap_type == CT_BOOL {
+                emit_line("{caps_var}[{ci2}] = (void*)(intptr_t){cap_name};")
+            } else {
+                emit_line("{caps_var}[{ci2}] = (void*){cap_name};")
+            }
+            ci2 = ci2 + 1
+        }
+        expr_result_str = "pact_closure_new((void*){cname}, {caps_var}, {captures.len()})"
+    } else {
+        expr_result_str = "pact_closure_new((void*){cname}, NULL, 0)"
+    }
     expr_result_type = CT_CLOSURE
 }
 
@@ -2489,6 +3045,11 @@ pub fn emit_stmt(node: Int) {
         return
     }
 
+    if kind == NodeKind.WithBlock {
+        emit_with_block(node)
+        return
+    }
+
     // Fallback: treat as expression
     emit_expr(node)
     let s = expr_result_str
@@ -2524,7 +3085,14 @@ pub fn emit_let_binding(node: Int) {
             enum_type = ann_name
         }
     }
+    let saved_let_target = cg_let_target_type
+    if type_ann != -1 {
+        cg_let_target_type = type_from_name(np_name.get(type_ann))
+    } else {
+        cg_let_target_type = 0
+    }
     emit_expr(val_node)
+    cg_let_target_type = saved_let_target
     let val_str = expr_result_str
     let val_type = expr_result_type
     let name = np_name.get(node)
@@ -2536,6 +3104,12 @@ pub fn emit_let_binding(node: Int) {
     }
     if val_type == CT_CLOSURE {
         set_var_closure(name, expr_closure_sig)
+    }
+    if val_type == CT_OPTION {
+        set_var_option(name, expr_option_inner)
+    }
+    if val_type == CT_RESULT {
+        set_var_result(name, expr_result_ok_type, expr_result_err_type)
     }
     if np_kind.get(val_node) == NodeKind.StructLit {
         let expr_struct = get_var_struct(val_str)
@@ -2570,7 +3144,24 @@ pub fn emit_let_binding(node: Int) {
         }
     }
     let struct_type = get_var_struct(name)
-    if enum_type != "" {
+    if val_type == CT_OPTION {
+        let opt_inner = get_var_option_inner(name)
+        let opt_c = option_c_type(opt_inner)
+        if is_mut != 0 {
+            emit_line("{opt_c} {name} = {val_str};")
+        } else {
+            emit_line("const {opt_c} {name} = {val_str};")
+        }
+    } else if val_type == CT_RESULT {
+        let rok = get_var_result_ok(name)
+        let rerr = get_var_result_err(name)
+        let res_c = result_c_type(rok, rerr)
+        if is_mut != 0 {
+            emit_line("{res_c} {name} = {val_str};")
+        } else {
+            emit_line("const {res_c} {name} = {val_str};")
+        }
+    } else if enum_type != "" {
         if is_mut != 0 {
             emit_line("pact_{enum_type} {name} = {val_str};")
         } else {
@@ -2699,6 +3290,56 @@ pub fn emit_block(block: Int) {
     }
 }
 
+// __ With-block codegen __
+
+pub fn emit_with_block(node: Int) {
+    let handlers_sl = np_handlers.get(node)
+    let body = np_body.get(node)
+    if handlers_sl == -1 {
+        emit_block(body)
+        return
+    }
+    let count = sublist_length(handlers_sl)
+    let mut resource_names: List[Str] = []
+    let mut resource_vars: List[Str] = []
+    emit_line("\{")
+    cg_indent = cg_indent + 1
+    let mut i = 0
+    while i < count {
+        let item = sublist_get(handlers_sl, i)
+        let item_kind = np_kind.get(item)
+        if item_kind == NodeKind.WithResource {
+            let binding = np_name.get(item)
+            let res_expr = np_value.get(item)
+            emit_expr(res_expr)
+            let res_str = expr_result_str
+            let tmp = fresh_temp("_wr_")
+            emit_line("int64_t {tmp} = {res_str};")
+            emitted_let_names.push(binding)
+            emit_line("int64_t {binding} = {tmp};")
+            resource_names.push(binding)
+            resource_vars.push(tmp)
+        } else {
+            emit_expr(item)
+            let handler_str = expr_result_str
+            if handler_str != "" {
+                emit_line("{handler_str};")
+            }
+        }
+        i = i + 1
+    }
+    emit_block(body)
+    let mut ri = resource_names.len() - 1
+    while ri >= 0 {
+        let rname = resource_names.get(ri)
+        emit_line("// close resource: {rname}")
+        emit_line("/* {rname}.close() -- Closeable trait call */")
+        ri = ri - 1
+    }
+    cg_indent = cg_indent - 1
+    emit_line("}")
+}
+
 // ── Function codegen ────────────────────────────────────────────────
 
 pub fn format_params(fn_node: Int) -> Str {
@@ -2782,6 +3423,7 @@ pub fn emit_impl_method_def(fn_node: Int, impl_type: Str) {
     cg_temp_counter = 0
     let mname = np_name.get(fn_node)
     let mangled = "{impl_type}_{mname}"
+    cg_current_fn_name = mangled
     let ret_str_raw = np_return_type.get(fn_node)
     let ret_str = resolve_self_type(ret_str_raw, impl_type)
     let ret_type = type_from_name(ret_str)
@@ -2866,6 +3508,7 @@ pub fn emit_fn_def(fn_node: Int) {
     push_scope()
     cg_temp_counter = 0
     let name = np_name.get(fn_node)
+    cg_current_fn_name = name
     let ret_str = np_return_type.get(fn_node)
     let ret_type = type_from_name(ret_str)
     let mut sig = ""
@@ -3341,6 +3984,10 @@ pub fn generate(program: Int) -> Str {
     scope_frame_starts = []
     fn_reg_names = []
     fn_reg_ret = []
+    fn_reg_effect_sl = []
+    effect_reg_names = []
+    effect_reg_parent = []
+    cg_current_fn_name = ""
     cg_global_inits = []
     var_list_elem_names = []
     var_list_elem_types = []
@@ -3379,6 +4026,14 @@ pub fn generate(program: Int) -> Str {
     generic_fn_nodes = []
     mono_fn_bases = []
     mono_fn_args = []
+    var_option_names = []
+    var_option_inner = []
+    var_result_names = []
+    var_result_ok = []
+    var_result_err = []
+    emitted_option_types = []
+    emitted_result_types = []
+    cg_let_target_type = 0
 
     push_scope()
 
@@ -3405,6 +4060,30 @@ pub fn generate(program: Int) -> Str {
     sf_reg_field.push("target_type")
     sf_reg_type.push(CT_STRING)
     sf_reg_stype.push("")
+
+    init_builtin_effects()
+
+    // Register user-defined effect declarations
+    let effects_decl_sl = np_args.get(program)
+    if effects_decl_sl != -1 {
+        let mut ei = 0
+        while ei < sublist_length(effects_decl_sl) {
+            let ed = sublist_get(effects_decl_sl, ei)
+            let eff_name = np_name.get(ed)
+            let parent_idx = reg_effect(eff_name, -1)
+            let children_sl = np_elements.get(ed)
+            if children_sl != -1 {
+                let mut ci = 0
+                while ci < sublist_length(children_sl) {
+                    let child = sublist_get(children_sl, ci)
+                    let child_name = np_name.get(child)
+                    reg_effect("{eff_name}.{child_name}", parent_idx)
+                    ci = ci + 1
+                }
+            }
+            ei = ei + 1
+        }
+    }
 
     // Preamble: include runtime
     cg_lines.push("#include \"runtime.h\"")
@@ -3481,12 +4160,13 @@ pub fn generate(program: Int) -> Str {
                 generic_fn_nodes.push(fn_node)
             } else if is_emitted_fn(fn_name) == 0 {
                 let ret_str = np_return_type.get(fn_node)
+                let fn_eff_sl = np_effects.get(fn_node)
                 if is_enum_type(ret_str) != 0 {
                     fn_enum_ret_names.push(fn_name)
                     fn_enum_ret_types.push(ret_str)
-                    reg_fn(fn_name, CT_INT)
+                    reg_fn_with_effects(fn_name, CT_INT, fn_eff_sl)
                 } else {
-                    reg_fn(fn_name, type_from_name(ret_str))
+                    reg_fn_with_effects(fn_name, type_from_name(ret_str), fn_eff_sl)
                 }
                 emitted_fn_names.push(fn_name)
             }
@@ -3657,6 +4337,9 @@ pub fn generate(program: Int) -> Str {
 
     // Emit monomorphized type definitions discovered during function emission
     emit_all_mono_typedefs()
+
+    // Emit Option/Result type definitions discovered during codegen
+    emit_all_option_result_types()
 
     // Emit monomorphized function definitions
     emit_all_mono_fns()

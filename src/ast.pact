@@ -13,7 +13,7 @@ pub type NodeKind {
     WhileLoop, LoopExpr, Break, Continue, Block, FnDef, Param, Program,
     TypeDef, TypeField, TypeVariant, TraitDef, ImplBlock, TestBlock, IntPattern, WildcardPattern,
     IdentPattern, TuplePattern, StringPattern, OrPattern, RangePattern, StructPattern, EnumPattern, AsPattern,
-    MatchArm, StructLitField, WithBlock, HandlerExpr, Annotation, ModBlock, ImportStmt, TypeAnn,
+    MatchArm, StructLitField, WithBlock, WithResource, HandlerExpr, Annotation, ModBlock, ImportStmt, TypeAnn,
     TypeParam, EffectDecl,
 }
 
@@ -194,6 +194,7 @@ pub fn node_kind_name(kind: Int) -> Str {
         NodeKind.MatchArm => "MatchArm"
         NodeKind.StructLitField => "StructLitField"
         NodeKind.WithBlock => "WithBlock"
+        NodeKind.WithResource => "WithResource"
         NodeKind.HandlerExpr => "HandlerExpr"
         NodeKind.Annotation => "Annotation"
         NodeKind.ModBlock => "ModBlock"
