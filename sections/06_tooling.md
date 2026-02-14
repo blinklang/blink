@@ -434,10 +434,10 @@ The formatter runs in the compiler daemon, so it shares the parser. Formatting i
 ### 8.9 Built-in Package Manager
 
 ```sh
-pact add serde          # add a dependency
-pact remove serde       # remove a dependency
-pact update             # update all deps within constraints
-pact update serde       # update one dependency
+pact add std/serde       # add a dependency
+pact remove std/serde    # remove a dependency
+pact update              # update all deps within constraints
+pact update std/serde    # update one dependency
 ```
 
 One package manager. Mandatory lockfile. Content-addressed storage. Deterministic resolution.
@@ -446,21 +446,140 @@ There is no `pact.lock` vs `package-lock.json` vs `yarn.lock` decision. There is
 
 The lockfile (`pact.lock`) is always committed to version control. Builds without a lockfile are an error — not a warning, an error. Reproducible builds are not optional.
 
+The package manager is integrated with the compiler daemon. When you run `pact add`, the daemon immediately re-checks the dependency graph and reports any type conflicts with the new dependency. You find out about incompatibilities at add time, not at build time.
+
+#### 8.9.1 Registry Model
+
+Pact uses a **hybrid registry model**: a central registry for short-name resolution with git URL fallback for unregistered packages.
+
+- **Central registry** — the default source. `pact add std/http` resolves to the registry.
+- **Git URL fallback** — for unregistered or private packages. `pact add git:https://github.com/org/pkg.git`.
+- **Path dependencies** — for local development. `path = "../my-lib"` in `pact.toml`.
+
+**Identity invariant:** A registered package has exactly one identity regardless of how it is accessed. If `std/http` is registered, `git:https://github.com/pact-lang/http.git` resolves to the same package. The registry is the canonical source of truth; git URLs are aliases, not separate packages.
+
+#### 8.9.2 Package Naming
+
+Packages use **namespaced `org/name` format**:
+
+- `std/http` — standard library HTTP package
+- `acme/web-framework` — organization-scoped package
+- Names are lowercase, alphanumeric plus hyphens. Org names follow the same rules.
+
+Namespacing maps directly to trust boundaries. A package's org determines its capability audit scope — `std/` packages are trusted differently than `acme/` packages. This enables per-org capability policies in CI (§4.9).
+
+#### 8.9.3 `pact.toml` Full Schema
+
 ```toml
-# pact.toml — project manifest
+[package]
+name = "acme/myapp"          # org/name format (required)
+version = "0.1.0"            # semver (required)
+edition = "2026"             # language edition (optional, default: latest)
+description = "My app"       # human-readable (optional)
+license = "MIT"              # SPDX identifier (optional)
+repository = "https://..."   # source URL (optional)
+
+[dependencies]
+std/http = "1.2"                                        # registry, caret constraint
+std/json = "~1.0"                                       # registry, tilde constraint
+acme/auth = { version = "0.5", features = ["oauth"] }   # registry with features
+internal/lib = { git = "https://github.com/org/lib.git", tag = "v1.0" }  # git dep
+local/utils = { path = "../utils" }                      # path dep
+
+[dev-dependencies]
+std/bench = "0.3"
+
+[capabilities]
+required = ["Net.Connect", "Net.DNS"]         # always needed
+optional = ["IO.Log"]                         # only if caller provides handler
+
+[alternatives]                                # §4.10 alt-effect registrations
+Net.Connect = "mock-http"                     # test alternative
+```
+
+**Dependency source table:** Each dependency specifies exactly one source — `version` (registry), `git`, or `path`. Combining sources is an error.
+
+#### 8.9.4 Version Constraints
+
+| Syntax | Meaning | Example |
+|--------|---------|---------|
+| `"1.2"` | Caret (default): `>=1.2.0, <2.0.0` | Compatible updates within major |
+| `"~1.2"` | Tilde: `>=1.2.0, <1.3.0` | Patch-level updates only |
+| `"=1.2.3"` | Exact: only `1.2.3` | Pinned version |
+| `">=1.0, <2.0"` | Explicit range | Manual bounds |
+
+**Caret is the default** because it expresses the semver contract directly: "any compatible version." Most dependencies should use bare `"1.2"`.
+
+**Pre-1.0 rule:** For versions `0.x.y`, the minor version is treated as breaking. `"0.2"` means `>=0.2.0, <0.3.0`. This matches the convention that pre-1.0 packages break APIs on minor bumps.
+
+#### 8.9.5 Resolution Algorithm
+
+Pact uses **Minimal Version Selection (MVS)**:
+
+- Given a set of version constraints, MVS selects the **oldest version** that satisfies all constraints.
+- Resolution is **deterministic without a lockfile**. The same `pact.toml` always resolves to the same versions, regardless of what versions exist on the registry at resolution time.
+- There is **no SAT solver**. MVS resolution is a simple graph walk — O(n) in the dependency graph size. It cannot fail due to solver timeouts or heuristic differences.
+
+**Why oldest, not newest:** Newest-version resolution is non-deterministic — it depends on what versions are published at resolution time. Two developers resolving on different days get different versions. MVS eliminates this: the resolved version depends only on what the dependency *declared*, not on what exists.
+
+`pact update` explicitly upgrades dependencies to the newest version satisfying constraints. This is the only operation that changes resolved versions — it is intentional, not incidental.
+
+`pact update std/http` upgrades one dependency. `pact update` upgrades all. Both update the lockfile.
+
+#### 8.9.6 `pact.lock` Schema
+
+```toml
+[metadata]
+lockfile-version = 1
+pact-version = "0.1.0"
+generated = "2026-01-15T10:30:00Z"
+
+[[package]]
+name = "std/http"
+version = "1.2.0"
+source = "registry"
+hash = "sha256:abc123..."
+capabilities = ["Net.Connect", "Net.DNS"]
+
+[[package]]
+name = "std/json"
+version = "1.0.3"
+source = "registry"
+hash = "sha256:def456..."
+capabilities = []
+
+[[package]]
+name = "internal/lib"
+version = "1.0.0"
+source = "git:https://github.com/org/lib.git#a1b2c3d"
+hash = "sha256:789ghi..."
+capabilities = ["FS.Read"]
+```
+
+Git dependencies are **pinned to commit hash** in the lockfile, ensuring reproducibility even if tags or branches move.
+
+The `hash` field is the content hash of the package source. The package manager verifies hashes on every build — a tampered dependency is a build error.
+
+Capability declarations in the lockfile enable `pact audit` to detect capability escalation without fetching package source (§4.9).
+
+#### 8.9.7 MVP Scope
+
+v1 ships with **path and git dependencies only**. No registry infrastructure is required for the initial release.
+
+```toml
+# v1 pact.toml — no registry deps
 [package]
 name = "myapp"
 version = "0.1.0"
 
 [dependencies]
-serde = "1.2"
-http = "0.5"
-
-[dev-dependencies]
-bench = "0.3"
+my-lib = { path = "../my-lib" }
+external = { git = "https://github.com/org/pkg.git", tag = "v0.1" }
 ```
 
-The package manager is integrated with the compiler daemon. When you run `pact add`, the daemon immediately re-checks the dependency graph and reports any type conflicts with the new dependency. You find out about incompatibilities at add time, not at build time.
+The `pact.toml` schema is **forward-compatible**: adding `version = "1.0"` registry deps in v2 requires no schema changes. The registry is an additional source, not a replacement.
+
+Import paths follow the `org/name` structure: `import std.http` maps to the `std/http` package. Local modules shadow dependencies with the same path, with compiler warning W1000 (§10.5).
 
 ---
 

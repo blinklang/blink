@@ -751,7 +751,7 @@ Every published package declares its maximum capabilities in its manifest file:
 ```toml
 # pact.toml
 [package]
-name = "http-client"
+name = "std/http-client"
 version = "2.1.0"
 
 [capabilities]
@@ -765,19 +765,19 @@ Capabilities flow through the dependency graph and are recorded in the lockfile:
 # pact.lock (auto-generated, checked into version control)
 
 [[package]]
-name = "http-client"
+name = "std/http-client"
 version = "2.1.0"
 hash = "sha256:abc123..."
 capabilities = ["Net.Connect", "Net.DNS"]
 
 [[package]]
-name = "json-parser"
+name = "std/json-parser"
 version = "1.0.3"
 hash = "sha256:def456..."
 capabilities = []  # pure package -- no effects
 
 [[package]]
-name = "orm-toolkit"
+name = "std/orm-toolkit"
 version = "3.4.0"
 hash = "sha256:789ghi..."
 capabilities = ["DB.Read", "DB.Write"]
@@ -789,7 +789,7 @@ When a package version bump introduces new capabilities, the lockfile diff shows
 
 ```diff
  [[package]]
- name = "http-client"
+ name = "std/http-client"
 -version = "2.1.0"
 +version = "2.2.0"
 -capabilities = ["Net.Connect", "Net.DNS"]
@@ -801,11 +801,11 @@ When a package version bump introduces new capabilities, the lockfile diff shows
 ```
 warning: capability escalation detected
 
-  http-client 2.1.0 -> 2.2.0
+  std/http-client 2.1.0 -> 2.2.0
     + FS.Write (NEW)
 
   This package previously had no filesystem access.
-  Run `pact update --accept-escalation http-client` to approve.
+  Run `pact update --accept-escalation std/http-client` to approve.
 ```
 
 This is the supply-chain security story. A JSON parser declaring `capabilities = []` that suddenly requests `Net.Connect` in a patch release is immediately visible. The lockfile is the audit trail. CI can enforce `pact audit --no-escalation` to block builds where capability budgets have grown without explicit approval.

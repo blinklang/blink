@@ -47,14 +47,19 @@ fn resolve_module_path(dotted_path: Str, src_root: Str) -> Str {
     if file_exists(full) == 1 {
         return full
     }
+    if dotted_path.starts_with("std.") {
+        let compiler_dir = path_dirname(get_arg(0))
+        let std_rel = dots_to_slashes(dotted_path.substring(4, dotted_path.len() - 4))
+        let std_full = path_join(compiler_dir, path_join("lib/std", std_rel.concat(".pact")))
+        if file_exists(std_full) == 1 {
+            return std_full
+        }
+    }
     diag_error_no_loc("ModuleNotFound", "E1200", "module not found: {dotted_path} (looked at: {full})", "")
     ""
 }
 
 fn should_import_item(item: Int, import_node: Int) -> Int {
-    if np_is_pub.get(item) != 1 {
-        return 0
-    }
     let names_sl = np_args.get(import_node)
     if names_sl == -1 {
         return 1

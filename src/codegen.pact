@@ -20,74 +20,42 @@ pub fn generate(program: Int) -> Str {
     cg_lines = []
     cg_indent = 0
     cg_temp_counter = 0
-    scope_names = []
-    scope_types = []
-    scope_muts = []
+    scope_vars = []
     scope_frame_starts = []
-    fn_reg_names = []
-    fn_reg_ret = []
-    fn_reg_effect_sl = []
-    fn_ret_result_names = []
-    fn_ret_result_ok = []
-    fn_ret_result_err = []
-    fn_ret_option_names = []
-    fn_ret_option_inner = []
-    fn_ret_list_names = []
-    fn_ret_list_elem = []
-    effect_reg_names = []
-    effect_reg_parent = []
+    fn_regs = []
+    fn_ret_structs = []
+    fn_ret_types = []
+    effect_entries = []
     cg_current_fn_name = ""
     cg_current_fn_ret = 0
     cg_global_inits = []
-    var_list_elem_names = []
-    var_list_elem_types = []
+    var_list_elems = []
+    var_list_elem_frame_starts = []
     struct_reg_names = []
-    enum_reg_names = []
-    enum_reg_variant_names = []
-    enum_reg_variant_enum_idx = []
-    var_enum_names = []
-    var_enum_types = []
-    enum_has_data = []
-    enum_variant_field_names = []
-    enum_variant_field_types = []
-    enum_variant_field_counts = []
-    fn_enum_ret_names = []
-    fn_enum_ret_types = []
+    enum_regs = []
+    enum_variants = []
+    var_enums = []
+    fn_enum_rets = []
     emitted_let_names = []
     emitted_fn_names = []
-    trait_reg_names = []
-    trait_reg_method_sl = []
-    impl_reg_trait = []
-    impl_reg_type = []
-    impl_reg_methods_sl = []
-    from_reg_source = []
-    from_reg_target = []
-    from_reg_method_sl = []
-    tryfrom_reg_source = []
-    tryfrom_reg_target = []
-    tryfrom_reg_method_sl = []
-    var_struct_names = []
-    var_struct_types = []
-    sf_reg_struct = []
-    sf_reg_field = []
-    sf_reg_type = []
-    sf_reg_stype = []
-    mono_base_names = []
-    mono_concrete_args = []
-    mono_c_names = []
+    trait_entries = []
+    impl_entries = []
+    from_entries = []
+    tryfrom_entries = []
+    var_structs = []
+    var_struct_frame_starts = []
+    sf_entries = []
+    mono_instances = []
     cg_closure_defs = []
     cg_closure_counter = 0
-    var_closure_names = []
-    var_closure_sigs = []
-    generic_fn_names = []
-    generic_fn_nodes = []
-    mono_fn_bases = []
-    mono_fn_args = []
-    var_option_names = []
-    var_option_inner = []
-    var_result_names = []
-    var_result_ok = []
-    var_result_err = []
+    var_closures = []
+    var_closure_frame_starts = []
+    generic_fns = []
+    mono_fns = []
+    var_options = []
+    var_option_frame_starts = []
+    var_results = []
+    var_result_frame_starts = []
     emitted_option_types = []
     emitted_result_types = []
     emitted_iter_types = []
@@ -99,16 +67,14 @@ pub fn generate(program: Int) -> Str {
     emitted_skip_iters = []
     emitted_chain_iters = []
     emitted_flat_map_iters = []
-    var_iterator_names = []
-    var_iterator_inner = []
-    var_iter_next_fns = []
-    var_iter_next_names = []
-    var_alias_names = []
-    var_alias_targets = []
-    var_handle_names = []
-    var_handle_inner = []
-    var_channel_names = []
-    var_channel_inner = []
+    var_iterators = []
+    var_iterator_frame_starts = []
+    var_aliases = []
+    var_alias_frame_starts = []
+    var_handles = []
+    var_handle_frame_starts = []
+    var_channels = []
+    var_channel_frame_starts = []
     cg_let_target_type = 0
     cg_let_target_name = ""
     cg_handler_vtable_field = ""
@@ -124,12 +90,8 @@ pub fn generate(program: Int) -> Str {
     cg_async_scope_counter = 0
     cap_budget_names = []
     cap_budget_active = 0
-    ue_reg_names = []
-    ue_reg_handle = []
-    ue_reg_methods = []
-    ue_reg_method_params = []
-    ue_reg_method_rets = []
-    ue_reg_method_effect = []
+    ue_effects = []
+    ue_methods = []
 
     push_scope()
 
@@ -148,25 +110,14 @@ pub fn generate(program: Int) -> Str {
 
     // Register built-in structs
     struct_reg_names.push("ConversionError")
-    sf_reg_struct.push("ConversionError")
-    sf_reg_field.push("message")
-    sf_reg_type.push(CT_STRING)
-    sf_reg_stype.push("")
-    sf_reg_struct.push("ConversionError")
-    sf_reg_field.push("source_type")
-    sf_reg_type.push(CT_STRING)
-    sf_reg_stype.push("")
-    sf_reg_struct.push("ConversionError")
-    sf_reg_field.push("target_type")
-    sf_reg_type.push(CT_STRING)
-    sf_reg_stype.push("")
+    sf_entries.push(StructFieldEntry { struct_name: "ConversionError", field_name: "message", field_type: CT_STRING, stype: "" })
+    sf_entries.push(StructFieldEntry { struct_name: "ConversionError", field_name: "source_type", field_type: CT_STRING, stype: "" })
+    sf_entries.push(StructFieldEntry { struct_name: "ConversionError", field_name: "target_type", field_type: CT_STRING, stype: "" })
 
     init_builtin_effects()
 
-    trait_reg_names.push("Iterator")
-    trait_reg_method_sl.push(-1)
-    trait_reg_names.push("IntoIterator")
-    trait_reg_method_sl.push(-1)
+    trait_entries.push(TraitEntry { name: "Iterator", method_sl: -1 })
+    trait_entries.push(TraitEntry { name: "IntoIterator", method_sl: -1 })
 
     // Register user-defined effect declarations
     let effects_decl_sl = np_args.get(program)
@@ -209,8 +160,7 @@ pub fn generate(program: Int) -> Str {
                 else { handle = handle.concat(eff_name.substring(hi, 1)) }
                 hi = hi + 1
             }
-            ue_reg_names.push(eff_name)
-            ue_reg_handle.push(handle)
+            ue_effects.push(UeEffect { name: eff_name, handle: handle })
             let children_sl = np_elements.get(ed)
             if children_sl != -1 {
                 let mut ci = 0
@@ -265,10 +215,7 @@ pub fn generate(program: Int) -> Str {
                             if op_c_params == "" {
                                 op_c_params = "void"
                             }
-                            ue_reg_methods.push(op_name)
-                            ue_reg_method_params.push(op_c_params)
-                            ue_reg_method_rets.push(op_c_ret)
-                            ue_reg_method_effect.push(handle)
+                            ue_methods.push(UeMethod { name: op_name, params: op_c_params, ret: op_c_ret, effect_handle: handle })
                             oi = oi + 1
                         }
                     }
@@ -310,42 +257,37 @@ pub fn generate(program: Int) -> Str {
 
     // Emit user-defined effect vtable structs and globals
     let mut uei = 0
-    while uei < ue_reg_names.len() {
-        let ue_name = ue_reg_names.get(uei)
-        let ue_handle = ue_reg_handle.get(uei)
-        let vt_type = "pact_ue_{ue_handle}_vtable"
+    while uei < ue_effects.len() {
+        let ue = ue_effects.get(uei)
+        let vt_type = "pact_ue_{ue.handle}_vtable"
         cg_lines.push("typedef struct \{")
         let mut mi = 0
-        while mi < ue_reg_methods.len() {
-            if ue_reg_method_effect.get(mi) == ue_handle {
-                let mname = ue_reg_methods.get(mi)
-                let mret = ue_reg_method_rets.get(mi)
-                let mparams = ue_reg_method_params.get(mi)
-                cg_lines.push("    {mret} (*{mname})({mparams});")
+        while mi < ue_methods.len() {
+            let uem = ue_methods.get(mi)
+            if uem.effect_handle == ue.handle {
+                cg_lines.push("    {uem.ret} (*{uem.name})({uem.params});")
             }
             mi = mi + 1
         }
         cg_lines.push("} {vt_type};")
         cg_lines.push("")
         mi = 0
-        while mi < ue_reg_methods.len() {
-            if ue_reg_method_effect.get(mi) == ue_handle {
-                let mname = ue_reg_methods.get(mi)
-                let mret = ue_reg_method_rets.get(mi)
-                let mparams = ue_reg_method_params.get(mi)
-                let dfn = "pact_ue_{ue_handle}_default_{mname}"
-                if mret == "void" {
-                    cg_lines.push("static void {dfn}({mparams}) \{")
-                    cg_lines.push("    fprintf(stderr, \"pact: {ue_handle}.{mname} not implemented\\n\");")
+        while mi < ue_methods.len() {
+            let uem = ue_methods.get(mi)
+            if uem.effect_handle == ue.handle {
+                let dfn = "pact_ue_{ue.handle}_default_{uem.name}"
+                if uem.ret == "void" {
+                    cg_lines.push("static void {dfn}({uem.params}) \{")
+                    cg_lines.push("    fprintf(stderr, \"pact: {ue.handle}.{uem.name} not implemented\\n\");")
                     cg_lines.push("}")
-                } else if mret == "const char*" {
-                    cg_lines.push("static const char* {dfn}({mparams}) \{")
-                    cg_lines.push("    fprintf(stderr, \"pact: {ue_handle}.{mname} not implemented\\n\");")
+                } else if uem.ret == "const char*" {
+                    cg_lines.push("static const char* {dfn}({uem.params}) \{")
+                    cg_lines.push("    fprintf(stderr, \"pact: {ue.handle}.{uem.name} not implemented\\n\");")
                     cg_lines.push("    return NULL;")
                     cg_lines.push("}")
                 } else {
-                    cg_lines.push("static {mret} {dfn}({mparams}) \{")
-                    cg_lines.push("    fprintf(stderr, \"pact: {ue_handle}.{mname} not implemented\\n\");")
+                    cg_lines.push("static {uem.ret} {dfn}({uem.params}) \{")
+                    cg_lines.push("    fprintf(stderr, \"pact: {ue.handle}.{uem.name} not implemented\\n\");")
                     cg_lines.push("    return 0;")
                     cg_lines.push("}")
                 }
@@ -356,20 +298,20 @@ pub fn generate(program: Int) -> Str {
         cg_lines.push("static {vt_type} {vt_type}_default = \{")
         mi = 0
         let mut first_m = 1
-        while mi < ue_reg_methods.len() {
-            if ue_reg_method_effect.get(mi) == ue_handle {
-                let mname = ue_reg_methods.get(mi)
+        while mi < ue_methods.len() {
+            let uem = ue_methods.get(mi)
+            if uem.effect_handle == ue.handle {
                 if first_m == 0 {
                     cg_lines.push(",")
                 }
-                cg_lines.push("    pact_ue_{ue_handle}_default_{mname}")
+                cg_lines.push("    pact_ue_{ue.handle}_default_{uem.name}")
                 first_m = 0
             }
             mi = mi + 1
         }
         cg_lines.push("};")
         cg_lines.push("")
-        cg_lines.push("static {vt_type}* __pact_ue_{ue_handle} = &{vt_type}_default;")
+        cg_lines.push("static {vt_type}* __pact_ue_{ue.handle} = &{vt_type}_default;")
         cg_lines.push("")
         uei = uei + 1
     }
@@ -441,17 +383,18 @@ pub fn generate(program: Int) -> Str {
             // Track generic functions separately
             let fn_tparams = np_type_params.get(fn_node)
             if fn_tparams != -1 && sublist_length(fn_tparams) > 0 {
-                generic_fn_names.push(fn_name)
-                generic_fn_nodes.push(fn_node)
+                generic_fns.push(GenericFnEntry { name: fn_name, node: fn_node })
             } else if is_emitted_fn(fn_name) == 0 {
                 let ret_str = np_return_type.get(fn_node)
                 let fn_eff_sl = np_effects.get(fn_node)
                 if is_enum_type(ret_str) != 0 {
-                    fn_enum_ret_names.push(fn_name)
-                    fn_enum_ret_types.push(ret_str)
+                    fn_enum_rets.push(FnEnumRetEntry { name: fn_name, enum_type: ret_str })
                     reg_fn_with_effects(fn_name, CT_INT, fn_eff_sl)
                 } else {
                     reg_fn_with_effects(fn_name, type_from_name(ret_str), fn_eff_sl)
+                    if is_struct_type(ret_str) != 0 {
+                        reg_fn_struct_ret(fn_name, ret_str)
+                    }
                 }
                 reg_fn_ret_from_ann(fn_name, fn_node)
                 check_capabilities_budget(fn_name, fn_eff_sl)
@@ -467,8 +410,7 @@ pub fn generate(program: Int) -> Str {
         let mut i = 0
         while i < sublist_length(traits_sl) {
             let tr = sublist_get(traits_sl, i)
-            trait_reg_names.push(np_name.get(tr))
-            trait_reg_method_sl.push(np_methods.get(tr))
+            trait_entries.push(TraitEntry { name: np_name.get(tr), method_sl: np_methods.get(tr) })
             i = i + 1
         }
     }
@@ -481,17 +423,13 @@ pub fn generate(program: Int) -> Str {
             let im = sublist_get(impls_sl, i)
             let impl_trait = np_trait_name.get(im)
             let impl_type = np_name.get(im)
-            impl_reg_trait.push(impl_trait)
-            impl_reg_type.push(impl_type)
-            impl_reg_methods_sl.push(np_methods.get(im))
+            impl_entries.push(ImplEntry { trait_name: impl_trait, type_name: impl_type, methods_sl: np_methods.get(im) })
             if impl_trait == "From" {
                 let trait_tparams = np_type_params.get(im)
                 if trait_tparams != -1 && sublist_length(trait_tparams) > 0 {
                     let src_node = sublist_get(trait_tparams, 0)
                     let src_type = np_name.get(src_node)
-                    from_reg_source.push(src_type)
-                    from_reg_target.push(impl_type)
-                    from_reg_method_sl.push(np_methods.get(im))
+                    from_entries.push(FromImplEntry { source: src_type, target: impl_type, method_sl: np_methods.get(im) })
                 }
             }
             if impl_trait == "TryFrom" {
@@ -499,9 +437,7 @@ pub fn generate(program: Int) -> Str {
                 if trait_tparams != -1 && sublist_length(trait_tparams) > 0 {
                     let src_node = sublist_get(trait_tparams, 0)
                     let src_type = np_name.get(src_node)
-                    tryfrom_reg_source.push(src_type)
-                    tryfrom_reg_target.push(impl_type)
-                    tryfrom_reg_method_sl.push(np_methods.get(im))
+                    tryfrom_entries.push(TryFromImplEntry { source: src_type, target: impl_type, method_sl: np_methods.get(im) })
                 }
             }
             let methods_sl = np_methods.get(im)
@@ -514,11 +450,11 @@ pub fn generate(program: Int) -> Str {
                     let ret_str_raw = np_return_type.get(m)
                     let ret_str = resolve_self_type(ret_str_raw, impl_type)
                     if is_enum_type(ret_str) != 0 {
-                        fn_enum_ret_names.push(mangled)
-                        fn_enum_ret_types.push(ret_str)
+                        fn_enum_rets.push(FnEnumRetEntry { name: mangled, enum_type: ret_str })
                         reg_fn(mangled, CT_INT)
                     } else if is_struct_type(ret_str) != 0 {
                         reg_fn(mangled, CT_VOID)
+                        reg_fn_struct_ret(mangled, ret_str)
                     } else {
                         reg_fn(mangled, type_from_name(ret_str))
                     }
@@ -532,12 +468,9 @@ pub fn generate(program: Int) -> Str {
 
     // Auto-derive Into from From
     let mut into_i = 0
-    while into_i < from_reg_source.len() {
-        let src = from_reg_source.get(into_i)
-        let tgt = from_reg_target.get(into_i)
-        impl_reg_trait.push("Into")
-        impl_reg_type.push(src)
-        impl_reg_methods_sl.push(from_reg_method_sl.get(into_i))
+    while into_i < from_entries.len() {
+        let fe = from_entries.get(into_i)
+        impl_entries.push(ImplEntry { trait_name: "Into", type_name: fe.source, methods_sl: fe.method_sl })
         into_i = into_i + 1
     }
 
@@ -685,8 +618,8 @@ pub fn generate(program: Int) -> Str {
     let mut test_tag_counts: List[Int] = []
     let pre_test_lines = cg_lines
     let pre_test_closure_count = cg_closure_defs.len()
-    let pre_test_mono_td_count = mono_base_names.len()
-    let pre_test_mono_fn_count = mono_fn_bases.len()
+    let pre_test_mono_td_count = mono_instances.len()
+    let pre_test_mono_fn_count = mono_fns.len()
     let pre_test_option_count = emitted_option_types.len()
     let pre_test_result_count = emitted_result_types.len()
     let pre_test_iter_count = emitted_iter_types.len()

@@ -720,11 +720,11 @@ import db.connection        // resolves to src/db/connection.pact
 **External dependencies** (from `pact.lock`):
 
 ```pact
-import pact.http            // dependency declared in pact.toml
-import pact.json.{parse}    // specific item from dependency
+import std.http            // stdlib or dependency declared in pact.toml
+import std.json.{parse}    // specific item from dependency
 ```
 
-External packages are namespaced by their package name as declared in `pact.toml`. The compiler resolves them from the lockfile's content-addressed store. The resolution order:
+External packages are namespaced by their registry org/name (§8.9.2, §8.9.7). The `std/http` package is imported as `std.http`. The compiler resolves them from the lockfile's content-addressed store (or from the bundled stdlib for implicit deps — see §10.7). The resolution order:
 
 1. Check local `src/` for a matching path
 2. Check dependencies declared in `pact.toml` (resolved via `pact.lock`)
@@ -991,6 +991,106 @@ warning[W1010]: name shadows prelude type
 ```
 
 Keywords (`true`, `false`, `fn`, etc.) cannot be shadowed — they are reserved by the parser.
+
+### 10.7 Standard Library Resolution
+
+The standard library is a set of packages that ship with the Pact compiler. They are available to every Pact program without explicit declaration in `pact.toml`. The compiler treats them as **implicit dependencies** — they participate in the same resolution algorithm as explicit deps (§10.5), with no special resolution step.
+
+#### Stdlib as Implicit Dependencies
+
+Tier 1 stdlib packages (§8.1, OPEN_QUESTIONS §2.2) are injected into the dependency graph as if the user had declared them in `pact.toml`. They are pinned to the compiler version and cannot be overridden.
+
+Conceptually, the compiler prepends these implicit entries before resolving dependencies:
+
+```toml
+# Implicit — injected by compiler, not written by user
+[dependencies]
+std/core = { builtin = true }       # pact.core types (ConversionError, Range, Handler)
+std/collections = { builtin = true } # additional collection utilities
+std/io = { builtin = true }         # io.println, io.print, etc.
+std/fs = { builtin = true }         # fs.read, fs.write, fs.list_dir
+std/toml = { builtin = true }       # TOML parser
+std/semver = { builtin = true }     # version parsing and constraint matching
+```
+
+The exact set of Tier 1 packages is determined by the compiler version. `pact --version` reports both: `pact 0.3.0 (stdlib 0.3.0)`.
+
+#### Import Syntax
+
+Stdlib packages live under the `std` namespace, matching the `std/` org on the registry (§8.9.2). Import paths follow the `org/name` → `org.name` mapping established in §8.9.7:
+
+```pact
+import std.toml                    // TOML parser
+import std.semver                  // version parsing
+import std.toml.{toml_parse, toml_get}  // selective import
+```
+
+The `std` prefix is mandatory. There are no bare stdlib imports — `import toml` resolves only to local `src/toml.pact`, never to stdlib. This avoids the ambiguity that plagues Python's stdlib (is `json` local or stdlib?) and matches Rust's `std::` convention.
+
+The `pact.*` namespace remains reserved for compiler-internal pseudo-modules (`pact.core`, `pact.ffi`) that are part of the language definition, not distributable packages.
+
+#### Resolution Order
+
+The resolution algorithm from §10.5 is unchanged:
+
+1. Check local `src/` for a matching path
+2. Check dependencies declared in `pact.toml` (resolved via `pact.lock`) — **stdlib packages are included here as implicit entries**
+3. No match → compile error
+
+Local modules shadow stdlib with warning W1000 (same as any dependency shadowing). Explicit `pact.toml` entries for `std/` packages override the bundled version — this is the escape hatch for pinning a specific stdlib version when needed.
+
+#### Physical Location
+
+Stdlib source ships alongside the compiler binary in `<pactc_dir>/lib/std/`. The compiler discovers this path relative to its own binary — no environment variables, no configuration. This satisfies the existing 5-0 decision: "no env vars, no configurable roots."
+
+```
+pact/
+  bin/pact              # compiler binary
+  lib/std/
+    toml.pact           # std.toml module
+    semver.pact         # std.semver module
+    core.pact           # std.core (ConversionError, Range, Handler)
+    ...
+```
+
+When the compiler encounters `import std.toml`, it resolves to `<pactc_dir>/lib/std/toml.pact` through the normal dependency resolution path.
+
+#### Tier 2 Packages
+
+Tier 2 "batteries" packages (§8.1) version independently from the compiler. They require explicit declaration in `pact.toml`:
+
+```toml
+[dependencies]
+std/http = "1.2"        # Tier 2 — explicit version required
+std/crypto = "0.5"      # Tier 2 — explicit version required
+```
+
+They are imported identically to Tier 1:
+
+```pact
+import std.http.{Client, Request}
+import std.crypto.{sha256}
+```
+
+The distinction between Tier 1 and Tier 2 is purely about distribution and versioning — Tier 1 is implicit and version-locked to the compiler, Tier 2 is explicit and independently versioned. The import syntax is the same for both.
+
+#### Stdlib Errors
+
+| Code | Error | Cause |
+|------|-------|-------|
+| E1050 | Stdlib not found | Compiler installation is incomplete or corrupted |
+| E1051 | Stdlib version mismatch | Lockfile records a different stdlib version than current compiler |
+
+```
+error[E1050]: stdlib module not found
+ --> app.pact:2:1
+  |
+2 | import std.toml
+  |        ^^^^^^^^ module `std.toml` not found
+  |
+  = note: expected at /usr/lib/pact/lib/std/toml.pact
+  = help: your Pact installation may be incomplete; reinstall with `pact self update`
+```
 
 ---
 

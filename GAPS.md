@@ -44,9 +44,10 @@ Unspecified or under-specified areas needing design work. Note: a self-hosting c
 - [ ] **Concurrency edge cases** — cancellation semantics, task panic propagation details, channel close behavior mentioned but not fully specified. §4.13
 - [ ] **Arena escape analysis** — rules stated (§5.2) but interaction with closures, effect handlers, and return-value promotion needs detail
 - [ ] **`@alt` annotation** — listed in §11.1 but usage/semantics barely described
+- [x] **Stdlib distribution & import resolution** — stdlib modules ship with compiler but no resolution mechanism specified. How does `import std.toml` find files on disk? *(Resolved: §10.7, panel vote 4-1 implicit dependency model, 3-2 `std` prefix over `pact` prefix, 3-2 stdlib-as-dep resolution order)*
 - [ ] **Stdlib tier boundaries** — `math`, `str`, `fmt` tier placement flagged as open in OPEN_QUESTIONS.md §2.2
 - [ ] **`env.exit()` / `env.args()`** — used in examples but `Env` effect operations not enumerated
-- [ ] **Package manifest format** — `pact.toml` shown partially (§4.9) but full schema not specified
+- [x] **Package manifest format** — `pact.toml` shown partially (§4.9) but full schema not specified *(Resolved: §8.9, panel vote 5-0 hybrid registry, 4-1 org/name namespacing, 4-1 MVS resolution, 4-1 caret constraints, 5-0 path+git MVP)*
 - [ ] **Const evaluation** — struct defaults and keyword-arg defaults must be "compile-time constants" (§2.12, §2.13) but no const-eval rules
 - [ ] **Serialization story** — every web service does JSON; no `@derive(Serialize)` or `@json("field")` equivalent. `@derive` exists, `@where` handles validation, but ser/de is unspecified. Language-level annotation vs stdlib trait vs library? "One way" principle argues for a blessed answer. Refinement types (`@where`) already cover validation; this is about codec dispatch and field mapping
 - [ ] **Web-service stdlib tier** — HTTP client/server, JSON codec, SQL (type-safe via `Query[C]`?), logging, config — all heavily used by AI-generated code. Effect system provides primitives (`Net.*`, `IO.*`) but no blessed stdlib modules. Every third-party dep is a hallucination risk for AI. Question: stdlib tier 1 (ships with compiler) vs tier 2 (blessed but separate package)?

@@ -99,14 +99,14 @@ pub fn emit_expr(node: Int) {
         }
         let cap_idx = get_capture_index(name)
         if cap_idx >= 0 {
-            let cap_mut = closure_capture_muts.get(cg_closure_cap_start + cap_idx)
-            if cap_mut != 0 {
+            let cap_entry = closure_captures.get(cg_closure_cap_start + cap_idx)
+            if cap_entry.is_mut != 0 {
                 expr_result_str = "(*{name}_cell)"
-                expr_result_type = closure_capture_types.get(cg_closure_cap_start + cap_idx)
+                expr_result_type = cap_entry.ctype
                 return
             }
             expr_result_str = capture_cast_expr(cap_idx)
-            expr_result_type = closure_capture_types.get(cg_closure_cap_start + cap_idx)
+            expr_result_type = cap_entry.ctype
             return
         }
         if is_mut_captured(name) != 0 {
@@ -329,11 +329,11 @@ pub fn emit_handler_expr(node: Int) {
     let mut is_user_effect = 0
     if vtable_type == "" {
         let mut uei = 0
-        while uei < ue_reg_names.len() {
-            let uen = ue_reg_names.get(uei)
-            if effect_name == uen || effect_name.starts_with("{uen}.") {
-                vtable_type = "pact_ue_{ue_reg_handle.get(uei)}_vtable"
-                vtable_field = ue_reg_handle.get(uei)
+        while uei < ue_effects.len() {
+            let ue = ue_effects.get(uei)
+            if effect_name == ue.name || effect_name.starts_with("{ue.name}.") {
+                vtable_type = "pact_ue_{ue.handle}_vtable"
+                vtable_field = ue.handle
                 is_user_effect = 1
                 break
             }
@@ -455,21 +455,15 @@ pub fn emit_handler_expr(node: Int) {
 pub fn emit_async_spawn_closure(closure_node: Int, wrapper_idx: Int, wrapper_name: Str, task_fn_name: Str) {
     let cl_params_sl = np_params.get(closure_node)
     let captures = analyze_captures(np_body.get(closure_node), cl_params_sl)
-    let cap_start = closure_capture_names.len()
+    let cap_start = closure_captures.len()
     let mut cap_i = 0
     while cap_i < captures.len() {
-        closure_capture_names.push(captures.get(cap_i))
         let cap_ct = get_var_type(captures.get(cap_i))
-        closure_capture_types.push(cap_ct)
-        if is_mut_captured(captures.get(cap_i)) != 0 {
-            closure_capture_muts.push(1)
-        } else {
-            closure_capture_muts.push(0)
-        }
+        let cap_mut = if is_mut_captured(captures.get(cap_i)) != 0 { 1 } else { 0 }
+        closure_captures.push(CaptureEntry { name: captures.get(cap_i), ctype: cap_ct, is_mut: cap_mut })
         cap_i = cap_i + 1
     }
-    closure_capture_starts.push(cap_start)
-    closure_capture_counts.push(captures.len())
+    closure_cap_infos.push(ClosureCapInfo { start: cap_start, count: captures.len() })
 
     cg_closure_defs.push("typedef struct \{")
     cg_closure_defs.push("    pact_handle* handle;")
@@ -499,12 +493,10 @@ pub fn emit_async_spawn_closure(closure_node: Int, wrapper_idx: Int, wrapper_nam
 
     let mut mc_i = 0
     while mc_i < captures.len() {
-        let mc_name = closure_capture_names.get(cap_start + mc_i)
-        let mc_mut = closure_capture_muts.get(cap_start + mc_i)
-        if mc_mut != 0 {
-            let mc_ct = closure_capture_types.get(cap_start + mc_i)
-            let mc_ts = c_type_str(mc_ct)
-            emit_line("{mc_ts}* {mc_name}_cell = ({mc_ts}*)pact_closure_get_capture(__self, {mc_i});")
+        let mc_e = closure_captures.get(cap_start + mc_i)
+        if mc_e.is_mut != 0 {
+            let mc_ts = c_type_str(mc_e.ctype)
+            emit_line("{mc_ts}* {mc_e.name}_cell = ({mc_ts}*)pact_closure_get_capture(__self, {mc_i});")
         }
         mc_i = mc_i + 1
     }
@@ -895,6 +887,11 @@ pub fn emit_call(node: Int) {
                 return
             }
         }
+        if fn_name == "Map" {
+            expr_result_str = "pact_map_new()"
+            expr_result_type = CT_MAP
+            return
+        }
         if fn_name == "Channel" {
             let args_sl = np_args.get(node)
             if args_sl != -1 && sublist_length(args_sl) > 0 {
@@ -980,15 +977,25 @@ pub fn emit_call(node: Int) {
         }
         expr_result_str = "pact_{fn_name}({args_str})"
         expr_result_type = get_fn_ret(fn_name)
+        if expr_result_type == CT_VOID {
+            let fn_sret = get_fn_ret_struct(fn_name)
+            if fn_sret != "" {
+                let s_tmp = fresh_temp("_sr")
+                emit_line("pact_{fn_sret} {s_tmp} = pact_{fn_name}({args_str});")
+                set_var_struct(s_tmp, fn_sret)
+                expr_result_str = s_tmp
+            }
+        }
+        let rt = get_fn_ret_type(fn_name)
         if expr_result_type == CT_RESULT {
-            expr_result_ok_type = get_fn_ret_result_ok(fn_name)
-            expr_result_err_type = get_fn_ret_result_err(fn_name)
+            expr_result_ok_type = rt.inner1
+            expr_result_err_type = rt.inner2
         }
         if expr_result_type == CT_OPTION {
-            expr_option_inner = get_fn_ret_option_inner(fn_name)
+            expr_option_inner = rt.inner1
         }
         if expr_result_type == CT_LIST {
-            expr_list_elem_type = get_fn_ret_list_elem(fn_name)
+            expr_list_elem_type = rt.inner1
         }
         return
     }
@@ -1159,38 +1166,35 @@ pub fn emit_method_call(node: Int) {
             let arg_tmp = fresh_temp("__spawn_arg_")
 
             if np_kind.get(spawn_arg_node) == NodeKind.Closure {
-                let cap_reg_idx = closure_capture_starts.len()
+                let cap_reg_idx = closure_cap_infos.len()
                 emit_async_spawn_closure(spawn_arg_node, wrapper_idx, wrapper_name, task_fn_name)
 
                 emit_line("pact_handle* {handle_tmp} = pact_handle_new();")
                 emit_line("__async_arg_{wrapper_idx}_t* {arg_tmp} = (__async_arg_{wrapper_idx}_t*)pact_alloc(sizeof(__async_arg_{wrapper_idx}_t));")
                 emit_line("{arg_tmp}->handle = {handle_tmp};")
-                let ac_start = closure_capture_starts.get(cap_reg_idx)
-                let ac_count = closure_capture_counts.get(cap_reg_idx)
-                if ac_count > 0 {
+                let ac_info = closure_cap_infos.get(cap_reg_idx)
+                if ac_info.count > 0 {
                     let caps_var = "__acaps_{wrapper_idx}"
-                    emit_line("void** {caps_var} = (void**)pact_alloc(sizeof(void*) * {ac_count});")
+                    emit_line("void** {caps_var} = (void**)pact_alloc(sizeof(void*) * {ac_info.count});")
                     let mut ci2 = 0
-                    while ci2 < ac_count {
-                        let cap_name = closure_capture_names.get(ac_start + ci2)
-                        let cap_type = closure_capture_types.get(ac_start + ci2)
-                        let cap_is_mut = closure_capture_muts.get(ac_start + ci2)
-                        if cap_is_mut != 0 {
-                            emit_line("{caps_var}[{ci2}] = (void*){cap_name}_cell;")
-                        } else if cap_type == CT_INT {
-                            emit_line("{caps_var}[{ci2}] = (void*)(intptr_t){cap_name};")
-                        } else if cap_type == CT_FLOAT {
+                    while ci2 < ac_info.count {
+                        let cap_e = closure_captures.get(ac_info.start + ci2)
+                        if cap_e.is_mut != 0 {
+                            emit_line("{caps_var}[{ci2}] = (void*){cap_e.name}_cell;")
+                        } else if cap_e.ctype == CT_INT {
+                            emit_line("{caps_var}[{ci2}] = (void*)(intptr_t){cap_e.name};")
+                        } else if cap_e.ctype == CT_FLOAT {
                             let fp_tmp = fresh_temp("__fp_")
-                            emit_line("\{double* {fp_tmp} = (double*)pact_alloc(sizeof(double)); *{fp_tmp} = {cap_name}; {caps_var}[{ci2}] = (void*){fp_tmp};}")
-                        } else if cap_type == CT_BOOL {
-                            emit_line("{caps_var}[{ci2}] = (void*)(intptr_t){cap_name};")
+                            emit_line("\{double* {fp_tmp} = (double*)pact_alloc(sizeof(double)); *{fp_tmp} = {cap_e.name}; {caps_var}[{ci2}] = (void*){fp_tmp};}")
+                        } else if cap_e.ctype == CT_BOOL {
+                            emit_line("{caps_var}[{ci2}] = (void*)(intptr_t){cap_e.name};")
                         } else {
-                            emit_line("{caps_var}[{ci2}] = (void*){cap_name};")
+                            emit_line("{caps_var}[{ci2}] = (void*){cap_e.name};")
                         }
                         ci2 = ci2 + 1
                     }
                     emit_line("{arg_tmp}->captures = {caps_var};")
-                    emit_line("{arg_tmp}->capture_count = {ac_count};")
+                    emit_line("{arg_tmp}->capture_count = {ac_info.count};")
                 }
                 emit_line("pact_threadpool_submit(__pact_pool, {wrapper_name}, (void*){arg_tmp});")
             } else {
@@ -1320,16 +1324,16 @@ pub fn emit_method_call(node: Int) {
             }
             let mut ue_ret_type = CT_VOID
             let mut mi = 0
-            while mi < ue_reg_methods.len() {
-                if ue_reg_method_effect.get(mi) == handle_name && ue_reg_methods.get(mi) == method {
-                    let mret = ue_reg_method_rets.get(mi)
-                    if mret == "int64_t" {
+            while mi < ue_methods.len() {
+                let uem = ue_methods.get(mi)
+                if uem.effect_handle == handle_name && uem.name == method {
+                    if uem.ret == "int64_t" {
                         ue_ret_type = CT_INT
-                    } else if mret == "const char*" {
+                    } else if uem.ret == "const char*" {
                         ue_ret_type = CT_STRING
-                    } else if mret == "double" {
+                    } else if uem.ret == "double" {
                         ue_ret_type = CT_FLOAT
-                    } else if mret == "int" {
+                    } else if uem.ret == "int" {
                         ue_ret_type = CT_BOOL
                     }
                     break
@@ -1427,12 +1431,11 @@ pub fn emit_method_call(node: Int) {
                     let mangled = "{target_type}_{tf_name}"
                     expr_result_str = "pact_{mangled}({arg_str})"
                     expr_result_type = get_fn_ret(mangled)
-                    let rok = get_fn_ret_result_ok(mangled)
-                    let rerr = get_fn_ret_result_err(mangled)
-                    if rok != -1 && rerr != -1 {
-                        expr_result_ok_type = rok
-                        expr_result_err_type = rerr
-                        set_var_result(expr_result_str, rok, rerr)
+                    let tf_rt = get_fn_ret_type(mangled)
+                    if tf_rt.inner1 != -1 && tf_rt.inner2 != -1 {
+                        expr_result_ok_type = tf_rt.inner1
+                        expr_result_err_type = tf_rt.inner2
+                        set_var_result(expr_result_str, tf_rt.inner1, tf_rt.inner2)
                     }
                     return
                 }
@@ -1560,7 +1563,15 @@ pub fn emit_method_call(node: Int) {
             if val_type != CT_INT {
                 set_list_elem_type(obj_str, val_type)
             }
-            if val_type == CT_INT {
+            let val_struct = get_var_struct(val_str)
+            if val_type == CT_VOID && val_struct != "" {
+                set_list_elem_struct(obj_str, val_struct)
+                set_list_elem_type(obj_str, CT_VOID)
+                let box_tmp = fresh_temp("_box")
+                emit_line("pact_{val_struct}* {box_tmp} = (pact_{val_struct}*)pact_alloc(sizeof(pact_{val_struct}));")
+                emit_line("*{box_tmp} = {val_str};")
+                emit_line("pact_list_push({obj_str}, (void*){box_tmp});")
+            } else if val_type == CT_INT {
                 emit_line("pact_list_push({obj_str}, (void*)(intptr_t){val_str});")
             } else {
                 emit_line("pact_list_push({obj_str}, (void*){val_str});")
@@ -1585,7 +1596,14 @@ pub fn emit_method_call(node: Int) {
             emit_expr(sublist_get(args_sl, 0))
             let idx_str = expr_result_str
             let elem_type = get_list_elem_type(obj_str)
-            if elem_type == CT_STRING {
+            let elem_struct = get_list_elem_struct(obj_str)
+            if elem_type == CT_VOID && elem_struct != "" {
+                let ub_tmp = fresh_temp("_ub")
+                emit_line("pact_{elem_struct} {ub_tmp} = *(pact_{elem_struct}*)pact_list_get({obj_str}, {idx_str});")
+                set_var_struct(ub_tmp, elem_struct)
+                expr_result_str = ub_tmp
+                expr_result_type = CT_VOID
+            } else if elem_type == CT_STRING {
                 expr_result_str = "(const char*)pact_list_get({obj_str}, {idx_str})"
                 expr_result_type = CT_STRING
             } else if elem_type == CT_LIST {
@@ -1605,7 +1623,13 @@ pub fn emit_method_call(node: Int) {
             emit_expr(sublist_get(args_sl, 1))
             let val_str2 = expr_result_str
             let val_type2 = expr_result_type
-            if val_type2 == CT_INT {
+            let val_struct2 = get_var_struct(val_str2)
+            if val_type2 == CT_VOID && val_struct2 != "" {
+                let box_tmp = fresh_temp("_box")
+                emit_line("pact_{val_struct2}* {box_tmp} = (pact_{val_struct2}*)pact_alloc(sizeof(pact_{val_struct2}));")
+                emit_line("*{box_tmp} = {val_str2};")
+                emit_line("pact_list_set({obj_str}, {idx_str}, (void*){box_tmp});")
+            } else if val_type2 == CT_INT {
                 emit_line("pact_list_set({obj_str}, {idx_str}, (void*)(intptr_t){val_str2});")
             } else {
                 emit_line("pact_list_set({obj_str}, {idx_str}, (void*){val_str2});")
@@ -1633,8 +1657,7 @@ pub fn emit_method_call(node: Int) {
             ensure_map_iter(elem_type)
             let adapter_var = fresh_temp("__map_")
             emit_line("pact_MapIterator_{tag} {adapter_var} = \{ .source = &{src_var}, .source_next = ({ifs_opt_type} (*)(void*)){src_next}, .fn = {fn_str} };")
-            set_var_iterator(adapter_var, elem_type)
-            set_var_iter_next_fn(adapter_var, "pact_MapIterator_{tag}_next")
+            set_var_iterator(adapter_var, elem_type, "pact_MapIterator_{tag}_next")
             expr_result_str = adapter_var
             expr_result_type = CT_ITERATOR
             expr_iter_next_fn = "pact_MapIterator_{tag}_next"
@@ -1653,8 +1676,7 @@ pub fn emit_method_call(node: Int) {
             ensure_filter_iter(elem_type)
             let adapter_var = fresh_temp("__filter_")
             emit_line("pact_FilterIterator_{tag} {adapter_var} = \{ .source = &{src_var}, .source_next = ({ifs_opt_type} (*)(void*)){src_next}, .fn = {fn_str} };")
-            set_var_iterator(adapter_var, elem_type)
-            set_var_iter_next_fn(adapter_var, "pact_FilterIterator_{tag}_next")
+            set_var_iterator(adapter_var, elem_type, "pact_FilterIterator_{tag}_next")
             expr_result_str = adapter_var
             expr_result_type = CT_ITERATOR
             expr_iter_next_fn = "pact_FilterIterator_{tag}_next"
@@ -1673,8 +1695,7 @@ pub fn emit_method_call(node: Int) {
             ensure_take_iter(elem_type)
             let adapter_var = fresh_temp("__take_")
             emit_line("pact_TakeIterator_{tag} {adapter_var} = \{ .source = &{src_var}, .source_next = ({ifs_opt_type} (*)(void*)){src_next}, .limit = {n_str}, .count = 0 };")
-            set_var_iterator(adapter_var, elem_type)
-            set_var_iter_next_fn(adapter_var, "pact_TakeIterator_{tag}_next")
+            set_var_iterator(adapter_var, elem_type, "pact_TakeIterator_{tag}_next")
             expr_result_str = adapter_var
             expr_result_type = CT_ITERATOR
             expr_iter_next_fn = "pact_TakeIterator_{tag}_next"
@@ -1693,8 +1714,7 @@ pub fn emit_method_call(node: Int) {
             ensure_skip_iter(elem_type)
             let adapter_var = fresh_temp("__skip_")
             emit_line("pact_SkipIterator_{tag} {adapter_var} = \{ .source = &{src_var}, .source_next = ({ifs_opt_type} (*)(void*)){src_next}, .skip_n = {n_str}, .skipped = 0 };")
-            set_var_iterator(adapter_var, elem_type)
-            set_var_iter_next_fn(adapter_var, "pact_SkipIterator_{tag}_next")
+            set_var_iterator(adapter_var, elem_type, "pact_SkipIterator_{tag}_next")
             expr_result_str = adapter_var
             expr_result_type = CT_ITERATOR
             expr_iter_next_fn = "pact_SkipIterator_{tag}_next"
@@ -1718,8 +1738,7 @@ pub fn emit_method_call(node: Int) {
             ensure_chain_iter(elem_type)
             let adapter_var = fresh_temp("__chain_")
             emit_line("pact_ChainIterator_{tag} {adapter_var} = \{ .source_a = &{src_a_var}, .next_a = ({opt_t} (*)(void*)){next_a}, .source_b = &{src_b_var}, .next_b = ({opt_t} (*)(void*)){next_b}, .phase = 0 };")
-            set_var_iterator(adapter_var, elem_type)
-            set_var_iter_next_fn(adapter_var, "pact_ChainIterator_{tag}_next")
+            set_var_iterator(adapter_var, elem_type, "pact_ChainIterator_{tag}_next")
             expr_result_str = adapter_var
             expr_result_type = CT_ITERATOR
             expr_iter_next_fn = "pact_ChainIterator_{tag}_next"
@@ -1738,8 +1757,7 @@ pub fn emit_method_call(node: Int) {
             ensure_flat_map_iter(elem_type)
             let adapter_var = fresh_temp("__flatmap_")
             emit_line("pact_FlatMapIterator_{tag} {adapter_var} = \{ .source = &{src_var}, .source_next = ({ifs_opt_type} (*)(void*)){src_next}, .fn = {fn_str}, .buffer = NULL, .buf_idx = 0 };")
-            set_var_iterator(adapter_var, elem_type)
-            set_var_iter_next_fn(adapter_var, "pact_FlatMapIterator_{tag}_next")
+            set_var_iterator(adapter_var, elem_type, "pact_FlatMapIterator_{tag}_next")
             expr_result_str = adapter_var
             expr_result_type = CT_ITERATOR
             expr_iter_next_fn = "pact_FlatMapIterator_{tag}_next"
@@ -2039,6 +2057,81 @@ pub fn emit_method_call(node: Int) {
         }
     }
 
+    // Map methods
+    if obj_type == CT_MAP {
+        if method == "set" {
+            let args_sl = np_args.get(node)
+            emit_expr(sublist_get(args_sl, 0))
+            let key_str = expr_result_str
+            emit_expr(sublist_get(args_sl, 1))
+            let val_str2 = expr_result_str
+            let val_type2 = expr_result_type
+            if val_type2 == CT_INT {
+                emit_line("pact_map_set({obj_str}, {key_str}, (void*)(intptr_t){val_str2});")
+            } else {
+                emit_line("pact_map_set({obj_str}, {key_str}, (void*){val_str2});")
+            }
+            set_map_types(obj_str, CT_STRING, val_type2)
+            expr_result_str = "0"
+            expr_result_type = CT_VOID
+            return
+        }
+        if method == "get" {
+            let args_sl = np_args.get(node)
+            emit_expr(sublist_get(args_sl, 0))
+            let key_str = expr_result_str
+            let vtype = get_map_value_type(obj_str)
+            if vtype == CT_STRING {
+                expr_result_str = "(const char*)pact_map_get({obj_str}, {key_str})"
+                expr_result_type = CT_STRING
+            } else if vtype == CT_LIST {
+                expr_result_str = "(pact_list*)pact_map_get({obj_str}, {key_str})"
+                expr_result_type = CT_LIST
+            } else if vtype == CT_MAP {
+                expr_result_str = "(pact_map*)pact_map_get({obj_str}, {key_str})"
+                expr_result_type = CT_MAP
+            } else {
+                expr_result_str = "(int64_t)(intptr_t)pact_map_get({obj_str}, {key_str})"
+                expr_result_type = CT_INT
+            }
+            return
+        }
+        if method == "has" {
+            let args_sl = np_args.get(node)
+            emit_expr(sublist_get(args_sl, 0))
+            let key_str = expr_result_str
+            expr_result_str = "pact_map_has({obj_str}, {key_str})"
+            expr_result_type = CT_INT
+            return
+        }
+        if method == "remove" {
+            let args_sl = np_args.get(node)
+            emit_expr(sublist_get(args_sl, 0))
+            let key_str = expr_result_str
+            expr_result_str = "pact_map_remove({obj_str}, {key_str})"
+            expr_result_type = CT_INT
+            return
+        }
+        if method == "len" {
+            expr_result_str = "pact_map_len({obj_str})"
+            expr_result_type = CT_INT
+            return
+        }
+        if method == "keys" {
+            expr_result_str = "pact_map_keys({obj_str})"
+            expr_result_type = CT_LIST
+            expr_list_elem_type = CT_STRING
+            return
+        }
+        if method == "values" {
+            let vtype = get_map_value_type(obj_str)
+            expr_result_str = "pact_map_values({obj_str})"
+            expr_result_type = CT_LIST
+            expr_list_elem_type = vtype
+            return
+        }
+    }
+
     // Trait impl method resolution
     let struct_type = get_var_struct(obj_str)
     if struct_type != "" && lookup_impl_method(struct_type, method) != 0 {
@@ -2091,6 +2184,8 @@ pub fn escape_c_string(s: Str) -> Str {
             result = result.concat("\\n")
         } else if ch == 9 {
             result = result.concat("\\t")
+        } else if ch == 63 {
+            result = result.concat("\\?")
         } else {
             result = result.concat(s.substring(i, 1))
         }
@@ -2200,6 +2295,7 @@ pub fn emit_list_lit(node: Int) {
     emit_line("pact_list* {tmp} = pact_list_new();")
     let elems_sl = np_elements.get(node)
     let mut first_elem_type = -1
+    let mut first_elem_struct = ""
     if elems_sl != -1 {
         let mut i = 0
         while i < sublist_length(elems_sl) {
@@ -2208,8 +2304,15 @@ pub fn emit_list_lit(node: Int) {
             let e_type = expr_result_type
             if i == 0 {
                 first_elem_type = e_type
+                first_elem_struct = get_var_struct(e_str)
             }
-            if e_type == CT_INT {
+            let e_struct = get_var_struct(e_str)
+            if e_type == CT_VOID && e_struct != "" {
+                let box_tmp = fresh_temp("_box")
+                emit_line("pact_{e_struct}* {box_tmp} = (pact_{e_struct}*)pact_alloc(sizeof(pact_{e_struct}));")
+                emit_line("*{box_tmp} = {e_str};")
+                emit_line("pact_list_push({tmp}, (void*){box_tmp});")
+            } else if e_type == CT_INT {
                 emit_line("pact_list_push({tmp}, (void*)(intptr_t){e_str});")
             } else {
                 emit_line("pact_list_push({tmp}, (void*){e_str});")
@@ -2219,6 +2322,10 @@ pub fn emit_list_lit(node: Int) {
     }
     if first_elem_type >= 0 {
         expr_list_elem_type = first_elem_type
+    }
+    if first_elem_struct != "" {
+        set_list_elem_type(tmp, CT_VOID)
+        set_list_elem_struct(tmp, first_elem_struct)
     }
     expr_result_str = tmp
     expr_result_type = CT_LIST
@@ -2331,8 +2438,8 @@ pub fn list_contains_str(lst: List[Str], val: Str) -> Int {
 
 pub fn is_in_scope(name: Str) -> Int {
     let mut i = 0
-    while i < scope_names.len() {
-        if scope_names.get(i) == name {
+    while i < scope_vars.len() {
+        if scope_vars.get(i).name == name {
             return 1
         }
         i = i + 1
@@ -2371,8 +2478,8 @@ pub fn collect_free_vars(node: Int, params: List[Str], locals: List[Str], result
         }
         let mut fi = 0
         let mut is_fn_reg = 0
-        while fi < fn_reg_names.len() {
-            if fn_reg_names.get(fi) == name {
+        while fi < fn_regs.len() {
+            if fn_regs.get(fi).name == name {
                 is_fn_reg = 1
             }
             fi = fi + 1
@@ -3008,31 +3115,16 @@ pub fn emit_closure(node: Int) {
 
     // Capture analysis: find free variables before switching codegen context
     let captures = analyze_captures(np_body.get(node), params_sl)
-    let cap_start = closure_capture_names.len()
+    let cap_start = closure_captures.len()
     let mut cap_i = 0
     while cap_i < captures.len() {
-        closure_capture_names.push(captures.get(cap_i))
+        let cap_name = captures.get(cap_i)
+        let cap_ct = get_var_type(cap_name)
+        let cap_mut = if is_mut_captured(cap_name) != 0 { 1 } else { 0 }
+        closure_captures.push(CaptureEntry { name: cap_name, ctype: cap_ct, is_mut: cap_mut })
         cap_i = cap_i + 1
     }
-    cap_i = 0
-    while cap_i < captures.len() {
-        let cname_lookup = closure_capture_names.get(cap_start + cap_i)
-        let cap_ct = get_var_type(cname_lookup)
-        closure_capture_types.push(cap_ct)
-        cap_i = cap_i + 1
-    }
-    cap_i = 0
-    while cap_i < captures.len() {
-        let cname_mc = closure_capture_names.get(cap_start + cap_i)
-        if is_mut_captured(cname_mc) != 0 {
-            closure_capture_muts.push(1)
-        } else {
-            closure_capture_muts.push(0)
-        }
-        cap_i = cap_i + 1
-    }
-    closure_capture_starts.push(cap_start)
-    closure_capture_counts.push(captures.len())
+    closure_cap_infos.push(ClosureCapInfo { start: cap_start, count: captures.len() })
 
     // Build C parameter list: __self first if captures, then user params
     let has_caps = captures.len() > 0
@@ -3089,8 +3181,7 @@ pub fn emit_closure(node: Int) {
                     set_var_struct(pname, ptype)
                 }
                 if is_enum_type(ptype) != 0 {
-                    var_enum_names.push(pname)
-                    var_enum_types.push(ptype)
+                    var_enums.push(VarEnumEntry { name: pname, enum_type: ptype })
                 }
             }
             i = i + 1
@@ -3102,21 +3193,19 @@ pub fn emit_closure(node: Int) {
     let mut mc_done: List[Str] = []
     let mut mc_i = 0
     while mc_i < captures.len() {
-        let mc_name = closure_capture_names.get(cap_start + mc_i)
-        let mc_mut = closure_capture_muts.get(cap_start + mc_i)
-        if mc_mut != 0 {
+        let mc_e = closure_captures.get(cap_start + mc_i)
+        if mc_e.is_mut != 0 {
             let mut mc_dup = 0
             let mut mc_j = 0
             while mc_j < mc_i {
-                if closure_capture_names.get(cap_start + mc_j) == mc_name {
+                if closure_captures.get(cap_start + mc_j).name == mc_e.name {
                     mc_dup = 1
                 }
                 mc_j = mc_j + 1
             }
             if mc_dup == 0 {
-                let mc_ct = closure_capture_types.get(cap_start + mc_i)
-                let mc_ts = c_type_str(mc_ct)
-                emit_line("{mc_ts}* {mc_name}_cell = ({mc_ts}*)pact_closure_get_capture(__self, {mc_i});")
+                let mc_ts = c_type_str(mc_e.ctype)
+                emit_line("{mc_ts}* {mc_e.name}_cell = ({mc_ts}*)pact_closure_get_capture(__self, {mc_i});")
             }
         }
         mc_i = mc_i + 1
@@ -3169,19 +3258,17 @@ pub fn emit_closure(node: Int) {
         emit_line("void** {caps_var} = (void**)pact_alloc(sizeof(void*) * {captures.len()});")
         let mut ci2 = 0
         while ci2 < captures.len() {
-            let cap_name = closure_capture_names.get(cap_start + ci2)
-            let cap_type = closure_capture_types.get(cap_start + ci2)
-            let cap_is_mut = closure_capture_muts.get(cap_start + ci2)
-            if cap_is_mut != 0 {
-                emit_line("{caps_var}[{ci2}] = (void*){cap_name}_cell;")
-            } else if cap_type == CT_INT {
-                emit_line("{caps_var}[{ci2}] = (void*)(intptr_t){cap_name};")
-            } else if cap_type == CT_FLOAT {
-                emit_line("\{double* __fp_{closure_idx}_{ci2} = (double*)pact_alloc(sizeof(double)); *__fp_{closure_idx}_{ci2} = {cap_name}; {caps_var}[{ci2}] = (void*)__fp_{closure_idx}_{ci2};}")
-            } else if cap_type == CT_BOOL {
-                emit_line("{caps_var}[{ci2}] = (void*)(intptr_t){cap_name};")
+            let cap_e = closure_captures.get(cap_start + ci2)
+            if cap_e.is_mut != 0 {
+                emit_line("{caps_var}[{ci2}] = (void*){cap_e.name}_cell;")
+            } else if cap_e.ctype == CT_INT {
+                emit_line("{caps_var}[{ci2}] = (void*)(intptr_t){cap_e.name};")
+            } else if cap_e.ctype == CT_FLOAT {
+                emit_line("\{double* __fp_{closure_idx}_{ci2} = (double*)pact_alloc(sizeof(double)); *__fp_{closure_idx}_{ci2} = {cap_e.name}; {caps_var}[{ci2}] = (void*)__fp_{closure_idx}_{ci2};}")
+            } else if cap_e.ctype == CT_BOOL {
+                emit_line("{caps_var}[{ci2}] = (void*)(intptr_t){cap_e.name};")
             } else {
-                emit_line("{caps_var}[{ci2}] = (void*){cap_name};")
+                emit_line("{caps_var}[{ci2}] = (void*){cap_e.name};")
             }
             ci2 = ci2 + 1
         }

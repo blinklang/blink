@@ -228,7 +228,7 @@ pub fn format_pattern(node: Int) -> Str {
 
 // ── Expression formatting ───────────────────────────────────────────
 
-pub fn op_precedence(op: Str) -> Int {
+fn op_precedence(op: Str) -> Int {
     if op == "||" { return 1 }
     if op == "&&" { return 2 }
     if op == "==" || op == "!=" { return 3 }
@@ -239,7 +239,7 @@ pub fn op_precedence(op: Str) -> Int {
     0
 }
 
-pub fn needs_parens(child: Int, parent_op: Str, is_right: Int) -> Int {
+fn needs_parens(child: Int, parent_op: Str, is_right: Int) -> Int {
     let kind = np_kind.get(child)
     if kind != NodeKind.BinOp {
         return 0
@@ -752,7 +752,7 @@ pub fn emit_binop_wrapped(node: Int, prefix: Str) {
     fmt_indent = fmt_indent - 1
 }
 
-pub fn flatten_binop_chain(node: Int) {
+fn flatten_binop_chain(node: Int) {
     let kind = np_kind.get(node)
     if kind != NodeKind.BinOp {
         binop_parts.push(format_expr(node))

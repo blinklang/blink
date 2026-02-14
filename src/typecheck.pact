@@ -29,6 +29,7 @@ pub let TK_ITERATOR = 14
 pub let TK_HANDLE = 15
 pub let TK_CHANNEL = 16
 pub let TK_TUPLE = 17
+pub let TK_MAP = 18
 
 // ── Type pool (parallel arrays) ─────────────────────────────────────
 pub let mut ty_kind: List[Int] = []
@@ -145,6 +146,14 @@ pub fn make_tuple_type(elem_types: List[Int]) -> Int {
     }
     ty_params_start.set(t, start)
     ty_params_count.set(t, elem_types.len())
+    t
+}
+
+
+pub fn make_map_type(key_type: Int, value_type: Int) -> Int {
+    let t = new_type(TK_MAP, "Map")
+    ty_inner1.set(t, key_type)
+    ty_inner2.set(t, value_type)
     t
 }
 
@@ -274,6 +283,14 @@ pub fn resolve_type_ann(ann_node: Int) -> Int {
             return make_result_type(ok_t, err_t)
         }
         return make_result_type(TYPE_UNKNOWN, TYPE_UNKNOWN)
+    }
+    if name == "Map" {
+        if elems_sl != -1 && sublist_length(elems_sl) >= 2 {
+            let key_t = resolve_type_ann(sublist_get(elems_sl, 0))
+            let val_t = resolve_type_ann(sublist_get(elems_sl, 1))
+            return make_map_type(key_t, val_t)
+        }
+        return make_map_type(TYPE_UNKNOWN, TYPE_UNKNOWN)
     }
 
     let resolved = resolve_type_name(name)
@@ -701,7 +718,7 @@ pub fn get_variant_enum_tid(name: Str) -> Int {
 pub fn is_known_type(name: Str) -> Int {
     if name == "Int" || name == "Float" || name == "Bool" || name == "Str" { return 1 }
     if name == "Void" || name == "List" || name == "Option" || name == "Result" { return 1 }
-    if name == "Iterator" || name == "Handle" || name == "Channel" { return 1 }
+    if name == "Iterator" || name == "Handle" || name == "Channel" || name == "Map" { return 1 }
     if name == "Fn" || name == "Self" { return 1 }
     if lookup_named_type(name) != -1 { return 1 }
     0
@@ -1238,6 +1255,10 @@ pub fn types_compatible(a: Int, b: Int) -> Int {
         if ka == TK_LIST || ka == TK_OPTION || ka == TK_ITERATOR {
             return types_compatible(ty_inner1.get(a), ty_inner1.get(b))
         }
+        if ka == TK_MAP {
+            if types_compatible(ty_inner1.get(a), ty_inner1.get(b)) == 0 { return 0 }
+            return types_compatible(ty_inner2.get(a), ty_inner2.get(b))
+        }
         if ka == TK_RESULT {
             if types_compatible(ty_inner1.get(a), ty_inner1.get(b)) == 0 { return 0 }
             return types_compatible(ty_inner2.get(a), ty_inner2.get(b))
@@ -1464,6 +1485,15 @@ pub fn infer_type(node: Int) -> Int {
             if method == "unwrap" { return ty_inner1.get(obj_t) }
             if method == "unwrap_err" { return ty_inner2.get(obj_t) }
             if method == "is_ok" || method == "is_err" { return TYPE_BOOL }
+        }
+
+        if obj_k == TK_MAP {
+            if method == "len" { return TYPE_INT }
+            if method == "has" || method == "remove" { return TYPE_INT }
+            if method == "set" { return TYPE_VOID }
+            if method == "get" { return ty_inner2.get(obj_t) }
+            if method == "keys" { return make_list_type(ty_inner1.get(obj_t)) }
+            if method == "values" { return make_list_type(ty_inner2.get(obj_t)) }
         }
 
         if obj_k == TK_STRUCT || obj_k == TK_ENUM {
@@ -2010,6 +2040,11 @@ pub fn type_to_str(tid: Int) -> Str {
         let ok_t = ty_inner1.get(tid)
         let err_t = ty_inner2.get(tid)
         return "Result[{type_to_str(ok_t)}, {type_to_str(err_t)}]"
+    }
+    if k == TK_MAP {
+        let key_t = ty_inner1.get(tid)
+        let val_t = ty_inner2.get(tid)
+        return "Map[{type_to_str(key_t)}, {type_to_str(val_t)}]"
     }
     if k == TK_FN {
         let ret = ty_inner1.get(tid)

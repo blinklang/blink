@@ -28,6 +28,7 @@ pub let CT_ITERATOR = 9
 pub let CT_HANDLE = 10
 pub let CT_CHANNEL = 11
 pub let CT_TAGGED_ENUM = 12
+pub let CT_MAP = 13
 
 
 // ── Codegen state ───────────────────────────────────────────────────
@@ -37,28 +38,50 @@ pub let mut cg_indent: Int = 0
 pub let mut cg_temp_counter: Int = 0
 pub let mut cg_global_inits: List[Str] = []
 pub let mut struct_reg_names: List[Str] = []
-pub let mut enum_reg_names: List[Str] = []
-pub let mut enum_reg_variant_names: List[Str] = []
-pub let mut enum_reg_variant_enum_idx: List[Int] = []
-pub let mut var_enum_names: List[Str] = []
-pub let mut var_enum_types: List[Str] = []
-pub let mut enum_has_data: List[Int] = []
-pub let mut enum_variant_field_names: List[Str] = []
-pub let mut enum_variant_field_types: List[Str] = []
-pub let mut enum_variant_field_counts: List[Int] = []
-pub let mut fn_enum_ret_names: List[Str] = []
-pub let mut fn_enum_ret_types: List[Str] = []
+type EnumReg {
+    name: Str
+    has_data: Int
+}
+
+type EnumVariant {
+    name: Str
+    enum_idx: Int
+    field_names: Str
+    field_types: Str
+    field_count: Int
+}
+
+pub let mut enum_regs: List[EnumReg] = []
+pub let mut enum_variants: List[EnumVariant] = []
+type VarEnumEntry {
+    name: Str
+    enum_type: Str
+}
+pub let mut var_enums: List[VarEnumEntry] = []
+type FnEnumRetEntry {
+    name: Str
+    enum_type: Str
+}
+pub let mut fn_enum_rets: List[FnEnumRetEntry] = []
 pub let mut emitted_let_names: List[Str] = []
 pub let mut emitted_fn_names: List[Str] = []
 pub let mut cg_closure_defs: List[Str] = []
 pub let mut cg_closure_counter: Int = 0
 
-// Capture analysis: per-closure capture info (flat list with start/count indexes)
-pub let mut closure_capture_names: List[Str] = []
-pub let mut closure_capture_types: List[Int] = []
-pub let mut closure_capture_muts: List[Int] = []
-pub let mut closure_capture_starts: List[Int] = []
-pub let mut closure_capture_counts: List[Int] = []
+// Capture analysis: per-capture info (flat list) and per-closure start/count
+type CaptureEntry {
+    name: Str
+    ctype: Int
+    is_mut: Int
+}
+
+type ClosureCapInfo {
+    start: Int
+    count: Int
+}
+
+pub let mut closure_captures: List[CaptureEntry] = []
+pub let mut closure_cap_infos: List[ClosureCapInfo] = []
 
 // Active closure context: set while emitting a closure body, -1 otherwise
 pub let mut cg_closure_cap_start: Int = -1
@@ -68,69 +91,117 @@ pub let mut cg_closure_cap_count: Int = 0
 pub let mut mut_captured_vars: List[Str] = []
 
 // Trait registry: maps trait name -> method names
-pub let mut trait_reg_names: List[Str] = []
-pub let mut trait_reg_method_sl: List[Int] = []
+type TraitEntry {
+    name: Str
+    method_sl: Int
+}
+pub let mut trait_entries: List[TraitEntry] = []
 
 // Impl registry: maps (trait, type) -> method FnDef nodes
-pub let mut impl_reg_trait: List[Str] = []
-pub let mut impl_reg_type: List[Str] = []
-pub let mut impl_reg_methods_sl: List[Int] = []
+type ImplEntry {
+    trait_name: Str
+    type_name: Str
+    methods_sl: Int
+}
+pub let mut impl_entries: List[ImplEntry] = []
 
 // From impl registry: (source_type, target_type) -> methods sublist
-pub let mut from_reg_source: List[Str] = []
-pub let mut from_reg_target: List[Str] = []
-pub let mut from_reg_method_sl: List[Int] = []
+type FromImplEntry {
+    source: Str
+    target: Str
+    method_sl: Int
+}
+pub let mut from_entries: List[FromImplEntry] = []
 
 // TryFrom impl registry: (source_type, target_type) -> methods sublist
-pub let mut tryfrom_reg_source: List[Str] = []
-pub let mut tryfrom_reg_target: List[Str] = []
-pub let mut tryfrom_reg_method_sl: List[Int] = []
+type TryFromImplEntry {
+    source: Str
+    target: Str
+    method_sl: Int
+}
+pub let mut tryfrom_entries: List[TryFromImplEntry] = []
 
 // Variable-to-struct-type tracking (for method resolution)
-pub let mut var_struct_names: List[Str] = []
-pub let mut var_struct_types: List[Str] = []
+type VarStructEntry {
+    name: Str
+    stype: Str
+}
+pub let mut var_structs: List[VarStructEntry] = []
+pub let mut var_struct_frame_starts: List[Int] = []
 
 // Struct field type registry: (struct_name, field_name) -> field C type
-pub let mut sf_reg_struct: List[Str] = []
-pub let mut sf_reg_field: List[Str] = []
-pub let mut sf_reg_type: List[Int] = []
-pub let mut sf_reg_stype: List[Str] = []
+type StructFieldEntry {
+    struct_name: Str
+    field_name: Str
+    field_type: Int
+    stype: Str
+}
+pub let mut sf_entries: List[StructFieldEntry] = []
 
 // Closure-typed variable tracking: (name) -> C function pointer signature
-pub let mut var_closure_names: List[Str] = []
-pub let mut var_closure_sigs: List[Str] = []
+type VarClosureEntry {
+    name: Str
+    sig: Str
+}
+pub let mut var_closures: List[VarClosureEntry] = []
+pub let mut var_closure_frame_starts: List[Int] = []
 
 // Generic function definition registry: fn_name -> fn_node for generic fns
-pub let mut generic_fn_names: List[Str] = []
-pub let mut generic_fn_nodes: List[Int] = []
+type GenericFnEntry {
+    name: Str
+    node: Int
+}
+pub let mut generic_fns: List[GenericFnEntry] = []
 
 // Mono function instances to emit: (base_fn_name, concrete_args)
-pub let mut mono_fn_bases: List[Str] = []
-pub let mut mono_fn_args: List[Str] = []
+type MonoFnInstance {
+    base: Str
+    args: Str
+}
+pub let mut mono_fns: List[MonoFnInstance] = []
 
 // Generic monomorphic instance registry
-pub let mut mono_base_names: List[Str] = []
-pub let mut mono_concrete_args: List[Str] = []
-pub let mut mono_c_names: List[Str] = []
+type MonoInstance {
+    base: Str
+    args: Str
+    c_name: Str
+}
+pub let mut mono_instances: List[MonoInstance] = []
 
 // Option/Result type tracking
-pub let mut var_option_names: List[Str] = []
-pub let mut var_option_inner: List[Int] = []
-pub let mut var_result_names: List[Str] = []
-pub let mut var_result_ok: List[Int] = []
-pub let mut var_result_err: List[Int] = []
+type VarOptionEntry {
+    name: Str
+    inner: Int
+}
+pub let mut var_options: List[VarOptionEntry] = []
+pub let mut var_option_frame_starts: List[Int] = []
+type VarResultEntry {
+    name: Str
+    ok_type: Int
+    err_type: Int
+}
+pub let mut var_results: List[VarResultEntry] = []
+pub let mut var_result_frame_starts: List[Int] = []
 pub let mut emitted_option_types: List[Int] = []
 pub let mut emitted_result_types: List[Str] = []
 pub let mut emitted_iter_types: List[Int] = []
 pub let mut emitted_range_iter: Int = 0
 pub let mut emitted_str_iter: Int = 0
 
-pub let mut var_iterator_names: List[Str] = []
-pub let mut var_iterator_inner: List[Int] = []
-pub let mut var_iter_next_fns: List[Str] = []
-pub let mut var_iter_next_names: List[Str] = []
-pub let mut var_alias_names: List[Str] = []
-pub let mut var_alias_targets: List[Str] = []
+type VarIteratorEntry {
+    name: Str
+    inner: Int
+    next_fn: Str
+    next_name: Str
+}
+pub let mut var_iterators: List[VarIteratorEntry] = []
+pub let mut var_iterator_frame_starts: List[Int] = []
+type VarAliasEntry {
+    name: Str
+    target: Str
+}
+pub let mut var_aliases: List[VarAliasEntry] = []
+pub let mut var_alias_frame_starts: List[Int] = []
 pub let mut emitted_map_iters: List[Int] = []
 pub let mut emitted_filter_iters: List[Int] = []
 pub let mut emitted_take_iters: List[Int] = []
@@ -138,10 +209,18 @@ pub let mut emitted_skip_iters: List[Int] = []
 pub let mut emitted_chain_iters: List[Int] = []
 pub let mut emitted_flat_map_iters: List[Int] = []
 
-pub let mut var_handle_names: List[Str] = []
-pub let mut var_handle_inner: List[Int] = []
-pub let mut var_channel_names: List[Str] = []
-pub let mut var_channel_inner: List[Int] = []
+type VarHandleEntry {
+    name: Str
+    inner: Int
+}
+pub let mut var_handles: List[VarHandleEntry] = []
+pub let mut var_handle_frame_starts: List[Int] = []
+type VarChannelEntry {
+    name: Str
+    inner: Int
+}
+pub let mut var_channels: List[VarChannelEntry] = []
+pub let mut var_channel_frame_starts: List[Int] = []
 
 // Assignment context for .into() type inference
 pub let mut cg_let_target_type: Int = 0
@@ -159,41 +238,61 @@ pub let mut cg_handler_body_idx: Int = 0
 
 // Scope: parallel lists for variable names, types, and mutability.
 // Each scope is a "frame" delimited by frame_starts.
-pub let mut scope_names: List[Str] = []
-pub let mut scope_types: List[Int] = []
-pub let mut scope_muts: List[Int] = []
+type ScopeVar {
+    name: Str
+    ctype: Int
+    is_mut: Int
+}
+pub let mut scope_vars: List[ScopeVar] = []
 pub let mut scope_frame_starts: List[Int] = []
 
 // Function registry: parallel lists (fn name -> return type, param count)
-pub let mut fn_reg_names: List[Str] = []
-pub let mut fn_reg_ret: List[Int] = []
-pub let mut fn_reg_effect_sl: List[Int] = []
+type FnRegEntry {
+    name: Str
+    ret: Int
+    effect_sl: Int
+}
+pub let mut fn_regs: List[FnRegEntry] = []
 
-// Function return type tracking for Result/Option/List
-pub let mut fn_ret_result_names: List[Str] = []
-pub let mut fn_ret_result_ok: List[Int] = []
-pub let mut fn_ret_result_err: List[Int] = []
-pub let mut fn_ret_option_names: List[Str] = []
-pub let mut fn_ret_option_inner: List[Int] = []
-pub let mut fn_ret_list_names: List[Str] = []
-pub let mut fn_ret_list_elem: List[Int] = []
+// Function return struct type tracking
+type FnRetStructEntry {
+    name: Str
+    stype: Str
+}
+pub let mut fn_ret_structs: List[FnRetStructEntry] = []
+
+// Function return type tracking — unified struct
+type RetType {
+    name: Str
+    kind: Int
+    inner1: Int
+    inner2: Int
+}
+
+pub let mut fn_ret_types: List[RetType] = []
 
 // Effect registry: name -> parent index (-1 = top-level)
-pub let mut effect_reg_names: List[Str] = []
-pub let mut effect_reg_parent: List[Int] = []
+type EffectEntry {
+    name: Str
+    parent: Int
+}
+pub let mut effect_entries: List[EffectEntry] = []
 
-// User-defined effect registry: tracks vtable types and handle names
-// ue_reg_names: top-level effect name (e.g. "Metrics")
-// ue_reg_handle: handle name (e.g. "metrics")
-// ue_reg_methods: comma-sep method names per effect (e.g. "counter,gauge,histogram")
-// ue_reg_method_params: comma-sep C param strings per method (parallel to flattened methods)
-// ue_reg_method_rets: C return type per method (parallel to flattened methods)
-pub let mut ue_reg_names: List[Str] = []
-pub let mut ue_reg_handle: List[Str] = []
-pub let mut ue_reg_methods: List[Str] = []
-pub let mut ue_reg_method_params: List[Str] = []
-pub let mut ue_reg_method_rets: List[Str] = []
-pub let mut ue_reg_method_effect: List[Str] = []
+// User-defined effect registry
+type UeEffect {
+    name: Str
+    handle: Str
+}
+
+type UeMethod {
+    name: Str
+    params: Str
+    ret: Str
+    effect_handle: Str
+}
+
+pub let mut ue_effects: List[UeEffect] = []
+pub let mut ue_methods: List[UeMethod] = []
 
 // @capabilities budget: allowed effects for the module (-1 = no budget)
 pub let mut cap_budget_names: List[Str] = []
@@ -203,8 +302,22 @@ pub let mut cap_budget_active: Int = 0
 pub let mut cg_current_fn_name: Str = ""
 pub let mut cg_current_fn_ret: Int = 0
 
-pub let mut var_list_elem_names: List[Str] = []
-pub let mut var_list_elem_types: List[Int] = []
+type VarListElemEntry {
+    name: Str
+    elem_type: Int
+    struct_name: Str
+}
+pub let mut var_list_elems: List[VarListElemEntry] = []
+pub let mut var_list_elem_frame_starts: List[Int] = []
+
+type VarMapEntry {
+    name: Str
+    key_type: Int
+    value_type: Int
+    value_struct: Str
+}
+pub let mut var_maps: List[VarMapEntry] = []
+pub let mut var_map_frame_starts: List[Int] = []
 
 // Scratch space for tuple match scrutinee temps
 pub let mut cg_program_node: Int = 0
@@ -215,35 +328,95 @@ pub let mut cg_async_wrapper_counter: Int = 0
 pub let mut cg_async_scope_stack: List[Str] = []
 pub let mut cg_async_scope_counter: Int = 0
 
-pub let mut match_scrut_strs: List[Str] = []
-pub let mut match_scrut_types: List[Int] = []
+type MatchScrutEntry {
+    str_val: Str
+    scrut_type: Int
+}
+pub let mut match_scruts: List[MatchScrutEntry] = []
 pub let mut match_scrut_enum: Str = ""
 
 pub fn push_scope() {
-    scope_frame_starts.push(scope_names.len())
+    scope_frame_starts.push(scope_vars.len())
+    var_struct_frame_starts.push(var_structs.len())
+    var_closure_frame_starts.push(var_closures.len())
+    var_option_frame_starts.push(var_options.len())
+    var_result_frame_starts.push(var_results.len())
+    var_iterator_frame_starts.push(var_iterators.len())
+    var_alias_frame_starts.push(var_aliases.len())
+    var_handle_frame_starts.push(var_handles.len())
+    var_channel_frame_starts.push(var_channels.len())
+    var_list_elem_frame_starts.push(var_list_elems.len())
+    var_map_frame_starts.push(var_maps.len())
 }
 
 pub fn pop_scope() {
     let start = scope_frame_starts.get(scope_frame_starts.len() - 1)
     scope_frame_starts.pop()
-    while scope_names.len() > start {
-        scope_names.pop()
-        scope_types.pop()
-        scope_muts.pop()
+    while scope_vars.len() > start {
+        scope_vars.pop()
+    }
+    let vs_start = var_struct_frame_starts.get(var_struct_frame_starts.len() - 1)
+    var_struct_frame_starts.pop()
+    while var_structs.len() > vs_start {
+        var_structs.pop()
+    }
+    let vc_start = var_closure_frame_starts.get(var_closure_frame_starts.len() - 1)
+    var_closure_frame_starts.pop()
+    while var_closures.len() > vc_start {
+        var_closures.pop()
+    }
+    let vo_start = var_option_frame_starts.get(var_option_frame_starts.len() - 1)
+    var_option_frame_starts.pop()
+    while var_options.len() > vo_start {
+        var_options.pop()
+    }
+    let vr_start = var_result_frame_starts.get(var_result_frame_starts.len() - 1)
+    var_result_frame_starts.pop()
+    while var_results.len() > vr_start {
+        var_results.pop()
+    }
+    let vi_start = var_iterator_frame_starts.get(var_iterator_frame_starts.len() - 1)
+    var_iterator_frame_starts.pop()
+    while var_iterators.len() > vi_start {
+        var_iterators.pop()
+    }
+    let va_start = var_alias_frame_starts.get(var_alias_frame_starts.len() - 1)
+    var_alias_frame_starts.pop()
+    while var_aliases.len() > va_start {
+        var_aliases.pop()
+    }
+    let vh_start = var_handle_frame_starts.get(var_handle_frame_starts.len() - 1)
+    var_handle_frame_starts.pop()
+    while var_handles.len() > vh_start {
+        var_handles.pop()
+    }
+    let vch_start = var_channel_frame_starts.get(var_channel_frame_starts.len() - 1)
+    var_channel_frame_starts.pop()
+    while var_channels.len() > vch_start {
+        var_channels.pop()
+    }
+    let vle_start = var_list_elem_frame_starts.get(var_list_elem_frame_starts.len() - 1)
+    var_list_elem_frame_starts.pop()
+    while var_list_elems.len() > vle_start {
+        var_list_elems.pop()
+    }
+    let vm_start = var_map_frame_starts.get(var_map_frame_starts.len() - 1)
+    var_map_frame_starts.pop()
+    while var_maps.len() > vm_start {
+        var_maps.pop()
     }
 }
 
 pub fn set_var(name: Str, ctype: Int, is_mut: Int) {
-    scope_names.push(name)
-    scope_types.push(ctype)
-    scope_muts.push(is_mut)
+    scope_vars.push(ScopeVar { name: name, ctype: ctype, is_mut: is_mut })
 }
 
 pub fn get_var_type(name: Str) -> Int {
-    let mut i = scope_names.len() - 1
+    let mut i = scope_vars.len() - 1
     while i >= 0 {
-        if scope_names.get(i) == name {
-            return scope_types.get(i)
+        let sv = scope_vars.get(i)
+        if sv.name == name {
+            return sv.ctype
         }
         i = i - 1
     }
@@ -251,10 +424,11 @@ pub fn get_var_type(name: Str) -> Int {
 }
 
 pub fn get_var_mut(name: Str) -> Int {
-    let mut i = scope_names.len() - 1
+    let mut i = scope_vars.len() - 1
     while i >= 0 {
-        if scope_names.get(i) == name {
-            return scope_muts.get(i)
+        let sv = scope_vars.get(i)
+        if sv.name == name {
+            return sv.is_mut
         }
         i = i - 1
     }
@@ -278,7 +452,7 @@ pub fn get_capture_index(name: Str) -> Int {
     }
     let mut i = 0
     while i < cg_closure_cap_count {
-        if closure_capture_names.get(cg_closure_cap_start + i) == name {
+        if closure_captures.get(cg_closure_cap_start + i).name == name {
             return i
         }
         i = i + 1
@@ -287,7 +461,7 @@ pub fn get_capture_index(name: Str) -> Int {
 }
 
 pub fn capture_cast_expr(idx: Int) -> Str {
-    let ct = closure_capture_types.get(cg_closure_cap_start + idx)
+    let ct = closure_captures.get(cg_closure_cap_start + idx).ctype
     if ct == CT_INT {
         "(int64_t)(intptr_t)pact_closure_get_capture(__self, {idx})"
     } else if ct == CT_FLOAT {
@@ -298,6 +472,8 @@ pub fn capture_cast_expr(idx: Int) -> Str {
         "(int)(intptr_t)pact_closure_get_capture(__self, {idx})"
     } else if ct == CT_LIST {
         "(pact_list*)pact_closure_get_capture(__self, {idx})"
+    } else if ct == CT_MAP {
+        "(pact_map*)pact_closure_get_capture(__self, {idx})"
     } else if ct == CT_CLOSURE {
         "(pact_closure*)pact_closure_get_capture(__self, {idx})"
     } else {
@@ -306,86 +482,55 @@ pub fn capture_cast_expr(idx: Int) -> Str {
 }
 
 pub fn reg_fn(name: Str, ret: Int) {
-    fn_reg_names.push(name)
-    fn_reg_ret.push(ret)
-    fn_reg_effect_sl.push(-1)
+    fn_regs.push(FnRegEntry { name: name, ret: ret, effect_sl: -1 })
 }
 
 pub fn reg_fn_with_effects(name: Str, ret: Int, effects_sl: Int) {
-    fn_reg_names.push(name)
-    fn_reg_ret.push(ret)
-    fn_reg_effect_sl.push(effects_sl)
+    fn_regs.push(FnRegEntry { name: name, ret: ret, effect_sl: effects_sl })
 }
 
 pub fn get_fn_effect_sl(name: Str) -> Int {
     let mut i = 0
-    while i < fn_reg_names.len() {
-        if fn_reg_names.get(i) == name {
-            return fn_reg_effect_sl.get(i)
+    while i < fn_regs.len() {
+        let fr = fn_regs.get(i)
+        if fr.name == name {
+            return fr.effect_sl
         }
         i = i + 1
     }
     -1
 }
 
-pub fn reg_fn_result_ret(name: Str, ok_t: Int, err_t: Int) {
-    fn_ret_result_names.push(name)
-    fn_ret_result_ok.push(ok_t)
-    fn_ret_result_err.push(err_t)
+pub fn reg_fn_struct_ret(name: Str, stype: Str) {
+    fn_ret_structs.push(FnRetStructEntry { name: name, stype: stype })
 }
 
-pub fn reg_fn_option_ret(name: Str, inner: Int) {
-    fn_ret_option_names.push(name)
-    fn_ret_option_inner.push(inner)
-}
-
-pub fn get_fn_ret_result_ok(name: Str) -> Int {
-    let mut i = fn_ret_result_names.len() - 1
+pub fn get_fn_ret_struct(name: Str) -> Str {
+    let mut i = fn_ret_structs.len() - 1
     while i >= 0 {
-        if fn_ret_result_names.get(i) == name {
-            return fn_ret_result_ok.get(i)
+        let frs = fn_ret_structs.get(i)
+        if frs.name == name {
+            return frs.stype
         }
         i = i - 1
     }
-    -1
+    ""
 }
 
-pub fn get_fn_ret_result_err(name: Str) -> Int {
-    let mut i = fn_ret_result_names.len() - 1
+pub fn reg_fn_ret_type(name: Str, kind: Int, inner1: Int, inner2: Int) {
+    fn_ret_types.push(RetType { name: name, kind: kind, inner1: inner1, inner2: inner2 })
+}
+
+pub fn get_fn_ret_type(name: Str) -> RetType {
+    let mut i = fn_ret_types.len() - 1
     while i >= 0 {
-        if fn_ret_result_names.get(i) == name {
-            return fn_ret_result_err.get(i)
+        let rt = fn_ret_types.get(i)
+        if rt.name == name {
+            return rt
         }
         i = i - 1
     }
-    -1
-}
-
-pub fn get_fn_ret_option_inner(name: Str) -> Int {
-    let mut i = fn_ret_option_names.len() - 1
-    while i >= 0 {
-        if fn_ret_option_names.get(i) == name {
-            return fn_ret_option_inner.get(i)
-        }
-        i = i - 1
-    }
-    -1
-}
-
-pub fn reg_fn_list_ret(name: Str, elem_t: Int) {
-    fn_ret_list_names.push(name)
-    fn_ret_list_elem.push(elem_t)
-}
-
-pub fn get_fn_ret_list_elem(name: Str) -> Int {
-    let mut i = fn_ret_list_names.len() - 1
-    while i >= 0 {
-        if fn_ret_list_names.get(i) == name {
-            return fn_ret_list_elem.get(i)
-        }
-        i = i - 1
-    }
-    -1
+    RetType { name: "", kind: CT_VOID, inner1: -1, inner2: -1 }
 }
 
 pub fn resolve_ret_type_from_ann(fn_node: Int) -> Str {
@@ -424,7 +569,7 @@ pub fn reg_fn_ret_from_ann(name: Str, fn_node: Int) {
             let err_ann = sublist_get(elems_sl, 1)
             let ok_t = type_from_name(np_name.get(ok_ann))
             let err_t = type_from_name(np_name.get(err_ann))
-            reg_fn_result_ret(name, ok_t, err_t)
+            reg_fn_ret_type(name, CT_RESULT, ok_t, err_t)
             ensure_result_type(ok_t, err_t)
         }
     }
@@ -433,7 +578,7 @@ pub fn reg_fn_ret_from_ann(name: Str, fn_node: Int) {
         if elems_sl != -1 && sublist_length(elems_sl) >= 1 {
             let inner_ann = sublist_get(elems_sl, 0)
             let inner_t = type_from_name(np_name.get(inner_ann))
-            reg_fn_option_ret(name, inner_t)
+            reg_fn_ret_type(name, CT_OPTION, inner_t, -1)
             ensure_option_type(inner_t)
         }
     }
@@ -441,23 +586,23 @@ pub fn reg_fn_ret_from_ann(name: Str, fn_node: Int) {
         let elems_sl = np_elements.get(ta)
         if elems_sl != -1 && sublist_length(elems_sl) >= 1 {
             let elem_ann = sublist_get(elems_sl, 0)
-            let elem_t = type_from_name(np_name.get(elem_ann))
-            reg_fn_list_ret(name, elem_t)
+            let elem_name = np_name.get(elem_ann)
+            let elem_t = type_from_name(elem_name)
+            reg_fn_ret_type(name, CT_LIST, elem_t, -1)
         }
     }
 }
 
 pub fn reg_effect(name: Str, parent: Int) -> Int {
-    let idx = effect_reg_names.len()
-    effect_reg_names.push(name)
-    effect_reg_parent.push(parent)
+    let idx = effect_entries.len()
+    effect_entries.push(EffectEntry { name: name, parent: parent })
     idx
 }
 
 pub fn get_effect_idx(name: Str) -> Int {
     let mut i = 0
-    while i < effect_reg_names.len() {
-        if effect_reg_names.get(i) == name {
+    while i < effect_entries.len() {
+        if effect_entries.get(i).name == name {
             return i
         }
         i = i + 1
@@ -473,11 +618,11 @@ pub fn effect_satisfies(caller_effect: Str, callee_effect: Str) -> Int {
     if callee_idx == -1 {
         return 0
     }
-    let parent_idx = effect_reg_parent.get(callee_idx)
+    let parent_idx = effect_entries.get(callee_idx).parent
     if parent_idx == -1 {
         return 0
     }
-    let parent_name = effect_reg_names.get(parent_idx)
+    let parent_name = effect_entries.get(parent_idx).name
     if parent_name == caller_effect {
         return 1
     }
@@ -591,9 +736,10 @@ pub fn init_builtin_effects() {
 
 pub fn get_ue_handle(effect_name: Str) -> Str {
     let mut i = 0
-    while i < ue_reg_names.len() {
-        if ue_reg_names.get(i) == effect_name {
-            return ue_reg_handle.get(i)
+    while i < ue_effects.len() {
+        let ue = ue_effects.get(i)
+        if ue.name == effect_name {
+            return ue.handle
         }
         i = i + 1
     }
@@ -602,9 +748,10 @@ pub fn get_ue_handle(effect_name: Str) -> Str {
 
 pub fn get_ue_top_for_handle(handle: Str) -> Str {
     let mut i = 0
-    while i < ue_reg_handle.len() {
-        if ue_reg_handle.get(i) == handle {
-            return ue_reg_names.get(i)
+    while i < ue_effects.len() {
+        let ue = ue_effects.get(i)
+        if ue.handle == handle {
+            return ue.name
         }
         i = i + 1
     }
@@ -613,8 +760,8 @@ pub fn get_ue_top_for_handle(handle: Str) -> Str {
 
 pub fn is_user_effect_handle(name: Str) -> Int {
     let mut i = 0
-    while i < ue_reg_handle.len() {
-        if ue_reg_handle.get(i) == name {
+    while i < ue_effects.len() {
+        if ue_effects.get(i).handle == name {
             return 1
         }
         i = i + 1
@@ -624,12 +771,10 @@ pub fn is_user_effect_handle(name: Str) -> Int {
 
 pub fn ue_has_method(handle: Str, method: Str) -> Int {
     let mut i = 0
-    while i < ue_reg_method_effect.len() {
-        if ue_reg_method_effect.get(i) == handle {
-            let mparts = ue_reg_methods.get(i)
-            if mparts == method {
-                return 1
-            }
+    while i < ue_methods.len() {
+        let uem = ue_methods.get(i)
+        if uem.effect_handle == handle && uem.name == method {
+            return 1
         }
         i = i + 1
     }
@@ -638,8 +783,8 @@ pub fn ue_has_method(handle: Str, method: Str) -> Int {
 
 pub fn is_fn_registered(name: Str) -> Int {
     let mut i = 0
-    while i < fn_reg_names.len() {
-        if fn_reg_names.get(i) == name {
+    while i < fn_regs.len() {
+        if fn_regs.get(i).name == name {
             return 1
         }
         i = i + 1
@@ -649,9 +794,10 @@ pub fn is_fn_registered(name: Str) -> Int {
 
 pub fn get_fn_ret(name: Str) -> Int {
     let mut i = 0
-    while i < fn_reg_names.len() {
-        if fn_reg_names.get(i) == name {
-            return fn_reg_ret.get(i)
+    while i < fn_regs.len() {
+        let fr = fn_regs.get(i)
+        if fr.name == name {
+            return fr.ret
         }
         i = i + 1
     }
@@ -659,19 +805,87 @@ pub fn get_fn_ret(name: Str) -> Int {
 }
 
 pub fn set_list_elem_type(name: Str, elem_type: Int) {
-    var_list_elem_names.push(name)
-    var_list_elem_types.push(elem_type)
+    var_list_elems.push(VarListElemEntry { name: name, elem_type: elem_type, struct_name: "" })
 }
 
 pub fn get_list_elem_type(name: Str) -> Int {
-    let mut i = 0
-    while i < var_list_elem_names.len() {
-        if var_list_elem_names.get(i) == name {
-            return var_list_elem_types.get(i)
+    let mut i = var_list_elems.len() - 1
+    while i >= 0 {
+        let e = var_list_elems.get(i)
+        if e.name == name && e.elem_type != -1 {
+            return e.elem_type
         }
-        i = i + 1
+        i = i - 1
     }
     CT_INT
+}
+
+pub fn set_list_elem_struct(name: Str, struct_name: Str) {
+    var_list_elems.push(VarListElemEntry { name: name, elem_type: -1, struct_name: struct_name })
+}
+
+pub fn get_list_elem_struct(name: Str) -> Str {
+    let mut i = var_list_elems.len() - 1
+    while i >= 0 {
+        let e = var_list_elems.get(i)
+        if e.name == name && e.struct_name != "" {
+            return e.struct_name
+        }
+        i = i - 1
+    }
+    ""
+}
+
+pub fn set_map_types(name: Str, key_type: Int, value_type: Int) {
+    var_maps.push(VarMapEntry { name: name, key_type: key_type, value_type: value_type, value_struct: "" })
+}
+
+pub fn get_map_key_type(name: Str) -> Int {
+    let mut i = var_maps.len() - 1
+    while i >= 0 {
+        let vm = var_maps.get(i)
+        if vm.name == name {
+            return vm.key_type
+        }
+        i = i - 1
+    }
+    CT_STRING
+}
+
+pub fn get_map_value_type(name: Str) -> Int {
+    let mut i = var_maps.len() - 1
+    while i >= 0 {
+        let vm = var_maps.get(i)
+        if vm.name == name {
+            return vm.value_type
+        }
+        i = i - 1
+    }
+    CT_INT
+}
+
+pub fn set_map_value_struct(name: Str, struct_name: Str) {
+    let mut i = var_maps.len() - 1
+    while i >= 0 {
+        let vm = var_maps.get(i)
+        if vm.name == name {
+            var_maps.set(i, VarMapEntry { name: name, key_type: vm.key_type, value_type: vm.value_type, value_struct: struct_name })
+            return
+        }
+        i = i - 1
+    }
+}
+
+pub fn get_map_value_struct(name: Str) -> Str {
+    let mut i = var_maps.len() - 1
+    while i >= 0 {
+        let vm = var_maps.get(i)
+        if vm.name == name {
+            return vm.value_struct
+        }
+        i = i - 1
+    }
+    ""
 }
 
 pub fn is_struct_type(name: Str) -> Int {
@@ -687,8 +901,8 @@ pub fn is_struct_type(name: Str) -> Int {
 
 pub fn is_enum_type(name: Str) -> Int {
     let mut i = 0
-    while i < enum_reg_names.len() {
-        if enum_reg_names.get(i) == name {
+    while i < enum_regs.len() {
+        if enum_regs.get(i).name == name {
             return 1
         }
         i = i + 1
@@ -698,9 +912,10 @@ pub fn is_enum_type(name: Str) -> Int {
 
 pub fn resolve_variant(name: Str) -> Str {
     let mut i = 0
-    while i < enum_reg_variant_names.len() {
-        if enum_reg_variant_names.get(i) == name {
-            return enum_reg_names.get(enum_reg_variant_enum_idx.get(i))
+    while i < enum_variants.len() {
+        let evar = enum_variants.get(i)
+        if evar.name == name {
+            return enum_regs.get(evar.enum_idx).name
         }
         i = i + 1
     }
@@ -709,9 +924,10 @@ pub fn resolve_variant(name: Str) -> Str {
 
 pub fn get_var_enum(name: Str) -> Str {
     let mut i = 0
-    while i < var_enum_names.len() {
-        if var_enum_names.get(i) == name {
-            return var_enum_types.get(i)
+    while i < var_enums.len() {
+        let ve = var_enums.get(i)
+        if ve.name == name {
+            return ve.enum_type
         }
         i = i + 1
     }
@@ -720,11 +936,10 @@ pub fn get_var_enum(name: Str) -> Str {
 
 pub fn is_data_enum(name: Str) -> Int {
     let mut i = 0
-    while i < enum_reg_names.len() {
-        if enum_reg_names.get(i) == name {
-            if i < enum_has_data.len() {
-                return enum_has_data.get(i)
-            }
+    while i < enum_regs.len() {
+        let ereg = enum_regs.get(i)
+        if ereg.name == name {
+            return ereg.has_data
         }
         i = i + 1
     }
@@ -733,10 +948,10 @@ pub fn is_data_enum(name: Str) -> Int {
 
 pub fn get_variant_index(enum_name: Str, variant_name: Str) -> Int {
     let mut i = 0
-    while i < enum_reg_variant_names.len() {
-        if enum_reg_variant_names.get(i) == variant_name {
-            let eidx = enum_reg_variant_enum_idx.get(i)
-            if enum_reg_names.get(eidx) == enum_name {
+    while i < enum_variants.len() {
+        let evar = enum_variants.get(i)
+        if evar.name == variant_name {
+            if enum_regs.get(evar.enum_idx).name == enum_name {
                 return i
             }
         }
@@ -748,10 +963,10 @@ pub fn get_variant_index(enum_name: Str, variant_name: Str) -> Int {
 pub fn get_variant_tag(enum_name: Str, variant_name: Str) -> Int {
     let mut tag = 0
     let mut i = 0
-    while i < enum_reg_variant_names.len() {
-        let eidx = enum_reg_variant_enum_idx.get(i)
-        if enum_reg_names.get(eidx) == enum_name {
-            if enum_reg_variant_names.get(i) == variant_name {
+    while i < enum_variants.len() {
+        let evar = enum_variants.get(i)
+        if enum_regs.get(evar.enum_idx).name == enum_name {
+            if evar.name == variant_name {
                 return tag
             }
             tag = tag + 1
@@ -762,14 +977,14 @@ pub fn get_variant_tag(enum_name: Str, variant_name: Str) -> Int {
 }
 
 pub fn get_variant_field_count(variant_idx: Int) -> Int {
-    if variant_idx < 0 || variant_idx >= enum_variant_field_counts.len() {
+    if variant_idx < 0 || variant_idx >= enum_variants.len() {
         return 0
     }
-    enum_variant_field_counts.get(variant_idx)
+    enum_variants.get(variant_idx).field_count
 }
 
 pub fn get_variant_field_name(variant_idx: Int, field_idx: Int) -> Str {
-    let names_str = enum_variant_field_names.get(variant_idx)
+    let names_str = enum_variants.get(variant_idx).field_names
     if names_str == "" {
         return ""
     }
@@ -790,7 +1005,7 @@ pub fn get_variant_field_name(variant_idx: Int, field_idx: Int) -> Str {
 }
 
 pub fn get_variant_field_type_str(variant_idx: Int, field_idx: Int) -> Str {
-    let types_str = enum_variant_field_types.get(variant_idx)
+    let types_str = enum_variants.get(variant_idx).field_types
     if types_str == "" {
         return ""
     }
@@ -812,9 +1027,10 @@ pub fn get_variant_field_type_str(variant_idx: Int, field_idx: Int) -> Str {
 
 pub fn get_fn_enum_ret(name: Str) -> Str {
     let mut i = 0
-    while i < fn_enum_ret_names.len() {
-        if fn_enum_ret_names.get(i) == name {
-            return fn_enum_ret_types.get(i)
+    while i < fn_enum_rets.len() {
+        let fe = fn_enum_rets.get(i)
+        if fe.name == name {
+            return fe.enum_type
         }
         i = i + 1
     }
@@ -822,26 +1038,27 @@ pub fn get_fn_enum_ret(name: Str) -> Str {
 }
 
 pub fn set_var_struct(name: Str, type_name: Str) {
-    var_struct_names.push(name)
-    var_struct_types.push(type_name)
+    var_structs.push(VarStructEntry { name: name, stype: type_name })
 }
 
 pub fn get_var_struct(name: Str) -> Str {
-    let mut i = 0
-    while i < var_struct_names.len() {
-        if var_struct_names.get(i) == name {
-            return var_struct_types.get(i)
+    let mut i = var_structs.len() - 1
+    while i >= 0 {
+        let vs = var_structs.get(i)
+        if vs.name == name {
+            return vs.stype
         }
-        i = i + 1
+        i = i - 1
     }
     ""
 }
 
 pub fn get_struct_field_type(sname: Str, fname: Str) -> Int {
     let mut i = 0
-    while i < sf_reg_struct.len() {
-        if sf_reg_struct.get(i) == sname && sf_reg_field.get(i) == fname {
-            return sf_reg_type.get(i)
+    while i < sf_entries.len() {
+        let sf = sf_entries.get(i)
+        if sf.struct_name == sname && sf.field_name == fname {
+            return sf.field_type
         }
         i = i + 1
     }
@@ -850,9 +1067,10 @@ pub fn get_struct_field_type(sname: Str, fname: Str) -> Int {
 
 pub fn get_struct_field_stype(sname: Str, fname: Str) -> Str {
     let mut i = 0
-    while i < sf_reg_struct.len() {
-        if sf_reg_struct.get(i) == sname && sf_reg_field.get(i) == fname {
-            return sf_reg_stype.get(i)
+    while i < sf_entries.len() {
+        let sf = sf_entries.get(i)
+        if sf.struct_name == sname && sf.field_name == fname {
+            return sf.stype
         }
         i = i + 1
     }
@@ -860,15 +1078,15 @@ pub fn get_struct_field_stype(sname: Str, fname: Str) -> Str {
 }
 
 pub fn set_var_closure(name: Str, sig: Str) {
-    var_closure_names.push(name)
-    var_closure_sigs.push(sig)
+    var_closures.push(VarClosureEntry { name: name, sig: sig })
 }
 
 pub fn get_var_closure_sig(name: Str) -> Str {
     let mut i = 0
-    while i < var_closure_names.len() {
-        if var_closure_names.get(i) == name {
-            return var_closure_sigs.get(i)
+    while i < var_closures.len() {
+        let vc = var_closures.get(i)
+        if vc.name == name {
+            return vc.sig
         }
         i = i + 1
     }
@@ -901,8 +1119,8 @@ pub fn build_closure_sig_from_type_ann(ta: Int) -> Str {
 
 pub fn is_generic_fn(name: Str) -> Int {
     let mut i = 0
-    while i < generic_fn_names.len() {
-        if generic_fn_names.get(i) == name {
+    while i < generic_fns.len() {
+        if generic_fns.get(i).name == name {
             return 1
         }
         i = i + 1
@@ -912,9 +1130,10 @@ pub fn is_generic_fn(name: Str) -> Int {
 
 pub fn get_generic_fn_node(name: Str) -> Int {
     let mut i = 0
-    while i < generic_fn_names.len() {
-        if generic_fn_names.get(i) == name {
-            return generic_fn_nodes.get(i)
+    while i < generic_fns.len() {
+        let gf = generic_fns.get(i)
+        if gf.name == name {
+            return gf.node
         }
         i = i + 1
     }
@@ -923,14 +1142,14 @@ pub fn get_generic_fn_node(name: Str) -> Int {
 
 pub fn register_mono_fn(base: Str, args: Str) {
     let mut i = 0
-    while i < mono_fn_bases.len() {
-        if mono_fn_bases.get(i) == base && mono_fn_args.get(i) == args {
+    while i < mono_fns.len() {
+        let mf = mono_fns.get(i)
+        if mf.base == base && mf.args == args {
             return
         }
         i = i + 1
     }
-    mono_fn_bases.push(base)
-    mono_fn_args.push(args)
+    mono_fns.push(MonoFnInstance { base: base, args: args })
 }
 
 pub fn infer_fn_type_args_from_types(fn_node: Int, arg_types: List[Int]) -> Str {
@@ -978,6 +1197,7 @@ pub fn type_name_from_ct(ct: Int) -> Str {
     else if ct == CT_ITERATOR { "Iterator" }
     else if ct == CT_HANDLE { "Handle" }
     else if ct == CT_CHANNEL { "Channel" }
+    else if ct == CT_MAP { "Map" }
     else { "Void" }
 }
 
@@ -1002,17 +1222,16 @@ pub fn register_mono_instance(base: Str, args: Str) -> Str {
         return existing
     }
     let c_name = mangle_generic_name(base, args)
-    mono_base_names.push(base)
-    mono_concrete_args.push(args)
-    mono_c_names.push(c_name)
+    mono_instances.push(MonoInstance { base: base, args: args, c_name: c_name })
     c_name
 }
 
 pub fn lookup_mono_instance(base: Str, args: Str) -> Str {
     let mut i = 0
-    while i < mono_base_names.len() {
-        if mono_base_names.get(i) == base && mono_concrete_args.get(i) == args {
-            return mono_c_names.get(i)
+    while i < mono_instances.len() {
+        let m = mono_instances.get(i)
+        if m.base == base && m.args == args {
+            return m.c_name
         }
         i = i + 1
     }
@@ -1021,8 +1240,8 @@ pub fn lookup_mono_instance(base: Str, args: Str) -> Str {
 
 pub fn is_trait_type(name: Str) -> Int {
     let mut i = 0
-    while i < trait_reg_names.len() {
-        if trait_reg_names.get(i) == name {
+    while i < trait_entries.len() {
+        if trait_entries.get(i).name == name {
             return 1
         }
         i = i + 1
@@ -1032,12 +1251,12 @@ pub fn is_trait_type(name: Str) -> Int {
 
 pub fn lookup_impl_method(type_name: Str, method: Str) -> Int {
     let mut i = 0
-    while i < impl_reg_type.len() {
-        if impl_reg_type.get(i) == type_name {
-            let methods_sl = impl_reg_methods_sl.get(i)
+    while i < impl_entries.len() {
+        let ie = impl_entries.get(i)
+        if ie.type_name == type_name {
             let mut j = 0
-            while j < sublist_length(methods_sl) {
-                let m = sublist_get(methods_sl, j)
+            while j < sublist_length(ie.methods_sl) {
+                let m = sublist_get(ie.methods_sl, j)
                 if np_name.get(m) == method {
                     return 1
                 }
@@ -1051,8 +1270,9 @@ pub fn lookup_impl_method(type_name: Str, method: Str) -> Int {
 
 pub fn lookup_impl_type_for_trait(trait_name: Str, type_name: Str) -> Int {
     let mut i = 0
-    while i < impl_reg_trait.len() {
-        if impl_reg_trait.get(i) == trait_name && impl_reg_type.get(i) == type_name {
+    while i < impl_entries.len() {
+        let ie = impl_entries.get(i)
+        if ie.trait_name == trait_name && ie.type_name == type_name {
             return 1
         }
         i = i + 1
@@ -1062,12 +1282,12 @@ pub fn lookup_impl_type_for_trait(trait_name: Str, type_name: Str) -> Int {
 
 pub fn get_impl_method_ret(type_name: Str, method: Str) -> Int {
     let mut i = 0
-    while i < impl_reg_type.len() {
-        if impl_reg_type.get(i) == type_name {
-            let methods_sl = impl_reg_methods_sl.get(i)
+    while i < impl_entries.len() {
+        let ie = impl_entries.get(i)
+        if ie.type_name == type_name {
             let mut j = 0
-            while j < sublist_length(methods_sl) {
-                let m = sublist_get(methods_sl, j)
+            while j < sublist_length(ie.methods_sl) {
+                let m = sublist_get(ie.methods_sl, j)
                 if np_name.get(m) == method {
                     let ret_str = np_return_type.get(m)
                     return type_from_name(ret_str)
@@ -1082,9 +1302,10 @@ pub fn get_impl_method_ret(type_name: Str, method: Str) -> Int {
 
 pub fn find_from_impl(source: Str, target: Str) -> Int {
     let mut i = 0
-    while i < from_reg_source.len() {
-        if from_reg_source.get(i) == source && from_reg_target.get(i) == target {
-            return from_reg_method_sl.get(i)
+    while i < from_entries.len() {
+        let fe = from_entries.get(i)
+        if fe.source == source && fe.target == target {
+            return fe.method_sl
         }
         i = i + 1
     }
@@ -1093,9 +1314,10 @@ pub fn find_from_impl(source: Str, target: Str) -> Int {
 
 pub fn find_tryfrom_impl(source: Str, target: Str) -> Int {
     let mut i = 0
-    while i < tryfrom_reg_source.len() {
-        if tryfrom_reg_source.get(i) == source && tryfrom_reg_target.get(i) == target {
-            return tryfrom_reg_method_sl.get(i)
+    while i < tryfrom_entries.len() {
+        let te = tryfrom_entries.get(i)
+        if te.source == source && te.target == target {
+            return te.method_sl
         }
         i = i + 1
     }
@@ -1158,6 +1380,7 @@ pub fn c_type_str(ct: Int) -> Str {
     else if ct == CT_ITERATOR { "void*" }
     else if ct == CT_HANDLE { "pact_handle*" }
     else if ct == CT_CHANNEL { "pact_channel*" }
+    else if ct == CT_MAP { "pact_map*" }
     else { "void" }
 }
 
@@ -1171,6 +1394,7 @@ pub fn type_from_name(name: Str) -> Int {
         "Option" => CT_OPTION
         "Result" => CT_RESULT
         "Iterator" => CT_ITERATOR
+        "Map" => CT_MAP
         _ => CT_VOID
     }
 }
@@ -1192,6 +1416,7 @@ pub fn c_type_tag(ct: Int) -> Str {
     else if ct == CT_ITERATOR { "iter" }
     else if ct == CT_HANDLE { "handle" }
     else if ct == CT_CHANNEL { "channel" }
+    else if ct == CT_MAP { "map" }
     else { "void" }
 }
 
@@ -1219,15 +1444,15 @@ pub fn ensure_result_type(ok_t: Int, err_t: Int) {
 }
 
 pub fn set_var_option(name: Str, inner: Int) {
-    var_option_names.push(name)
-    var_option_inner.push(inner)
+    var_options.push(VarOptionEntry { name: name, inner: inner })
 }
 
 pub fn get_var_option_inner(name: Str) -> Int {
-    let mut i = var_option_names.len() - 1
+    let mut i = var_options.len() - 1
     while i >= 0 {
-        if var_option_names.get(i) == name {
-            return var_option_inner.get(i)
+        let vo = var_options.get(i)
+        if vo.name == name {
+            return vo.inner
         }
         i = i - 1
     }
@@ -1235,16 +1460,15 @@ pub fn get_var_option_inner(name: Str) -> Int {
 }
 
 pub fn set_var_result(name: Str, ok_t: Int, err_t: Int) {
-    var_result_names.push(name)
-    var_result_ok.push(ok_t)
-    var_result_err.push(err_t)
+    var_results.push(VarResultEntry { name: name, ok_type: ok_t, err_type: err_t })
 }
 
 pub fn get_var_result_ok(name: Str) -> Int {
-    let mut i = var_result_names.len() - 1
+    let mut i = var_results.len() - 1
     while i >= 0 {
-        if var_result_names.get(i) == name {
-            return var_result_ok.get(i)
+        let vr = var_results.get(i)
+        if vr.name == name {
+            return vr.ok_type
         }
         i = i - 1
     }
@@ -1252,42 +1476,39 @@ pub fn get_var_result_ok(name: Str) -> Int {
 }
 
 pub fn get_var_result_err(name: Str) -> Int {
-    let mut i = var_result_names.len() - 1
+    let mut i = var_results.len() - 1
     while i >= 0 {
-        if var_result_names.get(i) == name {
-            return var_result_err.get(i)
+        let vr = var_results.get(i)
+        if vr.name == name {
+            return vr.err_type
         }
         i = i - 1
     }
     -1
 }
 
-pub fn set_var_iterator(name: Str, inner: Int) {
-    var_iterator_names.push(name)
-    var_iterator_inner.push(inner)
+pub fn set_var_iterator(name: Str, inner: Int, next_fn: Str) {
+    var_iterators.push(VarIteratorEntry { name: name, inner: inner, next_fn: next_fn, next_name: "" })
 }
 
 pub fn get_var_iterator_inner(name: Str) -> Int {
-    let mut i = var_iterator_names.len() - 1
+    let mut i = var_iterators.len() - 1
     while i >= 0 {
-        if var_iterator_names.get(i) == name {
-            return var_iterator_inner.get(i)
+        let vi = var_iterators.get(i)
+        if vi.name == name {
+            return vi.inner
         }
         i = i - 1
     }
     -1
 }
 
-pub fn set_var_iter_next_fn(name: Str, next_fn: Str) {
-    var_iter_next_names.push(name)
-    var_iter_next_fns.push(next_fn)
-}
-
 pub fn get_var_iter_next_fn(name: Str) -> Str {
-    let mut i = var_iter_next_names.len() - 1
+    let mut i = var_iterators.len() - 1
     while i >= 0 {
-        if var_iter_next_names.get(i) == name {
-            return var_iter_next_fns.get(i)
+        let vi = var_iterators.get(i)
+        if vi.name == name {
+            return vi.next_fn
         }
         i = i - 1
     }
@@ -1295,15 +1516,15 @@ pub fn get_var_iter_next_fn(name: Str) -> Str {
 }
 
 pub fn set_var_alias(name: Str, target: Str) {
-    var_alias_names.push(name)
-    var_alias_targets.push(target)
+    var_aliases.push(VarAliasEntry { name: name, target: target })
 }
 
 pub fn get_var_alias(name: Str) -> Str {
-    let mut i = var_alias_names.len() - 1
+    let mut i = var_aliases.len() - 1
     while i >= 0 {
-        if var_alias_names.get(i) == name {
-            return var_alias_targets.get(i)
+        let va = var_aliases.get(i)
+        if va.name == name {
+            return va.target
         }
         i = i - 1
     }
@@ -1311,15 +1532,15 @@ pub fn get_var_alias(name: Str) -> Str {
 }
 
 pub fn set_var_handle(name: Str, inner: Int) {
-    var_handle_names.push(name)
-    var_handle_inner.push(inner)
+    var_handles.push(VarHandleEntry { name: name, inner: inner })
 }
 
 pub fn get_var_handle_inner(name: Str) -> Int {
-    let mut i = var_handle_names.len() - 1
+    let mut i = var_handles.len() - 1
     while i >= 0 {
-        if var_handle_names.get(i) == name {
-            return var_handle_inner.get(i)
+        let vh = var_handles.get(i)
+        if vh.name == name {
+            return vh.inner
         }
         i = i - 1
     }
@@ -1327,15 +1548,15 @@ pub fn get_var_handle_inner(name: Str) -> Int {
 }
 
 pub fn set_var_channel(name: Str, inner: Int) {
-    var_channel_names.push(name)
-    var_channel_inner.push(inner)
+    var_channels.push(VarChannelEntry { name: name, inner: inner })
 }
 
 pub fn get_var_channel_inner(name: Str) -> Int {
-    let mut i = var_channel_names.len() - 1
+    let mut i = var_channels.len() - 1
     while i >= 0 {
-        if var_channel_names.get(i) == name {
-            return var_channel_inner.get(i)
+        let vch = var_channels.get(i)
+        if vch.name == name {
+            return vch.inner
         }
         i = i - 1
     }

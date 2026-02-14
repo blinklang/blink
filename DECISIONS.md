@@ -190,6 +190,12 @@ Decided by expert panel vote. See [OPEN_QUESTIONS.md](OPEN_QUESTIONS.md) for ful
 | Error catalog format | Table with name, code, one-line, category, spec ref. Deferred `--explain` for detailed explanations | 4-1 (Sys/PLT/DevOps/AI; Web for full Rust-style explain now) |
 | Error catalog location | Standalone `ERROR_CATALOG.md` at repo root | 5-0 |
 | Machine output format | JSON stays. Panel voted 3-1-1 for JSON+TOON flag, but deferred — JSON is required regardless, TOON ecosystem too immature. Revisit when token-optimized formats have tooling parity | Deferred (3-1-1 panel vote recorded) |
+| Package registry model | Hybrid: central registry + git URL fallback. Identity invariant: registered package has one identity regardless of access path | 5-0 |
+| Package naming | Namespaced `org/name` format. Maps to trust boundaries for capability auditing | 4-1 (AI: flat names for LLM accuracy) |
+| Version resolution algorithm | Minimal Version Selection. Oldest satisfying version. Deterministic without lockfile. No SAT solver | 4-1 (Web: maximal/latest for dev expectations) |
+| Version constraint syntax | Caret default (`"1.2"` = `>=1.2, <2.0`). Tilde/exact available. Pre-1.0: minor is breaking | 4-1 (Sys: tilde default for tighter control) |
+| MVP dependency sources | Path + git deps for v1. No registry infrastructure required. Schema forward-compatible for v2 registry | 5-0 |
+| Stdlib resolution mechanism | Implicit dependency model. `std.*` prefix. Stdlib bundled with compiler, injected as virtual deps. No new resolution step | 4-1 virtual dep, 3-2 `std` prefix, 3-2 stdlib-as-dep |
 
 ---
 
@@ -1317,6 +1323,100 @@ Five panelists (systems, web/scripting, PLT, DevOps/tooling, AI/ML) voted indepe
 **Key argument:** Compile-time and runtime skips are fundamentally different evaluation times. `@skip` cannot express "skip if no GPU" and `skip()` cannot avoid compiling/loading a test with missing dependencies. Conflating them into one mechanism forces losing either zero-cost static skipping or runtime conditional capability.
 
 **Dissent summary:** PLT argued that skip is a meta-level judgment about the test, not part of the test's computation — `skip()` inside the body is a category error. AI/ML argued that two mechanisms doubles the decision surface for LLMs and `@skip` alone covers 90% of use cases with zero ambiguity.
+
+---
+
+## Package Distribution & Resolution — Design Rationale
+
+### Panel Deliberation
+
+Five panelists (systems, web/scripting, PLT, DevOps/tooling, AI/ML) voted independently on 5 questions covering the package manager design gap identified in GAPS.md.
+
+**Q1: Registry model (5-0 for hybrid)**
+
+- **Systems:** Hybrid. Central registry provides content-addressed integrity verification. Git fallback handles private/corporate repos without requiring a private registry instance. Identity invariant prevents the "same package, two names" dependency duplication bug.
+- **Web/Scripting:** Hybrid. npm taught us that a central registry with URL fallback covers 99% of cases. Corporate proxies and private repos need git URLs. The identity invariant is critical — npm has the `npm:` alias mess because they lack this.
+- **PLT:** Hybrid. Go's proxy model proves this works at scale. The identity invariant is a theorem about package identity that prevents diamond-dependency confusion. Registry is the canonical source; git is a transport mechanism.
+- **DevOps:** Hybrid. CI/CD pipelines need deterministic dependency resolution from a single source of truth. Git fallback handles air-gapped environments and internal packages. The lockfile pins both registry and git deps uniformly.
+- **AI/ML:** Hybrid. LLMs need one canonical name per package for reliable code generation. If `http-client` and `git:...http-client.git` were different identities, models would hallucinate the wrong one. Single identity = single training signal.
+
+**Q2: Package naming (4-1 for namespaced org/name)**
+
+- **Systems:** Namespaced. `org/name` provides collision-free naming and maps directly to capability trust boundaries. `std/http` and `acme/http` are unambiguous. Slash separator is universal (GitHub, Docker, Go modules).
+- **Web/Scripting:** Namespaced. npm's `@scope/name` proves namespacing works at massive scale. Flat naming caused the `left-pad` land-grab problem. Organizations need ownership boundaries.
+- **PLT:** Namespaced. Module path mapping (`import std.http` → package `std/http`) is clean and deterministic. Namespaces provide a natural hierarchical organization that matches how developers think about code provenance.
+- **DevOps:** Namespaced. Org-scoped names enable per-org security policies in CI: `std/*` packages can be auto-approved while `unknown-org/*` requires review. Trust boundaries need machine-readable organization signals.
+- **AI/ML:** Flat names. LLMs trained on npm/PyPI primarily see flat names (`requests`, `express`, `flask`). Namespaced names double the token count per dependency reference and increase hallucination surface — models must get both org AND name correct. Flat names with a prefix convention (`pact-http`) would leverage existing training data better. *(dissent)*
+
+**Q3: Version resolution algorithm (4-1 for MVS)**
+
+- **Systems:** MVS. Deterministic without lockfile is the key property — reproducible builds are guaranteed by the algorithm, not by an artifact. No SAT solver means no exponential worst-case. Resolution is a simple graph walk.
+- **Web/Scripting:** Maximal/latest. Every JS/Python/Ruby developer expects `pact add foo` to get the newest version. MVS getting the *oldest* satisfying version will confuse developers and generate support tickets. The lockfile already ensures reproducibility — MVS's determinism-without-lockfile is solving a problem we don't have since lockfiles are mandatory. *(dissent)*
+- **PLT:** MVS. Russ Cox's formal proof that MVS is the only algorithm where adding a dependency cannot change existing resolved versions is compelling. Monotonicity is a strong theoretical property that prevents "dependency hell" by construction.
+- **DevOps:** MVS. `pact update` is an explicit operation that upgrades. Implicit latest-version resolution means CI builds change based on when they run. MVS + mandatory lockfile = maximum reproducibility.
+- **AI/ML:** MVS. Deterministic resolution means LLMs can predict resolved versions from `pact.toml` alone. Non-deterministic resolution (latest at time of resolve) means the model cannot know what versions will be selected, making version-specific API advice unreliable.
+
+**Q4: Version constraint syntax (4-1 for caret default)**
+
+- **Systems:** Tilde. Caret is too permissive — `"1.2"` accepting `1.9.0` trusts the entire ecosystem to never break semver within a major. Tilde (`~1.2` = `>=1.2, <1.3`) limits blast radius to patch versions, which are far less likely to break. *(dissent)*
+- **Web/Scripting:** Caret. npm's `^` default has proven itself at massive scale. Developers expect `"1.2"` to mean "compatible with 1.2." Tilde is too conservative — it prevents adopting minor-version features without manual update.
+- **PLT:** Caret. The semver contract explicitly states that minor versions add functionality without breaking compatibility. Caret directly encodes this contract. Tilde underutilizes semver by treating minor versions as potentially breaking.
+- **DevOps:** Caret. Combined with MVS, caret is conservative in practice — MVS selects the *oldest* 1.x that satisfies constraints, not the newest. Caret + MVS = you get 1.2.0 until something explicitly requires 1.3+.
+- **AI/ML:** Caret. Simpler mental model for LLMs: `"1.2"` means "1.x compatible." Models generating `pact.toml` files will use the default constraint most often — caret is the most forgiving default for AI-generated version strings.
+
+**Q5: MVP dependency sources (5-0 for path + git only)**
+
+- **Systems:** Path + git. Registry infrastructure is a massive engineering effort (storage, CDN, authentication, moderation). Path and git deps cover all development scenarios. Ship the language, not the ecosystem infrastructure.
+- **Web/Scripting:** Path + git. npm didn't launch with a registry either — the tool came first. Developers need local and git deps for real work. Registry can follow when there's a community to serve.
+- **PLT:** Path + git. The `pact.toml` schema should be forward-compatible so adding `version = "1.0"` registry deps later requires zero breaking changes. Design the schema now, ship the registry later.
+- **DevOps:** Path + git. Git deps with commit-hash pinning in the lockfile provide reproducibility. Path deps enable monorepo workflows. These two cover corporate development patterns completely.
+- **AI/ML:** Path + git. LLMs generating `pact.toml` for new projects will use path deps for workspace packages and git deps for external code. Registry deps need a live package index — AI can't verify package existence without it. Ship what works offline first.
+
+**Key argument:** MVS + caret + mandatory lockfile creates a uniquely conservative system: caret constraints allow compatible updates, but MVS selects the oldest satisfying version rather than the newest. `pact update` is the only operation that moves versions forward, making dependency upgrades always intentional. This eliminates the "it worked yesterday but today it resolves differently" class of bugs.
+
+**Dissent summary:** Web/Scripting argued that MVS's "oldest version" behavior contradicts developer expectations from every major package manager (npm, pip, cargo all select newest). AI/ML argued that flat package names would better leverage existing LLM training data from npm/PyPI ecosystems. Systems argued that tilde constraints provide tighter blast radius than caret.
+
+---
+
+## Stdlib Distribution & Import Resolution — Design Rationale
+
+### Panel Deliberation
+
+The import resolution algorithm (§10.5) specified local `src/` resolution and `pact.lock` dependency resolution but had no mechanism for standard library modules. This gap blocked stdlib modules (`std.toml`, `std.semver`) from being importable outside of the compiler's own `src/` directory.
+
+**Q1: Where does the stdlib physically live? (4-1 for D: virtual/implicit dependency)**
+
+- **Sys (A):** Alongside compiler binary in `<pactc_dir>/stdlib/`. Hermetic, relocatable, matches Go/Zig.
+- **Web (D):** Virtual dependency. Zero new concepts — stdlib is just deps you didn't have to declare. Go's approach.
+- **PLT (D):** Uniform module semantics. No special resolution step. Effect system needs zero special cases.
+- **DevOps (D):** Virtual dep backed by `<pactc_dir>/lib/std/`. LSP and compiler share same path. CI needs zero config.
+- **AI (D):** Virtual dep. Implementation detail hidden from import syntax. Eliminates "where is my stdlib?" debugging.
+
+*(dissent: Sys — preferred explicit filesystem colocating over virtual abstraction, citing Go's `GOROOT/src/` simplicity)*
+
+**Q2: What is the import syntax for stdlib? (3-2 for A: `std` prefix)**
+
+- **Sys (A):** `std.` prefix eliminates ambiguity. `pact.` prefix collides with language name. Matches Rust `std::`.
+- **Web (C):** `pact.` prefix — spec already shows `import pact.http` in §10.5 examples. No new naming convention. *(dissent)*
+- **PLT (A):** `std.` prefix avoids open namespace problems. OCaml retrofitted `Stdlib.List` for exactly this reason.
+- **DevOps (A):** `std.` prefix — matches `std/` org on registry (§8.9.2). `import std.http` → `std/http` package.
+- **AI (C):** `pact.` prefix — existing spec examples are the training data. Changing creates contradiction. *(dissent)*
+
+*Clarifying note: §8.9.7 explicitly states "import paths follow the `org/name` structure: `import std.http` maps to the `std/http` package." The `pact.*` namespace in §10.6 (`pact.core`, `pact.ffi`) is reserved for compiler-internal pseudo-modules, not distributable packages. The existing spec is consistent with the `std` prefix.*
+
+**Q3: What is the resolution order? (3-2 for C: stdlib is a dep, no new step)**
+
+- **Sys (A):** Local → stdlib → deps → error. Stdlib is trusted toolchain code, should shadow deps for security.
+- **Web (C):** Local → deps (stdlib included) → error. No new resolution step, uniform mental model.
+- **PLT (C):** Stdlib-as-dep. Scales to Tier 2/3 without semantic boundary changes.
+- **DevOps (A):** Local → stdlib → deps → error. With escape hatch: explicit `pact.toml` pinning overrides bundled version. *(dissent)*
+- **AI (C):** Stdlib-as-dep. One resolution algorithm, zero special cases.
+
+*(dissent: Sys — wanted explicit stdlib priority for supply-chain security. DevOps — wanted stdlib step for clearer error messages on corrupted installs)*
+
+### Resolution
+
+Stdlib modules are distributed alongside the compiler binary in `<pactc_dir>/lib/std/`. The compiler treats them as implicit dependencies injected into the dependency graph before resolution. Import syntax uses the `std` prefix: `import std.toml`, `import std.semver`. The resolution algorithm remains unchanged — local `src/` first, then all dependencies (including implicit stdlib entries), then error. See §10.7 for the full specification.
 
 ---
 

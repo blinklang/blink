@@ -102,6 +102,164 @@ static void pact_list_free(pact_list* l) {
     }
 }
 
+/* ── Hash map (string-keyed) ────────────────────────────────────────── */
+
+static int pact_str_eq(const char* a, const char* b);
+
+static uint64_t pact_map_hash(const char* key) {
+    uint64_t h = 14695981039346656037ULL;
+    for (const char* p = key; *p; p++) {
+        h ^= (uint64_t)(unsigned char)*p;
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+typedef struct {
+    const char** keys;
+    void** values;
+    uint8_t* states;   /* 0=empty, 1=occupied, 2=tombstone */
+    int64_t len;
+    int64_t cap;
+} pact_map;
+
+static pact_map* pact_map_new(void) {
+    pact_map* m = (pact_map*)pact_alloc(sizeof(pact_map));
+    m->cap = 16;
+    m->len = 0;
+    m->keys = (const char**)pact_alloc(sizeof(const char*) * (size_t)m->cap);
+    m->values = (void**)pact_alloc(sizeof(void*) * (size_t)m->cap);
+    m->states = (uint8_t*)pact_alloc(sizeof(uint8_t) * (size_t)m->cap);
+    memset(m->states, 0, (size_t)m->cap);
+    return m;
+}
+
+static void pact_map_grow(pact_map* m) {
+    int64_t old_cap = m->cap;
+    const char** old_keys = m->keys;
+    void** old_values = m->values;
+    uint8_t* old_states = m->states;
+    m->cap = old_cap * 2;
+    m->keys = (const char**)pact_alloc(sizeof(const char*) * (size_t)m->cap);
+    m->values = (void**)pact_alloc(sizeof(void*) * (size_t)m->cap);
+    m->states = (uint8_t*)pact_alloc(sizeof(uint8_t) * (size_t)m->cap);
+    memset(m->states, 0, (size_t)m->cap);
+    m->len = 0;
+    for (int64_t i = 0; i < old_cap; i++) {
+        if (old_states[i] == 1) {
+            uint64_t h = pact_map_hash(old_keys[i]);
+            int64_t idx = (int64_t)(h % (uint64_t)m->cap);
+            while (m->states[idx] != 0) {
+                idx = (idx + 1) % m->cap;
+            }
+            m->keys[idx] = old_keys[i];
+            m->values[idx] = old_values[i];
+            m->states[idx] = 1;
+            m->len++;
+        }
+    }
+    free(old_keys);
+    free(old_values);
+    free(old_states);
+}
+
+static void pact_map_set(pact_map* m, const char* key, void* value) {
+    if (m->len * 10 >= m->cap * 7) {
+        pact_map_grow(m);
+    }
+    uint64_t h = pact_map_hash(key);
+    int64_t idx = (int64_t)(h % (uint64_t)m->cap);
+    int64_t first_tombstone = -1;
+    while (1) {
+        if (m->states[idx] == 0) {
+            int64_t ins = (first_tombstone >= 0) ? first_tombstone : idx;
+            m->keys[ins] = key;
+            m->values[ins] = value;
+            m->states[ins] = 1;
+            m->len++;
+            return;
+        }
+        if (m->states[idx] == 2) {
+            if (first_tombstone < 0) first_tombstone = idx;
+        } else if (pact_str_eq(m->keys[idx], key)) {
+            m->values[idx] = value;
+            return;
+        }
+        idx = (idx + 1) % m->cap;
+    }
+}
+
+static void* pact_map_get(const pact_map* m, const char* key) {
+    uint64_t h = pact_map_hash(key);
+    int64_t idx = (int64_t)(h % (uint64_t)m->cap);
+    while (m->states[idx] != 0) {
+        if (m->states[idx] == 1 && pact_str_eq(m->keys[idx], key)) {
+            return m->values[idx];
+        }
+        idx = (idx + 1) % m->cap;
+    }
+    return NULL;
+}
+
+static int64_t pact_map_has(const pact_map* m, const char* key) {
+    uint64_t h = pact_map_hash(key);
+    int64_t idx = (int64_t)(h % (uint64_t)m->cap);
+    while (m->states[idx] != 0) {
+        if (m->states[idx] == 1 && pact_str_eq(m->keys[idx], key)) {
+            return 1;
+        }
+        idx = (idx + 1) % m->cap;
+    }
+    return 0;
+}
+
+static int64_t pact_map_remove(pact_map* m, const char* key) {
+    uint64_t h = pact_map_hash(key);
+    int64_t idx = (int64_t)(h % (uint64_t)m->cap);
+    while (m->states[idx] != 0) {
+        if (m->states[idx] == 1 && pact_str_eq(m->keys[idx], key)) {
+            m->states[idx] = 2;
+            m->len--;
+            return 1;
+        }
+        idx = (idx + 1) % m->cap;
+    }
+    return 0;
+}
+
+static int64_t pact_map_len(const pact_map* m) {
+    return m->len;
+}
+
+static pact_list* pact_map_keys(const pact_map* m) {
+    pact_list* result = pact_list_new();
+    for (int64_t i = 0; i < m->cap; i++) {
+        if (m->states[i] == 1) {
+            pact_list_push(result, (void*)m->keys[i]);
+        }
+    }
+    return result;
+}
+
+static pact_list* pact_map_values(const pact_map* m) {
+    pact_list* result = pact_list_new();
+    for (int64_t i = 0; i < m->cap; i++) {
+        if (m->states[i] == 1) {
+            pact_list_push(result, m->values[i]);
+        }
+    }
+    return result;
+}
+
+static void pact_map_free(pact_map* m) {
+    if (m) {
+        free(m->keys);
+        free(m->values);
+        free(m->states);
+        free(m);
+    }
+}
+
 static int64_t pact_str_len(const char* s) {
     return (int64_t)strlen(s);
 }

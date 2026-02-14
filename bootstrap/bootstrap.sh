@@ -7,6 +7,8 @@ BUILD_DIR="$ROOT_DIR/build"
 
 mkdir -p "$BUILD_DIR"
 cp "$SCRIPT_DIR/runtime.h" "$BUILD_DIR/runtime.h"
+mkdir -p "$BUILD_DIR/lib/std"
+cp "$ROOT_DIR/lib/std/"*.pact "$BUILD_DIR/lib/std/"
 
 echo "Compiling bootstrap compiler..."
 cc -o "$BUILD_DIR/pactc" "$SCRIPT_DIR/pactc_bootstrap.c" -lm

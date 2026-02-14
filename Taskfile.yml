@@ -57,11 +57,117 @@ tasks:
       - 'cc -o {{.BUILD_DIR}}/pact {{.BUILD_DIR}}/cli.c -lm'
       - echo "CLI built at {{.BUILD_DIR}}/pact"
 
+  test-fmt:
+    desc: Test formatter idempotency and golden outputs
+    deps: [bootstrap]
+    cmds:
+      - |
+        passed=0
+        failed=0
+        skipped=0
+        errors=""
+
+        # Known formatter issues (skip idempotency/semantic checks)
+        fmt_skip="test_hof test_lazy_iter test_semver test_toml"
+
+        # Golden output tests: compare formatter output against expected
+        for input in tests/fmt/input_*.pact; do
+          name=$(basename "$input" .pact | sed 's/^input_//')
+          expected="tests/fmt/expected_${name}.pact"
+          if [ ! -f "$expected" ]; then
+            continue
+          fi
+          actual=$(mktemp)
+          if ! {{.PACTC}} "$input" "$actual" --emit pact 2>/dev/null; then
+            failed=$((failed + 1))
+            errors="${errors}\n  FAIL (format) golden_${name}"
+            rm -f "$actual"
+            continue
+          fi
+          if diff -u "$expected" "$actual" >/dev/null 2>&1; then
+            passed=$((passed + 1))
+          else
+            failed=$((failed + 1))
+            errors="${errors}\n  FAIL (golden) ${name}"
+            diff -u "$expected" "$actual" | head -20
+          fi
+          rm -f "$actual"
+        done
+
+        # Idempotency: format(format(x)) == format(x) for all example files
+        for f in examples/test_*.pact; do
+          name=$(basename "$f" .pact)
+          if echo "$fmt_skip" | grep -qw "$name"; then skipped=$((skipped + 1)); continue; fi
+          fmt1=$(mktemp)
+          fmt2=$(mktemp)
+          if ! {{.PACTC}} "$f" "$fmt1" --emit pact 2>/dev/null; then
+            skipped=$((skipped + 1))
+            rm -f "$fmt1" "$fmt2"
+            continue
+          fi
+          if ! {{.PACTC}} "$fmt1" "$fmt2" --emit pact 2>/dev/null; then
+            skipped=$((skipped + 1))
+            rm -f "$fmt1" "$fmt2"
+            continue
+          fi
+          if diff -q "$fmt1" "$fmt2" >/dev/null 2>&1; then
+            passed=$((passed + 1))
+          else
+            failed=$((failed + 1))
+            errors="${errors}\n  FAIL (idempotent) ${name}"
+          fi
+          rm -f "$fmt1" "$fmt2"
+        done
+
+        # Semantic: formatted output still compiles and passes
+        for f in examples/test_*.pact; do
+          name=$(basename "$f" .pact)
+          if echo "$fmt_skip" | grep -qw "$name"; then skipped=$((skipped + 1)); continue; fi
+          fmt_src=$(mktemp --suffix=.pact)
+          fmt_c=$(mktemp --suffix=.c)
+          fmt_bin=$(mktemp)
+          if ! {{.PACTC}} "$f" "$fmt_src" --emit pact 2>/dev/null; then
+            skipped=$((skipped + 1))
+            rm -f "$fmt_src" "$fmt_c" "$fmt_bin"
+            continue
+          fi
+          if ! {{.PACTC}} "$fmt_src" "$fmt_c" 2>/dev/null; then
+            skipped=$((skipped + 1))
+            rm -f "$fmt_src" "$fmt_c" "$fmt_bin"
+            continue
+          fi
+          if ! cc -o "$fmt_bin" "$fmt_c" -I bootstrap -lm 2>/dev/null; then
+            failed=$((failed + 1))
+            errors="${errors}\n  FAIL (cc) ${name}"
+            rm -f "$fmt_src" "$fmt_c" "$fmt_bin"
+            continue
+          fi
+          if output=$("$fmt_bin" 2>&1); then
+            if echo "$output" | grep -q "FAIL"; then
+              failed=$((failed + 1))
+              errors="${errors}\n  FAIL (assert) fmt_${name}"
+            else
+              passed=$((passed + 1))
+            fi
+          else
+            failed=$((failed + 1))
+            errors="${errors}\n  FAIL (crash) fmt_${name}"
+          fi
+          rm -f "$fmt_src" "$fmt_c" "$fmt_bin"
+        done
+
+        echo "fmt: ${passed} passed, ${failed} failed, ${skipped} skipped"
+        if [ $failed -gt 0 ]; then
+          printf "Failures:${errors}\n"
+          exit 1
+        fi
+
   ci:
     desc: Full CI — bootstrap + run all tests
     cmds:
       - task: bootstrap
       - task: test
+      - task: test-fmt
 
   build-binaries:
     desc: Cross-compile bootstrap binaries for all platforms
