@@ -712,6 +712,37 @@ pub fn emit_call(node: Int) {
             return
         }
 
+        if fn_name == "debug_assert" {
+            let args_sl = np_args.get(node)
+            if cg_debug_mode == 0 {
+                expr_result_str = ""
+                expr_result_type = CT_VOID
+                return
+            }
+            if args_sl != -1 && sublist_length(args_sl) > 0 {
+                emit_expr(sublist_get(args_sl, 0))
+                let cond_str = expr_result_str
+                let mut msg_str = "\"debug assertion failed\""
+                if sublist_length(args_sl) >= 2 {
+                    emit_expr(sublist_get(args_sl, 1))
+                    msg_str = expr_result_str
+                }
+                emit_line("\{")
+                cg_indent = cg_indent + 1
+                emit_line("int64_t _dbg_val = (int64_t)({cond_str});")
+                emit_line("if (!_dbg_val) \{")
+                cg_indent = cg_indent + 1
+                emit_line("__pact_debug_assert_fail(\"{diag_source_file}\", {call_line}, \"{cg_current_fn_name}\", \"{cond_str}\", {msg_str});")
+                cg_indent = cg_indent - 1
+                emit_line("}")
+                cg_indent = cg_indent - 1
+                emit_line("}")
+            }
+            expr_result_str = ""
+            expr_result_type = CT_VOID
+            return
+        }
+
         if fn_name == "assert_eq" {
             let args_sl = np_args.get(node)
             if args_sl != -1 && sublist_length(args_sl) >= 2 {

@@ -24,6 +24,7 @@ fn print_usage() {
     io.println("  --git <url>       Git dependency source (for 'add')")
     io.println("  --tag <tag>       Git tag (for 'add', used with --git)")
     io.println("  --dev             Add as dev-dependency (for 'add')")
+    io.println("  --debug           Enable debug mode (debug_assert, -g -O0)")
     io.println("")
     io.println("Test options:")
     io.println("  --filter <pat>    Run only tests matching pattern")
@@ -74,7 +75,7 @@ fn collect_test_files(dir: Str, results: List[Str]) {
     }
 }
 
-fn do_build(source_path: Str, output_path: Str, c_path: Str, format_flag: Str) -> Int {
+fn do_build(source_path: Str, output_path: Str, c_path: Str, format_flag: Str, debug_mode: Int) -> Int {
     let pactc = "build/pactc"
     if !file_exists(pactc) {
         io.println("error: compiler not found at build/pactc")
@@ -85,6 +86,9 @@ fn do_build(source_path: Str, output_path: Str, c_path: Str, format_flag: Str) -
     let mut compile_cmd = "{pactc} {source_path} {c_path}"
     if format_flag != "" {
         compile_cmd = "{pactc} {source_path} {c_path} --format {format_flag}"
+    }
+    if debug_mode != 0 {
+        compile_cmd = "{compile_cmd} --debug"
     }
     let rc = shell_exec(compile_cmd)
     if rc != 0 {
@@ -98,7 +102,10 @@ fn do_build(source_path: Str, output_path: Str, c_path: Str, format_flag: Str) -
         link_flags = "-lm -pthread"
     }
 
-    let cc_cmd = "cc -o {output_path} {c_path} -Ibuild {link_flags}"
+    let mut cc_cmd = "cc -o {output_path} {c_path} -Ibuild {link_flags}"
+    if debug_mode != 0 {
+        cc_cmd = "cc -g -O0 -o {output_path} {c_path} -Ibuild {link_flags}"
+    }
     let cc_rc = shell_exec(cc_cmd)
     if cc_rc != 0 {
         io.println("error: C compilation failed")
@@ -241,6 +248,7 @@ fn main() {
     let mut git_url_flag = ""
     let mut git_tag_flag = ""
     let mut dev_flag = 0
+    let mut debug_flag = 0
     let mut i = 2
 
     while i < arg_count() {
@@ -295,6 +303,8 @@ fn main() {
             }
         } else if arg == "--dev" {
             dev_flag = 1
+        } else if arg == "--debug" {
+            debug_flag = 1
         } else if arg == "--json" {
             json_output = 1
         } else if arg == "--tags" {
@@ -338,12 +348,12 @@ fn main() {
     }
 
     if command == "build" {
-        let rc = do_build(source_path, output_path, c_path, format_flag)
+        let rc = do_build(source_path, output_path, c_path, format_flag, debug_flag)
         if rc == 0 {
             io.println("built: {output_path}")
         }
     } else if command == "run" {
-        let rc = do_build(source_path, output_path, c_path, format_flag)
+        let rc = do_build(source_path, output_path, c_path, format_flag, debug_flag)
         if rc != 0 {
             return
         }
@@ -351,7 +361,7 @@ fn main() {
         exit(run_rc)
     } else if command == "test" {
         if source_path != "" {
-            let rc = do_build(source_path, output_path, c_path, format_flag)
+            let rc = do_build(source_path, output_path, c_path, format_flag, 1)
             if rc != 0 {
                 return
             }
@@ -395,7 +405,7 @@ fn main() {
             let tf_c = "{build_dir}/{tf_base}.c"
             let tf_out = "{build_dir}/{tf_base}"
 
-            let build_rc = do_build(tf, tf_out, tf_c, format_flag)
+            let build_rc = do_build(tf, tf_out, tf_c, format_flag, 1)
             if build_rc != 0 {
                 total_errors = total_errors + 1
                 if json_output != 0 {

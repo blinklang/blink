@@ -84,6 +84,52 @@ pub fn emit_method_call(node: Int) {
         return
     }
 
+    // io.eprintln — print to stderr with newline
+    if np_kind.get(obj_node) == NodeKind.Ident && np_name.get(obj_node) == "io" && method == "eprintln" {
+        let args_sl = np_args.get(node)
+        if args_sl != -1 && sublist_length(args_sl) > 0 {
+            emit_expr(sublist_get(args_sl, 0))
+            let arg_str = expr_result_str
+            let arg_type = expr_result_type
+            if arg_type == CT_INT {
+                emit_line("fprintf(stderr, \"%%lld\\n\", (long long){arg_str});")
+            } else if arg_type == CT_FLOAT {
+                emit_line("fprintf(stderr, \"%%g\\n\", {arg_str});")
+            } else if arg_type == CT_BOOL {
+                emit_line("fprintf(stderr, \"%%s\\n\", {arg_str} ? \"true\" : \"false\");")
+            } else {
+                emit_line("fprintf(stderr, \"%%s\\n\", {arg_str});")
+            }
+        } else {
+            emit_line("fprintf(stderr, \"\\n\");")
+        }
+        expr_result_str = "0"
+        expr_result_type = CT_VOID
+        return
+    }
+
+    // io.eprint — print to stderr without newline
+    if np_kind.get(obj_node) == NodeKind.Ident && np_name.get(obj_node) == "io" && method == "eprint" {
+        let args_sl = np_args.get(node)
+        if args_sl != -1 && sublist_length(args_sl) > 0 {
+            emit_expr(sublist_get(args_sl, 0))
+            let arg_str = expr_result_str
+            let arg_type = expr_result_type
+            if arg_type == CT_INT {
+                emit_line("fprintf(stderr, \"%%lld\", (long long){arg_str});")
+            } else if arg_type == CT_FLOAT {
+                emit_line("fprintf(stderr, \"%%g\", {arg_str});")
+            } else if arg_type == CT_BOOL {
+                emit_line("fprintf(stderr, \"%%s\", {arg_str} ? \"true\" : \"false\");")
+            } else {
+                emit_line("fprintf(stderr, \"%%s\", {arg_str});")
+            }
+        }
+        expr_result_str = "0"
+        expr_result_type = CT_VOID
+        return
+    }
+
     // io.log — log to stderr
     if np_kind.get(obj_node) == NodeKind.Ident && np_name.get(obj_node) == "io" && method == "log" {
         let args_sl = np_args.get(node)

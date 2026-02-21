@@ -491,6 +491,8 @@ fn main() {
                 i = i + 1
                 emit_mode = get_arg(i)
             }
+        } else if arg == "--debug" {
+            cg_debug_mode = 1
         } else {
             out_path = arg
         }

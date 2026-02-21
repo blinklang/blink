@@ -335,6 +335,9 @@ type MatchScrutEntry {
 pub let mut match_scruts: List[MatchScrutEntry] = []
 pub let mut match_scrut_enum: Str = ""
 
+// Debug mode: 0 = release (strip debug_assert), 1 = debug (emit checks)
+pub let mut cg_debug_mode: Int = 0
+
 pub fn push_scope() {
     scope_frame_starts.push(scope_vars.len())
     var_struct_frame_starts.push(var_structs.len())

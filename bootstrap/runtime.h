@@ -933,6 +933,13 @@ static int __pact_test_failed;
 static char __pact_test_fail_msg[512];
 static int __pact_test_fail_line;
 
+static void __pact_debug_assert_fail(const char* file, int line, const char* fn, const char* cond, const char* msg) {
+    fprintf(stderr, "DEBUG ASSERT FAILED: %s\n", msg);
+    fprintf(stderr, "  condition: %s\n", cond);
+    fprintf(stderr, "  location: %s:%d in %s\n", file, line, fn);
+    exit(1);
+}
+
 static void __pact_assert_fail(const char* msg, int line) {
     __pact_test_failed = 1;
     if (msg) {
