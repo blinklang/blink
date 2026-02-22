@@ -278,7 +278,278 @@ fn should_import_item(item: Int, import_node: Int) -> Int {
     0
 }
 
-fn merge_programs(main_prog: Int, imported: List[Int], import_nodes_list: List[Int]) -> Int ! Parse.Build {
+fn is_builtin_type(name: Str) -> Int {
+    if name == "" || name == "Int" || name == "Str" || name == "Float" || name == "Bool" || name == "Void" {
+        return 1
+    }
+    if name == "List" || name == "Map" || name == "Option" || name == "Result" || name == "Iterator" {
+        return 1
+    }
+    0
+}
+
+fn add_type_dep(type_name: Str, mod_fns: Map[Str, Int], mod_types: Map[Str, Int], mod_lets: Map[Str, Int], needed: Map[Str, Int]) {
+    if is_builtin_type(type_name) == 1 {
+        return
+    }
+    if needed.has(type_name) {
+        return
+    }
+    if mod_types.has(type_name) {
+        needed.set(type_name, mod_types.get(type_name))
+        let tnode = mod_types.get(type_name)
+        let flds = np_fields.get(tnode)
+        if flds != -1 {
+            let mut fi = 0
+            while fi < sublist_length(flds) {
+                let fld = sublist_get(flds, fi)
+                let fkind = np_kind.get(fld)
+                if fkind == NodeKind.TypeField {
+                    let ta = np_value.get(fld)
+                    if ta != -1 {
+                        add_type_dep(np_name.get(ta), mod_fns, mod_types, mod_lets, needed)
+                    }
+                } else if fkind == NodeKind.TypeVariant {
+                    let vflds = np_fields.get(fld)
+                    if vflds != -1 {
+                        let mut vi = 0
+                        while vi < sublist_length(vflds) {
+                            let vf = sublist_get(vflds, vi)
+                            let vta = np_value.get(vf)
+                            if vta != -1 {
+                                add_type_dep(np_name.get(vta), mod_fns, mod_types, mod_lets, needed)
+                            }
+                            vi = vi + 1
+                        }
+                    }
+                }
+                fi = fi + 1
+            }
+        }
+    }
+}
+
+fn walk_body_deps(node: Int, mod_fns: Map[Str, Int], mod_types: Map[Str, Int], mod_lets: Map[Str, Int], needed: Map[Str, Int]) {
+    if node == -1 {
+        return
+    }
+    let kind = np_kind.get(node)
+
+    if kind == NodeKind.Call {
+        let callee = np_left.get(node)
+        if callee != -1 && np_kind.get(callee) == NodeKind.Ident {
+            let cname = np_name.get(callee)
+            if mod_fns.has(cname) && needed.has(cname) == false {
+                needed.set(cname, mod_fns.get(cname))
+                let dep_fn = mod_fns.get(cname)
+                collect_fn_deps(dep_fn, mod_fns, mod_types, mod_lets, needed)
+            }
+        }
+        walk_body_deps(callee, mod_fns, mod_types, mod_lets, needed)
+        let args_sl = np_args.get(node)
+        if args_sl != -1 {
+            let mut ai = 0
+            while ai < sublist_length(args_sl) {
+                walk_body_deps(sublist_get(args_sl, ai), mod_fns, mod_types, mod_lets, needed)
+                ai = ai + 1
+            }
+        }
+        return
+    }
+
+    if kind == NodeKind.StructLit {
+        let stype = np_type_name.get(node)
+        add_type_dep(stype, mod_fns, mod_types, mod_lets, needed)
+        let sfields = np_fields.get(node)
+        if sfields != -1 {
+            let mut si = 0
+            while si < sublist_length(sfields) {
+                let sf = sublist_get(sfields, si)
+                walk_body_deps(np_value.get(sf), mod_fns, mod_types, mod_lets, needed)
+                si = si + 1
+            }
+        }
+        return
+    }
+
+    if kind == NodeKind.Ident {
+        let ref_name = np_name.get(node)
+        if mod_lets.has(ref_name) && needed.has(ref_name) == false {
+            needed.set(ref_name, mod_lets.get(ref_name))
+            let let_node = mod_lets.get(ref_name)
+            walk_body_deps(np_value.get(let_node), mod_fns, mod_types, mod_lets, needed)
+        }
+        return
+    }
+
+    if kind == NodeKind.BinOp {
+        walk_body_deps(np_left.get(node), mod_fns, mod_types, mod_lets, needed)
+        walk_body_deps(np_right.get(node), mod_fns, mod_types, mod_lets, needed)
+        return
+    }
+    if kind == NodeKind.UnaryOp {
+        walk_body_deps(np_left.get(node), mod_fns, mod_types, mod_lets, needed)
+        return
+    }
+    if kind == NodeKind.IfExpr {
+        walk_body_deps(np_condition.get(node), mod_fns, mod_types, mod_lets, needed)
+        walk_body_deps(np_then_body.get(node), mod_fns, mod_types, mod_lets, needed)
+        walk_body_deps(np_else_body.get(node), mod_fns, mod_types, mod_lets, needed)
+        return
+    }
+    if kind == NodeKind.Block {
+        walk_stmts_deps(np_stmts.get(node), mod_fns, mod_types, mod_lets, needed)
+        return
+    }
+    if kind == NodeKind.LetBinding {
+        walk_body_deps(np_value.get(node), mod_fns, mod_types, mod_lets, needed)
+        return
+    }
+    if kind == NodeKind.ExprStmt {
+        walk_body_deps(np_value.get(node), mod_fns, mod_types, mod_lets, needed)
+        return
+    }
+    if kind == NodeKind.Return {
+        walk_body_deps(np_value.get(node), mod_fns, mod_types, mod_lets, needed)
+        return
+    }
+    if kind == NodeKind.Assignment || kind == NodeKind.CompoundAssign {
+        walk_body_deps(np_target.get(node), mod_fns, mod_types, mod_lets, needed)
+        walk_body_deps(np_value.get(node), mod_fns, mod_types, mod_lets, needed)
+        return
+    }
+    if kind == NodeKind.ForIn {
+        walk_body_deps(np_iterable.get(node), mod_fns, mod_types, mod_lets, needed)
+        walk_body_deps(np_body.get(node), mod_fns, mod_types, mod_lets, needed)
+        return
+    }
+    if kind == NodeKind.WhileLoop {
+        walk_body_deps(np_condition.get(node), mod_fns, mod_types, mod_lets, needed)
+        walk_body_deps(np_body.get(node), mod_fns, mod_types, mod_lets, needed)
+        return
+    }
+    if kind == NodeKind.LoopExpr {
+        walk_body_deps(np_body.get(node), mod_fns, mod_types, mod_lets, needed)
+        return
+    }
+    if kind == NodeKind.MatchExpr {
+        walk_body_deps(np_scrutinee.get(node), mod_fns, mod_types, mod_lets, needed)
+        let arms_sl = np_arms.get(node)
+        if arms_sl != -1 {
+            let mut ai = 0
+            while ai < sublist_length(arms_sl) {
+                let arm = sublist_get(arms_sl, ai)
+                walk_body_deps(np_guard.get(arm), mod_fns, mod_types, mod_lets, needed)
+                walk_body_deps(np_body.get(arm), mod_fns, mod_types, mod_lets, needed)
+                ai = ai + 1
+            }
+        }
+        return
+    }
+    if kind == NodeKind.IndexExpr {
+        walk_body_deps(np_obj.get(node), mod_fns, mod_types, mod_lets, needed)
+        walk_body_deps(np_index.get(node), mod_fns, mod_types, mod_lets, needed)
+        return
+    }
+    if kind == NodeKind.TupleLit || kind == NodeKind.ListLit {
+        let elems_sl = np_elements.get(node)
+        if elems_sl != -1 {
+            let mut ei = 0
+            while ei < sublist_length(elems_sl) {
+                walk_body_deps(sublist_get(elems_sl, ei), mod_fns, mod_types, mod_lets, needed)
+                ei = ei + 1
+            }
+        }
+        return
+    }
+    if kind == NodeKind.MethodCall {
+        walk_body_deps(np_obj.get(node), mod_fns, mod_types, mod_lets, needed)
+        let args_sl = np_args.get(node)
+        if args_sl != -1 {
+            let mut ai = 0
+            while ai < sublist_length(args_sl) {
+                walk_body_deps(sublist_get(args_sl, ai), mod_fns, mod_types, mod_lets, needed)
+                ai = ai + 1
+            }
+        }
+        return
+    }
+    if kind == NodeKind.FieldAccess {
+        walk_body_deps(np_obj.get(node), mod_fns, mod_types, mod_lets, needed)
+        return
+    }
+    if kind == NodeKind.Closure {
+        walk_body_deps(np_body.get(node), mod_fns, mod_types, mod_lets, needed)
+        return
+    }
+    if kind == NodeKind.InterpString {
+        let parts_sl = np_elements.get(node)
+        if parts_sl != -1 {
+            let mut pi = 0
+            while pi < sublist_length(parts_sl) {
+                walk_body_deps(sublist_get(parts_sl, pi), mod_fns, mod_types, mod_lets, needed)
+                pi = pi + 1
+            }
+        }
+        return
+    }
+    if kind == NodeKind.RangeLit {
+        walk_body_deps(np_start.get(node), mod_fns, mod_types, mod_lets, needed)
+        walk_body_deps(np_end.get(node), mod_fns, mod_types, mod_lets, needed)
+        return
+    }
+    if kind == NodeKind.WithBlock {
+        walk_body_deps(np_body.get(node), mod_fns, mod_types, mod_lets, needed)
+        return
+    }
+}
+
+fn walk_stmts_deps(stmts_sl: Int, mod_fns: Map[Str, Int], mod_types: Map[Str, Int], mod_lets: Map[Str, Int], needed: Map[Str, Int]) {
+    if stmts_sl == -1 {
+        return
+    }
+    let mut i = 0
+    while i < sublist_length(stmts_sl) {
+        walk_body_deps(sublist_get(stmts_sl, i), mod_fns, mod_types, mod_lets, needed)
+        i = i + 1
+    }
+}
+
+fn collect_fn_deps(fn_node: Int, mod_fns: Map[Str, Int], mod_types: Map[Str, Int], mod_lets: Map[Str, Int], needed: Map[Str, Int]) {
+    let ret_type = np_return_type.get(fn_node)
+    add_type_dep(ret_type, mod_fns, mod_types, mod_lets, needed)
+    let params_sl = np_params.get(fn_node)
+    if params_sl != -1 {
+        let mut pi = 0
+        while pi < sublist_length(params_sl) {
+            let p = sublist_get(params_sl, pi)
+            add_type_dep(np_type_name.get(p), mod_fns, mod_types, mod_lets, needed)
+            pi = pi + 1
+        }
+    }
+    walk_body_deps(np_body.get(fn_node), mod_fns, mod_types, mod_lets, needed)
+}
+
+fn check_pub_sig(fn_node: Int, fn_name: Str, mod_types_pub: Map[Str, Int]) ! Diag.Report {
+    let ret_type = np_return_type.get(fn_node)
+    if is_builtin_type(ret_type) == 0 && mod_types_pub.has(ret_type) && mod_types_pub.get(ret_type) == 0 {
+        diag_error_at("VisibilityError", "E1300", "pub fn '{fn_name}' returns non-pub type '{ret_type}'", fn_node, "make '{ret_type}' pub or change the return type")
+    }
+    let params_sl = np_params.get(fn_node)
+    if params_sl != -1 {
+        let mut pi = 0
+        while pi < sublist_length(params_sl) {
+            let p = sublist_get(params_sl, pi)
+            let ptype = np_type_name.get(p)
+            if is_builtin_type(ptype) == 0 && mod_types_pub.has(ptype) && mod_types_pub.get(ptype) == 0 {
+                diag_error_at("VisibilityError", "E1300", "pub fn '{fn_name}' has parameter of non-pub type '{ptype}'", fn_node, "make '{ptype}' pub or change the parameter type")
+            }
+            pi = pi + 1
+        }
+    }
+}
+
+fn merge_programs(main_prog: Int, imported: List[Int], import_nodes_list: List[Int]) -> Int ! Parse.Build, Diag.Report {
     let mut all_fns: List[Int] = []
     let mut all_types: List[Int] = []
     let mut all_lets: List[Int] = []
@@ -290,45 +561,138 @@ fn merge_programs(main_prog: Int, imported: List[Int], import_nodes_list: List[I
     while pi < imported.len() {
         let prog = imported.get(pi)
         let imp_node = import_nodes_list.get(pi)
+        let is_selective = np_args.get(imp_node) != -1
 
-        let fns_sl = np_params.get(prog)
-        let mut fi = 0
-        while fi < sublist_length(fns_sl) {
-            let f = sublist_get(fns_sl, fi)
-            if should_import_item(f, imp_node) == 1 {
-                all_fns.push(f)
-            }
-            fi = fi + 1
-        }
+        if is_selective {
+            let mut mod_fns: Map[Str, Int] = Map()
+            let mut mod_types: Map[Str, Int] = Map()
+            let mut mod_lets: Map[Str, Int] = Map()
+            let mut mod_types_pub: Map[Str, Int] = Map()
 
-        let types_sl = np_fields.get(prog)
-        let mut ti = 0
-        while ti < sublist_length(types_sl) {
-            let t = sublist_get(types_sl, ti)
-            if should_import_item(t, imp_node) == 1 {
-                all_types.push(t)
+            let fns_sl = np_params.get(prog)
+            let mut fi = 0
+            while fi < sublist_length(fns_sl) {
+                let f = sublist_get(fns_sl, fi)
+                mod_fns.set(np_name.get(f), f)
+                fi = fi + 1
             }
-            ti = ti + 1
-        }
+            let types_sl = np_fields.get(prog)
+            let mut ti = 0
+            while ti < sublist_length(types_sl) {
+                let t = sublist_get(types_sl, ti)
+                mod_types.set(np_name.get(t), t)
+                mod_types_pub.set(np_name.get(t), np_is_pub.get(t))
+                ti = ti + 1
+            }
+            let lets_sl = np_stmts.get(prog)
+            let mut li = 0
+            while li < sublist_length(lets_sl) {
+                let l = sublist_get(lets_sl, li)
+                mod_lets.set(np_name.get(l), l)
+                li = li + 1
+            }
 
-        let lets_sl = np_stmts.get(prog)
-        let mut li = 0
-        while li < sublist_length(lets_sl) {
-            let l = sublist_get(lets_sl, li)
-            if should_import_item(l, imp_node) == 1 {
-                all_lets.push(l)
-            }
-            li = li + 1
-        }
+            let mut needed: Map[Str, Int] = Map()
 
-        let traits_sl = np_arms.get(prog)
-        let mut tri = 0
-        while tri < sublist_length(traits_sl) {
-            let tr = sublist_get(traits_sl, tri)
-            if should_import_item(tr, imp_node) == 1 {
-                all_traits.push(tr)
+            fi = 0
+            while fi < sublist_length(fns_sl) {
+                let f = sublist_get(fns_sl, fi)
+                if should_import_item(f, imp_node) == 1 {
+                    let fname = np_name.get(f)
+                    needed.set(fname, f)
+                    if np_is_pub.get(f) != 0 {
+                        check_pub_sig(f, fname, mod_types_pub)
+                    }
+                    collect_fn_deps(f, mod_fns, mod_types, mod_lets, needed)
+                }
+                fi = fi + 1
             }
-            tri = tri + 1
+            ti = 0
+            while ti < sublist_length(types_sl) {
+                let t = sublist_get(types_sl, ti)
+                if should_import_item(t, imp_node) == 1 {
+                    let tname = np_name.get(t)
+                    needed.set(tname, t)
+                    add_type_dep(tname, mod_fns, mod_types, mod_lets, needed)
+                }
+                ti = ti + 1
+            }
+            li = 0
+            while li < sublist_length(lets_sl) {
+                let l = sublist_get(lets_sl, li)
+                if should_import_item(l, imp_node) == 1 {
+                    needed.set(np_name.get(l), l)
+                    walk_body_deps(np_value.get(l), mod_fns, mod_types, mod_lets, needed)
+                }
+                li = li + 1
+            }
+            let traits_sl = np_arms.get(prog)
+            let mut tri = 0
+            while tri < sublist_length(traits_sl) {
+                let tr = sublist_get(traits_sl, tri)
+                if should_import_item(tr, imp_node) == 1 {
+                    needed.set(np_name.get(tr), tr)
+                }
+                tri = tri + 1
+            }
+
+            fi = 0
+            while fi < sublist_length(fns_sl) {
+                let f = sublist_get(fns_sl, fi)
+                if needed.has(np_name.get(f)) {
+                    all_fns.push(f)
+                }
+                fi = fi + 1
+            }
+            ti = 0
+            while ti < sublist_length(types_sl) {
+                let t = sublist_get(types_sl, ti)
+                if needed.has(np_name.get(t)) {
+                    all_types.push(t)
+                }
+                ti = ti + 1
+            }
+            li = 0
+            while li < sublist_length(lets_sl) {
+                let l = sublist_get(lets_sl, li)
+                if needed.has(np_name.get(l)) {
+                    all_lets.push(l)
+                }
+                li = li + 1
+            }
+            tri = 0
+            while tri < sublist_length(traits_sl) {
+                let tr = sublist_get(traits_sl, tri)
+                if needed.has(np_name.get(tr)) {
+                    all_traits.push(tr)
+                }
+                tri = tri + 1
+            }
+        } else {
+            let fns_sl = np_params.get(prog)
+            let mut fi = 0
+            while fi < sublist_length(fns_sl) {
+                all_fns.push(sublist_get(fns_sl, fi))
+                fi = fi + 1
+            }
+            let types_sl = np_fields.get(prog)
+            let mut ti = 0
+            while ti < sublist_length(types_sl) {
+                all_types.push(sublist_get(types_sl, ti))
+                ti = ti + 1
+            }
+            let lets_sl = np_stmts.get(prog)
+            let mut li = 0
+            while li < sublist_length(lets_sl) {
+                all_lets.push(sublist_get(lets_sl, li))
+                li = li + 1
+            }
+            let traits_sl = np_arms.get(prog)
+            let mut tri = 0
+            while tri < sublist_length(traits_sl) {
+                all_traits.push(sublist_get(traits_sl, tri))
+                tri = tri + 1
+            }
         }
 
         let impls_sl = np_methods.get(prog)
