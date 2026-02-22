@@ -1420,7 +1420,8 @@ pub fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.
             if tc_current_fn_ret >= 0 && tc_current_fn_ret < ty_kind.len() {
                 let ret_kind = ty_kind.get(tc_current_fn_ret)
                 if ret_kind != TK_RESULT && ret_kind != TK_UNKNOWN {
-                    tc_error("'?' operator used in function '{tc_current_fn_name}' which does not return Result")
+                    tc_errors.push("'?' operator used in function '{tc_current_fn_name}' which does not return Result")
+                    diag_error_at("TypeError", "E0300", "'?' operator used in function '{tc_current_fn_name}' which does not return Result", node, "change the return type to Result")
                 }
             }
             let ok = type_kind(operand)

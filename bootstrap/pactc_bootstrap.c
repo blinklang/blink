@@ -6548,7 +6548,10 @@ int64_t pact_infer_type(int64_t node) {
                 if (((ret_kind != TK_RESULT) && (ret_kind != TK_UNKNOWN))) {
                     char _si_3[4096];
                     snprintf(_si_3, 4096, "'\?' operator used in function '%s' which does not return Result", tc_current_fn_name);
-                    pact_tc_error(strdup(_si_3));
+                    pact_list_push(tc_errors, (void*)strdup(_si_3));
+                    char _si_4[4096];
+                    snprintf(_si_4, 4096, "'\?' operator used in function '%s' which does not return Result", tc_current_fn_name);
+                    pact_diag_error_at("TypeError", "E0300", strdup(_si_4), node, "change the return type to Result");
                 }
             }
             const int64_t ok = pact_type_kind(operand);
@@ -6563,9 +6566,9 @@ int64_t pact_infer_type(int64_t node) {
         if (pact_str_eq(op, "\?\?")) {
             const int64_t operand_k = pact_type_kind(operand);
             if (((operand_k != TK_OPTION) && (operand_k != TK_UNKNOWN))) {
-                char _si_4[4096];
-                snprintf(_si_4, 4096, "'\?\?' operator requires Option value, got %s", pact_type_to_str(operand));
-                pact_tc_error(strdup(_si_4));
+                char _si_5[4096];
+                snprintf(_si_5, 4096, "'\?\?' operator requires Option value, got %s", pact_type_to_str(operand));
+                pact_tc_error(strdup(_si_5));
             }
             if ((operand_k == TK_OPTION)) {
                 return (int64_t)(intptr_t)pact_list_get(ty_inner1, operand);
@@ -6619,9 +6622,9 @@ int64_t pact_infer_type(int64_t node) {
                     }
                     const int64_t expected = (int64_t)(intptr_t)pact_list_get(fnsig_params_count, sig);
                     if ((arg_count != expected)) {
-                        char _si_5[4096];
-                        snprintf(_si_5, 4096, "function '%s' expects %lld argument(s), got %lld", fn_name, (long long)expected, (long long)arg_count);
-                        pact_tc_error(strdup(_si_5));
+                        char _si_6[4096];
+                        snprintf(_si_6, 4096, "function '%s' expects %lld argument(s), got %lld", fn_name, (long long)expected, (long long)arg_count);
+                        pact_tc_error(strdup(_si_6));
                     }
                     const int64_t tp_count = (int64_t)(intptr_t)pact_list_get(fnsig_type_params_count, sig);
                     if ((tp_count > 0)) {
@@ -6740,9 +6743,9 @@ int64_t pact_infer_type(int64_t node) {
         }
         if (((obj_k == TK_STRUCT) || (obj_k == TK_ENUM))) {
             const char* tname = (const char*)pact_list_get(ty_name, obj_t);
-            char _si_6[4096];
-            snprintf(_si_6, 4096, "%s_%s", tname, method);
-            const char* sig_name = strdup(_si_6);
+            char _si_7[4096];
+            snprintf(_si_7, 4096, "%s_%s", tname, method);
+            const char* sig_name = strdup(_si_7);
             const int64_t sig = pact_lookup_fnsig(sig_name);
             if ((sig != (-1))) {
                 return (int64_t)(intptr_t)pact_list_get(fnsig_ret, sig);
@@ -6800,8 +6803,8 @@ int64_t pact_infer_type(int64_t node) {
     if ((kind == pact_NodeKind_TupleLit)) {
         const int64_t elems_sl = (int64_t)(intptr_t)pact_list_get(np_elements, node);
         if ((elems_sl != (-1))) {
-            pact_list* _l7 = pact_list_new();
-            pact_list* elem_types = _l7;
+            pact_list* _l8 = pact_list_new();
+            pact_list* elem_types = _l8;
             int64_t i = 0;
             while ((i < pact_sublist_length(elems_sl))) {
                 pact_list_push(elem_types, (void*)(intptr_t)pact_infer_type(pact_sublist_get(elems_sl, i)));
@@ -6814,9 +6817,9 @@ int64_t pact_infer_type(int64_t node) {
     if ((kind == pact_NodeKind_IfExpr)) {
         const int64_t cond_t = pact_infer_type((int64_t)(intptr_t)pact_list_get(np_condition, node));
         if ((pact_is_bool_compat(cond_t) == 0)) {
-            char _si_8[4096];
-            snprintf(_si_8, 4096, "if condition must be Bool, got %s", pact_type_to_str(cond_t));
-            pact_tc_error(strdup(_si_8));
+            char _si_9[4096];
+            snprintf(_si_9, 4096, "if condition must be Bool, got %s", pact_type_to_str(cond_t));
+            pact_tc_error(strdup(_si_9));
         }
         const int64_t then_t = pact_infer_type((int64_t)(intptr_t)pact_list_get(np_then_body, node));
         const int64_t else_node = (int64_t)(intptr_t)pact_list_get(np_else_body, node);
@@ -6824,9 +6827,9 @@ int64_t pact_infer_type(int64_t node) {
             const int64_t else_t = pact_infer_type(else_node);
             if (((then_t != TYPE_UNKNOWN) && (else_t != TYPE_UNKNOWN))) {
                 if ((pact_types_compatible(then_t, else_t) == 0)) {
-                    char _si_9[4096];
-                    snprintf(_si_9, 4096, "if branches have incompatible types: %s vs %s", pact_type_to_str(then_t), pact_type_to_str(else_t));
-                    pact_tc_error(strdup(_si_9));
+                    char _si_10[4096];
+                    snprintf(_si_10, 4096, "if branches have incompatible types: %s vs %s", pact_type_to_str(then_t), pact_type_to_str(else_t));
+                    pact_tc_error(strdup(_si_10));
                 }
             }
             if ((then_t != TYPE_UNKNOWN)) {
@@ -12560,7 +12563,7 @@ void pact_emit_binop(int64_t node) {
         if (((((((left_type == CT_BOOL) || (left_type == CT_FLOAT)) || (left_type == CT_STRING)) || (left_type == CT_LIST)) || (left_type == CT_RESULT)) || (left_type == CT_CLOSURE))) {
             char _si_0[4096];
             snprintf(_si_0, 4096, "the \?\? operator requires an Option value but got a non-Option type in function '%s'", cg_current_fn_name);
-            pact_diag_error_no_loc("CoalesceRequiresOption", "E0502", strdup(_si_0), "");
+            pact_diag_error_at("CoalesceRequiresOption", "E0502", strdup(_si_0), node, "");
         }
         pact_emit_expr((int64_t)(intptr_t)pact_list_get(np_right, node));
         const char* right_str = expr_result_str;
@@ -12641,7 +12644,7 @@ void pact_emit_unaryop(int64_t node) {
                 if ((cg_current_fn_ret != CT_RESULT)) {
                     char _si_2[4096];
                     snprintf(_si_2, 4096, "'\?' operator used in function '%s' which does not return Result", cg_current_fn_name);
-                    pact_diag_error_no_loc("QuestionMarkRequiresResult", "E0503", strdup(_si_2), "change the return type to Result");
+                    pact_diag_error_at("QuestionMarkRequiresResult", "E0503", strdup(_si_2), node, "change the return type to Result");
                     expr_result_str = "0";
                     expr_result_type = CT_INT;
                 } else {
@@ -12662,7 +12665,7 @@ void pact_emit_unaryop(int64_t node) {
             } else {
                 char _si_6[4096];
                 snprintf(_si_6, 4096, "'\?' operator requires a Result value but got a non-Result type in function '%s'", cg_current_fn_name);
-                pact_diag_error_no_loc("QuestionMarkRequiresResult", "E0503", strdup(_si_6), "");
+                pact_diag_error_at("QuestionMarkRequiresResult", "E0503", strdup(_si_6), node, "");
                 expr_result_str = "0";
                 expr_result_type = CT_INT;
             }

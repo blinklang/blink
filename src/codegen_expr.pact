@@ -603,7 +603,7 @@ pub fn emit_binop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Di
         let left_type = expr_result_type
         let opt_inner = expr_option_inner
         if left_type == CT_BOOL || left_type == CT_FLOAT || left_type == CT_STRING || left_type == CT_LIST || left_type == CT_RESULT || left_type == CT_CLOSURE {
-            diag_error_no_loc("CoalesceRequiresOption", "E0502", "the ?? operator requires an Option value but got a non-Option type in function '{cg_current_fn_name}'", "")
+            diag_error_at("CoalesceRequiresOption", "E0502", "the ?? operator requires an Option value but got a non-Option type in function '{cg_current_fn_name}'", node, "")
         }
         emit_expr(np_right.get(node))
         let right_str = expr_result_str
@@ -665,7 +665,7 @@ pub fn emit_unaryop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
         let tmp = fresh_temp("__res")
         if operand_type == CT_RESULT {
             if cg_current_fn_ret != CT_RESULT {
-                diag_error_no_loc("QuestionMarkRequiresResult", "E0503", "'?' operator used in function '{cg_current_fn_name}' which does not return Result", "change the return type to Result")
+                diag_error_at("QuestionMarkRequiresResult", "E0503", "'?' operator used in function '{cg_current_fn_name}' which does not return Result", node, "change the return type to Result")
                 expr_result_str = "0"
                 expr_result_type = CT_INT
             } else {
@@ -678,7 +678,7 @@ pub fn emit_unaryop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
                 expr_result_type = rok
             }
         } else {
-            diag_error_no_loc("QuestionMarkRequiresResult", "E0503", "'?' operator requires a Result value but got a non-Result type in function '{cg_current_fn_name}'", "")
+            diag_error_at("QuestionMarkRequiresResult", "E0503", "'?' operator requires a Result value but got a non-Result type in function '{cg_current_fn_name}'", node, "")
             expr_result_str = "0"
             expr_result_type = CT_INT
         }
