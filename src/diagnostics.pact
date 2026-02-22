@@ -1,5 +1,9 @@
 import parser
 
+effect Diag {
+    effect Report
+}
+
 // diagnostics.pact — Structured diagnostic collector and emitter
 //
 // Collects errors/warnings into parallel arrays, then flushes as
@@ -24,7 +28,7 @@ pub let mut diag_count: Int = 0        // error count only
 
 // ── Emit helpers ─────────────────────────────────────────────────────
 
-pub fn diag_emit(severity: Str, name: Str, code: Str, message: Str, line: Int, col: Int, help: Str) {
+pub fn diag_emit(severity: Str, name: Str, code: Str, message: Str, line: Int, col: Int, help: Str) ! Diag.Report {
     diag_severity.push(severity)
     diag_name.push(name)
     diag_code.push(code)
@@ -38,21 +42,21 @@ pub fn diag_emit(severity: Str, name: Str, code: Str, message: Str, line: Int, c
     }
 }
 
-pub fn diag_error(name: Str, code: Str, message: Str, line: Int, col: Int, help: Str) {
+pub fn diag_error(name: Str, code: Str, message: Str, line: Int, col: Int, help: Str) ! Diag.Report {
     diag_emit("error", name, code, message, line, col, help)
 }
 
-pub fn diag_error_no_loc(name: Str, code: Str, message: Str, help: Str) {
+pub fn diag_error_no_loc(name: Str, code: Str, message: Str, help: Str) ! Diag.Report {
     diag_emit("error", name, code, message, 0, 0, help)
 }
 
-pub fn diag_error_at(name: Str, code: Str, message: Str, node_id: Int, help: Str) {
+pub fn diag_error_at(name: Str, code: Str, message: Str, node_id: Int, help: Str) ! Diag.Report {
     let line = np_line.get(node_id)
     let col = np_col.get(node_id)
     diag_emit("error", name, code, message, line, col, help)
 }
 
-pub fn diag_warn(name: Str, code: Str, message: Str, line: Int, col: Int, help: Str) {
+pub fn diag_warn(name: Str, code: Str, message: Str, line: Int, col: Int, help: Str) ! Diag.Report {
     diag_emit("warning", name, code, message, line, col, help)
 }
 
@@ -83,7 +87,7 @@ pub fn json_escape(s: Str) -> Str {
 
 // ── Flush: emit all diagnostics ──────────────────────────────────────
 
-pub fn diag_flush() {
+pub fn diag_flush() ! Diag.Report {
     let mut i = 0
     while i < diag_severity.len() {
         if diag_format == 1 {
@@ -102,7 +106,7 @@ pub fn diag_flush() {
     }
 }
 
-pub fn diag_print_json(idx: Int) {
+pub fn diag_print_json(idx: Int) ! Diag.Report {
     let sev = json_escape(diag_severity.get(idx))
     let name = json_escape(diag_name.get(idx))
     let code = json_escape(diag_code.get(idx))
@@ -119,7 +123,7 @@ pub fn diag_print_json(idx: Int) {
     io.println(json)
 }
 
-pub fn diag_print_human(idx: Int) {
+pub fn diag_print_human(idx: Int) ! Diag.Report {
     let sev = diag_severity.get(idx)
     let name = diag_name.get(idx)
     let msg = diag_message.get(idx)

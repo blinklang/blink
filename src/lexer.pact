@@ -1,5 +1,9 @@
 import tokens
 
+effect Lex {
+    effect Tokenize
+}
+
 // lexer.pact — Self-hosting lexer for Pact, ported from Python
 //
 // Demonstrates: parallel arrays (workaround for no struct-in-list),
@@ -94,7 +98,7 @@ pub let mut tok_cols: List[Int] = []
 
 // ── Main lexer ───────────────────────────────────────────────────────
 
-pub fn lex(source: Str) {
+pub fn lex(source: Str) ! Lex.Tokenize {
     // Reset output arrays
     tok_kinds = []
     tok_values = []

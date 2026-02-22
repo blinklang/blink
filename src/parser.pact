@@ -3,6 +3,11 @@ import ast
 import lexer
 import diagnostics
 
+effect Parse {
+    effect Advance
+    effect Build
+}
+
 // parser.pact — Self-hosting recursive descent parser for Pact
 //
 // Port of src/pact/parser.py. Uses parallel-array node pool since
@@ -70,7 +75,7 @@ pub let mut np_col: List[Int] = []
 pub let mut pending_comments: List[Str] = []
 pub let mut pending_doc_comment: Str = ""
 
-pub fn new_node(kind: Int) -> Int {
+pub fn new_node(kind: Int) -> Int ! Parse.Build {
     let id = np_kind.len()
     np_kind.push(kind)
     np_int_val.push(0)
@@ -120,7 +125,7 @@ pub fn new_node(kind: Int) -> Int {
     id
 }
 
-pub fn new_sublist() -> Int {
+pub fn new_sublist() -> Int ! Parse.Build {
     if sl_open {
         io.println("FATAL: new_sublist() called while another sublist is open — collect items into a List first, then build the sublist after parsing completes")
     }
@@ -131,14 +136,14 @@ pub fn new_sublist() -> Int {
     id
 }
 
-pub fn sublist_push(sl: Int, node_id: Int) {
+pub fn sublist_push(sl: Int, node_id: Int) ! Parse.Build {
     if !sl_open {
         io.println("FATAL: sublist_push() called with no open sublist — call new_sublist() first")
     }
     sl_items.push(node_id)
 }
 
-pub fn finalize_sublist(sl: Int) {
+pub fn finalize_sublist(sl: Int) ! Parse.Build {
     if !sl_open {
         io.println("FATAL: finalize_sublist() called with no open sublist — mismatched new_sublist/finalize_sublist calls")
     }
@@ -182,26 +187,26 @@ pub fn at(kind: Int) -> Int {
     peek_kind() == kind
 }
 
-pub fn advance() -> Int {
+pub fn advance() -> Int ! Parse.Advance {
     let old = pos
     pos = pos + 1
     old
 }
 
-pub fn advance_value() -> Str {
+pub fn advance_value() -> Str ! Parse.Advance {
     let v = tok_values.get(pos)
     pos = pos + 1
     v
 }
 
-pub fn expect(kind: Int) -> Int {
+pub fn expect(kind: Int) -> Int ! Parse.Advance {
     if peek_kind() != kind {
         diag_error("UnexpectedToken", "E1100", "expected token kind {kind}, got {peek_kind()}", peek_line(), peek_col(), "")
     }
     advance()
 }
 
-pub fn expect_value(kind: Int) -> Str {
+pub fn expect_value(kind: Int) -> Str ! Parse.Advance {
     if peek_kind() != kind {
         if kind == TokenKind.Ident && is_keyword(peek_kind()) {
             diag_error("KeywordAsIdentifier", "E1103", "'{peek_value()}' is a keyword and cannot be used as an identifier", peek_line(), peek_col(), "use a different name")
@@ -212,7 +217,7 @@ pub fn expect_value(kind: Int) -> Str {
     advance_value()
 }
 
-pub fn skip_newlines() {
+pub fn skip_newlines() ! Parse.Advance {
     while at(TokenKind.Newline) || at(TokenKind.Comment) || at(TokenKind.DocComment) {
         if at(TokenKind.Comment) {
             pending_comments.push(peek_value())
@@ -226,7 +231,7 @@ pub fn skip_newlines() {
     }
 }
 
-pub fn skip_comments() {
+pub fn skip_comments() ! Parse.Advance {
     while at(TokenKind.Comment) || at(TokenKind.DocComment) {
         if at(TokenKind.Comment) {
             pending_comments.push(peek_value())
@@ -240,7 +245,7 @@ pub fn skip_comments() {
     }
 }
 
-pub fn maybe_newline() {
+pub fn maybe_newline() ! Parse.Advance {
     if at(TokenKind.Newline) {
         advance()
     }
@@ -320,7 +325,7 @@ pub fn parse_import_stmt() -> Int {
 
 // ── Top-level ───────────────────────────────────────────────────────
 
-pub fn parse_program() -> Int {
+pub fn parse_program() -> Int ! Parse {
     let mut fn_nodes: List[Int] = []
     let mut type_nodes: List[Int] = []
     let mut let_nodes: List[Int] = []

@@ -3,6 +3,12 @@ import ast
 import parser
 import diagnostics
 
+effect Codegen {
+    effect Emit
+    effect Register
+    effect Scope
+}
+
 // codegen_types.pact — Type constants, global state, scope/registry helpers
 //
 // Minimal subset: enough to compile hello_compiled.pact via the
@@ -345,7 +351,7 @@ pub let mut match_scrut_enum: Str = ""
 // Debug mode: 0 = release (strip debug_assert), 1 = debug (emit checks)
 pub let mut cg_debug_mode: Int = 0
 
-pub fn push_scope() {
+pub fn push_scope() ! Codegen.Scope {
     scope_frame_starts.push(scope_vars.len())
     var_struct_frame_starts.push(var_structs.len())
     var_closure_frame_starts.push(var_closures.len())
@@ -359,7 +365,7 @@ pub fn push_scope() {
     var_map_frame_starts.push(var_maps.len())
 }
 
-pub fn pop_scope() {
+pub fn pop_scope() ! Codegen.Scope {
     let start = scope_frame_starts.get(scope_frame_starts.len() - 1)
     scope_frame_starts.pop()
     while scope_vars.len() > start {
@@ -417,7 +423,7 @@ pub fn pop_scope() {
     }
 }
 
-pub fn set_var(name: Str, ctype: Int, is_mut: Int) {
+pub fn set_var(name: Str, ctype: Int, is_mut: Int) ! Codegen.Scope {
     scope_vars.push(ScopeVar { name: name, ctype: ctype, is_mut: is_mut })
 }
 
@@ -491,11 +497,11 @@ pub fn capture_cast_expr(idx: Int) -> Str {
     }
 }
 
-pub fn reg_fn(name: Str, ret: Int) {
+pub fn reg_fn(name: Str, ret: Int) ! Codegen.Register {
     fn_regs.push(FnRegEntry { name: name, ret: ret, effect_sl: -1 })
 }
 
-pub fn reg_fn_with_effects(name: Str, ret: Int, effects_sl: Int) {
+pub fn reg_fn_with_effects(name: Str, ret: Int, effects_sl: Int) ! Codegen.Register {
     fn_regs.push(FnRegEntry { name: name, ret: ret, effect_sl: effects_sl })
 }
 
@@ -511,7 +517,7 @@ pub fn get_fn_effect_sl(name: Str) -> Int {
     -1
 }
 
-pub fn reg_fn_struct_ret(name: Str, stype: Str) {
+pub fn reg_fn_struct_ret(name: Str, stype: Str) ! Codegen.Register {
     fn_ret_structs.push(FnRetStructEntry { name: name, stype: stype })
 }
 
@@ -527,7 +533,7 @@ pub fn get_fn_ret_struct(name: Str) -> Str {
     ""
 }
 
-pub fn reg_fn_ret_type(name: Str, kind: Int, inner1: Int, inner2: Int) {
+pub fn reg_fn_ret_type(name: Str, kind: Int, inner1: Int, inner2: Int) ! Codegen.Register {
     fn_ret_types.push(RetType { name: name, kind: kind, inner1: inner1, inner2: inner2 })
 }
 
@@ -569,7 +575,7 @@ pub fn resolve_ret_type_from_ann(fn_node: Int) -> Str {
     ""
 }
 
-pub fn reg_fn_ret_from_ann(name: Str, fn_node: Int) {
+pub fn reg_fn_ret_from_ann(name: Str, fn_node: Int) ! Codegen.Register {
     let ret_str = np_return_type.get(fn_node)
     let ta = np_type_ann.get(fn_node)
     if ret_str == "Result" && ta != -1 {
@@ -603,7 +609,7 @@ pub fn reg_fn_ret_from_ann(name: Str, fn_node: Int) {
     }
 }
 
-pub fn reg_effect(name: Str, parent: Int) -> Int {
+pub fn reg_effect(name: Str, parent: Int) -> Int ! Codegen.Register {
     let idx = effect_entries.len()
     effect_entries.push(EffectEntry { name: name, parent: parent })
     idx
@@ -670,7 +676,7 @@ pub fn check_effect_propagation(callee_name: Str) {
             }
         }
         if satisfied == 0 {
-            diag_error_no_loc("UndeclaredEffect", "E0500", "function '{callee_name}' requires effect '{callee_eff}' but caller '{cg_current_fn_name}' does not declare it", "declare '! {callee_eff}' on function '{cg_current_fn_name}'")
+            diag_warn("UndeclaredEffect", "E0500", "function '{callee_name}' requires effect '{callee_eff}' but caller '{cg_current_fn_name}' does not declare it", 0, 0, "")
         }
         ci = ci + 1
     }
@@ -707,7 +713,7 @@ pub fn check_capabilities_budget(fn_name: Str, effects_sl: Int) {
     }
 }
 
-pub fn init_builtin_effects() {
+pub fn init_builtin_effects() ! Codegen.Register {
     let io_idx = reg_effect("IO", -1)
     reg_effect("IO.Print", io_idx)
     reg_effect("IO.Log", io_idx)
@@ -1136,7 +1142,7 @@ pub fn get_generic_fn_node(name: Str) -> Int {
     -1
 }
 
-pub fn register_mono_fn(base: Str, args: Str) {
+pub fn register_mono_fn(base: Str, args: Str) ! Codegen.Register {
     let mut i = 0
     while i < mono_fns.len() {
         let mf = mono_fns.get(i)
@@ -1212,7 +1218,7 @@ pub fn mangle_generic_name(base: Str, args: Str) -> Str {
     result
 }
 
-pub fn register_mono_instance(base: Str, args: Str) -> Str {
+pub fn register_mono_instance(base: Str, args: Str) -> Str ! Codegen.Register {
     let existing = lookup_mono_instance(base, args)
     if existing != "" {
         return existing
@@ -1540,7 +1546,7 @@ pub fn get_var_channel_inner(name: Str) -> Int {
     -1
 }
 
-pub fn emit_option_typedef(inner: Int) {
+pub fn emit_option_typedef(inner: Int) ! Codegen.Emit {
     let tag = c_type_tag(inner)
     let tname = "pact_Option_{tag}"
     let c_inner = c_type_str(inner)
@@ -1548,7 +1554,7 @@ pub fn emit_option_typedef(inner: Int) {
     emit_line("")
 }
 
-pub fn emit_result_typedef(ok_t: Int, err_t: Int) {
+pub fn emit_result_typedef(ok_t: Int, err_t: Int) ! Codegen.Emit {
     let ok_tag = c_type_tag(ok_t)
     let err_tag = c_type_tag(err_t)
     let tname = "pact_Result_{ok_tag}_{err_tag}"
@@ -1584,7 +1590,7 @@ pub fn ensure_str_iter() {
     ensure_option_type(CT_INT)
 }
 
-pub fn emit_range_iter_typedef() {
+pub fn emit_range_iter_typedef() ! Codegen.Emit {
     emit_line("typedef struct \{ int64_t current; int64_t end; int is_inclusive; } pact_RangeIterator;")
     emit_line("")
     emit_line("static pact_Option_int pact_RangeIterator_next(pact_RangeIterator* self) \{")
@@ -1599,7 +1605,7 @@ pub fn emit_range_iter_typedef() {
     emit_line("")
 }
 
-pub fn emit_str_iter_typedef() {
+pub fn emit_str_iter_typedef() ! Codegen.Emit {
     emit_line("typedef struct \{ const char* str; int64_t index; int64_t len; } pact_StrIterator;")
     emit_line("")
     emit_line("static pact_Option_int pact_StrIterator_next(pact_StrIterator* self) \{")
@@ -1617,7 +1623,7 @@ pub fn list_iter_c_type(inner: Int) -> Str {
     "pact_ListIterator_{c_type_tag(inner)}"
 }
 
-pub fn emit_list_iter_typedef(inner: Int) {
+pub fn emit_list_iter_typedef(inner: Int) ! Codegen.Emit {
     let tag = c_type_tag(inner)
     let tname = "pact_ListIterator_{tag}"
     let opt_name = option_c_type(inner)
@@ -1645,7 +1651,7 @@ pub fn emit_list_iter_typedef(inner: Int) {
     emit_line("")
 }
 
-pub fn emit_all_iter_types() {
+pub fn emit_all_iter_types() ! Codegen.Emit {
     if emitted_range_iter != 0 {
         emit_range_iter_typedef()
     }
@@ -1689,7 +1695,7 @@ pub fn emit_all_iter_types() {
     }
 }
 
-pub fn emit_iter_types_from(list_start: Int, map_start: Int, filter_start: Int, take_start: Int, skip_start: Int, chain_start: Int, flat_map_start: Int) {
+pub fn emit_iter_types_from(list_start: Int, map_start: Int, filter_start: Int, take_start: Int, skip_start: Int, chain_start: Int, flat_map_start: Int) ! Codegen.Emit {
     let mut i = list_start
     while i < emitted_iter_types.len() {
         emit_list_iter_typedef(emitted_iter_types.get(i))
@@ -1774,7 +1780,7 @@ pub fn ensure_flat_map_iter(inner: Int) {
     ensure_option_type(inner)
 }
 
-pub fn emit_map_iter_typedef(inner: Int) {
+pub fn emit_map_iter_typedef(inner: Int) ! Codegen.Emit {
     let tag = c_type_tag(inner)
     let opt = option_c_type(inner)
     let c_inner = c_type_str(inner)
@@ -1789,7 +1795,7 @@ pub fn emit_map_iter_typedef(inner: Int) {
     emit_line("")
 }
 
-pub fn emit_filter_iter_typedef(inner: Int) {
+pub fn emit_filter_iter_typedef(inner: Int) ! Codegen.Emit {
     let tag = c_type_tag(inner)
     let opt = option_c_type(inner)
     let c_inner = c_type_str(inner)
@@ -1807,7 +1813,7 @@ pub fn emit_filter_iter_typedef(inner: Int) {
     emit_line("")
 }
 
-pub fn emit_take_iter_typedef(inner: Int) {
+pub fn emit_take_iter_typedef(inner: Int) ! Codegen.Emit {
     let tag = c_type_tag(inner)
     let opt = option_c_type(inner)
     emit_line("typedef struct \{ void* source; {opt} (*source_next)(void*); int64_t limit; int64_t count; } pact_TakeIterator_{tag};")
@@ -1822,7 +1828,7 @@ pub fn emit_take_iter_typedef(inner: Int) {
     emit_line("")
 }
 
-pub fn emit_skip_iter_typedef(inner: Int) {
+pub fn emit_skip_iter_typedef(inner: Int) ! Codegen.Emit {
     let tag = c_type_tag(inner)
     let opt = option_c_type(inner)
     emit_line("typedef struct \{ void* source; {opt} (*source_next)(void*); int64_t skip_n; int64_t skipped; } pact_SkipIterator_{tag};")
@@ -1838,7 +1844,7 @@ pub fn emit_skip_iter_typedef(inner: Int) {
     emit_line("")
 }
 
-pub fn emit_chain_iter_typedef(inner: Int) {
+pub fn emit_chain_iter_typedef(inner: Int) ! Codegen.Emit {
     let tag = c_type_tag(inner)
     let opt = option_c_type(inner)
     emit_line("typedef struct \{ void* source_a; {opt} (*next_a)(void*); void* source_b; {opt} (*next_b)(void*); int phase; } pact_ChainIterator_{tag};")
@@ -1854,7 +1860,7 @@ pub fn emit_chain_iter_typedef(inner: Int) {
     emit_line("")
 }
 
-pub fn emit_flat_map_iter_typedef(inner: Int) {
+pub fn emit_flat_map_iter_typedef(inner: Int) ! Codegen.Emit {
     let tag = c_type_tag(inner)
     let opt = option_c_type(inner)
     let c_inner = c_type_str(inner)
@@ -1882,7 +1888,7 @@ pub fn emit_flat_map_iter_typedef(inner: Int) {
     emit_line("")
 }
 
-pub fn emit_all_option_result_types() {
+pub fn emit_all_option_result_types() ! Codegen.Emit {
     let mut i = 0
     while i < emitted_option_types.len() {
         emit_option_typedef(emitted_option_types.get(i))
@@ -1918,7 +1924,7 @@ pub fn emit_all_option_result_types() {
     }
 }
 
-pub fn emit_option_result_types_from(opt_start: Int, res_start: Int) {
+pub fn emit_option_result_types_from(opt_start: Int, res_start: Int) ! Codegen.Emit {
     let mut i = opt_start
     while i < emitted_option_types.len() {
         emit_option_typedef(emitted_option_types.get(i))
@@ -1960,7 +1966,7 @@ pub fn fresh_temp(prefix: Str) -> Str {
     "{prefix}{n}"
 }
 
-pub fn emit_line(line: Str) {
+pub fn emit_line(line: Str) ! Codegen.Emit {
     if line == "" {
         cg_lines.push("")
     } else {
@@ -1974,7 +1980,7 @@ pub fn emit_line(line: Str) {
     }
 }
 
-pub fn join_lines() -> Str {
+pub fn join_lines() -> Str ! Codegen.Emit {
     let mut result = ""
     let mut i = 0
     while i < cg_lines.len() {

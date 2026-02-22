@@ -7332,9 +7332,7 @@ void pact_check_effect_propagation(const char* callee_name) {
         if ((satisfied == 0)) {
             char _si_0[4096];
             snprintf(_si_0, 4096, "function '%s' requires effect '%s' but caller '%s' does not declare it", callee_name, callee_eff, cg_current_fn_name);
-            char _si_1[4096];
-            snprintf(_si_1, 4096, "declare '! %s' on function '%s'", callee_eff, cg_current_fn_name);
-            pact_diag_error_no_loc("UndeclaredEffect", "E0500", strdup(_si_0), strdup(_si_1));
+            pact_diag_warn("UndeclaredEffect", "E0500", strdup(_si_0), 0, 0, "");
         }
         ci = (ci + 1);
     }

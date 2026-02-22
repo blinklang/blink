@@ -1,7 +1,7 @@
 import codegen_types
 import diagnostics
 
-pub fn emit_method_call(node: Int) {
+pub fn emit_method_call(node: Int) ! Codegen.Emit {
     let obj_node = np_obj.get(node)
     let method = np_method.get(node)
 

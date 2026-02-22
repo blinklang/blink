@@ -1,6 +1,10 @@
 import ast
 import parser
 
+effect Format {
+    effect Emit
+}
+
 // formatter.pact — AST pretty-printer emitting canonical Pact source
 //
 // Walks the parallel-array AST and emits canonically formatted Pact.
@@ -14,7 +18,7 @@ pub let mut fmt_lines: List[Str] = []
 pub let mut fmt_indent: Int = 0
 pub let fmt_max_line: Int = 100
 
-pub fn fmt_emit(line: Str) {
+pub fn fmt_emit(line: Str) ! Format.Emit {
     if line == "" {
         fmt_lines.push("")
     } else {
@@ -28,7 +32,7 @@ pub fn fmt_emit(line: Str) {
     }
 }
 
-pub fn fmt_emit_raw(line: Str) {
+pub fn fmt_emit_raw(line: Str) ! Format.Emit {
     fmt_lines.push(line)
 }
 
@@ -653,7 +657,7 @@ pub fn format_handler_inline(node: Int) -> Str {
 
 // ── Wrapped emission helpers ────────────────────────────────────────
 
-pub fn emit_call_wrapped(node: Int, prefix: Str) {
+pub fn emit_call_wrapped(node: Int, prefix: Str) ! Format.Emit {
     let kind = np_kind.get(node)
     if kind == NodeKind.Call {
         let func = np_left.get(node)
@@ -709,7 +713,7 @@ pub fn emit_call_wrapped(node: Int, prefix: Str) {
     fmt_emit(prefix.concat(format_expr(node)))
 }
 
-pub fn emit_list_wrapped(node: Int, prefix: Str) {
+pub fn emit_list_wrapped(node: Int, prefix: Str) ! Format.Emit {
     let elems_sl = np_elements.get(node)
     if elems_sl == -1 || sublist_length(elems_sl) == 0 {
         fmt_emit(prefix.concat("[]"))
@@ -731,7 +735,7 @@ pub fn emit_list_wrapped(node: Int, prefix: Str) {
     fmt_emit("]")
 }
 
-pub fn emit_struct_lit_wrapped(node: Int, prefix: Str) {
+pub fn emit_struct_lit_wrapped(node: Int, prefix: Str) ! Format.Emit {
     let tname = np_type_name.get(node)
     let flds_sl = np_fields.get(node)
     if flds_sl == -1 || sublist_length(flds_sl) == 0 {
@@ -760,7 +764,7 @@ pub fn emit_struct_lit_wrapped(node: Int, prefix: Str) {
 pub let mut binop_parts: List[Str] = []
 pub let mut binop_ops: List[Str] = []
 
-pub fn emit_binop_wrapped(node: Int, prefix: Str) {
+pub fn emit_binop_wrapped(node: Int, prefix: Str) ! Format.Emit {
     binop_parts = []
     binop_ops = []
     flatten_binop_chain(node)
@@ -805,7 +809,7 @@ fn flatten_binop_chain(node: Int) {
     binop_parts.push(right_str)
 }
 
-pub fn emit_method_chain_wrapped(node: Int, prefix: Str) {
+pub fn emit_method_chain_wrapped(node: Int, prefix: Str) ! Format.Emit {
     let mut chain: List[Int] = []
     let mut cur = node
     while np_kind.get(cur) == NodeKind.MethodCall {
@@ -859,7 +863,7 @@ pub fn chain_depth(node: Int) -> Int {
     depth
 }
 
-pub fn emit_expr_wrapped(node: Int, prefix: Str, suffix: Str) {
+pub fn emit_expr_wrapped(node: Int, prefix: Str, suffix: Str) ! Format.Emit {
     let expr_str = format_expr(node)
     let full = prefix.concat(expr_str).concat(suffix)
     if fmt_needs_wrap(full) == 0 {
@@ -908,7 +912,7 @@ pub fn emit_expr_wrapped(node: Int, prefix: Str, suffix: Str) {
 
 // ── Statement formatting ────────────────────────────────────────────
 
-pub fn emit_comments(node: Int) {
+pub fn emit_comments(node: Int) ! Format.Emit {
     let doc = np_doc_comment.get(node)
     if doc != "" {
         let mut i = 0
@@ -937,7 +941,7 @@ pub fn emit_comments(node: Int) {
     }
 }
 
-pub fn format_stmt(node: Int) {
+pub fn format_stmt(node: Int) ! Format.Emit {
     if node == -1 {
         return
     }
@@ -1096,11 +1100,11 @@ pub fn format_stmt(node: Int) {
     fmt_emit(format_expr(node))
 }
 
-pub fn format_if_stmt(node: Int) {
+pub fn format_if_stmt(node: Int) ! Format.Emit {
     format_if_chain(node, "if")
 }
 
-pub fn format_if_chain(node: Int, prefix: Str) {
+pub fn format_if_chain(node: Int, prefix: Str) ! Format.Emit {
     let cond = np_condition.get(node)
     let then_b = np_then_body.get(node)
     let else_b = np_else_body.get(node)
@@ -1141,7 +1145,7 @@ pub fn format_else_if(node: Int) -> Str {
     ""
 }
 
-pub fn format_match_stmt(node: Int) {
+pub fn format_match_stmt(node: Int) ! Format.Emit {
     let scrut = np_scrutinee.get(node)
     let arms_sl = np_arms.get(node)
     fmt_emit("match {format_expr(scrut)} \{")
@@ -1157,7 +1161,7 @@ pub fn format_match_stmt(node: Int) {
     fmt_emit("}")
 }
 
-pub fn format_match_arm(node: Int) {
+pub fn format_match_arm(node: Int) ! Format.Emit {
     let pat = np_pattern.get(node)
     let guard = np_guard.get(node)
     let body = np_body.get(node)
@@ -1199,7 +1203,7 @@ pub fn format_match_arm(node: Int) {
     }
 }
 
-pub fn format_with_block(node: Int) {
+pub fn format_with_block(node: Int) ! Format.Emit {
     let handlers_sl = np_handlers.get(node)
     let body = np_body.get(node)
     let mut line = "with "
@@ -1228,7 +1232,7 @@ pub fn format_with_block(node: Int) {
     fmt_emit("}")
 }
 
-pub fn format_block_body(node: Int) {
+pub fn format_block_body(node: Int) ! Format.Emit {
     if node == -1 {
         return
     }
@@ -1268,7 +1272,7 @@ pub fn format_fn_sig_suffix(ret: Str, ret_ann: Int, effects_sl: Int) -> Str {
     suffix
 }
 
-pub fn format_fn_def(node: Int) {
+pub fn format_fn_def(node: Int) ! Format.Emit {
     emit_comments(node)
     let name = np_name.get(node)
     let is_pub = np_is_pub.get(node)
@@ -1391,7 +1395,7 @@ pub fn format_fn_def(node: Int) {
     }
 }
 
-pub fn format_type_def(node: Int) {
+pub fn format_type_def(node: Int) ! Format.Emit {
     emit_comments(node)
     let name = np_name.get(node)
     let is_pub = np_is_pub.get(node)
@@ -1480,7 +1484,7 @@ pub fn format_type_def(node: Int) {
     }
 }
 
-pub fn format_trait_def(node: Int) {
+pub fn format_trait_def(node: Int) ! Format.Emit {
     emit_comments(node)
     let name = np_name.get(node)
     let is_pub = np_is_pub.get(node)
@@ -1521,7 +1525,7 @@ pub fn format_trait_def(node: Int) {
     fmt_emit("}")
 }
 
-pub fn format_impl_block(node: Int) {
+pub fn format_impl_block(node: Int) ! Format.Emit {
     emit_comments(node)
     let trait_name = np_trait_name.get(node)
     let type_name = np_name.get(node)
@@ -1561,7 +1565,7 @@ pub fn format_impl_block(node: Int) {
     fmt_emit("}")
 }
 
-pub fn format_test_block(node: Int) {
+pub fn format_test_block(node: Int) ! Format.Emit {
     emit_comments(node)
     let name = np_name.get(node)
     let body = np_body.get(node)
@@ -1572,7 +1576,7 @@ pub fn format_test_block(node: Int) {
     fmt_emit("}")
 }
 
-pub fn format_annotation(node: Int) {
+pub fn format_annotation(node: Int) ! Format.Emit {
     let name = np_name.get(node)
     let args_sl = np_args.get(node)
     let mut line = "@".concat(name)
@@ -1591,7 +1595,7 @@ pub fn format_annotation(node: Int) {
     fmt_emit(line)
 }
 
-pub fn format_import(node: Int) {
+pub fn format_import(node: Int) ! Format.Emit {
     emit_comments(node)
     let path = np_str_val.get(node)
     let names_sl = np_args.get(node)
@@ -1611,7 +1615,7 @@ pub fn format_import(node: Int) {
     fmt_emit(line)
 }
 
-pub fn format_effect_decl(node: Int) {
+pub fn format_effect_decl(node: Int) ! Format.Emit {
     emit_comments(node)
     let name = np_name.get(node)
     let is_pub = np_is_pub.get(node)
@@ -1655,7 +1659,7 @@ pub fn format_effect_decl(node: Int) {
     fmt_emit("}")
 }
 
-pub fn format_effect_op_sig(node: Int) {
+pub fn format_effect_op_sig(node: Int) ! Format.Emit {
     let name = np_name.get(node)
     let params_sl = np_params.get(node)
     let ret = np_return_type.get(node)
@@ -1679,7 +1683,7 @@ pub fn format_effect_op_sig(node: Int) {
 
 // ── Main entry point ────────────────────────────────────────────────
 
-pub fn format(program: Int) -> Str {
+pub fn format(program: Int) -> Str ! Format.Emit {
     fmt_lines = []
     fmt_indent = 0
 

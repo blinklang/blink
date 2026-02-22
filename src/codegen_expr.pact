@@ -47,7 +47,7 @@ pub fn iter_from_source(obj_str: Str, obj_type: Int) {
     }
 }
 
-pub fn emit_expr(node: Int) {
+pub fn emit_expr(node: Int) ! Codegen.Emit {
     let kind = np_kind.get(node)
 
     if kind == NodeKind.IntLit {
@@ -291,7 +291,7 @@ pub fn emit_expr(node: Int) {
     expr_result_type = CT_VOID
 }
 
-pub fn emit_handler_expr(node: Int) {
+pub fn emit_handler_expr(node: Int) ! Codegen.Emit {
     let effect_name = np_name.get(node)
     let methods_sl = np_methods.get(node)
     let handler_idx = cg_temp_counter
@@ -454,7 +454,7 @@ pub fn emit_handler_expr(node: Int) {
     cg_handler_is_user_effect = is_user_effect
 }
 
-pub fn emit_async_spawn_closure(closure_node: Int, wrapper_idx: Int, wrapper_name: Str, task_fn_name: Str) {
+pub fn emit_async_spawn_closure(closure_node: Int, wrapper_idx: Int, wrapper_name: Str, task_fn_name: Str) ! Codegen.Emit {
     let cl_params_sl = np_params.get(closure_node)
     let captures = analyze_captures(np_body.get(closure_node), cl_params_sl)
     let cap_start = closure_captures.len()
@@ -538,7 +538,7 @@ pub fn emit_async_spawn_closure(closure_node: Int, wrapper_idx: Int, wrapper_nam
     cg_closure_defs.push("")
 }
 
-pub fn emit_await_expr(node: Int) {
+pub fn emit_await_expr(node: Int) ! Codegen.Emit {
     emit_expr(np_obj.get(node))
     let handle_str = expr_result_str
     let handle_type = expr_result_type
@@ -563,7 +563,7 @@ pub fn emit_await_expr(node: Int) {
     }
 }
 
-pub fn emit_async_scope(node: Int) {
+pub fn emit_async_scope(node: Int) ! Codegen.Emit {
     cg_uses_async = 1
     let scope_idx = cg_async_scope_counter
     cg_async_scope_counter = cg_async_scope_counter + 1
@@ -591,7 +591,7 @@ pub fn emit_async_scope(node: Int) {
     expr_result_type = saved_type
 }
 
-pub fn emit_binop(node: Int) {
+pub fn emit_binop(node: Int) ! Codegen.Emit {
     let op = np_op.get(node)
     if op == "??" {
         emit_expr(np_left.get(node))
@@ -646,7 +646,7 @@ pub fn emit_binop(node: Int) {
     }
 }
 
-pub fn emit_unaryop(node: Int) {
+pub fn emit_unaryop(node: Int) ! Codegen.Emit {
     emit_expr(np_left.get(node))
     let operand_str = expr_result_str
     let operand_type = expr_result_type
@@ -684,7 +684,7 @@ pub fn emit_unaryop(node: Int) {
     }
 }
 
-pub fn emit_call(node: Int) {
+pub fn emit_call(node: Int) ! Codegen.Emit {
     let func_node = np_left.get(node)
     let func_kind = np_kind.get(func_node)
     if func_kind == NodeKind.Ident {
@@ -1116,7 +1116,7 @@ pub fn escape_c_string(s: Str) -> Str {
     result
 }
 
-pub fn emit_interp_string(node: Int) {
+pub fn emit_interp_string(node: Int) ! Codegen.Emit {
     let parts_sl = np_elements.get(node)
     if parts_sl == -1 {
         expr_result_str = "\"\""
@@ -1212,7 +1212,7 @@ pub fn emit_interp_string(node: Int) {
     expr_result_type = CT_STRING
 }
 
-pub fn emit_list_lit(node: Int) {
+pub fn emit_list_lit(node: Int) ! Codegen.Emit {
     let tmp = fresh_temp("_l")
     emit_line("pact_list* {tmp} = pact_list_new();")
     let elems_sl = np_elements.get(node)
@@ -1307,7 +1307,7 @@ pub fn infer_struct_type_args(type_name: Str, field_types: List[Int]) -> Str {
     args
 }
 
-pub fn emit_struct_lit(node: Int) {
+pub fn emit_struct_lit(node: Int) ! Codegen.Emit {
     let sname = np_type_name.get(node)
     let mut c_type = "pact_{sname}"
     let tmp = fresh_temp("_s")
