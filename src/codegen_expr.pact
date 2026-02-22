@@ -1021,7 +1021,7 @@ pub fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
             }
         }
         if is_fn_registered(fn_name) == 0 && is_generic_fn(fn_name) == 0 {
-            diag_error_no_loc("UndefinedFunction", "E0504", "undefined function '{fn_name}' called in '{cg_current_fn_name}'", "")
+            diag_error_at("UndefinedFunction", "E0504", "undefined function '{fn_name}' called in '{cg_current_fn_name}'", node, "")
             emit_line("/* undefined: {fn_name} */")
             expr_result_str = "0"
             expr_result_type = CT_INT

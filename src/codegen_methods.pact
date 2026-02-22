@@ -1210,7 +1210,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
     }
 
     // Generic fallback — emit diagnostic and produce safe placeholder
-    diag_error_no_loc("UnresolvedMethod", "E0505", "unresolved method '.{method}' called on variable in '{cg_current_fn_name}'", "")
+    diag_error_at("UnresolvedMethod", "E0505", "unresolved method '.{method}' called on variable in '{cg_current_fn_name}'", node, "")
     emit_line("/* unresolved: .{method} */")
     expr_result_str = "0"
     expr_result_type = CT_INT

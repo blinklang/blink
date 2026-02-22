@@ -6083,7 +6083,7 @@ void pact_nr_check_node(int64_t node) {
         pact_list_push(tc_errors, (void*)strdup(_si_0));
         char _si_1[4096];
         snprintf(_si_1, 4096, "undefined variable '%s'", name);
-        pact_diag_error_no_loc("UndefinedVariable", "E0302", strdup(_si_1), "");
+        pact_diag_error_at("UndefinedVariable", "E0302", strdup(_si_1), node, "");
         return;
     }
     if ((((kind == pact_NodeKind_IntLit) || (kind == pact_NodeKind_FloatLit)) || (kind == pact_NodeKind_BoolLit))) {
@@ -6118,7 +6118,7 @@ void pact_nr_check_node(int64_t node) {
                     pact_list_push(tc_errors, (void*)strdup(_si_2));
                     char _si_3[4096];
                     snprintf(_si_3, 4096, "undefined function '%s'", fn_name);
-                    pact_diag_error_no_loc("UndefinedFunction", "E0303", strdup(_si_3), "");
+                    pact_diag_error_at("UndefinedFunction", "E0303", strdup(_si_3), node, "");
                 }
             } else {
                 pact_nr_check_node(callee);
@@ -11027,7 +11027,7 @@ void pact_emit_method_call(int64_t node) {
     }
     char _si_195[4096];
     snprintf(_si_195, 4096, "unresolved method '.%s' called on variable in '%s'", method, cg_current_fn_name);
-    pact_diag_error_no_loc("UnresolvedMethod", "E0505", strdup(_si_195), "");
+    pact_diag_error_at("UnresolvedMethod", "E0505", strdup(_si_195), node, "");
     char _si_196[4096];
     snprintf(_si_196, 4096, "/* unresolved: .%s */", method);
     pact_emit_line(strdup(_si_196));
@@ -13095,7 +13095,7 @@ void pact_emit_call(int64_t node) {
         if (((pact_is_fn_registered(fn_name) == 0) && (pact_is_generic_fn(fn_name) == 0))) {
             char _si_46[4096];
             snprintf(_si_46, 4096, "undefined function '%s' called in '%s'", fn_name, cg_current_fn_name);
-            pact_diag_error_no_loc("UndefinedFunction", "E0504", strdup(_si_46), "");
+            pact_diag_error_at("UndefinedFunction", "E0504", strdup(_si_46), node, "");
             char _si_47[4096];
             snprintf(_si_47, 4096, "/* undefined: %s */", fn_name);
             pact_emit_line(strdup(_si_47));

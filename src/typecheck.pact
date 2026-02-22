@@ -972,7 +972,7 @@ pub fn nr_check_node(node: Int) ! TypeCheck.Resolve, Diag.Report {
         if is_builtin_fn(name) != 0 { return }
         if is_known_type(name) != 0 { return }
         tc_errors.push("undefined variable '{name}'")
-        diag_error_no_loc("UndefinedVariable", "E0302", "undefined variable '{name}'", "")
+        diag_error_at("UndefinedVariable", "E0302", "undefined variable '{name}'", node, "")
         return
     }
 
@@ -1006,7 +1006,7 @@ pub fn nr_check_node(node: Int) ! TypeCheck.Resolve, Diag.Report {
                 let fn_name = np_name.get(callee)
                 if nr_is_defined(fn_name) == 0 && is_builtin_fn(fn_name) == 0 && is_variant_name(fn_name) == 0 && is_known_type(fn_name) == 0 {
                     tc_errors.push("undefined function '{fn_name}'")
-                    diag_error_no_loc("UndefinedFunction", "E0303", "undefined function '{fn_name}'", "")
+                    diag_error_at("UndefinedFunction", "E0303", "undefined function '{fn_name}'", node, "")
                 }
             } else {
                 nr_check_node(callee)
