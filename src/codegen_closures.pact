@@ -683,7 +683,7 @@ pub fn prescan_mut_captures(block: Int) {
     }
 }
 
-pub fn emit_closure(node: Int) {
+pub fn emit_closure(node: Int) ! Codegen.Emit {
     let closure_idx = cg_closure_counter
     let cname = "__closure_{closure_idx}"
     cg_closure_counter = cg_closure_counter + 1

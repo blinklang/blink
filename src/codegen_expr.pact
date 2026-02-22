@@ -27,7 +27,7 @@ pub let mut ifs_opt_type: Str = ""
 // Convert a CT_LIST or CT_ITERATOR source into a uniform iterator representation.
 // Sets ifs_iter_var (C var name of the iterator struct on the stack),
 // ifs_next_fn (C function name to call next), ifs_elem_type, ifs_opt_type.
-pub fn iter_from_source(obj_str: Str, obj_type: Int) {
+pub fn iter_from_source(obj_str: Str, obj_type: Int) ! Codegen.Emit {
     if obj_type == CT_LIST {
         let elem_type = get_list_elem_type(obj_str)
         ensure_iter_type(elem_type)

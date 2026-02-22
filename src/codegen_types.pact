@@ -645,7 +645,7 @@ pub fn effect_satisfies(caller_effect: Str, callee_effect: Str) -> Int {
     0
 }
 
-pub fn check_effect_propagation(callee_name: Str) {
+pub fn check_effect_propagation(callee_name: Str) ! Diag.Report {
     if cg_current_fn_name == "main" || cg_current_fn_name.starts_with("__test_") {
         return
     }
@@ -682,7 +682,7 @@ pub fn check_effect_propagation(callee_name: Str) {
     }
 }
 
-pub fn check_capabilities_budget(fn_name: Str, effects_sl: Int) {
+pub fn check_capabilities_budget(fn_name: Str, effects_sl: Int) ! Diag.Report {
     if cap_budget_active == 0 {
         return
     }

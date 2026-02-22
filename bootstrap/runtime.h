@@ -690,6 +690,12 @@ static pact_time_vtable pact_time_vtable_default = {
     pact_time_default_sleep
 };
 
+static int64_t pact_time_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + (int64_t)(ts.tv_nsec / 1000000);
+}
+
 /* ── Env ────────────────────────────────────────────────────────────── */
 typedef struct {
     const char* (*read)(const char* name);

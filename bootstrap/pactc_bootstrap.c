@@ -5373,6 +5373,9 @@ int64_t pact_is_builtin_fn(const char* name) {
     if (pact_str_eq(name, "get_env")) {
         return 1;
     }
+    if (pact_str_eq(name, "time_ms")) {
+        return 1;
+    }
     if (pact_str_eq(name, "Some")) {
         return 1;
     }
@@ -5392,6 +5395,9 @@ int64_t pact_is_builtin_fn(const char* name) {
         return 1;
     }
     if (pact_str_eq(name, "assert_ne")) {
+        return 1;
+    }
+    if (pact_str_eq(name, "debug_assert")) {
         return 1;
     }
     if (pact_str_eq(name, "Map")) {
@@ -5440,6 +5446,9 @@ int64_t pact_get_builtin_fn_ret(const char* name) {
     if (pact_str_eq(name, "get_env")) {
         return TYPE_STR;
     }
+    if (pact_str_eq(name, "time_ms")) {
+        return TYPE_INT;
+    }
     if (pact_str_eq(name, "assert")) {
         return TYPE_VOID;
     }
@@ -5447,6 +5456,9 @@ int64_t pact_get_builtin_fn_ret(const char* name) {
         return TYPE_VOID;
     }
     if (pact_str_eq(name, "assert_ne")) {
+        return TYPE_VOID;
+    }
+    if (pact_str_eq(name, "debug_assert")) {
         return TYPE_VOID;
     }
     return TYPE_UNKNOWN;
@@ -15535,6 +15547,7 @@ const char* pact_generate(int64_t program) {
     pact_reg_fn("path_basename", CT_STRING);
     pact_reg_fn("is_dir", CT_INT);
     pact_reg_fn("get_env", CT_STRING);
+    pact_reg_fn("time_ms", CT_INT);
     pact_list_push(struct_reg_names, (void*)"ConversionError");
     pact_map_set(struct_reg_set, "ConversionError", (void*)(intptr_t)1);
     pact_StructFieldEntry _s55 = { .struct_name = "ConversionError", .field_name = "message", .field_type = CT_STRING, .stype = "" };
@@ -19750,13 +19763,14 @@ void pact_collect_imports(int64_t program, const char* src_root, pact_list* all_
 
 void pact_main(void) {
     if ((pact_arg_count() < 2)) {
-        printf("%s\n", "Usage: pactc <source.pact> [output.c] [--format json] [--emit pact]");
+        printf("%s\n", "Usage: pactc <source.pact> [output.c] [--format json] [--json] [--emit pact] [--stats] [--debug]");
         printf("%s\n", "  Compiles a Pact source file to C.");
         return;
     }
     const char* source_path = pact_get_arg(1);
     const char* out_path = "";
     const char* emit_mode = "";
+    int64_t stats_mode = 0;
     int64_t i = 2;
     while ((i < pact_arg_count())) {
         const char* arg = pact_get_arg(i);
@@ -19768,27 +19782,38 @@ void pact_main(void) {
                     diag_format = 1;
                 }
             }
-        } else if (pact_str_eq(arg, "--emit")) {
-            if (((i + 1) < pact_arg_count())) {
-                i = (i + 1);
-                emit_mode = pact_get_arg(i);
-            }
+        } else if (pact_str_eq(arg, "--json")) {
+            diag_format = 1;
         } else {
-            if (pact_str_eq(arg, "--debug")) {
+            if (pact_str_eq(arg, "--emit")) {
+                if (((i + 1) < pact_arg_count())) {
+                    i = (i + 1);
+                    emit_mode = pact_get_arg(i);
+                }
+            } else if (pact_str_eq(arg, "--debug")) {
                 cg_debug_mode = 1;
             } else {
-                out_path = arg;
+                if (pact_str_eq(arg, "--stats")) {
+                    stats_mode = 1;
+                } else {
+                    out_path = arg;
+                }
             }
         }
         i = (i + 1);
     }
     diag_source_file = source_path;
     const char* source = pact_read_file(source_path);
+    const int64_t t_lex_start = pact_time_ms();
     pact_lex(source);
+    const int64_t t_lex_end = pact_time_ms();
     pos = 0;
+    const int64_t t_parse_start = pact_time_ms();
     const int64_t program_node = pact_parse_program();
+    const int64_t t_parse_end = pact_time_ms();
     pact_list_push(loaded_files, (void*)source_path);
     const char* src_root = pact_find_src_root(source_path);
+    const int64_t t_import_start = pact_time_ms();
     pact_list* _l0 = pact_list_new();
     pact_list* imported_programs = _l0;
     pact_collect_imports(program_node, src_root, imported_programs);
@@ -19796,6 +19821,7 @@ void pact_main(void) {
     if ((pact_list_len(imported_programs) > 0)) {
         final_program = pact_merge_programs(program_node, imported_programs, import_map_nodes);
     }
+    const int64_t t_import_end = pact_time_ms();
     if (pact_str_eq(emit_mode, "pact")) {
         const char* pact_output = pact_format(final_program);
         if ((!pact_str_eq(out_path, ""))) {
@@ -19805,13 +19831,19 @@ void pact_main(void) {
         }
         return;
     }
+    const int64_t t_tc_start = pact_time_ms();
     const int64_t tc_err_count = pact_check_types(final_program);
+    const int64_t t_tc_end = pact_time_ms();
     if ((diag_count > 0)) {
         pact_diag_flush();
         return;
     }
+    const int64_t t_mut_start = pact_time_ms();
     pact_analyze_mutations(final_program);
+    const int64_t t_mut_end = pact_time_ms();
+    const int64_t t_cg_start = pact_time_ms();
     const char* c_output = pact_generate(final_program);
+    const int64_t t_cg_end = pact_time_ms();
     if ((diag_count > 0)) {
         pact_diag_flush();
         return;
@@ -19820,6 +19852,19 @@ void pact_main(void) {
         pact_write_file(out_path, c_output);
     } else {
         printf("%s\n", c_output);
+    }
+    if ((stats_mode == 1)) {
+        const int64_t lex_ms = (t_lex_end - t_lex_start);
+        const int64_t parse_ms = (t_parse_end - t_parse_start);
+        const int64_t import_ms = (t_import_end - t_import_start);
+        const int64_t typecheck_ms = (t_tc_end - t_tc_start);
+        const int64_t mutation_ms = (t_mut_end - t_mut_start);
+        const int64_t codegen_ms = (t_cg_end - t_cg_start);
+        const int64_t total_ms = (t_cg_end - t_lex_start);
+        const char* q = "\"";
+        char _si_1[4096];
+        snprintf(_si_1, 4096, "{%slex_ms%s:%lld,%sparse_ms%s:%lld,%simport_ms%s:%lld,%stypecheck_ms%s:%lld,%smutation_ms%s:%lld,%scodegen_ms%s:%lld,%stotal_ms%s:%lld}", q, q, (long long)lex_ms, q, q, (long long)parse_ms, q, q, (long long)import_ms, q, q, (long long)typecheck_ms, q, q, (long long)mutation_ms, q, q, (long long)codegen_ms, q, q, (long long)total_ms);
+        fprintf(stderr, "%s\n", strdup(_si_1));
     }
 }
 

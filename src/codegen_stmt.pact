@@ -3,7 +3,7 @@
 import codegen_types
 import codegen_expr
 
-pub fn emit_if_expr(node: Int) {
+pub fn emit_if_expr(node: Int) ! Codegen.Emit {
     let tmp = fresh_temp("_if_")
     let then_type = infer_block_type(np_then_body.get(node))
     if then_type == CT_RESULT {
@@ -54,7 +54,7 @@ pub fn emit_if_expr(node: Int) {
     expr_result_type = then_type
 }
 
-pub fn emit_match_expr(node: Int) {
+pub fn emit_match_expr(node: Int) ! Codegen.Emit {
     let scrut = np_scrutinee.get(node)
 
     // Build list of scrutinee values (multiple if tuple literal)
@@ -325,7 +325,7 @@ pub fn pattern_condition(pat: Int, scrut_off: Int, scrut_len: Int) -> Str {
 
 // Emit C variable bindings for ident sub-patterns within a pattern.
 // scrut_off/scrut_len index into match_scruts.
-pub fn bind_pattern_vars(pat: Int, scrut_off: Int, scrut_len: Int) {
+pub fn bind_pattern_vars(pat: Int, scrut_off: Int, scrut_len: Int) ! Codegen.Emit {
     let pk = np_kind.get(pat)
     if pk == NodeKind.EnumPattern {
         let enum_name = np_name.get(pat)
@@ -470,7 +470,7 @@ pub fn bind_pattern_vars(pat: Int, scrut_off: Int, scrut_len: Int) {
     }
 }
 
-pub fn emit_block_expr(node: Int) {
+pub fn emit_block_expr(node: Int) ! Codegen.Emit {
     let stmts_sl = np_stmts.get(node)
     if stmts_sl == -1 {
         expr_result_str = "0"
@@ -496,7 +496,7 @@ pub fn emit_block_expr(node: Int) {
     expr_result_type = CT_VOID
 }
 
-pub fn emit_arm_value(body: Int) -> Str {
+pub fn emit_arm_value(body: Int) -> Str ! Codegen.Emit {
     if body == -1 {
         return "0"
     }
@@ -512,7 +512,7 @@ pub fn emit_arm_value(body: Int) -> Str {
     expr_result_str
 }
 
-pub fn emit_block_value(block: Int) -> Str {
+pub fn emit_block_value(block: Int) -> Str ! Codegen.Emit {
     if block == -1 {
         return "0"
     }
@@ -651,7 +651,7 @@ pub fn infer_expr_type(node: Int) -> Int {
 
 // ── Statement codegen ───────────────────────────────────────────────
 
-pub fn emit_stmt(node: Int) {
+pub fn emit_stmt(node: Int) ! Codegen.Emit {
     let kind = np_kind.get(node)
 
     if kind == NodeKind.ExprStmt {
@@ -792,7 +792,7 @@ pub fn infer_enum_from_node(val_node: Int) -> Str {
     ""
 }
 
-pub fn emit_let_binding(node: Int) {
+pub fn emit_let_binding(node: Int) ! Codegen.Emit {
     let val_node = np_value.get(node)
     let mut enum_type = infer_enum_from_node(val_node)
     let type_ann = np_target.get(node)
@@ -958,7 +958,7 @@ pub fn emit_let_binding(node: Int) {
     }
 }
 
-pub fn emit_for_in(node: Int) {
+pub fn emit_for_in(node: Int) ! Codegen.Emit {
     let var_name = np_var_name.get(node)
     let iter_node = np_iterable.get(node)
     let iter_kind = np_kind.get(iter_node)
@@ -1072,7 +1072,7 @@ pub fn emit_for_in(node: Int) {
     }
 }
 
-pub fn emit_if_stmt(node: Int) {
+pub fn emit_if_stmt(node: Int) ! Codegen.Emit {
     emit_expr(np_condition.get(node))
     let cond_str = expr_result_str
     emit_line("if ({cond_str}) \{")
@@ -1121,7 +1121,7 @@ pub fn emit_if_stmt(node: Int) {
     emit_line("}")
 }
 
-pub fn emit_block(block: Int) {
+pub fn emit_block(block: Int) ! Codegen.Emit {
     if block == -1 {
         return
     }
@@ -1138,7 +1138,7 @@ pub fn emit_block(block: Int) {
 
 // __ With-block codegen __
 
-pub fn emit_with_block(node: Int) {
+pub fn emit_with_block(node: Int) ! Codegen.Emit {
     let handlers_sl = np_handlers.get(node)
     let body = np_body.get(node)
     if handlers_sl == -1 {
@@ -1296,7 +1296,7 @@ pub fn format_impl_params(fn_node: Int, impl_type: Str) -> Str {
     result
 }
 
-pub fn emit_impl_method_def(fn_node: Int, impl_type: Str) {
+pub fn emit_impl_method_def(fn_node: Int, impl_type: Str) ! Codegen.Emit {
     push_scope()
     cg_temp_counter = 0
     let mname = np_name.get(fn_node)
@@ -1370,7 +1370,7 @@ pub fn emit_impl_method_def(fn_node: Int, impl_type: Str) {
     pop_scope()
 }
 
-pub fn emit_fn_decl(fn_node: Int) {
+pub fn emit_fn_decl(fn_node: Int) ! Codegen.Emit {
     let name = np_name.get(fn_node)
     if name == "main" {
         emit_line("void pact_main(void);")
@@ -1396,7 +1396,7 @@ pub fn emit_fn_decl(fn_node: Int) {
     }
 }
 
-pub fn emit_fn_def(fn_node: Int) {
+pub fn emit_fn_def(fn_node: Int) ! Codegen.Emit {
     push_scope()
     cg_temp_counter = 0
     let name = np_name.get(fn_node)
@@ -1489,7 +1489,7 @@ pub fn emit_fn_def(fn_node: Int) {
     pop_scope()
 }
 
-pub fn emit_fn_body(block: Int, ret_type: Int) {
+pub fn emit_fn_body(block: Int, ret_type: Int) ! Codegen.Emit {
     if block == -1 {
         return
     }
@@ -1608,7 +1608,7 @@ pub fn register_mono_field_types(base_name: Str, mono_name: Str, concrete_args: 
     }
 }
 
-pub fn emit_mono_struct_typedef(base_name: Str, concrete_args: Str) {
+pub fn emit_mono_struct_typedef(base_name: Str, concrete_args: Str) ! Codegen.Emit {
     let td = find_type_def(base_name)
     if td == -1 {
         return
@@ -1653,7 +1653,7 @@ pub fn emit_mono_struct_typedef(base_name: Str, concrete_args: Str) {
     emit_line("")
 }
 
-pub fn emit_all_mono_typedefs() {
+pub fn emit_all_mono_typedefs() ! Codegen.Emit {
     let mut i = 0
     while i < mono_instances.len() {
         let mi = mono_instances.get(i)
@@ -1670,7 +1670,7 @@ pub fn emit_all_mono_typedefs() {
     }
 }
 
-pub fn emit_mono_fn_def(fn_node: Int, concrete_args: Str) {
+pub fn emit_mono_fn_def(fn_node: Int, concrete_args: Str) ! Codegen.Emit {
     let base_name = np_name.get(fn_node)
     let mangled = mangle_generic_name(base_name, concrete_args)
     let tparams_sl = np_type_params.get(fn_node)
@@ -1739,7 +1739,7 @@ pub fn emit_mono_fn_def(fn_node: Int, concrete_args: Str) {
     pop_scope()
 }
 
-pub fn emit_all_mono_fns() {
+pub fn emit_all_mono_fns() ! Codegen.Emit {
     let mut i = 0
     while i < mono_fns.len() {
         let mf = mono_fns.get(i)
@@ -1751,7 +1751,7 @@ pub fn emit_all_mono_fns() {
     }
 }
 
-pub fn emit_mono_typedefs_from(start: Int) {
+pub fn emit_mono_typedefs_from(start: Int) ! Codegen.Emit {
     let mut i = start
     while i < mono_instances.len() {
         let mi = mono_instances.get(i)
@@ -1768,7 +1768,7 @@ pub fn emit_mono_typedefs_from(start: Int) {
     }
 }
 
-pub fn emit_mono_fns_from(start: Int) {
+pub fn emit_mono_fns_from(start: Int) ! Codegen.Emit {
     let mut i = start
     while i < mono_fns.len() {
         let mf = mono_fns.get(i)
@@ -1780,7 +1780,7 @@ pub fn emit_mono_fns_from(start: Int) {
     }
 }
 
-pub fn emit_struct_typedef(td_node: Int) {
+pub fn emit_struct_typedef(td_node: Int) ! Codegen.Emit {
     let name = np_name.get(td_node)
     let flds_sl = np_fields.get(td_node)
     if flds_sl == -1 {
@@ -1829,7 +1829,7 @@ pub fn emit_struct_typedef(td_node: Int) {
     emit_line("")
 }
 
-pub fn emit_enum_typedef(td_node: Int) {
+pub fn emit_enum_typedef(td_node: Int) ! Codegen.Emit {
     let name = np_name.get(td_node)
     let flds_sl = np_fields.get(td_node)
     if flds_sl == -1 {
@@ -1956,7 +1956,7 @@ pub fn emit_enum_typedef(td_node: Int) {
 
 // ── Top-level: generate ─────────────────────────────────────────────
 
-pub fn emit_top_level_let(node: Int) {
+pub fn emit_top_level_let(node: Int) ! Codegen.Emit {
     let saved_lines = cg_lines
     cg_lines = []
     emit_expr(np_value.get(node))

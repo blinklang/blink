@@ -16,7 +16,7 @@ import codegen_stmt
 
 // ── Top-level: generate ─────────────────────────────────────────────
 
-pub fn generate(program: Int) -> Str {
+pub fn generate(program: Int) -> Str ! Codegen {
     cg_program_node = program
     // Reset state
     cg_lines = []
@@ -117,6 +117,7 @@ pub fn generate(program: Int) -> Str {
     reg_fn("path_basename", CT_STRING)
     reg_fn("is_dir", CT_INT)
     reg_fn("get_env", CT_STRING)
+    reg_fn("time_ms", CT_INT)
 
     // Register built-in structs
     struct_reg_names.push("ConversionError")
