@@ -945,11 +945,15 @@ pub fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
             let args_sl = np_args.get(node)
             emit_expr(sublist_get(args_sl, 0))
             let arg_str = expr_result_str
+            ensure_option_type(CT_STRING)
+            let opt_type = option_c_type(CT_STRING)
             let tmp = fresh_temp("_env_")
+            let res = fresh_temp("_env_opt_")
             emit_line("const char* {tmp} = getenv({arg_str});")
-            emit_line("if ({tmp} == NULL) {tmp} = \"\";")
-            expr_result_str = tmp
-            expr_result_type = CT_STRING
+            emit_line("{opt_type} {res} = {tmp} ? ({opt_type})\{.tag = 1, .value = {tmp}} : ({opt_type})\{.tag = 0};")
+            expr_result_str = res
+            expr_result_type = CT_OPTION
+            expr_option_inner = CT_STRING
             return
         }
         // Check if this is a closure-typed variable

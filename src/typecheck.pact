@@ -743,7 +743,7 @@ pub fn get_builtin_fn_ret(name: Str) -> Int {
     if name == "shell_exec" { return TYPE_INT }
     if name == "exit" { return TYPE_VOID }
     if name == "is_dir" { return TYPE_INT }
-    if name == "get_env" { return TYPE_STR }
+    if name == "get_env" { return make_option_type(TYPE_STR) }
     if name == "time_ms" { return TYPE_INT }
     if name == "assert" { return TYPE_VOID }
     if name == "assert_eq" { return TYPE_VOID }

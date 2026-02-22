@@ -5846,7 +5846,7 @@ int64_t pact_get_builtin_fn_ret(const char* name) {
         return TYPE_INT;
     }
     if (pact_str_eq(name, "get_env")) {
-        return TYPE_STR;
+        return pact_make_option_type(TYPE_STR);
     }
     if (pact_str_eq(name, "time_ms")) {
         return TYPE_INT;
@@ -13052,15 +13052,19 @@ void pact_emit_call(int64_t node) {
             const int64_t args_sl = (int64_t)(intptr_t)pact_list_get(np_args, node);
             pact_emit_expr(pact_sublist_get(args_sl, 0));
             const char* arg_str = expr_result_str;
+            pact_ensure_option_type(CT_STRING);
+            const char* opt_type = pact_option_c_type(CT_STRING);
             const char* tmp = pact_fresh_temp("_env_");
+            const char* res = pact_fresh_temp("_env_opt_");
             char _si_41[4096];
             snprintf(_si_41, 4096, "const char* %s = getenv(%s);", tmp, arg_str);
             pact_emit_line(strdup(_si_41));
             char _si_42[4096];
-            snprintf(_si_42, 4096, "if (%s == NULL) %s = \"\";", tmp, tmp);
+            snprintf(_si_42, 4096, "%s %s = %s \? (%s){.tag = 1, .value = %s} : (%s){.tag = 0};", opt_type, res, tmp, opt_type, tmp, opt_type);
             pact_emit_line(strdup(_si_42));
-            expr_result_str = tmp;
-            expr_result_type = CT_STRING;
+            expr_result_str = res;
+            expr_result_type = CT_OPTION;
+            expr_option_inner = CT_STRING;
             return;
         }
         const char* closure_sig = pact_get_var_closure_sig(fn_name);
