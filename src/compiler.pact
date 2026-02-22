@@ -4,6 +4,7 @@ import typecheck
 import codegen
 import formatter
 import diagnostics
+import mutation_analysis
 import std.lockfile
 
 // compiler.pact — Self-hosting Pact compiler driver
@@ -532,6 +533,8 @@ fn main() {
         diag_flush()
         return
     }
+
+    analyze_mutations(final_program)
 
     let c_output = generate(final_program)
 

@@ -65,6 +65,13 @@ type FnEnumRetEntry {
 pub let mut fn_enum_rets: List[FnEnumRetEntry] = []
 pub let mut emitted_let_names: List[Str] = []
 pub let mut emitted_fn_names: List[Str] = []
+pub let mut struct_reg_set: Map[Str, Int] = Map()
+pub let mut enum_reg_set: Map[Str, Int] = Map()
+pub let mut emitted_fn_set: Map[Str, Int] = Map()
+pub let mut emitted_let_set: Map[Str, Int] = Map()
+pub let mut emitted_option_set: Map[Str, Int] = Map()
+pub let mut emitted_result_set: Map[Str, Int] = Map()
+pub let mut emitted_iter_set: Map[Str, Int] = Map()
 pub let mut cg_closure_defs: List[Str] = []
 pub let mut cg_closure_counter: Int = 0
 
@@ -892,25 +899,11 @@ pub fn get_map_value_struct(name: Str) -> Str {
 }
 
 pub fn is_struct_type(name: Str) -> Int {
-    let mut i = 0
-    while i < struct_reg_names.len() {
-        if struct_reg_names.get(i) == name {
-            return 1
-        }
-        i = i + 1
-    }
-    0
+    struct_reg_set.has(name)
 }
 
 pub fn is_enum_type(name: Str) -> Int {
-    let mut i = 0
-    while i < enum_regs.len() {
-        if enum_regs.get(i).name == name {
-            return 1
-        }
-        i = i + 1
-    }
-    0
+    enum_reg_set.has(name)
 }
 
 pub fn resolve_variant(name: Str) -> Str {
@@ -1350,25 +1343,11 @@ pub fn resolve_self_type(ret_str: Str, impl_type: Str) -> Str {
 }
 
 pub fn is_emitted_let(name: Str) -> Int {
-    let mut i = 0
-    while i < emitted_let_names.len() {
-        if emitted_let_names.get(i) == name {
-            return 1
-        }
-        i = i + 1
-    }
-    0
+    emitted_let_set.has(name)
 }
 
 pub fn is_emitted_fn(name: Str) -> Int {
-    let mut i = 0
-    while i < emitted_fn_names.len() {
-        if emitted_fn_names.get(i) == name {
-            return 1
-        }
-        i = i + 1
-    }
-    0
+    emitted_fn_set.has(name)
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────
@@ -1424,25 +1403,20 @@ pub fn c_type_tag(ct: Int) -> Str {
 }
 
 pub fn ensure_option_type(inner: Int) {
-    let mut i = 0
-    while i < emitted_option_types.len() {
-        if emitted_option_types.get(i) == inner {
-            return
-        }
-        i = i + 1
+    let key = "{inner}"
+    if emitted_option_set.has(key) != 0 {
+        return
     }
+    emitted_option_set.set(key, 1)
     emitted_option_types.push(inner)
 }
 
 pub fn ensure_result_type(ok_t: Int, err_t: Int) {
     let key = "{ok_t}_{err_t}"
-    let mut i = 0
-    while i < emitted_result_types.len() {
-        if emitted_result_types.get(i) == key {
-            return
-        }
-        i = i + 1
+    if emitted_result_set.has(key) != 0 {
+        return
     }
+    emitted_result_set.set(key, 1)
     emitted_result_types.push(key)
 }
 
@@ -1585,13 +1559,11 @@ pub fn emit_result_typedef(ok_t: Int, err_t: Int) {
 }
 
 pub fn ensure_iter_type(inner: Int) {
-    let mut i = 0
-    while i < emitted_iter_types.len() {
-        if emitted_iter_types.get(i) == inner {
-            return
-        }
-        i = i + 1
+    let key = "{inner}"
+    if emitted_iter_set.has(key) != 0 {
+        return
     }
+    emitted_iter_set.set(key, 1)
     emitted_iter_types.push(inner)
     ensure_option_type(inner)
 }

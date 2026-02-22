@@ -66,6 +66,9 @@ pub let mut evfield_var_idx: List[Int] = []
 pub let mut evfield_name: List[Str] = []
 pub let mut evfield_type_id: List[Int] = []
 
+pub let mut named_type_map: Map[Str, Int] = Map()
+pub let mut fnsig_map: Map[Str, Int] = Map()
+
 pub let mut fnsig_name: List[Str] = []
 pub let mut fnsig_ret: List[Int] = []
 pub let mut fnsig_params_start: List[Int] = []
@@ -160,12 +163,8 @@ pub fn make_map_type(key_type: Int, value_type: Int) -> Int {
 // ── Type lookup ─────────────────────────────────────────────────────
 
 pub fn lookup_named_type(name: Str) -> Int {
-    let mut i = 0
-    while i < named_type_names.len() {
-        if named_type_names.get(i) == name {
-            return named_type_ids.get(i)
-        }
-        i = i + 1
+    if named_type_map.has(name) != 0 {
+        return named_type_map.get(name)
     }
     -1
 }
@@ -202,12 +201,8 @@ pub fn get_variant_by_name(enum_tid: Int, vname: Str) -> Int {
 }
 
 pub fn lookup_fnsig(name: Str) -> Int {
-    let mut i = 0
-    while i < fnsig_name.len() {
-        if fnsig_name.get(i) == name {
-            return i
-        }
-        i = i + 1
+    if fnsig_map.has(name) != 0 {
+        return fnsig_map.get(name)
     }
     -1
 }
@@ -308,6 +303,7 @@ pub fn register_struct_type(td: Int) {
     let tid = new_type(TK_STRUCT, name)
     named_type_names.push(name)
     named_type_ids.push(tid)
+    named_type_map.set(name, tid)
 
     let flds_sl = np_fields.get(td)
     if flds_sl != -1 {
@@ -330,6 +326,7 @@ pub fn register_enum_type(td: Int) {
     let tid = new_type(TK_ENUM, name)
     named_type_names.push(name)
     named_type_ids.push(tid)
+    named_type_map.set(name, tid)
 
     let flds_sl = np_fields.get(td)
     if flds_sl != -1 {
@@ -384,6 +381,7 @@ pub fn register_fn_sig(fn_node: Int) {
 
     let sig_idx = fnsig_name.len()
     fnsig_name.push(name)
+    fnsig_map.set(name, sig_idx)
     fnsig_ret.push(ret_tid)
     let start = fnsig_param_list.len()
     fnsig_params_start.push(start)
@@ -476,6 +474,7 @@ pub fn init_types() {
     ty_param_list = []
     named_type_names = []
     named_type_ids = []
+    named_type_map = Map()
     sfield_struct_id = []
     sfield_name = []
     sfield_type_id = []
@@ -487,6 +486,7 @@ pub fn init_types() {
     evfield_name = []
     evfield_type_id = []
     fnsig_name = []
+    fnsig_map = Map()
     fnsig_ret = []
     fnsig_params_start = []
     fnsig_params_count = []

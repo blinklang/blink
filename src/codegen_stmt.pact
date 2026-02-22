@@ -1164,6 +1164,7 @@ pub fn emit_with_block(node: Int) {
             let tmp = fresh_temp("_wr_")
             emit_line("int64_t {tmp} = {res_str};")
             emitted_let_names.push(binding)
+            emitted_let_set.set(binding, 1)
             emit_line("int64_t {binding} = {tmp};")
             resource_names.push(binding)
             resource_vars.push(tmp)
@@ -1622,6 +1623,7 @@ pub fn emit_mono_struct_typedef(base_name: Str, concrete_args: Str) {
         return
     }
     struct_reg_names.push(c_name)
+    struct_reg_set.set(c_name, 1)
     emit_line("typedef struct \{")
     cg_indent = cg_indent + 1
     let mut i = 0
@@ -1846,6 +1848,7 @@ pub fn emit_enum_typedef(td_node: Int) {
         i = i + 1
     }
     enum_regs.push(EnumReg { name: name, has_data: has_data })
+    enum_reg_set.set(name, 1)
 
     i = 0
     while i < sublist_length(flds_sl) {

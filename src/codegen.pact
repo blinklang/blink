@@ -34,12 +34,16 @@ pub fn generate(program: Int) -> Str {
     var_list_elems = []
     var_list_elem_frame_starts = []
     struct_reg_names = []
+    struct_reg_set = Map()
     enum_regs = []
+    enum_reg_set = Map()
     enum_variants = []
     var_enums = []
     fn_enum_rets = []
     emitted_let_names = []
+    emitted_let_set = Map()
     emitted_fn_names = []
+    emitted_fn_set = Map()
     trait_entries = []
     impl_entries = []
     from_entries = []
@@ -59,8 +63,11 @@ pub fn generate(program: Int) -> Str {
     var_results = []
     var_result_frame_starts = []
     emitted_option_types = []
+    emitted_option_set = Map()
     emitted_result_types = []
+    emitted_result_set = Map()
     emitted_iter_types = []
+    emitted_iter_set = Map()
     emitted_range_iter = 0
     emitted_str_iter = 0
     emitted_map_iters = []
@@ -113,6 +120,7 @@ pub fn generate(program: Int) -> Str {
 
     // Register built-in structs
     struct_reg_names.push("ConversionError")
+    struct_reg_set.set("ConversionError", 1)
     sf_entries.push(StructFieldEntry { struct_name: "ConversionError", field_name: "message", field_type: CT_STRING, stype: "" })
     sf_entries.push(StructFieldEntry { struct_name: "ConversionError", field_name: "source_type", field_type: CT_STRING, stype: "" })
     sf_entries.push(StructFieldEntry { struct_name: "ConversionError", field_name: "target_type", field_type: CT_STRING, stype: "" })
@@ -334,6 +342,7 @@ pub fn generate(program: Int) -> Str {
             }
             if is_enum == 0 {
                 struct_reg_names.push(np_name.get(td))
+                struct_reg_set.set(np_name.get(td), 1)
             }
             i = i + 1
         }
@@ -370,6 +379,7 @@ pub fn generate(program: Int) -> Str {
             if is_emitted_let(let_name) == 0 {
                 emit_top_level_let(let_node)
                 emitted_let_names.push(let_name)
+                emitted_let_set.set(let_name, 1)
             }
             i = i + 1
         }
@@ -402,6 +412,7 @@ pub fn generate(program: Int) -> Str {
                 reg_fn_ret_from_ann(fn_name, fn_node)
                 check_capabilities_budget(fn_name, fn_eff_sl)
                 emitted_fn_names.push(fn_name)
+                emitted_fn_set.set(fn_name, 1)
             }
             i = i + 1
         }
@@ -483,6 +494,7 @@ pub fn generate(program: Int) -> Str {
 
     // Forward declarations (deduplicated, skip generics)
     emitted_fn_names = []
+    emitted_fn_set = Map()
     if fns_sl != -1 {
         let mut i = 0
         while i < sublist_length(fns_sl) {
@@ -491,6 +503,7 @@ pub fn generate(program: Int) -> Str {
             if is_emitted_fn(fn_name) == 0 && is_generic_fn(fn_name) == 0 {
                 emit_fn_decl(fn_node)
                 emitted_fn_names.push(fn_name)
+                emitted_fn_set.set(fn_name, 1)
             }
             i = i + 1
         }
@@ -541,6 +554,7 @@ pub fn generate(program: Int) -> Str {
     let pre_fn_lines = cg_lines
     cg_lines = []
     emitted_fn_names = []
+    emitted_fn_set = Map()
     if fns_sl != -1 {
         let mut i = 0
         while i < sublist_length(fns_sl) {
@@ -550,6 +564,7 @@ pub fn generate(program: Int) -> Str {
                 emit_fn_def(fn_node)
                 emit_line("")
                 emitted_fn_names.push(fn_name)
+                emitted_fn_set.set(fn_name, 1)
             }
             i = i + 1
         }
