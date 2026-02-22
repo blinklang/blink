@@ -993,7 +993,8 @@ pub fn emit_for_in(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
         let iter_str = expr_result_str
         let iter_type = expr_result_type
         if iter_type == CT_LIST {
-            let elem_type = get_list_elem_type(iter_str)
+            let mut elem_type = get_list_elem_type(iter_str)
+            if elem_type == -1 { elem_type = CT_INT }
             ensure_iter_type(elem_type)
             let tag = c_type_tag(elem_type)
             let li_type = list_iter_c_type(elem_type)
@@ -1351,6 +1352,28 @@ pub fn emit_impl_method_def(fn_node: Int, impl_type: Str) ! Codegen.Emit, Codege
                     }
                     if is_enum_type(ptype) != 0 {
                         var_enums.push(VarEnumEntry { name: pname, enum_type: ptype })
+                    }
+                    if ptype == "List" {
+                        let ta = np_type_ann.get(p)
+                        if ta != -1 {
+                            let elems_sl = np_elements.get(ta)
+                            if elems_sl != -1 && sublist_length(elems_sl) > 0 {
+                                let elem_ann = sublist_get(elems_sl, 0)
+                                let elem_name = np_name.get(elem_ann)
+                                set_list_elem_type(pname, type_from_name(elem_name))
+                            }
+                        }
+                    }
+                    if ptype == "Map" {
+                        let ta = np_type_ann.get(p)
+                        if ta != -1 {
+                            let elems_sl = np_elements.get(ta)
+                            if elems_sl != -1 && sublist_length(elems_sl) >= 2 {
+                                let key_ann = sublist_get(elems_sl, 0)
+                                let val_ann = sublist_get(elems_sl, 1)
+                                set_map_types(pname, type_from_name(np_name.get(key_ann)), type_from_name(np_name.get(val_ann)))
+                            }
+                        }
                     }
                 }
             }
@@ -1725,6 +1748,28 @@ pub fn emit_mono_fn_def(fn_node: Int, concrete_args: Str) ! Codegen.Emit, Codege
             }
             if is_enum_type(resolved_ptype) != 0 {
                 var_enums.push(VarEnumEntry { name: pname, enum_type: resolved_ptype })
+            }
+            if resolved_ptype == "List" {
+                let ta = np_type_ann.get(p)
+                if ta != -1 {
+                    let elems_sl = np_elements.get(ta)
+                    if elems_sl != -1 && sublist_length(elems_sl) > 0 {
+                        let elem_ann = sublist_get(elems_sl, 0)
+                        let elem_name = np_name.get(elem_ann)
+                        set_list_elem_type(pname, type_from_name(elem_name))
+                    }
+                }
+            }
+            if resolved_ptype == "Map" {
+                let ta = np_type_ann.get(p)
+                if ta != -1 {
+                    let elems_sl = np_elements.get(ta)
+                    if elems_sl != -1 && sublist_length(elems_sl) >= 2 {
+                        let key_ann = sublist_get(elems_sl, 0)
+                        let val_ann = sublist_get(elems_sl, 1)
+                        set_map_types(pname, type_from_name(np_name.get(key_ann)), type_from_name(np_name.get(val_ann)))
+                    }
+                }
             }
             i = i + 1
         }

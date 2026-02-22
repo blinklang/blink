@@ -29,7 +29,8 @@ pub let mut ifs_opt_type: Str = ""
 // ifs_next_fn (C function name to call next), ifs_elem_type, ifs_opt_type.
 pub fn iter_from_source(obj_str: Str, obj_type: Int) ! Codegen.Emit {
     if obj_type == CT_LIST {
-        let elem_type = get_list_elem_type(obj_str)
+        let mut elem_type = get_list_elem_type(obj_str)
+        if elem_type == -1 { elem_type = CT_INT }
         ensure_iter_type(elem_type)
         let tag = c_type_tag(elem_type)
         let li_type = list_iter_c_type(elem_type)
@@ -132,6 +133,9 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
         }
         if expr_result_type == CT_ITERATOR {
             expr_iter_next_fn = get_var_iter_next_fn(name)
+        }
+        if expr_result_type == CT_LIST {
+            expr_list_elem_type = get_list_elem_type(name)
         }
         return
     }
@@ -1018,6 +1022,10 @@ pub fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
         }
         if is_fn_registered(fn_name) == 0 && is_generic_fn(fn_name) == 0 {
             diag_error_no_loc("UndefinedFunction", "E0504", "undefined function '{fn_name}' called in '{cg_current_fn_name}'", "")
+            emit_line("/* undefined: {fn_name} */")
+            expr_result_str = "0"
+            expr_result_type = CT_INT
+            return
         }
         expr_result_str = "pact_{fn_name}({args_str})"
         expr_result_type = get_fn_ret(fn_name)
@@ -1244,6 +1252,8 @@ pub fn emit_list_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope,
     }
     if first_elem_type >= 0 {
         expr_list_elem_type = first_elem_type
+    } else {
+        expr_list_elem_type = -1
     }
     if first_elem_struct != "" {
         set_list_elem_type(tmp, CT_VOID)

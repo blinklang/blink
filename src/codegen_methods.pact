@@ -1201,21 +1201,9 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
         return
     }
 
-    // Generic fallback
+    // Generic fallback — emit diagnostic and produce safe placeholder
     diag_error_no_loc("UnresolvedMethod", "E0505", "unresolved method '.{method}' called on variable in '{cg_current_fn_name}'", "")
-    let args_sl = np_args.get(node)
-    let mut args_str = ""
-    if args_sl != -1 {
-        let mut i = 0
-        while i < sublist_length(args_sl) {
-            if i > 0 {
-                args_str = args_str.concat(", ")
-            }
-            emit_expr(sublist_get(args_sl, i))
-            args_str = args_str.concat(expr_result_str)
-            i = i + 1
-        }
-    }
-    expr_result_str = "{obj_str}_{method}({args_str})"
-    expr_result_type = CT_VOID
+    emit_line("/* unresolved: .{method} */")
+    expr_result_str = "0"
+    expr_result_type = CT_INT
 }

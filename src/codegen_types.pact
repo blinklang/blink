@@ -552,23 +552,27 @@ pub fn get_fn_ret_type(name: Str) -> RetType {
 pub fn resolve_ret_type_from_ann(fn_node: Int) -> Str {
     let ret_str = np_return_type.get(fn_node)
     let ta = np_type_ann.get(fn_node)
-    if ret_str == "Result" && ta != -1 {
-        let elems_sl = np_elements.get(ta)
-        if elems_sl != -1 && sublist_length(elems_sl) >= 2 {
-            let ok_ann = sublist_get(elems_sl, 0)
-            let err_ann = sublist_get(elems_sl, 1)
-            let ok_t = type_from_name(np_name.get(ok_ann))
-            let err_t = type_from_name(np_name.get(err_ann))
-            return result_c_type(ok_t, err_t)
+    if ret_str == "Result" {
+        if ta != -1 {
+            let elems_sl = np_elements.get(ta)
+            if elems_sl != -1 && sublist_length(elems_sl) >= 2 {
+                let ok_ann = sublist_get(elems_sl, 0)
+                let err_ann = sublist_get(elems_sl, 1)
+                let ok_t = type_from_name(np_name.get(ok_ann))
+                let err_t = type_from_name(np_name.get(err_ann))
+                return result_c_type(ok_t, err_t)
+            }
         }
         return result_c_type(CT_INT, CT_STRING)
     }
-    if ret_str == "Option" && ta != -1 {
-        let elems_sl = np_elements.get(ta)
-        if elems_sl != -1 && sublist_length(elems_sl) >= 1 {
-            let inner_ann = sublist_get(elems_sl, 0)
-            let inner_t = type_from_name(np_name.get(inner_ann))
-            return option_c_type(inner_t)
+    if ret_str == "Option" {
+        if ta != -1 {
+            let elems_sl = np_elements.get(ta)
+            if elems_sl != -1 && sublist_length(elems_sl) >= 1 {
+                let inner_ann = sublist_get(elems_sl, 0)
+                let inner_t = type_from_name(np_name.get(inner_ann))
+                return option_c_type(inner_t)
+            }
         }
         return option_c_type(CT_INT)
     }
@@ -578,24 +582,34 @@ pub fn resolve_ret_type_from_ann(fn_node: Int) -> Str {
 pub fn reg_fn_ret_from_ann(name: Str, fn_node: Int) ! Codegen.Register {
     let ret_str = np_return_type.get(fn_node)
     let ta = np_type_ann.get(fn_node)
-    if ret_str == "Result" && ta != -1 {
-        let elems_sl = np_elements.get(ta)
-        if elems_sl != -1 && sublist_length(elems_sl) >= 2 {
-            let ok_ann = sublist_get(elems_sl, 0)
-            let err_ann = sublist_get(elems_sl, 1)
-            let ok_t = type_from_name(np_name.get(ok_ann))
-            let err_t = type_from_name(np_name.get(err_ann))
-            reg_fn_ret_type(name, CT_RESULT, ok_t, err_t)
-            ensure_result_type(ok_t, err_t)
+    if ret_str == "Result" {
+        if ta != -1 {
+            let elems_sl = np_elements.get(ta)
+            if elems_sl != -1 && sublist_length(elems_sl) >= 2 {
+                let ok_ann = sublist_get(elems_sl, 0)
+                let err_ann = sublist_get(elems_sl, 1)
+                let ok_t = type_from_name(np_name.get(ok_ann))
+                let err_t = type_from_name(np_name.get(err_ann))
+                reg_fn_ret_type(name, CT_RESULT, ok_t, err_t)
+                ensure_result_type(ok_t, err_t)
+            }
+        } else {
+            reg_fn_ret_type(name, CT_RESULT, CT_INT, CT_STRING)
+            ensure_result_type(CT_INT, CT_STRING)
         }
     }
-    if ret_str == "Option" && ta != -1 {
-        let elems_sl = np_elements.get(ta)
-        if elems_sl != -1 && sublist_length(elems_sl) >= 1 {
-            let inner_ann = sublist_get(elems_sl, 0)
-            let inner_t = type_from_name(np_name.get(inner_ann))
-            reg_fn_ret_type(name, CT_OPTION, inner_t, -1)
-            ensure_option_type(inner_t)
+    if ret_str == "Option" {
+        if ta != -1 {
+            let elems_sl = np_elements.get(ta)
+            if elems_sl != -1 && sublist_length(elems_sl) >= 1 {
+                let inner_ann = sublist_get(elems_sl, 0)
+                let inner_t = type_from_name(np_name.get(inner_ann))
+                reg_fn_ret_type(name, CT_OPTION, inner_t, -1)
+                ensure_option_type(inner_t)
+            }
+        } else {
+            reg_fn_ret_type(name, CT_OPTION, CT_INT, -1)
+            ensure_option_type(CT_INT)
         }
     }
     if ret_str == "List" && ta != -1 {
@@ -833,7 +847,7 @@ pub fn get_list_elem_type(name: Str) -> Int {
         }
         i = i - 1
     }
-    CT_INT
+    -1
 }
 
 pub fn set_list_elem_struct(name: Str, struct_name: Str) {
