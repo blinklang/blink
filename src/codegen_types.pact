@@ -194,6 +194,41 @@ pub fn get_struct_field_list_elem_type(sname: Str, fname: Str) -> Int {
     CT_INT
 }
 
+// @derive(Serialize/Deserialize) registries
+pub let mut derive_serialize_types: List[Str] = []
+pub let mut derive_deserialize_types: List[Str] = []
+
+type DeriveMethodEntry {
+    type_name: Str
+    method_name: Str
+    ret_type: Int
+}
+pub let mut derive_method_entries: List[DeriveMethodEntry] = []
+
+pub fn has_derive_method(type_name: Str, method: Str) -> Int {
+    let mut i = 0
+    while i < derive_method_entries.len() {
+        let e = derive_method_entries.get(i)
+        if e.type_name == type_name && e.method_name == method {
+            return 1
+        }
+        i = i + 1
+    }
+    0
+}
+
+pub fn get_derive_method_ret(type_name: Str, method: Str) -> Int {
+    let mut i = 0
+    while i < derive_method_entries.len() {
+        let e = derive_method_entries.get(i)
+        if e.type_name == type_name && e.method_name == method {
+            return e.ret_type
+        }
+        i = i + 1
+    }
+    CT_VOID
+}
+
 // Closure-typed variable tracking: (name) -> C function pointer signature
 type VarClosureEntry {
     name: Str

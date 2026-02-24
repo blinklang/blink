@@ -52,6 +52,9 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
     var_struct_frame_starts = []
     sf_entries = []
     sf_closure_sigs = []
+    derive_serialize_types = []
+    derive_deserialize_types = []
+    derive_method_entries = []
     mono_instances = []
     cg_closure_defs = []
     cg_closure_counter = 0

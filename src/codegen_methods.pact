@@ -5,6 +5,25 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
     let obj_node = np_obj.get(node)
     let method = np_method.get(node)
 
+    // Static derive method dispatch: Type.from_json(str)
+    if np_kind.get(obj_node) == NodeKind.Ident {
+        let static_type_name = np_name.get(obj_node)
+        if method == "from_json" && has_derive_method(static_type_name, "from_json") != 0 {
+            let args_sl = np_args.get(node)
+            if args_sl != -1 && sublist_length(args_sl) > 0 {
+                emit_expr(sublist_get(args_sl, 0))
+                let arg_str = expr_result_str
+                let tmp = fresh_temp("_deser_")
+                emit_line("pact_Result_{static_type_name} {tmp} = pact_{static_type_name}_from_json({arg_str});")
+                set_var_struct(tmp, "Result_{static_type_name}")
+                set_var(tmp, CT_VOID, 0)
+                expr_result_str = tmp
+                expr_result_type = CT_VOID
+                return
+            }
+        }
+    }
+
     // Data-carrying enum variant constructor: Shape.Circle(5.0)
     if np_kind.get(obj_node) == NodeKind.Ident {
         let mc_obj_name = np_name.get(obj_node)
@@ -2066,6 +2085,24 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
         if method == "is_zero" {
             expr_result_str = "pact_duration_is_zero({obj_str})"
             expr_result_type = CT_BOOL
+            return
+        }
+    }
+
+    // Derived method dispatch (Serialize/Deserialize)
+    let derive_struct = get_var_struct(obj_str)
+    if derive_struct != "" && has_derive_method(derive_struct, method) != 0 {
+        if method == "to_json" {
+            expr_result_str = "pact_{derive_struct}_to_json({obj_str})"
+            expr_result_type = CT_STRING
+            return
+        }
+    }
+    let derive_enum = get_var_enum(obj_str)
+    if derive_enum != "" && has_derive_method(derive_enum, method) != 0 {
+        if method == "to_json" {
+            expr_result_str = "pact_{derive_enum}_to_json({obj_str})"
+            expr_result_type = CT_STRING
             return
         }
     }
