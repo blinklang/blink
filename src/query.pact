@@ -1,4 +1,5 @@
 import symbol_index
+import std.json
 
 // query.pact — Query engine for the symbol index
 //
@@ -69,48 +70,49 @@ fn vis_name(vis: Int) -> Str {
 // ── Format a single symbol as a JSON object ──────────────────────────
 
 fn symbol_to_json(idx: Int) -> Str {
-    let name = escape_str(si_sym_name.get(idx))
-    let kind = sym_kind_name(si_sym_kind.get(idx))
-    let module = escape_str(si_sym_module.get(idx))
-    let sig = escape_str(si_sym_sig.get(idx))
+    json_clear()
+    let obj = json_new_object()
+    json_set(obj, "name", json_new_str(si_sym_name.get(idx)))
+    json_set(obj, "kind", json_new_str(sym_kind_name(si_sym_kind.get(idx))))
+    json_set(obj, "module", json_new_str(si_sym_module.get(idx)))
+    json_set(obj, "signature", json_new_str(si_sym_sig.get(idx)))
+    let eff_arr = json_new_array()
     let effects = si_sym_effects.get(idx)
-    let vis = vis_name(si_sym_vis.get(idx))
-    let eff_arr = effects_to_json_array(effects)
-    let mut r = "\{\"name\":\""
-    r = r.concat(name)
-    r = r.concat("\",\"kind\":\"")
-    r = r.concat(kind)
-    r = r.concat("\",\"module\":\"")
-    r = r.concat(module)
-    r = r.concat("\",\"signature\":\"")
-    r = r.concat(sig)
-    r = r.concat("\",\"effects\":")
-    r = r.concat(eff_arr)
-    r = r.concat(",\"visibility\":\"")
-    r = r.concat(vis)
-    r = r.concat("\"")
+    if effects != "" {
+        let mut start = 0
+        let mut i = 0
+        while i <= effects.len() {
+            if i == effects.len() || effects.char_at(i) == 44 {
+                let part = effects.substring(start, i - start)
+                json_push(eff_arr, json_new_str(part))
+                start = i + 1
+            }
+            i = i + 1
+        }
+    }
+    json_set(obj, "effects", eff_arr)
+    json_set(obj, "visibility", json_new_str(vis_name(si_sym_vis.get(idx))))
     let intent = si_sym_intent.get(idx)
     if intent != "" {
-        r = r.concat(",\"intent\":\"").concat(escape_str(intent)).concat("\"")
+        json_set(obj, "intent", json_new_str(intent))
     }
     let doc = si_sym_doc.get(idx)
     if doc != "" {
-        r = r.concat(",\"doc\":\"").concat(escape_str(doc)).concat("\"")
+        json_set(obj, "doc", json_new_str(doc))
     }
     let req = si_sym_requires.get(idx)
     if req != "" {
-        r = r.concat(",\"requires\":\"").concat(escape_str(req)).concat("\"")
+        json_set(obj, "requires", json_new_str(req))
     }
     let ens = si_sym_ensures.get(idx)
     if ens != "" {
-        r = r.concat(",\"ensures\":\"").concat(escape_str(ens)).concat("\"")
+        json_set(obj, "ensures", json_new_str(ens))
     }
     let el = si_sym_end_line.get(idx)
     if el > 0 {
-        r = r.concat(",\"end_line\":{el}")
+        json_set(obj, "end_line", json_new_int(el))
     }
-    r = r.concat("}")
-    r
+    json_encode(obj)
 }
 
 // ── Wrap results array in envelope ───────────────────────────────────
@@ -253,43 +255,45 @@ pub fn query_filtered(vis_filter: Int, module_filter: Str, effect_filter: Str, p
 // ── Layer: intent — minimal name + intent ────────────────────────────
 
 fn symbol_to_intent_json(idx: Int) -> Str {
-    let name = escape_str(si_sym_name.get(idx))
-    let intent = escape_str(si_sym_intent.get(idx))
-    let mut r = "\{\"name\":\""
-    r = r.concat(name)
-    r = r.concat("\",\"intent\":\"")
-    r = r.concat(intent)
-    r = r.concat("\"}")
-    r
+    json_clear()
+    let obj = json_new_object()
+    json_set(obj, "name", json_new_str(si_sym_name.get(idx)))
+    json_set(obj, "intent", json_new_str(si_sym_intent.get(idx)))
+    json_encode(obj)
 }
 
 // ── Layer: contract — signature + contracts ──────────────────────────
 
 fn symbol_to_contract_json(idx: Int) -> Str {
-    let name = escape_str(si_sym_name.get(idx))
-    let sig = escape_str(si_sym_sig.get(idx))
+    json_clear()
+    let obj = json_new_object()
+    json_set(obj, "name", json_new_str(si_sym_name.get(idx)))
+    json_set(obj, "signature", json_new_str(si_sym_sig.get(idx)))
+    let eff_arr = json_new_array()
     let effects = si_sym_effects.get(idx)
-    let vis = vis_name(si_sym_vis.get(idx))
-    let eff_arr = effects_to_json_array(effects)
-    let mut r = "\{\"name\":\""
-    r = r.concat(name)
-    r = r.concat("\",\"signature\":\"")
-    r = r.concat(sig)
-    r = r.concat("\",\"effects\":")
-    r = r.concat(eff_arr)
-    r = r.concat(",\"visibility\":\"")
-    r = r.concat(vis)
-    r = r.concat("\"")
+    if effects != "" {
+        let mut start = 0
+        let mut i = 0
+        while i <= effects.len() {
+            if i == effects.len() || effects.char_at(i) == 44 {
+                let part = effects.substring(start, i - start)
+                json_push(eff_arr, json_new_str(part))
+                start = i + 1
+            }
+            i = i + 1
+        }
+    }
+    json_set(obj, "effects", eff_arr)
+    json_set(obj, "visibility", json_new_str(vis_name(si_sym_vis.get(idx))))
     let req = si_sym_requires.get(idx)
     if req != "" {
-        r = r.concat(",\"requires\":\"").concat(escape_str(req)).concat("\"")
+        json_set(obj, "requires", json_new_str(req))
     }
     let ens = si_sym_ensures.get(idx)
     if ens != "" {
-        r = r.concat(",\"ensures\":\"").concat(escape_str(ens)).concat("\"")
+        json_set(obj, "ensures", json_new_str(ens))
     }
-    r = r.concat("}")
-    r
+    json_encode(obj)
 }
 
 // ── Layer: full — everything including source text ───────────────────
@@ -323,60 +327,61 @@ fn extract_lines(content: Str, start_line: Int, end_line: Int) -> Str {
 }
 
 fn symbol_to_full_json(idx: Int) -> Str {
-    let name = escape_str(si_sym_name.get(idx))
-    let kind = sym_kind_name(si_sym_kind.get(idx))
-    let module = escape_str(si_sym_module.get(idx))
-    let sig = escape_str(si_sym_sig.get(idx))
+    json_clear()
+    let obj = json_new_object()
+    json_set(obj, "name", json_new_str(si_sym_name.get(idx)))
+    json_set(obj, "kind", json_new_str(sym_kind_name(si_sym_kind.get(idx))))
+    json_set(obj, "module", json_new_str(si_sym_module.get(idx)))
+    json_set(obj, "signature", json_new_str(si_sym_sig.get(idx)))
+    let eff_arr = json_new_array()
     let effects = si_sym_effects.get(idx)
-    let vis = vis_name(si_sym_vis.get(idx))
-    let eff_arr = effects_to_json_array(effects)
-    let mut r = "\{\"name\":\""
-    r = r.concat(name)
-    r = r.concat("\",\"kind\":\"")
-    r = r.concat(kind)
-    r = r.concat("\",\"module\":\"")
-    r = r.concat(module)
-    r = r.concat("\",\"signature\":\"")
-    r = r.concat(sig)
-    r = r.concat("\",\"effects\":")
-    r = r.concat(eff_arr)
-    r = r.concat(",\"visibility\":\"")
-    r = r.concat(vis)
-    r = r.concat("\"")
+    if effects != "" {
+        let mut start = 0
+        let mut i = 0
+        while i <= effects.len() {
+            if i == effects.len() || effects.char_at(i) == 44 {
+                let part = effects.substring(start, i - start)
+                json_push(eff_arr, json_new_str(part))
+                start = i + 1
+            }
+            i = i + 1
+        }
+    }
+    json_set(obj, "effects", eff_arr)
+    json_set(obj, "visibility", json_new_str(vis_name(si_sym_vis.get(idx))))
     let intent = si_sym_intent.get(idx)
     if intent != "" {
-        r = r.concat(",\"intent\":\"").concat(escape_str(intent)).concat("\"")
+        json_set(obj, "intent", json_new_str(intent))
     }
     let doc = si_sym_doc.get(idx)
     if doc != "" {
-        r = r.concat(",\"doc\":\"").concat(escape_str(doc)).concat("\"")
+        json_set(obj, "doc", json_new_str(doc))
     }
     let req = si_sym_requires.get(idx)
     if req != "" {
-        r = r.concat(",\"requires\":\"").concat(escape_str(req)).concat("\"")
+        json_set(obj, "requires", json_new_str(req))
     }
     let ens = si_sym_ensures.get(idx)
     if ens != "" {
-        r = r.concat(",\"ensures\":\"").concat(escape_str(ens)).concat("\"")
+        json_set(obj, "ensures", json_new_str(ens))
     }
     let line = si_sym_line.get(idx)
-    r = r.concat(",\"line\":{line}")
+    json_set(obj, "line", json_new_int(line))
     let el = si_sym_end_line.get(idx)
     if el > 0 {
-        r = r.concat(",\"end_line\":{el}")
+        json_set(obj, "end_line", json_new_int(el))
         let file_path = si_sym_file.get(idx)
         if file_path != "" {
             let file_content = read_file(file_path)
             if file_content != "" {
                 let source = extract_lines(file_content, line, el)
                 if source != "" {
-                    r = r.concat(",\"source\":\"").concat(escape_str(source)).concat("\"")
+                    json_set(obj, "source", json_new_str(source))
                 }
             }
         }
     }
-    r = r.concat("}")
-    r
+    json_encode(obj)
 }
 
 // ── Composable query with layer selection ─────────────────────────────
@@ -435,8 +440,7 @@ pub fn query_filtered_layer(layer: Str, vis_filter: Int, module_filter: Str, eff
 
 // ── Minimal JSON request parser ──────────────────────────────────────
 // Parses flat {"key":"value",...} objects. Only supports string values.
-// Avoids importing std.json which has a parse_value name collision
-// with std.toml when both are in the same compilation unit.
+// Minimal JSON request parser for incoming daemon requests.
 
 let mut qr_keys: List[Str] = []
 let mut qr_vals: List[Str] = []

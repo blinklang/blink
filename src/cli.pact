@@ -1,4 +1,5 @@
 import ast
+import std.args
 import std.audit
 import std.lockfile
 import std.manifest
@@ -10,49 +11,6 @@ import symbol_index
 import query
 import diagnostics
 import daemon
-
-fn print_usage() {
-    io.println("Usage: pact <command> [options] <file>")
-    io.println("")
-    io.println("Commands:")
-    io.println("  build <file>    Compile .pact to native binary")
-    io.println("  run <file>      Build and execute")
-    io.println("  test [<file>]   Build and run tests (discovers .pact files with test blocks)")
-    io.println("  check <file>    Validate without producing binary")
-    io.println("  fmt [<file>]    Format source file(s) in place")
-    io.println("  ast <file>      Dump parsed AST as JSON")
-    io.println("  audit           Check for capability escalations in dependencies")
-    io.println("  add <pkg>       Add a dependency (use --path or --git)")
-    io.println("  remove <pkg>    Remove a dependency")
-    io.println("  update [<pkg>]  Re-resolve dependencies and update lockfile")
-    io.println("  query <file>    Query symbol index (uses daemon if running)")
-    io.println("  daemon start <file>  Start compiler daemon (foreground)")
-    io.println("  daemon status   Show daemon status")
-    io.println("  daemon stop     Stop running daemon")
-    io.println("")
-    io.println("Options:")
-    io.println("  --output <path>   Output path (default: build/<name>)")
-    io.println("  --format json     Machine-readable JSON diagnostic output")
-    io.println("  --path <dir>      Path dependency source (for 'add')")
-    io.println("  --git <url>       Git dependency source (for 'add')")
-    io.println("  --tag <tag>       Git tag (for 'add', used with --git)")
-    io.println("  --dev             Add as dev-dependency (for 'add')")
-    io.println("  --debug           Enable debug mode (debug_assert, -g -O0)")
-    io.println("  --check           Check formatting without modifying files (exit 1 if unformatted)")
-    io.println("")
-    io.println("Test options:")
-    io.println("  --filter <pat>    Run only tests matching pattern")
-    io.println("  --json            Output test results as JSON")
-    io.println("  --tags <tag>      Run only tests with matching tag")
-    io.println("")
-    io.println("Query options:")
-    io.println("  --layer <mode>    Query detail level: intent, signature, contract, full")
-    io.println("  --effect <name>   Find functions with a specific effect")
-    io.println("  --module <name>   Filter by module name")
-    io.println("  --fn <name>       Look up a specific function by name")
-    io.println("  --pub             Filter to public symbols only")
-    io.println("  --pure            Filter to pure functions (no effects)")
-}
 
 fn strip_extension(filename: Str) -> Str {
     if filename.ends_with(".pact") {
@@ -483,144 +441,82 @@ fn ast_to_json(id: Int) -> Str {
 }
 
 fn main() {
-    if arg_count() < 2 {
-        print_usage()
+    let mut p = argparser_new("pact", "The Pact programming language compiler and toolchain")
+    p = add_command(p, "build", "Compile .pact to native binary")
+    p = add_command(p, "run", "Build and execute")
+    p = add_command(p, "check", "Validate without producing binary")
+    p = add_command(p, "test", "Build and run tests (discovers .pact files with test blocks)")
+    p = add_command(p, "fmt", "Format source file(s) in place")
+    p = add_command(p, "ast", "Dump parsed AST as JSON")
+    p = add_command(p, "audit", "Check for capability escalations in dependencies")
+    p = add_command(p, "add", "Add a dependency (use --path or --git)")
+    p = add_command(p, "remove", "Remove a dependency")
+    p = add_command(p, "update", "Re-resolve dependencies and update lockfile")
+    p = add_command(p, "daemon", "Compiler daemon (start/status/stop)")
+    p = add_command(p, "query", "Query symbol index (uses daemon if running)")
+
+    p = add_flag(p, "--debug", "-d", "Enable debug mode (debug_assert, -g -O0)")
+    p = add_flag(p, "--check", "-c", "Check formatting without modifying files")
+    p = add_flag(p, "--json", "-j", "JSON output")
+    p = add_flag(p, "--pub", "", "Filter to public symbols only")
+    p = add_flag(p, "--pure", "", "Filter to pure functions")
+    p = add_flag(p, "--dev", "", "Add as dev-dependency")
+
+    p = add_option(p, "--output", "-o", "Output path")
+    p = add_option(p, "--format", "-f", "Output format")
+    p = add_option(p, "--filter", "", "Test filter pattern")
+    p = add_option(p, "--tags", "", "Test tags filter")
+    p = add_option(p, "--layer", "", "Query detail level")
+    p = add_option(p, "--effect", "", "Filter by effect")
+    p = add_option(p, "--module", "-m", "Filter by module")
+    p = add_option(p, "--fn", "", "Look up function by name")
+    p = add_option(p, "--path", "", "Path dependency source")
+    p = add_option(p, "--git", "", "Git dependency source")
+    p = add_option(p, "--tag", "", "Git tag")
+    p = add_option(p, "--baseline", "", "Audit baseline path")
+
+    let a = argparse(p)
+
+    let err = args_error(a)
+    if err == "help" {
+        return
+    }
+    if err != "" {
+        io.println("error: {err}")
         return
     }
 
-    let command = get_arg(1)
-    let mut source_path = ""
-    let mut output_path = ""
-    let mut format_flag = ""
-    let mut filter_pattern = ""
-    let mut json_output = 0
-    let mut tags_filter = ""
-    let mut dep_path_flag = ""
-    let mut git_url_flag = ""
-    let mut git_tag_flag = ""
-    let mut dev_flag = 0
-    let mut debug_flag = 0
-    let mut check_flag = 0
-    let mut query_layer = ""
-    let mut query_effect = ""
-    let mut query_module = ""
-    let mut query_fn = ""
-    let mut query_pub = 0
-    let mut query_pure = 0
-    let mut i = 2
+    let command = args_command(a)
+    if command == "" {
+        io.println(generate_help(p))
+        return
+    }
 
-    while i < arg_count() {
-        let arg = get_arg(i)
-        if arg == "--output" {
-            if i + 1 < arg_count() {
-                i = i + 1
-                output_path = get_arg(i)
-            } else {
-                io.println("error: --output requires a path")
-                return
-            }
-        } else if arg == "--format" {
-            if i + 1 < arg_count() {
-                i = i + 1
-                format_flag = get_arg(i)
-            } else {
-                io.println("error: --format requires a value")
-                return
-            }
-        } else if arg == "--filter" {
-            if i + 1 < arg_count() {
-                i = i + 1
-                filter_pattern = get_arg(i)
-            } else {
-                io.println("error: --filter requires a pattern")
-                return
-            }
-        } else if arg == "--path" {
-            if i + 1 < arg_count() {
-                i = i + 1
-                dep_path_flag = get_arg(i)
-            } else {
-                io.println("error: --path requires a directory")
-                return
-            }
-        } else if arg == "--git" {
-            if i + 1 < arg_count() {
-                i = i + 1
-                git_url_flag = get_arg(i)
-            } else {
-                io.println("error: --git requires a URL")
-                return
-            }
-        } else if arg == "--tag" {
-            if i + 1 < arg_count() {
-                i = i + 1
-                git_tag_flag = get_arg(i)
-            } else {
-                io.println("error: --tag requires a value")
-                return
-            }
-        } else if arg == "--dev" {
-            dev_flag = 1
-        } else if arg == "--debug" {
-            debug_flag = 1
-        } else if arg == "--check" {
-            check_flag = 1
-        } else if arg == "--json" {
-            json_output = 1
-            format_flag = "json"
-        } else if arg == "--tags" {
-            if i + 1 < arg_count() {
-                i = i + 1
-                tags_filter = get_arg(i)
-            } else {
-                io.println("error: --tags requires a value")
-                return
-            }
-        } else if arg == "--layer" {
-            if i + 1 < arg_count() {
-                i = i + 1
-                query_layer = get_arg(i)
-            } else {
-                io.println("error: --layer requires a value")
-                return
-            }
-        } else if arg == "--effect" {
-            if i + 1 < arg_count() {
-                i = i + 1
-                query_effect = get_arg(i)
-            } else {
-                io.println("error: --effect requires an effect name")
-                return
-            }
-        } else if arg == "--module" {
-            if i + 1 < arg_count() {
-                i = i + 1
-                query_module = get_arg(i)
-            } else {
-                io.println("error: --module requires a module name")
-                return
-            }
-        } else if arg == "--fn" {
-            if i + 1 < arg_count() {
-                i = i + 1
-                query_fn = get_arg(i)
-            } else {
-                io.println("error: --fn requires a function name")
-                return
-            }
-        } else if arg == "--pub" {
-            query_pub = 1
-        } else if arg == "--pure" {
-            query_pure = 1
-        } else {
-            source_path = arg
-        }
-        i = i + 1
+    let source_path = args_positional(a, 0)
+    let mut output_path = args_get(a, "output")
+    let mut format_flag = args_get(a, "format")
+    let filter_pattern = args_get(a, "filter")
+    let tags_filter = args_get(a, "tags")
+    let dep_path_flag = args_get(a, "path")
+    let git_url_flag = args_get(a, "git")
+    let git_tag_flag = args_get(a, "tag")
+    let dev_flag = if args_has(a, "dev") { 1 } else { 0 }
+    let debug_flag = if args_has(a, "debug") { 1 } else { 0 }
+    let check_flag = if args_has(a, "check") { 1 } else { 0 }
+    let mut query_layer = args_get(a, "layer")
+    let query_effect = args_get(a, "effect")
+    let query_module = args_get(a, "module")
+    let query_fn = args_get(a, "fn")
+    let query_pub = if args_has(a, "pub") { 1 } else { 0 }
+    let query_pure = if args_has(a, "pure") { 1 } else { 0 }
+    let json_output = if args_has(a, "json") { 1 } else { 0 }
+    if json_output != 0 && format_flag == "" {
+        format_flag = "json"
     }
 
     if source_path == "" && command != "fmt" && command != "test" && command != "audit" && command != "add" && command != "remove" && command != "update" && command != "daemon" {
         io.println("error: no source file specified")
-        print_usage()
+        io.println(generate_help(p))
         return
     }
 
@@ -983,21 +879,7 @@ fn main() {
             }
         }
     } else if command == "audit" {
-        let mut baseline_path = ""
-        let mut ai = 2
-        while ai < arg_count() {
-            let aarg = get_arg(ai)
-            if aarg == "--baseline" {
-                if ai + 1 < arg_count() {
-                    ai = ai + 1
-                    baseline_path = get_arg(ai)
-                } else {
-                    io.println("error: --baseline requires a path")
-                    return
-                }
-            }
-            ai = ai + 1
-        }
+        let baseline_path = args_get(a, "baseline")
 
         if file_exists("pact.lock") == 0 {
             io.println("error: no pact.lock found. Run 'pact build' first.")
@@ -1168,22 +1050,12 @@ fn main() {
             io.println(result)
         }
     } else if command == "daemon" {
-        let mut sub_cmd = ""
-        let mut daemon_source = ""
-        let mut di = 2
-        while di < arg_count() {
-            let darg = get_arg(di)
-            if darg == "start" || darg == "status" || darg == "stop" {
-                sub_cmd = darg
-            } else if !darg.starts_with("--") {
-                daemon_source = darg
-            }
-            di = di + 1
-        }
+        let sub_cmd = args_positional(a, 0)
+        let daemon_source = args_positional(a, 1)
 
         if sub_cmd == "" {
             io.println("error: daemon requires a subcommand: start, status, or stop")
-            print_usage()
+            io.println(generate_help(p))
             return
         }
 
@@ -1248,6 +1120,6 @@ fn main() {
         io.println(ast_to_json(program))
     } else {
         io.println("error: unknown command '{command}'")
-        print_usage()
+        io.println(generate_help(p))
     }
 }

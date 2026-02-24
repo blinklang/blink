@@ -271,9 +271,9 @@ fn parse_float_val(s: Str) -> Float {
 
 // ── Forward declaration workaround ─────────────────────────────────
 // Pact doesn't have forward declarations. We use a dispatch pattern
-// where parse_value is defined before parse_array/parse_object call it.
+// where json_parse_value is defined before parse_array/parse_object call it.
 
-fn parse_value(s: Str, pos: Int, parent: Int, key: Str) -> Int {
+fn json_parse_value(s: Str, pos: Int, parent: Int, key: Str) -> Int {
     let p = skip_ws(s, pos)
     if p >= s.len() {
         parse_error = 1
@@ -359,7 +359,7 @@ fn parse_value(s: Str, pos: Int, parent: Int, key: Str) -> Int {
                 tmp_pos = ap
                 return idx
             }
-            parse_value(s, ap, idx, "")
+            json_parse_value(s, ap, idx, "")
             ap = tmp_pos
             ap = skip_ws(s, ap)
             count = count + 1
@@ -413,7 +413,7 @@ fn parse_value(s: Str, pos: Int, parent: Int, key: Str) -> Int {
             op = skip_ws(s, op)
 
             // Parse value
-            parse_value(s, op, idx, field_key)
+            json_parse_value(s, op, idx, field_key)
             op = tmp_pos
             op = skip_ws(s, op)
             count = count + 1
@@ -437,7 +437,7 @@ fn parse_value(s: Str, pos: Int, parent: Int, key: Str) -> Int {
 
 pub fn json_parse(input: Str) -> Int {
     parse_error = 0
-    let idx = parse_value(input, 0, -1, "")
+    let idx = json_parse_value(input, 0, -1, "")
     if parse_error == 1 {
         return -1
     }

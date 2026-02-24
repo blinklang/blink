@@ -3,6 +3,7 @@ import file_watcher
 import incremental
 import query
 import diagnostics
+import std.json
 import lexer
 import parser
 import typecheck
@@ -182,30 +183,26 @@ fn daemon_extract_type(request: Str) -> Str {
 // Collects current diagnostics into a JSON array string instead of printing.
 
 fn daemon_diags_to_json() -> Str {
-    let mut result = "["
+    json_clear()
+    let arr = json_new_array()
     let mut i = 0
     while i < diag_severity.len() {
-        if i > 0 {
-            result = result.concat(",")
-        }
-        let sev = dj_escape(diag_severity.get(i))
-        let name = dj_escape(diag_name.get(i))
-        let code = dj_escape(diag_code.get(i))
-        let msg = dj_escape(diag_message.get(i))
-        let file = dj_escape(diag_file.get(i))
-        let line = diag_line.get(i)
-        let col = diag_col.get(i)
+        let obj = json_new_object()
+        json_set(obj, "severity", json_new_str(diag_severity.get(i)))
+        json_set(obj, "name", json_new_str(diag_name.get(i)))
+        json_set(obj, "code", json_new_str(diag_code.get(i)))
+        json_set(obj, "message", json_new_str(diag_message.get(i)))
+        json_set(obj, "file", json_new_str(diag_file.get(i)))
+        json_set(obj, "line", json_new_int(diag_line.get(i)))
+        json_set(obj, "col", json_new_int(diag_col.get(i)))
         let help = diag_help.get(i)
-        let mut entry = "\{\"severity\":\"{sev}\",\"name\":\"{name}\",\"code\":\"{code}\",\"message\":\"{msg}\",\"file\":\"{file}\",\"line\":{line},\"col\":{col}"
         if help != "" {
-            entry = entry.concat(",\"help\":\"").concat(dj_escape(help)).concat("\"")
+            json_set(obj, "help", json_new_str(help))
         }
-        entry = entry.concat("}")
-        result = result.concat(entry)
+        json_push(arr, obj)
         i = i + 1
     }
-    result = result.concat("]")
-    result
+    json_encode(arr)
 }
 
 // ── Handle: check ───────────────────────────────────────────────────

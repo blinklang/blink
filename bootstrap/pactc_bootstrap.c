@@ -723,6 +723,34 @@ static pact_list* fw_dirty_path;
 static int64_t fw_dirty_count = 0;
 static int64_t fw_poll_interval = 500;
 static pact_map* path_map;
+static const int64_t CH_CR = 13;
+static const int64_t CH_b = 98;
+static const int64_t CH_e = 101;
+static const int64_t CH_f = 102;
+static const int64_t CH_l = 108;
+static const int64_t CH_s = 115;
+static const int64_t CH_u = 117;
+static const int64_t JSON_NULL = 0;
+static const int64_t JSON_BOOL = 1;
+static const int64_t JSON_INT = 2;
+static const int64_t JSON_FLOAT = 3;
+static const int64_t JSON_STRING = 4;
+static const int64_t JSON_ARRAY = 5;
+static const int64_t JSON_OBJECT = 6;
+static pact_list* json_types;
+static pact_list* json_str_vals;
+static pact_list* json_int_vals;
+static pact_list* json_float_vals;
+static pact_list* json_bool_vals;
+static pact_list* json_parents;
+static pact_list* json_keys;
+static pact_list* json_children;
+static pact_list* json_child_counts;
+static int64_t tmp_pos = 0;
+static const char* tmp_str = "";
+static int64_t tmp_int = 0;
+static const char* tmp_float_str = "";
+static int64_t parse_error = 0;
 static pact_list* qr_keys;
 static pact_list* qr_vals;
 static pact_list* inc_snap_path;
@@ -745,7 +773,6 @@ static int64_t daemon_check_count = 0;
 static int64_t daemon_program = (-1);
 static pact_list* dr_keys;
 static pact_list* dr_vals;
-static const int64_t CH_CR = 13;
 static const int64_t CH_HASH = 35;
 static const int64_t CH_z = 122;
 static const int64_t CH_TILDE = 126;
@@ -760,8 +787,6 @@ static pact_list* toml_values;
 static pact_list* toml_types;
 static pact_list* arr_table_names;
 static pact_list* arr_table_counts;
-static const char* tmp_str = "";
-static int64_t tmp_pos = 0;
 static int64_t lock_version = 0;
 static const char* lock_pact_version = "";
 static const char* lock_generated = "";
@@ -1253,6 +1278,38 @@ pact_list* pact_fw_get_dirty(void);
 void pact_fw_clear_dirty(void);
 void pact_fw_add_file(const char* path);
 void pact_fw_reset(void);
+int64_t pact_is_ws(int64_t c);
+int64_t pact_skip_ws(const char* s, int64_t pos);
+int64_t pact_alloc_node(int64_t ntype, int64_t parent, const char* key);
+void pact_parse_string(const char* s, int64_t pos);
+void pact_parse_number(const char* s, int64_t pos);
+int64_t pact_parse_int_val(const char* s);
+double pact_digit_to_float(int64_t ch);
+double pact_parse_float_val(const char* s);
+int64_t pact_json_parse_value(const char* s, int64_t pos, int64_t parent, const char* key);
+int64_t pact_json_parse(const char* input);
+int64_t pact_json_type(int64_t idx);
+const char* pact_json_as_str(int64_t idx);
+int64_t pact_json_as_int(int64_t idx);
+double pact_json_as_float(int64_t idx);
+int64_t pact_json_as_bool(int64_t idx);
+int64_t pact_json_get(int64_t idx, const char* key);
+int64_t pact_json_at(int64_t idx, int64_t i);
+int64_t pact_json_len(int64_t idx);
+int64_t pact_json_obj_child_at(int64_t parent, int64_t i);
+const char* pact_escape_json_str(const char* s);
+const char* pact_json_serialize(int64_t idx);
+void pact_json_clear(void);
+int64_t pact_json_new_object(void);
+int64_t pact_json_new_array(void);
+int64_t pact_json_new_str(const char* val);
+int64_t pact_json_new_int(int64_t val);
+int64_t pact_json_new_float(double val);
+int64_t pact_json_new_bool(int64_t val);
+int64_t pact_json_new_null(void);
+void pact_json_set(int64_t obj, const char* key, int64_t val);
+void pact_json_push(int64_t arr, int64_t val);
+const char* pact_json_encode(int64_t idx);
 const char* pact_escape_str(const char* s);
 const char* pact_effects_to_json_array(const char* effects);
 const char* pact_vis_name(int64_t vis);
@@ -1297,10 +1354,8 @@ const char* pact_daemon_handle_stop(void);
 void pact_daemon_loop(void);
 void pact_daemon_stop(void);
 void pact_daemon_start(const char* root, const char* source);
-int64_t pact_is_ws(int64_t c);
 int64_t pact_is_newline(int64_t c);
 int64_t pact_is_bare_key_char(int64_t c);
-int64_t pact_skip_ws(const char* content, int64_t pos);
 int64_t pact_skip_to_newline(const char* content, int64_t pos);
 int64_t pact_skip_ws_and_newlines(const char* content, int64_t pos);
 void pact_store_entry(const char* key, const char* value, int64_t vtype);
@@ -1314,7 +1369,7 @@ void pact_parse_dotted_key(const char* content, int64_t pos);
 void pact_parse_integer(const char* content, int64_t pos);
 void pact_parse_array_value(const char* content, int64_t pos, const char* full_key);
 void pact_parse_inline_table(const char* content, int64_t pos, const char* prefix);
-void pact_parse_value(const char* content, int64_t pos, const char* full_key);
+void pact_toml_parse_value(const char* content, int64_t pos, const char* full_key);
 void pact_parse_section_header(const char* content, int64_t pos);
 void pact_parse_array_table_header(const char* content, int64_t pos);
 int64_t pact_toml_parse(const char* content);
@@ -23789,6 +23844,667 @@ void pact_fw_reset(void) {
     path_map = pact_map_new();
 }
 
+int64_t pact_is_ws(int64_t c) {
+    return ((((c == CH_SPACE) || (c == CH_TAB)) || (c == CH_NEWLINE)) || (c == CH_CR));
+}
+
+int64_t pact_skip_ws(const char* s, int64_t pos) {
+    int64_t p = pos;
+    while (((p < pact_str_len(s)) && pact_is_ws(pact_peek(s, p)))) {
+        p = (p + 1);
+    }
+    return p;
+}
+
+int64_t pact_alloc_node(int64_t ntype, int64_t parent, const char* key) {
+    const int64_t idx = pact_list_len(json_types);
+    pact_list_push(json_types, (void*)(intptr_t)ntype);
+    pact_list_push(json_str_vals, (void*)"");
+    pact_list_push(json_int_vals, (void*)(intptr_t)0);
+    pact_list_push(json_float_vals, (void*)"");
+    pact_list_push(json_bool_vals, (void*)(intptr_t)0);
+    pact_list_push(json_parents, (void*)(intptr_t)parent);
+    pact_list_push(json_keys, (void*)key);
+    pact_list_push(json_children, (void*)(intptr_t)(-1));
+    pact_list_push(json_child_counts, (void*)(intptr_t)0);
+    return idx;
+}
+
+void pact_parse_string(const char* s, int64_t pos) {
+    int64_t p = (pos + 1);
+    const char* result = "";
+    while ((p < pact_str_len(s))) {
+        const int64_t c = pact_peek(s, p);
+        if ((c == CH_DQUOTE)) {
+            tmp_str = result;
+            tmp_pos = (p + 1);
+            return;
+        }
+        if (((c == CH_BACKSLASH) && ((p + 1) < pact_str_len(s)))) {
+            const int64_t next = pact_peek(s, (p + 1));
+            if ((next == CH_DQUOTE)) {
+                result = pact_str_concat(result, "\"");
+                p = (p + 2);
+            } else if ((next == CH_BACKSLASH)) {
+                result = pact_str_concat(result, "\\");
+                p = (p + 2);
+            } else {
+                if ((next == CH_SLASH)) {
+                    result = pact_str_concat(result, "/");
+                    p = (p + 2);
+                } else if ((next == CH_n)) {
+                    result = pact_str_concat(result, "\n");
+                    p = (p + 2);
+                } else {
+                    if ((next == CH_t)) {
+                        result = pact_str_concat(result, "\t");
+                        p = (p + 2);
+                    } else if ((next == CH_r)) {
+                        result = pact_str_concat(result, "\\");
+                        p = (p + 2);
+                    } else {
+                        if ((next == CH_b)) {
+                            result = pact_str_concat(result, "\\");
+                            p = (p + 2);
+                        } else if ((next == CH_f)) {
+                            result = pact_str_concat(result, "\\");
+                            p = (p + 2);
+                        } else {
+                            if ((next == CH_u)) {
+                                result = pact_str_concat(result, "\?");
+                                p = (p + 6);
+                            } else {
+                                result = pact_str_concat(result, pact_str_substr(s, p, 1));
+                                p = (p + 1);
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            result = pact_str_concat(result, pact_str_substr(s, p, 1));
+            p = (p + 1);
+        }
+    }
+    tmp_str = result;
+    tmp_pos = p;
+    parse_error = 1;
+}
+
+void pact_parse_number(const char* s, int64_t pos) {
+    int64_t p = pos;
+    int64_t is_float = 0;
+    if (((p < pact_str_len(s)) && (pact_peek(s, p) == CH_MINUS))) {
+        p = (p + 1);
+    }
+    while (((p < pact_str_len(s)) && pact_is_digit(pact_peek(s, p)))) {
+        p = (p + 1);
+    }
+    if (((p < pact_str_len(s)) && (pact_peek(s, p) == CH_DOT))) {
+        is_float = 1;
+        p = (p + 1);
+        while (((p < pact_str_len(s)) && pact_is_digit(pact_peek(s, p)))) {
+            p = (p + 1);
+        }
+    }
+    if ((p < pact_str_len(s))) {
+        const int64_t ec = pact_peek(s, p);
+        if (((ec == CH_e) || (ec == 69))) {
+            is_float = 1;
+            p = (p + 1);
+            if ((p < pact_str_len(s))) {
+                const int64_t sc = pact_peek(s, p);
+                if (((sc == CH_PLUS) || (sc == CH_MINUS))) {
+                    p = (p + 1);
+                }
+            }
+            while (((p < pact_str_len(s)) && pact_is_digit(pact_peek(s, p)))) {
+                p = (p + 1);
+            }
+        }
+    }
+    const char* num_str = pact_str_substr(s, pos, (p - pos));
+    tmp_pos = p;
+    if ((is_float == 1)) {
+        tmp_float_str = num_str;
+        tmp_int = 0;
+    } else {
+        tmp_int = pact_parse_int_val(num_str);
+        tmp_float_str = "";
+    }
+}
+
+int64_t pact_parse_int_val(const char* s) {
+    int64_t result = 0;
+    int64_t i = 0;
+    int64_t negative = 0;
+    if (((i < pact_str_len(s)) && (pact_str_char_at(s, i) == CH_MINUS))) {
+        negative = 1;
+        i = (i + 1);
+    }
+    while ((i < pact_str_len(s))) {
+        const int64_t c = pact_str_char_at(s, i);
+        if (((c >= CH_0) && (c <= CH_9))) {
+            result = ((result * 10) + (c - CH_0));
+        }
+        i = (i + 1);
+    }
+    if ((negative == 1)) {
+        return (0 - result);
+    }
+    return result;
+}
+
+double pact_digit_to_float(int64_t ch) {
+    const int64_t d = (ch - CH_0);
+    if ((d == 0)) {
+        return 0.0;
+    }
+    if ((d == 1)) {
+        return 1.0;
+    }
+    if ((d == 2)) {
+        return 2.0;
+    }
+    if ((d == 3)) {
+        return 3.0;
+    }
+    if ((d == 4)) {
+        return 4.0;
+    }
+    if ((d == 5)) {
+        return 5.0;
+    }
+    if ((d == 6)) {
+        return 6.0;
+    }
+    if ((d == 7)) {
+        return 7.0;
+    }
+    if ((d == 8)) {
+        return 8.0;
+    }
+    return 9.0;
+}
+
+double pact_parse_float_val(const char* s) {
+    double result = 0.0;
+    int64_t i = 0;
+    int64_t negative = 0;
+    if (((i < pact_str_len(s)) && (pact_str_char_at(s, i) == CH_MINUS))) {
+        negative = 1;
+        i = (i + 1);
+    }
+    while ((((i < pact_str_len(s)) && (pact_str_char_at(s, i) >= CH_0)) && (pact_str_char_at(s, i) <= CH_9))) {
+        result = ((result * 10.0) + pact_digit_to_float(pact_str_char_at(s, i)));
+        i = (i + 1);
+    }
+    if (((i < pact_str_len(s)) && (pact_str_char_at(s, i) == CH_DOT))) {
+        i = (i + 1);
+        double frac = 0.1;
+        while ((((i < pact_str_len(s)) && (pact_str_char_at(s, i) >= CH_0)) && (pact_str_char_at(s, i) <= CH_9))) {
+            result = (result + (pact_digit_to_float(pact_str_char_at(s, i)) * frac));
+            frac = (frac * 0.1);
+            i = (i + 1);
+        }
+    }
+    if ((negative == 1)) {
+        return (0.0 - result);
+    }
+    return result;
+}
+
+int64_t pact_json_parse_value(const char* s, int64_t pos, int64_t parent, const char* key) {
+    const int64_t p = pact_skip_ws(s, pos);
+    if ((p >= pact_str_len(s))) {
+        parse_error = 1;
+        tmp_pos = p;
+        return (-1);
+    }
+    const int64_t c = pact_peek(s, p);
+    if ((c == CH_DQUOTE)) {
+        pact_parse_string(s, p);
+        const int64_t idx = pact_alloc_node(JSON_STRING, parent, key);
+        pact_list_set(json_str_vals, idx, (void*)tmp_str);
+        return idx;
+    }
+    if ((pact_is_digit(c) || (c == CH_MINUS))) {
+        pact_parse_number(s, p);
+        const char* num_str = pact_str_substr(s, p, (tmp_pos - p));
+        int64_t has_dot = 0;
+        int64_t ci = 0;
+        while ((ci < pact_str_len(num_str))) {
+            if ((((pact_str_char_at(num_str, ci) == CH_DOT) || (pact_str_char_at(num_str, ci) == CH_e)) || (pact_str_char_at(num_str, ci) == 69))) {
+                has_dot = 1;
+            }
+            ci = (ci + 1);
+        }
+        if ((has_dot == 1)) {
+            const int64_t idx = pact_alloc_node(JSON_FLOAT, parent, key);
+            pact_list_set(json_float_vals, idx, (void*)tmp_float_str);
+            return idx;
+        } else {
+            const int64_t idx = pact_alloc_node(JSON_INT, parent, key);
+            pact_list_set(json_int_vals, idx, (void*)(intptr_t)tmp_int);
+            return idx;
+        }
+    }
+    if ((((c == CH_t) && ((p + 4) <= pact_str_len(s))) && pact_str_eq(pact_str_substr(s, p, 4), "true"))) {
+        tmp_pos = (p + 4);
+        const int64_t idx = pact_alloc_node(JSON_BOOL, parent, key);
+        pact_list_set(json_bool_vals, idx, (void*)(intptr_t)1);
+        return idx;
+    }
+    if ((((c == CH_f) && ((p + 5) <= pact_str_len(s))) && pact_str_eq(pact_str_substr(s, p, 5), "false"))) {
+        tmp_pos = (p + 5);
+        const int64_t idx = pact_alloc_node(JSON_BOOL, parent, key);
+        pact_list_set(json_bool_vals, idx, (void*)(intptr_t)0);
+        return idx;
+    }
+    if ((((c == CH_n) && ((p + 4) <= pact_str_len(s))) && pact_str_eq(pact_str_substr(s, p, 4), "null"))) {
+        tmp_pos = (p + 4);
+        const int64_t idx = pact_alloc_node(JSON_NULL, parent, key);
+        return idx;
+    }
+    if ((c == CH_LBRACKET)) {
+        const int64_t idx = pact_alloc_node(JSON_ARRAY, parent, key);
+        pact_list_set(json_children, idx, (void*)(intptr_t)pact_list_len(json_types));
+        int64_t ap = (p + 1);
+        int64_t count = 0;
+        ap = pact_skip_ws(s, ap);
+        while (((ap < pact_str_len(s)) && (pact_peek(s, ap) != CH_RBRACKET))) {
+            if ((count > 0)) {
+                if ((pact_peek(s, ap) == CH_COMMA)) {
+                    ap = (ap + 1);
+                    ap = pact_skip_ws(s, ap);
+                }
+            }
+            if (((ap < pact_str_len(s)) && (pact_peek(s, ap) == CH_RBRACKET))) {
+                ap = (ap + 1);
+                pact_list_set(json_child_counts, idx, (void*)(intptr_t)count);
+                tmp_pos = ap;
+                return idx;
+            }
+            pact_json_parse_value(s, ap, idx, "");
+            ap = tmp_pos;
+            ap = pact_skip_ws(s, ap);
+            count = (count + 1);
+        }
+        if (((ap < pact_str_len(s)) && (pact_peek(s, ap) == CH_RBRACKET))) {
+            ap = (ap + 1);
+        }
+        pact_list_set(json_child_counts, idx, (void*)(intptr_t)count);
+        tmp_pos = ap;
+        return idx;
+    }
+    if ((c == CH_LBRACE)) {
+        const int64_t idx = pact_alloc_node(JSON_OBJECT, parent, key);
+        pact_list_set(json_children, idx, (void*)(intptr_t)pact_list_len(json_types));
+        int64_t op = (p + 1);
+        int64_t count = 0;
+        op = pact_skip_ws(s, op);
+        while (((op < pact_str_len(s)) && (pact_peek(s, op) != CH_RBRACE))) {
+            if ((count > 0)) {
+                if ((pact_peek(s, op) == CH_COMMA)) {
+                    op = (op + 1);
+                    op = pact_skip_ws(s, op);
+                }
+            }
+            if (((op < pact_str_len(s)) && (pact_peek(s, op) == CH_RBRACE))) {
+                op = (op + 1);
+                pact_list_set(json_child_counts, idx, (void*)(intptr_t)count);
+                tmp_pos = op;
+                return idx;
+            }
+            if ((pact_peek(s, op) != CH_DQUOTE)) {
+                parse_error = 1;
+                tmp_pos = op;
+                return idx;
+            }
+            pact_parse_string(s, op);
+            const char* field_key = tmp_str;
+            op = tmp_pos;
+            op = pact_skip_ws(s, op);
+            if ((pact_peek(s, op) == CH_COLON)) {
+                op = (op + 1);
+            }
+            op = pact_skip_ws(s, op);
+            pact_json_parse_value(s, op, idx, field_key);
+            op = tmp_pos;
+            op = pact_skip_ws(s, op);
+            count = (count + 1);
+        }
+        if (((op < pact_str_len(s)) && (pact_peek(s, op) == CH_RBRACE))) {
+            op = (op + 1);
+        }
+        pact_list_set(json_child_counts, idx, (void*)(intptr_t)count);
+        tmp_pos = op;
+        return idx;
+    }
+    parse_error = 1;
+    tmp_pos = p;
+    return (-1);
+}
+
+int64_t pact_json_parse(const char* input) {
+    parse_error = 0;
+    const int64_t idx = pact_json_parse_value(input, 0, (-1), "");
+    if ((parse_error == 1)) {
+        return (-1);
+    }
+    return idx;
+}
+
+int64_t pact_json_type(int64_t idx) {
+    if (((idx < 0) || (idx >= pact_list_len(json_types)))) {
+        return (-1);
+    }
+    return (int64_t)(intptr_t)pact_list_get(json_types, idx);
+}
+
+const char* pact_json_as_str(int64_t idx) {
+    if (((idx < 0) || (idx >= pact_list_len(json_str_vals)))) {
+        return "";
+    }
+    return (const char*)pact_list_get(json_str_vals, idx);
+}
+
+int64_t pact_json_as_int(int64_t idx) {
+    if (((idx < 0) || (idx >= pact_list_len(json_int_vals)))) {
+        return 0;
+    }
+    return (int64_t)(intptr_t)pact_list_get(json_int_vals, idx);
+}
+
+double pact_json_as_float(int64_t idx) {
+    if (((idx < 0) || (idx >= pact_list_len(json_float_vals)))) {
+        return 0.0;
+    }
+    const char* s = (const char*)pact_list_get(json_float_vals, idx);
+    if (pact_str_eq(s, "")) {
+        return 0.0;
+    }
+    return pact_parse_float_val(s);
+}
+
+int64_t pact_json_as_bool(int64_t idx) {
+    if (((idx < 0) || (idx >= pact_list_len(json_bool_vals)))) {
+        return 0;
+    }
+    return (int64_t)(intptr_t)pact_list_get(json_bool_vals, idx);
+}
+
+int64_t pact_json_get(int64_t idx, const char* key) {
+    if (((idx < 0) || (idx >= pact_list_len(json_types)))) {
+        return (-1);
+    }
+    if (((int64_t)(intptr_t)pact_list_get(json_types, idx) != JSON_OBJECT)) {
+        return (-1);
+    }
+    const int64_t start = (int64_t)(intptr_t)pact_list_get(json_children, idx);
+    const int64_t count = (int64_t)(intptr_t)pact_list_get(json_child_counts, idx);
+    int64_t i = start;
+    const int64_t limit = (start + count);
+    while (((i < pact_list_len(json_types)) && (i < limit))) {
+        if ((((int64_t)(intptr_t)pact_list_get(json_parents, i) == idx) && pact_str_eq((const char*)pact_list_get(json_keys, i), key))) {
+            return i;
+        }
+        i = (i + 1);
+    }
+    int64_t j = 0;
+    while ((j < pact_list_len(json_types))) {
+        if ((((int64_t)(intptr_t)pact_list_get(json_parents, j) == idx) && pact_str_eq((const char*)pact_list_get(json_keys, j), key))) {
+            return j;
+        }
+        j = (j + 1);
+    }
+    return (-1);
+}
+
+int64_t pact_json_at(int64_t idx, int64_t i) {
+    if (((idx < 0) || (idx >= pact_list_len(json_types)))) {
+        return (-1);
+    }
+    if (((int64_t)(intptr_t)pact_list_get(json_types, idx) != JSON_ARRAY)) {
+        return (-1);
+    }
+    const int64_t start = (int64_t)(intptr_t)pact_list_get(json_children, idx);
+    const int64_t count = (int64_t)(intptr_t)pact_list_get(json_child_counts, idx);
+    if (((i < 0) || (i >= count))) {
+        return (-1);
+    }
+    const int64_t target = (start + i);
+    if (((target < pact_list_len(json_types)) && ((int64_t)(intptr_t)pact_list_get(json_parents, target) == idx))) {
+        return target;
+    }
+    int64_t ci = 0;
+    int64_t found = 0;
+    while ((ci < pact_list_len(json_types))) {
+        if (((int64_t)(intptr_t)pact_list_get(json_parents, ci) == idx)) {
+            if ((found == i)) {
+                return ci;
+            }
+            found = (found + 1);
+        }
+        ci = (ci + 1);
+    }
+    return (-1);
+}
+
+int64_t pact_json_len(int64_t idx) {
+    if (((idx < 0) || (idx >= pact_list_len(json_types)))) {
+        return 0;
+    }
+    return (int64_t)(intptr_t)pact_list_get(json_child_counts, idx);
+}
+
+int64_t pact_json_obj_child_at(int64_t parent, int64_t i) {
+    int64_t ci = 0;
+    int64_t found = 0;
+    while ((ci < pact_list_len(json_types))) {
+        if (((int64_t)(intptr_t)pact_list_get(json_parents, ci) == parent)) {
+            if ((found == i)) {
+                return ci;
+            }
+            found = (found + 1);
+        }
+        ci = (ci + 1);
+    }
+    return (-1);
+}
+
+const char* pact_escape_json_str(const char* s) {
+    const char* result = "";
+    int64_t i = 0;
+    while ((i < pact_str_len(s))) {
+        const int64_t c = pact_str_char_at(s, i);
+        if ((c == CH_DQUOTE)) {
+            result = pact_str_concat(result, "\\\"");
+        } else if ((c == CH_BACKSLASH)) {
+            result = pact_str_concat(result, "\\\\");
+        } else {
+            if ((c == CH_NEWLINE)) {
+                result = pact_str_concat(result, "\\n");
+            } else if ((c == CH_TAB)) {
+                result = pact_str_concat(result, "\\t");
+            } else {
+                if ((c == CH_CR)) {
+                    result = pact_str_concat(result, "\\r");
+                } else {
+                    result = pact_str_concat(result, pact_str_substr(s, i, 1));
+                }
+            }
+        }
+        i = (i + 1);
+    }
+    return result;
+}
+
+const char* pact_json_serialize(int64_t idx) {
+    if (((idx < 0) || (idx >= pact_list_len(json_types)))) {
+        return "null";
+    }
+    const int64_t ntype = (int64_t)(intptr_t)pact_list_get(json_types, idx);
+    if ((ntype == JSON_NULL)) {
+        return "null";
+    }
+    if ((ntype == JSON_BOOL)) {
+        if (((int64_t)(intptr_t)pact_list_get(json_bool_vals, idx) == 1)) {
+            return "true";
+        }
+        return "false";
+    }
+    if ((ntype == JSON_INT)) {
+        const int64_t v = (int64_t)(intptr_t)pact_list_get(json_int_vals, idx);
+        char _si_0[4096];
+        snprintf(_si_0, 4096, "%lld", (long long)v);
+        return strdup(_si_0);
+    }
+    if ((ntype == JSON_FLOAT)) {
+        return (const char*)pact_list_get(json_float_vals, idx);
+    }
+    if ((ntype == JSON_STRING)) {
+        const char* v = pact_escape_json_str((const char*)pact_list_get(json_str_vals, idx));
+        char _si_1[4096];
+        snprintf(_si_1, 4096, "\"%s\"", v);
+        return strdup(_si_1);
+    }
+    if ((ntype == JSON_ARRAY)) {
+        const char* result = "[";
+        const int64_t count = (int64_t)(intptr_t)pact_list_get(json_child_counts, idx);
+        int64_t i = 0;
+        while ((i < count)) {
+            if ((i > 0)) {
+                result = pact_str_concat(result, ",");
+            }
+            const int64_t child = pact_json_at(idx, i);
+            result = pact_str_concat(result, pact_json_serialize(child));
+            i = (i + 1);
+        }
+        result = pact_str_concat(result, "]");
+        return result;
+    }
+    if ((ntype == JSON_OBJECT)) {
+        const char* result = "{";
+        const int64_t count = (int64_t)(intptr_t)pact_list_get(json_child_counts, idx);
+        const int64_t start = (int64_t)(intptr_t)pact_list_get(json_children, idx);
+        int64_t i = 0;
+        while ((i < count)) {
+            if ((i > 0)) {
+                result = pact_str_concat(result, ",");
+            }
+            const int64_t child_idx = (start + i);
+            if (((child_idx < pact_list_len(json_types)) && ((int64_t)(intptr_t)pact_list_get(json_parents, child_idx) == idx))) {
+                const char* k = pact_escape_json_str((const char*)pact_list_get(json_keys, child_idx));
+                result = pact_str_concat(result, "\"");
+                result = pact_str_concat(result, k);
+                result = pact_str_concat(result, "\":");
+                result = pact_str_concat(result, pact_json_serialize(child_idx));
+            } else {
+                const int64_t ci = pact_json_obj_child_at(idx, i);
+                if ((ci >= 0)) {
+                    const char* k = pact_escape_json_str((const char*)pact_list_get(json_keys, ci));
+                    result = pact_str_concat(result, "\"");
+                    result = pact_str_concat(result, k);
+                    result = pact_str_concat(result, "\":");
+                    result = pact_str_concat(result, pact_json_serialize(ci));
+                }
+            }
+            i = (i + 1);
+        }
+        result = pact_str_concat(result, "}");
+        return result;
+    }
+    return "null";
+}
+
+void pact_json_clear(void) {
+    pact_list* _l0 = pact_list_new();
+    json_types = _l0;
+    pact_list* _l1 = pact_list_new();
+    json_str_vals = _l1;
+    pact_list* _l2 = pact_list_new();
+    json_int_vals = _l2;
+    pact_list* _l3 = pact_list_new();
+    json_float_vals = _l3;
+    pact_list* _l4 = pact_list_new();
+    json_bool_vals = _l4;
+    pact_list* _l5 = pact_list_new();
+    json_parents = _l5;
+    pact_list* _l6 = pact_list_new();
+    json_keys = _l6;
+    pact_list* _l7 = pact_list_new();
+    json_children = _l7;
+    pact_list* _l8 = pact_list_new();
+    json_child_counts = _l8;
+    tmp_pos = 0;
+    tmp_str = "";
+    tmp_int = 0;
+    tmp_float_str = "";
+    parse_error = 0;
+}
+
+int64_t pact_json_new_object(void) {
+    return pact_alloc_node(JSON_OBJECT, (-1), "");
+}
+
+int64_t pact_json_new_array(void) {
+    return pact_alloc_node(JSON_ARRAY, (-1), "");
+}
+
+int64_t pact_json_new_str(const char* val) {
+    const int64_t idx = pact_alloc_node(JSON_STRING, (-1), "");
+    pact_list_set(json_str_vals, idx, (void*)val);
+    return idx;
+}
+
+int64_t pact_json_new_int(int64_t val) {
+    const int64_t idx = pact_alloc_node(JSON_INT, (-1), "");
+    pact_list_set(json_int_vals, idx, (void*)(intptr_t)val);
+    return idx;
+}
+
+int64_t pact_json_new_float(double val) {
+    const int64_t idx = pact_alloc_node(JSON_FLOAT, (-1), "");
+    char _si_0[4096];
+    snprintf(_si_0, 4096, "%g", val);
+    pact_list_set(json_float_vals, idx, (void*)strdup(_si_0));
+    return idx;
+}
+
+int64_t pact_json_new_bool(int64_t val) {
+    const int64_t idx = pact_alloc_node(JSON_BOOL, (-1), "");
+    pact_list_set(json_bool_vals, idx, (void*)(intptr_t)val);
+    return idx;
+}
+
+int64_t pact_json_new_null(void) {
+    return pact_alloc_node(JSON_NULL, (-1), "");
+}
+
+void pact_json_set(int64_t obj, const char* key, int64_t val) {
+    pact_list_set(json_parents, val, (void*)(intptr_t)obj);
+    pact_list_set(json_keys, val, (void*)key);
+    const int64_t count = (int64_t)(intptr_t)pact_list_get(json_child_counts, obj);
+    if ((count == 0)) {
+        pact_list_set(json_children, obj, (void*)(intptr_t)val);
+    }
+    pact_list_set(json_child_counts, obj, (void*)(intptr_t)(count + 1));
+}
+
+void pact_json_push(int64_t arr, int64_t val) {
+    pact_list_set(json_parents, val, (void*)(intptr_t)arr);
+    const int64_t count = (int64_t)(intptr_t)pact_list_get(json_child_counts, arr);
+    if ((count == 0)) {
+        pact_list_set(json_children, arr, (void*)(intptr_t)val);
+    }
+    pact_list_set(json_child_counts, arr, (void*)(intptr_t)(count + 1));
+}
+
+const char* pact_json_encode(int64_t idx) {
+    return pact_json_serialize(idx);
+}
+
 const char* pact_escape_str(const char* s) {
     const char* result = "";
     int64_t i = 0;
@@ -23848,50 +24564,49 @@ const char* pact_vis_name(int64_t vis) {
 }
 
 const char* pact_symbol_to_json(int64_t idx) {
-    const char* name = pact_escape_str((const char*)pact_list_get(si_sym_name, idx));
-    const char* kind = pact_sym_kind_name((int64_t)(intptr_t)pact_list_get(si_sym_kind, idx));
-    const char* module = pact_escape_str((const char*)pact_list_get(si_sym_module, idx));
-    const char* sig = pact_escape_str((const char*)pact_list_get(si_sym_sig, idx));
+    pact_json_clear();
+    const int64_t obj = pact_json_new_object();
+    pact_json_set(obj, "name", pact_json_new_str((const char*)pact_list_get(si_sym_name, idx)));
+    pact_json_set(obj, "kind", pact_json_new_str(pact_sym_kind_name((int64_t)(intptr_t)pact_list_get(si_sym_kind, idx))));
+    pact_json_set(obj, "module", pact_json_new_str((const char*)pact_list_get(si_sym_module, idx)));
+    pact_json_set(obj, "signature", pact_json_new_str((const char*)pact_list_get(si_sym_sig, idx)));
+    const int64_t eff_arr = pact_json_new_array();
     const char* effects = (const char*)pact_list_get(si_sym_effects, idx);
-    const char* vis = pact_vis_name((int64_t)(intptr_t)pact_list_get(si_sym_vis, idx));
-    const char* eff_arr = pact_effects_to_json_array(effects);
-    const char* r = "{\"name\":\"";
-    r = pact_str_concat(r, name);
-    r = pact_str_concat(r, "\",\"kind\":\"");
-    r = pact_str_concat(r, kind);
-    r = pact_str_concat(r, "\",\"module\":\"");
-    r = pact_str_concat(r, module);
-    r = pact_str_concat(r, "\",\"signature\":\"");
-    r = pact_str_concat(r, sig);
-    r = pact_str_concat(r, "\",\"effects\":");
-    r = pact_str_concat(r, eff_arr);
-    r = pact_str_concat(r, ",\"visibility\":\"");
-    r = pact_str_concat(r, vis);
-    r = pact_str_concat(r, "\"");
+    if ((!pact_str_eq(effects, ""))) {
+        int64_t start = 0;
+        int64_t i = 0;
+        while ((i <= pact_str_len(effects))) {
+            if (((i == pact_str_len(effects)) || (pact_str_char_at(effects, i) == 44))) {
+                const char* part = pact_str_substr(effects, start, (i - start));
+                pact_json_push(eff_arr, pact_json_new_str(part));
+                start = (i + 1);
+            }
+            i = (i + 1);
+        }
+    }
+    pact_json_set(obj, "effects", eff_arr);
+    pact_json_set(obj, "visibility", pact_json_new_str(pact_vis_name((int64_t)(intptr_t)pact_list_get(si_sym_vis, idx))));
     const char* intent = (const char*)pact_list_get(si_sym_intent, idx);
     if ((!pact_str_eq(intent, ""))) {
-        r = pact_str_concat(pact_str_concat(pact_str_concat(r, ",\"intent\":\""), pact_escape_str(intent)), "\"");
+        pact_json_set(obj, "intent", pact_json_new_str(intent));
     }
     const char* doc = (const char*)pact_list_get(si_sym_doc, idx);
     if ((!pact_str_eq(doc, ""))) {
-        r = pact_str_concat(pact_str_concat(pact_str_concat(r, ",\"doc\":\""), pact_escape_str(doc)), "\"");
+        pact_json_set(obj, "doc", pact_json_new_str(doc));
     }
     const char* req = (const char*)pact_list_get(si_sym_requires, idx);
     if ((!pact_str_eq(req, ""))) {
-        r = pact_str_concat(pact_str_concat(pact_str_concat(r, ",\"requires\":\""), pact_escape_str(req)), "\"");
+        pact_json_set(obj, "requires", pact_json_new_str(req));
     }
     const char* ens = (const char*)pact_list_get(si_sym_ensures, idx);
     if ((!pact_str_eq(ens, ""))) {
-        r = pact_str_concat(pact_str_concat(pact_str_concat(r, ",\"ensures\":\""), pact_escape_str(ens)), "\"");
+        pact_json_set(obj, "ensures", pact_json_new_str(ens));
     }
     const int64_t el = (int64_t)(intptr_t)pact_list_get(si_sym_end_line, idx);
     if ((el > 0)) {
-        char _si_0[4096];
-        snprintf(_si_0, 4096, ",\"end_line\":%lld", (long long)el);
-        r = pact_str_concat(r, strdup(_si_0));
+        pact_json_set(obj, "end_line", pact_json_new_int(el));
     }
-    r = pact_str_concat(r, "}");
-    return r;
+    return pact_json_encode(obj);
 }
 
 const char* pact_wrap_results(const char* items) {
@@ -24018,41 +24733,43 @@ const char* pact_query_filtered(int64_t vis_filter, const char* module_filter, c
 }
 
 const char* pact_symbol_to_intent_json(int64_t idx) {
-    const char* name = pact_escape_str((const char*)pact_list_get(si_sym_name, idx));
-    const char* intent = pact_escape_str((const char*)pact_list_get(si_sym_intent, idx));
-    const char* r = "{\"name\":\"";
-    r = pact_str_concat(r, name);
-    r = pact_str_concat(r, "\",\"intent\":\"");
-    r = pact_str_concat(r, intent);
-    r = pact_str_concat(r, "\"}");
-    return r;
+    pact_json_clear();
+    const int64_t obj = pact_json_new_object();
+    pact_json_set(obj, "name", pact_json_new_str((const char*)pact_list_get(si_sym_name, idx)));
+    pact_json_set(obj, "intent", pact_json_new_str((const char*)pact_list_get(si_sym_intent, idx)));
+    return pact_json_encode(obj);
 }
 
 const char* pact_symbol_to_contract_json(int64_t idx) {
-    const char* name = pact_escape_str((const char*)pact_list_get(si_sym_name, idx));
-    const char* sig = pact_escape_str((const char*)pact_list_get(si_sym_sig, idx));
+    pact_json_clear();
+    const int64_t obj = pact_json_new_object();
+    pact_json_set(obj, "name", pact_json_new_str((const char*)pact_list_get(si_sym_name, idx)));
+    pact_json_set(obj, "signature", pact_json_new_str((const char*)pact_list_get(si_sym_sig, idx)));
+    const int64_t eff_arr = pact_json_new_array();
     const char* effects = (const char*)pact_list_get(si_sym_effects, idx);
-    const char* vis = pact_vis_name((int64_t)(intptr_t)pact_list_get(si_sym_vis, idx));
-    const char* eff_arr = pact_effects_to_json_array(effects);
-    const char* r = "{\"name\":\"";
-    r = pact_str_concat(r, name);
-    r = pact_str_concat(r, "\",\"signature\":\"");
-    r = pact_str_concat(r, sig);
-    r = pact_str_concat(r, "\",\"effects\":");
-    r = pact_str_concat(r, eff_arr);
-    r = pact_str_concat(r, ",\"visibility\":\"");
-    r = pact_str_concat(r, vis);
-    r = pact_str_concat(r, "\"");
+    if ((!pact_str_eq(effects, ""))) {
+        int64_t start = 0;
+        int64_t i = 0;
+        while ((i <= pact_str_len(effects))) {
+            if (((i == pact_str_len(effects)) || (pact_str_char_at(effects, i) == 44))) {
+                const char* part = pact_str_substr(effects, start, (i - start));
+                pact_json_push(eff_arr, pact_json_new_str(part));
+                start = (i + 1);
+            }
+            i = (i + 1);
+        }
+    }
+    pact_json_set(obj, "effects", eff_arr);
+    pact_json_set(obj, "visibility", pact_json_new_str(pact_vis_name((int64_t)(intptr_t)pact_list_get(si_sym_vis, idx))));
     const char* req = (const char*)pact_list_get(si_sym_requires, idx);
     if ((!pact_str_eq(req, ""))) {
-        r = pact_str_concat(pact_str_concat(pact_str_concat(r, ",\"requires\":\""), pact_escape_str(req)), "\"");
+        pact_json_set(obj, "requires", pact_json_new_str(req));
     }
     const char* ens = (const char*)pact_list_get(si_sym_ensures, idx);
     if ((!pact_str_eq(ens, ""))) {
-        r = pact_str_concat(pact_str_concat(pact_str_concat(r, ",\"ensures\":\""), pact_escape_str(ens)), "\"");
+        pact_json_set(obj, "ensures", pact_json_new_str(ens));
     }
-    r = pact_str_concat(r, "}");
-    return r;
+    return pact_json_encode(obj);
 }
 
 const char* pact_extract_lines(const char* content, int64_t start_line, int64_t end_line) {
@@ -24084,64 +24801,61 @@ const char* pact_extract_lines(const char* content, int64_t start_line, int64_t 
 }
 
 const char* pact_symbol_to_full_json(int64_t idx) {
-    const char* name = pact_escape_str((const char*)pact_list_get(si_sym_name, idx));
-    const char* kind = pact_sym_kind_name((int64_t)(intptr_t)pact_list_get(si_sym_kind, idx));
-    const char* module = pact_escape_str((const char*)pact_list_get(si_sym_module, idx));
-    const char* sig = pact_escape_str((const char*)pact_list_get(si_sym_sig, idx));
+    pact_json_clear();
+    const int64_t obj = pact_json_new_object();
+    pact_json_set(obj, "name", pact_json_new_str((const char*)pact_list_get(si_sym_name, idx)));
+    pact_json_set(obj, "kind", pact_json_new_str(pact_sym_kind_name((int64_t)(intptr_t)pact_list_get(si_sym_kind, idx))));
+    pact_json_set(obj, "module", pact_json_new_str((const char*)pact_list_get(si_sym_module, idx)));
+    pact_json_set(obj, "signature", pact_json_new_str((const char*)pact_list_get(si_sym_sig, idx)));
+    const int64_t eff_arr = pact_json_new_array();
     const char* effects = (const char*)pact_list_get(si_sym_effects, idx);
-    const char* vis = pact_vis_name((int64_t)(intptr_t)pact_list_get(si_sym_vis, idx));
-    const char* eff_arr = pact_effects_to_json_array(effects);
-    const char* r = "{\"name\":\"";
-    r = pact_str_concat(r, name);
-    r = pact_str_concat(r, "\",\"kind\":\"");
-    r = pact_str_concat(r, kind);
-    r = pact_str_concat(r, "\",\"module\":\"");
-    r = pact_str_concat(r, module);
-    r = pact_str_concat(r, "\",\"signature\":\"");
-    r = pact_str_concat(r, sig);
-    r = pact_str_concat(r, "\",\"effects\":");
-    r = pact_str_concat(r, eff_arr);
-    r = pact_str_concat(r, ",\"visibility\":\"");
-    r = pact_str_concat(r, vis);
-    r = pact_str_concat(r, "\"");
+    if ((!pact_str_eq(effects, ""))) {
+        int64_t start = 0;
+        int64_t i = 0;
+        while ((i <= pact_str_len(effects))) {
+            if (((i == pact_str_len(effects)) || (pact_str_char_at(effects, i) == 44))) {
+                const char* part = pact_str_substr(effects, start, (i - start));
+                pact_json_push(eff_arr, pact_json_new_str(part));
+                start = (i + 1);
+            }
+            i = (i + 1);
+        }
+    }
+    pact_json_set(obj, "effects", eff_arr);
+    pact_json_set(obj, "visibility", pact_json_new_str(pact_vis_name((int64_t)(intptr_t)pact_list_get(si_sym_vis, idx))));
     const char* intent = (const char*)pact_list_get(si_sym_intent, idx);
     if ((!pact_str_eq(intent, ""))) {
-        r = pact_str_concat(pact_str_concat(pact_str_concat(r, ",\"intent\":\""), pact_escape_str(intent)), "\"");
+        pact_json_set(obj, "intent", pact_json_new_str(intent));
     }
     const char* doc = (const char*)pact_list_get(si_sym_doc, idx);
     if ((!pact_str_eq(doc, ""))) {
-        r = pact_str_concat(pact_str_concat(pact_str_concat(r, ",\"doc\":\""), pact_escape_str(doc)), "\"");
+        pact_json_set(obj, "doc", pact_json_new_str(doc));
     }
     const char* req = (const char*)pact_list_get(si_sym_requires, idx);
     if ((!pact_str_eq(req, ""))) {
-        r = pact_str_concat(pact_str_concat(pact_str_concat(r, ",\"requires\":\""), pact_escape_str(req)), "\"");
+        pact_json_set(obj, "requires", pact_json_new_str(req));
     }
     const char* ens = (const char*)pact_list_get(si_sym_ensures, idx);
     if ((!pact_str_eq(ens, ""))) {
-        r = pact_str_concat(pact_str_concat(pact_str_concat(r, ",\"ensures\":\""), pact_escape_str(ens)), "\"");
+        pact_json_set(obj, "ensures", pact_json_new_str(ens));
     }
     const int64_t line = (int64_t)(intptr_t)pact_list_get(si_sym_line, idx);
-    char _si_0[4096];
-    snprintf(_si_0, 4096, ",\"line\":%lld", (long long)line);
-    r = pact_str_concat(r, strdup(_si_0));
+    pact_json_set(obj, "line", pact_json_new_int(line));
     const int64_t el = (int64_t)(intptr_t)pact_list_get(si_sym_end_line, idx);
     if ((el > 0)) {
-        char _si_1[4096];
-        snprintf(_si_1, 4096, ",\"end_line\":%lld", (long long)el);
-        r = pact_str_concat(r, strdup(_si_1));
+        pact_json_set(obj, "end_line", pact_json_new_int(el));
         const char* file_path = (const char*)pact_list_get(si_sym_file, idx);
         if ((!pact_str_eq(file_path, ""))) {
             const char* file_content = pact_read_file(file_path);
             if ((!pact_str_eq(file_content, ""))) {
                 const char* source = pact_extract_lines(file_content, line, el);
                 if ((!pact_str_eq(source, ""))) {
-                    r = pact_str_concat(pact_str_concat(pact_str_concat(r, ",\"source\":\""), pact_escape_str(source)), "\"");
+                    pact_json_set(obj, "source", pact_json_new_str(source));
                 }
             }
         }
     }
-    r = pact_str_concat(r, "}");
-    return r;
+    return pact_json_encode(obj);
 }
 
 const char* pact_format_symbol_for_layer(const char* layer, int64_t idx) {
@@ -24600,32 +25314,26 @@ const char* pact_daemon_extract_type(const char* request) {
 }
 
 const char* pact_daemon_diags_to_json(void) {
-    const char* result = "[";
+    pact_json_clear();
+    const int64_t arr = pact_json_new_array();
     int64_t i = 0;
     while ((i < pact_list_len(diag_severity))) {
-        if ((i > 0)) {
-            result = pact_str_concat(result, ",");
-        }
-        const char* sev = pact_dj_escape((const char*)pact_list_get(diag_severity, i));
-        const char* name = pact_dj_escape((const char*)pact_list_get(diag_name, i));
-        const char* code = pact_dj_escape((const char*)pact_list_get(diag_code, i));
-        const char* msg = pact_dj_escape((const char*)pact_list_get(diag_message, i));
-        const char* file = pact_dj_escape((const char*)pact_list_get(diag_file, i));
-        const int64_t line = (int64_t)(intptr_t)pact_list_get(diag_line, i);
-        const int64_t col = (int64_t)(intptr_t)pact_list_get(diag_col, i);
+        const int64_t obj = pact_json_new_object();
+        pact_json_set(obj, "severity", pact_json_new_str((const char*)pact_list_get(diag_severity, i)));
+        pact_json_set(obj, "name", pact_json_new_str((const char*)pact_list_get(diag_name, i)));
+        pact_json_set(obj, "code", pact_json_new_str((const char*)pact_list_get(diag_code, i)));
+        pact_json_set(obj, "message", pact_json_new_str((const char*)pact_list_get(diag_message, i)));
+        pact_json_set(obj, "file", pact_json_new_str((const char*)pact_list_get(diag_file, i)));
+        pact_json_set(obj, "line", pact_json_new_int((int64_t)(intptr_t)pact_list_get(diag_line, i)));
+        pact_json_set(obj, "col", pact_json_new_int((int64_t)(intptr_t)pact_list_get(diag_col, i)));
         const char* help = (const char*)pact_list_get(diag_help, i);
-        char _si_0[4096];
-        snprintf(_si_0, 4096, "{\"severity\":\"%s\",\"name\":\"%s\",\"code\":\"%s\",\"message\":\"%s\",\"file\":\"%s\",\"line\":%lld,\"col\":%lld", sev, name, code, msg, file, (long long)line, (long long)col);
-        const char* entry = strdup(_si_0);
         if ((!pact_str_eq(help, ""))) {
-            entry = pact_str_concat(pact_str_concat(pact_str_concat(entry, ",\"help\":\""), pact_dj_escape(help)), "\"");
+            pact_json_set(obj, "help", pact_json_new_str(help));
         }
-        entry = pact_str_concat(entry, "}");
-        result = pact_str_concat(result, entry);
+        pact_json_push(arr, obj);
         i = (i + 1);
     }
-    result = pact_str_concat(result, "]");
-    return result;
+    return pact_json_encode(arr);
 }
 
 const char* pact_daemon_handle_check(void) {
@@ -24773,24 +25481,12 @@ void pact_daemon_start(const char* root, const char* source) {
     pact_daemon_stop();
 }
 
-int64_t pact_is_ws(int64_t c) {
-    return ((c == CH_SPACE) || (c == CH_TAB));
-}
-
 int64_t pact_is_newline(int64_t c) {
     return ((c == CH_NEWLINE) || (c == CH_CR));
 }
 
 int64_t pact_is_bare_key_char(int64_t c) {
     return ((((pact_is_alpha(c) || pact_is_digit(c)) || (c == CH_UNDERSCORE)) || (c == CH_MINUS)) || (c == CH_SLASH));
-}
-
-int64_t pact_skip_ws(const char* content, int64_t pos) {
-    int64_t p = pos;
-    while (((p < pact_str_len(content)) && pact_is_ws(pact_peek(content, p)))) {
-        p = (p + 1);
-    }
-    return p;
 }
 
 int64_t pact_skip_to_newline(const char* content, int64_t pos) {
@@ -25060,7 +25756,7 @@ void pact_parse_inline_table(const char* content, int64_t pos, const char* prefi
     tmp_pos = p;
 }
 
-void pact_parse_value(const char* content, int64_t pos, const char* full_key) {
+void pact_toml_parse_value(const char* content, int64_t pos, const char* full_key) {
     const int64_t c = pact_peek(content, pos);
     if ((c == CH_DQUOTE)) {
         pact_parse_quoted_string(content, pos);
@@ -25188,7 +25884,7 @@ int64_t pact_toml_parse(const char* content) {
             snprintf(_si_1, 4096, "%s.%s", current_section, key);
             full_key = strdup(_si_1);
         }
-        pact_parse_value(content, pos, full_key);
+        pact_toml_parse_value(content, pos, full_key);
         pos = tmp_pos;
         pos = pact_skip_to_newline(content, pos);
         if ((pos < pact_str_len(content))) {
@@ -26512,49 +27208,67 @@ pact_list* _l216 = pact_list_new();
     fw_dirty_path = _l216;
     path_map = pact_map_new();
 pact_list* _l217 = pact_list_new();
-    qr_keys = _l217;
+    json_types = _l217;
 pact_list* _l218 = pact_list_new();
-    qr_vals = _l218;
+    json_str_vals = _l218;
 pact_list* _l219 = pact_list_new();
-    inc_snap_path = _l219;
+    json_int_vals = _l219;
 pact_list* _l220 = pact_list_new();
-    inc_snap_mtime = _l220;
+    json_float_vals = _l220;
 pact_list* _l221 = pact_list_new();
-    inc_dirty_path = _l221;
+    json_bool_vals = _l221;
 pact_list* _l222 = pact_list_new();
-    inc_affected = _l222;
+    json_parents = _l222;
+pact_list* _l223 = pact_list_new();
+    json_keys = _l223;
+pact_list* _l224 = pact_list_new();
+    json_children = _l224;
+pact_list* _l225 = pact_list_new();
+    json_child_counts = _l225;
+pact_list* _l226 = pact_list_new();
+    qr_keys = _l226;
+pact_list* _l227 = pact_list_new();
+    qr_vals = _l227;
+pact_list* _l228 = pact_list_new();
+    inc_snap_path = _l228;
+pact_list* _l229 = pact_list_new();
+    inc_snap_mtime = _l229;
+pact_list* _l230 = pact_list_new();
+    inc_dirty_path = _l230;
+pact_list* _l231 = pact_list_new();
+    inc_affected = _l231;
     affected_map = pact_map_new();
     snap_path_map = pact_map_new();
-pact_list* _l223 = pact_list_new();
-    dr_keys = _l223;
-pact_list* _l224 = pact_list_new();
-    dr_vals = _l224;
-pact_list* _l225 = pact_list_new();
-    toml_keys = _l225;
-pact_list* _l226 = pact_list_new();
-    toml_values = _l226;
-pact_list* _l227 = pact_list_new();
-    toml_types = _l227;
-pact_list* _l228 = pact_list_new();
-    arr_table_names = _l228;
-pact_list* _l229 = pact_list_new();
-    arr_table_counts = _l229;
-pact_list* _l230 = pact_list_new();
-    lock_pkg_names = _l230;
-pact_list* _l231 = pact_list_new();
-    lock_pkg_versions = _l231;
 pact_list* _l232 = pact_list_new();
-    lock_pkg_sources = _l232;
+    dr_keys = _l232;
 pact_list* _l233 = pact_list_new();
-    lock_pkg_hashes = _l233;
+    dr_vals = _l233;
 pact_list* _l234 = pact_list_new();
-    lock_pkg_caps = _l234;
+    toml_keys = _l234;
 pact_list* _l235 = pact_list_new();
-    loaded_files = _l235;
+    toml_values = _l235;
 pact_list* _l236 = pact_list_new();
-    import_map_paths = _l236;
+    toml_types = _l236;
 pact_list* _l237 = pact_list_new();
-    import_map_nodes = _l237;
+    arr_table_names = _l237;
+pact_list* _l238 = pact_list_new();
+    arr_table_counts = _l238;
+pact_list* _l239 = pact_list_new();
+    lock_pkg_names = _l239;
+pact_list* _l240 = pact_list_new();
+    lock_pkg_versions = _l240;
+pact_list* _l241 = pact_list_new();
+    lock_pkg_sources = _l241;
+pact_list* _l242 = pact_list_new();
+    lock_pkg_hashes = _l242;
+pact_list* _l243 = pact_list_new();
+    lock_pkg_caps = _l243;
+pact_list* _l244 = pact_list_new();
+    loaded_files = _l244;
+pact_list* _l245 = pact_list_new();
+    import_map_paths = _l245;
+pact_list* _l246 = pact_list_new();
+    import_map_nodes = _l246;
 }
 
 int main(int argc, char** argv) {

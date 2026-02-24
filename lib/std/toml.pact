@@ -388,7 +388,7 @@ fn parse_inline_table(content: Str, pos: Int, prefix: Str) {
 
 // ── Parse a value (string, int, bool, array, inline table) ─────────
 
-fn parse_value(content: Str, pos: Int, full_key: Str) {
+fn toml_parse_value(content: Str, pos: Int, full_key: Str) {
     let c = peek(content, pos)
 
     if c == CH_DQUOTE {
@@ -543,7 +543,7 @@ pub fn toml_parse(content: Str) -> Int {
             full_key = "{current_section}.{key}"
         }
 
-        parse_value(content, pos, full_key)
+        toml_parse_value(content, pos, full_key)
         pos = tmp_pos
 
         pos = skip_to_newline(content, pos)
