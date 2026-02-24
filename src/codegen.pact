@@ -56,6 +56,7 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
     derive_serialize_types = []
     derive_deserialize_types = []
     derive_method_entries = []
+    deser_externs_emitted = 0
     mono_instances = []
     cg_closure_defs = []
     cg_closure_counter = 0

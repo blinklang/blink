@@ -14,11 +14,16 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                 emit_expr(sublist_get(args_sl, 0))
                 let arg_str = expr_result_str
                 let tmp = fresh_temp("_deser_")
-                emit_line("pact_Result_{static_type_name} {tmp} = pact_{static_type_name}_from_json({arg_str});")
-                set_var_struct(tmp, "Result_{static_type_name}")
+                emit_line("pact_Result_{static_type_name}_str {tmp} = pact_{static_type_name}_from_json({arg_str});")
+                set_var_struct(tmp, "Result_{static_type_name}_str")
                 set_var(tmp, CT_VOID, 0)
+                set_var_result_struct(tmp, CT_VOID, CT_STRING, static_type_name, "")
                 expr_result_str = tmp
-                expr_result_type = CT_VOID
+                expr_result_type = CT_RESULT
+                expr_result_ok_type = CT_VOID
+                expr_result_ok_struct = static_type_name
+                expr_result_err_type = CT_STRING
+                expr_result_err_struct = ""
                 return
             }
         }
