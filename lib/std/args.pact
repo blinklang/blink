@@ -163,54 +163,54 @@ fn strip_dashes(s: Str) -> Str {
     s
 }
 
-fn check_parser_flag(p: ArgParser, arg: Str) -> Bool {
+fn resolve_flag_name(p: ArgParser, arg: Str) -> Str {
     let mut i = 0
     while i < p.flags.len() {
         let f = p.flags.get(i)
         if f.long_name == arg || f.short_name == arg {
-            return true
+            return strip_dashes(f.long_name)
         }
         i = i + 1
     }
-    false
+    ""
 }
 
-fn check_parser_option(p: ArgParser, arg: Str) -> Bool {
+fn resolve_option_name(p: ArgParser, arg: Str) -> Str {
     let mut i = 0
     while i < p.options.len() {
         let o = p.options.get(i)
         if o.long_name == arg || o.short_name == arg {
-            return true
+            return strip_dashes(o.long_name)
         }
         i = i + 1
     }
-    false
+    ""
 }
 
-fn check_cmd_flag(p: ArgParser, cmd_idx: Int, arg: Str) -> Bool {
+fn resolve_cmd_flag_name(p: ArgParser, cmd_idx: Int, arg: Str) -> Str {
     let cmd = p.commands.get(cmd_idx)
     let mut i = 0
     while i < cmd.flags.len() {
         let f = cmd.flags.get(i)
         if f.long_name == arg || f.short_name == arg {
-            return true
+            return strip_dashes(f.long_name)
         }
         i = i + 1
     }
-    false
+    ""
 }
 
-fn check_cmd_option(p: ArgParser, cmd_idx: Int, arg: Str) -> Bool {
+fn resolve_cmd_option_name(p: ArgParser, cmd_idx: Int, arg: Str) -> Str {
     let cmd = p.commands.get(cmd_idx)
     let mut i = 0
     while i < cmd.options.len() {
         let o = cmd.options.get(i)
         if o.long_name == arg || o.short_name == arg {
-            return true
+            return strip_dashes(o.long_name)
         }
         i = i + 1
     }
-    false
+    ""
 }
 
 fn find_command_idx(p: ArgParser, name: Str) -> Int {
@@ -270,23 +270,23 @@ pub fn argparse(p: ArgParser) -> Args {
             }
         }
 
-        let mut is_flag = check_parser_flag(p, arg)
-        if cmd_idx != -1 && is_flag == false {
-            is_flag = check_cmd_flag(p, cmd_idx, arg)
+        let mut flag_name = resolve_flag_name(p, arg)
+        if cmd_idx != -1 && flag_name == "" {
+            flag_name = resolve_cmd_flag_name(p, cmd_idx, arg)
         }
 
-        if is_flag {
-            result.flag_names.push(strip_dashes(arg))
+        if flag_name != "" {
+            result.flag_names.push(flag_name)
             i = i + 1
             continue
         }
 
-        let mut is_opt = check_parser_option(p, arg)
-        if cmd_idx != -1 && is_opt == false {
-            is_opt = check_cmd_option(p, cmd_idx, arg)
+        let mut opt_name = resolve_option_name(p, arg)
+        if cmd_idx != -1 && opt_name == "" {
+            opt_name = resolve_cmd_option_name(p, cmd_idx, arg)
         }
 
-        if is_opt {
+        if opt_name != "" {
             if i + 1 >= arg_count() {
                 result = Args {
                     command_name: result.command_name,
@@ -299,7 +299,7 @@ pub fn argparse(p: ArgParser) -> Args {
                 return result
             }
             i = i + 1
-            result.option_keys.push(strip_dashes(arg))
+            result.option_keys.push(opt_name)
             result.option_vals.push(get_arg(i))
             i = i + 1
             continue
