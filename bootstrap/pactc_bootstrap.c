@@ -17309,6 +17309,9 @@ void pact_emit_let_binding(int64_t node) {
     cg_let_target_name = saved_let_target_name;
     const char* val_str = expr_result_str;
     const int64_t val_type = expr_result_type;
+    if ((val_type == CT_RESULT)) {
+        enum_type = "";
+    }
     const char* name = (const char*)pact_list_get(np_name, node);
     const int64_t is_mut = (int64_t)(intptr_t)pact_list_get(np_is_mut, node);
     pact_set_var(name, val_type, is_mut);
@@ -19334,6 +19337,11 @@ void pact_emit_enum_from_json(const char* type_name) {
         pact_emit_json_extern_decls();
         deser_externs_emitted = 1;
     }
+    const int64_t eidx = pact_get_enum_reg_idx(type_name);
+    if ((eidx == (-1))) {
+        return;
+    }
+    const int64_t is_data = pact_is_data_enum(type_name);
     char _si_0[4096];
     snprintf(_si_0, 4096, "pact_Result_%s_str pact_%s_from_json(const char* input) {", type_name, type_name);
     pact_emit_line(strdup(_si_0));
@@ -19341,8 +19349,135 @@ void pact_emit_enum_from_json(const char* type_name) {
     char _si_1[4096];
     snprintf(_si_1, 4096, "pact_Result_%s_str _r;", type_name);
     pact_emit_line(strdup(_si_1));
+    pact_emit_line("pact_json_clear();");
+    pact_emit_line("int64_t _root = pact_json_parse(input);");
+    pact_emit_line("if (_root < 0) {");
+    cg_indent = (cg_indent + 1);
     pact_emit_line("_r.tag = 1;");
-    pact_emit_line("_r.err = \"not implemented\";");
+    pact_emit_line("_r.err = \"JSON parse error\";");
+    pact_emit_line("return _r;");
+    cg_indent = (cg_indent - 1);
+    pact_emit_line("}");
+    if ((is_data == 0)) {
+        pact_emit_line("const char* _str = pact_json_as_str(_root);");
+        int64_t i = 0;
+        int64_t tag = 0;
+        while ((i < pact_list_len(enum_variants))) {
+            pact_EnumVariant _ub2 = *(pact_EnumVariant*)pact_list_get(enum_variants, i);
+            const pact_EnumVariant evar = _ub2;
+            if ((evar.enum_idx == eidx)) {
+                if ((tag == 0)) {
+                    char _si_3[4096];
+                    snprintf(_si_3, 4096, "if (pact_str_eq(_str, \"%s\")) {", evar.name);
+                    pact_emit_line(strdup(_si_3));
+                } else {
+                    char _si_4[4096];
+                    snprintf(_si_4, 4096, "} else if (pact_str_eq(_str, \"%s\")) {", evar.name);
+                    pact_emit_line(strdup(_si_4));
+                }
+                cg_indent = (cg_indent + 1);
+                pact_emit_line("_r.tag = 0;");
+                char _si_5[4096];
+                snprintf(_si_5, 4096, "_r.ok = pact_%s_%s;", type_name, evar.name);
+                pact_emit_line(strdup(_si_5));
+                cg_indent = (cg_indent - 1);
+                tag = (tag + 1);
+            }
+            i = (i + 1);
+        }
+        pact_emit_line("} else {");
+        cg_indent = (cg_indent + 1);
+        pact_emit_line("_r.tag = 1;");
+        pact_emit_line("_r.err = \"unknown enum variant\";");
+        cg_indent = (cg_indent - 1);
+        pact_emit_line("}");
+    } else {
+        pact_emit_line("int64_t _type_node = pact_json_get(_root, \"type\");");
+        pact_emit_line("if (_type_node < 0) {");
+        cg_indent = (cg_indent + 1);
+        pact_emit_line("_r.tag = 1;");
+        pact_emit_line("_r.err = \"missing type discriminator\";");
+        pact_emit_line("return _r;");
+        cg_indent = (cg_indent - 1);
+        pact_emit_line("}");
+        pact_emit_line("const char* _disc = pact_json_as_str(_type_node);");
+        char _si_6[4096];
+        snprintf(_si_6, 4096, "pact_%s _val;", type_name);
+        pact_emit_line(strdup(_si_6));
+        int64_t i = 0;
+        int64_t tag = 0;
+        int64_t first = 1;
+        while ((i < pact_list_len(enum_variants))) {
+            pact_EnumVariant _ub7 = *(pact_EnumVariant*)pact_list_get(enum_variants, i);
+            const pact_EnumVariant evar = _ub7;
+            if ((evar.enum_idx == eidx)) {
+                if ((first == 1)) {
+                    char _si_8[4096];
+                    snprintf(_si_8, 4096, "if (pact_str_eq(_disc, \"%s\")) {", evar.name);
+                    pact_emit_line(strdup(_si_8));
+                    first = 0;
+                } else {
+                    char _si_9[4096];
+                    snprintf(_si_9, 4096, "} else if (pact_str_eq(_disc, \"%s\")) {", evar.name);
+                    pact_emit_line(strdup(_si_9));
+                }
+                cg_indent = (cg_indent + 1);
+                char _si_10[4096];
+                snprintf(_si_10, 4096, "_val.tag = %lld;", (long long)tag);
+                pact_emit_line(strdup(_si_10));
+                if ((evar.field_count > 0)) {
+                    const int64_t vidx = i;
+                    int64_t fi = 0;
+                    while ((fi < evar.field_count)) {
+                        const char* fname = pact_get_variant_field_name(vidx, fi);
+                        const char* ftype_str = pact_get_variant_field_type_str(vidx, fi);
+                        const int64_t fct = pact_type_from_name(ftype_str);
+                        pact_emit_line("{");
+                        cg_indent = (cg_indent + 1);
+                        char _si_11[4096];
+                        snprintf(_si_11, 4096, "int64_t _fv = pact_json_get(_root, \"%s\");", fname);
+                        pact_emit_line(strdup(_si_11));
+                        if ((fct == CT_STRING)) {
+                            char _si_12[4096];
+                            snprintf(_si_12, 4096, "_val.data.%s.%s = pact_json_as_str(_fv);", evar.name, fname);
+                            pact_emit_line(strdup(_si_12));
+                        } else if ((fct == CT_INT)) {
+                            char _si_13[4096];
+                            snprintf(_si_13, 4096, "_val.data.%s.%s = pact_json_as_int(_fv);", evar.name, fname);
+                            pact_emit_line(strdup(_si_13));
+                        } else {
+                            if ((fct == CT_FLOAT)) {
+                                char _si_14[4096];
+                                snprintf(_si_14, 4096, "_val.data.%s.%s = pact_json_as_float(_fv);", evar.name, fname);
+                                pact_emit_line(strdup(_si_14));
+                            } else if ((fct == CT_BOOL)) {
+                                char _si_15[4096];
+                                snprintf(_si_15, 4096, "_val.data.%s.%s = pact_json_as_bool(_fv);", evar.name, fname);
+                                pact_emit_line(strdup(_si_15));
+                            } else {
+                                pact_emit_line("// unsupported variant field type");
+                            }
+                        }
+                        cg_indent = (cg_indent - 1);
+                        pact_emit_line("}");
+                        fi = (fi + 1);
+                    }
+                }
+                cg_indent = (cg_indent - 1);
+                tag = (tag + 1);
+            }
+            i = (i + 1);
+        }
+        pact_emit_line("} else {");
+        cg_indent = (cg_indent + 1);
+        pact_emit_line("_r.tag = 1;");
+        pact_emit_line("_r.err = \"unknown enum variant\";");
+        pact_emit_line("return _r;");
+        cg_indent = (cg_indent - 1);
+        pact_emit_line("}");
+        pact_emit_line("_r.tag = 0;");
+        pact_emit_line("_r.ok = _val;");
+    }
     pact_emit_line("return _r;");
     cg_indent = (cg_indent - 1);
     pact_emit_line("}");

@@ -378,12 +378,116 @@ fn emit_enum_from_json(type_name: Str) ! Codegen.Emit {
         emit_json_extern_decls()
         deser_externs_emitted = 1
     }
-    // Placeholder — implemented in Task 8
+    let eidx = get_enum_reg_idx(type_name)
+    if eidx == -1 { return }
+    let is_data = is_data_enum(type_name)
+
     emit_line("pact_Result_{type_name}_str pact_{type_name}_from_json(const char* input) \{")
     cg_indent = cg_indent + 1
     emit_line("pact_Result_{type_name}_str _r;")
+    emit_line("pact_json_clear();")
+    emit_line("int64_t _root = pact_json_parse(input);")
+    emit_line("if (_root < 0) \{")
+    cg_indent = cg_indent + 1
     emit_line("_r.tag = 1;")
-    emit_line("_r.err = \"not implemented\";")
+    emit_line("_r.err = \"JSON parse error\";")
+    emit_line("return _r;")
+    cg_indent = cg_indent - 1
+    emit_line("}")
+
+    if is_data == 0 {
+        emit_line("const char* _str = pact_json_as_str(_root);")
+        let mut i = 0
+        let mut tag = 0
+        while i < enum_variants.len() {
+            let evar = enum_variants.get(i)
+            if evar.enum_idx == eidx {
+                if tag == 0 {
+                    emit_line("if (pact_str_eq(_str, \"{evar.name}\")) \{")
+                } else {
+                    emit_line("} else if (pact_str_eq(_str, \"{evar.name}\")) \{")
+                }
+                cg_indent = cg_indent + 1
+                emit_line("_r.tag = 0;")
+                emit_line("_r.ok = pact_{type_name}_{evar.name};")
+                cg_indent = cg_indent - 1
+                tag = tag + 1
+            }
+            i = i + 1
+        }
+        emit_line("} else \{")
+        cg_indent = cg_indent + 1
+        emit_line("_r.tag = 1;")
+        emit_line("_r.err = \"unknown enum variant\";")
+        cg_indent = cg_indent - 1
+        emit_line("}")
+    } else {
+        emit_line("int64_t _type_node = pact_json_get(_root, \"type\");")
+        emit_line("if (_type_node < 0) \{")
+        cg_indent = cg_indent + 1
+        emit_line("_r.tag = 1;")
+        emit_line("_r.err = \"missing type discriminator\";")
+        emit_line("return _r;")
+        cg_indent = cg_indent - 1
+        emit_line("}")
+        emit_line("const char* _disc = pact_json_as_str(_type_node);")
+        emit_line("pact_{type_name} _val;")
+        let mut i = 0
+        let mut tag = 0
+        let mut first = 1
+        while i < enum_variants.len() {
+            let evar = enum_variants.get(i)
+            if evar.enum_idx == eidx {
+                if first == 1 {
+                    emit_line("if (pact_str_eq(_disc, \"{evar.name}\")) \{")
+                    first = 0
+                } else {
+                    emit_line("} else if (pact_str_eq(_disc, \"{evar.name}\")) \{")
+                }
+                cg_indent = cg_indent + 1
+                emit_line("_val.tag = {tag};")
+                if evar.field_count > 0 {
+                    let vidx = i
+                    let mut fi = 0
+                    while fi < evar.field_count {
+                        let fname = get_variant_field_name(vidx, fi)
+                        let ftype_str = get_variant_field_type_str(vidx, fi)
+                        let fct = type_from_name(ftype_str)
+                        emit_line("\{")
+                        cg_indent = cg_indent + 1
+                        emit_line("int64_t _fv = pact_json_get(_root, \"{fname}\");")
+                        if fct == CT_STRING {
+                            emit_line("_val.data.{evar.name}.{fname} = pact_json_as_str(_fv);")
+                        } else if fct == CT_INT {
+                            emit_line("_val.data.{evar.name}.{fname} = pact_json_as_int(_fv);")
+                        } else if fct == CT_FLOAT {
+                            emit_line("_val.data.{evar.name}.{fname} = pact_json_as_float(_fv);")
+                        } else if fct == CT_BOOL {
+                            emit_line("_val.data.{evar.name}.{fname} = pact_json_as_bool(_fv);")
+                        } else {
+                            emit_line("// unsupported variant field type")
+                        }
+                        cg_indent = cg_indent - 1
+                        emit_line("}")
+                        fi = fi + 1
+                    }
+                }
+                cg_indent = cg_indent - 1
+                tag = tag + 1
+            }
+            i = i + 1
+        }
+        emit_line("} else \{")
+        cg_indent = cg_indent + 1
+        emit_line("_r.tag = 1;")
+        emit_line("_r.err = \"unknown enum variant\";")
+        emit_line("return _r;")
+        cg_indent = cg_indent - 1
+        emit_line("}")
+        emit_line("_r.tag = 0;")
+        emit_line("_r.ok = _val;")
+    }
+
     emit_line("return _r;")
     cg_indent = cg_indent - 1
     emit_line("}")

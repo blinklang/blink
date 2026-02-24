@@ -947,6 +947,9 @@ pub fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
     cg_let_target_name = saved_let_target_name
     let val_str = expr_result_str
     let val_type = expr_result_type
+    if val_type == CT_RESULT {
+        enum_type = ""
+    }
     let name = np_name.get(node)
     let is_mut = np_is_mut.get(node)
     set_var(name, val_type, is_mut)
