@@ -161,6 +161,27 @@ Source: `ai` (Claude) | `human` | `both`
 - **Context:** HTTP server module used `handler` as a function parameter name (e.g. `fn server_route(srv, method, pattern, handler)`)
 - **Description:** `handler` is a keyword (`TokenKind.Handler`). When used as a parameter name, `expect_value(TokenKind.Ident)` detects the error and emits `KeywordAsIdentifier` but continues parsing. The real problem: when `handler` later appears in expression context (e.g. `route_handlers.push(handler)`), `parse_primary()` sees the `Handler` token and dispatches to `parse_handler_expr()`, which expects `handler EffectName { fn... }` syntax. It consumes tokens looking for `}`, eating the rest of the file, then crashes on out-of-bounds token access. Fixed by checking lookahead in `parse_primary()` — only dispatch to `parse_handler_expr()` if the next token is an Ident (the effect name). Otherwise emit `KeywordAsIdentifier` error and treat as a plain identifier. Also added EOF guard to `parse_block()` while loop.
 
+### 2026-02-24 — Formatter drops @derive annotations from type definitions
+- **Category:** `tooling`
+- **Severity:** `annoying`
+- **Source:** `ai`
+- **Context:** Implementing `@derive(Serialize, Deserialize)` for JSON codegen (#44)
+- **Description:** The formatter does not preserve `@derive(...)` annotations on type definitions. Formatted output loses the annotation entirely, so the formatted code no longer compiles (methods like `to_json()` become undefined). All test files using `@derive` had to be added to `fmt_skip` in the CI script. This is part of a broader issue where the formatter drops all annotations on type definitions.
+
+### 2026-02-24 — `void _if_N` generated for second+ if-statement inside match arm
+- **Category:** `codegen`
+- **Severity:** `annoying`
+- **Source:** `ai`
+- **Context:** Writing tests for `@derive(Deserialize)` — multiple if-statements inside `Ok(v) =>` arm
+- **Description:** Inside a match arm, the first `if` statement works correctly, but subsequent `if` statements generate `void _if_N;` temporaries in C (to store the if-expression result), which is invalid C. Workaround: extract logic into a separate function so each function body has at most one if inside the match arm, or restructure to a single if/else chain. Root cause: the if-expression result type inference defaults to `CT_VOID` inside match arm scope.
+
+### 2026-02-24 — `infer_enum_from_node` misidentifies Result-returning method calls as enum constructors
+- **Category:** `codegen`
+- **Severity:** `annoying`
+- **Source:** `ai`
+- **Context:** `let s = Shape.from_json(...)` where Shape is a data enum and from_json returns Result
+- **Description:** `infer_enum_from_node` checks if a MethodCall's object is an enum type name, and if so returns that enum name. This causes `let` bindings of `Type.from_json(...)` (which returns `Result[Type, Str]`) to be registered as enum variables via `var_enums`, which then makes `match s` take the data-enum scrutinee path instead of the Result path. Fixed by clearing `enum_type` when `val_type == CT_RESULT` after expression evaluation.
+
 ### 2026-02-24 — Closure param name shadows outer `let mut` — codegen emits wrong variable
 - **Category:** `codegen`
 - **Severity:** `annoying`
