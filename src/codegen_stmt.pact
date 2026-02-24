@@ -1994,7 +1994,12 @@ pub fn emit_struct_typedef(td_node: Int) ! Codegen.Emit {
         let type_ann_node = np_value.get(f)
         if type_ann_node != -1 {
             let type_name = np_name.get(type_ann_node)
-            if type_name == name {
+            if type_name == "Fn" {
+                emit_line("pact_closure* {fname};")
+                sf_entries.push(StructFieldEntry { struct_name: name, field_name: fname, field_type: CT_CLOSURE, stype: "" })
+                let sig = build_closure_sig_from_type_ann(type_ann_node)
+                sf_closure_sigs.push(StructFieldClosureSig { struct_name: name, field_name: fname, sig: sig })
+            } else if type_name == name {
                 emit_line("int64_t {fname};")
                 sf_entries.push(StructFieldEntry { struct_name: name, field_name: fname, field_type: CT_INT, stype: "" })
             } else if is_struct_type(type_name) != 0 {

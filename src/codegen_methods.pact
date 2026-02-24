@@ -1632,6 +1632,58 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
         return
     }
 
+    // Closure field dispatch: struct.closure_field(args)
+    if struct_type != "" {
+        let cls_field_type = get_struct_field_type(struct_type, method)
+        if cls_field_type == CT_CLOSURE {
+            let cls_sig = get_struct_field_closure_sig(struct_type, method)
+            if cls_sig != "" {
+                let cls_ptr = "{obj_str}.{method}"
+                let args_sl = np_args.get(node)
+                let mut args_str = cls_ptr
+                if args_sl != -1 {
+                    let mut i = 0
+                    while i < sublist_length(args_sl) {
+                        args_str = args_str.concat(", ")
+                        emit_expr(sublist_get(args_sl, i))
+                        args_str = args_str.concat(expr_result_str)
+                        i = i + 1
+                    }
+                }
+                expr_result_str = "(({cls_sig}){cls_ptr}->fn_ptr)({args_str})"
+                let mut ret_end = 0
+                while ret_end < cls_sig.len() && cls_sig.char_at(ret_end) != 40 {
+                    ret_end = ret_end + 1
+                }
+                let ret_part = cls_sig.substring(0, ret_end)
+                if ret_part == "int64_t" {
+                    expr_result_type = CT_INT
+                } else if ret_part == "double" {
+                    expr_result_type = CT_FLOAT
+                } else if ret_part == "const char*" {
+                    expr_result_type = CT_STRING
+                } else if ret_part == "int" {
+                    expr_result_type = CT_BOOL
+                } else if ret_part.starts_with("pact_") {
+                    let sname = ret_part.substring(5, ret_part.len() - 5)
+                    if is_struct_type(sname) != 0 {
+                        let tmp = fresh_temp("_cls_ret_")
+                        emit_line("{ret_part} {tmp} = (({cls_sig}){cls_ptr}->fn_ptr)({args_str});")
+                        set_var_struct(tmp, sname)
+                        set_var(tmp, CT_VOID, 0)
+                        expr_result_str = tmp
+                        expr_result_type = CT_VOID
+                    } else {
+                        expr_result_type = CT_VOID
+                    }
+                } else {
+                    expr_result_type = CT_VOID
+                }
+                return
+            }
+        }
+    }
+
     // Generic fallback — emit diagnostic and produce safe placeholder
     diag_error_at("UnresolvedMethod", "E0505", "unresolved method '.{method}' called on variable in '{cg_current_fn_name}'", node, "")
     emit_line("/* unresolved: .{method} */")

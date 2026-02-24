@@ -53,6 +53,7 @@ pub fn iter_from_source(obj_str: Str, obj_type: Int) ! Codegen.Emit {
 
 pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
     let kind = np_kind.get(node)
+    expr_closure_sig = ""
 
     if kind == NodeKind.IntLit {
         let s = np_str_val.get(node)
@@ -214,6 +215,13 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
             let fa_stype = get_struct_field_stype(struct_type, fa_field)
             if fa_stype != "" {
                 set_var_struct(expr_result_str, fa_stype)
+            }
+            if fa_type == CT_CLOSURE {
+                let cls_sig = get_struct_field_closure_sig(struct_type, fa_field)
+                if cls_sig != "" {
+                    set_var_closure(expr_result_str, cls_sig)
+                    expr_closure_sig = cls_sig
+                }
             }
         }
         expr_result_type = fa_type
@@ -1192,21 +1200,64 @@ pub fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
     }
     emit_expr(func_node)
     let func_str = expr_result_str
+    let func_cls_sig = expr_closure_sig
     let args_sl = np_args.get(node)
     let mut args_str = ""
-    if args_sl != -1 {
-        let mut i = 0
-        while i < sublist_length(args_sl) {
-            if i > 0 {
+    if func_cls_sig != "" {
+        args_str = func_str
+        if args_sl != -1 {
+            let mut i = 0
+            while i < sublist_length(args_sl) {
                 args_str = args_str.concat(", ")
+                emit_expr(sublist_get(args_sl, i))
+                args_str = args_str.concat(expr_result_str)
+                i = i + 1
             }
-            emit_expr(sublist_get(args_sl, i))
-            args_str = args_str.concat(expr_result_str)
-            i = i + 1
         }
+        expr_result_str = "(({func_cls_sig}){func_str}->fn_ptr)({args_str})"
+        let mut ret_end = 0
+        while ret_end < func_cls_sig.len() && func_cls_sig.char_at(ret_end) != 40 {
+            ret_end = ret_end + 1
+        }
+        let ret_part = func_cls_sig.substring(0, ret_end)
+        if ret_part == "int64_t" {
+            expr_result_type = CT_INT
+        } else if ret_part == "double" {
+            expr_result_type = CT_FLOAT
+        } else if ret_part == "const char*" {
+            expr_result_type = CT_STRING
+        } else if ret_part == "int" {
+            expr_result_type = CT_BOOL
+        } else if ret_part.starts_with("pact_") {
+            let sname = ret_part.substring(5, ret_part.len() - 5)
+            if is_struct_type(sname) != 0 {
+                let tmp = fresh_temp("_cls_ret_")
+                emit_line("{ret_part} {tmp} = (({func_cls_sig}){func_str}->fn_ptr)({args_str});")
+                set_var_struct(tmp, sname)
+                set_var(tmp, CT_VOID, 0)
+                expr_result_str = tmp
+                expr_result_type = CT_VOID
+            } else {
+                expr_result_type = CT_VOID
+            }
+        } else {
+            expr_result_type = CT_VOID
+        }
+    } else {
+        if args_sl != -1 {
+            let mut i = 0
+            while i < sublist_length(args_sl) {
+                if i > 0 {
+                    args_str = args_str.concat(", ")
+                }
+                emit_expr(sublist_get(args_sl, i))
+                args_str = args_str.concat(expr_result_str)
+                i = i + 1
+            }
+        }
+        expr_result_str = "{func_str}({args_str})"
+        expr_result_type = CT_VOID
     }
-    expr_result_str = "{func_str}({args_str})"
-    expr_result_type = CT_VOID
 }
 
 pub fn escape_c_string(s: Str) -> Str {

@@ -152,6 +152,13 @@ type StructFieldEntry {
 }
 pub let mut sf_entries: List[StructFieldEntry] = []
 
+type StructFieldClosureSig {
+    struct_name: Str
+    field_name: Str
+    sig: Str
+}
+pub let mut sf_closure_sigs: List[StructFieldClosureSig] = []
+
 // Closure-typed variable tracking: (name) -> C function pointer signature
 type VarClosureEntry {
     name: Str
@@ -1168,6 +1175,18 @@ pub fn get_var_closure_sig(name: Str) -> Str {
     ""
 }
 
+pub fn get_struct_field_closure_sig(struct_name: Str, field_name: Str) -> Str {
+    let mut i = 0
+    while i < sf_closure_sigs.len() {
+        let e = sf_closure_sigs.get(i)
+        if e.struct_name == struct_name && e.field_name == field_name {
+            return e.sig
+        }
+        i = i + 1
+    }
+    ""
+}
+
 pub fn build_closure_sig_from_type_ann(ta: Int) -> Str {
     let ret_name = np_return_type.get(ta)
     let ret_type = type_from_name(ret_name)
@@ -1189,7 +1208,13 @@ pub fn build_closure_sig_from_type_ann(ta: Int) -> Str {
             i = i + 1
         }
     }
-    "{c_type_str(ret_type)}(*)({sig_params})"
+    let mut ret_str = c_type_str(ret_type)
+    if is_struct_type(ret_name) != 0 {
+        ret_str = "pact_{ret_name}"
+    } else if is_enum_type(ret_name) != 0 {
+        ret_str = "pact_{ret_name}"
+    }
+    "{ret_str}(*)({sig_params})"
 }
 
 pub fn is_generic_fn(name: Str) -> Int {
