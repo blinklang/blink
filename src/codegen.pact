@@ -126,6 +126,7 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
     reg_fn("unix_socket_listen", CT_INT)
     reg_fn("unix_socket_connect", CT_INT)
     reg_fn("unix_socket_accept", CT_INT)
+    reg_fn("unix_socket_accept_timeout", CT_INT)
     reg_fn("unix_socket_close", CT_VOID)
     reg_fn("socket_read_line", CT_STRING)
     reg_fn("socket_write", CT_VOID)

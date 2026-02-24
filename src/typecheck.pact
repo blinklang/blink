@@ -793,6 +793,7 @@ pub fn is_builtin_fn(name: Str) -> Int {
     if name == "unix_socket_listen" { return 1 }
     if name == "unix_socket_connect" { return 1 }
     if name == "unix_socket_accept" { return 1 }
+    if name == "unix_socket_accept_timeout" { return 1 }
     if name == "unix_socket_close" { return 1 }
     if name == "socket_read_line" { return 1 }
     if name == "socket_write" { return 1 }
@@ -822,6 +823,7 @@ pub fn get_builtin_fn_ret(name: Str) -> Int {
     if name == "unix_socket_listen" { return TYPE_INT }
     if name == "unix_socket_connect" { return TYPE_INT }
     if name == "unix_socket_accept" { return TYPE_INT }
+    if name == "unix_socket_accept_timeout" { return TYPE_INT }
     if name == "unix_socket_close" { return TYPE_VOID }
     if name == "socket_read_line" { return TYPE_STR }
     if name == "socket_write" { return TYPE_VOID }

@@ -61,6 +61,37 @@ fn strip_extension(filename: Str) -> Str {
     return filename
 }
 
+fn find_daemon_sock_from(start_dir: Str) -> Str {
+    let first = path_join(start_dir, ".pact/daemon.sock")
+    if file_exists(first) {
+        return first
+    }
+    let mut prev = start_dir
+    let mut dir = path_dirname(start_dir)
+    let mut depth = 0
+    while depth < 10 {
+        if dir == prev {
+            return ""
+        }
+        let candidate = path_join(dir, ".pact/daemon.sock")
+        if file_exists(candidate) {
+            return candidate
+        }
+        prev = dir
+        dir = path_dirname(dir)
+        depth = depth + 1
+    }
+    return ""
+}
+
+fn find_daemon_sock() -> Str {
+    // CWD-relative check is the common case
+    if file_exists(".pact/daemon.sock") {
+        return ".pact/daemon.sock"
+    }
+    return ""
+}
+
 fn detect_async(source: Str) -> Int {
     if source.contains("async.spawn") || source.contains("async.scope") {
         return 1
@@ -755,28 +786,43 @@ fn main() {
             exit(1)
         }
     } else if command == "check" {
-        let pactc = "build/pactc"
-        if !file_exists(pactc) {
-            io.println("error: compiler not found at build/pactc")
-            io.println("  run: ./bootstrap/bootstrap.sh")
-            return
-        }
-        let mut compile_cmd = "{pactc} {source_path} {c_path} --check-only"
-        if format_flag != "" {
-            compile_cmd = "{compile_cmd} --format {format_flag}"
-        }
-        let rc = shell_exec(compile_cmd)
-        if rc == 0 {
-            if json_output != 0 {
-                io.println("\{\"status\":\"ok\",\"file\":\"{source_path}\"}")
-            } else {
-                io.println("ok: {source_path}")
+        // Try daemon first if running
+        let mut daemon_used = 0
+        let sock = find_daemon_sock()
+        if sock != "" {
+            let fd = unix_socket_connect(sock)
+            if fd >= 0 {
+                socket_write(fd, "\{\"type\":\"check\"}\n")
+                let response = socket_read_line(fd)
+                unix_socket_close(fd)
+                daemon_used = 1
+                io.println(response)
             }
-        } else {
-            if json_output != 0 {
-                io.println("\{\"status\":\"error\",\"file\":\"{source_path}\"}")
+        }
+        if daemon_used == 0 {
+            let pactc = "build/pactc"
+            if !file_exists(pactc) {
+                io.println("error: compiler not found at build/pactc")
+                io.println("  run: ./bootstrap/bootstrap.sh")
+                return
+            }
+            let mut compile_cmd = "{pactc} {source_path} {c_path} --check-only"
+            if format_flag != "" {
+                compile_cmd = "{compile_cmd} --format {format_flag}"
+            }
+            let rc = shell_exec(compile_cmd)
+            if rc == 0 {
+                if json_output != 0 {
+                    io.println("\{\"status\":\"ok\",\"file\":\"{source_path}\"}")
+                } else {
+                    io.println("ok: {source_path}")
+                }
             } else {
-                io.println("error: check failed")
+                if json_output != 0 {
+                    io.println("\{\"status\":\"error\",\"file\":\"{source_path}\"}")
+                } else {
+                    io.println("error: check failed")
+                }
             }
         }
     } else if command == "fmt" {
@@ -1072,8 +1118,8 @@ fn main() {
         if query_layer == "" {
             query_layer = "signature"
         }
-        let sock_path = ".pact/daemon.sock"
-        let sock_fd = unix_socket_connect(sock_path)
+        let sock_path = find_daemon_sock()
+        let sock_fd = if sock_path != "" { unix_socket_connect(sock_path) } else { -1 }
         if sock_fd >= 0 {
             let mut request = ""
             if query_fn != "" {
@@ -1156,7 +1202,11 @@ fn main() {
             io.println("Daemon starting on .pact/daemon.sock")
             daemon_start(actual_root, daemon_source)
         } else if sub_cmd == "status" {
-            let sock_path = ".pact/daemon.sock"
+            let sock_path = find_daemon_sock()
+            if sock_path == "" {
+                io.println("error: daemon not running (no .pact/daemon.sock found)")
+                exit(1)
+            }
             let fd = unix_socket_connect(sock_path)
             if fd < 0 {
                 io.println("error: daemon not running (could not connect to {sock_path})")
@@ -1167,7 +1217,11 @@ fn main() {
             unix_socket_close(fd)
             io.println(response)
         } else if sub_cmd == "stop" {
-            let sock_path = ".pact/daemon.sock"
+            let sock_path = find_daemon_sock()
+            if sock_path == "" {
+                io.println("error: daemon not running (no .pact/daemon.sock found)")
+                exit(1)
+            }
             let fd = unix_socket_connect(sock_path)
             if fd < 0 {
                 io.println("error: daemon not running (could not connect to {sock_path})")

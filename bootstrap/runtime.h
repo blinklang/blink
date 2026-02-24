@@ -25,6 +25,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <sys/time.h>
 #include <strings.h>
 
@@ -553,6 +554,18 @@ static int64_t pact_unix_socket_accept(int64_t listen_fd) {
     return (int64_t)client;
 }
 
+static int64_t pact_unix_socket_accept_timeout(int64_t listen_fd, int64_t timeout_ms) {
+    struct pollfd pfd;
+    pfd.fd = (int)listen_fd;
+    pfd.events = POLLIN;
+    pfd.revents = 0;
+    int rc = poll(&pfd, 1, (int)timeout_ms);
+    if (rc <= 0) return -1;
+    int client = accept((int)listen_fd, NULL, NULL);
+    if (client < 0) return -1;
+    return (int64_t)client;
+}
+
 static void pact_unix_socket_close(int64_t fd) {
     close((int)fd);
 }
@@ -897,21 +910,74 @@ static pact_rand_vtable pact_rand_vtable_default = {
     pact_rand_default_bytes
 };
 
-/* ── Time ───────────────────────────────────────────────────────────── */
-typedef struct {
-    int64_t (*read)(void);
-    void    (*sleep)(int64_t ms);
-} pact_time_vtable;
+/* ── Duration / Instant value types ─────────────────────────────────── */
 
-static int64_t pact_time_default_read(void) {
-    /* seconds since epoch — good enough for bootstrap */
-    return (int64_t)time(NULL);
+typedef struct { int64_t nanos; } pact_duration;
+typedef struct { int64_t nanos; } pact_instant;
+
+/* Duration constructors */
+static pact_duration pact_duration_nanos(int64_t n)   { return (pact_duration){.nanos = n}; }
+static pact_duration pact_duration_ms(int64_t ms)     { return (pact_duration){.nanos = ms * 1000000LL}; }
+static pact_duration pact_duration_seconds(int64_t s) { return (pact_duration){.nanos = s * 1000000000LL}; }
+static pact_duration pact_duration_minutes(int64_t m) { return (pact_duration){.nanos = m * 60LL * 1000000000LL}; }
+static pact_duration pact_duration_hours(int64_t h)   { return (pact_duration){.nanos = h * 3600LL * 1000000000LL}; }
+
+/* Duration conversions */
+static int64_t pact_duration_to_nanos(pact_duration d)   { return d.nanos; }
+static int64_t pact_duration_to_ms(pact_duration d)      { return d.nanos / 1000000LL; }
+static int64_t pact_duration_to_seconds(pact_duration d) { return d.nanos / 1000000000LL; }
+
+/* Duration arithmetic */
+static pact_duration pact_duration_add(pact_duration a, pact_duration b) { return (pact_duration){.nanos = a.nanos + b.nanos}; }
+static pact_duration pact_duration_sub(pact_duration a, pact_duration b) { return (pact_duration){.nanos = a.nanos - b.nanos}; }
+static pact_duration pact_duration_scale(pact_duration d, int64_t factor) { return (pact_duration){.nanos = d.nanos * factor}; }
+
+/* Duration query */
+static int64_t pact_duration_is_zero(pact_duration d) { return d.nanos == 0 ? 1 : 0; }
+
+/* Instant conversions */
+static int64_t pact_instant_to_unix_secs(pact_instant i) { return i.nanos / 1000000000LL; }
+static int64_t pact_instant_to_unix_ms(pact_instant i)   { return i.nanos / 1000000LL; }
+
+static const char* pact_instant_to_rfc3339(pact_instant i) {
+    time_t epoch_secs = (time_t)(i.nanos / 1000000000LL);
+    struct tm utc;
+    gmtime_r(&epoch_secs, &utc);
+    char* buf = (char*)pact_alloc(32);
+    snprintf(buf, 32, "%04d-%02d-%02dT%02d:%02d:%02dZ",
+             utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday,
+             utc.tm_hour, utc.tm_min, utc.tm_sec);
+    return buf;
 }
 
-static void pact_time_default_sleep(int64_t ms) {
+/* Instant arithmetic */
+static pact_instant pact_instant_add(pact_instant i, pact_duration d) { return (pact_instant){.nanos = i.nanos + d.nanos}; }
+static pact_duration pact_instant_since(pact_instant later, pact_instant earlier) { return (pact_duration){.nanos = later.nanos - earlier.nanos}; }
+
+static pact_duration pact_instant_elapsed(pact_instant then) {
     struct timespec ts;
-    ts.tv_sec  = (time_t)(ms / 1000);
-    ts.tv_nsec = (long)((ms % 1000) * 1000000L);
+    clock_gettime(CLOCK_REALTIME, &ts);
+    int64_t now_nanos = (int64_t)ts.tv_sec * 1000000000LL + (int64_t)ts.tv_nsec;
+    return (pact_duration){.nanos = now_nanos - then.nanos};
+}
+
+/* ── Time ───────────────────────────────────────────────────────────── */
+typedef struct {
+    pact_instant (*read)(void);
+    void         (*sleep)(pact_duration d);
+} pact_time_vtable;
+
+static pact_instant pact_time_default_read(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (pact_instant){.nanos = (int64_t)ts.tv_sec * 1000000000LL + (int64_t)ts.tv_nsec};
+}
+
+static void pact_time_default_sleep(pact_duration d) {
+    int64_t ns = d.nanos;
+    struct timespec ts;
+    ts.tv_sec  = (time_t)(ns / 1000000000LL);
+    ts.tv_nsec = (long)(ns % 1000000000LL);
     nanosleep(&ts, NULL);
 }
 

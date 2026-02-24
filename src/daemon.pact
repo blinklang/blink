@@ -286,8 +286,10 @@ fn daemon_handle_stop() -> Str {
 
 fn daemon_loop() ! Daemon.Serve, Lex.Tokenize, Parse, TypeCheck, Diag.Report {
     while daemon_running == 1 {
-        let client_fd = unix_socket_accept(daemon_socket_fd)
+        let client_fd = unix_socket_accept_timeout(daemon_socket_fd, 500)
         if client_fd < 0 {
+            // Timeout — poll files for changes between requests
+            fw_poll()
             continue
         }
 
@@ -309,11 +311,6 @@ fn daemon_loop() ! Daemon.Serve, Lex.Tokenize, Parse, TypeCheck, Diag.Report {
 
         socket_write(client_fd, response.concat("\n"))
         unix_socket_close(client_fd)
-
-        // Background poll between requests
-        if daemon_running == 1 {
-            fw_poll()
-        }
     }
 }
 
