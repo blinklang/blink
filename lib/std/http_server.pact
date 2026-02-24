@@ -2,7 +2,7 @@
 
 import std.http_types
 
-// ── Route and Server types ───────────────────────────────────────────
+// ── Route, Hook, and Server types ───────────────────────────────────
 
 pub type Route {
     method: Str
@@ -10,10 +10,21 @@ pub type Route {
     callback: fn(Request) -> Response
 }
 
+pub type Hook {
+    name: Str
+    process: fn(Request) -> Request
+}
+
+pub type ErrorHandler {
+    on_error: fn(Request, Str) -> Response
+}
+
 pub type Server {
     host: Str
     port: Int
     routes: List[Route]
+    before_hooks: List[Hook]
+    error_handler: ErrorHandler
 }
 
 // ── Path param storage (per-request, reset each match) ──────────────
@@ -25,7 +36,13 @@ pub let mut param_values: List[Str] = []
 
 pub fn server_new(host: Str, port: Int) -> Server {
     let routes: List[Route] = []
-    Server { host: host, port: port, routes: routes }
+    let hooks: List[Hook] = []
+    let err_handler = ErrorHandler {
+        on_error: fn(req: Request, msg: Str) -> Response {
+            response_internal_error("Internal Server Error: {msg}")
+        }
+    }
+    Server { host: host, port: port, routes: routes, before_hooks: hooks, error_handler: err_handler }
 }
 
 pub fn server_route(srv: Server, method: Str, pattern: Str, cb: fn(Request) -> Response) -> Server {
@@ -48,6 +65,19 @@ pub fn server_put(srv: Server, pattern: Str, cb: fn(Request) -> Response) -> Ser
 
 pub fn server_delete(srv: Server, pattern: Str, cb: fn(Request) -> Response) -> Server {
     server_route(srv, "DELETE", pattern, cb)
+}
+
+// ── Middleware API ──────────────────────────────────────────────────
+
+pub fn server_use(srv: Server, name: Str, hook: fn(Request) -> Request) -> Server {
+    let h = Hook { name: name, process: hook }
+    srv.before_hooks.push(h)
+    srv
+}
+
+pub fn server_on_error(srv: Server, err_fn: fn(Request, Str) -> Response) -> Server {
+    let eh = ErrorHandler { on_error: err_fn }
+    Server { host: srv.host, port: srv.port, routes: srv.routes, before_hooks: srv.before_hooks, error_handler: eh }
 }
 
 // ── Route matching ──────────────────────────────────────────────────
@@ -189,13 +219,29 @@ pub fn server_serve(srv: Server) ! Net.Listen, IO {
         } else {
             let raw = net.read(conn, 8192)
             if raw.len() > 0 {
-                let req = parse_request(raw)
+                let mut req = parse_request(raw)
+
+                // Apply before hooks
+                let mut hi = 0
+                while hi < srv.before_hooks.len() {
+                    let hook = srv.before_hooks.get(hi)
+                    req = hook.process(req)
+                    hi = hi + 1
+                }
+
+                // Match and dispatch
                 let idx = match_route(srv, req.method, req.url)
                 let mut resp = response_not_found("Not Found")
                 if idx >= 0 {
                     let matched_route = srv.routes.get(idx)
                     resp = matched_route.callback(req)
                 }
+
+                // Error recovery: invalid response status triggers error handler
+                if resp.status <= 0 {
+                    resp = srv.error_handler.on_error(req, "handler returned invalid response")
+                }
+
                 let text = format_response(resp)
                 net.write(conn, text)
             }

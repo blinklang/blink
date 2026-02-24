@@ -161,3 +161,10 @@ Source: `ai` (Claude) | `human` | `both`
 - **Context:** HTTP server module used `handler` as a function parameter name (e.g. `fn server_route(srv, method, pattern, handler)`)
 - **Description:** `handler` is a keyword (`TokenKind.Handler`). When used as a parameter name, `expect_value(TokenKind.Ident)` detects the error and emits `KeywordAsIdentifier` but continues parsing. The real problem: when `handler` later appears in expression context (e.g. `route_handlers.push(handler)`), `parse_primary()` sees the `Handler` token and dispatches to `parse_handler_expr()`, which expects `handler EffectName { fn... }` syntax. It consumes tokens looking for `}`, eating the rest of the file, then crashes on out-of-bounds token access. Fixed by checking lookahead in `parse_primary()` — only dispatch to `parse_handler_expr()` if the next token is an Ident (the effect name). Otherwise emit `KeywordAsIdentifier` error and treat as a plain identifier. Also added EOF guard to `parse_block()` while loop.
 
+### 2026-02-24 — Closure param name shadows outer `let mut` — codegen emits wrong variable
+- **Category:** `codegen`
+- **Severity:** `annoying`
+- **Source:** `ai`
+- **Context:** Defining closures with a parameter name that matches an outer `let mut` variable (e.g. outer `let mut req = ...` + closure `fn(req: Request) -> Request { ... }`)
+- **Description:** When a closure parameter has the same name as an outer mutable variable, the codegen incorrectly treats references to the parameter inside the closure body as captures of the outer mutable cell (`*req_cell`). The generated C dereferences a `void*` pointer instead of using the closure's own parameter. Workaround: use a different parameter name in the closure to avoid shadowing (e.g. `fn(r: Request) -> Request { ... }`). The codegen's capture analysis should check whether a name resolves to a closure parameter before looking at outer scope mutable variables.
+

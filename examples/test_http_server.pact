@@ -15,6 +15,7 @@ fn test_server_construction() {
     check(srv.host == "127.0.0.1", "host set")
     check(srv.port == 8080, "port set")
     check(srv.routes.len() == 0, "no routes initially")
+    check(srv.before_hooks.len() == 0, "no hooks initially")
 }
 
 fn test_route_registration() {
