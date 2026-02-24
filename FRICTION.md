@@ -133,10 +133,11 @@ Source: `ai` (Claude) | `human` | `both`
 - **Context:** Writing JSON object literals in strings like `"\{\"name\":\"Alice\"}"`
 - **Description:** Lexer handles `\{` (line 830 of lexer.pact) to escape literal braces from string interpolation, but `\}` falls through to unknown-escape handler which outputs `\` and drops the `}`. This produces corrupt C strings. Workaround: `}` doesn't need escaping since the interpolation parser tracks brace depth and `}` in string mode is just a regular character. However, symmetry suggests `\}` should also work as an escape sequence producing a literal `}`.
 
-### 2026-02-14 — `List[Float]` broken in codegen
+### 2026-02-14 — `List[Float]` broken in codegen — ✅ RESOLVED
 - **Category:** `codegen`
 - **Severity:** `blocking`
 - **Source:** `ai`
+- **Resolved:** 2026-02-24 — heap boxing implemented (`pact_alloc(sizeof(double))` on push, `*(double*)` dereference on get). Tests `test_list_float.pact` and `test_float_boxing.pact` pass.
 - **Context:** JSON parser needed `List[Float]` for storing parsed float values
 - **Description:** All lists use `void*` internally. `list.push(float_val)` emits `pact_list_push(list, (void*)float_val)` which fails — can't cast `double` to `void*`. Ints work via `(void*)(intptr_t)` cast, strings are already pointers, but floats need boxing (allocate a `double*` and store). The codegen's push handler (codegen_expr.pact ~line 1558) has special cases for INT and struct types but not FLOAT. Workaround: store floats as `List[Str]` and parse on retrieval.
 
