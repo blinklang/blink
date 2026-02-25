@@ -134,5 +134,8 @@ The self-hosting compiler (`src/codegen_types.pact`, `src/codegen_expr.pact`) cu
 | E0508 | QuestionMarkResultInNonResult | Not yet implemented — requires type checker |
 | E0509 | QuestionMarkOptionInNonOption | Not yet implemented — requires type checker |
 | E0512 | QuestionMarkErrorMismatch | Not yet implemented — requires type checker |
-| E0504 | UndefinedFunction | `typecheck.pact` — name resolution phase 1 |
-| E0505 | UnresolvedMethod | `typecheck.pact` — name resolution phase 2 (type-aware) |
+| E0504 | UndefinedFunction | `typecheck.pact` — name resolution + `codegen_expr.pact` — codegen |
+| E0505 | UnresolvedMethod | `codegen_methods.pact` — method dispatch (codegen phase) |
+| E0506 | UndefinedVariable | `typecheck.pact` — name resolution |
+| E0507 | UnknownType | `typecheck.pact` — name resolution |
+| W0501 | UnknownMethod | `typecheck.pact` — name resolution (warning, may be false positive for struct field closures) |

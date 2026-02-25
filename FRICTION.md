@@ -40,19 +40,19 @@ Source: `ai` (Claude) | `human` | `both`
 - **Context:** Implementing HOF support (pact-222) and immutable captures (pact-218)
 - **Description:** Closures are emitted as `const pact_closure*` variables (since the binding is immutable `let`), but calling through `fn_ptr` requires casting and passing `self` as the first argument — which expects `pact_closure*` (non-const). Every single closure call site generates a `-Wdiscarded-qualifiers` warning. Similarly, `pact_list_len`/`pact_list_get` in runtime.h don't accept `const pact_list*`, so any list stored as `const` triggers the same warning. The bootstrap output has dozens of these. Fix options: (a) make runtime.h functions accept `const` pointers where they don't mutate, (b) emit closures as non-const `pact_closure*`, (c) generate explicit casts at call sites to suppress warnings.
 
-### 2026-02-09 — Calling an undefined function produces no error
+### 2026-02-09 — ~~Calling an undefined function produces no error~~ RESOLVED
 - **Category:** `spec-gap`
-- **Severity:** `annoying`
+- **Severity:** ~~`annoying`~~ **resolved**
 - **Source:** `ai`
 - **Context:** Implementing closure capture helpers; `capture_cast_expr` called `int_to_string()` which doesn't exist
-- **Description:** The compiler has no notion of "defined functions" at compile time. If you call a function that was never declared, the compiler happily emits a C call to it — you only discover the mistake when `gcc` reports an implicit function declaration. This applies to all function calls, not just built-ins. A Pact program with `foo_bar_baz()` will compile to C without complaint. The spec assumes functions are checked, but there's no symbol table or name resolution pass. Fix: add a name resolution phase that checks all function calls against known declarations (top-level `fn`, imported names, built-ins) before codegen. This would catch typos, missing imports, and nonexistent functions at the Pact level instead of deferring to C.
+- **Description:** ~~The compiler has no notion of "defined functions" at compile time.~~ Fixed: `resolve_names()` in `src/typecheck.pact` (Phase 1 of typechecking) now catches undefined functions (E0303) and undefined variables (E0302) with structured diagnostics before codegen runs.
 
-### 2026-02-09 — Method call fallback silently generates invalid C identifiers
+### 2026-02-09 — ~~Method call fallback silently generates invalid C identifiers~~ PARTIALLY RESOLVED
 - **Category:** `spec-gap`
-- **Severity:** `annoying`
+- **Severity:** ~~`annoying`~~ **downgraded to `papercut`**
 - **Source:** `ai`
 - **Context:** Implementing Into trait; `x.into()` generated `x_into()` as a C function call
-- **Description:** When `emit_method_call` encounters a method it doesn't recognize (not a built-in, not a known trait impl), it falls through to a generic handler that concatenates `{obj}_{method}({args})`. So `x.into()` becomes `x_into(x)`, `foo.whatever()` becomes `foo_whatever(foo)` — no error, no warning, just nonsense C code. The return type defaults to `CT_VOID`, so variables assigned from these calls get declared as `const void y`, which is also invalid C. The fallback should either (a) emit an error for unresolved methods, or (b) at minimum not silently produce garbage. This is the method-call equivalent of the undefined function problem above — the compiler trusts that all names resolve and defers validation to `gcc`.
+- **Description:** ~~Silently generates garbage C.~~ Now emits `W0501: unknown method 'nonexistent_method' — may fail at compile time` warning. Still a warning rather than a hard error, and the fallback codegen still runs, but at least the developer is informed. Could be upgraded to an error in future.
 
 ### 2026-02-09 — Generic list element types not propagated through function returns
 - **Category:** `types`
@@ -189,4 +189,11 @@ Source: `ai` (Claude) | `human` | `both`
 - **Source:** `ai`
 - **Context:** Defining closures with a parameter name that matches an outer `let mut` variable (e.g. outer `let mut req = ...` + closure `fn(req: Request) -> Request { ... }`)
 - **Description:** When a closure parameter has the same name as an outer mutable variable, the codegen incorrectly treats references to the parameter inside the closure body as captures of the outer mutable cell (`*req_cell`). The generated C dereferences a `void*` pointer instead of using the closure's own parameter. Workaround: use a different parameter name in the closure to avoid shadowing (e.g. `fn(r: Request) -> Request { ... }`). The codegen's capture analysis should check whether a name resolves to a closure parameter before looking at outer scope mutable variables.
+
+### 2026-02-24 — Built-in function return types unknown to name resolver
+- **Category:** `types`
+- **Severity:** `annoying`
+- **Source:** `both`
+- **Context:** Writing `test_name_resolution.pact`; `let output = shell_exec(...)` then `output.contains("...")` fails with `UnresolvedMethod`
+- **Description:** The name resolver doesn't know the return types of built-in functions (`shell_exec`, `read_file`, etc.). When their return value is stored in a variable and a method is called on it (e.g. `.contains()`, `.trim()`), the resolver can't verify the method exists because it doesn't know the variable is a `Str`. Even explicit type annotations (`let output: Str = shell_exec(...)`) don't help — the resolver doesn't use them for method validation. Workaround: avoid method calls on built-in return values, or delegate to shell commands. Fix: the resolver needs a type registry for built-in functions so it can propagate return types to local variables.
 

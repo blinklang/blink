@@ -6773,7 +6773,7 @@ void pact_nr_check_type_ref(const char* name) {
     pact_list_push(tc_errors, (void*)strdup(_si_0));
     char _si_1[4096];
     snprintf(_si_1, 4096, "unknown type '%s'", name);
-    pact_diag_error_no_loc("UnknownType", "E0301", strdup(_si_1), "");
+    pact_diag_error_no_loc("UnknownType", "E0507", strdup(_si_1), "");
 }
 
 void pact_nr_check_node(int64_t node) {
@@ -6843,7 +6843,7 @@ void pact_nr_check_node(int64_t node) {
         pact_list_push(tc_errors, (void*)strdup(_si_0));
         char _si_1[4096];
         snprintf(_si_1, 4096, "undefined variable '%s'", name);
-        pact_diag_error_at("UndefinedVariable", "E0302", strdup(_si_1), node, "");
+        pact_diag_error_at("UndefinedVariable", "E0506", strdup(_si_1), node, "");
         return;
     }
     if ((((kind == pact_NodeKind_IntLit) || (kind == pact_NodeKind_FloatLit)) || (kind == pact_NodeKind_BoolLit))) {
@@ -6878,7 +6878,7 @@ void pact_nr_check_node(int64_t node) {
                     pact_list_push(tc_errors, (void*)strdup(_si_2));
                     char _si_3[4096];
                     snprintf(_si_3, 4096, "undefined function '%s'", fn_name);
-                    pact_diag_error_at("UndefinedFunction", "E0303", strdup(_si_3), node, "");
+                    pact_diag_error_at("UndefinedFunction", "E0504", strdup(_si_3), node, "");
                 }
             } else {
                 pact_nr_check_node(callee);
@@ -6900,7 +6900,7 @@ void pact_nr_check_node(int64_t node) {
             pact_nr_check_node(obj);
         }
         const char* method_name = (const char*)pact_list_get(np_method, node);
-        if ((pact_is_builtin_method(method_name) == 0)) {
+        if (((pact_is_builtin_method(method_name) == 0) && (pact_is_variant_name(method_name) == 0))) {
             int64_t found_in_impl = 0;
             int64_t mi = 0;
             while ((mi < pact_list_len(nr_impl_method_names))) {
