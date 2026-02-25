@@ -121,7 +121,7 @@ fn add_dep(name: Str, version: Str, git_url: Str, git_tag: Str, dep_path: Str, i
 
 // ── Load package metadata from parsed toml ───────────────────────
 
-fn load_package() -> Int {
+pub fn load_package() -> Int {
     if toml_has("package.name") == 0 {
         io.println("error: [package] section missing required field 'name'")
         return 1
@@ -196,7 +196,7 @@ fn collect_dep_names(prefix: Str) {
 
 // ── Load dependencies from a section ─────────────────────────────
 
-fn load_deps(prefix: Str, is_dev: Int) -> Int {
+pub fn load_deps(prefix: Str, is_dev: Int) -> Int {
     collect_dep_names(prefix)
 
     let mut i = 0
@@ -294,7 +294,7 @@ fn find_dep_type(key: Str) -> Int {
 
 // ── Load capabilities ────────────────────────────────────────────
 
-fn load_capabilities() {
+pub fn load_capabilities() {
     if toml_has("capabilities.required") == 1 {
         let count = toml_get_array_len("capabilities.required")
         let mut i = 0
@@ -317,7 +317,7 @@ fn load_capabilities() {
 
 // ── Load alternatives ────────────────────────────────────────────
 
-fn load_alternatives() {
+pub fn load_alternatives() {
     let prefix = "alternatives."
     let prefix_len = prefix.len()
     let mut i = 0

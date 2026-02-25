@@ -693,6 +693,18 @@ pub fn is_user_effect_handle_name(name: Str) -> Int {
     0
 }
 
+// ── Import visibility ───────────────────────────────────────────────
+
+let mut nr_private_imports: Map[Str, Str] = Map()
+let mut nr_current_module: Str = ""
+
+fn is_private_access(name: Str) -> Int {
+    if nr_private_imports.has(name) == 0 { return 0 }
+    let mods = nr_private_imports.get(name)
+    if mods.contains("|{nr_current_module}|") != 0 { return 0 }
+    1
+}
+
 // ── Name resolution scope ───────────────────────────────────────────
 
 pub let mut nr_scope_names: List[Str] = []
@@ -1013,7 +1025,101 @@ pub fn resolve_names(program: Int) ! TypeCheck.Resolve, Diag.Report {
     nr_scope_frames = []
     nr_impl_type_names = []
     nr_impl_method_names = []
+    nr_private_imports = Map()
     nr_push_scope()
+
+    // Build private import set: imported non-pub fns, types, lets
+    // A name is private only if no pub definition exists for it
+    let mut nr_pub_names: Map[Str, Int] = Map()
+
+    // First pass: collect all pub imported names
+    let fns_sl_priv = np_params.get(program)
+    if fns_sl_priv != -1 {
+        let mut i = 0
+        while i < sublist_length(fns_sl_priv) {
+            let fn_node = sublist_get(fns_sl_priv, i)
+            if np_module.get(fn_node) != "" && np_is_pub.get(fn_node) != 0 {
+                nr_pub_names.set(np_name.get(fn_node), 1)
+            }
+            i = i + 1
+        }
+    }
+    let types_sl_priv = np_fields.get(program)
+    if types_sl_priv != -1 {
+        let mut i = 0
+        while i < sublist_length(types_sl_priv) {
+            let td = sublist_get(types_sl_priv, i)
+            if np_module.get(td) != "" && np_is_pub.get(td) != 0 {
+                nr_pub_names.set(np_name.get(td), 1)
+            }
+            i = i + 1
+        }
+    }
+    let lets_sl_priv = np_stmts.get(program)
+    if lets_sl_priv != -1 {
+        let mut i = 0
+        while i < sublist_length(lets_sl_priv) {
+            let l = sublist_get(lets_sl_priv, i)
+            if np_module.get(l) != "" && np_is_pub.get(l) != 0 {
+                nr_pub_names.set(np_name.get(l), 1)
+            }
+            i = i + 1
+        }
+    }
+
+    // Second pass: register private names (skip if a pub version exists)
+    // Value format: "|mod1|mod2|" so contains("|modX|") works for same-module check
+    if fns_sl_priv != -1 {
+        let mut i = 0
+        while i < sublist_length(fns_sl_priv) {
+            let fn_node = sublist_get(fns_sl_priv, i)
+            let fn_name = np_name.get(fn_node)
+            let mod_name = np_module.get(fn_node)
+            if mod_name != "" && np_is_pub.get(fn_node) == 0 && nr_pub_names.has(fn_name) == 0 {
+                if nr_private_imports.has(fn_name) != 0 {
+                    let prev = nr_private_imports.get(fn_name)
+                    nr_private_imports.set(fn_name, "{prev}{mod_name}|")
+                } else {
+                    nr_private_imports.set(fn_name, "|{mod_name}|")
+                }
+            }
+            i = i + 1
+        }
+    }
+    if types_sl_priv != -1 {
+        let mut i = 0
+        while i < sublist_length(types_sl_priv) {
+            let td = sublist_get(types_sl_priv, i)
+            let td_name = np_name.get(td)
+            let mod_name = np_module.get(td)
+            if mod_name != "" && np_is_pub.get(td) == 0 && nr_pub_names.has(td_name) == 0 {
+                if nr_private_imports.has(td_name) != 0 {
+                    let prev = nr_private_imports.get(td_name)
+                    nr_private_imports.set(td_name, "{prev}{mod_name}|")
+                } else {
+                    nr_private_imports.set(td_name, "|{mod_name}|")
+                }
+            }
+            i = i + 1
+        }
+    }
+    if lets_sl_priv != -1 {
+        let mut i = 0
+        while i < sublist_length(lets_sl_priv) {
+            let l = sublist_get(lets_sl_priv, i)
+            let l_name = np_name.get(l)
+            let mod_name = np_module.get(l)
+            if mod_name != "" && np_is_pub.get(l) == 0 && nr_pub_names.has(l_name) == 0 {
+                if nr_private_imports.has(l_name) != 0 {
+                    let prev = nr_private_imports.get(l_name)
+                    nr_private_imports.set(l_name, "{prev}{mod_name}|")
+                } else {
+                    nr_private_imports.set(l_name, "|{mod_name}|")
+                }
+            }
+            i = i + 1
+        }
+    }
 
     // Register all top-level let binding names
     let lets_sl = np_stmts.get(program)
@@ -1062,6 +1168,7 @@ pub fn resolve_names(program: Int) ! TypeCheck.Resolve, Diag.Report {
         let mut i = 0
         while i < sublist_length(fns_sl) {
             let fn_node = sublist_get(fns_sl, i)
+            nr_current_module = np_module.get(fn_node)
             nr_check_fn(fn_node)
             i = i + 1
         }
@@ -1072,6 +1179,7 @@ pub fn resolve_names(program: Int) ! TypeCheck.Resolve, Diag.Report {
         let mut i = 0
         while i < sublist_length(impls_sl) {
             let im = sublist_get(impls_sl, i)
+            nr_current_module = np_module.get(im)
             let methods_sl = np_methods.get(im)
             if methods_sl != -1 {
                 let mut j = 0
@@ -1166,6 +1274,11 @@ pub fn nr_check_node(node: Int) ! TypeCheck.Resolve, Diag.Report {
         if name == "true" || name == "false" || name == "None" { return }
         if name == "io" || name == "fs" || name == "net" || name == "db" || name == "env" || name == "time" || name == "async" || name == "channel" || name == "default" { return }
         if is_user_effect_handle_name(name) != 0 { return }
+        if is_private_access(name) != 0 {
+            tc_errors.push("cannot access private item '{name}'")
+            diag_error_at("PrivateItemAccess", "E1003", "cannot access private item '{name}' from another module", node, "mark the item as 'pub' in its module")
+            return
+        }
         if nr_is_defined(name) != 0 { return }
         if is_variant_name(name) != 0 { return }
         if is_builtin_fn(name) != 0 { return }
@@ -1203,7 +1316,10 @@ pub fn nr_check_node(node: Int) ! TypeCheck.Resolve, Diag.Report {
             let callee_kind = np_kind.get(callee)
             if callee_kind == NodeKind.Ident {
                 let fn_name = np_name.get(callee)
-                if nr_is_defined(fn_name) == 0 && is_builtin_fn(fn_name) == 0 && is_variant_name(fn_name) == 0 && is_known_type(fn_name) == 0 {
+                if is_private_access(fn_name) != 0 {
+                    tc_errors.push("cannot access private function '{fn_name}'")
+                    diag_error_at("PrivateItemAccess", "E1003", "cannot access private function '{fn_name}' from another module", node, "mark the function as 'pub' in its module")
+                } else if nr_is_defined(fn_name) == 0 && is_builtin_fn(fn_name) == 0 && is_variant_name(fn_name) == 0 && is_known_type(fn_name) == 0 {
                     tc_errors.push("undefined function '{fn_name}'")
                     diag_error_at("UndefinedFunction", "E0504", "undefined function '{fn_name}'", node, "")
                 }

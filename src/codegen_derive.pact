@@ -52,16 +52,16 @@ pub fn emit_derive_forward_decls() ! Codegen.Emit {
     while i < derive_serialize_types.len() {
         let tname = derive_serialize_types.get(i)
         if is_enum_type(tname) != 0 {
-            emit_line("const char* pact_{tname}_to_json(pact_{tname} self);")
+            emit_line("const char* {c_type_c_name(tname)}_to_json({c_type_c_name(tname)} self);")
         } else {
-            emit_line("const char* pact_{tname}_to_json(pact_{tname} self);")
+            emit_line("const char* {c_type_c_name(tname)}_to_json({c_type_c_name(tname)} self);")
         }
         i = i + 1
     }
     let mut j = 0
     while j < derive_deserialize_types.len() {
         let tname = derive_deserialize_types.get(j)
-        emit_line("pact_Result_{tname}_str pact_{tname}_from_json(const char* input);")
+        emit_line("pact_Result_{tname}_str {c_type_c_name(tname)}_from_json(const char* input);")
         j = j + 1
     }
 }
@@ -90,7 +90,7 @@ pub fn emit_derive_fn_defs() ! Codegen.Emit {
 }
 
 fn emit_struct_to_json(type_name: Str) ! Codegen.Emit {
-    emit_line("const char* pact_{type_name}_to_json(pact_{type_name} self) \{")
+    emit_line("const char* {c_type_c_name(type_name)}_to_json({c_type_c_name(type_name)} self) \{")
     cg_indent = cg_indent + 1
     emit_line("const char* result = \"\{\";")
     let mut field_idx = 0
@@ -116,7 +116,9 @@ fn emit_struct_to_json(type_name: Str) ! Codegen.Emit {
 
 fn emit_field_serialize(access: Str, field_type: Int, stype: Str, struct_name: Str, field_name: Str) ! Codegen.Emit {
     if field_type == CT_STRING {
-        emit_line("result = pact_str_concat(result, pact_json_escape_str({access}));")
+        emit_line("result = pact_str_concat(result, \"\\\"\");")
+        emit_line("result = pact_str_concat(result, {c_fn_name("escape_json_str")}({access}));")
+        emit_line("result = pact_str_concat(result, \"\\\"\");")
     } else if field_type == CT_INT {
         emit_line("result = pact_str_concat(result, pact_int_to_str({access}));")
     } else if field_type == CT_FLOAT {
@@ -125,7 +127,7 @@ fn emit_field_serialize(access: Str, field_type: Int, stype: Str, struct_name: S
         emit_line("result = pact_str_concat(result, {access} ? \"true\" : \"false\");")
     } else if field_type == CT_VOID && stype != "" {
         if has_derive_method(stype, "to_json") != 0 {
-            emit_line("result = pact_str_concat(result, pact_{stype}_to_json({access}));")
+            emit_line("result = pact_str_concat(result, {c_type_c_name(stype)}_to_json({access}));")
         } else {
             emit_line("result = pact_str_concat(result, \"null\");")
         }
@@ -147,14 +149,16 @@ fn emit_list_serialize(access: Str, struct_name: Str, field_name: Str) ! Codegen
     cg_indent = cg_indent + 1
     emit_line("if (_i > 0) result = pact_str_concat(result, \",\");")
     if elem_struct != "" {
-        emit_line("pact_{elem_struct} _elem = *(pact_{elem_struct}*)pact_list_get({access}, _i);")
+        emit_line("{c_type_c_name(elem_struct)} _elem = *({c_type_c_name(elem_struct)}*)pact_list_get({access}, _i);")
         if has_derive_method(elem_struct, "to_json") != 0 {
-            emit_line("result = pact_str_concat(result, pact_{elem_struct}_to_json(_elem));")
+            emit_line("result = pact_str_concat(result, {c_type_c_name(elem_struct)}_to_json(_elem));")
         } else {
             emit_line("result = pact_str_concat(result, \"null\");")
         }
     } else if elem_type == CT_STRING {
-        emit_line("result = pact_str_concat(result, pact_json_escape_str((const char*)pact_list_get({access}, _i)));")
+        emit_line("result = pact_str_concat(result, \"\\\"\");")
+        emit_line("result = pact_str_concat(result, {c_fn_name("escape_json_str")}((const char*)pact_list_get({access}, _i)));")
+        emit_line("result = pact_str_concat(result, \"\\\"\");")
     } else if elem_type == CT_INT {
         emit_line("result = pact_str_concat(result, pact_int_to_str((int64_t)(intptr_t)pact_list_get({access}, _i)));")
     } else if elem_type == CT_FLOAT {
@@ -189,7 +193,7 @@ fn emit_enum_to_json(type_name: Str) ! Codegen.Emit {
 
     if is_data == 0 {
         // Simple enum: return quoted variant name
-        emit_line("const char* pact_{type_name}_to_json(pact_{type_name} self) \{")
+        emit_line("const char* {c_type_c_name(type_name)}_to_json({c_type_c_name(type_name)} self) \{")
         cg_indent = cg_indent + 1
         emit_line("switch (self) \{")
         cg_indent = cg_indent + 1
@@ -197,7 +201,7 @@ fn emit_enum_to_json(type_name: Str) ! Codegen.Emit {
         while i < enum_variants.len() {
             let evar = enum_variants.get(i)
             if evar.enum_idx == eidx {
-                emit_line("case pact_{type_name}_{evar.name}: return \"\\\"{evar.name}\\\"\";")
+                emit_line("case {c_type_c_name(type_name)}_{evar.name}: return \"\\\"{evar.name}\\\"\";")
             }
             i = i + 1
         }
@@ -209,7 +213,7 @@ fn emit_enum_to_json(type_name: Str) ! Codegen.Emit {
         emit_line("")
     } else {
         // Data enum: internally tagged JSON object
-        emit_line("const char* pact_{type_name}_to_json(pact_{type_name} self) \{")
+        emit_line("const char* {c_type_c_name(type_name)}_to_json({c_type_c_name(type_name)} self) \{")
         cg_indent = cg_indent + 1
         emit_line("const char* result = \"\";")
         emit_line("switch (self.tag) \{")
@@ -232,7 +236,9 @@ fn emit_enum_to_json(type_name: Str) ! Codegen.Emit {
                         emit_line("result = pact_str_concat(result, \",\\\"{fname}\\\":\");")
                         let access = "self.data.{evar.name}.{fname}"
                         if fct == CT_STRING {
-                            emit_line("result = pact_str_concat(result, pact_json_escape_str({access}));")
+                            emit_line("result = pact_str_concat(result, \"\\\"\");")
+                            emit_line("result = pact_str_concat(result, {c_fn_name("escape_json_str")}({access}));")
+                            emit_line("result = pact_str_concat(result, \"\\\"\");")
                         } else if fct == CT_INT {
                             emit_line("result = pact_str_concat(result, pact_int_to_str({access}));")
                         } else if fct == CT_FLOAT {
@@ -240,7 +246,7 @@ fn emit_enum_to_json(type_name: Str) ! Codegen.Emit {
                         } else if fct == CT_BOOL {
                             emit_line("result = pact_str_concat(result, {access} ? \"true\" : \"false\");")
                         } else if is_struct_type(ftype_str) != 0 && has_derive_method(ftype_str, "to_json") != 0 {
-                            emit_line("result = pact_str_concat(result, pact_{ftype_str}_to_json({access}));")
+                            emit_line("result = pact_str_concat(result, {c_type_c_name(ftype_str)}_to_json({access}));")
                         } else {
                             emit_line("result = pact_str_concat(result, \"null\");")
                         }
@@ -266,31 +272,31 @@ fn emit_enum_to_json(type_name: Str) ! Codegen.Emit {
 
 fn emit_json_extern_decls() ! Codegen.Emit {
     emit_line("// JSON parser extern declarations for derive(Deserialize)")
-    emit_line("extern void pact_json_clear(void);")
-    emit_line("extern int64_t pact_json_parse(const char* input);")
-    emit_line("extern int64_t pact_json_get(int64_t idx, const char* key);")
-    emit_line("extern int64_t pact_json_type(int64_t idx);")
-    emit_line("extern const char* pact_json_as_str(int64_t idx);")
-    emit_line("extern int64_t pact_json_as_int(int64_t idx);")
-    emit_line("extern double pact_json_as_float(int64_t idx);")
-    emit_line("extern int64_t pact_json_as_bool(int64_t idx);")
-    emit_line("extern int64_t pact_json_at(int64_t idx, int64_t i);")
-    emit_line("extern int64_t pact_json_len(int64_t idx);")
+    emit_line("extern void {c_fn_name("json_clear")}(void);")
+    emit_line("extern int64_t {c_fn_name("json_parse")}(const char* input);")
+    emit_line("extern int64_t {c_fn_name("json_get")}(int64_t idx, const char* key);")
+    emit_line("extern int64_t {c_fn_name("json_type")}(int64_t idx);")
+    emit_line("extern const char* {c_fn_name("json_as_str")}(int64_t idx);")
+    emit_line("extern int64_t {c_fn_name("json_as_int")}(int64_t idx);")
+    emit_line("extern double {c_fn_name("json_as_float")}(int64_t idx);")
+    emit_line("extern int64_t {c_fn_name("json_as_bool")}(int64_t idx);")
+    emit_line("extern int64_t {c_fn_name("json_at")}(int64_t idx, int64_t i);")
+    emit_line("extern int64_t {c_fn_name("json_len")}(int64_t idx);")
     emit_line("")
 }
 
-let mut deser_externs_emitted = 0
+pub let mut deser_externs_emitted = 0
 
 fn emit_struct_from_json(type_name: Str) ! Codegen.Emit {
     if deser_externs_emitted == 0 {
         emit_json_extern_decls()
         deser_externs_emitted = 1
     }
-    emit_line("pact_Result_{type_name}_str pact_{type_name}_from_json(const char* input) \{")
+    emit_line("pact_Result_{type_name}_str {c_type_c_name(type_name)}_from_json(const char* input) \{")
     cg_indent = cg_indent + 1
     emit_line("pact_Result_{type_name}_str _r;")
-    emit_line("pact_json_clear();")
-    emit_line("int64_t _root = pact_json_parse(input);")
+    emit_line("{c_fn_name("json_clear")}();")
+    emit_line("int64_t _root = {c_fn_name("json_parse")}(input);")
     emit_line("if (_root < 0) \{")
     cg_indent = cg_indent + 1
     emit_line("_r.tag = 1;")
@@ -298,7 +304,7 @@ fn emit_struct_from_json(type_name: Str) ! Codegen.Emit {
     emit_line("return _r;")
     cg_indent = cg_indent - 1
     emit_line("}")
-    emit_line("pact_{type_name} _val;")
+    emit_line("{c_type_c_name(type_name)} _val;")
     // Iterate struct fields
     let mut i = 0
     while i < sf_entries.len() {
@@ -306,7 +312,7 @@ fn emit_struct_from_json(type_name: Str) ! Codegen.Emit {
         if sf.struct_name == type_name {
             emit_line("\{")
             cg_indent = cg_indent + 1
-            emit_line("int64_t _f = pact_json_get(_root, \"{sf.field_name}\");")
+            emit_line("int64_t _f = {c_fn_name("json_get")}(_root, \"{sf.field_name}\");")
             emit_deser_field("_val.{sf.field_name}", "_f", sf.field_type, sf.stype, type_name, sf.field_name)
             cg_indent = cg_indent - 1
             emit_line("}")
@@ -323,13 +329,13 @@ fn emit_struct_from_json(type_name: Str) ! Codegen.Emit {
 
 fn emit_deser_field(target: Str, node_var: Str, field_type: Int, stype: Str, struct_name: Str, field_name: Str) ! Codegen.Emit {
     if field_type == CT_STRING {
-        emit_line("{target} = pact_json_as_str({node_var});")
+        emit_line("{target} = {c_fn_name("json_as_str")}({node_var});")
     } else if field_type == CT_INT {
-        emit_line("{target} = pact_json_as_int({node_var});")
+        emit_line("{target} = {c_fn_name("json_as_int")}({node_var});")
     } else if field_type == CT_FLOAT {
-        emit_line("{target} = pact_json_as_float({node_var});")
+        emit_line("{target} = {c_fn_name("json_as_float")}({node_var});")
     } else if field_type == CT_BOOL {
-        emit_line("{target} = pact_json_as_bool({node_var});")
+        emit_line("{target} = {c_fn_name("json_as_bool")}({node_var});")
     } else if field_type == CT_VOID && stype != "" {
         if has_derive_method(stype, "from_json") != 0 {
             emit_line("// nested deserialize: re-serialize node to string, call from_json")
@@ -352,18 +358,18 @@ fn emit_list_deserialize(target: Str, node_var: Str, struct_name: Str, field_nam
     emit_line("{target} = pact_list_new();")
     emit_line("\{")
     cg_indent = cg_indent + 1
-    emit_line("int64_t _arr_len = pact_json_len({node_var});")
+    emit_line("int64_t _arr_len = {c_fn_name("json_len")}({node_var});")
     emit_line("for (int64_t _ai = 0; _ai < _arr_len; _ai++) \{")
     cg_indent = cg_indent + 1
-    emit_line("int64_t _elem_node = pact_json_at({node_var}, _ai);")
+    emit_line("int64_t _elem_node = {c_fn_name("json_at")}({node_var}, _ai);")
     if elem_type == CT_STRING {
-        emit_line("pact_list_push_str({target}, pact_json_as_str(_elem_node));")
+        emit_line("pact_list_push_str({target}, {c_fn_name("json_as_str")}(_elem_node));")
     } else if elem_type == CT_INT {
-        emit_line("pact_list_push_int({target}, pact_json_as_int(_elem_node));")
+        emit_line("pact_list_push_int({target}, {c_fn_name("json_as_int")}(_elem_node));")
     } else if elem_type == CT_FLOAT {
-        emit_line("pact_list_push_float({target}, pact_json_as_float(_elem_node));")
+        emit_line("pact_list_push_float({target}, {c_fn_name("json_as_float")}(_elem_node));")
     } else if elem_type == CT_BOOL {
-        emit_line("pact_list_push_int({target}, pact_json_as_bool(_elem_node));")
+        emit_line("pact_list_push_int({target}, {c_fn_name("json_as_bool")}(_elem_node));")
     } else {
         emit_line("// unsupported list element type")
     }
@@ -382,11 +388,11 @@ fn emit_enum_from_json(type_name: Str) ! Codegen.Emit {
     if eidx == -1 { return }
     let is_data = is_data_enum(type_name)
 
-    emit_line("pact_Result_{type_name}_str pact_{type_name}_from_json(const char* input) \{")
+    emit_line("pact_Result_{type_name}_str {c_type_c_name(type_name)}_from_json(const char* input) \{")
     cg_indent = cg_indent + 1
     emit_line("pact_Result_{type_name}_str _r;")
-    emit_line("pact_json_clear();")
-    emit_line("int64_t _root = pact_json_parse(input);")
+    emit_line("{c_fn_name("json_clear")}();")
+    emit_line("int64_t _root = {c_fn_name("json_parse")}(input);")
     emit_line("if (_root < 0) \{")
     cg_indent = cg_indent + 1
     emit_line("_r.tag = 1;")
@@ -396,7 +402,7 @@ fn emit_enum_from_json(type_name: Str) ! Codegen.Emit {
     emit_line("}")
 
     if is_data == 0 {
-        emit_line("const char* _str = pact_json_as_str(_root);")
+        emit_line("const char* _str = {c_fn_name("json_as_str")}(_root);")
         let mut i = 0
         let mut tag = 0
         while i < enum_variants.len() {
@@ -409,7 +415,7 @@ fn emit_enum_from_json(type_name: Str) ! Codegen.Emit {
                 }
                 cg_indent = cg_indent + 1
                 emit_line("_r.tag = 0;")
-                emit_line("_r.ok = pact_{type_name}_{evar.name};")
+                emit_line("_r.ok = {c_type_c_name(type_name)}_{evar.name};")
                 cg_indent = cg_indent - 1
                 tag = tag + 1
             }
@@ -422,7 +428,7 @@ fn emit_enum_from_json(type_name: Str) ! Codegen.Emit {
         cg_indent = cg_indent - 1
         emit_line("}")
     } else {
-        emit_line("int64_t _type_node = pact_json_get(_root, \"type\");")
+        emit_line("int64_t _type_node = {c_fn_name("json_get")}(_root, \"type\");")
         emit_line("if (_type_node < 0) \{")
         cg_indent = cg_indent + 1
         emit_line("_r.tag = 1;")
@@ -430,8 +436,8 @@ fn emit_enum_from_json(type_name: Str) ! Codegen.Emit {
         emit_line("return _r;")
         cg_indent = cg_indent - 1
         emit_line("}")
-        emit_line("const char* _disc = pact_json_as_str(_type_node);")
-        emit_line("pact_{type_name} _val;")
+        emit_line("const char* _disc = {c_fn_name("json_as_str")}(_type_node);")
+        emit_line("{c_type_c_name(type_name)} _val;")
         let mut i = 0
         let mut tag = 0
         let mut first = 1
@@ -455,15 +461,15 @@ fn emit_enum_from_json(type_name: Str) ! Codegen.Emit {
                         let fct = type_from_name(ftype_str)
                         emit_line("\{")
                         cg_indent = cg_indent + 1
-                        emit_line("int64_t _fv = pact_json_get(_root, \"{fname}\");")
+                        emit_line("int64_t _fv = {c_fn_name("json_get")}(_root, \"{fname}\");")
                         if fct == CT_STRING {
-                            emit_line("_val.data.{evar.name}.{fname} = pact_json_as_str(_fv);")
+                            emit_line("_val.data.{evar.name}.{fname} = {c_fn_name("json_as_str")}(_fv);")
                         } else if fct == CT_INT {
-                            emit_line("_val.data.{evar.name}.{fname} = pact_json_as_int(_fv);")
+                            emit_line("_val.data.{evar.name}.{fname} = {c_fn_name("json_as_int")}(_fv);")
                         } else if fct == CT_FLOAT {
-                            emit_line("_val.data.{evar.name}.{fname} = pact_json_as_float(_fv);")
+                            emit_line("_val.data.{evar.name}.{fname} = {c_fn_name("json_as_float")}(_fv);")
                         } else if fct == CT_BOOL {
-                            emit_line("_val.data.{evar.name}.{fname} = pact_json_as_bool(_fv);")
+                            emit_line("_val.data.{evar.name}.{fname} = {c_fn_name("json_as_bool")}(_fv);")
                         } else {
                             emit_line("// unsupported variant field type")
                         }

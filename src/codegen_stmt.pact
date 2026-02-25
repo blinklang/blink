@@ -108,7 +108,7 @@ pub fn emit_match_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scop
         emit_expr(scrut)
         if match_scrut_enum != "" && is_data_enum(match_scrut_enum) != 0 {
             let scrut_tmp = fresh_temp("_scrut_")
-            emit_line("pact_{match_scrut_enum} {scrut_tmp} = {expr_result_str};")
+            emit_line("{c_type_c_name(match_scrut_enum)} {scrut_tmp} = {expr_result_str};")
             set_var(scrut_tmp, CT_INT, 1)
             match_scruts.push(MatchScrutEntry { str_val: scrut_tmp, scrut_type: expr_result_type })
         } else if expr_result_type == CT_RESULT || expr_result_type == CT_OPTION {
@@ -282,7 +282,7 @@ pub fn pattern_condition(pat: Int, scrut_off: Int, scrut_len: Int) -> Str {
                 let tag = get_variant_tag(enum_name, pat_name)
                 return "({match_scruts.get(scrut_off).str_val}.tag == {tag})"
             }
-            return "({match_scruts.get(scrut_off).str_val} == pact_{enum_name}_{pat_name})"
+            return "({match_scruts.get(scrut_off).str_val} == {c_type_c_name(enum_name)}_{pat_name})"
         }
         return ""
     }
@@ -320,7 +320,7 @@ pub fn pattern_condition(pat: Int, scrut_off: Int, scrut_len: Int) -> Str {
                 let tag = get_variant_tag(enum_name, variant_name)
                 return "({match_scruts.get(scrut_off).str_val}.tag == {tag})"
             }
-            return "({match_scruts.get(scrut_off).str_val} == pact_{enum_name}_{variant_name})"
+            return "({match_scruts.get(scrut_off).str_val} == {c_type_c_name(enum_name)}_{variant_name})"
         }
         let pat_name = np_name.get(pat)
         let resolved = resolve_variant(pat_name)
@@ -449,7 +449,7 @@ pub fn bind_pattern_vars(pat: Int, scrut_off: Int, scrut_len: Int) ! Codegen.Emi
                         }
                     }
                     if inner_struct != "" {
-                        emit_line("pact_{inner_struct} {bind_name} = {scrut}.{field};")
+                        emit_line("{c_type_c_name(inner_struct)} {bind_name} = {scrut}.{field};")
                         set_var(bind_name, CT_INT, 0)
                         set_var_struct(bind_name, inner_struct)
                         if is_enum_type(inner_struct) != 0 {
@@ -487,11 +487,11 @@ pub fn bind_pattern_vars(pat: Int, scrut_off: Int, scrut_len: Int) ! Codegen.Emi
                         let bind_name = np_name.get(sub_pat)
                         if bind_name != "_" {
                             if is_struct_type(field_type_name) != 0 {
-                                emit_line("pact_{field_type_name} {bind_name} = {scrut}.data.{resolved_variant}.{field_name};")
+                                emit_line("{c_type_c_name(field_type_name)} {bind_name} = {scrut}.data.{resolved_variant}.{field_name};")
                                 set_var(bind_name, CT_VOID, 0)
                                 set_var_struct(bind_name, field_type_name)
                             } else if is_enum_type(field_type_name) != 0 {
-                                emit_line("pact_{field_type_name} {bind_name} = {scrut}.data.{resolved_variant}.{field_name};")
+                                emit_line("{c_type_c_name(field_type_name)} {bind_name} = {scrut}.data.{resolved_variant}.{field_name};")
                                 set_var(bind_name, CT_INT, 0)
                                 var_enums.push(VarEnumEntry { name: bind_name, enum_type: field_type_name })
                             } else {
@@ -564,7 +564,7 @@ pub fn bind_pattern_vars(pat: Int, scrut_off: Int, scrut_len: Int) ! Codegen.Emi
         let st = match_scruts.get(scrut_off).scrut_type
         let scrut_str = match_scruts.get(scrut_off).str_val
         if match_scrut_enum != "" {
-            emit_line("pact_{match_scrut_enum} {bind_name} = {scrut_str};")
+            emit_line("{c_type_c_name(match_scrut_enum)} {bind_name} = {scrut_str};")
             set_var(bind_name, CT_INT, 1)
             var_enums.push(VarEnumEntry { name: bind_name, enum_type: match_scrut_enum })
         } else {
@@ -1084,15 +1084,15 @@ pub fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
         }
     } else if enum_type != "" {
         if is_mut != 0 {
-            emit_line("pact_{enum_type} {name} = {val_str};")
+            emit_line("{c_type_c_name(enum_type)} {name} = {val_str};")
         } else {
-            emit_line("const pact_{enum_type} {name} = {val_str};")
+            emit_line("const {c_type_c_name(enum_type)} {name} = {val_str};")
         }
     } else if struct_type != "" {
         if is_mut != 0 {
-            emit_line("pact_{struct_type} {name} = {val_str};")
+            emit_line("{c_type_c_name(struct_type)} {name} = {val_str};")
         } else {
-            emit_line("const pact_{struct_type} {name} = {val_str};")
+            emit_line("const {c_type_c_name(struct_type)} {name} = {val_str};")
         }
     } else {
         let ts = c_type_str(val_type)
@@ -1393,9 +1393,9 @@ pub fn format_params(fn_node: Int) -> Str {
         if ptype == "Fn" {
             result = result.concat("pact_closure* {pname}")
         } else if is_enum_type(ptype) != 0 {
-            result = result.concat("pact_{ptype} {pname}")
+            result = result.concat("{c_type_c_name(ptype)} {pname}")
         } else if is_struct_type(ptype) != 0 {
-            result = result.concat("pact_{ptype} {pname}")
+            result = result.concat("{c_type_c_name(ptype)} {pname}")
         } else {
             let ct = type_from_name(ptype)
             result = result.concat("{c_type_str(ct)} {pname}")
@@ -1410,7 +1410,7 @@ pub fn format_impl_params(fn_node: Int, impl_type: Str) -> Str {
     let has_self = impl_method_has_self(fn_node)
     let mut result = ""
     if has_self != 0 {
-        result = "pact_{impl_type} self"
+        result = "{c_type_c_name(impl_type)} self"
     }
     let mut first = 1
     if has_self != 0 {
@@ -1431,9 +1431,9 @@ pub fn format_impl_params(fn_node: Int, impl_type: Str) -> Str {
                 if ptype == "Fn" {
                     result = result.concat("pact_closure* {pname}")
                 } else if is_struct_type(ptype) != 0 {
-                    result = result.concat("pact_{ptype} {pname}")
+                    result = result.concat("{c_type_c_name(ptype)} {pname}")
                 } else if is_enum_type(ptype) != 0 {
-                    result = result.concat("pact_{ptype} {pname}")
+                    result = result.concat("{c_type_c_name(ptype)} {pname}")
                 } else {
                     let ct = type_from_name(ptype)
                     result = result.concat("{c_type_str(ct)} {pname}")
@@ -1462,15 +1462,15 @@ pub fn emit_impl_method_def(fn_node: Int, impl_type: Str) ! Codegen.Emit, Codege
     let enum_ret = get_fn_enum_ret(mangled)
     let mut sig = ""
     if enum_ret != "" {
-        sig = "pact_{enum_ret} pact_{mangled}({params})"
+        sig = "{c_type_c_name(enum_ret)} {c_fn_name(mangled)}({params})"
     } else if is_struct_type(ret_str) != 0 {
-        sig = "pact_{ret_str} pact_{mangled}({params})"
+        sig = "{c_type_c_name(ret_str)} {c_fn_name(mangled)}({params})"
     } else {
         let resolved = resolve_ret_type_from_ann(fn_node)
         if resolved != "" {
-            sig = "{resolved} pact_{mangled}({params})"
+            sig = "{resolved} {c_fn_name(mangled)}({params})"
         } else {
-            sig = "{c_type_str(ret_type)} pact_{mangled}({params})"
+            sig = "{c_type_str(ret_type)} {c_fn_name(mangled)}({params})"
         }
     }
 
@@ -1553,18 +1553,18 @@ pub fn emit_fn_decl(fn_node: Int) ! Codegen.Emit {
     let params = format_params(fn_node)
     let enum_ret = get_fn_enum_ret(name)
     if enum_ret != "" {
-        emit_line("pact_{enum_ret} pact_{name}({params});")
+        emit_line("{c_type_c_name(enum_ret)} {c_fn_name(name)}({params});")
     } else {
         let ret_str = np_return_type.get(fn_node)
         if is_struct_type(ret_str) != 0 {
-            emit_line("pact_{ret_str} pact_{name}({params});")
+            emit_line("{c_type_c_name(ret_str)} {c_fn_name(name)}({params});")
         } else {
             let resolved = resolve_ret_type_from_ann(fn_node)
             if resolved != "" {
-                emit_line("{resolved} pact_{name}({params});")
+                emit_line("{resolved} {c_fn_name(name)}({params});")
             } else {
                 let ret_type = type_from_name(ret_str)
-                emit_line("{c_type_str(ret_type)} pact_{name}({params});")
+                emit_line("{c_type_str(ret_type)} {c_fn_name(name)}({params});")
             }
         }
     }
@@ -1585,15 +1585,15 @@ pub fn emit_fn_def(fn_node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope
         let params = format_params(fn_node)
         let enum_ret = get_fn_enum_ret(name)
         if enum_ret != "" {
-            sig = "pact_{enum_ret} pact_{name}({params})"
+            sig = "{c_type_c_name(enum_ret)} {c_fn_name(name)}({params})"
         } else if is_struct_type(ret_str) != 0 {
-            sig = "pact_{ret_str} pact_{name}({params})"
+            sig = "{c_type_c_name(ret_str)} {c_fn_name(name)}({params})"
         } else {
             let resolved = resolve_ret_type_from_ann(fn_node)
             if resolved != "" {
-                sig = "{resolved} pact_{name}({params})"
+                sig = "{resolved} {c_fn_name(name)}({params})"
             } else {
-                sig = "{c_type_str(ret_type)} pact_{name}({params})"
+                sig = "{c_type_str(ret_type)} {c_fn_name(name)}({params})"
             }
         }
     }
@@ -1809,7 +1809,7 @@ pub fn emit_mono_struct_typedef(base_name: Str, concrete_args: Str) ! Codegen.Em
             let type_name = np_name.get(type_ann_node)
             let resolved = resolve_type_param(type_name, tparams_sl, concrete_args)
             if is_struct_type(resolved) != 0 {
-                emit_line("pact_{resolved} {fname};")
+                emit_line("{c_type_c_name(resolved)} {fname};")
                 sf_entries.push(StructFieldEntry { struct_name: c_name, field_name: fname, field_type: CT_VOID, stype: resolved })
             } else {
                 let ct = type_from_name(resolved)
@@ -1823,7 +1823,7 @@ pub fn emit_mono_struct_typedef(base_name: Str, concrete_args: Str) ! Codegen.Em
         i = i + 1
     }
     cg_indent = cg_indent - 1
-    emit_line("} pact_{c_name};")
+    emit_line("} {c_type_c_name(c_name)};")
     emit_line("")
 }
 
@@ -1869,9 +1869,9 @@ pub fn emit_mono_fn_def(fn_node: Int, concrete_args: Str) ! Codegen.Emit, Codege
                 params_c = params_c.concat(", ")
             }
             if is_struct_type(resolved_ptype) != 0 {
-                params_c = params_c.concat("pact_{resolved_ptype} {pname}")
+                params_c = params_c.concat("{c_type_c_name(resolved_ptype)} {pname}")
             } else if is_enum_type(resolved_ptype) != 0 {
-                params_c = params_c.concat("pact_{resolved_ptype} {pname}")
+                params_c = params_c.concat("{c_type_c_name(resolved_ptype)} {pname}")
             } else {
                 let ct = type_from_name(resolved_ptype)
                 params_c = params_c.concat("{c_type_str(ct)} {pname}")
@@ -1881,7 +1881,7 @@ pub fn emit_mono_fn_def(fn_node: Int, concrete_args: Str) ! Codegen.Emit, Codege
     }
 
     // Forward declaration
-    emit_line("{c_type_str(ret_type)} pact_{mangled}({params_c});")
+    emit_line("{c_type_str(ret_type)} {c_fn_name(mangled)}({params_c});")
 
     // Register params in scope
     push_scope()
@@ -1926,7 +1926,7 @@ pub fn emit_mono_fn_def(fn_node: Int, concrete_args: Str) ! Codegen.Emit, Codege
         }
     }
 
-    emit_line("{c_type_str(ret_type)} pact_{mangled}({params_c}) \{")
+    emit_line("{c_type_str(ret_type)} {c_fn_name(mangled)}({params_c}) \{")
     cg_indent = cg_indent + 1
     emit_fn_body(np_body.get(fn_node), ret_type)
     cg_indent = cg_indent - 1
@@ -2012,7 +2012,7 @@ pub fn emit_struct_typedef(td_node: Int) ! Codegen.Emit {
                 emit_line("int64_t {fname};")
                 sf_entries.push(StructFieldEntry { struct_name: name, field_name: fname, field_type: CT_INT, stype: "" })
             } else if is_struct_type(type_name) != 0 {
-                emit_line("pact_{type_name} {fname};")
+                emit_line("{c_type_c_name(type_name)} {fname};")
                 sf_entries.push(StructFieldEntry { struct_name: name, field_name: fname, field_type: CT_VOID, stype: type_name })
             } else {
                 let ct = type_from_name(type_name)
@@ -2040,7 +2040,7 @@ pub fn emit_struct_typedef(td_node: Int) ! Codegen.Emit {
         i = i + 1
     }
     cg_indent = cg_indent - 1
-    emit_line("} pact_{name};")
+    emit_line("} {c_type_c_name(name)};")
     emit_line("")
 }
 
@@ -2106,10 +2106,10 @@ pub fn emit_enum_typedef(td_node: Int) ! Codegen.Emit {
             if i > 0 {
                 variants_str = variants_str.concat(", ")
             }
-            variants_str = variants_str.concat("pact_{name}_{vname}")
+            variants_str = variants_str.concat("{c_type_c_name(name)}_{vname}")
             i = i + 1
         }
-        emit_line("typedef enum \{ {variants_str} } pact_{name};")
+        emit_line("typedef enum \{ {variants_str} } {c_type_c_name(name)};")
         emit_line("")
     } else {
         emit_line("typedef struct \{")
@@ -2134,12 +2134,12 @@ pub fn emit_enum_typedef(td_node: Int) ! Codegen.Emit {
                     if vf_type_ann != -1 {
                         let vf_type_name = np_name.get(vf_type_ann)
                         if is_struct_type(vf_type_name) != 0 {
-                            vf_c_type = "pact_{vf_type_name}"
+                            vf_c_type = "{c_type_c_name(vf_type_name)}"
                         } else if is_enum_type(vf_type_name) != 0 {
                             if is_data_enum(vf_type_name) != 0 {
-                                vf_c_type = "pact_{vf_type_name}"
+                                vf_c_type = "{c_type_c_name(vf_type_name)}"
                             } else {
-                                vf_c_type = "pact_{vf_type_name}"
+                                vf_c_type = "{c_type_c_name(vf_type_name)}"
                             }
                         } else {
                             vf_c_type = c_type_str(type_from_name(vf_type_name))
@@ -2156,13 +2156,13 @@ pub fn emit_enum_typedef(td_node: Int) ! Codegen.Emit {
         cg_indent = cg_indent - 1
         emit_line("} data;")
         cg_indent = cg_indent - 1
-        emit_line("} pact_{name};")
+        emit_line("} {c_type_c_name(name)};")
         emit_line("")
         i = 0
         while i < sublist_length(flds_sl) {
             let v = sublist_get(flds_sl, i)
             let vname = np_name.get(v)
-            emit_line("#define pact_{name}_{vname}_TAG {i}")
+            emit_line("#define {c_type_c_name(name)}_{vname}_TAG {i}")
             i = i + 1
         }
         emit_line("")

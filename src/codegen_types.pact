@@ -85,6 +85,29 @@ pub let mut emitted_iter_set: Map[Str, Int] = Map()
 pub let mut cg_closure_defs: List[Str] = []
 pub let mut cg_closure_counter: Int = 0
 
+pub let mut mod_fn_prefix: Map[Str, Str] = Map()
+pub let mut mod_type_prefix: Map[Str, Str] = Map()
+
+pub fn c_fn_name(name: Str) -> Str {
+    if mod_fn_prefix.has(name) {
+        let prefix = mod_fn_prefix.get(name)
+        if prefix != "" {
+            return "pact_{prefix}_{name}"
+        }
+    }
+    "pact_{name}"
+}
+
+pub fn c_type_c_name(name: Str) -> Str {
+    if mod_type_prefix.has(name) {
+        let prefix = mod_type_prefix.get(name)
+        if prefix != "" {
+            return "pact_{prefix}_{name}"
+        }
+    }
+    "pact_{name}"
+}
+
 // Capture analysis: per-capture info (flat list) and per-closure start/count
 type CaptureEntry {
     name: Str
@@ -1276,9 +1299,9 @@ pub fn build_closure_sig_from_type_ann(ta: Int) -> Str {
             let ename = np_name.get(elem)
             sig_params = sig_params.concat(", ")
             if is_enum_type(ename) != 0 {
-                sig_params = sig_params.concat("pact_{ename}")
+                sig_params = sig_params.concat(c_type_c_name(ename))
             } else if is_struct_type(ename) != 0 {
-                sig_params = sig_params.concat("pact_{ename}")
+                sig_params = sig_params.concat(c_type_c_name(ename))
             } else {
                 sig_params = sig_params.concat(c_type_str(type_from_name(ename)))
             }
@@ -1287,9 +1310,9 @@ pub fn build_closure_sig_from_type_ann(ta: Int) -> Str {
     }
     let mut ret_str = c_type_str(ret_type)
     if is_struct_type(ret_name) != 0 {
-        ret_str = "pact_{ret_name}"
+        ret_str = c_type_c_name(ret_name)
     } else if is_enum_type(ret_name) != 0 {
-        ret_str = "pact_{ret_name}"
+        ret_str = c_type_c_name(ret_name)
     }
     "{ret_str}(*)({sig_params})"
 }
@@ -1842,14 +1865,14 @@ pub fn emit_result_typedef(ok_t: Int, err_t: Int) ! Codegen.Emit {
 
 pub fn emit_struct_option_typedef(struct_name: Str) ! Codegen.Emit {
     let tname = "pact_Option_{struct_name}"
-    emit_line("typedef struct \{ int tag; pact_{struct_name} value; } {tname};")
+    emit_line("typedef struct \{ int tag; {c_type_c_name(struct_name)} value; } {tname};")
     emit_line("")
 }
 
 pub fn emit_struct_result_typedef(ok_tag: Str, err_tag: Str) ! Codegen.Emit {
     let tname = "pact_Result_{ok_tag}_{err_tag}"
-    let c_ok = if is_struct_type(ok_tag) != 0 || is_enum_type(ok_tag) != 0 { "pact_{ok_tag}" } else { c_type_str(type_from_name_tag(ok_tag)) }
-    let c_err = if is_struct_type(err_tag) != 0 || is_enum_type(err_tag) != 0 { "pact_{err_tag}" } else { c_type_str(type_from_name_tag(err_tag)) }
+    let c_ok = if is_struct_type(ok_tag) != 0 || is_enum_type(ok_tag) != 0 { c_type_c_name(ok_tag) } else { c_type_str(type_from_name_tag(ok_tag)) }
+    let c_err = if is_struct_type(err_tag) != 0 || is_enum_type(err_tag) != 0 { c_type_c_name(err_tag) } else { c_type_str(type_from_name_tag(err_tag)) }
     emit_line("typedef struct \{ int tag; union \{ {c_ok} ok; {c_err} err; }; } {tname};")
     emit_line("")
 }

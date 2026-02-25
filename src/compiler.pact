@@ -34,6 +34,20 @@ fn dots_to_slashes(s: Str) -> Str {
     result
 }
 
+fn dots_to_underscores(s: Str) -> Str {
+    let mut result = ""
+    let mut i = 0
+    while i < s.len() {
+        if s.char_at(i) == 46 {
+            result = result.concat("_")
+        } else {
+            result = result.concat(s.substring(i, 1))
+        }
+        i = i + 1
+    }
+    result
+}
+
 fn find_src_root(source_path: Str) -> Str {
     let mut i = 0
     while i < source_path.len() - 4 {
@@ -289,39 +303,50 @@ fn merge_programs(main_prog: Int, imported: List[Int], import_nodes_list: List[I
     let mut pi = 0
     while pi < imported.len() {
         let prog = imported.get(pi)
+        let mod_name = import_map_modules.get(pi)
 
         let fns_sl = np_params.get(prog)
         let mut fi = 0
         while fi < sublist_length(fns_sl) {
-            all_fns.push(sublist_get(fns_sl, fi))
+            let fn_node = sublist_get(fns_sl, fi)
+            np_module.set(fn_node, mod_name)
+            all_fns.push(fn_node)
             fi = fi + 1
         }
 
         let types_sl = np_fields.get(prog)
         let mut ti = 0
         while ti < sublist_length(types_sl) {
-            all_types.push(sublist_get(types_sl, ti))
+            let type_node = sublist_get(types_sl, ti)
+            np_module.set(type_node, mod_name)
+            all_types.push(type_node)
             ti = ti + 1
         }
 
         let lets_sl = np_stmts.get(prog)
         let mut li = 0
         while li < sublist_length(lets_sl) {
-            all_lets.push(sublist_get(lets_sl, li))
+            let let_node = sublist_get(lets_sl, li)
+            np_module.set(let_node, mod_name)
+            all_lets.push(let_node)
             li = li + 1
         }
 
         let traits_sl = np_arms.get(prog)
         let mut tri = 0
         while tri < sublist_length(traits_sl) {
-            all_traits.push(sublist_get(traits_sl, tri))
+            let trait_node = sublist_get(traits_sl, tri)
+            np_module.set(trait_node, mod_name)
+            all_traits.push(trait_node)
             tri = tri + 1
         }
 
         let impls_sl = np_methods.get(prog)
         let mut ii = 0
         while ii < sublist_length(impls_sl) {
-            all_impls.push(sublist_get(impls_sl, ii))
+            let impl_node = sublist_get(impls_sl, ii)
+            np_module.set(impl_node, mod_name)
+            all_impls.push(impl_node)
             ii = ii + 1
         }
 
@@ -329,7 +354,9 @@ fn merge_programs(main_prog: Int, imported: List[Int], import_nodes_list: List[I
         if effects_sl != -1 {
             let mut edi = 0
             while edi < sublist_length(effects_sl) {
-                all_effects.push(sublist_get(effects_sl, edi))
+                let eff_node = sublist_get(effects_sl, edi)
+                np_module.set(eff_node, mod_name)
+                all_effects.push(eff_node)
                 edi = edi + 1
             }
         }
@@ -446,6 +473,7 @@ fn merge_programs(main_prog: Int, imported: List[Int], import_nodes_list: List[I
 let mut loaded_files: List[Str] = []
 let mut import_map_paths: List[Str] = []
 let mut import_map_nodes: List[Int] = []
+let mut import_map_modules: List[Str] = []
 
 fn is_file_loaded(path: Str) -> Int {
     let mut i = 0
@@ -485,6 +513,7 @@ fn collect_imports(program: Int, src_root: Str, all_programs: List[Int]) ! Lex.T
         all_programs.push(imported_prog)
         import_map_paths.push(file_path)
         import_map_nodes.push(imp_node)
+        import_map_modules.push(dots_to_underscores(dotted_path))
         i = i + 1
     }
 }

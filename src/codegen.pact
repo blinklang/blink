@@ -337,12 +337,20 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
         uei = uei + 1
     }
 
+    // Populate module prefix registries
+    mod_fn_prefix = Map()
+    mod_type_prefix = Map()
+
     // Register type names first (struct or enum)
     let types_sl = np_fields.get(program)
     if types_sl != -1 {
         let mut i = 0
         while i < sublist_length(types_sl) {
             let td = sublist_get(types_sl, i)
+            let mod_name = np_module.get(td)
+            if mod_name != "" {
+                mod_type_prefix.set(np_name.get(td), mod_name)
+            }
             let td_flds = np_fields.get(td)
             let mut is_enum = 0
             if td_flds != -1 && sublist_length(td_flds) > 0 {
@@ -403,6 +411,10 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
         while i < sublist_length(fns_sl) {
             let fn_node = sublist_get(fns_sl, i)
             let fn_name = np_name.get(fn_node)
+            let fn_mod = np_module.get(fn_node)
+            if fn_mod != "" {
+                mod_fn_prefix.set(fn_name, fn_mod)
+            }
             // Track generic functions separately
             let fn_tparams = np_type_params.get(fn_node)
             if fn_tparams != -1 && sublist_length(fn_tparams) > 0 {
@@ -448,6 +460,10 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
             let impl_trait = np_trait_name.get(im)
             let impl_type = np_name.get(im)
             impl_entries.push(ImplEntry { trait_name: impl_trait, type_name: impl_type, methods_sl: np_methods.get(im) })
+            let impl_mod = np_module.get(im)
+            if impl_mod != "" && mod_type_prefix.has(impl_type) == false {
+                mod_type_prefix.set(impl_type, impl_mod)
+            }
             if impl_trait == "From" {
                 let trait_tparams = np_type_params.get(im)
                 if trait_tparams != -1 && sublist_length(trait_tparams) > 0 {
@@ -471,6 +487,12 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
                     let m = sublist_get(methods_sl, j)
                     let mname = np_name.get(m)
                     let mangled = "{impl_type}_{mname}"
+                    if mod_type_prefix.has(impl_type) {
+                        let m_mod = mod_type_prefix.get(impl_type)
+                        if m_mod != "" {
+                            mod_fn_prefix.set(mangled, m_mod)
+                        }
+                    }
                     let ret_str_raw = np_return_type.get(m)
                     let ret_str = resolve_self_type(ret_str_raw, impl_type)
                     if is_enum_type(ret_str) != 0 {
@@ -540,19 +562,19 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
                     let params = format_impl_params(m, impl_type)
                     let enum_ret = get_fn_enum_ret(mangled)
                     if enum_ret != "" {
-                        emit_line("pact_{enum_ret} pact_{mangled}({params});")
+                        emit_line("{c_type_c_name(enum_ret)} {c_fn_name(mangled)}({params});")
                     } else {
                         let ret_str_raw = np_return_type.get(m)
                         let ret_str = resolve_self_type(ret_str_raw, impl_type)
                         if is_struct_type(ret_str) != 0 {
-                            emit_line("pact_{ret_str} pact_{mangled}({params});")
+                            emit_line("{c_type_c_name(ret_str)} {c_fn_name(mangled)}({params});")
                         } else {
                             let resolved = resolve_ret_type_from_ann(m)
                             if resolved != "" {
-                                emit_line("{resolved} pact_{mangled}({params});")
+                                emit_line("{resolved} {c_fn_name(mangled)}({params});")
                             } else {
                                 let ret_type = type_from_name(ret_str)
-                                emit_line("{c_type_str(ret_type)} pact_{mangled}({params});")
+                                emit_line("{c_type_str(ret_type)} {c_fn_name(mangled)}({params});")
                             }
                         }
                     }

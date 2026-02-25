@@ -693,7 +693,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                         args_str = args_str.concat(expr_result_str)
                         i = i + 1
                     }
-                    expr_result_str = "pact_{mangled}({args_str})"
+                    expr_result_str = "{c_fn_name(mangled)}({args_str})"
                     expr_result_type = get_impl_method_ret(type_name, method)
                     return
                 }
@@ -721,7 +721,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                     let from_fn = sublist_get(from_methods, 0)
                     let from_name = np_name.get(from_fn)
                     let mangled = "{target_type}_{from_name}"
-                    expr_result_str = "pact_{mangled}({arg_str})"
+                    expr_result_str = "{c_fn_name(mangled)}({arg_str})"
                     expr_result_type = get_fn_ret(mangled)
                     if expr_result_type == CT_VOID {
                         set_var_struct(expr_result_str, target_type)
@@ -752,7 +752,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                     let tf_fn = sublist_get(tf_methods, 0)
                     let tf_name = np_name.get(tf_fn)
                     let mangled = "{target_type}_{tf_name}"
-                    expr_result_str = "pact_{mangled}({arg_str})"
+                    expr_result_str = "{c_fn_name(mangled)}({arg_str})"
                     expr_result_type = get_fn_ret(mangled)
                     let tf_rt = get_fn_ret_type(mangled)
                     if tf_rt.inner1 != -1 && tf_rt.inner2 != -1 {
@@ -1179,7 +1179,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             let from_fn = sublist_get(from_methods, 0)
             let from_name = np_name.get(from_fn)
             let mangled = "{tgt_name}_{from_name}"
-            expr_result_str = "pact_{mangled}({obj_str})"
+            expr_result_str = "{c_fn_name(mangled)}({obj_str})"
             expr_result_type = target
             return
         }
@@ -1367,7 +1367,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                 set_list_elem_struct(obj_str, val_struct)
                 set_list_elem_type(obj_str, CT_VOID)
                 let box_tmp = fresh_temp("_box")
-                emit_line("pact_{val_struct}* {box_tmp} = (pact_{val_struct}*)pact_alloc(sizeof(pact_{val_struct}));")
+                emit_line("{c_type_c_name(val_struct)}* {box_tmp} = ({c_type_c_name(val_struct)}*)pact_alloc(sizeof({c_type_c_name(val_struct)}));")
                 emit_line("*{box_tmp} = {val_str};")
                 emit_line("pact_list_push({obj_str}, (void*){box_tmp});")
             } else if val_type == CT_INT {
@@ -1403,7 +1403,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             let elem_struct = get_list_elem_struct(obj_str)
             if elem_type == CT_VOID && elem_struct != "" {
                 let ub_tmp = fresh_temp("_ub")
-                emit_line("pact_{elem_struct} {ub_tmp} = *(pact_{elem_struct}*)pact_list_get({obj_str}, {idx_str});")
+                emit_line("{c_type_c_name(elem_struct)} {ub_tmp} = *({c_type_c_name(elem_struct)}*)pact_list_get({obj_str}, {idx_str});")
                 set_var_struct(ub_tmp, elem_struct)
                 expr_result_str = ub_tmp
                 expr_result_type = CT_VOID
@@ -1433,7 +1433,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             let val_struct2 = get_var_struct(val_str2)
             if val_type2 == CT_VOID && val_struct2 != "" {
                 let box_tmp = fresh_temp("_box")
-                emit_line("pact_{val_struct2}* {box_tmp} = (pact_{val_struct2}*)pact_alloc(sizeof(pact_{val_struct2}));")
+                emit_line("{c_type_c_name(val_struct2)}* {box_tmp} = ({c_type_c_name(val_struct2)}*)pact_alloc(sizeof({c_type_c_name(val_struct2)}));")
                 emit_line("*{box_tmp} = {val_str2};")
                 emit_line("pact_list_set({obj_str}, {idx_str}, (void*){box_tmp});")
             } else if val_type2 == CT_INT {
@@ -2139,7 +2139,8 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
     let derive_struct = get_var_struct(obj_str)
     if derive_struct != "" && has_derive_method(derive_struct, method) != 0 {
         if method == "to_json" {
-            expr_result_str = "pact_{derive_struct}_to_json({obj_str})"
+            let ds_mangled = "{derive_struct}_to_json"
+            expr_result_str = "{c_fn_name(ds_mangled)}({obj_str})"
             expr_result_type = CT_STRING
             return
         }
@@ -2147,7 +2148,8 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
     let derive_enum = get_var_enum(obj_str)
     if derive_enum != "" && has_derive_method(derive_enum, method) != 0 {
         if method == "to_json" {
-            expr_result_str = "pact_{derive_enum}_to_json({obj_str})"
+            let de_mangled = "{derive_enum}_to_json"
+            expr_result_str = "{c_fn_name(de_mangled)}({obj_str})"
             expr_result_type = CT_STRING
             return
         }
@@ -2168,7 +2170,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                 i = i + 1
             }
         }
-        expr_result_str = "pact_{mangled}({args_str})"
+        expr_result_str = "{c_fn_name(mangled)}({args_str})"
         expr_result_type = get_impl_method_ret(struct_type, method)
         return
     }

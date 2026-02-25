@@ -201,3 +201,17 @@ Source: `ai` (Claude) | `human` | `both`
 - **Context:** Writing `test_name_resolution.pact`; `let output = shell_exec(...)` then `output.contains("...")` fails with `UnresolvedMethod`
 - **Description:** The name resolver doesn't know the return types of built-in functions (`shell_exec`, `read_file`, etc.). When their return value is stored in a variable and a method is called on it (e.g. `.contains()`, `.trim()`), the resolver can't verify the method exists because it doesn't know the variable is a `Str`. Even explicit type annotations (`let output: Str = shell_exec(...)`) don't help — the resolver doesn't use them for method validation. Workaround: avoid method calls on built-in return values, or delegate to shell commands. Fix: the resolver needs a type registry for built-in functions so it can propagate return types to local variables.
 
+### 2026-02-25 — No `\"` escape sequence in strings
+- **Category:** `syntax`
+- **Severity:** `annoying`
+- **Source:** `both`
+- **Context:** Writing test code that constructs JSON strings inline
+- **Description:** Pact strings don't support `\"` as an escape sequence for double quotes inside strings. This makes it impossible to write string literals containing double quotes. Must construct them via `Str.from_char(34)` or similar workarounds. Common in JSON, SQL, HTML, and any data format that uses double quotes. Spec should define `\"` as a valid escape sequence alongside `\n`, `\t`, `\r`, `\\`.
+
+### 2026-02-25 — `bin/pact build` returns exit code 0 on C compilation failure
+- **Category:** `tooling`
+- **Severity:** `annoying`
+- **Source:** `ai`
+- **Context:** CI test runner silently passing tests that actually fail to compile
+- **Description:** `bin/pact build <file.pact>` prints "error: C compilation failed" to stderr but returns exit code 0 when the `cc` step fails. This causes the test runner (`task test`) to think the build succeeded, then the binary doesn't exist, and the test "crashes" with a confusing exit 127. The CLI should propagate the C compiler's non-zero exit code. Stale binaries from previous builds can mask this further — a test appears to pass because it runs an old binary.
+

@@ -107,11 +107,11 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
         if variant_enum2 != "" {
             if is_data_enum(variant_enum2) != 0 {
                 let tag = get_variant_tag(variant_enum2, name)
-                expr_result_str = "(pact_{variant_enum2})\{.tag = {tag}}"
+                expr_result_str = "({c_type_c_name(variant_enum2)})\{.tag = {tag}}"
                 expr_result_type = CT_INT
                 return
             }
-            expr_result_str = "pact_{variant_enum2}_{name}"
+            expr_result_str = "{c_type_c_name(variant_enum2)}_{name}"
             expr_result_type = CT_INT
             return
         }
@@ -206,11 +206,11 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
             if is_enum_type(obj_name) != 0 {
                 if is_data_enum(obj_name) != 0 {
                     let tag = get_variant_tag(obj_name, fa_field)
-                    expr_result_str = "(pact_{obj_name})\{.tag = {tag}}"
+                    expr_result_str = "({c_type_c_name(obj_name)})\{.tag = {tag}}"
                     expr_result_type = CT_INT
                     return
                 }
-                expr_result_str = "pact_{obj_name}_{fa_field}"
+                expr_result_str = "{c_type_c_name(obj_name)}_{fa_field}"
                 expr_result_type = CT_INT
                 return
             }
@@ -661,7 +661,7 @@ pub fn emit_binop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Di
             let opt_c = struct_option_c_type(opt_inner_s)
             emit_line("{opt_c} {tmp} = {left_str};")
             let val_tmp = fresh_temp("__optv")
-            emit_line("pact_{opt_inner_s} {val_tmp} = {tmp}.tag == 1 ? {tmp}.value : {right_str};")
+            emit_line("{c_type_c_name(opt_inner_s)} {val_tmp} = {tmp}.tag == 1 ? {tmp}.value : {right_str};")
             set_var_struct(val_tmp, opt_inner_s)
             expr_result_str = val_tmp
             expr_result_type = right_type
@@ -945,7 +945,7 @@ pub fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
             let tag = get_variant_tag(variant_enum, fn_name)
             let fcount = get_variant_field_count(vidx)
             let args_sl = np_args.get(node)
-            let mut init_str = "(pact_{variant_enum})\{.tag = {tag}"
+            let mut init_str = "({c_type_c_name(variant_enum)})\{.tag = {tag}"
             if fcount > 0 && args_sl != -1 {
                 init_str = init_str.concat(", .data.{fn_name} = \{")
                 let mut fi = 0
@@ -1156,7 +1156,7 @@ pub fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
                 let resolved_ret = resolve_type_param(ret_str, tparams_sl, type_args)
                 let ret_type = type_from_name(resolved_ret)
                 reg_fn(mangled, ret_type)
-                expr_result_str = "pact_{mangled}({args_str})"
+                expr_result_str = "{c_fn_name(mangled)}({args_str})"
                 expr_result_type = ret_type
                 return
             }
@@ -1168,13 +1168,13 @@ pub fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
             expr_result_type = CT_INT
             return
         }
-        expr_result_str = "pact_{fn_name}({args_str})"
+        expr_result_str = "{c_fn_name(fn_name)}({args_str})"
         expr_result_type = get_fn_ret(fn_name)
         if expr_result_type == CT_VOID {
             let fn_sret = get_fn_ret_struct(fn_name)
             if fn_sret != "" {
                 let s_tmp = fresh_temp("_sr")
-                emit_line("pact_{fn_sret} {s_tmp} = pact_{fn_name}({args_str});")
+                emit_line("{c_type_c_name(fn_sret)} {s_tmp} = {c_fn_name(fn_name)}({args_str});")
                 set_var_struct(s_tmp, fn_sret)
                 expr_result_str = s_tmp
             }
@@ -1220,7 +1220,7 @@ pub fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
                             args_str = args_str.concat(expr_result_str)
                             i = i + 1
                         }
-                        expr_result_str = "pact_{mangled}({args_str})"
+                        expr_result_str = "{c_fn_name(mangled)}({args_str})"
                         expr_result_type = get_impl_method_ret(type_name, method)
                         return
                     }
@@ -1428,7 +1428,7 @@ pub fn emit_list_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope,
             let e_struct = get_var_struct(e_str)
             if e_type == CT_VOID && e_struct != "" {
                 let box_tmp = fresh_temp("_box")
-                emit_line("pact_{e_struct}* {box_tmp} = (pact_{e_struct}*)pact_alloc(sizeof(pact_{e_struct}));")
+                emit_line("{c_type_c_name(e_struct)}* {box_tmp} = ({c_type_c_name(e_struct)}*)pact_alloc(sizeof({c_type_c_name(e_struct)}));")
                 emit_line("*{box_tmp} = {e_str};")
                 emit_line("pact_list_push({tmp}, (void*){box_tmp});")
             } else if e_type == CT_INT {
@@ -1513,7 +1513,7 @@ pub fn infer_struct_type_args(type_name: Str, field_types: List[Int]) -> Str {
 
 pub fn emit_struct_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
     let sname = np_type_name.get(node)
-    let mut c_type = "pact_{sname}"
+    let mut c_type = c_type_c_name(sname)
     let tmp = fresh_temp("_s")
     let flds_sl = np_fields.get(node)
     let mut inits = ""
@@ -1537,7 +1537,7 @@ pub fn emit_struct_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scop
     let mut struct_key = sname
     if type_args != "" {
         let mono_name = register_mono_instance(sname, type_args)
-        c_type = "pact_{mono_name}"
+        c_type = c_type_c_name(mono_name)
         struct_key = mono_name
         // Register field types for the mono instance so field access works
         register_mono_field_types(sname, mono_name, type_args)

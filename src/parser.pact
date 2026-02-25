@@ -38,6 +38,7 @@ pub let mut np_iterable: List[Int] = []
 pub let mut np_var_name: List[Str] = []
 pub let mut np_is_mut: List[Int] = []
 pub let mut np_is_pub: List[Int] = []
+pub let mut np_module: List[Str] = []
 pub let mut np_inclusive: List[Int] = []
 pub let mut np_start: List[Int] = []
 pub let mut np_end: List[Int] = []
@@ -101,6 +102,7 @@ pub fn new_node(kind: Int) -> Int ! Parse.Build {
     np_var_name.push("")
     np_is_mut.push(0)
     np_is_pub.push(0)
+    np_module.push("")
     np_inclusive.push(0)
     np_start.push(-1)
     np_end.push(-1)

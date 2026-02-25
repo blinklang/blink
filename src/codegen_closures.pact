@@ -718,9 +718,9 @@ pub fn emit_closure(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
             if ptype == "Fn" {
                 params_c = params_c.concat("pact_closure* {pname}")
             } else if is_enum_type(ptype) != 0 {
-                params_c = params_c.concat("pact_{ptype} {pname}")
+                params_c = params_c.concat("{c_type_c_name(ptype)} {pname}")
             } else if is_struct_type(ptype) != 0 {
-                params_c = params_c.concat("pact_{ptype} {pname}")
+                params_c = params_c.concat("{c_type_c_name(ptype)} {pname}")
             } else {
                 let ct = type_from_name(ptype)
                 params_c = params_c.concat("{c_type_str(ct)} {pname}")
@@ -782,10 +782,10 @@ pub fn emit_closure(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
     let mut closure_ret_struct = ""
     if ret_type == CT_VOID && ret_str != "Void" && ret_str != "" {
         if is_struct_type(ret_str) != 0 {
-            ret_c_str = "pact_{ret_str}"
+            ret_c_str = c_type_c_name(ret_str)
             closure_ret_struct = ret_str
         } else if is_enum_type(ret_str) != 0 {
-            ret_c_str = "pact_{ret_str}"
+            ret_c_str = c_type_c_name(ret_str)
         }
     }
     emit_line("static {ret_c_str} {cname}({params_c}) \{")
@@ -846,9 +846,9 @@ pub fn emit_closure(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
             if sptype == "Fn" {
                 sig_params = sig_params.concat("pact_closure*")
             } else if is_enum_type(sptype) != 0 {
-                sig_params = sig_params.concat("pact_{sptype}")
+                sig_params = sig_params.concat(c_type_c_name(sptype))
             } else if is_struct_type(sptype) != 0 {
-                sig_params = sig_params.concat("pact_{sptype}")
+                sig_params = sig_params.concat(c_type_c_name(sptype))
             } else {
                 sig_params = sig_params.concat(c_type_str(type_from_name(sptype)))
             }
