@@ -224,3 +224,10 @@ Source: `ai` (Claude) | `human` | `both`
 - **Context:** Inlining the compiler pipeline into the CLI binary brought lexer, toml, and json modules together for the first time
 - **Description:** `is_emitted_fn()` in codegen_types.pact checks the bare Pact function name (e.g., `is_alpha`), not the module-qualified C name (e.g., `pact_lexer_is_alpha`). When two modules define functions with the same name but different bodies, the first one emitted wins — the second is silently dropped. The `mod_fn_prefix` map is also keyed on bare name, so last-registered module prefix overwrites earlier ones. This caused: (1) toml's `is_alpha` (no underscore) replacing lexer's `is_alpha` (with underscore), breaking all identifier parsing; (2) json's `is_ws` (includes newlines) replacing toml's `is_ws` (space+tab only). Workaround: renamed colliding functions with module prefixes (`toml_is_alpha`, `toml_is_ws`, `toml_skip_ws`). Proper fix: dedup on fully-qualified C name, or key `mod_fn_prefix` on `(module, name)` tuples.
 
+### 2026-02-25 — CLI argparser lacks command-scoped flags and routing
+- **Category:** `tooling`
+- **Severity:** `annoying`
+- **Source:** `ai`
+- **Context:** Adding new commands to cli.pact requires updating two hardcoded exclusion chains
+- **Description:** `std.args` provides flat flag/option parsing but no command-scoped routing. Every command that doesn't require a source file must be added to a growing `command != "init" && command != "llms" && ...` chain (cli.pact lines 604 and 610). Adding a command means updating two separate exclusion lists. A command-scoped approach (where each command declares its own required positionals and flags) would eliminate this.
+

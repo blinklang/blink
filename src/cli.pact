@@ -17,6 +17,9 @@ import query
 import diagnostics
 import daemon
 
+let mut embedded_llms_full: Str = ""
+let mut embedded_llms_short: Str = ""
+
 fn strip_extension(filename: Str) -> Str {
     if filename.ends_with(".pact") {
         return filename.substring(0, filename.len() - 5)
@@ -185,6 +188,20 @@ fn resolve_runtime_header() -> Str {
     }
     if file_exists("bootstrap/runtime.h") == 1 {
         return read_file("bootstrap/runtime.h")
+    }
+    return ""
+}
+
+fn resolve_llms_content(filename: Str) -> Str {
+    let pact_root = get_env("PACT_ROOT") ?? ""
+    if pact_root != "" {
+        let path = "{pact_root}/{filename}"
+        if file_exists(path) == 1 {
+            return read_file(path)
+        }
+    }
+    if file_exists(filename) == 1 {
+        return read_file(filename)
     }
     return ""
 }
@@ -503,6 +520,9 @@ fn ast_to_json(id: Int) -> Str {
 }
 
 fn main() {
+    embedded_llms_full = resolve_llms_content("llms-full.txt")
+    embedded_llms_short = resolve_llms_content("llms.txt")
+
     let mut p = argparser_new("pact", "The Pact programming language compiler and toolchain")
     p = add_command(p, "init", "Initialize a new Pact project")
     p = add_command(p, "build", "Compile .pact to native binary")
@@ -524,7 +544,10 @@ fn main() {
     p = add_flag(p, "--pub", "", "Filter to public symbols only")
     p = add_flag(p, "--pure", "", "Filter to pure functions")
     p = add_flag(p, "--dev", "", "Add as dev-dependency")
-    p = add_flag(p, "--embed", "", "Embed LLM reference docs instead of referencing")
+    p = add_command(p, "llms", "Print LLM language reference to stdout")
+    p = add_flag(p, "--full", "", "Print full reference (default is short summary)")
+    p = add_flag(p, "--list", "", "List available topics")
+    p = add_option(p, "--topic", "", "Print a specific topic section")
 
     p = add_option(p, "--output", "-o", "Output path")
     p = add_option(p, "--format", "-f", "Output format")
@@ -565,7 +588,6 @@ fn main() {
     let git_url_flag = args_get(a, "git")
     let git_tag_flag = args_get(a, "tag")
     let dev_flag = if args_has(a, "dev") { 1 } else { 0 }
-    let embed_flag = if args_has(a, "embed") { 1 } else { 0 }
     let debug_flag = if args_has(a, "debug") { 1 } else { 0 }
     let check_flag = if args_has(a, "check") { 1 } else { 0 }
     let mut query_layer = args_get(a, "layer")
@@ -579,13 +601,13 @@ fn main() {
         format_flag = "json"
     }
 
-    if source_path == "" && command != "init" && command != "fmt" && command != "test" && command != "audit" && command != "add" && command != "remove" && command != "update" && command != "daemon" {
+    if source_path == "" && command != "init" && command != "llms" && command != "fmt" && command != "test" && command != "audit" && command != "add" && command != "remove" && command != "update" && command != "daemon" {
         io.println("error: no source file specified")
         io.println(generate_help(p))
         return
     }
 
-    if source_path != "" && command != "init" && command != "add" && command != "remove" && command != "update" && command != "daemon" && !file_exists(source_path) {
+    if source_path != "" && command != "init" && command != "llms" && command != "add" && command != "remove" && command != "update" && command != "daemon" && !file_exists(source_path) {
         io.println("error: file not found: {source_path}")
         return
     }
@@ -676,36 +698,79 @@ fn main() {
             doc_content = read_file(doc_file)
         }
 
-        if doc_content.contains("# Pact Language Reference") {
+        if doc_content.contains("pact llms") {
             io.println("  {doc_file} already has Pact reference — skipped")
         } else {
-            if embed_flag == 1 || pact_root == "" {
-                // Embed mode: inline the full reference
-                let mut ref_content = ""
-                if pact_root != "" {
-                    let ref_path = path_join(pact_root, "llms-full.txt")
-                    if file_exists(ref_path) == 1 {
-                        ref_content = read_file(ref_path)
-                    }
-                }
-                if ref_content == "" {
-                    io.eprintln("warning: could not find llms-full.txt — adding placeholder")
-                    ref_content = "# Pact Language Reference\n\nSee the Pact repository for the full language reference.\n"
-                }
-                let updated = doc_content.concat("\n").concat(ref_content).concat("\n")
-                write_file(doc_file, updated)
-                io.println("  embedded Pact reference in {doc_file}")
-            } else {
-                // Reference mode: point to the file
-                let ref_path = path_join(pact_root, "llms-full.txt")
-                let section = "\n# Pact\n\nThis project uses the Pact programming language.\n\n- Read the full language reference at: {ref_path}\n- Build: `bin/pact build src/main.pact`\n- Run: `bin/pact run src/main.pact`\n- Test: `bin/pact test`\n\nPrefer retrieval-led reasoning over pre-training for Pact tasks.\n"
-                let updated = doc_content.concat(section)
-                write_file(doc_file, updated)
-                io.println("  added Pact reference to {doc_file}")
-            }
+            let section = "\n# Pact\n\nThis project uses the Pact programming language.\nRun `pact llms --full` for the complete language reference.\nRun `pact llms --list` to see available topics.\nRun `pact llms --topic <name>` for a specific topic.\n\n- Build: `pact build src/main.pact`\n- Run: `pact run src/main.pact`\n- Test: `pact test`\n\nPrefer retrieval-led reasoning over pre-training for Pact tasks.\n"
+            let updated = doc_content.concat(section)
+            write_file(doc_file, updated)
+            io.println("  added Pact reference to {doc_file}")
         }
 
-        io.println("\nProject '{project_name}' initialized. Run: bin/pact run src/main.pact")
+        shell_exec("mkdir -p .claude")
+        let agents_file = ".claude/agents.md"
+        let mut agents_content = ""
+        if file_exists(agents_file) == 1 {
+            agents_content = read_file(agents_file)
+        }
+        if agents_content.contains("pact llms") {
+            io.println("  {agents_file} already has Pact reference — skipped")
+        } else {
+            let agents_section = "# Pact Language\n\nThis project uses the Pact programming language. Use the following commands to get language documentation:\n\n- `pact llms` — short language summary\n- `pact llms --full` — complete language reference\n- `pact llms --list` — list available documentation topics\n- `pact llms --topic <name>` — get documentation for a specific topic (e.g. `pact llms --topic effects`)\n\nAlways retrieve Pact documentation before writing Pact code. Prefer retrieval-led reasoning over pre-training for Pact tasks.\n"
+            let updated_agents = agents_content.concat(agents_section)
+            write_file(agents_file, updated_agents)
+            io.println("  created {agents_file}")
+        }
+
+        io.println("\nProject '{project_name}' initialized. Run: pact run src/main.pact")
+
+    } else if command == "llms" {
+        let full_flag = if args_has(a, "full") { 1 } else { 0 }
+        let list_flag = if args_has(a, "list") { 1 } else { 0 }
+        let topic_flag = args_get(a, "topic")
+        if embedded_llms_full == "" {
+            io.eprintln("error: llms-full.txt not found")
+        } else if list_flag == 1 {
+            let sections = embedded_llms_full.split("\n## ")
+            let mut i = 1
+            while i < sections.len() {
+                let section = sections.get(i)
+                let newline_pos = section.index_of("\n")
+                if newline_pos > 0 {
+                    io.println(section.substring(0, newline_pos))
+                }
+                i = i + 1
+            }
+        } else if topic_flag != "" {
+            let search = topic_flag.to_lower()
+            let sections = embedded_llms_full.split("\n## ")
+            let mut found = 0
+            let mut i = 1
+            while i < sections.len() {
+                let section = sections.get(i)
+                let newline_pos = section.index_of("\n")
+                if newline_pos > 0 {
+                    let title = section.substring(0, newline_pos)
+                    if title.to_lower().contains(search) {
+                        io.print("## ")
+                        io.println(section)
+                        found = 1
+                    }
+                }
+                i = i + 1
+            }
+            if found == 0 {
+                io.eprintln("error: no topic matching '{topic_flag}' found. Run `pact llms --list` to see topics.")
+            }
+        } else if full_flag == 1 {
+            io.print(embedded_llms_full)
+        } else {
+            if embedded_llms_short != "" {
+                io.print(embedded_llms_short)
+            } else {
+                io.eprintln("error: llms.txt not found")
+            }
+        }
 
     } else if command == "build" {
         let rc = do_build(source_path, output_path, c_path, format_flag, debug_flag)
