@@ -106,12 +106,13 @@ Source: `ai` (Claude) | `human` | `both`
 
 ---
 
-### 2026-02-14 — `match` is a keyword but no helpful error when used as variable name
+### 2026-02-14 — `match` is a keyword but no helpful error when used as variable name — ✅ RESOLVED
 - **Category:** `ergonomics`
-- **Severity:** `annoying`
+- **Severity:** `annoying` → **resolved**
 - **Source:** `ai`
 - **Context:** Implementing CLI add/remove commands (pact-365) — AI agent used `let mut match = 1` as variable
 - **Description:** Using the keyword `match` as a variable name causes the compiler to crash with an opaque "list index out of bounds: 4457" error instead of a clear diagnostic. The parser doesn't emit a "expected identifier, got keyword 'match'" error. AI code generators (and humans) are especially likely to use `match` as a variable name since it's a common English word. The compiler should produce a targeted error like "error: 'match' is a keyword and cannot be used as an identifier".
+- **Resolution (2026-02-25):** Parser emits E1103 KeywordAsIdentifier for `match`, `if`, `fn`, `handler`, and all other keywords (parser.pact:2166+).
 
 ### 2026-02-14 — `get_env` builtin missing, no obvious way to access env vars — ✅ RESOLVED
 - **Category:** `spec-gap`
@@ -201,12 +202,13 @@ Source: `ai` (Claude) | `human` | `both`
 - **Context:** Writing `test_name_resolution.pact`; `let output = shell_exec(...)` then `output.contains("...")` fails with `UnresolvedMethod`
 - **Description:** The name resolver doesn't know the return types of built-in functions (`shell_exec`, `read_file`, etc.). When their return value is stored in a variable and a method is called on it (e.g. `.contains()`, `.trim()`), the resolver can't verify the method exists because it doesn't know the variable is a `Str`. Even explicit type annotations (`let output: Str = shell_exec(...)`) don't help — the resolver doesn't use them for method validation. Workaround: avoid method calls on built-in return values, or delegate to shell commands. Fix: the resolver needs a type registry for built-in functions so it can propagate return types to local variables.
 
-### 2026-02-25 — No `\"` escape sequence in strings
+### 2026-02-25 — No `\"` escape sequence in strings — ✅ RESOLVED
 - **Category:** `syntax`
-- **Severity:** `annoying`
+- **Severity:** `annoying` → **resolved**
 - **Source:** `both`
 - **Context:** Writing test code that constructs JSON strings inline
 - **Description:** Pact strings don't support `\"` as an escape sequence for double quotes inside strings. This makes it impossible to write string literals containing double quotes. Must construct them via `Str.from_char(34)` or similar workarounds. Common in JSON, SQL, HTML, and any data format that uses double quotes. Spec should define `\"` as a valid escape sequence alongside `\n`, `\t`, `\r`, `\\`.
+- **Resolution (2026-02-25):** Was already implemented in lexer (lexer.pact:835). Friction was a documentation gap — escape sequence table added to spec §2.4.
 
 ### 2026-02-25 — `bin/pact build` returns exit code 0 on C compilation failure
 - **Category:** `tooling`
@@ -214,4 +216,11 @@ Source: `ai` (Claude) | `human` | `both`
 - **Source:** `ai`
 - **Context:** CI test runner silently passing tests that actually fail to compile
 - **Description:** `bin/pact build <file.pact>` prints "error: C compilation failed" to stderr but returns exit code 0 when the `cc` step fails. This causes the test runner (`task test`) to think the build succeeded, then the binary doesn't exist, and the test "crashes" with a confusing exit 127. The CLI should propagate the C compiler's non-zero exit code. Stale binaries from previous builds can mask this further — a test appears to pass because it runs an old binary.
+
+### 2026-02-25 — Codegen deduplicates functions by bare name, causing silent cross-module body swaps
+- **Category:** `codegen`
+- **Severity:** `blocking`
+- **Source:** `ai`
+- **Context:** Inlining the compiler pipeline into the CLI binary brought lexer, toml, and json modules together for the first time
+- **Description:** `is_emitted_fn()` in codegen_types.pact checks the bare Pact function name (e.g., `is_alpha`), not the module-qualified C name (e.g., `pact_lexer_is_alpha`). When two modules define functions with the same name but different bodies, the first one emitted wins — the second is silently dropped. The `mod_fn_prefix` map is also keyed on bare name, so last-registered module prefix overwrites earlier ones. This caused: (1) toml's `is_alpha` (no underscore) replacing lexer's `is_alpha` (with underscore), breaking all identifier parsing; (2) json's `is_ws` (includes newlines) replacing toml's `is_ws` (space+tab only). Workaround: renamed colliding functions with module prefixes (`toml_is_alpha`, `toml_is_ws`, `toml_skip_ws`). Proper fix: dedup on fully-qualified C name, or key `mod_fn_prefix` on `(module, name)` tuples.
 

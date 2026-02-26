@@ -78,7 +78,7 @@ static void pact_list_push(pact_list* l, void* item) {
 
 static void* pact_list_get(const pact_list* l, int64_t index) {
     if (index < 0 || index >= l->len) {
-        fprintf(stderr, "pact: list index out of bounds: %lld\n", (long long)index);
+        fprintf(stderr, "pact: list index out of bounds: idx=%lld len=%lld\n", (long long)index, (long long)l->len);
         exit(1);
     }
     return l->items[index];

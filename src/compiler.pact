@@ -20,7 +20,7 @@ import std.lockfile
 // Usage (once compiled): ./pactc <source.pact> [output.c]
 // If no output file given, writes to stdout.
 
-fn dots_to_slashes(s: Str) -> Str {
+pub fn dots_to_slashes(s: Str) -> Str {
     let mut result = ""
     let mut i = 0
     while i < s.len() {
@@ -34,7 +34,7 @@ fn dots_to_slashes(s: Str) -> Str {
     result
 }
 
-fn dots_to_underscores(s: Str) -> Str {
+pub fn dots_to_underscores(s: Str) -> Str {
     let mut result = ""
     let mut i = 0
     while i < s.len() {
@@ -48,7 +48,7 @@ fn dots_to_underscores(s: Str) -> Str {
     result
 }
 
-fn find_src_root(source_path: Str) -> Str {
+pub fn find_src_root(source_path: Str) -> Str {
     let mut i = 0
     while i < source_path.len() - 4 {
         if source_path.char_at(i) == 47 && source_path.substring(i, 5) == "/src/" {
@@ -62,9 +62,9 @@ fn find_src_root(source_path: Str) -> Str {
     path_dirname(source_path)
 }
 
-let mut lockfile_loaded: Int = 0
+pub let mut lockfile_loaded: Int = 0
 
-fn ensure_lockfile_loaded(src_root: Str) {
+pub fn ensure_lockfile_loaded(src_root: Str) {
     if lockfile_loaded == 1 {
         return
     }
@@ -234,7 +234,7 @@ fn resolve_from_lockfile(dotted_path: Str, src_root: Str) -> Str {
     ""
 }
 
-fn resolve_module_path(dotted_path: Str, src_root: Str) -> Str ! Diag.Report {
+pub fn resolve_module_path(dotted_path: Str, src_root: Str) -> Str ! Diag.Report {
     let rel = dots_to_slashes(dotted_path)
     let full = path_join(src_root, rel.concat(".pact"))
 
@@ -269,13 +269,20 @@ fn resolve_module_path(dotted_path: Str, src_root: Str) -> Str ! Diag.Report {
         if file_exists(std_full) == 1 {
             return std_full
         }
+        let pact_root = get_env("PACT_ROOT") ?? ""
+        if pact_root != "" {
+            let std_root = path_join(pact_root, path_join("lib/std", std_rel.concat(".pact")))
+            if file_exists(std_root) == 1 {
+                return std_root
+            }
+        }
     }
 
     diag_error_no_loc("ModuleNotFound", "E1200", "module not found: {dotted_path} (looked at: {full})", "")
     ""
 }
 
-fn should_import_item(item: Int, import_node: Int) -> Int {
+pub fn should_import_item(item: Int, import_node: Int) -> Int {
     let names_sl = np_args.get(import_node)
     if names_sl == -1 {
         return 1
@@ -292,7 +299,7 @@ fn should_import_item(item: Int, import_node: Int) -> Int {
     0
 }
 
-fn merge_programs(main_prog: Int, imported: List[Int], import_nodes_list: List[Int]) -> Int ! Parse.Build {
+pub fn merge_programs(main_prog: Int, imported: List[Int], import_nodes_list: List[Int]) -> Int ! Parse.Build {
     let mut all_fns: List[Int] = []
     let mut all_types: List[Int] = []
     let mut all_lets: List[Int] = []
@@ -470,12 +477,20 @@ fn merge_programs(main_prog: Int, imported: List[Int], import_nodes_list: List[I
     merged
 }
 
-let mut loaded_files: List[Str] = []
-let mut import_map_paths: List[Str] = []
-let mut import_map_nodes: List[Int] = []
-let mut import_map_modules: List[Str] = []
+pub let mut loaded_files: List[Str] = []
+pub let mut import_map_paths: List[Str] = []
+pub let mut import_map_nodes: List[Int] = []
+pub let mut import_map_modules: List[Str] = []
 
-fn is_file_loaded(path: Str) -> Int {
+pub fn reset_compiler_state() {
+    loaded_files = []
+    import_map_paths = []
+    import_map_nodes = []
+    import_map_modules = []
+    lockfile_loaded = 0
+}
+
+pub fn is_file_loaded(path: Str) -> Int {
     let mut i = 0
     while i < loaded_files.len() {
         if loaded_files.get(i) == path {
@@ -486,7 +501,7 @@ fn is_file_loaded(path: Str) -> Int {
     0
 }
 
-fn collect_imports(program: Int, src_root: Str, all_programs: List[Int]) ! Lex.Tokenize, Parse, Diag.Report {
+pub fn collect_imports(program: Int, src_root: Str, all_programs: List[Int]) ! Lex.Tokenize, Parse, Diag.Report {
     let imports_sl = np_elements.get(program)
     if imports_sl == -1 {
         return
@@ -518,124 +533,3 @@ fn collect_imports(program: Int, src_root: Str, all_programs: List[Int]) ! Lex.T
     }
 }
 
-fn main() {
-    if arg_count() < 2 {
-        io.println("Usage: pactc <source.pact> [output.c] [--format json] [--json] [--emit pact] [--stats] [--debug]")
-        io.println("  Compiles a Pact source file to C.")
-        return
-    }
-
-    let source_path = get_arg(1)
-    let mut out_path = ""
-    let mut emit_mode = ""
-    let mut stats_mode = 0
-    let mut check_only = 0
-    let mut i = 2
-    while i < arg_count() {
-        let arg = get_arg(i)
-        if arg == "--format" {
-            if i + 1 < arg_count() {
-                i = i + 1
-                let fmt = get_arg(i)
-                if fmt == "json" {
-                    diag_format = 1
-                }
-            }
-        } else if arg == "--json" {
-            diag_format = 1
-        } else if arg == "--emit" {
-            if i + 1 < arg_count() {
-                i = i + 1
-                emit_mode = get_arg(i)
-            }
-        } else if arg == "--debug" {
-            cg_debug_mode = 1
-        } else if arg == "--stats" {
-            stats_mode = 1
-        } else if arg == "--check-only" {
-            check_only = 1
-        } else {
-            out_path = arg
-        }
-        i = i + 1
-    }
-
-    diag_source_file = source_path
-    let source = read_file(source_path)
-
-    let t_lex_start = time_ms()
-    lex(source)
-    let t_lex_end = time_ms()
-    pos = 0
-    let t_parse_start = time_ms()
-    let program_node = parse_program()
-    let t_parse_end = time_ms()
-    loaded_files.push(source_path)
-
-    let src_root = find_src_root(source_path)
-    let t_import_start = time_ms()
-    let mut imported_programs: List[Int] = []
-    collect_imports(program_node, src_root, imported_programs)
-
-    let mut final_program = program_node
-    if imported_programs.len() > 0 {
-        final_program = merge_programs(program_node, imported_programs, import_map_nodes)
-    }
-    let t_import_end = time_ms()
-
-    if emit_mode == "pact" {
-        let pact_output = format(final_program)
-        if out_path != "" {
-            write_file(out_path, pact_output)
-        } else {
-            io.println(pact_output)
-        }
-        return
-    }
-
-    let t_tc_start = time_ms()
-    let tc_err_count = check_types(final_program)
-    let t_tc_end = time_ms()
-
-    if diag_count > 0 {
-        diag_flush()
-        return
-    }
-
-    if check_only != 0 {
-        diag_flush()
-        return
-    }
-
-    let t_mut_start = time_ms()
-    analyze_mutations(final_program)
-    analyze_save_restore(final_program)
-    let t_mut_end = time_ms()
-
-    let t_cg_start = time_ms()
-    let c_output = generate(final_program)
-    let t_cg_end = time_ms()
-
-    if diag_count > 0 {
-        diag_flush()
-        return
-    }
-
-    if out_path != "" {
-        write_file(out_path, c_output)
-    } else {
-        io.println(c_output)
-    }
-
-    if stats_mode == 1 {
-        let lex_ms = t_lex_end - t_lex_start
-        let parse_ms = t_parse_end - t_parse_start
-        let import_ms = t_import_end - t_import_start
-        let typecheck_ms = t_tc_end - t_tc_start
-        let mutation_ms = t_mut_end - t_mut_start
-        let codegen_ms = t_cg_end - t_cg_start
-        let total_ms = t_cg_end - t_lex_start
-        let q = "\""
-        io.eprintln("\{{q}lex_ms{q}:{lex_ms},{q}parse_ms{q}:{parse_ms},{q}import_ms{q}:{import_ms},{q}typecheck_ms{q}:{typecheck_ms},{q}mutation_ms{q}:{mutation_ms},{q}codegen_ms{q}:{codegen_ms},{q}total_ms{q}:{total_ms}\}")
-    }
-}

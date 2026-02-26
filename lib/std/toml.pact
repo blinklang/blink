@@ -68,7 +68,7 @@ fn peek(s: Str, pos: Int) -> Int {
     s.char_at(pos)
 }
 
-fn is_ws(c: Int) -> Int {
+fn toml_is_ws(c: Int) -> Int {
     c == CH_SPACE || c == CH_TAB
 }
 
@@ -80,19 +80,19 @@ fn is_digit(c: Int) -> Int {
     c >= CH_0 && c <= CH_9
 }
 
-fn is_alpha(c: Int) -> Int {
+fn toml_is_alpha(c: Int) -> Int {
     (c >= CH_a && c <= CH_z) || (c >= CH_A && c <= CH_Z)
 }
 
 fn is_bare_key_char(c: Int) -> Int {
-    is_alpha(c) || is_digit(c) || c == CH_UNDERSCORE || c == CH_MINUS || c == CH_SLASH
+    toml_is_alpha(c) || is_digit(c) || c == CH_UNDERSCORE || c == CH_MINUS || c == CH_SLASH
 }
 
 // ── Skip helpers ───────────────────────────────────────────────────
 
-fn skip_ws(content: Str, pos: Int) -> Int {
+fn toml_skip_ws(content: Str, pos: Int) -> Int {
     let mut p = pos
-    while p < content.len() && is_ws(peek(content, p)) {
+    while p < content.len() && toml_is_ws(peek(content, p)) {
         p = p + 1
     }
     p
@@ -110,7 +110,7 @@ fn skip_ws_and_newlines(content: Str, pos: Int) -> Int {
     let mut p = pos
     while p < content.len() {
         let c = peek(content, p)
-        if is_ws(c) || is_newline(c) {
+        if toml_is_ws(c) || is_newline(c) {
             p = p + 1
         } else {
             return p
@@ -242,9 +242,9 @@ fn parse_dotted_key(content: Str, pos: Int) {
     let mut result = tmp_str
     let mut p = tmp_pos
     while p < content.len() {
-        let pp = skip_ws(content, p)
+        let pp = toml_skip_ws(content, p)
         if peek(content, pp) == CH_DOT {
-            let after_dot = skip_ws(content, pp + 1)
+            let after_dot = toml_skip_ws(content, pp + 1)
             parse_key(content, after_dot)
             result = result.concat(".").concat(tmp_str)
             p = tmp_pos
@@ -326,10 +326,10 @@ fn parse_array_value(content: Str, pos: Int, full_key: Str) {
 
 fn parse_inline_table(content: Str, pos: Int, prefix: Str) {
     let mut p = pos + 1
-    p = skip_ws(content, p)
+    p = toml_skip_ws(content, p)
 
     while p < content.len() && peek(content, p) != CH_RBRACE {
-        p = skip_ws(content, p)
+        p = toml_skip_ws(content, p)
         if peek(content, p) == CH_RBRACE {
             p = p + 1
             tmp_pos = p
@@ -340,11 +340,11 @@ fn parse_inline_table(content: Str, pos: Int, prefix: Str) {
         let key = tmp_str
         p = tmp_pos
 
-        p = skip_ws(content, p)
+        p = toml_skip_ws(content, p)
         if peek(content, p) == CH_EQUALS {
             p = p + 1
         }
-        p = skip_ws(content, p)
+        p = toml_skip_ws(content, p)
 
         let full_key = "{prefix}.{key}"
 
@@ -374,7 +374,7 @@ fn parse_inline_table(content: Str, pos: Int, prefix: Str) {
             p = p + 1
         }
 
-        p = skip_ws(content, p)
+        p = toml_skip_ws(content, p)
         if peek(content, p) == CH_COMMA {
             p = p + 1
         }
@@ -435,11 +435,11 @@ fn toml_parse_value(content: Str, pos: Int, full_key: Str) {
 
 fn parse_section_header(content: Str, pos: Int) {
     let mut p = pos + 1
-    p = skip_ws(content, p)
+    p = toml_skip_ws(content, p)
     parse_dotted_key(content, p)
     let name = tmp_str
     p = tmp_pos
-    p = skip_ws(content, p)
+    p = toml_skip_ws(content, p)
     if p < content.len() && peek(content, p) == CH_RBRACKET {
         p = p + 1
     }
@@ -451,11 +451,11 @@ fn parse_section_header(content: Str, pos: Int) {
 
 fn parse_array_table_header(content: Str, pos: Int) {
     let mut p = pos + 2
-    p = skip_ws(content, p)
+    p = toml_skip_ws(content, p)
     parse_dotted_key(content, p)
     let name = tmp_str
     p = tmp_pos
-    p = skip_ws(content, p)
+    p = toml_skip_ws(content, p)
     if p < content.len() && peek(content, p) == CH_RBRACKET {
         p = p + 1
     }
@@ -476,7 +476,7 @@ pub fn toml_parse(content: Str) -> Int {
     let mut array_table_index = 0
 
     while pos < content.len() {
-        pos = skip_ws(content, pos)
+        pos = toml_skip_ws(content, pos)
 
         if pos >= content.len() {
             return 0
@@ -532,11 +532,11 @@ pub fn toml_parse(content: Str) -> Int {
         let key = tmp_str
         pos = tmp_pos
 
-        pos = skip_ws(content, pos)
+        pos = toml_skip_ws(content, pos)
         if peek(content, pos) == CH_EQUALS {
             pos = pos + 1
         }
-        pos = skip_ws(content, pos)
+        pos = toml_skip_ws(content, pos)
 
         let mut full_key = key
         if current_section != "" {

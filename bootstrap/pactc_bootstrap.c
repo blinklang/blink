@@ -737,7 +737,7 @@ pact_tokens_Token pact_tokens_make_token(int64_t kind, const char* value, int64_
 const char* pact_tokens_token_kind_name(int64_t kind);
 int64_t pact_tokens_is_keyword(int64_t kind);
 int64_t pact_tokens_keyword_lookup(const char* name);
-int64_t pact_std_toml_is_alpha(int64_t c);
+int64_t pact_lexer_is_alpha(int64_t c);
 int64_t pact_std_toml_is_digit(int64_t c);
 int64_t pact_lexer_is_alnum(int64_t c);
 int64_t pact_lexer_is_whitespace(int64_t c);
@@ -1222,8 +1222,8 @@ pact_list* pact_file_watcher_fw_get_dirty(void);
 void pact_file_watcher_fw_clear_dirty(void);
 void pact_file_watcher_fw_add_file(const char* path);
 void pact_file_watcher_fw_reset(void);
-int64_t pact_std_toml_is_ws(int64_t c);
-int64_t pact_std_toml_skip_ws(const char* s, int64_t pos);
+int64_t pact_std_json_is_ws(int64_t c);
+int64_t pact_std_json_skip_ws(const char* s, int64_t pos);
 int64_t pact_std_json_alloc_node(int64_t ntype, int64_t parent, const char* key);
 void pact_std_json_parse_string(const char* s, int64_t pos);
 void pact_std_json_parse_number(const char* s, int64_t pos);
@@ -1298,8 +1298,11 @@ const char* pact_daemon_daemon_handle_stop(void);
 void pact_daemon_daemon_loop(void);
 void pact_daemon_daemon_stop(void);
 void pact_daemon_daemon_start(const char* root, const char* source);
+int64_t pact_std_toml_toml_is_ws(int64_t c);
 int64_t pact_std_toml_is_newline(int64_t c);
+int64_t pact_std_toml_toml_is_alpha(int64_t c);
 int64_t pact_std_toml_is_bare_key_char(int64_t c);
+int64_t pact_std_toml_toml_skip_ws(const char* content, int64_t pos);
 int64_t pact_std_toml_skip_to_newline(const char* content, int64_t pos);
 int64_t pact_std_toml_skip_ws_and_newlines(const char* content, int64_t pos);
 void pact_std_toml_store_entry(const char* key, const char* value, int64_t vtype);
@@ -1337,18 +1340,21 @@ const char* pact_std_lockfile_format_caps_toml(const char* caps);
 int64_t pact_std_lockfile_lockfile_write(const char* path);
 const char* pact_std_lockfile_parse_caps_for_pkg(const char* prefix);
 int64_t pact_std_lockfile_lockfile_load(const char* path);
-const char* pact_dots_to_slashes(const char* s);
-const char* pact_dots_to_underscores(const char* s);
-const char* pact_find_src_root(const char* source_path);
-void pact_ensure_lockfile_loaded(const char* src_root);
-const char* pact_compiler_get_home(void);
-const char* pact_resolve_from_lockfile(const char* dotted_path, const char* src_root);
-const char* pact_resolve_module_path(const char* dotted_path, const char* src_root);
-int64_t pact_should_import_item(int64_t item, int64_t import_node);
-int64_t pact_merge_programs(int64_t main_prog, pact_list* imported, pact_list* import_nodes_list);
-int64_t pact_is_file_loaded(const char* path);
-void pact_collect_imports(int64_t program, const char* src_root, pact_list* all_programs);
+const char* pact_compiler_dots_to_slashes(const char* s);
+const char* pact_compiler_dots_to_underscores(const char* s);
+const char* pact_compiler_find_src_root(const char* source_path);
+void pact_compiler_ensure_lockfile_loaded(const char* src_root);
+const char* pact_compiler_compiler_get_home(void);
+const char* pact_compiler_resolve_from_lockfile(const char* dotted_path, const char* src_root);
+const char* pact_compiler_resolve_module_path(const char* dotted_path, const char* src_root);
+int64_t pact_compiler_should_import_item(int64_t item, int64_t import_node);
+int64_t pact_compiler_merge_programs(int64_t main_prog, pact_list* imported, pact_list* import_nodes_list);
+void pact_compiler_reset_compiler_state(void);
+int64_t pact_compiler_is_file_loaded(const char* path);
+void pact_compiler_collect_imports(int64_t program, const char* src_root, pact_list* all_programs);
 void pact_main(void);
+
+typedef struct { int tag; const char* value; } pact_Option_str;
 
 pact_tokens_Token pact_tokens_make_token(int64_t kind, const char* value, int64_t line, int64_t col) {
     pact_tokens_Token _s0 = { .kind = kind, .value = value, .line = line, .col = col };
@@ -1585,7 +1591,7 @@ int64_t pact_tokens_keyword_lookup(const char* name) {
     return _match_0;
 }
 
-int64_t pact_std_toml_is_alpha(int64_t c) {
+int64_t pact_lexer_is_alpha(int64_t c) {
     return ((((c >= CH_A) && (c <= CH_Z)) || ((c >= CH_a) && (c <= CH_Z_LOWER))) || (c == CH_UNDERSCORE));
 }
 
@@ -1594,7 +1600,7 @@ int64_t pact_std_toml_is_digit(int64_t c) {
 }
 
 int64_t pact_lexer_is_alnum(int64_t c) {
-    return (pact_std_toml_is_alpha(c) || pact_std_toml_is_digit(c));
+    return (pact_lexer_is_alpha(c) || pact_std_toml_is_digit(c));
 }
 
 int64_t pact_lexer_is_whitespace(int64_t c) {
@@ -2155,7 +2161,7 @@ void pact_lexer_lex(const char* source) {
                 last_kind = pact_tokens_TokenKind_At;
                 continue;
             }
-            if (pact_std_toml_is_alpha(ch)) {
+            if (pact_lexer_is_alpha(ch)) {
                 const int64_t t_line = line;
                 const int64_t t_col = col;
                 const int64_t start = pos;
@@ -24169,13 +24175,13 @@ void pact_file_watcher_fw_reset(void) {
     path_map = pact_map_new();
 }
 
-int64_t pact_std_toml_is_ws(int64_t c) {
+int64_t pact_std_json_is_ws(int64_t c) {
     return ((((c == CH_SPACE) || (c == CH_TAB)) || (c == CH_NEWLINE)) || (c == CH_CR));
 }
 
-int64_t pact_std_toml_skip_ws(const char* s, int64_t pos) {
+int64_t pact_std_json_skip_ws(const char* s, int64_t pos) {
     int64_t p = pos;
-    while (((p < pact_str_len(s)) && pact_std_toml_is_ws(pact_std_toml_peek(s, p)))) {
+    while (((p < pact_str_len(s)) && pact_std_json_is_ws(pact_std_toml_peek(s, p)))) {
         p = (p + 1);
     }
     return p;
@@ -24380,7 +24386,7 @@ double pact_std_json_parse_float_val(const char* s) {
 }
 
 int64_t pact_std_json_json_parse_value(const char* s, int64_t pos, int64_t parent, const char* key) {
-    const int64_t p = pact_std_toml_skip_ws(s, pos);
+    const int64_t p = pact_std_json_skip_ws(s, pos);
     if ((p >= pact_str_len(s))) {
         parse_error = 1;
         tmp_pos = p;
@@ -24436,12 +24442,12 @@ int64_t pact_std_json_json_parse_value(const char* s, int64_t pos, int64_t paren
         pact_list_set(json_children, idx, (void*)(intptr_t)pact_list_len(json_types));
         int64_t ap = (p + 1);
         int64_t count = 0;
-        ap = pact_std_toml_skip_ws(s, ap);
+        ap = pact_std_json_skip_ws(s, ap);
         while (((ap < pact_str_len(s)) && (pact_std_toml_peek(s, ap) != CH_RBRACKET))) {
             if ((count > 0)) {
                 if ((pact_std_toml_peek(s, ap) == CH_COMMA)) {
                     ap = (ap + 1);
-                    ap = pact_std_toml_skip_ws(s, ap);
+                    ap = pact_std_json_skip_ws(s, ap);
                 }
             }
             if (((ap < pact_str_len(s)) && (pact_std_toml_peek(s, ap) == CH_RBRACKET))) {
@@ -24452,7 +24458,7 @@ int64_t pact_std_json_json_parse_value(const char* s, int64_t pos, int64_t paren
             }
             pact_std_json_json_parse_value(s, ap, idx, "");
             ap = tmp_pos;
-            ap = pact_std_toml_skip_ws(s, ap);
+            ap = pact_std_json_skip_ws(s, ap);
             count = (count + 1);
         }
         if (((ap < pact_str_len(s)) && (pact_std_toml_peek(s, ap) == CH_RBRACKET))) {
@@ -24467,12 +24473,12 @@ int64_t pact_std_json_json_parse_value(const char* s, int64_t pos, int64_t paren
         pact_list_set(json_children, idx, (void*)(intptr_t)pact_list_len(json_types));
         int64_t op = (p + 1);
         int64_t count = 0;
-        op = pact_std_toml_skip_ws(s, op);
+        op = pact_std_json_skip_ws(s, op);
         while (((op < pact_str_len(s)) && (pact_std_toml_peek(s, op) != CH_RBRACE))) {
             if ((count > 0)) {
                 if ((pact_std_toml_peek(s, op) == CH_COMMA)) {
                     op = (op + 1);
-                    op = pact_std_toml_skip_ws(s, op);
+                    op = pact_std_json_skip_ws(s, op);
                 }
             }
             if (((op < pact_str_len(s)) && (pact_std_toml_peek(s, op) == CH_RBRACE))) {
@@ -24489,14 +24495,14 @@ int64_t pact_std_json_json_parse_value(const char* s, int64_t pos, int64_t paren
             pact_std_json_parse_string(s, op);
             const char* field_key = tmp_str;
             op = tmp_pos;
-            op = pact_std_toml_skip_ws(s, op);
+            op = pact_std_json_skip_ws(s, op);
             if ((pact_std_toml_peek(s, op) == CH_COLON)) {
                 op = (op + 1);
             }
-            op = pact_std_toml_skip_ws(s, op);
+            op = pact_std_json_skip_ws(s, op);
             pact_std_json_json_parse_value(s, op, idx, field_key);
             op = tmp_pos;
-            op = pact_std_toml_skip_ws(s, op);
+            op = pact_std_json_skip_ws(s, op);
             count = (count + 1);
         }
         if (((op < pact_str_len(s)) && (pact_std_toml_peek(s, op) == CH_RBRACE))) {
@@ -25806,12 +25812,28 @@ void pact_daemon_daemon_start(const char* root, const char* source) {
     pact_daemon_daemon_stop();
 }
 
+int64_t pact_std_toml_toml_is_ws(int64_t c) {
+    return ((c == CH_SPACE) || (c == CH_TAB));
+}
+
 int64_t pact_std_toml_is_newline(int64_t c) {
     return ((c == CH_NEWLINE) || (c == CH_CR));
 }
 
+int64_t pact_std_toml_toml_is_alpha(int64_t c) {
+    return (((c >= CH_a) && (c <= CH_z)) || ((c >= CH_A) && (c <= CH_Z)));
+}
+
 int64_t pact_std_toml_is_bare_key_char(int64_t c) {
-    return ((((pact_std_toml_is_alpha(c) || pact_std_toml_is_digit(c)) || (c == CH_UNDERSCORE)) || (c == CH_MINUS)) || (c == CH_SLASH));
+    return ((((pact_std_toml_toml_is_alpha(c) || pact_std_toml_is_digit(c)) || (c == CH_UNDERSCORE)) || (c == CH_MINUS)) || (c == CH_SLASH));
+}
+
+int64_t pact_std_toml_toml_skip_ws(const char* content, int64_t pos) {
+    int64_t p = pos;
+    while (((p < pact_str_len(content)) && pact_std_toml_toml_is_ws(pact_std_toml_peek(content, p)))) {
+        p = (p + 1);
+    }
+    return p;
 }
 
 int64_t pact_std_toml_skip_to_newline(const char* content, int64_t pos) {
@@ -25826,7 +25848,7 @@ int64_t pact_std_toml_skip_ws_and_newlines(const char* content, int64_t pos) {
     int64_t p = pos;
     while ((p < pact_str_len(content))) {
         const int64_t c = pact_std_toml_peek(content, p);
-        if ((pact_std_toml_is_ws(c) || pact_std_toml_is_newline(c))) {
+        if ((pact_std_toml_toml_is_ws(c) || pact_std_toml_is_newline(c))) {
             p = (p + 1);
         } else {
             return p;
@@ -25944,9 +25966,9 @@ void pact_std_toml_parse_dotted_key(const char* content, int64_t pos) {
     const char* result = tmp_str;
     int64_t p = tmp_pos;
     while ((p < pact_str_len(content))) {
-        const int64_t pp = pact_std_toml_skip_ws(content, p);
+        const int64_t pp = pact_std_toml_toml_skip_ws(content, p);
         if ((pact_std_toml_peek(content, pp) == CH_DOT)) {
-            const int64_t after_dot = pact_std_toml_skip_ws(content, (pp + 1));
+            const int64_t after_dot = pact_std_toml_toml_skip_ws(content, (pp + 1));
             pact_std_toml_parse_key(content, after_dot);
             result = pact_str_concat(pact_str_concat(result, "."), tmp_str);
             p = tmp_pos;
@@ -26022,9 +26044,9 @@ void pact_std_toml_parse_array_value(const char* content, int64_t pos, const cha
 
 void pact_std_toml_parse_inline_table(const char* content, int64_t pos, const char* prefix) {
     int64_t p = (pos + 1);
-    p = pact_std_toml_skip_ws(content, p);
+    p = pact_std_toml_toml_skip_ws(content, p);
     while (((p < pact_str_len(content)) && (pact_std_toml_peek(content, p) != CH_RBRACE))) {
-        p = pact_std_toml_skip_ws(content, p);
+        p = pact_std_toml_toml_skip_ws(content, p);
         if ((pact_std_toml_peek(content, p) == CH_RBRACE)) {
             p = (p + 1);
             tmp_pos = p;
@@ -26033,11 +26055,11 @@ void pact_std_toml_parse_inline_table(const char* content, int64_t pos, const ch
         pact_std_toml_parse_dotted_key(content, p);
         const char* key = tmp_str;
         p = tmp_pos;
-        p = pact_std_toml_skip_ws(content, p);
+        p = pact_std_toml_toml_skip_ws(content, p);
         if ((pact_std_toml_peek(content, p) == CH_EQUALS)) {
             p = (p + 1);
         }
-        p = pact_std_toml_skip_ws(content, p);
+        p = pact_std_toml_toml_skip_ws(content, p);
         char _si_0[4096];
         snprintf(_si_0, 4096, "%s.%s", prefix, key);
         const char* full_key = strdup(_si_0);
@@ -26070,7 +26092,7 @@ void pact_std_toml_parse_inline_table(const char* content, int64_t pos, const ch
                 }
             }
         }
-        p = pact_std_toml_skip_ws(content, p);
+        p = pact_std_toml_toml_skip_ws(content, p);
         if ((pact_std_toml_peek(content, p) == CH_COMMA)) {
             p = (p + 1);
         }
@@ -26117,11 +26139,11 @@ void pact_std_toml_toml_parse_value(const char* content, int64_t pos, const char
 
 void pact_std_toml_parse_section_header(const char* content, int64_t pos) {
     int64_t p = (pos + 1);
-    p = pact_std_toml_skip_ws(content, p);
+    p = pact_std_toml_toml_skip_ws(content, p);
     pact_std_toml_parse_dotted_key(content, p);
     const char* name = tmp_str;
     p = tmp_pos;
-    p = pact_std_toml_skip_ws(content, p);
+    p = pact_std_toml_toml_skip_ws(content, p);
     if (((p < pact_str_len(content)) && (pact_std_toml_peek(content, p) == CH_RBRACKET))) {
         p = (p + 1);
     }
@@ -26131,11 +26153,11 @@ void pact_std_toml_parse_section_header(const char* content, int64_t pos) {
 
 void pact_std_toml_parse_array_table_header(const char* content, int64_t pos) {
     int64_t p = (pos + 2);
-    p = pact_std_toml_skip_ws(content, p);
+    p = pact_std_toml_toml_skip_ws(content, p);
     pact_std_toml_parse_dotted_key(content, p);
     const char* name = tmp_str;
     p = tmp_pos;
-    p = pact_std_toml_skip_ws(content, p);
+    p = pact_std_toml_toml_skip_ws(content, p);
     if (((p < pact_str_len(content)) && (pact_std_toml_peek(content, p) == CH_RBRACKET))) {
         p = (p + 1);
     }
@@ -26153,7 +26175,7 @@ int64_t pact_std_toml_toml_parse(const char* content) {
     const char* array_table_name = "";
     int64_t array_table_index = 0;
     while ((pos < pact_str_len(content))) {
-        pos = pact_std_toml_skip_ws(content, pos);
+        pos = pact_std_toml_toml_skip_ws(content, pos);
         if ((pos >= pact_str_len(content))) {
             return 0;
         }
@@ -26198,11 +26220,11 @@ int64_t pact_std_toml_toml_parse(const char* content) {
         pact_std_toml_parse_dotted_key(content, pos);
         const char* key = tmp_str;
         pos = tmp_pos;
-        pos = pact_std_toml_skip_ws(content, pos);
+        pos = pact_std_toml_toml_skip_ws(content, pos);
         if ((pact_std_toml_peek(content, pos) == CH_EQUALS)) {
             pos = (pos + 1);
         }
-        pos = pact_std_toml_skip_ws(content, pos);
+        pos = pact_std_toml_toml_skip_ws(content, pos);
         const char* full_key = key;
         if ((!pact_str_eq(current_section, ""))) {
             char _si_1[4096];
@@ -26540,7 +26562,7 @@ int64_t pact_std_lockfile_lockfile_load(const char* path) {
     return 0;
 }
 
-const char* pact_dots_to_slashes(const char* s) {
+const char* pact_compiler_dots_to_slashes(const char* s) {
     const char* result = "";
     int64_t i = 0;
     while ((i < pact_str_len(s))) {
@@ -26554,7 +26576,7 @@ const char* pact_dots_to_slashes(const char* s) {
     return result;
 }
 
-const char* pact_dots_to_underscores(const char* s) {
+const char* pact_compiler_dots_to_underscores(const char* s) {
     const char* result = "";
     int64_t i = 0;
     while ((i < pact_str_len(s))) {
@@ -26568,7 +26590,7 @@ const char* pact_dots_to_underscores(const char* s) {
     return result;
 }
 
-const char* pact_find_src_root(const char* source_path) {
+const char* pact_compiler_find_src_root(const char* source_path) {
     int64_t i = 0;
     while ((i < (pact_str_len(source_path) - 4))) {
         if (((pact_str_char_at(source_path, i) == 47) && pact_str_eq(pact_str_substr(source_path, i, 5), "/src/"))) {
@@ -26582,7 +26604,7 @@ const char* pact_find_src_root(const char* source_path) {
     return pact_path_dirname(source_path);
 }
 
-void pact_ensure_lockfile_loaded(const char* src_root) {
+void pact_compiler_ensure_lockfile_loaded(const char* src_root) {
     if ((lockfile_loaded == 1)) {
         return;
     }
@@ -26597,7 +26619,7 @@ void pact_ensure_lockfile_loaded(const char* src_root) {
     }
 }
 
-const char* pact_compiler_get_home(void) {
+const char* pact_compiler_compiler_get_home(void) {
     pact_shell_exec("printf '%s' $HOME > /tmp/_pact_home");
     const char* raw = pact_read_file("/tmp/_pact_home");
     int64_t end = pact_str_len(raw);
@@ -26612,13 +26634,13 @@ const char* pact_compiler_get_home(void) {
     return "";
 }
 
-const char* pact_resolve_from_lockfile(const char* dotted_path, const char* src_root) {
+const char* pact_compiler_resolve_from_lockfile(const char* dotted_path, const char* src_root) {
     if ((pact_std_lockfile_lockfile_pkg_count() == 0)) {
         return "";
     }
     const char* pkg_name = "";
     const char* sub_path = "";
-    const char* full_pkg = pact_dots_to_slashes(dotted_path);
+    const char* full_pkg = pact_compiler_dots_to_slashes(dotted_path);
     const int64_t idx_full = pact_std_lockfile_lockfile_find_pkg(full_pkg);
     if ((idx_full >= 0)) {
         pkg_name = full_pkg;
@@ -26666,7 +26688,7 @@ const char* pact_resolve_from_lockfile(const char* dotted_path, const char* src_
         }
         if ((second_dot > 0)) {
             const char* two_seg = pact_str_substr(dotted_path, 0, second_dot);
-            const char* two_pkg = pact_dots_to_slashes(two_seg);
+            const char* two_pkg = pact_compiler_dots_to_slashes(two_seg);
             const char* rest = pact_str_substr(dotted_path, (second_dot + 1), ((pact_str_len(dotted_path) - second_dot) - 1));
             const int64_t idx_two = pact_std_lockfile_lockfile_find_pkg(two_pkg);
             if ((idx_two >= 0)) {
@@ -26684,7 +26706,7 @@ const char* pact_resolve_from_lockfile(const char* dotted_path, const char* src_
     if (pact_str_starts_with(source, "path:")) {
         base_dir = pact_str_substr(source, 5, (pact_str_len(source) - 5));
     } else if (pact_str_starts_with(source, "git:")) {
-        const char* home = pact_compiler_get_home();
+        const char* home = pact_compiler_compiler_get_home();
         const char* url_part = pact_str_substr(source, 4, (pact_str_len(source) - 4));
         int64_t hash_pos = (-1);
         int64_t i = 0;
@@ -26720,7 +26742,7 @@ const char* pact_resolve_from_lockfile(const char* dotted_path, const char* src_
         }
         return "";
     }
-    const char* sub_rel = pact_dots_to_slashes(sub_path);
+    const char* sub_rel = pact_compiler_dots_to_slashes(sub_path);
     const char* resolved = pact_path_join(base_dir, pact_path_join("src", pact_str_concat(sub_rel, ".pact")));
     if ((pact_file_exists(resolved) == 1)) {
         return resolved;
@@ -26728,12 +26750,12 @@ const char* pact_resolve_from_lockfile(const char* dotted_path, const char* src_
     return "";
 }
 
-const char* pact_resolve_module_path(const char* dotted_path, const char* src_root) {
-    const char* rel = pact_dots_to_slashes(dotted_path);
+const char* pact_compiler_resolve_module_path(const char* dotted_path, const char* src_root) {
+    const char* rel = pact_compiler_dots_to_slashes(dotted_path);
     const char* full = pact_path_join(src_root, pact_str_concat(rel, ".pact"));
     const int local_exists = (pact_file_exists(full) == 1);
-    pact_ensure_lockfile_loaded(src_root);
-    const char* dep_path = pact_resolve_from_lockfile(dotted_path, src_root);
+    pact_compiler_ensure_lockfile_loaded(src_root);
+    const char* dep_path = pact_compiler_resolve_from_lockfile(dotted_path, src_root);
     if (local_exists) {
         if ((!pact_str_eq(dep_path, ""))) {
             __pact_ctx.io->print("warning[W1000]: local module shadows dependency");
@@ -26752,19 +26774,29 @@ const char* pact_resolve_module_path(const char* dotted_path, const char* src_ro
     }
     if (pact_str_starts_with(dotted_path, "std.")) {
         const char* compiler_dir = pact_path_dirname(pact_get_arg(0));
-        const char* std_rel = pact_dots_to_slashes(pact_str_substr(dotted_path, 4, (pact_str_len(dotted_path) - 4)));
+        const char* std_rel = pact_compiler_dots_to_slashes(pact_str_substr(dotted_path, 4, (pact_str_len(dotted_path) - 4)));
         const char* std_full = pact_path_join(compiler_dir, pact_path_join("lib/std", pact_str_concat(std_rel, ".pact")));
         if ((pact_file_exists(std_full) == 1)) {
             return std_full;
         }
+        const char* _env_2 = getenv("PACT_ROOT");
+        pact_Option_str _env_opt_3 = _env_2 ? (pact_Option_str){.tag = 1, .value = _env_2} : (pact_Option_str){.tag = 0};
+        pact_Option_str __opt4 = _env_opt_3;
+        const char* pact_root = (__opt4.tag == 1 ? __opt4.value : "");
+        if ((!pact_str_eq(pact_root, ""))) {
+            const char* std_root = pact_path_join(pact_root, pact_path_join("lib/std", pact_str_concat(std_rel, ".pact")));
+            if ((pact_file_exists(std_root) == 1)) {
+                return std_root;
+            }
+        }
     }
-    char _si_2[4096];
-    snprintf(_si_2, 4096, "module not found: %s (looked at: %s)", dotted_path, full);
-    pact_diagnostics_diag_error_no_loc("ModuleNotFound", "E1200", strdup(_si_2), "");
+    char _si_5[4096];
+    snprintf(_si_5, 4096, "module not found: %s (looked at: %s)", dotted_path, full);
+    pact_diagnostics_diag_error_no_loc("ModuleNotFound", "E1200", strdup(_si_5), "");
     return "";
 }
 
-int64_t pact_should_import_item(int64_t item, int64_t import_node) {
+int64_t pact_compiler_should_import_item(int64_t item, int64_t import_node) {
     const int64_t names_sl = (int64_t)(intptr_t)pact_list_get(np_args, import_node);
     if ((names_sl == (-1))) {
         return 1;
@@ -26781,7 +26813,7 @@ int64_t pact_should_import_item(int64_t item, int64_t import_node) {
     return 0;
 }
 
-int64_t pact_merge_programs(int64_t main_prog, pact_list* imported, pact_list* import_nodes_list) {
+int64_t pact_compiler_merge_programs(int64_t main_prog, pact_list* imported, pact_list* import_nodes_list) {
     pact_list* _l0 = pact_list_new();
     pact_list* all_fns = _l0;
     pact_list* _l1 = pact_list_new();
@@ -26949,7 +26981,19 @@ int64_t pact_merge_programs(int64_t main_prog, pact_list* imported, pact_list* i
     return merged;
 }
 
-int64_t pact_is_file_loaded(const char* path) {
+void pact_compiler_reset_compiler_state(void) {
+    pact_list* _l0 = pact_list_new();
+    loaded_files = _l0;
+    pact_list* _l1 = pact_list_new();
+    import_map_paths = _l1;
+    pact_list* _l2 = pact_list_new();
+    import_map_nodes = _l2;
+    pact_list* _l3 = pact_list_new();
+    import_map_modules = _l3;
+    lockfile_loaded = 0;
+}
+
+int64_t pact_compiler_is_file_loaded(const char* path) {
     int64_t i = 0;
     while ((i < pact_list_len(loaded_files))) {
         if (pact_str_eq((const char*)pact_list_get(loaded_files, i), path)) {
@@ -26960,7 +27004,7 @@ int64_t pact_is_file_loaded(const char* path) {
     return 0;
 }
 
-void pact_collect_imports(int64_t program, const char* src_root, pact_list* all_programs) {
+void pact_compiler_collect_imports(int64_t program, const char* src_root, pact_list* all_programs) {
     const int64_t imports_sl = (int64_t)(intptr_t)pact_list_get(np_elements, program);
     if ((imports_sl == (-1))) {
         return;
@@ -26969,12 +27013,12 @@ void pact_collect_imports(int64_t program, const char* src_root, pact_list* all_
     while ((i < pact_parser_sublist_length(imports_sl))) {
         const int64_t imp_node = pact_parser_sublist_get(imports_sl, i);
         const char* dotted_path = (const char*)pact_list_get(np_str_val, imp_node);
-        const char* file_path = pact_resolve_module_path(dotted_path, src_root);
+        const char* file_path = pact_compiler_resolve_module_path(dotted_path, src_root);
         if (pact_str_eq(file_path, "")) {
             i = (i + 1);
             continue;
         }
-        if ((pact_is_file_loaded(file_path) == 1)) {
+        if ((pact_compiler_is_file_loaded(file_path) == 1)) {
             i = (i + 1);
             continue;
         }
@@ -26983,11 +27027,11 @@ void pact_collect_imports(int64_t program, const char* src_root, pact_list* all_
         pact_lexer_lex(source);
         pos = 0;
         const int64_t imported_prog = pact_parser_parse_program();
-        pact_collect_imports(imported_prog, src_root, all_programs);
+        pact_compiler_collect_imports(imported_prog, src_root, all_programs);
         pact_list_push(all_programs, (void*)(intptr_t)imported_prog);
         pact_list_push(import_map_paths, (void*)file_path);
         pact_list_push(import_map_nodes, (void*)(intptr_t)imp_node);
-        pact_list_push(import_map_modules, (void*)pact_dots_to_underscores(dotted_path));
+        pact_list_push(import_map_modules, (void*)pact_compiler_dots_to_underscores(dotted_path));
         i = (i + 1);
     }
 }
@@ -27046,14 +27090,14 @@ void pact_main(void) {
     const int64_t program_node = pact_parser_parse_program();
     const int64_t t_parse_end = pact_time_ms();
     pact_list_push(loaded_files, (void*)source_path);
-    const char* src_root = pact_find_src_root(source_path);
+    const char* src_root = pact_compiler_find_src_root(source_path);
     const int64_t t_import_start = pact_time_ms();
     pact_list* _l0 = pact_list_new();
     pact_list* imported_programs = _l0;
-    pact_collect_imports(program_node, src_root, imported_programs);
+    pact_compiler_collect_imports(program_node, src_root, imported_programs);
     int64_t final_program = program_node;
     if ((pact_list_len(imported_programs) > 0)) {
-        final_program = pact_merge_programs(program_node, imported_programs, import_map_nodes);
+        final_program = pact_compiler_merge_programs(program_node, imported_programs, import_map_nodes);
     }
     const int64_t t_import_end = pact_time_ms();
     if (pact_str_eq(emit_mode, "pact")) {

@@ -84,6 +84,18 @@ Two string types (`"plain"` vs `f"interpolated"`) create problems:
 
 With universal interpolation, `"Hello, {name}!"` just works. When no `{expr}` is present, the compiler treats it as a plain string literal — zero cost. Literal braces use `\{`, which is rare enough (JSON templates, regex) to be acceptable. The trade is a one-character escape in edge cases vs eliminating an entire class of bugs in the common case.
 
+**Escape sequences.** Strings support the following backslash escapes:
+
+| Escape | Produces |
+|--------|----------|
+| `\n` | newline |
+| `\r` | carriage return |
+| `\t` | tab |
+| `\\` | literal `\` |
+| `\"` | literal `"` |
+| `\{` | literal `{` (suppresses interpolation) |
+| `\}` | literal `}` |
+
 **Context-sensitive interpolation.** When an interpolated string literal appears where `Query[C]` is expected (e.g., `db.query_one("SELECT * FROM users WHERE id = {id}")`), the compiler extracts `{expr}` as bound parameters instead of concatenating. The *receiving type* determines behavior: `{id}` in a `Str` context is concatenation, `{id}` in a `Query[DB]` context is parameterization. No new string syntax is needed — the same `"..."` literal does the right thing based on where it appears. See section 3.12 for details.
 
 ### 2.5 Contested: No Semicolons

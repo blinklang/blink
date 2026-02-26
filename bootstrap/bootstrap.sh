@@ -14,11 +14,11 @@ echo "Compiling bootstrap compiler..."
 cc -o "$BUILD_DIR/pactc" "$SCRIPT_DIR/pactc_bootstrap.c" -lm
 
 echo "Self-compiling pactc..."
-"$BUILD_DIR/pactc" "$ROOT_DIR/src/compiler.pact" "$BUILD_DIR/pactc_self.c"
+"$BUILD_DIR/pactc" "$ROOT_DIR/src/pactc_main.pact" "$BUILD_DIR/pactc_self.c"
 cc -o "$BUILD_DIR/pactc_self" "$BUILD_DIR/pactc_self.c" -lm
 
 echo "Verifying bootstrap chain..."
-"$BUILD_DIR/pactc_self" "$ROOT_DIR/src/compiler.pact" "$BUILD_DIR/pactc_verify.c"
+"$BUILD_DIR/pactc_self" "$ROOT_DIR/src/pactc_main.pact" "$BUILD_DIR/pactc_verify.c"
 if diff -q "$BUILD_DIR/pactc_self.c" "$BUILD_DIR/pactc_verify.c" > /dev/null 2>&1; then
     echo "Bootstrap verified — self-compilation is stable."
     cp "$BUILD_DIR/pactc_self" "$BUILD_DIR/pactc"

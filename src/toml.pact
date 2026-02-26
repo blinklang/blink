@@ -80,12 +80,12 @@ fn is_digit(c: Int) -> Int {
     c >= CH_0 && c <= CH_9
 }
 
-fn is_alpha(c: Int) -> Int {
+fn toml_is_alpha(c: Int) -> Int {
     (c >= CH_a && c <= CH_z) || (c >= CH_A && c <= CH_Z)
 }
 
 fn is_bare_key_char(c: Int) -> Int {
-    is_alpha(c) || is_digit(c) || c == CH_UNDERSCORE || c == CH_MINUS || c == CH_SLASH
+    toml_is_alpha(c) || is_digit(c) || c == CH_UNDERSCORE || c == CH_MINUS || c == CH_SLASH
 }
 
 // ── Skip helpers ───────────────────────────────────────────────────

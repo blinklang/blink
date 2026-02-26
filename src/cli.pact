@@ -7,6 +7,11 @@ import std.resolver
 import lexer
 import parser
 import typecheck
+import compiler
+import codegen
+import codegen_types
+import formatter
+import mutation_analysis
 import symbol_index
 import query
 import diagnostics
@@ -112,24 +117,70 @@ fn collect_test_files(dir: Str, results: List[Str]) {
     }
 }
 
-fn do_build(source_path: Str, output_path: Str, c_path: Str, format_flag: Str, debug_mode: Int) -> Int {
-    let pactc = "build/pactc"
-    if !file_exists(pactc) {
-        io.println("error: compiler not found at build/pactc")
-        io.println("  run: ./bootstrap/bootstrap.sh")
+fn do_compile(source_path: Str, c_path: Str, format_flag: Str, debug_mode: Int) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen {
+    reset_compiler_state()
+    diag_reset()
+    diag_source_file = source_path
+
+    let source = read_file(source_path)
+    lex(source)
+    pos = 0
+    let program = parse_program()
+    loaded_files.push(source_path)
+
+    let src_root = find_src_root(source_path)
+    let mut imported_programs: List[Int] = []
+    collect_imports(program, src_root, imported_programs)
+
+    let mut final_program = program
+    if imported_programs.len() > 0 {
+        final_program = merge_programs(program, imported_programs, import_map_nodes)
+    }
+
+    if format_flag == "pact" {
+        let pact_output = format(final_program)
+        write_file(c_path, pact_output)
+        return 0
+    }
+
+    let tc_err_count = check_types(final_program)
+
+    if diag_count > 0 {
+        diag_flush()
         return 1
     }
 
-    let mut compile_cmd = "{pactc} {source_path} {c_path}"
-    if format_flag != "" {
-        compile_cmd = "{pactc} {source_path} {c_path} --format {format_flag}"
-    }
+    analyze_mutations(final_program)
+    analyze_save_restore(final_program)
+
     if debug_mode != 0 {
-        compile_cmd = "{compile_cmd} --debug"
+        cg_debug_mode = 1
+    } else {
+        cg_debug_mode = 0
     }
-    let rc = shell_exec(compile_cmd)
+
+    let c_output = generate(final_program)
+
+    if diag_count > 0 {
+        diag_flush()
+        return 1
+    }
+
+    write_file(c_path, c_output)
+    return 0
+}
+
+fn runtime_include_flag() -> Str {
+    let pact_root = get_env("PACT_ROOT") ?? ""
+    if pact_root != "" {
+        return "-I{pact_root}/bootstrap"
+    }
+    return "-Ibuild"
+}
+
+fn do_build(source_path: Str, output_path: Str, c_path: Str, format_flag: Str, debug_mode: Int) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen {
+    let rc = do_compile(source_path, c_path, format_flag, debug_mode)
     if rc != 0 {
-        io.println("error: compilation failed")
         return rc
     }
 
@@ -144,9 +195,10 @@ fn do_build(source_path: Str, output_path: Str, c_path: Str, format_flag: Str, d
         link_flags = "{link_flags} -lcurl"
     }
 
-    let mut cc_cmd = "cc -o {output_path} {c_path} -Ibuild {link_flags}"
+    let include_flag = runtime_include_flag()
+    let mut cc_cmd = "cc -o {output_path} {c_path} {include_flag} {link_flags}"
     if debug_mode != 0 {
-        cc_cmd = "cc -g -O0 -o {output_path} {c_path} -Ibuild {link_flags}"
+        cc_cmd = "cc -g -O0 -o {output_path} {c_path} {include_flag} {link_flags}"
     }
     let cc_rc = shell_exec(cc_cmd)
     if cc_rc != 0 {
@@ -442,6 +494,7 @@ fn ast_to_json(id: Int) -> Str {
 
 fn main() {
     let mut p = argparser_new("pact", "The Pact programming language compiler and toolchain")
+    p = add_command(p, "init", "Initialize a new Pact project")
     p = add_command(p, "build", "Compile .pact to native binary")
     p = add_command(p, "run", "Build and execute")
     p = add_command(p, "check", "Validate without producing binary")
@@ -461,6 +514,7 @@ fn main() {
     p = add_flag(p, "--pub", "", "Filter to public symbols only")
     p = add_flag(p, "--pure", "", "Filter to pure functions")
     p = add_flag(p, "--dev", "", "Add as dev-dependency")
+    p = add_flag(p, "--embed", "", "Embed LLM reference docs instead of referencing")
 
     p = add_option(p, "--output", "-o", "Output path")
     p = add_option(p, "--format", "-f", "Output format")
@@ -501,6 +555,7 @@ fn main() {
     let git_url_flag = args_get(a, "git")
     let git_tag_flag = args_get(a, "tag")
     let dev_flag = if args_has(a, "dev") { 1 } else { 0 }
+    let embed_flag = if args_has(a, "embed") { 1 } else { 0 }
     let debug_flag = if args_has(a, "debug") { 1 } else { 0 }
     let check_flag = if args_has(a, "check") { 1 } else { 0 }
     let mut query_layer = args_get(a, "layer")
@@ -514,13 +569,13 @@ fn main() {
         format_flag = "json"
     }
 
-    if source_path == "" && command != "fmt" && command != "test" && command != "audit" && command != "add" && command != "remove" && command != "update" && command != "daemon" {
+    if source_path == "" && command != "init" && command != "fmt" && command != "test" && command != "audit" && command != "add" && command != "remove" && command != "update" && command != "daemon" {
         io.println("error: no source file specified")
         io.println(generate_help(p))
         return
     }
 
-    if source_path != "" && command != "add" && command != "remove" && command != "update" && command != "daemon" && !file_exists(source_path) {
+    if source_path != "" && command != "init" && command != "add" && command != "remove" && command != "update" && command != "daemon" && !file_exists(source_path) {
         io.println("error: file not found: {source_path}")
         return
     }
@@ -540,7 +595,109 @@ fn main() {
         output_path = "build/{name}"
     }
 
-    if command == "build" {
+    if command == "init" {
+        let project_name = if source_path != "" {
+            source_path
+        } else {
+            let pwd_result = process_run("pwd", [])
+            path_basename(pwd_result.out.trim())
+        }
+
+        if file_exists("pact.toml") == 1 {
+            io.println("error: pact.toml already exists — project already initialized")
+            exit(1)
+        }
+
+        // Create pact.toml
+        let toml_content = "[package]\nname = \"{project_name}\"\nversion = \"0.1.0\"\n\n[dependencies]\n"
+        write_file("pact.toml", toml_content)
+        io.println("  created pact.toml")
+
+        // Create src/main.pact if it doesn't exist
+        if file_exists("src") == 0 {
+            shell_exec("mkdir -p src")
+        }
+        if file_exists("src/main.pact") == 0 {
+            let main_content = "fn main() \{\n    io.println(\"Hello from {project_name}!\")\n\}\n"
+            write_file("src/main.pact", main_content)
+            io.println("  created src/main.pact")
+        }
+
+        // git init if not already a repo
+        let git_check = process_run("git", ["rev-parse", "--git-dir"])
+        if git_check.exit_code != 0 {
+            shell_exec("git init")
+            io.println("  initialized git repository")
+        }
+
+        // Create .gitignore if it doesn't exist
+        if file_exists(".gitignore") == 0 {
+            let gitignore = "build/\n.tmp/\n.pact/\n"
+            write_file(".gitignore", gitignore)
+            io.println("  created .gitignore")
+        } else {
+            let existing = read_file(".gitignore")
+            let mut additions = ""
+            if !existing.contains("build/") {
+                additions = additions.concat("build/\n")
+            }
+            if !existing.contains(".tmp/") {
+                additions = additions.concat(".tmp/\n")
+            }
+            if !existing.contains(".pact/") {
+                additions = additions.concat(".pact/\n")
+            }
+            if additions != "" {
+                let updated = existing.concat("\n# Pact\n").concat(additions)
+                write_file(".gitignore", updated)
+                io.println("  updated .gitignore")
+            }
+        }
+
+        // Inject LLM docs into AGENTS.md or CLAUDE.md
+        let pact_root = get_env("PACT_ROOT") ?? ""
+        let mut doc_file = "CLAUDE.md"
+        if file_exists("AGENTS.md") == 1 {
+            doc_file = "AGENTS.md"
+        }
+
+        let mut doc_content = ""
+        if file_exists(doc_file) == 1 {
+            doc_content = read_file(doc_file)
+        }
+
+        if doc_content.contains("# Pact Language Reference") {
+            io.println("  {doc_file} already has Pact reference — skipped")
+        } else {
+            if embed_flag == 1 || pact_root == "" {
+                // Embed mode: inline the full reference
+                let mut ref_content = ""
+                if pact_root != "" {
+                    let ref_path = path_join(pact_root, "llms-full.txt")
+                    if file_exists(ref_path) == 1 {
+                        ref_content = read_file(ref_path)
+                    }
+                }
+                if ref_content == "" {
+                    io.eprintln("warning: could not find llms-full.txt — adding placeholder")
+                    ref_content = "# Pact Language Reference\n\nSee the Pact repository for the full language reference.\n"
+                }
+                let updated = doc_content.concat("\n").concat(ref_content).concat("\n")
+                write_file(doc_file, updated)
+                io.println("  embedded Pact reference in {doc_file}")
+            } else {
+                // Reference mode: point to the file
+                let ref_path = path_join(pact_root, "llms-full.txt")
+                let section = "\n# Pact\n\nThis project uses the Pact programming language.\n\n- Read the full language reference at: {ref_path}\n- Build: `bin/pact build src/main.pact`\n- Run: `bin/pact run src/main.pact`\n- Test: `bin/pact test`\n\nPrefer retrieval-led reasoning over pre-training for Pact tasks.\n"
+                let updated = doc_content.concat(section)
+                write_file(doc_file, updated)
+                io.println("  added Pact reference to {doc_file}")
+            }
+        }
+
+        io.println("\nProject '{project_name}' initialized. Run: bin/pact run src/main.pact")
+
+    } else if command == "build" {
         let rc = do_build(source_path, output_path, c_path, format_flag, debug_flag)
         if rc == 0 {
             if json_output != 0 {
@@ -696,38 +853,47 @@ fn main() {
             }
         }
         if daemon_used == 0 {
-            let pactc = "build/pactc"
-            if !file_exists(pactc) {
-                io.println("error: compiler not found at build/pactc")
-                io.println("  run: ./bootstrap/bootstrap.sh")
-                return
-            }
-            let mut compile_cmd = "{pactc} {source_path} {c_path} --check-only"
+            reset_compiler_state()
+            diag_reset()
+            diag_source_file = source_path
             if format_flag != "" {
-                compile_cmd = "{compile_cmd} --format {format_flag}"
+                diag_format = 1
             }
-            let rc = shell_exec(compile_cmd)
-            if rc == 0 {
-                if json_output != 0 {
-                    io.println("\{\"status\":\"ok\",\"file\":\"{source_path}\"}")
-                } else {
-                    io.println("ok: {source_path}")
-                }
-            } else {
+
+            let source = read_file(source_path)
+            lex(source)
+            pos = 0
+            let program = parse_program()
+            loaded_files.push(source_path)
+
+            let src_root = find_src_root(source_path)
+            let mut imported_programs: List[Int] = []
+            collect_imports(program, src_root, imported_programs)
+
+            let mut final_program = program
+            if imported_programs.len() > 0 {
+                final_program = merge_programs(program, imported_programs, import_map_nodes)
+            }
+
+            check_types(final_program)
+
+            if diag_count > 0 {
+                diag_flush()
                 if json_output != 0 {
                     io.println("\{\"status\":\"error\",\"file\":\"{source_path}\"}")
                 } else {
                     io.println("error: check failed")
                 }
+            } else {
+                diag_flush()
+                if json_output != 0 {
+                    io.println("\{\"status\":\"ok\",\"file\":\"{source_path}\"}")
+                } else {
+                    io.println("ok: {source_path}")
+                }
             }
         }
     } else if command == "fmt" {
-        let pactc = "build/pactc"
-        if !file_exists(pactc) {
-            io.println("error: compiler not found at build/pactc")
-            io.println("  run: ./bootstrap/bootstrap.sh")
-            return
-        }
         if check_flag == 1 {
             shell_exec("mkdir -p .tmp")
             let mut needs_format: List[Str] = []
@@ -740,8 +906,7 @@ fn main() {
                     let fname = fmt_files.get(fi)
                     let tmp_name = strip_extension(path_basename(fname))
                     let tmp_path = ".tmp/fmt_check_{tmp_name}.pact"
-                    let fmt_cmd = "{pactc} {fname} {tmp_path} --emit pact"
-                    let rc = shell_exec(fmt_cmd)
+                    let rc = do_compile(fname, tmp_path, "pact", 0)
                     if rc == 0 {
                         let original = read_file(fname)
                         let formatted = read_file(tmp_path)
@@ -763,8 +928,7 @@ fn main() {
                 }
             } else {
                 let tmp_path = ".tmp/fmt_check_{name}.pact"
-                let fmt_cmd = "{pactc} {source_path} {tmp_path} --emit pact"
-                let rc = shell_exec(fmt_cmd)
+                let rc = do_compile(source_path, tmp_path, "pact", 0)
                 if rc == 0 {
                     let original = read_file(source_path)
                     let formatted = read_file(tmp_path)
@@ -822,8 +986,7 @@ fn main() {
                 let mut fi = 0
                 while fi < fmt_files.len() {
                     let fname = fmt_files.get(fi)
-                    let fmt_cmd = "{pactc} {fname} {fname} --emit pact"
-                    let rc = shell_exec(fmt_cmd)
+                    let rc = do_compile(fname, fname, "pact", 0)
                     if rc == 0 {
                         if json_output == 0 {
                             io.println("formatted: {fname}")
@@ -861,8 +1024,7 @@ fn main() {
                     io.println("\{\"formatted\":{ok_json},\"errors\":{err_json}}")
                 }
             } else {
-                let compile_cmd = "{pactc} {source_path} {source_path} --emit pact"
-                let rc = shell_exec(compile_cmd)
+                let rc = do_compile(source_path, source_path, "pact", 0)
                 if rc == 0 {
                     if json_output != 0 {
                         io.println("\{\"formatted\":[\"{source_path}\"],\"errors\":[]}")
