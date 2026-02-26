@@ -141,12 +141,12 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
     trait_entries.push(TraitEntry { name: "IntoIterator", method_sl: -1 })
 
     // Register user-defined effect declarations
-    let effects_decl_sl = np_args.get(program)
+    let effects_decl_sl = np_args.unsafe_get(program)
     if effects_decl_sl != -1 {
         let mut ei = 0
         while ei < sublist_length(effects_decl_sl) {
             let ed = sublist_get(effects_decl_sl, ei)
-            let eff_name = np_name.get(ed)
+            let eff_name = np_name.unsafe_get(ed)
             let parent_idx = reg_effect(eff_name, -1)
             let mut handle = ""
             let mut hi = 0
@@ -182,20 +182,20 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
                 hi = hi + 1
             }
             ue_effects.push(UeEffect { name: eff_name, handle: handle })
-            let children_sl = np_elements.get(ed)
+            let children_sl = np_elements.unsafe_get(ed)
             if children_sl != -1 {
                 let mut ci = 0
                 while ci < sublist_length(children_sl) {
                     let child = sublist_get(children_sl, ci)
-                    let child_name = np_name.get(child)
+                    let child_name = np_name.unsafe_get(child)
                     reg_effect("{eff_name}.{child_name}", parent_idx)
-                    let child_ops = np_methods.get(child)
+                    let child_ops = np_methods.unsafe_get(child)
                     if child_ops != -1 {
                         let mut oi = 0
                         while oi < sublist_length(child_ops) {
                             let op = sublist_get(child_ops, oi)
-                            let op_name = np_name.get(op)
-                            let op_ret = np_return_type.get(op)
+                            let op_name = np_name.unsafe_get(op)
+                            let op_ret = np_return_type.unsafe_get(op)
                             let mut op_c_ret = "void"
                             if op_ret == "Int" {
                                 op_c_ret = "int64_t"
@@ -208,7 +208,7 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
                             } else if op_ret != "" {
                                 op_c_ret = "int64_t"
                             }
-                            let op_params_sl = np_params.get(op)
+                            let op_params_sl = np_params.unsafe_get(op)
                             let mut op_c_params = ""
                             if op_params_sl != -1 {
                                 let mut pi = 0
@@ -217,8 +217,8 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
                                         op_c_params = op_c_params.concat(", ")
                                     }
                                     let p = sublist_get(op_params_sl, pi)
-                                    let ptype = np_type_name.get(p)
-                                    let pname = np_name.get(p)
+                                    let ptype = np_type_name.unsafe_get(p)
+                                    let pname = np_name.unsafe_get(p)
                                     let mut pc = "int64_t"
                                     if ptype == "Str" {
                                         pc = "const char*"
@@ -248,20 +248,20 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
     }
 
     // Process top-level annotations (e.g. @capabilities)
-    let anns_sl = np_handlers.get(program)
+    let anns_sl = np_handlers.unsafe_get(program)
     if anns_sl != -1 {
         let mut ai = 0
         while ai < sublist_length(anns_sl) {
             let ann = sublist_get(anns_sl, ai)
-            let ann_name = np_name.get(ann)
+            let ann_name = np_name.unsafe_get(ann)
             if ann_name == "capabilities" {
                 cap_budget_active = 1
-                let ann_args_sl = np_args.get(ann)
+                let ann_args_sl = np_args.unsafe_get(ann)
                 if ann_args_sl != -1 {
                     let mut aj = 0
                     while aj < sublist_length(ann_args_sl) {
                         let arg_nd = sublist_get(ann_args_sl, aj)
-                        cap_budget_names.push(np_name.get(arg_nd))
+                        cap_budget_names.push(np_name.unsafe_get(arg_nd))
                         aj = aj + 1
                     }
                 }
@@ -283,12 +283,12 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
     // Emit user-defined effect vtable structs and globals
     let mut uei = 0
     while uei < ue_effects.len() {
-        let ue = ue_effects.get(uei)
+        let ue = ue_effects.unsafe_get(uei)
         let vt_type = "pact_ue_{ue.handle}_vtable"
         cg_lines.push("typedef struct \{")
         let mut mi = 0
         while mi < ue_methods.len() {
-            let uem = ue_methods.get(mi)
+            let uem = ue_methods.unsafe_get(mi)
             if uem.effect_handle == ue.handle {
                 cg_lines.push("    {uem.ret} (*{uem.name})({uem.params});")
             }
@@ -298,7 +298,7 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
         cg_lines.push("")
         mi = 0
         while mi < ue_methods.len() {
-            let uem = ue_methods.get(mi)
+            let uem = ue_methods.unsafe_get(mi)
             if uem.effect_handle == ue.handle {
                 let dfn = "pact_ue_{ue.handle}_default_{uem.name}"
                 if uem.ret == "void" {
@@ -324,7 +324,7 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
         mi = 0
         let mut first_m = 1
         while mi < ue_methods.len() {
-            let uem = ue_methods.get(mi)
+            let uem = ue_methods.unsafe_get(mi)
             if uem.effect_handle == ue.handle {
                 if first_m == 0 {
                     cg_lines.push(",")
@@ -346,25 +346,25 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
     mod_type_prefix = Map()
 
     // Register type names first (struct or enum)
-    let types_sl = np_fields.get(program)
+    let types_sl = np_fields.unsafe_get(program)
     if types_sl != -1 {
         let mut i = 0
         while i < sublist_length(types_sl) {
             let td = sublist_get(types_sl, i)
-            let mod_name = np_module.get(td)
+            let mod_name = np_module.unsafe_get(td)
             if mod_name != "" {
-                mod_type_prefix.set(np_name.get(td), mod_name)
+                mod_type_prefix.set(np_name.unsafe_get(td), mod_name)
             }
-            let td_flds = np_fields.get(td)
+            let td_flds = np_fields.unsafe_get(td)
             let mut is_enum = 0
             if td_flds != -1 && sublist_length(td_flds) > 0 {
-                if np_kind.get(sublist_get(td_flds, 0)) == NodeKind.TypeVariant {
+                if np_kind.unsafe_get(sublist_get(td_flds, 0)) == NodeKind.TypeVariant {
                     is_enum = 1
                 }
             }
             if is_enum == 0 {
-                struct_reg_names.push(np_name.get(td))
-                struct_reg_set.set(np_name.get(td), 1)
+                struct_reg_names.push(np_name.unsafe_get(td))
+                struct_reg_set.set(np_name.unsafe_get(td), 1)
             }
             i = i + 1
         }
@@ -375,10 +375,10 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
         let mut i = 0
         while i < sublist_length(types_sl) {
             let td = sublist_get(types_sl, i)
-            let td_flds = np_fields.get(td)
+            let td_flds = np_fields.unsafe_get(td)
             let mut is_enum = 0
             if td_flds != -1 && sublist_length(td_flds) > 0 {
-                if np_kind.get(sublist_get(td_flds, 0)) == NodeKind.TypeVariant {
+                if np_kind.unsafe_get(sublist_get(td_flds, 0)) == NodeKind.TypeVariant {
                     is_enum = 1
                 }
             }
@@ -392,12 +392,12 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
     }
 
     // Top-level let bindings (deduplicated)
-    let lets_sl = np_stmts.get(program)
+    let lets_sl = np_stmts.unsafe_get(program)
     if lets_sl != -1 {
         let mut i = 0
         while i < sublist_length(lets_sl) {
             let let_node = sublist_get(lets_sl, i)
-            let let_name = np_name.get(let_node)
+            let let_name = np_name.unsafe_get(let_node)
             if is_emitted_let(let_name) == 0 {
                 emit_top_level_let(let_node)
                 emitted_let_names.push(let_name)
@@ -409,23 +409,23 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
     }
 
     // Register all functions first (deduplicated)
-    let fns_sl = np_params.get(program)
+    let fns_sl = np_params.unsafe_get(program)
     if fns_sl != -1 {
         let mut i = 0
         while i < sublist_length(fns_sl) {
             let fn_node = sublist_get(fns_sl, i)
-            let fn_name = np_name.get(fn_node)
-            let fn_mod = np_module.get(fn_node)
+            let fn_name = np_name.unsafe_get(fn_node)
+            let fn_mod = np_module.unsafe_get(fn_node)
             if fn_mod != "" {
                 mod_fn_prefix.set(fn_name, fn_mod)
             }
             // Track generic functions separately
-            let fn_tparams = np_type_params.get(fn_node)
+            let fn_tparams = np_type_params.unsafe_get(fn_node)
             if fn_tparams != -1 && sublist_length(fn_tparams) > 0 {
                 generic_fns.push(GenericFnEntry { name: fn_name, node: fn_node })
             } else if is_emitted_fn(fn_name) == 0 {
-                let ret_str = np_return_type.get(fn_node)
-                let fn_eff_sl = np_effects.get(fn_node)
+                let ret_str = np_return_type.unsafe_get(fn_node)
+                let fn_eff_sl = np_effects.unsafe_get(fn_node)
                 if is_enum_type(ret_str) != 0 {
                     fn_enum_rets.push(FnEnumRetEntry { name: fn_name, enum_type: ret_str })
                     reg_fn_with_effects(fn_name, CT_INT, fn_eff_sl)
@@ -445,51 +445,51 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
     }
 
     // Register traits
-    let traits_sl = np_arms.get(program)
+    let traits_sl = np_arms.unsafe_get(program)
     if traits_sl != -1 {
         let mut i = 0
         while i < sublist_length(traits_sl) {
             let tr = sublist_get(traits_sl, i)
-            trait_entries.push(TraitEntry { name: np_name.get(tr), method_sl: np_methods.get(tr) })
+            trait_entries.push(TraitEntry { name: np_name.unsafe_get(tr), method_sl: np_methods.unsafe_get(tr) })
             i = i + 1
         }
     }
 
     // Register impls and their methods
-    let impls_sl = np_methods.get(program)
+    let impls_sl = np_methods.unsafe_get(program)
     if impls_sl != -1 {
         let mut i = 0
         while i < sublist_length(impls_sl) {
             let im = sublist_get(impls_sl, i)
-            let impl_trait = np_trait_name.get(im)
-            let impl_type = np_name.get(im)
-            impl_entries.push(ImplEntry { trait_name: impl_trait, type_name: impl_type, methods_sl: np_methods.get(im) })
-            let impl_mod = np_module.get(im)
+            let impl_trait = np_trait_name.unsafe_get(im)
+            let impl_type = np_name.unsafe_get(im)
+            impl_entries.push(ImplEntry { trait_name: impl_trait, type_name: impl_type, methods_sl: np_methods.unsafe_get(im) })
+            let impl_mod = np_module.unsafe_get(im)
             if impl_mod != "" && mod_type_prefix.has(impl_type) == false {
                 mod_type_prefix.set(impl_type, impl_mod)
             }
             if impl_trait == "From" {
-                let trait_tparams = np_type_params.get(im)
+                let trait_tparams = np_type_params.unsafe_get(im)
                 if trait_tparams != -1 && sublist_length(trait_tparams) > 0 {
                     let src_node = sublist_get(trait_tparams, 0)
-                    let src_type = np_name.get(src_node)
-                    from_entries.push(FromImplEntry { source: src_type, target: impl_type, method_sl: np_methods.get(im) })
+                    let src_type = np_name.unsafe_get(src_node)
+                    from_entries.push(FromImplEntry { source: src_type, target: impl_type, method_sl: np_methods.unsafe_get(im) })
                 }
             }
             if impl_trait == "TryFrom" {
-                let trait_tparams = np_type_params.get(im)
+                let trait_tparams = np_type_params.unsafe_get(im)
                 if trait_tparams != -1 && sublist_length(trait_tparams) > 0 {
                     let src_node = sublist_get(trait_tparams, 0)
-                    let src_type = np_name.get(src_node)
-                    tryfrom_entries.push(TryFromImplEntry { source: src_type, target: impl_type, method_sl: np_methods.get(im) })
+                    let src_type = np_name.unsafe_get(src_node)
+                    tryfrom_entries.push(TryFromImplEntry { source: src_type, target: impl_type, method_sl: np_methods.unsafe_get(im) })
                 }
             }
-            let methods_sl = np_methods.get(im)
+            let methods_sl = np_methods.unsafe_get(im)
             if methods_sl != -1 {
                 let mut j = 0
                 while j < sublist_length(methods_sl) {
                     let m = sublist_get(methods_sl, j)
-                    let mname = np_name.get(m)
+                    let mname = np_name.unsafe_get(m)
                     let mangled = "{impl_type}_{mname}"
                     if mod_type_prefix.has(impl_type) {
                         let m_mod = mod_type_prefix.get(impl_type)
@@ -497,7 +497,7 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
                             mod_fn_prefix.set(mangled, m_mod)
                         }
                     }
-                    let ret_str_raw = np_return_type.get(m)
+                    let ret_str_raw = np_return_type.unsafe_get(m)
                     let ret_str = resolve_self_type(ret_str_raw, impl_type)
                     if is_enum_type(ret_str) != 0 {
                         fn_enum_rets.push(FnEnumRetEntry { name: mangled, enum_type: ret_str })
@@ -522,7 +522,7 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
     // Auto-derive Into from From
     let mut into_i = 0
     while into_i < from_entries.len() {
-        let fe = from_entries.get(into_i)
+        let fe = from_entries.unsafe_get(into_i)
         impl_entries.push(ImplEntry { trait_name: "Into", type_name: fe.source, methods_sl: fe.method_sl })
         into_i = into_i + 1
     }
@@ -540,7 +540,7 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
         let mut i = 0
         while i < sublist_length(fns_sl) {
             let fn_node = sublist_get(fns_sl, i)
-            let fn_name = np_name.get(fn_node)
+            let fn_name = np_name.unsafe_get(fn_node)
             if is_emitted_fn(fn_name) == 0 && is_generic_fn(fn_name) == 0 {
                 emit_fn_decl(fn_node)
                 emitted_fn_names.push(fn_name)
@@ -555,20 +555,20 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
         let mut i = 0
         while i < sublist_length(impls_sl) {
             let im = sublist_get(impls_sl, i)
-            let impl_type = np_name.get(im)
-            let methods_sl = np_methods.get(im)
+            let impl_type = np_name.unsafe_get(im)
+            let methods_sl = np_methods.unsafe_get(im)
             if methods_sl != -1 {
                 let mut j = 0
                 while j < sublist_length(methods_sl) {
                     let m = sublist_get(methods_sl, j)
-                    let mname = np_name.get(m)
+                    let mname = np_name.unsafe_get(m)
                     let mangled = "{impl_type}_{mname}"
                     let params = format_impl_params(m, impl_type)
                     let enum_ret = get_fn_enum_ret(mangled)
                     if enum_ret != "" {
                         emit_line("{c_type_c_name(enum_ret)} {c_fn_name(mangled)}({params});")
                     } else {
-                        let ret_str_raw = np_return_type.get(m)
+                        let ret_str_raw = np_return_type.unsafe_get(m)
                         let ret_str = resolve_self_type(ret_str_raw, impl_type)
                         if is_struct_type(ret_str) != 0 {
                             emit_line("{c_type_c_name(ret_str)} {c_fn_name(mangled)}({params});")
@@ -602,7 +602,7 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
         let mut i = 0
         while i < sublist_length(fns_sl) {
             let fn_node = sublist_get(fns_sl, i)
-            let fn_name = np_name.get(fn_node)
+            let fn_name = np_name.unsafe_get(fn_node)
             if is_emitted_fn(fn_name) == 0 && is_generic_fn(fn_name) == 0 {
                 emit_fn_def(fn_node)
                 emit_line("")
@@ -618,8 +618,8 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
         let mut i = 0
         while i < sublist_length(impls_sl) {
             let im = sublist_get(impls_sl, i)
-            let impl_type = np_name.get(im)
-            let methods_sl = np_methods.get(im)
+            let impl_type = np_name.unsafe_get(im)
+            let methods_sl = np_methods.unsafe_get(im)
             if methods_sl != -1 {
                 let mut j = 0
                 while j < sublist_length(methods_sl) {
@@ -655,7 +655,7 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
     if cg_closure_defs.len() > 0 {
         let mut ci = 0
         while ci < cg_closure_defs.len() {
-            cg_lines.push(cg_closure_defs.get(ci))
+            cg_lines.push(cg_closure_defs.unsafe_get(ci))
             ci = ci + 1
         }
     }
@@ -669,12 +669,12 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
     // Now append the function definitions
     let mut fi = 0
     while fi < fn_def_lines.len() {
-        cg_lines.push(fn_def_lines.get(fi))
+        cg_lines.push(fn_def_lines.unsafe_get(fi))
         fi = fi + 1
     }
 
     // Emit test functions into temp buffer so we can prepend closure defs
-    let tests_sl = np_captures.get(program)
+    let tests_sl = np_captures.unsafe_get(program)
     let mut test_names: List[Str] = []
     let mut test_c_names: List[Str] = []
     let mut test_all_tags: List[Str] = []
@@ -700,8 +700,8 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
         let mut ti = 0
         while ti < sublist_length(tests_sl) {
             let tb = sublist_get(tests_sl, ti)
-            let tname = np_name.get(tb)
-            let tbody = np_body.get(tb)
+            let tname = np_name.unsafe_get(tb)
+            let tbody = np_body.unsafe_get(tb)
             let mut sanitized = ""
             let mut si = 0
             while si < tname.len() {
@@ -723,18 +723,18 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
             test_names.push(tname)
             test_c_names.push(c_name)
             let tag_offset = test_all_tags.len()
-            let tb_anns = np_handlers.get(tb)
+            let tb_anns = np_handlers.unsafe_get(tb)
             if tb_anns != -1 {
                 let mut tai = 0
                 while tai < sublist_length(tb_anns) {
                     let ann = sublist_get(tb_anns, tai)
-                    if np_name.get(ann) == "tags" {
-                        let tag_args_sl = np_args.get(ann)
+                    if np_name.unsafe_get(ann) == "tags" {
+                        let tag_args_sl = np_args.unsafe_get(ann)
                         if tag_args_sl != -1 {
                             let mut tgi = 0
                             while tgi < sublist_length(tag_args_sl) {
                                 let tag_nd = sublist_get(tag_args_sl, tgi)
-                                test_all_tags.push(np_name.get(tag_nd))
+                                test_all_tags.push(np_name.unsafe_get(tag_nd))
                                 tgi = tgi + 1
                             }
                         }
@@ -772,7 +772,7 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
     if cg_closure_defs.len() > pre_test_closure_count {
         let mut tci = pre_test_closure_count
         while tci < cg_closure_defs.len() {
-            cg_lines.push(cg_closure_defs.get(tci))
+            cg_lines.push(cg_closure_defs.unsafe_get(tci))
             tci = tci + 1
         }
     }
@@ -780,7 +780,7 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
     // Now append the test function definitions
     let mut tfi = 0
     while tfi < test_fn_lines.len() {
-        cg_lines.push(test_fn_lines.get(tfi))
+        cg_lines.push(test_fn_lines.unsafe_get(tfi))
         tfi = tfi + 1
     }
 
@@ -789,17 +789,17 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
     if test_count > 0 {
         let mut tti = 0
         while tti < test_count {
-            let tag_count = test_tag_counts.get(tti)
+            let tag_count = test_tag_counts.unsafe_get(tti)
             if tag_count > 0 {
-                let tcn = test_c_names.get(tti)
+                let tcn = test_c_names.unsafe_get(tti)
                 let mut tag_arr = "static const char* {tcn}_tags[] = \{"
                 let mut tgi = 0
                 while tgi < tag_count {
                     if tgi > 0 {
                         tag_arr = tag_arr.concat(", ")
                     }
-                    let tag_idx = test_tag_offsets.get(tti) + tgi
-                    let tag_val = test_all_tags.get(tag_idx)
+                    let tag_idx = test_tag_offsets.unsafe_get(tti) + tgi
+                    let tag_val = test_all_tags.unsafe_get(tag_idx)
                     tag_arr = tag_arr.concat("\"").concat(tag_val).concat("\"")
                     tgi = tgi + 1
                 }
@@ -812,10 +812,10 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
         cg_indent = cg_indent + 1
         let mut tri = 0
         while tri < test_count {
-            let tn = test_names.get(tri)
-            let tcn = test_c_names.get(tri)
+            let tn = test_names.unsafe_get(tri)
+            let tcn = test_c_names.unsafe_get(tri)
             let comma = if tri < test_count - 1 { "," } else { "" }
-            let tc = test_tag_counts.get(tri)
+            let tc = test_tag_counts.unsafe_get(tri)
             if tc > 0 {
                 emit_line("\{\"{tn}\", {tcn}, __FILE__, 0, 0, {tcn}_tags, {tc}}{comma}")
             } else {
@@ -839,7 +839,7 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
         emit_line("static void __pact_init_globals(void) \{")
         let mut gi = 0
         while gi < cg_global_inits.len() {
-            cg_lines.push(cg_global_inits.get(gi))
+            cg_lines.push(cg_global_inits.unsafe_get(gi))
             gi = gi + 1
         }
         emit_line("}")

@@ -7,7 +7,7 @@ import diagnostics
 pub fn list_contains_str(lst: List[Str], val: Str) -> Int {
     let mut i = 0
     while i < lst.len() {
-        if lst.get(i) == val {
+        if lst.unsafe_get(i) == val {
             return 1
         }
         i = i + 1
@@ -18,7 +18,7 @@ pub fn list_contains_str(lst: List[Str], val: Str) -> Int {
 pub fn is_in_scope(name: Str) -> Int {
     let mut i = 0
     while i < scope_vars.len() {
-        if scope_vars.get(i).name == name {
+        if scope_vars.unsafe_get(i).name == name {
             return 1
         }
         i = i + 1
@@ -30,10 +30,10 @@ pub fn collect_free_vars(node: Int, params: List[Str], locals: List[Str], result
     if node == -1 {
         return
     }
-    let kind = np_kind.get(node)
+    let kind = np_kind.unsafe_get(node)
 
     if kind == NodeKind.Ident {
-        let name = np_name.get(node)
+        let name = np_name.unsafe_get(node)
         if list_contains_str(params, name) {
             return
         }
@@ -58,7 +58,7 @@ pub fn collect_free_vars(node: Int, params: List[Str], locals: List[Str], result
         let mut fi = 0
         let mut is_fn_reg = 0
         while fi < fn_regs.len() {
-            if fn_regs.get(fi).name == name {
+            if fn_regs.unsafe_get(fi).name == name {
                 is_fn_reg = 1
             }
             fi = fi + 1
@@ -73,19 +73,19 @@ pub fn collect_free_vars(node: Int, params: List[Str], locals: List[Str], result
     }
 
     if kind == NodeKind.BinOp {
-        collect_free_vars(np_left.get(node), params, locals, result)
-        collect_free_vars(np_right.get(node), params, locals, result)
+        collect_free_vars(np_left.unsafe_get(node), params, locals, result)
+        collect_free_vars(np_right.unsafe_get(node), params, locals, result)
         return
     }
 
     if kind == NodeKind.UnaryOp {
-        collect_free_vars(np_left.get(node), params, locals, result)
+        collect_free_vars(np_left.unsafe_get(node), params, locals, result)
         return
     }
 
     if kind == NodeKind.Call {
-        collect_free_vars(np_left.get(node), params, locals, result)
-        let args_sl = np_args.get(node)
+        collect_free_vars(np_left.unsafe_get(node), params, locals, result)
+        let args_sl = np_args.unsafe_get(node)
         if args_sl != -1 {
             let mut ai = 0
             while ai < sublist_length(args_sl) {
@@ -97,8 +97,8 @@ pub fn collect_free_vars(node: Int, params: List[Str], locals: List[Str], result
     }
 
     if kind == NodeKind.MethodCall {
-        collect_free_vars(np_obj.get(node), params, locals, result)
-        let args_sl = np_args.get(node)
+        collect_free_vars(np_obj.unsafe_get(node), params, locals, result)
+        let args_sl = np_args.unsafe_get(node)
         if args_sl != -1 {
             let mut ai = 0
             while ai < sublist_length(args_sl) {
@@ -110,9 +110,9 @@ pub fn collect_free_vars(node: Int, params: List[Str], locals: List[Str], result
     }
 
     if kind == NodeKind.IfExpr {
-        collect_free_vars(np_condition.get(node), params, locals, result)
-        collect_free_vars_block(np_then_body.get(node), params, locals, result)
-        collect_free_vars_block(np_else_body.get(node), params, locals, result)
+        collect_free_vars(np_condition.unsafe_get(node), params, locals, result)
+        collect_free_vars_block(np_then_body.unsafe_get(node), params, locals, result)
+        collect_free_vars_block(np_else_body.unsafe_get(node), params, locals, result)
         return
     }
 
@@ -122,8 +122,8 @@ pub fn collect_free_vars(node: Int, params: List[Str], locals: List[Str], result
     }
 
     if kind == NodeKind.LetBinding {
-        collect_free_vars(np_value.get(node), params, locals, result)
-        let bound_name = np_name.get(node)
+        collect_free_vars(np_value.unsafe_get(node), params, locals, result)
+        let bound_name = np_name.unsafe_get(node)
         if !list_contains_str(locals, bound_name) {
             locals.push(bound_name)
         }
@@ -131,61 +131,61 @@ pub fn collect_free_vars(node: Int, params: List[Str], locals: List[Str], result
     }
 
     if kind == NodeKind.ForIn {
-        collect_free_vars(np_iterable.get(node), params, locals, result)
-        let vn = np_var_name.get(node)
+        collect_free_vars(np_iterable.unsafe_get(node), params, locals, result)
+        let vn = np_var_name.unsafe_get(node)
         let mut inner_locals: List[Str] = []
         let mut li = 0
         while li < locals.len() {
-            inner_locals.push(locals.get(li))
+            inner_locals.push(locals.unsafe_get(li))
             li = li + 1
         }
         inner_locals.push(vn)
-        collect_free_vars_block(np_body.get(node), params, inner_locals, result)
+        collect_free_vars_block(np_body.unsafe_get(node), params, inner_locals, result)
         return
     }
 
     if kind == NodeKind.WhileLoop {
-        collect_free_vars(np_condition.get(node), params, locals, result)
-        collect_free_vars_block(np_body.get(node), params, locals, result)
+        collect_free_vars(np_condition.unsafe_get(node), params, locals, result)
+        collect_free_vars_block(np_body.unsafe_get(node), params, locals, result)
         return
     }
 
     if kind == NodeKind.LoopExpr {
-        collect_free_vars_block(np_body.get(node), params, locals, result)
+        collect_free_vars_block(np_body.unsafe_get(node), params, locals, result)
         return
     }
 
     if kind == NodeKind.Return {
-        collect_free_vars(np_value.get(node), params, locals, result)
+        collect_free_vars(np_value.unsafe_get(node), params, locals, result)
         return
     }
 
     if kind == NodeKind.ExprStmt {
-        collect_free_vars(np_value.get(node), params, locals, result)
+        collect_free_vars(np_value.unsafe_get(node), params, locals, result)
         return
     }
 
     if kind == NodeKind.Assignment {
-        collect_free_vars(np_target.get(node), params, locals, result)
-        collect_free_vars(np_value.get(node), params, locals, result)
+        collect_free_vars(np_target.unsafe_get(node), params, locals, result)
+        collect_free_vars(np_value.unsafe_get(node), params, locals, result)
         return
     }
 
     if kind == NodeKind.CompoundAssign {
-        collect_free_vars(np_target.get(node), params, locals, result)
-        collect_free_vars(np_value.get(node), params, locals, result)
+        collect_free_vars(np_target.unsafe_get(node), params, locals, result)
+        collect_free_vars(np_value.unsafe_get(node), params, locals, result)
         return
     }
 
     if kind == NodeKind.MatchExpr {
-        collect_free_vars(np_scrutinee.get(node), params, locals, result)
-        let arms_sl = np_arms.get(node)
+        collect_free_vars(np_scrutinee.unsafe_get(node), params, locals, result)
+        let arms_sl = np_arms.unsafe_get(node)
         if arms_sl != -1 {
             let mut ai = 0
             while ai < sublist_length(arms_sl) {
                 let arm = sublist_get(arms_sl, ai)
-                collect_free_vars(np_guard.get(arm), params, locals, result)
-                collect_free_vars(np_body.get(arm), params, locals, result)
+                collect_free_vars(np_guard.unsafe_get(arm), params, locals, result)
+                collect_free_vars(np_body.unsafe_get(arm), params, locals, result)
                 ai = ai + 1
             }
         }
@@ -193,23 +193,23 @@ pub fn collect_free_vars(node: Int, params: List[Str], locals: List[Str], result
     }
 
     if kind == NodeKind.FieldAccess {
-        collect_free_vars(np_obj.get(node), params, locals, result)
+        collect_free_vars(np_obj.unsafe_get(node), params, locals, result)
         return
     }
 
     if kind == NodeKind.IndexExpr {
-        collect_free_vars(np_obj.get(node), params, locals, result)
-        collect_free_vars(np_index.get(node), params, locals, result)
+        collect_free_vars(np_obj.unsafe_get(node), params, locals, result)
+        collect_free_vars(np_index.unsafe_get(node), params, locals, result)
         return
     }
 
     if kind == NodeKind.InterpString {
-        let parts_sl = np_elements.get(node)
+        let parts_sl = np_elements.unsafe_get(node)
         if parts_sl != -1 {
             let mut pi = 0
             while pi < sublist_length(parts_sl) {
                 let part = sublist_get(parts_sl, pi)
-                if np_kind.get(part) != NodeKind.Ident || np_str_val.get(part) == "" {
+                if np_kind.unsafe_get(part) != NodeKind.Ident || np_str_val.unsafe_get(part) == "" {
                     collect_free_vars(part, params, locals, result)
                 }
                 pi = pi + 1
@@ -223,7 +223,7 @@ pub fn collect_free_vars(node: Int, params: List[Str], locals: List[Str], result
     }
 
     if kind == NodeKind.ListLit {
-        let elems_sl = np_elements.get(node)
+        let elems_sl = np_elements.unsafe_get(node)
         if elems_sl != -1 {
             let mut ei = 0
             while ei < sublist_length(elems_sl) {
@@ -235,12 +235,12 @@ pub fn collect_free_vars(node: Int, params: List[Str], locals: List[Str], result
     }
 
     if kind == NodeKind.StructLit {
-        let flds_sl = np_fields.get(node)
+        let flds_sl = np_fields.unsafe_get(node)
         if flds_sl != -1 {
             let mut fi = 0
             while fi < sublist_length(flds_sl) {
                 let sf = sublist_get(flds_sl, fi)
-                collect_free_vars(np_value.get(sf), params, locals, result)
+                collect_free_vars(np_value.unsafe_get(sf), params, locals, result)
                 fi = fi + 1
             }
         }
@@ -248,7 +248,7 @@ pub fn collect_free_vars(node: Int, params: List[Str], locals: List[Str], result
     }
 
     if kind == NodeKind.TupleLit {
-        let elems_sl = np_elements.get(node)
+        let elems_sl = np_elements.unsafe_get(node)
         if elems_sl != -1 {
             let mut ei = 0
             while ei < sublist_length(elems_sl) {
@@ -260,31 +260,31 @@ pub fn collect_free_vars(node: Int, params: List[Str], locals: List[Str], result
     }
 
     if kind == NodeKind.RangeLit {
-        collect_free_vars(np_start.get(node), params, locals, result)
-        collect_free_vars(np_end.get(node), params, locals, result)
+        collect_free_vars(np_start.unsafe_get(node), params, locals, result)
+        collect_free_vars(np_end.unsafe_get(node), params, locals, result)
         return
     }
 
     if kind == NodeKind.WithBlock {
-        let wh_sl = np_handlers.get(node)
+        let wh_sl = np_handlers.unsafe_get(node)
         if wh_sl != -1 {
             let mut hi = 0
             while hi < sublist_length(wh_sl) {
                 let hitem = sublist_get(wh_sl, hi)
-                if np_kind.get(hitem) == NodeKind.WithResource {
-                    collect_free_vars(np_value.get(hitem), params, locals, result)
+                if np_kind.unsafe_get(hitem) == NodeKind.WithResource {
+                    collect_free_vars(np_value.unsafe_get(hitem), params, locals, result)
                 } else {
                     collect_free_vars(hitem, params, locals, result)
                 }
                 hi = hi + 1
             }
         }
-        collect_free_vars_block(np_body.get(node), params, locals, result)
+        collect_free_vars_block(np_body.unsafe_get(node), params, locals, result)
         return
     }
 
     if kind == NodeKind.WithResource {
-        collect_free_vars(np_value.get(node), params, locals, result)
+        collect_free_vars(np_value.unsafe_get(node), params, locals, result)
         return
     }
 }
@@ -293,14 +293,14 @@ pub fn collect_free_vars_block(block: Int, params: List[Str], locals: List[Str],
     if block == -1 {
         return
     }
-    let stmts_sl = np_stmts.get(block)
+    let stmts_sl = np_stmts.unsafe_get(block)
     if stmts_sl == -1 {
         return
     }
     let mut block_locals: List[Str] = []
     let mut li = 0
     while li < locals.len() {
-        block_locals.push(locals.get(li))
+        block_locals.push(locals.unsafe_get(li))
         li = li + 1
     }
     let mut si = 0
@@ -316,7 +316,7 @@ pub fn analyze_captures(body: Int, params_sl: Int) -> List[Str] {
         let mut i = 0
         while i < sublist_length(params_sl) {
             let p = sublist_get(params_sl, i)
-            param_names.push(np_name.get(p))
+            param_names.push(np_name.unsafe_get(p))
             i = i + 1
         }
     }
@@ -333,10 +333,10 @@ pub fn prescan_collect_muts(node: Int) {
     if node == -1 {
         return
     }
-    let kind = np_kind.get(node)
+    let kind = np_kind.unsafe_get(node)
     if kind == NodeKind.LetBinding {
-        if np_is_mut.get(node) != 0 {
-            prescan_mut_names.push(np_name.get(node))
+        if np_is_mut.unsafe_get(node) != 0 {
+            prescan_mut_names.push(np_name.unsafe_get(node))
         }
         return
     }
@@ -345,24 +345,24 @@ pub fn prescan_collect_muts(node: Int) {
         return
     }
     if kind == NodeKind.IfExpr {
-        prescan_collect_muts_block(np_then_body.get(node))
-        prescan_collect_muts_block(np_else_body.get(node))
+        prescan_collect_muts_block(np_then_body.unsafe_get(node))
+        prescan_collect_muts_block(np_else_body.unsafe_get(node))
         return
     }
     if kind == NodeKind.WhileLoop {
-        prescan_collect_muts_block(np_body.get(node))
+        prescan_collect_muts_block(np_body.unsafe_get(node))
         return
     }
     if kind == NodeKind.ForIn {
-        prescan_collect_muts_block(np_body.get(node))
+        prescan_collect_muts_block(np_body.unsafe_get(node))
         return
     }
     if kind == NodeKind.LoopExpr {
-        prescan_collect_muts_block(np_body.get(node))
+        prescan_collect_muts_block(np_body.unsafe_get(node))
         return
     }
     if kind == NodeKind.WithBlock {
-        prescan_collect_muts_block(np_body.get(node))
+        prescan_collect_muts_block(np_body.unsafe_get(node))
         return
     }
 }
@@ -371,7 +371,7 @@ pub fn prescan_collect_muts_block(block: Int) {
     if block == -1 {
         return
     }
-    let stmts_sl = np_stmts.get(block)
+    let stmts_sl = np_stmts.unsafe_get(block)
     if stmts_sl == -1 {
         return
     }
@@ -389,23 +389,23 @@ pub fn prescan_collect_closure_idents(node: Int) {
     if node == -1 {
         return
     }
-    let kind = np_kind.get(node)
+    let kind = np_kind.unsafe_get(node)
     if kind == NodeKind.Ident {
-        prescan_closure_idents.push(np_name.get(node))
+        prescan_closure_idents.push(np_name.unsafe_get(node))
         return
     }
     if kind == NodeKind.BinOp {
-        prescan_collect_closure_idents(np_left.get(node))
-        prescan_collect_closure_idents(np_right.get(node))
+        prescan_collect_closure_idents(np_left.unsafe_get(node))
+        prescan_collect_closure_idents(np_right.unsafe_get(node))
         return
     }
     if kind == NodeKind.UnaryOp {
-        prescan_collect_closure_idents(np_left.get(node))
+        prescan_collect_closure_idents(np_left.unsafe_get(node))
         return
     }
     if kind == NodeKind.Call {
-        prescan_collect_closure_idents(np_left.get(node))
-        let args_sl = np_args.get(node)
+        prescan_collect_closure_idents(np_left.unsafe_get(node))
+        let args_sl = np_args.unsafe_get(node)
         if args_sl != -1 {
             let mut ai = 0
             while ai < sublist_length(args_sl) {
@@ -416,8 +416,8 @@ pub fn prescan_collect_closure_idents(node: Int) {
         return
     }
     if kind == NodeKind.MethodCall {
-        prescan_collect_closure_idents(np_obj.get(node))
-        let args_sl = np_args.get(node)
+        prescan_collect_closure_idents(np_obj.unsafe_get(node))
+        let args_sl = np_args.unsafe_get(node)
         if args_sl != -1 {
             let mut ai = 0
             while ai < sublist_length(args_sl) {
@@ -428,25 +428,25 @@ pub fn prescan_collect_closure_idents(node: Int) {
         return
     }
     if kind == NodeKind.Assignment {
-        prescan_collect_closure_idents(np_target.get(node))
-        prescan_collect_closure_idents(np_value.get(node))
+        prescan_collect_closure_idents(np_target.unsafe_get(node))
+        prescan_collect_closure_idents(np_value.unsafe_get(node))
         return
     }
     if kind == NodeKind.CompoundAssign {
-        prescan_collect_closure_idents(np_target.get(node))
-        prescan_collect_closure_idents(np_value.get(node))
+        prescan_collect_closure_idents(np_target.unsafe_get(node))
+        prescan_collect_closure_idents(np_value.unsafe_get(node))
         return
     }
     if kind == NodeKind.LetBinding {
-        prescan_collect_closure_idents(np_value.get(node))
+        prescan_collect_closure_idents(np_value.unsafe_get(node))
         return
     }
     if kind == NodeKind.ExprStmt {
-        prescan_collect_closure_idents(np_value.get(node))
+        prescan_collect_closure_idents(np_value.unsafe_get(node))
         return
     }
     if kind == NodeKind.Return {
-        prescan_collect_closure_idents(np_value.get(node))
+        prescan_collect_closure_idents(np_value.unsafe_get(node))
         return
     }
     if kind == NodeKind.Block {
@@ -454,27 +454,27 @@ pub fn prescan_collect_closure_idents(node: Int) {
         return
     }
     if kind == NodeKind.IfExpr {
-        prescan_collect_closure_idents(np_condition.get(node))
-        prescan_collect_closure_idents_block(np_then_body.get(node))
-        prescan_collect_closure_idents_block(np_else_body.get(node))
+        prescan_collect_closure_idents(np_condition.unsafe_get(node))
+        prescan_collect_closure_idents_block(np_then_body.unsafe_get(node))
+        prescan_collect_closure_idents_block(np_else_body.unsafe_get(node))
         return
     }
     if kind == NodeKind.WhileLoop {
-        prescan_collect_closure_idents(np_condition.get(node))
-        prescan_collect_closure_idents_block(np_body.get(node))
+        prescan_collect_closure_idents(np_condition.unsafe_get(node))
+        prescan_collect_closure_idents_block(np_body.unsafe_get(node))
         return
     }
     if kind == NodeKind.ForIn {
-        prescan_collect_closure_idents(np_iterable.get(node))
-        prescan_collect_closure_idents_block(np_body.get(node))
+        prescan_collect_closure_idents(np_iterable.unsafe_get(node))
+        prescan_collect_closure_idents_block(np_body.unsafe_get(node))
         return
     }
     if kind == NodeKind.LoopExpr {
-        prescan_collect_closure_idents_block(np_body.get(node))
+        prescan_collect_closure_idents_block(np_body.unsafe_get(node))
         return
     }
     if kind == NodeKind.InterpString {
-        let parts_sl = np_elements.get(node)
+        let parts_sl = np_elements.unsafe_get(node)
         if parts_sl != -1 {
             let mut pi = 0
             while pi < sublist_length(parts_sl) {
@@ -485,22 +485,22 @@ pub fn prescan_collect_closure_idents(node: Int) {
         return
     }
     if kind == NodeKind.FieldAccess {
-        prescan_collect_closure_idents(np_obj.get(node))
+        prescan_collect_closure_idents(np_obj.unsafe_get(node))
         return
     }
     if kind == NodeKind.IndexExpr {
-        prescan_collect_closure_idents(np_obj.get(node))
-        prescan_collect_closure_idents(np_index.get(node))
+        prescan_collect_closure_idents(np_obj.unsafe_get(node))
+        prescan_collect_closure_idents(np_index.unsafe_get(node))
         return
     }
     if kind == NodeKind.MatchExpr {
-        prescan_collect_closure_idents(np_scrutinee.get(node))
-        let arms_sl = np_arms.get(node)
+        prescan_collect_closure_idents(np_scrutinee.unsafe_get(node))
+        let arms_sl = np_arms.unsafe_get(node)
         if arms_sl != -1 {
             let mut ai = 0
             while ai < sublist_length(arms_sl) {
                 let arm = sublist_get(arms_sl, ai)
-                prescan_collect_closure_idents(np_body.get(arm))
+                prescan_collect_closure_idents(np_body.unsafe_get(arm))
                 ai = ai + 1
             }
         }
@@ -512,7 +512,7 @@ pub fn prescan_collect_closure_idents_block(block: Int) {
     if block == -1 {
         return
     }
-    let stmts_sl = np_stmts.get(block)
+    let stmts_sl = np_stmts.unsafe_get(block)
     if stmts_sl == -1 {
         return
     }
@@ -528,10 +528,10 @@ pub fn prescan_closures_in_node(node: Int) {
     if node == -1 {
         return
     }
-    let kind = np_kind.get(node)
+    let kind = np_kind.unsafe_get(node)
 
     if kind == NodeKind.Closure {
-        prescan_collect_closure_idents_block(np_body.get(node))
+        prescan_collect_closure_idents_block(np_body.unsafe_get(node))
         return
     }
 
@@ -541,57 +541,57 @@ pub fn prescan_closures_in_node(node: Int) {
     }
 
     if kind == NodeKind.LetBinding {
-        prescan_closures_in_node(np_value.get(node))
+        prescan_closures_in_node(np_value.unsafe_get(node))
         return
     }
 
     if kind == NodeKind.ExprStmt {
-        prescan_closures_in_node(np_value.get(node))
+        prescan_closures_in_node(np_value.unsafe_get(node))
         return
     }
 
     if kind == NodeKind.Assignment {
-        prescan_closures_in_node(np_value.get(node))
+        prescan_closures_in_node(np_value.unsafe_get(node))
         return
     }
 
     if kind == NodeKind.CompoundAssign {
-        prescan_closures_in_node(np_value.get(node))
+        prescan_closures_in_node(np_value.unsafe_get(node))
         return
     }
 
     if kind == NodeKind.IfExpr {
-        prescan_closures_in_node(np_condition.get(node))
-        prescan_closures_in_block(np_then_body.get(node))
-        prescan_closures_in_block(np_else_body.get(node))
+        prescan_closures_in_node(np_condition.unsafe_get(node))
+        prescan_closures_in_block(np_then_body.unsafe_get(node))
+        prescan_closures_in_block(np_else_body.unsafe_get(node))
         return
     }
 
     if kind == NodeKind.WhileLoop {
-        prescan_closures_in_node(np_condition.get(node))
-        prescan_closures_in_block(np_body.get(node))
+        prescan_closures_in_node(np_condition.unsafe_get(node))
+        prescan_closures_in_block(np_body.unsafe_get(node))
         return
     }
 
     if kind == NodeKind.ForIn {
-        prescan_closures_in_node(np_iterable.get(node))
-        prescan_closures_in_block(np_body.get(node))
+        prescan_closures_in_node(np_iterable.unsafe_get(node))
+        prescan_closures_in_block(np_body.unsafe_get(node))
         return
     }
 
     if kind == NodeKind.LoopExpr {
-        prescan_closures_in_block(np_body.get(node))
+        prescan_closures_in_block(np_body.unsafe_get(node))
         return
     }
 
     if kind == NodeKind.Return {
-        prescan_closures_in_node(np_value.get(node))
+        prescan_closures_in_node(np_value.unsafe_get(node))
         return
     }
 
     if kind == NodeKind.Call {
-        prescan_closures_in_node(np_left.get(node))
-        let args_sl = np_args.get(node)
+        prescan_closures_in_node(np_left.unsafe_get(node))
+        let args_sl = np_args.unsafe_get(node)
         if args_sl != -1 {
             let mut ai = 0
             while ai < sublist_length(args_sl) {
@@ -603,8 +603,8 @@ pub fn prescan_closures_in_node(node: Int) {
     }
 
     if kind == NodeKind.MethodCall {
-        prescan_closures_in_node(np_obj.get(node))
-        let args_sl = np_args.get(node)
+        prescan_closures_in_node(np_obj.unsafe_get(node))
+        let args_sl = np_args.unsafe_get(node)
         if args_sl != -1 {
             let mut ai = 0
             while ai < sublist_length(args_sl) {
@@ -616,24 +616,24 @@ pub fn prescan_closures_in_node(node: Int) {
     }
 
     if kind == NodeKind.BinOp {
-        prescan_closures_in_node(np_left.get(node))
-        prescan_closures_in_node(np_right.get(node))
+        prescan_closures_in_node(np_left.unsafe_get(node))
+        prescan_closures_in_node(np_right.unsafe_get(node))
         return
     }
 
     if kind == NodeKind.UnaryOp {
-        prescan_closures_in_node(np_left.get(node))
+        prescan_closures_in_node(np_left.unsafe_get(node))
         return
     }
 
     if kind == NodeKind.MatchExpr {
-        prescan_closures_in_node(np_scrutinee.get(node))
-        let arms_sl = np_arms.get(node)
+        prescan_closures_in_node(np_scrutinee.unsafe_get(node))
+        let arms_sl = np_arms.unsafe_get(node)
         if arms_sl != -1 {
             let mut ai = 0
             while ai < sublist_length(arms_sl) {
                 let arm = sublist_get(arms_sl, ai)
-                prescan_closures_in_node(np_body.get(arm))
+                prescan_closures_in_node(np_body.unsafe_get(arm))
                 ai = ai + 1
             }
         }
@@ -641,7 +641,7 @@ pub fn prescan_closures_in_node(node: Int) {
     }
 
     if kind == NodeKind.WithBlock {
-        prescan_closures_in_block(np_body.get(node))
+        prescan_closures_in_block(np_body.unsafe_get(node))
         return
     }
 }
@@ -650,7 +650,7 @@ pub fn prescan_closures_in_block(block: Int) {
     if block == -1 {
         return
     }
-    let stmts_sl = np_stmts.get(block)
+    let stmts_sl = np_stmts.unsafe_get(block)
     if stmts_sl == -1 {
         return
     }
@@ -668,10 +668,10 @@ pub fn prescan_mut_captures(block: Int) {
     prescan_closures_in_block(block)
     let mut i = 0
     while i < prescan_mut_names.len() {
-        let mname = prescan_mut_names.get(i)
+        let mname = prescan_mut_names.unsafe_get(i)
         let mut j = 0
         while j < prescan_closure_idents.len() {
-            let cident = prescan_closure_idents.get(j)
+            let cident = prescan_closure_idents.unsafe_get(j)
             if mname == cident {
                 if is_mut_captured(mname) == 0 {
                     mut_captured_vars.push(mname)
@@ -688,16 +688,16 @@ pub fn emit_closure(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
     let cname = "__closure_{closure_idx}"
     cg_closure_counter = cg_closure_counter + 1
 
-    let params_sl = np_params.get(node)
-    let ret_str = np_return_type.get(node)
+    let params_sl = np_params.unsafe_get(node)
+    let ret_str = np_return_type.unsafe_get(node)
     let ret_type = type_from_name(ret_str)
 
     // Capture analysis: find free variables before switching codegen context
-    let captures = analyze_captures(np_body.get(node), params_sl)
+    let captures = analyze_captures(np_body.unsafe_get(node), params_sl)
     let cap_start = closure_captures.len()
     let mut cap_i = 0
     while cap_i < captures.len() {
-        let cap_name = captures.get(cap_i)
+        let cap_name = captures.unsafe_get(cap_i)
         let cap_ct = get_var_type(cap_name)
         let cap_mut = if is_mut_captured(cap_name) != 0 { 1 } else { 0 }
         closure_captures.push(CaptureEntry { name: cap_name, ctype: cap_ct, is_mut: cap_mut })
@@ -712,8 +712,8 @@ pub fn emit_closure(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
         let mut i = 0
         while i < sublist_length(params_sl) {
             let p = sublist_get(params_sl, i)
-            let pname = np_name.get(p)
-            let ptype = np_type_name.get(p)
+            let pname = np_name.unsafe_get(p)
+            let ptype = np_type_name.unsafe_get(p)
             params_c = params_c.concat(", ")
             if ptype == "Fn" {
                 params_c = params_c.concat("pact_closure* {pname}")
@@ -747,11 +747,11 @@ pub fn emit_closure(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
         let mut i = 0
         while i < sublist_length(params_sl) {
             let p = sublist_get(params_sl, i)
-            let pname = np_name.get(p)
-            let ptype = np_type_name.get(p)
+            let pname = np_name.unsafe_get(p)
+            let ptype = np_type_name.unsafe_get(p)
             if ptype == "Fn" {
                 set_var(pname, CT_CLOSURE, 1)
-                let ta = np_type_ann.get(p)
+                let ta = np_type_ann.unsafe_get(p)
                 if ta != -1 {
                     let sig_str = build_closure_sig_from_type_ann(ta)
                     set_var_closure(pname, sig_str)
@@ -773,7 +773,7 @@ pub fn emit_closure(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
         let mut cpi = 0
         while cpi < sublist_length(params_sl) {
             let cp = sublist_get(params_sl, cpi)
-            closure_param_names.push(np_name.get(cp))
+            closure_param_names.push(np_name.unsafe_get(cp))
             cpi = cpi + 1
         }
     }
@@ -793,12 +793,12 @@ pub fn emit_closure(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
     let mut mc_done: List[Str] = []
     let mut mc_i = 0
     while mc_i < captures.len() {
-        let mc_e = closure_captures.get(cap_start + mc_i)
+        let mc_e = closure_captures.unsafe_get(cap_start + mc_i)
         if mc_e.is_mut != 0 {
             let mut mc_dup = 0
             let mut mc_j = 0
             while mc_j < mc_i {
-                if closure_captures.get(cap_start + mc_j).name == mc_e.name {
+                if closure_captures.unsafe_get(cap_start + mc_j).name == mc_e.name {
                     mc_dup = 1
                 }
                 mc_j = mc_j + 1
@@ -814,7 +814,7 @@ pub fn emit_closure(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
     if closure_ret_struct != "" || (ret_type == CT_VOID && ret_str != "Void" && ret_str != "" && (is_struct_type(ret_str) != 0 || is_enum_type(ret_str) != 0)) {
         body_ret = CT_INT
     }
-    emit_fn_body(np_body.get(node), body_ret)
+    emit_fn_body(np_body.unsafe_get(node), body_ret)
     cg_indent = cg_indent - 1
     emit_line("}")
     emit_line("")
@@ -831,7 +831,7 @@ pub fn emit_closure(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
 
     let mut ci = 0
     while ci < closure_lines.len() {
-        cg_closure_defs.push(closure_lines.get(ci))
+        cg_closure_defs.push(closure_lines.unsafe_get(ci))
         ci = ci + 1
     }
 
@@ -841,7 +841,7 @@ pub fn emit_closure(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
         let mut si = 0
         while si < sublist_length(params_sl) {
             let sp = sublist_get(params_sl, si)
-            let sptype = np_type_name.get(sp)
+            let sptype = np_type_name.unsafe_get(sp)
             sig_params = sig_params.concat(", ")
             if sptype == "Fn" {
                 sig_params = sig_params.concat("pact_closure*")
@@ -863,7 +863,7 @@ pub fn emit_closure(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
         emit_line("void** {caps_var} = (void**)pact_alloc(sizeof(void*) * {captures.len()});")
         let mut ci2 = 0
         while ci2 < captures.len() {
-            let cap_e = closure_captures.get(cap_start + ci2)
+            let cap_e = closure_captures.unsafe_get(cap_start + ci2)
             if cap_e.is_mut != 0 {
                 emit_line("{caps_var}[{ci2}] = (void*){cap_e.name}_cell;")
             } else if cap_e.ctype == CT_INT {

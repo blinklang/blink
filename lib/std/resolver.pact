@@ -45,7 +45,7 @@ fn trim_str(s: Str) -> Str {
 fn find_resolved(name: Str) -> Int {
     let mut i = 0
     while i < res_names.len() {
-        if res_names.get(i) == name {
+        if res_names.unsafe_get(i) == name {
             return i
         }
         i = i + 1
@@ -56,8 +56,8 @@ fn find_resolved(name: Str) -> Int {
 fn add_resolved(name: Str, version: Str, source: Str, hash: Str, caps: Str) -> Int {
     let existing = find_resolved(name)
     if existing >= 0 {
-        if res_versions.get(existing) != version {
-            io.println("error: version conflict for '{name}': resolved {res_versions.get(existing)} but also need {version}")
+        if res_versions.unsafe_get(existing) != version {
+            io.println("error: version conflict for '{name}': resolved {res_versions.unsafe_get(existing)} but also need {version}")
             return 1
         }
         return 0
@@ -77,7 +77,7 @@ fn build_caps_string() -> Str {
         if i > 0 {
             result = result.concat(",")
         }
-        result = result.concat(cap_required.get(i))
+        result = result.concat(cap_required.unsafe_get(i))
         i = i + 1
     }
     result
@@ -127,9 +127,9 @@ fn process_path_dep(name: Str, dep_path: Str, base_dir: Str) -> Int {
     let mut i = 0
     while i < sub_count {
         sub_names.push(manifest_get_dep_name(i))
-        sub_paths.push(dep_paths.get(i))
-        sub_git_urls.push(dep_git_urls.get(i))
-        sub_git_tags.push(dep_git_tags.get(i))
+        sub_paths.push(dep_paths.unsafe_get(i))
+        sub_git_urls.push(dep_git_urls.unsafe_get(i))
+        sub_git_tags.push(dep_git_tags.unsafe_get(i))
         sub_sources.push(manifest_get_dep_source(i))
         i = i + 1
     }
@@ -142,14 +142,14 @@ fn process_path_dep(name: Str, dep_path: Str, base_dir: Str) -> Int {
     // Recurse into transitive deps
     let mut j = 0
     while j < sub_count {
-        let src = sub_sources.get(j)
+        let src = sub_sources.unsafe_get(j)
         if src == "path" {
-            let rc = process_path_dep(sub_names.get(j), sub_paths.get(j), full_path)
+            let rc = process_path_dep(sub_names.unsafe_get(j), sub_paths.unsafe_get(j), full_path)
             if rc != 0 {
                 return 1
             }
         } else if src == "git" {
-            let rc = process_git_dep(sub_names.get(j), sub_git_urls.get(j), sub_git_tags.get(j))
+            let rc = process_git_dep(sub_names.unsafe_get(j), sub_git_urls.unsafe_get(j), sub_git_tags.unsafe_get(j))
             if rc != 0 {
                 return 1
             }
@@ -206,9 +206,9 @@ fn process_git_dep(name: Str, url: Str, tag: Str) -> Int {
     let mut i = 0
     while i < sub_count {
         sub_names.push(manifest_get_dep_name(i))
-        sub_paths.push(dep_paths.get(i))
-        sub_git_urls.push(dep_git_urls.get(i))
-        sub_git_tags.push(dep_git_tags.get(i))
+        sub_paths.push(dep_paths.unsafe_get(i))
+        sub_git_urls.push(dep_git_urls.unsafe_get(i))
+        sub_git_tags.push(dep_git_tags.unsafe_get(i))
         sub_sources.push(manifest_get_dep_source(i))
         i = i + 1
     }
@@ -221,14 +221,14 @@ fn process_git_dep(name: Str, url: Str, tag: Str) -> Int {
     // Recurse into transitive deps
     let mut j = 0
     while j < sub_count {
-        let src = sub_sources.get(j)
+        let src = sub_sources.unsafe_get(j)
         if src == "path" {
-            let rc = process_path_dep(sub_names.get(j), sub_paths.get(j), checkout_path)
+            let rc = process_path_dep(sub_names.unsafe_get(j), sub_paths.unsafe_get(j), checkout_path)
             if rc != 0 {
                 return 1
             }
         } else if src == "git" {
-            let rc = process_git_dep(sub_names.get(j), sub_git_urls.get(j), sub_git_tags.get(j))
+            let rc = process_git_dep(sub_names.unsafe_get(j), sub_git_urls.unsafe_get(j), sub_git_tags.unsafe_get(j))
             if rc != 0 {
                 return 1
             }
@@ -259,9 +259,9 @@ pub fn resolve(project_root: Str) -> Int {
     let mut i = 0
     while i < dep_count {
         local_names.push(manifest_get_dep_name(i))
-        local_paths.push(dep_paths.get(i))
-        local_git_urls.push(dep_git_urls.get(i))
-        local_git_tags.push(dep_git_tags.get(i))
+        local_paths.push(dep_paths.unsafe_get(i))
+        local_git_urls.push(dep_git_urls.unsafe_get(i))
+        local_git_tags.push(dep_git_tags.unsafe_get(i))
         local_sources.push(manifest_get_dep_source(i))
         i = i + 1
     }
@@ -269,14 +269,14 @@ pub fn resolve(project_root: Str) -> Int {
     // Process each dependency
     let mut j = 0
     while j < dep_count {
-        let src = local_sources.get(j)
+        let src = local_sources.unsafe_get(j)
         if src == "path" {
-            let rc = process_path_dep(local_names.get(j), local_paths.get(j), project_root)
+            let rc = process_path_dep(local_names.unsafe_get(j), local_paths.unsafe_get(j), project_root)
             if rc != 0 {
                 return 1
             }
         } else if src == "git" {
-            let rc = process_git_dep(local_names.get(j), local_git_urls.get(j), local_git_tags.get(j))
+            let rc = process_git_dep(local_names.unsafe_get(j), local_git_urls.unsafe_get(j), local_git_tags.unsafe_get(j))
             if rc != 0 {
                 return 1
             }
@@ -301,7 +301,7 @@ pub fn resolve_and_lock(project_root: Str) -> Int {
 
     let mut i = 0
     while i < res_names.len() {
-        lockfile_add_pkg(res_names.get(i), res_versions.get(i), res_sources.get(i), res_hashes.get(i), res_caps.get(i))
+        lockfile_add_pkg(res_names.unsafe_get(i), res_versions.unsafe_get(i), res_sources.unsafe_get(i), res_hashes.unsafe_get(i), res_caps.unsafe_get(i))
         i = i + 1
     }
 
@@ -320,33 +320,33 @@ pub fn resolver_get_name(i: Int) -> Str {
     if i < 0 || i >= res_names.len() {
         return ""
     }
-    res_names.get(i)
+    res_names.unsafe_get(i)
 }
 
 pub fn resolver_get_version(i: Int) -> Str {
     if i < 0 || i >= res_versions.len() {
         return ""
     }
-    res_versions.get(i)
+    res_versions.unsafe_get(i)
 }
 
 pub fn resolver_get_source(i: Int) -> Str {
     if i < 0 || i >= res_sources.len() {
         return ""
     }
-    res_sources.get(i)
+    res_sources.unsafe_get(i)
 }
 
 pub fn resolver_get_hash(i: Int) -> Str {
     if i < 0 || i >= res_hashes.len() {
         return ""
     }
-    res_hashes.get(i)
+    res_hashes.unsafe_get(i)
 }
 
 pub fn resolver_get_caps(i: Int) -> Str {
     if i < 0 || i >= res_caps.len() {
         return ""
     }
-    res_caps.get(i)
+    res_caps.unsafe_get(i)
 }

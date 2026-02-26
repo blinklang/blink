@@ -6,19 +6,19 @@ pub fn register_derive_annotations(types_sl: Int) {
     let mut i = 0
     while i < sublist_length(types_sl) {
         let td = sublist_get(types_sl, i)
-        let td_anns = np_handlers.get(td)
+        let td_anns = np_handlers.unsafe_get(td)
         if td_anns != -1 {
             let mut ai = 0
             while ai < sublist_length(td_anns) {
                 let ann = sublist_get(td_anns, ai)
-                if np_name.get(ann) == "derive" {
-                    let args_sl = np_args.get(ann)
+                if np_name.unsafe_get(ann) == "derive" {
+                    let args_sl = np_args.unsafe_get(ann)
                     if args_sl != -1 {
                         let mut di = 0
                         while di < sublist_length(args_sl) {
                             let darg = sublist_get(args_sl, di)
-                            let dname = np_name.get(darg)
-                            let tname = np_name.get(td)
+                            let dname = np_name.unsafe_get(darg)
+                            let tname = np_name.unsafe_get(td)
                             if dname == "Serialize" {
                                 derive_serialize_types.push(tname)
                                 derive_method_entries.push(DeriveMethodEntry {
@@ -50,7 +50,7 @@ pub fn register_derive_annotations(types_sl: Int) {
 pub fn emit_derive_forward_decls() ! Codegen.Emit {
     let mut i = 0
     while i < derive_serialize_types.len() {
-        let tname = derive_serialize_types.get(i)
+        let tname = derive_serialize_types.unsafe_get(i)
         if is_enum_type(tname) != 0 {
             emit_line("const char* {c_type_c_name(tname)}_to_json({c_type_c_name(tname)} self);")
         } else {
@@ -60,7 +60,7 @@ pub fn emit_derive_forward_decls() ! Codegen.Emit {
     }
     let mut j = 0
     while j < derive_deserialize_types.len() {
-        let tname = derive_deserialize_types.get(j)
+        let tname = derive_deserialize_types.unsafe_get(j)
         emit_line("pact_Result_{tname}_str {c_type_c_name(tname)}_from_json(const char* input);")
         j = j + 1
     }
@@ -69,7 +69,7 @@ pub fn emit_derive_forward_decls() ! Codegen.Emit {
 pub fn emit_derive_fn_defs() ! Codegen.Emit {
     let mut i = 0
     while i < derive_serialize_types.len() {
-        let tname = derive_serialize_types.get(i)
+        let tname = derive_serialize_types.unsafe_get(i)
         if is_enum_type(tname) != 0 {
             emit_enum_to_json(tname)
         } else {
@@ -79,7 +79,7 @@ pub fn emit_derive_fn_defs() ! Codegen.Emit {
     }
     let mut j = 0
     while j < derive_deserialize_types.len() {
-        let tname = derive_deserialize_types.get(j)
+        let tname = derive_deserialize_types.unsafe_get(j)
         if is_enum_type(tname) != 0 {
             emit_enum_from_json(tname)
         } else {
@@ -96,7 +96,7 @@ fn emit_struct_to_json(type_name: Str) ! Codegen.Emit {
     let mut field_idx = 0
     let mut i = 0
     while i < sf_entries.len() {
-        let sf = sf_entries.get(i)
+        let sf = sf_entries.unsafe_get(i)
         if sf.struct_name == type_name {
             if field_idx > 0 {
                 emit_line("result = pact_str_concat(result, \",\");")
@@ -178,7 +178,7 @@ fn emit_list_serialize(access: Str, struct_name: Str, field_name: Str) ! Codegen
 fn get_enum_reg_idx(name: Str) -> Int {
     let mut i = 0
     while i < enum_regs.len() {
-        if enum_regs.get(i).name == name {
+        if enum_regs.unsafe_get(i).name == name {
             return i
         }
         i = i + 1
@@ -199,7 +199,7 @@ fn emit_enum_to_json(type_name: Str) ! Codegen.Emit {
         cg_indent = cg_indent + 1
         let mut i = 0
         while i < enum_variants.len() {
-            let evar = enum_variants.get(i)
+            let evar = enum_variants.unsafe_get(i)
             if evar.enum_idx == eidx {
                 emit_line("case {c_type_c_name(type_name)}_{evar.name}: return \"\\\"{evar.name}\\\"\";")
             }
@@ -221,7 +221,7 @@ fn emit_enum_to_json(type_name: Str) ! Codegen.Emit {
         let mut tag = 0
         let mut i = 0
         while i < enum_variants.len() {
-            let evar = enum_variants.get(i)
+            let evar = enum_variants.unsafe_get(i)
             if evar.enum_idx == eidx {
                 emit_line("case {tag}: \{")
                 cg_indent = cg_indent + 1
@@ -308,7 +308,7 @@ fn emit_struct_from_json(type_name: Str) ! Codegen.Emit {
     // Iterate struct fields
     let mut i = 0
     while i < sf_entries.len() {
-        let sf = sf_entries.get(i)
+        let sf = sf_entries.unsafe_get(i)
         if sf.struct_name == type_name {
             emit_line("\{")
             cg_indent = cg_indent + 1
@@ -406,7 +406,7 @@ fn emit_enum_from_json(type_name: Str) ! Codegen.Emit {
         let mut i = 0
         let mut tag = 0
         while i < enum_variants.len() {
-            let evar = enum_variants.get(i)
+            let evar = enum_variants.unsafe_get(i)
             if evar.enum_idx == eidx {
                 if tag == 0 {
                     emit_line("if (pact_str_eq(_str, \"{evar.name}\")) \{")
@@ -442,7 +442,7 @@ fn emit_enum_from_json(type_name: Str) ! Codegen.Emit {
         let mut tag = 0
         let mut first = 1
         while i < enum_variants.len() {
-            let evar = enum_variants.get(i)
+            let evar = enum_variants.unsafe_get(i)
             if evar.enum_idx == eidx {
                 if first == 1 {
                     emit_line("if (pact_str_eq(_disc, \"{evar.name}\")) \{")

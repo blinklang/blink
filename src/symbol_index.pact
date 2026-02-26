@@ -93,7 +93,7 @@ fn extract_intent(doc: Str) -> Str {
 }
 
 fn extract_annotation_args(node: Int, ann_name: Str) -> Str {
-    let anns_sl = np_handlers.get(node)
+    let anns_sl = np_handlers.unsafe_get(node)
     if anns_sl == -1 {
         return ""
     }
@@ -101,15 +101,15 @@ fn extract_annotation_args(node: Int, ann_name: Str) -> Str {
     let mut i = 0
     while i < sublist_length(anns_sl) {
         let ann = sublist_get(anns_sl, i)
-        if np_name.get(ann) == ann_name {
-            let args_sl = np_args.get(ann)
+        if np_name.unsafe_get(ann) == ann_name {
+            let args_sl = np_args.unsafe_get(ann)
             if args_sl != -1 {
                 let mut j = 0
                 while j < sublist_length(args_sl) {
                     if result != "" {
                         result = result.concat(",")
                     }
-                    result = result.concat(np_name.get(sublist_get(args_sl, j)))
+                    result = result.concat(np_name.unsafe_get(sublist_get(args_sl, j)))
                     j = j + 1
                 }
             }
@@ -170,7 +170,7 @@ fn sym_index(name: Str) -> Int {
 // ── Build: collect params as comma-separated type string ──────────────
 
 fn collect_param_types(fn_node: Int) -> Str {
-    let params_sl = np_params.get(fn_node)
+    let params_sl = np_params.unsafe_get(fn_node)
     if params_sl == -1 {
         return ""
     }
@@ -181,14 +181,14 @@ fn collect_param_types(fn_node: Int) -> Str {
         if i > 0 {
             result = result.concat(",")
         }
-        result = result.concat(np_type_name.get(p))
+        result = result.concat(np_type_name.unsafe_get(p))
         i = i + 1
     }
     result
 }
 
 fn collect_effects(fn_node: Int) -> Str {
-    let eff_sl = np_effects.get(fn_node)
+    let eff_sl = np_effects.unsafe_get(fn_node)
     if eff_sl == -1 {
         return ""
     }
@@ -199,7 +199,7 @@ fn collect_effects(fn_node: Int) -> Str {
         if i > 0 {
             result = result.concat(",")
         }
-        result = result.concat(np_name.get(e))
+        result = result.concat(np_name.unsafe_get(e))
         i = i + 1
     }
     result
@@ -211,19 +211,19 @@ fn walk_deps(node: Int, from_idx: Int) {
     if node == -1 {
         return
     }
-    let kind = np_kind.get(node)
+    let kind = np_kind.unsafe_get(node)
 
     if kind == NodeKind.Call {
-        let callee = np_left.get(node)
-        if callee != -1 && np_kind.get(callee) == NodeKind.Ident {
-            let callee_name = np_name.get(callee)
+        let callee = np_left.unsafe_get(node)
+        if callee != -1 && np_kind.unsafe_get(callee) == NodeKind.Ident {
+            let callee_name = np_name.unsafe_get(callee)
             let callee_idx = sym_index(callee_name)
             if callee_idx >= 0 {
                 si_add_dep(from_idx, callee_idx, DK_CALLS)
             }
         }
         walk_deps(callee, from_idx)
-        let args_sl = np_args.get(node)
+        let args_sl = np_args.unsafe_get(node)
         if args_sl != -1 {
             let mut ai = 0
             while ai < sublist_length(args_sl) {
@@ -235,8 +235,8 @@ fn walk_deps(node: Int, from_idx: Int) {
     }
 
     if kind == NodeKind.MethodCall {
-        walk_deps(np_obj.get(node), from_idx)
-        let args_sl = np_args.get(node)
+        walk_deps(np_obj.unsafe_get(node), from_idx)
+        let args_sl = np_args.unsafe_get(node)
         if args_sl != -1 {
             let mut ai = 0
             while ai < sublist_length(args_sl) {
@@ -248,9 +248,9 @@ fn walk_deps(node: Int, from_idx: Int) {
     }
 
     if kind == NodeKind.FieldAccess {
-        let obj = np_obj.get(node)
-        if obj != -1 && np_kind.get(obj) == NodeKind.Ident {
-            let obj_name = np_name.get(obj)
+        let obj = np_obj.unsafe_get(node)
+        if obj != -1 && np_kind.unsafe_get(obj) == NodeKind.Ident {
+            let obj_name = np_name.unsafe_get(obj)
             let obj_idx = sym_index(obj_name)
             if obj_idx >= 0 {
                 si_add_dep(from_idx, obj_idx, DK_FIELD_ACCESS)
@@ -261,7 +261,7 @@ fn walk_deps(node: Int, from_idx: Int) {
     }
 
     if kind == NodeKind.Ident {
-        let ref_name = np_name.get(node)
+        let ref_name = np_name.unsafe_get(node)
         let ref_idx = sym_index(ref_name)
         if ref_idx >= 0 && ref_idx != from_idx {
             si_add_dep(from_idx, ref_idx, DK_USES_TYPE)
@@ -270,75 +270,75 @@ fn walk_deps(node: Int, from_idx: Int) {
     }
 
     if kind == NodeKind.BinOp {
-        walk_deps(np_left.get(node), from_idx)
-        walk_deps(np_right.get(node), from_idx)
+        walk_deps(np_left.unsafe_get(node), from_idx)
+        walk_deps(np_right.unsafe_get(node), from_idx)
         return
     }
 
     if kind == NodeKind.UnaryOp {
-        walk_deps(np_left.get(node), from_idx)
+        walk_deps(np_left.unsafe_get(node), from_idx)
         return
     }
 
     if kind == NodeKind.IfExpr {
-        walk_deps(np_condition.get(node), from_idx)
-        walk_deps(np_then_body.get(node), from_idx)
-        walk_deps(np_else_body.get(node), from_idx)
+        walk_deps(np_condition.unsafe_get(node), from_idx)
+        walk_deps(np_then_body.unsafe_get(node), from_idx)
+        walk_deps(np_else_body.unsafe_get(node), from_idx)
         return
     }
 
     if kind == NodeKind.Block {
-        walk_dep_stmts(np_stmts.get(node), from_idx)
+        walk_dep_stmts(np_stmts.unsafe_get(node), from_idx)
         return
     }
 
     if kind == NodeKind.LetBinding {
-        walk_deps(np_value.get(node), from_idx)
+        walk_deps(np_value.unsafe_get(node), from_idx)
         return
     }
 
     if kind == NodeKind.ExprStmt {
-        walk_deps(np_value.get(node), from_idx)
+        walk_deps(np_value.unsafe_get(node), from_idx)
         return
     }
 
     if kind == NodeKind.Return {
-        walk_deps(np_value.get(node), from_idx)
+        walk_deps(np_value.unsafe_get(node), from_idx)
         return
     }
 
     if kind == NodeKind.Assignment || kind == NodeKind.CompoundAssign {
-        walk_deps(np_target.get(node), from_idx)
-        walk_deps(np_value.get(node), from_idx)
+        walk_deps(np_target.unsafe_get(node), from_idx)
+        walk_deps(np_value.unsafe_get(node), from_idx)
         return
     }
 
     if kind == NodeKind.ForIn {
-        walk_deps(np_iterable.get(node), from_idx)
-        walk_deps(np_body.get(node), from_idx)
+        walk_deps(np_iterable.unsafe_get(node), from_idx)
+        walk_deps(np_body.unsafe_get(node), from_idx)
         return
     }
 
     if kind == NodeKind.WhileLoop {
-        walk_deps(np_condition.get(node), from_idx)
-        walk_deps(np_body.get(node), from_idx)
+        walk_deps(np_condition.unsafe_get(node), from_idx)
+        walk_deps(np_body.unsafe_get(node), from_idx)
         return
     }
 
     if kind == NodeKind.LoopExpr {
-        walk_deps(np_body.get(node), from_idx)
+        walk_deps(np_body.unsafe_get(node), from_idx)
         return
     }
 
     if kind == NodeKind.MatchExpr {
-        walk_deps(np_scrutinee.get(node), from_idx)
-        let arms_sl = np_arms.get(node)
+        walk_deps(np_scrutinee.unsafe_get(node), from_idx)
+        let arms_sl = np_arms.unsafe_get(node)
         if arms_sl != -1 {
             let mut ai = 0
             while ai < sublist_length(arms_sl) {
                 let arm = sublist_get(arms_sl, ai)
-                walk_deps(np_guard.get(arm), from_idx)
-                walk_deps(np_body.get(arm), from_idx)
+                walk_deps(np_guard.unsafe_get(arm), from_idx)
+                walk_deps(np_body.unsafe_get(arm), from_idx)
                 ai = ai + 1
             }
         }
@@ -346,13 +346,13 @@ fn walk_deps(node: Int, from_idx: Int) {
     }
 
     if kind == NodeKind.IndexExpr {
-        walk_deps(np_obj.get(node), from_idx)
-        walk_deps(np_index.get(node), from_idx)
+        walk_deps(np_obj.unsafe_get(node), from_idx)
+        walk_deps(np_index.unsafe_get(node), from_idx)
         return
     }
 
     if kind == NodeKind.TupleLit || kind == NodeKind.ListLit {
-        let elems_sl = np_elements.get(node)
+        let elems_sl = np_elements.unsafe_get(node)
         if elems_sl != -1 {
             let mut ei = 0
             while ei < sublist_length(elems_sl) {
@@ -364,17 +364,17 @@ fn walk_deps(node: Int, from_idx: Int) {
     }
 
     if kind == NodeKind.StructLit {
-        let type_name = np_type_name.get(node)
+        let type_name = np_type_name.unsafe_get(node)
         let type_idx = sym_index(type_name)
         if type_idx >= 0 {
             si_add_dep(from_idx, type_idx, DK_USES_TYPE)
         }
-        let fields_sl = np_fields.get(node)
+        let fields_sl = np_fields.unsafe_get(node)
         if fields_sl != -1 {
             let mut fi = 0
             while fi < sublist_length(fields_sl) {
                 let fld = sublist_get(fields_sl, fi)
-                walk_deps(np_value.get(fld), from_idx)
+                walk_deps(np_value.unsafe_get(fld), from_idx)
                 fi = fi + 1
             }
         }
@@ -382,12 +382,12 @@ fn walk_deps(node: Int, from_idx: Int) {
     }
 
     if kind == NodeKind.Closure {
-        walk_deps(np_body.get(node), from_idx)
+        walk_deps(np_body.unsafe_get(node), from_idx)
         return
     }
 
     if kind == NodeKind.InterpString {
-        let parts_sl = np_elements.get(node)
+        let parts_sl = np_elements.unsafe_get(node)
         if parts_sl != -1 {
             let mut pi = 0
             while pi < sublist_length(parts_sl) {
@@ -399,13 +399,13 @@ fn walk_deps(node: Int, from_idx: Int) {
     }
 
     if kind == NodeKind.RangeLit {
-        walk_deps(np_start.get(node), from_idx)
-        walk_deps(np_end.get(node), from_idx)
+        walk_deps(np_start.unsafe_get(node), from_idx)
+        walk_deps(np_end.unsafe_get(node), from_idx)
         return
     }
 
     if kind == NodeKind.WithBlock {
-        walk_deps(np_body.get(node), from_idx)
+        walk_deps(np_body.unsafe_get(node), from_idx)
         return
     }
 }
@@ -438,7 +438,7 @@ fn register_type_dep(from_idx: Int, type_name: Str) {
 fn build_reverse_deps() {
     let mut i = 0
     while i < si_dep_count {
-        add_rdep(si_dep_to.get(i), si_dep_from.get(i))
+        add_rdep(si_dep_to.unsafe_get(i), si_dep_from.unsafe_get(i))
         i = i + 1
     }
 }
@@ -450,84 +450,84 @@ pub fn si_build(program: Int, file_path: Str, module_name: Str) {
     let file_idx = register_file(file_path, 0, file_sym_start)
 
     // Step 1: register all function symbols
-    let fns_sl = np_params.get(program)
+    let fns_sl = np_params.unsafe_get(program)
     if fns_sl != -1 {
         let mut i = 0
         while i < sublist_length(fns_sl) {
             let fn_node = sublist_get(fns_sl, i)
-            let name = np_name.get(fn_node)
-            let vis = if np_is_pub.get(fn_node) != 0 { VIS_PUB } else { VIS_PRIVATE }
-            let ret = np_return_type.get(fn_node)
+            let name = np_name.unsafe_get(fn_node)
+            let vis = if np_is_pub.unsafe_get(fn_node) != 0 { VIS_PUB } else { VIS_PRIVATE }
+            let ret = np_return_type.unsafe_get(fn_node)
             let ptypes = collect_param_types(fn_node)
             let effs = collect_effects(fn_node)
             let sig = name.concat("(").concat(ptypes).concat(") -> ").concat(ret)
-            add_symbol(name, SK_FN, module_name, file_path, np_line.get(fn_node), vis, effs, sig, ret, ptypes)
-            let fn_doc = np_doc_comment.get(fn_node)
+            add_symbol(name, SK_FN, module_name, file_path, np_line.unsafe_get(fn_node), vis, effs, sig, ret, ptypes)
+            let fn_doc = np_doc_comment.unsafe_get(fn_node)
             si_sym_doc.push(fn_doc)
             si_sym_intent.push(extract_intent(fn_doc))
             si_sym_requires.push(extract_annotation_args(fn_node, "requires"))
             si_sym_ensures.push(extract_annotation_args(fn_node, "ensures"))
-            si_sym_end_line.push(np_end_line.get(fn_node))
+            si_sym_end_line.push(np_end_line.unsafe_get(fn_node))
             i = i + 1
         }
     }
 
     // Step 2: register type definitions (structs/enums)
-    let types_sl = np_fields.get(program)
+    let types_sl = np_fields.unsafe_get(program)
     if types_sl != -1 {
         let mut i = 0
         while i < sublist_length(types_sl) {
             let type_node = sublist_get(types_sl, i)
-            let name = np_name.get(type_node)
-            let vis = if np_is_pub.get(type_node) != 0 { VIS_PUB } else { VIS_PRIVATE }
-            let kind = np_kind.get(type_node)
+            let name = np_name.unsafe_get(type_node)
+            let vis = if np_is_pub.unsafe_get(type_node) != 0 { VIS_PUB } else { VIS_PRIVATE }
+            let kind = np_kind.unsafe_get(type_node)
             let sym_kind = if kind == NodeKind.TypeDef { SK_STRUCT } else { SK_ENUM }
-            add_symbol(name, sym_kind, module_name, file_path, np_line.get(type_node), vis, "", "", "", "")
-            let type_doc = np_doc_comment.get(type_node)
+            add_symbol(name, sym_kind, module_name, file_path, np_line.unsafe_get(type_node), vis, "", "", "", "")
+            let type_doc = np_doc_comment.unsafe_get(type_node)
             si_sym_doc.push(type_doc)
             si_sym_intent.push(extract_intent(type_doc))
             si_sym_requires.push("")
             si_sym_ensures.push("")
-            si_sym_end_line.push(np_end_line.get(type_node))
+            si_sym_end_line.push(np_end_line.unsafe_get(type_node))
             i = i + 1
         }
     }
 
     // Step 3: register trait definitions
-    let traits_sl = np_arms.get(program)
+    let traits_sl = np_arms.unsafe_get(program)
     if traits_sl != -1 {
         let mut i = 0
         while i < sublist_length(traits_sl) {
             let trait_node = sublist_get(traits_sl, i)
-            let name = np_name.get(trait_node)
-            let vis = if np_is_pub.get(trait_node) != 0 { VIS_PUB } else { VIS_PRIVATE }
-            add_symbol(name, SK_TRAIT, module_name, file_path, np_line.get(trait_node), vis, "", "", "", "")
-            let trait_doc = np_doc_comment.get(trait_node)
+            let name = np_name.unsafe_get(trait_node)
+            let vis = if np_is_pub.unsafe_get(trait_node) != 0 { VIS_PUB } else { VIS_PRIVATE }
+            add_symbol(name, SK_TRAIT, module_name, file_path, np_line.unsafe_get(trait_node), vis, "", "", "", "")
+            let trait_doc = np_doc_comment.unsafe_get(trait_node)
             si_sym_doc.push(trait_doc)
             si_sym_intent.push(extract_intent(trait_doc))
             si_sym_requires.push("")
             si_sym_ensures.push("")
-            si_sym_end_line.push(np_end_line.get(trait_node))
+            si_sym_end_line.push(np_end_line.unsafe_get(trait_node))
             i = i + 1
         }
     }
 
     // Step 4: register module-level let bindings
-    let lets_sl = np_stmts.get(program)
+    let lets_sl = np_stmts.unsafe_get(program)
     if lets_sl != -1 {
         let mut i = 0
         while i < sublist_length(lets_sl) {
             let let_node = sublist_get(lets_sl, i)
-            if np_kind.get(let_node) == NodeKind.LetBinding {
-                let name = np_name.get(let_node)
-                let vis = if np_is_pub.get(let_node) != 0 { VIS_PUB } else { VIS_PRIVATE }
-                add_symbol(name, SK_LET, module_name, file_path, np_line.get(let_node), vis, "", "", "", "")
-                let let_doc = np_doc_comment.get(let_node)
+            if np_kind.unsafe_get(let_node) == NodeKind.LetBinding {
+                let name = np_name.unsafe_get(let_node)
+                let vis = if np_is_pub.unsafe_get(let_node) != 0 { VIS_PUB } else { VIS_PRIVATE }
+                add_symbol(name, SK_LET, module_name, file_path, np_line.unsafe_get(let_node), vis, "", "", "", "")
+                let let_doc = np_doc_comment.unsafe_get(let_node)
                 si_sym_doc.push(let_doc)
                 si_sym_intent.push(extract_intent(let_doc))
                 si_sym_requires.push("")
                 si_sym_ensures.push("")
-                si_sym_end_line.push(np_line.get(let_node))
+                si_sym_end_line.push(np_line.unsafe_get(let_node))
             }
             i = i + 1
         }
@@ -541,22 +541,22 @@ pub fn si_build(program: Int, file_path: Str, module_name: Str) {
         let mut i = 0
         while i < sublist_length(fns_sl) {
             let fn_node = sublist_get(fns_sl, i)
-            let fn_name = np_name.get(fn_node)
+            let fn_name = np_name.unsafe_get(fn_node)
             let fn_idx = sym_index(fn_name)
             if fn_idx >= 0 {
                 // Register type deps from return type and param types
-                register_type_dep(fn_idx, np_return_type.get(fn_node))
-                let params_sl = np_params.get(fn_node)
+                register_type_dep(fn_idx, np_return_type.unsafe_get(fn_node))
+                let params_sl = np_params.unsafe_get(fn_node)
                 if params_sl != -1 {
                     let mut pi = 0
                     while pi < sublist_length(params_sl) {
                         let p = sublist_get(params_sl, pi)
-                        register_type_dep(fn_idx, np_type_name.get(p))
+                        register_type_dep(fn_idx, np_type_name.unsafe_get(p))
                         pi = pi + 1
                     }
                 }
                 // Walk body for call/field deps
-                walk_deps(np_body.get(fn_node), fn_idx)
+                walk_deps(np_body.unsafe_get(fn_node), fn_idx)
             }
             i = i + 1
         }
@@ -572,8 +572,8 @@ pub fn si_get_rdeps(sym_idx: Int) -> List[Int] {
     let mut result: List[Int] = []
     let mut i = 0
     while i < si_rdep_count {
-        if si_rdep_from.get(i) == sym_idx {
-            result.push(si_rdep_to.get(i))
+        if si_rdep_from.unsafe_get(i) == sym_idx {
+            result.push(si_rdep_to.unsafe_get(i))
         }
         i = i + 1
     }
@@ -593,8 +593,8 @@ pub fn si_file_symbols(path: Str) -> List[Int] {
         return result
     }
     let file_idx = file_path_map.get(path)
-    let start = si_file_sym_start.get(file_idx)
-    let end = si_file_sym_end.get(file_idx)
+    let start = si_file_sym_start.unsafe_get(file_idx)
+    let end = si_file_sym_end.unsafe_get(file_idx)
     let mut i = start
     while i < end {
         result.push(i)

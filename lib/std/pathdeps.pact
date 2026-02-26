@@ -33,7 +33,7 @@ pub fn pathdeps_clear() {
 fn is_already_resolved(name: Str) -> Int {
     let mut i = 0
     while i < resolved_names.len() {
-        if resolved_names.get(i) == name {
+        if resolved_names.unsafe_get(i) == name {
             return 1
         }
         i = i + 1
@@ -48,7 +48,7 @@ fn build_caps_string() -> Str {
         if i > 0 {
             result = result.concat(",")
         }
-        result = result.concat(cap_required.get(i))
+        result = result.concat(cap_required.unsafe_get(i))
         i = i + 1
     }
     result
@@ -85,7 +85,7 @@ fn resolve_one(name: Str, rel_path: Str, base_dir: Str) -> Int {
     // Cycle check: scan visit_stack up to stack_depth
     let mut i = 0
     while i < stack_depth {
-        if visit_stack.get(i) == name {
+        if visit_stack.unsafe_get(i) == name {
             io.println("error: circular path dependency detected: {name}")
             return 1
         }
@@ -136,7 +136,7 @@ fn resolve_one(name: Str, rel_path: Str, base_dir: Str) -> Int {
     let mut j = 0
     while j < sub_dep_count {
         sub_dep_names.push(manifest_get_dep_name(j))
-        sub_dep_paths.push(dep_paths.get(j))
+        sub_dep_paths.push(dep_paths.unsafe_get(j))
         sub_dep_sources.push(manifest_get_dep_source(j))
         j = j + 1
     }
@@ -144,8 +144,8 @@ fn resolve_one(name: Str, rel_path: Str, base_dir: Str) -> Int {
     // Recurse for transitive path deps
     let mut k = 0
     while k < sub_dep_count {
-        if sub_dep_sources.get(k) == "path" {
-            let rc = resolve_one(sub_dep_names.get(k), sub_dep_paths.get(k), full_path)
+        if sub_dep_sources.unsafe_get(k) == "path" {
+            let rc = resolve_one(sub_dep_names.unsafe_get(k), sub_dep_paths.unsafe_get(k), full_path)
             if rc != 0 {
                 stack_depth = stack_depth - 1
                 return 1
@@ -178,7 +178,7 @@ pub fn resolve_path_deps(project_root: Str) -> Int {
     let mut i = 0
     while i < dep_count {
         local_dep_names.push(manifest_get_dep_name(i))
-        local_dep_paths.push(dep_paths.get(i))
+        local_dep_paths.push(dep_paths.unsafe_get(i))
         local_dep_sources.push(manifest_get_dep_source(i))
         i = i + 1
     }
@@ -186,8 +186,8 @@ pub fn resolve_path_deps(project_root: Str) -> Int {
     // Resolve each path dependency
     let mut j = 0
     while j < dep_count {
-        if local_dep_sources.get(j) == "path" {
-            let rc = resolve_one(local_dep_names.get(j), local_dep_paths.get(j), project_root)
+        if local_dep_sources.unsafe_get(j) == "path" {
+            let rc = resolve_one(local_dep_names.unsafe_get(j), local_dep_paths.unsafe_get(j), project_root)
             if rc != 0 {
                 return 1
             }
@@ -208,33 +208,33 @@ pub fn pathdeps_get_name(i: Int) -> Str {
     if i < 0 || i >= resolved_names.len() {
         return ""
     }
-    resolved_names.get(i)
+    resolved_names.unsafe_get(i)
 }
 
 pub fn pathdeps_get_version(i: Int) -> Str {
     if i < 0 || i >= resolved_versions.len() {
         return ""
     }
-    resolved_versions.get(i)
+    resolved_versions.unsafe_get(i)
 }
 
 pub fn pathdeps_get_source(i: Int) -> Str {
     if i < 0 || i >= resolved_sources.len() {
         return ""
     }
-    resolved_sources.get(i)
+    resolved_sources.unsafe_get(i)
 }
 
 pub fn pathdeps_get_hash(i: Int) -> Str {
     if i < 0 || i >= resolved_hashes.len() {
         return ""
     }
-    resolved_hashes.get(i)
+    resolved_hashes.unsafe_get(i)
 }
 
 pub fn pathdeps_get_caps(i: Int) -> Str {
     if i < 0 || i >= resolved_caps.len() {
         return ""
     }
-    resolved_caps.get(i)
+    resolved_caps.unsafe_get(i)
 }

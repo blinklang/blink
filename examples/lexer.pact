@@ -331,11 +331,11 @@ fn lex(source: Str) {
 
     // ── Main loop ─────────────────────────────────────────────────
     while pos < source.len() {
-        let mode = mode_stack.get(mode_stack.len() - 1)
+        let mode = mode_stack.unsafe_get(mode_stack.len() - 1)
 
         if mode == MODE_NORMAL {
             // ── NORMAL MODE ───────────────────────────────────────
-            let brace_depth = brace_depth_stack.get(brace_depth_stack.len() - 1)
+            let brace_depth = brace_depth_stack.unsafe_get(brace_depth_stack.len() - 1)
             let ch = peek(source, pos)
 
             // Skip whitespace (not newline)
@@ -1051,10 +1051,10 @@ fn main() {
 
     let mut i = 0
     while i < tok_kinds.len() {
-        let k = tok_kinds.get(i)
-        let v = tok_values.get(i)
-        let l = tok_lines.get(i)
-        let c = tok_cols.get(i)
+        let k = tok_kinds.unsafe_get(i)
+        let v = tok_values.unsafe_get(i)
+        let l = tok_lines.unsafe_get(i)
+        let c = tok_cols.unsafe_get(i)
         io.println("{l}:{c}  {token_kind_name(k)}  {v}")
         i = i + 1
     }

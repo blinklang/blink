@@ -2,7 +2,7 @@
 
 > Pact is a statically-typed, effect-tracked programming language that compiles to C. Designed for AI-first development: minimal syntax, no semicolons, universal string interpolation, algebraic effects, and contracts.
 
-Pact v0.3. Self-hosting compiler. Targets native binaries via C codegen.
+Language spec v0.3. Self-hosting compiler. Targets native binaries via C codegen.
 
 Key facts:
 - `fn` keyword, `{ }` braces, no semicolons, newline-separated statements
@@ -15,7 +15,7 @@ Key facts:
 
 ## Docs
 
-- [Full LLM Reference](llms-full.txt): Complete self-contained language reference with all syntax, builtins, methods, and examples
+- [Full LLM Reference](llms-full.md): Complete self-contained language reference with all syntax, builtins, methods, and examples
 - [Language Spec Index](SPEC.md): Design decisions, philosophy, detailed specification
 - [Syntax & Closures](sections/02_syntax.md): fn, let, match, strings, closures, annotations
 - [Types & Generics](sections/03_types.md): Structs, enums, generics, traits, tuples

@@ -450,28 +450,28 @@ pub fn json_type(idx: Int) -> Int {
     if idx < 0 || idx >= json_types.len() {
         return -1
     }
-    json_types.get(idx)
+    json_types.unsafe_get(idx)
 }
 
 pub fn json_as_str(idx: Int) -> Str {
     if idx < 0 || idx >= json_str_vals.len() {
         return ""
     }
-    json_str_vals.get(idx)
+    json_str_vals.unsafe_get(idx)
 }
 
 pub fn json_as_int(idx: Int) -> Int {
     if idx < 0 || idx >= json_int_vals.len() {
         return 0
     }
-    json_int_vals.get(idx)
+    json_int_vals.unsafe_get(idx)
 }
 
 pub fn json_as_float(idx: Int) -> Float {
     if idx < 0 || idx >= json_float_vals.len() {
         return 0.0
     }
-    let s = json_float_vals.get(idx)
+    let s = json_float_vals.unsafe_get(idx)
     if s == "" {
         return 0.0
     }
@@ -482,22 +482,22 @@ pub fn json_as_bool(idx: Int) -> Int {
     if idx < 0 || idx >= json_bool_vals.len() {
         return 0
     }
-    json_bool_vals.get(idx)
+    json_bool_vals.unsafe_get(idx)
 }
 
 pub fn json_get(idx: Int, key: Str) -> Int {
     if idx < 0 || idx >= json_types.len() {
         return -1
     }
-    if json_types.get(idx) != JSON_OBJECT {
+    if json_types.unsafe_get(idx) != JSON_OBJECT {
         return -1
     }
-    let start = json_children.get(idx)
-    let count = json_child_counts.get(idx)
+    let start = json_children.unsafe_get(idx)
+    let count = json_child_counts.unsafe_get(idx)
     let mut i = start
     let limit = start + count
     while i < json_types.len() && i < limit {
-        if json_parents.get(i) == idx && json_keys.get(i) == key {
+        if json_parents.unsafe_get(i) == idx && json_keys.unsafe_get(i) == key {
             return i
         }
         i = i + 1
@@ -505,7 +505,7 @@ pub fn json_get(idx: Int, key: Str) -> Int {
     // Fallback: scan all children
     let mut j = 0
     while j < json_types.len() {
-        if json_parents.get(j) == idx && json_keys.get(j) == key {
+        if json_parents.unsafe_get(j) == idx && json_keys.unsafe_get(j) == key {
             return j
         }
         j = j + 1
@@ -517,24 +517,24 @@ pub fn json_at(idx: Int, i: Int) -> Int {
     if idx < 0 || idx >= json_types.len() {
         return -1
     }
-    if json_types.get(idx) != JSON_ARRAY {
+    if json_types.unsafe_get(idx) != JSON_ARRAY {
         return -1
     }
-    let start = json_children.get(idx)
-    let count = json_child_counts.get(idx)
+    let start = json_children.unsafe_get(idx)
+    let count = json_child_counts.unsafe_get(idx)
     if i < 0 || i >= count {
         return -1
     }
     // Children are stored contiguously starting at start
     let target = start + i
-    if target < json_types.len() && json_parents.get(target) == idx {
+    if target < json_types.len() && json_parents.unsafe_get(target) == idx {
         return target
     }
     // Fallback: count children
     let mut ci = 0
     let mut found = 0
     while ci < json_types.len() {
-        if json_parents.get(ci) == idx {
+        if json_parents.unsafe_get(ci) == idx {
             if found == i {
                 return ci
             }
@@ -549,14 +549,14 @@ pub fn json_len(idx: Int) -> Int {
     if idx < 0 || idx >= json_types.len() {
         return 0
     }
-    json_child_counts.get(idx)
+    json_child_counts.unsafe_get(idx)
 }
 
 fn json_obj_child_at(parent: Int, i: Int) -> Int {
     let mut ci = 0
     let mut found = 0
     while ci < json_types.len() {
-        if json_parents.get(ci) == parent {
+        if json_parents.unsafe_get(ci) == parent {
             if found == i {
                 return ci
             }
@@ -596,31 +596,31 @@ pub fn json_serialize(idx: Int) -> Str {
     if idx < 0 || idx >= json_types.len() {
         return "null"
     }
-    let ntype = json_types.get(idx)
+    let ntype = json_types.unsafe_get(idx)
 
     if ntype == JSON_NULL {
         return "null"
     }
     if ntype == JSON_BOOL {
-        if json_bool_vals.get(idx) == 1 {
+        if json_bool_vals.unsafe_get(idx) == 1 {
             return "true"
         }
         return "false"
     }
     if ntype == JSON_INT {
-        let v = json_int_vals.get(idx)
+        let v = json_int_vals.unsafe_get(idx)
         return "{v}"
     }
     if ntype == JSON_FLOAT {
-        return json_float_vals.get(idx)
+        return json_float_vals.unsafe_get(idx)
     }
     if ntype == JSON_STRING {
-        let v = escape_json_str(json_str_vals.get(idx))
+        let v = escape_json_str(json_str_vals.unsafe_get(idx))
         return "\"{v}\""
     }
     if ntype == JSON_ARRAY {
         let mut result = "["
-        let count = json_child_counts.get(idx)
+        let count = json_child_counts.unsafe_get(idx)
         let mut i = 0
         while i < count {
             if i > 0 {
@@ -635,16 +635,16 @@ pub fn json_serialize(idx: Int) -> Str {
     }
     if ntype == JSON_OBJECT {
         let mut result = "\{"
-        let count = json_child_counts.get(idx)
-        let start = json_children.get(idx)
+        let count = json_child_counts.unsafe_get(idx)
+        let start = json_children.unsafe_get(idx)
         let mut i = 0
         while i < count {
             if i > 0 {
                 result = result.concat(",")
             }
             let child_idx = start + i
-            if child_idx < json_types.len() && json_parents.get(child_idx) == idx {
-                let k = escape_json_str(json_keys.get(child_idx))
+            if child_idx < json_types.len() && json_parents.unsafe_get(child_idx) == idx {
+                let k = escape_json_str(json_keys.unsafe_get(child_idx))
                 result = result.concat("\"")
                 result = result.concat(k)
                 result = result.concat("\":")
@@ -652,7 +652,7 @@ pub fn json_serialize(idx: Int) -> Str {
             } else {
                 let ci = json_obj_child_at(idx, i)
                 if ci >= 0 {
-                    let k = escape_json_str(json_keys.get(ci))
+                    let k = escape_json_str(json_keys.unsafe_get(ci))
                     result = result.concat("\"")
                     result = result.concat(k)
                     result = result.concat("\":")
@@ -727,7 +727,7 @@ pub fn json_new_null() -> Int {
 pub fn json_set(obj: Int, key: Str, val: Int) {
     json_parents.set(val, obj)
     json_keys.set(val, key)
-    let count = json_child_counts.get(obj)
+    let count = json_child_counts.unsafe_get(obj)
     if count == 0 {
         json_children.set(obj, val)
     }
@@ -736,7 +736,7 @@ pub fn json_set(obj: Int, key: Str, val: Int) {
 
 pub fn json_push(arr: Int, val: Int) {
     json_parents.set(val, arr)
-    let count = json_child_counts.get(arr)
+    let count = json_child_counts.unsafe_get(arr)
     if count == 0 {
         json_children.set(arr, val)
     }

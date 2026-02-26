@@ -2,7 +2,7 @@ fn sum_floats(nums: List[Float]) -> Float {
     let mut total = 0.0
     let mut i = 0
     while i < nums.len() {
-        total = total + nums.get(i)
+        total = total + nums.unsafe_get(i)
         i = i + 1
     }
     total
@@ -24,7 +24,7 @@ fn main() {
 
     // Test List[Float] via variable alias
     let alias = vals
-    let first = alias.get(0)
+    let first = alias.unsafe_get(0)
     if first != 1.5 {
         io.println("FAIL: alias.get(0) expected 1.5, got {first}")
         pass = false

@@ -130,7 +130,7 @@ fn store_entry(key: Str, value: Str, vtype: Int) {
 fn find_key_index(key: Str) -> Int {
     let mut i = 0
     while i < toml_keys.len() {
-        if toml_keys.get(i) == key {
+        if toml_keys.unsafe_get(i) == key {
             return i
         }
         i = i + 1
@@ -141,8 +141,8 @@ fn find_key_index(key: Str) -> Int {
 fn get_arr_table_count(name: Str) -> Int {
     let mut i = 0
     while i < arr_table_names.len() {
-        if arr_table_names.get(i) == name {
-            return arr_table_counts.get(i)
+        if arr_table_names.unsafe_get(i) == name {
+            return arr_table_counts.unsafe_get(i)
         }
         i = i + 1
     }
@@ -152,8 +152,8 @@ fn get_arr_table_count(name: Str) -> Int {
 fn inc_arr_table_count(name: Str) -> Int {
     let mut i = 0
     while i < arr_table_names.len() {
-        if arr_table_names.get(i) == name {
-            let count = arr_table_counts.get(i)
+        if arr_table_names.unsafe_get(i) == name {
+            let count = arr_table_counts.unsafe_get(i)
             arr_table_counts.set(i, count + 1)
             return count
         }
@@ -562,7 +562,7 @@ pub fn toml_get(key: Str) -> Str {
     if idx == -1 {
         return ""
     }
-    toml_values.get(idx)
+    toml_values.unsafe_get(idx)
 }
 
 pub fn toml_get_int(key: Str) -> Int {

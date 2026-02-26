@@ -369,10 +369,10 @@ pub fn parse_constraint(s: Str) -> Int {
 pub fn version_satisfies(major: Int, minor: Int, patch: Int) -> Int {
     let mut i = 0
     while i < constraint_ops.len() {
-        let op = constraint_ops.get(i)
-        let c_major = constraint_majors.get(i)
-        let c_minor = constraint_minors.get(i)
-        let c_patch = constraint_patches.get(i)
+        let op = constraint_ops.unsafe_get(i)
+        let c_major = constraint_majors.unsafe_get(i)
+        let c_minor = constraint_minors.unsafe_get(i)
+        let c_patch = constraint_patches.unsafe_get(i)
 
         let cmp = version_compare(major, minor, patch,
                                   c_major, c_minor, c_patch)

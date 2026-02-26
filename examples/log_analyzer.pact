@@ -62,15 +62,15 @@ impl Iterator[LogEntry] for LineParser {
             if self.index >= self.lines.len() {
                 return None
             }
-            let line = self.lines.get(self.index) ?? ""
+            let line = self.lines.unsafe_get(self.index) ?? ""
             self.index += 1
 
             let parts = line.split(" ")
-            let level = parse_level(parts.get(0) ?? "")
+            let level = parse_level(parts.unsafe_get(0) ?? "")
             match level {
                 Some(lvl) => {
-                    let code = (parts.get(1) ?? "0").parse_int() ?? 0
-                    let msg = parts.get(2) ?? ""
+                    let code = (parts.unsafe_get(1) ?? "0").parse_int() ?? 0
+                    let msg = parts.unsafe_get(2) ?? ""
                     return Some(LogEntry { level: lvl, message: msg, status_code: code })
                 }
                 None => continue
@@ -192,8 +192,8 @@ test "custom iterator parses valid lines" {
     let lines = ["INFO 200 ok", "INVALID skip", "ERROR 500 fail"]
     let entries = line_parser(lines).collect()
     assert_eq(entries.len(), 2)
-    assert_eq(entries.get(0).unwrap().level, Info)
-    assert_eq(entries.get(1).unwrap().level, Error)
+    assert_eq(entries.unsafe_get(0).unwrap().level, Info)
+    assert_eq(entries.unsafe_get(1).unwrap().level, Error)
 }
 
 test "summarize returns correct tuple" {

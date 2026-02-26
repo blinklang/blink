@@ -85,7 +85,7 @@ fn test_server_routing() {
     let idx1 = match_route(srv, "GET", "/hello")
     check(idx1 >= 0, "match GET /hello")
     if idx1 >= 0 {
-        let route = srv.routes.get(idx1)
+        let route = srv.routes.unsafe_get(idx1)
         let req = request_new("GET", "/hello")
         let resp = route.callback(req)
         check(resp.status == 200, "GET /hello status 200")
@@ -95,7 +95,7 @@ fn test_server_routing() {
     let idx2 = match_route(srv, "POST", "/echo")
     check(idx2 >= 0, "match POST /echo")
     if idx2 >= 0 {
-        let route = srv.routes.get(idx2)
+        let route = srv.routes.unsafe_get(idx2)
         let req = request_new("POST", "/echo")
         let req2 = request_with_body(req, "ping")
         let resp = route.callback(req2)
@@ -107,7 +107,7 @@ fn test_server_routing() {
     check(idx3 >= 0, "match GET /users/:id")
     if idx3 >= 0 {
         check(path_param("id") == "42", "path param id=42")
-        let route = srv.routes.get(idx3)
+        let route = srv.routes.unsafe_get(idx3)
         let req = request_new("GET", "/users/42")
         let resp = route.callback(req)
         check(resp.status == 200, "GET /users/42 status 200")
@@ -140,7 +140,7 @@ fn test_full_pipeline() {
     let idx1 = match_route(srv, req1.method, req1.url)
     check(idx1 >= 0, "pipeline: matched GET /greet")
     if idx1 >= 0 {
-        let route = srv.routes.get(idx1)
+        let route = srv.routes.unsafe_get(idx1)
         let resp = route.callback(req1)
         let text = format_response(resp)
         check(text.contains("200"), "pipeline: GET response 200")
@@ -155,7 +155,7 @@ fn test_full_pipeline() {
     let idx2 = match_route(srv, req2.method, req2.url)
     check(idx2 >= 0, "pipeline: matched POST /echo")
     if idx2 >= 0 {
-        let route = srv.routes.get(idx2)
+        let route = srv.routes.unsafe_get(idx2)
         let resp = route.callback(req2)
         check(resp.body == "hello", "pipeline: POST echoed body")
         let text = format_response(resp)
@@ -189,22 +189,22 @@ fn test_middleware() {
 
     check(srv.before_hooks.len() == 1, "1 hook registered")
 
-    let h0 = srv.before_hooks.get(0)
+    let h0 = srv.before_hooks.unsafe_get(0)
     check(h0.name == "add-header", "hook name correct")
 
     // Simulate the middleware pipeline manually
     let raw_req = request_new("GET", "/check-header")
-    let hook = srv.before_hooks.get(0)
+    let hook = srv.before_hooks.unsafe_get(0)
     let req = hook.process(raw_req)
 
     // Verify header was injected by extracting from the processed request
-    let hdr_val = req.headers.get("X-Test")
+    let hdr_val = req.headers.unsafe_get("X-Test")
     check(hdr_val == "injected", "hook injected header")
 
     let idx = match_route(srv, req.method, req.url)
     check(idx >= 0, "middleware: route matched")
     if idx >= 0 {
-        let route = srv.routes.get(idx)
+        let route = srv.routes.unsafe_get(idx)
         let resp = route.callback(req)
         check(resp.status == 200, "middleware: handler returned 200")
     }

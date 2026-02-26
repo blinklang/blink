@@ -5,13 +5,13 @@
 
 // -- Keywords --
 pub type TokenKind {
-    Fn, Let, Mut, Type, Trait, Impl, If, Else,
+    Fn, Let, Mut, Const, Type, Trait, Impl, If, Else,
     Match, For, In, While, Loop, Break, Continue, Return,
     Pub, With, Handler, Self, Test, Import, As, Mod, Effect,
     Assert, AssertEq, AssertNe, Ident, Int, Float, StringStart, StringEnd,
     StringPart, InterpStart, InterpEnd, LParen, RParen, LBrace, RBrace, LBracket,
     RBracket, Colon, Comma, Dot, DotDot, DotDoteq, Arrow, FatArrow,
-    At, Plus, Minus, Star, Slash, Percent, Equals, EqEq,
+    At, Hash, Plus, Minus, Star, Slash, Percent, Equals, EqEq,
     NotEq, Less, Greater, LessEq, GreaterEq, And, Or, Bang,
     Question, DoubleQuestion, Pipe, PipeArrow, PlusEq, MinusEq, StarEq, SlashEq,
     Newline, EOF,
@@ -52,6 +52,7 @@ pub fn token_kind_name(kind: Int) -> Str {
         TokenKind.Fn => "fn"
         TokenKind.Let => "let"
         TokenKind.Mut => "mut"
+        TokenKind.Const => "const"
         TokenKind.Type => "type"
         TokenKind.Trait => "trait"
         TokenKind.Impl => "impl"
@@ -99,6 +100,7 @@ pub fn token_kind_name(kind: Int) -> Str {
         TokenKind.Arrow => "->"
         TokenKind.FatArrow => "=>"
         TokenKind.At => "@"
+        TokenKind.Hash => "#"
         TokenKind.Plus => "+"
         TokenKind.Minus => "-"
         TokenKind.Star => "*"
@@ -141,6 +143,7 @@ pub fn keyword_lookup(name: Str) -> Int {
         "fn" => TokenKind.Fn
         "let" => TokenKind.Let
         "mut" => TokenKind.Mut
+        "const" => TokenKind.Const
         "type" => TokenKind.Type
         "trait" => TokenKind.Trait
         "impl" => TokenKind.Impl

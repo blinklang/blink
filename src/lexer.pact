@@ -55,6 +55,7 @@ pub let CH_LBRACE = 123
 pub let CH_PIPE = 124
 pub let CH_RBRACE = 125
 pub let CH_BANG = 33
+pub let CH_HASH = 35
 pub let CH_AMP = 38
 
 // ── Character classification ─────────────────────────────────────────
@@ -130,11 +131,11 @@ pub fn lex(source: Str) ! Lex.Tokenize {
 
     // ── Main loop ─────────────────────────────────────────────────
     while pos < source.len() {
-        let mode = mode_stack.get(mode_stack.len() - 1)
+        let mode = mode_stack.unsafe_get(mode_stack.len() - 1)
 
         if mode == MODE_NORMAL {
             // ── NORMAL MODE ───────────────────────────────────────
-            let brace_depth = brace_depth_stack.get(brace_depth_stack.len() - 1)
+            let brace_depth = brace_depth_stack.unsafe_get(brace_depth_stack.len() - 1)
             let ch = peek(source, pos)
 
             // Skip whitespace (not newline)
@@ -706,6 +707,18 @@ pub fn lex(source: Str) ! Lex.Tokenize {
                 tok_lines.push(t_line)
                 tok_cols.push(t_col)
                 last_kind = TokenKind.At
+                continue
+            }
+            if ch == CH_HASH {
+                let t_line = line
+                let t_col = col
+                pos = pos + 1
+                col = col + 1
+                tok_kinds.push(TokenKind.Hash)
+                tok_values.push("#")
+                tok_lines.push(t_line)
+                tok_cols.push(t_col)
+                last_kind = TokenKind.Hash
                 continue
             }
 

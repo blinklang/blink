@@ -72,12 +72,12 @@ fn vis_name(vis: Int) -> Str {
 fn symbol_to_json(idx: Int) -> Str {
     json_clear()
     let obj = json_new_object()
-    json_set(obj, "name", json_new_str(si_sym_name.get(idx)))
-    json_set(obj, "kind", json_new_str(sym_kind_name(si_sym_kind.get(idx))))
-    json_set(obj, "module", json_new_str(si_sym_module.get(idx)))
-    json_set(obj, "signature", json_new_str(si_sym_sig.get(idx)))
+    json_set(obj, "name", json_new_str(si_sym_name.unsafe_get(idx)))
+    json_set(obj, "kind", json_new_str(sym_kind_name(si_sym_kind.unsafe_get(idx))))
+    json_set(obj, "module", json_new_str(si_sym_module.unsafe_get(idx)))
+    json_set(obj, "signature", json_new_str(si_sym_sig.unsafe_get(idx)))
     let eff_arr = json_new_array()
-    let effects = si_sym_effects.get(idx)
+    let effects = si_sym_effects.unsafe_get(idx)
     if effects != "" {
         let mut start = 0
         let mut i = 0
@@ -91,24 +91,24 @@ fn symbol_to_json(idx: Int) -> Str {
         }
     }
     json_set(obj, "effects", eff_arr)
-    json_set(obj, "visibility", json_new_str(vis_name(si_sym_vis.get(idx))))
-    let intent = si_sym_intent.get(idx)
+    json_set(obj, "visibility", json_new_str(vis_name(si_sym_vis.unsafe_get(idx))))
+    let intent = si_sym_intent.unsafe_get(idx)
     if intent != "" {
         json_set(obj, "intent", json_new_str(intent))
     }
-    let doc = si_sym_doc.get(idx)
+    let doc = si_sym_doc.unsafe_get(idx)
     if doc != "" {
         json_set(obj, "doc", json_new_str(doc))
     }
-    let req = si_sym_requires.get(idx)
+    let req = si_sym_requires.unsafe_get(idx)
     if req != "" {
         json_set(obj, "requires", json_new_str(req))
     }
-    let ens = si_sym_ensures.get(idx)
+    let ens = si_sym_ensures.unsafe_get(idx)
     if ens != "" {
         json_set(obj, "ensures", json_new_str(ens))
     }
-    let el = si_sym_end_line.get(idx)
+    let el = si_sym_end_line.unsafe_get(idx)
     if el > 0 {
         json_set(obj, "end_line", json_new_int(el))
     }
@@ -149,7 +149,7 @@ pub fn query_by_signature(module: Str) -> Str {
     let mut first = 1
     let mut i = 0
     while i < si_sym_count {
-        if si_sym_module.get(i) == module && si_sym_kind.get(i) == SK_FN {
+        if si_sym_module.unsafe_get(i) == module && si_sym_kind.unsafe_get(i) == SK_FN {
             if first == 0 {
                 items = items.concat(",")
             }
@@ -168,8 +168,8 @@ pub fn query_by_effect(effect_name: Str) -> Str {
     let mut first = 1
     let mut i = 0
     while i < si_sym_count {
-        if si_sym_kind.get(i) == SK_FN {
-            if effects_contain(si_sym_effects.get(i), effect_name) == 1 {
+        if si_sym_kind.unsafe_get(i) == SK_FN {
+            if effects_contain(si_sym_effects.unsafe_get(i), effect_name) == 1 {
                 if first == 0 {
                     items = items.concat(",")
                 }
@@ -189,7 +189,7 @@ pub fn query_pub_pure() -> Str {
     let mut first = 1
     let mut i = 0
     while i < si_sym_count {
-        if si_sym_kind.get(i) == SK_FN && si_sym_vis.get(i) == VIS_PUB && si_sym_effects.get(i) == "" {
+        if si_sym_kind.unsafe_get(i) == SK_FN && si_sym_vis.unsafe_get(i) == VIS_PUB && si_sym_effects.unsafe_get(i) == "" {
             if first == 0 {
                 items = items.concat(",")
             }
@@ -218,27 +218,27 @@ pub fn query_filtered(vis_filter: Int, module_filter: Str, effect_filter: Str, p
     let mut first = 1
     let mut i = 0
     while i < si_sym_count {
-        if si_sym_kind.get(i) != SK_FN {
+        if si_sym_kind.unsafe_get(i) != SK_FN {
             i = i + 1
             continue
         }
-        if vis_filter == VIS_PUB && si_sym_vis.get(i) != VIS_PUB {
+        if vis_filter == VIS_PUB && si_sym_vis.unsafe_get(i) != VIS_PUB {
             i = i + 1
             continue
         }
-        if module_filter != "" && si_sym_module.get(i) != module_filter {
+        if module_filter != "" && si_sym_module.unsafe_get(i) != module_filter {
             i = i + 1
             continue
         }
-        if effect_filter != "" && effects_contain(si_sym_effects.get(i), effect_filter) == 0 {
+        if effect_filter != "" && effects_contain(si_sym_effects.unsafe_get(i), effect_filter) == 0 {
             i = i + 1
             continue
         }
-        if pure_only != 0 && si_sym_effects.get(i) != "" {
+        if pure_only != 0 && si_sym_effects.unsafe_get(i) != "" {
             i = i + 1
             continue
         }
-        if name_filter != "" && si_sym_name.get(i) != name_filter {
+        if name_filter != "" && si_sym_name.unsafe_get(i) != name_filter {
             i = i + 1
             continue
         }
@@ -257,8 +257,8 @@ pub fn query_filtered(vis_filter: Int, module_filter: Str, effect_filter: Str, p
 fn symbol_to_intent_json(idx: Int) -> Str {
     json_clear()
     let obj = json_new_object()
-    json_set(obj, "name", json_new_str(si_sym_name.get(idx)))
-    json_set(obj, "intent", json_new_str(si_sym_intent.get(idx)))
+    json_set(obj, "name", json_new_str(si_sym_name.unsafe_get(idx)))
+    json_set(obj, "intent", json_new_str(si_sym_intent.unsafe_get(idx)))
     json_encode(obj)
 }
 
@@ -267,10 +267,10 @@ fn symbol_to_intent_json(idx: Int) -> Str {
 fn symbol_to_contract_json(idx: Int) -> Str {
     json_clear()
     let obj = json_new_object()
-    json_set(obj, "name", json_new_str(si_sym_name.get(idx)))
-    json_set(obj, "signature", json_new_str(si_sym_sig.get(idx)))
+    json_set(obj, "name", json_new_str(si_sym_name.unsafe_get(idx)))
+    json_set(obj, "signature", json_new_str(si_sym_sig.unsafe_get(idx)))
     let eff_arr = json_new_array()
-    let effects = si_sym_effects.get(idx)
+    let effects = si_sym_effects.unsafe_get(idx)
     if effects != "" {
         let mut start = 0
         let mut i = 0
@@ -284,12 +284,12 @@ fn symbol_to_contract_json(idx: Int) -> Str {
         }
     }
     json_set(obj, "effects", eff_arr)
-    json_set(obj, "visibility", json_new_str(vis_name(si_sym_vis.get(idx))))
-    let req = si_sym_requires.get(idx)
+    json_set(obj, "visibility", json_new_str(vis_name(si_sym_vis.unsafe_get(idx))))
+    let req = si_sym_requires.unsafe_get(idx)
     if req != "" {
         json_set(obj, "requires", json_new_str(req))
     }
-    let ens = si_sym_ensures.get(idx)
+    let ens = si_sym_ensures.unsafe_get(idx)
     if ens != "" {
         json_set(obj, "ensures", json_new_str(ens))
     }
@@ -329,12 +329,12 @@ fn extract_lines(content: Str, start_line: Int, end_line: Int) -> Str {
 fn symbol_to_full_json(idx: Int) -> Str {
     json_clear()
     let obj = json_new_object()
-    json_set(obj, "name", json_new_str(si_sym_name.get(idx)))
-    json_set(obj, "kind", json_new_str(sym_kind_name(si_sym_kind.get(idx))))
-    json_set(obj, "module", json_new_str(si_sym_module.get(idx)))
-    json_set(obj, "signature", json_new_str(si_sym_sig.get(idx)))
+    json_set(obj, "name", json_new_str(si_sym_name.unsafe_get(idx)))
+    json_set(obj, "kind", json_new_str(sym_kind_name(si_sym_kind.unsafe_get(idx))))
+    json_set(obj, "module", json_new_str(si_sym_module.unsafe_get(idx)))
+    json_set(obj, "signature", json_new_str(si_sym_sig.unsafe_get(idx)))
     let eff_arr = json_new_array()
-    let effects = si_sym_effects.get(idx)
+    let effects = si_sym_effects.unsafe_get(idx)
     if effects != "" {
         let mut start = 0
         let mut i = 0
@@ -348,29 +348,29 @@ fn symbol_to_full_json(idx: Int) -> Str {
         }
     }
     json_set(obj, "effects", eff_arr)
-    json_set(obj, "visibility", json_new_str(vis_name(si_sym_vis.get(idx))))
-    let intent = si_sym_intent.get(idx)
+    json_set(obj, "visibility", json_new_str(vis_name(si_sym_vis.unsafe_get(idx))))
+    let intent = si_sym_intent.unsafe_get(idx)
     if intent != "" {
         json_set(obj, "intent", json_new_str(intent))
     }
-    let doc = si_sym_doc.get(idx)
+    let doc = si_sym_doc.unsafe_get(idx)
     if doc != "" {
         json_set(obj, "doc", json_new_str(doc))
     }
-    let req = si_sym_requires.get(idx)
+    let req = si_sym_requires.unsafe_get(idx)
     if req != "" {
         json_set(obj, "requires", json_new_str(req))
     }
-    let ens = si_sym_ensures.get(idx)
+    let ens = si_sym_ensures.unsafe_get(idx)
     if ens != "" {
         json_set(obj, "ensures", json_new_str(ens))
     }
-    let line = si_sym_line.get(idx)
+    let line = si_sym_line.unsafe_get(idx)
     json_set(obj, "line", json_new_int(line))
-    let el = si_sym_end_line.get(idx)
+    let el = si_sym_end_line.unsafe_get(idx)
     if el > 0 {
         json_set(obj, "end_line", json_new_int(el))
-        let file_path = si_sym_file.get(idx)
+        let file_path = si_sym_file.unsafe_get(idx)
         if file_path != "" {
             let file_content = read_file(file_path)
             if file_content != "" {
@@ -404,27 +404,27 @@ pub fn query_filtered_layer(layer: Str, vis_filter: Int, module_filter: Str, eff
     let mut first = 1
     let mut i = 0
     while i < si_sym_count {
-        if si_sym_kind.get(i) != SK_FN {
+        if si_sym_kind.unsafe_get(i) != SK_FN {
             i = i + 1
             continue
         }
-        if vis_filter == VIS_PUB && si_sym_vis.get(i) != VIS_PUB {
+        if vis_filter == VIS_PUB && si_sym_vis.unsafe_get(i) != VIS_PUB {
             i = i + 1
             continue
         }
-        if module_filter != "" && si_sym_module.get(i) != module_filter {
+        if module_filter != "" && si_sym_module.unsafe_get(i) != module_filter {
             i = i + 1
             continue
         }
-        if effect_filter != "" && effects_contain(si_sym_effects.get(i), effect_filter) == 0 {
+        if effect_filter != "" && effects_contain(si_sym_effects.unsafe_get(i), effect_filter) == 0 {
             i = i + 1
             continue
         }
-        if pure_only != 0 && si_sym_effects.get(i) != "" {
+        if pure_only != 0 && si_sym_effects.unsafe_get(i) != "" {
             i = i + 1
             continue
         }
-        if name_filter != "" && si_sym_name.get(i) != name_filter {
+        if name_filter != "" && si_sym_name.unsafe_get(i) != name_filter {
             i = i + 1
             continue
         }
@@ -546,8 +546,8 @@ fn qr_parse_request(s: Str) -> Int {
 fn qr_get(key: Str) -> Str {
     let mut i = 0
     while i < qr_keys.len() {
-        if qr_keys.get(i) == key {
-            return qr_vals.get(i)
+        if qr_keys.unsafe_get(i) == key {
+            return qr_vals.unsafe_get(i)
         }
         i = i + 1
     }

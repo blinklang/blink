@@ -55,8 +55,8 @@ pub fn diag_error_no_loc(name: Str, code: Str, message: Str, help: Str) ! Diag.R
 }
 
 pub fn diag_error_at(name: Str, code: Str, message: Str, node_id: Int, help: Str) ! Diag.Report {
-    let line = np_line.get(node_id)
-    let col = np_col.get(node_id)
+    let line = np_line.unsafe_get(node_id)
+    let col = np_col.unsafe_get(node_id)
     diag_emit("error", name, code, message, line, col, help)
 }
 
@@ -69,8 +69,8 @@ pub fn diag_warn_no_loc(name: Str, code: Str, message: Str, help: Str) ! Diag.Re
 }
 
 pub fn diag_warn_at(name: Str, code: Str, message: Str, node_id: Int, help: Str) ! Diag.Report {
-    let line = np_line.get(node_id)
-    let col = np_col.get(node_id)
+    let line = np_line.unsafe_get(node_id)
+    let col = np_col.unsafe_get(node_id)
     diag_emit("warning", name, code, message, line, col, help)
 }
 
@@ -137,16 +137,16 @@ pub fn diag_flush() ! Diag.Report {
 }
 
 pub fn diag_print_json(idx: Int) ! Diag.Report {
-    let sev = json_escape(diag_severity.get(idx))
-    let name = json_escape(diag_name.get(idx))
-    let code = json_escape(diag_code.get(idx))
-    let msg = json_escape(diag_message.get(idx))
-    let file = json_escape(diag_file.get(idx))
-    let line = diag_line.get(idx)
-    let col = diag_col.get(idx)
-    let help = diag_help.get(idx)
-    let el = diag_end_line.get(idx)
-    let ec = diag_end_col.get(idx)
+    let sev = json_escape(diag_severity.unsafe_get(idx))
+    let name = json_escape(diag_name.unsafe_get(idx))
+    let code = json_escape(diag_code.unsafe_get(idx))
+    let msg = json_escape(diag_message.unsafe_get(idx))
+    let file = json_escape(diag_file.unsafe_get(idx))
+    let line = diag_line.unsafe_get(idx)
+    let col = diag_col.unsafe_get(idx)
+    let help = diag_help.unsafe_get(idx)
+    let el = diag_end_line.unsafe_get(idx)
+    let ec = diag_end_col.unsafe_get(idx)
     let mut span = "\"span\":\{\"file\":\"{file}\",\"line\":{line},\"col\":{col}"
     if el > 0 {
         span = span.concat(",\"end_line\":{el},\"end_col\":{ec}")
@@ -161,13 +161,13 @@ pub fn diag_print_json(idx: Int) ! Diag.Report {
 }
 
 pub fn diag_print_human(idx: Int) ! Diag.Report {
-    let sev = diag_severity.get(idx)
-    let name = diag_name.get(idx)
-    let msg = diag_message.get(idx)
-    let file = diag_file.get(idx)
-    let line = diag_line.get(idx)
-    let col = diag_col.get(idx)
-    let help = diag_help.get(idx)
+    let sev = diag_severity.unsafe_get(idx)
+    let name = diag_name.unsafe_get(idx)
+    let msg = diag_message.unsafe_get(idx)
+    let file = diag_file.unsafe_get(idx)
+    let line = diag_line.unsafe_get(idx)
+    let col = diag_col.unsafe_get(idx)
+    let help = diag_help.unsafe_get(idx)
     io.println("{sev}[{name}]: {msg}")
     if line > 0 {
         io.println("  --> {file}:{line}:{col}")

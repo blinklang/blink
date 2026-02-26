@@ -37,7 +37,7 @@ pub fn fw_init() {
 
     let mut i = 0
     while i < si_file_count {
-        let p = si_file_path.get(i)
+        let p = si_file_path.unsafe_get(i)
         let mt = file_mtime(p)
         fw_path.push(p)
         fw_mtime.push(mt)
@@ -56,8 +56,8 @@ pub fn fw_poll() -> Int {
     // Check existing watched files for mtime changes
     let mut i = 0
     while i < fw_count {
-        let p = fw_path.get(i)
-        let old_mt = fw_mtime.get(i)
+        let p = fw_path.unsafe_get(i)
+        let old_mt = fw_mtime.unsafe_get(i)
         let cur_mt = file_mtime(p)
         if cur_mt != old_mt {
             fw_mtime.set(i, cur_mt)
@@ -70,7 +70,7 @@ pub fn fw_poll() -> Int {
     // Detect new files in symbol index not yet tracked
     i = 0
     while i < si_file_count {
-        let p = si_file_path.get(i)
+        let p = si_file_path.unsafe_get(i)
         if path_map.has(p) == 0 {
             let mt = file_mtime(p)
             fw_path.push(p)

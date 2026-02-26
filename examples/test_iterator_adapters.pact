@@ -30,11 +30,11 @@ fn main() {
         io.println("FAIL: map(*2).filter(>6).collect len = {mfc.len()}, expected 7")
         fail = fail + 1
     }
-    if mfc.get(0) == 8 && mfc.get(6) == 20 {
+    if mfc.unsafe_get(0) == 8 && mfc.unsafe_get(6) == 20 {
         io.println("ok: map(*2).filter(>6).collect values correct")
         pass = pass + 1
     } else {
-        io.println("FAIL: map(*2).filter(>6).collect values wrong, first={mfc.get(0)}, last={mfc.get(6)}")
+        io.println("FAIL: map(*2).filter(>6).collect values wrong, first={mfc.unsafe_get(0)}, last={mfc.unsafe_get(6)}")
         fail = fail + 1
     }
 
@@ -43,9 +43,9 @@ fn main() {
     // doubles: [2,4,6,8,10,12,14,16,18,20], filter >10: [12,14,16,18,20], take 3: [12,14,16]
     let mut mft_ok = 1
     if mft.len() != 3 { mft_ok = 0 }
-    if mft.get(0) != 12 { mft_ok = 0 }
-    if mft.get(1) != 14 { mft_ok = 0 }
-    if mft.get(2) != 16 { mft_ok = 0 }
+    if mft.unsafe_get(0) != 12 { mft_ok = 0 }
+    if mft.unsafe_get(1) != 14 { mft_ok = 0 }
+    if mft.unsafe_get(2) != 16 { mft_ok = 0 }
     if mft_ok == 1 {
         io.println("ok: map(*2).filter(>10).take(3) = [12, 14, 16]")
         pass = pass + 1
@@ -81,11 +81,11 @@ fn main() {
     // odds: [1,3,5,7,9], tripled: [3,9,15,21,27]
     let mut fmc_ok = 1
     if fmc.len() != 5 { fmc_ok = 0 }
-    if fmc.get(0) != 3 { fmc_ok = 0 }
-    if fmc.get(1) != 9 { fmc_ok = 0 }
-    if fmc.get(2) != 15 { fmc_ok = 0 }
-    if fmc.get(3) != 21 { fmc_ok = 0 }
-    if fmc.get(4) != 27 { fmc_ok = 0 }
+    if fmc.unsafe_get(0) != 3 { fmc_ok = 0 }
+    if fmc.unsafe_get(1) != 9 { fmc_ok = 0 }
+    if fmc.unsafe_get(2) != 15 { fmc_ok = 0 }
+    if fmc.unsafe_get(3) != 21 { fmc_ok = 0 }
+    if fmc.unsafe_get(4) != 27 { fmc_ok = 0 }
     if fmc_ok == 1 {
         io.println("ok: filter(odd).map(*3).collect = [3,9,15,21,27]")
         pass = pass + 1
@@ -102,10 +102,10 @@ fn main() {
     // skip 3: [4,5,6,7,8,9,10], take 4: [4,5,6,7]
     let mut st_ok = 1
     if st.len() != 4 { st_ok = 0 }
-    if st.get(0) != 4 { st_ok = 0 }
-    if st.get(1) != 5 { st_ok = 0 }
-    if st.get(2) != 6 { st_ok = 0 }
-    if st.get(3) != 7 { st_ok = 0 }
+    if st.unsafe_get(0) != 4 { st_ok = 0 }
+    if st.unsafe_get(1) != 5 { st_ok = 0 }
+    if st.unsafe_get(2) != 6 { st_ok = 0 }
+    if st.unsafe_get(3) != 7 { st_ok = 0 }
     if st_ok == 1 {
         io.println("ok: skip(3).take(4) = [4,5,6,7]")
         pass = pass + 1
@@ -119,9 +119,9 @@ fn main() {
     // take 5: [1,2,3,4,5], skip 2: [3,4,5]
     let mut ts_ok = 1
     if ts.len() != 3 { ts_ok = 0 }
-    if ts.get(0) != 3 { ts_ok = 0 }
-    if ts.get(1) != 4 { ts_ok = 0 }
-    if ts.get(2) != 5 { ts_ok = 0 }
+    if ts.unsafe_get(0) != 3 { ts_ok = 0 }
+    if ts.unsafe_get(1) != 4 { ts_ok = 0 }
+    if ts.unsafe_get(2) != 5 { ts_ok = 0 }
     if ts_ok == 1 {
         io.println("ok: take(5).skip(2) = [3,4,5]")
         pass = pass + 1
@@ -280,9 +280,9 @@ fn main() {
     let cmt = nums.chain(other).map(fn(x: Int) -> Int { x * 2 }).take(3).collect()
     let mut cmt_ok = 1
     if cmt.len() != 3 { cmt_ok = 0 }
-    if cmt.get(0) != 2 { cmt_ok = 0 }
-    if cmt.get(1) != 4 { cmt_ok = 0 }
-    if cmt.get(2) != 6 { cmt_ok = 0 }
+    if cmt.unsafe_get(0) != 2 { cmt_ok = 0 }
+    if cmt.unsafe_get(1) != 4 { cmt_ok = 0 }
+    if cmt.unsafe_get(2) != 6 { cmt_ok = 0 }
     if cmt_ok == 1 {
         io.println("ok: chain.map(*2).take(3) = [2,4,6]")
         pass = pass + 1
@@ -299,9 +299,9 @@ fn main() {
     // filter >2: [3,4,5,6,7,8,9,10], map *10: [30,40,50,60,70,80,90,100], skip 2: [50,60,70,80,90,100], take 3: [50,60,70]
     let mut fmst_ok = 1
     if fmst.len() != 3 { fmst_ok = 0 }
-    if fmst.get(0) != 50 { fmst_ok = 0 }
-    if fmst.get(1) != 60 { fmst_ok = 0 }
-    if fmst.get(2) != 70 { fmst_ok = 0 }
+    if fmst.unsafe_get(0) != 50 { fmst_ok = 0 }
+    if fmst.unsafe_get(1) != 60 { fmst_ok = 0 }
+    if fmst.unsafe_get(2) != 70 { fmst_ok = 0 }
     if fmst_ok == 1 {
         io.println("ok: filter(>2).map(*10).skip(2).take(3) = [50,60,70]")
         pass = pass + 1
@@ -412,11 +412,11 @@ fn main() {
     // +1: [2,3,4,5,6,...], *2: [4,6,8,10,12,...], take 5: [4,6,8,10,12]
     let mut dm_ok = 1
     if dm.len() != 5 { dm_ok = 0 }
-    if dm.get(0) != 4 { dm_ok = 0 }
-    if dm.get(1) != 6 { dm_ok = 0 }
-    if dm.get(2) != 8 { dm_ok = 0 }
-    if dm.get(3) != 10 { dm_ok = 0 }
-    if dm.get(4) != 12 { dm_ok = 0 }
+    if dm.unsafe_get(0) != 4 { dm_ok = 0 }
+    if dm.unsafe_get(1) != 6 { dm_ok = 0 }
+    if dm.unsafe_get(2) != 8 { dm_ok = 0 }
+    if dm.unsafe_get(3) != 10 { dm_ok = 0 }
+    if dm.unsafe_get(4) != 12 { dm_ok = 0 }
     if dm_ok == 1 {
         io.println("ok: map(+1).map(*2).take(5) = [4,6,8,10,12]")
         pass = pass + 1
@@ -432,10 +432,10 @@ fn main() {
     // >3: [4,5,6,7,8,9,10], <8: [4,5,6,7]
     let mut df_ok = 1
     if df.len() != 4 { df_ok = 0 }
-    if df.get(0) != 4 { df_ok = 0 }
-    if df.get(1) != 5 { df_ok = 0 }
-    if df.get(2) != 6 { df_ok = 0 }
-    if df.get(3) != 7 { df_ok = 0 }
+    if df.unsafe_get(0) != 4 { df_ok = 0 }
+    if df.unsafe_get(1) != 5 { df_ok = 0 }
+    if df.unsafe_get(2) != 6 { df_ok = 0 }
+    if df.unsafe_get(3) != 7 { df_ok = 0 }
     if df_ok == 1 {
         io.println("ok: filter(>3).filter(<8) = [4,5,6,7]")
         pass = pass + 1

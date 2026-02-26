@@ -110,8 +110,8 @@ test "mutating method call on global list" {
     add_item(10)
     add_item(20)
     assert_eq(get_item_count(), 2)
-    assert_eq(items.get(0), 10)
-    assert_eq(items.get(1), 20)
+    assert_eq(items.unsafe_get(0), 10)
+    assert_eq(items.unsafe_get(1), 20)
 }
 
 test "string global assignment" {
@@ -140,7 +140,7 @@ test "single function writes multiple globals" {
     assert_eq(get_counter(), 10)
     assert_eq(get_name(), "bumped")
     assert_eq(get_item_count(), 1)
-    assert_eq(items.get(0), 99)
+    assert_eq(items.unsafe_get(0), 99)
 }
 
 test "read-only functions reflect mutations" {
@@ -175,7 +175,7 @@ test "complete save/restore preserves state" {
     assert_eq(get_counter(), 5)
     assert_eq(get_name(), "before")
     assert_eq(get_item_count(), 1)
-    assert_eq(items.get(0), 42)
+    assert_eq(items.unsafe_get(0), 42)
 }
 
 test "incomplete save/restore preserves only saved globals" {
@@ -186,7 +186,7 @@ test "incomplete save/restore preserves only saved globals" {
     assert_eq(get_counter(), 5)
     assert_eq(get_name(), "before")
     assert_eq(get_item_count(), 1)
-    assert_eq(items.get(0), 99)
+    assert_eq(items.unsafe_get(0), 99)
 }
 
 fn main() {

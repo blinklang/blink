@@ -16,6 +16,7 @@ pub type NodeKind {
     MatchArm, StructLitField, WithBlock, WithResource, HandlerExpr, Annotation, ModBlock, ImportStmt, TypeAnn,
     TypeParam, EffectDecl,
     AsyncScope, AsyncSpawn, AwaitExpr, ChannelNew,
+    EmbedExpr,
 }
 
 // -- Statement node kinds --
@@ -207,6 +208,7 @@ pub fn node_kind_name(kind: Int) -> Str {
         NodeKind.AsyncSpawn => "AsyncSpawn"
         NodeKind.AwaitExpr => "AwaitExpr"
         NodeKind.ChannelNew => "ChannelNew"
+        NodeKind.EmbedExpr => "EmbedExpr"
         _ => "Unknown"
     }
 }

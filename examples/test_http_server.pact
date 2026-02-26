@@ -29,11 +29,11 @@ fn test_route_registration() {
     })
     check(srv.routes.len() == 2, "2 routes registered")
 
-    let r0 = srv.routes.get(0)
+    let r0 = srv.routes.unsafe_get(0)
     check(r0.method == "GET", "route 0 method")
     check(r0.pattern == "/hello", "route 0 pattern")
 
-    let r1 = srv.routes.get(1)
+    let r1 = srv.routes.unsafe_get(1)
     check(r1.method == "POST", "route 1 method")
     check(r1.pattern == "/echo", "route 1 pattern")
 }
@@ -45,7 +45,7 @@ fn test_handler_dispatch() {
         response_ok("hello from handler")
     })
 
-    let route = srv.routes.get(0)
+    let route = srv.routes.unsafe_get(0)
     let req = request_new("GET", "/hello")
     let resp = route.callback(req)
     check(resp.status == 200, "handler returned 200")

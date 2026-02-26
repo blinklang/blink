@@ -37,7 +37,7 @@ fn main() {
         io.println("FAIL: request_with_header")
         pass = false
     }
-    let ct_val = req3.headers.get("Content-Type")
+    let ct_val = req3.headers.unsafe_get("Content-Type")
     if ct_val != "application/json" {
         io.println("FAIL: request_with_header value")
         pass = false
@@ -101,7 +101,7 @@ fn main() {
         io.println("FAIL: response_json status")
         pass = false
     }
-    let json_ct = resp_json.headers.get("Content-Type")
+    let json_ct = resp_json.headers.unsafe_get("Content-Type")
     if json_ct != "application/json" {
         io.println("FAIL: response_json content-type")
         pass = false

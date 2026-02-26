@@ -31,7 +31,7 @@ pub fn audit_clear() {
 fn find_in_baseline(name: Str) -> Int {
     let mut i = 0
     while i < base_names.len() {
-        if base_names.get(i) == name {
+        if base_names.unsafe_get(i) == name {
             return i
         }
         i = i + 1
@@ -106,9 +106,9 @@ pub fn audit_load_baseline(path: Str) -> Int {
 
     let mut i = 0
     while i < lock_pkg_names.len() {
-        base_names.push(lock_pkg_names.get(i))
-        base_versions.push(lock_pkg_versions.get(i))
-        base_caps.push(lock_pkg_caps.get(i))
+        base_names.push(lock_pkg_names.unsafe_get(i))
+        base_versions.push(lock_pkg_versions.unsafe_get(i))
+        base_caps.push(lock_pkg_caps.unsafe_get(i))
         i = i + 1
     }
 
@@ -125,8 +125,8 @@ pub fn audit_check() -> Int {
 
     let mut i = 0
     while i < lock_pkg_names.len() {
-        let name = lock_pkg_names.get(i)
-        let current_caps = lock_pkg_caps.get(i)
+        let name = lock_pkg_names.unsafe_get(i)
+        let current_caps = lock_pkg_caps.unsafe_get(i)
         let base_idx = find_in_baseline(name)
 
         if base_idx == -1 {
@@ -136,7 +136,7 @@ pub fn audit_check() -> Int {
                 escalation_types.push("new_pkg")
             }
         } else {
-            let new_caps = find_new_caps(current_caps, base_caps.get(base_idx))
+            let new_caps = find_new_caps(current_caps, base_caps.unsafe_get(base_idx))
             if new_caps != "" {
                 escalation_names.push(name)
                 escalation_new_caps.push(new_caps)
@@ -161,9 +161,9 @@ pub fn audit_report() {
     io.println("audit: {escalation_names.len()} capability escalation(s) found")
     let mut i = 0
     while i < escalation_names.len() {
-        let name = escalation_names.get(i)
-        let caps = escalation_new_caps.get(i)
-        let etype = escalation_types.get(i)
+        let name = escalation_names.unsafe_get(i)
+        let caps = escalation_new_caps.unsafe_get(i)
+        let etype = escalation_types.unsafe_get(i)
         if etype == "new_pkg" {
             io.println("  WARNING: new dependency '{name}' requires capabilities: {caps}")
         } else {

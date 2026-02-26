@@ -2,7 +2,7 @@ fn sum_list(nums: List[Float]) -> Float {
     let mut total = 0.0
     let mut i = 0
     while i < nums.len() {
-        total = total + nums.get(i)
+        total = total + nums.unsafe_get(i)
         i = i + 1
     }
     total
@@ -13,7 +13,7 @@ fn main() {
 
     // Float list literal boxing
     let vals = [1.5, 2.5, 3.0]
-    let first = vals.get(0)
+    let first = vals.unsafe_get(0)
     if first != 1.5 {
         io.println("FAIL: literal .get(0) expected 1.5, got {first}")
         pass = false

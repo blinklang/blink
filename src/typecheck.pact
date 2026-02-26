@@ -141,7 +141,7 @@ pub fn make_fn_type(ret_type: Int, param_types: List[Int]) -> Int {
     let start = ty_param_list.len()
     let mut i = 0
     while i < param_types.len() {
-        ty_param_list.push(param_types.get(i))
+        ty_param_list.push(param_types.unsafe_get(i))
         i = i + 1
     }
     ty_params_start.set(t, start)
@@ -158,7 +158,7 @@ pub fn make_tuple_type(elem_types: List[Int]) -> Int {
     let start = ty_param_list.len()
     let mut i = 0
     while i < elem_types.len() {
-        ty_param_list.push(elem_types.get(i))
+        ty_param_list.push(elem_types.unsafe_get(i))
         i = i + 1
     }
     ty_params_start.set(t, start)
@@ -195,8 +195,8 @@ pub fn resolve_type_name(name: Str) -> Int ! TypeCheck.Resolve {
 pub fn get_struct_field_tid(struct_tid: Int, fname: Str) -> Int {
     let mut i = 0
     while i < sfield_struct_id.len() {
-        if sfield_struct_id.get(i) == struct_tid && sfield_name.get(i) == fname {
-            return sfield_type_id.get(i)
+        if sfield_struct_id.unsafe_get(i) == struct_tid && sfield_name.unsafe_get(i) == fname {
+            return sfield_type_id.unsafe_get(i)
         }
         i = i + 1
     }
@@ -206,7 +206,7 @@ pub fn get_struct_field_tid(struct_tid: Int, fname: Str) -> Int {
 pub fn get_variant_by_name(enum_tid: Int, vname: Str) -> Int {
     let mut i = 0
     while i < evar_enum_id.len() {
-        if evar_enum_id.get(i) == enum_tid && evar_name.get(i) == vname {
+        if evar_enum_id.unsafe_get(i) == enum_tid && evar_name.unsafe_get(i) == vname {
             return i
         }
         i = i + 1
@@ -222,23 +222,23 @@ pub fn lookup_fnsig(name: Str) -> Int {
 }
 
 pub fn instantiate_return_type(sig: Int, args_sl: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
-    let ret = fnsig_ret.get(sig)
+    let ret = fnsig_ret.unsafe_get(sig)
     if ret < 0 || ret >= ty_kind.len() { return ret }
-    if ty_kind.get(ret) != TK_TYPEVAR { return ret }
+    if ty_kind.unsafe_get(ret) != TK_TYPEVAR { return ret }
 
-    let tp_name = ty_name.get(ret)
-    let tp_start = fnsig_type_params_start.get(sig)
-    let tp_count = fnsig_type_params_count.get(sig)
-    let param_start = fnsig_params_start.get(sig)
-    let param_count = fnsig_params_count.get(sig)
+    let tp_name = ty_name.unsafe_get(ret)
+    let tp_start = fnsig_type_params_start.unsafe_get(sig)
+    let tp_count = fnsig_type_params_count.unsafe_get(sig)
+    let param_start = fnsig_params_start.unsafe_get(sig)
+    let param_count = fnsig_params_count.unsafe_get(sig)
 
     let mut ti = 0
     while ti < tp_count {
-        if fnsig_type_param_names.get(tp_start + ti) == tp_name {
+        if fnsig_type_param_names.unsafe_get(tp_start + ti) == tp_name {
             let mut pi = 0
             while pi < param_count {
-                let ptid = fnsig_param_list.get(param_start + pi)
-                if ptid >= 0 && ptid < ty_kind.len() && ty_kind.get(ptid) == TK_TYPEVAR && ty_name.get(ptid) == tp_name {
+                let ptid = fnsig_param_list.unsafe_get(param_start + pi)
+                if ptid >= 0 && ptid < ty_kind.len() && ty_kind.unsafe_get(ptid) == TK_TYPEVAR && ty_name.unsafe_get(ptid) == tp_name {
                     if args_sl != -1 && pi < sublist_length(args_sl) {
                         return infer_type(sublist_get(args_sl, pi))
                     }
@@ -268,7 +268,7 @@ pub fn tc_set_incremental_filter(names: List[Str]) {
     tc_inc_filter = Map()
     let mut i = 0
     while i < names.len() {
-        tc_inc_filter.set(names.get(i), 1)
+        tc_inc_filter.set(names.unsafe_get(i), 1)
         i = i + 1
     }
     tc_inc_enabled = 1
@@ -292,8 +292,8 @@ pub fn resolve_type_ann(ann_node: Int) -> Int ! TypeCheck.Resolve {
     if ann_node == -1 {
         return TYPE_UNKNOWN
     }
-    let name = np_name.get(ann_node)
-    let elems_sl = np_elements.get(ann_node)
+    let name = np_name.unsafe_get(ann_node)
+    let elems_sl = np_elements.unsafe_get(ann_node)
 
     if name == "List" {
         if elems_sl != -1 && sublist_length(elems_sl) >= 1 {
@@ -340,19 +340,19 @@ pub fn resolve_type_ann(ann_node: Int) -> Int ! TypeCheck.Resolve {
 // ── Registration from AST ───────────────────────────────────────────
 
 pub fn register_struct_type(td: Int) ! TypeCheck.Register, TypeCheck.Resolve {
-    let name = np_name.get(td)
+    let name = np_name.unsafe_get(td)
     let tid = new_type(TK_STRUCT, name)
     named_type_names.push(name)
     named_type_ids.push(tid)
     named_type_map.set(name, tid)
 
-    let flds_sl = np_fields.get(td)
+    let flds_sl = np_fields.unsafe_get(td)
     if flds_sl != -1 {
         let mut i = 0
         while i < sublist_length(flds_sl) {
             let f = sublist_get(flds_sl, i)
-            let fname = np_name.get(f)
-            let ftype_ann = np_value.get(f)
+            let fname = np_name.unsafe_get(f)
+            let ftype_ann = np_value.unsafe_get(f)
             let ftype_id = resolve_type_ann(ftype_ann)
             sfield_struct_id.push(tid)
             sfield_name.push(fname)
@@ -363,32 +363,32 @@ pub fn register_struct_type(td: Int) ! TypeCheck.Register, TypeCheck.Resolve {
 }
 
 pub fn register_enum_type(td: Int) ! TypeCheck.Register, TypeCheck.Resolve {
-    let name = np_name.get(td)
+    let name = np_name.unsafe_get(td)
     let tid = new_type(TK_ENUM, name)
     named_type_names.push(name)
     named_type_ids.push(tid)
     named_type_map.set(name, tid)
 
-    let flds_sl = np_fields.get(td)
+    let flds_sl = np_fields.unsafe_get(td)
     if flds_sl != -1 {
         let mut tag = 0
         let mut i = 0
         while i < sublist_length(flds_sl) {
             let v = sublist_get(flds_sl, i)
-            let vname = np_name.get(v)
+            let vname = np_name.unsafe_get(v)
             let var_idx = evar_enum_id.len()
             evar_enum_id.push(tid)
             evar_name.push(vname)
             evar_tag.push(tag)
 
-            let vflds_sl = np_fields.get(v)
+            let vflds_sl = np_fields.unsafe_get(v)
             if vflds_sl != -1 && sublist_length(vflds_sl) > 0 {
                 evar_has_data.push(1)
                 let mut fi = 0
                 while fi < sublist_length(vflds_sl) {
                     let vf = sublist_get(vflds_sl, fi)
-                    let vf_name = np_name.get(vf)
-                    let vf_type_ann = np_value.get(vf)
+                    let vf_name = np_name.unsafe_get(vf)
+                    let vf_type_ann = np_value.unsafe_get(vf)
                     let vf_type_id = resolve_type_ann(vf_type_ann)
                     evfield_var_idx.push(var_idx)
                     evfield_name.push(vf_name)
@@ -406,9 +406,9 @@ pub fn register_enum_type(td: Int) ! TypeCheck.Register, TypeCheck.Resolve {
 }
 
 pub fn register_fn_sig(fn_node: Int) ! TypeCheck.Register, TypeCheck.Resolve {
-    let name = np_name.get(fn_node)
-    let ret_str = np_return_type.get(fn_node)
-    let ret_ann = np_type_ann.get(fn_node)
+    let name = np_name.unsafe_get(fn_node)
+    let ret_str = np_return_type.unsafe_get(fn_node)
+    let ret_ann = np_type_ann.unsafe_get(fn_node)
     let mut ret_tid = TYPE_VOID
 
     if ret_ann != -1 {
@@ -427,14 +427,14 @@ pub fn register_fn_sig(fn_node: Int) ! TypeCheck.Register, TypeCheck.Resolve {
     let start = fnsig_param_list.len()
     fnsig_params_start.push(start)
 
-    let params_sl = np_params.get(fn_node)
+    let params_sl = np_params.unsafe_get(fn_node)
     let mut count = 0
     if params_sl != -1 {
         let mut i = 0
         while i < sublist_length(params_sl) {
             let p = sublist_get(params_sl, i)
-            let ptype_str = np_type_name.get(p)
-            let ptype_ann = np_type_ann.get(p)
+            let ptype_str = np_type_name.unsafe_get(p)
+            let ptype_ann = np_type_ann.unsafe_get(p)
             let mut ptid = TYPE_UNKNOWN
             if ptype_ann != -1 {
                 ptid = resolve_type_ann(ptype_ann)
@@ -451,14 +451,14 @@ pub fn register_fn_sig(fn_node: Int) ! TypeCheck.Register, TypeCheck.Resolve {
     }
     fnsig_params_count.push(count)
 
-    let tparams_sl = np_type_params.get(fn_node)
+    let tparams_sl = np_type_params.unsafe_get(fn_node)
     let tp_start = fnsig_type_param_names.len()
     let mut tp_count = 0
     if tparams_sl != -1 {
         let mut ti = 0
         while ti < sublist_length(tparams_sl) {
             let tp = sublist_get(tparams_sl, ti)
-            fnsig_type_param_names.push(np_name.get(tp))
+            fnsig_type_param_names.push(np_name.unsafe_get(tp))
             tp_count = tp_count + 1
             ti = ti + 1
         }
@@ -466,7 +466,7 @@ pub fn register_fn_sig(fn_node: Int) ! TypeCheck.Register, TypeCheck.Resolve {
     fnsig_type_params_start.push(tp_start)
     fnsig_type_params_count.push(tp_count)
 
-    let effects_sl = np_effects.get(fn_node)
+    let effects_sl = np_effects.unsafe_get(fn_node)
     let mut effs = ""
     if effects_sl != -1 {
         let mut ei = 0
@@ -475,7 +475,7 @@ pub fn register_fn_sig(fn_node: Int) ! TypeCheck.Register, TypeCheck.Resolve {
             if ei > 0 {
                 effs = effs.concat(",")
             }
-            effs = effs.concat(np_name.get(eff))
+            effs = effs.concat(np_name.unsafe_get(eff))
             ei = ei + 1
         }
     }
@@ -486,18 +486,18 @@ pub fn tc_get_fn_effects(name: Str) -> Str {
     let sig = lookup_fnsig(name)
     if sig == -1 { return "" }
     if sig >= tc_fn_effects.len() { return "" }
-    tc_fn_effects.get(sig)
+    tc_fn_effects.unsafe_get(sig)
 }
 
 pub fn register_trait(tr_node: Int) ! TypeCheck.Register {
-    let name = np_name.get(tr_node)
+    let name = np_name.unsafe_get(tr_node)
     tc_trait_names.push(name)
-    let methods_sl = np_methods.get(tr_node)
+    let methods_sl = np_methods.unsafe_get(tr_node)
     if methods_sl != -1 {
         let mut i = 0
         while i < sublist_length(methods_sl) {
             let m = sublist_get(methods_sl, i)
-            tc_trait_method_names.push("{name}.{np_name.get(m)}")
+            tc_trait_method_names.push("{name}.{np_name.unsafe_get(m)}")
             i = i + 1
         }
     }
@@ -555,15 +555,15 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
     init_types()
 
     // Register all type definitions (structs and enums)
-    let types_sl = np_fields.get(program)
+    let types_sl = np_fields.unsafe_get(program)
     if types_sl != -1 {
         let mut i = 0
         while i < sublist_length(types_sl) {
             let td = sublist_get(types_sl, i)
-            let td_flds = np_fields.get(td)
+            let td_flds = np_fields.unsafe_get(td)
             let mut is_enum = 0
             if td_flds != -1 && sublist_length(td_flds) > 0 {
-                if np_kind.get(sublist_get(td_flds, 0)) == NodeKind.TypeVariant {
+                if np_kind.unsafe_get(sublist_get(td_flds, 0)) == NodeKind.TypeVariant {
                     is_enum = 1
                 }
             }
@@ -577,7 +577,7 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
     }
 
     // Register all function signatures
-    let fns_sl = np_params.get(program)
+    let fns_sl = np_params.unsafe_get(program)
     if fns_sl != -1 {
         let mut i = 0
         while i < sublist_length(fns_sl) {
@@ -587,7 +587,7 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
     }
 
     // Register traits
-    let traits_sl = np_arms.get(program)
+    let traits_sl = np_arms.unsafe_get(program)
     if traits_sl != -1 {
         let mut i = 0
         while i < sublist_length(traits_sl) {
@@ -597,18 +597,18 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
     }
 
     // Register impl method signatures
-    let impls_sl = np_methods.get(program)
+    let impls_sl = np_methods.unsafe_get(program)
     if impls_sl != -1 {
         let mut i = 0
         while i < sublist_length(impls_sl) {
             let im = sublist_get(impls_sl, i)
-            let impl_type = np_name.get(im)
-            let methods_sl = np_methods.get(im)
+            let impl_type = np_name.unsafe_get(im)
+            let methods_sl = np_methods.unsafe_get(im)
             if methods_sl != -1 {
                 let mut j = 0
                 while j < sublist_length(methods_sl) {
                     let m = sublist_get(methods_sl, j)
-                    let orig_name = np_name.get(m)
+                    let orig_name = np_name.unsafe_get(m)
                     np_name.set(m, "{impl_type}_{orig_name}")
                     register_fn_sig(m)
                     np_name.set(m, orig_name)
@@ -621,12 +621,12 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
 
     // Register user-defined effect handle names
     tc_ue_handles = []
-    let effects_decl_sl = np_args.get(program)
+    let effects_decl_sl = np_args.unsafe_get(program)
     if effects_decl_sl != -1 {
         let mut ei = 0
         while ei < sublist_length(effects_decl_sl) {
             let ed = sublist_get(effects_decl_sl, ei)
-            let eff_name = np_name.get(ed)
+            let eff_name = np_name.unsafe_get(ed)
             let mut handle = ""
             let mut hi = 0
             while hi < eff_name.len() {
@@ -685,7 +685,7 @@ pub fn register_ue_handle(name: Str) {
 pub fn is_user_effect_handle_name(name: Str) -> Int {
     let mut i = 0
     while i < tc_ue_handles.len() {
-        if tc_ue_handles.get(i) == name {
+        if tc_ue_handles.unsafe_get(i) == name {
             return 1
         }
         i = i + 1
@@ -717,7 +717,7 @@ pub fn nr_push_scope() {
 }
 
 pub fn nr_pop_scope() {
-    let start = nr_scope_frames.get(nr_scope_frames.len() - 1)
+    let start = nr_scope_frames.unsafe_get(nr_scope_frames.len() - 1)
     nr_scope_frames.pop()
     while nr_scope_names.len() > start {
         nr_scope_names.pop()
@@ -747,7 +747,7 @@ pub fn nr_define_typed(name: Str, is_mut: Int, tid: Int) {
 pub fn nr_is_defined(name: Str) -> Int {
     let mut i = nr_scope_names.len() - 1
     while i >= 0 {
-        if nr_scope_names.get(i) == name {
+        if nr_scope_names.unsafe_get(i) == name {
             return 1
         }
         i = i - 1
@@ -758,8 +758,8 @@ pub fn nr_is_defined(name: Str) -> Int {
 pub fn nr_is_mut(name: Str) -> Int {
     let mut i = nr_scope_names.len() - 1
     while i >= 0 {
-        if nr_scope_names.get(i) == name {
-            return nr_scope_muts.get(i)
+        if nr_scope_names.unsafe_get(i) == name {
+            return nr_scope_muts.unsafe_get(i)
         }
         i = i - 1
     }
@@ -769,8 +769,8 @@ pub fn nr_is_mut(name: Str) -> Int {
 pub fn nr_get_type(name: Str) -> Int {
     let mut i = nr_scope_names.len() - 1
     while i >= 0 {
-        if nr_scope_names.get(i) == name {
-            return nr_scope_types.get(i)
+        if nr_scope_names.unsafe_get(i) == name {
+            return nr_scope_types.unsafe_get(i)
         }
         i = i - 1
     }
@@ -838,6 +838,7 @@ pub fn is_builtin_method(name: Str) -> Int {
     if name == "push" { return 1 }
     if name == "pop" { return 1 }
     if name == "get" { return 1 }
+    if name == "unsafe_get" { return 1 }
     if name == "set" { return 1 }
     if name == "join" { return 1 }
     // Iterator methods
@@ -973,7 +974,7 @@ pub fn get_builtin_fn_ret(name: Str) -> Int {
 pub fn is_variant_name(name: Str) -> Int {
     let mut i = 0
     while i < evar_name.len() {
-        if evar_name.get(i) == name {
+        if evar_name.unsafe_get(i) == name {
             return 1
         }
         i = i + 1
@@ -984,8 +985,8 @@ pub fn is_variant_name(name: Str) -> Int {
 pub fn get_variant_enum_tid(name: Str) -> Int {
     let mut i = 0
     while i < evar_name.len() {
-        if evar_name.get(i) == name {
-            return evar_enum_id.get(i)
+        if evar_name.unsafe_get(i) == name {
+            return evar_enum_id.unsafe_get(i)
         }
         i = i + 1
     }
@@ -1008,7 +1009,7 @@ pub let mut nr_impl_method_names: List[Str] = []
 pub fn nr_has_impl_method(type_name: Str, method: Str) -> Int {
     let mut i = 0
     while i < nr_impl_type_names.len() {
-        if nr_impl_type_names.get(i) == type_name && nr_impl_method_names.get(i) == method {
+        if nr_impl_type_names.unsafe_get(i) == type_name && nr_impl_method_names.unsafe_get(i) == method {
             return 1
         }
         i = i + 1
@@ -1033,35 +1034,35 @@ pub fn resolve_names(program: Int) ! TypeCheck.Resolve, Diag.Report {
     let mut nr_pub_names: Map[Str, Int] = Map()
 
     // First pass: collect all pub imported names
-    let fns_sl_priv = np_params.get(program)
+    let fns_sl_priv = np_params.unsafe_get(program)
     if fns_sl_priv != -1 {
         let mut i = 0
         while i < sublist_length(fns_sl_priv) {
             let fn_node = sublist_get(fns_sl_priv, i)
-            if np_module.get(fn_node) != "" && np_is_pub.get(fn_node) != 0 {
-                nr_pub_names.set(np_name.get(fn_node), 1)
+            if np_module.unsafe_get(fn_node) != "" && np_is_pub.unsafe_get(fn_node) != 0 {
+                nr_pub_names.set(np_name.unsafe_get(fn_node), 1)
             }
             i = i + 1
         }
     }
-    let types_sl_priv = np_fields.get(program)
+    let types_sl_priv = np_fields.unsafe_get(program)
     if types_sl_priv != -1 {
         let mut i = 0
         while i < sublist_length(types_sl_priv) {
             let td = sublist_get(types_sl_priv, i)
-            if np_module.get(td) != "" && np_is_pub.get(td) != 0 {
-                nr_pub_names.set(np_name.get(td), 1)
+            if np_module.unsafe_get(td) != "" && np_is_pub.unsafe_get(td) != 0 {
+                nr_pub_names.set(np_name.unsafe_get(td), 1)
             }
             i = i + 1
         }
     }
-    let lets_sl_priv = np_stmts.get(program)
+    let lets_sl_priv = np_stmts.unsafe_get(program)
     if lets_sl_priv != -1 {
         let mut i = 0
         while i < sublist_length(lets_sl_priv) {
             let l = sublist_get(lets_sl_priv, i)
-            if np_module.get(l) != "" && np_is_pub.get(l) != 0 {
-                nr_pub_names.set(np_name.get(l), 1)
+            if np_module.unsafe_get(l) != "" && np_is_pub.unsafe_get(l) != 0 {
+                nr_pub_names.set(np_name.unsafe_get(l), 1)
             }
             i = i + 1
         }
@@ -1073,9 +1074,9 @@ pub fn resolve_names(program: Int) ! TypeCheck.Resolve, Diag.Report {
         let mut i = 0
         while i < sublist_length(fns_sl_priv) {
             let fn_node = sublist_get(fns_sl_priv, i)
-            let fn_name = np_name.get(fn_node)
-            let mod_name = np_module.get(fn_node)
-            if mod_name != "" && np_is_pub.get(fn_node) == 0 && nr_pub_names.has(fn_name) == 0 {
+            let fn_name = np_name.unsafe_get(fn_node)
+            let mod_name = np_module.unsafe_get(fn_node)
+            if mod_name != "" && np_is_pub.unsafe_get(fn_node) == 0 && nr_pub_names.has(fn_name) == 0 {
                 if nr_private_imports.has(fn_name) != 0 {
                     let prev = nr_private_imports.get(fn_name)
                     nr_private_imports.set(fn_name, "{prev}{mod_name}|")
@@ -1090,9 +1091,9 @@ pub fn resolve_names(program: Int) ! TypeCheck.Resolve, Diag.Report {
         let mut i = 0
         while i < sublist_length(types_sl_priv) {
             let td = sublist_get(types_sl_priv, i)
-            let td_name = np_name.get(td)
-            let mod_name = np_module.get(td)
-            if mod_name != "" && np_is_pub.get(td) == 0 && nr_pub_names.has(td_name) == 0 {
+            let td_name = np_name.unsafe_get(td)
+            let mod_name = np_module.unsafe_get(td)
+            if mod_name != "" && np_is_pub.unsafe_get(td) == 0 && nr_pub_names.has(td_name) == 0 {
                 if nr_private_imports.has(td_name) != 0 {
                     let prev = nr_private_imports.get(td_name)
                     nr_private_imports.set(td_name, "{prev}{mod_name}|")
@@ -1107,9 +1108,9 @@ pub fn resolve_names(program: Int) ! TypeCheck.Resolve, Diag.Report {
         let mut i = 0
         while i < sublist_length(lets_sl_priv) {
             let l = sublist_get(lets_sl_priv, i)
-            let l_name = np_name.get(l)
-            let mod_name = np_module.get(l)
-            if mod_name != "" && np_is_pub.get(l) == 0 && nr_pub_names.has(l_name) == 0 {
+            let l_name = np_name.unsafe_get(l)
+            let mod_name = np_module.unsafe_get(l)
+            if mod_name != "" && np_is_pub.unsafe_get(l) == 0 && nr_pub_names.has(l_name) == 0 {
                 if nr_private_imports.has(l_name) != 0 {
                     let prev = nr_private_imports.get(l_name)
                     nr_private_imports.set(l_name, "{prev}{mod_name}|")
@@ -1122,40 +1123,40 @@ pub fn resolve_names(program: Int) ! TypeCheck.Resolve, Diag.Report {
     }
 
     // Register all top-level let binding names
-    let lets_sl = np_stmts.get(program)
+    let lets_sl = np_stmts.unsafe_get(program)
     if lets_sl != -1 {
         let mut i = 0
         while i < sublist_length(lets_sl) {
             let l = sublist_get(lets_sl, i)
-            nr_define(np_name.get(l))
+            nr_define(np_name.unsafe_get(l))
             i = i + 1
         }
     }
 
     // Register all function names in scope
-    let fns_sl = np_params.get(program)
+    let fns_sl = np_params.unsafe_get(program)
     if fns_sl != -1 {
         let mut i = 0
         while i < sublist_length(fns_sl) {
-            nr_define(np_name.get(sublist_get(fns_sl, i)))
+            nr_define(np_name.unsafe_get(sublist_get(fns_sl, i)))
             i = i + 1
         }
     }
 
     // Register impl methods for method call resolution
-    let impls_sl = np_methods.get(program)
+    let impls_sl = np_methods.unsafe_get(program)
     if impls_sl != -1 {
         let mut i = 0
         while i < sublist_length(impls_sl) {
             let im = sublist_get(impls_sl, i)
-            let impl_type = np_name.get(im)
-            let methods_sl = np_methods.get(im)
+            let impl_type = np_name.unsafe_get(im)
+            let methods_sl = np_methods.unsafe_get(im)
             if methods_sl != -1 {
                 let mut j = 0
                 while j < sublist_length(methods_sl) {
                     let m = sublist_get(methods_sl, j)
                     nr_impl_type_names.push(impl_type)
-                    nr_impl_method_names.push(np_name.get(m))
+                    nr_impl_method_names.push(np_name.unsafe_get(m))
                     j = j + 1
                 }
             }
@@ -1168,7 +1169,7 @@ pub fn resolve_names(program: Int) ! TypeCheck.Resolve, Diag.Report {
         let mut i = 0
         while i < sublist_length(fns_sl) {
             let fn_node = sublist_get(fns_sl, i)
-            nr_current_module = np_module.get(fn_node)
+            nr_current_module = np_module.unsafe_get(fn_node)
             nr_check_fn(fn_node)
             i = i + 1
         }
@@ -1179,8 +1180,8 @@ pub fn resolve_names(program: Int) ! TypeCheck.Resolve, Diag.Report {
         let mut i = 0
         while i < sublist_length(impls_sl) {
             let im = sublist_get(impls_sl, i)
-            nr_current_module = np_module.get(im)
-            let methods_sl = np_methods.get(im)
+            nr_current_module = np_module.unsafe_get(im)
+            let methods_sl = np_methods.unsafe_get(im)
             if methods_sl != -1 {
                 let mut j = 0
                 while j < sublist_length(methods_sl) {
@@ -1197,21 +1198,21 @@ pub fn resolve_names(program: Int) ! TypeCheck.Resolve, Diag.Report {
 
 pub fn nr_check_fn(fn_node: Int) ! TypeCheck.Resolve, Diag.Report {
     nr_push_scope()
-    let params_sl = np_params.get(fn_node)
+    let params_sl = np_params.unsafe_get(fn_node)
     if params_sl != -1 {
         let mut i = 0
         while i < sublist_length(params_sl) {
             let p = sublist_get(params_sl, i)
-            nr_define(np_name.get(p))
-            nr_check_type_ref(np_type_name.get(p))
+            nr_define(np_name.unsafe_get(p))
+            nr_check_type_ref(np_type_name.unsafe_get(p))
             i = i + 1
         }
     }
-    let ret_str = np_return_type.get(fn_node)
+    let ret_str = np_return_type.unsafe_get(fn_node)
     if ret_str != "" {
         nr_check_type_ref(ret_str)
     }
-    let body = np_body.get(fn_node)
+    let body = np_body.unsafe_get(fn_node)
     if body != -1 {
         nr_check_node(body)
     }
@@ -1228,11 +1229,11 @@ pub fn nr_check_type_ref(name: Str) ! TypeCheck.Resolve, Diag.Report {
 
 pub fn nr_check_node(node: Int) ! TypeCheck.Resolve, Diag.Report {
     if node == -1 { return }
-    let kind = np_kind.get(node)
+    let kind = np_kind.unsafe_get(node)
 
     if kind == NodeKind.Block {
         nr_push_scope()
-        let stmts_sl = np_stmts.get(node)
+        let stmts_sl = np_stmts.unsafe_get(node)
         if stmts_sl != -1 {
             let mut i = 0
             while i < sublist_length(stmts_sl) {
@@ -1245,32 +1246,32 @@ pub fn nr_check_node(node: Int) ! TypeCheck.Resolve, Diag.Report {
     }
 
     if kind == NodeKind.LetBinding {
-        let val = np_value.get(node)
+        let val = np_value.unsafe_get(node)
         if val != -1 {
             nr_check_node(val)
         }
-        nr_define_mut(np_name.get(node), np_is_mut.get(node))
+        nr_define_mut(np_name.unsafe_get(node), np_is_mut.unsafe_get(node))
         return
     }
 
     if kind == NodeKind.Assignment || kind == NodeKind.CompoundAssign {
-        nr_check_node(np_target.get(node))
-        nr_check_node(np_value.get(node))
+        nr_check_node(np_target.unsafe_get(node))
+        nr_check_node(np_value.unsafe_get(node))
         return
     }
 
     if kind == NodeKind.ExprStmt {
-        nr_check_node(np_value.get(node))
+        nr_check_node(np_value.unsafe_get(node))
         return
     }
 
     if kind == NodeKind.Return {
-        nr_check_node(np_value.get(node))
+        nr_check_node(np_value.unsafe_get(node))
         return
     }
 
     if kind == NodeKind.Ident {
-        let name = np_name.get(node)
+        let name = np_name.unsafe_get(node)
         if name == "true" || name == "false" || name == "None" { return }
         if name == "io" || name == "fs" || name == "net" || name == "db" || name == "env" || name == "time" || name == "async" || name == "channel" || name == "default" { return }
         if is_user_effect_handle_name(name) != 0 { return }
@@ -1293,13 +1294,13 @@ pub fn nr_check_node(node: Int) ! TypeCheck.Resolve, Diag.Report {
     }
 
     if kind == NodeKind.InterpString {
-        let elems_sl = np_elements.get(node)
+        let elems_sl = np_elements.unsafe_get(node)
         if elems_sl != -1 {
             let mut i = 0
             while i < sublist_length(elems_sl) {
                 let part = sublist_get(elems_sl, i)
-                let pk = np_kind.get(part)
-                if pk == NodeKind.Ident && np_str_val.get(part) == np_name.get(part) {
+                let pk = np_kind.unsafe_get(part)
+                if pk == NodeKind.Ident && np_str_val.unsafe_get(part) == np_name.unsafe_get(part) {
                     let _skip = 0
                 } else {
                     nr_check_node(part)
@@ -1311,11 +1312,11 @@ pub fn nr_check_node(node: Int) ! TypeCheck.Resolve, Diag.Report {
     }
 
     if kind == NodeKind.Call {
-        let callee = np_left.get(node)
+        let callee = np_left.unsafe_get(node)
         if callee != -1 {
-            let callee_kind = np_kind.get(callee)
+            let callee_kind = np_kind.unsafe_get(callee)
             if callee_kind == NodeKind.Ident {
-                let fn_name = np_name.get(callee)
+                let fn_name = np_name.unsafe_get(callee)
                 if is_private_access(fn_name) != 0 {
                     tc_errors.push("cannot access private function '{fn_name}'")
                     diag_error_at("PrivateItemAccess", "E1003", "cannot access private function '{fn_name}' from another module", node, "mark the function as 'pub' in its module")
@@ -1327,7 +1328,7 @@ pub fn nr_check_node(node: Int) ! TypeCheck.Resolve, Diag.Report {
                 nr_check_node(callee)
             }
         }
-        let args_sl = np_args.get(node)
+        let args_sl = np_args.unsafe_get(node)
         if args_sl != -1 {
             let mut i = 0
             while i < sublist_length(args_sl) {
@@ -1339,16 +1340,16 @@ pub fn nr_check_node(node: Int) ! TypeCheck.Resolve, Diag.Report {
     }
 
     if kind == NodeKind.MethodCall {
-        let obj = np_obj.get(node)
+        let obj = np_obj.unsafe_get(node)
         if obj != -1 {
             nr_check_node(obj)
         }
-        let method_name = np_method.get(node)
+        let method_name = np_method.unsafe_get(node)
         if is_builtin_method(method_name) == 0 && is_variant_name(method_name) == 0 {
             let mut found_in_impl = 0
             let mut mi = 0
             while mi < nr_impl_method_names.len() {
-                if nr_impl_method_names.get(mi) == method_name {
+                if nr_impl_method_names.unsafe_get(mi) == method_name {
                     found_in_impl = 1
                 }
                 mi = mi + 1
@@ -1357,7 +1358,7 @@ pub fn nr_check_node(node: Int) ! TypeCheck.Resolve, Diag.Report {
                 diag_warn_at("UnknownMethod", "W0501", "unknown method '{method_name}' — may fail at compile time", node, "")
             }
         }
-        let args_sl = np_args.get(node)
+        let args_sl = np_args.unsafe_get(node)
         if args_sl != -1 {
             let mut i = 0
             while i < sublist_length(args_sl) {
@@ -1369,7 +1370,7 @@ pub fn nr_check_node(node: Int) ! TypeCheck.Resolve, Diag.Report {
     }
 
     if kind == NodeKind.FieldAccess {
-        let obj = np_obj.get(node)
+        let obj = np_obj.unsafe_get(node)
         if obj != -1 {
             nr_check_node(obj)
         }
@@ -1377,45 +1378,45 @@ pub fn nr_check_node(node: Int) ! TypeCheck.Resolve, Diag.Report {
     }
 
     if kind == NodeKind.IndexExpr {
-        nr_check_node(np_obj.get(node))
-        nr_check_node(np_index.get(node))
+        nr_check_node(np_obj.unsafe_get(node))
+        nr_check_node(np_index.unsafe_get(node))
         return
     }
 
     if kind == NodeKind.BinOp {
-        nr_check_node(np_left.get(node))
-        nr_check_node(np_right.get(node))
+        nr_check_node(np_left.unsafe_get(node))
+        nr_check_node(np_right.unsafe_get(node))
         return
     }
 
     if kind == NodeKind.UnaryOp {
-        nr_check_node(np_right.get(node))
+        nr_check_node(np_right.unsafe_get(node))
         return
     }
 
     if kind == NodeKind.IfExpr {
-        nr_check_node(np_condition.get(node))
-        nr_check_node(np_then_body.get(node))
-        nr_check_node(np_else_body.get(node))
+        nr_check_node(np_condition.unsafe_get(node))
+        nr_check_node(np_then_body.unsafe_get(node))
+        nr_check_node(np_else_body.unsafe_get(node))
         return
     }
 
     if kind == NodeKind.WhileLoop {
-        nr_check_node(np_condition.get(node))
-        nr_check_node(np_body.get(node))
+        nr_check_node(np_condition.unsafe_get(node))
+        nr_check_node(np_body.unsafe_get(node))
         return
     }
 
     if kind == NodeKind.LoopExpr {
-        nr_check_node(np_body.get(node))
+        nr_check_node(np_body.unsafe_get(node))
         return
     }
 
     if kind == NodeKind.ForIn {
-        nr_check_node(np_iterable.get(node))
+        nr_check_node(np_iterable.unsafe_get(node))
         nr_push_scope()
-        nr_define(np_var_name.get(node))
-        nr_check_node(np_body.get(node))
+        nr_define(np_var_name.unsafe_get(node))
+        nr_check_node(np_body.unsafe_get(node))
         nr_pop_scope()
         return
     }
@@ -1425,19 +1426,19 @@ pub fn nr_check_node(node: Int) ! TypeCheck.Resolve, Diag.Report {
     }
 
     if kind == NodeKind.MatchExpr {
-        nr_check_node(np_scrutinee.get(node))
-        let arms_sl = np_arms.get(node)
+        nr_check_node(np_scrutinee.unsafe_get(node))
+        let arms_sl = np_arms.unsafe_get(node)
         if arms_sl != -1 {
             let mut i = 0
             while i < sublist_length(arms_sl) {
                 let arm = sublist_get(arms_sl, i)
                 nr_push_scope()
-                nr_check_pattern(np_pattern.get(arm))
-                let guard = np_guard.get(arm)
+                nr_check_pattern(np_pattern.unsafe_get(arm))
+                let guard = np_guard.unsafe_get(arm)
                 if guard != -1 {
                     nr_check_node(guard)
                 }
-                nr_check_node(np_body.get(arm))
+                nr_check_node(np_body.unsafe_get(arm))
                 nr_pop_scope()
                 i = i + 1
             }
@@ -1447,30 +1448,30 @@ pub fn nr_check_node(node: Int) ! TypeCheck.Resolve, Diag.Report {
 
     if kind == NodeKind.Closure {
         nr_push_scope()
-        let params_sl = np_params.get(node)
+        let params_sl = np_params.unsafe_get(node)
         if params_sl != -1 {
             let mut i = 0
             while i < sublist_length(params_sl) {
-                nr_define(np_name.get(sublist_get(params_sl, i)))
+                nr_define(np_name.unsafe_get(sublist_get(params_sl, i)))
                 i = i + 1
             }
         }
-        nr_check_node(np_body.get(node))
+        nr_check_node(np_body.unsafe_get(node))
         nr_pop_scope()
         return
     }
 
     if kind == NodeKind.StructLit {
-        let type_name = np_type_name.get(node)
+        let type_name = np_type_name.unsafe_get(node)
         if type_name != "" {
             nr_check_type_ref(type_name)
         }
-        let flds_sl = np_fields.get(node)
+        let flds_sl = np_fields.unsafe_get(node)
         if flds_sl != -1 {
             let mut i = 0
             while i < sublist_length(flds_sl) {
                 let f = sublist_get(flds_sl, i)
-                nr_check_node(np_value.get(f))
+                nr_check_node(np_value.unsafe_get(f))
                 i = i + 1
             }
         }
@@ -1478,7 +1479,7 @@ pub fn nr_check_node(node: Int) ! TypeCheck.Resolve, Diag.Report {
     }
 
     if kind == NodeKind.ListLit {
-        let elems_sl = np_elements.get(node)
+        let elems_sl = np_elements.unsafe_get(node)
         if elems_sl != -1 {
             let mut i = 0
             while i < sublist_length(elems_sl) {
@@ -1490,7 +1491,7 @@ pub fn nr_check_node(node: Int) ! TypeCheck.Resolve, Diag.Report {
     }
 
     if kind == NodeKind.TupleLit {
-        let elems_sl = np_elements.get(node)
+        let elems_sl = np_elements.unsafe_get(node)
         if elems_sl != -1 {
             let mut i = 0
             while i < sublist_length(elems_sl) {
@@ -1502,13 +1503,13 @@ pub fn nr_check_node(node: Int) ! TypeCheck.Resolve, Diag.Report {
     }
 
     if kind == NodeKind.RangeLit {
-        nr_check_node(np_start.get(node))
-        nr_check_node(np_end.get(node))
+        nr_check_node(np_start.unsafe_get(node))
+        nr_check_node(np_end.unsafe_get(node))
         return
     }
 
     if kind == NodeKind.WithBlock {
-        let handlers_sl = np_handlers.get(node)
+        let handlers_sl = np_handlers.unsafe_get(node)
         if handlers_sl != -1 {
             let mut i = 0
             while i < sublist_length(handlers_sl) {
@@ -1516,21 +1517,21 @@ pub fn nr_check_node(node: Int) ! TypeCheck.Resolve, Diag.Report {
                 i = i + 1
             }
         }
-        nr_check_node(np_body.get(node))
+        nr_check_node(np_body.unsafe_get(node))
         return
     }
 
     if kind == NodeKind.WithResource {
         nr_push_scope()
-        nr_define(np_name.get(node))
-        nr_check_node(np_value.get(node))
-        nr_check_node(np_body.get(node))
+        nr_define(np_name.unsafe_get(node))
+        nr_check_node(np_value.unsafe_get(node))
+        nr_check_node(np_body.unsafe_get(node))
         nr_pop_scope()
         return
     }
 
     if kind == NodeKind.HandlerExpr {
-        let methods_sl = np_methods.get(node)
+        let methods_sl = np_methods.unsafe_get(node)
         if methods_sl != -1 {
             let mut i = 0
             while i < sublist_length(methods_sl) {
@@ -1542,21 +1543,25 @@ pub fn nr_check_node(node: Int) ! TypeCheck.Resolve, Diag.Report {
     }
 
     if kind == NodeKind.AsyncScope {
-        nr_check_node(np_body.get(node))
+        nr_check_node(np_body.unsafe_get(node))
         return
     }
 
     if kind == NodeKind.AsyncSpawn {
-        nr_check_node(np_body.get(node))
+        nr_check_node(np_body.unsafe_get(node))
         return
     }
 
     if kind == NodeKind.AwaitExpr {
-        nr_check_node(np_value.get(node))
+        nr_check_node(np_value.unsafe_get(node))
         return
     }
 
     if kind == NodeKind.ChannelNew {
+        return
+    }
+
+    if kind == NodeKind.EmbedExpr {
         return
     }
 
@@ -1565,10 +1570,10 @@ pub fn nr_check_node(node: Int) ! TypeCheck.Resolve, Diag.Report {
 
 pub fn nr_check_pattern(node: Int) ! TypeCheck.Resolve {
     if node == -1 { return }
-    let kind = np_kind.get(node)
+    let kind = np_kind.unsafe_get(node)
 
     if kind == NodeKind.IdentPattern {
-        let name = np_name.get(node)
+        let name = np_name.unsafe_get(node)
         if name != "_" {
             nr_define(name)
         }
@@ -1580,7 +1585,7 @@ pub fn nr_check_pattern(node: Int) ! TypeCheck.Resolve {
     }
 
     if kind == NodeKind.EnumPattern {
-        let flds_sl = np_fields.get(node)
+        let flds_sl = np_fields.unsafe_get(node)
         if flds_sl != -1 {
             let mut i = 0
             while i < sublist_length(flds_sl) {
@@ -1592,12 +1597,12 @@ pub fn nr_check_pattern(node: Int) ! TypeCheck.Resolve {
     }
 
     if kind == NodeKind.StructPattern {
-        let flds_sl = np_fields.get(node)
+        let flds_sl = np_fields.unsafe_get(node)
         if flds_sl != -1 {
             let mut i = 0
             while i < sublist_length(flds_sl) {
                 let f = sublist_get(flds_sl, i)
-                nr_define(np_name.get(f))
+                nr_define(np_name.unsafe_get(f))
                 i = i + 1
             }
         }
@@ -1605,7 +1610,7 @@ pub fn nr_check_pattern(node: Int) ! TypeCheck.Resolve {
     }
 
     if kind == NodeKind.TuplePattern {
-        let elems_sl = np_elements.get(node)
+        let elems_sl = np_elements.unsafe_get(node)
         if elems_sl != -1 {
             let mut i = 0
             while i < sublist_length(elems_sl) {
@@ -1617,8 +1622,8 @@ pub fn nr_check_pattern(node: Int) ! TypeCheck.Resolve {
     }
 
     if kind == NodeKind.OrPattern {
-        nr_check_pattern(np_left.get(node))
-        nr_check_pattern(np_right.get(node))
+        nr_check_pattern(np_left.unsafe_get(node))
+        nr_check_pattern(np_right.unsafe_get(node))
         return
     }
 
@@ -1627,8 +1632,8 @@ pub fn nr_check_pattern(node: Int) ! TypeCheck.Resolve {
     }
 
     if kind == NodeKind.AsPattern {
-        nr_check_pattern(np_pattern.get(node))
-        nr_define(np_name.get(node))
+        nr_check_pattern(np_pattern.unsafe_get(node))
+        nr_define(np_name.unsafe_get(node))
         return
     }
 
@@ -1642,22 +1647,22 @@ pub fn types_compatible(a: Int, b: Int) -> Int {
     if a == TYPE_UNKNOWN || b == TYPE_UNKNOWN { return 1 }
     if a < 0 || b < 0 { return 1 }
     if a >= ty_kind.len() || b >= ty_kind.len() { return 1 }
-    let ka = ty_kind.get(a)
-    let kb = ty_kind.get(b)
+    let ka = ty_kind.unsafe_get(a)
+    let kb = ty_kind.unsafe_get(b)
     if ka == TK_TYPEVAR || kb == TK_TYPEVAR { return 1 }
     // Int and Bool are interchangeable in Pact (C-style truthiness)
     if (ka == TK_INT || ka == TK_BOOL) && (kb == TK_INT || kb == TK_BOOL) { return 1 }
     if ka == kb {
         if ka == TK_LIST || ka == TK_OPTION || ka == TK_ITERATOR {
-            return types_compatible(ty_inner1.get(a), ty_inner1.get(b))
+            return types_compatible(ty_inner1.unsafe_get(a), ty_inner1.unsafe_get(b))
         }
         if ka == TK_MAP {
-            if types_compatible(ty_inner1.get(a), ty_inner1.get(b)) == 0 { return 0 }
-            return types_compatible(ty_inner2.get(a), ty_inner2.get(b))
+            if types_compatible(ty_inner1.unsafe_get(a), ty_inner1.unsafe_get(b)) == 0 { return 0 }
+            return types_compatible(ty_inner2.unsafe_get(a), ty_inner2.unsafe_get(b))
         }
         if ka == TK_RESULT {
-            if types_compatible(ty_inner1.get(a), ty_inner1.get(b)) == 0 { return 0 }
-            return types_compatible(ty_inner2.get(a), ty_inner2.get(b))
+            if types_compatible(ty_inner1.unsafe_get(a), ty_inner1.unsafe_get(b)) == 0 { return 0 }
+            return types_compatible(ty_inner2.unsafe_get(a), ty_inner2.unsafe_get(b))
         }
         if ka == TK_STRUCT || ka == TK_ENUM {
             return 0
@@ -1669,7 +1674,7 @@ pub fn types_compatible(a: Int, b: Int) -> Int {
 
 pub fn type_kind(tid: Int) -> Int {
     if tid < 0 || tid >= ty_kind.len() { return TK_UNKNOWN }
-    ty_kind.get(tid)
+    ty_kind.unsafe_get(tid)
 }
 
 // Pact treats Int as truthy — Int is valid in Bool contexts
@@ -1686,15 +1691,16 @@ pub fn is_bool_compat(tid: Int) -> Int {
 
 pub fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     if node == -1 { return TYPE_UNKNOWN }
-    let kind = np_kind.get(node)
+    let kind = np_kind.unsafe_get(node)
 
     if kind == NodeKind.IntLit { return TYPE_INT }
     if kind == NodeKind.FloatLit { return TYPE_FLOAT }
     if kind == NodeKind.BoolLit { return TYPE_BOOL }
     if kind == NodeKind.InterpString { return TYPE_STR }
+    if kind == NodeKind.EmbedExpr { return TYPE_STR }
 
     if kind == NodeKind.Ident {
-        let name = np_name.get(node)
+        let name = np_name.unsafe_get(node)
         if name == "true" || name == "false" { return TYPE_BOOL }
         if name == "None" { return make_option_type(TYPE_UNKNOWN) }
         let vt = nr_get_type(name)
@@ -1706,9 +1712,9 @@ pub fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.
     }
 
     if kind == NodeKind.BinOp {
-        let op = np_op.get(node)
-        let lt = infer_type(np_left.get(node))
-        let rt = infer_type(np_right.get(node))
+        let op = np_op.unsafe_get(node)
+        let lt = infer_type(np_left.unsafe_get(node))
+        let rt = infer_type(np_right.unsafe_get(node))
 
         if op == "==" || op == "!=" || op == "<" || op == ">" || op == "<=" || op == ">=" {
             return TYPE_BOOL
@@ -1741,21 +1747,21 @@ pub fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.
     }
 
     if kind == NodeKind.UnaryOp {
-        let op = np_op.get(node)
-        let operand = infer_type(np_right.get(node))
+        let op = np_op.unsafe_get(node)
+        let operand = infer_type(np_right.unsafe_get(node))
         if op == "!" { return TYPE_BOOL }
         if op == "-" { return operand }
         if op == "?" {
             if tc_current_fn_ret >= 0 && tc_current_fn_ret < ty_kind.len() {
-                let ret_kind = ty_kind.get(tc_current_fn_ret)
+                let ret_kind = ty_kind.unsafe_get(tc_current_fn_ret)
                 if ret_kind != TK_RESULT && ret_kind != TK_UNKNOWN {
                     tc_errors.push("'?' operator used in function '{tc_current_fn_name}' which does not return Result")
                     diag_error_at("TypeError", "E0300", "'?' operator used in function '{tc_current_fn_name}' which does not return Result", node, "change the return type to Result")
                 }
             }
             let ok = type_kind(operand)
-            if ok == TK_OPTION { return ty_inner1.get(operand) }
-            if ok == TK_RESULT { return ty_inner1.get(operand) }
+            if ok == TK_OPTION { return ty_inner1.unsafe_get(operand) }
+            if ok == TK_RESULT { return ty_inner1.unsafe_get(operand) }
             return operand
         }
         if op == "??" {
@@ -1763,20 +1769,20 @@ pub fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.
             if operand_k != TK_OPTION && operand_k != TK_UNKNOWN {
                 tc_error("'??' operator requires Option value, got {type_to_str(operand)}")
             }
-            if operand_k == TK_OPTION { return ty_inner1.get(operand) }
+            if operand_k == TK_OPTION { return ty_inner1.unsafe_get(operand) }
             return operand
         }
         return operand
     }
 
     if kind == NodeKind.Call {
-        let callee = np_left.get(node)
+        let callee = np_left.unsafe_get(node)
         if callee != -1 {
-            let callee_kind = np_kind.get(callee)
+            let callee_kind = np_kind.unsafe_get(callee)
             if callee_kind == NodeKind.Ident {
-                let fn_name = np_name.get(callee)
+                let fn_name = np_name.unsafe_get(callee)
                 if fn_name == "Some" {
-                    let args_sl = np_args.get(node)
+                    let args_sl = np_args.unsafe_get(node)
                     if args_sl != -1 && sublist_length(args_sl) >= 1 {
                         let inner = infer_type(sublist_get(args_sl, 0))
                         return make_option_type(inner)
@@ -1784,7 +1790,7 @@ pub fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.
                     return make_option_type(TYPE_UNKNOWN)
                 }
                 if fn_name == "Ok" {
-                    let args_sl = np_args.get(node)
+                    let args_sl = np_args.unsafe_get(node)
                     if args_sl != -1 && sublist_length(args_sl) >= 1 {
                         let inner = infer_type(sublist_get(args_sl, 0))
                         return make_result_type(inner, TYPE_UNKNOWN)
@@ -1792,7 +1798,7 @@ pub fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.
                     return make_result_type(TYPE_UNKNOWN, TYPE_UNKNOWN)
                 }
                 if fn_name == "Err" {
-                    let args_sl = np_args.get(node)
+                    let args_sl = np_args.unsafe_get(node)
                     if args_sl != -1 && sublist_length(args_sl) >= 1 {
                         let inner = infer_type(sublist_get(args_sl, 0))
                         return make_result_type(TYPE_UNKNOWN, inner)
@@ -1807,25 +1813,25 @@ pub fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.
                 }
                 let sig = lookup_fnsig(fn_name)
                 if sig != -1 {
-                    let args_sl = np_args.get(node)
+                    let args_sl = np_args.unsafe_get(node)
                     let mut arg_count = 0
                     if args_sl != -1 {
                         arg_count = sublist_length(args_sl)
                     }
-                    let expected = fnsig_params_count.get(sig)
+                    let expected = fnsig_params_count.unsafe_get(sig)
                     if arg_count != expected {
                         tc_error("function '{fn_name}' expects {expected} argument(s), got {arg_count}")
                     }
-                    let tp_count = fnsig_type_params_count.get(sig)
+                    let tp_count = fnsig_type_params_count.unsafe_get(sig)
                     if tp_count > 0 {
                         return instantiate_return_type(sig, args_sl)
                     }
-                    return fnsig_ret.get(sig)
+                    return fnsig_ret.unsafe_get(sig)
                 }
             } else if callee_kind == NodeKind.FieldAccess {
-                let obj = np_obj.get(callee)
-                if obj != -1 && np_kind.get(obj) == NodeKind.Ident {
-                    let type_name = np_name.get(obj)
+                let obj = np_obj.unsafe_get(callee)
+                if obj != -1 && np_kind.unsafe_get(obj) == NodeKind.Ident {
+                    let type_name = np_name.unsafe_get(obj)
                     let tid = lookup_named_type(type_name)
                     if tid != -1 { return tid }
                 }
@@ -1835,22 +1841,23 @@ pub fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.
     }
 
     if kind == NodeKind.MethodCall {
-        let obj_node = np_obj.get(node)
-        let method = np_method.get(node)
+        let obj_node = np_obj.unsafe_get(node)
+        let method = np_method.unsafe_get(node)
         let obj_t = infer_type(obj_node)
         let obj_k = type_kind(obj_t)
 
         if obj_k == TK_LIST {
             if method == "len" || method == "count" { return TYPE_INT }
-            if method == "get" { return ty_inner1.get(obj_t) }
+            if method == "get" { return make_option_type(ty_inner1.unsafe_get(obj_t)) }
+            if method == "unsafe_get" { return ty_inner1.unsafe_get(obj_t) }
             if method == "push" || method == "set" || method == "pop" || method == "for_each" { return TYPE_VOID }
             if method == "map" || method == "filter" || method == "take" || method == "skip" || method == "collect" {
                 return obj_t
             }
             if method == "contains" || method == "any" || method == "all" { return TYPE_BOOL }
-            if method == "find" { return make_option_type(ty_inner1.get(obj_t)) }
+            if method == "find" { return make_option_type(ty_inner1.unsafe_get(obj_t)) }
             if method == "fold" {
-                let args_sl = np_args.get(node)
+                let args_sl = np_args.unsafe_get(node)
                 if args_sl != -1 && sublist_length(args_sl) >= 1 {
                     return infer_type(sublist_get(args_sl, 0))
                 }
@@ -1874,13 +1881,13 @@ pub fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.
         }
 
         if obj_k == TK_OPTION {
-            if method == "unwrap" { return ty_inner1.get(obj_t) }
+            if method == "unwrap" { return ty_inner1.unsafe_get(obj_t) }
             if method == "is_some" || method == "is_none" { return TYPE_BOOL }
         }
 
         if obj_k == TK_RESULT {
-            if method == "unwrap" { return ty_inner1.get(obj_t) }
-            if method == "unwrap_err" { return ty_inner2.get(obj_t) }
+            if method == "unwrap" { return ty_inner1.unsafe_get(obj_t) }
+            if method == "unwrap_err" { return ty_inner2.unsafe_get(obj_t) }
             if method == "is_ok" || method == "is_err" { return TYPE_BOOL }
         }
 
@@ -1888,9 +1895,9 @@ pub fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.
             if method == "len" { return TYPE_INT }
             if method == "has" || method == "remove" { return TYPE_INT }
             if method == "set" { return TYPE_VOID }
-            if method == "get" { return ty_inner2.get(obj_t) }
-            if method == "keys" { return make_list_type(ty_inner1.get(obj_t)) }
-            if method == "values" { return make_list_type(ty_inner2.get(obj_t)) }
+            if method == "get" { return ty_inner2.unsafe_get(obj_t) }
+            if method == "keys" { return make_list_type(ty_inner1.unsafe_get(obj_t)) }
+            if method == "values" { return make_list_type(ty_inner2.unsafe_get(obj_t)) }
         }
 
         if obj_k == TK_BYTES {
@@ -1904,11 +1911,11 @@ pub fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.
         }
 
         if obj_k == TK_STRUCT || obj_k == TK_ENUM {
-            let tname = ty_name.get(obj_t)
+            let tname = ty_name.unsafe_get(obj_t)
             let sig_name = "{tname}_{method}"
             let sig = lookup_fnsig(sig_name)
             if sig != -1 {
-                return fnsig_ret.get(sig)
+                return fnsig_ret.unsafe_get(sig)
             }
         }
 
@@ -1916,12 +1923,12 @@ pub fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.
     }
 
     if kind == NodeKind.FieldAccess {
-        let obj_node = np_obj.get(node)
-        let fname = np_name.get(node)
+        let obj_node = np_obj.unsafe_get(node)
+        let fname = np_name.unsafe_get(node)
         if obj_node == -1 { return TYPE_UNKNOWN }
 
-        if np_kind.get(obj_node) == NodeKind.Ident {
-            let obj_name = np_name.get(obj_node)
+        if np_kind.unsafe_get(obj_node) == NodeKind.Ident {
+            let obj_name = np_name.unsafe_get(obj_node)
             let tid = lookup_named_type(obj_name)
             if tid != -1 && type_kind(tid) == TK_ENUM {
                 return tid
@@ -1937,15 +1944,15 @@ pub fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.
     }
 
     if kind == NodeKind.IndexExpr {
-        let obj_t = infer_type(np_obj.get(node))
+        let obj_t = infer_type(np_obj.unsafe_get(node))
         if type_kind(obj_t) == TK_LIST {
-            return ty_inner1.get(obj_t)
+            return ty_inner1.unsafe_get(obj_t)
         }
         return TYPE_UNKNOWN
     }
 
     if kind == NodeKind.ListLit {
-        let elems_sl = np_elements.get(node)
+        let elems_sl = np_elements.unsafe_get(node)
         if elems_sl != -1 && sublist_length(elems_sl) > 0 {
             let first_t = infer_type(sublist_get(elems_sl, 0))
             return make_list_type(first_t)
@@ -1954,7 +1961,7 @@ pub fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.
     }
 
     if kind == NodeKind.StructLit {
-        let sname = np_type_name.get(node)
+        let sname = np_type_name.unsafe_get(node)
         if sname != "" {
             let tid = lookup_named_type(sname)
             if tid != -1 { return tid }
@@ -1963,7 +1970,7 @@ pub fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.
     }
 
     if kind == NodeKind.TupleLit {
-        let elems_sl = np_elements.get(node)
+        let elems_sl = np_elements.unsafe_get(node)
         if elems_sl != -1 {
             let mut elem_types: List[Int] = []
             let mut i = 0
@@ -1977,12 +1984,12 @@ pub fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.
     }
 
     if kind == NodeKind.IfExpr {
-        let cond_t = infer_type(np_condition.get(node))
+        let cond_t = infer_type(np_condition.unsafe_get(node))
         if is_bool_compat(cond_t) == 0 {
             tc_error("if condition must be Bool, got {type_to_str(cond_t)}")
         }
-        let then_t = infer_type(np_then_body.get(node))
-        let else_node = np_else_body.get(node)
+        let then_t = infer_type(np_then_body.unsafe_get(node))
+        let else_node = np_else_body.unsafe_get(node)
         if else_node != -1 {
             let else_t = infer_type(else_node)
             if then_t != TYPE_UNKNOWN && else_t != TYPE_UNKNOWN {
@@ -1997,24 +2004,24 @@ pub fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.
     }
 
     if kind == NodeKind.MatchExpr {
-        let arms_sl = np_arms.get(node)
+        let arms_sl = np_arms.unsafe_get(node)
         if arms_sl != -1 && sublist_length(arms_sl) > 0 {
             let first_arm = sublist_get(arms_sl, 0)
-            return infer_type(np_body.get(first_arm))
+            return infer_type(np_body.unsafe_get(first_arm))
         }
         return TYPE_UNKNOWN
     }
 
     if kind == NodeKind.Block {
-        let stmts_sl = np_stmts.get(node)
+        let stmts_sl = np_stmts.unsafe_get(node)
         if stmts_sl != -1 && sublist_length(stmts_sl) > 0 {
             let last = sublist_get(stmts_sl, sublist_length(stmts_sl) - 1)
-            let last_k = np_kind.get(last)
+            let last_k = np_kind.unsafe_get(last)
             if last_k == NodeKind.ExprStmt {
-                return infer_type(np_value.get(last))
+                return infer_type(np_value.unsafe_get(last))
             }
             if last_k == NodeKind.Return {
-                return infer_type(np_value.get(last))
+                return infer_type(np_value.unsafe_get(last))
             }
             if last_k == NodeKind.IfExpr || last_k == NodeKind.MatchExpr || last_k == NodeKind.Call || last_k == NodeKind.MethodCall || last_k == NodeKind.Ident || last_k == NodeKind.IntLit || last_k == NodeKind.FloatLit || last_k == NodeKind.BoolLit || last_k == NodeKind.InterpString || last_k == NodeKind.BinOp || last_k == NodeKind.UnaryOp {
                 return infer_type(last)
@@ -2037,8 +2044,8 @@ pub fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.
 // ── Phase 2: Type check function bodies ─────────────────────────────
 
 pub fn resolve_param_type(p: Int) -> Int ! TypeCheck.Resolve {
-    let ptype_str = np_type_name.get(p)
-    let ptype_ann = np_type_ann.get(p)
+    let ptype_str = np_type_name.unsafe_get(p)
+    let ptype_ann = np_type_ann.unsafe_get(p)
     if ptype_ann != -1 {
         return resolve_type_ann(ptype_ann)
     }
@@ -2051,33 +2058,33 @@ pub fn resolve_param_type(p: Int) -> Int ! TypeCheck.Resolve {
 
 pub fn tc_check_fn(fn_node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     nr_push_scope()
-    let fn_name = np_name.get(fn_node)
+    let fn_name = np_name.unsafe_get(fn_node)
     let prev_fn_name = tc_current_fn_name
     let prev_fn_ret = tc_current_fn_ret
     tc_current_fn_name = fn_name
     let sig = lookup_fnsig(fn_name)
     if sig != -1 {
-        tc_current_fn_ret = fnsig_ret.get(sig)
+        tc_current_fn_ret = fnsig_ret.unsafe_get(sig)
     }
 
-    let params_sl = np_params.get(fn_node)
+    let params_sl = np_params.unsafe_get(fn_node)
     if params_sl != -1 {
         let mut i = 0
         while i < sublist_length(params_sl) {
             let p = sublist_get(params_sl, i)
-            let pname = np_name.get(p)
+            let pname = np_name.unsafe_get(p)
             let ptid = resolve_param_type(p)
             nr_define_typed(pname, 0, ptid)
             i = i + 1
         }
     }
 
-    let body = np_body.get(fn_node)
+    let body = np_body.unsafe_get(fn_node)
     if body != -1 {
         tc_check_body(body)
 
         if sig != -1 {
-            let declared_ret = fnsig_ret.get(sig)
+            let declared_ret = fnsig_ret.unsafe_get(sig)
             if declared_ret != TYPE_VOID && declared_ret != TYPE_UNKNOWN {
                 let inferred_ret = infer_type(body)
                 if inferred_ret != TYPE_UNKNOWN {
@@ -2095,11 +2102,11 @@ pub fn tc_check_fn(fn_node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Rep
 
 pub fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     if node == -1 { return }
-    let kind = np_kind.get(node)
+    let kind = np_kind.unsafe_get(node)
 
     if kind == NodeKind.Block {
         nr_push_scope()
-        let stmts_sl = np_stmts.get(node)
+        let stmts_sl = np_stmts.unsafe_get(node)
         if stmts_sl != -1 {
             let mut i = 0
             while i < sublist_length(stmts_sl) {
@@ -2112,12 +2119,12 @@ pub fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repo
     }
 
     if kind == NodeKind.LetBinding {
-        let vname = np_name.get(node)
-        let val = np_value.get(node)
-        let is_mut = np_is_mut.get(node)
+        let vname = np_name.unsafe_get(node)
+        let val = np_value.unsafe_get(node)
+        let is_mut = np_is_mut.unsafe_get(node)
 
-        let type_str = np_type_name.get(node)
-        let type_ann = np_type_ann.get(node)
+        let type_str = np_type_name.unsafe_get(node)
+        let type_ann = np_type_ann.unsafe_get(node)
         let mut declared_tid = TYPE_UNKNOWN
         if type_ann != -1 {
             declared_tid = resolve_type_ann(type_ann)
@@ -2149,8 +2156,8 @@ pub fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repo
     }
 
     if kind == NodeKind.Assignment || kind == NodeKind.CompoundAssign {
-        let target = np_target.get(node)
-        let val = np_value.get(node)
+        let target = np_target.unsafe_get(node)
+        let val = np_value.unsafe_get(node)
         if target != -1 && val != -1 {
             let target_t = infer_type(target)
             let val_t = infer_type(val)
@@ -2164,47 +2171,47 @@ pub fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repo
     }
 
     if kind == NodeKind.IfExpr {
-        let cond_t = infer_type(np_condition.get(node))
+        let cond_t = infer_type(np_condition.unsafe_get(node))
         if is_bool_compat(cond_t) == 0 {
             tc_error("if condition must be Bool, got {type_to_str(cond_t)}")
         }
-        tc_check_body(np_then_body.get(node))
-        tc_check_body(np_else_body.get(node))
+        tc_check_body(np_then_body.unsafe_get(node))
+        tc_check_body(np_else_body.unsafe_get(node))
         return
     }
 
     if kind == NodeKind.WhileLoop {
-        let cond_t = infer_type(np_condition.get(node))
+        let cond_t = infer_type(np_condition.unsafe_get(node))
         if is_bool_compat(cond_t) == 0 {
             tc_error("while condition must be Bool, got {type_to_str(cond_t)}")
         }
-        tc_check_body(np_body.get(node))
+        tc_check_body(np_body.unsafe_get(node))
         return
     }
 
     if kind == NodeKind.ForIn {
         nr_push_scope()
-        let iter_t = infer_type(np_iterable.get(node))
+        let iter_t = infer_type(np_iterable.unsafe_get(node))
         let mut elem_t = TYPE_UNKNOWN
         if type_kind(iter_t) == TK_LIST {
-            elem_t = ty_inner1.get(iter_t)
+            elem_t = ty_inner1.unsafe_get(iter_t)
         }
-        nr_define_typed(np_var_name.get(node), 0, elem_t)
-        tc_check_body(np_body.get(node))
+        nr_define_typed(np_var_name.unsafe_get(node), 0, elem_t)
+        tc_check_body(np_body.unsafe_get(node))
         nr_pop_scope()
         return
     }
 
     if kind == NodeKind.MatchExpr {
-        tc_check_body(np_scrutinee.get(node))
-        let arms_sl = np_arms.get(node)
+        tc_check_body(np_scrutinee.unsafe_get(node))
+        let arms_sl = np_arms.unsafe_get(node)
         if arms_sl != -1 {
             let mut i = 0
             while i < sublist_length(arms_sl) {
                 let arm = sublist_get(arms_sl, i)
                 nr_push_scope()
-                tc_check_pattern_types(np_pattern.get(arm))
-                tc_check_body(np_body.get(arm))
+                tc_check_pattern_types(np_pattern.unsafe_get(arm))
+                tc_check_body(np_body.unsafe_get(arm))
                 nr_pop_scope()
                 i = i + 1
             }
@@ -2213,9 +2220,9 @@ pub fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repo
             let mut ai = 0
             while ai < sublist_length(arms_sl) {
                 let arm = sublist_get(arms_sl, ai)
-                let pat = np_pattern.get(arm)
+                let pat = np_pattern.unsafe_get(arm)
                 if pat != -1 {
-                    let pk = np_kind.get(pat)
+                    let pk = np_kind.unsafe_get(pat)
                     if pk == NodeKind.WildcardPattern || pk == NodeKind.IdentPattern {
                         has_wildcard = 1
                     }
@@ -2230,54 +2237,54 @@ pub fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repo
     }
 
     if kind == NodeKind.LoopExpr {
-        tc_check_body(np_body.get(node))
+        tc_check_body(np_body.unsafe_get(node))
         return
     }
 
     if kind == NodeKind.WithBlock {
-        tc_check_body(np_body.get(node))
+        tc_check_body(np_body.unsafe_get(node))
         return
     }
 
     if kind == NodeKind.WithResource {
         nr_push_scope()
-        nr_define(np_name.get(node))
-        tc_check_body(np_value.get(node))
-        tc_check_body(np_body.get(node))
+        nr_define(np_name.unsafe_get(node))
+        tc_check_body(np_value.unsafe_get(node))
+        tc_check_body(np_body.unsafe_get(node))
         nr_pop_scope()
         return
     }
 
     if kind == NodeKind.AsyncScope {
-        tc_check_body(np_body.get(node))
+        tc_check_body(np_body.unsafe_get(node))
         return
     }
 
     if kind == NodeKind.AsyncSpawn {
-        tc_check_body(np_body.get(node))
+        tc_check_body(np_body.unsafe_get(node))
         return
     }
 
     if kind == NodeKind.Closure {
         nr_push_scope()
-        let params_sl = np_params.get(node)
+        let params_sl = np_params.unsafe_get(node)
         if params_sl != -1 {
             let mut i = 0
             while i < sublist_length(params_sl) {
                 let p = sublist_get(params_sl, i)
-                let pname = np_name.get(p)
+                let pname = np_name.unsafe_get(p)
                 let ptid = resolve_param_type(p)
                 nr_define_typed(pname, 0, ptid)
                 i = i + 1
             }
         }
-        tc_check_body(np_body.get(node))
+        tc_check_body(np_body.unsafe_get(node))
         nr_pop_scope()
         return
     }
 
     if kind == NodeKind.ExprStmt {
-        let val = np_value.get(node)
+        let val = np_value.unsafe_get(node)
         if val != -1 {
             infer_type(val)
         }
@@ -2285,7 +2292,7 @@ pub fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repo
     }
 
     if kind == NodeKind.Return {
-        let val = np_value.get(node)
+        let val = np_value.unsafe_get(node)
         if val != -1 {
             infer_type(val)
         }
@@ -2297,16 +2304,16 @@ pub fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repo
 
 pub fn tc_check_pattern_types(node: Int) ! TypeCheck.Resolve {
     if node == -1 { return }
-    let kind = np_kind.get(node)
+    let kind = np_kind.unsafe_get(node)
     if kind == NodeKind.IdentPattern {
-        let name = np_name.get(node)
+        let name = np_name.unsafe_get(node)
         if name != "_" {
             nr_define(name)
         }
         return
     }
     if kind == NodeKind.EnumPattern {
-        let flds_sl = np_fields.get(node)
+        let flds_sl = np_fields.unsafe_get(node)
         if flds_sl != -1 {
             let mut i = 0
             while i < sublist_length(flds_sl) {
@@ -2317,18 +2324,18 @@ pub fn tc_check_pattern_types(node: Int) ! TypeCheck.Resolve {
         return
     }
     if kind == NodeKind.StructPattern {
-        let flds_sl = np_fields.get(node)
+        let flds_sl = np_fields.unsafe_get(node)
         if flds_sl != -1 {
             let mut i = 0
             while i < sublist_length(flds_sl) {
-                nr_define(np_name.get(sublist_get(flds_sl, i)))
+                nr_define(np_name.unsafe_get(sublist_get(flds_sl, i)))
                 i = i + 1
             }
         }
         return
     }
     if kind == NodeKind.TuplePattern {
-        let elems_sl = np_elements.get(node)
+        let elems_sl = np_elements.unsafe_get(node)
         if elems_sl != -1 {
             let mut i = 0
             while i < sublist_length(elems_sl) {
@@ -2339,13 +2346,13 @@ pub fn tc_check_pattern_types(node: Int) ! TypeCheck.Resolve {
         return
     }
     if kind == NodeKind.OrPattern {
-        tc_check_pattern_types(np_left.get(node))
-        tc_check_pattern_types(np_right.get(node))
+        tc_check_pattern_types(np_left.unsafe_get(node))
+        tc_check_pattern_types(np_right.unsafe_get(node))
         return
     }
     if kind == NodeKind.AsPattern {
-        tc_check_pattern_types(np_pattern.get(node))
-        nr_define(np_name.get(node))
+        tc_check_pattern_types(np_pattern.unsafe_get(node))
+        nr_define(np_name.unsafe_get(node))
         return
     }
     let _skip = 0
@@ -2361,22 +2368,22 @@ pub fn tc_infer_program(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Dia
     nr_push_scope()
 
     // Register top-level let bindings
-    let lets_sl = np_stmts.get(program)
+    let lets_sl = np_stmts.unsafe_get(program)
     if lets_sl != -1 {
         let mut i = 0
         while i < sublist_length(lets_sl) {
             let l = sublist_get(lets_sl, i)
-            nr_define(np_name.get(l))
+            nr_define(np_name.unsafe_get(l))
             i = i + 1
         }
     }
 
     // Register function names
-    let fns_sl = np_params.get(program)
+    let fns_sl = np_params.unsafe_get(program)
     if fns_sl != -1 {
         let mut i = 0
         while i < sublist_length(fns_sl) {
-            nr_define(np_name.get(sublist_get(fns_sl, i)))
+            nr_define(np_name.unsafe_get(sublist_get(fns_sl, i)))
             i = i + 1
         }
     }
@@ -2386,7 +2393,7 @@ pub fn tc_infer_program(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Dia
         let mut i = 0
         while i < sublist_length(fns_sl) {
             let fn_node = sublist_get(fns_sl, i)
-            if tc_should_check_fn(np_name.get(fn_node)) != 0 {
+            if tc_should_check_fn(np_name.unsafe_get(fn_node)) != 0 {
                 tc_check_fn(fn_node)
             }
             i = i + 1
@@ -2394,18 +2401,18 @@ pub fn tc_infer_program(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Dia
     }
 
     // Type check impl methods (skip unaffected when incremental filter active)
-    let impls_sl = np_methods.get(program)
+    let impls_sl = np_methods.unsafe_get(program)
     if impls_sl != -1 {
         let mut i = 0
         while i < sublist_length(impls_sl) {
             let im = sublist_get(impls_sl, i)
-            let impl_type = np_name.get(im)
-            let methods_sl = np_methods.get(im)
+            let impl_type = np_name.unsafe_get(im)
+            let methods_sl = np_methods.unsafe_get(im)
             if methods_sl != -1 {
                 let mut j = 0
                 while j < sublist_length(methods_sl) {
                     let m = sublist_get(methods_sl, j)
-                    let orig_name = np_name.get(m)
+                    let orig_name = np_name.unsafe_get(m)
                     let qualified = "{impl_type}_{orig_name}"
                     if tc_should_check_fn(qualified) != 0 {
                         np_name.set(m, qualified)
@@ -2428,8 +2435,8 @@ pub fn type_to_str(tid: Int) -> Str {
     if tid < 0 || tid >= ty_kind.len() {
         return "<?>"
     }
-    let k = ty_kind.get(tid)
-    let name = ty_name.get(tid)
+    let k = ty_kind.unsafe_get(tid)
+    let name = ty_name.unsafe_get(tid)
 
     if k == TK_INT { return "Int" }
     if k == TK_FLOAT { return "Float" }
@@ -2442,51 +2449,51 @@ pub fn type_to_str(tid: Int) -> Str {
     if k == TK_ENUM { return name }
 
     if k == TK_LIST {
-        let inner = ty_inner1.get(tid)
+        let inner = ty_inner1.unsafe_get(tid)
         return "List[{type_to_str(inner)}]"
     }
     if k == TK_OPTION {
-        let inner = ty_inner1.get(tid)
+        let inner = ty_inner1.unsafe_get(tid)
         return "Option[{type_to_str(inner)}]"
     }
     if k == TK_RESULT {
-        let ok_t = ty_inner1.get(tid)
-        let err_t = ty_inner2.get(tid)
+        let ok_t = ty_inner1.unsafe_get(tid)
+        let err_t = ty_inner2.unsafe_get(tid)
         return "Result[{type_to_str(ok_t)}, {type_to_str(err_t)}]"
     }
     if k == TK_MAP {
-        let key_t = ty_inner1.get(tid)
-        let val_t = ty_inner2.get(tid)
+        let key_t = ty_inner1.unsafe_get(tid)
+        let val_t = ty_inner2.unsafe_get(tid)
         return "Map[{type_to_str(key_t)}, {type_to_str(val_t)}]"
     }
     if k == TK_BYTES {
         return "Bytes"
     }
     if k == TK_FN {
-        let ret = ty_inner1.get(tid)
-        let start = ty_params_start.get(tid)
-        let count = ty_params_count.get(tid)
+        let ret = ty_inner1.unsafe_get(tid)
+        let start = ty_params_start.unsafe_get(tid)
+        let count = ty_params_count.unsafe_get(tid)
         let mut params = ""
         let mut i = 0
         while i < count {
             if i > 0 {
                 params = params.concat(", ")
             }
-            params = params.concat(type_to_str(ty_param_list.get(start + i)))
+            params = params.concat(type_to_str(ty_param_list.unsafe_get(start + i)))
             i = i + 1
         }
         return "Fn({params}) -> {type_to_str(ret)}"
     }
     if k == TK_TUPLE {
-        let start = ty_params_start.get(tid)
-        let count = ty_params_count.get(tid)
+        let start = ty_params_start.unsafe_get(tid)
+        let count = ty_params_count.unsafe_get(tid)
         let mut elems = ""
         let mut i = 0
         while i < count {
             if i > 0 {
                 elems = elems.concat(", ")
             }
-            elems = elems.concat(type_to_str(ty_param_list.get(start + i)))
+            elems = elems.concat(type_to_str(ty_param_list.unsafe_get(start + i)))
             i = i + 1
         }
         return "({elems})"

@@ -6,12 +6,13 @@ Prefer retrieval-led reasoning over pre-training for Pact tasks.
 
 [Docs Index]|root: .
 |SPEC.md — spec index, design decisions summary
-|DECISIONS.md — influences, rejected features, resolved questions, panel votes
+|DECISIONS.md — influences, rejected features, resolved questions index
+|decisions/ — individual design rationale files (one per deliberation)
 |OPEN_QUESTIONS.md — panel deliberation archive
 |GAPS.md — spec gaps needing design work before compiler
 |FRICTION.md — friction log from building the compiler, for spec revision
 |README.md — language tour, 30-sec examples, quick reference
-|sections/philosophy:{01_philosophy.md} — 6 design principles, AI-first rationale
+|sections/philosophy:{01_philosophy.md} — 7 design principles, AI-first rationale
 |sections/syntax:{02_syntax.md} — fn, let, match, strings, closures, annotations
 |sections/types:{03_types.md} — structs, enums, generics, traits, tuples
 |sections/contracts:{03b_contracts.md} — refinement types, contracts, verification, Query[C]
@@ -20,7 +21,7 @@ Prefer retrieval-led reasoning over pre-training for Pact tasks.
 |sections/memory:{05_memory_compile_errors.md} — GC, arenas, compilation, diagnostics
 |sections/tooling:{06_tooling.md} — compiler daemon, LSP, formatter, tests, package manager
 |sections/trust:{07_trust_modules_metadata.md} — FFI, modules, imports, all 14 annotations (CANONICAL)
-|examples/:{hello,fizzbuzz,todo,calculator,fetch,bank,web_api}.pact
+|examples/:{hello,fizzbuzz,todo,calculator,fetch,bank,web_api,embed}.pact
 |src/compiler.pact — compiler entry point (imports lexer, parser, codegen)
 |src/tokens.pact — TokenKind type, keyword_lookup, token_kind_name
 |src/ast.pact — NodeKind type, node_kind_name

@@ -59,7 +59,7 @@ pub fn manifest_clear() {
 fn is_known_section(name: Str) -> Int {
     let mut i = 0
     while i < known_sections.len() {
-        if known_sections.get(i) == name {
+        if known_sections.unsafe_get(i) == name {
             return 1
         }
         i = i + 1
@@ -70,7 +70,7 @@ fn is_known_section(name: Str) -> Int {
 fn has_dep(name: Str) -> Int {
     let mut i = 0
     while i < dep_names.len() {
-        if dep_names.get(i) == name {
+        if dep_names.unsafe_get(i) == name {
             return 1
         }
         i = i + 1
@@ -172,7 +172,7 @@ fn collect_dep_names(prefix: Str) {
     let prefix_dot_len = prefix_dot.len()
     let mut i = 0
     while i < toml_keys.len() {
-        let key = toml_keys.get(i)
+        let key = toml_keys.unsafe_get(i)
         if key.starts_with(prefix_dot) {
             let name = extract_dep_name(key, prefix.len())
             if name != "" {
@@ -180,7 +180,7 @@ fn collect_dep_names(prefix: Str) {
                 let mut found = 0
                 let mut j = 0
                 while j < tmp_dep_names.len() {
-                    if tmp_dep_names.get(j) == name {
+                    if tmp_dep_names.unsafe_get(j) == name {
                         found = 1
                     }
                     j = j + 1
@@ -201,7 +201,7 @@ pub fn load_deps(prefix: Str, is_dev: Int) -> Int {
 
     let mut i = 0
     while i < tmp_dep_names.len() {
-        let name = tmp_dep_names.get(i)
+        let name = tmp_dep_names.unsafe_get(i)
         let base_key = prefix.concat(".").concat(name)
 
         let mut version = ""
@@ -284,8 +284,8 @@ pub fn load_deps(prefix: Str, is_dev: Int) -> Int {
 fn find_dep_type(key: Str) -> Int {
     let mut i = 0
     while i < toml_keys.len() {
-        if toml_keys.get(i) == key {
-            return toml_types.get(i)
+        if toml_keys.unsafe_get(i) == key {
+            return toml_types.unsafe_get(i)
         }
         i = i + 1
     }
@@ -322,10 +322,10 @@ pub fn load_alternatives() {
     let prefix_len = prefix.len()
     let mut i = 0
     while i < toml_keys.len() {
-        let key = toml_keys.get(i)
+        let key = toml_keys.unsafe_get(i)
         if key.starts_with(prefix) {
             let alt_key = key.substring(prefix_len, key.len() - prefix_len)
-            let alt_val = toml_values.get(i)
+            let alt_val = toml_values.unsafe_get(i)
             alt_keys.push(alt_key)
             alt_values.push(alt_val)
         }
@@ -338,7 +338,7 @@ pub fn load_alternatives() {
 fn check_unknown_sections() {
     let mut i = 0
     while i < toml_keys.len() {
-        let key = toml_keys.get(i)
+        let key = toml_keys.unsafe_get(i)
         // Extract top-level section name (part before first dot)
         let mut dot_pos = -1
         let mut j = 0
@@ -412,24 +412,24 @@ pub fn manifest_get_dep_name(i: Int) -> Str {
     if i < 0 || i >= dep_names.len() {
         return ""
     }
-    dep_names.get(i)
+    dep_names.unsafe_get(i)
 }
 
 pub fn manifest_get_dep_version(i: Int) -> Str {
     if i < 0 || i >= dep_versions.len() {
         return ""
     }
-    dep_versions.get(i)
+    dep_versions.unsafe_get(i)
 }
 
 pub fn manifest_get_dep_source(i: Int) -> Str {
     if i < 0 || i >= dep_names.len() {
         return ""
     }
-    if dep_git_urls.get(i) != "" {
+    if dep_git_urls.unsafe_get(i) != "" {
         return "git"
     }
-    if dep_paths.get(i) != "" {
+    if dep_paths.unsafe_get(i) != "" {
         return "path"
     }
     "registry"

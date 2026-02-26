@@ -3,7 +3,7 @@
 7 sections by domain experts. All blocking decisions resolved (5-0 unanimous). Self-hosting compiler achieved (Pact compiles itself via C backend).
 
 ## Sections
-1. [Philosophy](sections/01_philosophy.md) — 6 principles, AI-first
+1. [Philosophy](sections/01_philosophy.md) — 7 principles, AI-first
 2. [Syntax](sections/02_syntax.md) — fn, let, match, strings, keyword args, struct defaults, annotations
 3. [Types](sections/03_types.md) — structs, enums, generics, traits, tuples
 3b. [Contracts](sections/03b_contracts.md) — refinement types, contracts, verification, Query[C]

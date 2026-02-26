@@ -7,7 +7,7 @@ fn main() {
     parts.push("a")
     parts.push("b")
     io.println("list len: {parts.len()}")
-    io.println("get 0: {parts.get(0)}")
+    io.println("get 0: {parts.unsafe_get(0)}")
 
     let m = Map()
     m.set("key", "val")

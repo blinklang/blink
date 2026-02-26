@@ -189,7 +189,7 @@ pub let mut sf_list_elems: List[StructFieldListElem] = []
 pub fn get_struct_field_list_elem(sname: Str, fname: Str) -> Str {
     let mut i = 0
     while i < sf_list_elems.len() {
-        let e = sf_list_elems.get(i)
+        let e = sf_list_elems.unsafe_get(i)
         if e.struct_name == sname && e.field_name == fname {
             return e.elem_struct
         }
@@ -201,7 +201,7 @@ pub fn get_struct_field_list_elem(sname: Str, fname: Str) -> Str {
 pub fn get_struct_field_list_elem_type(sname: Str, fname: Str) -> Int {
     let mut i = 0
     while i < sf_list_elems.len() {
-        let e = sf_list_elems.get(i)
+        let e = sf_list_elems.unsafe_get(i)
         if e.struct_name == sname && e.field_name == fname {
             return e.elem_type
         }
@@ -224,7 +224,7 @@ pub let mut derive_method_entries: List[DeriveMethodEntry] = []
 pub fn has_derive_method(type_name: Str, method: Str) -> Int {
     let mut i = 0
     while i < derive_method_entries.len() {
-        let e = derive_method_entries.get(i)
+        let e = derive_method_entries.unsafe_get(i)
         if e.type_name == type_name && e.method_name == method {
             return 1
         }
@@ -236,7 +236,7 @@ pub fn has_derive_method(type_name: Str, method: Str) -> Int {
 pub fn get_derive_method_ret(type_name: Str, method: Str) -> Int {
     let mut i = 0
     while i < derive_method_entries.len() {
-        let e = derive_method_entries.get(i)
+        let e = derive_method_entries.unsafe_get(i)
         if e.type_name == type_name && e.method_name == method {
             return e.ret_type
         }
@@ -406,7 +406,7 @@ pub fn push_scope() ! Codegen.Scope {
 }
 
 pub fn pop_scope() ! Codegen.Scope {
-    let start = scope_frame_starts.get(scope_frame_starts.len() - 1)
+    let start = scope_frame_starts.unsafe_get(scope_frame_starts.len() - 1)
     scope_frame_starts.pop()
     while scope_vars.len() > start {
         scope_vars.pop()
@@ -420,7 +420,7 @@ pub fn set_var(name: Str, ctype: Int, is_mut: Int) ! Codegen.Scope {
 pub fn get_var_type(name: Str) -> Int {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
-        let sv = scope_vars.get(i)
+        let sv = scope_vars.unsafe_get(i)
         if sv.name == name {
             return sv.ctype
         }
@@ -432,7 +432,7 @@ pub fn get_var_type(name: Str) -> Int {
 pub fn get_var_mut(name: Str) -> Int {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
-        let sv = scope_vars.get(i)
+        let sv = scope_vars.unsafe_get(i)
         if sv.name == name {
             return sv.is_mut
         }
@@ -444,7 +444,7 @@ pub fn get_var_mut(name: Str) -> Int {
 pub fn get_sv_inner1(name: Str, ctype: Int) -> Int {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
-        let sv = scope_vars.get(i)
+        let sv = scope_vars.unsafe_get(i)
         if sv.name == name && sv.ctype == ctype {
             return sv.inner1
         }
@@ -456,7 +456,7 @@ pub fn get_sv_inner1(name: Str, ctype: Int) -> Int {
 pub fn get_sv_inner2(name: Str, ctype: Int) -> Int {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
-        let sv = scope_vars.get(i)
+        let sv = scope_vars.unsafe_get(i)
         if sv.name == name && sv.ctype == ctype {
             return sv.inner2
         }
@@ -468,7 +468,7 @@ pub fn get_sv_inner2(name: Str, ctype: Int) -> Int {
 pub fn get_sv_sname(name: Str, ctype: Int) -> Str {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
-        let sv = scope_vars.get(i)
+        let sv = scope_vars.unsafe_get(i)
         if sv.name == name && sv.ctype == ctype {
             return sv.sname
         }
@@ -480,7 +480,7 @@ pub fn get_sv_sname(name: Str, ctype: Int) -> Str {
 pub fn get_sv_sname2(name: Str, ctype: Int) -> Str {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
-        let sv = scope_vars.get(i)
+        let sv = scope_vars.unsafe_get(i)
         if sv.name == name && sv.ctype == ctype {
             return sv.sname2
         }
@@ -492,7 +492,7 @@ pub fn get_sv_sname2(name: Str, ctype: Int) -> Str {
 pub fn get_sv_extra(name: Str, ctype: Int) -> Str {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
-        let sv = scope_vars.get(i)
+        let sv = scope_vars.unsafe_get(i)
         if sv.name == name && sv.ctype == ctype {
             return sv.extra
         }
@@ -504,7 +504,7 @@ pub fn get_sv_extra(name: Str, ctype: Int) -> Str {
 pub fn update_sv_sname(name: Str, ctype: Int, val: Str) {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
-        let sv = scope_vars.get(i)
+        let sv = scope_vars.unsafe_get(i)
         if sv.name == name && sv.ctype == ctype {
             scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: sv.inner2, sname: val, sname2: sv.sname2, extra: sv.extra })
             return
@@ -516,7 +516,7 @@ pub fn update_sv_sname(name: Str, ctype: Int, val: Str) {
 pub fn update_sv_sname2(name: Str, ctype: Int, val: Str) {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
-        let sv = scope_vars.get(i)
+        let sv = scope_vars.unsafe_get(i)
         if sv.name == name && sv.ctype == ctype {
             scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: sv.inner2, sname: sv.sname, sname2: val, extra: sv.extra })
             return
@@ -532,7 +532,7 @@ pub fn set_var_full(name: Str, ctype: Int, is_mut: Int, inner1: Int, inner2: Int
 pub fn is_mut_captured(name: Str) -> Int {
     let mut i = 0
     while i < mut_captured_vars.len() {
-        if mut_captured_vars.get(i) == name {
+        if mut_captured_vars.unsafe_get(i) == name {
             return 1
         }
         i = i + 1
@@ -546,7 +546,7 @@ pub fn get_capture_index(name: Str) -> Int {
     }
     let mut i = 0
     while i < cg_closure_cap_count {
-        if closure_captures.get(cg_closure_cap_start + i).name == name {
+        if closure_captures.unsafe_get(cg_closure_cap_start + i).name == name {
             return i
         }
         i = i + 1
@@ -555,7 +555,7 @@ pub fn get_capture_index(name: Str) -> Int {
 }
 
 pub fn capture_cast_expr(idx: Int) -> Str {
-    let ct = closure_captures.get(cg_closure_cap_start + idx).ctype
+    let ct = closure_captures.unsafe_get(cg_closure_cap_start + idx).ctype
     if ct == CT_INT {
         "(int64_t)(intptr_t)pact_closure_get_capture(__self, {idx})"
     } else if ct == CT_FLOAT {
@@ -588,7 +588,7 @@ pub fn reg_fn_with_effects(name: Str, ret: Int, effects_sl: Int) ! Codegen.Regis
 pub fn get_fn_effect_sl(name: Str) -> Int {
     let mut i = 0
     while i < fn_regs.len() {
-        let fr = fn_regs.get(i)
+        let fr = fn_regs.unsafe_get(i)
         if fr.name == name {
             return fr.effect_sl
         }
@@ -604,7 +604,7 @@ pub fn reg_fn_struct_ret(name: Str, stype: Str) ! Codegen.Register {
 pub fn get_fn_ret_struct(name: Str) -> Str {
     let mut i = fn_ret_structs.len() - 1
     while i >= 0 {
-        let frs = fn_ret_structs.get(i)
+        let frs = fn_ret_structs.unsafe_get(i)
         if frs.name == name {
             return frs.stype
         }
@@ -620,7 +620,7 @@ pub fn reg_fn_ret_type(name: Str, kind: Int, inner1: Int, inner2: Int) ! Codegen
 pub fn get_fn_ret_type(name: Str) -> RetType {
     let mut i = fn_ret_types.len() - 1
     while i >= 0 {
-        let rt = fn_ret_types.get(i)
+        let rt = fn_ret_types.unsafe_get(i)
         if rt.name == name {
             return rt
         }
@@ -630,16 +630,16 @@ pub fn get_fn_ret_type(name: Str) -> RetType {
 }
 
 pub fn resolve_ret_type_from_ann(fn_node: Int) -> Str {
-    let ret_str = np_return_type.get(fn_node)
-    let ta = np_type_ann.get(fn_node)
+    let ret_str = np_return_type.unsafe_get(fn_node)
+    let ta = np_type_ann.unsafe_get(fn_node)
     if ret_str == "Result" {
         if ta != -1 {
-            let elems_sl = np_elements.get(ta)
+            let elems_sl = np_elements.unsafe_get(ta)
             if elems_sl != -1 && sublist_length(elems_sl) >= 2 {
                 let ok_ann = sublist_get(elems_sl, 0)
                 let err_ann = sublist_get(elems_sl, 1)
-                let ok_name = np_name.get(ok_ann)
-                let err_name = np_name.get(err_ann)
+                let ok_name = np_name.unsafe_get(ok_ann)
+                let err_name = np_name.unsafe_get(err_ann)
                 let ok_t = type_from_name(ok_name)
                 let err_t = type_from_name(err_name)
                 let ok_is_type = is_struct_type(ok_name) != 0 || is_enum_type(ok_name) != 0
@@ -656,10 +656,10 @@ pub fn resolve_ret_type_from_ann(fn_node: Int) -> Str {
     }
     if ret_str == "Option" {
         if ta != -1 {
-            let elems_sl = np_elements.get(ta)
+            let elems_sl = np_elements.unsafe_get(ta)
             if elems_sl != -1 && sublist_length(elems_sl) >= 1 {
                 let inner_ann = sublist_get(elems_sl, 0)
-                let inner_name = np_name.get(inner_ann)
+                let inner_name = np_name.unsafe_get(inner_ann)
                 let inner_t = type_from_name(inner_name)
                 if is_struct_type(inner_name) != 0 || is_enum_type(inner_name) != 0 {
                     return "pact_Option_{inner_name}"
@@ -673,16 +673,16 @@ pub fn resolve_ret_type_from_ann(fn_node: Int) -> Str {
 }
 
 pub fn reg_fn_ret_from_ann(name: Str, fn_node: Int) ! Codegen.Register {
-    let ret_str = np_return_type.get(fn_node)
-    let ta = np_type_ann.get(fn_node)
+    let ret_str = np_return_type.unsafe_get(fn_node)
+    let ta = np_type_ann.unsafe_get(fn_node)
     if ret_str == "Result" {
         if ta != -1 {
-            let elems_sl = np_elements.get(ta)
+            let elems_sl = np_elements.unsafe_get(ta)
             if elems_sl != -1 && sublist_length(elems_sl) >= 2 {
                 let ok_ann = sublist_get(elems_sl, 0)
                 let err_ann = sublist_get(elems_sl, 1)
-                let ok_name = np_name.get(ok_ann)
-                let err_name = np_name.get(err_ann)
+                let ok_name = np_name.unsafe_get(ok_ann)
+                let err_name = np_name.unsafe_get(err_ann)
                 let ok_t = type_from_name(ok_name)
                 let err_t = type_from_name(err_name)
                 let ok_is_type = is_struct_type(ok_name) != 0 || is_enum_type(ok_name) != 0
@@ -706,10 +706,10 @@ pub fn reg_fn_ret_from_ann(name: Str, fn_node: Int) ! Codegen.Register {
     }
     if ret_str == "Option" {
         if ta != -1 {
-            let elems_sl = np_elements.get(ta)
+            let elems_sl = np_elements.unsafe_get(ta)
             if elems_sl != -1 && sublist_length(elems_sl) >= 1 {
                 let inner_ann = sublist_get(elems_sl, 0)
-                let inner_name = np_name.get(inner_ann)
+                let inner_name = np_name.unsafe_get(inner_ann)
                 let inner_t = type_from_name(inner_name)
                 reg_fn_ret_type(name, CT_OPTION, inner_t, -1)
                 if is_struct_type(inner_name) != 0 || is_enum_type(inner_name) != 0 {
@@ -725,10 +725,10 @@ pub fn reg_fn_ret_from_ann(name: Str, fn_node: Int) ! Codegen.Register {
         }
     }
     if ret_str == "List" && ta != -1 {
-        let elems_sl = np_elements.get(ta)
+        let elems_sl = np_elements.unsafe_get(ta)
         if elems_sl != -1 && sublist_length(elems_sl) >= 1 {
             let elem_ann = sublist_get(elems_sl, 0)
-            let elem_name = np_name.get(elem_ann)
+            let elem_name = np_name.unsafe_get(elem_ann)
             let elem_t = type_from_name(elem_name)
             reg_fn_ret_type(name, CT_LIST, elem_t, -1)
         }
@@ -738,7 +738,7 @@ pub fn reg_fn_ret_from_ann(name: Str, fn_node: Int) ! Codegen.Register {
 pub fn get_fn_ret_struct_inner(name: Str) -> FnRetStructInner {
     let mut i = fn_ret_struct_inners.len() - 1
     while i >= 0 {
-        let fsi = fn_ret_struct_inners.get(i)
+        let fsi = fn_ret_struct_inners.unsafe_get(i)
         if fsi.name == name {
             return fsi
         }
@@ -756,7 +756,7 @@ pub fn reg_effect(name: Str, parent: Int) -> Int ! Codegen.Register {
 pub fn get_effect_idx(name: Str) -> Int {
     let mut i = 0
     while i < effect_entries.len() {
-        if effect_entries.get(i).name == name {
+        if effect_entries.unsafe_get(i).name == name {
             return i
         }
         i = i + 1
@@ -772,11 +772,11 @@ pub fn effect_satisfies(caller_effect: Str, callee_effect: Str) -> Int {
     if callee_idx == -1 {
         return 0
     }
-    let parent_idx = effect_entries.get(callee_idx).parent
+    let parent_idx = effect_entries.unsafe_get(callee_idx).parent
     if parent_idx == -1 {
         return 0
     }
-    let parent_name = effect_entries.get(parent_idx).name
+    let parent_name = effect_entries.unsafe_get(parent_idx).name
     if parent_name == caller_effect {
         return 1
     }
@@ -799,14 +799,14 @@ pub fn check_effect_propagation(callee_name: Str) ! Diag.Report {
     let mut ci = 0
     while ci < callee_count {
         let callee_eff_node = sublist_get(callee_sl, ci)
-        let callee_eff = np_name.get(callee_eff_node)
+        let callee_eff = np_name.unsafe_get(callee_eff_node)
         let mut satisfied = 0
         if caller_sl != -1 {
             let caller_count = sublist_length(caller_sl)
             let mut ki = 0
             while ki < caller_count {
                 let caller_eff_node = sublist_get(caller_sl, ki)
-                let caller_eff = np_name.get(caller_eff_node)
+                let caller_eff = np_name.unsafe_get(caller_eff_node)
                 if effect_satisfies(caller_eff, callee_eff) != 0 {
                     satisfied = 1
                 }
@@ -834,11 +834,11 @@ pub fn check_capabilities_budget(fn_name: Str, effects_sl: Int) ! Diag.Report {
     let mut ei = 0
     while ei < count {
         let eff_node = sublist_get(effects_sl, ei)
-        let eff_name = np_name.get(eff_node)
+        let eff_name = np_name.unsafe_get(eff_node)
         let mut allowed = 0
         let mut bi = 0
         while bi < cap_budget_names.len() {
-            let budget_eff = cap_budget_names.get(bi)
+            let budget_eff = cap_budget_names.unsafe_get(bi)
             if effect_satisfies(budget_eff, eff_name) != 0 {
                 allowed = 1
             }
@@ -891,7 +891,7 @@ pub fn init_builtin_effects() ! Codegen.Register {
 pub fn get_ue_handle(effect_name: Str) -> Str {
     let mut i = 0
     while i < ue_effects.len() {
-        let ue = ue_effects.get(i)
+        let ue = ue_effects.unsafe_get(i)
         if ue.name == effect_name {
             return ue.handle
         }
@@ -903,7 +903,7 @@ pub fn get_ue_handle(effect_name: Str) -> Str {
 pub fn get_ue_top_for_handle(handle: Str) -> Str {
     let mut i = 0
     while i < ue_effects.len() {
-        let ue = ue_effects.get(i)
+        let ue = ue_effects.unsafe_get(i)
         if ue.handle == handle {
             return ue.name
         }
@@ -915,7 +915,7 @@ pub fn get_ue_top_for_handle(handle: Str) -> Str {
 pub fn is_user_effect_handle(name: Str) -> Int {
     let mut i = 0
     while i < ue_effects.len() {
-        if ue_effects.get(i).handle == name {
+        if ue_effects.unsafe_get(i).handle == name {
             return 1
         }
         i = i + 1
@@ -926,7 +926,7 @@ pub fn is_user_effect_handle(name: Str) -> Int {
 pub fn ue_has_method(handle: Str, method: Str) -> Int {
     let mut i = 0
     while i < ue_methods.len() {
-        let uem = ue_methods.get(i)
+        let uem = ue_methods.unsafe_get(i)
         if uem.effect_handle == handle && uem.name == method {
             return 1
         }
@@ -938,7 +938,7 @@ pub fn ue_has_method(handle: Str, method: Str) -> Int {
 pub fn is_fn_registered(name: Str) -> Int {
     let mut i = 0
     while i < fn_regs.len() {
-        if fn_regs.get(i).name == name {
+        if fn_regs.unsafe_get(i).name == name {
             return 1
         }
         i = i + 1
@@ -949,7 +949,7 @@ pub fn is_fn_registered(name: Str) -> Int {
 pub fn get_fn_ret(name: Str) -> Int {
     let mut i = 0
     while i < fn_regs.len() {
-        let fr = fn_regs.get(i)
+        let fr = fn_regs.unsafe_get(i)
         if fr.name == name {
             return fr.ret
         }
@@ -961,7 +961,7 @@ pub fn get_fn_ret(name: Str) -> Int {
 pub fn set_list_elem_type(name: Str, elem_type: Int) {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
-        let sv = scope_vars.get(i)
+        let sv = scope_vars.unsafe_get(i)
         if sv.name == name && sv.ctype == CT_LIST {
             scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: elem_type, inner2: sv.inner2, sname: sv.sname, sname2: sv.sname2, extra: sv.extra })
             return
@@ -974,7 +974,7 @@ pub fn set_list_elem_type(name: Str, elem_type: Int) {
 pub fn get_list_elem_type(name: Str) -> Int {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
-        let sv = scope_vars.get(i)
+        let sv = scope_vars.unsafe_get(i)
         if sv.name == name && sv.ctype == CT_LIST && sv.inner1 != -1 {
             return sv.inner1
         }
@@ -986,7 +986,7 @@ pub fn get_list_elem_type(name: Str) -> Int {
 pub fn set_list_elem_struct(name: Str, struct_name: Str) {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
-        let sv = scope_vars.get(i)
+        let sv = scope_vars.unsafe_get(i)
         if sv.name == name && sv.ctype == CT_LIST {
             scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: sv.inner2, sname: sv.sname, sname2: struct_name, extra: sv.extra })
             return
@@ -999,7 +999,7 @@ pub fn set_list_elem_struct(name: Str, struct_name: Str) {
 pub fn get_list_elem_struct(name: Str) -> Str {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
-        let sv = scope_vars.get(i)
+        let sv = scope_vars.unsafe_get(i)
         if sv.name == name && sv.ctype == CT_LIST && sv.sname2 != "" {
             return sv.sname2
         }
@@ -1011,7 +1011,7 @@ pub fn get_list_elem_struct(name: Str) -> Str {
 pub fn set_map_types(name: Str, key_type: Int, value_type: Int) {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
-        let sv = scope_vars.get(i)
+        let sv = scope_vars.unsafe_get(i)
         if sv.name == name && sv.ctype == CT_MAP {
             scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: key_type, inner2: value_type, sname: sv.sname, sname2: sv.sname2, extra: sv.extra })
             return
@@ -1024,7 +1024,7 @@ pub fn set_map_types(name: Str, key_type: Int, value_type: Int) {
 pub fn get_map_key_type(name: Str) -> Int {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
-        let sv = scope_vars.get(i)
+        let sv = scope_vars.unsafe_get(i)
         if sv.name == name && sv.ctype == CT_MAP {
             return sv.inner1
         }
@@ -1036,7 +1036,7 @@ pub fn get_map_key_type(name: Str) -> Int {
 pub fn get_map_value_type(name: Str) -> Int {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
-        let sv = scope_vars.get(i)
+        let sv = scope_vars.unsafe_get(i)
         if sv.name == name && sv.ctype == CT_MAP {
             return sv.inner2
         }
@@ -1048,7 +1048,7 @@ pub fn get_map_value_type(name: Str) -> Int {
 pub fn set_map_value_struct(name: Str, struct_name: Str) {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
-        let sv = scope_vars.get(i)
+        let sv = scope_vars.unsafe_get(i)
         if sv.name == name && sv.ctype == CT_MAP {
             scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: sv.inner2, sname: sv.sname, sname2: struct_name, extra: sv.extra })
             return
@@ -1060,7 +1060,7 @@ pub fn set_map_value_struct(name: Str, struct_name: Str) {
 pub fn get_map_value_struct(name: Str) -> Str {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
-        let sv = scope_vars.get(i)
+        let sv = scope_vars.unsafe_get(i)
         if sv.name == name && sv.ctype == CT_MAP {
             return sv.sname2
         }
@@ -1080,9 +1080,9 @@ pub fn is_enum_type(name: Str) -> Int {
 pub fn resolve_variant(name: Str) -> Str {
     let mut i = 0
     while i < enum_variants.len() {
-        let evar = enum_variants.get(i)
+        let evar = enum_variants.unsafe_get(i)
         if evar.name == name {
-            return enum_regs.get(evar.enum_idx).name
+            return enum_regs.unsafe_get(evar.enum_idx).name
         }
         i = i + 1
     }
@@ -1092,7 +1092,7 @@ pub fn resolve_variant(name: Str) -> Str {
 pub fn get_var_enum(name: Str) -> Str {
     let mut i = 0
     while i < var_enums.len() {
-        let ve = var_enums.get(i)
+        let ve = var_enums.unsafe_get(i)
         if ve.name == name {
             return ve.enum_type
         }
@@ -1104,7 +1104,7 @@ pub fn get_var_enum(name: Str) -> Str {
 pub fn is_data_enum(name: Str) -> Int {
     let mut i = 0
     while i < enum_regs.len() {
-        let ereg = enum_regs.get(i)
+        let ereg = enum_regs.unsafe_get(i)
         if ereg.name == name {
             return ereg.has_data
         }
@@ -1116,9 +1116,9 @@ pub fn is_data_enum(name: Str) -> Int {
 pub fn get_variant_index(enum_name: Str, variant_name: Str) -> Int {
     let mut i = 0
     while i < enum_variants.len() {
-        let evar = enum_variants.get(i)
+        let evar = enum_variants.unsafe_get(i)
         if evar.name == variant_name {
-            if enum_regs.get(evar.enum_idx).name == enum_name {
+            if enum_regs.unsafe_get(evar.enum_idx).name == enum_name {
                 return i
             }
         }
@@ -1131,8 +1131,8 @@ pub fn get_variant_tag(enum_name: Str, variant_name: Str) -> Int {
     let mut tag = 0
     let mut i = 0
     while i < enum_variants.len() {
-        let evar = enum_variants.get(i)
-        if enum_regs.get(evar.enum_idx).name == enum_name {
+        let evar = enum_variants.unsafe_get(i)
+        if enum_regs.unsafe_get(evar.enum_idx).name == enum_name {
             if evar.name == variant_name {
                 return tag
             }
@@ -1147,11 +1147,11 @@ pub fn get_variant_field_count(variant_idx: Int) -> Int {
     if variant_idx < 0 || variant_idx >= enum_variants.len() {
         return 0
     }
-    enum_variants.get(variant_idx).field_count
+    enum_variants.unsafe_get(variant_idx).field_count
 }
 
 pub fn get_variant_field_name(variant_idx: Int, field_idx: Int) -> Str {
-    let names_str = enum_variants.get(variant_idx).field_names
+    let names_str = enum_variants.unsafe_get(variant_idx).field_names
     if names_str == "" {
         return ""
     }
@@ -1172,7 +1172,7 @@ pub fn get_variant_field_name(variant_idx: Int, field_idx: Int) -> Str {
 }
 
 pub fn get_variant_field_type_str(variant_idx: Int, field_idx: Int) -> Str {
-    let types_str = enum_variants.get(variant_idx).field_types
+    let types_str = enum_variants.unsafe_get(variant_idx).field_types
     if types_str == "" {
         return ""
     }
@@ -1195,7 +1195,7 @@ pub fn get_variant_field_type_str(variant_idx: Int, field_idx: Int) -> Str {
 pub fn get_fn_enum_ret(name: Str) -> Str {
     let mut i = 0
     while i < fn_enum_rets.len() {
-        let fe = fn_enum_rets.get(i)
+        let fe = fn_enum_rets.unsafe_get(i)
         if fe.name == name {
             return fe.enum_type
         }
@@ -1207,7 +1207,7 @@ pub fn get_fn_enum_ret(name: Str) -> Str {
 pub fn set_var_struct(name: Str, type_name: Str) {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
-        let sv = scope_vars.get(i)
+        let sv = scope_vars.unsafe_get(i)
         if sv.name == name && sv.ctype != CT_CLOSURE {
             scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: sv.inner2, sname: type_name, sname2: sv.sname2, extra: sv.extra })
             return
@@ -1220,7 +1220,7 @@ pub fn set_var_struct(name: Str, type_name: Str) {
 pub fn get_var_struct(name: Str) -> Str {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
-        let sv = scope_vars.get(i)
+        let sv = scope_vars.unsafe_get(i)
         if sv.name == name && sv.ctype != CT_CLOSURE {
             return sv.sname
         }
@@ -1232,7 +1232,7 @@ pub fn get_var_struct(name: Str) -> Str {
 pub fn get_struct_field_type(sname: Str, fname: Str) -> Int {
     let mut i = 0
     while i < sf_entries.len() {
-        let sf = sf_entries.get(i)
+        let sf = sf_entries.unsafe_get(i)
         if sf.struct_name == sname && sf.field_name == fname {
             return sf.field_type
         }
@@ -1244,7 +1244,7 @@ pub fn get_struct_field_type(sname: Str, fname: Str) -> Int {
 pub fn get_struct_field_stype(sname: Str, fname: Str) -> Str {
     let mut i = 0
     while i < sf_entries.len() {
-        let sf = sf_entries.get(i)
+        let sf = sf_entries.unsafe_get(i)
         if sf.struct_name == sname && sf.field_name == fname {
             return sf.stype
         }
@@ -1256,7 +1256,7 @@ pub fn get_struct_field_stype(sname: Str, fname: Str) -> Str {
 pub fn set_var_closure(name: Str, sig: Str) {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
-        let sv = scope_vars.get(i)
+        let sv = scope_vars.unsafe_get(i)
         if sv.name == name && sv.ctype == CT_CLOSURE {
             scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: sv.inner2, sname: sig, sname2: sv.sname2, extra: sv.extra })
             return
@@ -1269,7 +1269,7 @@ pub fn set_var_closure(name: Str, sig: Str) {
 pub fn get_var_closure_sig(name: Str) -> Str {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
-        let sv = scope_vars.get(i)
+        let sv = scope_vars.unsafe_get(i)
         if sv.name == name && sv.ctype == CT_CLOSURE {
             return sv.sname
         }
@@ -1281,7 +1281,7 @@ pub fn get_var_closure_sig(name: Str) -> Str {
 pub fn get_struct_field_closure_sig(struct_name: Str, field_name: Str) -> Str {
     let mut i = 0
     while i < sf_closure_sigs.len() {
-        let e = sf_closure_sigs.get(i)
+        let e = sf_closure_sigs.unsafe_get(i)
         if e.struct_name == struct_name && e.field_name == field_name {
             return e.sig
         }
@@ -1291,15 +1291,15 @@ pub fn get_struct_field_closure_sig(struct_name: Str, field_name: Str) -> Str {
 }
 
 pub fn build_closure_sig_from_type_ann(ta: Int) -> Str {
-    let ret_name = np_return_type.get(ta)
+    let ret_name = np_return_type.unsafe_get(ta)
     let ret_type = type_from_name(ret_name)
-    let elems_sl = np_elements.get(ta)
+    let elems_sl = np_elements.unsafe_get(ta)
     let mut sig_params = "pact_closure*"
     if elems_sl != -1 && sublist_length(elems_sl) > 0 {
         let mut i = 0
         while i < sublist_length(elems_sl) {
             let elem = sublist_get(elems_sl, i)
-            let ename = np_name.get(elem)
+            let ename = np_name.unsafe_get(elem)
             sig_params = sig_params.concat(", ")
             if is_enum_type(ename) != 0 {
                 sig_params = sig_params.concat(c_type_c_name(ename))
@@ -1323,7 +1323,7 @@ pub fn build_closure_sig_from_type_ann(ta: Int) -> Str {
 pub fn is_generic_fn(name: Str) -> Int {
     let mut i = 0
     while i < generic_fns.len() {
-        if generic_fns.get(i).name == name {
+        if generic_fns.unsafe_get(i).name == name {
             return 1
         }
         i = i + 1
@@ -1334,7 +1334,7 @@ pub fn is_generic_fn(name: Str) -> Int {
 pub fn get_generic_fn_node(name: Str) -> Int {
     let mut i = 0
     while i < generic_fns.len() {
-        let gf = generic_fns.get(i)
+        let gf = generic_fns.unsafe_get(i)
         if gf.name == name {
             return gf.node
         }
@@ -1346,7 +1346,7 @@ pub fn get_generic_fn_node(name: Str) -> Int {
 pub fn register_mono_fn(base: Str, args: Str) ! Codegen.Register {
     let mut i = 0
     while i < mono_fns.len() {
-        let mf = mono_fns.get(i)
+        let mf = mono_fns.unsafe_get(i)
         if mf.base == base && mf.args == args {
             return
         }
@@ -1356,7 +1356,7 @@ pub fn register_mono_fn(base: Str, args: Str) ! Codegen.Register {
 }
 
 pub fn infer_fn_type_args_from_types(fn_node: Int, arg_types: List[Int]) -> Str {
-    let tparams_sl = np_type_params.get(fn_node)
+    let tparams_sl = np_type_params.unsafe_get(fn_node)
     if tparams_sl == -1 {
         return ""
     }
@@ -1364,21 +1364,21 @@ pub fn infer_fn_type_args_from_types(fn_node: Int, arg_types: List[Int]) -> Str 
     if num_params == 0 {
         return ""
     }
-    let fn_params_sl = np_params.get(fn_node)
+    let fn_params_sl = np_params.unsafe_get(fn_node)
     if fn_params_sl == -1 {
         return ""
     }
     let mut args = ""
     let mut pi = 0
     while pi < num_params {
-        let param_name = np_name.get(sublist_get(tparams_sl, pi))
+        let param_name = np_name.unsafe_get(sublist_get(tparams_sl, pi))
         let mut resolved = "Void"
         let mut fi = 0
         while fi < sublist_length(fn_params_sl) && fi < arg_types.len() {
             let p = sublist_get(fn_params_sl, fi)
-            let ptype = np_type_name.get(p)
+            let ptype = np_type_name.unsafe_get(p)
             if ptype == param_name {
-                resolved = type_name_from_ct(arg_types.get(fi))
+                resolved = type_name_from_ct(arg_types.unsafe_get(fi))
             }
             fi = fi + 1
         }
@@ -1433,7 +1433,7 @@ pub fn register_mono_instance(base: Str, args: Str) -> Str ! Codegen.Register {
 pub fn lookup_mono_instance(base: Str, args: Str) -> Str {
     let mut i = 0
     while i < mono_instances.len() {
-        let m = mono_instances.get(i)
+        let m = mono_instances.unsafe_get(i)
         if m.base == base && m.args == args {
             return m.c_name
         }
@@ -1445,7 +1445,7 @@ pub fn lookup_mono_instance(base: Str, args: Str) -> Str {
 pub fn is_trait_type(name: Str) -> Int {
     let mut i = 0
     while i < trait_entries.len() {
-        if trait_entries.get(i).name == name {
+        if trait_entries.unsafe_get(i).name == name {
             return 1
         }
         i = i + 1
@@ -1456,12 +1456,12 @@ pub fn is_trait_type(name: Str) -> Int {
 pub fn lookup_impl_method(type_name: Str, method: Str) -> Int {
     let mut i = 0
     while i < impl_entries.len() {
-        let ie = impl_entries.get(i)
+        let ie = impl_entries.unsafe_get(i)
         if ie.type_name == type_name {
             let mut j = 0
             while j < sublist_length(ie.methods_sl) {
                 let m = sublist_get(ie.methods_sl, j)
-                if np_name.get(m) == method {
+                if np_name.unsafe_get(m) == method {
                     return 1
                 }
                 j = j + 1
@@ -1475,7 +1475,7 @@ pub fn lookup_impl_method(type_name: Str, method: Str) -> Int {
 pub fn lookup_impl_type_for_trait(trait_name: Str, type_name: Str) -> Int {
     let mut i = 0
     while i < impl_entries.len() {
-        let ie = impl_entries.get(i)
+        let ie = impl_entries.unsafe_get(i)
         if ie.trait_name == trait_name && ie.type_name == type_name {
             return 1
         }
@@ -1487,13 +1487,13 @@ pub fn lookup_impl_type_for_trait(trait_name: Str, type_name: Str) -> Int {
 pub fn get_impl_method_ret(type_name: Str, method: Str) -> Int {
     let mut i = 0
     while i < impl_entries.len() {
-        let ie = impl_entries.get(i)
+        let ie = impl_entries.unsafe_get(i)
         if ie.type_name == type_name {
             let mut j = 0
             while j < sublist_length(ie.methods_sl) {
                 let m = sublist_get(ie.methods_sl, j)
-                if np_name.get(m) == method {
-                    let ret_str = np_return_type.get(m)
+                if np_name.unsafe_get(m) == method {
+                    let ret_str = np_return_type.unsafe_get(m)
                     return type_from_name(ret_str)
                 }
                 j = j + 1
@@ -1507,7 +1507,7 @@ pub fn get_impl_method_ret(type_name: Str, method: Str) -> Int {
 pub fn find_from_impl(source: Str, target: Str) -> Int {
     let mut i = 0
     while i < from_entries.len() {
-        let fe = from_entries.get(i)
+        let fe = from_entries.unsafe_get(i)
         if fe.source == source && fe.target == target {
             return fe.method_sl
         }
@@ -1519,7 +1519,7 @@ pub fn find_from_impl(source: Str, target: Str) -> Int {
 pub fn find_tryfrom_impl(source: Str, target: Str) -> Int {
     let mut i = 0
     while i < tryfrom_entries.len() {
-        let te = tryfrom_entries.get(i)
+        let te = tryfrom_entries.unsafe_get(i)
         if te.source == source && te.target == target {
             return te.method_sl
         }
@@ -1529,12 +1529,12 @@ pub fn find_tryfrom_impl(source: Str, target: Str) -> Int {
 }
 
 pub fn impl_method_has_self(fn_node: Int) -> Int {
-    let params_sl = np_params.get(fn_node)
+    let params_sl = np_params.unsafe_get(fn_node)
     if params_sl != -1 {
         let mut i = 0
         while i < sublist_length(params_sl) {
             let p = sublist_get(params_sl, i)
-            if np_name.get(p) == "self" {
+            if np_name.unsafe_get(p) == "self" {
                 return 1
             }
             i = i + 1
@@ -1696,7 +1696,7 @@ pub fn ensure_mixed_option_type(inner: Int, inner_struct: Str) {
 pub fn set_var_option(name: Str, inner: Int) {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
-        let sv = scope_vars.get(i)
+        let sv = scope_vars.unsafe_get(i)
         if sv.name == name && sv.ctype == CT_OPTION {
             scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: inner, inner2: sv.inner2, sname: sv.sname, sname2: sv.sname2, extra: sv.extra })
             return
@@ -1709,7 +1709,7 @@ pub fn set_var_option(name: Str, inner: Int) {
 pub fn set_var_option_struct(name: Str, inner: Int, struct_name: Str) {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
-        let sv = scope_vars.get(i)
+        let sv = scope_vars.unsafe_get(i)
         if sv.name == name && sv.ctype == CT_OPTION {
             scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: inner, inner2: sv.inner2, sname: struct_name, sname2: sv.sname2, extra: sv.extra })
             return
@@ -1730,7 +1730,7 @@ pub fn get_var_option_inner_struct(name: Str) -> Str {
 pub fn set_var_result(name: Str, ok_t: Int, err_t: Int) {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
-        let sv = scope_vars.get(i)
+        let sv = scope_vars.unsafe_get(i)
         if sv.name == name && sv.ctype == CT_RESULT {
             scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: ok_t, inner2: err_t, sname: sv.sname, sname2: sv.sname2, extra: sv.extra })
             return
@@ -1743,7 +1743,7 @@ pub fn set_var_result(name: Str, ok_t: Int, err_t: Int) {
 pub fn set_var_result_struct(name: Str, ok_t: Int, err_t: Int, ok_s: Str, err_s: Str) {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
-        let sv = scope_vars.get(i)
+        let sv = scope_vars.unsafe_get(i)
         if sv.name == name && sv.ctype == CT_RESULT {
             scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: ok_t, inner2: err_t, sname: ok_s, sname2: err_s, extra: sv.extra })
             return
@@ -1772,7 +1772,7 @@ pub fn get_var_result_err_struct(name: Str) -> Str {
 pub fn set_var_iterator(name: Str, inner: Int, next_fn: Str) {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
-        let sv = scope_vars.get(i)
+        let sv = scope_vars.unsafe_get(i)
         if sv.name == name && sv.ctype == CT_ITERATOR {
             scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: inner, inner2: sv.inner2, sname: sv.sname, sname2: sv.sname2, extra: next_fn })
             return
@@ -1793,7 +1793,7 @@ pub fn get_var_iter_next_fn(name: Str) -> Str {
 pub fn set_var_alias(name: Str, target: Str) {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
-        let sv = scope_vars.get(i)
+        let sv = scope_vars.unsafe_get(i)
         if sv.name == name {
             scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: sv.inner2, sname: sv.sname, sname2: target, extra: sv.extra })
             return
@@ -1805,7 +1805,7 @@ pub fn set_var_alias(name: Str, target: Str) {
 pub fn get_var_alias(name: Str) -> Str {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
-        let sv = scope_vars.get(i)
+        let sv = scope_vars.unsafe_get(i)
         if sv.name == name && sv.ctype == CT_ITERATOR {
             return sv.sname2
         }
@@ -1817,7 +1817,7 @@ pub fn get_var_alias(name: Str) -> Str {
 pub fn set_var_handle(name: Str, inner: Int) {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
-        let sv = scope_vars.get(i)
+        let sv = scope_vars.unsafe_get(i)
         if sv.name == name && sv.ctype == CT_HANDLE {
             scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: inner, inner2: sv.inner2, sname: sv.sname, sname2: sv.sname2, extra: sv.extra })
             return
@@ -1834,7 +1834,7 @@ pub fn get_var_handle_inner(name: Str) -> Int {
 pub fn set_var_channel(name: Str, inner: Int) {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
-        let sv = scope_vars.get(i)
+        let sv = scope_vars.unsafe_get(i)
         if sv.name == name && sv.ctype == CT_CHANNEL {
             scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: inner, inner2: sv.inner2, sname: sv.sname, sname2: sv.sname2, extra: sv.extra })
             return
@@ -1992,37 +1992,37 @@ pub fn emit_all_iter_types() ! Codegen.Emit {
     }
     let mut i = 0
     while i < emitted_iter_types.len() {
-        emit_list_iter_typedef(emitted_iter_types.get(i))
+        emit_list_iter_typedef(emitted_iter_types.unsafe_get(i))
         i = i + 1
     }
     i = 0
     while i < emitted_map_iters.len() {
-        emit_map_iter_typedef(emitted_map_iters.get(i))
+        emit_map_iter_typedef(emitted_map_iters.unsafe_get(i))
         i = i + 1
     }
     i = 0
     while i < emitted_filter_iters.len() {
-        emit_filter_iter_typedef(emitted_filter_iters.get(i))
+        emit_filter_iter_typedef(emitted_filter_iters.unsafe_get(i))
         i = i + 1
     }
     i = 0
     while i < emitted_take_iters.len() {
-        emit_take_iter_typedef(emitted_take_iters.get(i))
+        emit_take_iter_typedef(emitted_take_iters.unsafe_get(i))
         i = i + 1
     }
     i = 0
     while i < emitted_skip_iters.len() {
-        emit_skip_iter_typedef(emitted_skip_iters.get(i))
+        emit_skip_iter_typedef(emitted_skip_iters.unsafe_get(i))
         i = i + 1
     }
     i = 0
     while i < emitted_chain_iters.len() {
-        emit_chain_iter_typedef(emitted_chain_iters.get(i))
+        emit_chain_iter_typedef(emitted_chain_iters.unsafe_get(i))
         i = i + 1
     }
     i = 0
     while i < emitted_flat_map_iters.len() {
-        emit_flat_map_iter_typedef(emitted_flat_map_iters.get(i))
+        emit_flat_map_iter_typedef(emitted_flat_map_iters.unsafe_get(i))
         i = i + 1
     }
 }
@@ -2030,37 +2030,37 @@ pub fn emit_all_iter_types() ! Codegen.Emit {
 pub fn emit_iter_types_from(list_start: Int, map_start: Int, filter_start: Int, take_start: Int, skip_start: Int, chain_start: Int, flat_map_start: Int) ! Codegen.Emit {
     let mut i = list_start
     while i < emitted_iter_types.len() {
-        emit_list_iter_typedef(emitted_iter_types.get(i))
+        emit_list_iter_typedef(emitted_iter_types.unsafe_get(i))
         i = i + 1
     }
     i = map_start
     while i < emitted_map_iters.len() {
-        emit_map_iter_typedef(emitted_map_iters.get(i))
+        emit_map_iter_typedef(emitted_map_iters.unsafe_get(i))
         i = i + 1
     }
     i = filter_start
     while i < emitted_filter_iters.len() {
-        emit_filter_iter_typedef(emitted_filter_iters.get(i))
+        emit_filter_iter_typedef(emitted_filter_iters.unsafe_get(i))
         i = i + 1
     }
     i = take_start
     while i < emitted_take_iters.len() {
-        emit_take_iter_typedef(emitted_take_iters.get(i))
+        emit_take_iter_typedef(emitted_take_iters.unsafe_get(i))
         i = i + 1
     }
     i = skip_start
     while i < emitted_skip_iters.len() {
-        emit_skip_iter_typedef(emitted_skip_iters.get(i))
+        emit_skip_iter_typedef(emitted_skip_iters.unsafe_get(i))
         i = i + 1
     }
     i = chain_start
     while i < emitted_chain_iters.len() {
-        emit_chain_iter_typedef(emitted_chain_iters.get(i))
+        emit_chain_iter_typedef(emitted_chain_iters.unsafe_get(i))
         i = i + 1
     }
     i = flat_map_start
     while i < emitted_flat_map_iters.len() {
-        emit_flat_map_iter_typedef(emitted_flat_map_iters.get(i))
+        emit_flat_map_iter_typedef(emitted_flat_map_iters.unsafe_get(i))
         i = i + 1
     }
 }
@@ -2068,7 +2068,7 @@ pub fn emit_iter_types_from(list_start: Int, map_start: Int, filter_start: Int, 
 pub fn has_int_in_list(lst: List[Int], val: Int) -> Bool {
     let mut i = 0
     while i < lst.len() {
-        if lst.get(i) == val {
+        if lst.unsafe_get(i) == val {
             return true
         }
         i = i + 1
@@ -2225,12 +2225,12 @@ pub fn emit_flat_map_iter_typedef(inner: Int) ! Codegen.Emit {
 pub fn emit_all_option_result_types() ! Codegen.Emit {
     let mut i = 0
     while i < emitted_option_types.len() {
-        emit_option_typedef(emitted_option_types.get(i))
+        emit_option_typedef(emitted_option_types.unsafe_get(i))
         i = i + 1
     }
     i = 0
     while i < emitted_result_types.len() {
-        let key = emitted_result_types.get(i)
+        let key = emitted_result_types.unsafe_get(i)
         let mut sep = 0
         let mut j = 0
         while j < key.len() {
@@ -2258,12 +2258,12 @@ pub fn emit_all_option_result_types() ! Codegen.Emit {
     }
     i = 0
     while i < emitted_struct_option_types.len() {
-        emit_struct_option_typedef(emitted_struct_option_types.get(i))
+        emit_struct_option_typedef(emitted_struct_option_types.unsafe_get(i))
         i = i + 1
     }
     i = 0
     while i < emitted_struct_result_types.len() {
-        let key = emitted_struct_result_types.get(i)
+        let key = emitted_struct_result_types.unsafe_get(i)
         let prefix_len = 2
         let stripped = key.substring(prefix_len, key.len() - prefix_len)
         let mut sep = 0
@@ -2284,12 +2284,12 @@ pub fn emit_all_option_result_types() ! Codegen.Emit {
 pub fn emit_option_result_types_from(opt_start: Int, res_start: Int, s_opt_start: Int, s_res_start: Int) ! Codegen.Emit {
     let mut i = opt_start
     while i < emitted_option_types.len() {
-        emit_option_typedef(emitted_option_types.get(i))
+        emit_option_typedef(emitted_option_types.unsafe_get(i))
         i = i + 1
     }
     i = res_start
     while i < emitted_result_types.len() {
-        let key = emitted_result_types.get(i)
+        let key = emitted_result_types.unsafe_get(i)
         let mut sep = 0
         let mut j = 0
         while j < key.len() {
@@ -2317,12 +2317,12 @@ pub fn emit_option_result_types_from(opt_start: Int, res_start: Int, s_opt_start
     }
     i = s_opt_start
     while i < emitted_struct_option_types.len() {
-        emit_struct_option_typedef(emitted_struct_option_types.get(i))
+        emit_struct_option_typedef(emitted_struct_option_types.unsafe_get(i))
         i = i + 1
     }
     i = s_res_start
     while i < emitted_struct_result_types.len() {
-        let key = emitted_struct_result_types.get(i)
+        let key = emitted_struct_result_types.unsafe_get(i)
         let prefix_len = 2
         let stripped = key.substring(prefix_len, key.len() - prefix_len)
         let mut sep = 0
@@ -2367,7 +2367,7 @@ pub fn join_lines() -> Str ! Codegen.Emit {
         if i > 0 {
             result = result.concat("\n")
         }
-        result = result.concat(cg_lines.get(i))
+        result = result.concat(cg_lines.unsafe_get(i))
         i = i + 1
     }
     result

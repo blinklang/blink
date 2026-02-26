@@ -170,11 +170,11 @@ fn main() {
     let doubled = nums.map(fn(x: Int) -> Int { x * 2 }).collect()
     let mut map_ok = 1
     if doubled.len() != 5 { map_ok = 0 }
-    if doubled.get(0) != 2 { map_ok = 0 }
-    if doubled.get(1) != 4 { map_ok = 0 }
-    if doubled.get(2) != 6 { map_ok = 0 }
-    if doubled.get(3) != 8 { map_ok = 0 }
-    if doubled.get(4) != 10 { map_ok = 0 }
+    if doubled.unsafe_get(0) != 2 { map_ok = 0 }
+    if doubled.unsafe_get(1) != 4 { map_ok = 0 }
+    if doubled.unsafe_get(2) != 6 { map_ok = 0 }
+    if doubled.unsafe_get(3) != 8 { map_ok = 0 }
+    if doubled.unsafe_get(4) != 10 { map_ok = 0 }
     if map_ok == 1 {
         io.println("ok: map doubles [1..5] = [2,4,6,8,10]")
         pass = pass + 1
@@ -197,8 +197,8 @@ fn main() {
     let evens = nums.filter(fn(x: Int) -> Bool { x % 2 == 0 }).collect()
     let mut filt_ok = 1
     if evens.len() != 2 { filt_ok = 0 }
-    if evens.get(0) != 2 { filt_ok = 0 }
-    if evens.get(1) != 4 { filt_ok = 0 }
+    if evens.unsafe_get(0) != 2 { filt_ok = 0 }
+    if evens.unsafe_get(1) != 4 { filt_ok = 0 }
     if filt_ok == 1 {
         io.println("ok: filter evens = [2, 4]")
         pass = pass + 1
@@ -230,9 +230,9 @@ fn main() {
     let first3 = nums.take(3).collect()
     let mut take_ok = 1
     if first3.len() != 3 { take_ok = 0 }
-    if first3.get(0) != 1 { take_ok = 0 }
-    if first3.get(1) != 2 { take_ok = 0 }
-    if first3.get(2) != 3 { take_ok = 0 }
+    if first3.unsafe_get(0) != 1 { take_ok = 0 }
+    if first3.unsafe_get(1) != 2 { take_ok = 0 }
+    if first3.unsafe_get(2) != 3 { take_ok = 0 }
     if take_ok == 1 {
         io.println("ok: take 3 = [1, 2, 3]")
         pass = pass + 1
@@ -264,9 +264,9 @@ fn main() {
     let after2 = nums.skip(2).collect()
     let mut skip_ok = 1
     if after2.len() != 3 { skip_ok = 0 }
-    if after2.get(0) != 3 { skip_ok = 0 }
-    if after2.get(1) != 4 { skip_ok = 0 }
-    if after2.get(2) != 5 { skip_ok = 0 }
+    if after2.unsafe_get(0) != 3 { skip_ok = 0 }
+    if after2.unsafe_get(1) != 4 { skip_ok = 0 }
+    if after2.unsafe_get(2) != 5 { skip_ok = 0 }
     if skip_ok == 1 {
         io.println("ok: skip 2 = [3, 4, 5]")
         pass = pass + 1
@@ -298,9 +298,9 @@ fn main() {
     let chain1 = nums.filter(fn(x: Int) -> Bool { x % 2 != 0 }).map(fn(x: Int) -> Int { x * 10 }).collect()
     let mut ch1_ok = 1
     if chain1.len() != 3 { ch1_ok = 0 }
-    if chain1.get(0) != 10 { ch1_ok = 0 }
-    if chain1.get(1) != 30 { ch1_ok = 0 }
-    if chain1.get(2) != 50 { ch1_ok = 0 }
+    if chain1.unsafe_get(0) != 10 { ch1_ok = 0 }
+    if chain1.unsafe_get(1) != 30 { ch1_ok = 0 }
+    if chain1.unsafe_get(2) != 50 { ch1_ok = 0 }
     if ch1_ok == 1 {
         io.println("ok: filter odds then map *10 = [10, 30, 50]")
         pass = pass + 1
@@ -312,9 +312,9 @@ fn main() {
     let chain2 = nums.map(fn(x: Int) -> Int { x * x }).filter(fn(x: Int) -> Bool { x > 5 }).collect()
     let mut ch2_ok = 1
     if chain2.len() != 3 { ch2_ok = 0 }
-    if chain2.get(0) != 9 { ch2_ok = 0 }
-    if chain2.get(1) != 16 { ch2_ok = 0 }
-    if chain2.get(2) != 25 { ch2_ok = 0 }
+    if chain2.unsafe_get(0) != 9 { ch2_ok = 0 }
+    if chain2.unsafe_get(1) != 16 { ch2_ok = 0 }
+    if chain2.unsafe_get(2) != 25 { ch2_ok = 0 }
     if ch2_ok == 1 {
         io.println("ok: map squares then filter > 5 = [9, 16, 25]")
         pass = pass + 1
@@ -326,8 +326,8 @@ fn main() {
     let chain3 = nums.filter(fn(x: Int) -> Bool { x > 2 }).take(2).collect()
     let mut ch3_ok = 1
     if chain3.len() != 2 { ch3_ok = 0 }
-    if chain3.get(0) != 3 { ch3_ok = 0 }
-    if chain3.get(1) != 4 { ch3_ok = 0 }
+    if chain3.unsafe_get(0) != 3 { ch3_ok = 0 }
+    if chain3.unsafe_get(1) != 4 { ch3_ok = 0 }
     if ch3_ok == 1 {
         io.println("ok: filter > 2 then take 2 = [3, 4]")
         pass = pass + 1

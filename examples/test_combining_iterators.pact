@@ -24,11 +24,11 @@ fn main() {
     }
 
     let mut chain_ok = 1
-    if chained.get(0) != 1 { chain_ok = 0 }
-    if chained.get(1) != 2 { chain_ok = 0 }
-    if chained.get(2) != 3 { chain_ok = 0 }
-    if chained.get(3) != 4 { chain_ok = 0 }
-    if chained.get(4) != 5 { chain_ok = 0 }
+    if chained.unsafe_get(0) != 1 { chain_ok = 0 }
+    if chained.unsafe_get(1) != 2 { chain_ok = 0 }
+    if chained.unsafe_get(2) != 3 { chain_ok = 0 }
+    if chained.unsafe_get(3) != 4 { chain_ok = 0 }
+    if chained.unsafe_get(4) != 5 { chain_ok = 0 }
     if chain_ok == 1 {
         io.println("ok: chain values = [1, 2, 3, 4, 5]")
         pass = pass + 1
@@ -86,9 +86,9 @@ fn main() {
         fail = fail + 1
     }
 
-    let pair0 = enumerated.get(0)
-    let idx0 = pair0.get(0)
-    let val0 = pair0.get(1)
+    let pair0 = enumerated.unsafe_get(0)
+    let idx0 = pair0.unsafe_get(0)
+    let val0 = pair0.unsafe_get(1)
     if idx0 == 0 && val0 == 1 {
         io.println("ok: enumerate[0] = (0, 1)")
         pass = pass + 1
@@ -97,9 +97,9 @@ fn main() {
         fail = fail + 1
     }
 
-    let pair1 = enumerated.get(1)
-    let idx1 = pair1.get(0)
-    let val1 = pair1.get(1)
+    let pair1 = enumerated.unsafe_get(1)
+    let idx1 = pair1.unsafe_get(0)
+    let val1 = pair1.unsafe_get(1)
     if idx1 == 1 && val1 == 2 {
         io.println("ok: enumerate[1] = (1, 2)")
         pass = pass + 1
@@ -108,9 +108,9 @@ fn main() {
         fail = fail + 1
     }
 
-    let pair2 = enumerated.get(2)
-    let idx2 = pair2.get(0)
-    let val2 = pair2.get(1)
+    let pair2 = enumerated.unsafe_get(2)
+    let idx2 = pair2.unsafe_get(0)
+    let val2 = pair2.unsafe_get(1)
     if idx2 == 2 && val2 == 3 {
         io.println("ok: enumerate[2] = (2, 3)")
         pass = pass + 1
@@ -149,9 +149,9 @@ fn main() {
         fail = fail + 1
     }
 
-    let zp0 = zipped.get(0)
-    let zp0_a = zp0.get(0)
-    let zp0_b = zp0.get(1)
+    let zp0 = zipped.unsafe_get(0)
+    let zp0_a = zp0.unsafe_get(0)
+    let zp0_b = zp0.unsafe_get(1)
     if zp0_a == 10 && zp0_b == 1 {
         io.println("ok: zip[0] = (10, 1)")
         pass = pass + 1
@@ -160,9 +160,9 @@ fn main() {
         fail = fail + 1
     }
 
-    let zp2 = zipped.get(2)
-    let zp2_a = zp2.get(0)
-    let zp2_b = zp2.get(1)
+    let zp2 = zipped.unsafe_get(2)
+    let zp2_a = zp2.unsafe_get(0)
+    let zp2_b = zp2.unsafe_get(1)
     if zp2_a == 30 && zp2_b == 3 {
         io.println("ok: zip[2] = (30, 3)")
         pass = pass + 1
@@ -185,9 +185,9 @@ fn main() {
         fail = fail + 1
     }
 
-    let zps0 = zip_short.get(0)
-    let zps0_a = zps0.get(0)
-    let zps0_b = zps0.get(1)
+    let zps0 = zip_short.unsafe_get(0)
+    let zps0_a = zps0.unsafe_get(0)
+    let zps0_b = zps0.unsafe_get(1)
     if zps0_a == 10 && zps0_b == 100 {
         io.println("ok: zip_short[0] = (10, 100)")
         pass = pass + 1

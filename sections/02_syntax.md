@@ -98,6 +98,55 @@ With universal interpolation, `"Hello, {name}!"` just works. When no `{expr}` is
 
 **Context-sensitive interpolation.** When an interpolated string literal appears where `Query[C]` is expected (e.g., `db.query_one("SELECT * FROM users WHERE id = {id}")`), the compiler extracts `{expr}` as bound parameters instead of concatenating. The *receiving type* determines behavior: `{id}` in a `Str` context is concatenation, `{id}` in a `Query[DB]` context is parameterization. No new string syntax is needed — the same `"..."` literal does the right thing based on where it appears. See section 3.12 for details.
 
+#### 2.4.1 Compile-Time Intrinsics (`#`)
+
+Pact uses the `#` prefix for **compile-time intrinsics** — expressions evaluated by the compiler during compilation, not at runtime. The `#` sigil visually distinguishes compile-time evaluation from runtime function calls, following Swift's precedent (`#file`, `#line`, `#embed`).
+
+##### `#embed` — File Inclusion
+
+For embedding large text content (documentation, templates, SQL, test fixtures), use `#embed` to include file contents at compile time:
+
+```pact
+const EMAIL_TEMPLATE: Str = #embed("templates/email.html")
+const SCHEMA: Str = #embed("sql/schema.sql")
+```
+
+Rules:
+- Path resolved relative to source file's directory
+- File read at compile time; contents become a `Str` literal in the binary
+- No interpolation, no escape processing on file contents
+- Type is `Str`. Works everywhere `Str` works
+- Compile error E1108 if file not found
+- Argument must be a string literal (no variables, no interpolation)
+
+When to use `#embed` vs inline strings:
+- **Inline**: short strings, strings needing interpolation
+- **`#embed`**: large text blobs, content with many special characters, templates
+
+```pact
+fn print_help() ! IO {
+    const HELP_TEXT: Str = #embed("docs/help.txt")
+    io.println(HELP_TEXT)
+}
+```
+
+##### Future Intrinsics (v2+)
+
+The `#` prefix is reserved for additional compile-time intrinsics:
+
+| Intrinsic | Type | Purpose |
+|-----------|------|---------|
+| `#embed("path")` | `Str` | File contents (v1) |
+| `#env("VAR")` | `Str` | Build-time environment variable |
+| `#version()` | `Str` | Package version from pact.toml |
+| `#target()` | `Str` | Compilation target (OS/arch) |
+| `#file()` | `Str` | Current source file path |
+| `#line()` | `Int` | Current source line number |
+
+All `#` intrinsics share the same rules: evaluated at compile time, arguments must be literals, results are baked into the binary.
+
+**Panel vote: 5-0** for compile-time file inclusion (resolving the raw/uninterpolated string gap). **5-0** for `#` sigil as compile-time intrinsic category (over `$` and unsigiled builtins). No new string syntax — the locked "one string syntax" decision is preserved. See [DECISIONS.md](../DECISIONS.md).
+
 ### 2.5 Contested: No Semicolons
 
 **Winner: newlines (voted as locked decision)**

@@ -233,6 +233,7 @@ The first `///` line declares human intent — structured, versioned, queryable.
 4. **Make correctness cheap.** Types → effects → contracts → tests. Each layer catches more bugs for less effort.
 5. **Effects are capabilities.** A function that doesn't declare `! Net` cannot touch the network. Period.
 6. **Precise, not verbose.** Explicit at boundaries, terse within them. Every piece of information appears exactly once.
+7. **Errors are the teaching signal.** Every diagnostic includes a machine-applicable fix. The language is designed so errors are unambiguously correctable.
 
 ---
 
@@ -287,7 +288,14 @@ pact daemon stop               # Stop running daemon
 # AST inspection
 pact ast <file>                # Dump parsed AST as JSON
 
+# LLM reference
+pact llms                      # Print short language reference
+pact llms --full               # Print full language reference
+pact llms --list               # List available topics
+pact llms --topic <name>       # Print a specific topic
+
 # Global options
+pact --version                 # Print version
 --format json                  # Machine-readable JSON diagnostics
 --json                         # JSON output (shorthand)
 ```

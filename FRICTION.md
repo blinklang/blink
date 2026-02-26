@@ -224,6 +224,13 @@ Source: `ai` (Claude) | `human` | `both`
 - **Context:** Inlining the compiler pipeline into the CLI binary brought lexer, toml, and json modules together for the first time
 - **Description:** `is_emitted_fn()` in codegen_types.pact checks the bare Pact function name (e.g., `is_alpha`), not the module-qualified C name (e.g., `pact_lexer_is_alpha`). When two modules define functions with the same name but different bodies, the first one emitted wins — the second is silently dropped. The `mod_fn_prefix` map is also keyed on bare name, so last-registered module prefix overwrites earlier ones. This caused: (1) toml's `is_alpha` (no underscore) replacing lexer's `is_alpha` (with underscore), breaking all identifier parsing; (2) json's `is_ws` (includes newlines) replacing toml's `is_ws` (space+tab only). Workaround: renamed colliding functions with module prefixes (`toml_is_alpha`, `toml_is_ws`, `toml_skip_ws`). Proper fix: dedup on fully-qualified C name, or key `mod_fn_prefix` on `(module, name)` tuples.
 
+### 2026-02-25 — No raw string syntax makes embedding text content impossible
+- **Category:** `spec-gap`
+- **Severity:** `blocking`
+- **Source:** `both`
+- **Context:** Trying to embed llms reference text as a string literal in cli.pact
+- **Description:** The spec deliberately chose "one string syntax" with universal interpolation and double quotes only — no raw strings, no backticks, no single quotes. This makes it impossible to embed large text blobs containing `{`, `}`, and `"` characters without escaping every one. Use cases: embedding documentation, regex patterns, code templates, test fixtures. Even `\{` escaping exists but manually escaping thousands of characters is impractical. A raw string syntax (e.g., `r"..."` or triple-quoted `"""..."""`) is needed for any serious text embedding.
+
 ### 2026-02-25 — CLI argparser lacks command-scoped flags and routing
 - **Category:** `tooling`
 - **Severity:** `annoying`

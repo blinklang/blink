@@ -10,7 +10,7 @@ fn main() ! IO {
     points.push(Point { x: 3, y: 4 })
     points.push(make_point(5, 6))
 
-    let p = points.get(0)
+    let p = points.unsafe_get(0)
     io.println("x={p.x} y={p.y}")
 
     io.println("len={points.len()}")

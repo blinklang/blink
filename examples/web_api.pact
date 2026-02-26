@@ -64,8 +64,8 @@ pub fn handle_get_user(req: Request) -> Response ! IO, DB.Read {
 
 /// HTTP handler: POST /users
 pub fn handle_create_user(req: Request) -> Response ! IO, DB.Write {
-    let name = req.body().get("name")?.as_str() ?? return Response.bad_request("Missing name")
-    let email = req.body().get("email")?.as_str() ?? return Response.bad_request("Missing email")
+    let name = req.body().unsafe_get("name")?.as_str() ?? return Response.bad_request("Missing name")
+    let email = req.body().unsafe_get("email")?.as_str() ?? return Response.bad_request("Missing email")
     match create_user(name, email) {
         Ok(user) => Response.json(user).with_status(201)
         Err(e) => Response.internal_error("{e}")

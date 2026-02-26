@@ -84,6 +84,10 @@ static void* pact_list_get(const pact_list* l, int64_t index) {
     return l->items[index];
 }
 
+static int pact_list_in_bounds(const pact_list* l, int64_t index) {
+    return (index >= 0 && index < l->len);
+}
+
 static int64_t pact_list_len(const pact_list* l) {
     return l->len;
 }

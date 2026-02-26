@@ -1210,7 +1210,7 @@ typedef struct {
 } pact_handler_DB;
 ```
 
-Handler values are heap-allocated via the GC. Storing a handler in a struct field or list copies the struct (function pointers are plain pointers; `state` is a GC root). The evidence-passing model (§4.5, Codegen Backend in DECISIONS.md) installs handler vtables into the evidence vector when entering a `with` block.
+Handler values are heap-allocated via the GC. Storing a handler in a struct field or list copies the struct (function pointers are plain pointers; `state` is a GC root). The evidence-passing model (§4.5, [Codegen Backend rationale](../decisions/codegen-backend-bootstrap.md)) installs handler vtables into the evidence vector when entering a `with` block.
 
 Effect projection (`Handler[DB]` → `Handler[DB.Read]`) generates a new struct containing only the relevant function pointer slots, populated from the source handler.
 
@@ -1838,7 +1838,7 @@ Here `! IO.Log, _` means: this function always requires `IO.Log` (for its own lo
 
 #### 4.15.3 Compilation
 
-Effect polymorphism compiles via the existing evidence-passing model (§4.2, Codegen Backend in DECISIONS.md):
+Effect polymorphism compiles via the existing evidence-passing model (§4.2, [Codegen Backend rationale](../decisions/codegen-backend-bootstrap.md)):
 
 - **Concrete effect function types** (`fn(T) -> U ! IO.Log`): The callback receives the caller's evidence vector. The compiler verifies the caller holds the required effect slots at the call site. Zero additional overhead — same as any effectful function call.
 

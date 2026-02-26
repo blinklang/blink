@@ -1399,7 +1399,7 @@ Traits also support retroactive implementation -- you can implement a trait for 
 
 #### Trait Coherence
 
-Coherence guarantees that for any (Trait, Type) pair, at most one implementation exists in the entire program. This invariant is essential -- trait dispatch must be deterministic, and evidence-passing compilation (§DECISIONS.md, Codegen Backend) requires exactly one vtable per (Trait, Type) pair at every call site.
+Coherence guarantees that for any (Trait, Type) pair, at most one implementation exists in the entire program. This invariant is essential -- trait dispatch must be deterministic, and evidence-passing compilation ([Codegen Backend rationale](../decisions/codegen-backend-bootstrap.md)) requires exactly one vtable per (Trait, Type) pair at every call site.
 
 Three rules enforce coherence: the orphan rule, the overlap rule, and the impl placement rule.
 

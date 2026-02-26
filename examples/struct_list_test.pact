@@ -33,7 +33,7 @@ fn main() {
 
     // For-in over range with list.get
     for i in 0..4 {
-        io.println("nums[{i}] = {nums.get(i)}")
+        io.println("nums[{i}] = {nums.unsafe_get(i)}")
     }
 
     // String methods

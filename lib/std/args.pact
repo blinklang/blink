@@ -109,7 +109,7 @@ pub fn command_add_flag(p: ArgParser, cmd_name: Str, long_name: Str, short_name:
     let mut cmds: List[CommandDef] = []
     let mut i = 0
     while i < p.commands.len() {
-        let c = p.commands.get(i)
+        let c = p.commands.unsafe_get(i)
         if c.name == cmd_name {
             let mut flags = c.flags
             flags.push(FlagDef { long_name: long_name, short_name: short_name, description: desc })
@@ -133,7 +133,7 @@ pub fn command_add_option(p: ArgParser, cmd_name: Str, long_name: Str, short_nam
     let mut cmds: List[CommandDef] = []
     let mut i = 0
     while i < p.commands.len() {
-        let c = p.commands.get(i)
+        let c = p.commands.unsafe_get(i)
         if c.name == cmd_name {
             let mut opts = c.options
             opts.push(OptionDef { long_name: long_name, short_name: short_name, description: desc, default_val: "" })
@@ -166,7 +166,7 @@ fn strip_dashes(s: Str) -> Str {
 fn resolve_flag_name(p: ArgParser, arg: Str) -> Str {
     let mut i = 0
     while i < p.flags.len() {
-        let f = p.flags.get(i)
+        let f = p.flags.unsafe_get(i)
         if f.long_name == arg || f.short_name == arg {
             return strip_dashes(f.long_name)
         }
@@ -178,7 +178,7 @@ fn resolve_flag_name(p: ArgParser, arg: Str) -> Str {
 fn resolve_option_name(p: ArgParser, arg: Str) -> Str {
     let mut i = 0
     while i < p.options.len() {
-        let o = p.options.get(i)
+        let o = p.options.unsafe_get(i)
         if o.long_name == arg || o.short_name == arg {
             return strip_dashes(o.long_name)
         }
@@ -188,10 +188,10 @@ fn resolve_option_name(p: ArgParser, arg: Str) -> Str {
 }
 
 fn resolve_cmd_flag_name(p: ArgParser, cmd_idx: Int, arg: Str) -> Str {
-    let cmd = p.commands.get(cmd_idx)
+    let cmd = p.commands.unsafe_get(cmd_idx)
     let mut i = 0
     while i < cmd.flags.len() {
-        let f = cmd.flags.get(i)
+        let f = cmd.flags.unsafe_get(i)
         if f.long_name == arg || f.short_name == arg {
             return strip_dashes(f.long_name)
         }
@@ -201,10 +201,10 @@ fn resolve_cmd_flag_name(p: ArgParser, cmd_idx: Int, arg: Str) -> Str {
 }
 
 fn resolve_cmd_option_name(p: ArgParser, cmd_idx: Int, arg: Str) -> Str {
-    let cmd = p.commands.get(cmd_idx)
+    let cmd = p.commands.unsafe_get(cmd_idx)
     let mut i = 0
     while i < cmd.options.len() {
-        let o = cmd.options.get(i)
+        let o = cmd.options.unsafe_get(i)
         if o.long_name == arg || o.short_name == arg {
             return strip_dashes(o.long_name)
         }
@@ -216,7 +216,7 @@ fn resolve_cmd_option_name(p: ArgParser, cmd_idx: Int, arg: Str) -> Str {
 fn find_command_idx(p: ArgParser, name: Str) -> Int {
     let mut i = 0
     while i < p.commands.len() {
-        let c = p.commands.get(i)
+        let c = p.commands.unsafe_get(i)
         if c.name == name {
             return i
         }
@@ -327,7 +327,7 @@ pub fn argparse(p: ArgParser) -> Args {
 pub fn args_has(a: Args, name: Str) -> Bool {
     let mut i = 0
     while i < a.flag_names.len() {
-        if a.flag_names.get(i) == name {
+        if a.flag_names.unsafe_get(i) == name {
             return true
         }
         i = i + 1
@@ -338,8 +338,8 @@ pub fn args_has(a: Args, name: Str) -> Bool {
 pub fn args_get(a: Args, name: Str) -> Str {
     let mut i = 0
     while i < a.option_keys.len() {
-        if a.option_keys.get(i) == name {
-            return a.option_vals.get(i)
+        if a.option_keys.unsafe_get(i) == name {
+            return a.option_vals.unsafe_get(i)
         }
         i = i + 1
     }
@@ -352,7 +352,7 @@ pub fn args_command(a: Args) -> Str {
 
 pub fn args_positional(a: Args, idx: Int) -> Str {
     if idx < a.positional_vals.len() {
-        return a.positional_vals.get(idx)
+        return a.positional_vals.unsafe_get(idx)
     }
     ""
 }
@@ -371,7 +371,7 @@ pub fn generate_help(p: ArgParser) -> Str {
     }
     let mut pi = 0
     while pi < p.positionals.len() {
-        let pos = p.positionals.get(pi)
+        let pos = p.positionals.unsafe_get(pi)
         h = h.concat(" <{pos.name}>")
         pi = pi + 1
     }
@@ -381,7 +381,7 @@ pub fn generate_help(p: ArgParser) -> Str {
         h = h.concat("\nCommands:\n")
         let mut ci = 0
         while ci < p.commands.len() {
-            let cmd = p.commands.get(ci)
+            let cmd = p.commands.unsafe_get(ci)
             h = h.concat("  {cmd.name}")
             h = h.concat("    {cmd.description}\n")
             ci = ci + 1
@@ -392,7 +392,7 @@ pub fn generate_help(p: ArgParser) -> Str {
         h = h.concat("\nFlags:\n")
         let mut fi = 0
         while fi < p.flags.len() {
-            let f = p.flags.get(fi)
+            let f = p.flags.unsafe_get(fi)
             h = h.concat("  {f.long_name}")
             if f.short_name != "" {
                 h = h.concat(", {f.short_name}")
@@ -406,7 +406,7 @@ pub fn generate_help(p: ArgParser) -> Str {
         h = h.concat("\nOptions:\n")
         let mut oi = 0
         while oi < p.options.len() {
-            let o = p.options.get(oi)
+            let o = p.options.unsafe_get(oi)
             h = h.concat("  {o.long_name}")
             if o.short_name != "" {
                 h = h.concat(", {o.short_name}")

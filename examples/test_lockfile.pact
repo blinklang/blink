@@ -65,13 +65,13 @@ fn test_write_and_load() {
     check_int(lockfile_pkg_count(), 3, "loaded 3 packages")
 
     // Should be sorted alphabetically: acme/auth, std/http, std/json
-    check_str(lock_pkg_names.get(0), "acme/auth", "sorted first: acme/auth")
-    check_str(lock_pkg_names.get(1), "std/http", "sorted second: std/http")
-    check_str(lock_pkg_names.get(2), "std/json", "sorted third: std/json")
+    check_str(lock_pkg_names.unsafe_get(0), "acme/auth", "sorted first: acme/auth")
+    check_str(lock_pkg_names.unsafe_get(1), "std/http", "sorted second: std/http")
+    check_str(lock_pkg_names.unsafe_get(2), "std/json", "sorted third: std/json")
 
-    check_str(lock_pkg_hashes.get(0), "sha256:789ghi", "acme/auth hash")
-    check_str(lock_pkg_hashes.get(1), "sha256:abc123", "std/http hash")
-    check_str(lock_pkg_caps.get(1), "Net.Connect,Net.DNS", "std/http caps")
+    check_str(lock_pkg_hashes.unsafe_get(0), "sha256:789ghi", "acme/auth hash")
+    check_str(lock_pkg_hashes.unsafe_get(1), "sha256:abc123", "std/http hash")
+    check_str(lock_pkg_caps.unsafe_get(1), "Net.Connect,Net.DNS", "std/http caps")
 }
 
 fn test_load_missing_file() {
@@ -91,9 +91,9 @@ fn test_sort_determinism() {
 
     lockfile_clear()
     lockfile_load("/tmp/test_sort.lock")
-    check_str(lock_pkg_names.get(0), "aaa/first", "sort: first")
-    check_str(lock_pkg_names.get(1), "mmm/middle", "sort: middle")
-    check_str(lock_pkg_names.get(2), "zzz/last", "sort: last")
+    check_str(lock_pkg_names.unsafe_get(0), "aaa/first", "sort: first")
+    check_str(lock_pkg_names.unsafe_get(1), "mmm/middle", "sort: middle")
+    check_str(lock_pkg_names.unsafe_get(2), "zzz/last", "sort: last")
 }
 
 fn test_caps_format() {
@@ -106,8 +106,8 @@ fn test_caps_format() {
 
     lockfile_clear()
     lockfile_load("/tmp/test_caps.lock")
-    check_str(lock_pkg_caps.get(0), "Net.Connect,FS.Read,IO.Log", "multi caps round-trip")
-    check_str(lock_pkg_caps.get(1), "", "empty caps round-trip")
+    check_str(lock_pkg_caps.unsafe_get(0), "Net.Connect,FS.Read,IO.Log", "multi caps round-trip")
+    check_str(lock_pkg_caps.unsafe_get(1), "", "empty caps round-trip")
 }
 
 fn main() {

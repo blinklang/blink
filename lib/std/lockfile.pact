@@ -39,7 +39,7 @@ pub fn lockfile_pkg_count() -> Int {
 pub fn lockfile_find_pkg(name: Str) -> Int {
     let mut i = 0
     while i < lock_pkg_names.len() {
-        if lock_pkg_names.get(i) == name {
+        if lock_pkg_names.unsafe_get(i) == name {
             return i
         }
         i = i + 1
@@ -52,7 +52,7 @@ pub fn lockfile_get_pkg_hash(name: Str) -> Str {
     if idx == -1 {
         return ""
     }
-    lock_pkg_hashes.get(idx)
+    lock_pkg_hashes.unsafe_get(idx)
 }
 
 pub fn lockfile_verify_hash(name: Str, expected_hash: Str) -> Int {
@@ -115,18 +115,18 @@ fn sort_packages() {
     let n = lock_pkg_names.len()
     let mut i = 1
     while i < n {
-        let key_name = lock_pkg_names.get(i)
-        let key_ver = lock_pkg_versions.get(i)
-        let key_src = lock_pkg_sources.get(i)
-        let key_hash = lock_pkg_hashes.get(i)
-        let key_caps = lock_pkg_caps.get(i)
+        let key_name = lock_pkg_names.unsafe_get(i)
+        let key_ver = lock_pkg_versions.unsafe_get(i)
+        let key_src = lock_pkg_sources.unsafe_get(i)
+        let key_hash = lock_pkg_hashes.unsafe_get(i)
+        let key_caps = lock_pkg_caps.unsafe_get(i)
         let mut j = i - 1
-        while j >= 0 && str_compare(lock_pkg_names.get(j), key_name) > 0 {
-            lock_pkg_names.set(j + 1, lock_pkg_names.get(j))
-            lock_pkg_versions.set(j + 1, lock_pkg_versions.get(j))
-            lock_pkg_sources.set(j + 1, lock_pkg_sources.get(j))
-            lock_pkg_hashes.set(j + 1, lock_pkg_hashes.get(j))
-            lock_pkg_caps.set(j + 1, lock_pkg_caps.get(j))
+        while j >= 0 && str_compare(lock_pkg_names.unsafe_get(j), key_name) > 0 {
+            lock_pkg_names.set(j + 1, lock_pkg_names.unsafe_get(j))
+            lock_pkg_versions.set(j + 1, lock_pkg_versions.unsafe_get(j))
+            lock_pkg_sources.set(j + 1, lock_pkg_sources.unsafe_get(j))
+            lock_pkg_hashes.set(j + 1, lock_pkg_hashes.unsafe_get(j))
+            lock_pkg_caps.set(j + 1, lock_pkg_caps.unsafe_get(j))
             j = j - 1
         }
         lock_pkg_names.set(j + 1, key_name)
@@ -183,11 +183,11 @@ pub fn lockfile_write(path: Str) -> Int {
     let mut i = 0
     while i < lock_pkg_names.len() {
         out = out.concat("\n[[package]]\n")
-        out = out.concat("name = \"").concat(lock_pkg_names.get(i)).concat("\"\n")
-        out = out.concat("version = \"").concat(lock_pkg_versions.get(i)).concat("\"\n")
-        out = out.concat("source = \"").concat(lock_pkg_sources.get(i)).concat("\"\n")
-        out = out.concat("hash = \"").concat(lock_pkg_hashes.get(i)).concat("\"\n")
-        out = out.concat("capabilities = ").concat(format_caps_toml(lock_pkg_caps.get(i))).concat("\n")
+        out = out.concat("name = \"").concat(lock_pkg_names.unsafe_get(i)).concat("\"\n")
+        out = out.concat("version = \"").concat(lock_pkg_versions.unsafe_get(i)).concat("\"\n")
+        out = out.concat("source = \"").concat(lock_pkg_sources.unsafe_get(i)).concat("\"\n")
+        out = out.concat("hash = \"").concat(lock_pkg_hashes.unsafe_get(i)).concat("\"\n")
+        out = out.concat("capabilities = ").concat(format_caps_toml(lock_pkg_caps.unsafe_get(i))).concat("\n")
         i = i + 1
     }
 

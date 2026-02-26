@@ -129,11 +129,13 @@ Two updates:
 | Decision name | Result summary | Vote tally |
 ```
 
-2. **Full deliberation section** — Add a new `## Section Title — Design Rationale` section at the end (before the `## Open Questions` section), following the exact format of existing deliberations (see While/Loop, If/Else, Iterator, Type Conversions sections as templates). Include:
+2. **Design rationale file** — Create a new file in `decisions/` directory named with kebab-case (e.g., `decisions/my-feature-name.md`). Start the file with a `[< All Decisions](../DECISIONS.md)` back-link, then follow the exact format of existing deliberation files (see existing files in `decisions/` as templates). Include:
    - `### Panel Deliberation` header
    - One subsection per question voted on (if multiple sub-questions)
    - Each expert's reasoning as a bullet under the question
    - `*(dissent)*` marker on dissenting votes
+
+3. **Design Rationales section** — Add a link to the new file in the `## Design Rationales` section of DECISIONS.md
 
 ## Step 11: Quality Checks
 

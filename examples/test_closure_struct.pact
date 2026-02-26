@@ -57,11 +57,11 @@ fn test_closure_field_in_list() {
     ops.push(MathOpList { name: "add", compute: fn(a: Int, b: Int) -> Int { a + b } })
     ops.push(MathOpList { name: "sub", compute: fn(a: Int, b: Int) -> Int { a - b } })
 
-    let op0 = ops.get(0)
+    let op0 = ops.unsafe_get(0)
     check(op0.name == "add", "list item 0 name")
     check(op0.compute(10, 3) == 13, "list item 0 compute")
 
-    let op1 = ops.get(1)
+    let op1 = ops.unsafe_get(1)
     check(op1.name == "sub", "list item 1 name")
     check(op1.compute(10, 3) == 7, "list item 1 compute")
 }

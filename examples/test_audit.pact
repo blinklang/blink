@@ -54,9 +54,9 @@ fn test_new_capability() {
 
     let count = audit_check()
     check_int(count, 1, "new cap: count == 1")
-    check_str(escalation_types.get(0), "escalation", "new cap: type is escalation")
-    check_str(escalation_names.get(0), "mylib", "new cap: name is mylib")
-    check_str(escalation_new_caps.get(0), "FS.Read", "new cap: new cap is FS.Read")
+    check_str(escalation_types.unsafe_get(0), "escalation", "new cap: type is escalation")
+    check_str(escalation_names.unsafe_get(0), "mylib", "new cap: name is mylib")
+    check_str(escalation_new_caps.unsafe_get(0), "FS.Read", "new cap: new cap is FS.Read")
 }
 
 fn test_new_pkg_with_caps() {
@@ -75,8 +75,8 @@ fn test_new_pkg_with_caps() {
 
     let count = audit_check()
     check_int(count, 1, "new pkg with caps: count == 1")
-    check_str(escalation_types.get(0), "new_pkg", "new pkg with caps: type is new_pkg")
-    check_str(escalation_names.get(0), "newlib", "new pkg with caps: name is newlib")
+    check_str(escalation_types.unsafe_get(0), "new_pkg", "new pkg with caps: type is new_pkg")
+    check_str(escalation_names.unsafe_get(0), "newlib", "new pkg with caps: name is newlib")
 }
 
 fn test_new_pkg_without_caps() {
@@ -152,8 +152,8 @@ fn test_multiple_escalations() {
 
     let count = audit_check()
     check_int(count, 2, "multi: count == 2")
-    check_str(escalation_types.get(0), "escalation", "multi: first is escalation")
-    check_str(escalation_types.get(1), "escalation", "multi: second is escalation")
+    check_str(escalation_types.unsafe_get(0), "escalation", "multi: first is escalation")
+    check_str(escalation_types.unsafe_get(1), "escalation", "multi: second is escalation")
 }
 
 fn main() {

@@ -72,8 +72,8 @@ fn test_git_dep() {
     check_int(rc, 0, "git dep loads ok")
     check_int(manifest_dep_count(), 1, "one git dep")
     check_str(manifest_get_dep_source(0), "git", "dep source is git")
-    check_str(dep_git_urls.get(0), "https://github.com/org/lib.git", "git url")
-    check_str(dep_git_tags.get(0), "v1.0", "git tag")
+    check_str(dep_git_urls.unsafe_get(0), "https://github.com/org/lib.git", "git url")
+    check_str(dep_git_tags.unsafe_get(0), "v1.0", "git tag")
 }
 
 fn test_path_dep() {
@@ -86,7 +86,7 @@ fn test_path_dep() {
     check_int(rc, 0, "path dep loads ok")
     check_int(manifest_dep_count(), 1, "one path dep")
     check_str(manifest_get_dep_source(0), "path", "dep source is path")
-    check_str(dep_paths.get(0), "../utils", "path value")
+    check_str(dep_paths.unsafe_get(0), "../utils", "path value")
 }
 
 fn test_dev_deps() {
@@ -98,7 +98,7 @@ fn test_dev_deps() {
     let rc = load_deps("dev-dependencies", 1)
     check_int(rc, 0, "dev deps load ok")
     check_int(manifest_dep_count(), 1, "one dev dep")
-    check_int(dep_is_dev.get(0), 1, "is dev dependency")
+    check_int(dep_is_dev.unsafe_get(0), 1, "is dev dependency")
 }
 
 fn test_capabilities() {
@@ -109,10 +109,10 @@ fn test_capabilities() {
     load_package()
     load_capabilities()
     check_int(cap_required.len(), 2, "2 required caps")
-    check_str(cap_required.get(0), "Net.Connect", "required cap 0")
-    check_str(cap_required.get(1), "Net.DNS", "required cap 1")
+    check_str(cap_required.unsafe_get(0), "Net.Connect", "required cap 0")
+    check_str(cap_required.unsafe_get(1), "Net.DNS", "required cap 1")
     check_int(cap_optional.len(), 1, "1 optional cap")
-    check_str(cap_optional.get(0), "IO.Log", "optional cap 0")
+    check_str(cap_optional.unsafe_get(0), "IO.Log", "optional cap 0")
 }
 
 fn test_alternatives() {
@@ -123,8 +123,8 @@ fn test_alternatives() {
     load_package()
     load_alternatives()
     check_int(alt_keys.len(), 1, "1 alternative")
-    check_str(alt_keys.get(0), "Net.Connect", "alt key")
-    check_str(alt_values.get(0), "mock-http", "alt value")
+    check_str(alt_keys.unsafe_get(0), "Net.Connect", "alt key")
+    check_str(alt_values.unsafe_get(0), "mock-http", "alt value")
 }
 
 fn test_dep_source_query() {

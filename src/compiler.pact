@@ -179,7 +179,7 @@ fn resolve_from_lockfile(dotted_path: Str, src_root: Str) -> Str {
 
     // Found a matching package — resolve to its source path
     let pkg_idx = lockfile_find_pkg(pkg_name)
-    let source = lock_pkg_sources.get(pkg_idx)
+    let source = lock_pkg_sources.unsafe_get(pkg_idx)
 
     let mut base_dir = ""
     if source.starts_with("path:") {
@@ -283,15 +283,15 @@ pub fn resolve_module_path(dotted_path: Str, src_root: Str) -> Str ! Diag.Report
 }
 
 pub fn should_import_item(item: Int, import_node: Int) -> Int {
-    let names_sl = np_args.get(import_node)
+    let names_sl = np_args.unsafe_get(import_node)
     if names_sl == -1 {
         return 1
     }
-    let item_name = np_name.get(item)
+    let item_name = np_name.unsafe_get(item)
     let mut i = 0
     while i < sublist_length(names_sl) {
         let name_node = sublist_get(names_sl, i)
-        if np_name.get(name_node) == item_name {
+        if np_name.unsafe_get(name_node) == item_name {
             return 1
         }
         i = i + 1
@@ -309,10 +309,10 @@ pub fn merge_programs(main_prog: Int, imported: List[Int], import_nodes_list: Li
 
     let mut pi = 0
     while pi < imported.len() {
-        let prog = imported.get(pi)
-        let mod_name = import_map_modules.get(pi)
+        let prog = imported.unsafe_get(pi)
+        let mod_name = import_map_modules.unsafe_get(pi)
 
-        let fns_sl = np_params.get(prog)
+        let fns_sl = np_params.unsafe_get(prog)
         let mut fi = 0
         while fi < sublist_length(fns_sl) {
             let fn_node = sublist_get(fns_sl, fi)
@@ -321,7 +321,7 @@ pub fn merge_programs(main_prog: Int, imported: List[Int], import_nodes_list: Li
             fi = fi + 1
         }
 
-        let types_sl = np_fields.get(prog)
+        let types_sl = np_fields.unsafe_get(prog)
         let mut ti = 0
         while ti < sublist_length(types_sl) {
             let type_node = sublist_get(types_sl, ti)
@@ -330,7 +330,7 @@ pub fn merge_programs(main_prog: Int, imported: List[Int], import_nodes_list: Li
             ti = ti + 1
         }
 
-        let lets_sl = np_stmts.get(prog)
+        let lets_sl = np_stmts.unsafe_get(prog)
         let mut li = 0
         while li < sublist_length(lets_sl) {
             let let_node = sublist_get(lets_sl, li)
@@ -339,7 +339,7 @@ pub fn merge_programs(main_prog: Int, imported: List[Int], import_nodes_list: Li
             li = li + 1
         }
 
-        let traits_sl = np_arms.get(prog)
+        let traits_sl = np_arms.unsafe_get(prog)
         let mut tri = 0
         while tri < sublist_length(traits_sl) {
             let trait_node = sublist_get(traits_sl, tri)
@@ -348,7 +348,7 @@ pub fn merge_programs(main_prog: Int, imported: List[Int], import_nodes_list: Li
             tri = tri + 1
         }
 
-        let impls_sl = np_methods.get(prog)
+        let impls_sl = np_methods.unsafe_get(prog)
         let mut ii = 0
         while ii < sublist_length(impls_sl) {
             let impl_node = sublist_get(impls_sl, ii)
@@ -357,7 +357,7 @@ pub fn merge_programs(main_prog: Int, imported: List[Int], import_nodes_list: Li
             ii = ii + 1
         }
 
-        let effects_sl = np_args.get(prog)
+        let effects_sl = np_args.unsafe_get(prog)
         if effects_sl != -1 {
             let mut edi = 0
             while edi < sublist_length(effects_sl) {
@@ -371,37 +371,37 @@ pub fn merge_programs(main_prog: Int, imported: List[Int], import_nodes_list: Li
         pi = pi + 1
     }
 
-    let main_fns = np_params.get(main_prog)
+    let main_fns = np_params.unsafe_get(main_prog)
     let mut fi = 0
     while fi < sublist_length(main_fns) {
         all_fns.push(sublist_get(main_fns, fi))
         fi = fi + 1
     }
-    let main_types = np_fields.get(main_prog)
+    let main_types = np_fields.unsafe_get(main_prog)
     let mut ti = 0
     while ti < sublist_length(main_types) {
         all_types.push(sublist_get(main_types, ti))
         ti = ti + 1
     }
-    let main_lets = np_stmts.get(main_prog)
+    let main_lets = np_stmts.unsafe_get(main_prog)
     let mut li = 0
     while li < sublist_length(main_lets) {
         all_lets.push(sublist_get(main_lets, li))
         li = li + 1
     }
-    let main_traits = np_arms.get(main_prog)
+    let main_traits = np_arms.unsafe_get(main_prog)
     let mut tri = 0
     while tri < sublist_length(main_traits) {
         all_traits.push(sublist_get(main_traits, tri))
         tri = tri + 1
     }
-    let main_impls = np_methods.get(main_prog)
+    let main_impls = np_methods.unsafe_get(main_prog)
     let mut ii = 0
     while ii < sublist_length(main_impls) {
         all_impls.push(sublist_get(main_impls, ii))
         ii = ii + 1
     }
-    let main_effects = np_args.get(main_prog)
+    let main_effects = np_args.unsafe_get(main_prog)
     if main_effects != -1 {
         let mut edi = 0
         while edi < sublist_length(main_effects) {
@@ -413,7 +413,7 @@ pub fn merge_programs(main_prog: Int, imported: List[Int], import_nodes_list: Li
     let merged_fns = new_sublist()
     fi = 0
     while fi < all_fns.len() {
-        sublist_push(merged_fns, all_fns.get(fi))
+        sublist_push(merged_fns, all_fns.unsafe_get(fi))
         fi = fi + 1
     }
     finalize_sublist(merged_fns)
@@ -421,7 +421,7 @@ pub fn merge_programs(main_prog: Int, imported: List[Int], import_nodes_list: Li
     let merged_types = new_sublist()
     ti = 0
     while ti < all_types.len() {
-        sublist_push(merged_types, all_types.get(ti))
+        sublist_push(merged_types, all_types.unsafe_get(ti))
         ti = ti + 1
     }
     finalize_sublist(merged_types)
@@ -429,7 +429,7 @@ pub fn merge_programs(main_prog: Int, imported: List[Int], import_nodes_list: Li
     let merged_lets = new_sublist()
     li = 0
     while li < all_lets.len() {
-        sublist_push(merged_lets, all_lets.get(li))
+        sublist_push(merged_lets, all_lets.unsafe_get(li))
         li = li + 1
     }
     finalize_sublist(merged_lets)
@@ -437,7 +437,7 @@ pub fn merge_programs(main_prog: Int, imported: List[Int], import_nodes_list: Li
     let merged_traits = new_sublist()
     tri = 0
     while tri < all_traits.len() {
-        sublist_push(merged_traits, all_traits.get(tri))
+        sublist_push(merged_traits, all_traits.unsafe_get(tri))
         tri = tri + 1
     }
     finalize_sublist(merged_traits)
@@ -445,7 +445,7 @@ pub fn merge_programs(main_prog: Int, imported: List[Int], import_nodes_list: Li
     let merged_impls = new_sublist()
     ii = 0
     while ii < all_impls.len() {
-        sublist_push(merged_impls, all_impls.get(ii))
+        sublist_push(merged_impls, all_impls.unsafe_get(ii))
         ii = ii + 1
     }
     finalize_sublist(merged_impls)
@@ -455,7 +455,7 @@ pub fn merge_programs(main_prog: Int, imported: List[Int], import_nodes_list: Li
         merged_effects = new_sublist()
         let mut edi = 0
         while edi < all_effects.len() {
-            sublist_push(merged_effects, all_effects.get(edi))
+            sublist_push(merged_effects, all_effects.unsafe_get(edi))
             edi = edi + 1
         }
         finalize_sublist(merged_effects)
@@ -493,7 +493,7 @@ pub fn reset_compiler_state() {
 pub fn is_file_loaded(path: Str) -> Int {
     let mut i = 0
     while i < loaded_files.len() {
-        if loaded_files.get(i) == path {
+        if loaded_files.unsafe_get(i) == path {
             return 1
         }
         i = i + 1
@@ -502,14 +502,14 @@ pub fn is_file_loaded(path: Str) -> Int {
 }
 
 pub fn collect_imports(program: Int, src_root: Str, all_programs: List[Int]) ! Lex.Tokenize, Parse, Diag.Report {
-    let imports_sl = np_elements.get(program)
+    let imports_sl = np_elements.unsafe_get(program)
     if imports_sl == -1 {
         return
     }
     let mut i = 0
     while i < sublist_length(imports_sl) {
         let imp_node = sublist_get(imports_sl, i)
-        let dotted_path = np_str_val.get(imp_node)
+        let dotted_path = np_str_val.unsafe_get(imp_node)
         let file_path = resolve_module_path(dotted_path, src_root)
         if file_path == "" {
             i = i + 1

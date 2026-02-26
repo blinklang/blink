@@ -15,10 +15,10 @@ fn main() {
     } else {
         io.println("FAIL: map.collect len = {doubled.len()}")
     }
-    if doubled.get(0) == 2 {
+    if doubled.unsafe_get(0) == 2 {
         io.println("ok: map.collect[0] = 2")
     } else {
-        io.println("FAIL: map.collect[0] = {doubled.get(0)}")
+        io.println("FAIL: map.collect[0] = {doubled.unsafe_get(0)}")
     }
 
     // Test 2: filter then collect
@@ -68,10 +68,10 @@ fn main() {
     } else {
         io.println("FAIL: map.filter.take(2).collect len = {chain4.len()}")
     }
-    if chain4.get(0) == 30 {
+    if chain4.unsafe_get(0) == 30 {
         io.println("ok: map.filter.take(2).collect[0] = 30")
     } else {
-        io.println("FAIL: map.filter.take(2).collect[0] = {chain4.get(0)}")
+        io.println("FAIL: map.filter.take(2).collect[0] = {chain4.unsafe_get(0)}")
     }
 
     // Test 8: count on iterator

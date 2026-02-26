@@ -167,10 +167,10 @@ fn test_resolve_and_lock() {
     let load_rc = lockfile_load(lock_path)
     check_int(load_rc, 0, "lockfile loads ok")
     check_int(lockfile_pkg_count(), 1, "lockfile has 1 package")
-    check_str(lock_pkg_names.get(0), "mylib", "lockfile pkg name")
-    check_str(lock_pkg_versions.get(0), "0.3.0", "lockfile pkg version")
-    check_starts_with(lock_pkg_sources.get(0), "path:", "lockfile source is path")
-    check_str(lock_pkg_caps.get(0), "Net.Connect", "lockfile caps")
+    check_str(lock_pkg_names.unsafe_get(0), "mylib", "lockfile pkg name")
+    check_str(lock_pkg_versions.unsafe_get(0), "0.3.0", "lockfile pkg version")
+    check_starts_with(lock_pkg_sources.unsafe_get(0), "path:", "lockfile source is path")
+    check_str(lock_pkg_caps.unsafe_get(0), "Net.Connect", "lockfile caps")
 }
 
 // ── Test: clear state ───────────────────────────────────────────

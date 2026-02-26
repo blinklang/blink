@@ -41,7 +41,7 @@ pub fn inc_snapshot() {
 
     let mut i = 0
     while i < si_file_count {
-        let path = si_file_path.get(i)
+        let path = si_file_path.unsafe_get(i)
         let mtime = file_mtime(path)
         inc_snap_path.push(path)
         inc_snap_mtime.push(mtime)
@@ -59,8 +59,8 @@ pub fn inc_detect_changes() {
 
     let mut i = 0
     while i < inc_snap_count {
-        let path = inc_snap_path.get(i)
-        let old_mtime = inc_snap_mtime.get(i)
+        let path = inc_snap_path.unsafe_get(i)
+        let old_mtime = inc_snap_mtime.unsafe_get(i)
         let cur_mtime = file_mtime(path)
         if cur_mtime != old_mtime {
             inc_dirty_path.push(path)
@@ -72,7 +72,7 @@ pub fn inc_detect_changes() {
     // Also check for new files in the symbol index that weren't in the snapshot
     i = 0
     while i < si_file_count {
-        let path = si_file_path.get(i)
+        let path = si_file_path.unsafe_get(i)
         if snap_path_map.has(path) == 0 {
             inc_dirty_path.push(path)
             inc_dirty_count = inc_dirty_count + 1
@@ -96,7 +96,7 @@ fn mark_affected(sym_idx: Int) {
     let rdeps = si_get_rdeps(sym_idx)
     let mut i = 0
     while i < rdeps.len() {
-        mark_affected(rdeps.get(i))
+        mark_affected(rdeps.unsafe_get(i))
         i = i + 1
     }
 }
@@ -109,11 +109,11 @@ pub fn inc_compute_affected() {
     // For each dirty file, get its symbols and mark them + rdeps as affected
     let mut di = 0
     while di < inc_dirty_count {
-        let path = inc_dirty_path.get(di)
+        let path = inc_dirty_path.unsafe_get(di)
         let syms = si_file_symbols(path)
         let mut si = 0
         while si < syms.len() {
-            mark_affected(syms.get(si))
+            mark_affected(syms.unsafe_get(si))
             si = si + 1
         }
         di = di + 1

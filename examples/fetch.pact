@@ -19,7 +19,7 @@ type Forecast {
 fn fetch_forecast(city: Str) -> Result[Forecast, WeatherError] ! Net.Connect, IO.Log {
     io.log("Fetching weather for {city}")
     let url = "https://api.weather.example/v1/forecast?city={city}"
-    let response = net.get(url)?
+    let response = net.unsafe_get(url)?
     parse_forecast(city, response.body)
 }
 
@@ -28,8 +28,8 @@ fn parse_forecast(city: Str, body: Str) -> Result[Forecast, WeatherError] {
     let json = json.parse(body) ?? return Err(WeatherError.ParseFailed("invalid JSON"))
     Ok(Forecast {
         city: city
-        temp_c: json.get("temp_c")?.as_float() ?? 0.0
-        summary: json.get("summary")?.as_str() ?? "Unknown"
+        temp_c: json.unsafe_get("temp_c")?.as_float() ?? 0.0
+        summary: json.unsafe_get("summary")?.as_str() ?? "Unknown"
     })
 }
 

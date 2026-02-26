@@ -27,7 +27,7 @@ fn test_before_hooks() {
     let mut req = request_new("GET", "/test")
     let mut hi = 0
     while hi < srv.before_hooks.len() {
-        let hook = srv.before_hooks.get(hi)
+        let hook = srv.before_hooks.unsafe_get(hi)
         req = hook.process(req)
         hi = hi + 1
     }
@@ -70,9 +70,9 @@ fn test_multiple_hooks() {
 
     check(srv.before_hooks.len() == 2, "two hooks registered")
 
-    let h0 = srv.before_hooks.get(0)
+    let h0 = srv.before_hooks.unsafe_get(0)
     check(h0.name == "hook-1", "first hook name")
-    let h1 = srv.before_hooks.get(1)
+    let h1 = srv.before_hooks.unsafe_get(1)
     check(h1.name == "hook-2", "second hook name")
 }
 
@@ -90,7 +90,7 @@ fn test_hook_chain_execution() {
     let mut req = request_new("POST", "/data")
     let mut hi = 0
     while hi < srv.before_hooks.len() {
-        let hook = srv.before_hooks.get(hi)
+        let hook = srv.before_hooks.unsafe_get(hi)
         req = hook.process(req)
         hi = hi + 1
     }

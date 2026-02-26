@@ -86,7 +86,7 @@ pub fn match_route(srv: Server, method: Str, path: Str) -> Int {
     path_param_clear()
     let mut i = 0
     while i < srv.routes.len() {
-        let route = srv.routes.get(i)
+        let route = srv.routes.unsafe_get(i)
         if route.method == method {
             if path_match(route.pattern, path) == 1 {
                 return i
@@ -106,8 +106,8 @@ pub fn path_match(pattern: Str, path: Str) -> Int {
     }
     let mut i = 0
     while i < pat_parts.len() {
-        let pat_seg = pat_parts.get(i)
-        let path_seg = path_parts.get(i)
+        let pat_seg = pat_parts.unsafe_get(i)
+        let path_seg = path_parts.unsafe_get(i)
         if pat_seg.len() > 0 && pat_seg.char_at(0) == 58 {
             // ':' = 58 — path parameter
             let pname = pat_seg.substring(1, pat_seg.len() - 1)
@@ -124,8 +124,8 @@ pub fn path_match(pattern: Str, path: Str) -> Int {
 pub fn path_param(name: Str) -> Str {
     let mut i = 0
     while i < param_names.len() {
-        if param_names.get(i) == name {
-            return param_values.get(i)
+        if param_names.unsafe_get(i) == name {
+            return param_values.unsafe_get(i)
         }
         i = i + 1
     }
@@ -224,7 +224,7 @@ pub fn server_serve(srv: Server) ! Net.Listen, IO {
                 // Apply before hooks
                 let mut hi = 0
                 while hi < srv.before_hooks.len() {
-                    let hook = srv.before_hooks.get(hi)
+                    let hook = srv.before_hooks.unsafe_get(hi)
                     req = hook.process(req)
                     hi = hi + 1
                 }
@@ -233,7 +233,7 @@ pub fn server_serve(srv: Server) ! Net.Listen, IO {
                 let idx = match_route(srv, req.method, req.url)
                 let mut resp = response_not_found("Not Found")
                 if idx >= 0 {
-                    let matched_route = srv.routes.get(idx)
+                    let matched_route = srv.routes.unsafe_get(idx)
                     resp = matched_route.callback(req)
                 }
 

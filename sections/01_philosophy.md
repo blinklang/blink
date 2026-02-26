@@ -25,6 +25,8 @@ Pact is designed around this loop. The compiler runs as a persistent daemon with
 
 *This is the operational principle. Every other principle exists in service of making this loop faster and more reliable.*
 
+The compiler must support **recoverable, incremental parsing** -- it should parse and type-check partial or malformed programs and still produce useful diagnostics for the valid portions. LLMs frequently generate code with one error in the middle of an otherwise correct program. A compiler that gives up at the first error without checking the rest of the file is hostile to AI workflows. Maximizing useful feedback per round-trip is the core optimization target.
+
 **Principle 2: One way to do everything.**
 
 Canonical syntax. Canonical formatting. One package manager. One test runner. One way to declare a function, one way to handle errors, one way to format a string.
@@ -32,6 +34,8 @@ Canonical syntax. Canonical formatting. One package manager. One test runner. On
 When an AI encounters a decision point -- "should I use single quotes or double quotes?", "which test framework?", "tabs or spaces?" -- that decision costs tokens, risks inconsistency, and produces code that looks different from the training data depending on which choice is made. Pact eliminates these decisions. There is one way. The AI never asks "which way?" It just writes the only way.
 
 This extends beyond syntax. There is one error handling mechanism (`Result[T, E]` with `?`). One polymorphism mechanism (traits). One way to represent absence (`Option[T]`). One way to declare effects. Pact is deliberately not a multi-paradigm language. It is an opinionated language that made the choices so nobody else has to.
+
+A corollary is **exemplar-friendliness**: every syntactic pattern should be visually distinct so that LLMs can learn from examples via structural pattern-matching. If two different concepts use similar syntax, the AI conflates them. When every construct has a unique visual shape, a single example teaches the pattern unambiguously.
 
 **Principle 3: Locality of reasoning.**
 
@@ -69,6 +73,14 @@ AI models consume and produce tokens. Every unnecessary token costs inference ti
 
 The test: if you can delete a token and the program's meaning doesn't change, that token shouldn't exist. If you can't determine a function's behavior without reading something outside the function, something is missing from the signature.
 
+**Principle 7: Errors are the teaching signal.**
+
+For an AI, the error message *is* the learning signal. The quality of diagnostics determines how many round-trips it takes to reach correct code. Pact diagnostics are not messages for humans to interpret -- they are structured correction instructions that an AI can apply mechanically.
+
+Every diagnostic includes: the error category, the precise source location, a human-readable explanation, and -- critically -- a machine-applicable fix: the exact edit that resolves the problem. An error like `{kind: "missing_effect", fix: {line: 5, insert: " ! IO"}}` lets the AI self-correct in one round-trip instead of reasoning about what to change. When multiple fixes are possible, the diagnostic enumerates them with confidence scores.
+
+This is not a tooling convenience layered on top -- it is a language design constraint. Syntax and semantics are chosen so that errors are *unambiguously correctable*. A grammar that produces parse errors with three possible resolutions is worse than one that produces errors with exactly one resolution, even if the grammar is slightly more verbose. Pact optimizes for diagnostic clarity the same way other languages optimize for runtime performance.
+
 ### 1.2.1 Design Aspiration: Intent as Code
 
 In current languages, the "why" behind code lives in comments, commit messages, Jira tickets, and tribal knowledge -- all invisible to the compiler, all easily lost, all perpetually out of sync with the implementation. Pact aims to treat intent as a first-class, compiler-aware part of the program.
@@ -77,7 +89,7 @@ Intent declarations, contracts, performance targets, and provenance links are st
 
 This bridges the fundamental gap in AI-assisted development: the human defines *what* should happen and *why*; the AI defines *how*; the compiler proves the *how* satisfies the *what*. Each role has first-class support in the language.
 
-This is aspirational -- it depends on the contract and verification systems being expressive enough to close the intent-implementation gap. The six principles above are concrete design constraints the compiler enforces today; this aspiration describes the direction they point toward.
+This is aspirational -- it depends on the contract and verification systems being expressive enough to close the intent-implementation gap. The seven principles above are concrete design constraints the compiler enforces today; this aspiration describes the direction they point toward.
 
 ### 1.3 Non-Goals
 

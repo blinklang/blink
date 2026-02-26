@@ -106,11 +106,11 @@ let mut sl_start: List[Int] = []
 let mut sl_len: List[Int] = []
 
 fn sublist_get(sl: Int, idx: Int) -> Int {
-    sl_items.get(sl_start.get(sl) + idx)
+    sl_items.unsafe_get(sl_start.unsafe_get(sl) + idx)
 }
 
 fn sublist_length(sl: Int) -> Int {
-    sl_len.get(sl)
+    sl_len.unsafe_get(sl)
 }
 
 // ── Codegen state ───────────────────────────────────────────────────
@@ -145,7 +145,7 @@ fn push_scope() {
 }
 
 fn pop_scope() {
-    let start = scope_frame_starts.get(scope_frame_starts.len() - 1)
+    let start = scope_frame_starts.unsafe_get(scope_frame_starts.len() - 1)
     scope_frame_starts.pop()
     while scope_names.len() > start {
         scope_names.pop()
@@ -163,8 +163,8 @@ fn set_var(name: Str, ctype: Int, is_mut: Int) {
 fn get_var_type(name: Str) -> Int {
     let mut i = scope_names.len() - 1
     while i >= 0 {
-        if scope_names.get(i) == name {
-            return scope_types.get(i)
+        if scope_names.unsafe_get(i) == name {
+            return scope_types.unsafe_get(i)
         }
         i = i - 1
     }
@@ -179,8 +179,8 @@ fn reg_fn(name: Str, ret: Int) {
 fn get_fn_ret(name: Str) -> Int {
     let mut i = 0
     while i < fn_reg_names.len() {
-        if fn_reg_names.get(i) == name {
-            return fn_reg_ret.get(i)
+        if fn_reg_names.unsafe_get(i) == name {
+            return fn_reg_ret.unsafe_get(i)
         }
         i = i + 1
     }
@@ -195,8 +195,8 @@ fn set_list_elem_type(name: Str, elem_type: Int) {
 fn get_list_elem_type(name: Str) -> Int {
     let mut i = 0
     while i < var_list_elem_names.len() {
-        if var_list_elem_names.get(i) == name {
-            return var_list_elem_types.get(i)
+        if var_list_elem_names.unsafe_get(i) == name {
+            return var_list_elem_types.unsafe_get(i)
         }
         i = i + 1
     }
@@ -206,7 +206,7 @@ fn get_list_elem_type(name: Str) -> Int {
 fn is_struct_type(name: Str) -> Int {
     let mut i = 0
     while i < struct_reg_names.len() {
-        if struct_reg_names.get(i) == name {
+        if struct_reg_names.unsafe_get(i) == name {
             return 1
         }
         i = i + 1
@@ -217,7 +217,7 @@ fn is_struct_type(name: Str) -> Int {
 fn is_emitted_let(name: Str) -> Int {
     let mut i = 0
     while i < emitted_let_names.len() {
-        if emitted_let_names.get(i) == name {
+        if emitted_let_names.unsafe_get(i) == name {
             return 1
         }
         i = i + 1
@@ -228,7 +228,7 @@ fn is_emitted_let(name: Str) -> Int {
 fn is_emitted_fn(name: Str) -> Int {
     let mut i = 0
     while i < emitted_fn_names.len() {
-        if emitted_fn_names.get(i) == name {
+        if emitted_fn_names.unsafe_get(i) == name {
             return 1
         }
         i = i + 1
@@ -283,7 +283,7 @@ fn join_lines() -> Str {
         if i > 0 {
             result = result.concat("\n")
         }
-        result = result.concat(cg_lines.get(i))
+        result = result.concat(cg_lines.unsafe_get(i))
         i = i + 1
     }
     result
@@ -297,12 +297,12 @@ let mut expr_result_str: Str = ""
 let mut expr_result_type: Int = 0
 
 fn emit_expr(node: Int) {
-    let kind = np_kind.get(node)
+    let kind = np_kind.unsafe_get(node)
 
     if kind == ND_INT_LIT {
-        let s = np_str_val.get(node)
+        let s = np_str_val.unsafe_get(node)
         if s == "" {
-            expr_result_str = "{np_int_val.get(node)}"
+            expr_result_str = "{np_int_val.unsafe_get(node)}"
         } else {
             expr_result_str = s
         }
@@ -311,13 +311,13 @@ fn emit_expr(node: Int) {
     }
 
     if kind == ND_FLOAT_LIT {
-        expr_result_str = np_str_val.get(node)
+        expr_result_str = np_str_val.unsafe_get(node)
         expr_result_type = CT_FLOAT
         return
     }
 
     if kind == ND_BOOL_LIT {
-        if np_int_val.get(node) != 0 {
+        if np_int_val.unsafe_get(node) != 0 {
             expr_result_str = "1"
         } else {
             expr_result_str = "0"
@@ -327,7 +327,7 @@ fn emit_expr(node: Int) {
     }
 
     if kind == ND_IDENT {
-        let name = np_name.get(node)
+        let name = np_name.unsafe_get(node)
         expr_result_str = name
         expr_result_type = get_var_type(name)
         return
@@ -364,18 +364,18 @@ fn emit_expr(node: Int) {
     }
 
     if kind == ND_FIELD_ACCESS {
-        emit_expr(np_obj.get(node))
+        emit_expr(np_obj.unsafe_get(node))
         let obj_str = expr_result_str
-        expr_result_str = "{obj_str}.{np_name.get(node)}"
+        expr_result_str = "{obj_str}.{np_name.unsafe_get(node)}"
         expr_result_type = CT_VOID
         return
     }
 
     if kind == ND_INDEX_EXPR {
-        emit_expr(np_obj.get(node))
+        emit_expr(np_obj.unsafe_get(node))
         let obj_str = expr_result_str
         let obj_type = expr_result_type
-        emit_expr(np_index.get(node))
+        emit_expr(np_index.unsafe_get(node))
         let idx_str = expr_result_str
         if obj_type == CT_STRING {
             expr_result_str = "pact_str_char_at({obj_str}, {idx_str})"
@@ -409,8 +409,8 @@ fn emit_expr(node: Int) {
     }
 
     if kind == ND_RETURN {
-        if np_value.get(node) != -1 {
-            emit_expr(np_value.get(node))
+        if np_value.unsafe_get(node) != -1 {
+            emit_expr(np_value.unsafe_get(node))
             let val_str = expr_result_str
             emit_line("return {val_str};")
         } else {
@@ -431,13 +431,13 @@ fn emit_expr(node: Int) {
 }
 
 fn emit_binop(node: Int) {
-    emit_expr(np_left.get(node))
+    emit_expr(np_left.unsafe_get(node))
     let left_str = expr_result_str
     let left_type = expr_result_type
-    emit_expr(np_right.get(node))
+    emit_expr(np_right.unsafe_get(node))
     let right_str = expr_result_str
     let right_type = expr_result_type
-    let op = np_op.get(node)
+    let op = np_op.unsafe_get(node)
 
     if op == "==" && left_type == CT_STRING && right_type == CT_STRING {
         expr_result_str = "pact_str_eq({left_str}, {right_str})"
@@ -464,10 +464,10 @@ fn emit_binop(node: Int) {
 }
 
 fn emit_unaryop(node: Int) {
-    emit_expr(np_left.get(node))
+    emit_expr(np_left.unsafe_get(node))
     let operand_str = expr_result_str
     let operand_type = expr_result_type
-    let op = np_op.get(node)
+    let op = np_op.unsafe_get(node)
     if op == "-" {
         expr_result_str = "(-{operand_str})"
         expr_result_type = operand_type
@@ -481,11 +481,11 @@ fn emit_unaryop(node: Int) {
 }
 
 fn emit_call(node: Int) {
-    let func_node = np_left.get(node)
-    let func_kind = np_kind.get(func_node)
+    let func_node = np_left.unsafe_get(node)
+    let func_kind = np_kind.unsafe_get(func_node)
     if func_kind == ND_IDENT {
-        let fn_name = np_name.get(func_node)
-        let args_sl = np_args.get(node)
+        let fn_name = np_name.unsafe_get(func_node)
+        let args_sl = np_args.unsafe_get(node)
         let mut args_str = ""
         if args_sl != -1 {
             let mut i = 0
@@ -504,7 +504,7 @@ fn emit_call(node: Int) {
     }
     emit_expr(func_node)
     let func_str = expr_result_str
-    let args_sl = np_args.get(node)
+    let args_sl = np_args.unsafe_get(node)
     let mut args_str = ""
     if args_sl != -1 {
         let mut i = 0
@@ -522,12 +522,12 @@ fn emit_call(node: Int) {
 }
 
 fn emit_method_call(node: Int) {
-    let obj_node = np_obj.get(node)
-    let method = np_method.get(node)
+    let obj_node = np_obj.unsafe_get(node)
+    let method = np_method.unsafe_get(node)
 
     // Special case: io.println
-    if np_kind.get(obj_node) == ND_IDENT && np_name.get(obj_node) == "io" && method == "println" {
-        let args_sl = np_args.get(node)
+    if np_kind.unsafe_get(obj_node) == ND_IDENT && np_name.unsafe_get(obj_node) == "io" && method == "println" {
+        let args_sl = np_args.unsafe_get(node)
         if args_sl != -1 && sublist_length(args_sl) > 0 {
             emit_expr(sublist_get(args_sl, 0))
             let arg_str = expr_result_str
@@ -561,7 +561,7 @@ fn emit_method_call(node: Int) {
             return
         }
         if method == "char_at" || method == "charAt" {
-            let args_sl = np_args.get(node)
+            let args_sl = np_args.unsafe_get(node)
             emit_expr(sublist_get(args_sl, 0))
             let idx_str = expr_result_str
             expr_result_str = "pact_str_char_at({obj_str}, {idx_str})"
@@ -569,7 +569,7 @@ fn emit_method_call(node: Int) {
             return
         }
         if method == "substring" || method == "substr" {
-            let args_sl = np_args.get(node)
+            let args_sl = np_args.unsafe_get(node)
             emit_expr(sublist_get(args_sl, 0))
             let start_str = expr_result_str
             emit_expr(sublist_get(args_sl, 1))
@@ -579,7 +579,7 @@ fn emit_method_call(node: Int) {
             return
         }
         if method == "contains" {
-            let args_sl = np_args.get(node)
+            let args_sl = np_args.unsafe_get(node)
             emit_expr(sublist_get(args_sl, 0))
             let needle_str = expr_result_str
             expr_result_str = "pact_str_contains({obj_str}, {needle_str})"
@@ -587,7 +587,7 @@ fn emit_method_call(node: Int) {
             return
         }
         if method == "starts_with" {
-            let args_sl = np_args.get(node)
+            let args_sl = np_args.unsafe_get(node)
             emit_expr(sublist_get(args_sl, 0))
             let pfx_str = expr_result_str
             expr_result_str = "pact_str_starts_with({obj_str}, {pfx_str})"
@@ -595,7 +595,7 @@ fn emit_method_call(node: Int) {
             return
         }
         if method == "concat" {
-            let args_sl = np_args.get(node)
+            let args_sl = np_args.unsafe_get(node)
             emit_expr(sublist_get(args_sl, 0))
             let other_str = expr_result_str
             expr_result_str = "pact_str_concat({obj_str}, {other_str})"
@@ -607,7 +607,7 @@ fn emit_method_call(node: Int) {
     // List methods
     if obj_type == CT_LIST {
         if method == "push" {
-            let args_sl = np_args.get(node)
+            let args_sl = np_args.unsafe_get(node)
             emit_expr(sublist_get(args_sl, 0))
             let val_str = expr_result_str
             let val_type = expr_result_type
@@ -632,7 +632,7 @@ fn emit_method_call(node: Int) {
             return
         }
         if method == "get" {
-            let args_sl = np_args.get(node)
+            let args_sl = np_args.unsafe_get(node)
             emit_expr(sublist_get(args_sl, 0))
             let idx_str = expr_result_str
             let elem_type = get_list_elem_type(obj_str)
@@ -646,7 +646,7 @@ fn emit_method_call(node: Int) {
             return
         }
         if method == "set" {
-            let args_sl = np_args.get(node)
+            let args_sl = np_args.unsafe_get(node)
             emit_expr(sublist_get(args_sl, 0))
             let idx_str = expr_result_str
             emit_expr(sublist_get(args_sl, 1))
@@ -664,7 +664,7 @@ fn emit_method_call(node: Int) {
     }
 
     // Generic fallback
-    let args_sl = np_args.get(node)
+    let args_sl = np_args.unsafe_get(node)
     let mut args_str = ""
     if args_sl != -1 {
         let mut i = 0
@@ -703,7 +703,7 @@ fn escape_c_string(s: Str) -> Str {
 }
 
 fn emit_interp_string(node: Int) {
-    let parts_sl = np_elements.get(node)
+    let parts_sl = np_elements.unsafe_get(node)
     if parts_sl == -1 {
         expr_result_str = "\"\""
         expr_result_type = CT_STRING
@@ -715,8 +715,8 @@ fn emit_interp_string(node: Int) {
     let mut ai = 0
     while ai < sublist_length(parts_sl) {
         let part = sublist_get(parts_sl, ai)
-        let pk = np_kind.get(part)
-        if !(pk == ND_IDENT && np_str_val.get(part) == np_name.get(part)) {
+        let pk = np_kind.unsafe_get(part)
+        if !(pk == ND_IDENT && np_str_val.unsafe_get(part) == np_name.unsafe_get(part)) {
             all_literal = 0
         }
         ai = ai + 1
@@ -726,7 +726,7 @@ fn emit_interp_string(node: Int) {
         let mut ci = 0
         while ci < sublist_length(parts_sl) {
             let part = sublist_get(parts_sl, ci)
-            concat_str = concat_str.concat(escape_c_string(np_str_val.get(part)))
+            concat_str = concat_str.concat(escape_c_string(np_str_val.unsafe_get(part)))
             ci = ci + 1
         }
         expr_result_str = "\"".concat(concat_str).concat("\"")
@@ -743,11 +743,11 @@ fn emit_interp_string(node: Int) {
     let mut i = 0
     while i < sublist_length(parts_sl) {
         let part = sublist_get(parts_sl, i)
-        let pk = np_kind.get(part)
+        let pk = np_kind.unsafe_get(part)
         // Literal string parts: parser stores them as ND_IDENT with str_val == name
         // Expression parts: ND_IDENT with str_val == "" (or other node kinds)
-        if pk == ND_IDENT && np_str_val.get(part) == np_name.get(part) {
-            fmt = fmt.concat(escape_c_string(np_str_val.get(part)))
+        if pk == ND_IDENT && np_str_val.unsafe_get(part) == np_name.unsafe_get(part) {
+            fmt = fmt.concat(escape_c_string(np_str_val.unsafe_get(part)))
         } else {
             // Expression part
             emit_expr(part)
@@ -801,7 +801,7 @@ fn emit_interp_string(node: Int) {
 fn emit_list_lit(node: Int) {
     let tmp = fresh_temp("_l")
     emit_line("pact_list* {tmp} = pact_list_new();")
-    let elems_sl = np_elements.get(node)
+    let elems_sl = np_elements.unsafe_get(node)
     if elems_sl != -1 {
         let mut i = 0
         while i < sublist_length(elems_sl) {
@@ -821,17 +821,17 @@ fn emit_list_lit(node: Int) {
 }
 
 fn emit_struct_lit(node: Int) {
-    let sname = np_type_name.get(node)
+    let sname = np_type_name.unsafe_get(node)
     let c_type = "pact_{sname}"
     let tmp = fresh_temp("_s")
-    let flds_sl = np_fields.get(node)
+    let flds_sl = np_fields.unsafe_get(node)
     let mut inits = ""
     if flds_sl != -1 {
         let mut i = 0
         while i < sublist_length(flds_sl) {
             let sf = sublist_get(flds_sl, i)
-            let fname = np_name.get(sf)
-            emit_expr(np_value.get(sf))
+            let fname = np_name.unsafe_get(sf)
+            emit_expr(np_value.unsafe_get(sf))
             let val_str = expr_result_str
             if i > 0 {
                 inits = inits.concat(", ")
@@ -848,19 +848,19 @@ fn emit_struct_lit(node: Int) {
 fn emit_if_expr(node: Int) {
     let tmp = fresh_temp("_if_")
     // Infer type from then branch
-    let then_type = infer_block_type(np_then_body.get(node))
+    let then_type = infer_block_type(np_then_body.unsafe_get(node))
     emit_line("{c_type_str(then_type)} {tmp};")
-    emit_expr(np_condition.get(node))
+    emit_expr(np_condition.unsafe_get(node))
     let cond_str = expr_result_str
     emit_line("if ({cond_str}) \{")
     cg_indent = cg_indent + 1
-    let then_val = emit_block_value(np_then_body.get(node))
+    let then_val = emit_block_value(np_then_body.unsafe_get(node))
     emit_line("{tmp} = {then_val};")
     cg_indent = cg_indent - 1
-    if np_else_body.get(node) != -1 {
+    if np_else_body.unsafe_get(node) != -1 {
         emit_line("} else \{")
         cg_indent = cg_indent + 1
-        let else_val = emit_block_value(np_else_body.get(node))
+        let else_val = emit_block_value(np_else_body.unsafe_get(node))
         emit_line("{tmp} = {else_val};")
         cg_indent = cg_indent - 1
     }
@@ -871,14 +871,14 @@ fn emit_if_expr(node: Int) {
 }
 
 fn emit_match_expr(node: Int) {
-    let scrut = np_scrutinee.get(node)
+    let scrut = np_scrutinee.unsafe_get(node)
 
     // Build list of scrutinee values (multiple if tuple literal)
     match_scrut_strs = []
     match_scrut_types = []
 
-    if np_kind.get(scrut) == ND_TUPLE_LIT {
-        let elems_sl = np_elements.get(scrut)
+    if np_kind.unsafe_get(scrut) == ND_TUPLE_LIT {
+        let elems_sl = np_elements.unsafe_get(scrut)
         if elems_sl != -1 {
             let mut ei = 0
             while ei < sublist_length(elems_sl) {
@@ -897,7 +897,7 @@ fn emit_match_expr(node: Int) {
         match_scrut_types.push(expr_result_type)
     }
 
-    let arms_sl = np_arms.get(node)
+    let arms_sl = np_arms.unsafe_get(node)
     if arms_sl == -1 {
         expr_result_str = "0"
         expr_result_type = CT_VOID
@@ -913,7 +913,7 @@ fn emit_match_expr(node: Int) {
     let mut i = 0
     while i < sublist_length(arms_sl) {
         let arm = sublist_get(arms_sl, i)
-        let pat = np_pattern.get(arm)
+        let pat = np_pattern.unsafe_get(arm)
 
         let cond = pattern_condition(pat, 0, match_scrut_strs.len())
         let is_wildcard = cond == ""
@@ -932,7 +932,7 @@ fn emit_match_expr(node: Int) {
 
         cg_indent = cg_indent + 1
         bind_pattern_vars(pat, 0, match_scrut_strs.len())
-        let arm_val = emit_arm_value(np_body.get(arm))
+        let arm_val = emit_arm_value(np_body.unsafe_get(arm))
         emit_line("{result_var} = {arm_val};")
         cg_indent = cg_indent - 1
 
@@ -949,16 +949,16 @@ fn emit_match_expr(node: Int) {
 // scrut_off/scrut_len index into match_scrut_strs/match_scrut_types.
 // Returns "" when the pattern always matches (wildcard/ident).
 fn pattern_condition(pat: Int, scrut_off: Int, scrut_len: Int) -> Str {
-    let pk = np_kind.get(pat)
+    let pk = np_kind.unsafe_get(pat)
     if pk == ND_WILDCARD_PATTERN || pk == ND_IDENT_PATTERN {
         return ""
     }
     if pk == ND_INT_PATTERN {
-        let pat_val = np_str_val.get(pat)
-        return "({match_scrut_strs.get(scrut_off)} == {pat_val})"
+        let pat_val = np_str_val.unsafe_get(pat)
+        return "({match_scrut_strs.unsafe_get(scrut_off)} == {pat_val})"
     }
     if pk == ND_TUPLE_PATTERN {
-        let elems_sl = np_elements.get(pat)
+        let elems_sl = np_elements.unsafe_get(pat)
         if elems_sl == -1 {
             return ""
         }
@@ -985,18 +985,18 @@ fn pattern_condition(pat: Int, scrut_off: Int, scrut_len: Int) -> Str {
 // Emit C variable bindings for ident sub-patterns within a pattern.
 // scrut_off/scrut_len index into match_scrut_strs/match_scrut_types.
 fn bind_pattern_vars(pat: Int, scrut_off: Int, scrut_len: Int) {
-    let pk = np_kind.get(pat)
+    let pk = np_kind.unsafe_get(pat)
     if pk == ND_IDENT_PATTERN {
         if scrut_len == 1 {
-            let bind_name = np_name.get(pat)
-            let st = match_scrut_types.get(scrut_off)
-            emit_line("{c_type_str(st)} {bind_name} = {match_scrut_strs.get(scrut_off)};")
+            let bind_name = np_name.unsafe_get(pat)
+            let st = match_scrut_types.unsafe_get(scrut_off)
+            emit_line("{c_type_str(st)} {bind_name} = {match_scrut_strs.unsafe_get(scrut_off)};")
             set_var(bind_name, st, 1)
         }
         return
     }
     if pk == ND_TUPLE_PATTERN {
-        let elems_sl = np_elements.get(pat)
+        let elems_sl = np_elements.unsafe_get(pat)
         if elems_sl != -1 {
             let mut j = 0
             while j < sublist_length(elems_sl) {
@@ -1010,7 +1010,7 @@ fn bind_pattern_vars(pat: Int, scrut_off: Int, scrut_len: Int) {
 }
 
 fn emit_block_expr(node: Int) {
-    let stmts_sl = np_stmts.get(node)
+    let stmts_sl = np_stmts.unsafe_get(node)
     if stmts_sl == -1 {
         expr_result_str = "0"
         expr_result_type = CT_VOID
@@ -1024,9 +1024,9 @@ fn emit_block_expr(node: Int) {
     }
     if count > 0 {
         let last = sublist_get(stmts_sl, count - 1)
-        let last_kind = np_kind.get(last)
+        let last_kind = np_kind.unsafe_get(last)
         if last_kind == ND_EXPR_STMT {
-            emit_expr(np_value.get(last))
+            emit_expr(np_value.unsafe_get(last))
             return
         }
         emit_stmt(last)
@@ -1039,12 +1039,12 @@ fn emit_arm_value(body: Int) -> Str {
     if body == -1 {
         return "0"
     }
-    let kind = np_kind.get(body)
+    let kind = np_kind.unsafe_get(body)
     if kind == ND_BLOCK {
         return emit_block_value(body)
     }
     if kind == ND_EXPR_STMT {
-        emit_expr(np_value.get(body))
+        emit_expr(np_value.unsafe_get(body))
         return expr_result_str
     }
     emit_expr(body)
@@ -1055,7 +1055,7 @@ fn emit_block_value(block: Int) -> Str {
     if block == -1 {
         return "0"
     }
-    let stmts_sl = np_stmts.get(block)
+    let stmts_sl = np_stmts.unsafe_get(block)
     if stmts_sl == -1 {
         return "0"
     }
@@ -1069,9 +1069,9 @@ fn emit_block_value(block: Int) -> Str {
         i = i + 1
     }
     let last = sublist_get(stmts_sl, count - 1)
-    let last_kind = np_kind.get(last)
+    let last_kind = np_kind.unsafe_get(last)
     if last_kind == ND_EXPR_STMT {
-        emit_expr(np_value.get(last))
+        emit_expr(np_value.unsafe_get(last))
         return expr_result_str
     }
     if last_kind == ND_IF_EXPR {
@@ -1079,8 +1079,8 @@ fn emit_block_value(block: Int) -> Str {
         return expr_result_str
     }
     if last_kind == ND_RETURN {
-        if np_value.get(last) != -1 {
-            emit_expr(np_value.get(last))
+        if np_value.unsafe_get(last) != -1 {
+            emit_expr(np_value.unsafe_get(last))
             let val_s = expr_result_str
             emit_line("return {val_s};")
         } else {
@@ -1096,7 +1096,7 @@ fn infer_block_type(block: Int) -> Int {
     if block == -1 {
         return CT_VOID
     }
-    let stmts_sl = np_stmts.get(block)
+    let stmts_sl = np_stmts.unsafe_get(block)
     if stmts_sl == -1 {
         return CT_VOID
     }
@@ -1105,24 +1105,24 @@ fn infer_block_type(block: Int) -> Int {
         return CT_VOID
     }
     let last = sublist_get(stmts_sl, count - 1)
-    let last_kind = np_kind.get(last)
+    let last_kind = np_kind.unsafe_get(last)
     if last_kind == ND_EXPR_STMT {
-        return infer_expr_type(np_value.get(last))
+        return infer_expr_type(np_value.unsafe_get(last))
     }
     CT_VOID
 }
 
 fn infer_arm_type(arm: Int) -> Int {
-    let body = np_body.get(arm)
+    let body = np_body.unsafe_get(arm)
     if body == -1 {
         return CT_VOID
     }
-    let kind = np_kind.get(body)
+    let kind = np_kind.unsafe_get(body)
     if kind == ND_BLOCK {
         return infer_block_type(body)
     }
     if kind == ND_EXPR_STMT {
-        return infer_expr_type(np_value.get(body))
+        return infer_expr_type(np_value.unsafe_get(body))
     }
     infer_expr_type(body)
 }
@@ -1131,27 +1131,27 @@ fn infer_expr_type(node: Int) -> Int {
     if node == -1 {
         return CT_VOID
     }
-    let kind = np_kind.get(node)
+    let kind = np_kind.unsafe_get(node)
     if kind == ND_INT_LIT { return CT_INT }
     if kind == ND_FLOAT_LIT { return CT_FLOAT }
     if kind == ND_BOOL_LIT { return CT_BOOL }
     if kind == ND_INTERP_STRING { return CT_STRING }
     if kind == ND_LIST_LIT { return CT_LIST }
     if kind == ND_IDENT {
-        return get_var_type(np_name.get(node))
+        return get_var_type(np_name.unsafe_get(node))
     }
     if kind == ND_CALL {
-        let func_node = np_left.get(node)
-        if np_kind.get(func_node) == ND_IDENT {
-            return get_fn_ret(np_name.get(func_node))
+        let func_node = np_left.unsafe_get(node)
+        if np_kind.unsafe_get(func_node) == ND_IDENT {
+            return get_fn_ret(np_name.unsafe_get(func_node))
         }
     }
     if kind == ND_BIN_OP {
-        let op = np_op.get(node)
+        let op = np_op.unsafe_get(node)
         if op == "==" || op == "!=" || op == "<" || op == ">" || op == "<=" || op == ">=" || op == "&&" || op == "||" {
             return CT_BOOL
         }
-        return infer_expr_type(np_left.get(node))
+        return infer_expr_type(np_left.unsafe_get(node))
     }
     CT_VOID
 }
@@ -1159,10 +1159,10 @@ fn infer_expr_type(node: Int) -> Int {
 // ── Statement codegen ───────────────────────────────────────────────
 
 fn emit_stmt(node: Int) {
-    let kind = np_kind.get(node)
+    let kind = np_kind.unsafe_get(node)
 
     if kind == ND_EXPR_STMT {
-        emit_expr(np_value.get(node))
+        emit_expr(np_value.unsafe_get(node))
         let s = expr_result_str
         if s != "" && s != "0" {
             emit_line("{s};")
@@ -1176,27 +1176,27 @@ fn emit_stmt(node: Int) {
     }
 
     if kind == ND_ASSIGNMENT {
-        emit_expr(np_target.get(node))
+        emit_expr(np_target.unsafe_get(node))
         let target_str = expr_result_str
-        emit_expr(np_value.get(node))
+        emit_expr(np_value.unsafe_get(node))
         let val_str = expr_result_str
         emit_line("{target_str} = {val_str};")
         return
     }
 
     if kind == ND_COMPOUND_ASSIGN {
-        emit_expr(np_target.get(node))
+        emit_expr(np_target.unsafe_get(node))
         let target_str = expr_result_str
-        emit_expr(np_value.get(node))
+        emit_expr(np_value.unsafe_get(node))
         let val_str = expr_result_str
-        let op = np_op.get(node)
+        let op = np_op.unsafe_get(node)
         emit_line("{target_str} {op}= {val_str};")
         return
     }
 
     if kind == ND_RETURN {
-        if np_value.get(node) != -1 {
-            emit_expr(np_value.get(node))
+        if np_value.unsafe_get(node) != -1 {
+            emit_expr(np_value.unsafe_get(node))
             let val_str = expr_result_str
             emit_line("return {val_str};")
         } else {
@@ -1211,11 +1211,11 @@ fn emit_stmt(node: Int) {
     }
 
     if kind == ND_WHILE_LOOP {
-        emit_expr(np_condition.get(node))
+        emit_expr(np_condition.unsafe_get(node))
         let cond_str = expr_result_str
         emit_line("while ({cond_str}) \{")
         cg_indent = cg_indent + 1
-        emit_block(np_body.get(node))
+        emit_block(np_body.unsafe_get(node))
         cg_indent = cg_indent - 1
         emit_line("}")
         return
@@ -1224,7 +1224,7 @@ fn emit_stmt(node: Int) {
     if kind == ND_LOOP_EXPR {
         emit_line("while (1) \{")
         cg_indent = cg_indent + 1
-        emit_block(np_body.get(node))
+        emit_block(np_body.unsafe_get(node))
         cg_indent = cg_indent - 1
         emit_line("}")
         return
@@ -1259,20 +1259,20 @@ fn emit_stmt(node: Int) {
 }
 
 fn emit_let_binding(node: Int) {
-    emit_expr(np_value.get(node))
+    emit_expr(np_value.unsafe_get(node))
     let val_str = expr_result_str
     let val_type = expr_result_type
-    let name = np_name.get(node)
-    let is_mut = np_is_mut.get(node)
+    let name = np_name.unsafe_get(node)
+    let is_mut = np_is_mut.unsafe_get(node)
     set_var(name, val_type, is_mut)
-    let type_ann = np_target.get(node)
+    let type_ann = np_target.unsafe_get(node)
     if val_type == CT_LIST && type_ann != -1 {
-        let ann_name = np_name.get(type_ann)
+        let ann_name = np_name.unsafe_get(type_ann)
         if ann_name == "List" {
-            let elems_sl = np_elements.get(type_ann)
+            let elems_sl = np_elements.unsafe_get(type_ann)
             if elems_sl != -1 && sublist_length(elems_sl) > 0 {
                 let elem_ann = sublist_get(elems_sl, 0)
-                let elem_name = np_name.get(elem_ann)
+                let elem_name = np_name.unsafe_get(elem_ann)
                 set_list_elem_type(name, type_from_name(elem_name))
             }
         }
@@ -1286,24 +1286,24 @@ fn emit_let_binding(node: Int) {
 }
 
 fn emit_for_in(node: Int) {
-    let var_name = np_var_name.get(node)
-    let iter_node = np_iterable.get(node)
-    let iter_kind = np_kind.get(iter_node)
+    let var_name = np_var_name.unsafe_get(node)
+    let iter_node = np_iterable.unsafe_get(node)
+    let iter_kind = np_kind.unsafe_get(iter_node)
 
     if iter_kind == ND_RANGE_LIT {
-        emit_expr(np_start.get(iter_node))
+        emit_expr(np_start.unsafe_get(iter_node))
         let start_str = expr_result_str
-        emit_expr(np_end.get(iter_node))
+        emit_expr(np_end.unsafe_get(iter_node))
         let end_str = expr_result_str
         let mut op = "<"
-        if np_inclusive.get(iter_node) != 0 {
+        if np_inclusive.unsafe_get(iter_node) != 0 {
             op = "<="
         }
         emit_line("for (int64_t {var_name} = {start_str}; {var_name} {op} {end_str}; {var_name}++) \{")
         push_scope()
         set_var(var_name, CT_INT, 1)
         cg_indent = cg_indent + 1
-        emit_block(np_body.get(node))
+        emit_block(np_body.unsafe_get(node))
         cg_indent = cg_indent - 1
         pop_scope()
         emit_line("}")
@@ -1318,7 +1318,7 @@ fn emit_for_in(node: Int) {
             emit_line("    int64_t {var_name} = (int64_t)(intptr_t)pact_list_get({iter_str}, {idx});")
             set_var(var_name, CT_INT, 0)
             cg_indent = cg_indent + 1
-            emit_block(np_body.get(node))
+            emit_block(np_body.unsafe_get(node))
             cg_indent = cg_indent - 1
             pop_scope()
             emit_line("}")
@@ -1329,22 +1329,22 @@ fn emit_for_in(node: Int) {
 }
 
 fn emit_if_stmt(node: Int) {
-    emit_expr(np_condition.get(node))
+    emit_expr(np_condition.unsafe_get(node))
     let cond_str = expr_result_str
     emit_line("if ({cond_str}) \{")
     cg_indent = cg_indent + 1
-    emit_block(np_then_body.get(node))
+    emit_block(np_then_body.unsafe_get(node))
     cg_indent = cg_indent - 1
-    if np_else_body.get(node) != -1 {
-        let else_b = np_else_body.get(node)
-        let else_stmts = np_stmts.get(else_b)
+    if np_else_body.unsafe_get(node) != -1 {
+        let else_b = np_else_body.unsafe_get(node)
+        let else_stmts = np_stmts.unsafe_get(else_b)
         // Check for else-if chain
         if else_stmts != -1 && sublist_length(else_stmts) == 1 {
             let inner = sublist_get(else_stmts, 0)
-            if np_kind.get(inner) == ND_IF_EXPR {
+            if np_kind.unsafe_get(inner) == ND_IF_EXPR {
                 let saved_lines2 = cg_lines
                 cg_lines = []
-                emit_expr(np_condition.get(inner))
+                emit_expr(np_condition.unsafe_get(inner))
                 let hoisted_lines = cg_lines
                 cg_lines = saved_lines2
                 if hoisted_lines.len() > 0 {
@@ -1356,12 +1356,12 @@ fn emit_if_stmt(node: Int) {
                     let inner_cond = expr_result_str
                     emit_line("} else if ({inner_cond}) \{")
                     cg_indent = cg_indent + 1
-                    emit_block(np_then_body.get(inner))
+                    emit_block(np_then_body.unsafe_get(inner))
                     cg_indent = cg_indent - 1
-                    if np_else_body.get(inner) != -1 {
+                    if np_else_body.unsafe_get(inner) != -1 {
                         emit_line("} else \{")
                         cg_indent = cg_indent + 1
-                        emit_block(np_else_body.get(inner))
+                        emit_block(np_else_body.unsafe_get(inner))
                         cg_indent = cg_indent - 1
                     }
                 }
@@ -1381,7 +1381,7 @@ fn emit_block(block: Int) {
     if block == -1 {
         return
     }
-    let stmts_sl = np_stmts.get(block)
+    let stmts_sl = np_stmts.unsafe_get(block)
     if stmts_sl == -1 {
         return
     }
@@ -1395,7 +1395,7 @@ fn emit_block(block: Int) {
 // ── Function codegen ────────────────────────────────────────────────
 
 fn format_params(fn_node: Int) -> Str {
-    let params_sl = np_params.get(fn_node)
+    let params_sl = np_params.unsafe_get(fn_node)
     if params_sl == -1 {
         return "void"
     }
@@ -1407,8 +1407,8 @@ fn format_params(fn_node: Int) -> Str {
     let mut i = 0
     while i < count {
         let p = sublist_get(params_sl, i)
-        let pname = np_name.get(p)
-        let ptype = np_type_name.get(p)
+        let pname = np_name.unsafe_get(p)
+        let ptype = np_type_name.unsafe_get(p)
         let ct = type_from_name(ptype)
         if i > 0 {
             result = result.concat(", ")
@@ -1420,12 +1420,12 @@ fn format_params(fn_node: Int) -> Str {
 }
 
 fn emit_fn_decl(fn_node: Int) {
-    let name = np_name.get(fn_node)
+    let name = np_name.unsafe_get(fn_node)
     if name == "main" {
         emit_line("void pact_main(void);")
         return
     }
-    let ret_str = np_return_type.get(fn_node)
+    let ret_str = np_return_type.unsafe_get(fn_node)
     let ret_type = type_from_name(ret_str)
     let params = format_params(fn_node)
     emit_line("{c_type_str(ret_type)} pact_{name}({params});")
@@ -1434,8 +1434,8 @@ fn emit_fn_decl(fn_node: Int) {
 fn emit_fn_def(fn_node: Int) {
     push_scope()
     cg_temp_counter = 0
-    let name = np_name.get(fn_node)
-    let ret_str = np_return_type.get(fn_node)
+    let name = np_name.unsafe_get(fn_node)
+    let ret_str = np_return_type.unsafe_get(fn_node)
     let ret_type = type_from_name(ret_str)
     let mut sig = ""
     if name == "main" {
@@ -1446,13 +1446,13 @@ fn emit_fn_def(fn_node: Int) {
     }
 
     // Register params in scope
-    let params_sl = np_params.get(fn_node)
+    let params_sl = np_params.unsafe_get(fn_node)
     if params_sl != -1 {
         let mut i = 0
         while i < sublist_length(params_sl) {
             let p = sublist_get(params_sl, i)
-            let pname = np_name.get(p)
-            let ptype = np_type_name.get(p)
+            let pname = np_name.unsafe_get(p)
+            let ptype = np_type_name.unsafe_get(p)
             set_var(pname, type_from_name(ptype), 1)
             i = i + 1
         }
@@ -1460,7 +1460,7 @@ fn emit_fn_def(fn_node: Int) {
 
     emit_line("{sig} \{")
     cg_indent = cg_indent + 1
-    emit_fn_body(np_body.get(fn_node), ret_type)
+    emit_fn_body(np_body.unsafe_get(fn_node), ret_type)
     cg_indent = cg_indent - 1
     emit_line("}")
     pop_scope()
@@ -1470,7 +1470,7 @@ fn emit_fn_body(block: Int, ret_type: Int) {
     if block == -1 {
         return
     }
-    let stmts_sl = np_stmts.get(block)
+    let stmts_sl = np_stmts.unsafe_get(block)
     if stmts_sl == -1 {
         return
     }
@@ -1484,9 +1484,9 @@ fn emit_fn_body(block: Int, ret_type: Int) {
         i = i + 1
     }
     let last = sublist_get(stmts_sl, count - 1)
-    let last_kind = np_kind.get(last)
+    let last_kind = np_kind.unsafe_get(last)
     if ret_type != CT_VOID && last_kind == ND_EXPR_STMT {
-        emit_expr(np_value.get(last))
+        emit_expr(np_value.unsafe_get(last))
         let val_str = expr_result_str
         emit_line("return {val_str};")
     } else if ret_type != CT_VOID && last_kind == ND_IF_EXPR {
@@ -1501,15 +1501,15 @@ fn emit_fn_body(block: Int, ret_type: Int) {
 // ── Type definition codegen ─────────────────────────────────────────
 
 fn emit_struct_typedef(td_node: Int) {
-    let name = np_name.get(td_node)
-    let flds_sl = np_fields.get(td_node)
+    let name = np_name.unsafe_get(td_node)
+    let flds_sl = np_fields.unsafe_get(td_node)
     if flds_sl == -1 {
         return
     }
     // Check if this is a variant-only type (enum), skip for now
     if sublist_length(flds_sl) > 0 {
         let first = sublist_get(flds_sl, 0)
-        if np_kind.get(first) == ND_TYPE_VARIANT {
+        if np_kind.unsafe_get(first) == ND_TYPE_VARIANT {
             return
         }
     }
@@ -1518,10 +1518,10 @@ fn emit_struct_typedef(td_node: Int) {
     let mut i = 0
     while i < sublist_length(flds_sl) {
         let f = sublist_get(flds_sl, i)
-        let fname = np_name.get(f)
-        let type_ann_node = np_value.get(f)
+        let fname = np_name.unsafe_get(f)
+        let type_ann_node = np_value.unsafe_get(f)
         if type_ann_node != -1 {
-            let type_name = np_name.get(type_ann_node)
+            let type_name = np_name.unsafe_get(type_ann_node)
             if type_name == name {
                 emit_line("int64_t {fname};")
             } else if is_struct_type(type_name) != 0 {
@@ -1545,23 +1545,23 @@ fn emit_struct_typedef(td_node: Int) {
 fn emit_top_level_let(node: Int) {
     let saved_lines = cg_lines
     cg_lines = []
-    emit_expr(np_value.get(node))
+    emit_expr(np_value.unsafe_get(node))
     let val_str = expr_result_str
     let val_type = expr_result_type
     let helper_lines = cg_lines
     cg_lines = saved_lines
-    let name = np_name.get(node)
-    let is_mut = np_is_mut.get(node)
+    let name = np_name.unsafe_get(node)
+    let is_mut = np_is_mut.unsafe_get(node)
     set_var(name, val_type, is_mut)
     // Track list element type from annotation
-    let type_ann = np_target.get(node)
+    let type_ann = np_target.unsafe_get(node)
     if val_type == CT_LIST && type_ann != -1 {
-        let ann_name = np_name.get(type_ann)
+        let ann_name = np_name.unsafe_get(type_ann)
         if ann_name == "List" {
-            let elems_sl = np_elements.get(type_ann)
+            let elems_sl = np_elements.unsafe_get(type_ann)
             if elems_sl != -1 && sublist_length(elems_sl) > 0 {
                 let elem_ann = sublist_get(elems_sl, 0)
-                let elem_name = np_name.get(elem_ann)
+                let elem_name = np_name.unsafe_get(elem_ann)
                 set_list_elem_type(name, type_from_name(elem_name))
             }
         }
@@ -1572,7 +1572,7 @@ fn emit_top_level_let(node: Int) {
         emit_line("static {ts} {name};")
         let mut hi = 0
         while hi < helper_lines.len() {
-            cg_global_inits.push(helper_lines.get(hi))
+            cg_global_inits.push(helper_lines.unsafe_get(hi))
             hi = hi + 1
         }
         cg_global_inits.push("    {name} = {val_str};")
@@ -1614,11 +1614,11 @@ fn generate(program: Int) -> Str {
     cg_lines.push("")
 
     // Register struct names first
-    let types_sl = np_fields.get(program)
+    let types_sl = np_fields.unsafe_get(program)
     if types_sl != -1 {
         let mut i = 0
         while i < sublist_length(types_sl) {
-            struct_reg_names.push(np_name.get(sublist_get(types_sl, i)))
+            struct_reg_names.push(np_name.unsafe_get(sublist_get(types_sl, i)))
             i = i + 1
         }
     }
@@ -1633,12 +1633,12 @@ fn generate(program: Int) -> Str {
     }
 
     // Top-level let bindings (deduplicated)
-    let lets_sl = np_stmts.get(program)
+    let lets_sl = np_stmts.unsafe_get(program)
     if lets_sl != -1 {
         let mut i = 0
         while i < sublist_length(lets_sl) {
             let let_node = sublist_get(lets_sl, i)
-            let let_name = np_name.get(let_node)
+            let let_name = np_name.unsafe_get(let_node)
             if is_emitted_let(let_name) == 0 {
                 emit_top_level_let(let_node)
                 emitted_let_names.push(let_name)
@@ -1649,14 +1649,14 @@ fn generate(program: Int) -> Str {
     }
 
     // Register all functions first (deduplicated)
-    let fns_sl = np_params.get(program)
+    let fns_sl = np_params.unsafe_get(program)
     if fns_sl != -1 {
         let mut i = 0
         while i < sublist_length(fns_sl) {
             let fn_node = sublist_get(fns_sl, i)
-            let fn_name = np_name.get(fn_node)
+            let fn_name = np_name.unsafe_get(fn_node)
             if is_emitted_fn(fn_name) == 0 {
-                let ret_str = np_return_type.get(fn_node)
+                let ret_str = np_return_type.unsafe_get(fn_node)
                 reg_fn(fn_name, type_from_name(ret_str))
                 emitted_fn_names.push(fn_name)
             }
@@ -1670,7 +1670,7 @@ fn generate(program: Int) -> Str {
         let mut i = 0
         while i < sublist_length(fns_sl) {
             let fn_node = sublist_get(fns_sl, i)
-            let fn_name = np_name.get(fn_node)
+            let fn_name = np_name.unsafe_get(fn_node)
             if is_emitted_fn(fn_name) == 0 {
                 emit_fn_decl(fn_node)
                 emitted_fn_names.push(fn_name)
@@ -1686,7 +1686,7 @@ fn generate(program: Int) -> Str {
         let mut i = 0
         while i < sublist_length(fns_sl) {
             let fn_node = sublist_get(fns_sl, i)
-            let fn_name = np_name.get(fn_node)
+            let fn_name = np_name.unsafe_get(fn_node)
             if is_emitted_fn(fn_name) == 0 {
                 emit_fn_def(fn_node)
                 emit_line("")
@@ -1701,7 +1701,7 @@ fn generate(program: Int) -> Str {
         emit_line("static void __pact_init_globals(void) \{")
         let mut gi = 0
         while gi < cg_global_inits.len() {
-            cg_lines.push(cg_global_inits.get(gi))
+            cg_lines.push(cg_global_inits.unsafe_get(gi))
             gi = gi + 1
         }
         emit_line("}")

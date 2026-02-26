@@ -162,8 +162,8 @@ fn dr_parse_request(s: Str) -> Int {
 fn dr_get(key: Str) -> Str {
     let mut i = 0
     while i < dr_keys.len() {
-        if dr_keys.get(i) == key {
-            return dr_vals.get(i)
+        if dr_keys.unsafe_get(i) == key {
+            return dr_vals.unsafe_get(i)
         }
         i = i + 1
     }
@@ -188,14 +188,14 @@ fn daemon_diags_to_json() -> Str {
     let mut i = 0
     while i < diag_severity.len() {
         let obj = json_new_object()
-        json_set(obj, "severity", json_new_str(diag_severity.get(i)))
-        json_set(obj, "name", json_new_str(diag_name.get(i)))
-        json_set(obj, "code", json_new_str(diag_code.get(i)))
-        json_set(obj, "message", json_new_str(diag_message.get(i)))
-        json_set(obj, "file", json_new_str(diag_file.get(i)))
-        json_set(obj, "line", json_new_int(diag_line.get(i)))
-        json_set(obj, "col", json_new_int(diag_col.get(i)))
-        let help = diag_help.get(i)
+        json_set(obj, "severity", json_new_str(diag_severity.unsafe_get(i)))
+        json_set(obj, "name", json_new_str(diag_name.unsafe_get(i)))
+        json_set(obj, "code", json_new_str(diag_code.unsafe_get(i)))
+        json_set(obj, "message", json_new_str(diag_message.unsafe_get(i)))
+        json_set(obj, "file", json_new_str(diag_file.unsafe_get(i)))
+        json_set(obj, "line", json_new_int(diag_line.unsafe_get(i)))
+        json_set(obj, "col", json_new_int(diag_col.unsafe_get(i)))
+        let help = diag_help.unsafe_get(i)
         if help != "" {
             json_set(obj, "help", json_new_str(help))
         }
@@ -224,8 +224,8 @@ fn daemon_handle_check() -> Str ! Daemon.Serve, Lex.Tokenize, Parse, TypeCheck, 
     let mut affected_names: List[Str] = []
     let mut i = 0
     while i < inc_affected_count {
-        let sym_idx = inc_affected.get(i)
-        affected_names.push(si_sym_name.get(sym_idx))
+        let sym_idx = inc_affected.unsafe_get(i)
+        affected_names.push(si_sym_name.unsafe_get(sym_idx))
         i = i + 1
     }
 
