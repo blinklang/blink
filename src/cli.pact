@@ -159,6 +159,8 @@ fn do_compile(source_path: Str, c_path: Str, format_flag: Str, debug_mode: Int) 
         cg_debug_mode = 0
     }
 
+    cg_runtime_header = resolve_runtime_header()
+
     let c_output = generate(final_program)
 
     if diag_count > 0 {
@@ -170,12 +172,21 @@ fn do_compile(source_path: Str, c_path: Str, format_flag: Str, debug_mode: Int) 
     return 0
 }
 
-fn runtime_include_flag() -> Str {
+fn resolve_runtime_header() -> Str {
     let pact_root = get_env("PACT_ROOT") ?? ""
     if pact_root != "" {
-        return "-I{pact_root}/bootstrap"
+        let path = "{pact_root}/bootstrap/runtime.h"
+        if file_exists(path) == 1 {
+            return read_file(path)
+        }
     }
-    return "-Ibuild"
+    if file_exists("build/runtime.h") == 1 {
+        return read_file("build/runtime.h")
+    }
+    if file_exists("bootstrap/runtime.h") == 1 {
+        return read_file("bootstrap/runtime.h")
+    }
+    return ""
 }
 
 fn do_build(source_path: Str, output_path: Str, c_path: Str, format_flag: Str, debug_mode: Int) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen {
@@ -195,10 +206,9 @@ fn do_build(source_path: Str, output_path: Str, c_path: Str, format_flag: Str, d
         link_flags = "{link_flags} -lcurl"
     }
 
-    let include_flag = runtime_include_flag()
-    let mut cc_cmd = "cc -o {output_path} {c_path} {include_flag} {link_flags}"
+    let mut cc_cmd = "cc -o {output_path} {c_path} {link_flags}"
     if debug_mode != 0 {
-        cc_cmd = "cc -g -O0 -o {output_path} {c_path} {include_flag} {link_flags}"
+        cc_cmd = "cc -g -O0 -o {output_path} {c_path} {link_flags}"
     }
     let cc_rc = shell_exec(cc_cmd)
     if cc_rc != 0 {

@@ -271,7 +271,11 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
     }
 
     // Preamble: include runtime
-    cg_lines.push("#include \"runtime.h\"")
+    if cg_runtime_header != "" {
+        cg_lines.push(cg_runtime_header)
+    } else {
+        cg_lines.push("#include \"runtime.h\"")
+    }
     cg_lines.push("")
     cg_lines.push("static pact_ctx __pact_ctx;")
     cg_lines.push("")
@@ -885,7 +889,11 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
     pop_scope()
 
     if cg_uses_curl != 0 {
-        cg_lines.set(0, "#define PACT_USE_CURL\n#include \"runtime.h\"")
+        if cg_runtime_header != "" {
+            cg_lines.set(0, "#define PACT_USE_CURL\n{cg_runtime_header}")
+        } else {
+            cg_lines.set(0, "#define PACT_USE_CURL\n#include \"runtime.h\"")
+        }
     }
 
     join_lines()

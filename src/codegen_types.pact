@@ -398,6 +398,9 @@ pub let mut match_scrut_enum: Str = ""
 // Debug mode: 0 = release (strip debug_assert), 1 = debug (emit checks)
 pub let mut cg_debug_mode: Int = 0
 
+// Inlined runtime.h content; if non-empty, emitted directly instead of #include
+pub let mut cg_runtime_header: Str = ""
+
 pub fn push_scope() ! Codegen.Scope {
     scope_frame_starts.push(scope_vars.len())
 }

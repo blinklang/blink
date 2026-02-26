@@ -8,6 +8,34 @@ Pact was created through a multi-expert AI panel process — multiple AI special
 
 ---
 
+## Install
+
+**Prerequisite:** A C compiler (`cc`, `gcc`, or `clang`) must be on your PATH.
+- macOS: `xcode-select --install`
+- Ubuntu/Debian: `sudo apt install build-essential`
+- Fedora: `sudo dnf install gcc`
+- Arch: `sudo pacman -S base-devel`
+
+### Binary download
+
+Download `pact` for your platform from the [latest release](https://github.com/nhumrich/pact/releases/latest), then:
+
+```sh
+chmod +x pact-*
+sudo mv pact-* /usr/local/bin/pact
+```
+
+### Build from source
+
+```sh
+git clone https://github.com/nhumrich/pact.git
+cd pact
+./bootstrap/bootstrap.sh
+bin/pact run examples/fizzbuzz.pact   # verify it works
+```
+
+---
+
 ## 30-Second Tour
 
 ### Hello World

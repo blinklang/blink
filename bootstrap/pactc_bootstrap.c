@@ -568,6 +568,7 @@ static int64_t cg_async_scope_counter = 0;
 static pact_list* match_scruts;
 static const char* match_scrut_enum = "";
 static int64_t cg_debug_mode = 0;
+static const char* cg_runtime_header = "";
 static pact_list* prescan_mut_names;
 static pact_list* prescan_closure_idents;
 static const char* expr_result_str = "";
@@ -20261,7 +20262,11 @@ const char* pact_codegen_generate(int64_t program) {
             ai = (ai + 1);
         }
     }
-    pact_list_push(cg_lines, (void*)"#include \"runtime.h\"");
+    if ((!pact_str_eq(cg_runtime_header, ""))) {
+        pact_list_push(cg_lines, (void*)cg_runtime_header);
+    } else {
+        pact_list_push(cg_lines, (void*)"#include \"runtime.h\"");
+    }
     pact_list_push(cg_lines, (void*)"");
     pact_list_push(cg_lines, (void*)"static pact_ctx __pact_ctx;");
     pact_list_push(cg_lines, (void*)"");
@@ -20911,7 +20916,13 @@ const char* pact_codegen_generate(int64_t program) {
     pact_codegen_types_emit_line("}");
     pact_codegen_types_pop_scope();
     if ((cg_uses_curl != 0)) {
-        pact_list_set(cg_lines, 0, (void*)"#define PACT_USE_CURL\n#include \"runtime.h\"");
+        if ((!pact_str_eq(cg_runtime_header, ""))) {
+            char _si_124[4096];
+            snprintf(_si_124, 4096, "#define PACT_USE_CURL\n%s", cg_runtime_header);
+            pact_list_set(cg_lines, 0, (void*)strdup(_si_124));
+        } else {
+            pact_list_set(cg_lines, 0, (void*)"#define PACT_USE_CURL\n#include \"runtime.h\"");
+        }
     }
     return pact_codegen_types_join_lines();
 }
