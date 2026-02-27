@@ -1,16 +1,7 @@
 import std.http_types
 import std.http_server
 
-fn check(cond: Int, label: Str) {
-    if cond != 0 {
-        io.println("PASS: {label}")
-    } else {
-        io.println("FAIL: {label}")
-    }
-}
-
-fn test_before_hooks() {
-    io.println("--- before hooks ---")
+test "before hooks" {
     let mut srv = server_new("127.0.0.1", 8080)
 
     srv = server_use(srv, "add-header", fn(r: Request) -> Request {
@@ -21,9 +12,8 @@ fn test_before_hooks() {
         response_ok("ok")
     })
 
-    check(srv.before_hooks.len() == 1, "one hook registered")
+    assert_eq(srv.before_hooks.len(), 1)
 
-    // Simulate the hook chain
     let mut req = request_new("GET", "/test")
     let mut hi = 0
     while hi < srv.before_hooks.len() {
@@ -31,11 +21,10 @@ fn test_before_hooks() {
         req = hook.process(req)
         hi = hi + 1
     }
-    check(req.method == "GET", "method preserved through hook")
+    assert_eq(req.method, "GET")
 }
 
-fn test_error_handler() {
-    io.println("--- error handler ---")
+test "error handler" {
     let mut srv = server_new("127.0.0.1", 8080)
     srv = server_on_error(srv, fn(r: Request, msg: Str) -> Response {
         Response { status: 500, body: "custom error: {msg}", headers: Map() }
@@ -43,22 +32,20 @@ fn test_error_handler() {
 
     let req = request_new("GET", "/fail")
     let resp = srv.error_handler.on_error(req, "something broke")
-    check(resp.status == 500, "error handler status 500")
-    check(resp.body == "custom error: something broke", "error handler body")
+    assert_eq(resp.status, 500)
+    assert_eq(resp.body, "custom error: something broke")
 }
 
-fn test_default_error_handler() {
-    io.println("--- default error handler ---")
+test "default error handler" {
     let srv = server_new("127.0.0.1", 8080)
 
     let req = request_new("GET", "/fail")
     let resp = srv.error_handler.on_error(req, "oops")
-    check(resp.status == 500, "default error handler status 500")
-    check(resp.body == "Internal Server Error: oops", "default error handler body")
+    assert_eq(resp.status, 500)
+    assert_eq(resp.body, "Internal Server Error: oops")
 }
 
-fn test_multiple_hooks() {
-    io.println("--- multiple hooks ---")
+test "multiple hooks" {
     let mut srv = server_new("127.0.0.1", 8080)
 
     srv = server_use(srv, "hook-1", fn(req: Request) -> Request {
@@ -68,16 +55,15 @@ fn test_multiple_hooks() {
         request_with_header(req, "X-Hook-2", "yes")
     })
 
-    check(srv.before_hooks.len() == 2, "two hooks registered")
+    assert_eq(srv.before_hooks.len(), 2)
 
     let h0 = srv.before_hooks.get(0).unwrap()
-    check(h0.name == "hook-1", "first hook name")
+    assert_eq(h0.name, "hook-1")
     let h1 = srv.before_hooks.get(1).unwrap()
-    check(h1.name == "hook-2", "second hook name")
+    assert_eq(h1.name, "hook-2")
 }
 
-fn test_hook_chain_execution() {
-    io.println("--- hook chain execution ---")
+test "hook chain execution" {
     let mut srv = server_new("127.0.0.1", 8080)
 
     srv = server_use(srv, "add-method-header", fn(r: Request) -> Request {
@@ -95,16 +81,6 @@ fn test_hook_chain_execution() {
         hi = hi + 1
     }
 
-    check(req.method == "POST", "method preserved")
-    check(req.url == "/data", "url preserved")
-}
-
-fn main() {
-    io.println("=== middleware tests ===")
-    test_before_hooks()
-    test_error_handler()
-    test_default_error_handler()
-    test_multiple_hooks()
-    test_hook_chain_execution()
-    io.println("=== done ===")
+    assert_eq(req.method, "POST")
+    assert_eq(req.url, "/data")
 }

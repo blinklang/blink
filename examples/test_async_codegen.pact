@@ -8,19 +8,15 @@ fn compute(n: Int) -> Int {
     sum
 }
 
-fn main() {
-    // Test 1: basic async.spawn + await
+test "basic spawn and await" {
     let h1 = async.spawn(fn() {
         compute(100)
     })
     let result1 = h1.await
-    if result1 == 4950 {
-        io.println("PASS: async.spawn + await returned correct value")
-    } else {
-        io.println("FAIL: expected 4950, got something else")
-    }
+    assert_eq(result1, 4950)
+}
 
-    // Test 2: multiple spawns
+test "multiple spawns" {
     let h2 = async.spawn(fn() {
         10 + 20
     })
@@ -29,22 +25,14 @@ fn main() {
     })
     let r2 = h2.await
     let r3 = h3.await
-    if r2 == 30 && r3 == 300 {
-        io.println("PASS: multiple async spawns work correctly")
-    } else {
-        io.println("FAIL: multiple async spawns returned wrong values")
-    }
+    assert_eq(r2, 30)
+    assert_eq(r3, 300)
+}
 
-    // Test 3: async.scope (synchronous block)
+test "async scope" {
     let scoped = async.scope {
         let x = 5
         x * 10
     }
-    if scoped == 50 {
-        io.println("PASS: async.scope works correctly")
-    } else {
-        io.println("FAIL: async.scope returned wrong value")
-    }
-
-    io.println("async codegen tests complete")
+    assert_eq(scoped, 50)
 }

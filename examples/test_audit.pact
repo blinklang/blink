@@ -6,23 +6,7 @@ fn write_lockfile_content(path: Str, packages: Str) {
     write_file(path, header.concat(packages))
 }
 
-fn check_int(actual: Int, expected: Int, label: Str) {
-    if actual == expected {
-        io.println("PASS: {label}")
-    } else {
-        io.println("FAIL: {label} — expected {expected}, got {actual}")
-    }
-}
-
-fn check_str(actual: Str, expected: Str, label: Str) {
-    if actual == expected {
-        io.println("PASS: {label}")
-    } else {
-        io.println("FAIL: {label} — expected \"{expected}\", got \"{actual}\"")
-    }
-}
-
-fn test_no_escalation() {
+test "no escalation" {
     audit_clear()
     lockfile_clear()
 
@@ -35,10 +19,10 @@ fn test_no_escalation() {
     lockfile_load("/tmp/_pact_test_current.lock")
 
     let count = audit_check()
-    check_int(count, 0, "no escalation: count == 0")
+    assert_eq(count, 0)
 }
 
-fn test_new_capability() {
+test "new capability" {
     audit_clear()
     lockfile_clear()
 
@@ -53,13 +37,13 @@ fn test_new_capability() {
     lockfile_load("/tmp/_pact_test_current.lock")
 
     let count = audit_check()
-    check_int(count, 1, "new cap: count == 1")
-    check_str(escalation_types.get(0).unwrap(), "escalation", "new cap: type is escalation")
-    check_str(escalation_names.get(0).unwrap(), "mylib", "new cap: name is mylib")
-    check_str(escalation_new_caps.get(0).unwrap(), "FS.Read", "new cap: new cap is FS.Read")
+    assert_eq(count, 1)
+    assert_eq(escalation_types.get(0).unwrap(), "escalation")
+    assert_eq(escalation_names.get(0).unwrap(), "mylib")
+    assert_eq(escalation_new_caps.get(0).unwrap(), "FS.Read")
 }
 
-fn test_new_pkg_with_caps() {
+test "new package with capabilities" {
     audit_clear()
     lockfile_clear()
 
@@ -74,12 +58,12 @@ fn test_new_pkg_with_caps() {
     lockfile_load("/tmp/_pact_test_current.lock")
 
     let count = audit_check()
-    check_int(count, 1, "new pkg with caps: count == 1")
-    check_str(escalation_types.get(0).unwrap(), "new_pkg", "new pkg with caps: type is new_pkg")
-    check_str(escalation_names.get(0).unwrap(), "newlib", "new pkg with caps: name is newlib")
+    assert_eq(count, 1)
+    assert_eq(escalation_types.get(0).unwrap(), "new_pkg")
+    assert_eq(escalation_names.get(0).unwrap(), "newlib")
 }
 
-fn test_new_pkg_without_caps() {
+test "new package without capabilities" {
     audit_clear()
     lockfile_clear()
 
@@ -94,10 +78,10 @@ fn test_new_pkg_without_caps() {
     lockfile_load("/tmp/_pact_test_current.lock")
 
     let count = audit_check()
-    check_int(count, 0, "new pkg no caps: count == 0")
+    assert_eq(count, 0)
 }
 
-fn test_removed_package() {
+test "removed package" {
     audit_clear()
     lockfile_clear()
 
@@ -112,10 +96,10 @@ fn test_removed_package() {
     lockfile_load("/tmp/_pact_test_current.lock")
 
     let count = audit_check()
-    check_int(count, 0, "removed pkg: count == 0")
+    assert_eq(count, 0)
 }
 
-fn test_clear_state() {
+test "clear state" {
     audit_clear()
     lockfile_clear()
 
@@ -129,14 +113,14 @@ fn test_clear_state() {
     audit_load_baseline("/tmp/_pact_test_baseline.lock")
     lockfile_load("/tmp/_pact_test_current.lock")
     audit_check()
-    check_int(escalation_names.len(), 1, "clear: has 1 escalation before clear")
+    assert_eq(escalation_names.len(), 1)
 
     audit_clear()
-    check_int(escalation_names.len(), 0, "clear: 0 escalations after clear")
-    check_int(escalation_types.len(), 0, "clear: 0 types after clear")
+    assert_eq(escalation_names.len(), 0)
+    assert_eq(escalation_types.len(), 0)
 }
 
-fn test_multiple_escalations() {
+test "multiple escalations" {
     audit_clear()
     lockfile_clear()
 
@@ -151,20 +135,11 @@ fn test_multiple_escalations() {
     lockfile_load("/tmp/_pact_test_current.lock")
 
     let count = audit_check()
-    check_int(count, 2, "multi: count == 2")
-    check_str(escalation_types.get(0).unwrap(), "escalation", "multi: first is escalation")
-    check_str(escalation_types.get(1).unwrap(), "escalation", "multi: second is escalation")
+    assert_eq(count, 2)
+    assert_eq(escalation_types.get(0).unwrap(), "escalation")
+    assert_eq(escalation_types.get(1).unwrap(), "escalation")
 }
 
-fn main() {
-    test_no_escalation()
-    test_new_capability()
-    test_new_pkg_with_caps()
-    test_new_pkg_without_caps()
-    test_removed_package()
-    test_clear_state()
-    test_multiple_escalations()
-
+test "cleanup" {
     shell_exec("rm -f /tmp/_pact_test_baseline.lock /tmp/_pact_test_current.lock")
-    io.println("All audit tests complete")
 }

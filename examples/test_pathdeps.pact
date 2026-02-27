@@ -1,33 +1,28 @@
 import std.pathdeps
 
-fn check_str(actual: Str, expected: Str, label: Str) {
-    if actual == expected {
-        io.println("PASS: {label}")
-    } else {
-        io.println("FAIL: {label} — expected \"{expected}\", got \"{actual}\"")
-    }
+test "clear" {
+    resolved_names.push("test")
+    resolved_versions.push("1.0")
+    resolved_sources.push("path:/x")
+    resolved_hashes.push("abc")
+    resolved_caps.push("")
+
+    pathdeps_clear()
+    assert_eq(pathdeps_count(), 0)
+    assert_eq(pathdeps_get_name(0), "")
 }
 
-fn check_int(actual: Int, expected: Int, label: Str) {
-    if actual == expected {
-        io.println("PASS: {label}")
-    } else {
-        io.println("FAIL: {label} — expected {expected}, got {actual}")
-    }
+test "query bounds" {
+    pathdeps_clear()
+    assert_eq(pathdeps_get_name(-1), "")
+    assert_eq(pathdeps_get_version(-1), "")
+    assert_eq(pathdeps_get_source(-1), "")
+    assert_eq(pathdeps_get_hash(-1), "")
+    assert_eq(pathdeps_get_caps(-1), "")
+    assert_eq(pathdeps_get_name(99), "")
 }
 
-fn check_starts_with(actual: Str, prefix: Str, label: Str) {
-    if actual.starts_with(prefix) {
-        io.println("PASS: {label}")
-    } else {
-        io.println("FAIL: {label} — expected to start with \"{prefix}\", got \"{actual}\"")
-    }
-}
-
-// ── Test: single path dependency ───────────────────────────────
-
-fn test_single_path_dep() {
-    io.println("--- test_single_path_dep ---")
+test "single path dep" {
     shell_exec("rm -rf /tmp/_pact_test_single")
     shell_exec("mkdir -p /tmp/_pact_test_single/mylib/src")
 
@@ -37,20 +32,17 @@ fn test_single_path_dep() {
 
     pathdeps_clear()
     let rc = resolve_path_deps("/tmp/_pact_test_single")
-    check_int(rc, 0, "single dep resolves ok")
-    check_int(pathdeps_count(), 1, "one dep resolved")
-    check_str(pathdeps_get_name(0), "mylib", "dep name")
-    check_str(pathdeps_get_version(0), "0.1.0", "dep version")
-    check_starts_with(pathdeps_get_source(0), "path:", "dep source starts with path:")
+    assert_eq(rc, 0)
+    assert_eq(pathdeps_count(), 1)
+    assert_eq(pathdeps_get_name(0), "mylib")
+    assert_eq(pathdeps_get_version(0), "0.1.0")
+    assert(pathdeps_get_source(0).starts_with("path:"))
     // Hash should be a 64-char hex string
     let hash = pathdeps_get_hash(0)
-    check_int(hash.len(), 64, "hash is 64 chars")
+    assert_eq(hash.len(), 64)
 }
 
-// ── Test: transitive deps (A -> B -> C) ────────────────────────
-
-fn test_transitive_deps() {
-    io.println("--- test_transitive_deps ---")
+test "transitive deps" {
     shell_exec("rm -rf /tmp/_pact_test_trans")
     shell_exec("mkdir -p /tmp/_pact_test_trans/libB/libC/src")
     shell_exec("mkdir -p /tmp/_pact_test_trans/libB/src")
@@ -63,20 +55,17 @@ fn test_transitive_deps() {
 
     pathdeps_clear()
     let rc = resolve_path_deps("/tmp/_pact_test_trans")
-    check_int(rc, 0, "transitive resolves ok")
-    check_int(pathdeps_count(), 2, "two deps resolved (B and C)")
+    assert_eq(rc, 0)
+    assert_eq(pathdeps_count(), 2)
 
     // B should be resolved first, then C (depth-first from B)
-    check_str(pathdeps_get_name(0), "libB", "first resolved is libB")
-    check_str(pathdeps_get_name(1), "libC", "second resolved is libC")
-    check_str(pathdeps_get_version(0), "0.2.0", "libB version")
-    check_str(pathdeps_get_version(1), "0.3.0", "libC version")
+    assert_eq(pathdeps_get_name(0), "libB")
+    assert_eq(pathdeps_get_name(1), "libC")
+    assert_eq(pathdeps_get_version(0), "0.2.0")
+    assert_eq(pathdeps_get_version(1), "0.3.0")
 }
 
-// ── Test: cycle detection ──────────────────────────────────────
-
-fn test_cycle_detection() {
-    io.println("--- test_cycle_detection ---")
+test "cycle detection" {
     shell_exec("rm -rf /tmp/_pact_test_cycle")
     shell_exec("mkdir -p /tmp/_pact_test_cycle/libA")
     shell_exec("mkdir -p /tmp/_pact_test_cycle/libB")
@@ -88,13 +77,10 @@ fn test_cycle_detection() {
 
     pathdeps_clear()
     let rc = resolve_path_deps("/tmp/_pact_test_cycle")
-    check_int(rc, 1, "cycle detection returns error")
+    assert_eq(rc, 1)
 }
 
-// ── Test: missing directory ────────────────────────────────────
-
-fn test_missing_directory() {
-    io.println("--- test_missing_directory ---")
+test "missing directory" {
     shell_exec("rm -rf /tmp/_pact_test_missingdir")
     shell_exec("mkdir -p /tmp/_pact_test_missingdir")
 
@@ -102,13 +88,10 @@ fn test_missing_directory() {
 
     pathdeps_clear()
     let rc = resolve_path_deps("/tmp/_pact_test_missingdir")
-    check_int(rc, 1, "missing dir returns error")
+    assert_eq(rc, 1)
 }
 
-// ── Test: missing pact.toml ────────────────────────────────────
-
-fn test_missing_manifest() {
-    io.println("--- test_missing_manifest ---")
+test "missing manifest" {
     shell_exec("rm -rf /tmp/_pact_test_nomanifest")
     shell_exec("mkdir -p /tmp/_pact_test_nomanifest/mylib")
 
@@ -117,13 +100,10 @@ fn test_missing_manifest() {
 
     pathdeps_clear()
     let rc = resolve_path_deps("/tmp/_pact_test_nomanifest")
-    check_int(rc, 1, "missing manifest returns error")
+    assert_eq(rc, 1)
 }
 
-// ── Test: already resolved (diamond) ───────────────────────────
-
-fn test_already_resolved() {
-    io.println("--- test_already_resolved ---")
+test "already resolved" {
     shell_exec("rm -rf /tmp/_pact_test_diamond")
     shell_exec("mkdir -p /tmp/_pact_test_diamond/libA/shared/src")
     shell_exec("mkdir -p /tmp/_pact_test_diamond/libB")
@@ -139,7 +119,7 @@ fn test_already_resolved() {
 
     pathdeps_clear()
     let rc = resolve_path_deps("/tmp/_pact_test_diamond")
-    check_int(rc, 0, "diamond resolves ok")
+    assert_eq(rc, 0)
     // shared should appear only once even though referenced by both A and B
     let mut shared_count = 0
     let mut i = 0
@@ -149,13 +129,10 @@ fn test_already_resolved() {
         }
         i = i + 1
     }
-    check_int(shared_count, 1, "shared resolved exactly once")
+    assert_eq(shared_count, 1)
 }
 
-// ── Test: hash determinism ─────────────────────────────────────
-
-fn test_hash_determinism() {
-    io.println("--- test_hash_determinism ---")
+test "hash determinism" {
     shell_exec("rm -rf /tmp/_pact_test_hash1 /tmp/_pact_test_hash2")
     shell_exec("mkdir -p /tmp/_pact_test_hash1/mylib/src")
     shell_exec("mkdir -p /tmp/_pact_test_hash2/mylib/src")
@@ -180,14 +157,11 @@ fn test_hash_determinism() {
     resolve_path_deps("/tmp/_pact_test_hash2")
     let hash2 = pathdeps_get_hash(0)
 
-    check_str(hash1, hash2, "identical files produce identical hashes")
-    check_int(hash1.len(), 64, "hash is 64 chars")
+    assert_eq(hash1, hash2)
+    assert_eq(hash1.len(), 64)
 }
 
-// ── Test: capabilities propagation ─────────────────────────────
-
-fn test_capabilities() {
-    io.println("--- test_capabilities ---")
+test "capabilities" {
     shell_exec("rm -rf /tmp/_pact_test_caps")
     shell_exec("mkdir -p /tmp/_pact_test_caps/netlib/src")
 
@@ -197,54 +171,10 @@ fn test_capabilities() {
 
     pathdeps_clear()
     let rc = resolve_path_deps("/tmp/_pact_test_caps")
-    check_int(rc, 0, "caps dep resolves ok")
-    check_str(pathdeps_get_caps(0), "Net.Connect,Net.DNS", "capabilities captured")
+    assert_eq(rc, 0)
+    assert_eq(pathdeps_get_caps(0), "Net.Connect,Net.DNS")
 }
 
-// ── Test: clear resets state ───────────────────────────────────
-
-fn test_clear() {
-    io.println("--- test_clear ---")
-    // Add some fake data
-    resolved_names.push("test")
-    resolved_versions.push("1.0")
-    resolved_sources.push("path:/x")
-    resolved_hashes.push("abc")
-    resolved_caps.push("")
-
-    pathdeps_clear()
-    check_int(pathdeps_count(), 0, "clear: no deps")
-    check_str(pathdeps_get_name(0), "", "clear: name out of bounds")
-}
-
-// ── Test: query out-of-bounds returns empty ─────────────────────
-
-fn test_query_bounds() {
-    io.println("--- test_query_bounds ---")
-    pathdeps_clear()
-    check_str(pathdeps_get_name(-1), "", "negative index name")
-    check_str(pathdeps_get_version(-1), "", "negative index version")
-    check_str(pathdeps_get_source(-1), "", "negative index source")
-    check_str(pathdeps_get_hash(-1), "", "negative index hash")
-    check_str(pathdeps_get_caps(-1), "", "negative index caps")
-    check_str(pathdeps_get_name(99), "", "large index name")
-}
-
-fn cleanup() {
+test "cleanup" {
     shell_exec("rm -rf /tmp/_pact_test_single /tmp/_pact_test_trans /tmp/_pact_test_cycle /tmp/_pact_test_missingdir /tmp/_pact_test_nomanifest /tmp/_pact_test_diamond /tmp/_pact_test_hash1 /tmp/_pact_test_hash2 /tmp/_pact_test_caps /tmp/_pact_hash")
-}
-
-fn main() {
-    test_clear()
-    test_query_bounds()
-    test_single_path_dep()
-    test_transitive_deps()
-    test_cycle_detection()
-    test_missing_directory()
-    test_missing_manifest()
-    test_already_resolved()
-    test_hash_determinism()
-    test_capabilities()
-    cleanup()
-    io.println("All pathdeps tests complete")
 }

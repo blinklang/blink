@@ -1,34 +1,28 @@
 import std.resolver
 import std.lockfile
 
-fn check_str(actual: Str, expected: Str, label: Str) {
-    if actual == expected {
-        io.println("PASS: {label}")
-    } else {
-        io.println("FAIL: {label} — expected \"{expected}\", got \"{actual}\"")
-    }
+test "clear" {
+    res_names.push("test")
+    res_versions.push("1.0")
+    res_sources.push("path:/x")
+    res_hashes.push("abc")
+    res_caps.push("")
+
+    resolver_clear()
+    assert_eq(resolver_count(), 0)
+    assert_eq(resolver_get_name(0), "")
 }
 
-fn check_int(actual: Int, expected: Int, label: Str) {
-    if actual == expected {
-        io.println("PASS: {label}")
-    } else {
-        io.println("FAIL: {label} — expected {expected}, got {actual}")
-    }
+test "query bounds" {
+    resolver_clear()
+    assert_eq(resolver_get_name(-1), "")
+    assert_eq(resolver_get_version(-1), "")
+    assert_eq(resolver_get_source(99), "")
+    assert_eq(resolver_get_hash(99), "")
+    assert_eq(resolver_get_caps(99), "")
 }
 
-fn check_starts_with(actual: Str, prefix: Str, label: Str) {
-    if actual.starts_with(prefix) {
-        io.println("PASS: {label}")
-    } else {
-        io.println("FAIL: {label} — expected to start with \"{prefix}\", got \"{actual}\"")
-    }
-}
-
-// ── Test: single path dependency ────────────────────────────────
-
-fn test_single_path_dep() {
-    io.println("--- test_single_path_dep ---")
+test "single path dep" {
     shell_exec("rm -rf /tmp/_pact_test_resolve_single")
     shell_exec("mkdir -p /tmp/_pact_test_resolve_single/mylib/src")
 
@@ -38,17 +32,14 @@ fn test_single_path_dep() {
 
     resolver_clear()
     let rc = resolve("/tmp/_pact_test_resolve_single")
-    check_int(rc, 0, "single path dep resolves")
-    check_int(resolver_count(), 1, "one dep resolved")
-    check_str(resolver_get_name(0), "mylib", "resolved name")
-    check_str(resolver_get_version(0), "0.1.0", "resolved version")
-    check_starts_with(resolver_get_source(0), "path:", "source is path")
+    assert_eq(rc, 0)
+    assert_eq(resolver_count(), 1)
+    assert_eq(resolver_get_name(0), "mylib")
+    assert_eq(resolver_get_version(0), "0.1.0")
+    assert(resolver_get_source(0).starts_with("path:"))
 }
 
-// ── Test: single git dependency ─────────────────────────────────
-
-fn test_single_git_dep() {
-    io.println("--- test_single_git_dep ---")
+test "single git dep" {
     shell_exec("rm -rf /tmp/_pact_test_resolve_git")
     shell_exec("mkdir -p /tmp/_pact_test_resolve_git/project")
 
@@ -62,17 +53,14 @@ fn test_single_git_dep() {
 
     resolver_clear()
     let rc = resolve("/tmp/_pact_test_resolve_git/project")
-    check_int(rc, 0, "git dep resolves")
-    check_int(resolver_count(), 1, "one git dep resolved")
-    check_str(resolver_get_name(0), "gitlib", "git dep name")
-    check_str(resolver_get_version(0), "2.0.0", "git dep version")
-    check_starts_with(resolver_get_source(0), "git:", "source is git")
+    assert_eq(rc, 0)
+    assert_eq(resolver_count(), 1)
+    assert_eq(resolver_get_name(0), "gitlib")
+    assert_eq(resolver_get_version(0), "2.0.0")
+    assert(resolver_get_source(0).starts_with("git:"))
 }
 
-// ── Test: diamond dep (same version = OK) ───────────────────────
-
-fn test_diamond_same_version() {
-    io.println("--- test_diamond_same_version ---")
+test "diamond same version" {
     shell_exec("rm -rf /tmp/_pact_test_resolve_diamond")
     shell_exec("mkdir -p /tmp/_pact_test_resolve_diamond/libA/shared/src")
     shell_exec("mkdir -p /tmp/_pact_test_resolve_diamond/libB")
@@ -86,7 +74,7 @@ fn test_diamond_same_version() {
 
     resolver_clear()
     let rc = resolve("/tmp/_pact_test_resolve_diamond")
-    check_int(rc, 0, "diamond same version resolves ok")
+    assert_eq(rc, 0)
 
     // shared should appear once
     let mut shared_count = 0
@@ -97,13 +85,10 @@ fn test_diamond_same_version() {
         }
         i = i + 1
     }
-    check_int(shared_count, 1, "shared resolved once")
+    assert_eq(shared_count, 1)
 }
 
-// ── Test: diamond conflict (diff version = error) ───────────────
-
-fn test_diamond_conflict() {
-    io.println("--- test_diamond_conflict ---")
+test "diamond conflict" {
     shell_exec("rm -rf /tmp/_pact_test_resolve_conflict")
     shell_exec("mkdir -p /tmp/_pact_test_resolve_conflict/libA/shared/src")
     shell_exec("mkdir -p /tmp/_pact_test_resolve_conflict/libB/shared/src")
@@ -118,13 +103,10 @@ fn test_diamond_conflict() {
 
     resolver_clear()
     let rc = resolve("/tmp/_pact_test_resolve_conflict")
-    check_int(rc, 1, "diamond conflict returns error")
+    assert_eq(rc, 1)
 }
 
-// ── Test: transitive chain ──────────────────────────────────────
-
-fn test_transitive_chain() {
-    io.println("--- test_transitive_chain ---")
+test "transitive chain" {
     shell_exec("rm -rf /tmp/_pact_test_resolve_chain")
     shell_exec("mkdir -p /tmp/_pact_test_resolve_chain/libA/libB/src")
     shell_exec("mkdir -p /tmp/_pact_test_resolve_chain/libA/src")
@@ -137,16 +119,13 @@ fn test_transitive_chain() {
 
     resolver_clear()
     let rc = resolve("/tmp/_pact_test_resolve_chain")
-    check_int(rc, 0, "chain resolves ok")
-    check_int(resolver_count(), 2, "two deps in chain")
-    check_str(resolver_get_name(0), "libA", "first is libA")
-    check_str(resolver_get_name(1), "libB", "second is libB")
+    assert_eq(rc, 0)
+    assert_eq(resolver_count(), 2)
+    assert_eq(resolver_get_name(0), "libA")
+    assert_eq(resolver_get_name(1), "libB")
 }
 
-// ── Test: resolve_and_lock writes lockfile ──────────────────────
-
-fn test_resolve_and_lock() {
-    io.println("--- test_resolve_and_lock ---")
+test "resolve and lock" {
     shell_exec("rm -rf /tmp/_pact_test_resolve_lock")
     shell_exec("mkdir -p /tmp/_pact_test_resolve_lock/mylib/src")
 
@@ -155,65 +134,25 @@ fn test_resolve_and_lock() {
     write_file("/tmp/_pact_test_resolve_lock/mylib/src/lib.pact", "pub fn fetch() -> Int \{ 0 \}\n")
 
     let rc = resolve_and_lock("/tmp/_pact_test_resolve_lock")
-    check_int(rc, 0, "resolve_and_lock succeeds")
+    assert_eq(rc, 0)
 
     // Verify lockfile was written
     let lock_path = "/tmp/_pact_test_resolve_lock/pact.lock"
     let exists = file_exists(lock_path)
-    check_int(exists, 1, "lockfile written")
+    assert_eq(exists, 1)
 
     // Load and verify lockfile contents
     lockfile_clear()
     let load_rc = lockfile_load(lock_path)
-    check_int(load_rc, 0, "lockfile loads ok")
-    check_int(lockfile_pkg_count(), 1, "lockfile has 1 package")
-    check_str(lock_pkg_names.get(0).unwrap(), "mylib", "lockfile pkg name")
-    check_str(lock_pkg_versions.get(0).unwrap(), "0.3.0", "lockfile pkg version")
-    check_starts_with(lock_pkg_sources.get(0).unwrap(), "path:", "lockfile source is path")
-    check_str(lock_pkg_caps.get(0).unwrap(), "Net.Connect", "lockfile caps")
+    assert_eq(load_rc, 0)
+    assert_eq(lockfile_pkg_count(), 1)
+    assert_eq(lock_pkg_names.get(0).unwrap(), "mylib")
+    assert_eq(lock_pkg_versions.get(0).unwrap(), "0.3.0")
+    assert(lock_pkg_sources.get(0).unwrap().starts_with("path:"))
+    assert_eq(lock_pkg_caps.get(0).unwrap(), "Net.Connect")
 }
 
-// ── Test: clear state ───────────────────────────────────────────
-
-fn test_clear() {
-    io.println("--- test_clear ---")
-    res_names.push("test")
-    res_versions.push("1.0")
-    res_sources.push("path:/x")
-    res_hashes.push("abc")
-    res_caps.push("")
-
-    resolver_clear()
-    check_int(resolver_count(), 0, "clear: no deps")
-    check_str(resolver_get_name(0), "", "clear: name oob")
-}
-
-// ── Test: query bounds ──────────────────────────────────────────
-
-fn test_query_bounds() {
-    io.println("--- test_query_bounds ---")
-    resolver_clear()
-    check_str(resolver_get_name(-1), "", "negative index name")
-    check_str(resolver_get_version(-1), "", "negative index version")
-    check_str(resolver_get_source(99), "", "large index source")
-    check_str(resolver_get_hash(99), "", "large index hash")
-    check_str(resolver_get_caps(99), "", "large index caps")
-}
-
-fn cleanup() {
+test "cleanup" {
     shell_exec("rm -rf /tmp/_pact_test_resolve_single /tmp/_pact_test_resolve_git /tmp/_pact_test_resolve_diamond /tmp/_pact_test_resolve_conflict /tmp/_pact_test_resolve_chain /tmp/_pact_test_resolve_lock /tmp/_pact_hash /tmp/_pact_commit /tmp/_pact_home")
     shell_exec("rm -rf ~/.pact/cache/git/*_pact_test_*")
-}
-
-fn main() {
-    test_clear()
-    test_query_bounds()
-    test_single_path_dep()
-    test_single_git_dep()
-    test_diamond_same_version()
-    test_diamond_conflict()
-    test_transitive_chain()
-    test_resolve_and_lock()
-    cleanup()
-    io.println("All resolver tests complete")
 }
