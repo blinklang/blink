@@ -48,16 +48,7 @@ pub fn fmt_needs_wrap(line: Str) -> Int {
 }
 
 pub fn fmt_join() -> Str {
-    let mut result = ""
-    let mut i = 0
-    while i < fmt_lines.len() {
-        if i > 0 {
-            result = result.concat("\n")
-        }
-        result = result.concat(fmt_lines.get(i).unwrap())
-        i = i + 1
-    }
-    result
+    fmt_lines.join("\n")
 }
 
 // ── Type annotation formatting ──────────────────────────────────────

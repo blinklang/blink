@@ -11,6 +11,7 @@ mkdir -p "$BUILD_DIR/lib/std"
 cp "$ROOT_DIR/lib/std/"*.pact "$BUILD_DIR/lib/std/"
 
 echo "Compiling bootstrap compiler..."
+rm -f "$BUILD_DIR/pactc"
 cc -o "$BUILD_DIR/pactc" "$SCRIPT_DIR/pactc_bootstrap.c" -lm
 
 echo "Self-compiling pactc..."
@@ -21,6 +22,7 @@ echo "Verifying bootstrap chain..."
 "$BUILD_DIR/pactc_self" "$ROOT_DIR/src/pactc_main.pact" "$BUILD_DIR/pactc_verify.c"
 if diff -q "$BUILD_DIR/pactc_self.c" "$BUILD_DIR/pactc_verify.c" > /dev/null 2>&1; then
     echo "Bootstrap verified — self-compilation is stable."
+    rm -f "$BUILD_DIR/pactc"
     cp "$BUILD_DIR/pactc_self" "$BUILD_DIR/pactc"
     rm -f "$BUILD_DIR/pactc_self" "$BUILD_DIR/pactc_self.c" "$BUILD_DIR/pactc_verify.c"
 else

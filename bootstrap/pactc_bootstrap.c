@@ -15151,23 +15151,7 @@ void pact_codegen_types_emit_line(const char* line) {
 }
 
 const char* pact_codegen_types_join_lines(void) {
-    const char* result = "";
-    int64_t i = 0;
-    while ((i < pact_list_len(cg_lines))) {
-        if ((i > 0)) {
-            result = pact_str_concat(result, "\n");
-        }
-        int64_t _lgi_0 = i;
-        pact_Option_str _lget_1;
-        if (pact_list_in_bounds(cg_lines, _lgi_0)) {
-            _lget_1.tag = 1; _lget_1.value = (const char*)pact_list_get(cg_lines, _lgi_0);
-        } else { _lget_1.tag = 0; }
-        pact_Option_str _ounw_2 = _lget_1;
-        if (_ounw_2.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
-        result = pact_str_concat(result, _ounw_2.value);
-        i = (i + 1);
-    }
-    return result;
+    return pact_str_join(cg_lines, "\n");
 }
 
 void pact_codegen_methods_emit_method_call(int64_t node) {
@@ -31261,23 +31245,7 @@ int64_t pact_formatter_fmt_needs_wrap(const char* line) {
 }
 
 const char* pact_formatter_fmt_join(void) {
-    const char* result = "";
-    int64_t i = 0;
-    while ((i < pact_list_len(fmt_lines))) {
-        if ((i > 0)) {
-            result = pact_str_concat(result, "\n");
-        }
-        int64_t _lgi_0 = i;
-        pact_Option_str _lget_1;
-        if (pact_list_in_bounds(fmt_lines, _lgi_0)) {
-            _lget_1.tag = 1; _lget_1.value = (const char*)pact_list_get(fmt_lines, _lgi_0);
-        } else { _lget_1.tag = 0; }
-        pact_Option_str _ounw_2 = _lget_1;
-        if (_ounw_2.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
-        result = pact_str_concat(result, _ounw_2.value);
-        i = (i + 1);
-    }
-    return result;
+    return pact_str_join(fmt_lines, "\n");
 }
 
 const char* pact_formatter_format_type_ann(int64_t node) {

@@ -2361,14 +2361,5 @@ pub fn emit_line(line: Str) ! Codegen.Emit {
 }
 
 pub fn join_lines() -> Str ! Codegen.Emit {
-    let mut result = ""
-    let mut i = 0
-    while i < cg_lines.len() {
-        if i > 0 {
-            result = result.concat("\n")
-        }
-        result = result.concat(cg_lines.get(i).unwrap())
-        i = i + 1
-    }
-    result
+    cg_lines.join("\n")
 }

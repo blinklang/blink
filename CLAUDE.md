@@ -74,6 +74,25 @@ Verify: `task ci` — regen bootstrap + test + test-fmt. Always run after compil
 Quick run: `bin/pact run <file.pact>` — compiles and runs in one step. Prefer this over manual pactc+cc.
 Low-level (dev): `build/pactc <file.pact> <output.c>` then `cc -o <binary> <output.c> -lm`
 After modifying compiler sources: `task regen` then `task ci` to verify.
+
+[Self-Hosting Bootstrap Protocol]
+The compiler compiles itself. Changing compiler code carelessly breaks the bootstrap.
+ALWAYS follow the appropriate protocol below. Each step ends with `task regen`.
+
+Adding a new feature (2-step):
+1. Add the feature to the compiler (parser/codegen/etc) → `task regen`
+2. Now use the feature in compiler source code → `task regen`
+
+Refactoring/breaking existing behavior (5-step):
+1. Add new functionality as a NEW keyword/syntax/feature alongside the old → `task regen`
+2. Migrate compiler source to use the new thing instead of the old → `task regen`
+3. Change the old thing's behavior to match the new way → `task regen`
+4. Migrate compiler source back to use the old thing (now with new behavior) → `task regen`
+5. Remove the temporary new thing (old way is now correct) → `task regen`
+
+NEVER skip steps or combine them. Each regen locks in the previous change so the
+compiler can still compile itself. Violating this = infinite loops of pain.
+
 Query: `bin/pact query <file.pact> --fn <name>` | `--effect <name>` | `--layer signature` | `--pub` | `--pure`
 Daemon: `bin/pact daemon start <file.pact>` | `bin/pact daemon status` | `bin/pact daemon stop`
 

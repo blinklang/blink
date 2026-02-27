@@ -3,12 +3,19 @@ version: '3'
 vars:
   BUILD_DIR: build
   PACTC: build/pactc
+  JOBS: 12
   VERSION:
     sh: cat VERSION | tr -d '\n'
 
 tasks:
   bootstrap:
     desc: Build compiler from bootstrap and verify self-hosting
+    sources:
+      - bootstrap/pactc_bootstrap.c
+      - bootstrap/runtime.h
+      - bootstrap/bootstrap.sh
+    generates:
+      - '{{.BUILD_DIR}}/pactc'
     cmds:
       - ./bootstrap/bootstrap.sh
 
@@ -29,37 +36,26 @@ tasks:
     deps: [build-cli]
     cmds:
       - |
-        passed=0
-        failed=0
-        errors=""
-        for f in examples/test_*.pact; do
-          name=$(basename "$f" .pact)
-          if ! {{.BUILD_DIR}}/pact build "$f" 2>/dev/null; then
-            failed=$((failed + 1))
-            errors="${errors}\n  FAIL (build) ${name}"
-            continue
-          fi
-          if output=$({{.BUILD_DIR}}/${name} 2>&1); then
-            if echo "$output" | grep -q "FAIL"; then
-              failed=$((failed + 1))
-              errors="${errors}\n  FAIL (assert) ${name}"
-            else
-              passed=$((passed + 1))
-            fi
-          else
-            failed=$((failed + 1))
-            errors="${errors}\n  FAIL (crash)  ${name}"
-          fi
-        done
+        results=$(parallel -j {{.JOBS}} --halt never ./scripts/run_test.sh {} {{.BUILD_DIR}}/pact {{.BUILD_DIR}} ::: examples/test_*.pact)
+        echo "$results"
+        passed=$(echo "$results" | grep -c "^PASS" || true)
+        failed=$(echo "$results" | grep -c "^FAIL" || true)
         echo "${passed} passed, ${failed} failed"
-        if [ $failed -gt 0 ]; then
-          printf "Failures:${errors}\n"
+        if [ "$failed" -gt 0 ]; then
+          echo "Failures:"
+          echo "$results" | grep "^FAIL" | sed 's/^/  /'
           exit 1
         fi
 
   build-cli:
     desc: Build the pact CLI tool
     deps: [bootstrap]
+    sources:
+      - src/*.pact
+      - lib/std/*.pact
+      - '{{.BUILD_DIR}}/pactc'
+    generates:
+      - '{{.BUILD_DIR}}/pact'
     cmds:
       - '{{.PACTC}} src/cli.pact {{.BUILD_DIR}}/cli.c'
       - sed -i 's/pact_cli_version = "dev"/pact_cli_version = "{{.VERSION}}-dev+'"$(date +%Y%m%d%H%M%S)"'"/' {{.BUILD_DIR}}/cli.c
@@ -80,103 +76,22 @@ tasks:
     cmds:
       - mkdir -p .tmp
       - |
-        passed=0
-        failed=0
-        skipped=0
-        errors=""
+        printf '%s\n' test_hof test_lazy_iter test_semver test_toml test_manifest test_lockfile test_http_types test_http_error test_json test_json_builder test_args test_args_cli test_derive_serialize test_derive_enum test_derive_nested test_derive_deserialize test_derive_enum_deser test_embed test_combining_iterators > .tmp/fmt_skip.txt
 
-        # Known formatter issues (skip idempotency/semantic checks)
-        fmt_skip="test_hof test_lazy_iter test_semver test_toml test_manifest test_lockfile test_http_types test_http_error test_json test_json_builder test_args test_args_cli test_derive_serialize test_derive_enum test_derive_nested test_derive_deserialize test_derive_enum_deser test_embed test_combining_iterators"
+        golden_results=$(parallel -j {{.JOBS}} --halt never ./scripts/run_fmt_golden.sh {} {{.PACTC}} ::: tests/fmt/input_*.pact 2>&1 || true)
+        idem_results=$(parallel -j {{.JOBS}} --halt never ./scripts/run_fmt_idempotent.sh {} {{.PACTC}} .tmp/fmt_skip.txt ::: examples/test_*.pact 2>&1 || true)
+        sem_results=$(parallel -j {{.JOBS}} --halt never ./scripts/run_fmt_semantic.sh {} {{.PACTC}} .tmp/fmt_skip.txt ::: examples/test_*.pact 2>&1 || true)
 
-        # Golden output tests: compare formatter output against expected
-        for input in tests/fmt/input_*.pact; do
-          name=$(basename "$input" .pact | sed 's/^input_//')
-          expected="tests/fmt/expected_${name}.pact"
-          if [ ! -f "$expected" ]; then
-            continue
-          fi
-          actual=$(mktemp .tmp/fmt-XXXXXX)
-          if ! {{.PACTC}} "$input" "$actual" --emit pact 2>/dev/null; then
-            failed=$((failed + 1))
-            errors="${errors}\n  FAIL (format) golden_${name}"
-            rm -f "$actual"
-            continue
-          fi
-          if diff -u "$expected" "$actual" >/dev/null 2>&1; then
-            passed=$((passed + 1))
-          else
-            failed=$((failed + 1))
-            errors="${errors}\n  FAIL (golden) ${name}"
-            diff -u "$expected" "$actual" | head -20
-          fi
-          rm -f "$actual"
-        done
+        all_results=$(printf '%s\n%s\n%s' "$golden_results" "$idem_results" "$sem_results")
+        echo "$all_results"
 
-        # Idempotency: format(format(x)) == format(x) for all example files
-        for f in examples/test_*.pact; do
-          name=$(basename "$f" .pact)
-          if echo "$fmt_skip" | grep -qw "$name"; then skipped=$((skipped + 1)); continue; fi
-          fmt1=$(mktemp .tmp/fmt-XXXXXX)
-          fmt2=$(mktemp .tmp/fmt-XXXXXX)
-          if ! {{.PACTC}} "$f" "$fmt1" --emit pact 2>/dev/null; then
-            skipped=$((skipped + 1))
-            rm -f "$fmt1" "$fmt2"
-            continue
-          fi
-          if ! {{.PACTC}} "$fmt1" "$fmt2" --emit pact 2>/dev/null; then
-            skipped=$((skipped + 1))
-            rm -f "$fmt1" "$fmt2"
-            continue
-          fi
-          if diff -q "$fmt1" "$fmt2" >/dev/null 2>&1; then
-            passed=$((passed + 1))
-          else
-            failed=$((failed + 1))
-            errors="${errors}\n  FAIL (idempotent) ${name}"
-          fi
-          rm -f "$fmt1" "$fmt2"
-        done
-
-        # Semantic: formatted output still compiles and passes
-        for f in examples/test_*.pact; do
-          name=$(basename "$f" .pact)
-          if echo "$fmt_skip" | grep -qw "$name"; then skipped=$((skipped + 1)); continue; fi
-          fmt_src=$(mktemp .tmp/fmt-XXXXXX.pact)
-          fmt_c=$(mktemp .tmp/fmt-XXXXXX.c)
-          fmt_bin=$(mktemp .tmp/fmt-XXXXXX)
-          if ! {{.PACTC}} "$f" "$fmt_src" --emit pact 2>/dev/null; then
-            skipped=$((skipped + 1))
-            rm -f "$fmt_src" "$fmt_c" "$fmt_bin"
-            continue
-          fi
-          if ! {{.PACTC}} "$fmt_src" "$fmt_c" 2>/dev/null; then
-            skipped=$((skipped + 1))
-            rm -f "$fmt_src" "$fmt_c" "$fmt_bin"
-            continue
-          fi
-          if ! cc -o "$fmt_bin" "$fmt_c" -I bootstrap -lm 2>/dev/null; then
-            failed=$((failed + 1))
-            errors="${errors}\n  FAIL (cc) ${name}"
-            rm -f "$fmt_src" "$fmt_c" "$fmt_bin"
-            continue
-          fi
-          if output=$("$fmt_bin" 2>&1); then
-            if echo "$output" | grep -q "FAIL"; then
-              failed=$((failed + 1))
-              errors="${errors}\n  FAIL (assert) fmt_${name}"
-            else
-              passed=$((passed + 1))
-            fi
-          else
-            failed=$((failed + 1))
-            errors="${errors}\n  FAIL (crash) fmt_${name}"
-          fi
-          rm -f "$fmt_src" "$fmt_c" "$fmt_bin"
-        done
-
+        passed=$(echo "$all_results" | grep -c "^PASS" || true)
+        failed=$(echo "$all_results" | grep -c "^FAIL" || true)
+        skipped=$(echo "$all_results" | grep -c "^SKIP" || true)
         echo "fmt: ${passed} passed, ${failed} failed, ${skipped} skipped"
-        if [ $failed -gt 0 ]; then
-          printf "Failures:${errors}\n"
+        if [ "$failed" -gt 0 ]; then
+          echo "Failures:"
+          echo "$all_results" | grep "^FAIL" | sed 's/^/  /'
           exit 1
         fi
 
