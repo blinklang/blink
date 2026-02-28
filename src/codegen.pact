@@ -697,6 +697,7 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
     let pre_test_skip_iter_count = emitted_skip_iters.len()
     let pre_test_chain_iter_count = emitted_chain_iters.len()
     let pre_test_flat_map_iter_count = emitted_flat_map_iters.len()
+    let pre_test_async = cg_uses_async
     cg_lines = []
     if tests_sl != -1 {
         let mut ti = 0
@@ -777,6 +778,12 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
             cg_lines.push(cg_closure_defs.get(tci).unwrap())
             tci = tci + 1
         }
+    }
+
+    // Thread pool global discovered during test block emission
+    if cg_uses_async != 0 && pre_test_async == 0 {
+        emit_line("static pact_threadpool* __pact_pool;")
+        emit_line("")
     }
 
     // Now append the test function definitions

@@ -31943,6 +31943,7 @@ const char* pact_codegen_generate(int64_t program) {
     const int64_t pre_test_skip_iter_count = pact_list_len(emitted_skip_iters);
     const int64_t pre_test_chain_iter_count = pact_list_len(emitted_chain_iters);
     const int64_t pre_test_flat_map_iter_count = pact_list_len(emitted_flat_map_iters);
+    const int64_t pre_test_async = cg_uses_async;
     pact_list* _l306 = pact_list_new();
     cg_lines = _l306;
     if ((tests_sl != (-1))) {
@@ -32080,6 +32081,10 @@ const char* pact_codegen_generate(int64_t program) {
             pact_list_push(cg_lines, (void*)_ounw_331.value);
             tci = (tci + 1);
         }
+    }
+    if (((cg_uses_async != 0) && (pre_test_async == 0))) {
+        pact_codegen_types_emit_line("static pact_threadpool* __pact_pool;");
+        pact_codegen_types_emit_line("");
     }
     int64_t tfi = 0;
     while ((tfi < pact_list_len(test_fn_lines))) {

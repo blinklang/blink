@@ -803,7 +803,7 @@ fn main() {
         if source_path != "" {
             let rc = do_build(source_path, output_path, c_path, format_flag, 1)
             if rc != 0 {
-                return
+                exit(1)
             }
             let mut run_cmd = output_path
             if filter_pattern != "" {
