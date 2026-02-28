@@ -22,6 +22,11 @@ type CommandDef {
     flags: List[FlagDef]
     options: List[OptionDef]
     positionals: List[PositionalDef]
+    subcommands: List[CommandDef]
+}
+
+type CmdList {
+    items: List[CommandDef]
 }
 
 type ArgParser {
@@ -35,6 +40,7 @@ type ArgParser {
 
 type Args {
     command_name: Str
+    command_path: List[Str]
     flag_names: List[Str]
     option_keys: List[Str]
     option_vals: List[Str]
@@ -93,9 +99,110 @@ pub fn add_positional(p: ArgParser, name: Str, desc: Str) -> ArgParser {
     }
 }
 
-pub fn add_command(p: ArgParser, name: Str, desc: Str) -> ArgParser {
+fn find_command_idx(cl: CmdList, name: Str) -> Int {
+    let mut i = 0
+    while i < cl.items.len() {
+        let c = cl.items.get(i).unwrap()
+        if c.name == name {
+            return i
+        }
+        i = i + 1
+    }
+    -1
+}
+
+fn wrap(cmds: List[CommandDef]) -> CmdList {
+    CmdList { items: cmds }
+}
+
+fn new_cmd(name: Str, desc: Str) -> CommandDef {
+    CommandDef { name: name, description: desc, flags: [], options: [], positionals: [], subcommands: [] }
+}
+
+fn cmd_with_sub(c: CommandDef, sub: CommandDef) -> CommandDef {
+    let mut subs = c.subcommands
+    let existing = find_command_idx(wrap(subs), sub.name)
+    if existing == -1 {
+        subs.push(sub)
+    }
+    CommandDef { name: c.name, description: c.description, flags: c.flags, options: c.options, positionals: c.positionals, subcommands: subs }
+}
+
+fn rebuild_cmds_with_sub(cl: CmdList, parent_name: Str, sub: CommandDef) -> List[CommandDef] {
+    let mut result: List[CommandDef] = []
+    let mut i = 0
+    while i < cl.items.len() {
+        let c = cl.items.get(i).unwrap()
+        if c.name == parent_name {
+            result.push(cmd_with_sub(c, sub))
+        } else {
+            result.push(c)
+        }
+        i = i + 1
+    }
+    result
+}
+
+fn rebuild_cmds_nested_sub(cl: CmdList, parent_name: Str, mid_name: Str, leaf: CommandDef) -> List[CommandDef] {
+    let mut result: List[CommandDef] = []
+    let mut i = 0
+    while i < cl.items.len() {
+        let c = cl.items.get(i).unwrap()
+        if c.name == parent_name {
+            let new_subs = rebuild_cmds_with_sub(wrap(c.subcommands), mid_name, leaf)
+            result.push(CommandDef { name: c.name, description: c.description, flags: c.flags, options: c.options, positionals: c.positionals, subcommands: new_subs })
+        } else {
+            result.push(c)
+        }
+        i = i + 1
+    }
+    result
+}
+
+pub fn add_command(p: ArgParser, path: Str, desc: Str) -> ArgParser {
+    if !path.contains(".") {
+        let mut cmds = p.commands
+        if find_command_idx(wrap(cmds), path) == -1 {
+            cmds.push(new_cmd(path, desc))
+        }
+        return ArgParser {
+            prog_name: p.prog_name,
+            description: p.description,
+            flags: p.flags,
+            options: p.options,
+            positionals: p.positionals,
+            commands: cmds
+        }
+    }
+
+    let dot_pos = path.index_of(".")
+    let parent_name = path.substring(0, dot_pos)
+    let rest = path.substring(dot_pos + 1, path.len())
+
     let mut cmds = p.commands
-    cmds.push(CommandDef { name: name, description: desc, flags: [], options: [], positionals: [] })
+    if find_command_idx(wrap(cmds), parent_name) == -1 {
+        cmds.push(new_cmd(parent_name, ""))
+    }
+
+    if !rest.contains(".") {
+        cmds = rebuild_cmds_with_sub(wrap(cmds), parent_name, new_cmd(rest, desc))
+        return ArgParser {
+            prog_name: p.prog_name,
+            description: p.description,
+            flags: p.flags,
+            options: p.options,
+            positionals: p.positionals,
+            commands: cmds
+        }
+    }
+
+    let dot2 = rest.index_of(".")
+    let mid_name = rest.substring(0, dot2)
+    let leaf_name = rest.substring(dot2 + 1, rest.len())
+
+    cmds = rebuild_cmds_with_sub(wrap(cmds), parent_name, new_cmd(mid_name, ""))
+    cmds = rebuild_cmds_nested_sub(wrap(cmds), parent_name, mid_name, new_cmd(leaf_name, desc))
+
     ArgParser {
         prog_name: p.prog_name,
         description: p.description,
@@ -106,51 +213,101 @@ pub fn add_command(p: ArgParser, name: Str, desc: Str) -> ArgParser {
     }
 }
 
-pub fn command_add_flag(p: ArgParser, cmd_name: Str, long_name: Str, short_name: Str, desc: Str) -> ArgParser {
-    let mut cmds: List[CommandDef] = []
+fn cmd_add_flag_direct(c: CommandDef, long: Str, short: Str, desc: Str) -> CommandDef {
+    let mut flags = c.flags
+    flags.push(FlagDef { long_name: long, short_name: short, description: desc })
+    CommandDef { name: c.name, description: c.description, flags: flags, options: c.options, positionals: c.positionals, subcommands: c.subcommands }
+}
+
+fn cmd_add_option_direct(c: CommandDef, long: Str, short: Str, desc: Str) -> CommandDef {
+    let mut opts = c.options
+    opts.push(OptionDef { long_name: long, short_name: short, description: desc, default_val: "" })
+    CommandDef { name: c.name, description: c.description, flags: c.flags, options: opts, positionals: c.positionals, subcommands: c.subcommands }
+}
+
+fn cmd_add_positional_direct(c: CommandDef, name: Str, desc: Str) -> CommandDef {
+    let mut pos = c.positionals
+    pos.push(PositionalDef { name: name, description: desc })
+    CommandDef { name: c.name, description: c.description, flags: c.flags, options: c.options, positionals: pos, subcommands: c.subcommands }
+}
+
+fn modify_cmd_in_list(cl: CmdList, name: Str, modifier: Str, long: Str, short: Str, desc: Str) -> List[CommandDef] {
+    let mut result: List[CommandDef] = []
     let mut i = 0
-    while i < p.commands.len() {
-        let c = p.commands.get(i).unwrap()
-        if c.name == cmd_name {
-            let mut flags = c.flags
-            flags.push(FlagDef { long_name: long_name, short_name: short_name, description: desc })
-            cmds.push(CommandDef { name: c.name, description: c.description, flags: flags, options: c.options, positionals: c.positionals })
+    while i < cl.items.len() {
+        let c = cl.items.get(i).unwrap()
+        if c.name == name {
+            if modifier == "flag" {
+                result.push(cmd_add_flag_direct(c, long, short, desc))
+            } else if modifier == "option" {
+                result.push(cmd_add_option_direct(c, long, short, desc))
+            } else if modifier == "positional" {
+                result.push(cmd_add_positional_direct(c, long, desc))
+            } else {
+                result.push(c)
+            }
         } else {
-            cmds.push(c)
+            result.push(c)
         }
         i = i + 1
     }
+    result
+}
+
+fn modify_nested_cmd(cl: CmdList, path: Str, modifier: Str, long: Str, short: Str, desc: Str) -> List[CommandDef] {
+    if !path.contains(".") {
+        return modify_cmd_in_list(cl, path, modifier, long, short, desc)
+    }
+
+    let dot_pos = path.index_of(".")
+    let parent_name = path.substring(0, dot_pos)
+    let rest = path.substring(dot_pos + 1, path.len())
+
+    let mut result: List[CommandDef] = []
+    let mut i = 0
+    while i < cl.items.len() {
+        let c = cl.items.get(i).unwrap()
+        if c.name == parent_name {
+            let new_subs = modify_nested_cmd(wrap(c.subcommands), rest, modifier, long, short, desc)
+            result.push(CommandDef { name: c.name, description: c.description, flags: c.flags, options: c.options, positionals: c.positionals, subcommands: new_subs })
+        } else {
+            result.push(c)
+        }
+        i = i + 1
+    }
+    result
+}
+
+pub fn command_add_flag(p: ArgParser, cmd_path: Str, long_name: Str, short_name: Str, desc: Str) -> ArgParser {
     ArgParser {
         prog_name: p.prog_name,
         description: p.description,
         flags: p.flags,
         options: p.options,
         positionals: p.positionals,
-        commands: cmds
+        commands: modify_nested_cmd(wrap(p.commands), cmd_path, "flag", long_name, short_name, desc)
     }
 }
 
-pub fn command_add_option(p: ArgParser, cmd_name: Str, long_name: Str, short_name: Str, desc: Str) -> ArgParser {
-    let mut cmds: List[CommandDef] = []
-    let mut i = 0
-    while i < p.commands.len() {
-        let c = p.commands.get(i).unwrap()
-        if c.name == cmd_name {
-            let mut opts = c.options
-            opts.push(OptionDef { long_name: long_name, short_name: short_name, description: desc, default_val: "" })
-            cmds.push(CommandDef { name: c.name, description: c.description, flags: c.flags, options: opts, positionals: c.positionals })
-        } else {
-            cmds.push(c)
-        }
-        i = i + 1
-    }
+pub fn command_add_option(p: ArgParser, cmd_path: Str, long_name: Str, short_name: Str, desc: Str) -> ArgParser {
     ArgParser {
         prog_name: p.prog_name,
         description: p.description,
         flags: p.flags,
         options: p.options,
         positionals: p.positionals,
-        commands: cmds
+        commands: modify_nested_cmd(wrap(p.commands), cmd_path, "option", long_name, short_name, desc)
+    }
+}
+
+pub fn command_add_positional(p: ArgParser, cmd_path: Str, name: Str, desc: Str) -> ArgParser {
+    ArgParser {
+        prog_name: p.prog_name,
+        description: p.description,
+        flags: p.flags,
+        options: p.options,
+        positionals: p.positionals,
+        commands: modify_nested_cmd(wrap(p.commands), cmd_path, "positional", name, "", desc)
     }
 }
 
@@ -188,11 +345,10 @@ fn resolve_option_name(p: ArgParser, arg: Str) -> Str {
     ""
 }
 
-fn resolve_cmd_flag_name(p: ArgParser, cmd_idx: Int, arg: Str) -> Str {
-    let cmd = p.commands.get(cmd_idx).unwrap()
+fn resolve_cmd_flag(c: CommandDef, arg: Str) -> Str {
     let mut i = 0
-    while i < cmd.flags.len() {
-        let f = cmd.flags.get(i).unwrap()
+    while i < c.flags.len() {
+        let f = c.flags.get(i).unwrap()
         if f.long_name == arg || f.short_name == arg {
             return strip_dashes(f.long_name)
         }
@@ -201,11 +357,10 @@ fn resolve_cmd_flag_name(p: ArgParser, cmd_idx: Int, arg: Str) -> Str {
     ""
 }
 
-fn resolve_cmd_option_name(p: ArgParser, cmd_idx: Int, arg: Str) -> Str {
-    let cmd = p.commands.get(cmd_idx).unwrap()
+fn resolve_cmd_option(c: CommandDef, arg: Str) -> Str {
     let mut i = 0
-    while i < cmd.options.len() {
-        let o = cmd.options.get(i).unwrap()
+    while i < c.options.len() {
+        let o = c.options.get(i).unwrap()
         if o.long_name == arg || o.short_name == arg {
             return strip_dashes(o.long_name)
         }
@@ -214,21 +369,55 @@ fn resolve_cmd_option_name(p: ArgParser, cmd_idx: Int, arg: Str) -> Str {
     ""
 }
 
-fn find_command_idx(p: ArgParser, name: Str) -> Int {
-    let mut i = 0
-    while i < p.commands.len() {
-        let c = p.commands.get(i).unwrap()
-        if c.name == name {
-            return i
+fn resolve_cmd_flag_hierarchical(cl: CmdList, arg: Str) -> Str {
+    let mut i = cl.items.len() - 1
+    while i >= 0 {
+        let result = resolve_cmd_flag(cl.items.get(i).unwrap(), arg)
+        if result != "" {
+            return result
         }
+        i = i - 1
+    }
+    ""
+}
+
+fn resolve_cmd_option_hierarchical(cl: CmdList, arg: Str) -> Str {
+    let mut i = cl.items.len() - 1
+    while i >= 0 {
+        let result = resolve_cmd_option(cl.items.get(i).unwrap(), arg)
+        if result != "" {
+            return result
+        }
+        i = i - 1
+    }
+    ""
+}
+
+fn join_path(parts: List[Str]) -> Str {
+    let mut result = ""
+    let mut i = 0
+    while i < parts.len() {
+        if i > 0 {
+            result = result.concat(" ")
+        }
+        result = result.concat(parts.get(i).unwrap())
         i = i + 1
     }
-    -1
+    result
+}
+
+fn find_command_in(cl: CmdList, name: Str) -> CommandDef {
+    let idx = find_command_idx(cl, name)
+    if idx == -1 {
+        return new_cmd("", "")
+    }
+    cl.items.get(idx).unwrap()
 }
 
 pub fn argparse(p: ArgParser) -> Args {
     let mut result = Args {
         command_name: "",
+        command_path: [],
         flag_names: [],
         option_keys: [],
         option_vals: [],
@@ -237,7 +426,8 @@ pub fn argparse(p: ArgParser) -> Args {
         error: ""
     }
     let mut i = 1
-    let mut cmd_idx = -1
+    let mut cmd_chain: List[CommandDef] = []
+    let mut current_cmds = p.commands
 
     while i < arg_count() {
         let arg = get_arg(i)
@@ -248,48 +438,35 @@ pub fn argparse(p: ArgParser) -> Args {
                 result.rest_args.push(get_arg(i))
                 i = i + 1
             }
+            result.command_name = join_path(result.command_path)
             return result
         }
 
         if arg == "--help" || arg == "-h" {
-            if cmd_idx != -1 {
+            result.command_name = join_path(result.command_path)
+            if cmd_chain.len() > 0 {
                 io.println(generate_command_help(p, result.command_name))
             } else {
                 io.println(generate_help(p))
             }
-            result = Args {
-                command_name: result.command_name,
-                flag_names: result.flag_names,
-                option_keys: result.option_keys,
-                option_vals: result.option_vals,
-                positional_vals: result.positional_vals,
-                rest_args: result.rest_args,
-                error: "help"
-            }
+            result.error = "help"
             return result
         }
 
-        if cmd_idx == -1 && result.command_name == "" {
-            let ci = find_command_idx(p, arg)
-            if ci != -1 {
-                result = Args {
-                    command_name: arg,
-                    flag_names: result.flag_names,
-                    option_keys: result.option_keys,
-                    option_vals: result.option_vals,
-                    positional_vals: result.positional_vals,
-                    rest_args: result.rest_args,
-                    error: ""
-                }
-                cmd_idx = ci
+        if !arg.starts_with("-") {
+            let matched = find_command_in(wrap(current_cmds), arg)
+            if matched.name != "" {
+                result.command_path.push(arg)
+                cmd_chain.push(matched)
+                current_cmds = matched.subcommands
                 i = i + 1
                 continue
             }
         }
 
         let mut flag_name = resolve_flag_name(p, arg)
-        if cmd_idx != -1 && flag_name == "" {
-            flag_name = resolve_cmd_flag_name(p, cmd_idx, arg)
+        if cmd_chain.len() > 0 && flag_name == "" {
+            flag_name = resolve_cmd_flag_hierarchical(wrap(cmd_chain), arg)
         }
 
         if flag_name != "" {
@@ -299,21 +476,13 @@ pub fn argparse(p: ArgParser) -> Args {
         }
 
         let mut opt_name = resolve_option_name(p, arg)
-        if cmd_idx != -1 && opt_name == "" {
-            opt_name = resolve_cmd_option_name(p, cmd_idx, arg)
+        if cmd_chain.len() > 0 && opt_name == "" {
+            opt_name = resolve_cmd_option_hierarchical(wrap(cmd_chain), arg)
         }
 
         if opt_name != "" {
             if i + 1 >= arg_count() {
-                result = Args {
-                    command_name: result.command_name,
-                    flag_names: result.flag_names,
-                    option_keys: result.option_keys,
-                    option_vals: result.option_vals,
-                    positional_vals: result.positional_vals,
-                    rest_args: result.rest_args,
-                    error: "option '{arg}' requires a value"
-                }
+                result.error = "option '{arg}' requires a value"
                 return result
             }
             i = i + 1
@@ -324,15 +493,7 @@ pub fn argparse(p: ArgParser) -> Args {
         }
 
         if arg.starts_with("-") {
-            result = Args {
-                command_name: result.command_name,
-                flag_names: result.flag_names,
-                option_keys: result.option_keys,
-                option_vals: result.option_vals,
-                positional_vals: result.positional_vals,
-                rest_args: result.rest_args,
-                error: "unknown option '{arg}'"
-            }
+            result.error = "unknown option '{arg}'"
             return result
         }
 
@@ -340,6 +501,7 @@ pub fn argparse(p: ArgParser) -> Args {
         i = i + 1
     }
 
+    result.command_name = join_path(result.command_path)
     result
 }
 
@@ -369,6 +531,10 @@ pub fn args_command(a: Args) -> Str {
     a.command_name
 }
 
+pub fn args_command_path(a: Args) -> List[Str] {
+    a.command_path
+}
+
 pub fn args_positional(a: Args, idx: Int) -> Str {
     if idx < a.positional_vals.len() {
         return a.positional_vals.get(idx).unwrap()
@@ -382,6 +548,50 @@ pub fn args_rest(a: Args) -> List[Str] {
 
 pub fn args_error(a: Args) -> Str {
     a.error
+}
+
+fn emit_cmd_help(h: Str, cmd: CommandDef, indent: Str) -> Str {
+    let mut result = h
+    result = result.concat("{indent}{cmd.name}")
+    if cmd.description != "" {
+        result = result.concat("    {cmd.description}")
+    }
+    result = result.concat("\n")
+    let inner_indent = indent.concat("  ")
+    let mut cfi = 0
+    while cfi < cmd.flags.len() {
+        let cf = cmd.flags.get(cfi).unwrap()
+        result = result.concat("{inner_indent}{cf.long_name}")
+        if cf.short_name != "" {
+            result = result.concat(", {cf.short_name}")
+        }
+        result = result.concat("    {cf.description}\n")
+        cfi = cfi + 1
+    }
+    let mut coi = 0
+    while coi < cmd.options.len() {
+        let co = cmd.options.get(coi).unwrap()
+        result = result.concat("{inner_indent}{co.long_name}")
+        if co.short_name != "" {
+            result = result.concat(", {co.short_name}")
+        }
+        result = result.concat(" <value>    {co.description}\n")
+        coi = coi + 1
+    }
+    if cmd.subcommands.len() > 0 {
+        result = emit_command_tree(result, wrap(cmd.subcommands), inner_indent)
+    }
+    result
+}
+
+fn emit_command_tree(h: Str, cl: CmdList, indent: Str) -> Str {
+    let mut result = h
+    let mut ci = 0
+    while ci < cl.items.len() {
+        result = emit_cmd_help(result, cl.items.get(ci).unwrap(), indent)
+        ci = ci + 1
+    }
+    result
 }
 
 pub fn generate_help(p: ArgParser) -> Str {
@@ -402,33 +612,7 @@ pub fn generate_help(p: ArgParser) -> Str {
 
     if p.commands.len() > 0 {
         h = h.concat("\nCommands:\n")
-        let mut ci = 0
-        while ci < p.commands.len() {
-            let cmd = p.commands.get(ci).unwrap()
-            h = h.concat("  {cmd.name}")
-            h = h.concat("    {cmd.description}\n")
-            let mut cfi = 0
-            while cfi < cmd.flags.len() {
-                let cf = cmd.flags.get(cfi).unwrap()
-                h = h.concat("    {cf.long_name}")
-                if cf.short_name != "" {
-                    h = h.concat(", {cf.short_name}")
-                }
-                h = h.concat("    {cf.description}\n")
-                cfi = cfi + 1
-            }
-            let mut coi = 0
-            while coi < cmd.options.len() {
-                let co = cmd.options.get(coi).unwrap()
-                h = h.concat("    {co.long_name}")
-                if co.short_name != "" {
-                    h = h.concat(", {co.short_name}")
-                }
-                h = h.concat(" <value>    {co.description}\n")
-                coi = coi + 1
-            }
-            ci = ci + 1
-        }
+        h = emit_command_tree(h, wrap(p.commands), "  ")
     }
 
     if p.flags.len() > 0 {
@@ -462,29 +646,49 @@ pub fn generate_help(p: ArgParser) -> Str {
     h
 }
 
-pub fn generate_command_help(p: ArgParser, cmd_name: Str) -> Str {
-    let idx = find_command_idx(p, cmd_name)
-    if idx == -1 {
-        return "unknown command '{cmd_name}'"
-    }
-    let cmd = p.commands.get(idx).unwrap()
-    let mut h = "Usage: {p.prog_name} {cmd_name}"
-    if cmd.options.len() > 0 || cmd.flags.len() > 0 {
-        h = h.concat(" [options]")
-    }
+fn find_cmd_by_path(p: ArgParser, cmd_path: Str) -> CommandDef {
+    let parts = cmd_path.split(" ")
+    let mut cmds = p.commands
+    let mut found = new_cmd("", "")
     let mut pi = 0
-    while pi < cmd.positionals.len() {
-        let pos = cmd.positionals.get(pi).unwrap()
-        h = h.concat(" <{pos.name}>")
+    while pi < parts.len() {
+        let seg = parts.get(pi).unwrap()
+        found = find_command_in(wrap(cmds), seg)
+        if found.name == "" {
+            return new_cmd("", "")
+        }
+        cmds = found.subcommands
         pi = pi + 1
     }
-    h = h.concat("\n\n{cmd.description}\n")
+    found
+}
 
-    if cmd.flags.len() > 0 {
+fn emit_cmd_detail_help(found: CommandDef, prog_name: Str, cmd_path: Str) -> Str {
+    let mut h = "Usage: {prog_name} {cmd_path}"
+    if found.options.len() > 0 || found.flags.len() > 0 {
+        h = h.concat(" [options]")
+    }
+    let mut posi = 0
+    while posi < found.positionals.len() {
+        let pos = found.positionals.get(posi).unwrap()
+        h = h.concat(" <{pos.name}>")
+        posi = posi + 1
+    }
+    if found.subcommands.len() > 0 {
+        h = h.concat(" <subcommand>")
+    }
+    h = h.concat("\n\n{found.description}\n")
+
+    if found.subcommands.len() > 0 {
+        h = h.concat("\nSubcommands:\n")
+        h = emit_command_tree(h, wrap(found.subcommands), "  ")
+    }
+
+    if found.flags.len() > 0 {
         h = h.concat("\nFlags:\n")
         let mut fi = 0
-        while fi < cmd.flags.len() {
-            let f = cmd.flags.get(fi).unwrap()
+        while fi < found.flags.len() {
+            let f = found.flags.get(fi).unwrap()
             h = h.concat("  {f.long_name}")
             if f.short_name != "" {
                 h = h.concat(", {f.short_name}")
@@ -494,11 +698,11 @@ pub fn generate_command_help(p: ArgParser, cmd_name: Str) -> Str {
         }
     }
 
-    if cmd.options.len() > 0 {
+    if found.options.len() > 0 {
         h = h.concat("\nOptions:\n")
         let mut oi = 0
-        while oi < cmd.options.len() {
-            let o = cmd.options.get(oi).unwrap()
+        while oi < found.options.len() {
+            let o = found.options.get(oi).unwrap()
             h = h.concat("  {o.long_name}")
             if o.short_name != "" {
                 h = h.concat(", {o.short_name}")
@@ -509,4 +713,12 @@ pub fn generate_command_help(p: ArgParser, cmd_name: Str) -> Str {
     }
 
     h
+}
+
+pub fn generate_command_help(p: ArgParser, cmd_path: Str) -> Str {
+    let found = find_cmd_by_path(p, cmd_path)
+    if found.name == "" {
+        return "unknown command '{cmd_path}'"
+    }
+    emit_cmd_detail_help(found, p.prog_name, cmd_path)
 }

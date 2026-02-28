@@ -218,6 +218,28 @@ pub fn format_pattern(node: Int) -> Str {
         let inner = np_pattern.get(node).unwrap()
         return "{name} as ".concat(format_pattern(inner))
     }
+    if kind == NodeKind.ListPattern {
+        let elems_sl = np_elements.get(node).unwrap()
+        let has_rest = np_inclusive.get(node).unwrap()
+        let mut result = "["
+        if elems_sl != -1 {
+            let mut i = 0
+            while i < sublist_length(elems_sl) {
+                if i > 0 {
+                    result = result.concat(", ")
+                }
+                result = result.concat(format_pattern(sublist_get(elems_sl, i)))
+                i = i + 1
+            }
+        }
+        if has_rest != 0 {
+            if elems_sl != -1 && sublist_length(elems_sl) > 0 {
+                result = result.concat(", ")
+            }
+            result = result.concat("...")
+        }
+        return result.concat("]")
+    }
     "_"
 }
 

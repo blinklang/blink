@@ -922,6 +922,46 @@ fn classify(pair: (Int, Int)) -> Str {
 }
 ```
 
+**List patterns.** Match list values by length and element values. Square brackets in pattern position.
+
+```pact
+fn dispatch(command_path: List[Str]) -> Str {
+    match command_path {
+        [] => "help"
+        ["build"] => "building"
+        ["daemon", "start"] => "starting daemon"
+        ["daemon", "stop"] => "stopping daemon"
+        ["daemon", sub] => "unknown daemon subcommand: {sub}"
+        [cmd] => "unknown command: {cmd}"
+        _ => "too many segments"
+    }
+}
+```
+
+Rest wildcard `...` matches zero or more trailing elements (tail position only, no binding):
+
+```pact
+fn process(tokens: List[Str]) -> Str {
+    match tokens {
+        [] => "done"
+        [first, ...] => "processing: {first}"
+    }
+}
+```
+
+`...` cannot bind a variable. Use `.slice()` or loops for tail access. (Rest binding deferred — would require O(n) copy or a slice type.)
+
+**Exhaustiveness**: list patterns are length-checked. The compiler tracks which concrete lengths are covered. A wildcard `_` or `...` arm is **always required** — lists are unbounded, so finite length patterns cannot be exhaustive. `[]` + `[_, ...]` IS exhaustive (covers empty + non-empty).
+
+```
+error[NonExhaustiveMatch]: non-exhaustive match on List[Str]
+ --> cli.pact:15:5
+  |
+15|     match path {
+  |     ^^^^^ patterns cover lengths 0, 1, 2 — no catch-all for longer lists
+  = help: add a `_` wildcard arm or `[_, _, ...]` rest pattern
+```
+
 **Struct patterns.** Match struct types by field values. Type name is required (nominal matching). Field punning binds a field to a variable of the same name. `..` is required when not all fields are listed.
 
 ```pact

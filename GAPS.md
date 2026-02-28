@@ -69,6 +69,8 @@ Unspecified or under-specified areas needing design work. Note: a self-hosting c
 
 - [x] **Int-to-char string conversion** — `char_at(Int) -> Int` exists but no reverse (`Int -> single-char Str`). Currently worked around with `str_from_char_code` C runtime builtin. Should there be a language-level mechanism (e.g. `chr(Int)`, `Int.to_char()`, or method on Str)? Touches string model (ASCII-only vs UTF-8 codepoints) and error handling (out-of-range values). Low urgency — runtime builtin works — but the gap means pure Pact can't construct arbitrary characters. *(Resolved: §3c.3, panel vote 4-1 Char.to_int() + From[Char] for Int, 4-1 TryFrom[Int] for Char + Char.from_code_point(), 5-0 From[Char] for Str + Char.to_str())*
 
+- [x] **Ergonomic dispatch on variable-length ordered data** — Pattern matching handles tuples (fixed-length) and enums, but not lists (variable-length). Surfaced from CLI subcommand dispatch: `args_command_path()` returns `List[Str]` (e.g., `["daemon", "start"]`) but no way to `match` on list shape/contents. Forces `if/else` chains with `.len()` + `.get()`. Broader than CLI — applies to JSON path traversal, token sequences, any `List[T]` branching. *(Resolved: §3.5, panel vote 5-0 list patterns, 4-1 wildcard-only rest, length-based exhaustiveness with mandatory catch-all)*
+
 ## Deferred to v2+
 
 Items that are specced or aspirational but not needed for v1 release. Kept here for tracking — no bd issues.

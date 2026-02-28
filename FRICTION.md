@@ -233,8 +233,16 @@ Source: `ai` (Claude) | `human` | `both`
 
 ### 2026-02-25 — CLI argparser lacks command-scoped flags and routing
 - **Category:** `tooling`
-- **Severity:** `annoying`
+- **Severity:** `annoying` → **partially resolved**
 - **Source:** `ai`
 - **Context:** Adding new commands to cli.pact requires updating two hardcoded exclusion chains
 - **Description:** `std.args` provides flat flag/option parsing but no command-scoped routing. Every command that doesn't require a source file must be added to a growing `command != "init" && command != "llms" && ...` chain (cli.pact lines 604 and 610). Adding a command means updating two separate exclusion lists. A command-scoped approach (where each command declares its own required positionals and flags) would eliminate this.
+- **Partial resolution (2026-02-28):** Added nested subcommand support (`add_command(p, "daemon.start", ...)`) and `command_add_positional` to `std.args`. Daemon now uses proper subcommands. The exclusion chain problem remains for non-daemon commands.
+
+### 2026-02-28 — Codegen loses element type for `List[T]` parameters
+- **Category:** `codegen`
+- **Severity:** `annoying`
+- **Source:** `ai`
+- **Context:** Implementing nested subcommands in `lib/std/args.pact`
+- **Description:** When a function takes `List[SomeStruct]` as a direct parameter, the codegen loses the element type info for items obtained via `.get().unwrap()`. Field access on the unwrapped item produces `int64_t.field` in C instead of a proper struct access. The same pattern works fine when the list is accessed through a struct field chain (e.g., `p.commands.get(i).unwrap().name`). Workaround: wrap `List[T]` in a struct (`type CmdList { items: List[CommandDef] }`) and pass the wrapper. This adds boilerplate (`wrap(cmds)` calls everywhere) but produces correct C.
 

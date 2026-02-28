@@ -19,6 +19,7 @@ test "parser setup with commands and flags" {
 test "Args struct field access" {
     let a = Args {
         command_name: "build",
+        command_path: ["build"],
         flag_names: ["verbose"],
         option_keys: ["output"],
         option_vals: ["out.txt"],

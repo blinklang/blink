@@ -528,7 +528,10 @@ fn main() {
     p = add_command(p, "add", "Add a dependency (use --path or --git)")
     p = add_command(p, "remove", "Remove a dependency")
     p = add_command(p, "update", "Re-resolve dependencies and update lockfile")
-    p = add_command(p, "daemon", "Compiler daemon (start/status/stop)")
+    p = add_command(p, "daemon.start", "Start compiler daemon")
+    p = add_command(p, "daemon.status", "Show daemon status")
+    p = add_command(p, "daemon.stop", "Stop compiler daemon")
+    p = command_add_positional(p, "daemon.start", "file", "Source file to watch")
     p = add_command(p, "query", "Query symbol index (uses daemon if running)")
     p = add_command(p, "llms", "Print LLM language reference to stdout")
 
@@ -627,13 +630,13 @@ fn main() {
         format_flag = "json"
     }
 
-    if source_path == "" && command != "init" && command != "llms" && command != "fmt" && command != "test" && command != "audit" && command != "add" && command != "remove" && command != "update" && command != "daemon" {
+    if source_path == "" && command != "init" && command != "llms" && command != "fmt" && command != "test" && command != "audit" && command != "add" && command != "remove" && command != "update" && command != "daemon start" && command != "daemon status" && command != "daemon stop" && command != "daemon" {
         io.println("error: no source file specified")
         io.println(generate_help(p))
         return
     }
 
-    if source_path != "" && command != "init" && command != "llms" && command != "add" && command != "remove" && command != "update" && command != "daemon" && !file_exists(source_path) {
+    if source_path != "" && command != "init" && command != "llms" && command != "add" && command != "remove" && command != "update" && command != "daemon start" && !file_exists(source_path) {
         io.println("error: file not found: {source_path}")
         return
     }
@@ -1391,61 +1394,54 @@ fn main() {
 
             io.println(result)
         }
-    } else if command == "daemon" {
-        let sub_cmd = args_positional(a, 0)
-        let daemon_source = args_positional(a, 1)
-
-        if sub_cmd == "" {
-            io.println("error: daemon requires a subcommand: start, status, or stop")
-            io.println(generate_help(p))
+    } else if command == "daemon start" {
+        let daemon_source = args_positional(a, 0)
+        if daemon_source == "" {
+            io.println("error: daemon start requires a source file")
+            io.println("usage: pact daemon start <file.pact>")
             return
         }
-
-        if sub_cmd == "start" {
-            if daemon_source == "" {
-                io.println("error: daemon start requires a source file")
-                io.println("usage: pact daemon start <file.pact>")
-                return
-            }
-            if !file_exists(daemon_source) {
-                io.println("error: file not found: {daemon_source}")
-                return
-            }
-            let root = path_dirname(daemon_source)
-            let actual_root = if root == "" { "." } else { root }
-            io.println("Daemon starting on .pact/daemon.sock")
-            daemon_start(actual_root, daemon_source)
-        } else if sub_cmd == "status" {
-            let sock_path = find_daemon_sock()
-            if sock_path == "" {
-                io.println("error: daemon not running (no .pact/daemon.sock found)")
-                exit(1)
-            }
-            let fd = unix_socket_connect(sock_path)
-            if fd < 0 {
-                io.println("error: daemon not running (could not connect to {sock_path})")
-                exit(1)
-            }
-            socket_write(fd, "\{\"type\":\"status\"}\n")
-            let response = socket_read_line(fd)
-            unix_socket_close(fd)
-            io.println(response)
-        } else if sub_cmd == "stop" {
-            let sock_path = find_daemon_sock()
-            if sock_path == "" {
-                io.println("error: daemon not running (no .pact/daemon.sock found)")
-                exit(1)
-            }
-            let fd = unix_socket_connect(sock_path)
-            if fd < 0 {
-                io.println("error: daemon not running (could not connect to {sock_path})")
-                exit(1)
-            }
-            socket_write(fd, "\{\"type\":\"stop\"}\n")
-            let response = socket_read_line(fd)
-            unix_socket_close(fd)
-            io.println("Daemon stopped")
+        if !file_exists(daemon_source) {
+            io.println("error: file not found: {daemon_source}")
+            return
         }
+        let root = path_dirname(daemon_source)
+        let actual_root = if root == "" { "." } else { root }
+        io.println("Daemon starting on .pact/daemon.sock")
+        daemon_start(actual_root, daemon_source)
+    } else if command == "daemon status" {
+        let sock_path = find_daemon_sock()
+        if sock_path == "" {
+            io.println("error: daemon not running (no .pact/daemon.sock found)")
+            exit(1)
+        }
+        let fd = unix_socket_connect(sock_path)
+        if fd < 0 {
+            io.println("error: daemon not running (could not connect to {sock_path})")
+            exit(1)
+        }
+        socket_write(fd, "\{\"type\":\"status\"}\n")
+        let response = socket_read_line(fd)
+        unix_socket_close(fd)
+        io.println(response)
+    } else if command == "daemon stop" {
+        let sock_path = find_daemon_sock()
+        if sock_path == "" {
+            io.println("error: daemon not running (no .pact/daemon.sock found)")
+            exit(1)
+        }
+        let fd = unix_socket_connect(sock_path)
+        if fd < 0 {
+            io.println("error: daemon not running (could not connect to {sock_path})")
+            exit(1)
+        }
+        socket_write(fd, "\{\"type\":\"stop\"}\n")
+        let response = socket_read_line(fd)
+        unix_socket_close(fd)
+        io.println("Daemon stopped")
+    } else if command == "daemon" {
+        io.println("error: daemon requires a subcommand: start, status, or stop")
+        io.println(generate_command_help(p, "daemon"))
     } else if command == "ast" {
         let source = read_file(source_path)
         lex(source)

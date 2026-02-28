@@ -137,6 +137,23 @@ pub fn emit_match_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scop
                 }
             }
             match_scruts.push(MatchScrutEntry { str_val: scrut_tmp, scrut_type: expr_result_type })
+        } else if expr_result_type == CT_LIST {
+            let scrut_tmp = fresh_temp("_scrut_")
+            emit_line("pact_list* {scrut_tmp} = {expr_result_str};")
+            set_var(scrut_tmp, CT_LIST, 1)
+            let mut src_name = expr_result_str
+            if np_kind.get(scrut).unwrap() == NodeKind.Ident {
+                src_name = np_name.get(scrut).unwrap()
+            }
+            let lelem = get_list_elem_type(src_name)
+            if lelem >= 0 {
+                set_list_elem_type(scrut_tmp, lelem)
+            }
+            let lstruct = get_list_elem_struct(src_name)
+            if lstruct != "" {
+                set_list_elem_struct(scrut_tmp, lstruct)
+            }
+            match_scruts.push(MatchScrutEntry { str_val: scrut_tmp, scrut_type: CT_LIST })
         } else {
             match_scruts.push(MatchScrutEntry { str_val: expr_result_str, scrut_type: expr_result_type })
         }
@@ -408,6 +425,55 @@ pub fn pattern_condition(pat: Int, scrut_off: Int, scrut_len: Int) -> Str {
         }
         return parts
     }
+    if pk == NodeKind.ListPattern {
+        let elems_sl = np_elements.get(pat).unwrap()
+        let has_rest = np_inclusive.get(pat).unwrap()
+        let scrut = match_scruts.get(scrut_off).unwrap().str_val
+        let mut elem_count = 0
+        if elems_sl != -1 {
+            elem_count = sublist_length(elems_sl)
+        }
+        let mut parts = ""
+        let mut parts_n = 0
+        if has_rest != 0 {
+            parts = "(pact_list_len({scrut}) >= {elem_count})"
+        } else {
+            parts = "(pact_list_len({scrut}) == {elem_count})"
+        }
+        parts_n = 1
+        if elems_sl != -1 {
+            let mut j = 0
+            while j < sublist_length(elems_sl) {
+                let sub_pat = sublist_get(elems_sl, j)
+                let saved_scruts = match_scruts
+                let elem_type = get_list_elem_type(scrut)
+                let elem_struct = get_list_elem_struct(scrut)
+                let mut cast = "(int64_t)(intptr_t)"
+                let mut sub_scrut_type = CT_STRING
+                if elem_type == CT_STRING {
+                    cast = "(const char*)"
+                    sub_scrut_type = CT_STRING
+                } else if elem_struct != "" {
+                    cast = "({c_type_c_name(elem_struct)})(intptr_t)"
+                    sub_scrut_type = CT_INT
+                } else if elem_type >= 0 {
+                    sub_scrut_type = elem_type
+                }
+                match_scruts = [MatchScrutEntry { str_val: "{cast}pact_list_get({scrut}, {j})", scrut_type: sub_scrut_type }]
+                let sub_cond = pattern_condition(sub_pat, 0, 1)
+                match_scruts = saved_scruts
+                if sub_cond != "" {
+                    if parts_n > 0 {
+                        parts = parts.concat(" && ")
+                    }
+                    parts = parts.concat(sub_cond)
+                    parts_n = parts_n + 1
+                }
+                j = j + 1
+            }
+        }
+        return parts
+    }
     ""
 }
 
@@ -605,6 +671,35 @@ pub fn bind_pattern_vars(pat: Int, scrut_off: Int, scrut_len: Int) ! Codegen.Emi
             while j < sublist_length(elems_sl) {
                 let sub_pat = sublist_get(elems_sl, j)
                 bind_pattern_vars(sub_pat, scrut_off + j, 1)
+                j = j + 1
+            }
+        }
+        return
+    }
+    if pk == NodeKind.ListPattern {
+        let elems_sl = np_elements.get(pat).unwrap()
+        if elems_sl != -1 {
+            let scrut = match_scruts.get(scrut_off).unwrap().str_val
+            let elem_type = get_list_elem_type(scrut)
+            let elem_struct = get_list_elem_struct(scrut)
+            let mut j = 0
+            while j < sublist_length(elems_sl) {
+                let sub_pat = sublist_get(elems_sl, j)
+                let saved_scruts = match_scruts
+                let mut cast = "(int64_t)(intptr_t)"
+                let mut bind_ct = CT_INT
+                if elem_type == CT_STRING {
+                    cast = "(const char*)"
+                    bind_ct = CT_STRING
+                } else if elem_struct != "" {
+                    cast = "({c_type_c_name(elem_struct)})(intptr_t)"
+                    bind_ct = CT_INT
+                } else if elem_type >= 0 {
+                    bind_ct = elem_type
+                }
+                match_scruts = [MatchScrutEntry { str_val: "{cast}pact_list_get({scrut}, {j})", scrut_type: bind_ct }]
+                bind_pattern_vars(sub_pat, 0, 1)
+                match_scruts = saved_scruts
                 j = j + 1
             }
         }

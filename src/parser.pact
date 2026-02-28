@@ -2607,6 +2607,58 @@ pub fn parse_pattern() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
 }
 
 pub fn parse_single_pattern() -> Int ! Diag.Report, Parse.Advance, Parse.Build {
+    if at(TokenKind.LBracket) {
+        advance()
+        skip_newlines()
+        if at(TokenKind.RBracket) {
+            advance()
+            let nd = new_node(NodeKind.ListPattern)
+            np_elements.pop()
+            np_elements.push(-1)
+            np_inclusive.pop()
+            np_inclusive.push(0)
+            return nd
+        }
+        let mut elem_nodes: List[Int] = []
+        let mut has_rest = 0
+        elem_nodes.push(parse_pattern())
+        while at(TokenKind.Comma) {
+            advance()
+            skip_newlines()
+            if at(TokenKind.DotDot) {
+                advance()
+                if at(TokenKind.Dot) {
+                    advance()
+                }
+                has_rest = 1
+                skip_newlines()
+                if at(TokenKind.Comma) {
+                    advance()
+                    skip_newlines()
+                }
+                break
+            }
+            if at(TokenKind.RBracket) {
+                break
+            }
+            elem_nodes.push(parse_pattern())
+        }
+        skip_newlines()
+        expect(TokenKind.RBracket)
+        let elems = new_sublist()
+        let mut ei = 0
+        while ei < elem_nodes.len() {
+            sublist_push(elems, elem_nodes.get(ei).unwrap())
+            ei = ei + 1
+        }
+        finalize_sublist(elems)
+        let nd = new_node(NodeKind.ListPattern)
+        np_elements.pop()
+        np_elements.push(elems)
+        np_inclusive.pop()
+        np_inclusive.push(has_rest)
+        return nd
+    }
     if at(TokenKind.LParen) {
         advance()
         skip_newlines()

@@ -263,6 +263,7 @@ Decided by expert panel vote. See [OPEN_QUESTIONS.md](OPEN_QUESTIONS.md) for ful
 | Char → Int conversion | `Char.to_int()` named method + `From[Char] for Int`. Infallible widening | 4-1 (PLT dissented: `code_point()` only, Char is not numeric) |
 | Int → Char conversion | `TryFrom[Int] for Char` + `Char.from_code_point(n) -> Result[Char, ConversionError]` | 4-1 (Web dissented: `Int.to_char()` for symmetry) |
 | Char → Str conversion | `From[Char] for Str` + `Char.to_str()` named method. Infallible | 5-0 |
+| List pattern matching | `[pattern, ...]` in match, wildcard-only rest (no binding), length-based exhaustiveness with mandatory catch-all | 5-0 patterns, 4-1 wildcard rest |
 
 ---
 
@@ -319,6 +320,7 @@ Full deliberation records for each decision. Each file contains expert votes, re
 | Compile-Time Intrinsics (`#` sigil) | [decisions/compile-time-intrinsics.md](decisions/compile-time-intrinsics.md) |
 | Language Evolution | [decisions/language-evolution.md](decisions/language-evolution.md) |
 | Char Conversions | [decisions/char-conversions.md](decisions/char-conversions.md) |
+| List Pattern Matching | [decisions/list-pattern-matching.md](decisions/list-pattern-matching.md) |
 
 ---
 

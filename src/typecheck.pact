@@ -1623,6 +1623,18 @@ pub fn nr_check_pattern(node: Int) ! TypeCheck.Resolve {
         return
     }
 
+    if kind == NodeKind.ListPattern {
+        let elems_sl = np_elements.get(node).unwrap()
+        if elems_sl != -1 {
+            let mut i = 0
+            while i < sublist_length(elems_sl) {
+                nr_check_pattern(sublist_get(elems_sl, i))
+                i = i + 1
+            }
+        }
+        return
+    }
+
     if kind == NodeKind.OrPattern {
         nr_check_pattern(np_left.get(node).unwrap())
         nr_check_pattern(np_right.get(node).unwrap())
@@ -2336,6 +2348,17 @@ pub fn tc_check_pattern_types(node: Int) ! TypeCheck.Resolve {
         return
     }
     if kind == NodeKind.TuplePattern {
+        let elems_sl = np_elements.get(node).unwrap()
+        if elems_sl != -1 {
+            let mut i = 0
+            while i < sublist_length(elems_sl) {
+                tc_check_pattern_types(sublist_get(elems_sl, i))
+                i = i + 1
+            }
+        }
+        return
+    }
+    if kind == NodeKind.ListPattern {
         let elems_sl = np_elements.get(node).unwrap()
         if elems_sl != -1 {
             let mut i = 0
