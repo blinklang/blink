@@ -21,6 +21,7 @@ let pact_cli_version: Str = "dev"
 const embedded_llms_full: Str = #embed("../llms-full.md")
 const embedded_llms_short: Str = #embed("../llms.md")
 const embedded_runtime_h: Str = #embed("../bootstrap/runtime.h")
+const embedded_upgrade_cmd: Str = #embed("../templates/claude-commands/pact-upgrade.md")
 
 fn strip_extension(filename: Str) -> Str {
     if filename.ends_with(".pact") {
@@ -729,6 +730,13 @@ fn main() {
             let updated_agents = agents_content.concat(agents_section)
             write_file(agents_file, updated_agents)
             io.println("  created {agents_file}")
+        }
+
+        shell_exec("mkdir -p .claude/commands")
+        let upgrade_cmd_path = ".claude/commands/pact-upgrade.md"
+        if file_exists(upgrade_cmd_path) == 0 {
+            write_file(upgrade_cmd_path, embedded_upgrade_cmd)
+            io.println("  installed .claude/commands/pact-upgrade.md")
         }
 
         io.println("\nProject '{project_name}' initialized. Run: pact run src/main.pact")
