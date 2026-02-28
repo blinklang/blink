@@ -1,16 +1,23 @@
 # Pact Language Reference
 
-> Pact is a statically-typed, effect-tracked language compiling to C. Compiler v0.8. Language spec v0.3. Self-hosting.
+> Pact is a statically-typed, effect-tracked language compiling to C. Compiler v0.9. Language spec v0.3. Self-hosting.
 
-## Recent Breaking Changes (v0.8)
+## What's New (v0.9)
+
+| Change | Details |
+|--------|---------|
+| List pattern matching | `match list { [] => ..., [a, b] => ..., [first, ...] => ... }` — match lists by length + element values in `match` expressions. Rest wildcard `...` matches zero or more trailing elements (tail only, no binding). Wildcard `_` or `...` arm required for exhaustiveness. |
+| Nested subcommands (`std.args`) | Dotted paths: `add_command(p, "daemon.start", "...")`. `args_command()` returns space-joined `"daemon start"`. New `args_command_path()` returns `List[Str]`. `command_add_positional()` and `generate_command_help()` added. |
+| Parallel test execution | `pact test --parallel` / `-P` runs tests in parallel (default 4 workers) |
+| `pact init` idempotent | `pact init` now safe to re-run on existing projects |
+
+### Prior: Breaking Changes (v0.8)
 
 | Change | Before | After |
 |--------|--------|-------|
 | `str_from_char_code()` removed | `str_from_char_code(65)` | `Char.from_code_point(65)` — static method, returns `Str` |
 | `\b`/`\f` escape sequences | Not supported | `\b` (backspace), `\f` (form feed) now valid in strings |
 | CLI flag scoping | Flags global | Flags scoped to subcommands (`build --emit`, `run --`, etc.) |
-
-Also: 24 test failures fixed (string iteration, list-of-list method codegen, process_exec, async pool decl), `/pact:upgrade` Claude command.
 
 ### Prior: What's New (v0.7)
 
@@ -75,6 +82,14 @@ let s = Shape.Circle(5.0)
 let area = match s {
     Circle(r) => 3.14 * r * r
     Rect(w, h) => w * h
+}
+
+// List patterns in match
+match args {
+    [] => show_help()
+    ["build"] => build()
+    ["daemon", sub] => handle_sub(sub)
+    [cmd, ...] => io.println("unknown: {cmd}")  // ... = rest wildcard (no binding)
 }
 
 // Control flow
@@ -366,12 +381,17 @@ import std.args
 fn main() {
     let mut p = argparser_new("myapp", "Description")
     p = add_command(p, "run", "Run the app")
+    p = add_command(p, "daemon.start", "Start daemon")   // nested subcommand
+    p = add_command(p, "daemon.stop", "Stop daemon")
     p = add_flag(p, "--verbose", "-v", "Verbose output")
+    p = command_add_flag(p, "run", "--watch", "-w", "Watch mode")  // command-scoped flag
     p = add_option(p, "--output", "-o", "Output file")
     p = add_positional(p, "file", "Input file")
+    p = command_add_positional(p, "daemon.start", "target", "File to watch")
 
     let a = argparse(p)
-    let cmd = args_command(a)
+    let cmd = args_command(a)            // "daemon start" (space-joined)
+    let path = args_command_path(a)      // ["daemon", "start"] (List[Str])
     let verbose = args_has(a, "verbose")
     let output = args_get(a, "output")
     let file = args_positional(a, 0)
@@ -453,6 +473,7 @@ if result.exit_code == 0 {
 - `shell_exec()` returns exit code (Int), not stdout — use `process_run()` for output capture
 - No `return` needed for last expression in function body
 - `match` must be exhaustive — cover all variants or use `_ =>` wildcard
+- List patterns in `match` ALWAYS need a wildcard `_` or rest `...` arm — finite patterns can't cover unbounded lists
 - `let mut` required for any variable you want to reassign
 - Function args separated by commas in calls, but by newlines in multi-line definitions
 - `assert`, `assert_eq`, `assert_ne` only available inside `test` blocks and debug mode

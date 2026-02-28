@@ -4,13 +4,18 @@
 
 Language spec v0.3. Self-hosting compiler. Targets native binaries via C codegen.
 
-## Recent Breaking Changes (v0.8)
+## What's New (v0.9)
+
+- **List pattern matching** in `match`: `[]`, `[a, b]`, `[first, ...]` with rest wildcard
+- **Nested subcommands** in `std.args`: dotted paths (`add_command(p, "daemon.start", ...)`), `args_command_path()` returns `List[Str]`
+- **Parallel test execution**: `pact test --parallel` / `-P` (default 4 workers)
+- `pact init` now idempotent for existing projects
+
+### Prior: Breaking Changes (v0.8)
 
 - `str_from_char_code()` removed → use `Char.from_code_point(n)` (returns `Str`)
 - `\b` (backspace) and `\f` (form feed) escape sequences added
-- 24 test failures fixed (6 codegen root causes: string iteration, list-of-list methods, process_exec, async pool decl)
 - CLI flags now scoped to subcommands
-- `/pact:upgrade` Claude command for automated migration
 
 ### Prior: What's New (v0.7)
 
