@@ -796,7 +796,13 @@ pub fn infer_expr_type(node: Int) -> Int {
         if op == "==" || op == "!=" || op == "<" || op == ">" || op == "<=" || op == ">=" || op == "&&" || op == "||" {
             return CT_BOOL
         }
-        return infer_expr_type(np_left.get(node).unwrap())
+        let left_t = infer_expr_type(np_left.get(node).unwrap())
+        if left_t == CT_STRING { return CT_STRING }
+        if op == "+" {
+            let right_t = infer_expr_type(np_right.get(node).unwrap())
+            if right_t == CT_STRING { return CT_STRING }
+        }
+        return left_t
     }
     CT_VOID
 }

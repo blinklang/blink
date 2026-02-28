@@ -2430,11 +2430,12 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                     expr_result_type = CT_BOOL
                 } else if ret_part.starts_with("pact_") {
                     let sname = ret_part.substring(5, ret_part.len() - 5)
-                    if is_struct_type(sname) != 0 {
+                    let resolved = resolve_struct_from_c_name(sname)
+                    if resolved != "" {
                         let tmp = fresh_temp("_cls_ret_")
                         emit_line("{ret_part} {tmp} = (({cls_sig}){cls_ptr}->fn_ptr)({args_str});")
-                        set_var_struct(tmp, sname)
                         set_var(tmp, CT_VOID, 0)
+                        set_var_struct(tmp, resolved)
                         expr_result_str = tmp
                         expr_result_type = CT_VOID
                     } else {

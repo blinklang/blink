@@ -1166,6 +1166,21 @@ pub fn is_struct_type(name: Str) -> Int {
     struct_reg_set.has(name)
 }
 
+pub fn resolve_struct_from_c_name(cname: Str) -> Str {
+    if struct_reg_set.has(cname) { return cname }
+    let mut i = 0
+    while i < cname.len() {
+        if cname.char_at(i) == 95 {
+            let suffix = cname.substring(i + 1, cname.len() - i - 1)
+            if struct_reg_set.has(suffix) {
+                return suffix
+            }
+        }
+        i = i + 1
+    }
+    ""
+}
+
 pub fn is_enum_type(name: Str) -> Int {
     enum_reg_set.has(name)
 }

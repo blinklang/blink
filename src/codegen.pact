@@ -697,6 +697,8 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
     let pre_test_skip_iter_count = emitted_skip_iters.len()
     let pre_test_chain_iter_count = emitted_chain_iters.len()
     let pre_test_flat_map_iter_count = emitted_flat_map_iters.len()
+    let pre_test_range_iter = emitted_range_iter
+    let pre_test_str_iter = emitted_str_iter
     let pre_test_async = cg_uses_async
     cg_lines = []
     if tests_sl != -1 {
@@ -769,6 +771,12 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
     emit_mono_typedefs_from(pre_test_mono_td_count)
     emit_option_result_types_from(pre_test_option_count, pre_test_result_count, pre_test_s_option_count, pre_test_s_result_count)
     emit_iter_types_from(pre_test_iter_count, pre_test_map_iter_count, pre_test_filter_iter_count, pre_test_take_iter_count, pre_test_skip_iter_count, pre_test_chain_iter_count, pre_test_flat_map_iter_count)
+    if emitted_range_iter != 0 && pre_test_range_iter == 0 {
+        emit_range_iter_typedef()
+    }
+    if emitted_str_iter != 0 && pre_test_str_iter == 0 {
+        emit_str_iter_typedef()
+    }
     emit_mono_fns_from(pre_test_mono_fn_count)
 
     // Flush closure defs discovered during test block emission

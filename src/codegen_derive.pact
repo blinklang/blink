@@ -116,9 +116,7 @@ fn emit_struct_to_json(type_name: Str) ! Codegen.Emit {
 
 fn emit_field_serialize(access: Str, field_type: Int, stype: Str, struct_name: Str, field_name: Str) ! Codegen.Emit {
     if field_type == CT_STRING {
-        emit_line("result = pact_str_concat(result, \"\\\"\");")
-        emit_line("result = pact_str_concat(result, {c_fn_name("escape_json_str")}({access}));")
-        emit_line("result = pact_str_concat(result, \"\\\"\");")
+        emit_line("result = pact_str_concat(result, {c_fn_name("json_escape_str")}({access}));")
     } else if field_type == CT_INT {
         emit_line("result = pact_str_concat(result, pact_int_to_str({access}));")
     } else if field_type == CT_FLOAT {
@@ -156,9 +154,7 @@ fn emit_list_serialize(access: Str, struct_name: Str, field_name: Str) ! Codegen
             emit_line("result = pact_str_concat(result, \"null\");")
         }
     } else if elem_type == CT_STRING {
-        emit_line("result = pact_str_concat(result, \"\\\"\");")
-        emit_line("result = pact_str_concat(result, {c_fn_name("escape_json_str")}((const char*)pact_list_get({access}, _i)));")
-        emit_line("result = pact_str_concat(result, \"\\\"\");")
+        emit_line("result = pact_str_concat(result, {c_fn_name("json_escape_str")}((const char*)pact_list_get({access}, _i)));")
     } else if elem_type == CT_INT {
         emit_line("result = pact_str_concat(result, pact_int_to_str((int64_t)(intptr_t)pact_list_get({access}, _i)));")
     } else if elem_type == CT_FLOAT {
@@ -236,9 +232,7 @@ fn emit_enum_to_json(type_name: Str) ! Codegen.Emit {
                         emit_line("result = pact_str_concat(result, \",\\\"{fname}\\\":\");")
                         let access = "self.data.{evar.name}.{fname}"
                         if fct == CT_STRING {
-                            emit_line("result = pact_str_concat(result, \"\\\"\");")
-                            emit_line("result = pact_str_concat(result, {c_fn_name("escape_json_str")}({access}));")
-                            emit_line("result = pact_str_concat(result, \"\\\"\");")
+                            emit_line("result = pact_str_concat(result, {c_fn_name("json_escape_str")}({access}));")
                         } else if fct == CT_INT {
                             emit_line("result = pact_str_concat(result, pact_int_to_str({access}));")
                         } else if fct == CT_FLOAT {

@@ -474,6 +474,9 @@ pub fn merge_programs(main_prog: Int, imported: List[Int], import_nodes_list: Li
     np_methods.push(merged_impls)
     np_args.pop()
     np_args.push(merged_effects)
+    let main_tests = np_captures.get(main_prog).unwrap()
+    np_captures.pop()
+    np_captures.push(main_tests)
     merged
 }
 

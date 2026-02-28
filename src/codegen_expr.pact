@@ -910,6 +910,12 @@ pub fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
                 emit_expr(sublist_get(args_sl, 0))
                 let left_str = expr_result_str
                 let left_type = expr_result_type
+                let left_ok = expr_result_ok_type
+                let left_err = expr_result_err_type
+                let left_ok_s = expr_result_ok_struct
+                let left_err_s = expr_result_err_struct
+                let left_opt_inner = expr_option_inner
+                let left_opt_inner_s = expr_option_inner_struct
                 emit_expr(sublist_get(args_sl, 1))
                 let right_str = expr_result_str
                 emit_line("\{")
@@ -934,6 +940,38 @@ pub fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
                     emit_line("char {msg_tmp3}[256];")
                     emit_line("snprintf({msg_tmp3}, 256, \"ASSERT_EQ FAILED: %%f != %%f\", _left, _right);")
                     emit_line("__pact_assert_fail({msg_tmp3}, {call_line});")
+                    cg_indent = cg_indent - 1
+                    emit_line("}")
+                } else if left_type == CT_RESULT {
+                    let res_c = if left_ok_s != "" || left_err_s != "" {
+                        result_c_type_mixed(left_ok, left_err, left_ok_s, left_err_s)
+                    } else {
+                        result_c_type(left_ok, left_err)
+                    }
+                    emit_line("{res_c} _left = {left_str};")
+                    emit_line("{res_c} _right = {right_str};")
+                    emit_line("if (memcmp(&_left, &_right, sizeof({res_c})) != 0) \{")
+                    cg_indent = cg_indent + 1
+                    let msg_tmp4 = fresh_temp("_msg")
+                    emit_line("char {msg_tmp4}[256];")
+                    emit_line("snprintf({msg_tmp4}, 256, \"ASSERT_EQ FAILED: Result values differ (tag %%lld vs %%lld)\", (long long)_left.tag, (long long)_right.tag);")
+                    emit_line("__pact_assert_fail({msg_tmp4}, {call_line});")
+                    cg_indent = cg_indent - 1
+                    emit_line("}")
+                } else if left_type == CT_OPTION {
+                    let opt_c = if left_opt_inner_s != "" {
+                        struct_option_c_type(left_opt_inner_s)
+                    } else {
+                        option_c_type(left_opt_inner)
+                    }
+                    emit_line("{opt_c} _left = {left_str};")
+                    emit_line("{opt_c} _right = {right_str};")
+                    emit_line("if (memcmp(&_left, &_right, sizeof({opt_c})) != 0) \{")
+                    cg_indent = cg_indent + 1
+                    let msg_tmp5 = fresh_temp("_msg")
+                    emit_line("char {msg_tmp5}[256];")
+                    emit_line("snprintf({msg_tmp5}, 256, \"ASSERT_EQ FAILED: Option values differ (tag %%lld vs %%lld)\", (long long)_left.tag, (long long)_right.tag);")
+                    emit_line("__pact_assert_fail({msg_tmp5}, {call_line});")
                     cg_indent = cg_indent - 1
                     emit_line("}")
                 } else {
@@ -1331,11 +1369,12 @@ pub fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
             expr_result_type = CT_BOOL
         } else if ret_part.starts_with("pact_") {
             let sname = ret_part.substring(5, ret_part.len() - 5)
-            if is_struct_type(sname) != 0 {
+            let resolved = resolve_struct_from_c_name(sname)
+            if resolved != "" {
                 let tmp = fresh_temp("_cls_ret_")
                 emit_line("{ret_part} {tmp} = (({func_cls_sig}){func_str}->fn_ptr)({args_str});")
-                set_var_struct(tmp, sname)
                 set_var(tmp, CT_VOID, 0)
+                set_var_struct(tmp, resolved)
                 expr_result_str = tmp
                 expr_result_type = CT_VOID
             } else {
