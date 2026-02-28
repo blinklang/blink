@@ -1,16 +1,24 @@
 # Pact Language Reference
 
-> Pact is a statically-typed, effect-tracked language compiling to C. Compiler v0.7. Language spec v0.3. Self-hosting.
+> Pact is a statically-typed, effect-tracked language compiling to C. Compiler v0.8. Language spec v0.3. Self-hosting.
 
-## What's New (v0.7)
+## Recent Breaking Changes (v0.8)
+
+| Change | Before | After |
+|--------|--------|-------|
+| `str_from_char_code()` removed | `str_from_char_code(65)` | `Char.from_code_point(65)` — static method, returns `Str` |
+| `\b`/`\f` escape sequences | Not supported | `\b` (backspace), `\f` (form feed) now valid in strings |
+| CLI flag scoping | Flags global | Flags scoped to subcommands (`build --emit`, `run --`, etc.) |
+
+Also: 24 test failures fixed (string iteration, list-of-list method codegen, process_exec, async pool decl), `/pact:upgrade` Claude command.
+
+### Prior: What's New (v0.7)
 
 | Change | Details |
 |--------|---------|
-| `process_exec(cmd, args)` builtin | Exec a binary directly (replaces current process). Used by `pact run -- args` to pass args through. |
-| `args_rest(a)` stdlib function | Returns `List[Str]` of arguments after `--` from argparser. |
-| 5 codegen/lexer bugfixes | C reserved word escaping, closure capture fixes, match codegen, chained method calls, iterator type detection |
-| Test suite on `test` blocks | All 82 test files migrated from main-based to `test` blocks |
-| CI ~18x faster | Parallelized test execution with task caching |
+| `process_exec(cmd, args)` builtin | Exec a binary directly (replaces current process) |
+| `args_rest(a)` stdlib function | Returns `List[Str]` of arguments after `--` from argparser |
+| 5 codegen/lexer bugfixes | C reserved word escaping, closure captures, match codegen, chained methods, iterator type detection |
 
 ### Prior: Breaking Changes (v0.6)
 
@@ -121,6 +129,8 @@ test "addition works" {
 | `\t` | tab |
 | `\\` | literal `\` |
 | `\"` | literal `"` |
+| `\b` | backspace |
+| `\f` | form feed |
 | `\{` | literal `{` (suppresses interpolation) |
 | `\}` | literal `}` |
 
@@ -157,6 +167,7 @@ test "addition works" {
 | `get_arg(idx)` | Str | CLI argument by index |
 | `time_ms()` | Int | Current time in milliseconds |
 | `getpid()` | Int | Process ID |
+| `Char.from_code_point(n)` | Str | Convert char code to 1-char string (was `str_from_char_code`) |
 
 ## Namespace Methods
 
@@ -164,7 +175,8 @@ test "addition works" {
 // IO (effect: IO)
 io.println("text")              // print + newline to stdout
 io.print("text")                // print without newline
-io.eprintln("error")            // print to stderr
+io.eprintln("error")            // print to stderr + newline
+io.eprint("error")              // print to stderr, no newline
 io.log("debug info")            // stderr with [LOG] prefix
 
 // Filesystem (effect: FS)
@@ -226,7 +238,12 @@ async.spawn(fn() { ... })       // spawn task, returns Handle
 | `.find(fn(T)->Bool)` | Option[T] | First match |
 | `.any(fn(T)->Bool)` | Bool | Any match? |
 | `.all(fn(T)->Bool)` | Bool | All match? |
-| `.enumerate()` | Iterator[(Int,T)] | With indices |
+| `.count()` | Int | Count elements (drives iterator) |
+| `.for_each(fn(T)->Void)` | Void | Apply to each element |
+| `.chain(other)` | Iterator[T] | Concatenate iterators |
+| `.flat_map(fn(T)->List[U])` | Iterator[U] | Map + flatten |
+| `.zip(other)` | List[List] | Pair elements (eager, returns list-of-pairs) |
+| `.enumerate()` | List[List] | With indices (eager, returns list-of-pairs) |
 | `.take(n)` | Iterator[T] | First n |
 | `.skip(n)` | Iterator[T] | Skip first n |
 | `.collect()` | List[T] | Iterator to list |
@@ -244,6 +261,43 @@ async.spawn(fn() { ... })       // spawn task, returns Handle
 | `.keys()` | List[K] | All keys |
 | `.values()` | List[V] | All values |
 
+## Bytes Methods
+
+| Method | Returns | Purpose |
+|--------|---------|---------|
+| `Bytes.new()` / `Bytes()` | Bytes | Create empty byte buffer |
+| `Bytes.from_str(s)` | Bytes | Create from string |
+| `.push(byte)` | Void | Append byte (mutates) |
+| `.get(idx)` | Option[Int] | Byte at index |
+| `.set(idx, byte)` | Void | Set byte (mutates) |
+| `.len()` | Int | Length |
+| `.is_empty()` | Bool | Check if empty |
+| `.slice(start, end)` | Bytes | Sub-buffer |
+| `.concat(other)` | Bytes | Concatenate |
+| `.to_str()` | Result[Str, Str] | Convert to UTF-8 string |
+| `.to_hex()` | Str | Hex encoding |
+
+## Option[T] Methods
+
+| Method | Returns | Purpose |
+|--------|---------|---------|
+| `.unwrap()` | T | Extract value (panics on None) |
+| `.is_some()` | Bool | Has value? |
+| `.is_none()` | Bool | Empty? |
+
+Use `??` operator for safe unwrap with default: `opt_val ?? "default"`
+
+## Result[T, E] Methods
+
+| Method | Returns | Purpose |
+|--------|---------|---------|
+| `.unwrap()` | T | Extract Ok value (panics on Err) |
+| `.unwrap_err()` | E | Extract Err value (panics on Ok) |
+| `.is_ok()` | Bool | Success? |
+| `.is_err()` | Bool | Failure? |
+
+Use `?` operator to propagate errors: `let val = fallible()?`
+
 ## ProcessResult Fields
 
 ```pact
@@ -253,16 +307,41 @@ result.err_out      // Str — stderr
 result.exit_code    // Int — exit code
 ```
 
-## Instant & Duration
+## Duration Methods
+
+| Method | Returns | Purpose |
+|--------|---------|---------|
+| `Duration.nanos(n)` | Duration | From nanoseconds |
+| `Duration.ms(n)` | Duration | From milliseconds |
+| `Duration.seconds(n)` | Duration | From seconds |
+| `Duration.minutes(n)` | Duration | From minutes |
+| `Duration.hours(n)` | Duration | From hours |
+| `.to_nanos()` | Int | As nanoseconds |
+| `.to_ms()` | Int | As milliseconds |
+| `.to_seconds()` | Int | As seconds |
+| `.add(other)` | Duration | Add durations |
+| `.sub(other)` | Duration | Subtract durations |
+| `.scale(n)` | Duration | Multiply by integer |
+| `.is_zero()` | Bool | Zero duration? |
+
+## Instant Methods
+
+| Method | Returns | Purpose |
+|--------|---------|---------|
+| `time.read()` | Instant | Current time |
+| `Instant.from_epoch_secs(n)` | Instant | From unix timestamp |
+| `.elapsed()` | Duration | Time since this instant |
+| `.since(other)` | Duration | Difference between instants |
+| `.add(dur)` | Instant | Add duration |
+| `.to_unix_ms()` | Int | As unix milliseconds |
+| `.to_unix_secs()` | Int | As unix seconds |
+| `.to_rfc3339()` | Str | ISO-8601 formatted string |
 
 ```pact
 let start = time.read()
 // ... work ...
-let elapsed = start.elapsed()           // -> Duration
+let elapsed = start.elapsed()
 io.println("Took {elapsed.to_ms()} ms")
-
-let t = Instant.from_epoch_secs(1700000000)
-io.println(t.to_rfc3339())             // ISO-8601
 
 let d = Duration.seconds(5)
 time.sleep(d)

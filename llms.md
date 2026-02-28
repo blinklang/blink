@@ -4,12 +4,19 @@
 
 Language spec v0.3. Self-hosting compiler. Targets native binaries via C codegen.
 
-## What's New (v0.7)
+## Recent Breaking Changes (v0.8)
 
-- `process_exec(cmd, args)` — exec a binary directly (replaces current process), used for `pact run -- args`
+- `str_from_char_code()` removed → use `Char.from_code_point(n)` (returns `Str`)
+- `\b` (backspace) and `\f` (form feed) escape sequences added
+- 24 test failures fixed (6 codegen root causes: string iteration, list-of-list methods, process_exec, async pool decl)
+- CLI flags now scoped to subcommands
+- `/pact:upgrade` Claude command for automated migration
+
+### Prior: What's New (v0.7)
+
+- `process_exec(cmd, args)` — exec a binary directly (replaces current process)
 - `args_rest(a)` — get remaining args after `--` from argparser
-- 5 codegen/lexer bugfixes (C reserved word escaping, closure captures, match codegen, chained methods, iterator type detection)
-- Test suite migrated to `test` blocks (82 files), CI parallelized (~18x faster)
+- 5 codegen/lexer bugfixes, test suite migrated to `test` blocks, CI parallelized
 
 ### Prior: Breaking Changes (v0.6)
 
