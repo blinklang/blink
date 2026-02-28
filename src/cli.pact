@@ -16,6 +16,7 @@ import symbol_index
 import query
 import diagnostics
 import daemon
+import docgen
 
 let pact_cli_version: Str = "dev"
 const embedded_llms_full: Str = #embed("../llms-full.md")
@@ -567,6 +568,7 @@ fn main() {
     p = add_command(p, "daemon.stop", "Stop compiler daemon")
     p = command_add_positional(p, "daemon.start", "file", "Source file to watch")
     p = add_command(p, "query", "Query symbol index (uses daemon if running)")
+    p = add_command(p, "doc", "Print module documentation")
     p = add_command(p, "llms", "Print LLM language reference to stdout")
 
     p = add_flag(p, "--help", "-h", "Print help")
@@ -579,6 +581,7 @@ fn main() {
     p = command_add_flag(p, "check", "--json", "-j", "JSON output")
     p = command_add_flag(p, "test", "--json", "-j", "JSON output")
     p = command_add_flag(p, "fmt", "--json", "-j", "JSON output")
+    p = command_add_flag(p, "doc", "--json", "-j", "JSON output")
     p = command_add_flag(p, "query", "--json", "-j", "JSON output")
 
     p = command_add_option(p, "build", "--output", "-o", "Output path")
@@ -664,13 +667,13 @@ fn main() {
         format_flag = "json"
     }
 
-    if source_path == "" && command != "init" && command != "llms" && command != "fmt" && command != "test" && command != "audit" && command != "add" && command != "remove" && command != "update" && command != "daemon start" && command != "daemon status" && command != "daemon stop" && command != "daemon" {
+    if source_path == "" && command != "init" && command != "llms" && command != "doc" && command != "fmt" && command != "test" && command != "audit" && command != "add" && command != "remove" && command != "update" && command != "daemon start" && command != "daemon status" && command != "daemon stop" && command != "daemon" {
         io.println("error: no source file specified")
         io.println(generate_help(p))
         return
     }
 
-    if source_path != "" && command != "init" && command != "llms" && command != "add" && command != "remove" && command != "update" && command != "daemon start" && !file_exists(source_path) {
+    if source_path != "" && command != "init" && command != "llms" && command != "doc" && command != "add" && command != "remove" && command != "update" && command != "daemon start" && !file_exists(source_path) {
         io.println("error: file not found: {source_path}")
         return
     }
@@ -1375,6 +1378,42 @@ fn main() {
         } else {
             io.println("error: dependency resolution failed")
         }
+    } else if command == "doc" {
+        let module_name = source_path
+        if module_name == "" {
+            io.println("error: pact doc requires a module name")
+            io.println("usage: pact doc <module>  (e.g. pact doc std.args)")
+            return
+        }
+        reset_compiler_state()
+        diag_reset()
+        let file_path = resolve_module_path(module_name, "src/")
+        if file_path == "" {
+            diag_flush()
+            return
+        }
+        let mut source = ""
+        if file_path.starts_with("<embedded:") {
+            let key = file_path.substring(10, file_path.len() - 11)
+            source = embedded_stdlib.get(key)
+        } else {
+            source = read_file(file_path)
+        }
+        if source == "" {
+            io.println("error: could not read module: {module_name}")
+            return
+        }
+        lex(source)
+        pos = 0
+        diag_source_file = file_path
+        let program = parse_program()
+        if diag_count > 0 {
+            diag_flush()
+            io.println("error: parse failed for module: {module_name}")
+            return
+        }
+        let result = generate_doc(program, module_name, json_output)
+        io.println(result)
     } else if command == "query" {
         if query_layer == "" {
             query_layer = "signature"

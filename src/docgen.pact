@@ -1,0 +1,508 @@
+import ast
+import parser
+import formatter
+import std.json
+
+fn doc_first_line(doc: Str) -> Str {
+    if doc == "" {
+        return ""
+    }
+    let mut i = 0
+    while i < doc.len() {
+        if doc.char_at(i) == 10 {
+            return doc.substring(0, i)
+        }
+        i = i + 1
+    }
+    doc
+}
+
+fn doc_format_type_params(node: Int) -> Str {
+    let tparams = np_type_params.get(node).unwrap()
+    if tparams == -1 || sublist_length(tparams) == 0 {
+        return ""
+    }
+    let mut result = "["
+    let mut i = 0
+    while i < sublist_length(tparams) {
+        if i > 0 {
+            result = result.concat(", ")
+        }
+        let tp = sublist_get(tparams, i)
+        result = result.concat(np_name.get(tp).unwrap())
+        i = i + 1
+    }
+    result.concat("]")
+}
+
+fn doc_format_fn_sig(node: Int) -> Str {
+    let name = np_name.get(node).unwrap()
+    let params_sl = np_params.get(node).unwrap()
+    let ret = np_return_type.get(node).unwrap()
+    let ret_ann = np_type_ann.get(node).unwrap()
+    let effects_sl = np_effects.get(node).unwrap()
+
+    let mut line = "fn ".concat(name)
+    line = line.concat(doc_format_type_params(node))
+    line = line.concat("(")
+    if params_sl != -1 {
+        let mut i = 0
+        while i < sublist_length(params_sl) {
+            if i > 0 {
+                line = line.concat(", ")
+            }
+            line = line.concat(format_param(sublist_get(params_sl, i)))
+            i = i + 1
+        }
+    }
+    line = line.concat(")")
+    line = line.concat(format_fn_sig_suffix(ret, ret_ann, effects_sl))
+    line
+}
+
+fn doc_format_type_header(node: Int) -> Str {
+    let name = np_name.get(node).unwrap()
+    "type ".concat(name).concat(doc_format_type_params(node))
+}
+
+fn doc_format_type(node: Int, lines: List[Str]) {
+    let flds_sl = np_fields.get(node).unwrap()
+    let doc = np_doc_comment.get(node).unwrap()
+    let header = doc_format_type_header(node)
+
+    if doc != "" {
+        lines.push("    /// ".concat(doc_first_line(doc)))
+    }
+
+    if flds_sl == -1 || sublist_length(flds_sl) == 0 {
+        lines.push("    ".concat(header))
+        return
+    }
+
+    let first = sublist_get(flds_sl, 0)
+    let first_kind = np_kind.get(first).unwrap()
+
+    if first_kind == NodeKind.TypeVariant {
+        lines.push("    ".concat(header).concat(" \{"))
+        let mut i = 0
+        while i < sublist_length(flds_sl) {
+            let v = sublist_get(flds_sl, i)
+            let vname = np_name.get(v).unwrap()
+            let vflds_sl = np_fields.get(v).unwrap()
+            if vflds_sl != -1 && sublist_length(vflds_sl) > 0 {
+                let mut vline = "        ".concat(vname).concat("(")
+                let mut j = 0
+                while j < sublist_length(vflds_sl) {
+                    if j > 0 {
+                        vline = vline.concat(", ")
+                    }
+                    let vf = sublist_get(vflds_sl, j)
+                    let vfn = np_name.get(vf).unwrap()
+                    let vft = np_value.get(vf).unwrap()
+                    vline = vline.concat(vfn).concat(": ").concat(format_type_ann(vft))
+                    j = j + 1
+                }
+                lines.push(vline.concat(")"))
+            } else {
+                lines.push("        ".concat(vname))
+            }
+            i = i + 1
+        }
+        lines.push("    }")
+    } else if first_kind == NodeKind.TypeField {
+        lines.push("    ".concat(header).concat(" \{"))
+        let mut i = 0
+        while i < sublist_length(flds_sl) {
+            let f = sublist_get(flds_sl, i)
+            let fname = np_name.get(f).unwrap()
+            let ftype = np_value.get(f).unwrap()
+            lines.push("        ".concat(fname).concat(": ").concat(format_type_ann(ftype)))
+            i = i + 1
+        }
+        lines.push("    }")
+    } else {
+        lines.push("    ".concat(header))
+    }
+}
+
+fn doc_format_trait(node: Int, lines: List[Str]) {
+    let name = np_name.get(node).unwrap()
+    let methods_sl = np_methods.get(node).unwrap()
+    let doc = np_doc_comment.get(node).unwrap()
+
+    if doc != "" {
+        lines.push("    /// ".concat(doc_first_line(doc)))
+    }
+
+    let header = "trait ".concat(name).concat(doc_format_type_params(node))
+
+    if methods_sl == -1 || sublist_length(methods_sl) == 0 {
+        lines.push("    ".concat(header))
+        return
+    }
+
+    lines.push("    ".concat(header).concat(" \{"))
+    let mut i = 0
+    while i < sublist_length(methods_sl) {
+        let m = sublist_get(methods_sl, i)
+        lines.push("        ".concat(doc_format_fn_sig(m)))
+        i = i + 1
+    }
+    lines.push("    }")
+}
+
+fn doc_format_effect(node: Int, lines: List[Str]) {
+    let name = np_name.get(node).unwrap()
+    let doc = np_doc_comment.get(node).unwrap()
+    let children_sl = np_elements.get(node).unwrap()
+
+    if doc != "" {
+        lines.push("    /// ".concat(doc_first_line(doc)))
+    }
+
+    if children_sl == -1 || sublist_length(children_sl) == 0 {
+        lines.push("    effect ".concat(name))
+        return
+    }
+
+    lines.push("    effect ".concat(name).concat(" \{"))
+    let mut i = 0
+    while i < sublist_length(children_sl) {
+        let child = sublist_get(children_sl, i)
+        lines.push("        effect ".concat(np_name.get(child).unwrap()))
+        i = i + 1
+    }
+    lines.push("    }")
+}
+
+fn doc_format_fn(node: Int, lines: List[Str]) {
+    let doc = np_doc_comment.get(node).unwrap()
+    let sig = doc_format_fn_sig(node)
+    lines.push("    ".concat(sig))
+    if doc != "" {
+        lines.push("        ".concat(doc_first_line(doc)))
+    }
+}
+
+fn doc_format_let(node: Int, lines: List[Str]) {
+    let name = np_name.get(node).unwrap()
+    let type_name = np_type_name.get(node).unwrap()
+    let doc = np_doc_comment.get(node).unwrap()
+    let is_mut = np_is_mut.get(node).unwrap()
+    let mut line = "    "
+    if is_mut != 0 {
+        line = line.concat("let mut ")
+    } else {
+        line = line.concat("let ")
+    }
+    line = line.concat(name)
+    if type_name != "" {
+        line = line.concat(": ").concat(type_name)
+    }
+    lines.push(line)
+    if doc != "" {
+        lines.push("        ".concat(doc_first_line(doc)))
+    }
+}
+
+pub fn generate_doc(program: Int, module_name: Str, json_mode: Int) -> Str {
+    if json_mode != 0 {
+        return generate_doc_json(program, module_name)
+    }
+
+    let mut lines: List[Str] = []
+    lines.push("Module: ".concat(module_name))
+
+    let mut type_lines: List[Str] = []
+    let types_sl = np_fields.get(program).unwrap()
+    if types_sl != -1 {
+        let mut i = 0
+        while i < sublist_length(types_sl) {
+            let node = sublist_get(types_sl, i)
+            if np_is_pub.get(node).unwrap() != 0 && np_module.get(node).unwrap() == "" {
+                doc_format_type(node, type_lines)
+                type_lines.push("")
+            }
+            i = i + 1
+        }
+    }
+    if type_lines.len() > 0 {
+        lines.push("")
+        lines.push("TYPES")
+        lines.push("")
+        let mut i = 0
+        while i < type_lines.len() {
+            lines.push(type_lines.get(i).unwrap())
+            i = i + 1
+        }
+    }
+
+    let mut trait_lines: List[Str] = []
+    let traits_sl = np_arms.get(program).unwrap()
+    if traits_sl != -1 {
+        let mut i = 0
+        while i < sublist_length(traits_sl) {
+            let node = sublist_get(traits_sl, i)
+            if np_is_pub.get(node).unwrap() != 0 && np_module.get(node).unwrap() == "" {
+                doc_format_trait(node, trait_lines)
+                trait_lines.push("")
+            }
+            i = i + 1
+        }
+    }
+    if trait_lines.len() > 0 {
+        lines.push("TRAITS")
+        lines.push("")
+        let mut i = 0
+        while i < trait_lines.len() {
+            lines.push(trait_lines.get(i).unwrap())
+            i = i + 1
+        }
+    }
+
+    let mut effect_lines: List[Str] = []
+    let effects_sl = np_args.get(program).unwrap()
+    if effects_sl != -1 {
+        let mut i = 0
+        while i < sublist_length(effects_sl) {
+            let node = sublist_get(effects_sl, i)
+            if np_is_pub.get(node).unwrap() != 0 && np_module.get(node).unwrap() == "" {
+                doc_format_effect(node, effect_lines)
+                effect_lines.push("")
+            }
+            i = i + 1
+        }
+    }
+    if effect_lines.len() > 0 {
+        lines.push("EFFECTS")
+        lines.push("")
+        let mut i = 0
+        while i < effect_lines.len() {
+            lines.push(effect_lines.get(i).unwrap())
+            i = i + 1
+        }
+    }
+
+    let mut fn_lines: List[Str] = []
+    let fns_sl = np_params.get(program).unwrap()
+    if fns_sl != -1 {
+        let mut i = 0
+        while i < sublist_length(fns_sl) {
+            let node = sublist_get(fns_sl, i)
+            if np_is_pub.get(node).unwrap() != 0 && np_module.get(node).unwrap() == "" {
+                doc_format_fn(node, fn_lines)
+                fn_lines.push("")
+            }
+            i = i + 1
+        }
+    }
+    if fn_lines.len() > 0 {
+        lines.push("FUNCTIONS")
+        lines.push("")
+        let mut i = 0
+        while i < fn_lines.len() {
+            lines.push(fn_lines.get(i).unwrap())
+            i = i + 1
+        }
+    }
+
+    let mut let_lines: List[Str] = []
+    let lets_sl = np_stmts.get(program).unwrap()
+    if lets_sl != -1 {
+        let mut i = 0
+        while i < sublist_length(lets_sl) {
+            let node = sublist_get(lets_sl, i)
+            if np_kind.get(node).unwrap() == NodeKind.LetBinding && np_is_pub.get(node).unwrap() != 0 && np_module.get(node).unwrap() == "" {
+                doc_format_let(node, let_lines)
+                let_lines.push("")
+            }
+            i = i + 1
+        }
+    }
+    if let_lines.len() > 0 {
+        lines.push("CONSTANTS")
+        lines.push("")
+        let mut i = 0
+        while i < let_lines.len() {
+            lines.push(let_lines.get(i).unwrap())
+            i = i + 1
+        }
+    }
+
+    lines.join("\n")
+}
+
+fn doc_fn_to_json(node: Int) -> Int {
+    let obj = json_new_object()
+    json_set(obj, "name", json_new_str(np_name.get(node).unwrap()))
+    json_set(obj, "signature", json_new_str(doc_format_fn_sig(node)))
+    let doc = np_doc_comment.get(node).unwrap()
+    if doc != "" {
+        json_set(obj, "doc", json_new_str(doc))
+    }
+    let effects_sl = np_effects.get(node).unwrap()
+    if effects_sl != -1 && sublist_length(effects_sl) > 0 {
+        let eff_arr = json_new_array()
+        let mut i = 0
+        while i < sublist_length(effects_sl) {
+            json_push(eff_arr, json_new_str(np_name.get(sublist_get(effects_sl, i)).unwrap()))
+            i = i + 1
+        }
+        json_set(obj, "effects", eff_arr)
+    }
+    obj
+}
+
+fn doc_type_to_json(node: Int) -> Int {
+    let obj = json_new_object()
+    json_set(obj, "name", json_new_str(np_name.get(node).unwrap()))
+    let doc = np_doc_comment.get(node).unwrap()
+    if doc != "" {
+        json_set(obj, "doc", json_new_str(doc))
+    }
+
+    let flds_sl = np_fields.get(node).unwrap()
+    if flds_sl != -1 && sublist_length(flds_sl) > 0 {
+        let first = sublist_get(flds_sl, 0)
+        let first_kind = np_kind.get(first).unwrap()
+
+        if first_kind == NodeKind.TypeVariant {
+            json_set(obj, "kind", json_new_str("enum"))
+            let variants_arr = json_new_array()
+            let mut i = 0
+            while i < sublist_length(flds_sl) {
+                let v = sublist_get(flds_sl, i)
+                let vobj = json_new_object()
+                json_set(vobj, "name", json_new_str(np_name.get(v).unwrap()))
+                let vflds_sl = np_fields.get(v).unwrap()
+                if vflds_sl != -1 && sublist_length(vflds_sl) > 0 {
+                    let vfields_arr = json_new_array()
+                    let mut j = 0
+                    while j < sublist_length(vflds_sl) {
+                        let vf = sublist_get(vflds_sl, j)
+                        let fobj = json_new_object()
+                        json_set(fobj, "name", json_new_str(np_name.get(vf).unwrap()))
+                        json_set(fobj, "type", json_new_str(format_type_ann(np_value.get(vf).unwrap())))
+                        json_push(vfields_arr, fobj)
+                        j = j + 1
+                    }
+                    json_set(vobj, "fields", vfields_arr)
+                }
+                json_push(variants_arr, vobj)
+                i = i + 1
+            }
+            json_set(obj, "variants", variants_arr)
+        } else if first_kind == NodeKind.TypeField {
+            json_set(obj, "kind", json_new_str("struct"))
+            let fields_arr = json_new_array()
+            let mut i = 0
+            while i < sublist_length(flds_sl) {
+                let f = sublist_get(flds_sl, i)
+                let fobj = json_new_object()
+                json_set(fobj, "name", json_new_str(np_name.get(f).unwrap()))
+                json_set(fobj, "type", json_new_str(format_type_ann(np_value.get(f).unwrap())))
+                json_push(fields_arr, fobj)
+                i = i + 1
+            }
+            json_set(obj, "fields", fields_arr)
+        }
+    } else {
+        json_set(obj, "kind", json_new_str("struct"))
+    }
+    obj
+}
+
+fn doc_trait_to_json(node: Int) -> Int {
+    let obj = json_new_object()
+    json_set(obj, "name", json_new_str(np_name.get(node).unwrap()))
+    let doc = np_doc_comment.get(node).unwrap()
+    if doc != "" {
+        json_set(obj, "doc", json_new_str(doc))
+    }
+    let methods_sl = np_methods.get(node).unwrap()
+    if methods_sl != -1 && sublist_length(methods_sl) > 0 {
+        let methods_arr = json_new_array()
+        let mut i = 0
+        while i < sublist_length(methods_sl) {
+            let m = sublist_get(methods_sl, i)
+            json_push(methods_arr, doc_fn_to_json(m))
+            i = i + 1
+        }
+        json_set(obj, "methods", methods_arr)
+    }
+    obj
+}
+
+fn generate_doc_json(program: Int, module_name: Str) -> Str {
+    json_clear()
+    let root = json_new_object()
+    json_set(root, "module", json_new_str(module_name))
+
+    let types_arr = json_new_array()
+    let types_sl = np_fields.get(program).unwrap()
+    if types_sl != -1 {
+        let mut i = 0
+        while i < sublist_length(types_sl) {
+            let node = sublist_get(types_sl, i)
+            if np_is_pub.get(node).unwrap() != 0 && np_module.get(node).unwrap() == "" {
+                json_push(types_arr, doc_type_to_json(node))
+            }
+            i = i + 1
+        }
+    }
+    json_set(root, "types", types_arr)
+
+    let traits_arr = json_new_array()
+    let traits_sl = np_arms.get(program).unwrap()
+    if traits_sl != -1 {
+        let mut i = 0
+        while i < sublist_length(traits_sl) {
+            let node = sublist_get(traits_sl, i)
+            if np_is_pub.get(node).unwrap() != 0 && np_module.get(node).unwrap() == "" {
+                json_push(traits_arr, doc_trait_to_json(node))
+            }
+            i = i + 1
+        }
+    }
+    json_set(root, "traits", traits_arr)
+
+    let fns_arr = json_new_array()
+    let fns_sl = np_params.get(program).unwrap()
+    if fns_sl != -1 {
+        let mut i = 0
+        while i < sublist_length(fns_sl) {
+            let node = sublist_get(fns_sl, i)
+            if np_is_pub.get(node).unwrap() != 0 && np_module.get(node).unwrap() == "" {
+                json_push(fns_arr, doc_fn_to_json(node))
+            }
+            i = i + 1
+        }
+    }
+    json_set(root, "functions", fns_arr)
+
+    let lets_arr = json_new_array()
+    let lets_sl = np_stmts.get(program).unwrap()
+    if lets_sl != -1 {
+        let mut i = 0
+        while i < sublist_length(lets_sl) {
+            let node = sublist_get(lets_sl, i)
+            if np_kind.get(node).unwrap() == NodeKind.LetBinding && np_is_pub.get(node).unwrap() != 0 && np_module.get(node).unwrap() == "" {
+                let lobj = json_new_object()
+                json_set(lobj, "name", json_new_str(np_name.get(node).unwrap()))
+                let type_name = np_type_name.get(node).unwrap()
+                if type_name != "" {
+                    json_set(lobj, "type", json_new_str(type_name))
+                }
+                let ldoc = np_doc_comment.get(node).unwrap()
+                if ldoc != "" {
+                    json_set(lobj, "doc", json_new_str(ldoc))
+                }
+                json_push(lets_arr, lobj)
+            }
+            i = i + 1
+        }
+    }
+    json_set(root, "constants", lets_arr)
+
+    json_encode(root)
+}
