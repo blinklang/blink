@@ -120,7 +120,7 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
     reg_fn("file_mtime", CT_INT)
     reg_fn("getpid", CT_INT)
     reg_fn("process_exec", CT_VOID)
-    reg_fn("str_from_char_code", CT_STRING)
+
     reg_fn("process_run", CT_VOID)
     reg_fn_struct_ret("process_run", "ProcessResult")
 

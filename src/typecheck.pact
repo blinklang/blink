@@ -813,7 +813,6 @@ pub fn is_builtin_fn(name: Str) -> Int {
     if name == "getpid" { return 1 }
     if name == "process_run" { return 1 }
     if name == "process_exec" { return 1 }
-    if name == "str_from_char_code" { return 1 }
     0
 }
 
@@ -868,6 +867,7 @@ pub fn is_builtin_method(name: Str) -> Int {
     if name == "to_str" { return 1 }
     if name == "to_hex" { return 1 }
     if name == "from_str" { return 1 }
+    if name == "from_code_point" { return 1 }
     // Effect handle methods (io, fs, net, time, async, env)
     if name == "println" { return 1 }
     if name == "print" { return 1 }
@@ -969,7 +969,6 @@ pub fn get_builtin_fn_ret(name: Str) -> Int {
     if name == "getpid" { return TYPE_INT }
     if name == "process_run" { return TYPE_VOID }
     if name == "process_exec" { return TYPE_VOID }
-    if name == "str_from_char_code" { return TYPE_STR }
     if name == "Bytes" { return new_type(TK_BYTES, "Bytes") }
     TYPE_UNKNOWN
 }
@@ -999,7 +998,7 @@ pub fn get_variant_enum_tid(name: Str) -> Int {
 pub fn is_known_type(name: Str) -> Int {
     if name == "Int" || name == "Float" || name == "Bool" || name == "Str" { return 1 }
     if name == "Void" || name == "List" || name == "Option" || name == "Result" { return 1 }
-    if name == "Iterator" || name == "Handle" || name == "Channel" || name == "Map" || name == "Bytes" || name == "Instant" || name == "Duration" { return 1 }
+    if name == "Iterator" || name == "Handle" || name == "Channel" || name == "Map" || name == "Bytes" || name == "Instant" || name == "Duration" || name == "Char" { return 1 }
     if name == "Fn" || name == "Self" { return 1 }
     if lookup_named_type(name) != -1 { return 1 }
     0

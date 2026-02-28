@@ -84,6 +84,20 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
         }
     }
 
+    // Char.from_code_point(n) — static constructor
+    if np_kind.get(obj_node).unwrap() == NodeKind.Ident && np_name.get(obj_node).unwrap() == "Char" {
+        if method == "from_code_point" {
+            let args_sl = np_args.get(node).unwrap()
+            if args_sl != -1 && sublist_length(args_sl) > 0 {
+                emit_expr(sublist_get(args_sl, 0))
+                let arg_str = expr_result_str
+                expr_result_str = "pact_str_from_char_code({arg_str})"
+                expr_result_type = CT_STRING
+                return
+            }
+        }
+    }
+
     // Duration static constructors: Duration.nanos(n), Duration.ms(n), etc.
     if np_kind.get(obj_node).unwrap() == NodeKind.Ident && np_name.get(obj_node).unwrap() == "Duration" {
         let args_sl = np_args.get(node).unwrap()

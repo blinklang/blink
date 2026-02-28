@@ -848,9 +848,9 @@ pub fn lex(source: Str) ! Lex.Tokenize {
                 } else if esc == CH_BACKSLASH {
                     string_buf = string_buf.concat("\\")
                 } else if esc == CH_b {
-                    string_buf = string_buf.concat(str_from_char_code(8))
+                    string_buf = string_buf.concat(Char.from_code_point(8))
                 } else if esc == CH_f {
-                    string_buf = string_buf.concat(str_from_char_code(12))
+                    string_buf = string_buf.concat(Char.from_code_point(12))
                 } else if esc == CH_DQUOTE {
                     string_buf = string_buf.concat("\"")
                 } else if esc == CH_LBRACE {

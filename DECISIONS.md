@@ -260,6 +260,9 @@ Decided by expert panel vote. See [OPEN_QUESTIONS.md](OPEN_QUESTIONS.md) for ful
 | Language evolution: compatibility window | Infinite — all editions supported forever. Compiler never drops edition support | 4-1 (Systems dissented: wanted 5-year sunset) |
 | Language evolution: llms.txt headers | Yes. Edition-specific API change summary in llms.txt | 5-0 |
 | Language evolution: built-in changelog | Yes. `pact editions` command compiled into binary, offline-available | 3-2 (PLT/DevOps/AI for built-in; Systems/Web for external file) |
+| Char → Int conversion | `Char.to_int()` named method + `From[Char] for Int`. Infallible widening | 4-1 (PLT dissented: `code_point()` only, Char is not numeric) |
+| Int → Char conversion | `TryFrom[Int] for Char` + `Char.from_code_point(n) -> Result[Char, ConversionError]` | 4-1 (Web dissented: `Int.to_char()` for symmetry) |
+| Char → Str conversion | `From[Char] for Str` + `Char.to_str()` named method. Infallible | 5-0 |
 
 ---
 
@@ -315,6 +318,7 @@ Full deliberation records for each decision. Each file contains expert votes, re
 | `@i` Annotation | [decisions/i-annotation.md](decisions/i-annotation.md) |
 | Compile-Time Intrinsics (`#` sigil) | [decisions/compile-time-intrinsics.md](decisions/compile-time-intrinsics.md) |
 | Language Evolution | [decisions/language-evolution.md](decisions/language-evolution.md) |
+| Char Conversions | [decisions/char-conversions.md](decisions/char-conversions.md) |
 
 ---
 

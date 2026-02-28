@@ -524,6 +524,84 @@ let z = x.to_float() + y   // OK
 
 This is unchanged from §2.18 and §3.6 — stated here for completeness.
 
+#### Char Conversions
+
+`Char` (Unicode scalar value) participates in the conversion system via `From`/`TryFrom` traits and named methods, following the same dual-API pattern as numeric types (§3c.3). `Char` is not a numeric type — it does not implement arithmetic traits — but its codepoint representation is an integer, so conversions between `Char` and `Int` are well-defined.
+
+##### Char → Int (Infallible — `From`)
+
+Every `Char` is a Unicode scalar value in the range 0x0000–0x10FFFF (excluding surrogates). This always fits in `Int` (i64), so the conversion is infallible.
+
+| From | To | Method | Trait | Notes |
+|------|----|--------|-------|-------|
+| `Char` | `Int` | `.to_int()` | `From[Char] for Int` | Returns Unicode codepoint value |
+
+```pact
+let c = 'A'
+let n = c.to_int()         // 65
+let n = Int.from(c)        // 65 (equivalent, via From trait)
+
+// In generic code
+fn to_number[T: From[Char]](c: Char) -> T { T.from(c) }
+```
+
+**Note.** `.to_int()` returns the Unicode codepoint value, not an ASCII code. For ASCII characters the values coincide, but `'é'.to_int()` returns `233`, not an error. `Char` does not implement `Add`, `Sub`, or other arithmetic traits — use `.to_int()` to perform arithmetic on codepoint values, then convert back.
+
+##### Int → Char (Fallible — `TryFrom`)
+
+Not all integers are valid Unicode scalar values. Surrogate codepoints (0xD800–0xDFFF) and values above 0x10FFFF are rejected at runtime.
+
+| From | To | Method | Trait | Fails when |
+|------|----|--------|-------|-----------|
+| `Int` | `Char` | `Char.from_code_point(n)` | `TryFrom[Int] for Char` | Surrogate (0xD800–0xDFFF) or > 0x10FFFF or negative |
+
+```pact
+let c = Char.from_code_point(65)?      // Ok('A')
+let c = Char.from_code_point(0xD800)?  // Err(ConversionError)
+let c = Char.from_code_point(-1)?      // Err(ConversionError)
+
+// Via TryFrom trait (equivalent)
+let c = Char.try_from(0x1F600)?        // Ok('😀')
+
+// Round-trip
+let n = 'Z'.to_int()                   // 90
+let c = Char.from_code_point(n)?       // Ok('Z')
+```
+
+The named method `Char.from_code_point(n)` is the idiomatic form. It is sugar over `TryFrom[Int] for Char` and returns `Result[Char, ConversionError]`. The `ConversionError` message includes the invalid value (e.g., `"55296 is not a valid Unicode scalar value"`).
+
+##### Char → Str (Infallible — `From`)
+
+Every `Char` can be encoded as a single-codepoint UTF-8 string. This conversion is total.
+
+| From | To | Method | Trait |
+|------|----|--------|-------|
+| `Char` | `Str` | `.to_str()` | `From[Char] for Str` |
+
+```pact
+let s = 'A'.to_str()      // "A"
+let s = Str.from('é')     // "é" (via From trait)
+
+// Useful in method chains
+let vowels = "hello"
+    .chars()
+    .filter(fn(c) { "aeiou".contains(c.to_str()) })
+    .map(fn(c) { c.to_str() })
+    .collect()
+```
+
+**When to use `.to_str()` vs interpolation.** Use `"{c}"` when embedding a `Char` in a larger string. Use `c.to_str()` when a standalone `Str` value is needed — function arguments, map/collect chains, struct fields. Both produce identical output; the choice is contextual, not semantic.
+
+##### Summary Table
+
+| Conversion | Direction | Method | Trait | Fallible? |
+|------------|-----------|--------|-------|-----------|
+| Char → Int | widening | `.to_int()` | `From[Char] for Int` | No |
+| Int → Char | narrowing | `Char.from_code_point(n)` | `TryFrom[Int] for Char` | Yes |
+| Char → Str | encoding | `.to_str()` | `From[Char] for Str` | No |
+
+(Vote: Q1 4-1, Q2 4-1, Q3 5-0. See [Char Conversions rationale](../decisions/char-conversions.md).)
+
 ---
 
 ### 3c.4 Method Resolution
