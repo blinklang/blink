@@ -252,7 +252,11 @@ pub fn argparse(p: ArgParser) -> Args {
         }
 
         if arg == "--help" || arg == "-h" {
-            io.println(generate_help(p))
+            if cmd_idx != -1 {
+                io.println(generate_command_help(p, result.command_name))
+            } else {
+                io.println(generate_help(p))
+            }
             result = Args {
                 command_name: result.command_name,
                 flag_names: result.flag_names,
@@ -403,6 +407,26 @@ pub fn generate_help(p: ArgParser) -> Str {
             let cmd = p.commands.get(ci).unwrap()
             h = h.concat("  {cmd.name}")
             h = h.concat("    {cmd.description}\n")
+            let mut cfi = 0
+            while cfi < cmd.flags.len() {
+                let cf = cmd.flags.get(cfi).unwrap()
+                h = h.concat("    {cf.long_name}")
+                if cf.short_name != "" {
+                    h = h.concat(", {cf.short_name}")
+                }
+                h = h.concat("    {cf.description}\n")
+                cfi = cfi + 1
+            }
+            let mut coi = 0
+            while coi < cmd.options.len() {
+                let co = cmd.options.get(coi).unwrap()
+                h = h.concat("    {co.long_name}")
+                if co.short_name != "" {
+                    h = h.concat(", {co.short_name}")
+                }
+                h = h.concat(" <value>    {co.description}\n")
+                coi = coi + 1
+            }
             ci = ci + 1
         }
     }
@@ -426,6 +450,55 @@ pub fn generate_help(p: ArgParser) -> Str {
         let mut oi = 0
         while oi < p.options.len() {
             let o = p.options.get(oi).unwrap()
+            h = h.concat("  {o.long_name}")
+            if o.short_name != "" {
+                h = h.concat(", {o.short_name}")
+            }
+            h = h.concat(" <value>    {o.description}\n")
+            oi = oi + 1
+        }
+    }
+
+    h
+}
+
+pub fn generate_command_help(p: ArgParser, cmd_name: Str) -> Str {
+    let idx = find_command_idx(p, cmd_name)
+    if idx == -1 {
+        return "unknown command '{cmd_name}'"
+    }
+    let cmd = p.commands.get(idx).unwrap()
+    let mut h = "Usage: {p.prog_name} {cmd_name}"
+    if cmd.options.len() > 0 || cmd.flags.len() > 0 {
+        h = h.concat(" [options]")
+    }
+    let mut pi = 0
+    while pi < cmd.positionals.len() {
+        let pos = cmd.positionals.get(pi).unwrap()
+        h = h.concat(" <{pos.name}>")
+        pi = pi + 1
+    }
+    h = h.concat("\n\n{cmd.description}\n")
+
+    if cmd.flags.len() > 0 {
+        h = h.concat("\nFlags:\n")
+        let mut fi = 0
+        while fi < cmd.flags.len() {
+            let f = cmd.flags.get(fi).unwrap()
+            h = h.concat("  {f.long_name}")
+            if f.short_name != "" {
+                h = h.concat(", {f.short_name}")
+            }
+            h = h.concat("    {f.description}\n")
+            fi = fi + 1
+        }
+    }
+
+    if cmd.options.len() > 0 {
+        h = h.concat("\nOptions:\n")
+        let mut oi = 0
+        while oi < cmd.options.len() {
+            let o = cmd.options.get(oi).unwrap()
             h = h.concat("  {o.long_name}")
             if o.short_name != "" {
                 h = h.concat(", {o.short_name}")

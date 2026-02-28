@@ -522,31 +522,49 @@ fn main() {
     p = add_command(p, "update", "Re-resolve dependencies and update lockfile")
     p = add_command(p, "daemon", "Compiler daemon (start/status/stop)")
     p = add_command(p, "query", "Query symbol index (uses daemon if running)")
-
-    p = add_flag(p, "--version", "-V", "Print version and exit")
-    p = add_flag(p, "--debug", "-d", "Enable debug mode (debug_assert, -g -O0)")
-    p = add_flag(p, "--check", "-c", "Check formatting without modifying files")
-    p = add_flag(p, "--json", "-j", "JSON output")
-    p = add_flag(p, "--pub", "", "Filter to public symbols only")
-    p = add_flag(p, "--pure", "", "Filter to pure functions")
-    p = add_flag(p, "--dev", "", "Add as dev-dependency")
     p = add_command(p, "llms", "Print LLM language reference to stdout")
-    p = add_flag(p, "--full", "", "Print full reference (default is short summary)")
-    p = add_flag(p, "--list", "", "List available topics")
-    p = add_option(p, "--topic", "", "Print a specific topic section")
 
-    p = add_option(p, "--output", "-o", "Output path")
-    p = add_option(p, "--format", "-f", "Output format")
-    p = add_option(p, "--filter", "", "Test filter pattern")
-    p = add_option(p, "--tags", "", "Test tags filter")
-    p = add_option(p, "--layer", "", "Query detail level")
-    p = add_option(p, "--effect", "", "Filter by effect")
-    p = add_option(p, "--module", "-m", "Filter by module")
-    p = add_option(p, "--fn", "", "Look up function by name")
-    p = add_option(p, "--path", "", "Path dependency source")
-    p = add_option(p, "--git", "", "Git dependency source")
-    p = add_option(p, "--tag", "", "Git tag")
-    p = add_option(p, "--baseline", "", "Audit baseline path")
+    p = add_flag(p, "--help", "-h", "Print help")
+    p = add_flag(p, "--version", "-V", "Print version and exit")
+
+    p = command_add_flag(p, "build", "--debug", "-d", "Enable debug mode (debug_assert, -g -O0)")
+    p = command_add_flag(p, "run", "--debug", "-d", "Enable debug mode (debug_assert, -g -O0)")
+
+    p = command_add_flag(p, "build", "--json", "-j", "JSON output")
+    p = command_add_flag(p, "check", "--json", "-j", "JSON output")
+    p = command_add_flag(p, "test", "--json", "-j", "JSON output")
+    p = command_add_flag(p, "fmt", "--json", "-j", "JSON output")
+    p = command_add_flag(p, "query", "--json", "-j", "JSON output")
+
+    p = command_add_option(p, "build", "--output", "-o", "Output path")
+    p = command_add_option(p, "run", "--output", "-o", "Output path")
+
+    p = command_add_option(p, "build", "--format", "-f", "Output format")
+    p = command_add_option(p, "check", "--format", "-f", "Output format")
+    p = command_add_option(p, "fmt", "--format", "-f", "Output format")
+
+    p = command_add_flag(p, "llms", "--list", "", "List available topics")
+    p = command_add_flag(p, "llms", "--full", "", "Print full reference (default is short summary)")
+    p = command_add_option(p, "llms", "--topic", "", "Print a specific topic section")
+
+    p = command_add_flag(p, "fmt", "--check", "-c", "Check formatting without modifying files")
+
+    p = command_add_flag(p, "query", "--pub", "", "Filter to public symbols only")
+    p = command_add_flag(p, "query", "--pure", "", "Filter to pure functions")
+    p = command_add_option(p, "query", "--layer", "", "Query detail level")
+    p = command_add_option(p, "query", "--effect", "", "Filter by effect")
+    p = command_add_option(p, "query", "--module", "-m", "Filter by module")
+    p = command_add_option(p, "query", "--fn", "", "Look up function by name")
+
+    p = command_add_flag(p, "add", "--dev", "", "Add as dev-dependency")
+    p = command_add_option(p, "add", "--path", "", "Path dependency source")
+    p = command_add_option(p, "add", "--git", "", "Git dependency source")
+    p = command_add_option(p, "add", "--tag", "", "Git tag")
+
+    p = command_add_option(p, "test", "--filter", "", "Test filter pattern")
+    p = command_add_option(p, "test", "--tags", "", "Test tags filter")
+
+    p = command_add_option(p, "audit", "--baseline", "", "Audit baseline path")
 
     let a = argparse(p)
 
