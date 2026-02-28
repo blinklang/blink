@@ -289,7 +289,7 @@ pub fn resolve(project_root: Str) -> Int {
 
 // ── Resolve + write lockfile ────────────────────────────────────
 
-pub fn resolve_and_lock(project_root: Str) -> Int {
+pub fn resolve_and_lock(project_root: Str, pact_version: Str) -> Int {
     resolver_clear()
     let rc = resolve(project_root)
     if rc != 0 {
@@ -297,7 +297,8 @@ pub fn resolve_and_lock(project_root: Str) -> Int {
     }
 
     lockfile_clear()
-    lockfile_set_metadata("0.1.0", "2026-02-14T00:00:00Z")
+    let generated = time.read().to_rfc3339()
+    lockfile_set_metadata(pact_version, generated)
 
     let mut i = 0
     while i < res_names.len() {

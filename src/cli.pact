@@ -61,6 +61,13 @@ fn find_daemon_sock() -> Str {
     return ""
 }
 
+fn resolve_pact_bin() -> Str {
+    let env = get_env("PACT_BIN") ?? ""
+    if env != "" { return env }
+    if file_exists("bin/pact") { return "bin/pact" }
+    return "pact"
+}
+
 fn detect_async(source: Str) -> Int {
     if source.contains("async.spawn") || source.contains("async.scope") {
         return 1
@@ -564,6 +571,7 @@ fn main() {
 
     p = command_add_option(p, "test", "--filter", "", "Test filter pattern")
     p = command_add_option(p, "test", "--tags", "", "Test tags filter")
+    p = command_add_option(p, "test", "--parallel", "-P", "Parallel workers (default: 4)")
 
     p = command_add_option(p, "audit", "--baseline", "", "Audit baseline path")
 
@@ -594,6 +602,14 @@ fn main() {
     let mut format_flag = args_get(a, "format")
     let filter_pattern = args_get(a, "filter")
     let tags_filter = args_get(a, "tags")
+    let parallel_str = args_get(a, "parallel")
+    let mut num_workers = 4
+    if parallel_str != "" {
+        num_workers = parallel_str.to_int()
+    }
+    if num_workers < 1 {
+        num_workers = 1
+    }
     let dep_path_flag = args_get(a, "path")
     let git_url_flag = args_get(a, "git")
     let git_tag_flag = args_get(a, "tag")
@@ -832,18 +848,24 @@ fn main() {
 
         let mut test_files: List[Str] = []
         collect_test_files(".", test_files)
-
-        let mut total_passed = 0
-        let mut total_failed = 0
-        let mut total_errors = 0
         let file_count = test_files.len()
-        let mut json_first = 1
-        let mut fi = 0
 
-        if json_output != 0 {
-            io.println("\{\"files\":[")
+        if file_count == 0 {
+            if json_output != 0 {
+                io.println("\{\"files\":[],\"summary\":\{\"files\":0,\"files_passed\":0,\"files_failed\":0,\"build_errors\":0}}")
+            } else {
+                io.println("error: no files with test blocks found")
+            }
+            exit(1)
         }
 
+        let pact_bin = resolve_pact_bin()
+
+        // Phase A: discovery — compute paths, build args, create dirs
+        let mut build_args: List[List[Str]] = []
+        let mut run_args: List[List[Str]] = []
+        let mut output_bins: List[Str] = []
+        let mut fi = 0
         while fi < file_count {
             let tf = test_files.get(fi).unwrap()
             let tf_dir = path_dirname(tf)
@@ -853,11 +875,99 @@ fn main() {
                 build_dir = "build/{tf_dir}"
             }
             shell_exec("mkdir -p {build_dir}")
-            let tf_c = "{build_dir}/{tf_base}.c"
             let tf_out = "{build_dir}/{tf_base}"
+            output_bins.push(tf_out)
 
-            let build_rc = do_build(tf, tf_out, tf_c, format_flag, 1)
-            if build_rc != 0 {
+            let mut ba: List[Str] = ["build", tf, "-o", tf_out, "--debug"]
+            build_args.push(ba)
+
+            let source = read_file(tf)
+            let mut ra: List[Str] = []
+            if source.contains("fn main(") {
+                ra.push("--test")
+            }
+            if filter_pattern != "" {
+                ra.push("--test-filter")
+                ra.push(filter_pattern)
+            }
+            if json_output != 0 {
+                ra.push("--test-json")
+            }
+            if tags_filter != "" {
+                ra.push("--test-tags")
+                ra.push(tags_filter)
+            }
+            run_args.push(ra)
+            fi = fi + 1
+        }
+
+        // Phase B: parallel build + run
+        let mut exit_codes: List[Int] = []
+        let mut outputs: List[Str] = []
+        let mut errors: List[Str] = []
+        let mut pi = 0
+        while pi < file_count {
+            exit_codes.push(-1)
+            outputs.push("")
+            errors.push("")
+            pi = pi + 1
+        }
+
+        let sem = Channel(num_workers)
+        let mut ti = 0
+        while ti < num_workers {
+            sem.send(1)
+            ti = ti + 1
+        }
+
+        async.scope {
+            let mut si = 0
+            while si < file_count {
+                let idx = si
+                let bcmd = build_args.get(si).unwrap()
+                let rcmd = run_args.get(si).unwrap()
+                let bin_path = output_bins.get(si).unwrap()
+                async.spawn(fn() {
+                    sem.recv()
+                    let br = process_run(pact_bin, bcmd)
+                    if br.exit_code != 0 || !file_exists(bin_path) {
+                        let mut err_text = br.out
+                        if br.err_out != "" {
+                            if err_text != "" {
+                                err_text = "{err_text}\n{br.err_out}"
+                            } else {
+                                err_text = br.err_out
+                            }
+                        }
+                        errors.set(idx, err_text)
+                        sem.send(1)
+                        return 0
+                    }
+                    let rr = process_run(bin_path, rcmd)
+                    exit_codes.set(idx, rr.exit_code)
+                    outputs.set(idx, rr.out)
+                    sem.send(1)
+                    0
+                })
+                si = si + 1
+            }
+        }
+
+        // Phase C: report results
+        let mut total_passed = 0
+        let mut total_failed = 0
+        let mut total_errors = 0
+
+        if json_output != 0 {
+            io.println("\{\"files\":[")
+        }
+
+        let mut ri = 0
+        let mut json_first = 1
+        while ri < file_count {
+            let tf = test_files.get(ri).unwrap()
+            let ec = exit_codes.get(ri).unwrap()
+            if ec == -1 {
                 total_errors = total_errors + 1
                 if json_output != 0 {
                     if json_first == 0 {
@@ -868,59 +978,34 @@ fn main() {
                 } else {
                     io.println("--- {tf} ---")
                     io.println("  BUILD FAILED")
+                    let err_msg = errors.get(ri).unwrap()
+                    if err_msg != "" {
+                        io.println(err_msg)
+                    }
                     io.println("")
                 }
-                fi = fi + 1
-                continue
-            }
-
-            let source = read_file(tf)
-            let mut run_cmd = tf_out
-            if source.contains("fn main(") {
-                run_cmd = "{run_cmd} --test"
-            }
-            if filter_pattern != "" {
-                run_cmd = "{run_cmd} --test-filter \"{filter_pattern}\""
-            }
-            if json_output != 0 {
-                run_cmd = "{run_cmd} --test-json"
-            }
-            if tags_filter != "" {
-                run_cmd = "{run_cmd} --test-tags \"{tags_filter}\""
-            }
-
-            if json_output == 0 {
-                io.println("--- {tf} ---")
             } else {
-                if json_first == 0 {
-                    io.println(",")
+                if json_output == 0 {
+                    io.println("--- {tf} ---")
+                    let out = outputs.get(ri).unwrap()
+                    if out != "" {
+                        io.println(out)
+                    }
+                } else {
+                    if json_first == 0 {
+                        io.println(",")
+                    }
+                    json_first = 0
+                    let out = outputs.get(ri).unwrap().trim()
+                    io.println("\{\"file\":\"{tf}\",\"results\":{out}}")
                 }
-                json_first = 0
-                io.println("\{\"file\":\"{tf}\",\"results\":")
+                if ec != 0 {
+                    total_failed = total_failed + 1
+                } else {
+                    total_passed = total_passed + 1
+                }
             }
-
-            let test_rc = shell_exec(run_cmd)
-
-            if json_output != 0 {
-                io.println("}")
-            }
-
-            if test_rc != 0 {
-                total_failed = total_failed + 1
-            } else {
-                total_passed = total_passed + 1
-            }
-
-            fi = fi + 1
-        }
-
-        if file_count == 0 {
-            if json_output != 0 {
-                io.println("],\"summary\":\{\"files\":0,\"files_passed\":0,\"files_failed\":0,\"build_errors\":0}}")
-            } else {
-                io.println("error: no files with test blocks found")
-            }
-            exit(1)
+            ri = ri + 1
         }
 
         if json_output != 0 {
@@ -1195,7 +1280,7 @@ fn main() {
             write_file("pact.toml", updated)
         }
 
-        let resolve_rc = resolve_and_lock(".")
+        let resolve_rc = resolve_and_lock(".", pact_cli_version)
         if resolve_rc == 0 {
             io.println("added: {pkg_name}")
         } else {
@@ -1229,7 +1314,7 @@ fn main() {
         let updated = remove_dep_line(content, pkg_name)
         write_file("pact.toml", updated)
 
-        let resolve_rc = resolve_and_lock(".")
+        let resolve_rc = resolve_and_lock(".", pact_cli_version)
         if resolve_rc == 0 {
             io.println("removed: {pkg_name}")
         } else {
@@ -1242,7 +1327,7 @@ fn main() {
             return
         }
 
-        let resolve_rc = resolve_and_lock(".")
+        let resolve_rc = resolve_and_lock(".", pact_cli_version)
         if resolve_rc == 0 {
             if source_path != "" {
                 io.println("updated: {source_path}")

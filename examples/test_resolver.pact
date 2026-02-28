@@ -133,7 +133,7 @@ test "resolve and lock" {
     write_file("/tmp/_pact_test_resolve_lock/mylib/pact.toml", "[package]\nname = \"mylib\"\nversion = \"0.3.0\"\n\n[capabilities]\nrequired = [\"Net.Connect\"]\n")
     write_file("/tmp/_pact_test_resolve_lock/mylib/src/lib.pact", "pub fn fetch() -> Int \{ 0 \}\n")
 
-    let rc = resolve_and_lock("/tmp/_pact_test_resolve_lock")
+    let rc = resolve_and_lock("/tmp/_pact_test_resolve_lock", "0.0.0-test")
     assert_eq(rc, 0)
 
     // Verify lockfile was written
