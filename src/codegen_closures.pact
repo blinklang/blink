@@ -707,16 +707,20 @@ pub fn emit_closure(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
 
     // Build C parameter list: __self first if captures, then user params
     let has_caps = captures.len() > 0
+    let saved_param_hint = cg_closure_param_type_hint
     let mut params_c = "pact_closure* __self"
     if params_sl != -1 && sublist_length(params_sl) > 0 {
         let mut i = 0
         while i < sublist_length(params_sl) {
             let p = sublist_get(params_sl, i)
-            let pname = np_name.get(p).unwrap()
+            let pname = c_safe_name(np_name.get(p).unwrap())
             let ptype = np_type_name.get(p).unwrap()
             params_c = params_c.concat(", ")
             if ptype == "Fn" {
                 params_c = params_c.concat("pact_closure* {pname}")
+            } else if ptype == "" && cg_closure_param_type_hint >= 0 && cg_closure_param_type_hint != CT_VOID {
+                let ct = cg_closure_param_type_hint
+                params_c = params_c.concat("{c_type_str(ct)} {pname}")
             } else if is_enum_type(ptype) != 0 {
                 params_c = params_c.concat("{c_type_c_name(ptype)} {pname}")
             } else if is_struct_type(ptype) != 0 {
@@ -756,6 +760,8 @@ pub fn emit_closure(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
                     let sig_str = build_closure_sig_from_type_ann(ta)
                     set_var_closure(pname, sig_str)
                 }
+            } else if ptype == "" && saved_param_hint >= 0 && saved_param_hint != CT_VOID {
+                set_var(pname, saved_param_hint, 1)
             } else {
                 set_var(pname, type_from_name(ptype), 1)
                 if is_struct_type(ptype) != 0 {
@@ -845,6 +851,8 @@ pub fn emit_closure(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
             sig_params = sig_params.concat(", ")
             if sptype == "Fn" {
                 sig_params = sig_params.concat("pact_closure*")
+            } else if sptype == "" && saved_param_hint >= 0 && saved_param_hint != CT_VOID {
+                sig_params = sig_params.concat(c_type_str(saved_param_hint))
             } else if is_enum_type(sptype) != 0 {
                 sig_params = sig_params.concat(c_type_c_name(sptype))
             } else if is_struct_type(sptype) != 0 {
@@ -856,6 +864,7 @@ pub fn emit_closure(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
         }
     }
     expr_closure_sig = "{c_type_str(ret_type)}(*)({sig_params})"
+    cg_closure_param_type_hint = -1
 
     // Build captures array if needed
     if captures.len() > 0 {

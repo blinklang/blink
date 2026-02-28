@@ -218,7 +218,7 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
                                     }
                                     let p = sublist_get(op_params_sl, pi)
                                     let ptype = np_type_name.get(p).unwrap()
-                                    let pname = np_name.get(p).unwrap()
+                                    let pname = c_safe_name(np_name.get(p).unwrap())
                                     let mut pc = "int64_t"
                                     if ptype == "Str" {
                                         pc = "const char*"

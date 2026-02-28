@@ -852,10 +852,9 @@ pub fn lex(source: Str) ! Lex.Tokenize {
                 } else if esc == CH_RBRACE {
                     string_buf = string_buf.concat("}")
                 } else {
-                    // Unknown escape — keep as-is
+                    let esc_ch = source.substring(pos - 1, 1)
+                    io.eprintln("warning: unknown escape sequence '\\{esc_ch}' at line {line} col {col - 2}")
                     string_buf = string_buf.concat("\\")
-                    // Can't easily append a char-as-int to a string in
-                    // the C backend. For bootstrap, just drop unknown escapes.
                 }
                 continue
             }

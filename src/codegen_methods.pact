@@ -1385,9 +1385,58 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             return
         }
         if method == "pop" {
-            emit_line("pact_list_pop({obj_str});")
-            expr_result_str = "0"
-            expr_result_type = CT_VOID
+            let elem_type = get_list_elem_type(obj_str)
+            let elem_struct = get_list_elem_struct(obj_str)
+            let res = fresh_temp("_lpop_")
+            if elem_type == CT_VOID && elem_struct != "" {
+                ensure_struct_option_type(elem_struct)
+                let opt_type = struct_option_c_type(elem_struct)
+                emit_line("{opt_type} {res};")
+                emit_line("if (pact_list_len({obj_str}) > 0) \{")
+                emit_line("    {res}.tag = 1; {res}.value = *({c_type_c_name(elem_struct)}*)pact_list_pop({obj_str});")
+                emit_line("} else \{ {res}.tag = 0; }")
+                set_var_option_struct(res, CT_VOID, elem_struct)
+                expr_result_str = res
+                expr_result_type = CT_OPTION
+                expr_option_inner = CT_VOID
+                expr_option_inner_struct = elem_struct
+            } else if elem_type == CT_STRING {
+                ensure_option_type(CT_STRING)
+                let opt_type = option_c_type(CT_STRING)
+                emit_line("{opt_type} {res};")
+                emit_line("if (pact_list_len({obj_str}) > 0) \{")
+                emit_line("    {res}.tag = 1; {res}.value = (const char*)pact_list_pop({obj_str});")
+                emit_line("} else \{ {res}.tag = 0; }")
+                set_var_option(res, CT_STRING)
+                expr_result_str = res
+                expr_result_type = CT_OPTION
+                expr_option_inner = CT_STRING
+                expr_option_inner_struct = ""
+            } else if elem_type == CT_FLOAT {
+                ensure_option_type(CT_FLOAT)
+                let opt_type = option_c_type(CT_FLOAT)
+                emit_line("{opt_type} {res};")
+                emit_line("if (pact_list_len({obj_str}) > 0) \{")
+                emit_line("    {res}.tag = 1; {res}.value = *(double*)pact_list_pop({obj_str});")
+                emit_line("} else \{ {res}.tag = 0; }")
+                set_var_option(res, CT_FLOAT)
+                expr_result_str = res
+                expr_result_type = CT_OPTION
+                expr_option_inner = CT_FLOAT
+                expr_option_inner_struct = ""
+            } else {
+                ensure_option_type(CT_INT)
+                let opt_type = option_c_type(CT_INT)
+                emit_line("{opt_type} {res};")
+                emit_line("if (pact_list_len({obj_str}) > 0) \{")
+                emit_line("    {res}.tag = 1; {res}.value = (int64_t)(intptr_t)pact_list_pop({obj_str});")
+                emit_line("} else \{ {res}.tag = 0; }")
+                set_var_option(res, CT_INT)
+                expr_result_str = res
+                expr_result_type = CT_OPTION
+                expr_option_inner = CT_INT
+                expr_option_inner_struct = ""
+            }
             return
         }
         if method == "len" {
@@ -1499,6 +1548,19 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
 
     // Iterator adapter and consumer methods — work on both CT_LIST and CT_ITERATOR
     if (obj_type == CT_LIST || obj_type == CT_ITERATOR) && (method == "count" || method == "collect" || method == "for_each" || method == "any" || method == "all" || method == "find" || method == "fold" || method == "map" || method == "filter" || method == "take" || method == "skip" || method == "chain" || method == "flat_map" || method == "enumerate" || method == "zip") {
+
+        // Set element type hint for closure param type inference
+        if obj_type == CT_LIST {
+            let hint_elem = get_list_elem_type(obj_str)
+            if hint_elem != -1 {
+                cg_closure_param_type_hint = hint_elem
+            }
+        } else if obj_type == CT_ITERATOR {
+            let hint_elem = get_var_iterator_inner(obj_str)
+            if hint_elem > 0 {
+                cg_closure_param_type_hint = hint_elem
+            }
+        }
 
         // --- Adapter methods: return CT_ITERATOR ---
 
@@ -1877,6 +1939,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             expr_result_type = init_type
             return
         }
+        cg_closure_param_type_hint = -1
     }
 
     // Channel methods

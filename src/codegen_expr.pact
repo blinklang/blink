@@ -115,11 +115,12 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
             expr_result_type = CT_INT
             return
         }
+        let safe = c_safe_name(name)
         let cap_idx = get_capture_index(name)
         if cap_idx >= 0 {
             let cap_entry = closure_captures.get(cg_closure_cap_start + cap_idx).unwrap()
             if cap_entry.is_mut != 0 {
-                expr_result_str = "(*{name}_cell)"
+                expr_result_str = "(*{safe}_cell)"
                 expr_result_type = cap_entry.ctype
                 return
             }
@@ -137,7 +138,7 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
                 cpi = cpi + 1
             }
             if is_closure_param == 0 {
-                expr_result_str = "(*{name}_cell)"
+                expr_result_str = "(*{safe}_cell)"
                 expr_result_type = get_var_type(name)
                 return
             }
@@ -146,7 +147,7 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
         if alias != "" {
             expr_result_str = alias
         } else {
-            expr_result_str = name
+            expr_result_str = safe
         }
         expr_result_type = get_var_type(name)
         if expr_result_type == CT_OPTION {
@@ -1383,6 +1384,27 @@ pub fn escape_c_string(s: Str) -> Str {
     result
 }
 
+pub fn escape_fmt_percent(s: Str) -> Str {
+    let mut result = ""
+    let mut i = 0
+    while i < s.len() {
+        let ch = s.char_at(i)
+        if ch == 37 {
+            if i + 1 < s.len() && s.char_at(i + 1) == 37 {
+                result = result.concat("%%")
+                i = i + 2
+            } else {
+                result = result.concat("%%")
+                i = i + 1
+            }
+        } else {
+            result = result.concat(s.substring(i, 1))
+            i = i + 1
+        }
+    }
+    result
+}
+
 pub fn emit_interp_string(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
     let parts_sl = np_elements.get(node).unwrap()
     if parts_sl == -1 {
@@ -1428,7 +1450,7 @@ pub fn emit_interp_string(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.S
         // Literal string parts: parser stores them as NodeKind.Ident with str_val == name
         // Expression parts: NodeKind.Ident with str_val == "" (or other node kinds)
         if pk == NodeKind.Ident && np_str_val.get(part).unwrap() == np_name.get(part).unwrap() {
-            fmt = fmt.concat(escape_c_string(np_str_val.get(part).unwrap()))
+            fmt = fmt.concat(escape_fmt_percent(escape_c_string(np_str_val.get(part).unwrap())))
         } else {
             // Expression part
             emit_expr(part)

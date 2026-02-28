@@ -84,9 +84,102 @@ pub let mut emitted_result_set: Map[Str, Int] = Map()
 pub let mut emitted_iter_set: Map[Str, Int] = Map()
 pub let mut cg_closure_defs: List[Str] = []
 pub let mut cg_closure_counter: Int = 0
+pub let mut cg_closure_param_type_hint: Int = -1
 
 pub let mut mod_fn_prefix: Map[Str, Str] = Map()
 pub let mut mod_type_prefix: Map[Str, Str] = Map()
+
+// C reserved words and problematic libc names — identifiers that must be mangled
+let mut c_reserved_set: Map[Str, Int] = Map()
+let mut c_reserved_init_done: Int = 0
+
+fn init_c_reserved() {
+    if c_reserved_init_done != 0 {
+        return
+    }
+    c_reserved_init_done = 1
+    // C keywords
+    c_reserved_set.set("auto", 1)
+    c_reserved_set.set("break", 1)
+    c_reserved_set.set("case", 1)
+    c_reserved_set.set("char", 1)
+    c_reserved_set.set("const", 1)
+    c_reserved_set.set("continue", 1)
+    c_reserved_set.set("default", 1)
+    c_reserved_set.set("do", 1)
+    c_reserved_set.set("double", 1)
+    c_reserved_set.set("else", 1)
+    c_reserved_set.set("enum", 1)
+    c_reserved_set.set("extern", 1)
+    c_reserved_set.set("float", 1)
+    c_reserved_set.set("for", 1)
+    c_reserved_set.set("goto", 1)
+    c_reserved_set.set("if", 1)
+    c_reserved_set.set("inline", 1)
+    c_reserved_set.set("int", 1)
+    c_reserved_set.set("long", 1)
+    c_reserved_set.set("register", 1)
+    c_reserved_set.set("restrict", 1)
+    c_reserved_set.set("return", 1)
+    c_reserved_set.set("short", 1)
+    c_reserved_set.set("signed", 1)
+    c_reserved_set.set("sizeof", 1)
+    c_reserved_set.set("static", 1)
+    c_reserved_set.set("struct", 1)
+    c_reserved_set.set("switch", 1)
+    c_reserved_set.set("typedef", 1)
+    c_reserved_set.set("union", 1)
+    c_reserved_set.set("unsigned", 1)
+    c_reserved_set.set("void", 1)
+    c_reserved_set.set("volatile", 1)
+    c_reserved_set.set("while", 1)
+    // C99/C11
+    c_reserved_set.set("_Bool", 1)
+    c_reserved_set.set("_Complex", 1)
+    c_reserved_set.set("_Imaginary", 1)
+    c_reserved_set.set("_Alignas", 1)
+    c_reserved_set.set("_Alignof", 1)
+    c_reserved_set.set("_Atomic", 1)
+    c_reserved_set.set("_Generic", 1)
+    c_reserved_set.set("_Noreturn", 1)
+    c_reserved_set.set("_Static_assert", 1)
+    c_reserved_set.set("_Thread_local", 1)
+    // Common libc/POSIX names that would conflict
+    c_reserved_set.set("errno", 1)
+    c_reserved_set.set("stdin", 1)
+    c_reserved_set.set("stdout", 1)
+    c_reserved_set.set("stderr", 1)
+    c_reserved_set.set("printf", 1)
+    c_reserved_set.set("fprintf", 1)
+    c_reserved_set.set("sprintf", 1)
+    c_reserved_set.set("snprintf", 1)
+    c_reserved_set.set("scanf", 1)
+    c_reserved_set.set("malloc", 1)
+    c_reserved_set.set("calloc", 1)
+    c_reserved_set.set("realloc", 1)
+    c_reserved_set.set("free", 1)
+    c_reserved_set.set("exit", 1)
+    c_reserved_set.set("abort", 1)
+    c_reserved_set.set("strlen", 1)
+    c_reserved_set.set("strcmp", 1)
+    c_reserved_set.set("strcpy", 1)
+    c_reserved_set.set("strcat", 1)
+    c_reserved_set.set("memcpy", 1)
+    c_reserved_set.set("memset", 1)
+    c_reserved_set.set("memmove", 1)
+    c_reserved_set.set("NULL", 1)
+    c_reserved_set.set("main", 1)
+    c_reserved_set.set("true", 1)
+    c_reserved_set.set("false", 1)
+}
+
+pub fn c_safe_name(name: Str) -> Str {
+    init_c_reserved()
+    if c_reserved_set.has(name) {
+        return "_pact_{name}"
+    }
+    name
+}
 
 pub fn c_fn_name(name: Str) -> Str {
     if mod_fn_prefix.has(name) {

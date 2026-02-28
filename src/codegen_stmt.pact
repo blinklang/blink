@@ -427,6 +427,7 @@ pub fn bind_pattern_vars(pat: Int, scrut_off: Int, scrut_len: Int) ! Codegen.Emi
             if sub_pk == NodeKind.IdentPattern {
                 let bind_name = np_name.get(sub_pat).unwrap()
                 if bind_name != "_" {
+                    let c_bind = c_safe_name(bind_name)
                     let mut field = "ok"
                     let mut inner_ct = CT_STRING
                     let mut inner_struct = ""
@@ -449,14 +450,14 @@ pub fn bind_pattern_vars(pat: Int, scrut_off: Int, scrut_len: Int) ! Codegen.Emi
                         }
                     }
                     if inner_struct != "" {
-                        emit_line("{c_type_c_name(inner_struct)} {bind_name} = {scrut}.{field};")
+                        emit_line("{c_type_c_name(inner_struct)} {c_bind} = {scrut}.{field};")
                         set_var(bind_name, CT_INT, 0)
                         set_var_struct(bind_name, inner_struct)
                         if is_enum_type(inner_struct) != 0 {
                             var_enums.push(VarEnumEntry { name: bind_name, enum_type: inner_struct })
                         }
                     } else {
-                        emit_line("{c_type_str(inner_ct)} {bind_name} = {scrut}.{field};")
+                        emit_line("{c_type_str(inner_ct)} {c_bind} = {scrut}.{field};")
                         set_var(bind_name, inner_ct, 0)
                     }
                 }
@@ -486,16 +487,17 @@ pub fn bind_pattern_vars(pat: Int, scrut_off: Int, scrut_len: Int) ! Codegen.Emi
                     if sub_pk == NodeKind.IdentPattern {
                         let bind_name = np_name.get(sub_pat).unwrap()
                         if bind_name != "_" {
+                            let c_bind = c_safe_name(bind_name)
                             if is_struct_type(field_type_name) != 0 {
-                                emit_line("{c_type_c_name(field_type_name)} {bind_name} = {scrut}.data.{resolved_variant}.{field_name};")
+                                emit_line("{c_type_c_name(field_type_name)} {c_bind} = {scrut}.data.{resolved_variant}.{field_name};")
                                 set_var(bind_name, CT_VOID, 0)
                                 set_var_struct(bind_name, field_type_name)
                             } else if is_enum_type(field_type_name) != 0 {
-                                emit_line("{c_type_c_name(field_type_name)} {bind_name} = {scrut}.data.{resolved_variant}.{field_name};")
+                                emit_line("{c_type_c_name(field_type_name)} {c_bind} = {scrut}.data.{resolved_variant}.{field_name};")
                                 set_var(bind_name, CT_INT, 0)
                                 var_enums.push(VarEnumEntry { name: bind_name, enum_type: field_type_name })
                             } else {
-                                emit_line("{c_type_str(field_ct)} {bind_name} = {scrut}.data.{resolved_variant}.{field_name};")
+                                emit_line("{c_type_str(field_ct)} {c_bind} = {scrut}.data.{resolved_variant}.{field_name};")
                                 set_var(bind_name, field_ct, 0)
                             }
                         }
@@ -540,6 +542,7 @@ pub fn bind_pattern_vars(pat: Int, scrut_off: Int, scrut_len: Int) ! Codegen.Emi
         while j < sublist_length(flds_sl) {
             let sf = sublist_get(flds_sl, j)
             let fname = np_name.get(sf).unwrap()
+            let c_fname = c_safe_name(fname)
             let fpat = np_pattern.get(sf).unwrap()
             if fpat != -1 {
                 let saved_scruts = match_scruts
@@ -547,7 +550,7 @@ pub fn bind_pattern_vars(pat: Int, scrut_off: Int, scrut_len: Int) ! Codegen.Emi
                 bind_pattern_vars(fpat, 0, 1)
                 match_scruts = saved_scruts
             } else {
-                emit_line("__typeof__({scrut}.{fname}) {fname} = {scrut}.{fname};")
+                emit_line("__typeof__({scrut}.{fname}) {c_fname} = {scrut}.{fname};")
                 let ftype = get_struct_field_type(stype_name, fname)
                 let fstype = get_struct_field_stype(stype_name, fname)
                 set_var(fname, ftype, 0)
@@ -561,14 +564,15 @@ pub fn bind_pattern_vars(pat: Int, scrut_off: Int, scrut_len: Int) ! Codegen.Emi
     }
     if pk == NodeKind.AsPattern {
         let bind_name = np_name.get(pat).unwrap()
+        let c_bind = c_safe_name(bind_name)
         let st = match_scruts.get(scrut_off).unwrap().scrut_type
         let scrut_str = match_scruts.get(scrut_off).unwrap().str_val
         if match_scrut_enum != "" {
-            emit_line("{c_type_c_name(match_scrut_enum)} {bind_name} = {scrut_str};")
+            emit_line("{c_type_c_name(match_scrut_enum)} {c_bind} = {scrut_str};")
             set_var(bind_name, CT_INT, 1)
             var_enums.push(VarEnumEntry { name: bind_name, enum_type: match_scrut_enum })
         } else {
-            emit_line("{c_type_str(st)} {bind_name} = {scrut_str};")
+            emit_line("{c_type_str(st)} {c_bind} = {scrut_str};")
             set_var(bind_name, st, 1)
         }
         bind_pattern_vars(np_pattern.get(pat).unwrap(), scrut_off, scrut_len)
@@ -587,8 +591,9 @@ pub fn bind_pattern_vars(pat: Int, scrut_off: Int, scrut_len: Int) ! Codegen.Emi
             return
         }
         if scrut_len == 1 {
+            let c_bind = c_safe_name(bind_name)
             let st = match_scruts.get(scrut_off).unwrap().scrut_type
-            emit_line("{c_type_str(st)} {bind_name} = {match_scruts.get(scrut_off).unwrap().str_val};")
+            emit_line("{c_type_str(st)} {c_bind} = {match_scruts.get(scrut_off).unwrap().str_val};")
             set_var(bind_name, st, 1)
         }
         return
@@ -1099,14 +1104,15 @@ pub fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
         return
     }
     let struct_type = get_var_struct(name)
+    let cname = c_safe_name(name)
     if val_type == CT_OPTION {
         let opt_inner = get_var_option_inner(name)
         let opt_inner_s = get_var_option_inner_struct(name)
         let opt_c = option_c_type_mixed(opt_inner, opt_inner_s)
         if is_mut != 0 {
-            emit_line("{opt_c} {name} = {val_str};")
+            emit_line("{opt_c} {cname} = {val_str};")
         } else {
-            emit_line("const {opt_c} {name} = {val_str};")
+            emit_line("const {opt_c} {cname} = {val_str};")
         }
     } else if val_type == CT_RESULT {
         let rok = get_var_result_ok(name)
@@ -1115,39 +1121,40 @@ pub fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
         let rerr_s = get_var_result_err_struct(name)
         let res_c = result_c_type_mixed(rok, rerr, rok_s, rerr_s)
         if is_mut != 0 {
-            emit_line("{res_c} {name} = {val_str};")
+            emit_line("{res_c} {cname} = {val_str};")
         } else {
-            emit_line("const {res_c} {name} = {val_str};")
+            emit_line("const {res_c} {cname} = {val_str};")
         }
     } else if enum_type != "" {
         if is_mut != 0 {
-            emit_line("{c_type_c_name(enum_type)} {name} = {val_str};")
+            emit_line("{c_type_c_name(enum_type)} {cname} = {val_str};")
         } else {
-            emit_line("const {c_type_c_name(enum_type)} {name} = {val_str};")
+            emit_line("const {c_type_c_name(enum_type)} {cname} = {val_str};")
         }
     } else if struct_type != "" {
         if is_mut != 0 {
-            emit_line("{c_type_c_name(struct_type)} {name} = {val_str};")
+            emit_line("{c_type_c_name(struct_type)} {cname} = {val_str};")
         } else {
-            emit_line("const {c_type_c_name(struct_type)} {name} = {val_str};")
+            emit_line("const {c_type_c_name(struct_type)} {cname} = {val_str};")
         }
     } else {
         let ts = c_type_str(val_type)
         if is_mut != 0 || val_type == CT_STRING || val_type == CT_LIST || val_type == CT_MAP || val_type == CT_BYTES || val_type == CT_CLOSURE || val_type == CT_ITERATOR || val_type == CT_HANDLE || val_type == CT_CHANNEL {
-            emit_line("{ts} {name} = {val_str};")
+            emit_line("{ts} {cname} = {val_str};")
         } else {
-            emit_line("const {ts} {name} = {val_str};")
+            emit_line("const {ts} {cname} = {val_str};")
         }
     }
     if is_mut_captured(name) != 0 {
         let cell_type = c_type_str(val_type)
-        emit_line("{cell_type}* {name}_cell = ({cell_type}*)pact_alloc(sizeof({cell_type}));")
-        emit_line("*{name}_cell = {name};")
+        emit_line("{cell_type}* {cname}_cell = ({cell_type}*)pact_alloc(sizeof({cell_type}));")
+        emit_line("*{cname}_cell = {cname};")
     }
 }
 
 pub fn emit_for_in(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
     let var_name = np_var_name.get(node).unwrap()
+    let c_var_name = c_safe_name(var_name)
     let iter_node = np_iterable.get(node).unwrap()
     let iter_kind = np_kind.get(iter_node).unwrap()
 
@@ -1169,7 +1176,7 @@ pub fn emit_for_in(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
         cg_indent = cg_indent + 1
         emit_line("{opt_type} {next_var} = pact_RangeIterator_next(&{iter_var});")
         emit_line("if ({next_var}.tag == 0) break;")
-        emit_line("int64_t {var_name} = {next_var}.value;")
+        emit_line("int64_t {c_var_name} = {next_var}.value;")
         push_scope()
         set_var(var_name, CT_INT, 1)
         emit_block(np_body.get(node).unwrap())
@@ -1194,7 +1201,7 @@ pub fn emit_for_in(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
             cg_indent = cg_indent + 1
             emit_line("{opt_type} {next_var} = {li_type}_next(&{iter_var});")
             emit_line("if ({next_var}.tag == 0) break;")
-            emit_line("{c_type_str(elem_type)} {var_name} = {next_var}.value;")
+            emit_line("{c_type_str(elem_type)} {c_var_name} = {next_var}.value;")
             push_scope()
             set_var(var_name, elem_type, 0)
             emit_block(np_body.get(node).unwrap())
@@ -1211,7 +1218,7 @@ pub fn emit_for_in(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
             cg_indent = cg_indent + 1
             emit_line("{opt_type} {next_var} = (({opt_type} (*)(void*)){next_fn})(&{iter_str});")
             emit_line("if ({next_var}.tag == 0) break;")
-            emit_line("{c_type_str(elem_type)} {var_name} = {next_var}.value;")
+            emit_line("{c_type_str(elem_type)} {c_var_name} = {next_var}.value;")
             push_scope()
             set_var(var_name, elem_type, 0)
             emit_block(np_body.get(node).unwrap())
@@ -1226,11 +1233,11 @@ pub fn emit_for_in(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
             emit_line("void* {recv_tmp} = pact_channel_recv({iter_str});")
             emit_line("if ({recv_tmp} == NULL) break;")
             if ch_inner == CT_STRING {
-                emit_line("const char* {var_name} = (const char*){recv_tmp};")
+                emit_line("const char* {c_var_name} = (const char*){recv_tmp};")
                 push_scope()
                 set_var(var_name, CT_STRING, 0)
             } else {
-                emit_line("int64_t {var_name} = (int64_t)(intptr_t){recv_tmp};")
+                emit_line("int64_t {c_var_name} = (int64_t)(intptr_t){recv_tmp};")
                 push_scope()
                 set_var(var_name, CT_INT, 0)
             }
@@ -1248,7 +1255,7 @@ pub fn emit_for_in(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
             cg_indent = cg_indent + 1
             emit_line("{opt_type} {next_var} = pact_StrIterator_next(&{iter_var});")
             emit_line("if ({next_var}.tag == 0) break;")
-            emit_line("int64_t {var_name} = {next_var}.value;")
+            emit_line("int64_t {c_var_name} = {next_var}.value;")
             push_scope()
             set_var(var_name, CT_INT, 0)
             emit_block(np_body.get(node).unwrap())
@@ -1422,7 +1429,7 @@ pub fn format_params(fn_node: Int) -> Str {
     let mut i = 0
     while i < count {
         let p = sublist_get(params_sl, i)
-        let pname = np_name.get(p).unwrap()
+        let pname = c_safe_name(np_name.get(p).unwrap())
         let ptype = np_type_name.get(p).unwrap()
         if i > 0 {
             result = result.concat(", ")
@@ -1457,8 +1464,9 @@ pub fn format_impl_params(fn_node: Int, impl_type: Str) -> Str {
         let mut i = 0
         while i < sublist_length(params_sl) {
             let p = sublist_get(params_sl, i)
-            let pname = np_name.get(p).unwrap()
-            if pname != "self" {
+            let pname_raw = np_name.get(p).unwrap()
+            if pname_raw != "self" {
+                let pname = c_safe_name(pname_raw)
                 let ptype_raw = np_type_name.get(p).unwrap()
                 let ptype = resolve_self_type(ptype_raw, impl_type)
                 if first == 0 {
@@ -1899,7 +1907,7 @@ pub fn emit_mono_fn_def(fn_node: Int, concrete_args: Str) ! Codegen.Emit, Codege
         let mut i = 0
         while i < sublist_length(params_sl) {
             let p = sublist_get(params_sl, i)
-            let pname = np_name.get(p).unwrap()
+            let pname = c_safe_name(np_name.get(p).unwrap())
             let ptype = np_type_name.get(p).unwrap()
             let resolved_ptype = resolve_type_param(ptype, tparams_sl, concrete_args)
             if i > 0 {
@@ -2258,19 +2266,20 @@ pub fn emit_top_level_let(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.S
         }
     }
     let ts = c_type_str(val_type)
+    let cname = c_safe_name(name)
     let needs_init = helper_lines.len() > 0 || val_type == CT_LIST || val_type == CT_MAP
     if needs_init {
-        emit_line("static {ts} {name};")
+        emit_line("static {ts} {cname};")
         let mut hi = 0
         while hi < helper_lines.len() {
             cg_global_inits.push(helper_lines.get(hi).unwrap())
             hi = hi + 1
         }
-        cg_global_inits.push("    ".concat(name).concat(" = ").concat(val_str).concat(";"))
+        cg_global_inits.push("    ".concat(cname).concat(" = ").concat(val_str).concat(";"))
     } else if is_mut != 0 {
-        emit_line("static ".concat(ts).concat(" ").concat(name).concat(" = ").concat(val_str).concat(";"))
+        emit_line("static ".concat(ts).concat(" ").concat(cname).concat(" = ").concat(val_str).concat(";"))
     } else {
         let qualifier = if val_type == CT_STRING { "static " } else { "static const " }
-        emit_line(qualifier.concat(ts).concat(" ").concat(name).concat(" = ").concat(val_str).concat(";"))
+        emit_line(qualifier.concat(ts).concat(" ").concat(cname).concat(" = ").concat(val_str).concat(";"))
     }
 }
