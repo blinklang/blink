@@ -1078,6 +1078,30 @@ pub fn get_list_elem_type(name: Str) -> Int {
     -1
 }
 
+pub fn set_list_nested_elem_type(name: Str, nested_type: Int) {
+    let mut i = scope_vars.len() - 1
+    while i >= 0 {
+        let sv = scope_vars.get(i).unwrap()
+        if sv.name == name && sv.ctype == CT_LIST {
+            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: nested_type, sname: sv.sname, sname2: sv.sname2, extra: sv.extra })
+            return
+        }
+        i = i - 1
+    }
+}
+
+pub fn get_list_nested_elem_type(name: Str) -> Int {
+    let mut i = scope_vars.len() - 1
+    while i >= 0 {
+        let sv = scope_vars.get(i).unwrap()
+        if sv.name == name && sv.ctype == CT_LIST {
+            return sv.inner2
+        }
+        i = i - 1
+    }
+    -1
+}
+
 pub fn set_list_elem_struct(name: Str, struct_name: Str) {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
@@ -1814,6 +1838,30 @@ pub fn set_var_option(name: Str, inner: Int) {
         i = i - 1
     }
     scope_vars.push(ScopeVar { name: name, ctype: CT_OPTION, is_mut: 0, inner1: inner, inner2: -1, sname: "", sname2: "", extra: "" })
+}
+
+pub fn set_var_option_inner2(name: Str, val: Int) {
+    let mut i = scope_vars.len() - 1
+    while i >= 0 {
+        let sv = scope_vars.get(i).unwrap()
+        if sv.name == name && sv.ctype == CT_OPTION {
+            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: val, sname: sv.sname, sname2: sv.sname2, extra: sv.extra })
+            return
+        }
+        i = i - 1
+    }
+}
+
+pub fn get_var_option_inner2(name: Str) -> Int {
+    let mut i = scope_vars.len() - 1
+    while i >= 0 {
+        let sv = scope_vars.get(i).unwrap()
+        if sv.name == name && sv.ctype == CT_OPTION {
+            return sv.inner2
+        }
+        i = i - 1
+    }
+    -1
 }
 
 pub fn set_var_option_struct(name: Str, inner: Int, struct_name: Str) {

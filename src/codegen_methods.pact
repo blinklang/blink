@@ -1446,6 +1446,10 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                 emit_line("    {res}.tag = 1; {res}.value = (int64_t)(intptr_t)pact_list_pop({obj_str});")
                 emit_line("} else \{ {res}.tag = 0; }")
                 set_var_option(res, CT_LIST)
+                let pop_nested = get_list_nested_elem_type(obj_str)
+                if pop_nested != -1 {
+                    set_var_option_inner2(res, pop_nested)
+                }
                 expr_result_str = res
                 expr_result_type = CT_OPTION
                 expr_option_inner = CT_LIST
@@ -1528,10 +1532,15 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                 emit_line("    {res}.tag = 1; {res}.value = (int64_t)(intptr_t)pact_list_get({obj_str}, {idx_tmp});")
                 emit_line("} else \{ {res}.tag = 0; }")
                 set_var_option(res, CT_LIST)
+                let nested_et = get_list_nested_elem_type(obj_str)
+                if nested_et != -1 {
+                    set_var_option_inner2(res, nested_et)
+                }
                 expr_result_str = res
                 expr_result_type = CT_OPTION
                 expr_option_inner = CT_LIST
                 expr_option_inner_struct = ""
+                expr_option_inner_list_elem = nested_et
             } else {
                 ensure_option_type(CT_INT)
                 let opt_type = option_c_type(CT_INT)
@@ -2305,7 +2314,14 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                 let val_tmp = fresh_temp("_ounv_")
                 emit_line("pact_list* {val_tmp} = (pact_list*)(intptr_t){tmp}.value;")
                 set_var(val_tmp, CT_LIST, 0)
-                set_list_elem_type(val_tmp, CT_INT)
+                let nested = get_var_option_inner2(obj_str)
+                if nested != -1 {
+                    set_list_elem_type(val_tmp, nested)
+                    expr_list_elem_type = nested
+                } else {
+                    set_list_elem_type(val_tmp, CT_INT)
+                    expr_list_elem_type = CT_INT
+                }
                 expr_result_str = val_tmp
                 expr_result_type = CT_LIST
             } else {

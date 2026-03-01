@@ -51,10 +51,8 @@ pub let mut np_type_name: List[Str] = []
 pub let mut np_trait_name: List[Str] = []
 
 // Sublists: for lists of node references (params, args, stmts, etc.)
-pub let mut sl_items: List[Int] = []
-pub let mut sl_start: List[Int] = []
-pub let mut sl_len: List[Int] = []
-pub let mut sl_open: Int = 0
+pub let mut sl_data: List[List[Int]] = []
+pub let mut sl_stack: List[Int] = []
 
 // Each node stores a sublist index for various list fields (-1 = none)
 pub let mut np_params: List[Int] = []
@@ -137,39 +135,36 @@ pub fn new_node(kind: Int) -> Int ! Parse.Build {
 }
 
 pub fn new_sublist() -> Int ! Parse.Build {
-    if sl_open {
-        io.println("FATAL: new_sublist() called while another sublist is open — collect items into a List first, then build the sublist after parsing completes")
-    }
-    sl_open = 1
-    let id = sl_start.len()
-    sl_start.push(sl_items.len())
-    sl_len.push(0)
+    let id = sl_data.len()
+    let inner: List[Int] = []
+    sl_data.push(inner)
+    sl_stack.push(id)
     id
 }
 
 pub fn sublist_push(sl: Int, node_id: Int) ! Parse.Build {
-    if !sl_open {
-        io.println("FATAL: sublist_push() called with no open sublist — call new_sublist() first")
+    if sl_stack.len() == 0 {
+        io.println("FATAL: sublist_push() called with no open sublist")
     }
-    sl_items.push(node_id)
+    let items = sl_data.get(sl).unwrap()
+    items.push(node_id)
 }
 
 pub fn finalize_sublist(sl: Int) ! Parse.Build {
-    if !sl_open {
-        io.println("FATAL: finalize_sublist() called with no open sublist — mismatched new_sublist/finalize_sublist calls")
+    if sl_stack.len() == 0 {
+        io.println("FATAL: finalize_sublist() called with no open sublist")
     }
-    let start = sl_start.get(sl).unwrap()
-    let length = sl_items.len() - start
-    sl_len.set(sl, length)
-    sl_open = 0
+    sl_stack.pop()
 }
 
 pub fn sublist_get(sl: Int, idx: Int) -> Int {
-    sl_items.get(sl_start.get(sl).unwrap() + idx).unwrap()
+    let items = sl_data.get(sl).unwrap()
+    items.get(idx).unwrap()
 }
 
 pub fn sublist_length(sl: Int) -> Int {
-    sl_len.get(sl).unwrap()
+    let items = sl_data.get(sl).unwrap()
+    items.len()
 }
 
 // ── Token input (parallel arrays from lexer) ────────────────────────

@@ -19,6 +19,7 @@ pub let mut expr_result_ok_struct: Str = ""
 pub let mut expr_result_err_struct: Str = ""
 pub let mut expr_option_inner_struct: Str = ""
 pub let mut expr_list_elem_type: Int = -1
+pub let mut expr_option_inner_list_elem: Int = -1
 pub let mut expr_iter_next_fn: Str = ""
 
 // Helper output for iter_from_source

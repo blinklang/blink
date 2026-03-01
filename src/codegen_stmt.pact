@@ -1114,6 +1114,10 @@ pub fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
         } else {
             set_var_option(name, expr_option_inner)
         }
+        if expr_option_inner == CT_LIST && expr_option_inner_list_elem != -1 {
+            set_var_option_inner2(name, expr_option_inner_list_elem)
+            expr_option_inner_list_elem = -1
+        }
     }
     if val_type == CT_RESULT {
         if expr_result_ok_struct != "" || expr_result_err_struct != "" {
@@ -1170,6 +1174,14 @@ pub fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                 set_list_elem_type(name, elem_ct)
                 if elem_ct == CT_VOID && is_struct_type(elem_name) != 0 {
                     set_list_elem_struct(name, elem_name)
+                }
+                if elem_ct == CT_LIST {
+                    let nested_sl = np_elements.get(elem_ann).unwrap()
+                    if nested_sl != -1 && sublist_length(nested_sl) > 0 {
+                        let nested_ann = sublist_get(nested_sl, 0)
+                        let nested_name = np_name.get(nested_ann).unwrap()
+                        set_list_nested_elem_type(name, type_from_name(nested_name))
+                    }
                 }
             }
         }
@@ -2341,6 +2353,14 @@ pub fn emit_top_level_let(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.S
                 set_list_elem_type(name, elem_ct)
                 if elem_ct == CT_VOID && is_struct_type(elem_name) != 0 {
                     set_list_elem_struct(name, elem_name)
+                }
+                if elem_ct == CT_LIST {
+                    let nested_sl = np_elements.get(elem_ann).unwrap()
+                    if nested_sl != -1 && sublist_length(nested_sl) > 0 {
+                        let nested_ann = sublist_get(nested_sl, 0)
+                        let nested_name = np_name.get(nested_ann).unwrap()
+                        set_list_nested_elem_type(name, type_from_name(nested_name))
+                    }
                 }
             }
         }
