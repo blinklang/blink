@@ -4,7 +4,7 @@
 // Cache layout: ~/.pact/cache/git/{sanitized_url}/repo.git (bare clone)
 //               ~/.pact/cache/git/{sanitized_url}/{commit}/ (checkout)
 
-import std.manifest
+import pkg.manifest
 
 // ── Last fetch results ──────────────────────────────────────────
 pub let mut last_commit: Str = ""

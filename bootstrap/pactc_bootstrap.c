@@ -1341,19 +1341,19 @@ int64_t pact_std_toml_toml_array_len(const char* key);
 const char* pact_std_toml_toml_get_array_item(const char* key, int64_t index);
 int64_t pact_std_toml_toml_get_array_len(const char* key);
 int64_t pact_std_toml_toml_clear(void);
-void pact_std_lockfile_lockfile_clear(void);
-int64_t pact_std_lockfile_lockfile_pkg_count(void);
-int64_t pact_std_lockfile_lockfile_find_pkg(const char* name);
-const char* pact_std_lockfile_lockfile_get_pkg_hash(const char* name);
-int64_t pact_std_lockfile_lockfile_verify_hash(const char* name, const char* expected_hash);
-void pact_std_lockfile_lockfile_add_pkg(const char* name, const char* version, const char* source, const char* hash, const char* caps);
-void pact_std_lockfile_lockfile_set_metadata(const char* pact_version, const char* generated);
-int64_t pact_std_lockfile_str_compare(const char* a, const char* b);
-void pact_std_lockfile_sort_packages(void);
-const char* pact_std_lockfile_format_caps_toml(const char* caps);
-int64_t pact_std_lockfile_lockfile_write(const char* path);
-const char* pact_std_lockfile_parse_caps_for_pkg(const char* prefix);
-int64_t pact_std_lockfile_lockfile_load(const char* path);
+void pact_pkg_lockfile_lockfile_clear(void);
+int64_t pact_pkg_lockfile_lockfile_pkg_count(void);
+int64_t pact_pkg_lockfile_lockfile_find_pkg(const char* name);
+const char* pact_pkg_lockfile_lockfile_get_pkg_hash(const char* name);
+int64_t pact_pkg_lockfile_lockfile_verify_hash(const char* name, const char* expected_hash);
+void pact_pkg_lockfile_lockfile_add_pkg(const char* name, const char* version, const char* source, const char* hash, const char* caps);
+void pact_pkg_lockfile_lockfile_set_metadata(const char* pact_version, const char* generated);
+int64_t pact_pkg_lockfile_str_compare(const char* a, const char* b);
+void pact_pkg_lockfile_sort_packages(void);
+const char* pact_pkg_lockfile_format_caps_toml(const char* caps);
+int64_t pact_pkg_lockfile_lockfile_write(const char* path);
+const char* pact_pkg_lockfile_parse_caps_for_pkg(const char* prefix);
+int64_t pact_pkg_lockfile_lockfile_load(const char* path);
 const char* pact_compiler_dots_to_slashes(const char* s);
 const char* pact_compiler_dots_to_underscores(const char* s);
 const char* pact_compiler_find_src_root(const char* source_path);
@@ -42116,7 +42116,7 @@ int64_t pact_std_toml_toml_clear(void) {
     return 0;
 }
 
-void pact_std_lockfile_lockfile_clear(void) {
+void pact_pkg_lockfile_lockfile_clear(void) {
     lock_version = 0;
     lock_pact_version = "";
     lock_generated = "";
@@ -42132,11 +42132,11 @@ void pact_std_lockfile_lockfile_clear(void) {
     lock_pkg_caps = _l4;
 }
 
-int64_t pact_std_lockfile_lockfile_pkg_count(void) {
+int64_t pact_pkg_lockfile_lockfile_pkg_count(void) {
     return pact_list_len(lock_pkg_names);
 }
 
-int64_t pact_std_lockfile_lockfile_find_pkg(const char* name) {
+int64_t pact_pkg_lockfile_lockfile_find_pkg(const char* name) {
     int64_t i = 0;
     while ((i < pact_list_len(lock_pkg_names))) {
         int64_t _lgi_0 = i;
@@ -42154,8 +42154,8 @@ int64_t pact_std_lockfile_lockfile_find_pkg(const char* name) {
     return (-1);
 }
 
-const char* pact_std_lockfile_lockfile_get_pkg_hash(const char* name) {
-    const int64_t idx = pact_std_lockfile_lockfile_find_pkg(name);
+const char* pact_pkg_lockfile_lockfile_get_pkg_hash(const char* name) {
+    const int64_t idx = pact_pkg_lockfile_lockfile_find_pkg(name);
     if ((idx == (-1))) {
         return "";
     }
@@ -42169,8 +42169,8 @@ const char* pact_std_lockfile_lockfile_get_pkg_hash(const char* name) {
     return _ounw_2.value;
 }
 
-int64_t pact_std_lockfile_lockfile_verify_hash(const char* name, const char* expected_hash) {
-    const char* actual = pact_std_lockfile_lockfile_get_pkg_hash(name);
+int64_t pact_pkg_lockfile_lockfile_verify_hash(const char* name, const char* expected_hash) {
+    const char* actual = pact_pkg_lockfile_lockfile_get_pkg_hash(name);
     if (pact_str_eq(actual, "")) {
         return 0;
     }
@@ -42180,7 +42180,7 @@ int64_t pact_std_lockfile_lockfile_verify_hash(const char* name, const char* exp
     return 0;
 }
 
-void pact_std_lockfile_lockfile_add_pkg(const char* name, const char* version, const char* source, const char* hash, const char* caps) {
+void pact_pkg_lockfile_lockfile_add_pkg(const char* name, const char* version, const char* source, const char* hash, const char* caps) {
     pact_list_push(lock_pkg_names, (void*)name);
     pact_list_push(lock_pkg_versions, (void*)version);
     pact_list_push(lock_pkg_sources, (void*)source);
@@ -42188,13 +42188,13 @@ void pact_std_lockfile_lockfile_add_pkg(const char* name, const char* version, c
     pact_list_push(lock_pkg_caps, (void*)caps);
 }
 
-void pact_std_lockfile_lockfile_set_metadata(const char* pact_version, const char* generated) {
+void pact_pkg_lockfile_lockfile_set_metadata(const char* pact_version, const char* generated) {
     lock_version = 1;
     lock_pact_version = pact_version;
     lock_generated = generated;
 }
 
-int64_t pact_std_lockfile_str_compare(const char* a, const char* b) {
+int64_t pact_pkg_lockfile_str_compare(const char* a, const char* b) {
     int64_t i = 0;
     const int64_t a_len = pact_str_len(a);
     const int64_t b_len = pact_str_len(b);
@@ -42218,7 +42218,7 @@ int64_t pact_std_lockfile_str_compare(const char* a, const char* b) {
     return 0;
 }
 
-void pact_std_lockfile_sort_packages(void) {
+void pact_pkg_lockfile_sort_packages(void) {
     const int64_t n = pact_list_len(lock_pkg_names);
     int64_t i = 1;
     while ((i < n)) {
@@ -42273,7 +42273,7 @@ void pact_std_lockfile_sort_packages(void) {
         } else { _lget_16.tag = 0; }
         pact_Option_str _ounw_17 = _lget_16;
         if (_ounw_17.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
-            __sc18 = ((pact_std_lockfile_str_compare(_ounw_17.value, key_name) > 0)) ? 1 : 0;
+            __sc18 = ((pact_pkg_lockfile_str_compare(_ounw_17.value, key_name) > 0)) ? 1 : 0;
         } else { __sc18 = 0; }
             if (!(__sc18)) break;
             int64_t _lgi_19 = j;
@@ -42327,7 +42327,7 @@ void pact_std_lockfile_sort_packages(void) {
     }
 }
 
-const char* pact_std_lockfile_format_caps_toml(const char* caps) {
+const char* pact_pkg_lockfile_format_caps_toml(const char* caps) {
     if (pact_str_eq(caps, "")) {
         return "[]";
     }
@@ -42355,8 +42355,8 @@ const char* pact_std_lockfile_format_caps_toml(const char* caps) {
     return pact_str_concat(result, "]");
 }
 
-int64_t pact_std_lockfile_lockfile_write(const char* path) {
-    pact_std_lockfile_sort_packages();
+int64_t pact_pkg_lockfile_lockfile_write(const char* path) {
+    pact_pkg_lockfile_sort_packages();
     const char* out = "[metadata]\n";
     out = pact_str_concat(out, "lockfile-version = 1\n");
     out = pact_str_concat(pact_str_concat(pact_str_concat(out, "pact-version = \""), lock_pact_version), "\"\n");
@@ -42403,14 +42403,14 @@ int64_t pact_std_lockfile_lockfile_write(const char* path) {
         } else { _lget_13.tag = 0; }
         pact_Option_str _ounw_14 = _lget_13;
         if (_ounw_14.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
-        out = pact_str_concat(pact_str_concat(pact_str_concat(out, "capabilities = "), pact_std_lockfile_format_caps_toml(_ounw_14.value)), "\n");
+        out = pact_str_concat(pact_str_concat(pact_str_concat(out, "capabilities = "), pact_pkg_lockfile_format_caps_toml(_ounw_14.value)), "\n");
         i = (i + 1);
     }
     pact_write_file(path, out);
     return 0;
 }
 
-const char* pact_std_lockfile_parse_caps_for_pkg(const char* prefix) {
+const char* pact_pkg_lockfile_parse_caps_for_pkg(const char* prefix) {
     const char* caps_key = pact_str_concat(prefix, ".capabilities");
     if ((pact_std_toml_toml_has(caps_key) == 0)) {
         return "";
@@ -42431,8 +42431,8 @@ const char* pact_std_lockfile_parse_caps_for_pkg(const char* prefix) {
     return result;
 }
 
-int64_t pact_std_lockfile_lockfile_load(const char* path) {
-    pact_std_lockfile_lockfile_clear();
+int64_t pact_pkg_lockfile_lockfile_load(const char* path) {
+    pact_pkg_lockfile_lockfile_clear();
     if ((pact_file_exists(path) == 0)) {
         return 1;
     }
@@ -42479,7 +42479,7 @@ int64_t pact_std_lockfile_lockfile_load(const char* path) {
         const char* pkg_ver = pact_std_toml_toml_get(ver_key);
         const char* pkg_src = pact_std_toml_toml_get(src_key);
         const char* pkg_hash = pact_std_toml_toml_get(hash_key);
-        const char* pkg_caps = pact_std_lockfile_parse_caps_for_pkg(prefix);
+        const char* pkg_caps = pact_pkg_lockfile_parse_caps_for_pkg(prefix);
         pact_list_push(lock_pkg_names, (void*)pkg_name);
         pact_list_push(lock_pkg_versions, (void*)pkg_ver);
         pact_list_push(lock_pkg_sources, (void*)pkg_src);
@@ -42543,7 +42543,7 @@ void pact_compiler_ensure_lockfile_loaded(const char* src_root) {
     }
     const char* lock_path = pact_path_join(project_root, "pact.lock");
     if ((pact_file_exists(lock_path) == 1)) {
-        pact_std_lockfile_lockfile_load(lock_path);
+        pact_pkg_lockfile_lockfile_load(lock_path);
     }
 }
 
@@ -42563,13 +42563,13 @@ const char* pact_compiler_compiler_get_home(void) {
 }
 
 const char* pact_compiler_resolve_from_lockfile(const char* dotted_path, const char* src_root) {
-    if ((pact_std_lockfile_lockfile_pkg_count() == 0)) {
+    if ((pact_pkg_lockfile_lockfile_pkg_count() == 0)) {
         return "";
     }
     const char* pkg_name = "";
     const char* sub_path = "";
     const char* full_pkg = pact_compiler_dots_to_slashes(dotted_path);
-    const int64_t idx_full = pact_std_lockfile_lockfile_find_pkg(full_pkg);
+    const int64_t idx_full = pact_pkg_lockfile_lockfile_find_pkg(full_pkg);
     if ((idx_full >= 0)) {
         pkg_name = full_pkg;
         sub_path = "";
@@ -42587,13 +42587,13 @@ const char* pact_compiler_resolve_from_lockfile(const char* dotted_path, const c
         if ((dot_pos > 0)) {
             const char* first = pact_str_substr(dotted_path, 0, dot_pos);
             const char* rest = pact_str_substr(dotted_path, (dot_pos + 1), ((pact_str_len(dotted_path) - dot_pos) - 1));
-            const int64_t idx_first = pact_std_lockfile_lockfile_find_pkg(first);
+            const int64_t idx_first = pact_pkg_lockfile_lockfile_find_pkg(first);
             if ((idx_first >= 0)) {
                 pkg_name = first;
                 sub_path = rest;
             }
         } else {
-            const int64_t idx_single = pact_std_lockfile_lockfile_find_pkg(dotted_path);
+            const int64_t idx_single = pact_pkg_lockfile_lockfile_find_pkg(dotted_path);
             if ((idx_single >= 0)) {
                 pkg_name = dotted_path;
                 sub_path = "";
@@ -42618,7 +42618,7 @@ const char* pact_compiler_resolve_from_lockfile(const char* dotted_path, const c
             const char* two_seg = pact_str_substr(dotted_path, 0, second_dot);
             const char* two_pkg = pact_compiler_dots_to_slashes(two_seg);
             const char* rest = pact_str_substr(dotted_path, (second_dot + 1), ((pact_str_len(dotted_path) - second_dot) - 1));
-            const int64_t idx_two = pact_std_lockfile_lockfile_find_pkg(two_pkg);
+            const int64_t idx_two = pact_pkg_lockfile_lockfile_find_pkg(two_pkg);
             if ((idx_two >= 0)) {
                 pkg_name = two_pkg;
                 sub_path = rest;
@@ -42628,7 +42628,7 @@ const char* pact_compiler_resolve_from_lockfile(const char* dotted_path, const c
     if (pact_str_eq(pkg_name, "")) {
         return "";
     }
-    const int64_t pkg_idx = pact_std_lockfile_lockfile_find_pkg(pkg_name);
+    const int64_t pkg_idx = pact_pkg_lockfile_lockfile_find_pkg(pkg_name);
     int64_t _lgi_0 = pkg_idx;
     pact_Option_str _lget_1;
     if (pact_list_in_bounds(lock_pkg_sources, _lgi_0)) {
@@ -42707,6 +42707,30 @@ const char* pact_compiler_resolve_module_path(const char* dotted_path, const cha
     if ((!pact_str_eq(dep_path, ""))) {
         return dep_path;
     }
+    if (pact_str_starts_with(dotted_path, "pkg.")) {
+        const char* compiler_dir = pact_path_dirname(pact_get_arg(0));
+        const char* pkg_rel = pact_compiler_dots_to_slashes(pact_str_substr(dotted_path, 4, (pact_str_len(dotted_path) - 4)));
+        const char* pkg_full = pact_path_join(compiler_dir, pact_path_join("lib/pkg", pact_str_concat(pkg_rel, ".pact")));
+        if ((pact_file_exists(pkg_full) == 1)) {
+            return pkg_full;
+        }
+        const char* _env_2 = getenv("PACT_ROOT");
+        pact_Option_str _env_opt_3 = _env_2 ? (pact_Option_str){.tag = 1, .value = _env_2} : (pact_Option_str){.tag = 0};
+        pact_Option_str __opt4 = _env_opt_3;
+        const char* pact_root = (__opt4.tag == 1 ? __opt4.value : "");
+        if ((!pact_str_eq(pact_root, ""))) {
+            const char* pkg_root = pact_path_join(pact_root, pact_path_join("lib/pkg", pact_str_concat(pkg_rel, ".pact")));
+            if ((pact_file_exists(pkg_root) == 1)) {
+                return pkg_root;
+            }
+        }
+        const char* pkg_key = pact_str_concat("pkg_", pact_compiler_dots_to_underscores(pact_str_substr(dotted_path, 4, (pact_str_len(dotted_path) - 4))));
+        if ((pact_map_has(embedded_stdlib, pkg_key) != 0)) {
+            char _si_5[4096];
+            snprintf(_si_5, 4096, "<embedded:%s>", pkg_key);
+            return strdup(_si_5);
+        }
+    }
     if (pact_str_starts_with(dotted_path, "std.")) {
         const char* compiler_dir = pact_path_dirname(pact_get_arg(0));
         const char* std_rel = pact_compiler_dots_to_slashes(pact_str_substr(dotted_path, 4, (pact_str_len(dotted_path) - 4)));
@@ -42714,10 +42738,10 @@ const char* pact_compiler_resolve_module_path(const char* dotted_path, const cha
         if ((pact_file_exists(std_full) == 1)) {
             return std_full;
         }
-        const char* _env_2 = getenv("PACT_ROOT");
-        pact_Option_str _env_opt_3 = _env_2 ? (pact_Option_str){.tag = 1, .value = _env_2} : (pact_Option_str){.tag = 0};
-        pact_Option_str __opt4 = _env_opt_3;
-        const char* pact_root = (__opt4.tag == 1 ? __opt4.value : "");
+        const char* _env_6 = getenv("PACT_ROOT");
+        pact_Option_str _env_opt_7 = _env_6 ? (pact_Option_str){.tag = 1, .value = _env_6} : (pact_Option_str){.tag = 0};
+        pact_Option_str __opt8 = _env_opt_7;
+        const char* pact_root = (__opt8.tag == 1 ? __opt8.value : "");
         if ((!pact_str_eq(pact_root, ""))) {
             const char* std_root = pact_path_join(pact_root, pact_path_join("lib/std", pact_str_concat(std_rel, ".pact")));
             if ((pact_file_exists(std_root) == 1)) {
@@ -42726,14 +42750,14 @@ const char* pact_compiler_resolve_module_path(const char* dotted_path, const cha
         }
         const char* std_key = pact_compiler_dots_to_underscores(pact_str_substr(dotted_path, 4, (pact_str_len(dotted_path) - 4)));
         if ((pact_map_has(embedded_stdlib, std_key) != 0)) {
-            char _si_5[4096];
-            snprintf(_si_5, 4096, "<embedded:%s>", std_key);
-            return strdup(_si_5);
+            char _si_9[4096];
+            snprintf(_si_9, 4096, "<embedded:%s>", std_key);
+            return strdup(_si_9);
         }
     }
-    char _si_6[4096];
-    snprintf(_si_6, 4096, "module not found: %s (looked at: %s)", dotted_path, full);
-    pact_diagnostics_diag_error_no_loc("ModuleNotFound", "E1200", strdup(_si_6), "");
+    char _si_10[4096];
+    snprintf(_si_10, 4096, "module not found: %s (looked at: %s)", dotted_path, full);
+    pact_diagnostics_diag_error_no_loc("ModuleNotFound", "E1200", strdup(_si_10), "");
     return "";
 }
 

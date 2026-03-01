@@ -1,4 +1,4 @@
-import std.gitdeps
+import pkg.gitdeps
 
 fn setup_test_repo() {
     shell_exec("rm -rf /tmp/_pact_test_git")

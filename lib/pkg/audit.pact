@@ -3,7 +3,7 @@
 // Compares current lockfile capabilities against a baseline to detect
 // new or escalated capabilities in dependencies.
 
-import std.lockfile
+import pkg.lockfile
 
 // ── Baseline: parallel arrays from reference lockfile ───────────
 let mut base_names: List[Str] = []

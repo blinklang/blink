@@ -1,9 +1,9 @@
 import ast
 import std.args
-import std.audit
-import std.lockfile
-import std.manifest
-import std.resolver
+import pkg.audit
+import pkg.lockfile
+import pkg.manifest
+import pkg.resolver
 import lexer
 import parser
 import typecheck
@@ -24,37 +24,37 @@ const embedded_llms_short: Str = #embed("../llms.md")
 const embedded_runtime_h: Str = #embed("../bootstrap/runtime.h")
 const embedded_upgrade_cmd: Str = #embed("../templates/claude-commands/pact:upgrade.md")
 const embedded_std_args: Str = #embed("../lib/std/args.pact")
-const embedded_std_audit: Str = #embed("../lib/std/audit.pact")
-const embedded_std_gitdeps: Str = #embed("../lib/std/gitdeps.pact")
+const embedded_pkg_audit: Str = #embed("../lib/pkg/audit.pact")
+const embedded_pkg_gitdeps: Str = #embed("../lib/pkg/gitdeps.pact")
 const embedded_std_http: Str = #embed("../lib/std/http.pact")
 const embedded_std_http_client: Str = #embed("../lib/std/http_client.pact")
 const embedded_std_http_error: Str = #embed("../lib/std/http_error.pact")
 const embedded_std_http_server: Str = #embed("../lib/std/http_server.pact")
 const embedded_std_http_types: Str = #embed("../lib/std/http_types.pact")
 const embedded_std_json: Str = #embed("../lib/std/json.pact")
-const embedded_std_lockfile: Str = #embed("../lib/std/lockfile.pact")
-const embedded_std_manifest: Str = #embed("../lib/std/manifest.pact")
-const embedded_std_pathdeps: Str = #embed("../lib/std/pathdeps.pact")
-const embedded_std_resolver: Str = #embed("../lib/std/resolver.pact")
+const embedded_pkg_lockfile: Str = #embed("../lib/pkg/lockfile.pact")
+const embedded_pkg_manifest: Str = #embed("../lib/pkg/manifest.pact")
+const embedded_pkg_pathdeps: Str = #embed("../lib/pkg/pathdeps.pact")
+const embedded_pkg_resolver: Str = #embed("../lib/pkg/resolver.pact")
 const embedded_std_semver: Str = #embed("../lib/std/semver.pact")
 const embedded_std_toml: Str = #embed("../lib/std/toml.pact")
 
 fn init_embedded_stdlib() {
     embedded_stdlib.set("args", embedded_std_args)
-    embedded_stdlib.set("audit", embedded_std_audit)
-    embedded_stdlib.set("gitdeps", embedded_std_gitdeps)
     embedded_stdlib.set("http", embedded_std_http)
     embedded_stdlib.set("http_client", embedded_std_http_client)
     embedded_stdlib.set("http_error", embedded_std_http_error)
     embedded_stdlib.set("http_server", embedded_std_http_server)
     embedded_stdlib.set("http_types", embedded_std_http_types)
     embedded_stdlib.set("json", embedded_std_json)
-    embedded_stdlib.set("lockfile", embedded_std_lockfile)
-    embedded_stdlib.set("manifest", embedded_std_manifest)
-    embedded_stdlib.set("pathdeps", embedded_std_pathdeps)
-    embedded_stdlib.set("resolver", embedded_std_resolver)
     embedded_stdlib.set("semver", embedded_std_semver)
     embedded_stdlib.set("toml", embedded_std_toml)
+    embedded_stdlib.set("pkg_audit", embedded_pkg_audit)
+    embedded_stdlib.set("pkg_gitdeps", embedded_pkg_gitdeps)
+    embedded_stdlib.set("pkg_lockfile", embedded_pkg_lockfile)
+    embedded_stdlib.set("pkg_manifest", embedded_pkg_manifest)
+    embedded_stdlib.set("pkg_pathdeps", embedded_pkg_pathdeps)
+    embedded_stdlib.set("pkg_resolver", embedded_pkg_resolver)
 }
 
 fn strip_extension(filename: Str) -> Str {

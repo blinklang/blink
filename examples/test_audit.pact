@@ -1,5 +1,5 @@
-import std.audit
-import std.lockfile
+import pkg.audit
+import pkg.lockfile
 
 fn write_lockfile_content(path: Str, packages: Str) {
     let header = "[metadata]\nlockfile-version = 1\npact-version = \"0.1.0\"\ngenerated = \"2026-01-01T00:00:00Z\"\n"

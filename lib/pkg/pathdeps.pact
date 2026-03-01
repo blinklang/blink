@@ -1,9 +1,9 @@
 // pathdeps.pact — path dependency resolver
 //
 // Resolves local path dependencies from pact.toml manifests, handling
-// transitive deps and cycle detection. Uses std.manifest for loading.
+// transitive deps and cycle detection. Uses pkg.manifest for loading.
 
-import std.manifest
+import pkg.manifest
 
 // ── Resolved path deps: parallel arrays ────────────────────────
 pub let mut resolved_names: List[Str] = []

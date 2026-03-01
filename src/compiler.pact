@@ -10,7 +10,7 @@ import file_watcher
 import query
 import incremental
 import daemon
-import std.lockfile
+import pkg.lockfile
 
 // compiler.pact — Self-hosting Pact compiler driver
 //
@@ -261,7 +261,28 @@ pub fn resolve_module_path(dotted_path: Str, src_root: Str) -> Str ! Diag.Report
         return dep_path
     }
 
-    // Step 3: Check std. prefix (bundled stdlib)
+    // Step 3: Check pkg. prefix (bundled package-manager modules)
+    if dotted_path.starts_with("pkg.") {
+        let compiler_dir = path_dirname(get_arg(0))
+        let pkg_rel = dots_to_slashes(dotted_path.substring(4, dotted_path.len() - 4))
+        let pkg_full = path_join(compiler_dir, path_join("lib/pkg", pkg_rel.concat(".pact")))
+        if file_exists(pkg_full) == 1 {
+            return pkg_full
+        }
+        let pact_root = get_env("PACT_ROOT") ?? ""
+        if pact_root != "" {
+            let pkg_root = path_join(pact_root, path_join("lib/pkg", pkg_rel.concat(".pact")))
+            if file_exists(pkg_root) == 1 {
+                return pkg_root
+            }
+        }
+        let pkg_key = "pkg_".concat(dots_to_underscores(dotted_path.substring(4, dotted_path.len() - 4)))
+        if embedded_stdlib.has(pkg_key) != 0 {
+            return "<embedded:{pkg_key}>"
+        }
+    }
+
+    // Step 4: Check std. prefix (bundled stdlib)
     if dotted_path.starts_with("std.") {
         let compiler_dir = path_dirname(get_arg(0))
         let std_rel = dots_to_slashes(dotted_path.substring(4, dotted_path.len() - 4))

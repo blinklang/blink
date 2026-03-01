@@ -1,5 +1,5 @@
-import std.resolver
-import std.lockfile
+import pkg.resolver
+import pkg.lockfile
 
 test "clear" {
     res_names.push("test")

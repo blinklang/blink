@@ -1,4 +1,4 @@
-import std.pathdeps
+import pkg.pathdeps
 
 test "clear" {
     resolved_names.push("test")

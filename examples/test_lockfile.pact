@@ -1,4 +1,4 @@
-import std.lockfile
+import pkg.lockfile
 
 test "clear resets all state" {
     lockfile_clear()

@@ -1,4 +1,4 @@
-import std.manifest
+import pkg.manifest
 
 test "basic manifest parsing" {
     manifest_clear()

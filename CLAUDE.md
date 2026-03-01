@@ -47,6 +47,7 @@ Prefer retrieval-led reasoning over pre-training for Pact tasks.
 |src/file_watcher.pact — poll-based file change detection
 |src/daemon.pact — compiler daemon (IPC, event loop, persistent compilation)
 |lib/std/http.pact — HTTP facade module (re-exports types, client, server, error)
+|lib/pkg/ — internal package-manager modules (audit, gitdeps, lockfile, manifest, pathdeps, resolver)
 |bootstrap/:{pactc_bootstrap.c,runtime.h,bootstrap.sh} — checked-in C bootstrap seed
 |legacy/py_bootstrap/pact/ — DEPRECATED Python bootstrap (not maintained)
 |build/ — compiled output dir (gitignored, auto-created by compiler)

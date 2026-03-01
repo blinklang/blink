@@ -4,11 +4,11 @@
 // For path+git-only (no registry), "MVS" reduces to: resolve each dep,
 // check for version conflicts, recurse into transitive deps.
 
-import std.manifest
-import std.lockfile
+import pkg.manifest
+import pkg.lockfile
 import std.semver
-import std.pathdeps
-import std.gitdeps
+import pkg.pathdeps
+import pkg.gitdeps
 
 // ── Resolved dependency graph: parallel arrays ──────────────────
 pub let mut res_names: List[Str] = []
