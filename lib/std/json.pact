@@ -545,17 +545,10 @@ pub fn json_at(idx: Int, i: Int) -> Int {
     if json_types.get(idx).unwrap() != JSON_ARRAY {
         return -1
     }
-    let start = json_children.get(idx).unwrap()
     let count = json_child_counts.get(idx).unwrap()
     if i < 0 || i >= count {
         return -1
     }
-    // Children are stored contiguously starting at start
-    let target = start + i
-    if target < json_types.len() && json_parents.get(target).unwrap() == idx {
-        return target
-    }
-    // Fallback: count children
     let mut ci = 0
     let mut found = 0
     while ci < json_types.len() {
@@ -663,30 +656,21 @@ pub fn json_serialize(idx: Int) -> Str {
     if ntype == JSON_OBJECT {
         let mut result = "\{"
         let count = json_child_counts.get(idx).unwrap()
-        let start = json_children.get(idx).unwrap()
-        let mut i = 0
-        while i < count {
-            if i > 0 {
-                result = result.concat(",")
-            }
-            let child_idx = start + i
-            if child_idx < json_types.len() && json_parents.get(child_idx).unwrap() == idx {
-                let k = escape_json_str(json_keys.get(child_idx).unwrap())
+        let mut found = 0
+        let mut scan = 0
+        while found < count && scan < json_types.len() {
+            if json_parents.get(scan).unwrap() == idx {
+                if found > 0 {
+                    result = result.concat(",")
+                }
+                let k = escape_json_str(json_keys.get(scan).unwrap())
                 result = result.concat("\"")
                 result = result.concat(k)
                 result = result.concat("\":")
-                result = result.concat(json_serialize(child_idx))
-            } else {
-                let ci = json_obj_child_at(idx, i)
-                if ci >= 0 {
-                    let k = escape_json_str(json_keys.get(ci).unwrap())
-                    result = result.concat("\"")
-                    result = result.concat(k)
-                    result = result.concat("\":")
-                    result = result.concat(json_serialize(ci))
-                }
+                result = result.concat(json_serialize(scan))
+                found = found + 1
             }
-            i = i + 1
+            scan = scan + 1
         }
         result = result.concat("}")
         return result

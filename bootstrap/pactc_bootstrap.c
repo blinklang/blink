@@ -40002,49 +40002,26 @@ int64_t pact_std_json_json_at(int64_t idx, int64_t i) {
     }
     int64_t _lgi_3 = idx;
     pact_Option_int _lget_4;
-    if (pact_list_in_bounds(json_children, _lgi_3)) {
-        _lget_4.tag = 1; _lget_4.value = (int64_t)(intptr_t)pact_list_get(json_children, _lgi_3);
+    if (pact_list_in_bounds(json_child_counts, _lgi_3)) {
+        _lget_4.tag = 1; _lget_4.value = (int64_t)(intptr_t)pact_list_get(json_child_counts, _lgi_3);
     } else { _lget_4.tag = 0; }
     pact_Option_int _ounw_5 = _lget_4;
     if (_ounw_5.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
-    const int64_t start = _ounw_5.value;
-    int64_t _lgi_6 = idx;
-    pact_Option_int _lget_7;
-    if (pact_list_in_bounds(json_child_counts, _lgi_6)) {
-        _lget_7.tag = 1; _lget_7.value = (int64_t)(intptr_t)pact_list_get(json_child_counts, _lgi_6);
-    } else { _lget_7.tag = 0; }
-    pact_Option_int _ounw_8 = _lget_7;
-    if (_ounw_8.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
-    const int64_t count = _ounw_8.value;
+    const int64_t count = _ounw_5.value;
     if (((i < 0) || (i >= count))) {
         return (-1);
-    }
-    const int64_t target = (start + i);
-    int64_t __sc12;
-    if ((target < pact_list_len(json_types))) {
-    int64_t _lgi_9 = target;
-    pact_Option_int _lget_10;
-    if (pact_list_in_bounds(json_parents, _lgi_9)) {
-        _lget_10.tag = 1; _lget_10.value = (int64_t)(intptr_t)pact_list_get(json_parents, _lgi_9);
-    } else { _lget_10.tag = 0; }
-    pact_Option_int _ounw_11 = _lget_10;
-    if (_ounw_11.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
-        __sc12 = ((_ounw_11.value == idx)) ? 1 : 0;
-    } else { __sc12 = 0; }
-    if (__sc12) {
-        return target;
     }
     int64_t ci = 0;
     int64_t found = 0;
     while ((ci < pact_list_len(json_types))) {
-        int64_t _lgi_13 = ci;
-        pact_Option_int _lget_14;
-        if (pact_list_in_bounds(json_parents, _lgi_13)) {
-            _lget_14.tag = 1; _lget_14.value = (int64_t)(intptr_t)pact_list_get(json_parents, _lgi_13);
-        } else { _lget_14.tag = 0; }
-        pact_Option_int _ounw_15 = _lget_14;
-        if (_ounw_15.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
-        if ((_ounw_15.value == idx)) {
+        int64_t _lgi_6 = ci;
+        pact_Option_int _lget_7;
+        if (pact_list_in_bounds(json_parents, _lgi_6)) {
+            _lget_7.tag = 1; _lget_7.value = (int64_t)(intptr_t)pact_list_get(json_parents, _lgi_6);
+        } else { _lget_7.tag = 0; }
+        pact_Option_int _ounw_8 = _lget_7;
+        if (_ounw_8.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
+        if ((_ounw_8.value == idx)) {
             if ((found == i)) {
                 return ci;
             }
@@ -40214,62 +40191,35 @@ const char* pact_std_json_json_serialize(int64_t idx) {
         pact_Option_int _ounw_22 = _lget_21;
         if (_ounw_22.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
         const int64_t count = _ounw_22.value;
-        int64_t _lgi_23 = idx;
-        pact_Option_int _lget_24;
-        if (pact_list_in_bounds(json_children, _lgi_23)) {
-            _lget_24.tag = 1; _lget_24.value = (int64_t)(intptr_t)pact_list_get(json_children, _lgi_23);
-        } else { _lget_24.tag = 0; }
-        pact_Option_int _ounw_25 = _lget_24;
-        if (_ounw_25.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
-        const int64_t start = _ounw_25.value;
-        int64_t i = 0;
-        while ((i < count)) {
-            if ((i > 0)) {
-                result = pact_str_concat(result, ",");
-            }
-            const int64_t child_idx = (start + i);
-            int64_t __sc29;
-            if ((child_idx < pact_list_len(json_types))) {
-            int64_t _lgi_26 = child_idx;
-            pact_Option_int _lget_27;
-            if (pact_list_in_bounds(json_parents, _lgi_26)) {
-                _lget_27.tag = 1; _lget_27.value = (int64_t)(intptr_t)pact_list_get(json_parents, _lgi_26);
-            } else { _lget_27.tag = 0; }
-            pact_Option_int _ounw_28 = _lget_27;
-            if (_ounw_28.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
-                __sc29 = ((_ounw_28.value == idx)) ? 1 : 0;
-            } else { __sc29 = 0; }
-            if (__sc29) {
-                int64_t _lgi_30 = child_idx;
-                pact_Option_str _lget_31;
-                if (pact_list_in_bounds(json_keys, _lgi_30)) {
-                    _lget_31.tag = 1; _lget_31.value = (const char*)pact_list_get(json_keys, _lgi_30);
-                } else { _lget_31.tag = 0; }
-                pact_Option_str _ounw_32 = _lget_31;
-                if (_ounw_32.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
-                const char* k = pact_std_json_escape_json_str(_ounw_32.value);
+        int64_t found = 0;
+        int64_t scan = 0;
+        while (((found < count) && (scan < pact_list_len(json_types)))) {
+            int64_t _lgi_23 = scan;
+            pact_Option_int _lget_24;
+            if (pact_list_in_bounds(json_parents, _lgi_23)) {
+                _lget_24.tag = 1; _lget_24.value = (int64_t)(intptr_t)pact_list_get(json_parents, _lgi_23);
+            } else { _lget_24.tag = 0; }
+            pact_Option_int _ounw_25 = _lget_24;
+            if (_ounw_25.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
+            if ((_ounw_25.value == idx)) {
+                if ((found > 0)) {
+                    result = pact_str_concat(result, ",");
+                }
+                int64_t _lgi_26 = scan;
+                pact_Option_str _lget_27;
+                if (pact_list_in_bounds(json_keys, _lgi_26)) {
+                    _lget_27.tag = 1; _lget_27.value = (const char*)pact_list_get(json_keys, _lgi_26);
+                } else { _lget_27.tag = 0; }
+                pact_Option_str _ounw_28 = _lget_27;
+                if (_ounw_28.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
+                const char* k = pact_std_json_escape_json_str(_ounw_28.value);
                 result = pact_str_concat(result, "\"");
                 result = pact_str_concat(result, k);
                 result = pact_str_concat(result, "\":");
-                result = pact_str_concat(result, pact_std_json_json_serialize(child_idx));
-            } else {
-                const int64_t ci = pact_std_json_json_obj_child_at(idx, i);
-                if ((ci >= 0)) {
-                    int64_t _lgi_33 = ci;
-                    pact_Option_str _lget_34;
-                    if (pact_list_in_bounds(json_keys, _lgi_33)) {
-                        _lget_34.tag = 1; _lget_34.value = (const char*)pact_list_get(json_keys, _lgi_33);
-                    } else { _lget_34.tag = 0; }
-                    pact_Option_str _ounw_35 = _lget_34;
-                    if (_ounw_35.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
-                    const char* k = pact_std_json_escape_json_str(_ounw_35.value);
-                    result = pact_str_concat(result, "\"");
-                    result = pact_str_concat(result, k);
-                    result = pact_str_concat(result, "\":");
-                    result = pact_str_concat(result, pact_std_json_json_serialize(ci));
-                }
+                result = pact_str_concat(result, pact_std_json_json_serialize(scan));
+                found = (found + 1);
             }
-            i = (i + 1);
+            scan = (scan + 1);
         }
         result = pact_str_concat(result, "}");
         return result;
