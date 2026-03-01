@@ -2,7 +2,13 @@
 
 > Pact is a statically-typed, effect-tracked language compiling to C. Compiler v0.11. Language spec v0.3. Self-hosting.
 
-## What's New (v0.11)
+## What's New (v0.11.1)
+
+| Change | Details |
+|--------|---------|
+| Cross-module error locations | Diagnostics in imported modules now report the correct source file instead of always showing the main file |
+
+### Prior: What's New (v0.11)
 
 | Change | Details |
 |--------|---------|

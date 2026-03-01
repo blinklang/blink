@@ -4,7 +4,11 @@
 
 Language spec v0.3. Self-hosting compiler. Targets native binaries via C codegen.
 
-## What's New (v0.11)
+## What's New (v0.11.1)
+
+- **Cross-module error locations** — diagnostics in imported modules now report the correct source file (was always showing main file)
+
+### Prior: What's New (v0.11)
 
 - **`pact doc --list`** — list available stdlib modules for discoverability
 - **Type error locations** — type errors now report source file + line number
