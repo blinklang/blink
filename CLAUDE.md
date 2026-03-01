@@ -104,4 +104,4 @@ When working on the compiler or interpreter, append to `FRICTION.md` whenever yo
 - Missing features (spec doesn't address something the compiler needs)
 
 Use the format in `FRICTION.md`: date, title, category (`syntax`|`types`|`codegen`|`ergonomics`|`ambiguity`|`tooling`|`spec-gap`), severity (`papercut`|`annoying`|`blocking`), source (`ai`|`human`|`both`), context, description.
-Promote `blocking` items to `GAPS.md` or a bd issue so they get resolved.
+Promote `blocking` items to `GAPS.md` or a br task so they get resolved.

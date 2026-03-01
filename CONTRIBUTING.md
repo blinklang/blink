@@ -83,11 +83,11 @@ The compiler is self-hosting and split across multiple source files. `src/cli.pa
 
 ## Task Tracking
 
-We use `bd` (beads) for task management:
+We use `br` (Bridge) for task management:
 
 ```sh
-bd ready          # see available work
-bd create "task"  # create an issue
-bd update ID --status in_progress
-bd close ID
+br ready          # see available work
+br add "task"     # create a task
+br start ID       # start working on a task
+br close ID       # complete a task
 ```
