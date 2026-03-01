@@ -122,3 +122,175 @@ test "command_add_positional" {
     let help = generate_command_help(p, "daemon start")
     assert(help.contains("<file>"))
 }
+
+test "args_get_all returns all repeated option values" {
+    let a = Args {
+        command_name: "",
+        command_path: [],
+        flag_names: [],
+        option_keys: ["tag", "name", "tag", "tag"],
+        option_vals: ["bug", "foo", "feature", "urgent"],
+        positional_vals: [],
+        rest_args: [],
+        error: ""
+    }
+    let tags = args_get_all(a, "tag")
+    assert_eq(tags.len(), 3)
+    assert_eq(tags.get(0).unwrap(), "bug")
+    assert_eq(tags.get(1).unwrap(), "feature")
+    assert_eq(tags.get(2).unwrap(), "urgent")
+}
+
+test "args_get_all returns empty list if absent" {
+    let a = Args {
+        command_name: "",
+        command_path: [],
+        flag_names: [],
+        option_keys: [],
+        option_vals: [],
+        positional_vals: [],
+        rest_args: [],
+        error: ""
+    }
+    assert_eq(args_get_all(a, "missing").len(), 0)
+}
+
+test "args_positional_count" {
+    let a = Args {
+        command_name: "",
+        command_path: [],
+        flag_names: [],
+        option_keys: [],
+        option_vals: [],
+        positional_vals: ["one", "two", "three"],
+        rest_args: [],
+        error: ""
+    }
+    assert_eq(args_positional_count(a), 3)
+}
+
+test "args_positional_count empty" {
+    let a = Args {
+        command_name: "",
+        command_path: [],
+        flag_names: [],
+        option_keys: [],
+        option_vals: [],
+        positional_vals: [],
+        rest_args: [],
+        error: ""
+    }
+    assert_eq(args_positional_count(a), 0)
+}
+
+test "parse_argv basic round-trip" {
+    let mut p = argparser_new("myapp", "Test app")
+    p = add_flag(p, "--verbose", "-v", "Verbose")
+    p = add_option(p, "--output", "-o", "Output file")
+    p = add_command(p, "build", "Build it")
+    p = command_add_positional(p, "build", "file", "Source file")
+
+    let args = parse_argv(p, ["myapp", "build", "--verbose", "-o", "out.txt", "main.pact"])
+    assert_eq(args_command(args), "build")
+    assert(args_has(args, "verbose"))
+    assert_eq(args_get(args, "output"), "out.txt")
+    assert_eq(args_positional(args, 0), "main.pact")
+    assert_eq(args_error(args), "")
+}
+
+test "parse_argv unknown bare word errors when commands defined" {
+    let mut p = argparser_new("cli", "CLI tool")
+    p = add_command(p, "build", "Build it")
+    p = add_command(p, "test", "Test it")
+
+    let args = parse_argv(p, ["cli", "bild"])
+    assert_eq(args_error(args), "unknown command 'bild'")
+}
+
+test "parse_argv bare word allowed when positional defs exist" {
+    let mut p = argparser_new("cli", "CLI tool")
+    p = add_command(p, "build", "Build it")
+    p = add_positional(p, "file", "Source file")
+
+    let args = parse_argv(p, ["cli", "somefile.pact"])
+    assert_eq(args_error(args), "")
+    assert_eq(args_positional(args, 0), "somefile.pact")
+}
+
+test "parse_argv unknown subcommand errors nested" {
+    let mut p = argparser_new("cli", "CLI tool")
+    p = add_command(p, "daemon.start", "Start daemon")
+    p = add_command(p, "daemon.stop", "Stop daemon")
+
+    let args = parse_argv(p, ["cli", "daemon", "bild"])
+    assert_eq(args_error(args), "unknown command 'bild'")
+}
+
+test "parse_argv command positional allows bare words" {
+    let mut p = argparser_new("cli", "CLI tool")
+    p = add_command(p, "run", "Run it")
+    p = command_add_positional(p, "run", "file", "Source")
+
+    let args = parse_argv(p, ["cli", "run", "main.pact"])
+    assert_eq(args_error(args), "")
+    assert_eq(args_command(args), "run")
+    assert_eq(args_positional(args, 0), "main.pact")
+}
+
+test "alias resolves to canonical name" {
+    let mut p = argparser_new("cli", "CLI tool")
+    p = add_command(p, "build", "Build it")
+    p = add_command(p, "test", "Test it")
+    p = add_command_alias(p, "b", "build")
+    p = add_command_alias(p, "t", "test")
+
+    let args = parse_argv(p, ["cli", "b"])
+    assert_eq(args_command(args), "build")
+    assert_eq(args_error(args), "")
+}
+
+test "original command still works alongside alias" {
+    let mut p = argparser_new("cli", "CLI tool")
+    p = add_command(p, "build", "Build it")
+    p = add_command_alias(p, "b", "build")
+
+    let args1 = parse_argv(p, ["cli", "build"])
+    assert_eq(args_command(args1), "build")
+
+    let args2 = parse_argv(p, ["cli", "b"])
+    assert_eq(args_command(args2), "build")
+}
+
+test "alias shows in help text" {
+    let mut p = argparser_new("cli", "CLI tool")
+    p = add_command(p, "build", "Build it")
+    p = add_command_alias(p, "b", "build")
+
+    let help = generate_help(p)
+    assert(help.contains("Aliases:"))
+    assert(help.contains("b -> build"))
+}
+
+test "parse_argv handles rest args separator" {
+    let mut p = argparser_new("cli", "CLI tool")
+    p = add_flag(p, "--verbose", "-v", "Verbose")
+
+    let args = parse_argv(p, ["cli", "--verbose", "--", "foo", "--bar"])
+    assert(args_has(args, "verbose"))
+    assert_eq(args_rest(args).len(), 2)
+    assert_eq(args_rest(args).get(0).unwrap(), "foo")
+    assert_eq(args_rest(args).get(1).unwrap(), "--bar")
+}
+
+test "parse_argv unknown option errors" {
+    let p = argparser_new("cli", "CLI tool")
+    let args = parse_argv(p, ["cli", "--badopt"])
+    assert_eq(args_error(args), "unknown option '--badopt'")
+}
+
+test "parse_argv missing option value errors" {
+    let mut p = argparser_new("cli", "CLI tool")
+    p = add_option(p, "--output", "-o", "Output")
+    let args = parse_argv(p, ["cli", "--output"])
+    assert_eq(args_error(args), "option '--output' requires a value")
+}

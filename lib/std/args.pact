@@ -29,6 +29,11 @@ type CmdList {
     items: List[CommandDef]
 }
 
+type CommandAlias {
+    alias: Str
+    target: Str
+}
+
 type ArgParser {
     prog_name: Str
     description: Str
@@ -36,6 +41,7 @@ type ArgParser {
     options: List[OptionDef]
     positionals: List[PositionalDef]
     commands: List[CommandDef]
+    aliases: List[CommandAlias]
 }
 
 type Args {
@@ -63,7 +69,8 @@ pub fn argparser_new(name: Str, desc: Str) -> ArgParser {
         flags: [],
         options: [],
         positionals: [],
-        commands: []
+        commands: [],
+        aliases: []
     }
 }
 
@@ -85,7 +92,8 @@ pub fn add_flag(p: ArgParser, long_name: Str, short_name: Str, desc: Str) -> Arg
         flags: flags,
         options: p.options,
         positionals: p.positionals,
-        commands: p.commands
+        commands: p.commands,
+        aliases: p.aliases
     }
 }
 
@@ -105,7 +113,8 @@ pub fn add_option(p: ArgParser, long_name: Str, short_name: Str, desc: Str) -> A
         flags: p.flags,
         options: opts,
         positionals: p.positionals,
-        commands: p.commands
+        commands: p.commands,
+        aliases: p.aliases
     }
 }
 
@@ -119,7 +128,8 @@ pub fn add_positional(p: ArgParser, name: Str, desc: Str) -> ArgParser {
         flags: p.flags,
         options: p.options,
         positionals: pos,
-        commands: p.commands
+        commands: p.commands,
+        aliases: p.aliases
     }
 }
 
@@ -206,7 +216,8 @@ pub fn add_command(p: ArgParser, path: Str, desc: Str) -> ArgParser {
             flags: p.flags,
             options: p.options,
             positionals: p.positionals,
-            commands: cmds
+            commands: cmds,
+            aliases: p.aliases
         }
     }
 
@@ -227,7 +238,8 @@ pub fn add_command(p: ArgParser, path: Str, desc: Str) -> ArgParser {
             flags: p.flags,
             options: p.options,
             positionals: p.positionals,
-            commands: cmds
+            commands: cmds,
+            aliases: p.aliases
         }
     }
 
@@ -244,7 +256,8 @@ pub fn add_command(p: ArgParser, path: Str, desc: Str) -> ArgParser {
         flags: p.flags,
         options: p.options,
         positionals: p.positionals,
-        commands: cmds
+        commands: cmds,
+        aliases: p.aliases
     }
 }
 
@@ -321,7 +334,8 @@ pub fn command_add_flag(p: ArgParser, cmd_path: Str, long_name: Str, short_name:
         flags: p.flags,
         options: p.options,
         positionals: p.positionals,
-        commands: modify_nested_cmd(wrap(p.commands), cmd_path, "flag", long_name, short_name, desc)
+        commands: modify_nested_cmd(wrap(p.commands), cmd_path, "flag", long_name, short_name, desc),
+        aliases: p.aliases
     }
 }
 
@@ -333,7 +347,8 @@ pub fn command_add_option(p: ArgParser, cmd_path: Str, long_name: Str, short_nam
         flags: p.flags,
         options: p.options,
         positionals: p.positionals,
-        commands: modify_nested_cmd(wrap(p.commands), cmd_path, "option", long_name, short_name, desc)
+        commands: modify_nested_cmd(wrap(p.commands), cmd_path, "option", long_name, short_name, desc),
+        aliases: p.aliases
     }
 }
 
@@ -345,8 +360,37 @@ pub fn command_add_positional(p: ArgParser, cmd_path: Str, name: Str, desc: Str)
         flags: p.flags,
         options: p.options,
         positionals: p.positionals,
-        commands: modify_nested_cmd(wrap(p.commands), cmd_path, "positional", name, "", desc)
+        commands: modify_nested_cmd(wrap(p.commands), cmd_path, "positional", name, "", desc),
+        aliases: p.aliases
     }
+}
+
+/// Add a top-level alias for a command (e.g. "t" -> "test").
+/// Aliases only resolve at the root command level, not for subcommands.
+pub fn add_command_alias(p: ArgParser, alias: Str, target: Str) -> ArgParser {
+    let mut aliases = p.aliases
+    aliases.push(CommandAlias { alias: alias, target: target })
+    ArgParser {
+        prog_name: p.prog_name,
+        description: p.description,
+        flags: p.flags,
+        options: p.options,
+        positionals: p.positionals,
+        commands: p.commands,
+        aliases: aliases
+    }
+}
+
+fn resolve_alias(p: ArgParser, name: Str) -> Str {
+    let mut i = 0
+    while i < p.aliases.len() {
+        let a = p.aliases.get(i).unwrap()
+        if a.alias == name {
+            return a.target
+        }
+        i = i + 1
+    }
+    ""
 }
 
 fn strip_dashes(s: Str) -> Str {
@@ -452,18 +496,13 @@ fn find_command_in(cl: CmdList, name: Str) -> CommandDef {
     cl.items.get(idx).unwrap()
 }
 
-/// Parse command-line arguments. Returns Args with parsed results.
+/// Parse an explicit argument list. argv[0] is the program name (skipped).
 ///
 /// Example:
 ///     let p = argparser_new("myapp", "My app")
 ///     let p = add_flag(p, "--verbose", "-v", "Verbose")
-///     let p = add_command(p, "run", "Run something")
-///     let args = argparse(p)
-///     if args_error(args) != "" {
-///         io.println(args_error(args))
-///         return
-///     }
-pub fn argparse(p: ArgParser) -> Args {
+///     let args = parse_argv(p, ["myapp", "--verbose", "file.pact"])
+pub fn parse_argv(p: ArgParser, argv: List[Str]) -> Args {
     let mut result = Args {
         command_name: "",
         command_path: [],
@@ -478,13 +517,13 @@ pub fn argparse(p: ArgParser) -> Args {
     let mut cmd_chain: List[CommandDef] = []
     let mut current_cmds = p.commands
 
-    while i < arg_count() {
-        let arg = get_arg(i)
+    while i < argv.len() {
+        let arg = argv.get(i).unwrap()
 
         if arg == "--" {
             i = i + 1
-            while i < arg_count() {
-                result.rest_args.push(get_arg(i))
+            while i < argv.len() {
+                result.rest_args.push(argv.get(i).unwrap())
                 i = i + 1
             }
             result.command_name = join_path(result.command_path)
@@ -503,9 +542,14 @@ pub fn argparse(p: ArgParser) -> Args {
         }
 
         if !arg.starts_with("-") {
-            let matched = find_command_in(wrap(current_cmds), arg)
+            let mut cmd_name = arg
+            let alias_target = resolve_alias(p, arg)
+            if alias_target != "" {
+                cmd_name = alias_target
+            }
+            let matched = find_command_in(wrap(current_cmds), cmd_name)
             if matched.name != "" {
-                result.command_path.push(arg)
+                result.command_path.push(cmd_name)
                 cmd_chain.push(matched)
                 current_cmds = matched.subcommands
                 i = i + 1
@@ -530,13 +574,13 @@ pub fn argparse(p: ArgParser) -> Args {
         }
 
         if opt_name != "" {
-            if i + 1 >= arg_count() {
+            if i + 1 >= argv.len() {
                 result.error = "option '{arg}' requires a value"
                 return result
             }
             i = i + 1
             result.option_keys.push(opt_name)
-            result.option_vals.push(get_arg(i))
+            result.option_vals.push(argv.get(i).unwrap())
             i = i + 1
             continue
         }
@@ -546,12 +590,44 @@ pub fn argparse(p: ArgParser) -> Args {
             return result
         }
 
+        let mut ctx_has_positionals = p.positionals.len() > 0
+        let mut ctx_has_commands = p.commands.len() > 0
+        if cmd_chain.len() > 0 {
+            let active = cmd_chain.get(cmd_chain.len() - 1).unwrap()
+            ctx_has_positionals = active.positionals.len() > 0
+            ctx_has_commands = active.subcommands.len() > 0
+        }
+        if ctx_has_commands && !ctx_has_positionals {
+            result.error = "unknown command '{arg}'"
+            return result
+        }
         result.positional_vals.push(arg)
         i = i + 1
     }
 
     result.command_name = join_path(result.command_path)
     result
+}
+
+/// Parse command-line arguments from process args. Returns Args with parsed results.
+///
+/// Example:
+///     let p = argparser_new("myapp", "My app")
+///     let p = add_flag(p, "--verbose", "-v", "Verbose")
+///     let p = add_command(p, "run", "Run something")
+///     let args = argparse(p)
+///     if args_error(args) != "" {
+///         io.println(args_error(args))
+///         return
+///     }
+pub fn argparse(p: ArgParser) -> Args {
+    let mut argv: List[Str] = []
+    let mut i = 0
+    while i < arg_count() {
+        argv.push(get_arg(i))
+        i = i + 1
+    }
+    parse_argv(p, argv)
 }
 
 /// Check if a flag was set
@@ -566,7 +642,7 @@ pub fn args_has(a: Args, name: Str) -> Bool {
     false
 }
 
-/// Get an option value. Returns empty string if not set
+/// Get an option value (first occurrence). Returns empty string if not set
 pub fn args_get(a: Args, name: Str) -> Str {
     let mut i = 0
     while i < a.option_keys.len() {
@@ -576,6 +652,19 @@ pub fn args_get(a: Args, name: Str) -> Str {
         i = i + 1
     }
     ""
+}
+
+/// Get all values for a repeated option. Returns empty list if not set
+pub fn args_get_all(a: Args, name: Str) -> List[Str] {
+    let mut vals: List[Str] = []
+    let mut i = 0
+    while i < a.option_keys.len() {
+        if a.option_keys.get(i).unwrap() == name {
+            vals.push(a.option_vals.get(i).unwrap())
+        }
+        i = i + 1
+    }
+    vals
 }
 
 /// Get the matched command name
@@ -594,6 +683,11 @@ pub fn args_positional(a: Args, idx: Int) -> Str {
         return a.positional_vals.get(idx).unwrap()
     }
     ""
+}
+
+/// Get the count of positional arguments
+pub fn args_positional_count(a: Args) -> Int {
+    a.positional_vals.len()
 }
 
 /// Get arguments after the "--" separator
@@ -670,6 +764,16 @@ pub fn generate_help(p: ArgParser) -> Str {
     if p.commands.len() > 0 {
         h = h.concat("\nCommands:\n")
         h = emit_command_tree(h, wrap(p.commands), "  ")
+    }
+
+    if p.aliases.len() > 0 {
+        h = h.concat("\nAliases:\n")
+        let mut ai = 0
+        while ai < p.aliases.len() {
+            let a = p.aliases.get(ai).unwrap()
+            h = h.concat("  {a.alias} -> {a.target}\n")
+            ai = ai + 1
+        }
     }
 
     if p.flags.len() > 0 {
