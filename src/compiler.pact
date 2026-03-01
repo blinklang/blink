@@ -561,9 +561,11 @@ pub fn collect_imports(program: Int, src_root: Str, all_programs: List[Int]) ! L
         let imported_prog = parse_program()
         collect_imports(imported_prog, src_root, all_programs)
         all_programs.push(imported_prog)
+        let mod_key = dots_to_underscores(dotted_path)
         import_map_paths.push(file_path)
         import_map_nodes.push(imp_node)
-        import_map_modules.push(dots_to_underscores(dotted_path))
+        import_map_modules.push(mod_key)
+        diag_module_files.set(mod_key, file_path)
         i = i + 1
     }
 }

@@ -27,6 +27,7 @@ pub let mut diag_end_col: List[Int] = []
 pub let mut diag_format: Int = 0       // 0=human, 1=json
 pub let mut diag_source_file: Str = ""
 pub let mut diag_count: Int = 0        // error count only
+pub let mut diag_module_files: Map[Str, Str] = Map()
 
 // ── Emit helpers ─────────────────────────────────────────────────────
 
@@ -54,10 +55,24 @@ pub fn diag_error_no_loc(name: Str, code: Str, message: Str, help: Str) ! Diag.R
     diag_emit("error", name, code, message, 0, 0, help)
 }
 
+pub fn diag_file_for_node(node_id: Int) -> Str {
+    let mod_name = np_module.get(node_id).unwrap()
+    if mod_name != "" {
+        let f = diag_module_files.get(mod_name)
+        if f != "" {
+            return f
+        }
+    }
+    diag_source_file
+}
+
 pub fn diag_error_at(name: Str, code: Str, message: Str, node_id: Int, help: Str) ! Diag.Report {
     let line = np_line.get(node_id).unwrap()
     let col = np_col.get(node_id).unwrap()
+    let saved_file = diag_source_file
+    diag_source_file = diag_file_for_node(node_id)
     diag_emit("error", name, code, message, line, col, help)
+    diag_source_file = saved_file
 }
 
 pub fn diag_warn(name: Str, code: Str, message: Str, line: Int, col: Int, help: Str) ! Diag.Report {
@@ -71,7 +86,10 @@ pub fn diag_warn_no_loc(name: Str, code: Str, message: Str, help: Str) ! Diag.Re
 pub fn diag_warn_at(name: Str, code: Str, message: Str, node_id: Int, help: Str) ! Diag.Report {
     let line = np_line.get(node_id).unwrap()
     let col = np_col.get(node_id).unwrap()
+    let saved_file = diag_source_file
+    diag_source_file = diag_file_for_node(node_id)
     diag_emit("warning", name, code, message, line, col, help)
+    diag_source_file = saved_file
 }
 
 pub fn diag_emit_range(severity: Str, name: Str, code: Str, message: Str, line: Int, col: Int, end_line: Int, end_col: Int, help: Str) ! Diag.Report {
@@ -191,4 +209,5 @@ pub fn diag_reset() {
     diag_end_line = []
     diag_end_col = []
     diag_count = 0
+    diag_module_files = Map()
 }

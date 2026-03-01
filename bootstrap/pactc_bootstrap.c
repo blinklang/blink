@@ -339,6 +339,7 @@ static pact_list* diag_end_col;
 static int64_t diag_format = 0;
 static const char* diag_source_file = "";
 static int64_t diag_count = 0;
+static pact_map* diag_module_files;
 static pact_list* np_kind;
 static pact_list* np_int_val;
 static pact_list* np_str_val;
@@ -754,6 +755,7 @@ const char* pact_ast_node_kind_name(int64_t kind);
 void pact_diagnostics_diag_emit(const char* severity, const char* name, const char* code, const char* message, int64_t line, int64_t col, const char* help);
 void pact_diagnostics_diag_error(const char* name, const char* code, const char* message, int64_t line, int64_t col, const char* help);
 void pact_diagnostics_diag_error_no_loc(const char* name, const char* code, const char* message, const char* help);
+const char* pact_diagnostics_diag_file_for_node(int64_t node_id);
 void pact_diagnostics_diag_error_at(const char* name, const char* code, const char* message, int64_t node_id, const char* help);
 void pact_diagnostics_diag_warn(const char* name, const char* code, const char* message, int64_t line, int64_t col, const char* help);
 void pact_diagnostics_diag_warn_no_loc(const char* name, const char* code, const char* message, const char* help);
@@ -2609,6 +2611,24 @@ void pact_diagnostics_diag_error_no_loc(const char* name, const char* code, cons
     pact_diagnostics_diag_emit("error", name, code, message, 0, 0, help);
 }
 
+const char* pact_diagnostics_diag_file_for_node(int64_t node_id) {
+    int64_t _lgi_0 = node_id;
+    pact_Option_str _lget_1;
+    if (pact_list_in_bounds(np_module, _lgi_0)) {
+        _lget_1.tag = 1; _lget_1.value = (const char*)pact_list_get(np_module, _lgi_0);
+    } else { _lget_1.tag = 0; }
+    pact_Option_str _ounw_2 = _lget_1;
+    if (_ounw_2.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
+    const char* mod_name = _ounw_2.value;
+    if ((!pact_str_eq(mod_name, ""))) {
+        const char* f = (const char*)pact_map_get(diag_module_files, mod_name);
+        if ((!pact_str_eq(f, ""))) {
+            return f;
+        }
+    }
+    return diag_source_file;
+}
+
 void pact_diagnostics_diag_error_at(const char* name, const char* code, const char* message, int64_t node_id, const char* help) {
     int64_t _lgi_0 = node_id;
     pact_Option_int _lget_1;
@@ -2626,7 +2646,10 @@ void pact_diagnostics_diag_error_at(const char* name, const char* code, const ch
     pact_Option_int _ounw_5 = _lget_4;
     if (_ounw_5.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
     const int64_t col = _ounw_5.value;
+    const char* saved_file = diag_source_file;
+    diag_source_file = pact_diagnostics_diag_file_for_node(node_id);
     pact_diagnostics_diag_emit("error", name, code, message, line, col, help);
+    diag_source_file = saved_file;
 }
 
 void pact_diagnostics_diag_warn(const char* name, const char* code, const char* message, int64_t line, int64_t col, const char* help) {
@@ -2654,7 +2677,10 @@ void pact_diagnostics_diag_warn_at(const char* name, const char* code, const cha
     pact_Option_int _ounw_5 = _lget_4;
     if (_ounw_5.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
     const int64_t col = _ounw_5.value;
+    const char* saved_file = diag_source_file;
+    diag_source_file = pact_diagnostics_diag_file_for_node(node_id);
     pact_diagnostics_diag_emit("warning", name, code, message, line, col, help);
+    diag_source_file = saved_file;
 }
 
 void pact_diagnostics_diag_emit_range(const char* severity, const char* name, const char* code, const char* message, int64_t line, int64_t col, int64_t end_line, int64_t end_col, const char* help) {
@@ -2912,6 +2938,7 @@ void pact_diagnostics_diag_reset(void) {
     pact_list* _l9 = pact_list_new();
     diag_end_col = _l9;
     diag_count = 0;
+    diag_module_files = pact_map_new();
 }
 
 int64_t pact_parser_new_node(int64_t kind) {
@@ -43220,9 +43247,11 @@ void pact_compiler_collect_imports(int64_t program, const char* src_root, pact_l
         const int64_t imported_prog = pact_parser_parse_program();
         pact_compiler_collect_imports(imported_prog, src_root, all_programs);
         pact_list_push(all_programs, (void*)(intptr_t)imported_prog);
+        const char* mod_key = pact_compiler_dots_to_underscores(dotted_path);
         pact_list_push(import_map_paths, (void*)file_path);
         pact_list_push(import_map_nodes, (void*)(intptr_t)imp_node);
-        pact_list_push(import_map_modules, (void*)pact_compiler_dots_to_underscores(dotted_path));
+        pact_list_push(import_map_modules, (void*)mod_key);
+        pact_map_set(diag_module_files, mod_key, (void*)file_path);
         i = (i + 1);
     }
 }
@@ -43371,6 +43400,7 @@ pact_list* _l12 = pact_list_new();
     diag_end_line = _l12;
 pact_list* _l13 = pact_list_new();
     diag_end_col = _l13;
+    diag_module_files = pact_map_new();
 pact_list* _l14 = pact_list_new();
     np_kind = _l14;
 pact_list* _l15 = pact_list_new();
