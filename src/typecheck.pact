@@ -258,6 +258,11 @@ pub fn tc_error(msg: Str) ! TypeCheck.Report, Diag.Report {
     diag_error_no_loc("TypeError", "E0300", msg, "")
 }
 
+pub fn tc_error_at(msg: Str, node_id: Int) ! TypeCheck.Report, Diag.Report {
+    tc_errors.push(msg)
+    diag_error_at("TypeError", "E0300", msg, node_id, "")
+}
+
 pub fn tc_warn(msg: Str) ! TypeCheck.Report {
     tc_warnings.push(msg)
 }
@@ -1735,10 +1740,10 @@ pub fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.
         }
         if op == "&&" || op == "||" {
             if is_bool_compat(lt) == 0 {
-                tc_error("logical operator '{op}' requires Bool operands, got {type_to_str(lt)}")
+                tc_error_at("logical operator '{op}' requires Bool operands, got {type_to_str(lt)}", node)
             }
             if is_bool_compat(rt) == 0 {
-                tc_error("logical operator '{op}' requires Bool operands, got {type_to_str(rt)}")
+                tc_error_at("logical operator '{op}' requires Bool operands, got {type_to_str(rt)}", node)
             }
             return TYPE_BOOL
         }
@@ -1750,7 +1755,7 @@ pub fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.
         if op == "+" || op == "-" || op == "*" || op == "/" || op == "%" {
             if lt != TYPE_UNKNOWN && rt != TYPE_UNKNOWN {
                 if types_compatible(lt, rt) == 0 {
-                    tc_error("binary '{op}': incompatible types {type_to_str(lt)} and {type_to_str(rt)}")
+                    tc_error_at("binary '{op}': incompatible types {type_to_str(lt)} and {type_to_str(rt)}", node)
                 }
             }
             if lt != TYPE_UNKNOWN { return lt }
@@ -1781,7 +1786,7 @@ pub fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.
         if op == "??" {
             let operand_k = type_kind(operand)
             if operand_k != TK_OPTION && operand_k != TK_UNKNOWN {
-                tc_error("'??' operator requires Option value, got {type_to_str(operand)}")
+                tc_error_at("'??' operator requires Option value, got {type_to_str(operand)}", node)
             }
             if operand_k == TK_OPTION { return ty_inner1.get(operand).unwrap() }
             return operand
@@ -1834,7 +1839,7 @@ pub fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.
                     }
                     let expected = fnsig_params_count.get(sig).unwrap()
                     if arg_count != expected {
-                        tc_error("function '{fn_name}' expects {expected} argument(s), got {arg_count}")
+                        tc_error_at("function '{fn_name}' expects {expected} argument(s), got {arg_count}", node)
                     }
                     let tp_count = fnsig_type_params_count.get(sig).unwrap()
                     if tp_count > 0 {
@@ -1999,7 +2004,7 @@ pub fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.
     if kind == NodeKind.IfExpr {
         let cond_t = infer_type(np_condition.get(node).unwrap())
         if is_bool_compat(cond_t) == 0 {
-            tc_error("if condition must be Bool, got {type_to_str(cond_t)}")
+            tc_error_at("if condition must be Bool, got {type_to_str(cond_t)}", node)
         }
         let then_t = infer_type(np_then_body.get(node).unwrap())
         let else_node = np_else_body.get(node).unwrap()
@@ -2007,7 +2012,7 @@ pub fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.
             let else_t = infer_type(else_node)
             if then_t != TYPE_UNKNOWN && else_t != TYPE_UNKNOWN {
                 if types_compatible(then_t, else_t) == 0 {
-                    tc_error("if branches have incompatible types: {type_to_str(then_t)} vs {type_to_str(else_t)}")
+                    tc_error_at("if branches have incompatible types: {type_to_str(then_t)} vs {type_to_str(else_t)}", node)
                 }
             }
             if then_t != TYPE_UNKNOWN { return then_t }
@@ -2102,7 +2107,7 @@ pub fn tc_check_fn(fn_node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Rep
                 let inferred_ret = infer_type(body)
                 if inferred_ret != TYPE_UNKNOWN {
                     if types_compatible(declared_ret, inferred_ret) == 0 {
-                        tc_error("function '{fn_name}' declared return type {type_to_str(declared_ret)} but body returns {type_to_str(inferred_ret)}")
+                        tc_error_at("function '{fn_name}' declared return type {type_to_str(declared_ret)} but body returns {type_to_str(inferred_ret)}", fn_node)
                     }
                 }
             }
@@ -2156,7 +2161,7 @@ pub fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repo
 
         if declared_tid != TYPE_UNKNOWN && inferred_tid != TYPE_UNKNOWN {
             if types_compatible(declared_tid, inferred_tid) == 0 {
-                tc_error("variable '{vname}': declared type {type_to_str(declared_tid)} but got {type_to_str(inferred_tid)}")
+                tc_error_at("variable '{vname}': declared type {type_to_str(declared_tid)} but got {type_to_str(inferred_tid)}", node)
             }
         }
 
@@ -2176,7 +2181,7 @@ pub fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repo
             let val_t = infer_type(val)
             if target_t != TYPE_UNKNOWN && val_t != TYPE_UNKNOWN {
                 if types_compatible(target_t, val_t) == 0 {
-                    tc_error("assignment: cannot assign {type_to_str(val_t)} to {type_to_str(target_t)}")
+                    tc_error_at("assignment: cannot assign {type_to_str(val_t)} to {type_to_str(target_t)}", node)
                 }
             }
         }
@@ -2186,7 +2191,7 @@ pub fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repo
     if kind == NodeKind.IfExpr {
         let cond_t = infer_type(np_condition.get(node).unwrap())
         if is_bool_compat(cond_t) == 0 {
-            tc_error("if condition must be Bool, got {type_to_str(cond_t)}")
+            tc_error_at("if condition must be Bool, got {type_to_str(cond_t)}", node)
         }
         tc_check_body(np_then_body.get(node).unwrap())
         tc_check_body(np_else_body.get(node).unwrap())
@@ -2196,7 +2201,7 @@ pub fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repo
     if kind == NodeKind.WhileLoop {
         let cond_t = infer_type(np_condition.get(node).unwrap())
         if is_bool_compat(cond_t) == 0 {
-            tc_error("while condition must be Bool, got {type_to_str(cond_t)}")
+            tc_error_at("while condition must be Bool, got {type_to_str(cond_t)}", node)
         }
         tc_check_body(np_body.get(node).unwrap())
         return

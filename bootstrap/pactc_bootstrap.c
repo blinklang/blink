@@ -848,6 +848,7 @@ int64_t pact_typecheck_get_variant_by_name(int64_t enum_tid, const char* vname);
 int64_t pact_typecheck_lookup_fnsig(const char* name);
 int64_t pact_typecheck_instantiate_return_type(int64_t sig, int64_t args_sl);
 void pact_typecheck_tc_error(const char* msg);
+void pact_typecheck_tc_error_at(const char* msg, int64_t node_id);
 void pact_typecheck_tc_warn(const char* msg);
 void pact_typecheck_tc_set_incremental_filter(pact_list* names);
 void pact_typecheck_tc_clear_incremental_filter(void);
@@ -7410,6 +7411,11 @@ void pact_typecheck_tc_error(const char* msg) {
     pact_diagnostics_diag_error_no_loc("TypeError", "E0300", msg, "");
 }
 
+void pact_typecheck_tc_error_at(const char* msg, int64_t node_id) {
+    pact_list_push(tc_errors, (void*)msg);
+    pact_diagnostics_diag_error_at("TypeError", "E0300", msg, node_id, "");
+}
+
 void pact_typecheck_tc_warn(const char* msg) {
     pact_list_push(tc_warnings, (void*)msg);
 }
@@ -10582,12 +10588,12 @@ int64_t pact_typecheck_infer_type(int64_t node) {
             if ((pact_typecheck_is_bool_compat(lt) == 0)) {
                 char _si_15[4096];
                 snprintf(_si_15, 4096, "logical operator '%s' requires Bool operands, got %s", op, pact_typecheck_type_to_str(lt));
-                pact_typecheck_tc_error(strdup(_si_15));
+                pact_typecheck_tc_error_at(strdup(_si_15), node);
             }
             if ((pact_typecheck_is_bool_compat(rt) == 0)) {
                 char _si_16[4096];
                 snprintf(_si_16, 4096, "logical operator '%s' requires Bool operands, got %s", op, pact_typecheck_type_to_str(rt));
-                pact_typecheck_tc_error(strdup(_si_16));
+                pact_typecheck_tc_error_at(strdup(_si_16), node);
             }
             return TYPE_BOOL;
         }
@@ -10601,7 +10607,7 @@ int64_t pact_typecheck_infer_type(int64_t node) {
                 if ((pact_typecheck_types_compatible(lt, rt) == 0)) {
                     char _si_17[4096];
                     snprintf(_si_17, 4096, "binary '%s': incompatible types %s and %s", op, pact_typecheck_type_to_str(lt), pact_typecheck_type_to_str(rt));
-                    pact_typecheck_tc_error(strdup(_si_17));
+                    pact_typecheck_tc_error_at(strdup(_si_17), node);
                 }
             }
             if ((lt != TYPE_UNKNOWN)) {
@@ -10684,7 +10690,7 @@ int64_t pact_typecheck_infer_type(int64_t node) {
             if (((operand_k != TK_OPTION) && (operand_k != TK_UNKNOWN))) {
                 char _si_35[4096];
                 snprintf(_si_35, 4096, "'\?\?' operator requires Option value, got %s", pact_typecheck_type_to_str(operand));
-                pact_typecheck_tc_error(strdup(_si_35));
+                pact_typecheck_tc_error_at(strdup(_si_35), node);
             }
             if ((operand_k == TK_OPTION)) {
                 int64_t _lgi_36 = operand;
@@ -10803,7 +10809,7 @@ int64_t pact_typecheck_infer_type(int64_t node) {
                     if ((arg_count != expected)) {
                         char _si_63[4096];
                         snprintf(_si_63, 4096, "function '%s' expects %lld argument(s), got %lld", fn_name, (long long)expected, (long long)arg_count);
-                        pact_typecheck_tc_error(strdup(_si_63));
+                        pact_typecheck_tc_error_at(strdup(_si_63), node);
                     }
                     int64_t _lgi_64 = sig;
                     pact_Option_int _lget_65;
@@ -11221,7 +11227,7 @@ int64_t pact_typecheck_infer_type(int64_t node) {
         if ((pact_typecheck_is_bool_compat(cond_t) == 0)) {
             char _si_151[4096];
             snprintf(_si_151, 4096, "if condition must be Bool, got %s", pact_typecheck_type_to_str(cond_t));
-            pact_typecheck_tc_error(strdup(_si_151));
+            pact_typecheck_tc_error_at(strdup(_si_151), node);
         }
         int64_t _lgi_152 = node;
         pact_Option_int _lget_153;
@@ -11245,7 +11251,7 @@ int64_t pact_typecheck_infer_type(int64_t node) {
                 if ((pact_typecheck_types_compatible(then_t, else_t) == 0)) {
                     char _si_158[4096];
                     snprintf(_si_158, 4096, "if branches have incompatible types: %s vs %s", pact_typecheck_type_to_str(then_t), pact_typecheck_type_to_str(else_t));
-                    pact_typecheck_tc_error(strdup(_si_158));
+                    pact_typecheck_tc_error_at(strdup(_si_158), node);
                 }
             }
             if ((then_t != TYPE_UNKNOWN)) {
@@ -11434,7 +11440,7 @@ void pact_typecheck_tc_check_fn(int64_t fn_node) {
                     if ((pact_typecheck_types_compatible(declared_ret, inferred_ret) == 0)) {
                         char _si_18[4096];
                         snprintf(_si_18, 4096, "function '%s' declared return type %s but body returns %s", fn_name, pact_typecheck_type_to_str(declared_ret), pact_typecheck_type_to_str(inferred_ret));
-                        pact_typecheck_tc_error(strdup(_si_18));
+                        pact_typecheck_tc_error_at(strdup(_si_18), fn_node);
                     }
                 }
             }
@@ -11536,7 +11542,7 @@ void pact_typecheck_tc_check_body(int64_t node) {
             if ((pact_typecheck_types_compatible(declared_tid, inferred_tid) == 0)) {
                 char _si_21[4096];
                 snprintf(_si_21, 4096, "variable '%s': declared type %s but got %s", vname, pact_typecheck_type_to_str(declared_tid), pact_typecheck_type_to_str(inferred_tid));
-                pact_typecheck_tc_error(strdup(_si_21));
+                pact_typecheck_tc_error_at(strdup(_si_21), node);
             }
         }
         int64_t final_tid = declared_tid;
@@ -11570,7 +11576,7 @@ void pact_typecheck_tc_check_body(int64_t node) {
                 if ((pact_typecheck_types_compatible(target_t, val_t) == 0)) {
                     char _si_28[4096];
                     snprintf(_si_28, 4096, "assignment: cannot assign %s to %s", pact_typecheck_type_to_str(val_t), pact_typecheck_type_to_str(target_t));
-                    pact_typecheck_tc_error(strdup(_si_28));
+                    pact_typecheck_tc_error_at(strdup(_si_28), node);
                 }
             }
         }
@@ -11588,7 +11594,7 @@ void pact_typecheck_tc_check_body(int64_t node) {
         if ((pact_typecheck_is_bool_compat(cond_t) == 0)) {
             char _si_32[4096];
             snprintf(_si_32, 4096, "if condition must be Bool, got %s", pact_typecheck_type_to_str(cond_t));
-            pact_typecheck_tc_error(strdup(_si_32));
+            pact_typecheck_tc_error_at(strdup(_si_32), node);
         }
         int64_t _lgi_33 = node;
         pact_Option_int _lget_34;
@@ -11620,7 +11626,7 @@ void pact_typecheck_tc_check_body(int64_t node) {
         if ((pact_typecheck_is_bool_compat(cond_t) == 0)) {
             char _si_42[4096];
             snprintf(_si_42, 4096, "while condition must be Bool, got %s", pact_typecheck_type_to_str(cond_t));
-            pact_typecheck_tc_error(strdup(_si_42));
+            pact_typecheck_tc_error_at(strdup(_si_42), node);
         }
         int64_t _lgi_43 = node;
         pact_Option_int _lget_44;
