@@ -582,6 +582,7 @@ fn main() {
     p = command_add_flag(p, "test", "--json", "-j", "JSON output")
     p = command_add_flag(p, "fmt", "--json", "-j", "JSON output")
     p = command_add_flag(p, "doc", "--json", "-j", "JSON output")
+    p = command_add_flag(p, "doc", "--list", "-l", "List available stdlib modules")
     p = command_add_flag(p, "query", "--json", "-j", "JSON output")
 
     p = command_add_option(p, "build", "--output", "-o", "Output path")
@@ -1374,10 +1375,23 @@ fn main() {
             io.println("error: dependency resolution failed")
         }
     } else if command == "doc" {
+        let list_flag = if args_has(a, "list") { 1 } else { 0 }
+        if list_flag == 1 {
+            io.println("Standard library modules:")
+            io.println("  std.args        CLI argument parsing")
+            io.println("  std.http        HTTP client and server")
+            io.println("  std.json        JSON parser and serializer")
+            io.println("  std.semver      Semantic version parsing")
+            io.println("  std.toml        TOML parser")
+            io.println("")
+            io.println("Run: pact doc <module>  (e.g. pact doc std.args)")
+            return
+        }
         let module_name = source_path
         if module_name == "" {
             io.println("error: pact doc requires a module name")
             io.println("usage: pact doc <module>  (e.g. pact doc std.args)")
+            io.println("       pact doc --list    (list available modules)")
             return
         }
         reset_compiler_state()

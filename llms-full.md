@@ -473,6 +473,19 @@ if result.exit_code == 0 {
 }
 ```
 
+## Standard Library
+
+| Module | Description | Example |
+|--------|-------------|---------|
+| `std.args` | CLI argument parsing (flags, options, commands) | `import std.args` |
+| `std.http` | HTTP client and server | `import std.http` |
+| `std.json` | JSON parser and serializer | `import std.json` |
+| `std.semver` | Semantic version parsing and constraints | `import std.semver` |
+| `std.toml` | TOML parser | `import std.toml` |
+
+Run `pact doc <module>` for full documentation (e.g. `pact doc std.args`).
+Run `pact doc --list` to list available modules.
+
 ## Gotchas
 
 - `{}` is NOT an empty map — use `Map()`. `{}` in expression position is a compile error.

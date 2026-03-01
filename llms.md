@@ -44,6 +44,11 @@ Key facts:
 - `io.println(...)` not `print(...)` — IO goes through effect handles
 - No string `+` operator — use interpolation or `.concat()`
 
+## Standard Library
+
+`std.args` (CLI parsing), `std.http` (HTTP client/server), `std.json` (JSON), `std.semver` (versions), `std.toml` (TOML).
+Run `pact doc --list` to list modules, `pact doc <module>` for details.
+
 ## Docs
 
 - [Full LLM Reference](llms-full.md): Complete self-contained language reference with all syntax, builtins, methods, and examples
