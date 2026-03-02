@@ -512,6 +512,9 @@ static int64_t cg_closure_counter = 0;
 static int64_t cg_closure_param_type_hint = (-1);
 static pact_map* mod_fn_prefix;
 static pact_map* mod_type_prefix;
+static pact_map* type_alias_base;
+static pact_map* type_where_preds;
+static const char* cg_where_self_var = "";
 static pact_map* c_reserved_set;
 static int64_t c_reserved_init_done = 0;
 static pact_list* closure_captures;
@@ -882,6 +885,7 @@ int64_t pact_typecheck_is_builtin_method(const char* name);
 int64_t pact_typecheck_get_builtin_fn_ret(const char* name);
 int64_t pact_typecheck_is_variant_name(const char* name);
 int64_t pact_typecheck_get_variant_enum_tid(const char* name);
+int64_t pact_typecheck_is_trait_name(const char* name);
 int64_t pact_typecheck_is_known_type(const char* name);
 int64_t pact_typecheck_nr_has_impl_method(const char* type_name, const char* method);
 void pact_typecheck_resolve_names(int64_t program);
@@ -1062,6 +1066,7 @@ void pact_codegen_types_emit_option_result_types_from(int64_t opt_start, int64_t
 const char* pact_codegen_types_fresh_temp(const char* prefix);
 void pact_codegen_types_emit_line(const char* line);
 const char* pact_codegen_types_join_lines(void);
+const char* pact_codegen_types_c_type_for_alias(const char* base_name);
 void pact_codegen_methods_emit_method_call(int64_t node);
 int64_t pact_codegen_closures_list_contains_str(pact_list* lst, const char* val);
 int64_t pact_codegen_closures_is_in_scope(const char* name);
@@ -3984,6 +3989,48 @@ int64_t pact_parser_parse_type_def(void) {
     int64_t flds = (-1);
     int64_t td_end_line = (-1);
     int64_t td_end_col = (-1);
+    if (pact_parser_at(pact_tokens_TokenKind_Equals)) {
+        pact_parser_advance();
+        const int64_t alias_type = pact_parser_parse_type_annotation();
+        int64_t where_expr = (-1);
+        if (pact_parser_at(pact_tokens_TokenKind_At)) {
+            pact_parser_advance();
+            const char* ann_name = pact_parser_expect_value(pact_tokens_TokenKind_Ident);
+            if (pact_str_eq(ann_name, "where")) {
+                pact_parser_expect(pact_tokens_TokenKind_LParen);
+                where_expr = pact_parser_parse_expr();
+                pact_parser_expect(pact_tokens_TokenKind_RParen);
+            } else {
+                char _si_1[4096];
+                snprintf(_si_1, 4096, "only @where is supported on type aliases, got @%s", ann_name);
+                pact_diagnostics_diag_error("UnexpectedAnnotation", "E1100", strdup(_si_1), pact_parser_peek_line(), pact_parser_peek_col(), "use @where(predicate) to add a refinement constraint");
+            }
+        }
+        const int64_t td = pact_parser_new_node(pact_ast_NodeKind_TypeDef);
+        pact_Option_str _lpop_2;
+        if (pact_list_len(np_name) > 0) {
+            _lpop_2.tag = 1; _lpop_2.value = (const char*)pact_list_pop(np_name);
+        } else { _lpop_2.tag = 0; }
+        _lpop_2;
+        pact_list_push(np_name, (void*)name);
+        pact_Option_int _lpop_3;
+        if (pact_list_len(np_fields) > 0) {
+            _lpop_3.tag = 1; _lpop_3.value = (int64_t)(intptr_t)pact_list_pop(np_fields);
+        } else { _lpop_3.tag = 0; }
+        _lpop_3;
+        pact_list_push(np_fields, (void*)(intptr_t)(-1));
+        pact_Option_int _lpop_4;
+        if (pact_list_len(np_type_params) > 0) {
+            _lpop_4.tag = 1; _lpop_4.value = (int64_t)(intptr_t)pact_list_pop(np_type_params);
+        } else { _lpop_4.tag = 0; }
+        _lpop_4;
+        pact_list_push(np_type_params, (void*)(intptr_t)tparams);
+        pact_list_set(np_value, td, (void*)(intptr_t)alias_type);
+        pact_list_set(np_condition, td, (void*)(intptr_t)where_expr);
+        pending_comments = saved_comments;
+        pending_doc_comment = saved_doc;
+        return td;
+    }
     if (pact_parser_at(pact_tokens_TokenKind_LBrace)) {
         pact_parser_expect(pact_tokens_TokenKind_LBrace);
         pact_parser_skip_newlines();
@@ -3994,17 +4041,17 @@ int64_t pact_parser_parse_type_def(void) {
                 pact_parser_advance();
                 const int64_t type_ann = pact_parser_parse_type_annotation();
                 const int64_t tf = pact_parser_new_node(pact_ast_NodeKind_TypeField);
-                pact_Option_str _lpop_1;
+                pact_Option_str _lpop_5;
                 if (pact_list_len(np_name) > 0) {
-                    _lpop_1.tag = 1; _lpop_1.value = (const char*)pact_list_pop(np_name);
-                } else { _lpop_1.tag = 0; }
-                _lpop_1;
+                    _lpop_5.tag = 1; _lpop_5.value = (const char*)pact_list_pop(np_name);
+                } else { _lpop_5.tag = 0; }
+                _lpop_5;
                 pact_list_push(np_name, (void*)fname);
-                pact_Option_int _lpop_2;
+                pact_Option_int _lpop_6;
                 if (pact_list_len(np_value) > 0) {
-                    _lpop_2.tag = 1; _lpop_2.value = (int64_t)(intptr_t)pact_list_pop(np_value);
-                } else { _lpop_2.tag = 0; }
-                _lpop_2;
+                    _lpop_6.tag = 1; _lpop_6.value = (int64_t)(intptr_t)pact_list_pop(np_value);
+                } else { _lpop_6.tag = 0; }
+                _lpop_6;
                 pact_list_push(np_value, (void*)(intptr_t)type_ann);
                 pact_parser_sublist_push(flds, tf);
             } else if (pact_parser_at(pact_tokens_TokenKind_LParen)) {
@@ -4044,11 +4091,11 @@ int64_t pact_parser_parse_type_def(void) {
                 pact_parser_sublist_push(flds, tv);
             } else {
                 const int64_t tv = pact_parser_new_node(pact_ast_NodeKind_TypeVariant);
-                pact_Option_str _lpop_3;
+                pact_Option_str _lpop_7;
                 if (pact_list_len(np_name) > 0) {
-                    _lpop_3.tag = 1; _lpop_3.value = (const char*)pact_list_pop(np_name);
-                } else { _lpop_3.tag = 0; }
-                _lpop_3;
+                    _lpop_7.tag = 1; _lpop_7.value = (const char*)pact_list_pop(np_name);
+                } else { _lpop_7.tag = 0; }
+                _lpop_7;
                 pact_list_push(np_name, (void*)fname);
                 pact_parser_sublist_push(flds, tv);
             }
@@ -4063,23 +4110,23 @@ int64_t pact_parser_parse_type_def(void) {
         pact_parser_finalize_sublist(flds);
     }
     const int64_t td = pact_parser_new_node(pact_ast_NodeKind_TypeDef);
-    pact_Option_str _lpop_4;
+    pact_Option_str _lpop_8;
     if (pact_list_len(np_name) > 0) {
-        _lpop_4.tag = 1; _lpop_4.value = (const char*)pact_list_pop(np_name);
-    } else { _lpop_4.tag = 0; }
-    _lpop_4;
+        _lpop_8.tag = 1; _lpop_8.value = (const char*)pact_list_pop(np_name);
+    } else { _lpop_8.tag = 0; }
+    _lpop_8;
     pact_list_push(np_name, (void*)name);
-    pact_Option_int _lpop_5;
+    pact_Option_int _lpop_9;
     if (pact_list_len(np_fields) > 0) {
-        _lpop_5.tag = 1; _lpop_5.value = (int64_t)(intptr_t)pact_list_pop(np_fields);
-    } else { _lpop_5.tag = 0; }
-    _lpop_5;
+        _lpop_9.tag = 1; _lpop_9.value = (int64_t)(intptr_t)pact_list_pop(np_fields);
+    } else { _lpop_9.tag = 0; }
+    _lpop_9;
     pact_list_push(np_fields, (void*)(intptr_t)flds);
-    pact_Option_int _lpop_6;
+    pact_Option_int _lpop_10;
     if (pact_list_len(np_type_params) > 0) {
-        _lpop_6.tag = 1; _lpop_6.value = (int64_t)(intptr_t)pact_list_pop(np_type_params);
-    } else { _lpop_6.tag = 0; }
-    _lpop_6;
+        _lpop_10.tag = 1; _lpop_10.value = (int64_t)(intptr_t)pact_list_pop(np_type_params);
+    } else { _lpop_10.tag = 0; }
+    _lpop_10;
     pact_list_push(np_type_params, (void*)(intptr_t)tparams);
     if ((td_end_line != (-1))) {
         pact_list_set(np_end_line, td, (void*)(intptr_t)td_end_line);
@@ -8538,6 +8585,24 @@ int64_t pact_typecheck_get_variant_enum_tid(const char* name) {
     return TYPE_UNKNOWN;
 }
 
+int64_t pact_typecheck_is_trait_name(const char* name) {
+    int64_t i = 0;
+    while ((i < pact_list_len(tc_trait_names))) {
+        int64_t _lgi_0 = i;
+        pact_Option_str _lget_1;
+        if (pact_list_in_bounds(tc_trait_names, _lgi_0)) {
+            _lget_1.tag = 1; _lget_1.value = (const char*)pact_list_get(tc_trait_names, _lgi_0);
+        } else { _lget_1.tag = 0; }
+        pact_Option_str _ounw_2 = _lget_1;
+        if (_ounw_2.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
+        if (pact_str_eq(_ounw_2.value, name)) {
+            return 1;
+        }
+        i = (i + 1);
+    }
+    return 0;
+}
+
 int64_t pact_typecheck_is_known_type(const char* name) {
     if ((((pact_str_eq(name, "Int") || pact_str_eq(name, "Float")) || pact_str_eq(name, "Bool")) || pact_str_eq(name, "Str"))) {
         return 1;
@@ -9227,6 +9292,9 @@ void pact_typecheck_nr_check_node(int64_t node) {
         if ((pact_typecheck_is_known_type(name) != 0)) {
             return;
         }
+        if ((pact_typecheck_is_trait_name(name) != 0)) {
+            return;
+        }
         char _si_32[4096];
         snprintf(_si_32, 4096, "undefined variable '%s'", name);
         pact_list_push(tc_errors, (void*)strdup(_si_32));
@@ -9321,7 +9389,7 @@ void pact_typecheck_nr_check_node(int64_t node) {
                     char _si_57[4096];
                     snprintf(_si_57, 4096, "cannot access private function '%s' from another module", fn_name);
                     pact_diagnostics_diag_error_at("PrivateItemAccess", "E1003", strdup(_si_57), node, "mark the function as 'pub' in its module");
-                } else if (((((pact_typecheck_nr_is_defined(fn_name) == 0) && (pact_typecheck_is_builtin_fn(fn_name) == 0)) && (pact_typecheck_is_variant_name(fn_name) == 0)) && (pact_typecheck_is_known_type(fn_name) == 0))) {
+                } else if ((((((pact_typecheck_nr_is_defined(fn_name) == 0) && (pact_typecheck_is_builtin_fn(fn_name) == 0)) && (pact_typecheck_is_variant_name(fn_name) == 0)) && (pact_typecheck_is_known_type(fn_name) == 0)) && (pact_typecheck_is_trait_name(fn_name) == 0))) {
                     char _si_58[4096];
                     snprintf(_si_58, 4096, "undefined function '%s'", fn_name);
                     pact_list_push(tc_errors, (void*)strdup(_si_58));
@@ -15941,6 +16009,24 @@ void pact_codegen_types_emit_line(const char* line) {
 
 const char* pact_codegen_types_join_lines(void) {
     return pact_str_join(cg_lines, "\n");
+}
+
+const char* pact_codegen_types_c_type_for_alias(const char* base_name) {
+    if (pact_str_eq(base_name, "Int")) {
+        return "int64_t";
+    }
+    if (pact_str_eq(base_name, "Float")) {
+        return "double";
+    }
+    if (pact_str_eq(base_name, "Bool")) {
+        return "int64_t";
+    }
+    if (pact_str_eq(base_name, "Str")) {
+        return "const char*";
+    }
+    char _si_0[4096];
+    snprintf(_si_0, 4096, "pact_%s", base_name);
+    return strdup(_si_0);
 }
 
 void pact_codegen_methods_emit_method_call(int64_t node) {
@@ -22619,6 +22705,11 @@ void pact_codegen_expr_emit_expr(int64_t node) {
         pact_Option_str _ounw_18 = _lget_17;
         if (_ounw_18.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
         const char* name = _ounw_18.value;
+        if ((pact_str_eq(name, "self") && (!pact_str_eq(cg_where_self_var, "")))) {
+            expr_result_str = cg_where_self_var;
+            expr_result_type = CT_INT;
+            return;
+        }
         if (pact_str_eq(name, "None")) {
             pact_codegen_types_FnRetStructInner _sr19 = pact_codegen_types_get_fn_ret_struct_inner(cg_current_fn_name);
             const pact_codegen_types_FnRetStructInner fsi = _sr19;
@@ -31587,6 +31678,9 @@ const char* pact_codegen_generate(int64_t program) {
     }
     mod_fn_prefix = pact_map_new();
     mod_type_prefix = pact_map_new();
+    type_alias_base = pact_map_new();
+    type_where_preds = pact_map_new();
+    cg_where_self_var = "";
     int64_t _lgi_137 = program;
     pact_Option_int _lget_138;
     if (pact_list_in_bounds(np_fields, _lgi_137)) {
@@ -31625,36 +31719,87 @@ const char* pact_codegen_generate(int64_t program) {
             pact_Option_int _ounw_148 = _lget_147;
             if (_ounw_148.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
             const int64_t td_flds = _ounw_148.value;
+            int64_t __sc152;
+            if ((td_flds == (-1))) {
+            int64_t _lgi_149 = td;
+            pact_Option_int _lget_150;
+            if (pact_list_in_bounds(np_value, _lgi_149)) {
+                _lget_150.tag = 1; _lget_150.value = (int64_t)(intptr_t)pact_list_get(np_value, _lgi_149);
+            } else { _lget_150.tag = 0; }
+            pact_Option_int _ounw_151 = _lget_150;
+            if (_ounw_151.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
+                __sc152 = ((_ounw_151.value != (-1))) ? 1 : 0;
+            } else { __sc152 = 0; }
+            if (__sc152) {
+                int64_t _lgi_153 = td;
+                pact_Option_str _lget_154;
+                if (pact_list_in_bounds(np_name, _lgi_153)) {
+                    _lget_154.tag = 1; _lget_154.value = (const char*)pact_list_get(np_name, _lgi_153);
+                } else { _lget_154.tag = 0; }
+                pact_Option_str _ounw_155 = _lget_154;
+                if (_ounw_155.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
+                const char* alias_name = _ounw_155.value;
+                int64_t _lgi_156 = td;
+                pact_Option_int _lget_157;
+                if (pact_list_in_bounds(np_value, _lgi_156)) {
+                    _lget_157.tag = 1; _lget_157.value = (int64_t)(intptr_t)pact_list_get(np_value, _lgi_156);
+                } else { _lget_157.tag = 0; }
+                pact_Option_int _ounw_158 = _lget_157;
+                if (_ounw_158.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
+                const int64_t base_ann = _ounw_158.value;
+                int64_t _lgi_159 = base_ann;
+                pact_Option_str _lget_160;
+                if (pact_list_in_bounds(np_name, _lgi_159)) {
+                    _lget_160.tag = 1; _lget_160.value = (const char*)pact_list_get(np_name, _lgi_159);
+                } else { _lget_160.tag = 0; }
+                pact_Option_str _ounw_161 = _lget_160;
+                if (_ounw_161.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
+                const char* base_name = _ounw_161.value;
+                pact_map_set(type_alias_base, alias_name, (void*)base_name);
+                int64_t _lgi_162 = td;
+                pact_Option_int _lget_163;
+                if (pact_list_in_bounds(np_condition, _lgi_162)) {
+                    _lget_163.tag = 1; _lget_163.value = (int64_t)(intptr_t)pact_list_get(np_condition, _lgi_162);
+                } else { _lget_163.tag = 0; }
+                pact_Option_int _ounw_164 = _lget_163;
+                if (_ounw_164.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
+                const int64_t where_pred = _ounw_164.value;
+                if ((where_pred != (-1))) {
+                    pact_map_set(type_where_preds, alias_name, (void*)(intptr_t)where_pred);
+                }
+                i = (i + 1);
+                continue;
+            }
             int64_t is_enum = 0;
             if (((td_flds != (-1)) && (pact_parser_sublist_length(td_flds) > 0))) {
-                int64_t _lgi_149 = pact_parser_sublist_get(td_flds, 0);
-                pact_Option_int _lget_150;
-                if (pact_list_in_bounds(np_kind, _lgi_149)) {
-                    _lget_150.tag = 1; _lget_150.value = (int64_t)(intptr_t)pact_list_get(np_kind, _lgi_149);
-                } else { _lget_150.tag = 0; }
-                pact_Option_int _ounw_151 = _lget_150;
-                if (_ounw_151.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
-                if ((_ounw_151.value == pact_ast_NodeKind_TypeVariant)) {
+                int64_t _lgi_165 = pact_parser_sublist_get(td_flds, 0);
+                pact_Option_int _lget_166;
+                if (pact_list_in_bounds(np_kind, _lgi_165)) {
+                    _lget_166.tag = 1; _lget_166.value = (int64_t)(intptr_t)pact_list_get(np_kind, _lgi_165);
+                } else { _lget_166.tag = 0; }
+                pact_Option_int _ounw_167 = _lget_166;
+                if (_ounw_167.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
+                if ((_ounw_167.value == pact_ast_NodeKind_TypeVariant)) {
                     is_enum = 1;
                 }
             }
             if ((is_enum == 0)) {
-                int64_t _lgi_152 = td;
-                pact_Option_str _lget_153;
-                if (pact_list_in_bounds(np_name, _lgi_152)) {
-                    _lget_153.tag = 1; _lget_153.value = (const char*)pact_list_get(np_name, _lgi_152);
-                } else { _lget_153.tag = 0; }
-                pact_Option_str _ounw_154 = _lget_153;
-                if (_ounw_154.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
-                pact_list_push(struct_reg_names, (void*)_ounw_154.value);
-                int64_t _lgi_155 = td;
-                pact_Option_str _lget_156;
-                if (pact_list_in_bounds(np_name, _lgi_155)) {
-                    _lget_156.tag = 1; _lget_156.value = (const char*)pact_list_get(np_name, _lgi_155);
-                } else { _lget_156.tag = 0; }
-                pact_Option_str _ounw_157 = _lget_156;
-                if (_ounw_157.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
-                pact_map_set(struct_reg_set, _ounw_157.value, (void*)(intptr_t)1);
+                int64_t _lgi_168 = td;
+                pact_Option_str _lget_169;
+                if (pact_list_in_bounds(np_name, _lgi_168)) {
+                    _lget_169.tag = 1; _lget_169.value = (const char*)pact_list_get(np_name, _lgi_168);
+                } else { _lget_169.tag = 0; }
+                pact_Option_str _ounw_170 = _lget_169;
+                if (_ounw_170.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
+                pact_list_push(struct_reg_names, (void*)_ounw_170.value);
+                int64_t _lgi_171 = td;
+                pact_Option_str _lget_172;
+                if (pact_list_in_bounds(np_name, _lgi_171)) {
+                    _lget_172.tag = 1; _lget_172.value = (const char*)pact_list_get(np_name, _lgi_171);
+                } else { _lget_172.tag = 0; }
+                pact_Option_str _ounw_173 = _lget_172;
+                if (_ounw_173.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
+                pact_map_set(struct_reg_set, _ounw_173.value, (void*)(intptr_t)1);
             }
             i = (i + 1);
         }
@@ -31663,24 +31808,52 @@ const char* pact_codegen_generate(int64_t program) {
         int64_t i = 0;
         while ((i < pact_parser_sublist_length(types_sl))) {
             const int64_t td = pact_parser_sublist_get(types_sl, i);
-            int64_t _lgi_158 = td;
-            pact_Option_int _lget_159;
-            if (pact_list_in_bounds(np_fields, _lgi_158)) {
-                _lget_159.tag = 1; _lget_159.value = (int64_t)(intptr_t)pact_list_get(np_fields, _lgi_158);
-            } else { _lget_159.tag = 0; }
-            pact_Option_int _ounw_160 = _lget_159;
-            if (_ounw_160.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
-            const int64_t td_flds = _ounw_160.value;
+            int64_t _lgi_174 = td;
+            pact_Option_int _lget_175;
+            if (pact_list_in_bounds(np_fields, _lgi_174)) {
+                _lget_175.tag = 1; _lget_175.value = (int64_t)(intptr_t)pact_list_get(np_fields, _lgi_174);
+            } else { _lget_175.tag = 0; }
+            pact_Option_int _ounw_176 = _lget_175;
+            if (_ounw_176.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
+            const int64_t td_flds = _ounw_176.value;
+            int64_t __sc180;
+            if ((td_flds == (-1))) {
+            int64_t _lgi_177 = td;
+            pact_Option_int _lget_178;
+            if (pact_list_in_bounds(np_value, _lgi_177)) {
+                _lget_178.tag = 1; _lget_178.value = (int64_t)(intptr_t)pact_list_get(np_value, _lgi_177);
+            } else { _lget_178.tag = 0; }
+            pact_Option_int _ounw_179 = _lget_178;
+            if (_ounw_179.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
+                __sc180 = ((_ounw_179.value != (-1))) ? 1 : 0;
+            } else { __sc180 = 0; }
+            if (__sc180) {
+                int64_t _lgi_181 = td;
+                pact_Option_str _lget_182;
+                if (pact_list_in_bounds(np_name, _lgi_181)) {
+                    _lget_182.tag = 1; _lget_182.value = (const char*)pact_list_get(np_name, _lgi_181);
+                } else { _lget_182.tag = 0; }
+                pact_Option_str _ounw_183 = _lget_182;
+                if (_ounw_183.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
+                const char* alias_name = _ounw_183.value;
+                const char* base_name = (const char*)pact_map_get(type_alias_base, alias_name);
+                const char* c_base = pact_codegen_types_c_type_for_alias(base_name);
+                char _si_184[4096];
+                snprintf(_si_184, 4096, "typedef %s pact_%s;", c_base, alias_name);
+                pact_codegen_types_emit_line(strdup(_si_184));
+                i = (i + 1);
+                continue;
+            }
             int64_t is_enum = 0;
             if (((td_flds != (-1)) && (pact_parser_sublist_length(td_flds) > 0))) {
-                int64_t _lgi_161 = pact_parser_sublist_get(td_flds, 0);
-                pact_Option_int _lget_162;
-                if (pact_list_in_bounds(np_kind, _lgi_161)) {
-                    _lget_162.tag = 1; _lget_162.value = (int64_t)(intptr_t)pact_list_get(np_kind, _lgi_161);
-                } else { _lget_162.tag = 0; }
-                pact_Option_int _ounw_163 = _lget_162;
-                if (_ounw_163.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
-                if ((_ounw_163.value == pact_ast_NodeKind_TypeVariant)) {
+                int64_t _lgi_185 = pact_parser_sublist_get(td_flds, 0);
+                pact_Option_int _lget_186;
+                if (pact_list_in_bounds(np_kind, _lgi_185)) {
+                    _lget_186.tag = 1; _lget_186.value = (int64_t)(intptr_t)pact_list_get(np_kind, _lgi_185);
+                } else { _lget_186.tag = 0; }
+                pact_Option_int _ounw_187 = _lget_186;
+                if (_ounw_187.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
+                if ((_ounw_187.value == pact_ast_NodeKind_TypeVariant)) {
                     is_enum = 1;
                 }
             }
@@ -31692,26 +31865,26 @@ const char* pact_codegen_generate(int64_t program) {
             i = (i + 1);
         }
     }
-    int64_t _lgi_164 = program;
-    pact_Option_int _lget_165;
-    if (pact_list_in_bounds(np_stmts, _lgi_164)) {
-        _lget_165.tag = 1; _lget_165.value = (int64_t)(intptr_t)pact_list_get(np_stmts, _lgi_164);
-    } else { _lget_165.tag = 0; }
-    pact_Option_int _ounw_166 = _lget_165;
-    if (_ounw_166.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
-    const int64_t lets_sl = _ounw_166.value;
+    int64_t _lgi_188 = program;
+    pact_Option_int _lget_189;
+    if (pact_list_in_bounds(np_stmts, _lgi_188)) {
+        _lget_189.tag = 1; _lget_189.value = (int64_t)(intptr_t)pact_list_get(np_stmts, _lgi_188);
+    } else { _lget_189.tag = 0; }
+    pact_Option_int _ounw_190 = _lget_189;
+    if (_ounw_190.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
+    const int64_t lets_sl = _ounw_190.value;
     if ((lets_sl != (-1))) {
         int64_t i = 0;
         while ((i < pact_parser_sublist_length(lets_sl))) {
             const int64_t let_node = pact_parser_sublist_get(lets_sl, i);
-            int64_t _lgi_167 = let_node;
-            pact_Option_str _lget_168;
-            if (pact_list_in_bounds(np_name, _lgi_167)) {
-                _lget_168.tag = 1; _lget_168.value = (const char*)pact_list_get(np_name, _lgi_167);
-            } else { _lget_168.tag = 0; }
-            pact_Option_str _ounw_169 = _lget_168;
-            if (_ounw_169.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
-            const char* let_name = _ounw_169.value;
+            int64_t _lgi_191 = let_node;
+            pact_Option_str _lget_192;
+            if (pact_list_in_bounds(np_name, _lgi_191)) {
+                _lget_192.tag = 1; _lget_192.value = (const char*)pact_list_get(np_name, _lgi_191);
+            } else { _lget_192.tag = 0; }
+            pact_Option_str _ounw_193 = _lget_192;
+            if (_ounw_193.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
+            const char* let_name = _ounw_193.value;
             if ((pact_codegen_types_is_emitted_let(let_name) == 0)) {
                 pact_codegen_stmt_emit_top_level_let(let_node);
                 pact_list_push(emitted_let_names, (void*)let_name);
@@ -31721,72 +31894,72 @@ const char* pact_codegen_generate(int64_t program) {
         }
         pact_codegen_types_emit_line("");
     }
-    int64_t _lgi_170 = program;
-    pact_Option_int _lget_171;
-    if (pact_list_in_bounds(np_params, _lgi_170)) {
-        _lget_171.tag = 1; _lget_171.value = (int64_t)(intptr_t)pact_list_get(np_params, _lgi_170);
-    } else { _lget_171.tag = 0; }
-    pact_Option_int _ounw_172 = _lget_171;
-    if (_ounw_172.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
-    const int64_t fns_sl = _ounw_172.value;
+    int64_t _lgi_194 = program;
+    pact_Option_int _lget_195;
+    if (pact_list_in_bounds(np_params, _lgi_194)) {
+        _lget_195.tag = 1; _lget_195.value = (int64_t)(intptr_t)pact_list_get(np_params, _lgi_194);
+    } else { _lget_195.tag = 0; }
+    pact_Option_int _ounw_196 = _lget_195;
+    if (_ounw_196.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
+    const int64_t fns_sl = _ounw_196.value;
     if ((fns_sl != (-1))) {
         int64_t i = 0;
         while ((i < pact_parser_sublist_length(fns_sl))) {
             const int64_t fn_node = pact_parser_sublist_get(fns_sl, i);
-            int64_t _lgi_173 = fn_node;
-            pact_Option_str _lget_174;
-            if (pact_list_in_bounds(np_name, _lgi_173)) {
-                _lget_174.tag = 1; _lget_174.value = (const char*)pact_list_get(np_name, _lgi_173);
-            } else { _lget_174.tag = 0; }
-            pact_Option_str _ounw_175 = _lget_174;
-            if (_ounw_175.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
-            const char* fn_name = _ounw_175.value;
-            int64_t _lgi_176 = fn_node;
-            pact_Option_str _lget_177;
-            if (pact_list_in_bounds(np_module, _lgi_176)) {
-                _lget_177.tag = 1; _lget_177.value = (const char*)pact_list_get(np_module, _lgi_176);
-            } else { _lget_177.tag = 0; }
-            pact_Option_str _ounw_178 = _lget_177;
-            if (_ounw_178.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
-            const char* fn_mod = _ounw_178.value;
+            int64_t _lgi_197 = fn_node;
+            pact_Option_str _lget_198;
+            if (pact_list_in_bounds(np_name, _lgi_197)) {
+                _lget_198.tag = 1; _lget_198.value = (const char*)pact_list_get(np_name, _lgi_197);
+            } else { _lget_198.tag = 0; }
+            pact_Option_str _ounw_199 = _lget_198;
+            if (_ounw_199.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
+            const char* fn_name = _ounw_199.value;
+            int64_t _lgi_200 = fn_node;
+            pact_Option_str _lget_201;
+            if (pact_list_in_bounds(np_module, _lgi_200)) {
+                _lget_201.tag = 1; _lget_201.value = (const char*)pact_list_get(np_module, _lgi_200);
+            } else { _lget_201.tag = 0; }
+            pact_Option_str _ounw_202 = _lget_201;
+            if (_ounw_202.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
+            const char* fn_mod = _ounw_202.value;
             if ((!pact_str_eq(fn_mod, ""))) {
                 pact_map_set(mod_fn_prefix, fn_name, (void*)fn_mod);
             }
-            int64_t _lgi_179 = fn_node;
-            pact_Option_int _lget_180;
-            if (pact_list_in_bounds(np_type_params, _lgi_179)) {
-                _lget_180.tag = 1; _lget_180.value = (int64_t)(intptr_t)pact_list_get(np_type_params, _lgi_179);
-            } else { _lget_180.tag = 0; }
-            pact_Option_int _ounw_181 = _lget_180;
-            if (_ounw_181.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
-            const int64_t fn_tparams = _ounw_181.value;
+            int64_t _lgi_203 = fn_node;
+            pact_Option_int _lget_204;
+            if (pact_list_in_bounds(np_type_params, _lgi_203)) {
+                _lget_204.tag = 1; _lget_204.value = (int64_t)(intptr_t)pact_list_get(np_type_params, _lgi_203);
+            } else { _lget_204.tag = 0; }
+            pact_Option_int _ounw_205 = _lget_204;
+            if (_ounw_205.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
+            const int64_t fn_tparams = _ounw_205.value;
             if (((fn_tparams != (-1)) && (pact_parser_sublist_length(fn_tparams) > 0))) {
-                pact_codegen_types_GenericFnEntry _s182 = { .name = fn_name, .node = fn_node };
-                pact_codegen_types_GenericFnEntry* _box183 = (pact_codegen_types_GenericFnEntry*)pact_alloc(sizeof(pact_codegen_types_GenericFnEntry));
-                *_box183 = _s182;
-                pact_list_push(generic_fns, (void*)_box183);
+                pact_codegen_types_GenericFnEntry _s206 = { .name = fn_name, .node = fn_node };
+                pact_codegen_types_GenericFnEntry* _box207 = (pact_codegen_types_GenericFnEntry*)pact_alloc(sizeof(pact_codegen_types_GenericFnEntry));
+                *_box207 = _s206;
+                pact_list_push(generic_fns, (void*)_box207);
             } else if ((pact_codegen_types_is_emitted_fn(fn_name) == 0)) {
-                int64_t _lgi_184 = fn_node;
-                pact_Option_str _lget_185;
-                if (pact_list_in_bounds(np_return_type, _lgi_184)) {
-                    _lget_185.tag = 1; _lget_185.value = (const char*)pact_list_get(np_return_type, _lgi_184);
-                } else { _lget_185.tag = 0; }
-                pact_Option_str _ounw_186 = _lget_185;
-                if (_ounw_186.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
-                const char* ret_str = _ounw_186.value;
-                int64_t _lgi_187 = fn_node;
-                pact_Option_int _lget_188;
-                if (pact_list_in_bounds(np_effects, _lgi_187)) {
-                    _lget_188.tag = 1; _lget_188.value = (int64_t)(intptr_t)pact_list_get(np_effects, _lgi_187);
-                } else { _lget_188.tag = 0; }
-                pact_Option_int _ounw_189 = _lget_188;
-                if (_ounw_189.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
-                const int64_t fn_eff_sl = _ounw_189.value;
+                int64_t _lgi_208 = fn_node;
+                pact_Option_str _lget_209;
+                if (pact_list_in_bounds(np_return_type, _lgi_208)) {
+                    _lget_209.tag = 1; _lget_209.value = (const char*)pact_list_get(np_return_type, _lgi_208);
+                } else { _lget_209.tag = 0; }
+                pact_Option_str _ounw_210 = _lget_209;
+                if (_ounw_210.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
+                const char* ret_str = _ounw_210.value;
+                int64_t _lgi_211 = fn_node;
+                pact_Option_int _lget_212;
+                if (pact_list_in_bounds(np_effects, _lgi_211)) {
+                    _lget_212.tag = 1; _lget_212.value = (int64_t)(intptr_t)pact_list_get(np_effects, _lgi_211);
+                } else { _lget_212.tag = 0; }
+                pact_Option_int _ounw_213 = _lget_212;
+                if (_ounw_213.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
+                const int64_t fn_eff_sl = _ounw_213.value;
                 if ((pact_codegen_types_is_enum_type(ret_str) != 0)) {
-                    pact_codegen_types_FnEnumRetEntry _s190 = { .name = fn_name, .enum_type = ret_str };
-                    pact_codegen_types_FnEnumRetEntry* _box191 = (pact_codegen_types_FnEnumRetEntry*)pact_alloc(sizeof(pact_codegen_types_FnEnumRetEntry));
-                    *_box191 = _s190;
-                    pact_list_push(fn_enum_rets, (void*)_box191);
+                    pact_codegen_types_FnEnumRetEntry _s214 = { .name = fn_name, .enum_type = ret_str };
+                    pact_codegen_types_FnEnumRetEntry* _box215 = (pact_codegen_types_FnEnumRetEntry*)pact_alloc(sizeof(pact_codegen_types_FnEnumRetEntry));
+                    *_box215 = _s214;
+                    pact_list_push(fn_enum_rets, (void*)_box215);
                     pact_codegen_types_reg_fn_with_effects(fn_name, CT_INT, fn_eff_sl);
                 } else {
                     pact_codegen_types_reg_fn_with_effects(fn_name, pact_codegen_types_type_from_name(ret_str), fn_eff_sl);
@@ -31802,196 +31975,196 @@ const char* pact_codegen_generate(int64_t program) {
             i = (i + 1);
         }
     }
-    int64_t _lgi_192 = program;
-    pact_Option_int _lget_193;
-    if (pact_list_in_bounds(np_arms, _lgi_192)) {
-        _lget_193.tag = 1; _lget_193.value = (int64_t)(intptr_t)pact_list_get(np_arms, _lgi_192);
-    } else { _lget_193.tag = 0; }
-    pact_Option_int _ounw_194 = _lget_193;
-    if (_ounw_194.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
-    const int64_t traits_sl = _ounw_194.value;
+    int64_t _lgi_216 = program;
+    pact_Option_int _lget_217;
+    if (pact_list_in_bounds(np_arms, _lgi_216)) {
+        _lget_217.tag = 1; _lget_217.value = (int64_t)(intptr_t)pact_list_get(np_arms, _lgi_216);
+    } else { _lget_217.tag = 0; }
+    pact_Option_int _ounw_218 = _lget_217;
+    if (_ounw_218.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
+    const int64_t traits_sl = _ounw_218.value;
     if ((traits_sl != (-1))) {
         int64_t i = 0;
         while ((i < pact_parser_sublist_length(traits_sl))) {
             const int64_t tr = pact_parser_sublist_get(traits_sl, i);
-            int64_t _lgi_196 = tr;
-            pact_Option_str _lget_197;
-            if (pact_list_in_bounds(np_name, _lgi_196)) {
-                _lget_197.tag = 1; _lget_197.value = (const char*)pact_list_get(np_name, _lgi_196);
-            } else { _lget_197.tag = 0; }
-            pact_Option_str _ounw_198 = _lget_197;
-            if (_ounw_198.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
-            int64_t _lgi_199 = tr;
-            pact_Option_int _lget_200;
-            if (pact_list_in_bounds(np_methods, _lgi_199)) {
-                _lget_200.tag = 1; _lget_200.value = (int64_t)(intptr_t)pact_list_get(np_methods, _lgi_199);
-            } else { _lget_200.tag = 0; }
-            pact_Option_int _ounw_201 = _lget_200;
-            if (_ounw_201.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
-            pact_codegen_types_TraitEntry _s195 = { .name = _ounw_198.value, .method_sl = _ounw_201.value };
-            pact_codegen_types_TraitEntry* _box202 = (pact_codegen_types_TraitEntry*)pact_alloc(sizeof(pact_codegen_types_TraitEntry));
-            *_box202 = _s195;
-            pact_list_push(trait_entries, (void*)_box202);
+            int64_t _lgi_220 = tr;
+            pact_Option_str _lget_221;
+            if (pact_list_in_bounds(np_name, _lgi_220)) {
+                _lget_221.tag = 1; _lget_221.value = (const char*)pact_list_get(np_name, _lgi_220);
+            } else { _lget_221.tag = 0; }
+            pact_Option_str _ounw_222 = _lget_221;
+            if (_ounw_222.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
+            int64_t _lgi_223 = tr;
+            pact_Option_int _lget_224;
+            if (pact_list_in_bounds(np_methods, _lgi_223)) {
+                _lget_224.tag = 1; _lget_224.value = (int64_t)(intptr_t)pact_list_get(np_methods, _lgi_223);
+            } else { _lget_224.tag = 0; }
+            pact_Option_int _ounw_225 = _lget_224;
+            if (_ounw_225.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
+            pact_codegen_types_TraitEntry _s219 = { .name = _ounw_222.value, .method_sl = _ounw_225.value };
+            pact_codegen_types_TraitEntry* _box226 = (pact_codegen_types_TraitEntry*)pact_alloc(sizeof(pact_codegen_types_TraitEntry));
+            *_box226 = _s219;
+            pact_list_push(trait_entries, (void*)_box226);
             i = (i + 1);
         }
     }
-    int64_t _lgi_203 = program;
-    pact_Option_int _lget_204;
-    if (pact_list_in_bounds(np_methods, _lgi_203)) {
-        _lget_204.tag = 1; _lget_204.value = (int64_t)(intptr_t)pact_list_get(np_methods, _lgi_203);
-    } else { _lget_204.tag = 0; }
-    pact_Option_int _ounw_205 = _lget_204;
-    if (_ounw_205.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
-    const int64_t impls_sl = _ounw_205.value;
+    int64_t _lgi_227 = program;
+    pact_Option_int _lget_228;
+    if (pact_list_in_bounds(np_methods, _lgi_227)) {
+        _lget_228.tag = 1; _lget_228.value = (int64_t)(intptr_t)pact_list_get(np_methods, _lgi_227);
+    } else { _lget_228.tag = 0; }
+    pact_Option_int _ounw_229 = _lget_228;
+    if (_ounw_229.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
+    const int64_t impls_sl = _ounw_229.value;
     if ((impls_sl != (-1))) {
         int64_t i = 0;
         while ((i < pact_parser_sublist_length(impls_sl))) {
             const int64_t im = pact_parser_sublist_get(impls_sl, i);
-            int64_t _lgi_206 = im;
-            pact_Option_str _lget_207;
-            if (pact_list_in_bounds(np_trait_name, _lgi_206)) {
-                _lget_207.tag = 1; _lget_207.value = (const char*)pact_list_get(np_trait_name, _lgi_206);
-            } else { _lget_207.tag = 0; }
-            pact_Option_str _ounw_208 = _lget_207;
-            if (_ounw_208.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
-            const char* impl_trait = _ounw_208.value;
-            int64_t _lgi_209 = im;
-            pact_Option_str _lget_210;
-            if (pact_list_in_bounds(np_name, _lgi_209)) {
-                _lget_210.tag = 1; _lget_210.value = (const char*)pact_list_get(np_name, _lgi_209);
-            } else { _lget_210.tag = 0; }
-            pact_Option_str _ounw_211 = _lget_210;
-            if (_ounw_211.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
-            const char* impl_type = _ounw_211.value;
-            int64_t _lgi_213 = im;
-            pact_Option_int _lget_214;
-            if (pact_list_in_bounds(np_methods, _lgi_213)) {
-                _lget_214.tag = 1; _lget_214.value = (int64_t)(intptr_t)pact_list_get(np_methods, _lgi_213);
-            } else { _lget_214.tag = 0; }
-            pact_Option_int _ounw_215 = _lget_214;
-            if (_ounw_215.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
-            pact_codegen_types_ImplEntry _s212 = { .trait_name = impl_trait, .type_name = impl_type, .methods_sl = _ounw_215.value };
-            pact_codegen_types_ImplEntry* _box216 = (pact_codegen_types_ImplEntry*)pact_alloc(sizeof(pact_codegen_types_ImplEntry));
-            *_box216 = _s212;
-            pact_list_push(impl_entries, (void*)_box216);
-            int64_t _lgi_217 = im;
-            pact_Option_str _lget_218;
-            if (pact_list_in_bounds(np_module, _lgi_217)) {
-                _lget_218.tag = 1; _lget_218.value = (const char*)pact_list_get(np_module, _lgi_217);
-            } else { _lget_218.tag = 0; }
-            pact_Option_str _ounw_219 = _lget_218;
-            if (_ounw_219.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
-            const char* impl_mod = _ounw_219.value;
+            int64_t _lgi_230 = im;
+            pact_Option_str _lget_231;
+            if (pact_list_in_bounds(np_trait_name, _lgi_230)) {
+                _lget_231.tag = 1; _lget_231.value = (const char*)pact_list_get(np_trait_name, _lgi_230);
+            } else { _lget_231.tag = 0; }
+            pact_Option_str _ounw_232 = _lget_231;
+            if (_ounw_232.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
+            const char* impl_trait = _ounw_232.value;
+            int64_t _lgi_233 = im;
+            pact_Option_str _lget_234;
+            if (pact_list_in_bounds(np_name, _lgi_233)) {
+                _lget_234.tag = 1; _lget_234.value = (const char*)pact_list_get(np_name, _lgi_233);
+            } else { _lget_234.tag = 0; }
+            pact_Option_str _ounw_235 = _lget_234;
+            if (_ounw_235.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
+            const char* impl_type = _ounw_235.value;
+            int64_t _lgi_237 = im;
+            pact_Option_int _lget_238;
+            if (pact_list_in_bounds(np_methods, _lgi_237)) {
+                _lget_238.tag = 1; _lget_238.value = (int64_t)(intptr_t)pact_list_get(np_methods, _lgi_237);
+            } else { _lget_238.tag = 0; }
+            pact_Option_int _ounw_239 = _lget_238;
+            if (_ounw_239.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
+            pact_codegen_types_ImplEntry _s236 = { .trait_name = impl_trait, .type_name = impl_type, .methods_sl = _ounw_239.value };
+            pact_codegen_types_ImplEntry* _box240 = (pact_codegen_types_ImplEntry*)pact_alloc(sizeof(pact_codegen_types_ImplEntry));
+            *_box240 = _s236;
+            pact_list_push(impl_entries, (void*)_box240);
+            int64_t _lgi_241 = im;
+            pact_Option_str _lget_242;
+            if (pact_list_in_bounds(np_module, _lgi_241)) {
+                _lget_242.tag = 1; _lget_242.value = (const char*)pact_list_get(np_module, _lgi_241);
+            } else { _lget_242.tag = 0; }
+            pact_Option_str _ounw_243 = _lget_242;
+            if (_ounw_243.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
+            const char* impl_mod = _ounw_243.value;
             if (((!pact_str_eq(impl_mod, "")) && (pact_map_has(mod_type_prefix, impl_type) == 0))) {
                 pact_map_set(mod_type_prefix, impl_type, (void*)impl_mod);
             }
             if (pact_str_eq(impl_trait, "From")) {
-                int64_t _lgi_220 = im;
-                pact_Option_int _lget_221;
-                if (pact_list_in_bounds(np_type_params, _lgi_220)) {
-                    _lget_221.tag = 1; _lget_221.value = (int64_t)(intptr_t)pact_list_get(np_type_params, _lgi_220);
-                } else { _lget_221.tag = 0; }
-                pact_Option_int _ounw_222 = _lget_221;
-                if (_ounw_222.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
-                const int64_t trait_tparams = _ounw_222.value;
+                int64_t _lgi_244 = im;
+                pact_Option_int _lget_245;
+                if (pact_list_in_bounds(np_type_params, _lgi_244)) {
+                    _lget_245.tag = 1; _lget_245.value = (int64_t)(intptr_t)pact_list_get(np_type_params, _lgi_244);
+                } else { _lget_245.tag = 0; }
+                pact_Option_int _ounw_246 = _lget_245;
+                if (_ounw_246.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
+                const int64_t trait_tparams = _ounw_246.value;
                 if (((trait_tparams != (-1)) && (pact_parser_sublist_length(trait_tparams) > 0))) {
                     const int64_t src_node = pact_parser_sublist_get(trait_tparams, 0);
-                    int64_t _lgi_223 = src_node;
-                    pact_Option_str _lget_224;
-                    if (pact_list_in_bounds(np_name, _lgi_223)) {
-                        _lget_224.tag = 1; _lget_224.value = (const char*)pact_list_get(np_name, _lgi_223);
-                    } else { _lget_224.tag = 0; }
-                    pact_Option_str _ounw_225 = _lget_224;
-                    if (_ounw_225.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
-                    const char* src_type = _ounw_225.value;
-                    int64_t _lgi_227 = im;
-                    pact_Option_int _lget_228;
-                    if (pact_list_in_bounds(np_methods, _lgi_227)) {
-                        _lget_228.tag = 1; _lget_228.value = (int64_t)(intptr_t)pact_list_get(np_methods, _lgi_227);
-                    } else { _lget_228.tag = 0; }
-                    pact_Option_int _ounw_229 = _lget_228;
-                    if (_ounw_229.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
-                    pact_codegen_types_FromImplEntry _s226 = { .source = src_type, .target = impl_type, .method_sl = _ounw_229.value };
-                    pact_codegen_types_FromImplEntry* _box230 = (pact_codegen_types_FromImplEntry*)pact_alloc(sizeof(pact_codegen_types_FromImplEntry));
-                    *_box230 = _s226;
-                    pact_list_push(from_entries, (void*)_box230);
+                    int64_t _lgi_247 = src_node;
+                    pact_Option_str _lget_248;
+                    if (pact_list_in_bounds(np_name, _lgi_247)) {
+                        _lget_248.tag = 1; _lget_248.value = (const char*)pact_list_get(np_name, _lgi_247);
+                    } else { _lget_248.tag = 0; }
+                    pact_Option_str _ounw_249 = _lget_248;
+                    if (_ounw_249.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
+                    const char* src_type = _ounw_249.value;
+                    int64_t _lgi_251 = im;
+                    pact_Option_int _lget_252;
+                    if (pact_list_in_bounds(np_methods, _lgi_251)) {
+                        _lget_252.tag = 1; _lget_252.value = (int64_t)(intptr_t)pact_list_get(np_methods, _lgi_251);
+                    } else { _lget_252.tag = 0; }
+                    pact_Option_int _ounw_253 = _lget_252;
+                    if (_ounw_253.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
+                    pact_codegen_types_FromImplEntry _s250 = { .source = src_type, .target = impl_type, .method_sl = _ounw_253.value };
+                    pact_codegen_types_FromImplEntry* _box254 = (pact_codegen_types_FromImplEntry*)pact_alloc(sizeof(pact_codegen_types_FromImplEntry));
+                    *_box254 = _s250;
+                    pact_list_push(from_entries, (void*)_box254);
                 }
             }
             if (pact_str_eq(impl_trait, "TryFrom")) {
-                int64_t _lgi_231 = im;
-                pact_Option_int _lget_232;
-                if (pact_list_in_bounds(np_type_params, _lgi_231)) {
-                    _lget_232.tag = 1; _lget_232.value = (int64_t)(intptr_t)pact_list_get(np_type_params, _lgi_231);
-                } else { _lget_232.tag = 0; }
-                pact_Option_int _ounw_233 = _lget_232;
-                if (_ounw_233.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
-                const int64_t trait_tparams = _ounw_233.value;
+                int64_t _lgi_255 = im;
+                pact_Option_int _lget_256;
+                if (pact_list_in_bounds(np_type_params, _lgi_255)) {
+                    _lget_256.tag = 1; _lget_256.value = (int64_t)(intptr_t)pact_list_get(np_type_params, _lgi_255);
+                } else { _lget_256.tag = 0; }
+                pact_Option_int _ounw_257 = _lget_256;
+                if (_ounw_257.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
+                const int64_t trait_tparams = _ounw_257.value;
                 if (((trait_tparams != (-1)) && (pact_parser_sublist_length(trait_tparams) > 0))) {
                     const int64_t src_node = pact_parser_sublist_get(trait_tparams, 0);
-                    int64_t _lgi_234 = src_node;
-                    pact_Option_str _lget_235;
-                    if (pact_list_in_bounds(np_name, _lgi_234)) {
-                        _lget_235.tag = 1; _lget_235.value = (const char*)pact_list_get(np_name, _lgi_234);
-                    } else { _lget_235.tag = 0; }
-                    pact_Option_str _ounw_236 = _lget_235;
-                    if (_ounw_236.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
-                    const char* src_type = _ounw_236.value;
-                    int64_t _lgi_238 = im;
-                    pact_Option_int _lget_239;
-                    if (pact_list_in_bounds(np_methods, _lgi_238)) {
-                        _lget_239.tag = 1; _lget_239.value = (int64_t)(intptr_t)pact_list_get(np_methods, _lgi_238);
-                    } else { _lget_239.tag = 0; }
-                    pact_Option_int _ounw_240 = _lget_239;
-                    if (_ounw_240.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
-                    pact_codegen_types_TryFromImplEntry _s237 = { .source = src_type, .target = impl_type, .method_sl = _ounw_240.value };
-                    pact_codegen_types_TryFromImplEntry* _box241 = (pact_codegen_types_TryFromImplEntry*)pact_alloc(sizeof(pact_codegen_types_TryFromImplEntry));
-                    *_box241 = _s237;
-                    pact_list_push(tryfrom_entries, (void*)_box241);
+                    int64_t _lgi_258 = src_node;
+                    pact_Option_str _lget_259;
+                    if (pact_list_in_bounds(np_name, _lgi_258)) {
+                        _lget_259.tag = 1; _lget_259.value = (const char*)pact_list_get(np_name, _lgi_258);
+                    } else { _lget_259.tag = 0; }
+                    pact_Option_str _ounw_260 = _lget_259;
+                    if (_ounw_260.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
+                    const char* src_type = _ounw_260.value;
+                    int64_t _lgi_262 = im;
+                    pact_Option_int _lget_263;
+                    if (pact_list_in_bounds(np_methods, _lgi_262)) {
+                        _lget_263.tag = 1; _lget_263.value = (int64_t)(intptr_t)pact_list_get(np_methods, _lgi_262);
+                    } else { _lget_263.tag = 0; }
+                    pact_Option_int _ounw_264 = _lget_263;
+                    if (_ounw_264.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
+                    pact_codegen_types_TryFromImplEntry _s261 = { .source = src_type, .target = impl_type, .method_sl = _ounw_264.value };
+                    pact_codegen_types_TryFromImplEntry* _box265 = (pact_codegen_types_TryFromImplEntry*)pact_alloc(sizeof(pact_codegen_types_TryFromImplEntry));
+                    *_box265 = _s261;
+                    pact_list_push(tryfrom_entries, (void*)_box265);
                 }
             }
-            int64_t _lgi_242 = im;
-            pact_Option_int _lget_243;
-            if (pact_list_in_bounds(np_methods, _lgi_242)) {
-                _lget_243.tag = 1; _lget_243.value = (int64_t)(intptr_t)pact_list_get(np_methods, _lgi_242);
-            } else { _lget_243.tag = 0; }
-            pact_Option_int _ounw_244 = _lget_243;
-            if (_ounw_244.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
-            const int64_t methods_sl = _ounw_244.value;
+            int64_t _lgi_266 = im;
+            pact_Option_int _lget_267;
+            if (pact_list_in_bounds(np_methods, _lgi_266)) {
+                _lget_267.tag = 1; _lget_267.value = (int64_t)(intptr_t)pact_list_get(np_methods, _lgi_266);
+            } else { _lget_267.tag = 0; }
+            pact_Option_int _ounw_268 = _lget_267;
+            if (_ounw_268.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
+            const int64_t methods_sl = _ounw_268.value;
             if ((methods_sl != (-1))) {
                 int64_t j = 0;
                 while ((j < pact_parser_sublist_length(methods_sl))) {
                     const int64_t m = pact_parser_sublist_get(methods_sl, j);
-                    int64_t _lgi_245 = m;
-                    pact_Option_str _lget_246;
-                    if (pact_list_in_bounds(np_name, _lgi_245)) {
-                        _lget_246.tag = 1; _lget_246.value = (const char*)pact_list_get(np_name, _lgi_245);
-                    } else { _lget_246.tag = 0; }
-                    pact_Option_str _ounw_247 = _lget_246;
-                    if (_ounw_247.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
-                    const char* mname = _ounw_247.value;
-                    char _si_248[4096];
-                    snprintf(_si_248, 4096, "%s_%s", impl_type, mname);
-                    const char* mangled = strdup(_si_248);
+                    int64_t _lgi_269 = m;
+                    pact_Option_str _lget_270;
+                    if (pact_list_in_bounds(np_name, _lgi_269)) {
+                        _lget_270.tag = 1; _lget_270.value = (const char*)pact_list_get(np_name, _lgi_269);
+                    } else { _lget_270.tag = 0; }
+                    pact_Option_str _ounw_271 = _lget_270;
+                    if (_ounw_271.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
+                    const char* mname = _ounw_271.value;
+                    char _si_272[4096];
+                    snprintf(_si_272, 4096, "%s_%s", impl_type, mname);
+                    const char* mangled = strdup(_si_272);
                     if (pact_map_has(mod_type_prefix, impl_type)) {
                         const char* m_mod = (const char*)pact_map_get(mod_type_prefix, impl_type);
                         if ((!pact_str_eq(m_mod, ""))) {
                             pact_map_set(mod_fn_prefix, mangled, (void*)m_mod);
                         }
                     }
-                    int64_t _lgi_249 = m;
-                    pact_Option_str _lget_250;
-                    if (pact_list_in_bounds(np_return_type, _lgi_249)) {
-                        _lget_250.tag = 1; _lget_250.value = (const char*)pact_list_get(np_return_type, _lgi_249);
-                    } else { _lget_250.tag = 0; }
-                    pact_Option_str _ounw_251 = _lget_250;
-                    if (_ounw_251.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
-                    const char* ret_str_raw = _ounw_251.value;
+                    int64_t _lgi_273 = m;
+                    pact_Option_str _lget_274;
+                    if (pact_list_in_bounds(np_return_type, _lgi_273)) {
+                        _lget_274.tag = 1; _lget_274.value = (const char*)pact_list_get(np_return_type, _lgi_273);
+                    } else { _lget_274.tag = 0; }
+                    pact_Option_str _ounw_275 = _lget_274;
+                    if (_ounw_275.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
+                    const char* ret_str_raw = _ounw_275.value;
                     const char* ret_str = pact_codegen_types_resolve_self_type(ret_str_raw, impl_type);
                     if ((pact_codegen_types_is_enum_type(ret_str) != 0)) {
-                        pact_codegen_types_FnEnumRetEntry _s252 = { .name = mangled, .enum_type = ret_str };
-                        pact_codegen_types_FnEnumRetEntry* _box253 = (pact_codegen_types_FnEnumRetEntry*)pact_alloc(sizeof(pact_codegen_types_FnEnumRetEntry));
-                        *_box253 = _s252;
-                        pact_list_push(fn_enum_rets, (void*)_box253);
+                        pact_codegen_types_FnEnumRetEntry _s276 = { .name = mangled, .enum_type = ret_str };
+                        pact_codegen_types_FnEnumRetEntry* _box277 = (pact_codegen_types_FnEnumRetEntry*)pact_alloc(sizeof(pact_codegen_types_FnEnumRetEntry));
+                        *_box277 = _s276;
+                        pact_list_push(fn_enum_rets, (void*)_box277);
                         pact_codegen_types_reg_fn(mangled, CT_INT);
                     } else if ((pact_codegen_types_is_struct_type(ret_str) != 0)) {
                         pact_codegen_types_reg_fn(mangled, CT_VOID);
@@ -32009,19 +32182,19 @@ const char* pact_codegen_generate(int64_t program) {
     pact_codegen_derive_register_derive_annotations(types_sl);
     int64_t into_i = 0;
     while ((into_i < pact_list_len(from_entries))) {
-        int64_t _lgi_254 = into_i;
-        pact_Option_FromImplEntry _lget_255;
-        if (pact_list_in_bounds(from_entries, _lgi_254)) {
-            _lget_255.tag = 1; _lget_255.value = *(pact_codegen_types_FromImplEntry*)pact_list_get(from_entries, _lgi_254);
-        } else { _lget_255.tag = 0; }
-        pact_Option_FromImplEntry _ounw_256 = _lget_255;
-        if (_ounw_256.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
-        pact_codegen_types_FromImplEntry _ounv_257 = _ounw_256.value;
-        const pact_codegen_types_FromImplEntry fe = _ounv_257;
-        pact_codegen_types_ImplEntry _s258 = { .trait_name = "Into", .type_name = fe.source, .methods_sl = fe.method_sl };
-        pact_codegen_types_ImplEntry* _box259 = (pact_codegen_types_ImplEntry*)pact_alloc(sizeof(pact_codegen_types_ImplEntry));
-        *_box259 = _s258;
-        pact_list_push(impl_entries, (void*)_box259);
+        int64_t _lgi_278 = into_i;
+        pact_Option_FromImplEntry _lget_279;
+        if (pact_list_in_bounds(from_entries, _lgi_278)) {
+            _lget_279.tag = 1; _lget_279.value = *(pact_codegen_types_FromImplEntry*)pact_list_get(from_entries, _lgi_278);
+        } else { _lget_279.tag = 0; }
+        pact_Option_FromImplEntry _ounw_280 = _lget_279;
+        if (_ounw_280.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
+        pact_codegen_types_FromImplEntry _ounv_281 = _ounw_280.value;
+        const pact_codegen_types_FromImplEntry fe = _ounv_281;
+        pact_codegen_types_ImplEntry _s282 = { .trait_name = "Into", .type_name = fe.source, .methods_sl = fe.method_sl };
+        pact_codegen_types_ImplEntry* _box283 = (pact_codegen_types_ImplEntry*)pact_alloc(sizeof(pact_codegen_types_ImplEntry));
+        *_box283 = _s282;
+        pact_list_push(impl_entries, (void*)_box283);
         into_i = (into_i + 1);
     }
     pact_codegen_types_emit_all_option_result_types();
@@ -32029,21 +32202,21 @@ const char* pact_codegen_generate(int64_t program) {
     const int64_t early_result_count = pact_list_len(emitted_result_types);
     const int64_t early_s_option_count = pact_list_len(emitted_struct_option_types);
     const int64_t early_s_result_count = pact_list_len(emitted_struct_result_types);
-    pact_list* _l260 = pact_list_new();
-    emitted_fn_names = _l260;
+    pact_list* _l284 = pact_list_new();
+    emitted_fn_names = _l284;
     emitted_fn_set = pact_map_new();
     if ((fns_sl != (-1))) {
         int64_t i = 0;
         while ((i < pact_parser_sublist_length(fns_sl))) {
             const int64_t fn_node = pact_parser_sublist_get(fns_sl, i);
-            int64_t _lgi_261 = fn_node;
-            pact_Option_str _lget_262;
-            if (pact_list_in_bounds(np_name, _lgi_261)) {
-                _lget_262.tag = 1; _lget_262.value = (const char*)pact_list_get(np_name, _lgi_261);
-            } else { _lget_262.tag = 0; }
-            pact_Option_str _ounw_263 = _lget_262;
-            if (_ounw_263.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
-            const char* fn_name = _ounw_263.value;
+            int64_t _lgi_285 = fn_node;
+            pact_Option_str _lget_286;
+            if (pact_list_in_bounds(np_name, _lgi_285)) {
+                _lget_286.tag = 1; _lget_286.value = (const char*)pact_list_get(np_name, _lgi_285);
+            } else { _lget_286.tag = 0; }
+            pact_Option_str _ounw_287 = _lget_286;
+            if (_ounw_287.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
+            const char* fn_name = _ounw_287.value;
             if (((pact_codegen_types_is_emitted_fn(fn_name) == 0) && (pact_codegen_types_is_generic_fn(fn_name) == 0))) {
                 pact_codegen_stmt_emit_fn_decl(fn_node);
                 pact_list_push(emitted_fn_names, (void*)fn_name);
@@ -32056,68 +32229,68 @@ const char* pact_codegen_generate(int64_t program) {
         int64_t i = 0;
         while ((i < pact_parser_sublist_length(impls_sl))) {
             const int64_t im = pact_parser_sublist_get(impls_sl, i);
-            int64_t _lgi_264 = im;
-            pact_Option_str _lget_265;
-            if (pact_list_in_bounds(np_name, _lgi_264)) {
-                _lget_265.tag = 1; _lget_265.value = (const char*)pact_list_get(np_name, _lgi_264);
-            } else { _lget_265.tag = 0; }
-            pact_Option_str _ounw_266 = _lget_265;
-            if (_ounw_266.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
-            const char* impl_type = _ounw_266.value;
-            int64_t _lgi_267 = im;
-            pact_Option_int _lget_268;
-            if (pact_list_in_bounds(np_methods, _lgi_267)) {
-                _lget_268.tag = 1; _lget_268.value = (int64_t)(intptr_t)pact_list_get(np_methods, _lgi_267);
-            } else { _lget_268.tag = 0; }
-            pact_Option_int _ounw_269 = _lget_268;
-            if (_ounw_269.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
-            const int64_t methods_sl = _ounw_269.value;
+            int64_t _lgi_288 = im;
+            pact_Option_str _lget_289;
+            if (pact_list_in_bounds(np_name, _lgi_288)) {
+                _lget_289.tag = 1; _lget_289.value = (const char*)pact_list_get(np_name, _lgi_288);
+            } else { _lget_289.tag = 0; }
+            pact_Option_str _ounw_290 = _lget_289;
+            if (_ounw_290.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
+            const char* impl_type = _ounw_290.value;
+            int64_t _lgi_291 = im;
+            pact_Option_int _lget_292;
+            if (pact_list_in_bounds(np_methods, _lgi_291)) {
+                _lget_292.tag = 1; _lget_292.value = (int64_t)(intptr_t)pact_list_get(np_methods, _lgi_291);
+            } else { _lget_292.tag = 0; }
+            pact_Option_int _ounw_293 = _lget_292;
+            if (_ounw_293.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
+            const int64_t methods_sl = _ounw_293.value;
             if ((methods_sl != (-1))) {
                 int64_t j = 0;
                 while ((j < pact_parser_sublist_length(methods_sl))) {
                     const int64_t m = pact_parser_sublist_get(methods_sl, j);
-                    int64_t _lgi_270 = m;
-                    pact_Option_str _lget_271;
-                    if (pact_list_in_bounds(np_name, _lgi_270)) {
-                        _lget_271.tag = 1; _lget_271.value = (const char*)pact_list_get(np_name, _lgi_270);
-                    } else { _lget_271.tag = 0; }
-                    pact_Option_str _ounw_272 = _lget_271;
-                    if (_ounw_272.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
-                    const char* mname = _ounw_272.value;
-                    char _si_273[4096];
-                    snprintf(_si_273, 4096, "%s_%s", impl_type, mname);
-                    const char* mangled = strdup(_si_273);
+                    int64_t _lgi_294 = m;
+                    pact_Option_str _lget_295;
+                    if (pact_list_in_bounds(np_name, _lgi_294)) {
+                        _lget_295.tag = 1; _lget_295.value = (const char*)pact_list_get(np_name, _lgi_294);
+                    } else { _lget_295.tag = 0; }
+                    pact_Option_str _ounw_296 = _lget_295;
+                    if (_ounw_296.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
+                    const char* mname = _ounw_296.value;
+                    char _si_297[4096];
+                    snprintf(_si_297, 4096, "%s_%s", impl_type, mname);
+                    const char* mangled = strdup(_si_297);
                     const char* params = pact_codegen_stmt_format_impl_params(m, impl_type);
                     const char* enum_ret = pact_codegen_types_get_fn_enum_ret(mangled);
                     if ((!pact_str_eq(enum_ret, ""))) {
-                        char _si_274[4096];
-                        snprintf(_si_274, 4096, "%s %s(%s);", pact_codegen_types_c_type_c_name(enum_ret), pact_codegen_types_c_fn_name(mangled), params);
-                        pact_codegen_types_emit_line(strdup(_si_274));
+                        char _si_298[4096];
+                        snprintf(_si_298, 4096, "%s %s(%s);", pact_codegen_types_c_type_c_name(enum_ret), pact_codegen_types_c_fn_name(mangled), params);
+                        pact_codegen_types_emit_line(strdup(_si_298));
                     } else {
-                        int64_t _lgi_275 = m;
-                        pact_Option_str _lget_276;
-                        if (pact_list_in_bounds(np_return_type, _lgi_275)) {
-                            _lget_276.tag = 1; _lget_276.value = (const char*)pact_list_get(np_return_type, _lgi_275);
-                        } else { _lget_276.tag = 0; }
-                        pact_Option_str _ounw_277 = _lget_276;
-                        if (_ounw_277.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
-                        const char* ret_str_raw = _ounw_277.value;
+                        int64_t _lgi_299 = m;
+                        pact_Option_str _lget_300;
+                        if (pact_list_in_bounds(np_return_type, _lgi_299)) {
+                            _lget_300.tag = 1; _lget_300.value = (const char*)pact_list_get(np_return_type, _lgi_299);
+                        } else { _lget_300.tag = 0; }
+                        pact_Option_str _ounw_301 = _lget_300;
+                        if (_ounw_301.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
+                        const char* ret_str_raw = _ounw_301.value;
                         const char* ret_str = pact_codegen_types_resolve_self_type(ret_str_raw, impl_type);
                         if ((pact_codegen_types_is_struct_type(ret_str) != 0)) {
-                            char _si_278[4096];
-                            snprintf(_si_278, 4096, "%s %s(%s);", pact_codegen_types_c_type_c_name(ret_str), pact_codegen_types_c_fn_name(mangled), params);
-                            pact_codegen_types_emit_line(strdup(_si_278));
+                            char _si_302[4096];
+                            snprintf(_si_302, 4096, "%s %s(%s);", pact_codegen_types_c_type_c_name(ret_str), pact_codegen_types_c_fn_name(mangled), params);
+                            pact_codegen_types_emit_line(strdup(_si_302));
                         } else {
                             const char* resolved = pact_codegen_types_resolve_ret_type_from_ann(m);
                             if ((!pact_str_eq(resolved, ""))) {
-                                char _si_279[4096];
-                                snprintf(_si_279, 4096, "%s %s(%s);", resolved, pact_codegen_types_c_fn_name(mangled), params);
-                                pact_codegen_types_emit_line(strdup(_si_279));
+                                char _si_303[4096];
+                                snprintf(_si_303, 4096, "%s %s(%s);", resolved, pact_codegen_types_c_fn_name(mangled), params);
+                                pact_codegen_types_emit_line(strdup(_si_303));
                             } else {
                                 const int64_t ret_type = pact_codegen_types_type_from_name(ret_str);
-                                char _si_280[4096];
-                                snprintf(_si_280, 4096, "%s %s(%s);", pact_codegen_types_c_type_str(ret_type), pact_codegen_types_c_fn_name(mangled), params);
-                                pact_codegen_types_emit_line(strdup(_si_280));
+                                char _si_304[4096];
+                                snprintf(_si_304, 4096, "%s %s(%s);", pact_codegen_types_c_type_str(ret_type), pact_codegen_types_c_fn_name(mangled), params);
+                                pact_codegen_types_emit_line(strdup(_si_304));
                             }
                         }
                     }
@@ -32130,23 +32303,23 @@ const char* pact_codegen_generate(int64_t program) {
     pact_codegen_derive_emit_derive_forward_decls();
     pact_codegen_types_emit_line("");
     pact_list* pre_fn_lines = cg_lines;
-    pact_list* _l281 = pact_list_new();
-    cg_lines = _l281;
-    pact_list* _l282 = pact_list_new();
-    emitted_fn_names = _l282;
+    pact_list* _l305 = pact_list_new();
+    cg_lines = _l305;
+    pact_list* _l306 = pact_list_new();
+    emitted_fn_names = _l306;
     emitted_fn_set = pact_map_new();
     if ((fns_sl != (-1))) {
         int64_t i = 0;
         while ((i < pact_parser_sublist_length(fns_sl))) {
             const int64_t fn_node = pact_parser_sublist_get(fns_sl, i);
-            int64_t _lgi_283 = fn_node;
-            pact_Option_str _lget_284;
-            if (pact_list_in_bounds(np_name, _lgi_283)) {
-                _lget_284.tag = 1; _lget_284.value = (const char*)pact_list_get(np_name, _lgi_283);
-            } else { _lget_284.tag = 0; }
-            pact_Option_str _ounw_285 = _lget_284;
-            if (_ounw_285.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
-            const char* fn_name = _ounw_285.value;
+            int64_t _lgi_307 = fn_node;
+            pact_Option_str _lget_308;
+            if (pact_list_in_bounds(np_name, _lgi_307)) {
+                _lget_308.tag = 1; _lget_308.value = (const char*)pact_list_get(np_name, _lgi_307);
+            } else { _lget_308.tag = 0; }
+            pact_Option_str _ounw_309 = _lget_308;
+            if (_ounw_309.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
+            const char* fn_name = _ounw_309.value;
             if (((pact_codegen_types_is_emitted_fn(fn_name) == 0) && (pact_codegen_types_is_generic_fn(fn_name) == 0))) {
                 pact_codegen_stmt_emit_fn_def(fn_node);
                 pact_codegen_types_emit_line("");
@@ -32160,22 +32333,22 @@ const char* pact_codegen_generate(int64_t program) {
         int64_t i = 0;
         while ((i < pact_parser_sublist_length(impls_sl))) {
             const int64_t im = pact_parser_sublist_get(impls_sl, i);
-            int64_t _lgi_286 = im;
-            pact_Option_str _lget_287;
-            if (pact_list_in_bounds(np_name, _lgi_286)) {
-                _lget_287.tag = 1; _lget_287.value = (const char*)pact_list_get(np_name, _lgi_286);
-            } else { _lget_287.tag = 0; }
-            pact_Option_str _ounw_288 = _lget_287;
-            if (_ounw_288.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
-            const char* impl_type = _ounw_288.value;
-            int64_t _lgi_289 = im;
-            pact_Option_int _lget_290;
-            if (pact_list_in_bounds(np_methods, _lgi_289)) {
-                _lget_290.tag = 1; _lget_290.value = (int64_t)(intptr_t)pact_list_get(np_methods, _lgi_289);
-            } else { _lget_290.tag = 0; }
-            pact_Option_int _ounw_291 = _lget_290;
-            if (_ounw_291.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
-            const int64_t methods_sl = _ounw_291.value;
+            int64_t _lgi_310 = im;
+            pact_Option_str _lget_311;
+            if (pact_list_in_bounds(np_name, _lgi_310)) {
+                _lget_311.tag = 1; _lget_311.value = (const char*)pact_list_get(np_name, _lgi_310);
+            } else { _lget_311.tag = 0; }
+            pact_Option_str _ounw_312 = _lget_311;
+            if (_ounw_312.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
+            const char* impl_type = _ounw_312.value;
+            int64_t _lgi_313 = im;
+            pact_Option_int _lget_314;
+            if (pact_list_in_bounds(np_methods, _lgi_313)) {
+                _lget_314.tag = 1; _lget_314.value = (int64_t)(intptr_t)pact_list_get(np_methods, _lgi_313);
+            } else { _lget_314.tag = 0; }
+            pact_Option_int _ounw_315 = _lget_314;
+            if (_ounw_315.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
+            const int64_t methods_sl = _ounw_315.value;
             if ((methods_sl != (-1))) {
                 int64_t j = 0;
                 while ((j < pact_parser_sublist_length(methods_sl))) {
@@ -32198,14 +32371,14 @@ const char* pact_codegen_generate(int64_t program) {
     if ((pact_list_len(cg_closure_defs) > 0)) {
         int64_t ci = 0;
         while ((ci < pact_list_len(cg_closure_defs))) {
-            int64_t _lgi_292 = ci;
-            pact_Option_str _lget_293;
-            if (pact_list_in_bounds(cg_closure_defs, _lgi_292)) {
-                _lget_293.tag = 1; _lget_293.value = (const char*)pact_list_get(cg_closure_defs, _lgi_292);
-            } else { _lget_293.tag = 0; }
-            pact_Option_str _ounw_294 = _lget_293;
-            if (_ounw_294.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
-            pact_list_push(cg_lines, (void*)_ounw_294.value);
+            int64_t _lgi_316 = ci;
+            pact_Option_str _lget_317;
+            if (pact_list_in_bounds(cg_closure_defs, _lgi_316)) {
+                _lget_317.tag = 1; _lget_317.value = (const char*)pact_list_get(cg_closure_defs, _lgi_316);
+            } else { _lget_317.tag = 0; }
+            pact_Option_str _ounw_318 = _lget_317;
+            if (_ounw_318.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
+            pact_list_push(cg_lines, (void*)_ounw_318.value);
             ci = (ci + 1);
         }
     }
@@ -32215,34 +32388,34 @@ const char* pact_codegen_generate(int64_t program) {
     }
     int64_t fi = 0;
     while ((fi < pact_list_len(fn_def_lines))) {
-        int64_t _lgi_295 = fi;
-        pact_Option_str _lget_296;
-        if (pact_list_in_bounds(fn_def_lines, _lgi_295)) {
-            _lget_296.tag = 1; _lget_296.value = (const char*)pact_list_get(fn_def_lines, _lgi_295);
-        } else { _lget_296.tag = 0; }
-        pact_Option_str _ounw_297 = _lget_296;
-        if (_ounw_297.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
-        pact_list_push(cg_lines, (void*)_ounw_297.value);
+        int64_t _lgi_319 = fi;
+        pact_Option_str _lget_320;
+        if (pact_list_in_bounds(fn_def_lines, _lgi_319)) {
+            _lget_320.tag = 1; _lget_320.value = (const char*)pact_list_get(fn_def_lines, _lgi_319);
+        } else { _lget_320.tag = 0; }
+        pact_Option_str _ounw_321 = _lget_320;
+        if (_ounw_321.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
+        pact_list_push(cg_lines, (void*)_ounw_321.value);
         fi = (fi + 1);
     }
-    int64_t _lgi_298 = program;
-    pact_Option_int _lget_299;
-    if (pact_list_in_bounds(np_captures, _lgi_298)) {
-        _lget_299.tag = 1; _lget_299.value = (int64_t)(intptr_t)pact_list_get(np_captures, _lgi_298);
-    } else { _lget_299.tag = 0; }
-    pact_Option_int _ounw_300 = _lget_299;
-    if (_ounw_300.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
-    const int64_t tests_sl = _ounw_300.value;
-    pact_list* _l301 = pact_list_new();
-    pact_list* test_names = _l301;
-    pact_list* _l302 = pact_list_new();
-    pact_list* test_c_names = _l302;
-    pact_list* _l303 = pact_list_new();
-    pact_list* test_all_tags = _l303;
-    pact_list* _l304 = pact_list_new();
-    pact_list* test_tag_offsets = _l304;
-    pact_list* _l305 = pact_list_new();
-    pact_list* test_tag_counts = _l305;
+    int64_t _lgi_322 = program;
+    pact_Option_int _lget_323;
+    if (pact_list_in_bounds(np_captures, _lgi_322)) {
+        _lget_323.tag = 1; _lget_323.value = (int64_t)(intptr_t)pact_list_get(np_captures, _lgi_322);
+    } else { _lget_323.tag = 0; }
+    pact_Option_int _ounw_324 = _lget_323;
+    if (_ounw_324.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
+    const int64_t tests_sl = _ounw_324.value;
+    pact_list* _l325 = pact_list_new();
+    pact_list* test_names = _l325;
+    pact_list* _l326 = pact_list_new();
+    pact_list* test_c_names = _l326;
+    pact_list* _l327 = pact_list_new();
+    pact_list* test_all_tags = _l327;
+    pact_list* _l328 = pact_list_new();
+    pact_list* test_tag_offsets = _l328;
+    pact_list* _l329 = pact_list_new();
+    pact_list* test_tag_counts = _l329;
     pact_list* pre_test_lines = cg_lines;
     const int64_t pre_test_closure_count = pact_list_len(cg_closure_defs);
     const int64_t pre_test_mono_td_count = pact_list_len(mono_instances);
@@ -32261,28 +32434,28 @@ const char* pact_codegen_generate(int64_t program) {
     const int64_t pre_test_range_iter = emitted_range_iter;
     const int64_t pre_test_str_iter = emitted_str_iter;
     const int64_t pre_test_async = cg_uses_async;
-    pact_list* _l306 = pact_list_new();
-    cg_lines = _l306;
+    pact_list* _l330 = pact_list_new();
+    cg_lines = _l330;
     if ((tests_sl != (-1))) {
         int64_t ti = 0;
         while ((ti < pact_parser_sublist_length(tests_sl))) {
             const int64_t tb = pact_parser_sublist_get(tests_sl, ti);
-            int64_t _lgi_307 = tb;
-            pact_Option_str _lget_308;
-            if (pact_list_in_bounds(np_name, _lgi_307)) {
-                _lget_308.tag = 1; _lget_308.value = (const char*)pact_list_get(np_name, _lgi_307);
-            } else { _lget_308.tag = 0; }
-            pact_Option_str _ounw_309 = _lget_308;
-            if (_ounw_309.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
-            const char* tname = _ounw_309.value;
-            int64_t _lgi_310 = tb;
-            pact_Option_int _lget_311;
-            if (pact_list_in_bounds(np_body, _lgi_310)) {
-                _lget_311.tag = 1; _lget_311.value = (int64_t)(intptr_t)pact_list_get(np_body, _lgi_310);
-            } else { _lget_311.tag = 0; }
-            pact_Option_int _ounw_312 = _lget_311;
-            if (_ounw_312.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
-            const int64_t tbody = _ounw_312.value;
+            int64_t _lgi_331 = tb;
+            pact_Option_str _lget_332;
+            if (pact_list_in_bounds(np_name, _lgi_331)) {
+                _lget_332.tag = 1; _lget_332.value = (const char*)pact_list_get(np_name, _lgi_331);
+            } else { _lget_332.tag = 0; }
+            pact_Option_str _ounw_333 = _lget_332;
+            if (_ounw_333.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
+            const char* tname = _ounw_333.value;
+            int64_t _lgi_334 = tb;
+            pact_Option_int _lget_335;
+            if (pact_list_in_bounds(np_body, _lgi_334)) {
+                _lget_335.tag = 1; _lget_335.value = (int64_t)(intptr_t)pact_list_get(np_body, _lgi_334);
+            } else { _lget_335.tag = 0; }
+            pact_Option_int _ounw_336 = _lget_335;
+            if (_ounw_336.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
+            const int64_t tbody = _ounw_336.value;
             const char* sanitized = "";
             int64_t si = 0;
             while ((si < pact_str_len(tname))) {
@@ -32304,52 +32477,52 @@ const char* pact_codegen_generate(int64_t program) {
                 }
                 si = (si + 1);
             }
-            char _si_313[4096];
-            snprintf(_si_313, 4096, "pact_test_%s", sanitized);
-            const char* c_name = strdup(_si_313);
+            char _si_337[4096];
+            snprintf(_si_337, 4096, "pact_test_%s", sanitized);
+            const char* c_name = strdup(_si_337);
             pact_list_push(test_names, (void*)tname);
             pact_list_push(test_c_names, (void*)c_name);
             const int64_t tag_offset = pact_list_len(test_all_tags);
-            int64_t _lgi_314 = tb;
-            pact_Option_int _lget_315;
-            if (pact_list_in_bounds(np_handlers, _lgi_314)) {
-                _lget_315.tag = 1; _lget_315.value = (int64_t)(intptr_t)pact_list_get(np_handlers, _lgi_314);
-            } else { _lget_315.tag = 0; }
-            pact_Option_int _ounw_316 = _lget_315;
-            if (_ounw_316.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
-            const int64_t tb_anns = _ounw_316.value;
+            int64_t _lgi_338 = tb;
+            pact_Option_int _lget_339;
+            if (pact_list_in_bounds(np_handlers, _lgi_338)) {
+                _lget_339.tag = 1; _lget_339.value = (int64_t)(intptr_t)pact_list_get(np_handlers, _lgi_338);
+            } else { _lget_339.tag = 0; }
+            pact_Option_int _ounw_340 = _lget_339;
+            if (_ounw_340.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
+            const int64_t tb_anns = _ounw_340.value;
             if ((tb_anns != (-1))) {
                 int64_t tai = 0;
                 while ((tai < pact_parser_sublist_length(tb_anns))) {
                     const int64_t ann = pact_parser_sublist_get(tb_anns, tai);
-                    int64_t _lgi_317 = ann;
-                    pact_Option_str _lget_318;
-                    if (pact_list_in_bounds(np_name, _lgi_317)) {
-                        _lget_318.tag = 1; _lget_318.value = (const char*)pact_list_get(np_name, _lgi_317);
-                    } else { _lget_318.tag = 0; }
-                    pact_Option_str _ounw_319 = _lget_318;
-                    if (_ounw_319.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
-                    if (pact_str_eq(_ounw_319.value, "tags")) {
-                        int64_t _lgi_320 = ann;
-                        pact_Option_int _lget_321;
-                        if (pact_list_in_bounds(np_args, _lgi_320)) {
-                            _lget_321.tag = 1; _lget_321.value = (int64_t)(intptr_t)pact_list_get(np_args, _lgi_320);
-                        } else { _lget_321.tag = 0; }
-                        pact_Option_int _ounw_322 = _lget_321;
-                        if (_ounw_322.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
-                        const int64_t tag_args_sl = _ounw_322.value;
+                    int64_t _lgi_341 = ann;
+                    pact_Option_str _lget_342;
+                    if (pact_list_in_bounds(np_name, _lgi_341)) {
+                        _lget_342.tag = 1; _lget_342.value = (const char*)pact_list_get(np_name, _lgi_341);
+                    } else { _lget_342.tag = 0; }
+                    pact_Option_str _ounw_343 = _lget_342;
+                    if (_ounw_343.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
+                    if (pact_str_eq(_ounw_343.value, "tags")) {
+                        int64_t _lgi_344 = ann;
+                        pact_Option_int _lget_345;
+                        if (pact_list_in_bounds(np_args, _lgi_344)) {
+                            _lget_345.tag = 1; _lget_345.value = (int64_t)(intptr_t)pact_list_get(np_args, _lgi_344);
+                        } else { _lget_345.tag = 0; }
+                        pact_Option_int _ounw_346 = _lget_345;
+                        if (_ounw_346.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
+                        const int64_t tag_args_sl = _ounw_346.value;
                         if ((tag_args_sl != (-1))) {
                             int64_t tgi = 0;
                             while ((tgi < pact_parser_sublist_length(tag_args_sl))) {
                                 const int64_t tag_nd = pact_parser_sublist_get(tag_args_sl, tgi);
-                                int64_t _lgi_323 = tag_nd;
-                                pact_Option_str _lget_324;
-                                if (pact_list_in_bounds(np_name, _lgi_323)) {
-                                    _lget_324.tag = 1; _lget_324.value = (const char*)pact_list_get(np_name, _lgi_323);
-                                } else { _lget_324.tag = 0; }
-                                pact_Option_str _ounw_325 = _lget_324;
-                                if (_ounw_325.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
-                                pact_list_push(test_all_tags, (void*)_ounw_325.value);
+                                int64_t _lgi_347 = tag_nd;
+                                pact_Option_str _lget_348;
+                                if (pact_list_in_bounds(np_name, _lgi_347)) {
+                                    _lget_348.tag = 1; _lget_348.value = (const char*)pact_list_get(np_name, _lgi_347);
+                                } else { _lget_348.tag = 0; }
+                                pact_Option_str _ounw_349 = _lget_348;
+                                if (_ounw_349.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
+                                pact_list_push(test_all_tags, (void*)_ounw_349.value);
                                 tgi = (tgi + 1);
                             }
                         }
@@ -32360,16 +32533,16 @@ const char* pact_codegen_generate(int64_t program) {
             pact_list_push(test_tag_offsets, (void*)(intptr_t)tag_offset);
             pact_list_push(test_tag_counts, (void*)(intptr_t)(pact_list_len(test_all_tags) - tag_offset));
             pact_codegen_types_push_scope();
-            char _si_326[4096];
-            snprintf(_si_326, 4096, "__test_%s", sanitized);
-            cg_current_fn_name = strdup(_si_326);
+            char _si_350[4096];
+            snprintf(_si_350, 4096, "__test_%s", sanitized);
+            cg_current_fn_name = strdup(_si_350);
             cg_current_fn_ret = CT_VOID;
-            pact_list* _l327 = pact_list_new();
-            mut_captured_vars = _l327;
+            pact_list* _l351 = pact_list_new();
+            mut_captured_vars = _l351;
             pact_codegen_closures_prescan_mut_captures(tbody);
-            char _si_328[4096];
-            snprintf(_si_328, 4096, "static void %s(void) {", c_name);
-            pact_codegen_types_emit_line(strdup(_si_328));
+            char _si_352[4096];
+            snprintf(_si_352, 4096, "static void %s(void) {", c_name);
+            pact_codegen_types_emit_line(strdup(_si_352));
             cg_indent = (cg_indent + 1);
             pact_codegen_stmt_emit_block(tbody);
             cg_indent = (cg_indent - 1);
@@ -32394,14 +32567,14 @@ const char* pact_codegen_generate(int64_t program) {
     if ((pact_list_len(cg_closure_defs) > pre_test_closure_count)) {
         int64_t tci = pre_test_closure_count;
         while ((tci < pact_list_len(cg_closure_defs))) {
-            int64_t _lgi_329 = tci;
-            pact_Option_str _lget_330;
-            if (pact_list_in_bounds(cg_closure_defs, _lgi_329)) {
-                _lget_330.tag = 1; _lget_330.value = (const char*)pact_list_get(cg_closure_defs, _lgi_329);
-            } else { _lget_330.tag = 0; }
-            pact_Option_str _ounw_331 = _lget_330;
-            if (_ounw_331.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
-            pact_list_push(cg_lines, (void*)_ounw_331.value);
+            int64_t _lgi_353 = tci;
+            pact_Option_str _lget_354;
+            if (pact_list_in_bounds(cg_closure_defs, _lgi_353)) {
+                _lget_354.tag = 1; _lget_354.value = (const char*)pact_list_get(cg_closure_defs, _lgi_353);
+            } else { _lget_354.tag = 0; }
+            pact_Option_str _ounw_355 = _lget_354;
+            if (_ounw_355.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
+            pact_list_push(cg_lines, (void*)_ounw_355.value);
             tci = (tci + 1);
         }
     }
@@ -32411,61 +32584,61 @@ const char* pact_codegen_generate(int64_t program) {
     }
     int64_t tfi = 0;
     while ((tfi < pact_list_len(test_fn_lines))) {
-        int64_t _lgi_332 = tfi;
-        pact_Option_str _lget_333;
-        if (pact_list_in_bounds(test_fn_lines, _lgi_332)) {
-            _lget_333.tag = 1; _lget_333.value = (const char*)pact_list_get(test_fn_lines, _lgi_332);
-        } else { _lget_333.tag = 0; }
-        pact_Option_str _ounw_334 = _lget_333;
-        if (_ounw_334.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
-        pact_list_push(cg_lines, (void*)_ounw_334.value);
+        int64_t _lgi_356 = tfi;
+        pact_Option_str _lget_357;
+        if (pact_list_in_bounds(test_fn_lines, _lgi_356)) {
+            _lget_357.tag = 1; _lget_357.value = (const char*)pact_list_get(test_fn_lines, _lgi_356);
+        } else { _lget_357.tag = 0; }
+        pact_Option_str _ounw_358 = _lget_357;
+        if (_ounw_358.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
+        pact_list_push(cg_lines, (void*)_ounw_358.value);
         tfi = (tfi + 1);
     }
     const int64_t test_count = pact_list_len(test_names);
     if ((test_count > 0)) {
         int64_t tti = 0;
         while ((tti < test_count)) {
-            int64_t _lgi_335 = tti;
-            pact_Option_int _lget_336;
-            if (pact_list_in_bounds(test_tag_counts, _lgi_335)) {
-                _lget_336.tag = 1; _lget_336.value = (int64_t)(intptr_t)pact_list_get(test_tag_counts, _lgi_335);
-            } else { _lget_336.tag = 0; }
-            pact_Option_int _ounw_337 = _lget_336;
-            if (_ounw_337.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
-            const int64_t tag_count = _ounw_337.value;
+            int64_t _lgi_359 = tti;
+            pact_Option_int _lget_360;
+            if (pact_list_in_bounds(test_tag_counts, _lgi_359)) {
+                _lget_360.tag = 1; _lget_360.value = (int64_t)(intptr_t)pact_list_get(test_tag_counts, _lgi_359);
+            } else { _lget_360.tag = 0; }
+            pact_Option_int _ounw_361 = _lget_360;
+            if (_ounw_361.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
+            const int64_t tag_count = _ounw_361.value;
             if ((tag_count > 0)) {
-                int64_t _lgi_338 = tti;
-                pact_Option_str _lget_339;
-                if (pact_list_in_bounds(test_c_names, _lgi_338)) {
-                    _lget_339.tag = 1; _lget_339.value = (const char*)pact_list_get(test_c_names, _lgi_338);
-                } else { _lget_339.tag = 0; }
-                pact_Option_str _ounw_340 = _lget_339;
-                if (_ounw_340.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
-                const char* tcn = _ounw_340.value;
-                char _si_341[4096];
-                snprintf(_si_341, 4096, "static const char* %s_tags[] = {", tcn);
-                const char* tag_arr = strdup(_si_341);
+                int64_t _lgi_362 = tti;
+                pact_Option_str _lget_363;
+                if (pact_list_in_bounds(test_c_names, _lgi_362)) {
+                    _lget_363.tag = 1; _lget_363.value = (const char*)pact_list_get(test_c_names, _lgi_362);
+                } else { _lget_363.tag = 0; }
+                pact_Option_str _ounw_364 = _lget_363;
+                if (_ounw_364.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
+                const char* tcn = _ounw_364.value;
+                char _si_365[4096];
+                snprintf(_si_365, 4096, "static const char* %s_tags[] = {", tcn);
+                const char* tag_arr = strdup(_si_365);
                 int64_t tgi = 0;
                 while ((tgi < tag_count)) {
                     if ((tgi > 0)) {
                         tag_arr = pact_str_concat(tag_arr, ", ");
                     }
-                    int64_t _lgi_342 = tti;
-                    pact_Option_int _lget_343;
-                    if (pact_list_in_bounds(test_tag_offsets, _lgi_342)) {
-                        _lget_343.tag = 1; _lget_343.value = (int64_t)(intptr_t)pact_list_get(test_tag_offsets, _lgi_342);
-                    } else { _lget_343.tag = 0; }
-                    pact_Option_int _ounw_344 = _lget_343;
-                    if (_ounw_344.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
-                    const int64_t tag_idx = (_ounw_344.value + tgi);
-                    int64_t _lgi_345 = tag_idx;
-                    pact_Option_str _lget_346;
-                    if (pact_list_in_bounds(test_all_tags, _lgi_345)) {
-                        _lget_346.tag = 1; _lget_346.value = (const char*)pact_list_get(test_all_tags, _lgi_345);
-                    } else { _lget_346.tag = 0; }
-                    pact_Option_str _ounw_347 = _lget_346;
-                    if (_ounw_347.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
-                    const char* tag_val = _ounw_347.value;
+                    int64_t _lgi_366 = tti;
+                    pact_Option_int _lget_367;
+                    if (pact_list_in_bounds(test_tag_offsets, _lgi_366)) {
+                        _lget_367.tag = 1; _lget_367.value = (int64_t)(intptr_t)pact_list_get(test_tag_offsets, _lgi_366);
+                    } else { _lget_367.tag = 0; }
+                    pact_Option_int _ounw_368 = _lget_367;
+                    if (_ounw_368.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
+                    const int64_t tag_idx = (_ounw_368.value + tgi);
+                    int64_t _lgi_369 = tag_idx;
+                    pact_Option_str _lget_370;
+                    if (pact_list_in_bounds(test_all_tags, _lgi_369)) {
+                        _lget_370.tag = 1; _lget_370.value = (const char*)pact_list_get(test_all_tags, _lgi_369);
+                    } else { _lget_370.tag = 0; }
+                    pact_Option_str _ounw_371 = _lget_370;
+                    if (_ounw_371.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
+                    const char* tag_val = _ounw_371.value;
                     tag_arr = pact_str_concat(pact_str_concat(pact_str_concat(tag_arr, "\""), tag_val), "\"");
                     tgi = (tgi + 1);
                 }
@@ -32478,45 +32651,45 @@ const char* pact_codegen_generate(int64_t program) {
         cg_indent = (cg_indent + 1);
         int64_t tri = 0;
         while ((tri < test_count)) {
-            int64_t _lgi_348 = tri;
-            pact_Option_str _lget_349;
-            if (pact_list_in_bounds(test_names, _lgi_348)) {
-                _lget_349.tag = 1; _lget_349.value = (const char*)pact_list_get(test_names, _lgi_348);
-            } else { _lget_349.tag = 0; }
-            pact_Option_str _ounw_350 = _lget_349;
-            if (_ounw_350.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
-            const char* tn = _ounw_350.value;
-            int64_t _lgi_351 = tri;
-            pact_Option_str _lget_352;
-            if (pact_list_in_bounds(test_c_names, _lgi_351)) {
-                _lget_352.tag = 1; _lget_352.value = (const char*)pact_list_get(test_c_names, _lgi_351);
-            } else { _lget_352.tag = 0; }
-            pact_Option_str _ounw_353 = _lget_352;
-            if (_ounw_353.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
-            const char* tcn = _ounw_353.value;
-            const char* _if_354;
+            int64_t _lgi_372 = tri;
+            pact_Option_str _lget_373;
+            if (pact_list_in_bounds(test_names, _lgi_372)) {
+                _lget_373.tag = 1; _lget_373.value = (const char*)pact_list_get(test_names, _lgi_372);
+            } else { _lget_373.tag = 0; }
+            pact_Option_str _ounw_374 = _lget_373;
+            if (_ounw_374.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
+            const char* tn = _ounw_374.value;
+            int64_t _lgi_375 = tri;
+            pact_Option_str _lget_376;
+            if (pact_list_in_bounds(test_c_names, _lgi_375)) {
+                _lget_376.tag = 1; _lget_376.value = (const char*)pact_list_get(test_c_names, _lgi_375);
+            } else { _lget_376.tag = 0; }
+            pact_Option_str _ounw_377 = _lget_376;
+            if (_ounw_377.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
+            const char* tcn = _ounw_377.value;
+            const char* _if_378;
             if ((tri < (test_count - 1))) {
-                _if_354 = ",";
+                _if_378 = ",";
             } else {
-                _if_354 = "";
+                _if_378 = "";
             }
-            const char* comma = _if_354;
-            int64_t _lgi_355 = tri;
-            pact_Option_int _lget_356;
-            if (pact_list_in_bounds(test_tag_counts, _lgi_355)) {
-                _lget_356.tag = 1; _lget_356.value = (int64_t)(intptr_t)pact_list_get(test_tag_counts, _lgi_355);
-            } else { _lget_356.tag = 0; }
-            pact_Option_int _ounw_357 = _lget_356;
-            if (_ounw_357.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
-            const int64_t tc = _ounw_357.value;
+            const char* comma = _if_378;
+            int64_t _lgi_379 = tri;
+            pact_Option_int _lget_380;
+            if (pact_list_in_bounds(test_tag_counts, _lgi_379)) {
+                _lget_380.tag = 1; _lget_380.value = (int64_t)(intptr_t)pact_list_get(test_tag_counts, _lgi_379);
+            } else { _lget_380.tag = 0; }
+            pact_Option_int _ounw_381 = _lget_380;
+            if (_ounw_381.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
+            const int64_t tc = _ounw_381.value;
             if ((tc > 0)) {
-                char _si_358[4096];
-                snprintf(_si_358, 4096, "{\"%s\", %s, __FILE__, 0, 0, %s_tags, %lld}%s", tn, tcn, tcn, (long long)tc, comma);
-                pact_codegen_types_emit_line(strdup(_si_358));
+                char _si_382[4096];
+                snprintf(_si_382, 4096, "{\"%s\", %s, __FILE__, 0, 0, %s_tags, %lld}%s", tn, tcn, tcn, (long long)tc, comma);
+                pact_codegen_types_emit_line(strdup(_si_382));
             } else {
-                char _si_359[4096];
-                snprintf(_si_359, 4096, "{\"%s\", %s, __FILE__, 0, 0, NULL, 0}%s", tn, tcn, comma);
-                pact_codegen_types_emit_line(strdup(_si_359));
+                char _si_383[4096];
+                snprintf(_si_383, 4096, "{\"%s\", %s, __FILE__, 0, 0, NULL, 0}%s", tn, tcn, comma);
+                pact_codegen_types_emit_line(strdup(_si_383));
             }
             tri = (tri + 1);
         }
@@ -32525,9 +32698,9 @@ const char* pact_codegen_generate(int64_t program) {
         pact_codegen_types_emit_line("");
         pact_codegen_types_emit_line("static void __pact_run_tests(int argc, const char** argv) {");
         cg_indent = (cg_indent + 1);
-        char _si_360[4096];
-        snprintf(_si_360, 4096, "pact_test_run(__pact_tests, %lld, argc, argv);", (long long)test_count);
-        pact_codegen_types_emit_line(strdup(_si_360));
+        char _si_384[4096];
+        snprintf(_si_384, 4096, "pact_test_run(__pact_tests, %lld, argc, argv);", (long long)test_count);
+        pact_codegen_types_emit_line(strdup(_si_384));
         cg_indent = (cg_indent - 1);
         pact_codegen_types_emit_line("}");
         pact_codegen_types_emit_line("");
@@ -32536,14 +32709,14 @@ const char* pact_codegen_generate(int64_t program) {
         pact_codegen_types_emit_line("static void __pact_init_globals(void) {");
         int64_t gi = 0;
         while ((gi < pact_list_len(cg_global_inits))) {
-            int64_t _lgi_361 = gi;
-            pact_Option_str _lget_362;
-            if (pact_list_in_bounds(cg_global_inits, _lgi_361)) {
-                _lget_362.tag = 1; _lget_362.value = (const char*)pact_list_get(cg_global_inits, _lgi_361);
-            } else { _lget_362.tag = 0; }
-            pact_Option_str _ounw_363 = _lget_362;
-            if (_ounw_363.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
-            pact_list_push(cg_lines, (void*)_ounw_363.value);
+            int64_t _lgi_385 = gi;
+            pact_Option_str _lget_386;
+            if (pact_list_in_bounds(cg_global_inits, _lgi_385)) {
+                _lget_386.tag = 1; _lget_386.value = (const char*)pact_list_get(cg_global_inits, _lgi_385);
+            } else { _lget_386.tag = 0; }
+            pact_Option_str _ounw_387 = _lget_386;
+            if (_ounw_387.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
+            pact_list_push(cg_lines, (void*)_ounw_387.value);
             gi = (gi + 1);
         }
         pact_codegen_types_emit_line("}");
@@ -32590,9 +32763,9 @@ const char* pact_codegen_generate(int64_t program) {
     pact_codegen_types_pop_scope();
     if ((cg_uses_curl != 0)) {
         if ((!pact_str_eq(cg_runtime_header, ""))) {
-            char _si_364[4096];
-            snprintf(_si_364, 4096, "#define PACT_USE_CURL\n%s", cg_runtime_header);
-            pact_list_set(cg_lines, 0, (void*)strdup(_si_364));
+            char _si_388[4096];
+            snprintf(_si_388, 4096, "#define PACT_USE_CURL\n%s", cg_runtime_header);
+            pact_list_set(cg_lines, 0, (void*)strdup(_si_388));
         } else {
             pact_list_set(cg_lines, 0, (void*)"#define PACT_USE_CURL\n#include \"runtime.h\"");
         }
@@ -43658,6 +43831,8 @@ pact_list* _l119 = pact_list_new();
     cg_closure_defs = _l119;
     mod_fn_prefix = pact_map_new();
     mod_type_prefix = pact_map_new();
+    type_alias_base = pact_map_new();
+    type_where_preds = pact_map_new();
     c_reserved_set = pact_map_new();
 pact_list* _l120 = pact_list_new();
     closure_captures = _l120;

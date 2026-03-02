@@ -237,6 +237,7 @@ fn resolve_runtime_header() -> Str {
 }
 
 fn do_build(source_path: Str, output_path: Str, c_path: Str, format_flag: Str, debug_mode: Int) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen {
+    shell_exec("rm -f {output_path}")
     let rc = do_compile(source_path, c_path, format_flag, debug_mode)
     if rc != 0 {
         return rc
@@ -868,7 +869,7 @@ fn main() {
         let rest = args_rest(a)
         process_exec(output_path, rest)
     } else if command == "test" {
-        if source_path != "" {
+        if source_path != "" && is_dir(source_path) == 0 {
             let rc = do_build(source_path, output_path, c_path, format_flag, 1)
             if rc != 0 {
                 exit(1)
@@ -887,8 +888,12 @@ fn main() {
             exit(test_rc)
         }
 
+        let mut test_dir = "."
+        if source_path != "" {
+            test_dir = source_path
+        }
         let mut test_files: List[Str] = []
-        collect_test_files(".", test_files)
+        collect_test_files(test_dir, test_files)
         let file_count = test_files.len()
 
         if file_count == 0 {

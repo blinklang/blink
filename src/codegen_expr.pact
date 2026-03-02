@@ -85,6 +85,11 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
 
     if kind == NodeKind.Ident {
         let name = np_name.get(node).unwrap()
+        if name == "self" && cg_where_self_var != "" {
+            expr_result_str = cg_where_self_var
+            expr_result_type = CT_INT
+            return
+        }
         if name == "None" {
             let fsi = get_fn_ret_struct_inner(cg_current_fn_name)
             if fsi.ok_struct != "" && cg_current_fn_ret == CT_OPTION {

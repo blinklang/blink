@@ -346,8 +346,11 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
     // Populate module prefix registries
     mod_fn_prefix = Map()
     mod_type_prefix = Map()
+    type_alias_base = Map()
+    type_where_preds = Map()
+    cg_where_self_var = ""
 
-    // Register type names first (struct or enum)
+    // Register type names first (struct or enum, skip aliases)
     let types_sl = np_fields.get(program).unwrap()
     if types_sl != -1 {
         let mut i = 0
@@ -358,6 +361,18 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
                 mod_type_prefix.set(np_name.get(td).unwrap(), mod_name)
             }
             let td_flds = np_fields.get(td).unwrap()
+            if td_flds == -1 && np_value.get(td).unwrap() != -1 {
+                let alias_name = np_name.get(td).unwrap()
+                let base_ann = np_value.get(td).unwrap()
+                let base_name = np_name.get(base_ann).unwrap()
+                type_alias_base.set(alias_name, base_name)
+                let where_pred = np_condition.get(td).unwrap()
+                if where_pred != -1 {
+                    type_where_preds.set(alias_name, where_pred)
+                }
+                i = i + 1
+                continue
+            }
             let mut is_enum = 0
             if td_flds != -1 && sublist_length(td_flds) > 0 {
                 if np_kind.get(sublist_get(td_flds, 0)).unwrap() == NodeKind.TypeVariant {
@@ -372,12 +387,20 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
         }
     }
 
-    // Type definitions (structs and enums)
+    // Type definitions (structs, enums, and aliases)
     if types_sl != -1 {
         let mut i = 0
         while i < sublist_length(types_sl) {
             let td = sublist_get(types_sl, i)
             let td_flds = np_fields.get(td).unwrap()
+            if td_flds == -1 && np_value.get(td).unwrap() != -1 {
+                let alias_name = np_name.get(td).unwrap()
+                let base_name = type_alias_base.get(alias_name)
+                let c_base = c_type_for_alias(base_name)
+                emit_line("typedef {c_base} pact_{alias_name};")
+                i = i + 1
+                continue
+            }
             let mut is_enum = 0
             if td_flds != -1 && sublist_length(td_flds) > 0 {
                 if np_kind.get(sublist_get(td_flds, 0)).unwrap() == NodeKind.TypeVariant {

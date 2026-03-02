@@ -730,6 +730,34 @@ pub fn parse_type_def() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
     let mut flds = -1
     let mut td_end_line = -1
     let mut td_end_col = -1
+    if at(TokenKind.Equals) {
+        advance()
+        let alias_type = parse_type_annotation()
+        let mut where_expr = -1
+        if at(TokenKind.At) {
+            advance()
+            let ann_name = expect_value(TokenKind.Ident)
+            if ann_name == "where" {
+                expect(TokenKind.LParen)
+                where_expr = parse_expr()
+                expect(TokenKind.RParen)
+            } else {
+                diag_error("UnexpectedAnnotation", "E1100", "only @where is supported on type aliases, got @{ann_name}", peek_line(), peek_col(), "use @where(predicate) to add a refinement constraint")
+            }
+        }
+        let td = new_node(NodeKind.TypeDef)
+        np_name.pop()
+        np_name.push(name)
+        np_fields.pop()
+        np_fields.push(-1)
+        np_type_params.pop()
+        np_type_params.push(tparams)
+        np_value.set(td, alias_type)
+        np_condition.set(td, where_expr)
+        pending_comments = saved_comments
+        pending_doc_comment = saved_doc
+        return td
+    }
     if at(TokenKind.LBrace) {
         expect(TokenKind.LBrace)
         skip_newlines()

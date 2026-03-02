@@ -89,6 +89,10 @@ pub let mut cg_closure_param_type_hint: Int = -1
 pub let mut mod_fn_prefix: Map[Str, Str] = Map()
 pub let mut mod_type_prefix: Map[Str, Str] = Map()
 
+pub let mut type_alias_base: Map[Str, Str] = Map()
+pub let mut type_where_preds: Map[Str, Int] = Map()
+pub let mut cg_where_self_var: Str = ""
+
 // C reserved words and problematic libc names — identifiers that must be mangled
 let mut c_reserved_set: Map[Str, Int] = Map()
 let mut c_reserved_init_done: Int = 0
@@ -2520,4 +2524,12 @@ pub fn emit_line(line: Str) ! Codegen.Emit {
 
 pub fn join_lines() -> Str ! Codegen.Emit {
     cg_lines.join("\n")
+}
+
+pub fn c_type_for_alias(base_name: Str) -> Str {
+    if base_name == "Int" { return "int64_t" }
+    if base_name == "Float" { return "double" }
+    if base_name == "Bool" { return "int64_t" }
+    if base_name == "Str" { return "const char*" }
+    return "pact_{base_name}"
 }

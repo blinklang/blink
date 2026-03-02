@@ -1000,6 +1000,17 @@ pub fn get_variant_enum_tid(name: Str) -> Int {
     TYPE_UNKNOWN
 }
 
+pub fn is_trait_name(name: Str) -> Int {
+    let mut i = 0
+    while i < tc_trait_names.len() {
+        if tc_trait_names.get(i).unwrap() == name {
+            return 1
+        }
+        i = i + 1
+    }
+    0
+}
+
 pub fn is_known_type(name: Str) -> Int {
     if name == "Int" || name == "Float" || name == "Bool" || name == "Str" { return 1 }
     if name == "Void" || name == "List" || name == "Option" || name == "Result" { return 1 }
@@ -1291,6 +1302,7 @@ pub fn nr_check_node(node: Int) ! TypeCheck.Resolve, Diag.Report {
         if is_variant_name(name) != 0 { return }
         if is_builtin_fn(name) != 0 { return }
         if is_known_type(name) != 0 { return }
+        if is_trait_name(name) != 0 { return }
         tc_errors.push("undefined variable '{name}'")
         diag_error_at("UndefinedVariable", "E0506", "undefined variable '{name}'", node, "")
         return
@@ -1327,7 +1339,7 @@ pub fn nr_check_node(node: Int) ! TypeCheck.Resolve, Diag.Report {
                 if is_private_access(fn_name) != 0 {
                     tc_errors.push("cannot access private function '{fn_name}'")
                     diag_error_at("PrivateItemAccess", "E1003", "cannot access private function '{fn_name}' from another module", node, "mark the function as 'pub' in its module")
-                } else if nr_is_defined(fn_name) == 0 && is_builtin_fn(fn_name) == 0 && is_variant_name(fn_name) == 0 && is_known_type(fn_name) == 0 {
+                } else if nr_is_defined(fn_name) == 0 && is_builtin_fn(fn_name) == 0 && is_variant_name(fn_name) == 0 && is_known_type(fn_name) == 0 && is_trait_name(fn_name) == 0 {
                     tc_errors.push("undefined function '{fn_name}'")
                     diag_error_at("UndefinedFunction", "E0504", "undefined function '{fn_name}'", node, "")
                 }
