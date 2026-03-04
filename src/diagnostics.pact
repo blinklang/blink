@@ -274,6 +274,9 @@ pub fn diag_explain(code: Str) -> Str {
     if code == "E1003" {
         return "E1003 -- PrivateItemAccess\n\nAn attempt was made to access a private (non-pub) item from another\nmodule.\n\nFix: either mark the item as 'pub' in its module, or use the\nmodule's public API instead.\n\n  // in math.pact\n  pub fn sqrt(x: Float) -> Float \{ ... \}  // accessible\n  fn helper() \{ ... \}                      // private"
     }
+    if code == "E1015" {
+        return "E1015 -- InlineModuleNotSupported\n\nInline modules (mod name \{ ... \}) are not supported in Pact.\nPact uses file-based modules: one file = one module.\n\nFix: move the module contents into a separate file and use import.\n\n  // Instead of:\n  mod schema \{\n      fn validate() \{ ... \}\n  \}\n\n  // Create schema.pact with the contents and import it:\n  import schema\n  schema.validate()\n\nSee section 10.1 for details on Pact's module system."
+    }
     if code == "E1100" {
         return "E1100 -- UnexpectedToken\n\nThe parser encountered a token it did not expect at this position.\n\nCommon causes:\n  - Missing or extra braces, parentheses, or brackets\n  - Incorrect syntax for the current context\n  - Using an operator in the wrong position\n\nFix: check the line and column indicated and look for syntax errors."
     }

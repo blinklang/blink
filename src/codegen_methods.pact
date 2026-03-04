@@ -532,7 +532,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                 cg_closure_defs.push("    __async_arg_{wrapper_idx}_t* __a = (__async_arg_{wrapper_idx}_t*)__arg;")
                 cg_closure_defs.push("    pact_closure* __cl = __a->closure;")
                 cg_closure_defs.push("    pact_handle* __h = __a->handle;")
-                cg_closure_defs.push("    int64_t __r = ((int64_t(*)(pact_closure*))__cl->fn_ptr)(__cl);")
+                cg_closure_defs.push("    int64_t __r = ((int64_t(*)(const pact_closure*))__cl->fn_ptr)(__cl);")
                 cg_closure_defs.push("    pact_handle_set_result(__h, (void*)(intptr_t)__r);")
                 cg_closure_defs.push("    free(__arg);")
                 cg_closure_defs.push("}")

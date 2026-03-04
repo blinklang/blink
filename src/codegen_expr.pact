@@ -577,7 +577,7 @@ pub fn emit_async_spawn_closure(closure_node: Int, wrapper_idx: Int, wrapper_nam
 
     push_scope()
 
-    let mut task_params = "pact_closure* __self"
+    let mut task_params = "const pact_closure* __self"
     emit_line("static int64_t {task_fn_name}({task_params}) \{")
     cg_indent = cg_indent + 1
 

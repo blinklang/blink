@@ -541,6 +541,27 @@ pub fn parse_program() -> Int ! Parse, Diag.Report {
             attach_pending_annotations(f)
             fn_nodes.push(f)
             collect_trailing_comment(f)
+        } else if at(TokenKind.Mod) {
+            let mod_line = peek_line()
+            let mod_col = peek_col()
+            advance()
+            if at(TokenKind.Ident) {
+                advance()
+            }
+            skip_newlines()
+            if at(TokenKind.LBrace) {
+                advance()
+                let mut depth = 1
+                while depth > 0 && !at(TokenKind.EOF) {
+                    if at(TokenKind.LBrace) {
+                        depth = depth + 1
+                    } else if at(TokenKind.RBrace) {
+                        depth = depth - 1
+                    }
+                    advance()
+                }
+            }
+            diag_error("InlineModuleNotSupported", "E1015", "inline modules are not supported; create a separate file and use 'import' instead (see section 10.1.1)", mod_line, mod_col, "Pact uses file-based modules: one file = one module")
         } else {
             diag_error("UnexpectedToken", "E1100", "unexpected token at top level: {peek_kind()}", peek_line(), peek_col(), "")
             advance()

@@ -1496,7 +1496,7 @@ pub fn build_closure_sig_from_type_ann(ta: Int) -> Str {
     let ret_name = np_return_type.get(ta).unwrap()
     let ret_type = type_from_name(ret_name)
     let elems_sl = np_elements.get(ta).unwrap()
-    let mut sig_params = "pact_closure*"
+    let mut sig_params = "const pact_closure*"
     if elems_sl != -1 && sublist_length(elems_sl) > 0 {
         let mut i = 0
         while i < sublist_length(elems_sl) {
@@ -2455,7 +2455,7 @@ pub fn emit_map_iter_typedef(inner: Int) ! Codegen.Emit {
     emit_line("static {opt} pact_MapIterator_{tag}_next(pact_MapIterator_{tag}* self) \{")
     emit_line("    {opt} __src = self->source_next(self->source);")
     emit_line("    if (__src.tag == 0) return ({opt})\{ .tag = 0 };")
-    emit_line("    {c_inner} __val = (({c_inner} (*)(pact_closure*, {c_inner}))self->fn->fn_ptr)(self->fn, __src.value);")
+    emit_line("    {c_inner} __val = (({c_inner} (*)(const pact_closure*, {c_inner}))self->fn->fn_ptr)(self->fn, __src.value);")
     emit_line("    return ({opt})\{ .tag = 1, .value = __val };")
     emit_line("}")
     emit_line("")
@@ -2471,7 +2471,7 @@ pub fn emit_filter_iter_typedef(inner: Int) ! Codegen.Emit {
     emit_line("    while (1) \{")
     emit_line("        {opt} __src = self->source_next(self->source);")
     emit_line("        if (__src.tag == 0) return ({opt})\{ .tag = 0 };")
-    emit_line("        if (((int (*)(pact_closure*, {c_inner}))self->fn->fn_ptr)(self->fn, __src.value)) \{")
+    emit_line("        if (((int (*)(const pact_closure*, {c_inner}))self->fn->fn_ptr)(self->fn, __src.value)) \{")
     emit_line("            return __src;")
     emit_line("        }")
     emit_line("    }")
@@ -2549,7 +2549,7 @@ pub fn emit_flat_map_iter_typedef(inner: Int) ! Codegen.Emit {
     emit_line("        }")
     emit_line("        {opt} __src = self->source_next(self->source);")
     emit_line("        if (__src.tag == 0) return ({opt})\{ .tag = 0 };")
-    emit_line("        self->buffer = ((pact_list* (*)(pact_closure*, {c_inner}))self->fn->fn_ptr)(self->fn, __src.value);")
+    emit_line("        self->buffer = ((pact_list* (*)(const pact_closure*, {c_inner}))self->fn->fn_ptr)(self->fn, __src.value);")
     emit_line("        self->buf_idx = 0;")
     emit_line("    }")
     emit_line("}")

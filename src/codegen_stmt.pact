@@ -1775,7 +1775,11 @@ pub fn emit_impl_method_def(fn_node: Int, impl_type: Str) ! Codegen.Emit, Codege
                             if elems_sl != -1 && sublist_length(elems_sl) > 0 {
                                 let elem_ann = sublist_get(elems_sl, 0)
                                 let elem_name = np_name.get(elem_ann).unwrap()
-                                set_list_elem_type(pname, type_from_name(elem_name))
+                                let elem_ct = type_from_name(elem_name)
+                                set_list_elem_type(pname, elem_ct)
+                                if elem_ct == CT_VOID && is_struct_type(elem_name) != 0 {
+                                    set_list_elem_struct(pname, elem_name)
+                                }
                             }
                         }
                     }
@@ -1901,7 +1905,11 @@ pub fn emit_fn_def(fn_node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope
                         if elems_sl != -1 && sublist_length(elems_sl) > 0 {
                             let elem_ann = sublist_get(elems_sl, 0)
                             let elem_name = np_name.get(elem_ann).unwrap()
-                            set_list_elem_type(pname, type_from_name(elem_name))
+                            let elem_ct = type_from_name(elem_name)
+                            set_list_elem_type(pname, elem_ct)
+                            if elem_ct == CT_VOID && is_struct_type(elem_name) != 0 {
+                                set_list_elem_struct(pname, elem_name)
+                            }
                         }
                     }
                 }
@@ -2189,7 +2197,11 @@ pub fn emit_mono_fn_def(fn_node: Int, concrete_args: Str) ! Codegen.Emit, Codege
                     if elems_sl != -1 && sublist_length(elems_sl) > 0 {
                         let elem_ann = sublist_get(elems_sl, 0)
                         let elem_name = np_name.get(elem_ann).unwrap()
-                        set_list_elem_type(pname, type_from_name(elem_name))
+                        let elem_ct = type_from_name(elem_name)
+                        set_list_elem_type(pname, elem_ct)
+                        if elem_ct == CT_VOID && is_struct_type(elem_name) != 0 {
+                            set_list_elem_struct(pname, elem_name)
+                        }
                     }
                 }
             }

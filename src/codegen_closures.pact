@@ -726,7 +726,7 @@ pub fn emit_closure(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
     // Build C parameter list: __self first if captures, then user params
     let has_caps = captures.len() > 0
     let saved_param_hint = cg_closure_param_type_hint
-    let mut params_c = "pact_closure* __self"
+    let mut params_c = "const pact_closure* __self"
     if params_sl != -1 && sublist_length(params_sl) > 0 {
         let mut i = 0
         while i < sublist_length(params_sl) {
@@ -860,7 +860,7 @@ pub fn emit_closure(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
     }
 
     // Build C function pointer signature for closure calls
-    let mut sig_params = "pact_closure*"
+    let mut sig_params = "const pact_closure*"
     if params_sl != -1 && sublist_length(params_sl) > 0 {
         let mut si = 0
         while si < sublist_length(params_sl) {
