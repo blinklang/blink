@@ -4,7 +4,21 @@
 
 Language spec v0.3. Self-hosting compiler. Targets native binaries via C codegen.
 
-## What's New (v0.11.1)
+## What's New (v0.12)
+
+- **Tuple destructuring** — `let (a, b) = some_tuple` in let bindings
+- **Extended strings** — `#"literal "quotes" and \backslashes"#` with `#{expr}` interpolation
+- **Struct field defaults** — `type Point { x: Int = 0, y: Int = 0 }`, omit fields at construction
+- **`@requires` contracts** — precondition annotations on functions
+- **Nested generics** — `List[List[Int]]` and other parameterized inner types
+- **`--release` flag** — optimized builds with `-O2`
+- **Multi-target builds** — `bin/pact build -T linux -T macos-arm64`
+- **Error catalog** — `pact explain E1234` with machine-applicable fix suggestions
+- **Closure const-qualifier fix** — eliminated dozens of C compiler warnings in bootstrap
+- **List[T] param fix** — struct element types now preserved through function parameters
+- **`mod {}` parser error** — helpful E1015 error instead of generic parse failure
+
+### Prior: What's New (v0.11.1)
 
 - **Cross-module error locations** — diagnostics in imported modules now report the correct source file (was always showing main file)
 

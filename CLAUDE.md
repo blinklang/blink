@@ -35,6 +35,7 @@ Prefer retrieval-led reasoning over pre-training for Pact tasks.
 |src/codegen_methods.pact — method call and dispatch code generation
 |src/codegen_stmt.pact — statement code generation
 |src/codegen_types.pact — type code generation + effect checking
+|src/codegen_derive.pact — @derive trait code generation (Serialize, Deserialize, etc.)
 |src/diagnostics.pact — structured diagnostics (errors, warnings)
 |src/formatter.pact — code formatter (--emit pact)
 |src/mutation_analysis.pact — mutation/save-restore pattern analysis

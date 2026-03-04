@@ -1,8 +1,23 @@
 # Pact Language Reference
 
-> Pact is a statically-typed, effect-tracked language compiling to C. Compiler v0.11. Language spec v0.3. Self-hosting.
+> Pact is a statically-typed, effect-tracked language compiling to C. Compiler v0.12. Language spec v0.3. Self-hosting.
 
-## What's New (v0.11.1)
+## What's New (v0.12)
+
+| Change | Details |
+|--------|---------|
+| Tuple destructuring | `let (a, b) = some_tuple` — destructure tuples in let bindings |
+| Extended strings | `#"literal "quotes" and \backslashes"#` — no escaping needed, `#{expr}` for interpolation |
+| Struct field defaults | `type Point { x: Int = 0, y: Int = 0 }` — omit fields with defaults at construction |
+| `@requires` contracts | Precondition annotations: `@requires(amount > 0)` checked at call sites |
+| Nested generics | `List[List[Int]]` and other parameterized inner types now work correctly |
+| `--release` flag | Optimized builds with `-O2`: `bin/pact build src/main.pact --release` |
+| Multi-target builds | Cross-compile: `bin/pact build -T linux -T macos-arm64` |
+| Error catalog | `pact explain E1234` with machine-applicable fix suggestions |
+| List[T] param fix | Struct element types preserved through function parameters (`.get().unwrap()` on `List[Struct]` params) |
+| `mod {}` parser error | Helpful E1015 error for inline module blocks instead of generic parse failure |
+
+### Prior: What's New (v0.11.1)
 
 | Change | Details |
 |--------|---------|
@@ -78,6 +93,7 @@
 let x = 42                       // immutable
 let mut count = 0                // mutable
 let name: Str = "Alice"          // type annotation
+let (a, b) = (10, 20)           // tuple destructuring
 
 // Functions
 fn add(a: Int, b: Int) -> Int {
@@ -96,6 +112,10 @@ numbers.map(fn(x) { x * 2 })
 type Point { x: Float, y: Float }
 let p = Point { x: 1.0, y: 2.0 }
 io.println("x={p.x}")
+
+// Struct field defaults
+type Config { host: Str = "localhost", port: Int = 8080 }
+let c = Config { host: "0.0.0.0" }  // port gets default 8080
 
 // Enums (ADTs)
 type Shape {
@@ -175,6 +195,17 @@ test "addition works" {
 | `\{` | literal `{` (suppresses interpolation) |
 | `\}` | literal `}` |
 
+### Extended Strings
+
+Extended strings `#"..."#` allow literal `"` and `\` without escaping. Use `#{expr}` for interpolation.
+
+```pact
+let raw = #"path\to\file"#              // no escaping needed
+let json = #"{"key": "value"}"#         // literal quotes
+let msg = #"Hello, #{name}!"#           // interpolation with #{...}
+let nested = ##"contains #"inner"#"##   // depth-2 nesting
+```
+
 ## Operators
 
 | Op | Types | Notes |
@@ -209,6 +240,13 @@ test "addition works" {
 | `time_ms()` | Int | Current time in milliseconds |
 | `getpid()` | Int | Process ID |
 | `Char.from_code_point(n)` | Str | Convert char code to 1-char string (was `str_from_char_code`) |
+| `unix_socket_listen(path)` | Int | Listen on Unix domain socket |
+| `unix_socket_connect(path)` | Int | Connect to Unix domain socket |
+| `unix_socket_accept(fd)` | Int | Accept incoming connection |
+| `unix_socket_accept_timeout(fd, ms)` | Int | Accept with timeout (ms) |
+| `unix_socket_close(fd)` | Void | Close socket |
+| `socket_read_line(fd)` | Str | Read line from socket |
+| `socket_write(fd, data)` | Void | Write data to socket |
 
 ## Namespace Methods
 
