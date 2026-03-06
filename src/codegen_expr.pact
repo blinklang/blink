@@ -1428,6 +1428,8 @@ pub fn escape_c_string(s: Str) -> Str {
             result = result.concat("\\\"")
         } else if ch == 10 {
             result = result.concat("\\n")
+        } else if ch == 13 {
+            result = result.concat("\\r")
         } else if ch == 9 {
             result = result.concat("\\t")
         } else if ch == 8 {

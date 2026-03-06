@@ -248,3 +248,10 @@ Source: `ai` (Claude) | `human` | `both`
 - **Context:** Implementing nested subcommands in `lib/std/args.pact`
 - **Description:** When a function takes `List[SomeStruct]` as a direct parameter, the codegen loses the element type info for items obtained via `.get().unwrap()`. Field access on the unwrapped item produces `int64_t.field` in C instead of a proper struct access. The same pattern works fine when the list is accessed through a struct field chain (e.g., `p.commands.get(i).unwrap().name`). Workaround: wrap `List[T]` in a struct (`type CmdList { items: List[CommandDef] }`) and pass the wrapper. This adds boilerplate (`wrap(cmds)` calls everywhere) but produces correct C.
 
+### 2026-03-05 — `\r` escape sequence emits literal backslash-r, not CR
+- **Category:** `codegen`
+- **Severity:** `annoying`
+- **Source:** `ai`
+- **Context:** Building HTTP benchmark server, stdlib `format_response` in `lib/std/http_server.pact`
+- **Description:** String literal `"\r\n"` emits `\` + `r` + `\` + `n` (4 literal chars) instead of CR (0x0D) + LF (0x0A). The `\n` escape IS supported (produces 0x0A), but `\r` is not — it becomes a literal backslash + `r`. This means `format_response` in the HTTP stdlib produces malformed HTTP responses that Go's `net/http` (and `hey`) reject as "malformed MIME header". Workaround: `Char.from_code_point(13).concat(Char.from_code_point(10))` stored in a mutable global set at init time. The lexer (`src/lexer.pact`) handles `\n`, `\t`, `\\`, `\"` but appears to be missing `\r`. Also affects `\0` and `\b`/`\f` if those are expected.
+
