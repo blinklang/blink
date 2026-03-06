@@ -1,8 +1,16 @@
 # Pact Language Reference
 
-> Pact is a statically-typed, effect-tracked language compiling to C. Compiler v0.12. Language spec v0.3. Self-hosting.
+> Pact is a statically-typed, effect-tracked language compiling to C. Compiler v0.13. Language spec v0.3. Self-hosting.
 
-## What's New (v0.12)
+## What's New (v0.13)
+
+| Change | Details |
+|--------|---------|
+| SQLite `db.*` namespace | 16 methods for database operations — `db.open`, `db.exec`, `db.query`, `db.execute`, `db.query_one`, `db.prepare`/`bind`/`step`/`column`/`finalize`, `db.begin`/`commit`/`rollback`, `db.close`, `db.errmsg` |
+| `pact.toml` versioning | `pact init` stamps `pact-version` in project manifest for toolchain compatibility |
+| `\r` escape sequence | Carriage return (`\r`) now supported in string literals |
+
+### Prior: What's New (v0.12)
 
 | Change | Details |
 |--------|---------|
@@ -273,6 +281,27 @@ time.sleep(duration)            // sleep for Duration
 // Async (effect: Async)
 async.scope { ... }             // synchronous scope for spawned tasks
 async.spawn(fn() { ... })       // spawn task, returns Handle
+
+// Database (effect: DB) — requires SQLite
+db.open(path)                   // open SQLite database, sets implicit connection
+db.exec(sql)                    // execute SQL (no results), e.g. CREATE TABLE
+db.execute(sql)                 // execute SQL, returns last insert rowid (Int)
+db.query(sql)                   // -> List[List[Str]] (all rows, all columns as strings)
+db.query_one(sql)               // -> Option[List[Str]] (first row or None)
+db.prepare(sql)                 // -> Int (statement handle)
+db.bind_int(stmt, idx, val)     // bind Int to parameter index
+db.bind_text(stmt, idx, val)    // bind Str to parameter index
+db.bind_real(stmt, idx, val)    // bind Float to parameter index
+db.step(stmt)                   // -> Int (SQLITE_ROW=100, SQLITE_DONE=101)
+db.column_text(stmt, idx)       // -> Str (column value as string)
+db.column_int(stmt, idx)        // -> Int (column value as integer)
+db.reset(stmt)                  // reset prepared statement for re-use
+db.finalize(stmt)               // free prepared statement
+db.begin()                      // BEGIN TRANSACTION
+db.commit()                     // COMMIT
+db.rollback()                   // ROLLBACK
+db.errmsg()                     // -> Str (last error message)
+db.close()                      // close database connection
 ```
 
 ## String Methods

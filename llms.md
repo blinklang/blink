@@ -4,7 +4,13 @@
 
 Language spec v0.3. Self-hosting compiler. Targets native binaries via C codegen.
 
-## What's New (v0.12)
+## What's New (v0.13)
+
+- **SQLite `db.*` namespace** — 16 methods for database operations: `db.open`, `db.exec`, `db.execute`, `db.query`, `db.query_one`, `db.prepare`, `db.bind_int`, `db.bind_text`, `db.bind_real`, `db.step`, `db.column_text`, `db.column_int`, `db.reset`, `db.finalize`, `db.close`, `db.errmsg`
+- **`pact.toml` versioning** — `pact init` stamps `pact-version` in project manifest
+- **`\r` escape sequence** — carriage return now supported in string literals
+
+### Prior: What's New (v0.12)
 
 - **Tuple destructuring** — `let (a, b) = some_tuple` in let bindings
 - **Extended strings** — `#"literal "quotes" and \backslashes"#` with `#{expr}` interpolation
