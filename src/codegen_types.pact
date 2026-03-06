@@ -497,6 +497,7 @@ pub let mut cg_current_fn_node: Int = -1
 pub let mut cg_program_node: Int = 0
 pub let mut cg_uses_async: Int = 0
 pub let mut cg_uses_curl: Int = 0
+pub let mut cg_uses_sqlite: Int = 0
 pub let mut cg_async_wrapper_counter: Int = 0
 
 // Async scope tracking: stack of scope handle list variable names

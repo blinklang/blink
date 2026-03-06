@@ -90,6 +90,7 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
     cg_handler_body_idx = 0
     cg_uses_async = 0
     cg_uses_curl = 0
+    cg_uses_sqlite = 0
     cg_async_wrapper_counter = 0
     cg_async_scope_stack = []
     cg_async_scope_counter = 0
@@ -954,11 +955,10 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
     pop_scope()
 
     if cg_uses_curl != 0 {
-        if cg_runtime_header != "" {
-            cg_lines.set(0, "#define PACT_USE_CURL\n{cg_runtime_header}")
-        } else {
-            cg_lines.set(0, "#define PACT_USE_CURL\n#include \"runtime.h\"")
-        }
+        cg_lines.set(0, "#define PACT_USE_CURL\n{cg_lines.get(0).unwrap()}")
+    }
+    if cg_uses_sqlite != 0 {
+        cg_lines.set(0, "#define PACT_USE_SQLITE\n{cg_lines.get(0).unwrap()}")
     }
 
     join_lines()

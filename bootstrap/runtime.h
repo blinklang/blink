@@ -2006,4 +2006,137 @@ static pact_ProcessResult pact_process_run(const char* cmd, const pact_list* arg
     return result;
 }
 
+
+/* ── SQLite3 bindings (conditional) ──────────────────────────────────── */
+
+#ifdef PACT_USE_SQLITE
+#include <sqlite3.h>
+
+/* Result struct for pact_sqlite3_query convenience wrapper */
+typedef struct {
+    pact_list* rows;      /* List of pact_list* (each row is a list of strings) */
+    pact_list* columns;   /* List of column name strings */
+    int64_t num_rows;
+    int64_t num_cols;
+} pact_sqlite3_result;
+
+static void* pact_sqlite3_open(const char* path) {
+    sqlite3* db = NULL;
+    int rc = sqlite3_open(path, &db);
+    if (rc != SQLITE_OK) {
+        if (db) sqlite3_close(db);
+        return NULL;
+    }
+    return (void*)db;
+}
+
+static int64_t pact_sqlite3_exec(void* db, const char* sql,
+                                  int (*callback)(void*, int, char**, char**),
+                                  void* arg, const char** errmsg) {
+    char* err = NULL;
+    int rc = sqlite3_exec((sqlite3*)db, sql, callback, arg, &err);
+    if (errmsg) {
+        *errmsg = err ? strdup(err) : NULL;
+    }
+    if (err) sqlite3_free(err);
+    return (int64_t)rc;
+}
+
+/* Callback used by pact_sqlite3_query to collect rows */
+static int pact_sqlite3_query_cb(void* ud, int ncols, char** values, char** names) {
+    pact_sqlite3_result* res = (pact_sqlite3_result*)ud;
+    if (res->num_rows == 0) {
+        for (int i = 0; i < ncols; i++) {
+            pact_list_push(res->columns, (void*)strdup(names[i]));
+        }
+        res->num_cols = (int64_t)ncols;
+    }
+    pact_list* row = pact_list_new();
+    for (int i = 0; i < ncols; i++) {
+        pact_list_push(row, (void*)strdup(values[i] ? values[i] : ""));
+    }
+    pact_list_push(res->rows, (void*)row);
+    res->num_rows++;
+    return 0;
+}
+
+static pact_sqlite3_result* pact_sqlite3_query(void* db, const char* sql) {
+    pact_sqlite3_result* res = (pact_sqlite3_result*)pact_alloc(sizeof(pact_sqlite3_result));
+    res->rows = pact_list_new();
+    res->columns = pact_list_new();
+    res->num_rows = 0;
+    res->num_cols = 0;
+    char* err = NULL;
+    int rc = sqlite3_exec((sqlite3*)db, sql, pact_sqlite3_query_cb, res, &err);
+    if (rc != SQLITE_OK) {
+        if (err) {
+            fprintf(stderr, "pact: sqlite3 query error: %s\n", err);
+            sqlite3_free(err);
+        }
+    }
+    return res;
+}
+
+static void* pact_sqlite3_prepare(void* db, const char* sql) {
+    sqlite3_stmt* stmt = NULL;
+    int rc = sqlite3_prepare_v2((sqlite3*)db, sql, -1, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        return NULL;
+    }
+    return (void*)stmt;
+}
+
+static int64_t pact_sqlite3_bind_int(void* stmt, int64_t idx, int64_t val) {
+    return (int64_t)sqlite3_bind_int64((sqlite3_stmt*)stmt, (int)idx, (sqlite3_int64)val);
+}
+
+static int64_t pact_sqlite3_bind_text(void* stmt, int64_t idx, const char* val) {
+    return (int64_t)sqlite3_bind_text((sqlite3_stmt*)stmt, (int)idx, val, -1, SQLITE_TRANSIENT);
+}
+
+static int64_t pact_sqlite3_step(void* stmt) {
+    return (int64_t)sqlite3_step((sqlite3_stmt*)stmt);
+}
+
+static int64_t pact_sqlite3_column_int(void* stmt, int64_t col) {
+    return (int64_t)sqlite3_column_int64((sqlite3_stmt*)stmt, (int)col);
+}
+
+static const char* pact_sqlite3_column_text(void* stmt, int64_t col) {
+    const unsigned char* text = sqlite3_column_text((sqlite3_stmt*)stmt, (int)col);
+    if (!text) return strdup("");
+    return strdup((const char*)text);
+}
+
+static int64_t pact_sqlite3_reset(void* stmt) {
+    return (int64_t)sqlite3_reset((sqlite3_stmt*)stmt);
+}
+
+static int64_t pact_sqlite3_finalize(void* stmt) {
+    return (int64_t)sqlite3_finalize((sqlite3_stmt*)stmt);
+}
+
+static int64_t pact_sqlite3_close(void* db) {
+    return (int64_t)sqlite3_close((sqlite3*)db);
+}
+
+static const char* pact_sqlite3_errmsg(void* db) {
+    const char* msg = sqlite3_errmsg((sqlite3*)db);
+    return msg ? strdup(msg) : strdup("");
+}
+
+static int64_t pact_sqlite3_begin(void* db) {
+    return (int64_t)sqlite3_exec((sqlite3*)db, "BEGIN", NULL, NULL, NULL);
+}
+
+static int64_t pact_sqlite3_commit(void* db) {
+    return (int64_t)sqlite3_exec((sqlite3*)db, "COMMIT", NULL, NULL, NULL);
+}
+
+static int64_t pact_sqlite3_rollback(void* db) {
+    return (int64_t)sqlite3_exec((sqlite3*)db, "ROLLBACK", NULL, NULL, NULL);
+}
+
+#endif /* PACT_USE_SQLITE */
+
 #endif
