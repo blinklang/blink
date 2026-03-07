@@ -207,6 +207,9 @@ fn do_compile(source_path: Str, c_path: Str, format_flag: Str, debug_mode: Int) 
         diag_flush()
         return 1
     }
+    if diag_warn_count > 0 {
+        diag_flush()
+    }
 
     analyze_mutations(final_program)
     analyze_save_restore(final_program)
@@ -224,6 +227,9 @@ fn do_compile(source_path: Str, c_path: Str, format_flag: Str, debug_mode: Int) 
     if diag_count > 0 {
         diag_flush()
         return 1
+    }
+    if diag_warn_count > 0 {
+        diag_flush()
     }
 
     write_file(c_path, c_output)

@@ -2061,7 +2061,6 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             let src_next = ifs_next_fn
             let elem_type = ifs_elem_type
             let opt_t = ifs_opt_type
-            let tag = c_type_tag(elem_type)
             let result_list = fresh_temp("__enum_")
             let next_var = fresh_temp("__enum_next_")
             let i_var = fresh_temp("__enum_i_")

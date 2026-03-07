@@ -1199,7 +1199,7 @@ pub fn format_if_chain(node: Int, prefix: Str) ! Format.Emit {
     }
 }
 
-pub fn format_else_if(node: Int) -> Str {
+pub fn format_else_if(_node: Int) -> Str {
     ""
 }
 

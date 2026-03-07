@@ -29,6 +29,7 @@ pub let mut diag_fix_text: List[Str] = []
 pub let mut diag_format: Int = 0       // 0=human, 1=json
 pub let mut diag_source_file: Str = ""
 pub let mut diag_count: Int = 0        // error count only
+pub let mut diag_warn_count: Int = 0   // warning count only
 pub let mut diag_module_files: Map[Str, Str] = Map()
 
 // ── Emit helpers ─────────────────────────────────────────────────────
@@ -48,6 +49,9 @@ pub fn diag_emit(severity: Str, name: Str, code: Str, message: Str, line: Int, c
     diag_fix_text.push("")
     if severity == "error" {
         diag_count = diag_count + 1
+    }
+    if severity == "warning" {
+        diag_warn_count = diag_warn_count + 1
     }
 }
 
@@ -119,6 +123,9 @@ pub fn diag_emit_range(severity: Str, name: Str, code: Str, message: Str, line: 
     diag_fix_text.push("")
     if severity == "error" {
         diag_count = diag_count + 1
+    }
+    if severity == "warning" {
+        diag_warn_count = diag_warn_count + 1
     }
 }
 
@@ -235,6 +242,7 @@ pub fn diag_reset() {
     diag_fix_action = []
     diag_fix_text = []
     diag_count = 0
+    diag_warn_count = 0
     diag_module_files = Map()
 }
 
@@ -306,6 +314,9 @@ pub fn diag_explain(code: Str) -> Str {
     }
     if code == "W0551" {
         return "W0551 -- UnrestoredMutation\n\nA function call mutates 3 or more globals with no save/restore\npattern at all.\n\nCommon causes:\n  - Calling a function with broad side effects speculatively\n  - Forgetting to wrap the call in a save/restore block\n\nFix: if the call is speculative (may need to be rolled back), save\nand restore the affected globals."
+    }
+    if code == "W0600" {
+        return "W0600 -- UnusedVariable\n\nA variable was declared but never read.\n\nCommon causes:\n  - Leftover variable from refactoring\n  - Variable assigned but result never used\n\nFix: remove the variable, or prefix its name with '_' to suppress\nthis warning.\n\n  let _unused = compute()  // OK -- prefixed with '_'"
     }
     ""
 }

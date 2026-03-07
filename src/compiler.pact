@@ -94,7 +94,7 @@ fn compiler_get_home() -> Str {
     ""
 }
 
-fn resolve_from_lockfile(dotted_path: Str, src_root: Str) -> Str {
+fn resolve_from_lockfile(dotted_path: Str, _src_root: Str) -> Str {
     if lockfile_pkg_count() == 0 {
         return ""
     }
@@ -324,7 +324,7 @@ pub fn should_import_item(item: Int, import_node: Int) -> Int {
     0
 }
 
-pub fn merge_programs(main_prog: Int, imported: List[Int], import_nodes_list: List[Int]) -> Int ! Parse.Build {
+pub fn merge_programs(main_prog: Int, imported: List[Int], _import_nodes_list: List[Int]) -> Int ! Parse.Build {
     let mut all_fns: List[Int] = []
     let mut all_types: List[Int] = []
     let mut all_lets: List[Int] = []

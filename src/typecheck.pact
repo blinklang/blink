@@ -672,6 +672,7 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
 
     // Phase 1: Name resolution
     resolve_names(program)
+    nr_warn_unused = 0
 
     // Phase 2: Expression type inference
     tc_infer_program(program)
@@ -715,44 +716,89 @@ fn is_private_access(name: Str) -> Int {
 pub let mut nr_scope_names: List[Str] = []
 pub let mut nr_scope_muts: List[Int] = []
 pub let mut nr_scope_types: List[Int] = []
+pub let mut nr_scope_reads: List[Int] = []
+pub let mut nr_scope_nodes: List[Int] = []
 pub let mut nr_scope_frames: List[Int] = []
+pub let mut nr_scope_depth: Int = 0
+pub let mut nr_warn_unused: Int = 0
 
 pub fn nr_push_scope() {
     nr_scope_frames.push(nr_scope_names.len())
+    nr_scope_depth = nr_scope_depth + 1
 }
 
-pub fn nr_pop_scope() {
+pub fn nr_pop_scope() ! Diag.Report {
     let start = nr_scope_frames.get(nr_scope_frames.len() - 1).unwrap()
     nr_scope_frames.pop()
+    // Emit unused variable warnings for locals (depth > 1 = inside a function)
+    if nr_warn_unused != 0 && nr_scope_depth > 1 {
+        let mut i = nr_scope_names.len() - 1
+        while i >= start {
+            let vname = nr_scope_names.get(i).unwrap()
+            if nr_scope_reads.get(i).unwrap() == 0 && vname.len() > 0 && vname.char_at(0) != 95 {
+                let nd = nr_scope_nodes.get(i).unwrap()
+                if nd != -1 {
+                    diag_warn_at("UnusedVariable", "W0600", "variable '{vname}' is never read", nd, "prefix with '_' to suppress this warning")
+                }
+            }
+            i = i - 1
+        }
+    }
     while nr_scope_names.len() > start {
         nr_scope_names.pop()
         nr_scope_muts.pop()
         nr_scope_types.pop()
+        nr_scope_reads.pop()
+        nr_scope_nodes.pop()
     }
+    nr_scope_depth = nr_scope_depth - 1
 }
 
 pub fn nr_define(name: Str) {
     nr_scope_names.push(name)
     nr_scope_muts.push(0)
     nr_scope_types.push(TYPE_UNKNOWN)
+    nr_scope_reads.push(0)
+    nr_scope_nodes.push(-1)
+}
+
+pub fn nr_define_at(name: Str, node: Int) {
+    nr_scope_names.push(name)
+    nr_scope_muts.push(0)
+    nr_scope_types.push(TYPE_UNKNOWN)
+    nr_scope_reads.push(0)
+    nr_scope_nodes.push(node)
 }
 
 pub fn nr_define_mut(name: Str, is_mut: Int) {
     nr_scope_names.push(name)
     nr_scope_muts.push(is_mut)
     nr_scope_types.push(TYPE_UNKNOWN)
+    nr_scope_reads.push(0)
+    nr_scope_nodes.push(-1)
+}
+
+pub fn nr_define_mut_at(name: Str, is_mut: Int, node: Int) {
+    nr_scope_names.push(name)
+    nr_scope_muts.push(is_mut)
+    nr_scope_types.push(TYPE_UNKNOWN)
+    nr_scope_reads.push(0)
+    nr_scope_nodes.push(node)
 }
 
 pub fn nr_define_typed(name: Str, is_mut: Int, tid: Int) {
     nr_scope_names.push(name)
     nr_scope_muts.push(is_mut)
     nr_scope_types.push(tid)
+    nr_scope_reads.push(0)
+    nr_scope_nodes.push(-1)
 }
 
 pub fn nr_is_defined(name: Str) -> Int {
     let mut i = nr_scope_names.len() - 1
     while i >= 0 {
         if nr_scope_names.get(i).unwrap() == name {
+            nr_scope_reads.set(i, 1)
             return 1
         }
         i = i - 1
@@ -1041,7 +1087,11 @@ pub fn resolve_names(program: Int) ! TypeCheck.Resolve, Diag.Report {
     nr_scope_names = []
     nr_scope_muts = []
     nr_scope_types = []
+    nr_scope_reads = []
+    nr_scope_nodes = []
     nr_scope_frames = []
+    nr_scope_depth = 0
+    nr_warn_unused = 1
     nr_impl_type_names = []
     nr_impl_method_names = []
     nr_private_imports = Map()
@@ -1221,7 +1271,7 @@ pub fn nr_check_fn(fn_node: Int) ! TypeCheck.Resolve, Diag.Report {
         let mut i = 0
         while i < sublist_length(params_sl) {
             let p = sublist_get(params_sl, i)
-            nr_define(np_name.get(p).unwrap())
+            nr_define_at(np_name.get(p).unwrap(), p)
             nr_check_type_ref(np_type_name.get(p).unwrap())
             i = i + 1
         }
@@ -1269,7 +1319,7 @@ pub fn nr_check_node(node: Int) ! TypeCheck.Resolve, Diag.Report {
             nr_check_node(val)
         }
         let let_is_mut = np_is_mut.get(node).unwrap()
-        nr_define_mut(np_name.get(node).unwrap(), let_is_mut)
+        nr_define_mut_at(np_name.get(node).unwrap(), let_is_mut, node)
         let let_pat_sl = np_elements.get(node).unwrap()
         if let_pat_sl != -1 {
             let let_elems_sl = np_elements.get(let_pat_sl).unwrap()
@@ -1277,7 +1327,7 @@ pub fn nr_check_node(node: Int) ! TypeCheck.Resolve, Diag.Report {
                 let mut pi = 0
                 while pi < sublist_length(let_elems_sl) {
                     let sp = sublist_get(let_elems_sl, pi)
-                    nr_define_mut(np_name.get(sp).unwrap(), let_is_mut)
+                    nr_define_mut_at(np_name.get(sp).unwrap(), let_is_mut, sp)
                     pi = pi + 1
                 }
             }
@@ -1304,6 +1354,7 @@ pub fn nr_check_node(node: Int) ! TypeCheck.Resolve, Diag.Report {
     if kind == NodeKind.Ident {
         let name = np_name.get(node).unwrap()
         if name == "true" || name == "false" || name == "None" { return }
+        if nr_is_defined(name) != 0 { return }
         if name == "io" || name == "fs" || name == "net" || name == "db" || name == "env" || name == "time" || name == "async" || name == "channel" || name == "default" { return }
         if is_user_effect_handle_name(name) != 0 { return }
         if is_private_access(name) != 0 {
@@ -1311,7 +1362,6 @@ pub fn nr_check_node(node: Int) ! TypeCheck.Resolve, Diag.Report {
             diag_error_at("PrivateItemAccess", "E1003", "cannot access private item '{name}' from another module", node, "mark the item as 'pub' in its module")
             return
         }
-        if nr_is_defined(name) != 0 { return }
         if is_variant_name(name) != 0 { return }
         if is_builtin_fn(name) != 0 { return }
         if is_known_type(name) != 0 { return }
@@ -1333,7 +1383,11 @@ pub fn nr_check_node(node: Int) ! TypeCheck.Resolve, Diag.Report {
                 let part = sublist_get(elems_sl, i)
                 let pk = np_kind.get(part).unwrap()
                 if pk == NodeKind.Ident && np_str_val.get(part).unwrap() == np_name.get(part).unwrap() {
-                    let _skip = 0
+                    // Simple interpolation like {var} — mark as read but skip full check
+                    let iname = np_name.get(part).unwrap()
+                    if nr_is_defined(iname) != 0 {
+                        let _skip = 0
+                    }
                 } else {
                     nr_check_node(part)
                 }
@@ -1422,7 +1476,7 @@ pub fn nr_check_node(node: Int) ! TypeCheck.Resolve, Diag.Report {
     }
 
     if kind == NodeKind.UnaryOp {
-        nr_check_node(np_right.get(node).unwrap())
+        nr_check_node(np_left.get(node).unwrap())
         return
     }
 
@@ -1447,7 +1501,7 @@ pub fn nr_check_node(node: Int) ! TypeCheck.Resolve, Diag.Report {
     if kind == NodeKind.ForIn {
         nr_check_node(np_iterable.get(node).unwrap())
         nr_push_scope()
-        nr_define(np_var_name.get(node).unwrap())
+        nr_define_at(np_var_name.get(node).unwrap(), node)
         let for_pat_sl = np_elements.get(node).unwrap()
         if for_pat_sl != -1 {
             nr_check_pattern(for_pat_sl)
@@ -1488,7 +1542,8 @@ pub fn nr_check_node(node: Int) ! TypeCheck.Resolve, Diag.Report {
         if params_sl != -1 {
             let mut i = 0
             while i < sublist_length(params_sl) {
-                nr_define(np_name.get(sublist_get(params_sl, i)).unwrap())
+                let cp = sublist_get(params_sl, i)
+                nr_define_at(np_name.get(cp).unwrap(), cp)
                 i = i + 1
             }
         }
@@ -1559,7 +1614,7 @@ pub fn nr_check_node(node: Int) ! TypeCheck.Resolve, Diag.Report {
 
     if kind == NodeKind.WithResource {
         nr_push_scope()
-        nr_define(np_name.get(node).unwrap())
+        nr_define_at(np_name.get(node).unwrap(), node)
         nr_check_node(np_value.get(node).unwrap())
         nr_check_node(np_body.get(node).unwrap())
         nr_pop_scope()
@@ -1611,7 +1666,7 @@ pub fn nr_check_pattern(node: Int) ! TypeCheck.Resolve {
     if kind == NodeKind.IdentPattern {
         let name = np_name.get(node).unwrap()
         if name != "_" {
-            nr_define(name)
+            nr_define_at(name, node)
         }
         return
     }
@@ -1638,7 +1693,7 @@ pub fn nr_check_pattern(node: Int) ! TypeCheck.Resolve {
             let mut i = 0
             while i < sublist_length(flds_sl) {
                 let f = sublist_get(flds_sl, i)
-                nr_define(np_name.get(f).unwrap())
+                nr_define_at(np_name.get(f).unwrap(), f)
                 i = i + 1
             }
         }

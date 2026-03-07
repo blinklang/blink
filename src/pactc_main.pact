@@ -76,16 +76,18 @@ fn main() {
     }
 
     let t_tc_start = time_ms()
-    let tc_err_count = check_types(final_program)
+    let _tc_err_count = check_types(final_program)
     let t_tc_end = time_ms()
 
     if diag_count > 0 {
         diag_flush()
         return
     }
+    if diag_warn_count > 0 {
+        diag_flush()
+    }
 
     if check_only != 0 {
-        diag_flush()
         return
     }
 
@@ -101,6 +103,9 @@ fn main() {
     if diag_count > 0 {
         diag_flush()
         return
+    }
+    if diag_warn_count > 0 {
+        diag_flush()
     }
 
     if out_path != "" {

@@ -151,7 +151,7 @@ pub fn sublist_push(sl: Int, node_id: Int) ! Parse.Build {
     items.push(node_id)
 }
 
-pub fn finalize_sublist(sl: Int) ! Parse.Build {
+pub fn finalize_sublist(_sl: Int) ! Parse.Build {
     if sl_stack.len() == 0 {
         io.println("FATAL: finalize_sublist() called with no open sublist")
         exit(1)
