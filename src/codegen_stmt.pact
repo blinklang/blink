@@ -1259,7 +1259,7 @@ pub fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
     if val_type == CT_OPTION {
         let opt_inner = get_var_option_inner(name)
         let opt_inner_s = get_var_option_inner_struct(name)
-        let opt_c_inner = if opt_inner == CT_LIST { CT_INT } else { opt_inner }
+        let opt_c_inner = opt_inner
         let opt_c = option_c_type_mixed(opt_c_inner, opt_inner_s)
         if is_mut != 0 {
             emit_line("{opt_c} {cname} = {val_str};")

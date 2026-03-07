@@ -562,15 +562,15 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
         if args_sl != -1 && sublist_length(args_sl) > 0 {
             emit_expr(sublist_get(args_sl, 0))
             let arg_str = expr_result_str
-            ensure_option_type(CT_INT)
-            let opt_type = option_c_type(CT_INT)
+            ensure_option_type(CT_LIST)
+            let opt_type = option_c_type(CT_LIST)
             let tmp_res = fresh_temp("__db_qr_")
             let tmp_opt = fresh_temp("__db_opt_")
             emit_line("pact_sqlite3_result* {tmp_res} = pact_sqlite3_query(__pact_db, {arg_str});")
             emit_line("{opt_type} {tmp_opt};")
             emit_line("if ({tmp_res}->num_rows > 0) \{")
             emit_line("  {tmp_opt}.tag = 1;")
-            emit_line("  {tmp_opt}.value = (int64_t)(intptr_t)pact_list_get({tmp_res}->rows, 0);")
+            emit_line("  {tmp_opt}.value = (pact_list*)pact_list_get({tmp_res}->rows, 0);")
             emit_line("} else \{")
             emit_line("  {tmp_opt}.tag = 0;")
             emit_line("}")
@@ -1753,11 +1753,11 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                 expr_option_inner = CT_FLOAT
                 expr_option_inner_struct = ""
             } else if elem_type == CT_LIST {
-                ensure_option_type(CT_INT)
-                let opt_type = option_c_type(CT_INT)
+                ensure_option_type(CT_LIST)
+                let opt_type = option_c_type(CT_LIST)
                 emit_line("{opt_type} {res};")
                 emit_line("if (pact_list_len({obj_str}) > 0) \{")
-                emit_line("    {res}.tag = 1; {res}.value = (int64_t)(intptr_t)pact_list_pop({obj_str});")
+                emit_line("    {res}.tag = 1; {res}.value = (pact_list*)pact_list_pop({obj_str});")
                 emit_line("} else \{ {res}.tag = 0; }")
                 set_var_option(res, CT_LIST)
                 let pop_nested = get_list_nested_elem_type(obj_str)
@@ -1839,11 +1839,11 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                 expr_option_inner = CT_FLOAT
                 expr_option_inner_struct = ""
             } else if elem_type == CT_LIST {
-                ensure_option_type(CT_INT)
-                let opt_type = option_c_type(CT_INT)
+                ensure_option_type(CT_LIST)
+                let opt_type = option_c_type(CT_LIST)
                 emit_line("{opt_type} {res};")
                 emit_line("if (pact_list_in_bounds({obj_str}, {idx_tmp})) \{")
-                emit_line("    {res}.tag = 1; {res}.value = (int64_t)(intptr_t)pact_list_get({obj_str}, {idx_tmp});")
+                emit_line("    {res}.tag = 1; {res}.value = (pact_list*)pact_list_get({obj_str}, {idx_tmp});")
                 emit_line("} else \{ {res}.tag = 0; }")
                 set_var_option(res, CT_LIST)
                 let nested_et = get_list_nested_elem_type(obj_str)
@@ -2622,11 +2622,11 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                 expr_result_str = "{tmp}.value"
                 expr_result_type = CT_STRING
             } else if inner == CT_LIST {
-                let opt_c = option_c_type(CT_INT)
+                let opt_c = option_c_type(CT_LIST)
                 emit_line("{opt_c} {tmp} = {obj_str};")
                 emit_line("if ({tmp}.tag == 0) \{ fprintf(stderr, \"panic: unwrap called on None\\n\"); exit(1); }")
                 let val_tmp = fresh_temp("_ounv_")
-                emit_line("pact_list* {val_tmp} = (pact_list*)(intptr_t){tmp}.value;")
+                emit_line("pact_list* {val_tmp} = {tmp}.value;")
                 set_var(val_tmp, CT_LIST, 0)
                 let nested = get_var_option_inner2(obj_str)
                 if nested != -1 {

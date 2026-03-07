@@ -159,6 +159,9 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
         if expr_result_type == CT_OPTION {
             expr_option_inner = get_var_option_inner(name)
             expr_option_inner_struct = get_var_option_inner_struct(name)
+            if expr_option_inner == CT_LIST {
+                expr_option_inner_list_elem = get_var_option_inner2(name)
+            }
         }
         if expr_result_type == CT_RESULT {
             expr_result_ok_type = get_var_result_ok(name)
@@ -702,6 +705,19 @@ pub fn emit_binop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Di
             set_var_struct(val_tmp, opt_inner_s)
             expr_result_str = val_tmp
             expr_result_type = right_type
+        } else if opt_inner == CT_LIST {
+            let opt_c = option_c_type(CT_LIST)
+            emit_line("{opt_c} {tmp} = {left_str};")
+            let val_tmp = fresh_temp("__optv")
+            emit_line("pact_list* {val_tmp} = {tmp}.tag == 1 ? {tmp}.value : {right_str};")
+            set_var(val_tmp, CT_LIST, 0)
+            let inner2 = expr_option_inner_list_elem
+            if inner2 >= 0 {
+                set_list_elem_type(val_tmp, inner2)
+                expr_list_elem_type = inner2
+            }
+            expr_result_str = val_tmp
+            expr_result_type = CT_LIST
         } else if opt_inner >= 0 {
             let opt_c = option_c_type(opt_inner)
             emit_line("{opt_c} {tmp} = {left_str};")
