@@ -20,6 +20,7 @@ pub let mut expr_result_err_struct: Str = ""
 pub let mut expr_option_inner_struct: Str = ""
 pub let mut expr_list_elem_type: Int = -1
 pub let mut expr_option_inner_list_elem: Int = -1
+pub let mut expr_option_inner_list_struct: Str = ""
 pub let mut expr_iter_next_fn: Str = ""
 
 // Helper output for iter_from_source
@@ -161,6 +162,7 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
             expr_option_inner_struct = get_var_option_inner_struct(name)
             if expr_option_inner == CT_LIST {
                 expr_option_inner_list_elem = get_var_option_inner2(name)
+                expr_option_inner_list_struct = get_var_option_inner2_struct(name)
             }
         }
         if expr_result_type == CT_RESULT {
@@ -715,6 +717,10 @@ pub fn emit_binop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Di
             if inner2 >= 0 {
                 set_list_elem_type(val_tmp, inner2)
                 expr_list_elem_type = inner2
+            }
+            let inner2_s = expr_option_inner_list_struct
+            if inner2_s != "" {
+                set_list_elem_struct(val_tmp, inner2_s)
             }
             expr_result_str = val_tmp
             expr_result_type = CT_LIST

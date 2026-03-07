@@ -525,6 +525,14 @@ pub fn bind_pattern_vars(pat: Int, scrut_off: Int, scrut_len: Int) ! Codegen.Emi
                     } else {
                         emit_line("{c_type_str(inner_ct)} {c_bind} = {scrut}.{field};")
                         set_var(bind_name, inner_ct, 0)
+                        if inner_ct == CT_LIST {
+                            if expr_option_inner_list_elem >= 0 {
+                                set_list_elem_type(bind_name, expr_option_inner_list_elem)
+                            }
+                            if expr_option_inner_list_struct != "" {
+                                set_list_elem_struct(bind_name, expr_option_inner_list_struct)
+                            }
+                        }
                     }
                 }
             } else if sub_pk == NodeKind.WildcardPattern {
@@ -1143,6 +1151,10 @@ pub fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
         if expr_option_inner == CT_LIST && expr_option_inner_list_elem != -1 {
             set_var_option_inner2(name, expr_option_inner_list_elem)
             expr_option_inner_list_elem = -1
+            if expr_option_inner_list_struct != "" {
+                set_var_option_inner2_struct(name, expr_option_inner_list_struct)
+                expr_option_inner_list_struct = ""
+            }
         }
     }
     if val_type == CT_RESULT {
@@ -1214,7 +1226,11 @@ pub fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                     if nested_sl != -1 && sublist_length(nested_sl) > 0 {
                         let nested_ann = sublist_get(nested_sl, 0)
                         let nested_name = np_name.get(nested_ann).unwrap()
-                        set_list_nested_elem_type(name, type_from_name(nested_name))
+                        let nested_ct = type_from_name(nested_name)
+                        set_list_nested_elem_type(name, nested_ct)
+                        if nested_ct == CT_VOID && is_struct_type(nested_name) != 0 {
+                            set_list_nested_elem_struct(name, nested_name)
+                        }
                     }
                 }
             }
@@ -1243,6 +1259,10 @@ pub fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
         let src_nested = get_list_nested_elem_type(val_str)
         if src_nested != -1 {
             set_list_nested_elem_type(name, src_nested)
+        }
+        let src_nested_struct = get_list_nested_elem_struct(val_str)
+        if src_nested_struct != "" {
+            set_list_nested_elem_struct(name, src_nested_struct)
         }
     }
     if val_type == CT_ITERATOR {
@@ -1389,6 +1409,16 @@ pub fn emit_for_in(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
                 emit_line("{c_type_str(elem_type)} {c_var_name} = {next_var}.value;")
                 push_scope()
                 set_var(var_name, elem_type, 0)
+                if elem_type == CT_LIST {
+                    let nested_et = get_list_nested_elem_type(iter_str)
+                    if nested_et != -1 {
+                        set_list_elem_type(var_name, nested_et)
+                    }
+                    let nested_es = get_list_nested_elem_struct(iter_str)
+                    if nested_es != "" {
+                        set_list_elem_struct(var_name, nested_es)
+                    }
+                }
                 emit_block(np_body.get(node).unwrap())
                 pop_scope()
                 cg_indent = cg_indent - 1
@@ -2511,7 +2541,11 @@ pub fn emit_top_level_let(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.S
                     if nested_sl != -1 && sublist_length(nested_sl) > 0 {
                         let nested_ann = sublist_get(nested_sl, 0)
                         let nested_name = np_name.get(nested_ann).unwrap()
-                        set_list_nested_elem_type(name, type_from_name(nested_name))
+                        let nested_ct = type_from_name(nested_name)
+                        set_list_nested_elem_type(name, nested_ct)
+                        if nested_ct == CT_VOID && is_struct_type(nested_name) != 0 {
+                            set_list_nested_elem_struct(name, nested_name)
+                        }
                     }
                 }
             }
@@ -2540,6 +2574,10 @@ pub fn emit_top_level_let(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.S
         let src_nested = get_list_nested_elem_type(val_str)
         if src_nested != -1 {
             set_list_nested_elem_type(name, src_nested)
+        }
+        let src_nested_struct = get_list_nested_elem_struct(val_str)
+        if src_nested_struct != "" {
+            set_list_nested_elem_struct(name, src_nested_struct)
         }
     }
     let ts = c_type_str(val_type)

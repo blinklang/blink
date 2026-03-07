@@ -1764,10 +1764,16 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                 if pop_nested != -1 {
                     set_var_option_inner2(res, pop_nested)
                 }
+                let pop_nested_s = get_list_nested_elem_struct(obj_str)
+                if pop_nested_s != "" {
+                    set_var_option_inner2_struct(res, pop_nested_s)
+                }
                 expr_result_str = res
                 expr_result_type = CT_OPTION
                 expr_option_inner = CT_LIST
                 expr_option_inner_struct = ""
+                expr_option_inner_list_elem = pop_nested
+                expr_option_inner_list_struct = pop_nested_s
             } else {
                 ensure_option_type(CT_INT)
                 let opt_type = option_c_type(CT_INT)
@@ -1850,11 +1856,16 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                 if nested_et != -1 {
                     set_var_option_inner2(res, nested_et)
                 }
+                let nested_es = get_list_nested_elem_struct(obj_str)
+                if nested_es != "" {
+                    set_var_option_inner2_struct(res, nested_es)
+                }
                 expr_result_str = res
                 expr_result_type = CT_OPTION
                 expr_option_inner = CT_LIST
                 expr_option_inner_struct = ""
                 expr_option_inner_list_elem = nested_et
+                expr_option_inner_list_struct = nested_es
             } else {
                 ensure_option_type(CT_INT)
                 let opt_type = option_c_type(CT_INT)
@@ -2635,6 +2646,10 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                 } else {
                     set_list_elem_type(val_tmp, CT_INT)
                     expr_list_elem_type = CT_INT
+                }
+                let nested_s = get_var_option_inner2_struct(obj_str)
+                if nested_s != "" {
+                    set_list_elem_struct(val_tmp, nested_s)
                 }
                 expr_result_str = val_tmp
                 expr_result_type = CT_LIST
