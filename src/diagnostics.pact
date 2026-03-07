@@ -318,5 +318,8 @@ pub fn diag_explain(code: Str) -> Str {
     if code == "W0600" {
         return "W0600 -- UnusedVariable\n\nA variable was declared but never read.\n\nCommon causes:\n  - Leftover variable from refactoring\n  - Variable assigned but result never used\n\nFix: remove the variable, or prefix its name with '_' to suppress\nthis warning.\n\n  let _unused = compute()  // OK -- prefixed with '_'"
     }
+    if code == "W0700" {
+        return "W0700 -- UnreachableCode\n\nCode appears after an unconditional return, break, or continue\nstatement and will never execute.\n\nCommon causes:\n  - Leftover code from refactoring\n  - Early return added without removing subsequent code\n\nFix: remove the unreachable code or move it before the control\nflow statement."
+    }
     ""
 }

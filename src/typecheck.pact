@@ -1755,6 +1755,8 @@ pub fn types_compatible(a: Int, b: Int) -> Int {
     if ka == TK_TYPEVAR || kb == TK_TYPEVAR { return 1 }
     // Int and Bool are interchangeable in Pact (C-style truthiness)
     if (ka == TK_INT || ka == TK_BOOL) && (kb == TK_INT || kb == TK_BOOL) { return 1 }
+    // Enums are tag-ints at runtime — Int and Enum are compatible
+    if (ka == TK_INT && kb == TK_ENUM) || (ka == TK_ENUM && kb == TK_INT) { return 1 }
     if ka == kb {
         if ka == TK_LIST || ka == TK_OPTION || ka == TK_ITERATOR {
             return types_compatible(ty_inner1.get(a).unwrap(), ty_inner1.get(b).unwrap())
@@ -1851,7 +1853,7 @@ pub fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.
 
     if kind == NodeKind.UnaryOp {
         let op = np_op.get(node).unwrap()
-        let operand = infer_type(np_right.get(node).unwrap())
+        let operand = infer_type(np_left.get(node).unwrap())
         if op == "!" { return TYPE_BOOL }
         if op == "-" { return operand }
         if op == "?" {
@@ -2211,8 +2213,17 @@ pub fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repo
         let stmts_sl = np_stmts.get(node).unwrap()
         if stmts_sl != -1 {
             let mut i = 0
+            let mut found_terminal = 0
             while i < sublist_length(stmts_sl) {
-                tc_check_body(sublist_get(stmts_sl, i))
+                let stmt = sublist_get(stmts_sl, i)
+                if found_terminal != 0 {
+                    diag_warn_at("UnreachableCode", "W0700", "unreachable code after return/break/continue", stmt, "remove this code or move it before the control flow statement")
+                }
+                tc_check_body(stmt)
+                let sk = np_kind.get(stmt).unwrap()
+                if sk == NodeKind.Return || sk == NodeKind.Break || sk == NodeKind.Continue {
+                    found_terminal = 1
+                }
                 i = i + 1
             }
         }
@@ -2226,7 +2237,7 @@ pub fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repo
         let is_mut = np_is_mut.get(node).unwrap()
 
         let type_str = np_type_name.get(node).unwrap()
-        let type_ann = np_type_ann.get(node).unwrap()
+        let type_ann = np_target.get(node).unwrap()
         let mut declared_tid = TYPE_UNKNOWN
         if type_ann != -1 {
             declared_tid = resolve_type_ann(type_ann)
