@@ -4,7 +4,11 @@
 
 Language spec v0.3. Self-hosting compiler. Targets native binaries via C codegen.
 
-## What's New (v0.13.1)
+## What's New (v0.13.2)
+
+- **Nested struct type propagation** — `List[List[Struct]]` and `Option[List[Struct]]` now correctly propagate inner struct types through `for` loops, `let` bindings, `??`, `.unwrap()`, and `match Some(x)`
+
+### Prior: What's New (v0.13.1)
 
 - **`List[List[T]]` codegen fix** — `.get()`, `.pop()`, `.unwrap()`, and `??` on nested lists now produce correct C types (`pact_Option_list` instead of `pact_Option_int`)
 - **Extended string lexer fix** — `"#{"` no longer misparsed as end delimiter in extended strings

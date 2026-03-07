@@ -1,8 +1,14 @@
 # Pact Language Reference
 
-> Pact is a statically-typed, effect-tracked language compiling to C. Compiler v0.13.1. Language spec v0.3. Self-hosting.
+> Pact is a statically-typed, effect-tracked language compiling to C. Compiler v0.13.2. Language spec v0.3. Self-hosting.
 
-## What's New (v0.13.1)
+## What's New (v0.13.2)
+
+| Change | Details |
+|--------|---------|
+| Nested struct type propagation | `List[List[Struct]]` and `Option[List[Struct]]` now correctly propagate inner struct types through `for` loops, `let` bindings, `??`, `.unwrap()`, and `match Some(x)` |
+
+### Prior: What's New (v0.13.1)
 
 | Change | Details |
 |--------|---------|
