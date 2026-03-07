@@ -1815,6 +1815,18 @@ pub fn emit_impl_method_def(fn_node: Int, impl_type: Str) ! Codegen.Emit, Codege
                                 if elem_ct == CT_VOID && is_struct_type(elem_name) != 0 {
                                     set_list_elem_struct(pname, elem_name)
                                 }
+                                if elem_ct == CT_LIST {
+                                    let nested_sl = np_elements.get(elem_ann).unwrap()
+                                    if nested_sl != -1 && sublist_length(nested_sl) > 0 {
+                                        let nested_ann = sublist_get(nested_sl, 0)
+                                        let nested_name = np_name.get(nested_ann).unwrap()
+                                        let nested_ct = type_from_name(nested_name)
+                                        set_list_nested_elem_type(pname, nested_ct)
+                                        if nested_ct == CT_VOID && is_struct_type(nested_name) != 0 {
+                                            set_list_nested_elem_struct(pname, nested_name)
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -1944,6 +1956,18 @@ pub fn emit_fn_def(fn_node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope
                             set_list_elem_type(pname, elem_ct)
                             if elem_ct == CT_VOID && is_struct_type(elem_name) != 0 {
                                 set_list_elem_struct(pname, elem_name)
+                            }
+                            if elem_ct == CT_LIST {
+                                let nested_sl = np_elements.get(elem_ann).unwrap()
+                                if nested_sl != -1 && sublist_length(nested_sl) > 0 {
+                                    let nested_ann = sublist_get(nested_sl, 0)
+                                    let nested_name = np_name.get(nested_ann).unwrap()
+                                    let nested_ct = type_from_name(nested_name)
+                                    set_list_nested_elem_type(pname, nested_ct)
+                                    if nested_ct == CT_VOID && is_struct_type(nested_name) != 0 {
+                                        set_list_nested_elem_struct(pname, nested_name)
+                                    }
+                                }
                             }
                         }
                     }
@@ -2236,6 +2260,18 @@ pub fn emit_mono_fn_def(fn_node: Int, concrete_args: Str) ! Codegen.Emit, Codege
                         set_list_elem_type(pname, elem_ct)
                         if elem_ct == CT_VOID && is_struct_type(elem_name) != 0 {
                             set_list_elem_struct(pname, elem_name)
+                        }
+                        if elem_ct == CT_LIST {
+                            let nested_sl = np_elements.get(elem_ann).unwrap()
+                            if nested_sl != -1 && sublist_length(nested_sl) > 0 {
+                                let nested_ann = sublist_get(nested_sl, 0)
+                                let nested_name = np_name.get(nested_ann).unwrap()
+                                let nested_ct = type_from_name(nested_name)
+                                set_list_nested_elem_type(pname, nested_ct)
+                                if nested_ct == CT_VOID && is_struct_type(nested_name) != 0 {
+                                    set_list_nested_elem_struct(pname, nested_name)
+                                }
+                            }
                         }
                     }
                 }
