@@ -1,8 +1,14 @@
 # Pact Language Reference
 
-> Pact is a statically-typed, effect-tracked language compiling to C. Compiler v0.13.2. Language spec v0.3. Self-hosting.
+> Pact is a statically-typed, effect-tracked language compiling to C. Compiler v0.13.3. Language spec v0.3. Self-hosting.
 
-## What's New (v0.13.2)
+## What's New (v0.13.3)
+
+| Change | Details |
+|--------|---------|
+| `List[List[T]]` function parameter fix | Nested list parameters now propagate inner element types correctly — `.get()` on inner list no longer produces `pact_Option_int` |
+
+### Prior: What's New (v0.13.2)
 
 | Change | Details |
 |--------|---------|
