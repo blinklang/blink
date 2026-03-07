@@ -4,7 +4,12 @@
 
 Language spec v0.3. Self-hosting compiler. Targets native binaries via C codegen.
 
-## What's New (v0.13.3)
+## What's New (v0.14)
+
+- **Unused variable warnings** — compiler emits W0600 for `let` bindings that are never read; prefix with `_` to suppress
+- **Cross-compilation fix** — removed spurious libcurl link dependency that caused linker failures on non-host targets
+
+### Prior: What's New (v0.13.3)
 
 - **`List[List[T]]` function parameter fix** — nested list parameters now propagate inner element types correctly (`.get()` on inner list no longer produces `pact_Option_int`)
 

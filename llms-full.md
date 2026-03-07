@@ -1,8 +1,15 @@
 # Pact Language Reference
 
-> Pact is a statically-typed, effect-tracked language compiling to C. Compiler v0.13.3. Language spec v0.3. Self-hosting.
+> Pact is a statically-typed, effect-tracked language compiling to C. Compiler v0.14.0. Language spec v0.3. Self-hosting.
 
-## What's New (v0.13.3)
+## What's New (v0.14)
+
+| Change | Details |
+|--------|---------|
+| Unused variable warnings | Compiler emits W0600 for `let` bindings that are never read; prefix with `_` to suppress |
+| Cross-compilation fix | Removed spurious libcurl link dependency that caused linker failures on non-host targets |
+
+### Prior: What's New (v0.13.3)
 
 | Change | Details |
 |--------|---------|
