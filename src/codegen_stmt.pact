@@ -919,7 +919,7 @@ pub fn emit_stmt(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
         emit_expr(np_value.get(node).unwrap())
         let s = expr_result_str
         if s != "" && s != "0" {
-            emit_line("{s};")
+            emit_line("(void){s};")
         }
         return
     }
@@ -1317,6 +1317,9 @@ pub fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             emit_line("const {ts} {cname} = {val_str};")
         }
     }
+    if name.starts_with("_") {
+        emit_line("(void){cname};")
+    }
     if is_mut_captured(name) != 0 {
         let cell_type = c_type_str(val_type)
         emit_line("{cell_type}* {cname}_cell = ({cell_type}*)pact_alloc(sizeof({cell_type}));")
@@ -1428,7 +1431,7 @@ pub fn emit_for_in(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
             let elem_type = get_var_iterator_inner(iter_str)
             let next_fn = get_var_iter_next_fn(iter_str)
             let opt_type = option_c_type(elem_type)
-            let iter_var = fresh_temp("__iter_")
+            let _iter_var = fresh_temp("__iter_")
             let next_var = fresh_temp("__next_")
             emit_line("while (1) \{")
             cg_indent = cg_indent + 1
@@ -2620,7 +2623,7 @@ pub fn emit_top_level_let(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.S
     let cname = c_safe_name(name)
     let needs_init = helper_lines.len() > 0 || val_type == CT_LIST || val_type == CT_MAP
     if needs_init {
-        emit_line("static {ts} {cname};")
+        emit_line("PACT_UNUSED static {ts} {cname};")
         let mut hi = 0
         while hi < helper_lines.len() {
             cg_global_inits.push(helper_lines.get(hi).unwrap())
@@ -2628,9 +2631,9 @@ pub fn emit_top_level_let(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.S
         }
         cg_global_inits.push("    ".concat(cname).concat(" = ").concat(val_str).concat(";"))
     } else if is_mut != 0 {
-        emit_line("static ".concat(ts).concat(" ").concat(cname).concat(" = ").concat(val_str).concat(";"))
+        emit_line("PACT_UNUSED static ".concat(ts).concat(" ").concat(cname).concat(" = ").concat(val_str).concat(";"))
     } else {
-        let qualifier = if val_type == CT_STRING { "static " } else { "static const " }
+        let qualifier = if val_type == CT_STRING { "PACT_UNUSED static " } else { "PACT_UNUSED static const " }
         emit_line(qualifier.concat(ts).concat(" ").concat(cname).concat(" = ").concat(val_str).concat(";"))
     }
 }

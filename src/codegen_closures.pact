@@ -724,7 +724,6 @@ pub fn emit_closure(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
     closure_cap_infos.push(ClosureCapInfo { start: cap_start, count: captures.len() })
 
     // Build C parameter list: __self first if captures, then user params
-    let has_caps = captures.len() > 0
     let saved_param_hint = cg_closure_param_type_hint
     let mut params_c = "const pact_closure* __self"
     if params_sl != -1 && sublist_length(params_sl) > 0 {
@@ -814,7 +813,6 @@ pub fn emit_closure(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
     }
     emit_line("static {ret_c_str} {cname}({params_c}) \{")
     cg_indent = cg_indent + 1
-    let mut mc_done: List[Str] = []
     let mut mc_i = 0
     while mc_i < captures.len() {
         let mc_e = closure_captures.get(cap_start + mc_i).unwrap()

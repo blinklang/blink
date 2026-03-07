@@ -347,7 +347,6 @@ fn emit_deser_field(target: Str, node_var: Str, field_type: Int, stype: Str, str
 }
 
 fn emit_list_deserialize(target: Str, node_var: Str, struct_name: Str, field_name: Str) ! Codegen.Emit {
-    let elem_struct = get_struct_field_list_elem(struct_name, field_name)
     let elem_type = get_struct_field_list_elem_type(struct_name, field_name)
     emit_line("{target} = pact_list_new();")
     emit_line("\{")

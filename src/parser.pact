@@ -374,7 +374,6 @@ pub fn parse_program() -> Int ! Parse, Diag.Report {
     let mut let_nodes: List[Int] = []
     let mut trait_nodes: List[Int] = []
     let mut impl_nodes: List[Int] = []
-    let mut fn_pub: List[Int] = []
     let mut import_nodes: List[Int] = []
     let mut effect_decl_nodes: List[Int] = []
     let mut test_nodes: List[Int] = []
@@ -1078,7 +1077,6 @@ pub fn parse_fn_def() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
     }
     expect(TokenKind.RParen)
     finalize_sublist(params)
-    let ret_type = ""
     let mut ret_str = ""
     let mut ret_ann = -1
     if at(TokenKind.Arrow) {
@@ -1116,7 +1114,6 @@ pub fn parse_fn_def() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         finalize_sublist(effects_sl)
     }
     skip_newlines()
-    let body = -1
     let mut body_id = -1
     if at(TokenKind.LBrace) {
         body_id = parse_block()
@@ -1438,7 +1435,6 @@ pub fn parse_block() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
     expect(TokenKind.LBrace)
     skip_newlines()
     let stmts = new_sublist()
-    let mut trailing_comments: List[Str] = []
     while !at(TokenKind.RBrace) && !at(TokenKind.EOF) {
         let stmt = parse_stmt()
         sublist_push(stmts, stmt)
@@ -1446,7 +1442,6 @@ pub fn parse_block() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         skip_newlines()
     }
     let block_trailing = pending_comments
-    let block_trailing_doc = pending_doc_comment
     pending_comments = []
     pending_doc_comment = ""
     let rbrace_line = peek_line()

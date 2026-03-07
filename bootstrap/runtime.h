@@ -29,19 +29,25 @@
 #include <sys/time.h>
 #include <strings.h>
 
-static const char* pact_int_to_str(int64_t n) {
+#ifdef __GNUC__
+#define PACT_UNUSED __attribute__((unused))
+#else
+#define PACT_UNUSED
+#endif
+
+PACT_UNUSED static const char* pact_int_to_str(int64_t n) {
     char buf[32];
     snprintf(buf, sizeof(buf), "%lld", (long long)n);
     return strdup(buf);
 }
 
-static const char* pact_float_to_str(double d) {
+PACT_UNUSED static const char* pact_float_to_str(double d) {
     char buf[64];
     snprintf(buf, sizeof(buf), "%g", d);
     return strdup(buf);
 }
 
-static void* pact_alloc(int64_t size) {
+PACT_UNUSED static void* pact_alloc(int64_t size) {
     void* p = malloc((size_t)size);
     if (!p) {
         fprintf(stderr, "pact: out of memory\n");
@@ -56,7 +62,7 @@ typedef struct {
     int64_t cap;
 } pact_list;
 
-static pact_list* pact_list_new(void) {
+PACT_UNUSED static pact_list* pact_list_new(void) {
     pact_list* l = (pact_list*)pact_alloc(sizeof(pact_list));
     l->cap = 8;
     l->len = 0;
@@ -64,7 +70,7 @@ static pact_list* pact_list_new(void) {
     return l;
 }
 
-static void pact_list_push(pact_list* l, void* item) {
+PACT_UNUSED static void pact_list_push(pact_list* l, void* item) {
     if (l->len >= l->cap) {
         l->cap *= 2;
         l->items = (void**)realloc(l->items, sizeof(void*) * (size_t)l->cap);
@@ -76,7 +82,7 @@ static void pact_list_push(pact_list* l, void* item) {
     l->items[l->len++] = item;
 }
 
-static void* pact_list_get(const pact_list* l, int64_t index) {
+PACT_UNUSED static void* pact_list_get(const pact_list* l, int64_t index) {
     if (index < 0 || index >= l->len) {
         fprintf(stderr, "pact: list index out of bounds: idx=%lld len=%lld\n", (long long)index, (long long)l->len);
         exit(1);
@@ -84,15 +90,15 @@ static void* pact_list_get(const pact_list* l, int64_t index) {
     return l->items[index];
 }
 
-static int pact_list_in_bounds(const pact_list* l, int64_t index) {
+PACT_UNUSED static int pact_list_in_bounds(const pact_list* l, int64_t index) {
     return (index >= 0 && index < l->len);
 }
 
-static int64_t pact_list_len(const pact_list* l) {
+PACT_UNUSED static int64_t pact_list_len(const pact_list* l) {
     return l->len;
 }
 
-static void pact_list_set(pact_list* l, int64_t index, void* item) {
+PACT_UNUSED static void pact_list_set(pact_list* l, int64_t index, void* item) {
     if (index < 0 || index >= l->len) {
         fprintf(stderr, "pact: list set index out of bounds: %lld\n", (long long)index);
         exit(1);
@@ -100,7 +106,7 @@ static void pact_list_set(pact_list* l, int64_t index, void* item) {
     l->items[index] = item;
 }
 
-static void* pact_list_pop(pact_list* l) {
+PACT_UNUSED static void* pact_list_pop(pact_list* l) {
     if (l->len <= 0) {
         fprintf(stderr, "pact: list pop on empty list\n");
         exit(1);
@@ -109,7 +115,7 @@ static void* pact_list_pop(pact_list* l) {
     return l->items[l->len];
 }
 
-static void pact_list_free(pact_list* l) {
+PACT_UNUSED static void pact_list_free(pact_list* l) {
     if (l) {
         free(l->items);
         free(l);
@@ -118,9 +124,9 @@ static void pact_list_free(pact_list* l) {
 
 /* ── Hash map (string-keyed) ────────────────────────────────────────── */
 
-static int pact_str_eq(const char* a, const char* b);
+PACT_UNUSED static int pact_str_eq(const char* a, const char* b);
 
-static uint64_t pact_map_hash(const char* key) {
+PACT_UNUSED static uint64_t pact_map_hash(const char* key) {
     uint64_t h = 14695981039346656037ULL;
     for (const char* p = key; *p; p++) {
         h ^= (uint64_t)(unsigned char)*p;
@@ -137,7 +143,7 @@ typedef struct {
     int64_t cap;
 } pact_map;
 
-static pact_map* pact_map_new(void) {
+PACT_UNUSED static pact_map* pact_map_new(void) {
     pact_map* m = (pact_map*)pact_alloc(sizeof(pact_map));
     m->cap = 16;
     m->len = 0;
@@ -148,7 +154,7 @@ static pact_map* pact_map_new(void) {
     return m;
 }
 
-static void pact_map_grow(pact_map* m) {
+PACT_UNUSED static void pact_map_grow(pact_map* m) {
     int64_t old_cap = m->cap;
     const char** old_keys = m->keys;
     void** old_values = m->values;
@@ -177,7 +183,7 @@ static void pact_map_grow(pact_map* m) {
     free(old_states);
 }
 
-static void pact_map_set(pact_map* m, const char* key, void* value) {
+PACT_UNUSED static void pact_map_set(pact_map* m, const char* key, void* value) {
     if (m->len * 10 >= m->cap * 7) {
         pact_map_grow(m);
     }
@@ -203,7 +209,7 @@ static void pact_map_set(pact_map* m, const char* key, void* value) {
     }
 }
 
-static void* pact_map_get(const pact_map* m, const char* key) {
+PACT_UNUSED static void* pact_map_get(const pact_map* m, const char* key) {
     uint64_t h = pact_map_hash(key);
     int64_t idx = (int64_t)(h % (uint64_t)m->cap);
     while (m->states[idx] != 0) {
@@ -215,7 +221,7 @@ static void* pact_map_get(const pact_map* m, const char* key) {
     return NULL;
 }
 
-static int64_t pact_map_has(const pact_map* m, const char* key) {
+PACT_UNUSED static int64_t pact_map_has(const pact_map* m, const char* key) {
     uint64_t h = pact_map_hash(key);
     int64_t idx = (int64_t)(h % (uint64_t)m->cap);
     while (m->states[idx] != 0) {
@@ -227,7 +233,7 @@ static int64_t pact_map_has(const pact_map* m, const char* key) {
     return 0;
 }
 
-static int64_t pact_map_remove(pact_map* m, const char* key) {
+PACT_UNUSED static int64_t pact_map_remove(pact_map* m, const char* key) {
     uint64_t h = pact_map_hash(key);
     int64_t idx = (int64_t)(h % (uint64_t)m->cap);
     while (m->states[idx] != 0) {
@@ -241,11 +247,11 @@ static int64_t pact_map_remove(pact_map* m, const char* key) {
     return 0;
 }
 
-static int64_t pact_map_len(const pact_map* m) {
+PACT_UNUSED static int64_t pact_map_len(const pact_map* m) {
     return m->len;
 }
 
-static pact_list* pact_map_keys(const pact_map* m) {
+PACT_UNUSED static pact_list* pact_map_keys(const pact_map* m) {
     pact_list* result = pact_list_new();
     for (int64_t i = 0; i < m->cap; i++) {
         if (m->states[i] == 1) {
@@ -255,7 +261,7 @@ static pact_list* pact_map_keys(const pact_map* m) {
     return result;
 }
 
-static pact_list* pact_map_values(const pact_map* m) {
+PACT_UNUSED static pact_list* pact_map_values(const pact_map* m) {
     pact_list* result = pact_list_new();
     for (int64_t i = 0; i < m->cap; i++) {
         if (m->states[i] == 1) {
@@ -265,7 +271,7 @@ static pact_list* pact_map_values(const pact_map* m) {
     return result;
 }
 
-static void pact_map_free(pact_map* m) {
+PACT_UNUSED static void pact_map_free(pact_map* m) {
     if (m) {
         free(m->keys);
         free(m->values);
@@ -282,7 +288,7 @@ typedef struct {
     int64_t cap;
 } pact_bytes;
 
-static pact_bytes* pact_bytes_new(void) {
+PACT_UNUSED static pact_bytes* pact_bytes_new(void) {
     pact_bytes* b = (pact_bytes*)pact_alloc(sizeof(pact_bytes));
     b->cap = 16;
     b->len = 0;
@@ -290,7 +296,7 @@ static pact_bytes* pact_bytes_new(void) {
     return b;
 }
 
-static void pact_bytes_push(pact_bytes* b, int64_t byte) {
+PACT_UNUSED static void pact_bytes_push(pact_bytes* b, int64_t byte) {
     if (b->len >= b->cap) {
         b->cap *= 2;
         b->data = (uint8_t*)realloc(b->data, (size_t)b->cap);
@@ -299,12 +305,12 @@ static void pact_bytes_push(pact_bytes* b, int64_t byte) {
     b->data[b->len++] = (uint8_t)(byte & 0xFF);
 }
 
-static int64_t pact_bytes_get(const pact_bytes* b, int64_t index) {
+PACT_UNUSED static int64_t pact_bytes_get(const pact_bytes* b, int64_t index) {
     if (index < 0 || index >= b->len) return -1;
     return (int64_t)b->data[index];
 }
 
-static void pact_bytes_set(pact_bytes* b, int64_t index, int64_t byte) {
+PACT_UNUSED static void pact_bytes_set(pact_bytes* b, int64_t index, int64_t byte) {
     if (index < 0 || index >= b->len) {
         fprintf(stderr, "pact: bytes set index out of bounds: %lld\n", (long long)index);
         exit(1);
@@ -312,15 +318,15 @@ static void pact_bytes_set(pact_bytes* b, int64_t index, int64_t byte) {
     b->data[index] = (uint8_t)(byte & 0xFF);
 }
 
-static int64_t pact_bytes_len(const pact_bytes* b) {
+PACT_UNUSED static int64_t pact_bytes_len(const pact_bytes* b) {
     return b->len;
 }
 
-static int64_t pact_bytes_is_empty(const pact_bytes* b) {
+PACT_UNUSED static int64_t pact_bytes_is_empty(const pact_bytes* b) {
     return b->len == 0;
 }
 
-static pact_bytes* pact_bytes_concat(const pact_bytes* a, const pact_bytes* b) {
+PACT_UNUSED static pact_bytes* pact_bytes_concat(const pact_bytes* a, const pact_bytes* b) {
     pact_bytes* r = pact_bytes_new();
     int64_t total = a->len + b->len;
     if (total > r->cap) {
@@ -333,7 +339,7 @@ static pact_bytes* pact_bytes_concat(const pact_bytes* a, const pact_bytes* b) {
     return r;
 }
 
-static pact_bytes* pact_bytes_slice(const pact_bytes* b, int64_t start, int64_t end) {
+PACT_UNUSED static pact_bytes* pact_bytes_slice(const pact_bytes* b, int64_t start, int64_t end) {
     if (start < 0) start = 0;
     if (end > b->len) end = b->len;
     if (start > end) start = end;
@@ -350,7 +356,7 @@ static pact_bytes* pact_bytes_slice(const pact_bytes* b, int64_t start, int64_t 
     return r;
 }
 
-static int pact_bytes_to_str_checked(const pact_bytes* b, const char** out) {
+PACT_UNUSED static int pact_bytes_to_str_checked(const pact_bytes* b, const char** out) {
     int64_t i = 0;
     while (i < b->len) {
         uint8_t c = b->data[i];
@@ -373,7 +379,7 @@ static int pact_bytes_to_str_checked(const pact_bytes* b, const char** out) {
     return 1;
 }
 
-static const char* pact_bytes_to_hex(const pact_bytes* b) {
+PACT_UNUSED static const char* pact_bytes_to_hex(const pact_bytes* b) {
     char* hex = (char*)pact_alloc(b->len * 2 + 1);
     for (int64_t i = 0; i < b->len; i++) {
         sprintf(hex + i * 2, "%02x", b->data[i]);
@@ -382,7 +388,7 @@ static const char* pact_bytes_to_hex(const pact_bytes* b) {
     return hex;
 }
 
-static pact_bytes* pact_bytes_from_str(const char* s) {
+PACT_UNUSED static pact_bytes* pact_bytes_from_str(const char* s) {
     pact_bytes* b = pact_bytes_new();
     int64_t slen = (int64_t)strlen(s);
     if (slen > b->cap) {
@@ -394,29 +400,29 @@ static pact_bytes* pact_bytes_from_str(const char* s) {
     return b;
 }
 
-static int64_t pact_str_len(const char* s) {
+PACT_UNUSED static int64_t pact_str_len(const char* s) {
     return (int64_t)strlen(s);
 }
 
-static int64_t pact_str_char_at(const char* s, int64_t i) {
+PACT_UNUSED static int64_t pact_str_char_at(const char* s, int64_t i) {
     return (int64_t)(unsigned char)s[i];
 }
 
-static const char* pact_str_substr(const char* s, int64_t start, int64_t len) {
+PACT_UNUSED static const char* pact_str_substr(const char* s, int64_t start, int64_t len) {
     char* buf = (char*)pact_alloc(len + 1);
     memcpy(buf, s + start, (size_t)len);
     buf[len] = '\0';
     return buf;
 }
 
-static const char* pact_str_from_char_code(int64_t code) {
+PACT_UNUSED static const char* pact_str_from_char_code(int64_t code) {
     char* buf = (char*)pact_alloc(2);
     buf[0] = (char)code;
     buf[1] = '\0';
     return buf;
 }
 
-static const char* pact_str_concat(const char* a, const char* b) {
+PACT_UNUSED static const char* pact_str_concat(const char* a, const char* b) {
     int64_t la = pact_str_len(a);
     int64_t lb = pact_str_len(b);
     char* buf = (char*)pact_alloc(la + lb + 1);
@@ -426,27 +432,27 @@ static const char* pact_str_concat(const char* a, const char* b) {
     return buf;
 }
 
-static int pact_str_eq(const char* a, const char* b) {
+PACT_UNUSED static int pact_str_eq(const char* a, const char* b) {
     return strcmp(a, b) == 0;
 }
 
-static int pact_str_contains(const char* s, const char* needle) {
+PACT_UNUSED static int pact_str_contains(const char* s, const char* needle) {
     return strstr(s, needle) != NULL;
 }
 
-static int pact_str_starts_with(const char* s, const char* prefix) {
+PACT_UNUSED static int pact_str_starts_with(const char* s, const char* prefix) {
     size_t plen = strlen(prefix);
     return strncmp(s, prefix, plen) == 0;
 }
 
-static int pact_str_ends_with(const char* s, const char* suffix) {
+PACT_UNUSED static int pact_str_ends_with(const char* s, const char* suffix) {
     size_t slen = strlen(s);
     size_t sufflen = strlen(suffix);
     if (sufflen > slen) return 0;
     return memcmp(s + slen - sufflen, suffix, sufflen) == 0;
 }
 
-static const char* pact_read_file(const char* path) {
+PACT_UNUSED static const char* pact_read_file(const char* path) {
     FILE* f = fopen(path, "rb");
     if (!f) {
         fprintf(stderr, "pact: cannot open file: %s\n", path);
@@ -462,7 +468,7 @@ static const char* pact_read_file(const char* path) {
     return buf;
 }
 
-static void pact_write_file(const char* path, const char* content) {
+PACT_UNUSED static void pact_write_file(const char* path, const char* content) {
     FILE* f = fopen(path, "wb");
     if (!f) {
         fprintf(stderr, "pact: cannot open file for writing: %s\n", path);
@@ -473,14 +479,14 @@ static void pact_write_file(const char* path, const char* content) {
     fclose(f);
 }
 
-static int pact_g_argc = 0;
-static const char** pact_g_argv = NULL;
+PACT_UNUSED static int pact_g_argc = 0;
+PACT_UNUSED static const char** pact_g_argv = NULL;
 
-static int64_t pact_arg_count(void) {
+PACT_UNUSED static int64_t pact_arg_count(void) {
     return (int64_t)pact_g_argc;
 }
 
-static const char* pact_get_arg(int64_t index) {
+PACT_UNUSED static const char* pact_get_arg(int64_t index) {
     if (index < 0 || index >= pact_g_argc) {
         fprintf(stderr, "pact: arg index out of bounds: %lld\n", (long long)index);
         exit(1);
@@ -488,17 +494,17 @@ static const char* pact_get_arg(int64_t index) {
     return pact_g_argv[index];
 }
 
-static int64_t pact_file_exists(const char* path) {
+PACT_UNUSED static int64_t pact_file_exists(const char* path) {
     return access(path, F_OK) == 0 ? 1 : 0;
 }
 
-static int64_t pact_is_dir(const char* path) {
+PACT_UNUSED static int64_t pact_is_dir(const char* path) {
     struct stat st;
     if (stat(path, &st) != 0) return 0;
     return S_ISDIR(st.st_mode) ? 1 : 0;
 }
 
-static pact_list* pact_list_dir(const char* path) {
+PACT_UNUSED static pact_list* pact_list_dir(const char* path) {
     pact_list* result = pact_list_new();
     DIR* d = opendir(path);
     if (!d) return result;
@@ -514,7 +520,7 @@ static pact_list* pact_list_dir(const char* path) {
 
 /* ── Unix domain sockets ────────────────────────────────────────────── */
 
-static int64_t pact_unix_socket_listen(const char* path) {
+PACT_UNUSED static int64_t pact_unix_socket_listen(const char* path) {
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) {
         fprintf(stderr, "pact: socket() failed\n");
@@ -538,7 +544,7 @@ static int64_t pact_unix_socket_listen(const char* path) {
     return (int64_t)fd;
 }
 
-static int64_t pact_unix_socket_connect(const char* path) {
+PACT_UNUSED static int64_t pact_unix_socket_connect(const char* path) {
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) {
         fprintf(stderr, "pact: socket() failed\n");
@@ -556,7 +562,7 @@ static int64_t pact_unix_socket_connect(const char* path) {
     return (int64_t)fd;
 }
 
-static int64_t pact_unix_socket_accept(int64_t listen_fd) {
+PACT_UNUSED static int64_t pact_unix_socket_accept(int64_t listen_fd) {
     int client = accept((int)listen_fd, NULL, NULL);
     if (client < 0) {
         fprintf(stderr, "pact: accept() failed\n");
@@ -565,7 +571,7 @@ static int64_t pact_unix_socket_accept(int64_t listen_fd) {
     return (int64_t)client;
 }
 
-static int64_t pact_unix_socket_accept_timeout(int64_t listen_fd, int64_t timeout_ms) {
+PACT_UNUSED static int64_t pact_unix_socket_accept_timeout(int64_t listen_fd, int64_t timeout_ms) {
     struct pollfd pfd;
     pfd.fd = (int)listen_fd;
     pfd.events = POLLIN;
@@ -577,11 +583,11 @@ static int64_t pact_unix_socket_accept_timeout(int64_t listen_fd, int64_t timeou
     return (int64_t)client;
 }
 
-static void pact_unix_socket_close(int64_t fd) {
+PACT_UNUSED static void pact_unix_socket_close(int64_t fd) {
     close((int)fd);
 }
 
-static const char* pact_socket_read_line(int64_t fd) {
+PACT_UNUSED static const char* pact_socket_read_line(int64_t fd) {
     char buf[4096];
     int64_t pos = 0;
     while (pos < (int64_t)(sizeof(buf) - 1)) {
@@ -595,7 +601,7 @@ static const char* pact_socket_read_line(int64_t fd) {
     return strdup(buf);
 }
 
-static void pact_socket_write(int64_t fd, const char* data) {
+PACT_UNUSED static void pact_socket_write(int64_t fd, const char* data) {
     size_t len = strlen(data);
     size_t written = 0;
     while (written < len) {
@@ -607,7 +613,7 @@ static void pact_socket_write(int64_t fd, const char* data) {
 
 /* ── File stat ──────────────────────────────────────────────────────── */
 
-static int64_t pact_file_mtime(const char* path) {
+PACT_UNUSED static int64_t pact_file_mtime(const char* path) {
     struct stat st;
     if (stat(path, &st) != 0) return -1;
 #ifdef __APPLE__
@@ -621,13 +627,13 @@ static int64_t pact_file_mtime(const char* path) {
 
 /* ── Process info ───────────────────────────────────────────────────── */
 
-static int64_t pact_getpid(void) {
+PACT_UNUSED static int64_t pact_getpid(void) {
     return (int64_t)getpid();
 }
 
-static void pact_exit(int64_t code) { exit((int)code); }
+PACT_UNUSED static void pact_exit(int64_t code) { exit((int)code); }
 
-static const char* pact_path_join(const char* a, const char* b) {
+PACT_UNUSED static const char* pact_path_join(const char* a, const char* b) {
     int64_t la = pact_str_len(a);
     int64_t lb = pact_str_len(b);
     int has_slash = (la > 0 && a[la-1] == '/') ? 1 : 0;
@@ -642,7 +648,7 @@ static const char* pact_path_join(const char* a, const char* b) {
     return buf;
 }
 
-static const char* pact_path_dirname(const char* path) {
+PACT_UNUSED static const char* pact_path_dirname(const char* path) {
     int64_t len = pact_str_len(path);
     int64_t i = len - 1;
     while (i >= 0 && path[i] != '/') {
@@ -657,7 +663,7 @@ static const char* pact_path_dirname(const char* path) {
     return pact_str_substr(path, 0, i);
 }
 
-static const char* pact_path_basename(const char* path) {
+PACT_UNUSED static const char* pact_path_basename(const char* path) {
     int64_t len = pact_str_len(path);
     int64_t i = len - 1;
     while (i >= 0 && path[i] != '/') {
@@ -671,7 +677,7 @@ static const char* pact_path_basename(const char* path) {
     return buf;
 }
 
-static int64_t pact_shell_exec(const char* command) {
+PACT_UNUSED static int64_t pact_shell_exec(const char* command) {
     int status = system(command);
 #ifdef _WIN32
     return (int64_t)status;
@@ -695,7 +701,7 @@ typedef struct {
     int64_t capture_count;
 } pact_closure;
 
-static pact_closure* pact_closure_new(void* fn_ptr, void** captures, int64_t capture_count) {
+PACT_UNUSED static pact_closure* pact_closure_new(void* fn_ptr, void** captures, int64_t capture_count) {
     pact_closure* c = (pact_closure*)pact_alloc(sizeof(pact_closure));
     c->fn_ptr = fn_ptr;
     c->captures = captures;
@@ -703,11 +709,11 @@ static pact_closure* pact_closure_new(void* fn_ptr, void** captures, int64_t cap
     return c;
 }
 
-static void* pact_closure_get_fn(const pact_closure* c) {
+PACT_UNUSED static void* pact_closure_get_fn(const pact_closure* c) {
     return c->fn_ptr;
 }
 
-static void* pact_closure_get_capture(const pact_closure* c, int64_t index) {
+PACT_UNUSED static void* pact_closure_get_capture(const pact_closure* c, int64_t index) {
     if (index < 0 || index >= c->capture_count) {
         fprintf(stderr, "pact: closure capture index out of bounds: %lld\n", (long long)index);
         exit(1);
@@ -732,15 +738,15 @@ typedef struct {
     void  (*log)(const char* msg);
 } pact_io_vtable;
 
-static void pact_io_default_print(const char* msg) {
+PACT_UNUSED static void pact_io_default_print(const char* msg) {
     printf("%s\n", msg);
 }
 
-static void pact_io_default_log(const char* msg) {
+PACT_UNUSED static void pact_io_default_log(const char* msg) {
     fprintf(stderr, "[LOG] %s\n", msg);
 }
 
-static pact_io_vtable pact_io_vtable_default = {
+PACT_UNUSED static pact_io_vtable pact_io_vtable_default = {
     pact_io_default_print,
     pact_io_default_log
 };
@@ -753,26 +759,26 @@ typedef struct {
     int         (*watch)(const char* path, void (*callback)(const char*));
 } pact_fs_vtable;
 
-static const char* pact_fs_default_read(const char* path) {
+PACT_UNUSED static const char* pact_fs_default_read(const char* path) {
     return pact_read_file(path);
 }
 
-static int pact_fs_default_write(const char* path, const char* content) {
+PACT_UNUSED static int pact_fs_default_write(const char* path, const char* content) {
     pact_write_file(path, content);
     return 0;
 }
 
-static int pact_fs_default_delete(const char* path) {
+PACT_UNUSED static int pact_fs_default_delete(const char* path) {
     return remove(path);
 }
 
-static int pact_fs_default_watch(const char* path, void (*callback)(const char*)) {
+PACT_UNUSED static int pact_fs_default_watch(const char* path, void (*callback)(const char*)) {
     (void)path; (void)callback;
     fprintf(stderr, "pact: fs.watch not implemented\n");
     return -1;
 }
 
-static pact_fs_vtable pact_fs_vtable_default = {
+PACT_UNUSED static pact_fs_vtable pact_fs_vtable_default = {
     pact_fs_default_read,
     pact_fs_default_write,
     pact_fs_default_delete,
@@ -786,25 +792,25 @@ typedef struct {
     const char* (*dns)(const char* hostname);
 } pact_net_vtable;
 
-static int pact_net_default_connect(const char* url) {
+PACT_UNUSED static int pact_net_default_connect(const char* url) {
     (void)url;
     fprintf(stderr, "pact: net.connect not implemented\n");
     return -1;
 }
 
-static int pact_net_default_listen(const char* addr, int port) {
+PACT_UNUSED static int pact_net_default_listen(const char* addr, int port) {
     (void)addr; (void)port;
     fprintf(stderr, "pact: net.listen not implemented\n");
     return -1;
 }
 
-static const char* pact_net_default_dns(const char* hostname) {
+PACT_UNUSED static const char* pact_net_default_dns(const char* hostname) {
     (void)hostname;
     fprintf(stderr, "pact: net.dns not implemented\n");
     return NULL;
 }
 
-static pact_net_vtable pact_net_vtable_default = {
+PACT_UNUSED static pact_net_vtable pact_net_vtable_default = {
     pact_net_default_connect,
     pact_net_default_listen,
     pact_net_default_dns
@@ -817,25 +823,25 @@ typedef struct {
     int         (*admin)(const char* query);
 } pact_db_vtable;
 
-static const char* pact_db_default_read(const char* query) {
+PACT_UNUSED static const char* pact_db_default_read(const char* query) {
     (void)query;
     fprintf(stderr, "pact: db.read not implemented\n");
     return NULL;
 }
 
-static int pact_db_default_write(const char* query) {
+PACT_UNUSED static int pact_db_default_write(const char* query) {
     (void)query;
     fprintf(stderr, "pact: db.write not implemented\n");
     return -1;
 }
 
-static int pact_db_default_admin(const char* query) {
+PACT_UNUSED static int pact_db_default_admin(const char* query) {
     (void)query;
     fprintf(stderr, "pact: db.admin not implemented\n");
     return -1;
 }
 
-static pact_db_vtable pact_db_vtable_default = {
+PACT_UNUSED static pact_db_vtable pact_db_vtable_default = {
     pact_db_default_read,
     pact_db_default_write,
     pact_db_default_admin
@@ -849,31 +855,31 @@ typedef struct {
     const char* (*decrypt)(const char* data, const char* key);
 } pact_crypto_vtable;
 
-static const char* pact_crypto_default_hash(const char* data) {
+PACT_UNUSED static const char* pact_crypto_default_hash(const char* data) {
     (void)data;
     fprintf(stderr, "pact: crypto.hash not implemented\n");
     return NULL;
 }
 
-static const char* pact_crypto_default_sign(const char* data, const char* key) {
+PACT_UNUSED static const char* pact_crypto_default_sign(const char* data, const char* key) {
     (void)data; (void)key;
     fprintf(stderr, "pact: crypto.sign not implemented\n");
     return NULL;
 }
 
-static const char* pact_crypto_default_encrypt(const char* data, const char* key) {
+PACT_UNUSED static const char* pact_crypto_default_encrypt(const char* data, const char* key) {
     (void)data; (void)key;
     fprintf(stderr, "pact: crypto.encrypt not implemented\n");
     return NULL;
 }
 
-static const char* pact_crypto_default_decrypt(const char* data, const char* key) {
+PACT_UNUSED static const char* pact_crypto_default_decrypt(const char* data, const char* key) {
     (void)data; (void)key;
     fprintf(stderr, "pact: crypto.decrypt not implemented\n");
     return NULL;
 }
 
-static pact_crypto_vtable pact_crypto_vtable_default = {
+PACT_UNUSED static pact_crypto_vtable pact_crypto_vtable_default = {
     pact_crypto_default_hash,
     pact_crypto_default_sign,
     pact_crypto_default_encrypt,
@@ -887,27 +893,27 @@ typedef struct {
     void    (*rand_bytes)(void* buf, int64_t len);
 } pact_rand_vtable;
 
-static int pact_rand_seeded = 0;
+PACT_UNUSED static int pact_rand_seeded = 0;
 
-static void pact_rand_ensure_seed(void) {
+PACT_UNUSED static void pact_rand_ensure_seed(void) {
     if (!pact_rand_seeded) {
         srand((unsigned)42);
         pact_rand_seeded = 1;
     }
 }
 
-static int64_t pact_rand_default_int(int64_t min, int64_t max) {
+PACT_UNUSED static int64_t pact_rand_default_int(int64_t min, int64_t max) {
     pact_rand_ensure_seed();
     if (min >= max) return min;
     return min + (int64_t)(rand() % (int)(max - min));
 }
 
-static double pact_rand_default_float(void) {
+PACT_UNUSED static double pact_rand_default_float(void) {
     pact_rand_ensure_seed();
     return (double)rand() / (double)RAND_MAX;
 }
 
-static void pact_rand_default_bytes(void* buf, int64_t len) {
+PACT_UNUSED static void pact_rand_default_bytes(void* buf, int64_t len) {
     pact_rand_ensure_seed();
     unsigned char* p = (unsigned char*)buf;
     for (int64_t i = 0; i < len; i++) {
@@ -915,7 +921,7 @@ static void pact_rand_default_bytes(void* buf, int64_t len) {
     }
 }
 
-static pact_rand_vtable pact_rand_vtable_default = {
+PACT_UNUSED static pact_rand_vtable pact_rand_vtable_default = {
     pact_rand_default_int,
     pact_rand_default_float,
     pact_rand_default_bytes
@@ -927,30 +933,30 @@ typedef struct { int64_t nanos; } pact_duration;
 typedef struct { int64_t nanos; } pact_instant;
 
 /* Duration constructors */
-static pact_duration pact_duration_nanos(int64_t n)   { return (pact_duration){.nanos = n}; }
-static pact_duration pact_duration_ms(int64_t ms)     { return (pact_duration){.nanos = ms * 1000000LL}; }
-static pact_duration pact_duration_seconds(int64_t s) { return (pact_duration){.nanos = s * 1000000000LL}; }
-static pact_duration pact_duration_minutes(int64_t m) { return (pact_duration){.nanos = m * 60LL * 1000000000LL}; }
-static pact_duration pact_duration_hours(int64_t h)   { return (pact_duration){.nanos = h * 3600LL * 1000000000LL}; }
+PACT_UNUSED static pact_duration pact_duration_nanos(int64_t n)   { return (pact_duration){.nanos = n}; }
+PACT_UNUSED static pact_duration pact_duration_ms(int64_t ms)     { return (pact_duration){.nanos = ms * 1000000LL}; }
+PACT_UNUSED static pact_duration pact_duration_seconds(int64_t s) { return (pact_duration){.nanos = s * 1000000000LL}; }
+PACT_UNUSED static pact_duration pact_duration_minutes(int64_t m) { return (pact_duration){.nanos = m * 60LL * 1000000000LL}; }
+PACT_UNUSED static pact_duration pact_duration_hours(int64_t h)   { return (pact_duration){.nanos = h * 3600LL * 1000000000LL}; }
 
 /* Duration conversions */
-static int64_t pact_duration_to_nanos(pact_duration d)   { return d.nanos; }
-static int64_t pact_duration_to_ms(pact_duration d)      { return d.nanos / 1000000LL; }
-static int64_t pact_duration_to_seconds(pact_duration d) { return d.nanos / 1000000000LL; }
+PACT_UNUSED static int64_t pact_duration_to_nanos(pact_duration d)   { return d.nanos; }
+PACT_UNUSED static int64_t pact_duration_to_ms(pact_duration d)      { return d.nanos / 1000000LL; }
+PACT_UNUSED static int64_t pact_duration_to_seconds(pact_duration d) { return d.nanos / 1000000000LL; }
 
 /* Duration arithmetic */
-static pact_duration pact_duration_add(pact_duration a, pact_duration b) { return (pact_duration){.nanos = a.nanos + b.nanos}; }
-static pact_duration pact_duration_sub(pact_duration a, pact_duration b) { return (pact_duration){.nanos = a.nanos - b.nanos}; }
-static pact_duration pact_duration_scale(pact_duration d, int64_t factor) { return (pact_duration){.nanos = d.nanos * factor}; }
+PACT_UNUSED static pact_duration pact_duration_add(pact_duration a, pact_duration b) { return (pact_duration){.nanos = a.nanos + b.nanos}; }
+PACT_UNUSED static pact_duration pact_duration_sub(pact_duration a, pact_duration b) { return (pact_duration){.nanos = a.nanos - b.nanos}; }
+PACT_UNUSED static pact_duration pact_duration_scale(pact_duration d, int64_t factor) { return (pact_duration){.nanos = d.nanos * factor}; }
 
 /* Duration query */
-static int64_t pact_duration_is_zero(pact_duration d) { return d.nanos == 0 ? 1 : 0; }
+PACT_UNUSED static int64_t pact_duration_is_zero(pact_duration d) { return d.nanos == 0 ? 1 : 0; }
 
 /* Instant conversions */
-static int64_t pact_instant_to_unix_secs(pact_instant i) { return i.nanos / 1000000000LL; }
-static int64_t pact_instant_to_unix_ms(pact_instant i)   { return i.nanos / 1000000LL; }
+PACT_UNUSED static int64_t pact_instant_to_unix_secs(pact_instant i) { return i.nanos / 1000000000LL; }
+PACT_UNUSED static int64_t pact_instant_to_unix_ms(pact_instant i)   { return i.nanos / 1000000LL; }
 
-static const char* pact_instant_to_rfc3339(pact_instant i) {
+PACT_UNUSED static const char* pact_instant_to_rfc3339(pact_instant i) {
     time_t epoch_secs = (time_t)(i.nanos / 1000000000LL);
     struct tm utc;
     gmtime_r(&epoch_secs, &utc);
@@ -962,10 +968,10 @@ static const char* pact_instant_to_rfc3339(pact_instant i) {
 }
 
 /* Instant arithmetic */
-static pact_instant pact_instant_add(pact_instant i, pact_duration d) { return (pact_instant){.nanos = i.nanos + d.nanos}; }
-static pact_duration pact_instant_since(pact_instant later, pact_instant earlier) { return (pact_duration){.nanos = later.nanos - earlier.nanos}; }
+PACT_UNUSED static pact_instant pact_instant_add(pact_instant i, pact_duration d) { return (pact_instant){.nanos = i.nanos + d.nanos}; }
+PACT_UNUSED static pact_duration pact_instant_since(pact_instant later, pact_instant earlier) { return (pact_duration){.nanos = later.nanos - earlier.nanos}; }
 
-static pact_duration pact_instant_elapsed(pact_instant then) {
+PACT_UNUSED static pact_duration pact_instant_elapsed(pact_instant then) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     int64_t now_nanos = (int64_t)ts.tv_sec * 1000000000LL + (int64_t)ts.tv_nsec;
@@ -978,13 +984,13 @@ typedef struct {
     void         (*sleep)(pact_duration d);
 } pact_time_vtable;
 
-static pact_instant pact_time_default_read(void) {
+PACT_UNUSED static pact_instant pact_time_default_read(void) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     return (pact_instant){.nanos = (int64_t)ts.tv_sec * 1000000000LL + (int64_t)ts.tv_nsec};
 }
 
-static void pact_time_default_sleep(pact_duration d) {
+PACT_UNUSED static void pact_time_default_sleep(pact_duration d) {
     int64_t ns = d.nanos;
     struct timespec ts;
     ts.tv_sec  = (time_t)(ns / 1000000000LL);
@@ -992,12 +998,12 @@ static void pact_time_default_sleep(pact_duration d) {
     nanosleep(&ts, NULL);
 }
 
-static pact_time_vtable pact_time_vtable_default = {
+PACT_UNUSED static pact_time_vtable pact_time_vtable_default = {
     pact_time_default_read,
     pact_time_default_sleep
 };
 
-static int64_t pact_time_ms(void) {
+PACT_UNUSED static int64_t pact_time_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (int64_t)ts.tv_sec * 1000 + (int64_t)(ts.tv_nsec / 1000000);
@@ -1009,16 +1015,16 @@ typedef struct {
     int         (*write)(const char* name, const char* value);
 } pact_env_vtable;
 
-static const char* pact_env_default_read(const char* name) {
+PACT_UNUSED static const char* pact_env_default_read(const char* name) {
     const char* v = getenv(name);
     return v ? strdup(v) : NULL;
 }
 
-static int pact_env_default_write(const char* name, const char* value) {
+PACT_UNUSED static int pact_env_default_write(const char* name, const char* value) {
     return setenv(name, value, 1);
 }
 
-static pact_env_vtable pact_env_vtable_default = {
+PACT_UNUSED static pact_env_vtable pact_env_vtable_default = {
     pact_env_default_read,
     pact_env_default_write
 };
@@ -1029,19 +1035,19 @@ typedef struct {
     int     (*signal)(int64_t pid, int sig);
 } pact_process_vtable;
 
-static int64_t pact_process_default_spawn(const char* command) {
+PACT_UNUSED static int64_t pact_process_default_spawn(const char* command) {
     (void)command;
     fprintf(stderr, "pact: process.spawn not implemented\n");
     return -1;
 }
 
-static int pact_process_default_signal(int64_t pid, int sig) {
+PACT_UNUSED static int pact_process_default_signal(int64_t pid, int sig) {
     (void)pid; (void)sig;
     fprintf(stderr, "pact: process.signal not implemented\n");
     return -1;
 }
 
-static pact_process_vtable pact_process_vtable_default = {
+PACT_UNUSED static pact_process_vtable pact_process_vtable_default = {
     pact_process_default_spawn,
     pact_process_default_signal
 };
@@ -1059,7 +1065,7 @@ typedef struct {
     pact_process_vtable* process;
 } pact_ctx;
 
-static pact_ctx pact_ctx_default(void) {
+PACT_UNUSED static pact_ctx pact_ctx_default(void) {
     pact_ctx ctx;
     ctx.io      = &pact_io_vtable_default;
     ctx.fs      = &pact_fs_vtable_default;
@@ -1119,7 +1125,7 @@ typedef struct {
     pthread_cond_t recv_cond;
 } pact_channel;
 
-static void* pact_threadpool_worker(void* arg) {
+PACT_UNUSED static void* pact_threadpool_worker(void* arg) {
     pact_threadpool* pool = (pact_threadpool*)arg;
     while (1) {
         pthread_mutex_lock(&pool->mutex);
@@ -1142,7 +1148,7 @@ static void* pact_threadpool_worker(void* arg) {
     return NULL;
 }
 
-static pact_threadpool* pact_threadpool_init(int thread_count) {
+PACT_UNUSED static pact_threadpool* pact_threadpool_init(int thread_count) {
     if (thread_count <= 0) {
         thread_count = 4;
     }
@@ -1160,7 +1166,7 @@ static pact_threadpool* pact_threadpool_init(int thread_count) {
     return pool;
 }
 
-static void pact_threadpool_submit(pact_threadpool* pool, void (*fn)(void*), void* arg) {
+PACT_UNUSED static void pact_threadpool_submit(pact_threadpool* pool, void (*fn)(void*), void* arg) {
     pact_task* task = (pact_task*)pact_alloc(sizeof(pact_task));
     task->fn = fn;
     task->arg = arg;
@@ -1176,7 +1182,7 @@ static void pact_threadpool_submit(pact_threadpool* pool, void (*fn)(void*), voi
     pthread_mutex_unlock(&pool->mutex);
 }
 
-static void pact_threadpool_shutdown(pact_threadpool* pool) {
+PACT_UNUSED static void pact_threadpool_shutdown(pact_threadpool* pool) {
     pthread_mutex_lock(&pool->mutex);
     pool->shutdown = 1;
     pthread_cond_broadcast(&pool->cond);
@@ -1192,7 +1198,7 @@ static void pact_threadpool_shutdown(pact_threadpool* pool) {
 
 /* ── Handle operations ──────────────────────────────────────────────── */
 
-static pact_handle* pact_handle_new(void) {
+PACT_UNUSED static pact_handle* pact_handle_new(void) {
     pact_handle* h = (pact_handle*)pact_alloc(sizeof(pact_handle));
     memset(&h->thread, 0, sizeof(pthread_t));
     h->result = NULL;
@@ -1202,7 +1208,7 @@ static pact_handle* pact_handle_new(void) {
     return h;
 }
 
-static void pact_handle_set_result(pact_handle* h, void* result) {
+PACT_UNUSED static void pact_handle_set_result(pact_handle* h, void* result) {
     pthread_mutex_lock(&h->mutex);
     h->result = result;
     h->status = PACT_HANDLE_DONE;
@@ -1210,7 +1216,7 @@ static void pact_handle_set_result(pact_handle* h, void* result) {
     pthread_mutex_unlock(&h->mutex);
 }
 
-static void* pact_handle_await(pact_handle* h) {
+PACT_UNUSED static void* pact_handle_await(pact_handle* h) {
     pthread_mutex_lock(&h->mutex);
     while (h->status == PACT_HANDLE_RUNNING) {
         pthread_cond_wait(&h->cond, &h->mutex);
@@ -1220,7 +1226,7 @@ static void* pact_handle_await(pact_handle* h) {
     return result;
 }
 
-static void pact_handle_cancel(pact_handle* h) {
+PACT_UNUSED static void pact_handle_cancel(pact_handle* h) {
     pthread_mutex_lock(&h->mutex);
     if (h->status == PACT_HANDLE_RUNNING) {
         h->status = PACT_HANDLE_CANCELLED;
@@ -1241,19 +1247,19 @@ typedef struct {
     int tag_count;
 } pact_test_entry;
 
-static jmp_buf __pact_test_jmp;
-static int __pact_test_failed;
-static char __pact_test_fail_msg[512];
-static int __pact_test_fail_line;
+PACT_UNUSED static jmp_buf __pact_test_jmp;
+PACT_UNUSED static int __pact_test_failed;
+PACT_UNUSED static char __pact_test_fail_msg[512];
+PACT_UNUSED static int __pact_test_fail_line;
 
-static void __pact_debug_assert_fail(const char* file, int line, const char* fn, const char* cond, const char* msg) {
+PACT_UNUSED static void __pact_debug_assert_fail(const char* file, int line, const char* fn, const char* cond, const char* msg) {
     fprintf(stderr, "DEBUG ASSERT FAILED: %s\n", msg);
     fprintf(stderr, "  condition: %s\n", cond);
     fprintf(stderr, "  location: %s:%d in %s\n", file, line, fn);
     exit(1);
 }
 
-static void __pact_assert_fail(const char* msg, int line) {
+PACT_UNUSED static void __pact_assert_fail(const char* msg, int line) {
     __pact_test_failed = 1;
     if (msg) {
         strncpy(__pact_test_fail_msg, msg, sizeof(__pact_test_fail_msg) - 1);
@@ -1265,14 +1271,14 @@ static void __pact_assert_fail(const char* msg, int line) {
     longjmp(__pact_test_jmp, 1);
 }
 
-static int __pact_test_has_tag(const pact_test_entry* test, const char* tag) {
+PACT_UNUSED static int __pact_test_has_tag(const pact_test_entry* test, const char* tag) {
     for (int t = 0; t < test->tag_count; t++) {
         if (strcmp(test->tags[t], tag) == 0) return 1;
     }
     return 0;
 }
 
-static void __pact_test_print_tags_json(const pact_test_entry* test) {
+PACT_UNUSED static void __pact_test_print_tags_json(const pact_test_entry* test) {
     printf(",\"tags\":[");
     for (int t = 0; t < test->tag_count; t++) {
         if (t > 0) printf(",");
@@ -1281,7 +1287,7 @@ static void __pact_test_print_tags_json(const pact_test_entry* test) {
     printf("]");
 }
 
-static void pact_test_run(const pact_test_entry* tests, int count, int argc, const char** argv) {
+PACT_UNUSED static void pact_test_run(const pact_test_entry* tests, int count, int argc, const char** argv) {
     const char* filter = NULL;
     const char* tags_filter = NULL;
     int json_output = 0;
@@ -1359,7 +1365,7 @@ static void pact_test_run(const pact_test_entry* tests, int count, int argc, con
 
 /* ── Channel operations ─────────────────────────────────────────────── */
 
-static pact_channel* pact_channel_new(int64_t capacity) {
+PACT_UNUSED static pact_channel* pact_channel_new(int64_t capacity) {
     if (capacity <= 0) capacity = 16;
     pact_channel* ch = (pact_channel*)pact_alloc(sizeof(pact_channel));
     ch->buffer = (void**)pact_alloc(sizeof(void*) * (size_t)capacity);
@@ -1374,7 +1380,7 @@ static pact_channel* pact_channel_new(int64_t capacity) {
     return ch;
 }
 
-static int pact_channel_send(pact_channel* ch, void* value) {
+PACT_UNUSED static int pact_channel_send(pact_channel* ch, void* value) {
     pthread_mutex_lock(&ch->mutex);
     while (ch->count >= ch->capacity && !ch->closed) {
         pthread_cond_wait(&ch->send_cond, &ch->mutex);
@@ -1391,7 +1397,7 @@ static int pact_channel_send(pact_channel* ch, void* value) {
     return 0;
 }
 
-static void* pact_channel_recv(pact_channel* ch) {
+PACT_UNUSED static void* pact_channel_recv(pact_channel* ch) {
     pthread_mutex_lock(&ch->mutex);
     while (ch->count == 0 && !ch->closed) {
         pthread_cond_wait(&ch->recv_cond, &ch->mutex);
@@ -1408,7 +1414,7 @@ static void* pact_channel_recv(pact_channel* ch) {
     return value;
 }
 
-static void pact_channel_close(pact_channel* ch) {
+PACT_UNUSED static void pact_channel_close(pact_channel* ch) {
     pthread_mutex_lock(&ch->mutex);
     ch->closed = 1;
     pthread_cond_broadcast(&ch->send_cond);
@@ -1418,7 +1424,7 @@ static void pact_channel_close(pact_channel* ch) {
 
 /* ── HTTP client (POSIX sockets, HTTP/1.1, no TLS) ─────────────────── */
 
-static int pact_http_parse_url(const char* url,
+PACT_UNUSED static int pact_http_parse_url(const char* url,
                                char* host, int host_sz,
                                char* port, int port_sz,
                                char* path, int path_sz) {
@@ -1459,7 +1465,7 @@ static int pact_http_parse_url(const char* url,
     return 0;
 }
 
-static int pact_http_request(
+PACT_UNUSED static int pact_http_request(
     const char* method,
     const char* url,
     const char* body,
@@ -1682,7 +1688,7 @@ static int pact_http_request(
 
 /* ── String utilities: slice and to_int ─────────────────────────────── */
 
-static const char* pact_str_slice(const char* s, int64_t start, int64_t end) {
+PACT_UNUSED static const char* pact_str_slice(const char* s, int64_t start, int64_t end) {
     int64_t slen = (int64_t)strlen(s);
     if (start < 0) start = 0;
     if (end > slen) end = slen;
@@ -1694,11 +1700,11 @@ static const char* pact_str_slice(const char* s, int64_t start, int64_t end) {
     return buf;
 }
 
-static int64_t pact_parse_int(const char* s) {
+PACT_UNUSED static int64_t pact_parse_int(const char* s) {
     return (int64_t)atoll(s);
 }
 
-static pact_list* pact_str_split(const char* s, const char* delim) {
+PACT_UNUSED static pact_list* pact_str_split(const char* s, const char* delim) {
     pact_list* result = pact_list_new();
     if (!s || !delim || !*delim) {
         pact_list_push(result, (void*)strdup(s ? s : ""));
@@ -1722,7 +1728,7 @@ static pact_list* pact_str_split(const char* s, const char* delim) {
     return result;
 }
 
-static const char* pact_str_join(const pact_list* parts, const char* delim) {
+PACT_UNUSED static const char* pact_str_join(const pact_list* parts, const char* delim) {
     if (!parts || parts->len == 0) return strdup("");
     int64_t dlen = delim ? (int64_t)strlen(delim) : 0;
     int64_t total = 0;
@@ -1747,7 +1753,7 @@ static const char* pact_str_join(const pact_list* parts, const char* delim) {
 
 /* ── String utilities: trim, case, replace, index_of, lines ──────── */
 
-static const char* pact_str_trim(const char* s) {
+PACT_UNUSED static const char* pact_str_trim(const char* s) {
     if (!s) return strdup("");
     const char* start = s;
     while (*start && (*start == ' ' || *start == '\t' || *start == '\n' || *start == '\r')) start++;
@@ -1760,7 +1766,7 @@ static const char* pact_str_trim(const char* s) {
     return buf;
 }
 
-static const char* pact_str_to_upper(const char* s) {
+PACT_UNUSED static const char* pact_str_to_upper(const char* s) {
     if (!s) return strdup("");
     int64_t len = (int64_t)strlen(s);
     char* buf = (char*)pact_alloc(len + 1);
@@ -1772,7 +1778,7 @@ static const char* pact_str_to_upper(const char* s) {
     return buf;
 }
 
-static const char* pact_str_to_lower(const char* s) {
+PACT_UNUSED static const char* pact_str_to_lower(const char* s) {
     if (!s) return strdup("");
     int64_t len = (int64_t)strlen(s);
     char* buf = (char*)pact_alloc(len + 1);
@@ -1784,7 +1790,7 @@ static const char* pact_str_to_lower(const char* s) {
     return buf;
 }
 
-static const char* pact_str_replace(const char* s, const char* needle, const char* repl) {
+PACT_UNUSED static const char* pact_str_replace(const char* s, const char* needle, const char* repl) {
     if (!s || !needle || !*needle) return strdup(s ? s : "");
     if (!repl) repl = "";
     int64_t slen = (int64_t)strlen(s);
@@ -1810,14 +1816,14 @@ static const char* pact_str_replace(const char* s, const char* needle, const cha
     return buf;
 }
 
-static int64_t pact_str_index_of(const char* s, const char* needle) {
+PACT_UNUSED static int64_t pact_str_index_of(const char* s, const char* needle) {
     if (!s || !needle) return -1;
     const char* found = strstr(s, needle);
     if (!found) return -1;
     return (int64_t)(found - s);
 }
 
-static pact_list* pact_str_lines(const char* s) {
+PACT_UNUSED static pact_list* pact_str_lines(const char* s) {
     pact_list* result = pact_list_new();
     if (!s || !*s) return result;
     const char* p = s;
@@ -1836,13 +1842,13 @@ static pact_list* pact_str_lines(const char* s) {
     return result;
 }
 
-static double pact_parse_float(const char* s) {
+PACT_UNUSED static double pact_parse_float(const char* s) {
     return atof(s ? s : "0");
 }
 
 /* ── JSON helpers ────────────────────────────────────────────────── */
 
-static const char* pact_json_escape_str(const char* s) {
+PACT_UNUSED static const char* pact_json_escape_str(const char* s) {
     if (!s) return "\"null\"";
     int64_t len = (int64_t)strlen(s);
     char* buf = (char*)pact_alloc(len * 2 + 3);
@@ -1866,7 +1872,7 @@ static const char* pact_json_escape_str(const char* s) {
 
 /* ── TCP socket functions ───────────────────────────────────────────── */
 
-static int64_t pact_tcp_listen(const char* host, int64_t port) {
+PACT_UNUSED static int64_t pact_tcp_listen(const char* host, int64_t port) {
     (void)host;
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return -1;
@@ -1888,12 +1894,12 @@ static int64_t pact_tcp_listen(const char* host, int64_t port) {
     return (int64_t)fd;
 }
 
-static int64_t pact_tcp_accept(int64_t listen_fd) {
+PACT_UNUSED static int64_t pact_tcp_accept(int64_t listen_fd) {
     int client = accept((int)listen_fd, NULL, NULL);
     return (int64_t)client;
 }
 
-static const char* pact_tcp_read(int64_t fd, int64_t max_bytes) {
+PACT_UNUSED static const char* pact_tcp_read(int64_t fd, int64_t max_bytes) {
     char* buf = (char*)pact_alloc(max_bytes + 1);
     int64_t total = 0;
     while (total < max_bytes) {
@@ -1906,7 +1912,7 @@ static const char* pact_tcp_read(int64_t fd, int64_t max_bytes) {
     return buf;
 }
 
-static void pact_tcp_write(int64_t fd, const char* data) {
+PACT_UNUSED static void pact_tcp_write(int64_t fd, const char* data) {
     size_t len = strlen(data);
     size_t written = 0;
     while (written < len) {
@@ -1916,7 +1922,7 @@ static void pact_tcp_write(int64_t fd, const char* data) {
     }
 }
 
-static void pact_tcp_close(int64_t fd) {
+PACT_UNUSED static void pact_tcp_close(int64_t fd) {
     close((int)fd);
 }
 
@@ -1928,7 +1934,7 @@ typedef struct {
     int64_t exit_code;
 } pact_ProcessResult;
 
-static void pact_process_exec(const char* cmd, const pact_list* args) {
+PACT_UNUSED static void pact_process_exec(const char* cmd, const pact_list* args) {
     int64_t argc = args ? args->len : 0;
     char** argv = (char**)pact_alloc(sizeof(char*) * (int64_t)(argc + 2));
     argv[0] = (char*)cmd;
@@ -1941,7 +1947,7 @@ static void pact_process_exec(const char* cmd, const pact_list* args) {
     _exit(127);
 }
 
-static pact_ProcessResult pact_process_run(const char* cmd, const pact_list* args) {
+PACT_UNUSED static pact_ProcessResult pact_process_run(const char* cmd, const pact_list* args) {
     pact_ProcessResult result = { "", "", -1 };
     int stdout_pipe[2], stderr_pipe[2];
     if (pipe(stdout_pipe) < 0 || pipe(stderr_pipe) < 0) {
@@ -2020,7 +2026,7 @@ typedef struct {
     int64_t num_cols;
 } pact_sqlite3_result;
 
-static void* pact_sqlite3_open(const char* path) {
+PACT_UNUSED static void* pact_sqlite3_open(const char* path) {
     sqlite3* db = NULL;
     int rc = sqlite3_open(path, &db);
     if (rc != SQLITE_OK) {
@@ -2030,7 +2036,7 @@ static void* pact_sqlite3_open(const char* path) {
     return (void*)db;
 }
 
-static int64_t pact_sqlite3_exec(void* db, const char* sql,
+PACT_UNUSED static int64_t pact_sqlite3_exec(void* db, const char* sql,
                                   int (*callback)(void*, int, char**, char**),
                                   void* arg, const char** errmsg) {
     char* err = NULL;
@@ -2043,7 +2049,7 @@ static int64_t pact_sqlite3_exec(void* db, const char* sql,
 }
 
 /* Callback used by pact_sqlite3_query to collect rows */
-static int pact_sqlite3_query_cb(void* ud, int ncols, char** values, char** names) {
+PACT_UNUSED static int pact_sqlite3_query_cb(void* ud, int ncols, char** values, char** names) {
     pact_sqlite3_result* res = (pact_sqlite3_result*)ud;
     if (res->num_rows == 0) {
         for (int i = 0; i < ncols; i++) {
@@ -2060,7 +2066,7 @@ static int pact_sqlite3_query_cb(void* ud, int ncols, char** values, char** name
     return 0;
 }
 
-static pact_sqlite3_result* pact_sqlite3_query(void* db, const char* sql) {
+PACT_UNUSED static pact_sqlite3_result* pact_sqlite3_query(void* db, const char* sql) {
     pact_sqlite3_result* res = (pact_sqlite3_result*)pact_alloc(sizeof(pact_sqlite3_result));
     res->rows = pact_list_new();
     res->columns = pact_list_new();
@@ -2077,7 +2083,7 @@ static pact_sqlite3_result* pact_sqlite3_query(void* db, const char* sql) {
     return res;
 }
 
-static void* pact_sqlite3_prepare(void* db, const char* sql) {
+PACT_UNUSED static void* pact_sqlite3_prepare(void* db, const char* sql) {
     sqlite3_stmt* stmt = NULL;
     int rc = sqlite3_prepare_v2((sqlite3*)db, sql, -1, &stmt, NULL);
     if (rc != SQLITE_OK) {
@@ -2086,54 +2092,54 @@ static void* pact_sqlite3_prepare(void* db, const char* sql) {
     return (void*)stmt;
 }
 
-static int64_t pact_sqlite3_bind_int(void* stmt, int64_t idx, int64_t val) {
+PACT_UNUSED static int64_t pact_sqlite3_bind_int(void* stmt, int64_t idx, int64_t val) {
     return (int64_t)sqlite3_bind_int64((sqlite3_stmt*)stmt, (int)idx, (sqlite3_int64)val);
 }
 
-static int64_t pact_sqlite3_bind_text(void* stmt, int64_t idx, const char* val) {
+PACT_UNUSED static int64_t pact_sqlite3_bind_text(void* stmt, int64_t idx, const char* val) {
     return (int64_t)sqlite3_bind_text((sqlite3_stmt*)stmt, (int)idx, val, -1, SQLITE_TRANSIENT);
 }
 
-static int64_t pact_sqlite3_step(void* stmt) {
+PACT_UNUSED static int64_t pact_sqlite3_step(void* stmt) {
     return (int64_t)sqlite3_step((sqlite3_stmt*)stmt);
 }
 
-static int64_t pact_sqlite3_column_int(void* stmt, int64_t col) {
+PACT_UNUSED static int64_t pact_sqlite3_column_int(void* stmt, int64_t col) {
     return (int64_t)sqlite3_column_int64((sqlite3_stmt*)stmt, (int)col);
 }
 
-static const char* pact_sqlite3_column_text(void* stmt, int64_t col) {
+PACT_UNUSED static const char* pact_sqlite3_column_text(void* stmt, int64_t col) {
     const unsigned char* text = sqlite3_column_text((sqlite3_stmt*)stmt, (int)col);
     if (!text) return strdup("");
     return strdup((const char*)text);
 }
 
-static int64_t pact_sqlite3_reset(void* stmt) {
+PACT_UNUSED static int64_t pact_sqlite3_reset(void* stmt) {
     return (int64_t)sqlite3_reset((sqlite3_stmt*)stmt);
 }
 
-static int64_t pact_sqlite3_finalize(void* stmt) {
+PACT_UNUSED static int64_t pact_sqlite3_finalize(void* stmt) {
     return (int64_t)sqlite3_finalize((sqlite3_stmt*)stmt);
 }
 
-static int64_t pact_sqlite3_close(void* db) {
+PACT_UNUSED static int64_t pact_sqlite3_close(void* db) {
     return (int64_t)sqlite3_close((sqlite3*)db);
 }
 
-static const char* pact_sqlite3_errmsg(void* db) {
+PACT_UNUSED static const char* pact_sqlite3_errmsg(void* db) {
     const char* msg = sqlite3_errmsg((sqlite3*)db);
     return msg ? strdup(msg) : strdup("");
 }
 
-static int64_t pact_sqlite3_begin(void* db) {
+PACT_UNUSED static int64_t pact_sqlite3_begin(void* db) {
     return (int64_t)sqlite3_exec((sqlite3*)db, "BEGIN", NULL, NULL, NULL);
 }
 
-static int64_t pact_sqlite3_commit(void* db) {
+PACT_UNUSED static int64_t pact_sqlite3_commit(void* db) {
     return (int64_t)sqlite3_exec((sqlite3*)db, "COMMIT", NULL, NULL, NULL);
 }
 
-static int64_t pact_sqlite3_rollback(void* db) {
+PACT_UNUSED static int64_t pact_sqlite3_rollback(void* db) {
     return (int64_t)sqlite3_exec((sqlite3*)db, "ROLLBACK", NULL, NULL, NULL);
 }
 

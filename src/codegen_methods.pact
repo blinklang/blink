@@ -2191,9 +2191,8 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             iter_from_source(obj_str, obj_type)
             let src_var = ifs_iter_var
             let src_next = ifs_next_fn
-            let elem_type = ifs_elem_type
             let opt_t = ifs_opt_type
-            let c_inner = c_type_str(elem_type)
+
             let next_var = fresh_temp("__fe_next_")
             emit_line("while (1) \{")
             cg_indent = cg_indent + 1
@@ -2214,9 +2213,8 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             iter_from_source(obj_str, obj_type)
             let src_var = ifs_iter_var
             let src_next = ifs_next_fn
-            let elem_type = ifs_elem_type
             let opt_t = ifs_opt_type
-            let c_inner = c_type_str(elem_type)
+
             let result_var = fresh_temp("__any_")
             let next_var = fresh_temp("__any_next_")
             emit_line("int {result_var} = 0;")
@@ -2239,9 +2237,8 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             iter_from_source(obj_str, obj_type)
             let src_var = ifs_iter_var
             let src_next = ifs_next_fn
-            let elem_type = ifs_elem_type
             let opt_t = ifs_opt_type
-            let c_inner = c_type_str(elem_type)
+
             let result_var = fresh_temp("__all_")
             let next_var = fresh_temp("__all_next_")
             emit_line("int {result_var} = 1;")
@@ -2295,7 +2292,6 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             iter_from_source(obj_str, obj_type)
             let src_var = ifs_iter_var
             let src_next = ifs_next_fn
-            let elem_type = ifs_elem_type
             let opt_t = ifs_opt_type
             let acc_var = fresh_temp("__fold_acc_")
             let next_var = fresh_temp("__fold_next_")

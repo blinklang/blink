@@ -634,7 +634,6 @@ pub fn emit_async_spawn_closure(closure_node: Int, wrapper_idx: Int, wrapper_nam
 pub fn emit_await_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
     emit_expr(np_obj.get(node).unwrap())
     let handle_str = expr_result_str
-    let handle_type = expr_result_type
     let inner_type = get_var_handle_inner(handle_str)
     let tmp = fresh_temp("__await_")
     emit_line("void* {tmp} = pact_handle_await({handle_str});")

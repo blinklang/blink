@@ -343,7 +343,7 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
         }
         cg_lines.push("};")
         cg_lines.push("")
-        cg_lines.push("static {vt_type}* __pact_ue_{ue.handle} = &{vt_type}_default;")
+        cg_lines.push("PACT_UNUSED static {vt_type}* __pact_ue_{ue.handle} = &{vt_type}_default;")
         cg_lines.push("")
         uei = uei + 1
     }

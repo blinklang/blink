@@ -201,7 +201,7 @@ fn do_compile(source_path: Str, c_path: Str, format_flag: Str, debug_mode: Int) 
         return 0
     }
 
-    let tc_err_count = check_types(final_program)
+    let _tc_err_count = check_types(final_program)
 
     if diag_count > 0 {
         diag_flush()

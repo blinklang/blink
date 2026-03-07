@@ -259,7 +259,6 @@ pub fn lex(source: Str) ! Lex.Tokenize {
                     // Replace top of stack by popping and re-pushing
                     // Actually we need to update the current entry.
                     // Since List has no set(), we pop and push.
-                    let mlen = mode_stack.len()
                     // We just pushed, so undo and fix the original entry.
                     // Simpler: the brace_depth_stack top IS the one we
                     // just pushed. Pop it, pop the old, push updated old,
