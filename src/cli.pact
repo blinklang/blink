@@ -109,12 +109,6 @@ fn detect_async(source: Str) -> Int {
     return 0
 }
 
-fn detect_net_client(c_source: Str) -> Int {
-    if c_source.contains("PACT_USE_CURL") {
-        return 1
-    }
-    return 0
-}
 
 fn detect_sqlite(c_source: Str) -> Int {
     if c_source.contains("PACT_USE_SQLITE") {
@@ -309,10 +303,6 @@ fn do_build(source_path: Str, output_path: Str, c_path: Str, format_flag: Str, d
     let mut link_flags = "-lm"
     if detect_async(source) {
         link_flags = "-lm -pthread"
-    }
-
-    if detect_net_client(c_source) {
-        link_flags = "{link_flags} -lcurl"
     }
 
     if detect_sqlite(c_source) {

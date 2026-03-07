@@ -493,6 +493,10 @@ std/bench = "0.3"
 required = ["Net.Connect", "Net.DNS"]         # always needed
 optional = ["IO.Log"]                         # only if caller provides handler
 
+[native-dependencies]                         # §9.1.2 native C library resolution
+libsodium = { type = "system" }               # dynamic link, must be on target
+mylib = { type = "vendored", path = "vendor/mylib.c" }  # compiled from source
+
 [alternatives]                                # §4.10 alt-effect registrations
 Net.Connect = "mock-http"                     # test alternative
 ```

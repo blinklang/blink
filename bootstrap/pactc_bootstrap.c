@@ -594,7 +594,6 @@ PACT_UNUSED static int64_t cg_current_fn_ret = 0;
 PACT_UNUSED static int64_t cg_current_fn_node = (-1);
 PACT_UNUSED static int64_t cg_program_node = 0;
 PACT_UNUSED static int64_t cg_uses_async = 0;
-PACT_UNUSED static int64_t cg_uses_curl = 0;
 PACT_UNUSED static int64_t cg_uses_sqlite = 0;
 PACT_UNUSED static int64_t cg_async_wrapper_counter = 0;
 PACT_UNUSED static pact_list* cg_async_scope_stack;
@@ -17487,7 +17486,6 @@ void pact_codegen_methods_emit_method_call(int64_t node) {
         __sc176 = (pact_str_eq(_ounw_175.value, "net")) ? 1 : 0;
     } else { __sc176 = 0; }
     if ((__sc176 && pact_str_eq(method, "request"))) {
-        cg_uses_curl = 1;
         int64_t _lgi_177 = node;
         pact_Option_int _lget_178;
         if (pact_list_in_bounds(np_args, _lgi_177)) {
@@ -33370,7 +33368,6 @@ const char* pact_codegen_generate(int64_t program) {
     cg_handler_body_is_ue = 0;
     cg_handler_body_idx = 0;
     cg_uses_async = 0;
-    cg_uses_curl = 0;
     cg_uses_sqlite = 0;
     cg_async_wrapper_counter = 0;
     pact_list* _l42 = pact_list_new();
@@ -34972,7 +34969,7 @@ const char* pact_codegen_generate(int64_t program) {
     cg_indent = (cg_indent - 1);
     (void)pact_codegen_types_emit_line("}");
     (void)pact_codegen_types_pop_scope();
-    if ((cg_uses_curl != 0)) {
+    if ((cg_uses_sqlite != 0)) {
         int64_t _lgi_394 = 0;
         pact_Option_str _lget_395;
         if (pact_list_in_bounds(cg_lines, _lgi_394)) {
@@ -34980,25 +34977,15 @@ const char* pact_codegen_generate(int64_t program) {
         } else { _lget_395.tag = 0; }
         pact_Option_str _ounw_396 = _lget_395;
         if (_ounw_396.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
-        pact_list_set(cg_lines, 0, (void*)pact_str_concat("#define PACT_USE_CURL\n", _ounw_396.value));
-    }
-    if ((cg_uses_sqlite != 0)) {
-        int64_t _lgi_397 = 0;
+        pact_list_set(cg_lines, 0, (void*)pact_str_concat("#define PACT_USE_SQLITE\n", _ounw_396.value));
+        int64_t _lgi_397 = 2;
         pact_Option_str _lget_398;
         if (pact_list_in_bounds(cg_lines, _lgi_397)) {
             _lget_398.tag = 1; _lget_398.value = (const char*)pact_list_get(cg_lines, _lgi_397);
         } else { _lget_398.tag = 0; }
         pact_Option_str _ounw_399 = _lget_398;
         if (_ounw_399.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
-        pact_list_set(cg_lines, 0, (void*)pact_str_concat("#define PACT_USE_SQLITE\n", _ounw_399.value));
-        int64_t _lgi_400 = 2;
-        pact_Option_str _lget_401;
-        if (pact_list_in_bounds(cg_lines, _lgi_400)) {
-            _lget_401.tag = 1; _lget_401.value = (const char*)pact_list_get(cg_lines, _lgi_400);
-        } else { _lget_401.tag = 0; }
-        pact_Option_str _ounw_402 = _lget_401;
-        if (_ounw_402.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
-        pact_list_set(cg_lines, 2, (void*)pact_str_concat("static void* __pact_db = NULL;\n", _ounw_402.value));
+        pact_list_set(cg_lines, 2, (void*)pact_str_concat("static void* __pact_db = NULL;\n", _ounw_399.value));
     }
     return pact_codegen_types_join_lines();
 }

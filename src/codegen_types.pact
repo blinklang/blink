@@ -496,7 +496,6 @@ pub let mut cg_current_fn_node: Int = -1
 // Scratch space for tuple match scrutinee temps
 pub let mut cg_program_node: Int = 0
 pub let mut cg_uses_async: Int = 0
-pub let mut cg_uses_curl: Int = 0
 pub let mut cg_uses_sqlite: Int = 0
 pub let mut cg_async_wrapper_counter: Int = 0
 

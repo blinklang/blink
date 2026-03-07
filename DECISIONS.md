@@ -266,6 +266,10 @@ Decided by expert panel vote. See [OPEN_QUESTIONS.md](OPEN_QUESTIONS.md) for ful
 | List pattern matching | `[pattern, ...]` in match, wildcard-only rest (no binding), length-based exhaustiveness with mandatory catch-all | 5-0 patterns, 4-1 wildcard rest |
 | Extended delimiter strings | `#"..."#` with `#{expr}` interpolation. `"` and `\` literal inside. Adjustable `#` depth (max 3). Same `Str` type. Parametric extension, not second syntax | 5-0 |
 | Inline module blocks | No `mod name { }`. File = Module is absolute (§10.1.1). `mod` keyword reserved but unused. Separate files for sub-modules | 4-1 (Web: file-scoped namespaces) |
+| Native dep manifest declaration | `[native-dependencies]` section in `pact.toml` for user `@ffi` C libraries. `@ffi` without manifest entry is compile error | 5-0 |
+| Cross-compilation linking | Static by default for cross-targets (vendored source), dynamic for host. `link = "dynamic"` override available | 5-0 |
+| Compiler-managed vs user-managed native deps | Compiler manages deps for language-defined effects (`db.*`, `net.*`). User manages raw `@ffi` via `[native-dependencies]` | 3-2 (PLT/DevOps/AI for B; Sys/Web for C) |
+| Dead `-lcurl` flag | Remove immediately. HTTP uses raw POSIX sockets, not libcurl | 5-0 |
 
 ---
 
@@ -325,6 +329,7 @@ Full deliberation records for each decision. Each file contains expert votes, re
 | List Pattern Matching | [decisions/list-pattern-matching.md](decisions/list-pattern-matching.md) |
 | Inline String Escape (Extended Delimiters) | [decisions/inline-string-escape.md](decisions/inline-string-escape.md) |
 | Inline Module Blocks | [decisions/inline-module-blocks.md](decisions/inline-module-blocks.md) |
+| Native C Dependency Resolution | [decisions/native-c-dependency-resolution.md](decisions/native-c-dependency-resolution.md) |
 
 ---
 

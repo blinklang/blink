@@ -361,6 +361,110 @@ Pointer Allocations: 3 across 2 modules
     alloc_ptr[Void]   line 7     unscoped (WARNING)
 ```
 
+### 9.1.2 Native Dependency Resolution
+
+When Pact code uses `@ffi` to bind a C library, the compiler must *link* against that library. On the host system, dynamic linking (`-l`) works if the library is installed. Cross-compilation breaks this: the target system's libraries are not available on the build machine.
+
+This section specifies how native C dependencies are declared, resolved, and linked — for both user `@ffi` bindings and compiler-provided built-in modules.
+
+#### Two-Tier Model: Compiler-Managed vs User-Managed
+
+Native C dependencies fall into two categories:
+
+**Compiler-managed** dependencies back language-defined effect domains. The `db.*` operations (backed by sqlite3) and `net.*` operations (backed by POSIX sockets) are language primitives — they participate in the effect system, have compiler-known semantics, and are defined by the language, not imported from C headers. The compiler is responsible for providing these dependencies on all supported targets. Users never declare them in `pact.toml`.
+
+**User-managed** dependencies are C libraries bound via `@ffi`. The user is responsible for declaring how to resolve them. The compiler cannot know what arbitrary C libraries a project needs.
+
+The boundary is crisp: if the API is behind a Pact effect handle (`db.*`, `net.*`, `io.*`), the compiler manages its native deps. If it's raw `@ffi`, the user manages it.
+
+#### `[native-dependencies]` in `pact.toml`
+
+User `@ffi` bindings require a corresponding entry in the `[native-dependencies]` section of `pact.toml`. An `@ffi` annotation referencing a library not declared in `[native-dependencies]` is a compile error.
+
+```toml
+[native-dependencies]
+# System library — dynamic link, must be installed on target
+libsodium = { type = "system" }
+
+# Vendored source — compiled alongside generated C
+libpq = { type = "vendored", path = "vendor/libpq.c" }
+
+# pkg-config lookup (host builds only, cross-compile falls back to vendored)
+zlib = { type = "pkg-config", name = "zlib" }
+```
+
+**Schema:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `type` | `"system"` \| `"vendored"` \| `"pkg-config"` | How to resolve the library |
+| `path` | `Str` (optional) | Path to vendored C source file(s), relative to project root |
+| `name` | `Str` (optional) | pkg-config package name (defaults to dependency key) |
+| `link` | `"static"` \| `"dynamic"` (optional) | Override default linking strategy |
+
+**Diagnostic — missing native dependency:**
+
+```
+error[E0820]: @ffi references undeclared native dependency
+ --> crypto/sodium.pact:3:1
+  |
+3 | @ffi("libsodium", "crypto_secretbox_easy")
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ library "libsodium" not in [native-dependencies]
+  |
+  = help: add to pact.toml:
+  = help:   [native-dependencies]
+  = help:   libsodium = { type = "system" }
+```
+
+#### Linking Strategy
+
+The compiler uses different linking strategies for host and cross-compilation targets:
+
+**Host builds** (`pact build` with no `--target`): Dynamic linking by default. The compiler uses system-installed libraries via `-l` flags. `pkg-config` entries are resolved via the host's `pkg-config` tool.
+
+**Cross-compilation** (`pact build --target <triple>`): Static linking by default. The compiler compiles vendored C sources alongside the generated C output using the cross-compiler (e.g., `zig cc -target <triple>`). Dependencies declared as `type = "system"` with no vendored fallback produce a clear error:
+
+```
+error[E0821]: native dependency unavailable for cross-target
+ --> pact.toml:8:1
+  |
+8 | libsodium = { type = "system" }
+  | ^^^^^^^^^ "libsodium" is system-only but target is aarch64-linux-gnu
+  |
+  = note: cross-compilation requires vendored source or static archive
+  = help: provide source: libsodium = { type = "vendored", path = "vendor/sodium.c" }
+  = help: or override linking: libsodium = { type = "system", link = "dynamic" }
+```
+
+The `link = "dynamic"` override forces dynamic linking for a cross-target. This is an explicit opt-in — the user accepts that the target system must have the library installed.
+
+**Compiler-managed deps** follow the same strategy automatically: the compiler bundles source for its own dependencies (e.g., the sqlite3 amalgamation) and compiles them from source during cross-compilation, or dynamically links on the host. Users never interact with this.
+
+#### Compiler-Managed Dependency List
+
+The following native C dependencies are compiler-managed. This list is exhaustive — additions require a spec revision:
+
+| Module | C Dependency | Strategy |
+|--------|-------------|----------|
+| `db.*` | sqlite3 | Amalgamation bundled with compiler |
+| `net.*` | POSIX sockets | System headers (no library linkage) |
+| runtime | libc, libm | System (always available) |
+| `async.*` | pthreads | System (`-pthread` flag) |
+
+#### Interaction with `pact audit`
+
+`pact audit` includes native dependency status alongside FFI call sites:
+
+```
+Native Dependencies:
+  compiler-managed:
+    sqlite3           bundled (3.45.0)    OK
+    pthreads          system              OK
+  user-managed:
+    libsodium         vendored            vendor/sodium.c    OK
+    zlib              pkg-config          host-only          WARNING (no cross-target source)
+```
+
 ### 9.2 System Boundary — Runtime Validation
 
 Inside Pact, contracts (`@requires`, `@ensures`) are verified statically by the SMT solver wherever possible. But at the edges of the system — HTTP handlers, CLI entry points, message consumers, gRPC endpoints — input arrives from the outside world. External input cannot satisfy `@requires` statically because the compiler has no control over what a client sends.

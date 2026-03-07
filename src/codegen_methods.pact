@@ -298,9 +298,8 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
 
     // ── net.* operations ────────────────────────────────────────────
 
-    // net.request(req_idx) — HTTP request via libcurl, returns response index
+    // net.request(req_idx) — HTTP request via POSIX sockets, returns response index
     if np_kind.get(obj_node).unwrap() == NodeKind.Ident && np_name.get(obj_node).unwrap() == "net" && method == "request" {
-        cg_uses_curl = 1
         let args_sl = np_args.get(node).unwrap()
         if args_sl != -1 && sublist_length(args_sl) > 0 {
             emit_expr(sublist_get(args_sl, 0))

@@ -75,6 +75,8 @@ Unspecified or under-specified areas needing design work. Note: a self-hosting c
 
 - [x] **Ergonomic dispatch on variable-length ordered data** — Pattern matching handles tuples (fixed-length) and enums, but not lists (variable-length). Surfaced from CLI subcommand dispatch: `args_command_path()` returns `List[Str]` (e.g., `["daemon", "start"]`) but no way to `match` on list shape/contents. Forces `if/else` chains with `.len()` + `.get()`. Broader than CLI — applies to JSON path traversal, token sequences, any `List[T]` branching. *(Resolved: §3.5, panel vote 5-0 list patterns, 4-1 wildcard-only rest, length-based exhaustiveness with mandatory catch-all)*
 
+- [x] **Native C dependency resolution for cross-compilation** — `@ffi("library", "symbol")` names libraries but no mechanism to resolve/provide them. `pact.toml` has no `[native-dependencies]` section. Compiler built-ins (`db.*`, `net.*`) use C libraries in `runtime.h` but aren't visible to the dependency system. Cross-compilation via `zig cc` fails because dynamic link flags can't find libraries for non-host targets. *(Resolved: §9.1.2, panel vote 5-0 `[native-dependencies]` manifest section, 5-0 static-cross/dynamic-host linking, 3-2 compiler-managed built-ins, 5-0 remove dead `-lcurl`)*
+
 ## Deferred to v2+
 
 Items that are specced or aspirational but not needed for v1 release. Kept here for tracking — no br tasks.
