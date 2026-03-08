@@ -1678,19 +1678,7 @@ fn format_param_names(fn_node: Int) -> Str {
 }
 
 fn get_ffi_ann(fn_node: Int) -> Int {
-    let anns_sl = np_handlers.get(fn_node).unwrap()
-    if anns_sl == -1 {
-        return -1
-    }
-    let mut i = 0
-    while i < sublist_length(anns_sl) {
-        let ann = sublist_get(anns_sl, i)
-        if np_name.get(ann).unwrap() == "ffi" {
-            return ann
-        }
-        i = i + 1
-    }
-    -1
+    get_annotation(fn_node, "ffi")
 }
 
 pub fn format_params(fn_node: Int) -> Str {

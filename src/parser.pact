@@ -169,6 +169,26 @@ pub fn sublist_length(sl: Int) -> Int {
     items.len()
 }
 
+pub fn get_annotation(node: Int, name: Str) -> Int {
+    let anns_sl = np_handlers.get(node).unwrap()
+    if anns_sl == -1 {
+        return -1
+    }
+    let mut i = 0
+    while i < sublist_length(anns_sl) {
+        let ann = sublist_get(anns_sl, i)
+        if np_name.get(ann).unwrap() == name {
+            return ann
+        }
+        i = i + 1
+    }
+    -1
+}
+
+pub fn has_annotation(node: Int, name: Str) -> Int {
+    if get_annotation(node, name) != -1 { 1 } else { 0 }
+}
+
 // ── Token input (parallel arrays from lexer) ────────────────────────
 
 pub let mut pos: Int = 0

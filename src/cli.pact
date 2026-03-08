@@ -19,6 +19,7 @@ import daemon
 import docgen
 
 let pact_cli_version: Str = "dev"
+let mut lint_cache_mtime: Int = -1
 const embedded_llms_full: Str = #embed("../llms-full.md")
 const embedded_llms_short: Str = #embed("../llms.md")
 const embedded_runtime_h: Str = #embed("../bootstrap/runtime.h")
@@ -190,13 +191,17 @@ fn collect_test_files(dir: Str, results: List[Str]) {
 }
 
 fn load_lint_overrides() {
-    if file_exists("pact.toml") == 0 {
+    let mtime = file_mtime("pact.toml")
+    if mtime == -1 {
         return
     }
-    manifest_clear()
-    let rc = manifest_load("pact.toml")
-    if rc != 0 {
-        return
+    if mtime != lint_cache_mtime {
+        lint_cache_mtime = mtime
+        manifest_clear()
+        let rc = manifest_load("pact.toml")
+        if rc != 0 {
+            return
+        }
     }
     let mut i = 0
     while i < lint_names.len() {

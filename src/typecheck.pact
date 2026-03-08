@@ -551,36 +551,13 @@ fn check_ptr_in_type_name(type_name: Str, node: Int, has_ffi: Int) ! Diag.Report
 
 pub fn validate_ffi_fn(fn_node: Int) ! Diag.Report {
     let name = np_name.get(fn_node).unwrap()
-    let anns_sl = np_handlers.get(fn_node).unwrap()
-    let mut has_ffi = 0
-    let mut has_trusted = 0
-    let mut has_requires = 0
-    let mut has_ensures = 0
-    let mut ffi_node = -1
-    let mut requires_node = -1
-    let mut ensures_node = -1
-
-    if anns_sl != -1 {
-        let mut ai = 0
-        while ai < sublist_length(anns_sl) {
-            let ann = sublist_get(anns_sl, ai)
-            let ann_name = np_name.get(ann).unwrap()
-            if ann_name == "ffi" {
-                has_ffi = 1
-                ffi_node = ann
-            }
-            if ann_name == "trusted" { has_trusted = 1 }
-            if ann_name == "requires" {
-                has_requires = 1
-                requires_node = ann
-            }
-            if ann_name == "ensures" {
-                has_ensures = 1
-                ensures_node = ann
-            }
-            ai = ai + 1
-        }
-    }
+    let ffi_node = get_annotation(fn_node, "ffi")
+    let has_ffi = if ffi_node != -1 { 1 } else { 0 }
+    let has_trusted = has_annotation(fn_node, "trusted")
+    let requires_node = get_annotation(fn_node, "requires")
+    let has_requires = if requires_node != -1 { 1 } else { 0 }
+    let ensures_node = get_annotation(fn_node, "ensures")
+    let has_ensures = if ensures_node != -1 { 1 } else { 0 }
 
     if has_ffi != 0 {
         if np_is_pub.get(fn_node).unwrap() != 0 {
@@ -1585,17 +1562,7 @@ pub fn resolve_names(program: Int) ! TypeCheck.Resolve, Diag.Report {
 
 pub fn nr_check_fn(fn_node: Int) ! TypeCheck.Resolve, Diag.Report {
     nr_push_scope()
-    let nr_anns_sl = np_handlers.get(fn_node).unwrap()
-    let mut nr_is_ffi = 0
-    if nr_anns_sl != -1 {
-        let mut nai = 0
-        while nai < sublist_length(nr_anns_sl) {
-            if np_name.get(sublist_get(nr_anns_sl, nai)).unwrap() == "ffi" {
-                nr_is_ffi = 1
-            }
-            nai = nai + 1
-        }
-    }
+    let nr_is_ffi = has_annotation(fn_node, "ffi")
     let params_sl = np_params.get(fn_node).unwrap()
     if params_sl != -1 && nr_is_ffi == 0 {
         let mut i = 0
@@ -2529,17 +2496,7 @@ pub fn tc_check_fn(fn_node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Rep
         tc_current_fn_ret = fnsig_ret.get(sig).unwrap()
     }
 
-    let mut is_ffi = 0
-    let tc_anns_sl = np_handlers.get(fn_node).unwrap()
-    if tc_anns_sl != -1 {
-        let mut tai = 0
-        while tai < sublist_length(tc_anns_sl) {
-            if np_name.get(sublist_get(tc_anns_sl, tai)).unwrap() == "ffi" {
-                is_ffi = 1
-            }
-            tai = tai + 1
-        }
-    }
+    let is_ffi = has_annotation(fn_node, "ffi")
 
     let params_sl = np_params.get(fn_node).unwrap()
     if params_sl != -1 && is_ffi == 0 {

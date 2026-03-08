@@ -502,6 +502,8 @@ let mut sr_save_global: List[Str] = []
 let mut sr_restore_globals: Map[Str, Int] = Map()
 let mut sr_current_fn: Str = ""
 let mut sr_fn_has_save_restore: Int = 0
+let mut sr_allow_w0550: Int = 0
+let mut sr_allow_w0551: Int = 0
 
 fn sr_reset() {
     sr_save_local = []
@@ -561,8 +563,7 @@ fn sr_check_call(call_node: Int, callee_name: Str) ! Diag.Report {
         wi = wi + 1
     }
 
-    if saved_count > 0 && unsaved.len() > 0 {
-        // W0550: some globals saved but not all
+    if saved_count > 0 && unsaved.len() > 0 && sr_allow_w0550 == 0 {
         let mut missing = ""
         let mut ui = 0
         while ui < unsaved.len() {
@@ -580,8 +581,7 @@ fn sr_check_call(call_node: Int, callee_name: Str) ! Diag.Report {
         )
     }
 
-    if saved_count == 0 && sr_fn_has_save_restore != 0 {
-        // W0551: function has save/restore patterns but this call has none
+    if saved_count == 0 && sr_fn_has_save_restore != 0 && sr_allow_w0551 == 0 {
         let mut all_writes = ""
         wi = 0
         while wi < wcount {
@@ -808,6 +808,25 @@ fn sr_analyze_fn(fn_node: Int) ! Diag.Report {
     diag_source_file = diag_file_for_node(fn_node)
     sr_reset()
     sr_fn_has_save_restore = 0
+    sr_allow_w0550 = 0
+    sr_allow_w0551 = 0
+    let allow_ann = get_annotation(fn_node, "allow")
+    if allow_ann != -1 {
+        let allow_args_sl = np_args.get(allow_ann).unwrap()
+        if allow_args_sl != -1 {
+            let mut saj = 0
+            while saj < sublist_length(allow_args_sl) {
+                let sr_arg_name = np_name.get(sublist_get(allow_args_sl, saj)).unwrap()
+                if sr_arg_name == "IncompleteStateRestore" {
+                    sr_allow_w0550 = 1
+                }
+                if sr_arg_name == "UnrestoredMutation" {
+                    sr_allow_w0551 = 1
+                }
+                saj = saj + 1
+            }
+        }
+    }
     let body = np_body.get(fn_node).unwrap()
     if body == -1 {
         return
