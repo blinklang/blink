@@ -2145,4 +2145,36 @@ PACT_UNUSED static int64_t pact_sqlite3_rollback(void* db) {
 
 #endif /* PACT_USE_SQLITE */
 
+// ── FFI scope helpers ─────────────────────────────────────────────────
+
+PACT_UNUSED static pact_list* pact_ffi_scope_new(void) {
+    return pact_list_new();
+}
+
+PACT_UNUSED static void* pact_ffi_scope_track(pact_list* scope, void* ptr) {
+    pact_list_push(scope, ptr);
+    return ptr;
+}
+
+PACT_UNUSED static void* pact_ffi_scope_take(pact_list* scope, void* ptr) {
+    for (int64_t i = 0; i < scope->len; i++) {
+        if (scope->items[i] == ptr) {
+            for (int64_t j = i; j < scope->len - 1; j++) {
+                scope->items[j] = scope->items[j + 1];
+            }
+            scope->len--;
+            return ptr;
+        }
+    }
+    return ptr;
+}
+
+PACT_UNUSED static void pact_ffi_scope_cleanup(pact_list* scope) {
+    for (int64_t i = 0; i < scope->len; i++) {
+        free(scope->items[i]);
+    }
+    free(scope->items);
+    free(scope);
+}
+
 #endif

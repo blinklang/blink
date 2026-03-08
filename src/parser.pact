@@ -418,7 +418,7 @@ pub fn parse_program() -> Int ! Parse, Diag.Report {
                 advance()
                 skip_newlines()
                 let mut ann_arg_nodes: List[Int] = []
-                if ann_name == "requires" || ann_name == "ensures" {
+                if ann_name == "requires" || ann_name == "ensures" || ann_name == "invariant" {
                     let expr_nd = parse_expr()
                     ann_arg_nodes.push(expr_nd)
                     skip_newlines()

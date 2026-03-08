@@ -35,6 +35,30 @@ pub let mut diag_module_files: Map[Str, Str] = Map()
 // ── Lint severity overrides from [lints] in pact.toml ───────────────
 pub let mut lint_overrides: Map[Str, Str] = Map()
 
+// ── Per-function @allow suppression set ─────────────────────────────
+pub let mut diag_allow_set: Map[Str, Int] = Map()
+
+pub fn diag_push_allows(fn_node: Int) {
+    let allow_ann = get_annotation(fn_node, "allow")
+    if allow_ann == -1 {
+        return
+    }
+    let args_sl = np_args.get(allow_ann).unwrap()
+    if args_sl == -1 {
+        return
+    }
+    let mut i = 0
+    while i < sublist_length(args_sl) {
+        let arg_name = np_name.get(sublist_get(args_sl, i)).unwrap()
+        diag_allow_set.set(arg_name, 1)
+        i = i + 1
+    }
+}
+
+pub fn diag_clear_allows() {
+    diag_allow_set = Map()
+}
+
 // ── Lint override helpers ────────────────────────────────────────────
 
 pub fn lint_set_override(name: Str, level: Str) {
@@ -42,6 +66,9 @@ pub fn lint_set_override(name: Str, level: Str) {
 }
 
 fn lint_apply_override(severity: Str, name: Str) -> Str {
+    if diag_allow_set.has(name) != 0 {
+        return "off"
+    }
     if lint_overrides.has(name) == 0 {
         return severity
     }
@@ -279,6 +306,7 @@ pub fn diag_reset() {
     diag_warn_count = 0
     diag_module_files = Map()
     lint_overrides = Map()
+    diag_allow_set = Map()
 }
 
 // ── Error catalog ─────────────────────────────────────────────────

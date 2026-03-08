@@ -1587,11 +1587,16 @@ pub fn emit_with_block(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scop
             let res_expr = np_value.get(item).unwrap()
             emit_expr(res_expr)
             let res_str = expr_result_str
+            let res_type = expr_result_type
             let tmp = fresh_temp("_wr_")
-            emit_line("int64_t {tmp} = {res_str};")
+            let c_decl = c_type_str(res_type)
+            emit_line("{c_decl} {tmp} = {res_str};")
             emitted_let_names.push(binding)
             emitted_let_set.set(binding, 1)
-            emit_line("int64_t {binding} = {tmp};")
+            emit_line("{c_decl} {binding} = {tmp};")
+            if res_type == CT_FFI_SCOPE {
+                set_var(binding, CT_FFI_SCOPE, 0)
+            }
             resource_names.push(binding)
             resource_vars.push(tmp)
         } else {
@@ -1636,8 +1641,13 @@ pub fn emit_with_block(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scop
     let mut rri = resource_names.len() - 1
     while rri >= 0 {
         let rname = resource_names.get(rri).unwrap()
-        emit_line("// close resource: {rname}")
-        emit_line("/* {rname}.close() -- Closeable trait call */")
+        let rvar_type = get_var_type(rname)
+        if rvar_type == CT_FFI_SCOPE {
+            emit_line("pact_ffi_scope_cleanup({rname});")
+        } else {
+            emit_line("// close resource: {rname}")
+            emit_line("/* {rname}.close() -- Closeable trait call */")
+        }
         rri = rri - 1
     }
     cg_indent = cg_indent - 1
@@ -2531,6 +2541,22 @@ pub fn emit_struct_typedef(td_node: Int) ! Codegen.Emit {
     cg_indent = cg_indent - 1
     emit_line("} {c_type_c_name(name)};")
     emit_line("")
+    let inv_anns_sl = np_handlers.get(td_node).unwrap()
+    if inv_anns_sl != -1 {
+        let mut ai = 0
+        while ai < sublist_length(inv_anns_sl) {
+            let ann = sublist_get(inv_anns_sl, ai)
+            let ann_name = np_name.get(ann).unwrap()
+            if ann_name == "invariant" {
+                let args_sl = np_args.get(ann).unwrap()
+                if args_sl != -1 && sublist_length(args_sl) > 0 {
+                    let expr_node = sublist_get(args_sl, 0)
+                    struct_invariants.push(StructInvariant { struct_name: name, expr_node: expr_node })
+                }
+            }
+            ai = ai + 1
+        }
+    }
 }
 
 pub fn emit_enum_typedef(td_node: Int) ! Codegen.Emit {

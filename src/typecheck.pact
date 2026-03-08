@@ -2497,6 +2497,7 @@ pub fn tc_check_fn(fn_node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Rep
     }
 
     let is_ffi = has_annotation(fn_node, "ffi")
+    diag_push_allows(fn_node)
 
     let params_sl = np_params.get(fn_node).unwrap()
     if params_sl != -1 && is_ffi == 0 {
@@ -2526,6 +2527,7 @@ pub fn tc_check_fn(fn_node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Rep
             }
         }
     }
+    diag_clear_allows()
     tc_current_fn_name = prev_fn_name
     tc_current_fn_ret = prev_fn_ret
     nr_pop_scope()

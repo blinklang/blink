@@ -1320,6 +1320,11 @@ pub fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
             expr_result_type = CT_CHANNEL
             return
         }
+        if fn_name == "ffi_scope" {
+            expr_result_str = "pact_ffi_scope_new()"
+            expr_result_type = CT_FFI_SCOPE
+            return
+        }
         if fn_name == "alloc_ptr" {
             let inner_c = resolve_ptr_inner_c()
             expr_result_str = "({inner_c}*)malloc(sizeof({inner_c}))"
@@ -1875,6 +1880,19 @@ pub fn emit_struct_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scop
     }
     emit_line("{c_type} {tmp} = \{ {inits} };")
     set_var_struct(tmp, struct_key)
+    let mut ii = 0
+    while ii < struct_invariants.len() {
+        let inv = struct_invariants.get(ii).unwrap()
+        if inv.struct_name == sname {
+            let old_self = cg_where_self_var
+            cg_where_self_var = tmp
+            emit_expr(inv.expr_node)
+            let inv_cond = expr_result_str
+            emit_line("if (!({inv_cond})) \{ fprintf(stderr, \"invariant violated: @invariant on %s\\n\", \"{sname}\"); exit(1); }")
+            cg_where_self_var = old_self
+        }
+        ii = ii + 1
+    }
     expr_result_str = tmp
     expr_result_type = CT_VOID
 }

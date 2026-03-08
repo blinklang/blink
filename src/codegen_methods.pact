@@ -2650,6 +2650,31 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
         }
     }
 
+    if obj_type == CT_FFI_SCOPE {
+        if method == "alloc" {
+            let inner_c = resolve_ptr_inner_c()
+            expr_result_str = "({inner_c}*)pact_ffi_scope_track({obj_str}, calloc(1, sizeof({inner_c})))"
+            expr_result_type = CT_PTR
+            return
+        }
+        if method == "cstr" {
+            let args_sl = np_args.get(node).unwrap()
+            emit_expr(sublist_get(args_sl, 0))
+            let arg_str = expr_result_str
+            expr_result_str = "(uint8_t*)pact_ffi_scope_track({obj_str}, strdup({arg_str}))"
+            expr_result_type = CT_PTR
+            return
+        }
+        if method == "take" {
+            let args_sl = np_args.get(node).unwrap()
+            emit_expr(sublist_get(args_sl, 0))
+            let arg_str = expr_result_str
+            expr_result_str = "pact_ffi_scope_take({obj_str}, {arg_str})"
+            expr_result_type = CT_PTR
+            return
+        }
+    }
+
     // Option methods: unwrap, is_some, is_none
     if obj_type == CT_OPTION {
         if method == "unwrap" {

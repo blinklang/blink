@@ -39,6 +39,7 @@ pub let CT_BYTES = 14
 pub let CT_INSTANT = 15
 pub let CT_DURATION = 16
 pub let CT_PTR = 17
+pub let CT_FFI_SCOPE = 18
 
 
 // ── Codegen state ───────────────────────────────────────────────────
@@ -317,6 +318,13 @@ pub fn get_struct_field_list_elem_type(sname: Str, fname: Str) -> Int {
     }
     CT_INT
 }
+
+// @invariant registry
+type StructInvariant {
+    struct_name: Str
+    expr_node: Int
+}
+pub let mut struct_invariants: List[StructInvariant] = []
 
 // @derive(Serialize/Deserialize) registries
 pub let mut derive_serialize_types: List[Str] = []
@@ -1842,6 +1850,7 @@ pub fn c_type_str(ct: Int) -> Str {
     else if ct == CT_INSTANT { "pact_instant" }
     else if ct == CT_DURATION { "pact_duration" }
     else if ct == CT_PTR { "void*" }
+    else if ct == CT_FFI_SCOPE { "pact_list*" }
     else { "void" }
 }
 

@@ -50,6 +50,7 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
     tryfrom_entries = []
     sf_entries = []
     struct_field_defaults = []
+    struct_invariants = []
     sf_closure_sigs = []
     derive_serialize_types = []
     derive_deserialize_types = []
@@ -126,6 +127,7 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
     reg_fn("file_mtime", CT_INT)
     reg_fn("getpid", CT_INT)
     reg_fn("process_exec", CT_VOID)
+    reg_fn("ffi_scope", CT_FFI_SCOPE)
 
     reg_fn("process_run", CT_VOID)
     reg_fn_struct_ret("process_run", "ProcessResult")
