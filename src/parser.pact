@@ -2034,12 +2034,11 @@ pub fn parse_postfix() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
                 expect(TokenKind.LParen)
                 let cn_args = new_sublist()
                 if !at(TokenKind.RParen) {
-                    skip_named_arg_label()
-                    sublist_push(cn_args, parse_expr())
+                    sublist_push(cn_args, parse_maybe_named_arg())
                     while at(TokenKind.Comma) {
                         advance()
                         skip_newlines()
-                        sublist_push(cn_args, parse_expr())
+                        sublist_push(cn_args, parse_maybe_named_arg())
                     }
                 }
                 expect(TokenKind.RParen)
@@ -2052,16 +2051,14 @@ pub fn parse_postfix() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
                 advance()
                 let args = new_sublist()
                 if !at(TokenKind.RParen) {
-                    skip_named_arg_label()
-                    sublist_push(args, parse_expr())
+                    sublist_push(args, parse_maybe_named_arg())
                     while at(TokenKind.Comma) {
                         advance()
                         skip_newlines()
                         if at(TokenKind.RParen) {
                             break
                         }
-                        skip_named_arg_label()
-                        sublist_push(args, parse_expr())
+                        sublist_push(args, parse_maybe_named_arg())
                     }
                     skip_newlines()
                 }
@@ -2098,16 +2095,14 @@ pub fn parse_postfix() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
             let args = new_sublist()
             if !at(TokenKind.RParen) {
                 skip_newlines()
-                skip_named_arg_label()
-                sublist_push(args, parse_expr())
+                sublist_push(args, parse_maybe_named_arg())
                 while at(TokenKind.Comma) {
                     advance()
                     skip_newlines()
                     if at(TokenKind.RParen) {
                         break
                     }
-                    skip_named_arg_label()
-                    sublist_push(args, parse_expr())
+                    sublist_push(args, parse_maybe_named_arg())
                 }
                 skip_newlines()
             }
@@ -2158,7 +2153,6 @@ pub fn parse_postfix() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
 
 pub fn skip_named_arg_label() ! Parse.Advance {
     if at(TokenKind.Ident) {
-        // Peek ahead to see if next is colon (named arg)
         let saved = pos
         advance()
         if at(TokenKind.Colon) {
@@ -2168,6 +2162,26 @@ pub fn skip_named_arg_label() ! Parse.Advance {
             pos = saved
         }
     }
+}
+
+pub fn parse_maybe_named_arg() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
+    if at(TokenKind.Ident) {
+        let saved = pos
+        let label = peek_value()
+        advance()
+        if at(TokenKind.Colon) {
+            advance()
+            skip_newlines()
+            let inner = parse_expr()
+            let nd = new_node(NodeKind.NamedArg)
+            np_name.set(nd, label)
+            np_value.set(nd, inner)
+            return nd
+        } else {
+            pos = saved
+        }
+    }
+    parse_expr()
 }
 
 pub fn flatten_field_access(node: Int) -> Str {

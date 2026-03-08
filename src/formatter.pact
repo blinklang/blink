@@ -512,6 +512,12 @@ pub fn format_expr(node: Int) -> Str {
         return "#embed(\"{path}\")"
     }
 
+    if kind == NodeKind.NamedArg {
+        let label = np_name.get(node).unwrap()
+        let inner = np_value.get(node).unwrap()
+        return "{label}: {format_expr(inner)}"
+    }
+
     ""
 }
 

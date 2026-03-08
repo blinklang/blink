@@ -77,6 +77,10 @@ Unspecified or under-specified areas needing design work. Note: a self-hosting c
 
 - [x] **Native C dependency resolution for cross-compilation** — `@ffi("library", "symbol")` names libraries but no mechanism to resolve/provide them. `pact.toml` has no `[native-dependencies]` section. Compiler built-ins (`db.*`, `net.*`) use C libraries in `runtime.h` but aren't visible to the dependency system. Cross-compilation via `zig cc` fails because dynamic link flags can't find libraries for non-host targets. *(Resolved: §9.1.2, panel vote 5-0 `[native-dependencies]` manifest section, 5-0 static-cross/dynamic-host linking, 3-2 compiler-managed built-ins, 5-0 remove dead `-lcurl`)*
 
+## Needs Deliberation (open)
+
+- **Mutation analysis suppression / precision** — W0551 (UnrestoredMutation) fires for every function that calls anything writing 3+ globals (e.g. `diag_emit` mutates 14 globals). Produces 2,400+ warnings on compiler self-host — virtually all false positives. The analysis was designed to catch speculative-lookahead bugs (save `pos` but forget `pending_comments`) and found real bugs, but the heuristic "3+ unsaved globals = warning" catches *all* normal code too. Missing: (1) suppression mechanism (`@allow(UnrestoredMutation)` per-site or per-function), (2) smarter heuristics (only warn inside functions that already have save/restore patterns, i.e. functions doing speculative work), (3) the threshold of 3 is arbitrary. §4.16 specifies the analysis but not how to manage its noise.
+
 ## Deferred to v2+
 
 Items that are specced or aspirational but not needed for v1 release. Kept here for tracking — no br tasks.

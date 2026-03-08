@@ -450,6 +450,7 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
             if fn_mod != "" && fn_mod != "__main__" {
                 mod_fn_prefix.set(fn_name, fn_mod)
             }
+            reg_fn_node(fn_name, fn_node)
             // Track generic functions separately
             let fn_tparams = np_type_params.get(fn_node).unwrap()
             if fn_tparams != -1 && sublist_length(fn_tparams) > 0 {

@@ -380,6 +380,12 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
         return
     }
 
+    if kind == NodeKind.NamedArg {
+        let inner = np_value.get(node).unwrap()
+        emit_expr(inner)
+        return
+    }
+
     expr_result_str = "0"
     expr_result_type = CT_VOID
 }
@@ -883,6 +889,97 @@ pub fn emit_unaryop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
     }
 }
 
+pub let mut reorder_result: List[Int] = []
+
+pub fn reorder_named_args(fn_name: Str, args_sl: Int, call_node: Int) ! Diag.Report {
+    reorder_result = []
+    if args_sl == -1 {
+        return
+    }
+    let argc = sublist_length(args_sl)
+    if argc == 0 {
+        return
+    }
+    let mut positional_end = -1
+    let mut i = 0
+    while i < argc {
+        let arg = sublist_get(args_sl, i)
+        if np_kind.get(arg).unwrap() == NodeKind.NamedArg {
+            positional_end = i
+            i = argc
+        }
+        i = i + 1
+    }
+    if positional_end == -1 {
+        return
+    }
+    let fn_node = get_fn_node(fn_name)
+    if fn_node == -1 {
+        return
+    }
+    let params_sl = np_params.get(fn_node).unwrap()
+    if params_sl == -1 {
+        return
+    }
+    let param_count = sublist_length(params_sl)
+    i = positional_end
+    while i < argc {
+        let arg = sublist_get(args_sl, i)
+        if np_kind.get(arg).unwrap() == NodeKind.NamedArg {
+            let label = np_name.get(arg).unwrap()
+            let mut valid = 0
+            let mut k = 0
+            while k < param_count {
+                let pk = sublist_get(params_sl, k)
+                if np_name.get(pk).unwrap() == label {
+                    valid = 1
+                    k = param_count
+                }
+                k = k + 1
+            }
+            if valid == 0 {
+                diag_error_at("InvalidKeywordArg", "E0511", "no parameter named '{label}' in function '{fn_name}'", call_node, "check the function signature")
+                return
+            }
+        } else {
+            diag_error_at("InvalidKeywordArg", "E0511", "positional argument after named argument in call to '{fn_name}'", call_node, "place all positional arguments before named arguments")
+            return
+        }
+        i = i + 1
+    }
+    let mut result: List[Int] = []
+    i = 0
+    while i < positional_end {
+        result.push(sublist_get(args_sl, i))
+        i = i + 1
+    }
+    i = positional_end
+    while i < param_count {
+        let param_node = sublist_get(params_sl, i)
+        let param_name = np_name.get(param_node).unwrap()
+        let mut found = 0
+        let mut j = positional_end
+        while j < argc {
+            let arg = sublist_get(args_sl, j)
+            if np_kind.get(arg).unwrap() == NodeKind.NamedArg {
+                let label = np_name.get(arg).unwrap()
+                if label == param_name {
+                    result.push(arg)
+                    found = 1
+                    j = argc
+                }
+            }
+            j = j + 1
+        }
+        if found == 0 {
+            diag_error_at("MissingKeywordArg", "E0510", "missing keyword argument '{param_name}' in call to '{fn_name}'", call_node, "add '{param_name}: <value>'")
+            return
+        }
+        i = i + 1
+    }
+    reorder_result = result
+}
+
 pub fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
     let func_node = np_left.get(node).unwrap()
     let func_kind = np_kind.get(func_node).unwrap()
@@ -1289,7 +1386,24 @@ pub fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
         let args_sl = np_args.get(node).unwrap()
         let mut args_str = ""
         let mut arg_types: List[Int] = []
-        if args_sl != -1 {
+        reorder_named_args(fn_name, args_sl, node)
+        if reorder_result.len() > 0 {
+            let mut i = 0
+            while i < reorder_result.len() {
+                if i > 0 {
+                    args_str = args_str.concat(", ")
+                }
+                let arg_node = reorder_result.get(i).unwrap()
+                let mut actual = arg_node
+                if np_kind.get(arg_node).unwrap() == NodeKind.NamedArg {
+                    actual = np_value.get(arg_node).unwrap()
+                }
+                emit_expr(actual)
+                args_str = args_str.concat(expr_result_str)
+                arg_types.push(expr_result_type)
+                i = i + 1
+            }
+        } else if args_sl != -1 {
             let mut i = 0
             while i < sublist_length(args_sl) {
                 if i > 0 {

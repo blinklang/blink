@@ -353,6 +353,29 @@ pub fn get_derive_method_ret(type_name: Str, method: Str) -> Int {
     CT_VOID
 }
 
+// Function AST node registry: fn_name -> fn_node for all functions
+type FnNodeEntry {
+    name: Str
+    node: Int
+}
+pub let mut fn_node_registry: List[FnNodeEntry] = []
+
+pub fn reg_fn_node(name: Str, node: Int) {
+    fn_node_registry.push(FnNodeEntry { name: name, node: node })
+}
+
+pub fn get_fn_node(name: Str) -> Int {
+    let mut i = 0
+    while i < fn_node_registry.len() {
+        let entry = fn_node_registry.get(i).unwrap()
+        if entry.name == name {
+            return entry.node
+        }
+        i = i + 1
+    }
+    -1
+}
+
 // Generic function definition registry: fn_name -> fn_node for generic fns
 type GenericFnEntry {
     name: Str

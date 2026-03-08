@@ -17,6 +17,7 @@ pub type NodeKind {
     TypeParam, EffectDecl,
     AsyncScope, AsyncSpawn, AwaitExpr, ChannelNew,
     EmbedExpr,
+    NamedArg,
 }
 
 // -- Statement node kinds --
@@ -210,6 +211,7 @@ pub fn node_kind_name(kind: Int) -> Str {
         NodeKind.AwaitExpr => "AwaitExpr"
         NodeKind.ChannelNew => "ChannelNew"
         NodeKind.EmbedExpr => "EmbedExpr"
+        NodeKind.NamedArg => "NamedArg"
         _ => "Unknown"
     }
 }

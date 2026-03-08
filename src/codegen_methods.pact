@@ -1677,6 +1677,11 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             expr_result_type = CT_FLOAT
             return
         }
+        if method == "as_cstr" {
+            expr_result_str = "strdup({obj_str})"
+            expr_result_type = CT_PTR
+            return
+        }
     }
 
     // List methods
@@ -2629,6 +2634,18 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
         if method == "addr" {
             expr_result_str = "((int64_t)(intptr_t){obj_str})"
             expr_result_type = CT_INT
+            return
+        }
+        if method == "to_str" {
+            ensure_option_type(CT_STRING)
+            let opt_type = option_c_type(CT_STRING)
+            let res = fresh_temp("_tostr_opt_")
+            emit_line("{opt_type} {res} = ({obj_str} != NULL) ? ({opt_type})\{.tag = 1, .value = strdup((const char*){obj_str})} : ({opt_type})\{.tag = 0};")
+            set_var_option(res, CT_STRING)
+            expr_result_str = res
+            expr_result_type = CT_OPTION
+            expr_option_inner = CT_STRING
+            expr_option_inner_struct = ""
             return
         }
     }
