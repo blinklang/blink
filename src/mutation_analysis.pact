@@ -501,6 +501,7 @@ let mut sr_save_local: List[Str] = []
 let mut sr_save_global: List[Str] = []
 let mut sr_restore_globals: Map[Str, Int] = Map()
 let mut sr_current_fn: Str = ""
+let mut sr_fn_has_save_restore: Int = 0
 
 fn sr_reset() {
     sr_save_local = []
@@ -547,7 +548,6 @@ fn sr_check_call(call_node: Int, callee_name: Str) ! Diag.Report {
 
     let wstart = ma_write_starts.get(callee_idx).unwrap()
     let mut saved_count = 0
-    let mut total_in_ws = wcount
     let mut unsaved: List[Str] = []
 
     let mut wi = 0
@@ -580,8 +580,8 @@ fn sr_check_call(call_node: Int, callee_name: Str) ! Diag.Report {
         )
     }
 
-    if saved_count == 0 && total_in_ws >= 3 {
-        // W0551: no save/restore at all for a call with large write-set
+    if saved_count == 0 && sr_fn_has_save_restore != 0 {
+        // W0551: function has save/restore patterns but this call has none
         let mut all_writes = ""
         wi = 0
         while wi < wcount {
@@ -736,18 +736,87 @@ fn sr_scan_node(node: Int) ! Diag.Report {
     }
 }
 
+fn sr_prescan_has_save(stmts_sl: Int) -> Int {
+    if stmts_sl == -1 {
+        return 0
+    }
+    let num_stmts = sublist_length(stmts_sl)
+    let mut i = 0
+    while i < num_stmts {
+        let stmt = sublist_get(stmts_sl, i)
+        let kind = np_kind.get(stmt).unwrap()
+        if kind == NodeKind.LetBinding {
+            let val = np_value.get(stmt).unwrap()
+            if val != -1 && np_kind.get(val).unwrap() == NodeKind.Ident {
+                let val_name = np_name.get(val).unwrap()
+                if is_global(val_name) != 0 {
+                    return 1
+                }
+            }
+        }
+        if kind == NodeKind.Block {
+            if sr_prescan_has_save(np_stmts.get(stmt).unwrap()) != 0 {
+                return 1
+            }
+        }
+        if kind == NodeKind.IfExpr {
+            let then_body = np_then_body.get(stmt).unwrap()
+            if then_body != -1 && np_kind.get(then_body).unwrap() == NodeKind.Block {
+                if sr_prescan_has_save(np_stmts.get(then_body).unwrap()) != 0 {
+                    return 1
+                }
+            }
+            let else_body = np_else_body.get(stmt).unwrap()
+            if else_body != -1 && np_kind.get(else_body).unwrap() == NodeKind.Block {
+                if sr_prescan_has_save(np_stmts.get(else_body).unwrap()) != 0 {
+                    return 1
+                }
+            }
+        }
+        if kind == NodeKind.WhileLoop || kind == NodeKind.ForIn || kind == NodeKind.LoopExpr {
+            let body = np_body.get(stmt).unwrap()
+            if body != -1 && np_kind.get(body).unwrap() == NodeKind.Block {
+                if sr_prescan_has_save(np_stmts.get(body).unwrap()) != 0 {
+                    return 1
+                }
+            }
+        }
+        if kind == NodeKind.MatchExpr {
+            let arms_sl = np_arms.get(stmt).unwrap()
+            if arms_sl != -1 {
+                let mut ai = 0
+                while ai < sublist_length(arms_sl) {
+                    let arm = sublist_get(arms_sl, ai)
+                    let arm_body = np_body.get(arm).unwrap()
+                    if arm_body != -1 && np_kind.get(arm_body).unwrap() == NodeKind.Block {
+                        if sr_prescan_has_save(np_stmts.get(arm_body).unwrap()) != 0 {
+                            return 1
+                        }
+                    }
+                    ai = ai + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    0
+}
+
 fn sr_analyze_fn(fn_node: Int) ! Diag.Report {
     sr_current_fn = np_name.get(fn_node).unwrap()
     let saved_source = diag_source_file
     diag_source_file = diag_file_for_node(fn_node)
     sr_reset()
+    sr_fn_has_save_restore = 0
     let body = np_body.get(fn_node).unwrap()
     if body == -1 {
         return
     }
     let body_kind = np_kind.get(body).unwrap()
     if body_kind == NodeKind.Block {
-        sr_scan_stmts(np_stmts.get(body).unwrap())
+        let body_stmts = np_stmts.get(body).unwrap()
+        sr_fn_has_save_restore = sr_prescan_has_save(body_stmts)
+        sr_scan_stmts(body_stmts)
     }
     diag_source_file = saved_source
 }

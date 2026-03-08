@@ -88,8 +88,8 @@ fn speculative_bump_incomplete() {
     name = saved_name
 }
 
-// No save/restore at all for a 3-global write-set
-// Should trigger W0551 for bump_everything() call
+// No save/restore pattern in this function at all
+// Should NOT trigger W0551 (only fires when function has existing save/restore)
 fn speculative_bump_none() {
     bump_everything()
 }

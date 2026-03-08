@@ -2044,7 +2044,79 @@ Callers see `! Parse.Advance` in the signature and know the call changes parser 
 
 **Closures:** If a closure writes to a module-level `let mut` binding, the write is attributed to the enclosing function's write set. Closures that only capture function-local `let mut` are not tracked.
 
-#### 4.16.7 Compilation
+#### 4.16.7 Diagnostic Precision: W0550 and W0551
+
+The mutation analysis produces two warnings related to save/restore patterns in speculative code (lookahead, backtracking):
+
+**W0550 (IncompleteStateRestore):** Fires when a function saves SOME module-level `let mut` bindings before a call, but the callee's write set includes additional bindings that are not saved or restored. This is the high-value diagnostic — it catches exactly the speculative-lookahead bugs that motivated the analysis.
+
+```
+warning[IncompleteStateRestore]: speculative lookahead may leave stale state
+ --> parser.pact:42:5
+  |
+42 |     let saved = pos
+  |         ^^^^^ saves `pos` before calling `skip_newlines`
+  |
+  = note: `skip_newlines` writes {pos, pending_comments}
+  = note: only `pos` is restored after the call
+  = help: also save and restore `pending_comments`, or verify the mutation is intentional
+```
+
+**W0551 (UnrestoredMutation):** Fires when a function that already has a save/restore pattern (i.e., it is doing speculative work) calls a function whose write set includes unsaved bindings. Unlike W0550, W0551 applies to call sites where the caller has *no* saves for the *specific callee* — but the presence of save/restore patterns elsewhere in the function indicates speculative intent.
+
+**Context-aware firing:** W0551 only fires inside functions that already exhibit at least one save/restore pattern. Functions with no save/restore patterns at all are doing normal sequential mutation and do not trigger W0551. This eliminates false positives from normal code calling utility functions with large write sets.
+
+```pact
+fn looks_like_struct_lit() -> Bool {     // has save/restore → speculative context
+    let saved_pos = pos                  // save pattern detected
+    let saved_comments = pending_comments.clone()
+    skip_newlines()                      // W0550 would fire if saves were incomplete
+    let result = at() == CH_LBRACE
+    pos = saved_pos                      // restore
+    pending_comments = saved_comments    // restore
+    result
+}
+
+fn compile_module(path: Str) -> Result[Module, CompileError] ! IO {
+    // No save/restore patterns → not speculative → W0551 does NOT fire
+    diag_emit("error", name, code, msg, line, col, help)  // OK, no warning
+}
+```
+
+**No threshold.** W0551 does not use a write-set size threshold. Inside a speculative context, any unsaved mutation is potentially a bug regardless of how many globals the callee writes. The context-aware heuristic (save/restore pattern present) is the sole gating condition.
+
+#### 4.16.8 Warning Suppression
+
+Mutation analysis warnings can be suppressed at two levels:
+
+**Per-function: `@allow(WarningName)`**
+
+```pact
+@allow(UnrestoredMutation)
+fn parse_with_fallback() -> Node {
+    let saved_pos = pos
+    // Intentionally not saving all state — we know what we're doing
+    try_parse_complex()
+    pos = saved_pos
+    parse_simple()
+}
+```
+
+`@allow` takes the warning name (PascalCase) as its argument. It suppresses all instances of that warning within the annotated function. Multiple warnings can be suppressed: `@allow(UnrestoredMutation, IncompleteStateRestore)`.
+
+**Project-wide: `pact.toml` `[lints]` section**
+
+```toml
+[lints]
+W0551 = "off"       # disable UnrestoredMutation globally
+W0550 = "error"     # upgrade IncompleteStateRestore to error
+```
+
+Valid severity levels: `"off"` (suppress), `"warn"` (default for W0550/W0551), `"error"` (fail compilation).
+
+**Precedence:** Function-level `@allow` always overrides project-level `pact.toml` configuration. A function annotated with `@allow(UnrestoredMutation)` will not emit W0551 even if `pact.toml` sets `W0551 = "error"`.
+
+#### 4.16.9 Compilation
 
 Mutation analysis is a **purely compile-time pass**. It generates no runtime code. The generated C for a function is identical whether or not mutation analysis is enabled — module-level `let mut` compiles to a C global variable regardless. The analysis exists solely to enable diagnostics and tooling.
 

@@ -20,7 +20,7 @@ Prefer retrieval-led reasoning over pre-training for Pact tasks.
 |sections/effects:{04_effects.md} — effect system, handlers, capabilities, concurrency, testing
 |sections/memory:{05_memory_compile_errors.md} — GC, arenas, compilation, diagnostics
 |sections/tooling:{06_tooling.md} — compiler daemon, LSP, formatter, tests, package manager
-|sections/trust:{07_trust_modules_metadata.md} — FFI, modules, imports, all 14 annotations (CANONICAL)
+|sections/trust:{07_trust_modules_metadata.md} — FFI, modules, imports, all 15 annotations (CANONICAL)
 |examples/:{hello,fizzbuzz,todo,calculator,fetch,bank,web_api,embed}.pact
 |src/compiler.pact — compiler entry point (imports lexer, parser, codegen)
 |src/tokens.pact — TokenKind type, keyword_lookup, token_kind_name
@@ -60,7 +60,7 @@ Closures: fn(params) { body } | Generics: List[T] not <T> | Errors: Result[T,E] 
 Extended strings: #"..."# (literal " and \, interpolation #{expr}) | #embed("path") for file inclusion
 Effects: fn foo() ! IO, DB | Handles: io.println(...) not print(...) | main has implicit effects
 Annotations: standalone @annotation(...), NOT inside /// doc comments
-Annotation order: @mod>@capabilities>@derive>@src>@requires>@ensures>@where>@invariant>@perf>@ffi>@trusted>@effects>@alt>@verify>@deprecated
+Annotation order: @mod>@capabilities>@derive>@src>@requires>@ensures>@where>@invariant>@perf>@ffi>@trusted>@effects>@alt>@verify>@allow>@deprecated
 Canonical annotation ref: sections/07_trust_modules_metadata.md §11.1
 
 [Design Panel]

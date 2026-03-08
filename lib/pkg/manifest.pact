@@ -30,9 +30,13 @@ pub let mut cap_optional: List[Str] = []
 pub let mut alt_keys: List[Str] = []
 pub let mut alt_values: List[Str] = []
 
+// ── Lint overrides ──────────────────────────────────────────────
+pub let mut lint_names: List[Str] = []
+pub let mut lint_levels: List[Str] = []
+
 // ── Known top-level sections ─────────────────────────────────────
-let SECTION_COUNT = 5
-let mut known_sections: List[Str] = ["package", "dependencies", "dev-dependencies", "capabilities", "alternatives"]
+let SECTION_COUNT = 6
+let mut known_sections: List[Str] = ["package", "dependencies", "dev-dependencies", "capabilities", "alternatives", "lints"]
 
 // ── Clear all manifest state ─────────────────────────────────────
 
@@ -54,6 +58,8 @@ pub fn manifest_clear() {
     cap_optional = []
     alt_keys = []
     alt_values = []
+    lint_names = []
+    lint_levels = []
 }
 
 // ── Helpers ──────────────────────────────────────────────────────
@@ -338,6 +344,28 @@ pub fn load_alternatives() {
     }
 }
 
+// ── Load lint overrides ─────────────────────────────────────────
+
+pub fn load_lints() {
+    let prefix = "lints."
+    let prefix_len = prefix.len()
+    let mut i = 0
+    while i < toml_keys.len() {
+        let key = toml_keys.get(i).unwrap()
+        if key.starts_with(prefix) {
+            let lint_name = key.substring(prefix_len, key.len() - prefix_len)
+            let lint_val = toml_values.get(i).unwrap()
+            if lint_val == "off" || lint_val == "warn" || lint_val == "error" {
+                lint_names.push(lint_name)
+                lint_levels.push(lint_val)
+            } else {
+                io.println("warning: unknown lint level '{lint_val}' for '{lint_name}' in [lints] (expected off, warn, or error)")
+            }
+        }
+        i = i + 1
+    }
+}
+
 // ── Warn about unknown sections ──────────────────────────────────
 
 fn check_unknown_sections() {
@@ -402,6 +430,7 @@ pub fn manifest_load(path: Str) -> Int {
 
     load_capabilities()
     load_alternatives()
+    load_lints()
     check_unknown_sections()
 
     0

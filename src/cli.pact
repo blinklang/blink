@@ -189,9 +189,26 @@ fn collect_test_files(dir: Str, results: List[Str]) {
     }
 }
 
+fn load_lint_overrides() {
+    if file_exists("pact.toml") == 0 {
+        return
+    }
+    manifest_clear()
+    let rc = manifest_load("pact.toml")
+    if rc != 0 {
+        return
+    }
+    let mut i = 0
+    while i < lint_names.len() {
+        lint_set_override(lint_names.get(i).unwrap(), lint_levels.get(i).unwrap())
+        i = i + 1
+    }
+}
+
 fn do_compile(source_path: Str, c_path: Str, format_flag: Str, debug_mode: Int, strict_mode: Int) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen {
     reset_compiler_state()
     diag_reset()
+    load_lint_overrides()
     diag_source_file = source_path
 
     let source = read_file(source_path)
@@ -1230,6 +1247,7 @@ fn main() {
         if daemon_used == 0 {
             reset_compiler_state()
             diag_reset()
+            load_lint_overrides()
             diag_source_file = source_path
             if format_flag != "" {
                 diag_format = 1

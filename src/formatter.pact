@@ -1754,7 +1754,8 @@ pub fn annotation_order(name: Str) -> Int {
     if name == "effects" { return 11 }
     if name == "alt" { return 12 }
     if name == "verify" { return 13 }
-    if name == "deprecated" { return 14 }
+    if name == "allow" { return 14 }
+    if name == "deprecated" { return 15 }
     99
 }
 

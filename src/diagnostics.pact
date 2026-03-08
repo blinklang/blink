@@ -32,10 +32,40 @@ pub let mut diag_count: Int = 0        // error count only
 pub let mut diag_warn_count: Int = 0   // warning count only
 pub let mut diag_module_files: Map[Str, Str] = Map()
 
+// ── Lint severity overrides from [lints] in pact.toml ───────────────
+pub let mut lint_overrides: Map[Str, Str] = Map()
+
+// ── Lint override helpers ────────────────────────────────────────────
+
+pub fn lint_set_override(name: Str, level: Str) {
+    lint_overrides.set(name, level)
+}
+
+fn lint_apply_override(severity: Str, name: Str) -> Str {
+    if lint_overrides.has(name) == 0 {
+        return severity
+    }
+    let level = lint_overrides.get(name)
+    if level == "off" {
+        return "off"
+    }
+    if level == "error" && severity == "warning" {
+        return "error"
+    }
+    if level == "warn" && severity == "error" {
+        return "warning"
+    }
+    severity
+}
+
 // ── Emit helpers ─────────────────────────────────────────────────────
 
 pub fn diag_emit(severity: Str, name: Str, code: Str, message: Str, line: Int, col: Int, help: Str) ! Diag.Report {
-    diag_severity.push(severity)
+    let effective_severity = lint_apply_override(severity, name)
+    if effective_severity == "off" {
+        return
+    }
+    diag_severity.push(effective_severity)
     diag_name.push(name)
     diag_code.push(code)
     diag_message.push(message)
@@ -47,10 +77,10 @@ pub fn diag_emit(severity: Str, name: Str, code: Str, message: Str, line: Int, c
     diag_end_col.push(0)
     diag_fix_action.push("")
     diag_fix_text.push("")
-    if severity == "error" {
+    if effective_severity == "error" {
         diag_count = diag_count + 1
     }
-    if severity == "warning" {
+    if effective_severity == "warning" {
         diag_warn_count = diag_warn_count + 1
     }
 }
@@ -109,7 +139,11 @@ pub fn diag_warn_at(name: Str, code: Str, message: Str, node_id: Int, help: Str)
 }
 
 pub fn diag_emit_range(severity: Str, name: Str, code: Str, message: Str, line: Int, col: Int, end_line: Int, end_col: Int, help: Str) ! Diag.Report {
-    diag_severity.push(severity)
+    let effective_severity = lint_apply_override(severity, name)
+    if effective_severity == "off" {
+        return
+    }
+    diag_severity.push(effective_severity)
     diag_name.push(name)
     diag_code.push(code)
     diag_message.push(message)
@@ -121,10 +155,10 @@ pub fn diag_emit_range(severity: Str, name: Str, code: Str, message: Str, line: 
     diag_end_col.push(end_col)
     diag_fix_action.push("")
     diag_fix_text.push("")
-    if severity == "error" {
+    if effective_severity == "error" {
         diag_count = diag_count + 1
     }
-    if severity == "warning" {
+    if effective_severity == "warning" {
         diag_warn_count = diag_warn_count + 1
     }
 }
@@ -244,6 +278,7 @@ pub fn diag_reset() {
     diag_count = 0
     diag_warn_count = 0
     diag_module_files = Map()
+    lint_overrides = Map()
 }
 
 // ── Error catalog ─────────────────────────────────────────────────
@@ -313,7 +348,7 @@ pub fn diag_explain(code: Str) -> Str {
         return "W0550 -- IncompleteStateRestore\n\nA function call mutates global state but only some of the affected\nglobals are saved and restored around the call.\n\nCommon causes:\n  - Adding a new global to a function's write-set without updating\n    the save/restore pattern in the caller\n\nFix: save and restore all affected globals around the call, or\nverify the mutation is intentional."
     }
     if code == "W0551" {
-        return "W0551 -- UnrestoredMutation\n\nA function call mutates 3 or more globals with no save/restore\npattern at all.\n\nCommon causes:\n  - Calling a function with broad side effects speculatively\n  - Forgetting to wrap the call in a save/restore block\n\nFix: if the call is speculative (may need to be rolled back), save\nand restore the affected globals."
+        return "W0551 -- UnrestoredMutation\n\nA function call mutates globals with no save/restore pattern, but\nthe enclosing function uses save/restore elsewhere. This suggests\nthe call may need save/restore too.\n\nCommon causes:\n  - Calling a function with broad side effects speculatively\n  - Forgetting to wrap the call in a save/restore block\n\nFix: if the call is speculative (may need to be rolled back), save\nand restore the affected globals."
     }
     if code == "W0600" {
         return "W0600 -- UnusedVariable\n\nA variable was declared but never read.\n\nCommon causes:\n  - Leftover variable from refactoring\n  - Variable assigned but result never used\n\nFix: remove the variable, or prefix its name with '_' to suppress\nthis warning.\n\n  let _unused = compute()  // OK -- prefixed with '_'"
