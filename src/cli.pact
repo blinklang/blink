@@ -395,8 +395,107 @@ fn compile_vendored_source(c_path: Str, o_path: Str, debug_mode: Int, release_mo
     return 0
 }
 
-fn do_link_target(out: Str, c_path: Str, link_flags: Str, debug_mode: Int, release_mode: Int, target: Str) -> Int {
-    let rc = run_cc("-o {out} {c_path} {link_flags}", debug_mode, release_mode, target)
+fn resolve_sqlite_source(has_sqlite: Int) -> Str {
+    if has_sqlite == 0 {
+        return ""
+    }
+    let sqlite_type = manifest_native_dep_type("sqlite3")
+    let sqlite_path = manifest_native_dep_path("sqlite3")
+    if sqlite_type == "vendored" && sqlite_path != "" {
+        return sqlite_path
+    }
+    if sqlite_type == "" {
+        return "lib/native/sqlite3/sqlite3.c"
+    }
+    ""
+}
+
+fn resolve_vendored_objects(has_sqlite: Int, debug_mode: Int, release_mode: Int, target: Str) -> List[Str] {
+    let mut objects: List[Str] = []
+    let mut did_mkdir = 0
+
+    let sqlite_src = resolve_sqlite_source(has_sqlite)
+    if sqlite_src != "" {
+        shell_exec("mkdir -p .tmp")
+        did_mkdir = 1
+        let mut o_path = ".tmp/sqlite3.o"
+        if target != "" {
+            o_path = ".tmp/sqlite3-{target}.o"
+        }
+        let rc = compile_vendored_source(sqlite_src, o_path, debug_mode, release_mode, target)
+        if rc != 0 {
+            return objects
+        }
+        objects.push(o_path)
+    }
+
+    let count = manifest_native_dep_count()
+    let mut i = 0
+    while i < count {
+        let name = manifest_native_dep_name_at(i)
+        let dep_type = manifest_native_dep_type(name)
+        if dep_type == "vendored" && name != "sqlite3" {
+            let dep_path = manifest_native_dep_path(name)
+            if dep_path != "" {
+                if did_mkdir == 0 {
+                    shell_exec("mkdir -p .tmp")
+                    did_mkdir = 1
+                }
+                let mut o_path = ".tmp/{name}.o"
+                if target != "" {
+                    o_path = ".tmp/{name}-{target}.o"
+                }
+                let rc = compile_vendored_source(dep_path, o_path, debug_mode, release_mode, target)
+                if rc != 0 {
+                    return objects
+                }
+                objects.push(o_path)
+            }
+        }
+        i = i + 1
+    }
+
+    objects
+}
+
+fn resolve_vendored_includes(has_sqlite: Int) -> Str {
+    let mut includes: List[Str] = []
+
+    let sqlite_src = resolve_sqlite_source(has_sqlite)
+    if sqlite_src != "" {
+        includes.push("-I{path_dirname(sqlite_src)}")
+    }
+
+    let count = manifest_native_dep_count()
+    let mut i = 0
+    while i < count {
+        let name = manifest_native_dep_name_at(i)
+        let dep_type = manifest_native_dep_type(name)
+        if dep_type == "vendored" && name != "sqlite3" {
+            let dep_path = manifest_native_dep_path(name)
+            if dep_path != "" {
+                includes.push("-I{path_dirname(dep_path)}")
+            }
+        }
+        i = i + 1
+    }
+
+    if includes.len() == 0 {
+        return ""
+    }
+    includes.join(" ")
+}
+
+fn do_link_target(out: Str, c_path: Str, link_flags: Str, obj_files: List[Str], include_flags: Str, debug_mode: Int, release_mode: Int, target: Str) -> Int {
+    let mut objs = ""
+    if obj_files.len() > 0 {
+        objs = " {obj_files.join(" ")}"
+    }
+    let mut includes = ""
+    if include_flags != "" {
+        includes = " {include_flags}"
+    }
+    let rc = run_cc("-o {out} {c_path}{objs}{includes} {link_flags}", debug_mode, release_mode, target)
     if rc != 0 {
         io.println("error: C compilation failed")
         return rc
@@ -484,7 +583,9 @@ fn do_build(source_path: Str, output_path: Str, c_path: Str, format_flag: Str, d
             target = resolve_target_triple(targets.get(0).unwrap())
         }
         let link_flags = build_link_flags(target, has_async, has_sqlite, ffi_libs)
-        let lrc = do_link_target(output_path, c_path, link_flags, debug_mode, release_mode, target)
+        let obj_files = resolve_vendored_objects(has_sqlite, debug_mode, release_mode, target)
+        let inc_flags = resolve_vendored_includes(has_sqlite)
+        let lrc = do_link_target(output_path, c_path, link_flags, obj_files, inc_flags, debug_mode, release_mode, target)
         if lrc != 0 {
             return lrc
         }
@@ -496,6 +597,7 @@ fn do_build(source_path: Str, output_path: Str, c_path: Str, format_flag: Str, d
         return 0
     }
 
+    let inc_flags = resolve_vendored_includes(has_sqlite)
     if json_output != 0 {
         io.print("\{\"status\":\"ok\",\"outputs\":[")
     }
@@ -504,9 +606,10 @@ fn do_build(source_path: Str, output_path: Str, c_path: Str, format_flag: Str, d
         let alias = targets.get(i).unwrap()
         let triple = resolve_target_triple(alias)
         let link_flags = build_link_flags(triple, has_async, has_sqlite, ffi_libs)
+        let obj_files = resolve_vendored_objects(has_sqlite, debug_mode, release_mode, triple)
         let out = "{output_path}-{alias}"
         shell_exec("rm -f {out}")
-        let lrc = do_link_target(out, c_path, link_flags, debug_mode, release_mode, triple)
+        let lrc = do_link_target(out, c_path, link_flags, obj_files, inc_flags, debug_mode, release_mode, triple)
         if lrc != 0 {
             return lrc
         }

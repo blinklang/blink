@@ -1,0 +1,84 @@
+fn get_project_root() -> Str {
+    let result = process_run("pwd", [])
+    result.out.trim()
+}
+
+fn setup_vendored_project(dir: Str, root: Str) {
+    shell_exec("rm -rf {dir}")
+    shell_exec("mkdir -p {dir}/lib/native/sqlite3")
+    shell_exec("cp {root}/lib/native/sqlite3/sqlite3.c {dir}/lib/native/sqlite3/sqlite3.c")
+    shell_exec("cp {root}/lib/native/sqlite3/sqlite3.h {dir}/lib/native/sqlite3/sqlite3.h")
+
+    write_file("{dir}/pact.toml", "[package]\nname = \"crosstest\"\nversion = \"0.1.0\"\n\n[native-dependencies]\nsqlite3 = \{ type = \"vendored\", path = \"lib/native/sqlite3/sqlite3.c\" \}\n")
+
+    write_file("{dir}/main.pact", "fn main() ! IO, DB \{\n    let h = db.open(\":memory:\")\n    db.exec(\"CREATE TABLE t (id INTEGER PRIMARY KEY)\")\n    let rows = db.query(\"SELECT count(*) FROM t\")\n    io.println(rows.get(0).unwrap().get(0).unwrap())\n    db.close(h)\n\}\n")
+}
+
+test "host build with vendored sqlite" {
+    let root = get_project_root()
+    let pact = "{root}/bin/pact"
+    let dir = "/tmp/_pact_test_cross_ffi_host"
+
+    setup_vendored_project(dir, root)
+
+    let result = process_run("sh", ["-c", "cd {dir} && {pact} build main.pact"])
+    assert_eq(result.exit_code, 0)
+    assert(result.out.contains("built:"))
+
+    let run_result = process_run("sh", ["-c", "cd {dir} && ./build/main"])
+    assert_eq(run_result.exit_code, 0)
+    assert_eq(run_result.out.trim(), "0")
+}
+
+test "host build with compiler-managed sqlite (no manifest entry)" {
+    let root = get_project_root()
+    let pact = "{root}/bin/pact"
+    let dir = "/tmp/_pact_test_cross_ffi_auto"
+
+    shell_exec("rm -rf {dir}")
+    shell_exec("mkdir -p {dir}")
+
+    write_file("{dir}/main.pact", "fn main() ! IO, DB \{\n    let h = db.open(\":memory:\")\n    db.exec(\"CREATE TABLE t (id INTEGER PRIMARY KEY)\")\n    let rows = db.query(\"SELECT count(*) FROM t\")\n    io.println(rows.get(0).unwrap().get(0).unwrap())\n    db.close(h)\n\}\n")
+
+    let result = process_run("sh", ["-c", "cd {dir} && {pact} build main.pact"])
+    assert_eq(result.exit_code, 0)
+
+    let run_result = process_run("sh", ["-c", "cd {dir} && ./build/main"])
+    assert_eq(run_result.exit_code, 0)
+    assert_eq(run_result.out.trim(), "0")
+}
+
+test "cross-compile with vendored sqlite" {
+    let root = get_project_root()
+    let pact = "{root}/bin/pact"
+    let dir = "/tmp/_pact_test_cross_ffi_cross"
+
+    setup_vendored_project(dir, root)
+
+    let result = process_run("sh", ["-c", "cd {dir} && {pact} build main.pact --target aarch64-linux-gnu"])
+    assert_eq(result.exit_code, 0)
+    assert(result.out.contains("built:"))
+
+    let file_result = process_run("sh", ["-c", "cd {dir} && file build/main-aarch64-linux-gnu"])
+    assert_eq(file_result.exit_code, 0)
+    assert(file_result.out.contains("aarch64") || file_result.out.contains("ARM aarch64"))
+}
+
+test "multi-target cross-compile" {
+    let root = get_project_root()
+    let pact = "{root}/bin/pact"
+    let dir = "/tmp/_pact_test_cross_ffi_multi"
+
+    setup_vendored_project(dir, root)
+
+    let result = process_run("sh", ["-c", "cd {dir} && {pact} build main.pact --target linux --target linux-arm64"])
+    assert_eq(result.exit_code, 0)
+    assert(result.out.contains("built: build/main-linux"))
+    assert(result.out.contains("built: build/main-linux-arm64"))
+
+    let file_x86 = process_run("sh", ["-c", "cd {dir} && file build/main-linux"])
+    assert(file_x86.out.contains("x86-64") || file_x86.out.contains("x86_64"))
+
+    let file_arm = process_run("sh", ["-c", "cd {dir} && file build/main-linux-arm64"])
+    assert(file_arm.out.contains("aarch64") || file_arm.out.contains("ARM aarch64"))
+}
