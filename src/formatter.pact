@@ -256,6 +256,13 @@ fn op_precedence(op: Str) -> Int {
     0
 }
 
+fn format_binop_side(s: Str, child: Int, parent_op: Str, is_right: Int) -> Str {
+    if needs_parens(child, parent_op, is_right) != 0 {
+        return "(".concat(s).concat(")")
+    }
+    s
+}
+
 fn needs_parens(child: Int, parent_op: Str, is_right: Int) -> Int {
     let kind = np_kind.get(child).unwrap()
     if kind != NodeKind.BinOp {
@@ -310,14 +317,8 @@ pub fn format_expr(node: Int) -> Str {
         let op = np_op.get(node).unwrap()
         let left = np_left.get(node).unwrap()
         let right = np_right.get(node).unwrap()
-        let mut left_str = format_expr(left)
-        let mut right_str = format_expr(right)
-        if needs_parens(left, op, 0) != 0 {
-            left_str = "(".concat(left_str).concat(")")
-        }
-        if needs_parens(right, op, 1) != 0 {
-            right_str = "(".concat(right_str).concat(")")
-        }
+        let left_str = format_binop_side(format_expr(left), left, op, 0)
+        let right_str = format_binop_side(format_expr(right), right, op, 1)
         return "{left_str} {op} {right_str}"
     }
 
@@ -817,18 +818,10 @@ fn flatten_binop_chain(node: Int) {
     if left_kind == NodeKind.BinOp && np_op.get(left).unwrap() == op {
         flatten_binop_chain(left)
     } else {
-        let mut left_str = format_expr(left)
-        if needs_parens(left, op, 0) != 0 {
-            left_str = "(".concat(left_str).concat(")")
-        }
-        binop_parts.push(left_str)
+        binop_parts.push(format_binop_side(format_expr(left), left, op, 0))
     }
     binop_ops.push(op)
-    let mut right_str = format_expr(right)
-    if needs_parens(right, op, 1) != 0 {
-        right_str = "(".concat(right_str).concat(")")
-    }
-    binop_parts.push(right_str)
+    binop_parts.push(format_binop_side(format_expr(right), right, op, 1))
 }
 
 pub fn emit_method_chain_wrapped(node: Int, prefix: Str) ! Format.Emit {

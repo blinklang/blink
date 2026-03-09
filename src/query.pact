@@ -458,16 +458,16 @@ fn qr_skip_ws(s: Str, pos: Int) -> Int {
     p
 }
 
-fn qr_parse_string(s: Str, pos: Int) -> Str {
+fn qr_parse_string(s: Str, pos: Int) -> Option[Str] {
     if pos >= s.len() || s.char_at(pos) != 34 {
-        return ""
+        return None
     }
     let mut p = pos + 1
     let mut result = ""
     while p < s.len() {
         let c = s.char_at(p)
         if c == 34 {
-            return result
+            return Some(result)
         }
         if c == 92 && p + 1 < s.len() {
             let next = s.char_at(p + 1)
@@ -489,7 +489,7 @@ fn qr_parse_string(s: Str, pos: Int) -> Str {
             p = p + 1
         }
     }
-    result
+    Some(result)
 }
 
 fn qr_end_of_string(s: Str, pos: Int) -> Int {
@@ -527,14 +527,14 @@ fn qr_parse_request(s: Str) -> Int {
                 p = qr_skip_ws(s, p)
             }
         }
-        let key = qr_parse_string(s, p)
+        let key = qr_parse_string(s, p) ?? ""
         p = qr_end_of_string(s, p)
         p = qr_skip_ws(s, p)
         if p < s.len() && s.char_at(p) == 58 {
             p = p + 1
         }
         p = qr_skip_ws(s, p)
-        let val = qr_parse_string(s, p)
+        let val = qr_parse_string(s, p) ?? ""
         p = qr_end_of_string(s, p)
         p = qr_skip_ws(s, p)
         qr_keys.push(key)

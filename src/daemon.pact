@@ -74,16 +74,16 @@ fn dr_skip_ws(s: Str, p: Int) -> Int {
     i
 }
 
-fn dr_parse_string(s: Str, p: Int) -> Str {
+fn dr_parse_string(s: Str, p: Int) -> Option[Str] {
     if p >= s.len() || s.char_at(p) != 34 {
-        return ""
+        return None
     }
     let mut i = p + 1
     let mut result = ""
     while i < s.len() {
         let c = s.char_at(i)
         if c == 34 {
-            return result
+            return Some(result)
         }
         if c == 92 && i + 1 < s.len() {
             let next = s.char_at(i + 1)
@@ -105,7 +105,7 @@ fn dr_parse_string(s: Str, p: Int) -> Str {
             i = i + 1
         }
     }
-    result
+    Some(result)
 }
 
 fn dr_end_of_string(s: Str, p: Int) -> Int {
@@ -143,14 +143,14 @@ fn dr_parse_request(s: Str) -> Int {
                 p = dr_skip_ws(s, p)
             }
         }
-        let key = dr_parse_string(s, p)
+        let key = dr_parse_string(s, p) ?? ""
         p = dr_end_of_string(s, p)
         p = dr_skip_ws(s, p)
         if p < s.len() && s.char_at(p) == 58 {
             p = p + 1
         }
         p = dr_skip_ws(s, p)
-        let val = dr_parse_string(s, p)
+        let val = dr_parse_string(s, p) ?? ""
         p = dr_end_of_string(s, p)
         p = dr_skip_ws(s, p)
         dr_keys.push(key)
@@ -172,11 +172,11 @@ fn dr_get(key: Str) -> Str {
 
 // ── Extract request type ────────────────────────────────────────────
 
-fn daemon_extract_type(request: Str) -> Str {
+fn daemon_extract_type(request: Str) -> Option[Str] {
     if dr_parse_request(request) == 0 {
-        return ""
+        return None
     }
-    dr_get("type")
+    Some(dr_get("type"))
 }
 
 // ── Diagnostics to JSON ─────────────────────────────────────────────
@@ -291,7 +291,7 @@ fn daemon_loop() ! Daemon.Serve, Lex.Tokenize, Parse, TypeCheck, Diag.Report {
         }
 
         let request = socket_read_line(client_fd)
-        let req_type = daemon_extract_type(request)
+        let req_type = daemon_extract_type(request) ?? ""
 
         let mut response = ""
         if req_type == "check" {

@@ -46,7 +46,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                         if fi > 0 {
                             init_str = init_str.concat(", ")
                         }
-                        let field_name = get_variant_field_name(vidx, fi)
+                        let field_name = get_variant_field_name(vidx, fi).unwrap()
                         emit_expr(sublist_get(args_sl, fi))
                         let arg_str = expr_result_str
                         init_str = init_str.concat(".{field_name} = {arg_str}")
@@ -2678,8 +2678,10 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
     // Option methods: unwrap, is_some, is_none
     if obj_type == CT_OPTION {
         if method == "unwrap" {
-            let inner = get_var_option_inner(obj_str)
-            let inner_s = get_var_option_inner_struct(obj_str)
+            let sv_inner = get_var_option_inner(obj_str)
+            let inner = if sv_inner != -1 { sv_inner } else { expr_option_inner }
+            let sv_inner_s = get_var_option_inner_struct(obj_str)
+            let inner_s = if sv_inner_s != "" { sv_inner_s } else { expr_option_inner_struct }
             let tmp = fresh_temp("_ounw_")
             if inner_s != "" {
                 let opt_c = struct_option_c_type(inner_s)

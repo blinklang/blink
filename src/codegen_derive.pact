@@ -226,8 +226,8 @@ fn emit_enum_to_json(type_name: Str) ! Codegen.Emit {
                     let vidx = i
                     let mut fi = 0
                     while fi < evar.field_count {
-                        let fname = get_variant_field_name(vidx, fi)
-                        let ftype_str = get_variant_field_type_str(vidx, fi)
+                        let fname = get_variant_field_name(vidx, fi).unwrap()
+                        let ftype_str = get_variant_field_type_str(vidx, fi).unwrap()
                         let fct = type_from_name(ftype_str)
                         emit_line("result = pact_str_concat(result, \",\\\"{fname}\\\":\");")
                         let access = "self.data.{evar.name}.{fname}"
@@ -449,8 +449,8 @@ fn emit_enum_from_json(type_name: Str) ! Codegen.Emit {
                     let vidx = i
                     let mut fi = 0
                     while fi < evar.field_count {
-                        let fname = get_variant_field_name(vidx, fi)
-                        let ftype_str = get_variant_field_type_str(vidx, fi)
+                        let fname = get_variant_field_name(vidx, fi).unwrap()
+                        let ftype_str = get_variant_field_type_str(vidx, fi).unwrap()
                         let fct = type_from_name(ftype_str)
                         emit_line("\{")
                         cg_indent = cg_indent + 1

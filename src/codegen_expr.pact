@@ -101,11 +101,12 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
                 expr_option_inner = CT_INT
                 expr_option_inner_struct = fsi.ok_struct
             } else {
-                ensure_option_type(CT_INT)
-                let opt_type = option_c_type(CT_INT)
+                let none_inner = if cg_current_fn_option_inner != 0 { cg_current_fn_option_inner } else { CT_INT }
+                ensure_option_type(none_inner)
+                let opt_type = option_c_type(none_inner)
                 expr_result_str = "({opt_type})\{.tag = 0}"
                 expr_result_type = CT_OPTION
-                expr_option_inner = CT_INT
+                expr_option_inner = none_inner
                 expr_option_inner_struct = ""
             }
             return
@@ -1195,7 +1196,7 @@ pub fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
                     if fi > 0 {
                         init_str = init_str.concat(", ")
                     }
-                    let field_name = get_variant_field_name(vidx, fi)
+                    let field_name = get_variant_field_name(vidx, fi).unwrap()
                     emit_expr(sublist_get(args_sl, fi))
                     let arg_str = expr_result_str
                     init_str = init_str.concat(".{field_name} = {arg_str}")
@@ -1425,13 +1426,14 @@ pub fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
         if is_generic_fn(fn_name) != 0 {
             let gfn_node = get_generic_fn_node(fn_name)
             let type_args = infer_fn_type_args_from_types(gfn_node, arg_types)
-            if type_args != "" {
-                let mangled = mangle_generic_name(fn_name, type_args)
-                register_mono_fn(fn_name, type_args)
-                register_mono_instance(fn_name, type_args)
+            if type_args.is_some() {
+                let ta_str = type_args.unwrap()
+                let mangled = mangle_generic_name(fn_name, ta_str)
+                register_mono_fn(fn_name, ta_str)
+                register_mono_instance(fn_name, ta_str)
                 let ret_str = np_return_type.get(gfn_node).unwrap()
                 let tparams_sl = np_type_params.get(gfn_node).unwrap()
-                let resolved_ret = resolve_type_param(ret_str, tparams_sl, type_args)
+                let resolved_ret = resolve_type_param(ret_str, tparams_sl, ta_str)
                 let ret_type = type_from_name(resolved_ret)
                 reg_fn(mangled, ret_type)
                 expr_result_str = "{c_fn_name(mangled)}({args_str})"
@@ -1763,10 +1765,10 @@ pub fn emit_list_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope,
     expr_result_type = CT_LIST
 }
 
-pub fn infer_struct_type_args(type_name: Str, field_types: List[Int]) -> Str {
+pub fn infer_struct_type_args(type_name: Str, field_types: List[Int]) -> Option[Str] {
     let types_sl = np_fields.get(cg_program_node).unwrap()
     if types_sl == -1 {
-        return ""
+        return None
     }
     let mut td = -1
     let mut ti = 0
@@ -1778,19 +1780,19 @@ pub fn infer_struct_type_args(type_name: Str, field_types: List[Int]) -> Str {
         ti = ti + 1
     }
     if td == -1 {
-        return ""
+        return None
     }
     let tparams_sl = np_type_params.get(td).unwrap()
     if tparams_sl == -1 {
-        return ""
+        return None
     }
     let num_params = sublist_length(tparams_sl)
     if num_params == 0 {
-        return ""
+        return None
     }
     let td_flds_sl = np_fields.get(td).unwrap()
     if td_flds_sl == -1 {
-        return ""
+        return None
     }
     let mut args = ""
     let mut pi = 0
@@ -1814,7 +1816,7 @@ pub fn infer_struct_type_args(type_name: Str, field_types: List[Int]) -> Str {
         args = args.concat(resolved)
         pi = pi + 1
     }
-    args
+    Some(args)
 }
 
 pub fn emit_struct_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
@@ -1871,12 +1873,12 @@ pub fn emit_struct_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scop
     }
     let type_args = infer_struct_type_args(sname, field_types)
     let mut struct_key = sname
-    if type_args != "" {
-        let mono_name = register_mono_instance(sname, type_args)
+    if type_args.is_some() {
+        let ta_str = type_args.unwrap()
+        let mono_name = register_mono_instance(sname, ta_str)
         c_type = c_type_c_name(mono_name)
         struct_key = mono_name
-        // Register field types for the mono instance so field access works
-        register_mono_field_types(sname, mono_name, type_args)
+        register_mono_field_types(sname, mono_name, ta_str)
     }
     emit_line("{c_type} {tmp} = \{ {inits} };")
     set_var_struct(tmp, struct_key)

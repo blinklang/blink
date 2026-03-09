@@ -850,6 +850,7 @@ pub let mut cap_budget_active: Int = 0
 pub let mut cg_current_fn_name: Str = ""
 pub let mut cg_current_fn_ret: Int = 0
 pub let mut cg_current_fn_node: Int = -1
+pub let mut cg_current_fn_option_inner: Int = 0
 
 // Scratch space for tuple match scrutinee temps
 pub let mut cg_program_node: Int = 0
@@ -1102,6 +1103,19 @@ pub fn get_fn_ret_type(name: Str) -> RetType {
     RetType { name: "", kind: CT_VOID, inner1: -1, inner2: -1 }
 }
 
+pub fn resolve_option_inner_from_ann(fn_node: Int) -> Int {
+    let ta = np_type_ann.get(fn_node).unwrap()
+    if ta != -1 {
+        let elems_sl = np_elements.get(ta).unwrap()
+        if elems_sl != -1 && sublist_length(elems_sl) >= 1 {
+            let inner_ann = sublist_get(elems_sl, 0)
+            let inner_name = np_name.get(inner_ann).unwrap()
+            return type_from_name(inner_name)
+        }
+    }
+    CT_INT
+}
+
 pub fn resolve_ret_type_from_ann(fn_node: Int) -> Str {
     let ret_str = np_return_type.get(fn_node).unwrap()
     let ta = np_type_ann.get(fn_node).unwrap()
@@ -1144,7 +1158,7 @@ pub fn resolve_ret_type_from_ann(fn_node: Int) -> Str {
     }
     if ret_str == "Tuple" {
         if ta != -1 {
-            let tn = resolve_tuple_ann(ta)
+            let tn = resolve_tuple_ann(ta).unwrap()
             return c_type_c_name(tn)
         }
     }
@@ -1162,10 +1176,10 @@ pub fn resolve_ret_type_from_ann(fn_node: Int) -> Str {
     ""
 }
 
-pub fn resolve_tuple_ann(ta: Int) -> Str {
+pub fn resolve_tuple_ann(ta: Int) -> Option[Str] {
     let elems_sl = np_elements.get(ta).unwrap()
     if elems_sl == -1 {
-        return ""
+        return None
     }
     let arity = sublist_length(elems_sl)
     let mut tags = ""
@@ -1193,7 +1207,7 @@ pub fn resolve_tuple_ann(ta: Int) -> Str {
     }
     let tup_name = tuple_c_type_name(tags, arity)
     ensure_tuple_type(tup_name, arity, elem_types_enc, elem_structs_enc)
-    tup_name
+    Some(tup_name)
 }
 
 pub fn reg_fn_ret_from_ann(name: Str, fn_node: Int) ! Codegen.Register {
@@ -1259,8 +1273,8 @@ pub fn reg_fn_ret_from_ann(name: Str, fn_node: Int) ! Codegen.Register {
     }
     if ret_str == "Tuple" && ta != -1 {
         let tup_c_name = resolve_tuple_ann(ta)
-        if tup_c_name != "" {
-            fn_ret_structs.push(FnRetStructEntry { name: name, stype: tup_c_name })
+        if tup_c_name.is_some() {
+            fn_ret_structs.push(FnRetStructEntry { name: name, stype: tup_c_name.unwrap() })
         }
     }
 }
@@ -1746,10 +1760,10 @@ pub fn get_variant_field_count(variant_idx: Int) -> Int {
     enum_variants.get(variant_idx).unwrap().field_count
 }
 
-pub fn get_variant_field_name(variant_idx: Int, field_idx: Int) -> Str {
+pub fn get_variant_field_name(variant_idx: Int, field_idx: Int) -> Option[Str] {
     let names_str = enum_variants.get(variant_idx).unwrap().field_names
     if names_str == "" {
-        return ""
+        return None
     }
     let mut seg_start = 0
     let mut seg_idx = 0
@@ -1757,20 +1771,20 @@ pub fn get_variant_field_name(variant_idx: Int, field_idx: Int) -> Str {
     while i <= names_str.len() {
         if i == names_str.len() || names_str.char_at(i) == 44 {
             if seg_idx == field_idx {
-                return names_str.substr(seg_start, i - seg_start)
+                return Some(names_str.substr(seg_start, i - seg_start))
             }
             seg_start = i + 1
             seg_idx = seg_idx + 1
         }
         i = i + 1
     }
-    ""
+    None
 }
 
-pub fn get_variant_field_type_str(variant_idx: Int, field_idx: Int) -> Str {
+pub fn get_variant_field_type_str(variant_idx: Int, field_idx: Int) -> Option[Str] {
     let types_str = enum_variants.get(variant_idx).unwrap().field_types
     if types_str == "" {
-        return ""
+        return None
     }
     let mut seg_start = 0
     let mut seg_idx = 0
@@ -1778,14 +1792,14 @@ pub fn get_variant_field_type_str(variant_idx: Int, field_idx: Int) -> Str {
     while i <= types_str.len() {
         if i == types_str.len() || types_str.char_at(i) == 44 {
             if seg_idx == field_idx {
-                return types_str.substr(seg_start, i - seg_start)
+                return Some(types_str.substr(seg_start, i - seg_start))
             }
             seg_start = i + 1
             seg_idx = seg_idx + 1
         }
         i = i + 1
     }
-    ""
+    None
 }
 
 pub fn get_fn_enum_ret(name: Str) -> Str {
@@ -1951,18 +1965,18 @@ pub fn register_mono_fn(base: Str, args: Str) ! Codegen.Register {
     mono_fns.push(MonoFnInstance { base: base, args: args })
 }
 
-pub fn infer_fn_type_args_from_types(fn_node: Int, arg_types: List[Int]) -> Str {
+pub fn infer_fn_type_args_from_types(fn_node: Int, arg_types: List[Int]) -> Option[Str] {
     let tparams_sl = np_type_params.get(fn_node).unwrap()
     if tparams_sl == -1 {
-        return ""
+        return None
     }
     let num_params = sublist_length(tparams_sl)
     if num_params == 0 {
-        return ""
+        return None
     }
     let fn_params_sl = np_params.get(fn_node).unwrap()
     if fn_params_sl == -1 {
-        return ""
+        return None
     }
     let mut args = ""
     let mut pi = 0
@@ -1984,7 +1998,7 @@ pub fn infer_fn_type_args_from_types(fn_node: Int, arg_types: List[Int]) -> Str 
         args = args.concat(resolved)
         pi = pi + 1
     }
-    args
+    Some(args)
 }
 
 pub fn type_name_from_ct(ct: Int) -> Str {

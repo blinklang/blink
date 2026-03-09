@@ -94,9 +94,9 @@ fn compiler_get_home() -> Str {
     ""
 }
 
-fn resolve_from_lockfile(dotted_path: Str, _src_root: Str) -> Str {
+fn resolve_from_lockfile(dotted_path: Str, _src_root: Str) -> Option[Str] {
     if lockfile_pkg_count() == 0 {
-        return ""
+        return None
     }
 
     // Strategy: try progressively shorter prefixes of the dotted path
@@ -174,7 +174,7 @@ fn resolve_from_lockfile(dotted_path: Str, _src_root: Str) -> Str {
     }
 
     if pkg_name == "" {
-        return ""
+        return None
     }
 
     // Found a matching package — resolve to its source path
@@ -215,23 +215,23 @@ fn resolve_from_lockfile(dotted_path: Str, _src_root: Str) -> Str {
     }
 
     if base_dir == "" {
-        return ""
+        return None
     }
 
     if sub_path == "" {
         let lib_path = path_join(base_dir, "src/lib.pact")
         if file_exists(lib_path) == 1 {
-            return lib_path
+            return Some(lib_path)
         }
-        return ""
+        return None
     }
 
     let sub_rel = dots_to_slashes(sub_path)
     let resolved = path_join(base_dir, path_join("src", sub_rel.concat(".pact")))
     if file_exists(resolved) == 1 {
-        return resolved
+        return Some(resolved)
     }
-    ""
+    None
 }
 
 pub fn resolve_module_path(dotted_path: Str, src_root: Str) -> Str ! Diag.Report {
@@ -247,7 +247,7 @@ pub fn resolve_module_path(dotted_path: Str, src_root: Str) -> Str ! Diag.Report
 
     // If local exists, use it (but warn if it shadows a dependency)
     if local_exists {
-        if dep_path != "" {
+        if dep_path.is_some() {
             io.println("warning[W1000]: local module shadows dependency")
             io.println(" --> {full}")
             io.println("  = note: import '{dotted_path}' matches both local file and a dependency")
@@ -257,8 +257,8 @@ pub fn resolve_module_path(dotted_path: Str, src_root: Str) -> Str ! Diag.Report
     }
 
     // Use dependency path if found
-    if dep_path != "" {
-        return dep_path
+    if dep_path.is_some() {
+        return dep_path.unwrap()
     }
 
     // Step 3: Check pkg. prefix (bundled package-manager modules)

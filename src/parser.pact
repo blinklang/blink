@@ -2104,8 +2104,8 @@ pub fn parse_postfix() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
                     if looks_like_struct_lit() {
                         // Reconstruct dotted name
                         let dotted = flatten_field_access(node)
-                        if dotted != "" {
-                            node = parse_struct_lit(dotted)
+                        if dotted.is_some() {
+                            node = parse_struct_lit(dotted.unwrap())
                         }
                     }
                 }
@@ -2204,18 +2204,18 @@ pub fn parse_maybe_named_arg() -> Int ! Parse.Advance, Parse.Build, Diag.Report 
     parse_expr()
 }
 
-pub fn flatten_field_access(node: Int) -> Str {
+pub fn flatten_field_access(node: Int) -> Option[Str] {
     let kind = np_kind.get(node).unwrap()
     if kind == NodeKind.Ident {
-        return np_name.get(node).unwrap()
+        return Some(np_name.get(node).unwrap())
     }
     if kind == NodeKind.FieldAccess {
         let base = flatten_field_access(np_obj.get(node).unwrap())
-        if base != "" {
-            return base + "." + np_name.get(node).unwrap()
+        if base.is_some() {
+            return Some(base.unwrap() + "." + np_name.get(node).unwrap())
         }
     }
-    ""
+    None
 }
 
 pub fn looks_like_struct_lit() -> Int {

@@ -606,11 +606,11 @@ pub fn validate_ffi_fn(fn_node: Int) ! Diag.Report {
     }
 }
 
-pub fn tc_get_fn_effects(name: Str) -> Str {
+pub fn tc_get_fn_effects(name: Str) -> Option[Str] {
     let sig = lookup_fnsig(name)
-    if sig == -1 { return "" }
-    if sig >= tc_fn_effects.len() { return "" }
-    tc_fn_effects.get(sig).unwrap()
+    if sig == -1 { return None }
+    if sig >= tc_fn_effects.len() { return None }
+    Some(tc_fn_effects.get(sig).unwrap())
 }
 
 pub fn register_trait(tr_node: Int) ! TypeCheck.Register {

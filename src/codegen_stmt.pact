@@ -555,8 +555,8 @@ pub fn bind_pattern_vars(pat: Int, scrut_off: Int, scrut_len: Int) ! Codegen.Emi
                 while fi < sublist_length(ep_flds_sl) && fi < fcount {
                     let sub_pat = sublist_get(ep_flds_sl, fi)
                     let sub_pk = np_kind.get(sub_pat).unwrap()
-                    let field_name = get_variant_field_name(vidx, fi)
-                    let field_type_name = get_variant_field_type_str(vidx, fi)
+                    let field_name = get_variant_field_name(vidx, fi).unwrap()
+                    let field_type_name = get_variant_field_type_str(vidx, fi).unwrap()
                     let field_ct = type_from_name(field_type_name)
                     if sub_pk == NodeKind.IdentPattern {
                         let bind_name = np_name.get(sub_pat).unwrap()
@@ -1199,7 +1199,7 @@ pub fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
         if is_struct_type(ann_name) != 0 {
             set_var_struct(name, ann_name)
         } else if ann_name == "Tuple" {
-            let tup_name = resolve_tuple_ann(type_ann)
+            let tup_name = resolve_tuple_ann(type_ann).unwrap()
             set_var_struct(name, tup_name)
         } else {
             let expr_struct = get_var_struct(val_str)
@@ -1728,7 +1728,7 @@ pub fn format_params(fn_node: Int) -> Str {
         } else if ptype == "Tuple" {
             let ta = np_type_ann.get(p).unwrap()
             if ta != -1 {
-                let tup_name = resolve_tuple_ann(ta)
+                let tup_name = resolve_tuple_ann(ta).unwrap()
                 result = result.concat("{c_type_c_name(tup_name)} {pname}")
             } else {
                 result = result.concat("void {pname}")
@@ -1775,7 +1775,7 @@ pub fn format_impl_params(fn_node: Int, impl_type: Str) -> Str {
                 } else if ptype == "Tuple" {
                     let ta = np_type_ann.get(p).unwrap()
                     if ta != -1 {
-                        let tup_name = resolve_tuple_ann(ta)
+                        let tup_name = resolve_tuple_ann(ta).unwrap()
                         result = result.concat("{c_type_c_name(tup_name)} {pname}")
                     } else {
                         result = result.concat("void {pname}")
@@ -1830,6 +1830,11 @@ pub fn emit_impl_method_def(fn_node: Int, impl_type: Str) ! Codegen.Emit, Codege
     let ret_str = resolve_self_type(ret_str_raw, impl_type)
     let ret_type = type_from_name(ret_str)
     cg_current_fn_ret = ret_type
+    if ret_type == CT_OPTION {
+        cg_current_fn_option_inner = resolve_option_inner_from_ann(fn_node)
+    } else {
+        cg_current_fn_option_inner = 0
+    }
     let params = format_impl_params(fn_node, impl_type)
     let enum_ret = get_fn_enum_ret(mangled)
     let mut sig = ""
@@ -1918,7 +1923,7 @@ pub fn emit_impl_method_def(fn_node: Int, impl_type: Str) ! Codegen.Emit, Codege
                     if ptype == "Tuple" {
                         let ta = np_type_ann.get(p).unwrap()
                         if ta != -1 {
-                            let tup_name = resolve_tuple_ann(ta)
+                            let tup_name = resolve_tuple_ann(ta).unwrap()
                             set_var_struct(pname, tup_name)
                         }
                     }
@@ -1979,6 +1984,11 @@ pub fn emit_fn_def(fn_node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope
     let ret_str = np_return_type.get(fn_node).unwrap()
     let ret_type = type_from_name(ret_str)
     cg_current_fn_ret = ret_type
+    if ret_type == CT_OPTION {
+        cg_current_fn_option_inner = resolve_option_inner_from_ann(fn_node)
+    } else {
+        cg_current_fn_option_inner = 0
+    }
 
     let ffi_ann = get_ffi_ann(fn_node)
     if ffi_ann != -1 {
@@ -2110,7 +2120,7 @@ pub fn emit_fn_def(fn_node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope
                 if ptype == "Tuple" {
                     let ta = np_type_ann.get(p).unwrap()
                     if ta != -1 {
-                        let tup_name = resolve_tuple_ann(ta)
+                        let tup_name = resolve_tuple_ann(ta).unwrap()
                         set_var_struct(pname, tup_name)
                     }
                 }
@@ -2415,7 +2425,7 @@ pub fn emit_mono_fn_def(fn_node: Int, concrete_args: Str) ! Codegen.Emit, Codege
             if resolved_ptype == "Tuple" {
                 let ta = np_type_ann.get(p).unwrap()
                 if ta != -1 {
-                    let tup_name = resolve_tuple_ann(ta)
+                    let tup_name = resolve_tuple_ann(ta).unwrap()
                     set_var_struct(pname, tup_name)
                 }
             }

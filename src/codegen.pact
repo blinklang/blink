@@ -32,6 +32,7 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
     cg_current_fn_name = ""
     cg_current_fn_ret = 0
     cg_current_fn_node = -1
+    cg_current_fn_option_inner = 0
     cg_global_inits = []
     struct_reg_names = []
     struct_reg_set = Map()

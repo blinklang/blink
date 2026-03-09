@@ -98,14 +98,14 @@ fn add_write(fn_idx: Int, global_name: Str) {
 
 // ── AST walking ───────────────────────────────────────────────────────
 
-fn extract_ident_name(node: Int) -> Str {
+fn extract_ident_name(node: Int) -> Option[Str] {
     if node == -1 {
-        return ""
+        return None
     }
     if np_kind.get(node).unwrap() == NodeKind.Ident {
-        return np_name.get(node).unwrap()
+        return Some(np_name.get(node).unwrap())
     }
-    ""
+    None
 }
 
 fn walk_expr(node: Int, fn_idx: Int) {
@@ -171,8 +171,8 @@ fn walk_expr(node: Int, fn_idx: Int) {
     if kind == NodeKind.Call {
         let callee = np_left.get(node).unwrap()
         let callee_name = extract_ident_name(callee)
-        if callee_name != "" {
-            let callee_idx = fn_index(callee_name)
+        if callee_name.is_some() {
+            let callee_idx = fn_index(callee_name.unwrap())
             if callee_idx >= 0 {
                 ma_call_edges_from.push(fn_idx)
                 ma_call_edges_to.push(callee_idx)
@@ -652,8 +652,8 @@ fn sr_scan_stmts(stmts_sl: Int) ! Diag.Report {
                 if ik == NodeKind.Call {
                     let callee = np_left.get(inner).unwrap()
                     let cname = extract_ident_name(callee)
-                    if cname != "" {
-                        sr_check_call(inner, cname)
+                    if cname.is_some() {
+                        sr_check_call(inner, cname.unwrap())
                     }
                 }
             }
@@ -662,8 +662,8 @@ fn sr_scan_stmts(stmts_sl: Int) ! Diag.Report {
         if kind == NodeKind.Call {
             let callee = np_left.get(stmt).unwrap()
             let cname = extract_ident_name(callee)
-            if cname != "" {
-                sr_check_call(stmt, cname)
+            if cname.is_some() {
+                sr_check_call(stmt, cname.unwrap())
             }
         }
 

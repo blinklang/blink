@@ -30,10 +30,10 @@ fn doc_append_lines(doc: Str, lines: List[Str], indent: Str) {
     }
 }
 
-fn doc_format_type_params(node: Int) -> Str {
+fn doc_format_type_params(node: Int) -> Option[Str] {
     let tparams = np_type_params.get(node).unwrap()
     if tparams == -1 || sublist_length(tparams) == 0 {
-        return ""
+        return None
     }
     let mut result = "["
     let mut i = 0
@@ -45,7 +45,7 @@ fn doc_format_type_params(node: Int) -> Str {
         result = result.concat(np_name.get(tp).unwrap())
         i = i + 1
     }
-    result.concat("]")
+    Some(result.concat("]"))
 }
 
 fn doc_format_fn_sig(node: Int) -> Str {
@@ -56,7 +56,7 @@ fn doc_format_fn_sig(node: Int) -> Str {
     let effects_sl = np_effects.get(node).unwrap()
 
     let mut line = "fn ".concat(name)
-    line = line.concat(doc_format_type_params(node))
+    line = line.concat(doc_format_type_params(node) ?? "")
     line = line.concat("(")
     if params_sl != -1 {
         let mut i = 0
@@ -75,7 +75,7 @@ fn doc_format_fn_sig(node: Int) -> Str {
 
 fn doc_format_type_header(node: Int) -> Str {
     let name = np_name.get(node).unwrap()
-    "type ".concat(name).concat(doc_format_type_params(node))
+    "type ".concat(name).concat(doc_format_type_params(node) ?? "")
 }
 
 fn doc_format_type(node: Int, lines: List[Str]) {
@@ -147,7 +147,7 @@ fn doc_format_trait(node: Int, lines: List[Str]) {
         doc_append_lines(doc, lines, "    /// ")
     }
 
-    let header = "trait ".concat(name).concat(doc_format_type_params(node))
+    let header = "trait ".concat(name).concat(doc_format_type_params(node) ?? "")
 
     if methods_sl == -1 || sublist_length(methods_sl) == 0 {
         lines.push("    ".concat(header))

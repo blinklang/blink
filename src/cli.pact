@@ -65,35 +65,35 @@ fn strip_extension(filename: Str) -> Str {
     return filename
 }
 
-fn find_daemon_sock_from(start_dir: Str) -> Str {
+fn find_daemon_sock_from(start_dir: Str) -> Option[Str] {
     let first = path_join(start_dir, ".pact/daemon.sock")
     if file_exists(first) {
-        return first
+        return Some(first)
     }
     let mut prev = start_dir
     let mut dir = path_dirname(start_dir)
     let mut depth = 0
     while depth < 10 {
         if dir == prev {
-            return ""
+            return None
         }
         let candidate = path_join(dir, ".pact/daemon.sock")
         if file_exists(candidate) {
-            return candidate
+            return Some(candidate)
         }
         prev = dir
         dir = path_dirname(dir)
         depth = depth + 1
     }
-    return ""
+    return None
 }
 
-fn find_daemon_sock() -> Str {
+fn find_daemon_sock() -> Option[Str] {
     // CWD-relative check is the common case
     if file_exists(".pact/daemon.sock") {
-        return ".pact/daemon.sock"
+        return Some(".pact/daemon.sock")
     }
-    return ""
+    return None
 }
 
 fn resolve_pact_bin() -> Str {
@@ -138,12 +138,12 @@ fn detect_ffi_libs(c_source: Str) -> List[Str] {
     libs
 }
 
-fn try_pkg_config(lib: Str) -> Str {
+fn try_pkg_config(lib: Str) -> Option[Str] {
     let result = process_run("pkg-config", ["--libs", lib])
     if result.exit_code == 0 {
-        return result.out.trim()
+        return Some(result.out.trim())
     }
-    return ""
+    return None
 }
 
 fn resolve_ffi_link_flags(lib: Str, target: Str) -> Str {
@@ -162,8 +162,8 @@ fn resolve_ffi_link_flags(lib: Str, target: Str) -> Str {
         return "-l:lib{lib}.a"
     }
     let pkg_flags = try_pkg_config(lib)
-    if pkg_flags != "" {
-        return pkg_flags
+    if pkg_flags.is_some() {
+        return pkg_flags.unwrap()
     }
     "-l{lib}"
 }
@@ -395,19 +395,19 @@ fn compile_vendored_source(c_path: Str, o_path: Str, debug_mode: Int, release_mo
     return 0
 }
 
-fn resolve_sqlite_source(has_sqlite: Int) -> Str {
+fn resolve_sqlite_source(has_sqlite: Int) -> Option[Str] {
     if has_sqlite == 0 {
-        return ""
+        return None
     }
     let sqlite_type = manifest_native_dep_type("sqlite3")
     let sqlite_path = manifest_native_dep_path("sqlite3")
     if sqlite_type == "vendored" && sqlite_path != "" {
-        return sqlite_path
+        return Some(sqlite_path)
     }
     if sqlite_type == "" {
-        return "lib/native/sqlite3/sqlite3.c"
+        return Some("lib/native/sqlite3/sqlite3.c")
     }
-    ""
+    None
 }
 
 fn resolve_vendored_objects(has_sqlite: Int, debug_mode: Int, release_mode: Int, target: Str) -> List[Str] {
@@ -415,14 +415,14 @@ fn resolve_vendored_objects(has_sqlite: Int, debug_mode: Int, release_mode: Int,
     let mut did_mkdir = 0
 
     let sqlite_src = resolve_sqlite_source(has_sqlite)
-    if sqlite_src != "" {
+    if sqlite_src.is_some() {
         shell_exec("mkdir -p .tmp")
         did_mkdir = 1
         let mut o_path = ".tmp/sqlite3.o"
         if target != "" {
             o_path = ".tmp/sqlite3-{target}.o"
         }
-        let rc = compile_vendored_source(sqlite_src, o_path, debug_mode, release_mode, target)
+        let rc = compile_vendored_source(sqlite_src.unwrap(), o_path, debug_mode, release_mode, target)
         if rc != 0 {
             return objects
         }
@@ -462,8 +462,8 @@ fn resolve_vendored_includes(has_sqlite: Int) -> Str {
     let mut includes: List[Str] = []
 
     let sqlite_src = resolve_sqlite_source(has_sqlite)
-    if sqlite_src != "" {
-        includes.push("-I{path_dirname(sqlite_src)}")
+    if sqlite_src.is_some() {
+        includes.push("-I{path_dirname(sqlite_src.unwrap())}")
     }
 
     let count = manifest_native_dep_count()
@@ -1701,8 +1701,8 @@ fn main() {
         // Try daemon first if running
         let mut daemon_used = 0
         let sock = find_daemon_sock()
-        if sock != "" {
-            let fd = unix_socket_connect(sock)
+        if sock.is_some() {
+            let fd = unix_socket_connect(sock.unwrap())
             if fd >= 0 {
                 socket_write(fd, "\{\"type\":\"check\"}\n")
                 let response = socket_read_line(fd)
@@ -2116,7 +2116,7 @@ fn main() {
             query_layer = "signature"
         }
         let sock_path = find_daemon_sock()
-        let sock_fd = if sock_path != "" { unix_socket_connect(sock_path) } else { -1 }
+        let sock_fd = if sock_path.is_some() { unix_socket_connect(sock_path.unwrap()) } else { -1 }
         if sock_fd >= 0 {
             let mut request = ""
             if query_fn != "" {
@@ -2181,13 +2181,14 @@ fn main() {
         daemon_start(actual_root, daemon_source)
     } else if command == "daemon status" {
         let sock_path = find_daemon_sock()
-        if sock_path == "" {
+        if sock_path.is_none() {
             io.println("error: daemon not running (no .pact/daemon.sock found)")
             exit(1)
         }
-        let fd = unix_socket_connect(sock_path)
+        let sp = sock_path.unwrap()
+        let fd = unix_socket_connect(sp)
         if fd < 0 {
-            io.println("error: daemon not running (could not connect to {sock_path})")
+            io.println("error: daemon not running (could not connect to {sp})")
             exit(1)
         }
         socket_write(fd, "\{\"type\":\"status\"}\n")
@@ -2196,13 +2197,14 @@ fn main() {
         io.println(response)
     } else if command == "daemon stop" {
         let sock_path = find_daemon_sock()
-        if sock_path == "" {
+        if sock_path.is_none() {
             io.println("error: daemon not running (no .pact/daemon.sock found)")
             exit(1)
         }
-        let fd = unix_socket_connect(sock_path)
+        let sp = sock_path.unwrap()
+        let fd = unix_socket_connect(sp)
         if fd < 0 {
-            io.println("error: daemon not running (could not connect to {sock_path})")
+            io.println("error: daemon not running (could not connect to {sp})")
             exit(1)
         }
         socket_write(fd, "\{\"type\":\"stop\"}\n")
