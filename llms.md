@@ -12,6 +12,7 @@ Language spec v0.3. Self-hosting compiler. Targets native binaries via C codegen
 - **`@invariant` struct assertions** — struct-level invariants: `@invariant(self.balance >= 0)`
 - **Vendored C cross-compilation** — compile vendored C sources with cross-compile support; SQLite3 amalgamation bundle included
 - **`pact audit`** — FFI audit command: inventory @ffi calls, audit status, pointer operations
+- **`pact update`** — updates dependencies, lockfile, and stamps `pact-version` in `pact.toml`
 - **Native dependencies** — `pact.toml [native-dependencies]` section for linking C libraries
 - **Interned type node pool** — compiler-internal performance improvement
 - **`""` sentinels → `Option[Str]`** — compiler refactor for type safety

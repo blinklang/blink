@@ -80,4 +80,4 @@ After all fixes are applied:
 2. If a `pact.toml` exists with test configuration, run `pact test`.
 3. Report results. If any checks fail, help the user fix the remaining issues.
 
-The `pact-version` field in `pact.toml` is updated automatically on the next `pact build`.
+Run `pact update` to update the `pact-version` field in `pact.toml` and re-resolve dependencies.

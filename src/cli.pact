@@ -578,7 +578,6 @@ fn do_build(source_path: Str, output_path: Str, c_path: Str, format_flag: Str, d
     if rc != 0 {
         return rc
     }
-    stamp_pact_version()
 
     if emit_mode == "c" {
         return 0
@@ -1199,7 +1198,7 @@ fn main() {
     p = add_command(p, "audit", "Audit FFI usage and dependency capabilities")
     p = add_command(p, "add", "Add a dependency (use --path or --git)")
     p = add_command(p, "remove", "Remove a dependency")
-    p = add_command(p, "update", "Re-resolve dependencies and update lockfile")
+    p = add_command(p, "update", "Update dependencies, lockfile, and pact-version")
     p = add_command(p, "daemon.start", "Start compiler daemon")
     p = add_command(p, "daemon.status", "Show daemon status")
     p = add_command(p, "daemon.stop", "Stop compiler daemon")
@@ -2082,6 +2081,7 @@ fn main() {
             return
         }
 
+        stamp_pact_version()
         let resolve_rc = resolve_and_lock(".", pact_cli_version)
         if resolve_rc == 0 {
             if source_path != "" {

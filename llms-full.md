@@ -711,6 +711,7 @@ bin/pact doc --list              # list available stdlib modules
 bin/pact doc std.args            # print module documentation
 bin/pact doc std.json --json     # module docs as JSON
 bin/pact audit src/main.pact     # FFI audit report
+bin/pact update                  # update deps + pact-version in pact.toml
 
 # Release builds (optimized with -O2)
 bin/pact build src/main.pact --release
