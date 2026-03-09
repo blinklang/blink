@@ -781,6 +781,235 @@ fn ast_to_json(id: Int) -> Str {
     r
 }
 
+fn ffi_collect_ptr_params(fn_node: Int) -> Str {
+    let params_sl = np_params.get(fn_node).unwrap()
+    if params_sl == -1 {
+        return ""
+    }
+    let mut result = ""
+    let mut i = 0
+    while i < sublist_length(params_sl) {
+        let p = sublist_get(params_sl, i)
+        let ptype = np_type_name.get(p).unwrap()
+        if ptype == "Ptr" {
+            if result != "" {
+                result = result.concat(",")
+            }
+            let pname = np_name.get(p).unwrap()
+            let mut full_type = "Ptr"
+            let pta = np_type_ann.get(p).unwrap()
+            if pta != -1 {
+                let pelems_sl = np_elements.get(pta).unwrap()
+                if pelems_sl != -1 && sublist_length(pelems_sl) > 0 {
+                    let inner = np_name.get(sublist_get(pelems_sl, 0)).unwrap()
+                    full_type = "Ptr[{inner}]"
+                }
+            }
+            result = result.concat("{pname}:{full_type}")
+        }
+        i = i + 1
+    }
+    result
+}
+
+fn ffi_ptr_return(fn_node: Int) -> Str {
+    let ret = np_return_type.get(fn_node).unwrap()
+    if ret == "Ptr" {
+        let ret_ann = np_type_ann.get(fn_node).unwrap()
+        if ret_ann != -1 {
+            let relems_sl = np_elements.get(ret_ann).unwrap()
+            if relems_sl != -1 && sublist_length(relems_sl) > 0 {
+                let inner = np_name.get(sublist_get(relems_sl, 0)).unwrap()
+                return "Ptr[{inner}]"
+            }
+        }
+        return "Ptr"
+    }
+    ""
+}
+
+fn ffi_extract_trusted_info(fn_node: Int) -> Str {
+    let ann = get_annotation(fn_node, "trusted")
+    if ann == -1 {
+        return ""
+    }
+    let args_sl = np_args.get(ann).unwrap()
+    if args_sl == -1 {
+        return "true"
+    }
+    let count = sublist_length(args_sl)
+    if count == 0 {
+        return "true"
+    }
+    let mut result = ""
+    let mut i = 0
+    while i < count {
+        let arg = sublist_get(args_sl, i)
+        let arg_name = np_name.get(arg).unwrap()
+        if i > 0 {
+            result = result.concat(",")
+        }
+        let str_val = ann_str_val(arg)
+        if arg_name != str_val && arg_name != "" {
+            result = result.concat(arg_name).concat(":").concat(str_val)
+        } else {
+            result = result.concat(str_val)
+        }
+        i = i + 1
+    }
+    result
+}
+
+fn do_ffi_audit(program: Int, json_output: Int) {
+    let fns_sl = np_params.get(program).unwrap()
+    if fns_sl == -1 {
+        if json_output != 0 {
+            io.println("\{\"ffi_functions\":[],\"summary\":\{\"total\":0,\"audited\":0,\"unaudited\":0,\"ptr_params\":0,\"ptr_returns\":0}}")
+        } else {
+            io.println("No FFI functions found.")
+        }
+        return
+    }
+
+    let mut names: List[Str] = []
+    let mut libs: List[Str] = []
+    let mut symbols: List[Str] = []
+    let mut trusted_infos: List[Str] = []
+    let mut effects_list: List[Str] = []
+    let mut ptr_params_list: List[Str] = []
+    let mut ptr_returns: List[Str] = []
+    let mut lines: List[Int] = []
+    let mut files: List[Str] = []
+    let mut audited = 0
+    let mut ptr_param_count = 0
+    let mut ptr_ret_count = 0
+
+    let mut i = 0
+    while i < sublist_length(fns_sl) {
+        let fn_node = sublist_get(fns_sl, i)
+        let ffi_ann = get_annotation(fn_node, "ffi")
+        if ffi_ann != -1 {
+            let fn_name = np_name.get(fn_node).unwrap()
+            names.push(fn_name)
+            lines.push(np_line.get(fn_node).unwrap())
+            files.push(diag_source_file)
+
+            let ffi_args_sl = np_args.get(ffi_ann).unwrap()
+            let mut lib = ""
+            let mut sym = fn_name
+            if ffi_args_sl != -1 {
+                let arg_count = sublist_length(ffi_args_sl)
+                if arg_count >= 2 {
+                    lib = ann_str_val(sublist_get(ffi_args_sl, 0))
+                    sym = ann_str_val(sublist_get(ffi_args_sl, 1))
+                } else if arg_count == 1 {
+                    sym = ann_str_val(sublist_get(ffi_args_sl, 0))
+                }
+            }
+            libs.push(lib)
+            symbols.push(sym)
+
+            let trusted = ffi_extract_trusted_info(fn_node)
+            trusted_infos.push(trusted)
+            if trusted != "" {
+                audited = audited + 1
+            }
+
+            effects_list.push(collect_effects(fn_node))
+
+            let ptrs = ffi_collect_ptr_params(fn_node)
+            ptr_params_list.push(ptrs)
+            if ptrs != "" {
+                ptr_param_count = ptr_param_count + 1
+            }
+
+            let ptr_ret = ffi_ptr_return(fn_node)
+            ptr_returns.push(ptr_ret)
+            if ptr_ret != "" {
+                ptr_ret_count = ptr_ret_count + 1
+            }
+        }
+        i = i + 1
+    }
+
+    let total = names.len()
+    let unaudited = total - audited
+
+    if json_output != 0 {
+        let mut out = "\{\"ffi_functions\":["
+        let mut k = 0
+        while k < total {
+            if k > 0 {
+                out = out.concat(",")
+            }
+            let n = names.get(k).unwrap()
+            let lib = libs.get(k).unwrap()
+            let sym = symbols.get(k).unwrap()
+            let trusted = trusted_infos.get(k).unwrap()
+            let effs = effects_list.get(k).unwrap()
+            let ptrs = ptr_params_list.get(k).unwrap()
+            let ptr_ret = ptr_returns.get(k).unwrap()
+            let line = lines.get(k).unwrap()
+            let file = files.get(k).unwrap()
+            let trusted_json = if trusted != "" { "true" } else { "false" }
+            out = out.concat("\{\"name\":\"{n}\",\"lib\":\"{lib}\",\"symbol\":\"{sym}\",\"trusted\":{trusted_json}")
+            if trusted != "" && trusted != "true" {
+                out = out.concat(",\"audit\":\"{trusted}\"")
+            }
+            out = out.concat(",\"effects\":\"{effs}\"")
+            if ptrs != "" {
+                out = out.concat(",\"ptr_params\":\"{ptrs}\"")
+            }
+            if ptr_ret != "" {
+                out = out.concat(",\"ptr_return\":\"{ptr_ret}\"")
+            }
+            out = out.concat(",\"file\":\"{file}\",\"line\":{line}}")
+            k = k + 1
+        }
+        out = out.concat("],\"summary\":\{\"total\":{total},\"audited\":{audited},\"unaudited\":{unaudited},\"ptr_params\":{ptr_param_count},\"ptr_returns\":{ptr_ret_count}}}")
+        io.println(out)
+    } else {
+        if total == 0 {
+            io.println("No FFI functions found.")
+            return
+        }
+        io.println("FFI Audit Report")
+        io.println("================")
+        io.println("")
+        let mut k = 0
+        while k < total {
+            let n = names.get(k).unwrap()
+            let lib = libs.get(k).unwrap()
+            let sym = symbols.get(k).unwrap()
+            let trusted = trusted_infos.get(k).unwrap()
+            let effs = effects_list.get(k).unwrap()
+            let ptrs = ptr_params_list.get(k).unwrap()
+            let ptr_ret = ptr_returns.get(k).unwrap()
+            let line = lines.get(k).unwrap()
+            let file = files.get(k).unwrap()
+            let status = if trusted != "" { "AUDITED" } else { "UNAUDITED" }
+            io.println("  {n} [{status}]")
+            io.println("    lib: {lib}  symbol: {sym}")
+            io.println("    effects: {effs}  file: {file}:{line}")
+            if trusted != "" && trusted != "true" {
+                io.println("    audit: {trusted}")
+            }
+            if ptrs != "" {
+                io.println("    ptr params: {ptrs}")
+            }
+            if ptr_ret != "" {
+                io.println("    ptr return: {ptr_ret}")
+            }
+            io.println("")
+            k = k + 1
+        }
+        io.println("Summary: {total} FFI function(s), {audited} audited, {unaudited} unaudited")
+        if ptr_param_count > 0 || ptr_ret_count > 0 {
+            io.println("Pointers: {ptr_param_count} with ptr params, {ptr_ret_count} with ptr returns")
+        }
+    }
+}
+
 fn command_needs_source(cmd: Str) -> Int {
     if cmd == "build" || cmd == "run" || cmd == "check" || cmd == "query" || cmd == "ast" {
         return 1
@@ -789,7 +1018,7 @@ fn command_needs_source(cmd: Str) -> Int {
 }
 
 fn command_checks_file_exists(cmd: Str) -> Int {
-    if cmd == "build" || cmd == "run" || cmd == "check" || cmd == "query" || cmd == "ast" || cmd == "fmt" || cmd == "test" || cmd == "audit" || cmd == "daemon status" || cmd == "daemon stop" || cmd == "daemon" {
+    if cmd == "build" || cmd == "run" || cmd == "check" || cmd == "query" || cmd == "ast" || cmd == "fmt" || cmd == "test" || cmd == "daemon status" || cmd == "daemon stop" || cmd == "daemon" {
         return 1
     }
     0
@@ -805,7 +1034,7 @@ fn main() {
     p = add_command(p, "test", "Build and run tests (discovers .pact files with test blocks)")
     p = add_command(p, "fmt", "Format source file(s) in place")
     p = add_command(p, "ast", "Dump parsed AST as JSON")
-    p = add_command(p, "audit", "Check for capability escalations in dependencies")
+    p = add_command(p, "audit", "Audit FFI usage and dependency capabilities")
     p = add_command(p, "add", "Add a dependency (use --path or --git)")
     p = add_command(p, "remove", "Remove a dependency")
     p = add_command(p, "update", "Re-resolve dependencies and update lockfile")
@@ -873,6 +1102,8 @@ fn main() {
     p = command_add_option(p, "test", "--parallel", "-P", "Parallel workers (default: 4)")
 
     p = command_add_option(p, "audit", "--baseline", "", "Audit baseline path")
+    p = command_add_flag(p, "audit", "--json", "-j", "JSON output")
+    p = command_add_flag(p, "audit", "--ffi", "", "Audit FFI usage in source files")
 
     let a = argparse(p)
 
@@ -912,6 +1143,7 @@ fn main() {
     let release_flag = if args_has(a, "release") { 1 } else { 0 }
     let check_flag = if args_has(a, "check") { 1 } else { 0 }
     let strict_flag = if args_has(a, "strict") { 1 } else { 0 }
+    let ffi_flag = if args_has(a, "ffi") { 1 } else { 0 }
     let mut query_layer = args_get(a, "layer")
     let query_effect = args_get(a, "effect")
     let query_module = args_get(a, "module")
@@ -1552,21 +1784,53 @@ fn main() {
     } else if command == "audit" {
         let baseline_path = args_get(a, "baseline")
 
-        if file_exists("pact.lock") == 0 {
-            io.println("error: no pact.lock found. Run 'pact build' first.")
-            return
-        }
+        if ffi_flag != 0 || source_path != "" {
+            reset_compiler_state()
+            diag_reset()
+            load_lint_overrides()
+            let audit_path = if source_path != "" { source_path } else { "src/main.pact" }
+            if !file_exists(audit_path) {
+                io.eprintln("error: file not found: {audit_path}")
+                exit(1)
+            }
+            diag_source_file = audit_path
+            let source = read_file(audit_path)
+            lex(source)
+            pos = 0
+            let program = parse_program()
+            loaded_files.push(audit_path)
 
-        lockfile_load("pact.lock")
+            let src_root = find_src_root(audit_path)
+            let mut imported_programs: List[Int] = []
+            collect_root_imports(program)
+            collect_imports(program, src_root, imported_programs)
 
-        if baseline_path != "" {
-            audit_load_baseline(baseline_path)
-        }
+            let mut final_program = program
+            if imported_programs.len() > 0 {
+                final_program = merge_programs(program, imported_programs, import_map_nodes)
+            }
 
-        let count = audit_check()
-        audit_report()
-        if count > 0 {
-            exit(1)
+            do_ffi_audit(final_program, json_output)
+            if diag_count > 0 {
+                diag_flush()
+            }
+        } else {
+            if file_exists("pact.lock") == 0 {
+                io.println("error: no pact.lock found. Run 'pact build' first.")
+                return
+            }
+
+            lockfile_load("pact.lock")
+
+            if baseline_path != "" {
+                audit_load_baseline(baseline_path)
+            }
+
+            let count = audit_check()
+            audit_report()
+            if count > 0 {
+                exit(1)
+            }
         }
     } else if command == "add" {
         if source_path == "" {

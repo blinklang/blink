@@ -187,7 +187,7 @@ fn collect_param_types(fn_node: Int) -> Str {
     result
 }
 
-fn collect_effects(fn_node: Int) -> Str {
+pub fn collect_effects(fn_node: Int) -> Str {
     let eff_sl = np_effects.get(fn_node).unwrap()
     if eff_sl == -1 {
         return ""

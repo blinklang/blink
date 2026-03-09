@@ -1656,7 +1656,7 @@ pub fn emit_with_block(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scop
 
 // ── Function codegen ────────────────────────────────────────────────
 
-fn ann_str_val(node: Int) -> Str {
+pub fn ann_str_val(node: Int) -> Str {
     let parts_sl = np_elements.get(node).unwrap()
     if parts_sl != -1 && sublist_length(parts_sl) > 0 {
         return np_str_val.get(sublist_get(parts_sl, 0)).unwrap()
