@@ -3792,25 +3792,9 @@ void pact_parser_attach_comments(int64_t node) {
         pending_doc_comment = "";
     }
     if ((pact_list_len(pending_comments) > 0)) {
-        const char* combined = "";
-        int64_t i = 0;
-        while ((i < pact_list_len(pending_comments))) {
-            if ((i > 0)) {
-                combined = pact_str_concat(combined, "\n");
-            }
-            int64_t _lgi_0 = i;
-            pact_Option_str _lget_1;
-            if (pact_list_in_bounds(pending_comments, _lgi_0)) {
-                _lget_1.tag = 1; _lget_1.value = (const char*)pact_list_get(pending_comments, _lgi_0);
-            } else { _lget_1.tag = 0; }
-            pact_Option_str _ounw_2 = _lget_1;
-            if (_ounw_2.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
-            combined = pact_str_concat(combined, _ounw_2.value);
-            i = (i + 1);
-        }
-        pact_list_set(np_leading_comments, node, (void*)combined);
-        pact_list* _l3 = pact_list_new();
-        pending_comments = _l3;
+        pact_list_set(np_leading_comments, node, (void*)pact_str_join(pending_comments, "\n"));
+        pact_list* _l0 = pact_list_new();
+        pending_comments = _l0;
     }
 }
 
@@ -5479,23 +5463,7 @@ int64_t pact_parser_parse_block(void) {
     pact_list_set(np_end_line, nd, (void*)(intptr_t)rbrace_line);
     pact_list_set(np_end_col, nd, (void*)(intptr_t)rbrace_col);
     if ((pact_list_len(block_trailing) > 0)) {
-        const char* combined = "";
-        int64_t ti = 0;
-        while ((ti < pact_list_len(block_trailing))) {
-            if ((ti > 0)) {
-                combined = pact_str_concat(combined, "\n");
-            }
-            int64_t _lgi_2 = ti;
-            pact_Option_str _lget_3;
-            if (pact_list_in_bounds(block_trailing, _lgi_2)) {
-                _lget_3.tag = 1; _lget_3.value = (const char*)pact_list_get(block_trailing, _lgi_2);
-            } else { _lget_3.tag = 0; }
-            pact_Option_str _ounw_4 = _lget_3;
-            if (_ounw_4.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
-            combined = pact_str_concat(combined, _ounw_4.value);
-            ti = (ti + 1);
-        }
-        pact_list_set(np_trailing_comments, nd, (void*)combined);
+        pact_list_set(np_trailing_comments, nd, (void*)pact_str_join(block_trailing, "\n"));
     }
     return nd;
 }

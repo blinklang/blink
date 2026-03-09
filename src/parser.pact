@@ -306,16 +306,7 @@ pub fn attach_comments(node: Int) {
         pending_doc_comment = ""
     }
     if pending_comments.len() > 0 {
-        let mut combined = ""
-        let mut i = 0
-        while i < pending_comments.len() {
-            if i > 0 {
-                combined = combined.concat("\n")
-            }
-            combined = combined.concat(pending_comments.get(i).unwrap())
-            i = i + 1
-        }
-        np_leading_comments.set(node, combined)
+        np_leading_comments.set(node, pending_comments.join("\n"))
         pending_comments = []
     }
 }
@@ -1538,16 +1529,7 @@ pub fn parse_block() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
     np_end_line.set(nd, rbrace_line)
     np_end_col.set(nd, rbrace_col)
     if block_trailing.len() > 0 {
-        let mut combined = ""
-        let mut ti = 0
-        while ti < block_trailing.len() {
-            if ti > 0 {
-                combined = combined.concat("\n")
-            }
-            combined = combined.concat(block_trailing.get(ti).unwrap())
-            ti = ti + 1
-        }
-        np_trailing_comments.set(nd, combined)
+        np_trailing_comments.set(nd, block_trailing.join("\n"))
     }
     nd
 }
