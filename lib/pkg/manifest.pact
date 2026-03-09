@@ -597,3 +597,9 @@ pub fn manifest_native_dep_name_at(i: Int) -> Str {
     if i < 0 || i >= native_dep_names.len() { return "" }
     native_dep_names.get(i).unwrap()
 }
+
+pub fn manifest_native_dep_path(name: Str) -> Str {
+    let idx = native_dep_index(name)
+    if idx >= 0 { return native_dep_paths.get(idx).unwrap() }
+    ""
+}

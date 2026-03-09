@@ -147,6 +147,17 @@ fn try_pkg_config(lib: Str) -> Str {
 }
 
 fn resolve_ffi_link_flags(lib: Str, target: Str) -> Str {
+    let dep_type = manifest_native_dep_type(lib)
+
+    if dep_type == "vendored" {
+        return ""
+    }
+
+    let dep_link = manifest_native_dep_link(lib)
+    if dep_link == "dynamic" {
+        return "-l{lib}"
+    }
+
     if target != "" {
         return "-l:lib{lib}.a"
     }
@@ -164,13 +175,17 @@ fn build_link_flags(target: Str, has_async: Int, has_sqlite: Int, ffi_libs: List
     }
     if has_sqlite != 0 {
         let sqlite_flags = resolve_ffi_link_flags("sqlite3", target)
-        flags = "{flags} {sqlite_flags}"
+        if sqlite_flags != "" {
+            flags = "{flags} {sqlite_flags}"
+        }
     }
     let mut i = 0
     while i < ffi_libs.len() {
         let lib = ffi_libs.get(i).unwrap()
         let lib_flags = resolve_ffi_link_flags(lib, target)
-        flags = "{flags} {lib_flags}"
+        if lib_flags != "" {
+            flags = "{flags} {lib_flags}"
+        }
         i = i + 1
     }
     flags
@@ -357,21 +372,34 @@ fn resolve_target_triple(alias: Str) -> Str {
     return alias
 }
 
-fn do_link_target(out: Str, c_path: Str, link_flags: Str, debug_mode: Int, release_mode: Int, target: Str) -> Int {
+fn run_cc(args: Str, debug_mode: Int, release_mode: Int, target: Str) -> Int {
     let mut compiler = "cc"
     if target != "" {
         compiler = "zig cc -target {target}"
     }
-    let mut cc_cmd = "{compiler} -o {out} {c_path} {link_flags}"
+    let mut opt_flags = ""
     if debug_mode != 0 {
-        cc_cmd = "{compiler} -g -O0 -o {out} {c_path} {link_flags}"
+        opt_flags = "-g -O0 "
     } else if release_mode != 0 {
-        cc_cmd = "{compiler} -O2 -o {out} {c_path} {link_flags}"
+        opt_flags = "-O2 "
     }
-    let cc_rc = shell_exec(cc_cmd)
-    if cc_rc != 0 {
+    shell_exec("{compiler} {opt_flags}{args}")
+}
+
+fn compile_vendored_source(c_path: Str, o_path: Str, debug_mode: Int, release_mode: Int, target: Str) -> Int {
+    let rc = run_cc("-c -o {o_path} {c_path}", debug_mode, release_mode, target)
+    if rc != 0 {
+        io.println("error: compiling vendored source {c_path} failed")
+        return rc
+    }
+    return 0
+}
+
+fn do_link_target(out: Str, c_path: Str, link_flags: Str, debug_mode: Int, release_mode: Int, target: Str) -> Int {
+    let rc = run_cc("-o {out} {c_path} {link_flags}", debug_mode, release_mode, target)
+    if rc != 0 {
         io.println("error: C compilation failed")
-        return cc_rc
+        return rc
     }
     return 0
 }
