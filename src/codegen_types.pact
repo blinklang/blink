@@ -41,6 +41,160 @@ pub let CT_DURATION = 16
 pub let CT_PTR = 17
 pub let CT_FFI_SCOPE = 18
 
+// ── Type node pool (interned, parallel arrays) ─────────────────────
+// Recursive type representation: each type is an integer handle into
+// these arrays. Constructed bottom-up, interned for O(1) equality.
+// Coexists with CT_* during migration; will eventually replace it.
+
+pub let mut tp_kind: List[Int] = []
+pub let mut tp_child1: List[Int] = []
+pub let mut tp_child2: List[Int] = []
+pub let mut tp_sname: List[Str] = []
+pub let mut tp_intern: Map[Str, Int] = Map()
+
+fn tp_intern_key(kind: Int, c1: Int, c2: Int, sname: Str) -> Str {
+    "{kind}:{c1}:{c2}:{sname}"
+}
+
+fn tp_alloc(kind: Int, c1: Int, c2: Int, sname: Str) -> Int {
+    let key = tp_intern_key(kind, c1, c2, sname)
+    if tp_intern.has(key) {
+        return tp_intern.get(key)
+    }
+    let id = tp_kind.len()
+    tp_kind.push(kind)
+    tp_child1.push(c1)
+    tp_child2.push(c2)
+    tp_sname.push(sname)
+    tp_intern.set(key, id)
+    id
+}
+
+pub fn type_int() -> Int {
+    tp_alloc(CT_INT, -1, -1, "")
+}
+
+pub fn type_float() -> Int {
+    tp_alloc(CT_FLOAT, -1, -1, "")
+}
+
+pub fn type_bool() -> Int {
+    tp_alloc(CT_BOOL, -1, -1, "")
+}
+
+pub fn type_string() -> Int {
+    tp_alloc(CT_STRING, -1, -1, "")
+}
+
+pub fn type_void() -> Int {
+    tp_alloc(CT_VOID, -1, -1, "")
+}
+
+pub fn type_bytes() -> Int {
+    tp_alloc(CT_BYTES, -1, -1, "")
+}
+
+pub fn type_instant() -> Int {
+    tp_alloc(CT_INSTANT, -1, -1, "")
+}
+
+pub fn type_duration() -> Int {
+    tp_alloc(CT_DURATION, -1, -1, "")
+}
+
+pub fn type_list(elem: Int) -> Int {
+    tp_alloc(CT_LIST, elem, -1, "")
+}
+
+pub fn type_option(inner: Int) -> Int {
+    tp_alloc(CT_OPTION, inner, -1, "")
+}
+
+pub fn type_result(ok: Int, err: Int) -> Int {
+    tp_alloc(CT_RESULT, ok, err, "")
+}
+
+pub fn type_map(key: Int, value: Int) -> Int {
+    tp_alloc(CT_MAP, key, value, "")
+}
+
+pub fn type_iterator(inner: Int) -> Int {
+    tp_alloc(CT_ITERATOR, inner, -1, "")
+}
+
+pub fn type_handle(inner: Int) -> Int {
+    tp_alloc(CT_HANDLE, inner, -1, "")
+}
+
+pub fn type_channel(inner: Int) -> Int {
+    tp_alloc(CT_CHANNEL, inner, -1, "")
+}
+
+pub fn type_closure(sig: Str) -> Int {
+    tp_alloc(CT_CLOSURE, -1, -1, sig)
+}
+
+pub fn type_struct(name: Str) -> Int {
+    tp_alloc(CT_TAGGED_ENUM, -1, -1, name)
+}
+
+pub fn type_enum(name: Str) -> Int {
+    tp_alloc(CT_TAGGED_ENUM, -1, -1, name)
+}
+
+pub fn type_ptr(inner: Int) -> Int {
+    tp_alloc(CT_PTR, inner, -1, "")
+}
+
+pub fn type_ffi_scope() -> Int {
+    tp_alloc(CT_FFI_SCOPE, -1, -1, "")
+}
+
+pub fn tp_get_kind(id: Int) -> Int {
+    tp_kind.get(id).unwrap()
+}
+
+pub fn tp_get_child1(id: Int) -> Int {
+    tp_child1.get(id).unwrap()
+}
+
+pub fn tp_get_child2(id: Int) -> Int {
+    tp_child2.get(id).unwrap()
+}
+
+pub fn tp_get_sname(id: Int) -> Str {
+    tp_sname.get(id).unwrap()
+}
+
+pub fn tp_display(id: Int) -> Str {
+    if id < 0 {
+        return "?"
+    }
+    let k = tp_kind.get(id).unwrap()
+    if k == CT_INT { return "Int" }
+    if k == CT_FLOAT { return "Float" }
+    if k == CT_BOOL { return "Bool" }
+    if k == CT_STRING { return "Str" }
+    if k == CT_VOID { return "Void" }
+    if k == CT_BYTES { return "Bytes" }
+    if k == CT_INSTANT { return "Instant" }
+    if k == CT_DURATION { return "Duration" }
+    if k == CT_FFI_SCOPE { return "FFIScope" }
+    let c1 = tp_child1.get(id).unwrap()
+    let c2 = tp_child2.get(id).unwrap()
+    let sn = tp_sname.get(id).unwrap()
+    if k == CT_LIST { return "List[{tp_display(c1)}]" }
+    if k == CT_OPTION { return "Option[{tp_display(c1)}]" }
+    if k == CT_RESULT { return "Result[{tp_display(c1)}, {tp_display(c2)}]" }
+    if k == CT_MAP { return "Map[{tp_display(c1)}, {tp_display(c2)}]" }
+    if k == CT_ITERATOR { return "Iterator[{tp_display(c1)}]" }
+    if k == CT_HANDLE { return "Handle[{tp_display(c1)}]" }
+    if k == CT_CHANNEL { return "Channel[{tp_display(c1)}]" }
+    if k == CT_PTR { return "Ptr[{tp_display(c1)}]" }
+    if k == CT_CLOSURE { return "Fn({sn})" }
+    if k == CT_TAGGED_ENUM { return sn }
+    "Unknown"
+}
 
 // ── Codegen state ───────────────────────────────────────────────────
 

@@ -1,0 +1,122 @@
+// Test the interned type pool pattern used by the compiler.
+// This is a standalone reproduction of the tp_* pool to verify
+// the pattern compiles and works correctly end-to-end.
+
+let TK_INT = 0
+let TK_FLOAT = 1
+let TK_BOOL = 2
+let TK_STRING = 3
+let TK_LIST = 4
+let TK_OPTION = 7
+let TK_RESULT = 8
+let TK_MAP = 13
+
+let mut pool_kind: List[Int] = []
+let mut pool_child1: List[Int] = []
+let mut pool_child2: List[Int] = []
+let mut pool_sname: List[Str] = []
+let mut pool_count: Int = 0
+let mut pool_intern: Map[Str, Int] = Map()
+
+fn intern_key(kind: Int, c1: Int, c2: Int, sname: Str) -> Str {
+    "{kind}:{c1}:{c2}:{sname}"
+}
+
+fn pool_alloc(kind: Int, c1: Int, c2: Int, sname: Str) -> Int {
+    let key = intern_key(kind, c1, c2, sname)
+    if pool_intern.has(key) {
+        return pool_intern.get(key)
+    }
+    let id = pool_count
+    pool_kind.push(kind)
+    pool_child1.push(c1)
+    pool_child2.push(c2)
+    pool_sname.push(sname)
+    pool_intern.set(key, id)
+    pool_count = pool_count + 1
+    id
+}
+
+fn mk_int() -> Int { pool_alloc(TK_INT, -1, -1, "") }
+fn mk_float() -> Int { pool_alloc(TK_FLOAT, -1, -1, "") }
+fn mk_bool() -> Int { pool_alloc(TK_BOOL, -1, -1, "") }
+fn mk_string() -> Int { pool_alloc(TK_STRING, -1, -1, "") }
+fn mk_list(elem: Int) -> Int { pool_alloc(TK_LIST, elem, -1, "") }
+fn mk_option(inner: Int) -> Int { pool_alloc(TK_OPTION, inner, -1, "") }
+fn mk_result(ok: Int, err: Int) -> Int { pool_alloc(TK_RESULT, ok, err, "") }
+fn mk_map(k: Int, v: Int) -> Int { pool_alloc(TK_MAP, k, v, "") }
+
+fn display(id: Int) -> Str {
+    if id < 0 { return "?" }
+    let k = pool_kind.get(id).unwrap()
+    if k == TK_INT { return "Int" }
+    if k == TK_FLOAT { return "Float" }
+    if k == TK_BOOL { return "Bool" }
+    if k == TK_STRING { return "Str" }
+    let c1 = pool_child1.get(id).unwrap()
+    let c2 = pool_child2.get(id).unwrap()
+    if k == TK_LIST { return "List[{display(c1)}]" }
+    if k == TK_OPTION { return "Option[{display(c1)}]" }
+    if k == TK_RESULT { return "Result[{display(c1)}, {display(c2)}]" }
+    if k == TK_MAP { return "Map[{display(c1)}, {display(c2)}]" }
+    "Unknown"
+}
+
+test "primitive interning" {
+    let t1 = mk_int()
+    let t2 = mk_int()
+    assert_eq(t1, t2)
+    let t3 = mk_string()
+    assert(t1 != t3)
+    io.println("primitive interning OK")
+}
+
+test "nested types" {
+    let t_int = mk_int()
+    let t_opt = mk_option(t_int)
+    let t_list = mk_list(t_opt)
+    assert_eq(pool_kind.get(t_list).unwrap(), TK_LIST)
+    assert_eq(pool_child1.get(t_list).unwrap(), t_opt)
+    assert_eq(pool_kind.get(t_opt).unwrap(), TK_OPTION)
+    assert_eq(pool_child1.get(t_opt).unwrap(), t_int)
+    io.println("nested types OK")
+}
+
+test "compound interning" {
+    let a = mk_list(mk_int())
+    let b = mk_list(mk_int())
+    assert_eq(a, b)
+    let c = mk_list(mk_string())
+    assert(a != c)
+    io.println("compound interning OK")
+}
+
+test "result type" {
+    let ok = mk_string()
+    let err = mk_int()
+    let r = mk_result(ok, err)
+    assert_eq(pool_kind.get(r).unwrap(), TK_RESULT)
+    assert_eq(pool_child1.get(r).unwrap(), ok)
+    assert_eq(pool_child2.get(r).unwrap(), err)
+    io.println("result type OK")
+}
+
+test "map type" {
+    let k = mk_string()
+    let v = mk_list(mk_int())
+    let m = mk_map(k, v)
+    assert_eq(pool_kind.get(m).unwrap(), TK_MAP)
+    assert_eq(pool_child1.get(m).unwrap(), k)
+    assert_eq(pool_child2.get(m).unwrap(), v)
+    io.println("map type OK")
+}
+
+test "display nested types" {
+    let t = mk_result(
+        mk_map(mk_string(), mk_list(mk_int())),
+        mk_int()
+    )
+    let s = display(t)
+    assert_eq(s, "Result[Map[Str, List[Int]], Int]")
+    io.println("display: {s}")
+}
