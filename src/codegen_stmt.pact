@@ -2006,7 +2006,9 @@ pub fn emit_fn_def(fn_node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope
         } else if is_enum_type(ret_str) != 0 {
             c_ret = c_type_c_name(ret_str)
         }
-        emit_line("extern {c_ret} {ffi_symbol}({params});")
+        if !is_runtime_header_fn(ffi_symbol) {
+            emit_line("extern {c_ret} {ffi_symbol}({params});")
+        }
         if ret_type == CT_VOID {
             if params == "void" {
                 emit_line("void {c_fn_name(name)}(void) \{ {ffi_symbol}(); }")

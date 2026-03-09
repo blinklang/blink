@@ -554,6 +554,8 @@ PACT_UNUSED static pact_map* type_where_preds;
 PACT_UNUSED static const char* cg_where_self_var = "";
 PACT_UNUSED static pact_map* c_reserved_set;
 PACT_UNUSED static int64_t c_reserved_init_done = 0;
+PACT_UNUSED static pact_map* runtime_header_fns;
+PACT_UNUSED static int64_t runtime_header_init_done = 0;
 PACT_UNUSED static pact_list* closure_captures;
 PACT_UNUSED static pact_list* closure_cap_infos;
 PACT_UNUSED static int64_t cg_closure_cap_start = (-1);
@@ -970,6 +972,8 @@ void pact_typecheck_tc_check_pattern_types(int64_t node);
 void pact_typecheck_tc_infer_program(int64_t program);
 const char* pact_typecheck_type_to_str(int64_t tid);
 void pact_codegen_types_init_c_reserved(void);
+void pact_codegen_types_init_runtime_header_fns(void);
+int pact_codegen_types_is_runtime_header_fn(const char* name);
 const char* pact_codegen_types_c_safe_name(const char* name);
 const char* pact_codegen_types_c_fn_name(const char* name);
 const char* pact_codegen_types_c_type_c_name(const char* name);
@@ -2668,7 +2672,7 @@ void pact_lexer_lex(const char* source) {
                 if ((esc == CH_n)) {
                     string_buf = pact_str_concat(string_buf, "\n");
                 } else if ((esc == CH_r)) {
-                    string_buf = pact_str_concat(string_buf, "\\");
+                    string_buf = pact_str_concat(string_buf, "\r");
                 } else {
                     if ((esc == CH_t)) {
                         string_buf = pact_str_concat(string_buf, "\t");
@@ -13646,10 +13650,165 @@ void pact_codegen_types_init_c_reserved(void) {
     pact_map_set(c_reserved_set, "memcpy", (void*)(intptr_t)1);
     pact_map_set(c_reserved_set, "memset", (void*)(intptr_t)1);
     pact_map_set(c_reserved_set, "memmove", (void*)(intptr_t)1);
+    pact_map_set(c_reserved_set, "memcmp", (void*)(intptr_t)1);
+    pact_map_set(c_reserved_set, "strncmp", (void*)(intptr_t)1);
+    pact_map_set(c_reserved_set, "strncpy", (void*)(intptr_t)1);
+    pact_map_set(c_reserved_set, "strncat", (void*)(intptr_t)1);
+    pact_map_set(c_reserved_set, "strstr", (void*)(intptr_t)1);
+    pact_map_set(c_reserved_set, "strchr", (void*)(intptr_t)1);
+    pact_map_set(c_reserved_set, "strdup", (void*)(intptr_t)1);
+    pact_map_set(c_reserved_set, "strtok", (void*)(intptr_t)1);
+    pact_map_set(c_reserved_set, "fopen", (void*)(intptr_t)1);
+    pact_map_set(c_reserved_set, "fclose", (void*)(intptr_t)1);
+    pact_map_set(c_reserved_set, "fread", (void*)(intptr_t)1);
+    pact_map_set(c_reserved_set, "fwrite", (void*)(intptr_t)1);
+    pact_map_set(c_reserved_set, "atoi", (void*)(intptr_t)1);
+    pact_map_set(c_reserved_set, "atof", (void*)(intptr_t)1);
+    pact_map_set(c_reserved_set, "strtol", (void*)(intptr_t)1);
+    pact_map_set(c_reserved_set, "strtod", (void*)(intptr_t)1);
+    pact_map_set(c_reserved_set, "getenv", (void*)(intptr_t)1);
+    pact_map_set(c_reserved_set, "system", (void*)(intptr_t)1);
+    pact_map_set(c_reserved_set, "qsort", (void*)(intptr_t)1);
+    pact_map_set(c_reserved_set, "read", (void*)(intptr_t)1);
+    pact_map_set(c_reserved_set, "write", (void*)(intptr_t)1);
+    pact_map_set(c_reserved_set, "close", (void*)(intptr_t)1);
+    pact_map_set(c_reserved_set, "sleep", (void*)(intptr_t)1);
+    pact_map_set(c_reserved_set, "fork", (void*)(intptr_t)1);
+    pact_map_set(c_reserved_set, "pipe", (void*)(intptr_t)1);
+    pact_map_set(c_reserved_set, "socket", (void*)(intptr_t)1);
+    pact_map_set(c_reserved_set, "bind", (void*)(intptr_t)1);
+    pact_map_set(c_reserved_set, "listen", (void*)(intptr_t)1);
+    pact_map_set(c_reserved_set, "accept", (void*)(intptr_t)1);
+    pact_map_set(c_reserved_set, "connect", (void*)(intptr_t)1);
+    pact_map_set(c_reserved_set, "send", (void*)(intptr_t)1);
+    pact_map_set(c_reserved_set, "recv", (void*)(intptr_t)1);
+    pact_map_set(c_reserved_set, "time", (void*)(intptr_t)1);
+    pact_map_set(c_reserved_set, "clock", (void*)(intptr_t)1);
+    pact_map_set(c_reserved_set, "log", (void*)(intptr_t)1);
+    pact_map_set(c_reserved_set, "round", (void*)(intptr_t)1);
     pact_map_set(c_reserved_set, "NULL", (void*)(intptr_t)1);
     pact_map_set(c_reserved_set, "main", (void*)(intptr_t)1);
     pact_map_set(c_reserved_set, "true", (void*)(intptr_t)1);
     pact_map_set(c_reserved_set, "false", (void*)(intptr_t)1);
+}
+
+void pact_codegen_types_init_runtime_header_fns(void) {
+    if ((runtime_header_init_done != 0)) {
+        return;
+    }
+    runtime_header_init_done = 1;
+    pact_map_set(runtime_header_fns, "printf", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "fprintf", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "sprintf", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "snprintf", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "fopen", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "fclose", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "fread", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "fwrite", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "fgets", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "fputs", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "puts", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "scanf", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "fflush", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "fseek", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "ftell", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "rewind", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "remove", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "rename", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "perror", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "malloc", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "calloc", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "realloc", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "free", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "exit", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "abort", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "atoi", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "atol", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "atof", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "strtol", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "strtod", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "abs", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "labs", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "llabs", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "rand", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "srand", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "getenv", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "system", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "qsort", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "bsearch", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "strlen", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "strcmp", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "strncmp", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "strcpy", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "strncpy", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "strcat", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "strncat", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "memcpy", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "memset", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "memmove", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "memcmp", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "strstr", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "strchr", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "strdup", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "strtok", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "time", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "clock", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "difftime", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "mktime", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "strftime", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "localtime", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "gmtime", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "read", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "write", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "close", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "sleep", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "usleep", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "getcwd", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "chdir", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "fork", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "execvp", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "pipe", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "dup2", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "access", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "unlink", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "rmdir", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "pthread_create", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "pthread_join", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "pthread_mutex_init", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "pthread_mutex_lock", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "pthread_mutex_unlock", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "socket", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "bind", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "listen", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "accept", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "connect", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "send", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "recv", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "getaddrinfo", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "freeaddrinfo", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "sqlite3_open", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "sqlite3_close", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "sqlite3_exec", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "sqlite3_prepare_v2", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "sqlite3_step", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "sqlite3_finalize", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "sqlite3_errmsg", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "sqrt", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "pow", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "sin", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "cos", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "tan", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "log", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "exp", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "ceil", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "floor", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "fabs", (void*)(intptr_t)1);
+    pact_map_set(runtime_header_fns, "round", (void*)(intptr_t)1);
+}
+
+int pact_codegen_types_is_runtime_header_fn(const char* name) {
+    (void)pact_codegen_types_init_runtime_header_fns();
+    return pact_map_has(runtime_header_fns, name);
 }
 
 const char* pact_codegen_types_c_safe_name(const char* name) {
@@ -32642,9 +32801,11 @@ void pact_codegen_stmt_emit_fn_def(int64_t fn_node) {
         } else if ((pact_codegen_types_is_enum_type(ret_str) != 0)) {
             c_ret = pact_codegen_types_c_type_c_name(ret_str);
         }
-        char _si_9[4096];
-        snprintf(_si_9, 4096, "extern %s %s(%s);", c_ret, ffi_symbol, params);
-        (void)pact_codegen_types_emit_line(strdup(_si_9));
+        if ((!pact_codegen_types_is_runtime_header_fn(ffi_symbol))) {
+            char _si_9[4096];
+            snprintf(_si_9, 4096, "extern %s %s(%s);", c_ret, ffi_symbol, params);
+            (void)pact_codegen_types_emit_line(strdup(_si_9));
+        }
         if ((ret_type == CT_VOID)) {
             if (pact_str_eq(params, "void")) {
                 char _si_10[4096];
@@ -43760,7 +43921,7 @@ void pact_std_json_parse_string(const char* s, int64_t pos) {
                         result = pact_str_concat(result, "\t");
                         p = (p + 2);
                     } else if ((next == CH_r)) {
-                        result = pact_str_concat(result, "\\");
+                        result = pact_str_concat(result, "\r");
                         p = (p + 2);
                     } else {
                         if ((next == CH_b)) {
@@ -48345,6 +48506,7 @@ pact_list* _l123 = pact_list_new();
     type_alias_base = pact_map_new();
     type_where_preds = pact_map_new();
     c_reserved_set = pact_map_new();
+    runtime_header_fns = pact_map_new();
 pact_list* _l124 = pact_list_new();
     closure_captures = _l124;
 pact_list* _l125 = pact_list_new();
