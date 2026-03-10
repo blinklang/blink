@@ -151,7 +151,9 @@ pub fn type_ffi_scope() -> Int {
 }
 
 pub fn tp_get_kind(id: Int) -> Int {
-    tp_kind.get(id).unwrap()
+    let k = tp_kind.get(id).unwrap()
+    if k == CT_TAGGED_ENUM { return CT_VOID }
+    k
 }
 
 pub fn tp_get_child1(id: Int) -> Int {
@@ -168,13 +170,13 @@ pub fn tp_get_sname(id: Int) -> Str {
 
 pub fn tp_child1_kind(id: Int) -> Int {
     let c1 = tp_child1.get(id).unwrap()
-    if c1 >= 0 { return tp_kind.get(c1).unwrap() }
+    if c1 >= 0 { return tp_get_kind(c1) }
     -1
 }
 
 pub fn tp_child2_kind(id: Int) -> Int {
     let c2 = tp_child2.get(id).unwrap()
-    if c2 >= 0 { return tp_kind.get(c2).unwrap() }
+    if c2 >= 0 { return tp_get_kind(c2) }
     -1
 }
 
@@ -1008,7 +1010,7 @@ pub fn get_sv_sname(name: Str, ctype: Int) -> Str {
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
         if sv.name == name && tp_get_kind(sv.tp_id) == ctype {
-            return tp_get_sname(sv.tp_id)
+            return sv.sname
         }
         i = i - 1
     }
@@ -1904,7 +1906,7 @@ pub fn get_var_struct(name: Str) -> Str {
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
         if sv.name == name && tp_get_kind(sv.tp_id) != CT_CLOSURE {
-            return tp_get_sname(sv.tp_id)
+            return sv.sname
         }
         i = i - 1
     }

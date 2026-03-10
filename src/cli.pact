@@ -810,7 +810,7 @@ fn ast_to_json(id: Int) -> Str {
     let kind = np_kind.get(id).unwrap()
     let kind_name = node_kind_name(kind)
     let mut r = "\{\"kind\":\""
-    r = r.concat(ast_json_escape(kind_name)).concat("\"")
+    r = r.concat(ast_json_escape(kind_name)).concat("\",\"id\":{id}")
 
     let line = np_line.get(id).unwrap()
     let col = np_col.get(id).unwrap()
@@ -1178,7 +1178,7 @@ fn check_file_exists(path: Str) {
     }
 }
 
-fn cmd_build(p: ArgParser, a: Args) {
+fn cmd_build(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen {
     let source_path = args_positional(a, 0)
     if source_path == "" {
         io.println("error: no source file specified")
@@ -1225,7 +1225,7 @@ fn cmd_build(p: ArgParser, a: Args) {
     }
 }
 
-fn cmd_run(p: ArgParser, a: Args) {
+fn cmd_run(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen {
     let source_path = args_positional(a, 0)
     if source_path == "" {
         io.println("error: no source file specified")
@@ -1262,7 +1262,7 @@ fn cmd_run(p: ArgParser, a: Args) {
     process_exec(output_path, rest)
 }
 
-fn cmd_test(p: ArgParser, a: Args) {
+fn cmd_test(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen {
     let source_path = args_positional(a, 0)
     let json_output = if args_has(a, "json") { 1 } else { 0 }
     let filter_pattern = args_get(a, "filter")
@@ -1480,7 +1480,7 @@ fn cmd_test(p: ArgParser, a: Args) {
     }
 }
 
-fn cmd_check(p: ArgParser, a: Args) {
+fn cmd_check(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
     let source_path = args_positional(a, 0)
     if source_path == "" {
         io.println("error: no source file specified")
@@ -1563,7 +1563,7 @@ fn cmd_check(p: ArgParser, a: Args) {
     }
 }
 
-fn cmd_audit(p: ArgParser, a: Args) {
+fn cmd_audit(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report {
     let source_path = args_positional(a, 0)
     let baseline_path = args_get(a, "baseline")
     let json_output = if args_has(a, "json") { 1 } else { 0 }
@@ -1616,7 +1616,7 @@ fn cmd_audit(p: ArgParser, a: Args) {
     }
 }
 
-fn cmd_fmt(p: ArgParser, a: Args) {
+fn cmd_fmt(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen {
     let source_path = args_positional(a, 0)
     let json_output = if args_has(a, "json") { 1 } else { 0 }
     let check_flag = if args_has(a, "check") { 1 } else { 0 }
@@ -1924,7 +1924,7 @@ fn cmd_llms(p: ArgParser, a: Args) {
     }
 }
 
-fn cmd_doc(p: ArgParser, a: Args) {
+fn cmd_doc(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Diag.Report {
     let list_flag = if args_has(a, "list") { 1 } else { 0 }
     let json_output = if args_has(a, "json") { 1 } else { 0 }
     if list_flag == 1 {
@@ -1976,7 +1976,7 @@ fn cmd_doc(p: ArgParser, a: Args) {
     io.println(result)
 }
 
-fn cmd_query(p: ArgParser, a: Args) {
+fn cmd_query(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Diag.Report {
     let source_path = args_positional(a, 0)
     if source_path == "" {
         io.println("error: no source file specified")
@@ -2180,7 +2180,7 @@ fn cmd_explain(p: ArgParser, a: Args) {
     io.println(explanation)
 }
 
-fn cmd_ast(p: ArgParser, a: Args) {
+fn cmd_ast(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report {
     let source_path = args_positional(a, 0)
     if source_path == "" {
         io.println("error: no source file specified")
@@ -2188,6 +2188,8 @@ fn cmd_ast(p: ArgParser, a: Args) {
         return
     }
     check_file_exists(source_path)
+    reset_compiler_state()
+    diag_reset()
     let source = read_file(source_path)
     lex(source)
     pos = 0
@@ -2200,10 +2202,30 @@ fn cmd_ast(p: ArgParser, a: Args) {
         exit(1)
     }
 
-    io.println(ast_to_json(program))
+    let imports_flag = if args_has(a, "imports") { 1 } else { 0 }
+    let node_id_str = args_get(a, "node")
+
+    let mut final_program = program
+    if imports_flag != 0 {
+        loaded_files.push(source_path)
+        let src_root = find_src_root(source_path)
+        let mut imported_programs: List[Int] = []
+        collect_root_imports(program)
+        collect_imports(program, src_root, imported_programs)
+        if imported_programs.len() > 0 {
+            final_program = merge_programs(program, imported_programs, import_map_nodes)
+        }
+    }
+
+    if node_id_str != "" {
+        let node_id = node_id_str.to_int()
+        io.println(ast_to_json(node_id))
+    } else {
+        io.println(ast_to_json(final_program))
+    }
 }
 
-fn cmd_daemon_start(p: ArgParser, a: Args) {
+fn cmd_daemon_start(p: ArgParser, a: Args) ! Daemon.Serve, Lex.Tokenize, Parse, TypeCheck, Diag.Report {
     let daemon_source = args_positional(a, 0)
     if daemon_source == "" {
         io.println("error: daemon start requires a source file")
@@ -2290,6 +2312,8 @@ fn main() {
     p = command_add_positional(p, "check", "file", "Source file to validate")
     p = command_add_positional(p, "query", "file", "Source file to query")
     p = command_add_positional(p, "ast", "file", "Source file to parse")
+    p = command_add_flag(p, "ast", "--imports", "-i", "Resolve imports and show merged AST")
+    p = command_add_option(p, "ast", "--node", "-n", "Dump subtree for specific node ID")
     p = command_add_positional(p, "fmt", "file", "Source file or directory (default: all .pact files)")
     p = command_add_positional(p, "test", "file", "Test file or directory (default: discover all)")
     p = command_add_positional(p, "doc", "module", "Module name (e.g. std.args)")
