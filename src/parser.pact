@@ -260,28 +260,14 @@ pub fn expect_value(kind: TokenKind) -> Str ! Parse.Advance, Diag.Report {
     advance_value()
 }
 
-pub fn skip_newlines_only() ! Parse.Advance {
+pub fn skip_newlines() ! Parse.Advance {
     while at(TokenKind.Newline) {
         advance()
     }
 }
 
-pub fn skip_newlines() ! Parse.Advance {
+pub fn skip_newlines_and_comments() ! Parse.Advance {
     while at(TokenKind.Newline) || at(TokenKind.Comment) || at(TokenKind.DocComment) {
-        if at(TokenKind.Comment) {
-            pending_comments.push(peek_value())
-        } else if at(TokenKind.DocComment) {
-            if pending_doc_comment != "" {
-                pending_doc_comment = pending_doc_comment.concat("\n")
-            }
-            pending_doc_comment = pending_doc_comment.concat(peek_value())
-        }
-        advance()
-    }
-}
-
-pub fn skip_comments() ! Parse.Advance {
-    while at(TokenKind.Comment) || at(TokenKind.DocComment) {
         if at(TokenKind.Comment) {
             pending_comments.push(peek_value())
         } else if at(TokenKind.DocComment) {
@@ -360,7 +346,7 @@ pub fn parse_import_stmt() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
 
     if at(TokenKind.LBrace) {
         advance()
-        skip_newlines()
+        skip_newlines_and_comments()
         let names_sl = new_sublist()
         while !at(TokenKind.RBrace) && !at(TokenKind.EOF) {
             let name_node = new_node(NodeKind.Ident)
@@ -374,10 +360,10 @@ pub fn parse_import_stmt() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
                 np_str_val.push(alias)
             }
             sublist_push(names_sl, name_node)
-            skip_newlines()
+            skip_newlines_and_comments()
             if at(TokenKind.Comma) {
                 advance()
-                skip_newlines()
+                skip_newlines_and_comments()
             }
         }
         expect(TokenKind.RBrace)
@@ -400,13 +386,13 @@ pub fn parse_program() -> Int ! Parse, Diag.Report {
     let mut effect_decl_nodes: List[Int] = []
     let mut test_nodes: List[Int] = []
     annotation_nodes = []
-    skip_newlines()
+    skip_newlines_and_comments()
     let header_comments = pending_comments
     let header_doc = pending_doc_comment
     pending_comments = []
     pending_doc_comment = ""
     while !at(TokenKind.EOF) {
-        skip_newlines()
+        skip_newlines_and_comments()
         if at(TokenKind.EOF) {
             break
         }
@@ -418,12 +404,12 @@ pub fn parse_program() -> Int ! Parse, Diag.Report {
             np_name.set(ann_nd, ann_name)
             if at(TokenKind.LParen) {
                 advance()
-                skip_newlines()
+                skip_newlines_and_comments()
                 let mut ann_arg_nodes: List[Int] = []
                 if ann_name == "requires" || ann_name == "ensures" || ann_name == "invariant" {
                     let expr_nd = parse_expr()
                     ann_arg_nodes.push(expr_nd)
-                    skip_newlines()
+                    skip_newlines_and_comments()
                 } else {
                     while !at(TokenKind.RParen) && !at(TokenKind.EOF) {
                         if at(TokenKind.StringStart) {
@@ -434,7 +420,7 @@ pub fn parse_program() -> Int ! Parse, Diag.Report {
                             let mut full_arg = arg_name
                             if at(TokenKind.Colon) {
                                 advance()
-                                skip_newlines()
+                                skip_newlines_and_comments()
                                 if at(TokenKind.StringStart) {
                                     let val_nd = parse_interp_string()
                                     np_name.set(val_nd, full_arg)
@@ -456,10 +442,10 @@ pub fn parse_program() -> Int ! Parse, Diag.Report {
                                 ann_arg_nodes.push(arg_nd)
                             }
                         }
-                        skip_newlines()
+                        skip_newlines_and_comments()
                         if at(TokenKind.Comma) {
                             advance()
-                            skip_newlines()
+                            skip_newlines_and_comments()
                         }
                     }
                 }
@@ -476,14 +462,14 @@ pub fn parse_program() -> Int ! Parse, Diag.Report {
                 }
             }
             annotation_nodes.push(ann_nd)
-            skip_newlines()
+            skip_newlines_and_comments()
         } else if at(TokenKind.Import) {
             advance()
             let imp = parse_import_stmt()
             attach_comments(imp)
             import_nodes.push(imp)
             collect_trailing_comment(imp)
-            skip_newlines()
+            skip_newlines_and_comments()
         } else if at(TokenKind.Type) {
             let td = parse_type_def()
             attach_comments(td)
@@ -516,7 +502,7 @@ pub fn parse_program() -> Int ! Parse, Diag.Report {
             collect_trailing_comment(cb)
         } else if at(TokenKind.Pub) {
             advance()
-            skip_newlines()
+            skip_newlines_and_comments()
             if at(TokenKind.Fn) {
                 let f = parse_fn_def()
                 attach_comments(f)
@@ -589,7 +575,7 @@ pub fn parse_program() -> Int ! Parse, Diag.Report {
             if at(TokenKind.Ident) {
                 advance()
             }
-            skip_newlines()
+            skip_newlines_and_comments()
             if at(TokenKind.LBrace) {
                 advance()
                 let mut depth = 1
@@ -607,7 +593,7 @@ pub fn parse_program() -> Int ! Parse, Diag.Report {
             diag_error("UnexpectedToken", "E1100", "unexpected token at top level: {peek_kind()}", peek_line(), peek_col(), "")
             advance()
         }
-        skip_newlines()
+        skip_newlines_and_comments()
     }
     // Build sublists from collected node IDs
     let fns = new_sublist()
@@ -796,7 +782,7 @@ pub fn parse_type_def() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
     expect(TokenKind.Type)
     let name = expect_value(TokenKind.Ident)
     let tparams = parse_type_params()
-    skip_newlines()
+    skip_newlines_and_comments()
     let mut flds = -1
     let mut td_end_line = -1
     let mut td_end_col = -1
@@ -830,7 +816,7 @@ pub fn parse_type_def() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
     }
     if at(TokenKind.LBrace) {
         expect(TokenKind.LBrace)
-        skip_newlines()
+        skip_newlines_and_comments()
         flds = new_sublist()
         while !at(TokenKind.RBrace) {
             let fname = expect_value(TokenKind.Ident)
@@ -845,14 +831,14 @@ pub fn parse_type_def() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
                 np_value.push(type_ann)
                 if at(TokenKind.Equals) {
                     advance()
-                    skip_newlines()
+                    skip_newlines_and_comments()
                     let default_expr = parse_expr()
                     np_condition.set(tf, default_expr)
                 }
                 sublist_push(flds, tf)
             } else if at(TokenKind.LParen) {
                 advance()
-                skip_newlines()
+                skip_newlines_and_comments()
                 let mut vflds = -1
                 if !at(TokenKind.RParen) {
                     vflds = new_sublist()
@@ -865,7 +851,7 @@ pub fn parse_type_def() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
                     sublist_push(vflds, vf)
                     while at(TokenKind.Comma) {
                         advance()
-                        skip_newlines()
+                        skip_newlines_and_comments()
                         if at(TokenKind.RParen) {
                             break
                         }
@@ -879,7 +865,7 @@ pub fn parse_type_def() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
                     }
                     finalize_sublist(vflds)
                 }
-                skip_newlines()
+                skip_newlines_and_comments()
                 expect(TokenKind.RParen)
                 let tv = new_node(NodeKind.TypeVariant)
                 attach_comments(tv)
@@ -896,7 +882,7 @@ pub fn parse_type_def() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
             if at(TokenKind.Comma) {
                 advance()
             }
-            skip_newlines()
+            skip_newlines_and_comments()
         }
         td_end_line = peek_line()
         td_end_col = peek_col()
@@ -1046,23 +1032,23 @@ pub fn parse_effect_decl() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
     pending_doc_comment = ""
     expect(TokenKind.Effect)
     let name = expect_value(TokenKind.Ident)
-    skip_newlines()
+    skip_newlines_and_comments()
     if at(TokenKind.LBrace) {
         advance()
-        skip_newlines()
+        skip_newlines_and_comments()
         let children_sl = new_sublist()
         while !at(TokenKind.RBrace) && !at(TokenKind.EOF) {
             expect(TokenKind.Effect)
             let child_name = expect_value(TokenKind.Ident)
-            skip_newlines()
+            skip_newlines_and_comments()
             let mut child_methods_sl = -1
             if at(TokenKind.LBrace) {
                 advance()
-                skip_newlines()
+                skip_newlines_and_comments()
                 child_methods_sl = new_sublist()
                 while !at(TokenKind.RBrace) && !at(TokenKind.EOF) {
                     sublist_push(child_methods_sl, parse_effect_op_sig())
-                    skip_newlines()
+                    skip_newlines_and_comments()
                 }
                 expect(TokenKind.RBrace)
                 finalize_sublist(child_methods_sl)
@@ -1073,11 +1059,11 @@ pub fn parse_effect_decl() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
             np_methods.pop()
             np_methods.push(child_methods_sl)
             sublist_push(children_sl, child)
-            skip_newlines()
+            skip_newlines_and_comments()
             if at(TokenKind.Comma) {
                 advance()
             }
-            skip_newlines()
+            skip_newlines_and_comments()
         }
         expect(TokenKind.RBrace)
         finalize_sublist(children_sl)
@@ -1158,7 +1144,7 @@ pub fn parse_fn_def() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         sublist_push(effects_sl, eff)
         while at(TokenKind.Comma) {
             advance()
-            skip_newlines()
+            skip_newlines_and_comments()
             let mut eff_name2 = expect_value(TokenKind.Ident)
             if at(TokenKind.Dot) {
                 advance()
@@ -1171,7 +1157,7 @@ pub fn parse_fn_def() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         }
         finalize_sublist(effects_sl)
     }
-    skip_newlines_only()
+    skip_newlines()
     let mut body_id = -1
     if at(TokenKind.LBrace) {
         body_id = parse_block()
@@ -1219,7 +1205,7 @@ pub fn parse_test_block() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
     if name_parts_sl != -1 && sublist_length(name_parts_sl) > 0 {
         test_name = np_str_val.get(sublist_get(name_parts_sl, 0)).unwrap()
     }
-    skip_newlines()
+    skip_newlines_and_comments()
     let body = parse_block()
     let nd = new_node(NodeKind.TestBlock)
     np_str_val.set(nd, test_name)
@@ -1302,7 +1288,7 @@ pub fn parse_closure() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         let rt = parse_type_annotation()
         ret_str = np_name.get(rt).unwrap()
     }
-    skip_newlines()
+    skip_newlines_and_comments()
     let body_id = parse_block()
     let nd = new_node(NodeKind.Closure)
     np_params.pop()
@@ -1336,9 +1322,9 @@ pub fn parse_trait_def() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         expect(TokenKind.RBracket)
         finalize_sublist(trait_type_args)
     }
-    skip_newlines()
+    skip_newlines_and_comments()
     expect(TokenKind.LBrace)
-    skip_newlines()
+    skip_newlines_and_comments()
     let methods = new_sublist()
     while !at(TokenKind.RBrace) {
         if at(TokenKind.Fn) {
@@ -1348,7 +1334,7 @@ pub fn parse_trait_def() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         } else {
             advance()
         }
-        skip_newlines()
+        skip_newlines_and_comments()
     }
     let trait_end_line = peek_line()
     let trait_end_col = peek_col()
@@ -1390,16 +1376,16 @@ pub fn parse_impl_block() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         expect(TokenKind.RBracket)
         finalize_sublist(trait_type_args)
     }
-    skip_newlines()
+    skip_newlines_and_comments()
     let mut type_name = ""
     if at(TokenKind.For) {
         advance()
-        skip_newlines()
+        skip_newlines_and_comments()
         type_name = expect_value(TokenKind.Ident)
     }
-    skip_newlines()
+    skip_newlines_and_comments()
     expect(TokenKind.LBrace)
-    skip_newlines()
+    skip_newlines_and_comments()
     let methods = new_sublist()
     while !at(TokenKind.RBrace) {
         if at(TokenKind.Fn) {
@@ -1409,7 +1395,7 @@ pub fn parse_impl_block() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         } else {
             advance()
         }
-        skip_newlines()
+        skip_newlines_and_comments()
     }
     let impl_end_line = peek_line()
     let impl_end_col = peek_col()
@@ -1442,9 +1428,9 @@ pub fn parse_handler_expr() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         let child = expect_value(TokenKind.Ident)
         full_name = full_name.concat(".").concat(child)
     }
-    skip_newlines()
+    skip_newlines_and_comments()
     expect(TokenKind.LBrace)
-    skip_newlines()
+    skip_newlines_and_comments()
     let methods = new_sublist()
     while !at(TokenKind.RBrace) && !at(TokenKind.EOF) {
         if at(TokenKind.Fn) {
@@ -1452,7 +1438,7 @@ pub fn parse_handler_expr() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         } else {
             advance()
         }
-        skip_newlines()
+        skip_newlines_and_comments()
     }
     expect(TokenKind.RBrace)
     finalize_sublist(methods)
@@ -1482,7 +1468,7 @@ pub fn parse_with_block() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
     }
     while at(TokenKind.Comma) {
         advance()
-        skip_newlines()
+        skip_newlines_and_comments()
         let expr_n = parse_expr()
         if at(TokenKind.As) {
             advance()
@@ -1495,7 +1481,7 @@ pub fn parse_with_block() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
             sublist_push(handlers_sl, expr_n)
         }
     }
-    skip_newlines()
+    skip_newlines_and_comments()
     let body = parse_block()
     finalize_sublist(handlers_sl)
     let nd = new_node(NodeKind.WithBlock)
@@ -1508,13 +1494,13 @@ pub fn parse_with_block() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
 
 pub fn parse_block() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
     expect(TokenKind.LBrace)
-    skip_newlines()
+    skip_newlines_and_comments()
     let stmts = new_sublist()
     while !at(TokenKind.RBrace) && !at(TokenKind.EOF) {
         let stmt = parse_stmt()
         sublist_push(stmts, stmt)
         collect_trailing_comment(stmt)
-        skip_newlines()
+        skip_newlines_and_comments()
     }
     let block_trailing = pending_comments
     pending_comments = []
@@ -1609,7 +1595,7 @@ pub fn parse_stmt() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         sublist_push(args_sl, parse_expr())
         while at(TokenKind.Comma) {
             advance()
-            skip_newlines()
+            skip_newlines_and_comments()
             if at(TokenKind.RParen) {
                 break
             }
@@ -1633,7 +1619,7 @@ pub fn parse_stmt() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
 
     if at(TokenKind.Equals) {
         advance()
-        skip_newlines()
+        skip_newlines_and_comments()
         let val = parse_expr()
         maybe_newline()
         let nd = new_node(NodeKind.Assignment)
@@ -1648,7 +1634,7 @@ pub fn parse_stmt() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
     if at(TokenKind.PlusEq) || at(TokenKind.MinusEq) || at(TokenKind.StarEq) || at(TokenKind.SlashEq) {
         let op_kind = peek_kind()
         advance()
-        skip_newlines()
+        skip_newlines_and_comments()
         let val = parse_expr()
         maybe_newline()
         let mut op_str = "+"
@@ -1699,7 +1685,7 @@ pub fn parse_let_binding() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         type_ann = parse_type_annotation()
     }
     expect(TokenKind.Equals)
-    skip_newlines()
+    skip_newlines_and_comments()
     let val = parse_expr()
     maybe_newline()
     let nd = new_node(NodeKind.LetBinding)
@@ -1727,7 +1713,7 @@ pub fn parse_const_binding() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         type_ann = parse_type_annotation()
     }
     expect(TokenKind.Equals)
-    skip_newlines()
+    skip_newlines_and_comments()
     let val = parse_expr()
     maybe_newline()
     let nd = new_node(NodeKind.LetBinding)
@@ -1779,7 +1765,7 @@ pub fn parse_return_stmt() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
 pub fn parse_if_expr() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
     expect(TokenKind.If)
     let cond = parse_expr()
-    skip_newlines()
+    skip_newlines_and_comments()
     let then_b = parse_block()
     let mut else_b = -1
     let mut peek_pos = pos
@@ -1787,11 +1773,11 @@ pub fn parse_if_expr() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         peek_pos = peek_pos + 1
     }
     if peek_pos < tok_kinds.len() && peek_kind_at(peek_pos) == TokenKind.Else {
-        skip_newlines()
+        skip_newlines_and_comments()
     }
     if at(TokenKind.Else) {
         advance()
-        skip_newlines()
+        skip_newlines_and_comments()
         if at(TokenKind.If) {
             let inner = parse_if_expr()
             let stmts = new_sublist()
@@ -1818,7 +1804,7 @@ pub fn parse_if_expr() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
 pub fn parse_while_loop() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
     expect(TokenKind.While)
     let cond = parse_expr()
-    skip_newlines()
+    skip_newlines_and_comments()
     let body = parse_block()
     let nd = new_node(NodeKind.WhileLoop)
     np_condition.pop()
@@ -1830,7 +1816,7 @@ pub fn parse_while_loop() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
 
 pub fn parse_loop_expr() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
     expect(TokenKind.Loop)
-    skip_newlines()
+    skip_newlines_and_comments()
     let body = parse_block()
     let nd = new_node(NodeKind.LoopExpr)
     np_body.pop()
@@ -1850,7 +1836,7 @@ pub fn parse_for_in() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
     }
     expect(TokenKind.In)
     let iter = parse_expr()
-    skip_newlines()
+    skip_newlines_and_comments()
     let body = parse_block()
     let nd = new_node(NodeKind.ForIn)
     np_var_name.pop()
@@ -2444,7 +2430,7 @@ pub fn parse_primary() -> Int ! Diag.Report, Parse.Advance, Parse.Build {
 
 pub fn parse_struct_lit(type_name: Str) -> Int ! Parse.Advance, Parse.Build, Diag.Report {
     expect(TokenKind.LBrace)
-    skip_newlines()
+    skip_newlines_and_comments()
     let flds = new_sublist()
     while !at(TokenKind.RBrace) {
         let fname = expect_value(TokenKind.Ident)
@@ -2460,7 +2446,7 @@ pub fn parse_struct_lit(type_name: Str) -> Int ! Parse.Advance, Parse.Build, Dia
         if at(TokenKind.Comma) {
             advance()
         }
-        skip_newlines()
+        skip_newlines_and_comments()
     }
     expect(TokenKind.RBrace)
     finalize_sublist(flds)
@@ -2474,14 +2460,14 @@ pub fn parse_struct_lit(type_name: Str) -> Int ! Parse.Advance, Parse.Build, Dia
 
 pub fn parse_list_lit() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
     expect(TokenKind.LBracket)
-    skip_newlines()
+    skip_newlines_and_comments()
     let elems = new_sublist()
     while !at(TokenKind.RBracket) {
         sublist_push(elems, parse_expr())
         if at(TokenKind.Comma) {
             advance()
         }
-        skip_newlines()
+        skip_newlines_and_comments()
     }
     expect(TokenKind.RBracket)
     finalize_sublist(elems)
@@ -2525,13 +2511,13 @@ pub fn parse_interp_string() -> Int ! Diag.Report, Parse.Advance, Parse.Build {
 pub fn parse_match_expr() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
     expect(TokenKind.Match)
     let scrut = parse_expr()
-    skip_newlines()
+    skip_newlines_and_comments()
     expect(TokenKind.LBrace)
-    skip_newlines()
+    skip_newlines_and_comments()
     let arms = new_sublist()
     while !at(TokenKind.RBrace) {
         sublist_push(arms, parse_match_arm())
-        skip_newlines()
+        skip_newlines_and_comments()
     }
     expect(TokenKind.RBrace)
     finalize_sublist(arms)
@@ -2546,14 +2532,14 @@ pub fn parse_match_expr() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
 pub fn parse_match_arm() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
     let pat = parse_pattern()
     let mut guard = -1
-    skip_newlines()
+    skip_newlines_and_comments()
     if at(TokenKind.If) {
         advance()
         guard = parse_expr()
     }
-    skip_newlines()
+    skip_newlines_and_comments()
     expect(TokenKind.FatArrow)
-    skip_newlines()
+    skip_newlines_and_comments()
     let mut body = -1
     if at(TokenKind.LBrace) {
         body = parse_block()

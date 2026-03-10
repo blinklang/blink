@@ -857,9 +857,8 @@ int64_t pact_parser_advance(void);
 const char* pact_parser_advance_value(void);
 int64_t pact_parser_expect(pact_tokens_TokenKind kind);
 const char* pact_parser_expect_value(pact_tokens_TokenKind kind);
-void pact_parser_skip_newlines_only(void);
 void pact_parser_skip_newlines(void);
-void pact_parser_skip_comments(void);
+void pact_parser_skip_newlines_and_comments(void);
 void pact_parser_maybe_newline(void);
 void pact_parser_attach_comments(int64_t node);
 void pact_parser_flush_pending_comments(void);
@@ -3789,28 +3788,14 @@ const char* pact_parser_expect_value(pact_tokens_TokenKind kind) {
     return pact_parser_advance_value();
 }
 
-void pact_parser_skip_newlines_only(void) {
+void pact_parser_skip_newlines(void) {
     while (pact_parser_at(pact_tokens_TokenKind_Newline)) {
         (void)pact_parser_advance();
     }
 }
 
-void pact_parser_skip_newlines(void) {
+void pact_parser_skip_newlines_and_comments(void) {
     while (((pact_parser_at(pact_tokens_TokenKind_Newline) || pact_parser_at(pact_tokens_TokenKind_Comment)) || pact_parser_at(pact_tokens_TokenKind_DocComment))) {
-        if (pact_parser_at(pact_tokens_TokenKind_Comment)) {
-            pact_list_push(pending_comments, (void*)pact_parser_peek_value());
-        } else if (pact_parser_at(pact_tokens_TokenKind_DocComment)) {
-            if ((!pact_str_eq(pending_doc_comment, ""))) {
-                pending_doc_comment = pact_str_concat(pending_doc_comment, "\n");
-            }
-            pending_doc_comment = pact_str_concat(pending_doc_comment, pact_parser_peek_value());
-        }
-        (void)pact_parser_advance();
-    }
-}
-
-void pact_parser_skip_comments(void) {
-    while ((pact_parser_at(pact_tokens_TokenKind_Comment) || pact_parser_at(pact_tokens_TokenKind_DocComment))) {
         if (pact_parser_at(pact_tokens_TokenKind_Comment)) {
             pact_list_push(pending_comments, (void*)pact_parser_peek_value());
         } else if (pact_parser_at(pact_tokens_TokenKind_DocComment)) {
@@ -3905,7 +3890,7 @@ int64_t pact_parser_parse_import_stmt(void) {
     pact_list_push(np_str_val, (void*)path);
     if (pact_parser_at(pact_tokens_TokenKind_LBrace)) {
         (void)pact_parser_advance();
-        (void)pact_parser_skip_newlines();
+        (void)pact_parser_skip_newlines_and_comments();
         const int64_t names_sl = pact_parser_new_sublist();
         while (((!pact_parser_at(pact_tokens_TokenKind_RBrace)) && (!pact_parser_at(pact_tokens_TokenKind_EOF)))) {
             const int64_t name_node = pact_parser_new_node(pact_ast_NodeKind_Ident);
@@ -3927,10 +3912,10 @@ int64_t pact_parser_parse_import_stmt(void) {
                 pact_list_push(np_str_val, (void*)alias);
             }
             (void)pact_parser_sublist_push(names_sl, name_node);
-            (void)pact_parser_skip_newlines();
+            (void)pact_parser_skip_newlines_and_comments();
             if (pact_parser_at(pact_tokens_TokenKind_Comma)) {
                 (void)pact_parser_advance();
-                (void)pact_parser_skip_newlines();
+                (void)pact_parser_skip_newlines_and_comments();
             }
         }
         (void)pact_parser_expect(pact_tokens_TokenKind_RBrace);
@@ -3959,14 +3944,14 @@ int64_t pact_parser_parse_program(void) {
     pact_list* test_nodes = _l7;
     pact_list* _l8 = pact_list_new();
     annotation_nodes = _l8;
-    (void)pact_parser_skip_newlines();
+    (void)pact_parser_skip_newlines_and_comments();
     pact_list* header_comments = pending_comments;
     const char* header_doc = pending_doc_comment;
     pact_list* _l9 = pact_list_new();
     pending_comments = _l9;
     pending_doc_comment = "";
     while ((!pact_parser_at(pact_tokens_TokenKind_EOF))) {
-        (void)pact_parser_skip_newlines();
+        (void)pact_parser_skip_newlines_and_comments();
         if (pact_parser_at(pact_tokens_TokenKind_EOF)) {
             break;
         }
@@ -3978,13 +3963,13 @@ int64_t pact_parser_parse_program(void) {
             pact_list_set(np_name, ann_nd, (void*)ann_name);
             if (pact_parser_at(pact_tokens_TokenKind_LParen)) {
                 (void)pact_parser_advance();
-                (void)pact_parser_skip_newlines();
+                (void)pact_parser_skip_newlines_and_comments();
                 pact_list* _l10 = pact_list_new();
                 pact_list* ann_arg_nodes = _l10;
                 if (((pact_str_eq(ann_name, "requires") || pact_str_eq(ann_name, "ensures")) || pact_str_eq(ann_name, "invariant"))) {
                     const int64_t expr_nd = pact_parser_parse_expr();
                     pact_list_push(ann_arg_nodes, (void*)(intptr_t)expr_nd);
-                    (void)pact_parser_skip_newlines();
+                    (void)pact_parser_skip_newlines_and_comments();
                 } else {
                     while (((!pact_parser_at(pact_tokens_TokenKind_RParen)) && (!pact_parser_at(pact_tokens_TokenKind_EOF)))) {
                         if (pact_parser_at(pact_tokens_TokenKind_StringStart)) {
@@ -3995,7 +3980,7 @@ int64_t pact_parser_parse_program(void) {
                             const char* full_arg = arg_name;
                             if (pact_parser_at(pact_tokens_TokenKind_Colon)) {
                                 (void)pact_parser_advance();
-                                (void)pact_parser_skip_newlines();
+                                (void)pact_parser_skip_newlines_and_comments();
                                 if (pact_parser_at(pact_tokens_TokenKind_StringStart)) {
                                     const int64_t val_nd = pact_parser_parse_interp_string();
                                     pact_list_set(np_name, val_nd, (void*)full_arg);
@@ -4017,10 +4002,10 @@ int64_t pact_parser_parse_program(void) {
                                 pact_list_push(ann_arg_nodes, (void*)(intptr_t)arg_nd);
                             }
                         }
-                        (void)pact_parser_skip_newlines();
+                        (void)pact_parser_skip_newlines_and_comments();
                         if (pact_parser_at(pact_tokens_TokenKind_Comma)) {
                             (void)pact_parser_advance();
-                            (void)pact_parser_skip_newlines();
+                            (void)pact_parser_skip_newlines_and_comments();
                         }
                     }
                 }
@@ -4044,14 +4029,14 @@ int64_t pact_parser_parse_program(void) {
                 }
             }
             pact_list_push(annotation_nodes, (void*)(intptr_t)ann_nd);
-            (void)pact_parser_skip_newlines();
+            (void)pact_parser_skip_newlines_and_comments();
         } else if (pact_parser_at(pact_tokens_TokenKind_Import)) {
             (void)pact_parser_advance();
             const int64_t imp = pact_parser_parse_import_stmt();
             (void)pact_parser_attach_comments(imp);
             pact_list_push(import_nodes, (void*)(intptr_t)imp);
             (void)pact_parser_collect_trailing_comment(imp);
-            (void)pact_parser_skip_newlines();
+            (void)pact_parser_skip_newlines_and_comments();
         } else {
             if (pact_parser_at(pact_tokens_TokenKind_Type)) {
                 const int64_t td = pact_parser_parse_type_def();
@@ -4087,7 +4072,7 @@ int64_t pact_parser_parse_program(void) {
                         (void)pact_parser_collect_trailing_comment(cb);
                     } else if (pact_parser_at(pact_tokens_TokenKind_Pub)) {
                         (void)pact_parser_advance();
-                        (void)pact_parser_skip_newlines();
+                        (void)pact_parser_skip_newlines_and_comments();
                         if (pact_parser_at(pact_tokens_TokenKind_Fn)) {
                             const int64_t f = pact_parser_parse_fn_def();
                             (void)pact_parser_attach_comments(f);
@@ -4166,7 +4151,7 @@ int64_t pact_parser_parse_program(void) {
                                 if (pact_parser_at(pact_tokens_TokenKind_Ident)) {
                                     (void)pact_parser_advance();
                                 }
-                                (void)pact_parser_skip_newlines();
+                                (void)pact_parser_skip_newlines_and_comments();
                                 if (pact_parser_at(pact_tokens_TokenKind_LBrace)) {
                                     (void)pact_parser_advance();
                                     int64_t depth = 1;
@@ -4191,7 +4176,7 @@ int64_t pact_parser_parse_program(void) {
                 }
             }
         }
-        (void)pact_parser_skip_newlines();
+        (void)pact_parser_skip_newlines_and_comments();
     }
     const int64_t fns = pact_parser_new_sublist();
     int64_t i = 0;
@@ -4497,7 +4482,7 @@ int64_t pact_parser_parse_type_def(void) {
     (void)pact_parser_expect(pact_tokens_TokenKind_Type);
     const char* name = pact_parser_expect_value(pact_tokens_TokenKind_Ident);
     const int64_t tparams = pact_parser_parse_type_params();
-    (void)pact_parser_skip_newlines();
+    (void)pact_parser_skip_newlines_and_comments();
     int64_t flds = (-1);
     int64_t td_end_line = (-1);
     int64_t td_end_col = (-1);
@@ -4545,7 +4530,7 @@ int64_t pact_parser_parse_type_def(void) {
     }
     if (pact_parser_at(pact_tokens_TokenKind_LBrace)) {
         (void)pact_parser_expect(pact_tokens_TokenKind_LBrace);
-        (void)pact_parser_skip_newlines();
+        (void)pact_parser_skip_newlines_and_comments();
         flds = pact_parser_new_sublist();
         while ((!pact_parser_at(pact_tokens_TokenKind_RBrace))) {
             const char* fname = pact_parser_expect_value(pact_tokens_TokenKind_Ident);
@@ -4568,14 +4553,14 @@ int64_t pact_parser_parse_type_def(void) {
                 pact_list_push(np_value, (void*)(intptr_t)type_ann);
                 if (pact_parser_at(pact_tokens_TokenKind_Equals)) {
                     (void)pact_parser_advance();
-                    (void)pact_parser_skip_newlines();
+                    (void)pact_parser_skip_newlines_and_comments();
                     const int64_t default_expr = pact_parser_parse_expr();
                     pact_list_set(np_condition, tf, (void*)(intptr_t)default_expr);
                 }
                 (void)pact_parser_sublist_push(flds, tf);
             } else if (pact_parser_at(pact_tokens_TokenKind_LParen)) {
                 (void)pact_parser_advance();
-                (void)pact_parser_skip_newlines();
+                (void)pact_parser_skip_newlines_and_comments();
                 int64_t vflds = (-1);
                 if ((!pact_parser_at(pact_tokens_TokenKind_RParen))) {
                     vflds = pact_parser_new_sublist();
@@ -4588,7 +4573,7 @@ int64_t pact_parser_parse_type_def(void) {
                     (void)pact_parser_sublist_push(vflds, vf);
                     while (pact_parser_at(pact_tokens_TokenKind_Comma)) {
                         (void)pact_parser_advance();
-                        (void)pact_parser_skip_newlines();
+                        (void)pact_parser_skip_newlines_and_comments();
                         if (pact_parser_at(pact_tokens_TokenKind_RParen)) {
                             break;
                         }
@@ -4602,7 +4587,7 @@ int64_t pact_parser_parse_type_def(void) {
                     }
                     (void)pact_parser_finalize_sublist(vflds);
                 }
-                (void)pact_parser_skip_newlines();
+                (void)pact_parser_skip_newlines_and_comments();
                 (void)pact_parser_expect(pact_tokens_TokenKind_RParen);
                 const int64_t tv = pact_parser_new_node(pact_ast_NodeKind_TypeVariant);
                 (void)pact_parser_attach_comments(tv);
@@ -4623,7 +4608,7 @@ int64_t pact_parser_parse_type_def(void) {
             if (pact_parser_at(pact_tokens_TokenKind_Comma)) {
                 (void)pact_parser_advance();
             }
-            (void)pact_parser_skip_newlines();
+            (void)pact_parser_skip_newlines_and_comments();
         }
         td_end_line = pact_parser_peek_line();
         td_end_col = pact_parser_peek_col();
@@ -4846,23 +4831,23 @@ int64_t pact_parser_parse_effect_decl(void) {
     pending_doc_comment = "";
     (void)pact_parser_expect(pact_tokens_TokenKind_Effect);
     const char* name = pact_parser_expect_value(pact_tokens_TokenKind_Ident);
-    (void)pact_parser_skip_newlines();
+    (void)pact_parser_skip_newlines_and_comments();
     if (pact_parser_at(pact_tokens_TokenKind_LBrace)) {
         (void)pact_parser_advance();
-        (void)pact_parser_skip_newlines();
+        (void)pact_parser_skip_newlines_and_comments();
         const int64_t children_sl = pact_parser_new_sublist();
         while (((!pact_parser_at(pact_tokens_TokenKind_RBrace)) && (!pact_parser_at(pact_tokens_TokenKind_EOF)))) {
             (void)pact_parser_expect(pact_tokens_TokenKind_Effect);
             const char* child_name = pact_parser_expect_value(pact_tokens_TokenKind_Ident);
-            (void)pact_parser_skip_newlines();
+            (void)pact_parser_skip_newlines_and_comments();
             int64_t child_methods_sl = (-1);
             if (pact_parser_at(pact_tokens_TokenKind_LBrace)) {
                 (void)pact_parser_advance();
-                (void)pact_parser_skip_newlines();
+                (void)pact_parser_skip_newlines_and_comments();
                 child_methods_sl = pact_parser_new_sublist();
                 while (((!pact_parser_at(pact_tokens_TokenKind_RBrace)) && (!pact_parser_at(pact_tokens_TokenKind_EOF)))) {
                     (void)pact_parser_sublist_push(child_methods_sl, pact_parser_parse_effect_op_sig());
-                    (void)pact_parser_skip_newlines();
+                    (void)pact_parser_skip_newlines_and_comments();
                 }
                 (void)pact_parser_expect(pact_tokens_TokenKind_RBrace);
                 (void)pact_parser_finalize_sublist(child_methods_sl);
@@ -4881,11 +4866,11 @@ int64_t pact_parser_parse_effect_decl(void) {
             (void)_lpop_2;
             pact_list_push(np_methods, (void*)(intptr_t)child_methods_sl);
             (void)pact_parser_sublist_push(children_sl, child);
-            (void)pact_parser_skip_newlines();
+            (void)pact_parser_skip_newlines_and_comments();
             if (pact_parser_at(pact_tokens_TokenKind_Comma)) {
                 (void)pact_parser_advance();
             }
-            (void)pact_parser_skip_newlines();
+            (void)pact_parser_skip_newlines_and_comments();
         }
         (void)pact_parser_expect(pact_tokens_TokenKind_RBrace);
         (void)pact_parser_finalize_sublist(children_sl);
@@ -4992,7 +4977,7 @@ int64_t pact_parser_parse_fn_def(void) {
         (void)pact_parser_sublist_push(effects_sl, eff);
         while (pact_parser_at(pact_tokens_TokenKind_Comma)) {
             (void)pact_parser_advance();
-            (void)pact_parser_skip_newlines();
+            (void)pact_parser_skip_newlines_and_comments();
             const char* eff_name2 = pact_parser_expect_value(pact_tokens_TokenKind_Ident);
             if (pact_parser_at(pact_tokens_TokenKind_Dot)) {
                 (void)pact_parser_advance();
@@ -5009,7 +4994,7 @@ int64_t pact_parser_parse_fn_def(void) {
         }
         (void)pact_parser_finalize_sublist(effects_sl);
     }
-    (void)pact_parser_skip_newlines_only();
+    (void)pact_parser_skip_newlines();
     int64_t body_id = (-1);
     if (pact_parser_at(pact_tokens_TokenKind_LBrace)) {
         body_id = pact_parser_parse_block();
@@ -5107,7 +5092,7 @@ int64_t pact_parser_parse_test_block(void) {
         if (_ounw_6.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
         test_name = _ounw_6.value;
     }
-    (void)pact_parser_skip_newlines();
+    (void)pact_parser_skip_newlines_and_comments();
     const int64_t body = pact_parser_parse_block();
     const int64_t nd = pact_parser_new_node(pact_ast_NodeKind_TestBlock);
     pact_list_set(np_str_val, nd, (void*)test_name);
@@ -5234,7 +5219,7 @@ int64_t pact_parser_parse_closure(void) {
         if (_ounw_2.tag == 0) { fprintf(stderr, "panic: unwrap called on None\n"); exit(1); }
         ret_str = _ounw_2.value;
     }
-    (void)pact_parser_skip_newlines();
+    (void)pact_parser_skip_newlines_and_comments();
     const int64_t body_id = pact_parser_parse_block();
     const int64_t nd = pact_parser_new_node(pact_ast_NodeKind_Closure);
     pact_Option_int _lpop_3;
@@ -5279,9 +5264,9 @@ int64_t pact_parser_parse_trait_def(void) {
         (void)pact_parser_expect(pact_tokens_TokenKind_RBracket);
         (void)pact_parser_finalize_sublist(trait_type_args);
     }
-    (void)pact_parser_skip_newlines();
+    (void)pact_parser_skip_newlines_and_comments();
     (void)pact_parser_expect(pact_tokens_TokenKind_LBrace);
-    (void)pact_parser_skip_newlines();
+    (void)pact_parser_skip_newlines_and_comments();
     const int64_t methods = pact_parser_new_sublist();
     while ((!pact_parser_at(pact_tokens_TokenKind_RBrace))) {
         if (pact_parser_at(pact_tokens_TokenKind_Fn)) {
@@ -5291,7 +5276,7 @@ int64_t pact_parser_parse_trait_def(void) {
         } else {
             (void)pact_parser_advance();
         }
-        (void)pact_parser_skip_newlines();
+        (void)pact_parser_skip_newlines_and_comments();
     }
     const int64_t trait_end_line = pact_parser_peek_line();
     const int64_t trait_end_col = pact_parser_peek_col();
@@ -5344,16 +5329,16 @@ int64_t pact_parser_parse_impl_block(void) {
         (void)pact_parser_expect(pact_tokens_TokenKind_RBracket);
         (void)pact_parser_finalize_sublist(trait_type_args);
     }
-    (void)pact_parser_skip_newlines();
+    (void)pact_parser_skip_newlines_and_comments();
     const char* type_name = "";
     if (pact_parser_at(pact_tokens_TokenKind_For)) {
         (void)pact_parser_advance();
-        (void)pact_parser_skip_newlines();
+        (void)pact_parser_skip_newlines_and_comments();
         type_name = pact_parser_expect_value(pact_tokens_TokenKind_Ident);
     }
-    (void)pact_parser_skip_newlines();
+    (void)pact_parser_skip_newlines_and_comments();
     (void)pact_parser_expect(pact_tokens_TokenKind_LBrace);
-    (void)pact_parser_skip_newlines();
+    (void)pact_parser_skip_newlines_and_comments();
     const int64_t methods = pact_parser_new_sublist();
     while ((!pact_parser_at(pact_tokens_TokenKind_RBrace))) {
         if (pact_parser_at(pact_tokens_TokenKind_Fn)) {
@@ -5363,7 +5348,7 @@ int64_t pact_parser_parse_impl_block(void) {
         } else {
             (void)pact_parser_advance();
         }
-        (void)pact_parser_skip_newlines();
+        (void)pact_parser_skip_newlines_and_comments();
     }
     const int64_t impl_end_line = pact_parser_peek_line();
     const int64_t impl_end_col = pact_parser_peek_col();
@@ -5410,9 +5395,9 @@ int64_t pact_parser_parse_handler_expr(void) {
         const char* child = pact_parser_expect_value(pact_tokens_TokenKind_Ident);
         full_name = pact_str_concat(pact_str_concat(full_name, "."), child);
     }
-    (void)pact_parser_skip_newlines();
+    (void)pact_parser_skip_newlines_and_comments();
     (void)pact_parser_expect(pact_tokens_TokenKind_LBrace);
-    (void)pact_parser_skip_newlines();
+    (void)pact_parser_skip_newlines_and_comments();
     const int64_t methods = pact_parser_new_sublist();
     while (((!pact_parser_at(pact_tokens_TokenKind_RBrace)) && (!pact_parser_at(pact_tokens_TokenKind_EOF)))) {
         if (pact_parser_at(pact_tokens_TokenKind_Fn)) {
@@ -5420,7 +5405,7 @@ int64_t pact_parser_parse_handler_expr(void) {
         } else {
             (void)pact_parser_advance();
         }
-        (void)pact_parser_skip_newlines();
+        (void)pact_parser_skip_newlines_and_comments();
     }
     (void)pact_parser_expect(pact_tokens_TokenKind_RBrace);
     (void)pact_parser_finalize_sublist(methods);
@@ -5456,7 +5441,7 @@ int64_t pact_parser_parse_with_block(void) {
     }
     while (pact_parser_at(pact_tokens_TokenKind_Comma)) {
         (void)pact_parser_advance();
-        (void)pact_parser_skip_newlines();
+        (void)pact_parser_skip_newlines_and_comments();
         const int64_t expr_n = pact_parser_parse_expr();
         if (pact_parser_at(pact_tokens_TokenKind_As)) {
             (void)pact_parser_advance();
@@ -5469,7 +5454,7 @@ int64_t pact_parser_parse_with_block(void) {
             (void)pact_parser_sublist_push(handlers_sl, expr_n);
         }
     }
-    (void)pact_parser_skip_newlines();
+    (void)pact_parser_skip_newlines_and_comments();
     const int64_t body = pact_parser_parse_block();
     (void)pact_parser_finalize_sublist(handlers_sl);
     const int64_t nd = pact_parser_new_node(pact_ast_NodeKind_WithBlock);
@@ -5480,13 +5465,13 @@ int64_t pact_parser_parse_with_block(void) {
 
 int64_t pact_parser_parse_block(void) {
     (void)pact_parser_expect(pact_tokens_TokenKind_LBrace);
-    (void)pact_parser_skip_newlines();
+    (void)pact_parser_skip_newlines_and_comments();
     const int64_t stmts = pact_parser_new_sublist();
     while (((!pact_parser_at(pact_tokens_TokenKind_RBrace)) && (!pact_parser_at(pact_tokens_TokenKind_EOF)))) {
         const int64_t stmt = pact_parser_parse_stmt();
         (void)pact_parser_sublist_push(stmts, stmt);
         (void)pact_parser_collect_trailing_comment(stmt);
-        (void)pact_parser_skip_newlines();
+        (void)pact_parser_skip_newlines_and_comments();
     }
     pact_list* block_trailing = pending_comments;
     pact_list* _l0 = pact_list_new();
@@ -5603,7 +5588,7 @@ int64_t pact_parser_parse_stmt(void) {
         (void)pact_parser_sublist_push(args_sl, pact_parser_parse_expr());
         while (pact_parser_at(pact_tokens_TokenKind_Comma)) {
             (void)pact_parser_advance();
-            (void)pact_parser_skip_newlines();
+            (void)pact_parser_skip_newlines_and_comments();
             if (pact_parser_at(pact_tokens_TokenKind_RParen)) {
                 break;
             }
@@ -5627,7 +5612,7 @@ int64_t pact_parser_parse_stmt(void) {
     const int64_t expr = pact_parser_parse_expr();
     if (pact_parser_at(pact_tokens_TokenKind_Equals)) {
         (void)pact_parser_advance();
-        (void)pact_parser_skip_newlines();
+        (void)pact_parser_skip_newlines_and_comments();
         const int64_t val = pact_parser_parse_expr();
         (void)pact_parser_maybe_newline();
         const int64_t nd = pact_parser_new_node(pact_ast_NodeKind_Assignment);
@@ -5651,7 +5636,7 @@ int64_t pact_parser_parse_stmt(void) {
     if ((((pact_parser_at(pact_tokens_TokenKind_PlusEq) || pact_parser_at(pact_tokens_TokenKind_MinusEq)) || pact_parser_at(pact_tokens_TokenKind_StarEq)) || pact_parser_at(pact_tokens_TokenKind_SlashEq))) {
         const int64_t op_kind = pact_parser_peek_kind();
         (void)pact_parser_advance();
-        (void)pact_parser_skip_newlines();
+        (void)pact_parser_skip_newlines_and_comments();
         const int64_t val = pact_parser_parse_expr();
         (void)pact_parser_maybe_newline();
         const char* op_str = "+";
@@ -5723,7 +5708,7 @@ int64_t pact_parser_parse_let_binding(void) {
         type_ann = pact_parser_parse_type_annotation();
     }
     (void)pact_parser_expect(pact_tokens_TokenKind_Equals);
-    (void)pact_parser_skip_newlines();
+    (void)pact_parser_skip_newlines_and_comments();
     const int64_t val = pact_parser_parse_expr();
     (void)pact_parser_maybe_newline();
     const int64_t nd = pact_parser_new_node(pact_ast_NodeKind_LetBinding);
@@ -5771,7 +5756,7 @@ int64_t pact_parser_parse_const_binding(void) {
         type_ann = pact_parser_parse_type_annotation();
     }
     (void)pact_parser_expect(pact_tokens_TokenKind_Equals);
-    (void)pact_parser_skip_newlines();
+    (void)pact_parser_skip_newlines_and_comments();
     const int64_t val = pact_parser_parse_expr();
     (void)pact_parser_maybe_newline();
     const int64_t nd = pact_parser_new_node(pact_ast_NodeKind_LetBinding);
@@ -5849,7 +5834,7 @@ int64_t pact_parser_parse_return_stmt(void) {
 int64_t pact_parser_parse_if_expr(void) {
     (void)pact_parser_expect(pact_tokens_TokenKind_If);
     const int64_t cond = pact_parser_parse_expr();
-    (void)pact_parser_skip_newlines();
+    (void)pact_parser_skip_newlines_and_comments();
     const int64_t then_b = pact_parser_parse_block();
     int64_t else_b = (-1);
     int64_t peek_pos = pos;
@@ -5857,11 +5842,11 @@ int64_t pact_parser_parse_if_expr(void) {
         peek_pos = (peek_pos + 1);
     }
     if (((peek_pos < pact_list_len(tok_kinds)) && (pact_parser_peek_kind_at(peek_pos) == pact_tokens_TokenKind_Else))) {
-        (void)pact_parser_skip_newlines();
+        (void)pact_parser_skip_newlines_and_comments();
     }
     if (pact_parser_at(pact_tokens_TokenKind_Else)) {
         (void)pact_parser_advance();
-        (void)pact_parser_skip_newlines();
+        (void)pact_parser_skip_newlines_and_comments();
         if (pact_parser_at(pact_tokens_TokenKind_If)) {
             const int64_t inner = pact_parser_parse_if_expr();
             const int64_t stmts = pact_parser_new_sublist();
@@ -5904,7 +5889,7 @@ int64_t pact_parser_parse_if_expr(void) {
 int64_t pact_parser_parse_while_loop(void) {
     (void)pact_parser_expect(pact_tokens_TokenKind_While);
     const int64_t cond = pact_parser_parse_expr();
-    (void)pact_parser_skip_newlines();
+    (void)pact_parser_skip_newlines_and_comments();
     const int64_t body = pact_parser_parse_block();
     const int64_t nd = pact_parser_new_node(pact_ast_NodeKind_WhileLoop);
     pact_Option_int _lpop_0;
@@ -5924,7 +5909,7 @@ int64_t pact_parser_parse_while_loop(void) {
 
 int64_t pact_parser_parse_loop_expr(void) {
     (void)pact_parser_expect(pact_tokens_TokenKind_Loop);
-    (void)pact_parser_skip_newlines();
+    (void)pact_parser_skip_newlines_and_comments();
     const int64_t body = pact_parser_parse_block();
     const int64_t nd = pact_parser_new_node(pact_ast_NodeKind_LoopExpr);
     pact_Option_int _lpop_0;
@@ -5948,7 +5933,7 @@ int64_t pact_parser_parse_for_in(void) {
     }
     (void)pact_parser_expect(pact_tokens_TokenKind_In);
     const int64_t iter = pact_parser_parse_expr();
-    (void)pact_parser_skip_newlines();
+    (void)pact_parser_skip_newlines_and_comments();
     const int64_t body = pact_parser_parse_block();
     const int64_t nd = pact_parser_new_node(pact_ast_NodeKind_ForIn);
     pact_Option_str _lpop_0;
@@ -6833,7 +6818,7 @@ int64_t pact_parser_parse_primary(void) {
 
 int64_t pact_parser_parse_struct_lit(const char* type_name) {
     (void)pact_parser_expect(pact_tokens_TokenKind_LBrace);
-    (void)pact_parser_skip_newlines();
+    (void)pact_parser_skip_newlines_and_comments();
     const int64_t flds = pact_parser_new_sublist();
     while ((!pact_parser_at(pact_tokens_TokenKind_RBrace))) {
         const char* fname = pact_parser_expect_value(pact_tokens_TokenKind_Ident);
@@ -6857,7 +6842,7 @@ int64_t pact_parser_parse_struct_lit(const char* type_name) {
         if (pact_parser_at(pact_tokens_TokenKind_Comma)) {
             (void)pact_parser_advance();
         }
-        (void)pact_parser_skip_newlines();
+        (void)pact_parser_skip_newlines_and_comments();
     }
     (void)pact_parser_expect(pact_tokens_TokenKind_RBrace);
     (void)pact_parser_finalize_sublist(flds);
@@ -6879,14 +6864,14 @@ int64_t pact_parser_parse_struct_lit(const char* type_name) {
 
 int64_t pact_parser_parse_list_lit(void) {
     (void)pact_parser_expect(pact_tokens_TokenKind_LBracket);
-    (void)pact_parser_skip_newlines();
+    (void)pact_parser_skip_newlines_and_comments();
     const int64_t elems = pact_parser_new_sublist();
     while ((!pact_parser_at(pact_tokens_TokenKind_RBracket))) {
         (void)pact_parser_sublist_push(elems, pact_parser_parse_expr());
         if (pact_parser_at(pact_tokens_TokenKind_Comma)) {
             (void)pact_parser_advance();
         }
-        (void)pact_parser_skip_newlines();
+        (void)pact_parser_skip_newlines_and_comments();
     }
     (void)pact_parser_expect(pact_tokens_TokenKind_RBracket);
     (void)pact_parser_finalize_sublist(elems);
@@ -6946,13 +6931,13 @@ int64_t pact_parser_parse_interp_string(void) {
 int64_t pact_parser_parse_match_expr(void) {
     (void)pact_parser_expect(pact_tokens_TokenKind_Match);
     const int64_t scrut = pact_parser_parse_expr();
-    (void)pact_parser_skip_newlines();
+    (void)pact_parser_skip_newlines_and_comments();
     (void)pact_parser_expect(pact_tokens_TokenKind_LBrace);
-    (void)pact_parser_skip_newlines();
+    (void)pact_parser_skip_newlines_and_comments();
     const int64_t arms = pact_parser_new_sublist();
     while ((!pact_parser_at(pact_tokens_TokenKind_RBrace))) {
         (void)pact_parser_sublist_push(arms, pact_parser_parse_match_arm());
-        (void)pact_parser_skip_newlines();
+        (void)pact_parser_skip_newlines_and_comments();
     }
     (void)pact_parser_expect(pact_tokens_TokenKind_RBrace);
     (void)pact_parser_finalize_sublist(arms);
@@ -6975,14 +6960,14 @@ int64_t pact_parser_parse_match_expr(void) {
 int64_t pact_parser_parse_match_arm(void) {
     const int64_t pat = pact_parser_parse_pattern();
     int64_t guard = (-1);
-    (void)pact_parser_skip_newlines();
+    (void)pact_parser_skip_newlines_and_comments();
     if (pact_parser_at(pact_tokens_TokenKind_If)) {
         (void)pact_parser_advance();
         guard = pact_parser_parse_expr();
     }
-    (void)pact_parser_skip_newlines();
+    (void)pact_parser_skip_newlines_and_comments();
     (void)pact_parser_expect(pact_tokens_TokenKind_FatArrow);
-    (void)pact_parser_skip_newlines();
+    (void)pact_parser_skip_newlines_and_comments();
     int64_t body = (-1);
     if (pact_parser_at(pact_tokens_TokenKind_LBrace)) {
         body = pact_parser_parse_block();
