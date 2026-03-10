@@ -15,20 +15,23 @@ pub fn emit_if_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
     if then_type == CT_RESULT {
         let rt = get_fn_ret_type(cg_current_fn_name)
         let fsi = get_fn_ret_struct_inner(cg_current_fn_name)
+        let rt_c1 = tp_child1_kind(rt.tp_id)
+        let rt_c2 = tp_child2_kind(rt.tp_id)
         if fsi.ok_struct != "" || fsi.err_struct != "" {
-            emit_line("{result_c_type_mixed(rt.inner1, rt.inner2, fsi.ok_struct, fsi.err_struct)} {tmp};")
-        } else if rt.inner1 >= 0 {
-            emit_line("{result_c_type(rt.inner1, rt.inner2)} {tmp};")
+            emit_line("{result_c_type_mixed(rt_c1, rt_c2, fsi.ok_struct, fsi.err_struct)} {tmp};")
+        } else if rt_c1 >= 0 {
+            emit_line("{result_c_type(rt_c1, rt_c2)} {tmp};")
         } else {
             emit_line("{result_c_type(CT_INT, CT_STRING)} {tmp};")
         }
     } else if then_type == CT_OPTION {
         let rt = get_fn_ret_type(cg_current_fn_name)
         let fsi = get_fn_ret_struct_inner(cg_current_fn_name)
+        let rt_c1 = tp_child1_kind(rt.tp_id)
         if fsi.ok_struct != "" {
             emit_line("{struct_option_c_type(fsi.ok_struct)} {tmp};")
-        } else if rt.inner1 >= 0 {
-            emit_line("{option_c_type(rt.inner1)} {tmp};")
+        } else if rt_c1 >= 0 {
+            emit_line("{option_c_type(rt_c1)} {tmp};")
         } else {
             emit_line("{option_c_type(CT_INT)} {tmp};")
         }
@@ -54,26 +57,29 @@ pub fn emit_if_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
     if then_type == CT_RESULT {
         let rt2 = get_fn_ret_type(cg_current_fn_name)
         let fsi2 = get_fn_ret_struct_inner(cg_current_fn_name)
+        let rt2_c1 = tp_child1_kind(rt2.tp_id)
+        let rt2_c2 = tp_child2_kind(rt2.tp_id)
         if fsi2.ok_struct != "" || fsi2.err_struct != "" {
-            set_var_result_struct(tmp, rt2.inner1, rt2.inner2, fsi2.ok_struct, fsi2.err_struct)
+            set_var_result_struct(tmp, rt2_c1, rt2_c2, fsi2.ok_struct, fsi2.err_struct)
             expr_result_ok_struct = fsi2.ok_struct
             expr_result_err_struct = fsi2.err_struct
         } else {
-            set_var_result(tmp, rt2.inner1, rt2.inner2)
+            set_var_result(tmp, rt2_c1, rt2_c2)
         }
-        expr_result_ok_type = rt2.inner1
-        expr_result_err_type = rt2.inner2
+        expr_result_ok_type = rt2_c1
+        expr_result_err_type = rt2_c2
     }
     if then_type == CT_OPTION {
         let rt3 = get_fn_ret_type(cg_current_fn_name)
         let fsi3 = get_fn_ret_struct_inner(cg_current_fn_name)
+        let rt3_c1 = tp_child1_kind(rt3.tp_id)
         if fsi3.ok_struct != "" {
-            set_var_option_struct(tmp, rt3.inner1, fsi3.ok_struct)
+            set_var_option_struct(tmp, rt3_c1, fsi3.ok_struct)
             expr_option_inner_struct = fsi3.ok_struct
         } else {
-            set_var_option(tmp, rt3.inner1)
+            set_var_option(tmp, rt3_c1)
         }
-        expr_option_inner = rt3.inner1
+        expr_option_inner = rt3_c1
     }
     expr_result_str = tmp
     expr_result_type = then_type

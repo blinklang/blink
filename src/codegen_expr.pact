@@ -850,7 +850,7 @@ pub fn emit_unaryop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
                     let fn_ok_s = fn_fsi.ok_struct
                     let fn_err_s = fn_fsi.err_struct
                     let fn_rt = get_fn_ret_type(cg_current_fn_name)
-                    let fn_res_c = result_c_type_mixed(fn_rt.inner1, fn_rt.inner2, fn_ok_s, fn_err_s)
+                    let fn_res_c = result_c_type_mixed(tp_child1_kind(fn_rt.tp_id), tp_child2_kind(fn_rt.tp_id), fn_ok_s, fn_err_s)
                     emit_line("{res_c} {tmp} = {operand_str};")
                     emit_line("if ({tmp}.tag == 1) return ({fn_res_c})\{.tag = 1, .err = {tmp}.err};")
                     expr_result_str = "{tmp}.ok"
@@ -1461,19 +1461,19 @@ pub fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
         }
         let rt = get_fn_ret_type(fn_name)
         if expr_result_type == CT_RESULT {
-            expr_result_ok_type = rt.inner1
-            expr_result_err_type = rt.inner2
+            expr_result_ok_type = tp_child1_kind(rt.tp_id)
+            expr_result_err_type = tp_child2_kind(rt.tp_id)
             let fsi = get_fn_ret_struct_inner(fn_name)
             expr_result_ok_struct = fsi.ok_struct
             expr_result_err_struct = fsi.err_struct
         }
         if expr_result_type == CT_OPTION {
-            expr_option_inner = rt.inner1
+            expr_option_inner = tp_child1_kind(rt.tp_id)
             let fsi = get_fn_ret_struct_inner(fn_name)
             expr_option_inner_struct = fsi.ok_struct
         }
         if expr_result_type == CT_LIST {
-            expr_list_elem_type = rt.inner1
+            expr_list_elem_type = tp_child1_kind(rt.tp_id)
         }
         return
     }

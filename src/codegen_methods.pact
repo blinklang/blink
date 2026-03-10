@@ -1082,10 +1082,12 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                     expr_result_str = "{c_fn_name(mangled)}({arg_str})"
                     expr_result_type = get_fn_ret(mangled)
                     let tf_rt = get_fn_ret_type(mangled)
-                    if tf_rt.inner1 != -1 && tf_rt.inner2 != -1 {
-                        expr_result_ok_type = tf_rt.inner1
-                        expr_result_err_type = tf_rt.inner2
-                        set_var_result(expr_result_str, tf_rt.inner1, tf_rt.inner2)
+                    let tf_c1 = tp_child1_kind(tf_rt.tp_id)
+                    let tf_c2 = tp_child2_kind(tf_rt.tp_id)
+                    if tf_c1 != -1 && tf_c2 != -1 {
+                        expr_result_ok_type = tf_c1
+                        expr_result_err_type = tf_c2
+                        set_var_result(expr_result_str, tf_c1, tf_c2)
                     }
                     return
                 }
