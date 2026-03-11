@@ -776,52 +776,6 @@ PACT_UNUSED static int64_t pact_getpid(void) {
 
 PACT_UNUSED static void pact_exit(int64_t code) { exit((int)code); }
 
-/* ── Path utilities ─────────────────────────────────────────────────── */
-
-PACT_UNUSED static const char* pact_path_join(const char* a, const char* b) {
-    int64_t la = pact_str_len(a);
-    int64_t lb = pact_str_len(b);
-    int has_slash = (la > 0 && a[la-1] == '/') ? 1 : 0;
-    if (has_slash) {
-        return pact_str_concat(a, b);
-    }
-    char* buf = (char*)pact_alloc(la + 1 + lb + 1);
-    memcpy(buf, a, (size_t)la);
-    buf[la] = '/';
-    memcpy(buf + la + 1, b, (size_t)lb);
-    buf[la + 1 + lb] = '\0';
-    return buf;
-}
-
-PACT_UNUSED static const char* pact_path_dirname(const char* path) {
-    int64_t len = pact_str_len(path);
-    int64_t i = len - 1;
-    while (i >= 0 && path[i] != '/') {
-        i--;
-    }
-    if (i < 0) {
-        return strdup(".");
-    }
-    if (i == 0) {
-        return strdup("/");
-    }
-    return pact_str_substr(path, 0, i);
-}
-
-PACT_UNUSED static const char* pact_path_basename(const char* path) {
-    int64_t len = pact_str_len(path);
-    int64_t i = len - 1;
-    while (i >= 0 && path[i] != '/') {
-        i--;
-    }
-    int64_t start = i + 1;
-    int64_t blen = len - start;
-    char* buf = (char*)pact_alloc(blen + 1);
-    memcpy(buf, path + start, (size_t)blen);
-    buf[blen] = '\0';
-    return buf;
-}
-
 PACT_UNUSED static int64_t pact_shell_exec(const char* command) {
     int status = system(command);
 #ifdef _WIN32

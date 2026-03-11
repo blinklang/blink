@@ -2,6 +2,7 @@ import codegen_types
 import codegen_methods
 import codegen_closures
 import diagnostics
+import std.path
 
 // codegen_expr.pact — Expression codegen, closures, capture analysis
 

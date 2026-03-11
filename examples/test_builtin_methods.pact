@@ -1,3 +1,5 @@
+import std.path
+
 // Test that methods resolve correctly on built-in function return values
 
 fn main() ! IO {

@@ -4,6 +4,7 @@
 // For path+git-only (no registry), "MVS" reduces to: resolve each dep,
 // check for version conflicts, recurse into transitive deps.
 
+import std.path
 import pkg.manifest
 import pkg.lockfile
 import std.semver

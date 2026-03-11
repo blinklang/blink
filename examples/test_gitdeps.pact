@@ -1,3 +1,4 @@
+import std.path
 import pkg.gitdeps
 
 fn setup_test_repo() {

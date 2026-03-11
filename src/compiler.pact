@@ -12,6 +12,7 @@ import incremental
 import daemon
 import pkg.lockfile
 import ast_dump
+import std.path
 
 // compiler.pact — Self-hosting Pact compiler driver
 //
@@ -33,6 +34,44 @@ pub fn dots_to_slashes(s: Str) -> Str {
         i = i + 1
     }
     result
+}
+
+fn read_module_ann(anns_sl: Int) -> Option[Str] {
+    if anns_sl == -1 {
+        return None
+    }
+    let mut ai = 0
+    while ai < sublist_length(anns_sl) {
+        let ann = sublist_get(anns_sl, ai)
+        let ann_name = np_name.get(ann).unwrap()
+        if ann_name == "module" {
+            let ann_args_sl = np_args.get(ann).unwrap()
+            if ann_args_sl != -1 && sublist_length(ann_args_sl) > 0 {
+                let arg_nd = sublist_get(ann_args_sl, 0)
+                let arg_parts = np_elements.get(arg_nd).unwrap()
+                if arg_parts == -1 || sublist_length(arg_parts) == 0 {
+                    return Some("")
+                }
+                let val = np_name.get(sublist_get(arg_parts, 0)).unwrap()
+                return Some(val)
+            }
+        }
+        ai = ai + 1
+    }
+    None
+}
+
+fn find_module_annotation(prog: Int) -> Option[Str] {
+    let result = read_module_ann(np_handlers.get(prog).unwrap())
+    if result.is_some() {
+        return result
+    }
+    let fns_sl = np_params.get(prog).unwrap()
+    if fns_sl != -1 && sublist_length(fns_sl) > 0 {
+        let first_fn = sublist_get(fns_sl, 0)
+        return read_module_ann(np_handlers.get(first_fn).unwrap())
+    }
+    None
 }
 
 pub fn dots_to_underscores(s: Str) -> Str {
@@ -593,7 +632,11 @@ pub fn collect_imports(program: Int, src_root: Str, all_programs: List[Int]) ! L
         let imported_prog = parse_program()
         collect_imports(imported_prog, src_root, all_programs)
         all_programs.push(imported_prog)
-        let mod_key = dots_to_underscores(dotted_path)
+        let mut mod_key = dots_to_underscores(dotted_path)
+        let override_key = find_module_annotation(imported_prog)
+        if override_key.is_some() {
+            mod_key = override_key.unwrap()
+        }
         import_map_paths.push(file_path)
         import_map_nodes.push(imp_node)
         import_map_modules.push(mod_key)

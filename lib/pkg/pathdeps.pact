@@ -3,6 +3,7 @@
 // Resolves local path dependencies from pact.toml manifests, handling
 // transitive deps and cycle detection. Uses pkg.manifest for loading.
 
+import std.path
 import pkg.manifest
 
 // ── Resolved path deps: parallel arrays ────────────────────────

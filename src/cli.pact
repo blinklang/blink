@@ -1,5 +1,6 @@
 import ast
 import std.args
+import std.path
 import pkg.audit
 import pkg.lockfile
 import pkg.manifest

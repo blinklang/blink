@@ -4,6 +4,7 @@
 // Cache layout: ~/.pact/cache/git/{sanitized_url}/repo.git (bare clone)
 //               ~/.pact/cache/git/{sanitized_url}/{commit}/ (checkout)
 
+import std.path
 import pkg.manifest
 
 // ── Last fetch results ──────────────────────────────────────────

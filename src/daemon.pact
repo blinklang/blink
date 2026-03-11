@@ -4,6 +4,7 @@ import incremental
 import query
 import diagnostics
 import std.json
+import std.path
 import lexer
 import parser
 import typecheck

@@ -1776,7 +1776,7 @@ pub fn format_test_block(node: Int) ! Format.Emit {
 }
 
 pub fn annotation_order(name: Str) -> Int {
-    if name == "mod" { return 0 }
+    if name == "module" { return 0 }
     if name == "capabilities" { return 1 }
     if name == "derive" { return 2 }
     if name == "src" { return 3 }
