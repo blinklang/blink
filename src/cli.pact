@@ -355,9 +355,13 @@ fn do_compile(source_path: Str, c_path: Str, format_flag: Str, debug_mode: Int, 
 fn resolve_runtime_header() -> Str {
     let pact_root = get_env("PACT_ROOT") ?? ""
     if pact_root != "" {
-        let path = "{pact_root}/bootstrap/runtime.h"
-        if file_exists(path) == 1 {
-            return read_file(path)
+        let build_path = "{pact_root}/build/runtime.h"
+        if file_exists(build_path) == 1 {
+            return read_file(build_path)
+        }
+        let bootstrap_path = "{pact_root}/bootstrap/runtime.h"
+        if file_exists(bootstrap_path) == 1 {
+            return read_file(bootstrap_path)
         }
     }
     if file_exists("build/runtime.h") == 1 {

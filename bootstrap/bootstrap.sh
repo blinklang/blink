@@ -6,7 +6,19 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 BUILD_DIR="$ROOT_DIR/build"
 
 mkdir -p "$BUILD_DIR"
-cp "$SCRIPT_DIR/runtime.h" "$BUILD_DIR/runtime.h"
+# Copy split runtime headers to build/ for direct #include usage
+cp "$SCRIPT_DIR"/runtime_*.h "$BUILD_DIR/"
+# Build a flat runtime.h in build/ for CLI inlining (CLI reads build/runtime.h
+# and embeds it verbatim in generated C, so nested #includes won't work)
+cat "$SCRIPT_DIR/runtime_core.h" \
+    "$SCRIPT_DIR/runtime_tcp.h" \
+    "$SCRIPT_DIR/runtime_unix_socket.h" \
+    "$SCRIPT_DIR/runtime_thread.h" \
+    "$SCRIPT_DIR/runtime_process.h" \
+    "$SCRIPT_DIR/runtime_http.h" \
+    "$SCRIPT_DIR/runtime_test.h" \
+    "$SCRIPT_DIR/runtime_sqlite.h" \
+    > "$BUILD_DIR/runtime.h"
 mkdir -p "$BUILD_DIR/lib/std"
 cp "$ROOT_DIR/lib/std/"*.pact "$BUILD_DIR/lib/std/"
 mkdir -p "$BUILD_DIR/lib/pkg"
