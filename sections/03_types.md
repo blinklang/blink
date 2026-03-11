@@ -185,7 +185,7 @@ let seconds = timeout.parse_int() ?? 30
 
 ##### String Building
 
-For assembling strings from parts, Pact provides three mechanisms in v1:
+For assembling strings from parts, Pact provides four mechanisms:
 
 1. **String interpolation** — for inline composition: `"Hello, {name}!"`
 2. **`concat`** — for joining two strings: `greeting.concat(name)`
@@ -220,7 +220,60 @@ impl Joinable for List[Str] {
 }
 ```
 
-**Why `join` over a mutable builder.** A mutable `StrBuf` type is the standard approach for languages without GC-optimized string concatenation. Pact defers `StrBuf` to v1.1 — the combination of interpolation, `concat`, and `join` covers the vast majority of string assembly patterns. The `join` idiom (build a `List[Str]`, then join) is simple, composable, and produces correct results without requiring the programmer to manage buffer state.
+4. **`StringBuilder`** — for efficient incremental string building in loops and codegen:
+
+```pact
+import std.str.{StringBuilder}
+
+fn build_json(fields: List[(Str, Str)]) -> Str {
+    let mut sb = StringBuilder.new()
+    sb.write("{")
+    for entry in fields.enumerate() {
+        let (i, (key, value)) = entry
+        if i > 0 { sb.write(", ") }
+        sb.write("{key}: {value}")
+    }
+    sb.write("}")
+    sb.to_str()
+}
+```
+
+`StringBuilder` is a mutable buffer backed by a contiguous byte array with amortized O(1) append. It lives in `std.str` (Tier 1) and requires explicit import. Methods are on the compiler-known `StringBuildOps` trait:
+
+```pact
+trait StringBuildOps {
+    fn write(self, s: Str)
+    fn write_char(self, c: Char)
+    fn to_str(self) -> Str
+    fn len(self) -> Int
+    fn capacity(self) -> Int
+    fn clear(self)
+}
+```
+
+`StringBuilder` also implements `Sized` (via `len`/`is_empty`).
+
+| Method | Signature | Notes |
+|--------|-----------|-------|
+| `new` | `fn() -> StringBuilder` | Empty buffer, default capacity |
+| `with_capacity` | `fn(n: Int) -> StringBuilder` | Pre-allocate `n` bytes to avoid reallocs |
+| `write` | `fn(self, s: Str)` | Append string. Requires `let mut` |
+| `write_char` | `fn(self, c: Char)` | Append single character |
+| `to_str` | `fn(self) -> Str` | Produce immutable `Str` (copies buffer) |
+| `len` | `fn(self) -> Int` | Current content length in codepoints |
+| `capacity` | `fn(self) -> Int` | Current buffer capacity |
+| `clear` | `fn(self)` | Reset to empty, retains capacity for reuse |
+
+**`to_str()` always copies.** The returned `Str` is an independent immutable value. Subsequent `write()` or `clear()` calls on the builder do not affect previously returned strings. This is the only safe semantics given GC-managed immutable `Str`.
+
+**Interpolation optimization.** When the compiler sees `sb.write("{x}: {y}")` where the argument is an interpolated string literal, it lowers the call to a sequence of individual writes (`sb.write(x_str); sb.write(": "); sb.write(y_str)`) instead of materializing a temporary `Str`. This is a codegen optimization, transparent to the type system — the method signature is unchanged. (Vote: 4-1, Systems dissented wanting explicit multi-write.)
+
+**When to use which:**
+- **Interpolation** — inline composition, the 80% case
+- **`concat`/`join`** — combining known pieces or a list of strings
+- **`StringBuilder`** — loops building strings incrementally, codegen, or any case where `concat` in a loop would be O(N²)
+
+(Panel vote: 3-1-1 for Option D. See [StringBuilder rationale](../decisions/string-builder.md).)
 
 #### §3.2.2 Collection Methods
 
@@ -430,13 +483,14 @@ let combined = a.union(b)                  // all elements from both
 
 | Trait | Applies to | Methods | In prelude |
 |-------|-----------|---------|------------|
-| `Sized` | Str, List, Map, Set | `len`, `is_empty` | Yes |
+| `Sized` | Str, List, Map, Set, StringBuilder | `len`, `is_empty` | Yes |
 | `Contains[T]` | List, Map, Set | `contains` | Yes |
 | `ListOps[T]` | List | 12 methods | Yes |
 | `MapOps[K, V]` | Map | 8 methods | Yes |
 | `SetOps[T]` | Set | 3 methods | Yes |
 | `IntoIterator[T]` | List, Map, Set, Str, Range | `into_iter` | Yes (§3c.1) |
 | `Joinable` | List[Str] | `join` | Yes (§3.2.1) |
+| `StringBuildOps` | StringBuilder | `write`, `write_char`, `to_str`, `len`, `capacity`, `clear` | No (import `std.str`) |
 
 All collection traits are in the prelude — no import required. This matches the rationale from §10.6: operators like `for` desugar through `IntoIterator`, method calls resolve through traits, and requiring imports for built-in collection methods would add ceremony with no information value.
 
