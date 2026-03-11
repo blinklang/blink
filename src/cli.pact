@@ -1035,6 +1035,7 @@ fn cmd_build(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
         io.eprintln("error: --debug and --release are mutually exclusive")
         exit(1)
     }
+    trace_mode = args_get(a, "trace")
     let basename = path_basename(source_path)
     let name = strip_extension(basename)
     let mut output_path = args_get(a, "output")
@@ -1086,6 +1087,7 @@ fn cmd_run(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Repor
         io.eprintln("error: 'run' does not support multiple targets")
         exit(1)
     }
+    trace_mode = args_get(a, "trace")
     let basename = path_basename(source_path)
     let name = strip_extension(basename)
     let mut output_path = args_get(a, "output")
@@ -1355,6 +1357,7 @@ fn cmd_check(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
         format_flag = "json"
     }
 
+    trace_mode = args_get(a, "trace")
     let mut daemon_used = 0
     let sock = find_daemon_sock()
     if sock.is_some() {
@@ -2208,6 +2211,10 @@ fn main() {
     p = command_add_option(p, "build", "--format", "-f", "Output format")
     p = command_add_option(p, "check", "--format", "-f", "Output format")
     p = command_add_option(p, "fmt", "--format", "-f", "Output format")
+
+    p = command_add_option(p, "build", "--trace", "", "Trace phase (lex, parse, codegen, typecheck, all)")
+    p = command_add_option(p, "run", "--trace", "", "Trace phase (lex, parse, codegen, typecheck, all)")
+    p = command_add_option(p, "check", "--trace", "", "Trace phase (lex, parse, codegen, typecheck, all)")
 
     p = command_add_flag(p, "llms", "--list", "", "List available topics")
     p = command_add_flag(p, "llms", "--full", "", "Print full reference (default is short summary)")

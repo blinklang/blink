@@ -63,6 +63,14 @@ pub fn find_src_root(source_path: Str) -> Str {
     path_dirname(source_path)
 }
 
+pub let mut trace_mode: Str = ""
+
+pub fn trace(phase: Str, msg: Str) {
+    if trace_mode == phase || trace_mode == "all" {
+        io.eprintln("[trace:{phase}] {msg}")
+    }
+}
+
 pub let mut lockfile_loaded: Int = 0
 
 pub fn ensure_lockfile_loaded(src_root: Str) {
@@ -569,6 +577,7 @@ pub fn collect_imports(program: Int, src_root: Str, all_programs: List[Int]) ! L
             continue
         }
         loaded_files.push(file_path)
+        if trace_mode != "" { trace("parse", "import {dotted_path} -> {file_path}") }
         let mut source = ""
         if file_path.starts_with("<embedded:") {
             let key = file_path.substring(10, file_path.len() - 11)

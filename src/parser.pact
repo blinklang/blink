@@ -378,6 +378,7 @@ pub fn parse_import_stmt() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
 
 @allow(UnrestoredMutation, IncompleteStateRestore)
 pub fn parse_program() -> Int ! Parse, Diag.Report {
+    if trace_mode != "" { trace("parse", "start ({tok_kinds.len()} tokens)") }
     let mut fn_nodes: List[Int] = []
     let mut type_nodes: List[Int] = []
     let mut let_nodes: List[Int] = []
@@ -715,6 +716,7 @@ pub fn parse_program() -> Int ! Parse, Diag.Report {
         np_trailing_comments.set(prog, tc)
         pending_comments = []
     }
+    if trace_mode != "" { trace("parse", "done ({fn_nodes.len()} fns, {type_nodes.len()} types, {import_nodes.len()} imports)") }
     prog
 }
 

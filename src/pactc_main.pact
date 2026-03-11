@@ -2,7 +2,7 @@ import compiler
 
 fn main() {
     if arg_count() < 2 {
-        io.println("Usage: pactc <source.pact> [output.c] [--format json] [--json] [--emit pact] [--stats] [--debug] [--dump-ast]")
+        io.println("Usage: pactc <source.pact> [output.c] [--format json] [--json] [--emit pact] [--stats] [--debug] [--dump-ast] [--trace <phase>]")
         io.println("  Compiles a Pact source file to C.")
         return
     }
@@ -13,6 +13,7 @@ fn main() {
     let mut stats_mode = 0
     let mut check_only = 0
     let mut dump_ast = 0
+    let mut trace_flag = ""
     let mut i = 2
     while i < arg_count() {
         let arg = get_arg(i)
@@ -39,6 +40,11 @@ fn main() {
             check_only = 1
         } else if arg == "--dump-ast" {
             dump_ast = 1
+        } else if arg == "--trace" {
+            if i + 1 < arg_count() {
+                i = i + 1
+                trace_flag = get_arg(i)
+            }
         } else {
             out_path = arg
         }
@@ -46,6 +52,7 @@ fn main() {
     }
 
     diag_source_file = source_path
+    trace_mode = trace_flag
     let source = read_file(source_path)
 
     let t_lex_start = time_ms()

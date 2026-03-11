@@ -678,6 +678,7 @@ pub fn init_types() ! TypeCheck.Register {
 }
 
 pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
+    if trace_mode != "" { trace("typecheck", "start") }
     init_types()
 
     // Register all type definitions (structs and enums)
@@ -900,6 +901,7 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
     // Phase 2: Expression type inference
     tc_infer_program(program)
 
+    if trace_mode != "" { trace("typecheck", "done ({tc_errors.len()} errors)") }
     tc_errors.len()
 }
 

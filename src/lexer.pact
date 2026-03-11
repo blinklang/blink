@@ -104,6 +104,7 @@ pub let mut tok_cols: List[Int] = []
 // ── Main lexer ───────────────────────────────────────────────────────
 
 pub fn lex(source: Str) ! Lex.Tokenize {
+    if trace_mode != "" { trace("lex", "start ({source.len()} chars)") }
     // Reset output arrays
     tok_kinds = []
     tok_values = []
@@ -1020,4 +1021,5 @@ pub fn lex(source: Str) ! Lex.Tokenize {
     tok_values.push("")
     tok_lines.push(line)
     tok_cols.push(col)
+    if trace_mode != "" { trace("lex", "done ({tok_kinds.len()} tokens)") }
 }

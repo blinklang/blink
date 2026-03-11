@@ -19,6 +19,7 @@ import codegen_derive
 
 @allow(UnrestoredMutation, IncompleteStateRestore)
 pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
+    if trace_mode != "" { trace("codegen", "start") }
     cg_program_node = program
     // Reset state
     cg_lines = []
@@ -975,5 +976,6 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
         cg_lines.set(0, ffi_defines.concat(cg_lines.get(0).unwrap()))
     }
 
+    if trace_mode != "" { trace("codegen", "done ({cg_lines.len()} lines)") }
     join_lines()
 }
