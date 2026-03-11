@@ -265,6 +265,22 @@ fn load_lint_overrides() {
     }
 }
 
+fn ensure_deps_resolved() {
+    let toml_mt = file_mtime("pact.toml")
+    if toml_mt == -1 {
+        return
+    }
+    let lock_mt = file_mtime("pact.lock")
+    if lock_mt == -1 || toml_mt > lock_mt {
+        io.eprintln("resolving dependencies...")
+        let rc = resolve_and_lock(".", pact_cli_version)
+        if rc != 0 {
+            io.eprintln("error: dependency resolution failed")
+            exit(1)
+        }
+    }
+}
+
 fn do_compile(source_path: Str, c_path: Str, format_flag: Str, debug_mode: Int, strict_mode: Int) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen {
     reset_compiler_state()
     diag_reset()
@@ -1049,6 +1065,7 @@ fn cmd_build(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
     shell_exec("mkdir -p {out_dir}")
     let out_base = strip_extension(path_basename(output_path))
     let c_path = "{out_dir}/{out_base}.c"
+    ensure_deps_resolved()
     let rc = do_build(source_path, output_path, c_path, format_flag, debug_flag, release_flag, emit_flag, targets, json_output, strict_flag)
     if rc == 0 {
         if emit_flag == "c" {
@@ -1101,6 +1118,7 @@ fn cmd_run(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Repor
     shell_exec("mkdir -p {out_dir}")
     let out_base = strip_extension(path_basename(output_path))
     let c_path = "{out_dir}/{out_base}.c"
+    ensure_deps_resolved()
     let rc = do_build(source_path, output_path, c_path, format_flag, debug_flag, release_flag, "", targets, 0, strict_flag)
     if rc != 0 {
         exit(1)
@@ -1126,6 +1144,7 @@ fn cmd_test(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Repo
     let targets = args_get_all(a, "target")
     let format_flag = args_get(a, "format")
 
+    ensure_deps_resolved()
     if source_path != "" {
         check_file_exists(source_path)
     }
@@ -1358,6 +1377,7 @@ fn cmd_check(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
     }
 
     trace_mode = args_get(a, "pact-trace")
+    ensure_deps_resolved()
     let mut daemon_used = 0
     let sock = find_daemon_sock()
     if sock.is_some() {
