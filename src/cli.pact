@@ -38,6 +38,7 @@ const embedded_pkg_manifest: Str = #embed("../lib/pkg/manifest.pact")
 const embedded_pkg_pathdeps: Str = #embed("../lib/pkg/pathdeps.pact")
 const embedded_pkg_resolver: Str = #embed("../lib/pkg/resolver.pact")
 const embedded_std_semver: Str = #embed("../lib/std/semver.pact")
+const embedded_std_str: Str = #embed("../lib/std/str.pact")
 const embedded_std_toml: Str = #embed("../lib/std/toml.pact")
 
 fn init_embedded_stdlib() {
@@ -49,6 +50,7 @@ fn init_embedded_stdlib() {
     embedded_stdlib.set("http_types", embedded_std_http_types)
     embedded_stdlib.set("json", embedded_std_json)
     embedded_stdlib.set("semver", embedded_std_semver)
+    embedded_stdlib.set("str", embedded_std_str)
     embedded_stdlib.set("toml", embedded_std_toml)
     embedded_stdlib.set("pkg_audit", embedded_pkg_audit)
     embedded_stdlib.set("pkg_gitdeps", embedded_pkg_gitdeps)

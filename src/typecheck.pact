@@ -1135,6 +1135,7 @@ pub fn is_builtin_fn(name: Str) -> Int {
     if name == "Map" { return 1 }
     if name == "Bytes" { return 1 }
     if name == "Channel" { return 1 }
+    if name == "StringBuilder" { return 1 }
     if name == "unix_socket_listen" { return 1 }
     if name == "unix_socket_connect" { return 1 }
     if name == "unix_socket_accept" { return 1 }
@@ -1353,7 +1354,7 @@ pub fn is_trait_name(name: Str) -> Int {
 pub fn is_known_type(name: Str) -> Int {
     if name == "Int" || name == "Float" || name == "Bool" || name == "Str" { return 1 }
     if name == "Void" || name == "List" || name == "Option" || name == "Result" { return 1 }
-    if name == "Iterator" || name == "Handle" || name == "Channel" || name == "Map" || name == "Bytes" || name == "Instant" || name == "Duration" || name == "Char" { return 1 }
+    if name == "Iterator" || name == "Handle" || name == "Channel" || name == "Map" || name == "Bytes" || name == "Instant" || name == "Duration" || name == "Char" || name == "StringBuilder" { return 1 }
     if name == "Ptr" || name == "U8" || name == "U16" || name == "U32" || name == "U64" || name == "I8" || name == "I16" || name == "I32" || name == "I64" { return 1 }
     if name == "Fn" || name == "Self" || name == "Tuple" { return 1 }
     if lookup_named_type(name) != -1 { return 1 }

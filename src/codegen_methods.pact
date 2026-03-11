@@ -98,6 +98,27 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
         }
     }
 
+    // StringBuilder.new() and StringBuilder.with_capacity(n) — static constructors
+    if np_kind.get(obj_node).unwrap() == NodeKind.Ident && np_name.get(obj_node).unwrap() == "StringBuilder" {
+        if method == "new" {
+            expr_result_str = "pact_sb_new()"
+            expr_result_type = CT_STRINGBUILDER
+            return
+        }
+        if method == "with_capacity" {
+            let args_sl = np_args.get(node).unwrap()
+            if args_sl != -1 && sublist_length(args_sl) > 0 {
+                emit_expr(sublist_get(args_sl, 0))
+                let cap_str = expr_result_str
+                expr_result_str = "pact_sb_with_capacity({cap_str})"
+            } else {
+                expr_result_str = "pact_sb_new()"
+            }
+            expr_result_type = CT_STRINGBUILDER
+            return
+        }
+    }
+
     // Duration static constructors: Duration.nanos(n), Duration.ms(n), etc.
     if np_kind.get(obj_node).unwrap() == NodeKind.Ident && np_name.get(obj_node).unwrap() == "Duration" {
         let args_sl = np_args.get(node).unwrap()
@@ -2521,6 +2542,87 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
         if method == "to_hex" {
             expr_result_str = "pact_bytes_to_hex({obj_str})"
             expr_result_type = CT_STRING
+            return
+        }
+    }
+
+    // StringBuilder methods
+    if obj_type == CT_STRINGBUILDER {
+        if method == "write" {
+            let args_sl = np_args.get(node).unwrap()
+            let arg_node = sublist_get(args_sl, 0)
+            let arg_kind = np_kind.get(arg_node).unwrap()
+            if arg_kind == NodeKind.InterpString {
+                let parts_sl = np_elements.get(arg_node).unwrap()
+                if parts_sl != -1 {
+                    let mut pi = 0
+                    while pi < sublist_length(parts_sl) {
+                        let part = sublist_get(parts_sl, pi)
+                        let pk = np_kind.get(part).unwrap()
+                        if pk == NodeKind.Ident && np_str_val.get(part).unwrap() == np_name.get(part).unwrap() {
+                            let lit = np_str_val.get(part).unwrap()
+                            if lit != "" {
+                                emit_line("pact_sb_write({obj_str}, \"{escape_c_string(lit)}\");")
+                            }
+                        } else {
+                            emit_expr(part)
+                            let e_str = expr_result_str
+                            let e_type = expr_result_type
+                            if e_type == CT_INT {
+                                emit_line("pact_sb_write_int({obj_str}, {e_str});")
+                            } else if e_type == CT_FLOAT {
+                                emit_line("pact_sb_write_float({obj_str}, {e_str});")
+                            } else if e_type == CT_BOOL {
+                                emit_line("pact_sb_write_bool({obj_str}, {e_str});")
+                            } else {
+                                emit_line("pact_sb_write({obj_str}, {e_str});")
+                            }
+                        }
+                        pi = pi + 1
+                    }
+                }
+            } else {
+                emit_expr(arg_node)
+                let arg_str = expr_result_str
+                emit_line("pact_sb_write({obj_str}, {arg_str});")
+            }
+            expr_result_str = "0"
+            expr_result_type = CT_VOID
+            return
+        }
+        if method == "write_char" {
+            let args_sl = np_args.get(node).unwrap()
+            emit_expr(sublist_get(args_sl, 0))
+            let ch_str = expr_result_str
+            emit_line("pact_sb_write_char({obj_str}, {ch_str});")
+            expr_result_str = "0"
+            expr_result_type = CT_VOID
+            return
+        }
+        if method == "to_str" {
+            expr_result_str = "pact_sb_to_str({obj_str})"
+            expr_result_type = CT_STRING
+            return
+        }
+        if method == "len" {
+            expr_result_str = "pact_sb_len({obj_str})"
+            expr_result_type = CT_INT
+            return
+        }
+        if method == "capacity" {
+            expr_result_str = "pact_sb_capacity({obj_str})"
+            expr_result_type = CT_INT
+            return
+        }
+        if method == "clear" {
+            emit_line("pact_sb_clear({obj_str});")
+            expr_result_str = "0"
+            expr_result_type = CT_VOID
+            return
+        }
+        if method == "is_empty" {
+            expr_result_str = "(pact_sb_is_empty({obj_str}))"
+            expr_result_type = CT_BOOL
             return
         }
     }

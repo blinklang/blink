@@ -40,6 +40,7 @@ pub let CT_INSTANT = 15
 pub let CT_DURATION = 16
 pub let CT_PTR = 17
 pub let CT_FFI_SCOPE = 18
+pub let CT_STRINGBUILDER = 19
 
 // ── Type node pool (interned, parallel arrays) ─────────────────────
 // Recursive type representation: each type is an integer handle into
@@ -150,6 +151,10 @@ pub fn type_ffi_scope() -> Int {
     tp_alloc(CT_FFI_SCOPE, -1, -1, "")
 }
 
+pub fn type_stringbuilder() -> Int {
+    tp_alloc(CT_STRINGBUILDER, -1, -1, "")
+}
+
 pub fn tp_get_kind(id: Int) -> Int {
     let k = tp_kind.get(id).unwrap()
     if k == CT_TAGGED_ENUM { return CT_VOID }
@@ -194,6 +199,7 @@ pub fn tp_display(id: Int) -> Str {
     if k == CT_INSTANT { return "Instant" }
     if k == CT_DURATION { return "Duration" }
     if k == CT_FFI_SCOPE { return "FFIScope" }
+    if k == CT_STRINGBUILDER { return "StringBuilder" }
     let c1 = tp_child1.get(id).unwrap()
     let c2 = tp_child2.get(id).unwrap()
     let sn = tp_sname.get(id).unwrap()
@@ -2086,6 +2092,7 @@ pub fn type_name_from_ct(ct: Int) -> Str {
     else if ct == CT_CHANNEL { "Channel" }
     else if ct == CT_MAP { "Map" }
     else if ct == CT_BYTES { "Bytes" }
+    else if ct == CT_STRINGBUILDER { "StringBuilder" }
     else if ct == CT_PTR { "Ptr" }
     else { "Void" }
 }
@@ -2261,6 +2268,7 @@ pub fn c_type_str(ct: Int) -> Str {
     else if ct == CT_DURATION { "pact_duration" }
     else if ct == CT_PTR { "void*" }
     else if ct == CT_FFI_SCOPE { "pact_list*" }
+    else if ct == CT_STRINGBUILDER { "pact_sb*" }
     else { "void" }
 }
 
@@ -2306,6 +2314,7 @@ pub fn type_from_name(name: Str) -> Int {
         "Instant" => CT_INSTANT
         "Duration" => CT_DURATION
         "Ptr" => CT_PTR
+        "StringBuilder" => CT_STRINGBUILDER
         _ => CT_VOID
     }
 }
@@ -2459,6 +2468,7 @@ pub fn c_type_tag(ct: Int) -> Str {
     else if ct == CT_CHANNEL { "channel" }
     else if ct == CT_MAP { "map" }
     else if ct == CT_BYTES { "bytes" }
+    else if ct == CT_STRINGBUILDER { "stringbuilder" }
     else if ct == CT_PTR { "ptr" }
     else { "void" }
 }
@@ -2763,6 +2773,7 @@ pub fn type_from_name_tag(tag: Str) -> Int {
     else if tag == "channel" { CT_CHANNEL }
     else if tag == "map" { CT_MAP }
     else if tag == "bytes" { CT_BYTES }
+    else if tag == "stringbuilder" { CT_STRINGBUILDER }
     else if tag == "ptr" { CT_PTR }
     else { CT_VOID }
 }

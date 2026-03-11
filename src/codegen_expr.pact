@@ -1309,6 +1309,18 @@ pub fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
             expr_result_type = CT_BYTES
             return
         }
+        if fn_name == "StringBuilder" {
+            let args_sl = np_args.get(node).unwrap()
+            if args_sl != -1 && sublist_length(args_sl) > 0 {
+                emit_expr(sublist_get(args_sl, 0))
+                let cap_str = expr_result_str
+                expr_result_str = "pact_sb_with_capacity({cap_str})"
+            } else {
+                expr_result_str = "pact_sb_new()"
+            }
+            expr_result_type = CT_STRINGBUILDER
+            return
+        }
         if fn_name == "Channel" {
             let args_sl = np_args.get(node).unwrap()
             if args_sl != -1 && sublist_length(args_sl) > 0 {

@@ -400,6 +400,93 @@ PACT_UNUSED static pact_bytes* pact_bytes_from_str(const char* s) {
     return b;
 }
 
+/* ── StringBuilder ──────────────────────────────────────────────────── */
+
+typedef struct {
+    char* data;
+    int64_t len;
+    int64_t cap;
+} pact_sb;
+
+PACT_UNUSED static pact_sb* pact_sb_new(void) {
+    pact_sb* sb = (pact_sb*)pact_alloc(sizeof(pact_sb));
+    sb->cap = 64;
+    sb->len = 0;
+    sb->data = (char*)pact_alloc((size_t)sb->cap);
+    sb->data[0] = '\0';
+    return sb;
+}
+
+PACT_UNUSED static pact_sb* pact_sb_with_capacity(int64_t cap) {
+    if (cap < 16) cap = 16;
+    pact_sb* sb = (pact_sb*)pact_alloc(sizeof(pact_sb));
+    sb->cap = cap;
+    sb->len = 0;
+    sb->data = (char*)pact_alloc((size_t)sb->cap);
+    sb->data[0] = '\0';
+    return sb;
+}
+
+PACT_UNUSED static void pact_sb_write_n(pact_sb* sb, const char* s, int64_t slen) {
+    if (slen == 0) return;
+    int64_t needed = sb->len + slen + 1;
+    if (needed > sb->cap) {
+        int64_t new_cap = sb->cap * 2;
+        while (new_cap < needed) new_cap *= 2;
+        sb->cap = new_cap;
+        sb->data = (char*)realloc(sb->data, (size_t)sb->cap);
+        if (!sb->data) { fprintf(stderr, "pact: out of memory\n"); exit(1); }
+    }
+    memcpy(sb->data + sb->len, s, (size_t)slen);
+    sb->len += slen;
+    sb->data[sb->len] = '\0';
+}
+
+PACT_UNUSED static void pact_sb_write(pact_sb* sb, const char* s) {
+    pact_sb_write_n(sb, s, (int64_t)strlen(s));
+}
+
+PACT_UNUSED static void pact_sb_write_char(pact_sb* sb, const char* ch) {
+    pact_sb_write(sb, ch);
+}
+
+PACT_UNUSED static void pact_sb_write_int(pact_sb* sb, int64_t val) {
+    char buf[32];
+    int len = snprintf(buf, sizeof(buf), "%lld", (long long)val);
+    pact_sb_write_n(sb, buf, (int64_t)len);
+}
+
+PACT_UNUSED static void pact_sb_write_float(pact_sb* sb, double val) {
+    char buf[64];
+    int len = snprintf(buf, sizeof(buf), "%g", val);
+    pact_sb_write_n(sb, buf, (int64_t)len);
+}
+
+PACT_UNUSED static void pact_sb_write_bool(pact_sb* sb, int val) {
+    pact_sb_write(sb, val ? "true" : "false");
+}
+
+PACT_UNUSED static const char* pact_sb_to_str(const pact_sb* sb) {
+    return strdup(sb->data);
+}
+
+PACT_UNUSED static int64_t pact_sb_len(const pact_sb* sb) {
+    return sb->len;
+}
+
+PACT_UNUSED static int64_t pact_sb_capacity(const pact_sb* sb) {
+    return sb->cap;
+}
+
+PACT_UNUSED static void pact_sb_clear(pact_sb* sb) {
+    sb->len = 0;
+    sb->data[0] = '\0';
+}
+
+PACT_UNUSED static int pact_sb_is_empty(const pact_sb* sb) {
+    return sb->len == 0;
+}
+
 PACT_UNUSED static int64_t pact_str_len(const char* s) {
     return (int64_t)strlen(s);
 }
