@@ -1,8 +1,27 @@
 # Pact Language Reference
 
-> Pact is a statically-typed, effect-tracked language compiling to C. Compiler v0.15.0. Language spec v0.3. Self-hosting.
+> Pact is a statically-typed, effect-tracked language compiling to C. Compiler v0.16.0. Language spec v0.3. Self-hosting.
 
-## What's New (v0.15)
+## Recent Breaking Changes (v0.16)
+
+| Change | Before | After |
+|--------|--------|-------|
+| pub visibility enforcement | Non-pub enums/traits/types/let/const accessible across modules | Must be `pub` to use cross-module — compiler now errors on non-pub access |
+| `--trace` renamed | `--trace` | `--pact-trace` (avoids conflicts with user flags) |
+| Path utils → stdlib | `path_join(a, b)` (builtin) | `import std.path` then `path_join(a, b)` |
+
+| Change | Details |
+|--------|---------|
+| StringBuilder type | Compiler-intrinsic: `StringBuilder.new()`, `.write()`, `.write_char()`, `.to_str()`, `.len()`, `.capacity()`, `.clear()`, `.is_empty()` |
+| `std.path` module | `path_join(a, b)`, `path_dirname(path)`, `path_basename(path)` — moved from C builtins to Pact stdlib |
+| `--dump-ast` flag | Dump parsed AST for debugging: `build/pactc --dump-ast file.pact` |
+| Auto-resolve deps | `pact build/run/test/check` auto-resolves dependencies before compilation |
+| Self-bootstrap | Compiler bootstraps from PATH `pact`; checked-in C bootstrap files removed |
+| Quiet test output | `pact test` quiet by default; `--verbose` for detail |
+| O(N²) concat → StringBuilder | Lexer/formatter performance: StringBuilder replaces repeated string concat |
+| Bugfixes | Lockfile not loaded on second build (src/ root), 3,718 compiler warnings eliminated, CT_TAGGED_ENUM leak as Void, nested list type lost in type pool |
+
+### Prior: What's New (v0.15)
 
 | Change | Details |
 |--------|---------|
@@ -13,8 +32,6 @@
 | Vendored C cross-compilation | Compile vendored C source files with cross-compile support; SQLite3 amalgamation bundled |
 | `pact audit` command | FFI audit: inventory `@ffi` calls, audit status, pointer operations |
 | Native dependencies | `pact.toml [native-dependencies]` section for linking C libraries |
-| O(N²) concat → List.join() | Parser performance improvement |
-| Option[Str] refactor | `""` sentinels replaced with `Option[Str]` across compiler for type safety |
 | Bugfixes | `\r` escape bootstrap, comment preservation in type/trait/impl bodies, UnaryOp type inference, TokenKind annotations |
 
 ### Prior: What's New (v0.14)
@@ -292,6 +309,7 @@ test "addition works" {
 | Option[T] | `Some(v)`, `None` | Nullable value |
 | Result[T, E] | `Ok(v)`, `Err(e)` | Error-or-value |
 | Bytes | `Bytes.new()` | Byte buffer |
+| StringBuilder | `StringBuilder.new()` | Mutable string builder |
 | Instant | `time.read()` | Point in time |
 | Ptr[T] | `Ptr[Int]` | Raw pointer (FFI) |
 | Duration | `Duration.ms(100)` | Time span |
@@ -341,9 +359,9 @@ let nested = ##"contains #"inner"#"##   // depth-2 nesting
 | `write_file(path, content)` | Void | Write string to file |
 | `file_exists(path)` | Int | 1 if exists, 0 if not |
 | `is_dir(path)` | Int | 1 if directory |
-| `path_join(a, b)` | Str | Join path components |
-| `path_dirname(path)` | Str | Directory part of path |
-| `path_basename(path)` | Str | Filename part of path |
+| `path_join(a, b)` | Str | Join path components — **moved to `std.path`**, use `import std.path` |
+| `path_dirname(path)` | Str | Directory part of path — **moved to `std.path`** |
+| `path_basename(path)` | Str | Filename part of path — **moved to `std.path`** |
 | `file_mtime(path)` | Int | Modification time (ms) |
 | `get_env(name)` | Option[Str] | Environment variable |
 | `shell_exec(cmd)` | Int | Run shell command, return exit code |
@@ -492,6 +510,19 @@ db.close()                      // close database connection
 | `.concat(other)` | Bytes | Concatenate |
 | `.to_str()` | Result[Str, Str] | Convert to UTF-8 string |
 | `.to_hex()` | Str | Hex encoding |
+
+## StringBuilder Methods
+
+| Method | Returns | Purpose |
+|--------|---------|---------|
+| `StringBuilder.new()` | StringBuilder | Create empty builder |
+| `.write(s)` | Void | Append string |
+| `.write_char(ch)` | Void | Append single character |
+| `.to_str()` | Str | Build final string |
+| `.len()` | Int | Current length |
+| `.capacity()` | Int | Allocated capacity |
+| `.clear()` | Void | Reset to empty |
+| `.is_empty()` | Bool | Check if empty |
 
 ## Option[T] Methods
 
@@ -680,6 +711,7 @@ if result.exit_code == 0 {
 | `std.args` | CLI argument parsing (flags, options, commands) | `import std.args` |
 | `std.http` | HTTP client and server | `import std.http` |
 | `std.json` | JSON parser and serializer | `import std.json` |
+| `std.path` | Path utilities: `path_join(a, b)`, `path_dirname(path)`, `path_basename(path)` | `import std.path` |
 | `std.semver` | Semantic version parsing and constraints | `import std.semver` |
 | `std.toml` | TOML parser | `import std.toml` |
 

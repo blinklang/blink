@@ -4,7 +4,20 @@
 
 Language spec v0.3. Self-hosting compiler. Targets native binaries via C codegen.
 
-## What's New (v0.15)
+## Recent Breaking Changes (v0.16)
+
+- **pub visibility enforcement** — enum variants, trait names, type references, and `let`/`const` bindings must be `pub` to use across modules. Existing cross-module references to non-pub items will now error.
+- **`--trace` → `--pact-trace`** — compiler phase tracing flag renamed to avoid conflicts
+- **`std.path` module** — `path_join`, `path_dirname`, `path_basename` moved from C builtins to `import std.path` (stdlib). Old builtin calls still work but prefer the import.
+- **StringBuilder type** — new compiler-intrinsic `StringBuilder` with `new()`, `write()`, `write_char()`, `to_str()`, `len()`, `capacity()`, `clear()`, `is_empty()`
+- **`--dump-ast` flag** — dump parsed AST for debugging
+- **Auto-resolve deps** — `pact build/run/test/check` now auto-resolves dependencies (no manual `pact update` needed)
+- **Self-bootstrap** — compiler bootstraps from PATH `pact`; no checked-in C bootstrap files
+- **Quiet test output** — `pact test` is quiet by default; use `--verbose` for detail
+- **Perf: O(N²) concat → StringBuilder** — lexer/formatter performance improvement
+- **Bugfixes** — lockfile not loaded on second build, 3,718 compiler warnings eliminated, CT_TAGGED_ENUM leak as Void, nested list element type lost in type pool
+
+### Prior: What's New (v0.15)
 
 - **FFI system** — `@ffi("lib", "symbol")` annotation, `@trusted` audit marker, `Ptr[T]` type with methods (deref, addr, write, is_null, to_str, as_cstr), `ffi.scope()` resource management (alloc, cstr, take)
 - **Keyword arguments** — named arguments in function calls: `fn(pos, name: val)`
@@ -14,9 +27,6 @@ Language spec v0.3. Self-hosting compiler. Targets native binaries via C codegen
 - **`pact audit`** — FFI audit command: inventory @ffi calls, audit status, pointer operations
 - **`pact update`** — updates dependencies, lockfile, and stamps `pact-version` in `pact.toml`
 - **Native dependencies** — `pact.toml [native-dependencies]` section for linking C libraries
-- **Interned type node pool** — compiler-internal performance improvement
-- **`""` sentinels → `Option[Str]`** — compiler refactor for type safety
-- **Perf: O(N²) concat → List.join()** — parser performance fix
 - **Bugfixes** — `\r` escape bootstrap, comment preservation in type/trait/impl bodies, UnaryOp type inference, TokenKind type annotations
 
 ### Prior: What's New (v0.14)
@@ -113,7 +123,7 @@ Key facts:
 
 ## Standard Library
 
-`std.args` (CLI parsing), `std.http` (HTTP client/server), `std.json` (JSON), `std.semver` (versions), `std.toml` (TOML).
+`std.args` (CLI parsing), `std.http` (HTTP client/server), `std.json` (JSON), `std.path` (path utilities), `std.semver` (versions), `std.toml` (TOML).
 Run `pact doc --list` to list modules, `pact doc <module>` for details.
 
 ## Docs
