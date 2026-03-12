@@ -664,7 +664,7 @@ pub fn collect_root_imports(program: Int) {
 }
 
 pub fn inject_prelude(src_root: Str, all_programs: List[Int]) ! Lex.Tokenize, Parse, Diag.Report {
-    let prelude_modules = ["std.num", "std.time", "std.str", "std.sb"]
+    let prelude_modules = ["std.num", "std.time", "std.str", "std.sb", "std.bytes"]
     let mut pi = 0
     while pi < prelude_modules.len() {
         let dotted_path = prelude_modules.get(pi).unwrap()

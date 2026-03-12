@@ -548,6 +548,18 @@ fn init_runtime_header_fns() {
     runtime_header_fns.set("pact_sb_capacity", 1)
     runtime_header_fns.set("pact_sb_clear", 1)
     runtime_header_fns.set("pact_sb_is_empty", 1)
+    // runtime_core.h bytes functions
+    runtime_header_fns.set("pact_bytes_new", 1)
+    runtime_header_fns.set("pact_bytes_from_str", 1)
+    runtime_header_fns.set("pact_bytes_push", 1)
+    runtime_header_fns.set("pact_bytes_get", 1)
+    runtime_header_fns.set("pact_bytes_set", 1)
+    runtime_header_fns.set("pact_bytes_len", 1)
+    runtime_header_fns.set("pact_bytes_is_empty", 1)
+    runtime_header_fns.set("pact_bytes_concat", 1)
+    runtime_header_fns.set("pact_bytes_slice", 1)
+    runtime_header_fns.set("pact_bytes_to_str_checked", 1)
+    runtime_header_fns.set("pact_bytes_to_hex", 1)
 }
 
 pub fn is_runtime_header_fn(name: Str) -> Bool {

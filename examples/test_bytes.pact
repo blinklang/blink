@@ -118,3 +118,39 @@ test "invalid utf8 returns Err" {
     bad.push(254)
     assert(bad.to_str().is_err())
 }
+
+test "free function bytes_new and bytes_len" {
+    let b = bytes_new()
+    assert_eq(bytes_len(b), 0)
+    assert_eq(bytes_is_empty(b), 1)
+}
+
+test "free function bytes_push and bytes_get" {
+    let b = bytes_new()
+    bytes_push(b, 72)
+    bytes_push(b, 101)
+    assert_eq(bytes_len(b), 2)
+    assert_eq(bytes_get(b, 0), 72)
+    assert_eq(bytes_get(b, 1), 101)
+}
+
+test "free function bytes_from_str and bytes_to_hex" {
+    let b = bytes_from_str("hello")
+    assert_eq(bytes_len(b), 5)
+    assert_eq(bytes_to_hex(b), "68656c6c6f")
+}
+
+test "free function bytes_set" {
+    let b = bytes_from_str("Hello")
+    bytes_set(b, 0, 104)
+    assert_eq(bytes_get(b, 0), 104)
+}
+
+test "free function bytes_slice and bytes_concat" {
+    let a = bytes_from_str("hello")
+    let b = bytes_from_str("world")
+    let joined = bytes_concat(a, b)
+    assert_eq(bytes_len(joined), 10)
+    let sl = bytes_slice(joined, 0, 5)
+    assert_eq(bytes_len(sl), 5)
+}
