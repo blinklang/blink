@@ -536,6 +536,18 @@ fn init_runtime_header_fns() {
     runtime_header_fns.set("pact_str_replace", 1)
     runtime_header_fns.set("pact_str_index_of", 1)
     runtime_header_fns.set("pact_str_lines", 1)
+    runtime_header_fns.set("pact_sb_new", 1)
+    runtime_header_fns.set("pact_sb_with_capacity", 1)
+    runtime_header_fns.set("pact_sb_write", 1)
+    runtime_header_fns.set("pact_sb_write_char", 1)
+    runtime_header_fns.set("pact_sb_write_int", 1)
+    runtime_header_fns.set("pact_sb_write_float", 1)
+    runtime_header_fns.set("pact_sb_write_bool", 1)
+    runtime_header_fns.set("pact_sb_to_str", 1)
+    runtime_header_fns.set("pact_sb_len", 1)
+    runtime_header_fns.set("pact_sb_capacity", 1)
+    runtime_header_fns.set("pact_sb_clear", 1)
+    runtime_header_fns.set("pact_sb_is_empty", 1)
 }
 
 pub fn is_runtime_header_fn(name: Str) -> Bool {
