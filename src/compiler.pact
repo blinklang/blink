@@ -247,7 +247,9 @@ fn resolve_from_lockfile(dotted_path: Str, _src_root: Str) -> Option[Str] {
             }
             i = i + 1
         }
+        let mut commit_hash = ""
         if hash_pos > 0 {
+            commit_hash = url_part.substring(hash_pos + 1, url_part.len() - hash_pos - 1)
             url_part = url_part.substring(0, hash_pos)
         }
         // Convert URL to cache dir name (replace non-alphanumeric with _)
@@ -262,7 +264,7 @@ fn resolve_from_lockfile(dotted_path: Str, _src_root: Str) -> Option[Str] {
             }
             i = i + 1
         }
-        base_dir = path_join(home, path_join(".pact/cache/git", path_join(cache_name, "checkout")))
+        base_dir = path_join(home, path_join(".pact/cache/git", path_join(cache_name, commit_hash)))
     }
 
     if base_dir == "" {
