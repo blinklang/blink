@@ -298,6 +298,57 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
         return
     }
 
+    // io.read_line() — read one line from stdin
+    if np_kind.get(obj_node).unwrap() == NodeKind.Ident && np_name.get(obj_node).unwrap() == "io" && method == "read_line" {
+        let tmp = fresh_temp("_rline_")
+        emit_line("const char* {tmp} = pact_stdin_read_line();")
+        expr_result_str = tmp
+        expr_result_type = CT_STRING
+        return
+    }
+
+    // io.read_bytes(n) — read exactly n bytes from stdin, returns Bytes
+    if np_kind.get(obj_node).unwrap() == NodeKind.Ident && np_name.get(obj_node).unwrap() == "io" && method == "read_bytes" {
+        let args_sl = np_args.get(node).unwrap()
+        if args_sl != -1 && sublist_length(args_sl) > 0 {
+            emit_expr(sublist_get(args_sl, 0))
+            let n_str = expr_result_str
+            let tmp = fresh_temp("_rbytes_")
+            emit_line("pact_bytes* {tmp} = pact_stdin_read_bytes({n_str});")
+            expr_result_str = tmp
+        } else {
+            expr_result_str = "pact_bytes_new()"
+        }
+        expr_result_type = CT_BYTES
+        return
+    }
+
+    // io.write(s) — write string to stdout with immediate flush
+    if np_kind.get(obj_node).unwrap() == NodeKind.Ident && np_name.get(obj_node).unwrap() == "io" && method == "write" {
+        let args_sl = np_args.get(node).unwrap()
+        if args_sl != -1 && sublist_length(args_sl) > 0 {
+            emit_expr(sublist_get(args_sl, 0))
+            let arg_str = expr_result_str
+            emit_line("pact_stdout_write({arg_str});")
+        }
+        expr_result_str = "0"
+        expr_result_type = CT_VOID
+        return
+    }
+
+    // io.write_bytes(b) — write bytes to stdout with immediate flush
+    if np_kind.get(obj_node).unwrap() == NodeKind.Ident && np_name.get(obj_node).unwrap() == "io" && method == "write_bytes" {
+        let args_sl = np_args.get(node).unwrap()
+        if args_sl != -1 && sublist_length(args_sl) > 0 {
+            emit_expr(sublist_get(args_sl, 0))
+            let arg_str = expr_result_str
+            emit_line("pact_stdout_write_bytes({arg_str});")
+        }
+        expr_result_str = "0"
+        expr_result_type = CT_VOID
+        return
+    }
+
     // time.read() — returns Instant via Time vtable (convert from pact_instant_struct)
     if np_kind.get(obj_node).unwrap() == NodeKind.Ident && np_name.get(obj_node).unwrap() == "time" && method == "read" {
         expr_result_str = "(pact_Instant)\{.nanos = __pact_ctx.time->read().nanos}"

@@ -1228,6 +1228,8 @@ pub fn is_builtin_method(name: Str) -> Int {
     if name == "accept" { return 1 }
     if name == "read_line" { return 1 }
     if name == "read_n" { return 1 }
+    if name == "read_bytes" { return 1 }
+    if name == "write_bytes" { return 1 }
     if name == "write_line" { return 1 }
     if name == "close" { return 1 }
     if name == "post" { return 1 }

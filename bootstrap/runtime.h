@@ -12,5 +12,6 @@
 #include "runtime_http.h"
 #include "runtime_test.h"
 #include "runtime_sqlite.h"
+#include "runtime_stdio.h"
 
 #endif /* PACT_RUNTIME_H */
