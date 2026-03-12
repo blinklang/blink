@@ -44,6 +44,8 @@ pub let mut si_sym_intent: List[Str] = []
 pub let mut si_sym_requires: List[Str] = []
 pub let mut si_sym_ensures: List[Str] = []
 pub let mut si_sym_end_line: List[Int] = []
+pub let mut si_sym_col: List[Int] = []
+pub let mut si_sym_end_col: List[Int] = []
 
 pub let mut si_sym_count: Int = 0
 
@@ -119,13 +121,14 @@ fn extract_annotation_args(node: Int, ann_name: Str) -> Str {
     result
 }
 
-fn add_symbol(name: Str, kind: Int, module: Str, file: Str, line: Int, vis: Int, effects: Str, sig: Str, ret_type: Str, param_types: Str) -> Int {
+fn add_symbol(name: Str, kind: Int, module: Str, file: Str, line: Int, col: Int, vis: Int, effects: Str, sig: Str, ret_type: Str, param_types: Str) -> Int {
     let idx = si_sym_count
     si_sym_name.push(name)
     si_sym_kind.push(kind)
     si_sym_module.push(module)
     si_sym_file.push(file)
     si_sym_line.push(line)
+    si_sym_col.push(col)
     si_sym_vis.push(vis)
     si_sym_effects.push(effects)
     si_sym_sig.push(sig)
@@ -462,13 +465,14 @@ pub fn si_build(program: Int, file_path: Str, module_name: Str) {
             let ptypes = collect_param_types(fn_node)
             let effs = collect_effects(fn_node)
             let sig = name.concat("(").concat(ptypes).concat(") -> ").concat(ret)
-            add_symbol(name, SK_FN, module_name, file_path, np_line.get(fn_node).unwrap(), vis, effs, sig, ret, ptypes)
+            add_symbol(name, SK_FN, module_name, file_path, np_line.get(fn_node).unwrap(), np_col.get(fn_node).unwrap(), vis, effs, sig, ret, ptypes)
             let fn_doc = np_doc_comment.get(fn_node).unwrap()
             si_sym_doc.push(fn_doc)
             si_sym_intent.push(extract_intent(fn_doc))
             si_sym_requires.push(extract_annotation_args(fn_node, "requires"))
             si_sym_ensures.push(extract_annotation_args(fn_node, "ensures"))
             si_sym_end_line.push(np_end_line.get(fn_node).unwrap())
+            si_sym_end_col.push(np_end_col.get(fn_node).unwrap())
             i = i + 1
         }
     }
@@ -483,13 +487,14 @@ pub fn si_build(program: Int, file_path: Str, module_name: Str) {
             let vis = if np_is_pub.get(type_node).unwrap() != 0 { VIS_PUB } else { VIS_PRIVATE }
             let kind = np_kind.get(type_node).unwrap()
             let sym_kind = if kind == NodeKind.TypeDef { SK_STRUCT } else { SK_ENUM }
-            add_symbol(name, sym_kind, module_name, file_path, np_line.get(type_node).unwrap(), vis, "", "", "", "")
+            add_symbol(name, sym_kind, module_name, file_path, np_line.get(type_node).unwrap(), np_col.get(type_node).unwrap(), vis, "", "", "", "")
             let type_doc = np_doc_comment.get(type_node).unwrap()
             si_sym_doc.push(type_doc)
             si_sym_intent.push(extract_intent(type_doc))
             si_sym_requires.push("")
             si_sym_ensures.push("")
             si_sym_end_line.push(np_end_line.get(type_node).unwrap())
+            si_sym_end_col.push(np_end_col.get(type_node).unwrap())
             i = i + 1
         }
     }
@@ -502,13 +507,14 @@ pub fn si_build(program: Int, file_path: Str, module_name: Str) {
             let trait_node = sublist_get(traits_sl, i)
             let name = np_name.get(trait_node).unwrap()
             let vis = if np_is_pub.get(trait_node).unwrap() != 0 { VIS_PUB } else { VIS_PRIVATE }
-            add_symbol(name, SK_TRAIT, module_name, file_path, np_line.get(trait_node).unwrap(), vis, "", "", "", "")
+            add_symbol(name, SK_TRAIT, module_name, file_path, np_line.get(trait_node).unwrap(), np_col.get(trait_node).unwrap(), vis, "", "", "", "")
             let trait_doc = np_doc_comment.get(trait_node).unwrap()
             si_sym_doc.push(trait_doc)
             si_sym_intent.push(extract_intent(trait_doc))
             si_sym_requires.push("")
             si_sym_ensures.push("")
             si_sym_end_line.push(np_end_line.get(trait_node).unwrap())
+            si_sym_end_col.push(np_end_col.get(trait_node).unwrap())
             i = i + 1
         }
     }
@@ -522,13 +528,14 @@ pub fn si_build(program: Int, file_path: Str, module_name: Str) {
             if np_kind.get(let_node).unwrap() == NodeKind.LetBinding {
                 let name = np_name.get(let_node).unwrap()
                 let vis = if np_is_pub.get(let_node).unwrap() != 0 { VIS_PUB } else { VIS_PRIVATE }
-                add_symbol(name, SK_LET, module_name, file_path, np_line.get(let_node).unwrap(), vis, "", "", "", "")
+                add_symbol(name, SK_LET, module_name, file_path, np_line.get(let_node).unwrap(), np_col.get(let_node).unwrap(), vis, "", "", "", "")
                 let let_doc = np_doc_comment.get(let_node).unwrap()
                 si_sym_doc.push(let_doc)
                 si_sym_intent.push(extract_intent(let_doc))
                 si_sym_requires.push("")
                 si_sym_ensures.push("")
                 si_sym_end_line.push(np_line.get(let_node).unwrap())
+                si_sym_end_col.push(np_end_col.get(let_node).unwrap())
             }
             i = i + 1
         }
@@ -620,6 +627,8 @@ pub fn si_reset() {
     si_sym_requires = []
     si_sym_ensures = []
     si_sym_end_line = []
+    si_sym_col = []
+    si_sym_end_col = []
     si_sym_count = 0
 
     si_dep_from = []
@@ -659,4 +668,29 @@ pub fn dep_kind_name(kind: Int) -> Str {
     if kind == DK_USES_TYPE { return "uses_type" }
     if kind == DK_FIELD_ACCESS { return "field_access" }
     "unknown"
+}
+
+pub fn si_symbol_at(file: Str, line: Int, col: Int) -> Int {
+    let syms = si_file_symbols(file)
+    let mut best = -1
+    let mut best_size = 999999
+    let mut i = 0
+    while i < syms.len() {
+        let idx = syms.get(i).unwrap()
+        let sym_line = si_sym_line.get(idx).unwrap()
+        let sym_col = si_sym_col.get(idx).unwrap()
+        let sym_end_line = si_sym_end_line.get(idx).unwrap()
+        let sym_end_col = si_sym_end_col.get(idx).unwrap()
+        let after_start = if line > sym_line { 1 } else if line == sym_line && col >= sym_col { 1 } else { 0 }
+        let before_end = if line < sym_end_line { 1 } else if line == sym_end_line && col <= sym_end_col { 1 } else { 0 }
+        if after_start != 0 && before_end != 0 {
+            let size = (sym_end_line - sym_line) * 1000 + (sym_end_col - sym_col)
+            if size < best_size {
+                best = idx
+                best_size = size
+            }
+        }
+        i = i + 1
+    }
+    best
 }

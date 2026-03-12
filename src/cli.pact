@@ -18,6 +18,7 @@ import query
 import diagnostics
 import daemon
 import docgen
+import lsp
 
 let pact_cli_version: Str = "dev"
 let mut lint_cache_mtime: Int = -1
@@ -2059,6 +2060,10 @@ fn cmd_update(p: ArgParser, a: Args) {
     }
 }
 
+fn cmd_lsp(p: ArgParser, a: Args) ! IO {
+    lsp_start()
+}
+
 fn cmd_explain(p: ArgParser, a: Args) {
     let code = args_positional(a, 0)
     if code == "" {
@@ -2200,6 +2205,7 @@ fn main() {
     p = add_command(p, "doc", "Print module documentation")
     p = add_command(p, "llms", "Print LLM language reference to stdout")
     p = add_command(p, "explain", "Explain an error or warning code")
+    p = add_command(p, "lsp", "Start Language Server Protocol server")
     p = command_add_positional(p, "explain", "code", "Error code (e.g. E0500)")
 
     p = command_add_positional(p, "build", "file", "Source file to compile")
@@ -2333,6 +2339,8 @@ fn main() {
         cmd_explain(p, a)
     } else if command == "ast" {
         cmd_ast(p, a)
+    } else if command == "lsp" {
+        cmd_lsp(p, a)
     } else {
         io.println("error: unknown command '{command}'")
         io.println(generate_help(p))

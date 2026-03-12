@@ -112,6 +112,14 @@ fn symbol_to_json(idx: Int) -> Str {
     if el > 0 {
         json_set(obj, "end_line", json_new_int(el))
     }
+    let scol = si_sym_col.get(idx).unwrap()
+    if scol > 0 {
+        json_set(obj, "col", json_new_int(scol))
+    }
+    let ecol = si_sym_end_col.get(idx).unwrap()
+    if ecol > 0 {
+        json_set(obj, "end_col", json_new_int(ecol))
+    }
     json_encode(obj)
 }
 
@@ -381,6 +389,14 @@ fn symbol_to_full_json(idx: Int) -> Str {
             }
         }
     }
+    let full_scol = si_sym_col.get(idx).unwrap()
+    if full_scol > 0 {
+        json_set(obj, "col", json_new_int(full_scol))
+    }
+    let full_ecol = si_sym_end_col.get(idx).unwrap()
+    if full_ecol > 0 {
+        json_set(obj, "end_col", json_new_int(full_ecol))
+    }
     json_encode(obj)
 }
 
@@ -562,6 +578,14 @@ fn qr_get(key: Str) -> Str {
 //   {"type":"pub_pure"}
 //   {"type":"fn","name":"foo"}
 
+pub fn query_at_position(file: Str, line: Int, col: Int) -> Str {
+    let idx = si_symbol_at(file, line, col)
+    if idx < 0 {
+        return wrap_results("")
+    }
+    wrap_results(symbol_to_json(idx))
+}
+
 pub fn query_dispatch(request: Str) -> Str {
     if qr_parse_request(request) == 0 {
         return "\{\"error\":\"invalid JSON request\"}"
@@ -598,6 +622,16 @@ pub fn query_dispatch(request: Str) -> Str {
             return "\{\"error\":\"missing 'name' field for fn query\"}"
         }
         return query_by_name(name)
+    }
+
+    if qtype == "at_position" {
+        let file = qr_get("file")
+        let line_str = qr_get("line")
+        let col_str = qr_get("col")
+        if file == "" || line_str == "" || col_str == "" {
+            return "\{\"error\":\"missing file, line, or col for at_position query\"}"
+        }
+        return query_at_position(file, parse_int(line_str), parse_int(col_str))
     }
 
     "\{\"error\":\"unknown query type: {qtype}\"}"
