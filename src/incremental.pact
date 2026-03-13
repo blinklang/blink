@@ -130,6 +130,19 @@ pub fn inc_needs_recheck(sym_idx: Int) -> Int {
     affected_map.has("{sym_idx}")
 }
 
+// ── Collect affected symbol names ─────────────────────────────────────
+
+pub fn inc_affected_names() -> List[Str] {
+    let mut names: List[Str] = []
+    let mut i = 0
+    while i < inc_affected_count {
+        let sym_idx = inc_affected.get(i).unwrap()
+        names.push(si_sym_name.get(sym_idx).unwrap())
+        i = i + 1
+    }
+    names
+}
+
 // ── Reset all incremental state ──────────────────────────────────────
 
 pub fn inc_reset() {

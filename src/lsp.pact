@@ -6,8 +6,12 @@ import parser
 import typecheck
 import symbol_index
 import tokens
+import file_watcher
+import incremental
 
 let mut lsp_running: Int = 0
+let mut lsp_initialized: Int = 0
+let mut lsp_source_path: Str = ""
 
 pub fn lsp_parse_content_length(line: Str) -> Int {
     if line.starts_with("Content-Length: ") != 0 {
@@ -132,8 +136,7 @@ fn lsp_build_diagnostics_json(uri: Str) -> Str {
     sb.to_str()
 }
 
-fn lsp_check_and_publish(uri: Str, file_path: Str) ! IO, Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
-    io.eprintln("pact-lsp: checking {file_path}")
+fn lsp_compile_and_build(file_path: Str) -> Int ! IO, Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
     reset_compiler_state()
     diag_reset()
     diag_source_file = file_path
@@ -154,16 +157,67 @@ fn lsp_check_and_publish(uri: Str, file_path: Str) ! IO, Lex.Tokenize, Parse, Pa
     if imported_programs.len() > 0 {
         final_program = merge_programs(program, imported_programs, import_map_nodes)
     }
+    final_program
+}
+
+fn lsp_publish_diagnostics(uri: Str) ! IO {
+    let params = lsp_build_diagnostics_json(uri)
+    lsp_send_notification("textDocument/publishDiagnostics", params)
+    io.eprintln("pact-lsp: published {diag_severity.len()} diagnostic(s)")
+}
+
+fn lsp_full_check(uri: Str, file_path: Str) ! IO, Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    io.eprintln("pact-lsp: full check {file_path}")
+    let final_program = lsp_compile_and_build(file_path)
 
     check_types(final_program)
     check_unused_imports()
 
     si_reset()
     si_build(final_program, file_path, "main")
+    fw_init()
+    inc_snapshot()
 
-    let params = lsp_build_diagnostics_json(uri)
-    lsp_send_notification("textDocument/publishDiagnostics", params)
-    io.eprintln("pact-lsp: published {diag_severity.len()} diagnostic(s)")
+    lsp_initialized = 1
+    lsp_source_path = file_path
+
+    lsp_publish_diagnostics(uri)
+}
+
+@allow(UnrestoredMutation, IncompleteStateRestore)
+fn lsp_incremental_check(uri: Str, file_path: Str) ! IO, Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    inc_detect_changes()
+    inc_compute_affected()
+
+    if inc_affected_count == 0 {
+        io.eprintln("pact-lsp: no affected symbols, skipping recheck")
+        lsp_publish_diagnostics(uri)
+        return
+    }
+
+    let affected_names = inc_affected_names()
+
+    io.eprintln("pact-lsp: incremental check ({inc_affected_count} affected)")
+    let final_program = lsp_compile_and_build(file_path)
+
+    tc_set_incremental_filter(affected_names)
+    check_types(final_program)
+    tc_clear_incremental_filter()
+
+    si_reset()
+    si_build(final_program, file_path, "main")
+    inc_snapshot()
+    fw_clear_dirty()
+
+    lsp_publish_diagnostics(uri)
+}
+
+fn lsp_check_and_publish(uri: Str, file_path: Str) ! IO, Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    if lsp_initialized == 0 {
+        lsp_full_check(uri, file_path)
+    } else {
+        lsp_incremental_check(uri, file_path)
+    }
 }
 
 fn lsp_extract_document_uri(root: Int) -> Str {
@@ -194,6 +248,13 @@ fn lsp_handle_did_close(root: Int) ! IO {
     let uri = lsp_extract_document_uri(root)
     if uri == "" {
         return
+    }
+    let file_path = lsp_uri_to_path(uri)
+    if file_path == lsp_source_path {
+        lsp_initialized = 0
+        fw_reset()
+        inc_reset()
+        si_reset()
     }
     let params = "\{\"uri\":\"{uri}\",\"diagnostics\":[]\}"
     lsp_send_notification("textDocument/publishDiagnostics", params)

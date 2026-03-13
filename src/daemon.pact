@@ -222,14 +222,7 @@ fn daemon_handle_check() -> Str ! Daemon.Serve, Lex.Tokenize, Parse, TypeCheck, 
     inc_detect_changes()
     inc_compute_affected()
 
-    // Build incremental filter from affected symbols
-    let mut affected_names: List[Str] = []
-    let mut i = 0
-    while i < inc_affected_count {
-        let sym_idx = inc_affected.get(i).unwrap()
-        affected_names.push(si_sym_name.get(sym_idx).unwrap())
-        i = i + 1
-    }
+    let affected_names = inc_affected_names()
 
     // Re-read and re-parse the source
     diag_reset()

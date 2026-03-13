@@ -181,3 +181,36 @@ test "lsp definition returns null for non-identifier" {
     assert(lsp_last_out.contains("\"id\":3"))
     assert(lsp_last_out.contains("null"))
 }
+
+test "lsp didSave after didOpen uses incremental check" {
+    write_file(".tmp/lsp_test_inc.pact", "fn foo() \{\n    io.println(\"v1\")\n\}\n\nfn main() \{\n    foo()\n\}\n")
+
+    let init = lsp_msg("\{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":\{\"capabilities\":\{\}\}\}")
+    let initialized = lsp_msg("\{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":\{\}\}")
+    let didopen = lsp_msg("\{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":\{\"textDocument\":\{\"uri\":\"file://.tmp/lsp_test_inc.pact\",\"languageId\":\"pact\",\"version\":1,\"text\":\"\"\}\}\}")
+    let didsave = lsp_msg("\{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didSave\",\"params\":\{\"textDocument\":\{\"uri\":\"file://.tmp/lsp_test_inc.pact\"\}\}\}")
+    let shutdown = lsp_msg("\{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"shutdown\",\"params\":null\}")
+    let exit_msg = lsp_msg("\{\"jsonrpc\":\"2.0\",\"method\":\"exit\",\"params\":\{\}\}")
+    let input = init.concat(initialized).concat(didopen).concat(didsave).concat(shutdown).concat(exit_msg)
+
+    lsp_run_session(input)
+    assert(lsp_last_err.contains("full check"))
+    assert(lsp_last_err.contains("incremental") || lsp_last_err.contains("no affected symbols"))
+}
+
+test "lsp didClose then didOpen does full recompile" {
+    write_file(".tmp/lsp_test_reset.pact", "fn main() \{\n    io.println(\"hi\")\n\}\n")
+
+    let init = lsp_msg("\{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":\{\"capabilities\":\{\}\}\}")
+    let initialized = lsp_msg("\{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":\{\}\}")
+    let didopen1 = lsp_msg("\{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":\{\"textDocument\":\{\"uri\":\"file://.tmp/lsp_test_reset.pact\",\"languageId\":\"pact\",\"version\":1,\"text\":\"\"\}\}\}")
+    let didclose = lsp_msg("\{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didClose\",\"params\":\{\"textDocument\":\{\"uri\":\"file://.tmp/lsp_test_reset.pact\"\}\}\}")
+    let didopen2 = lsp_msg("\{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":\{\"textDocument\":\{\"uri\":\"file://.tmp/lsp_test_reset.pact\",\"languageId\":\"pact\",\"version\":2,\"text\":\"\"\}\}\}")
+    let shutdown = lsp_msg("\{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"shutdown\",\"params\":null\}")
+    let exit_msg = lsp_msg("\{\"jsonrpc\":\"2.0\",\"method\":\"exit\",\"params\":\{\}\}")
+    let input = init.concat(initialized).concat(didopen1).concat(didclose).concat(didopen2).concat(shutdown).concat(exit_msg)
+
+    lsp_run_session(input)
+    let parts = lsp_last_err.split("full check")
+    assert(parts.len() >= 3)
+}
