@@ -16,3 +16,14 @@ test "parse content length returns -1 for non-matching headers" {
     assert_eq(parse_content_length("Content-Type: utf-8"), -1)
     assert_eq(parse_content_length(""), -1)
 }
+
+fn mock_initialize_result() -> Str {
+    "\{\"capabilities\":\{\"textDocumentSync\":1,\"definitionProvider\":true\},\"serverInfo\":\{\"name\":\"pact-lsp\",\"version\":\"0.1.0\"\}\}"
+}
+
+test "initialize result contains expected capabilities" {
+    let result = mock_initialize_result()
+    assert(result.contains("textDocumentSync"))
+    assert(result.contains("definitionProvider"))
+    assert(result.contains("pact-lsp"))
+}

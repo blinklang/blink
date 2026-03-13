@@ -60,7 +60,7 @@ fn lsp_send_error_int(id: Int, code: Int, message: Str) ! IO {
 }
 
 fn lsp_handle_initialize() -> Str {
-    "\{\"capabilities\":\{\}\}"
+    "\{\"capabilities\":\{\"textDocumentSync\":1,\"definitionProvider\":true\},\"serverInfo\":\{\"name\":\"pact-lsp\",\"version\":\"0.1.0\"\}\}"
 }
 
 fn lsp_handle_shutdown() -> Str {
