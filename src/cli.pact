@@ -423,6 +423,11 @@ fn run_cc(args: Str, debug_mode: Int, release_mode: Int, target: Str) -> Int {
 }
 
 fn compile_vendored_source(c_path: Str, o_path: Str, debug_mode: Int, release_mode: Int, target: Str) -> Int {
+    let src_mt = file_mtime(c_path)
+    let obj_mt = file_mtime(o_path)
+    if obj_mt >= src_mt && src_mt != -1 {
+        return 0
+    }
     let rc = run_cc("-c -o {o_path} {c_path}", debug_mode, release_mode, target)
     if rc != 0 {
         io.println("error: compiling vendored source {c_path} failed")
