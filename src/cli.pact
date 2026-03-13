@@ -1,4 +1,3 @@
-import ast
 import std.args
 import std.path
 import pkg.audit
@@ -10,7 +9,6 @@ import parser
 import typecheck
 import compiler
 import codegen
-import codegen_types
 import formatter
 import mutation_analysis
 import symbol_index
@@ -1147,7 +1145,7 @@ fn cmd_run(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Repor
     process_exec(output_path, rest)
 }
 
-fn cmd_test(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen {
+fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen {
     let source_path = args_positional(a, 0)
     let json_output = if args_has(a, "json") { 1 } else { 0 }
     let verbose = if args_has(a, "verbose") { 1 } else { 0 }
@@ -1467,7 +1465,7 @@ fn cmd_check(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
     }
 }
 
-fn cmd_audit(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report {
+fn cmd_audit(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report {
     let source_path = args_positional(a, 0)
     let baseline_path = args_get(a, "baseline")
     let json_output = if args_has(a, "json") { 1 } else { 0 }
@@ -1521,7 +1519,7 @@ fn cmd_audit(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
     }
 }
 
-fn cmd_fmt(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen {
+fn cmd_fmt(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen {
     let source_path = args_positional(a, 0)
     let json_output = if args_has(a, "json") { 1 } else { 0 }
     let check_flag = if args_has(a, "check") { 1 } else { 0 }
@@ -1677,7 +1675,7 @@ fn cmd_fmt(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Repor
     }
 }
 
-fn cmd_init(p: ArgParser, a: Args) {
+fn cmd_init(_p: ArgParser, a: Args) {
     let source_path = args_positional(a, 0)
     let project_name = if source_path != "" {
         source_path
@@ -1770,7 +1768,7 @@ fn cmd_init(p: ArgParser, a: Args) {
     }
 }
 
-fn cmd_llms(p: ArgParser, a: Args) {
+fn cmd_llms(_p: ArgParser, a: Args) {
     let full_flag = if args_has(a, "full") { 1 } else { 0 }
     let list_flag = if args_has(a, "list") { 1 } else { 0 }
     let topic_flag = args_get(a, "topic")
@@ -1819,7 +1817,7 @@ fn cmd_llms(p: ArgParser, a: Args) {
     }
 }
 
-fn cmd_doc(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Diag.Report {
+fn cmd_doc(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Diag.Report {
     let list_flag = if args_has(a, "list") { 1 } else { 0 }
     let json_output = if args_has(a, "json") { 1 } else { 0 }
     if list_flag == 1 {
@@ -1939,7 +1937,7 @@ fn cmd_query(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Diag.Report {
     }
 }
 
-fn cmd_add(p: ArgParser, a: Args) {
+fn cmd_add(_p: ArgParser, a: Args) {
     let source_path = args_positional(a, 0)
     if source_path == "" {
         io.println("error: pact add requires a package name")
@@ -1993,7 +1991,7 @@ fn cmd_add(p: ArgParser, a: Args) {
     }
 }
 
-fn cmd_remove(p: ArgParser, a: Args) {
+fn cmd_remove(_p: ArgParser, a: Args) {
     let source_path = args_positional(a, 0)
     if source_path == "" {
         io.println("error: pact remove requires a package name")
@@ -2031,7 +2029,7 @@ fn cmd_remove(p: ArgParser, a: Args) {
     }
 }
 
-fn cmd_update(p: ArgParser, a: Args) {
+fn cmd_update(_p: ArgParser, a: Args) {
     let source_path = args_positional(a, 0)
     if file_exists("pact.toml") == 0 {
         io.println("error: no pact.toml found in current directory")
@@ -2068,11 +2066,11 @@ fn cmd_update(p: ArgParser, a: Args) {
     }
 }
 
-fn cmd_lsp(p: ArgParser, a: Args) ! IO, Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+fn cmd_lsp(_p: ArgParser, _a: Args) ! IO, Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
     lsp_start()
 }
 
-fn cmd_explain(p: ArgParser, a: Args) {
+fn cmd_explain(_p: ArgParser, a: Args) {
     let code = args_positional(a, 0)
     if code == "" {
         io.println("usage: pact explain <code>")
@@ -2133,7 +2131,7 @@ fn cmd_ast(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Repor
     }
 }
 
-fn cmd_daemon_start(p: ArgParser, a: Args) ! Daemon.Serve, Lex.Tokenize, Parse, TypeCheck, Diag.Report {
+fn cmd_daemon_start(_p: ArgParser, a: Args) ! Daemon.Serve, Lex.Tokenize, Parse, TypeCheck, Diag.Report {
     let daemon_source = args_positional(a, 0)
     if daemon_source == "" {
         io.println("error: daemon start requires a source file")
@@ -2150,7 +2148,7 @@ fn cmd_daemon_start(p: ArgParser, a: Args) ! Daemon.Serve, Lex.Tokenize, Parse, 
     daemon_start(actual_root, daemon_source)
 }
 
-fn cmd_daemon_status(p: ArgParser, a: Args) {
+fn cmd_daemon_status(_p: ArgParser, _a: Args) {
     let sock_path = find_daemon_sock()
     if sock_path.is_none() {
         io.println("error: daemon not running (no .pact/daemon.sock found)")
@@ -2168,7 +2166,7 @@ fn cmd_daemon_status(p: ArgParser, a: Args) {
     io.println(response)
 }
 
-fn cmd_daemon_stop(p: ArgParser, a: Args) {
+fn cmd_daemon_stop(_p: ArgParser, _a: Args) {
     let sock_path = find_daemon_sock()
     if sock_path.is_none() {
         io.println("error: daemon not running (no .pact/daemon.sock found)")
@@ -2181,12 +2179,12 @@ fn cmd_daemon_stop(p: ArgParser, a: Args) {
         exit(1)
     }
     socket_write(fd, "\{\"type\":\"stop\"}\n")
-    let response = socket_read_line(fd)
+    let _response = socket_read_line(fd)
     unix_socket_close(fd)
     io.println("Daemon stopped")
 }
 
-fn cmd_daemon_bare(p: ArgParser, a: Args) {
+fn cmd_daemon_bare(p: ArgParser, _a: Args) {
     io.println("error: daemon requires a subcommand: start, status, or stop")
     io.println(generate_command_help(p, "daemon"))
 }

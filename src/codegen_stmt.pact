@@ -762,6 +762,10 @@ pub fn emit_arm_value(body: Int) -> Str ! Codegen.Emit, Codegen.Register, Codege
         emit_expr(np_value.get(body).unwrap())
         return expr_result_str
     }
+    if kind == NodeKind.Assignment || kind == NodeKind.CompoundAssign {
+        emit_stmt(body)
+        return "0"
+    }
     emit_expr(body)
     expr_result_str
 }
@@ -1334,7 +1338,7 @@ pub fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
         emit_line("{ptr_c_type} {cname} = {val_str};")
     } else {
         let ts = c_type_str(val_type)
-        if is_mut != 0 || val_type == CT_STRING || val_type == CT_LIST || val_type == CT_MAP || val_type == CT_BYTES || val_type == CT_CLOSURE || val_type == CT_ITERATOR || val_type == CT_HANDLE || val_type == CT_CHANNEL || val_type == CT_PTR {
+        if is_mut != 0 || val_type == CT_STRING || val_type == CT_LIST || val_type == CT_MAP || val_type == CT_BYTES || val_type == CT_CLOSURE || val_type == CT_ITERATOR || val_type == CT_HANDLE || val_type == CT_CHANNEL || val_type == CT_PTR || val_type == CT_STRINGBUILDER || val_type == CT_FFI_SCOPE {
             emit_line("{ts} {cname} = {val_str};")
         } else {
             emit_line("const {ts} {cname} = {val_str};")

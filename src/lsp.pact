@@ -101,11 +101,16 @@ pub fn lsp_to_zero_based(n: Int) -> Int {
 }
 
 fn lsp_build_diagnostics_json(uri: Str) -> Str {
-    let mut diags = ""
+    let mut sb = StringBuilder.new()
+    let diag_hdr = "\{\"uri\":\""
+    let diag_mid = "\",\"diagnostics\":["
+    sb.write(diag_hdr)
+    sb.write(uri)
+    sb.write(diag_mid)
     let mut i = 0
     while i < diag_severity.len() {
         if i > 0 {
-            diags = diags.concat(",")
+            sb.write(",")
         }
         let sev = lsp_severity(diag_severity.get(i).unwrap())
         let line = lsp_to_zero_based(diag_line.get(i).unwrap())
@@ -116,10 +121,13 @@ fn lsp_build_diagnostics_json(uri: Str) -> Str {
         let end_col = if el > 0 { lsp_to_zero_based(ec) } else { col }
         let code = json_escape(diag_code.get(i).unwrap())
         let msg = json_escape(diag_message.get(i).unwrap())
-        diags = diags.concat("\{\"range\":\{\"start\":\{\"line\":{line},\"character\":{col}\},\"end\":\{\"line\":{end_line},\"character\":{end_col}\}\},\"severity\":{sev},\"code\":\"{code}\",\"source\":\"pact\",\"message\":\"{msg}\"\}")
+        let entry = "\{\"range\":\{\"start\":\{\"line\":{line},\"character\":{col}\},\"end\":\{\"line\":{end_line},\"character\":{end_col}\}\},\"severity\":{sev},\"code\":\"{code}\",\"source\":\"pact\",\"message\":\"{msg}\"\}"
+        sb.write(entry)
         i = i + 1
     }
-    "\{\"uri\":\"{uri}\",\"diagnostics\":[{diags}]\}"
+    let diag_end = "]\}"
+    sb.write(diag_end)
+    sb.to_str()
 }
 
 fn lsp_check_and_publish(uri: Str, file_path: Str) ! IO, Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {

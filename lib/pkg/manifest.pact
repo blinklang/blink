@@ -191,7 +191,6 @@ let mut tmp_dep_names: List[Str] = []
 fn collect_dep_names(prefix: Str) {
     tmp_dep_names = []
     let prefix_dot = prefix.concat(".")
-    let prefix_dot_len = prefix_dot.len()
     let mut i = 0
     while i < toml_keys.len() {
         let key = toml_keys.get(i).unwrap()

@@ -216,7 +216,7 @@ fn expand_caret(major: Int, minor: Int, patch: Int,
 // ── Constraint expansion: tilde ────────────────────────────────────
 
 fn expand_tilde(major: Int, minor: Int, patch: Int,
-                has_minor: Int, has_patch: Int) {
+                has_minor: Int, _has_patch: Int) {
     add_bound(OP_GTE, major, minor, patch)
 
     if has_minor == 1 {
