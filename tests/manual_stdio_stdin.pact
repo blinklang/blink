@@ -1,4 +1,5 @@
-// Manual test — run with: printf 'hello from stdin\nABCDE' | build/test_stdio_stdin
+// xtest — manual stdin test, requires piped input
+// Run with: printf 'hello from stdin\nABCDE' | build/test_stdio_stdin
 
 test "io.read_line reads from stdin" {
     let line = io.read_line()

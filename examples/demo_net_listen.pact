@@ -1,6 +1,6 @@
 // test_net_listen.pact — TCP echo server test (manual testing)
 //
-// Run: bin/pact run examples/test_net_listen.pact
+// Run: bin/pact run tests/test_net_listen.pact
 // Then connect: echo "hello" | nc localhost 9876
 // Or: curl http://localhost:9876/
 //

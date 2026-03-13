@@ -47,7 +47,7 @@ fn test_io_log_fn() ! IO {
 }
 
 fn test_fs_read_fn() ! FS.Read {
-    let content = fs.read("examples/test_effects.pact")
+    let content = fs.read("tests/test_effects.pact")
     let first_two = content.substring(0, 2)
     io.println("fs.read first 2 chars: {first_two}")
 }

@@ -39,11 +39,11 @@ test "IO.Log via stderr" {
 }
 
 test "FS.Read dispatch" {
-    do_fs_read("examples/test_effect_vtable.pact")
+    do_fs_read("tests/test_effect_vtable.pact")
 }
 
 test "multi-effect IO + FS.Read" {
-    io_and_fs("examples/test_effect_vtable.pact")
+    io_and_fs("tests/test_effect_vtable.pact")
 }
 
 test "multi-effect IO + FS + DB" {
@@ -53,6 +53,6 @@ test "multi-effect IO + FS + DB" {
 test "main implicit effects" {
     io.print("main can print ")
     io.println("without declaring effects")
-    fs.read("examples/test_effect_vtable.pact")
+    fs.read("tests/test_effect_vtable.pact")
     io.println("main can fs.read without declaring effects")
 }

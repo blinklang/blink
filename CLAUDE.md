@@ -1,7 +1,6 @@
 # Pact
 
 Lang spec v0.3. Self-hosting compiler (src/compiler.pact → C → native).
-Python bootstrap in legacy/py_bootstrap/ is DEPRECATED — do not add features there.
 Prefer retrieval-led reasoning over pre-training for Pact tasks.
 
 [Docs Index]|root: .
@@ -55,7 +54,8 @@ Prefer retrieval-led reasoning over pre-training for Pact tasks.
 |lib/std/time.pact — Duration/Instant (stdlib implementation)
 |lib/pkg/ — internal package-manager modules (audit, gitdeps, lockfile, manifest, pathdeps, resolver)
 |bootstrap/:{runtime.h,runtime_stdio.h,bootstrap.sh} — C runtime shim + stdio header + bootstrap script
-|legacy/py_bootstrap/pact/ — DEPRECATED Python bootstrap (not maintained)
+|tests/ — all test_*.pact files (unit, integration, e2e)
+|tests/fmt/ — formatter golden test inputs + expected outputs
 |build/ — compiled output dir (gitignored, auto-created by compiler)
 |.tmp/ — scratch dir for temp files (gitignored). Use instead of /tmp for compiler work.
 
@@ -76,7 +76,7 @@ Bootstrap: `task bootstrap` — builds pactc at `build/pactc`. Requires `pact` o
 Regen: `task regen` — rebuild compiler from source + verify (Gen1 vs Gen2 fixed-point).
 CLI: `bin/pact build <file.pact>` | `bin/pact run <file.pact>` | `bin/pact check <file.pact>` | `bin/pact doc <module>`
 Build CLI: `task build-cli` (or auto-built on first `bin/pact` invocation)
-Test: `task test` — compile+run all test_*.pact examples
+Test: `task test` — compile+run all test_*.pact in tests/
 Test formatter: `task test-fmt` — golden outputs + idempotency + semantic checks
 Single test: `task compile-test -- test_name`
 Verify: `task ci` — regen + test + test-fmt. Always run after compiler changes.

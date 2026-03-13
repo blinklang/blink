@@ -1,6 +1,6 @@
 // test_http_live.pact — live HTTP client test (needs network + libcurl)
 //
-// Run: bin/pact run examples/test_http_live.pact
+// Run: bin/pact run tests/test_http_live.pact
 // Requires: network access, libcurl installed
 
 import std.http_types

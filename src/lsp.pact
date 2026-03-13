@@ -38,12 +38,11 @@ fn lsp_read_message() -> Str ! IO {
         return ""
     }
     let bytes = io.read_bytes(cl)
-    let mut body = ""
-    match bytes.to_str() {
-        Ok(s) => body = s
-        Err(_) => body = ""
+    let result = bytes.to_str()
+    match result {
+        Ok(s) => return s
+        Err(_) => return ""
     }
-    body
 }
 
 fn lsp_write_message(body: Str) ! IO {

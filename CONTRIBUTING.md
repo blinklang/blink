@@ -5,7 +5,6 @@ How to work on the Pact interpreter and compiler.
 ## Prerequisites
 
 - A C compiler (gcc or clang)
-- Python 3.12+ and [uv](https://docs.astral.sh/uv/) (only needed for legacy tests)
 
 ## Setup
 
@@ -31,7 +30,7 @@ bootstrap/
   pactc_bootstrap.c         # Checked-in C bootstrap seed
   runtime.h                 # C runtime header
   bootstrap.sh              # Build script
-legacy/py_bootstrap/pact/   # DEPRECATED — not maintained
+tests/                      # All test_*.pact files
 ```
 
 ## Compiling Programs
@@ -54,15 +53,9 @@ task ci       # full CI: regen + test + test-fmt
 ## Tests
 
 ```sh
-task test         # compile+run all test_*.pact examples
+task test         # compile+run all test_*.pact in tests/
 task test-fmt     # formatter golden outputs + idempotency
 task ci           # full verification (regen + test + test-fmt)
-```
-
-Legacy Python tests (deprecated bootstrap only):
-
-```sh
-uv sync && uv run pytest
 ```
 
 ## Architecture
