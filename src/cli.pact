@@ -1,4 +1,5 @@
 import std.args
+import std.json
 import std.path
 import pkg.audit
 import pkg.lockfile
@@ -23,8 +24,8 @@ let mut lint_cache_mtime: Int = -1
 const embedded_llms_full: Str = #embed("../llms-full.md")
 const embedded_llms_short: Str = #embed("../llms.md")
 const embedded_runtime_h: Str = #embed("../build/runtime.h")
-const embedded_upgrade_cmd: Str = #embed("../templates/claude-commands/pact:upgrade.md")
-const embedded_init_cmd: Str = #embed("../templates/claude-commands/pact:init.md")
+const embedded_upgrade_cmd: Str = #embed("../.claude/pact-marketplace/plugins/pact/skills/upgrade/SKILL.md")
+const embedded_init_cmd: Str = #embed("../.claude/pact-marketplace/plugins/pact/skills/init/SKILL.md")
 const embedded_std_args: Str = #embed("../lib/std/args.pact")
 const embedded_pkg_audit: Str = #embed("../lib/pkg/audit.pact")
 const embedded_pkg_gitdeps: Str = #embed("../lib/pkg/gitdeps.pact")
@@ -1683,6 +1684,16 @@ fn cmd_fmt(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Repo
     }
 }
 
+fn json_ensure_object(parent: Int, key: Str) -> Int {
+    let existing = json_get(parent, key)
+    if existing >= 0 {
+        return existing
+    }
+    let obj = json_new_object()
+    json_set(parent, key, obj)
+    obj
+}
+
 fn cmd_init(_p: ArgParser, a: Args) {
     let source_path = args_positional(a, 0)
     let project_name = if source_path != "" {
@@ -1757,17 +1768,55 @@ fn cmd_init(_p: ArgParser, a: Args) {
         io.println("  added Pact reference to {doc_file}")
     }
 
-    shell_exec("mkdir -p .claude/commands")
-    let upgrade_cmd_path = ".claude/commands/pact:upgrade.md"
-    if file_exists(upgrade_cmd_path) == 0 {
-        write_file(upgrade_cmd_path, embedded_upgrade_cmd)
-        io.println("  installed .claude/commands/pact:upgrade.md")
+    // Set up Claude Code plugin (LSP + skills)
+    let pwd = process_run("pwd", []).out.trim()
+    let marketplace_abs = pwd.concat("/.claude/pact-marketplace")
+    shell_exec("mkdir -p .claude/pact-marketplace/.claude-plugin .claude/pact-marketplace/plugins/pact/.claude-plugin .claude/pact-marketplace/plugins/pact/skills/upgrade .claude/pact-marketplace/plugins/pact/skills/init")
+
+    let marketplace_json = "\{\"name\":\"pact-plugins\",\"owner\":\{\"name\":\"Pact\"},\"plugins\":[\{\"name\":\"pact\",\"source\":\"./plugins/pact\",\"description\":\"Pact language support: LSP, skills, and tools\"}]}"
+    write_file(".claude/pact-marketplace/.claude-plugin/marketplace.json", marketplace_json)
+
+    let plugin_json = "\{\"name\":\"pact\",\"description\":\"Pact language support: LSP, skills, and tools\",\"version\":\"1.0.0\"}"
+    write_file(".claude/pact-marketplace/plugins/pact/.claude-plugin/plugin.json", plugin_json)
+
+    let lsp_json = "\{\"pact\":\{\"command\":\"pact\",\"args\":[\"lsp\"],\"extensionToLanguage\":\{\".pact\":\"pact\"}}}"
+    write_file(".claude/pact-marketplace/plugins/pact/.lsp.json", lsp_json)
+
+    write_file(".claude/pact-marketplace/plugins/pact/skills/upgrade/SKILL.md", embedded_upgrade_cmd)
+    write_file(".claude/pact-marketplace/plugins/pact/skills/init/SKILL.md", embedded_init_cmd)
+
+    // Create/update .claude/settings.json with marketplace path
+    let claude_settings = ".claude/settings.json"
+    json_clear()
+    let root = if file_exists(claude_settings) == 1 {
+        let parsed = json_parse(read_file(claude_settings))
+        if parsed < 0 {
+            json_clear()
+            json_new_object()
+        } else {
+            parsed
+        }
+    } else {
+        json_new_object()
     }
-    let init_cmd_path = ".claude/commands/pact:init.md"
-    if file_exists(init_cmd_path) == 0 {
-        write_file(init_cmd_path, embedded_init_cmd)
-        io.println("  installed .claude/commands/pact:init.md")
-    }
+
+    let source_obj = json_new_object()
+    json_set(source_obj, "source", json_new_str("directory"))
+    json_set(source_obj, "path", json_new_str(marketplace_abs))
+
+    let marketplace_entry = json_new_object()
+    json_set(marketplace_entry, "source", source_obj)
+
+    let mkts = json_ensure_object(root, "extraKnownMarketplaces")
+    json_set(mkts, "pact-plugins", marketplace_entry)
+
+    let plugins = json_ensure_object(root, "enabledPlugins")
+    json_set(plugins, "pact@pact-plugins", json_new_bool(1))
+
+    write_file(claude_settings, json_encode(root))
+    io.println("  configured Claude Code plugin (LSP + skills)")
+    io.println("\n  To activate the Pact plugin in Claude Code:")
+    io.println("    /plugin install pact@pact-plugins --scope project")
 
     if already_initialized == 0 {
         io.println("\nProject '{project_name}' initialized. Run: pact run src/main.pact")
@@ -2045,20 +2094,20 @@ fn cmd_update(_p: ArgParser, a: Args) {
     }
 
     stamp_pact_version()
-    let upgrade_cmd_path = ".claude/commands/pact:upgrade.md"
-    if file_exists(upgrade_cmd_path) == 1 {
-        let existing = read_file(upgrade_cmd_path)
+    let upgrade_skill = ".claude/pact-marketplace/plugins/pact/skills/upgrade/SKILL.md"
+    if file_exists(upgrade_skill) == 1 {
+        let existing = read_file(upgrade_skill)
         if existing != embedded_upgrade_cmd {
-            write_file(upgrade_cmd_path, embedded_upgrade_cmd)
-            io.println("updated: {upgrade_cmd_path}")
+            write_file(upgrade_skill, embedded_upgrade_cmd)
+            io.println("updated: pact plugin upgrade skill")
         }
     }
-    let init_cmd_path = ".claude/commands/pact:init.md"
-    if file_exists(init_cmd_path) == 1 {
-        let existing_init = read_file(init_cmd_path)
+    let init_skill = ".claude/pact-marketplace/plugins/pact/skills/init/SKILL.md"
+    if file_exists(init_skill) == 1 {
+        let existing_init = read_file(init_skill)
         if existing_init != embedded_init_cmd {
-            write_file(init_cmd_path, embedded_init_cmd)
-            io.println("updated: {init_cmd_path}")
+            write_file(init_skill, embedded_init_cmd)
+            io.println("updated: pact plugin init skill")
         }
     }
     let resolve_rc = resolve_and_lock(".", pact_cli_version)
