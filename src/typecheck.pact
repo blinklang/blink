@@ -1149,6 +1149,7 @@ pub fn is_builtin_fn(name: Str) -> Int {
     if name == "file_mtime" { return 1 }
     if name == "getpid" { return 1 }
     if name == "process_run" { return 1 }
+    if name == "process_run_with_stdin" { return 1 }
     if name == "process_exec" { return 1 }
     if name == "alloc_ptr" { return 1 }
     if name == "null_ptr" { return 1 }
@@ -1317,6 +1318,7 @@ pub fn get_builtin_fn_ret(name: Str) -> Int {
     if name == "file_mtime" { return TYPE_INT }
     if name == "getpid" { return TYPE_INT }
     if name == "process_run" { return TYPE_VOID }
+    if name == "process_run_with_stdin" { return TYPE_VOID }
     if name == "process_exec" { return TYPE_VOID }
     if name == "Bytes" { return new_type(TK_BYTES, "Bytes") }
     TYPE_UNKNOWN

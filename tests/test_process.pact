@@ -14,4 +14,8 @@ fn main() {
 
     let result5 = process_run("nonexistent_command_xyz", [])
     io.println("not found exit: {result5.exit_code}")
+
+    let result6 = process_run_with_stdin("cat", [], "hello from stdin")
+    io.println("stdin: {result6.out}")
+    io.println("stdin exit: {result6.exit_code}")
 }
