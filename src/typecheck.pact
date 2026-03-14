@@ -2256,6 +2256,14 @@ pub fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.
             if lt != TYPE_UNKNOWN { return lt }
             return rt
         }
+        if op == "??" {
+            let left_k = type_kind(lt)
+            if left_k != TK_OPTION && left_k != TK_UNKNOWN {
+                tc_error_at("'??' operator requires Option value, got {type_to_str(lt)}", node)
+            }
+            if left_k == TK_OPTION { return ty_inner1.get(lt).unwrap() }
+            return rt
+        }
         if lt != TYPE_UNKNOWN { return lt }
         return rt
     }
@@ -2276,14 +2284,6 @@ pub fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.
             let ok = type_kind(operand)
             if ok == TK_OPTION { return ty_inner1.get(operand).unwrap() }
             if ok == TK_RESULT { return ty_inner1.get(operand).unwrap() }
-            return operand
-        }
-        if op == "??" {
-            let operand_k = type_kind(operand)
-            if operand_k != TK_OPTION && operand_k != TK_UNKNOWN {
-                tc_error_at("'??' operator requires Option value, got {type_to_str(operand)}", node)
-            }
-            if operand_k == TK_OPTION { return ty_inner1.get(operand).unwrap() }
             return operand
         }
         return operand
