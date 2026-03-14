@@ -803,6 +803,8 @@ The AI gets structured feedback — result value, type, effects actually perform
 | `pact build` | Compile to native binary |
 | `pact build --target wasm` | Compile to WebAssembly |
 | `pact run` | Compile and execute in one step |
+| `pact run --trace` | Run with full execution tracing (NDJSON to stderr) |
+| `pact run --trace=<filter>` | Run with filtered tracing (see §8.15) |
 | `pact check` | Type-check without codegen (fast) |
 | `pact eval <expr>` | Interpret an expression with full checking |
 | **Query & Inspect** | |
@@ -856,11 +858,119 @@ All commands that produce output accept `--json` for structured JSON output. All
 
 ---
 
-### 8.15 Language Evolution
+### 8.15 Runtime Execution Tracing
+
+The `--trace` flag enables structured runtime tracing of compiled Pact programs. Output is NDJSON (one JSON object per line) to stderr, enabling observation of function calls, state mutations, and effect invocations without modifying source code.
+
+#### 8.15.1 Usage
+
+```sh
+pact run app.pact --trace                              # trace everything
+pact run app.pact --trace=fn:skip_newlines             # single function
+pact run app.pact --trace=module:parser,depth:3        # AND composition
+pact run app.pact --trace=fn:skip_newlines+parse_block # OR within key
+pact run app.pact --trace=effect:FS.Write              # specific effect type
+pact run app.pact --trace=event:state                  # only state events
+```
+
+Trace output goes to stderr. Program stdout is unaffected. Pipe through `jq` for filtering:
+
+```sh
+pact run app.pact --trace 2>trace.ndjson
+cat trace.ndjson | jq 'select(.event == "state" and .var == "pending_comments")'
+```
+
+#### 8.15.2 Event Types
+
+Four event types form a complete and orthogonal basis for execution observation:
+
+| Event | Observes | Description |
+|-------|----------|-------------|
+| `enter` | Function application | Function call with arguments and source location |
+| `exit` | Function return | Return value and wall-time duration |
+| `state` | Store transitions | Mutation of `let mut` bindings |
+| `effect` | Effect operations | Algebraic effect invocations (IO, FS, DB, etc.) |
+
+Program termination events (`panic`, assertion failures) are not trace events — they produce structured diagnostics through the existing error reporting pipeline (§8.6).
+
+#### 8.15.3 Schema
+
+All events share common fields:
+
+| Field | Type | Present | Description |
+|-------|------|---------|-------------|
+| `ts_us` | Int | all | Monotonic microseconds since trace start |
+| `event` | Str | all | `"enter"` \| `"exit"` \| `"state"` \| `"effect"` |
+| `fn` | Str | all | Fully-qualified function name (`module.function`) |
+| `module` | Str | all | Module name |
+| `depth` | Int | all | Call stack depth (0 = top-level) |
+
+Per-event fields:
+
+| Field | Type | Event | Description |
+|-------|------|-------|-------------|
+| `span` | `{file, line, col}` | `enter` | Source location (same shape as diagnostic spans, §8.6) |
+| `args` | `{name: str}` | `enter` | Function arguments as Display strings. Omitted if no args |
+| `duration_us` | Int | `exit` | Wall time in function (microseconds) |
+| `return` | Str | `exit` | Return value as Display string |
+| `var` | Str | `state` | Variable name |
+| `op` | Str | `state` | `"assign"` \| `"push"` \| `"pop"` \| `"insert"` \| `"remove"` |
+| `value` | Str | `state` | New value as Display string (post-mutation) |
+| `effect` | Str | `effect` | Effect type (e.g. `"IO.Print"`, `"FS.Write"`) |
+| `op` | Str | `effect` | Operation name (e.g. `"io.println"`) |
+| `args` | `{name: str}` | `effect` | Operation arguments as Display strings |
+
+Design notes:
+- **`span` appears only on `enter`** — source location is static per function, saving ~40 bytes on other events.
+- **`module` is a separate field** despite being derivable from `fn` — enables O(1) module-level filtering without string splitting.
+- **`duration_us` on `exit`** — computed by the emitter rather than requiring consumers to maintain an enter-timestamp stack.
+- **All values are Display strings** — bounded serialization cost; values longer than 200 characters are truncated with a `"truncated":true` field appended.
+
+#### 8.15.4 Example
+
+A function that enters, mutates state, performs an effect, and exits:
+
+```json
+{"ts_us":18042,"event":"enter","fn":"parser.write_output","module":"parser","depth":3,"span":{"file":"src/parser.pact","line":142,"col":1},"args":{"path":"out.c"}}
+{"ts_us":18044,"event":"state","fn":"parser.write_output","module":"parser","depth":3,"var":"files_written","op":"assign","value":"1"}
+{"ts_us":18045,"event":"effect","fn":"parser.write_output","module":"parser","depth":3,"effect":"FS.Write","op":"fs.write_file","args":{"path":"out.c"}}
+{"ts_us":18048,"event":"exit","fn":"parser.write_output","module":"parser","depth":3,"duration_us":6,"return":"()"}
+```
+
+#### 8.15.5 Filter Syntax
+
+Filters use colon-syntax: `--trace=key:value`. Multiple filters compose with AND (comma-separated). Multiple values for the same key compose with OR (`+` separator).
+
+| Filter | Meaning |
+|--------|---------|
+| `fn:<name>` | Match function name (short or fully-qualified) |
+| `module:<name>` | Match module name |
+| `depth:<n>` | Events at call depth <= N |
+| `event:<type>` | Only emit specified event types |
+| `effect:<name>` | Match effect type (e.g. `FS.Write`) |
+| `state:<var>` | Match state variable name |
+
+Examples:
+
+```sh
+pact run app.pact --trace=module:parser,depth:2          # parser module, depth <= 2
+pact run app.pact --trace=fn:skip_newlines+parse_block   # two functions (OR)
+pact run app.pact --trace=event:state,module:parser      # state events in parser only
+```
+
+Bare `--trace` with no value traces all events. The `PACT_TRACE` environment variable accepts the same filter syntax.
+
+#### 8.15.6 Timestamp Semantics
+
+`ts_us` is a monotonic microsecond counter relative to trace start (not wall-clock time). The clock source is `clock_gettime(CLOCK_MONOTONIC)` on Linux, `mach_absolute_time()` on macOS. Microsecond resolution matches the instrumentation overhead — sub-microsecond precision would measure the tracer, not the program.
+
+---
+
+### 8.16 Language Evolution
 
 Pact evolves without breaking existing programs. The mechanism is **editions** — a per-package declaration that opts into a set of stdlib changes, keyword reservations, and lint severity upgrades. Combined with a rich `@deprecated` annotation and automated migration tooling, editions let the language improve continuously while maintaining infinite backward compatibility.
 
-#### 8.15.1 Editions
+#### 8.16.1 Editions
 
 An edition is a named yearly snapshot of language-surface defaults. Each package declares its edition in `pact.toml`:
 
@@ -884,7 +994,7 @@ edition = "2026"
 
 **How editions interact with dependencies:** The compiler resolves each package's edition independently. If package A (edition 2028) depends on package B (edition 2026), the compiler checks A against 2028 rules and B against 2026 rules. No edition leaks across package boundaries. This is why editions can only gate per-package concerns (stdlib, keywords, lint) — they cannot change type system semantics or effect resolution, which are cross-package.
 
-#### 8.15.2 `@deprecated` Semantics
+#### 8.16.2 `@deprecated` Semantics
 
 The `@deprecated` annotation marks functions, types, and methods for eventual removal. It carries structured metadata enabling automated migration:
 
@@ -942,7 +1052,7 @@ When `fix` is `"replace"` and `replacement` is provided, the compiler emits a ma
 
 The `@deprecated` annotation is the canonical mechanism for all API lifecycle communication — stdlib changes, user library evolution, and cross-package migration all use the same annotation with the same structured diagnostic output. See §11.1 for annotation catalog placement.
 
-#### 8.15.3 `pact migrate`
+#### 8.16.3 `pact migrate`
 
 The `pact migrate` command applies all machine-applicable deprecation fixes and advances the package's edition:
 
@@ -988,7 +1098,7 @@ pact migrate
 
 The `pact migrate` command is idempotent. Running it on a package that is already at the target edition produces no changes.
 
-#### 8.15.4 `pact editions`
+#### 8.16.4 `pact editions`
 
 The `pact editions` command displays a built-in changelog of all editions, compiled directly into the `pact` binary. No network access required — the changelog is always available offline.
 
@@ -1017,7 +1127,7 @@ Edition 2026 (released 2026-06-01)
 
 The changelog is also exposed in the `llms.txt` header (§8.3) as an edition-specific API change summary, giving AI agents immediate awareness of what has changed between the edition a project uses and the current edition.
 
-#### 8.15.5 Edition Cadence
+#### 8.16.5 Edition Cadence
 
 - **At most one edition per year.** Editions are not releases — they are compatibility snapshots. Most years will have zero or one edition.
 - **2+ year deprecation window.** Any item deprecated in edition N cannot have `removal` earlier than edition N+2. This gives downstream consumers at minimum two years to migrate.
@@ -1027,7 +1137,7 @@ The changelog is also exposed in the `llms.txt` header (§8.3) as an edition-spe
 
 ---
 
-### 8.16 Summary
+### 8.17 Summary
 
 The tooling story is not a feature list — it is the thesis of the language:
 

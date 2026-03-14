@@ -68,4 +68,4 @@ Result: **Yes**, 3-2.
 4. **Debuggability** — PASS. W2000/E2001 diagnostics include exact spans, replacement names, and machine-applicable fix edits.
 5. **Token Efficiency** — PASS. `pact editions --json` replaces reading external changelogs. `pact migrate --dry-run --json` replaces manual deprecation auditing.
 
-**Resolution:** Edition-gated evolution with rich `@deprecated` (since, removal, replacement, fix fields), `pact migrate` for automated migration, `pact editions` for built-in changelog. Editions scope: stdlib + keywords + lint severity, NOT core syntax. Infinite backward compatibility. Enforced semver deferred to v2. Spec: §8.15, §11.1.
+**Resolution:** Edition-gated evolution with rich `@deprecated` (since, removal, replacement, fix fields), `pact migrate` for automated migration, `pact editions` for built-in changelog. Editions scope: stdlib + keywords + lint severity, NOT core syntax. Infinite backward compatibility. Enforced semver deferred to v2. Spec: §8.16, §11.1.

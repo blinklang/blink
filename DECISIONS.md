@@ -278,6 +278,11 @@ Decided by expert panel vote. See [OPEN_QUESTIONS.md](OPEN_QUESTIONS.md) for ful
 | Compiler type representation: interning | Full interning via Map — type equality is integer comparison | 5-0 |
 | StringBuilder API | `StringBuilder` struct with `with_capacity`, Tier 1 (`std.str`), import required. Interpolation optimization in `write()` | 3-1-1 (PLT: Writable trait; AI: no capacity) |
 | Stdlib API surface | Methods only; free functions are internal FFI bridges, not public API. Constructors use `Type.method()` static syntax | 4-1 (Web: D, methods + constructors — functionally identical) |
+| `--trace` event types | 4 types: `enter`, `exit`, `state`, `effect`. Panics/assertions are diagnostics, not trace events | 4-1 (DevOps: 6 types including `assert_fail`/`panic`) |
+| `--trace` schema shape | Semi-nested: flat top-level + `span` object matching diagnostic format | 5-0 |
+| `--trace` value serialization | String/Display representation only. Bounded cost, forward-compatible | 4-1 (PLT: tagged `{"type":"Int","value":42}`) |
+| `--trace` filter syntax | Colon-syntax `--trace=fn:name,module:mod,depth:3`. AND across keys, OR within key via `+` | 4-1 (PLT: separate flags) |
+| `--trace` timestamp format | Microseconds monotonic (`ts_us`). Right precision for function-level tracing | 5-0 |
 
 ---
 
@@ -342,6 +347,7 @@ Full deliberation records for each decision. Each file contains expert votes, re
 | Compiler Internal Type Representation | [decisions/compiler-type-representation.md](decisions/compiler-type-representation.md) |
 | StringBuilder | [decisions/string-builder.md](decisions/string-builder.md) |
 | Stdlib API Surface | [decisions/stdlib-api-surface.md](decisions/stdlib-api-surface.md) |
+| `--trace` NDJSON Format | [decisions/trace-ndjson-format.md](decisions/trace-ndjson-format.md) |
 
 ---
 

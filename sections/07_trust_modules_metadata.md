@@ -1404,7 +1404,7 @@ Annotations use the `@` prefix and are compiler-checked. They are not comments, 
 | `@verify(strategy)` | fn | Hints to the SMT solver about verification strategy. | Verification engine |
 | `@derive(Trait, ...)` | type | Auto-generate trait implementations. Compiler-known traits only in v1: `Eq`, `Ord`, `Hash`, `Debug`, `Clone`, `Display`, `Serialize`, `Deserialize`. | Compile-time codegen |
 | `@allow(WarningName, ...)` | fn | Suppress specific compiler warnings within the annotated function. Takes PascalCase warning names (e.g., `UnrestoredMutation`, `IncompleteStateRestore`). Function-level override of `pact.toml` `[lints]` config. See §4.16.8. | Compiler diagnostic filter |
-| `@deprecated(since, removal, replacement, fix)` | fn, type | Edition-aware deprecation with structured migration. Fields: `since` (edition, required), `removal` (edition, optional), `replacement` (qualified name, optional), `fix` (`"replace"`/`"inline"`/`"manual"`, optional). Emits W2000 when current edition < `removal`, E2001 when current edition >= `removal`. Machine-applicable fixes in structured diagnostics when `fix` is `"replace"` or `"inline"`. See §8.15.2. | Compiler warning/error (edition-gated) |
+| `@deprecated(since, removal, replacement, fix)` | fn, type | Edition-aware deprecation with structured migration. Fields: `since` (edition, required), `removal` (edition, optional), `replacement` (qualified name, optional), `fix` (`"replace"`/`"inline"`/`"manual"`, optional). Emits W2000 when current edition < `removal`, E2001 when current edition >= `removal`. Machine-applicable fixes in structured diagnostics when `fix` is `"replace"` or `"inline"`. See §8.16.2. | Compiler warning/error (edition-gated) |
 
 #### Canonical Ordering
 
