@@ -1,0 +1,69 @@
+// Test: compiler finds pact.lock by walking up from source file location
+// when the source file is not directly under a sibling src/ of pact.lock.
+
+fn trim_newlines(s: Str) -> Str {
+    let mut end = s.len()
+    while end > 0 {
+        let ch = s.char_at(end - 1)
+        if ch == 10 || ch == 13 {
+            end = end - 1
+        } else {
+            return s.substring(0, end)
+        }
+    }
+    ""
+}
+
+fn main() {
+    let base = ".tmp/_test_lockfile_disc"
+    shell_exec("rm -rf {base}")
+
+    // Set up a project where source is in a nested subdir
+    // project/
+    //   pact.toml
+    //   pact.lock  (with a dep)
+    //   deps/mylib/src/lib.pact
+    //   app/code/main.pact  (NOT under src/)
+    shell_exec("mkdir -p {base}/project/deps/mylib/src")
+    shell_exec("mkdir -p {base}/project/app/code")
+
+    write_file("{base}/project/pact.toml", "[package]\nname = \"testproj\"\nversion = \"0.1.0\"\n")
+    write_file("{base}/project/deps/mylib/src/lib.pact", "pub fn helper() -> Str \{\n    \"found-it\"\n\}\n")
+
+    // Get absolute path for the lockfile source entry
+    let abs_result = process_run("sh", ["-c", "cd {base}/project && pwd -P"])
+    let proj_abs = trim_newlines(abs_result.out)
+
+    write_file("{base}/project/pact.lock", "[metadata]\nlockfile-version = 1\npact-version = \"dev\"\ngenerated = \"2026-01-01T00:00:00Z\"\n\n[[package]]\nname = \"mylib\"\nversion = \"0.1.0\"\nsource = \"path:{proj_abs}/deps/mylib\"\nhash = \"0000000000000000000000000000000000000000000000000000000000000000\"\ncapabilities = []\n")
+
+    // Source file NOT in src/ — it's in app/code/
+    write_file("{base}/project/app/code/main.pact", "import mylib\n\nfn main() \{\n    io.println(helper())\n\}\n")
+
+    // Compile using absolute path — the compiler should walk up from
+    // app/code/main.pact to find project/pact.lock
+    shell_exec("rm -f build/_test_ld.c")
+    let compile_result = process_run("sh", ["-c", "build/pactc {proj_abs}/app/code/main.pact build/_test_ld.c 2>&1"])
+    let c_exists = file_exists("build/_test_ld.c")
+    let c_content = if c_exists == 1 { read_file("build/_test_ld.c") } else { "" }
+
+    if c_content.len() > 0 {
+        io.println("PASS: compiler found pact.lock from nested non-src dir")
+    } else {
+        io.println("FAIL: compiler could not find pact.lock from nested non-src dir")
+        io.println(compile_result.out)
+    }
+
+    if c_content.len() > 0 {
+        shell_exec("cc -o build/_test_ld build/_test_ld.c -lm 2>&1 || true")
+        let run_result = process_run("sh", ["-c", "build/_test_ld"])
+        let output = trim_newlines(run_result.out)
+        if output == "found-it" {
+            io.println("PASS: dep resolved correctly after lockfile discovery")
+        } else {
+            io.println("FAIL: expected 'found-it', got: '{output}'")
+        }
+    }
+
+    // Cleanup
+    shell_exec("rm -rf {base} build/_test_ld*")
+}

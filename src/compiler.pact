@@ -127,6 +127,26 @@ pub fn ensure_lockfile_loaded(src_root: Str) {
     let lock_path = path_join(project_root, "pact.lock")
     if file_exists(lock_path) == 1 {
         lockfile_load(lock_path)
+        return
+    }
+    // Walk up from src_root looking for pact.lock
+    let mut dir = src_root
+    if dir.ends_with("/") {
+        dir = dir.substring(0, dir.len() - 1)
+    }
+    let mut depth = 0
+    while depth < 20 {
+        let parent = path_dirname(dir)
+        if parent == dir || parent == "" {
+            return
+        }
+        let candidate = path_join(parent, "pact.lock")
+        if file_exists(candidate) == 1 {
+            lockfile_load(candidate)
+            return
+        }
+        dir = parent
+        depth = depth + 1
     }
 }
 
