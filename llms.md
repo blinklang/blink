@@ -4,12 +4,18 @@
 
 Targets native binaries via C codegen.
 
-## What's New (v0.17)
+## What's New (v0.18)
 
-- **Stdlib migrations** — Duration/Instant (`lib/std/time.pact`), StringBuilder (`lib/std/sb.pact`), string functions (`lib/std/str.pact`), Bytes (`lib/std/bytes.pact`) migrated from C runtime to Pact stdlib
-- **I/O primitives** — `io.read_line()`, `io.read_bytes(n)`, `io.write(s)`, `io.write_bytes(b)` for stdin/stdout binary and line-oriented I/O
-- **`pact init` improvements** — better AI context setup (generates `.claude/` config)
-- **Bugfix** — SetButNotRead false positives on loop-carried state variables
+- **LSP support** — textDocument/diagnostics, go-to-definition, hover (type signatures + docs), incremental compilation on save
+- **`--trace` runtime execution tracing** — structured NDJSON to stderr with enter/exit, effect, and state mutation events. Filters: `fn:`, `module:`, `depth:`, `effect:`, `state:`, `event:`. `--trace-limit N` caps output. `PACT_TRACE` env var.
+- **`json_encode_pretty()`** — pretty-printed JSON output with `json_encode_pretty()` (2-space) and `json_encode_indent(idx, n)` (custom width)
+- **`process_run_with_stdin`** — pipe input to child processes
+- **Fixes** — SIGINT forwarding, `??` type inference, void calls in match arms, JSON unicode escapes, doc comment parsing, iterator type safety
+
+### Prior: What's New (v0.17)
+
+- **Stdlib migrations** — Duration/Instant, StringBuilder, string functions, Bytes migrated from C runtime to Pact stdlib
+- **I/O primitives** — `io.read_line()`, `io.read_bytes(n)`, `io.write(s)`, `io.write_bytes(b)`
 
 ### Prior: What's New (v0.16.1)
 

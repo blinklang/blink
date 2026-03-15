@@ -1,16 +1,28 @@
 # Pact Language Reference
 
-> Pact is a statically-typed, effect-tracked language compiling to C. Compiler v0.17.0.
+> Pact is a statically-typed, effect-tracked language compiling to C. Compiler v0.18.0.
 
-## What's New (v0.17)
+## What's New (v0.18)
 
 | Change | Details |
 |--------|---------|
-| Stdlib migrations | Duration/Instant (`lib/std/time.pact`), StringBuilder (`lib/std/sb.pact`), string functions (`lib/std/str.pact`), Bytes (`lib/std/bytes.pact`) migrated from C runtime to Pact stdlib |
+| LSP support | textDocument/diagnostics, go-to-definition, hover (type signatures + docs), incremental compilation on didSave |
+| `--trace` execution tracing | Structured NDJSON to stderr: enter/exit, effect invocations (IO, FS, DB), state mutations. Filters: `fn:`, `module:`, `depth:`, `effect:`, `state:`, `event:`. `--trace-limit N`. `PACT_TRACE` env var. |
+| `json_encode_pretty()` | Pretty-printed JSON with 2-space indent. `json_encode_indent(idx, n)` for custom width. Shared `json_serialize_leaf()` helper. |
+| `process_run_with_stdin` | New builtin: pipe input to child processes |
+| SIGINT forwarding | `process_run` now forwards SIGINT to child processes |
+| `??` type inference fix | `??` operator now correctly infers `T` instead of `Option[T]` for variable bindings |
+| Void match arm fix | Void function calls in match arms no longer silently dropped |
+| JSON unicode escapes | `\uXXXX` unicode escapes and runtime UTF-8 encoding in JSON parser |
+| Iterator type safety | Iterator adapter `next()` functions take `void*` for type-safe casts |
+
+### Prior: What's New (v0.17)
+
+| Change | Details |
+|--------|---------|
+| Stdlib migrations | Duration/Instant, StringBuilder, string functions, Bytes migrated from C runtime to Pact stdlib |
 | I/O primitives | `io.read_line()`, `io.read_bytes(n)`, `io.write(s)`, `io.write_bytes(b)` — stdin/stdout binary and line-oriented I/O |
 | StringBuilder extras | `.write_int(n)`, `.write_float(f)`, `.write_bool(b)`, `StringBuilder.with_capacity(n)` |
-| `pact init` improvements | Better AI context setup (generates `.claude/` config) |
-| SetButNotRead fix | False positives on loop-carried state variables eliminated |
 
 ### Prior: What's New (v0.16.1)
 
@@ -382,6 +394,7 @@ let nested = ##"contains #"inner"#"##   // depth-2 nesting
 | `get_env(name)` | Option[Str] | Environment variable |
 | `shell_exec(cmd)` | Int | Run shell command, return exit code |
 | `process_run(cmd, args)` | ProcessResult | Run command with args (`List[Str]`), capture stdout/stderr/exit_code |
+| `process_run_with_stdin(cmd, args, input)` | ProcessResult | Like `process_run` but pipes `input` (Str) to child's stdin |
 | `process_exec(cmd, args)` | Void | Exec binary directly (replaces process). `args` is `List[Str]` |
 | `exit(code)` | Void | Exit with code |
 | `arg_count()` | Int | CLI argument count |
@@ -628,6 +641,29 @@ let task = Task { id: 1, title: "Test", done: false }
 let json = task.to_json()                    // -> Str
 let back = Task.from_json(json)              // -> Result[Task, Str]
 ```
+
+Low-level JSON API (`import std.json`):
+
+| Function | Returns | Purpose |
+|----------|---------|---------|
+| `json_parse(input)` | Int | Parse JSON string, returns root node index (-1 on error) |
+| `json_encode(idx)` | Str | Serialize node tree to compact JSON |
+| `json_encode_pretty(idx)` | Str | Serialize to pretty-printed JSON (2-space indent) |
+| `json_encode_indent(idx, n)` | Str | Serialize to pretty-printed JSON (custom indent width) |
+| `json_type(idx)` | Int | Node type (JSON_NULL/BOOL/INT/FLOAT/STRING/ARRAY/OBJECT) |
+| `json_get(idx, key)` | Int | Get child by key from object (-1 if missing) |
+| `json_at(idx, i)` | Int | Get child by index from array |
+| `json_len(idx)` | Int | Child count of array/object |
+| `json_as_str(idx)` | Str | Extract string value |
+| `json_as_int(idx)` | Int | Extract integer value |
+| `json_new_object()` | Int | Create empty object node |
+| `json_new_array()` | Int | Create empty array node |
+| `json_new_str(s)` | Int | Create string node |
+| `json_new_int(n)` | Int | Create integer node |
+| `json_set(obj, key, val)` | Void | Set key-value on object (add or replace) |
+| `json_push(arr, val)` | Void | Append value to array |
+| `json_remove(obj, key)` | Void | Remove key from object |
+| `json_clear()` | Void | Reset all JSON state for next parse |
 
 ## CLI Argument Parsing (std.args)
 
