@@ -45,6 +45,33 @@ pub fn load_lint_overrides() {
     }
 }
 
+pub fn compile_to_program(file_path: Str, use_prelude: Int) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report {
+    reset_compiler_state()
+    diag_reset()
+    load_lint_overrides()
+    diag_source_file = file_path
+
+    let source = read_file(file_path)
+    lex(source)
+    pos = 0
+    let program = parse_program()
+    loaded_files.push(file_path)
+
+    let src_root = find_src_root(file_path)
+    let mut imported_programs: List[Int] = []
+    collect_root_imports(program)
+    collect_imports(program, src_root, imported_programs)
+    if use_prelude != 0 {
+        inject_prelude(src_root, imported_programs)
+    }
+
+    let mut final_program = program
+    if imported_programs.len() > 0 {
+        final_program = merge_programs(program, imported_programs, import_map_nodes)
+    }
+    final_program
+}
+
 pub fn dots_to_slashes(s: Str) -> Str {
     let mut result = ""
     let mut i = 0

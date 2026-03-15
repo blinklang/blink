@@ -273,29 +273,8 @@ fn ensure_deps_resolved() {
 }
 
 fn do_compile(source_path: Str, c_path: Str, format_flag: Str, debug_mode: Int, strict_mode: Int) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen {
-    reset_compiler_state()
-    diag_reset()
-    load_lint_overrides()
-    diag_source_file = source_path
-
-    let source = read_file(source_path)
-    lex(source)
-    pos = 0
-    let program = parse_program()
-    loaded_files.push(source_path)
-
-    let src_root = find_src_root(source_path)
-    let mut imported_programs: List[Int] = []
-    collect_root_imports(program)
-    collect_imports(program, src_root, imported_programs)
-    if format_flag != "pact" {
-        inject_prelude(src_root, imported_programs)
-    }
-
-    let mut final_program = program
-    if imported_programs.len() > 0 {
-        final_program = merge_programs(program, imported_programs, import_map_nodes)
-    }
+    let use_prelude = if format_flag != "pact" { 1 } else { 0 }
+    let final_program = compile_to_program(source_path, use_prelude)
 
     if format_flag == "pact" {
         let pact_output = format(final_program)
@@ -1436,30 +1415,10 @@ fn cmd_check(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
         }
     }
     if daemon_used == 0 {
-        reset_compiler_state()
-        diag_reset()
-        load_lint_overrides()
-        diag_source_file = source_path
         if format_flag != "" {
             diag_format = 1
         }
-
-        let source = read_file(source_path)
-        lex(source)
-        pos = 0
-        let program = parse_program()
-        loaded_files.push(source_path)
-
-        let src_root = find_src_root(source_path)
-        let mut imported_programs: List[Int] = []
-        collect_root_imports(program)
-        collect_imports(program, src_root, imported_programs)
-        inject_prelude(src_root, imported_programs)
-
-        let mut final_program = program
-        if imported_programs.len() > 0 {
-            final_program = merge_programs(program, imported_programs, import_map_nodes)
-        }
+        let final_program = compile_to_program(source_path, 1)
 
         check_types(final_program)
 
@@ -1499,28 +1458,9 @@ fn cmd_audit(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Re
     let ffi_flag = if args_has(a, "ffi") { 1 } else { 0 }
 
     if ffi_flag != 0 || source_path != "" {
-        reset_compiler_state()
-        diag_reset()
-        load_lint_overrides()
         let audit_path = if source_path != "" { source_path } else { "src/main.pact" }
         check_file_exists(audit_path)
-        diag_source_file = audit_path
-        let source = read_file(audit_path)
-        lex(source)
-        pos = 0
-        let program = parse_program()
-        loaded_files.push(audit_path)
-
-        let src_root = find_src_root(audit_path)
-        let mut imported_programs: List[Int] = []
-        collect_root_imports(program)
-        collect_imports(program, src_root, imported_programs)
-        inject_prelude(src_root, imported_programs)
-
-        let mut final_program = program
-        if imported_programs.len() > 0 {
-            final_program = merge_programs(program, imported_programs, import_map_nodes)
-        }
+        let final_program = compile_to_program(audit_path, 1)
 
         do_ffi_audit(final_program, json_output)
         if diag_count > 0 {

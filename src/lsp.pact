@@ -137,28 +137,7 @@ fn lsp_build_diagnostics_json(uri: Str) -> Str {
 }
 
 fn lsp_compile_and_build(file_path: Str) -> Int ! IO, Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
-    reset_compiler_state()
-    diag_reset()
-    load_lint_overrides()
-    diag_source_file = file_path
-
-    let source = read_file(file_path)
-    lex(source)
-    pos = 0
-    let program = parse_program()
-    loaded_files.push(file_path)
-
-    let src_root = find_src_root(file_path)
-    let mut imported_programs: List[Int] = []
-    collect_root_imports(program)
-    collect_imports(program, src_root, imported_programs)
-    inject_prelude(src_root, imported_programs)
-
-    let mut final_program = program
-    if imported_programs.len() > 0 {
-        final_program = merge_programs(program, imported_programs, import_map_nodes)
-    }
-    final_program
+    compile_to_program(file_path, 1)
 }
 
 fn lsp_publish_diagnostics(uri: Str) ! IO {
