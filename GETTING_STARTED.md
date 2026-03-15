@@ -93,6 +93,46 @@ Run tests with:
 pact test myfile.pact
 ```
 
+## Debugging & Tracing
+
+Debug builds enable `debug_assert` and include debug symbols:
+
+```sh
+bin/pact build hello.pact --debug
+bin/pact run hello.pact -d
+```
+
+Trace runtime execution with structured NDJSON output to stderr:
+
+```sh
+# Trace all function calls, effects, and state mutations
+bin/pact run hello.pact --trace all
+
+# Filter by function or module
+bin/pact run hello.pact --trace "fn:main"
+bin/pact run hello.pact --trace "module:parser,depth:2"
+
+# Trace only specific event types
+bin/pact run hello.pact --trace "event:effect"       # IO/FS/DB operations
+bin/pact run hello.pact --trace "event:state"        # variable mutations
+
+# Filter by effect type or variable name
+bin/pact run hello.pact --trace "effect:FS.Write"
+bin/pact run hello.pact --trace "state:count"
+
+# Cap output to avoid runaway traces
+bin/pact run hello.pact --trace all --trace-limit 100
+```
+
+Trace can also be enabled via environment variables: `PACT_TRACE=all` and `PACT_TRACE_LIMIT=100`.
+
+Inspect the parsed AST:
+
+```sh
+bin/pact ast hello.pact              # JSON AST dump
+bin/pact ast hello.pact --imports    # with resolved imports
+```
+
 ## Next Steps
 
 - [README.md](README.md) — language tour and quick reference
