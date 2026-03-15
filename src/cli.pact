@@ -47,6 +47,9 @@ const embedded_std_time: Str = #embed("../lib/std/time.pact")
 const embedded_std_sb: Str = #embed("../lib/std/sb.pact")
 const embedded_std_bytes: Str = #embed("../lib/std/bytes.pact")
 
+let mut ccache_checked: Int = 0
+let mut ccache_available: Int = 0
+
 fn init_embedded_stdlib() {
     embedded_stdlib.set("args", embedded_std_args)
     embedded_stdlib.set("http", embedded_std_http)
@@ -367,10 +370,24 @@ fn resolve_target_triple(alias: Str) -> Str {
     return alias
 }
 
+fn has_ccache() -> Int {
+    if ccache_checked == 0 {
+        ccache_checked = 1
+        if shell_exec("command -v ccache >/dev/null 2>&1") == 0 {
+            ccache_available = 1
+        }
+    }
+    ccache_available
+}
+
 fn run_cc(args: Str, debug_mode: Int, release_mode: Int, target: Str) -> Int {
     let mut compiler = "cc"
+    let mut pipe = "-pipe "
     if target != "" {
         compiler = "zig cc -target {target}"
+        pipe = ""
+    } else if has_ccache() != 0 {
+        compiler = "ccache cc"
     }
     let mut opt_flags = ""
     if debug_mode != 0 {
@@ -378,7 +395,7 @@ fn run_cc(args: Str, debug_mode: Int, release_mode: Int, target: Str) -> Int {
     } else if release_mode != 0 {
         opt_flags = "-O2 "
     }
-    shell_exec("{compiler} {opt_flags}{args}")
+    shell_exec("{compiler} {pipe}{opt_flags}{args}")
 }
 
 fn compile_vendored_source(c_path: Str, o_path: Str, debug_mode: Int, release_mode: Int, target: Str) -> Int {
