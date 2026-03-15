@@ -20,7 +20,6 @@ import docgen
 import lsp
 
 let pact_cli_version: Str = "dev"
-let mut lint_cache_mtime: Int = -1
 const embedded_llms_full: Str = #embed("../llms-full.md")
 const embedded_llms_short: Str = #embed("../llms.md")
 const embedded_runtime_h: Str = #embed("../build/runtime.h")
@@ -253,26 +252,6 @@ fn collect_test_files(dir: Str, results: List[Str]) {
                 results.push(full_path)
             }
         }
-        i = i + 1
-    }
-}
-
-fn load_lint_overrides() {
-    let mtime = file_mtime("pact.toml")
-    if mtime == -1 {
-        return
-    }
-    if mtime != lint_cache_mtime {
-        lint_cache_mtime = mtime
-        manifest_clear()
-        let rc = manifest_load("pact.toml")
-        if rc != 0 {
-            return
-        }
-    }
-    let mut i = 0
-    while i < lint_names.len() {
-        lint_set_override(lint_names.get(i).unwrap(), lint_levels.get(i).unwrap())
         i = i + 1
     }
 }

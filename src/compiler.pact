@@ -11,6 +11,7 @@ import query
 import incremental
 import daemon
 import pkg.lockfile
+import pkg.manifest
 import ast_dump
 import std.path
 
@@ -21,6 +22,28 @@ import std.path
 //
 // Usage (once compiled): ./pactc <source.pact> [output.c]
 // If no output file given, writes to stdout.
+
+let mut lint_cache_mtime: Int = -1
+
+pub fn load_lint_overrides() {
+    let mtime = file_mtime("pact.toml")
+    if mtime == -1 {
+        return
+    }
+    if mtime != lint_cache_mtime {
+        lint_cache_mtime = mtime
+        manifest_clear()
+        let rc = manifest_load("pact.toml")
+        if rc != 0 {
+            return
+        }
+    }
+    let mut i = 0
+    while i < lint_names.len() {
+        lint_set_override(lint_names.get(i).unwrap(), lint_levels.get(i).unwrap())
+        i = i + 1
+    }
+}
 
 pub fn dots_to_slashes(s: Str) -> Str {
     let mut result = ""

@@ -139,6 +139,7 @@ fn lsp_build_diagnostics_json(uri: Str) -> Str {
 fn lsp_compile_and_build(file_path: Str) -> Int ! IO, Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
     reset_compiler_state()
     diag_reset()
+    load_lint_overrides()
     diag_source_file = file_path
 
     let source = read_file(file_path)
