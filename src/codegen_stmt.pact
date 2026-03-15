@@ -3,6 +3,31 @@
 import codegen_types
 import codegen_expr
 
+fn strip_outer_parens(s: Str) -> Str {
+    if s.starts_with("(") && s.ends_with(")") {
+        let inner = s.substring(1, s.len() - 2)
+        let mut depth = 0
+        let mut i = 0
+        let mut balanced = 1
+        while i < inner.len() {
+            let ch = inner.char_at(i)
+            if ch == 40 {
+                depth = depth + 1
+            } else if ch == 41 {
+                if depth == 0 {
+                    balanced = 0
+                }
+                depth = depth - 1
+            }
+            i = i + 1
+        }
+        if balanced != 0 && depth == 0 {
+            return inner
+        }
+    }
+    s
+}
+
 @allow(UnrestoredMutation, IncompleteStateRestore)
 pub fn emit_if_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
     let tmp = fresh_temp("_if_")
@@ -40,7 +65,7 @@ pub fn emit_if_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
         emit_line("{c_type_str(then_type)} {tmp};")
     }
     emit_expr(np_condition.get(node).unwrap())
-    let cond_str = expr_result_str
+    let cond_str = strip_outer_parens(expr_result_str)
     emit_line("if ({cond_str}) \{")
     cg_indent = cg_indent + 1
     let then_val = emit_block_value(np_then_body.get(node).unwrap())
@@ -263,9 +288,9 @@ pub fn emit_match_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scop
                     emit_line("} else \{")
                 }
             } else if _first {
-                emit_line("if ({pat_cond}) \{")
+                emit_line("if ({strip_outer_parens(pat_cond)}) \{")
             } else {
-                emit_line("} else if ({pat_cond}) \{")
+                emit_line("} else if ({strip_outer_parens(pat_cond)}) \{")
             }
             cg_indent = cg_indent + 1
             bind_pattern_vars(pat, 0, match_scruts.len())
@@ -999,7 +1024,7 @@ pub fn emit_stmt(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
     if kind == NodeKind.WhileLoop {
         let pre_len = cg_lines.len()
         emit_expr(np_condition.get(node).unwrap())
-        let cond_str = expr_result_str
+        let cond_str = strip_outer_parens(expr_result_str)
         let post_len = cg_lines.len()
         if post_len > pre_len {
             let mut cond_setup: List[Str] = []
@@ -1535,7 +1560,7 @@ pub fn emit_for_in(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
 @allow(UnrestoredMutation, IncompleteStateRestore)
 pub fn emit_if_stmt(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
     emit_expr(np_condition.get(node).unwrap())
-    let cond_str = expr_result_str
+    let cond_str = strip_outer_parens(expr_result_str)
     emit_line("if ({cond_str}) \{")
     cg_indent = cg_indent + 1
     emit_block(np_then_body.get(node).unwrap())
@@ -1558,7 +1583,7 @@ pub fn emit_if_stmt(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
                     emit_if_stmt(inner)
                     cg_indent = cg_indent - 1
                 } else {
-                    let inner_cond = expr_result_str
+                    let inner_cond = strip_outer_parens(expr_result_str)
                     emit_line("} else if ({inner_cond}) \{")
                     cg_indent = cg_indent + 1
                     emit_block(np_then_body.get(inner).unwrap())
