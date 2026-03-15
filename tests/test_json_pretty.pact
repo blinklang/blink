@@ -1,0 +1,72 @@
+import std.json
+
+test "pretty print simple object" {
+    json_clear()
+    let obj = json_new_object()
+    json_set(obj, "name", json_new_str("Alice"))
+    json_set(obj, "age", json_new_int(30))
+    let expected = "\{\n  \"name\": \"Alice\",\n  \"age\": 30\n}"
+    assert_eq(json_encode_pretty(obj), expected)
+}
+
+test "pretty print nested object" {
+    json_clear()
+    let outer = json_new_object()
+    let inner = json_new_object()
+    json_set(inner, "x", json_new_int(10))
+    json_set(inner, "y", json_new_int(20))
+    json_set(outer, "point", inner)
+    json_set(outer, "label", json_new_str("origin"))
+    let expected = "\{\n  \"point\": \{\n    \"x\": 10,\n    \"y\": 20\n  },\n  \"label\": \"origin\"\n}"
+    assert_eq(json_encode_pretty(outer), expected)
+}
+
+test "pretty print array" {
+    json_clear()
+    let arr = json_new_array()
+    json_push(arr, json_new_int(1))
+    json_push(arr, json_new_int(2))
+    json_push(arr, json_new_int(3))
+    let expected = "[\n  1,\n  2,\n  3\n]"
+    assert_eq(json_encode_pretty(arr), expected)
+}
+
+test "pretty print mixed nested" {
+    json_clear()
+    let obj = json_new_object()
+    json_set(obj, "name", json_new_str("Alice"))
+    let arr = json_new_array()
+    json_push(arr, json_new_str("admin"))
+    json_push(arr, json_new_str("user"))
+    json_set(obj, "tags", arr)
+    let expected = "\{\n  \"name\": \"Alice\",\n  \"tags\": [\n    \"admin\",\n    \"user\"\n  ]\n}"
+    assert_eq(json_encode_pretty(obj), expected)
+}
+
+test "pretty print primitives unchanged" {
+    json_clear()
+    assert_eq(json_encode_pretty(json_new_int(42)), "42")
+    assert_eq(json_encode_pretty(json_new_str("hello")), "\"hello\"")
+    assert_eq(json_encode_pretty(json_new_bool(1)), "true")
+    assert_eq(json_encode_pretty(json_new_null()), "null")
+}
+
+test "pretty print empty object" {
+    json_clear()
+    let obj = json_new_object()
+    assert_eq(json_encode_pretty(obj), "\{}")
+}
+
+test "pretty print empty array" {
+    json_clear()
+    let arr = json_new_array()
+    assert_eq(json_encode_pretty(arr), "[]")
+}
+
+test "pretty print custom indent" {
+    json_clear()
+    let obj = json_new_object()
+    json_set(obj, "a", json_new_int(1))
+    let expected = "\{\n    \"a\": 1\n}"
+    assert_eq(json_encode_indent(obj, 4), expected)
+}

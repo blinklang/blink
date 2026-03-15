@@ -657,13 +657,7 @@ fn escape_json_str(s: Str) -> Str {
     result
 }
 
-/// Convert node tree to a JSON string
-pub fn json_serialize(idx: Int) -> Str {
-    if idx < 0 || idx >= json_types.len() {
-        return "null"
-    }
-    let ntype = json_types.get(idx).unwrap()
-
+fn json_serialize_leaf(idx: Int, ntype: Int) -> Str {
     if ntype == JSON_NULL {
         return "null"
     }
@@ -683,6 +677,19 @@ pub fn json_serialize(idx: Int) -> Str {
     if ntype == JSON_STRING {
         let v = escape_json_str(json_str_vals.get(idx).unwrap())
         return "\"{v}\""
+    }
+    ""
+}
+
+/// Convert node tree to a JSON string
+pub fn json_serialize(idx: Int) -> Str {
+    if idx < 0 || idx >= json_types.len() {
+        return "null"
+    }
+    let ntype = json_types.get(idx).unwrap()
+    let leaf = json_serialize_leaf(idx, ntype)
+    if leaf != "" {
+        return leaf
     }
     if ntype == JSON_ARRAY {
         let mut result = "["
@@ -722,6 +729,94 @@ pub fn json_serialize(idx: Int) -> Str {
         return result
     }
     "null"
+}
+
+// ── Pretty-print serialization ────────────────────────────────────
+
+fn make_indent(indent: Int, depth: Int) -> Str {
+    let total = indent * depth
+    let mut s = ""
+    let mut i = 0
+    while i < total {
+        s = s.concat(" ")
+        i = i + 1
+    }
+    s
+}
+
+fn json_serialize_pretty_inner(idx: Int, indent: Int, depth: Int) -> Str {
+    if idx < 0 || idx >= json_types.len() {
+        return "null"
+    }
+    let ntype = json_types.get(idx).unwrap()
+    let leaf = json_serialize_leaf(idx, ntype)
+    if leaf != "" {
+        return leaf
+    }
+    if ntype == JSON_ARRAY {
+        let count = json_child_counts.get(idx).unwrap()
+        if count == 0 {
+            return "[]"
+        }
+        let child_indent = make_indent(indent, depth + 1)
+        let close_indent = make_indent(indent, depth)
+        let mut result = "[\n"
+        let mut i = 0
+        while i < count {
+            if i > 0 {
+                result = result.concat(",\n")
+            }
+            let child = json_at(idx, i)
+            result = result.concat(child_indent)
+            result = result.concat(json_serialize_pretty_inner(child, indent, depth + 1))
+            i = i + 1
+        }
+        result = result.concat("\n")
+        result = result.concat(close_indent)
+        result = result.concat("]")
+        return result
+    }
+    if ntype == JSON_OBJECT {
+        let count = json_child_counts.get(idx).unwrap()
+        if count == 0 {
+            return "\{}"
+        }
+        let child_indent = make_indent(indent, depth + 1)
+        let close_indent = make_indent(indent, depth)
+        let mut result = "\{\n"
+        let mut found = 0
+        let mut scan = 0
+        while found < count && scan < json_types.len() {
+            if json_parents.get(scan).unwrap() == idx {
+                if found > 0 {
+                    result = result.concat(",\n")
+                }
+                let k = escape_json_str(json_keys.get(scan).unwrap())
+                result = result.concat(child_indent)
+                result = result.concat("\"")
+                result = result.concat(k)
+                result = result.concat("\": ")
+                result = result.concat(json_serialize_pretty_inner(scan, indent, depth + 1))
+                found = found + 1
+            }
+            scan = scan + 1
+        }
+        result = result.concat("\n")
+        result = result.concat(close_indent)
+        result = result.concat("}")
+        return result
+    }
+    "null"
+}
+
+/// Encode node tree to a pretty-printed JSON string with 2-space indent
+pub fn json_encode_pretty(idx: Int) -> Str {
+    json_serialize_pretty_inner(idx, 2, 0)
+}
+
+/// Encode node tree to a pretty-printed JSON string with custom indent width
+pub fn json_encode_indent(idx: Int, indent: Int) -> Str {
+    json_serialize_pretty_inner(idx, indent, 0)
 }
 
 // ── State management ───────────────────────────────────────────────
