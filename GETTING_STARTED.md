@@ -93,6 +93,92 @@ Run tests with:
 pact test myfile.pact
 ```
 
+## Packages
+
+Pact projects use a `pact.toml` manifest to declare metadata and dependencies.
+
+### Creating a Package
+
+A package is a directory with a manifest and a `src/` folder:
+
+```
+mylib/
+  pact.toml
+  src/
+    mylib.pact
+```
+
+The manifest declares the package name and version:
+
+```toml
+[package]
+name = "mylib"
+version = "0.1.0"
+```
+
+Mark public API with `pub` — only `pub` symbols are visible to consumers:
+
+```pact
+pub fn add(a: Int, b: Int) -> Int {
+    a + b
+}
+
+fn internal_helper() -> Int {
+    42
+}
+```
+
+`pub` works on `fn`, `struct`, and `enum`. Anything without `pub` is package-private.
+
+If you publish via git, tag your releases so consumers can pin a version: `git tag v0.1.0`.
+
+### Using Dependencies
+
+Add a dependency with the CLI:
+
+```sh
+pact add mylib --path ../mylib
+# or from git:
+pact add mylib --git https://github.com/org/mylib --tag v0.1.0
+```
+
+This updates your `pact.toml`:
+
+```toml
+[dependencies]
+mylib = { path = "../mylib" }
+```
+
+Import and use the dependency:
+
+```pact
+import mylib
+
+fn main() {
+    let sum = add(2, 3)
+    io.println("{sum}")
+}
+```
+
+Selective imports pull in specific symbols: `import mylib.{add}`.
+
+Build or run as usual — dependencies resolve automatically:
+
+```sh
+pact build src/main.pact
+pact run src/main.pact
+```
+
+Pact generates a `pact.lock` file on first build. Commit it to version control for reproducible builds.
+
+Other dependency commands:
+
+```sh
+pact add mylib --dev       # dev-only dependency
+pact remove mylib          # remove a dependency
+pact update                # re-resolve all deps
+```
+
 ## Debugging & Tracing
 
 Debug builds enable `debug_assert` and include debug symbols:
@@ -139,3 +225,4 @@ bin/pact ast hello.pact --imports    # with resolved imports
 - [SPEC.md](SPEC.md) — full language specification
 - [examples/](examples/) — working example programs
 - [sections/](sections/) — detailed spec sections (types, effects, contracts, etc.)
+- [Package management spec](sections/06_tooling.md) — dependency resolution, version constraints, lockfile format
