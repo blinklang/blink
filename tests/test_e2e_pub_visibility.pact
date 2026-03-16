@@ -183,6 +183,60 @@ fn main() {
     } else {
         io.println("FAIL: build should have failed for private trait access")
     }
+    // --- Test 8: Private trait in generic type param rejected (let binding) ---
+    write_file(
+        "{base}/projA/src/bad_generic_trait.pact",
+        "import libV\n\nfn main() \{\n    let x: List[PrivCodec] = []\n    io.println(\"hi\")\n}\n"
+    )
+    let rc8 = shell_exec(
+        "cd {base}/projA && {pact} build src/bad_generic_trait.pact -o build/bad_generic_trait > err_generic_trait.txt 2>&1"
+    )
+    if rc8 != 0 {
+        let err_generic_trait = read_file("{base}/projA/err_generic_trait.txt")
+        if err_generic_trait.contains("cannot access private") {
+            io.println("PASS: private trait in generic param correctly rejected")
+        } else {
+            io.println("FAIL: build failed but wrong error: {err_generic_trait}")
+        }
+    } else {
+        io.println("FAIL: build should have failed for private trait in generic param")
+    }
+    // --- Test 9: Private type in generic fn param rejected ---
+    write_file(
+        "{base}/projA/src/bad_generic_param.pact",
+        "import libV\n\nfn use_priv(x: List[Hidden]) \{\n    io.println(\"hi\")\n}\n\nfn main() \{\n    use_priv([])\n}\n"
+    )
+    let rc9 = shell_exec(
+        "cd {base}/projA && {pact} build src/bad_generic_param.pact -o build/bad_generic_param > err_generic_param.txt 2>&1"
+    )
+    if rc9 != 0 {
+        let err_generic_param = read_file("{base}/projA/err_generic_param.txt")
+        if err_generic_param.contains("cannot access private") {
+            io.println("PASS: private type in generic fn param correctly rejected")
+        } else {
+            io.println("FAIL: build failed but wrong error: {err_generic_param}")
+        }
+    } else {
+        io.println("FAIL: build should have failed for private type in generic fn param")
+    }
+    // --- Test 10: Private type in generic return type rejected ---
+    write_file(
+        "{base}/projA/src/bad_generic_ret.pact",
+        "import libV\n\nfn ret_priv() -> List[Hidden] \{\n    []\n}\n\nfn main() \{\n    let x = ret_priv()\n    io.println(\"hi\")\n}\n"
+    )
+    let rc10 = shell_exec(
+        "cd {base}/projA && {pact} build src/bad_generic_ret.pact -o build/bad_generic_ret > err_generic_ret.txt 2>&1"
+    )
+    if rc10 != 0 {
+        let err_generic_ret = read_file("{base}/projA/err_generic_ret.txt")
+        if err_generic_ret.contains("cannot access private") {
+            io.println("PASS: private type in generic return type correctly rejected")
+        } else {
+            io.println("FAIL: build failed but wrong error: {err_generic_ret}")
+        }
+    } else {
+        io.println("FAIL: build should have failed for private type in generic return type")
+    }
     // --- Cleanup ---
     shell_exec("rm -rf {base}")
     shell_exec("rm -rf ~/.pact/cache/git/*_test_e2e_pub*")

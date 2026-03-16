@@ -1622,13 +1622,23 @@ pub fn nr_check_fn(fn_node: Int) ! TypeCheck.Resolve, Diag.Report {
         while i < sublist_length(params_sl) {
             let p = sublist_get(params_sl, i)
             nr_define_at(np_name.get(p).unwrap(), p)
-            nr_check_type_ref(np_type_name.get(p).unwrap())
+            let ptype_ann = np_type_ann.get(p).unwrap()
+            if ptype_ann != -1 {
+                nr_check_type_ann_visibility(ptype_ann)
+            } else {
+                nr_check_type_ref(np_type_name.get(p).unwrap())
+            }
             i = i + 1
         }
     }
-    let ret_str = np_return_type.get(fn_node).unwrap()
-    if ret_str != "" {
-        nr_check_type_ref(ret_str)
+    let ret_ann = np_type_ann.get(fn_node).unwrap()
+    if ret_ann != -1 {
+        nr_check_type_ann_visibility(ret_ann)
+    } else {
+        let ret_str = np_return_type.get(fn_node).unwrap()
+        if ret_str != "" {
+            nr_check_type_ref(ret_str)
+        }
     }
     if nr_is_ffi == 0 {
         let body = np_body.get(fn_node).unwrap()
@@ -1639,8 +1649,23 @@ pub fn nr_check_fn(fn_node: Int) ! TypeCheck.Resolve, Diag.Report {
     nr_pop_scope()
 }
 
+pub fn nr_check_type_ann_visibility(ann_node: Int) ! TypeCheck.Resolve, Diag.Report {
+    if ann_node == -1 { return }
+    let name = np_name.get(ann_node).unwrap()
+    nr_check_type_ref(name)
+    let elems_sl = np_elements.get(ann_node).unwrap()
+    if elems_sl != -1 {
+        let mut i = 0
+        while i < sublist_length(elems_sl) {
+            nr_check_type_ann_visibility(sublist_get(elems_sl, i))
+            i = i + 1
+        }
+    }
+}
+
 pub fn nr_check_type_ref(name: Str) ! TypeCheck.Resolve, Diag.Report {
     if name == "" { return }
+    if name.len() == 1 { return }
     if is_known_type(name) != 0 {
         if is_private_access(name) != 0 {
             tc_errors.push("cannot access private type '{name}'")
@@ -1659,7 +1684,6 @@ pub fn nr_check_type_ref(name: Str) ! TypeCheck.Resolve, Diag.Report {
         tc_mark_symbol_used(name)
         return
     }
-    if name.len() == 1 { return }
     tc_errors.push("unknown type '{name}'")
     diag_error_no_loc("UnknownType", "E0507", "unknown type '{name}'", "")
 }
@@ -1689,7 +1713,7 @@ pub fn nr_check_node(node: Int) ! TypeCheck.Resolve, Diag.Report {
         }
         let let_type_ann = np_target.get(node).unwrap()
         if let_type_ann != -1 {
-            nr_check_type_ref(np_name.get(let_type_ann).unwrap())
+            nr_check_type_ann_visibility(let_type_ann)
         }
         let let_is_mut = np_is_mut.get(node).unwrap()
         nr_define_mut_at(np_name.get(node).unwrap(), let_is_mut, node)
