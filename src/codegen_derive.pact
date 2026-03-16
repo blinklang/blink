@@ -356,13 +356,16 @@ fn emit_list_deserialize(target: Str, node_var: Str, struct_name: Str, field_nam
     cg_indent = cg_indent + 1
     emit_line("int64_t _elem_node = {c_fn_name("json_at")}({node_var}, _ai);")
     if elem_type == CT_STRING {
-        emit_line("pact_list_push_str({target}, {c_fn_name("json_as_str")}(_elem_node));")
+        emit_line("pact_list_push({target}, (void*){c_fn_name("json_as_str")}(_elem_node));")
     } else if elem_type == CT_INT {
-        emit_line("pact_list_push_int({target}, {c_fn_name("json_as_int")}(_elem_node));")
+        emit_line("pact_list_push({target}, (void*)(intptr_t){c_fn_name("json_as_int")}(_elem_node));")
     } else if elem_type == CT_FLOAT {
-        emit_line("pact_list_push_float({target}, {c_fn_name("json_as_float")}(_elem_node));")
+        let fbox = fresh_temp("_fbox")
+        emit_line("double* {fbox} = (double*)pact_alloc(sizeof(double));")
+        emit_line("*{fbox} = {c_fn_name("json_as_float")}(_elem_node);")
+        emit_line("pact_list_push({target}, (void*){fbox});")
     } else if elem_type == CT_BOOL {
-        emit_line("pact_list_push_int({target}, {c_fn_name("json_as_bool")}(_elem_node));")
+        emit_line("pact_list_push({target}, (void*)(intptr_t){c_fn_name("json_as_bool")}(_elem_node));")
     } else {
         emit_line("// unsupported list element type")
     }
