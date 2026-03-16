@@ -1,6 +1,18 @@
 import codegen_types
 import diagnostics
 
+pub fn resolve_push_struct(val_str: Str, list_name: Str) -> Str {
+    let s = get_var_struct(val_str)
+    if s != "" {
+        return s
+    }
+    let ve = get_var_enum(val_str)
+    if ve != "" && is_data_enum(ve) != 0 {
+        return ve
+    }
+    get_list_elem_struct(list_name)
+}
+
 @allow(UnrestoredMutation, IncompleteStateRestore)
 pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
     let obj_node = np_obj.get(node).unwrap()
@@ -1776,8 +1788,8 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             if val_type != CT_INT {
                 set_list_elem_type(obj_str, val_type)
             }
-            let val_struct = get_var_struct(val_str)
-            if val_type == CT_VOID && val_struct != "" {
+            let val_struct = resolve_push_struct(val_str, obj_str)
+            if val_struct != "" {
                 set_list_elem_struct(obj_str, val_struct)
                 set_list_elem_type(obj_str, CT_VOID)
                 let box_tmp = fresh_temp("_box")

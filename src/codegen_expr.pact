@@ -54,6 +54,15 @@ pub fn iter_from_source(obj_str: Str, obj_type: Int) ! Codegen.Emit {
     }
 }
 
+pub fn propagate_enum_struct(name: Str, result_str: Str) {
+    if get_var_struct(name) == "" {
+        let ve = get_var_enum(name)
+        if ve != "" && is_data_enum(ve) != 0 {
+            set_var_struct(result_str, ve)
+        }
+    }
+}
+
 @allow(UnrestoredMutation, IncompleteStateRestore)
 pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
     let kind = np_kind.get(node).unwrap()
@@ -118,7 +127,8 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
             if is_data_enum(variant_enum2) != 0 {
                 let tag = get_variant_tag(variant_enum2, name)
                 expr_result_str = "({c_type_c_name(variant_enum2)})\{.tag = {tag}}"
-                expr_result_type = CT_INT
+                expr_result_type = CT_VOID
+                set_var_struct(expr_result_str, variant_enum2)
                 return
             }
             expr_result_str = "{c_type_c_name(variant_enum2)}_{name}"
@@ -180,6 +190,9 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
         if expr_result_type == CT_LIST {
             expr_list_elem_type = get_list_elem_type(name)
         }
+        if expr_result_type == CT_VOID {
+            propagate_enum_struct(name, expr_result_str)
+        }
         return
     }
 
@@ -222,7 +235,8 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
                 if is_data_enum(obj_name) != 0 {
                     let tag = get_variant_tag(obj_name, fa_field)
                     expr_result_str = "({c_type_c_name(obj_name)})\{.tag = {tag}}"
-                    expr_result_type = CT_INT
+                    expr_result_type = CT_VOID
+                    set_var_struct(expr_result_str, obj_name)
                     return
                 }
                 expr_result_str = "{c_type_c_name(obj_name)}_{fa_field}"
@@ -1218,7 +1232,8 @@ pub fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
             }
             init_str = init_str.concat("}")
             expr_result_str = init_str
-            expr_result_type = CT_INT
+            expr_result_type = CT_VOID
+            set_var_struct(init_str, variant_enum)
             return
         }
         if fn_name == "Some" {

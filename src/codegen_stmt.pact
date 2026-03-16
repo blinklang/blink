@@ -1280,7 +1280,7 @@ pub fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                 let elem_name = np_name.get(elem_ann).unwrap()
                 let elem_ct = type_from_name(elem_name)
                 set_list_elem_type(name, elem_ct)
-                if elem_ct == CT_VOID && is_struct_type(elem_name) != 0 {
+                if elem_ct == CT_VOID && (is_struct_type(elem_name) != 0 || is_data_enum(elem_name) != 0) {
                     set_list_elem_struct(name, elem_name)
                 }
                 if elem_ct == CT_LIST {
@@ -1290,7 +1290,7 @@ pub fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                         let nested_name = np_name.get(nested_ann).unwrap()
                         let nested_ct = type_from_name(nested_name)
                         set_list_nested_elem_type(name, nested_ct)
-                        if nested_ct == CT_VOID && is_struct_type(nested_name) != 0 {
+                        if nested_ct == CT_VOID && (is_struct_type(nested_name) != 0 || is_data_enum(nested_name) != 0) {
                             set_list_nested_elem_struct(name, nested_name)
                         }
                     }
@@ -1954,7 +1954,7 @@ pub fn emit_impl_method_def(fn_node: Int, impl_type: Str) ! Codegen.Emit, Codege
                                 let elem_name = np_name.get(elem_ann).unwrap()
                                 let elem_ct = type_from_name(elem_name)
                                 set_list_elem_type(pname, elem_ct)
-                                if elem_ct == CT_VOID && is_struct_type(elem_name) != 0 {
+                                if elem_ct == CT_VOID && (is_struct_type(elem_name) != 0 || is_data_enum(elem_name) != 0) {
                                     set_list_elem_struct(pname, elem_name)
                                 }
                                 if elem_ct == CT_LIST {
@@ -2384,7 +2384,7 @@ pub fn emit_fn_def(fn_node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope
                             let elem_name = np_name.get(elem_ann).unwrap()
                             let elem_ct = type_from_name(elem_name)
                             set_list_elem_type(pname, elem_ct)
-                            if elem_ct == CT_VOID && is_struct_type(elem_name) != 0 {
+                            if elem_ct == CT_VOID && (is_struct_type(elem_name) != 0 || is_data_enum(elem_name) != 0) {
                                 set_list_elem_struct(pname, elem_name)
                             }
                             if elem_ct == CT_LIST {
@@ -2704,7 +2704,7 @@ pub fn emit_mono_fn_def(fn_node: Int, concrete_args: Str) ! Codegen.Emit, Codege
                         let elem_name = np_name.get(elem_ann).unwrap()
                         let elem_ct = type_from_name(elem_name)
                         set_list_elem_type(pname, elem_ct)
-                        if elem_ct == CT_VOID && is_struct_type(elem_name) != 0 {
+                        if elem_ct == CT_VOID && (is_struct_type(elem_name) != 0 || is_data_enum(elem_name) != 0) {
                             set_list_elem_struct(pname, elem_name)
                         }
                         if elem_ct == CT_LIST {
@@ -2863,7 +2863,7 @@ pub fn emit_struct_typedef(td_node: Int) ! Codegen.Emit {
                     if elem_sl != -1 && sublist_length(elem_sl) > 0 {
                         let elem_ann = sublist_get(elem_sl, 0)
                         let elem_name = np_name.get(elem_ann).unwrap()
-                        if is_struct_type(elem_name) != 0 {
+                        if is_struct_type(elem_name) != 0 || is_data_enum(elem_name) != 0 {
                             sf_list_elems.push(StructFieldListElem { struct_name: name, field_name: fname, elem_struct: elem_name, elem_type: CT_VOID })
                         } else {
                             let ect = type_from_name(elem_name)
@@ -3053,7 +3053,7 @@ pub fn emit_top_level_let(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.S
                 let elem_name = np_name.get(elem_ann).unwrap()
                 let elem_ct = type_from_name(elem_name)
                 set_list_elem_type(name, elem_ct)
-                if elem_ct == CT_VOID && is_struct_type(elem_name) != 0 {
+                if elem_ct == CT_VOID && (is_struct_type(elem_name) != 0 || is_data_enum(elem_name) != 0) {
                     set_list_elem_struct(name, elem_name)
                 }
                 if elem_ct == CT_LIST {
@@ -3063,7 +3063,7 @@ pub fn emit_top_level_let(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.S
                         let nested_name = np_name.get(nested_ann).unwrap()
                         let nested_ct = type_from_name(nested_name)
                         set_list_nested_elem_type(name, nested_ct)
-                        if nested_ct == CT_VOID && is_struct_type(nested_name) != 0 {
+                        if nested_ct == CT_VOID && (is_struct_type(nested_name) != 0 || is_data_enum(nested_name) != 0) {
                             set_list_nested_elem_struct(name, nested_name)
                         }
                     }
