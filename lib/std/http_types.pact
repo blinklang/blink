@@ -1,3 +1,10 @@
+pub type UrlParts {
+    scheme: Str
+    host: Str
+    port: Int
+    path: Str
+}
+
 pub type Request {
     method: Str
     url: Str

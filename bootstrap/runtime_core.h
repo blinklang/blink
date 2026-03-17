@@ -557,140 +557,11 @@ PACT_UNUSED static const char* pact_str_slice(const char* s, int64_t start, int6
     return buf;
 }
 
-PACT_UNUSED static pact_list* pact_str_split(const char* s, const char* delim) {
-    pact_list* result = pact_list_new();
-    if (!s || !delim || !*delim) {
-        pact_list_push(result, (void*)strdup(s ? s : ""));
-        return result;
-    }
-    int64_t dlen = (int64_t)strlen(delim);
-    const char* p = s;
-    while (1) {
-        const char* found = strstr(p, delim);
-        if (!found) {
-            pact_list_push(result, (void*)strdup(p));
-            break;
-        }
-        int64_t seg_len = (int64_t)(found - p);
-        char* seg = (char*)pact_alloc(seg_len + 1);
-        memcpy(seg, p, (size_t)seg_len);
-        seg[seg_len] = '\0';
-        pact_list_push(result, (void*)seg);
-        p = found + dlen;
-    }
-    return result;
-}
-
-PACT_UNUSED static const char* pact_str_join(const pact_list* parts, const char* delim) {
-    if (!parts || parts->len == 0) return strdup("");
-    int64_t dlen = delim ? (int64_t)strlen(delim) : 0;
-    int64_t total = 0;
-    for (int64_t i = 0; i < parts->len; i++) {
-        total += (int64_t)strlen((const char*)parts->items[i]);
-        if (i > 0) total += dlen;
-    }
-    char* buf = (char*)pact_alloc(total + 1);
-    int64_t pos = 0;
-    for (int64_t i = 0; i < parts->len; i++) {
-        if (i > 0 && dlen > 0) {
-            memcpy(buf + pos, delim, (size_t)dlen);
-            pos += dlen;
-        }
-        int64_t slen = (int64_t)strlen((const char*)parts->items[i]);
-        memcpy(buf + pos, (const char*)parts->items[i], (size_t)slen);
-        pos += slen;
-    }
-    buf[pos] = '\0';
-    return buf;
-}
-
-PACT_UNUSED static const char* pact_str_trim(const char* s) {
-    if (!s) return strdup("");
-    const char* start = s;
-    while (*start && (*start == ' ' || *start == '\t' || *start == '\n' || *start == '\r')) start++;
-    const char* end = s + strlen(s);
-    while (end > start && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\n' || end[-1] == '\r')) end--;
-    int64_t len = (int64_t)(end - start);
-    char* buf = (char*)pact_alloc(len + 1);
-    memcpy(buf, start, (size_t)len);
-    buf[len] = '\0';
-    return buf;
-}
-
-PACT_UNUSED static const char* pact_str_to_upper(const char* s) {
-    if (!s) return strdup("");
-    int64_t len = (int64_t)strlen(s);
-    char* buf = (char*)pact_alloc(len + 1);
-    for (int64_t i = 0; i < len; i++) {
-        unsigned char c = (unsigned char)s[i];
-        buf[i] = (c >= 'a' && c <= 'z') ? (char)(c - 32) : (char)c;
-    }
-    buf[len] = '\0';
-    return buf;
-}
-
-PACT_UNUSED static const char* pact_str_to_lower(const char* s) {
-    if (!s) return strdup("");
-    int64_t len = (int64_t)strlen(s);
-    char* buf = (char*)pact_alloc(len + 1);
-    for (int64_t i = 0; i < len; i++) {
-        unsigned char c = (unsigned char)s[i];
-        buf[i] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : (char)c;
-    }
-    buf[len] = '\0';
-    return buf;
-}
-
-PACT_UNUSED static const char* pact_str_replace(const char* s, const char* needle, const char* repl) {
-    if (!s || !needle || !*needle) return strdup(s ? s : "");
-    if (!repl) repl = "";
-    int64_t slen = (int64_t)strlen(s);
-    int64_t nlen = (int64_t)strlen(needle);
-    int64_t rlen = (int64_t)strlen(repl);
-    int64_t count = 0;
-    const char* p = s;
-    while ((p = strstr(p, needle)) != NULL) { count++; p += nlen; }
-    int64_t new_len = slen + count * (rlen - nlen);
-    char* buf = (char*)pact_alloc(new_len + 1);
-    char* out = buf;
-    p = s;
-    while (1) {
-        const char* found = strstr(p, needle);
-        if (!found) { strcpy(out, p); break; }
-        int64_t seg = (int64_t)(found - p);
-        memcpy(out, p, (size_t)seg);
-        out += seg;
-        memcpy(out, repl, (size_t)rlen);
-        out += rlen;
-        p = found + nlen;
-    }
-    return buf;
-}
-
 PACT_UNUSED static int64_t pact_str_index_of(const char* s, const char* needle) {
     if (!s || !needle) return -1;
     const char* found = strstr(s, needle);
     if (!found) return -1;
     return (int64_t)(found - s);
-}
-
-PACT_UNUSED static pact_list* pact_str_lines(const char* s) {
-    pact_list* result = pact_list_new();
-    if (!s || !*s) return result;
-    const char* p = s;
-    while (*p) {
-        const char* eol = p;
-        while (*eol && *eol != '\n' && *eol != '\r') eol++;
-        int64_t seg_len = (int64_t)(eol - p);
-        char* seg = (char*)pact_alloc(seg_len + 1);
-        memcpy(seg, p, (size_t)seg_len);
-        seg[seg_len] = '\0';
-        pact_list_push(result, (void*)seg);
-        if (*eol == '\r' && *(eol + 1) == '\n') eol += 2;
-        else if (*eol) eol++;
-        p = eol;
-    }
-    return result;
 }
 
 /* ── File I/O ───────────────────────────────────────────────────────── */
@@ -1157,30 +1028,6 @@ PACT_UNUSED static pact_ctx pact_ctx_default(void) {
     ctx.env     = &pact_env_vtable_default;
     ctx.process = &pact_process_vtable_default;
     return ctx;
-}
-
-/* ── JSON helpers ────────────────────────────────────────────────── */
-
-PACT_UNUSED static const char* pact_json_escape_str(const char* s) {
-    if (!s) return "\"null\"";
-    int64_t len = (int64_t)strlen(s);
-    char* buf = (char*)pact_alloc(len * 2 + 3);
-    int64_t j = 0;
-    buf[j++] = '"';
-    for (int64_t i = 0; i < len; i++) {
-        char c = s[i];
-        switch (c) {
-            case '"':  buf[j++] = '\\'; buf[j++] = '"'; break;
-            case '\\': buf[j++] = '\\'; buf[j++] = '\\'; break;
-            case '\n': buf[j++] = '\\'; buf[j++] = 'n'; break;
-            case '\t': buf[j++] = '\\'; buf[j++] = 't'; break;
-            case '\r': buf[j++] = '\\'; buf[j++] = 'r'; break;
-            default:   buf[j++] = c; break;
-        }
-    }
-    buf[j++] = '"';
-    buf[j] = '\0';
-    return buf;
 }
 
 /* ── Debug assert ───────────────────────────────────────────────────── */

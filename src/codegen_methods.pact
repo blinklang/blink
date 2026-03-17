@@ -383,108 +383,9 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
         return
     }
 
-    // ── net.* operations ────────────────────────────────────────────
+    // ── net.* operations — old blocks removed, see pact_tcp_* blocks below ──
 
-    // net.request(req_idx) — HTTP request via POSIX sockets, returns response index
-    if np_kind.get(obj_node).unwrap() == NodeKind.Ident && np_name.get(obj_node).unwrap() == "net" && method == "request" {
-        let args_sl = np_args.get(node).unwrap()
-        if args_sl != -1 && sublist_length(args_sl) > 0 {
-            emit_expr(sublist_get(args_sl, 0))
-            let req_str = expr_result_str
-            let tmp_req = fresh_temp("__req_idx_")
-            let tmp_method = fresh_temp("__method_")
-            let tmp_method_str = fresh_temp("__method_str_")
-            let tmp_url = fresh_temp("__url_")
-            let tmp_body = fresh_temp("__body_")
-            let tmp_hdr_count = fresh_temp("__hdr_count_")
-            let tmp_hdr_names = fresh_temp("__hdr_names_")
-            let tmp_hdr_vals = fresh_temp("__hdr_vals_")
-            let tmp_out_body = fresh_temp("__out_body_")
-            let tmp_out_status = fresh_temp("__out_status_")
-            let tmp_resp = fresh_temp("__resp_idx_")
-            let tmp_hi = fresh_temp("__hi_")
-            let tmp_hj = fresh_temp("__hj_")
-
-            emit_line("int64_t {tmp_req} = {req_str};")
-            emit_line("int64_t {tmp_method} = (int64_t)(intptr_t)pact_list_get(req_methods, {tmp_req});")
-            emit_line("const char* {tmp_method_str} = pact_method_to_str({tmp_method});")
-            emit_line("const char* {tmp_url} = (const char*)pact_list_get(req_paths, {tmp_req});")
-            emit_line("const char* {tmp_body} = (const char*)pact_list_get(req_bodies, {tmp_req});")
-
-            // Collect headers matching this request
-            emit_line("int64_t {tmp_hdr_count} = 0;")
-            emit_line("for (int64_t {tmp_hi} = 0; {tmp_hi} < pact_list_len(req_header_owners); {tmp_hi}++) \{")
-            emit_line("  if ((int64_t)(intptr_t)pact_list_get(req_header_owners, {tmp_hi}) == {tmp_req}) {tmp_hdr_count}++;")
-            emit_line("}")
-            emit_line("const char** {tmp_hdr_names} = (const char**)pact_alloc(sizeof(const char*) * ({tmp_hdr_count} + 1));")
-            emit_line("const char** {tmp_hdr_vals} = (const char**)pact_alloc(sizeof(const char*) * ({tmp_hdr_count} + 1));")
-            emit_line("int64_t {tmp_hj} = 0;")
-            emit_line("for (int64_t {tmp_hi} = 0; {tmp_hi} < pact_list_len(req_header_owners); {tmp_hi}++) \{")
-            emit_line("  if ((int64_t)(intptr_t)pact_list_get(req_header_owners, {tmp_hi}) == {tmp_req}) \{")
-            emit_line("    {tmp_hdr_names}[{tmp_hj}] = (const char*)pact_list_get(req_header_names, {tmp_hi});")
-            emit_line("    {tmp_hdr_vals}[{tmp_hj}] = (const char*)pact_list_get(req_header_values, {tmp_hi});")
-            emit_line("    {tmp_hj}++;")
-            emit_line("  }")
-            emit_line("}")
-
-            // Call curl
-            emit_line("const char* {tmp_out_body} = NULL;")
-            emit_line("int64_t {tmp_out_status} = 0;")
-            emit_line("int __curl_rc = pact_curl_perform({tmp_method_str}, {tmp_url}, {tmp_body}, {tmp_hdr_names}, {tmp_hdr_vals}, {tmp_hdr_count}, &{tmp_out_body}, &{tmp_out_status});")
-
-            // Build response
-            emit_line("int64_t {tmp_resp};")
-            emit_line("if (__curl_rc != 0) \{")
-            emit_line("  {tmp_resp} = -1;")
-            emit_line("} else \{")
-            emit_line("  {tmp_resp} = pact_list_len(resp_statuses);")
-            emit_line("  pact_list_push(resp_statuses, (void*)(intptr_t){tmp_out_status});")
-            emit_line("  pact_list_push(resp_bodies, (void*){tmp_out_body});")
-            emit_line("}")
-
-            expr_result_str = tmp_resp
-        } else {
-            expr_result_str = "-1"
-        }
-        expr_result_type = CT_INT
-        return
-    }
-
-    // net.listen(addr, port) — TCP listen, returns fd
-    if np_kind.get(obj_node).unwrap() == NodeKind.Ident && np_name.get(obj_node).unwrap() == "net" && method == "listen" {
-        let args_sl = np_args.get(node).unwrap()
-        if args_sl != -1 && sublist_length(args_sl) >= 2 {
-            emit_expr(sublist_get(args_sl, 0))
-            let addr_str = expr_result_str
-            emit_expr(sublist_get(args_sl, 1))
-            let port_str = expr_result_str
-            let tmp = fresh_temp("__listen_fd_")
-            emit_line("int64_t {tmp} = pact_tcp_listen({addr_str}, {port_str});")
-            expr_result_str = tmp
-        } else {
-            expr_result_str = "-1"
-        }
-        expr_result_type = CT_INT
-        return
-    }
-
-    // net.accept(fd) — TCP accept, returns client fd
-    if np_kind.get(obj_node).unwrap() == NodeKind.Ident && np_name.get(obj_node).unwrap() == "net" && method == "accept" {
-        let args_sl = np_args.get(node).unwrap()
-        if args_sl != -1 && sublist_length(args_sl) > 0 {
-            emit_expr(sublist_get(args_sl, 0))
-            let fd_str = expr_result_str
-            let tmp = fresh_temp("__accept_fd_")
-            emit_line("int64_t {tmp} = pact_tcp_accept({fd_str});")
-            expr_result_str = tmp
-        } else {
-            expr_result_str = "-1"
-        }
-        expr_result_type = CT_INT
-        return
-    }
-
-    // net.read_line(fd) — read line from socket
+    // net.read_line(fd) — read line from socket (unix socket primitive)
     if np_kind.get(obj_node).unwrap() == NodeKind.Ident && np_name.get(obj_node).unwrap() == "net" && method == "read_line" {
         let args_sl = np_args.get(node).unwrap()
         if args_sl != -1 && sublist_length(args_sl) > 0 {
@@ -497,67 +398,6 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             expr_result_str = "\"\""
         }
         expr_result_type = CT_STRING
-        return
-    }
-
-    // net.read_n(fd, n) — read exactly n bytes
-    if np_kind.get(obj_node).unwrap() == NodeKind.Ident && np_name.get(obj_node).unwrap() == "net" && method == "read_n" {
-        let args_sl = np_args.get(node).unwrap()
-        if args_sl != -1 && sublist_length(args_sl) >= 2 {
-            emit_expr(sublist_get(args_sl, 0))
-            let fd_str = expr_result_str
-            emit_expr(sublist_get(args_sl, 1))
-            let n_str = expr_result_str
-            let tmp = fresh_temp("__rn_")
-            emit_line("const char* {tmp} = pact_socket_read_n({fd_str}, {n_str});")
-            expr_result_str = tmp
-        } else {
-            expr_result_str = "\"\""
-        }
-        expr_result_type = CT_STRING
-        return
-    }
-
-    // net.write(fd, data) — write data to socket
-    if np_kind.get(obj_node).unwrap() == NodeKind.Ident && np_name.get(obj_node).unwrap() == "net" && method == "write" {
-        let args_sl = np_args.get(node).unwrap()
-        if args_sl != -1 && sublist_length(args_sl) >= 2 {
-            emit_expr(sublist_get(args_sl, 0))
-            let fd_str = expr_result_str
-            emit_expr(sublist_get(args_sl, 1))
-            let data_str = expr_result_str
-            emit_line("pact_socket_write({fd_str}, {data_str});")
-        }
-        expr_result_str = "0"
-        expr_result_type = CT_VOID
-        return
-    }
-
-    // net.write_line(fd, data) — write data + CRLF to socket
-    if np_kind.get(obj_node).unwrap() == NodeKind.Ident && np_name.get(obj_node).unwrap() == "net" && method == "write_line" {
-        let args_sl = np_args.get(node).unwrap()
-        if args_sl != -1 && sublist_length(args_sl) >= 2 {
-            emit_expr(sublist_get(args_sl, 0))
-            let fd_str = expr_result_str
-            emit_expr(sublist_get(args_sl, 1))
-            let data_str = expr_result_str
-            emit_line("pact_socket_write_line({fd_str}, {data_str});")
-        }
-        expr_result_str = "0"
-        expr_result_type = CT_VOID
-        return
-    }
-
-    // net.close(fd) — close socket
-    if np_kind.get(obj_node).unwrap() == NodeKind.Ident && np_name.get(obj_node).unwrap() == "net" && method == "close" {
-        let args_sl = np_args.get(node).unwrap()
-        if args_sl != -1 && sublist_length(args_sl) > 0 {
-            emit_expr(sublist_get(args_sl, 0))
-            let fd_str = expr_result_str
-            emit_line("close((int){fd_str});")
-        }
-        expr_result_str = "0"
-        expr_result_type = CT_VOID
         return
     }
 
@@ -1188,38 +1028,16 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
         }
     }
 
-    // net.request(req) -> Result[Response, NetError]
+    // net.request(req) -> Result[Response, NetError] — redirects to Pact stdlib
     if np_kind.get(obj_node).unwrap() == NodeKind.Ident && np_name.get(obj_node).unwrap() == "net" && method == "request" {
         let args_sl = np_args.get(node).unwrap()
         if args_sl != -1 && sublist_length(args_sl) > 0 {
             emit_expr(sublist_get(args_sl, 0))
             let req_str = expr_result_str
-
-            let status_tmp = fresh_temp("__http_status_")
-            let body_tmp = fresh_temp("__http_body_")
-            let hdrs_tmp = fresh_temp("__http_hdrs_")
-            let rc_tmp = fresh_temp("__http_rc_")
-            let result_tmp = fresh_temp("__http_result_")
-
             ensure_struct_result_type("Response", "NetError")
             let result_type = struct_result_c_type("Response", "NetError")
-
-            emit_line("int64_t {status_tmp} = 0;")
-            emit_line("const char* {body_tmp} = \"\";")
-            emit_line("pact_map* {hdrs_tmp} = NULL;")
-            emit_line("int {rc_tmp} = pact_http_request({req_str}.method, {req_str}.url, {req_str}.body, {req_str}.headers, {req_str}.timeout_ms, &{status_tmp}, &{body_tmp}, &{hdrs_tmp});")
-            emit_line("{result_type} {result_tmp};")
-            emit_line("if ({rc_tmp} == 0) \{")
-            emit_line("    {result_tmp}.tag = 0;")
-            emit_line("    {result_tmp}.ok.status = {status_tmp};")
-            emit_line("    {result_tmp}.ok.body = {body_tmp};")
-            emit_line("    {result_tmp}.ok.headers = {hdrs_tmp} ? {hdrs_tmp} : pact_map_new();")
-            emit_line("} else \{")
-            emit_line("    {result_tmp}.tag = 1;")
-            emit_line("    {result_tmp}.err.tag = 1;")
-            emit_line("    {result_tmp}.err.data.ConnectionRefused.msg = {body_tmp} ? {body_tmp} : \"request failed\";")
-            emit_line("}")
-
+            let result_tmp = fresh_temp("__http_result_")
+            emit_line("{result_type} {result_tmp} = {c_fn_name("http_do_request")}({req_str});")
             set_var_struct(result_tmp, "")
             set_var_result_struct(result_tmp, CT_VOID, CT_VOID, "Response", "NetError")
             expr_result_str = result_tmp
@@ -1232,275 +1050,8 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
         return
     }
 
-    // net.get(url) -> Result[Response, NetError]
-    if np_kind.get(obj_node).unwrap() == NodeKind.Ident && np_name.get(obj_node).unwrap() == "net" && method == "get" {
-        let args_sl = np_args.get(node).unwrap()
-        if args_sl != -1 && sublist_length(args_sl) > 0 {
-            emit_expr(sublist_get(args_sl, 0))
-            let url_str = expr_result_str
-
-            ensure_struct_result_type("Response", "NetError")
-            let result_type = struct_result_c_type("Response", "NetError")
-
-            let status_tmp = fresh_temp("__http_status_")
-            let body_tmp = fresh_temp("__http_body_")
-            let hdrs_tmp = fresh_temp("__http_hdrs_")
-            let rc_tmp = fresh_temp("__http_rc_")
-            let result_tmp = fresh_temp("__http_result_")
-
-            emit_line("int64_t {status_tmp} = 0;")
-            emit_line("const char* {body_tmp} = \"\";")
-            emit_line("pact_map* {hdrs_tmp} = NULL;")
-            emit_line("int {rc_tmp} = pact_http_request(\"GET\", {url_str}, \"\", NULL, 30000, &{status_tmp}, &{body_tmp}, &{hdrs_tmp});")
-            emit_line("{result_type} {result_tmp};")
-            emit_line("if ({rc_tmp} == 0) \{")
-            emit_line("    {result_tmp}.tag = 0;")
-            emit_line("    {result_tmp}.ok.status = {status_tmp};")
-            emit_line("    {result_tmp}.ok.body = {body_tmp};")
-            emit_line("    {result_tmp}.ok.headers = {hdrs_tmp} ? {hdrs_tmp} : pact_map_new();")
-            emit_line("} else \{")
-            emit_line("    {result_tmp}.tag = 1;")
-            emit_line("    {result_tmp}.err.tag = 1;")
-            emit_line("    {result_tmp}.err.data.ConnectionRefused.msg = {body_tmp} ? {body_tmp} : \"request failed\";")
-            emit_line("}")
-
-            set_var_struct(result_tmp, "")
-            set_var_result_struct(result_tmp, CT_VOID, CT_VOID, "Response", "NetError")
-            expr_result_str = result_tmp
-            expr_result_type = CT_RESULT
-            expr_result_ok_type = CT_VOID
-            expr_result_err_type = CT_VOID
-            expr_result_ok_struct = "Response"
-            expr_result_err_struct = "NetError"
-        }
-        return
-    }
-
-    // net.post(url, body) -> Result[Response, NetError]
-    if np_kind.get(obj_node).unwrap() == NodeKind.Ident && np_name.get(obj_node).unwrap() == "net" && method == "post" {
-        let args_sl = np_args.get(node).unwrap()
-        if args_sl != -1 && sublist_length(args_sl) >= 2 {
-            emit_expr(sublist_get(args_sl, 0))
-            let url_str = expr_result_str
-            emit_expr(sublist_get(args_sl, 1))
-            let body_str = expr_result_str
-
-            ensure_struct_result_type("Response", "NetError")
-            let result_type = struct_result_c_type("Response", "NetError")
-
-            let status_tmp = fresh_temp("__http_status_")
-            let body_tmp = fresh_temp("__http_body_")
-            let hdrs_tmp = fresh_temp("__http_hdrs_")
-            let rc_tmp = fresh_temp("__http_rc_")
-            let result_tmp = fresh_temp("__http_result_")
-
-            emit_line("int64_t {status_tmp} = 0;")
-            emit_line("const char* {body_tmp} = \"\";")
-            emit_line("pact_map* {hdrs_tmp} = NULL;")
-            emit_line("int {rc_tmp} = pact_http_request(\"POST\", {url_str}, {body_str}, NULL, 30000, &{status_tmp}, &{body_tmp}, &{hdrs_tmp});")
-            emit_line("{result_type} {result_tmp};")
-            emit_line("if ({rc_tmp} == 0) \{")
-            emit_line("    {result_tmp}.tag = 0;")
-            emit_line("    {result_tmp}.ok.status = {status_tmp};")
-            emit_line("    {result_tmp}.ok.body = {body_tmp};")
-            emit_line("    {result_tmp}.ok.headers = {hdrs_tmp} ? {hdrs_tmp} : pact_map_new();")
-            emit_line("} else \{")
-            emit_line("    {result_tmp}.tag = 1;")
-            emit_line("    {result_tmp}.err.tag = 1;")
-            emit_line("    {result_tmp}.err.data.ConnectionRefused.msg = {body_tmp} ? {body_tmp} : \"request failed\";")
-            emit_line("}")
-
-            set_var_struct(result_tmp, "")
-            set_var_result_struct(result_tmp, CT_VOID, CT_VOID, "Response", "NetError")
-            expr_result_str = result_tmp
-            expr_result_type = CT_RESULT
-            expr_result_ok_type = CT_VOID
-            expr_result_err_type = CT_VOID
-            expr_result_ok_struct = "Response"
-            expr_result_err_struct = "NetError"
-        }
-        return
-    }
-
-    // net.put(url, body) -> Result[Response, NetError]
-    if np_kind.get(obj_node).unwrap() == NodeKind.Ident && np_name.get(obj_node).unwrap() == "net" && method == "put" {
-        let args_sl = np_args.get(node).unwrap()
-        if args_sl != -1 && sublist_length(args_sl) >= 2 {
-            emit_expr(sublist_get(args_sl, 0))
-            let url_str = expr_result_str
-            emit_expr(sublist_get(args_sl, 1))
-            let body_str = expr_result_str
-
-            ensure_struct_result_type("Response", "NetError")
-            let result_type = struct_result_c_type("Response", "NetError")
-
-            let status_tmp = fresh_temp("__http_status_")
-            let body_tmp = fresh_temp("__http_body_")
-            let hdrs_tmp = fresh_temp("__http_hdrs_")
-            let rc_tmp = fresh_temp("__http_rc_")
-            let result_tmp = fresh_temp("__http_result_")
-
-            emit_line("int64_t {status_tmp} = 0;")
-            emit_line("const char* {body_tmp} = \"\";")
-            emit_line("pact_map* {hdrs_tmp} = NULL;")
-            emit_line("int {rc_tmp} = pact_http_request(\"PUT\", {url_str}, {body_str}, NULL, 30000, &{status_tmp}, &{body_tmp}, &{hdrs_tmp});")
-            emit_line("{result_type} {result_tmp};")
-            emit_line("if ({rc_tmp} == 0) \{")
-            emit_line("    {result_tmp}.tag = 0;")
-            emit_line("    {result_tmp}.ok.status = {status_tmp};")
-            emit_line("    {result_tmp}.ok.body = {body_tmp};")
-            emit_line("    {result_tmp}.ok.headers = {hdrs_tmp} ? {hdrs_tmp} : pact_map_new();")
-            emit_line("} else \{")
-            emit_line("    {result_tmp}.tag = 1;")
-            emit_line("    {result_tmp}.err.tag = 1;")
-            emit_line("    {result_tmp}.err.data.ConnectionRefused.msg = {body_tmp} ? {body_tmp} : \"request failed\";")
-            emit_line("}")
-
-            set_var_struct(result_tmp, "")
-            set_var_result_struct(result_tmp, CT_VOID, CT_VOID, "Response", "NetError")
-            expr_result_str = result_tmp
-            expr_result_type = CT_RESULT
-            expr_result_ok_type = CT_VOID
-            expr_result_err_type = CT_VOID
-            expr_result_ok_struct = "Response"
-            expr_result_err_struct = "NetError"
-        }
-        return
-    }
-
-    // net.delete(url) -> Result[Response, NetError]
-    if np_kind.get(obj_node).unwrap() == NodeKind.Ident && np_name.get(obj_node).unwrap() == "net" && method == "delete" {
-        let args_sl = np_args.get(node).unwrap()
-        if args_sl != -1 && sublist_length(args_sl) > 0 {
-            emit_expr(sublist_get(args_sl, 0))
-            let url_str = expr_result_str
-
-            ensure_struct_result_type("Response", "NetError")
-            let result_type = struct_result_c_type("Response", "NetError")
-
-            let status_tmp = fresh_temp("__http_status_")
-            let body_tmp = fresh_temp("__http_body_")
-            let hdrs_tmp = fresh_temp("__http_hdrs_")
-            let rc_tmp = fresh_temp("__http_rc_")
-            let result_tmp = fresh_temp("__http_result_")
-
-            emit_line("int64_t {status_tmp} = 0;")
-            emit_line("const char* {body_tmp} = \"\";")
-            emit_line("pact_map* {hdrs_tmp} = NULL;")
-            emit_line("int {rc_tmp} = pact_http_request(\"DELETE\", {url_str}, \"\", NULL, 30000, &{status_tmp}, &{body_tmp}, &{hdrs_tmp});")
-            emit_line("{result_type} {result_tmp};")
-            emit_line("if ({rc_tmp} == 0) \{")
-            emit_line("    {result_tmp}.tag = 0;")
-            emit_line("    {result_tmp}.ok.status = {status_tmp};")
-            emit_line("    {result_tmp}.ok.body = {body_tmp};")
-            emit_line("    {result_tmp}.ok.headers = {hdrs_tmp} ? {hdrs_tmp} : pact_map_new();")
-            emit_line("} else \{")
-            emit_line("    {result_tmp}.tag = 1;")
-            emit_line("    {result_tmp}.err.tag = 1;")
-            emit_line("    {result_tmp}.err.data.ConnectionRefused.msg = {body_tmp} ? {body_tmp} : \"request failed\";")
-            emit_line("}")
-
-            set_var_struct(result_tmp, "")
-            set_var_result_struct(result_tmp, CT_VOID, CT_VOID, "Response", "NetError")
-            expr_result_str = result_tmp
-            expr_result_type = CT_RESULT
-            expr_result_ok_type = CT_VOID
-            expr_result_err_type = CT_VOID
-            expr_result_ok_struct = "Response"
-            expr_result_err_struct = "NetError"
-        }
-        return
-    }
-
-    // net.head(url) -> Result[Response, NetError]
-    if np_kind.get(obj_node).unwrap() == NodeKind.Ident && np_name.get(obj_node).unwrap() == "net" && method == "head" {
-        let args_sl = np_args.get(node).unwrap()
-        if args_sl != -1 && sublist_length(args_sl) > 0 {
-            emit_expr(sublist_get(args_sl, 0))
-            let url_str = expr_result_str
-
-            ensure_struct_result_type("Response", "NetError")
-            let result_type = struct_result_c_type("Response", "NetError")
-
-            let status_tmp = fresh_temp("__http_status_")
-            let body_tmp = fresh_temp("__http_body_")
-            let hdrs_tmp = fresh_temp("__http_hdrs_")
-            let rc_tmp = fresh_temp("__http_rc_")
-            let result_tmp = fresh_temp("__http_result_")
-
-            emit_line("int64_t {status_tmp} = 0;")
-            emit_line("const char* {body_tmp} = \"\";")
-            emit_line("pact_map* {hdrs_tmp} = NULL;")
-            emit_line("int {rc_tmp} = pact_http_request(\"HEAD\", {url_str}, \"\", NULL, 30000, &{status_tmp}, &{body_tmp}, &{hdrs_tmp});")
-            emit_line("{result_type} {result_tmp};")
-            emit_line("if ({rc_tmp} == 0) \{")
-            emit_line("    {result_tmp}.tag = 0;")
-            emit_line("    {result_tmp}.ok.status = {status_tmp};")
-            emit_line("    {result_tmp}.ok.body = {body_tmp};")
-            emit_line("    {result_tmp}.ok.headers = {hdrs_tmp} ? {hdrs_tmp} : pact_map_new();")
-            emit_line("} else \{")
-            emit_line("    {result_tmp}.tag = 1;")
-            emit_line("    {result_tmp}.err.tag = 1;")
-            emit_line("    {result_tmp}.err.data.ConnectionRefused.msg = {body_tmp} ? {body_tmp} : \"request failed\";")
-            emit_line("}")
-
-            set_var_struct(result_tmp, "")
-            set_var_result_struct(result_tmp, CT_VOID, CT_VOID, "Response", "NetError")
-            expr_result_str = result_tmp
-            expr_result_type = CT_RESULT
-            expr_result_ok_type = CT_VOID
-            expr_result_err_type = CT_VOID
-            expr_result_ok_struct = "Response"
-            expr_result_err_struct = "NetError"
-        }
-        return
-    }
-
-    // net.patch(url, body) -> Result[Response, NetError]
-    if np_kind.get(obj_node).unwrap() == NodeKind.Ident && np_name.get(obj_node).unwrap() == "net" && method == "patch" {
-        let args_sl = np_args.get(node).unwrap()
-        if args_sl != -1 && sublist_length(args_sl) >= 2 {
-            emit_expr(sublist_get(args_sl, 0))
-            let url_str = expr_result_str
-            emit_expr(sublist_get(args_sl, 1))
-            let body_str = expr_result_str
-
-            ensure_struct_result_type("Response", "NetError")
-            let result_type = struct_result_c_type("Response", "NetError")
-
-            let status_tmp = fresh_temp("__http_status_")
-            let body_tmp = fresh_temp("__http_body_")
-            let hdrs_tmp = fresh_temp("__http_hdrs_")
-            let rc_tmp = fresh_temp("__http_rc_")
-            let result_tmp = fresh_temp("__http_result_")
-
-            emit_line("int64_t {status_tmp} = 0;")
-            emit_line("const char* {body_tmp} = \"\";")
-            emit_line("pact_map* {hdrs_tmp} = NULL;")
-            emit_line("int {rc_tmp} = pact_http_request(\"PATCH\", {url_str}, {body_str}, NULL, 30000, &{status_tmp}, &{body_tmp}, &{hdrs_tmp});")
-            emit_line("{result_type} {result_tmp};")
-            emit_line("if ({rc_tmp} == 0) \{")
-            emit_line("    {result_tmp}.tag = 0;")
-            emit_line("    {result_tmp}.ok.status = {status_tmp};")
-            emit_line("    {result_tmp}.ok.body = {body_tmp};")
-            emit_line("    {result_tmp}.ok.headers = {hdrs_tmp} ? {hdrs_tmp} : pact_map_new();")
-            emit_line("} else \{")
-            emit_line("    {result_tmp}.tag = 1;")
-            emit_line("    {result_tmp}.err.tag = 1;")
-            emit_line("    {result_tmp}.err.data.ConnectionRefused.msg = {body_tmp} ? {body_tmp} : \"request failed\";")
-            emit_line("}")
-
-            set_var_struct(result_tmp, "")
-            set_var_result_struct(result_tmp, CT_VOID, CT_VOID, "Response", "NetError")
-            expr_result_str = result_tmp
-            expr_result_type = CT_RESULT
-            expr_result_ok_type = CT_VOID
-            expr_result_err_type = CT_VOID
-            expr_result_ok_struct = "Response"
-            expr_result_err_struct = "NetError"
-        }
-        return
-    }
+    // net.get/post/put/delete/head/patch — handled by Pact stdlib (http_client.pact)
+    // Users should use http_client.get(), http_client.post(), etc.
 
     // net.listen(host, port) -> Int
     if np_kind.get(obj_node).unwrap() == NodeKind.Ident && np_name.get(obj_node).unwrap() == "net" && method == "listen" {
@@ -1557,6 +1108,41 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
         emit_line("pact_tcp_close({fd_str});")
         expr_result_str = "0"
         expr_result_type = CT_VOID
+        return
+    }
+
+    // net.connect(host, port) -> Int
+    if np_kind.get(obj_node).unwrap() == NodeKind.Ident && np_name.get(obj_node).unwrap() == "net" && method == "connect" {
+        let args_sl = np_args.get(node).unwrap()
+        emit_expr(sublist_get(args_sl, 0))
+        let host_str = expr_result_str
+        emit_expr(sublist_get(args_sl, 1))
+        let port_str = expr_result_str
+        expr_result_str = "pact_tcp_connect({host_str}, {port_str})"
+        expr_result_type = CT_INT
+        return
+    }
+
+    // net.set_timeout(fd, ms)
+    if np_kind.get(obj_node).unwrap() == NodeKind.Ident && np_name.get(obj_node).unwrap() == "net" && method == "set_timeout" {
+        let args_sl = np_args.get(node).unwrap()
+        emit_expr(sublist_get(args_sl, 0))
+        let fd_str = expr_result_str
+        emit_expr(sublist_get(args_sl, 1))
+        let ms_str = expr_result_str
+        emit_line("pact_tcp_set_timeout({fd_str}, {ms_str});")
+        expr_result_str = "0"
+        expr_result_type = CT_VOID
+        return
+    }
+
+    // net.read_all(fd) -> Str
+    if np_kind.get(obj_node).unwrap() == NodeKind.Ident && np_name.get(obj_node).unwrap() == "net" && method == "read_all" {
+        let args_sl = np_args.get(node).unwrap()
+        emit_expr(sublist_get(args_sl, 0))
+        let fd_str = expr_result_str
+        expr_result_str = "pact_tcp_read_all({fd_str})"
+        expr_result_type = CT_STRING
         return
     }
 
