@@ -31,6 +31,15 @@ pub let mut diag_source_file: Str = ""
 pub let mut diag_count: Int = 0        // error count only
 pub let mut diag_warn_count: Int = 0   // warning count only
 pub let mut diag_module_files: Map[Str, Str] = Map()
+pub let mut diag_file_ranges_start: List[Int] = []
+pub let mut diag_file_ranges_end: List[Int] = []
+pub let mut diag_file_ranges_path: List[Str] = []
+
+pub fn diag_register_file_range(start: Int, end: Int, path: Str) {
+    diag_file_ranges_start.push(start)
+    diag_file_ranges_end.push(end)
+    diag_file_ranges_path.push(path)
+}
 
 // ── Lint severity overrides from [lints] in pact.toml ───────────────
 pub let mut lint_overrides: Map[Str, Str] = Map()
@@ -135,6 +144,13 @@ pub fn diag_file_for_node(node_id: Int) -> Str {
         if f != "" {
             return f
         }
+    }
+    let mut ri = 0
+    while ri < diag_file_ranges_start.len() {
+        if node_id >= diag_file_ranges_start.get(ri).unwrap() && node_id < diag_file_ranges_end.get(ri).unwrap() {
+            return diag_file_ranges_path.get(ri).unwrap()
+        }
+        ri = ri + 1
     }
     diag_source_file
 }
@@ -307,6 +323,9 @@ pub fn diag_reset() {
     diag_count = 0
     diag_warn_count = 0
     diag_module_files = Map()
+    diag_file_ranges_start = []
+    diag_file_ranges_end = []
+    diag_file_ranges_path = []
     lint_overrides = Map()
     diag_allow_set = Map()
 }

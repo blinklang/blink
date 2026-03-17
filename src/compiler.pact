@@ -684,6 +684,7 @@ fn load_module(dotted_path: Str, file_path: Str, src_root: Str, all_programs: Li
     let first_imp_node = np_kind.len()
     let imported_prog = parse_program()
     attach_comments_pass(imported_prog, first_imp_node)
+    diag_register_file_range(first_imp_node, np_kind.len(), file_path)
     collect_imports(imported_prog, src_root, all_programs)
     all_programs.push(imported_prog)
     let mut mod_key = dots_to_underscores(dotted_path)

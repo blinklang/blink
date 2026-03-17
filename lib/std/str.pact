@@ -105,15 +105,15 @@ pub fn str_split(s: Str, delim: Str) -> List[Str] {
         return result
     }
     let slen = s.len()
-    let mut pos = 0
+    let mut cursor = 0
     loop {
-        let idx = s.slice(pos, slen).index_of(delim)
+        let idx = s.slice(cursor, slen).index_of(delim)
         if idx == -1 {
-            result.push(s.slice(pos, slen))
+            result.push(s.slice(cursor, slen))
             break
         }
-        result.push(s.slice(pos, pos + idx))
-        pos = pos + idx + dlen
+        result.push(s.slice(cursor, cursor + idx))
+        cursor = cursor + idx + dlen
     }
     result
 }
@@ -142,16 +142,16 @@ pub fn str_replace(s: Str, needle: Str, repl: Str) -> Str {
     }
     let slen = s.len()
     let sb = StringBuilder.new()
-    let mut pos = 0
+    let mut cursor = 0
     loop {
-        let idx = s.slice(pos, slen).index_of(needle)
+        let idx = s.slice(cursor, slen).index_of(needle)
         if idx == -1 {
-            sb.write(s.slice(pos, slen))
+            sb.write(s.slice(cursor, slen))
             break
         }
-        sb.write(s.slice(pos, pos + idx))
+        sb.write(s.slice(cursor, cursor + idx))
         sb.write(repl)
-        pos = pos + idx + nlen
+        cursor = cursor + idx + nlen
     }
     sb.to_str()
 }
@@ -162,23 +162,23 @@ pub fn str_lines(s: Str) -> List[Str] {
     if slen == 0 {
         return result
     }
-    let mut pos = 0
+    let mut cursor = 0
     let mut line_start = 0
-    while pos < slen {
-        let c = s.char_at(pos)
+    while cursor < slen {
+        let c = s.char_at(cursor)
         if c == 10 {
-            result.push(s.slice(line_start, pos))
-            pos = pos + 1
-            line_start = pos
+            result.push(s.slice(line_start, cursor))
+            cursor = cursor + 1
+            line_start = cursor
         } else if c == 13 {
-            result.push(s.slice(line_start, pos))
-            pos = pos + 1
-            if pos < slen && s.char_at(pos) == 10 {
-                pos = pos + 1
+            result.push(s.slice(line_start, cursor))
+            cursor = cursor + 1
+            if cursor < slen && s.char_at(cursor) == 10 {
+                cursor = cursor + 1
             }
-            line_start = pos
+            line_start = cursor
         } else {
-            pos = pos + 1
+            cursor = cursor + 1
         }
     }
     if line_start < slen {

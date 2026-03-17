@@ -97,52 +97,52 @@ fn parse_version_range(s: Str, start: Int, end: Int) -> Int {
     ver_has_minor = 0
     ver_has_patch = 0
 
-    let mut pos = start
+    let mut cursor = start
 
     // Skip leading whitespace
-    pos = skip_whitespace(s, pos)
+    cursor = skip_whitespace(s, cursor)
 
-    if pos >= end {
+    if cursor >= end {
         return 0
     }
 
     // Parse major
-    let major_start = pos
-    while pos < end && is_digit(s.char_at(pos)) {
-        pos = pos + 1
+    let major_start = cursor
+    while cursor < end && is_digit(s.char_at(cursor)) {
+        cursor = cursor + 1
     }
-    if pos == major_start {
+    if cursor == major_start {
         return 0
     }
-    ver_major = str_to_int(s, major_start, pos - major_start)
+    ver_major = str_to_int(s, major_start, cursor - major_start)
 
     // Check for .minor
-    if pos < end && s.char_at(pos) == CH_DOT {
-        pos = pos + 1
+    if cursor < end && s.char_at(cursor) == CH_DOT {
+        cursor = cursor + 1
         ver_has_minor = 1
 
-        let minor_start = pos
-        while pos < end && is_digit(s.char_at(pos)) {
-            pos = pos + 1
+        let minor_start = cursor
+        while cursor < end && is_digit(s.char_at(cursor)) {
+            cursor = cursor + 1
         }
-        if pos == minor_start {
+        if cursor == minor_start {
             return 0
         }
-        ver_minor = str_to_int(s, minor_start, pos - minor_start)
+        ver_minor = str_to_int(s, minor_start, cursor - minor_start)
 
         // Check for .patch
-        if pos < end && s.char_at(pos) == CH_DOT {
-            pos = pos + 1
+        if cursor < end && s.char_at(cursor) == CH_DOT {
+            cursor = cursor + 1
             ver_has_patch = 1
 
-            let patch_start = pos
-            while pos < end && is_digit(s.char_at(pos)) {
-                pos = pos + 1
+            let patch_start = cursor
+            while cursor < end && is_digit(s.char_at(cursor)) {
+                cursor = cursor + 1
             }
-            if pos == patch_start {
+            if cursor == patch_start {
                 return 0
             }
-            ver_patch = str_to_int(s, patch_start, pos - patch_start)
+            ver_patch = str_to_int(s, patch_start, cursor - patch_start)
         }
     }
 
@@ -234,19 +234,19 @@ fn expand_tilde(major: Int, minor: Int, patch: Int,
 // Adds bounds to the global constraint arrays.
 
 fn parse_single_constraint(s: Str, start: Int, end: Int) {
-    let mut pos = skip_whitespace(s, start)
+    let mut cursor = skip_whitespace(s, start)
 
-    if pos >= end {
+    if cursor >= end {
         return
     }
 
-    let ch = s.char_at(pos)
+    let ch = s.char_at(cursor)
 
     // Tilde: ~version
     if ch == CH_TILDE {
-        pos = pos + 1
-        pos = skip_whitespace(s, pos)
-        let ok = parse_version_range(s, pos, end)
+        cursor = cursor + 1
+        cursor = skip_whitespace(s, cursor)
+        let ok = parse_version_range(s, cursor, end)
         if ok == 1 {
             expand_tilde(ver_major, ver_minor, ver_patch,
                          ver_has_minor, ver_has_patch)
@@ -256,11 +256,11 @@ fn parse_single_constraint(s: Str, start: Int, end: Int) {
 
     // Exact: =version
     if ch == CH_EQUALS {
-        let next_pos = pos + 1
+        let next_pos = cursor + 1
         if next_pos < end && is_digit(s.char_at(next_pos)) {
-            pos = next_pos
-            pos = skip_whitespace(s, pos)
-            let ok = parse_version_range(s, pos, end)
+            cursor = next_pos
+            cursor = skip_whitespace(s, cursor)
+            let ok = parse_version_range(s, cursor, end)
             if ok == 1 {
                 add_bound(OP_EQ, ver_major, ver_minor, ver_patch)
             }
@@ -268,9 +268,9 @@ fn parse_single_constraint(s: Str, start: Int, end: Int) {
         }
         // Could be ==, treat same as =
         if next_pos < end && s.char_at(next_pos) == CH_EQUALS {
-            pos = next_pos + 1
-            pos = skip_whitespace(s, pos)
-            let ok = parse_version_range(s, pos, end)
+            cursor = next_pos + 1
+            cursor = skip_whitespace(s, cursor)
+            let ok = parse_version_range(s, cursor, end)
             if ok == 1 {
                 add_bound(OP_EQ, ver_major, ver_minor, ver_patch)
             }
@@ -280,20 +280,20 @@ fn parse_single_constraint(s: Str, start: Int, end: Int) {
 
     // >=
     if ch == CH_GREATER {
-        let next_pos = pos + 1
+        let next_pos = cursor + 1
         if next_pos < end && s.char_at(next_pos) == CH_EQUALS {
-            pos = next_pos + 1
-            pos = skip_whitespace(s, pos)
-            let ok = parse_version_range(s, pos, end)
+            cursor = next_pos + 1
+            cursor = skip_whitespace(s, cursor)
+            let ok = parse_version_range(s, cursor, end)
             if ok == 1 {
                 add_bound(OP_GTE, ver_major, ver_minor, ver_patch)
             }
             return
         }
         // Just >
-        pos = next_pos
-        pos = skip_whitespace(s, pos)
-        let ok = parse_version_range(s, pos, end)
+        cursor = next_pos
+        cursor = skip_whitespace(s, cursor)
+        let ok = parse_version_range(s, cursor, end)
         if ok == 1 {
             add_bound(OP_GT, ver_major, ver_minor, ver_patch)
         }
@@ -302,20 +302,20 @@ fn parse_single_constraint(s: Str, start: Int, end: Int) {
 
     // <=
     if ch == CH_LESS {
-        let next_pos = pos + 1
+        let next_pos = cursor + 1
         if next_pos < end && s.char_at(next_pos) == CH_EQUALS {
-            pos = next_pos + 1
-            pos = skip_whitespace(s, pos)
-            let ok = parse_version_range(s, pos, end)
+            cursor = next_pos + 1
+            cursor = skip_whitespace(s, cursor)
+            let ok = parse_version_range(s, cursor, end)
             if ok == 1 {
                 add_bound(OP_LTE, ver_major, ver_minor, ver_patch)
             }
             return
         }
         // Just <
-        pos = next_pos
-        pos = skip_whitespace(s, pos)
-        let ok = parse_version_range(s, pos, end)
+        cursor = next_pos
+        cursor = skip_whitespace(s, cursor)
+        let ok = parse_version_range(s, cursor, end)
         if ok == 1 {
             add_bound(OP_LT, ver_major, ver_minor, ver_patch)
         }
@@ -324,7 +324,7 @@ fn parse_single_constraint(s: Str, start: Int, end: Int) {
 
     // Bare version: caret (default)
     if is_digit(ch) {
-        let ok = parse_version_range(s, pos, end)
+        let ok = parse_version_range(s, cursor, end)
         if ok == 1 {
             expand_caret(ver_major, ver_minor, ver_patch,
                          ver_has_minor, ver_has_patch)

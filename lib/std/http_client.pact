@@ -97,23 +97,23 @@ pub fn format_request(req: Request, host: Str, path: Str) -> Str {
 fn decode_chunked(raw: Str) -> Str {
     let sb = StringBuilder.new()
     let rlen = raw.len()
-    let mut pos = 0
-    while pos < rlen {
-        let crlf_idx = raw.slice(pos, rlen).index_of("\r\n")
+    let mut cursor = 0
+    while cursor < rlen {
+        let crlf_idx = raw.slice(cursor, rlen).index_of("\r\n")
         if crlf_idx < 0 { break }
-        let size_str = raw.slice(pos, pos + crlf_idx).trim()
+        let size_str = raw.slice(cursor, cursor + crlf_idx).trim()
         let chunk_size = parse_hex(size_str)
         if chunk_size <= 0 { break }
-        let data_start = pos + crlf_idx + 2
+        let data_start = cursor + crlf_idx + 2
         let data_end = data_start + chunk_size
         if data_end > rlen {
             sb.write(raw.slice(data_start, rlen))
             break
         }
         sb.write(raw.slice(data_start, data_end))
-        pos = data_end
-        if pos + 2 <= rlen && raw.char_at(pos) == 13 && raw.char_at(pos + 1) == 10 {
-            pos = pos + 2
+        cursor = data_end
+        if cursor + 2 <= rlen && raw.char_at(cursor) == 13 && raw.char_at(cursor + 1) == 10 {
+            cursor = cursor + 2
         }
     }
     sb.to_str()

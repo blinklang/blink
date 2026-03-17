@@ -28,6 +28,14 @@ Quick run: `bin/pact run <file.pact>` — compiles and runs in one step. Prefer 
 Low-level (dev): `build/pactc <file.pact> <output.c>` then `cc -o <binary> <output.c> -lm`
 After modifying compiler sources: `task regen` then `task ci` to verify.
 
+## Debugging
+
+Inspect generated C: `bin/pact build --emit c <file.pact>` — output goes to `build/<name>.c`.
+Trace compiler phases: `bin/pact run --pact-trace codegen <file.pact>` (also: lex, parse, typecheck, all).
+Runtime trace: `bin/pact run --trace all <file.pact>` (NDJSON to stderr, filter: `fn:name`, `module:mod`, `depth:N`).
+Debug build: `bin/pact run --debug <file.pact>` — enables debug_assert, compiles with `-g -O0`.
+When debugging codegen bugs, inspect the emitted C first (`--emit c`), then use `--pact-trace codegen`.
+
 ## Self-Hosting Bootstrap Protocol
 
 The compiler compiles itself. `task regen` verifies by compiling pactc twice (Gen1 + Gen2)
