@@ -1,6 +1,5 @@
 import std.http_types
 import std.http_server
-import std.http_error
 
 test "str methods" {
     let s = "hello world"
@@ -40,31 +39,31 @@ test "response formatting" {
 
 test "server routing" {
     let mut srv = server_new("127.0.0.1", 9999)
-    srv = server_get(srv, "/hello", fn(req: Request) -> Response {
+    srv = server_get(srv, "/hello", fn(_req: Request) -> Response {
         response_ok("hello world")
     })
     srv = server_post(srv, "/echo", fn(req: Request) -> Response {
         response_ok(req.body)
     })
     srv = server_get(srv, "/users/:id", fn(req: Request) -> Response {
-        let id = path_param("id")
+        let id = req_path_param(req, "id")
         response_ok("user {id}")
     })
 
-    let idx1 = match_route(srv, "GET", "/hello")
-    assert(idx1 >= 0)
-    if idx1 >= 0 {
-        let route = srv.routes.get(idx1).unwrap()
+    let r1 = match_route(srv, "GET", "/hello")
+    assert(r1.index >= 0)
+    if r1.index >= 0 {
+        let route = srv.routes.get(r1.index).unwrap()
         let req = request_new("GET", "/hello")
         let resp = route.callback(req)
         assert_eq(resp.status, 200)
         assert_eq(resp.body, "hello world")
     }
 
-    let idx2 = match_route(srv, "POST", "/echo")
-    assert(idx2 >= 0)
-    if idx2 >= 0 {
-        let route = srv.routes.get(idx2).unwrap()
+    let r2 = match_route(srv, "POST", "/echo")
+    assert(r2.index >= 0)
+    if r2.index >= 0 {
+        let route = srv.routes.get(r2.index).unwrap()
         let req = request_new("POST", "/echo")
         let req2 = request_with_body(req, "ping")
         let resp = route.callback(req2)
@@ -72,27 +71,27 @@ test "server routing" {
         assert_eq(resp.body, "ping")
     }
 
-    let idx3 = match_route(srv, "GET", "/users/42")
-    assert(idx3 >= 0)
-    if idx3 >= 0 {
-        assert_eq(path_param("id"), "42")
-        let route = srv.routes.get(idx3).unwrap()
-        let req = request_new("GET", "/users/42")
-        let resp = route.callback(req)
+    let r3 = match_route(srv, "GET", "/users/42")
+    assert(r3.index >= 0)
+    if r3.index >= 0 {
+        let route = srv.routes.get(r3.index).unwrap()
+        let base = request_new("GET", "/users/42")
+        let req3 = Request { method: base.method, url: base.url, body: base.body, headers: base.headers, param_names: r3.param_names, param_values: r3.param_values, timeout_ms: base.timeout_ms }
+        let resp = route.callback(req3)
         assert_eq(resp.status, 200)
         assert_eq(resp.body, "user 42")
     }
 
-    let idx4 = match_route(srv, "DELETE", "/hello")
-    assert(idx4 < 0)
+    let r4 = match_route(srv, "DELETE", "/hello")
+    assert(r4.index < 0)
 
-    let idx5 = match_route(srv, "GET", "/nonexistent")
-    assert(idx5 < 0)
+    let r5 = match_route(srv, "GET", "/nonexistent")
+    assert(r5.index < 0)
 }
 
 test "full pipeline" {
     let mut srv = server_new("127.0.0.1", 9999)
-    srv = server_get(srv, "/greet", fn(req: Request) -> Response {
+    srv = server_get(srv, "/greet", fn(_req: Request) -> Response {
         response_ok("hi there")
     })
     srv = server_post(srv, "/echo", fn(req: Request) -> Response {
@@ -101,10 +100,10 @@ test "full pipeline" {
 
     let raw1 = "GET /greet HTTP/1.1\r\nHost: localhost\r\n\r\n"
     let req1 = parse_request(raw1)
-    let idx1 = match_route(srv, req1.method, req1.url)
-    assert(idx1 >= 0)
-    if idx1 >= 0 {
-        let route = srv.routes.get(idx1).unwrap()
+    let r1 = match_route(srv, req1.method, req1.url)
+    assert(r1.index >= 0)
+    if r1.index >= 0 {
+        let route = srv.routes.get(r1.index).unwrap()
         let resp = route.callback(req1)
         let text = format_response(resp)
         assert(text.contains("200"))
@@ -114,10 +113,10 @@ test "full pipeline" {
     let raw2 = "POST /echo HTTP/1.1\r\nHost: localhost\r\n\r\n"
     let parsed2 = parse_request(raw2)
     let req2 = request_with_body(parsed2, "hello")
-    let idx2 = match_route(srv, req2.method, req2.url)
-    assert(idx2 >= 0)
-    if idx2 >= 0 {
-        let route = srv.routes.get(idx2).unwrap()
+    let r2 = match_route(srv, req2.method, req2.url)
+    assert(r2.index >= 0)
+    if r2.index >= 0 {
+        let route = srv.routes.get(r2.index).unwrap()
         let resp = route.callback(req2)
         assert_eq(resp.body, "hello")
         let text = format_response(resp)
@@ -126,9 +125,9 @@ test "full pipeline" {
 
     let raw3 = "DELETE /nope HTTP/1.1\r\nHost: localhost\r\n\r\n"
     let req3 = parse_request(raw3)
-    let idx3 = match_route(srv, req3.method, req3.url)
-    assert(idx3 < 0)
-    if idx3 < 0 {
+    let r3 = match_route(srv, req3.method, req3.url)
+    assert(r3.index < 0)
+    if r3.index < 0 {
         let resp = response_not_found("not found")
         let text = format_response(resp)
         assert(text.contains("404"))
@@ -140,7 +139,7 @@ test "middleware" {
     srv = server_use(srv, "add-header", fn(req: Request) -> Request {
         request_with_header(req, "X-Test", "injected")
     })
-    srv = server_get(srv, "/check-header", fn(req: Request) -> Response {
+    srv = server_get(srv, "/check-header", fn(_req: Request) -> Response {
         response_ok("checked")
     })
 
@@ -156,10 +155,10 @@ test "middleware" {
     let hdr_val = req.headers.get("X-Test")
     assert_eq(hdr_val, "injected")
 
-    let idx = match_route(srv, req.method, req.url)
-    assert(idx >= 0)
-    if idx >= 0 {
-        let route = srv.routes.get(idx).unwrap()
+    let r = match_route(srv, req.method, req.url)
+    assert(r.index >= 0)
+    if r.index >= 0 {
+        let route = srv.routes.get(r.index).unwrap()
         let resp = route.callback(req)
         assert_eq(resp.status, 200)
     }

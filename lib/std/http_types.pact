@@ -10,6 +10,8 @@ pub type Request {
     url: Str
     body: Str
     headers: Map[Str, Str]
+    param_names: List[Str]
+    param_values: List[Str]
     timeout_ms: Int
 }
 
@@ -21,7 +23,7 @@ pub type Response {
 
 /// Create an HTTP request with method and URL
 pub fn request_new(method: Str, url: Str) -> Request {
-    Request { method: method, url: url, body: "", headers: Map(), timeout_ms: 30000 }
+    Request { method: method, url: url, body: "", headers: Map(), param_names: [], param_values: [], timeout_ms: 30000 }
 }
 
 /// Create an HTTP response with status code and body
@@ -58,19 +60,19 @@ pub fn response_json(body: Str) -> Response {
 
 /// Return a copy of the request with a new body
 pub fn request_with_body(req: Request, body: Str) -> Request {
-    Request { method: req.method, url: req.url, body: body, headers: req.headers, timeout_ms: req.timeout_ms }
+    Request { method: req.method, url: req.url, body: body, headers: req.headers, param_names: req.param_names, param_values: req.param_values, timeout_ms: req.timeout_ms }
 }
 
 /// Return a copy of the request with an added header
 pub fn request_with_header(req: Request, name: Str, value: Str) -> Request {
     let hdrs = req.headers
     hdrs.set(name, value)
-    Request { method: req.method, url: req.url, body: req.body, headers: hdrs, timeout_ms: req.timeout_ms }
+    Request { method: req.method, url: req.url, body: req.body, headers: hdrs, param_names: req.param_names, param_values: req.param_values, timeout_ms: req.timeout_ms }
 }
 
 /// Return a copy of the request with a new timeout in milliseconds
 pub fn request_with_timeout(req: Request, ms: Int) -> Request {
-    Request { method: req.method, url: req.url, body: req.body, headers: req.headers, timeout_ms: ms }
+    Request { method: req.method, url: req.url, body: req.body, headers: req.headers, param_names: req.param_names, param_values: req.param_values, timeout_ms: ms }
 }
 
 /// Check if the response status is 2xx

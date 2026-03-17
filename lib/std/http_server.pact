@@ -27,10 +27,11 @@ pub type Server {
     error_handler: ErrorHandler
 }
 
-// ── Path param storage (per-request, reset each match) ──────────────
-
-pub let mut param_names: List[Str] = []
-pub let mut param_values: List[Str] = []
+pub type MatchResult {
+    index: Int
+    param_names: List[Str]
+    param_values: List[Str]
+}
 
 // ── Server API ──────────────────────────────────────────────────────
 
@@ -39,7 +40,7 @@ pub fn server_new(host: Str, port: Int) -> Server {
     let routes: List[Route] = []
     let hooks: List[Hook] = []
     let err_handler = ErrorHandler {
-        on_error: fn(req: Request, msg: Str) -> Response {
+        on_error: fn(_req: Request, msg: Str) -> Response {
             response_internal_error("Internal Server Error: {msg}")
         }
     }
@@ -90,25 +91,13 @@ pub fn server_on_error(srv: Server, err_fn: fn(Request, Str) -> Response) -> Ser
 
 // ── Route matching ──────────────────────────────────────────────────
 
-/// Find the matching route index for a method and path
-pub fn match_route(srv: Server, method: Str, path: Str) -> Int {
-    path_param_clear()
-    let mut i = 0
-    while i < srv.routes.len() {
-        let route = srv.routes.get(i).unwrap()
-        if route.method == method {
-            if path_match(route.pattern, path) == 1 {
-                return i
-            }
-            path_param_clear()
-        }
-        i = i + 1
-    }
-    -1
+/// Find the matching route for a method and path, returning index and extracted params
+pub fn match_route(srv: Server, method: Str, path: Str) -> MatchResult {
+    match_route_with(srv.routes, method, path)
 }
 
 /// Check if a path matches a pattern with :param placeholders
-pub fn path_match(pattern: Str, path: Str) -> Int {
+pub fn path_match(pattern: Str, path: Str, names: List[Str], values: List[Str]) -> Int {
     let pat_parts = split_path(pattern)
     let path_parts = split_path(path)
     if pat_parts.len() != path_parts.len() {
@@ -121,8 +110,8 @@ pub fn path_match(pattern: Str, path: Str) -> Int {
         if pat_seg.len() > 0 && pat_seg.char_at(0) == 58 {
             // ':' = 58 — path parameter
             let pname = pat_seg.substring(1, pat_seg.len() - 1)
-            param_names.push(pname)
-            param_values.push(path_seg)
+            names.push(pname)
+            values.push(path_seg)
         } else if pat_seg != path_seg {
             return 0
         }
@@ -131,22 +120,16 @@ pub fn path_match(pattern: Str, path: Str) -> Int {
     1
 }
 
-/// Get a path parameter value by name
-pub fn path_param(name: Str) -> Str {
+/// Get a path parameter value by name from a request
+pub fn req_path_param(req: Request, name: Str) -> Str {
     let mut i = 0
-    while i < param_names.len() {
-        if param_names.get(i).unwrap() == name {
-            return param_values.get(i).unwrap()
+    while i < req.param_names.len() {
+        if req.param_names.get(i).unwrap() == name {
+            return req.param_values.get(i).unwrap()
         }
         i = i + 1
     }
     ""
-}
-
-/// Clear path parameter storage
-pub fn path_param_clear() {
-    param_names = []
-    param_values = []
 }
 
 // ── HTTP parsing ────────────────────────────────────────────────────
@@ -201,7 +184,7 @@ pub fn parse_request(raw: Str) -> Request {
 
 fn request_new_with_body(method: Str, url: Str, body: Str) -> Request {
     let hdrs: Map[Str, Str] = Map()
-    Request { method: method, url: url, body: body, headers: hdrs, timeout_ms: 0 }
+    Request { method: method, url: url, body: body, headers: hdrs, param_names: [], param_values: [], timeout_ms: 0 }
 }
 
 // ── HTTP response formatting ────────────────────────────────────────
@@ -215,9 +198,56 @@ pub fn format_response(resp: Response) -> Str {
     result
 }
 
-// ── Server loop ─────────────────────────────────────────────────────
+// ── Server loops ────────────────────────────────────────────────────
 
-/// Start the server and listen for connections
+fn dispatch_connection(routes: List[Route], hooks: List[Hook], err_fn: fn(Request, Str) -> Response, conn: Int) -> Int ! IO {
+    let raw = net.read(conn, 8192)
+    if raw.len() > 0 {
+        let mut req = parse_request(raw)
+
+        let mut hi = 0
+        while hi < hooks.len() {
+            let hook = hooks.get(hi).unwrap()
+            req = hook.process(req)
+            hi = hi + 1
+        }
+
+        let result = match_route_with(routes, req.method, req.url)
+        let mut resp = response_not_found("Not Found")
+        if result.index >= 0 {
+            let matched_req = Request { method: req.method, url: req.url, body: req.body, headers: req.headers, param_names: result.param_names, param_values: result.param_values, timeout_ms: req.timeout_ms }
+            let matched_route = routes.get(result.index).unwrap()
+            resp = matched_route.callback(matched_req)
+        }
+
+        if resp.status <= 0 {
+            resp = err_fn(req, "handler returned invalid response")
+        }
+
+        let text = format_response(resp)
+        net.write(conn, text)
+    }
+    net.close(conn)
+    0
+}
+
+fn match_route_with(routes: List[Route], method: Str, path: Str) -> MatchResult {
+    let mut i = 0
+    while i < routes.len() {
+        let route = routes.get(i).unwrap()
+        if route.method == method {
+            let names: List[Str] = []
+            let values: List[Str] = []
+            if path_match(route.pattern, path, names, values) == 1 {
+                return MatchResult { index: i, param_names: names, param_values: values }
+            }
+        }
+        i = i + 1
+    }
+    MatchResult { index: -1, param_names: [], param_values: [] }
+}
+
+/// Start the server and listen for connections (single-threaded)
 pub fn server_serve(srv: Server) ! Net.Listen, IO {
     let fd = net.listen(srv.host, srv.port)
     if fd < 0 {
@@ -230,37 +260,33 @@ pub fn server_serve(srv: Server) ! Net.Listen, IO {
         let conn = net.accept(fd)
         if conn < 0 {
             io.eprintln("Accept failed")
-            // continue accepting
         } else {
-            let raw = net.read(conn, 8192)
-            if raw.len() > 0 {
-                let mut req = parse_request(raw)
+            dispatch_connection(srv.routes, srv.before_hooks, srv.error_handler.on_error, conn)
+        }
+    }
+}
 
-                // Apply before hooks
-                let mut hi = 0
-                while hi < srv.before_hooks.len() {
-                    let hook = srv.before_hooks.get(hi).unwrap()
-                    req = hook.process(req)
-                    hi = hi + 1
-                }
+/// Start the server with concurrent connection handling via threadpool
+pub fn server_serve_async(srv: Server) ! Net.Listen, IO, Async {
+    let fd = net.listen(srv.host, srv.port)
+    if fd < 0 {
+        io.eprintln("Failed to listen on {srv.host}:{srv.port.to_string()}")
+        return
+    }
+    io.println("Listening on {srv.host}:{srv.port.to_string()}")
 
-                // Match and dispatch
-                let idx = match_route(srv, req.method, req.url)
-                let mut resp = response_not_found("Not Found")
-                if idx >= 0 {
-                    let matched_route = srv.routes.get(idx).unwrap()
-                    resp = matched_route.callback(req)
-                }
+    let routes = srv.routes
+    let hooks = srv.before_hooks
+    let err_fn = srv.error_handler.on_error
 
-                // Error recovery: invalid response status triggers error handler
-                if resp.status <= 0 {
-                    resp = srv.error_handler.on_error(req, "handler returned invalid response")
-                }
-
-                let text = format_response(resp)
-                net.write(conn, text)
+    async.scope {
+        while 1 == 1 {
+            let conn = net.accept(fd)
+            if conn >= 0 {
+                async.spawn(fn() {
+                    dispatch_connection(routes, hooks, err_fn, conn)
+                })
             }
-            net.close(conn)
         }
     }
 }

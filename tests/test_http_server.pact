@@ -11,7 +11,7 @@ test "server construction" {
 
 test "route registration" {
     let mut srv = server_new("127.0.0.1", 8080)
-    srv = server_get(srv, "/hello", fn(req: Request) -> Response {
+    srv = server_get(srv, "/hello", fn(_req: Request) -> Response {
         response_ok("hello world")
     })
     srv = server_post(srv, "/echo", fn(req: Request) -> Response {
@@ -30,7 +30,7 @@ test "route registration" {
 
 test "handler dispatch" {
     let mut srv = server_new("127.0.0.1", 8080)
-    srv = server_get(srv, "/hello", fn(req: Request) -> Response {
+    srv = server_get(srv, "/hello", fn(_req: Request) -> Response {
         response_ok("hello from handler")
     })
 
@@ -43,27 +43,56 @@ test "handler dispatch" {
 
 test "route matching" {
     let mut srv = server_new("127.0.0.1", 8080)
-    srv = server_get(srv, "/hello", fn(req: Request) -> Response { response_ok("hello") })
-    srv = server_post(srv, "/data", fn(req: Request) -> Response { response_ok("data") })
+    srv = server_get(srv, "/hello", fn(_req: Request) -> Response { response_ok("hello") })
+    srv = server_post(srv, "/data", fn(_req: Request) -> Response { response_ok("data") })
     srv = server_get(srv, "/users/:id", fn(req: Request) -> Response {
-        let id = path_param("id")
+        let id = req_path_param(req, "id")
         response_ok("user: {id}")
     })
 
-    let idx1 = match_route(srv, "GET", "/hello")
-    assert(idx1 >= 0)
+    let r1 = match_route(srv, "GET", "/hello")
+    assert(r1.index >= 0)
 
-    let idx2 = match_route(srv, "POST", "/data")
-    assert(idx2 >= 0)
+    let r2 = match_route(srv, "POST", "/data")
+    assert(r2.index >= 0)
 
-    let idx3 = match_route(srv, "GET", "/users/42")
-    assert(idx3 >= 0)
-    if idx3 >= 0 {
-        assert_eq(path_param("id"), "42")
+    let r3 = match_route(srv, "GET", "/users/42")
+    assert(r3.index >= 0)
+    if r3.index >= 0 {
+        assert_eq(r3.param_names.len(), 1)
+        assert_eq(r3.param_names.get(0).unwrap(), "id")
+        assert_eq(r3.param_values.get(0).unwrap(), "42")
     }
 
-    let idx4 = match_route(srv, "DELETE", "/hello")
-    assert(idx4 < 0)
+    let r4 = match_route(srv, "DELETE", "/hello")
+    assert(r4.index < 0)
+}
+
+test "match result params populated on request" {
+    let mut srv = server_new("127.0.0.1", 8080)
+    srv = server_get(srv, "/users/:id/posts/:post_id", fn(req: Request) -> Response {
+        let uid = req_path_param(req, "id")
+        let pid = req_path_param(req, "post_id")
+        response_ok("{uid}:{pid}")
+    })
+
+    let result = match_route(srv, "GET", "/users/7/posts/99")
+    assert(result.index >= 0)
+    assert_eq(result.param_names.get(0).unwrap(), "id")
+    assert_eq(result.param_values.get(0).unwrap(), "7")
+    assert_eq(result.param_names.get(1).unwrap(), "post_id")
+    assert_eq(result.param_values.get(1).unwrap(), "99")
+
+    let base = request_new("GET", "/users/7/posts/99")
+    let req = Request { method: base.method, url: base.url, body: base.body, headers: base.headers, param_names: result.param_names, param_values: result.param_values, timeout_ms: base.timeout_ms }
+    let route = srv.routes.get(result.index).unwrap()
+    let resp = route.callback(req)
+    assert_eq(resp.body, "7:99")
+}
+
+test "req_path_param returns empty for missing param" {
+    let req = request_new("GET", "/test")
+    assert_eq(req_path_param(req, "nope"), "")
 }
 
 test "http parsing" {
