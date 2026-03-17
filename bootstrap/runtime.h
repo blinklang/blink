@@ -9,7 +9,6 @@
 #include "runtime_unix_socket.h"
 #include "runtime_thread.h"
 #include "runtime_process.h"
-#include "runtime_http.h"
 #include "runtime_test.h"
 #include "runtime_sqlite.h"
 #include "runtime_stdio.h"

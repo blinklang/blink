@@ -15,7 +15,6 @@ cat "$SCRIPT_DIR/runtime_core.h" \
     "$SCRIPT_DIR/runtime_unix_socket.h" \
     "$SCRIPT_DIR/runtime_thread.h" \
     "$SCRIPT_DIR/runtime_process.h" \
-    "$SCRIPT_DIR/runtime_http.h" \
     "$SCRIPT_DIR/runtime_test.h" \
     "$SCRIPT_DIR/runtime_sqlite.h" \
     "$SCRIPT_DIR/runtime_stdio.h" \

@@ -25,7 +25,6 @@ typedef struct {
 
 #define PACT_HANDLE_RUNNING   0
 #define PACT_HANDLE_DONE      1
-#define PACT_HANDLE_CANCELLED 2
 
 typedef struct {
     pthread_t thread;
@@ -148,15 +147,6 @@ PACT_UNUSED static void* pact_handle_await(pact_handle* h) {
     void* result = h->result;
     pthread_mutex_unlock(&h->mutex);
     return result;
-}
-
-PACT_UNUSED static void pact_handle_cancel(pact_handle* h) {
-    pthread_mutex_lock(&h->mutex);
-    if (h->status == PACT_HANDLE_RUNNING) {
-        h->status = PACT_HANDLE_CANCELLED;
-        pthread_cond_broadcast(&h->cond);
-    }
-    pthread_mutex_unlock(&h->mutex);
 }
 
 /* ── Channel operations ─────────────────────────────────────────────── */
