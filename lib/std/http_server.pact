@@ -31,6 +31,7 @@ pub type Server {
     routes: List[Route]
     before_hooks: List[Hook]
     error_handler: ErrorHandler
+    max_connections: Int
 }
 
 pub type MatchResult {
@@ -50,7 +51,7 @@ pub fn server_new(host: Str, port: Int) -> Server {
             response_internal_error("Internal Server Error: {msg}")
         }
     }
-    Server { host: host, port: port, routes: routes, before_hooks: hooks, error_handler: err_handler }
+    Server { host: host, port: port, routes: routes, before_hooks: hooks, error_handler: err_handler, max_connections: 0 }
 }
 
 /// Parse a route pattern into pre-split segments
@@ -108,10 +109,15 @@ pub fn server_use(srv: Server, name: Str, hook: fn(Request) -> Request) -> Serve
     srv
 }
 
+/// Set the maximum number of concurrent connections (0 = unlimited)
+pub fn server_max_connections(srv: Server, max: Int) -> Server {
+    Server { host: srv.host, port: srv.port, routes: srv.routes, before_hooks: srv.before_hooks, error_handler: srv.error_handler, max_connections: max }
+}
+
 /// Set the error handler
 pub fn server_on_error(srv: Server, err_fn: fn(Request, Str) -> Response) -> Server {
     let eh = ErrorHandler { on_error: err_fn }
-    Server { host: srv.host, port: srv.port, routes: srv.routes, before_hooks: srv.before_hooks, error_handler: eh }
+    Server { host: srv.host, port: srv.port, routes: srv.routes, before_hooks: srv.before_hooks, error_handler: eh, max_connections: srv.max_connections }
 }
 
 // ── Route matching ──────────────────────────────────────────────────
@@ -305,14 +311,38 @@ pub fn server_serve_async(srv: Server) ! Net.Listen, IO, Async {
     let routes = srv.routes
     let hooks = srv.before_hooks
     let err_fn = srv.error_handler.on_error
+    let max = srv.max_connections
 
-    async.scope {
-        while 1 == 1 {
-            let conn = net.accept(fd)
-            if conn >= 0 {
-                async.spawn(fn() {
-                    dispatch_connection(routes, hooks, err_fn, conn)
-                })
+    if max > 0 {
+        let sem = Channel(max)
+        let mut i = 0
+        while i < max {
+            sem.send(1)
+            i = i + 1
+        }
+        async.scope {
+            while 1 == 1 {
+                sem.recv()
+                let conn = net.accept(fd)
+                if conn >= 0 {
+                    async.spawn(fn() {
+                        dispatch_connection(routes, hooks, err_fn, conn)
+                        sem.send(1)
+                    })
+                } else {
+                    sem.send(1)
+                }
+            }
+        }
+    } else {
+        async.scope {
+            while 1 == 1 {
+                let conn = net.accept(fd)
+                if conn >= 0 {
+                    async.spawn(fn() {
+                        dispatch_connection(routes, hooks, err_fn, conn)
+                    })
+                }
             }
         }
     }
