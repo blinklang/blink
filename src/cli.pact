@@ -1307,6 +1307,7 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
                 let rr = process_run(bin_path, rcmd)
                 exit_codes.set(idx, rr.exit_code)
                 outputs.set(idx, rr.out)
+                errors.set(idx, rr.err_out)
                 if dots != 0 {
                     if rr.exit_code != 0 {
                         io.eprint("{esc}[31mF{esc}[0m")
@@ -1362,6 +1363,10 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
                     io.println("--- {tf} ---")
                     if out != "" {
                         io.println(out)
+                    }
+                    let err_out = errors.get(ri).unwrap()
+                    if err_out != "" {
+                        io.println(err_out)
                     }
                 } else if dots == 0 && quiet == 0 {
                     let mut summary = ""
