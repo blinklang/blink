@@ -52,6 +52,12 @@ pub trait MapOps[K, V] {
     fn contains_key(self, key: K) -> Bool
 }
 
+pub trait SetOps[T] {
+    fn insert(self, value: T) -> Bool
+    fn remove(self, value: T) -> Bool
+    fn union(self, other: Set[T]) -> Set[T]
+}
+
 pub trait StringBuildOps {
     fn write(self, s: Str)
     fn write_char(self, c: Char)
