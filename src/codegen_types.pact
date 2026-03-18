@@ -1157,6 +1157,13 @@ pub fn capture_cast_expr(idx: Int) -> Str {
         "(pact_bytes*)pact_closure_get_capture(__self, {idx})"
     } else if ct == CT_CLOSURE {
         "(pact_closure*)pact_closure_get_capture(__self, {idx})"
+    } else if ct == CT_VOID {
+        let sname = tp_get_sname(closure_captures.get(cg_closure_cap_start + idx).unwrap().tp_id)
+        if sname != "" {
+            "(*(({c_type_c_name(sname)}*)pact_closure_get_capture(__self, {idx})))"
+        } else {
+            "pact_closure_get_capture(__self, {idx})"
+        }
     } else {
         "pact_closure_get_capture(__self, {idx})"
     }
@@ -1380,6 +1387,16 @@ pub fn reg_fn_ret_from_ann(name: Str, fn_node: Int) ! Codegen.Register {
             let elem_name = np_name.get(elem_ann).unwrap()
             let elem_t = type_from_name(elem_name)
             reg_fn_ret_type(name, CT_LIST, elem_t, -1)
+        }
+    }
+    if ret_str == "Map" && ta != -1 {
+        let elems_sl = np_elements.get(ta).unwrap()
+        if elems_sl != -1 && sublist_length(elems_sl) >= 2 {
+            let key_ann = sublist_get(elems_sl, 0)
+            let val_ann = sublist_get(elems_sl, 1)
+            let key_t = type_from_name(np_name.get(key_ann).unwrap())
+            let val_t = type_from_name(np_name.get(val_ann).unwrap())
+            reg_fn_ret_type(name, CT_MAP, key_t, val_t)
         }
     }
     if ret_str == "Tuple" && ta != -1 {

@@ -20,6 +20,8 @@ pub let mut expr_result_ok_struct: Str = ""
 pub let mut expr_result_err_struct: Str = ""
 pub let mut expr_option_inner_struct: Str = ""
 pub let mut expr_list_elem_type: Int = -1
+pub let mut expr_map_key_type: Int = -1
+pub let mut expr_map_val_type: Int = -1
 pub let mut expr_option_inner_list_elem: Int = -1
 pub let mut expr_option_inner_list_struct: Str = ""
 pub let mut expr_iter_next_fn: Str = ""
@@ -623,7 +625,14 @@ pub fn emit_async_spawn_closure(closure_node: Int, wrapper_idx: Int, wrapper_nam
         mc_i = mc_i + 1
     }
 
-    emit_fn_body(np_body.get(closure_node).unwrap(), CT_INT)
+    let cl_body = np_body.get(closure_node).unwrap()
+    let cl_ret_str = np_return_type.get(closure_node).unwrap()
+    if cl_ret_str == "Void" || (cl_ret_str == "" && infer_block_type(cl_body) == CT_VOID) {
+        emit_fn_body(cl_body, CT_VOID)
+        emit_line("return 0;")
+    } else {
+        emit_fn_body(cl_body, CT_INT)
+    }
     cg_indent = cg_indent - 1
     emit_line("}")
     emit_line("")
@@ -1571,6 +1580,10 @@ pub fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
         }
         if expr_result_type == CT_LIST {
             expr_list_elem_type = tp_child1_kind(rt.tp_id)
+        }
+        if expr_result_type == CT_MAP {
+            expr_map_key_type = tp_child1_kind(rt.tp_id)
+            expr_map_val_type = tp_child2_kind(rt.tp_id)
         }
         return
     }

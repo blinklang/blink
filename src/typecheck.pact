@@ -383,6 +383,12 @@ pub fn register_struct_type(td: Int) ! TypeCheck.Register, TypeCheck.Resolve {
             sfield_struct_id.push(tid)
             sfield_name.push(fname)
             sfield_type_id.push(ftype_id)
+            let ftype_ann_name = np_name.get(ftype_ann).unwrap()
+            if ftype_ann_name == "Fn" {
+                if is_callable_field_name(fname) == 0 {
+                    nr_callable_field_names.push(fname)
+                }
+            }
             i = i + 1
         }
     }
@@ -643,6 +649,7 @@ pub fn init_types() ! TypeCheck.Register {
     sfield_struct_id = []
     sfield_name = []
     sfield_type_id = []
+    nr_callable_field_names = []
     evar_enum_id = []
     evar_name = []
     evar_tag = []
@@ -1370,6 +1377,16 @@ pub fn is_known_type(name: Str) -> Int {
 // Impl method registry for name resolution
 pub let mut nr_impl_type_names: List[Str] = []
 pub let mut nr_impl_method_names: List[Str] = []
+pub let mut nr_callable_field_names: List[Str] = []
+
+fn is_callable_field_name(name: Str) -> Int {
+    let mut i = 0
+    while i < nr_callable_field_names.len() {
+        if nr_callable_field_names.get(i).unwrap() == name { return 1 }
+        i = i + 1
+    }
+    0
+}
 
 pub fn nr_has_impl_method(type_name: Str, method: Str) -> Int {
     let mut i = 0
@@ -1879,7 +1896,7 @@ pub fn nr_check_node(node: Int) ! TypeCheck.Resolve, Diag.Report {
                 }
                 mi = mi + 1
             }
-            if found_in_impl == 0 {
+            if found_in_impl == 0 && is_callable_field_name(method_name) == 0 {
                 diag_warn_at("UnknownMethod", "W0501", "unknown method '{method_name}' — may fail at compile time", node, "")
             }
         }

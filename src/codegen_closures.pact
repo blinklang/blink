@@ -903,6 +903,10 @@ pub fn emit_closure(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
                 emit_line("\{double* __fp_{closure_idx}_{ci2} = (double*)pact_alloc(sizeof(double)); *__fp_{closure_idx}_{ci2} = {cap_e.name}; {caps_var}[{ci2}] = (void*)__fp_{closure_idx}_{ci2};}")
             } else if cap_kind == CT_BOOL {
                 emit_line("{caps_var}[{ci2}] = (void*)(intptr_t){cap_e.name};")
+            } else if cap_kind == CT_VOID && tp_get_sname(cap_e.tp_id) != "" {
+                let st_name = tp_get_sname(cap_e.tp_id)
+                let c_name = c_type_c_name(st_name)
+                emit_line("\{{c_name}* __st_{closure_idx}_{ci2} = ({c_name}*)pact_alloc(sizeof({c_name})); *__st_{closure_idx}_{ci2} = {cap_e.name}; {caps_var}[{ci2}] = (void*)__st_{closure_idx}_{ci2};}")
             } else {
                 emit_line("{caps_var}[{ci2}] = (void*){cap_e.name};")
             }

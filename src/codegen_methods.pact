@@ -755,6 +755,11 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                             emit_line("\{double* {fp_tmp} = (double*)pact_alloc(sizeof(double)); *{fp_tmp} = {cap_e.name}; {caps_var}[{ci2}] = (void*){fp_tmp};}")
                         } else if cap_kind == CT_BOOL {
                             emit_line("{caps_var}[{ci2}] = (void*)(intptr_t){cap_e.name};")
+                        } else if cap_kind == CT_VOID && tp_get_sname(cap_e.tp_id) != "" {
+                            let st_tmp = fresh_temp("__st_")
+                            let st_name = tp_get_sname(cap_e.tp_id)
+                            let c_name = c_type_c_name(st_name)
+                            emit_line("\{{c_name}* {st_tmp} = ({c_name}*)pact_alloc(sizeof({c_name})); *{st_tmp} = {cap_e.name}; {caps_var}[{ci2}] = (void*){st_tmp};}")
                         } else {
                             emit_line("{caps_var}[{ci2}] = (void*){cap_e.name};")
                         }

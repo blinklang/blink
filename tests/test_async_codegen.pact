@@ -36,3 +36,14 @@ test "async scope" {
     }
     assert_eq(scoped, 50)
 }
+
+fn do_nothing() {
+    let _ = 1
+}
+
+test "void spawn" {
+    let _h = async.spawn(fn() {
+        do_nothing()
+    })
+    _h.await
+}

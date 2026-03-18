@@ -1,3 +1,5 @@
+type Point { x: Int, y: Int }
+
 test "single capture" {
     let multiplier = 10
     let h = async.spawn(fn() {
@@ -15,4 +17,12 @@ test "multiple captures" {
     })
     let r2 = h2.await
     assert_eq(r2, 142)
+}
+
+test "struct capture in spawn" {
+    let p = Point { x: 3, y: 4 }
+    let _h = async.spawn(fn() -> Int {
+        p.x + p.y
+    })
+    assert_eq(_h.await, 7)
 }

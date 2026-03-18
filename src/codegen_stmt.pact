@@ -1355,6 +1355,11 @@ pub fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             }
         }
     }
+    if val_type == CT_MAP && expr_map_key_type >= 0 {
+        set_map_types(name, expr_map_key_type, expr_map_val_type)
+        expr_map_key_type = -1
+        expr_map_val_type = -1
+    }
     if val_type == CT_LIST && expr_list_elem_type >= 0 {
         set_list_elem_type(name, expr_list_elem_type)
         expr_list_elem_type = -1
@@ -3212,6 +3217,11 @@ pub fn emit_top_level_let(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.S
                 set_map_types(name, key_ct, val_ct)
             }
         }
+    }
+    if val_type == CT_MAP && expr_map_key_type >= 0 {
+        set_map_types(name, expr_map_key_type, expr_map_val_type)
+        expr_map_key_type = -1
+        expr_map_val_type = -1
     }
     if val_type == CT_LIST && expr_list_elem_type >= 0 {
         set_list_elem_type(name, expr_list_elem_type)
