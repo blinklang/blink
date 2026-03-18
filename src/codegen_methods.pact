@@ -2118,7 +2118,8 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             if set_var_name != "" {
                 emit_trace_state(set_var_name, "insert", val_str2, val_type2)
             }
-            set_map_types(obj_str, CT_STRING, val_type2)
+            let map_name_for_set = if set_var_name != "" { set_var_name } else { obj_str }
+            set_map_types(map_name_for_set, CT_STRING, val_type2)
             expr_result_str = "0"
             expr_result_type = CT_VOID
             return
@@ -2127,7 +2128,11 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             let args_sl = np_args.get(node).unwrap()
             emit_expr(sublist_get(args_sl, 0))
             let key_str = expr_result_str
-            let vtype = get_map_value_type(obj_str)
+            let mut map_var_name = obj_str
+            if np_kind.get(obj_node).unwrap() == NodeKind.Ident {
+                map_var_name = np_name.get(obj_node).unwrap()
+            }
+            let vtype = get_map_value_type(map_var_name)
             if vtype == CT_STRING {
                 expr_result_str = "(const char*)pact_map_get({obj_str}, {key_str})"
                 expr_result_type = CT_STRING
@@ -2174,7 +2179,11 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             return
         }
         if method == "values" {
-            let vtype = get_map_value_type(obj_str)
+            let mut values_var_name = obj_str
+            if np_kind.get(obj_node).unwrap() == NodeKind.Ident {
+                values_var_name = np_name.get(obj_node).unwrap()
+            }
+            let vtype = get_map_value_type(values_var_name)
             expr_result_str = "pact_map_values({obj_str})"
             expr_result_type = CT_LIST
             expr_list_elem_type = vtype

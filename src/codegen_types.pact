@@ -1762,6 +1762,18 @@ pub fn get_map_key_type(name: Str) -> Int {
         }
         i = i - 1
     }
+    if cg_closure_cap_start >= 0 {
+        let mut ci = 0
+        while ci < cg_closure_cap_count {
+            let cap = closure_captures.get(cg_closure_cap_start + ci).unwrap()
+            if cap.name == name && tp_get_kind(cap.tp_id) == CT_MAP {
+                let c1k = tp_child1_kind(cap.tp_id)
+                if c1k >= 0 { return c1k }
+                return CT_STRING
+            }
+            ci = ci + 1
+        }
+    }
     CT_STRING
 }
 
@@ -1775,6 +1787,18 @@ pub fn get_map_value_type(name: Str) -> Int {
             return CT_INT
         }
         i = i - 1
+    }
+    if cg_closure_cap_start >= 0 {
+        let mut ci = 0
+        while ci < cg_closure_cap_count {
+            let cap = closure_captures.get(cg_closure_cap_start + ci).unwrap()
+            if cap.name == name && tp_get_kind(cap.tp_id) == CT_MAP {
+                let c2k = tp_child2_kind(cap.tp_id)
+                if c2k >= 0 { return c2k }
+                return CT_INT
+            }
+            ci = ci + 1
+        }
     }
     CT_INT
 }
@@ -2452,6 +2476,8 @@ pub fn type_from_name(name: Str) -> Int {
         "Ptr" => CT_PTR
         "StringBuilder" => CT_STRINGBUILDER
         "Fn" => CT_CLOSURE
+        "Channel" => CT_CHANNEL
+        "Handle" => CT_HANDLE
         _ => CT_VOID
     }
 }

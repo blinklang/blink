@@ -3247,7 +3247,7 @@ pub fn emit_top_level_let(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.S
     }
     let ts = c_type_str(val_type)
     let cname = c_safe_name(name)
-    let needs_init = helper_lines.len() > 0 || val_type == CT_LIST || val_type == CT_MAP
+    let needs_init = helper_lines.len() > 0 || val_type == CT_LIST || val_type == CT_MAP || val_type == CT_CHANNEL
     if needs_init {
         emit_line("PACT_UNUSED static {ts} {cname};")
         let mut hi = 0

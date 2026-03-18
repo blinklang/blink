@@ -192,11 +192,21 @@ pub fn query_pub_pure() -> Str {
 // ── Query: lookup specific function by name ──────────────────────────
 
 pub fn query_by_name(name: Str) -> Str {
-    let idx = si_find_sym(name)
-    if idx < 0 {
-        return wrap_results("")
+    let names = name.split(",")
+    let mut items = ""
+    let mut i = 0
+    while i < names.len() {
+        let n = names.get(i).unwrap().trim()
+        let idx = si_find_sym(n)
+        if idx >= 0 {
+            if items != "" {
+                items = items.concat(",")
+            }
+            items = items.concat(symbol_to_json(idx))
+        }
+        i = i + 1
     }
-    wrap_results(symbol_to_json(idx))
+    wrap_results(items)
 }
 
 // ── Composable query: apply all filters in a single pass ─────────────
