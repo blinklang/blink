@@ -12,9 +12,9 @@ Pick ready tasks from Bridge and execute the appropriate workflow based on type.
 
 ## Step 1: Fetch Ready Tasks
 
-Run `br ready -t repo:pact --json` to get all unblocked tasks.
+Run `br ready -t repo:pact` to get all unblocked tasks.
 
-If no tasks are ready, run `br blocked -t repo:pact --json`, report what's stuck, and ask the user how to proceed.
+If no tasks are ready, run `br blocked -t repo:pact`, report what's stuck, and ask the user how to proceed.
 
 ## Step 2: Select Tasks
 

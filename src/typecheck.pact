@@ -706,6 +706,11 @@ pub fn validate_trait_impls(program: Int) ! TypeCheck.Register, Diag.Report {
         let im = sublist_get(impls_sl, ii)
         let trait_name = np_trait_name.get(im).unwrap()
         let impl_type = np_name.get(im).unwrap()
+        if is_trait_name(trait_name) == 0 {
+            diag_error_at("TraitContract", "E0904", "trait '{trait_name}' is not defined", im, "check the trait name or define 'trait {trait_name} \{ ... }'")
+            ii = ii + 1
+            continue
+        }
         // Check each trait method signature against this impl
         let impl_methods_sl = np_methods.get(im).unwrap()
         let mut si = 0
@@ -932,6 +937,12 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
             i = i + 1
         }
     }
+    // Register builtin trait names (handled specially in codegen, no AST nodes)
+    tc_trait_names.push("From")
+    tc_trait_names.push("TryFrom")
+    tc_trait_names.push("Into")
+    tc_trait_names.push("Iterator")
+    tc_trait_names.push("IntoIterator")
 
     // Register impl method signatures
     let impls_sl = np_methods.get(program).unwrap()

@@ -62,4 +62,9 @@ fn main() {
     let src_tp = "trait Convert[T] \{\n    fn convert(self, value: T) -> Str\n}\ntype Fmt \{ prefix: Str }\nimpl Convert[Int] for Fmt \{\n    fn convert(self, value: Str) -> Str \{ value }\n}\nfn main() \{\n}\n"
     let out_tp = compile_and_capture(src_tp, "_tc_tparam")
     expect_error(out_tp, "E0902", "type param substitution mismatch detected")
+
+    // --- Negative: impl for undefined trait → E0904 ---
+    let src_undef = "type Dog \{ name: Str }\nimpl NonExistent for Dog \{\n}\nfn main() \{\n}\n"
+    let out_undef = compile_and_capture(src_undef, "_tc_undef")
+    expect_error(out_undef, "E0904", "undefined trait detected")
 }
