@@ -92,39 +92,32 @@ test "generic fn returning Option[List[T]] — empty list returns None" {
 //     match r { Ok(list) => assert_eq(list.len(), 1) Err(_) => assert(false) }
 // }
 
-// --- BUG: List[Option[Int]] — cannot push compound types into list ---
-// Codegen casts Option[Int] struct to void* in pact_list_push which is invalid.
-// test "List[Option[Int]] — list of optionals" {
-//     let items: List[Option[Int]] = []
-//     items.push(Some(10))
-//     assert_eq(items.len(), 1)
-// }
+test "List[Option[Int]] — list of optionals" {
+    let items: List[Option[Int]] = []
+    items.push(Some(10))
+    assert_eq(items.len(), 1)
+}
 
-// --- BUG: Option[Result[Int, Str]] — generates pact_Option_void ---
-// c_type_tag(CT_RESULT) falls through to "void" since Result isn't handled.
-// test "Option[Result[Int, Str]] — option wrapping a result" {
-//     let inner: Result[Int, Str] = Ok(42)
-//     let opt: Option[Result[Int, Str]] = Some(inner)
-//     match opt {
-//         Some(res) => { match res { Ok(val) => assert_eq(val, 42) Err(_) => assert(false) } }
-//         None => assert(false)
-//     }
-// }
+test "Option[Result[Int, Str]] — option wrapping a result" {
+    let inner: Result[Int, Str] = Ok(42)
+    let opt: Option[Result[Int, Str]] = Some(inner)
+    match opt {
+        Some(res) => { match res { Ok(val) => assert_eq(val, 42) Err(_) => assert(false) } }
+        None => assert(false)
+    }
+}
 
-// --- BUG: Wrapper[T] generic struct — typedef not generated ---
-// Codegen emits unmonomorphized pact_Wrapper instead of pact_Wrapper_Int.
-// type Wrapper[T] { inner: Option[T] }
-// fn make_wrapper[T](val: T) -> Wrapper[T] { Wrapper { inner: Some(val) } }
-// test "Wrapper[Int]" {
-//     let w = make_wrapper(42)
-//     match w.inner { Some(val) => assert_eq(val, 42) None => assert(false) }
-// }
+type Wrapper[T] { inner: Option[T] }
+fn make_wrapper[T](val: T) -> Wrapper[T] { Wrapper { inner: Some(val) } }
+test "Wrapper[Int] — generic struct with Option[T] field" {
+    let w = make_wrapper(42)
+    let opt: Option[Int] = w.inner
+    match opt { Some(val) => assert_eq(val, 42) None => assert(false) }
+}
 
-// --- BUG: Result[Map[Str, Int], Str] — missing typedef ---
-// Generates pact_Result_map_str name but no typedef is emitted.
-// test "Result[Map[Str, Int], Str]" {
-//     let m = Map()
-//     m.set("a", 1)
-//     let r: Result[Map[Str, Int], Str] = Ok(m)
-//     match r { Ok(map) => assert_eq(map.len(), 1) Err(_) => assert(false) }
-// }
+test "Result[Map[Str, Int], Str]" {
+    let m = Map()
+    m.set("a", 1)
+    let r: Result[Map[Str, Int], Str] = Ok(m)
+    match r { Ok(map) => assert_eq(map.len(), 1) Err(_) => assert(false) }
+}

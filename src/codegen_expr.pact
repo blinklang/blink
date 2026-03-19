@@ -259,6 +259,57 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
         let struct_type = get_var_struct(obj_str)
         if struct_type != "" {
             fa_type = get_struct_field_type(struct_type, c_field)
+            if fa_type == CT_VOID {
+                let mi = lookup_mono_base(struct_type)
+                if mi.base != "" {
+                    let td = find_type_def_node(mi.base)
+                    if td != -1 {
+                        let td_tparams = np_type_params.get(td).unwrap()
+                        let td_flds = np_fields.get(td).unwrap()
+                        if td_flds != -1 && td_tparams != -1 {
+                            let mut fi = 0
+                            while fi < sublist_length(td_flds) {
+                                let f = sublist_get(td_flds, fi)
+                                if np_name.get(f).unwrap() == fa_field {
+                                    let type_ann_node = np_value.get(f).unwrap()
+                                    if type_ann_node != -1 {
+                                        let type_name = np_name.get(type_ann_node).unwrap()
+                                        let resolved = resolve_tp(type_name, td_tparams, mi.args)
+                                        if resolved == "Option" {
+                                            fa_type = CT_OPTION
+                                            let inner_elems = np_elements.get(type_ann_node).unwrap()
+                                            if inner_elems != -1 && sublist_length(inner_elems) >= 1 {
+                                                let inner_ann = sublist_get(inner_elems, 0)
+                                                let inner_raw = np_name.get(inner_ann).unwrap()
+                                                let inner_resolved = resolve_tp(inner_raw, td_tparams, mi.args)
+                                                let inner_ct = type_from_name(inner_resolved)
+                                                expr_option_inner = inner_ct
+                                                expr_option_inner_struct = ""
+                                                if is_struct_type(inner_resolved) != 0 || is_enum_type(inner_resolved) != 0 {
+                                                    expr_option_inner_struct = inner_resolved
+                                                } else if is_compound_ct(inner_ct) != 0 {
+                                                    expr_option_inner_struct = compound_name_from_ann(inner_ann)
+                                                }
+                                            }
+                                        } else if resolved == "Result" {
+                                            fa_type = CT_RESULT
+                                        } else {
+                                            let resolved_ct = type_from_name(resolved)
+                                            if resolved_ct != CT_VOID {
+                                                fa_type = resolved_ct
+                                            } else if is_struct_type(resolved) != 0 {
+                                                fa_type = CT_VOID
+                                                set_var_struct(expr_result_str, resolved)
+                                            }
+                                        }
+                                    }
+                                }
+                                fi = fi + 1
+                            }
+                        }
+                    }
+                }
+            }
             let fa_stype = get_struct_field_stype(struct_type, c_field)
             if fa_stype != "" {
                 set_var_struct(expr_result_str, fa_stype)
@@ -280,6 +331,21 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
                     if le_type != CT_INT {
                         set_list_elem_type(expr_result_str, le_type)
                     }
+                }
+            }
+            if fa_type == CT_OPTION {
+                let fa_tp = get_struct_field_tp_id(struct_type, c_field)
+                if fa_tp >= 0 {
+                    expr_option_inner = tp_child1_kind(fa_tp)
+                    let fa_opt_sname = tp_get_sname(fa_tp)
+                    expr_option_inner_struct = if fa_opt_sname != "" { fa_opt_sname } else { "" }
+                }
+            }
+            if fa_type == CT_RESULT {
+                let fa_tp = get_struct_field_tp_id(struct_type, c_field)
+                if fa_tp >= 0 {
+                    expr_result_ok_type = tp_child1_kind(fa_tp)
+                    expr_result_err_type = tp_child2_kind(fa_tp)
                 }
             }
         }
@@ -616,6 +682,10 @@ pub fn emit_async_spawn_closure(closure_node: Int, wrapper_idx: Int, wrapper_nam
                 if inner_ct == CT_VOID && is_struct_type(inner_name) != 0 {
                     ensure_struct_option_type(inner_name)
                     task_ret_c = struct_option_c_type(inner_name)
+                } else if is_compound_ct(inner_ct) != 0 {
+                    let compound_name = compound_name_from_ann(inner_ann)
+                    ensure_struct_option_type(compound_name)
+                    task_ret_c = struct_option_c_type(compound_name)
                 } else {
                     ensure_option_type(inner_ct)
                     task_ret_c = option_c_type(inner_ct)
@@ -1386,6 +1456,14 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                     expr_result_type = CT_OPTION
                     expr_option_inner = inner_type
                     expr_option_inner_struct = inner_s
+                } else if is_compound_ct(inner_type) != 0 {
+                    let compound_name = compound_option_inner_name(inner_type, inner_str)
+                    ensure_struct_option_type(compound_name)
+                    let opt_type = struct_option_c_type(compound_name)
+                    expr_result_str = "({opt_type})\{.tag = 1, .value = {inner_str}}"
+                    expr_result_type = CT_OPTION
+                    expr_option_inner = inner_type
+                    expr_option_inner_struct = compound_name
                 } else {
                     ensure_option_type(inner_type)
                     let opt_type = option_c_type(inner_type)
@@ -1669,6 +1747,27 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                             let inner_name_raw = np_name.get(inner_ann).unwrap()
                             let inner_name = resolve_type_param(inner_name_raw, tparams_sl, ta_str)
                             expr_list_elem_type = type_from_name(inner_name)
+                        }
+                    }
+                } else if ret_type == CT_VOID && resolved_ret != "Void" && resolved_ret != "" {
+                    let ret_ann = np_type_ann.get(gfn_node).unwrap()
+                    if ret_ann != -1 {
+                        let ret_elems = np_elements.get(ret_ann).unwrap()
+                        if ret_elems != -1 && sublist_length(ret_elems) > 0 {
+                            let mut mono_args = ""
+                            let mut ai = 0
+                            while ai < sublist_length(ret_elems) {
+                                let elem = sublist_get(ret_elems, ai)
+                                let raw_name = np_name.get(elem).unwrap()
+                                let resolved_arg = resolve_type_param(raw_name, tparams_sl, ta_str)
+                                if ai > 0 {
+                                    mono_args = mono_args.concat(",")
+                                }
+                                mono_args = mono_args.concat(resolved_arg)
+                                ai = ai + 1
+                            }
+                            let ret_mono = register_mono_instance(resolved_ret, mono_args)
+                            set_var_struct("{c_fn_name(mangled)}({args_str})", ret_mono)
                         }
                     }
                 }
@@ -2042,8 +2141,30 @@ fn infer_struct_type_args(type_name: Str, field_types: List[Int]) -> Option[Str]
             let f = sublist_get(td_flds_sl, fi)
             let type_ann_node = np_value.get(f).unwrap()
             if type_ann_node != -1 {
-                if np_name.get(type_ann_node).unwrap() == param_name {
+                let ann_name = np_name.get(type_ann_node).unwrap()
+                if ann_name == param_name {
                     resolved = type_name_from_ct(field_types.get(fi).unwrap())
+                } else {
+                    let sub_elems = np_elements.get(type_ann_node).unwrap()
+                    if sub_elems != -1 {
+                        let mut si = 0
+                        while si < sublist_length(sub_elems) {
+                            let sub_ann = sublist_get(sub_elems, si)
+                            if np_name.get(sub_ann).unwrap() == param_name {
+                                let ft = field_types.get(fi).unwrap()
+                                if ft == CT_OPTION {
+                                    resolved = type_name_from_ct(expr_option_inner)
+                                } else if ft == CT_RESULT {
+                                    if si == 0 {
+                                        resolved = type_name_from_ct(expr_result_ok_type)
+                                    } else {
+                                        resolved = type_name_from_ct(expr_result_err_type)
+                                    }
+                                }
+                            }
+                            si = si + 1
+                        }
+                    }
                 }
             }
             fi = fi + 1

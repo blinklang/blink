@@ -369,8 +369,12 @@ pub fn emit_match_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scop
                 emit_line("} else if ({strip_outer_parens(pat_cond)}) \{")
             }
             cg_indent = cg_indent + 1
+            let saved_match_scruts = match_scruts
+            let saved_match_scrut_enum = match_scrut_enum
             bind_pattern_vars(pat, 0, match_scruts.len())
             let arm_val = emit_arm_value(np_body.get(arm).unwrap())
+            match_scruts = saved_match_scruts
+            match_scrut_enum = saved_match_scrut_enum
             if result_type != CT_VOID || match_struct_name != "" {
                 emit_line("{result_var} = {arm_val};")
             } else if arm_val != "0" && arm_val != "" {
@@ -637,7 +641,15 @@ fn bind_pattern_vars(pat: Int, scrut_off: Int, scrut_len: Int) ! Codegen.Emit, C
                             inner_struct = expr_option_inner_struct
                         }
                     }
-                    if inner_struct != "" {
+                    if inner_struct != "" && inner_ct == CT_RESULT {
+                        emit_line("{c_type_c_name(inner_struct)} {c_bind} = {scrut}.{field};")
+                        set_var(bind_name, CT_RESULT, 0)
+                        set_var_result(bind_name, expr_result_ok_type, expr_result_err_type)
+                    } else if inner_struct != "" && inner_ct == CT_OPTION {
+                        emit_line("{c_type_c_name(inner_struct)} {c_bind} = {scrut}.{field};")
+                        set_var(bind_name, CT_OPTION, 0)
+                        set_var_option(bind_name, expr_option_inner)
+                    } else if inner_struct != "" {
                         emit_line("{c_type_c_name(inner_struct)} {c_bind} = {scrut}.{field};")
                         set_var(bind_name, CT_INT, 0)
                         set_var_struct(bind_name, inner_struct)
@@ -1342,10 +1354,35 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
         set_var_closure(name, expr_closure_sig)
     }
     if val_type == CT_OPTION {
-        if expr_option_inner_struct != "" {
-            set_var_option_struct(name, expr_option_inner, expr_option_inner_struct)
+        let mut opt_inner_ct = expr_option_inner
+        let mut opt_inner_s = expr_option_inner_struct
+        if type_ann != -1 {
+            let ann_name = np_name.get(type_ann).unwrap()
+            if ann_name == "Option" {
+                let ann_elems = np_elements.get(type_ann).unwrap()
+                if ann_elems != -1 && sublist_length(ann_elems) >= 1 {
+                    let inner_ann = sublist_get(ann_elems, 0)
+                    let inner_name = np_name.get(inner_ann).unwrap()
+                    let inner_ct = type_from_name(inner_name)
+                    if is_struct_type(inner_name) != 0 || is_enum_type(inner_name) != 0 {
+                        opt_inner_s = inner_name
+                        opt_inner_ct = inner_ct
+                    } else if is_compound_ct(inner_ct) != 0 {
+                        opt_inner_s = compound_name_from_ann(inner_ann)
+                        opt_inner_ct = inner_ct
+                    } else {
+                        opt_inner_ct = inner_ct
+                        opt_inner_s = ""
+                    }
+                }
+            }
+        }
+        if opt_inner_s != "" {
+            set_var_option_struct(name, opt_inner_ct, opt_inner_s)
+            ensure_struct_option_type(opt_inner_s)
         } else {
-            set_var_option(name, expr_option_inner)
+            set_var_option(name, opt_inner_ct)
+            ensure_option_type(opt_inner_ct)
         }
         if expr_option_inner == CT_LIST && expr_option_inner_list_elem != -1 {
             set_var_option_inner2(name, expr_option_inner_list_elem)
@@ -2727,7 +2764,7 @@ pub fn emit_fn_body(block: Int, ret_type: Int) ! Codegen.Emit, Codegen.Register,
 
 // ── Type definition codegen ─────────────────────────────────────────
 
-fn find_type_def(name: Str) -> Int {
+pub fn find_type_def(name: Str) -> Int {
     let types_sl = np_fields.get(cg_program_node).unwrap()
     if types_sl == -1 {
         return -1
@@ -2841,6 +2878,68 @@ fn emit_mono_struct_typedef(base_name: Str, concrete_args: Str) ! Codegen.Emit {
             if is_struct_type(resolved) != 0 {
                 emit_line("{c_type_c_name(resolved)} {fname};")
                 sf_entries.push(StructFieldEntry { struct_name: c_name, field_name: fname, field_type: CT_VOID, stype: resolved, tp_id: sv_tp(CT_VOID, -1, -1, resolved) })
+            } else if resolved == "Option" {
+                let inner_elems = np_elements.get(type_ann_node).unwrap()
+                if inner_elems != -1 && sublist_length(inner_elems) >= 1 {
+                    let inner_ann = sublist_get(inner_elems, 0)
+                    let inner_raw = np_name.get(inner_ann).unwrap()
+                    let inner_resolved = resolve_type_param(inner_raw, tparams_sl, concrete_args)
+                    let inner_ct = type_from_name(inner_resolved)
+                    if is_struct_type(inner_resolved) != 0 || is_enum_type(inner_resolved) != 0 {
+                        ensure_struct_option_type(inner_resolved)
+                        let opt_c = struct_option_c_type(inner_resolved)
+                        emit_line("{opt_c} {fname};")
+                        sf_entries.push(StructFieldEntry { struct_name: c_name, field_name: fname, field_type: CT_OPTION, stype: opt_c, tp_id: sv_tp(CT_OPTION, inner_ct, -1, inner_resolved) })
+                    } else if is_compound_ct(inner_ct) != 0 {
+                        let compound_name = compound_name_from_ann(inner_ann)
+                        ensure_struct_option_type(compound_name)
+                        let opt_c = struct_option_c_type(compound_name)
+                        emit_line("{opt_c} {fname};")
+                        sf_entries.push(StructFieldEntry { struct_name: c_name, field_name: fname, field_type: CT_OPTION, stype: opt_c, tp_id: sv_tp(CT_OPTION, inner_ct, -1, compound_name) })
+                    } else {
+                        ensure_option_type(inner_ct)
+                        let opt_c = option_c_type(inner_ct)
+                        emit_line("{opt_c} {fname};")
+                        sf_entries.push(StructFieldEntry { struct_name: c_name, field_name: fname, field_type: CT_OPTION, stype: "", tp_id: sv_tp(CT_OPTION, inner_ct, -1, "") })
+                    }
+                } else {
+                    ensure_option_type(CT_INT)
+                    let opt_c = option_c_type(CT_INT)
+                    emit_line("{opt_c} {fname};")
+                    sf_entries.push(StructFieldEntry { struct_name: c_name, field_name: fname, field_type: CT_OPTION, stype: "", tp_id: sv_tp(CT_OPTION, CT_INT, -1, "") })
+                }
+            } else if resolved == "Result" {
+                let inner_elems = np_elements.get(type_ann_node).unwrap()
+                if inner_elems != -1 && sublist_length(inner_elems) >= 2 {
+                    let ok_ann = sublist_get(inner_elems, 0)
+                    let err_ann = sublist_get(inner_elems, 1)
+                    let ok_raw = np_name.get(ok_ann).unwrap()
+                    let err_raw = np_name.get(err_ann).unwrap()
+                    let ok_resolved = resolve_type_param(ok_raw, tparams_sl, concrete_args)
+                    let err_resolved = resolve_type_param(err_raw, tparams_sl, concrete_args)
+                    let ok_ct = type_from_name(ok_resolved)
+                    let err_ct = type_from_name(err_resolved)
+                    let ok_is_type = is_struct_type(ok_resolved) != 0 || is_enum_type(ok_resolved) != 0
+                    let err_is_type = is_struct_type(err_resolved) != 0 || is_enum_type(err_resolved) != 0
+                    if ok_is_type || err_is_type {
+                        let ok_tag = if ok_is_type { ok_resolved } else { c_type_tag(ok_ct) }
+                        let err_tag = if err_is_type { err_resolved } else { c_type_tag(err_ct) }
+                        ensure_struct_result_type(ok_tag, err_tag)
+                        let res_c = struct_result_c_type(ok_tag, err_tag)
+                        emit_line("{res_c} {fname};")
+                        sf_entries.push(StructFieldEntry { struct_name: c_name, field_name: fname, field_type: CT_RESULT, stype: res_c, tp_id: sv_tp(CT_RESULT, ok_ct, err_ct, "") })
+                    } else {
+                        ensure_result_type(ok_ct, err_ct)
+                        let res_c = result_c_type(ok_ct, err_ct)
+                        emit_line("{res_c} {fname};")
+                        sf_entries.push(StructFieldEntry { struct_name: c_name, field_name: fname, field_type: CT_RESULT, stype: "", tp_id: sv_tp(CT_RESULT, ok_ct, err_ct, "") })
+                    }
+                } else {
+                    ensure_result_type(CT_INT, CT_STRING)
+                    let res_c = result_c_type(CT_INT, CT_STRING)
+                    emit_line("{res_c} {fname};")
+                    sf_entries.push(StructFieldEntry { struct_name: c_name, field_name: fname, field_type: CT_RESULT, stype: "", tp_id: sv_tp(CT_RESULT, CT_INT, CT_STRING, "") })
+                }
             } else {
                 let ct = type_from_name(resolved)
                 emit_line("{c_type_str(ct)} {fname};")
@@ -2929,6 +3028,10 @@ fn emit_mono_fn_def(fn_node: Int, concrete_args: Str) ! Codegen.Emit, Codegen.Re
                 if inner_ct == CT_VOID && is_struct_type(inner_name) != 0 {
                     ensure_struct_option_type(inner_name)
                     ret_c_str = struct_option_c_type(inner_name)
+                } else if is_compound_ct(inner_ct) != 0 {
+                    let compound_name = compound_name_from_ann(inner_ann)
+                    ensure_struct_option_type(compound_name)
+                    ret_c_str = struct_option_c_type(compound_name)
                 } else {
                     ensure_option_type(inner_ct)
                     ret_c_str = option_c_type(inner_ct)
@@ -2951,10 +3054,38 @@ fn emit_mono_fn_def(fn_node: Int, concrete_args: Str) ! Codegen.Emit, Codegen.Re
                 ret_c_str = result_c_type(ok_ct, err_ct)
             }
         }
-    } else if is_struct_type(resolved_ret) != 0 {
-        ret_c_str = c_type_c_name(resolved_ret)
-    } else if is_enum_type(resolved_ret) != 0 {
-        ret_c_str = c_type_c_name(resolved_ret)
+    } else if is_struct_type(resolved_ret) != 0 || is_enum_type(resolved_ret) != 0 {
+        let td = find_type_def(resolved_ret)
+        let mut is_generic_ret = 0
+        if td != -1 {
+            let td_tparams = np_type_params.get(td).unwrap()
+            if td_tparams != -1 && sublist_length(td_tparams) > 0 {
+                is_generic_ret = 1
+                let ret_ann = np_type_ann.get(fn_node).unwrap()
+                if ret_ann != -1 {
+                    let ret_elems = np_elements.get(ret_ann).unwrap()
+                    if ret_elems != -1 {
+                        let mut mono_args = ""
+                        let mut ai = 0
+                        while ai < sublist_length(ret_elems) {
+                            let elem = sublist_get(ret_elems, ai)
+                            let raw_name = np_name.get(elem).unwrap()
+                            let resolved_arg = resolve_type_param(raw_name, tparams_sl, concrete_args)
+                            if ai > 0 {
+                                mono_args = mono_args.concat(",")
+                            }
+                            mono_args = mono_args.concat(resolved_arg)
+                            ai = ai + 1
+                        }
+                        let mono_name = mangle_generic_name(resolved_ret, mono_args)
+                        ret_c_str = c_type_c_name(mono_name)
+                    }
+                }
+            }
+        }
+        if is_generic_ret == 0 {
+            ret_c_str = c_type_c_name(resolved_ret)
+        }
     }
 
     // Build parameter string with substituted types
@@ -3080,8 +3211,12 @@ fn emit_mono_fn_def(fn_node: Int, concrete_args: Str) ! Codegen.Emit, Codegen.Re
     let trace_file = diag_file_for_node(fn_node)
     emit_trace_enter(fn_node, mangled, trace_mod, trace_file)
 
-    emit_fn_body(np_body.get(fn_node).unwrap(), ret_type)
-    if ret_type == CT_VOID {
+    let mut body_ret = ret_type
+    if is_struct_type(resolved_ret) != 0 || is_enum_type(resolved_ret) != 0 {
+        body_ret = CT_INT
+    }
+    emit_fn_body(np_body.get(fn_node).unwrap(), body_ret)
+    if ret_type == CT_VOID && body_ret == CT_VOID {
         emit_trace_exit_void()
     }
     cg_indent = cg_indent - 1

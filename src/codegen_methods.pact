@@ -190,6 +190,36 @@ fn emit_list_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int 
             emit_line("double* {box_tmp} = (double*)pact_alloc(sizeof(double));")
             emit_line("*{box_tmp} = {val_str};")
             emit_line("pact_list_push({obj_str}, (void*){box_tmp});")
+        } else if val_type == CT_OPTION {
+            let opt_inner_s = expr_option_inner_struct
+            let opt_tag = if opt_inner_s != "" { opt_inner_s } else { c_type_tag(expr_option_inner) }
+            let opt_sname = "Option_{opt_tag}"
+            if opt_inner_s != "" {
+                ensure_struct_option_type(opt_inner_s)
+            } else {
+                ensure_option_type(expr_option_inner)
+            }
+            set_list_elem_struct(obj_str, opt_sname)
+            set_list_elem_type(obj_str, CT_VOID)
+            let opt_c = c_type_c_name(opt_sname)
+            let box_tmp = fresh_temp("_obox")
+            emit_line("{opt_c}* {box_tmp} = ({opt_c}*)pact_alloc(sizeof({opt_c}));")
+            emit_line("*{box_tmp} = {val_str};")
+            emit_line("pact_list_push({obj_str}, (void*){box_tmp});")
+        } else if val_type == CT_RESULT {
+            let res_ok_s = expr_result_ok_struct
+            let res_err_s = expr_result_err_struct
+            let ok_tag = if res_ok_s != "" { res_ok_s } else { c_type_tag(expr_result_ok_type) }
+            let err_tag = if res_err_s != "" { res_err_s } else { c_type_tag(expr_result_err_type) }
+            let res_sname = "Result_{ok_tag}_{err_tag}"
+            ensure_mixed_result_type(expr_result_ok_type, expr_result_err_type, res_ok_s, res_err_s)
+            set_list_elem_struct(obj_str, res_sname)
+            set_list_elem_type(obj_str, CT_VOID)
+            let res_c = c_type_c_name(res_sname)
+            let box_tmp = fresh_temp("_rbox")
+            emit_line("{res_c}* {box_tmp} = ({res_c}*)pact_alloc(sizeof({res_c}));")
+            emit_line("*{box_tmp} = {val_str};")
+            emit_line("pact_list_push({obj_str}, (void*){box_tmp});")
         } else {
             emit_line("pact_list_push({obj_str}, (void*){val_str});")
         }

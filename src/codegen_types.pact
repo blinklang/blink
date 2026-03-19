@@ -1285,6 +1285,10 @@ pub fn resolve_ret_type_from_ann(fn_node: Int) -> Str {
                 if is_struct_type(inner_name) != 0 || is_enum_type(inner_name) != 0 {
                     return "pact_Option_{inner_name}"
                 }
+                if is_compound_ct(inner_t) != 0 {
+                    let compound_name = compound_name_from_ann(inner_ann)
+                    return struct_option_c_type(compound_name)
+                }
                 return option_c_type(inner_t)
             }
         }
@@ -1387,6 +1391,10 @@ pub fn reg_fn_ret_from_ann(name: Str, fn_node: Int) ! Codegen.Register {
                 if is_struct_type(inner_name) != 0 || is_enum_type(inner_name) != 0 {
                     fn_ret_struct_inners.push(FnRetStructInner { name: name, ok_struct: inner_name, err_struct: "" })
                     ensure_struct_option_type(inner_name)
+                } else if is_compound_ct(inner_t) != 0 {
+                    let compound_name = compound_name_from_ann(inner_ann)
+                    fn_ret_struct_inners.push(FnRetStructInner { name: name, ok_struct: compound_name, err_struct: "" })
+                    ensure_struct_option_type(compound_name)
                 } else {
                     ensure_option_type(inner_t)
                 }
@@ -2097,6 +2105,18 @@ pub fn get_struct_field_stype(sname: Str, fname: Str) -> Str {
     ""
 }
 
+pub fn get_struct_field_tp_id(sname: Str, fname: Str) -> Int {
+    let mut i = 0
+    while i < sf_entries.len() {
+        let sf = sf_entries.get(i).unwrap()
+        if sf.struct_name == sname && sf.field_name == fname {
+            return sf.tp_id
+        }
+        i = i + 1
+    }
+    -1
+}
+
 pub fn set_var_closure(name: Str, sig: Str) {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
@@ -2355,7 +2375,66 @@ pub fn register_mono_instance(base: Str, args: Str) -> Str ! Codegen.Register {
     c_name
 }
 
-fn lookup_mono_instance(base: Str, args: Str) -> Str {
+pub type MonoLookup {
+    base: Str
+    args: Str
+}
+
+pub fn lookup_mono_base(c_name: Str) -> MonoLookup {
+    let mut i = 0
+    while i < mono_instances.len() {
+        let m = mono_instances.get(i).unwrap()
+        if m.c_name == c_name {
+            return MonoLookup { base: m.base, args: m.args }
+        }
+        i = i + 1
+    }
+    MonoLookup { base: "", args: "" }
+}
+
+pub fn resolve_tp(param_name: Str, tparams_sl: Int, concrete_args: Str) -> Str {
+    let mut pi = 0
+    let mut _arg_idx = 0
+    while pi < sublist_length(tparams_sl) {
+        if np_name.get(sublist_get(tparams_sl, pi)).unwrap() == param_name {
+            let mut start = 0
+            let mut ci = 0
+            let mut idx = 0
+            while ci <= concrete_args.len() {
+                if ci == concrete_args.len() || concrete_args.char_at(ci) == 44 {
+                    if idx == _arg_idx {
+                        return concrete_args.substring(start, ci - start)
+                    }
+                    idx = idx + 1
+                    start = ci + 1
+                }
+                ci = ci + 1
+            }
+            return param_name
+        }
+        _arg_idx = _arg_idx + 1
+        pi = pi + 1
+    }
+    param_name
+}
+
+pub fn find_type_def_node(name: Str) -> Int {
+    let types_sl = np_fields.get(cg_program_node).unwrap()
+    if types_sl == -1 {
+        return -1
+    }
+    let mut i = 0
+    while i < sublist_length(types_sl) {
+        let td = sublist_get(types_sl, i)
+        if np_name.get(td).unwrap() == name {
+            return td
+        }
+        i = i + 1
+    }
+    -1
+}
+
+pub fn lookup_mono_instance(base: Str, args: Str) -> Str {
     let mut i = 0
     while i < mono_instances.len() {
         let m = mono_instances.get(i).unwrap()
@@ -2719,7 +2798,96 @@ pub fn c_type_tag(ct: Int) -> Str {
     else if ct == CT_BYTES { "bytes" }
     else if ct == CT_STRINGBUILDER { "stringbuilder" }
     else if ct == CT_PTR { "ptr" }
+    else if ct == CT_OPTION { "option" }
+    else if ct == CT_RESULT { "result" }
     else { "void" }
+}
+
+pub fn is_compound_ct(ct: Int) -> Int {
+    if ct == CT_OPTION || ct == CT_RESULT || ct == CT_MAP {
+        1
+    } else {
+        0
+    }
+}
+
+pub fn compound_name_from_ann(ann_node: Int) -> Str {
+    let name = np_name.get(ann_node).unwrap()
+    let ct = type_from_name(name)
+    if ct == CT_RESULT {
+        let inner_elems = np_elements.get(ann_node).unwrap()
+        if inner_elems != -1 && sublist_length(inner_elems) >= 2 {
+            let ok_ann = sublist_get(inner_elems, 0)
+            let err_ann = sublist_get(inner_elems, 1)
+            let ok_name = np_name.get(ok_ann).unwrap()
+            let err_name = np_name.get(err_ann).unwrap()
+            let ok_tag = if is_struct_type(ok_name) != 0 || is_enum_type(ok_name) != 0 { ok_name } else { c_type_tag(type_from_name(ok_name)) }
+            let err_tag = if is_struct_type(err_name) != 0 || is_enum_type(err_name) != 0 { err_name } else { c_type_tag(type_from_name(err_name)) }
+            return "Result_{ok_tag}_{err_tag}"
+        }
+        "Result_int_str"
+    } else if ct == CT_OPTION {
+        let inner_elems = np_elements.get(ann_node).unwrap()
+        if inner_elems != -1 && sublist_length(inner_elems) >= 1 {
+            let inner_ann2 = sublist_get(inner_elems, 0)
+            let inner_name2 = np_name.get(inner_ann2).unwrap()
+            let inner_tag = if is_struct_type(inner_name2) != 0 || is_enum_type(inner_name2) != 0 { inner_name2 } else { c_type_tag(type_from_name(inner_name2)) }
+            return "Option_{inner_tag}"
+        }
+        "Option_int"
+    } else if ct == CT_MAP {
+        let inner_elems = np_elements.get(ann_node).unwrap()
+        if inner_elems != -1 && sublist_length(inner_elems) >= 2 {
+            let key_ann = sublist_get(inner_elems, 0)
+            let val_ann = sublist_get(inner_elems, 1)
+            let key_tag = c_type_tag(type_from_name(np_name.get(key_ann).unwrap()))
+            let val_tag = c_type_tag(type_from_name(np_name.get(val_ann).unwrap()))
+            return "Map_{key_tag}_{val_tag}"
+        }
+        "map"
+    } else {
+        c_type_tag(ct)
+    }
+}
+
+pub fn compound_option_inner_name(inner_type: Int, inner_str: Str) -> Str {
+    if inner_type == CT_RESULT {
+        let ok_t = get_var_result_ok(inner_str)
+        let err_t = get_var_result_err(inner_str)
+        let ok_s = get_var_result_ok_struct(inner_str)
+        let err_s = get_var_result_err_struct(inner_str)
+        let ok_tag = if ok_s != "" { ok_s } else { c_type_tag(ok_t) }
+        let err_tag = if err_s != "" { err_s } else { c_type_tag(err_t) }
+        "Result_{ok_tag}_{err_tag}"
+    } else if inner_type == CT_OPTION {
+        let opt_inner = get_var_option_inner(inner_str)
+        let opt_inner_s = get_var_option_inner_struct(inner_str)
+        let inner_tag = if opt_inner_s != "" { opt_inner_s } else { c_type_tag(opt_inner) }
+        "Option_{inner_tag}"
+    } else if inner_type == CT_MAP {
+        "map"
+    } else {
+        c_type_tag(inner_type)
+    }
+}
+
+fn ct_from_str(s: Str) -> Int {
+    if s == "0" { CT_INT }
+    else if s == "1" { CT_FLOAT }
+    else if s == "2" { CT_BOOL }
+    else if s == "3" { CT_STRING }
+    else if s == "4" { CT_LIST }
+    else if s == "5" { CT_VOID }
+    else if s == "7" { CT_OPTION }
+    else if s == "8" { CT_RESULT }
+    else if s == "9" { CT_ITERATOR }
+    else if s == "10" { CT_HANDLE }
+    else if s == "11" { CT_CHANNEL }
+    else if s == "13" { CT_MAP }
+    else if s == "14" { CT_BYTES }
+    else if s == "17" { CT_PTR }
+    else if s == "19" { CT_STRINGBUILDER }
+    else { CT_INT }
 }
 
 pub fn ensure_option_type(inner: Int) {
@@ -3422,18 +3590,8 @@ pub fn emit_all_option_result_types() ! Codegen.Emit {
         }
         let ok_str = key.substring(0, sep)
         let err_str = key.substring(sep + 1, key.len() - sep - 1)
-        let mut ok_t = CT_INT
-        let mut err_t = CT_INT
-        if ok_str == "0" { ok_t = CT_INT }
-        else if ok_str == "1" { ok_t = CT_FLOAT }
-        else if ok_str == "2" { ok_t = CT_BOOL }
-        else if ok_str == "3" { ok_t = CT_STRING }
-        else if ok_str == "4" { ok_t = CT_LIST }
-        if err_str == "0" { err_t = CT_INT }
-        else if err_str == "1" { err_t = CT_FLOAT }
-        else if err_str == "2" { err_t = CT_BOOL }
-        else if err_str == "3" { err_t = CT_STRING }
-        else if err_str == "4" { err_t = CT_LIST }
+        let ok_t = ct_from_str(ok_str)
+        let err_t = ct_from_str(err_str)
         emit_result_typedef(ok_t, err_t)
         i = i + 1
     }
@@ -3481,18 +3639,8 @@ pub fn emit_option_result_types_from(opt_start: Int, res_start: Int, s_opt_start
         }
         let ok_str = key.substring(0, sep)
         let err_str = key.substring(sep + 1, key.len() - sep - 1)
-        let mut ok_t = CT_INT
-        let mut err_t = CT_INT
-        if ok_str == "0" { ok_t = CT_INT }
-        else if ok_str == "1" { ok_t = CT_FLOAT }
-        else if ok_str == "2" { ok_t = CT_BOOL }
-        else if ok_str == "3" { ok_t = CT_STRING }
-        else if ok_str == "4" { ok_t = CT_LIST }
-        if err_str == "0" { err_t = CT_INT }
-        else if err_str == "1" { err_t = CT_FLOAT }
-        else if err_str == "2" { err_t = CT_BOOL }
-        else if err_str == "3" { err_t = CT_STRING }
-        else if err_str == "4" { err_t = CT_LIST }
+        let ok_t = ct_from_str(ok_str)
+        let err_t = ct_from_str(err_str)
         emit_result_typedef(ok_t, err_t)
         i = i + 1
     }
