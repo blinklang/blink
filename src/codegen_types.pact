@@ -41,6 +41,7 @@ pub let CT_DURATION = 16
 pub let CT_PTR = 17
 pub let CT_FFI_SCOPE = 18
 pub let CT_STRINGBUILDER = 19
+pub let CT_SET = 20
 
 // ── Type node pool (interned, parallel arrays) ─────────────────────
 // Recursive type representation: each type is an integer handle into
@@ -117,6 +118,10 @@ fn type_result(ok: Int, err: Int) -> Int {
 
 fn type_map(key: Int, value: Int) -> Int {
     tp_alloc(CT_MAP, key, value, "")
+}
+
+fn type_set(elem: Int) -> Int {
+    tp_alloc(CT_SET, elem, -1, "")
 }
 
 fn type_iterator(inner: Int) -> Int {
@@ -876,6 +881,10 @@ pub fn sv_tp(ctype: Int, inner1: Int, inner2: Int, sname: Str) -> Int {
         let k = if inner1 >= 0 { sv_tp(inner1, -1, -1, "") } else { type_string() }
         let v = if inner2 >= 0 { sv_tp(inner2, -1, -1, "") } else { type_int() }
         return type_map(k, v)
+    }
+    if ctype == CT_SET {
+        let elem = if inner1 >= 0 { sv_tp(inner1, -1, -1, "") } else { type_string() }
+        return type_set(elem)
     }
     if ctype == CT_ITERATOR {
         if inner1 >= 0 { return type_iterator(sv_tp(inner1, inner2, -1, sname)) }
@@ -1745,6 +1754,45 @@ pub fn get_list_elem_struct(name: Str) -> Str {
     ""
 }
 
+pub fn set_set_elem_type(name: Str, elem_type: Int) {
+    let mut i = scope_vars.len() - 1
+    while i >= 0 {
+        let sv = scope_vars.get(i).unwrap()
+        if sv.name == name && tp_get_kind(sv.tp_id) == CT_SET {
+            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: elem_type, inner2: -1, sname: sv.sname, sname2: sv.sname2, extra: sv.extra, tp_id: sv_tp(sv.ctype, elem_type, -1, sv.sname) })
+            return
+        }
+        i = i - 1
+    }
+    scope_vars.push(ScopeVar { name: name, ctype: CT_SET, is_mut: 0, inner1: elem_type, inner2: -1, sname: "", sname2: "", extra: "", tp_id: sv_tp(CT_SET, elem_type, -1, "") })
+}
+
+pub fn get_set_elem_type(name: Str) -> Int {
+    let mut i = scope_vars.len() - 1
+    while i >= 0 {
+        let sv = scope_vars.get(i).unwrap()
+        if sv.name == name && tp_get_kind(sv.tp_id) == CT_SET {
+            let c1k = tp_child1_kind(sv.tp_id)
+            if c1k >= 0 { return c1k }
+            return CT_STRING
+        }
+        i = i - 1
+    }
+    if cg_closure_cap_start >= 0 {
+        let mut ci = 0
+        while ci < cg_closure_cap_count {
+            let cap = closure_captures.get(cg_closure_cap_start + ci).unwrap()
+            if cap.name == name && tp_get_kind(cap.tp_id) == CT_SET {
+                let c1k = tp_child1_kind(cap.tp_id)
+                if c1k >= 0 { return c1k }
+                return CT_STRING
+            }
+            ci = ci + 1
+        }
+    }
+    CT_STRING
+}
+
 pub fn set_map_types(name: Str, key_type: Int, value_type: Int) {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
@@ -2260,6 +2308,7 @@ fn ct_from_c_type(ctype: Str) -> Int {
     else if ctype == "int" { CT_BOOL }
     else if ctype == "pact_list*" { CT_LIST }
     else if ctype == "pact_map*" { CT_MAP }
+    else if ctype == "pact_set*" { CT_SET }
     else { CT_VOID }
 }
 
@@ -2273,6 +2322,7 @@ pub fn type_name_from_ct(ct: Int) -> Str {
     else if ct == CT_HANDLE { "Handle" }
     else if ct == CT_CHANNEL { "Channel" }
     else if ct == CT_MAP { "Map" }
+    else if ct == CT_SET { "Set" }
     else if ct == CT_BYTES { "Bytes" }
     else if ct == CT_STRINGBUILDER { "StringBuilder" }
     else if ct == CT_PTR { "Ptr" }
@@ -2458,6 +2508,7 @@ pub fn c_type_str(ct: Int) -> Str {
     else if ct == CT_HANDLE { "pact_handle*" }
     else if ct == CT_CHANNEL { "pact_channel*" }
     else if ct == CT_MAP { "pact_map*" }
+    else if ct == CT_SET { "pact_set*" }
     else if ct == CT_BYTES { "pact_bytes*" }
     else if ct == CT_INSTANT { "pact_Instant" }
     else if ct == CT_DURATION { "pact_Duration" }

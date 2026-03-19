@@ -259,6 +259,146 @@ PACT_UNUSED static void pact_map_free(pact_map* m) {
     }
 }
 
+/* ── Hash set (string-keyed) ─────────────────────────────────────────── */
+
+typedef struct {
+    const char** items;
+    uint8_t* states;   /* 0=empty, 1=occupied, 2=tombstone */
+    int64_t len;
+    int64_t cap;
+} pact_set;
+
+PACT_UNUSED static const char* pact_int_to_key(int64_t val) {
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%lld", (long long)val);
+    size_t len = strlen(buf);
+    char* s = (char*)pact_alloc(len + 1);
+    memcpy(s, buf, len + 1);
+    return s;
+}
+
+PACT_UNUSED static pact_set* pact_set_new(void) {
+    pact_set* s = (pact_set*)pact_alloc(sizeof(pact_set));
+    s->cap = 16;
+    s->len = 0;
+    s->items = (const char**)pact_alloc(sizeof(const char*) * (size_t)s->cap);
+    s->states = (uint8_t*)pact_alloc(sizeof(uint8_t) * (size_t)s->cap);
+    memset(s->states, 0, (size_t)s->cap);
+    return s;
+}
+
+PACT_UNUSED static void pact_set_grow(pact_set* s) {
+    int64_t old_cap = s->cap;
+    const char** old_items = s->items;
+    uint8_t* old_states = s->states;
+    s->cap = old_cap * 2;
+    s->items = (const char**)pact_alloc(sizeof(const char*) * (size_t)s->cap);
+    s->states = (uint8_t*)pact_alloc(sizeof(uint8_t) * (size_t)s->cap);
+    memset(s->states, 0, (size_t)s->cap);
+    s->len = 0;
+    for (int64_t i = 0; i < old_cap; i++) {
+        if (old_states[i] == 1) {
+            uint64_t h = pact_map_hash(old_items[i]);
+            int64_t idx = (int64_t)(h % (uint64_t)s->cap);
+            while (s->states[idx] != 0) {
+                idx = (idx + 1) % s->cap;
+            }
+            s->items[idx] = old_items[i];
+            s->states[idx] = 1;
+            s->len++;
+        }
+    }
+    free(old_items);
+    free(old_states);
+}
+
+PACT_UNUSED static int64_t pact_set_insert(pact_set* s, const char* item) {
+    if (s->len * 10 >= s->cap * 7) {
+        pact_set_grow(s);
+    }
+    uint64_t h = pact_map_hash(item);
+    int64_t idx = (int64_t)(h % (uint64_t)s->cap);
+    int64_t first_tombstone = -1;
+    while (1) {
+        if (s->states[idx] == 0) {
+            int64_t ins = (first_tombstone >= 0) ? first_tombstone : idx;
+            s->items[ins] = item;
+            s->states[ins] = 1;
+            s->len++;
+            return 1;
+        }
+        if (s->states[idx] == 2) {
+            if (first_tombstone < 0) first_tombstone = idx;
+        } else if (pact_str_eq(s->items[idx], item)) {
+            return 0;
+        }
+        idx = (idx + 1) % s->cap;
+    }
+}
+
+PACT_UNUSED static int64_t pact_set_contains(const pact_set* s, const char* item) {
+    uint64_t h = pact_map_hash(item);
+    int64_t idx = (int64_t)(h % (uint64_t)s->cap);
+    while (s->states[idx] != 0) {
+        if (s->states[idx] == 1 && pact_str_eq(s->items[idx], item)) {
+            return 1;
+        }
+        idx = (idx + 1) % s->cap;
+    }
+    return 0;
+}
+
+PACT_UNUSED static int64_t pact_set_remove(pact_set* s, const char* item) {
+    uint64_t h = pact_map_hash(item);
+    int64_t idx = (int64_t)(h % (uint64_t)s->cap);
+    while (s->states[idx] != 0) {
+        if (s->states[idx] == 1 && pact_str_eq(s->items[idx], item)) {
+            s->states[idx] = 2;
+            s->len--;
+            return 1;
+        }
+        idx = (idx + 1) % s->cap;
+    }
+    return 0;
+}
+
+PACT_UNUSED static int64_t pact_set_len(const pact_set* s) {
+    return s->len;
+}
+
+PACT_UNUSED static pact_set* pact_set_union(const pact_set* a, const pact_set* b) {
+    pact_set* result = pact_set_new();
+    for (int64_t i = 0; i < a->cap; i++) {
+        if (a->states[i] == 1) {
+            pact_set_insert(result, a->items[i]);
+        }
+    }
+    for (int64_t i = 0; i < b->cap; i++) {
+        if (b->states[i] == 1) {
+            pact_set_insert(result, b->items[i]);
+        }
+    }
+    return result;
+}
+
+PACT_UNUSED static pact_list* pact_set_to_list(const pact_set* s) {
+    pact_list* result = pact_list_new();
+    for (int64_t i = 0; i < s->cap; i++) {
+        if (s->states[i] == 1) {
+            pact_list_push(result, (void*)s->items[i]);
+        }
+    }
+    return result;
+}
+
+PACT_UNUSED static void pact_set_free(pact_set* s) {
+    if (s) {
+        free(s->items);
+        free(s->states);
+        free(s);
+    }
+}
+
 /* ── Byte buffer ────────────────────────────────────────────────────── */
 
 typedef struct {

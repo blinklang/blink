@@ -1,7 +1,6 @@
 ---
 allowed-tools: Bash(git push:*), Bash(git commit:*), Bash(task ci)
 description: (overrides global commit skill with small modification)
-model: sonnet
 ---
 
 Create a git commit with the following workflow:

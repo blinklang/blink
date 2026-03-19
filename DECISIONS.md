@@ -283,6 +283,7 @@ Decided by expert panel vote. See [OPEN_QUESTIONS.md](OPEN_QUESTIONS.md) for ful
 | `--trace` value serialization | String/Display representation only. Bounded cost, forward-compatible | 4-1 (PLT: tagged `{"type":"Int","value":42}`) |
 | `--trace` filter syntax | Colon-syntax `--trace=fn:name,module:mod,depth:3`. AND across keys, OR within key via `+` | 4-1 (PLT: separate flags) |
 | `--trace` timestamp format | Microseconds monotonic (`ts_us`). Right precision for function-level tracing | 5-0 |
+| Set[T] implementation | Implement now as full builtin type. Spec'd-but-unimplemented = hallucination trap + DX trap. ~300 LOC following Map pattern | 4-1 (Sys/Web/DevOps/AI for implement; PLT for defer) |
 
 ---
 
@@ -348,6 +349,7 @@ Full deliberation records for each decision. Each file contains expert votes, re
 | StringBuilder | [decisions/string-builder.md](decisions/string-builder.md) |
 | Stdlib API Surface | [decisions/stdlib-api-surface.md](decisions/stdlib-api-surface.md) |
 | `--trace` NDJSON Format | [decisions/trace-ndjson-format.md](decisions/trace-ndjson-format.md) |
+| Set[T] Builtin Type | [decisions/set-type-implementation.md](decisions/set-type-implementation.md) |
 
 ---
 

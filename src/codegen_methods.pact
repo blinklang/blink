@@ -510,6 +510,75 @@ fn emit_map_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int !
     0
 }
 
+fn set_key_str(val_str: Str, val_type: Int) -> Str ! Codegen.Emit {
+    if val_type == CT_INT {
+        return "pact_int_to_key({val_str})"
+    }
+    val_str
+}
+
+@allow(UnrestoredMutation, IncompleteStateRestore)
+fn emit_set_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
+    if method == "insert" {
+        let mut set_var_name = ""
+        if np_kind.get(obj_node).unwrap() == NodeKind.Ident {
+            set_var_name = np_name.get(obj_node).unwrap()
+        }
+        let args_sl = np_args.get(node).unwrap()
+        emit_expr(sublist_get(args_sl, btc_arg_offset))
+        let val_str = expr_result_str
+        let val_type = expr_result_type
+        let str_val = set_key_str(val_str, val_type)
+        expr_result_str = "pact_set_insert({obj_str}, {str_val})"
+        expr_result_type = CT_BOOL
+        if set_var_name != "" {
+            set_set_elem_type(set_var_name, val_type)
+        }
+        return 1
+    }
+    if method == "remove" {
+        let args_sl = np_args.get(node).unwrap()
+        emit_expr(sublist_get(args_sl, btc_arg_offset))
+        let str_val = set_key_str(expr_result_str, expr_result_type)
+        expr_result_str = "pact_set_remove({obj_str}, {str_val})"
+        expr_result_type = CT_BOOL
+        return 1
+    }
+    if method == "contains" {
+        let args_sl = np_args.get(node).unwrap()
+        emit_expr(sublist_get(args_sl, btc_arg_offset))
+        let str_val = set_key_str(expr_result_str, expr_result_type)
+        expr_result_str = "pact_set_contains({obj_str}, {str_val})"
+        expr_result_type = CT_BOOL
+        return 1
+    }
+    if method == "len" {
+        expr_result_str = "pact_set_len({obj_str})"
+        expr_result_type = CT_INT
+        return 1
+    }
+    if method == "is_empty" {
+        expr_result_str = "(pact_set_len({obj_str}) == 0)"
+        expr_result_type = CT_BOOL
+        return 1
+    }
+    if method == "union" {
+        let mut set_var_name = ""
+        if np_kind.get(obj_node).unwrap() == NodeKind.Ident {
+            set_var_name = np_name.get(obj_node).unwrap()
+        }
+        let elem_type = get_set_elem_type(if set_var_name != "" { set_var_name } else { obj_str })
+        let args_sl = np_args.get(node).unwrap()
+        emit_expr(sublist_get(args_sl, btc_arg_offset))
+        let other_str = expr_result_str
+        expr_result_str = "pact_set_union({obj_str}, {other_str})"
+        expr_result_type = CT_SET
+        expr_list_elem_type = elem_type
+        return 1
+    }
+    0
+}
+
 @allow(UnrestoredMutation, IncompleteStateRestore)
 fn emit_bytes_method(node: Int, obj_str: Str, _obj_node: Int, method: Str) -> Int ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
     if method == "push" {
@@ -691,6 +760,9 @@ fn emit_builtin_trait_method(node: Int, obj_str: Str, obj_type: Int, obj_node: I
     }
     if lookup_builtin_trait_impl("MapOps", obj_type) != 0 {
         if emit_map_method(node, obj_str, obj_node, method) != 0 { return 1 }
+    }
+    if lookup_builtin_trait_impl("SetOps", obj_type) != 0 {
+        if emit_set_method(node, obj_str, obj_node, method) != 0 { return 1 }
     }
     if lookup_builtin_trait_impl("BytesOps", obj_type) != 0 {
         if emit_bytes_method(node, obj_str, obj_node, method) != 0 { return 1 }

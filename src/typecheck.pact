@@ -37,6 +37,7 @@ let TK_CHANNEL = 16
 let TK_TUPLE = 17
 let TK_MAP = 18
 let TK_BYTES = 19
+let TK_SET = 20
 
 // ── Type pool (parallel arrays) ─────────────────────────────────────
 let mut ty_kind: List[Int] = []
@@ -206,6 +207,12 @@ fn make_map_type(key_type: Int, value_type: Int) -> Int {
     t
 }
 
+fn make_set_type(elem_type: Int) -> Int {
+    let t = new_type(TK_SET, "Set")
+    ty_inner1.set(t, elem_type)
+    t
+}
+
 // ── Type lookup ─────────────────────────────────────────────────────
 
 fn lookup_named_type(name: Str) -> Int {
@@ -361,6 +368,13 @@ fn resolve_type_ann(ann_node: Int) -> Int ! TypeCheck.Resolve {
             return make_map_type(key_t, val_t)
         }
         return make_map_type(TYPE_UNKNOWN, TYPE_UNKNOWN)
+    }
+    if name == "Set" {
+        if elems_sl != -1 && sublist_length(elems_sl) >= 1 {
+            let elem_t = resolve_type_ann(sublist_get(elems_sl, 0))
+            return make_set_type(elem_t)
+        }
+        return make_set_type(TYPE_UNKNOWN)
     }
     if name == "Bytes" {
         return new_type(TK_BYTES, "Bytes")
@@ -1304,6 +1318,7 @@ fn is_builtin_fn(name: Str) -> Int {
     if name == "assert_ne" { return 1 }
     if name == "debug_assert" { return 1 }
     if name == "Map" { return 1 }
+    if name == "Set" { return 1 }
     if name == "Bytes" { return 1 }
     if name == "Channel" { return 1 }
     if name == "StringBuilder" { return 1 }
@@ -1372,6 +1387,9 @@ fn is_builtin_method(name: Str) -> Int {
     if name == "remove" { return 1 }
     if name == "keys" { return 1 }
     if name == "values" { return 1 }
+    // Set methods
+    if name == "insert" { return 1 }
+    if name == "union" { return 1 }
     // Ptr methods
     if name == "deref" { return 1 }
     if name == "is_null" { return 1 }
@@ -1489,6 +1507,8 @@ fn get_builtin_fn_ret(name: Str) -> Int {
     if name == "process_run_with_stdin" { return TYPE_VOID }
     if name == "process_exec" { return TYPE_VOID }
     if name == "Bytes" { return new_type(TK_BYTES, "Bytes") }
+    if name == "Map" { return make_map_type(TYPE_UNKNOWN, TYPE_UNKNOWN) }
+    if name == "Set" { return make_set_type(TYPE_UNKNOWN) }
     TYPE_UNKNOWN
 }
 
@@ -1528,7 +1548,7 @@ fn is_trait_name(name: Str) -> Int {
 fn is_known_type(name: Str) -> Int {
     if name == "Int" || name == "Float" || name == "Bool" || name == "Str" { return 1 }
     if name == "Void" || name == "List" || name == "Option" || name == "Result" { return 1 }
-    if name == "Iterator" || name == "Handle" || name == "Channel" || name == "Map" || name == "Bytes" || name == "Instant" || name == "Duration" || name == "Char" || name == "StringBuilder" { return 1 }
+    if name == "Iterator" || name == "Handle" || name == "Channel" || name == "Map" || name == "Set" || name == "Bytes" || name == "Instant" || name == "Duration" || name == "Char" || name == "StringBuilder" { return 1 }
     if name == "Ptr" || name == "U8" || name == "U16" || name == "U32" || name == "U64" || name == "I8" || name == "I16" || name == "I32" || name == "I64" { return 1 }
     if name == "Fn" || name == "Self" || name == "Tuple" { return 1 }
     if lookup_named_type(name) != -1 { return 1 }
@@ -2382,7 +2402,7 @@ fn types_compatible(a: Int, b: Int) -> Int {
     // Enums are tag-ints at runtime — Int and Enum are compatible
     if (ka == TK_INT && kb == TK_ENUM) || (ka == TK_ENUM && kb == TK_INT) { return 1 }
     if ka == kb {
-        if ka == TK_LIST || ka == TK_OPTION || ka == TK_ITERATOR {
+        if ka == TK_LIST || ka == TK_OPTION || ka == TK_ITERATOR || ka == TK_SET {
             return types_compatible(ty_inner1.get(a).unwrap(), ty_inner1.get(b).unwrap())
         }
         if ka == TK_MAP {
@@ -2626,6 +2646,13 @@ fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repo
             if method == "get" { return ty_inner2.get(obj_t).unwrap() }
             if method == "keys" { return make_list_type(ty_inner1.get(obj_t).unwrap()) }
             if method == "values" { return make_list_type(ty_inner2.get(obj_t).unwrap()) }
+        }
+
+        if obj_k == TK_SET {
+            if method == "len" { return TYPE_INT }
+            if method == "is_empty" { return TYPE_BOOL }
+            if method == "contains" || method == "insert" || method == "remove" { return TYPE_BOOL }
+            if method == "union" { return obj_t }
         }
 
         if obj_k == TK_BYTES {
@@ -3240,6 +3267,10 @@ fn type_to_str(tid: Int) -> Str {
         let key_t = ty_inner1.get(tid).unwrap()
         let val_t = ty_inner2.get(tid).unwrap()
         return "Map[{type_to_str(key_t)}, {type_to_str(val_t)}]"
+    }
+    if k == TK_SET {
+        let elem_t = ty_inner1.get(tid).unwrap()
+        return "Set[{type_to_str(elem_t)}]"
     }
     if k == TK_BYTES {
         return "Bytes"

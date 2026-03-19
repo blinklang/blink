@@ -1342,6 +1342,11 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
             expr_result_type = CT_MAP
             return
         }
+        if fn_name == "Set" {
+            expr_result_str = "pact_set_new()"
+            expr_result_type = CT_SET
+            return
+        }
         if fn_name == "Bytes" {
             expr_result_str = "pact_bytes_new()"
             expr_result_type = CT_BYTES
@@ -1586,6 +1591,9 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
         if expr_result_type == CT_MAP {
             expr_map_key_type = tp_child1_kind(rt.tp_id)
             expr_map_val_type = tp_child2_kind(rt.tp_id)
+        }
+        if expr_result_type == CT_SET {
+            expr_list_elem_type = tp_child1_kind(rt.tp_id)
         }
         return
     }
