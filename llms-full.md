@@ -1,8 +1,20 @@
 # Pact Language Reference
 
-> Pact is a statically-typed, effect-tracked language compiling to C. Compiler v0.20.0.
+> Pact is a statically-typed, effect-tracked language compiling to C. Compiler v0.21.0.
 
-## Recent Breaking Changes (v0.20)
+## What's New (v0.21)
+
+| Change | Details |
+|--------|---------|
+| `Set[T]` builtin type | Generic hash set: `Set()` constructor, `.insert(elem)→Bool`, `.remove(elem)→Bool`, `.contains(elem)→Bool`, `.len()→Int`, `.is_empty()→Bool`, `.union(other)→Set[T]` |
+| LSP completion | Dot-triggered symbol + keyword completion with type info, capped at 100 items |
+| LSP documentSymbol | File symbol listing with name, kind, signature, range info |
+| LSP signatureHelp | Function signature on `(` and `,` with parameter info and active param highlighting |
+| LSP rename | Cross-file symbol rename via workspace edits |
+| LSP codeAction | Quickfix actions generated from diagnostic registry |
+| Diagnostic path fix | Stdlib paths in diagnostics normalized to strip `build/` prefix |
+
+### Prior: Breaking Changes (v0.20)
 
 | Change | Before | After |
 |--------|--------|-------|
@@ -371,6 +383,7 @@ test "addition works" {
 | Bool | `true`, `false` | Boolean |
 | List[T] | `[1, 2, 3]` | Dynamic array |
 | Map[K, V] | `Map()` | Hash map (construct with `Map()`, not `{}`) |
+| Set[T] | `Set()` | Hash set (construct with `Set()`) |
 | Option[T] | `Some(v)`, `None` | Nullable value |
 | Result[T, E] | `Ok(v)`, `Err(e)` | Error-or-value |
 | Bytes | `Bytes.new()` | Byte buffer |
@@ -564,6 +577,18 @@ db.close()                      // close database connection
 | `.len()` | Int | Entry count |
 | `.keys()` | List[K] | All keys |
 | `.values()` | List[V] | All values |
+
+## Set[T] Methods
+
+| Method | Returns | Purpose |
+|--------|---------|---------|
+| `Set()` | Set[T] | Create empty set |
+| `.insert(elem)` | Bool | Add element to set |
+| `.remove(elem)` | Bool | Remove element from set |
+| `.contains(elem)` | Bool | Membership check |
+| `.len()` | Int | Number of elements |
+| `.is_empty()` | Bool | Check if empty |
+| `.union(other)` | Set[T] | Union of two sets |
 
 ## Bytes Methods
 
@@ -829,7 +854,7 @@ Run `pact doc --list` to list available modules.
 
 ## Gotchas
 
-- `{}` is NOT an empty map — use `Map()`. `{}` in expression position is a compile error.
+- `{}` is NOT an empty map — use `Map()`. `{}` in expression position is a compile error. Similarly, use `Set()` for empty sets.
 - `file_exists()` returns `Int` (0/1), not `Bool` — use `== 1` or `== 0`
 - `is_dir()` also returns `Int`, not `Bool`
 - `shell_exec()` returns exit code (Int), not stdout — use `process_run()` for output capture

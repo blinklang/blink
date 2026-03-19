@@ -4,7 +4,17 @@
 
 Targets native binaries via C codegen.
 
-## Recent Breaking Changes (v0.20)
+## What's New (v0.21)
+
+- **`Set[T]` builtin type** — generic hash set with `insert`, `remove`, `contains`, `len`, `is_empty`, `union` methods
+- **LSP completion** — dot-triggered symbol + keyword completion with type info
+- **LSP documentSymbol** — file symbol listing with kinds and ranges
+- **LSP signatureHelp** — function signature display on `(` and `,` with active parameter highlighting
+- **LSP rename** — cross-file symbol rename
+- **LSP codeAction** — quickfix actions from diagnostics
+- **Fix** — stdlib diagnostic paths normalized to strip `build/` prefix
+
+### Prior: Breaking Changes (v0.20)
 
 - **BREAKING: `path_param()` removed** — replaced by `req_path_param(req, name)` on the Request object (per-request instead of global state)
 - **Trait declarations** — builtin traits for all core types: Sized, Contains[T], StrOps, ListOps[T], MapOps[K,V], SetOps[T], BytesOps, StringBuildOps, Joinable
