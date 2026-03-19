@@ -54,7 +54,6 @@ pub fn compile_to_program(file_path: Str, use_prelude: Int) -> Int ! Lex.Tokeniz
 
     let source = read_file(file_path)
     lex(source)
-    pos = 0
     let first_node = np_kind.len()
     let program = parse_program()
     attach_comments_pass(program, first_node)
@@ -649,6 +648,7 @@ let mut root_import_modules: List[Str] = []
 pub let mut embedded_stdlib: Map[Str, Str] = Map()
 
 pub fn reset_compiler_state() {
+    parser_reset()
     loaded_files = []
     import_map_paths = []
     import_map_nodes = []
