@@ -183,17 +183,17 @@ pub fn http_do_request(req: Request) -> Result[Response, NetError] ! Net.Connect
     if connect_result.is_err() {
         return Err(connect_result.unwrap_err())
     }
-    let fd = connect_result.unwrap()
+    let sock = connect_result.unwrap()
 
     if req.timeout_ms > 0 {
-        tcp_set_timeout(fd, req.timeout_ms)
+        sock.set_timeout(req.timeout_ms)
     }
 
     let request_str = format_request(req, parts.host, parts.path)
-    tcp_write(fd, request_str)
+    sock.write(request_str)
 
-    let raw = tcp_read_all(fd)
-    tcp_close(fd)
+    let raw = sock.read_all()
+    sock.close()
 
     if raw.is_empty() {
         return Err(NetError.ProtocolError("empty response"))

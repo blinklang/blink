@@ -1,7 +1,60 @@
 import std.net_error
 
-/// Connect to a TCP host:port. Returns the file descriptor on success.
-pub fn tcp_connect(host: Str, port: Int) -> Result[Int, NetError] {
+pub type TcpSocket {
+    fd: Int
+}
+
+pub type TcpListener {
+    fd: Int
+}
+
+pub trait TcpSocketOps {
+    fn read(self, max_bytes: Int) -> Str
+    fn read_all(self) -> Str
+    fn write(self, data: Str)
+    fn close(self)
+    fn set_timeout(self, ms: Int)
+}
+
+pub trait TcpListenerOps {
+    fn close(self)
+}
+
+impl TcpSocketOps for TcpSocket {
+    fn read(self, max_bytes: Int) -> Str {
+        net.read(self.fd, max_bytes)
+    }
+
+    fn read_all(self) -> Str {
+        net.read_all(self.fd)
+    }
+
+    fn write(self, data: Str) {
+        net.write(self.fd, data)
+    }
+
+    fn close(self) {
+        net.close(self.fd)
+    }
+
+    fn set_timeout(self, ms: Int) {
+        net.set_timeout(self.fd, ms)
+    }
+}
+
+impl TcpListenerOps for TcpListener {
+    fn close(self) {
+        net.close(self.fd)
+    }
+}
+
+/// Accept an incoming connection on a TcpListener. Returns a TcpSocket.
+pub fn listener_accept(listener: TcpListener) -> Result[TcpSocket, NetError] {
+    tcp_accept(listener.fd)
+}
+
+/// Connect to a TCP host:port. Returns a TcpSocket on success.
+pub fn tcp_connect(host: Str, port: Int) -> Result[TcpSocket, NetError] {
     let fd = net.connect(host, port)
     if fd == -2 {
         return Err(NetError.DnsFailure("DNS resolution failed for {host}"))
@@ -12,25 +65,25 @@ pub fn tcp_connect(host: Str, port: Int) -> Result[Int, NetError] {
     if fd < 0 {
         return Err(NetError.ConnectionRefused("connection refused"))
     }
-    Ok(fd)
+    Ok(TcpSocket { fd: fd })
 }
 
-/// Bind and listen on host:port. Returns the listener file descriptor on success.
-pub fn tcp_listen(host: Str, port: Int) -> Result[Int, NetError] {
+/// Bind and listen on host:port. Returns a TcpListener on success.
+pub fn tcp_listen(host: Str, port: Int) -> Result[TcpListener, NetError] {
     let fd = net.listen(host, port)
     if fd < 0 {
         return Err(NetError.BindError("failed to listen on {host}:{port.to_string()}"))
     }
-    Ok(fd)
+    Ok(TcpListener { fd: fd })
 }
 
-/// Accept an incoming connection on a listener fd. Returns the client file descriptor.
-pub fn tcp_accept(fd: Int) -> Result[Int, NetError] {
-    let conn = net.accept(fd)
+/// Accept an incoming connection on a listener fd. Returns a TcpSocket.
+pub fn tcp_accept(listener_fd: Int) -> Result[TcpSocket, NetError] {
+    let conn = net.accept(listener_fd)
     if conn < 0 {
         return Err(NetError.BindError("accept failed"))
     }
-    Ok(conn)
+    Ok(TcpSocket { fd: conn })
 }
 
 /// Read up to max_bytes from a socket. Returns the data read (empty string on EOF).

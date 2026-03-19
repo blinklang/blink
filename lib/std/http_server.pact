@@ -335,15 +335,15 @@ pub fn server_serve(srv: Server) ! Net.Listen, IO {
         io.eprintln("Failed to listen on {srv.host}:{srv.port.to_string()}")
         return
     }
-    let fd = listen_result.unwrap()
+    let listener = listen_result.unwrap()
     io.println("Listening on {srv.host}:{srv.port.to_string()}")
 
     while 1 == 1 {
-        let accept_result = tcp_accept(fd)
+        let accept_result = listener_accept(listener)
         if accept_result.is_err() {
             io.eprintln("Accept failed")
         } else {
-            dispatch_connection(srv.routes, srv.before_hooks, srv.error_handler.on_error, accept_result.unwrap())
+            dispatch_connection(srv.routes, srv.before_hooks, srv.error_handler.on_error, accept_result.unwrap().fd)
         }
     }
 }
@@ -355,7 +355,7 @@ pub fn server_serve_async(srv: Server) ! Net.Listen, IO, Async {
         io.eprintln("Failed to listen on {srv.host}:{srv.port.to_string()}")
         return
     }
-    let fd = listen_result.unwrap()
+    let listener = listen_result.unwrap()
     io.println("Listening on {srv.host}:{srv.port.to_string()}")
 
     let routes = srv.routes
@@ -373,11 +373,11 @@ pub fn server_serve_async(srv: Server) ! Net.Listen, IO, Async {
         async.scope {
             while 1 == 1 {
                 sem.recv()
-                let accept_result = tcp_accept(fd)
+                let accept_result = listener_accept(listener)
                 if accept_result.is_ok() {
-                    let conn = accept_result.unwrap()
+                    let conn_fd = accept_result.unwrap().fd
                     async.spawn(fn() {
-                        dispatch_connection(routes, hooks, err_fn, conn)
+                        dispatch_connection(routes, hooks, err_fn, conn_fd)
                         sem.send(1)
                     })
                 } else {
@@ -388,11 +388,11 @@ pub fn server_serve_async(srv: Server) ! Net.Listen, IO, Async {
     } else {
         async.scope {
             while 1 == 1 {
-                let accept_result = tcp_accept(fd)
+                let accept_result = listener_accept(listener)
                 if accept_result.is_ok() {
-                    let conn = accept_result.unwrap()
+                    let conn_fd = accept_result.unwrap().fd
                     async.spawn(fn() {
-                        dispatch_connection(routes, hooks, err_fn, conn)
+                        dispatch_connection(routes, hooks, err_fn, conn_fd)
                     })
                 }
             }

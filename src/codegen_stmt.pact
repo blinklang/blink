@@ -206,6 +206,12 @@ pub fn emit_match_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scop
             match_scrut_enum = infer_enum_from_node(scrut)
         }
         emit_expr(scrut)
+        if match_scrut_enum == "" && expr_result_type == CT_VOID {
+            let scrut_s = get_var_struct(expr_result_str)
+            if scrut_s != "" && is_data_enum(scrut_s) != 0 {
+                match_scrut_enum = scrut_s
+            }
+        }
         if match_scrut_enum != "" && is_data_enum(match_scrut_enum) != 0 {
             let scrut_tmp = fresh_temp("_scrut_")
             emit_line("{c_type_c_name(match_scrut_enum)} {scrut_tmp} = {expr_result_str};")
@@ -704,6 +710,20 @@ fn bind_pattern_vars(pat: Int, scrut_off: Int, scrut_len: Int) ! Codegen.Emit, C
                                 emit_line("{c_type_c_name(field_type_name)} {c_bind} = {scrut}.data.{resolved_variant}.{field_name};")
                                 set_var(bind_name, CT_INT, 0)
                                 var_enums.push(VarEnumEntry { name: bind_name, enum_type: field_type_name })
+                            } else if field_ct == CT_LIST {
+                                emit_line("pact_list* {c_bind} = {scrut}.data.{resolved_variant}.{field_name};")
+                                set_var(bind_name, CT_LIST, 0)
+                                let bracket_pos = field_type_name.index_of("[")
+                                if bracket_pos > 0 {
+                                    let inner_name = field_type_name.substr(bracket_pos + 1, field_type_name.len() - bracket_pos - 2)
+                                    let inner_ct = type_from_name(inner_name)
+                                    if inner_ct != CT_VOID {
+                                        set_list_elem_type(bind_name, inner_ct)
+                                    } else if is_enum_type(inner_name) != 0 || is_struct_type(inner_name) != 0 {
+                                        set_list_elem_struct(bind_name, inner_name)
+                                        set_list_elem_type(bind_name, CT_VOID)
+                                    }
+                                }
                             } else {
                                 emit_line("{c_type_str(field_ct)} {c_bind} = {scrut}.data.{resolved_variant}.{field_name};")
                                 set_var(bind_name, field_ct, 0)
@@ -3407,6 +3427,12 @@ pub fn emit_enum_typedef(td_node: Int) ! Codegen.Emit {
                 let mut vf_type_name = "Int"
                 if vf_type_ann != -1 {
                     vf_type_name = np_name.get(vf_type_ann).unwrap()
+                    let vf_elems = np_elements.get(vf_type_ann).unwrap()
+                    if vf_elems != -1 && sublist_length(vf_elems) > 0 {
+                        let inner_ann = sublist_get(vf_elems, 0)
+                        let inner_type_name = np_name.get(inner_ann).unwrap()
+                        vf_type_name = "{vf_type_name}[{inner_type_name}]"
+                    }
                 }
                 if fi > 0 {
                     field_names = field_names.concat(",")

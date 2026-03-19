@@ -14,26 +14,26 @@ fn main() ! Net.Listen, IO {
         io.println("FAIL: listen failed")
         return
     }
-    let fd = listen_result.unwrap()
-    io.println("PASS: listen returned fd {fd}")
+    let listener = listen_result.unwrap()
+    io.println("PASS: listen returned fd {listener.fd}")
     io.println("Waiting for connection (use: echo hello | nc localhost 9876)")
 
-    let accept_result = tcp_accept(fd)
+    let accept_result = listener_accept(listener)
     if accept_result.is_err() {
         io.println("FAIL: accept failed")
         return
     }
     let conn = accept_result.unwrap()
-    io.println("PASS: accepted connection fd {conn}")
+    io.println("PASS: accepted connection fd {conn.fd}")
 
-    let data = tcp_read(conn, 4096)
+    let data = conn.read(4096)
     io.println("PASS: read data: \"{data}\"")
 
-    tcp_write(conn, "echo: {data}")
+    conn.write("echo: {data}")
     io.println("PASS: wrote response")
 
-    tcp_close(conn)
-    tcp_close(fd)
+    conn.close()
+    listener.close()
     io.println("PASS: closed connections")
     io.println("All net_listen tests complete")
 }

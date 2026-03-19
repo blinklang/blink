@@ -2629,7 +2629,12 @@ pub fn resolve_ptr_inner_c() -> Str {
 }
 
 pub fn type_from_name(name: Str) -> Int {
-    match name {
+    let bracket_pos = name.index_of("[")
+    let mut base = name
+    if bracket_pos >= 0 {
+        base = name.substr(0, bracket_pos)
+    }
+    match base {
         "Int" => CT_INT
         "Str" => CT_STRING
         "Float" => CT_FLOAT
