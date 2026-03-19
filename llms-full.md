@@ -770,7 +770,7 @@ Files are modules. `pub` marks items visible to importers. `import` brings `pub`
 
 | Annotation | Target | Purpose |
 |------------|--------|---------|
-| `@mod(name)` | module | Module declaration |
+| `@module(name)` | module | Module declaration |
 | `@capabilities(...)` | module | Effect ceiling |
 | `@derive(...)` | type | Auto-generate traits (Serialize, Deserialize, Eq, Ord, Hash, Debug, Clone, Display) |
 | `@src(req)` | fn | Requirement traceability |

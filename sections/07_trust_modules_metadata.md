@@ -598,32 +598,32 @@ The module name is derived from the file path relative to `src/`. The directory 
 
 **Why file = module:** Go proved this works at scale. One file, one module, one namespace. No indirection. An AI agent looking at `auth/login.pact` knows immediately that it's the `auth.login` module. No configuration to parse, no module maps to resolve.
 
-#### `@mod` — Explicit Module Naming
+#### `@module` — Explicit Module Naming
 
-The `@mod` annotation at the top of a file overrides the path-derived name. This is optional — most files don't need it.
+The `@module` annotation at the top of a file overrides the path-derived name. This is optional — most files don't need it.
 
 ```pact
 // File: src/auth/login.pact
-// Without @mod, this module is auth.login
-// With @mod, it can be renamed:
-@mod("auth")
+// Without @module, this module is auth.login
+// With @module, it can be renamed:
+@module("auth")
 
 // Now this file's public items are importable as auth.login(), auth.Token, etc.
 // rather than auth.login.login(), auth.login.Token
 ```
 
-The primary use case for `@mod` is when a directory has a single "main" file that should represent the package itself:
+The primary use case for `@module` is when a directory has a single "main" file that should represent the package itself:
 
 ```
 auth/
-  auth.pact        # @mod("auth") — the package's primary module
+  auth.pact        # @module("auth") — the package's primary module
   rate_limit.pact  # module: auth.rate_limit
   token.pact       # module: auth.token
 ```
 
-Without `@mod`, you'd import as `auth.auth.login()`. With `@mod("auth")` on `auth.pact`, you import as `auth.login()`.
+Without `@module`, you'd import as `auth.auth.login()`. With `@module("auth")` on `auth.pact`, you import as `auth.login()`.
 
-**Constraint:** `@mod` can only set the name to the parent package name. You cannot use `@mod` to move a module into a completely different package. The compiler rejects `@mod("billing")` on a file inside `auth/`.
+**Constraint:** `@module` can only set the name to the parent package name. You cannot use `@module` to move a module into a completely different package. The compiler rejects `@module("billing")` on a file inside `auth/`.
 
 #### Imports
 
@@ -740,7 +740,7 @@ There is no `pub(crate)`, no `protected`, no `internal`, no `friend`. Two levels
 A module can declare a capability ceiling with `@capabilities`. This sets a hard upper bound on what effects any function in the module is allowed to perform.
 
 ```pact
-@mod("auth")
+@module("auth")
 @capabilities(DB, Crypto, IO)
 
 // OK — DB and Crypto are within budget
@@ -774,7 +774,7 @@ Capability budgets compose hierarchically. A package-level `@capabilities` in th
 
 ```pact
 // auth/auth.pact
-@mod("auth")
+@module("auth")
 @capabilities(DB, Crypto, IO)
 // All modules under auth/ inherit this ceiling
 ```
@@ -858,7 +858,7 @@ Import resolution is a deterministic function from module path to file path. No 
 
 ```
 resolve("auth.token") → <project>/src/auth/token.pact
-resolve("auth")       → <project>/src/auth.pact (if @mod("auth"))
+resolve("auth")       → <project>/src/auth.pact (if @module("auth"))
                         OR <project>/src/auth/ (package — exposes pub items)
 ```
 
@@ -889,30 +889,30 @@ Local modules shadow dependencies with the same name. This is intentional — it
 warning[W1000]: local module shadows dependency
  --> src/http.pact:1:1
   |
-1 | @mod("http")
+1 | @module("http")
   | ^^^^^^^^^^^^ shadows package `pact.http` from pact.toml
   |
   = help: this is allowed but may confuse consumers expecting the library
 ```
 
-#### `@mod` Resolution
+#### `@module` Resolution
 
-When a file declares `@mod("parent_package")`, its public items merge into the parent package namespace. The compiler validates that `@mod` only refers to the immediate parent:
+When a file declares `@module("parent_package")`, its public items merge into the parent package namespace. The compiler validates that `@module` only refers to the immediate parent:
 
 ```
 src/auth/
-  auth.pact         @mod("auth") — items available as auth.X
+  auth.pact         @module("auth") — items available as auth.X
   token.pact        items available as auth.token.X
   rate_limit.pact   items available as auth.rate_limit.X
 ```
 
-If two files in the same directory both declare `@mod` with the same name, or if `@mod` conflicts with a sibling module name, the compiler rejects it:
+If two files in the same directory both declare `@module` with the same name, or if `@module` conflicts with a sibling module name, the compiler rejects it:
 
 ```
 error[E1001]: duplicate module name
  --> src/auth/helpers.pact:1:1
   |
-1 | @mod("auth")
+1 | @module("auth")
   | ^^^^^^^^^^^^ module name `auth` already claimed by src/auth/auth.pact
 ```
 
@@ -969,7 +969,7 @@ A module can re-export items from other modules using `pub import`. This decoupl
 
 ```pact
 // src/auth/auth.pact
-@mod("auth")
+@module("auth")
 pub import auth.token.{Token, verify}
 pub import auth.login.{login, AuthError}
 pub import auth.rate_limit.{RateLimiter}
@@ -993,7 +993,7 @@ Re-exports enable API evolution: moving a type from `auth.token` to `auth.sessio
 | Code | Error | Cause |
 |------|-------|-------|
 | E1000 | Module not found | No file at resolved path, no matching dependency |
-| E1001 | Duplicate module name | Two files claim same `@mod` name |
+| E1001 | Duplicate module name | Two files claim same `@module` name |
 | E1002 | Circular package dependency | Cross-package import cycle |
 | E1003 | Item not found | Named item doesn't exist or isn't `pub` in the target module |
 | E1004 | Version conflict | Diamond dependency with incompatible versions |
@@ -1411,7 +1411,7 @@ Annotations use the `@` prefix and are compiler-checked. They are not comments, 
 `pact fmt` enforces a deterministic annotation order. No style debates.
 
 ```pact
-@mod("auth")                          // 1. module declaration
+@module("auth")                          // 1. module declaration
 @capabilities(DB, Crypto)             // 2. capability budget
 @src(req: "AUTH-001")                 // 3. provenance
 
@@ -1425,7 +1425,7 @@ pub fn login(email: Str, pwd: Str) -> Result[Session, AuthError] ! DB, Crypto {
 }
 ```
 
-The ordering: `@mod` > `@capabilities` > `@derive` > `@src` > `@requires` > `@ensures` > `@where` > `@invariant` > `@perf` > `@ffi` > `@trusted` > `@effects` > `@alt` > `@verify` > `@allow` > `@deprecated`.
+The ordering: `@module` > `@capabilities` > `@derive` > `@src` > `@requires` > `@ensures` > `@where` > `@invariant` > `@perf` > `@ffi` > `@trusted` > `@effects` > `@alt` > `@verify` > `@allow` > `@deprecated`.
 
 Rationale: metadata about the container (module, capabilities) comes first. Then provenance (why does this exist?). Then contracts (what must be true?). Then operational concerns (performance, FFI). Then lifecycle (alternatives, deprecation).
 
@@ -1530,7 +1530,7 @@ pub type MaskedCardNumber {
 Module-level provenance applies to the entire module:
 
 ```pact
-@mod("auth")
+@module("auth")
 @src(req: "AUTH-001", "AUTH-002", "AUTH-003")
 @src(design: "RFC-2026-07")
 

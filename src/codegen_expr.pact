@@ -1810,6 +1810,10 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
             }
         }
         let rt = get_fn_ret_type(fn_name)
+        expr_result_ok_struct = ""
+        expr_result_err_struct = ""
+        expr_option_inner_struct = ""
+        expr_list_elem_struct = ""
         if expr_result_type == CT_RESULT {
             expr_result_ok_type = tp_child1_kind(rt.tp_id)
             expr_result_err_type = tp_child2_kind(rt.tp_id)

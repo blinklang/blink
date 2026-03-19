@@ -3,7 +3,7 @@
 /// Facade module that re-exports all public items from submodules.
 /// Users import this with: import std.http
 
-@mod("http")
+@module("http")
 @capabilities(Net, IO)
 
 pub import std.http_types

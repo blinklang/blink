@@ -1364,6 +1364,9 @@ fn is_builtin_method(name: Str) -> Int {
     if name == "to_upper" { return 1 }
     if name == "replace" { return 1 }
     if name == "as_cstr" { return 1 }
+    if name == "lines" { return 1 }
+    if name == "parse_float" { return 1 }
+    if name == "parse_int" { return 1 }
     // List methods
     if name == "push" { return 1 }
     if name == "pop" { return 1 }
@@ -2625,6 +2628,10 @@ fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repo
             }
             if method == "char_at" || method == "index_of" || method == "to_int" { return TYPE_INT }
             if method == "split" { return make_list_type(TYPE_STR) }
+            if method == "lines" { return make_list_type(TYPE_STR) }
+            if method == "parse_float" { return TYPE_FLOAT }
+            if method == "parse_int" { return TYPE_INT }
+            if method == "is_empty" { return TYPE_BOOL }
         }
 
         if obj_k == TK_INT {
