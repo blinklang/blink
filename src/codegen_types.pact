@@ -1434,6 +1434,10 @@ pub fn reg_fn_ret_from_ann(name: Str, fn_node: Int) ! Codegen.Register {
     }
 }
 
+pub fn reg_fn_ret_struct_inner(name: Str, ok_s: Str, err_s: Str) {
+    fn_ret_struct_inners.push(FnRetStructInner { name: name, ok_struct: ok_s, err_struct: err_s })
+}
+
 pub fn get_fn_ret_struct_inner(name: Str) -> FnRetStructInner {
     let mut i = fn_ret_struct_inners.len() - 1
     while i >= 0 {

@@ -1481,8 +1481,9 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                 emit_expr(sublist_get(args_sl, 0))
                 let ok_str = expr_result_str
                 let ok_type = expr_result_type
-                let ok_s = get_var_struct(ok_str)
+                let ok_s0 = get_var_struct(ok_str)
                 let fsi = get_fn_ret_struct_inner(cg_current_fn_name)
+                let ok_s = if ok_s0 != "" { ok_s0 } else { fsi.ok_struct }
                 let err_s = fsi.err_struct
                 let err_type = if err_s != "" { CT_INT } else { CT_STRING }
                 if ok_s != "" || err_s != "" {
@@ -1517,7 +1518,8 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                 let fsi = get_fn_ret_struct_inner(cg_current_fn_name)
                 let err_s = if err_enum != "" { err_enum } else { fsi.err_struct }
                 let ok_s = fsi.ok_struct
-                let ok_type = if ok_s != "" { CT_INT } else { CT_INT }
+                let fn_rt = get_fn_ret_type(cg_current_fn_name)
+                let ok_type = if ok_s != "" { CT_INT } else if fn_rt.kind == CT_RESULT { fn_rt.inner1 } else { CT_INT }
                 if ok_s != "" || err_s != "" {
                     ensure_mixed_result_type(ok_type, err_type, ok_s, err_s)
                     let res_type = result_c_type_mixed(ok_type, err_type, ok_s, err_s)
@@ -1734,7 +1736,20 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                             let err_ct = type_from_name(err_name)
                             expr_result_ok_type = ok_ct
                             expr_result_err_type = err_ct
-                            ensure_result_type(ok_ct, err_ct)
+                            let ok_is_type = is_struct_type(ok_name) != 0 || is_enum_type(ok_name) != 0
+                            let err_is_type = is_struct_type(err_name) != 0 || is_enum_type(err_name) != 0
+                            if ok_is_type || err_is_type {
+                                let ok_s = if ok_is_type { ok_name } else { "" }
+                                let err_s = if err_is_type { err_name } else { "" }
+                                reg_fn_ret_struct_inner(mangled, ok_s, err_s)
+                                ensure_mixed_result_type(ok_ct, err_ct, ok_s, err_s)
+                                expr_result_ok_struct = ok_s
+                                expr_result_err_struct = err_s
+                            } else {
+                                ensure_result_type(ok_ct, err_ct)
+                                expr_result_ok_struct = ""
+                                expr_result_err_struct = ""
+                            }
                             reg_fn_ret_type(mangled, CT_RESULT, ok_ct, err_ct)
                         }
                     }
