@@ -88,6 +88,17 @@ pub let mut fnsig_type_param_names: List[Str] = []
 pub let mut tc_trait_names: List[Str] = []
 pub let mut tc_trait_method_names: List[Str] = []
 
+// Trait method signature registry (for contract validation)
+let mut tc_tmsig_trait: List[Str] = []
+let mut tc_tmsig_method: List[Str] = []
+let mut tc_tmsig_param_names: List[Str] = []
+let mut tc_tmsig_params_start: List[Int] = []
+let mut tc_tmsig_params_count: List[Int] = []
+let mut tc_tmsig_ret: List[Str] = []
+let mut tc_trait_tparam_names: List[Str] = []
+let mut tc_trait_tparams_start: List[Int] = []
+let mut tc_trait_tparams_count: List[Int] = []
+
 pub let mut tc_fn_effects: List[Str] = []
 
 pub let mut tc_current_fn_ret: Int = -1
@@ -622,14 +633,141 @@ pub fn tc_get_fn_effects(name: Str) -> Option[Str] {
 pub fn register_trait(tr_node: Int) ! TypeCheck.Register {
     let name = np_name.get(tr_node).unwrap()
     tc_trait_names.push(name)
+    // Collect trait-level type params (e.g., T in trait From[T])
+    let tparams_sl = np_type_params.get(tr_node).unwrap()
+    let tp_start = tc_trait_tparam_names.len()
+    let mut tp_count = 0
+    if tparams_sl != -1 {
+        let mut ti = 0
+        while ti < sublist_length(tparams_sl) {
+            let tp = sublist_get(tparams_sl, ti)
+            tc_trait_tparam_names.push(np_name.get(tp).unwrap())
+            tp_count = tp_count + 1
+            ti = ti + 1
+        }
+    }
     let methods_sl = np_methods.get(tr_node).unwrap()
     if methods_sl != -1 {
         let mut i = 0
         while i < sublist_length(methods_sl) {
             let m = sublist_get(methods_sl, i)
-            tc_trait_method_names.push("{name}.{np_name.get(m).unwrap()}")
+            let mname = np_name.get(m).unwrap()
+            tc_trait_method_names.push("{name}.{mname}")
+            // Store method signature for contract validation
+            tc_tmsig_trait.push(name)
+            tc_tmsig_method.push(mname)
+            tc_tmsig_ret.push(np_return_type.get(m).unwrap())
+            tc_trait_tparams_start.push(tp_start)
+            tc_trait_tparams_count.push(tp_count)
+            let p_start = tc_tmsig_param_names.len()
+            let params_sl = np_params.get(m).unwrap()
+            let mut p_count = 0
+            if params_sl != -1 {
+                let mut j = 0
+                while j < sublist_length(params_sl) {
+                    let p = sublist_get(params_sl, j)
+                    tc_tmsig_param_names.push(np_type_name.get(p).unwrap())
+                    p_count = p_count + 1
+                    j = j + 1
+                }
+            }
+            tc_tmsig_params_start.push(p_start)
+            tc_tmsig_params_count.push(p_count)
             i = i + 1
         }
+    }
+}
+
+fn subst_trait_type(type_str: Str, impl_type: Str, tmsig_idx: Int, impl_node: Int) -> Str {
+    if type_str == "Self" { return impl_type }
+    let tp_start = tc_trait_tparams_start.get(tmsig_idx).unwrap()
+    let tp_count = tc_trait_tparams_count.get(tmsig_idx).unwrap()
+    if tp_count > 0 {
+        let impl_targs_sl = np_type_params.get(impl_node).unwrap()
+        let mut k = 0
+        while k < tp_count {
+            let tp_name = tc_trait_tparam_names.get(tp_start + k).unwrap()
+            if type_str == tp_name {
+                if impl_targs_sl != -1 && k < sublist_length(impl_targs_sl) {
+                    return np_name.get(sublist_get(impl_targs_sl, k)).unwrap()
+                }
+            }
+            k = k + 1
+        }
+    }
+    type_str
+}
+
+pub fn validate_trait_impls(program: Int) ! TypeCheck.Register, Diag.Report {
+    let impls_sl = np_methods.get(program).unwrap()
+    if impls_sl == -1 { return }
+    let mut ii = 0
+    while ii < sublist_length(impls_sl) {
+        let im = sublist_get(impls_sl, ii)
+        let trait_name = np_trait_name.get(im).unwrap()
+        let impl_type = np_name.get(im).unwrap()
+        // Check each trait method signature against this impl
+        let impl_methods_sl = np_methods.get(im).unwrap()
+        let mut si = 0
+        while si < tc_tmsig_trait.len() {
+            if tc_tmsig_trait.get(si).unwrap() == trait_name {
+                let expected_method = tc_tmsig_method.get(si).unwrap()
+                let mut found = 0
+                let mut mi = 0
+                if impl_methods_sl != -1 {
+                    while mi < sublist_length(impl_methods_sl) {
+                        let impl_m = sublist_get(impl_methods_sl, mi)
+                        if np_name.get(impl_m).unwrap() == expected_method {
+                            found = 1
+                            // Check arity
+                            let trait_pcount = tc_tmsig_params_count.get(si).unwrap()
+                            let impl_params_sl = np_params.get(impl_m).unwrap()
+                            let mut impl_pcount = 0
+                            if impl_params_sl != -1 {
+                                impl_pcount = sublist_length(impl_params_sl)
+                            }
+                            if trait_pcount != impl_pcount {
+                                diag_error_at("TraitContract", "E0901", "method '{expected_method}' in impl {trait_name} for {impl_type} has {impl_pcount} params, expected {trait_pcount}", impl_m, "trait requires {trait_pcount} parameters (including self)")
+                            } else {
+                                // Check param types
+                                let tp_start = tc_tmsig_params_start.get(si).unwrap()
+                                let mut pi = 0
+                                while pi < trait_pcount {
+                                    let trait_ptype = tc_tmsig_param_names.get(tp_start + pi).unwrap()
+                                    if trait_ptype != "" {
+                                        let impl_p = sublist_get(impl_params_sl, pi)
+                                        let raw_impl_ptype = np_type_name.get(impl_p).unwrap()
+                                        let impl_ptype = if raw_impl_ptype == "Self" { impl_type } else { raw_impl_ptype }
+                                        let expected_type = subst_trait_type(trait_ptype, impl_type, si, im)
+                                        if impl_ptype != expected_type {
+                                            diag_error_at("TraitContract", "E0902", "method '{expected_method}' param has type '{impl_ptype}', expected '{expected_type}'", impl_p, "change type to '{expected_type}' to match trait {trait_name}")
+                                        }
+                                    }
+                                    pi = pi + 1
+                                }
+                                // Check return type
+                                let trait_ret = tc_tmsig_ret.get(si).unwrap()
+                                if trait_ret != "" {
+                                    let raw_impl_ret = np_return_type.get(impl_m).unwrap()
+                                    let impl_ret = if raw_impl_ret == "Self" { impl_type } else { raw_impl_ret }
+                                    let expected_ret = subst_trait_type(trait_ret, impl_type, si, im)
+                                    if impl_ret != expected_ret {
+                                        diag_error_at("TraitContract", "E0903", "method '{expected_method}' returns '{impl_ret}', expected '{expected_ret}'", impl_m, "change return type to '{expected_ret}' to match trait {trait_name}")
+                                    }
+                                }
+                            }
+                            break
+                        }
+                        mi = mi + 1
+                    }
+                }
+                if found == 0 {
+                    diag_error_at("TraitContract", "E0900", "impl {trait_name} for {impl_type} is missing method '{expected_method}'", im, "add 'fn {expected_method}(...)' to the impl block")
+                }
+            }
+            si = si + 1
+        }
+        ii = ii + 1
     }
 }
 
@@ -668,6 +806,15 @@ pub fn init_types() ! TypeCheck.Register {
     fnsig_type_param_names = []
     tc_trait_names = []
     tc_trait_method_names = []
+    tc_tmsig_trait = []
+    tc_tmsig_method = []
+    tc_tmsig_param_names = []
+    tc_tmsig_params_start = []
+    tc_tmsig_params_count = []
+    tc_tmsig_ret = []
+    tc_trait_tparam_names = []
+    tc_trait_tparams_start = []
+    tc_trait_tparams_count = []
     tc_fn_effects = []
     tc_current_fn_ret = -1
     tc_current_fn_name = ""
@@ -808,6 +955,9 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
             i = i + 1
         }
     }
+
+    // Validate trait impl contracts
+    validate_trait_impls(program)
 
     // Register user-defined effect handle names
     tc_ue_handles = []
