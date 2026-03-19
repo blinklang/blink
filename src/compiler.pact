@@ -753,6 +753,7 @@ pub fn check_unused_imports() ! Diag.Report {
         if tc_is_module_used(mod_name) == 0 {
             let imp_node = root_import_nodes.get(ii).unwrap()
             diag_warn_at("UnusedImport", "W0602", "module '{mod_name}' is imported but not used", imp_node, "remove the unused import")
+            diag_set_last_fix("Remove unused import", "")
         }
         ii = ii + 1
     }

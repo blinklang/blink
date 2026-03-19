@@ -21,8 +21,8 @@ pub let mut diag_col: List[Int] = []
 pub let mut diag_help: List[Str] = []
 pub let mut diag_end_line: List[Int] = []
 pub let mut diag_end_col: List[Int] = []
-let mut diag_fix_action: List[Str] = []
-let mut diag_fix_text: List[Str] = []
+pub let mut diag_fix_action: List[Str] = []
+pub let mut diag_fix_text: List[Str] = []
 
 // ── Configuration ────────────────────────────────────────────────────
 

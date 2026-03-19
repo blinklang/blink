@@ -74,7 +74,7 @@ fn lsp_send_notification(method: Str, params: Str) ! IO {
 }
 
 fn lsp_handle_initialize() -> Str {
-    "\{\"capabilities\":\{\"textDocumentSync\":1,\"definitionProvider\":true,\"hoverProvider\":true,\"referencesProvider\":true,\"documentSymbolProvider\":true,\"completionProvider\":\{\"triggerCharacters\":[\".\"]},\"signatureHelpProvider\":\{\"triggerCharacters\":[\"(\",\",\"]\}\},\"serverInfo\":\{\"name\":\"pact-lsp\",\"version\":\"0.1.0\"\}\}"
+    "\{\"capabilities\":\{\"textDocumentSync\":1,\"definitionProvider\":true,\"hoverProvider\":true,\"referencesProvider\":true,\"documentSymbolProvider\":true,\"completionProvider\":\{\"triggerCharacters\":[\".\"]},\"signatureHelpProvider\":\{\"triggerCharacters\":[\"(\",\",\"]\},\"renameProvider\":true,\"codeActionProvider\":true\},\"serverInfo\":\{\"name\":\"pact-lsp\",\"version\":\"0.1.0\"\}\}"
 }
 
 fn lsp_handle_shutdown() -> Str {
@@ -479,6 +479,115 @@ fn lsp_handle_references(id: Int, root: Int) ! IO, Lex.Tokenize {
     lsp_send_response_int(id, sb.to_str())
 }
 
+fn lsp_handle_rename(id: Int, root: Int) ! IO, Lex.Tokenize {
+    let sym_idx = lsp_resolve_symbol_at_cursor(root)
+    if sym_idx < 0 {
+        lsp_send_error_int(id, -32602, "No symbol at cursor")
+        return
+    }
+
+    let params_node = json_get(root, "params")
+    let new_name_node = if params_node != -1 { json_get(params_node, "newName") } else { -1 }
+    if new_name_node == -1 {
+        lsp_send_error_int(id, -32602, "Missing newName")
+        return
+    }
+    let new_name = json_as_str(new_name_node)
+
+    let mut changes = StringBuilder.new()
+    changes.write("\{\"changes\":\{")
+
+    let decl_file = si_sym_file.get(sym_idx).unwrap()
+    let sym_name = si_sym_name.get(sym_idx).unwrap()
+    let sym_kind = si_sym_kind.get(sym_idx).unwrap()
+    let name_len = sym_name.len()
+    let decl_uri = "file://{decl_file}"
+    let escaped_decl_uri = json_escape(decl_uri)
+
+    let mut decl_line = lsp_to_zero_based(si_sym_line.get(sym_idx).unwrap())
+    let mut decl_col = lsp_to_zero_based(si_sym_col.get(sym_idx).unwrap())
+
+    if decl_file == lsp_lookup_file {
+        let def_tok = lsp_find_def_token(sym_name, sym_kind)
+        if def_tok >= 0 {
+            decl_line = lsp_to_zero_based(tok_lines.get(def_tok).unwrap())
+            decl_col = lsp_to_zero_based(tok_cols.get(def_tok).unwrap())
+        }
+    }
+
+    let mut edit_uris: List[Str] = []
+    let mut edit_jsons: List[Str] = []
+
+    let escaped_new = json_escape(new_name)
+
+    let decl_edit = "\{\"range\":\{\"start\":\{\"line\":{decl_line},\"character\":{decl_col}\},\"end\":\{\"line\":{decl_line},\"character\":{decl_col + name_len}\}\},\"newText\":\"{escaped_new}\"\}"
+    edit_uris.push(escaped_decl_uri)
+    edit_jsons.push(decl_edit)
+
+    let refs = si_get_ref_locations(sym_idx)
+    let mut i = 0
+    while i < refs.len() {
+        let edge = refs.get(i).unwrap()
+        let from_idx = si_dep_from.get(edge).unwrap()
+        let ref_file = si_sym_file.get(from_idx).unwrap()
+        let ref_line = lsp_to_zero_based(si_dep_line.get(edge).unwrap())
+        let ref_col = lsp_to_zero_based(si_dep_col.get(edge).unwrap())
+        let ref_name_len = si_dep_name_len.get(edge).unwrap()
+        let ref_uri = json_escape("file://{ref_file}")
+        let ref_edit = "\{\"range\":\{\"start\":\{\"line\":{ref_line},\"character\":{ref_col}\},\"end\":\{\"line\":{ref_line},\"character\":{ref_col + ref_name_len}\}\},\"newText\":\"{escaped_new}\"\}"
+        edit_uris.push(ref_uri)
+        edit_jsons.push(ref_edit)
+        i = i + 1
+    }
+
+    let mut seen_uris: List[Str] = []
+    let mut uri_idx = 0
+    while uri_idx < edit_uris.len() {
+        let u = edit_uris.get(uri_idx).unwrap()
+        let mut found = 0
+        let mut si = 0
+        while si < seen_uris.len() {
+            if seen_uris.get(si).unwrap() == u {
+                found = 1
+                break
+            }
+            si = si + 1
+        }
+        if found == 0 {
+            seen_uris.push(u)
+        }
+        uri_idx = uri_idx + 1
+    }
+
+    let mut first_uri = 1
+    let mut su = 0
+    while su < seen_uris.len() {
+        let u = seen_uris.get(su).unwrap()
+        if first_uri == 0 {
+            changes.write(",")
+        }
+        changes.write("\"{u}\":[")
+        let mut first_edit = 1
+        let mut ei = 0
+        while ei < edit_uris.len() {
+            if edit_uris.get(ei).unwrap() == u {
+                if first_edit == 0 {
+                    changes.write(",")
+                }
+                changes.write(edit_jsons.get(ei).unwrap())
+                first_edit = 0
+            }
+            ei = ei + 1
+        }
+        changes.write("]")
+        first_uri = 0
+        su = su + 1
+    }
+
+    changes.write("\}\}")
+    lsp_send_response_int(id, changes.to_str())
+}
+
 fn lsp_sym_kind_to_lsp(kind: Int) -> Int {
     if kind == SK_FN { return 12 }
     if kind == SK_STRUCT { return 23 }
@@ -759,6 +868,63 @@ fn lsp_handle_signature_help(id: Int, root: Int) ! IO, Lex.Tokenize {
     lsp_send_response_int(id, result_sb.to_str())
 }
 
+fn lsp_handle_code_action(id: Int, root: Int) ! IO {
+    let uri = lsp_extract_document_uri(root)
+    if uri == "" {
+        lsp_send_response_int(id, "[]")
+        return
+    }
+    let params_node = json_get(root, "params")
+    let range_node = if params_node != -1 { json_get(params_node, "range") } else { -1 }
+    if range_node == -1 {
+        lsp_send_response_int(id, "[]")
+        return
+    }
+    let start_node = json_get(range_node, "start")
+    let end_node = json_get(range_node, "end")
+    let req_start_line = if start_node != -1 { json_as_int(json_get(start_node, "line")) } else { -1 }
+    let req_end_line = if end_node != -1 { json_as_int(json_get(end_node, "line")) } else { -1 }
+
+    let mut sb = StringBuilder.new()
+    sb.write("[")
+    let mut first = 1
+
+    let mut i = 0
+    while i < diag_severity.len() {
+        let fix_act = diag_fix_action.get(i).unwrap()
+        if fix_act == "" {
+            i = i + 1
+            continue
+        }
+        let d_line = lsp_to_zero_based(diag_line.get(i).unwrap())
+        if d_line < req_start_line || d_line > req_end_line {
+            i = i + 1
+            continue
+        }
+
+        let fix_txt = diag_fix_text.get(i).unwrap()
+        let d_col = lsp_to_zero_based(diag_col.get(i).unwrap())
+        let d_el = diag_end_line.get(i).unwrap()
+        let d_ec = diag_end_col.get(i).unwrap()
+        let d_end_line = if d_el > 0 { lsp_to_zero_based(d_el) } else { d_line }
+        let d_end_col = if d_el > 0 { lsp_to_zero_based(d_ec) } else { d_col }
+
+        let escaped_title = json_escape(fix_act)
+        let escaped_uri = json_escape(uri)
+        let escaped_text = json_escape(fix_txt)
+
+        if first == 0 {
+            sb.write(",")
+        }
+        sb.write("\{\"title\":\"{escaped_title}\",\"kind\":\"quickfix\",\"edit\":\{\"changes\":\{\"{escaped_uri}\":[\{\"range\":\{\"start\":\{\"line\":{d_line},\"character\":{d_col}\},\"end\":\{\"line\":{d_end_line},\"character\":{d_end_col}\}\},\"newText\":\"{escaped_text}\"\}]\}\}\}")
+        first = 0
+        i = i + 1
+    }
+
+    sb.write("]")
+    lsp_send_response_int(id, sb.to_str())
+}
+
 fn lsp_dispatch(method: Str, id_int: Int, id_is_present: Int, root: Int) ! IO, Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
     if method == "initialize" {
         let result = lsp_handle_initialize()
@@ -803,6 +969,14 @@ fn lsp_dispatch(method: Str, id_int: Int, id_is_present: Int, root: Int) ! IO, L
     } else if method == "textDocument/signatureHelp" {
         if id_is_present != 0 {
             lsp_handle_signature_help(id_int, root)
+        }
+    } else if method == "textDocument/rename" {
+        if id_is_present != 0 {
+            lsp_handle_rename(id_int, root)
+        }
+    } else if method == "textDocument/codeAction" {
+        if id_is_present != 0 {
+            lsp_handle_code_action(id_int, root)
         }
     } else {
         if id_is_present != 0 {

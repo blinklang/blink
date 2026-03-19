@@ -1,0 +1,25 @@
+pub fn compile_and_capture(source: Str, tag: Str) -> Str {
+    write_file("build/{tag}.pact", source)
+    shell_exec(
+        "build/pactc build/{tag}.pact /dev/null --format json > build/{tag}_out.txt 2>&1 || true"
+    )
+    let output = read_file("build/{tag}_out.txt")
+    shell_exec("rm -f build/{tag}.pact build/{tag}_out.txt")
+    output
+}
+
+pub fn expect_error(output: Str, code: Str, label: Str) {
+    if output.contains(code) {
+        io.println("PASS: {label}")
+    } else {
+        io.println("FAIL: {label} — expected {code} in output")
+    }
+}
+
+pub fn expect_clean(output: Str, label: Str) {
+    if output.contains("E0900") || output.contains("E0901") || output.contains("E0902") || output.contains("E0903") {
+        io.println("FAIL: {label} — unexpected trait contract error in output")
+    } else {
+        io.println("PASS: {label}")
+    }
+}
