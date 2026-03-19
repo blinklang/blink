@@ -1,8 +1,19 @@
 # Pact Language Reference
 
-> Pact is a statically-typed, effect-tracked language compiling to C. Compiler v0.21.0.
+> Pact is a statically-typed, effect-tracked language compiling to C. **Compiler v0.22.0**.
 
-## What's New (v0.21)
+## What's New (v0.22)
+
+| Change | Details |
+|--------|---------|
+| `TcpSocket` / `TcpListener` types | Typed wrappers for TCP file descriptors. `TcpSocket` has `.read()→Str`, `.read_all()→Str`, `.write(data)→Void`, `.close()→Void`, `.set_timeout(ms)→Void`. `TcpListener` has `.close()→Void`. |
+| `std.net` TCP stdlib | `tcp_listen(host, port)→Result[TcpListener, NetError]`, `tcp_connect(host, port)→Result[TcpSocket, NetError]`, `listener_accept(listener)→Result[TcpSocket, NetError]` |
+| `net.*` namespace methods | `net.listen`, `net.accept`, `net.read`, `net.write`, `net.close`, `net.connect`, `net.set_timeout`, `net.read_all` — low-level TCP via namespace dispatch |
+| `NetError` enum | `Timeout`, `ConnectionRefused`, `DnsFailure`, `TlsError`, `InvalidUrl`, `BindError`, `ProtocolError` |
+| Codegen fixes | Result/Option type mismatches for enums/generics, nested compound type codegen, recursive enum list codegen, trait dispatch |
+| Typecheck/parser fixes | String method typechecking, stale codegen state, @module annotations, LSP parser AST reset, daemon parser reset, async spawn |
+
+### Prior: What's New (v0.21)
 
 | Change | Details |
 |--------|---------|
@@ -460,6 +471,14 @@ let nested = ##"contains #"inner"#"##   // depth-2 nesting
 | `socket_read_line(fd)` | Str | Read line from socket |
 | `socket_write(fd, data)` | Void | Write data to socket |
 | `ffi_scope(fn)` | Void | FFI resource scope — auto-frees allocations on exit |
+| `tcp_listen(host, port)` | Int | Listen on TCP socket |
+| `tcp_connect(host, port)` | Int | Connect to TCP host:port |
+| `tcp_accept(fd)` | Int | Accept incoming TCP connection |
+| `tcp_read(fd, max_bytes)` | Str | Read up to max_bytes from TCP socket |
+| `tcp_read_all(fd)` | Str | Read all available data from TCP socket |
+| `tcp_write(fd, data)` | Void | Write data to TCP socket |
+| `tcp_close(fd)` | Void | Close TCP socket |
+| `tcp_set_timeout(fd, ms)` | Void | Set read timeout on TCP socket |
 
 ## Namespace Methods
 
@@ -511,6 +530,16 @@ db.commit()                     // COMMIT
 db.rollback()                   // ROLLBACK
 db.errmsg()                     // -> Str (last error message)
 db.close()                      // close database connection
+
+// Net (effect: Net.Listen for listen/accept, Net.Connect for connect)
+net.listen(host, port)          // -> Int (listen fd)
+net.accept(fd)                  // -> Int (connection fd)
+net.read(fd, max_bytes)         // -> Str (read up to max_bytes)
+net.read_all(fd)                // -> Str (read all available data)
+net.write(fd, data)             // -> Void
+net.close(fd)                   // -> Void
+net.connect(host, port)         // -> Int (connection fd)
+net.set_timeout(fd, ms)         // -> Void (set read timeout)
 ```
 
 ## String Methods
@@ -833,6 +862,7 @@ if result.exit_code == 0 {
 | `std.args` | CLI argument parsing (flags, options, commands) | `import std.args` |
 | `std.http` | HTTP client and server | `import std.http` |
 | `std.json` | JSON parser and serializer | `import std.json` |
+| `std.net` | TCP networking: `TcpSocket`, `TcpListener`, `NetError`, `tcp_listen`, `tcp_connect`, `tcp_accept` | `import std.net` |
 | `std.path` | Path utilities: `path_join(a, b)`, `path_dirname(path)`, `path_basename(path)` | `import std.path` |
 | `std.semver` | Semantic version parsing and constraints | `import std.semver` |
 | `std.toml` | TOML parser | `import std.toml` |

@@ -4,7 +4,15 @@
 
 Targets native binaries via C codegen.
 
-## What's New (v0.21)
+## What's New (v0.22)
+
+- **`TcpSocket` / `TcpListener` types** — typed wrappers for TCP file descriptors with trait-based methods (`read`, `read_all`, `write`, `close`, `set_timeout`)
+- **`std.net` TCP stdlib** — `tcp_listen`, `tcp_connect`, `tcp_accept`, `tcp_read`, `tcp_write`, `tcp_close`, `tcp_set_timeout`, `tcp_read_all`
+- **`net.*` namespace methods** — `net.listen`, `net.accept`, `net.read`, `net.write`, `net.close`, `net.connect`, `net.set_timeout`, `net.read_all`
+- **`NetError` enum** — Timeout, ConnectionRefused, DnsFailure, TlsError, InvalidUrl, BindError, ProtocolError
+- **Fixes** — typecheck string methods, Result/Option type mismatches for enums/generics, nested compound type codegen, trait dispatch, LSP parser reset, async spawn, daemon parser reset
+
+### Prior: What's New (v0.21)
 
 - **`Set[T]` builtin type** — generic hash set with `insert`, `remove`, `contains`, `len`, `is_empty`, `union` methods
 - **LSP completion** — dot-triggered symbol + keyword completion with type info
@@ -164,7 +172,7 @@ Key facts:
 
 ## Standard Library
 
-`std.args` (CLI parsing), `std.http` (HTTP client/server), `std.json` (JSON), `std.path` (path utilities), `std.semver` (versions), `std.toml` (TOML).
+`std.args` (CLI parsing), `std.http` (HTTP client/server), `std.json` (JSON), `std.net` (TCP networking), `std.path` (path utilities), `std.semver` (versions), `std.toml` (TOML).
 Prelude (auto-imported): `std.str` (string ops), `std.list` (list HOFs), `std.map` (map HOFs), `std.num`, `std.sb`, `std.bytes`, `std.time`.
 Run `pact doc --list` to list modules, `pact doc <module>` for details.
 
