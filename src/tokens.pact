@@ -48,7 +48,7 @@ fn make_token(kind: Int, value: Str, line: Int, col: Int) -> Token {
 }
 
 // Helper: human-readable name for a token kind (for error messages)
-pub fn token_kind_name(kind: TokenKind) -> Str {
+fn token_kind_name(kind: TokenKind) -> Str {
     match kind {
         TokenKind.Fn => "fn"
         TokenKind.Let => "let"

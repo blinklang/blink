@@ -26,7 +26,7 @@ import comment_attach
 
 let mut lint_cache_mtime: Int = -1
 
-pub fn load_lint_overrides() {
+fn load_lint_overrides() {
     let mtime = file_mtime("pact.toml")
     if mtime == -1 {
         return
@@ -75,7 +75,7 @@ pub fn compile_to_program(file_path: Str, use_prelude: Int) -> Int ! Lex.Tokeniz
     final_program
 }
 
-pub fn dots_to_slashes(s: Str) -> Str {
+fn dots_to_slashes(s: Str) -> Str {
     let mut result = ""
     let mut i = 0
     while i < s.len() {
@@ -127,7 +127,7 @@ fn find_module_annotation(prog: Int) -> Option[Str] {
     None
 }
 
-pub fn dots_to_underscores(s: Str) -> Str {
+fn dots_to_underscores(s: Str) -> Str {
     let mut result = ""
     let mut i = 0
     while i < s.len() {
@@ -163,9 +163,9 @@ pub fn trace(phase: Str, msg: Str) {
     }
 }
 
-pub let mut lockfile_loaded: Int = 0
+let mut lockfile_loaded: Int = 0
 
-pub fn ensure_lockfile_loaded(src_root: Str) {
+fn ensure_lockfile_loaded(src_root: Str) {
     if lockfile_loaded == 1 {
         return
     }
@@ -427,7 +427,7 @@ pub fn resolve_module_path(dotted_path: Str, src_root: Str) -> Str ! Diag.Report
     ""
 }
 
-pub fn should_import_item(item: Int, import_node: Int) -> Int {
+fn should_import_item(item: Int, import_node: Int) -> Int {
     let names_sl = np_args.get(import_node).unwrap()
     if names_sl == -1 {
         return 1
@@ -641,11 +641,11 @@ pub fn merge_programs(main_prog: Int, imported: List[Int], _import_nodes_list: L
 }
 
 pub let mut loaded_files: List[Str] = []
-pub let mut import_map_paths: List[Str] = []
+let mut import_map_paths: List[Str] = []
 pub let mut import_map_nodes: List[Int] = []
-pub let mut import_map_modules: List[Str] = []
-pub let mut root_import_nodes: List[Int] = []
-pub let mut root_import_modules: List[Str] = []
+let mut import_map_modules: List[Str] = []
+let mut root_import_nodes: List[Int] = []
+let mut root_import_modules: List[Str] = []
 pub let mut embedded_stdlib: Map[Str, Str] = Map()
 
 pub fn reset_compiler_state() {
@@ -658,7 +658,7 @@ pub fn reset_compiler_state() {
     lockfile_loaded = 0
 }
 
-pub fn is_file_loaded(path: Str) -> Int {
+fn is_file_loaded(path: Str) -> Int {
     let mut i = 0
     while i < loaded_files.len() {
         if loaded_files.get(i).unwrap() == path {

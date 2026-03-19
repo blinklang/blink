@@ -10,16 +10,16 @@ import diagnostics
 
 // ── Parallel-array storage ────────────────────────────────────────────
 
-pub let mut ma_fn_names: List[Str] = []
-pub let mut ma_write_items: List[Str] = []
-pub let mut ma_write_starts: List[Int] = []
-pub let mut ma_write_counts: List[Int] = []
+let mut ma_fn_names: List[Str] = []
+let mut ma_write_items: List[Str] = []
+let mut ma_write_starts: List[Int] = []
+let mut ma_write_counts: List[Int] = []
 
-pub let mut ma_globals: List[Str] = []
+let mut ma_globals: List[Str] = []
 
 // Call edges stored as indices (not names) for O(1) propagation
-pub let mut ma_call_edges_from: List[Int] = []
-pub let mut ma_call_edges_to: List[Int] = []
+let mut ma_call_edges_from: List[Int] = []
+let mut ma_call_edges_to: List[Int] = []
 
 // Hash maps for O(1) lookups
 let mut fn_name_map: Map[Str, Int] = Map()
@@ -465,7 +465,7 @@ pub fn analyze_mutations(program: Int) {
 
 // ── Query API ─────────────────────────────────────────────────────────
 
-pub fn get_fn_write_count(name: Str) -> Int {
+fn get_fn_write_count(name: Str) -> Int {
     let idx = fn_index(name)
     if idx >= 0 {
         return ma_write_counts.get(idx).unwrap()
@@ -473,7 +473,7 @@ pub fn get_fn_write_count(name: Str) -> Int {
     0
 }
 
-pub fn get_fn_write_at(name: Str, wi: Int) -> Str {
+fn get_fn_write_at(name: Str, wi: Int) -> Str {
     let idx = fn_index(name)
     if idx >= 0 {
         let start = ma_write_starts.get(idx).unwrap()
@@ -482,11 +482,11 @@ pub fn get_fn_write_at(name: Str, wi: Int) -> Str {
     ""
 }
 
-pub fn get_all_globals() -> List[Str] {
+fn get_all_globals() -> List[Str] {
     ma_globals
 }
 
-pub fn fn_writes_to(fn_name: Str, global_name: Str) -> Int {
+fn fn_writes_to(fn_name: Str, global_name: Str) -> Int {
     let idx = fn_index(fn_name)
     if idx >= 0 {
         return fn_has_write(idx, global_name)

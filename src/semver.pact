@@ -22,7 +22,7 @@ let CH_TILDE = 126
 
 // ── Version struct ─────────────────────────────────────────────────
 
-pub type Version {
+type Version {
     major: Int
     minor: Int
     patch: Int
@@ -30,11 +30,11 @@ pub type Version {
 
 // ── Parse output globals ───────────────────────────────────────────
 
-pub let mut ver_major = 0
-pub let mut ver_minor = 0
-pub let mut ver_patch = 0
-pub let mut ver_has_minor = 0
-pub let mut ver_has_patch = 0
+let mut ver_major = 0
+let mut ver_minor = 0
+let mut ver_patch = 0
+let mut ver_has_minor = 0
+let mut ver_has_patch = 0
 
 // ── Constraint parallel arrays ─────────────────────────────────────
 // Op codes: 0=gte, 1=lt, 2=eq, 3=lte, 4=gt
@@ -45,10 +45,10 @@ let OP_EQ = 2
 let OP_LTE = 3
 let OP_GT = 4
 
-pub let mut constraint_ops: List[Int] = []
-pub let mut constraint_majors: List[Int] = []
-pub let mut constraint_minors: List[Int] = []
-pub let mut constraint_patches: List[Int] = []
+let mut constraint_ops: List[Int] = []
+let mut constraint_majors: List[Int] = []
+let mut constraint_minors: List[Int] = []
+let mut constraint_patches: List[Int] = []
 
 // ── Helpers ────────────────────────────────────────────────────────
 
@@ -151,13 +151,13 @@ fn parse_version_range(s: Str, start: Int, end: Int) -> Int {
     1
 }
 
-pub fn parse_version(s: Str) -> Int {
+fn parse_version(s: Str) -> Int {
     parse_version_range(s, 0, s.len())
 }
 
 // ── version_compare ────────────────────────────────────────────────
 
-pub fn version_compare(a_major: Int, a_minor: Int, a_patch: Int,
+fn version_compare(a_major: Int, a_minor: Int, a_patch: Int,
                        b_major: Int, b_minor: Int, b_patch: Int) -> Int {
     if a_major < b_major {
         return -1
@@ -182,7 +182,7 @@ pub fn version_compare(a_major: Int, a_minor: Int, a_patch: Int,
 
 // ── version_to_str ─────────────────────────────────────────────────
 
-pub fn version_to_str(major: Int, minor: Int, patch: Int) -> Str {
+fn version_to_str(major: Int, minor: Int, patch: Int) -> Str {
     "{major}.{minor}.{patch}"
 }
 
@@ -337,7 +337,7 @@ fn parse_single_constraint(s: Str, start: Int, end: Int) {
 // Parses a constraint string which may contain comma-separated terms.
 // Returns the number of bounds parsed.
 
-pub fn parse_constraint(s: Str) -> Int {
+fn parse_constraint(s: Str) -> Int {
     constraint_ops = []
     constraint_majors = []
     constraint_minors = []
@@ -369,7 +369,7 @@ pub fn parse_constraint(s: Str) -> Int {
 // arrays. Call parse_constraint first.
 // Returns 1 if satisfied, 0 otherwise.
 
-pub fn version_satisfies(major: Int, minor: Int, patch: Int) -> Int {
+fn version_satisfies(major: Int, minor: Int, patch: Int) -> Int {
     let mut i = 0
     while i < constraint_ops.len() {
         let op = constraint_ops.get(i).unwrap()
@@ -417,7 +417,7 @@ pub fn version_satisfies(major: Int, minor: Int, patch: Int) -> Int {
 // Convenience: parse both version and constraint, then check match.
 // Returns 1 if version satisfies constraint, 0 otherwise.
 
-pub fn version_matches(version_str: Str, constraint_str: Str) -> Int {
+fn version_matches(version_str: Str, constraint_str: Str) -> Int {
     let ok = parse_version(version_str)
     if ok == 0 {
         return 0

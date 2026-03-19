@@ -11,18 +11,18 @@ import symbol_index
 
 // ── Snapshot storage (parallel arrays) ───────────────────────────────
 
-pub let mut inc_snap_path: List[Str] = []
-pub let mut inc_snap_mtime: List[Int] = []
-pub let mut inc_snap_count: Int = 0
+let mut inc_snap_path: List[Str] = []
+let mut inc_snap_mtime: List[Int] = []
+let mut inc_snap_count: Int = 0
 
 // ── Changed file list ────────────────────────────────────────────────
 
-pub let mut inc_dirty_path: List[Str] = []
-pub let mut inc_dirty_count: Int = 0
+let mut inc_dirty_path: List[Str] = []
+let mut inc_dirty_count: Int = 0
 
 // ── Affected symbol set ──────────────────────────────────────────────
 
-pub let mut inc_affected: List[Int] = []
+let mut inc_affected: List[Int] = []
 pub let mut inc_affected_count: Int = 0
 
 // Lookup map for O(1) affected check (keyed by string-converted sym index)
@@ -122,7 +122,7 @@ pub fn inc_compute_affected() {
 
 // ── Query: check if a symbol needs rechecking ────────────────────────
 
-pub fn inc_needs_recheck(sym_idx: Int) -> Int {
+fn inc_needs_recheck(sym_idx: Int) -> Int {
     if inc_affected_count == 0 {
         // No affected set computed — recheck everything
         return 1

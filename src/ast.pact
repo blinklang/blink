@@ -42,7 +42,7 @@ pub type NodeKind {
 // This is not pretty. It's the minimum viable representation that
 // the C backend can compile today. Once the backend gains tagged
 // unions or proper enum support, this gets replaced.
-pub type Node {
+type Node {
     kind: Int
 
     // Literal values

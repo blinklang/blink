@@ -16,72 +16,72 @@ effect Lex {
 // parallel lists instead of tuples.
 
 // ── Mode constants ───────────────────────────────────────────────────
-pub let MODE_NORMAL = 0
-pub let MODE_STRING = 1
+let MODE_NORMAL = 0
+let MODE_STRING = 1
 
 // ── ASCII constants ──────────────────────────────────────────────────
-pub let CH_TAB = 9
-pub let CH_NEWLINE = 10
-pub let CH_SPACE = 32
-pub let CH_DQUOTE = 34
-pub let CH_PERCENT = 37
-pub let CH_LPAREN = 40
-pub let CH_RPAREN = 41
-pub let CH_STAR = 42
-pub let CH_PLUS = 43
-pub let CH_COMMA = 44
-pub let CH_MINUS = 45
-pub let CH_DOT = 46
-pub let CH_SLASH = 47
-pub let CH_0 = 48
-pub let CH_9 = 57
-pub let CH_COLON = 58
-pub let CH_LESS = 60
-pub let CH_EQUALS = 61
-pub let CH_GREATER = 62
-pub let CH_QUESTION = 63
-pub let CH_AT = 64
-pub let CH_A = 65
-pub let CH_Z = 90
-pub let CH_LBRACKET = 91
-pub let CH_BACKSLASH = 92
-pub let CH_RBRACKET = 93
-pub let CH_UNDERSCORE = 95
-pub let CH_a = 97
-pub let CH_b = 98
-pub let CH_f = 102
-pub let CH_n = 110
-pub let CH_r = 114
-pub let CH_t = 116
-pub let CH_Z_LOWER = 122
-pub let CH_LBRACE = 123
-pub let CH_PIPE = 124
-pub let CH_RBRACE = 125
-pub let CH_BANG = 33
-pub let CH_HASH = 35
-pub let CH_AMP = 38
+let CH_TAB = 9
+let CH_NEWLINE = 10
+let CH_SPACE = 32
+let CH_DQUOTE = 34
+let CH_PERCENT = 37
+let CH_LPAREN = 40
+let CH_RPAREN = 41
+let CH_STAR = 42
+let CH_PLUS = 43
+let CH_COMMA = 44
+let CH_MINUS = 45
+let CH_DOT = 46
+let CH_SLASH = 47
+let CH_0 = 48
+let CH_9 = 57
+let CH_COLON = 58
+let CH_LESS = 60
+let CH_EQUALS = 61
+let CH_GREATER = 62
+let CH_QUESTION = 63
+let CH_AT = 64
+let CH_A = 65
+let CH_Z = 90
+let CH_LBRACKET = 91
+let CH_BACKSLASH = 92
+let CH_RBRACKET = 93
+let CH_UNDERSCORE = 95
+let CH_a = 97
+let CH_b = 98
+let CH_f = 102
+let CH_n = 110
+let CH_r = 114
+let CH_t = 116
+let CH_Z_LOWER = 122
+let CH_LBRACE = 123
+let CH_PIPE = 124
+let CH_RBRACE = 125
+let CH_BANG = 33
+let CH_HASH = 35
+let CH_AMP = 38
 
 // ── Character classification ─────────────────────────────────────────
 
-pub fn is_alpha(c: Int) -> Int {
+fn is_alpha(c: Int) -> Int {
     (c >= CH_A && c <= CH_Z) || (c >= CH_a && c <= CH_Z_LOWER) || c == CH_UNDERSCORE
 }
 
-pub fn is_digit(c: Int) -> Int {
+fn is_digit(c: Int) -> Int {
     c >= CH_0 && c <= CH_9
 }
 
-pub fn is_alnum(c: Int) -> Int {
+fn is_alnum(c: Int) -> Int {
     is_alpha(c) || is_digit(c)
 }
 
-pub fn is_whitespace(c: Int) -> Int {
+fn is_whitespace(c: Int) -> Int {
     c == CH_SPACE || c == CH_TAB
 }
 
 // ── Peek helpers ─────────────────────────────────────────────────────
 
-pub fn peek(source: Str, scan_pos: Int) -> Int {
+fn peek(source: Str, scan_pos: Int) -> Int {
     if scan_pos >= source.len() {
         0
     } else {
@@ -89,7 +89,7 @@ pub fn peek(source: Str, scan_pos: Int) -> Int {
     }
 }
 
-pub fn peek_at(source: Str, scan_pos: Int, offset: Int) -> Int {
+fn peek_at(source: Str, scan_pos: Int, offset: Int) -> Int {
     peek(source, scan_pos + offset)
 }
 

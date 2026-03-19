@@ -132,7 +132,7 @@ fn effects_contain(effects: Str, target: Str) -> Int {
 
 // ── Query: list fn signatures in a module ────────────────────────────
 
-pub fn query_by_signature(module: Str) -> Str {
+fn query_by_signature(module: Str) -> Str {
     let mut items = ""
     let mut _first = 1
     let mut i = 0
@@ -151,7 +151,7 @@ pub fn query_by_signature(module: Str) -> Str {
 
 // ── Query: find fns with a matching effect ───────────────────────────
 
-pub fn query_by_effect(effect_name: Str) -> Str {
+fn query_by_effect(effect_name: Str) -> Str {
     let mut items = ""
     let mut _first = 1
     let mut i = 0
@@ -172,7 +172,7 @@ pub fn query_by_effect(effect_name: Str) -> Str {
 
 // ── Query: public functions with no effects (pure) ───────────────────
 
-pub fn query_pub_pure() -> Str {
+fn query_pub_pure() -> Str {
     let mut items = ""
     let mut _first = 1
     let mut i = 0
@@ -191,7 +191,7 @@ pub fn query_pub_pure() -> Str {
 
 // ── Query: lookup specific function by name ──────────────────────────
 
-pub fn query_by_name(name: Str) -> Str {
+fn query_by_name(name: Str) -> Str {
     let names = name.split(",")
     let mut items = ""
     let mut i = 0
@@ -211,7 +211,7 @@ pub fn query_by_name(name: Str) -> Str {
 
 // ── Composable query: apply all filters in a single pass ─────────────
 
-pub fn query_filtered(vis_filter: Int, module_filter: Str, effect_filter: Str, pure_only: Int, name_filter: Str) -> Str {
+fn query_filtered(vis_filter: Int, module_filter: Str, effect_filter: Str, pure_only: Int, name_filter: Str) -> Str {
     let mut items = ""
     let mut _first = 1
     let mut i = 0
@@ -424,7 +424,7 @@ pub fn query_filtered_layer(layer: Str, vis_filter: Int, module_filter: Str, eff
 //   {"type":"pub_pure"}
 //   {"type":"fn","name":"foo"}
 
-pub fn query_at_position(file: Str, line: Int, col: Int) -> Str {
+fn query_at_position(file: Str, line: Int, col: Int) -> Str {
     let idx = si_symbol_at(file, line, col)
     if idx < 0 {
         return wrap_results("")

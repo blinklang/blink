@@ -33,7 +33,7 @@ pub let CT_RESULT = 8
 pub let CT_ITERATOR = 9
 pub let CT_HANDLE = 10
 pub let CT_CHANNEL = 11
-pub let CT_TAGGED_ENUM = 12
+let CT_TAGGED_ENUM = 12
 pub let CT_MAP = 13
 pub let CT_BYTES = 14
 pub let CT_INSTANT = 15
@@ -47,11 +47,11 @@ pub let CT_STRINGBUILDER = 19
 // these arrays. Constructed bottom-up, interned for O(1) equality.
 // Coexists with CT_* during migration; will eventually replace it.
 
-pub let mut tp_kind: List[Int] = []
-pub let mut tp_child1: List[Int] = []
-pub let mut tp_child2: List[Int] = []
-pub let mut tp_sname: List[Str] = []
-pub let mut tp_intern: Map[Str, Int] = Map()
+let mut tp_kind: List[Int] = []
+let mut tp_child1: List[Int] = []
+let mut tp_child2: List[Int] = []
+let mut tp_sname: List[Str] = []
+let mut tp_intern: Map[Str, Int] = Map()
 
 fn tp_intern_key(kind: Int, c1: Int, c2: Int, sname: Str) -> Str {
     "{kind}:{c1}:{c2}:{sname}"
@@ -71,87 +71,87 @@ fn tp_alloc(kind: Int, c1: Int, c2: Int, sname: Str) -> Int {
     id
 }
 
-pub fn type_int() -> Int {
+fn type_int() -> Int {
     tp_alloc(CT_INT, -1, -1, "")
 }
 
-pub fn type_float() -> Int {
+fn type_float() -> Int {
     tp_alloc(CT_FLOAT, -1, -1, "")
 }
 
-pub fn type_bool() -> Int {
+fn type_bool() -> Int {
     tp_alloc(CT_BOOL, -1, -1, "")
 }
 
-pub fn type_string() -> Int {
+fn type_string() -> Int {
     tp_alloc(CT_STRING, -1, -1, "")
 }
 
-pub fn type_void() -> Int {
+fn type_void() -> Int {
     tp_alloc(CT_VOID, -1, -1, "")
 }
 
-pub fn type_bytes() -> Int {
+fn type_bytes() -> Int {
     tp_alloc(CT_BYTES, -1, -1, "")
 }
 
-pub fn type_instant() -> Int {
+fn type_instant() -> Int {
     tp_alloc(CT_INSTANT, -1, -1, "")
 }
 
-pub fn type_duration() -> Int {
+fn type_duration() -> Int {
     tp_alloc(CT_DURATION, -1, -1, "")
 }
 
-pub fn type_list(elem: Int) -> Int {
+fn type_list(elem: Int) -> Int {
     tp_alloc(CT_LIST, elem, -1, "")
 }
 
-pub fn type_option(inner: Int) -> Int {
+fn type_option(inner: Int) -> Int {
     tp_alloc(CT_OPTION, inner, -1, "")
 }
 
-pub fn type_result(ok: Int, err: Int) -> Int {
+fn type_result(ok: Int, err: Int) -> Int {
     tp_alloc(CT_RESULT, ok, err, "")
 }
 
-pub fn type_map(key: Int, value: Int) -> Int {
+fn type_map(key: Int, value: Int) -> Int {
     tp_alloc(CT_MAP, key, value, "")
 }
 
-pub fn type_iterator(inner: Int) -> Int {
+fn type_iterator(inner: Int) -> Int {
     tp_alloc(CT_ITERATOR, inner, -1, "")
 }
 
-pub fn type_handle(inner: Int) -> Int {
+fn type_handle(inner: Int) -> Int {
     tp_alloc(CT_HANDLE, inner, -1, "")
 }
 
-pub fn type_channel(inner: Int) -> Int {
+fn type_channel(inner: Int) -> Int {
     tp_alloc(CT_CHANNEL, inner, -1, "")
 }
 
-pub fn type_closure(sig: Str) -> Int {
+fn type_closure(sig: Str) -> Int {
     tp_alloc(CT_CLOSURE, -1, -1, sig)
 }
 
-pub fn type_struct(name: Str) -> Int {
+fn type_struct(name: Str) -> Int {
     tp_alloc(CT_TAGGED_ENUM, -1, -1, name)
 }
 
-pub fn type_enum(name: Str) -> Int {
+fn type_enum(name: Str) -> Int {
     tp_alloc(CT_TAGGED_ENUM, -1, -1, name)
 }
 
-pub fn type_ptr(inner: Int) -> Int {
+fn type_ptr(inner: Int) -> Int {
     tp_alloc(CT_PTR, inner, -1, "")
 }
 
-pub fn type_ffi_scope() -> Int {
+fn type_ffi_scope() -> Int {
     tp_alloc(CT_FFI_SCOPE, -1, -1, "")
 }
 
-pub fn type_stringbuilder() -> Int {
+fn type_stringbuilder() -> Int {
     tp_alloc(CT_STRINGBUILDER, -1, -1, "")
 }
 
@@ -161,11 +161,11 @@ pub fn tp_get_kind(id: Int) -> Int {
     k
 }
 
-pub fn tp_get_child1(id: Int) -> Int {
+fn tp_get_child1(id: Int) -> Int {
     tp_child1.get(id).unwrap()
 }
 
-pub fn tp_get_child2(id: Int) -> Int {
+fn tp_get_child2(id: Int) -> Int {
     tp_child2.get(id).unwrap()
 }
 
@@ -185,7 +185,7 @@ pub fn tp_child2_kind(id: Int) -> Int {
     -1
 }
 
-pub fn tp_display(id: Int) -> Str {
+fn tp_display(id: Int) -> Str {
     if id < 0 {
         return "?"
     }
@@ -255,9 +255,9 @@ pub let mut struct_reg_set: Map[Str, Int] = Map()
 pub let mut enum_reg_set: Map[Str, Int] = Map()
 pub let mut emitted_fn_set: Map[Str, Int] = Map()
 pub let mut emitted_let_set: Map[Str, Int] = Map()
-pub let mut emitted_option_set: Map[Str, Int] = Map()
-pub let mut emitted_result_set: Map[Str, Int] = Map()
-pub let mut emitted_iter_set: Map[Str, Int] = Map()
+let mut emitted_option_set: Map[Str, Int] = Map()
+let mut emitted_result_set: Map[Str, Int] = Map()
+let mut emitted_iter_set: Map[Str, Int] = Map()
 pub let mut cg_closure_defs: List[Str] = []
 pub let mut cg_closure_counter: Int = 0
 pub let mut cg_closure_param_type_hint: Int = -1
@@ -735,7 +735,7 @@ pub fn has_derive_method(type_name: Str, method: Str) -> Int {
     0
 }
 
-pub fn get_derive_method_ret(type_name: Str, method: Str) -> Int {
+fn get_derive_method_ret(type_name: Str, method: Str) -> Int {
     let mut i = 0
     while i < derive_method_entries.len() {
         let e = derive_method_entries.get(i).unwrap()
@@ -752,7 +752,7 @@ type FnNodeEntry {
     name: Str
     node: Int
 }
-pub let mut fn_node_registry: List[FnNodeEntry] = []
+let mut fn_node_registry: List[FnNodeEntry] = []
 
 pub fn reg_fn_node(name: Str, node: Int) {
     fn_node_registry.push(FnNodeEntry { name: name, node: node })
@@ -802,7 +802,7 @@ type FnRetStructInner {
     ok_struct: Str
     err_struct: Str
 }
-pub let mut fn_ret_struct_inners: List[FnRetStructInner] = []
+let mut fn_ret_struct_inners: List[FnRetStructInner] = []
 pub let mut emitted_iter_types: List[Int] = []
 pub let mut emitted_range_iter: Int = 0
 pub let mut emitted_str_iter: Int = 0
@@ -821,7 +821,7 @@ type TupleEntry {
     elem_types: Str
     elem_structs: Str
 }
-pub let mut emitted_tuple_set: Map[Str, Int] = Map()
+let mut emitted_tuple_set: Map[Str, Int] = Map()
 pub let mut emitted_tuple_entries: List[TupleEntry] = []
 
 // Assignment context for .into() type inference
@@ -901,7 +901,7 @@ pub fn sv_tp(ctype: Int, inner1: Int, inner2: Int, sname: Str) -> Int {
     tp_alloc(ctype, -1, -1, "")
 }
 pub let mut scope_vars: List[ScopeVar] = []
-pub let mut scope_frame_starts: List[Int] = []
+let mut scope_frame_starts: List[Int] = []
 
 // Function registry: parallel lists (fn name -> return type, param count)
 type FnRegEntry {
@@ -917,7 +917,7 @@ type FnRetStructEntry {
     name: Str
     stype: Str
 }
-pub let mut fn_ret_structs: List[FnRetStructEntry] = []
+let mut fn_ret_structs: List[FnRetStructEntry] = []
 
 // Function return type tracking — unified struct
 type RetType {
@@ -928,14 +928,14 @@ type RetType {
     tp_id: Int
 }
 
-pub let mut fn_ret_types: List[RetType] = []
+let mut fn_ret_types: List[RetType] = []
 
 // Effect registry: name -> parent index (-1 = top-level)
 type EffectEntry {
     name: Str
     parent: Int
 }
-pub let mut effect_entries: List[EffectEntry] = []
+let mut effect_entries: List[EffectEntry] = []
 
 // User-defined effect registry
 pub type UeEffect {
@@ -955,12 +955,12 @@ pub let mut ue_methods: List[UeMethod] = []
 
 // @capabilities budget: allowed effects for the module (-1 = no budget)
 pub let mut cap_budget_names: List[Str] = []
-pub let mut cap_budget_active: Int = 0
+let mut cap_budget_active: Int = 0
 
 // Current function being emitted (for effect propagation checking)
 pub let mut cg_current_fn_name: Str = ""
 pub let mut cg_current_fn_ret: Int = 0
-pub let mut cg_current_fn_node: Int = -1
+let mut cg_current_fn_node: Int = -1
 pub let mut cg_current_fn_option_inner: Int = 0
 
 // Scratch space for tuple match scrutinee temps
@@ -1021,7 +1021,7 @@ pub fn get_var_type(name: Str) -> Int {
     tp_get_kind(get_var_tp(name))
 }
 
-pub fn get_var_mut(name: Str) -> Int {
+fn get_var_mut(name: Str) -> Int {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
@@ -1033,7 +1033,7 @@ pub fn get_var_mut(name: Str) -> Int {
     0
 }
 
-pub fn get_sv_inner1(name: Str, ctype: Int) -> Int {
+fn get_sv_inner1(name: Str, ctype: Int) -> Int {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
@@ -1045,7 +1045,7 @@ pub fn get_sv_inner1(name: Str, ctype: Int) -> Int {
     -1
 }
 
-pub fn get_sv_inner2(name: Str, ctype: Int) -> Int {
+fn get_sv_inner2(name: Str, ctype: Int) -> Int {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
@@ -1057,7 +1057,7 @@ pub fn get_sv_inner2(name: Str, ctype: Int) -> Int {
     -1
 }
 
-pub fn get_sv_sname(name: Str, ctype: Int) -> Str {
+fn get_sv_sname(name: Str, ctype: Int) -> Str {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
@@ -1069,7 +1069,7 @@ pub fn get_sv_sname(name: Str, ctype: Int) -> Str {
     ""
 }
 
-pub fn get_sv_sname2(name: Str, ctype: Int) -> Str {
+fn get_sv_sname2(name: Str, ctype: Int) -> Str {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
@@ -1081,7 +1081,7 @@ pub fn get_sv_sname2(name: Str, ctype: Int) -> Str {
     ""
 }
 
-pub fn get_sv_extra(name: Str, ctype: Int) -> Str {
+fn get_sv_extra(name: Str, ctype: Int) -> Str {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
@@ -1093,7 +1093,7 @@ pub fn get_sv_extra(name: Str, ctype: Int) -> Str {
     ""
 }
 
-pub fn update_sv_sname(name: Str, ctype: Int, val: Str) {
+fn update_sv_sname(name: Str, ctype: Int, val: Str) {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
@@ -1105,7 +1105,7 @@ pub fn update_sv_sname(name: Str, ctype: Int, val: Str) {
     }
 }
 
-pub fn update_sv_sname2(name: Str, ctype: Int, val: Str) {
+fn update_sv_sname2(name: Str, ctype: Int, val: Str) {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
@@ -1117,7 +1117,7 @@ pub fn update_sv_sname2(name: Str, ctype: Int, val: Str) {
     }
 }
 
-pub fn set_var_full(name: Str, ctype: Int, is_mut: Int, inner1: Int, inner2: Int, sname: Str, sname2: Str, extra: Str) ! Codegen.Scope {
+fn set_var_full(name: Str, ctype: Int, is_mut: Int, inner1: Int, inner2: Int, sname: Str, sname2: Str, extra: Str) ! Codegen.Scope {
     scope_vars.push(ScopeVar { name: name, ctype: ctype, is_mut: is_mut, inner1: inner1, inner2: inner2, sname: sname, sname2: sname2, extra: extra, tp_id: sv_tp(ctype, inner1, inner2, sname) })
 }
 
@@ -1184,7 +1184,7 @@ pub fn reg_fn_with_effects(name: Str, ret: Int, effects_sl: Int) ! Codegen.Regis
     fn_regs.push(FnRegEntry { name: name, ret: ret, effect_sl: effects_sl, tp_id: sv_tp(ret, -1, -1, "") })
 }
 
-pub fn get_fn_effect_sl(name: Str) -> Int {
+fn get_fn_effect_sl(name: Str) -> Int {
     let mut i = 0
     while i < fn_regs.len() {
         let fr = fn_regs.get(i).unwrap()
@@ -1435,7 +1435,7 @@ pub fn reg_effect(name: Str, parent: Int) -> Int ! Codegen.Register {
     idx
 }
 
-pub fn get_effect_idx(name: Str) -> Int {
+fn get_effect_idx(name: Str) -> Int {
     let mut i = 0
     while i < effect_entries.len() {
         if effect_entries.get(i).unwrap().name == name {
@@ -1446,7 +1446,7 @@ pub fn get_effect_idx(name: Str) -> Int {
     -1
 }
 
-pub fn effect_satisfies(caller_effect: Str, callee_effect: Str) -> Int {
+fn effect_satisfies(caller_effect: Str, callee_effect: Str) -> Int {
     if caller_effect == callee_effect {
         return 1
     }
@@ -1572,7 +1572,7 @@ pub fn init_builtin_effects() ! Codegen.Register {
     reg_effect("Async.Channel", async_idx)
 }
 
-pub fn get_ue_handle(effect_name: Str) -> Str {
+fn get_ue_handle(effect_name: Str) -> Str {
     let mut i = 0
     while i < ue_effects.len() {
         let ue = ue_effects.get(i).unwrap()
@@ -1584,7 +1584,7 @@ pub fn get_ue_handle(effect_name: Str) -> Str {
     ""
 }
 
-pub fn get_ue_top_for_handle(handle: Str) -> Str {
+fn get_ue_top_for_handle(handle: Str) -> Str {
     let mut i = 0
     while i < ue_effects.len() {
         let ue = ue_effects.get(i).unwrap()
@@ -1607,7 +1607,7 @@ pub fn is_user_effect_handle(name: Str) -> Int {
     0
 }
 
-pub fn ue_has_method(handle: Str, method: Str) -> Int {
+fn ue_has_method(handle: Str, method: Str) -> Int {
     let mut i = 0
     while i < ue_methods.len() {
         let uem = ue_methods.get(i).unwrap()
@@ -1758,7 +1758,7 @@ pub fn set_map_types(name: Str, key_type: Int, value_type: Int) {
     scope_vars.push(ScopeVar { name: name, ctype: CT_MAP, is_mut: 0, inner1: key_type, inner2: value_type, sname: "", sname2: "", extra: "", tp_id: sv_tp(CT_MAP, key_type, value_type, "") })
 }
 
-pub fn get_map_key_type(name: Str) -> Int {
+fn get_map_key_type(name: Str) -> Int {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
@@ -1810,7 +1810,7 @@ pub fn get_map_value_type(name: Str) -> Int {
     CT_INT
 }
 
-pub fn set_map_value_struct(name: Str, struct_name: Str) {
+fn set_map_value_struct(name: Str, struct_name: Str) {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
@@ -1822,7 +1822,7 @@ pub fn set_map_value_struct(name: Str, struct_name: Str) {
     }
 }
 
-pub fn get_map_value_struct(name: Str) -> Str {
+fn get_map_value_struct(name: Str) -> Str {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
@@ -2305,7 +2305,7 @@ pub fn register_mono_instance(base: Str, args: Str) -> Str ! Codegen.Register {
     c_name
 }
 
-pub fn lookup_mono_instance(base: Str, args: Str) -> Str {
+fn lookup_mono_instance(base: Str, args: Str) -> Str {
     let mut i = 0
     while i < mono_instances.len() {
         let m = mono_instances.get(i).unwrap()
@@ -2347,7 +2347,7 @@ pub fn lookup_impl_method(type_name: Str, method: Str) -> Int {
     0
 }
 
-pub fn lookup_impl_type_for_trait(trait_name: Str, type_name: Str) -> Int {
+fn lookup_impl_type_for_trait(trait_name: Str, type_name: Str) -> Int {
     let mut i = 0
     while i < impl_entries.len() {
         let ie = impl_entries.get(i).unwrap()
@@ -2573,7 +2573,7 @@ pub fn ensure_tuple_type(c_name: Str, arity: Int, elem_types: Str, elem_structs:
     }
 }
 
-pub fn emit_tuple_typedef(entry: TupleEntry) ! Codegen.Emit {
+fn emit_tuple_typedef(entry: TupleEntry) ! Codegen.Emit {
     emit_line("typedef struct \{")
     cg_indent = cg_indent + 1
     let mut i = 0
@@ -2609,7 +2609,7 @@ pub fn emit_tuple_types_from(start: Int) ! Codegen.Emit {
     }
 }
 
-pub fn get_tuple_entry_elem_type(encoded: Str, idx: Int) -> Int {
+fn get_tuple_entry_elem_type(encoded: Str, idx: Int) -> Int {
     let mut sep_count = 0
     let mut start = 0
     let mut i = 0
@@ -2631,7 +2631,7 @@ pub fn get_tuple_entry_elem_type(encoded: Str, idx: Int) -> Int {
     CT_VOID
 }
 
-pub fn get_tuple_entry_elem_struct(encoded: Str, idx: Int) -> Str {
+fn get_tuple_entry_elem_struct(encoded: Str, idx: Int) -> Str {
     let mut sep_count = 0
     let mut start = 0
     let mut i = 0
@@ -2717,7 +2717,7 @@ pub fn ensure_mixed_result_type(ok_t: Int, err_t: Int, ok_struct: Str, err_struc
     }
 }
 
-pub fn ensure_mixed_option_type(inner: Int, inner_struct: Str) {
+fn ensure_mixed_option_type(inner: Int, inner_struct: Str) {
     if inner_struct != "" {
         ensure_struct_option_type(inner_struct)
     } else {
@@ -2928,7 +2928,7 @@ pub fn get_var_channel_inner(name: Str) -> Int {
     get_sv_inner1(name, CT_CHANNEL)
 }
 
-pub fn emit_option_typedef(inner: Int) ! Codegen.Emit {
+fn emit_option_typedef(inner: Int) ! Codegen.Emit {
     let tag = c_type_tag(inner)
     let tname = "pact_Option_{tag}"
     let c_inner = c_type_str(inner)
@@ -2936,7 +2936,7 @@ pub fn emit_option_typedef(inner: Int) ! Codegen.Emit {
     emit_line("")
 }
 
-pub fn emit_result_typedef(ok_t: Int, err_t: Int) ! Codegen.Emit {
+fn emit_result_typedef(ok_t: Int, err_t: Int) ! Codegen.Emit {
     let ok_tag = c_type_tag(ok_t)
     let err_tag = c_type_tag(err_t)
     let tname = "pact_Result_{ok_tag}_{err_tag}"
@@ -2946,13 +2946,13 @@ pub fn emit_result_typedef(ok_t: Int, err_t: Int) ! Codegen.Emit {
     emit_line("")
 }
 
-pub fn emit_struct_option_typedef(struct_name: Str) ! Codegen.Emit {
+fn emit_struct_option_typedef(struct_name: Str) ! Codegen.Emit {
     let tname = "pact_Option_{struct_name}"
     emit_line("typedef struct \{ int tag; {c_type_c_name(struct_name)} value; } {tname};")
     emit_line("")
 }
 
-pub fn emit_struct_result_typedef(ok_tag: Str, err_tag: Str) ! Codegen.Emit {
+fn emit_struct_result_typedef(ok_tag: Str, err_tag: Str) ! Codegen.Emit {
     let tname = "pact_Result_{ok_tag}_{err_tag}"
     let c_ok = if is_struct_type(ok_tag) != 0 || is_enum_type(ok_tag) != 0 { c_type_c_name(ok_tag) } else { c_type_str(type_from_name_tag(ok_tag)) }
     let c_err = if is_struct_type(err_tag) != 0 || is_enum_type(err_tag) != 0 { c_type_c_name(err_tag) } else { c_type_str(type_from_name_tag(err_tag)) }
@@ -2960,7 +2960,7 @@ pub fn emit_struct_result_typedef(ok_tag: Str, err_tag: Str) ! Codegen.Emit {
     emit_line("")
 }
 
-pub fn type_from_name_tag(tag: Str) -> Int {
+fn type_from_name_tag(tag: Str) -> Int {
     if tag == "int" { CT_INT }
     else if tag == "str" { CT_STRING }
     else if tag == "double" { CT_FLOAT }
@@ -3035,7 +3035,7 @@ pub fn list_iter_c_type(inner: Int) -> Str {
     "pact_ListIterator_{c_type_tag(inner)}"
 }
 
-pub fn emit_list_iter_typedef(inner: Int) ! Codegen.Emit {
+fn emit_list_iter_typedef(inner: Int) ! Codegen.Emit {
     let tag = c_type_tag(inner)
     let tname = "pact_ListIterator_{tag}"
     let opt_name = option_c_type(inner)
@@ -3147,7 +3147,7 @@ pub fn emit_iter_types_from(list_start: Int, map_start: Int, filter_start: Int, 
     }
 }
 
-pub fn has_int_in_list(lst: List[Int], val: Int) -> Bool {
+fn has_int_in_list(lst: List[Int], val: Int) -> Bool {
     let mut i = 0
     while i < lst.len() {
         if lst.get(i).unwrap() == val {
@@ -3194,7 +3194,7 @@ pub fn ensure_flat_map_iter(inner: Int) {
     ensure_option_type(inner)
 }
 
-pub fn emit_map_iter_typedef(inner: Int) ! Codegen.Emit {
+fn emit_map_iter_typedef(inner: Int) ! Codegen.Emit {
     let tag = c_type_tag(inner)
     let opt = option_c_type(inner)
     let c_inner = c_type_str(inner)
@@ -3210,7 +3210,7 @@ pub fn emit_map_iter_typedef(inner: Int) ! Codegen.Emit {
     emit_line("")
 }
 
-pub fn emit_filter_iter_typedef(inner: Int) ! Codegen.Emit {
+fn emit_filter_iter_typedef(inner: Int) ! Codegen.Emit {
     let tag = c_type_tag(inner)
     let opt = option_c_type(inner)
     let c_inner = c_type_str(inner)
@@ -3229,7 +3229,7 @@ pub fn emit_filter_iter_typedef(inner: Int) ! Codegen.Emit {
     emit_line("")
 }
 
-pub fn emit_take_iter_typedef(inner: Int) ! Codegen.Emit {
+fn emit_take_iter_typedef(inner: Int) ! Codegen.Emit {
     let tag = c_type_tag(inner)
     let opt = option_c_type(inner)
     emit_line("typedef struct \{ void* source; {opt} (*source_next)(void*); int64_t limit; int64_t count; } pact_TakeIterator_{tag};")
@@ -3245,7 +3245,7 @@ pub fn emit_take_iter_typedef(inner: Int) ! Codegen.Emit {
     emit_line("")
 }
 
-pub fn emit_skip_iter_typedef(inner: Int) ! Codegen.Emit {
+fn emit_skip_iter_typedef(inner: Int) ! Codegen.Emit {
     let tag = c_type_tag(inner)
     let opt = option_c_type(inner)
     emit_line("typedef struct \{ void* source; {opt} (*source_next)(void*); int64_t skip_n; int64_t skipped; } pact_SkipIterator_{tag};")
@@ -3262,7 +3262,7 @@ pub fn emit_skip_iter_typedef(inner: Int) ! Codegen.Emit {
     emit_line("")
 }
 
-pub fn emit_chain_iter_typedef(inner: Int) ! Codegen.Emit {
+fn emit_chain_iter_typedef(inner: Int) ! Codegen.Emit {
     let tag = c_type_tag(inner)
     let opt = option_c_type(inner)
     emit_line("typedef struct \{ void* source_a; {opt} (*next_a)(void*); void* source_b; {opt} (*next_b)(void*); int phase; } pact_ChainIterator_{tag};")
@@ -3279,7 +3279,7 @@ pub fn emit_chain_iter_typedef(inner: Int) ! Codegen.Emit {
     emit_line("")
 }
 
-pub fn emit_flat_map_iter_typedef(inner: Int) ! Codegen.Emit {
+fn emit_flat_map_iter_typedef(inner: Int) ! Codegen.Emit {
     let tag = c_type_tag(inner)
     let opt = option_c_type(inner)
     let c_inner = c_type_str(inner)

@@ -3,7 +3,7 @@ import diagnostics
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
-pub fn collect_pat_names(node: Int, target: List[Str]) {
+fn collect_pat_names(node: Int, target: List[Str]) {
     let pat_sl = np_elements.get(node).unwrap()
     if pat_sl == -1 { return }
     let elems_sl = np_elements.get(pat_sl).unwrap()
@@ -19,7 +19,7 @@ pub fn collect_pat_names(node: Int, target: List[Str]) {
 // ── Capture analysis ────────────────────────────────────────────────
 // Walk a closure body AST collecting free variable references.
 
-pub fn list_contains_str(lst: List[Str], val: Str) -> Int {
+fn list_contains_str(lst: List[Str], val: Str) -> Int {
     let mut i = 0
     while i < lst.len() {
         if lst.get(i).unwrap() == val {
@@ -30,7 +30,7 @@ pub fn list_contains_str(lst: List[Str], val: Str) -> Int {
     0
 }
 
-pub fn is_in_scope(name: Str) -> Int {
+fn is_in_scope(name: Str) -> Int {
     let mut i = 0
     while i < scope_vars.len() {
         if scope_vars.get(i).unwrap().name == name {
@@ -41,7 +41,7 @@ pub fn is_in_scope(name: Str) -> Int {
     0
 }
 
-pub fn collect_free_vars(node: Int, params: List[Str], locals: List[Str], result: List[Str]) {
+fn collect_free_vars(node: Int, params: List[Str], locals: List[Str], result: List[Str]) {
     if node == -1 {
         return
     }
@@ -306,7 +306,7 @@ pub fn collect_free_vars(node: Int, params: List[Str], locals: List[Str], result
     }
 }
 
-pub fn collect_free_vars_block(block: Int, params: List[Str], locals: List[Str], result: List[Str]) {
+fn collect_free_vars_block(block: Int, params: List[Str], locals: List[Str], result: List[Str]) {
     if block == -1 {
         return
     }
@@ -344,9 +344,9 @@ pub fn analyze_captures(body: Int, params_sl: Int) -> List[Str] {
 }
 
 // Prescan: collect all let-mut names from a block (non-recursive into closures)
-pub let mut prescan_mut_names: List[Str] = []
+let mut prescan_mut_names: List[Str] = []
 
-pub fn prescan_collect_muts(node: Int) {
+fn prescan_collect_muts(node: Int) {
     if node == -1 {
         return
     }
@@ -385,7 +385,7 @@ pub fn prescan_collect_muts(node: Int) {
     }
 }
 
-pub fn prescan_collect_muts_block(block: Int) {
+fn prescan_collect_muts_block(block: Int) {
     if block == -1 {
         return
     }
@@ -401,9 +401,9 @@ pub fn prescan_collect_muts_block(block: Int) {
 }
 
 // Prescan: collect all idents used inside closure bodies
-pub let mut prescan_closure_idents: List[Str] = []
+let mut prescan_closure_idents: List[Str] = []
 
-pub fn prescan_collect_closure_idents(node: Int) {
+fn prescan_collect_closure_idents(node: Int) {
     if node == -1 {
         return
     }
@@ -526,7 +526,7 @@ pub fn prescan_collect_closure_idents(node: Int) {
     }
 }
 
-pub fn prescan_collect_closure_idents_block(block: Int) {
+fn prescan_collect_closure_idents_block(block: Int) {
     if block == -1 {
         return
     }
@@ -542,7 +542,7 @@ pub fn prescan_collect_closure_idents_block(block: Int) {
 }
 
 // Walk function body looking for closures; for each, collect idents used in body
-pub fn prescan_closures_in_node(node: Int) {
+fn prescan_closures_in_node(node: Int) {
     if node == -1 {
         return
     }
@@ -664,7 +664,7 @@ pub fn prescan_closures_in_node(node: Int) {
     }
 }
 
-pub fn prescan_closures_in_block(block: Int) {
+fn prescan_closures_in_block(block: Int) {
     if block == -1 {
         return
     }

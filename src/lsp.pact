@@ -13,7 +13,7 @@ let mut lsp_running: Int = 0
 let mut lsp_initialized: Int = 0
 let mut lsp_source_path: Str = ""
 
-pub fn lsp_parse_content_length(line: Str) -> Int {
+fn lsp_parse_content_length(line: Str) -> Int {
     if line.starts_with("Content-Length: ") != 0 {
         let num_str = line.substring(16, line.len() - 16)
         return parse_int(num_str)
@@ -82,14 +82,14 @@ fn lsp_handle_shutdown() -> Str {
     "null"
 }
 
-pub fn lsp_uri_to_path(uri: Str) -> Str {
+fn lsp_uri_to_path(uri: Str) -> Str {
     if uri.starts_with("file://") != 0 {
         return uri.substring(7, uri.len() - 7)
     }
     uri
 }
 
-pub fn lsp_severity(sev: Str) -> Int {
+fn lsp_severity(sev: Str) -> Int {
     if sev == "error" {
         return 1
     }
@@ -99,7 +99,7 @@ pub fn lsp_severity(sev: Str) -> Int {
     3
 }
 
-pub fn lsp_to_zero_based(n: Int) -> Int {
+fn lsp_to_zero_based(n: Int) -> Int {
     if n > 0 {
         return n - 1
     }

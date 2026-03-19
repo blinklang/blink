@@ -17,76 +17,76 @@ effect TypeCheck {
 // The pipeline: lex → parse → typecheck → codegen
 
 // ── Type kind constants ─────────────────────────────────────────────
-pub let TK_INT = 0
-pub let TK_FLOAT = 1
-pub let TK_BOOL = 2
-pub let TK_STR = 3
-pub let TK_VOID = 4
-pub let TK_LIST = 5
-pub let TK_OPTION = 6
-pub let TK_RESULT = 7
-pub let TK_FN = 8
-pub let TK_STRUCT = 9
-pub let TK_ENUM = 10
-pub let TK_TYPEVAR = 11
-pub let TK_UNKNOWN = 12
-pub let TK_CLOSURE = 13
-pub let TK_ITERATOR = 14
-pub let TK_HANDLE = 15
-pub let TK_CHANNEL = 16
-pub let TK_TUPLE = 17
-pub let TK_MAP = 18
-pub let TK_BYTES = 19
+let TK_INT = 0
+let TK_FLOAT = 1
+let TK_BOOL = 2
+let TK_STR = 3
+let TK_VOID = 4
+let TK_LIST = 5
+let TK_OPTION = 6
+let TK_RESULT = 7
+let TK_FN = 8
+let TK_STRUCT = 9
+let TK_ENUM = 10
+let TK_TYPEVAR = 11
+let TK_UNKNOWN = 12
+let TK_CLOSURE = 13
+let TK_ITERATOR = 14
+let TK_HANDLE = 15
+let TK_CHANNEL = 16
+let TK_TUPLE = 17
+let TK_MAP = 18
+let TK_BYTES = 19
 
 // ── Type pool (parallel arrays) ─────────────────────────────────────
-pub let mut ty_kind: List[Int] = []
-pub let mut ty_name: List[Str] = []
-pub let mut ty_inner1: List[Int] = []
-pub let mut ty_inner2: List[Int] = []
-pub let mut ty_params_start: List[Int] = []
-pub let mut ty_params_count: List[Int] = []
+let mut ty_kind: List[Int] = []
+let mut ty_name: List[Str] = []
+let mut ty_inner1: List[Int] = []
+let mut ty_inner2: List[Int] = []
+let mut ty_params_start: List[Int] = []
+let mut ty_params_count: List[Int] = []
 
-pub let mut ty_param_list: List[Int] = []
+let mut ty_param_list: List[Int] = []
 
 // ── Builtin type indices (populated by init_types) ──────────────────
-pub let mut TYPE_INT: Int = -1
-pub let mut TYPE_FLOAT: Int = -1
-pub let mut TYPE_BOOL: Int = -1
-pub let mut TYPE_STR: Int = -1
-pub let mut TYPE_VOID: Int = -1
-pub let mut TYPE_UNKNOWN: Int = -1
+let mut TYPE_INT: Int = -1
+let mut TYPE_FLOAT: Int = -1
+let mut TYPE_BOOL: Int = -1
+let mut TYPE_STR: Int = -1
+let mut TYPE_VOID: Int = -1
+let mut TYPE_UNKNOWN: Int = -1
 
 // ── Type registries ─────────────────────────────────────────────────
-pub let mut named_type_names: List[Str] = []
-pub let mut named_type_ids: List[Int] = []
+let mut named_type_names: List[Str] = []
+let mut named_type_ids: List[Int] = []
 
-pub let mut sfield_struct_id: List[Int] = []
-pub let mut sfield_name: List[Str] = []
-pub let mut sfield_type_id: List[Int] = []
+let mut sfield_struct_id: List[Int] = []
+let mut sfield_name: List[Str] = []
+let mut sfield_type_id: List[Int] = []
 
-pub let mut evar_enum_id: List[Int] = []
-pub let mut evar_name: List[Str] = []
-pub let mut evar_tag: List[Int] = []
-pub let mut evar_has_data: List[Int] = []
+let mut evar_enum_id: List[Int] = []
+let mut evar_name: List[Str] = []
+let mut evar_tag: List[Int] = []
+let mut evar_has_data: List[Int] = []
 
-pub let mut evfield_var_idx: List[Int] = []
-pub let mut evfield_name: List[Str] = []
-pub let mut evfield_type_id: List[Int] = []
+let mut evfield_var_idx: List[Int] = []
+let mut evfield_name: List[Str] = []
+let mut evfield_type_id: List[Int] = []
 
-pub let mut named_type_map: Map[Str, Int] = Map()
-pub let mut fnsig_map: Map[Str, Int] = Map()
+let mut named_type_map: Map[Str, Int] = Map()
+let mut fnsig_map: Map[Str, Int] = Map()
 
-pub let mut fnsig_name: List[Str] = []
-pub let mut fnsig_ret: List[Int] = []
-pub let mut fnsig_params_start: List[Int] = []
-pub let mut fnsig_params_count: List[Int] = []
-pub let mut fnsig_param_list: List[Int] = []
-pub let mut fnsig_type_params_start: List[Int] = []
-pub let mut fnsig_type_params_count: List[Int] = []
-pub let mut fnsig_type_param_names: List[Str] = []
+let mut fnsig_name: List[Str] = []
+let mut fnsig_ret: List[Int] = []
+let mut fnsig_params_start: List[Int] = []
+let mut fnsig_params_count: List[Int] = []
+let mut fnsig_param_list: List[Int] = []
+let mut fnsig_type_params_start: List[Int] = []
+let mut fnsig_type_params_count: List[Int] = []
+let mut fnsig_type_param_names: List[Str] = []
 
-pub let mut tc_trait_names: List[Str] = []
-pub let mut tc_trait_method_names: List[Str] = []
+let mut tc_trait_names: List[Str] = []
+let mut tc_trait_method_names: List[Str] = []
 
 // Trait method signature registry (for contract validation)
 let mut tc_tmsig_trait: List[Str] = []
@@ -99,19 +99,19 @@ let mut tc_trait_tparam_names: List[Str] = []
 let mut tc_trait_tparams_start: List[Int] = []
 let mut tc_trait_tparams_count: List[Int] = []
 
-pub let mut tc_fn_effects: List[Str] = []
+let mut tc_fn_effects: List[Str] = []
 
-pub let mut tc_current_fn_ret: Int = -1
-pub let mut tc_current_fn_name: Str = ""
+let mut tc_current_fn_ret: Int = -1
+let mut tc_current_fn_name: Str = ""
 
-pub let mut tc_errors: List[Str] = []
-pub let mut tc_warnings: List[Str] = []
+let mut tc_errors: List[Str] = []
+let mut tc_warnings: List[Str] = []
 
 // ── Unused import tracking ──────────────────────────────────────────
-pub let mut tc_symbol_module: Map[Str, Str] = Map()
-pub let mut tc_used_modules: Map[Str, Int] = Map()
+let mut tc_symbol_module: Map[Str, Str] = Map()
+let mut tc_used_modules: Map[Str, Int] = Map()
 
-pub fn tc_mark_symbol_used(name: Str) {
+fn tc_mark_symbol_used(name: Str) {
     if nr_current_module != "" && nr_current_module != "__main__" { return }
     if tc_symbol_module.has(name) {
         let mod_name = tc_symbol_module.get(name)
@@ -137,7 +137,7 @@ let mut tc_inc_filter: Map[Str, Int] = Map()
 
 // ── Type creation ───────────────────────────────────────────────────
 
-pub fn new_type(kind: Int, name: Str) -> Int {
+fn new_type(kind: Int, name: Str) -> Int {
     let idx = ty_kind.len()
     ty_kind.push(kind)
     ty_name.push(name)
@@ -148,26 +148,26 @@ pub fn new_type(kind: Int, name: Str) -> Int {
     idx
 }
 
-pub fn make_list_type(inner: Int) -> Int {
+fn make_list_type(inner: Int) -> Int {
     let t = new_type(TK_LIST, "List")
     ty_inner1.set(t, inner)
     t
 }
 
-pub fn make_option_type(inner: Int) -> Int {
+fn make_option_type(inner: Int) -> Int {
     let t = new_type(TK_OPTION, "Option")
     ty_inner1.set(t, inner)
     t
 }
 
-pub fn make_result_type(ok_type: Int, err_type: Int) -> Int {
+fn make_result_type(ok_type: Int, err_type: Int) -> Int {
     let t = new_type(TK_RESULT, "Result")
     ty_inner1.set(t, ok_type)
     ty_inner2.set(t, err_type)
     t
 }
 
-pub fn make_fn_type(ret_type: Int, param_types: List[Int]) -> Int {
+fn make_fn_type(ret_type: Int, param_types: List[Int]) -> Int {
     let t = new_type(TK_FN, "Fn")
     ty_inner1.set(t, ret_type)
     let start = ty_param_list.len()
@@ -181,11 +181,11 @@ pub fn make_fn_type(ret_type: Int, param_types: List[Int]) -> Int {
     t
 }
 
-pub fn make_typevar(name: Str) -> Int {
+fn make_typevar(name: Str) -> Int {
     new_type(TK_TYPEVAR, name)
 }
 
-pub fn make_tuple_type(elem_types: List[Int]) -> Int {
+fn make_tuple_type(elem_types: List[Int]) -> Int {
     let t = new_type(TK_TUPLE, "Tuple")
     let start = ty_param_list.len()
     let mut i = 0
@@ -199,7 +199,7 @@ pub fn make_tuple_type(elem_types: List[Int]) -> Int {
 }
 
 
-pub fn make_map_type(key_type: Int, value_type: Int) -> Int {
+fn make_map_type(key_type: Int, value_type: Int) -> Int {
     let t = new_type(TK_MAP, "Map")
     ty_inner1.set(t, key_type)
     ty_inner2.set(t, value_type)
@@ -208,14 +208,14 @@ pub fn make_map_type(key_type: Int, value_type: Int) -> Int {
 
 // ── Type lookup ─────────────────────────────────────────────────────
 
-pub fn lookup_named_type(name: Str) -> Int {
+fn lookup_named_type(name: Str) -> Int {
     if named_type_map.has(name) != 0 {
         return named_type_map.get(name)
     }
     -1
 }
 
-pub fn resolve_type_name(name: Str) -> Int ! TypeCheck.Resolve {
+fn resolve_type_name(name: Str) -> Int ! TypeCheck.Resolve {
     if name == "Int" { return TYPE_INT }
     if name == "Float" { return TYPE_FLOAT }
     if name == "Bool" { return TYPE_BOOL }
@@ -224,7 +224,7 @@ pub fn resolve_type_name(name: Str) -> Int ! TypeCheck.Resolve {
     lookup_named_type(name)
 }
 
-pub fn get_struct_field_tid(struct_tid: Int, fname: Str) -> Int {
+fn get_struct_field_tid(struct_tid: Int, fname: Str) -> Int {
     let mut i = 0
     while i < sfield_struct_id.len() {
         if sfield_struct_id.get(i).unwrap() == struct_tid && sfield_name.get(i).unwrap() == fname {
@@ -235,7 +235,7 @@ pub fn get_struct_field_tid(struct_tid: Int, fname: Str) -> Int {
     -1
 }
 
-pub fn get_variant_by_name(enum_tid: Int, vname: Str) -> Int {
+fn get_variant_by_name(enum_tid: Int, vname: Str) -> Int {
     let mut i = 0
     while i < evar_enum_id.len() {
         if evar_enum_id.get(i).unwrap() == enum_tid && evar_name.get(i).unwrap() == vname {
@@ -246,14 +246,14 @@ pub fn get_variant_by_name(enum_tid: Int, vname: Str) -> Int {
     -1
 }
 
-pub fn lookup_fnsig(name: Str) -> Int {
+fn lookup_fnsig(name: Str) -> Int {
     if fnsig_map.has(name) != 0 {
         return fnsig_map.get(name)
     }
     -1
 }
 
-pub fn instantiate_return_type(sig: Int, args_sl: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+fn instantiate_return_type(sig: Int, args_sl: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let ret = fnsig_ret.get(sig).unwrap()
     if ret < 0 || ret >= ty_kind.len() { return ret }
     if ty_kind.get(ret).unwrap() != TK_TYPEVAR { return ret }
@@ -285,17 +285,17 @@ pub fn instantiate_return_type(sig: Int, args_sl: Int) -> Int ! TypeCheck.Resolv
 
 // ── Error reporting ─────────────────────────────────────────────────
 
-pub fn tc_error(msg: Str) ! TypeCheck.Report, Diag.Report {
+fn tc_error(msg: Str) ! TypeCheck.Report, Diag.Report {
     tc_errors.push(msg)
     diag_error_no_loc("TypeError", "E0300", msg, "")
 }
 
-pub fn tc_error_at(msg: Str, node_id: Int) ! TypeCheck.Report, Diag.Report {
+fn tc_error_at(msg: Str, node_id: Int) ! TypeCheck.Report, Diag.Report {
     tc_errors.push(msg)
     diag_error_at("TypeError", "E0300", msg, node_id, "")
 }
 
-pub fn tc_warn(msg: Str) ! TypeCheck.Report {
+fn tc_warn(msg: Str) ! TypeCheck.Report {
     tc_warnings.push(msg)
 }
 
@@ -325,7 +325,7 @@ fn tc_should_check_fn(name: Str) -> Int {
 
 // ── Type annotation resolution ──────────────────────────────────────
 
-pub fn resolve_type_ann(ann_node: Int) -> Int ! TypeCheck.Resolve {
+fn resolve_type_ann(ann_node: Int) -> Int ! TypeCheck.Resolve {
     if ann_node == -1 {
         return TYPE_UNKNOWN
     }
@@ -376,7 +376,7 @@ pub fn resolve_type_ann(ann_node: Int) -> Int ! TypeCheck.Resolve {
 
 // ── Registration from AST ───────────────────────────────────────────
 
-pub fn register_struct_type(td: Int) ! TypeCheck.Register, TypeCheck.Resolve {
+fn register_struct_type(td: Int) ! TypeCheck.Register, TypeCheck.Resolve {
     let name = np_name.get(td).unwrap()
     let tid = new_type(TK_STRUCT, name)
     named_type_names.push(name)
@@ -405,7 +405,7 @@ pub fn register_struct_type(td: Int) ! TypeCheck.Register, TypeCheck.Resolve {
     }
 }
 
-pub fn register_enum_type(td: Int) ! TypeCheck.Register, TypeCheck.Resolve {
+fn register_enum_type(td: Int) ! TypeCheck.Register, TypeCheck.Resolve {
     let name = np_name.get(td).unwrap()
     let tid = new_type(TK_ENUM, name)
     named_type_names.push(name)
@@ -448,7 +448,7 @@ pub fn register_enum_type(td: Int) ! TypeCheck.Register, TypeCheck.Resolve {
     }
 }
 
-pub fn register_fn_sig(fn_node: Int) ! TypeCheck.Register, TypeCheck.Resolve {
+fn register_fn_sig(fn_node: Int) ! TypeCheck.Register, TypeCheck.Resolve {
     let name = np_name.get(fn_node).unwrap()
     let ret_str = np_return_type.get(fn_node).unwrap()
     let ret_ann = np_type_ann.get(fn_node).unwrap()
@@ -566,7 +566,7 @@ fn check_ptr_in_type_name(type_name: Str, node: Int, has_ffi: Int) ! Diag.Report
     }
 }
 
-pub fn validate_ffi_fn(fn_node: Int) ! Diag.Report {
+fn validate_ffi_fn(fn_node: Int) ! Diag.Report {
     let name = np_name.get(fn_node).unwrap()
     let ffi_node = get_annotation(fn_node, "ffi")
     let has_ffi = if ffi_node != -1 { 1 } else { 0 }
@@ -623,14 +623,14 @@ pub fn validate_ffi_fn(fn_node: Int) ! Diag.Report {
     }
 }
 
-pub fn tc_get_fn_effects(name: Str) -> Option[Str] {
+fn tc_get_fn_effects(name: Str) -> Option[Str] {
     let sig = lookup_fnsig(name)
     if sig == -1 { return None }
     if sig >= tc_fn_effects.len() { return None }
     Some(tc_fn_effects.get(sig).unwrap())
 }
 
-pub fn register_trait(tr_node: Int) ! TypeCheck.Register {
+fn register_trait(tr_node: Int) ! TypeCheck.Register {
     let name = np_name.get(tr_node).unwrap()
     tc_trait_names.push(name)
     // Collect trait-level type params (e.g., T in trait From[T])
@@ -698,7 +698,7 @@ fn subst_trait_type(type_str: Str, impl_type: Str, tmsig_idx: Int, impl_node: In
     type_str
 }
 
-pub fn validate_trait_impls(program: Int) ! TypeCheck.Register, Diag.Report {
+fn validate_trait_impls(program: Int) ! TypeCheck.Register, Diag.Report {
     let impls_sl = np_methods.get(program).unwrap()
     if impls_sl == -1 { return }
     let mut ii = 0
@@ -778,7 +778,7 @@ pub fn validate_trait_impls(program: Int) ! TypeCheck.Register, Diag.Report {
 
 // ── Main entry point ────────────────────────────────────────────────
 
-pub fn init_types() ! TypeCheck.Register {
+fn init_types() ! TypeCheck.Register {
     ty_kind = []
     ty_name = []
     ty_inner1 = []
@@ -1075,13 +1075,13 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
 
 // ── User-effect handle name tracking ────────────────────────────────
 
-pub let mut tc_ue_handles: List[Str] = []
+let mut tc_ue_handles: List[Str] = []
 
-pub fn register_ue_handle(name: Str) {
+fn register_ue_handle(name: Str) {
     tc_ue_handles.push(name)
 }
 
-pub fn is_user_effect_handle_name(name: Str) -> Int {
+fn is_user_effect_handle_name(name: Str) -> Int {
     let mut i = 0
     while i < tc_ue_handles.len() {
         if tc_ue_handles.get(i).unwrap() == name {
@@ -1115,23 +1115,23 @@ fn nr_register_private(name: Str, mod_name: Str) {
 
 // ── Name resolution scope ───────────────────────────────────────────
 
-pub let mut nr_scope_names: List[Str] = []
-pub let mut nr_scope_muts: List[Int] = []
-pub let mut nr_scope_types: List[Int] = []
-pub let mut nr_scope_reads: List[Int] = []
-pub let mut nr_scope_writes: List[Int] = []
-pub let mut nr_scope_nodes: List[Int] = []
-pub let mut nr_scope_frames: List[Int] = []
-pub let mut nr_scope_depth: Int = 0
-pub let mut nr_loop_depth: Int = 0
-pub let mut nr_warn_unused: Int = 0
+let mut nr_scope_names: List[Str] = []
+let mut nr_scope_muts: List[Int] = []
+let mut nr_scope_types: List[Int] = []
+let mut nr_scope_reads: List[Int] = []
+let mut nr_scope_writes: List[Int] = []
+let mut nr_scope_nodes: List[Int] = []
+let mut nr_scope_frames: List[Int] = []
+let mut nr_scope_depth: Int = 0
+let mut nr_loop_depth: Int = 0
+let mut nr_warn_unused: Int = 0
 
-pub fn nr_push_scope() {
+fn nr_push_scope() {
     nr_scope_frames.push(nr_scope_names.len())
     nr_scope_depth = nr_scope_depth + 1
 }
 
-pub fn nr_pop_scope() ! Diag.Report {
+fn nr_pop_scope() ! Diag.Report {
     let start = nr_scope_frames.get(nr_scope_frames.len() - 1).unwrap()
     nr_scope_frames.pop()
     // Emit unused variable warnings for locals (depth > 1 = inside a function)
@@ -1163,7 +1163,7 @@ pub fn nr_pop_scope() ! Diag.Report {
     nr_scope_depth = nr_scope_depth - 1
 }
 
-pub fn nr_define(name: Str) {
+fn nr_define(name: Str) {
     nr_scope_names.push(name)
     nr_scope_muts.push(0)
     nr_scope_types.push(TYPE_UNKNOWN)
@@ -1188,7 +1188,7 @@ fn nr_check_shadow(name: Str, node: Int) ! Diag.Report {
     }
 }
 
-pub fn nr_define_at(name: Str, node: Int) ! Diag.Report {
+fn nr_define_at(name: Str, node: Int) ! Diag.Report {
     if node != -1 && nr_current_module != "" {
         np_module.set(node, nr_current_module)
     }
@@ -1201,7 +1201,7 @@ pub fn nr_define_at(name: Str, node: Int) ! Diag.Report {
     nr_scope_nodes.push(node)
 }
 
-pub fn nr_define_mut(name: Str, is_mut: Int) {
+fn nr_define_mut(name: Str, is_mut: Int) {
     nr_scope_names.push(name)
     nr_scope_muts.push(is_mut)
     nr_scope_types.push(TYPE_UNKNOWN)
@@ -1210,7 +1210,7 @@ pub fn nr_define_mut(name: Str, is_mut: Int) {
     nr_scope_nodes.push(-1)
 }
 
-pub fn nr_define_mut_at(name: Str, is_mut: Int, node: Int) ! Diag.Report {
+fn nr_define_mut_at(name: Str, is_mut: Int, node: Int) ! Diag.Report {
     if node != -1 && nr_current_module != "" {
         np_module.set(node, nr_current_module)
     }
@@ -1223,7 +1223,7 @@ pub fn nr_define_mut_at(name: Str, is_mut: Int, node: Int) ! Diag.Report {
     nr_scope_nodes.push(node)
 }
 
-pub fn nr_define_typed(name: Str, is_mut: Int, tid: Int) {
+fn nr_define_typed(name: Str, is_mut: Int, tid: Int) {
     nr_scope_names.push(name)
     nr_scope_muts.push(is_mut)
     nr_scope_types.push(tid)
@@ -1232,7 +1232,7 @@ pub fn nr_define_typed(name: Str, is_mut: Int, tid: Int) {
     nr_scope_nodes.push(-1)
 }
 
-pub fn nr_is_defined(name: Str) -> Int {
+fn nr_is_defined(name: Str) -> Int {
     let mut i = nr_scope_names.len() - 1
     while i >= 0 {
         if nr_scope_names.get(i).unwrap() == name {
@@ -1244,7 +1244,7 @@ pub fn nr_is_defined(name: Str) -> Int {
     0
 }
 
-pub fn nr_is_mut(name: Str) -> Int {
+fn nr_is_mut(name: Str) -> Int {
     let mut i = nr_scope_names.len() - 1
     while i >= 0 {
         if nr_scope_names.get(i).unwrap() == name {
@@ -1255,7 +1255,7 @@ pub fn nr_is_mut(name: Str) -> Int {
     0
 }
 
-pub fn nr_mark_written(name: Str, _node: Int) ! Diag.Report {
+fn nr_mark_written(name: Str, _node: Int) ! Diag.Report {
     let mut _fn_frame_start = 0
     if nr_scope_frames.len() > 1 {
         _fn_frame_start = nr_scope_frames.get(1).unwrap()
@@ -1273,7 +1273,7 @@ pub fn nr_mark_written(name: Str, _node: Int) ! Diag.Report {
     }
 }
 
-pub fn nr_get_type(name: Str) -> Int {
+fn nr_get_type(name: Str) -> Int {
     let mut i = nr_scope_names.len() - 1
     while i >= 0 {
         if nr_scope_names.get(i).unwrap() == name {
@@ -1284,7 +1284,7 @@ pub fn nr_get_type(name: Str) -> Int {
     TYPE_UNKNOWN
 }
 
-pub fn is_builtin_fn(name: Str) -> Int {
+fn is_builtin_fn(name: Str) -> Int {
     if name == "arg_count" { return 1 }
     if name == "get_arg" { return 1 }
     if name == "read_file" { return 1 }
@@ -1325,7 +1325,7 @@ pub fn is_builtin_fn(name: Str) -> Int {
     0
 }
 
-pub fn is_builtin_method(name: Str) -> Int {
+fn is_builtin_method(name: Str) -> Int {
     // String methods
     if name == "len" { return 1 }
     if name == "contains" { return 1 }
@@ -1461,7 +1461,7 @@ pub fn is_builtin_method(name: Str) -> Int {
     0
 }
 
-pub fn get_builtin_fn_ret(name: Str) -> Int {
+fn get_builtin_fn_ret(name: Str) -> Int {
     if name == "arg_count" { return TYPE_INT }
     if name == "get_arg" { return TYPE_STR }
     if name == "read_file" { return TYPE_STR }
@@ -1492,7 +1492,7 @@ pub fn get_builtin_fn_ret(name: Str) -> Int {
     TYPE_UNKNOWN
 }
 
-pub fn is_variant_name(name: Str) -> Int {
+fn is_variant_name(name: Str) -> Int {
     let mut i = 0
     while i < evar_name.len() {
         if evar_name.get(i).unwrap() == name {
@@ -1503,7 +1503,7 @@ pub fn is_variant_name(name: Str) -> Int {
     0
 }
 
-pub fn get_variant_enum_tid(name: Str) -> Int {
+fn get_variant_enum_tid(name: Str) -> Int {
     let mut i = 0
     while i < evar_name.len() {
         if evar_name.get(i).unwrap() == name {
@@ -1514,7 +1514,7 @@ pub fn get_variant_enum_tid(name: Str) -> Int {
     TYPE_UNKNOWN
 }
 
-pub fn is_trait_name(name: Str) -> Int {
+fn is_trait_name(name: Str) -> Int {
     let mut i = 0
     while i < tc_trait_names.len() {
         if tc_trait_names.get(i).unwrap() == name {
@@ -1525,7 +1525,7 @@ pub fn is_trait_name(name: Str) -> Int {
     0
 }
 
-pub fn is_known_type(name: Str) -> Int {
+fn is_known_type(name: Str) -> Int {
     if name == "Int" || name == "Float" || name == "Bool" || name == "Str" { return 1 }
     if name == "Void" || name == "List" || name == "Option" || name == "Result" { return 1 }
     if name == "Iterator" || name == "Handle" || name == "Channel" || name == "Map" || name == "Bytes" || name == "Instant" || name == "Duration" || name == "Char" || name == "StringBuilder" { return 1 }
@@ -1536,9 +1536,9 @@ pub fn is_known_type(name: Str) -> Int {
 }
 
 // Impl method registry for name resolution
-pub let mut nr_impl_type_names: List[Str] = []
-pub let mut nr_impl_method_names: List[Str] = []
-pub let mut nr_callable_field_names: List[Str] = []
+let mut nr_impl_type_names: List[Str] = []
+let mut nr_impl_method_names: List[Str] = []
+let mut nr_callable_field_names: List[Str] = []
 
 fn is_callable_field_name(name: Str) -> Int {
     let mut i = 0
@@ -1549,7 +1549,7 @@ fn is_callable_field_name(name: Str) -> Int {
     0
 }
 
-pub fn nr_has_impl_method(type_name: Str, method: Str) -> Int {
+fn nr_has_impl_method(type_name: Str, method: Str) -> Int {
     let mut i = 0
     while i < nr_impl_type_names.len() {
         if nr_impl_type_names.get(i).unwrap() == type_name && nr_impl_method_names.get(i).unwrap() == method {
@@ -1562,7 +1562,7 @@ pub fn nr_has_impl_method(type_name: Str, method: Str) -> Int {
 
 // ── Name resolution walker ──────────────────────────────────────────
 
-pub fn resolve_names(program: Int) ! TypeCheck.Resolve, Diag.Report {
+fn resolve_names(program: Int) ! TypeCheck.Resolve, Diag.Report {
     nr_scope_names = []
     nr_scope_muts = []
     nr_scope_types = []
@@ -1791,7 +1791,7 @@ pub fn resolve_names(program: Int) ! TypeCheck.Resolve, Diag.Report {
     nr_pop_scope()
 }
 
-pub fn nr_check_fn(fn_node: Int) ! TypeCheck.Resolve, Diag.Report {
+fn nr_check_fn(fn_node: Int) ! TypeCheck.Resolve, Diag.Report {
     nr_push_scope()
     let nr_is_ffi = has_annotation(fn_node, "ffi")
     let params_sl = np_params.get(fn_node).unwrap()
@@ -1827,7 +1827,7 @@ pub fn nr_check_fn(fn_node: Int) ! TypeCheck.Resolve, Diag.Report {
     nr_pop_scope()
 }
 
-pub fn nr_check_type_ann_visibility(ann_node: Int) ! TypeCheck.Resolve, Diag.Report {
+fn nr_check_type_ann_visibility(ann_node: Int) ! TypeCheck.Resolve, Diag.Report {
     if ann_node == -1 { return }
     let name = np_name.get(ann_node).unwrap()
     nr_check_type_ref(name)
@@ -1841,7 +1841,7 @@ pub fn nr_check_type_ann_visibility(ann_node: Int) ! TypeCheck.Resolve, Diag.Rep
     }
 }
 
-pub fn nr_check_type_ref(name: Str) ! TypeCheck.Resolve, Diag.Report {
+fn nr_check_type_ref(name: Str) ! TypeCheck.Resolve, Diag.Report {
     if name == "" { return }
     if name.len() == 1 { return }
     if is_known_type(name) != 0 {
@@ -1866,7 +1866,7 @@ pub fn nr_check_type_ref(name: Str) ! TypeCheck.Resolve, Diag.Report {
     diag_error_no_loc("UnknownType", "E0507", "unknown type '{name}'", "")
 }
 
-pub fn nr_check_node(node: Int) ! TypeCheck.Resolve, Diag.Report {
+fn nr_check_node(node: Int) ! TypeCheck.Resolve, Diag.Report {
     if node == -1 { return }
     let kind = np_kind.get(node).unwrap()
 
@@ -2283,7 +2283,7 @@ pub fn nr_check_node(node: Int) ! TypeCheck.Resolve, Diag.Report {
     let _skip = 0
 }
 
-pub fn nr_check_pattern(node: Int) ! TypeCheck.Resolve, Diag.Report {
+fn nr_check_pattern(node: Int) ! TypeCheck.Resolve, Diag.Report {
     if node == -1 { return }
     let kind = np_kind.get(node).unwrap()
 
@@ -2369,7 +2369,7 @@ pub fn nr_check_pattern(node: Int) ! TypeCheck.Resolve, Diag.Report {
 
 // ── Phase 2: Type compatibility ─────────────────────────────────────
 
-pub fn types_compatible(a: Int, b: Int) -> Int {
+fn types_compatible(a: Int, b: Int) -> Int {
     if a == b { return 1 }
     if a == TYPE_UNKNOWN || b == TYPE_UNKNOWN { return 1 }
     if a < 0 || b < 0 { return 1 }
@@ -2401,13 +2401,13 @@ pub fn types_compatible(a: Int, b: Int) -> Int {
     0
 }
 
-pub fn type_kind(tid: Int) -> Int {
+fn type_kind(tid: Int) -> Int {
     if tid < 0 || tid >= ty_kind.len() { return TK_UNKNOWN }
     ty_kind.get(tid).unwrap()
 }
 
 // Pact treats Int as truthy — Int is valid in Bool contexts
-pub fn is_bool_compat(tid: Int) -> Int {
+fn is_bool_compat(tid: Int) -> Int {
     if tid == TYPE_UNKNOWN { return 1 }
     if tid == TYPE_BOOL { return 1 }
     if tid == TYPE_INT { return 1 }
@@ -2418,7 +2418,7 @@ pub fn is_bool_compat(tid: Int) -> Int {
 
 // ── Phase 2: Expression type inference ──────────────────────────────
 
-pub fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     if node == -1 { return TYPE_UNKNOWN }
     let kind = np_kind.get(node).unwrap()
 
@@ -2771,7 +2771,7 @@ pub fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.
 
 // ── Phase 2: Type check function bodies ─────────────────────────────
 
-pub fn resolve_param_type(p: Int) -> Int ! TypeCheck.Resolve {
+fn resolve_param_type(p: Int) -> Int ! TypeCheck.Resolve {
     let ptype_str = np_type_name.get(p).unwrap()
     let ptype_ann = np_type_ann.get(p).unwrap()
     if ptype_ann != -1 {
@@ -2785,7 +2785,7 @@ pub fn resolve_param_type(p: Int) -> Int ! TypeCheck.Resolve {
 }
 
 @allow(UnrestoredMutation, IncompleteStateRestore)
-pub fn tc_check_fn(fn_node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+fn tc_check_fn(fn_node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     nr_push_scope()
     let fn_name = np_name.get(fn_node).unwrap()
     let prev_fn_name = tc_current_fn_name
@@ -2834,7 +2834,7 @@ pub fn tc_check_fn(fn_node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Rep
 }
 
 @allow(UnrestoredMutation, IncompleteStateRestore)
-pub fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     if node == -1 { return }
     let kind = np_kind.get(node).unwrap()
 
@@ -3061,7 +3061,7 @@ pub fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repo
     let _skip = 0
 }
 
-pub fn tc_check_pattern_types(node: Int) ! TypeCheck.Resolve {
+fn tc_check_pattern_types(node: Int) ! TypeCheck.Resolve {
     if node == -1 { return }
     let kind = np_kind.get(node).unwrap()
     if kind == NodeKind.IdentPattern {
@@ -3130,7 +3130,7 @@ pub fn tc_check_pattern_types(node: Int) ! TypeCheck.Resolve {
 
 // ── Phase 2: Top-level driver ───────────────────────────────────────
 
-pub fn tc_infer_program(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+fn tc_infer_program(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     nr_scope_names = []
     nr_scope_muts = []
     nr_scope_types = []
@@ -3206,7 +3206,7 @@ pub fn tc_infer_program(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Dia
 
 // ── Debug / introspection ───────────────────────────────────────────
 
-pub fn type_to_str(tid: Int) -> Str {
+fn type_to_str(tid: Int) -> Str {
     if tid < 0 || tid >= ty_kind.len() {
         return "<?>"
     }

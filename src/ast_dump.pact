@@ -1,7 +1,7 @@
 import parser
 import ast
 
-pub fn ast_json_escape(s: Str) -> Str {
+fn ast_json_escape(s: Str) -> Str {
     let mut sb = StringBuilder.new()
     let mut i = 0
     while i < s.len() {
@@ -17,7 +17,7 @@ pub fn ast_json_escape(s: Str) -> Str {
     sb.to_str()
 }
 
-pub fn sublist_to_json(sl: Int) -> Str {
+fn sublist_to_json(sl: Int) -> Str {
     let len = sublist_length(sl)
     let mut sb = StringBuilder.new()
     sb.write("[")

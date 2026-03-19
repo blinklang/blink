@@ -2,9 +2,9 @@ import codegen_types
 import diagnostics
 
 // Arg offset for trait-qualified builtin calls: MapOps.has(m, k) has receiver at args[0]
-pub let mut btc_arg_offset: Int = 0
+let mut btc_arg_offset: Int = 0
 
-pub fn resolve_push_struct(val_str: Str, list_name: Str) -> Str {
+fn resolve_push_struct(val_str: Str, list_name: Str) -> Str {
     let s = get_var_struct(val_str)
     if s != "" {
         return s
@@ -682,7 +682,7 @@ fn emit_sb_method(node: Int, obj_str: Str, _obj_node: Int, method: Str) -> Int !
     0
 }
 
-pub fn emit_builtin_trait_method(node: Int, obj_str: Str, obj_type: Int, obj_node: Int, method: Str) -> Int ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
+fn emit_builtin_trait_method(node: Int, obj_str: Str, obj_type: Int, obj_node: Int, method: Str) -> Int ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
     if lookup_builtin_trait_impl("StrOps", obj_type) != 0 {
         if emit_str_method(node, obj_str, obj_node, method) != 0 { return 1 }
     }

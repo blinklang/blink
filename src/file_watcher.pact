@@ -8,18 +8,18 @@ import symbol_index
 
 // ── Watched file storage (parallel arrays) ──────────────────────────
 
-pub let mut fw_path: List[Str] = []
-pub let mut fw_mtime: List[Int] = []
-pub let mut fw_count: Int = 0
+let mut fw_path: List[Str] = []
+let mut fw_mtime: List[Int] = []
+let mut fw_count: Int = 0
 
 // ── Dirty file list ─────────────────────────────────────────────────
 
-pub let mut fw_dirty_path: List[Str] = []
-pub let mut fw_dirty_count: Int = 0
+let mut fw_dirty_path: List[Str] = []
+let mut fw_dirty_count: Int = 0
 
 // ── Configuration ───────────────────────────────────────────────────
 
-pub let mut fw_poll_interval: Int = 500
+let mut fw_poll_interval: Int = 500
 
 // ── Lookup map for O(1) path check ──────────────────────────────────
 
@@ -88,7 +88,7 @@ pub fn fw_poll() -> Int {
 
 // ── Get dirty file list ─────────────────────────────────────────────
 
-pub fn fw_get_dirty() -> List[Str] {
+fn fw_get_dirty() -> List[Str] {
     fw_dirty_path
 }
 
@@ -101,7 +101,7 @@ pub fn fw_clear_dirty() {
 
 // ── Manually add a file to watch ────────────────────────────────────
 
-pub fn fw_add_file(path: Str) {
+fn fw_add_file(path: Str) {
     if path_map.has(path) != 0 {
         return
     }

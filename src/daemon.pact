@@ -197,7 +197,7 @@ fn daemon_loop() ! Daemon.Serve, Lex.Tokenize, Parse, TypeCheck, Diag.Report {
 
 // ── Shutdown ────────────────────────────────────────────────────────
 
-pub fn daemon_stop() ! Daemon.Serve {
+fn daemon_stop() ! Daemon.Serve {
     if daemon_socket_fd >= 0 {
         unix_socket_close(daemon_socket_fd)
         daemon_socket_fd = -1

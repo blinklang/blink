@@ -279,7 +279,7 @@ fn emit_json_extern_decls() ! Codegen.Emit {
     emit_line("")
 }
 
-pub let mut deser_externs_emitted = 0
+let mut deser_externs_emitted = 0
 
 fn emit_struct_from_json(type_name: Str) ! Codegen.Emit {
     if deser_externs_emitted == 0 {

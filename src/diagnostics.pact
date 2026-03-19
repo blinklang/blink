@@ -21,19 +21,19 @@ pub let mut diag_col: List[Int] = []
 pub let mut diag_help: List[Str] = []
 pub let mut diag_end_line: List[Int] = []
 pub let mut diag_end_col: List[Int] = []
-pub let mut diag_fix_action: List[Str] = []
-pub let mut diag_fix_text: List[Str] = []
+let mut diag_fix_action: List[Str] = []
+let mut diag_fix_text: List[Str] = []
 
 // ── Configuration ────────────────────────────────────────────────────
 
-pub let mut diag_format: Int = 0       // 0=human, 1=json
+let mut diag_format: Int = 0       // 0=human, 1=json
 pub let mut diag_source_file: Str = ""
 pub let mut diag_count: Int = 0        // error count only
 pub let mut diag_warn_count: Int = 0   // warning count only
 pub let mut diag_module_files: Map[Str, Str] = Map()
-pub let mut diag_file_ranges_start: List[Int] = []
-pub let mut diag_file_ranges_end: List[Int] = []
-pub let mut diag_file_ranges_path: List[Str] = []
+let mut diag_file_ranges_start: List[Int] = []
+let mut diag_file_ranges_end: List[Int] = []
+let mut diag_file_ranges_path: List[Str] = []
 
 pub fn diag_register_file_range(start: Int, end: Int, path: Str) {
     diag_file_ranges_start.push(start)
@@ -42,10 +42,10 @@ pub fn diag_register_file_range(start: Int, end: Int, path: Str) {
 }
 
 // ── Lint severity overrides from [lints] in pact.toml ───────────────
-pub let mut lint_overrides: Map[Str, Str] = Map()
+let mut lint_overrides: Map[Str, Str] = Map()
 
 // ── Per-function @allow suppression set ─────────────────────────────
-pub let mut diag_allow_set: Map[Str, Int] = Map()
+let mut diag_allow_set: Map[Str, Int] = Map()
 
 pub fn diag_push_allows(fn_node: Int) {
     let allow_ann = get_annotation(fn_node, "allow")
@@ -96,7 +96,7 @@ fn lint_apply_override(severity: Str, name: Str) -> Str {
 
 // ── Emit helpers ─────────────────────────────────────────────────────
 
-pub fn diag_emit(severity: Str, name: Str, code: Str, message: Str, line: Int, col: Int, help: Str) ! Diag.Report {
+fn diag_emit(severity: Str, name: Str, code: Str, message: Str, line: Int, col: Int, help: Str) ! Diag.Report {
     let effective_severity = lint_apply_override(severity, name)
     if effective_severity == "off" {
         return
@@ -165,11 +165,11 @@ pub fn diag_error_at(name: Str, code: Str, message: Str, node_id: Int, help: Str
     diag_source_file = saved_file
 }
 
-pub fn diag_warn(name: Str, code: Str, message: Str, line: Int, col: Int, help: Str) ! Diag.Report {
+fn diag_warn(name: Str, code: Str, message: Str, line: Int, col: Int, help: Str) ! Diag.Report {
     diag_emit("warning", name, code, message, line, col, help)
 }
 
-pub fn diag_warn_no_loc(name: Str, code: Str, message: Str, help: Str) ! Diag.Report {
+fn diag_warn_no_loc(name: Str, code: Str, message: Str, help: Str) ! Diag.Report {
     diag_emit("warning", name, code, message, 0, 0, help)
 }
 
@@ -183,7 +183,7 @@ pub fn diag_warn_at(name: Str, code: Str, message: Str, node_id: Int, help: Str)
     diag_source_file = saved_file
 }
 
-pub fn diag_emit_range(severity: Str, name: Str, code: Str, message: Str, line: Int, col: Int, end_line: Int, end_col: Int, help: Str) ! Diag.Report {
+fn diag_emit_range(severity: Str, name: Str, code: Str, message: Str, line: Int, col: Int, end_line: Int, end_col: Int, help: Str) ! Diag.Report {
     let effective_severity = lint_apply_override(severity, name)
     if effective_severity == "off" {
         return
@@ -254,7 +254,7 @@ pub fn diag_flush() ! Diag.Report {
     }
 }
 
-pub fn diag_print_json(idx: Int) ! Diag.Report {
+fn diag_print_json(idx: Int) ! Diag.Report {
     let sev = json_escape(diag_severity.get(idx).unwrap())
     let name = json_escape(diag_name.get(idx).unwrap())
     let code = json_escape(diag_code.get(idx).unwrap())
@@ -283,7 +283,7 @@ pub fn diag_print_json(idx: Int) ! Diag.Report {
     io.eprintln(json)
 }
 
-pub fn diag_print_human(idx: Int) ! Diag.Report {
+fn diag_print_human(idx: Int) ! Diag.Report {
     let sev = diag_severity.get(idx).unwrap()
     let name = diag_name.get(idx).unwrap()
     let msg = diag_message.get(idx).unwrap()

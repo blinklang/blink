@@ -514,7 +514,7 @@ pub fn attach_comments_pass(program: Int, _first_node: Int) {
     process_scope(program, 0, tok_kinds.len())
 }
 
-pub fn verify_comment_attachment(program: Int, first_node: Int) {
+fn verify_comment_attachment(program: Int, first_node: Int) {
     let mut saved_leading: List[Str] = []
     let mut saved_trailing: List[Str] = []
     let mut saved_doc: List[Str] = []

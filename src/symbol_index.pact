@@ -11,20 +11,20 @@ import diagnostics
 // ── Symbol kind constants ─────────────────────────────────────────────
 
 pub let SK_FN = 0
-pub let SK_STRUCT = 1
-pub let SK_ENUM = 2
+let SK_STRUCT = 1
+let SK_ENUM = 2
 pub let SK_TRAIT = 3
 pub let SK_LET = 4
 
 // ── Dependency kind constants ─────────────────────────────────────────
 
-pub let DK_CALLS = 0
-pub let DK_USES_TYPE = 1
-pub let DK_FIELD_ACCESS = 2
+let DK_CALLS = 0
+let DK_USES_TYPE = 1
+let DK_FIELD_ACCESS = 2
 
 // ── Visibility constants ──────────────────────────────────────────────
 
-pub let VIS_PRIVATE = 0
+let VIS_PRIVATE = 0
 pub let VIS_PUB = 1
 
 // ── Symbol registry (parallel arrays) ─────────────────────────────────
@@ -37,8 +37,8 @@ pub let mut si_sym_line: List[Int] = []
 pub let mut si_sym_vis: List[Int] = []
 pub let mut si_sym_effects: List[Str] = []
 pub let mut si_sym_sig: List[Str] = []
-pub let mut si_sym_ret_type: List[Str] = []
-pub let mut si_sym_param_types: List[Str] = []
+let mut si_sym_ret_type: List[Str] = []
+let mut si_sym_param_types: List[Str] = []
 pub let mut si_sym_doc: List[Str] = []
 pub let mut si_sym_intent: List[Str] = []
 pub let mut si_sym_requires: List[Str] = []
@@ -52,27 +52,27 @@ pub let mut si_sym_count: Int = 0
 // ── Forward dependency arrays ─────────────────────────────────────────
 
 pub let mut si_dep_from: List[Int] = []
-pub let mut si_dep_to: List[Int] = []
-pub let mut si_dep_kind: List[Int] = []
+let mut si_dep_to: List[Int] = []
+let mut si_dep_kind: List[Int] = []
 pub let mut si_dep_line: List[Int] = []
 pub let mut si_dep_col: List[Int] = []
 pub let mut si_dep_name_len: List[Int] = []
 
-pub let mut si_dep_count: Int = 0
+let mut si_dep_count: Int = 0
 
 // ── Reverse dependency arrays ─────────────────────────────────────────
 
-pub let mut si_rdep_from: List[Int] = []
-pub let mut si_rdep_to: List[Int] = []
+let mut si_rdep_from: List[Int] = []
+let mut si_rdep_to: List[Int] = []
 
-pub let mut si_rdep_count: Int = 0
+let mut si_rdep_count: Int = 0
 
 // ── File tracking ─────────────────────────────────────────────────────
 
 pub let mut si_file_path: List[Str] = []
-pub let mut si_file_mtime: List[Int] = []
-pub let mut si_file_sym_start: List[Int] = []
-pub let mut si_file_sym_end: List[Int] = []
+let mut si_file_mtime: List[Int] = []
+let mut si_file_sym_start: List[Int] = []
+let mut si_file_sym_end: List[Int] = []
 
 pub let mut si_file_count: Int = 0
 
@@ -686,7 +686,7 @@ pub fn sym_kind_name(kind: Int) -> Str {
 
 // ── Convenience: dep kind name ────────────────────────────────────────
 
-pub fn dep_kind_name(kind: Int) -> Str {
+fn dep_kind_name(kind: Int) -> Str {
     if kind == DK_CALLS { return "calls" }
     if kind == DK_USES_TYPE { return "uses_type" }
     if kind == DK_FIELD_ACCESS { return "field_access" }

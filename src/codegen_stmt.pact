@@ -343,7 +343,7 @@ pub fn emit_match_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scop
 // Build a C condition string for a pattern.
 // scrut_off/scrut_len index into match_scruts.
 // Returns "" when the pattern always matches (wildcard/ident).
-pub fn pattern_condition(pat: Int, scrut_off: Int, scrut_len: Int) -> Str {
+fn pattern_condition(pat: Int, scrut_off: Int, scrut_len: Int) -> Str {
     let pk = np_kind.get(pat).unwrap()
     if pk == NodeKind.WildcardPattern {
         return ""
@@ -543,7 +543,7 @@ pub fn pattern_condition(pat: Int, scrut_off: Int, scrut_len: Int) -> Str {
 // Emit C variable bindings for ident sub-patterns within a pattern.
 // scrut_off/scrut_len index into match_scruts.
 @allow(UnrestoredMutation, IncompleteStateRestore)
-pub fn bind_pattern_vars(pat: Int, scrut_off: Int, scrut_len: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
+fn bind_pattern_vars(pat: Int, scrut_off: Int, scrut_len: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
     let pk = np_kind.get(pat).unwrap()
     if pk == NodeKind.EnumPattern {
         let enum_name = np_name.get(pat).unwrap()
@@ -805,7 +805,7 @@ pub fn emit_block_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scop
     expr_result_type = CT_VOID
 }
 
-pub fn emit_arm_value(body: Int) -> Str ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
+fn emit_arm_value(body: Int) -> Str ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
     if body == -1 {
         return "0"
     }
@@ -826,7 +826,7 @@ pub fn emit_arm_value(body: Int) -> Str ! Codegen.Emit, Codegen.Register, Codege
 }
 
 @allow(UnrestoredMutation, IncompleteStateRestore)
-pub fn emit_block_value(block: Int) -> Str ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
+fn emit_block_value(block: Int) -> Str ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
     if block == -1 {
         return "0"
     }
@@ -893,7 +893,7 @@ pub fn infer_block_type(block: Int) -> Int {
     CT_VOID
 }
 
-pub fn infer_arm_type(arm: Int) -> Int {
+fn infer_arm_type(arm: Int) -> Int {
     let body = np_body.get(arm).unwrap()
     if body == -1 {
         return CT_VOID
@@ -952,7 +952,7 @@ fn infer_enum_pattern_binding(pat: Int) -> Str {
     ""
 }
 
-pub fn infer_expr_type(node: Int) -> Int {
+fn infer_expr_type(node: Int) -> Int {
     if node == -1 {
         return CT_VOID
     }
@@ -1026,7 +1026,7 @@ pub fn infer_expr_type(node: Int) -> Int {
 // ── Statement codegen ───────────────────────────────────────────────
 
 @allow(UnrestoredMutation, IncompleteStateRestore)
-pub fn emit_stmt(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
+fn emit_stmt(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
     let kind = np_kind.get(node).unwrap()
 
     if kind == NodeKind.ExprStmt {
@@ -1169,7 +1169,7 @@ pub fn emit_stmt(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
     }
 }
 
-pub fn infer_enum_from_node(val_node: Int) -> Str {
+fn infer_enum_from_node(val_node: Int) -> Str {
     let vk = np_kind.get(val_node).unwrap()
     if vk == NodeKind.FieldAccess {
         let obj = np_obj.get(val_node).unwrap()
@@ -1205,7 +1205,7 @@ pub fn infer_enum_from_node(val_node: Int) -> Str {
     ""
 }
 
-pub fn emit_tuple_destructure(pat_node: Int, source_var: Str, struct_name: Str, is_mut: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope {
+fn emit_tuple_destructure(pat_node: Int, source_var: Str, struct_name: Str, is_mut: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope {
     let elems_sl = np_elements.get(pat_node).unwrap()
     if elems_sl == -1 { return }
     let mut di = 0
@@ -1229,7 +1229,7 @@ pub fn emit_tuple_destructure(pat_node: Int, source_var: Str, struct_name: Str, 
 }
 
 @allow(UnrestoredMutation, IncompleteStateRestore)
-pub fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
+fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
     let val_node = np_value.get(node).unwrap()
     let mut enum_type = infer_enum_from_node(val_node)
     let type_ann = np_target.get(node).unwrap()
@@ -1480,7 +1480,7 @@ pub fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
 }
 
 @allow(UnrestoredMutation, IncompleteStateRestore)
-pub fn emit_for_in(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
+fn emit_for_in(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
     let var_name = np_var_name.get(node).unwrap()
     let c_var_name = c_safe_name(var_name)
     let iter_node = np_iterable.get(node).unwrap()
@@ -1634,7 +1634,7 @@ pub fn emit_for_in(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
 }
 
 @allow(UnrestoredMutation, IncompleteStateRestore)
-pub fn emit_if_stmt(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
+fn emit_if_stmt(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
     emit_expr(np_condition.get(node).unwrap())
     let cond_str = strip_outer_parens(expr_result_str)
     emit_line("if ({cond_str}) \{")
@@ -1701,7 +1701,7 @@ pub fn emit_block(block: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
 // __ With-block codegen __
 
 @allow(UnrestoredMutation, IncompleteStateRestore)
-pub fn emit_with_block(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
+fn emit_with_block(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
     let handlers_sl = np_handlers.get(node).unwrap()
     let body = np_body.get(node).unwrap()
     if handlers_sl == -1 {
@@ -1828,7 +1828,7 @@ fn get_ffi_ann(fn_node: Int) -> Int {
     get_annotation(fn_node, "ffi")
 }
 
-pub fn format_params(fn_node: Int) -> Str {
+fn format_params(fn_node: Int) -> Str {
     let params_sl = np_params.get(fn_node).unwrap()
     if params_sl == -1 {
         return "void"
@@ -1936,7 +1936,7 @@ pub fn format_impl_params(fn_node: Int, impl_type: Str) -> Str {
 }
 
 @allow(UnrestoredMutation, IncompleteStateRestore)
-pub fn emit_requires_assertions(fn_node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
+fn emit_requires_assertions(fn_node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
     let anns_sl = np_handlers.get(fn_node).unwrap()
     if anns_sl == -1 {
         return
@@ -2132,8 +2132,8 @@ pub fn emit_fn_decl(fn_node: Int) ! Codegen.Emit {
 
 // ── Trace helpers ────────────────────────────────────────────────────
 
-pub let mut cg_trace_fn_qualified: Str = ""
-pub let mut cg_trace_module: Str = ""
+let mut cg_trace_fn_qualified: Str = ""
+let mut cg_trace_module: Str = ""
 pub let mut cg_in_traced_fn: Int = 0
 
 fn trace_format_spec(ptype: Str) -> Str {
@@ -2153,7 +2153,7 @@ fn trace_c_arg_expr(pname: Str, ptype: Str) -> Str {
     "\"{ptype}\""
 }
 
-pub fn trace_ret_is_primitive(ret_str: Str) -> Int {
+fn trace_ret_is_primitive(ret_str: Str) -> Int {
     if ret_str == "Int" || ret_str == "Float" || ret_str == "Bool" || ret_str == "Str" {
         return 1
     }
@@ -2237,7 +2237,7 @@ pub fn emit_trace_exit_void() ! Codegen.Emit {
     emit_line("}")
 }
 
-pub fn emit_trace_exit_with_val(val_expr: Str, ret_str: Str) ! Codegen.Emit {
+fn emit_trace_exit_with_val(val_expr: Str, ret_str: Str) ! Codegen.Emit {
     if cg_in_traced_fn == 0 { return }
     emit_line("if (__trace_enter_ts) \{")
     cg_indent = cg_indent + 1
@@ -2275,7 +2275,7 @@ pub fn emit_return_with_trace(val_str: Str, ret_type: Int) ! Codegen.Emit {
     }
 }
 
-pub fn emit_trace_effect(eff_name: Str, op: Str, args_json_expr: Str) ! Codegen.Emit {
+fn emit_trace_effect(eff_name: Str, op: Str, args_json_expr: Str) ! Codegen.Emit {
     if cg_trace_codegen == 0 { return }
     if cg_in_traced_fn == 0 { return }
     emit_line("if (__pact_trace.active && pact_trace_match_effect(\"{cg_trace_fn_qualified}\", \"{cg_trace_module}\", __pact_trace.depth, \"{eff_name}\")) \{")
@@ -2331,7 +2331,7 @@ pub fn emit_trace_state(var_name: Str, op: Str, val_expr: Str, val_type: Int) ! 
     emit_line("}")
 }
 
-pub fn emit_trace_state_str(var_name: Str, op: Str, val_expr: Str) ! Codegen.Emit {
+fn emit_trace_state_str(var_name: Str, op: Str, val_expr: Str) ! Codegen.Emit {
     if cg_trace_codegen == 0 { return }
     if cg_in_traced_fn == 0 { return }
     let tbuf = fresh_temp("__ts_")
@@ -2566,7 +2566,7 @@ pub fn emit_fn_body(block: Int, ret_type: Int) ! Codegen.Emit, Codegen.Register,
 
 // ── Type definition codegen ─────────────────────────────────────────
 
-pub fn find_type_def(name: Str) -> Int {
+fn find_type_def(name: Str) -> Int {
     let types_sl = np_fields.get(cg_program_node).unwrap()
     if types_sl == -1 {
         return -1
@@ -2651,7 +2651,7 @@ pub fn register_mono_field_types(base_name: Str, mono_name: Str, concrete_args: 
     }
 }
 
-pub fn emit_mono_struct_typedef(base_name: Str, concrete_args: Str) ! Codegen.Emit {
+fn emit_mono_struct_typedef(base_name: Str, concrete_args: Str) ! Codegen.Emit {
     let td = find_type_def(base_name)
     if td == -1 {
         return
@@ -2746,7 +2746,7 @@ fn build_closure_sig_resolved_mono(ta: Int, tparams_sl: Int, concrete_args: Str)
 }
 
 @allow(UnrestoredMutation, IncompleteStateRestore)
-pub fn emit_mono_fn_def(fn_node: Int, concrete_args: Str) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
+fn emit_mono_fn_def(fn_node: Int, concrete_args: Str) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
     let base_name = np_name.get(fn_node).unwrap()
     let mangled = mangle_generic_name(base_name, concrete_args)
     let tparams_sl = np_type_params.get(fn_node).unwrap()
