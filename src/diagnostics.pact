@@ -94,6 +94,18 @@ fn lint_apply_override(severity: Str, name: Str) -> Str {
     severity
 }
 
+pub fn diag_normalize_path(path: Str) -> Str {
+    let idx = path.index_of("lib/std/")
+    if idx > 0 {
+        return path.substring(idx, path.len() - idx)
+    }
+    let idx2 = path.index_of("lib/pkg/")
+    if idx2 > 0 {
+        return path.substring(idx2, path.len() - idx2)
+    }
+    path
+}
+
 // ── Emit helpers ─────────────────────────────────────────────────────
 
 fn diag_emit(severity: Str, name: Str, code: Str, message: Str, line: Int, col: Int, help: Str) ! Diag.Report {
