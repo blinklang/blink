@@ -625,6 +625,13 @@ pub type ImplEntry {
 }
 pub let mut impl_entries: List[ImplEntry] = []
 
+// Builtin trait impl registry: maps (trait, ct_type) for builtin types
+pub type BuiltinTraitImpl {
+    trait_name: Str
+    ct_type: Int
+}
+pub let mut builtin_trait_impls: List[BuiltinTraitImpl] = []
+
 // From impl registry: (source_type, target_type) -> methods sublist
 pub type FromImplEntry {
     source: Str
@@ -2345,6 +2352,18 @@ pub fn lookup_impl_type_for_trait(trait_name: Str, type_name: Str) -> Int {
     while i < impl_entries.len() {
         let ie = impl_entries.get(i).unwrap()
         if ie.trait_name == trait_name && ie.type_name == type_name {
+            return 1
+        }
+        i = i + 1
+    }
+    0
+}
+
+pub fn lookup_builtin_trait_impl(trait_name: Str, ct_type: Int) -> Int {
+    let mut i = 0
+    while i < builtin_trait_impls.len() {
+        let bt = builtin_trait_impls.get(i).unwrap()
+        if bt.trait_name == trait_name && bt.ct_type == ct_type {
             return 1
         }
         i = i + 1

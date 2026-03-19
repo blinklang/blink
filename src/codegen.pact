@@ -154,6 +154,19 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
     trait_entries.push(TraitEntry { name: "Iterator", method_sl: -1 })
     trait_entries.push(TraitEntry { name: "IntoIterator", method_sl: -1 })
 
+    // Builtin trait impls: which CT_* types implement which traits
+    builtin_trait_impls.push(BuiltinTraitImpl { trait_name: "Sized", ct_type: CT_STRING })
+    builtin_trait_impls.push(BuiltinTraitImpl { trait_name: "Sized", ct_type: CT_LIST })
+    builtin_trait_impls.push(BuiltinTraitImpl { trait_name: "Sized", ct_type: CT_MAP })
+    builtin_trait_impls.push(BuiltinTraitImpl { trait_name: "Sized", ct_type: CT_BYTES })
+    builtin_trait_impls.push(BuiltinTraitImpl { trait_name: "Sized", ct_type: CT_STRINGBUILDER })
+    builtin_trait_impls.push(BuiltinTraitImpl { trait_name: "Contains", ct_type: CT_STRING })
+    builtin_trait_impls.push(BuiltinTraitImpl { trait_name: "StrOps", ct_type: CT_STRING })
+    builtin_trait_impls.push(BuiltinTraitImpl { trait_name: "ListOps", ct_type: CT_LIST })
+    builtin_trait_impls.push(BuiltinTraitImpl { trait_name: "MapOps", ct_type: CT_MAP })
+    builtin_trait_impls.push(BuiltinTraitImpl { trait_name: "StringBuildOps", ct_type: CT_STRINGBUILDER })
+    builtin_trait_impls.push(BuiltinTraitImpl { trait_name: "Joinable", ct_type: CT_LIST })
+
     // Register user-defined effect declarations
     let effects_decl_sl = np_args.get(program).unwrap()
     if effects_decl_sl != -1 {
