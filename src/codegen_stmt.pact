@@ -1069,6 +1069,13 @@ fn infer_expr_type(node: Int) -> Int {
             return get_fn_ret(call_name)
         }
     }
+    if kind == NodeKind.UnaryOp {
+        let op = np_op.get(node).unwrap()
+        if op == "!" {
+            return CT_BOOL
+        }
+        return infer_expr_type(np_left.get(node).unwrap())
+    }
     if kind == NodeKind.BinOp {
         let op = np_op.get(node).unwrap()
         if op == "==" || op == "!=" || op == "<" || op == ">" || op == "<=" || op == ">=" || op == "&&" || op == "||" {
@@ -3167,6 +3174,13 @@ pub fn emit_struct_typedef(td_node: Int) ! Codegen.Emit {
                 sf_entries.push(StructFieldEntry { struct_name: name, field_name: fname, field_type: CT_INT, stype: "", tp_id: sv_tp(CT_INT, -1, -1, "") })
             } else if is_struct_type(type_name) != 0 {
                 emit_line("{c_type_c_name(type_name)} {fname};")
+                sf_entries.push(StructFieldEntry { struct_name: name, field_name: fname, field_type: CT_VOID, stype: type_name, tp_id: sv_tp(CT_VOID, -1, -1, type_name) })
+            } else if is_enum_type(type_name) != 0 {
+                if is_data_enum(type_name) != 0 {
+                    emit_line("{c_type_c_name(type_name)} {fname};")
+                } else {
+                    emit_line("int64_t {fname};")
+                }
                 sf_entries.push(StructFieldEntry { struct_name: name, field_name: fname, field_type: CT_VOID, stype: type_name, tp_id: sv_tp(CT_VOID, -1, -1, type_name) })
             } else {
                 let ct = type_from_name(type_name)

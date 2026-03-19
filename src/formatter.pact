@@ -614,8 +614,14 @@ fn format_closure_inline(node: Int) -> Str {
     }
     sb.write(")")
     if ret != "" {
-        sb.write(" -> ")
-        sb.write(ret)
+        let ret_ann = np_type_ann.get(node).unwrap()
+        if ret_ann != -1 {
+            sb.write(" -> ")
+            sb.write(format_type_ann(ret_ann))
+        } else {
+            sb.write(" -> ")
+            sb.write(ret)
+        }
     }
     sb.write(" ")
     sb.write(format_block_inline(body))

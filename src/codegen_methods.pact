@@ -148,6 +148,11 @@ fn emit_str_method(node: Int, obj_str: Str, _obj_node: Int, method: Str) -> Int 
         expr_result_type = CT_FLOAT
         return 1
     }
+    if method == "parse_int" {
+        expr_result_str = "pact_parse_int({obj_str})"
+        expr_result_type = CT_INT
+        return 1
+    }
     if method == "as_cstr" {
         expr_result_str = "strdup({obj_str})"
         expr_result_type = CT_PTR
@@ -2829,7 +2834,10 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
     }
 
     // Trait impl method resolution
-    let struct_type = get_var_struct(obj_str)
+    let mut struct_type = get_var_struct(obj_str)
+    if struct_type == "" {
+        struct_type = get_var_enum(obj_str)
+    }
     if struct_type != "" && lookup_impl_method(struct_type, method) != 0 {
         let mangled = "{struct_type}_{method}"
         let args_sl = np_args.get(node).unwrap()

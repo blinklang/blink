@@ -39,6 +39,12 @@ test "parse_float" {
     assert(f > 3.13)
 }
 
+test "parse_int" {
+    assert_eq("42".parse_int(), 42)
+    assert_eq("-7".parse_int(), -7)
+    assert_eq("0".parse_int(), 0)
+}
+
 test "existing string methods" {
     assert_eq("hello".len(), 5)
     assert("hello world".contains("world"))
