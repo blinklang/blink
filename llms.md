@@ -4,6 +4,18 @@
 
 Targets native binaries via C codegen.
 
+## Install
+
+**Binary** (Linux/macOS): download from [GitHub Releases](https://github.com/nhumrich/pact/releases/latest) and place on PATH.
+
+**Docker**:
+```
+docker pull ghcr.io/nhumrich/pact:latest
+docker run --rm -v "$PWD":/workspace ghcr.io/nhumrich/pact run myfile.pact
+```
+
+Tags: `latest`, `0.23`, `0.23.1` (semver). Image is `debian:bookworm-slim` with `gcc`, `pact`, and `libsqlite3-dev`.
+
 ## What's New (v0.23.1)
 
 - **Fixes** — recursive self-referencing data enum variants, data enum values in list literals, `?` operator Result type when fn returns struct
