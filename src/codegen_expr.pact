@@ -1076,31 +1076,20 @@ fn emit_unaryop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag
                 let rok_s = expr_result_ok_struct
                 let rerr_s = expr_result_err_struct
                 let fn_rt = get_fn_ret_type(cg_current_fn_name)
-                if rok_s != "" || rerr_s != "" {
-                    let res_c = result_c_type_mixed(rok, rerr, rok_s, rerr_s)
-                    let fn_fsi = get_fn_ret_struct_inner(cg_current_fn_name)
-                    let fn_ok_s = fn_fsi.ok_struct
-                    let fn_err_s = fn_fsi.err_struct
-                    let fn_res_c = result_c_type_mixed(tp_child1_kind(fn_rt.tp_id), tp_child2_kind(fn_rt.tp_id), fn_ok_s, fn_err_s)
-                    emit_line("{res_c} {tmp} = {operand_str};")
-                    emit_line("if ({tmp}.tag == 1) return ({fn_res_c})\{.tag = 1, .err = {tmp}.err};")
-                    expr_result_str = "{tmp}.ok"
-                    if rok_s != "" {
-                        expr_result_type = CT_INT
-                        set_var_struct(expr_result_str, rok_s)
-                    } else {
-                        expr_result_type = rok
-                    }
-                    expr_result_ok_struct = ""
-                    expr_result_err_struct = ""
+                let fn_fsi = get_fn_ret_struct_inner(cg_current_fn_name)
+                let res_c = result_c_type_mixed(rok, rerr, rok_s, rerr_s)
+                let fn_res_c = result_c_type_mixed(tp_child1_kind(fn_rt.tp_id), tp_child2_kind(fn_rt.tp_id), fn_fsi.ok_struct, fn_fsi.err_struct)
+                emit_line("{res_c} {tmp} = {operand_str};")
+                emit_line("if ({tmp}.tag == 1) return ({fn_res_c})\{.tag = 1, .err = {tmp}.err};")
+                expr_result_str = "{tmp}.ok"
+                if rok_s != "" {
+                    expr_result_type = CT_INT
+                    set_var_struct(expr_result_str, rok_s)
                 } else {
-                    let res_c = result_c_type(rok, rerr)
-                    let fn_res_c = result_c_type(tp_child1_kind(fn_rt.tp_id), tp_child2_kind(fn_rt.tp_id))
-                    emit_line("{res_c} {tmp} = {operand_str};")
-                    emit_line("if ({tmp}.tag == 1) return ({fn_res_c})\{.tag = 1, .err = {tmp}.err};")
-                    expr_result_str = "{tmp}.ok"
                     expr_result_type = rok
                 }
+                expr_result_ok_struct = ""
+                expr_result_err_struct = ""
             }
         } else if operand_type == CT_OPTION {
             if cg_current_fn_ret != CT_OPTION {
