@@ -1,11 +1,12 @@
 FROM debian:bookworm-slim
 
-ARG PACT_VERSION=v0.18.0
+ARG PACT_VERSION=v0.23.2
 ARG ZIG_VERSION=0.13.0
 
 RUN apt-get update && apt-get install -y \
     gcc \
     libc6-dev \
+    libgc-dev \
     libsqlite3-dev \
     git \
     curl \
