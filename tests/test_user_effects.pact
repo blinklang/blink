@@ -27,9 +27,9 @@ fn main() {
         fn counter(name: Str, value: Int) {
             io.println("captured: {name} = {value}")
         }
-        fn gauge(name: Str, value: Float) {
+        fn gauge(_name: Str, _value: Float) {
         }
-        fn get_counter(name: Str) -> Int {
+        fn get_counter(_name: Str) -> Int {
             42
         }
     } {
@@ -48,9 +48,9 @@ fn main() {
         fn counter(name: Str, value: Int) {
             io.println("mock counter: {name} = {value}")
         }
-        fn gauge(name: Str, value: Float) {
+        fn gauge(_name: Str, _value: Float) {
         }
-        fn get_counter(name: Str) -> Int {
+        fn get_counter(_name: Str) -> Int {
             0
         }
     } {
@@ -61,11 +61,11 @@ fn main() {
 
     io.println("--- test 5: query sub-effect ---")
     with handler Metrics {
-        fn counter(name: Str, value: Int) {
+        fn counter(_name: Str, _value: Int) {
         }
-        fn gauge(name: Str, value: Float) {
+        fn gauge(_name: Str, _value: Float) {
         }
-        fn get_counter(name: Str) -> Int {
+        fn get_counter(_name: Str) -> Int {
             100
         }
     } {
@@ -83,9 +83,9 @@ fn main() {
         fn counter(name: Str, value: Int) {
             io.println("[OUTER] {name} = {value}")
         }
-        fn gauge(name: Str, value: Float) {
+        fn gauge(_name: Str, _value: Float) {
         }
-        fn get_counter(name: Str) -> Int {
+        fn get_counter(_name: Str) -> Int {
             10
         }
     } {
@@ -94,9 +94,9 @@ fn main() {
             fn counter(name: Str, value: Int) {
                 io.println("[INNER] {name} = {value}")
             }
-            fn gauge(name: Str, value: Float) {
+            fn gauge(_name: Str, _value: Float) {
             }
-            fn get_counter(name: Str) -> Int {
+            fn get_counter(_name: Str) -> Int {
                 20
             }
         } {

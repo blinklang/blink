@@ -2087,7 +2087,15 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, Diag.Report {
                 mi = mi + 1
             }
             if found_in_impl == 0 && is_callable_field_name(method_name) == 0 {
-                diag_warn_at("UnknownMethod", "W0501", "unknown method '{method_name}' — may fail at compile time", node, "")
+                let mut is_ue_call = 0
+                if obj != -1 && np_kind.get(obj).unwrap() == NodeKind.Ident {
+                    if is_user_effect_handle_name(np_name.get(obj).unwrap()) != 0 {
+                        is_ue_call = 1
+                    }
+                }
+                if is_ue_call == 0 {
+                    diag_warn_at("UnknownMethod", "W0501", "unknown method '{method_name}' — may fail at compile time", node, "")
+                }
             }
         }
         let args_sl = np_args.get(node).unwrap()
@@ -2518,16 +2526,38 @@ fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repo
         if op == "!" { return TYPE_BOOL }
         if op == "-" { return operand }
         if op == "?" {
-            if tc_current_fn_ret >= 0 && tc_current_fn_ret < ty_kind.len() {
-                let ret_kind = ty_kind.get(tc_current_fn_ret).unwrap()
-                if ret_kind != TK_RESULT && ret_kind != TK_UNKNOWN {
-                    tc_errors.push("'?' operator used in function '{tc_current_fn_name}' which does not return Result")
-                    diag_error_at("TypeError", "E0300", "'?' operator used in function '{tc_current_fn_name}' which does not return Result", node, "change the return type to Result")
-                }
-            }
             let ok = type_kind(operand)
-            if ok == TK_OPTION { return ty_inner1.get(operand).unwrap() }
-            if ok == TK_RESULT { return ty_inner1.get(operand).unwrap() }
+            if ok == TK_RESULT {
+                if tc_current_fn_ret >= 0 && tc_current_fn_ret < ty_kind.len() {
+                    let ret_kind = ty_kind.get(tc_current_fn_ret).unwrap()
+                    if ret_kind != TK_RESULT && ret_kind != TK_UNKNOWN {
+                        tc_errors.push("'?' on Result in function '{tc_current_fn_name}' which does not return Result")
+                        diag_error_at("QuestionMarkResultInNonResult", "E0508", "'?' on Result in function '{tc_current_fn_name}' which does not return Result", node, "change the return type to Result[T, E]")
+                    } else if ret_kind == TK_RESULT {
+                        let operand_err = ty_inner2.get(operand).unwrap()
+                        let ret_err = ty_inner2.get(tc_current_fn_ret).unwrap()
+                        if types_compatible(operand_err, ret_err) == 0 {
+                            tc_errors.push("'?' error type mismatch in function '{tc_current_fn_name}'")
+                            diag_error_at("QuestionMarkErrorMismatch", "E0512", "'?' error type mismatch: operand error type does not match return error type in '{tc_current_fn_name}'", node, "ensure the error types are compatible")
+                        }
+                    }
+                }
+                return ty_inner1.get(operand).unwrap()
+            }
+            if ok == TK_OPTION {
+                if tc_current_fn_ret >= 0 && tc_current_fn_ret < ty_kind.len() {
+                    let ret_kind = ty_kind.get(tc_current_fn_ret).unwrap()
+                    if ret_kind != TK_OPTION && ret_kind != TK_UNKNOWN {
+                        tc_errors.push("'?' on Option in function '{tc_current_fn_name}' which does not return Option")
+                        diag_error_at("QuestionMarkOptionInNonOption", "E0509", "'?' on Option in function '{tc_current_fn_name}' which does not return Option", node, "change the return type to Option[T]")
+                    }
+                }
+                return ty_inner1.get(operand).unwrap()
+            }
+            if ok != TK_UNKNOWN {
+                tc_errors.push("'?' requires Result or Option value")
+                diag_error_at("QuestionMarkInvalidOperand", "E0502", "'?' requires a Result or Option value", node, "")
+            }
             return operand
         }
         return operand

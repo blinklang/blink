@@ -338,6 +338,7 @@ trait ListOps[T] {
     fn set(self, index: Int, value: T)
     fn insert(self, index: Int, value: T)
     fn remove(self, index: Int) -> T
+    fn clear(self)
 
     // Transformation (returns new list)
     fn append(self, other: List[T]) -> List[T]
@@ -346,7 +347,7 @@ trait ListOps[T] {
 }
 ```
 
-The full `List[T]` method surface (12 methods from `ListOps` + 2 from `Sized` + 1 from `Contains`):
+The full `List[T]` method surface (13 methods from `ListOps` + 2 from `Sized` + 1 from `Contains`):
 
 | Method | Signature | Mutates | Notes |
 |--------|-----------|---------|-------|
@@ -361,6 +362,7 @@ The full `List[T]` method surface (12 methods from `ListOps` + 2 from `Sized` + 
 | `set` | `fn(self, Int, T)` | yes | Replace at index |
 | `insert` | `fn(self, Int, T)` | yes | Insert at index, shift right |
 | `remove` | `fn(self, Int) -> T` | yes | Remove at index, shift left |
+| `clear` | `fn(self)` | yes | Reset to empty, retains capacity |
 | `append` | `fn(self, List[T]) -> List[T]` | no | Concatenate, returns new list |
 | `reverse` | `fn(self) -> List[T]` | no | Reversed copy |
 | `sort` | `fn(self) -> List[T]` | no | Sorted copy (requires `T: Ord`) |
@@ -381,11 +383,12 @@ let combined = items.append([6, 7])  // [99, 1, 4, 1, 5, 6, 7] — new list
 items.contains(4)                    // true
 items.index_of(1)                    // Some(1) — first occurrence
 items.last()                         // Some(5)
+items.clear()                        // items is now [], capacity retained
 ```
 
 **Why `.get()` returns `Option[T]`.** Out-of-bounds access is a runtime error in most languages. Returning `Option[T]` forces the caller to handle the absence case — no index-out-of-bounds panics, no null pointer exceptions. Use `??` for default values: `list.get(i) ?? 0`.
 
-**Why 12 methods (vote: 3-2).** Systems and PLT argued for 8, excluding `insert`, `remove`, `index_of`, and `last` as O(n) operations better served by iterator methods. Web/Scripting, DevOps, and AI/ML argued these are bread-and-butter operations in every major language (Python `list`, JS `Array`, Java `ArrayList`), and their absence would cause every user to write the same helpers on day one. The expanded surface won on developer experience grounds — performance characteristics should be documented, not hidden.
+**Why 13 methods (vote: 3-2).** Systems and PLT argued for 8, excluding `insert`, `remove`, `index_of`, and `last` as O(n) operations better served by iterator methods. Web/Scripting, DevOps, and AI/ML argued these are bread-and-butter operations in every major language (Python `list`, JS `Array`, Java `ArrayList`), and their absence would cause every user to write the same helpers on day one. The expanded surface won on developer experience grounds — performance characteristics should be documented, not hidden.
 
 ##### The `MapOps` Trait
 
@@ -402,10 +405,11 @@ trait MapOps[K, V] {
     fn insert(self, key: K, value: V)
     fn remove(self, key: K) -> Option[V]
     fn contains_key(self, key: K) -> Bool
+    fn clear(self)
 }
 ```
 
-The full `Map[K, V]` method surface (8 methods from `MapOps` + 2 from `Sized` + 1 from `Contains`):
+The full `Map[K, V]` method surface (9 methods from `MapOps` + 2 from `Sized` + 1 from `Contains`):
 
 | Method | Signature | Mutates | Notes |
 |--------|-----------|---------|-------|
@@ -420,6 +424,7 @@ The full `Map[K, V]` method surface (8 methods from `MapOps` + 2 from `Sized` + 
 | `contains_key` | `fn(self, K) -> Bool` | no | Key presence check |
 | `insert` | `fn(self, K, V)` | yes | Insert or update |
 | `remove` | `fn(self, K) -> Option[V]` | yes | Remove by key |
+| `clear` | `fn(self)` | yes | Reset to empty, retains capacity |
 
 ```pact
 let mut config = Map.new()
@@ -436,11 +441,12 @@ let vs = config.values()                   // ["localhost", "8080"] (unspecified
 let es = config.entries()                  // [("host", "localhost"), ("port", "8080")]
 
 let removed = config.remove("port")        // Some("8080")
+config.clear()                             // config is now empty, capacity retained
 ```
 
 **Why `contains_key` when `Contains` exists.** `Contains[K]` on `Map[K, V]` checks key presence — identical to `contains_key`. Both exist because `contains` comes from the generic `Contains` trait (for generic code) and `contains_key` lives in `MapOps` (for map-specific code that reads more clearly). They have identical semantics; the compiler may optimize `contains` to `contains_key` internally.
 
-**Why 8 methods (vote: 3-2).** Systems and PLT argued for 6, noting that `entries` duplicates `IntoIterator` (which yields `(K, V)` tuples) and `get_or_default` duplicates `get(k) ?? default`. Web/Scripting, DevOps, and AI/ML argued that `entries` is the standard "dump the map" operation every developer expects (Python's `dict.items()`, JS's `Map.entries()`), and `get_or_default` eliminates the most common map boilerplate pattern. Discoverability and training data representation won.
+**Why 9 methods (vote: 3-2).** Systems and PLT argued for 6, noting that `entries` duplicates `IntoIterator` (which yields `(K, V)` tuples) and `get_or_default` duplicates `get(k) ?? default`. Web/Scripting, DevOps, and AI/ML argued that `entries` is the standard "dump the map" operation every developer expects (Python's `dict.items()`, JS's `Map.entries()`), and `get_or_default` eliminates the most common map boilerplate pattern. Discoverability and training data representation won.
 
 ##### The `SetOps` Trait
 
@@ -487,8 +493,8 @@ let combined = a.union(b)                  // all elements from both
 |-------|-----------|---------|------------|
 | `Sized` | Str, List, Map, Set, StringBuilder | `len`, `is_empty` | Yes |
 | `Contains[T]` | List, Map, Set | `contains` | Yes |
-| `ListOps[T]` | List | 12 methods | Yes |
-| `MapOps[K, V]` | Map | 8 methods | Yes |
+| `ListOps[T]` | List | 13 methods | Yes |
+| `MapOps[K, V]` | Map | 9 methods | Yes |
 | `SetOps[T]` | Set | 3 methods | Yes |
 | `IntoIterator[T]` | List, Map, Set, Str, Range | `into_iter` | Yes (§3c.1) |
 | `Joinable` | List[Str] | `join` | Yes (§3.2.1) |

@@ -731,6 +731,23 @@ fn format_handler_inline(node: Int) -> Str {
     return "handler {name} \{ ... }"
 }
 
+fn format_handler_full(node: Int) ! Format.Emit {
+    let name = np_name.get(node).unwrap()
+    let methods_sl = np_methods.get(node).unwrap()
+    fmt_emit("handler {name} \{")
+    fmt_indent = fmt_indent + 1
+    if methods_sl != -1 {
+        let mut mi = 0
+        while mi < sublist_length(methods_sl) {
+            let m = sublist_get(methods_sl, mi)
+            format_fn_def(m)
+            mi = mi + 1
+        }
+    }
+    fmt_indent = fmt_indent - 1
+    fmt_emit("}")
+}
+
 // ── Wrapped emission helpers ────────────────────────────────────────
 
 fn emit_call_wrapped(node: Int, prefix: Str) ! Format.Emit {
@@ -1316,6 +1333,29 @@ fn format_match_arm(node: Int) ! Format.Emit {
 fn format_with_block(node: Int) ! Format.Emit {
     let handlers_sl = np_handlers.get(node).unwrap()
     let body = np_body.get(node).unwrap()
+    if handlers_sl != -1 && sublist_length(handlers_sl) == 1 {
+        let h = sublist_get(handlers_sl, 0)
+        if np_kind.get(h).unwrap() == NodeKind.HandlerExpr {
+            let hname = np_name.get(h).unwrap()
+            let methods_sl = np_methods.get(h).unwrap()
+            fmt_emit("with handler {hname} \{")
+            fmt_indent = fmt_indent + 1
+            if methods_sl != -1 {
+                let mut mi = 0
+                while mi < sublist_length(methods_sl) {
+                    format_fn_def(sublist_get(methods_sl, mi))
+                    mi = mi + 1
+                }
+            }
+            fmt_indent = fmt_indent - 1
+            fmt_emit("} \{")
+            fmt_indent = fmt_indent + 1
+            format_block_body(body)
+            fmt_indent = fmt_indent - 1
+            fmt_emit("}")
+            return
+        }
+    }
     let mut line = "with "
     if handlers_sl != -1 {
         let mut i = 0

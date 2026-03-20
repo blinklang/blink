@@ -1106,11 +1106,46 @@ fn emit_unaryop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag
             if cg_current_fn_ret != CT_OPTION {
                 diag_error_at("QuestionMarkOptionInNonOption", "E0509", "'?' on Option in function '{cg_current_fn_name}' which does not return Option", node, "change the return type to Option")
                 diag_set_last_fix("replace", "-> Option[T]")
+                expr_result_str = "0"
+                expr_result_type = CT_INT
             } else {
-                diag_error_at("QuestionMarkInvalidOperand", "E0502", "'?' on Option is not yet supported, use '??' instead", node, "")
+                let opt_inner = expr_option_inner
+                let opt_inner_s = expr_option_inner_struct
+                let fsi = get_fn_ret_struct_inner(cg_current_fn_name)
+                if opt_inner_s != "" {
+                    let opt_c = struct_option_c_type(opt_inner_s)
+                    emit_line("{opt_c} {tmp} = {operand_str};")
+                    if fsi.ok_struct != "" {
+                        let fn_opt_c = struct_option_c_type(fsi.ok_struct)
+                        emit_line("if ({tmp}.tag == 0) return ({fn_opt_c})\{.tag = 0};")
+                    } else {
+                        let fn_inner = if cg_current_fn_option_inner != 0 { cg_current_fn_option_inner } else { CT_INT }
+                        let fn_opt_c = option_c_type(fn_inner)
+                        emit_line("if ({tmp}.tag == 0) return ({fn_opt_c})\{.tag = 0};")
+                    }
+                    expr_result_str = "{tmp}.value"
+                    expr_result_type = CT_INT
+                    set_var_struct(expr_result_str, opt_inner_s)
+                    expr_option_inner = -1
+                    expr_option_inner_struct = ""
+                } else {
+                    let inner = if opt_inner >= 0 { opt_inner } else { CT_INT }
+                    let opt_c = option_c_type(inner)
+                    emit_line("{opt_c} {tmp} = {operand_str};")
+                    if fsi.ok_struct != "" {
+                        let fn_opt_c = struct_option_c_type(fsi.ok_struct)
+                        emit_line("if ({tmp}.tag == 0) return ({fn_opt_c})\{.tag = 0};")
+                    } else {
+                        let fn_inner = if cg_current_fn_option_inner != 0 { cg_current_fn_option_inner } else { CT_INT }
+                        let fn_opt_c = option_c_type(fn_inner)
+                        emit_line("if ({tmp}.tag == 0) return ({fn_opt_c})\{.tag = 0};")
+                    }
+                    expr_result_str = "{tmp}.value"
+                    expr_result_type = inner
+                    expr_option_inner = -1
+                    expr_option_inner_struct = ""
+                }
             }
-            expr_result_str = "0"
-            expr_result_type = CT_INT
         } else {
             diag_error_at("QuestionMarkInvalidOperand", "E0502", "'?' requires a Result or Option value", node, "")
             expr_result_str = "0"

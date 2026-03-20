@@ -355,7 +355,7 @@ pub fn diag_explain(code: Str) -> Str {
         return "E0501 -- InsufficientCapability\n\nA function uses an effect that is not listed in the module's\n@capabilities budget.\n\nFix: add the effect to the @capabilities annotation at the top of\nyour module.\n\n  @capabilities(IO, Net)\n  fn fetch() ! IO, Net \{ ... \}  // OK -- both in budget"
     }
     if code == "E0502" {
-        return "E0502 -- InvalidOperand for ? or ??\n\nThe '?' or '??' operator was used on a value that is not the\nexpected type. '?' requires Result or Option, '??' requires Option.\n\nCommon causes:\n  - Using '?' on a plain value instead of a Result or Option\n  - Using '??' on a Result instead of an Option\n  - Using '?' on Option (not yet supported -- use '??' instead)\n\n  let val = some_option ?? \"default\"  // OK\n  let res = try_parse()?              // OK -- ? on Result"
+        return "E0502 -- InvalidOperand for ? or ??\n\nThe '?' or '??' operator was used on a value that is not the\nexpected type. '?' requires Result or Option, '??' requires Option.\n\nCommon causes:\n  - Using '?' on a plain value instead of a Result or Option\n  - Using '??' on a Result instead of an Option\n\n  let val = some_option ?? \"default\"  // OK\n  let res = try_parse()?              // OK -- ? on Result\n  let inner = some_option?            // OK -- ? on Option (in Option-returning fn)"
     }
     if code == "E0504" {
         return "E0504 -- UndefinedFunction\n\nA function was called that has not been defined or imported.\n\nCommon causes:\n  - Typo in the function name\n  - Forgetting to import the module that defines the function\n  - The function is private (not pub) in another module\n\nFix: check the function name spelling, or add the appropriate import.\n\n  import math\n  let x = math.sqrt(4.0)  // OK -- imported"
@@ -374,6 +374,9 @@ pub fn diag_explain(code: Str) -> Str {
     }
     if code == "E0509" {
         return "E0509 -- QuestionMarkOptionInNonOption\n\nThe '?' operator was used on an Option value inside a function that\ndoes not return Option.\n\nFix: change the function's return type to Option[T].\n\n  fn find(items: List[Str], key: Str) -> Option[Str] \{\n      items.get(0)?  // OK -- function returns Option\n  \}"
+    }
+    if code == "E0512" {
+        return "E0512 -- QuestionMarkErrorMismatch\n\nThe '?' operator was used on a Result whose error type does not\nmatch the enclosing function's return error type.\n\nFix: ensure both error types are the same, or convert the error.\n\n  fn parse(s: Str) -> Result[Int, ParseError] \{ ... \}\n\n  fn caller() -> Result[Str, ParseError] \{\n      let n = parse(\"42\")?  // OK -- both use ParseError\n      Ok(n.to_string())\n  \}"
     }
     if code == "E1003" {
         return "E1003 -- PrivateItemAccess\n\nAn attempt was made to access a private (non-pub) item from another\nmodule.\n\nFix: either mark the item as 'pub' in its module, or use the\nmodule's public API instead.\n\n  // in math.pact\n  pub fn sqrt(x: Float) -> Float \{ ... \}  // accessible\n  fn helper() \{ ... \}                      // private"

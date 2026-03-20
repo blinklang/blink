@@ -334,16 +334,14 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
                 let dfn = "pact_ue_{ue.handle}_default_{uem.name}"
                 if uem.ret == "void" {
                     cg_lines.push("static void {dfn}({uem.params}) \{")
-                    cg_lines.push("    fprintf(stderr, \"pact: {ue.handle}.{uem.name} not implemented\\n\");")
+                    cg_lines.push("    (void)0;")
                     cg_lines.push("}")
                 } else if uem.ret == "const char*" {
                     cg_lines.push("static const char* {dfn}({uem.params}) \{")
-                    cg_lines.push("    fprintf(stderr, \"pact: {ue.handle}.{uem.name} not implemented\\n\");")
                     cg_lines.push("    return NULL;")
                     cg_lines.push("}")
                 } else {
                     cg_lines.push("static {uem.ret} {dfn}({uem.params}) \{")
-                    cg_lines.push("    fprintf(stderr, \"pact: {ue.handle}.{uem.name} not implemented\\n\");")
                     cg_lines.push("    return 0;")
                     cg_lines.push("}")
                 }

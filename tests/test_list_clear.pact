@@ -1,0 +1,44 @@
+test "List.clear empties the list" {
+    let mut items = [1, 2, 3]
+    items.clear()
+    assert_eq(items.len(), 0)
+    assert_eq(items.is_empty(), true)
+}
+
+test "List.clear on empty list is a no-op" {
+    let mut items: List[Int] = []
+    items.clear()
+    assert_eq(items.len(), 0)
+    assert_eq(items.is_empty(), true)
+}
+
+test "List.clear then push reuses list" {
+    let mut items = [10, 20, 30]
+    items.clear()
+    items.push(42)
+    assert_eq(items.len(), 1)
+    assert_eq(items.get(0).unwrap(), 42)
+}
+
+test "Map.clear empties the map" {
+    let mut m: Map[Str, Int] = Map()
+    m.set("a", 1)
+    m.set("b", 2)
+    m.clear()
+    assert_eq(m.len(), 0)
+}
+
+test "Map.clear on empty map is a no-op" {
+    let mut m: Map[Str, Int] = Map()
+    m.clear()
+    assert_eq(m.len(), 0)
+}
+
+test "Map.clear then insert reuses map" {
+    let mut m: Map[Str, Int] = Map()
+    m.set("x", 99)
+    m.clear()
+    m.set("y", 42)
+    assert_eq(m.len(), 1)
+    assert_eq(m.get("y"), 42)
+}
