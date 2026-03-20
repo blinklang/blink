@@ -1075,12 +1075,12 @@ fn emit_unaryop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag
                 let rerr = expr_result_err_type
                 let rok_s = expr_result_ok_struct
                 let rerr_s = expr_result_err_struct
+                let fn_rt = get_fn_ret_type(cg_current_fn_name)
                 if rok_s != "" || rerr_s != "" {
                     let res_c = result_c_type_mixed(rok, rerr, rok_s, rerr_s)
                     let fn_fsi = get_fn_ret_struct_inner(cg_current_fn_name)
                     let fn_ok_s = fn_fsi.ok_struct
                     let fn_err_s = fn_fsi.err_struct
-                    let fn_rt = get_fn_ret_type(cg_current_fn_name)
                     let fn_res_c = result_c_type_mixed(tp_child1_kind(fn_rt.tp_id), tp_child2_kind(fn_rt.tp_id), fn_ok_s, fn_err_s)
                     emit_line("{res_c} {tmp} = {operand_str};")
                     emit_line("if ({tmp}.tag == 1) return ({fn_res_c})\{.tag = 1, .err = {tmp}.err};")
@@ -1095,8 +1095,9 @@ fn emit_unaryop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag
                     expr_result_err_struct = ""
                 } else {
                     let res_c = result_c_type(rok, rerr)
+                    let fn_res_c = result_c_type(tp_child1_kind(fn_rt.tp_id), tp_child2_kind(fn_rt.tp_id))
                     emit_line("{res_c} {tmp} = {operand_str};")
-                    emit_line("if ({tmp}.tag == 1) return ({res_c})\{.tag = 1, .err = {tmp}.err};")
+                    emit_line("if ({tmp}.tag == 1) return ({fn_res_c})\{.tag = 1, .err = {tmp}.err};")
                     expr_result_str = "{tmp}.ok"
                     expr_result_type = rok
                 }

@@ -2042,9 +2042,20 @@ pub fn get_variant_field_type_str(variant_idx: Int, field_idx: Int) -> Option[St
     }
     let mut _seg_start = 0
     let mut _seg_idx = 0
+    let mut bracket_depth = 0
     let mut i = 0
     while i <= types_str.len() {
-        if i == types_str.len() || types_str.char_at(i) == 44 {
+        if i == types_str.len() {
+            if _seg_idx == field_idx {
+                return Some(types_str.substr(_seg_start, i - _seg_start))
+            }
+            _seg_start = i + 1
+            _seg_idx = _seg_idx + 1
+        } else if types_str.char_at(i) == 91 {
+            bracket_depth = bracket_depth + 1
+        } else if types_str.char_at(i) == 93 {
+            bracket_depth = bracket_depth - 1
+        } else if types_str.char_at(i) == 44 && bracket_depth == 0 {
             if _seg_idx == field_idx {
                 return Some(types_str.substr(_seg_start, i - _seg_start))
             }

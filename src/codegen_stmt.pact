@@ -288,9 +288,48 @@ pub fn emit_match_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scop
         if match_struct_name == "" {
             match_struct_name = get_fn_ret_struct(cg_current_fn_name)
         }
+        if match_struct_name == "" && saved_ok_struct != "" {
+            let first_body = np_body.get(first_arm).unwrap()
+            if first_body != -1 {
+                let fb_kind = np_kind.get(first_body).unwrap()
+                let mut check_node = first_body
+                if fb_kind == NodeKind.ExprStmt {
+                    check_node = np_value.get(first_body).unwrap()
+                }
+                if np_kind.get(check_node).unwrap() == NodeKind.Ident {
+                    let ib_type = infer_arm_body_from_pattern(first_arm, check_node)
+                    if ib_type >= 0 {
+                        match_struct_name = saved_ok_struct
+                    }
+                }
+            }
+        }
     }
     if match_struct_name != "" {
         emit_line("{c_type_c_name(match_struct_name)} {result_var};")
+    } else if result_type == CT_RESULT {
+        let rt = get_fn_ret_type(cg_current_fn_name)
+        let fsi = get_fn_ret_struct_inner(cg_current_fn_name)
+        let rt_c1 = tp_child1_kind(rt.tp_id)
+        let rt_c2 = tp_child2_kind(rt.tp_id)
+        if fsi.ok_struct != "" || fsi.err_struct != "" {
+            emit_line("{result_c_type_mixed(rt_c1, rt_c2, fsi.ok_struct, fsi.err_struct)} {result_var};")
+        } else if rt_c1 >= 0 {
+            emit_line("{result_c_type(rt_c1, rt_c2)} {result_var};")
+        } else {
+            emit_line("{result_c_type(CT_INT, CT_STRING)} {result_var};")
+        }
+    } else if result_type == CT_OPTION {
+        let rt = get_fn_ret_type(cg_current_fn_name)
+        let fsi = get_fn_ret_struct_inner(cg_current_fn_name)
+        let rt_c1 = tp_child1_kind(rt.tp_id)
+        if fsi.ok_struct != "" {
+            emit_line("{struct_option_c_type(fsi.ok_struct)} {result_var};")
+        } else if rt_c1 >= 0 {
+            emit_line("{option_c_type(rt_c1)} {result_var};")
+        } else {
+            emit_line("{option_c_type(CT_INT)} {result_var};")
+        }
     } else if result_type != CT_VOID {
         emit_line("{c_type_str(result_type)} {result_var};")
     }
@@ -344,7 +383,7 @@ pub fn emit_match_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scop
                 emit_line("if ({guard_str}) \{")
                 cg_indent = cg_indent + 1
                 let arm_val = emit_arm_value(np_body.get(arm).unwrap())
-                if result_type != CT_VOID || match_struct_name != "" {
+                if (result_type != CT_VOID || match_struct_name != "") && !(match_struct_name != "" && arm_val == "0") {
                     emit_line("{result_var} = {arm_val};")
                 } else if arm_val != "0" && arm_val != "" {
                     emit_line("(void){arm_val};")
@@ -354,7 +393,7 @@ pub fn emit_match_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scop
                 emit_line("}")
             } else {
                 let arm_val = emit_arm_value(np_body.get(arm).unwrap())
-                if result_type != CT_VOID || match_struct_name != "" {
+                if (result_type != CT_VOID || match_struct_name != "") && !(match_struct_name != "" && arm_val == "0") {
                     emit_line("{result_var} = {arm_val};")
                 } else if arm_val != "0" && arm_val != "" {
                     emit_line("(void){arm_val};")
@@ -381,7 +420,7 @@ pub fn emit_match_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scop
             let arm_val = emit_arm_value(np_body.get(arm).unwrap())
             match_scruts = saved_match_scruts
             match_scrut_enum = saved_match_scrut_enum
-            if result_type != CT_VOID || match_struct_name != "" {
+            if (result_type != CT_VOID || match_struct_name != "") && !(match_struct_name != "" && arm_val == "0") {
                 emit_line("{result_var} = {arm_val};")
             } else if arm_val != "0" && arm_val != "" {
                 emit_line("(void){arm_val};")
@@ -398,6 +437,37 @@ pub fn emit_match_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scop
         set_var_struct(result_var, match_struct_name)
         expr_result_str = result_var
         expr_result_type = CT_VOID
+    } else if result_type == CT_RESULT {
+        set_var(result_var, result_type, 1)
+        let rt2 = get_fn_ret_type(cg_current_fn_name)
+        let fsi2 = get_fn_ret_struct_inner(cg_current_fn_name)
+        let rt2_c1 = tp_child1_kind(rt2.tp_id)
+        let rt2_c2 = tp_child2_kind(rt2.tp_id)
+        if fsi2.ok_struct != "" || fsi2.err_struct != "" {
+            set_var_result_struct(result_var, rt2_c1, rt2_c2, fsi2.ok_struct, fsi2.err_struct)
+            expr_result_ok_struct = fsi2.ok_struct
+            expr_result_err_struct = fsi2.err_struct
+        } else {
+            set_var_result(result_var, rt2_c1, rt2_c2)
+        }
+        expr_result_ok_type = rt2_c1
+        expr_result_err_type = rt2_c2
+        expr_result_str = result_var
+        expr_result_type = result_type
+    } else if result_type == CT_OPTION {
+        set_var(result_var, result_type, 1)
+        let rt3 = get_fn_ret_type(cg_current_fn_name)
+        let fsi3 = get_fn_ret_struct_inner(cg_current_fn_name)
+        let rt3_c1 = tp_child1_kind(rt3.tp_id)
+        if fsi3.ok_struct != "" {
+            set_var_option_struct(result_var, rt3_c1, fsi3.ok_struct)
+            expr_option_inner_struct = fsi3.ok_struct
+        } else {
+            set_var_option(result_var, rt3_c1)
+        }
+        expr_option_inner = rt3_c1
+        expr_result_str = result_var
+        expr_result_type = result_type
     } else if result_type != CT_VOID {
         set_var(result_var, result_type, 1)
         expr_result_str = result_var
@@ -3390,6 +3460,25 @@ pub fn emit_struct_typedef(td_node: Int) ! Codegen.Emit {
     }
 }
 
+fn build_type_name_from_ann(ann: Int) -> Str {
+    let name = np_name.get(ann).unwrap()
+    let elems = np_elements.get(ann).unwrap()
+    if elems == -1 || sublist_length(elems) == 0 {
+        return name
+    }
+    let mut params = ""
+    let mut i = 0
+    while i < sublist_length(elems) {
+        if i > 0 {
+            params = params.concat(", ")
+        }
+        let inner = sublist_get(elems, i)
+        params = params.concat(build_type_name_from_ann(inner))
+        i = i + 1
+    }
+    "{name}[{params}]"
+}
+
 pub fn emit_enum_typedef(td_node: Int) ! Codegen.Emit {
     let name = np_name.get(td_node).unwrap()
     let flds_sl = np_fields.get(td_node).unwrap()
@@ -3426,13 +3515,7 @@ pub fn emit_enum_typedef(td_node: Int) ! Codegen.Emit {
                 let vf_type_ann = np_value.get(vf).unwrap()
                 let mut vf_type_name = "Int"
                 if vf_type_ann != -1 {
-                    vf_type_name = np_name.get(vf_type_ann).unwrap()
-                    let vf_elems = np_elements.get(vf_type_ann).unwrap()
-                    if vf_elems != -1 && sublist_length(vf_elems) > 0 {
-                        let inner_ann = sublist_get(vf_elems, 0)
-                        let inner_type_name = np_name.get(inner_ann).unwrap()
-                        vf_type_name = "{vf_type_name}[{inner_type_name}]"
-                    }
+                    vf_type_name = build_type_name_from_ann(vf_type_ann)
                 }
                 if fi > 0 {
                     field_names = field_names.concat(",")
