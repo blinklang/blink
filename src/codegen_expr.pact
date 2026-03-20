@@ -2118,9 +2118,9 @@ fn emit_list_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
             let e_type = expr_result_type
             if i == 0 {
                 first_elem_type = e_type
-                first_elem_struct = get_var_struct(e_str)
+                first_elem_struct = resolve_push_struct(e_str, tmp)
             }
-            let e_struct = get_var_struct(e_str)
+            let e_struct = resolve_push_struct(e_str, tmp)
             if e_type == CT_VOID && e_struct != "" {
                 let box_tmp = fresh_temp("_box")
                 emit_line("{c_type_c_name(e_struct)}* {box_tmp} = ({c_type_c_name(e_struct)}*)pact_alloc(sizeof({c_type_c_name(e_struct)}));")

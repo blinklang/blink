@@ -4,7 +4,7 @@ import diagnostics
 // Arg offset for trait-qualified builtin calls: MapOps.has(m, k) has receiver at args[0]
 let mut btc_arg_offset: Int = 0
 
-fn resolve_push_struct(val_str: Str, list_name: Str) -> Str {
+pub fn resolve_push_struct(val_str: Str, list_name: Str) -> Str {
     let s = get_var_struct(val_str)
     if s != "" {
         return s
@@ -885,7 +885,8 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                 }
                 init_str = init_str.concat("}")
                 expr_result_str = init_str
-                expr_result_type = CT_INT
+                expr_result_type = CT_VOID
+                set_var_struct(init_str, mc_obj_name)
                 return
             }
         }
