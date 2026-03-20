@@ -2515,23 +2515,27 @@ pub fn lookup_builtin_trait_impl(trait_name: Str, ct_type: Int) -> Int {
     0
 }
 
-pub fn get_impl_method_ret(type_name: Str, method: Str) -> Int {
-    let mut m = -1
+fn find_impl_method_node(type_name: Str, method: Str) -> Int {
     let mut i = 0
     while i < impl_entries.len() {
         let ie = impl_entries.get(i).unwrap()
         if ie.type_name == type_name {
             let mut j = 0
             while j < sublist_length(ie.methods_sl) {
-                let candidate = sublist_get(ie.methods_sl, j)
-                if np_name.get(candidate).unwrap() == method {
-                    m = candidate
+                let m = sublist_get(ie.methods_sl, j)
+                if np_name.get(m).unwrap() == method {
+                    return m
                 }
                 j = j + 1
             }
         }
         i = i + 1
     }
+    -1
+}
+
+pub fn get_impl_method_ret(type_name: Str, method: Str) -> Int {
+    let m = find_impl_method_node(type_name, method)
     if m == -1 { return CT_VOID }
     let ret_str = np_return_type.get(m).unwrap()
     let ret_ct = type_from_name(ret_str)
@@ -2558,9 +2562,12 @@ pub fn get_impl_method_ret(type_name: Str, method: Str) -> Int {
             if elems_sl != -1 && sublist_length(elems_sl) >= 1 {
                 let inner_ann = sublist_get(elems_sl, 0)
                 let inner_name = np_name.get(inner_ann).unwrap()
-                expr_option_inner = type_from_name(inner_name)
+                let inner_t = type_from_name(inner_name)
+                expr_option_inner = inner_t
                 if is_struct_type(inner_name) != 0 || is_enum_type(inner_name) != 0 {
                     expr_option_inner_struct = inner_name
+                } else if is_compound_ct(inner_t) != 0 {
+                    expr_option_inner_struct = compound_name_from_ann(inner_ann)
                 }
             }
         }

@@ -68,7 +68,7 @@ fn main() {
         return
     }
 
-    shell_exec("cc -o build/_test_ig_main build/_test_ig_main.c -lm 2>&1 || true")
+    shell_exec("cc -o build/_test_ig_main build/_test_ig_main.c -lm -lgc 2>&1 || true")
     shell_exec("build/_test_ig_main > build/_test_ig_output.txt 2>&1 || true")
     let output = read_file("build/_test_ig_output.txt")
     if output.starts_with("hello-from-git") {
@@ -91,7 +91,7 @@ fn main() {
         return
     }
 
-    shell_exec("cc -o build/_test_ig_main2 build/_test_ig_main2.c -lm 2>&1 || true")
+    shell_exec("cc -o build/_test_ig_main2 build/_test_ig_main2.c -lm -lgc 2>&1 || true")
     shell_exec("build/_test_ig_main2 > build/_test_ig_output2.txt 2>&1 || true")
     let output2 = read_file("build/_test_ig_output2.txt")
     if output2.starts_with("util-from-git") {

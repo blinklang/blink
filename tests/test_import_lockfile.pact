@@ -32,7 +32,7 @@ fn main() {
     }
 
     // Compile C to binary and run
-    shell_exec("cc -o build/_test_import_lockfile build/_test_import_lockfile.c -lm 2>&1 || true")
+    shell_exec("cc -o build/_test_import_lockfile build/_test_import_lockfile.c -lm -lgc 2>&1 || true")
     shell_exec("build/_test_import_lockfile > build/_test_il_output.txt 2>&1 || true")
 
     let output = read_file("build/_test_il_output.txt")
@@ -57,7 +57,7 @@ fn main() {
         return
     }
 
-    shell_exec("cc -o build/_test_import_lockfile2 build/_test_import_lockfile2.c -lm 2>&1 || true")
+    shell_exec("cc -o build/_test_import_lockfile2 build/_test_import_lockfile2.c -lm -lgc 2>&1 || true")
     shell_exec("build/_test_import_lockfile2 > build/_test_il_output2.txt 2>&1 || true")
 
     let output2 = read_file("build/_test_il_output2.txt")
@@ -84,7 +84,7 @@ fn main() {
     }
 
     if c_twoseg.len() > 0 {
-        shell_exec("cc -o build/_test_il_twoseg build/_test_il_twoseg.c -lm 2>&1 || true")
+        shell_exec("cc -o build/_test_il_twoseg build/_test_il_twoseg.c -lm -lgc 2>&1 || true")
         shell_exec("build/_test_il_twoseg > build/_test_il_twoseg_out.txt 2>&1 || true")
         let out_twoseg = read_file("build/_test_il_twoseg_out.txt")
         if out_twoseg.starts_with("got-it") {
@@ -110,7 +110,7 @@ fn main() {
     }
 
     if c_shadow.len() > 0 {
-        shell_exec("cc -o build/_test_il_shadow build/_test_il_shadow.c -lm 2>&1 || true")
+        shell_exec("cc -o build/_test_il_shadow build/_test_il_shadow.c -lm -lgc 2>&1 || true")
         shell_exec("build/_test_il_shadow > build/_test_il_shadow_out.txt 2>&1 || true")
         let out_shadow = read_file("build/_test_il_shadow_out.txt")
         if out_shadow.starts_with("hello-from-local") {
@@ -142,7 +142,7 @@ fn main() {
     }
 
     if c_trans.len() > 0 {
-        shell_exec("cc -o build/_test_il_trans build/_test_il_trans.c -lm 2>&1 || true")
+        shell_exec("cc -o build/_test_il_trans build/_test_il_trans.c -lm -lgc 2>&1 || true")
         shell_exec("build/_test_il_trans > build/_test_il_trans_out.txt 2>&1 || true")
         let out_trans = read_file("build/_test_il_trans_out.txt")
         if out_trans.starts_with("from-libb") {

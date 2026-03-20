@@ -54,7 +54,7 @@ fn main() {
     }
 
     if c_content.len() > 0 {
-        shell_exec("cc -o build/_test_ld build/_test_ld.c -lm 2>&1 || true")
+        shell_exec("cc -o build/_test_ld build/_test_ld.c -lm -lgc 2>&1 || true")
         let run_result = process_run("sh", ["-c", "build/_test_ld"])
         let output = trim_newlines(run_result.out)
         if output == "found-it" {
