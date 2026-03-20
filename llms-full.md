@@ -1,8 +1,16 @@
 # Pact Language Reference
 
-> Pact is a statically-typed, effect-tracked language compiling to C. **Compiler v0.23.0**.
+> Pact is a statically-typed, effect-tracked language compiling to C. **Compiler v0.23.1**.
 
-## What's New (v0.23)
+## What's New (v0.23.1)
+
+| Change | Details |
+|--------|---------|
+| Recursive self-ref enums | Data enum variants can now reference the parent type directly (e.g. `Add(left: Expr, right: Expr)` inside `type Expr`). Fields are auto-boxed via heap allocation. |
+| Data enum list literals | `[Value.Text("x"), Value.Num(42)]` now correctly heap-allocates enum values instead of invalid intptr_t cast. |
+| `?` operator fix | `?` on Result now emits correct Result type when the enclosing function returns a struct. |
+
+### Prior: What's New (v0.23)
 
 | Change | Details |
 |--------|---------|

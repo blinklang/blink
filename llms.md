@@ -4,7 +4,11 @@
 
 Targets native binaries via C codegen.
 
-## What's New (v0.23)
+## What's New (v0.23.1)
+
+- **Fixes** — recursive self-referencing data enum variants, data enum values in list literals, `?` operator Result type when fn returns struct
+
+### Prior: What's New (v0.23)
 
 - **`?` operator on `Option[T]`** — propagates None in Option-returning functions (mirrors Result `?`)
 - **User-defined effects** — `effect` declarations with sub-effects, `with handler` blocks, namespaced dispatch (`metrics.counter(...)`)
