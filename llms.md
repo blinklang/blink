@@ -4,7 +4,15 @@
 
 Targets native binaries via C codegen.
 
-## What's New (v0.22)
+## What's New (v0.23)
+
+- **`?` operator on `Option[T]`** — propagates None in Option-returning functions (mirrors Result `?`)
+- **User-defined effects** — `effect` declarations with sub-effects, `with handler` blocks, namespaced dispatch (`metrics.counter(...)`)
+- **Boehm GC** — automatic garbage collection via libgc, replaces manual memory management
+- **`List.clear()` / `Map.clear()`** — in-place mutation to empty collections
+- **Fixes** — Result/Option type resolution in match/? expressions, impl method return types, enum variant codegen
+
+### Prior: What's New (v0.22)
 
 - **`TcpSocket` / `TcpListener` types** — typed wrappers for TCP file descriptors with trait-based methods (`read`, `read_all`, `write`, `close`, `set_timeout`)
 - **`std.net` TCP stdlib** — `tcp_listen`, `tcp_connect`, `tcp_accept`, `tcp_read`, `tcp_write`, `tcp_close`, `tcp_set_timeout`, `tcp_read_all`

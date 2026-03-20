@@ -1,8 +1,18 @@
 # Pact Language Reference
 
-> Pact is a statically-typed, effect-tracked language compiling to C. **Compiler v0.22.0**.
+> Pact is a statically-typed, effect-tracked language compiling to C. **Compiler v0.23.0**.
 
-## What's New (v0.22)
+## What's New (v0.23)
+
+| Change | Details |
+|--------|---------|
+| `?` on `Option[T]` | `let v = opt_expr?` — returns None if None, unwraps if Some. Function must return `Option[T]`. |
+| User-defined effects | `effect Name { effect Sub { fn op(...) } }` — declare custom effects. `with handler Name { fn op(...) { ... } } { body }` — handle them. Namespaced dispatch: `name.op(...)`. |
+| Boehm GC | Automatic garbage collection via libgc. All allocations GC-managed. No manual free needed. |
+| `List.clear()` / `Map.clear()` | In-place clear of collection contents. Returns Void. |
+| Codegen fixes | Result/Option type resolution in match/`?`/enum variants, impl method return types |
+
+### Prior: What's New (v0.22)
 
 | Change | Details |
 |--------|---------|
@@ -593,6 +603,7 @@ net.set_timeout(fd, ms)         // -> Void (set read timeout)
 | `.take(n)` | Iterator[T] | First n |
 | `.skip(n)` | Iterator[T] | Skip first n |
 | `.collect()` | List[T] | Iterator to list |
+| `.clear()` | Void | Remove all elements (mutates) |
 
 ## Map[K, V] Methods
 
@@ -606,6 +617,7 @@ net.set_timeout(fd, ms)         // -> Void (set read timeout)
 | `.len()` | Int | Entry count |
 | `.keys()` | List[K] | All keys |
 | `.values()` | List[V] | All values |
+| `.clear()` | Void | Remove all entries (mutates) |
 
 ## Set[T] Methods
 
@@ -661,6 +673,8 @@ net.set_timeout(fd, ms)         // -> Void (set read timeout)
 | `.is_none()` | Bool | Empty? |
 
 Use `??` operator for safe unwrap with default: `opt_val ?? "default"`
+
+Use `?` operator to propagate None: `let val = opt_fn()?` (in Option-returning fn)
 
 ## Result[T, E] Methods
 
@@ -854,6 +868,48 @@ if result.exit_code == 0 {
     io.println("Commit: {result.out.trim()}")
 }
 ```
+
+## User-Defined Effects
+
+Declare custom effects with `effect` blocks. Sub-effects group related operations.
+
+```pact
+effect Metrics {
+    effect Emit {
+        fn counter(name: Str, value: Int)
+        fn gauge(name: Str, value: Float)
+    }
+    effect Query {
+        fn get_counter(name: Str) -> Int
+    }
+}
+```
+
+Use effects via namespaced dispatch:
+
+```pact
+fn record(name: Str, val: Int) ! Metrics.Emit {
+    metrics.counter(name, val)
+}
+```
+
+Handle effects with `with handler`:
+
+```pact
+with handler Metrics {
+    fn counter(name: Str, value: Int) {
+        io.println("captured: {name} = {value}")
+    }
+    fn gauge(_name: Str, _value: Float) {}
+    fn get_counter(_name: Str) -> Int { 42 }
+} {
+    metrics.counter("requests", 1)  // intercepted by handler
+    let v = metrics.get_counter("requests")  // returns 42
+}
+// after with-block, default handler restored
+```
+
+Handlers nest — inner handlers shadow outer ones for the same effect.
 
 ## Standard Library
 
