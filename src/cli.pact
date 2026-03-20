@@ -485,7 +485,14 @@ fn resolve_vendored_objects(has_sqlite: Int, debug_mode: Int, release_mode: Int,
             let obj_mt = file_mtime(o_path)
             if obj_mt < src_mt || src_mt == -1 {
                 let tmp_path = "{o_path}.{getpid()}.tmp"
-                let rc = run_cc("-c -o {tmp_path} -I{gc_inc} -DGC_THREADS -DGC_BUILTIN_ATOMIC -DUSE_MMAP -DUSE_MUNMAP {gc_src}", debug_mode, release_mode, target)
+                let mut gc_extra_flags = ""
+                if target.contains("macos") {
+                    let stubs = "{gc_inc}/zig-stubs"
+                    if file_exists("{stubs}/mach/exception.h") == 1 {
+                        gc_extra_flags = "-I{stubs} -DNO_MPROTECT_VDB"
+                    }
+                }
+                let rc = run_cc("-c -o {tmp_path} {gc_extra_flags} -I{gc_inc} -DGC_THREADS -DGC_BUILTIN_ATOMIC -DUSE_MMAP -DUSE_MUNMAP {gc_src}", debug_mode, release_mode, target)
                 if rc != 0 {
                     shell_exec("rm -f {tmp_path}")
                     io.println("error: compiling vendored gc failed")
@@ -547,6 +554,12 @@ fn resolve_vendored_includes(has_sqlite: Int, target: Str) -> Str {
     if target != "" {
         let gc_inc = resolve_gc_include()
         if gc_inc != "" {
+            if target.contains("macos") {
+                let stubs = "{gc_inc}/zig-stubs"
+                if file_exists("{stubs}/mach/exception.h") == 1 {
+                    includes.push("-I{stubs}")
+                }
+            }
             includes.push("-I{gc_inc}")
         }
     }
