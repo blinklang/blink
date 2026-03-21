@@ -1254,7 +1254,7 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
     let func_node = np_left.get(node).unwrap()
     let func_kind = np_kind.get(func_node).unwrap()
     if func_kind == NodeKind.Ident {
-        let fn_name = np_name.get(func_node).unwrap()
+        let fn_name = resolve_import_alias(np_name.get(func_node).unwrap())
         let call_line = np_line.get(func_node).unwrap()
 
         if fn_name == "assert" {

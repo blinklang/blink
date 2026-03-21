@@ -573,24 +573,33 @@ pub fn c_safe_name(name: Str) -> Str {
     name
 }
 
+pub fn resolve_import_alias(name: Str) -> Str {
+    if tc_alias_to_original.has(name) {
+        return tc_alias_to_original.get(name)
+    }
+    name
+}
+
 pub fn c_fn_name(name: Str) -> Str {
-    if mod_fn_prefix.has(name) {
-        let prefix = mod_fn_prefix.get(name)
+    let resolved = resolve_import_alias(name)
+    if mod_fn_prefix.has(resolved) {
+        let prefix = mod_fn_prefix.get(resolved)
         if prefix != "" {
-            return "pact_{prefix}_{name}"
+            return "pact_{prefix}_{resolved}"
         }
     }
-    "pact_{name}"
+    "pact_{resolved}"
 }
 
 pub fn c_type_c_name(name: Str) -> Str {
-    if mod_type_prefix.has(name) {
-        let prefix = mod_type_prefix.get(name)
+    let resolved = resolve_import_alias(name)
+    if mod_type_prefix.has(resolved) {
+        let prefix = mod_type_prefix.get(resolved)
         if prefix != "" {
-            return "pact_{prefix}_{name}"
+            return "pact_{prefix}_{resolved}"
         }
     }
-    "pact_{name}"
+    "pact_{resolved}"
 }
 
 // Capture analysis: per-capture info (flat list) and per-closure start/count

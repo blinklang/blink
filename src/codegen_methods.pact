@@ -448,6 +448,24 @@ fn emit_list_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int 
         expr_result_type = CT_STRING
         return 1
     }
+    if method == "concat" {
+        let args_sl = np_args.get(node).unwrap()
+        emit_expr(sublist_get(args_sl, btc_arg_offset))
+        let other_str = expr_result_str
+        expr_result_str = "pact_list_concat({obj_str}, {other_str})"
+        expr_result_type = CT_LIST
+        return 1
+    }
+    if method == "slice" {
+        let args_sl = np_args.get(node).unwrap()
+        emit_expr(sublist_get(args_sl, btc_arg_offset))
+        let start_str = expr_result_str
+        emit_expr(sublist_get(args_sl, 1 + btc_arg_offset))
+        let end_str = expr_result_str
+        expr_result_str = "pact_list_slice({obj_str}, {start_str}, {end_str})"
+        expr_result_type = CT_LIST
+        return 1
+    }
     0
 }
 
@@ -515,7 +533,7 @@ fn emit_map_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int !
         emit_expr(sublist_get(args_sl, btc_arg_offset))
         let key_str = expr_result_str
         expr_result_str = "pact_map_has({obj_str}, {key_str})"
-        expr_result_type = CT_INT
+        expr_result_type = CT_BOOL
         return 1
     }
     if method == "remove" {
@@ -523,7 +541,7 @@ fn emit_map_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int !
         emit_expr(sublist_get(args_sl, btc_arg_offset))
         let key_str = expr_result_str
         expr_result_str = "pact_map_remove({obj_str}, {key_str})"
-        expr_result_type = CT_INT
+        expr_result_type = CT_BOOL
         return 1
     }
     if method == "len" {

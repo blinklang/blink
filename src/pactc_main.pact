@@ -81,6 +81,8 @@ fn main() {
     if imported_programs.len() > 0 {
         final_program = merge_programs(program_node, imported_programs, import_map_nodes)
     }
+    tc_import_modules = import_map_modules
+    tc_import_nodes = import_map_nodes
     let t_import_end = time_ms()
 
     if dump_ast == 1 {

@@ -1,0 +1,109 @@
+fn run_cmd(cmd: Str, label: Str) -> Int {
+    let rc = shell_exec(cmd)
+    if rc != 0 {
+        io.println("FAIL: {label} (rc={rc})")
+    }
+    rc
+}
+
+fn check_output(path: Str, expected: Str, label: Str) {
+    shell_exec("{path} > {path}_out.txt 2>&1 || true")
+    let output = read_file("{path}_out.txt")
+    if output.starts_with(expected) {
+        io.println("PASS: {label}")
+    } else {
+        io.println("FAIL: {label} — expected '{expected}', got: {output}")
+    }
+}
+
+fn main() {
+    let base = ".tmp/_test_selective_import"
+    shell_exec("rm -rf {base}")
+    let pact = "../../../bin/pact"
+
+    shell_exec("mkdir -p {base}/mylib/src")
+    write_file("{base}/mylib/pact.toml", "[package]\nname = \"mylib\"\nversion = \"0.1.0\"\n")
+    write_file(
+        "{base}/mylib/src/lib.pact",
+        "pub fn add(a: Int, b: Int) -> Int \{\n    a + b\n}\n\npub fn multiply(a: Int, b: Int) -> Int \{\n    a * b\n}\n\npub fn subtract(a: Int, b: Int) -> Int \{\n    a - b\n}\n"
+    )
+
+    shell_exec("mkdir -p {base}/app/src")
+    write_file(
+        "{base}/app/pact.toml",
+        "[package]\nname = \"app\"\nversion = \"1.0.0\"\n\n[dependencies]\nmylib = \{ path = \"../mylib\" }\n"
+    )
+
+    // Test 1: Selective import — only selected item is accessible
+    write_file(
+        "{base}/app/src/t1.pact",
+        "import mylib.\{add\}\n\nfn main() \{\n    io.println(\"\{add(2, 3)\}\")\n}\n"
+    )
+    let rc1 = run_cmd("cd {base}/app && {pact} build src/t1.pact -o build/t1 2>&1", "build selective add")
+    if rc1 != 0 {
+        shell_exec("rm -rf {base}")
+        return
+    }
+    check_output("{base}/app/build/t1", "5", "selective import: add works")
+
+    // Test 2: Unselected item is rejected
+    write_file(
+        "{base}/app/src/t2.pact",
+        "import mylib.\{add\}\n\nfn main() \{\n    io.println(\"\{multiply(2, 3)\}\")\n}\n"
+    )
+    shell_exec("mkdir -p {base}/app/build")
+    let rc2 = shell_exec("cd {base}/app && {pact} build src/t2.pact -o build/t2 > ../err2.txt 2>&1")
+    if rc2 == 0 {
+        io.println("FAIL: unselected item should be rejected but compiled ok")
+    } else {
+        let err = read_file("{base}/err2.txt")
+        if err.contains("multiply") {
+            io.println("PASS: unselected item rejected")
+        } else {
+            io.println("FAIL: expected error about multiply, got: {err}")
+        }
+    }
+
+    // Test 3: Bare import — all items accessible
+    write_file(
+        "{base}/app/src/t3.pact",
+        "import mylib\n\nfn main() \{\n    io.println(\"\{add(2, 3)\}\")\n    io.println(\"\{multiply(4, 5)\}\")\n    io.println(\"\{subtract(10, 3)\}\")\n}\n"
+    )
+    let rc3 = run_cmd("cd {base}/app && {pact} build src/t3.pact -o build/t3 2>&1", "build bare import")
+    if rc3 != 0 {
+        shell_exec("rm -rf {base}")
+        return
+    }
+    check_output("{base}/app/build/t3", "5", "bare import: all items accessible")
+
+    // Test 4: Multiple selective items
+    write_file(
+        "{base}/app/src/t4.pact",
+        "import mylib.\{add, multiply\}\n\nfn main() \{\n    io.println(\"\{add(2, 3)\}\")\n    io.println(\"\{multiply(4, 5)\}\")\n}\n"
+    )
+    let rc4 = run_cmd("cd {base}/app && {pact} build src/t4.pact -o build/t4 2>&1", "build multi selective")
+    if rc4 != 0 {
+        shell_exec("rm -rf {base}")
+        return
+    }
+    check_output("{base}/app/build/t4", "5", "multi selective: add+multiply work")
+
+    // Test 5: Multiple selective items — third item still excluded
+    write_file(
+        "{base}/app/src/t5.pact",
+        "import mylib.\{add, multiply\}\n\nfn main() \{\n    io.println(\"\{subtract(10, 3)\}\")\n}\n"
+    )
+    let rc5 = shell_exec("cd {base}/app && {pact} build src/t5.pact -o build/t5 > ../err5.txt 2>&1")
+    if rc5 == 0 {
+        io.println("FAIL: subtract should be rejected with selective import")
+    } else {
+        let err5 = read_file("{base}/err5.txt")
+        if err5.contains("subtract") {
+            io.println("PASS: unselected subtract rejected in multi-selective")
+        } else {
+            io.println("FAIL: expected error about subtract, got: {err5}")
+        }
+    }
+
+    shell_exec("rm -rf {base}")
+}

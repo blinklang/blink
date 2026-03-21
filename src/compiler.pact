@@ -71,6 +71,8 @@ pub fn compile_to_program(file_path: Str, use_prelude: Int) -> Int ! Lex.Tokeniz
     if imported_programs.len() > 0 {
         final_program = merge_programs(program, imported_programs, import_map_nodes)
     }
+    tc_import_modules = import_map_modules
+    tc_import_nodes = import_map_nodes
     final_program
 }
 
@@ -642,7 +644,7 @@ pub fn merge_programs(main_prog: Int, imported: List[Int], _import_nodes_list: L
 pub let mut loaded_files: List[Str] = []
 let mut import_map_paths: List[Str] = []
 pub let mut import_map_nodes: List[Int] = []
-let mut import_map_modules: List[Str] = []
+pub let mut import_map_modules: List[Str] = []
 let mut root_import_nodes: List[Int] = []
 let mut root_import_modules: List[Str] = []
 pub let mut embedded_stdlib: Map[Str, Str] = Map()

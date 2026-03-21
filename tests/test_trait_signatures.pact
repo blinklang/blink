@@ -1,0 +1,171 @@
+test "StrOps return types" {
+    let s = "hello world"
+    let s_len: Int = s.len()
+    let _s_char: Int = s.char_at(0)
+    let s_contains: Bool = s.contains("hello")
+    let s_starts: Bool = s.starts_with("hello")
+    let s_ends: Bool = s.ends_with("world")
+    let s_idx: Int = s.index_of("world")
+    let s_sub: Str = s.substring(0, 5)
+    let s_cat: Str = s.concat(" foo")
+    let s_split: List[Str] = s.split(" ")
+    let s_lines: List[Str] = s.lines()
+    let s_upper: Str = s.to_upper()
+    let s_lower: Str = s.to_lower()
+    let s_trim: Str = s.trim()
+    let s_repl: Str = s.replace("hello", "bye")
+    let s_pi: Int = "42".parse_int()
+    let s_pf: Float = "3.14".parse_float()
+    let s_slice: Str = s.slice(0, 5)
+    let s_toint: Int = "65".to_int()
+    let s_empty: Bool = s.is_empty()
+    assert(s_len > 0)
+    assert(s_contains)
+    assert(s_starts)
+    assert(s_ends)
+    assert_eq(s_idx, 6)
+    assert_eq(s_sub, "hello")
+    assert_eq(s_cat, "hello world foo")
+    assert_eq(s_split.len(), 2)
+    assert_eq(s_lines.len(), 1)
+    assert_eq(s_upper, "HELLO WORLD")
+    assert_eq(s_lower, "hello world")
+    assert_eq(s_trim, "hello world")
+    assert_eq(s_repl, "bye world")
+    assert_eq(s_pi, 42)
+    assert(s_pf > 3.0)
+    assert_eq(s_slice, "hello")
+    assert_eq(s_toint, 65)
+    assert(!s_empty)
+}
+
+test "ListOps return types" {
+    let mut items: List[Int] = []
+    items.push(1)
+    items.push(2)
+    items.push(3)
+    let l_len: Int = items.len()
+    let l_empty: Bool = items.is_empty()
+    let l_get: Option[Int] = items.get(0)
+    assert_eq(l_len, 3)
+    assert(!l_empty)
+    assert_eq(l_get ?? -1, 1)
+
+    let mut other: List[Int] = []
+    other.push(4)
+    other.push(5)
+    let l_cat: List[Int] = items.concat(other)
+    let l_slice: List[Int] = items.slice(0, 2)
+    assert_eq(l_cat.len(), 5)
+    assert_eq(l_slice.len(), 2)
+}
+
+test "MapOps return types" {
+    let m: Map[Str, Int] = Map()
+    m.set("a", 1)
+    m.set("b", 2)
+    let m_len: Int = m.len()
+    let m_get: Int = m.get("a")
+    let m_has: Bool = m.has("a")
+    let m_rem: Bool = m.remove("b")
+    let m_keys: List[Str] = m.keys()
+    let m_vals: List[Int] = m.values()
+    assert_eq(m_len, 2)
+    assert_eq(m_get, 1)
+    assert(m_has)
+    assert(m_rem)
+    assert_eq(m_keys.len(), 1)
+    assert_eq(m_vals.len(), 1)
+}
+
+test "SetOps return types" {
+    let mut s = Set()
+    let s_ins: Bool = s.insert("x")
+    let s_con: Bool = s.contains("x")
+    let s_rem: Bool = s.remove("x")
+    let s_len: Int = s.len()
+    let s_empty: Bool = s.is_empty()
+    assert(s_ins)
+    assert(s_con)
+    assert(s_rem)
+    assert_eq(s_len, 0)
+    assert(s_empty)
+    let mut s2 = Set()
+    s2.insert("y")
+    let s_union: Set[Str] = s.union(s2)
+    assert_eq(s_union.len(), 1)
+}
+
+test "BytesOps return types" {
+    let b = Bytes.new()
+    b.push(72)
+    b.push(101)
+    b.push(108)
+    let b_len: Int = b.len()
+    let b_empty: Bool = b.is_empty()
+    let b_get: Option[Int] = b.get(0)
+    let b_slice: Bytes = b.slice(0, 2)
+    let b2 = Bytes.from_str("lo")
+    let b_cat: Bytes = b.concat(b2)
+    let b_str: Result[Str, Str] = b.to_str()
+    let b_hex: Str = b.to_hex()
+    assert_eq(b_len, 3)
+    assert(!b_empty)
+    assert_eq(b_get ?? -1, 72)
+    assert_eq(b_slice.len(), 2)
+    assert_eq(b_cat.len(), 5)
+    assert(b_str.is_ok())
+    assert_eq(b_hex, "48656c")
+}
+
+test "StringBuildOps return types" {
+    let mut sb = StringBuilder.new()
+    sb.write("hello")
+    sb.write_char("!")
+    let sb_str: Str = sb.to_str()
+    let sb_len2: Int = sb.len()
+    let sb_cap: Int = sb.capacity()
+    let sb_empty: Bool = sb.is_empty()
+    assert_eq(sb_str, "hello!")
+    assert_eq(sb_len2, 6)
+    assert(sb_cap >= 6)
+    assert(!sb_empty)
+    sb.clear()
+    assert(sb.is_empty())
+}
+
+test "list concat produces correct values" {
+    let mut a: List[Str] = []
+    a.push("x")
+    a.push("y")
+    let mut b: List[Str] = []
+    b.push("z")
+    let joined = a.concat(b)
+    assert_eq(joined.len(), 3)
+    assert_eq(joined.get(0) ?? "", "x")
+    assert_eq(joined.get(1) ?? "", "y")
+    assert_eq(joined.get(2) ?? "", "z")
+}
+
+test "list slice produces correct values" {
+    let mut items: List[Str] = []
+    items.push("a")
+    items.push("b")
+    items.push("c")
+    items.push("d")
+    let sl = items.slice(1, 3)
+    assert_eq(sl.len(), 2)
+    assert_eq(sl.get(0) ?? "", "b")
+    assert_eq(sl.get(1) ?? "", "c")
+}
+
+test "map has and remove return Bool" {
+    let m: Map[Str, Int] = Map()
+    m.set("k", 42)
+    let present: Bool = m.has("k")
+    assert(present)
+    let removed: Bool = m.remove("k")
+    assert(removed)
+    let gone: Bool = m.has("k")
+    assert(!gone)
+}

@@ -108,6 +108,10 @@ let mut tc_current_fn_name: Str = ""
 let mut tc_errors: List[Str] = []
 let mut tc_warnings: List[Str] = []
 
+// ── Import alias maps ──────────────────────────────────────────────
+pub let mut tc_alias_to_original: Map[Str, Str] = Map()
+let mut tc_original_to_alias: Map[Str, Str] = Map()
+
 // ── Unused import tracking ──────────────────────────────────────────
 let mut tc_symbol_module: Map[Str, Str] = Map()
 let mut tc_used_modules: Map[Str, Int] = Map()
@@ -841,6 +845,7 @@ fn init_types() ! TypeCheck.Register {
     tc_warnings.clear()
     tc_symbol_module.clear()
     tc_used_modules.clear()
+    tc_build_import_map()
 
     TYPE_INT = new_type(TK_INT, "Int")
     TYPE_FLOAT = new_type(TK_FLOAT, "Float")
@@ -924,7 +929,11 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
             let fn_node = sublist_get(fns_sl, i)
             let mod_name = np_module.get(fn_node).unwrap()
             if mod_name != "" && mod_name != "__main__" {
-                tc_symbol_module.set(np_name.get(fn_node).unwrap(), mod_name)
+                let fn_sym_name = np_name.get(fn_node).unwrap()
+                tc_symbol_module.set(fn_sym_name, mod_name)
+                if tc_original_to_alias.has(fn_sym_name) {
+                    tc_symbol_module.set(tc_original_to_alias.get(fn_sym_name), mod_name)
+                }
             }
             i = i + 1
         }
@@ -1106,10 +1115,80 @@ fn is_user_effect_handle_name(name: Str) -> Int {
     0
 }
 
+// ── Selective import filtering ──────────────────────────────────────
+pub let mut tc_import_modules: List[Str] = []
+pub let mut tc_import_nodes: List[Int] = []
+let mut tc_module_import_node: Map[Str, Int] = Map()
+
+fn tc_build_import_map() {
+    tc_module_import_node = Map()
+    tc_alias_to_original = Map()
+    tc_original_to_alias = Map()
+    let mut i = 0
+    while i < tc_import_modules.len() {
+        let mod_key = tc_import_modules.get(i).unwrap()
+        let node_id = tc_import_nodes.get(i).unwrap()
+        if node_id != -1 {
+            tc_module_import_node.set(mod_key, node_id)
+            let names_sl = np_args.get(node_id).unwrap()
+            if names_sl != -1 {
+                let mut j = 0
+                while j < sublist_length(names_sl) {
+                    let name_node = sublist_get(names_sl, j)
+                    let alias = np_str_val.get(name_node).unwrap()
+                    if alias != "" {
+                        let original = np_name.get(name_node).unwrap()
+                        tc_alias_to_original.set(alias, original)
+                        tc_original_to_alias.set(original, alias)
+                    }
+                    j = j + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+}
+
+fn is_filtered_import(name: Str, mod_name: Str) -> Int {
+    if tc_module_import_node.has(mod_name) {
+        return is_selected_import(name, tc_module_import_node.get(mod_name)) == 0
+    }
+    0
+}
+
+fn is_selected_import(name: Str, imp_node: Int) -> Int {
+    let names_sl = np_args.get(imp_node).unwrap()
+    if names_sl == -1 { return 1 }
+    let mut i = 0
+    while i < sublist_length(names_sl) {
+        let name_node = sublist_get(names_sl, i)
+        if np_name.get(name_node).unwrap() == name { return 1 }
+        let alias = np_str_val.get(name_node).unwrap()
+        if alias != "" && alias == name { return 1 }
+        i = i + 1
+    }
+    0
+}
+
 // ── Import visibility ───────────────────────────────────────────────
 
 let mut nr_private_imports: Map[Str, Str] = Map()
 let mut nr_current_module: Str = ""
+let mut nr_name_source_module: Map[Str, Str] = Map()
+
+fn nr_check_ambiguity(name: Str, mod_name: Str, local_names: Map[Str, Int]) ! Diag.Report {
+    if mod_name == "" || mod_name == "__main__" { return }
+    if nr_private_imports.has(name) { return }
+    if local_names.has(name) { return }
+    if nr_name_source_module.has(name) {
+        let existing_mod = nr_name_source_module.get(name)
+        if existing_mod != mod_name && existing_mod != "__main__" {
+            diag_error_no_loc("AmbiguousImport", "E1005", "name '{name}' is ambiguous — imported from both '{existing_mod}' and '{mod_name}'", "use selective imports to disambiguate, e.g. import {existing_mod}.\{name}")
+        }
+    } else {
+        nr_name_source_module.set(name, mod_name)
+    }
+}
 
 fn is_private_access(name: Str) -> Int {
     if nr_private_imports.has(name) == 0 { return 0 }
@@ -1605,6 +1684,7 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, Diag.Report {
     nr_impl_type_names = []
     nr_impl_method_names = []
     nr_private_imports = Map()
+    nr_name_source_module = Map()
     nr_push_scope()
 
     // Build private import set: imported non-pub fns, types, lets
@@ -1612,13 +1692,18 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, Diag.Report {
     let mut nr_pub_names: Map[Str, Int] = Map()
 
     // First pass: collect all pub imported names
+    // Items that are pub but excluded by selective imports are treated as private
     let fns_sl_priv = np_params.get(program).unwrap()
     if fns_sl_priv != -1 {
         let mut i = 0
         while i < sublist_length(fns_sl_priv) {
             let fn_node = sublist_get(fns_sl_priv, i)
-            if np_module.get(fn_node).unwrap() != "" && np_is_pub.get(fn_node).unwrap() != 0 {
-                nr_pub_names.set(np_name.get(fn_node).unwrap(), 1)
+            let fn_mod = np_module.get(fn_node).unwrap()
+            if fn_mod != "" && np_is_pub.get(fn_node).unwrap() != 0 {
+                let fn_name = np_name.get(fn_node).unwrap()
+                if is_filtered_import(fn_name, fn_mod) == 0 {
+                    nr_pub_names.set(fn_name, 1)
+                }
             }
             i = i + 1
         }
@@ -1628,15 +1713,19 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, Diag.Report {
         let mut i = 0
         while i < sublist_length(types_sl_priv) {
             let td = sublist_get(types_sl_priv, i)
-            if np_module.get(td).unwrap() != "" && np_is_pub.get(td).unwrap() != 0 {
-                nr_pub_names.set(np_name.get(td).unwrap(), 1)
-                let td_flds = np_fields.get(td).unwrap()
-                if td_flds != -1 && sublist_length(td_flds) > 0 {
-                    if np_kind.get(sublist_get(td_flds, 0)).unwrap() == NodeKind.TypeVariant {
-                        let mut vi = 0
-                        while vi < sublist_length(td_flds) {
-                            nr_pub_names.set(np_name.get(sublist_get(td_flds, vi)).unwrap(), 1)
-                            vi = vi + 1
+            let td_mod = np_module.get(td).unwrap()
+            if td_mod != "" && np_is_pub.get(td).unwrap() != 0 {
+                let td_name = np_name.get(td).unwrap()
+                if is_filtered_import(td_name, td_mod) == 0 {
+                    nr_pub_names.set(td_name, 1)
+                    let td_flds = np_fields.get(td).unwrap()
+                    if td_flds != -1 && sublist_length(td_flds) > 0 {
+                        if np_kind.get(sublist_get(td_flds, 0)).unwrap() == NodeKind.TypeVariant {
+                            let mut vi = 0
+                            while vi < sublist_length(td_flds) {
+                                nr_pub_names.set(np_name.get(sublist_get(td_flds, vi)).unwrap(), 1)
+                                vi = vi + 1
+                            }
                         }
                     }
                 }
@@ -1649,8 +1738,12 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, Diag.Report {
         let mut i = 0
         while i < sublist_length(traits_sl_priv) {
             let tr = sublist_get(traits_sl_priv, i)
-            if np_module.get(tr).unwrap() != "" && np_is_pub.get(tr).unwrap() != 0 {
-                nr_pub_names.set(np_name.get(tr).unwrap(), 1)
+            let tr_mod = np_module.get(tr).unwrap()
+            if tr_mod != "" && np_is_pub.get(tr).unwrap() != 0 {
+                let tr_name = np_name.get(tr).unwrap()
+                if is_filtered_import(tr_name, tr_mod) == 0 {
+                    nr_pub_names.set(tr_name, 1)
+                }
             }
             i = i + 1
         }
@@ -1660,8 +1753,12 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, Diag.Report {
         let mut i = 0
         while i < sublist_length(lets_sl_priv) {
             let l = sublist_get(lets_sl_priv, i)
-            if np_module.get(l).unwrap() != "" && np_is_pub.get(l).unwrap() != 0 {
-                nr_pub_names.set(np_name.get(l).unwrap(), 1)
+            let l_mod = np_module.get(l).unwrap()
+            if l_mod != "" && np_is_pub.get(l).unwrap() != 0 {
+                let l_name = np_name.get(l).unwrap()
+                if is_filtered_import(l_name, l_mod) == 0 {
+                    nr_pub_names.set(l_name, 1)
+                }
             }
             i = i + 1
         }
@@ -1731,13 +1828,52 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, Diag.Report {
         }
     }
 
+    // Pre-collect __main__ names to suppress ambiguity when local defs shadow
+    let mut main_names: Map[Str, Int] = Map()
+    let pre_fns = np_params.get(program).unwrap()
+    if pre_fns != -1 {
+        let mut i = 0
+        while i < sublist_length(pre_fns) {
+            let fn_node = sublist_get(pre_fns, i)
+            if np_module.get(fn_node).unwrap() == "__main__" {
+                main_names.set(np_name.get(fn_node).unwrap(), 1)
+            }
+            i = i + 1
+        }
+    }
+    let pre_lets = np_stmts.get(program).unwrap()
+    if pre_lets != -1 {
+        let mut i = 0
+        while i < sublist_length(pre_lets) {
+            let l = sublist_get(pre_lets, i)
+            if np_module.get(l).unwrap() == "__main__" {
+                main_names.set(np_name.get(l).unwrap(), 1)
+            }
+            i = i + 1
+        }
+    }
+
     // Register all top-level let binding names
     let lets_sl = np_stmts.get(program).unwrap()
     if lets_sl != -1 {
         let mut i = 0
         while i < sublist_length(lets_sl) {
             let l = sublist_get(lets_sl, i)
-            nr_define(np_name.get(l).unwrap())
+            let l_name = np_name.get(l).unwrap()
+            let l_mod = np_module.get(l).unwrap()
+            if l_mod != "" && l_mod != "__main__" && is_filtered_import(l_name, l_mod) != 0 {
+                i = i + 1
+                continue
+            }
+            if l_mod != "__main__" && tc_original_to_alias.has(l_name) {
+                let alias = tc_original_to_alias.get(l_name)
+                nr_check_ambiguity(alias, l_mod, main_names)
+                nr_define(alias)
+                nr_register_private(l_name, l_mod)
+            } else {
+                nr_check_ambiguity(l_name, l_mod, main_names)
+                nr_define(l_name)
+            }
             i = i + 1
         }
     }
@@ -1747,7 +1883,22 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, Diag.Report {
     if fns_sl != -1 {
         let mut i = 0
         while i < sublist_length(fns_sl) {
-            nr_define(np_name.get(sublist_get(fns_sl, i)).unwrap())
+            let fn_node = sublist_get(fns_sl, i)
+            let fn_name = np_name.get(fn_node).unwrap()
+            let fn_mod = np_module.get(fn_node).unwrap()
+            if fn_mod != "" && fn_mod != "__main__" && is_filtered_import(fn_name, fn_mod) != 0 {
+                i = i + 1
+                continue
+            }
+            if fn_mod != "__main__" && tc_original_to_alias.has(fn_name) {
+                let alias = tc_original_to_alias.get(fn_name)
+                nr_check_ambiguity(alias, fn_mod, main_names)
+                nr_define(alias)
+                nr_register_private(fn_name, fn_mod)
+            } else {
+                nr_check_ambiguity(fn_name, fn_mod, main_names)
+                nr_define(fn_name)
+            }
             i = i + 1
         }
     }
@@ -2568,7 +2719,10 @@ fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repo
         if callee != -1 {
             let callee_kind = np_kind.get(callee).unwrap()
             if callee_kind == NodeKind.Ident {
-                let fn_name = np_name.get(callee).unwrap()
+                let mut fn_name = np_name.get(callee).unwrap()
+                if tc_alias_to_original.has(fn_name) {
+                    fn_name = tc_alias_to_original.get(fn_name)
+                }
                 if fn_name == "Some" {
                     let args_sl = np_args.get(node).unwrap()
                     if args_sl != -1 && sublist_length(args_sl) >= 1 {
@@ -2638,7 +2792,7 @@ fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repo
             if method == "len" || method == "count" { return TYPE_INT }
             if method == "get" { return make_option_type(ty_inner1.get(obj_t).unwrap()) }
             if method == "push" || method == "set" || method == "pop" || method == "for_each" || method == "clear" { return TYPE_VOID }
-            if method == "map" || method == "filter" || method == "take" || method == "skip" || method == "collect" {
+            if method == "map" || method == "filter" || method == "take" || method == "skip" || method == "collect" || method == "concat" || method == "slice" {
                 return obj_t
             }
             if method == "contains" || method == "any" || method == "all" || method == "is_empty" { return TYPE_BOOL }
@@ -2684,7 +2838,7 @@ fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repo
 
         if obj_k == TK_MAP {
             if method == "len" { return TYPE_INT }
-            if method == "has" || method == "remove" { return TYPE_INT }
+            if method == "has" || method == "remove" { return TYPE_BOOL }
             if method == "set" || method == "clear" { return TYPE_VOID }
             if method == "get" { return ty_inner2.get(obj_t).unwrap() }
             if method == "keys" { return make_list_type(ty_inner1.get(obj_t).unwrap()) }

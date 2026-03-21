@@ -116,6 +116,21 @@ PACT_UNUSED static void pact_list_clear(pact_list* l) {
     l->len = 0;
 }
 
+PACT_UNUSED static pact_list* pact_list_concat(pact_list* a, pact_list* b) {
+    pact_list* result = pact_list_new();
+    for (int64_t i = 0; i < a->len; i++) pact_list_push(result, a->items[i]);
+    for (int64_t i = 0; i < b->len; i++) pact_list_push(result, b->items[i]);
+    return result;
+}
+
+PACT_UNUSED static pact_list* pact_list_slice(pact_list* l, int64_t start, int64_t end) {
+    pact_list* result = pact_list_new();
+    if (start < 0) start = 0;
+    if (end > l->len) end = l->len;
+    for (int64_t i = start; i < end; i++) pact_list_push(result, l->items[i]);
+    return result;
+}
+
 /* ── Hash map (string-keyed) ────────────────────────────────────────── */
 
 PACT_UNUSED static int pact_str_eq(const char* a, const char* b);
