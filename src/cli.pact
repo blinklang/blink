@@ -2276,7 +2276,7 @@ fn cmd_update(_p: ArgParser, a: Args) {
     }
 }
 
-fn cmd_lsp(_p: ArgParser, _a: Args) ! IO, Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+fn cmd_lsp(_p: ArgParser, _a: Args) ! IO, Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit {
     lsp_start()
 }
 

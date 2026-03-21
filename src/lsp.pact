@@ -9,6 +9,7 @@ import file_watcher
 import incremental
 import codegen_types
 import mutation_analysis
+import formatter
 
 let mut lsp_running: Int = 0
 let mut lsp_initialized: Int = 0
@@ -76,7 +77,7 @@ fn lsp_send_notification(method: Str, params: Str) ! IO {
 }
 
 fn lsp_handle_initialize() -> Str {
-    "\{\"capabilities\":\{\"textDocumentSync\":1,\"definitionProvider\":true,\"hoverProvider\":true,\"referencesProvider\":true,\"documentSymbolProvider\":true,\"completionProvider\":\{\"triggerCharacters\":[\".\"]},\"signatureHelpProvider\":\{\"triggerCharacters\":[\"(\",\",\"]\},\"renameProvider\":true,\"codeActionProvider\":true\},\"serverInfo\":\{\"name\":\"pact-lsp\",\"version\":\"0.1.0\"\}\}"
+    "\{\"capabilities\":\{\"textDocumentSync\":1,\"definitionProvider\":true,\"hoverProvider\":true,\"referencesProvider\":true,\"documentSymbolProvider\":true,\"completionProvider\":\{\"triggerCharacters\":[\".\"]},\"signatureHelpProvider\":\{\"triggerCharacters\":[\"(\",\",\"]\},\"renameProvider\":true,\"codeActionProvider\":true,\"workspaceSymbolProvider\":true,\"documentFormattingProvider\":true\},\"serverInfo\":\{\"name\":\"pact-lsp\",\"version\":\"0.1.0\"\}\}"
 }
 
 fn lsp_handle_shutdown() -> Str {
@@ -652,6 +653,74 @@ fn lsp_handle_document_symbol(id: Int, root: Int) ! IO, Lex.Tokenize {
     lsp_send_response_int(id, sb.to_str())
 }
 
+fn lsp_handle_workspace_symbol(id: Int, root: Int) ! IO {
+    let params_node = json_get(root, "params")
+    let query = if params_node != -1 {
+        let q_node = json_get(params_node, "query")
+        if q_node != -1 { json_as_str(q_node) } else { "" }
+    } else {
+        ""
+    }
+    let lower_query = query.to_lower()
+    let mut sb = StringBuilder.new()
+    sb.write("[")
+    let mut first = 1
+    let mut i = 0
+    while i < si_sym_count {
+        let sym_name = si_sym_name.get(i).unwrap()
+        if lower_query == "" || sym_name.to_lower().contains(lower_query) != 0 {
+            if first == 0 {
+                sb.write(",")
+            }
+            let name = json_escape(sym_name)
+            let kind = lsp_sym_kind_to_lsp(si_sym_kind.get(i).unwrap())
+            let file = si_sym_file.get(i).unwrap()
+            let escaped_uri = json_escape("file://{file}")
+            let sl = lsp_to_zero_based(si_sym_line.get(i).unwrap())
+            let sc = lsp_to_zero_based(si_sym_col.get(i).unwrap())
+            let el = lsp_to_zero_based(si_sym_end_line.get(i).unwrap())
+            let ec = lsp_to_zero_based(si_sym_end_col.get(i).unwrap())
+            let container = json_escape(si_sym_module.get(i).unwrap())
+            let loc = lsp_build_location(escaped_uri, sl, sc, el, ec)
+            sb.write("\{\"name\":\"{name}\",\"kind\":{kind},\"location\":{loc},\"containerName\":\"{container}\"\}")
+            first = 0
+        }
+        i = i + 1
+    }
+    sb.write("]")
+    lsp_send_response_int(id, sb.to_str())
+}
+
+fn lsp_handle_formatting(id: Int, root: Int) ! IO, Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit {
+    let uri = lsp_extract_document_uri(root)
+    if uri == "" {
+        lsp_send_response_int(id, "[]")
+        return
+    }
+    let path = lsp_uri_to_path(uri)
+    let source = read_file(path)
+    if source == "" {
+        lsp_send_response_int(id, "[]")
+        return
+    }
+    let line_count = source.split("\n").len()
+    let program = compile_to_program(path, 0)
+    if diag_count > 0 {
+        lsp_check_and_publish(uri, path)
+        lsp_send_response_int(id, "[]")
+        return
+    }
+    let formatted = format(program)
+    if formatted == source {
+        lsp_check_and_publish(uri, path)
+        lsp_send_response_int(id, "[]")
+        return
+    }
+    let escaped = json_escape(formatted)
+    lsp_send_response_int(id, "[\{\"range\":\{\"start\":\{\"line\":0,\"character\":0\},\"end\":\{\"line\":{line_count},\"character\":0\}\},\"newText\":\"{escaped}\"\}]")
+    lsp_check_and_publish(uri, path)
+}
+
 fn lsp_completion_kind(kind: Int) -> Int {
     if kind == SK_FN { return 3 }
     if kind == SK_STRUCT { return 22 }
@@ -927,7 +996,7 @@ fn lsp_handle_code_action(id: Int, root: Int) ! IO {
     lsp_send_response_int(id, sb.to_str())
 }
 
-fn lsp_dispatch(method: Str, id_int: Int, id_is_present: Int, root: Int) ! IO, Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+fn lsp_dispatch(method: Str, id_int: Int, id_is_present: Int, root: Int) ! IO, Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit {
     if method == "initialize" {
         let result = lsp_handle_initialize()
         if id_is_present != 0 {
@@ -980,6 +1049,14 @@ fn lsp_dispatch(method: Str, id_int: Int, id_is_present: Int, root: Int) ! IO, L
         if id_is_present != 0 {
             lsp_handle_code_action(id_int, root)
         }
+    } else if method == "workspace/symbol" {
+        if id_is_present != 0 {
+            lsp_handle_workspace_symbol(id_int, root)
+        }
+    } else if method == "textDocument/formatting" {
+        if id_is_present != 0 {
+            lsp_handle_formatting(id_int, root)
+        }
     } else {
         if id_is_present != 0 {
             lsp_send_error_int(id_int, -32601, "Method not found")
@@ -1002,7 +1079,7 @@ fn lsp_log_memory_stats(method: Str) ! IO {
     io.eprintln("pact-lsp: mem [{method}] np={np} diag={diag} si={si} tp={tp} fnreg={fnreg} ma={ma} gen={gen} mono={mono}")
 }
 
-pub fn lsp_start() ! IO, Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+pub fn lsp_start() ! IO, Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit {
     lsp_running = 1
     io.eprintln("pact-lsp: starting")
     while lsp_running == 1 {
