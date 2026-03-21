@@ -14,9 +14,18 @@ docker pull ghcr.io/nhumrich/pact:latest
 docker run --rm -v "$PWD":/workspace ghcr.io/nhumrich/pact run myfile.pact
 ```
 
-Tags: `latest`, `0.23`, `0.23.3` (semver). Image is `debian:bookworm-slim` with `gcc`, `zig`, `pact`, `libgc-dev`, and `libsqlite3-dev`.
+Tags: `latest`, `0.24`, `0.24.0` (semver). Image is `debian:bookworm-slim` with `gcc`, `zig`, `pact`, `libgc-dev`, and `libsqlite3-dev`.
 
-## What's New (v0.23.3)
+## What's New (v0.24)
+
+- **Selective imports & aliases** — `import mod.{add, multiply as mul}` restricts which items are imported; aliases rename items at import site; ambiguous names across modules produce a compile error
+- **`Closeable` trait** — `impl Closeable for T` enables `with expr as name { ... }` blocks that auto-call `.close()` on scope exit (reverse order for multi-resource)
+- **Rich panic messages** — `unwrap()` / `unwrap_err()` panics now include source file and line number
+- **LSP workspace/symbol & formatting** — `workspace/symbol` for project-wide symbol search; `textDocument/formatting` for in-editor format
+- **Fix** — closures returning `Option[T]` now generate correct C type
+- **Fix** — helpful E1109 error when `mut` is used on struct/enum fields (mutability is on the binding, not the field)
+
+### Prior: What's New (v0.23.3)
 
 - **Portable cross-compilation** — vendored GC source/headers embedded in binary; `pact build --target` now works from standalone installs without the source tree
 - **Docker** — image includes `libgc-dev` for native builds and zig for cross-compilation

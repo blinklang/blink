@@ -1,8 +1,20 @@
 # Pact Language Reference
 
-> Pact is a statically-typed, effect-tracked language compiling to C. **Compiler v0.23.3**.
+> Pact is a statically-typed, effect-tracked language compiling to C. **Compiler v0.24.0**.
 
-## What's New (v0.23.3)
+## What's New (v0.24)
+
+| Change | Details |
+|--------|---------|
+| Selective imports & aliases | `import mod.{add, multiply as mul}` — restrict which items are imported; `as` renames at import site; ambiguous names across modules produce a compile error |
+| `Closeable` trait | `impl Closeable for T` enables `with expr as name { ... }` blocks — `.close()` is auto-called on scope exit (reverse order for multi-resource `with a, b`) |
+| Rich panic messages | `unwrap()` / `unwrap_err()` panics now include source file and line number: `panic: unwrap called on None at main.pact:42` |
+| LSP workspace/symbol | `workspace/symbol` for project-wide symbol search across all files |
+| LSP formatting | `textDocument/formatting` for in-editor code formatting |
+| Closure `Option[T]` fix | Closures returning `Option[T]` now generate the correct C type (was emitting wrong wrapper) |
+| E1109 `mut` on fields | Helpful error when `mut` is used on struct/enum fields — mutability is on the binding (`let mut`), not the field |
+
+### Prior: What's New (v0.23.3)
 
 | Change | Details |
 |--------|---------|
@@ -826,11 +838,16 @@ fn main() {
 ## Imports & Modules
 
 ```pact
-import lexer                     // import module
+import lexer                     // import module (all pub items)
 import std.args                  // import stdlib module
+import mylib.{add, multiply}     // selective: only add and multiply
+import mylib.{add as plus}       // alias: import add, call it plus
+import mylib.{add as plus, multiply}  // mix alias + plain
 ```
 
 Files are modules. `pub` marks items visible to importers. `import` brings `pub` items into scope.
+
+Selective imports (`import mod.{a, b}`) restrict which items are visible — unselected items produce a compile error. Aliases (`as`) rename the item at the import site; the original name is no longer accessible. When two modules export the same name and both are imported without selection, the compiler emits an ambiguity error.
 
 ## Annotations (ordered)
 
@@ -933,6 +950,32 @@ with handler Metrics {
 ```
 
 Handlers nest — inner handlers shadow outer ones for the same effect.
+
+## Closeable Trait & `with`-`as` Blocks
+
+Types that implement `Closeable` (from `std.traits`) can be used in `with`-`as` blocks for automatic resource cleanup.
+
+```pact
+import std.traits
+
+impl Closeable for MyResource {
+    fn close(self) {
+        // cleanup logic
+    }
+}
+
+// Single resource — close() called on scope exit
+with open_resource("file.txt") as f {
+    io.println("using: {f.name}")
+}
+// f.close() called here automatically
+
+// Multiple resources — close() called in reverse order (b, then a)
+with open_resource("a") as a, open_resource("b") as b {
+    io.println("using: {a.name} and {b.name}")
+}
+// b.close() called first, then a.close()
+```
 
 ## Standard Library
 
