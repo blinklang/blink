@@ -14,9 +14,15 @@ docker pull ghcr.io/nhumrich/pact:latest
 docker run --rm -v "$PWD":/workspace ghcr.io/nhumrich/pact run myfile.pact
 ```
 
-Tags: `latest`, `0.23`, `0.23.2` (semver). Image is `debian:bookworm-slim` with `gcc`, `zig`, `pact`, and `libsqlite3-dev`.
+Tags: `latest`, `0.23`, `0.23.3` (semver). Image is `debian:bookworm-slim` with `gcc`, `zig`, `pact`, `libgc-dev`, and `libsqlite3-dev`.
 
-## What's New (v0.23.2)
+## What's New (v0.23.3)
+
+- **Portable cross-compilation** — vendored GC source/headers embedded in binary; `pact build --target` now works from standalone installs without the source tree
+- **Docker** — image includes `libgc-dev` for native builds and zig for cross-compilation
+- **Perf** — `#embed` codegen uses byte arrays instead of escaped string literals; `escape_c_string` and other hot-path functions use StringBuilder (O(n) vs O(n²))
+
+### Prior: What's New (v0.23.2)
 
 - **Fixes** — for-in loop over `List[DataEnum]` now registers enum type for match inference
 - **Docker** — image now includes zig for cross-compilation via `--target`

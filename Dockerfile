@@ -1,6 +1,6 @@
 FROM debian:bookworm-slim
 
-ARG PACT_VERSION=v0.23.2
+ARG PACT_VERSION=v0.23.3
 ARG ZIG_VERSION=0.13.0
 
 RUN apt-get update && apt-get install -y \

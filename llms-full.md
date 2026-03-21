@@ -1,8 +1,16 @@
 # Pact Language Reference
 
-> Pact is a statically-typed, effect-tracked language compiling to C. **Compiler v0.23.2**.
+> Pact is a statically-typed, effect-tracked language compiling to C. **Compiler v0.23.3**.
 
-## What's New (v0.23.2)
+## What's New (v0.23.3)
+
+| Change | Details |
+|--------|---------|
+| Portable cross-compilation | Vendored GC source and headers are now embedded in the `pact` binary. `pact build --target` works from any directory without the source tree or `PACT_ROOT`. |
+| `#embed` perf | `#embed` now emits C byte array initializers instead of escaped string literals. Combined with StringBuilder in `escape_c_string`, build-cli went from 4min to 26s. |
+| Docker improvements | Image includes `libgc-dev` for native builds, zig 0.13.0 for cross-compilation, workflow handles `workflow_dispatch` correctly. |
+
+### Prior: What's New (v0.23.2)
 
 | Change | Details |
 |--------|---------|
