@@ -761,6 +761,7 @@ pub fn emit_closure(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
     let saved_closure_params = closure_param_names
     let saved_fn_name = cg_current_fn_name
     let saved_fn_ret = cg_current_fn_ret
+    let saved_fn_option_inner = cg_current_fn_option_inner
     closure_param_names = []
     cg_lines = []
     cg_indent = 0
@@ -845,12 +846,19 @@ pub fn emit_closure(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
     }
     cg_current_fn_name = cname
     cg_current_fn_ret = body_ret
+    if ret_type == CT_OPTION {
+        cg_current_fn_option_inner = resolve_option_inner_from_ann(node)
+    } else {
+        cg_current_fn_option_inner = 0
+    }
     if closure_ret_struct != "" {
         reg_fn_struct_ret(cname, closure_ret_struct)
     }
+    reg_fn_ret_from_ann(cname, node)
     emit_fn_body(np_body.get(node).unwrap(), body_ret)
     cg_current_fn_name = saved_fn_name
     cg_current_fn_ret = saved_fn_ret
+    cg_current_fn_option_inner = saved_fn_option_inner
     cg_indent = cg_indent - 1
     emit_line("}")
     emit_line("")

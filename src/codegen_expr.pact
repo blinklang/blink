@@ -749,12 +749,18 @@ pub fn emit_async_spawn_closure(closure_node: Int, wrapper_idx: Int, wrapper_nam
     let saved_cap_count = cg_closure_cap_count
     let saved_fn_name = cg_current_fn_name
     let saved_fn_ret = cg_current_fn_ret
+    let saved_fn_option_inner = cg_current_fn_option_inner
     cg_lines = []
     cg_indent = 0
     cg_temp_counter = 0
     cg_closure_cap_start = cap_start
     cg_closure_cap_count = captures.len()
     cg_current_fn_ret = body_ret
+    if cl_ret_type == CT_OPTION {
+        cg_current_fn_option_inner = resolve_option_inner_from_ann(closure_node)
+    } else {
+        cg_current_fn_option_inner = 0
+    }
 
     push_scope()
 
@@ -775,6 +781,7 @@ pub fn emit_async_spawn_closure(closure_node: Int, wrapper_idx: Int, wrapper_nam
     if task_ret_struct != "" {
         reg_fn_struct_ret(task_fn_name, task_ret_struct)
     }
+    reg_fn_ret_from_ann(task_fn_name, closure_node)
 
     if is_void_ret {
         emit_fn_body(cl_body, CT_VOID)
@@ -796,6 +803,7 @@ pub fn emit_async_spawn_closure(closure_node: Int, wrapper_idx: Int, wrapper_nam
     cg_closure_cap_count = saved_cap_count
     cg_current_fn_name = saved_fn_name
     cg_current_fn_ret = saved_fn_ret
+    cg_current_fn_option_inner = saved_fn_option_inner
     cg_in_traced_fn = saved_in_traced
 
     let mut tli = 0
