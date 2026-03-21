@@ -402,6 +402,9 @@ pub fn diag_explain(code: Str) -> Str {
     if code == "E1108" {
         return "E1108 -- FileNotFound / UnknownIntrinsic\n\nEither an #embed() referenced a file that does not exist, or an\nunknown compile-time intrinsic was used.\n\nFix: check that the file path is correct relative to the source\nfile, or use a supported intrinsic (#embed is currently the only one).\n\n  const data: Str = #embed(\"data.txt\")  // file must exist"
     }
+    if code == "E1109" {
+        return "E1109 -- MutFieldNotSupported\n\nThe 'mut' keyword was used on a struct field declaration. In Pact,\nmutability is a property of the binding, not the type or its fields.\nAll fields of a 'let mut' binding are mutable; all fields of a 'let'\nbinding are immutable.\n\nFix: remove 'mut' from the field and use 'let mut' when binding.\n\n  type Point \{ x: Float, y: Float \}\n  let mut p = Point \{ x: 1.0, y: 2.0 \}\n  p.x = 3.0  // OK — binding is mut"
+    }
     if code == "E1200" {
         return "E1200 -- ModuleNotFound\n\nAn import statement referenced a module that could not be found.\n\nCommon causes:\n  - Typo in the module name\n  - Missing file: the module's .pact file does not exist\n  - Incorrect path in the module hierarchy\n\nFix: verify the module name matches a .pact file in your project or\nthe standard library.\n\n  import math       // looks for lib/std/math.pact or src/math.pact\n  import pkg.audit  // looks for lib/pkg/audit.pact"
     }

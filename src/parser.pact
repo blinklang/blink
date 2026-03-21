@@ -812,6 +812,12 @@ fn parse_type_def() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
             if at(TokenKind.EOF) {
                 break
             }
+            if at(TokenKind.Mut) {
+                diag_error("MutFieldNotSupported", "E1109", "'mut' is not valid on struct fields — mutability is controlled by the binding (let mut)", peek_line(), peek_col(), "remove 'mut' from the field declaration; use 'let mut' when binding the struct")
+                while at(TokenKind.Mut) {
+                    advance()
+                }
+            }
             let fname = expect_value(TokenKind.Ident)
             if at(TokenKind.Colon) {
                 advance()
@@ -834,6 +840,12 @@ fn parse_type_def() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
                 let mut vflds = -1
                 if !at(TokenKind.RParen) {
                     vflds = new_sublist()
+                    if at(TokenKind.Mut) {
+                        diag_error("MutFieldNotSupported", "E1109", "'mut' is not valid on struct fields — mutability is controlled by the binding (let mut)", peek_line(), peek_col(), "remove 'mut' from the field declaration; use 'let mut' when binding the struct")
+                        while at(TokenKind.Mut) {
+                            advance()
+                        }
+                    }
                     let vf_name = expect_value(TokenKind.Ident)
                     if at(TokenKind.Colon) {
                         advance()
@@ -847,6 +859,12 @@ fn parse_type_def() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
                             skip_newlines_and_comments()
                             if at(TokenKind.RParen) {
                                 break
+                            }
+                            if at(TokenKind.Mut) {
+                                diag_error("MutFieldNotSupported", "E1109", "'mut' is not valid on struct fields — mutability is controlled by the binding (let mut)", peek_line(), peek_col(), "remove 'mut' from the field declaration; use 'let mut' when binding the struct")
+                                while at(TokenKind.Mut) {
+                                    advance()
+                                }
                             }
                             let vf_name2 = expect_value(TokenKind.Ident)
                             expect(TokenKind.Colon)
