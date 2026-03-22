@@ -1170,6 +1170,18 @@ fn is_selected_import(name: Str, imp_node: Int) -> Int {
     0
 }
 
+pub fn is_import_module_name(name: Str) -> Int {
+    if tc_module_import_node.has(name) { return 1 }
+    let mut i = 0
+    while i < tc_import_modules.len() {
+        if tc_import_modules.get(i).unwrap() == name {
+            return 1
+        }
+        i = i + 1
+    }
+    0
+}
+
 // ── Import visibility ───────────────────────────────────────────────
 
 let mut nr_private_imports: Map[Str, Str] = Map()
@@ -2157,6 +2169,7 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, Diag.Report {
             tc_mark_symbol_used(name)
             return
         }
+        if is_import_module_name(name) != 0 { return }
         tc_errors.push("undefined variable '{name}'")
         diag_error_at("UndefinedVariable", "E0506", "undefined variable '{name}'", node, "")
         return
@@ -2224,11 +2237,20 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, Diag.Report {
 
     if kind == NodeKind.MethodCall {
         let obj = np_obj.get(node).unwrap()
-        if obj != -1 {
+        let mut is_module_qual = 0
+        if obj != -1 && np_kind.get(obj).unwrap() == NodeKind.Ident {
+            let obj_name = np_name.get(obj).unwrap()
+            if is_import_module_name(obj_name) != 0 && nr_is_defined(obj_name) == 0 {
+                is_module_qual = 1
+                let mq_method = np_method.get(node).unwrap()
+                tc_mark_symbol_used(mq_method)
+            }
+        }
+        if is_module_qual == 0 && obj != -1 {
             nr_check_node(obj)
         }
         let method_name = np_method.get(node).unwrap()
-        if is_builtin_method(method_name) == 0 && is_variant_name(method_name) == 0 {
+        if is_module_qual == 0 && is_builtin_method(method_name) == 0 && is_variant_name(method_name) == 0 {
             let mut found_in_impl = 0
             let mut mi = 0
             while mi < nr_impl_method_names.len() {
@@ -2263,7 +2285,18 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, Diag.Report {
     if kind == NodeKind.FieldAccess {
         let obj = np_obj.get(node).unwrap()
         if obj != -1 {
-            nr_check_node(obj)
+            let mut is_mod_fa = 0
+            if np_kind.get(obj).unwrap() == NodeKind.Ident {
+                let fa_obj_name = np_name.get(obj).unwrap()
+                if is_import_module_name(fa_obj_name) != 0 && nr_is_defined(fa_obj_name) == 0 {
+                    is_mod_fa = 1
+                    let fa_field = np_name.get(node).unwrap()
+                    tc_mark_symbol_used(fa_field)
+                }
+            }
+            if is_mod_fa == 0 {
+                nr_check_node(obj)
+            }
         }
         return
     }

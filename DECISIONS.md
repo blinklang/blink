@@ -285,6 +285,7 @@ Decided by expert panel vote. See [OPEN_QUESTIONS.md](OPEN_QUESTIONS.md) for ful
 | `--trace` timestamp format | Microseconds monotonic (`ts_us`). Right precision for function-level tracing | 5-0 |
 | Set[T] implementation | Implement now as full builtin type. Spec'd-but-unimplemented = hallucination trap + DX trap. ~300 LOC following Map pattern | 4-1 (Sys/Web/DevOps/AI for implement; PLT for defer) |
 | Memory management GC | Boehm-Demers-Weiser conservative tracing GC. Replace `malloc` with `GC_MALLOC` in `pact_alloc`, link `-lgc`. ~15 lines. Custom precise GC deferred to Phase 3 if needed | 5-0 |
+| Qualified access semantics | Selective restricts unqualified only; covers fn+type+const; leaf module name; resolves E1005 ambiguity | 3-2, 5-0, 5-0, 5-0 |
 
 ---
 
@@ -352,6 +353,7 @@ Full deliberation records for each decision. Each file contains expert votes, re
 | `--trace` NDJSON Format | [decisions/trace-ndjson-format.md](decisions/trace-ndjson-format.md) |
 | Set[T] Builtin Type | [decisions/set-type-implementation.md](decisions/set-type-implementation.md) |
 | Memory Management GC | [decisions/memory-management-gc.md](decisions/memory-management-gc.md) |
+| Qualified Access Semantics | [decisions/qualified-access-semantics.md](decisions/qualified-access-semantics.md) |
 
 ---
 

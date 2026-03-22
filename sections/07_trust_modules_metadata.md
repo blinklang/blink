@@ -657,6 +657,27 @@ fn handle_login(req: Request) -> Response ! IO, DB, Crypto {
 }
 ```
 
+#### Qualified Access
+
+After importing a module, you can access its `pub` items using `module.name` syntax:
+
+```pact
+import auth
+
+fn handle_login(req: Request) -> Response ! IO, DB, Crypto {
+    let session = auth.login(req.email, req.password)?
+    let token = auth.Token.new(session)
+    // ...
+}
+```
+
+**Rules:**
+- Qualified access works for functions (`auth.login()`), types (`auth.Token`), and constants (`auth.MAX_RETRIES`). Enum variants use their type qualifier: `Role.Admin`, not `auth.Role.Admin`.
+- Only the leaf module name is used as qualifier. `import std.num` enables `num.parse_int()`, not `std.num.parse_int()`. For modules with the same leaf name, use aliases: `import legacy.auth as legacy_auth`.
+- Selective imports do NOT restrict qualified access. `import auth.{login}` restricts bare `Token` but `auth.Token` still works.
+- Qualified access resolves name ambiguity (E1005). If `import foo` and `import bar` both export `helper`, bare `helper()` is an error — use `foo.helper()` or `bar.helper()`.
+- Local definitions shadow module names: if `let auth = 5` exists, `auth.login()` is a method call on the integer, not a module-qualified call.
+
 **No wildcard imports.** `import auth.*` does not exist. Every name in scope is explicitly imported. This is non-negotiable for locality of reasoning — an AI reading a file can determine every available name from the import block alone.
 
 #### 10.1.1 No Inline Modules

@@ -1918,6 +1918,82 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
         }
     }
 
+    // Module-qualified function call: module.function(args)
+    if np_kind.get(obj_node).unwrap() == NodeKind.Ident {
+        let mq_mod_name = np_name.get(obj_node).unwrap()
+        let mut mq_is_local_var = 0
+        let mut mq_si = scope_vars.len() - 1
+        while mq_si >= 0 && mq_is_local_var == 0 {
+            if scope_vars.get(mq_si).unwrap().name == mq_mod_name {
+                mq_is_local_var = 1
+            }
+            mq_si = mq_si - 1
+        }
+        if mq_is_local_var == 0 && is_trait_type(mq_mod_name) == 0 && is_struct_type(mq_mod_name) == 0 && is_enum_type(mq_mod_name) == 0 && is_import_module_name(mq_mod_name) != 0 {
+            let mq_fn_name = resolve_import_alias(method)
+            if is_fn_registered(mq_fn_name) != 0 || is_generic_fn(mq_fn_name) != 0 {
+                let args_sl = np_args.get(node).unwrap()
+                let mut mq_args_str = ""
+                if args_sl != -1 {
+                    let mut mqi = 0
+                    while mqi < sublist_length(args_sl) {
+                        if mqi > 0 {
+                            mq_args_str = mq_args_str.concat(", ")
+                        }
+                        emit_expr(sublist_get(args_sl, mqi))
+                        mq_args_str = mq_args_str.concat(expr_result_str)
+                        mqi = mqi + 1
+                    }
+                }
+                expr_result_str = "{c_fn_name(mq_fn_name)}({mq_args_str})"
+                expr_result_type = get_fn_ret(mq_fn_name)
+                if expr_result_type == CT_VOID {
+                    let mq_sret = get_fn_ret_struct(mq_fn_name)
+                    if mq_sret != "" {
+                        let mq_tmp = fresh_temp("_mqr")
+                        emit_line("{c_type_c_name(mq_sret)} {mq_tmp} = {c_fn_name(mq_fn_name)}({mq_args_str});")
+                        set_var_struct(mq_tmp, mq_sret)
+                        expr_result_str = mq_tmp
+                    }
+                }
+                let mq_rt = get_fn_ret_type(mq_fn_name)
+                expr_result_ok_struct = ""
+                expr_result_err_struct = ""
+                expr_option_inner_struct = ""
+                expr_list_elem_struct = ""
+                if expr_result_type == CT_RESULT {
+                    expr_result_ok_type = tp_child1_kind(mq_rt.tp_id)
+                    expr_result_err_type = tp_child2_kind(mq_rt.tp_id)
+                    let mq_fsi = get_fn_ret_struct_inner(mq_fn_name)
+                    expr_result_ok_struct = mq_fsi.ok_struct
+                    expr_result_err_struct = mq_fsi.err_struct
+                }
+                if expr_result_type == CT_OPTION {
+                    expr_option_inner = tp_child1_kind(mq_rt.tp_id)
+                    let mq_fsi = get_fn_ret_struct_inner(mq_fn_name)
+                    expr_option_inner_struct = mq_fsi.ok_struct
+                }
+                if expr_result_type == CT_LIST {
+                    expr_list_elem_type = tp_child1_kind(mq_rt.tp_id)
+                    let mq_fsi = get_fn_ret_struct_inner(mq_fn_name)
+                    expr_list_elem_struct = mq_fsi.ok_struct
+                }
+                if expr_result_type == CT_MAP {
+                    expr_map_key_type = tp_child1_kind(mq_rt.tp_id)
+                    expr_map_val_type = tp_child2_kind(mq_rt.tp_id)
+                }
+                if expr_result_type == CT_SET {
+                    expr_list_elem_type = tp_child1_kind(mq_rt.tp_id)
+                }
+                return
+            }
+            diag_error_at("UndefinedFunction", "E0504", "module '{mq_mod_name}' has no function '{method}'", node, "")
+            expr_result_str = "0"
+            expr_result_type = CT_INT
+            return
+        }
+    }
+
     // net.request(req) -> Result[Response, NetError] — redirects to Pact stdlib
     if np_kind.get(obj_node).unwrap() == NodeKind.Ident && np_name.get(obj_node).unwrap() == "net" && method == "request" {
         let args_sl = np_args.get(node).unwrap()
