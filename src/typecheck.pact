@@ -223,6 +223,20 @@ fn lookup_named_type(name: Str) -> Int {
     if named_type_map.has(name) != 0 {
         return named_type_map.get(name)
     }
+    let dot = name.index_of(".")
+    if dot >= 0 {
+        let bare = name.slice(dot + 1, name.len())
+        let mut resolved = bare
+        if tc_alias_to_original.has(bare) {
+            resolved = tc_alias_to_original.get(bare)
+        }
+        if named_type_map.has(resolved) != 0 {
+            return named_type_map.get(resolved)
+        }
+        if named_type_map.has(bare) != 0 {
+            return named_type_map.get(bare)
+        }
+    }
     -1
 }
 

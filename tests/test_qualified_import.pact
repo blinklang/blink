@@ -25,7 +25,7 @@ fn main() {
     write_file("{base}/mylib/pact.toml", "[package]\nname = \"mylib\"\nversion = \"0.1.0\"\n")
     write_file(
         "{base}/mylib/src/lib.pact",
-        "pub fn add(a: Int, b: Int) -> Int \{\n    a + b\n}\n\npub fn multiply(a: Int, b: Int) -> Int \{\n    a * b\n}\n\npub fn subtract(a: Int, b: Int) -> Int \{\n    a - b\n}\n\nfn internal_helper() -> Int \{\n    999\n}\n"
+        "pub fn add(a: Int, b: Int) -> Int \{\n    a + b\n}\n\npub fn multiply(a: Int, b: Int) -> Int \{\n    a * b\n}\n\npub fn subtract(a: Int, b: Int) -> Int \{\n    a - b\n}\n\nfn internal_helper() -> Int \{\n    999\n}\n\npub type Point \{\n    x: Int\n    y: Int\n}\n\npub let MAX = 100\n"
     )
 
     shell_exec("mkdir -p {base}/app/src")
@@ -83,6 +83,54 @@ fn main() {
         return
     }
     check_output("{base}/app/build/t4", "5", "selective+qualified: add bare + mylib.multiply qualified")
+
+    // Test 5: Qualified type in struct construction — mylib.Point { x: 1, y: 2 }
+    write_file(
+        "{base}/app/src/t5.pact",
+        "import mylib\n\nfn main() \{\n    let p = mylib.Point \{ x: 1, y: 2 \}\n    io.println(\"\{p.x\}\")\n}\n"
+    )
+    let rc5 = run_cmd("cd {base}/app && {pact} build src/t5.pact -o build/t5 2>&1", "build qualified struct")
+    if rc5 != 0 {
+        shell_exec("rm -rf {base}")
+        return
+    }
+    check_output("{base}/app/build/t5", "1", "qualified type: mylib.Point construction")
+
+    // Test 6: Qualified type in annotation — let p: mylib.Point = ...
+    write_file(
+        "{base}/app/src/t6.pact",
+        "import mylib\n\nfn main() \{\n    let p: mylib.Point = mylib.Point \{ x: 3, y: 4 \}\n    io.println(\"\{p.y\}\")\n}\n"
+    )
+    let rc6 = run_cmd("cd {base}/app && {pact} build src/t6.pact -o build/t6 2>&1", "build qualified type annotation")
+    if rc6 != 0 {
+        shell_exec("rm -rf {base}")
+        return
+    }
+    check_output("{base}/app/build/t6", "4", "qualified type annotation: mylib.Point")
+
+    // Test 7: Qualified constant access — mylib.MAX
+    write_file(
+        "{base}/app/src/t7.pact",
+        "import mylib\n\nfn main() \{\n    io.println(\"\{mylib.MAX\}\")\n}\n"
+    )
+    let rc7 = run_cmd("cd {base}/app && {pact} build src/t7.pact -o build/t7 2>&1", "build qualified constant")
+    if rc7 != 0 {
+        shell_exec("rm -rf {base}")
+        return
+    }
+    check_output("{base}/app/build/t7", "100", "qualified constant: mylib.MAX")
+
+    // Test 8: Qualified constant in expression — mylib.MAX + 1
+    write_file(
+        "{base}/app/src/t8.pact",
+        "import mylib\n\nfn main() \{\n    io.println(\"\{mylib.MAX + 1\}\")\n}\n"
+    )
+    let rc8 = run_cmd("cd {base}/app && {pact} build src/t8.pact -o build/t8 2>&1", "build qualified constant expr")
+    if rc8 != 0 {
+        shell_exec("rm -rf {base}")
+        return
+    }
+    check_output("{base}/app/build/t8", "101", "qualified constant in expression: mylib.MAX + 1")
 
     shell_exec("rm -rf {base}")
 }

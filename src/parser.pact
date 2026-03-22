@@ -1000,7 +1000,12 @@ fn parse_type_annotation() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         np_type_ann.push(ret_ann)
         return ta
     }
-    let name = expect_value(TokenKind.Ident)
+    let mut name = expect_value(TokenKind.Ident)
+    if at(TokenKind.Dot) {
+        advance()
+        let qualified = expect_value(TokenKind.Ident)
+        name = name + "." + qualified
+    }
     let mut elems = -1
     if at(TokenKind.LBracket) {
         advance()

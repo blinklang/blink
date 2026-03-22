@@ -235,6 +235,49 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
         let fa_field = np_name.get(node).unwrap()
         if np_kind.get(fa_obj).unwrap() == NodeKind.Ident {
             let obj_name = np_name.get(fa_obj).unwrap()
+            if is_import_module_name(obj_name) != 0 && is_enum_type(obj_name) == 0 && is_struct_type(obj_name) == 0 {
+                let mut mq_is_local = 0
+                let mut mq_si = scope_vars.len() - 1
+                while mq_si >= 0 && mq_is_local == 0 {
+                    if scope_vars.get(mq_si).unwrap().name == obj_name {
+                        mq_is_local = 1
+                    }
+                    mq_si = mq_si - 1
+                }
+                if mq_is_local == 0 {
+                    let resolved_field = resolve_import_alias(fa_field)
+                    if is_emitted_let(resolved_field) != 0 {
+                        let cname = c_safe_name(resolved_field)
+                        expr_result_str = cname
+                        expr_result_type = get_var_type(resolved_field)
+                        if expr_result_type == CT_OPTION {
+                            expr_option_inner = get_var_option_inner(resolved_field)
+                            expr_option_inner_struct = get_var_option_inner_struct(resolved_field)
+                            if expr_option_inner == CT_LIST {
+                                expr_option_inner_list_elem = get_var_option_inner2(resolved_field)
+                                expr_option_inner_list_struct = get_var_option_inner2_struct(resolved_field)
+                            }
+                        }
+                        if expr_result_type == CT_RESULT {
+                            expr_result_ok_type = get_var_result_ok(resolved_field)
+                            expr_result_err_type = get_var_result_err(resolved_field)
+                            expr_result_ok_struct = get_var_result_ok_struct(resolved_field)
+                            expr_result_err_struct = get_var_result_err_struct(resolved_field)
+                        }
+                        if expr_result_type == CT_ITERATOR {
+                            expr_iter_next_fn = get_var_iter_next_fn(resolved_field)
+                        }
+                        if expr_result_type == CT_LIST {
+                            expr_list_elem_type = get_list_elem_type(resolved_field)
+                            expr_list_elem_struct = get_list_elem_struct(resolved_field)
+                        }
+                        if expr_result_type == CT_VOID {
+                            propagate_enum_struct(resolved_field, expr_result_str)
+                        }
+                        return
+                    }
+                }
+            }
             if is_enum_type(obj_name) != 0 {
                 if is_data_enum(obj_name) != 0 {
                     let tag = get_variant_tag(obj_name, fa_field)
@@ -2253,7 +2296,12 @@ fn infer_struct_type_args(type_name: Str, field_types: List[Int]) -> Option[Str]
 
 @allow(UnrestoredMutation, IncompleteStateRestore)
 fn emit_struct_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
-    let sname = np_type_name.get(node).unwrap()
+    let raw_sname = np_type_name.get(node).unwrap()
+    let dot = raw_sname.index_of(".")
+    let mut sname = raw_sname
+    if dot >= 0 {
+        sname = raw_sname.slice(dot + 1, raw_sname.len())
+    }
     let mut c_type = c_type_c_name(sname)
     let tmp = fresh_temp("_s")
     let flds_sl = np_fields.get(node).unwrap()
