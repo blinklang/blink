@@ -112,6 +112,14 @@ let mut tc_warnings: List[Str] = []
 pub let mut tc_alias_to_original: Map[Str, Str] = Map()
 let mut tc_original_to_alias: Map[Str, Str] = Map()
 
+// ── Inferred type hints (for LSP inlayHint) ─────────────────────────
+pub let mut tc_hint_line: List[Int] = []
+pub let mut tc_hint_col: List[Int] = []
+pub let mut tc_hint_name: List[Str] = []
+pub let mut tc_hint_type: List[Str] = []
+pub let mut tc_hint_module: List[Str] = []
+pub let mut tc_hint_count: Int = 0
+
 // ── Unused import tracking ──────────────────────────────────────────
 let mut tc_symbol_module: Map[Str, Str] = Map()
 let mut tc_used_modules: Map[Str, Int] = Map()
@@ -913,6 +921,12 @@ fn init_types() ! TypeCheck.Register {
     tc_warnings.clear()
     tc_symbol_module.clear()
     tc_used_modules.clear()
+    tc_hint_line.clear()
+    tc_hint_col.clear()
+    tc_hint_name.clear()
+    tc_hint_type.clear()
+    tc_hint_module.clear()
+    tc_hint_count = 0
     tc_build_import_map()
 
     TYPE_INT = new_type(TK_INT, "Int")
@@ -3227,6 +3241,14 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             final_tid = inferred_tid
         }
         nr_define_typed(vname, is_mut, final_tid)
+        if type_ann == -1 && type_str == "" && final_tid != TYPE_UNKNOWN {
+            tc_hint_line.push(np_line.get(node).unwrap())
+            tc_hint_col.push(np_col.get(node).unwrap())
+            tc_hint_name.push(vname)
+            tc_hint_type.push(type_to_str(final_tid))
+            tc_hint_module.push(nr_current_module)
+            tc_hint_count = tc_hint_count + 1
+        }
         let tc_let_pat_sl = np_elements.get(node).unwrap()
         if tc_let_pat_sl != -1 {
             let tc_let_elems_sl = np_elements.get(tc_let_pat_sl).unwrap()

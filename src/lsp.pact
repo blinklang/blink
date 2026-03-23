@@ -77,7 +77,7 @@ fn lsp_send_notification(method: Str, params: Str) ! IO {
 }
 
 fn lsp_handle_initialize() -> Str {
-    "\{\"capabilities\":\{\"textDocumentSync\":1,\"definitionProvider\":true,\"hoverProvider\":true,\"referencesProvider\":true,\"documentSymbolProvider\":true,\"completionProvider\":\{\"triggerCharacters\":[\".\"]},\"signatureHelpProvider\":\{\"triggerCharacters\":[\"(\",\",\"]\},\"renameProvider\":true,\"codeActionProvider\":true,\"workspaceSymbolProvider\":true,\"documentFormattingProvider\":true\},\"serverInfo\":\{\"name\":\"pact-lsp\",\"version\":\"0.1.0\"\}\}"
+    "\{\"capabilities\":\{\"textDocumentSync\":1,\"definitionProvider\":true,\"hoverProvider\":true,\"referencesProvider\":true,\"documentSymbolProvider\":true,\"completionProvider\":\{\"triggerCharacters\":[\".\"]},\"signatureHelpProvider\":\{\"triggerCharacters\":[\"(\",\",\"]\},\"renameProvider\":true,\"codeActionProvider\":true,\"workspaceSymbolProvider\":true,\"documentFormattingProvider\":true,\"inlayHintProvider\":true\},\"serverInfo\":\{\"name\":\"pact-lsp\",\"version\":\"0.1.0\"\}\}"
 }
 
 fn lsp_handle_shutdown() -> Str {
@@ -721,6 +721,84 @@ fn lsp_handle_formatting(id: Int, root: Int) ! IO, Lex.Tokenize, Parse, Parse.Bu
     lsp_check_and_publish(uri, path)
 }
 
+fn lsp_handle_inlay_hint(id: Int, root: Int) ! IO, Lex.Tokenize {
+    let uri = lsp_extract_document_uri(root)
+    if uri == "" || lsp_initialized == 0 {
+        lsp_send_response_int(id, "[]")
+        return
+    }
+    let params_node = json_get(root, "params")
+    let range_node = if params_node != -1 { json_get(params_node, "range") } else { -1 }
+    let mut range_start = 0
+    let mut range_end = 999999
+    if range_node != -1 {
+        let start_node = json_get(range_node, "start")
+        let end_node = json_get(range_node, "end")
+        if start_node != -1 {
+            range_start = json_as_int(json_get(start_node, "line"))
+        }
+        if end_node != -1 {
+            range_end = json_as_int(json_get(end_node, "line"))
+        }
+    }
+
+    let file_path = lsp_uri_to_path(uri)
+    let source = read_file(file_path)
+    lex(source)
+
+    let mut sb = StringBuilder.new()
+    sb.write("[")
+    let mut first = 1
+    let mut hi = 0
+    while hi < tc_hint_count {
+        let hint_mod = tc_hint_module.get(hi).unwrap()
+        if hint_mod != "__main__" {
+            hi = hi + 1
+            continue
+        }
+        let hint_line_1based = tc_hint_line.get(hi).unwrap()
+        let hint_line = lsp_to_zero_based(hint_line_1based)
+        if hint_line < range_start || hint_line > range_end {
+            hi = hi + 1
+            continue
+        }
+        let hint_name = tc_hint_name.get(hi).unwrap()
+        let hint_type = tc_hint_type.get(hi).unwrap()
+        if hint_type == "?" || hint_type == "" {
+            hi = hi + 1
+            continue
+        }
+
+        let mut end_char = -1
+        let mut ti = 0
+        let tok_count = tok_kinds.len()
+        while ti < tok_count {
+            if tok_lines.get(ti).unwrap() == hint_line_1based {
+                if tok_kinds.get(ti).unwrap() == TokenKind.Ident {
+                    if tok_values.get(ti).unwrap() == hint_name {
+                        let tc = tok_cols.get(ti).unwrap()
+                        end_char = lsp_to_zero_based(tc) + hint_name.len()
+                        ti = tok_count
+                    }
+                }
+            }
+            ti = ti + 1
+        }
+
+        if end_char >= 0 {
+            if first == 0 {
+                sb.write(",")
+            }
+            let escaped_type = json_escape(hint_type)
+            sb.write("\{\"position\":\{\"line\":{hint_line},\"character\":{end_char}\},\"label\":\": {escaped_type}\",\"kind\":1,\"paddingLeft\":false\}")
+            first = 0
+        }
+        hi = hi + 1
+    }
+    sb.write("]")
+    lsp_send_response_int(id, sb.to_str())
+}
+
 fn lsp_completion_kind(kind: Int) -> Int {
     if kind == SK_FN { return 3 }
     if kind == SK_STRUCT { return 22 }
@@ -1056,6 +1134,10 @@ fn lsp_dispatch(method: Str, id_int: Int, id_is_present: Int, root: Int) ! IO, L
     } else if method == "textDocument/formatting" {
         if id_is_present != 0 {
             lsp_handle_formatting(id_int, root)
+        }
+    } else if method == "textDocument/inlayHint" {
+        if id_is_present != 0 {
+            lsp_handle_inlay_hint(id_int, root)
         }
     } else {
         if id_is_present != 0 {

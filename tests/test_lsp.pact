@@ -459,3 +459,64 @@ test "lsp signatureHelp outside call returns null" {
     assert(lsp_last_out.contains("\"id\":3"))
     assert(lsp_last_out.contains("null"))
 }
+
+// ── inlayHint tests ────────────────────────────────────────────
+
+test "lsp initialize advertises inlayHintProvider" {
+    let init = lsp_msg("\{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":\{\"capabilities\":\{\}\}\}")
+    let exit_msg = lsp_msg("\{\"jsonrpc\":\"2.0\",\"method\":\"exit\",\"params\":\{\}\}")
+    let input = init.concat(exit_msg)
+
+    lsp_run_session(input)
+    assert(lsp_last_out.contains("inlayHintProvider"))
+}
+
+test "lsp inlayHint shows inferred type for let without annotation" {
+    write_file(".tmp/lsp_test_hint.pact", "fn main() \{\n    let _x = 42\n    let _y = \"hello\"\n\}\n")
+
+    let init = lsp_msg("\{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":\{\"capabilities\":\{\}\}\}")
+    let initialized = lsp_msg("\{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":\{\}\}")
+    let didopen = lsp_msg("\{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":\{\"textDocument\":\{\"uri\":\"file://.tmp/lsp_test_hint.pact\",\"languageId\":\"pact\",\"version\":1,\"text\":\"\"\}\}\}")
+    let hint = lsp_msg("\{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"textDocument/inlayHint\",\"params\":\{\"textDocument\":\{\"uri\":\"file://.tmp/lsp_test_hint.pact\"\},\"range\":\{\"start\":\{\"line\":0,\"character\":0\},\"end\":\{\"line\":10,\"character\":0\}\}\}\}")
+    let shutdown = lsp_msg("\{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"shutdown\",\"params\":null\}")
+    let exit_msg = lsp_msg("\{\"jsonrpc\":\"2.0\",\"method\":\"exit\",\"params\":\{\}\}")
+    let input = init.concat(initialized).concat(didopen).concat(hint).concat(shutdown).concat(exit_msg)
+
+    lsp_run_session(input)
+    assert(lsp_last_out.contains("\"id\":3"))
+    assert(lsp_last_out.contains(": Int"))
+    assert(lsp_last_out.contains(": Str"))
+}
+
+test "lsp inlayHint does not show hint for annotated let" {
+    write_file(".tmp/lsp_test_hint2.pact", "fn main() \{\n    let _x: Int = 42\n\}\n")
+
+    let init = lsp_msg("\{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":\{\"capabilities\":\{\}\}\}")
+    let initialized = lsp_msg("\{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":\{\}\}")
+    let didopen = lsp_msg("\{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":\{\"textDocument\":\{\"uri\":\"file://.tmp/lsp_test_hint2.pact\",\"languageId\":\"pact\",\"version\":1,\"text\":\"\"\}\}\}")
+    let hint = lsp_msg("\{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"textDocument/inlayHint\",\"params\":\{\"textDocument\":\{\"uri\":\"file://.tmp/lsp_test_hint2.pact\"\},\"range\":\{\"start\":\{\"line\":0,\"character\":0\},\"end\":\{\"line\":10,\"character\":0\}\}\}\}")
+    let shutdown = lsp_msg("\{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"shutdown\",\"params\":null\}")
+    let exit_msg = lsp_msg("\{\"jsonrpc\":\"2.0\",\"method\":\"exit\",\"params\":\{\}\}")
+    let input = init.concat(initialized).concat(didopen).concat(hint).concat(shutdown).concat(exit_msg)
+
+    lsp_run_session(input)
+    assert(lsp_last_out.contains("\"id\":3"))
+    assert(lsp_last_out.contains("[]"))
+}
+
+test "lsp inlayHint shows correct label format" {
+    write_file(".tmp/lsp_test_hint3.pact", "fn add(a: Int, b: Int) -> Int \{ a + b \}\n\nfn main() \{\n    let _result = add(1, 2)\n\}\n")
+
+    let init = lsp_msg("\{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":\{\"capabilities\":\{\}\}\}")
+    let initialized = lsp_msg("\{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":\{\}\}")
+    let didopen = lsp_msg("\{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":\{\"textDocument\":\{\"uri\":\"file://.tmp/lsp_test_hint3.pact\",\"languageId\":\"pact\",\"version\":1,\"text\":\"\"\}\}\}")
+    let hint = lsp_msg("\{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"textDocument/inlayHint\",\"params\":\{\"textDocument\":\{\"uri\":\"file://.tmp/lsp_test_hint3.pact\"\},\"range\":\{\"start\":\{\"line\":0,\"character\":0\},\"end\":\{\"line\":10,\"character\":0\}\}\}\}")
+    let shutdown = lsp_msg("\{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"shutdown\",\"params\":null\}")
+    let exit_msg = lsp_msg("\{\"jsonrpc\":\"2.0\",\"method\":\"exit\",\"params\":\{\}\}")
+    let input = init.concat(initialized).concat(didopen).concat(hint).concat(shutdown).concat(exit_msg)
+
+    lsp_run_session(input)
+    assert(lsp_last_out.contains("\"id\":3"))
+    assert(lsp_last_out.contains(": Int"))
+    assert(lsp_last_out.contains("\"kind\":1"))
+}
