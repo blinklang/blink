@@ -1,0 +1,39 @@
+// capabilities.pact — Module capability budgets
+//
+// Demonstrates: @capabilities annotation, effect tracking,
+//               parent effects covering children, budget enforcement
+//
+// The @capabilities annotation declares which effects this module is
+// allowed to use. The compiler rejects any function that exceeds the
+// budget — even if the code is otherwise correct.
+//
+// Try adding a function with `! FS.Write` or `! Net.Connect` and
+// watch the compiler reject it with E0501.
+
+@capabilities(IO, FS.Read)
+
+fn read_config(path: Str) -> Str ! FS.Read {
+    if file_exists(path) {
+        return read_file(path)
+    }
+    ""
+}
+
+fn report(msg: Str) ! IO {
+    io.println("[report] {msg}")
+}
+
+fn process_config(path: Str) ! IO, FS.Read {
+    let cfg = read_config(path)
+    if cfg.len() > 0 {
+        report("config has {cfg.len()} bytes")
+    } else {
+        report("no config found at {path}")
+    }
+}
+
+fn main() {
+    report("starting up")
+    process_config("examples/capabilities.pact")
+    report("done")
+}
