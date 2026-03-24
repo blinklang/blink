@@ -1,6 +1,6 @@
 import symbol_index
 
-// incremental.pact — Incremental recheck engine for Pact compiler
+// incremental.pact — Incremental recheck engine for Blink compiler
 //
 // Detects changed files via mtime comparison against a snapshot,
 // computes affected symbol set by walking reverse deps transitively,

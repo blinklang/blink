@@ -20,12 +20,12 @@ import docgen
 import lsp
 import comment_attach
 
-let pact_cli_version: Str = "dev"
+let blink_cli_version: Str = "dev"
 const embedded_llms_full: Str = #embed("../llms-full.md")
 const embedded_llms_short: Str = #embed("../llms.md")
 const embedded_runtime_h: Str = #embed("../build/runtime.h")
-const embedded_upgrade_cmd: Str = #embed("../.claude/pact-marketplace/plugins/pact/skills/upgrade/SKILL.md")
-const embedded_init_cmd: Str = #embed("../.claude/pact-marketplace/plugins/pact/skills/init/SKILL.md")
+const embedded_upgrade_cmd: Str = #embed("../.claude/blink-marketplace/plugins/blink/skills/upgrade/SKILL.md")
+const embedded_init_cmd: Str = #embed("../.claude/blink-marketplace/plugins/blink/skills/init/SKILL.md")
 const embedded_std_args: Str = #embed("../lib/std/args.pact")
 const embedded_pkg_audit: Str = #embed("../lib/pkg/audit.pact")
 const embedded_pkg_gitdeps: Str = #embed("../lib/pkg/gitdeps.pact")
@@ -173,7 +173,7 @@ fn strip_extension(filename: Str) -> Str {
 }
 
 fn find_daemon_sock_from(start_dir: Str) -> Option[Str] {
-    let first = path_join(start_dir, ".pact/daemon.sock")
+    let first = path_join(start_dir, ".blink/daemon.sock")
     if file_exists(first) {
         return Some(first)
     }
@@ -184,7 +184,7 @@ fn find_daemon_sock_from(start_dir: Str) -> Option[Str] {
         if dir == prev {
             return None
         }
-        let candidate = path_join(dir, ".pact/daemon.sock")
+        let candidate = path_join(dir, ".blink/daemon.sock")
         if file_exists(candidate) {
             return Some(candidate)
         }
@@ -197,15 +197,17 @@ fn find_daemon_sock_from(start_dir: Str) -> Option[Str] {
 
 fn find_daemon_sock() -> Option[Str] {
     // CWD-relative check is the common case
-    if file_exists(".pact/daemon.sock") {
-        return Some(".pact/daemon.sock")
+    if file_exists(".blink/daemon.sock") {
+        return Some(".blink/daemon.sock")
     }
     return None
 }
 
-fn resolve_pact_bin() -> Str {
-    let env = get_env("PACT_BIN") ?? ""
+fn resolve_blink_bin() -> Str {
+    let env = get_env("BLINK_BIN") ?? ""
     if env != "" { return env }
+    let env_old = get_env("PACT_BIN") ?? ""
+    if env_old != "" { return env_old }
     if file_exists("bin/pact") { return "bin/pact" }
     return "pact"
 }
@@ -276,9 +278,9 @@ fn resolve_ffi_link_flags(lib: Str, target: Str) -> Str {
 }
 
 fn resolve_gc_source() -> Str {
-    let pact_root = get_env("PACT_ROOT") ?? ""
-    if pact_root != "" {
-        let path = "{pact_root}/bootstrap/vendor/gc/extra/gc.c"
+    let blink_root = get_env("BLINK_ROOT") ?? (get_env("PACT_ROOT") ?? "")
+    if blink_root != "" {
+        let path = "{blink_root}/bootstrap/vendor/gc/extra/gc.c"
         if file_exists(path) == 1 {
             return path
         }
@@ -291,9 +293,9 @@ fn resolve_gc_source() -> Str {
 }
 
 fn resolve_gc_include() -> Str {
-    let pact_root = get_env("PACT_ROOT") ?? ""
-    if pact_root != "" {
-        let path = "{pact_root}/bootstrap/vendor/gc/include"
+    let blink_root = get_env("BLINK_ROOT") ?? (get_env("PACT_ROOT") ?? "")
+    if blink_root != "" {
+        let path = "{blink_root}/bootstrap/vendor/gc/include"
         if file_exists("{path}/gc.h") == 1 {
             return path
         }
@@ -338,7 +340,7 @@ fn has_test_blocks(source: Str) -> Int {
     return 0
 }
 
-fn collect_pact_files(dir: Str, results: List[Str]) {
+fn collect_source_files(dir: Str, results: List[Str]) {
     let entries = fs.list_dir(dir)
     let mut i = 0
     while i < entries.len() {
@@ -349,7 +351,7 @@ fn collect_pact_files(dir: Str, results: List[Str]) {
         }
         let full_path = path_join(dir, entry)
         if is_dir(full_path) {
-            collect_pact_files(full_path, results)
+            collect_source_files(full_path, results)
         } else if entry.ends_with(".pact") {
             results.push(full_path)
         }
@@ -383,15 +385,40 @@ fn collect_test_files(dir: Str, results: List[Str]) {
     }
 }
 
+fn resolve_manifest_path() -> Str {
+    if file_exists("blink.toml") == 1 {
+        return "blink.toml"
+    }
+    if file_exists("pact.toml") == 1 {
+        return "pact.toml"
+    }
+    ""
+}
+
+fn resolve_lockfile_path() -> Str {
+    if file_exists("blink.lock") == 1 {
+        return "blink.lock"
+    }
+    if file_exists("pact.lock") == 1 {
+        return "pact.lock"
+    }
+    ""
+}
+
 fn ensure_deps_resolved() {
-    let toml_mt = file_mtime("pact.toml")
+    let manifest = resolve_manifest_path()
+    if manifest == "" {
+        return
+    }
+    let toml_mt = file_mtime(manifest)
     if toml_mt == -1 {
         return
     }
-    let lock_mt = file_mtime("pact.lock")
+    let lockfile = resolve_lockfile_path()
+    let lock_mt = if lockfile != "" { file_mtime(lockfile) } else { -1 }
     if lock_mt == -1 || toml_mt > lock_mt {
         io.eprintln("resolving dependencies...")
-        let rc = resolve_and_lock(".", pact_cli_version)
+        let rc = resolve_and_lock(".", blink_cli_version)
         if rc != 0 {
             io.eprintln("error: dependency resolution failed")
             exit(1)
@@ -404,8 +431,8 @@ fn do_compile(source_path: Str, c_path: Str, format_flag: Str, debug_mode: Int, 
     let final_program = compile_to_program(source_path, use_prelude)
 
     if format_flag == "pact" {
-        let pact_output = format(final_program)
-        write_file(c_path, pact_output)
+        let fmt_output = format(final_program)
+        write_file(c_path, fmt_output)
         return 0
     }
 
@@ -453,13 +480,13 @@ fn do_compile(source_path: Str, c_path: Str, format_flag: Str, debug_mode: Int, 
 }
 
 fn resolve_runtime_header() -> Str {
-    let pact_root = get_env("PACT_ROOT") ?? ""
-    if pact_root != "" {
-        let build_path = "{pact_root}/build/runtime.h"
+    let blink_root = get_env("BLINK_ROOT") ?? (get_env("PACT_ROOT") ?? "")
+    if blink_root != "" {
+        let build_path = "{blink_root}/build/runtime.h"
         if file_exists(build_path) == 1 {
             return read_file(build_path)
         }
-        let bootstrap_path = "{pact_root}/bootstrap/runtime.h"
+        let bootstrap_path = "{blink_root}/bootstrap/runtime.h"
         if file_exists(bootstrap_path) == 1 {
             return read_file(bootstrap_path)
         }
@@ -696,7 +723,7 @@ fn validate_ffi_native_deps(ffi_libs: List[Str]) -> Int ! Diag.Report {
     while i < ffi_libs.len() {
         let lib = ffi_libs.get(i).unwrap()
         if manifest_has_native_dep(lib) == 0 {
-            diag_error_no_loc("MissingNativeDep", "E0820", "@ffi references undeclared native dependency \"{lib}\"", "add to pact.toml:\n  [native-dependencies]\n  {lib} = \{ system = true \}")
+            diag_error_no_loc("MissingNativeDep", "E0820", "@ffi references undeclared native dependency \"{lib}\"", "add to blink.toml:\n  [native-dependencies]\n  {lib} = \{ system = true \}")
             errors = errors + 1
         }
         i = i + 1
@@ -729,33 +756,34 @@ fn validate_cross_target_deps(target: Str) -> Int ! Diag.Report {
     0
 }
 
-fn stamp_pact_version() {
-    if file_exists("pact.toml") == 0 {
+fn stamp_blink_version() {
+    let manifest = resolve_manifest_path()
+    if manifest == "" {
         return
     }
     manifest_clear()
-    let rc = manifest_load("pact.toml")
+    let rc = manifest_load(manifest)
     if rc != 0 {
         return
     }
-    if manifest_pact_version == pact_cli_version {
+    if manifest_pact_version == blink_cli_version {
         return
     }
-    let content = read_file("pact.toml")
+    let content = read_file(manifest)
     if manifest_pact_version == "" {
-        let insertion = "pact-version = \"{pact_cli_version}\"\n"
+        let insertion = "blink-version = \"{blink_cli_version}\"\n"
         let pkg_header = "[package]\n"
         if content.contains(pkg_header) {
             let idx = content.index_of(pkg_header)
             let after = idx + pkg_header.len()
             let updated = content.slice(0, after).concat(insertion).concat(content.slice(after, content.len()))
-            write_file("pact.toml", updated)
+            write_file(manifest, updated)
         }
     } else {
         let old_line = "pact-version = \"{manifest_pact_version}\""
-        let new_line = "pact-version = \"{pact_cli_version}\""
+        let new_line = "blink-version = \"{blink_cli_version}\""
         let updated = content.replace(old_line, new_line)
-        write_file("pact.toml", updated)
+        write_file(manifest, updated)
     }
 }
 
@@ -776,7 +804,7 @@ fn do_build(source_path: Str, output_path: Str, c_path: Str, format_flag: Str, d
     let has_sqlite = detect_sqlite(c_source)
     let ffi_libs = detect_ffi_libs(c_source)
 
-    let has_toml = file_exists("pact.toml")
+    let has_toml = if resolve_manifest_path() != "" { 1 } else { 0 }
     if has_toml == 1 && ffi_libs.len() > 0 {
         let vrc = validate_ffi_native_deps(ffi_libs)
         if vrc != 0 {
@@ -1221,7 +1249,7 @@ fn cmd_build(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
         io.eprintln("error: --debug and --release are mutually exclusive")
         exit(1)
     }
-    trace_mode = args_get(a, "pact-trace")
+    trace_mode = args_get(a, "blink-trace")
     let build_trace_val = args_get(a, "trace")
     if build_trace_val != "" {
         cg_trace_codegen = 1
@@ -1278,7 +1306,7 @@ fn cmd_run(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Repor
         io.eprintln("error: 'run' does not support multiple targets")
         exit(1)
     }
-    trace_mode = args_get(a, "pact-trace")
+    trace_mode = args_get(a, "blink-trace")
     let basename = path_basename(source_path)
     let name = strip_extension(basename)
     let mut output_path = args_get(a, "output")
@@ -1293,7 +1321,8 @@ fn cmd_run(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Repor
     let out_base = strip_extension(path_basename(output_path))
     let c_path = "{out_dir}/{out_base}.c"
     let trace_val = args_get(a, "trace")
-    let trace_env = get_env("PACT_TRACE") ?? ""
+    let trace_env_new = get_env("BLINK_TRACE") ?? ""
+    let trace_env = if trace_env_new != "" { trace_env_new } else { get_env("PACT_TRACE") ?? "" }
     if trace_val != "" || trace_env != "" {
         cg_trace_codegen = 1
     }
@@ -1382,7 +1411,7 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
         exit(1)
     }
 
-    let pact_bin = resolve_pact_bin()
+    let blink_bin = resolve_blink_bin()
 
     let mut build_args: List[List[Str]] = []
     let mut run_args: List[List[Str]] = []
@@ -1450,7 +1479,7 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
             let bin_path = output_bins.get(si).unwrap()
             async.spawn(fn() {
                 sem.recv()
-                let br = process_run(pact_bin, bcmd)
+                let br = process_run(blink_bin, bcmd)
                 if br.exit_code != 0 || !file_exists(bin_path) {
                     let mut err_text = br.out
                     if br.err_out != "" {
@@ -1590,7 +1619,7 @@ fn cmd_check(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
         format_flag = "json"
     }
 
-    trace_mode = args_get(a, "pact-trace")
+    trace_mode = args_get(a, "blink-trace")
     ensure_deps_resolved()
     let mut daemon_used = 0
     let sock = find_daemon_sock()
@@ -1657,12 +1686,13 @@ fn cmd_audit(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Re
             diag_flush()
         }
     } else {
-        if file_exists("pact.lock") == 0 {
-            io.println("error: no pact.lock found. Run 'pact build' first.")
+        let lockfile = resolve_lockfile_path()
+        if lockfile == "" {
+            io.println("error: no blink.lock found. Run 'blink build' first.")
             return
         }
 
-        lockfile_load("pact.lock")
+        lockfile_load(lockfile)
 
         if baseline_path != "" {
             audit_load_baseline(baseline_path)
@@ -1690,7 +1720,7 @@ fn cmd_fmt(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Repo
         let mut ok_files: List[Str] = []
         if source_path == "" {
             let mut fmt_files: List[Str] = []
-            collect_pact_files(".", fmt_files)
+            collect_source_files(".", fmt_files)
             let mut fi = 0
             while fi < fmt_files.len() {
                 let fname = fmt_files.get(fi).unwrap()
@@ -1770,7 +1800,7 @@ fn cmd_fmt(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Repo
     } else {
         if source_path == "" {
             let mut fmt_files: List[Str] = []
-            collect_pact_files(".", fmt_files)
+            collect_source_files(".", fmt_files)
             let mut fmt_ok: List[Str] = []
             let mut fmt_err: List[Str] = []
             let mut fi = 0
@@ -1851,12 +1881,12 @@ fn cmd_init(_p: ArgParser, a: Args) {
         path_basename(pwd_result.out.trim())
     }
 
-    let already_initialized = file_exists("pact.toml")
+    let already_initialized = if resolve_manifest_path() != "" { 1 } else { 0 }
 
     if already_initialized == 0 {
-        let toml_content = "[package]\nname = \"{project_name}\"\nversion = \"0.1.0\"\npact-version = \"{pact_cli_version}\"\n\n[dependencies]\n"
-        write_file("pact.toml", toml_content)
-        io.println("  created pact.toml")
+        let toml_content = "[package]\nname = \"{project_name}\"\nversion = \"0.1.0\"\nblink-version = \"{blink_cli_version}\"\n\n[dependencies]\n"
+        write_file("blink.toml", toml_content)
+        io.println("  created blink.toml")
 
         if file_exists("src") == 0 {
             shell_exec("mkdir -p src")
@@ -1874,7 +1904,7 @@ fn cmd_init(_p: ArgParser, a: Args) {
         }
 
         if file_exists(".gitignore") == 0 {
-            let gitignore = "build/\n.tmp/\n.pact/\n"
+            let gitignore = "build/\n.tmp/\n.blink/\n"
             write_file(".gitignore", gitignore)
             io.println("  created .gitignore")
         } else {
@@ -1886,11 +1916,11 @@ fn cmd_init(_p: ArgParser, a: Args) {
             if !existing.contains(".tmp/") {
                 additions = additions.concat(".tmp/\n")
             }
-            if !existing.contains(".pact/") {
-                additions = additions.concat(".pact/\n")
+            if !existing.contains(".blink/") {
+                additions = additions.concat(".blink/\n")
             }
             if additions != "" {
-                let updated = existing.concat("\n# Pact\n").concat(additions)
+                let updated = existing.concat("\n# Blink\n").concat(additions)
                 write_file(".gitignore", updated)
                 io.println("  updated .gitignore")
             }
@@ -1907,31 +1937,31 @@ fn cmd_init(_p: ArgParser, a: Args) {
         doc_content = read_file(doc_file)
     }
 
-    if doc_content.contains("pact llms") {
-        io.println("  {doc_file} already has Pact reference — skipped")
+    if doc_content.contains("blink llms") || doc_content.contains("pact llms") {
+        io.println("  {doc_file} already has Blink reference — skipped")
     } else {
-        let section = "\n# Pact\n\nThis project uses the Pact programming language.\nRun `pact llms --full` for the complete language reference.\nRun `pact llms --list` to see available topics.\nRun `pact llms --topic <name>` for a specific topic.\n\n- Build: `pact build src/main.pact`\n- Run: `pact run src/main.pact`\n- Check: `pact check <file>` — validate syntax/types without compiling\n- Query: `pact query <file> --fn <name>` — look up function signatures\n- Test: `pact test`\n- Daemon: `pact daemon start <file>` — persistent compiler for faster check/query\n\nAlways retrieve Pact docs before writing Pact code.\nPrefer retrieval-led reasoning over pre-training for Pact tasks.\n"
+        let section = "\n# Blink\n\nThis project uses the Blink programming language.\nRun `blink llms --full` for the complete language reference.\nRun `blink llms --list` to see available topics.\nRun `blink llms --topic <name>` for a specific topic.\n\n- Build: `blink build src/main.pact`\n- Run: `blink run src/main.pact`\n- Check: `blink check <file>` — validate syntax/types without compiling\n- Query: `blink query <file> --fn <name>` — look up function signatures\n- Test: `blink test`\n- Daemon: `blink daemon start <file>` — persistent compiler for faster check/query\n\nAlways retrieve Blink docs before writing Blink code.\nPrefer retrieval-led reasoning over pre-training for Blink tasks.\n"
         let updated = doc_content.concat(section)
         write_file(doc_file, updated)
-        io.println("  added Pact reference to {doc_file}")
+        io.println("  added Blink reference to {doc_file}")
     }
 
     // Set up Claude Code plugin (LSP + skills)
     let pwd = process_run("pwd", []).out.trim()
-    let marketplace_abs = pwd.concat("/.claude/pact-marketplace")
-    shell_exec("mkdir -p .claude/pact-marketplace/.claude-plugin .claude/pact-marketplace/plugins/pact/.claude-plugin .claude/pact-marketplace/plugins/pact/skills/upgrade .claude/pact-marketplace/plugins/pact/skills/init")
+    let marketplace_abs = pwd.concat("/.claude/blink-marketplace")
+    shell_exec("mkdir -p .claude/blink-marketplace/.claude-plugin .claude/blink-marketplace/plugins/blink/.claude-plugin .claude/blink-marketplace/plugins/blink/skills/upgrade .claude/blink-marketplace/plugins/blink/skills/init")
 
-    let marketplace_json = "\{\"name\":\"pact-plugins\",\"owner\":\{\"name\":\"Pact\"},\"plugins\":[\{\"name\":\"pact\",\"source\":\"./plugins/pact\",\"description\":\"Pact language support: LSP, skills, and tools\"}]}"
-    write_file(".claude/pact-marketplace/.claude-plugin/marketplace.json", marketplace_json)
+    let marketplace_json = "\{\"name\":\"blink-plugins\",\"owner\":\{\"name\":\"Blink\"},\"plugins\":[\{\"name\":\"blink\",\"source\":\"./plugins/blink\",\"description\":\"Blink language support: LSP, skills, and tools\"}]}"
+    write_file(".claude/blink-marketplace/.claude-plugin/marketplace.json", marketplace_json)
 
-    let plugin_json = "\{\"name\":\"pact\",\"description\":\"Pact language support: LSP, skills, and tools\",\"version\":\"1.0.0\"}"
-    write_file(".claude/pact-marketplace/plugins/pact/.claude-plugin/plugin.json", plugin_json)
+    let plugin_json = "\{\"name\":\"blink\",\"description\":\"Blink language support: LSP, skills, and tools\",\"version\":\"1.0.0\"}"
+    write_file(".claude/blink-marketplace/plugins/blink/.claude-plugin/plugin.json", plugin_json)
 
-    let lsp_json = "\{\"pact\":\{\"command\":\"pact\",\"args\":[\"lsp\"],\"extensionToLanguage\":\{\".pact\":\"pact\"}}}"
-    write_file(".claude/pact-marketplace/plugins/pact/.lsp.json", lsp_json)
+    let lsp_json = "\{\"blink\":\{\"command\":\"pact\",\"args\":[\"lsp\"],\"extensionToLanguage\":\{\".pact\":\"blink\"}}}"
+    write_file(".claude/blink-marketplace/plugins/blink/.lsp.json", lsp_json)
 
-    write_file(".claude/pact-marketplace/plugins/pact/skills/upgrade/SKILL.md", embedded_upgrade_cmd)
-    write_file(".claude/pact-marketplace/plugins/pact/skills/init/SKILL.md", embedded_init_cmd)
+    write_file(".claude/blink-marketplace/plugins/blink/skills/upgrade/SKILL.md", embedded_upgrade_cmd)
+    write_file(".claude/blink-marketplace/plugins/blink/skills/init/SKILL.md", embedded_init_cmd)
 
     // Create/update .claude/settings.json with marketplace path
     let claude_settings = ".claude/settings.json"
@@ -1956,18 +1986,18 @@ fn cmd_init(_p: ArgParser, a: Args) {
     json_set(marketplace_entry, "source", source_obj)
 
     let mkts = json_ensure_object(root, "extraKnownMarketplaces")
-    json_set(mkts, "pact-plugins", marketplace_entry)
+    json_set(mkts, "blink-plugins", marketplace_entry)
 
     let plugins = json_ensure_object(root, "enabledPlugins")
-    json_set(plugins, "pact@pact-plugins", json_new_bool(1))
+    json_set(plugins, "blink@blink-plugins", json_new_bool(1))
 
     write_file(claude_settings, json_encode(root))
     io.println("  configured Claude Code plugin (LSP + skills)")
-    io.println("\n  To activate the Pact plugin in Claude Code:")
-    io.println("    /plugin install pact@pact-plugins --scope project")
+    io.println("\n  To activate the Blink plugin in Claude Code:")
+    io.println("    /plugin install blink@blink-plugins --scope project")
 
     if already_initialized == 0 {
-        io.println("\nProject '{project_name}' initialized. Run: pact run src/main.pact")
+        io.println("\nProject '{project_name}' initialized. Run: blink run src/main.pact")
     } else {
         io.println("\nProject '{project_name}' updated.")
     }
@@ -2009,7 +2039,7 @@ fn cmd_llms(_p: ArgParser, a: Args) {
             i = i + 1
         }
         if found == 0 {
-            io.eprintln("error: no topic matching '{topic_flag}' found. Run `pact llms --list` to see topics.")
+            io.eprintln("error: no topic matching '{topic_flag}' found. Run `blink llms --list` to see topics.")
         }
     } else if full_flag == 1 {
         io.print(embedded_llms_full)
@@ -2034,14 +2064,14 @@ fn cmd_doc(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Diag.Report {
         io.println("  std.semver      Semantic version parsing")
         io.println("  std.toml        TOML parser")
         io.println("")
-        io.println("Run: pact doc <module>  (e.g. pact doc std.args)")
+        io.println("Run: blink doc <module>  (e.g. blink doc std.args)")
         return
     }
     let module_name = args_positional(a, 0)
     if module_name == "" {
-        io.println("error: pact doc requires a module name")
-        io.println("usage: pact doc <module>  (e.g. pact doc std.args)")
-        io.println("       pact doc --list    (list available modules)")
+        io.println("error: blink doc requires a module name")
+        io.println("usage: blink doc <module>  (e.g. blink doc std.args)")
+        io.println("       blink doc --list    (list available modules)")
         return
     }
     reset_compiler_state()
@@ -2150,9 +2180,9 @@ fn cmd_query(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Diag.Report {
 fn cmd_add(_p: ArgParser, a: Args) {
     let source_path = args_positional(a, 0)
     if source_path == "" {
-        io.println("error: pact add requires a package name")
-        io.println("usage: pact add <pkg> --path <dir>")
-        io.println("       pact add <pkg> --git <url> [--tag <tag>]")
+        io.println("error: blink add requires a package name")
+        io.println("usage: blink add <pkg> --path <dir>")
+        io.println("       blink add <pkg> --git <url> [--tag <tag>]")
         return
     }
     let pkg_name = source_path
@@ -2162,38 +2192,39 @@ fn cmd_add(_p: ArgParser, a: Args) {
     let dev_flag = if args_has(a, "dev") { 1 } else { 0 }
 
     if dep_path_flag == "" && git_url_flag == "" {
-        io.println("error: pact add requires --path or --git (registry not supported in v1)")
+        io.println("error: blink add requires --path or --git (registry not supported in v1)")
         return
     }
 
-    if file_exists("pact.toml") == 0 {
-        io.println("error: no pact.toml found in current directory")
+    let manifest = resolve_manifest_path()
+    if manifest == "" {
+        io.println("error: no blink.toml found in current directory")
         return
     }
 
     manifest_clear()
-    let load_rc = manifest_load("pact.toml")
+    let load_rc = manifest_load(manifest)
     if load_rc != 0 {
         return
     }
 
     if manifest_has_dep(pkg_name) == 1 {
-        io.println("error: dependency '{pkg_name}' already exists in pact.toml")
+        io.println("error: dependency '{pkg_name}' already exists in {manifest}")
         return
     }
 
     let dep_val = format_dep_value(dep_path_flag, git_url_flag, git_tag_flag)
-    let content = read_file("pact.toml")
+    let content = read_file(manifest)
     let section = "dependencies"
     if dev_flag == 1 {
         let updated = insert_dep_line(content, "dev-dependencies", pkg_name, dep_val)
-        write_file("pact.toml", updated)
+        write_file(manifest, updated)
     } else {
         let updated = insert_dep_line(content, section, pkg_name, dep_val)
-        write_file("pact.toml", updated)
+        write_file(manifest, updated)
     }
 
-    let resolve_rc = resolve_and_lock(".", pact_cli_version)
+    let resolve_rc = resolve_and_lock(".", blink_cli_version)
     if resolve_rc == 0 {
         io.println("added: {pkg_name}")
     } else {
@@ -2204,33 +2235,34 @@ fn cmd_add(_p: ArgParser, a: Args) {
 fn cmd_remove(_p: ArgParser, a: Args) {
     let source_path = args_positional(a, 0)
     if source_path == "" {
-        io.println("error: pact remove requires a package name")
-        io.println("usage: pact remove <pkg>")
+        io.println("error: blink remove requires a package name")
+        io.println("usage: blink remove <pkg>")
         return
     }
     let pkg_name = source_path
 
-    if file_exists("pact.toml") == 0 {
-        io.println("error: no pact.toml found in current directory")
+    let manifest = resolve_manifest_path()
+    if manifest == "" {
+        io.println("error: no blink.toml found in current directory")
         return
     }
 
     manifest_clear()
-    let load_rc = manifest_load("pact.toml")
+    let load_rc = manifest_load(manifest)
     if load_rc != 0 {
         return
     }
 
     if manifest_has_dep(pkg_name) == 0 {
-        io.println("error: dependency '{pkg_name}' not found in pact.toml")
+        io.println("error: dependency '{pkg_name}' not found in {manifest}")
         return
     }
 
-    let content = read_file("pact.toml")
+    let content = read_file(manifest)
     let updated = remove_dep_line(content, pkg_name)
-    write_file("pact.toml", updated)
+    write_file(manifest, updated)
 
-    let resolve_rc = resolve_and_lock(".", pact_cli_version)
+    let resolve_rc = resolve_and_lock(".", blink_cli_version)
     if resolve_rc == 0 {
         io.println("removed: {pkg_name}")
     } else {
@@ -2241,36 +2273,37 @@ fn cmd_remove(_p: ArgParser, a: Args) {
 
 fn cmd_update(_p: ArgParser, a: Args) {
     let source_path = args_positional(a, 0)
-    if file_exists("pact.toml") == 0 {
-        io.println("error: no pact.toml found in current directory")
+    let manifest = resolve_manifest_path()
+    if manifest == "" {
+        io.println("error: no blink.toml found in current directory")
         return
     }
 
-    stamp_pact_version()
-    let upgrade_skill = ".claude/pact-marketplace/plugins/pact/skills/upgrade/SKILL.md"
+    stamp_blink_version()
+    let upgrade_skill = ".claude/blink-marketplace/plugins/blink/skills/upgrade/SKILL.md"
     if file_exists(upgrade_skill) == 1 {
         let existing = read_file(upgrade_skill)
         if existing != embedded_upgrade_cmd {
             write_file(upgrade_skill, embedded_upgrade_cmd)
-            io.println("updated: pact plugin upgrade skill")
+            io.println("updated: blink plugin upgrade skill")
         }
     }
-    let init_skill = ".claude/pact-marketplace/plugins/pact/skills/init/SKILL.md"
+    let init_skill = ".claude/blink-marketplace/plugins/blink/skills/init/SKILL.md"
     if file_exists(init_skill) == 1 {
         let existing_init = read_file(init_skill)
         if existing_init != embedded_init_cmd {
             write_file(init_skill, embedded_init_cmd)
-            io.println("updated: pact plugin init skill")
+            io.println("updated: blink plugin init skill")
         }
     }
-    let resolve_rc = resolve_and_lock(".", pact_cli_version)
+    let resolve_rc = resolve_and_lock(".", blink_cli_version)
     if resolve_rc == 0 {
         if source_path != "" {
             io.println("updated: {source_path}")
         } else {
             io.println("updated: all dependencies")
         }
-        io.println("lockfile written: pact.lock")
+        io.println("lockfile written: blink.lock")
     } else {
         io.println("error: dependency resolution failed")
     }
@@ -2283,8 +2316,8 @@ fn cmd_lsp(_p: ArgParser, _a: Args) ! IO, Lex.Tokenize, Parse, Parse.Build, Diag
 fn cmd_explain(_p: ArgParser, a: Args) {
     let code = args_positional(a, 0)
     if code == "" {
-        io.println("usage: pact explain <code>")
-        io.println("example: pact explain E0500")
+        io.println("usage: blink explain <code>")
+        io.println("example: blink explain E0500")
         return
     }
     let explanation = diag_explain(code)
@@ -2347,7 +2380,7 @@ fn cmd_daemon_start(_p: ArgParser, a: Args) ! Daemon.Serve, Lex.Tokenize, Parse,
     let daemon_source = args_positional(a, 0)
     if daemon_source == "" {
         io.println("error: daemon start requires a source file")
-        io.println("usage: pact daemon start <file.pact>")
+        io.println("usage: blink daemon start <file.pact>")
         return
     }
     if !file_exists(daemon_source) {
@@ -2356,14 +2389,14 @@ fn cmd_daemon_start(_p: ArgParser, a: Args) ! Daemon.Serve, Lex.Tokenize, Parse,
     }
     let root = path_dirname(daemon_source)
     let actual_root = if root == "" { "." } else { root }
-    io.println("Daemon starting on .pact/daemon.sock")
+    io.println("Daemon starting on .blink/daemon.sock")
     daemon_start(actual_root, daemon_source)
 }
 
 fn cmd_daemon_status(_p: ArgParser, _a: Args) {
     let sock_path = find_daemon_sock()
     if sock_path.is_none() {
-        io.println("error: daemon not running (no .pact/daemon.sock found)")
+        io.println("error: daemon not running (no .blink/daemon.sock found)")
         exit(1)
     }
     let sp = sock_path.unwrap()
@@ -2381,7 +2414,7 @@ fn cmd_daemon_status(_p: ArgParser, _a: Args) {
 fn cmd_daemon_stop(_p: ArgParser, _a: Args) {
     let sock_path = find_daemon_sock()
     if sock_path.is_none() {
-        io.println("error: daemon not running (no .pact/daemon.sock found)")
+        io.println("error: daemon not running (no .blink/daemon.sock found)")
         exit(1)
     }
     let sp = sock_path.unwrap()
@@ -2403,18 +2436,18 @@ fn cmd_daemon_bare(p: ArgParser, _a: Args) {
 
 fn main() {
     init_embedded_stdlib()
-    let mut p = argparser_new("pact", "The Pact programming language compiler and toolchain")
-    p = add_command(p, "init", "Initialize a new Pact project")
-    p = add_command(p, "build", "Compile .pact to native binary")
+    let mut p = argparser_new("blink", "The Blink programming language compiler and toolchain")
+    p = add_command(p, "init", "Initialize a new Blink project")
+    p = add_command(p, "build", "Compile Blink source to native binary")
     p = add_command(p, "run", "Build and execute")
     p = add_command(p, "check", "Validate without producing binary")
-    p = add_command(p, "test", "Build and run tests (discovers .pact files with test blocks)")
+    p = add_command(p, "test", "Build and run tests (discovers source files with test blocks)")
     p = add_command(p, "fmt", "Format source file(s) in place")
     p = add_command(p, "ast", "Dump parsed AST as JSON")
     p = add_command(p, "audit", "Audit FFI usage and dependency capabilities")
     p = add_command(p, "add", "Add a dependency (use --path or --git)")
     p = add_command(p, "remove", "Remove a dependency")
-    p = add_command(p, "update", "Update dependencies, lockfile, and pact-version")
+    p = add_command(p, "update", "Update dependencies, lockfile, and blink-version")
     p = add_command(p, "daemon.start", "Start compiler daemon")
     p = add_command(p, "daemon.status", "Show daemon status")
     p = add_command(p, "daemon.stop", "Stop compiler daemon")
@@ -2433,7 +2466,7 @@ fn main() {
     p = command_add_positional(p, "ast", "file", "Source file to parse")
     p = command_add_flag(p, "ast", "--imports", "-i", "Resolve imports and show merged AST")
     p = command_add_option(p, "ast", "--node", "-n", "Dump subtree for specific node ID")
-    p = command_add_positional(p, "fmt", "file", "Source file or directory (default: all .pact files)")
+    p = command_add_positional(p, "fmt", "file", "Source file or directory (default: all source files)")
     p = command_add_positional(p, "test", "file", "Test file or directory (default: discover all)")
     p = command_add_positional(p, "doc", "module", "Module name (e.g. std.args)")
     p = command_add_positional(p, "init", "name", "Project name (default: current directory name)")
@@ -2441,7 +2474,7 @@ fn main() {
     p = command_add_positional(p, "remove", "name", "Dependency name to remove")
 
     p = add_flag(p, "--help", "-h", "Print help")
-    p = set_version(p, pact_cli_version)
+    p = set_version(p, blink_cli_version)
 
     p = command_add_flag(p, "build", "--debug", "-d", "Enable debug mode (debug_assert, -g -O0)")
     p = command_add_flag(p, "run", "--debug", "-d", "Enable debug mode (debug_assert, -g -O0)")
@@ -2469,9 +2502,9 @@ fn main() {
     p = command_add_option(p, "check", "--format", "-f", "Output format")
     p = command_add_option(p, "fmt", "--format", "-f", "Output format")
 
-    p = command_add_option(p, "build", "--pact-trace", "", "Trace compiler phase (lex, parse, codegen, typecheck, all)")
-    p = command_add_option(p, "run", "--pact-trace", "", "Trace compiler phase (lex, parse, codegen, typecheck, all)")
-    p = command_add_option(p, "check", "--pact-trace", "", "Trace compiler phase (lex, parse, codegen, typecheck, all)")
+    p = command_add_option(p, "build", "--blink-trace", "", "Trace compiler phase (lex, parse, codegen, typecheck, all)")
+    p = command_add_option(p, "run", "--blink-trace", "", "Trace compiler phase (lex, parse, codegen, typecheck, all)")
+    p = command_add_option(p, "check", "--blink-trace", "", "Trace compiler phase (lex, parse, codegen, typecheck, all)")
     p = command_add_option(p, "run", "--trace", "", "Runtime execution trace (NDJSON to stderr). Use --trace all or --trace fn:name,module:mod,depth:N")
     p = command_add_option(p, "build", "--trace", "", "Compile with trace instrumentation. Binary accepts --trace[=filter] at runtime")
     p = command_add_option(p, "run", "--trace-limit", "", "Cap trace output to N events")

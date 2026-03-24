@@ -4,7 +4,7 @@ effect Diag {
     effect Report
 }
 
-// diagnostics.pact — Structured diagnostic collector and emitter
+// diagnostics.pact — Structured diagnostic collector and emitter for Blink
 //
 // Collects errors/warnings into parallel arrays, then flushes as
 // JSON (one object per line) or human-readable format.
@@ -41,7 +41,7 @@ pub fn diag_register_file_range(start: Int, end: Int, path: Str) {
     diag_file_ranges_path.push(path)
 }
 
-// ── Lint severity overrides from [lints] in pact.toml ───────────────
+// ── Lint severity overrides from [lints] in blink.toml ───────────────
 let mut lint_overrides: Map[Str, Str] = Map()
 
 // ── Per-function @allow suppression set ─────────────────────────────
@@ -364,7 +364,7 @@ pub fn diag_explain(code: Str) -> Str {
         return "E0505 -- UnresolvedMethod\n\nA method call could not be resolved for the receiver's type.\n\nCommon causes:\n  - Calling a method that does not exist on that type\n  - The variable's type is not what you expected\n  - Missing trait implementation\n\nFix: check the receiver type and available methods.\n\n  let x: Int = 42\n  x.contains(\"a\")  // E0505: Int has no .contains() method"
     }
     if code == "E0506" {
-        return "E0506 -- UndefinedVariable\n\nA variable was referenced that has not been declared in scope.\n\nCommon causes:\n  - Typo in the variable name\n  - Using a variable before it is declared\n  - Variable is out of scope (declared in a different block)\n\n  let name = \"Pact\"\n  io.println(nane)  // E0506: 'nane' -- did you mean 'name'?"
+        return "E0506 -- UndefinedVariable\n\nA variable was referenced that has not been declared in scope.\n\nCommon causes:\n  - Typo in the variable name\n  - Using a variable before it is declared\n  - Variable is out of scope (declared in a different block)\n\n  let name = \"Blink\"\n  io.println(nane)  // E0506: 'nane' -- did you mean 'name'?"
     }
     if code == "E0507" {
         return "E0507 -- UnknownType\n\nA type name was used that the compiler does not recognize.\n\nCommon causes:\n  - Typo in the type name\n  - Forgetting to define or import the type\n  - Using a type from a module that is not imported\n\n  type Point \{ x: Int, y: Int \}\n  let p: Piont = ...  // E0507: unknown type 'Piont'"
@@ -382,13 +382,13 @@ pub fn diag_explain(code: Str) -> Str {
         return "E1003 -- PrivateItemAccess\n\nAn attempt was made to access a private (non-pub) item from another\nmodule.\n\nFix: either mark the item as 'pub' in its module, or use the\nmodule's public API instead.\n\n  // in math.pact\n  pub fn sqrt(x: Float) -> Float \{ ... \}  // accessible\n  fn helper() \{ ... \}                      // private"
     }
     if code == "E1015" {
-        return "E1015 -- InlineModuleNotSupported\n\nInline modules (mod name \{ ... \}) are not supported in Pact.\nPact uses file-based modules: one file = one module.\n\nFix: move the module contents into a separate file and use import.\n\n  // Instead of:\n  mod schema \{\n      fn validate() \{ ... \}\n  \}\n\n  // Create schema.pact with the contents and import it:\n  import schema\n  schema.validate()\n\nSee section 10.1 for details on Pact's module system."
+        return "E1015 -- InlineModuleNotSupported\n\nInline modules (mod name \{ ... \}) are not supported in Blink.\nBlink uses file-based modules: one file = one module.\n\nFix: move the module contents into a separate file and use import.\n\n  // Instead of:\n  mod schema \{\n      fn validate() \{ ... \}\n  \}\n\n  // Create schema.pact with the contents and import it:\n  import schema\n  schema.validate()\n\nSee section 10.1 for details on Blink's module system."
     }
     if code == "E1100" {
         return "E1100 -- UnexpectedToken\n\nThe parser encountered a token it did not expect at this position.\n\nCommon causes:\n  - Missing or extra braces, parentheses, or brackets\n  - Incorrect syntax for the current context\n  - Using an operator in the wrong position\n\nFix: check the line and column indicated and look for syntax errors."
     }
     if code == "E1101" {
-        return "E1101 -- UnexpectedToken in String\n\nThe parser encountered an unexpected token inside a string\ninterpolation.\n\nCommon causes:\n  - Malformed interpolation expression\n  - Unmatched braces inside a string\n\nFix: ensure interpolation expressions are valid Pact expressions."
+        return "E1101 -- UnexpectedToken in String\n\nThe parser encountered an unexpected token inside a string\ninterpolation.\n\nCommon causes:\n  - Malformed interpolation expression\n  - Unmatched braces inside a string\n\nFix: ensure interpolation expressions are valid Blink expressions."
     }
     if code == "E1102" {
         return "E1102 -- UnexpectedToken in Pattern\n\nThe parser encountered an unexpected token inside a match pattern.\n\nCommon causes:\n  - Invalid pattern syntax in a match arm\n  - Using expressions where a pattern is expected\n\nFix: use valid pattern syntax: literals, identifiers, enum variants,\nor wildcard '_'."
@@ -397,13 +397,13 @@ pub fn diag_explain(code: Str) -> Str {
         return "E1103 -- KeywordAsIdentifier\n\nA language keyword was used where an identifier (variable or\nfunction name) was expected.\n\nKeywords: fn, let, if, else, match, while, return, type, trait,\nimport, pub, handler, effect, enum, for, in, mut, const, test\n\nFix: choose a different name that is not a reserved keyword.\n\n  let result = 42    // OK\n  let match = 42     // E1103: 'match' is a keyword"
     }
     if code == "E1107" {
-        return "E1107 -- EmptyBraceExpr\n\nEmpty braces were used in expression position. Pact does not have\nempty-brace map syntax.\n\nFix: use Map() to construct an empty map.\n\n  let m: Map[Str, Int] = Map()  // OK"
+        return "E1107 -- EmptyBraceExpr\n\nEmpty braces were used in expression position. Blink does not have\nempty-brace map syntax.\n\nFix: use Map() to construct an empty map.\n\n  let m: Map[Str, Int] = Map()  // OK"
     }
     if code == "E1108" {
         return "E1108 -- FileNotFound / UnknownIntrinsic\n\nEither an #embed() referenced a file that does not exist, or an\nunknown compile-time intrinsic was used.\n\nFix: check that the file path is correct relative to the source\nfile, or use a supported intrinsic (#embed is currently the only one).\n\n  const data: Str = #embed(\"data.txt\")  // file must exist"
     }
     if code == "E1109" {
-        return "E1109 -- MutFieldNotSupported\n\nThe 'mut' keyword was used on a struct field declaration. In Pact,\nmutability is a property of the binding, not the type or its fields.\nAll fields of a 'let mut' binding are mutable; all fields of a 'let'\nbinding are immutable.\n\nFix: remove 'mut' from the field and use 'let mut' when binding.\n\n  type Point \{ x: Float, y: Float \}\n  let mut p = Point \{ x: 1.0, y: 2.0 \}\n  p.x = 3.0  // OK — binding is mut"
+        return "E1109 -- MutFieldNotSupported\n\nThe 'mut' keyword was used on a struct field declaration. In Blink,\nmutability is a property of the binding, not the type or its fields.\nAll fields of a 'let mut' binding are mutable; all fields of a 'let'\nbinding are immutable.\n\nFix: remove 'mut' from the field and use 'let mut' when binding.\n\n  type Point \{ x: Float, y: Float \}\n  let mut p = Point \{ x: 1.0, y: 2.0 \}\n  p.x = 3.0  // OK — binding is mut"
     }
     if code == "E1200" {
         return "E1200 -- ModuleNotFound\n\nAn import statement referenced a module that could not be found.\n\nCommon causes:\n  - Typo in the module name\n  - Missing file: the module's .pact file does not exist\n  - Incorrect path in the module hierarchy\n\nFix: verify the module name matches a .pact file in your project or\nthe standard library.\n\n  import math       // looks for lib/std/math.pact or src/math.pact\n  import pkg.audit  // looks for lib/pkg/audit.pact"
@@ -451,7 +451,7 @@ pub fn diag_explain(code: Str) -> Str {
         return "E0811 -- PtrOutsideFFI\n\nPtr[T] was used in a function that is not marked @ffi. Pointer\ntypes are only valid in FFI contexts.\n\nFix: add @ffi to the function, or use a safe wrapper.\n\n  @ffi(\"malloc\")\n  @trusted\n  fn c_malloc(size: Int) -> Ptr[Void] ! FFI \{ \}"
     }
     if code == "E0820" {
-        return "E0820 -- MissingNativeDep\n\nAn @ffi annotation references a C library that is not declared in\nthe [native-dependencies] section of pact.toml.\n\nFix: add the library to pact.toml:\n\n  [native-dependencies]\n  libname = \{ system = true \}"
+        return "E0820 -- MissingNativeDep\n\nAn @ffi annotation references a C library that is not declared in\nthe [native-dependencies] section of blink.toml.\n\nFix: add the library to blink.toml:\n\n  [native-dependencies]\n  libname = \{ system = true \}"
     }
     if code == "E0821" {
         return "E0821 -- NativeDepUnavailableCrossTarget\n\nA native dependency declared as system-only cannot be resolved for\na cross-compilation target. Cross-compilation requires vendored\nsource or a static archive.\n\nFix: provide vendored source:\n  libname = \{ path = \"vendor/libname.c\" \}\n\nOr explicitly opt in to dynamic linking on the target:\n  libname = \{ system = true, link = \"dynamic\" \}"

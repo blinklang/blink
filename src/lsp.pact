@@ -77,7 +77,7 @@ fn lsp_send_notification(method: Str, params: Str) ! IO {
 }
 
 fn lsp_handle_initialize() -> Str {
-    "\{\"capabilities\":\{\"textDocumentSync\":1,\"definitionProvider\":true,\"hoverProvider\":true,\"referencesProvider\":true,\"documentSymbolProvider\":true,\"completionProvider\":\{\"triggerCharacters\":[\".\"]},\"signatureHelpProvider\":\{\"triggerCharacters\":[\"(\",\",\"]\},\"renameProvider\":true,\"codeActionProvider\":true,\"workspaceSymbolProvider\":true,\"documentFormattingProvider\":true,\"inlayHintProvider\":true\},\"serverInfo\":\{\"name\":\"pact-lsp\",\"version\":\"0.1.0\"\}\}"
+    "\{\"capabilities\":\{\"textDocumentSync\":1,\"definitionProvider\":true,\"hoverProvider\":true,\"referencesProvider\":true,\"documentSymbolProvider\":true,\"completionProvider\":\{\"triggerCharacters\":[\".\"]},\"signatureHelpProvider\":\{\"triggerCharacters\":[\"(\",\",\"]\},\"renameProvider\":true,\"codeActionProvider\":true,\"workspaceSymbolProvider\":true,\"documentFormattingProvider\":true,\"inlayHintProvider\":true\},\"serverInfo\":\{\"name\":\"blink-lsp\",\"version\":\"0.1.0\"\}\}"
 }
 
 fn lsp_handle_shutdown() -> Str {
@@ -129,7 +129,7 @@ fn lsp_build_diagnostics_json(uri: Str) -> Str {
         let end_col = if el > 0 { lsp_to_zero_based(ec) } else { col }
         let code = json_escape(diag_code.get(i).unwrap())
         let msg = json_escape(diag_message.get(i).unwrap())
-        let entry = "\{\"range\":\{\"start\":\{\"line\":{line},\"character\":{col}\},\"end\":\{\"line\":{end_line},\"character\":{end_col}\}\},\"severity\":{sev},\"code\":\"{code}\",\"source\":\"pact\",\"message\":\"{msg}\"\}"
+        let entry = "\{\"range\":\{\"start\":\{\"line\":{line},\"character\":{col}\},\"end\":\{\"line\":{end_line},\"character\":{end_col}\}\},\"severity\":{sev},\"code\":\"{code}\",\"source\":\"blink\",\"message\":\"{msg}\"\}"
         sb.write(entry)
         i = i + 1
     }
@@ -145,11 +145,11 @@ fn lsp_compile_and_build(file_path: Str) -> Int ! IO, Lex.Tokenize, Parse, Parse
 fn lsp_publish_diagnostics(uri: Str) ! IO {
     let params = lsp_build_diagnostics_json(uri)
     lsp_send_notification("textDocument/publishDiagnostics", params)
-    io.eprintln("pact-lsp: published {diag_severity.len()} diagnostic(s)")
+    io.eprintln("blink-lsp: published {diag_severity.len()} diagnostic(s)")
 }
 
 fn lsp_full_check(uri: Str, file_path: Str) ! IO, Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
-    io.eprintln("pact-lsp: full check {file_path}")
+    io.eprintln("blink-lsp: full check {file_path}")
     let final_program = lsp_compile_and_build(file_path)
 
     check_types(final_program)
@@ -172,14 +172,14 @@ fn lsp_incremental_check(uri: Str, file_path: Str) ! IO, Lex.Tokenize, Parse, Pa
     inc_compute_affected()
 
     if inc_affected_count == 0 {
-        io.eprintln("pact-lsp: no affected symbols, skipping recheck")
+        io.eprintln("blink-lsp: no affected symbols, skipping recheck")
         lsp_publish_diagnostics(uri)
         return
     }
 
     let affected_names = inc_affected_names()
 
-    io.eprintln("pact-lsp: incremental check ({inc_affected_count} affected)")
+    io.eprintln("blink-lsp: incremental check ({inc_affected_count} affected)")
     let final_program = lsp_compile_and_build(file_path)
 
     tc_set_incremental_filter(affected_names)
@@ -307,7 +307,7 @@ fn lsp_build_hover_markdown(sym_idx: Int) -> Str {
     let ensures = si_sym_ensures.get(sym_idx).unwrap()
     let name = si_sym_name.get(sym_idx).unwrap()
 
-    sb.write("```pact\n")
+    sb.write("```blink\n")
     if kind == SK_FN {
         sb.write("fn ")
         sb.write(sig)
@@ -1158,12 +1158,12 @@ fn lsp_log_memory_stats(method: Str) ! IO {
     let gen = generic_fns.len()
     let mono = mono_instances.len()
     lsp_mem_seq = lsp_mem_seq + 1
-    io.eprintln("pact-lsp: mem [{method}] np={np} diag={diag} si={si} tp={tp} fnreg={fnreg} ma={ma} gen={gen} mono={mono}")
+    io.eprintln("blink-lsp: mem [{method}] np={np} diag={diag} si={si} tp={tp} fnreg={fnreg} ma={ma} gen={gen} mono={mono}")
 }
 
 pub fn lsp_start() ! IO, Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit {
     lsp_running = 1
-    io.eprintln("pact-lsp: starting")
+    io.eprintln("blink-lsp: starting")
     while lsp_running == 1 {
         let msg = lsp_read_message()
         if msg == "" {
@@ -1187,5 +1187,5 @@ pub fn lsp_start() ! IO, Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeChec
         lsp_dispatch(method, id_int, id_is_present, root)
         lsp_log_memory_stats(method)
     }
-    io.eprintln("pact-lsp: stopped")
+    io.eprintln("blink-lsp: stopped")
 }

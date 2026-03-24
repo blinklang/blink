@@ -136,9 +136,13 @@ test "resolve and lock" {
     let rc = resolve_and_lock("/tmp/_pact_test_resolve_lock", "0.0.0-test")
     assert_eq(rc, 0)
 
-    // Verify lockfile was written
-    let lock_path = "/tmp/_pact_test_resolve_lock/pact.lock"
-    let exists = file_exists(lock_path)
+    // Verify lockfile was written (resolver writes blink.lock)
+    let mut lock_path = "/tmp/_pact_test_resolve_lock/blink.lock"
+    let mut exists = file_exists(lock_path)
+    if exists == 0 {
+        lock_path = "/tmp/_pact_test_resolve_lock/pact.lock"
+        exists = file_exists(lock_path)
+    }
     assert_eq(exists, 1)
 
     // Load and verify lockfile contents

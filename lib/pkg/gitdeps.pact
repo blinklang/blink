@@ -112,7 +112,7 @@ pub fn git_fetch(url: Str, tag: Str) -> Int {
 
     let home = get_home_dir()
     let sanitized = sanitize_url(url)
-    let cache_dir = path_join(path_join(path_join(home, ".pact"), "cache"), "git")
+    let cache_dir = path_join(path_join(path_join(home, ".blink"), "cache"), "git")
     let dep_dir = path_join(cache_dir, sanitized)
 
     shell_exec("mkdir -p {dep_dir}")

@@ -1994,7 +1994,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
         }
     }
 
-    // net.request(req) -> Result[Response, NetError] — redirects to Pact stdlib
+    // net.request(req) -> Result[Response, NetError] — redirects to Blink stdlib
     if np_kind.get(obj_node).unwrap() == NodeKind.Ident && np_name.get(obj_node).unwrap() == "net" && method == "request" {
         let args_sl = np_args.get(node).unwrap()
         if args_sl != -1 && sublist_length(args_sl) > 0 {
@@ -2016,7 +2016,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
         return
     }
 
-    // net.get/post/put/delete/head/patch — handled by Pact stdlib (http_client.pact)
+    // net.get/post/put/delete/head/patch — handled by Blink stdlib (http_client.pact)
     // Users should use http_client.get(), http_client.post(), etc.
 
     // net.listen(host, port) -> Int

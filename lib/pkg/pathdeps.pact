@@ -75,10 +75,13 @@ fn resolve_one(name: Str, rel_path: Str, base_dir: Str) -> Int {
         return 1
     }
 
-    // Validate pact.toml exists
-    let manifest_path = path_join(full_path, "pact.toml")
+    // Validate manifest exists
+    let mut manifest_path = path_join(full_path, "blink.toml")
     if file_exists(manifest_path) == 0 {
-        io.println("error: path dependency '{name}' missing pact.toml in: {full_path}")
+        manifest_path = path_join(full_path, "pact.toml")
+    }
+    if file_exists(manifest_path) == 0 {
+        io.println("error: path dependency '{name}' missing manifest in: {full_path}")
         return 1
     }
 
@@ -162,7 +165,10 @@ fn resolve_one(name: Str, rel_path: Str, base_dir: Str) -> Int {
 // ── Main entry point ───────────────────────────────────────────
 
 pub fn resolve_path_deps(project_root: Str) -> Int {
-    let root_manifest = path_join(project_root, "pact.toml")
+    let mut root_manifest = path_join(project_root, "blink.toml")
+    if file_exists(root_manifest) == 0 {
+        root_manifest = path_join(project_root, "pact.toml")
+    }
     let load_rc = manifest_load(root_manifest)
     if load_rc != 0 {
         io.println("error: failed to load root manifest")

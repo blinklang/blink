@@ -6,10 +6,10 @@ effect Format {
     effect Emit
 }
 
-// formatter.pact — AST pretty-printer emitting canonical Pact source
+// formatter.pact — AST pretty-printer emitting canonical Blink source
 //
-// Walks the parallel-array AST and emits canonically formatted Pact.
-// Follows the same pattern as codegen but outputs Pact source instead of C.
+// Walks the parallel-array AST and emits canonically formatted Blink.
+// Follows the same pattern as codegen but outputs Blink source instead of C.
 //
 // Canonical rules: 4-space indent, K&R braces, no semicolons,
 // double quotes, max 1 blank line, trailing whitespace stripped.

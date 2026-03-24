@@ -99,9 +99,12 @@ fn process_path_dep(name: Str, dep_path: Str, base_dir: Str) -> Int {
         return 1
     }
 
-    let manifest_path = path_join(full_path, "pact.toml")
+    let mut manifest_path = path_join(full_path, "blink.toml")
     if file_exists(manifest_path) == 0 {
-        io.println("error: path dependency '{name}' missing pact.toml: {full_path}")
+        manifest_path = path_join(full_path, "pact.toml")
+    }
+    if file_exists(manifest_path) == 0 {
+        io.println("error: path dependency '{name}' missing manifest: {full_path}")
         return 1
     }
 
@@ -179,9 +182,12 @@ fn process_git_dep(name: Str, url: Str, tag: Str) -> Int {
     let content_hash = git_get_content_hash()
 
     // Load the dep's manifest from checkout
-    let manifest_path = path_join(checkout_path, "pact.toml")
+    let mut manifest_path = path_join(checkout_path, "blink.toml")
     if file_exists(manifest_path) == 0 {
-        io.println("error: git dependency '{name}' missing pact.toml")
+        manifest_path = path_join(checkout_path, "pact.toml")
+    }
+    if file_exists(manifest_path) == 0 {
+        io.println("error: git dependency '{name}' missing manifest")
         return 1
     }
 
@@ -242,7 +248,10 @@ fn process_git_dep(name: Str, url: Str, tag: Str) -> Int {
 // ── Main resolver entry point ───────────────────────────────────
 
 pub fn resolve(project_root: Str) -> Int {
-    let root_manifest = path_join(project_root, "pact.toml")
+    let mut root_manifest = path_join(project_root, "blink.toml")
+    if file_exists(root_manifest) == 0 {
+        root_manifest = path_join(project_root, "pact.toml")
+    }
     let load_rc = manifest_load(root_manifest)
     if load_rc != 0 {
         io.println("error: failed to load root manifest")
@@ -306,7 +315,7 @@ pub fn resolve_and_lock(project_root: Str, pact_version: Str) -> Int {
         i = i + 1
     }
 
-    let lock_path = path_join(project_root, "pact.lock")
+    let lock_path = path_join(project_root, "blink.lock")
     lockfile_write(lock_path)
     0
 }

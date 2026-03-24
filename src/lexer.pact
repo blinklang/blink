@@ -5,7 +5,7 @@ effect Lex {
     effect Tokenize
 }
 
-// lexer.pact — Self-hosting lexer for Pact, ported from Python
+// lexer.pact — Self-hosting lexer for Blink, ported from Python
 //
 // Demonstrates: parallel arrays (workaround for no struct-in-list),
 //               char_at / ASCII arithmetic, string interpolation scanning,

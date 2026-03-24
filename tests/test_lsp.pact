@@ -18,14 +18,14 @@ test "parse content length returns -1 for non-matching headers" {
 }
 
 fn mock_initialize_result() -> Str {
-    "\{\"capabilities\":\{\"textDocumentSync\":1,\"definitionProvider\":true\},\"serverInfo\":\{\"name\":\"pact-lsp\",\"version\":\"0.1.0\"\}\}"
+    "\{\"capabilities\":\{\"textDocumentSync\":1,\"definitionProvider\":true\},\"serverInfo\":\{\"name\":\"blink-lsp\",\"version\":\"0.1.0\"\}\}"
 }
 
 test "initialize result contains expected capabilities" {
     let result = mock_initialize_result()
     assert(result.contains("textDocumentSync"))
     assert(result.contains("definitionProvider"))
-    assert(result.contains("pact-lsp"))
+    assert(result.contains("blink-lsp"))
 }
 
 fn uri_to_path(uri: Str) -> Str {
@@ -103,7 +103,7 @@ test "lsp initialize returns capabilities" {
     lsp_run_session(input)
     assert(lsp_last_out.len() > 0)
     assert(lsp_last_out.contains("textDocumentSync"))
-    assert(lsp_last_out.contains("pact-lsp"))
+    assert(lsp_last_out.contains("blink-lsp"))
 }
 
 test "lsp didOpen with type error produces diagnostics" {

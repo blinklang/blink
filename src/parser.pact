@@ -8,7 +8,7 @@ effect Parse {
     effect Build
 }
 
-// parser.pact — Self-hosting recursive descent parser for Pact
+// parser.pact — Self-hosting recursive descent parser for Blink
 //
 // Port of src/pact/parser.py. Uses parallel-array node pool since
 // the C backend can't store structs in List. Token input arrives as
@@ -590,7 +590,7 @@ pub fn parse_program() -> Int ! Parse, Diag.Report {
                     advance()
                 }
             }
-            diag_error("InlineModuleNotSupported", "E1015", "inline modules are not supported; create a separate file and use 'import' instead (see section 10.1.1)", mod_line, mod_col, "Pact uses file-based modules: one file = one module")
+            diag_error("InlineModuleNotSupported", "E1015", "inline modules are not supported; create a separate file and use 'import' instead (see section 10.1.1)", mod_line, mod_col, "Blink uses file-based modules: one file = one module")
         } else {
             diag_error("UnexpectedToken", "E1100", "unexpected token at top level: {peek_kind()}", peek_line(), peek_col(), "")
             advance()

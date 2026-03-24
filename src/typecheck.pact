@@ -2730,7 +2730,7 @@ fn types_compatible(a: Int, b: Int) -> Int {
     let ka = ty_kind.get(a).unwrap()
     let kb = ty_kind.get(b).unwrap()
     if ka == TK_TYPEVAR || kb == TK_TYPEVAR { return 1 }
-    // Int and Bool are interchangeable in Pact (C-style truthiness)
+    // Int and Bool are interchangeable in Blink (C-style truthiness)
     if (ka == TK_INT || ka == TK_BOOL) && (kb == TK_INT || kb == TK_BOOL) { return 1 }
     // Enums are tag-ints at runtime — Int and Enum are compatible
     if (ka == TK_INT && kb == TK_ENUM) || (ka == TK_ENUM && kb == TK_INT) { return 1 }
@@ -2759,7 +2759,7 @@ fn type_kind(tid: Int) -> Int {
     ty_kind.get(tid).unwrap()
 }
 
-// Pact treats Int as truthy — Int is valid in Bool contexts
+// Blink treats Int as truthy — Int is valid in Bool contexts
 fn is_bool_compat(tid: Int) -> Int {
     if tid == TYPE_UNKNOWN { return 1 }
     if tid == TYPE_BOOL { return 1 }

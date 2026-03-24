@@ -2,7 +2,7 @@ import ast
 import parser
 import diagnostics
 
-// mutation_analysis.pact — Tier 1 write-set inference for Pact modules
+// mutation_analysis.pact — Tier 1 write-set inference for Blink modules
 //
 // Walks the AST after parsing to determine which module-level mutable
 // bindings each function may write to (directly or transitively via

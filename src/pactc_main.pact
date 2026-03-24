@@ -4,8 +4,8 @@ import parser
 
 fn main() {
     if arg_count() < 2 {
-        io.println("Usage: pactc <source.pact> [output.c] [--format json] [--json] [--emit pact] [--stats] [--debug] [--dump-ast] [--pact-trace <phase>]")
-        io.println("  Compiles a Pact source file to C.")
+        io.println("Usage: blinkc <source.pact> [output.c] [--format json] [--json] [--emit pact] [--stats] [--debug] [--dump-ast] [--blink-trace <phase>]")
+        io.println("  Compiles a Blink source file to C.")
         return
     }
 
@@ -15,7 +15,7 @@ fn main() {
     let mut stats_mode = 0
     let mut check_only = 0
     let mut dump_ast = 0
-    let mut pact_trace_flag = ""
+    let mut blink_trace_flag = ""
     let mut i = 2
     while i < arg_count() {
         let arg = get_arg(i)
@@ -42,10 +42,10 @@ fn main() {
             check_only = 1
         } else if arg == "--dump-ast" {
             dump_ast = 1
-        } else if arg == "--pact-trace" {
+        } else if arg == "--blink-trace" || arg == "--pact-trace" {
             if i + 1 < arg_count() {
                 i = i + 1
-                pact_trace_flag = get_arg(i)
+                blink_trace_flag = get_arg(i)
             }
         } else {
             out_path = arg
@@ -54,7 +54,7 @@ fn main() {
     }
 
     diag_source_file = source_path
-    trace_mode = pact_trace_flag
+    trace_mode = blink_trace_flag
     let source = read_file(source_path)
 
     let t_lex_start = time_ms()
@@ -62,9 +62,9 @@ fn main() {
     let t_lex_end = time_ms()
     pos = 0
     let t_parse_start = time_ms()
-    let first_node_pactc = np_kind.len()
+    let first_node_blinkc = np_kind.len()
     let program_node = parse_program()
-    attach_comments_pass(program_node, first_node_pactc)
+    attach_comments_pass(program_node, first_node_blinkc)
     let t_parse_end = time_ms()
     loaded_files.push(source_path)
 
@@ -91,11 +91,11 @@ fn main() {
     }
 
     if emit_mode == "pact" {
-        let pact_output = format(final_program)
+        let fmt_output = format(final_program)
         if out_path != "" {
-            write_file(out_path, pact_output)
+            write_file(out_path, fmt_output)
         } else {
-            io.println(pact_output)
+            io.println(fmt_output)
         }
         return
     }

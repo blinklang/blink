@@ -18,9 +18,9 @@ fn main() {
     // Write main source that imports the dependency
     write_file("{base}/src/main.pact", "import mylib\n\nfn main() \{\n    io.println(greet())\n\}\n")
 
-    // Verify no pact.lock exists yet
-    if file_exists("{base}/pact.lock") == 1 {
-        io.println("FAIL: pact.lock should not exist before build")
+    // Verify no lock file exists yet
+    if file_exists("{base}/blink.lock") == 1 || file_exists("{base}/pact.lock") == 1 {
+        io.println("FAIL: lock file should not exist before build")
         shell_exec("rm -rf {base}")
         return
     }
@@ -36,11 +36,11 @@ fn main() {
         return
     }
 
-    // Verify pact.lock was auto-created
-    if file_exists("{base}/pact.lock") == 1 {
-        io.println("PASS: pact.lock auto-created by build")
+    // Verify lock file was auto-created
+    if file_exists("{base}/blink.lock") == 1 || file_exists("{base}/pact.lock") == 1 {
+        io.println("PASS: lock file auto-created by build")
     } else {
-        io.println("FAIL: pact.lock was not created by build")
+        io.println("FAIL: lock file was not created by build")
         shell_exec("rm -rf {base}")
         return
     }

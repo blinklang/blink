@@ -16,25 +16,30 @@ import ast_dump
 import std.path
 import comment_attach
 
-// compiler.pact — Self-hosting Pact compiler driver
+// compiler.pact — Self-hosting Blink compiler driver
 //
 // Ties together lexer, parser, and codegen into a complete compiler.
 // Reads a .pact source file, lexes, parses, generates C, and writes output.
 //
-// Usage (once compiled): ./pactc <source.pact> [output.c]
+// Usage (once compiled): ./blinkc <source.pact> [output.c]
 // If no output file given, writes to stdout.
 
 let mut lint_cache_mtime: Int = -1
 
 fn load_lint_overrides() {
-    let mtime = file_mtime("pact.toml")
+    let mut manifest_path = "blink.toml"
+    let mut mtime = file_mtime(manifest_path)
+    if mtime == -1 {
+        manifest_path = "pact.toml"
+        mtime = file_mtime(manifest_path)
+    }
     if mtime == -1 {
         return
     }
     if mtime != lint_cache_mtime {
         lint_cache_mtime = mtime
         manifest_clear()
-        let rc = manifest_load("pact.toml")
+        let rc = manifest_load(manifest_path)
         if rc != 0 {
             return
         }
@@ -185,12 +190,17 @@ fn ensure_lockfile_loaded(src_root: Str) {
     if project_root == "" {
         project_root = "."
     }
+    let lock_path_new = path_join(project_root, "blink.lock")
+    if file_exists(lock_path_new) == 1 {
+        lockfile_load(lock_path_new)
+        return
+    }
     let lock_path = path_join(project_root, "pact.lock")
     if file_exists(lock_path) == 1 {
         lockfile_load(lock_path)
         return
     }
-    // Walk up from src_root looking for pact.lock
+    // Walk up from src_root looking for blink.lock / pact.lock
     let mut dir = src_root
     if dir.ends_with("/") {
         dir = dir.substring(0, dir.len() - 1)
@@ -199,6 +209,11 @@ fn ensure_lockfile_loaded(src_root: Str) {
     while depth < 20 {
         let parent = path_dirname(dir)
         if parent == dir || parent == "" {
+            return
+        }
+        let candidate_new = path_join(parent, "blink.lock")
+        if file_exists(candidate_new) == 1 {
+            lockfile_load(candidate_new)
             return
         }
         let candidate = path_join(parent, "pact.lock")
@@ -334,7 +349,7 @@ fn resolve_from_lockfile(dotted_path: Str, _src_root: Str) -> Option[Str] {
             }
             i = i + 1
         }
-        base_dir = path_join(home, path_join(".pact/cache/git", path_join(cache_name, commit_hash)))
+        base_dir = path_join(home, path_join(".blink/cache/git", path_join(cache_name, commit_hash)))
     }
 
     if base_dir == "" {
@@ -364,7 +379,7 @@ pub fn resolve_module_path(dotted_path: Str, src_root: Str) -> Str ! Diag.Report
     // Step 1: Check local src/
     let local_exists = file_exists(full) == 1
 
-    // Step 2: Check dependencies via pact.lock
+    // Step 2: Check dependencies via blink.lock
     ensure_lockfile_loaded(src_root)
     let dep_path = resolve_from_lockfile(dotted_path, src_root)
 
@@ -392,9 +407,9 @@ pub fn resolve_module_path(dotted_path: Str, src_root: Str) -> Str ! Diag.Report
         if file_exists(pkg_full) == 1 {
             return pkg_full
         }
-        let pact_root = get_env("PACT_ROOT") ?? ""
-        if pact_root != "" {
-            let pkg_root = path_join(pact_root, path_join("lib/pkg", pkg_rel.concat(".pact")))
+        let blink_root = get_env("BLINK_ROOT") ?? (get_env("PACT_ROOT") ?? "")
+        if blink_root != "" {
+            let pkg_root = path_join(blink_root, path_join("lib/pkg", pkg_rel.concat(".pact")))
             if file_exists(pkg_root) == 1 {
                 return pkg_root
             }
@@ -413,9 +428,9 @@ pub fn resolve_module_path(dotted_path: Str, src_root: Str) -> Str ! Diag.Report
         if file_exists(std_full) == 1 {
             return std_full
         }
-        let pact_root = get_env("PACT_ROOT") ?? ""
-        if pact_root != "" {
-            let std_root = path_join(pact_root, path_join("lib/std", std_rel.concat(".pact")))
+        let blink_root = get_env("BLINK_ROOT") ?? (get_env("PACT_ROOT") ?? "")
+        if blink_root != "" {
+            let std_root = path_join(blink_root, path_join("lib/std", std_rel.concat(".pact")))
             if file_exists(std_root) == 1 {
                 return std_root
             }
@@ -430,7 +445,7 @@ pub fn resolve_module_path(dotted_path: Str, src_root: Str) -> Str ! Diag.Report
     if npkgs > 0 {
         diag_error_no_loc("ModuleNotFound", "E1200", "module not found: {dotted_path} (looked at: {full}, checked {npkgs} lockfile packages)", "")
     } else {
-        diag_error_no_loc("ModuleNotFound", "E1200", "module not found: {dotted_path} (looked at: {full}; no dependencies - run `pact add` to add packages)", "")
+        diag_error_no_loc("ModuleNotFound", "E1200", "module not found: {dotted_path} (looked at: {full}; no dependencies - run `blink add` to add packages)", "")
     }
     ""
 }

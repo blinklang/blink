@@ -46,8 +46,8 @@ fn main() {
     }
     io.println("PASS: pact init created project")
 
-    if file_exists("{proj}/pact.toml") == 0 {
-        io.println("FAIL: pact init did not create pact.toml")
+    if file_exists("{proj}/blink.toml") == 0 && file_exists("{proj}/pact.toml") == 0 {
+        io.println("FAIL: blink init did not create blink.toml")
         shell_exec("rm -rf {base}")
         return
     }
@@ -66,12 +66,12 @@ fn main() {
     }
     io.println("PASS: pact add --git succeeded")
 
-    if file_exists("{proj}/pact.lock") == 0 {
-        io.println("FAIL: pact add did not create pact.lock")
+    if file_exists("{proj}/blink.lock") == 0 && file_exists("{proj}/pact.lock") == 0 {
+        io.println("FAIL: blink add did not create lock file")
         shell_exec("rm -rf {base}")
         return
     }
-    io.println("PASS: pact.lock created")
+    io.println("PASS: lock file created")
 
     // Step 4: Write main.pact that uses the dependency
     write_file("{proj}/src/main.pact", "import mathlib\n\nfn main() \{\n    if add(2, 3) == 5 \{\n        io.println(\"correct\")\n    \} else \{\n        io.println(\"wrong\")\n    \}\n\}\n")

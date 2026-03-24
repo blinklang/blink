@@ -196,17 +196,17 @@ pub fn daemon_start(root: Str, source: Str) ! Daemon.Serve, Lex.Tokenize, Parse,
     daemon_source_path = source
     daemon_start_time = time_ms()
 
-    // Ensure .pact/ directory exists
-    let pact_dir = path_join(root, ".pact")
-    shell_exec("mkdir -p {pact_dir}")
+    // Ensure .blink/ directory exists
+    let blink_dir = path_join(root, ".blink")
+    shell_exec("mkdir -p {blink_dir}")
 
     // Write PID file
-    daemon_pid_path = path_join(pact_dir, "daemon.pid")
+    daemon_pid_path = path_join(blink_dir, "daemon.pid")
     let pid = getpid()
     write_file(daemon_pid_path, "{pid}")
 
     // Create Unix socket
-    daemon_sock_path = path_join(pact_dir, "daemon.sock")
+    daemon_sock_path = path_join(blink_dir, "daemon.sock")
     daemon_socket_fd = unix_socket_listen(daemon_sock_path)
     if daemon_socket_fd < 0 {
         io.eprintln("daemon: failed to create socket at {daemon_sock_path}")

@@ -1,6 +1,6 @@
-// manifest.pact — pact.toml manifest loader and validator (§8.9.3)
+// manifest.pact — blink.toml manifest loader and validator (§8.9.3)
 //
-// Loads, parses, and validates pact.toml project manifests.
+// Loads, parses, and validates blink.toml/pact.toml project manifests.
 // Uses std.toml for parsing and stores results in parallel arrays.
 
 import std.toml
@@ -473,7 +473,7 @@ fn check_unknown_sections() {
             section = key.substring(0, dot_pos)
         }
         if is_known_section(section) == 0 {
-            io.println("warning: unknown section '{section}' in pact.toml")
+            io.println("warning: unknown section '{section}' in manifest")
             // Only warn once per unknown section — add it to known list
             known_sections.push(section)
         }
