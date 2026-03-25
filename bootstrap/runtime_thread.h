@@ -1,5 +1,5 @@
-#ifndef PACT_RUNTIME_THREAD_H
-#define PACT_RUNTIME_THREAD_H
+#ifndef BLINK_RUNTIME_THREAD_H
+#define BLINK_RUNTIME_THREAD_H
 
 #include <pthread.h>
 
@@ -23,8 +23,8 @@ typedef struct {
 
 /* ── Handle[T]: async result ────────────────────────────────────────── */
 
-#define PACT_HANDLE_RUNNING   0
-#define PACT_HANDLE_DONE      1
+#define BLINK_HANDLE_RUNNING  0
+#define BLINK_HANDLE_DONE     1
 
 typedef struct {
     pthread_t thread;
@@ -48,7 +48,7 @@ typedef struct {
     pthread_cond_t recv_cond;
 } pact_channel;
 
-PACT_UNUSED static void* pact_threadpool_worker(void* arg) {
+BLINK_UNUSED static void* pact_threadpool_worker(void* arg) {
     pact_threadpool* pool = (pact_threadpool*)arg;
     while (1) {
         pthread_mutex_lock(&pool->mutex);
@@ -71,7 +71,7 @@ PACT_UNUSED static void* pact_threadpool_worker(void* arg) {
     return NULL;
 }
 
-PACT_UNUSED static pact_threadpool* pact_threadpool_init(int thread_count) {
+BLINK_UNUSED static pact_threadpool* pact_threadpool_init(int thread_count) {
     if (thread_count <= 0) {
         thread_count = 4;
     }
@@ -89,7 +89,7 @@ PACT_UNUSED static pact_threadpool* pact_threadpool_init(int thread_count) {
     return pool;
 }
 
-PACT_UNUSED static void pact_threadpool_submit(pact_threadpool* pool, void (*fn)(void*), void* arg) {
+BLINK_UNUSED static void pact_threadpool_submit(pact_threadpool* pool, void (*fn)(void*), void* arg) {
     pact_task* task = (pact_task*)pact_alloc(sizeof(pact_task));
     task->fn = fn;
     task->arg = arg;
@@ -105,7 +105,7 @@ PACT_UNUSED static void pact_threadpool_submit(pact_threadpool* pool, void (*fn)
     pthread_mutex_unlock(&pool->mutex);
 }
 
-PACT_UNUSED static void pact_threadpool_shutdown(pact_threadpool* pool) {
+BLINK_UNUSED static void pact_threadpool_shutdown(pact_threadpool* pool) {
     pthread_mutex_lock(&pool->mutex);
     pool->shutdown = 1;
     pthread_cond_broadcast(&pool->cond);
@@ -121,27 +121,27 @@ PACT_UNUSED static void pact_threadpool_shutdown(pact_threadpool* pool) {
 
 /* ── Handle operations ──────────────────────────────────────────────── */
 
-PACT_UNUSED static pact_handle* pact_handle_new(void) {
+BLINK_UNUSED static pact_handle* pact_handle_new(void) {
     pact_handle* h = (pact_handle*)pact_alloc(sizeof(pact_handle));
     memset(&h->thread, 0, sizeof(pthread_t));
     h->result = NULL;
-    h->status = PACT_HANDLE_RUNNING;
+    h->status = BLINK_HANDLE_RUNNING;
     pthread_mutex_init(&h->mutex, NULL);
     pthread_cond_init(&h->cond, NULL);
     return h;
 }
 
-PACT_UNUSED static void pact_handle_set_result(pact_handle* h, void* result) {
+BLINK_UNUSED static void pact_handle_set_result(pact_handle* h, void* result) {
     pthread_mutex_lock(&h->mutex);
     h->result = result;
-    h->status = PACT_HANDLE_DONE;
+    h->status = BLINK_HANDLE_DONE;
     pthread_cond_broadcast(&h->cond);
     pthread_mutex_unlock(&h->mutex);
 }
 
-PACT_UNUSED static void* pact_handle_await(pact_handle* h) {
+BLINK_UNUSED static void* pact_handle_await(pact_handle* h) {
     pthread_mutex_lock(&h->mutex);
-    while (h->status == PACT_HANDLE_RUNNING) {
+    while (h->status == BLINK_HANDLE_RUNNING) {
         pthread_cond_wait(&h->cond, &h->mutex);
     }
     void* result = h->result;
@@ -151,7 +151,7 @@ PACT_UNUSED static void* pact_handle_await(pact_handle* h) {
 
 /* ── Channel operations ─────────────────────────────────────────────── */
 
-PACT_UNUSED static pact_channel* pact_channel_new(int64_t capacity) {
+BLINK_UNUSED static pact_channel* pact_channel_new(int64_t capacity) {
     if (capacity <= 0) capacity = 16;
     pact_channel* ch = (pact_channel*)pact_alloc(sizeof(pact_channel));
     ch->buffer = (void**)pact_alloc(sizeof(void*) * (size_t)capacity);
@@ -166,7 +166,7 @@ PACT_UNUSED static pact_channel* pact_channel_new(int64_t capacity) {
     return ch;
 }
 
-PACT_UNUSED static int pact_channel_send(pact_channel* ch, void* value) {
+BLINK_UNUSED static int pact_channel_send(pact_channel* ch, void* value) {
     pthread_mutex_lock(&ch->mutex);
     while (ch->count >= ch->capacity && !ch->closed) {
         pthread_cond_wait(&ch->send_cond, &ch->mutex);
@@ -183,7 +183,7 @@ PACT_UNUSED static int pact_channel_send(pact_channel* ch, void* value) {
     return 0;
 }
 
-PACT_UNUSED static void* pact_channel_recv(pact_channel* ch) {
+BLINK_UNUSED static void* pact_channel_recv(pact_channel* ch) {
     pthread_mutex_lock(&ch->mutex);
     while (ch->count == 0 && !ch->closed) {
         pthread_cond_wait(&ch->recv_cond, &ch->mutex);
@@ -200,7 +200,7 @@ PACT_UNUSED static void* pact_channel_recv(pact_channel* ch) {
     return value;
 }
 
-PACT_UNUSED static void pact_channel_close(pact_channel* ch) {
+BLINK_UNUSED static void pact_channel_close(pact_channel* ch) {
     pthread_mutex_lock(&ch->mutex);
     ch->closed = 1;
     pthread_cond_broadcast(&ch->send_cond);

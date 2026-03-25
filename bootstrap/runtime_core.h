@@ -1,5 +1,5 @@
-#ifndef PACT_RUNTIME_CORE_H
-#define PACT_RUNTIME_CORE_H
+#ifndef BLINK_RUNTIME_CORE_H
+#define BLINK_RUNTIME_CORE_H
 
 #if !defined(_POSIX_C_SOURCE) && !defined(_GNU_SOURCE) && !defined(__APPLE__)
 #define _POSIX_C_SOURCE 200809L
@@ -23,25 +23,25 @@
 #include <gc.h>
 
 #ifdef __GNUC__
-#define PACT_UNUSED __attribute__((unused))
+#define BLINK_UNUSED __attribute__((unused))
 #else
-#define PACT_UNUSED
+#define BLINK_UNUSED
 #endif
 
-PACT_UNUSED static void* pact_alloc(int64_t size) {
+BLINK_UNUSED static void* pact_alloc(int64_t size) {
     void* p = GC_MALLOC((size_t)size);
     if (!p) {
-        fprintf(stderr, "pact: out of memory\n");
+        fprintf(stderr, "blink: out of memory\n");
         exit(1);
     }
     return p;
 }
 
-PACT_UNUSED static char* pact_strdup(const char* s) {
+BLINK_UNUSED static char* pact_strdup(const char* s) {
     if (!s) return NULL;
     size_t len = strlen(s) + 1;
     char* p = (char*)GC_MALLOC_ATOMIC(len);
-    if (!p) { fprintf(stderr, "pact: out of memory\n"); exit(1); }
+    if (!p) { fprintf(stderr, "blink: out of memory\n"); exit(1); }
     memcpy(p, s, len);
     return p;
 }
@@ -52,7 +52,7 @@ typedef struct {
     int64_t cap;
 } pact_list;
 
-PACT_UNUSED static pact_list* pact_list_new(void) {
+BLINK_UNUSED static pact_list* pact_list_new(void) {
     pact_list* l = (pact_list*)pact_alloc(sizeof(pact_list));
     l->cap = 8;
     l->len = 0;
@@ -60,70 +60,70 @@ PACT_UNUSED static pact_list* pact_list_new(void) {
     return l;
 }
 
-PACT_UNUSED static void pact_list_push(pact_list* l, void* item) {
+BLINK_UNUSED static void pact_list_push(pact_list* l, void* item) {
     if (l->len >= l->cap) {
         l->cap *= 2;
         l->items = (void**)GC_REALLOC(l->items, sizeof(void*) * (size_t)l->cap);
         if (!l->items) {
-            fprintf(stderr, "pact: out of memory\n");
+            fprintf(stderr, "blink: out of memory\n");
             exit(1);
         }
     }
     l->items[l->len++] = item;
 }
 
-PACT_UNUSED static void* pact_list_get(const pact_list* l, int64_t index) {
+BLINK_UNUSED static void* pact_list_get(const pact_list* l, int64_t index) {
     if (index < 0 || index >= l->len) {
-        fprintf(stderr, "pact: list index out of bounds: idx=%lld len=%lld\n", (long long)index, (long long)l->len);
+        fprintf(stderr, "blink: list index out of bounds: idx=%lld len=%lld\n", (long long)index, (long long)l->len);
         exit(1);
     }
     return l->items[index];
 }
 
-PACT_UNUSED static int pact_list_in_bounds(const pact_list* l, int64_t index) {
+BLINK_UNUSED static int pact_list_in_bounds(const pact_list* l, int64_t index) {
     return (index >= 0 && index < l->len);
 }
 
-PACT_UNUSED static int64_t pact_list_len(const pact_list* l) {
+BLINK_UNUSED static int64_t pact_list_len(const pact_list* l) {
     return l->len;
 }
 
-PACT_UNUSED static void pact_list_set(pact_list* l, int64_t index, void* item) {
+BLINK_UNUSED static void pact_list_set(pact_list* l, int64_t index, void* item) {
     if (index < 0 || index >= l->len) {
-        fprintf(stderr, "pact: list set index out of bounds: %lld\n", (long long)index);
+        fprintf(stderr, "blink: list set index out of bounds: %lld\n", (long long)index);
         exit(1);
     }
     l->items[index] = item;
 }
 
-PACT_UNUSED static void* pact_list_pop(pact_list* l) {
+BLINK_UNUSED static void* pact_list_pop(pact_list* l) {
     if (l->len <= 0) {
-        fprintf(stderr, "pact: list pop on empty list\n");
+        fprintf(stderr, "blink: list pop on empty list\n");
         exit(1);
     }
     l->len--;
     return l->items[l->len];
 }
 
-PACT_UNUSED static void pact_list_free(pact_list* l) {
+BLINK_UNUSED static void pact_list_free(pact_list* l) {
     if (l) {
         GC_FREE(l->items);
         GC_FREE(l);
     }
 }
 
-PACT_UNUSED static void pact_list_clear(pact_list* l) {
+BLINK_UNUSED static void pact_list_clear(pact_list* l) {
     l->len = 0;
 }
 
-PACT_UNUSED static pact_list* pact_list_concat(pact_list* a, pact_list* b) {
+BLINK_UNUSED static pact_list* pact_list_concat(pact_list* a, pact_list* b) {
     pact_list* result = pact_list_new();
     for (int64_t i = 0; i < a->len; i++) pact_list_push(result, a->items[i]);
     for (int64_t i = 0; i < b->len; i++) pact_list_push(result, b->items[i]);
     return result;
 }
 
-PACT_UNUSED static pact_list* pact_list_slice(pact_list* l, int64_t start, int64_t end) {
+BLINK_UNUSED static pact_list* pact_list_slice(pact_list* l, int64_t start, int64_t end) {
     pact_list* result = pact_list_new();
     if (start < 0) start = 0;
     if (end > l->len) end = l->len;
@@ -133,9 +133,9 @@ PACT_UNUSED static pact_list* pact_list_slice(pact_list* l, int64_t start, int64
 
 /* ── Hash map (string-keyed) ────────────────────────────────────────── */
 
-PACT_UNUSED static int pact_str_eq(const char* a, const char* b);
+BLINK_UNUSED static int pact_str_eq(const char* a, const char* b);
 
-PACT_UNUSED static uint64_t pact_map_hash(const char* key) {
+BLINK_UNUSED static uint64_t pact_map_hash(const char* key) {
     uint64_t h = 14695981039346656037ULL;
     for (const char* p = key; *p; p++) {
         h ^= (uint64_t)(unsigned char)*p;
@@ -152,7 +152,7 @@ typedef struct {
     int64_t cap;
 } pact_map;
 
-PACT_UNUSED static pact_map* pact_map_new(void) {
+BLINK_UNUSED static pact_map* pact_map_new(void) {
     pact_map* m = (pact_map*)pact_alloc(sizeof(pact_map));
     m->cap = 16;
     m->len = 0;
@@ -163,7 +163,7 @@ PACT_UNUSED static pact_map* pact_map_new(void) {
     return m;
 }
 
-PACT_UNUSED static void pact_map_grow(pact_map* m) {
+BLINK_UNUSED static void pact_map_grow(pact_map* m) {
     int64_t old_cap = m->cap;
     const char** old_keys = m->keys;
     void** old_values = m->values;
@@ -192,7 +192,7 @@ PACT_UNUSED static void pact_map_grow(pact_map* m) {
     GC_FREE(old_states);
 }
 
-PACT_UNUSED static void pact_map_set(pact_map* m, const char* key, void* value) {
+BLINK_UNUSED static void pact_map_set(pact_map* m, const char* key, void* value) {
     if (m->len * 10 >= m->cap * 7) {
         pact_map_grow(m);
     }
@@ -218,7 +218,7 @@ PACT_UNUSED static void pact_map_set(pact_map* m, const char* key, void* value) 
     }
 }
 
-PACT_UNUSED static void* pact_map_get(const pact_map* m, const char* key) {
+BLINK_UNUSED static void* pact_map_get(const pact_map* m, const char* key) {
     uint64_t h = pact_map_hash(key);
     int64_t idx = (int64_t)(h % (uint64_t)m->cap);
     while (m->states[idx] != 0) {
@@ -230,7 +230,7 @@ PACT_UNUSED static void* pact_map_get(const pact_map* m, const char* key) {
     return NULL;
 }
 
-PACT_UNUSED static int64_t pact_map_has(const pact_map* m, const char* key) {
+BLINK_UNUSED static int64_t pact_map_has(const pact_map* m, const char* key) {
     uint64_t h = pact_map_hash(key);
     int64_t idx = (int64_t)(h % (uint64_t)m->cap);
     while (m->states[idx] != 0) {
@@ -242,7 +242,7 @@ PACT_UNUSED static int64_t pact_map_has(const pact_map* m, const char* key) {
     return 0;
 }
 
-PACT_UNUSED static int64_t pact_map_remove(pact_map* m, const char* key) {
+BLINK_UNUSED static int64_t pact_map_remove(pact_map* m, const char* key) {
     uint64_t h = pact_map_hash(key);
     int64_t idx = (int64_t)(h % (uint64_t)m->cap);
     while (m->states[idx] != 0) {
@@ -256,11 +256,11 @@ PACT_UNUSED static int64_t pact_map_remove(pact_map* m, const char* key) {
     return 0;
 }
 
-PACT_UNUSED static int64_t pact_map_len(const pact_map* m) {
+BLINK_UNUSED static int64_t pact_map_len(const pact_map* m) {
     return m->len;
 }
 
-PACT_UNUSED static pact_list* pact_map_keys(const pact_map* m) {
+BLINK_UNUSED static pact_list* pact_map_keys(const pact_map* m) {
     pact_list* result = pact_list_new();
     for (int64_t i = 0; i < m->cap; i++) {
         if (m->states[i] == 1) {
@@ -270,7 +270,7 @@ PACT_UNUSED static pact_list* pact_map_keys(const pact_map* m) {
     return result;
 }
 
-PACT_UNUSED static pact_list* pact_map_values(const pact_map* m) {
+BLINK_UNUSED static pact_list* pact_map_values(const pact_map* m) {
     pact_list* result = pact_list_new();
     for (int64_t i = 0; i < m->cap; i++) {
         if (m->states[i] == 1) {
@@ -280,7 +280,7 @@ PACT_UNUSED static pact_list* pact_map_values(const pact_map* m) {
     return result;
 }
 
-PACT_UNUSED static void pact_map_free(pact_map* m) {
+BLINK_UNUSED static void pact_map_free(pact_map* m) {
     if (m) {
         GC_FREE(m->keys);
         GC_FREE(m->values);
@@ -289,7 +289,7 @@ PACT_UNUSED static void pact_map_free(pact_map* m) {
     }
 }
 
-PACT_UNUSED static void pact_map_clear(pact_map* m) {
+BLINK_UNUSED static void pact_map_clear(pact_map* m) {
     m->len = 0;
     memset(m->states, 0, sizeof(uint8_t) * (size_t)m->cap);
 }
@@ -303,7 +303,7 @@ typedef struct {
     int64_t cap;
 } pact_set;
 
-PACT_UNUSED static const char* pact_int_to_key(int64_t val) {
+BLINK_UNUSED static const char* pact_int_to_key(int64_t val) {
     char buf[32];
     snprintf(buf, sizeof(buf), "%lld", (long long)val);
     size_t len = strlen(buf);
@@ -312,7 +312,7 @@ PACT_UNUSED static const char* pact_int_to_key(int64_t val) {
     return s;
 }
 
-PACT_UNUSED static pact_set* pact_set_new(void) {
+BLINK_UNUSED static pact_set* pact_set_new(void) {
     pact_set* s = (pact_set*)pact_alloc(sizeof(pact_set));
     s->cap = 16;
     s->len = 0;
@@ -322,7 +322,7 @@ PACT_UNUSED static pact_set* pact_set_new(void) {
     return s;
 }
 
-PACT_UNUSED static void pact_set_grow(pact_set* s) {
+BLINK_UNUSED static void pact_set_grow(pact_set* s) {
     int64_t old_cap = s->cap;
     const char** old_items = s->items;
     uint8_t* old_states = s->states;
@@ -347,7 +347,7 @@ PACT_UNUSED static void pact_set_grow(pact_set* s) {
     GC_FREE(old_states);
 }
 
-PACT_UNUSED static int64_t pact_set_insert(pact_set* s, const char* item) {
+BLINK_UNUSED static int64_t pact_set_insert(pact_set* s, const char* item) {
     if (s->len * 10 >= s->cap * 7) {
         pact_set_grow(s);
     }
@@ -371,7 +371,7 @@ PACT_UNUSED static int64_t pact_set_insert(pact_set* s, const char* item) {
     }
 }
 
-PACT_UNUSED static int64_t pact_set_contains(const pact_set* s, const char* item) {
+BLINK_UNUSED static int64_t pact_set_contains(const pact_set* s, const char* item) {
     uint64_t h = pact_map_hash(item);
     int64_t idx = (int64_t)(h % (uint64_t)s->cap);
     while (s->states[idx] != 0) {
@@ -383,7 +383,7 @@ PACT_UNUSED static int64_t pact_set_contains(const pact_set* s, const char* item
     return 0;
 }
 
-PACT_UNUSED static int64_t pact_set_remove(pact_set* s, const char* item) {
+BLINK_UNUSED static int64_t pact_set_remove(pact_set* s, const char* item) {
     uint64_t h = pact_map_hash(item);
     int64_t idx = (int64_t)(h % (uint64_t)s->cap);
     while (s->states[idx] != 0) {
@@ -397,11 +397,11 @@ PACT_UNUSED static int64_t pact_set_remove(pact_set* s, const char* item) {
     return 0;
 }
 
-PACT_UNUSED static int64_t pact_set_len(const pact_set* s) {
+BLINK_UNUSED static int64_t pact_set_len(const pact_set* s) {
     return s->len;
 }
 
-PACT_UNUSED static pact_set* pact_set_union(const pact_set* a, const pact_set* b) {
+BLINK_UNUSED static pact_set* pact_set_union(const pact_set* a, const pact_set* b) {
     pact_set* result = pact_set_new();
     for (int64_t i = 0; i < a->cap; i++) {
         if (a->states[i] == 1) {
@@ -416,7 +416,7 @@ PACT_UNUSED static pact_set* pact_set_union(const pact_set* a, const pact_set* b
     return result;
 }
 
-PACT_UNUSED static pact_list* pact_set_to_list(const pact_set* s) {
+BLINK_UNUSED static pact_list* pact_set_to_list(const pact_set* s) {
     pact_list* result = pact_list_new();
     for (int64_t i = 0; i < s->cap; i++) {
         if (s->states[i] == 1) {
@@ -426,7 +426,7 @@ PACT_UNUSED static pact_list* pact_set_to_list(const pact_set* s) {
     return result;
 }
 
-PACT_UNUSED static void pact_set_free(pact_set* s) {
+BLINK_UNUSED static void pact_set_free(pact_set* s) {
     if (s) {
         GC_FREE(s->items);
         GC_FREE(s->states);
@@ -442,7 +442,7 @@ typedef struct {
     int64_t cap;
 } pact_bytes;
 
-PACT_UNUSED static pact_bytes* pact_bytes_new(void) {
+BLINK_UNUSED static pact_bytes* pact_bytes_new(void) {
     pact_bytes* b = (pact_bytes*)pact_alloc(sizeof(pact_bytes));
     b->cap = 16;
     b->len = 0;
@@ -450,37 +450,37 @@ PACT_UNUSED static pact_bytes* pact_bytes_new(void) {
     return b;
 }
 
-PACT_UNUSED static void pact_bytes_push(pact_bytes* b, int64_t byte) {
+BLINK_UNUSED static void pact_bytes_push(pact_bytes* b, int64_t byte) {
     if (b->len >= b->cap) {
         b->cap *= 2;
         b->data = (uint8_t*)GC_REALLOC(b->data, (size_t)b->cap);
-        if (!b->data) { fprintf(stderr, "pact: out of memory\n"); exit(1); }
+        if (!b->data) { fprintf(stderr, "blink: out of memory\n"); exit(1); }
     }
     b->data[b->len++] = (uint8_t)(byte & 0xFF);
 }
 
-PACT_UNUSED static int64_t pact_bytes_get(const pact_bytes* b, int64_t index) {
+BLINK_UNUSED static int64_t pact_bytes_get(const pact_bytes* b, int64_t index) {
     if (index < 0 || index >= b->len) return -1;
     return (int64_t)b->data[index];
 }
 
-PACT_UNUSED static void pact_bytes_set(pact_bytes* b, int64_t index, int64_t byte) {
+BLINK_UNUSED static void pact_bytes_set(pact_bytes* b, int64_t index, int64_t byte) {
     if (index < 0 || index >= b->len) {
-        fprintf(stderr, "pact: bytes set index out of bounds: %lld\n", (long long)index);
+        fprintf(stderr, "blink: bytes set index out of bounds: %lld\n", (long long)index);
         exit(1);
     }
     b->data[index] = (uint8_t)(byte & 0xFF);
 }
 
-PACT_UNUSED static int64_t pact_bytes_len(const pact_bytes* b) {
+BLINK_UNUSED static int64_t pact_bytes_len(const pact_bytes* b) {
     return b->len;
 }
 
-PACT_UNUSED static int64_t pact_bytes_is_empty(const pact_bytes* b) {
+BLINK_UNUSED static int64_t pact_bytes_is_empty(const pact_bytes* b) {
     return b->len == 0;
 }
 
-PACT_UNUSED static pact_bytes* pact_bytes_concat(const pact_bytes* a, const pact_bytes* b) {
+BLINK_UNUSED static pact_bytes* pact_bytes_concat(const pact_bytes* a, const pact_bytes* b) {
     pact_bytes* r = pact_bytes_new();
     int64_t total = a->len + b->len;
     if (total > r->cap) {
@@ -493,7 +493,7 @@ PACT_UNUSED static pact_bytes* pact_bytes_concat(const pact_bytes* a, const pact
     return r;
 }
 
-PACT_UNUSED static pact_bytes* pact_bytes_slice(const pact_bytes* b, int64_t start, int64_t end) {
+BLINK_UNUSED static pact_bytes* pact_bytes_slice(const pact_bytes* b, int64_t start, int64_t end) {
     if (start < 0) start = 0;
     if (end > b->len) end = b->len;
     if (start > end) start = end;
@@ -510,7 +510,7 @@ PACT_UNUSED static pact_bytes* pact_bytes_slice(const pact_bytes* b, int64_t sta
     return r;
 }
 
-PACT_UNUSED static int pact_bytes_to_str_checked(const pact_bytes* b, const char** out) {
+BLINK_UNUSED static int pact_bytes_to_str_checked(const pact_bytes* b, const char** out) {
     int64_t i = 0;
     while (i < b->len) {
         uint8_t c = b->data[i];
@@ -533,7 +533,7 @@ PACT_UNUSED static int pact_bytes_to_str_checked(const pact_bytes* b, const char
     return 1;
 }
 
-PACT_UNUSED static const char* pact_bytes_to_hex(const pact_bytes* b) {
+BLINK_UNUSED static const char* pact_bytes_to_hex(const pact_bytes* b) {
     char* hex = (char*)pact_alloc(b->len * 2 + 1);
     for (int64_t i = 0; i < b->len; i++) {
         sprintf(hex + i * 2, "%02x", b->data[i]);
@@ -542,7 +542,7 @@ PACT_UNUSED static const char* pact_bytes_to_hex(const pact_bytes* b) {
     return hex;
 }
 
-PACT_UNUSED static pact_bytes* pact_bytes_from_str(const char* s) {
+BLINK_UNUSED static pact_bytes* pact_bytes_from_str(const char* s) {
     pact_bytes* b = pact_bytes_new();
     int64_t slen = (int64_t)strlen(s);
     if (slen > b->cap) {
@@ -554,7 +554,7 @@ PACT_UNUSED static pact_bytes* pact_bytes_from_str(const char* s) {
     return b;
 }
 
-PACT_UNUSED static void pact_bytes_free(pact_bytes* b) {
+BLINK_UNUSED static void pact_bytes_free(pact_bytes* b) {
     if (b) {
         GC_FREE(b->data);
         GC_FREE(b);
@@ -569,7 +569,7 @@ typedef struct {
     int64_t cap;
 } pact_sb;
 
-PACT_UNUSED static pact_sb* pact_sb_new(void) {
+BLINK_UNUSED static pact_sb* pact_sb_new(void) {
     pact_sb* sb = (pact_sb*)pact_alloc(sizeof(pact_sb));
     sb->cap = 64;
     sb->len = 0;
@@ -578,7 +578,7 @@ PACT_UNUSED static pact_sb* pact_sb_new(void) {
     return sb;
 }
 
-PACT_UNUSED static pact_sb* pact_sb_with_capacity(int64_t cap) {
+BLINK_UNUSED static pact_sb* pact_sb_with_capacity(int64_t cap) {
     if (cap < 16) cap = 16;
     pact_sb* sb = (pact_sb*)pact_alloc(sizeof(pact_sb));
     sb->cap = cap;
@@ -588,7 +588,7 @@ PACT_UNUSED static pact_sb* pact_sb_with_capacity(int64_t cap) {
     return sb;
 }
 
-PACT_UNUSED static void pact_sb_write_n(pact_sb* sb, const char* s, int64_t slen) {
+BLINK_UNUSED static void pact_sb_write_n(pact_sb* sb, const char* s, int64_t slen) {
     if (slen == 0) return;
     int64_t needed = sb->len + slen + 1;
     if (needed > sb->cap) {
@@ -596,59 +596,59 @@ PACT_UNUSED static void pact_sb_write_n(pact_sb* sb, const char* s, int64_t slen
         while (new_cap < needed) new_cap *= 2;
         sb->cap = new_cap;
         sb->data = (char*)GC_REALLOC(sb->data, (size_t)sb->cap);
-        if (!sb->data) { fprintf(stderr, "pact: out of memory\n"); exit(1); }
+        if (!sb->data) { fprintf(stderr, "blink: out of memory\n"); exit(1); }
     }
     memcpy(sb->data + sb->len, s, (size_t)slen);
     sb->len += slen;
     sb->data[sb->len] = '\0';
 }
 
-PACT_UNUSED static void pact_sb_write(pact_sb* sb, const char* s) {
+BLINK_UNUSED static void pact_sb_write(pact_sb* sb, const char* s) {
     pact_sb_write_n(sb, s, (int64_t)strlen(s));
 }
 
-PACT_UNUSED static void pact_sb_write_char(pact_sb* sb, const char* ch) {
+BLINK_UNUSED static void pact_sb_write_char(pact_sb* sb, const char* ch) {
     pact_sb_write(sb, ch);
 }
 
-PACT_UNUSED static void pact_sb_write_int(pact_sb* sb, int64_t val) {
+BLINK_UNUSED static void pact_sb_write_int(pact_sb* sb, int64_t val) {
     char buf[32];
     int len = snprintf(buf, sizeof(buf), "%lld", (long long)val);
     pact_sb_write_n(sb, buf, (int64_t)len);
 }
 
-PACT_UNUSED static void pact_sb_write_float(pact_sb* sb, double val) {
+BLINK_UNUSED static void pact_sb_write_float(pact_sb* sb, double val) {
     char buf[64];
     int len = snprintf(buf, sizeof(buf), "%g", val);
     pact_sb_write_n(sb, buf, (int64_t)len);
 }
 
-PACT_UNUSED static void pact_sb_write_bool(pact_sb* sb, int val) {
+BLINK_UNUSED static void pact_sb_write_bool(pact_sb* sb, int val) {
     pact_sb_write(sb, val ? "true" : "false");
 }
 
-PACT_UNUSED static const char* pact_sb_to_str(const pact_sb* sb) {
+BLINK_UNUSED static const char* pact_sb_to_str(const pact_sb* sb) {
     return pact_strdup(sb->data);
 }
 
-PACT_UNUSED static int64_t pact_sb_len(const pact_sb* sb) {
+BLINK_UNUSED static int64_t pact_sb_len(const pact_sb* sb) {
     return sb->len;
 }
 
-PACT_UNUSED static int64_t pact_sb_capacity(const pact_sb* sb) {
+BLINK_UNUSED static int64_t pact_sb_capacity(const pact_sb* sb) {
     return sb->cap;
 }
 
-PACT_UNUSED static void pact_sb_clear(pact_sb* sb) {
+BLINK_UNUSED static void pact_sb_clear(pact_sb* sb) {
     sb->len = 0;
     sb->data[0] = '\0';
 }
 
-PACT_UNUSED static int pact_sb_is_empty(const pact_sb* sb) {
+BLINK_UNUSED static int pact_sb_is_empty(const pact_sb* sb) {
     return sb->len == 0;
 }
 
-PACT_UNUSED static void pact_sb_free(pact_sb* sb) {
+BLINK_UNUSED static void pact_sb_free(pact_sb* sb) {
     if (sb) {
         GC_FREE(sb->data);
         GC_FREE(sb);
@@ -657,22 +657,22 @@ PACT_UNUSED static void pact_sb_free(pact_sb* sb) {
 
 /* ── String operations ──────────────────────────────────────────────── */
 
-PACT_UNUSED static int64_t pact_str_len(const char* s) {
+BLINK_UNUSED static int64_t pact_str_len(const char* s) {
     return (int64_t)strlen(s);
 }
 
-PACT_UNUSED static int64_t pact_str_char_at(const char* s, int64_t i) {
+BLINK_UNUSED static int64_t pact_str_char_at(const char* s, int64_t i) {
     return (int64_t)(unsigned char)s[i];
 }
 
-PACT_UNUSED static const char* pact_str_substr(const char* s, int64_t start, int64_t len) {
+BLINK_UNUSED static const char* pact_str_substr(const char* s, int64_t start, int64_t len) {
     char* buf = (char*)pact_alloc(len + 1);
     memcpy(buf, s + start, (size_t)len);
     buf[len] = '\0';
     return buf;
 }
 
-PACT_UNUSED static const char* pact_str_from_char_code(int64_t code) {
+BLINK_UNUSED static const char* pact_str_from_char_code(int64_t code) {
     char* buf;
     if (code < 0x80) {
         buf = (char*)pact_alloc(2);
@@ -704,7 +704,7 @@ PACT_UNUSED static const char* pact_str_from_char_code(int64_t code) {
     return buf;
 }
 
-PACT_UNUSED static const char* pact_str_concat(const char* a, const char* b) {
+BLINK_UNUSED static const char* pact_str_concat(const char* a, const char* b) {
     int64_t la = pact_str_len(a);
     int64_t lb = pact_str_len(b);
     char* buf = (char*)pact_alloc(la + lb + 1);
@@ -714,27 +714,27 @@ PACT_UNUSED static const char* pact_str_concat(const char* a, const char* b) {
     return buf;
 }
 
-PACT_UNUSED static int pact_str_eq(const char* a, const char* b) {
+BLINK_UNUSED static int pact_str_eq(const char* a, const char* b) {
     return strcmp(a, b) == 0;
 }
 
-PACT_UNUSED static int pact_str_contains(const char* s, const char* needle) {
+BLINK_UNUSED static int pact_str_contains(const char* s, const char* needle) {
     return strstr(s, needle) != NULL;
 }
 
-PACT_UNUSED static int pact_str_starts_with(const char* s, const char* prefix) {
+BLINK_UNUSED static int pact_str_starts_with(const char* s, const char* prefix) {
     size_t plen = strlen(prefix);
     return strncmp(s, prefix, plen) == 0;
 }
 
-PACT_UNUSED static int pact_str_ends_with(const char* s, const char* suffix) {
+BLINK_UNUSED static int pact_str_ends_with(const char* s, const char* suffix) {
     size_t slen = strlen(s);
     size_t sufflen = strlen(suffix);
     if (sufflen > slen) return 0;
     return memcmp(s + slen - sufflen, suffix, sufflen) == 0;
 }
 
-PACT_UNUSED static const char* pact_str_slice(const char* s, int64_t start, int64_t end) {
+BLINK_UNUSED static const char* pact_str_slice(const char* s, int64_t start, int64_t end) {
     int64_t slen = (int64_t)strlen(s);
     if (start < 0) start = 0;
     if (end > slen) end = slen;
@@ -746,7 +746,7 @@ PACT_UNUSED static const char* pact_str_slice(const char* s, int64_t start, int6
     return buf;
 }
 
-PACT_UNUSED static int64_t pact_str_index_of(const char* s, const char* needle) {
+BLINK_UNUSED static int64_t pact_str_index_of(const char* s, const char* needle) {
     if (!s || !needle) return -1;
     const char* found = strstr(s, needle);
     if (!found) return -1;
@@ -755,10 +755,10 @@ PACT_UNUSED static int64_t pact_str_index_of(const char* s, const char* needle) 
 
 /* ── File I/O ───────────────────────────────────────────────────────── */
 
-PACT_UNUSED static const char* pact_read_file(const char* path) {
+BLINK_UNUSED static const char* pact_read_file(const char* path) {
     FILE* f = fopen(path, "rb");
     if (!f) {
-        fprintf(stderr, "pact: cannot open file: %s\n", path);
+        fprintf(stderr, "blink: cannot open file: %s\n", path);
         exit(1);
     }
     fseek(f, 0, SEEK_END);
@@ -771,10 +771,10 @@ PACT_UNUSED static const char* pact_read_file(const char* path) {
     return buf;
 }
 
-PACT_UNUSED static void pact_write_file(const char* path, const char* content) {
+BLINK_UNUSED static void pact_write_file(const char* path, const char* content) {
     FILE* f = fopen(path, "wb");
     if (!f) {
-        fprintf(stderr, "pact: cannot open file for writing: %s\n", path);
+        fprintf(stderr, "blink: cannot open file for writing: %s\n", path);
         exit(1);
     }
     size_t len = strlen(content);
@@ -782,32 +782,32 @@ PACT_UNUSED static void pact_write_file(const char* path, const char* content) {
     fclose(f);
 }
 
-PACT_UNUSED static int pact_g_argc = 0;
-PACT_UNUSED static const char** pact_g_argv = NULL;
+BLINK_UNUSED static int pact_g_argc = 0;
+BLINK_UNUSED static const char** pact_g_argv = NULL;
 
-PACT_UNUSED static int64_t pact_arg_count(void) {
+BLINK_UNUSED static int64_t pact_arg_count(void) {
     return (int64_t)pact_g_argc;
 }
 
-PACT_UNUSED static const char* pact_get_arg(int64_t index) {
+BLINK_UNUSED static const char* pact_get_arg(int64_t index) {
     if (index < 0 || index >= pact_g_argc) {
-        fprintf(stderr, "pact: arg index out of bounds: %lld\n", (long long)index);
+        fprintf(stderr, "blink: arg index out of bounds: %lld\n", (long long)index);
         exit(1);
     }
     return pact_g_argv[index];
 }
 
-PACT_UNUSED static int64_t pact_file_exists(const char* path) {
+BLINK_UNUSED static int64_t pact_file_exists(const char* path) {
     return access(path, F_OK) == 0 ? 1 : 0;
 }
 
-PACT_UNUSED static int64_t pact_is_dir(const char* path) {
+BLINK_UNUSED static int64_t pact_is_dir(const char* path) {
     struct stat st;
     if (stat(path, &st) != 0) return 0;
     return S_ISDIR(st.st_mode) ? 1 : 0;
 }
 
-PACT_UNUSED static pact_list* pact_list_dir(const char* path) {
+BLINK_UNUSED static pact_list* pact_list_dir(const char* path) {
     pact_list* result = pact_list_new();
     DIR* d = opendir(path);
     if (!d) return result;
@@ -821,7 +821,7 @@ PACT_UNUSED static pact_list* pact_list_dir(const char* path) {
     return result;
 }
 
-PACT_UNUSED static int64_t pact_file_mtime(const char* path) {
+BLINK_UNUSED static int64_t pact_file_mtime(const char* path) {
     struct stat st;
     if (stat(path, &st) != 0) return -1;
 #ifdef __APPLE__
@@ -835,13 +835,13 @@ PACT_UNUSED static int64_t pact_file_mtime(const char* path) {
 
 /* ── Process info ───────────────────────────────────────────────────── */
 
-PACT_UNUSED static int64_t pact_getpid(void) {
+BLINK_UNUSED static int64_t pact_getpid(void) {
     return (int64_t)getpid();
 }
 
-PACT_UNUSED static void pact_exit(int64_t code) { exit((int)code); }
+BLINK_UNUSED static void pact_exit(int64_t code) { exit((int)code); }
 
-PACT_UNUSED static int64_t pact_shell_exec(const char* command) {
+BLINK_UNUSED static int64_t pact_shell_exec(const char* command) {
     int status = system(command);
 #ifdef _WIN32
     return (int64_t)status;
@@ -867,7 +867,7 @@ typedef struct {
     int64_t capture_count;
 } pact_closure;
 
-PACT_UNUSED static pact_closure* pact_closure_new(void* fn_ptr, void** captures, int64_t capture_count) {
+BLINK_UNUSED static pact_closure* pact_closure_new(void* fn_ptr, void** captures, int64_t capture_count) {
     pact_closure* c = (pact_closure*)pact_alloc(sizeof(pact_closure));
     c->fn_ptr = fn_ptr;
     c->captures = captures;
@@ -875,13 +875,13 @@ PACT_UNUSED static pact_closure* pact_closure_new(void* fn_ptr, void** captures,
     return c;
 }
 
-PACT_UNUSED static void* pact_closure_get_fn(const pact_closure* c) {
+BLINK_UNUSED static void* pact_closure_get_fn(const pact_closure* c) {
     return c->fn_ptr;
 }
 
-PACT_UNUSED static void* pact_closure_get_capture(const pact_closure* c, int64_t index) {
+BLINK_UNUSED static void* pact_closure_get_capture(const pact_closure* c, int64_t index) {
     if (index < 0 || index >= c->capture_count) {
-        fprintf(stderr, "pact: closure capture index out of bounds: %lld\n", (long long)index);
+        fprintf(stderr, "blink: closure capture index out of bounds: %lld\n", (long long)index);
         exit(1);
     }
     return c->captures[index];
@@ -904,15 +904,15 @@ typedef struct {
     void  (*log)(const char* msg);
 } pact_io_vtable;
 
-PACT_UNUSED static void pact_io_default_print(const char* msg) {
+BLINK_UNUSED static void pact_io_default_print(const char* msg) {
     printf("%s\n", msg);
 }
 
-PACT_UNUSED static void pact_io_default_log(const char* msg) {
+BLINK_UNUSED static void pact_io_default_log(const char* msg) {
     fprintf(stderr, "[LOG] %s\n", msg);
 }
 
-PACT_UNUSED static pact_io_vtable pact_io_vtable_default = {
+BLINK_UNUSED static pact_io_vtable pact_io_vtable_default = {
     pact_io_default_print,
     pact_io_default_log
 };
@@ -925,26 +925,26 @@ typedef struct {
     int         (*watch)(const char* path, void (*callback)(const char*));
 } pact_fs_vtable;
 
-PACT_UNUSED static const char* pact_fs_default_read(const char* path) {
+BLINK_UNUSED static const char* pact_fs_default_read(const char* path) {
     return pact_read_file(path);
 }
 
-PACT_UNUSED static int pact_fs_default_write(const char* path, const char* content) {
+BLINK_UNUSED static int pact_fs_default_write(const char* path, const char* content) {
     pact_write_file(path, content);
     return 0;
 }
 
-PACT_UNUSED static int pact_fs_default_delete(const char* path) {
+BLINK_UNUSED static int pact_fs_default_delete(const char* path) {
     return remove(path);
 }
 
-PACT_UNUSED static int pact_fs_default_watch(const char* path, void (*callback)(const char*)) {
+BLINK_UNUSED static int pact_fs_default_watch(const char* path, void (*callback)(const char*)) {
     (void)path; (void)callback;
-    fprintf(stderr, "pact: fs.watch not implemented\n");
+    fprintf(stderr, "blink: fs.watch not implemented\n");
     return -1;
 }
 
-PACT_UNUSED static pact_fs_vtable pact_fs_vtable_default = {
+BLINK_UNUSED static pact_fs_vtable pact_fs_vtable_default = {
     pact_fs_default_read,
     pact_fs_default_write,
     pact_fs_default_delete,
@@ -958,25 +958,25 @@ typedef struct {
     const char* (*dns)(const char* hostname);
 } pact_net_vtable;
 
-PACT_UNUSED static int pact_net_default_connect(const char* url) {
+BLINK_UNUSED static int pact_net_default_connect(const char* url) {
     (void)url;
-    fprintf(stderr, "pact: net.connect not implemented\n");
+    fprintf(stderr, "blink: net.connect not implemented\n");
     return -1;
 }
 
-PACT_UNUSED static int pact_net_default_listen(const char* addr, int port) {
+BLINK_UNUSED static int pact_net_default_listen(const char* addr, int port) {
     (void)addr; (void)port;
-    fprintf(stderr, "pact: net.listen not implemented\n");
+    fprintf(stderr, "blink: net.listen not implemented\n");
     return -1;
 }
 
-PACT_UNUSED static const char* pact_net_default_dns(const char* hostname) {
+BLINK_UNUSED static const char* pact_net_default_dns(const char* hostname) {
     (void)hostname;
-    fprintf(stderr, "pact: net.dns not implemented\n");
+    fprintf(stderr, "blink: net.dns not implemented\n");
     return NULL;
 }
 
-PACT_UNUSED static pact_net_vtable pact_net_vtable_default = {
+BLINK_UNUSED static pact_net_vtable pact_net_vtable_default = {
     pact_net_default_connect,
     pact_net_default_listen,
     pact_net_default_dns
@@ -989,25 +989,25 @@ typedef struct {
     int         (*admin)(const char* query);
 } pact_db_vtable;
 
-PACT_UNUSED static const char* pact_db_default_read(const char* query) {
+BLINK_UNUSED static const char* pact_db_default_read(const char* query) {
     (void)query;
-    fprintf(stderr, "pact: db.read not implemented\n");
+    fprintf(stderr, "blink: db.read not implemented\n");
     return NULL;
 }
 
-PACT_UNUSED static int pact_db_default_write(const char* query) {
+BLINK_UNUSED static int pact_db_default_write(const char* query) {
     (void)query;
-    fprintf(stderr, "pact: db.write not implemented\n");
+    fprintf(stderr, "blink: db.write not implemented\n");
     return -1;
 }
 
-PACT_UNUSED static int pact_db_default_admin(const char* query) {
+BLINK_UNUSED static int pact_db_default_admin(const char* query) {
     (void)query;
-    fprintf(stderr, "pact: db.admin not implemented\n");
+    fprintf(stderr, "blink: db.admin not implemented\n");
     return -1;
 }
 
-PACT_UNUSED static pact_db_vtable pact_db_vtable_default = {
+BLINK_UNUSED static pact_db_vtable pact_db_vtable_default = {
     pact_db_default_read,
     pact_db_default_write,
     pact_db_default_admin
@@ -1021,31 +1021,31 @@ typedef struct {
     const char* (*decrypt)(const char* data, const char* key);
 } pact_crypto_vtable;
 
-PACT_UNUSED static const char* pact_crypto_default_hash(const char* data) {
+BLINK_UNUSED static const char* pact_crypto_default_hash(const char* data) {
     (void)data;
-    fprintf(stderr, "pact: crypto.hash not implemented\n");
+    fprintf(stderr, "blink: crypto.hash not implemented\n");
     return NULL;
 }
 
-PACT_UNUSED static const char* pact_crypto_default_sign(const char* data, const char* key) {
+BLINK_UNUSED static const char* pact_crypto_default_sign(const char* data, const char* key) {
     (void)data; (void)key;
-    fprintf(stderr, "pact: crypto.sign not implemented\n");
+    fprintf(stderr, "blink: crypto.sign not implemented\n");
     return NULL;
 }
 
-PACT_UNUSED static const char* pact_crypto_default_encrypt(const char* data, const char* key) {
+BLINK_UNUSED static const char* pact_crypto_default_encrypt(const char* data, const char* key) {
     (void)data; (void)key;
-    fprintf(stderr, "pact: crypto.encrypt not implemented\n");
+    fprintf(stderr, "blink: crypto.encrypt not implemented\n");
     return NULL;
 }
 
-PACT_UNUSED static const char* pact_crypto_default_decrypt(const char* data, const char* key) {
+BLINK_UNUSED static const char* pact_crypto_default_decrypt(const char* data, const char* key) {
     (void)data; (void)key;
-    fprintf(stderr, "pact: crypto.decrypt not implemented\n");
+    fprintf(stderr, "blink: crypto.decrypt not implemented\n");
     return NULL;
 }
 
-PACT_UNUSED static pact_crypto_vtable pact_crypto_vtable_default = {
+BLINK_UNUSED static pact_crypto_vtable pact_crypto_vtable_default = {
     pact_crypto_default_hash,
     pact_crypto_default_sign,
     pact_crypto_default_encrypt,
@@ -1059,27 +1059,27 @@ typedef struct {
     void    (*rand_bytes)(void* buf, int64_t len);
 } pact_rand_vtable;
 
-PACT_UNUSED static int pact_rand_seeded = 0;
+BLINK_UNUSED static int pact_rand_seeded = 0;
 
-PACT_UNUSED static void pact_rand_ensure_seed(void) {
+BLINK_UNUSED static void pact_rand_ensure_seed(void) {
     if (!pact_rand_seeded) {
         srand((unsigned)42);
         pact_rand_seeded = 1;
     }
 }
 
-PACT_UNUSED static int64_t pact_rand_default_int(int64_t min, int64_t max) {
+BLINK_UNUSED static int64_t pact_rand_default_int(int64_t min, int64_t max) {
     pact_rand_ensure_seed();
     if (min >= max) return min;
     return min + (int64_t)(rand() % (int)(max - min));
 }
 
-PACT_UNUSED static double pact_rand_default_float(void) {
+BLINK_UNUSED static double pact_rand_default_float(void) {
     pact_rand_ensure_seed();
     return (double)rand() / (double)RAND_MAX;
 }
 
-PACT_UNUSED static void pact_rand_default_bytes(void* buf, int64_t len) {
+BLINK_UNUSED static void pact_rand_default_bytes(void* buf, int64_t len) {
     pact_rand_ensure_seed();
     unsigned char* p = (unsigned char*)buf;
     for (int64_t i = 0; i < len; i++) {
@@ -1087,7 +1087,7 @@ PACT_UNUSED static void pact_rand_default_bytes(void* buf, int64_t len) {
     }
 }
 
-PACT_UNUSED static pact_rand_vtable pact_rand_vtable_default = {
+BLINK_UNUSED static pact_rand_vtable pact_rand_vtable_default = {
     pact_rand_default_int,
     pact_rand_default_float,
     pact_rand_default_bytes
@@ -1100,7 +1100,7 @@ PACT_UNUSED static pact_rand_vtable pact_rand_vtable_default = {
 typedef struct { int64_t nanos; } pact_duration_struct;
 typedef struct { int64_t nanos; } pact_instant_struct;
 
-PACT_UNUSED static const char* pact_Instant_to_rfc3339(pact_instant_struct i) {
+BLINK_UNUSED static const char* pact_Instant_to_rfc3339(pact_instant_struct i) {
     time_t epoch_secs = (time_t)(i.nanos / 1000000000LL);
     struct tm utc;
     gmtime_r(&epoch_secs, &utc);
@@ -1111,7 +1111,7 @@ PACT_UNUSED static const char* pact_Instant_to_rfc3339(pact_instant_struct i) {
     return buf;
 }
 
-PACT_UNUSED static pact_duration_struct pact_Instant_elapsed(pact_instant_struct then) {
+BLINK_UNUSED static pact_duration_struct pact_Instant_elapsed(pact_instant_struct then) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     int64_t now_nanos = (int64_t)ts.tv_sec * 1000000000LL + (int64_t)ts.tv_nsec;
@@ -1124,13 +1124,13 @@ typedef struct {
     void                (*sleep)(pact_duration_struct d);
 } pact_time_vtable;
 
-PACT_UNUSED static pact_instant_struct pact_time_default_read(void) {
+BLINK_UNUSED static pact_instant_struct pact_time_default_read(void) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     return (pact_instant_struct){.nanos = (int64_t)ts.tv_sec * 1000000000LL + (int64_t)ts.tv_nsec};
 }
 
-PACT_UNUSED static void pact_time_default_sleep(pact_duration_struct d) {
+BLINK_UNUSED static void pact_time_default_sleep(pact_duration_struct d) {
     int64_t ns = d.nanos;
     struct timespec ts;
     ts.tv_sec  = (time_t)(ns / 1000000000LL);
@@ -1138,12 +1138,12 @@ PACT_UNUSED static void pact_time_default_sleep(pact_duration_struct d) {
     nanosleep(&ts, NULL);
 }
 
-PACT_UNUSED static pact_time_vtable pact_time_vtable_default = {
+BLINK_UNUSED static pact_time_vtable pact_time_vtable_default = {
     pact_time_default_read,
     pact_time_default_sleep
 };
 
-PACT_UNUSED static int64_t pact_time_ms(void) {
+BLINK_UNUSED static int64_t pact_time_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (int64_t)ts.tv_sec * 1000 + (int64_t)(ts.tv_nsec / 1000000);
@@ -1155,16 +1155,16 @@ typedef struct {
     int         (*write)(const char* name, const char* value);
 } pact_env_vtable;
 
-PACT_UNUSED static const char* pact_env_default_read(const char* name) {
+BLINK_UNUSED static const char* pact_env_default_read(const char* name) {
     const char* v = getenv(name);
     return v ? pact_strdup(v) : NULL;
 }
 
-PACT_UNUSED static int pact_env_default_write(const char* name, const char* value) {
+BLINK_UNUSED static int pact_env_default_write(const char* name, const char* value) {
     return setenv(name, value, 1);
 }
 
-PACT_UNUSED static pact_env_vtable pact_env_vtable_default = {
+BLINK_UNUSED static pact_env_vtable pact_env_vtable_default = {
     pact_env_default_read,
     pact_env_default_write
 };
@@ -1175,19 +1175,19 @@ typedef struct {
     int     (*signal)(int64_t pid, int sig);
 } pact_process_vtable;
 
-PACT_UNUSED static int64_t pact_process_default_spawn(const char* command) {
+BLINK_UNUSED static int64_t pact_process_default_spawn(const char* command) {
     (void)command;
-    fprintf(stderr, "pact: process.spawn not implemented\n");
+    fprintf(stderr, "blink: process.spawn not implemented\n");
     return -1;
 }
 
-PACT_UNUSED static int pact_process_default_signal(int64_t pid, int sig) {
+BLINK_UNUSED static int pact_process_default_signal(int64_t pid, int sig) {
     (void)pid; (void)sig;
-    fprintf(stderr, "pact: process.signal not implemented\n");
+    fprintf(stderr, "blink: process.signal not implemented\n");
     return -1;
 }
 
-PACT_UNUSED static pact_process_vtable pact_process_vtable_default = {
+BLINK_UNUSED static pact_process_vtable pact_process_vtable_default = {
     pact_process_default_spawn,
     pact_process_default_signal
 };
@@ -1205,7 +1205,7 @@ typedef struct {
     pact_process_vtable* process;
 } pact_ctx;
 
-PACT_UNUSED static pact_ctx pact_ctx_default(void) {
+BLINK_UNUSED static pact_ctx pact_ctx_default(void) {
     pact_ctx ctx;
     ctx.io      = &pact_io_vtable_default;
     ctx.fs      = &pact_fs_vtable_default;
@@ -1221,7 +1221,7 @@ PACT_UNUSED static pact_ctx pact_ctx_default(void) {
 
 /* ── Debug assert ───────────────────────────────────────────────────── */
 
-PACT_UNUSED static void __pact_debug_assert_fail(const char* file, int line, const char* fn, const char* cond, const char* msg) {
+BLINK_UNUSED static void __pact_debug_assert_fail(const char* file, int line, const char* fn, const char* cond, const char* msg) {
     fprintf(stderr, "DEBUG ASSERT FAILED: %s\n", msg);
     fprintf(stderr, "  condition: %s\n", cond);
     fprintf(stderr, "  location: %s:%d in %s\n", file, line, fn);
@@ -1230,16 +1230,16 @@ PACT_UNUSED static void __pact_debug_assert_fail(const char* file, int line, con
 
 /* ── FFI scope helpers ─────────────────────────────────────────────── */
 
-PACT_UNUSED static pact_list* pact_ffi_scope_new(void) {
+BLINK_UNUSED static pact_list* pact_ffi_scope_new(void) {
     return pact_list_new();
 }
 
-PACT_UNUSED static void* pact_ffi_scope_track(pact_list* scope, void* ptr) {
+BLINK_UNUSED static void* pact_ffi_scope_track(pact_list* scope, void* ptr) {
     pact_list_push(scope, ptr);
     return ptr;
 }
 
-PACT_UNUSED static void* pact_ffi_scope_take(pact_list* scope, void* ptr) {
+BLINK_UNUSED static void* pact_ffi_scope_take(pact_list* scope, void* ptr) {
     for (int64_t i = 0; i < scope->len; i++) {
         if (scope->items[i] == ptr) {
             for (int64_t j = i; j < scope->len - 1; j++) {
@@ -1252,7 +1252,7 @@ PACT_UNUSED static void* pact_ffi_scope_take(pact_list* scope, void* ptr) {
     return ptr;
 }
 
-PACT_UNUSED static void pact_ffi_scope_cleanup(pact_list* scope) {
+BLINK_UNUSED static void pact_ffi_scope_cleanup(pact_list* scope) {
     for (int64_t i = 0; i < scope->len; i++) {
         GC_FREE(scope->items[i]);
     }

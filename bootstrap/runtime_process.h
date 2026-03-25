@@ -1,5 +1,5 @@
-#ifndef PACT_RUNTIME_PROCESS_H
-#define PACT_RUNTIME_PROCESS_H
+#ifndef BLINK_RUNTIME_PROCESS_H
+#define BLINK_RUNTIME_PROCESS_H
 
 #ifndef _WIN32
 #include <sys/wait.h>
@@ -48,7 +48,7 @@ static char* pact_read_fd_to_string(int fd) {
     return buf;
 }
 
-PACT_UNUSED static void pact_process_exec(const char* cmd, const pact_list* args) {
+BLINK_UNUSED static void pact_process_exec(const char* cmd, const pact_list* args) {
     char** argv = pact_process_build_argv(cmd, args);
     execvp(cmd, argv);
     perror("execvp");
@@ -57,7 +57,7 @@ PACT_UNUSED static void pact_process_exec(const char* cmd, const pact_list* args
 
 // Note: writes all stdin before reading stdout/stderr. May deadlock if
 // stdin + stdout together exceed pipe buffer (~64KB). Fine for small payloads.
-PACT_UNUSED static pact_ProcessResult pact_process_run_with_stdin(const char* cmd, const pact_list* args, const char* stdin_data) {
+BLINK_UNUSED static pact_ProcessResult pact_process_run_with_stdin(const char* cmd, const pact_list* args, const char* stdin_data) {
     pact_ProcessResult result = { "", "", -1 };
     int stdin_pipe[2] = {-1, -1}, stdout_pipe[2] = {-1, -1}, stderr_pipe[2] = {-1, -1};
     if (pipe(stdin_pipe) < 0 || pipe(stdout_pipe) < 0 || pipe(stderr_pipe) < 0) {
@@ -133,7 +133,7 @@ PACT_UNUSED static pact_ProcessResult pact_process_run_with_stdin(const char* cm
     return result;
 }
 
-PACT_UNUSED static pact_ProcessResult pact_process_run(const char* cmd, const pact_list* args) {
+BLINK_UNUSED static pact_ProcessResult pact_process_run(const char* cmd, const pact_list* args) {
     return pact_process_run_with_stdin(cmd, args, NULL);
 }
 

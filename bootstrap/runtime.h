@@ -1,5 +1,5 @@
-#ifndef PACT_RUNTIME_H
-#define PACT_RUNTIME_H
+#ifndef BLINK_RUNTIME_H
+#define BLINK_RUNTIME_H
 
 /* Core runtime: alloc, list, map, bytes, strings, file I/O, closures, effects */
 #include "runtime_core.h"
@@ -13,4 +13,4 @@
 #include "runtime_sqlite.h"
 #include "runtime_stdio.h"
 
-#endif /* PACT_RUNTIME_H */
+#endif /* BLINK_RUNTIME_H */

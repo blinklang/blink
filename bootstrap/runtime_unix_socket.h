@@ -1,14 +1,14 @@
-#ifndef PACT_RUNTIME_UNIX_SOCKET_H
-#define PACT_RUNTIME_UNIX_SOCKET_H
+#ifndef BLINK_RUNTIME_UNIX_SOCKET_H
+#define BLINK_RUNTIME_UNIX_SOCKET_H
 
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <poll.h>
 
-PACT_UNUSED static int64_t pact_unix_socket_listen(const char* path) {
+BLINK_UNUSED static int64_t pact_unix_socket_listen(const char* path) {
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) {
-        fprintf(stderr, "pact: socket() failed\n");
+        fprintf(stderr, "blink: socket() failed\n");
         return -1;
     }
     struct sockaddr_un addr;
@@ -17,22 +17,22 @@ PACT_UNUSED static int64_t pact_unix_socket_listen(const char* path) {
     strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
     unlink(path);
     if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        fprintf(stderr, "pact: bind(%s) failed\n", path);
+        fprintf(stderr, "blink: bind(%s) failed\n", path);
         close(fd);
         return -1;
     }
     if (listen(fd, 5) < 0) {
-        fprintf(stderr, "pact: listen(%s) failed\n", path);
+        fprintf(stderr, "blink: listen(%s) failed\n", path);
         close(fd);
         return -1;
     }
     return (int64_t)fd;
 }
 
-PACT_UNUSED static int64_t pact_unix_socket_connect(const char* path) {
+BLINK_UNUSED static int64_t pact_unix_socket_connect(const char* path) {
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) {
-        fprintf(stderr, "pact: socket() failed\n");
+        fprintf(stderr, "blink: socket() failed\n");
         return -1;
     }
     struct sockaddr_un addr;
@@ -40,23 +40,23 @@ PACT_UNUSED static int64_t pact_unix_socket_connect(const char* path) {
     addr.sun_family = AF_UNIX;
     strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
     if (connect(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        fprintf(stderr, "pact: connect(%s) failed\n", path);
+        fprintf(stderr, "blink: connect(%s) failed\n", path);
         close(fd);
         return -1;
     }
     return (int64_t)fd;
 }
 
-PACT_UNUSED static int64_t pact_unix_socket_accept(int64_t listen_fd) {
+BLINK_UNUSED static int64_t pact_unix_socket_accept(int64_t listen_fd) {
     int client = accept((int)listen_fd, NULL, NULL);
     if (client < 0) {
-        fprintf(stderr, "pact: accept() failed\n");
+        fprintf(stderr, "blink: accept() failed\n");
         return -1;
     }
     return (int64_t)client;
 }
 
-PACT_UNUSED static int64_t pact_unix_socket_accept_timeout(int64_t listen_fd, int64_t timeout_ms) {
+BLINK_UNUSED static int64_t pact_unix_socket_accept_timeout(int64_t listen_fd, int64_t timeout_ms) {
     struct pollfd pfd;
     pfd.fd = (int)listen_fd;
     pfd.events = POLLIN;
@@ -68,11 +68,11 @@ PACT_UNUSED static int64_t pact_unix_socket_accept_timeout(int64_t listen_fd, in
     return (int64_t)client;
 }
 
-PACT_UNUSED static void pact_unix_socket_close(int64_t fd) {
+BLINK_UNUSED static void pact_unix_socket_close(int64_t fd) {
     close((int)fd);
 }
 
-PACT_UNUSED static const char* pact_socket_read_line(int64_t fd) {
+BLINK_UNUSED static const char* pact_socket_read_line(int64_t fd) {
     char buf[4096];
     int64_t pos = 0;
     while (pos < (int64_t)(sizeof(buf) - 1)) {
@@ -86,7 +86,7 @@ PACT_UNUSED static const char* pact_socket_read_line(int64_t fd) {
     return pact_strdup(buf);
 }
 
-PACT_UNUSED static void pact_socket_write(int64_t fd, const char* data) {
+BLINK_UNUSED static void pact_socket_write(int64_t fd, const char* data) {
     size_t len = strlen(data);
     size_t written = 0;
     while (written < len) {

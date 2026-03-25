@@ -1,12 +1,12 @@
-#ifndef PACT_RUNTIME_TCP_H
-#define PACT_RUNTIME_TCP_H
+#ifndef BLINK_RUNTIME_TCP_H
+#define BLINK_RUNTIME_TCP_H
 
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
 
-PACT_UNUSED static int64_t pact_tcp_listen(const char* host, int64_t port) {
+BLINK_UNUSED static int64_t pact_tcp_listen(const char* host, int64_t port) {
     (void)host;
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return -1;
@@ -28,12 +28,12 @@ PACT_UNUSED static int64_t pact_tcp_listen(const char* host, int64_t port) {
     return (int64_t)fd;
 }
 
-PACT_UNUSED static int64_t pact_tcp_accept(int64_t listen_fd) {
+BLINK_UNUSED static int64_t pact_tcp_accept(int64_t listen_fd) {
     int client = accept((int)listen_fd, NULL, NULL);
     return (int64_t)client;
 }
 
-PACT_UNUSED static const char* pact_tcp_read(int64_t fd, int64_t max_bytes) {
+BLINK_UNUSED static const char* pact_tcp_read(int64_t fd, int64_t max_bytes) {
     char* buf = (char*)pact_alloc(max_bytes + 1);
     ssize_t n = read((int)fd, buf, (size_t)max_bytes);
     if (n < 0) n = 0;
@@ -41,7 +41,7 @@ PACT_UNUSED static const char* pact_tcp_read(int64_t fd, int64_t max_bytes) {
     return buf;
 }
 
-PACT_UNUSED static void pact_tcp_write(int64_t fd, const char* data) {
+BLINK_UNUSED static void pact_tcp_write(int64_t fd, const char* data) {
     size_t len = strlen(data);
     size_t written = 0;
     while (written < len) {
@@ -51,11 +51,11 @@ PACT_UNUSED static void pact_tcp_write(int64_t fd, const char* data) {
     }
 }
 
-PACT_UNUSED static void pact_tcp_close(int64_t fd) {
+BLINK_UNUSED static void pact_tcp_close(int64_t fd) {
     close((int)fd);
 }
 
-PACT_UNUSED static int64_t pact_tcp_connect(const char* host, int64_t port) {
+BLINK_UNUSED static int64_t pact_tcp_connect(const char* host, int64_t port) {
     char port_str[16];
     snprintf(port_str, sizeof(port_str), "%lld", (long long)port);
     struct addrinfo hints, *res;
@@ -80,7 +80,7 @@ PACT_UNUSED static int64_t pact_tcp_connect(const char* host, int64_t port) {
     return (int64_t)fd;
 }
 
-PACT_UNUSED static void pact_tcp_set_timeout(int64_t fd, int64_t ms) {
+BLINK_UNUSED static void pact_tcp_set_timeout(int64_t fd, int64_t ms) {
     if (ms <= 0) return;
     struct timeval tv;
     tv.tv_sec = (time_t)(ms / 1000);
@@ -89,7 +89,7 @@ PACT_UNUSED static void pact_tcp_set_timeout(int64_t fd, int64_t ms) {
     setsockopt((int)fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 }
 
-PACT_UNUSED static const char* pact_tcp_read_all(int64_t fd) {
+BLINK_UNUSED static const char* pact_tcp_read_all(int64_t fd) {
     int64_t cap = 4096;
     int64_t len = 0;
     char* buf = (char*)pact_alloc(cap);

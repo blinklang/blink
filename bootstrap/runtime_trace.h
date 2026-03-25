@@ -1,13 +1,13 @@
-#ifndef PACT_RUNTIME_TRACE_H
-#define PACT_RUNTIME_TRACE_H
+#ifndef BLINK_RUNTIME_TRACE_H
+#define BLINK_RUNTIME_TRACE_H
 
-#define PACT_TRACE_MAX_FILTERS 16
-#define PACT_TRACE_MAX_OR_VALUES 8
-#define PACT_TRACE_MAX_VALUE_LEN 200
+#define BLINK_TRACE_MAX_FILTERS 16
+#define BLINK_TRACE_MAX_OR_VALUES 8
+#define BLINK_TRACE_MAX_VALUE_LEN 200
 
 typedef struct {
     char key[32];
-    char values[PACT_TRACE_MAX_OR_VALUES][128];
+    char values[BLINK_TRACE_MAX_OR_VALUES][128];
     int count;
 } pact_trace_filter;
 
@@ -15,7 +15,7 @@ typedef struct {
     int active;
     int depth;
     struct timespec start;
-    pact_trace_filter filters[PACT_TRACE_MAX_FILTERS];
+    pact_trace_filter filters[BLINK_TRACE_MAX_FILTERS];
     int filter_count;
     int event_enter;
     int event_exit;
@@ -27,7 +27,7 @@ typedef struct {
 
 static pact_trace_state __pact_trace = {0};
 
-PACT_UNUSED static int64_t pact_trace_ts_us(void) {
+BLINK_UNUSED static int64_t pact_trace_ts_us(void) {
     struct timespec now;
 #ifdef __APPLE__
     clock_gettime(CLOCK_MONOTONIC, &now);
@@ -39,12 +39,12 @@ PACT_UNUSED static int64_t pact_trace_ts_us(void) {
     return sec_diff * 1000000 + nsec_diff / 1000;
 }
 
-PACT_UNUSED static void pact_trace_parse_filters(const char* filter_str) {
+BLINK_UNUSED static void pact_trace_parse_filters(const char* filter_str) {
     if (!filter_str || !*filter_str) return;
     __pact_trace.event_enter = 1;
     __pact_trace.event_exit = 1;
     const char* p = filter_str;
-    while (*p && __pact_trace.filter_count < PACT_TRACE_MAX_FILTERS) {
+    while (*p && __pact_trace.filter_count < BLINK_TRACE_MAX_FILTERS) {
         pact_trace_filter* f = &__pact_trace.filters[__pact_trace.filter_count];
         const char* colon = p;
         while (*colon && *colon != ':' && *colon != ',') colon++;
@@ -55,7 +55,7 @@ PACT_UNUSED static void pact_trace_parse_filters(const char* filter_str) {
         f->key[klen] = '\0';
         p = colon + 1;
         f->count = 0;
-        while (f->count < PACT_TRACE_MAX_OR_VALUES) {
+        while (f->count < BLINK_TRACE_MAX_OR_VALUES) {
             const char* end = p;
             while (*end && *end != '+' && *end != ',') end++;
             int vlen = (int)(end - p);
@@ -84,7 +84,7 @@ PACT_UNUSED static void pact_trace_parse_filters(const char* filter_str) {
     }
 }
 
-PACT_UNUSED static void pact_trace_init(int argc, char** argv) {
+BLINK_UNUSED static void pact_trace_init(int argc, char** argv) {
     __pact_trace.active = 0;
     __pact_trace.depth = 0;
     __pact_trace.filter_count = 0;
@@ -94,7 +94,7 @@ PACT_UNUSED static void pact_trace_init(int argc, char** argv) {
     __pact_trace.event_state = 1;
     __pact_trace.event_limit = 0;
     __pact_trace.event_count = 0;
-#ifndef PACT_NO_TRACE_INIT
+#ifndef BLINK_NO_TRACE_INIT
     const char* filter_str = NULL;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--trace") == 0) {
@@ -109,14 +109,14 @@ PACT_UNUSED static void pact_trace_init(int argc, char** argv) {
         }
     }
     if (!__pact_trace.active) {
-        const char* env = getenv("PACT_TRACE");
+        const char* env = getenv("BLINK_TRACE");
         if (env && *env) {
             __pact_trace.active = 1;
             filter_str = (strcmp(env, "1") == 0) ? NULL : env;
         }
     }
     if (!__pact_trace.event_limit) {
-        const char* limit_env = getenv("PACT_TRACE_LIMIT");
+        const char* limit_env = getenv("BLINK_TRACE_LIMIT");
         if (limit_env && *limit_env) {
             __pact_trace.event_limit = atoi(limit_env);
         }
@@ -130,7 +130,7 @@ PACT_UNUSED static void pact_trace_init(int argc, char** argv) {
 #endif
 }
 
-PACT_UNUSED static int pact_trace_match(const char* fn, const char* module, int depth) {
+BLINK_UNUSED static int pact_trace_match(const char* fn, const char* module, int depth) {
     if (!__pact_trace.active) return 0;
     if (__pact_trace.filter_count == 0) return 1;
     for (int i = 0; i < __pact_trace.filter_count; i++) {
@@ -163,7 +163,7 @@ PACT_UNUSED static int pact_trace_match(const char* fn, const char* module, int 
     return 1;
 }
 
-PACT_UNUSED static int pact_trace_match_effect(const char* fn, const char* module, int depth, const char* effect) {
+BLINK_UNUSED static int pact_trace_match_effect(const char* fn, const char* module, int depth, const char* effect) {
     if (!pact_trace_match(fn, module, depth)) return 0;
     for (int i = 0; i < __pact_trace.filter_count; i++) {
         pact_trace_filter* f = &__pact_trace.filters[i];
@@ -178,7 +178,7 @@ PACT_UNUSED static int pact_trace_match_effect(const char* fn, const char* modul
     return 1;
 }
 
-PACT_UNUSED static int pact_trace_match_state(const char* fn, const char* module, int depth, const char* var) {
+BLINK_UNUSED static int pact_trace_match_state(const char* fn, const char* module, int depth, const char* var) {
     if (!pact_trace_match(fn, module, depth)) return 0;
     for (int i = 0; i < __pact_trace.filter_count; i++) {
         pact_trace_filter* f = &__pact_trace.filters[i];
@@ -193,7 +193,7 @@ PACT_UNUSED static int pact_trace_match_state(const char* fn, const char* module
     return 1;
 }
 
-PACT_UNUSED static void pact_trace_write_escaped(FILE* out, const char* s, int max_len) {
+BLINK_UNUSED static void pact_trace_write_escaped(FILE* out, const char* s, int max_len) {
     int written = 0;
     while (*s && written < max_len) {
         switch (*s) {
@@ -211,13 +211,13 @@ PACT_UNUSED static void pact_trace_write_escaped(FILE* out, const char* s, int m
     }
 }
 
-PACT_UNUSED static int pact_trace_str_truncated(const char* s) {
+BLINK_UNUSED static int pact_trace_str_truncated(const char* s) {
     int len = 0;
-    while (s[len]) { len++; if (len > PACT_TRACE_MAX_VALUE_LEN) return 1; }
+    while (s[len]) { len++; if (len > BLINK_TRACE_MAX_VALUE_LEN) return 1; }
     return 0;
 }
 
-PACT_UNUSED static void pact_trace_enter(const char* fn, const char* module, int depth,
+BLINK_UNUSED static void pact_trace_enter(const char* fn, const char* module, int depth,
     const char* file, int line, int col, const char* args_json) {
     if (!__pact_trace.event_enter) return;
     if (__pact_trace.event_limit > 0 && __pact_trace.event_count >= __pact_trace.event_limit) return;
@@ -233,7 +233,7 @@ PACT_UNUSED static void pact_trace_enter(const char* fn, const char* module, int
     fflush(stderr);
 }
 
-PACT_UNUSED static void pact_trace_exit(const char* fn, const char* module, int depth,
+BLINK_UNUSED static void pact_trace_exit(const char* fn, const char* module, int depth,
     int64_t enter_ts, const char* ret_str) {
     if (!__pact_trace.event_exit) return;
     if (__pact_trace.event_limit > 0 && __pact_trace.event_count >= __pact_trace.event_limit) return;
@@ -244,7 +244,7 @@ PACT_UNUSED static void pact_trace_exit(const char* fn, const char* module, int 
         "\"duration_us\":%lld,\"return\":\"",
         (long long)ts, fn, module, depth, (long long)duration);
     if (ret_str) {
-        pact_trace_write_escaped(stderr, ret_str, PACT_TRACE_MAX_VALUE_LEN);
+        pact_trace_write_escaped(stderr, ret_str, BLINK_TRACE_MAX_VALUE_LEN);
     } else {
         fputs("()", stderr);
     }
@@ -256,7 +256,7 @@ PACT_UNUSED static void pact_trace_exit(const char* fn, const char* module, int 
     fflush(stderr);
 }
 
-PACT_UNUSED static void pact_trace_state_event(const char* fn, const char* module, int depth,
+BLINK_UNUSED static void pact_trace_state_event(const char* fn, const char* module, int depth,
     const char* var, const char* op, const char* value) {
     if (!__pact_trace.event_state) return;
     if (__pact_trace.event_limit > 0 && __pact_trace.event_count >= __pact_trace.event_limit) return;
@@ -266,7 +266,7 @@ PACT_UNUSED static void pact_trace_state_event(const char* fn, const char* modul
         "\"var\":\"%s\",\"op\":\"%s\",\"value\":\"",
         (long long)ts, fn, module, depth, var, op);
     if (value) {
-        pact_trace_write_escaped(stderr, value, PACT_TRACE_MAX_VALUE_LEN);
+        pact_trace_write_escaped(stderr, value, BLINK_TRACE_MAX_VALUE_LEN);
     }
     fputs("\"", stderr);
     if (value && pact_trace_str_truncated(value)) {
@@ -276,7 +276,7 @@ PACT_UNUSED static void pact_trace_state_event(const char* fn, const char* modul
     fflush(stderr);
 }
 
-PACT_UNUSED static void pact_trace_effect(const char* fn, const char* module, int depth,
+BLINK_UNUSED static void pact_trace_effect(const char* fn, const char* module, int depth,
     const char* effect, const char* op, const char* args_json) {
     if (!__pact_trace.event_effect) return;
     if (__pact_trace.event_limit > 0 && __pact_trace.event_count >= __pact_trace.event_limit) return;
@@ -292,4 +292,4 @@ PACT_UNUSED static void pact_trace_effect(const char* fn, const char* module, in
     fflush(stderr);
 }
 
-#endif /* PACT_RUNTIME_TRACE_H */
+#endif /* BLINK_RUNTIME_TRACE_H */

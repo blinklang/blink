@@ -1,5 +1,5 @@
-#ifndef PACT_RUNTIME_TEST_H
-#define PACT_RUNTIME_TEST_H
+#ifndef BLINK_RUNTIME_TEST_H
+#define BLINK_RUNTIME_TEST_H
 
 #include <setjmp.h>
 
@@ -13,12 +13,12 @@ typedef struct {
     int tag_count;
 } pact_test_entry;
 
-PACT_UNUSED static jmp_buf __pact_test_jmp;
-PACT_UNUSED static int __pact_test_failed;
-PACT_UNUSED static char __pact_test_fail_msg[512];
-PACT_UNUSED static int __pact_test_fail_line;
+BLINK_UNUSED static jmp_buf __pact_test_jmp;
+BLINK_UNUSED static int __pact_test_failed;
+BLINK_UNUSED static char __pact_test_fail_msg[512];
+BLINK_UNUSED static int __pact_test_fail_line;
 
-PACT_UNUSED static void __pact_assert_fail(const char* msg, int line) {
+BLINK_UNUSED static void __pact_assert_fail(const char* msg, int line) {
     __pact_test_failed = 1;
     if (msg) {
         strncpy(__pact_test_fail_msg, msg, sizeof(__pact_test_fail_msg) - 1);
@@ -30,14 +30,14 @@ PACT_UNUSED static void __pact_assert_fail(const char* msg, int line) {
     longjmp(__pact_test_jmp, 1);
 }
 
-PACT_UNUSED static int __pact_test_has_tag(const pact_test_entry* test, const char* tag) {
+BLINK_UNUSED static int __pact_test_has_tag(const pact_test_entry* test, const char* tag) {
     for (int t = 0; t < test->tag_count; t++) {
         if (strcmp(test->tags[t], tag) == 0) return 1;
     }
     return 0;
 }
 
-PACT_UNUSED static void __pact_test_print_tags_json(const pact_test_entry* test) {
+BLINK_UNUSED static void __pact_test_print_tags_json(const pact_test_entry* test) {
     printf(",\"tags\":[");
     for (int t = 0; t < test->tag_count; t++) {
         if (t > 0) printf(",");
@@ -46,7 +46,7 @@ PACT_UNUSED static void __pact_test_print_tags_json(const pact_test_entry* test)
     printf("]");
 }
 
-PACT_UNUSED static void pact_test_run(const pact_test_entry* tests, int count, int argc, const char** argv) {
+BLINK_UNUSED static void pact_test_run(const pact_test_entry* tests, int count, int argc, const char** argv) {
     const char* filter = NULL;
     const char* tags_filter = NULL;
     int json_output = 0;
