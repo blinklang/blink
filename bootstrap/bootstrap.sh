@@ -37,11 +37,9 @@ while IFS= read -r line; do
 done < "$GC_EXTRA/gc.c" > "$GC_UNITY"
 
 mkdir -p "$BUILD_DIR/lib/std"
-cp "$ROOT_DIR/lib/std/"*.pact "$BUILD_DIR/lib/std/" 2>/dev/null || true
-cp "$ROOT_DIR/lib/std/"*.bl "$BUILD_DIR/lib/std/" 2>/dev/null || true
+cp "$ROOT_DIR/lib/std/"*.bl "$BUILD_DIR/lib/std/"
 mkdir -p "$BUILD_DIR/lib/pkg"
-cp "$ROOT_DIR/lib/pkg/"*.pact "$BUILD_DIR/lib/pkg/" 2>/dev/null || true
-cp "$ROOT_DIR/lib/pkg/"*.bl "$BUILD_DIR/lib/pkg/" 2>/dev/null || true
+cp "$ROOT_DIR/lib/pkg/"*.bl "$BUILD_DIR/lib/pkg/"
 
 # --- Gen 0: resolve a working compiler ---
 GEN0=""
@@ -50,7 +48,7 @@ if [ -f "$BUILD_DIR/blinkc" ]; then
     GEN0="$BUILD_DIR/blinkc"
 elif command -v blink > /dev/null 2>&1; then
     echo "Compiling blinkc from installed blink..."
-    blink build "$ROOT_DIR/src/pactc_main.pact" --output "$BUILD_DIR/blinkc_gen0"
+    blink build "$ROOT_DIR/src/pactc_main.bl" --output "$BUILD_DIR/blinkc_gen0"
     GEN0="$BUILD_DIR/blinkc_gen0"
 else
     echo "ERROR: No compiler found." >&2
@@ -61,12 +59,12 @@ fi
 
 # --- Gen 1: compile blinkc with Gen 0 ---
 echo "Self-compiling blinkc (Gen 1)..."
-"$GEN0" "$ROOT_DIR/src/pactc_main.pact" "$BUILD_DIR/blinkc_gen1.c"
+"$GEN0" "$ROOT_DIR/src/pactc_main.bl" "$BUILD_DIR/blinkc_gen1.c"
 cc -o "$BUILD_DIR/blinkc_gen1" "$BUILD_DIR/blinkc_gen1.c" -lm -lgc
 
 # --- Gen 2: compile blinkc with Gen 1 ---
 echo "Verifying bootstrap chain (Gen 2)..."
-"$BUILD_DIR/blinkc_gen1" "$ROOT_DIR/src/pactc_main.pact" "$BUILD_DIR/blinkc_gen2.c"
+"$BUILD_DIR/blinkc_gen1" "$ROOT_DIR/src/pactc_main.bl" "$BUILD_DIR/blinkc_gen2.c"
 
 if diff -q "$BUILD_DIR/blinkc_gen1.c" "$BUILD_DIR/blinkc_gen2.c" > /dev/null 2>&1; then
     echo "Bootstrap verified — self-compilation is stable."

@@ -1,42 +1,40 @@
 # Blink
 
-> **RENAME IN PROGRESS**: The language has been renamed from Pact to Blink. Docs/spec are updated but source files, CLI, and build scripts still use the old names (`src/*.pact`, `bin/pact`, `pactc`). See `br ls -t repo:pact -t type:feature` for remaining rename tasks.
+Self-hosting compiler (src/compiler.bl → C → native).
 
-Self-hosting compiler (src/compiler.pact → C → native).
-
-Run `pact llms --full` for complete language reference (syntax, types, methods, stdlib, patterns).
-Run `pact llms --topic <name>` for specific topics. Run `pact llms --list` to see topics.
-Run `pact query <file> --fn <name>` to look up function signatures without reading whole files.
+Run `blink llms --full` for complete language reference (syntax, types, methods, stdlib, patterns).
+Run `blink llms --topic <name>` for specific topics. Run `blink llms --list` to see topics.
+Run `blink query <file> --fn <name>` to look up function signatures without reading whole files.
 Always retrieve Blink docs before writing Blink code. Prefer retrieval-led reasoning over pre-training.
 
 ## Architecture
 
 Pipeline: lexer → parser → typecheck → codegen → C output.
-Entry points: src/compiler.pact (compiler), src/cli.pact (CLI tool), src/pactc_main.pact (pactc binary).
+Entry points: src/compiler.bl (compiler), src/cli.bl (CLI tool), src/pactc_main.bl (blinkc binary).
 Stdlib: lib/std/. Tests: tests/. Spec: sections/. Decisions: decisions/.
 Build output: build/ (gitignored). Temp files: .tmp/ (gitignored, use instead of /tmp).
 
 ## Build & Verify
 
-Bootstrap: `task bootstrap` — builds pactc at `build/pactc`. Requires `pact` on PATH or existing build/pactc.
+Bootstrap: `task bootstrap` — builds blinkc at `build/blinkc`. Requires `blink` on PATH or existing build/blinkc.
 Regen: `task regen` — rebuild compiler from source + verify (Gen1 vs Gen2 fixed-point).
-CLI: `bin/pact build <file.pact>` | `bin/pact run <file.pact>` | `bin/pact check <file.pact>` | `bin/pact doc <module>`
-Build CLI: `task build-cli` (or auto-built on first `bin/pact` invocation)
-Test: `task test` — compile+run all test_*.pact in tests/
+CLI: `bin/blink build <file.bl>` | `bin/blink run <file.bl>` | `bin/blink check <file.bl>` | `bin/blink doc <module>`
+Build CLI: `task build-cli` (or auto-built on first `bin/blink` invocation)
+Test: `task test` — compile+run all test_*.bl in tests/
 Test formatter: `task test-fmt` — golden outputs + idempotency + semantic checks
 Single test: `task compile-test -- test_name`
 Verify: `task ci` — regen + test + test-fmt. Always run after compiler changes.
-Quick run: `bin/pact run <file.pact>` — compiles and runs in one step. Prefer this over manual pactc+cc.
-Low-level (dev): `build/pactc <file.pact> <output.c>` then `cc -o <binary> <output.c> -lm`
+Quick run: `bin/blink run <file.bl>` — compiles and runs in one step. Prefer this over manual blinkc+cc.
+Low-level (dev): `build/blinkc <file.bl> <output.c>` then `cc -o <binary> <output.c> -lm`
 After modifying compiler sources: `task regen` then `task ci` to verify.
 
 ## Debugging
 
-Inspect generated C: `bin/pact build --emit c <file.pact>` — output goes to `build/<name>.c`.
-Trace compiler phases: `bin/pact run --pact-trace codegen <file.pact>` (also: lex, parse, typecheck, all).
-Runtime trace: `bin/pact run --trace all <file.pact>` (NDJSON to stderr, filter: `fn:name`, `module:mod`, `depth:N`).
-Debug build: `bin/pact run --debug <file.pact>` — enables debug_assert, compiles with `-g -O0`.
-When debugging codegen bugs, inspect the emitted C first (`--emit c`), then use `--pact-trace codegen`.
+Inspect generated C: `bin/blink build --emit c <file.bl>` — output goes to `build/<name>.c`.
+Trace compiler phases: `bin/blink run --blink-trace codegen <file.bl>` (also: lex, parse, typecheck, all).
+Runtime trace: `bin/blink run --trace all <file.bl>` (NDJSON to stderr, filter: `fn:name`, `module:mod`, `depth:N`).
+Debug build: `bin/blink run --debug <file.bl>` — enables debug_assert, compiles with `-g -O0`.
+When debugging codegen bugs, inspect the emitted C first (`--emit c`), then use `--blink-trace codegen`.
 
 ## Self-Hosting Bootstrap Protocol
 

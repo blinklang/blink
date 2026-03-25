@@ -1,0 +1,2904 @@
+import tokens
+import ast
+import lexer
+import diagnostics
+
+effect Parse {
+    effect Advance
+    effect Build
+}
+
+// parser.bl — Self-hosting recursive descent parser for Blink
+//
+// Port of src/pact/parser.py. Uses parallel-array node pool since
+// the C backend can't store structs in List. Token input arrives as
+// parallel arrays (from the lexer). AST output is a node pool: one
+// set of parallel arrays indexed by node ID.
+
+// ── Node pool (parallel arrays) ─────────────────────────────────────
+// Each node is an index into these arrays. -1 means "no node".
+
+pub let mut np_kind: List[Int] = []
+pub let mut np_int_val: List[Int] = []
+pub let mut np_str_val: List[Str] = []
+pub let mut np_name: List[Str] = []
+pub let mut np_op: List[Str] = []
+pub let mut np_left: List[Int] = []
+pub let mut np_right: List[Int] = []
+pub let mut np_body: List[Int] = []
+pub let mut np_condition: List[Int] = []
+pub let mut np_then_body: List[Int] = []
+pub let mut np_else_body: List[Int] = []
+pub let mut np_scrutinee: List[Int] = []
+pub let mut np_pattern: List[Int] = []
+pub let mut np_guard: List[Int] = []
+pub let mut np_value: List[Int] = []
+pub let mut np_target: List[Int] = []
+pub let mut np_iterable: List[Int] = []
+pub let mut np_var_name: List[Str] = []
+pub let mut np_is_mut: List[Int] = []
+pub let mut np_is_pub: List[Int] = []
+pub let mut np_is_const: List[Int] = []
+pub let mut np_module: List[Str] = []
+pub let mut np_inclusive: List[Int] = []
+pub let mut np_start: List[Int] = []
+pub let mut np_end: List[Int] = []
+pub let mut np_obj: List[Int] = []
+pub let mut np_method: List[Str] = []
+pub let mut np_index: List[Int] = []
+pub let mut np_return_type: List[Str] = []
+pub let mut np_type_name: List[Str] = []
+pub let mut np_trait_name: List[Str] = []
+
+// Sublists: for lists of node references (params, args, stmts, etc.)
+let mut sl_data: List[List[Int]] = []
+let mut sl_stack: List[Int] = []
+
+// Each node stores a sublist index for various list fields (-1 = none)
+pub let mut np_params: List[Int] = []
+pub let mut np_args: List[Int] = []
+pub let mut np_stmts: List[Int] = []
+pub let mut np_arms: List[Int] = []
+pub let mut np_fields: List[Int] = []
+pub let mut np_elements: List[Int] = []
+pub let mut np_methods: List[Int] = []
+pub let mut np_type_params: List[Int] = []
+pub let mut np_effects: List[Int] = []
+pub let mut np_captures: List[Int] = []
+pub let mut np_type_ann: List[Int] = []
+pub let mut np_handlers: List[Int] = []
+pub let mut np_leading_comments: List[Str] = []
+pub let mut np_trailing_comments: List[Str] = []
+pub let mut np_doc_comment: List[Str] = []
+pub let mut np_line: List[Int] = []
+pub let mut np_col: List[Int] = []
+pub let mut np_end_line: List[Int] = []
+pub let mut np_end_col: List[Int] = []
+
+let mut annotation_nodes: List[Int] = []
+let mut program_annotation_nodes: List[Int] = []
+
+pub fn parser_reset() {
+    np_kind.clear()
+    np_int_val.clear()
+    np_str_val.clear()
+    np_name.clear()
+    np_op.clear()
+    np_left.clear()
+    np_right.clear()
+    np_body.clear()
+    np_condition.clear()
+    np_then_body.clear()
+    np_else_body.clear()
+    np_scrutinee.clear()
+    np_pattern.clear()
+    np_guard.clear()
+    np_value.clear()
+    np_target.clear()
+    np_iterable.clear()
+    np_var_name.clear()
+    np_is_mut.clear()
+    np_is_pub.clear()
+    np_is_const.clear()
+    np_module.clear()
+    np_inclusive.clear()
+    np_start.clear()
+    np_end.clear()
+    np_obj.clear()
+    np_method.clear()
+    np_index.clear()
+    np_return_type.clear()
+    np_type_name.clear()
+    np_trait_name.clear()
+    sl_data.clear()
+    sl_stack.clear()
+    np_params.clear()
+    np_args.clear()
+    np_stmts.clear()
+    np_arms.clear()
+    np_fields.clear()
+    np_elements.clear()
+    np_methods.clear()
+    np_type_params.clear()
+    np_effects.clear()
+    np_captures.clear()
+    np_type_ann.clear()
+    np_handlers.clear()
+    np_leading_comments.clear()
+    np_trailing_comments.clear()
+    np_doc_comment.clear()
+    np_line.clear()
+    np_col.clear()
+    np_end_line.clear()
+    np_end_col.clear()
+    annotation_nodes.clear()
+    program_annotation_nodes.clear()
+    pos = 0
+}
+
+pub fn new_node(kind: Int) -> Int ! Parse.Build {
+    let id = np_kind.len()
+    np_kind.push(kind)
+    np_int_val.push(0)
+    np_str_val.push("")
+    np_name.push("")
+    np_op.push("")
+    np_left.push(-1)
+    np_right.push(-1)
+    np_body.push(-1)
+    np_condition.push(-1)
+    np_then_body.push(-1)
+    np_else_body.push(-1)
+    np_scrutinee.push(-1)
+    np_pattern.push(-1)
+    np_guard.push(-1)
+    np_value.push(-1)
+    np_target.push(-1)
+    np_iterable.push(-1)
+    np_var_name.push("")
+    np_is_mut.push(0)
+    np_is_pub.push(0)
+    np_is_const.push(0)
+    np_module.push("")
+    np_inclusive.push(0)
+    np_start.push(-1)
+    np_end.push(-1)
+    np_obj.push(-1)
+    np_method.push("")
+    np_index.push(-1)
+    np_return_type.push("")
+    np_type_name.push("")
+    np_trait_name.push("")
+    np_params.push(-1)
+    np_args.push(-1)
+    np_stmts.push(-1)
+    np_arms.push(-1)
+    np_fields.push(-1)
+    np_elements.push(-1)
+    np_methods.push(-1)
+    np_type_params.push(-1)
+    np_effects.push(-1)
+    np_captures.push(-1)
+    np_type_ann.push(-1)
+    np_handlers.push(-1)
+    np_leading_comments.push("")
+    np_trailing_comments.push("")
+    np_doc_comment.push("")
+    np_line.push(peek_line())
+    np_col.push(peek_col())
+    np_end_line.push(-1)
+    np_end_col.push(-1)
+    id
+}
+
+pub fn new_sublist() -> Int ! Parse.Build {
+    let id = sl_data.len()
+    let inner: List[Int] = []
+    sl_data.push(inner)
+    sl_stack.push(id)
+    id
+}
+
+pub fn sublist_push(sl: Int, node_id: Int) ! Parse.Build {
+    if sl_stack.len() == 0 {
+        io.println("FATAL: sublist_push() called with no open sublist")
+        exit(1)
+    }
+    let items = sl_data.get(sl).unwrap()
+    items.push(node_id)
+}
+
+pub fn finalize_sublist(sl: Int) ! Parse.Build {
+    if sl_stack.len() == 0 {
+        io.println("FATAL: finalize_sublist() called with no open sublist")
+        exit(1)
+    }
+    let top = sl_stack.get(sl_stack.len() - 1).unwrap()
+    if top != sl {
+        io.println("FATAL: finalize_sublist({sl}) but top of stack is {top}")
+        exit(1)
+    }
+    sl_stack.pop()
+}
+
+pub fn sublist_get(sl: Int, idx: Int) -> Int {
+    let items = sl_data.get(sl).unwrap()
+    items.get(idx).unwrap()
+}
+
+pub fn sublist_length(sl: Int) -> Int {
+    let items = sl_data.get(sl).unwrap()
+    items.len()
+}
+
+pub fn get_annotation(node: Int, name: Str) -> Int {
+    let anns_sl = np_handlers.get(node).unwrap()
+    if anns_sl == -1 {
+        return -1
+    }
+    let mut i = 0
+    while i < sublist_length(anns_sl) {
+        let ann = sublist_get(anns_sl, i)
+        if np_name.get(ann).unwrap() == name {
+            return ann
+        }
+        i = i + 1
+    }
+    -1
+}
+
+pub fn has_annotation(node: Int, name: Str) -> Int {
+    if get_annotation(node, name) != -1 { 1 } else { 0 }
+}
+
+// ── Token input (parallel arrays from lexer) ────────────────────────
+
+let mut pos: Int = 0
+
+// ── Token navigation ────────────────────────────────────────────────
+
+fn peek_kind() -> TokenKind {
+    if pos >= tok_kinds.len() {
+        return TokenKind.EOF
+    }
+    tok_kinds.get(pos).unwrap()
+}
+
+fn peek_kind_at(p: Int) -> TokenKind {
+    if p >= tok_kinds.len() {
+        return TokenKind.EOF
+    }
+    tok_kinds.get(p).unwrap()
+}
+
+fn peek_value() -> Str {
+    tok_values.get(pos).unwrap()
+}
+
+fn peek_line() -> Int {
+    tok_lines.get(pos).unwrap()
+}
+
+fn peek_col() -> Int {
+    tok_cols.get(pos).unwrap()
+}
+
+fn at(kind: TokenKind) -> Int {
+    peek_kind() == kind
+}
+
+fn advance() -> Int ! Parse.Advance {
+    let old = pos
+    pos = pos + 1
+    old
+}
+
+fn advance_value() -> Str ! Parse.Advance {
+    let v = tok_values.get(pos).unwrap()
+    pos = pos + 1
+    v
+}
+
+fn expect(kind: TokenKind) -> Int ! Parse.Advance, Diag.Report {
+    if peek_kind() != kind {
+        diag_error("UnexpectedToken", "E1100", "expected token kind {kind}, got {peek_kind()}", peek_line(), peek_col(), "")
+    }
+    advance()
+}
+
+fn expect_value(kind: TokenKind) -> Str ! Parse.Advance, Diag.Report {
+    if peek_kind() != kind {
+        if kind == TokenKind.Ident && is_keyword(peek_kind()) {
+            diag_error("KeywordAsIdentifier", "E1103", "'{peek_value()}' is a keyword and cannot be used as an identifier", peek_line(), peek_col(), "use a different name")
+        } else {
+            diag_error("UnexpectedToken", "E1100", "expected token kind {kind}, got {peek_kind()}", peek_line(), peek_col(), "")
+        }
+    }
+    advance_value()
+}
+
+fn skip_newlines() ! Parse.Advance {
+    while at(TokenKind.Newline) {
+        advance()
+    }
+}
+
+fn skip_newlines_and_comments() ! Parse.Advance {
+    while at(TokenKind.Newline) || at(TokenKind.Comment) || at(TokenKind.DocComment) {
+        advance()
+    }
+}
+
+fn maybe_newline() ! Parse.Advance {
+    if at(TokenKind.Newline) {
+        advance()
+    }
+}
+
+fn attach_pending_annotations(node: Int) ! Parse.Build {
+    if annotation_nodes.len() > 0 {
+        let anns_sl = new_sublist()
+        let mut ai = 0
+        while ai < annotation_nodes.len() {
+            sublist_push(anns_sl, annotation_nodes.get(ai).unwrap())
+            ai = ai + 1
+        }
+        finalize_sublist(anns_sl)
+        np_handlers.set(node, anns_sl)
+        annotation_nodes = []
+    }
+}
+
+// ── Import statements ────────────────────────────────────────────────
+
+fn parse_import_stmt() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
+    // 'import' already consumed
+    let mut path = expect_value(TokenKind.Ident)
+    while at(TokenKind.Dot) {
+        advance()
+        if at(TokenKind.LBrace) {
+            break
+        }
+        path = path.concat(".").concat(expect_value(TokenKind.Ident))
+    }
+
+    let node = new_node(NodeKind.ImportStmt)
+    np_str_val.pop()
+    np_str_val.push(path)
+
+    if at(TokenKind.LBrace) {
+        advance()
+        skip_newlines_and_comments()
+        let names_sl = new_sublist()
+        while !at(TokenKind.RBrace) && !at(TokenKind.EOF) {
+            let name_node = new_node(NodeKind.Ident)
+            let item_name = expect_value(TokenKind.Ident)
+            np_name.pop()
+            np_name.push(item_name)
+            if at(TokenKind.As) {
+                advance()
+                let alias = expect_value(TokenKind.Ident)
+                np_str_val.pop()
+                np_str_val.push(alias)
+            }
+            sublist_push(names_sl, name_node)
+            skip_newlines_and_comments()
+            if at(TokenKind.Comma) {
+                advance()
+                skip_newlines_and_comments()
+            }
+        }
+        expect(TokenKind.RBrace)
+        finalize_sublist(names_sl)
+        np_args.set(node, names_sl)
+    }
+
+    node
+}
+
+// ── Top-level ───────────────────────────────────────────────────────
+
+pub fn parse_program() -> Int ! Parse, Diag.Report {
+    if trace_mode != "" { trace("parse", "start ({tok_kinds.len()} tokens)") }
+    let mut fn_nodes: List[Int] = []
+    let mut type_nodes: List[Int] = []
+    let mut let_nodes: List[Int] = []
+    let mut trait_nodes: List[Int] = []
+    let mut impl_nodes: List[Int] = []
+    let mut import_nodes: List[Int] = []
+    let mut effect_decl_nodes: List[Int] = []
+    let mut test_nodes: List[Int] = []
+    annotation_nodes = []
+    skip_newlines_and_comments()
+    while !at(TokenKind.EOF) {
+        skip_newlines_and_comments()
+        if at(TokenKind.EOF) {
+            break
+        }
+        if at(TokenKind.At) {
+            let ann_start_line = peek_line()
+            let ann_start_col = peek_col()
+            advance()
+            let ann_name = if is_keyword(peek_kind()) { advance_value() } else { expect_value(TokenKind.Ident) }
+            let ann_nd = new_node(NodeKind.Annotation)
+            np_line.set(ann_nd, ann_start_line)
+            np_col.set(ann_nd, ann_start_col)
+            np_name.set(ann_nd, ann_name)
+            if at(TokenKind.LParen) {
+                advance()
+                skip_newlines_and_comments()
+                let mut ann_arg_nodes: List[Int] = []
+                if ann_name == "requires" || ann_name == "ensures" || ann_name == "invariant" {
+                    let expr_nd = parse_expr()
+                    ann_arg_nodes.push(expr_nd)
+                    skip_newlines_and_comments()
+                } else {
+                    while !at(TokenKind.RParen) && !at(TokenKind.EOF) {
+                        if at(TokenKind.StringStart) {
+                            let str_nd = parse_interp_string()
+                            ann_arg_nodes.push(str_nd)
+                        } else {
+                            let arg_name = expect_value(TokenKind.Ident)
+                            let mut full_arg = arg_name
+                            if at(TokenKind.Colon) {
+                                advance()
+                                skip_newlines_and_comments()
+                                if at(TokenKind.StringStart) {
+                                    let val_nd = parse_interp_string()
+                                    np_name.set(val_nd, full_arg)
+                                    ann_arg_nodes.push(val_nd)
+                                } else {
+                                    let val_name = expect_value(TokenKind.Ident)
+                                    let kv_nd = new_node(NodeKind.Ident)
+                                    np_name.set(kv_nd, full_arg.concat(":").concat(val_name))
+                                    ann_arg_nodes.push(kv_nd)
+                                }
+                            } else {
+                                if at(TokenKind.Dot) {
+                                    advance()
+                                    let child = expect_value(TokenKind.Ident)
+                                    full_arg = full_arg.concat(".").concat(child)
+                                }
+                                let arg_nd = new_node(NodeKind.Ident)
+                                np_name.set(arg_nd, full_arg)
+                                ann_arg_nodes.push(arg_nd)
+                            }
+                        }
+                        skip_newlines_and_comments()
+                        if at(TokenKind.Comma) {
+                            advance()
+                            skip_newlines_and_comments()
+                        }
+                    }
+                }
+                expect(TokenKind.RParen)
+                if ann_arg_nodes.len() > 0 {
+                    let ann_args_sl = new_sublist()
+                    let mut ai = 0
+                    while ai < ann_arg_nodes.len() {
+                        sublist_push(ann_args_sl, ann_arg_nodes.get(ai).unwrap())
+                        ai = ai + 1
+                    }
+                    finalize_sublist(ann_args_sl)
+                    np_args.set(ann_nd, ann_args_sl)
+                }
+            }
+            if ann_name == "capabilities" {
+                program_annotation_nodes.push(ann_nd)
+            } else {
+                annotation_nodes.push(ann_nd)
+            }
+            skip_newlines_and_comments()
+        } else if at(TokenKind.Import) {
+            advance()
+            let imp = parse_import_stmt()
+            import_nodes.push(imp)
+            skip_newlines_and_comments()
+        } else if at(TokenKind.Type) {
+            let td = parse_type_def()
+            attach_pending_annotations(td)
+            type_nodes.push(td)
+        } else if at(TokenKind.Trait) {
+            let tr = parse_trait_def()
+            attach_pending_annotations(tr)
+            trait_nodes.push(tr)
+        } else if at(TokenKind.Impl) {
+            let im = parse_impl_block()
+            attach_pending_annotations(im)
+            impl_nodes.push(im)
+        } else if at(TokenKind.Let) {
+            let lb = parse_let_binding()
+            attach_pending_annotations(lb)
+            let_nodes.push(lb)
+        } else if at(TokenKind.Const) {
+            let cb = parse_const_binding()
+            attach_pending_annotations(cb)
+            let_nodes.push(cb)
+        } else if at(TokenKind.Pub) {
+            advance()
+            skip_newlines_and_comments()
+            if at(TokenKind.Fn) {
+                let f = parse_fn_def()
+                np_is_pub.set(f, 1)
+                attach_pending_annotations(f)
+                fn_nodes.push(f)
+            } else if at(TokenKind.Type) {
+                let td = parse_type_def()
+                np_is_pub.set(td, 1)
+                attach_pending_annotations(td)
+                type_nodes.push(td)
+            } else if at(TokenKind.Trait) {
+                let tr = parse_trait_def()
+                np_is_pub.set(tr, 1)
+                attach_pending_annotations(tr)
+                trait_nodes.push(tr)
+            } else if at(TokenKind.Let) {
+                let lb = parse_let_binding()
+                np_is_pub.set(lb, 1)
+                attach_pending_annotations(lb)
+                let_nodes.push(lb)
+            } else if at(TokenKind.Const) {
+                let cb = parse_const_binding()
+                np_is_pub.set(cb, 1)
+                attach_pending_annotations(cb)
+                let_nodes.push(cb)
+            } else if at(TokenKind.Effect) {
+                let ed = parse_effect_decl()
+                np_is_pub.set(ed, 1)
+                attach_pending_annotations(ed)
+                effect_decl_nodes.push(ed)
+            } else if at(TokenKind.Import) {
+                advance()
+                let imp = parse_import_stmt()
+                np_is_pub.set(imp, 1)
+                attach_pending_annotations(imp)
+                import_nodes.push(imp)
+            } else {
+                diag_error("UnexpectedToken", "E1100", "expected fn, type, trait, or effect after pub", peek_line(), peek_col(), "")
+                advance()
+            }
+        } else if at(TokenKind.Effect) {
+            let ed = parse_effect_decl()
+            attach_pending_annotations(ed)
+            effect_decl_nodes.push(ed)
+        } else if at(TokenKind.Test) {
+            advance()
+            let tb = parse_test_block()
+            attach_pending_annotations(tb)
+            test_nodes.push(tb)
+        } else if at(TokenKind.Fn) {
+            let f = parse_fn_def()
+            attach_pending_annotations(f)
+            fn_nodes.push(f)
+        } else if at(TokenKind.Mod) {
+            let mod_line = peek_line()
+            let mod_col = peek_col()
+            advance()
+            if at(TokenKind.Ident) {
+                advance()
+            }
+            skip_newlines_and_comments()
+            if at(TokenKind.LBrace) {
+                advance()
+                let mut depth = 1
+                while depth > 0 && !at(TokenKind.EOF) {
+                    if at(TokenKind.LBrace) {
+                        depth = depth + 1
+                    } else if at(TokenKind.RBrace) {
+                        depth = depth - 1
+                    }
+                    advance()
+                }
+            }
+            diag_error("InlineModuleNotSupported", "E1015", "inline modules are not supported; create a separate file and use 'import' instead (see section 10.1.1)", mod_line, mod_col, "Blink uses file-based modules: one file = one module")
+        } else {
+            diag_error("UnexpectedToken", "E1100", "unexpected token at top level: {peek_kind()}", peek_line(), peek_col(), "")
+            advance()
+        }
+        skip_newlines_and_comments()
+    }
+    // Build sublists from collected node IDs
+    let fns = new_sublist()
+    let mut i = 0
+    while i < fn_nodes.len() {
+        sublist_push(fns, fn_nodes.get(i).unwrap())
+        i = i + 1
+    }
+    finalize_sublist(fns)
+    let types = new_sublist()
+    i = 0
+    while i < type_nodes.len() {
+        sublist_push(types, type_nodes.get(i).unwrap())
+        i = i + 1
+    }
+    finalize_sublist(types)
+    let lets = new_sublist()
+    i = 0
+    while i < let_nodes.len() {
+        sublist_push(lets, let_nodes.get(i).unwrap())
+        i = i + 1
+    }
+    finalize_sublist(lets)
+    let traits = new_sublist()
+    i = 0
+    while i < trait_nodes.len() {
+        sublist_push(traits, trait_nodes.get(i).unwrap())
+        i = i + 1
+    }
+    finalize_sublist(traits)
+    let impls = new_sublist()
+    i = 0
+    while i < impl_nodes.len() {
+        sublist_push(impls, impl_nodes.get(i).unwrap())
+        i = i + 1
+    }
+    finalize_sublist(impls)
+    let imports = new_sublist()
+    i = 0
+    while i < import_nodes.len() {
+        sublist_push(imports, import_nodes.get(i).unwrap())
+        i = i + 1
+    }
+    finalize_sublist(imports)
+    let mut effect_decls = -1
+    if effect_decl_nodes.len() > 0 {
+        effect_decls = new_sublist()
+        i = 0
+        while i < effect_decl_nodes.len() {
+            sublist_push(effect_decls, effect_decl_nodes.get(i).unwrap())
+            i = i + 1
+        }
+        finalize_sublist(effect_decls)
+    }
+    let mut annotations_sl = -1
+    if annotation_nodes.len() > 0 || program_annotation_nodes.len() > 0 {
+        annotations_sl = new_sublist()
+        i = 0
+        while i < program_annotation_nodes.len() {
+            sublist_push(annotations_sl, program_annotation_nodes.get(i).unwrap())
+            i = i + 1
+        }
+        i = 0
+        while i < annotation_nodes.len() {
+            sublist_push(annotations_sl, annotation_nodes.get(i).unwrap())
+            i = i + 1
+        }
+        finalize_sublist(annotations_sl)
+    }
+    // np_captures on Program is reused to store collected test block nodes
+    let mut tests_sl = -1
+    if test_nodes.len() > 0 {
+        tests_sl = new_sublist()
+        i = 0
+        while i < test_nodes.len() {
+            sublist_push(tests_sl, test_nodes.get(i).unwrap())
+            i = i + 1
+        }
+        finalize_sublist(tests_sl)
+    }
+    let prog = new_node(NodeKind.Program)
+    np_params.pop()
+    np_params.push(fns)
+    np_fields.pop()
+    np_fields.push(types)
+    np_stmts.pop()
+    np_stmts.push(lets)
+    np_arms.pop()
+    np_arms.push(traits)
+    np_methods.pop()
+    np_methods.push(impls)
+    np_elements.pop()
+    np_elements.push(imports)
+    np_args.pop()
+    np_args.push(effect_decls)
+    np_handlers.set(prog, annotations_sl)
+    np_captures.set(prog, tests_sl)
+    if trace_mode != "" { trace("parse", "done ({fn_nodes.len()} fns, {type_nodes.len()} types, {import_nodes.len()} imports)") }
+    prog
+}
+
+// ── Type parameters ──────────────────────────────────────────────────
+
+fn parse_type_params() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
+    if !at(TokenKind.LBracket) {
+        return -1
+    }
+    advance()
+    let sl = new_sublist()
+    let pname = expect_value(TokenKind.Ident)
+    let mut bounds_sl = -1
+    if at(TokenKind.Colon) {
+        advance()
+        bounds_sl = new_sublist()
+        sublist_push(bounds_sl, parse_type_annotation())
+        while at(TokenKind.Plus) {
+            advance()
+            skip_newlines()
+            sublist_push(bounds_sl, parse_type_annotation())
+        }
+        finalize_sublist(bounds_sl)
+    }
+    let tp = new_node(NodeKind.TypeParam)
+    np_name.pop()
+    np_name.push(pname)
+    np_elements.pop()
+    np_elements.push(bounds_sl)
+    sublist_push(sl, tp)
+    while at(TokenKind.Comma) {
+        advance()
+        skip_newlines()
+        let pn2 = expect_value(TokenKind.Ident)
+        let mut bs2 = -1
+        if at(TokenKind.Colon) {
+            advance()
+            bs2 = new_sublist()
+            sublist_push(bs2, parse_type_annotation())
+            while at(TokenKind.Plus) {
+                advance()
+                skip_newlines()
+                sublist_push(bs2, parse_type_annotation())
+            }
+            finalize_sublist(bs2)
+        }
+        let tp2 = new_node(NodeKind.TypeParam)
+        np_name.pop()
+        np_name.push(pn2)
+        np_elements.pop()
+        np_elements.push(bs2)
+        sublist_push(sl, tp2)
+    }
+    expect(TokenKind.RBracket)
+    finalize_sublist(sl)
+    sl
+}
+
+// ── Type definitions ────────────────────────────────────────────────
+
+fn parse_type_def() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
+    let td_start_line = peek_line()
+    let td_start_col = peek_col()
+    expect(TokenKind.Type)
+    let name = expect_value(TokenKind.Ident)
+    let tparams = parse_type_params()
+    skip_newlines_and_comments()
+    let mut flds = -1
+    let mut td_end_line = -1
+    let mut td_end_col = -1
+    if at(TokenKind.Equals) {
+        advance()
+        let alias_type = parse_type_annotation()
+        let mut where_expr = -1
+        if at(TokenKind.At) {
+            advance()
+            let ann_name = expect_value(TokenKind.Ident)
+            if ann_name == "where" {
+                expect(TokenKind.LParen)
+                where_expr = parse_expr()
+                expect(TokenKind.RParen)
+            } else {
+                diag_error("UnexpectedAnnotation", "E1100", "only @where is supported on type aliases, got @{ann_name}", peek_line(), peek_col(), "use @where(predicate) to add a refinement constraint")
+            }
+        }
+        let td = new_node(NodeKind.TypeDef)
+        np_line.set(td, td_start_line)
+        np_col.set(td, td_start_col)
+        np_name.pop()
+        np_name.push(name)
+        np_fields.pop()
+        np_fields.push(-1)
+        np_type_params.pop()
+        np_type_params.push(tparams)
+        np_value.set(td, alias_type)
+        np_condition.set(td, where_expr)
+        return td
+    }
+    if at(TokenKind.LBrace) {
+        expect(TokenKind.LBrace)
+        skip_newlines_and_comments()
+        flds = new_sublist()
+        while !at(TokenKind.RBrace) {
+            if at(TokenKind.At) {
+                advance()
+                let _ann_name = expect_value(TokenKind.Ident)
+                if at(TokenKind.LParen) {
+                    advance()
+                    skip_newlines_and_comments()
+                    let mut depth = 1
+                    while depth > 0 && !at(TokenKind.EOF) {
+                        if at(TokenKind.LParen) {
+                            depth = depth + 1
+                        } else if at(TokenKind.RParen) {
+                            depth = depth - 1
+                            if depth == 0 {
+                                break
+                            }
+                        }
+                        advance()
+                    }
+                    expect(TokenKind.RParen)
+                }
+                skip_newlines_and_comments()
+                continue
+            }
+            if at(TokenKind.EOF) {
+                break
+            }
+            if at(TokenKind.Mut) {
+                diag_error("MutFieldNotSupported", "E1109", "'mut' is not valid on struct fields — mutability is controlled by the binding (let mut)", peek_line(), peek_col(), "remove 'mut' from the field declaration; use 'let mut' when binding the struct")
+                while at(TokenKind.Mut) {
+                    advance()
+                }
+            }
+            let fname = expect_value(TokenKind.Ident)
+            if at(TokenKind.Colon) {
+                advance()
+                let type_ann = parse_type_annotation()
+                let tf = new_node(NodeKind.TypeField)
+                np_name.pop()
+                np_name.push(fname)
+                np_value.pop()
+                np_value.push(type_ann)
+                if at(TokenKind.Equals) {
+                    advance()
+                    skip_newlines_and_comments()
+                    let default_expr = parse_expr()
+                    np_condition.set(tf, default_expr)
+                }
+                sublist_push(flds, tf)
+            } else if at(TokenKind.LParen) {
+                advance()
+                skip_newlines_and_comments()
+                let mut vflds = -1
+                if !at(TokenKind.RParen) {
+                    vflds = new_sublist()
+                    if at(TokenKind.Mut) {
+                        diag_error("MutFieldNotSupported", "E1109", "'mut' is not valid on struct fields — mutability is controlled by the binding (let mut)", peek_line(), peek_col(), "remove 'mut' from the field declaration; use 'let mut' when binding the struct")
+                        while at(TokenKind.Mut) {
+                            advance()
+                        }
+                    }
+                    let vf_name = expect_value(TokenKind.Ident)
+                    if at(TokenKind.Colon) {
+                        advance()
+                        let vf_type = parse_type_annotation()
+                        let vf = new_node(NodeKind.TypeField)
+                        np_name.set(vf, vf_name)
+                        np_value.set(vf, vf_type)
+                        sublist_push(vflds, vf)
+                        while at(TokenKind.Comma) {
+                            advance()
+                            skip_newlines_and_comments()
+                            if at(TokenKind.RParen) {
+                                break
+                            }
+                            if at(TokenKind.Mut) {
+                                diag_error("MutFieldNotSupported", "E1109", "'mut' is not valid on struct fields — mutability is controlled by the binding (let mut)", peek_line(), peek_col(), "remove 'mut' from the field declaration; use 'let mut' when binding the struct")
+                                while at(TokenKind.Mut) {
+                                    advance()
+                                }
+                            }
+                            let vf_name2 = expect_value(TokenKind.Ident)
+                            expect(TokenKind.Colon)
+                            let vf_type2 = parse_type_annotation()
+                            let vf2 = new_node(NodeKind.TypeField)
+                            np_name.set(vf2, vf_name2)
+                            np_value.set(vf2, vf_type2)
+                            sublist_push(vflds, vf2)
+                        }
+                    } else {
+                        // Positional variant fields: skip to closing paren
+                        let mut paren_depth = 1
+                        while paren_depth > 0 && !at(TokenKind.EOF) {
+                            if at(TokenKind.LParen) {
+                                paren_depth = paren_depth + 1
+                            } else if at(TokenKind.RParen) {
+                                paren_depth = paren_depth - 1
+                                if paren_depth == 0 {
+                                    break
+                                }
+                            }
+                            advance()
+                        }
+                    }
+                    finalize_sublist(vflds)
+                }
+                skip_newlines_and_comments()
+                expect(TokenKind.RParen)
+                let tv = new_node(NodeKind.TypeVariant)
+                np_name.set(tv, fname)
+                np_fields.set(tv, vflds)
+                sublist_push(flds, tv)
+            } else {
+                let tv = new_node(NodeKind.TypeVariant)
+                np_name.pop()
+                np_name.push(fname)
+                sublist_push(flds, tv)
+            }
+            if at(TokenKind.Comma) {
+                advance()
+            }
+            skip_newlines_and_comments()
+        }
+        td_end_line = peek_line()
+        td_end_col = peek_col()
+        expect(TokenKind.RBrace)
+        finalize_sublist(flds)
+    }
+    let td = new_node(NodeKind.TypeDef)
+    np_line.set(td, td_start_line)
+    np_col.set(td, td_start_col)
+    np_name.pop()
+    np_name.push(name)
+    np_fields.pop()
+    np_fields.push(flds)
+    np_type_params.pop()
+    np_type_params.push(tparams)
+    if td_end_line != -1 {
+        np_end_line.set(td, td_end_line)
+        np_end_col.set(td, td_end_col)
+    }
+    td
+}
+
+fn parse_type_annotation() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
+    if at(TokenKind.LBracket) {
+        advance()
+        skip_newlines()
+        let inner = parse_type_annotation()
+        skip_newlines()
+        expect(TokenKind.RBracket)
+        let elems = new_sublist()
+        sublist_push(elems, inner)
+        finalize_sublist(elems)
+        let ta = new_node(NodeKind.TypeAnn)
+        np_name.pop()
+        np_name.push("List")
+        np_elements.pop()
+        np_elements.push(elems)
+        return ta
+    }
+    if at(TokenKind.LParen) {
+        advance()
+        skip_newlines()
+        let elems = new_sublist()
+        sublist_push(elems, parse_type_annotation())
+        while at(TokenKind.Comma) {
+            advance()
+            skip_newlines()
+            sublist_push(elems, parse_type_annotation())
+        }
+        skip_newlines()
+        expect(TokenKind.RParen)
+        finalize_sublist(elems)
+        let ta = new_node(NodeKind.TypeAnn)
+        np_name.pop()
+        np_name.push("Tuple")
+        np_elements.pop()
+        np_elements.push(elems)
+        return ta
+    }
+    if at(TokenKind.Fn) {
+        advance()
+        expect(TokenKind.LParen)
+        let mut elems = -1
+        if !at(TokenKind.RParen) {
+            elems = new_sublist()
+            sublist_push(elems, parse_type_annotation())
+            while at(TokenKind.Comma) {
+                advance()
+                skip_newlines()
+                sublist_push(elems, parse_type_annotation())
+            }
+            finalize_sublist(elems)
+        }
+        expect(TokenKind.RParen)
+        let mut ret_name = "Void"
+        let mut ret_ann = -1
+        if at(TokenKind.Arrow) {
+            advance()
+            let rt = parse_type_annotation()
+            ret_name = np_name.get(rt).unwrap()
+            ret_ann = rt
+        }
+        let ta = new_node(NodeKind.TypeAnn)
+        np_name.pop()
+        np_name.push("Fn")
+        np_elements.pop()
+        np_elements.push(elems)
+        np_return_type.pop()
+        np_return_type.push(ret_name)
+        np_type_ann.pop()
+        np_type_ann.push(ret_ann)
+        return ta
+    }
+    let mut name = expect_value(TokenKind.Ident)
+    if at(TokenKind.Dot) {
+        advance()
+        let qualified = expect_value(TokenKind.Ident)
+        name = name + "." + qualified
+    }
+    let mut elems = -1
+    if at(TokenKind.LBracket) {
+        advance()
+        elems = new_sublist()
+        sublist_push(elems, parse_type_annotation())
+        while at(TokenKind.Comma) {
+            advance()
+            skip_newlines()
+            sublist_push(elems, parse_type_annotation())
+        }
+        expect(TokenKind.RBracket)
+        finalize_sublist(elems)
+    }
+    let ta = new_node(NodeKind.TypeAnn)
+    np_name.pop()
+    np_name.push(name)
+    np_elements.pop()
+    np_elements.push(elems)
+    if at(TokenKind.Question) {
+        advance()
+        let inner_sl = new_sublist()
+        sublist_push(inner_sl, ta)
+        finalize_sublist(inner_sl)
+        let opt = new_node(NodeKind.TypeAnn)
+        np_name.pop()
+        np_name.push("Option")
+        np_elements.pop()
+        np_elements.push(inner_sl)
+        return opt
+    }
+    ta
+}
+
+// ── Effect declarations ─────────────────────────────────────────────
+
+fn parse_effect_op_sig() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
+    expect(TokenKind.Fn)
+    let op_name = expect_value(TokenKind.Ident)
+    expect(TokenKind.LParen)
+    let params_sl = new_sublist()
+    if !at(TokenKind.RParen) {
+        sublist_push(params_sl, parse_param())
+        while at(TokenKind.Comma) {
+            advance()
+            if at(TokenKind.RParen) {
+                break
+            }
+            sublist_push(params_sl, parse_param())
+        }
+    }
+    expect(TokenKind.RParen)
+    finalize_sublist(params_sl)
+    let mut ret_str = ""
+    if at(TokenKind.Arrow) {
+        advance()
+        let rt = parse_type_annotation()
+        ret_str = np_name.get(rt).unwrap()
+    }
+    let nd = new_node(NodeKind.FnDef)
+    np_name.pop()
+    np_name.push(op_name)
+    np_params.pop()
+    np_params.push(params_sl)
+    np_return_type.pop()
+    np_return_type.push(ret_str)
+    nd
+}
+
+fn parse_effect_decl() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
+    let eff_start_line = peek_line()
+    let eff_start_col = peek_col()
+    expect(TokenKind.Effect)
+    let name = expect_value(TokenKind.Ident)
+    skip_newlines_and_comments()
+    if at(TokenKind.LBrace) {
+        advance()
+        skip_newlines_and_comments()
+        let children_sl = new_sublist()
+        while !at(TokenKind.RBrace) && !at(TokenKind.EOF) {
+            expect(TokenKind.Effect)
+            let child_name = expect_value(TokenKind.Ident)
+            skip_newlines_and_comments()
+            let mut child_methods_sl = -1
+            if at(TokenKind.LBrace) {
+                advance()
+                skip_newlines_and_comments()
+                child_methods_sl = new_sublist()
+                while !at(TokenKind.RBrace) && !at(TokenKind.EOF) {
+                    sublist_push(child_methods_sl, parse_effect_op_sig())
+                    skip_newlines_and_comments()
+                }
+                expect(TokenKind.RBrace)
+                finalize_sublist(child_methods_sl)
+            }
+            let child = new_node(NodeKind.EffectDecl)
+            np_name.pop()
+            np_name.push(child_name)
+            np_methods.pop()
+            np_methods.push(child_methods_sl)
+            sublist_push(children_sl, child)
+            skip_newlines_and_comments()
+            if at(TokenKind.Comma) {
+                advance()
+            }
+            skip_newlines_and_comments()
+        }
+        expect(TokenKind.RBrace)
+        finalize_sublist(children_sl)
+        let nd = new_node(NodeKind.EffectDecl)
+        np_line.set(nd, eff_start_line)
+        np_col.set(nd, eff_start_col)
+        np_name.pop()
+        np_name.push(name)
+        np_elements.pop()
+        np_elements.push(children_sl)
+        return nd
+    }
+    let nd = new_node(NodeKind.EffectDecl)
+    np_line.set(nd, eff_start_line)
+    np_col.set(nd, eff_start_col)
+    np_name.pop()
+    np_name.push(name)
+    nd
+}
+
+// ── Function definitions ────────────────────────────────────────────
+
+fn parse_fn_def() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
+    let fn_start_line = peek_line()
+    let fn_start_col = peek_col()
+    expect(TokenKind.Fn)
+    let name = expect_value(TokenKind.Ident)
+    let tparams = parse_type_params()
+    expect(TokenKind.LParen)
+    let params = new_sublist()
+    let mut kw_only = 0
+    if at(TokenKind.DashDash) {
+        advance()
+        kw_only = 1
+    }
+    if !at(TokenKind.RParen) {
+        let p = parse_param()
+        if kw_only { np_int_val.set(p, 1) }
+        sublist_push(params, p)
+        while at(TokenKind.Comma) {
+            advance()
+            if at(TokenKind.RParen) {
+                break
+            }
+            if at(TokenKind.DashDash) {
+                advance()
+                kw_only = 1
+            }
+            let p2 = parse_param()
+            if kw_only { np_int_val.set(p2, 1) }
+            sublist_push(params, p2)
+        }
+    }
+    expect(TokenKind.RParen)
+    finalize_sublist(params)
+    let mut ret_str = ""
+    let mut ret_ann = -1
+    if at(TokenKind.Arrow) {
+        advance()
+        let rt = parse_type_annotation()
+        ret_str = np_name.get(rt).unwrap()
+        ret_ann = rt
+    }
+    let mut effects_sl = -1
+    if at(TokenKind.Bang) {
+        advance()
+        effects_sl = new_sublist()
+        let mut eff_name = expect_value(TokenKind.Ident)
+        if at(TokenKind.Dot) {
+            advance()
+            eff_name = eff_name.concat(".").concat(expect_value(TokenKind.Ident))
+        }
+        let eff = new_node(NodeKind.Ident)
+        np_name.pop()
+        np_name.push(eff_name)
+        sublist_push(effects_sl, eff)
+        while at(TokenKind.Comma) {
+            advance()
+            skip_newlines_and_comments()
+            let mut eff_name2 = expect_value(TokenKind.Ident)
+            if at(TokenKind.Dot) {
+                advance()
+                eff_name2 = eff_name2.concat(".").concat(expect_value(TokenKind.Ident))
+            }
+            let eff2 = new_node(NodeKind.Ident)
+            np_name.pop()
+            np_name.push(eff_name2)
+            sublist_push(effects_sl, eff2)
+        }
+        finalize_sublist(effects_sl)
+    }
+    skip_newlines()
+    let mut body_id = -1
+    if at(TokenKind.LBrace) {
+        body_id = parse_block()
+    }
+    let nd = new_node(NodeKind.FnDef)
+    np_line.set(nd, fn_start_line)
+    np_col.set(nd, fn_start_col)
+    np_name.pop()
+    np_name.push(name)
+    np_params.pop()
+    np_params.push(params)
+    np_body.pop()
+    np_body.push(body_id)
+    np_return_type.pop()
+    np_return_type.push(ret_str)
+    np_type_params.pop()
+    np_type_params.push(tparams)
+    np_effects.pop()
+    np_effects.push(effects_sl)
+    if ret_ann != -1 {
+        np_type_ann.set(nd, ret_ann)
+    }
+    if body_id != -1 {
+        let fn_end_l = np_end_line.get(body_id).unwrap()
+        let fn_end_c = np_end_col.get(body_id).unwrap()
+        if fn_end_l != -1 {
+            np_end_line.set(nd, fn_end_l)
+            np_end_col.set(nd, fn_end_c)
+        }
+    }
+    nd
+}
+
+// ── Test blocks ──────────────────────────────────────────────────────
+
+fn parse_test_block() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
+    let test_start_line = peek_line()
+    let test_start_col = peek_col()
+    // 'test' already consumed — but we capture line from the string token
+    let name_node = parse_interp_string()
+    let name_parts_sl = np_elements.get(name_node).unwrap()
+    let mut test_name = ""
+    if name_parts_sl != -1 && sublist_length(name_parts_sl) > 0 {
+        test_name = np_str_val.get(sublist_get(name_parts_sl, 0)).unwrap()
+    }
+    skip_newlines_and_comments()
+    let body = parse_block()
+    let nd = new_node(NodeKind.TestBlock)
+    np_line.set(nd, test_start_line)
+    np_col.set(nd, test_start_col)
+    np_str_val.set(nd, test_name)
+    np_name.set(nd, test_name)
+    np_body.set(nd, body)
+    let tb_end_l = np_end_line.get(body).unwrap()
+    if tb_end_l != -1 {
+        np_end_line.set(nd, tb_end_l)
+        np_end_col.set(nd, np_end_col.get(body).unwrap())
+    }
+    nd
+}
+
+fn parse_param() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
+    let mut is_mut = 0
+    if at(TokenKind.Mut) {
+        is_mut = 1
+        advance()
+    }
+    let mut name = ""
+    if at(TokenKind.Self) {
+        name = "self"
+        advance()
+    } else {
+        name = expect_value(TokenKind.Ident)
+    }
+    let mut type_str = ""
+    let mut type_ann_id = -1
+    if at(TokenKind.Colon) {
+        advance()
+        let ta = parse_type_annotation()
+        type_str = np_name.get(ta).unwrap()
+        type_ann_id = ta
+    }
+    let nd = new_node(NodeKind.Param)
+    np_name.pop()
+    np_name.push(name)
+    np_type_name.pop()
+    np_type_name.push(type_str)
+    np_is_mut.pop()
+    np_is_mut.push(is_mut)
+    np_type_ann.set(nd, type_ann_id)
+    nd
+}
+
+fn parse_closure() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
+    expect(TokenKind.Fn)
+    expect(TokenKind.LParen)
+    let params = new_sublist()
+    let mut cl_kw_only = 0
+    if at(TokenKind.DashDash) {
+        advance()
+        cl_kw_only = 1
+    }
+    if !at(TokenKind.RParen) {
+        let cp = parse_param()
+        if cl_kw_only { np_int_val.set(cp, 1) }
+        sublist_push(params, cp)
+        while at(TokenKind.Comma) {
+            advance()
+            if at(TokenKind.RParen) {
+                break
+            }
+            if at(TokenKind.DashDash) {
+                advance()
+                cl_kw_only = 1
+            }
+            let cp2 = parse_param()
+            if cl_kw_only { np_int_val.set(cp2, 1) }
+            sublist_push(params, cp2)
+        }
+    }
+    expect(TokenKind.RParen)
+    finalize_sublist(params)
+    let mut ret_str = ""
+    let mut ret_ann = -1
+    if at(TokenKind.Arrow) {
+        advance()
+        let rt = parse_type_annotation()
+        ret_str = np_name.get(rt).unwrap()
+        ret_ann = rt
+    }
+    skip_newlines_and_comments()
+    let body_id = parse_block()
+    let nd = new_node(NodeKind.Closure)
+    np_params.pop()
+    np_params.push(params)
+    np_body.pop()
+    np_body.push(body_id)
+    np_return_type.pop()
+    np_return_type.push(ret_str)
+    if ret_ann != -1 {
+        np_type_ann.set(nd, ret_ann)
+    }
+    nd
+}
+
+// ── Trait definitions ────────────────────────────────────────────────
+
+fn parse_trait_def() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
+    let trait_start_line = peek_line()
+    let trait_start_col = peek_col()
+    expect(TokenKind.Trait)
+    let name = expect_value(TokenKind.Ident)
+    let mut trait_type_args = -1
+    if at(TokenKind.LBracket) {
+        advance()
+        trait_type_args = new_sublist()
+        sublist_push(trait_type_args, parse_type_annotation())
+        while at(TokenKind.Comma) {
+            advance()
+            skip_newlines()
+            sublist_push(trait_type_args, parse_type_annotation())
+        }
+        expect(TokenKind.RBracket)
+        finalize_sublist(trait_type_args)
+    }
+    skip_newlines_and_comments()
+    expect(TokenKind.LBrace)
+    skip_newlines_and_comments()
+    let methods = new_sublist()
+    while !at(TokenKind.RBrace) {
+        if at(TokenKind.Fn) {
+            let fn_node = parse_fn_def()
+            sublist_push(methods, fn_node)
+        } else {
+            advance()
+        }
+        skip_newlines_and_comments()
+    }
+    let trait_end_line = peek_line()
+    let trait_end_col = peek_col()
+    expect(TokenKind.RBrace)
+    finalize_sublist(methods)
+    let nd = new_node(NodeKind.TraitDef)
+    np_line.set(nd, trait_start_line)
+    np_col.set(nd, trait_start_col)
+    np_name.pop()
+    np_name.push(name)
+    np_methods.pop()
+    np_methods.push(methods)
+    np_type_params.pop()
+    np_type_params.push(trait_type_args)
+    np_end_line.set(nd, trait_end_line)
+    np_end_col.set(nd, trait_end_col)
+    nd
+}
+
+// ── Impl blocks ─────────────────────────────────────────────────────
+
+fn parse_impl_block() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
+    let impl_start_line = peek_line()
+    let impl_start_col = peek_col()
+    expect(TokenKind.Impl)
+    let trait_name = expect_value(TokenKind.Ident)
+    let mut trait_type_args = -1
+    if at(TokenKind.LBracket) {
+        advance()
+        trait_type_args = new_sublist()
+        sublist_push(trait_type_args, parse_type_annotation())
+        while at(TokenKind.Comma) {
+            advance()
+            skip_newlines()
+            sublist_push(trait_type_args, parse_type_annotation())
+        }
+        expect(TokenKind.RBracket)
+        finalize_sublist(trait_type_args)
+    }
+    skip_newlines_and_comments()
+    let mut type_name = ""
+    if at(TokenKind.For) {
+        advance()
+        skip_newlines_and_comments()
+        type_name = expect_value(TokenKind.Ident)
+    }
+    skip_newlines_and_comments()
+    expect(TokenKind.LBrace)
+    skip_newlines_and_comments()
+    let methods = new_sublist()
+    while !at(TokenKind.RBrace) {
+        if at(TokenKind.Fn) {
+            let fn_node = parse_fn_def()
+            sublist_push(methods, fn_node)
+        } else {
+            advance()
+        }
+        skip_newlines_and_comments()
+    }
+    let impl_end_line = peek_line()
+    let impl_end_col = peek_col()
+    expect(TokenKind.RBrace)
+    finalize_sublist(methods)
+    let nd = new_node(NodeKind.ImplBlock)
+    np_line.set(nd, impl_start_line)
+    np_col.set(nd, impl_start_col)
+    np_trait_name.pop()
+    np_trait_name.push(trait_name)
+    np_name.pop()
+    np_name.push(type_name)
+    np_methods.pop()
+    np_methods.push(methods)
+    np_type_params.pop()
+    np_type_params.push(trait_type_args)
+    np_end_line.set(nd, impl_end_line)
+    np_end_col.set(nd, impl_end_col)
+    nd
+}
+
+// ── Handler expressions ──────────────────────────────────────────────
+
+fn parse_handler_expr() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
+    expect(TokenKind.Handler)
+    let effect_name = expect_value(TokenKind.Ident)
+    let mut full_name = effect_name
+    if at(TokenKind.Dot) {
+        advance()
+        let child = expect_value(TokenKind.Ident)
+        full_name = full_name.concat(".").concat(child)
+    }
+    skip_newlines_and_comments()
+    expect(TokenKind.LBrace)
+    skip_newlines_and_comments()
+    let methods = new_sublist()
+    while !at(TokenKind.RBrace) && !at(TokenKind.EOF) {
+        if at(TokenKind.Fn) {
+            sublist_push(methods, parse_fn_def())
+        } else {
+            advance()
+        }
+        skip_newlines_and_comments()
+    }
+    expect(TokenKind.RBrace)
+    finalize_sublist(methods)
+    let nd = new_node(NodeKind.HandlerExpr)
+    np_name.pop()
+    np_name.push(full_name)
+    np_methods.pop()
+    np_methods.push(methods)
+    nd
+}
+
+// ── With blocks ─────────────────────────────────────────────────────
+
+fn parse_with_block() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
+    expect(TokenKind.With)
+    let handlers_sl = new_sublist()
+    let expr0 = parse_expr()
+    if at(TokenKind.As) {
+        advance()
+        let binding = expect_value(TokenKind.Ident)
+        let wr = new_node(NodeKind.WithResource)
+        np_value.set(wr, expr0)
+        np_name.set(wr, binding)
+        sublist_push(handlers_sl, wr)
+    } else {
+        sublist_push(handlers_sl, expr0)
+    }
+    while at(TokenKind.Comma) {
+        advance()
+        skip_newlines_and_comments()
+        let expr_n = parse_expr()
+        if at(TokenKind.As) {
+            advance()
+            let binding_n = expect_value(TokenKind.Ident)
+            let wr_n = new_node(NodeKind.WithResource)
+            np_value.set(wr_n, expr_n)
+            np_name.set(wr_n, binding_n)
+            sublist_push(handlers_sl, wr_n)
+        } else {
+            sublist_push(handlers_sl, expr_n)
+        }
+    }
+    skip_newlines_and_comments()
+    let body = parse_block()
+    finalize_sublist(handlers_sl)
+    let nd = new_node(NodeKind.WithBlock)
+    np_handlers.set(nd, handlers_sl)
+    np_body.set(nd, body)
+    nd
+}
+
+// ── Block ───────────────────────────────────────────────────────────
+
+fn parse_block() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
+    let block_start_line = peek_line()
+    let block_start_col = peek_col()
+    expect(TokenKind.LBrace)
+    skip_newlines_and_comments()
+    let stmts = new_sublist()
+    while !at(TokenKind.RBrace) && !at(TokenKind.EOF) {
+        let stmt = parse_stmt()
+        sublist_push(stmts, stmt)
+        skip_newlines_and_comments()
+    }
+    let rbrace_line = peek_line()
+    let rbrace_col = peek_col()
+    expect(TokenKind.RBrace)
+    finalize_sublist(stmts)
+    let nd = new_node(NodeKind.Block)
+    np_line.set(nd, block_start_line)
+    np_col.set(nd, block_start_col)
+    np_stmts.pop()
+    np_stmts.push(stmts)
+    np_end_line.set(nd, rbrace_line)
+    np_end_col.set(nd, rbrace_col)
+    nd
+}
+
+// ── Statements ──────────────────────────────────────────────────────
+
+fn parse_stmt() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
+    if at(TokenKind.While) {
+        let nd = parse_while_loop()
+        return nd
+    }
+    if at(TokenKind.Loop) {
+        let nd = parse_loop_expr()
+        return nd
+    }
+    if at(TokenKind.Break) {
+        advance()
+        maybe_newline()
+        let nd = new_node(NodeKind.Break)
+        return nd
+    }
+    if at(TokenKind.Continue) {
+        advance()
+        maybe_newline()
+        let nd = new_node(NodeKind.Continue)
+        return nd
+    }
+    if at(TokenKind.Let) {
+        let nd = parse_let_binding()
+        return nd
+    }
+    if at(TokenKind.Const) {
+        let nd = parse_const_binding()
+        return nd
+    }
+    if at(TokenKind.For) {
+        let nd = parse_for_in()
+        return nd
+    }
+    if at(TokenKind.Return) {
+        let nd = parse_return_stmt()
+        return nd
+    }
+    if at(TokenKind.If) {
+        let nd = parse_if_expr()
+        maybe_newline()
+        return nd
+    }
+    if at(TokenKind.With) {
+        let nd = parse_with_block()
+        maybe_newline()
+        return nd
+    }
+
+    if at(TokenKind.Assert) || at(TokenKind.AssertEq) || at(TokenKind.AssertNe) {
+        let assert_kind = peek_kind()
+        let mut assert_name = "assert"
+        if assert_kind == TokenKind.AssertEq {
+            assert_name = "assert_eq"
+        } else if assert_kind == TokenKind.AssertNe {
+            assert_name = "assert_ne"
+        }
+        advance()
+        expect(TokenKind.LParen)
+        let args_sl = new_sublist()
+        sublist_push(args_sl, parse_expr())
+        while at(TokenKind.Comma) {
+            advance()
+            skip_newlines_and_comments()
+            if at(TokenKind.RParen) {
+                break
+            }
+            sublist_push(args_sl, parse_expr())
+        }
+        expect(TokenKind.RParen)
+        finalize_sublist(args_sl)
+        let fn_ident = new_node(NodeKind.Ident)
+        np_name.set(fn_ident, assert_name)
+        let call_nd = new_node(NodeKind.Call)
+        np_left.set(call_nd, fn_ident)
+        np_args.set(call_nd, args_sl)
+        maybe_newline()
+        let stmt_nd = new_node(NodeKind.ExprStmt)
+        np_value.set(stmt_nd, call_nd)
+        return stmt_nd
+    }
+
+    let expr = parse_expr()
+
+    if at(TokenKind.Equals) {
+        advance()
+        skip_newlines_and_comments()
+        let val = parse_expr()
+        maybe_newline()
+        let nd = new_node(NodeKind.Assignment)
+        np_line.set(nd, np_line.get(expr).unwrap())
+        np_col.set(nd, np_col.get(expr).unwrap())
+        np_target.pop()
+        np_target.push(expr)
+        np_value.pop()
+        np_value.push(val)
+        return nd
+    }
+
+    if at(TokenKind.PlusEq) || at(TokenKind.MinusEq) || at(TokenKind.StarEq) || at(TokenKind.SlashEq) {
+        let op_kind = peek_kind()
+        advance()
+        skip_newlines_and_comments()
+        let val = parse_expr()
+        maybe_newline()
+        let mut op_str = "+"
+        if op_kind == TokenKind.MinusEq {
+            op_str = "-"
+        } else if op_kind == TokenKind.StarEq {
+            op_str = "*"
+        } else if op_kind == TokenKind.SlashEq {
+            op_str = "/"
+        }
+        let nd = new_node(NodeKind.CompoundAssign)
+        np_line.set(nd, np_line.get(expr).unwrap())
+        np_col.set(nd, np_col.get(expr).unwrap())
+        np_op.pop()
+        np_op.push(op_str)
+        np_target.pop()
+        np_target.push(expr)
+        np_value.pop()
+        np_value.push(val)
+        return nd
+    }
+
+    maybe_newline()
+    let nd = new_node(NodeKind.ExprStmt)
+    np_line.set(nd, np_line.get(expr).unwrap())
+    np_col.set(nd, np_col.get(expr).unwrap())
+    np_value.pop()
+    np_value.push(expr)
+    nd
+}
+
+fn parse_let_binding() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
+    let let_start_line = peek_line()
+    let let_start_col = peek_col()
+    expect(TokenKind.Let)
+    let mut is_mut = 0
+    if at(TokenKind.Mut) {
+        is_mut = 1
+        advance()
+    }
+    let mut name = ""
+    let mut pat = -1
+    if at(TokenKind.LParen) {
+        pat = parse_pattern()
+        name = "_destructure"
+    } else {
+        name = expect_value(TokenKind.Ident)
+    }
+    let mut type_ann = -1
+    if at(TokenKind.Colon) {
+        advance()
+        type_ann = parse_type_annotation()
+    }
+    expect(TokenKind.Equals)
+    skip_newlines_and_comments()
+    let val = parse_expr()
+    maybe_newline()
+    let nd = new_node(NodeKind.LetBinding)
+    np_line.set(nd, let_start_line)
+    np_col.set(nd, let_start_col)
+    np_name.pop()
+    np_name.push(name)
+    np_value.pop()
+    np_value.push(val)
+    np_is_mut.pop()
+    np_is_mut.push(is_mut)
+    np_target.pop()
+    np_target.push(type_ann)
+    if pat != -1 {
+        np_elements.pop()
+        np_elements.push(pat)
+    }
+    nd
+}
+
+fn parse_const_binding() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
+    let const_start_line = peek_line()
+    let const_start_col = peek_col()
+    expect(TokenKind.Const)
+    let name = expect_value(TokenKind.Ident)
+    let mut type_ann = -1
+    if at(TokenKind.Colon) {
+        advance()
+        type_ann = parse_type_annotation()
+    }
+    expect(TokenKind.Equals)
+    skip_newlines_and_comments()
+    let val = parse_expr()
+    maybe_newline()
+    let nd = new_node(NodeKind.LetBinding)
+    np_line.set(nd, const_start_line)
+    np_col.set(nd, const_start_col)
+    np_name.pop()
+    np_name.push(name)
+    np_value.pop()
+    np_value.push(val)
+    np_is_const.pop()
+    np_is_const.push(1)
+    np_target.pop()
+    np_target.push(type_ann)
+    nd
+}
+
+fn parse_embed_expr() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
+    expect(TokenKind.Hash)
+    let intrinsic = expect_value(TokenKind.Ident)
+    if intrinsic != "embed" {
+        diag_error("UnknownIntrinsic", "E1108", "unknown compile-time intrinsic '#{intrinsic}' (only #embed is supported)", peek_line(), peek_col(), "")
+        let nd = new_node(NodeKind.IntLit)
+        return nd
+    }
+    expect(TokenKind.LParen)
+    expect(TokenKind.StringStart)
+    let path = expect_value(TokenKind.StringPart)
+    expect(TokenKind.StringEnd)
+    expect(TokenKind.RParen)
+    let nd = new_node(NodeKind.EmbedExpr)
+    np_str_val.pop()
+    np_str_val.push(path)
+    nd
+}
+
+fn parse_return_stmt() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
+    let ret_start_line = peek_line()
+    let ret_start_col = peek_col()
+    expect(TokenKind.Return)
+    if at(TokenKind.Newline) || at(TokenKind.RBrace) || at(TokenKind.EOF) {
+        maybe_newline()
+        let nd = new_node(NodeKind.Return)
+        np_line.set(nd, ret_start_line)
+        np_col.set(nd, ret_start_col)
+        return nd
+    }
+    let val = parse_expr()
+    maybe_newline()
+    let nd = new_node(NodeKind.Return)
+    np_line.set(nd, ret_start_line)
+    np_col.set(nd, ret_start_col)
+    np_value.pop()
+    np_value.push(val)
+    nd
+}
+
+@allow(UnrestoredMutation, IncompleteStateRestore)
+fn parse_if_expr() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
+    let if_start_line = peek_line()
+    let if_start_col = peek_col()
+    expect(TokenKind.If)
+    let cond = parse_expr()
+    skip_newlines_and_comments()
+    let then_b = parse_block()
+    let mut else_b = -1
+    let mut peek_pos = pos
+    while peek_pos < tok_kinds.len() && (peek_kind_at(peek_pos) == TokenKind.Newline || peek_kind_at(peek_pos) == TokenKind.Comment || peek_kind_at(peek_pos) == TokenKind.DocComment) {
+        peek_pos = peek_pos + 1
+    }
+    if peek_pos < tok_kinds.len() && peek_kind_at(peek_pos) == TokenKind.Else {
+        skip_newlines_and_comments()
+    }
+    if at(TokenKind.Else) {
+        advance()
+        skip_newlines_and_comments()
+        if at(TokenKind.If) {
+            let inner = parse_if_expr()
+            let stmts = new_sublist()
+            sublist_push(stmts, inner)
+            finalize_sublist(stmts)
+            let blk = new_node(NodeKind.Block)
+            np_stmts.pop()
+            np_stmts.push(stmts)
+            else_b = blk
+        } else {
+            else_b = parse_block()
+        }
+    }
+    let nd = new_node(NodeKind.IfExpr)
+    np_line.set(nd, if_start_line)
+    np_col.set(nd, if_start_col)
+    np_condition.pop()
+    np_condition.push(cond)
+    np_then_body.pop()
+    np_then_body.push(then_b)
+    np_else_body.pop()
+    np_else_body.push(else_b)
+    nd
+}
+
+fn parse_while_loop() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
+    let while_start_line = peek_line()
+    let while_start_col = peek_col()
+    expect(TokenKind.While)
+    let cond = parse_expr()
+    skip_newlines_and_comments()
+    let body = parse_block()
+    let nd = new_node(NodeKind.WhileLoop)
+    np_line.set(nd, while_start_line)
+    np_col.set(nd, while_start_col)
+    np_condition.pop()
+    np_condition.push(cond)
+    np_body.pop()
+    np_body.push(body)
+    nd
+}
+
+fn parse_loop_expr() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
+    let loop_start_line = peek_line()
+    let loop_start_col = peek_col()
+    expect(TokenKind.Loop)
+    skip_newlines_and_comments()
+    let body = parse_block()
+    let nd = new_node(NodeKind.LoopExpr)
+    np_line.set(nd, loop_start_line)
+    np_col.set(nd, loop_start_col)
+    np_body.pop()
+    np_body.push(body)
+    nd
+}
+
+fn parse_for_in() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
+    let for_start_line = peek_line()
+    let for_start_col = peek_col()
+    expect(TokenKind.For)
+    let mut var = ""
+    let mut pat = -1
+    if at(TokenKind.LParen) {
+        pat = parse_pattern()
+        var = "_tuple"
+    } else {
+        var = expect_value(TokenKind.Ident)
+    }
+    expect(TokenKind.In)
+    let iter = parse_expr()
+    skip_newlines_and_comments()
+    let body = parse_block()
+    let nd = new_node(NodeKind.ForIn)
+    np_line.set(nd, for_start_line)
+    np_col.set(nd, for_start_col)
+    np_var_name.pop()
+    np_var_name.push(var)
+    np_iterable.pop()
+    np_iterable.push(iter)
+    np_body.pop()
+    np_body.push(body)
+    if pat != -1 {
+        np_elements.pop()
+        np_elements.push(pat)
+    }
+    nd
+}
+
+// ── Expressions (precedence climbing) ───────────────────────────────
+
+fn parse_expr() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
+    parse_nullcoalesce()
+}
+
+fn parse_nullcoalesce() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
+    let mut left = parse_or()
+    while at(TokenKind.DoubleQuestion) {
+        advance()
+        skip_newlines()
+        let right = parse_or()
+        let nd = new_node(NodeKind.BinOp)
+        np_op.pop()
+        np_op.push("??")
+        np_left.pop()
+        np_left.push(left)
+        np_right.pop()
+        np_right.push(right)
+        left = nd
+    }
+    left
+}
+
+fn parse_or() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
+    let mut left = parse_and()
+    while at(TokenKind.Or) {
+        advance()
+        skip_newlines()
+        let right = parse_and()
+        let nd = new_node(NodeKind.BinOp)
+        np_op.pop()
+        np_op.push("||")
+        np_left.pop()
+        np_left.push(left)
+        np_right.pop()
+        np_right.push(right)
+        left = nd
+    }
+    left
+}
+
+fn parse_and() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
+    let mut left = parse_equality()
+    while at(TokenKind.And) {
+        advance()
+        skip_newlines()
+        let right = parse_equality()
+        let nd = new_node(NodeKind.BinOp)
+        np_op.pop()
+        np_op.push("&&")
+        np_left.pop()
+        np_left.push(left)
+        np_right.pop()
+        np_right.push(right)
+        left = nd
+    }
+    left
+}
+
+fn parse_equality() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
+    let mut left = parse_comparison()
+    while at(TokenKind.EqEq) || at(TokenKind.NotEq) {
+        let op = advance_value()
+        skip_newlines()
+        let right = parse_comparison()
+        let nd = new_node(NodeKind.BinOp)
+        np_op.pop()
+        np_op.push(op)
+        np_left.pop()
+        np_left.push(left)
+        np_right.pop()
+        np_right.push(right)
+        left = nd
+    }
+    left
+}
+
+fn parse_comparison() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
+    let mut left = parse_additive()
+    while at(TokenKind.Less) || at(TokenKind.Greater) || at(TokenKind.LessEq) || at(TokenKind.GreaterEq) {
+        let op = advance_value()
+        skip_newlines()
+        let right = parse_additive()
+        let nd = new_node(NodeKind.BinOp)
+        np_op.pop()
+        np_op.push(op)
+        np_left.pop()
+        np_left.push(left)
+        np_right.pop()
+        np_right.push(right)
+        left = nd
+    }
+    left
+}
+
+fn parse_additive() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
+    let mut left = parse_multiplicative()
+    while at(TokenKind.Plus) || at(TokenKind.Minus) {
+        let op = advance_value()
+        skip_newlines()
+        let right = parse_multiplicative()
+        let nd = new_node(NodeKind.BinOp)
+        np_op.pop()
+        np_op.push(op)
+        np_left.pop()
+        np_left.push(left)
+        np_right.pop()
+        np_right.push(right)
+        left = nd
+    }
+    left
+}
+
+fn parse_multiplicative() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
+    let mut left = parse_unary()
+    while at(TokenKind.Star) || at(TokenKind.Slash) || at(TokenKind.Percent) {
+        let op = advance_value()
+        skip_newlines()
+        let right = parse_unary()
+        let nd = new_node(NodeKind.BinOp)
+        np_op.pop()
+        np_op.push(op)
+        np_left.pop()
+        np_left.push(left)
+        np_right.pop()
+        np_right.push(right)
+        left = nd
+    }
+    left
+}
+
+fn parse_unary() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
+    if at(TokenKind.Minus) {
+        advance()
+        let operand = parse_unary()
+        let nd = new_node(NodeKind.UnaryOp)
+        np_op.pop()
+        np_op.push("-")
+        np_left.pop()
+        np_left.push(operand)
+        return nd
+    }
+    if at(TokenKind.Bang) {
+        advance()
+        let operand = parse_unary()
+        let nd = new_node(NodeKind.UnaryOp)
+        np_op.pop()
+        np_op.push("!")
+        np_left.pop()
+        np_left.push(operand)
+        return nd
+    }
+    parse_postfix()
+}
+
+// ── Postfix: calls, field access, index, method calls ───────────────
+
+@allow(UnrestoredMutation, IncompleteStateRestore)
+fn parse_postfix() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
+    let mut node = parse_primary()
+    let mut running = 1
+    while running {
+        if at(TokenKind.Dot) {
+            advance()
+            let mut member = ""
+            if at(TokenKind.Int) {
+                member = peek_value()
+                advance()
+            } else {
+                member = expect_value(TokenKind.Ident)
+            }
+            // async.scope { body }
+            if member == "scope" && np_kind.get(node).unwrap() == NodeKind.Ident && np_name.get(node).unwrap() == "async" && at(TokenKind.LBrace) {
+                let body = parse_block()
+                let nd = new_node(NodeKind.AsyncScope)
+                np_body.set(nd, body)
+                node = nd
+            // .await — postfix await on handles
+            } else if member == "await" {
+                let nd = new_node(NodeKind.AwaitExpr)
+                np_obj.set(nd, node)
+                node = nd
+            // channel.new[T](buffer) — typed channel constructor
+            } else if member == "new" && np_kind.get(node).unwrap() == NodeKind.Ident && np_name.get(node).unwrap() == "channel" && at(TokenKind.LBracket) {
+                let tparams = parse_type_params()
+                expect(TokenKind.LParen)
+                let cn_args = new_sublist()
+                if !at(TokenKind.RParen) {
+                    sublist_push(cn_args, parse_maybe_named_arg())
+                    while at(TokenKind.Comma) {
+                        advance()
+                        skip_newlines()
+                        sublist_push(cn_args, parse_maybe_named_arg())
+                    }
+                }
+                expect(TokenKind.RParen)
+                finalize_sublist(cn_args)
+                let nd = new_node(NodeKind.ChannelNew)
+                np_type_params.set(nd, tparams)
+                np_args.set(nd, cn_args)
+                node = nd
+            } else if at(TokenKind.LParen) {
+                advance()
+                let args = new_sublist()
+                if !at(TokenKind.RParen) {
+                    sublist_push(args, parse_maybe_named_arg())
+                    while at(TokenKind.Comma) {
+                        advance()
+                        skip_newlines()
+                        if at(TokenKind.RParen) {
+                            break
+                        }
+                        sublist_push(args, parse_maybe_named_arg())
+                    }
+                    skip_newlines()
+                }
+                expect(TokenKind.RParen)
+                finalize_sublist(args)
+                let nd = new_node(NodeKind.MethodCall)
+                np_obj.pop()
+                np_obj.push(node)
+                np_method.pop()
+                np_method.push(member)
+                np_args.pop()
+                np_args.push(args)
+                node = nd
+            } else {
+                let nd = new_node(NodeKind.FieldAccess)
+                np_obj.pop()
+                np_obj.push(node)
+                np_name.pop()
+                np_name.push(member)
+                node = nd
+                // Check for struct literal after field access (e.g. Foo.Bar { ... })
+                if at(TokenKind.LBrace) {
+                    if looks_like_struct_lit() {
+                        // Reconstruct dotted name
+                        let dotted = flatten_field_access(node)
+                        if dotted.is_some() {
+                            node = parse_struct_lit(dotted.unwrap())
+                        }
+                    }
+                }
+            }
+        } else if at(TokenKind.LParen) {
+            advance()
+            let args = new_sublist()
+            if !at(TokenKind.RParen) {
+                skip_newlines()
+                sublist_push(args, parse_maybe_named_arg())
+                while at(TokenKind.Comma) {
+                    advance()
+                    skip_newlines()
+                    if at(TokenKind.RParen) {
+                        break
+                    }
+                    sublist_push(args, parse_maybe_named_arg())
+                }
+                skip_newlines()
+            }
+            expect(TokenKind.RParen)
+            finalize_sublist(args)
+            let nd = new_node(NodeKind.Call)
+            np_left.pop()
+            np_left.push(node)
+            np_args.pop()
+            np_args.push(args)
+            node = nd
+        } else if at(TokenKind.LBracket) {
+            advance()
+            skip_newlines()
+            let idx = parse_expr()
+            skip_newlines()
+            expect(TokenKind.RBracket)
+            let nd = new_node(NodeKind.IndexExpr)
+            np_obj.pop()
+            np_obj.push(node)
+            np_index.pop()
+            np_index.push(idx)
+            node = nd
+        } else if at(TokenKind.Question) {
+            advance()
+            let nd = new_node(NodeKind.UnaryOp)
+            np_op.pop()
+            np_op.push("?")
+            np_left.pop()
+            np_left.push(node)
+            node = nd
+        } else if at(TokenKind.Newline) || at(TokenKind.Comment) {
+            let mut peek_pos = pos
+            while peek_pos < tok_kinds.len() && (peek_kind_at(peek_pos) == TokenKind.Newline || peek_kind_at(peek_pos) == TokenKind.Comment || peek_kind_at(peek_pos) == TokenKind.DocComment) {
+                peek_pos = peek_pos + 1
+            }
+            if peek_pos < tok_kinds.len() && peek_kind_at(peek_pos) == TokenKind.Dot {
+                skip_newlines()
+            } else {
+                running = 0
+            }
+        } else {
+            running = 0
+        }
+    }
+    node
+}
+
+@allow(UnrestoredMutation, IncompleteStateRestore)
+fn skip_named_arg_label() ! Parse.Advance {
+    if at(TokenKind.Ident) {
+        let saved = pos
+        advance()
+        if at(TokenKind.Colon) {
+            advance()
+            skip_newlines()
+        } else {
+            pos = saved
+        }
+    }
+}
+
+@allow(UnrestoredMutation, IncompleteStateRestore)
+fn parse_maybe_named_arg() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
+    if at(TokenKind.Ident) {
+        let saved = pos
+        let label = peek_value()
+        advance()
+        if at(TokenKind.Colon) {
+            advance()
+            skip_newlines()
+            let inner = parse_expr()
+            let nd = new_node(NodeKind.NamedArg)
+            np_name.set(nd, label)
+            np_value.set(nd, inner)
+            return nd
+        } else {
+            pos = saved
+        }
+    }
+    parse_expr()
+}
+
+fn flatten_field_access(node: Int) -> Option[Str] {
+    let kind = np_kind.get(node).unwrap()
+    if kind == NodeKind.Ident {
+        return Some(np_name.get(node).unwrap())
+    }
+    if kind == NodeKind.FieldAccess {
+        let base = flatten_field_access(np_obj.get(node).unwrap())
+        if base.is_some() {
+            return Some(base.unwrap() + "." + np_name.get(node).unwrap())
+        }
+    }
+    None
+}
+
+fn looks_like_struct_lit() -> Int {
+    // Side-effect-free lookahead: peek past { and whitespace/comments
+    // to check for "ident :" pattern without collecting comments
+    let mut peek_pos = pos
+    if peek_pos >= tok_kinds.len() || peek_kind_at(peek_pos) != TokenKind.LBrace {
+        return 0
+    }
+    peek_pos = peek_pos + 1
+    while peek_pos < tok_kinds.len() && (peek_kind_at(peek_pos) == TokenKind.Newline || peek_kind_at(peek_pos) == TokenKind.Comment || peek_kind_at(peek_pos) == TokenKind.DocComment) {
+        peek_pos = peek_pos + 1
+    }
+    if peek_pos >= tok_kinds.len() {
+        return 0
+    }
+    if peek_kind_at(peek_pos) == TokenKind.RBrace {
+        return 1
+    }
+    if peek_kind_at(peek_pos) != TokenKind.Ident {
+        return 0
+    }
+    peek_pos = peek_pos + 1
+    if peek_pos < tok_kinds.len() && peek_kind_at(peek_pos) == TokenKind.Colon {
+        return 1
+    }
+    0
+}
+
+// ── Primary expressions ─────────────────────────────────────────────
+
+fn parse_primary() -> Int ! Diag.Report, Parse.Advance, Parse.Build {
+    if at(TokenKind.Match) {
+        let next_pos = pos + 1
+        let next_ok = next_pos < tok_kinds.len() && peek_kind_at(next_pos) != TokenKind.RParen && peek_kind_at(next_pos) != TokenKind.RBrace && peek_kind_at(next_pos) != TokenKind.Comma && peek_kind_at(next_pos) != TokenKind.Dot && peek_kind_at(next_pos) != TokenKind.Newline && peek_kind_at(next_pos) != TokenKind.EOF && peek_kind_at(next_pos) != TokenKind.Equals && peek_kind_at(next_pos) != TokenKind.EqEq && peek_kind_at(next_pos) != TokenKind.RBracket && peek_kind_at(next_pos) != TokenKind.StringEnd && peek_kind_at(next_pos) != TokenKind.InterpEnd
+        if next_ok {
+            return parse_match_expr()
+        }
+        diag_error("KeywordAsIdentifier", "E1103", "'match' is a keyword and cannot be used as an identifier", peek_line(), peek_col(), "use a different name")
+        advance()
+        let nd = new_node(NodeKind.Ident)
+        np_name.pop()
+        np_name.push("match")
+        return nd
+    }
+    if at(TokenKind.If) {
+        let next_pos = pos + 1
+        let next_ok = next_pos < tok_kinds.len() && peek_kind_at(next_pos) != TokenKind.RParen && peek_kind_at(next_pos) != TokenKind.RBrace && peek_kind_at(next_pos) != TokenKind.Comma && peek_kind_at(next_pos) != TokenKind.Dot && peek_kind_at(next_pos) != TokenKind.Newline && peek_kind_at(next_pos) != TokenKind.EOF && peek_kind_at(next_pos) != TokenKind.Equals && peek_kind_at(next_pos) != TokenKind.EqEq && peek_kind_at(next_pos) != TokenKind.RBracket && peek_kind_at(next_pos) != TokenKind.StringEnd && peek_kind_at(next_pos) != TokenKind.InterpEnd
+        if next_ok {
+            return parse_if_expr()
+        }
+        diag_error("KeywordAsIdentifier", "E1103", "'if' is a keyword and cannot be used as an identifier", peek_line(), peek_col(), "use a different name")
+        advance()
+        let nd = new_node(NodeKind.Ident)
+        np_name.pop()
+        np_name.push("if")
+        return nd
+    }
+    if at(TokenKind.Self) {
+        advance()
+        let nd = new_node(NodeKind.Ident)
+        np_name.pop()
+        np_name.push("self")
+        return nd
+    }
+
+    if at(TokenKind.Fn) {
+        let next_pos = pos + 1
+        if next_pos < tok_kinds.len() && peek_kind_at(next_pos) == TokenKind.LParen {
+            return parse_closure()
+        }
+        diag_error("KeywordAsIdentifier", "E1103", "'fn' is a keyword and cannot be used as an identifier", peek_line(), peek_col(), "use a different name")
+        advance()
+        let nd = new_node(NodeKind.Ident)
+        np_name.pop()
+        np_name.push("fn")
+        return nd
+    }
+
+    if at(TokenKind.Handler) {
+        // Check if this is a handler expression (handler EffectName { ... })
+        // vs a keyword used as a variable name (e.g. fn foo(handler: Int) { handler })
+        let next_pos = pos + 1
+        if next_pos < tok_kinds.len() && peek_kind_at(next_pos) == TokenKind.Ident {
+            return parse_handler_expr()
+        }
+        // Keyword used as identifier — emit error and treat as ident
+        diag_error("KeywordAsIdentifier", "E1103", "'handler' is a keyword and cannot be used as an identifier", peek_line(), peek_col(), "use a different name")
+        advance()
+        let nd = new_node(NodeKind.Ident)
+        np_name.pop()
+        np_name.push("handler")
+        return nd
+    }
+
+    if at(TokenKind.Ident) {
+        let name = advance_value()
+        if name == "true" {
+            let nd = new_node(NodeKind.BoolLit)
+            np_int_val.pop()
+            np_int_val.push(1)
+            return nd
+        }
+        if name == "false" {
+            let nd = new_node(NodeKind.BoolLit)
+            np_int_val.pop()
+            np_int_val.push(0)
+            return nd
+        }
+        if at(TokenKind.LBrace) && looks_like_struct_lit() {
+            return parse_struct_lit(name)
+        }
+        let nd = new_node(NodeKind.Ident)
+        np_name.pop()
+        np_name.push(name)
+        return nd
+    }
+
+    if at(TokenKind.Int) {
+        let val_str = advance_value()
+        let nd = new_node(NodeKind.IntLit)
+        np_str_val.pop()
+        np_str_val.push(val_str)
+        // Check for range
+        if at(TokenKind.DotDot) {
+            advance()
+            let end_nd = parse_primary()
+            let rng = new_node(NodeKind.RangeLit)
+            np_start.pop()
+            np_start.push(nd)
+            np_end.pop()
+            np_end.push(end_nd)
+            return rng
+        }
+        if at(TokenKind.DotDoteq) {
+            advance()
+            let end_nd = parse_primary()
+            let rng = new_node(NodeKind.RangeLit)
+            np_start.pop()
+            np_start.push(nd)
+            np_end.pop()
+            np_end.push(end_nd)
+            np_inclusive.pop()
+            np_inclusive.push(1)
+            return rng
+        }
+        return nd
+    }
+
+    if at(TokenKind.Float) {
+        let val_str = advance_value()
+        let nd = new_node(NodeKind.FloatLit)
+        np_str_val.pop()
+        np_str_val.push(val_str)
+        return nd
+    }
+
+    if at(TokenKind.LParen) {
+        advance()
+        skip_newlines()
+        if at(TokenKind.RParen) {
+            advance()
+            // Unit / empty tuple — represent as int lit 0 for simplicity
+            return new_node(NodeKind.IntLit)
+        }
+        let first = parse_expr()
+        if at(TokenKind.Comma) {
+            let elems = new_sublist()
+            sublist_push(elems, first)
+            while at(TokenKind.Comma) {
+                advance()
+                skip_newlines()
+                if at(TokenKind.RParen) {
+                    break
+                }
+                sublist_push(elems, parse_expr())
+            }
+            expect(TokenKind.RParen)
+            finalize_sublist(elems)
+            let nd = new_node(NodeKind.TupleLit)
+            np_elements.pop()
+            np_elements.push(elems)
+            return nd
+        }
+        skip_newlines()
+        expect(TokenKind.RParen)
+        return first
+    }
+
+    if at(TokenKind.Hash) {
+        return parse_embed_expr()
+    }
+
+    if at(TokenKind.LBracket) {
+        return parse_list_lit()
+    }
+
+    if at(TokenKind.StringStart) {
+        return parse_interp_string()
+    }
+
+    if at(TokenKind.LBrace) {
+        if tok_kinds.get(pos + 1).unwrap() == TokenKind.RBrace {
+            diag_error("EmptyBraceExpr", "E1107", "empty '\{\}' is not a valid expression — use Map() for empty maps", peek_line(), peek_col(), "replace '\{\}' with 'Map()'")
+            advance()
+            advance()
+            return new_node(NodeKind.IntLit)
+        }
+        return parse_block()
+    }
+
+    if is_keyword(peek_kind()) {
+        let kw_name = peek_value()
+        diag_error("KeywordAsIdentifier", "E1103", "'{kw_name}' is a keyword and cannot be used as an identifier", peek_line(), peek_col(), "use a different name")
+        advance()
+        let nd = new_node(NodeKind.Ident)
+        np_name.pop()
+        np_name.push(kw_name)
+        return nd
+    }
+
+    diag_error("UnexpectedToken", "E1100", "unexpected token {peek_kind()}", peek_line(), peek_col(), "")
+    advance()
+    new_node(NodeKind.IntLit)
+}
+
+fn parse_struct_lit(type_name: Str) -> Int ! Parse.Advance, Parse.Build, Diag.Report {
+    expect(TokenKind.LBrace)
+    skip_newlines_and_comments()
+    let flds = new_sublist()
+    while !at(TokenKind.RBrace) {
+        let fname = expect_value(TokenKind.Ident)
+        expect(TokenKind.Colon)
+        skip_newlines()
+        let fval = parse_expr()
+        let sf = new_node(NodeKind.StructLitField)
+        np_name.pop()
+        np_name.push(fname)
+        np_value.pop()
+        np_value.push(fval)
+        sublist_push(flds, sf)
+        if at(TokenKind.Comma) {
+            advance()
+        }
+        skip_newlines_and_comments()
+    }
+    expect(TokenKind.RBrace)
+    finalize_sublist(flds)
+    let nd = new_node(NodeKind.StructLit)
+    np_type_name.pop()
+    np_type_name.push(type_name)
+    np_fields.pop()
+    np_fields.push(flds)
+    nd
+}
+
+fn parse_list_lit() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
+    expect(TokenKind.LBracket)
+    skip_newlines_and_comments()
+    let elems = new_sublist()
+    while !at(TokenKind.RBracket) {
+        sublist_push(elems, parse_expr())
+        if at(TokenKind.Comma) {
+            advance()
+        }
+        skip_newlines_and_comments()
+    }
+    expect(TokenKind.RBracket)
+    finalize_sublist(elems)
+    let nd = new_node(NodeKind.ListLit)
+    np_elements.pop()
+    np_elements.push(elems)
+    nd
+}
+
+fn parse_interp_string() -> Int ! Diag.Report, Parse.Advance, Parse.Build {
+    expect(TokenKind.StringStart)
+    let parts = new_sublist()
+    while !at(TokenKind.StringEnd) {
+        if at(TokenKind.StringPart) {
+            let s = advance_value()
+            let sn = new_node(NodeKind.Ident)
+            np_str_val.pop()
+            np_str_val.push(s)
+            np_name.pop()
+            np_name.push(s)
+            sublist_push(parts, sn)
+        } else if at(TokenKind.InterpStart) {
+            advance()
+            sublist_push(parts, parse_expr())
+            expect(TokenKind.InterpEnd)
+        } else {
+            diag_error("UnexpectedToken", "E1101", "unexpected token in string: {peek_kind()}", peek_line(), peek_col(), "")
+            advance()
+        }
+    }
+    expect(TokenKind.StringEnd)
+    finalize_sublist(parts)
+    let nd = new_node(NodeKind.InterpString)
+    np_elements.pop()
+    np_elements.push(parts)
+    nd
+}
+
+// ── Match ───────────────────────────────────────────────────────────
+
+fn parse_match_expr() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
+    expect(TokenKind.Match)
+    let scrut = parse_expr()
+    skip_newlines_and_comments()
+    expect(TokenKind.LBrace)
+    skip_newlines_and_comments()
+    let arms = new_sublist()
+    while !at(TokenKind.RBrace) {
+        sublist_push(arms, parse_match_arm())
+        skip_newlines_and_comments()
+    }
+    expect(TokenKind.RBrace)
+    finalize_sublist(arms)
+    let nd = new_node(NodeKind.MatchExpr)
+    np_scrutinee.pop()
+    np_scrutinee.push(scrut)
+    np_arms.pop()
+    np_arms.push(arms)
+    nd
+}
+
+fn parse_match_arm() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
+    let pat = parse_pattern()
+    let mut guard = -1
+    skip_newlines_and_comments()
+    if at(TokenKind.If) {
+        advance()
+        guard = parse_expr()
+    }
+    skip_newlines_and_comments()
+    expect(TokenKind.FatArrow)
+    skip_newlines_and_comments()
+    let mut body = -1
+    if at(TokenKind.LBrace) {
+        body = parse_block()
+    } else {
+        body = parse_stmt()
+    }
+    let nd = new_node(NodeKind.MatchArm)
+    np_pattern.pop()
+    np_pattern.push(pat)
+    np_body.pop()
+    np_body.push(body)
+    np_guard.pop()
+    np_guard.push(guard)
+    nd
+}
+
+fn parse_pattern() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
+    let first = parse_single_pattern()
+    if !at(TokenKind.Pipe) {
+        return first
+    }
+    let alts = new_sublist()
+    sublist_push(alts, first)
+    while at(TokenKind.Pipe) {
+        advance()
+        skip_newlines()
+        sublist_push(alts, parse_single_pattern())
+    }
+    finalize_sublist(alts)
+    let nd = new_node(NodeKind.OrPattern)
+    np_elements.pop()
+    np_elements.push(alts)
+    nd
+}
+
+fn parse_single_pattern() -> Int ! Diag.Report, Parse.Advance, Parse.Build {
+    if at(TokenKind.LBracket) {
+        advance()
+        skip_newlines()
+        if at(TokenKind.RBracket) {
+            advance()
+            let nd = new_node(NodeKind.ListPattern)
+            np_elements.pop()
+            np_elements.push(-1)
+            np_inclusive.pop()
+            np_inclusive.push(0)
+            return nd
+        }
+        let elems = new_sublist()
+        let mut has_rest = 0
+        sublist_push(elems, parse_pattern())
+        while at(TokenKind.Comma) {
+            advance()
+            skip_newlines()
+            if at(TokenKind.DotDot) {
+                advance()
+                if at(TokenKind.Dot) {
+                    advance()
+                }
+                has_rest = 1
+                skip_newlines()
+                if at(TokenKind.Comma) {
+                    advance()
+                    skip_newlines()
+                }
+                break
+            }
+            if at(TokenKind.RBracket) {
+                break
+            }
+            sublist_push(elems, parse_pattern())
+        }
+        skip_newlines()
+        expect(TokenKind.RBracket)
+        finalize_sublist(elems)
+        let nd = new_node(NodeKind.ListPattern)
+        np_elements.pop()
+        np_elements.push(elems)
+        np_inclusive.pop()
+        np_inclusive.push(has_rest)
+        return nd
+    }
+    if at(TokenKind.LParen) {
+        advance()
+        skip_newlines()
+        let elems = new_sublist()
+        sublist_push(elems, parse_pattern())
+        while at(TokenKind.Comma) {
+            advance()
+            skip_newlines()
+            sublist_push(elems, parse_pattern())
+        }
+        skip_newlines()
+        expect(TokenKind.RParen)
+        finalize_sublist(elems)
+        let nd = new_node(NodeKind.TuplePattern)
+        np_elements.pop()
+        np_elements.push(elems)
+        return nd
+    }
+    if at(TokenKind.StringStart) {
+        let str_node = parse_interp_string()
+        let parts_sl = np_elements.get(str_node).unwrap()
+        let mut str_val = ""
+        if parts_sl != -1 && sublist_length(parts_sl) == 1 {
+            str_val = np_str_val.get(sublist_get(parts_sl, 0)).unwrap()
+        }
+        let nd = new_node(NodeKind.StringPattern)
+        np_str_val.pop()
+        np_str_val.push(str_val)
+        return nd
+    }
+    if at(TokenKind.Int) {
+        let v = advance_value()
+        if at(TokenKind.DotDot) {
+            advance()
+            let hi = advance_value()
+            let nd = new_node(NodeKind.RangePattern)
+            np_str_val.pop()
+            np_str_val.push(v)
+            np_name.pop()
+            np_name.push(hi)
+            np_inclusive.pop()
+            np_inclusive.push(0)
+            return nd
+        }
+        if at(TokenKind.DotDoteq) {
+            advance()
+            let hi = advance_value()
+            let nd = new_node(NodeKind.RangePattern)
+            np_str_val.pop()
+            np_str_val.push(v)
+            np_name.pop()
+            np_name.push(hi)
+            np_inclusive.pop()
+            np_inclusive.push(1)
+            return nd
+        }
+        let nd = new_node(NodeKind.IntPattern)
+        np_str_val.pop()
+        np_str_val.push(v)
+        return nd
+    }
+    if at(TokenKind.Ident) {
+        let name = advance_value()
+        if name == "_" {
+            return new_node(NodeKind.WildcardPattern)
+        }
+        if name == "true" {
+            let nd = new_node(NodeKind.IntPattern)
+            np_str_val.pop()
+            np_str_val.push("1")
+            return nd
+        }
+        if name == "false" {
+            let nd = new_node(NodeKind.IntPattern)
+            np_str_val.pop()
+            np_str_val.push("0")
+            return nd
+        }
+        // Qualified variant: Type.Variant or Type.Variant(fields)
+        if at(TokenKind.Dot) {
+            advance()
+            let variant = advance_value()
+            if at(TokenKind.LParen) {
+                advance()
+                skip_newlines()
+                let flds = new_sublist()
+                if !at(TokenKind.RParen) {
+                    sublist_push(flds, parse_pattern())
+                    while at(TokenKind.Comma) {
+                        advance()
+                        skip_newlines()
+                        sublist_push(flds, parse_pattern())
+                    }
+                }
+                skip_newlines()
+                expect(TokenKind.RParen)
+                finalize_sublist(flds)
+                let nd = new_node(NodeKind.EnumPattern)
+                np_name.pop()
+                np_name.push(name)
+                np_type_name.pop()
+                np_type_name.push(variant)
+                np_fields.pop()
+                np_fields.push(flds)
+                return nd
+            }
+            let nd = new_node(NodeKind.EnumPattern)
+            np_name.pop()
+            np_name.push(name)
+            np_type_name.pop()
+            np_type_name.push(variant)
+            np_fields.pop()
+            np_fields.push(-1)
+            return nd
+        }
+        if at(TokenKind.LParen) {
+            advance()
+            skip_newlines()
+            let flds = new_sublist()
+            if !at(TokenKind.RParen) {
+                sublist_push(flds, parse_pattern())
+                while at(TokenKind.Comma) {
+                    advance()
+                    skip_newlines()
+                    sublist_push(flds, parse_pattern())
+                }
+            }
+            skip_newlines()
+            expect(TokenKind.RParen)
+            finalize_sublist(flds)
+            let nd = new_node(NodeKind.EnumPattern)
+            np_name.pop()
+            np_name.push(name)
+            np_fields.pop()
+            np_fields.push(flds)
+            return nd
+        }
+        if at(TokenKind.LBrace) {
+            advance()
+            skip_newlines()
+            let flds = new_sublist()
+            let mut has_rest = 0
+            while !at(TokenKind.RBrace) && !at(TokenKind.EOF) {
+                if at(TokenKind.DotDot) {
+                    advance()
+                    has_rest = 1
+                    skip_newlines()
+                    if at(TokenKind.Comma) {
+                        advance()
+                        skip_newlines()
+                    }
+                    break
+                }
+                let fname = expect_value(TokenKind.Ident)
+                if at(TokenKind.Colon) {
+                    advance()
+                    skip_newlines()
+                    let fpat = parse_pattern()
+                    let sf = new_node(NodeKind.StructLitField)
+                    np_name.pop()
+                    np_name.push(fname)
+                    np_pattern.pop()
+                    np_pattern.push(fpat)
+                    sublist_push(flds, sf)
+                } else {
+                    let sf = new_node(NodeKind.StructLitField)
+                    np_name.pop()
+                    np_name.push(fname)
+                    sublist_push(flds, sf)
+                }
+                if at(TokenKind.Comma) {
+                    advance()
+                    skip_newlines()
+                }
+            }
+            expect(TokenKind.RBrace)
+            finalize_sublist(flds)
+            let nd = new_node(NodeKind.StructPattern)
+            np_type_name.pop()
+            np_type_name.push(name)
+            np_fields.pop()
+            np_fields.push(flds)
+            np_inclusive.pop()
+            np_inclusive.push(has_rest)
+            return nd
+        }
+        if at(TokenKind.As) {
+            advance()
+            let inner = parse_pattern()
+            let nd = new_node(NodeKind.AsPattern)
+            np_name.pop()
+            np_name.push(name)
+            np_pattern.pop()
+            np_pattern.push(inner)
+            return nd
+        }
+        let nd = new_node(NodeKind.IdentPattern)
+        np_name.pop()
+        np_name.push(name)
+        return nd
+    }
+    diag_error("UnexpectedToken", "E1102", "unexpected token in pattern: {peek_kind()}", peek_line(), peek_col(), "")
+    advance()
+    new_node(NodeKind.WildcardPattern)
+}

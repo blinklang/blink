@@ -1,0 +1,425 @@
+// http_server.bl — HTTP server with struct types + closure handlers
+
+import std.http_types
+import std.net_tcp
+
+// ── Route, Hook, and Server types ───────────────────────────────────
+
+pub type RouteSegment {
+    Literal(value: Str)
+    Param(name: Str)
+}
+
+pub type Route {
+    method: Str
+    pattern: Str
+    segments: List[RouteSegment]
+    callback: fn(Request) -> Response
+}
+
+pub type Hook {
+    name: Str
+    process: fn(Request) -> Request
+}
+
+pub type ErrorHandler {
+    on_error: fn(Request, Str) -> Response
+}
+
+pub type Server {
+    host: Str
+    port: Int
+    routes: List[Route]
+    before_hooks: List[Hook]
+    error_handler: ErrorHandler
+    max_connections: Int
+}
+
+pub type MatchResult {
+    index: Int
+    param_names: List[Str]
+    param_values: List[Str]
+}
+
+// ── Server API ──────────────────────────────────────────────────────
+
+/// Create an HTTP server on host:port
+pub fn server_new(host: Str, port: Int) -> Server {
+    let routes: List[Route] = []
+    let hooks: List[Hook] = []
+    let err_handler = ErrorHandler {
+        on_error: fn(_req: Request, msg: Str) -> Response {
+            response_internal_error("Internal Server Error: {msg}")
+        }
+    }
+    Server { host: host, port: port, routes: routes, before_hooks: hooks, error_handler: err_handler, max_connections: 0 }
+}
+
+/// Parse a route pattern into pre-split segments
+pub fn parse_pattern(pattern: Str) -> List[RouteSegment] {
+    let parts = split_path(pattern)
+    let mut segments: List[RouteSegment] = []
+    let mut i = 0
+    while i < parts.len() {
+        let part = parts.get(i).unwrap()
+        if part.len() > 0 && part.char_at(0) == 58 { // ':' = 58
+            let name = part.substring(1, part.len() - 1)
+            segments.push(RouteSegment.Param(name))
+        } else {
+            segments.push(RouteSegment.Literal(part))
+        }
+        i = i + 1
+    }
+    segments
+}
+
+/// Add a route handler for a method and path pattern
+pub fn server_route(srv: Server, method: Str, pattern: Str, cb: fn(Request) -> Response) -> Server {
+    let segments = parse_pattern(pattern)
+    let r = Route { method: method, pattern: pattern, segments: segments, callback: cb }
+    srv.routes.push(r)
+    srv
+}
+
+/// Add a GET route
+pub fn server_get(srv: Server, pattern: Str, cb: fn(Request) -> Response) -> Server {
+    server_route(srv, "GET", pattern, cb)
+}
+
+/// Add a POST route
+pub fn server_post(srv: Server, pattern: Str, cb: fn(Request) -> Response) -> Server {
+    server_route(srv, "POST", pattern, cb)
+}
+
+/// Add a PUT route
+pub fn server_put(srv: Server, pattern: Str, cb: fn(Request) -> Response) -> Server {
+    server_route(srv, "PUT", pattern, cb)
+}
+
+/// Add a DELETE route
+pub fn server_delete(srv: Server, pattern: Str, cb: fn(Request) -> Response) -> Server {
+    server_route(srv, "DELETE", pattern, cb)
+}
+
+// ── Middleware API ──────────────────────────────────────────────────
+
+/// Add a middleware hook that transforms requests
+pub fn server_use(srv: Server, name: Str, hook: fn(Request) -> Request) -> Server {
+    let h = Hook { name: name, process: hook }
+    srv.before_hooks.push(h)
+    srv
+}
+
+/// Set the maximum number of concurrent connections (0 = unlimited)
+pub fn server_max_connections(srv: Server, max: Int) -> Server {
+    Server { host: srv.host, port: srv.port, routes: srv.routes, before_hooks: srv.before_hooks, error_handler: srv.error_handler, max_connections: max }
+}
+
+/// Set the error handler
+pub fn server_on_error(srv: Server, err_fn: fn(Request, Str) -> Response) -> Server {
+    let eh = ErrorHandler { on_error: err_fn }
+    Server { host: srv.host, port: srv.port, routes: srv.routes, before_hooks: srv.before_hooks, error_handler: eh, max_connections: srv.max_connections }
+}
+
+// ── Route matching ──────────────────────────────────────────────────
+
+/// Find the matching route for a method and path, returning index and extracted params
+pub fn match_route(srv: Server, method: Str, path: Str) -> MatchResult {
+    match_route_with(srv.routes, method, path)
+}
+
+/// Check if a path matches pre-split route segments, extracting params
+pub fn path_match(segments: List[RouteSegment], path_parts: List[Str], names: List[Str], values: List[Str]) -> Int {
+    if segments.len() != path_parts.len() {
+        return 0
+    }
+    let mut i = 0
+    while i < segments.len() {
+        let seg = segments.get(i).unwrap()
+        let path_seg = path_parts.get(i).unwrap()
+        match seg {
+            RouteSegment.Literal(v) => {
+                if v != path_seg {
+                    return 0
+                }
+            }
+            RouteSegment.Param(name) => {
+                names.push(name)
+                values.push(path_seg)
+            }
+        }
+        i = i + 1
+    }
+    1
+}
+
+/// Get a path parameter value by name from a request
+pub fn req_path_param(req: Request, name: Str) -> Str {
+    let mut i = 0
+    while i < req.param_names.len() {
+        if req.param_names.get(i).unwrap() == name {
+            return req.param_values.get(i).unwrap()
+        }
+        i = i + 1
+    }
+    ""
+}
+
+// ── HTTP parsing ────────────────────────────────────────────────────
+
+/// Parse a raw HTTP request string into a Request
+pub fn parse_request(raw: Str) -> Request {
+    // Parse "METHOD URL HTTP/1.1\r\n..."
+    let mut method = ""
+    let mut url = ""
+    let mut body = ""
+    let mut i = 0
+
+    // Extract method (up to first space)
+    while i < raw.len() && raw.char_at(i) != 32 {
+        i = i + 1
+    }
+    method = raw.substring(0, i)
+
+    // Skip space
+    i = i + 1
+
+    // Extract URL (up to next space)
+    let url_start = i
+    while i < raw.len() && raw.char_at(i) != 32 {
+        i = i + 1
+    }
+    url = raw.substring(url_start, i - url_start)
+
+    // Skip to end of request line (find \r\n)
+    while i < raw.len() - 1 {
+        if raw.char_at(i) == 13 && raw.char_at(i + 1) == 10 {
+            i = i + 2
+            // Now skip headers until we find \r\n\r\n
+            while i < raw.len() - 3 {
+                if raw.char_at(i) == 13 && raw.char_at(i + 1) == 10 && raw.char_at(i + 2) == 13 && raw.char_at(i + 3) == 10 {
+                    // Body starts after \r\n\r\n
+                    let body_start = i + 4
+                    if body_start < raw.len() {
+                        body = raw.substring(body_start, raw.len() - body_start)
+                    }
+                    return request_new_with_body(method, url, body)
+                }
+                i = i + 1
+            }
+            return request_new_with_body(method, url, "")
+        }
+        i = i + 1
+    }
+
+    request_new_with_body(method, url, body)
+}
+
+fn request_new_with_body(method: Str, url: Str, body: Str) -> Request {
+    let hdrs: Map[Str, Str] = Map()
+    Request { method: method, url: url, body: body, headers: hdrs, param_names: [], param_values: [], timeout_ms: 0 }
+}
+
+// ── HTTP response formatting ────────────────────────────────────────
+
+/// Format a Response into an HTTP response string
+pub fn format_response(resp: Response) -> Str {
+    let reason = status_reason(resp.status)
+    let status_str = resp.status.to_string()
+    let body_len = resp.body.len().to_string()
+    let mut result = "HTTP/1.1 {status_str} {reason}\r\nContent-Length: {body_len}\r\nConnection: close\r\n\r\n{resp.body}"
+    result
+}
+
+// ── Server loops ────────────────────────────────────────────────────
+
+fn parse_content_length(headers: Str) -> Int {
+    let lower = headers.to_lower()
+    let idx = lower.index_of("content-length:")
+    if idx < 0 { return 0 }
+    let after_raw = lower.slice(idx + 15, lower.len())
+    let cr = after_raw.index_of("\r")
+    if cr < 0 { return 0 }
+    let val = str_trim(after_raw.slice(0, cr))
+    val.to_int()
+}
+
+pub fn read_http_request(conn: Int) -> Str {
+    let sb = StringBuilder.new()
+    let mut tail = ""
+    let mut done = false
+    while !done {
+        let chunk = tcp_read(conn, 4096)
+        if chunk.len() == 0 {
+            done = true
+        } else {
+            sb.write(chunk)
+            let boundary = "{tail}{chunk}"
+            if boundary.index_of("\r\n\r\n") >= 0 {
+                done = true
+            }
+            let clen = chunk.len()
+            tail = if clen >= 3 { chunk.slice(clen - 3, clen) } else { boundary.slice(if boundary.len() > 3 { boundary.len() - 3 } else { 0 }, boundary.len()) }
+        }
+    }
+    let headers_raw = sb.to_str()
+    let hdr_end = headers_raw.index_of("\r\n\r\n")
+    if hdr_end < 0 { return headers_raw }
+    let header_section = headers_raw.slice(0, hdr_end)
+    let content_length = parse_content_length(header_section)
+    if content_length <= 0 { return headers_raw }
+    let body_start = hdr_end + 4
+    let body_so_far = headers_raw.len() - body_start
+    let mut remaining = content_length - body_so_far
+    while remaining > 0 {
+        let chunk = tcp_read(conn, if remaining > 4096 { 4096 } else { remaining })
+        if chunk.len() == 0 { return sb.to_str() }
+        sb.write(chunk)
+        remaining = remaining - chunk.len()
+    }
+    sb.to_str()
+}
+
+fn dispatch_connection(routes: List[Route], hooks: List[Hook], err_fn: fn(Request, Str) -> Response, conn: Int) -> Int ! IO {
+    let raw = read_http_request(conn)
+    if raw.len() > 0 {
+        let mut req = parse_request(raw)
+
+        let mut hi = 0
+        while hi < hooks.len() {
+            let hook = hooks.get(hi).unwrap()
+            req = hook.process(req)
+            hi = hi + 1
+        }
+
+        let result = match_route_with(routes, req.method, req.url)
+        let mut resp = response_not_found("Not Found")
+        if result.index >= 0 {
+            let matched_req = Request { method: req.method, url: req.url, body: req.body, headers: req.headers, param_names: result.param_names, param_values: result.param_values, timeout_ms: req.timeout_ms }
+            let matched_route = routes.get(result.index).unwrap()
+            resp = matched_route.callback(matched_req)
+        }
+
+        if resp.status <= 0 {
+            resp = err_fn(req, "handler returned invalid response")
+        }
+
+        let text = format_response(resp)
+        tcp_write(conn, text)
+    }
+    tcp_close(conn)
+    0
+}
+
+fn match_route_with(routes: List[Route], method: Str, path: Str) -> MatchResult {
+    let path_parts = split_path(path)
+    let mut i = 0
+    while i < routes.len() {
+        let route = routes.get(i).unwrap()
+        if route.method == method {
+            let names: List[Str] = []
+            let values: List[Str] = []
+            if path_match(route.segments, path_parts, names, values) == 1 {
+                return MatchResult { index: i, param_names: names, param_values: values }
+            }
+        }
+        i = i + 1
+    }
+    MatchResult { index: -1, param_names: [], param_values: [] }
+}
+
+/// Start the server and listen for connections (single-threaded)
+pub fn server_serve(srv: Server) ! Net.Listen, IO {
+    let listen_result = tcp_listen(srv.host, srv.port)
+    if listen_result.is_err() {
+        io.eprintln("Failed to listen on {srv.host}:{srv.port.to_string()}")
+        return
+    }
+    let listener = listen_result.unwrap()
+    io.println("Listening on {srv.host}:{srv.port.to_string()}")
+
+    while 1 == 1 {
+        let accept_result = listener_accept(listener)
+        if accept_result.is_err() {
+            io.eprintln("Accept failed")
+        } else {
+            dispatch_connection(srv.routes, srv.before_hooks, srv.error_handler.on_error, accept_result.unwrap().fd)
+        }
+    }
+}
+
+/// Start the server with concurrent connection handling via threadpool
+pub fn server_serve_async(srv: Server) ! Net.Listen, IO, Async {
+    let listen_result = tcp_listen(srv.host, srv.port)
+    if listen_result.is_err() {
+        io.eprintln("Failed to listen on {srv.host}:{srv.port.to_string()}")
+        return
+    }
+    let listener = listen_result.unwrap()
+    io.println("Listening on {srv.host}:{srv.port.to_string()}")
+
+    let routes = srv.routes
+    let hooks = srv.before_hooks
+    let err_fn = srv.error_handler.on_error
+    let max = srv.max_connections
+
+    if max > 0 {
+        let sem = Channel(max)
+        let mut i = 0
+        while i < max {
+            sem.send(1)
+            i = i + 1
+        }
+        async.scope {
+            while 1 == 1 {
+                sem.recv()
+                let accept_result = listener_accept(listener)
+                if accept_result.is_ok() {
+                    let conn_fd = accept_result.unwrap().fd
+                    async.spawn(fn() {
+                        dispatch_connection(routes, hooks, err_fn, conn_fd)
+                        sem.send(1)
+                    })
+                } else {
+                    sem.send(1)
+                }
+            }
+        }
+    } else {
+        async.scope {
+            while 1 == 1 {
+                let accept_result = listener_accept(listener)
+                if accept_result.is_ok() {
+                    let conn_fd = accept_result.unwrap().fd
+                    async.spawn(fn() {
+                        dispatch_connection(routes, hooks, err_fn, conn_fd)
+                    })
+                }
+            }
+        }
+    }
+}
+
+// ── Helpers ─────────────────────────────────────────────────────────
+
+fn split_path(path: Str) -> List[Str] {
+    let mut parts: List[Str] = []
+    let mut current = ""
+    let mut i = 0
+    while i < path.len() {
+        if path.char_at(i) == 47 {
+            // '/' = 47
+            if current.len() > 0 {
+                parts.push(current)
+                current = ""
+            }
+        } else {
+            current = current.concat(path.substring(i, 1))
+        }
+        i = i + 1
+    }
+    if current.len() > 0 {
+        parts.push(current)
+    }
+    parts
+}

@@ -1,0 +1,3692 @@
+import ast
+import parser
+import diagnostics
+
+effect TypeCheck {
+    effect Register
+    effect Resolve
+    effect Report
+}
+
+// typecheck.bl — Type representation, registries, and type checking
+//
+// Phase 0: Type registries — registers struct/enum/fn/trait types into pools
+// Phase 1: Name resolution — walks function bodies checking identifiers resolve
+// Phase 2: Expression type inference — infers types, checks compatibility
+//
+// The pipeline: lex → parse → typecheck → codegen
+
+// ── Type kind constants ─────────────────────────────────────────────
+let TK_INT = 0
+let TK_FLOAT = 1
+let TK_BOOL = 2
+let TK_STR = 3
+let TK_VOID = 4
+let TK_LIST = 5
+let TK_OPTION = 6
+let TK_RESULT = 7
+let TK_FN = 8
+let TK_STRUCT = 9
+let TK_ENUM = 10
+let TK_TYPEVAR = 11
+let TK_UNKNOWN = 12
+let TK_CLOSURE = 13
+let TK_ITERATOR = 14
+let TK_HANDLE = 15
+let TK_CHANNEL = 16
+let TK_TUPLE = 17
+let TK_MAP = 18
+let TK_BYTES = 19
+let TK_SET = 20
+
+// ── Type pool (parallel arrays) ─────────────────────────────────────
+let mut ty_kind: List[Int] = []
+let mut ty_name: List[Str] = []
+let mut ty_inner1: List[Int] = []
+let mut ty_inner2: List[Int] = []
+let mut ty_params_start: List[Int] = []
+let mut ty_params_count: List[Int] = []
+
+let mut ty_param_list: List[Int] = []
+
+// ── Builtin type indices (populated by init_types) ──────────────────
+let mut TYPE_INT: Int = -1
+let mut TYPE_FLOAT: Int = -1
+let mut TYPE_BOOL: Int = -1
+let mut TYPE_STR: Int = -1
+let mut TYPE_VOID: Int = -1
+let mut TYPE_UNKNOWN: Int = -1
+
+// ── Type registries ─────────────────────────────────────────────────
+let mut named_type_names: List[Str] = []
+let mut named_type_ids: List[Int] = []
+
+let mut sfield_struct_id: List[Int] = []
+let mut sfield_name: List[Str] = []
+let mut sfield_type_id: List[Int] = []
+
+let mut evar_enum_id: List[Int] = []
+let mut evar_name: List[Str] = []
+let mut evar_tag: List[Int] = []
+let mut evar_has_data: List[Int] = []
+
+let mut evfield_var_idx: List[Int] = []
+let mut evfield_name: List[Str] = []
+let mut evfield_type_id: List[Int] = []
+
+let mut named_type_map: Map[Str, Int] = Map()
+let mut fnsig_map: Map[Str, Int] = Map()
+
+let mut fnsig_name: List[Str] = []
+let mut fnsig_ret: List[Int] = []
+let mut fnsig_params_start: List[Int] = []
+let mut fnsig_params_count: List[Int] = []
+let mut fnsig_param_list: List[Int] = []
+let mut fnsig_type_params_start: List[Int] = []
+let mut fnsig_type_params_count: List[Int] = []
+let mut fnsig_type_param_names: List[Str] = []
+
+let mut tc_trait_names: List[Str] = []
+let mut tc_trait_method_names: List[Str] = []
+
+// Trait method signature registry (for contract validation)
+let mut tc_tmsig_trait: List[Str] = []
+let mut tc_tmsig_method: List[Str] = []
+let mut tc_tmsig_param_names: List[Str] = []
+let mut tc_tmsig_params_start: List[Int] = []
+let mut tc_tmsig_params_count: List[Int] = []
+let mut tc_tmsig_ret: List[Str] = []
+let mut tc_trait_tparam_names: List[Str] = []
+let mut tc_trait_tparams_start: List[Int] = []
+let mut tc_trait_tparams_count: List[Int] = []
+
+let mut tc_fn_effects: List[Str] = []
+
+let mut tc_current_fn_ret: Int = -1
+let mut tc_current_fn_name: Str = ""
+
+let mut tc_errors: List[Str] = []
+let mut tc_warnings: List[Str] = []
+
+// ── Import alias maps ──────────────────────────────────────────────
+pub let mut tc_alias_to_original: Map[Str, Str] = Map()
+let mut tc_original_to_alias: Map[Str, Str] = Map()
+
+// ── Inferred type hints (for LSP inlayHint) ─────────────────────────
+pub let mut tc_hint_line: List[Int] = []
+pub let mut tc_hint_col: List[Int] = []
+pub let mut tc_hint_name: List[Str] = []
+pub let mut tc_hint_type: List[Str] = []
+pub let mut tc_hint_module: List[Str] = []
+pub let mut tc_hint_count: Int = 0
+
+// ── Unused import tracking ──────────────────────────────────────────
+let mut tc_symbol_module: Map[Str, Str] = Map()
+let mut tc_used_modules: Map[Str, Int] = Map()
+
+fn tc_mark_symbol_used(name: Str) {
+    if nr_current_module != "" && nr_current_module != "__main__" { return }
+    if tc_symbol_module.has(name) {
+        let mod_name = tc_symbol_module.get(name)
+        if mod_name != "" {
+            tc_used_modules.set(mod_name, 1)
+        }
+    }
+}
+
+pub fn tc_is_module_used(mod_name: Str) -> Int {
+    if tc_used_modules.has(mod_name) {
+        return 1
+    }
+    0
+}
+
+// ── Incremental filter ──────────────────────────────────────────────
+// When enabled, only functions whose names appear in the filter set
+// are typechecked. Used by the incremental recheck engine.
+
+let mut tc_inc_enabled: Int = 0
+let mut tc_inc_filter: Map[Str, Int] = Map()
+
+// ── Type creation ───────────────────────────────────────────────────
+
+fn new_type(kind: Int, name: Str) -> Int {
+    let idx = ty_kind.len()
+    ty_kind.push(kind)
+    ty_name.push(name)
+    ty_inner1.push(-1)
+    ty_inner2.push(-1)
+    ty_params_start.push(-1)
+    ty_params_count.push(0)
+    idx
+}
+
+fn make_list_type(inner: Int) -> Int {
+    let t = new_type(TK_LIST, "List")
+    ty_inner1.set(t, inner)
+    t
+}
+
+fn make_option_type(inner: Int) -> Int {
+    let t = new_type(TK_OPTION, "Option")
+    ty_inner1.set(t, inner)
+    t
+}
+
+fn make_result_type(ok_type: Int, err_type: Int) -> Int {
+    let t = new_type(TK_RESULT, "Result")
+    ty_inner1.set(t, ok_type)
+    ty_inner2.set(t, err_type)
+    t
+}
+
+fn make_fn_type(ret_type: Int, param_types: List[Int]) -> Int {
+    let t = new_type(TK_FN, "Fn")
+    ty_inner1.set(t, ret_type)
+    let start = ty_param_list.len()
+    let mut i = 0
+    while i < param_types.len() {
+        ty_param_list.push(param_types.get(i).unwrap())
+        i = i + 1
+    }
+    ty_params_start.set(t, start)
+    ty_params_count.set(t, param_types.len())
+    t
+}
+
+fn make_typevar(name: Str) -> Int {
+    new_type(TK_TYPEVAR, name)
+}
+
+fn make_tuple_type(elem_types: List[Int]) -> Int {
+    let t = new_type(TK_TUPLE, "Tuple")
+    let start = ty_param_list.len()
+    let mut i = 0
+    while i < elem_types.len() {
+        ty_param_list.push(elem_types.get(i).unwrap())
+        i = i + 1
+    }
+    ty_params_start.set(t, start)
+    ty_params_count.set(t, elem_types.len())
+    t
+}
+
+
+fn make_map_type(key_type: Int, value_type: Int) -> Int {
+    let t = new_type(TK_MAP, "Map")
+    ty_inner1.set(t, key_type)
+    ty_inner2.set(t, value_type)
+    t
+}
+
+fn make_set_type(elem_type: Int) -> Int {
+    let t = new_type(TK_SET, "Set")
+    ty_inner1.set(t, elem_type)
+    t
+}
+
+// ── Type lookup ─────────────────────────────────────────────────────
+
+fn lookup_named_type(name: Str) -> Int {
+    if named_type_map.has(name) != 0 {
+        return named_type_map.get(name)
+    }
+    let dot = name.index_of(".")
+    if dot >= 0 {
+        let bare = name.slice(dot + 1, name.len())
+        let mut resolved = bare
+        if tc_alias_to_original.has(bare) {
+            resolved = tc_alias_to_original.get(bare)
+        }
+        if named_type_map.has(resolved) != 0 {
+            return named_type_map.get(resolved)
+        }
+        if named_type_map.has(bare) != 0 {
+            return named_type_map.get(bare)
+        }
+    }
+    -1
+}
+
+fn resolve_type_name(name: Str) -> Int ! TypeCheck.Resolve {
+    if name == "Int" { return TYPE_INT }
+    if name == "Float" { return TYPE_FLOAT }
+    if name == "Bool" { return TYPE_BOOL }
+    if name == "Str" { return TYPE_STR }
+    if name == "Void" || name == "" { return TYPE_VOID }
+    lookup_named_type(name)
+}
+
+fn get_struct_field_tid(struct_tid: Int, fname: Str) -> Int {
+    let mut i = 0
+    while i < sfield_struct_id.len() {
+        if sfield_struct_id.get(i).unwrap() == struct_tid && sfield_name.get(i).unwrap() == fname {
+            return sfield_type_id.get(i).unwrap()
+        }
+        i = i + 1
+    }
+    -1
+}
+
+fn get_variant_by_name(enum_tid: Int, vname: Str) -> Int {
+    let mut i = 0
+    while i < evar_enum_id.len() {
+        if evar_enum_id.get(i).unwrap() == enum_tid && evar_name.get(i).unwrap() == vname {
+            return i
+        }
+        i = i + 1
+    }
+    -1
+}
+
+fn lookup_fnsig(name: Str) -> Int {
+    if fnsig_map.has(name) != 0 {
+        return fnsig_map.get(name)
+    }
+    -1
+}
+
+fn instantiate_return_type(sig: Int, args_sl: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let ret = fnsig_ret.get(sig).unwrap()
+    if ret < 0 || ret >= ty_kind.len() { return ret }
+    if ty_kind.get(ret).unwrap() != TK_TYPEVAR { return ret }
+
+    let tp_name = ty_name.get(ret).unwrap()
+    let tp_start = fnsig_type_params_start.get(sig).unwrap()
+    let tp_count = fnsig_type_params_count.get(sig).unwrap()
+    let param_start = fnsig_params_start.get(sig).unwrap()
+    let param_count = fnsig_params_count.get(sig).unwrap()
+
+    let mut ti = 0
+    while ti < tp_count {
+        if fnsig_type_param_names.get(tp_start + ti).unwrap() == tp_name {
+            let mut pi = 0
+            while pi < param_count {
+                let ptid = fnsig_param_list.get(param_start + pi).unwrap()
+                if ptid >= 0 && ptid < ty_kind.len() && ty_kind.get(ptid).unwrap() == TK_TYPEVAR && ty_name.get(ptid).unwrap() == tp_name {
+                    if args_sl != -1 && pi < sublist_length(args_sl) {
+                        return infer_type(sublist_get(args_sl, pi))
+                    }
+                }
+                pi = pi + 1
+            }
+        }
+        ti = ti + 1
+    }
+    ret
+}
+
+// ── Error reporting ─────────────────────────────────────────────────
+
+fn tc_error(msg: Str) ! TypeCheck.Report, Diag.Report {
+    tc_errors.push(msg)
+    diag_error_no_loc("TypeError", "E0300", msg, "")
+}
+
+fn tc_error_at(msg: Str, node_id: Int) ! TypeCheck.Report, Diag.Report {
+    tc_errors.push(msg)
+    diag_error_at("TypeError", "E0300", msg, node_id, "")
+}
+
+fn tc_warn(msg: Str) ! TypeCheck.Report {
+    tc_warnings.push(msg)
+}
+
+// ── Incremental filter API ──────────────────────────────────────────
+
+pub fn tc_set_incremental_filter(names: List[Str]) {
+    tc_inc_filter = Map()
+    let mut i = 0
+    while i < names.len() {
+        tc_inc_filter.set(names.get(i).unwrap(), 1)
+        i = i + 1
+    }
+    tc_inc_enabled = 1
+}
+
+pub fn tc_clear_incremental_filter() {
+    tc_inc_filter = Map()
+    tc_inc_enabled = 0
+}
+
+fn tc_should_check_fn(name: Str) -> Int {
+    if tc_inc_enabled == 0 {
+        return 1
+    }
+    tc_inc_filter.has(name)
+}
+
+// ── Type annotation resolution ──────────────────────────────────────
+
+fn resolve_type_ann(ann_node: Int) -> Int ! TypeCheck.Resolve {
+    if ann_node == -1 {
+        return TYPE_UNKNOWN
+    }
+    let name = np_name.get(ann_node).unwrap()
+    let elems_sl = np_elements.get(ann_node).unwrap()
+
+    if name == "List" {
+        if elems_sl != -1 && sublist_length(elems_sl) >= 1 {
+            let inner = resolve_type_ann(sublist_get(elems_sl, 0))
+            return make_list_type(inner)
+        }
+        return make_list_type(TYPE_UNKNOWN)
+    }
+    if name == "Option" {
+        if elems_sl != -1 && sublist_length(elems_sl) >= 1 {
+            let inner = resolve_type_ann(sublist_get(elems_sl, 0))
+            return make_option_type(inner)
+        }
+        return make_option_type(TYPE_UNKNOWN)
+    }
+    if name == "Result" {
+        if elems_sl != -1 && sublist_length(elems_sl) >= 2 {
+            let ok_t = resolve_type_ann(sublist_get(elems_sl, 0))
+            let err_t = resolve_type_ann(sublist_get(elems_sl, 1))
+            return make_result_type(ok_t, err_t)
+        }
+        return make_result_type(TYPE_UNKNOWN, TYPE_UNKNOWN)
+    }
+    if name == "Map" {
+        if elems_sl != -1 && sublist_length(elems_sl) >= 2 {
+            let key_t = resolve_type_ann(sublist_get(elems_sl, 0))
+            let val_t = resolve_type_ann(sublist_get(elems_sl, 1))
+            return make_map_type(key_t, val_t)
+        }
+        return make_map_type(TYPE_UNKNOWN, TYPE_UNKNOWN)
+    }
+    if name == "Set" {
+        if elems_sl != -1 && sublist_length(elems_sl) >= 1 {
+            let elem_t = resolve_type_ann(sublist_get(elems_sl, 0))
+            return make_set_type(elem_t)
+        }
+        return make_set_type(TYPE_UNKNOWN)
+    }
+    if name == "Bytes" {
+        return new_type(TK_BYTES, "Bytes")
+    }
+
+    let resolved = resolve_type_name(name)
+    if resolved != -1 {
+        return resolved
+    }
+
+    make_typevar(name)
+}
+
+// ── Registration from AST ───────────────────────────────────────────
+
+fn register_struct_type(td: Int) ! TypeCheck.Register, TypeCheck.Resolve {
+    let name = np_name.get(td).unwrap()
+    let tid = new_type(TK_STRUCT, name)
+    named_type_names.push(name)
+    named_type_ids.push(tid)
+    named_type_map.set(name, tid)
+
+    let flds_sl = np_fields.get(td).unwrap()
+    if flds_sl != -1 {
+        let mut i = 0
+        while i < sublist_length(flds_sl) {
+            let f = sublist_get(flds_sl, i)
+            let fname = np_name.get(f).unwrap()
+            let ftype_ann = np_value.get(f).unwrap()
+            let ftype_id = resolve_type_ann(ftype_ann)
+            sfield_struct_id.push(tid)
+            sfield_name.push(fname)
+            sfield_type_id.push(ftype_id)
+            let ftype_ann_name = np_name.get(ftype_ann).unwrap()
+            if ftype_ann_name == "Fn" {
+                if is_callable_field_name(fname) == 0 {
+                    nr_callable_field_names.push(fname)
+                }
+            }
+            i = i + 1
+        }
+    }
+}
+
+fn register_enum_type(td: Int) ! TypeCheck.Register, TypeCheck.Resolve {
+    let name = np_name.get(td).unwrap()
+    let tid = new_type(TK_ENUM, name)
+    named_type_names.push(name)
+    named_type_ids.push(tid)
+    named_type_map.set(name, tid)
+
+    let flds_sl = np_fields.get(td).unwrap()
+    if flds_sl != -1 {
+        let mut _tag = 0
+        let mut i = 0
+        while i < sublist_length(flds_sl) {
+            let v = sublist_get(flds_sl, i)
+            let vname = np_name.get(v).unwrap()
+            let var_idx = evar_enum_id.len()
+            evar_enum_id.push(tid)
+            evar_name.push(vname)
+            evar_tag.push(_tag)
+
+            let vflds_sl = np_fields.get(v).unwrap()
+            if vflds_sl != -1 && sublist_length(vflds_sl) > 0 {
+                evar_has_data.push(1)
+                let mut fi = 0
+                while fi < sublist_length(vflds_sl) {
+                    let vf = sublist_get(vflds_sl, fi)
+                    let vf_name = np_name.get(vf).unwrap()
+                    let vf_type_ann = np_value.get(vf).unwrap()
+                    let vf_type_id = resolve_type_ann(vf_type_ann)
+                    evfield_var_idx.push(var_idx)
+                    evfield_name.push(vf_name)
+                    evfield_type_id.push(vf_type_id)
+                    fi = fi + 1
+                }
+            } else {
+                evar_has_data.push(0)
+            }
+
+            _tag = _tag + 1
+            i = i + 1
+        }
+    }
+}
+
+fn register_fn_sig(fn_node: Int) ! TypeCheck.Register, TypeCheck.Resolve {
+    let name = np_name.get(fn_node).unwrap()
+    let ret_str = np_return_type.get(fn_node).unwrap()
+    let ret_ann = np_type_ann.get(fn_node).unwrap()
+    let mut ret_tid = TYPE_VOID
+
+    if ret_ann != -1 {
+        ret_tid = resolve_type_ann(ret_ann)
+    } else if ret_str != "" {
+        ret_tid = resolve_type_name(ret_str)
+        if ret_tid == -1 {
+            ret_tid = TYPE_VOID
+        }
+    }
+
+    let sig_idx = fnsig_name.len()
+    fnsig_name.push(name)
+    fnsig_map.set(name, sig_idx)
+    fnsig_ret.push(ret_tid)
+    let start = fnsig_param_list.len()
+    fnsig_params_start.push(start)
+
+    let params_sl = np_params.get(fn_node).unwrap()
+    let mut count = 0
+    if params_sl != -1 {
+        let mut i = 0
+        while i < sublist_length(params_sl) {
+            let p = sublist_get(params_sl, i)
+            let ptype_str = np_type_name.get(p).unwrap()
+            let ptype_ann = np_type_ann.get(p).unwrap()
+            let mut ptid = TYPE_UNKNOWN
+            if ptype_ann != -1 {
+                ptid = resolve_type_ann(ptype_ann)
+            } else if ptype_str != "" {
+                ptid = resolve_type_name(ptype_str)
+                if ptid == -1 {
+                    ptid = TYPE_UNKNOWN
+                }
+            }
+            fnsig_param_list.push(ptid)
+            count = count + 1
+            i = i + 1
+        }
+    }
+    fnsig_params_count.push(count)
+
+    let tparams_sl = np_type_params.get(fn_node).unwrap()
+    let tp_start = fnsig_type_param_names.len()
+    let mut tp_count = 0
+    if tparams_sl != -1 {
+        let mut ti = 0
+        while ti < sublist_length(tparams_sl) {
+            let tp = sublist_get(tparams_sl, ti)
+            fnsig_type_param_names.push(np_name.get(tp).unwrap())
+            tp_count = tp_count + 1
+            ti = ti + 1
+        }
+    }
+    fnsig_type_params_start.push(tp_start)
+    fnsig_type_params_count.push(tp_count)
+
+    let effects_sl = np_effects.get(fn_node).unwrap()
+    let mut effs = ""
+    if effects_sl != -1 {
+        let mut ei = 0
+        while ei < sublist_length(effects_sl) {
+            let eff = sublist_get(effects_sl, ei)
+            if ei > 0 {
+                effs = effs.concat(",")
+            }
+            effs = effs.concat(np_name.get(eff).unwrap())
+            ei = ei + 1
+        }
+    }
+    tc_fn_effects.push(effs)
+}
+
+fn is_valid_ptr_inner(name: Str) -> Int {
+    if name == "Void" { return 1 }
+    if name == "U8" || name == "U16" || name == "U32" || name == "U64" { return 1 }
+    if name == "I8" || name == "I16" || name == "I32" || name == "I64" { return 1 }
+    if name == "Int" || name == "Float" || name == "Ptr" { return 1 }
+    0
+}
+
+fn check_ptr_in_type_ann(ann_node: Int, has_ffi: Int) ! Diag.Report {
+    if ann_node == -1 { return }
+    let name = np_name.get(ann_node).unwrap()
+    if name == "Ptr" {
+        if has_ffi == 0 {
+            diag_error_at("PtrOutsideFFI", "E0811", "Ptr[T] type can only be used in @ffi functions or @trusted blocks", ann_node, "add @ffi annotation to the function or wrap usage in @trusted")
+        }
+        let elems_sl = np_elements.get(ann_node).unwrap()
+        if elems_sl != -1 && sublist_length(elems_sl) > 0 {
+            let inner = sublist_get(elems_sl, 0)
+            let inner_name = np_name.get(inner).unwrap()
+            if is_valid_ptr_inner(inner_name) == 0 {
+                diag_error_at("InvalidPtrType", "E0810", "invalid Ptr type parameter '{inner_name}' — only Void, U8-U64, I8-I64, Int, Float, Ptr are allowed", inner, "use a valid FFI-compatible type")
+            }
+        }
+        return
+    }
+    let elems_sl = np_elements.get(ann_node).unwrap()
+    if elems_sl != -1 {
+        let mut i = 0
+        while i < sublist_length(elems_sl) {
+            check_ptr_in_type_ann(sublist_get(elems_sl, i), has_ffi)
+            i = i + 1
+        }
+    }
+}
+
+fn check_ptr_in_type_name(type_name: Str, node: Int, has_ffi: Int) ! Diag.Report {
+    if type_name == "Ptr" && has_ffi == 0 {
+        diag_error_at("PtrOutsideFFI", "E0811", "Ptr[T] type can only be used in @ffi functions or @trusted blocks", node, "add @ffi annotation to the function or wrap usage in @trusted")
+    }
+}
+
+fn validate_ffi_fn(fn_node: Int) ! Diag.Report {
+    let name = np_name.get(fn_node).unwrap()
+    let ffi_node = get_annotation(fn_node, "ffi")
+    let has_ffi = if ffi_node != -1 { 1 } else { 0 }
+    let has_trusted = has_annotation(fn_node, "trusted")
+    let requires_node = get_annotation(fn_node, "requires")
+    let has_requires = if requires_node != -1 { 1 } else { 0 }
+    let ensures_node = get_annotation(fn_node, "ensures")
+    let has_ensures = if ensures_node != -1 { 1 } else { 0 }
+
+    if has_ffi != 0 {
+        if np_is_pub.get(fn_node).unwrap() != 0 {
+            diag_error_at("PubFFI", "E0801", "FFI function '{name}' must not be pub — FFI functions are unsafe and should be wrapped", ffi_node, "remove 'pub' or wrap the FFI call in a safe public function")
+        }
+        let effects_sl = np_effects.get(fn_node).unwrap()
+        if effects_sl == -1 || sublist_length(effects_sl) == 0 {
+            diag_error_at("FFINoEffects", "E0802", "FFI function '{name}' must declare effects — FFI calls are side-effectful", ffi_node, "add '! FFI' or appropriate effects to the function signature")
+        }
+        if has_requires != 0 {
+            diag_error_at("ContractOnFFI", "E0803", "@requires cannot be used on FFI function '{name}' — contracts cannot verify foreign code", requires_node, "remove @requires from the FFI function")
+        }
+        if has_ensures != 0 {
+            diag_error_at("ContractOnFFI", "E0803", "@ensures cannot be used on FFI function '{name}' — contracts cannot verify foreign code", ensures_node, "remove @ensures from the FFI function")
+        }
+        if has_trusted == 0 {
+            diag_warn_at("UnauditedFFI", "W0800", "FFI function '{name}' is not marked @trusted — consider auditing and adding @trusted", ffi_node, "add @trusted after auditing the foreign function")
+        }
+    }
+
+    // Check Ptr[T] in parameter types
+    let params_sl = np_params.get(fn_node).unwrap()
+    if params_sl != -1 {
+        let mut pi = 0
+        while pi < sublist_length(params_sl) {
+            let p = sublist_get(params_sl, pi)
+            let ptype_ann = np_type_ann.get(p).unwrap()
+            if ptype_ann != -1 {
+                check_ptr_in_type_ann(ptype_ann, has_ffi)
+            } else {
+                check_ptr_in_type_name(np_type_name.get(p).unwrap(), p, has_ffi)
+            }
+            pi = pi + 1
+        }
+    }
+
+    // Check Ptr[T] in return type
+    let ret_ann = np_type_ann.get(fn_node).unwrap()
+    if ret_ann != -1 {
+        check_ptr_in_type_ann(ret_ann, has_ffi)
+    } else {
+        let ret_str = np_return_type.get(fn_node).unwrap()
+        if ret_str == "Ptr" && has_ffi == 0 {
+            diag_error_at("PtrOutsideFFI", "E0811", "Ptr[T] type can only be used in @ffi functions or @trusted blocks", fn_node, "add @ffi annotation to the function or wrap usage in @trusted")
+        }
+    }
+}
+
+fn budget_effect_satisfies(budget_eff: Str, fn_eff: Str) -> Int {
+    if budget_eff == fn_eff { return 1 }
+    if fn_eff.starts_with(budget_eff.concat(".")) { return 1 }
+    0
+}
+
+fn validate_capabilities_budget(program: Int, fns_sl: Int) ! Diag.Report {
+    let cap_node = get_annotation(program, "capabilities")
+    if cap_node == -1 { return }
+    let mut budget_names: List[Str] = []
+    let ann_args_sl = np_args.get(cap_node).unwrap()
+    if ann_args_sl != -1 {
+        let mut ai = 0
+        while ai < sublist_length(ann_args_sl) {
+            let arg_nd = sublist_get(ann_args_sl, ai)
+            budget_names.push(np_name.get(arg_nd).unwrap())
+            ai = ai + 1
+        }
+    }
+    if fns_sl == -1 { return }
+    let mut fi = 0
+    while fi < sublist_length(fns_sl) {
+        let fn_node = sublist_get(fns_sl, fi)
+        let fn_name = np_name.get(fn_node).unwrap()
+        let fn_mod = np_module.get(fn_node).unwrap()
+        if fn_name != "main" && !fn_name.starts_with("__test_") && (fn_mod == "__main__") {
+            let sig = lookup_fnsig(fn_name)
+            if sig != -1 && sig < tc_fn_effects.len() {
+                let effs_str = tc_fn_effects.get(sig).unwrap()
+                if effs_str != "" {
+                    let effs = effs_str.split(",")
+                    let mut ei = 0
+                    while ei < effs.len() {
+                        let eff = effs.get(ei).unwrap()
+                        let mut allowed = 0
+                        let mut bi = 0
+                        while bi < budget_names.len() {
+                            if budget_effect_satisfies(budget_names.get(bi).unwrap(), eff) != 0 {
+                                allowed = 1
+                            }
+                            bi = bi + 1
+                        }
+                        if allowed == 0 {
+                            diag_error_at("CapabilityBudgetExceeded", "E0501", "function '{fn_name}' uses effect '{eff}' which is not in @capabilities budget", fn_node, "add '{eff}' to @capabilities")
+                        }
+                        ei = ei + 1
+                    }
+                }
+            }
+        }
+        fi = fi + 1
+    }
+}
+
+fn tc_get_fn_effects(name: Str) -> Option[Str] {
+    let sig = lookup_fnsig(name)
+    if sig == -1 { return None }
+    if sig >= tc_fn_effects.len() { return None }
+    Some(tc_fn_effects.get(sig).unwrap())
+}
+
+fn register_trait(tr_node: Int) ! TypeCheck.Register {
+    let name = np_name.get(tr_node).unwrap()
+    tc_trait_names.push(name)
+    // Collect trait-level type params (e.g., T in trait From[T])
+    let tparams_sl = np_type_params.get(tr_node).unwrap()
+    let tp_start = tc_trait_tparam_names.len()
+    let mut tp_count = 0
+    if tparams_sl != -1 {
+        let mut ti = 0
+        while ti < sublist_length(tparams_sl) {
+            let tp = sublist_get(tparams_sl, ti)
+            tc_trait_tparam_names.push(np_name.get(tp).unwrap())
+            tp_count = tp_count + 1
+            ti = ti + 1
+        }
+    }
+    let methods_sl = np_methods.get(tr_node).unwrap()
+    if methods_sl != -1 {
+        let mut i = 0
+        while i < sublist_length(methods_sl) {
+            let m = sublist_get(methods_sl, i)
+            let mname = np_name.get(m).unwrap()
+            tc_trait_method_names.push("{name}.{mname}")
+            // Store method signature for contract validation
+            tc_tmsig_trait.push(name)
+            tc_tmsig_method.push(mname)
+            tc_tmsig_ret.push(np_return_type.get(m).unwrap())
+            tc_trait_tparams_start.push(tp_start)
+            tc_trait_tparams_count.push(tp_count)
+            let p_start = tc_tmsig_param_names.len()
+            let params_sl = np_params.get(m).unwrap()
+            let mut p_count = 0
+            if params_sl != -1 {
+                let mut j = 0
+                while j < sublist_length(params_sl) {
+                    let p = sublist_get(params_sl, j)
+                    tc_tmsig_param_names.push(np_type_name.get(p).unwrap())
+                    p_count = p_count + 1
+                    j = j + 1
+                }
+            }
+            tc_tmsig_params_start.push(p_start)
+            tc_tmsig_params_count.push(p_count)
+            i = i + 1
+        }
+    }
+}
+
+fn subst_trait_type(type_str: Str, impl_type: Str, tmsig_idx: Int, impl_node: Int) -> Str {
+    if type_str == "Self" { return impl_type }
+    let tp_start = tc_trait_tparams_start.get(tmsig_idx).unwrap()
+    let tp_count = tc_trait_tparams_count.get(tmsig_idx).unwrap()
+    if tp_count > 0 {
+        let impl_targs_sl = np_type_params.get(impl_node).unwrap()
+        let mut k = 0
+        while k < tp_count {
+            let tp_name = tc_trait_tparam_names.get(tp_start + k).unwrap()
+            if type_str == tp_name {
+                if impl_targs_sl != -1 && k < sublist_length(impl_targs_sl) {
+                    return np_name.get(sublist_get(impl_targs_sl, k)).unwrap()
+                }
+            }
+            k = k + 1
+        }
+    }
+    type_str
+}
+
+fn validate_trait_impls(program: Int) ! TypeCheck.Register, Diag.Report {
+    let impls_sl = np_methods.get(program).unwrap()
+    if impls_sl == -1 { return }
+    let mut ii = 0
+    while ii < sublist_length(impls_sl) {
+        let im = sublist_get(impls_sl, ii)
+        let trait_name = np_trait_name.get(im).unwrap()
+        let impl_type = np_name.get(im).unwrap()
+        if is_trait_name(trait_name) == 0 {
+            diag_error_at("TraitContract", "E0904", "trait '{trait_name}' is not defined", im, "check the trait name or define 'trait {trait_name} \{ ... }'")
+            ii = ii + 1
+            continue
+        }
+        // Check each trait method signature against this impl
+        let impl_methods_sl = np_methods.get(im).unwrap()
+        let mut si = 0
+        while si < tc_tmsig_trait.len() {
+            if tc_tmsig_trait.get(si).unwrap() == trait_name {
+                let expected_method = tc_tmsig_method.get(si).unwrap()
+                let mut found = 0
+                let mut mi = 0
+                if impl_methods_sl != -1 {
+                    while mi < sublist_length(impl_methods_sl) {
+                        let impl_m = sublist_get(impl_methods_sl, mi)
+                        if np_name.get(impl_m).unwrap() == expected_method {
+                            found = 1
+                            // Check arity
+                            let trait_pcount = tc_tmsig_params_count.get(si).unwrap()
+                            let impl_params_sl = np_params.get(impl_m).unwrap()
+                            let mut impl_pcount = 0
+                            if impl_params_sl != -1 {
+                                impl_pcount = sublist_length(impl_params_sl)
+                            }
+                            if trait_pcount != impl_pcount {
+                                diag_error_at("TraitContract", "E0901", "method '{expected_method}' in impl {trait_name} for {impl_type} has {impl_pcount} params, expected {trait_pcount}", impl_m, "trait requires {trait_pcount} parameters (including self)")
+                            } else {
+                                // Check param types
+                                let tp_start = tc_tmsig_params_start.get(si).unwrap()
+                                let mut pi = 0
+                                while pi < trait_pcount {
+                                    let trait_ptype = tc_tmsig_param_names.get(tp_start + pi).unwrap()
+                                    if trait_ptype != "" {
+                                        let impl_p = sublist_get(impl_params_sl, pi)
+                                        let raw_impl_ptype = np_type_name.get(impl_p).unwrap()
+                                        let impl_ptype = if raw_impl_ptype == "Self" { impl_type } else { raw_impl_ptype }
+                                        let expected_type = subst_trait_type(trait_ptype, impl_type, si, im)
+                                        if impl_ptype != expected_type {
+                                            diag_error_at("TraitContract", "E0902", "method '{expected_method}' param has type '{impl_ptype}', expected '{expected_type}'", impl_p, "change type to '{expected_type}' to match trait {trait_name}")
+                                        }
+                                    }
+                                    pi = pi + 1
+                                }
+                                // Check return type
+                                let trait_ret = tc_tmsig_ret.get(si).unwrap()
+                                if trait_ret != "" {
+                                    let raw_impl_ret = np_return_type.get(impl_m).unwrap()
+                                    let impl_ret = if raw_impl_ret == "Self" { impl_type } else { raw_impl_ret }
+                                    let expected_ret = subst_trait_type(trait_ret, impl_type, si, im)
+                                    if impl_ret != expected_ret {
+                                        diag_error_at("TraitContract", "E0903", "method '{expected_method}' returns '{impl_ret}', expected '{expected_ret}'", impl_m, "change return type to '{expected_ret}' to match trait {trait_name}")
+                                    }
+                                }
+                            }
+                            break
+                        }
+                        mi = mi + 1
+                    }
+                }
+                if found == 0 {
+                    diag_error_at("TraitContract", "E0900", "impl {trait_name} for {impl_type} is missing method '{expected_method}'", im, "add 'fn {expected_method}(...)' to the impl block")
+                }
+            }
+            si = si + 1
+        }
+        ii = ii + 1
+    }
+}
+
+// ── Main entry point ────────────────────────────────────────────────
+
+fn init_types() ! TypeCheck.Register {
+    ty_kind.clear()
+    ty_name.clear()
+    ty_inner1.clear()
+    ty_inner2.clear()
+    ty_params_start.clear()
+    ty_params_count.clear()
+    ty_param_list.clear()
+    named_type_names.clear()
+    named_type_ids.clear()
+    named_type_map.clear()
+    sfield_struct_id.clear()
+    sfield_name.clear()
+    sfield_type_id.clear()
+    nr_callable_field_names.clear()
+    evar_enum_id.clear()
+    evar_name.clear()
+    evar_tag.clear()
+    evar_has_data.clear()
+    evfield_var_idx.clear()
+    evfield_name.clear()
+    evfield_type_id.clear()
+    fnsig_name.clear()
+    fnsig_map.clear()
+    fnsig_ret.clear()
+    fnsig_params_start.clear()
+    fnsig_params_count.clear()
+    fnsig_param_list.clear()
+    fnsig_type_params_start.clear()
+    fnsig_type_params_count.clear()
+    fnsig_type_param_names.clear()
+    tc_trait_names.clear()
+    tc_trait_method_names.clear()
+    tc_tmsig_trait.clear()
+    tc_tmsig_method.clear()
+    tc_tmsig_param_names.clear()
+    tc_tmsig_params_start.clear()
+    tc_tmsig_params_count.clear()
+    tc_tmsig_ret.clear()
+    tc_trait_tparam_names.clear()
+    tc_trait_tparams_start.clear()
+    tc_trait_tparams_count.clear()
+    tc_fn_effects.clear()
+    tc_current_fn_ret = -1
+    tc_current_fn_name = ""
+    tc_errors.clear()
+    tc_warnings.clear()
+    tc_symbol_module.clear()
+    tc_used_modules.clear()
+    tc_hint_line.clear()
+    tc_hint_col.clear()
+    tc_hint_name.clear()
+    tc_hint_type.clear()
+    tc_hint_module.clear()
+    tc_hint_count = 0
+    tc_build_import_map()
+
+    TYPE_INT = new_type(TK_INT, "Int")
+    TYPE_FLOAT = new_type(TK_FLOAT, "Float")
+    TYPE_BOOL = new_type(TK_BOOL, "Bool")
+    TYPE_STR = new_type(TK_STR, "Str")
+    TYPE_VOID = new_type(TK_VOID, "Void")
+    TYPE_UNKNOWN = new_type(TK_UNKNOWN, "?")
+}
+
+pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
+    if trace_mode != "" { trace("typecheck", "start") }
+    init_types()
+
+    // Register all type definitions (structs and enums)
+    let types_sl = np_fields.get(program).unwrap()
+    if types_sl != -1 {
+        let mut i = 0
+        while i < sublist_length(types_sl) {
+            let td = sublist_get(types_sl, i)
+            let td_flds = np_fields.get(td).unwrap()
+            let mut is_enum = 0
+            if td_flds != -1 && sublist_length(td_flds) > 0 {
+                if np_kind.get(sublist_get(td_flds, 0)).unwrap() == NodeKind.TypeVariant {
+                    is_enum = 1
+                }
+            }
+            if is_enum != 0 {
+                register_enum_type(td)
+            } else {
+                register_struct_type(td)
+            }
+            i = i + 1
+        }
+    }
+
+    // Register all function signatures
+    let fns_sl = np_params.get(program).unwrap()
+    if fns_sl != -1 {
+        let mut i = 0
+        while i < sublist_length(fns_sl) {
+            register_fn_sig(sublist_get(fns_sl, i))
+            i = i + 1
+        }
+    }
+
+    // Validate FFI annotations and Ptr[T] usage
+    if fns_sl != -1 {
+        let mut i = 0
+        while i < sublist_length(fns_sl) {
+            validate_ffi_fn(sublist_get(fns_sl, i))
+            i = i + 1
+        }
+    }
+
+    validate_capabilities_budget(program, fns_sl)
+
+    // Build symbol-to-module map for unused import detection
+    if types_sl != -1 {
+        let mut i = 0
+        while i < sublist_length(types_sl) {
+            let td = sublist_get(types_sl, i)
+            let mod_name = np_module.get(td).unwrap()
+            if mod_name != "" && mod_name != "__main__" {
+                tc_symbol_module.set(np_name.get(td).unwrap(), mod_name)
+                let td_flds = np_fields.get(td).unwrap()
+                if td_flds != -1 {
+                    let mut j = 0
+                    while j < sublist_length(td_flds) {
+                        let fld = sublist_get(td_flds, j)
+                        if np_kind.get(fld).unwrap() == NodeKind.TypeVariant {
+                            tc_symbol_module.set(np_name.get(fld).unwrap(), mod_name)
+                        }
+                        j = j + 1
+                    }
+                }
+            }
+            i = i + 1
+        }
+    }
+    if fns_sl != -1 {
+        let mut i = 0
+        while i < sublist_length(fns_sl) {
+            let fn_node = sublist_get(fns_sl, i)
+            let mod_name = np_module.get(fn_node).unwrap()
+            if mod_name != "" && mod_name != "__main__" {
+                let fn_sym_name = np_name.get(fn_node).unwrap()
+                tc_symbol_module.set(fn_sym_name, mod_name)
+                if tc_original_to_alias.has(fn_sym_name) {
+                    tc_symbol_module.set(tc_original_to_alias.get(fn_sym_name), mod_name)
+                }
+            }
+            i = i + 1
+        }
+    }
+    let lets_sl_sym = np_stmts.get(program).unwrap()
+    if lets_sl_sym != -1 {
+        let mut i = 0
+        while i < sublist_length(lets_sl_sym) {
+            let l = sublist_get(lets_sl_sym, i)
+            let mod_name = np_module.get(l).unwrap()
+            if mod_name != "" && mod_name != "__main__" {
+                tc_symbol_module.set(np_name.get(l).unwrap(), mod_name)
+            }
+            i = i + 1
+        }
+    }
+
+    // Register traits
+    let traits_sl = np_arms.get(program).unwrap()
+    if traits_sl != -1 {
+        let mut i = 0
+        while i < sublist_length(traits_sl) {
+            register_trait(sublist_get(traits_sl, i))
+            i = i + 1
+        }
+    }
+    // Register builtin trait names (handled specially in codegen, no AST nodes)
+    tc_trait_names.push("From")
+    tc_trait_names.push("TryFrom")
+    tc_trait_names.push("Into")
+    tc_trait_names.push("Iterator")
+    tc_trait_names.push("IntoIterator")
+
+    // Register impl method signatures
+    let impls_sl = np_methods.get(program).unwrap()
+    if impls_sl != -1 {
+        let mut i = 0
+        while i < sublist_length(impls_sl) {
+            let im = sublist_get(impls_sl, i)
+            let impl_type = np_name.get(im).unwrap()
+            let methods_sl = np_methods.get(im).unwrap()
+            if methods_sl != -1 {
+                let mut j = 0
+                while j < sublist_length(methods_sl) {
+                    let m = sublist_get(methods_sl, j)
+                    let orig_name = np_name.get(m).unwrap()
+                    np_name.set(m, "{impl_type}_{orig_name}")
+                    register_fn_sig(m)
+                    np_name.set(m, orig_name)
+                    j = j + 1
+                }
+            }
+            i = i + 1
+        }
+    }
+
+    // Validate trait impl contracts
+    validate_trait_impls(program)
+
+    // Register user-defined effect handle names
+    tc_ue_handles = []
+    let effects_decl_sl = np_args.get(program).unwrap()
+    if effects_decl_sl != -1 {
+        let mut ei = 0
+        while ei < sublist_length(effects_decl_sl) {
+            let ed = sublist_get(effects_decl_sl, ei)
+            let eff_name = np_name.get(ed).unwrap()
+            let mut handle = ""
+            let mut hi = 0
+            while hi < eff_name.len() {
+                let ch = eff_name.char_at(hi)
+                if ch == 65 { handle = handle.concat("a") }
+                else if ch == 66 { handle = handle.concat("b") }
+                else if ch == 67 { handle = handle.concat("c") }
+                else if ch == 68 { handle = handle.concat("d") }
+                else if ch == 69 { handle = handle.concat("e") }
+                else if ch == 70 { handle = handle.concat("f") }
+                else if ch == 71 { handle = handle.concat("g") }
+                else if ch == 72 { handle = handle.concat("h") }
+                else if ch == 73 { handle = handle.concat("i") }
+                else if ch == 74 { handle = handle.concat("j") }
+                else if ch == 75 { handle = handle.concat("k") }
+                else if ch == 76 { handle = handle.concat("l") }
+                else if ch == 77 { handle = handle.concat("m") }
+                else if ch == 78 { handle = handle.concat("n") }
+                else if ch == 79 { handle = handle.concat("o") }
+                else if ch == 80 { handle = handle.concat("p") }
+                else if ch == 81 { handle = handle.concat("q") }
+                else if ch == 82 { handle = handle.concat("r") }
+                else if ch == 83 { handle = handle.concat("s") }
+                else if ch == 84 { handle = handle.concat("t") }
+                else if ch == 85 { handle = handle.concat("u") }
+                else if ch == 86 { handle = handle.concat("v") }
+                else if ch == 87 { handle = handle.concat("w") }
+                else if ch == 88 { handle = handle.concat("x") }
+                else if ch == 89 { handle = handle.concat("y") }
+                else if ch == 90 { handle = handle.concat("z") }
+                else { handle = handle.concat(eff_name.substring(hi, 1)) }
+                hi = hi + 1
+            }
+            register_ue_handle(handle)
+            ei = ei + 1
+        }
+    }
+
+    // Build symbol-to-module map (continued): impls, traits, effects
+    if impls_sl != -1 {
+        let mut i = 0
+        while i < sublist_length(impls_sl) {
+            let im = sublist_get(impls_sl, i)
+            let mod_name = np_module.get(im).unwrap()
+            if mod_name != "" && mod_name != "__main__" {
+                let impl_type = np_name.get(im).unwrap()
+                tc_symbol_module.set(impl_type, mod_name)
+                let methods_sl_sym = np_methods.get(im).unwrap()
+                if methods_sl_sym != -1 {
+                    let mut j = 0
+                    while j < sublist_length(methods_sl_sym) {
+                        let m = sublist_get(methods_sl_sym, j)
+                        tc_symbol_module.set("{impl_type}_{np_name.get(m).unwrap()}", mod_name)
+                        j = j + 1
+                    }
+                }
+            }
+            i = i + 1
+        }
+    }
+    if traits_sl != -1 {
+        let mut i = 0
+        while i < sublist_length(traits_sl) {
+            let tr = sublist_get(traits_sl, i)
+            let mod_name = np_module.get(tr).unwrap()
+            if mod_name != "" && mod_name != "__main__" {
+                tc_symbol_module.set(np_name.get(tr).unwrap(), mod_name)
+            }
+            i = i + 1
+        }
+    }
+    let effects_sl_sym = np_args.get(program).unwrap()
+    if effects_sl_sym != -1 {
+        let mut i = 0
+        while i < sublist_length(effects_sl_sym) {
+            let ed = sublist_get(effects_sl_sym, i)
+            let mod_name = np_module.get(ed).unwrap()
+            if mod_name != "" && mod_name != "__main__" {
+                tc_symbol_module.set(np_name.get(ed).unwrap(), mod_name)
+            }
+            i = i + 1
+        }
+    }
+
+    // Remap tc_symbol_module for pub import re-exports
+    tc_apply_reexport_remapping()
+
+    // Phase 1: Name resolution
+    resolve_names(program)
+    nr_warn_unused = 0
+
+    // Phase 2: Expression type inference
+    tc_infer_program(program)
+
+    if trace_mode != "" { trace("typecheck", "done ({tc_errors.len()} errors)") }
+    tc_errors.len()
+}
+
+// ── User-effect handle name tracking ────────────────────────────────
+
+let mut tc_ue_handles: List[Str] = []
+
+fn register_ue_handle(name: Str) {
+    tc_ue_handles.push(name)
+}
+
+fn is_user_effect_handle_name(name: Str) -> Int {
+    let mut i = 0
+    while i < tc_ue_handles.len() {
+        if tc_ue_handles.get(i).unwrap() == name {
+            return 1
+        }
+        i = i + 1
+    }
+    0
+}
+
+// ── Selective import filtering ──────────────────────────────────────
+pub let mut tc_import_modules: List[Str] = []
+pub let mut tc_import_nodes: List[Int] = []
+let mut tc_module_import_node: Map[Str, Int] = Map()
+
+// ── Pub import re-export tracking ──────────────────────────────────
+// Key: "reexporting_mod:item_name" → source module name (selective re-exports)
+// Key: "reexporting_mod:*:source_mod" → source module name (wildcard re-exports)
+pub let mut tc_reexport_source: Map[Str, Str] = Map()
+pub let mut tc_reexport_modules: Map[Str, Int] = Map()
+
+fn tc_apply_reexport_remapping() {
+    let keys = tc_reexport_source.keys()
+    let mut i = 0
+    while i < keys.len() {
+        let key = keys.get(i).unwrap()
+        let colon_idx = key.index_of(":")
+        if colon_idx > 0 {
+            let reexporter = key.substring(0, colon_idx)
+            let rest = key.substring(colon_idx + 1, key.len() - colon_idx - 1)
+            if rest.starts_with("*:") {
+                let source_mod = rest.substring(2, rest.len() - 2)
+                let sym_keys = tc_symbol_module.keys()
+                let mut si = 0
+                while si < sym_keys.len() {
+                    let sym = sym_keys.get(si).unwrap()
+                    if tc_symbol_module.get(sym) == source_mod {
+                        tc_symbol_module.set(sym, reexporter)
+                    }
+                    si = si + 1
+                }
+            } else {
+                let item_name = rest
+                if tc_symbol_module.has(item_name) {
+                    let source_mod = tc_reexport_source.get(key)
+                    if tc_symbol_module.get(item_name) == source_mod {
+                        tc_symbol_module.set(item_name, reexporter)
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+}
+
+fn tc_build_import_map() {
+    tc_module_import_node = Map()
+    tc_alias_to_original = Map()
+    tc_original_to_alias = Map()
+    let mut i = 0
+    while i < tc_import_modules.len() {
+        let mod_key = tc_import_modules.get(i).unwrap()
+        let node_id = tc_import_nodes.get(i).unwrap()
+        if node_id != -1 {
+            tc_module_import_node.set(mod_key, node_id)
+            let names_sl = np_args.get(node_id).unwrap()
+            if names_sl != -1 {
+                let mut j = 0
+                while j < sublist_length(names_sl) {
+                    let name_node = sublist_get(names_sl, j)
+                    let alias = np_str_val.get(name_node).unwrap()
+                    if alias != "" {
+                        let original = np_name.get(name_node).unwrap()
+                        tc_alias_to_original.set(alias, original)
+                        tc_original_to_alias.set(original, alias)
+                    }
+                    j = j + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+}
+
+fn is_filtered_import(name: Str, mod_name: Str) -> Int {
+    if tc_module_import_node.has(mod_name) {
+        return is_selected_import(name, tc_module_import_node.get(mod_name)) == 0
+    }
+    0
+}
+
+fn is_selected_import(name: Str, imp_node: Int) -> Int {
+    let names_sl = np_args.get(imp_node).unwrap()
+    if names_sl == -1 { return 1 }
+    let mut i = 0
+    while i < sublist_length(names_sl) {
+        let name_node = sublist_get(names_sl, i)
+        if np_name.get(name_node).unwrap() == name { return 1 }
+        let alias = np_str_val.get(name_node).unwrap()
+        if alias != "" && alias == name { return 1 }
+        i = i + 1
+    }
+    0
+}
+
+pub fn is_import_module_name(name: Str) -> Int {
+    if tc_module_import_node.has(name) { return 1 }
+    let mut i = 0
+    while i < tc_import_modules.len() {
+        if tc_import_modules.get(i).unwrap() == name {
+            return 1
+        }
+        i = i + 1
+    }
+    0
+}
+
+// ── Import visibility ───────────────────────────────────────────────
+
+let mut nr_private_imports: Map[Str, Str] = Map()
+let mut nr_current_module: Str = ""
+let mut nr_name_source_module: Map[Str, Str] = Map()
+
+fn nr_check_ambiguity(name: Str, mod_name: Str, local_names: Map[Str, Int]) ! Diag.Report {
+    if mod_name == "" || mod_name == "__main__" { return }
+    if nr_private_imports.has(name) { return }
+    if local_names.has(name) { return }
+    if nr_name_source_module.has(name) {
+        let existing_mod = nr_name_source_module.get(name)
+        if existing_mod != mod_name && existing_mod != "__main__" {
+            diag_error_no_loc("AmbiguousImport", "E1005", "name '{name}' is ambiguous — imported from both '{existing_mod}' and '{mod_name}'", "use selective imports to disambiguate, e.g. import {existing_mod}.\{name}")
+        }
+    } else {
+        nr_name_source_module.set(name, mod_name)
+    }
+}
+
+fn is_private_access(name: Str) -> Int {
+    if nr_private_imports.has(name) == 0 { return 0 }
+    let mods = nr_private_imports.get(name)
+    if mods.contains("|{nr_current_module}|") != 0 { return 0 }
+    1
+}
+
+fn nr_register_private(name: Str, mod_name: Str) {
+    if nr_private_imports.has(name) != 0 {
+        let prev = nr_private_imports.get(name)
+        nr_private_imports.set(name, "{prev}{mod_name}|")
+    } else {
+        nr_private_imports.set(name, "|{mod_name}|")
+    }
+}
+
+// ── Name resolution scope ───────────────────────────────────────────
+
+let mut nr_scope_names: List[Str] = []
+let mut nr_scope_muts: List[Int] = []
+let mut nr_scope_types: List[Int] = []
+let mut nr_scope_reads: List[Int] = []
+let mut nr_scope_writes: List[Int] = []
+let mut nr_scope_nodes: List[Int] = []
+let mut nr_scope_frames: List[Int] = []
+let mut nr_scope_depth: Int = 0
+let mut nr_loop_depth: Int = 0
+let mut nr_warn_unused: Int = 0
+
+fn nr_push_scope() {
+    nr_scope_frames.push(nr_scope_names.len())
+    nr_scope_depth = nr_scope_depth + 1
+}
+
+fn nr_pop_scope() ! Diag.Report {
+    if nr_scope_frames.len() == 0 {
+        return
+    }
+    let start = nr_scope_frames.get(nr_scope_frames.len() - 1).unwrap()
+    nr_scope_frames.pop()
+    // Emit unused variable warnings for locals (depth > 1 = inside a function)
+    if nr_warn_unused != 0 && nr_scope_depth > 1 {
+        let mut i = nr_scope_names.len() - 1
+        while i >= start {
+            let vname = nr_scope_names.get(i).unwrap()
+            if nr_scope_reads.get(i).unwrap() == 0 && vname.len() > 0 && vname.char_at(0) != 95 {
+                let nd = nr_scope_nodes.get(i).unwrap()
+                if nd != -1 {
+                    if nr_scope_writes.get(i).unwrap() > 1 {
+                        diag_warn_at("SetButNotRead", "W0601", "variable '{vname}' is assigned a value that is never read", nd, "remove the unused assignment, or prefix with '_' to suppress")
+                    } else {
+                        diag_warn_at("UnusedVariable", "W0600", "variable '{vname}' is never read", nd, "prefix with '_' to suppress this warning")
+                    }
+                }
+            }
+            i = i - 1
+        }
+    }
+    while nr_scope_names.len() > start {
+        nr_scope_names.pop()
+        nr_scope_muts.pop()
+        nr_scope_types.pop()
+        nr_scope_reads.pop()
+        nr_scope_writes.pop()
+        nr_scope_nodes.pop()
+    }
+    nr_scope_depth = nr_scope_depth - 1
+}
+
+fn nr_define(name: Str) {
+    nr_scope_names.push(name)
+    nr_scope_muts.push(0)
+    nr_scope_types.push(TYPE_UNKNOWN)
+    nr_scope_reads.push(0)
+    nr_scope_writes.push(1)
+    nr_scope_nodes.push(-1)
+}
+
+fn nr_check_shadow(name: Str, node: Int) ! Diag.Report {
+    if nr_warn_unused == 0 { return }
+    if name.len() == 0 { return }
+    if name.char_at(0) == 95 { return }
+    if nr_scope_depth <= 1 { return }
+    if nr_scope_frames.len() == 0 { return }
+    let frame_start = nr_scope_frames.get(nr_scope_frames.len() - 1).unwrap()
+    let mut i = 0
+    while i < frame_start {
+        if nr_scope_names.get(i).unwrap() == name {
+            diag_warn_at("ShadowedVariable", "W0603", "variable '{name}' shadows a variable from an outer scope", node, "rename the variable or prefix with '_' to suppress")
+            return
+        }
+        i = i + 1
+    }
+}
+
+fn nr_define_at(name: Str, node: Int) ! Diag.Report {
+    if node != -1 && nr_current_module != "" {
+        np_module.set(node, nr_current_module)
+    }
+    nr_check_shadow(name, node)
+    nr_scope_names.push(name)
+    nr_scope_muts.push(0)
+    nr_scope_types.push(TYPE_UNKNOWN)
+    nr_scope_reads.push(0)
+    nr_scope_writes.push(1)
+    nr_scope_nodes.push(node)
+}
+
+fn nr_define_mut(name: Str, is_mut: Int) {
+    nr_scope_names.push(name)
+    nr_scope_muts.push(is_mut)
+    nr_scope_types.push(TYPE_UNKNOWN)
+    nr_scope_reads.push(0)
+    nr_scope_writes.push(1)
+    nr_scope_nodes.push(-1)
+}
+
+fn nr_define_mut_at(name: Str, is_mut: Int, node: Int) ! Diag.Report {
+    if node != -1 && nr_current_module != "" {
+        np_module.set(node, nr_current_module)
+    }
+    nr_check_shadow(name, node)
+    nr_scope_names.push(name)
+    nr_scope_muts.push(is_mut)
+    nr_scope_types.push(TYPE_UNKNOWN)
+    nr_scope_reads.push(0)
+    nr_scope_writes.push(1)
+    nr_scope_nodes.push(node)
+}
+
+fn nr_define_typed(name: Str, is_mut: Int, tid: Int) {
+    nr_scope_names.push(name)
+    nr_scope_muts.push(is_mut)
+    nr_scope_types.push(tid)
+    nr_scope_reads.push(0)
+    nr_scope_writes.push(1)
+    nr_scope_nodes.push(-1)
+}
+
+fn nr_is_defined(name: Str) -> Int {
+    let mut i = nr_scope_names.len() - 1
+    while i >= 0 {
+        if nr_scope_names.get(i).unwrap() == name {
+            nr_scope_reads.set(i, 1)
+            return 1
+        }
+        i = i - 1
+    }
+    0
+}
+
+fn nr_is_mut(name: Str) -> Int {
+    let mut i = nr_scope_names.len() - 1
+    while i >= 0 {
+        if nr_scope_names.get(i).unwrap() == name {
+            return nr_scope_muts.get(i).unwrap()
+        }
+        i = i - 1
+    }
+    0
+}
+
+fn nr_mark_written(name: Str, _node: Int) ! Diag.Report {
+    let mut _fn_frame_start = 0
+    if nr_scope_frames.len() > 1 {
+        _fn_frame_start = nr_scope_frames.get(1).unwrap()
+    }
+    let mut i = nr_scope_names.len() - 1
+    while i >= 0 {
+        if nr_scope_names.get(i).unwrap() == name {
+            if nr_loop_depth == 0 {
+                nr_scope_reads.set(i, 0)
+            }
+            nr_scope_writes.set(i, nr_scope_writes.get(i).unwrap() + 1)
+            return
+        }
+        i = i - 1
+    }
+}
+
+fn nr_get_type(name: Str) -> Int {
+    let mut i = nr_scope_names.len() - 1
+    while i >= 0 {
+        if nr_scope_names.get(i).unwrap() == name {
+            return nr_scope_types.get(i).unwrap()
+        }
+        i = i - 1
+    }
+    TYPE_UNKNOWN
+}
+
+fn is_builtin_fn(name: Str) -> Int {
+    if name == "arg_count" { return 1 }
+    if name == "get_arg" { return 1 }
+    if name == "read_file" { return 1 }
+    if name == "write_file" { return 1 }
+    if name == "file_exists" { return 1 }
+    if name == "shell_exec" { return 1 }
+    if name == "exit" { return 1 }
+    if name == "is_dir" { return 1 }
+    if name == "get_env" { return 1 }
+    if name == "time_ms" { return 1 }
+    if name == "Some" { return 1 }
+    if name == "None" { return 1 }
+    if name == "Ok" { return 1 }
+    if name == "Err" { return 1 }
+    if name == "assert" { return 1 }
+    if name == "assert_eq" { return 1 }
+    if name == "assert_ne" { return 1 }
+    if name == "debug_assert" { return 1 }
+    if name == "Map" { return 1 }
+    if name == "Set" { return 1 }
+    if name == "Bytes" { return 1 }
+    if name == "Channel" { return 1 }
+    if name == "StringBuilder" { return 1 }
+    if name == "unix_socket_listen" { return 1 }
+    if name == "unix_socket_connect" { return 1 }
+    if name == "unix_socket_accept" { return 1 }
+    if name == "unix_socket_accept_timeout" { return 1 }
+    if name == "unix_socket_close" { return 1 }
+    if name == "socket_read_line" { return 1 }
+    if name == "socket_write" { return 1 }
+    if name == "file_mtime" { return 1 }
+    if name == "getpid" { return 1 }
+    if name == "process_run" { return 1 }
+    if name == "process_run_with_stdin" { return 1 }
+    if name == "process_exec" { return 1 }
+    if name == "alloc_ptr" { return 1 }
+    if name == "null_ptr" { return 1 }
+    if name == "ffi_scope" { return 1 }
+    0
+}
+
+fn is_builtin_method(name: Str) -> Int {
+    // String methods
+    if name == "len" { return 1 }
+    if name == "contains" { return 1 }
+    if name == "starts_with" { return 1 }
+    if name == "ends_with" { return 1 }
+    if name == "concat" { return 1 }
+    if name == "slice" { return 1 }
+    if name == "to_int" { return 1 }
+    if name == "split" { return 1 }
+    if name == "char_at" { return 1 }
+    if name == "charAt" { return 1 }
+    if name == "substring" { return 1 }
+    if name == "substr" { return 1 }
+    if name == "index_of" { return 1 }
+    if name == "trim" { return 1 }
+    if name == "to_lower" { return 1 }
+    if name == "to_upper" { return 1 }
+    if name == "replace" { return 1 }
+    if name == "as_cstr" { return 1 }
+    if name == "lines" { return 1 }
+    if name == "parse_float" { return 1 }
+    if name == "parse_int" { return 1 }
+    // List methods
+    if name == "push" { return 1 }
+    if name == "pop" { return 1 }
+    if name == "get" { return 1 }
+    if name == "set" { return 1 }
+    if name == "join" { return 1 }
+    if name == "clear" { return 1 }
+    // Iterator methods
+    if name == "map" { return 1 }
+    if name == "filter" { return 1 }
+    if name == "collect" { return 1 }
+    if name == "count" { return 1 }
+    if name == "for_each" { return 1 }
+    if name == "any" { return 1 }
+    if name == "all" { return 1 }
+    if name == "find" { return 1 }
+    if name == "fold" { return 1 }
+    if name == "take" { return 1 }
+    if name == "skip" { return 1 }
+    if name == "chain" { return 1 }
+    if name == "flat_map" { return 1 }
+    if name == "enumerate" { return 1 }
+    if name == "zip" { return 1 }
+    // Map methods
+    if name == "has" { return 1 }
+    if name == "remove" { return 1 }
+    if name == "clear" { return 1 }
+    if name == "keys" { return 1 }
+    if name == "values" { return 1 }
+    // Set methods
+    if name == "insert" { return 1 }
+    if name == "union" { return 1 }
+    // Ptr methods
+    if name == "deref" { return 1 }
+    if name == "is_null" { return 1 }
+    if name == "addr" { return 1 }
+    // FFI scope methods
+    if name == "alloc" { return 1 }
+    if name == "cstr" { return 1 }
+    // Bytes methods
+    if name == "is_empty" { return 1 }
+    if name == "to_str" { return 1 }
+    if name == "to_hex" { return 1 }
+    if name == "from_str" { return 1 }
+    if name == "from_code_point" { return 1 }
+    // Effect handle methods (io, fs, net, time, async, env)
+    if name == "println" { return 1 }
+    if name == "print" { return 1 }
+    if name == "eprintln" { return 1 }
+    if name == "eprint" { return 1 }
+    if name == "log" { return 1 }
+    if name == "read" { return 1 }
+    if name == "write" { return 1 }
+    if name == "list_dir" { return 1 }
+    if name == "args" { return 1 }
+    if name == "sleep" { return 1 }
+    if name == "spawn" { return 1 }
+    // Net methods
+    if name == "request" { return 1 }
+    if name == "listen" { return 1 }
+    if name == "accept" { return 1 }
+    if name == "read_line" { return 1 }
+    if name == "read_n" { return 1 }
+    if name == "read_bytes" { return 1 }
+    if name == "write_bytes" { return 1 }
+    if name == "write_line" { return 1 }
+    if name == "close" { return 1 }
+    if name == "post" { return 1 }
+    if name == "put" { return 1 }
+    if name == "patch" { return 1 }
+    if name == "head" { return 1 }
+    if name == "delete" { return 1 }
+    // Channel methods
+    if name == "send" { return 1 }
+    if name == "recv" { return 1 }
+    // Conversion methods
+    if name == "into" { return 1 }
+    if name == "to_float" { return 1 }
+    if name == "to_string" { return 1 }
+    if name == "from" { return 1 }
+    if name == "try_from" { return 1 }
+    // Int methods
+    if name == "abs" { return 1 }
+    if name == "min" { return 1 }
+    if name == "max" { return 1 }
+    // Option methods
+    if name == "unwrap" { return 1 }
+    if name == "is_some" { return 1 }
+    if name == "is_none" { return 1 }
+    // Result methods
+    if name == "unwrap_err" { return 1 }
+    if name == "is_ok" { return 1 }
+    if name == "is_err" { return 1 }
+    // Instant methods
+    if name == "elapsed" { return 1 }
+    if name == "since" { return 1 }
+    if name == "add" { return 1 }
+    if name == "to_rfc3339" { return 1 }
+    if name == "to_unix_ms" { return 1 }
+    if name == "to_unix_secs" { return 1 }
+    // Duration static constructors
+    if name == "nanos" { return 1 }
+    if name == "ms" { return 1 }
+    if name == "seconds" { return 1 }
+    if name == "minutes" { return 1 }
+    if name == "hours" { return 1 }
+    // Duration methods
+    if name == "to_ms" { return 1 }
+    if name == "to_seconds" { return 1 }
+    if name == "to_nanos" { return 1 }
+    if name == "sub" { return 1 }
+    if name == "scale" { return 1 }
+    if name == "is_zero" { return 1 }
+    // StringBuilder methods
+    if name == "clear" { return 1 }
+    // Bytes/Instant static constructors
+    if name == "new" { return 1 }
+    if name == "from_epoch_secs" { return 1 }
+    0
+}
+
+fn get_builtin_fn_ret(name: Str) -> Int {
+    if name == "arg_count" { return TYPE_INT }
+    if name == "get_arg" { return TYPE_STR }
+    if name == "read_file" { return TYPE_STR }
+    if name == "write_file" { return TYPE_VOID }
+    if name == "file_exists" { return TYPE_INT }
+    if name == "shell_exec" { return TYPE_INT }
+    if name == "exit" { return TYPE_VOID }
+    if name == "is_dir" { return TYPE_INT }
+    if name == "get_env" { return make_option_type(TYPE_STR) }
+    if name == "time_ms" { return TYPE_INT }
+    if name == "assert" { return TYPE_VOID }
+    if name == "assert_eq" { return TYPE_VOID }
+    if name == "assert_ne" { return TYPE_VOID }
+    if name == "debug_assert" { return TYPE_VOID }
+    if name == "unix_socket_listen" { return TYPE_INT }
+    if name == "unix_socket_connect" { return TYPE_INT }
+    if name == "unix_socket_accept" { return TYPE_INT }
+    if name == "unix_socket_accept_timeout" { return TYPE_INT }
+    if name == "unix_socket_close" { return TYPE_VOID }
+    if name == "socket_read_line" { return TYPE_STR }
+    if name == "socket_write" { return TYPE_VOID }
+    if name == "file_mtime" { return TYPE_INT }
+    if name == "getpid" { return TYPE_INT }
+    if name == "process_run" { return TYPE_VOID }
+    if name == "process_run_with_stdin" { return TYPE_VOID }
+    if name == "process_exec" { return TYPE_VOID }
+    if name == "Bytes" { return new_type(TK_BYTES, "Bytes") }
+    if name == "Map" { return make_map_type(TYPE_UNKNOWN, TYPE_UNKNOWN) }
+    if name == "Set" { return make_set_type(TYPE_UNKNOWN) }
+    TYPE_UNKNOWN
+}
+
+fn is_variant_name(name: Str) -> Int {
+    let mut i = 0
+    while i < evar_name.len() {
+        if evar_name.get(i).unwrap() == name {
+            return 1
+        }
+        i = i + 1
+    }
+    0
+}
+
+fn get_variant_enum_tid(name: Str) -> Int {
+    let mut i = 0
+    while i < evar_name.len() {
+        if evar_name.get(i).unwrap() == name {
+            return evar_enum_id.get(i).unwrap()
+        }
+        i = i + 1
+    }
+    TYPE_UNKNOWN
+}
+
+fn is_trait_name(name: Str) -> Int {
+    let mut i = 0
+    while i < tc_trait_names.len() {
+        if tc_trait_names.get(i).unwrap() == name {
+            return 1
+        }
+        i = i + 1
+    }
+    0
+}
+
+fn is_known_type(name: Str) -> Int {
+    if name == "Int" || name == "Float" || name == "Bool" || name == "Str" { return 1 }
+    if name == "Void" || name == "List" || name == "Option" || name == "Result" { return 1 }
+    if name == "Iterator" || name == "Handle" || name == "Channel" || name == "Map" || name == "Set" || name == "Bytes" || name == "Instant" || name == "Duration" || name == "Char" || name == "StringBuilder" { return 1 }
+    if name == "Ptr" || name == "U8" || name == "U16" || name == "U32" || name == "U64" || name == "I8" || name == "I16" || name == "I32" || name == "I64" { return 1 }
+    if name == "Fn" || name == "Self" || name == "Tuple" { return 1 }
+    if lookup_named_type(name) != -1 { return 1 }
+    0
+}
+
+// Impl method registry for name resolution
+let mut nr_impl_type_names: List[Str] = []
+let mut nr_impl_method_names: List[Str] = []
+let mut nr_callable_field_names: List[Str] = []
+
+fn is_callable_field_name(name: Str) -> Int {
+    let mut i = 0
+    while i < nr_callable_field_names.len() {
+        if nr_callable_field_names.get(i).unwrap() == name { return 1 }
+        i = i + 1
+    }
+    0
+}
+
+fn nr_has_impl_method(type_name: Str, method: Str) -> Int {
+    let mut i = 0
+    while i < nr_impl_type_names.len() {
+        if nr_impl_type_names.get(i).unwrap() == type_name && nr_impl_method_names.get(i).unwrap() == method {
+            return 1
+        }
+        i = i + 1
+    }
+    0
+}
+
+// ── Name resolution walker ──────────────────────────────────────────
+
+fn resolve_names(program: Int) ! TypeCheck.Resolve, Diag.Report {
+    nr_scope_names = []
+    nr_scope_muts = []
+    nr_scope_types = []
+    nr_scope_reads = []
+    nr_scope_writes = []
+    nr_scope_nodes = []
+    nr_scope_frames = []
+    nr_scope_depth = 0
+    nr_loop_depth = 0
+    nr_warn_unused = 1
+    nr_impl_type_names = []
+    nr_impl_method_names = []
+    nr_private_imports = Map()
+    nr_name_source_module = Map()
+    nr_push_scope()
+
+    // Build private import set: imported non-pub fns, types, lets
+    // A name is private only if no pub definition exists for it
+    let mut nr_pub_names: Map[Str, Int] = Map()
+
+    // First pass: collect all pub imported names
+    // Items that are pub but excluded by selective imports are treated as private
+    let fns_sl_priv = np_params.get(program).unwrap()
+    if fns_sl_priv != -1 {
+        let mut i = 0
+        while i < sublist_length(fns_sl_priv) {
+            let fn_node = sublist_get(fns_sl_priv, i)
+            let fn_mod = np_module.get(fn_node).unwrap()
+            if fn_mod != "" && np_is_pub.get(fn_node).unwrap() != 0 {
+                let fn_name = np_name.get(fn_node).unwrap()
+                if is_filtered_import(fn_name, fn_mod) == 0 {
+                    nr_pub_names.set(fn_name, 1)
+                }
+            }
+            i = i + 1
+        }
+    }
+    let types_sl_priv = np_fields.get(program).unwrap()
+    if types_sl_priv != -1 {
+        let mut i = 0
+        while i < sublist_length(types_sl_priv) {
+            let td = sublist_get(types_sl_priv, i)
+            let td_mod = np_module.get(td).unwrap()
+            if td_mod != "" && np_is_pub.get(td).unwrap() != 0 {
+                let td_name = np_name.get(td).unwrap()
+                if is_filtered_import(td_name, td_mod) == 0 {
+                    nr_pub_names.set(td_name, 1)
+                    let td_flds = np_fields.get(td).unwrap()
+                    if td_flds != -1 && sublist_length(td_flds) > 0 {
+                        if np_kind.get(sublist_get(td_flds, 0)).unwrap() == NodeKind.TypeVariant {
+                            let mut vi = 0
+                            while vi < sublist_length(td_flds) {
+                                nr_pub_names.set(np_name.get(sublist_get(td_flds, vi)).unwrap(), 1)
+                                vi = vi + 1
+                            }
+                        }
+                    }
+                }
+            }
+            i = i + 1
+        }
+    }
+    let traits_sl_priv = np_arms.get(program).unwrap()
+    if traits_sl_priv != -1 {
+        let mut i = 0
+        while i < sublist_length(traits_sl_priv) {
+            let tr = sublist_get(traits_sl_priv, i)
+            let tr_mod = np_module.get(tr).unwrap()
+            if tr_mod != "" && np_is_pub.get(tr).unwrap() != 0 {
+                let tr_name = np_name.get(tr).unwrap()
+                if is_filtered_import(tr_name, tr_mod) == 0 {
+                    nr_pub_names.set(tr_name, 1)
+                }
+            }
+            i = i + 1
+        }
+    }
+    let lets_sl_priv = np_stmts.get(program).unwrap()
+    if lets_sl_priv != -1 {
+        let mut i = 0
+        while i < sublist_length(lets_sl_priv) {
+            let l = sublist_get(lets_sl_priv, i)
+            let l_mod = np_module.get(l).unwrap()
+            if l_mod != "" && np_is_pub.get(l).unwrap() != 0 {
+                let l_name = np_name.get(l).unwrap()
+                if is_filtered_import(l_name, l_mod) == 0 {
+                    nr_pub_names.set(l_name, 1)
+                }
+            }
+            i = i + 1
+        }
+    }
+
+    // Second pass: register private names (skip if a pub version exists)
+    // Value format: "|mod1|mod2|" so contains("|modX|") works for same-module check
+    if fns_sl_priv != -1 {
+        let mut i = 0
+        while i < sublist_length(fns_sl_priv) {
+            let fn_node = sublist_get(fns_sl_priv, i)
+            let fn_name = np_name.get(fn_node).unwrap()
+            let mod_name = np_module.get(fn_node).unwrap()
+            if mod_name != "" && np_is_pub.get(fn_node).unwrap() == 0 && nr_pub_names.has(fn_name) == 0 {
+                nr_register_private(fn_name, mod_name)
+            }
+            i = i + 1
+        }
+    }
+    if types_sl_priv != -1 {
+        let mut i = 0
+        while i < sublist_length(types_sl_priv) {
+            let td = sublist_get(types_sl_priv, i)
+            let td_name = np_name.get(td).unwrap()
+            let mod_name = np_module.get(td).unwrap()
+            if mod_name != "" && np_is_pub.get(td).unwrap() == 0 && nr_pub_names.has(td_name) == 0 {
+                nr_register_private(td_name, mod_name)
+                let td_flds = np_fields.get(td).unwrap()
+                if td_flds != -1 && sublist_length(td_flds) > 0 {
+                    if np_kind.get(sublist_get(td_flds, 0)).unwrap() == NodeKind.TypeVariant {
+                        let mut vi = 0
+                        while vi < sublist_length(td_flds) {
+                            let vname = np_name.get(sublist_get(td_flds, vi)).unwrap()
+                            if nr_pub_names.has(vname) == 0 {
+                                nr_register_private(vname, mod_name)
+                            }
+                            vi = vi + 1
+                        }
+                    }
+                }
+            }
+            i = i + 1
+        }
+    }
+    if traits_sl_priv != -1 {
+        let mut i = 0
+        while i < sublist_length(traits_sl_priv) {
+            let tr = sublist_get(traits_sl_priv, i)
+            let tr_name = np_name.get(tr).unwrap()
+            let mod_name = np_module.get(tr).unwrap()
+            if mod_name != "" && np_is_pub.get(tr).unwrap() == 0 && nr_pub_names.has(tr_name) == 0 {
+                nr_register_private(tr_name, mod_name)
+            }
+            i = i + 1
+        }
+    }
+    if lets_sl_priv != -1 {
+        let mut i = 0
+        while i < sublist_length(lets_sl_priv) {
+            let l = sublist_get(lets_sl_priv, i)
+            let l_name = np_name.get(l).unwrap()
+            let mod_name = np_module.get(l).unwrap()
+            if mod_name != "" && np_is_pub.get(l).unwrap() == 0 && nr_pub_names.has(l_name) == 0 {
+                nr_register_private(l_name, mod_name)
+            }
+            i = i + 1
+        }
+    }
+
+    // Pre-collect __main__ names to suppress ambiguity when local defs shadow
+    let mut main_names: Map[Str, Int] = Map()
+    let pre_fns = np_params.get(program).unwrap()
+    if pre_fns != -1 {
+        let mut i = 0
+        while i < sublist_length(pre_fns) {
+            let fn_node = sublist_get(pre_fns, i)
+            if np_module.get(fn_node).unwrap() == "__main__" {
+                main_names.set(np_name.get(fn_node).unwrap(), 1)
+            }
+            i = i + 1
+        }
+    }
+    let pre_lets = np_stmts.get(program).unwrap()
+    if pre_lets != -1 {
+        let mut i = 0
+        while i < sublist_length(pre_lets) {
+            let l = sublist_get(pre_lets, i)
+            if np_module.get(l).unwrap() == "__main__" {
+                main_names.set(np_name.get(l).unwrap(), 1)
+            }
+            i = i + 1
+        }
+    }
+
+    // Register all top-level let binding names
+    let lets_sl = np_stmts.get(program).unwrap()
+    if lets_sl != -1 {
+        let mut i = 0
+        while i < sublist_length(lets_sl) {
+            let l = sublist_get(lets_sl, i)
+            let l_name = np_name.get(l).unwrap()
+            let l_mod = np_module.get(l).unwrap()
+            if l_mod != "" && l_mod != "__main__" && is_filtered_import(l_name, l_mod) != 0 {
+                i = i + 1
+                continue
+            }
+            if l_mod != "__main__" && tc_original_to_alias.has(l_name) {
+                let alias = tc_original_to_alias.get(l_name)
+                nr_check_ambiguity(alias, l_mod, main_names)
+                nr_define(alias)
+                nr_register_private(l_name, l_mod)
+            } else {
+                nr_check_ambiguity(l_name, l_mod, main_names)
+                nr_define(l_name)
+            }
+            i = i + 1
+        }
+    }
+
+    // Register all function names in scope
+    let fns_sl = np_params.get(program).unwrap()
+    if fns_sl != -1 {
+        let mut i = 0
+        while i < sublist_length(fns_sl) {
+            let fn_node = sublist_get(fns_sl, i)
+            let fn_name = np_name.get(fn_node).unwrap()
+            let fn_mod = np_module.get(fn_node).unwrap()
+            if fn_mod != "" && fn_mod != "__main__" && is_filtered_import(fn_name, fn_mod) != 0 {
+                i = i + 1
+                continue
+            }
+            if fn_mod != "__main__" && tc_original_to_alias.has(fn_name) {
+                let alias = tc_original_to_alias.get(fn_name)
+                nr_check_ambiguity(alias, fn_mod, main_names)
+                nr_define(alias)
+                nr_register_private(fn_name, fn_mod)
+            } else {
+                nr_check_ambiguity(fn_name, fn_mod, main_names)
+                nr_define(fn_name)
+            }
+            i = i + 1
+        }
+    }
+
+    // Register impl methods for method call resolution
+    let impls_sl = np_methods.get(program).unwrap()
+    if impls_sl != -1 {
+        let mut i = 0
+        while i < sublist_length(impls_sl) {
+            let im = sublist_get(impls_sl, i)
+            let impl_type = np_name.get(im).unwrap()
+            let methods_sl = np_methods.get(im).unwrap()
+            if methods_sl != -1 {
+                let mut j = 0
+                while j < sublist_length(methods_sl) {
+                    let m = sublist_get(methods_sl, j)
+                    nr_impl_type_names.push(impl_type)
+                    nr_impl_method_names.push(np_name.get(m).unwrap())
+                    j = j + 1
+                }
+            }
+            i = i + 1
+        }
+    }
+
+    // Walk each function body
+    if fns_sl != -1 {
+        let mut i = 0
+        while i < sublist_length(fns_sl) {
+            let fn_node = sublist_get(fns_sl, i)
+            nr_current_module = np_module.get(fn_node).unwrap()
+            nr_check_fn(fn_node)
+            i = i + 1
+        }
+    }
+
+    // Walk each impl method body
+    if impls_sl != -1 {
+        let mut i = 0
+        while i < sublist_length(impls_sl) {
+            let im = sublist_get(impls_sl, i)
+            nr_current_module = np_module.get(im).unwrap()
+            let methods_sl = np_methods.get(im).unwrap()
+            if methods_sl != -1 {
+                let mut j = 0
+                while j < sublist_length(methods_sl) {
+                    nr_check_fn(sublist_get(methods_sl, j))
+                    j = j + 1
+                }
+            }
+            i = i + 1
+        }
+    }
+
+    // Walk test block bodies for unused import detection
+    let tests_sl = np_captures.get(program).unwrap()
+    if tests_sl != -1 {
+        nr_current_module = "__main__"
+        let mut i = 0
+        while i < sublist_length(tests_sl) {
+            let tb = sublist_get(tests_sl, i)
+            let tbody = np_body.get(tb).unwrap()
+            if tbody != -1 {
+                nr_check_node(tbody)
+            }
+            i = i + 1
+        }
+    }
+
+    nr_pop_scope()
+}
+
+fn nr_check_fn(fn_node: Int) ! TypeCheck.Resolve, Diag.Report {
+    nr_push_scope()
+    let nr_is_ffi = has_annotation(fn_node, "ffi")
+    let params_sl = np_params.get(fn_node).unwrap()
+    if params_sl != -1 && nr_is_ffi == 0 {
+        let mut i = 0
+        while i < sublist_length(params_sl) {
+            let p = sublist_get(params_sl, i)
+            nr_define_at(np_name.get(p).unwrap(), p)
+            let ptype_ann = np_type_ann.get(p).unwrap()
+            if ptype_ann != -1 {
+                nr_check_type_ann_visibility(ptype_ann)
+            } else {
+                nr_check_type_ref(np_type_name.get(p).unwrap())
+            }
+            i = i + 1
+        }
+    }
+    let ret_ann = np_type_ann.get(fn_node).unwrap()
+    if ret_ann != -1 {
+        nr_check_type_ann_visibility(ret_ann)
+    } else {
+        let ret_str = np_return_type.get(fn_node).unwrap()
+        if ret_str != "" {
+            nr_check_type_ref(ret_str)
+        }
+    }
+    if nr_is_ffi == 0 {
+        let body = np_body.get(fn_node).unwrap()
+        if body != -1 {
+            nr_check_node(body)
+        }
+    }
+    nr_pop_scope()
+}
+
+fn nr_check_type_ann_visibility(ann_node: Int) ! TypeCheck.Resolve, Diag.Report {
+    if ann_node == -1 { return }
+    let name = np_name.get(ann_node).unwrap()
+    nr_check_type_ref(name)
+    let elems_sl = np_elements.get(ann_node).unwrap()
+    if elems_sl != -1 {
+        let mut i = 0
+        while i < sublist_length(elems_sl) {
+            nr_check_type_ann_visibility(sublist_get(elems_sl, i))
+            i = i + 1
+        }
+    }
+}
+
+fn nr_check_type_ref(name: Str) ! TypeCheck.Resolve, Diag.Report {
+    if name == "" { return }
+    if name.len() == 1 { return }
+    if is_known_type(name) != 0 {
+        if is_private_access(name) != 0 {
+            tc_errors.push("cannot access private type '{name}'")
+            diag_error_no_loc("PrivateItemAccess", "E1003", "cannot access private type '{name}' from another module", "mark the type as 'pub' in its module")
+            return
+        }
+        tc_mark_symbol_used(name)
+        return
+    }
+    if is_trait_name(name) != 0 {
+        if is_private_access(name) != 0 {
+            tc_errors.push("cannot access private trait '{name}'")
+            diag_error_no_loc("PrivateItemAccess", "E1003", "cannot access private trait '{name}' from another module", "mark the trait as 'pub' in its module")
+            return
+        }
+        tc_mark_symbol_used(name)
+        return
+    }
+    tc_errors.push("unknown type '{name}'")
+    diag_error_no_loc("UnknownType", "E0507", "unknown type '{name}'", "")
+}
+
+fn nr_check_node(node: Int) ! TypeCheck.Resolve, Diag.Report {
+    if node == -1 { return }
+    let kind = np_kind.get(node).unwrap()
+
+    if kind == NodeKind.Block {
+        nr_push_scope()
+        let stmts_sl = np_stmts.get(node).unwrap()
+        if stmts_sl != -1 {
+            let mut i = 0
+            while i < sublist_length(stmts_sl) {
+                nr_check_node(sublist_get(stmts_sl, i))
+                i = i + 1
+            }
+        }
+        nr_pop_scope()
+        return
+    }
+
+    if kind == NodeKind.LetBinding {
+        let val = np_value.get(node).unwrap()
+        if val != -1 {
+            nr_check_node(val)
+        }
+        let let_type_ann = np_target.get(node).unwrap()
+        if let_type_ann != -1 {
+            nr_check_type_ann_visibility(let_type_ann)
+        }
+        let let_is_mut = np_is_mut.get(node).unwrap()
+        nr_define_mut_at(np_name.get(node).unwrap(), let_is_mut, node)
+        let let_pat_sl = np_elements.get(node).unwrap()
+        if let_pat_sl != -1 {
+            let let_elems_sl = np_elements.get(let_pat_sl).unwrap()
+            if let_elems_sl != -1 {
+                let mut pi = 0
+                while pi < sublist_length(let_elems_sl) {
+                    let sp = sublist_get(let_elems_sl, pi)
+                    nr_define_mut_at(np_name.get(sp).unwrap(), let_is_mut, sp)
+                    pi = pi + 1
+                }
+            }
+        }
+        return
+    }
+
+    if kind == NodeKind.Assignment || kind == NodeKind.CompoundAssign {
+        let assign_target = np_target.get(node).unwrap()
+        nr_check_node(np_value.get(node).unwrap())
+        if assign_target != -1 && np_kind.get(assign_target).unwrap() == NodeKind.Ident {
+            let assign_name = np_name.get(assign_target).unwrap()
+            if kind == NodeKind.CompoundAssign {
+                nr_check_node(assign_target)
+            }
+            nr_mark_written(assign_name, node)
+        } else {
+            nr_check_node(assign_target)
+        }
+        return
+    }
+
+    if kind == NodeKind.ExprStmt {
+        nr_check_node(np_value.get(node).unwrap())
+        return
+    }
+
+    if kind == NodeKind.Return {
+        nr_check_node(np_value.get(node).unwrap())
+        return
+    }
+
+    if kind == NodeKind.Ident {
+        let name = np_name.get(node).unwrap()
+        if name == "true" || name == "false" || name == "None" { return }
+        if nr_is_defined(name) != 0 {
+            if is_private_access(name) != 0 {
+                tc_errors.push("cannot access private item '{name}'")
+                diag_error_at("PrivateItemAccess", "E1003", "cannot access private item '{name}' from another module", node, "mark the item as 'pub' in its module")
+                return
+            }
+            tc_mark_symbol_used(name)
+            return
+        }
+        if name == "io" || name == "fs" || name == "net" || name == "db" || name == "env" || name == "time" || name == "async" || name == "channel" || name == "default" { return }
+        if is_user_effect_handle_name(name) != 0 { return }
+        if is_variant_name(name) != 0 {
+            if is_private_access(name) != 0 {
+                tc_errors.push("cannot access private variant '{name}'")
+                diag_error_at("PrivateItemAccess", "E1003", "cannot access private variant '{name}' from another module", node, "mark the enum as 'pub' in its module")
+                return
+            }
+            tc_mark_symbol_used(name)
+            return
+        }
+        if is_builtin_fn(name) != 0 { return }
+        if is_known_type(name) != 0 {
+            if is_private_access(name) != 0 {
+                tc_errors.push("cannot access private type '{name}'")
+                diag_error_at("PrivateItemAccess", "E1003", "cannot access private type '{name}' from another module", node, "mark the type as 'pub' in its module")
+                return
+            }
+            tc_mark_symbol_used(name)
+            return
+        }
+        if is_trait_name(name) != 0 {
+            if is_private_access(name) != 0 {
+                tc_errors.push("cannot access private trait '{name}'")
+                diag_error_at("PrivateItemAccess", "E1003", "cannot access private trait '{name}' from another module", node, "mark the trait as 'pub' in its module")
+                return
+            }
+            tc_mark_symbol_used(name)
+            return
+        }
+        if is_import_module_name(name) != 0 { return }
+        tc_errors.push("undefined variable '{name}'")
+        diag_error_at("UndefinedVariable", "E0506", "undefined variable '{name}'", node, "")
+        return
+    }
+
+    if kind == NodeKind.IntLit || kind == NodeKind.FloatLit || kind == NodeKind.BoolLit {
+        return
+    }
+
+    if kind == NodeKind.InterpString {
+        let elems_sl = np_elements.get(node).unwrap()
+        if elems_sl != -1 {
+            let mut i = 0
+            while i < sublist_length(elems_sl) {
+                let part = sublist_get(elems_sl, i)
+                let pk = np_kind.get(part).unwrap()
+                if pk == NodeKind.Ident && np_str_val.get(part).unwrap() == np_name.get(part).unwrap() {
+                    // Simple interpolation like {var} — mark as read but skip full check
+                    let iname = np_name.get(part).unwrap()
+                    if nr_is_defined(iname) != 0 {
+                        let _skip = 0
+                    }
+                } else {
+                    nr_check_node(part)
+                }
+                i = i + 1
+            }
+        }
+        return
+    }
+
+    if kind == NodeKind.Call {
+        let callee = np_left.get(node).unwrap()
+        if callee != -1 {
+            let callee_kind = np_kind.get(callee).unwrap()
+            if callee_kind == NodeKind.Ident {
+                let fn_name = np_name.get(callee).unwrap()
+                let fn_is_priv = is_private_access(fn_name)
+                if nr_is_defined(fn_name) != 0 && fn_is_priv != 0 {
+                    tc_errors.push("cannot access private function '{fn_name}'")
+                    diag_error_at("PrivateItemAccess", "E1003", "cannot access private function '{fn_name}' from another module", node, "mark the function as 'pub' in its module")
+                } else if is_variant_name(fn_name) != 0 && fn_is_priv != 0 {
+                    tc_errors.push("cannot access private variant '{fn_name}'")
+                    diag_error_at("PrivateItemAccess", "E1003", "cannot access private variant '{fn_name}' from another module", node, "mark the enum as 'pub' in its module")
+                } else if nr_is_defined(fn_name) == 0 && is_builtin_fn(fn_name) == 0 && is_variant_name(fn_name) == 0 && is_known_type(fn_name) == 0 && is_trait_name(fn_name) == 0 {
+                    tc_errors.push("undefined function '{fn_name}'")
+                    diag_error_at("UndefinedFunction", "E0504", "undefined function '{fn_name}'", node, "")
+                } else {
+                    tc_mark_symbol_used(fn_name)
+                }
+            } else {
+                nr_check_node(callee)
+            }
+        }
+        let args_sl = np_args.get(node).unwrap()
+        if args_sl != -1 {
+            let mut i = 0
+            while i < sublist_length(args_sl) {
+                nr_check_node(sublist_get(args_sl, i))
+                i = i + 1
+            }
+        }
+        return
+    }
+
+    if kind == NodeKind.MethodCall {
+        let obj = np_obj.get(node).unwrap()
+        let mut is_module_qual = 0
+        if obj != -1 && np_kind.get(obj).unwrap() == NodeKind.Ident {
+            let obj_name = np_name.get(obj).unwrap()
+            if is_import_module_name(obj_name) != 0 && nr_is_defined(obj_name) == 0 {
+                is_module_qual = 1
+                let mq_method = np_method.get(node).unwrap()
+                tc_mark_symbol_used(mq_method)
+            }
+        }
+        if is_module_qual == 0 && obj != -1 {
+            nr_check_node(obj)
+        }
+        let method_name = np_method.get(node).unwrap()
+        if is_module_qual == 0 && is_builtin_method(method_name) == 0 && is_variant_name(method_name) == 0 {
+            let mut found_in_impl = 0
+            let mut mi = 0
+            while mi < nr_impl_method_names.len() {
+                if nr_impl_method_names.get(mi).unwrap() == method_name {
+                    found_in_impl = 1
+                }
+                mi = mi + 1
+            }
+            if found_in_impl == 0 && is_callable_field_name(method_name) == 0 {
+                let mut is_ue_call = 0
+                if obj != -1 && np_kind.get(obj).unwrap() == NodeKind.Ident {
+                    if is_user_effect_handle_name(np_name.get(obj).unwrap()) != 0 {
+                        is_ue_call = 1
+                    }
+                }
+                if is_ue_call == 0 {
+                    diag_warn_at("UnknownMethod", "W0501", "unknown method '{method_name}' — may fail at compile time", node, "")
+                }
+            }
+        }
+        let args_sl = np_args.get(node).unwrap()
+        if args_sl != -1 {
+            let mut i = 0
+            while i < sublist_length(args_sl) {
+                nr_check_node(sublist_get(args_sl, i))
+                i = i + 1
+            }
+        }
+        return
+    }
+
+    if kind == NodeKind.FieldAccess {
+        let obj = np_obj.get(node).unwrap()
+        if obj != -1 {
+            let mut is_mod_fa = 0
+            if np_kind.get(obj).unwrap() == NodeKind.Ident {
+                let fa_obj_name = np_name.get(obj).unwrap()
+                if is_import_module_name(fa_obj_name) != 0 && nr_is_defined(fa_obj_name) == 0 {
+                    is_mod_fa = 1
+                    let fa_field = np_name.get(node).unwrap()
+                    tc_mark_symbol_used(fa_field)
+                }
+            }
+            if is_mod_fa == 0 {
+                nr_check_node(obj)
+            }
+        }
+        return
+    }
+
+    if kind == NodeKind.IndexExpr {
+        nr_check_node(np_obj.get(node).unwrap())
+        nr_check_node(np_index.get(node).unwrap())
+        return
+    }
+
+    if kind == NodeKind.BinOp {
+        nr_check_node(np_left.get(node).unwrap())
+        nr_check_node(np_right.get(node).unwrap())
+        return
+    }
+
+    if kind == NodeKind.UnaryOp {
+        nr_check_node(np_left.get(node).unwrap())
+        return
+    }
+
+    if kind == NodeKind.IfExpr {
+        nr_check_node(np_condition.get(node).unwrap())
+        nr_check_node(np_then_body.get(node).unwrap())
+        nr_check_node(np_else_body.get(node).unwrap())
+        return
+    }
+
+    if kind == NodeKind.WhileLoop {
+        nr_check_node(np_condition.get(node).unwrap())
+        nr_loop_depth = nr_loop_depth + 1
+        nr_check_node(np_body.get(node).unwrap())
+        nr_loop_depth = nr_loop_depth - 1
+        nr_check_node(np_condition.get(node).unwrap())
+        return
+    }
+
+    if kind == NodeKind.LoopExpr {
+        nr_loop_depth = nr_loop_depth + 1
+        nr_check_node(np_body.get(node).unwrap())
+        nr_loop_depth = nr_loop_depth - 1
+        return
+    }
+
+    if kind == NodeKind.ForIn {
+        nr_check_node(np_iterable.get(node).unwrap())
+        nr_push_scope()
+        nr_define_at(np_var_name.get(node).unwrap(), node)
+        let for_pat_sl = np_elements.get(node).unwrap()
+        if for_pat_sl != -1 {
+            nr_check_pattern(for_pat_sl)
+        }
+        nr_loop_depth = nr_loop_depth + 1
+        nr_check_node(np_body.get(node).unwrap())
+        nr_loop_depth = nr_loop_depth - 1
+        nr_pop_scope()
+        return
+    }
+
+    if kind == NodeKind.Break || kind == NodeKind.Continue {
+        return
+    }
+
+    if kind == NodeKind.MatchExpr {
+        nr_check_node(np_scrutinee.get(node).unwrap())
+        let arms_sl = np_arms.get(node).unwrap()
+        if arms_sl != -1 {
+            let mut i = 0
+            while i < sublist_length(arms_sl) {
+                let arm = sublist_get(arms_sl, i)
+                nr_push_scope()
+                nr_check_pattern(np_pattern.get(arm).unwrap())
+                let guard = np_guard.get(arm).unwrap()
+                if guard != -1 {
+                    nr_check_node(guard)
+                }
+                nr_check_node(np_body.get(arm).unwrap())
+                nr_pop_scope()
+                i = i + 1
+            }
+        }
+        return
+    }
+
+    if kind == NodeKind.Closure {
+        nr_push_scope()
+        let params_sl = np_params.get(node).unwrap()
+        if params_sl != -1 {
+            let mut i = 0
+            while i < sublist_length(params_sl) {
+                let cp = sublist_get(params_sl, i)
+                nr_define_at(np_name.get(cp).unwrap(), cp)
+                i = i + 1
+            }
+        }
+        nr_check_node(np_body.get(node).unwrap())
+        nr_pop_scope()
+        return
+    }
+
+    if kind == NodeKind.StructLit {
+        let type_name = np_type_name.get(node).unwrap()
+        if type_name != "" {
+            nr_check_type_ref(type_name)
+        }
+        let flds_sl = np_fields.get(node).unwrap()
+        if flds_sl != -1 {
+            let mut i = 0
+            while i < sublist_length(flds_sl) {
+                let f = sublist_get(flds_sl, i)
+                nr_check_node(np_value.get(f).unwrap())
+                i = i + 1
+            }
+        }
+        return
+    }
+
+    if kind == NodeKind.ListLit {
+        let elems_sl = np_elements.get(node).unwrap()
+        if elems_sl != -1 {
+            let mut i = 0
+            while i < sublist_length(elems_sl) {
+                nr_check_node(sublist_get(elems_sl, i))
+                i = i + 1
+            }
+        }
+        return
+    }
+
+    if kind == NodeKind.TupleLit {
+        let elems_sl = np_elements.get(node).unwrap()
+        if elems_sl != -1 {
+            let mut i = 0
+            while i < sublist_length(elems_sl) {
+                nr_check_node(sublist_get(elems_sl, i))
+                i = i + 1
+            }
+        }
+        return
+    }
+
+    if kind == NodeKind.RangeLit {
+        nr_check_node(np_start.get(node).unwrap())
+        nr_check_node(np_end.get(node).unwrap())
+        return
+    }
+
+    if kind == NodeKind.WithBlock {
+        let wh_sl = np_handlers.get(node).unwrap()
+        nr_push_scope()
+        if wh_sl != -1 {
+            let mut wi = 0
+            while wi < sublist_length(wh_sl) {
+                let wh_item = sublist_get(wh_sl, wi)
+                let wh_kind = np_kind.get(wh_item).unwrap()
+                if wh_kind == NodeKind.WithResource {
+                    nr_define_at(np_name.get(wh_item).unwrap(), wh_item)
+                    nr_check_node(np_value.get(wh_item).unwrap())
+                } else {
+                    nr_check_node(wh_item)
+                }
+                wi = wi + 1
+            }
+        }
+        nr_check_node(np_body.get(node).unwrap())
+        nr_pop_scope()
+        return
+    }
+
+    if kind == NodeKind.WithResource {
+        nr_check_node(np_value.get(node).unwrap())
+        return
+    }
+
+    if kind == NodeKind.HandlerExpr {
+        let methods_sl = np_methods.get(node).unwrap()
+        if methods_sl != -1 {
+            let mut i = 0
+            while i < sublist_length(methods_sl) {
+                nr_check_fn(sublist_get(methods_sl, i))
+                i = i + 1
+            }
+        }
+        return
+    }
+
+    if kind == NodeKind.AsyncScope {
+        nr_check_node(np_body.get(node).unwrap())
+        return
+    }
+
+    if kind == NodeKind.AsyncSpawn {
+        nr_check_node(np_body.get(node).unwrap())
+        return
+    }
+
+    if kind == NodeKind.AwaitExpr {
+        nr_check_node(np_value.get(node).unwrap())
+        return
+    }
+
+    if kind == NodeKind.ChannelNew {
+        return
+    }
+
+    if kind == NodeKind.EmbedExpr {
+        return
+    }
+
+    let _skip = 0
+}
+
+fn nr_check_pattern(node: Int) ! TypeCheck.Resolve, Diag.Report {
+    if node == -1 { return }
+    let kind = np_kind.get(node).unwrap()
+
+    if kind == NodeKind.IdentPattern {
+        let name = np_name.get(node).unwrap()
+        if name != "_" {
+            nr_define_at(name, node)
+        }
+        return
+    }
+
+    if kind == NodeKind.IntPattern || kind == NodeKind.StringPattern || kind == NodeKind.WildcardPattern {
+        return
+    }
+
+    if kind == NodeKind.EnumPattern {
+        let flds_sl = np_fields.get(node).unwrap()
+        if flds_sl != -1 {
+            let mut i = 0
+            while i < sublist_length(flds_sl) {
+                nr_check_pattern(sublist_get(flds_sl, i))
+                i = i + 1
+            }
+        }
+        return
+    }
+
+    if kind == NodeKind.StructPattern {
+        let flds_sl = np_fields.get(node).unwrap()
+        if flds_sl != -1 {
+            let mut i = 0
+            while i < sublist_length(flds_sl) {
+                let f = sublist_get(flds_sl, i)
+                nr_define_at(np_name.get(f).unwrap(), f)
+                i = i + 1
+            }
+        }
+        return
+    }
+
+    if kind == NodeKind.TuplePattern {
+        let elems_sl = np_elements.get(node).unwrap()
+        if elems_sl != -1 {
+            let mut i = 0
+            while i < sublist_length(elems_sl) {
+                nr_check_pattern(sublist_get(elems_sl, i))
+                i = i + 1
+            }
+        }
+        return
+    }
+
+    if kind == NodeKind.ListPattern {
+        let elems_sl = np_elements.get(node).unwrap()
+        if elems_sl != -1 {
+            let mut i = 0
+            while i < sublist_length(elems_sl) {
+                nr_check_pattern(sublist_get(elems_sl, i))
+                i = i + 1
+            }
+        }
+        return
+    }
+
+    if kind == NodeKind.OrPattern {
+        nr_check_pattern(np_left.get(node).unwrap())
+        nr_check_pattern(np_right.get(node).unwrap())
+        return
+    }
+
+    if kind == NodeKind.RangePattern {
+        return
+    }
+
+    if kind == NodeKind.AsPattern {
+        nr_check_pattern(np_pattern.get(node).unwrap())
+        nr_define(np_name.get(node).unwrap())
+        return
+    }
+
+    let _skip = 0
+}
+
+// ── Phase 2: Type compatibility ─────────────────────────────────────
+
+fn types_compatible(a: Int, b: Int) -> Int {
+    if a == b { return 1 }
+    if a == TYPE_UNKNOWN || b == TYPE_UNKNOWN { return 1 }
+    if a < 0 || b < 0 { return 1 }
+    if a >= ty_kind.len() || b >= ty_kind.len() { return 1 }
+    let ka = ty_kind.get(a).unwrap()
+    let kb = ty_kind.get(b).unwrap()
+    if ka == TK_TYPEVAR || kb == TK_TYPEVAR { return 1 }
+    // Int and Bool are interchangeable in Blink (C-style truthiness)
+    if (ka == TK_INT || ka == TK_BOOL) && (kb == TK_INT || kb == TK_BOOL) { return 1 }
+    // Enums are tag-ints at runtime — Int and Enum are compatible
+    if (ka == TK_INT && kb == TK_ENUM) || (ka == TK_ENUM && kb == TK_INT) { return 1 }
+    if ka == kb {
+        if ka == TK_LIST || ka == TK_OPTION || ka == TK_ITERATOR || ka == TK_SET {
+            return types_compatible(ty_inner1.get(a).unwrap(), ty_inner1.get(b).unwrap())
+        }
+        if ka == TK_MAP {
+            if types_compatible(ty_inner1.get(a).unwrap(), ty_inner1.get(b).unwrap()) == 0 { return 0 }
+            return types_compatible(ty_inner2.get(a).unwrap(), ty_inner2.get(b).unwrap())
+        }
+        if ka == TK_RESULT {
+            if types_compatible(ty_inner1.get(a).unwrap(), ty_inner1.get(b).unwrap()) == 0 { return 0 }
+            return types_compatible(ty_inner2.get(a).unwrap(), ty_inner2.get(b).unwrap())
+        }
+        if ka == TK_STRUCT || ka == TK_ENUM {
+            return 0
+        }
+        return 1
+    }
+    0
+}
+
+fn type_kind(tid: Int) -> Int {
+    if tid < 0 || tid >= ty_kind.len() { return TK_UNKNOWN }
+    ty_kind.get(tid).unwrap()
+}
+
+// Blink treats Int as truthy — Int is valid in Bool contexts
+fn is_bool_compat(tid: Int) -> Int {
+    if tid == TYPE_UNKNOWN { return 1 }
+    if tid == TYPE_BOOL { return 1 }
+    if tid == TYPE_INT { return 1 }
+    let k = type_kind(tid)
+    if k == TK_BOOL || k == TK_INT { return 1 }
+    0
+}
+
+// ── Phase 2: Expression type inference ──────────────────────────────
+
+fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    if node == -1 { return TYPE_UNKNOWN }
+    let kind = np_kind.get(node).unwrap()
+
+    if kind == NodeKind.IntLit { return TYPE_INT }
+    if kind == NodeKind.FloatLit { return TYPE_FLOAT }
+    if kind == NodeKind.BoolLit { return TYPE_BOOL }
+    if kind == NodeKind.InterpString { return TYPE_STR }
+    if kind == NodeKind.EmbedExpr { return TYPE_STR }
+
+    if kind == NodeKind.Ident {
+        let name = np_name.get(node).unwrap()
+        if name == "true" || name == "false" { return TYPE_BOOL }
+        if name == "None" { return make_option_type(TYPE_UNKNOWN) }
+        let vt = nr_get_type(name)
+        if vt != TYPE_UNKNOWN { return vt }
+        if is_variant_name(name) != 0 {
+            return get_variant_enum_tid(name)
+        }
+        return TYPE_UNKNOWN
+    }
+
+    if kind == NodeKind.BinOp {
+        let op = np_op.get(node).unwrap()
+        let lt = infer_type(np_left.get(node).unwrap())
+        let rt = infer_type(np_right.get(node).unwrap())
+
+        if op == "==" || op == "!=" || op == "<" || op == ">" || op == "<=" || op == ">=" {
+            return TYPE_BOOL
+        }
+        if op == "&&" || op == "||" {
+            if is_bool_compat(lt) == 0 {
+                tc_error_at("logical operator '{op}' requires Bool operands, got {type_to_str(lt)}", node)
+            }
+            if is_bool_compat(rt) == 0 {
+                tc_error_at("logical operator '{op}' requires Bool operands, got {type_to_str(rt)}", node)
+            }
+            return TYPE_BOOL
+        }
+        if op == "+" {
+            if type_kind(lt) == TK_STR || type_kind(rt) == TK_STR {
+                return TYPE_STR
+            }
+        }
+        if op == "+" || op == "-" || op == "*" || op == "/" || op == "%" {
+            if lt != TYPE_UNKNOWN && rt != TYPE_UNKNOWN {
+                if types_compatible(lt, rt) == 0 {
+                    tc_error_at("binary '{op}': incompatible types {type_to_str(lt)} and {type_to_str(rt)}", node)
+                }
+            }
+            if lt != TYPE_UNKNOWN { return lt }
+            return rt
+        }
+        if op == "??" {
+            let left_k = type_kind(lt)
+            if left_k != TK_OPTION && left_k != TK_UNKNOWN {
+                tc_error_at("'??' operator requires Option value, got {type_to_str(lt)}", node)
+            }
+            if left_k == TK_OPTION { return ty_inner1.get(lt).unwrap() }
+            return rt
+        }
+        if lt != TYPE_UNKNOWN { return lt }
+        return rt
+    }
+
+    if kind == NodeKind.UnaryOp {
+        let op = np_op.get(node).unwrap()
+        let operand = infer_type(np_left.get(node).unwrap())
+        if op == "!" { return TYPE_BOOL }
+        if op == "-" { return operand }
+        if op == "?" {
+            let ok = type_kind(operand)
+            if ok == TK_RESULT {
+                if tc_current_fn_ret >= 0 && tc_current_fn_ret < ty_kind.len() {
+                    let ret_kind = ty_kind.get(tc_current_fn_ret).unwrap()
+                    if ret_kind != TK_RESULT && ret_kind != TK_UNKNOWN {
+                        tc_errors.push("'?' on Result in function '{tc_current_fn_name}' which does not return Result")
+                        diag_error_at("QuestionMarkResultInNonResult", "E0508", "'?' on Result in function '{tc_current_fn_name}' which does not return Result", node, "change the return type to Result[T, E]")
+                    } else if ret_kind == TK_RESULT {
+                        let operand_err = ty_inner2.get(operand).unwrap()
+                        let ret_err = ty_inner2.get(tc_current_fn_ret).unwrap()
+                        if types_compatible(operand_err, ret_err) == 0 {
+                            tc_errors.push("'?' error type mismatch in function '{tc_current_fn_name}'")
+                            diag_error_at("QuestionMarkErrorMismatch", "E0512", "'?' error type mismatch: operand error type does not match return error type in '{tc_current_fn_name}'", node, "ensure the error types are compatible")
+                        }
+                    }
+                }
+                return ty_inner1.get(operand).unwrap()
+            }
+            if ok == TK_OPTION {
+                if tc_current_fn_ret >= 0 && tc_current_fn_ret < ty_kind.len() {
+                    let ret_kind = ty_kind.get(tc_current_fn_ret).unwrap()
+                    if ret_kind != TK_OPTION && ret_kind != TK_UNKNOWN {
+                        tc_errors.push("'?' on Option in function '{tc_current_fn_name}' which does not return Option")
+                        diag_error_at("QuestionMarkOptionInNonOption", "E0509", "'?' on Option in function '{tc_current_fn_name}' which does not return Option", node, "change the return type to Option[T]")
+                    }
+                }
+                return ty_inner1.get(operand).unwrap()
+            }
+            if ok != TK_UNKNOWN {
+                tc_errors.push("'?' requires Result or Option value")
+                diag_error_at("QuestionMarkInvalidOperand", "E0502", "'?' requires a Result or Option value", node, "")
+            }
+            return operand
+        }
+        return operand
+    }
+
+    if kind == NodeKind.Call {
+        let callee = np_left.get(node).unwrap()
+        if callee != -1 {
+            let callee_kind = np_kind.get(callee).unwrap()
+            if callee_kind == NodeKind.Ident {
+                let mut fn_name = np_name.get(callee).unwrap()
+                if tc_alias_to_original.has(fn_name) {
+                    fn_name = tc_alias_to_original.get(fn_name)
+                }
+                if fn_name == "Some" {
+                    let args_sl = np_args.get(node).unwrap()
+                    if args_sl != -1 && sublist_length(args_sl) >= 1 {
+                        let inner = infer_type(sublist_get(args_sl, 0))
+                        return make_option_type(inner)
+                    }
+                    return make_option_type(TYPE_UNKNOWN)
+                }
+                if fn_name == "Ok" {
+                    let args_sl = np_args.get(node).unwrap()
+                    if args_sl != -1 && sublist_length(args_sl) >= 1 {
+                        let inner = infer_type(sublist_get(args_sl, 0))
+                        return make_result_type(inner, TYPE_UNKNOWN)
+                    }
+                    return make_result_type(TYPE_UNKNOWN, TYPE_UNKNOWN)
+                }
+                if fn_name == "Err" {
+                    let args_sl = np_args.get(node).unwrap()
+                    if args_sl != -1 && sublist_length(args_sl) >= 1 {
+                        let inner = infer_type(sublist_get(args_sl, 0))
+                        return make_result_type(TYPE_UNKNOWN, inner)
+                    }
+                    return make_result_type(TYPE_UNKNOWN, TYPE_UNKNOWN)
+                }
+                if is_builtin_fn(fn_name) != 0 {
+                    return get_builtin_fn_ret(fn_name)
+                }
+                if is_variant_name(fn_name) != 0 {
+                    return get_variant_enum_tid(fn_name)
+                }
+                let sig = lookup_fnsig(fn_name)
+                if sig != -1 {
+                    let args_sl = np_args.get(node).unwrap()
+                    let mut arg_count = 0
+                    if args_sl != -1 {
+                        arg_count = sublist_length(args_sl)
+                    }
+                    let expected = fnsig_params_count.get(sig).unwrap()
+                    if arg_count != expected {
+                        tc_error_at("function '{fn_name}' expects {expected} argument(s), got {arg_count}", node)
+                    }
+                    let tp_count = fnsig_type_params_count.get(sig).unwrap()
+                    if tp_count > 0 {
+                        return instantiate_return_type(sig, args_sl)
+                    }
+                    return fnsig_ret.get(sig).unwrap()
+                }
+            } else if callee_kind == NodeKind.FieldAccess {
+                let obj = np_obj.get(callee).unwrap()
+                if obj != -1 && np_kind.get(obj).unwrap() == NodeKind.Ident {
+                    let type_name = np_name.get(obj).unwrap()
+                    let tid = lookup_named_type(type_name)
+                    if tid != -1 { return tid }
+                }
+            }
+        }
+        return TYPE_UNKNOWN
+    }
+
+    if kind == NodeKind.MethodCall {
+        let obj_node = np_obj.get(node).unwrap()
+        let method = np_method.get(node).unwrap()
+        let obj_t = infer_type(obj_node)
+        let obj_k = type_kind(obj_t)
+
+        if obj_k == TK_LIST {
+            if method == "len" || method == "count" { return TYPE_INT }
+            if method == "get" { return make_option_type(ty_inner1.get(obj_t).unwrap()) }
+            if method == "push" || method == "set" || method == "pop" || method == "for_each" || method == "clear" { return TYPE_VOID }
+            if method == "map" || method == "filter" || method == "take" || method == "skip" || method == "collect" || method == "concat" || method == "slice" {
+                return obj_t
+            }
+            if method == "contains" || method == "any" || method == "all" || method == "is_empty" { return TYPE_BOOL }
+            if method == "find" { return make_option_type(ty_inner1.get(obj_t).unwrap()) }
+            if method == "fold" {
+                let args_sl = np_args.get(node).unwrap()
+                if args_sl != -1 && sublist_length(args_sl) >= 1 {
+                    return infer_type(sublist_get(args_sl, 0))
+                }
+                return TYPE_UNKNOWN
+            }
+        }
+
+        if obj_k == TK_STR {
+            if method == "len" { return TYPE_INT }
+            if method == "contains" || method == "starts_with" || method == "ends_with" { return TYPE_BOOL }
+            if method == "substring" || method == "concat" || method == "trim" || method == "to_lower" || method == "to_upper" || method == "replace" || method == "slice" {
+                return TYPE_STR
+            }
+            if method == "char_at" || method == "index_of" || method == "to_int" { return TYPE_INT }
+            if method == "split" { return make_list_type(TYPE_STR) }
+            if method == "lines" { return make_list_type(TYPE_STR) }
+            if method == "parse_float" { return TYPE_FLOAT }
+            if method == "parse_int" { return TYPE_INT }
+            if method == "is_empty" { return TYPE_BOOL }
+        }
+
+        if obj_k == TK_INT {
+            if method == "to_str" { return TYPE_STR }
+            if method == "abs" || method == "min" || method == "max" { return TYPE_INT }
+        }
+
+        if obj_k == TK_OPTION {
+            if method == "unwrap" { return ty_inner1.get(obj_t).unwrap() }
+            if method == "is_some" || method == "is_none" { return TYPE_BOOL }
+        }
+
+        if obj_k == TK_RESULT {
+            if method == "unwrap" { return ty_inner1.get(obj_t).unwrap() }
+            if method == "unwrap_err" { return ty_inner2.get(obj_t).unwrap() }
+            if method == "is_ok" || method == "is_err" { return TYPE_BOOL }
+        }
+
+        if obj_k == TK_MAP {
+            if method == "len" { return TYPE_INT }
+            if method == "has" || method == "remove" { return TYPE_BOOL }
+            if method == "set" || method == "clear" { return TYPE_VOID }
+            if method == "get" { return ty_inner2.get(obj_t).unwrap() }
+            if method == "keys" { return make_list_type(ty_inner1.get(obj_t).unwrap()) }
+            if method == "values" { return make_list_type(ty_inner2.get(obj_t).unwrap()) }
+        }
+
+        if obj_k == TK_SET {
+            if method == "len" { return TYPE_INT }
+            if method == "is_empty" { return TYPE_BOOL }
+            if method == "contains" || method == "insert" || method == "remove" { return TYPE_BOOL }
+            if method == "union" { return obj_t }
+        }
+
+        if obj_k == TK_BYTES {
+            if method == "len" { return TYPE_INT }
+            if method == "get" { return make_option_type(TYPE_INT) }
+            if method == "is_empty" { return TYPE_BOOL }
+            if method == "push" || method == "set" { return TYPE_VOID }
+            if method == "slice" || method == "concat" { return obj_t }
+            if method == "to_str" { return make_result_type(TYPE_STR, TYPE_STR) }
+            if method == "to_hex" { return TYPE_STR }
+        }
+
+        if obj_k == TK_STRUCT || obj_k == TK_ENUM {
+            let tname = ty_name.get(obj_t).unwrap()
+            let sig_name = "{tname}_{method}"
+            let sig = lookup_fnsig(sig_name)
+            if sig != -1 {
+                return fnsig_ret.get(sig).unwrap()
+            }
+        }
+
+        return TYPE_UNKNOWN
+    }
+
+    if kind == NodeKind.FieldAccess {
+        let obj_node = np_obj.get(node).unwrap()
+        let fname = np_name.get(node).unwrap()
+        if obj_node == -1 { return TYPE_UNKNOWN }
+
+        if np_kind.get(obj_node).unwrap() == NodeKind.Ident {
+            let obj_name = np_name.get(obj_node).unwrap()
+            let tid = lookup_named_type(obj_name)
+            if tid != -1 && type_kind(tid) == TK_ENUM {
+                return tid
+            }
+        }
+
+        let obj_t = infer_type(obj_node)
+        if type_kind(obj_t) == TK_STRUCT {
+            let ft = get_struct_field_tid(obj_t, fname)
+            if ft != -1 { return ft }
+        }
+        return TYPE_UNKNOWN
+    }
+
+    if kind == NodeKind.IndexExpr {
+        let obj_t = infer_type(np_obj.get(node).unwrap())
+        if type_kind(obj_t) == TK_LIST {
+            return ty_inner1.get(obj_t).unwrap()
+        }
+        return TYPE_UNKNOWN
+    }
+
+    if kind == NodeKind.ListLit {
+        let elems_sl = np_elements.get(node).unwrap()
+        if elems_sl != -1 && sublist_length(elems_sl) > 0 {
+            let first_t = infer_type(sublist_get(elems_sl, 0))
+            return make_list_type(first_t)
+        }
+        return make_list_type(TYPE_UNKNOWN)
+    }
+
+    if kind == NodeKind.StructLit {
+        let sname = np_type_name.get(node).unwrap()
+        if sname != "" {
+            let tid = lookup_named_type(sname)
+            if tid != -1 { return tid }
+        }
+        return TYPE_UNKNOWN
+    }
+
+    if kind == NodeKind.TupleLit {
+        let elems_sl = np_elements.get(node).unwrap()
+        if elems_sl != -1 {
+            let mut elem_types: List[Int] = []
+            let mut i = 0
+            while i < sublist_length(elems_sl) {
+                elem_types.push(infer_type(sublist_get(elems_sl, i)))
+                i = i + 1
+            }
+            return make_tuple_type(elem_types)
+        }
+        return TYPE_UNKNOWN
+    }
+
+    if kind == NodeKind.IfExpr {
+        let cond_t = infer_type(np_condition.get(node).unwrap())
+        if is_bool_compat(cond_t) == 0 {
+            tc_error_at("if condition must be Bool, got {type_to_str(cond_t)}", node)
+        }
+        let then_t = infer_type(np_then_body.get(node).unwrap())
+        let else_node = np_else_body.get(node).unwrap()
+        if else_node != -1 {
+            let else_t = infer_type(else_node)
+            if then_t != TYPE_UNKNOWN && else_t != TYPE_UNKNOWN {
+                if types_compatible(then_t, else_t) == 0 {
+                    tc_error_at("if branches have incompatible types: {type_to_str(then_t)} vs {type_to_str(else_t)}", node)
+                }
+            }
+            if then_t != TYPE_UNKNOWN { return then_t }
+            return else_t
+        }
+        return then_t
+    }
+
+    if kind == NodeKind.MatchExpr {
+        let arms_sl = np_arms.get(node).unwrap()
+        if arms_sl != -1 && sublist_length(arms_sl) > 0 {
+            let first_arm = sublist_get(arms_sl, 0)
+            return infer_type(np_body.get(first_arm).unwrap())
+        }
+        return TYPE_UNKNOWN
+    }
+
+    if kind == NodeKind.Block {
+        let stmts_sl = np_stmts.get(node).unwrap()
+        if stmts_sl != -1 && sublist_length(stmts_sl) > 0 {
+            let last = sublist_get(stmts_sl, sublist_length(stmts_sl) - 1)
+            let last_k = np_kind.get(last).unwrap()
+            if last_k == NodeKind.ExprStmt {
+                return infer_type(np_value.get(last).unwrap())
+            }
+            if last_k == NodeKind.Return {
+                return infer_type(np_value.get(last).unwrap())
+            }
+            if last_k == NodeKind.IfExpr || last_k == NodeKind.MatchExpr || last_k == NodeKind.Call || last_k == NodeKind.MethodCall || last_k == NodeKind.Ident || last_k == NodeKind.IntLit || last_k == NodeKind.FloatLit || last_k == NodeKind.BoolLit || last_k == NodeKind.InterpString || last_k == NodeKind.BinOp || last_k == NodeKind.UnaryOp {
+                return infer_type(last)
+            }
+        }
+        return TYPE_VOID
+    }
+
+    if kind == NodeKind.RangeLit {
+        return make_list_type(TYPE_INT)
+    }
+
+    if kind == NodeKind.Closure {
+        return TYPE_UNKNOWN
+    }
+
+    TYPE_UNKNOWN
+}
+
+// ── Phase 2: Type check function bodies ─────────────────────────────
+
+fn resolve_param_type(p: Int) -> Int ! TypeCheck.Resolve {
+    let ptype_str = np_type_name.get(p).unwrap()
+    let ptype_ann = np_type_ann.get(p).unwrap()
+    if ptype_ann != -1 {
+        return resolve_type_ann(ptype_ann)
+    }
+    if ptype_str != "" {
+        let t = resolve_type_name(ptype_str)
+        if t != -1 { return t }
+    }
+    TYPE_UNKNOWN
+}
+
+@allow(UnrestoredMutation, IncompleteStateRestore)
+fn tc_check_fn(fn_node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    nr_push_scope()
+    let fn_name = np_name.get(fn_node).unwrap()
+    let prev_fn_name = tc_current_fn_name
+    let prev_fn_ret = tc_current_fn_ret
+    tc_current_fn_name = fn_name
+    let sig = lookup_fnsig(fn_name)
+    if sig != -1 {
+        tc_current_fn_ret = fnsig_ret.get(sig).unwrap()
+    }
+
+    let is_ffi = has_annotation(fn_node, "ffi")
+    diag_push_allows(fn_node)
+
+    let params_sl = np_params.get(fn_node).unwrap()
+    if params_sl != -1 && is_ffi == 0 {
+        let mut i = 0
+        while i < sublist_length(params_sl) {
+            let p = sublist_get(params_sl, i)
+            let pname = np_name.get(p).unwrap()
+            let ptid = resolve_param_type(p)
+            nr_define_typed(pname, 0, ptid)
+            i = i + 1
+        }
+    }
+
+    let body = np_body.get(fn_node).unwrap()
+    if body != -1 && is_ffi == 0 {
+        tc_check_body(body)
+
+        if sig != -1 {
+            let declared_ret = fnsig_ret.get(sig).unwrap()
+            if declared_ret != TYPE_VOID && declared_ret != TYPE_UNKNOWN {
+                let inferred_ret = infer_type(body)
+                if inferred_ret != TYPE_UNKNOWN {
+                    if types_compatible(declared_ret, inferred_ret) == 0 {
+                        tc_error_at("function '{fn_name}' declared return type {type_to_str(declared_ret)} but body returns {type_to_str(inferred_ret)}", fn_node)
+                    }
+                }
+            }
+        }
+    }
+    diag_clear_allows()
+    tc_current_fn_name = prev_fn_name
+    tc_current_fn_ret = prev_fn_ret
+    nr_pop_scope()
+}
+
+@allow(UnrestoredMutation, IncompleteStateRestore)
+fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    if node == -1 { return }
+    let kind = np_kind.get(node).unwrap()
+
+    if kind == NodeKind.Block {
+        nr_push_scope()
+        let stmts_sl = np_stmts.get(node).unwrap()
+        if stmts_sl != -1 {
+            let mut i = 0
+            let mut _found_terminal = 0
+            while i < sublist_length(stmts_sl) {
+                let stmt = sublist_get(stmts_sl, i)
+                if _found_terminal != 0 {
+                    diag_warn_at("UnreachableCode", "W0700", "unreachable code after return/break/continue", stmt, "remove this code or move it before the control flow statement")
+                }
+                tc_check_body(stmt)
+                let sk = np_kind.get(stmt).unwrap()
+                if sk == NodeKind.Return || sk == NodeKind.Break || sk == NodeKind.Continue {
+                    _found_terminal = 1
+                }
+                i = i + 1
+            }
+        }
+        nr_pop_scope()
+        return
+    }
+
+    if kind == NodeKind.LetBinding {
+        let vname = np_name.get(node).unwrap()
+        let val = np_value.get(node).unwrap()
+        let is_mut = np_is_mut.get(node).unwrap()
+
+        let type_str = np_type_name.get(node).unwrap()
+        let type_ann = np_target.get(node).unwrap()
+        let mut declared_tid = TYPE_UNKNOWN
+        if type_ann != -1 {
+            declared_tid = resolve_type_ann(type_ann)
+        } else if type_str != "" {
+            let rt = resolve_type_name(type_str)
+            if rt != -1 {
+                declared_tid = rt
+            }
+        }
+
+        let mut inferred_tid = TYPE_UNKNOWN
+        if val != -1 {
+            inferred_tid = infer_type(val)
+            tc_check_body(val)
+        }
+
+        if declared_tid != TYPE_UNKNOWN && inferred_tid != TYPE_UNKNOWN {
+            if types_compatible(declared_tid, inferred_tid) == 0 {
+                tc_error_at("variable '{vname}': declared type {type_to_str(declared_tid)} but got {type_to_str(inferred_tid)}", node)
+            }
+        }
+
+        let mut final_tid = declared_tid
+        if final_tid == TYPE_UNKNOWN {
+            final_tid = inferred_tid
+        }
+        nr_define_typed(vname, is_mut, final_tid)
+        if type_ann == -1 && type_str == "" && final_tid != TYPE_UNKNOWN {
+            tc_hint_line.push(np_line.get(node).unwrap())
+            tc_hint_col.push(np_col.get(node).unwrap())
+            tc_hint_name.push(vname)
+            tc_hint_type.push(type_to_str(final_tid))
+            tc_hint_module.push(nr_current_module)
+            tc_hint_count = tc_hint_count + 1
+        }
+        let tc_let_pat_sl = np_elements.get(node).unwrap()
+        if tc_let_pat_sl != -1 {
+            let tc_let_elems_sl = np_elements.get(tc_let_pat_sl).unwrap()
+            if tc_let_elems_sl != -1 {
+                let mut tpi = 0
+                while tpi < sublist_length(tc_let_elems_sl) {
+                    let tsp = sublist_get(tc_let_elems_sl, tpi)
+                    nr_define_typed(np_name.get(tsp).unwrap(), is_mut, TYPE_UNKNOWN)
+                    tpi = tpi + 1
+                }
+            }
+        }
+        return
+    }
+
+    if kind == NodeKind.Assignment || kind == NodeKind.CompoundAssign {
+        let target = np_target.get(node).unwrap()
+        let val = np_value.get(node).unwrap()
+        if target != -1 && val != -1 {
+            let target_t = infer_type(target)
+            let val_t = infer_type(val)
+            if target_t != TYPE_UNKNOWN && val_t != TYPE_UNKNOWN {
+                if types_compatible(target_t, val_t) == 0 {
+                    tc_error_at("assignment: cannot assign {type_to_str(val_t)} to {type_to_str(target_t)}", node)
+                }
+            }
+        }
+        return
+    }
+
+    if kind == NodeKind.IfExpr {
+        let cond_t = infer_type(np_condition.get(node).unwrap())
+        if is_bool_compat(cond_t) == 0 {
+            tc_error_at("if condition must be Bool, got {type_to_str(cond_t)}", node)
+        }
+        tc_check_body(np_then_body.get(node).unwrap())
+        tc_check_body(np_else_body.get(node).unwrap())
+        return
+    }
+
+    if kind == NodeKind.WhileLoop {
+        let cond_t = infer_type(np_condition.get(node).unwrap())
+        if is_bool_compat(cond_t) == 0 {
+            tc_error_at("while condition must be Bool, got {type_to_str(cond_t)}", node)
+        }
+        tc_check_body(np_body.get(node).unwrap())
+        return
+    }
+
+    if kind == NodeKind.ForIn {
+        nr_push_scope()
+        let iter_t = infer_type(np_iterable.get(node).unwrap())
+        let mut elem_t = TYPE_UNKNOWN
+        if type_kind(iter_t) == TK_LIST {
+            elem_t = ty_inner1.get(iter_t).unwrap()
+        }
+        nr_define_typed(np_var_name.get(node).unwrap(), 0, elem_t)
+        let tc_for_pat_sl = np_elements.get(node).unwrap()
+        if tc_for_pat_sl != -1 {
+            tc_check_pattern_types(tc_for_pat_sl)
+        }
+        tc_check_body(np_body.get(node).unwrap())
+        nr_pop_scope()
+        return
+    }
+
+    if kind == NodeKind.MatchExpr {
+        tc_check_body(np_scrutinee.get(node).unwrap())
+        let arms_sl = np_arms.get(node).unwrap()
+        if arms_sl != -1 {
+            let mut i = 0
+            while i < sublist_length(arms_sl) {
+                let arm = sublist_get(arms_sl, i)
+                nr_push_scope()
+                tc_check_pattern_types(np_pattern.get(arm).unwrap())
+                tc_check_body(np_body.get(arm).unwrap())
+                nr_pop_scope()
+                i = i + 1
+            }
+
+            let mut has_wildcard = 0
+            let mut ai = 0
+            while ai < sublist_length(arms_sl) {
+                let arm = sublist_get(arms_sl, ai)
+                let pat = np_pattern.get(arm).unwrap()
+                if pat != -1 {
+                    let pk = np_kind.get(pat).unwrap()
+                    if pk == NodeKind.WildcardPattern || pk == NodeKind.IdentPattern {
+                        has_wildcard = 1
+                    }
+                }
+                ai = ai + 1
+            }
+            if has_wildcard == 0 {
+                tc_warn("match expression may not be exhaustive (no wildcard or catch-all arm)")
+            }
+        }
+        return
+    }
+
+    if kind == NodeKind.LoopExpr {
+        tc_check_body(np_body.get(node).unwrap())
+        return
+    }
+
+    if kind == NodeKind.WithBlock {
+        let wh_sl2 = np_handlers.get(node).unwrap()
+        nr_push_scope()
+        if wh_sl2 != -1 {
+            let mut wi2 = 0
+            while wi2 < sublist_length(wh_sl2) {
+                let wh_item2 = sublist_get(wh_sl2, wi2)
+                let wh_kind2 = np_kind.get(wh_item2).unwrap()
+                if wh_kind2 == NodeKind.WithResource {
+                    nr_define(np_name.get(wh_item2).unwrap())
+                    tc_check_body(np_value.get(wh_item2).unwrap())
+                } else {
+                    tc_check_body(wh_item2)
+                }
+                wi2 = wi2 + 1
+            }
+        }
+        tc_check_body(np_body.get(node).unwrap())
+        nr_pop_scope()
+        return
+    }
+
+    if kind == NodeKind.WithResource {
+        tc_check_body(np_value.get(node).unwrap())
+        return
+    }
+
+    if kind == NodeKind.AsyncScope {
+        tc_check_body(np_body.get(node).unwrap())
+        return
+    }
+
+    if kind == NodeKind.AsyncSpawn {
+        tc_check_body(np_body.get(node).unwrap())
+        return
+    }
+
+    if kind == NodeKind.Closure {
+        nr_push_scope()
+        let params_sl = np_params.get(node).unwrap()
+        if params_sl != -1 {
+            let mut i = 0
+            while i < sublist_length(params_sl) {
+                let p = sublist_get(params_sl, i)
+                let pname = np_name.get(p).unwrap()
+                let ptid = resolve_param_type(p)
+                nr_define_typed(pname, 0, ptid)
+                i = i + 1
+            }
+        }
+        tc_check_body(np_body.get(node).unwrap())
+        nr_pop_scope()
+        return
+    }
+
+    if kind == NodeKind.ExprStmt {
+        let val = np_value.get(node).unwrap()
+        if val != -1 {
+            infer_type(val)
+        }
+        return
+    }
+
+    if kind == NodeKind.Return {
+        let val = np_value.get(node).unwrap()
+        if val != -1 {
+            infer_type(val)
+        }
+        return
+    }
+
+    let _skip = 0
+}
+
+fn tc_check_pattern_types(node: Int) ! TypeCheck.Resolve {
+    if node == -1 { return }
+    let kind = np_kind.get(node).unwrap()
+    if kind == NodeKind.IdentPattern {
+        let name = np_name.get(node).unwrap()
+        if name != "_" {
+            nr_define(name)
+        }
+        return
+    }
+    if kind == NodeKind.EnumPattern {
+        let flds_sl = np_fields.get(node).unwrap()
+        if flds_sl != -1 {
+            let mut i = 0
+            while i < sublist_length(flds_sl) {
+                tc_check_pattern_types(sublist_get(flds_sl, i))
+                i = i + 1
+            }
+        }
+        return
+    }
+    if kind == NodeKind.StructPattern {
+        let flds_sl = np_fields.get(node).unwrap()
+        if flds_sl != -1 {
+            let mut i = 0
+            while i < sublist_length(flds_sl) {
+                nr_define(np_name.get(sublist_get(flds_sl, i)).unwrap())
+                i = i + 1
+            }
+        }
+        return
+    }
+    if kind == NodeKind.TuplePattern {
+        let elems_sl = np_elements.get(node).unwrap()
+        if elems_sl != -1 {
+            let mut i = 0
+            while i < sublist_length(elems_sl) {
+                tc_check_pattern_types(sublist_get(elems_sl, i))
+                i = i + 1
+            }
+        }
+        return
+    }
+    if kind == NodeKind.ListPattern {
+        let elems_sl = np_elements.get(node).unwrap()
+        if elems_sl != -1 {
+            let mut i = 0
+            while i < sublist_length(elems_sl) {
+                tc_check_pattern_types(sublist_get(elems_sl, i))
+                i = i + 1
+            }
+        }
+        return
+    }
+    if kind == NodeKind.OrPattern {
+        tc_check_pattern_types(np_left.get(node).unwrap())
+        tc_check_pattern_types(np_right.get(node).unwrap())
+        return
+    }
+    if kind == NodeKind.AsPattern {
+        tc_check_pattern_types(np_pattern.get(node).unwrap())
+        nr_define(np_name.get(node).unwrap())
+        return
+    }
+    let _skip = 0
+}
+
+// ── Phase 2: Top-level driver ───────────────────────────────────────
+
+fn tc_infer_program(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    nr_scope_names = []
+    nr_scope_muts = []
+    nr_scope_types = []
+    nr_scope_reads = []
+    nr_scope_writes = []
+    nr_scope_nodes = []
+    nr_scope_frames = []
+    nr_scope_depth = 0
+    nr_loop_depth = 0
+    nr_push_scope()
+
+    // Register top-level let bindings
+    let lets_sl = np_stmts.get(program).unwrap()
+    if lets_sl != -1 {
+        let mut i = 0
+        while i < sublist_length(lets_sl) {
+            let l = sublist_get(lets_sl, i)
+            nr_define(np_name.get(l).unwrap())
+            i = i + 1
+        }
+    }
+
+    // Register function names
+    let fns_sl = np_params.get(program).unwrap()
+    if fns_sl != -1 {
+        let mut i = 0
+        while i < sublist_length(fns_sl) {
+            nr_define(np_name.get(sublist_get(fns_sl, i)).unwrap())
+            i = i + 1
+        }
+    }
+
+    // Type check each function body (skip unaffected when incremental filter active)
+    if fns_sl != -1 {
+        let mut i = 0
+        while i < sublist_length(fns_sl) {
+            let fn_node = sublist_get(fns_sl, i)
+            if tc_should_check_fn(np_name.get(fn_node).unwrap()) != 0 {
+                tc_check_fn(fn_node)
+            }
+            i = i + 1
+        }
+    }
+
+    // Type check impl methods (skip unaffected when incremental filter active)
+    let impls_sl = np_methods.get(program).unwrap()
+    if impls_sl != -1 {
+        let mut i = 0
+        while i < sublist_length(impls_sl) {
+            let im = sublist_get(impls_sl, i)
+            let impl_type = np_name.get(im).unwrap()
+            let methods_sl = np_methods.get(im).unwrap()
+            if methods_sl != -1 {
+                let mut j = 0
+                while j < sublist_length(methods_sl) {
+                    let m = sublist_get(methods_sl, j)
+                    let orig_name = np_name.get(m).unwrap()
+                    let qualified = "{impl_type}_{orig_name}"
+                    if tc_should_check_fn(qualified) != 0 {
+                        np_name.set(m, qualified)
+                        tc_check_fn(m)
+                        np_name.set(m, orig_name)
+                    }
+                    j = j + 1
+                }
+            }
+            i = i + 1
+        }
+    }
+
+    nr_pop_scope()
+}
+
+// ── Debug / introspection ───────────────────────────────────────────
+
+fn type_to_str(tid: Int) -> Str {
+    if tid < 0 || tid >= ty_kind.len() {
+        return "<?>"
+    }
+    let k = ty_kind.get(tid).unwrap()
+    let name = ty_name.get(tid).unwrap()
+
+    if k == TK_INT { return "Int" }
+    if k == TK_FLOAT { return "Float" }
+    if k == TK_BOOL { return "Bool" }
+    if k == TK_STR { return "Str" }
+    if k == TK_VOID { return "Void" }
+    if k == TK_UNKNOWN { return "?" }
+    if k == TK_TYPEVAR { return name }
+    if k == TK_STRUCT { return name }
+    if k == TK_ENUM { return name }
+
+    if k == TK_LIST {
+        let inner = ty_inner1.get(tid).unwrap()
+        return "List[{type_to_str(inner)}]"
+    }
+    if k == TK_OPTION {
+        let inner = ty_inner1.get(tid).unwrap()
+        return "Option[{type_to_str(inner)}]"
+    }
+    if k == TK_RESULT {
+        let ok_t = ty_inner1.get(tid).unwrap()
+        let err_t = ty_inner2.get(tid).unwrap()
+        return "Result[{type_to_str(ok_t)}, {type_to_str(err_t)}]"
+    }
+    if k == TK_MAP {
+        let key_t = ty_inner1.get(tid).unwrap()
+        let val_t = ty_inner2.get(tid).unwrap()
+        return "Map[{type_to_str(key_t)}, {type_to_str(val_t)}]"
+    }
+    if k == TK_SET {
+        let elem_t = ty_inner1.get(tid).unwrap()
+        return "Set[{type_to_str(elem_t)}]"
+    }
+    if k == TK_BYTES {
+        return "Bytes"
+    }
+    if k == TK_FN {
+        let ret = ty_inner1.get(tid).unwrap()
+        let start = ty_params_start.get(tid).unwrap()
+        let count = ty_params_count.get(tid).unwrap()
+        let mut params = ""
+        let mut i = 0
+        while i < count {
+            if i > 0 {
+                params = params.concat(", ")
+            }
+            params = params.concat(type_to_str(ty_param_list.get(start + i).unwrap()))
+            i = i + 1
+        }
+        return "Fn({params}) -> {type_to_str(ret)}"
+    }
+    if k == TK_TUPLE {
+        let start = ty_params_start.get(tid).unwrap()
+        let count = ty_params_count.get(tid).unwrap()
+        let mut elems = ""
+        let mut i = 0
+        while i < count {
+            if i > 0 {
+                elems = elems.concat(", ")
+            }
+            elems = elems.concat(type_to_str(ty_param_list.get(start + i).unwrap()))
+            i = i + 1
+        }
+        return "({elems})"
+    }
+
+    name
+}

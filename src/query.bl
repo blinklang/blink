@@ -1,0 +1,459 @@
+import symbol_index
+import std.json
+import std.flat_json
+
+// query.bl — Query engine for the symbol index
+//
+// Filters the symbol index and returns JSON results.
+// Supports: --layer intent|signature|contract|full, --effect, --pub --pure, --fn name.
+// Output format per spec section 8.5.
+
+// ── Effects string to JSON array ─────────────────────────────────────
+
+fn effects_to_json_node(effects: Str) -> Int {
+    let arr = json_new_array()
+    if effects != "" {
+        let mut _start = 0
+        let mut i = 0
+        while i <= effects.len() {
+            if i == effects.len() || effects.char_at(i) == 44 {
+                let part = effects.substring(_start, i - _start)
+                json_push(arr, json_new_str(part))
+                _start = i + 1
+            }
+            i = i + 1
+        }
+    }
+    arr
+}
+
+// ── Visibility name ──────────────────────────────────────────────────
+
+fn vis_name(vis: Int) -> Str {
+    if vis == VIS_PUB {
+        return "pub"
+    }
+    "private"
+}
+
+// ── Format a single symbol as a JSON object ──────────────────────────
+
+fn symbol_to_json(idx: Int) -> Str {
+    json_clear()
+    let obj = json_new_object()
+    json_set(obj, "name", json_new_str(si_sym_name.get(idx).unwrap()))
+    json_set(obj, "kind", json_new_str(sym_kind_name(si_sym_kind.get(idx).unwrap())))
+    json_set(obj, "module", json_new_str(si_sym_module.get(idx).unwrap()))
+    json_set(obj, "signature", json_new_str(si_sym_sig.get(idx).unwrap()))
+    json_set(obj, "effects", effects_to_json_node(si_sym_effects.get(idx).unwrap()))
+    json_set(obj, "visibility", json_new_str(vis_name(si_sym_vis.get(idx).unwrap())))
+    let intent = si_sym_intent.get(idx).unwrap()
+    if intent != "" {
+        json_set(obj, "intent", json_new_str(intent))
+    }
+    let doc = si_sym_doc.get(idx).unwrap()
+    if doc != "" {
+        json_set(obj, "doc", json_new_str(doc))
+    }
+    let req = si_sym_requires.get(idx).unwrap()
+    if req != "" {
+        json_set(obj, "requires", json_new_str(req))
+    }
+    let ens = si_sym_ensures.get(idx).unwrap()
+    if ens != "" {
+        json_set(obj, "ensures", json_new_str(ens))
+    }
+    let el = si_sym_end_line.get(idx).unwrap()
+    if el > 0 {
+        json_set(obj, "end_line", json_new_int(el))
+    }
+    let scol = si_sym_col.get(idx).unwrap()
+    if scol > 0 {
+        json_set(obj, "col", json_new_int(scol))
+    }
+    let ecol = si_sym_end_col.get(idx).unwrap()
+    if ecol > 0 {
+        json_set(obj, "end_col", json_new_int(ecol))
+    }
+    json_encode(obj)
+}
+
+// ── Wrap results array in envelope ───────────────────────────────────
+
+fn wrap_results(items: Str) -> Str {
+    "\{\"results\":[".concat(items).concat("]}")
+}
+
+// ── Check if comma-separated effects string contains a given effect ──
+
+fn effects_contain(effects: Str, target: Str) -> Int {
+    if effects == "" {
+        return 0
+    }
+    let mut _start = 0
+    let mut i = 0
+    while i <= effects.len() {
+        if i == effects.len() || effects.char_at(i) == 44 {
+            let part = effects.substring(_start, i - _start)
+            if part == target {
+                return 1
+            }
+            _start = i + 1
+        }
+        i = i + 1
+    }
+    0
+}
+
+// ── Query: list fn signatures in a module ────────────────────────────
+
+fn query_by_signature(module: Str) -> Str {
+    let mut items = ""
+    let mut _first = 1
+    let mut i = 0
+    while i < si_sym_count {
+        if si_sym_module.get(i).unwrap() == module && si_sym_kind.get(i).unwrap() == SK_FN {
+            if _first == 0 {
+                items = items.concat(",")
+            }
+            items = items.concat(symbol_to_json(i))
+            _first = 0
+        }
+        i = i + 1
+    }
+    wrap_results(items)
+}
+
+// ── Query: find fns with a matching effect ───────────────────────────
+
+fn query_by_effect(effect_name: Str) -> Str {
+    let mut items = ""
+    let mut _first = 1
+    let mut i = 0
+    while i < si_sym_count {
+        if si_sym_kind.get(i).unwrap() == SK_FN {
+            if effects_contain(si_sym_effects.get(i).unwrap(), effect_name) == 1 {
+                if _first == 0 {
+                    items = items.concat(",")
+                }
+                items = items.concat(symbol_to_json(i))
+                _first = 0
+            }
+        }
+        i = i + 1
+    }
+    wrap_results(items)
+}
+
+// ── Query: public functions with no effects (pure) ───────────────────
+
+fn query_pub_pure() -> Str {
+    let mut items = ""
+    let mut _first = 1
+    let mut i = 0
+    while i < si_sym_count {
+        if si_sym_kind.get(i).unwrap() == SK_FN && si_sym_vis.get(i).unwrap() == VIS_PUB && si_sym_effects.get(i).unwrap() == "" {
+            if _first == 0 {
+                items = items.concat(",")
+            }
+            items = items.concat(symbol_to_json(i))
+            _first = 0
+        }
+        i = i + 1
+    }
+    wrap_results(items)
+}
+
+// ── Query: lookup specific function by name ──────────────────────────
+
+fn query_by_name(name: Str) -> Str {
+    let names = name.split(",")
+    let mut items = ""
+    let mut i = 0
+    while i < names.len() {
+        let n = names.get(i).unwrap().trim()
+        let idx = si_find_sym(n)
+        if idx >= 0 {
+            if items != "" {
+                items = items.concat(",")
+            }
+            items = items.concat(symbol_to_json(idx))
+        }
+        i = i + 1
+    }
+    wrap_results(items)
+}
+
+// ── Composable query: apply all filters in a single pass ─────────────
+
+fn query_filtered(vis_filter: Int, module_filter: Str, effect_filter: Str, pure_only: Int, name_filter: Str) -> Str {
+    let mut items = ""
+    let mut _first = 1
+    let mut i = 0
+    while i < si_sym_count {
+        if si_sym_kind.get(i).unwrap() != SK_FN {
+            i = i + 1
+            continue
+        }
+        if vis_filter == VIS_PUB && si_sym_vis.get(i).unwrap() != VIS_PUB {
+            i = i + 1
+            continue
+        }
+        if module_filter != "" && si_sym_module.get(i).unwrap() != module_filter {
+            i = i + 1
+            continue
+        }
+        if effect_filter != "" && effects_contain(si_sym_effects.get(i).unwrap(), effect_filter) == 0 {
+            i = i + 1
+            continue
+        }
+        if pure_only != 0 && si_sym_effects.get(i).unwrap() != "" {
+            i = i + 1
+            continue
+        }
+        if name_filter != "" && si_sym_name.get(i).unwrap() != name_filter {
+            i = i + 1
+            continue
+        }
+        if _first == 0 {
+            items = items.concat(",")
+        }
+        items = items.concat(symbol_to_json(i))
+        _first = 0
+        i = i + 1
+    }
+    wrap_results(items)
+}
+
+// ── Layer: intent — minimal name + intent ────────────────────────────
+
+fn symbol_to_intent_json(idx: Int) -> Str {
+    json_clear()
+    let obj = json_new_object()
+    json_set(obj, "name", json_new_str(si_sym_name.get(idx).unwrap()))
+    json_set(obj, "intent", json_new_str(si_sym_intent.get(idx).unwrap()))
+    json_encode(obj)
+}
+
+// ── Layer: contract — signature + contracts ──────────────────────────
+
+fn symbol_to_contract_json(idx: Int) -> Str {
+    json_clear()
+    let obj = json_new_object()
+    json_set(obj, "name", json_new_str(si_sym_name.get(idx).unwrap()))
+    json_set(obj, "signature", json_new_str(si_sym_sig.get(idx).unwrap()))
+    json_set(obj, "effects", effects_to_json_node(si_sym_effects.get(idx).unwrap()))
+    json_set(obj, "visibility", json_new_str(vis_name(si_sym_vis.get(idx).unwrap())))
+    let req = si_sym_requires.get(idx).unwrap()
+    if req != "" {
+        json_set(obj, "requires", json_new_str(req))
+    }
+    let ens = si_sym_ensures.get(idx).unwrap()
+    if ens != "" {
+        json_set(obj, "ensures", json_new_str(ens))
+    }
+    json_encode(obj)
+}
+
+// ── Layer: full — everything including source text ───────────────────
+
+fn extract_lines(content: Str, start_line: Int, end_line: Int) -> Str {
+    let mut _line_num = 1
+    let mut _line_start = 0
+    let mut capture_start = -1
+    let mut i = 0
+    while i <= content.len() {
+        if i == content.len() || content.char_at(i) == 10 {
+            if _line_num == start_line {
+                capture_start = _line_start
+            }
+            if _line_num == end_line {
+                let capture_end = i
+                if capture_start < 0 {
+                    capture_start = _line_start
+                }
+                return content.substring(capture_start, capture_end - capture_start)
+            }
+            _line_num = _line_num + 1
+            _line_start = i + 1
+        }
+        i = i + 1
+    }
+    if capture_start >= 0 {
+        return content.substring(capture_start, content.len() - capture_start)
+    }
+    ""
+}
+
+fn symbol_to_full_json(idx: Int) -> Str {
+    json_clear()
+    let obj = json_new_object()
+    json_set(obj, "name", json_new_str(si_sym_name.get(idx).unwrap()))
+    json_set(obj, "kind", json_new_str(sym_kind_name(si_sym_kind.get(idx).unwrap())))
+    json_set(obj, "module", json_new_str(si_sym_module.get(idx).unwrap()))
+    json_set(obj, "signature", json_new_str(si_sym_sig.get(idx).unwrap()))
+    json_set(obj, "effects", effects_to_json_node(si_sym_effects.get(idx).unwrap()))
+    json_set(obj, "visibility", json_new_str(vis_name(si_sym_vis.get(idx).unwrap())))
+    let intent = si_sym_intent.get(idx).unwrap()
+    if intent != "" {
+        json_set(obj, "intent", json_new_str(intent))
+    }
+    let doc = si_sym_doc.get(idx).unwrap()
+    if doc != "" {
+        json_set(obj, "doc", json_new_str(doc))
+    }
+    let req = si_sym_requires.get(idx).unwrap()
+    if req != "" {
+        json_set(obj, "requires", json_new_str(req))
+    }
+    let ens = si_sym_ensures.get(idx).unwrap()
+    if ens != "" {
+        json_set(obj, "ensures", json_new_str(ens))
+    }
+    let line = si_sym_line.get(idx).unwrap()
+    json_set(obj, "line", json_new_int(line))
+    let el = si_sym_end_line.get(idx).unwrap()
+    if el > 0 {
+        json_set(obj, "end_line", json_new_int(el))
+        let file_path = si_sym_file.get(idx).unwrap()
+        if file_path != "" {
+            let file_content = read_file(file_path)
+            if file_content != "" {
+                let source = extract_lines(file_content, line, el)
+                if source != "" {
+                    json_set(obj, "source", json_new_str(source))
+                }
+            }
+        }
+    }
+    let full_scol = si_sym_col.get(idx).unwrap()
+    if full_scol > 0 {
+        json_set(obj, "col", json_new_int(full_scol))
+    }
+    let full_ecol = si_sym_end_col.get(idx).unwrap()
+    if full_ecol > 0 {
+        json_set(obj, "end_col", json_new_int(full_ecol))
+    }
+    json_encode(obj)
+}
+
+// ── Composable query with layer selection ─────────────────────────────
+
+fn format_symbol_for_layer(layer: Str, idx: Int) -> Str {
+    if layer == "intent" {
+        return symbol_to_intent_json(idx)
+    }
+    if layer == "contract" {
+        return symbol_to_contract_json(idx)
+    }
+    if layer == "full" {
+        return symbol_to_full_json(idx)
+    }
+    symbol_to_json(idx)
+}
+
+pub fn query_filtered_layer(layer: Str, vis_filter: Int, module_filter: Str, effect_filter: Str, pure_only: Int, name_filter: Str) -> Str {
+    let mut items = ""
+    let mut _first = 1
+    let mut i = 0
+    while i < si_sym_count {
+        if si_sym_kind.get(i).unwrap() != SK_FN {
+            i = i + 1
+            continue
+        }
+        if vis_filter == VIS_PUB && si_sym_vis.get(i).unwrap() != VIS_PUB {
+            i = i + 1
+            continue
+        }
+        if module_filter != "" && si_sym_module.get(i).unwrap() != module_filter {
+            i = i + 1
+            continue
+        }
+        if effect_filter != "" && effects_contain(si_sym_effects.get(i).unwrap(), effect_filter) == 0 {
+            i = i + 1
+            continue
+        }
+        if pure_only != 0 && si_sym_effects.get(i).unwrap() != "" {
+            i = i + 1
+            continue
+        }
+        if name_filter != "" && si_sym_name.get(i).unwrap() != name_filter {
+            i = i + 1
+            continue
+        }
+        if _first == 0 {
+            items = items.concat(",")
+        }
+        items = items.concat(format_symbol_for_layer(layer, i))
+        _first = 0
+        i = i + 1
+    }
+    wrap_results(items)
+}
+
+// ── Dispatch: parse JSON request, route to filter fn ─────────────────
+//
+// Request format:
+//   {"type":"signature","module":"main"}
+//   {"type":"effect","effect":"IO"}
+//   {"type":"pub_pure"}
+//   {"type":"fn","name":"foo"}
+
+fn query_at_position(file: Str, line: Int, col: Int) -> Str {
+    let idx = si_symbol_at(file, line, col)
+    if idx < 0 {
+        return wrap_results("")
+    }
+    wrap_results(symbol_to_json(idx))
+}
+
+pub fn query_dispatch(request: Str) -> Str {
+    if fj_parse(request) == 0 {
+        return "\{\"error\":\"invalid JSON request\"}"
+    }
+
+    let qtype = fj_get("type")
+    if qtype == "" {
+        return "\{\"error\":\"missing 'type' field\"}"
+    }
+
+    if qtype == "signature" {
+        let module = fj_get("module")
+        if module == "" {
+            return "\{\"error\":\"missing 'module' field for signature query\"}"
+        }
+        return query_by_signature(module)
+    }
+
+    if qtype == "effect" {
+        let eff_name = fj_get("effect")
+        if eff_name == "" {
+            return "\{\"error\":\"missing 'effect' field for effect query\"}"
+        }
+        return query_by_effect(eff_name)
+    }
+
+    if qtype == "pub_pure" {
+        return query_pub_pure()
+    }
+
+    if qtype == "fn" {
+        let name = fj_get("name")
+        if name == "" {
+            return "\{\"error\":\"missing 'name' field for fn query\"}"
+        }
+        return query_by_name(name)
+    }
+
+    if qtype == "at_position" {
+        let file = fj_get("file")
+        let line_str = fj_get("line")
+        let col_str = fj_get("col")
+        if file == "" || line_str == "" || col_str == "" {
+            return "\{\"error\":\"missing file, line, or col for at_position query\"}"
+        }
+        return query_at_position(file, parse_int(line_str), parse_int(col_str))
+    }
+
+    "\{\"error\":\"unknown query type: {qtype}\"}"
+}
