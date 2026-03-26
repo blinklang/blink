@@ -10,7 +10,7 @@ Always retrieve Blink docs before writing Blink code. Prefer retrieval-led reaso
 ## Architecture
 
 Pipeline: lexer → parser → typecheck → codegen → C output.
-Entry points: src/compiler.bl (compiler), src/cli.bl (CLI tool), src/pactc_main.bl (compiler binary).
+Entry points: src/compiler.bl (compiler), src/cli.bl (CLI tool), src/blinkc_main.bl (compiler binary).
 Stdlib: lib/std/. Tests: tests/. Spec: sections/. Decisions: decisions/.
 Build output: build/ (gitignored). Temp files: .tmp/ (gitignored, use instead of /tmp).
 
