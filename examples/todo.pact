@@ -1,4 +1,3 @@
-// xtest — Result codegen with data enums needs fixes (pact_Result_int_TodoError vs pact_Result_str_TodoError)
 // todo.pact — Structs, enums, traits, error handling
 //
 // Demonstrates: type (struct/enum), trait, impl, Result,
