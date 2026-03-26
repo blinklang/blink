@@ -24,8 +24,8 @@ let blink_cli_version: Str = "dev"
 const embedded_llms_full: Str = #embed("../llms-full.md")
 const embedded_llms_short: Str = #embed("../llms.md")
 const embedded_runtime_h: Str = #embed("../build/runtime.h")
-const embedded_upgrade_cmd: Str = #embed("../.claude/blink-marketplace/plugins/blink/skills/upgrade/SKILL.md")
-const embedded_init_cmd: Str = #embed("../.claude/blink-marketplace/plugins/blink/skills/init/SKILL.md")
+const embedded_upgrade_cmd: Str = #embed("../.claude/blink-marketplace/plugins/blink/skills/blink:upgrade/SKILL.md")
+const embedded_init_cmd: Str = #embed("../.claude/blink-marketplace/plugins/blink/skills/blink:init/SKILL.md")
 const embedded_std_args: Str = #embed("../lib/std/args.bl")
 const embedded_pkg_audit: Str = #embed("../lib/pkg/audit.bl")
 const embedded_pkg_gitdeps: Str = #embed("../lib/pkg/gitdeps.bl")
@@ -1862,6 +1862,44 @@ fn cmd_fmt(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Repo
     }
 }
 
+fn setup_marketplace(pwd: Str) {
+    let base = ".claude/blink-marketplace"
+    let plugin_dir = "{base}/plugins/blink"
+    shell_exec("rm -rf {plugin_dir}/skills/upgrade {plugin_dir}/skills/init")
+    shell_exec("mkdir -p {base}/.claude-plugin {plugin_dir}/.claude-plugin {plugin_dir}/skills/blink:upgrade {plugin_dir}/skills/blink:init")
+
+    write_file("{base}/.claude-plugin/marketplace.json", "\{\"name\":\"blink-plugins\",\"owner\":\{\"name\":\"Blink\"},\"plugins\":[\{\"name\":\"blink\",\"source\":\"./plugins/blink\",\"description\":\"Blink language support: LSP, skills, and tools\"}]}")
+    write_file("{plugin_dir}/.claude-plugin/plugin.json", "\{\"name\":\"blink\",\"description\":\"Blink language support: LSP, skills, and tools\",\"version\":\"1.0.0\"}")
+    write_file("{plugin_dir}/.lsp.json", "\{\"blink\":\{\"command\":\"blink\",\"args\":[\"lsp\"],\"extensionToLanguage\":\{\".pact\":\"blink\",\".bl\":\"blink\"}}}")
+    write_file("{plugin_dir}/skills/blink:upgrade/SKILL.md", embedded_upgrade_cmd)
+    write_file("{plugin_dir}/skills/blink:init/SKILL.md", embedded_init_cmd)
+
+    let settings_path = ".claude/settings.json"
+    json_clear()
+    let root = if file_exists(settings_path) == 1 {
+        let parsed = json_parse(read_file(settings_path))
+        if parsed < 0 {
+            json_clear()
+            json_new_object()
+        } else {
+            parsed
+        }
+    } else {
+        json_new_object()
+    }
+
+    let source_obj = json_new_object()
+    json_set(source_obj, "source", json_new_str("directory"))
+    json_set(source_obj, "path", json_new_str(pwd.concat("/.claude/blink-marketplace")))
+    let entry = json_new_object()
+    json_set(entry, "source", source_obj)
+    let mkts = json_ensure_object(root, "extraKnownMarketplaces")
+    json_set(mkts, "blink-plugins", entry)
+    let plugins = json_ensure_object(root, "enabledPlugins")
+    json_set(plugins, "blink@blink-plugins", json_new_bool(1))
+    write_file(settings_path, json_encode(root))
+}
+
 fn migrate_pact_marketplace() {
     let old_dir = ".claude/pact-marketplace"
     let new_dir = ".claude/blink-marketplace"
@@ -1870,51 +1908,24 @@ fn migrate_pact_marketplace() {
     }
     shell_exec("mv {old_dir} {new_dir}")
 
-    let mkt_json = "\{\"name\":\"blink-plugins\",\"owner\":\{\"name\":\"Blink\"},\"plugins\":[\{\"name\":\"blink\",\"source\":\"./plugins/blink\",\"description\":\"Blink language support: LSP, skills, and tools\"}]}"
-    write_file("{new_dir}/.claude-plugin/marketplace.json", mkt_json)
-
-    let plugin_dir = "{new_dir}/plugins/blink"
-    shell_exec("mkdir -p {plugin_dir}/.claude-plugin {plugin_dir}/skills/upgrade {plugin_dir}/skills/init")
-
-    let plugin_json = "\{\"name\":\"blink\",\"description\":\"Blink language support: LSP, skills, and tools\",\"version\":\"1.0.0\"}"
-    write_file("{plugin_dir}/.claude-plugin/plugin.json", plugin_json)
-
-    let lsp_json = "\{\"blink\":\{\"command\":\"blink\",\"args\":[\"lsp\"],\"extensionToLanguage\":\{\".pact\":\"blink\",\".bl\":\"blink\"}}}"
-    write_file("{plugin_dir}/.lsp.json", lsp_json)
-
-    write_file("{plugin_dir}/skills/upgrade/SKILL.md", embedded_upgrade_cmd)
-    write_file("{plugin_dir}/skills/init/SKILL.md", embedded_init_cmd)
-
     let settings_path = ".claude/settings.json"
     if file_exists(settings_path) == 1 {
         json_clear()
         let root = json_parse(read_file(settings_path))
         if root >= 0 {
-            let pwd = process_run("pwd", []).out.trim()
             let mkts = json_get(root, "extraKnownMarketplaces")
-            if mkts >= 0 {
-                json_remove(mkts, "pact-plugins")
-            }
+            if mkts >= 0 { json_remove(mkts, "pact-plugins") }
             let plugins = json_get(root, "enabledPlugins")
             if plugins >= 0 {
                 json_remove(plugins, "pact@pact-plugins")
                 json_remove(plugins, "blink@pact-plugins")
             }
-
-            let new_mkts = json_ensure_object(root, "extraKnownMarketplaces")
-            let source_obj = json_new_object()
-            json_set(source_obj, "source", json_new_str("directory"))
-            json_set(source_obj, "path", json_new_str(pwd.concat("/.claude/blink-marketplace")))
-            let entry = json_new_object()
-            json_set(entry, "source", source_obj)
-            json_set(new_mkts, "blink-plugins", entry)
-
-            let new_plugins = json_ensure_object(root, "enabledPlugins")
-            json_set(new_plugins, "blink@blink-plugins", json_new_bool(1))
-
             write_file(settings_path, json_encode(root))
         }
     }
+
+    let pwd = process_run("pwd", []).out.trim()
+    setup_marketplace(pwd)
     io.println("  migrated: .claude/pact-marketplace → .claude/blink-marketplace")
 }
 
@@ -2005,50 +2016,7 @@ fn cmd_init(_p: ArgParser, a: Args) {
     // Set up Claude Code plugin (LSP + skills)
     migrate_pact_marketplace()
     let pwd = process_run("pwd", []).out.trim()
-    let marketplace_abs = pwd.concat("/.claude/blink-marketplace")
-    shell_exec("mkdir -p .claude/blink-marketplace/.claude-plugin .claude/blink-marketplace/plugins/blink/.claude-plugin .claude/blink-marketplace/plugins/blink/skills/upgrade .claude/blink-marketplace/plugins/blink/skills/init")
-
-    let marketplace_json = "\{\"name\":\"blink-plugins\",\"owner\":\{\"name\":\"Blink\"},\"plugins\":[\{\"name\":\"blink\",\"source\":\"./plugins/blink\",\"description\":\"Blink language support: LSP, skills, and tools\"}]}"
-    write_file(".claude/blink-marketplace/.claude-plugin/marketplace.json", marketplace_json)
-
-    let plugin_json = "\{\"name\":\"blink\",\"description\":\"Blink language support: LSP, skills, and tools\",\"version\":\"1.0.0\"}"
-    write_file(".claude/blink-marketplace/plugins/blink/.claude-plugin/plugin.json", plugin_json)
-
-    let lsp_json = "\{\"blink\":\{\"command\":\"blink\",\"args\":[\"lsp\"],\"extensionToLanguage\":\{\".pact\":\"blink\",\".bl\":\"blink\"}}}"
-    write_file(".claude/blink-marketplace/plugins/blink/.lsp.json", lsp_json)
-
-    write_file(".claude/blink-marketplace/plugins/blink/skills/upgrade/SKILL.md", embedded_upgrade_cmd)
-    write_file(".claude/blink-marketplace/plugins/blink/skills/init/SKILL.md", embedded_init_cmd)
-
-    // Create/update .claude/settings.json with marketplace path
-    let claude_settings = ".claude/settings.json"
-    json_clear()
-    let root = if file_exists(claude_settings) == 1 {
-        let parsed = json_parse(read_file(claude_settings))
-        if parsed < 0 {
-            json_clear()
-            json_new_object()
-        } else {
-            parsed
-        }
-    } else {
-        json_new_object()
-    }
-
-    let source_obj = json_new_object()
-    json_set(source_obj, "source", json_new_str("directory"))
-    json_set(source_obj, "path", json_new_str(marketplace_abs))
-
-    let marketplace_entry = json_new_object()
-    json_set(marketplace_entry, "source", source_obj)
-
-    let mkts = json_ensure_object(root, "extraKnownMarketplaces")
-    json_set(mkts, "blink-plugins", marketplace_entry)
-
-    let plugins = json_ensure_object(root, "enabledPlugins")
-    json_set(plugins, "blink@blink-plugins", json_new_bool(1))
-
-    write_file(claude_settings, json_encode(root))
+    setup_marketplace(pwd)
     io.println("  configured Claude Code plugin (LSP + skills)")
     io.println("\n  To activate the Blink plugin in Claude Code:")
     io.println("    /plugin install blink@blink-plugins --scope project")
@@ -2338,7 +2306,7 @@ fn cmd_update(_p: ArgParser, a: Args) {
 
     stamp_blink_version()
     migrate_pact_marketplace()
-    let upgrade_skill = ".claude/blink-marketplace/plugins/blink/skills/upgrade/SKILL.md"
+    let upgrade_skill = ".claude/blink-marketplace/plugins/blink/skills/blink:upgrade/SKILL.md"
     if file_exists(upgrade_skill) == 1 {
         let existing = read_file(upgrade_skill)
         if existing != embedded_upgrade_cmd {
@@ -2346,7 +2314,7 @@ fn cmd_update(_p: ArgParser, a: Args) {
             io.println("updated: blink plugin upgrade skill")
         }
     }
-    let init_skill = ".claude/blink-marketplace/plugins/blink/skills/init/SKILL.md"
+    let init_skill = ".claude/blink-marketplace/plugins/blink/skills/blink:init/SKILL.md"
     if file_exists(init_skill) == 1 {
         let existing_init = read_file(init_skill)
         if existing_init != embedded_init_cmd {

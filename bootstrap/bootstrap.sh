@@ -53,7 +53,7 @@ elif command -v blink > /dev/null 2>&1; then
 else
     echo "ERROR: No compiler found." >&2
     echo "Either build/blinkc must exist, or 'blink' must be on PATH." >&2
-    echo "Install blink from: https://github.com/nhumrich/blink/releases" >&2
+    echo "Install blink from: https://github.com/blinklang/blink/releases" >&2
     exit 1
 fi
 

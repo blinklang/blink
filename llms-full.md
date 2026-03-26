@@ -2,6 +2,18 @@
 
 > Blink is a statically-typed, effect-tracked language compiling to C. **Compiler v0.26.0**.
 
+## Install
+
+**Binary** (Linux/macOS): download from [GitHub Releases](https://github.com/blinklang/blink/releases/latest) and place on PATH.
+
+**Docker**:
+```
+docker pull ghcr.io/blinklang/blink:latest
+docker run --rm -v "$PWD":/workspace ghcr.io/blinklang/blink run myfile.bl
+```
+
+Tags: `latest`, `0.26`, `0.26.0` (semver). Image is `debian:bookworm-slim` with `gcc`, `zig`, `blink`, `libgc-dev`, and `libsqlite3-dev`.
+
 ## Recent Breaking Changes (v0.26)
 
 | Change | Details |

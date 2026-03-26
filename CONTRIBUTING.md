@@ -9,7 +9,7 @@ How to work on the Blink interpreter and compiler.
 ## Setup
 
 ```sh
-git clone https://github.com/nhumrich/blink.git
+git clone https://github.com/blinklang/blink.git
 cd blink
 ./bootstrap/bootstrap.sh
 ```

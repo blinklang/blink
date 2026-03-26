@@ -19,7 +19,7 @@ RUN curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-x86_64-${Z
     && ln -s /usr/local/zig-linux-x86_64-${ZIG_VERSION}/zig /usr/local/bin/zig \
     && rm /tmp/zig.tar.xz
 
-RUN curl -fsSL "https://github.com/nhumrich/blink/releases/download/${BLINK_VERSION}/blink-linux-x86_64" \
+RUN curl -fsSL "https://github.com/blinklang/blink/releases/download/${BLINK_VERSION}/blink-linux-x86_64" \
     -o /usr/local/bin/blink \
     && chmod +x /usr/local/bin/blink
 

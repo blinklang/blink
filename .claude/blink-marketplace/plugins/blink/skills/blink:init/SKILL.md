@@ -1,5 +1,5 @@
 ---
-name: init
+name: blink:init
 description: Set up or enrich AI assistant context for a Blink project
 ---
 

@@ -18,7 +18,7 @@ Blink was created through a multi-expert AI panel process — multiple AI specia
 
 ### Binary download
 
-Download `blink` for your platform from the [latest release](https://github.com/nhumrich/blink/releases/latest), then:
+Download `blink` for your platform from the [latest release](https://github.com/blinklang/blink/releases/latest), then:
 
 ```sh
 chmod +x blink-*
@@ -28,7 +28,7 @@ sudo mv blink-* /usr/local/bin/blink
 ### Build from source
 
 ```sh
-git clone https://github.com/nhumrich/blink.git
+git clone https://github.com/blinklang/blink.git
 cd blink
 task build    # bootstrap, compile, install to ~/.local/bin/
 ```
@@ -36,8 +36,8 @@ task build    # bootstrap, compile, install to ~/.local/bin/
 ### Docker
 
 ```sh
-docker run --rm -v "$PWD":/workspace ghcr.io/nhumrich/blink build src/main.bl
-docker run --rm -v "$PWD":/workspace ghcr.io/nhumrich/blink run src/main.bl
+docker run --rm -v "$PWD":/workspace ghcr.io/blinklang/blink build src/main.bl
+docker run --rm -v "$PWD":/workspace ghcr.io/blinklang/blink run src/main.bl
 ```
 
 ---

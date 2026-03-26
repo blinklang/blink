@@ -6,12 +6,12 @@ Targets native binaries via C codegen.
 
 ## Install
 
-**Binary** (Linux/macOS): download from [GitHub Releases](https://github.com/nhumrich/blink/releases/latest) and place on PATH.
+**Binary** (Linux/macOS): download from [GitHub Releases](https://github.com/blinklang/blink/releases/latest) and place on PATH.
 
 **Docker**:
 ```
-docker pull ghcr.io/nhumrich/blink:latest
-docker run --rm -v "$PWD":/workspace ghcr.io/nhumrich/blink run myfile.bl
+docker pull ghcr.io/blinklang/blink:latest
+docker run --rm -v "$PWD":/workspace ghcr.io/blinklang/blink run myfile.bl
 ```
 
 Tags: `latest`, `0.26`, `0.26.0` (semver). Image is `debian:bookworm-slim` with `gcc`, `zig`, `blink`, `libgc-dev`, and `libsqlite3-dev`.

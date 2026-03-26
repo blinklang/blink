@@ -23,7 +23,7 @@ Download a prebuilt binary from the [releases page](#) for your platform.
 Blink is self-hosting — the compiler is written in Blink and compiles itself. A checked-in C file provides the bootstrap:
 
 ```sh
-git clone https://github.com/nhumrich/blink.git
+git clone https://github.com/blinklang/blink.git
 cd blink
 ./bootstrap/bootstrap.sh
 ```

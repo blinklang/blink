@@ -1,5 +1,5 @@
 ---
-name: upgrade
+name: blink:upgrade
 description: Guided migration assistant for upgrading Blink projects to a new version
 ---
 
