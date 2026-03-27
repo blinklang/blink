@@ -1,0 +1,100 @@
+fn run_cmd(cmd: Str, label: Str) -> Int {
+    let rc = shell_exec(cmd)
+    if rc != 0 {
+        io.println("FAIL: {label} (rc={rc})")
+    }
+    rc
+}
+
+fn check_output(path: Str, expected: Str, label: Str) {
+    shell_exec("{path} > {path}_out.txt 2>&1 || true")
+    let output = read_file("{path}_out.txt")
+    if output.starts_with(expected) {
+        io.println("PASS: {label}")
+    } else {
+        io.println("FAIL: {label} — expected '{expected}', got: {output}")
+    }
+}
+
+fn check_build_error(base: Str, pact: Str, src: Str, expected_err: Str, label: Str) {
+    shell_exec("cd {base}/app && {pact} build {src} -o build/err_test 2>../err.txt; true")
+    let output = read_file("{base}/err.txt")
+    if output.contains(expected_err) != 0 {
+        io.println("PASS: {label}")
+    } else {
+        io.println("FAIL: {label} — expected error containing '{expected_err}', got: {output}")
+    }
+}
+
+fn main() {
+    let base = ".tmp/_test_module_enum_qualified"
+    shell_exec("rm -rf {base}")
+    let pact = "../../../bin/blink"
+    shell_exec("mkdir -p {base}/mylib/src")
+    write_file("{base}/mylib/blink.toml", "[package]\nname = \"mylib\"\nversion = \"0.1.0\"\n")
+    write_file(
+        "{base}/mylib/src/lib.bl",
+        "pub type Color \{\n    Red, Green, Blue,\n}\n\npub type Shape \{\n    Circle(radius: Float)\n    Rect(w: Float, h: Float)\n}\n\npub fn color_name(c: Int) -> Str \{\n    \"color\"\n}\n"
+    )
+    shell_exec("mkdir -p {base}/app/src")
+    write_file(
+        "{base}/app/blink.toml",
+        "[package]\nname = \"app\"\nversion = \"1.0.0\"\n\n[dependencies]\nmylib = \{ path = \"../mylib\" }\n"
+    )
+    // Test 1: Type-qualified enum access works (Color.Red)
+    write_file(
+        "{base}/app/src/t1.bl",
+        "import mylib\n\nfn main() \{\n    let c = Color.Red\n    io.println(\"ok\")\n}\n"
+    )
+    let rc1 = run_cmd(
+        "cd {base}/app && {pact} build src/t1.bl -o build/t1 2>&1",
+        "build type-qualified enum"
+    )
+    if rc1 != 0 {
+        shell_exec("rm -rf {base}")
+        return
+    }
+    check_output("{base}/app/build/t1", "ok", "type-qualified Color.Red works")
+    // Test 2: Module-qualified enum access rejected (mylib.Color.Red)
+    write_file(
+        "{base}/app/src/t2.bl",
+        "import mylib\n\nfn main() \{\n    let c = mylib.Color.Red\n    io.println(\"bad\")\n}\n"
+    )
+    check_build_error(base, pact, "src/t2.bl", "ModuleQualifiedType", "module-qualified enum rejected")
+    // Test 3: Module-qualified function still works (mylib.color_name())
+    write_file(
+        "{base}/app/src/t3.bl",
+        "import mylib\n\nfn main() \{\n    io.println(mylib.color_name(0))\n}\n"
+    )
+    let rc3 = run_cmd(
+        "cd {base}/app && {pact} build src/t3.bl -o build/t3 2>&1",
+        "build module-qualified fn"
+    )
+    if rc3 != 0 {
+        shell_exec("rm -rf {base}")
+        return
+    }
+    check_output("{base}/app/build/t3", "color", "module-qualified fn call works")
+    // Test 4: Module-qualified data enum access rejected (mylib.Shape.Circle)
+    write_file(
+        "{base}/app/src/t4.bl",
+        "import mylib\n\nfn main() \{\n    let s = mylib.Shape.Circle(5.0)\n    io.println(\"bad\")\n}\n"
+    )
+    check_build_error(base, pact, "src/t4.bl", "ModuleQualifiedType", "module-qualified data enum rejected")
+    // Test 5: Selective import with type-qualified access works
+    write_file(
+        "{base}/app/src/t5.bl",
+        "import mylib.\{Color}\n\nfn main() \{\n    let c = Color.Blue\n    io.println(\"ok\")\n}\n"
+    )
+    let rc5 = run_cmd(
+        "cd {base}/app && {pact} build src/t5.bl -o build/t5 2>&1",
+        "build selective type-qualified"
+    )
+    if rc5 != 0 {
+        shell_exec("rm -rf {base}")
+        return
+    }
+    check_output("{base}/app/build/t5", "ok", "selective import Color.Blue works")
+    shell_exec("rm -rf {base}")
+    io.println("all module enum qualified tests done")
+}
