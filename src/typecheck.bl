@@ -1325,6 +1325,41 @@ pub fn is_import_module_name(name: Str) -> Int {
     0
 }
 
+fn is_filtered_for_module(name: Str, source_mod: Str, consuming_mod: Str) -> Int {
+    if source_mod == consuming_mod { return 0 }
+    if source_mod == "" || source_mod == "__main__" { return 0 }
+    if consuming_mod == "" { return 0 }
+    let key = "{consuming_mod}:{source_mod}"
+    if per_module_imports.has(key) != 0 {
+        let imp_node = per_module_imports.get(key)
+        if imp_node == -1 { return 0 }
+        return is_selected_import(name, imp_node) == 0
+    }
+    0
+}
+
+fn is_builtin_name(name: Str) -> Int {
+    if is_primitive_type(name) != 0 { return 1 }
+    if is_builtin_fn(name) != 0 { return 1 }
+    0
+}
+
+fn nr_check_selective_access(name: Str, node: Int) -> Int ! Diag.Report {
+    if nr_current_module == "" { return 0 }
+    if is_builtin_name(name) != 0 { return 0 }
+    if tc_symbol_module.has(name) == 0 { return 0 }
+    let source_mod = tc_symbol_module.get(name)
+    if is_filtered_for_module(name, source_mod, nr_current_module) != 0 {
+        if node == -1 {
+            diag_error_no_loc("ImportNotSelected", "E1006", "'{name}' is not in scope — add it to the import list or use qualified access '{source_mod}.{name}'", "add '{name}' to your selective import")
+        } else {
+            diag_error_at("ImportNotSelected", "E1006", "'{name}' is not in scope — add it to the import list or use qualified access '{source_mod}.{name}'", node, "add '{name}' to your selective import")
+        }
+        return 1
+    }
+    0
+}
+
 // ── Import visibility ───────────────────────────────────────────────
 
 let mut nr_private_imports: Map[Str, Str] = Map()
@@ -1788,12 +1823,19 @@ fn is_trait_name(name: Str) -> Int {
     0
 }
 
-fn is_known_type(name: Str) -> Int {
+fn is_primitive_type(name: Str) -> Int {
     if name == "Int" || name == "Float" || name == "Bool" || name == "Str" { return 1 }
     if name == "Void" || name == "List" || name == "Option" || name == "Result" { return 1 }
-    if name == "Iterator" || name == "Handle" || name == "Channel" || name == "Map" || name == "Set" || name == "Bytes" || name == "Instant" || name == "Duration" || name == "Char" || name == "StringBuilder" { return 1 }
-    if name == "Ptr" || name == "U8" || name == "U16" || name == "U32" || name == "U64" || name == "I8" || name == "I16" || name == "I32" || name == "I64" { return 1 }
+    if name == "Iterator" || name == "Handle" || name == "Channel" || name == "Map" || name == "Set" { return 1 }
+    if name == "Bytes" || name == "Instant" || name == "Duration" || name == "Char" || name == "StringBuilder" { return 1 }
+    if name == "Ptr" || name == "U8" || name == "U16" || name == "U32" || name == "U64" { return 1 }
+    if name == "I8" || name == "I16" || name == "I32" || name == "I64" { return 1 }
     if name == "Fn" || name == "Self" || name == "Tuple" { return 1 }
+    0
+}
+
+fn is_known_type(name: Str) -> Int {
+    if is_primitive_type(name) != 0 { return 1 }
     if lookup_named_type(name) != -1 { return 1 }
     0
 }
@@ -1855,10 +1897,7 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, Diag.Report {
             let fn_node = sublist_get(fns_sl_priv, i)
             let fn_mod = np_module.get(fn_node).unwrap()
             if fn_mod != "" && np_is_pub.get(fn_node).unwrap() != 0 {
-                let fn_name = np_name.get(fn_node).unwrap()
-                if is_filtered_import(fn_name, fn_mod) == 0 {
-                    nr_pub_names.set(fn_name, 1)
-                }
+                nr_pub_names.set(np_name.get(fn_node).unwrap(), 1)
             }
             i = i + 1
         }
@@ -1870,17 +1909,14 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, Diag.Report {
             let td = sublist_get(types_sl_priv, i)
             let td_mod = np_module.get(td).unwrap()
             if td_mod != "" && np_is_pub.get(td).unwrap() != 0 {
-                let td_name = np_name.get(td).unwrap()
-                if is_filtered_import(td_name, td_mod) == 0 {
-                    nr_pub_names.set(td_name, 1)
-                    let td_flds = np_fields.get(td).unwrap()
-                    if td_flds != -1 && sublist_length(td_flds) > 0 {
-                        if np_kind.get(sublist_get(td_flds, 0)).unwrap() == NodeKind.TypeVariant {
-                            let mut vi = 0
-                            while vi < sublist_length(td_flds) {
-                                nr_pub_names.set(np_name.get(sublist_get(td_flds, vi)).unwrap(), 1)
-                                vi = vi + 1
-                            }
+                nr_pub_names.set(np_name.get(td).unwrap(), 1)
+                let td_flds = np_fields.get(td).unwrap()
+                if td_flds != -1 && sublist_length(td_flds) > 0 {
+                    if np_kind.get(sublist_get(td_flds, 0)).unwrap() == NodeKind.TypeVariant {
+                        let mut vi = 0
+                        while vi < sublist_length(td_flds) {
+                            nr_pub_names.set(np_name.get(sublist_get(td_flds, vi)).unwrap(), 1)
+                            vi = vi + 1
                         }
                     }
                 }
@@ -1895,10 +1931,7 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, Diag.Report {
             let tr = sublist_get(traits_sl_priv, i)
             let tr_mod = np_module.get(tr).unwrap()
             if tr_mod != "" && np_is_pub.get(tr).unwrap() != 0 {
-                let tr_name = np_name.get(tr).unwrap()
-                if is_filtered_import(tr_name, tr_mod) == 0 {
-                    nr_pub_names.set(tr_name, 1)
-                }
+                nr_pub_names.set(np_name.get(tr).unwrap(), 1)
             }
             i = i + 1
         }
@@ -1910,10 +1943,7 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, Diag.Report {
             let l = sublist_get(lets_sl_priv, i)
             let l_mod = np_module.get(l).unwrap()
             if l_mod != "" && np_is_pub.get(l).unwrap() != 0 {
-                let l_name = np_name.get(l).unwrap()
-                if is_filtered_import(l_name, l_mod) == 0 {
-                    nr_pub_names.set(l_name, 1)
-                }
+                nr_pub_names.set(np_name.get(l).unwrap(), 1)
             }
             i = i + 1
         }
@@ -2016,10 +2046,6 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, Diag.Report {
             let l = sublist_get(lets_sl, i)
             let l_name = np_name.get(l).unwrap()
             let l_mod = np_module.get(l).unwrap()
-            if l_mod != "" && l_mod != "__main__" && is_filtered_import(l_name, l_mod) != 0 {
-                i = i + 1
-                continue
-            }
             if l_mod != "__main__" && tc_original_to_alias.has(l_name) {
                 let alias = tc_original_to_alias.get(l_name)
                 nr_check_ambiguity(alias, l_mod, main_names)
@@ -2041,10 +2067,6 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, Diag.Report {
             let fn_node = sublist_get(fns_sl, i)
             let fn_name = np_name.get(fn_node).unwrap()
             let fn_mod = np_module.get(fn_node).unwrap()
-            if fn_mod != "" && fn_mod != "__main__" && is_filtered_import(fn_name, fn_mod) != 0 {
-                i = i + 1
-                continue
-            }
             if fn_mod != "__main__" && tc_original_to_alias.has(fn_name) {
                 let alias = tc_original_to_alias.get(fn_name)
                 nr_check_ambiguity(alias, fn_mod, main_names)
@@ -2180,6 +2202,7 @@ fn nr_check_type_ref(name: Str) ! TypeCheck.Resolve, Diag.Report {
     if name == "" { return }
     if name.len() == 1 { return }
     if is_known_type(name) != 0 {
+        if nr_check_selective_access(name, -1) != 0 { return }
         if is_private_access(name) != 0 {
             tc_errors.push("cannot access private type '{name}'")
             diag_error_no_loc("PrivateItemAccess", "E1003", "cannot access private type '{name}' from another module", "mark the type as 'pub' in its module")
@@ -2189,6 +2212,7 @@ fn nr_check_type_ref(name: Str) ! TypeCheck.Resolve, Diag.Report {
         return
     }
     if is_trait_name(name) != 0 {
+        if nr_check_selective_access(name, -1) != 0 { return }
         if is_private_access(name) != 0 {
             tc_errors.push("cannot access private trait '{name}'")
             diag_error_no_loc("PrivateItemAccess", "E1003", "cannot access private trait '{name}' from another module", "mark the trait as 'pub' in its module")
@@ -2276,6 +2300,7 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, Diag.Report {
         let name = np_name.get(node).unwrap()
         if name == "true" || name == "false" || name == "None" { return }
         if nr_is_defined(name) != 0 {
+            if nr_check_selective_access(name, node) != 0 { return }
             if is_private_access(name) != 0 {
                 tc_errors.push("cannot access private item '{name}'")
                 diag_error_at("PrivateItemAccess", "E1003", "cannot access private item '{name}' from another module", node, "mark the item as 'pub' in its module")
@@ -2287,6 +2312,7 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, Diag.Report {
         if name == "io" || name == "fs" || name == "net" || name == "db" || name == "env" || name == "time" || name == "async" || name == "channel" || name == "default" { return }
         if is_user_effect_handle_name(name) != 0 { return }
         if is_variant_name(name) != 0 {
+            if nr_check_selective_access(name, node) != 0 { return }
             if is_private_access(name) != 0 {
                 tc_errors.push("cannot access private variant '{name}'")
                 diag_error_at("PrivateItemAccess", "E1003", "cannot access private variant '{name}' from another module", node, "mark the enum as 'pub' in its module")
@@ -2297,6 +2323,7 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, Diag.Report {
         }
         if is_builtin_fn(name) != 0 { return }
         if is_known_type(name) != 0 {
+            if nr_check_selective_access(name, node) != 0 { return }
             if is_private_access(name) != 0 {
                 tc_errors.push("cannot access private type '{name}'")
                 diag_error_at("PrivateItemAccess", "E1003", "cannot access private type '{name}' from another module", node, "mark the type as 'pub' in its module")
@@ -2306,6 +2333,7 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, Diag.Report {
             return
         }
         if is_trait_name(name) != 0 {
+            if nr_check_selective_access(name, node) != 0 { return }
             if is_private_access(name) != 0 {
                 tc_errors.push("cannot access private trait '{name}'")
                 diag_error_at("PrivateItemAccess", "E1003", "cannot access private trait '{name}' from another module", node, "mark the trait as 'pub' in its module")
@@ -2352,18 +2380,19 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, Diag.Report {
             let callee_kind = np_kind.get(callee).unwrap()
             if callee_kind == NodeKind.Ident {
                 let fn_name = np_name.get(callee).unwrap()
-                let fn_is_priv = is_private_access(fn_name)
-                if nr_is_defined(fn_name) != 0 && fn_is_priv != 0 {
-                    tc_errors.push("cannot access private function '{fn_name}'")
-                    diag_error_at("PrivateItemAccess", "E1003", "cannot access private function '{fn_name}' from another module", node, "mark the function as 'pub' in its module")
-                } else if is_variant_name(fn_name) != 0 && fn_is_priv != 0 {
-                    tc_errors.push("cannot access private variant '{fn_name}'")
-                    diag_error_at("PrivateItemAccess", "E1003", "cannot access private variant '{fn_name}' from another module", node, "mark the enum as 'pub' in its module")
-                } else if nr_is_defined(fn_name) == 0 && is_builtin_fn(fn_name) == 0 && is_variant_name(fn_name) == 0 && is_known_type(fn_name) == 0 && is_trait_name(fn_name) == 0 {
-                    tc_errors.push("undefined function '{fn_name}'")
-                    diag_error_at("UndefinedFunction", "E0504", "undefined function '{fn_name}'", node, "")
-                } else {
-                    tc_mark_symbol_used(fn_name)
+                if nr_check_selective_access(fn_name, node) == 0 {
+                    if nr_is_defined(fn_name) != 0 && is_private_access(fn_name) != 0 {
+                        tc_errors.push("cannot access private function '{fn_name}'")
+                        diag_error_at("PrivateItemAccess", "E1003", "cannot access private function '{fn_name}' from another module", node, "mark the function as 'pub' in its module")
+                    } else if is_variant_name(fn_name) != 0 && is_private_access(fn_name) != 0 {
+                        tc_errors.push("cannot access private variant '{fn_name}'")
+                        diag_error_at("PrivateItemAccess", "E1003", "cannot access private variant '{fn_name}' from another module", node, "mark the enum as 'pub' in its module")
+                    } else if nr_is_defined(fn_name) == 0 && is_builtin_fn(fn_name) == 0 && is_variant_name(fn_name) == 0 && is_known_type(fn_name) == 0 && is_trait_name(fn_name) == 0 {
+                        tc_errors.push("undefined function '{fn_name}'")
+                        diag_error_at("UndefinedFunction", "E0504", "undefined function '{fn_name}'", node, "")
+                    } else {
+                        tc_mark_symbol_used(fn_name)
+                    }
                 }
             } else {
                 nr_check_node(callee)

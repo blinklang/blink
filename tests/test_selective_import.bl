@@ -16,84 +16,112 @@ fn check_output(path: Str, expected: Str, label: Str) {
     }
 }
 
+fn check_build_error(base: Str, pact: Str, src: Str, expected_err: Str, label: Str) {
+    shell_exec("cd {base}/app && {pact} build {src} -o build/err_test 2>../err.txt; true")
+    let output = read_file("{base}/err.txt")
+    if output.contains(expected_err) != 0 {
+        io.println("PASS: {label}")
+    } else {
+        io.println("FAIL: {label} — expected error containing '{expected_err}', got: {output}")
+    }
+}
+
 fn main() {
     let base = ".tmp/_test_selective_import"
     shell_exec("rm -rf {base}")
     let pact = "../../../bin/blink"
-
     shell_exec("mkdir -p {base}/mylib/src")
     write_file("{base}/mylib/blink.toml", "[package]\nname = \"mylib\"\nversion = \"0.1.0\"\n")
     write_file(
         "{base}/mylib/src/lib.bl",
-        "pub fn add(a: Int, b: Int) -> Int \{\n    a + b\n}\n\npub fn multiply(a: Int, b: Int) -> Int \{\n    a * b\n}\n\npub fn subtract(a: Int, b: Int) -> Int \{\n    a - b\n}\n"
+        "pub fn add(a: Int, b: Int) -> Int \{\n    a + b\n}\n\npub fn multiply(a: Int, b: Int) -> Int \{\n    a * b\n}\n\npub fn subtract(a: Int, b: Int) -> Int \{\n    a - b\n}\n\npub type Point \{ x: Int, y: Int }\n"
     )
-
     shell_exec("mkdir -p {base}/app/src")
     write_file(
         "{base}/app/blink.toml",
         "[package]\nname = \"app\"\nversion = \"1.0.0\"\n\n[dependencies]\nmylib = \{ path = \"../mylib\" }\n"
     )
-
-    // Test 1: Selective import — only selected item is accessible
+    // Test 1: Selective import — selected item works
     write_file(
         "{base}/app/src/t1.bl",
-        "import mylib.\{add\}\n\nfn main() \{\n    io.println(\"\{add(2, 3)\}\")\n}\n"
+        "import mylib.\{add}\n\nfn main() \{\n    io.println(\"\{add(2, 3)}\")\n}\n"
     )
-    let rc1 = run_cmd("cd {base}/app && {pact} build src/t1.bl -o build/t1 2>&1", "build selective add")
+    let rc1 = run_cmd(
+        "cd {base}/app && {pact} build src/t1.bl -o build/t1 2>&1",
+        "build selective add"
+    )
     if rc1 != 0 {
         shell_exec("rm -rf {base}")
         return
     }
     check_output("{base}/app/build/t1", "5", "selective import: add works")
-
-    // Test 2: Unselected item is still accessible in emit-all model
-    // (selective imports are documentation, not enforcement, in the current compilation model)
+    // Test 2: Unselected item is rejected
     write_file(
         "{base}/app/src/t2.bl",
-        "import mylib.\{add\}\n\nfn main() \{\n    io.println(\"\{multiply(2, 3)\}\")\n}\n"
+        "import mylib.\{add}\n\nfn main() \{\n    io.println(\"\{multiply(2, 3)}\")\n}\n"
     )
-    let rc2 = run_cmd("cd {base}/app && {pact} build src/t2.bl -o build/t2 2>&1", "build unselected item (allowed in emit-all)")
-    if rc2 != 0 {
-        shell_exec("rm -rf {base}")
-        return
-    }
-    check_output("{base}/app/build/t2", "6", "unselected item accessible in emit-all model")
-
+    check_build_error(base, pact, "src/t2.bl", "ImportNotSelected", "unselected item rejected")
     // Test 3: Bare import — all items accessible
     write_file(
         "{base}/app/src/t3.bl",
-        "import mylib\n\nfn main() \{\n    io.println(\"\{add(2, 3)\}\")\n    io.println(\"\{multiply(4, 5)\}\")\n    io.println(\"\{subtract(10, 3)\}\")\n}\n"
+        "import mylib\n\nfn main() \{\n    io.println(\"\{add(2, 3)}\")\n    io.println(\"\{multiply(4, 5)}\")\n    io.println(\"\{subtract(10, 3)}\")\n}\n"
     )
-    let rc3 = run_cmd("cd {base}/app && {pact} build src/t3.bl -o build/t3 2>&1", "build bare import")
+    let rc3 = run_cmd(
+        "cd {base}/app && {pact} build src/t3.bl -o build/t3 2>&1",
+        "build bare import"
+    )
     if rc3 != 0 {
         shell_exec("rm -rf {base}")
         return
     }
     check_output("{base}/app/build/t3", "5", "bare import: all items accessible")
-
     // Test 4: Multiple selective items
     write_file(
         "{base}/app/src/t4.bl",
-        "import mylib.\{add, multiply\}\n\nfn main() \{\n    io.println(\"\{add(2, 3)\}\")\n    io.println(\"\{multiply(4, 5)\}\")\n}\n"
+        "import mylib.\{add, multiply}\n\nfn main() \{\n    io.println(\"\{add(2, 3)}\")\n    io.println(\"\{multiply(4, 5)}\")\n}\n"
     )
-    let rc4 = run_cmd("cd {base}/app && {pact} build src/t4.bl -o build/t4 2>&1", "build multi selective")
+    let rc4 = run_cmd(
+        "cd {base}/app && {pact} build src/t4.bl -o build/t4 2>&1",
+        "build multi selective"
+    )
     if rc4 != 0 {
         shell_exec("rm -rf {base}")
         return
     }
     check_output("{base}/app/build/t4", "5", "multi selective: add+multiply work")
-
-    // Test 5: Multiple selective items — unselected item still accessible in emit-all
+    // Test 5: Multiple selective — unselected item rejected
     write_file(
         "{base}/app/src/t5.bl",
-        "import mylib.\{add, multiply\}\n\nfn main() \{\n    io.println(\"\{subtract(10, 3)\}\")\n}\n"
+        "import mylib.\{add, multiply}\n\nfn main() \{\n    io.println(\"\{subtract(10, 3)}\")\n}\n"
     )
-    let rc5 = run_cmd("cd {base}/app && {pact} build src/t5.bl -o build/t5 2>&1", "build unselected subtract (allowed in emit-all)")
-    if rc5 != 0 {
+    check_build_error(base, pact, "src/t5.bl", "ImportNotSelected", "unselected subtract rejected")
+    // Test 6: Qualified access works even for unselected items
+    write_file(
+        "{base}/app/src/t6.bl",
+        "import mylib.\{add}\n\nfn main() \{\n    io.println(\"\{add(2, 3)}\")\n    io.println(\"\{mylib.multiply(4, 5)}\")\n}\n"
+    )
+    let rc6 = run_cmd(
+        "cd {base}/app && {pact} build src/t6.bl -o build/t6 2>&1",
+        "build qualified access"
+    )
+    if rc6 != 0 {
         shell_exec("rm -rf {base}")
         return
     }
-    check_output("{base}/app/build/t5", "7", "unselected subtract accessible in emit-all model")
-
+    check_output("{base}/app/build/t6", "5", "qualified access works for unselected")
+    // Test 7: Selective import of a type
+    write_file(
+        "{base}/app/src/t7.bl",
+        "import mylib.\{Point}\n\nfn main() \{\n    let p = Point \{ x: 1, y: 2 }\n    io.println(\"\{p.x + p.y}\")\n}\n"
+    )
+    let rc7 = run_cmd(
+        "cd {base}/app && {pact} build src/t7.bl -o build/t7 2>&1",
+        "build selective type"
+    )
+    if rc7 != 0 {
+        shell_exec("rm -rf {base}")
+        return
+    }
+    check_output("{base}/app/build/t7", "3", "selective import: type works")
     shell_exec("rm -rf {base}")
 }
