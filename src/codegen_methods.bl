@@ -879,6 +879,40 @@ fn emit_builtin_trait_method(node: Int, obj_str: Str, obj_type: Int, obj_node: I
     0
 }
 
+// Emit a direct C printf/fprintf call with type dispatch.
+// fmt_prefix is the C call prefix before the format string, e.g. "printf(" or "fprintf(stderr, ".
+// prefix is an optional string prepended to the output, e.g. "[LOG] " or "".
+fn emit_io_typed_direct(fmt_prefix: Str, arg_str: Str, arg_type: Int, newline: Int, prefix: Str) ! Codegen.Emit {
+    let nl = if newline != 0 { "\\n" } else { "" }
+    if arg_type == CT_INT {
+        emit_line("{fmt_prefix}\"{prefix}%%lld{nl}\", (long long){arg_str});")
+    } else if arg_type == CT_FLOAT {
+        emit_line("{fmt_prefix}\"{prefix}%%g{nl}\", {arg_str});")
+    } else if arg_type == CT_BOOL {
+        emit_line("{fmt_prefix}\"{prefix}%%s{nl}\", {arg_str} ? \"true\" : \"false\");")
+    } else {
+        emit_line("{fmt_prefix}\"{prefix}%%s{nl}\", {arg_str});")
+    }
+}
+
+// Emit snprintf + vtable call with type dispatch (for non-handler IO paths).
+// vtable_method is the C vtable call, e.g. "__pact_ctx.io->print" or "__pact_ctx.io->log".
+fn emit_io_typed_vtable(vtable_method: Str, arg_str: Str, arg_type: Int, tmp_prefix: Str) ! Codegen.Emit {
+    if arg_type == CT_INT {
+        let tmp = fresh_temp(tmp_prefix)
+        emit_line("char {tmp}[64]; snprintf({tmp}, 64, \"%%lld\", (long long){arg_str});")
+        emit_line("{vtable_method}({tmp});")
+    } else if arg_type == CT_FLOAT {
+        let tmp = fresh_temp(tmp_prefix)
+        emit_line("char {tmp}[64]; snprintf({tmp}, 64, \"%%g\", {arg_str});")
+        emit_line("{vtable_method}({tmp});")
+    } else if arg_type == CT_BOOL {
+        emit_line("{vtable_method}({arg_str} ? \"true\" : \"false\");")
+    } else {
+        emit_line("{vtable_method}({arg_str});")
+    }
+}
+
 @allow(UnrestoredMutation, IncompleteStateRestore)
 pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
     let obj_node = np_obj.get(node).unwrap()
@@ -1063,29 +1097,9 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             let arg_type = expr_result_type
             emit_trace_effect_typed("IO", "io.println", "msg", arg_str, arg_type)
             if cg_in_handler_body != 0 {
-                if arg_type == CT_INT {
-                    emit_line("printf(\"%%lld\\n\", (long long){arg_str});")
-                } else if arg_type == CT_FLOAT {
-                    emit_line("printf(\"%%g\\n\", {arg_str});")
-                } else if arg_type == CT_BOOL {
-                    emit_line("printf(\"%%s\\n\", {arg_str} ? \"true\" : \"false\");")
-                } else {
-                    emit_line("printf(\"%%s\\n\", {arg_str});")
-                }
+                emit_io_typed_direct("printf(", arg_str, arg_type, 1, "")
             } else {
-                if arg_type == CT_INT {
-                    let tmp = fresh_temp("_io_")
-                    emit_line("char {tmp}[64]; snprintf({tmp}, 64, \"%%lld\", (long long){arg_str});")
-                    emit_line("__pact_ctx.io->print({tmp});")
-                } else if arg_type == CT_FLOAT {
-                    let tmp = fresh_temp("_io_")
-                    emit_line("char {tmp}[64]; snprintf({tmp}, 64, \"%%g\", {arg_str});")
-                    emit_line("__pact_ctx.io->print({tmp});")
-                } else if arg_type == CT_BOOL {
-                    emit_line("__pact_ctx.io->print({arg_str} ? \"true\" : \"false\");")
-                } else {
-                    emit_line("__pact_ctx.io->print({arg_str});")
-                }
+                emit_io_typed_vtable("__pact_ctx.io->print", arg_str, arg_type, "_io_")
             }
         } else {
             if cg_in_handler_body != 0 {
@@ -1104,17 +1118,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
         let args_sl = np_args.get(node).unwrap()
         if args_sl != -1 && sublist_length(args_sl) > 0 {
             emit_expr(sublist_get(args_sl, 0))
-            let arg_str = expr_result_str
-            let arg_type = expr_result_type
-            if arg_type == CT_INT {
-                emit_line("printf(\"%%lld\", (long long){arg_str});")
-            } else if arg_type == CT_FLOAT {
-                emit_line("printf(\"%%g\", {arg_str});")
-            } else if arg_type == CT_BOOL {
-                emit_line("printf(\"%%s\", {arg_str} ? \"true\" : \"false\");")
-            } else {
-                emit_line("printf(\"%%s\", {arg_str});")
-            }
+            emit_io_typed_direct("printf(", expr_result_str, expr_result_type, 0, "")
         }
         expr_result_str = "0"
         expr_result_type = CT_VOID
@@ -1129,15 +1133,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             let arg_str = expr_result_str
             let arg_type = expr_result_type
             emit_trace_effect_typed("IO", "io.eprintln", "msg", arg_str, arg_type)
-            if arg_type == CT_INT {
-                emit_line("fprintf(stderr, \"%%lld\\n\", (long long){arg_str});")
-            } else if arg_type == CT_FLOAT {
-                emit_line("fprintf(stderr, \"%%g\\n\", {arg_str});")
-            } else if arg_type == CT_BOOL {
-                emit_line("fprintf(stderr, \"%%s\\n\", {arg_str} ? \"true\" : \"false\");")
-            } else {
-                emit_line("fprintf(stderr, \"%%s\\n\", {arg_str});")
-            }
+            emit_io_typed_direct("fprintf(stderr, ", arg_str, arg_type, 1, "")
         } else {
             emit_line("fprintf(stderr, \"\\n\");")
         }
@@ -1151,17 +1147,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
         let args_sl = np_args.get(node).unwrap()
         if args_sl != -1 && sublist_length(args_sl) > 0 {
             emit_expr(sublist_get(args_sl, 0))
-            let arg_str = expr_result_str
-            let arg_type = expr_result_type
-            if arg_type == CT_INT {
-                emit_line("fprintf(stderr, \"%%lld\", (long long){arg_str});")
-            } else if arg_type == CT_FLOAT {
-                emit_line("fprintf(stderr, \"%%g\", {arg_str});")
-            } else if arg_type == CT_BOOL {
-                emit_line("fprintf(stderr, \"%%s\", {arg_str} ? \"true\" : \"false\");")
-            } else {
-                emit_line("fprintf(stderr, \"%%s\", {arg_str});")
-            }
+            emit_io_typed_direct("fprintf(stderr, ", expr_result_str, expr_result_type, 0, "")
         }
         expr_result_str = "0"
         expr_result_type = CT_VOID
@@ -1177,29 +1163,9 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             let arg_type = expr_result_type
             emit_trace_effect_typed("IO", "io.log", "msg", arg_str, arg_type)
             if cg_in_handler_body != 0 {
-                if arg_type == CT_INT {
-                    emit_line("fprintf(stderr, \"[LOG] %%lld\\n\", (long long){arg_str});")
-                } else if arg_type == CT_FLOAT {
-                    emit_line("fprintf(stderr, \"[LOG] %%g\\n\", {arg_str});")
-                } else if arg_type == CT_BOOL {
-                    emit_line("fprintf(stderr, \"[LOG] %%s\\n\", {arg_str} ? \"true\" : \"false\");")
-                } else {
-                    emit_line("fprintf(stderr, \"[LOG] %%s\\n\", {arg_str});")
-                }
+                emit_io_typed_direct("fprintf(stderr, ", arg_str, arg_type, 1, "[LOG] ")
             } else {
-                if arg_type == CT_INT {
-                    let tmp = fresh_temp("_log_")
-                    emit_line("char {tmp}[64]; snprintf({tmp}, 64, \"%%lld\", (long long){arg_str});")
-                    emit_line("__pact_ctx.io->log({tmp});")
-                } else if arg_type == CT_FLOAT {
-                    let tmp = fresh_temp("_log_")
-                    emit_line("char {tmp}[64]; snprintf({tmp}, 64, \"%%g\", {arg_str});")
-                    emit_line("__pact_ctx.io->log({tmp});")
-                } else if arg_type == CT_BOOL {
-                    emit_line("__pact_ctx.io->log({arg_str} ? \"true\" : \"false\");")
-                } else {
-                    emit_line("__pact_ctx.io->log({arg_str});")
-                }
+                emit_io_typed_vtable("__pact_ctx.io->log", arg_str, arg_type, "_log_")
             }
         }
         expr_result_str = "0"
