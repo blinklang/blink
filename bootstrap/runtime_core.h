@@ -901,11 +901,16 @@ BLINK_UNUSED static void* pact_closure_get_capture(const pact_closure* c, int64_
 /* ── IO ─────────────────────────────────────────────────────────────── */
 typedef struct {
     void  (*print)(const char* msg);
+    void  (*print_no_nl)(const char* msg);
     void  (*log)(const char* msg);
 } pact_io_vtable;
 
 BLINK_UNUSED static void pact_io_default_print(const char* msg) {
     printf("%s\n", msg);
+}
+
+BLINK_UNUSED static void pact_io_default_print_no_nl(const char* msg) {
+    printf("%s", msg);
 }
 
 BLINK_UNUSED static void pact_io_default_log(const char* msg) {
@@ -914,6 +919,7 @@ BLINK_UNUSED static void pact_io_default_log(const char* msg) {
 
 BLINK_UNUSED static pact_io_vtable pact_io_vtable_default = {
     pact_io_default_print,
+    pact_io_default_print_no_nl,
     pact_io_default_log
 };
 

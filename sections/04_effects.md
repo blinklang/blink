@@ -175,7 +175,8 @@ Declaring an effect in a function signature brings a **handle** into scope. The 
 
 ```blink
 fn example() ! IO.Print, FS.Read, DB.Read, Net.Connect, Crypto.Hash {
-    io.print("Starting...")          // IO.Print handle
+    io.print("Starting...")          // IO.Print handle (no newline)
+    io.println("Done!")              // IO.Print handle (with newline)
     let data = fs.read("input.txt")  // FS.Read handle
     let rows = db.read("SELECT *..") // DB.Read handle — string literal auto-parameterized to Query[DB]
     let resp = net.get(url)?          // Net.Connect handle
@@ -183,11 +184,25 @@ fn example() ! IO.Print, FS.Read, DB.Read, Net.Connect, Crypto.Hash {
 }
 ```
 
+**IO operations by dispatch mode:**
+
+| Operation | Behavior | Vtable-dispatched | Handler-interceptable | Trace |
+|---|---|---|---|---|
+| `io.print(x)` | stdout, no newline | Yes (`IO.Print`) | Yes | Yes |
+| `io.println(x)` | stdout, with newline | Yes (`IO.Print`) | Yes | Yes |
+| `io.log(x)` | stderr, `[LOG]` prefix + newline | Yes (`IO.Log`) | Yes | Yes |
+| `io.eprintln(x)` | stderr, with newline | No | No | Yes |
+| `io.eprint(x)` | stderr, no newline | No | No | Yes |
+| `io.print_raw(x)` | raw stdout, no newline | No | No | No |
+| `io.eprint_raw(x)` | raw stderr, no newline | No | No | No |
+
+The `_raw` variants are escape hatches for cases where direct C output is needed (e.g., streaming JSON fragments, progress indicators). They bypass the effect handler system entirely and emit no trace effects. Prefer `io.print`/`io.println` for application code; reserve `_raw` for low-level tooling.
+
 **Handle naming is deterministic:**
 
 | Effect | Handle | Operations |
 |---|---|---|
-| `IO` / `IO.*` | `io` | `io.print(...)`, `io.log(...)` |
+| `IO` / `IO.*` | `io` | `io.print(...)`, `io.println(...)`, `io.log(...)`, `io.eprintln(...)`, `io.eprint(...)`, `io.print_raw(...)`, `io.eprint_raw(...)` |
 | `FS` / `FS.*` | `fs` | `fs.read(...)`, `fs.write(...)`, `fs.delete(...)`, `fs.watch(...)` |
 | `DB` / `DB.*` | `db` | `db.read(...)`, `db.write(...)`, `db.admin(...)` |
 | `Net` / `Net.*` | `net` | `net.request(...)`, `net.get(...)`, `net.post(...)`, `net.listen(...)`, `net.dns(...)` |

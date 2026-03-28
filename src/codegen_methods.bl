@@ -913,6 +913,43 @@ fn emit_io_typed_vtable(vtable_method: Str, arg_str: Str, arg_type: Int, tmp_pre
     }
 }
 
+// Unified IO output method emitter. Parameters:
+// - trace_op: trace label (e.g. "io.println"), empty = no trace
+// - direct_prefix: C call prefix for direct mode (e.g. "printf(" or "fprintf(stderr, ")
+// - newline: 1 = append \n, 0 = no newline
+// - vtable_method: vtable call (e.g. "__pact_ctx.io->print"), empty = always direct
+// - vtable_tmp: temp prefix for vtable snprintf buffers, empty if no vtable
+// - direct_text_prefix: text prefix in direct mode (e.g. "[LOG] "), usually empty
+// - zero_arg_direct: C statement for zero-arg call in handler body, empty = no-op
+// - zero_arg_vtable: C statement for zero-arg call outside handler body, empty = no-op
+@allow(UnrestoredMutation, IncompleteStateRestore)
+fn emit_io_output(node: Int, trace_op: Str, direct_prefix: Str, newline: Int, vtable_method: Str, vtable_tmp: Str, direct_text_prefix: Str, zero_arg_direct: Str, zero_arg_vtable: Str) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
+    let args_sl = np_args.get(node).unwrap()
+    if args_sl != -1 && sublist_length(args_sl) > 0 {
+        emit_expr(sublist_get(args_sl, 0))
+        let arg_str = expr_result_str
+        let arg_type = expr_result_type
+        if trace_op != "" {
+            emit_trace_effect_typed("IO", trace_op, "msg", arg_str, arg_type)
+        }
+        if vtable_method != "" && cg_in_handler_body == 0 {
+            emit_io_typed_vtable(vtable_method, arg_str, arg_type, vtable_tmp)
+        } else {
+            emit_io_typed_direct(direct_prefix, arg_str, arg_type, newline, direct_text_prefix)
+        }
+    } else if zero_arg_direct != "" || zero_arg_vtable != "" {
+        if cg_in_handler_body != 0 || zero_arg_vtable == "" {
+            if zero_arg_direct != "" {
+                emit_line(zero_arg_direct)
+            }
+        } else {
+            emit_line(zero_arg_vtable)
+        }
+    }
+    expr_result_str = "0"
+    expr_result_type = CT_VOID
+}
+
 @allow(UnrestoredMutation, IncompleteStateRestore)
 pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
     let obj_node = np_obj.get(node).unwrap()
@@ -1088,140 +1125,77 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
         }
     }
 
-    // Special case: io.println — dispatch through IO vtable (unless in handler body)
-    if np_kind.get(obj_node).unwrap() == NodeKind.Ident && np_name.get(obj_node).unwrap() == "io" && method == "println" {
-        let args_sl = np_args.get(node).unwrap()
-        if args_sl != -1 && sublist_length(args_sl) > 0 {
-            emit_expr(sublist_get(args_sl, 0))
-            let arg_str = expr_result_str
-            let arg_type = expr_result_type
-            emit_trace_effect_typed("IO", "io.println", "msg", arg_str, arg_type)
-            if cg_in_handler_body != 0 {
-                emit_io_typed_direct("printf(", arg_str, arg_type, 1, "")
-            } else {
-                emit_io_typed_vtable("__pact_ctx.io->print", arg_str, arg_type, "_io_")
-            }
-        } else {
-            if cg_in_handler_body != 0 {
-                emit_line("printf(\"\\n\");")
-            } else {
-                emit_line("__pact_ctx.io->print(\"\");")
-            }
+    // io.* output methods — unified dispatch
+    if np_kind.get(obj_node).unwrap() == NodeKind.Ident && np_name.get(obj_node).unwrap() == "io" {
+        if method == "println" {
+            emit_io_output(node, "io.println", "printf(", 1, "__pact_ctx.io->print", "_io_", "", "printf(\"\\n\");", "__pact_ctx.io->print(\"\");")
+            return
         }
-        expr_result_str = "0"
-        expr_result_type = CT_VOID
-        return
-    }
-
-    // io.print — like println but no trailing newline (direct printf, no vtable)
-    if np_kind.get(obj_node).unwrap() == NodeKind.Ident && np_name.get(obj_node).unwrap() == "io" && method == "print" {
-        let args_sl = np_args.get(node).unwrap()
-        if args_sl != -1 && sublist_length(args_sl) > 0 {
-            emit_expr(sublist_get(args_sl, 0))
-            emit_io_typed_direct("printf(", expr_result_str, expr_result_type, 0, "")
+        if method == "print" {
+            emit_io_output(node, "io.print", "printf(", 0, "__pact_ctx.io->print_no_nl", "_io_nonl_", "", "", "")
+            return
         }
-        expr_result_str = "0"
-        expr_result_type = CT_VOID
-        return
-    }
-
-    // io.eprintln — print to stderr with newline (direct fprintf)
-    if np_kind.get(obj_node).unwrap() == NodeKind.Ident && np_name.get(obj_node).unwrap() == "io" && method == "eprintln" {
-        let args_sl = np_args.get(node).unwrap()
-        if args_sl != -1 && sublist_length(args_sl) > 0 {
-            emit_expr(sublist_get(args_sl, 0))
-            let arg_str = expr_result_str
-            let arg_type = expr_result_type
-            emit_trace_effect_typed("IO", "io.eprintln", "msg", arg_str, arg_type)
-            emit_io_typed_direct("fprintf(stderr, ", arg_str, arg_type, 1, "")
-        } else {
-            emit_line("fprintf(stderr, \"\\n\");")
+        if method == "print_raw" {
+            emit_io_output(node, "", "printf(", 0, "", "", "", "", "")
+            return
         }
-        expr_result_str = "0"
-        expr_result_type = CT_VOID
-        return
-    }
-
-    // io.eprint — print to stderr without newline
-    if np_kind.get(obj_node).unwrap() == NodeKind.Ident && np_name.get(obj_node).unwrap() == "io" && method == "eprint" {
-        let args_sl = np_args.get(node).unwrap()
-        if args_sl != -1 && sublist_length(args_sl) > 0 {
-            emit_expr(sublist_get(args_sl, 0))
-            emit_io_typed_direct("fprintf(stderr, ", expr_result_str, expr_result_type, 0, "")
+        if method == "eprintln" {
+            emit_io_output(node, "io.eprintln", "fprintf(stderr, ", 1, "", "", "", "fprintf(stderr, \"\\n\");", "")
+            return
         }
-        expr_result_str = "0"
-        expr_result_type = CT_VOID
-        return
-    }
-
-    // io.log — dispatch through IO vtable (unless in handler body)
-    if np_kind.get(obj_node).unwrap() == NodeKind.Ident && np_name.get(obj_node).unwrap() == "io" && method == "log" {
-        let args_sl = np_args.get(node).unwrap()
-        if args_sl != -1 && sublist_length(args_sl) > 0 {
-            emit_expr(sublist_get(args_sl, 0))
-            let arg_str = expr_result_str
-            let arg_type = expr_result_type
-            emit_trace_effect_typed("IO", "io.log", "msg", arg_str, arg_type)
-            if cg_in_handler_body != 0 {
-                emit_io_typed_direct("fprintf(stderr, ", arg_str, arg_type, 1, "[LOG] ")
-            } else {
-                emit_io_typed_vtable("__pact_ctx.io->log", arg_str, arg_type, "_log_")
-            }
+        if method == "eprint" {
+            emit_io_output(node, "io.eprint", "fprintf(stderr, ", 0, "", "", "", "", "")
+            return
         }
-        expr_result_str = "0"
-        expr_result_type = CT_VOID
-        return
-    }
-
-    // io.read_line() — read one line from stdin
-    if np_kind.get(obj_node).unwrap() == NodeKind.Ident && np_name.get(obj_node).unwrap() == "io" && method == "read_line" {
-        let tmp = fresh_temp("_rline_")
-        emit_line("const char* {tmp} = pact_stdin_read_line();")
-        expr_result_str = tmp
-        expr_result_type = CT_STRING
-        return
-    }
-
-    // io.read_bytes(n) — read exactly n bytes from stdin, returns Bytes
-    if np_kind.get(obj_node).unwrap() == NodeKind.Ident && np_name.get(obj_node).unwrap() == "io" && method == "read_bytes" {
-        let args_sl = np_args.get(node).unwrap()
-        if args_sl != -1 && sublist_length(args_sl) > 0 {
-            emit_expr(sublist_get(args_sl, 0))
-            let n_str = expr_result_str
-            let tmp = fresh_temp("_rbytes_")
-            emit_line("pact_bytes* {tmp} = pact_stdin_read_bytes({n_str});")
+        if method == "eprint_raw" {
+            emit_io_output(node, "", "fprintf(stderr, ", 0, "", "", "", "", "")
+            return
+        }
+        if method == "log" {
+            emit_io_output(node, "io.log", "fprintf(stderr, ", 1, "__pact_ctx.io->log", "_log_", "[LOG] ", "", "")
+            return
+        }
+        if method == "read_line" {
+            let tmp = fresh_temp("_rline_")
+            emit_line("const char* {tmp} = pact_stdin_read_line();")
             expr_result_str = tmp
-        } else {
-            expr_result_str = "pact_bytes_new()"
+            expr_result_type = CT_STRING
+            return
         }
-        expr_result_type = CT_BYTES
-        return
-    }
-
-    // io.write(s) — write string to stdout with immediate flush
-    if np_kind.get(obj_node).unwrap() == NodeKind.Ident && np_name.get(obj_node).unwrap() == "io" && method == "write" {
-        let args_sl = np_args.get(node).unwrap()
-        if args_sl != -1 && sublist_length(args_sl) > 0 {
-            emit_expr(sublist_get(args_sl, 0))
-            let arg_str = expr_result_str
-            emit_line("pact_stdout_write({arg_str});")
+        if method == "read_bytes" {
+            let args_sl = np_args.get(node).unwrap()
+            if args_sl != -1 && sublist_length(args_sl) > 0 {
+                emit_expr(sublist_get(args_sl, 0))
+                let n_str = expr_result_str
+                let tmp = fresh_temp("_rbytes_")
+                emit_line("pact_bytes* {tmp} = pact_stdin_read_bytes({n_str});")
+                expr_result_str = tmp
+            } else {
+                expr_result_str = "pact_bytes_new()"
+            }
+            expr_result_type = CT_BYTES
+            return
         }
-        expr_result_str = "0"
-        expr_result_type = CT_VOID
-        return
-    }
-
-    // io.write_bytes(b) — write bytes to stdout with immediate flush
-    if np_kind.get(obj_node).unwrap() == NodeKind.Ident && np_name.get(obj_node).unwrap() == "io" && method == "write_bytes" {
-        let args_sl = np_args.get(node).unwrap()
-        if args_sl != -1 && sublist_length(args_sl) > 0 {
-            emit_expr(sublist_get(args_sl, 0))
-            let arg_str = expr_result_str
-            emit_line("pact_stdout_write_bytes({arg_str});")
+        if method == "write" {
+            let args_sl = np_args.get(node).unwrap()
+            if args_sl != -1 && sublist_length(args_sl) > 0 {
+                emit_expr(sublist_get(args_sl, 0))
+                emit_line("pact_stdout_write({expr_result_str});")
+            }
+            expr_result_str = "0"
+            expr_result_type = CT_VOID
+            return
         }
-        expr_result_str = "0"
-        expr_result_type = CT_VOID
-        return
+        if method == "write_bytes" {
+            let args_sl = np_args.get(node).unwrap()
+            if args_sl != -1 && sublist_length(args_sl) > 0 {
+                emit_expr(sublist_get(args_sl, 0))
+                emit_line("pact_stdout_write_bytes({expr_result_str});")
+            }
+            expr_result_str = "0"
+            expr_result_type = CT_VOID
+            return
+        }
     }
 
     // time.read() — returns Instant via Time vtable (convert from pact_instant_struct)
