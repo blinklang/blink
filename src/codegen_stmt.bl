@@ -2,8 +2,8 @@
 
 import codegen_types.{
     CT_BOOL, CT_BYTES, CT_CHANNEL, CT_CLOSURE, CT_FFI_SCOPE, CT_FLOAT,
-    CT_HANDLE, CT_INT, CT_ITERATOR, CT_LIST, CT_MAP, CT_OPTION, CT_PTR,
-    CT_RESULT, CT_STRING, CT_STRINGBUILDER, CT_VOID,
+    CT_HANDLE, CT_HANDLER, CT_INT, CT_ITERATOR, CT_LIST, CT_MAP, CT_OPTION,
+    CT_PTR, CT_RESULT, CT_STRING, CT_STRINGBUILDER, CT_VOID,
     EnumReg, EnumVariant, MatchScrutEntry, StructFieldClosureSig,
     StructFieldDefault, StructFieldEntry, StructFieldListElem,
     StructInvariant, VarEnumEntry,
@@ -11,7 +11,8 @@ import codegen_types.{
     c_type_str, c_type_tag, cg_current_fn_name, cg_current_fn_node,
     cg_current_fn_option_inner, cg_current_fn_ret, cg_ffi_lib_set,
     cg_ffi_libs, cg_global_inits, cg_handler_is_user_effect,
-    cg_handler_vtable_field, cg_indent, cg_let_target_ann,
+    cg_handler_vtable_field, cg_handler_vtable_type,
+    cg_indent, cg_let_target_ann,
     cg_let_target_name, cg_let_target_type, cg_lines, cg_program_node,
     cg_temp_counter, cg_trace_codegen, compound_name_from_ann, emit_line,
     emitted_let_names, emitted_let_set, ensure_iter_type,
@@ -23,6 +24,8 @@ import codegen_types.{
     get_list_nested_elem_struct, get_list_nested_elem_type,
     get_struct_field_stype, get_struct_field_type, get_var_channel_inner,
     get_var_enum, get_var_handle_inner, get_var_handle_inner2,
+    get_var_handler_is_ue, get_var_handler_vtable_field,
+    get_var_handler_vtable_type,
     get_var_handle_sname, get_var_handle_sname2, get_var_iter_next_fn,
     get_var_iterator_inner, get_var_option_inner, get_var_option_inner_struct,
     get_var_result_err, get_var_result_err_struct, get_var_result_ok,
@@ -34,11 +37,13 @@ import codegen_types.{
     lookup_impl_type_for_trait, mangle_generic_name, match_scrut_enum,
     match_scruts, mono_fns, mono_instances, mut_captured_vars, option_c_type,
     option_c_type_mixed, pop_scope, ptr_inner_c_type, push_scope,
+    resolve_effect_field, resolve_effect_is_ue, resolve_effect_vtable,
     resolve_option_inner_from_ann, resolve_ret_type_from_ann,
     resolve_self_type, resolve_tuple_ann, resolve_variant, result_c_type,
     result_c_type_mixed, set_list_elem_struct, set_list_elem_type,
     set_list_nested_elem_struct, set_list_nested_elem_type, set_map_types,
     set_var, set_var_alias, set_var_channel, set_var_closure, set_var_handle,
+    set_var_handler,
     set_var_handle_full, set_var_iterator, set_var_option,
     set_var_option_inner2, set_var_option_inner2_struct,
     set_var_option_struct, set_var_result, set_var_result_struct,
@@ -1500,6 +1505,25 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
     if enum_type != "" {
         var_enums.push(VarEnumEntry { name: name, enum_type: enum_type })
     }
+    if val_type == CT_HANDLER {
+        let mut h_vtt = cg_handler_vtable_type
+        let mut h_vtf = cg_handler_vtable_field
+        let mut h_is_ue = cg_handler_is_user_effect
+        if h_vtf == "" && type_ann != -1 {
+            let ann_name = np_name.get(type_ann).unwrap()
+            if ann_name == "Handler" {
+                let ann_elems = np_elements.get(type_ann).unwrap()
+                if ann_elems != -1 && sublist_length(ann_elems) >= 1 {
+                    let effect_ann = sublist_get(ann_elems, 0)
+                    let effect_name = np_name.get(effect_ann).unwrap()
+                    h_vtt = resolve_effect_vtable(effect_name)
+                    h_vtf = resolve_effect_field(effect_name)
+                    h_is_ue = resolve_effect_is_ue(effect_name)
+                }
+            }
+        }
+        set_var_handler(name, h_vtt, h_vtf, h_is_ue)
+    }
     if val_type == CT_CLOSURE {
         set_var_closure(name, expr_closure_sig)
     }
@@ -1704,6 +1728,13 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
             emit_line("{c_type_c_name(enum_type)} {cname} = {val_str};")
         } else {
             emit_line("const {c_type_c_name(enum_type)} {cname} = {val_str};")
+        }
+    } else if val_type == CT_HANDLER {
+        let h_vtt = get_var_handler_vtable_type(name)
+        if h_vtt != "" {
+            emit_line("{h_vtt}* {cname} = ({h_vtt}*){val_str};")
+        } else {
+            emit_line("void* {cname} = {val_str};")
         }
     } else if struct_type != "" {
         if is_mut != 0 {
@@ -2008,16 +2039,21 @@ fn emit_with_block(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
         } else {
             emit_expr(item)
             let handler_str = expr_result_str
-            let vtable_field = cg_handler_vtable_field
-            let is_ue = cg_handler_is_user_effect
+            let handler_type = expr_result_type
+            let mut vtable_field = cg_handler_vtable_field
+            let mut is_ue = cg_handler_is_user_effect
+            if vtable_field == "" && handler_type == CT_HANDLER {
+                vtable_field = get_var_handler_vtable_field(handler_str)
+                is_ue = get_var_handler_is_ue(handler_str)
+            }
             if vtable_field != "" {
                 let save_name = fresh_temp("__saved_")
                 if is_ue != 0 {
                     emit_line("void* {save_name} = (void*)__pact_ue_{vtable_field};")
-                    emit_line("__pact_ue_{vtable_field} = &{handler_str};")
+                    emit_line("__pact_ue_{vtable_field} = {handler_str};")
                 } else {
                     emit_line("void* {save_name} = (void*)__pact_ctx.{vtable_field};")
-                    emit_line("__pact_ctx.{vtable_field} = &{handler_str};")
+                    emit_line("__pact_ctx.{vtable_field} = {handler_str};")
                 }
                 if is_ue != 0 {
                     saved_fields.push("ue:{vtable_field}")
@@ -2190,6 +2226,25 @@ fn format_params(fn_node: Int) -> Str {
                 }
             } else {
                 result = result.concat("{option_c_type(CT_INT)} {pname}")
+            }
+        } else if ptype == "Handler" {
+            let ta = np_type_ann.get(p).unwrap()
+            if ta != -1 {
+                let elems_sl = np_elements.get(ta).unwrap()
+                if elems_sl != -1 && sublist_length(elems_sl) >= 1 {
+                    let effect_ann = sublist_get(elems_sl, 0)
+                    let effect_name = np_name.get(effect_ann).unwrap()
+                    let vt = resolve_effect_vtable(effect_name)
+                    if vt != "" {
+                        result = result.concat("{vt}* {pname}")
+                    } else {
+                        result = result.concat("void* {pname}")
+                    }
+                } else {
+                    result = result.concat("void* {pname}")
+                }
+            } else {
+                result = result.concat("void* {pname}")
             }
         } else {
             let ct = type_from_name(ptype)
@@ -2674,7 +2729,6 @@ pub fn emit_fn_def(fn_node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope
     } else {
         cg_current_fn_option_inner = 0
     }
-
     let ffi_ann = get_ffi_ann(fn_node)
     if ffi_ann != -1 {
         let ffi_args_sl = np_args.get(ffi_ann).unwrap()
@@ -2849,6 +2903,20 @@ pub fn emit_fn_def(fn_node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope
                             } else {
                                 set_var_option(pname, inner_t)
                             }
+                        }
+                    }
+                }
+                if ptype == "Handler" {
+                    let ta = np_type_ann.get(p).unwrap()
+                    if ta != -1 {
+                        let elems_sl = np_elements.get(ta).unwrap()
+                        if elems_sl != -1 && sublist_length(elems_sl) >= 1 {
+                            let effect_ann = sublist_get(elems_sl, 0)
+                            let effect_name = np_name.get(effect_ann).unwrap()
+                            let h_vtt = resolve_effect_vtable(effect_name)
+                            let h_vtf = resolve_effect_field(effect_name)
+                            let h_is_ue = resolve_effect_is_ue(effect_name)
+                            set_var_handler(pname, h_vtt, h_vtf, h_is_ue)
                         }
                     }
                 }

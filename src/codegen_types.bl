@@ -44,6 +44,7 @@ pub let CT_PTR = 17
 pub let CT_FFI_SCOPE = 18
 pub let CT_STRINGBUILDER = 19
 pub let CT_SET = 20
+pub let CT_HANDLER = 21
 
 // ── Type node pool (interned, parallel arrays) ─────────────────────
 // Recursive type representation: each type is an integer handle into
@@ -853,7 +854,8 @@ pub let mut cg_let_target_type: Int = 0
 pub let mut cg_let_target_name: Str = ""
 pub let mut cg_let_target_ann: Int = -1
 
-// Handler vtable field set by emit_handler_expr for emit_with_block
+// Handler vtable metadata set by emit_handler_expr for emit_with_block / let binding
+pub let mut cg_handler_vtable_type: Str = ""
 pub let mut cg_handler_vtable_field: Str = ""
 pub let mut cg_handler_is_user_effect: Int = 0
 // Tracks the current handler's vtable type and field for default delegation
@@ -862,6 +864,84 @@ pub let mut cg_handler_body_vtable_type: Str = ""
 pub let mut cg_handler_body_field: Str = ""
 pub let mut cg_handler_body_is_ue: Int = 0
 pub let mut cg_handler_body_idx: Int = 0
+
+pub fn resolve_effect_vtable(effect_name: Str) -> Str {
+    if effect_name == "IO" || effect_name == "IO.Print" || effect_name == "IO.Log" {
+        return "pact_io_vtable"
+    } else if effect_name == "FS" || effect_name == "FS.Read" || effect_name == "FS.Write" || effect_name == "FS.Delete" || effect_name == "FS.Watch" {
+        return "pact_fs_vtable"
+    } else if effect_name == "DB" || effect_name == "DB.Read" || effect_name == "DB.Write" || effect_name == "DB.Admin" {
+        return "pact_db_vtable"
+    } else if effect_name == "Net" || effect_name == "Net.Connect" || effect_name == "Net.Listen" || effect_name == "Net.DNS" {
+        return "pact_net_vtable"
+    } else if effect_name == "Crypto" || effect_name == "Crypto.Hash" || effect_name == "Crypto.Sign" || effect_name == "Crypto.Encrypt" || effect_name == "Crypto.Decrypt" {
+        return "pact_crypto_vtable"
+    } else if effect_name == "Rand" {
+        return "pact_rand_vtable"
+    } else if effect_name == "Time" || effect_name == "Time.Read" || effect_name == "Time.Sleep" {
+        return "pact_time_vtable"
+    } else if effect_name == "Env" || effect_name == "Env.Read" || effect_name == "Env.Write" {
+        return "pact_env_vtable"
+    } else if effect_name == "Process" || effect_name == "Process.Spawn" || effect_name == "Process.Signal" {
+        return "pact_process_vtable"
+    }
+    let mut uei = 0
+    while uei < ue_effects.len() {
+        let ue = ue_effects.get(uei).unwrap()
+        if effect_name == ue.name || effect_name.starts_with("{ue.name}.") {
+            return "pact_ue_{ue.handle}_vtable"
+        }
+        uei = uei + 1
+    }
+    ""
+}
+
+pub fn resolve_effect_field(effect_name: Str) -> Str {
+    if effect_name == "IO" || effect_name == "IO.Print" || effect_name == "IO.Log" {
+        return "io"
+    } else if effect_name == "FS" || effect_name == "FS.Read" || effect_name == "FS.Write" || effect_name == "FS.Delete" || effect_name == "FS.Watch" {
+        return "fs"
+    } else if effect_name == "DB" || effect_name == "DB.Read" || effect_name == "DB.Write" || effect_name == "DB.Admin" {
+        return "db"
+    } else if effect_name == "Net" || effect_name == "Net.Connect" || effect_name == "Net.Listen" || effect_name == "Net.DNS" {
+        return "net"
+    } else if effect_name == "Crypto" || effect_name == "Crypto.Hash" || effect_name == "Crypto.Sign" || effect_name == "Crypto.Encrypt" || effect_name == "Crypto.Decrypt" {
+        return "crypto"
+    } else if effect_name == "Rand" {
+        return "rand"
+    } else if effect_name == "Time" || effect_name == "Time.Read" || effect_name == "Time.Sleep" {
+        return "time"
+    } else if effect_name == "Env" || effect_name == "Env.Read" || effect_name == "Env.Write" {
+        return "env"
+    } else if effect_name == "Process" || effect_name == "Process.Spawn" || effect_name == "Process.Signal" {
+        return "process"
+    }
+    let mut uei = 0
+    while uei < ue_effects.len() {
+        let ue = ue_effects.get(uei).unwrap()
+        if effect_name == ue.name || effect_name.starts_with("{ue.name}.") {
+            return ue.handle
+        }
+        uei = uei + 1
+    }
+    ""
+}
+
+pub fn resolve_effect_is_ue(effect_name: Str) -> Int {
+    if resolve_effect_vtable(effect_name) != "" {
+        if effect_name == "IO" || effect_name == "IO.Print" || effect_name == "IO.Log" { return 0 }
+        if effect_name == "FS" || effect_name.starts_with("FS.") { return 0 }
+        if effect_name == "DB" || effect_name.starts_with("DB.") { return 0 }
+        if effect_name == "Net" || effect_name.starts_with("Net.") { return 0 }
+        if effect_name == "Crypto" || effect_name.starts_with("Crypto.") { return 0 }
+        if effect_name == "Rand" { return 0 }
+        if effect_name == "Time" || effect_name.starts_with("Time.") { return 0 }
+        if effect_name == "Env" || effect_name.starts_with("Env.") { return 0 }
+        if effect_name == "Process" || effect_name.starts_with("Process.") { return 0 }
+        return 1
+    }
+    0
+}
 
 // Scope: unified variable tracking with parameterized type info.
 // inner1: List elem, Option inner, Result ok, Map key, Iterator/Handle/Channel inner
@@ -1326,6 +1406,20 @@ pub fn resolve_ret_type_from_ann(fn_node: Int) -> Str {
                 let inner_ann = sublist_get(elems_sl, 0)
                 let inner_name = np_name.get(inner_ann).unwrap()
                 return "{ptr_inner_c_type(inner_name)}*"
+            }
+        }
+        return "void*"
+    }
+    if ret_str == "Handler" {
+        if ta != -1 {
+            let elems_sl = np_elements.get(ta).unwrap()
+            if elems_sl != -1 && sublist_length(elems_sl) >= 1 {
+                let effect_ann = sublist_get(elems_sl, 0)
+                let effect_name = np_name.get(effect_ann).unwrap()
+                let vt = resolve_effect_vtable(effect_name)
+                if vt != "" {
+                    return "{vt}*"
+                }
             }
         }
         return "void*"
@@ -2107,12 +2201,60 @@ pub fn get_var_struct(name: Str) -> Str {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
-        if sv.name == name && tp_get_kind(sv.tp_id) != CT_CLOSURE {
+        if sv.name == name && tp_get_kind(sv.tp_id) != CT_CLOSURE && tp_get_kind(sv.tp_id) != CT_HANDLER {
             return sv.sname
         }
         i = i - 1
     }
     ""
+}
+
+pub fn set_var_handler(name: Str, vtable_type: Str, vtable_field: Str, is_ue: Int) {
+    let mut i = scope_vars.len() - 1
+    while i >= 0 {
+        let sv = scope_vars.get(i).unwrap()
+        if sv.name == name && sv.ctype == CT_HANDLER {
+            scope_vars.set(i, ScopeVar { name: sv.name, ctype: CT_HANDLER, is_mut: sv.is_mut, inner1: is_ue, inner2: sv.inner2, sname: vtable_type, sname2: vtable_field, extra: sv.extra, tp_id: sv_tp(CT_HANDLER, is_ue, -1, vtable_type) })
+            return
+        }
+        i = i - 1
+    }
+}
+
+pub fn get_var_handler_vtable_type(name: Str) -> Str {
+    let mut i = scope_vars.len() - 1
+    while i >= 0 {
+        let sv = scope_vars.get(i).unwrap()
+        if sv.name == name && sv.ctype == CT_HANDLER {
+            return sv.sname
+        }
+        i = i - 1
+    }
+    ""
+}
+
+pub fn get_var_handler_vtable_field(name: Str) -> Str {
+    let mut i = scope_vars.len() - 1
+    while i >= 0 {
+        let sv = scope_vars.get(i).unwrap()
+        if sv.name == name && sv.ctype == CT_HANDLER {
+            return sv.sname2
+        }
+        i = i - 1
+    }
+    ""
+}
+
+pub fn get_var_handler_is_ue(name: Str) -> Int {
+    let mut i = scope_vars.len() - 1
+    while i >= 0 {
+        let sv = scope_vars.get(i).unwrap()
+        if sv.name == name && sv.ctype == CT_HANDLER {
+            return sv.inner1
+        }
+        i = i - 1
+    }
+    0
 }
 
 pub fn get_struct_field_type(sname: Str, fname: Str) -> Int {
@@ -2384,6 +2526,7 @@ pub fn type_name_from_ct(ct: Int) -> Str {
     else if ct == CT_STRINGBUILDER { "StringBuilder" }
     else if ct == CT_PTR { "Ptr" }
     else if ct == CT_CLOSURE { "Fn" }
+    else if ct == CT_HANDLER { "Handler" }
     else { "Void" }
 }
 
@@ -2671,6 +2814,7 @@ pub fn c_type_str(ct: Int) -> Str {
     else if ct == CT_PTR { "void*" }
     else if ct == CT_FFI_SCOPE { "pact_list*" }
     else if ct == CT_STRINGBUILDER { "pact_sb*" }
+    else if ct == CT_HANDLER { "void*" }
     else { "void" }
 }
 
@@ -2725,6 +2869,7 @@ pub fn type_from_name(name: Str) -> Int {
         "Fn" => CT_CLOSURE
         "Channel" => CT_CHANNEL
         "Handle" => CT_HANDLE
+        "Handler" => CT_HANDLER
         _ => CT_VOID
     }
 }
