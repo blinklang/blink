@@ -18,16 +18,19 @@ If no tasks are ready, run `br blocked -t repo:blink`, report what's stuck, and 
 
 ## Step 2: Select Tasks
 
-Separate ready tasks by type tag. Priority order within each type: P0 > P1 > P2 > P3 > P4.
+Sort ALL ready tasks by priority first (P0 > P1 > P2 > P3 > P4), then by type preference within the same priority level (bug > friction > feature > project > spec).
 
 If `$ARGUMENTS` is provided, filter tasks whose title matches the argument (case-insensitive substring).
 
-**Selection logic — auto-start types first:**
+**Selection logic — priority-first, then type:**
 
-1. If any `type:bug` or `type:friction` tasks exist → pick up to 5 (priority-ordered, bugs before friction at same priority). These are auto-start — no confirmation needed.
-2. If NO bugs/friction exist → pick up to 5 `type:feature` tasks (priority-ordered). These require confirmation.
-3. If NO features either → pick 1 `type:project` task (highest priority). Requires confirmation.
-4. `type:spec` tasks → tell the user to run `/deliberate`. Only work a spec task if literally nothing else is available.
+1. Sort the full ready list by priority. Within the same priority, prefer: bug > friction > feature > project > spec.
+2. Walk the sorted list and pick up to 5 tasks, applying type rules:
+   - `type:bug` / `type:friction` — auto-start, no confirmation needed.
+   - `type:feature` — requires confirmation before starting.
+   - `type:project` — requires confirmation; pick at most 1 project.
+   - `type:spec` — tell the user to run `/deliberate` for this item. Only work it directly if the user confirms.
+3. Don't skip a higher-priority task just because of its type. A P2 spec should be surfaced before a P4 feature.
 
 ## Step 3: Route by Type
 
