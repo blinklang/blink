@@ -14,9 +14,19 @@ docker pull ghcr.io/blinklang/blink:latest
 docker run --rm -v "$PWD":/workspace ghcr.io/blinklang/blink run myfile.bl
 ```
 
-Tags: `latest`, `0.26`, `0.26.0` (semver). Image is `debian:bookworm-slim` with `gcc`, `zig`, `blink`, `libgc-dev`, and `libsqlite3-dev`.
+Tags: `latest`, `0.27`, `0.27.0` (semver). Image is `debian:bookworm-slim` with `gcc`, `zig`, `blink`, `libgc-dev`, and `libsqlite3-dev`.
 
-## Recent Breaking Changes (v0.26)
+## Recent Breaking Changes (v0.27)
+
+- **BREAKING: Selective import enforcement** — `import foo` now only provides qualified access (`foo.bar()`). Unqualified access requires selective imports: `import foo.{bar}`. Per-file scoping enforced.
+- **Pub re-export semantics** — `pub import` re-exports formalized: consumers see re-exported items as if locally defined; name collisions (define + re-export same name) produce E1012
+- **New module error codes** — E1004 (VersionConflict), E1007 (reject module-qualified type member access), E1008 (InvalidModuleAnnotation), E1009 (DuplicateModuleBinding), E1012 (DuplicatePubSymbol), E1052 (PackageNotDeclared for tier-2 imports)
+- **`capture_log` test instrumentation** — `std.testing.capture_log` handler factory spec'd for intercepting `io.log()` calls in tests
+- **Fix** — module qualifier mangling, loop return type inference, `std.*` resolution
+- **Fix** — pub import warnings and enum qualification errors
+- **Fix** — false W0602 (unused import) on `pub let mut` assignment
+
+### Prior: Breaking Changes (v0.26)
 
 - **BREAKING: Language renamed Pact → Blink** — binary `pactc` → `blinkc`, env vars `PACT_*` → `BLINK_*`, file extension `.pact` → `.bl` (`.pact` still accepted as fallback), `pact.toml` → `blink.toml` (fallback supported). Compiler entry point renamed `src/pactc_main.bl` → `src/blinkc_main.bl`.
 - **Cross-package cycle detection (E1002)** — circular dependencies between packages are now detected and reported at compile time

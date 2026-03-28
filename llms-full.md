@@ -1,6 +1,6 @@
 # Blink Language Reference
 
-> Blink is a statically-typed, effect-tracked language compiling to C. **Compiler v0.26.0**.
+> Blink is a statically-typed, effect-tracked language compiling to C. **Compiler v0.27.0**.
 
 ## Install
 
@@ -12,9 +12,22 @@ docker pull ghcr.io/blinklang/blink:latest
 docker run --rm -v "$PWD":/workspace ghcr.io/blinklang/blink run myfile.bl
 ```
 
-Tags: `latest`, `0.26`, `0.26.0` (semver). Image is `debian:bookworm-slim` with `gcc`, `zig`, `blink`, `libgc-dev`, and `libsqlite3-dev`.
+Tags: `latest`, `0.27`, `0.27.0` (semver). Image is `debian:bookworm-slim` with `gcc`, `zig`, `blink`, `libgc-dev`, and `libsqlite3-dev`.
 
-## Recent Breaking Changes (v0.26)
+## Recent Breaking Changes (v0.27)
+
+| Change | Details |
+|--------|---------|
+| **BREAKING:** Selective import enforcement | `import foo` now only provides qualified access (`foo.bar()`). Unqualified access requires selective imports: `import foo.{bar}`. Per-file scoping enforced. |
+| Pub re-export semantics | `pub import` re-exports formalized: consumers see re-exported items as if locally defined. Name collisions (define + re-export same name) produce E1012. `pub import` never triggers W0602 (unused import). |
+| New module error codes | E1004 (VersionConflict), E1007 (reject module-qualified type member access), E1008 (InvalidModuleAnnotation), E1009 (DuplicateModuleBinding), E1012 (DuplicatePubSymbol), E1052 (PackageNotDeclared for tier-2 imports). |
+| `capture_log` test instrumentation | `std.testing.capture_log` handler factory spec'd — intercepts `io.log()` calls in tests, collects messages into a list for assertion. |
+| Module qualifier fixes | Module qualifier mangling, loop return type inference, and `std.*` resolution fixed. |
+| Import warning fixes | Pub import warnings, enum qualification errors, and false W0602 on `pub let mut` assignment fixed. |
+
+**Migration:** Change bare `import foo` to `import foo.{bar, baz}` for any unqualified usage. Qualified access (`foo.bar()`) continues to work with bare imports.
+
+### Prior: Breaking Changes (v0.26)
 
 | Change | Details |
 |--------|---------|
