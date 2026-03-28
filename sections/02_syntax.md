@@ -607,14 +607,14 @@ type HashedPassword {
 
 Module-level `let` and `let mut` declare module-scoped bindings. These follow different rules from function-local bindings:
 
-**Duplicate names are a compile error.** A module may not declare two `let` bindings with the same name. Module scope is a flat namespace — there is no inner scope for shadowing to inhabit, so "redeclaration" has no well-defined semantics. The compiler reports `DuplicateModuleBinding` (E1004).
+**Duplicate names are a compile error.** A module may not declare two `let` bindings with the same name. Module scope is a flat namespace — there is no inner scope for shadowing to inhabit, so "redeclaration" has no well-defined semantics. The compiler reports `DuplicateModuleBinding` (E1009).
 
 ```blink
 // Valid — each name is unique
 let max_retries = 3
 let mut request_count = 0
 
-// INVALID — compile error E1004
+// INVALID — compile error E1009
 let x = 1
 let x = 2  // error[DuplicateModuleBinding]: duplicate module-level binding `x`
 ```

@@ -1,0 +1,92 @@
+fn run_cmd(cmd: Str, label: Str) -> Int {
+    let rc = shell_exec(cmd)
+    if rc != 0 {
+        io.println("FAIL: {label} (rc={rc})")
+    }
+    rc
+}
+
+fn check_build_error(base: Str, blink: Str, src: Str, expected_err: Str, label: Str) {
+    shell_exec("cd {base}/app && {blink} build {src} -o build/err_test 2>../err.txt; true")
+    let output = read_file("{base}/err.txt")
+    if output.contains(expected_err) != 0 {
+        io.println("PASS: {label}")
+    } else {
+        io.println("FAIL: {label} — expected error containing '{expected_err}', got: {output}")
+    }
+}
+
+fn check_output(path: Str, expected: Str, label: Str) {
+    shell_exec("{path} > {path}_out.txt 2>&1 || true")
+    let output = read_file("{path}_out.txt")
+    if output.starts_with(expected) {
+        io.println("PASS: {label}")
+    } else {
+        io.println("FAIL: {label} — expected '{expected}', got: {output}")
+    }
+}
+
+fn main() {
+    let base = ".tmp/_test_module_annotation"
+    shell_exec("rm -rf {base}")
+    let blink = "../../../bin/blink"
+
+    shell_exec("mkdir -p {base}/app/src/auth")
+    shell_exec("mkdir -p {base}/app/build")
+    write_file("{base}/app/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n")
+
+    // --- Test 1: Valid @module matching parent package ---
+    write_file(
+        "{base}/app/src/auth/login.bl",
+        "@module(\"auth\")\n\npub fn greet() -> Str \{\n    \"hello from auth\"\n}\n"
+    )
+    write_file(
+        "{base}/app/src/t1.bl",
+        "import auth.login\n\nfn main() \{\n    io.println(auth.greet())\n}\n"
+    )
+    let rc1 = run_cmd("cd {base}/app && {blink} build src/t1.bl -o build/t1 2>&1", "build valid @module(\"auth\")")
+    if rc1 == 0 {
+        check_output("{base}/app/build/t1", "hello from auth", "valid @module matches parent package")
+    }
+
+    // --- Test 2: Invalid @module — billing in auth/ ---
+    write_file(
+        "{base}/app/src/auth/login.bl",
+        "@module(\"billing\")\n\npub fn greet() -> Str \{\n    \"hello from billing\"\n}\n"
+    )
+    write_file(
+        "{base}/app/src/t2.bl",
+        "import auth.login\n\nfn main() \{\n    io.println(billing.greet())\n}\n"
+    )
+    check_build_error(base, blink, "src/t2.bl", "InvalidModuleAnnotation", "invalid @module(\"billing\") in auth/ rejected")
+
+    // --- Test 3: @module("") is always allowed ---
+    write_file(
+        "{base}/app/src/auth/helper.bl",
+        "@module(\"\")\n\npub fn help_me() -> Str \{\n    \"helper\"\n}\n"
+    )
+    write_file(
+        "{base}/app/src/t3.bl",
+        "import auth.helper\n\nfn main() \{\n    io.println(help_me())\n}\n"
+    )
+    let rc3 = run_cmd("cd {base}/app && {blink} build src/t3.bl -o build/t3 2>&1", "build @module(\"\") allowed")
+    if rc3 == 0 {
+        check_output("{base}/app/build/t3", "helper", "@module(\"\") is always allowed")
+    }
+
+    // --- Test 4: Root-level file not constrained ---
+    write_file(
+        "{base}/app/src/rootmod.bl",
+        "@module(\"anything\")\n\npub fn root_fn() -> Str \{\n    \"root\"\n}\n"
+    )
+    write_file(
+        "{base}/app/src/t4.bl",
+        "import rootmod\n\nfn main() \{\n    io.println(anything.root_fn())\n}\n"
+    )
+    let rc4 = run_cmd("cd {base}/app && {blink} build src/t4.bl -o build/t4 2>&1", "build root-level @module(\"anything\")")
+    if rc4 == 0 {
+        check_output("{base}/app/build/t4", "root", "root-level file @module unconstrained")
+    }
+
+    shell_exec("rm -rf {base}")
+}

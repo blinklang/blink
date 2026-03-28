@@ -93,9 +93,11 @@ error[NonExhaustiveMatch]: non-exhaustive match
 | DuplicateModuleName | E1001 | Duplicate module name in package | Modules | §10.5 |
 | CircularPackageDep | E1002 | Circular package dependency | Modules | §10.5 |
 | PrivateItemAccess | E1003 | Access to private item in another module | Modules | §10.5 |
-| DuplicateModuleBinding | E1004 | Duplicate `let` binding name at module level | Modules | §2.12.1 |
+| VersionConflict | E1004 | Diamond dependency — incompatible package versions | Modules | §10.5 |
 | AmbiguousImport | E1005 | Ambiguous import — name exists in multiple modules | Modules | §10.5 |
 | PubLetMutForbidden | E1006 | `pub let mut` is forbidden — mutable state must use functions with effects | Modules | §2.12.1 |
+| InvalidModuleAnnotation | E1008 | `@module` value does not match parent package name | Modules | §10.1 |
+| DuplicateModuleBinding | E1009 | Duplicate `let` binding name at module level | Modules | §2.12.1 |
 | StdlibNotFound | E1050 | Stdlib module not found — installation incomplete | Stdlib | §10.7 |
 | StdlibVersionMismatch | E1051 | Stdlib version mismatch with lockfile | Stdlib | §10.7 |
 | PackageNotDeclared | E1052 | Package not declared in blink.toml — Tier 2 package needs explicit dependency | Stdlib | §10.7.1 |
@@ -141,3 +143,6 @@ The self-hosting compiler (`src/codegen_types.bl`, `src/codegen_expr.bl`) curren
 | E0506 | UndefinedVariable | `typecheck.bl` — name resolution |
 | E0507 | UnknownType | `typecheck.bl` — name resolution |
 | W0501 | UnknownMethod | `typecheck.bl` — name resolution (warning, may be false positive for struct field closures) |
+| E1004 | VersionConflict | `compiler.bl` — lockfile version conflict validation in `ensure_lockfile_loaded()` |
+| E1008 | InvalidModuleAnnotation | `compiler.bl` — @module annotation validation in `load_module()` |
+| E1052 | PackageNotDeclared | `compiler.bl` — Tier 2 stdlib import without blink.toml dependency |

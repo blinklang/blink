@@ -3,8 +3,8 @@ import lexer.{Lex, lex}
 import parser.{Parse, parser_reset, parse_program, new_node, new_sublist, sublist_push, finalize_sublist, sublist_get, sublist_length, pos, np_kind, np_name, np_args, np_elements, np_handlers, np_params, np_fields, np_stmts, np_arms, np_methods, np_module, np_captures, np_str_val, np_is_pub}
 import typecheck.{tc_import_modules, tc_import_nodes, tc_reexport_source, tc_reexport_modules, tc_is_module_used}
 import diagnostics.{Diag, diag_register_file_range, lint_set_override, diag_normalize_path, diag_set_last_fix, diag_error_no_loc, diag_warn_at, diag_reset, diag_source_file, diag_module_files}
-import pkg.lockfile.{lockfile_load, lockfile_find_pkg, lockfile_pkg_count, lock_pkg_sources}
-import pkg.manifest.{manifest_clear, manifest_load, lint_names, lint_levels}
+import pkg.lockfile.{lockfile_load, lockfile_find_pkg, lockfile_pkg_count, lock_pkg_sources, lock_pkg_names, lock_pkg_versions}
+import pkg.manifest.{manifest_clear, manifest_load, manifest_has_dep, manifest_name, lint_names, lint_levels}
 import std.path.{path_join, path_dirname}
 import comment_attach.{attach_comments_pass}
 
@@ -168,9 +168,29 @@ pub fn trace(phase: Str, msg: Str) {
     }
 }
 
+fn validate_lockfile_versions() ! Diag.Report {
+    let mut i = 0
+    while i < lock_pkg_names.len() {
+        let name = lock_pkg_names.get(i).unwrap()
+        let version = lock_pkg_versions.get(i).unwrap()
+        let mut j = i + 1
+        while j < lock_pkg_names.len() {
+            if lock_pkg_names.get(j).unwrap() == name {
+                let other_version = lock_pkg_versions.get(j).unwrap()
+                if other_version != version {
+                    diag_error_no_loc("VersionConflict", "E1004", "dependency version conflict for '{name}': version {version} and version {other_version} both required — only one version per package is allowed", "run 'blink update' to resolve, or pin dependencies to compatible versions")
+                    return
+                }
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+}
+
 let mut lockfile_loaded: Int = 0
 
-fn ensure_lockfile_loaded(src_root: Str) {
+fn ensure_lockfile_loaded(src_root: Str) ! Diag.Report {
     if lockfile_loaded == 1 {
         return
     }
@@ -185,11 +205,13 @@ fn ensure_lockfile_loaded(src_root: Str) {
     let lock_path_new = path_join(project_root, "blink.lock")
     if file_exists(lock_path_new) == 1 {
         lockfile_load(lock_path_new)
+        validate_lockfile_versions()
         return
     }
     let lock_path = path_join(project_root, "pact.lock")
     if file_exists(lock_path) == 1 {
         lockfile_load(lock_path)
+        validate_lockfile_versions()
         return
     }
     // Walk up from src_root looking for blink.lock / pact.lock
@@ -206,11 +228,13 @@ fn ensure_lockfile_loaded(src_root: Str) {
         let candidate_new = path_join(parent, "blink.lock")
         if file_exists(candidate_new) == 1 {
             lockfile_load(candidate_new)
+            validate_lockfile_versions()
             return
         }
         let candidate = path_join(parent, "pact.lock")
         if file_exists(candidate) == 1 {
             lockfile_load(candidate)
+            validate_lockfile_versions()
             return
         }
         dir = parent
@@ -435,28 +459,46 @@ pub fn resolve_module_path(dotted_path: Str, src_root: Str) -> Str ! Diag.Report
     if dotted_path.starts_with("std.") {
         let compiler_dir = path_dirname(get_arg(0))
         let std_rel = dots_to_slashes(dotted_path.substring(4, dotted_path.len() - 4))
+        let std_key = dots_to_underscores(dotted_path.substring(4, dotted_path.len() - 4))
+        let mut std_resolved = ""
         let std_full_bl = path_join(compiler_dir, path_join("lib/std", std_rel.concat(".bl")))
         if file_exists(std_full_bl) == 1 {
-            return std_full_bl
+            std_resolved = std_full_bl
         }
-        let std_full = path_join(compiler_dir, path_join("lib/std", std_rel.concat(".pact")))
-        if file_exists(std_full) == 1 {
-            return std_full
-        }
-        let blink_root = get_env("BLINK_ROOT") ?? ""
-        if blink_root != "" {
-            let std_root_bl = path_join(blink_root, path_join("lib/std", std_rel.concat(".bl")))
-            if file_exists(std_root_bl) == 1 {
-                return std_root_bl
-            }
-            let std_root = path_join(blink_root, path_join("lib/std", std_rel.concat(".pact")))
-            if file_exists(std_root) == 1 {
-                return std_root
+        if std_resolved == "" {
+            let std_full = path_join(compiler_dir, path_join("lib/std", std_rel.concat(".pact")))
+            if file_exists(std_full) == 1 {
+                std_resolved = std_full
             }
         }
-        let std_key = dots_to_underscores(dotted_path.substring(4, dotted_path.len() - 4))
-        if embedded_stdlib.has(std_key) != 0 {
-            return "<embedded:{std_key}>"
+        if std_resolved == "" {
+            let blink_root = get_env("BLINK_ROOT") ?? ""
+            if blink_root != "" {
+                let std_root_bl = path_join(blink_root, path_join("lib/std", std_rel.concat(".bl")))
+                if file_exists(std_root_bl) == 1 {
+                    std_resolved = std_root_bl
+                }
+                if std_resolved == "" {
+                    let std_root = path_join(blink_root, path_join("lib/std", std_rel.concat(".pact")))
+                    if file_exists(std_root) == 1 {
+                        std_resolved = std_root
+                    }
+                }
+            }
+        }
+        if std_resolved == "" {
+            if embedded_stdlib.has(std_key) != 0 {
+                std_resolved = "<embedded:{std_key}>"
+            }
+        }
+        if std_resolved != "" {
+            let tier2_pkg = is_tier2_std_module(std_key)
+            if tier2_pkg != "" && manifest_name != "" && is_stdlib_import_context() == 0 {
+                if manifest_has_dep(tier2_pkg) == 0 {
+                    diag_error_no_loc("PackageNotDeclared", "E1052", "package '{tier2_pkg}' is not declared in blink.toml — Tier 2 stdlib packages require explicit dependency", "add '{tier2_pkg} = \"0.1\"' to [dependencies] in blink.toml")
+                }
+            }
+            return std_resolved
         }
     }
 
@@ -716,6 +758,26 @@ fn extract_package(file_path: Str, src_root: Str) -> Str {
     "__root__"
 }
 
+fn is_tier2_std_module(std_key: Str) -> Str {
+    if std_key == "http" || std_key == "http_client" || std_key == "http_server" || std_key == "http_types" {
+        return "std/http"
+    }
+    if std_key == "net" || std_key == "net_tcp" || std_key == "net_error" {
+        return "std/net"
+    }
+    if std_key == "db" { return "std/db" }
+    if std_key == "log" { return "std/log" }
+    if std_key == "config" { return "std/config" }
+    ""
+}
+
+fn is_stdlib_import_context() -> Int {
+    if current_import_file.starts_with("<embedded:") { return 1 }
+    if current_import_file.contains("/lib/std/") != 0 { return 1 }
+    if current_import_file.contains("/lib/pkg/") != 0 { return 1 }
+    0
+}
+
 fn detect_package_cycles() -> Str {
     let mut all_pkgs: Map[Str, Int] = Map()
     let mut adj: Map[Str, List[Str]] = Map()
@@ -881,7 +943,17 @@ fn load_module(dotted_path: Str, file_path: Str, src_root: Str, all_programs: Li
     let mut mod_key = dots_to_underscores(dotted_path)
     let override_key = find_module_annotation(imported_prog)
     if override_key.is_some() {
-        mod_key = override_key.unwrap()
+        let ann_val = override_key.unwrap()
+        if ann_val != "" {
+            let pkg = extract_package(file_path, src_root)
+            if pkg != "" && pkg != "__root__" && ann_val != pkg {
+                let saved_diag = diag_source_file
+                diag_source_file = display_path
+                diag_error_no_loc("InvalidModuleAnnotation", "E1008", "@module(\"{ann_val}\") is invalid — file is in package '{pkg}', @module can only use the parent package name '{pkg}'", "use @module(\"{pkg}\") or remove the annotation")
+                diag_source_file = saved_diag
+            }
+        }
+        mod_key = ann_val
     }
     let saved_import_file = current_import_file
     let saved_import_module = current_import_module

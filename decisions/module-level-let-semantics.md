@@ -34,5 +34,5 @@ Five panelists (systems, web/scripting, PLT, DevOps/tooling, AI/ML) voted indepe
 
 ### Resolution
 
-Module-level `let` bindings must have unique names — duplicates are a compile error (`DuplicateModuleBinding`, E1004). Only immutable `pub let` is allowed; `pub let mut` is a compile error (`PubLetMutForbidden`, E1006). Function-local `let` shadowing remains permitted. See §2.12.1 for the full specification.
+Module-level `let` bindings must have unique names — duplicates are a compile error (`DuplicateModuleBinding`, E1009). Only immutable `pub let` is allowed; `pub let mut` is a compile error (`PubLetMutForbidden`, E1006). Function-local `let` shadowing remains permitted. See §2.12.1 for the full specification.
 
