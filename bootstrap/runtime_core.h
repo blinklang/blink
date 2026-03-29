@@ -1122,8 +1122,8 @@ BLINK_UNUSED static const char* pact_Instant_to_rfc3339(pact_instant_struct i) {
     time_t epoch_secs = (time_t)(i.nanos / 1000000000LL);
     struct tm utc;
     gmtime_r(&epoch_secs, &utc);
-    char* buf = (char*)pact_alloc(32);
-    snprintf(buf, 32, "%04d-%02d-%02dT%02d:%02d:%02dZ",
+    char* buf = (char*)pact_alloc(64);
+    snprintf(buf, 64, "%04d-%02d-%02dT%02d:%02d:%02dZ",
              utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday,
              utc.tm_hour, utc.tm_min, utc.tm_sec);
     return buf;
