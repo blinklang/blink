@@ -617,26 +617,44 @@ time.sleep(duration)            // sleep for Duration
 async.scope { ... }             // synchronous scope for spawned tasks
 async.spawn(fn() { ... })       // spawn task, returns Handle
 
-// Database (effect: DB) — requires SQLite
-db.open(path)                   // open SQLite database, sets implicit connection
-db.exec(sql)                    // execute SQL (no results), e.g. CREATE TABLE
-db.execute(sql)                 // execute SQL, returns last insert rowid (Int)
-db.query(sql)                   // -> List[List[Str]] (all rows, all columns as strings)
-db.query_one(sql)               // -> Option[List[Str]] (first row or None)
-db.prepare(sql)                 // -> Int (statement handle)
-db.bind_int(stmt, idx, val)     // bind Int to parameter index
-db.bind_text(stmt, idx, val)    // bind Str to parameter index
-db.bind_real(stmt, idx, val)    // bind Float to parameter index
-db.step(stmt)                   // -> Int (SQLITE_ROW=100, SQLITE_DONE=101)
-db.column_text(stmt, idx)       // -> Str (column value as string)
-db.column_int(stmt, idx)        // -> Int (column value as integer)
-db.reset(stmt)                  // reset prepared statement for re-use
-db.finalize(stmt)               // free prepared statement
-db.begin()                      // BEGIN TRANSACTION
-db.commit()                     // COMMIT
-db.rollback()                   // ROLLBACK
+// Database (effect: DB) — requires SQLite (bundled, compiler-managed)
+// Connection: effect-handler scoped (no global state)
+with db.connect(path) {         // open SQLite DB, installs DB handler for scope
+    // all db.* operations use this connection within scope
+}                               // connection closed when scope exits
+
+// Queries (effect: DB.Read) — return Result types
+db.query(sql)                   // -> Result[List[Row], DBError] (all rows)
+db.query_one(sql)               // -> Result[Option[Row], DBError] (first row or None)
+
+// Mutations (effect: DB.Write)
+db.exec(sql)                    // -> Result[Void, DBError] (DDL/DML, no return)
+db.execute(sql)                 // -> Result[Int, DBError] (returns last insert rowid)
+
+// Row type (named column access)
+row.get("col")                  // -> Option[Str] (by column name)
+row.get_int("col")              // -> Option[Int] (typed access)
+row.get_str("col")              // -> Option[Str] (explicit string)
+row.get_at(idx)                 // -> Option[Str] (positional fallback)
+row.column_names()              // -> List[Str]
+
+// Prepared statements (low-level, for batch operations)
+db.prepare(sql)                 // -> Result[Stmt, DBError] (Closeable — use with...as)
+stmt.bind(idx, val)             // bind parameter (type-overloaded)
+stmt.step()                     // -> Result[StepResult, DBError]
+stmt.column_int(idx)            // -> Int
+stmt.column_text(idx)           // -> Str
+stmt.reset()                    // reset for re-use
+stmt.finalize()                 // free statement
+
+// Transactions (effect: DB.Write)
+db.transaction {                // scoped: auto-commit on success, auto-rollback on error
+    db.exec("INSERT ...")?
+}
+db.begin()                      // -> Result[Void, DBError] (manual)
+db.commit()                     // -> Result[Void, DBError]
+db.rollback()                   // -> Result[Void, DBError]
 db.errmsg()                     // -> Str (last error message)
-db.close()                      // close database connection
 
 // Net (effect: Net.Listen for listen/accept, Net.Connect for connect)
 net.listen(host, port)          // -> Int (listen fd)

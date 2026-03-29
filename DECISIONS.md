@@ -366,6 +366,7 @@ Full deliberation records for each decision. Each file contains expert votes, re
 | Pub Re-export Semantics | [decisions/pub-re-export-semantics.md](decisions/pub-re-export-semantics.md) |
 | `capture_log` Test Instrumentation | [decisions/capture-log-test-instrumentation.md](decisions/capture-log-test-instrumentation.md) |
 | Sized Numeric Types | [decisions/sized-numeric-types.md](decisions/sized-numeric-types.md) |
+| DB Module Design | [decisions/db-module-design.md](decisions/db-module-design.md) |
 
 ---
 

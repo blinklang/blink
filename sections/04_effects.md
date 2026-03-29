@@ -76,19 +76,19 @@ fn read_config(path: Str) -> Result[Config, IOError] ! FS.Read {
 
 // Multiple fine-grained effects
 fn process_order(id: Int) -> Result[Receipt, OrderError] ! DB.Read, DB.Write, IO.Log {
-    let order = db.read("SELECT * FROM orders WHERE id = {id}")?
+    let order = db.query_one("SELECT * FROM orders WHERE id = {id}")?
     io.log("Processing order {id}")
     let receipt = Receipt { order_id: id, total: order.total }
-    db.write("INSERT INTO receipts ...", receipt)?
+    db.execute("INSERT INTO receipts ...")?
     Ok(receipt)
 }
 
 // Parent effect grants all children
 fn dangerous_migration() ! DB {
-    // DB grants DB.Read, DB.Write, DB.Admin -- the whole tree
-    db.admin("DROP TABLE legacy_data")
-    db.write("INSERT INTO migrations ...")
-    db.read("SELECT count(*) FROM migrations")
+    // DB grants DB.Read and DB.Write -- the whole tree
+    db.exec("DROP TABLE legacy_data")?
+    db.exec("INSERT INTO migrations ...")?
+    db.query("SELECT count(*) FROM migrations")?
 }
 ```
 
@@ -116,8 +116,7 @@ effect Net {
 
 effect DB {
     effect Read       // SELECT, read-only queries
-    effect Write      // INSERT, UPDATE
-    effect Admin      // DDL, DROP, GRANT, schema changes
+    effect Write      // INSERT, UPDATE, DELETE, CREATE, DROP, ALTER — all mutations
 }
 
 effect IO {
@@ -158,8 +157,9 @@ effect Process {
 | `! FS.Read` | `fs.read(...)`, `fs.list(...)` -- read-only FS operations |
 | `! FS.Read, FS.Write` | Read and write, but not delete or watch |
 | `! FS` | All FS operations: read, write, delete, watch |
-| `! DB.Read` | Read-only database queries |
-| `! DB` | Full database access including admin/DDL |
+| `! DB.Read` | Read-only database queries: `db.query(...)`, `db.query_one(...)` |
+| `! DB.Write` | Database mutations: `db.exec(...)`, `db.execute(...)`, `db.begin()`, `db.commit()`, `db.rollback()` |
+| `! DB` | Full database access: read and write |
 
 Declaring a parent is syntactic sugar for declaring all children. `! FS` and `! FS.Read, FS.Write, FS.Delete, FS.Watch` are identical to the compiler. The short form exists for the (rare) functions that genuinely need everything; the long form is what most functions should use.
 
@@ -178,7 +178,7 @@ fn example() ! IO.Print, FS.Read, DB.Read, Net.Connect, Crypto.Hash {
     io.print("Starting...")          // IO.Print handle (no newline)
     io.println("Done!")              // IO.Print handle (with newline)
     let data = fs.read("input.txt")  // FS.Read handle
-    let rows = db.read("SELECT *..") // DB.Read handle — string literal auto-parameterized to Query[DB]
+    let rows = db.query("SELECT *..")? // DB.Read handle — string literal auto-parameterized to Query[DB]
     let resp = net.get(url)?          // Net.Connect handle
     let hash = crypto.hash(data)     // Crypto.Hash handle
 }
@@ -204,7 +204,7 @@ The `_raw` variants are escape hatches for cases where direct C output is needed
 |---|---|---|
 | `IO` / `IO.*` | `io` | `io.print(...)`, `io.println(...)`, `io.log(...)`, `io.eprintln(...)`, `io.eprint(...)`, `io.print_raw(...)`, `io.eprint_raw(...)` |
 | `FS` / `FS.*` | `fs` | `fs.read(...)`, `fs.write(...)`, `fs.delete(...)`, `fs.watch(...)` |
-| `DB` / `DB.*` | `db` | `db.read(...)`, `db.write(...)`, `db.admin(...)` |
+| `DB` / `DB.*` | `db` | `db.query(...)`, `db.query_one(...)`, `db.exec(...)`, `db.execute(...)`, `db.connect(...)`, `db.prepare(...)`, `db.transaction { }`, `db.begin()`, `db.commit()`, `db.rollback()`, `db.errmsg()` |
 | `Net` / `Net.*` | `net` | `net.request(...)`, `net.get(...)`, `net.post(...)`, `net.listen(...)`, `net.dns(...)` |
 | `Env` / `Env.*` | `env` | `env.args()`, `env.var(...)`, `env.vars()`, `env.cwd()`, `env.set_var(...)`, `env.remove_var(...)`, `env.exit(...)` |
 | `Time` / `Time.*` | `time` | `time.read() -> Instant`, `time.sleep(Duration)` |
@@ -760,8 +760,8 @@ test "CLI exits with 1 on missing args" {
 Effects propagate upward through the call graph. If function A calls function B, A must declare at least all of B's effects. The compiler enforces this transitively across the entire program.
 
 ```blink
-fn check_inventory(item_id: Int) -> Int ! DB.Read {
-    db.read("SELECT quantity FROM inventory WHERE id = {item_id}")
+fn check_inventory(item_id: Int) -> Result[Int, DBError] ! DB.Read {
+    db.query_one("SELECT quantity FROM inventory WHERE id = {item_id}")?
 }
 
 fn log_check(item_id: Int) ! DB.Read, IO.Log {
@@ -801,12 +801,12 @@ fn do_everything() ! DB {
 But a function declaring a child effect does NOT satisfy a callee requiring the parent:
 
 ```blink
-fn admin_task() ! DB {
-    db.admin("ALTER TABLE ...")
+fn write_task() ! DB.Write {
+    db.exec("ALTER TABLE ...")?
 }
 
 fn read_only_caller() ! DB.Read {
-    admin_task()  // COMPILE ERROR: DB.Read does not grant DB (which includes DB.Admin)
+    write_task()  // COMPILE ERROR: DB.Read does not grant DB.Write
 }
 ```
 
@@ -817,8 +817,7 @@ Effects follow a subtyping relationship: parent > child. A function that require
 ```
 DB > DB.Read
 DB > DB.Write
-DB > DB.Admin
-DB.Read + DB.Write + DB.Admin = DB
+DB.Read + DB.Write = DB
 ```
 
 This is standard capability attenuation: you can always pass a more-powerful capability where a less-powerful one is expected, but never the reverse.
@@ -834,14 +833,14 @@ This is standard capability attenuation: you can always pass a more-powerful cap
 fn main() {
     io.print("Hello, world!")
     let data = fs.read("config.toml")
-    let rows = db.read("SELECT * FROM users")
+    let rows = db.query("SELECT * FROM users")?
 }
 
 // Also valid -- explicit annotation, but unnecessary
 fn main() ! IO.Print, FS.Read, DB.Read {
     io.print("Hello, world!")
     let data = fs.read("config.toml")
-    let rows = db.read("SELECT * FROM users")
+    let rows = db.query("SELECT * FROM users")?
 }
 ```
 
@@ -871,10 +870,10 @@ The most common use case. Replace real effects with test doubles:
 
 ```blink
 fn process_order(id: Int) -> Result[Receipt, OrderError] ! DB.Read, DB.Write, IO.Log {
-    let order = db.read("SELECT * FROM orders WHERE id = {id}")?
+    let order = db.query_one("SELECT * FROM orders WHERE id = {id}")?
     io.log("Processing order {id}")
     let receipt = Receipt { order_id: id, total: order.total }
-    db.write("INSERT INTO receipts ...", receipt)?
+    db.execute("INSERT INTO receipts ...")?
     Ok(receipt)
 }
 
@@ -893,7 +892,7 @@ test "process_order creates receipt for valid order" {
 }
 ```
 
-The code under test calls `db.read(...)` and `io.log(...)` as normal. The handler intercepts these calls and routes them to the mock implementation. The function being tested does not know or care -- it interacts with the same handle interface either way.
+The code under test calls `db.query_one(...)` and `io.log(...)` as normal. The handler intercepts these calls and routes them to the mock implementation. The function being tested does not know or care -- it interacts with the same handle interface either way.
 
 #### Dependency injection: swapping backends
 
@@ -1164,7 +1163,7 @@ A `Handler[E]` where `E` is a parent effect can be used where a `Handler[E.Sub]`
 ```blink
 fn read_only_test(h: Handler[DB.Read]) ! DB.Read {
     with h {
-        let rows = db.read("SELECT * FROM users")
+        let rows = db.query("SELECT * FROM users")?
     }
 }
 
@@ -1239,17 +1238,17 @@ Modules can declare a hard ceiling on the effects any function inside them may u
 @capabilities(DB.Read, DB.Write)
 module inventory
 
-fn check_stock(item_id: Int) -> Int ! DB.Read {
-    db.read("SELECT quantity FROM inventory WHERE id = {item_id}")
+fn check_stock(item_id: Int) -> Result[Int, DBError] ! DB.Read {
+    db.query_one("SELECT quantity FROM inventory WHERE id = {item_id}")?
 }
 
-fn update_stock(item_id: Int, delta: Int) ! DB.Write {
-    db.write("UPDATE inventory SET quantity = quantity + {delta} WHERE id = {item_id}")
+fn update_stock(item_id: Int, delta: Int) -> Result[Void, DBError] ! DB.Write {
+    db.exec("UPDATE inventory SET quantity = quantity + {delta} WHERE id = {item_id}")?
 }
 
-fn drop_table() ! DB.Admin {
-    db.admin("DROP TABLE inventory")
-    // COMPILE ERROR: module `inventory` does not have capability `DB.Admin`
+fn drop_table() -> Result[Void, DBError] ! DB.Write {
+    db.exec("DROP TABLE inventory")?
+    // This works if the module's capability budget includes DB.Write
 }
 ```
 
@@ -1257,16 +1256,16 @@ fn drop_table() ! DB.Admin {
 error[CapabilityBudgetExceeded]: capability budget exceeded
  --> inventory.bl:12:5
   |
-12|     db.admin("DROP TABLE inventory")
-  |     ^^^^^^^^ requires `DB.Admin`
+12|     db.exec("DROP TABLE inventory")
+  |     ^^^^^^^^ requires `DB.Write`
   |
-  = note: module `inventory` declares capabilities `DB.Read, DB.Write`
-  = note: `DB.Admin` is not within the module's capability budget
+  = note: module `inventory` declares capabilities `DB.Read`
+  = note: `DB.Write` is not within the module's capability budget
 ```
 
 **Why module budgets:**
 
-Module budgets are a defense against both mistakes and malice. A module responsible for inventory should never perform network calls, spawn processes, or administer the database schema. The budget makes this constraint explicit and compiler-enforced. When an AI generates code in this module, the compiler immediately rejects anything that exceeds the budget -- no human review needed to catch a misplaced `db.admin(...)` call.
+Module budgets are a defense against both mistakes and malice. A module responsible for inventory reads should never perform network calls, spawn processes, or mutate the database. The budget makes this constraint explicit and compiler-enforced. When an AI generates code in this module, the compiler immediately rejects anything that exceeds the budget -- no human review needed to catch a misplaced `db.exec(...)` call in a read-only module.
 
 Module budgets are also the **audit surface** for security review. Instead of reviewing every function in a module, a reviewer checks the `@capabilities` declaration. If the budget is `DB.Read, DB.Write`, the reviewer knows -- with compiler-level certainty -- that nothing in this module touches the network, filesystem, process table, or database schema.
 
@@ -1624,7 +1623,7 @@ fn validate(order: Order) -> Result[Order, OrderError] {
 
 fn check_inventory(order: Order) -> Result[(), OrderError] ! DB.Read {
     for item in order.items {
-        let stock = db.read("SELECT quantity FROM inventory WHERE id = {item.id}")?
+        let stock = db.query_one("SELECT quantity FROM inventory WHERE id = {item.id}")?
         if stock < item.quantity {
             return Err(OrderError.InsufficientStock(item.id, stock))
         }
@@ -1632,9 +1631,9 @@ fn check_inventory(order: Order) -> Result[(), OrderError] ! DB.Read {
     Ok(())
 }
 
-fn reserve_stock(order: Order) ! DB.Write {
+fn reserve_stock(order: Order) -> Result[Void, DBError] ! DB.Write {
     for item in order.items {
-        db.write("UPDATE inventory SET quantity = quantity - {item.quantity} WHERE id = {item.id}")
+        db.exec("UPDATE inventory SET quantity = quantity - {item.quantity} WHERE id = {item.id}")?
     }
 }
 
@@ -1716,7 +1715,7 @@ test "place_order fails with insufficient stock" {
 Notice what the effect system gives you in this example:
 
 1. **`validate` is pure.** No `!`, no handle. It cannot accidentally log, query, or charge. The compiler guarantees it.
-2. **`check_inventory` is read-only.** `! DB.Read`. It cannot modify stock, cannot charge payment. If someone adds a `db.write(...)` call, the compiler rejects it.
+2. **`check_inventory` is read-only.** `! DB.Read`. It cannot modify stock, cannot charge payment. If someone adds a `db.exec(...)` call, the compiler rejects it.
 3. **`charge` only touches payment.** It cannot read the database. It cannot log. Separation of concerns is compiler-enforced, not a convention.
 4. **The module budget is `DB.Read, DB.Write, Payment.Charge, IO.Log`.** If someone adds `! Net.Connect` to any function, the module budget rejects it. The orders module does not make network calls -- period.
 5. **Tests swap all effects with handlers.** No real database, no real payment processor, no real logging. The same code runs in both contexts because the interface (handles) is identical.
@@ -1748,7 +1747,7 @@ fn with_logging(f: fn(Str) -> () ! IO.Log) ! IO.Log {
 
 // Function type with multiple effects
 fn transform(f: fn(Row) -> Row ! DB.Read, IO.Log) -> List[Row] ! DB.Read, IO.Log {
-    let rows = db.read("SELECT * FROM data")
+    let rows = db.query("SELECT * FROM data")?
     rows.map(fn(r) { f(r) }).collect()
 }
 ```
@@ -1818,7 +1817,7 @@ fn process_items(items: List[Item]) ! DB.Read, IO.Log {
     items.iter()
         .filter(fn(item) { item.is_active() })          // pure callback: _ = (nothing)
         .map(fn(item) {
-            let price = db.read("SELECT ...")?           // _ = DB.Read
+            let price = db.query_one("SELECT ...")?       // _ = DB.Read
             io.log("Processing {item.id}")               // _ = IO.Log
             item.with_price(price)
         })
@@ -1867,11 +1866,11 @@ Effect polymorphism compiles via the existing evidence-passing model (§4.2, [Co
 
 ```blink
 fn caller() ! DB.Read {
-    items.map(fn(x) { db.read("...") })  // OK: _ resolves to DB.Read, caller has it
+    items.map(fn(x) { db.query("...") })  // OK: _ resolves to DB.Read, caller has it
 }
 
 fn bad_caller() {
-    items.map(fn(x) { db.read("...") })  // ERROR E0500: missing DB.Read
+    items.map(fn(x) { db.query("...") })  // ERROR E0500: missing DB.Read
 }
 ```
 
@@ -1880,7 +1879,7 @@ fn bad_caller() {
 ```blink
 test "map with mock DB" {
     with mock_db() {
-        let results = items.map(fn(x) { db.read("...") })
+        let results = items.map(fn(x) { db.query("...") })
         // handler intercepts DB.Read flowing through map's _
     }
 }
