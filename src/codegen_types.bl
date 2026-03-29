@@ -284,6 +284,10 @@ pub let mut cg_where_self_var: Str = ""
 let mut c_reserved_set: Map[Str, Int] = Map()
 let mut c_reserved_init_done: Int = 0
 
+// Bare names that collide with pact_* runtime C identifiers when prefixed
+let mut pact_reserved_set: Map[Str, Int] = Map()
+let mut pact_reserved_init_done: Int = 0
+
 fn init_c_reserved() {
     if c_reserved_init_done != 0 {
         return
@@ -398,6 +402,38 @@ fn init_c_reserved() {
     c_reserved_set.set("main", 1)
     c_reserved_set.set("true", 1)
     c_reserved_set.set("false", 1)
+}
+
+fn init_pact_reserved() {
+    if pact_reserved_init_done != 0 {
+        return
+    }
+    pact_reserved_init_done = 1
+    pact_reserved_set.set("list", 1)
+    pact_reserved_set.set("map", 1)
+    pact_reserved_set.set("set", 1)
+    pact_reserved_set.set("bytes", 1)
+    pact_reserved_set.set("sb", 1)
+    pact_reserved_set.set("closure", 1)
+    pact_reserved_set.set("ctx", 1)
+    pact_reserved_set.set("task", 1)
+    pact_reserved_set.set("threadpool", 1)
+    pact_reserved_set.set("handle", 1)
+    pact_reserved_set.set("channel", 1)
+    pact_reserved_set.set("alloc", 1)
+    pact_reserved_set.set("strdup", 1)
+    pact_reserved_set.set("ConversionError", 1)
+    pact_reserved_set.set("ProcessResult", 1)
+    pact_reserved_set.set("duration_struct", 1)
+    pact_reserved_set.set("instant_struct", 1)
+}
+
+fn is_pact_reserved(name: Str) -> Int {
+    init_pact_reserved()
+    if pact_reserved_set.has(name) {
+        return 1
+    }
+    0
 }
 
 let mut runtime_header_fns: Map[Str, Int] = Map()
@@ -601,6 +637,9 @@ pub fn c_fn_name(name: Str) -> Str {
         if prefix != "" {
             return "pact_{prefix}_{resolved}"
         }
+    }
+    if is_pact_reserved(resolved) != 0 {
+        return "pact_u_{resolved}"
     }
     "pact_{resolved}"
 }
@@ -1456,12 +1495,12 @@ pub fn resolve_ret_type_from_ann(fn_node: Int) -> Str {
                 let err_name = np_name.get(err_ann).unwrap()
                 let ok_t = type_from_name(ok_name)
                 let err_t = type_from_name(err_name)
-                let ok_is_type = is_struct_type(ok_name) != 0 || is_enum_type(ok_name) != 0
-                let err_is_type = is_struct_type(err_name) != 0 || is_enum_type(err_name) != 0
-                if ok_is_type || err_is_type {
-                    let ok_tag = if ok_is_type { strip_module_qualifier(ok_name) } else { c_type_tag(ok_t) }
-                    let err_tag = if err_is_type { strip_module_qualifier(err_name) } else { c_type_tag(err_t) }
-                    return "pact_Result_{ok_tag}_{err_tag}"
+                let ok_tag = resolve_result_inner_tag(ok_ann, ok_name, ok_t)
+                let err_tag = resolve_result_inner_tag(err_ann, err_name, err_t)
+                if ok_tag != "" || err_tag != "" {
+                    let ok_t_tag = if ok_tag != "" { ok_tag } else { c_type_tag(ok_t) }
+                    let err_t_tag = if err_tag != "" { err_tag } else { c_type_tag(err_t) }
+                    return "pact_Result_{ok_t_tag}_{err_t_tag}"
                 }
                 return result_c_type(ok_t, err_t)
             }
@@ -1568,12 +1607,16 @@ pub fn reg_fn_ret_from_ann(name: Str, fn_node: Int) ! Codegen.Register {
                 let err_name = np_name.get(err_ann).unwrap()
                 let ok_t = type_from_name(ok_name)
                 let err_t = type_from_name(err_name)
-                let ok_is_type = is_struct_type(ok_name) != 0 || is_enum_type(ok_name) != 0
-                let err_is_type = is_struct_type(err_name) != 0 || is_enum_type(err_name) != 0
+                let bare_ok = resolve_result_inner_tag(ok_ann, ok_name, ok_t)
+                let bare_err = resolve_result_inner_tag(err_ann, err_name, err_t)
                 reg_fn_ret_type(name, CT_RESULT, ok_t, err_t)
-                if ok_is_type || err_is_type {
-                    let bare_ok = if ok_is_type { strip_module_qualifier(ok_name) } else { "" }
-                    let bare_err = if err_is_type { strip_module_qualifier(err_name) } else { "" }
+                if bare_ok != "" || bare_err != "" {
+                    if is_compound_ct(ok_t) != 0 {
+                        ensure_compound_type_from_ann(ok_ann)
+                    }
+                    if is_compound_ct(err_t) != 0 {
+                        ensure_compound_type_from_ann(err_ann)
+                    }
                     fn_ret_struct_inners.push(FnRetStructInner { name: name, ok_struct: bare_ok, err_struct: bare_err })
                     let ok_tag = if bare_ok != "" { bare_ok } else { c_type_tag(ok_t) }
                     let err_tag = if bare_err != "" { bare_err } else { c_type_tag(err_t) }
@@ -3315,6 +3358,58 @@ fn ensure_mixed_option_type(inner: Int, inner_struct: Str) {
     }
 }
 
+fn resolve_result_inner_tag(ann: Int, name: Str, ct: Int) -> Str {
+    if is_compound_ct(ct) != 0 {
+        compound_name_from_ann(ann)
+    } else if is_struct_type(name) != 0 || is_enum_type(name) != 0 {
+        strip_module_qualifier(name)
+    } else {
+        ""
+    }
+}
+
+pub fn ensure_compound_type_from_ann(ann_node: Int) {
+    let name = np_name.get(ann_node).unwrap()
+    let ct = type_from_name(name)
+    if ct == CT_OPTION {
+        let inner_elems = np_elements.get(ann_node).unwrap()
+        if inner_elems != -1 && sublist_length(inner_elems) >= 1 {
+            let inner_ann = sublist_get(inner_elems, 0)
+            let inner_name = np_name.get(inner_ann).unwrap()
+            let inner_t = type_from_name(inner_name)
+            if is_struct_type(inner_name) != 0 || is_enum_type(inner_name) != 0 {
+                ensure_struct_option_type(strip_module_qualifier(inner_name))
+            } else if is_compound_ct(inner_t) != 0 {
+                ensure_compound_type_from_ann(inner_ann)
+                ensure_struct_option_type(compound_name_from_ann(inner_ann))
+            } else {
+                ensure_option_type(inner_t)
+            }
+        }
+    } else if ct == CT_RESULT {
+        let inner_elems = np_elements.get(ann_node).unwrap()
+        if inner_elems != -1 && sublist_length(inner_elems) >= 2 {
+            let ok_ann = sublist_get(inner_elems, 0)
+            let err_ann = sublist_get(inner_elems, 1)
+            let ok_name = np_name.get(ok_ann).unwrap()
+            let err_name = np_name.get(err_ann).unwrap()
+            let ok_t = type_from_name(ok_name)
+            let err_t = type_from_name(err_name)
+            if is_compound_ct(ok_t) != 0 {
+                ensure_compound_type_from_ann(ok_ann)
+            }
+            if is_compound_ct(err_t) != 0 {
+                ensure_compound_type_from_ann(err_ann)
+            }
+            let ok_r = resolve_result_inner_tag(ok_ann, ok_name, ok_t)
+            let err_r = resolve_result_inner_tag(err_ann, err_name, err_t)
+            let ok_tag = if ok_r != "" { ok_r } else { c_type_tag(ok_t) }
+            let err_tag = if err_r != "" { err_r } else { c_type_tag(err_t) }
+            ensure_struct_result_type(ok_tag, err_tag)
+        }
+    }
+}
+
 pub fn set_var_option(name: Str, inner: Int) {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
@@ -3635,10 +3730,28 @@ fn emit_struct_option_typedef(struct_name: Str) ! Codegen.Emit {
     emit_line("")
 }
 
+fn is_compound_tag(tag: Str) -> Int {
+    if tag.starts_with("Option_") || tag.starts_with("Result_") || tag.starts_with("Map_") {
+        1
+    } else {
+        0
+    }
+}
+
+fn c_type_from_tag(tag: Str) -> Str {
+    if is_struct_type(tag) != 0 || is_enum_type(tag) != 0 {
+        c_type_c_name(tag)
+    } else if is_compound_tag(tag) != 0 {
+        "pact_{tag}"
+    } else {
+        c_type_str(type_from_name_tag(tag))
+    }
+}
+
 fn emit_struct_result_typedef(ok_tag: Str, err_tag: Str) ! Codegen.Emit {
     let tname = "pact_Result_{ok_tag}_{err_tag}"
-    let c_ok = if is_struct_type(ok_tag) != 0 || is_enum_type(ok_tag) != 0 { c_type_c_name(ok_tag) } else { c_type_str(type_from_name_tag(ok_tag)) }
-    let c_err = if is_struct_type(err_tag) != 0 || is_enum_type(err_tag) != 0 { c_type_c_name(err_tag) } else { c_type_str(type_from_name_tag(err_tag)) }
+    let c_ok = c_type_from_tag(ok_tag)
+    let c_err = c_type_from_tag(err_tag)
     emit_line("typedef struct \{ int tag; union \{ {c_ok} ok; {c_err} err; }; } {tname};")
     emit_line("")
 }
