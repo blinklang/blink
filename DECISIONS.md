@@ -289,6 +289,11 @@ Decided by expert panel vote. See [OPEN_QUESTIONS.md](OPEN_QUESTIONS.md) for ful
 | Pub re-export semantics | Re-exported items = first-class pub. Both selective + qualified access. Name collision = compile error. No W0602. Any module can re-export | 5-0, 5-0, 5-0, 5-0 |
 | Logo direction | Hybrid syntax+focus metaphor (chevrons evoking blinkers). Blue+gold palette. Full design system (icon+wordmark+combo). Pick one metaphor, commit | 2-2 (Q1, hybrid resolution), 4-0, 4-0, 4-0 |
 | `capture_log` test instrumentation | Stdlib `std.testing.capture_log(List[Str]) -> Handler[IO.Log]`. Captures `io.log()` only. No new assertion helpers — use existing `assert`/`assert_eq` on `List[Str]` | 4-1 (Q1, Sys dissent), 5-0, 5-0 |
+| Sized integer role | First-class nominal types, not refinement types or FFI-only. Different representation (8/16/32/64 bits), not value constraints on Int | 3-1-1 (Sys/PLT/DevOps for A; Web for C; AI/ML for B) |
+| Sized integer overflow | Checked by default (panic on overflow). Explicit wrapping via `.wrapping_add()` etc. Compile-time range checking for literals | 3-2 (Sys/PLT/DevOps for checked; Web/AI for panic-always) |
+| Bitwise operations | Operator syntax (`&`, `\|`, `^`, `<<`, `>>`, `~`) with sealed traits. Integer types only | 4-1 (AI/ML dissented: named methods only) |
+| Sized numeric method surface | Standard: `.abs()`, `.min()`, `.max()`, `.pow()`, `.clamp()` plus wrapping arithmetic methods | 5-0 |
+| Sized numeric literal syntax | Type inference only. `let x: U8 = 42` — literal range-checked against context type. No suffix syntax, no constructor syntax | 4-1 (Sys dissented: constructor syntax) |
 
 ---
 
@@ -360,6 +365,7 @@ Full deliberation records for each decision. Each file contains expert votes, re
 | Qualified Access Semantics | [decisions/qualified-access-semantics.md](decisions/qualified-access-semantics.md) |
 | Pub Re-export Semantics | [decisions/pub-re-export-semantics.md](decisions/pub-re-export-semantics.md) |
 | `capture_log` Test Instrumentation | [decisions/capture-log-test-instrumentation.md](decisions/capture-log-test-instrumentation.md) |
+| Sized Numeric Types | [decisions/sized-numeric-types.md](decisions/sized-numeric-types.md) |
 
 ---
 

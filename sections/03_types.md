@@ -711,6 +711,153 @@ UUID implements: `Eq`, `Ord`, `Hash`, `Display`, `Clone`, `Debug`, `Serialize`, 
 | `BigInt` | `std.math` | 2 | No | Arbitrary-precision integer for crypto/scientific |
 | `UUID` | `std.uuid` | 2 | No | 128-bit identity type, Rand effect integration |
 
+##### Sized Integer Types
+
+Blink provides a family of fixed-width integer types alongside the default `Int`. These are first-class nominal types -- not refinements of `Int`, not aliases, not newtypes. A `U8` has a fundamentally different *representation* than an `Int`: 8 bits instead of 64 bits. Refinement types constrain values; sized types constrain representation. Different widths have different overflow boundaries, different bitwise semantics, and different memory layouts.
+
+**Type table:**
+
+| Type | Width | Range | C Type | Signed |
+|------|-------|-------|--------|--------|
+| `I8` | 8-bit | -128 to 127 | `int8_t` | Yes |
+| `I16` | 16-bit | -32,768 to 32,767 | `int16_t` | Yes |
+| `I32` | 32-bit | -2,147,483,648 to 2,147,483,647 | `int32_t` | Yes |
+| `Int` | 64-bit | -2^63 to 2^63-1 | `int64_t` | Yes |
+| `U8` | 8-bit | 0 to 255 | `uint8_t` | No |
+| `U16` | 16-bit | 0 to 65,535 | `uint16_t` | No |
+| `U32` | 32-bit | 0 to 4,294,967,295 | `uint32_t` | No |
+| `U64` | 64-bit | 0 to 2^64-1 | `uint64_t` | No |
+
+All sized types map directly to their C equivalents for zero-cost FFI. No wrapper structs, no indirection -- `U8` *is* `uint8_t` in the generated C. (Panel vote: 5-0.)
+
+**Why not just `Int` everywhere.** `Int` (64-bit) is the default and covers most use cases. Sized types exist for three reasons: (1) memory efficiency -- `[U8]` is 8x denser than `[Int]`, critical for buffers, images, and network protocols; (2) C FFI -- matching the exact width the foreign function expects; (3) domain semantics -- a byte is 0-255, not -2^63 to 2^63-1. Use `Int` unless you have a specific reason not to. (Panel vote: 3-1-1, Web dissented wanting refinement types, AI/ML dissented wanting FFI-only.)
+
+**Overflow behavior:**
+
+Arithmetic overflow is checked by default. An operation that exceeds the type's range panics at runtime with a descriptive message. The compiler also catches overflow in constant expressions at compile time.
+
+```blink
+let x: U8 = 255
+let y = x + 1               // RUNTIME PANIC: U8 overflow in addition (255 + 1)
+
+let bad: I8 = 127 + 1       // COMPILE ERROR: constant overflow in I8 (127 + 1 = 128, max 127)
+```
+
+For intentional modular arithmetic, use the explicit wrapping methods:
+
+```blink
+let x: U8 = 255
+let y = x.wrapping_add(1)   // y == 0 (wraps around)
+
+let a: I8 = 127
+let b = a.wrapping_add(1)   // b == -128 (wraps around)
+```
+
+**Why checked by default.** Silent overflow is the source of countless security vulnerabilities and subtle bugs. The wrapping methods make modular arithmetic opt-in and visible -- the intent is clear in the source code. Performance-sensitive inner loops can use wrapping methods where profiling shows the checks matter; everywhere else, the safety net catches bugs. (Panel vote: 3-2, Web/AI dissented wanting panic-always with no wrapping escape hatch.)
+
+**Bitwise operations:**
+
+Bitwise operators are available on all integer types (`Int`, `I8`, `I16`, `I32`, `U8`, `U16`, `U32`, `U64`). They are *not* available on `Float`, `Bool`, or `Str`.
+
+| Expression | Desugars to | Trait | Description |
+|------------|-------------|-------|-------------|
+| `a & b` | `BitAnd.bit_and(a, b)` | `BitAnd` | Bitwise AND |
+| `a \| b` | `BitOr.bit_or(a, b)` | `BitOr` | Bitwise OR |
+| `a ^ b` | `BitXor.bit_xor(a, b)` | `BitXor` | Bitwise XOR |
+| `a << b` | `Shl.shl(a, b)` | `Shl` | Left shift |
+| `a >> b` | `Shr.shr(a, b)` | `Shr` | Right shift (arithmetic for signed, logical for unsigned) |
+| `~a` | `BitNot.bit_not(a)` | `BitNot` | Bitwise NOT (complement) |
+
+Bitwise traits are **sealed** to integer types, following the same pattern as arithmetic traits (§3.6). Shift amounts are `U32` (matching the underlying C shift semantics). Shifting by more than the bit width is a runtime panic.
+
+```blink
+trait BitAnd {
+    fn bit_and(self, other: Self) -> Self
+}
+
+trait BitOr {
+    fn bit_or(self, other: Self) -> Self
+}
+
+trait BitXor {
+    fn bit_xor(self, other: Self) -> Self
+}
+
+trait Shl {
+    fn shl(self, amount: U32) -> Self
+}
+
+trait Shr {
+    fn shr(self, amount: U32) -> Self
+}
+
+trait BitNot {
+    fn bit_not(self) -> Self
+}
+```
+
+**Precedence:** Bitwise operators bind *lower* than comparison operators. This means `x & mask == 0` parses as `x & (mask == 0)`, which is almost certainly not what you intended. The compiler emits a warning (W0700) and requires explicit parentheses:
+
+```blink
+// WARNING: bitwise operator has lower precedence than comparison
+let bad = flags & 0x0F == 0          // W0700: add parentheses
+
+let good = (flags & 0x0F) == 0       // OK: intent is clear
+```
+
+**Why lower precedence than comparison.** This matches C's precedence table. Changing it would surprise every programmer with C/C++/Java experience and create a different class of bugs. Instead, the mandatory-parentheses warning eliminates the footgun while preserving familiar precedence. (Panel vote: 4-1, AI/ML dissented wanting named methods instead of operators.)
+
+**Standard methods on sized integer types:**
+
+All sized integer types support the following methods (in addition to arithmetic trait impls and conversion methods documented in §3c.3):
+
+| Method | Signature | Notes |
+|--------|-----------|-------|
+| `abs` | `fn(self) -> Self` | Panics on min value for signed types (e.g., `I8(-128).abs()`). No-op on unsigned types |
+| `min` | `fn(self, Self) -> Self` | Returns the smaller of two values |
+| `max` | `fn(self, Self) -> Self` | Returns the larger of two values |
+| `pow` | `fn(self, U32) -> Self` | Integer exponentiation. Panics on overflow |
+| `clamp` | `fn(self, Self, Self) -> Self` | Clamp value to `[min, max]` range. Panics if `min > max` |
+
+Wrapping arithmetic methods for intentional modular arithmetic:
+
+| Method | Signature | Notes |
+|--------|-----------|-------|
+| `wrapping_add` | `fn(self, Self) -> Self` | Modular addition (wraps on overflow) |
+| `wrapping_sub` | `fn(self, Self) -> Self` | Modular subtraction (wraps on underflow) |
+| `wrapping_mul` | `fn(self, Self) -> Self` | Modular multiplication (wraps on overflow) |
+
+```blink
+let x: I32 = -42
+let a = x.abs()              // 42
+let b = x.min(0)             // -42
+let c = x.max(0)             // 0
+let d = x.clamp(-10, 10)     // -10
+let e: U8 = 2
+let f = e.pow(8)             // RUNTIME PANIC: U8 overflow (256 > 255)
+let g = e.pow(7)             // 128
+```
+
+**Literal syntax:**
+
+Integer literals have no suffix syntax. The type is determined by context: the expected type from a variable annotation, function parameter, or surrounding expression. When no context is available, an unadorned integer literal defaults to `Int`.
+
+```blink
+let byte: U8 = 255       // OK: 255 fits in U8
+let bad: U8 = 300        // COMPILE ERROR: 300 exceeds U8 range (0..255)
+let x = 42               // type is Int (default)
+
+fn process(val: U8) { }
+process(200)              // OK: literal 200 fits in U8
+process(300)              // COMPILE ERROR: 300 exceeds U8 range
+```
+
+The compiler performs range checking on all constant expressions assigned to sized types. This catches errors at compile time rather than runtime. Non-constant expressions are checked at runtime via the overflow machinery described above.
+
+**Why no literal suffixes.** Languages like Rust use `42u8`, `100i32`, etc. Blink omits suffixes because (1) function signatures already provide the context -- `fn process(val: U8)` makes `process(200)` unambiguous; (2) suffixes add visual noise to a language designed for readability; (3) the rare case where disambiguation is needed can use a type annotation: `let x: U8 = 42`. (Panel vote: 4-1, Systems expert preferred constructor syntax `U8(42)`.)
+
+**Why not refinement types.** Sized integers are not `Int @where(self >= 0 && self <= 255)`. Refinement types constrain values but not representation -- a refined `Int` still occupies 64 bits. `U8` occupies 8 bits, enables efficient array layouts (`[U8]` is 8x denser than `[Int]`), and maps directly to C `uint8_t` for zero-cost FFI. The overflow and bitwise semantics also differ by width: `U8(255) + U8(1)` wraps to 0 (with `wrapping_add`), while a refined `Int` would just be 256. These are fundamentally different kinds of types serving different purposes. (Panel vote: 5-0.)
+
 ---
 
 ### 3.3 Type Inference
