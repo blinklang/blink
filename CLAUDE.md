@@ -61,11 +61,12 @@ Majority vote required. Record in DECISIONS.md. See OPEN_QUESTIONS.md for archiv
 ## Task Tags
 
 All tasks use `repo:blink` + one type tag:
-- `type:bug` — write failing test → fix → regen → ci.
-- `type:feature` — plan → confirm → implement.
-- `type:project` — break down into subtasks.
-- `type:friction` — triage → create bug/spec/feature tasks.
-- `type:spec` — panel deliberation via `/deliberate`.
+- `type:bug` - write failing test → fix → regen → ci.
+- `type:feature` - plan → confirm → implement.
+- `type:project` - break down into subtasks.
+- `type:friction` - triage → create bug/spec/feature tasks.
+- `type:spec` - panel deliberation via `/deliberate`.
+- `type:chore` - carry out task
 
 ## Friction Log
 

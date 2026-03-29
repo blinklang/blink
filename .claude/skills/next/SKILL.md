@@ -30,6 +30,7 @@ If `$ARGUMENTS` is provided, filter tasks whose title matches the argument (case
    - `type:feature` — requires confirmation before starting.
    - `type:project` — requires confirmation; pick at most 1 project.
    - `type:spec` — tell the user to run `/deliberate` for this item. Only work it directly if the user confirms.
+   - `type:chore` - auto-start, no confirmation needed.
 3. Don't skip a higher-priority task just because of its type. A P2 spec should be surfaced before a P4 feature.
 
 ## Step 3: Route by Type
@@ -76,6 +77,14 @@ When working multiple features: use parallel agents with worktrees. Each agent g
 ### type:spec — Defer to /deliberate
 1. Tell user to run `/deliberate` for this item
 2. Only work it directly if nothing else is available
+
+### type:chore - Auto-start, parallelizable
+You can do chores and bugs at the same time.
+For each chore item:
+1. `br start <id>`
+2. Read the task, find relevant info
+3. Do the task
+4. `br close <id>`
 
 ## Step 4: Ship it
 
