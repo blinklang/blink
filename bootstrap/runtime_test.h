@@ -11,33 +11,33 @@ typedef struct {
     int skip;
     const char** tags;
     int tag_count;
-} pact_test_entry;
+} blink_test_entry;
 
-BLINK_UNUSED static jmp_buf __pact_test_jmp;
-BLINK_UNUSED static int __pact_test_failed;
-BLINK_UNUSED static char __pact_test_fail_msg[512];
-BLINK_UNUSED static int __pact_test_fail_line;
+BLINK_UNUSED static jmp_buf __blink_test_jmp;
+BLINK_UNUSED static int __blink_test_failed;
+BLINK_UNUSED static char __blink_test_fail_msg[512];
+BLINK_UNUSED static int __blink_test_fail_line;
 
-BLINK_UNUSED static void __pact_assert_fail(const char* msg, int line) {
-    __pact_test_failed = 1;
+BLINK_UNUSED static void __blink_assert_fail(const char* msg, int line) {
+    __blink_test_failed = 1;
     if (msg) {
-        strncpy(__pact_test_fail_msg, msg, sizeof(__pact_test_fail_msg) - 1);
-        __pact_test_fail_msg[sizeof(__pact_test_fail_msg) - 1] = '\0';
+        strncpy(__blink_test_fail_msg, msg, sizeof(__blink_test_fail_msg) - 1);
+        __blink_test_fail_msg[sizeof(__blink_test_fail_msg) - 1] = '\0';
     } else {
-        __pact_test_fail_msg[0] = '\0';
+        __blink_test_fail_msg[0] = '\0';
     }
-    __pact_test_fail_line = line;
-    longjmp(__pact_test_jmp, 1);
+    __blink_test_fail_line = line;
+    longjmp(__blink_test_jmp, 1);
 }
 
-BLINK_UNUSED static int __pact_test_has_tag(const pact_test_entry* test, const char* tag) {
+BLINK_UNUSED static int __blink_test_has_tag(const blink_test_entry* test, const char* tag) {
     for (int t = 0; t < test->tag_count; t++) {
         if (strcmp(test->tags[t], tag) == 0) return 1;
     }
     return 0;
 }
 
-BLINK_UNUSED static void __pact_test_print_tags_json(const pact_test_entry* test) {
+BLINK_UNUSED static void __blink_test_print_tags_json(const blink_test_entry* test) {
     printf(",\"tags\":[");
     for (int t = 0; t < test->tag_count; t++) {
         if (t > 0) printf(",");
@@ -46,7 +46,7 @@ BLINK_UNUSED static void __pact_test_print_tags_json(const pact_test_entry* test
     printf("]");
 }
 
-BLINK_UNUSED static void pact_test_run(const pact_test_entry* tests, int count, int argc, const char** argv) {
+BLINK_UNUSED static void blink_test_run(const blink_test_entry* tests, int count, int argc, const char** argv) {
     const char* filter = NULL;
     const char* tags_filter = NULL;
     int json_output = 0;
@@ -66,12 +66,12 @@ BLINK_UNUSED static void pact_test_run(const pact_test_entry* tests, int count, 
 
     for (int i = 0; i < count; i++) {
         if (filter && !strstr(tests[i].name, filter)) continue;
-        if (tags_filter && !__pact_test_has_tag(&tests[i], tags_filter)) continue;
+        if (tags_filter && !__blink_test_has_tag(&tests[i], tags_filter)) continue;
         if (tests[i].skip) { skip++; total++;
             if (json_output) {
                 if (total > 1) printf(",");
                 printf("{\"name\":\"%s\",\"status\":\"skipped\"", tests[i].name);
-                __pact_test_print_tags_json(&tests[i]);
+                __blink_test_print_tags_json(&tests[i]);
                 printf("}");
             } else {
                 printf("test %s ... \033[33mskipped\033[0m\n", tests[i].name);
@@ -79,24 +79,24 @@ BLINK_UNUSED static void pact_test_run(const pact_test_entry* tests, int count, 
             continue;
         }
         total++;
-        __pact_test_failed = 0;
-        __pact_test_fail_msg[0] = '\0';
-        __pact_test_fail_line = 0;
-        if (setjmp(__pact_test_jmp) == 0) {
+        __blink_test_failed = 0;
+        __blink_test_fail_msg[0] = '\0';
+        __blink_test_fail_line = 0;
+        if (setjmp(__blink_test_jmp) == 0) {
             tests[i].fn();
         }
-        if (__pact_test_failed) {
+        if (__blink_test_failed) {
             fail++;
             if (json_output) {
                 if (total > 1) printf(",");
                 printf("{\"name\":\"%s\",\"status\":\"fail\",\"line\":%d,\"message\":\"%s\"",
-                       tests[i].name, __pact_test_fail_line, __pact_test_fail_msg);
-                __pact_test_print_tags_json(&tests[i]);
+                       tests[i].name, __blink_test_fail_line, __blink_test_fail_msg);
+                __blink_test_print_tags_json(&tests[i]);
                 printf("}");
             } else {
                 printf("test %s ... \033[31mFAIL\033[0m\n", tests[i].name);
-                if (__pact_test_fail_msg[0]) {
-                    fprintf(stderr, "  %s (line %d)\n", __pact_test_fail_msg, __pact_test_fail_line);
+                if (__blink_test_fail_msg[0]) {
+                    fprintf(stderr, "  %s (line %d)\n", __blink_test_fail_msg, __blink_test_fail_line);
                 }
             }
         } else {
@@ -104,7 +104,7 @@ BLINK_UNUSED static void pact_test_run(const pact_test_entry* tests, int count, 
             if (json_output) {
                 if (total > 1) printf(",");
                 printf("{\"name\":\"%s\",\"status\":\"pass\"", tests[i].name);
-                __pact_test_print_tags_json(&tests[i]);
+                __blink_test_print_tags_json(&tests[i]);
                 printf("}");
             } else {
                 printf("test %s ... \033[32mok\033[0m\n", tests[i].name);

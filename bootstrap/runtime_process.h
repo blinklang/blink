@@ -10,21 +10,21 @@ typedef struct {
     const char* out;
     const char* err_out;
     int64_t exit_code;
-} pact_ProcessResult;
+} blink_ProcessResult;
 
-static volatile pid_t pact_child_pid = 0;
-static volatile sig_atomic_t pact_got_sigint = 0;
+static volatile pid_t blink_child_pid = 0;
+static volatile sig_atomic_t blink_got_sigint = 0;
 
-static void pact_sigint_handler(int sig) {
+static void blink_sigint_handler(int sig) {
     (void)sig;
-    pact_got_sigint = 1;
-    pid_t p = pact_child_pid;
+    blink_got_sigint = 1;
+    pid_t p = blink_child_pid;
     if (p > 0) kill(p, SIGINT);
 }
 
-static char** pact_process_build_argv(const char* cmd, const pact_list* args) {
+static char** blink_process_build_argv(const char* cmd, const blink_list* args) {
     int64_t argc = args ? args->len : 0;
-    char** argv = (char**)pact_alloc(sizeof(char*) * (int64_t)(argc + 2));
+    char** argv = (char**)blink_alloc(sizeof(char*) * (int64_t)(argc + 2));
     argv[0] = (char*)cmd;
     for (int64_t i = 0; i < argc; i++) {
         argv[i + 1] = (char*)args->items[i];
@@ -33,9 +33,9 @@ static char** pact_process_build_argv(const char* cmd, const pact_list* args) {
     return argv;
 }
 
-static char* pact_read_fd_to_string(int fd) {
+static char* blink_read_fd_to_string(int fd) {
     int64_t cap = 4096, len = 0;
-    char* buf = (char*)pact_alloc(cap);
+    char* buf = (char*)blink_alloc(cap);
     while (1) {
         if (len + 1024 > cap) { cap *= 2; buf = (char*)GC_REALLOC(buf, (size_t)cap); }
         ssize_t n = read(fd, buf + len, (size_t)(cap - len - 1));
@@ -48,8 +48,8 @@ static char* pact_read_fd_to_string(int fd) {
     return buf;
 }
 
-BLINK_UNUSED static void pact_process_exec(const char* cmd, const pact_list* args) {
-    char** argv = pact_process_build_argv(cmd, args);
+BLINK_UNUSED static void blink_process_exec(const char* cmd, const blink_list* args) {
+    char** argv = blink_process_build_argv(cmd, args);
     execvp(cmd, argv);
     perror("execvp");
     _exit(127);
@@ -57,13 +57,13 @@ BLINK_UNUSED static void pact_process_exec(const char* cmd, const pact_list* arg
 
 // Note: writes all stdin before reading stdout/stderr. May deadlock if
 // stdin + stdout together exceed pipe buffer (~64KB). Fine for small payloads.
-BLINK_UNUSED static pact_ProcessResult pact_process_run_with_stdin(const char* cmd, const pact_list* args, const char* stdin_data) {
-    pact_ProcessResult result = { "", "", -1 };
+BLINK_UNUSED static blink_ProcessResult blink_process_run_with_stdin(const char* cmd, const blink_list* args, const char* stdin_data) {
+    blink_ProcessResult result = { "", "", -1 };
     int stdin_pipe[2] = {-1, -1}, stdout_pipe[2] = {-1, -1}, stderr_pipe[2] = {-1, -1};
     if (pipe(stdin_pipe) < 0 || pipe(stdout_pipe) < 0 || pipe(stderr_pipe) < 0) {
         if (stdin_pipe[0] >= 0) { close(stdin_pipe[0]); close(stdin_pipe[1]); }
         if (stdout_pipe[0] >= 0) { close(stdout_pipe[0]); close(stdout_pipe[1]); }
-        result.err_out = pact_strdup("pipe() failed");
+        result.err_out = blink_strdup("pipe() failed");
         return result;
     }
     pid_t pid = fork();
@@ -71,7 +71,7 @@ BLINK_UNUSED static pact_ProcessResult pact_process_run_with_stdin(const char* c
         close(stdin_pipe[0]); close(stdin_pipe[1]);
         close(stdout_pipe[0]); close(stdout_pipe[1]);
         close(stderr_pipe[0]); close(stderr_pipe[1]);
-        result.err_out = pact_strdup("fork() failed");
+        result.err_out = blink_strdup("fork() failed");
         return result;
     }
     if (pid == 0) {
@@ -84,7 +84,7 @@ BLINK_UNUSED static pact_ProcessResult pact_process_run_with_stdin(const char* c
         close(stdin_pipe[0]);
         close(stdout_pipe[1]);
         close(stderr_pipe[1]);
-        char** argv = pact_process_build_argv(cmd, args);
+        char** argv = blink_process_build_argv(cmd, args);
         execvp(cmd, argv);
         _exit(127);
     }
@@ -107,19 +107,19 @@ BLINK_UNUSED static pact_ProcessResult pact_process_run_with_stdin(const char* c
         sigaction(SIGPIPE, &sa_old, NULL);
     }
     close(stdin_pipe[1]);
-    result.out = pact_read_fd_to_string(stdout_pipe[0]);
-    result.err_out = pact_read_fd_to_string(stderr_pipe[0]);
-    pact_child_pid = pid;
-    pact_got_sigint = 0;
+    result.out = blink_read_fd_to_string(stdout_pipe[0]);
+    result.err_out = blink_read_fd_to_string(stderr_pipe[0]);
+    blink_child_pid = pid;
+    blink_got_sigint = 0;
     struct sigaction sa_int_old, sa_int_new;
     memset(&sa_int_new, 0, sizeof(sa_int_new));
-    sa_int_new.sa_handler = pact_sigint_handler;
+    sa_int_new.sa_handler = blink_sigint_handler;
     sa_int_new.sa_flags = SA_RESTART;
     sigaction(SIGINT, &sa_int_new, &sa_int_old);
     int status;
     waitpid(pid, &status, 0);
     sigaction(SIGINT, &sa_int_old, NULL);
-    pact_child_pid = 0;
+    blink_child_pid = 0;
     if (WIFEXITED(status)) {
         result.exit_code = (int64_t)WEXITSTATUS(status);
     } else if (WIFSIGNALED(status)) {
@@ -127,14 +127,14 @@ BLINK_UNUSED static pact_ProcessResult pact_process_run_with_stdin(const char* c
     } else {
         result.exit_code = -1;
     }
-    if (pact_got_sigint) {
+    if (blink_got_sigint) {
         raise(SIGINT);
     }
     return result;
 }
 
-BLINK_UNUSED static pact_ProcessResult pact_process_run(const char* cmd, const pact_list* args) {
-    return pact_process_run_with_stdin(cmd, args, NULL);
+BLINK_UNUSED static blink_ProcessResult blink_process_run(const char* cmd, const blink_list* args) {
+    return blink_process_run_with_stdin(cmd, args, NULL);
 }
 
 #endif

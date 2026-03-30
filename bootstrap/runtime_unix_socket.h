@@ -5,7 +5,7 @@
 #include <sys/un.h>
 #include <poll.h>
 
-BLINK_UNUSED static int64_t pact_unix_socket_listen(const char* path) {
+BLINK_UNUSED static int64_t blink_unix_socket_listen(const char* path) {
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) {
         fprintf(stderr, "blink: socket() failed\n");
@@ -29,7 +29,7 @@ BLINK_UNUSED static int64_t pact_unix_socket_listen(const char* path) {
     return (int64_t)fd;
 }
 
-BLINK_UNUSED static int64_t pact_unix_socket_connect(const char* path) {
+BLINK_UNUSED static int64_t blink_unix_socket_connect(const char* path) {
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) {
         fprintf(stderr, "blink: socket() failed\n");
@@ -47,7 +47,7 @@ BLINK_UNUSED static int64_t pact_unix_socket_connect(const char* path) {
     return (int64_t)fd;
 }
 
-BLINK_UNUSED static int64_t pact_unix_socket_accept(int64_t listen_fd) {
+BLINK_UNUSED static int64_t blink_unix_socket_accept(int64_t listen_fd) {
     int client = accept((int)listen_fd, NULL, NULL);
     if (client < 0) {
         fprintf(stderr, "blink: accept() failed\n");
@@ -56,7 +56,7 @@ BLINK_UNUSED static int64_t pact_unix_socket_accept(int64_t listen_fd) {
     return (int64_t)client;
 }
 
-BLINK_UNUSED static int64_t pact_unix_socket_accept_timeout(int64_t listen_fd, int64_t timeout_ms) {
+BLINK_UNUSED static int64_t blink_unix_socket_accept_timeout(int64_t listen_fd, int64_t timeout_ms) {
     struct pollfd pfd;
     pfd.fd = (int)listen_fd;
     pfd.events = POLLIN;
@@ -68,11 +68,11 @@ BLINK_UNUSED static int64_t pact_unix_socket_accept_timeout(int64_t listen_fd, i
     return (int64_t)client;
 }
 
-BLINK_UNUSED static void pact_unix_socket_close(int64_t fd) {
+BLINK_UNUSED static void blink_unix_socket_close(int64_t fd) {
     close((int)fd);
 }
 
-BLINK_UNUSED static const char* pact_socket_read_line(int64_t fd) {
+BLINK_UNUSED static const char* blink_socket_read_line(int64_t fd) {
     char buf[4096];
     int64_t pos = 0;
     while (pos < (int64_t)(sizeof(buf) - 1)) {
@@ -83,10 +83,10 @@ BLINK_UNUSED static const char* pact_socket_read_line(int64_t fd) {
         buf[pos++] = ch;
     }
     buf[pos] = '\0';
-    return pact_strdup(buf);
+    return blink_strdup(buf);
 }
 
-BLINK_UNUSED static void pact_socket_write(int64_t fd, const char* data) {
+BLINK_UNUSED static void blink_socket_write(int64_t fd, const char* data) {
     size_t len = strlen(data);
     size_t written = 0;
     while (written < len) {

@@ -7,7 +7,7 @@
 #include <stdint.h>
 
 /* Read one line from stdin (strips \r\n and \n, returns strdup'd string) */
-BLINK_UNUSED static const char* pact_stdin_read_line(void) {
+BLINK_UNUSED static const char* blink_stdin_read_line(void) {
     char buf[4096];
     int64_t pos = 0;
     while (pos < (int64_t)(sizeof(buf) - 1)) {
@@ -17,12 +17,12 @@ BLINK_UNUSED static const char* pact_stdin_read_line(void) {
     }
     if (pos > 0 && buf[pos - 1] == '\r') pos--;
     buf[pos] = '\0';
-    return pact_strdup(buf);
+    return blink_strdup(buf);
 }
 
 /* Read exactly n bytes from stdin into Bytes */
-BLINK_UNUSED static pact_bytes* pact_stdin_read_bytes(int64_t n) {
-    pact_bytes* b = pact_bytes_new();
+BLINK_UNUSED static blink_bytes* blink_stdin_read_bytes(int64_t n) {
+    blink_bytes* b = blink_bytes_new();
     if (n <= 0) return b;
     if (n > b->cap) {
         b->cap = n;
@@ -39,14 +39,14 @@ BLINK_UNUSED static pact_bytes* pact_stdin_read_bytes(int64_t n) {
 }
 
 /* Write string to stdout with immediate flush */
-BLINK_UNUSED static void pact_stdout_write(const char* data) {
+BLINK_UNUSED static void blink_stdout_write(const char* data) {
     size_t len = strlen(data);
     fwrite(data, 1, len, stdout);
     fflush(stdout);
 }
 
 /* Write bytes to stdout with immediate flush */
-BLINK_UNUSED static void pact_stdout_write_bytes(pact_bytes* b) {
+BLINK_UNUSED static void blink_stdout_write_bytes(blink_bytes* b) {
     fwrite(b->data, 1, (size_t)b->len, stdout);
     fflush(stdout);
 }
