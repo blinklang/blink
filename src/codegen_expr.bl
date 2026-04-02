@@ -671,7 +671,11 @@ fn emit_handler_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope,
             let ret_str = np_return_type.get(m).unwrap()
             let ret_type = type_from_name(ret_str)
             let ann_ret_c = resolve_ret_type_from_ann(m)
-            let ret_c = if ann_ret_c != "" { ann_ret_c } else { c_type_str(ret_type) }
+            let mut ret_c = if ann_ret_c != "" { ann_ret_c } else { c_type_str(ret_type) }
+            let ue_needs_ptr = is_user_effect != 0 && ret_type == CT_OPTION && resolve_option_inner_from_ann(m) == CT_VOID
+            if ue_needs_ptr {
+                ret_c = option_c_type(CT_PTR)
+            }
             let fn_line = "static {ret_c} {static_name}({param_str}) \{"
             cg_closure_defs.push(fn_line)
             let saved_lines = cg_lines
@@ -691,7 +695,9 @@ fn emit_handler_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope,
             cg_handler_body_is_ue = is_user_effect
             cg_handler_body_idx = handler_idx
             cg_current_fn_ret = ret_type
-            if ret_type == CT_OPTION {
+            if ue_needs_ptr {
+                cg_current_fn_option_inner = CT_PTR
+            } else if ret_type == CT_OPTION {
                 cg_current_fn_option_inner = resolve_option_inner_from_ann(m)
             } else {
                 cg_current_fn_option_inner = 0
@@ -1610,12 +1616,25 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                 expr_option_is_none = 0
                 let inner_s = get_var_struct(inner_str)
                 if inner_s != "" {
-                    ensure_struct_option_type(inner_s)
-                    let opt_type = struct_option_c_type(inner_s)
-                    expr_result_str = "({opt_type})\{.tag = 1, .value = {inner_str}}"
-                    expr_result_type = CT_OPTION
-                    expr_option_inner = inner_type
-                    expr_option_inner_struct = inner_s
+                    if cg_in_handler_body != 0 && cg_handler_body_is_ue != 0 && cg_current_fn_option_inner == CT_PTR {
+                        ensure_option_type(CT_PTR)
+                        let opt_type = option_c_type(CT_PTR)
+                        let struct_c = c_type_c_name(inner_s)
+                        let heap_tmp = fresh_temp("__ue_heap_")
+                        emit_line("{struct_c}* {heap_tmp} = ({struct_c}*)blink_alloc(sizeof({struct_c}));")
+                        emit_line("*{heap_tmp} = {inner_str};")
+                        expr_result_str = "({opt_type})\{.tag = 1, .value = (void*){heap_tmp}}"
+                        expr_result_type = CT_OPTION
+                        expr_option_inner = CT_PTR
+                        expr_option_inner_struct = inner_s
+                    } else {
+                        ensure_struct_option_type(inner_s)
+                        let opt_type = struct_option_c_type(inner_s)
+                        expr_result_str = "({opt_type})\{.tag = 1, .value = {inner_str}}"
+                        expr_result_type = CT_OPTION
+                        expr_option_inner = inner_type
+                        expr_option_inner_struct = inner_s
+                    }
                 } else if is_compound_ct(inner_type) != 0 {
                     let compound_name = if inner_type == CT_OPTION && expr_option_inner_struct != "" {
                         expr_option_inner_struct
