@@ -9,7 +9,7 @@ import parser.{
 }
 import codegen_types.{
     Codegen,
-    CT_BYTES, CT_FFI_SCOPE, CT_INT, CT_LIST, CT_MAP, CT_OPTION, CT_PTR, CT_SET,
+    CT_BYTES, CT_FFI_SCOPE, CT_INT, CT_LIST, CT_MAP, CT_OPTION, CT_PTR, CT_RESULT, CT_SET,
     CT_STRING, CT_STRINGBUILDER, CT_VOID,
     BuiltinTraitImpl, FnEnumRetEntry, FromImplEntry, GenericFnEntry,
     ImplEntry, StructFieldEntry, TraitEntry, TryFromImplEntry,
@@ -41,7 +41,11 @@ import codegen_types.{
     emitted_struct_result_types, emitted_take_iters,
     emitted_tuple_entries, emitted_tuple_set,
     emit_option_typedef, option_typedef_emitted,
-    ensure_mixed_result_type, ensure_option_type, ensure_struct_option_type, option_c_type,
+    c_type_tag, emit_struct_option_typedef, emit_struct_result_typedef,
+    ensure_compound_type_from_ann, find_type_def_node,
+    ensure_mixed_result_type, ensure_option_type, ensure_struct_option_type,
+    ensure_struct_result_type, is_compound_ct, option_c_type,
+    resolve_result_inner_tag,
     enum_reg_set, enum_regs, enum_variants,
     fn_enum_rets, fn_regs, fn_ret_struct_inners, fn_ret_structs, fn_ret_types,
     from_entries, generic_fns, get_fn_enum_ret,
@@ -237,6 +241,29 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
     builtin_trait_impls.push(BuiltinTraitImpl { trait_name: "StringBuildOps", ct_type: CT_STRINGBUILDER })
     builtin_trait_impls.push(BuiltinTraitImpl { trait_name: "Joinable", ct_type: CT_LIST })
 
+    // Pre-register struct/enum names and module prefixes so UE effect type resolution works
+    let pre_types_sl = np_fields.get(program).unwrap()
+    if pre_types_sl != -1 {
+        let mut pti = 0
+        while pti < sublist_length(pre_types_sl) {
+            let ptd = sublist_get(pre_types_sl, pti)
+            let ptd_name = np_name.get(ptd).unwrap()
+            let ptd_mod = np_module.get(ptd).unwrap()
+            if ptd_mod != "" && ptd_mod != "__main__" {
+                mod_type_prefix.set(ptd_name, ptd_mod)
+            }
+            let ptd_flds = np_fields.get(ptd).unwrap()
+            if ptd_flds != -1 && sublist_length(ptd_flds) > 0 {
+                if np_kind.get(sublist_get(ptd_flds, 0)).unwrap() == NodeKind.TypeVariant {
+                    enum_reg_set.set(ptd_name, 1)
+                } else {
+                    struct_reg_set.set(ptd_name, 1)
+                }
+            }
+            pti = pti + 1
+        }
+    }
+
     // Register user-defined effect declarations
     let effects_decl_sl = np_args.get(program).unwrap()
     if effects_decl_sl != -1 {
@@ -296,6 +323,10 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
                             let op_ret_ct = type_from_name(op_ret)
                             let mut op_ret_inner_ct = CT_VOID
                             let mut op_ret_inner_struct = ""
+                            let mut op_ret_inner_ct2 = CT_VOID
+                            let mut op_ret_inner_struct2 = ""
+                            let mut op_ret_ok_elem_ct = CT_VOID
+                            let mut op_ret_ok_elem_struct = ""
                             let mut op_c_ret = c_type_str(op_ret_ct)
                             if op_ret == "" {
                                 op_c_ret = "void"
@@ -320,6 +351,75 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
                                     } else {
                                         ensure_option_type(op_ret_inner_ct)
                                         op_c_ret = option_c_type(op_ret_inner_ct)
+                                    }
+                                }
+                            } else if op_ret_ct == CT_RESULT {
+                                let op_ta = np_type_ann.get(op).unwrap()
+                                if op_ta != -1 {
+                                    let op_ta_elems = np_elements.get(op_ta).unwrap()
+                                    if op_ta_elems != -1 && sublist_length(op_ta_elems) >= 2 {
+                                        let ok_ann = sublist_get(op_ta_elems, 0)
+                                        let err_ann = sublist_get(op_ta_elems, 1)
+                                        let ok_name = np_name.get(ok_ann).unwrap()
+                                        let err_name = np_name.get(err_ann).unwrap()
+                                        let ok_t = type_from_name(ok_name)
+                                        let err_t = type_from_name(err_name)
+                                        op_ret_inner_ct = ok_t
+                                        if ok_t == CT_VOID && ok_name != "" && ok_name != "Void" {
+                                            op_ret_inner_struct = strip_module_qualifier(ok_name)
+                                        }
+                                        op_ret_inner_ct2 = err_t
+                                        if err_t == CT_VOID && err_name != "" {
+                                            op_ret_inner_struct2 = strip_module_qualifier(err_name)
+                                        }
+                                        if ok_t == CT_LIST || ok_t == CT_OPTION {
+                                            let ok_ann_elems = np_elements.get(ok_ann).unwrap()
+                                            if ok_ann_elems != -1 && sublist_length(ok_ann_elems) > 0 {
+                                                let elem_ann = sublist_get(ok_ann_elems, 0)
+                                                let elem_name = np_name.get(elem_ann).unwrap()
+                                                let elem_ct = type_from_name(elem_name)
+                                                op_ret_ok_elem_ct = elem_ct
+                                                if elem_ct == CT_VOID && elem_name != "" {
+                                                    let stripped_elem = strip_module_qualifier(elem_name)
+                                                    op_ret_ok_elem_struct = stripped_elem
+                                                    struct_reg_set.set(stripped_elem, 1)
+                                                    if elem_name != stripped_elem {
+                                                        struct_reg_set.set(elem_name, 1)
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        if err_t == CT_VOID && err_name != "" {
+                                            let stripped_err = strip_module_qualifier(err_name)
+                                            enum_reg_set.set(stripped_err, 1)
+                                            if err_name != stripped_err {
+                                                enum_reg_set.set(err_name, 1)
+                                            }
+                                        }
+                                        let ok_tag = resolve_result_inner_tag(ok_ann, ok_name, ok_t)
+                                        let err_tag = resolve_result_inner_tag(err_ann, err_name, err_t)
+                                        if ok_tag != "" && is_compound_ct(ok_t) != 0 {
+                                            op_ret_inner_struct = ok_tag
+                                        }
+                                        if err_tag != "" && is_compound_ct(err_t) != 0 {
+                                            op_ret_inner_struct2 = err_tag
+                                        }
+                                        let mut ok_t_tag = if ok_tag != "" { ok_tag } else { c_type_tag(ok_t) }
+                                        let err_t_tag = if err_tag != "" { err_tag } else { c_type_tag(err_t) }
+                                        if ok_t == CT_OPTION && op_ret_ok_elem_struct != "" {
+                                            ok_t_tag = "Option_ptr"
+                                            ensure_option_type(CT_PTR)
+                                        }
+                                        ensure_struct_result_type(ok_t_tag, err_t_tag)
+                                        if ok_t == CT_OPTION && op_ret_ok_elem_struct != "" {
+                                            // ptr-erased: skip compound type emission for Ok
+                                        } else if is_compound_ct(ok_t) != 0 {
+                                            ensure_compound_type_from_ann(ok_ann)
+                                        }
+                                        if is_compound_ct(err_t) != 0 {
+                                            ensure_compound_type_from_ann(err_ann)
+                                        }
+                                        op_c_ret = "blink_Result_{ok_t_tag}_{err_t_tag}"
                                     }
                                 }
                             } else if op_ret_ct == CT_VOID && op_ret != "" {
@@ -356,7 +456,7 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
                             if op_c_params == "" {
                                 op_c_params = "void"
                             }
-                            ue_methods.push(UeMethod { name: op_name, params: op_c_params, ret: op_c_ret, ret_ct: op_ret_ct, ret_inner_ct: op_ret_inner_ct, ret_inner_struct: op_ret_inner_struct, effect_handle: handle })
+                            ue_methods.push(UeMethod { name: op_name, params: op_c_params, ret: op_c_ret, ret_ct: op_ret_ct, ret_inner_ct: op_ret_inner_ct, ret_inner_struct: op_ret_inner_struct, ret_inner_ct2: op_ret_inner_ct2, ret_inner_struct2: op_ret_inner_struct2, ret_ok_elem_ct: op_ret_ok_elem_ct, ret_ok_elem_struct: op_ret_ok_elem_struct, effect_handle: handle })
                             oi = oi + 1
                         }
                     }
@@ -400,12 +500,32 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
     cg_lines.push("static blink_ctx __blink_ctx;")
     cg_lines.push("")
 
-    // Emit option typedefs needed by UE vtable signatures (early, before vtable structs)
+    // Emit option/result typedefs needed by UE vtable signatures (early, before vtable structs)
     let mut ue_pre = 0
     while ue_pre < ue_methods.len() {
         let ue_m = ue_methods.get(ue_pre).unwrap()
         if ue_m.ret_ct == CT_OPTION {
             emit_option_typedef(ue_m.ret_inner_ct)
+        } else if ue_m.ret_ct == CT_RESULT {
+            if ue_m.ret_inner_struct != "" && ue_m.ret_inner_ct == CT_VOID {
+                let td_ok = find_type_def_node(ue_m.ret_inner_struct)
+                if td_ok != -1 {
+                    emit_struct_typedef(td_ok)
+                }
+            }
+            if ue_m.ret_inner_struct2 != "" {
+                let td2 = find_type_def_node(ue_m.ret_inner_struct2)
+                if td2 != -1 {
+                    emit_enum_typedef(td2)
+                }
+            }
+            let mut ok_tag = if ue_m.ret_inner_struct != "" { ue_m.ret_inner_struct } else { c_type_tag(ue_m.ret_inner_ct) }
+            let err_tag = if ue_m.ret_inner_struct2 != "" { ue_m.ret_inner_struct2 } else { c_type_tag(ue_m.ret_inner_ct2) }
+            if ue_m.ret_inner_ct == CT_OPTION && ue_m.ret_ok_elem_struct != "" {
+                emit_option_typedef(CT_PTR)
+                ok_tag = "Option_ptr"
+            }
+            emit_struct_result_typedef(ok_tag, err_tag)
         }
         ue_pre = ue_pre + 1
     }
@@ -446,6 +566,10 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
                 } else if uem.ret_ct == CT_OPTION {
                     cg_lines.push("static {uem.ret} {dfn}({uem.params}) \{")
                     cg_lines.push("    return ({uem.ret})\{ .tag = 0 };")
+                    cg_lines.push("}")
+                } else if uem.ret_ct == CT_RESULT {
+                    cg_lines.push("static {uem.ret} {dfn}({uem.params}) \{")
+                    cg_lines.push("    return ({uem.ret})\{ .tag = 1 };")
                     cg_lines.push("}")
                 } else {
                     cg_lines.push("static {uem.ret} {dfn}({uem.params}) \{")

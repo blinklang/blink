@@ -2,7 +2,7 @@ import codegen_types.{
     CT_BOOL, CT_BYTES, CT_CHANNEL, CT_CLOSURE, CT_FFI_SCOPE, CT_FLOAT,
     CT_HANDLER, CT_INT, CT_ITERATOR, CT_LIST, CT_MAP, CT_OPTION, CT_PTR,
     CT_RESULT, CT_SET, CT_STRING, CT_STRINGBUILDER, CT_VOID,
-    CaptureEntry, ClosureCapInfo,
+    CaptureEntry, ClosureCapInfo, FnRetStructInner,
     c_fn_name, c_safe_name, c_type_c_name, c_type_str, c_type_tag,
     capture_cast_expr, check_effect_propagation,
     cg_async_scope_counter, cg_async_scope_stack,
@@ -19,7 +19,7 @@ import codegen_types.{
     compound_name_from_ann, compound_option_inner_name,
     emit_line, ensure_iter_type, ensure_mixed_result_type,
     ensure_option_type, ensure_result_type, ensure_struct_option_type,
-    ensure_tuple_type, find_type_def_node, fresh_temp,
+    ensure_tuple_type, find_type_def_node, fn_ret_struct_inners, fresh_temp,
     get_capture_index, get_fn_node, get_fn_ret, get_fn_ret_struct,
     get_fn_ret_handler, get_fn_ret_struct_inner, get_fn_ret_type,
     get_generic_fn_node,
@@ -46,7 +46,7 @@ import codegen_types.{
     reg_fn_ret_type, reg_fn_struct_ret,
     register_mono_fn, register_mono_instance,
     resolve_import_alias, resolve_option_inner_from_ann,
-    resolve_ptr_inner_c, resolve_ret_type_from_ann, resolve_struct_from_c_name,
+    resolve_ptr_inner_c, resolve_result_inner_tag, resolve_ret_type_from_ann, resolve_struct_from_c_name,
     resolve_tp, resolve_variant,
     result_c_type, result_c_type_mixed,
     scope_vars, set_list_elem_struct, set_list_elem_type,
@@ -676,6 +676,35 @@ fn emit_handler_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope,
             if ue_needs_ptr {
                 ret_c = option_c_type(CT_PTR)
             }
+            let mut ue_result_opt_ptr = 0
+            if is_user_effect != 0 && ret_type == CT_RESULT {
+                let _ta = np_type_ann.get(m).unwrap()
+                if _ta != -1 {
+                    let _elems = np_elements.get(_ta).unwrap()
+                    if _elems != -1 && sublist_length(_elems) >= 2 {
+                        let _ok_ann = sublist_get(_elems, 0)
+                        let _ok_name = np_name.get(_ok_ann).unwrap()
+                        let _ok_t = type_from_name(_ok_name)
+                        if _ok_t == CT_OPTION {
+                            let _ok_elems = np_elements.get(_ok_ann).unwrap()
+                            if _ok_elems != -1 && sublist_length(_ok_elems) > 0 {
+                                let _elem_ann = sublist_get(_ok_elems, 0)
+                                let _elem_name = np_name.get(_elem_ann).unwrap()
+                                let _elem_ct = type_from_name(_elem_name)
+                                if _elem_ct == CT_VOID && _elem_name != "" {
+                                    let _err_ann = sublist_get(_elems, 1)
+                                    let _err_name = np_name.get(_err_ann).unwrap()
+                                    let _err_t = type_from_name(_err_name)
+                                    let _err_tag = resolve_result_inner_tag(_err_ann, _err_name, _err_t)
+                                    let _err_t_tag = if _err_tag != "" { _err_tag } else { c_type_tag(_err_t) }
+                                    ret_c = "blink_Result_Option_ptr_{_err_t_tag}"
+                                    ue_result_opt_ptr = 1
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             let fn_line = "static {ret_c} {static_name}({param_str}) \{"
             cg_closure_defs.push(fn_line)
             let saved_lines = cg_lines
@@ -687,6 +716,7 @@ fn emit_handler_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope,
             let saved_handler_hidx = cg_handler_body_idx
             let saved_fn_ret = cg_current_fn_ret
             let saved_fn_option_inner = cg_current_fn_option_inner
+            let saved_fn_name = cg_current_fn_name
             cg_lines = []
             cg_indent = 1
             cg_in_handler_body = 1
@@ -695,7 +725,17 @@ fn emit_handler_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope,
             cg_handler_body_is_ue = is_user_effect
             cg_handler_body_idx = handler_idx
             cg_current_fn_ret = ret_type
+            cg_current_fn_name = static_name
+            if ret_type == CT_RESULT {
+                reg_fn_ret_from_ann(static_name, m)
+                if ue_result_opt_ptr != 0 {
+                    let _fsi_cur = get_fn_ret_struct_inner(static_name)
+                    fn_ret_struct_inners.push(FnRetStructInner { name: static_name, ok_struct: "Option_ptr", err_struct: _fsi_cur.err_struct })
+                }
+            }
             if ue_needs_ptr {
+                cg_current_fn_option_inner = CT_PTR
+            } else if ue_result_opt_ptr != 0 {
                 cg_current_fn_option_inner = CT_PTR
             } else if ret_type == CT_OPTION {
                 cg_current_fn_option_inner = resolve_option_inner_from_ann(m)
@@ -731,6 +771,7 @@ fn emit_handler_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope,
             cg_handler_body_idx = saved_handler_hidx
             cg_current_fn_ret = saved_fn_ret
             cg_current_fn_option_inner = saved_fn_option_inner
+            cg_current_fn_name = saved_fn_name
             mi = mi + 1
         }
     }
@@ -1681,7 +1722,11 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
             if args_sl != -1 && sublist_length(args_sl) > 0 {
                 emit_expr(sublist_get(args_sl, 0))
                 let ok_str = expr_result_str
-                let ok_type = expr_result_type
+                let mut ok_type = expr_result_type
+                let fn_rt = get_fn_ret_type(cg_current_fn_name)
+                if fn_rt.kind == CT_RESULT && fn_rt.inner1 == CT_VOID {
+                    ok_type = CT_VOID
+                }
                 let ok_s0 = get_var_struct(ok_str)
                 let fsi = get_fn_ret_struct_inner(cg_current_fn_name)
                 let mut ok_s = if ok_s0 != "" { ok_s0 } else { fsi.ok_struct }

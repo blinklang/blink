@@ -10,6 +10,7 @@ typedef struct {
     blink_list* columns;   /* List of column name strings */
     int64_t num_rows;
     int64_t num_cols;
+    int64_t rc;            /* sqlite3 return code (0 = SQLITE_OK) */
 } blink_sqlite3_result;
 
 BLINK_UNUSED static void* blink_sqlite3_open(const char* path) {
@@ -57,14 +58,11 @@ BLINK_UNUSED static void* blink_sqlite3_query(void* db, const char* sql) {
     res->columns = blink_list_new();
     res->num_rows = 0;
     res->num_cols = 0;
+    res->rc = 0;
     char* err = NULL;
     int rc = sqlite3_exec((sqlite3*)db, sql, blink_sqlite3_query_cb, res, &err);
-    if (rc != SQLITE_OK) {
-        if (err) {
-            fprintf(stderr, "blink: sqlite3 query error: %s\n", err);
-            sqlite3_free(err);
-        }
-    }
+    res->rc = (int64_t)rc;
+    if (err) sqlite3_free(err);
     return res;
 }
 
@@ -128,13 +126,15 @@ BLINK_UNUSED static int64_t blink_sqlite3_rollback(void* db) {
     return (int64_t)sqlite3_exec((sqlite3*)db, "ROLLBACK", NULL, NULL, NULL);
 }
 
+int64_t blink_sqlite3_result_rc(blink_handle* r) {
+    blink_sqlite3_result* res = (blink_sqlite3_result*)r;
+    return res->rc;
+}
+
 BLINK_UNUSED static int64_t blink_sqlite3_exec_void(void* db, const char* sql) {
     char* err = NULL;
     int rc = sqlite3_exec((sqlite3*)db, sql, NULL, NULL, &err);
-    if (err) {
-        fprintf(stderr, "blink: sqlite3 exec error: %s\n", err);
-        sqlite3_free(err);
-    }
+    if (err) sqlite3_free(err);
     return (int64_t)rc;
 }
 

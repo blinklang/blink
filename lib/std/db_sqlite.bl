@@ -1,5 +1,6 @@
 import std.db
 import std.db_row.{Row}
+import std.db_error.{DBError}
 
 // --- SQLite FFI bindings ---
 
@@ -43,6 +44,10 @@ fn sqlite_result_cell(result: Handle, row: Int, col: Int) -> Str ! FFI {}
 @trusted
 fn sqlite_result_free(result: Handle) ! FFI {}
 
+@ffi("blink_sqlite3_result_rc")
+@trusted
+fn sqlite_result_rc(result: Handle) -> Int ! FFI {}
+
 @ffi("blink_sqlite3_prepare")
 @trusted
 pub fn sqlite_prepare(handle: Handle, sql: Str) -> Handle ! FFI {}
@@ -79,22 +84,16 @@ pub fn sqlite_finalize(stmt: Handle) -> Int ! FFI {}
 @trusted
 pub fn sqlite_errmsg(handle: Handle) -> Str ! FFI {}
 
-@ffi("blink_sqlite3_begin")
-@trusted
-pub fn sqlite_begin_raw(handle: Handle) -> Int ! FFI {}
-
-@ffi("blink_sqlite3_commit")
-@trusted
-pub fn sqlite_commit_raw(handle: Handle) -> Int ! FFI {}
-
-@ffi("blink_sqlite3_rollback")
-@trusted
-pub fn sqlite_rollback_raw(handle: Handle) -> Int ! FFI {}
-
 // --- Query result marshaling ---
 
-pub fn sqlite_query(handle: Handle, sql: Str) -> List[Row] {
+pub fn sqlite_query(handle: Handle, sql: Str) -> Result[List[Row], DBError] {
     let result = sqlite_query_raw(handle, sql)
+    let rc = sqlite_result_rc(result)
+    if rc != 0 {
+        let msg = sqlite_errmsg(handle)
+        sqlite_result_free(result)
+        return Err(DBError.QueryError(msg))
+    }
     let num_rows = sqlite_result_num_rows(result)
     let num_cols = sqlite_result_num_cols(result)
     let mut columns: List[Str] = []
@@ -116,15 +115,21 @@ pub fn sqlite_query(handle: Handle, sql: Str) -> List[Row] {
         ri = ri + 1
     }
     sqlite_result_free(result)
-    rows
+    Ok(rows)
 }
 
-pub fn sqlite_query_one(handle: Handle, sql: Str) -> Option[Row] {
+pub fn sqlite_query_one(handle: Handle, sql: Str) -> Result[Row, DBError] {
     let result = sqlite_query_raw(handle, sql)
+    let rc = sqlite_result_rc(result)
+    if rc != 0 {
+        let msg = sqlite_errmsg(handle)
+        sqlite_result_free(result)
+        return Err(DBError.QueryError(msg))
+    }
     let num_rows = sqlite_result_num_rows(result)
     if num_rows == 0 {
         sqlite_result_free(result)
-        return None
+        return Err(DBError.NotFound)
     }
     let num_cols = sqlite_result_num_cols(result)
     let mut columns: List[Str] = []
@@ -140,7 +145,25 @@ pub fn sqlite_query_one(handle: Handle, sql: Str) -> Option[Row] {
         di = di + 1
     }
     sqlite_result_free(result)
-    Some(Row { data: data, columns: columns })
+    Ok(Row { data: data, columns: columns })
+}
+
+fn sqlite_exec_checked(handle: Handle, sql: Str) -> Result[Void, DBError] {
+    let rc = sqlite_exec_raw(handle, sql)
+    if rc != 0 {
+        Err(DBError.ExecError(sqlite_errmsg(handle)))
+    } else {
+        Ok(0)
+    }
+}
+
+fn sqlite_execute_checked(handle: Handle, sql: Str) -> Result[Int, DBError] {
+    let rc = sqlite_execute_raw(handle, sql)
+    if rc == -1 {
+        Err(DBError.ExecError(sqlite_errmsg(handle)))
+    } else {
+        Ok(rc)
+    }
 }
 
 // --- SQLite effect handler ---
@@ -150,26 +173,26 @@ let mut sqlite_db_handle: Handle = null_ptr()
 pub fn sqlite_handler(handle: Handle) -> Handler[DB] {
     sqlite_db_handle = handle
     handler DB {
-        fn query(sql: Str) -> List[Row] {
+        fn query(sql: Str) -> Result[List[Row], DBError] {
             sqlite_query(sqlite_db_handle, sql)
         }
-        fn query_one(sql: Str) -> Option[Row] {
+        fn query_one(sql: Str) -> Result[Row, DBError] {
             sqlite_query_one(sqlite_db_handle, sql)
         }
-        fn exec(sql: Str) {
-            sqlite_exec_raw(sqlite_db_handle, sql)
+        fn exec(sql: Str) -> Result[Void, DBError] {
+            sqlite_exec_checked(sqlite_db_handle, sql)
         }
-        fn execute(sql: Str) -> Int {
-            sqlite_execute_raw(sqlite_db_handle, sql)
+        fn execute(sql: Str) -> Result[Int, DBError] {
+            sqlite_execute_checked(sqlite_db_handle, sql)
         }
-        fn begin() -> Int {
-            sqlite_begin_raw(sqlite_db_handle)
+        fn begin() -> Result[Void, DBError] {
+            sqlite_exec_checked(sqlite_db_handle, "BEGIN")
         }
-        fn commit() -> Int {
-            sqlite_commit_raw(sqlite_db_handle)
+        fn commit() -> Result[Void, DBError] {
+            sqlite_exec_checked(sqlite_db_handle, "COMMIT")
         }
-        fn rollback() -> Int {
-            sqlite_rollback_raw(sqlite_db_handle)
+        fn rollback() -> Result[Void, DBError] {
+            sqlite_exec_checked(sqlite_db_handle, "ROLLBACK")
         }
     }
 }
