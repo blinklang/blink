@@ -755,6 +755,46 @@ test "CLI exits with 1 on missing args" {
 
 ---
 
+#### 4.4.4 DB.Write Scoped Transaction
+
+`db.transaction` implements the `BlockHandler` trait (see §4.6.3), providing automatic `BEGIN`/`COMMIT`/`ROLLBACK` semantics via `with`. It requires the `DB.Write` effect.
+
+```blink
+fn transfer(from_id: Int, to_id: Int, amount: Int) -> Result[Void, DBError] ! DB.Write {
+    with db.transaction() {
+        let from = db.query_one("SELECT balance FROM accounts WHERE id = {from_id}")?
+        let to_acct = db.query_one("SELECT balance FROM accounts WHERE id = {to_id}")?
+
+        if from.get_int("balance").unwrap() < amount {
+            return Err(DBError.ExecError("insufficient funds"))
+        }
+
+        db.execute("UPDATE accounts SET balance = balance - {amount} WHERE id = {from_id}")?
+        db.execute("UPDATE accounts SET balance = balance + {amount} WHERE id = {to_id}")?
+        Ok(())
+    }
+}
+```
+
+**Semantics:**
+
+- `enter()` calls `db.begin()` before the block body executes
+- On normal completion: `exit(true)` calls `db.commit()`
+- On error (`?` propagation or `return`): `exit(false)` calls `db.rollback()`
+- `return` inside the block returns from the **enclosing function**, not just the transaction — same as `async.scope`
+- The block's type is `Result[T, DBError]` where `T` is inferred from the last expression
+- The `with db.transaction()` expression is itself an expression — it can appear on the right side of `let`
+
+**Block semantics, not closure semantics:** The transaction body is a block that runs in the enclosing function's context. The `?` operator propagates errors directly to the enclosing function's `Result` return type, and `return` exits the enclosing function. This is distinct from a closure, where `?` and `return` would operate within the closure's own scope.
+
+**Effect operations go through handles, not bindings:** When `as tx` is used (e.g., to access a savepoint handle), `db.execute()` still routes through the `db` effect handle — `tx` is the `BlockHandler.Context` value, not a replacement for the effect handle.
+
+**Manual API:** `db.begin()`, `db.commit()`, `db.rollback()` remain available for advanced patterns (nested transactions via SAVEPOINTs, long-running operations). See [db-module-design.md](../decisions/db-module-design.md) Q6.
+
+**History:** Originally specified as a parser special form (3-1 vote, see [transaction-block-syntax.md](../decisions/transaction-block-syntax.md)). Superseded by the general `BlockHandler` mechanism (5-0 vote, see [scoped-block-mechanism.md](../decisions/scoped-block-mechanism.md)) which provides the same block semantics through a trait-based approach.
+
+---
+
 ### 4.5 Effect Composition Rules
 
 Effects propagate upward through the call graph. If function A calls function B, A must declare at least all of B's effects. The compiler enforces this transitively across the entire program.
@@ -1053,13 +1093,21 @@ The outer `with mock_db(fixtures), temp_fs()` installs effect handlers (no `as`)
 | Syntax | `as` present? | Type check | Meaning |
 |--------|--------------|------------|---------|
 | `with expr { }` | No | `expr: Handler[E]` | Effect handler |
+| `with expr { }` | No | `expr: T where T: BlockHandler, T.Context == ()` | Block handler (no binding) |
 | `with expr as name { }` | Yes | `expr: T where T: Closeable` | Scoped resource |
+| `with expr as name { }` | Yes | `expr: T where T: BlockHandler` | Block handler (with binding) |
 
-Both can appear in the same comma-separated `with`:
+When `as` is absent, the compiler checks `Handler[E]` first, then `BlockHandler`. When `as` is present, the compiler checks `Closeable` first, then `BlockHandler`. A type implementing both `Closeable` and `BlockHandler` is a compile error (ambiguity).
+
+All forms can appear in the same comma-separated `with`:
 
 ```blink
 with mock_db(fixtures), fs.open("x.txt")? as f {
     // mock_db provides DB handler, f is a Closeable file handle
+}
+
+with mock_db(fixtures), db.transaction() {
+    // mock_db provides DB handler, transaction is a BlockHandler
 }
 ```
 
@@ -1089,6 +1137,116 @@ fn good_example() ! FS, Async {
     }
 }
 ```
+
+---
+
+### 4.6.3 BlockHandler Trait — Scoped Blocks
+
+The `BlockHandler` trait provides a general mechanism for types that need enter/exit semantics around a block of code. It replaces the need for parser special forms for each new block-accepting API.
+
+```blink
+trait BlockHandler {
+    type Context
+
+    fn enter(self) -> Self.Context
+    fn exit(self, ok: Bool)
+}
+```
+
+**`enter()`** is called before the block body executes. Its return value is bound via `as` (or discarded if `as` is absent). **`exit(ok)`** is called after the block body completes — `ok` is `true` for normal completion, `false` if the block exited via `?` propagation or `return`.
+
+#### Block semantics
+
+`BlockHandler` blocks have block semantics, not closure semantics:
+
+- `?` propagates errors to the **enclosing function's** `Result` return type
+- `return` exits the **enclosing function**, not just the block
+- Variables from the enclosing scope are directly accessible (no capture)
+
+This is the same behavior as `async.scope { }` — the block runs in the caller's context, not in a separate closure scope.
+
+#### Usage
+
+```blink
+// With binding — Context is meaningful
+with db.transaction() as tx {
+    db.execute("INSERT INTO orders ...")?
+}
+
+// Without binding — Context is ()
+with metrics.timer("request_duration") {
+    handle_request()?
+}
+
+// As an expression
+let result = with db.transaction() {
+    db.query_one("SELECT count(*) FROM users")?
+}
+```
+
+#### Implementing BlockHandler
+
+Any type can implement `BlockHandler`:
+
+```blink
+struct Timer {
+    label: Str
+    start: Instant
+}
+
+impl BlockHandler for Timer {
+    type Context = ()
+
+    fn enter(self) -> () {
+        self.start = time.now()
+    }
+
+    fn exit(self, ok: Bool) ! IO.Log {
+        let elapsed = time.now().since(self.start)
+        io.log("{self.label}: {elapsed}ms (ok={ok})")
+    }
+}
+
+// Usage
+with Timer { label: "db_query", start: time.now() } {
+    db.query("SELECT * FROM large_table")?
+}
+```
+
+#### `exit()` constraints
+
+`exit()` is a finalizer, not a control flow mechanism. It **cannot**:
+
+- **Suppress panics** — panics bypass `exit()` entirely (same as `Closeable.close()`)
+- **Retry the block** — no mechanism to re-enter the block body
+- **Transform the block's result** — `exit()` returns `()`, not a modified value
+- **Replace errors** — if `exit()` itself panics, the original error is lost (same as a panic in `Closeable.close()`)
+
+#### Interaction with async
+
+`BlockHandler` bindings follow the same scoping rules as `Closeable` bindings. A `BlockHandler` binding cannot be sent to a spawned task:
+
+```blink
+fn bad_example() ! DB, Async {
+    with db.transaction() as tx {
+        async.spawn(fn() {
+            // COMPILE ERROR: `tx` escapes BlockHandler scope
+            use_tx(tx)
+        })
+    }
+}
+```
+
+#### Relationship to existing scoped blocks
+
+| Block form | Mechanism | Migration status |
+|-----------|-----------|-----------------|
+| `db.transaction { }` | `BlockHandler` | Migrated — uses `with db.transaction() { }` |
+| `async.scope { }` | Parser special form | v1: remains special form. v2: migrate to `BlockHandler` |
+
+`async.scope` remains a parser special form in v1 because its structured concurrency semantics (task cancellation, panic propagation, implicit join at scope exit) require deeper compiler integration than `enter()/exit()` provides. Once `BlockHandler` proves itself on simpler use cases, `async.scope` migration will be evaluated for v2.
+
+**Panel vote: 5-0 (runoff).** See [decisions/scoped-block-mechanism.md](../decisions/scoped-block-mechanism.md).
 
 ---
 
@@ -1516,7 +1674,7 @@ Concurrency in Blink is not a language keyword or a function color — it is an 
 
 | Primitive | Purpose |
 |-----------|---------|
-| `async.scope { ... }` | Structured concurrency boundary. All spawned tasks must complete before the scope exits. |
+| `async.scope { ... }` | Structured concurrency boundary. All spawned tasks must complete before the scope exits. *(v1: parser special form; v2: may migrate to `BlockHandler` — see §4.6.3)* |
 | `async.spawn(fn() { ... })` | Launch a concurrent task within the current scope. Returns `Handle[T]`. |
 | `handle.await` | Wait for a spawned task's result. Method on `Handle[T]`, returns `T`. |
 | `channel.new[T](buffer: N)` | Create a buffered channel for inter-task communication. |

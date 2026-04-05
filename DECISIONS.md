@@ -294,6 +294,8 @@ Decided by expert panel vote. See [OPEN_QUESTIONS.md](OPEN_QUESTIONS.md) for ful
 | Bitwise operations | Operator syntax (`&`, `\|`, `^`, `<<`, `>>`, `~`) with sealed traits. Integer types only | 4-1 (AI/ML dissented: named methods only) |
 | Sized numeric method surface | Standard: `.abs()`, `.min()`, `.max()`, `.pow()`, `.clamp()` plus wrapping arithmetic methods | 5-0 |
 | Sized numeric literal syntax | Type inference only. `let x: U8 = 42` — literal range-checked against context type. No suffix syntax, no constructor syntax | 4-1 (Sys dissented: constructor syntax) |
+| Transaction block syntax | `db.transaction { }` as parser special form (like `async.scope { }`). Block semantics (not closure) — `?` propagates to enclosing function. Manual API (`db.begin/commit/rollback`) remains for advanced use | 3-1 (PLT/DevOps/AI for A; Web for B trailing blocks; Sys abstained) |
+| Scoped block mechanism | `BlockHandler` trait with `enter()/exit()` + `with`/`as` syntax. General mechanism for scoped blocks (transactions, timers, locks). Replaces need for parser special forms. `async.scope` migration deferred to v2 | 5-0 (runoff F vs C) |
 
 ---
 
@@ -358,6 +360,8 @@ Full deliberation records for each decision. Each file contains expert votes, re
 | Logo Direction | [decisions/logo-direction.md](decisions/logo-direction.md) |
 | Compiler Internal Type Representation | [decisions/compiler-type-representation.md](decisions/compiler-type-representation.md) |
 | StringBuilder | [decisions/string-builder.md](decisions/string-builder.md) |
+| Transaction Block Syntax | [decisions/transaction-block-syntax.md](decisions/transaction-block-syntax.md) |
+| Scoped Block Mechanism | [decisions/scoped-block-mechanism.md](decisions/scoped-block-mechanism.md) |
 | Stdlib API Surface | [decisions/stdlib-api-surface.md](decisions/stdlib-api-surface.md) |
 | `--trace` NDJSON Format | [decisions/trace-ndjson-format.md](decisions/trace-ndjson-format.md) |
 | Set[T] Builtin Type | [decisions/set-type-implementation.md](decisions/set-type-implementation.md) |
