@@ -10,9 +10,10 @@ import codegen_types.{
     build_closure_sig_from_type_ann, c_fn_name, c_safe_name, c_type_c_name,
     c_type_str, c_type_tag, cg_current_fn_name, cg_current_fn_node,
     cg_current_fn_option_inner, cg_current_fn_ret, cg_ffi_lib_set,
-    cg_ffi_libs, cg_global_inits, cg_uses_sqlite, cg_handler_is_user_effect,
+    cg_ffi_libs, cg_global_inits, cg_uses_sqlite,
+    cg_handler_body_is_ue, cg_handler_is_user_effect,
     cg_handler_vtable_field, cg_handler_vtable_type,
-    cg_indent, cg_let_target_ann,
+    cg_in_handler_body, cg_indent, cg_let_target_ann,
     cg_let_target_name, cg_let_target_type, cg_lines, cg_program_node,
     cg_temp_counter, cg_trace_codegen, compound_name_from_ann, emit_line,
     emitted_let_names, emitted_let_set, ensure_iter_type,
@@ -2746,16 +2747,47 @@ fn emit_trace_exit_with_val(val_expr: Str, ret_str: Str) ! Codegen.Emit {
     emit_line("}")
 }
 
+@allow(UnrestoredMutation)
 pub fn emit_return_with_trace(val_str: Str, ret_type: Int) ! Codegen.Emit {
+    let mut actual_val = val_str
+    if cg_in_handler_body != 0 && cg_handler_body_is_ue != 0 && ret_type == CT_RESULT && cg_current_fn_option_inner == CT_PTR {
+        let fsi = get_fn_ret_struct_inner(cg_current_fn_name)
+        if fsi.ok_struct == "Option_ptr" && expr_result_ok_type == CT_OPTION && expr_result_ok_struct != "" && expr_result_ok_struct != "Option_ptr" {
+            let mut concrete_struct = expr_result_ok_struct
+            if concrete_struct.starts_with("Option_") {
+                concrete_struct = concrete_struct.substring(7, concrete_struct.len() - 7)
+            }
+            let src = fresh_temp("__hret_src_")
+            let dst = fresh_temp("__hret_dst_")
+            let ret_c_name = "blink_Result_Option_ptr_{fsi.err_struct}"
+            let concrete_type = "blink_Result_Option_{concrete_struct}_{fsi.err_struct}"
+            emit_line("{concrete_type} {src} = {val_str};")
+            emit_line("{ret_c_name} {dst};")
+            emit_line("{dst}.tag = {src}.tag;")
+            emit_line("if ({src}.tag == 0) \{")
+            emit_line("    blink_Option_ptr __hret_opt;")
+            emit_line("    __hret_opt.tag = {src}.ok.tag;")
+            emit_line("    if ({src}.ok.tag == 1) \{")
+            emit_line("        {c_type_c_name(concrete_struct)}* __hret_p = ({c_type_c_name(concrete_struct)}*)blink_alloc(sizeof({c_type_c_name(concrete_struct)}));")
+            emit_line("        *__hret_p = {src}.ok.value;")
+            emit_line("        __hret_opt.value = (void*)__hret_p;")
+            emit_line("    }")
+            emit_line("    {dst}.ok = __hret_opt;")
+            emit_line("} else \{")
+            emit_line("    memcpy(&{dst}.err, &{src}.err, sizeof({src}.err));")
+            emit_line("}")
+            actual_val = dst
+        }
+    }
     let ret_name = type_name_from_ct(ret_type)
     if cg_in_traced_fn != 0 && trace_ret_is_primitive(ret_name) != 0 {
         let ret_tmp = fresh_temp("__trace_rv_")
-        emit_line("{c_type_str(ret_type)} {ret_tmp} = {val_str};")
+        emit_line("{c_type_str(ret_type)} {ret_tmp} = {actual_val};")
         emit_trace_exit_with_val(ret_tmp, ret_name)
         emit_line("return {ret_tmp};")
     } else {
-        emit_trace_exit_with_val(val_str, ret_name)
-        emit_line("return {val_str};")
+        emit_trace_exit_with_val(actual_val, ret_name)
+        emit_line("return {actual_val};")
     }
 }
 

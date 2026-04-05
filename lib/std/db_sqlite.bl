@@ -1,6 +1,7 @@
 import std.db
 import std.db_row.{Row}
 import std.db_error.{DBError}
+import std.db_stmt.{Stmt}
 
 // --- SQLite FFI bindings ---
 
@@ -118,7 +119,7 @@ pub fn sqlite_query(handle: Handle, sql: Str) -> Result[List[Row], DBError] {
     Ok(rows)
 }
 
-pub fn sqlite_query_one(handle: Handle, sql: Str) -> Result[Row, DBError] {
+pub fn sqlite_query_one(handle: Handle, sql: Str) -> Result[Option[Row], DBError] {
     let result = sqlite_query_raw(handle, sql)
     let rc = sqlite_result_rc(result)
     if rc != 0 {
@@ -129,7 +130,7 @@ pub fn sqlite_query_one(handle: Handle, sql: Str) -> Result[Row, DBError] {
     let num_rows = sqlite_result_num_rows(result)
     if num_rows == 0 {
         sqlite_result_free(result)
-        return Err(DBError.NotFound)
+        return Ok(None)
     }
     let num_cols = sqlite_result_num_cols(result)
     let mut columns: List[Str] = []
@@ -145,7 +146,7 @@ pub fn sqlite_query_one(handle: Handle, sql: Str) -> Result[Row, DBError] {
         di = di + 1
     }
     sqlite_result_free(result)
-    Ok(Row { data: data, columns: columns })
+    Ok(Some(Row { data: data, columns: columns }))
 }
 
 fn sqlite_exec_checked(handle: Handle, sql: Str) -> Result[Void, DBError] {
@@ -166,33 +167,61 @@ fn sqlite_execute_checked(handle: Handle, sql: Str) -> Result[Int, DBError] {
     }
 }
 
+// --- Prepared statement helper ---
+
+pub fn sqlite_prepare_stmt(db_handle: Handle, sql: Str) -> Result[Stmt, DBError] {
+    let stmt_handle = sqlite_prepare(db_handle, sql)
+    if stmt_handle == null_ptr() {
+        Err(DBError.ExecError(sqlite_errmsg(db_handle)))
+    } else {
+        Ok(Stmt { handle: stmt_handle, db_handle: db_handle })
+    }
+}
+
 // --- SQLite effect handler ---
 
-let mut sqlite_db_handle: Handle = null_ptr()
-
 pub fn sqlite_handler(handle: Handle) -> Handler[DB] {
-    sqlite_db_handle = handle
     handler DB {
         fn query(sql: Str) -> Result[List[Row], DBError] {
-            sqlite_query(sqlite_db_handle, sql)
+            sqlite_query(handle, sql)
         }
-        fn query_one(sql: Str) -> Result[Row, DBError] {
-            sqlite_query_one(sqlite_db_handle, sql)
+        fn query_one(sql: Str) -> Result[Option[Row], DBError] {
+            sqlite_query_one(handle, sql)
+        }
+        fn prepare(sql: Str) -> Result[Stmt, DBError] {
+            sqlite_prepare_stmt(handle, sql)
         }
         fn exec(sql: Str) -> Result[Void, DBError] {
-            sqlite_exec_checked(sqlite_db_handle, sql)
+            sqlite_exec_checked(handle, sql)
         }
         fn execute(sql: Str) -> Result[Int, DBError] {
-            sqlite_execute_checked(sqlite_db_handle, sql)
+            sqlite_execute_checked(handle, sql)
         }
         fn begin() -> Result[Void, DBError] {
-            sqlite_exec_checked(sqlite_db_handle, "BEGIN")
+            sqlite_exec_checked(handle, "BEGIN")
         }
         fn commit() -> Result[Void, DBError] {
-            sqlite_exec_checked(sqlite_db_handle, "COMMIT")
+            sqlite_exec_checked(handle, "COMMIT")
         }
         fn rollback() -> Result[Void, DBError] {
-            sqlite_exec_checked(sqlite_db_handle, "ROLLBACK")
+            sqlite_exec_checked(handle, "ROLLBACK")
         }
     }
+}
+
+// --- Connection management ---
+
+pub type DbConnection {
+    handle: Handle
+}
+
+impl Closeable for DbConnection {
+    fn close(self) {
+        sqlite_close(self.handle)
+    }
+}
+
+pub fn db_connect(path: Str) -> DbConnection {
+    let handle = sqlite_open(path)
+    DbConnection { handle: handle }
 }
