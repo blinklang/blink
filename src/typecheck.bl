@@ -1,7 +1,7 @@
 import ast.{NodeKind}
 import parser.{
     get_annotation, has_annotation,
-    np_args, np_arms, np_body, np_captures, np_col, np_condition,
+    np_args, np_assoc_types, np_arms, np_body, np_captures, np_col, np_condition,
     np_effects, np_elements, np_else_body, np_end, np_fields, np_guard,
     np_handlers, np_index, np_is_mut, np_is_pub, np_iterable, np_kind,
     np_left, np_line, np_method, np_methods, np_module, np_name, np_obj,
@@ -101,6 +101,7 @@ let mut fnsig_type_param_names: List[Str] = []
 
 let mut tc_trait_names: List[Str] = []
 let mut tc_trait_method_names: List[Str] = []
+let mut tc_trait_assoc_names: List[Str] = []
 
 // Trait method signature registry (for contract validation)
 let mut tc_tmsig_trait: List[Str] = []
@@ -791,10 +792,35 @@ fn register_trait(tr_node: Int) ! TypeCheck.Register {
             i = i + 1
         }
     }
+    let assoc_sl = np_assoc_types.get(tr_node).unwrap()
+    if assoc_sl != -1 {
+        let mut ai = 0
+        while ai < sublist_length(assoc_sl) {
+            let at_node = sublist_get(assoc_sl, ai)
+            let aname = np_name.get(at_node).unwrap()
+            tc_trait_assoc_names.push("{name}.{aname}")
+            ai = ai + 1
+        }
+    }
 }
 
 fn subst_trait_type(type_str: Str, impl_type: Str, tmsig_idx: Int, impl_node: Int) -> Str {
     if type_str == "Self" { return impl_type }
+    if type_str.starts_with("Self.") {
+        let assoc_name = type_str.substring(5, type_str.len() - 5)
+        let assoc_sl = np_assoc_types.get(impl_node).unwrap()
+        if assoc_sl != -1 {
+            let mut ai = 0
+            while ai < sublist_length(assoc_sl) {
+                let at_node = sublist_get(assoc_sl, ai)
+                if np_name.get(at_node).unwrap() == assoc_name {
+                    return np_type_name.get(at_node).unwrap()
+                }
+                ai = ai + 1
+            }
+        }
+        return type_str
+    }
     let tp_start = tc_trait_tparams_start.get(tmsig_idx).unwrap()
     let tp_count = tc_trait_tparams_count.get(tmsig_idx).unwrap()
     if tp_count > 0 {
@@ -887,6 +913,30 @@ fn validate_trait_impls(program: Int) ! TypeCheck.Register, Diag.Report {
             }
             si = si + 1
         }
+        let impl_assoc_sl = np_assoc_types.get(im).unwrap()
+        let mut ati = 0
+        while ati < tc_trait_assoc_names.len() {
+            let full_name = tc_trait_assoc_names.get(ati).unwrap()
+            if full_name.starts_with("{trait_name}.") {
+                let expected_assoc = full_name.substring(trait_name.len() + 1, full_name.len() - trait_name.len() - 1)
+                let mut found_assoc = 0
+                if impl_assoc_sl != -1 {
+                    let mut aj = 0
+                    while aj < sublist_length(impl_assoc_sl) {
+                        let at_node = sublist_get(impl_assoc_sl, aj)
+                        if np_name.get(at_node).unwrap() == expected_assoc {
+                            found_assoc = 1
+                            break
+                        }
+                        aj = aj + 1
+                    }
+                }
+                if found_assoc == 0 {
+                    diag_error_at("TraitContract", "E0905", "impl {trait_name} for {impl_type} is missing associated type '{expected_assoc}'", im, "add 'type {expected_assoc} = ...' to the impl block")
+                }
+            }
+            ati = ati + 1
+        }
         ii = ii + 1
     }
 }
@@ -926,6 +976,7 @@ fn init_types() ! TypeCheck.Register {
     fnsig_type_param_names.clear()
     tc_trait_names.clear()
     tc_trait_method_names.clear()
+    tc_trait_assoc_names.clear()
     tc_tmsig_trait.clear()
     tc_tmsig_method.clear()
     tc_tmsig_param_names.clear()
