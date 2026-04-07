@@ -1,5 +1,15 @@
 import std.db_sqlite.{db_connect, sqlite_handler, sqlite_open, sqlite_close, sqlite_prepare,
-    sqlite_bind_int, sqlite_step, sqlite_column_text, sqlite_finalize, sqlite_errmsg}
+    sqlite_bind_int, sqlite_step, sqlite_column_text, sqlite_finalize, sqlite_errmsg,
+    sqlite_transaction}
+import std.db_error.{DBError}
+
+fn insert_then_fail(handle: Handle) -> Result[Int, DBError] ! DB {
+    with sqlite_transaction(handle) {
+        db.exec("INSERT INTO txn_test VALUES ('rollback_me')")?
+        db.exec("INSERT INTO nonexistent_table VALUES (1)")?
+    }
+    Ok(0)
+}
 
 fn main() ! IO {
     let handle = sqlite_open(":memory:")
@@ -126,4 +136,41 @@ fn main() ! IO {
         io.println("mixed: {row.get("name").unwrap()} = {row.get("price").unwrap()}")
     }
     sqlite_close(h2)
+
+    // Test scoped transaction via BlockHandler — auto-commit
+    let h3 = sqlite_open(":memory:")
+    with sqlite_handler(h3) {
+        db.exec("CREATE TABLE txn_test (name TEXT)").unwrap()
+
+        with sqlite_transaction(h3) {
+            db.exec("INSERT INTO txn_test VALUES ('alice')").unwrap()
+            db.exec("INSERT INTO txn_test VALUES ('bob')").unwrap()
+        }
+
+        let rows = db.query("SELECT name FROM txn_test ORDER BY name").unwrap()
+        assert_eq(rows.len(), 2)
+        assert_eq(rows.get(0).unwrap().get("name").unwrap(), "alice")
+        assert_eq(rows.get(1).unwrap().get("name").unwrap(), "bob")
+        io.println("transaction auto-commit: ok")
+
+        // Test scoped transaction — auto-rollback on ? propagation
+        let result = insert_then_fail(h3)
+        assert(result.is_err())
+
+        let rows2 = db.query("SELECT name FROM txn_test ORDER BY name").unwrap()
+        assert_eq(rows2.len(), 2)
+        io.println("transaction auto-rollback: ok")
+    }
+    sqlite_close(h3)
+
+    // Test scoped transaction with db_connect pattern
+    with db_connect(":memory:") as conn, sqlite_handler(conn.handle) {
+        db.exec("CREATE TABLE t2 (v INT)").unwrap()
+        with sqlite_transaction(conn.handle) {
+            db.exec("INSERT INTO t2 VALUES (42)").unwrap()
+        }
+        let rows = db.query("SELECT v FROM t2").unwrap()
+        assert_eq(rows.len(), 1)
+        io.println("transaction with db_connect: ok")
+    }
 }
