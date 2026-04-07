@@ -1,6 +1,6 @@
 # Blink Language Reference
 
-> Blink is a statically-typed, effect-tracked language compiling to C. **Compiler v0.31.0**.
+> Blink is a statically-typed, effect-tracked language compiling to C. **Compiler v0.32.0**.
 
 ## Install
 
@@ -12,9 +12,33 @@ docker pull ghcr.io/blinklang/blink:latest
 docker run --rm -v "$PWD":/workspace ghcr.io/blinklang/blink run myfile.bl
 ```
 
-Tags: `latest`, `0.31`, `0.31.0` (semver). Image is `debian:bookworm-slim` with `gcc`, `zig`, `blink`, `libgc-dev`, and `libsqlite3-dev`.
+Tags: `latest`, `0.32`, `0.32.0` (semver). Image is `debian:bookworm-slim` with `gcc`, `zig`, `blink`, `libgc-dev`, and `libsqlite3-dev`.
 
-## What's New (v0.31)
+## Recent Breaking Changes (v0.32)
+
+| Change | Details |
+|--------|---------|
+| **BREAKING:** DB moved to stdlib | Database operations are now a user-defined effect in `lib/std/db.bl` instead of compiler magic. `import std.db` required. `DbRow` renamed to `Row`, `CT_ROW`/DB compiler magic removed. |
+| **BREAKING:** `Template[C]` replaces raw SQL | DB queries now use `Template[DB]` for automatic parameterization and injection safety. String interpolation in templates auto-extracts parameters. Use `Raw(expr)` to opt out of parameterization. |
+| **BREAKING:** DB ops return `Result` | All `db.*` operations now return `Result[T, DBError]` instead of bare types. New `DBError` enum with variants: `QueryError`, `ExecError`, `ConnectionError`, `NotFound`. |
+| Associated types on traits | Traits can declare `type Name` members that implementers must define. Example: `BlockHandler` trait has `type Context`. |
+| `BlockHandler` trait | Scoped resource management with `enter(self) -> Self.Context` and `exit(self, ok: Bool)` methods. Enables `with db.transaction() { ... }` pattern with auto-commit/rollback. |
+| `Closeable` cleanup fix | `close()` now correctly called on early exit from `with`-blocks (break, return, error propagation). |
+| Scoped `db.transaction()` | `BlockHandler` implementation: auto-commit on success, auto-rollback on failure. Usage: `with db.transaction() { db.exec(...)? }`. |
+| `Stmt` prepared statements | New `Stmt` type with `bind_int`, `bind_text`, `step`, `column_int`, `column_text`, `reset`, `finalize`. Implements `Closeable` for `with...as` usage. |
+| Handler captures | Handlers can now capture values from their enclosing scope. |
+| E0601: escaped `with...as` | New diagnostic when `with...as` bindings escape via `async.spawn` (dangling reference). |
+| W0602 false positive fix | No longer fires on Handler/Template type parameters. |
+| Impl method `_self` fix | `_self` param in impl methods no longer generates invalid C `void` type. |
+| List element type fixes | `List[Str]` element type no longer lost across function boundaries; list element type no longer leaks through struct impl method calls. |
+| `unwrap()`/`unwrap_err()` fix | Double-evaluation in codegen eliminated. |
+| 4 codegen fixes | Set params, Map struct codegen, for-in key iteration, if-expr method calls. |
+| Option/UE dispatch fixes | Option type codegen and user-effect dispatch bugs fixed. |
+| Formatter fixes | Handler body collapse and import inlining bugs fixed. |
+
+**Migration:** Replace `import std.db_sqlite` with `import std.db`. Change bare `db.query("SELECT ...")` to use `Template[DB]` (string interpolation auto-parameterizes). Wrap DB results with `?` operator since operations now return `Result[T, DBError]`. Rename `DbRow` → `Row`.
+
+### Prior: What's New (v0.31)
 
 | Change | Details |
 |--------|---------|
@@ -534,6 +558,7 @@ test "addition works" {
 | Instant | `time.read()` | Point in time |
 | Ptr[T] | `Ptr[Int]` | Raw pointer (FFI) |
 | Duration | `Duration.ms(100)` | Time span |
+| Template[C] | `"SELECT * FROM t WHERE id = {id}"` | Parameterized template string (context `C` = `DB`, etc.). Interpolated values auto-extracted as parameters. `Raw(expr)` escapes parameterization. |
 
 ## Escape Sequences
 
@@ -644,19 +669,26 @@ time.sleep(duration)            // sleep for Duration
 async.scope { ... }             // synchronous scope for spawned tasks
 async.spawn(fn() { ... })       // spawn task, returns Handle
 
-// Database (effect: DB) — requires SQLite (bundled, compiler-managed)
+// Database (effect: DB) — stdlib module, requires `import std.db`
 // Connection: effect-handler scoped (no global state)
 with db.connect(path) {         // open SQLite DB, installs DB handler for scope
     // all db.* operations use this connection within scope
 }                               // connection closed when scope exits
 
-// Queries (effect: DB.Read) — return Result types
-db.query(sql)                   // -> Result[List[Row], DBError] (all rows)
-db.query_one(sql)               // -> Result[Option[Row], DBError] (first row or None)
+// Queries use Template[DB] for injection safety
+// String interpolation auto-parameterizes:
+let name = "Alice"
+db.query("SELECT * FROM users WHERE name = {name}")?
+// Compiles to: SELECT * FROM users WHERE name = ?  [params: "Alice"]
+// Use Raw() to opt out: db.query("SELECT * FROM {Raw(table_name)}")?
+
+// Queries (effect: DB.Read) — return Result[T, DBError]
+db.query(tpl)                   // -> Result[List[Row], DBError] (all rows)
+db.query_one(tpl)               // -> Result[Option[Row], DBError] (first row or None)
 
 // Mutations (effect: DB.Write)
-db.exec(sql)                    // -> Result[Void, DBError] (DDL/DML, no return)
-db.execute(sql)                 // -> Result[Int, DBError] (returns last insert rowid)
+db.exec(tpl)                    // -> Result[Void, DBError] (DDL/DML, no return)
+db.execute(tpl)                 // -> Result[Int, DBError] (returns last insert rowid)
 
 // Row type (named column access)
 row.get("col")                  // -> Option[Str] (by column name)
@@ -666,22 +698,24 @@ row.get_at(idx)                 // -> Option[Str] (positional fallback)
 row.column_names()              // -> List[Str]
 
 // Prepared statements (low-level, for batch operations)
-db.prepare(sql)                 // -> Result[Stmt, DBError] (Closeable — use with...as)
-stmt.bind(idx, val)             // bind parameter (type-overloaded)
+db.prepare(tpl)                 // -> Result[Stmt, DBError] (Closeable — use with...as)
+stmt.bind_int(idx, val)         // bind integer parameter
+stmt.bind_text(idx, val)        // bind string parameter
 stmt.step()                     // -> Result[StepResult, DBError]
 stmt.column_int(idx)            // -> Int
 stmt.column_text(idx)           // -> Str
 stmt.reset()                    // reset for re-use
 stmt.finalize()                 // free statement
 
-// Transactions (effect: DB.Write)
-db.transaction {                // scoped: auto-commit on success, auto-rollback on error
+// Transactions (effect: DB.Write) — via BlockHandler
+with db.transaction() {         // scoped: auto-commit on success, auto-rollback on error
     db.exec("INSERT ...")?
 }
 db.begin()                      // -> Result[Void, DBError] (manual)
 db.commit()                     // -> Result[Void, DBError]
 db.rollback()                   // -> Result[Void, DBError]
-db.errmsg()                     // -> Str (last error message)
+
+// DBError enum variants: QueryError, ExecError, ConnectionError, NotFound
 
 // Net (effect: Net.Listen for listen/accept, Net.Connect for connect)
 net.listen(host, port)          // -> Int (listen fd)
@@ -1062,7 +1096,7 @@ Handlers nest — inner handlers shadow outer ones for the same effect.
 
 ## Closeable Trait & `with`-`as` Blocks
 
-Types that implement `Closeable` (from `std.traits`) can be used in `with`-`as` blocks for automatic resource cleanup.
+Types that implement `Closeable` (from `std.traits`) can be used in `with`-`as` blocks for automatic resource cleanup. `close()` is called on scope exit, including early exits (break, return, error propagation).
 
 ```blink
 import std.traits
@@ -1086,11 +1120,49 @@ with open_resource("a") as a, open_resource("b") as b {
 // b.close() called first, then a.close()
 ```
 
+## BlockHandler Trait & Scoped Blocks
+
+Types that implement `BlockHandler` (from `std.traits`) provide scoped enter/exit semantics with an associated `Context` type.
+
+```blink
+pub trait BlockHandler {
+    type Context
+    fn enter(self) -> Self.Context
+    fn exit(self, ok: Bool)
+}
+
+// Example: database transactions
+with db.transaction() {
+    db.exec("INSERT INTO users (name) VALUES ({name})")?
+    db.exec("UPDATE stats SET count = count + 1")?
+}
+// auto-commit on success, auto-rollback on error/early exit
+```
+
+## Associated Types on Traits
+
+Traits can declare associated type members with `type Name`. Implementers must define these types.
+
+```blink
+trait BlockHandler {
+    type Context                    // associated type declaration
+    fn enter(self) -> Self.Context  // used in method signatures
+    fn exit(self, ok: Bool)
+}
+
+impl BlockHandler for Transaction {
+    type Context = Void             // implementer defines the type
+    fn enter(self) -> Void { ... }
+    fn exit(self, ok: Bool) { ... }
+}
+```
+
 ## Standard Library
 
 | Module | Description | Example |
 |--------|-------------|---------|
 | `std.args` | CLI argument parsing (flags, options, commands) | `import std.args` |
+| `std.db` | SQLite database with effect-based API (`DB.Read`, `DB.Write`), `Template[DB]` parameterization, `Row`, `Stmt`, `DBError`, transactions | `import std.db` |
 | `std.http` | HTTP client and server | `import std.http` |
 | `std.json` | JSON parser and serializer | `import std.json` |
 | `std.net` | TCP networking: `TcpSocket`, `TcpListener`, `NetError`, `tcp_listen`, `tcp_connect`, `tcp_accept` | `import std.net` |
@@ -1110,7 +1182,7 @@ with open_resource("a") as a, open_resource("b") as b {
 | `std.sb` | StringBuilder extensions |
 | `std.bytes` | Bytes type operations |
 | `std.time` | Duration/Instant constructors and methods |
-| `std.traits` | Core traits: `Closeable`, `Sized`, `Contains`, `StrOps`, `ListOps`, `MapOps`, `SetOps`, `BytesOps`, `StringBuildOps`, `Joinable` |
+| `std.traits` | Core traits: `Closeable`, `BlockHandler`, `Sized`, `Contains`, `StrOps`, `ListOps`, `MapOps`, `SetOps`, `BytesOps`, `StringBuildOps`, `Joinable` |
 
 Run `blink doc <module>` for full documentation (e.g. `blink doc std.args`).
 Run `blink doc --list` to list available modules.

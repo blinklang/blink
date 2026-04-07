@@ -14,9 +14,30 @@ docker pull ghcr.io/blinklang/blink:latest
 docker run --rm -v "$PWD":/workspace ghcr.io/blinklang/blink run myfile.bl
 ```
 
-Tags: `latest`, `0.31`, `0.31.0` (semver). Image is `debian:bookworm-slim` with `gcc`, `zig`, `blink`, `libgc-dev`, and `libsqlite3-dev`.
+Tags: `latest`, `0.32`, `0.32.0` (semver). Image is `debian:bookworm-slim` with `gcc`, `zig`, `blink`, `libgc-dev`, and `libsqlite3-dev`.
 
-## What's New (v0.31)
+## Recent Breaking Changes (v0.32)
+
+- **BREAKING: DB moved to stdlib** — database operations are now a user-defined effect in `lib/std/db.bl` instead of compiler magic. `import std.db` required. `DbRow` renamed to `Row`, `CT_ROW` removed.
+- **BREAKING: `Template[C]` replaces raw SQL strings** — DB queries now use `Template[DB]` for automatic parameterization and injection safety. String interpolation in templates auto-extracts parameters. Use `Raw(expr)` to opt out.
+- **BREAKING: DB operations return `Result`** — all `db.*` operations now return `Result[T, DBError]` instead of bare types. New `DBError` enum: `QueryError`, `ExecError`, `ConnectionError`, `NotFound`.
+- **Associated types on traits** — traits can declare `type Name` members that implementers must define (e.g., `BlockHandler` has `type Context`)
+- **`BlockHandler` trait** — scoped resource management with `enter()`/`exit()` methods and associated `Context` type. Enables `with db.transaction() { ... }` pattern.
+- **`Closeable` trait cleanup** — `close()` now correctly called on early exit from `with`-blocks (break, return, error propagation)
+- **Scoped `db.transaction()`** — auto-commit on success, auto-rollback on failure via `BlockHandler` implementation
+- **`Stmt` type** — prepared statement support with `bind_int`, `bind_text`, `step`, `column_int`, `column_text`, `reset`, `finalize` methods
+- **Handler captures** — handlers can capture values from their enclosing scope
+- **E0601 diagnostic** — new error when `with...as` bindings escape via `async.spawn`
+- **Fix** — W0602 false positive on Handler/Template type params
+- **Fix** — `_self` param in impl methods generating invalid C void type
+- **Fix** — `List[Str]` element type lost across function boundaries
+- **Fix** — double-evaluation in `Result.unwrap()`/`unwrap_err()` codegen
+- **Fix** — 4 codegen bugs: Set params, Map structs, for-in keys, if-expr methods
+- **Fix** — list element type leak through struct impl method calls
+- **Fix** — Option types and user-effect dispatch codegen bugs
+- **Fix** — 2 formatter bugs: handler body collapse and import inlining
+
+### Prior: What's New (v0.31)
 
 - **Pact references removed** — all remaining `pact` references and `pact.toml` fallback support removed; `.pact` file extension fallback also removed
 - **C output renamed** — generated C symbols now use `blink_` prefix instead of `pact_` (no user-facing impact unless inspecting emitted C)
@@ -46,7 +67,7 @@ Tags: `latest`, `0.31`, `0.31.0` (semver). Image is `debian:bookworm-slim` with 
 
 ### Prior: What's New (v0.28)
 
-- **`std.traits` in prelude** — compiler-known traits (`Closeable`, `Sized`, `Contains`, `StrOps`, `ListOps`, `MapOps`, `SetOps`, `BytesOps`, `StringBuildOps`, `Joinable`) are now auto-imported; no explicit `import std.traits` needed
+- **`std.traits` in prelude** — compiler-known traits (`Closeable`, `BlockHandler`, `Sized`, `Contains`, `StrOps`, `ListOps`, `MapOps`, `SetOps`, `BytesOps`, `StringBuildOps`, `Joinable`) are now auto-imported; no explicit `import std.traits` needed
 - **`blink add` for Tier 2 stdlib** — `blink add std/http`, `std/net`, `std/db`, `std/log`, `std/config` now work without `--path` or `--git`; packages are added with automatic version pinning
 - **Fix** — `@module("")` annotation on trait-only modules now detected correctly (was ignored, causing false W0602)
 - **Fix** — unused import checker skips empty module entries
@@ -274,7 +295,7 @@ Key facts:
 
 ## Standard Library
 
-`std.args` (CLI parsing), `std.http` (HTTP client/server), `std.json` (JSON), `std.net` (TCP networking), `std.path` (path utilities), `std.semver` (versions), `std.toml` (TOML).
+`std.args` (CLI parsing), `std.db` (SQLite database with effect-based API), `std.http` (HTTP client/server), `std.json` (JSON), `std.net` (TCP networking), `std.path` (path utilities), `std.semver` (versions), `std.toml` (TOML).
 Prelude (auto-imported): `std.str` (string ops), `std.list` (list HOFs), `std.map` (map HOFs), `std.num`, `std.sb`, `std.bytes`, `std.time`, `std.traits` (core traits).
 Run `blink doc --list` to list modules, `blink doc <module>` for details.
 
