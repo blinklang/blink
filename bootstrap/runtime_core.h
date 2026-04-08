@@ -1163,6 +1163,9 @@ BLINK_UNUSED static int64_t blink_time_ms(void) {
 typedef struct {
     const char* (*read)(const char* name);
     int         (*write)(const char* name, const char* value);
+    int         (*remove)(const char* name);
+    const char* (*cwd)(void);
+    void        (*exit_fn)(int code);
 } blink_env_vtable;
 
 BLINK_UNUSED static const char* blink_env_default_read(const char* name) {
@@ -1174,9 +1177,27 @@ BLINK_UNUSED static int blink_env_default_write(const char* name, const char* va
     return setenv(name, value, 1);
 }
 
+BLINK_UNUSED static int blink_env_default_remove(const char* name) {
+    return unsetenv(name);
+}
+
+BLINK_UNUSED static const char* blink_env_default_cwd(void) {
+    char buf[4096];
+    char* r = getcwd(buf, sizeof(buf));
+    if (!r) { fprintf(stderr, "blink: getcwd failed, falling back to \".\"\n"); }
+    return r ? blink_strdup(r) : blink_strdup(".");
+}
+
+BLINK_UNUSED static void blink_env_default_exit(int code) {
+    exit(code);
+}
+
 BLINK_UNUSED static blink_env_vtable blink_env_vtable_default = {
     blink_env_default_read,
-    blink_env_default_write
+    blink_env_default_write,
+    blink_env_default_remove,
+    blink_env_default_cwd,
+    blink_env_default_exit
 };
 
 /* ── Process ────────────────────────────────────────────────────────── */
