@@ -4,9 +4,9 @@ import codegen_types.{
     CT_BOOL, CT_BYTES, CT_CHANNEL, CT_CLOSURE, CT_FFI_SCOPE, CT_FLOAT,
     CT_HANDLE, CT_HANDLER, CT_INT, CT_ITERATOR, CT_LIST, CT_MAP, CT_OPTION,
     CT_PTR, CT_RESULT, CT_STRING, CT_STRINGBUILDER, CT_VOID,
-    EnumReg, EnumVariant, MatchScrutEntry, StructFieldClosureSig,
+    DeriveMethodEntry, EnumReg, EnumVariant, MatchScrutEntry, StructFieldClosureSig,
     StructFieldDefault, StructFieldEntry,
-    StructInvariant, VarEnumEntry,
+    StructInvariant, VarEnumEntry, derive_method_entries,
     build_closure_sig_from_type_ann, c_fn_name, c_safe_name, c_type_c_name,
     c_type_str, c_type_tag, cg_current_fn_name, cg_current_fn_node, cg_current_module,
     cg_current_fn_option_inner, cg_current_fn_ret, cg_ffi_lib_set,
@@ -17,10 +17,11 @@ import codegen_types.{
     cg_let_target_name, cg_let_target_type, cg_lines, cg_program_node,
     cg_temp_counter, cg_trace_codegen, compound_name_from_ann,
     emit_bh_cleanup_for_type, emit_cl_cleanup_for_type, emit_line,
+    emit_struct_option_typedef,
     emitted_let_names, emitted_let_set, ensure_iter_type,
     ensure_option_type, ensure_range_iter, ensure_result_type,
     ensure_str_iter, ensure_struct_option_type, ensure_struct_result_type,
-    enum_reg_set, enum_regs, enum_variants, fresh_temp, get_fn_enum_ret,
+    enum_reg_set, enum_regs, enum_str_backed_set, enum_variants, fresh_temp, get_fn_enum_ret,
     get_fn_ret, get_fn_ret_struct, get_fn_ret_struct_inner, get_fn_ret_type,
     get_generic_fn_node, get_list_elem_struct, get_list_elem_type,
     get_list_nested_elem_struct, get_list_nested_elem_type, get_map_value_type,
@@ -3913,6 +3914,8 @@ pub fn emit_enum_typedef(td_node: Int) ! Codegen.Emit {
     let enum_idx = enum_regs.len()
 
     let mut has_data = 0
+    let mut str_backed_count = 0
+    let mut variant_count = 0
     let mut i = 0
     while i < sublist_length(flds_sl) {
         let v = sublist_get(flds_sl, i)
@@ -3920,16 +3923,26 @@ pub fn emit_enum_typedef(td_node: Int) ! Codegen.Emit {
         if vflds != -1 && sublist_length(vflds) > 0 {
             has_data = 1
         }
+        let vstr = np_str_val.get(v).unwrap()
+        if vstr != "" {
+            str_backed_count = str_backed_count + 1
+        }
+        variant_count = variant_count + 1
         i = i + 1
     }
-    enum_regs.push(EnumReg { name: name, has_data: has_data })
+    let is_sb = if str_backed_count > 0 && str_backed_count == variant_count { 1 } else { 0 }
+    enum_regs.push(EnumReg { name: name, has_data: has_data, is_str_backed: is_sb })
     enum_reg_set.set(name, has_data)
+    if is_sb != 0 {
+        enum_str_backed_set.set(name, 1)
+    }
 
     i = 0
     while i < sublist_length(flds_sl) {
         let v = sublist_get(flds_sl, i)
         let vname = np_name.get(v).unwrap()
         let vflds = np_fields.get(v).unwrap()
+        let ev_str = np_str_val.get(v).unwrap()
         if vflds != -1 && sublist_length(vflds) > 0 {
             let mut field_names = ""
             let mut field_types = ""
@@ -3950,9 +3963,9 @@ pub fn emit_enum_typedef(td_node: Int) ! Codegen.Emit {
                 field_types = field_types.concat(vf_type_name)
                 fi = fi + 1
             }
-            enum_variants.push(EnumVariant { name: vname, enum_idx: enum_idx, field_names: field_names, field_types: field_types, field_count: sublist_length(vflds) })
+            enum_variants.push(EnumVariant { name: vname, enum_idx: enum_idx, field_names: field_names, field_types: field_types, field_count: sublist_length(vflds), str_value: ev_str })
         } else {
-            enum_variants.push(EnumVariant { name: vname, enum_idx: enum_idx, field_names: "", field_types: "", field_count: 0 })
+            enum_variants.push(EnumVariant { name: vname, enum_idx: enum_idx, field_names: "", field_types: "", field_count: 0, str_value: ev_str })
         }
         i = i + 1
     }
@@ -4028,6 +4041,62 @@ pub fn emit_enum_typedef(td_node: Int) ! Codegen.Emit {
             i = i + 1
         }
         emit_line("")
+    }
+
+    if is_sb != 0 {
+        let cn = c_type_c_name(name)
+        emit_line("const char* {c_fn_name("{name}_to_str")}({cn} self) \{")
+        cg_indent = cg_indent + 1
+        emit_line("switch (self) \{")
+        cg_indent = cg_indent + 1
+        i = 0
+        while i < enum_variants.len() {
+            let evar = enum_variants.get(i).unwrap()
+            if evar.enum_idx == enum_idx {
+                emit_line("case {cn}_{evar.name}: return \"{evar.str_value}\";")
+            }
+            i = i + 1
+        }
+        emit_line("default: return \"\";")
+        cg_indent = cg_indent - 1
+        emit_line("}")
+        cg_indent = cg_indent - 1
+        emit_line("}")
+        emit_line("")
+
+        emit_struct_option_typedef(name)
+        emit_line("blink_Option_{name} {c_fn_name("{name}_from_str")}(const char* s) \{")
+        cg_indent = cg_indent + 1
+        emit_line("blink_Option_{name} _r;")
+        let mut first = 1
+        i = 0
+        while i < enum_variants.len() {
+            let evar = enum_variants.get(i).unwrap()
+            if evar.enum_idx == enum_idx {
+                if first == 1 {
+                    emit_line("if (blink_str_eq(s, \"{evar.str_value}\")) \{")
+                    first = 0
+                } else {
+                    emit_line("} else if (blink_str_eq(s, \"{evar.str_value}\")) \{")
+                }
+                cg_indent = cg_indent + 1
+                emit_line("_r.tag = 1; _r.value = {cn}_{evar.name};")
+                cg_indent = cg_indent - 1
+            }
+            i = i + 1
+        }
+        emit_line("} else \{")
+        cg_indent = cg_indent + 1
+        emit_line("_r.tag = 0;")
+        cg_indent = cg_indent - 1
+        emit_line("}")
+        emit_line("return _r;")
+        cg_indent = cg_indent - 1
+        emit_line("}")
+        emit_line("")
+
+        derive_method_entries.push(DeriveMethodEntry { type_name: name, method_name: "to_str", ret_type: CT_STRING })
+        derive_method_entries.push(DeriveMethodEntry { type_name: name, method_name: "from_str", ret_type: CT_VOID })
     }
 }
 
