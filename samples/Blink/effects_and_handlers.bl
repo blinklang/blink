@@ -1,0 +1,92 @@
+// effects_and_handlers.bl — Effects, handlers, scoped resources, testing
+//
+// Demonstrates: effect declarations, handler blocks, with...as scoped
+// resources, effect annotations on functions, mock handlers for DI
+
+pub effect Storage {
+    fn get(key: Str) -> Option[Str]
+    fn set(key: Str, value: Str)
+    fn delete(key: Str) -> Bool
+}
+
+type CacheEntry {
+    key: Str
+    value: Str
+    ttl_secs: Int = 300
+}
+
+/// Look up a value, falling back to the underlying store on cache miss.
+fn get_or_fetch(key: Str) -> Option[Str] ! Storage, IO.Log {
+    match cache_get(key) {
+        Some(hit) => {
+            io.log("cache hit: {key}")
+            Some(hit)
+        }
+        None => {
+            io.log("cache miss: {key}, fetching from storage")
+            let val = Storage.get(key)
+            match val {
+                Some(v) => {
+                    cache_set(key, v)
+                    Some(v)
+                }
+                None => None
+            }
+        }
+    }
+}
+
+/// Batch-fetch multiple keys, returning found entries.
+fn get_many(keys: List[Str]) -> List[CacheEntry] ! Storage {
+    keys.into_iter()
+        .filter_map(fn(k) {
+            Storage.get(k)
+                .map(fn(v) { CacheEntry { key: k, value: v } })
+        })
+        .collect()
+}
+
+/// Create a mock storage handler backed by an in-memory map.
+fn mock_storage(data: Map[Str, Str]) -> Handler[Storage] {
+    let mut store = data
+    handler Storage {
+        fn get(key: Str) -> Option[Str] {
+            store.get(key)
+        }
+        fn set(key: Str, value: Str) {
+            store.insert(key, value)
+        }
+        fn delete(key: Str) -> Bool {
+            store.remove(key).is_some()
+        }
+    }
+}
+
+fn main() ! Storage, IO {
+    Storage.set("greeting", "hello world")
+    let val = get_or_fetch("greeting") ?? "default"
+    io.println("Got: {val}")
+}
+
+test "get_or_fetch returns stored value" {
+    let data = Map.of([("color", "blue")])
+    with mock_storage(data), capture_log([]) {
+        let result = get_or_fetch("color")
+        assert_eq(result, Some("blue"))
+    }
+}
+
+test "get_or_fetch returns None for missing key" {
+    with mock_storage(Map.new()), capture_log([]) {
+        let result = get_or_fetch("missing")
+        assert_eq(result, None)
+    }
+}
+
+test "get_many collects matching entries" {
+    let data = Map.of([("a", "1"), ("b", "2"), ("c", "3")])
+    with mock_storage(data) {
+        let entries = get_many(["a", "c", "z"])
+        assert_eq(entries.len(), 2)
+    }
+}

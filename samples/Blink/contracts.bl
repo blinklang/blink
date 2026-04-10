@@ -1,0 +1,100 @@
+// contracts.bl — Annotations, invariants, capability budgets, keyword args
+//
+// Demonstrates: @capabilities, @invariant, @requires, @ensures, @src,
+// @deprecated, old() in postconditions, keyword args with --, effect tracking
+
+@capabilities(DB.Read, DB.Write, IO.Log)
+
+type TransferError {
+    InsufficientFunds(available: Int, requested: Int)
+    AccountNotFound(id: Int)
+    InvalidAmount
+}
+
+type Account {
+    id: Int
+    owner: Str
+    balance: Int
+    @invariant(self.balance >= 0)
+}
+
+/// Create an account with an initial deposit.
+@src(req: "ACCT-001")
+@requires(initial >= 0)
+@ensures(result.balance == initial)
+pub fn create_account(id: Int, owner: Str, initial: Int = 0) -> Account {
+    Account { id: id, owner: owner, balance: initial }
+}
+
+/// Deposit funds into an account.
+@src(req: "ACCT-002")
+@requires(amount > 0)
+@ensures(result.is_ok() => result.unwrap().balance == old(acct.balance) + amount)
+pub fn deposit(acct: Account, amount: Int) -> Result[Account, TransferError] {
+    if amount <= 0 {
+        return Err(TransferError.InvalidAmount)
+    }
+    Ok(Account { id: acct.id, owner: acct.owner, balance: acct.balance + amount })
+}
+
+/// Withdraw funds, enforcing the balance invariant.
+@src(req: "ACCT-003")
+@requires(amount > 0)
+@ensures(result.is_ok() => result.unwrap().balance == old(acct.balance) - amount)
+pub fn withdraw(acct: Account, amount: Int) -> Result[Account, TransferError] {
+    if amount <= 0 {
+        return Err(TransferError.InvalidAmount)
+    }
+    if acct.balance < amount {
+        return Err(TransferError.InsufficientFunds(acct.balance, amount))
+    }
+    Ok(Account { id: acct.id, owner: acct.owner, balance: acct.balance - amount })
+}
+
+/// Transfer between accounts using keyword arguments.
+@src(req: "ACCT-004")
+@requires(amount > 0)
+pub fn transfer(amount: Int, -- from: Account, to: Account) -> Result[(Account, Account), TransferError] {
+    let updated_from = withdraw(from, amount)?
+    let updated_to = deposit(to, amount)?
+    Ok((updated_from, updated_to))
+}
+
+/// Old transfer function, kept for backwards compat.
+@deprecated("Use transfer() instead")
+pub fn transfer_v1(from: Account, to: Account, amount: Int) -> Result[(Account, Account), TransferError] {
+    transfer(amount, from: from, to: to)
+}
+
+/// Look up an account from the database.
+fn find_account(id: Int) -> Result[Account, TransferError] ! DB.Read {
+    db.query_one("SELECT * FROM accounts WHERE id = {id}")
+        ?? Err(TransferError.AccountNotFound(id))
+}
+
+/// Persist account state after modification.
+fn save_account(acct: Account) ! DB.Write, IO.Log {
+    db.execute("UPDATE accounts SET balance = {acct.balance} WHERE id = {acct.id}")
+    io.log("Account {acct.id} updated: balance={acct.balance}")
+}
+
+test "deposit increases balance" {
+    let acct = create_account(1, "Alice")
+    let result = deposit(acct, 500)
+    assert(result.is_ok())
+    assert_eq(result.unwrap().balance, 500)
+}
+
+test "withdraw insufficient funds" {
+    let acct = create_account(1, "Bob")
+    let result = withdraw(acct, 100)
+    assert(result.is_err())
+}
+
+test "transfer moves funds between accounts" {
+    let a = deposit(create_account(1, "A"), 1000).unwrap()
+    let b = create_account(2, "B")
+    let (a, b) = transfer(300, from: a, to: b).unwrap()
+    assert_eq(a.balance, 700)
+    assert_eq(b.balance, 300)
+}
