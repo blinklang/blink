@@ -3,6 +3,7 @@
 // Mutation analysis is a compile-time pass that infers which functions write
 // to module-level mutable globals (directly or transitively). If the pass has
 // bugs, this file won't compile. The tests verify runtime behavior is correct.
+import compile_test_helpers
 
 // ── Module-level mutable globals ─────────────────────────────────────
 let mut counter: Int = 0
@@ -10,7 +11,6 @@ let mut items: List[Int] = []
 let mut name: Str = ""
 
 // ── Direct writers ───────────────────────────────────────────────────
-
 fn increment() {
     counter = counter + 1
 }
@@ -20,13 +20,11 @@ fn set_name(s: Str) {
 }
 
 // ── Mutating method call on global ───────────────────────────────────
-
 fn add_item(x: Int) {
     items.push(x)
 }
 
 // ── Read-only (no writes) ────────────────────────────────────────────
-
 fn get_counter() -> Int {
     counter
 }
@@ -40,7 +38,6 @@ fn get_name() -> Str {
 }
 
 // ── Transitive writers (call a fn that writes) ───────────────────────
-
 fn double_increment() {
     increment()
     increment()
@@ -52,7 +49,6 @@ fn setup_defaults() {
 }
 
 // ── Writes multiple globals in one function ──────────────────────────
-
 fn reset_all() {
     counter = 0
     items = []
@@ -66,7 +62,6 @@ fn bump_everything() {
 }
 
 // ── Save/restore patterns (W0550/W0551 diagnostics) ─────────────
-
 // Complete save/restore — should NOT trigger W0550
 fn speculative_bump_safe() {
     let saved_counter = counter
@@ -78,8 +73,7 @@ fn speculative_bump_safe() {
     name = saved_name
 }
 
-// Incomplete save/restore — saves counter+name but NOT items
-// Should trigger W0550 for bump_everything() call
+@allow(IncompleteStateRestore)
 fn speculative_bump_incomplete() {
     let saved_counter = counter
     let saved_name = name
@@ -94,26 +88,7 @@ fn speculative_bump_none() {
     bump_everything()
 }
 
-// ── W0551 context-awareness test ────────────────────────────────────
-//
-// W0551 (UnrestoredMutation) only fires when the *containing function*
-// already has a save/restore pattern (sr_fn_has_save_restore != 0).
-//
-// speculative_bump_none() above has NO save/restore → W0551 should NOT fire.
-//
-// The function below DOES have a save/restore pattern (saves counter)
-// but calls bump_everything() which also mutates items and name without
-// saving them. Because saved_count==0 for that second call AND
-// sr_fn_has_save_restore==1, W0551 WOULD fire for a bare unprotected call.
-// However, here the first call (increment) is fully protected and the
-// second call (bump_everything) has partial saves, so W0550 fires instead.
-// We add a dedicated function that triggers W0551 specifically.
-
-// This function has a save/restore for counter (via increment), which sets
-// sr_fn_has_save_restore=1. Then it calls set_name() with NO save at all
-// for the name global. Since saved_count==0 for set_name and
-// sr_fn_has_save_restore!=0, this triggers W0551.
-// W0551 is a warning, not an error, so compilation still succeeds.
+@allow(UnrestoredMutation)
 fn speculative_mixed_pattern() {
     let saved_counter = counter
     increment()
@@ -121,36 +96,6 @@ fn speculative_mixed_pattern() {
     set_name("speculative")
 }
 
-// ── @allow suppression tests ────────────────────────────────────────
-//
-// @allow(IncompleteStateRestore) suppresses W0550
-// @allow(UnrestoredMutation) suppresses W0551
-//
-// NOTE: [lints] config in blink.toml is project-level and cannot be tested
-// in a standalone test file. It should be verified separately/manually.
-
-// Would trigger W0550 (incomplete save/restore: saves counter+name but not items)
-// @allow suppresses the warning
-@allow(IncompleteStateRestore)
-fn speculative_bump_incomplete_allowed() {
-    let saved_counter = counter
-    let saved_name = name
-    bump_everything()
-    counter = saved_counter
-    name = saved_name
-}
-
-// Would trigger W0551 (has save/restore pattern but set_name call has none)
-// @allow suppresses the warning
-@allow(UnrestoredMutation)
-fn speculative_mixed_allowed() {
-    let saved_counter = counter
-    increment()
-    counter = saved_counter
-    set_name("allowed")
-}
-
-// Both warnings suppressed in one annotation
 @allow(IncompleteStateRestore, UnrestoredMutation)
 fn speculative_both_allowed() {
     let saved_counter = counter
@@ -160,7 +105,6 @@ fn speculative_both_allowed() {
 }
 
 // ── Tests ────────────────────────────────────────────────────────────
-
 test "direct assignment to global" {
     reset_all()
     assert_eq(get_counter(), 0)
@@ -278,7 +222,7 @@ test "@allow(IncompleteStateRestore) suppresses W0550" {
     reset_all()
     counter = 5
     name = "before"
-    speculative_bump_incomplete_allowed()
+    speculative_bump_incomplete()
     assert_eq(get_counter(), 5)
     assert_eq(get_name(), "before")
     assert_eq(get_item_count(), 1)
@@ -288,9 +232,9 @@ test "@allow(IncompleteStateRestore) suppresses W0550" {
 test "@allow(UnrestoredMutation) suppresses W0551" {
     reset_all()
     counter = 5
-    speculative_mixed_allowed()
+    speculative_mixed_pattern()
     assert_eq(get_counter(), 5)
-    assert_eq(get_name(), "allowed")
+    assert_eq(get_name(), "speculative")
 }
 
 test "@allow with multiple warning names" {
@@ -300,4 +244,19 @@ test "@allow with multiple warning names" {
     assert_eq(get_counter(), 5)
     assert_eq(get_name(), "both")
     assert_eq(get_item_count(), 1)
+}
+
+// ── Compile-time error tests ────────────────────────────────────────
+//
+// W0550 and W0551 are hard errors. Verify they fire via compile_and_capture.
+test "W0550 fires as error for incomplete save/restore" {
+    let src = "let mut counter: Int = 0\nlet mut name: Str = \"\"\nlet mut items: List[Int] = []\nfn bump() \{\n    counter = 10\n    name = \"bumped\"\n    items.push(99)\n}\nfn bad() \{\n    let saved_counter = counter\n    let saved_name = name\n    bump()\n    counter = saved_counter\n    name = saved_name\n}\nfn main() \{\n}\n"
+    let output = compile_test_helpers.compile_and_capture(src, "_test_ma_w0550")
+    compile_test_helpers.expect_error(output, "IncompleteStateRestore", "W0550 fires for incomplete save/restore")
+}
+
+test "W0551 fires as error for unrestored mutation" {
+    let src = "let mut counter: Int = 0\nlet mut name: Str = \"\"\nfn increment() \{\n    counter = counter + 1\n}\nfn set_name(s: Str) \{\n    name = s\n}\nfn bad() \{\n    let saved_counter = counter\n    increment()\n    counter = saved_counter\n    set_name(\"oops\")\n}\nfn main() \{\n}\n"
+    let output = compile_test_helpers.compile_and_capture(src, "_test_ma_w0551")
+    compile_test_helpers.expect_error(output, "UnrestoredMutation", "W0551 fires for unrestored mutation")
 }
