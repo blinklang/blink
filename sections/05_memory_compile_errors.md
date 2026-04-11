@@ -121,7 +121,7 @@ fn process_all(items: List[Item]) -> List[Result] {
 
 The GC handles memory. But file handles, sockets, locks, database cursors, and temp files need deterministic cleanup — released at a specific program point, not whenever the GC runs a finalizer.
 
-Blink solves this with two pieces: the `Closeable` trait (section 3.6) and the `with...as` syntax (section 2.17).
+Blink solves this with two pieces: the `Closeable` trait (section 3.6) and the `with...as` syntax (section 2.18).
 
 #### The `Closeable` trait
 

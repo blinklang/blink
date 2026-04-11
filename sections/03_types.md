@@ -1147,20 +1147,22 @@ fn dispatch(command_path: List[Str]) -> Str {
 }
 ```
 
-Rest wildcard `...` matches zero or more trailing elements (tail position only, no binding):
+Rest wildcard `..` matches zero or more trailing elements (tail position only, no binding):
 
 ```blink
 fn process(tokens: List[Str]) -> Str {
     match tokens {
         [] => "done"
-        [first, ...] => "processing: {first}"
+        [first, ..] => "processing: {first}"
     }
 }
 ```
 
-`...` cannot bind a variable. Use `.slice()` or loops for tail access. (Rest binding deferred — would require O(n) copy or a slice type.)
+`..` in list patterns cannot bind a variable. Use `.slice()` or loops for tail access. (Rest binding deferred — would require O(n) copy or a slice type.)
 
-**Exhaustiveness**: list patterns are length-checked. The compiler tracks which concrete lengths are covered. A wildcard `_` or `...` arm is **always required** — lists are unbounded, so finite length patterns cannot be exhaustive. `[]` + `[_, ...]` IS exhaustive (covers empty + non-empty).
+The `..` rest sigil is unified across struct and list patterns — same concept ("remaining elements I didn't name"), same sigil. See §2.16 for the full spread/rest operator specification, including the construction-side dual (`..source` in struct literals).
+
+**Exhaustiveness**: list patterns are length-checked. The compiler tracks which concrete lengths are covered. A wildcard `_` or `..` arm is **always required** — lists are unbounded, so finite length patterns cannot be exhaustive. `[]` + `[_, ..]` IS exhaustive (covers empty + non-empty).
 
 ```
 error[NonExhaustiveMatch]: non-exhaustive match on List[Str]
@@ -1168,7 +1170,7 @@ error[NonExhaustiveMatch]: non-exhaustive match on List[Str]
   |
 15|     match path {
   |     ^^^^^ patterns cover lengths 0, 1, 2 — no catch-all for longer lists
-  = help: add a `_` wildcard arm or `[_, _, ...]` rest pattern
+  = help: add a `_` wildcard arm or `[_, _, ..] rest pattern
 ```
 
 **Struct patterns.** Match struct types by field values. Type name is required (nominal matching). Field punning binds a field to a variable of the same name. `..` is required when not all fields are listed.
@@ -1225,7 +1227,7 @@ error[InconsistentPatternBindings]: inconsistent bindings in OR-pattern
 
 #### Range Patterns
 
-Integer and character ranges match contiguous value sets. Both `..` (exclusive end) and `..=` (inclusive end) are supported, consistent with range expression syntax (§2.9). Bounds must be const expressions (§2.20). Only `Int`, sized integers (`I8`, `U8`, etc.), and `Char` types are allowed — not `Float` or `Str`. The exhaustiveness checker tracks covered ranges.
+Integer and character ranges match contiguous value sets. Both `..` (exclusive end) and `..=` (inclusive end) are supported, consistent with range expression syntax (§2.9). Bounds must be const expressions (§2.21). Only `Int`, sized integers (`I8`, `U8`, etc.), and `Char` types are allowed — not `Float` or `Str`. The exhaustiveness checker tracks covered ranges.
 
 ```blink
 fn classify_http(code: Int) -> Str {
@@ -1817,7 +1819,7 @@ trait Closeable {
 }
 ```
 
-A type implementing `Closeable` holds resources (file handles, sockets, locks, database cursors) that must be released deterministically — not when the GC gets around to it, but at a specific point in the program. The `with...as` construct (section 2.17, section 5.5) guarantees `close()` is called on all exit paths.
+A type implementing `Closeable` holds resources (file handles, sockets, locks, database cursors) that must be released deterministically — not when the GC gets around to it, but at a specific point in the program. The `with...as` construct (section 2.18, section 5.5) guarantees `close()` is called on all exit paths.
 
 ```blink
 type FileHandle {

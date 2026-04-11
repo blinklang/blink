@@ -522,7 +522,7 @@ let z = x + y   // COMPILE ERROR: Int + Float not defined
 let z = x.to_float() + y   // OK
 ```
 
-This is unchanged from §2.18 and §3.6 — stated here for completeness.
+This is unchanged from §2.19 and §3.6 — stated here for completeness.
 
 #### Char Conversions
 

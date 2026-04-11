@@ -56,8 +56,9 @@ All decided through independent design and cross-team voting. None are revisitab
 | While/loop | `while` and `loop` | `while cond { }` for conditional, `loop { }` for unconditional. Plain `break`/`continue`. No labels, no `while let`. See [2.11](#211-whileloop). |
 | Visibility | `pub` keyword | Public items use `pub`. Everything else is module-private. See [2.12](#212-visibility). |
 | Scoped resources | `with expr as name { }` | Deterministic resource cleanup. `Closeable` trait + LIFO close order. Reuses `with` from effect handlers; `as` disambiguates. 3-0 over `defer`. |
-| Constants | `const NAME = expr` | Compile-time constants. Distinct from `let` (runtime). Literals + arithmetic + boolean ops + references to other consts. See [2.20](#220-const-declarations). |
-| Tests | `test "name" { }` | First-class syntax. Pure by default (no implicit effects). Four built-in assertions. `panic()` for unreachable states. Module-scoped tests access private items. `@tags(...)` for filtering. See [2.19](#219-test-blocks). |
+| Constants | `const NAME = expr` | Compile-time constants. Distinct from `let` (runtime). Literals + arithmetic + boolean ops + references to other consts. See [2.21](#221-const-declarations). |
+| Tests | `test "name" { }` | First-class syntax. Pure by default (no implicit effects). Four built-in assertions. `panic()` for unreachable states. Module-scoped tests access private items. `@tags(...)` for filtering. See [2.20](#220-test-blocks). |
+| Spread/rest operator | `..` | General spread/rest sigil. Patterns: `{ name, .. }`, `[first, ..]` (ignore rest). Construction: `{ field: val, ..source }` (copy rest), `[..list1, ..list2]` (list spread). See [2.16](#216-spread--rest-operator-). |
 
 ### 2.3 Contested: Braces vs Indentation
 
@@ -454,7 +455,7 @@ match expr {
 - **Expression context** (let binding, return, argument): `else` is required. Both branches must unify to the same type. Missing `else` is a compile error.
 - **Statement context** (value discarded): `else` is optional. The expression type is `()`. If `else` is present, both branches must be `()`.
 - **No parentheses** around the condition. The condition is delimited by `if` and `{`. Sub-expression grouping with `()` inside the condition is normal expression syntax, not part of `if`.
-- **No truthiness.** The condition must be `Bool`. `if 0 { }` and `if items { }` are compile errors. See [2.18](#218-operator-precedence--semantics).
+- **No truthiness.** The condition must be `Bool`. `if 0 { }` and `if items { }` are compile errors. See [2.19](#219-operator-precedence--semantics).
 - **No `if let`** for v1. Use `match` for pattern-based control flow, `??` for Option defaulting. Revisitable in v2 if `match` with single-arm + wildcard proves painful in practice.
 
 **Panel vote: 5-0 unanimous** on all four sub-questions — if/else as expression, else required in expression context, no if-let for v1, parentheses forbidden. See [DECISIONS.md](../DECISIONS.md) for full deliberation.
@@ -619,12 +620,12 @@ let x = 1
 let x = 2  // error[DuplicateModuleBinding]: duplicate module-level binding `x`
 ```
 
-**`pub let` exports immutable bindings.** A module-level `let` (without `mut`) can be marked `pub` to make it importable by other modules. For compile-time constants, prefer `const` (see [2.20](#220-const-declarations)) — `let` at module level is for runtime-initialized values.
+**`pub let` exports immutable bindings.** A module-level `let` (without `mut`) can be marked `pub` to make it importable by other modules. For compile-time constants, prefer `const` (see [2.21](#221-const-declarations)) — `let` at module level is for runtime-initialized values.
 
 **`pub let mut` is forbidden.** Mutable module-level state must not be directly exposed to other modules. The compiler tracks which functions write to module-level `let mut` bindings via mutation analysis (see §4.16). The compiler reports `PubLetMutForbidden` (E1006).
 
 ```blink
-// Compile-time constants — prefer const (§2.20)
+// Compile-time constants — prefer const (§2.21)
 pub const api_version = "2.0"
 pub const default_timeout = 30
 
@@ -680,7 +681,7 @@ transfer(300, to: bob, from: alice)  // valid, same as above
 - Params before `--` are **positional**: order matters, no labels at call site
 - Params after `--` are **keyword-required**: labels required, order-independent at call site
 - Default values only allowed on keyword params (after `--`)
-- Default values must be const expressions (see [2.20](#220-const-declarations))
+- Default values must be const expressions (see [2.21](#221-const-declarations))
 - Labels are **call-site sugar** — the function type is `fn(Int, Account, Account)` regardless of `--`. Closures, trait impls, and higher-order functions are unaffected. See [3.3](#33-type-inference).
 - The formatter enforces declaration order at call sites for consistency
 
@@ -729,7 +730,7 @@ let config = ServerConfig { port: 3000, debug: true }
 
 #### Rules
 
-- Default values must be const expressions (see [2.20](#220-const-declarations))
+- Default values must be const expressions (see [2.21](#221-const-declarations))
 - Fields without defaults are always required at construction
 - The compiler inserts default values at construction sites — no runtime lookup
 - Struct field defaults do not interact with the type system: `ServerConfig` is the same type regardless of which fields were explicitly provided
@@ -765,7 +766,91 @@ The shorthand applies only when:
 
 When the type is ambiguous (e.g., the parameter is a trait object or generic), the full form is required.
 
-### 2.16 Annotations
+### 2.16 Spread / Rest Operator (`..`)
+
+`..` is Blink's spread/rest operator. It means "the elements I didn't name" — in patterns it ignores them, in construction it copies them from a source.
+
+#### v1 Contexts
+
+| Context | Syntax | Meaning |
+|---------|--------|---------|
+| Struct pattern rest | `User { name, .. }` | Ignore remaining fields |
+| List pattern rest | `[first, ..]` | Match remaining elements |
+| Struct copy-update | `Account { balance: new_val, ..acct }` | Copy remaining fields from source |
+| List literal spread | `[..list1, extra, ..list2]` | Expand elements into list |
+| Range (infix) | `0..100`, `1..=100` | Exclusive/inclusive range |
+
+Pattern rest and construction spread are duals: patterns discard "the rest," construction copies "the rest" from a source.
+
+#### Struct Copy-Update
+
+When constructing a struct, `..source` at the end of the field list copies all unspecified fields from an existing value of the same type:
+
+```blink
+let updated = Account { balance: acct.balance + amount, ..acct }
+
+// Multiple overrides — only changed fields are listed
+let patched = Node { kind: NodeKind.Call, args: new_args, ..node }
+
+// Works in any expression position
+fn deposit(acct: Account, amount: Int) -> Account {
+    Account { balance: acct.balance + amount, ..acct }
+}
+```
+
+This is purely syntactic sugar. The compiler desugars `T { f1: e1, ..src }` to `T { f1: e1, f2: src.f2, f3: src.f3, ... }` at typecheck time — zero runtime cost beyond a normal struct literal.
+
+**Rules:**
+
+- The source must be the **same nominal type** as the struct being constructed. Cross-type spread is not supported (Blink uses nominal typing).
+- `..source` must appear **last** in the field list. This is a hard parse rule — `{ ..src, field: val }` is a parse error.
+- At most **one** `..source` per literal. Multiple spread sources are not supported.
+- Explicitly provided fields **shadow** same-named fields from the source.
+- Source field values take precedence over field defaults (§2.14) for non-explicit fields.
+
+Copy-update composes with the construction shorthand (§2.15):
+
+```blink
+fn reconfigure(config: ServerConfig) -> ServerConfig {
+    { debug: true, ..config }
+}
+```
+
+#### List Literal Spread
+
+Inside a list literal, `..expr` expands all elements from the source list:
+
+```blink
+let copy = [..original]
+let combined = [..list1, ..list2]
+let prepended = [first_item, ..rest]
+let interleaved = [..heads, separator, ..tails]
+```
+
+**Rules:**
+
+- The spread source must be a `List[T]` with the same element type as the list being constructed. Type mismatches are compile errors.
+- **Multiple** `..source` spreads are allowed per literal (unlike struct copy-update which allows only one).
+- Spreads can appear at **any position** (unlike struct `..source` which must be last) — lists are ordered sequences with no key conflicts.
+- Spreads evaluate **left-to-right** and produce a new list (eager copy, not lazy view). `[..a, ..a]` copies `a` twice.
+- Runtime cost: O(n) per spread source — same as any eager list construction.
+
+**Panel vote: 5-0** for including list spread in v1. The pattern/construction duality (`[first, ..]` deconstructs, `[..list, extra]` constructs) and absence of `.clone()` on lists made this essential. See [DECISIONS.md](../DECISIONS.md).
+
+#### Future Contexts
+
+`..` is a general concept. Future versions may extend it to additional contexts (e.g., tuple spread). Each new context requires its own panel deliberation — the shared sigil is a surface-syntax decision, not a guarantee of uniform semantics across all contexts.
+
+**v1 explicitly does not support:** tuple spread, function call spread. Using `..` in those positions is a parse error.
+
+#### Panel Votes
+
+- **Spread/rest as unified concept**: 5-0. See [DECISIONS.md](../DECISIONS.md).
+- **`..` as rest sigil in patterns** (unifying struct `..` and list `..`, dropping `...`): 4-1 (PLT dissented for `*`).
+- **`..source` for struct copy-update**: 4-1 (AI/ML dissented for `copy` keyword).
+- **List literal spread in v1**: 5-0.
+
+### 2.17 Annotations
 
 Annotations use the `@` prefix and are **compiler-checked** — they are not comments, not decorators, not optional metadata. They participate in type checking, verification, and optimization.
 
@@ -845,7 +930,7 @@ pub fn login(email: Str, pwd: Str) -> Result[Session, AuthError] ! DB, Crypto {
 
 The canonical ordering enforced by `blink fmt` is: `@capabilities` first (permissions), then `@requires`/`@ensures` (contracts), then `@where` (type constraints), then `@perf` (performance). See section 11.1 for the complete ordering across all 13 annotation types.
 
-### 2.17 Scoped Resources (`with...as`)
+### 2.18 Scoped Resources (`with...as`)
 
 The `with...as` construct binds a `Closeable` value to a name and guarantees cleanup when the block exits — whether by normal completion, `?` early return, or any other exit path.
 
@@ -901,7 +986,7 @@ Here `mock_db(fixtures)` is an effect handler (no `as`) and `f` is a scoped `Clo
 
 ---
 
-### 2.18 Operator Precedence & Semantics
+### 2.19 Operator Precedence & Semantics
 
 #### Precedence Table
 
@@ -995,7 +1080,7 @@ let full = first.concat(" ").concat(last) // .concat() for dynamic cases
 
 String `+` encourages O(n²) loops, creates ambiguity with numeric `+`, and violates Principle 2 when interpolation already exists. (Vote: 5-0)
 
-### 2.19 Test Blocks
+### 2.20 Test Blocks
 
 Tests are first-class syntax — `test` blocks are part of the grammar, understood by the parser, type-checked by the compiler, and run by the built-in test runner. No test framework to import.
 
@@ -1097,7 +1182,7 @@ test "assertions demo" {
 
 Assertion failure panics — unwinding to the test runner, which marks the test as failed and continues running other tests. This is the one context where Blink uses panic semantics, since tests are controlled environments where unwinding is safe.
 
-**Panel vote: 4-1** for three built-ins (original §2.19 vote). PLT dissented (assert_ne is `assert(a != b)` — Principle 2 violation). See [DECISIONS.md](../DECISIONS.md). Testing framework deliberation added `assert_matches` (4-1, AI/ML dissented) and optional messages (3-2). See [DECISIONS.md](../DECISIONS.md).
+**Panel vote: 4-1** for three built-ins (original §2.20 vote). PLT dissented (assert_ne is `assert(a != b)` — Principle 2 violation). See [DECISIONS.md](../DECISIONS.md). Testing framework deliberation added `assert_matches` (4-1, AI/ML dissented) and optional messages (3-2). See [DECISIONS.md](../DECISIONS.md).
 
 #### `panic()` Function
 
@@ -1333,7 +1418,7 @@ Doc-tests verify that documentation stays in sync with implementation. They are 
 - Stripped from release builds
 - JSON structured output via `blink test --json`
 
-### 2.20 Const Declarations
+### 2.21 Const Declarations
 
 The `const` keyword declares compile-time constants. Unlike `let` (runtime-initialized, immutable), `const` bindings are evaluated by the compiler during compilation and their values are substituted at every use site. The right-hand side must be a **const expression**.
 

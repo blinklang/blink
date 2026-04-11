@@ -300,6 +300,10 @@ Decided by expert panel vote. See [OPEN_QUESTIONS.md](OPEN_QUESTIONS.md) for ful
 | Tier-2 pre-registry behavior | Collapse tier-2 into tier-1 until registry exists. All `std.*` modules implicit, no `blink.toml` required | 4-1 (DevOps dissented: keep manifest gate for auditability) |
 | Long-term stdlib tier architecture | Batteries included — all `std.*` is tier-1 forever. No tier-2 concept. Stdlib version-locks to compiler. If it doesn't belong in stdlib, it's an ecosystem package without `std.*` prefix | 3-2 (Web/PLT dissented: semi-stdlib with independent versioning) |
 | Env var exposure mechanism | Pure codegen builtin with vtable dispatch (same as IO/FS/Time). Remove `get_env()` immediately (soundness hole). Vtable swap for handler mockability | 4-1 (PLT dissented: stdlib module), 4-1 (Web dissented: deprecate get_env), 4-1 (PLT dissented: evidence passing) |
+| Spread/rest operator (`..`) | `..` is a general spread/rest concept. v1: struct/list pattern rest, struct literal copy-update, list literal spread. Future contexts (tuple spread, etc.) require separate deliberation | 5-0 (generic framing) |
+| Rest sigil unification | Unified `..` for struct and list rest patterns. Drop `...` from list patterns. One sigil, context disambiguates | 4-1 (PLT dissented for `*` Kleene star) |
+| Struct copy-update | `Type { field: val, ..source }` — spread suffix in struct literals. Same `..` sigil as pattern rest. Zero new keywords | 4-1 (AI/ML dissented for `copy` keyword) |
+| List literal spread | `[..list1, extra, ..list2]` — spread elements into list literals. Multiple sources, any position. Eager copy. Completes pattern/construction duality | 5-0 |
 
 ---
 
@@ -380,6 +384,9 @@ Full deliberation records for each decision. Each file contains expert votes, re
 | Tier-2 Pre-Registry Behavior | [decisions/tier2-pre-registry-behavior.md](decisions/tier2-pre-registry-behavior.md) |
 | Long-Term Stdlib Tier Architecture | [decisions/stdlib-tier-architecture.md](decisions/stdlib-tier-architecture.md) |
 | Env Var Exposure Mechanism | [decisions/env-var-exposure-mechanism.md](decisions/env-var-exposure-mechanism.md) |
+| Rest Sigil Unification | [decisions/rest-sigil-unification.md](decisions/rest-sigil-unification.md) |
+| Struct Copy-Update | [decisions/struct-copy-update.md](decisions/struct-copy-update.md) |
+| List Literal Spread | [decisions/list-literal-spread.md](decisions/list-literal-spread.md) |
 
 ---
 
