@@ -1,7 +1,7 @@
 import codegen_types.{
     CT_BOOL, CT_BYTES, CT_CHANNEL, CT_CLOSURE, CT_FFI_SCOPE, CT_FLOAT,
     CT_HANDLER, CT_INT, CT_ITERATOR, CT_LIST, CT_MAP, CT_OPTION, CT_PTR,
-    CT_RESULT, CT_SET, CT_STRING, CT_STRINGBUILDER, CT_STRUCT, CT_TEMPLATE, CT_VOID,
+    CT_ENUM, CT_RESULT, CT_SET, CT_STRING, CT_STRINGBUILDER, CT_STRUCT, CT_TEMPLATE, CT_VOID,
     CaptureEntry, ClosureCapInfo, VarEnumEntry,
     c_fn_name, c_safe_name, c_type_c_name, c_type_str, c_type_tag,
     capture_cast_expr, check_effect_propagation,
@@ -56,7 +56,7 @@ import codegen_types.{
     set_var, set_var_closure, set_var_option, set_var_struct,
     strip_module_qualifier,
     sf_entries, struct_field_defaults, struct_invariants, struct_option_c_type,
-    tp_child1_kind, tp_child1_sname, tp_child2_kind, tp_child2_sname, tp_get_child1, tp_get_child2, tp_get_kind_raw, tp_get_sname,
+    tp_child1_kind, tp_child1_sname, tp_child2_kind, tp_child2_sname, tp_get_child1, tp_get_child2, tp_get_kind, tp_get_sname,
     resolve_effect_field, resolve_effect_is_ue, resolve_effect_vtable,
     split_result_compound, tuple_c_type_name, type_from_name, type_from_name_tag, type_name_from_ct, ue_effects, c_type_from_tag,
     var_enums
@@ -250,11 +250,11 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
             let cap_entry = closure_captures.get(cg_closure_cap_start + cap_idx).unwrap()
             if cap_entry.is_mut != 0 {
                 expr_result_str = "(*{safe}_cell)"
-                expr_result_type = tp_get_kind_raw(cap_entry.tp_id)
+                expr_result_type = tp_get_kind(cap_entry.tp_id)
                 return
             }
             expr_result_str = capture_cast_expr(cap_idx)
-            expr_result_type = tp_get_kind_raw(cap_entry.tp_id)
+            expr_result_type = tp_get_kind(cap_entry.tp_id)
             return
         }
         if is_mut_captured(name) != 0 {
@@ -417,7 +417,7 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
         let struct_type = get_var_struct(obj_str)
         if struct_type != "" {
             fa_type = get_struct_field_type(struct_type, c_field)
-            if fa_type == CT_STRUCT {
+            if fa_type == CT_STRUCT || fa_type == CT_VOID {
                 let mi = lookup_mono_base(struct_type)
                 if mi.base != "" {
                     let td = find_type_def_node(mi.base)
@@ -1070,7 +1070,7 @@ pub fn emit_async_spawn_closure(closure_node: Int, wrapper_idx: Int, wrapper_nam
     while mc_i < captures.len() {
         let mc_e = closure_captures.get(cap_start + mc_i).unwrap()
         if mc_e.is_mut != 0 {
-            let mc_ts = c_type_str(tp_get_kind_raw(mc_e.tp_id))
+            let mc_ts = c_type_str(tp_get_kind(mc_e.tp_id))
             emit_line("{mc_ts}* {mc_e.name}_cell = ({mc_ts}*)blink_closure_get_capture(__self, {mc_i});")
         }
         mc_i = mc_i + 1
@@ -1172,7 +1172,7 @@ fn emit_await_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
         let inner2 = get_var_handle_inner2(handle_str)
         let opt_c_type = if inner2 >= 0 {
             let inner_ct = type_from_name(handle_sname)
-            if inner_ct == CT_VOID && is_struct_type(handle_sname) != 0 {
+            if (inner_ct == CT_VOID || inner_ct == CT_STRUCT || inner_ct == CT_ENUM) && (is_struct_type(handle_sname) != 0 || is_enum_type(handle_sname) != 0) {
                 struct_option_c_type(handle_sname)
             } else {
                 option_c_type(inner2)
@@ -2325,16 +2325,21 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
             expr_result_type = CT_INT
             return
         }
-        expr_result_str = "{c_fn_name(fn_name)}({args_str})"
         expr_result_type = get_fn_ret(fn_name)
-        if expr_result_type == CT_VOID {
+        if expr_result_type == CT_VOID || expr_result_type == CT_STRUCT || expr_result_type == CT_ENUM {
             let fn_sret = get_fn_ret_struct(fn_name)
             if fn_sret != "" {
                 let s_tmp = fresh_temp("_sr")
                 emit_line("{c_type_c_name(fn_sret)} {s_tmp} = {c_fn_name(fn_name)}({args_str});")
+                set_var(s_tmp, CT_STRUCT, 0)
                 set_var_struct(s_tmp, fn_sret)
                 expr_result_str = s_tmp
+                expr_result_type = CT_STRUCT
+            } else {
+                expr_result_str = "{c_fn_name(fn_name)}({args_str})"
             }
+        } else {
+            expr_result_str = "{c_fn_name(fn_name)}({args_str})"
         }
         let rt = get_fn_ret_type(fn_name)
         expr_result_ok_struct = ""
@@ -2371,11 +2376,11 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
             if expr_option_inner == CT_MAP && opt_child1 >= 0 {
                 let map_val_child = tp_get_child2(opt_child1)
                 if map_val_child >= 0 {
-                    let mvk = tp_get_kind_raw(map_val_child)
+                    let mvk = tp_get_kind(map_val_child)
                     if mvk == CT_LIST {
                         let list_child = tp_get_child1(map_val_child)
                         if list_child >= 0 {
-                            expr_option_inner_map_val_list_elem = tp_get_kind_raw(list_child)
+                            expr_option_inner_map_val_list_elem = tp_get_kind(list_child)
                         }
                     }
                     let mvs = tp_get_sname(map_val_child)
