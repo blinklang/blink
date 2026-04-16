@@ -1,0 +1,195 @@
+// Staleness test: detects module-level `let mut` variables that are not
+// covered by the corresponding reset function or an explicit allowlist.
+
+fn extract_var_name(line: Str) -> Str {
+    let idx = line.index_of("mut ")
+    if idx == -1 {
+        return ""
+    }
+    let after_mut = line.slice(idx + 4, line.len())
+    let colon = after_mut.index_of(":")
+    if colon == -1 {
+        return ""
+    }
+    after_mut.slice(0, colon).trim()
+}
+
+fn extract_fn_body(source: Str, fn_name: Str) -> Str {
+    let marker = "fn {fn_name}("
+    let start = source.index_of(marker)
+    if start == -1 {
+        return ""
+    }
+    let after = source.slice(start, source.len())
+    let brace = after.index_of("\{")
+    if brace == -1 {
+        return ""
+    }
+    let mut depth = 0
+    let mut i = brace
+    let mut body_start = brace + 1
+    let mut found_end = -1
+    while i < after.len() {
+        let ch = after.char_at(i)
+        if ch == 123 { // '{'
+            depth = depth + 1
+        }
+        if ch == 125 { // '}'
+            depth = depth - 1
+            if depth == 0 {
+                found_end = i
+                break
+            }
+        }
+        i = i + 1
+    }
+    if found_end == -1 {
+        return ""
+    }
+    after.slice(body_start, found_end)
+}
+
+fn is_in_reset(var_name: Str, reset_body: Str) -> Bool {
+    if reset_body.contains("{var_name}.clear()") {
+        return true
+    }
+    if reset_body.contains("{var_name} = ") {
+        return true
+    }
+    if reset_body.contains("{var_name}.push(") {
+        return true
+    }
+    false
+}
+
+fn collect_global_mut_vars(source: Str) -> List[Str] {
+    let lines = source.lines()
+    let mut vars: List[Str] = []
+    let mut i = 0
+    while i < lines.len() {
+        let line = lines.get(i).unwrap()
+        let is_let_mut = line.starts_with("let mut ") || line.starts_with("pub let mut ")
+        if is_let_mut {
+            let name = extract_var_name(line)
+            if name != "" {
+                vars.push(name)
+            }
+        }
+        i = i + 1
+    }
+    vars
+}
+
+fn check_file(file_path: Str, fn_name: Str, allowlist: List[Str]) -> List[Str] {
+    let source = read_file(file_path)
+    let vars = collect_global_mut_vars(source)
+    let reset_body = extract_fn_body(source, fn_name)
+
+    let mut allow_set: Map[Str, Int] = Map()
+    let mut j = 0
+    while j < allowlist.len() {
+        allow_set.insert(allowlist.get(j).unwrap(), 1)
+        j = j + 1
+    }
+
+    let mut missing: List[Str] = []
+    let mut k = 0
+    while k < vars.len() {
+        let v = vars.get(k).unwrap()
+        if !allow_set.contains_key(v) && !is_in_reset(v, reset_body) {
+            missing.push(v)
+        }
+        k = k + 1
+    }
+    missing
+}
+
+fn fail_missing(file_path: Str, fn_name: Str, missing: List[Str]) {
+    let mut sb = StringBuilder.new()
+    sb.write("{file_path}: {missing.len()} variable(s) not in {fn_name}() or allowlist:")
+    let mut i = 0
+    while i < missing.len() {
+        sb.write("\n  - {missing.get(i).unwrap()}")
+        i = i + 1
+    }
+    io.eprintln(sb.to_str())
+    assert(false)
+}
+
+test "no stale global state in compiler.bl" {
+    let allowlist: List[Str] = [
+        "trace_mode",
+        "embedded_stdlib",
+        "lint_cache_mtime",
+    ]
+    let missing = check_file("src/compiler.bl", "reset_compiler_state", allowlist)
+    if missing.len() > 0 {
+        fail_missing("src/compiler.bl", "reset_compiler_state", missing)
+    }
+}
+
+test "no stale global state in diagnostics.bl" {
+    let allowlist: List[Str] = [
+        "diag_format",
+        "diag_source_file",
+    ]
+    let missing = check_file("src/diagnostics.bl", "diag_reset", allowlist)
+    if missing.len() > 0 {
+        fail_missing("src/diagnostics.bl", "diag_reset", missing)
+    }
+}
+
+test "no stale global state in parser.bl" {
+    let allowlist: List[Str] = []
+    let missing = check_file("src/parser.bl", "parser_reset", allowlist)
+    if missing.len() > 0 {
+        fail_missing("src/parser.bl", "parser_reset", missing)
+    }
+}
+
+test "no stale global state in typecheck.bl" {
+    let allowlist: List[Str] = [
+        // per-scope name resolution scratch, managed by push/pop within each compilation
+        "nr_private_imports",
+        "nr_current_module",
+        "nr_name_source_module",
+        "nr_scope_names",
+        "nr_scope_muts",
+        "nr_scope_types",
+        "nr_scope_reads",
+        "nr_scope_writes",
+        "nr_scope_nodes",
+        "nr_scope_frames",
+        "nr_scope_depth",
+        "nr_loop_depth",
+        "nr_warn_unused",
+        "nr_impl_type_names",
+        "nr_impl_method_names",
+        // assigned fresh from import maps each pass
+        "tc_import_modules",
+        "tc_import_qualifiers",
+        "tc_import_nodes",
+        // assigned fresh by tc_build_import_map each pass
+        "tc_module_import_node",
+        "tc_qualifier_to_module",
+        "tc_import_modules_idx",
+        "tc_import_qualifiers_set",
+        // type alias cache, rebuilt each pass by tc_build_import_map
+        "tc_alias_to_original",
+        "tc_original_to_alias",
+        // per-expression scratch
+        "tc_pattern_binding_type",
+        // incremental compilation config, set once
+        "tc_inc_enabled",
+        "tc_inc_filter",
+        // per-function effect handles
+        "tc_ue_handles",
+        // reset by reset_compiler_state in compiler.bl
+        "tc_reexport_source",
+        "tc_reexport_modules",
+    ]
+    let missing = check_file("src/typecheck.bl", "init_types", allowlist)
+    if missing.len() > 0 {
+        fail_missing("src/typecheck.bl", "init_types", missing)
+    }
+}
