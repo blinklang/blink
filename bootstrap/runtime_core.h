@@ -28,7 +28,94 @@
 #define BLINK_UNUSED
 #endif
 
+#define BLINK_ARENA_DEFAULT_CHUNK_SIZE ((int64_t)(64 * 1024))
+#define BLINK_ARENA_ALIGN ((int64_t)16)
+
+typedef struct blink_arena_chunk {
+    struct blink_arena_chunk* next;
+    int64_t capacity;
+    int64_t used;
+    /* _Alignas keeps data[] at a BLINK_ARENA_ALIGN boundary; without it the
+       24-byte header on 64-bit lands data[] at 8-aligned, violating the
+       per-allocation alignment contract used by blink_arena_alloc. */
+    _Alignas(16) char data[];
+} blink_arena_chunk;
+
+typedef struct blink_arena_t {
+    blink_arena_chunk* head;
+    int64_t default_chunk_size;
+} blink_arena_t;
+
+static __thread blink_arena_t* __blink_current_arena = NULL;
+
+BLINK_UNUSED static blink_arena_chunk* blink_arena_chunk_new(int64_t capacity) {
+    blink_arena_chunk* c = (blink_arena_chunk*)GC_MALLOC_ATOMIC(sizeof(blink_arena_chunk) + (size_t)capacity);
+    if (!c) { fprintf(stderr, "blink: out of memory\n"); exit(1); }
+    c->next = NULL;
+    c->capacity = capacity;
+    c->used = 0;
+    return c;
+}
+
+BLINK_UNUSED static blink_arena_t* blink_arena_create(int64_t chunk_size) {
+    blink_arena_t* a = (blink_arena_t*)GC_MALLOC(sizeof(blink_arena_t));
+    if (!a) { fprintf(stderr, "blink: out of memory\n"); exit(1); }
+    a->default_chunk_size = chunk_size > 0 ? chunk_size : BLINK_ARENA_DEFAULT_CHUNK_SIZE;
+    a->head = blink_arena_chunk_new(a->default_chunk_size);
+    return a;
+}
+
+BLINK_UNUSED static void blink_arena_destroy(blink_arena_t* a) {
+    if (!a) return;
+    blink_arena_chunk* c = a->head;
+    while (c) {
+        blink_arena_chunk* next = c->next;
+        GC_FREE(c);
+        c = next;
+    }
+    a->head = NULL;
+    GC_FREE(a);
+}
+
+BLINK_UNUSED static void* blink_arena_alloc(blink_arena_t* a, int64_t size) {
+    if (size <= 0) size = 1;
+    int64_t aligned = (size + BLINK_ARENA_ALIGN - 1) & ~(BLINK_ARENA_ALIGN - 1);
+    blink_arena_chunk* head = a->head;
+    if (aligned > a->default_chunk_size) {
+        /* Splice the dedicated chunk *after* head so head's remaining free
+           space stays reachable for subsequent small allocations. */
+        blink_arena_chunk* big = blink_arena_chunk_new(aligned);
+        big->used = aligned;
+        if (head) {
+            big->next = head->next;
+            head->next = big;
+        } else {
+            a->head = big;
+        }
+        memset(big->data, 0, (size_t)aligned);
+        return big->data;
+    }
+    if (!head || head->used + aligned > head->capacity) {
+        blink_arena_chunk* fresh = blink_arena_chunk_new(a->default_chunk_size);
+        fresh->next = head;
+        a->head = fresh;
+        head = fresh;
+    }
+    void* p = head->data + head->used;
+    head->used += aligned;
+    memset(p, 0, (size_t)aligned);
+    return p;
+}
+
+/* Arena memory is never GC-scanned, so the atomic distinction is meaningless
+   here. Kept for API symmetry with GC_MALLOC / GC_MALLOC_ATOMIC. */
+BLINK_UNUSED static void* blink_arena_alloc_atomic(blink_arena_t* a, int64_t size) {
+    return blink_arena_alloc(a, size);
+}
+
 BLINK_UNUSED static void* blink_alloc(int64_t size) {
+    blink_arena_t* a = __blink_current_arena;
+    if (a != NULL) return blink_arena_alloc(a, size);
     void* p = GC_MALLOC((size_t)size);
     if (!p) {
         fprintf(stderr, "blink: out of memory\n");
