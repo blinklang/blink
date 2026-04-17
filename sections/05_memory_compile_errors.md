@@ -86,6 +86,72 @@ error[ArenaValueEscapes]: arena-scoped value escapes
   |                                   ++++++++
 ```
 
+#### 5.2.1 Arena Semantics
+
+This subsection fixes the four semantic points needed to implement the arena effect: return-value promotion, escape classification, handler plumbing, and nesting. See the [Arena Allocation Semantics deliberation](../decisions/arena-allocation-semantics.md) for rationale.
+
+##### Promotion walkers
+
+The compiler generates a per-type promotion function `blink_promote_<Type>(value, target_allocator)` for every type that crosses a `with arena { }` boundary. The walker:
+
+- copies the top-level value into `target_allocator` (an outer arena if one is active, otherwise the GC heap);
+- recurses into pointer fields structurally (struct fields, list elements, map entries);
+- copies strings via `GC_MALLOC_ATOMIC` (they are non-pointer-containing);
+- rejects cyclic types at compile time with `error[E0701]: arena type contains a cycle`, since a compile-time walker cannot safely materialize a cyclic graph into another allocator.
+
+Walkers are emitted only for types that actually cross an arena boundary in the program (detected by escape analysis), so the code-size cost scales with usage, not with the type pool.
+
+##### Escape rule
+
+An allocation site inside an `! Arena` function is classified as either **promoted** or **escaped**:
+
+- **Promoted** — the value flows (possibly through `if` / `match` / early `return`) to the block's result expression. The compiler inserts a `blink_promote_<Type>` call at the `with arena` boundary.
+- **Escaped** — the value flows anywhere else: captured by a closure that outlives the block, stored into a field of a non-arena-local struct, passed as an argument to a function whose parameter is not itself arena-local, or written to a module-level `let mut`. These sites produce `error[E0700]: ArenaValueEscapes` at compile time.
+
+"Arena-local parameter" is inferred from the callee's signature: an `! Arena` function's parameters are arena-transparent for the caller's escape analysis. No region-variable annotations are required or accepted.
+
+##### Handler plumbing
+
+`with arena { body }` is implemented as a `BlockHandler` (§4.6.3). The block handler's `enter()` captures the prior value of the thread-local `__blink_current_arena`, installs a freshly-created `blink_arena_t*`, and returns `()`. Its `exit(ok: Bool)` restores the saved pointer and destroys the inner arena unconditionally (commit and rollback paths are identical — arena lifetime is not tied to `ok`).
+
+`blink_alloc(size)` takes the fast path through `__blink_current_arena`:
+
+```c
+// runtime_core.h (conceptual)
+static void* blink_alloc(int64_t size) {
+    blink_arena_t* a = __blink_current_arena;
+    if (a != NULL) return blink_arena_alloc(a, size);
+    return GC_MALLOC((size_t)size);
+}
+```
+
+Because the block is a `BlockHandler`, arena enter/exit events are emitted by `--blink-trace` and `--trace all` uniformly with every other block-scoped construct. `! Arena` on a function signature is a *marker* effect consumed by escape analysis; it does not participate in evidence-passing dispatch.
+
+##### Nesting
+
+Nested `with arena { }` blocks create independent arenas. An inner block's allocations are freed when the inner block exits; the outer arena is untouched.
+
+```blink
+fn main() {
+    with arena {
+        let outer_work = build_tree()
+        let summary = with arena {
+            // inner arena: freed when this block exits
+            let temps = compute_temporaries()
+            summarize(temps)  // promoted into the OUTER arena at this `}`
+        }
+        use_summary(summary)  // `summary` lives in the outer arena
+    }  // outer arena freed here; `build_tree` + promoted `summary` both gone
+}
+```
+
+Because the nearest enclosing arena is the promotion target, `blink_promote_<Type>` takes the target allocator as a parameter rather than hardcoding `GC_MALLOC`. A value promoted from the outermost `with arena` block lands in the GC heap.
+
+##### Error codes
+
+- `E0700 ArenaValueEscapes` — an allocation site reaches a non-return position (closure capture, field store on non-arena target, argument to a non-arena-local parameter, module-level `let mut` assignment).
+- `E0701 ArenaTypeHasCycle` — a type crossing a `with arena { }` boundary contains a cycle (directly or transitively). Break the cycle or allocate the cyclic value on the GC heap outside the arena.
+
 ### 5.3 Compiler-Driven Optimization
 
 The compiler performs several optimizations that reduce GC pressure without programmer intervention:

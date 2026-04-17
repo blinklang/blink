@@ -304,6 +304,10 @@ Decided by expert panel vote. See [OPEN_QUESTIONS.md](OPEN_QUESTIONS.md) for ful
 | Rest sigil unification | Unified `..` for struct and list rest patterns. Drop `...` from list patterns. One sigil, context disambiguates | 4-1 (PLT dissented for `*` Kleene star) |
 | Struct copy-update | `Type { field: val, ..source }` — spread suffix in struct literals. Same `..` sigil as pattern rest. Zero new keywords | 4-1 (AI/ML dissented for `copy` keyword) |
 | List literal spread | `[..list1, extra, ..list2]` — spread elements into list literals. Multiple sources, any position. Eager copy. Completes pattern/construction duality | 5-0 |
+| Arena promotion semantics | Per-type compiler-generated `blink_promote_<Type>` walkers. Deep structurally, `GC_MALLOC_ATOMIC` copy for strings, cyclic types rejected as E0701. Walker takes target allocator parameter | 4-1 (DevOps dissented for outermost-only) |
+| Arena escape rules | Sound-conservative + return-path exception. Return expression is promoted, all other flows produce E0700. Arena-local params inferred from `! Arena` signatures | 5-0 |
+| Arena handler plumbing | Hybrid: thread-local `__blink_current_arena` for `blink_alloc` fast path; `BlockHandler` trait for `with arena { }` lifecycle (enter sets TLS, exit restores + destroys). `! Arena` is a marker effect for escape analysis, not evidence-passing dispatch | 5-0 runoff (round 1: A=1 / C=2 / D=2) |
+| Arena nesting | Independent arenas per nested `with arena`. Inner block allocations freed on inner exit; values promoted into nearest enclosing arena (or GC heap if none) | 5-0 |
 
 ---
 
@@ -387,6 +391,7 @@ Full deliberation records for each decision. Each file contains expert votes, re
 | Rest Sigil Unification | [decisions/rest-sigil-unification.md](decisions/rest-sigil-unification.md) |
 | Struct Copy-Update | [decisions/struct-copy-update.md](decisions/struct-copy-update.md) |
 | List Literal Spread | [decisions/list-literal-spread.md](decisions/list-literal-spread.md) |
+| Arena Allocation Semantics | [decisions/arena-allocation-semantics.md](decisions/arena-allocation-semantics.md) |
 
 ---
 
