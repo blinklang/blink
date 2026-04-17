@@ -1,0 +1,745 @@
+import ast.{NodeKind}
+import parser.{
+    node_kind, node_name, node_left, node_right, node_body, node_condition,
+    node_then_body, node_else_body, node_scrutinee, node_guard, node_value,
+    node_target, node_iterable, node_obj, node_method, node_params, node_args,
+    node_stmts, node_arms, node_fields, node_elements, node_handlers,
+    sublist_get, sublist_length,
+}
+import diagnostics.{
+    Diag, diag_error_at, diag_source_file, diag_file_for_node,
+    diag_push_allows, diag_clear_allows,
+}
+import typecheck.{tc_get_fn_effects}
+
+// Arena escape analysis: classifies allocations inside `with arena { }` as
+// promoted (tail-position return) or escaped (emits E0700).
+
+let mut ea_promote_nodes: List[Int] = []
+let mut ea_promote_types: List[Str] = []
+
+fn find_promote_idx(node_id: Int) -> Int {
+    let mut i = 0
+    while i < ea_promote_nodes.len() {
+        if ea_promote_nodes.get(i).unwrap() == node_id { return i }
+        i = i + 1
+    }
+    -1
+}
+
+pub fn ea_is_promoted(node_id: Int) -> Int {
+    if find_promote_idx(node_id) >= 0 { 1 } else { 0 }
+}
+
+pub fn ea_promoted_type(node_id: Int) -> Str {
+    let idx = find_promote_idx(node_id)
+    if idx < 0 { return "" }
+    ea_promote_types.get(idx).unwrap()
+}
+
+fn record_promote(node_id: Int, type_name: Str) {
+    if find_promote_idx(node_id) >= 0 {
+        return
+    }
+    ea_promote_nodes.push(node_id)
+    ea_promote_types.push(type_name)
+}
+
+let mut ea_safe_intrinsics: Map[Str, Int] = Map()
+
+fn init_safe_intrinsics() {
+    if ea_safe_intrinsics.len() > 0 { return }
+    ea_safe_intrinsics.insert("print", 1)
+    ea_safe_intrinsics.insert("println", 1)
+    ea_safe_intrinsics.insert("eprintln", 1)
+    ea_safe_intrinsics.insert("len", 1)
+    ea_safe_intrinsics.insert("assert", 1)
+    ea_safe_intrinsics.insert("assert_eq", 1)
+    ea_safe_intrinsics.insert("assert_ne", 1)
+}
+
+fn callee_is_safe(name: Str) -> Int {
+    if ea_safe_intrinsics.contains_key(name) { return 1 }
+    let effs = tc_get_fn_effects(name)
+    if effs.is_some() {
+        let s = effs.unwrap()
+        if s.contains("Arena") { return 1 }
+    }
+    0
+}
+
+// Flat scope stack: ea_frame_starts[i] is the first index in ea_local_names
+// owned by arena frame i. Popping a frame truncates names back to that index.
+let mut ea_local_names: List[Str] = []
+let mut ea_frame_starts: List[Int] = []
+
+fn ea_push_frame() {
+    ea_frame_starts.push(ea_local_names.len())
+}
+
+fn ea_pop_frame() {
+    if ea_frame_starts.len() == 0 { return }
+    let start = ea_frame_starts.get(ea_frame_starts.len() - 1).unwrap()
+    while ea_local_names.len() > start {
+        ea_local_names.pop()
+    }
+    ea_frame_starts.pop()
+}
+
+fn ea_in_arena() -> Int {
+    if ea_frame_starts.len() > 0 { 1 } else { 0 }
+}
+
+fn ea_top_start() -> Int {
+    if ea_frame_starts.len() == 0 { return 0 }
+    ea_frame_starts.get(ea_frame_starts.len() - 1).unwrap()
+}
+
+fn ea_mark_local(name: Str) {
+    if ea_frame_starts.len() == 0 { return }
+    ea_local_names.push(name)
+}
+
+fn ea_is_local_in_top(name: Str) -> Int {
+    if ea_frame_starts.len() == 0 { return 0 }
+    let start = ea_top_start()
+    let mut i = start
+    while i < ea_local_names.len() {
+        if ea_local_names.get(i).unwrap() == name { return 1 }
+        i = i + 1
+    }
+    0
+}
+
+fn ea_is_local_anywhere(name: Str) -> Int {
+    let mut i = 0
+    while i < ea_local_names.len() {
+        if ea_local_names.get(i).unwrap() == name { return 1 }
+        i = i + 1
+    }
+    0
+}
+
+fn is_alloc_expr(kind: Int) -> Int {
+    if kind == NodeKind.StructLit { return 1 }
+    if kind == NodeKind.ListLit { return 1 }
+    if kind == NodeKind.TupleLit { return 1 }
+    if kind == NodeKind.InterpString { return 1 }
+    0
+}
+
+fn infer_alloc_type(node: Int) -> Str {
+    let k = node_kind(node)
+    if k == NodeKind.StructLit {
+        let n = node_name(node)
+        if n != "" { return n }
+        return "?"
+    }
+    if k == NodeKind.ListLit { return "List" }
+    if k == NodeKind.TupleLit { return "Tuple" }
+    if k == NodeKind.InterpString { return "Str" }
+    "?"
+}
+
+fn rhs_is_arena_value(rhs: Int) -> Int {
+    if rhs == -1 { return 0 }
+    let k = node_kind(rhs)
+    if is_alloc_expr(k) != 0 { return 1 }
+    if k == NodeKind.Ident {
+        let n = node_name(rhs)
+        if ea_is_local_in_top(n) != 0 { return 1 }
+    }
+    if k == NodeKind.IfExpr {
+        if rhs_is_arena_value(node_then_body(rhs)) != 0 {
+            if rhs_is_arena_value(node_else_body(rhs)) != 0 {
+                return 1
+            }
+        }
+    }
+    if k == NodeKind.Block {
+        let sl = node_stmts(rhs)
+        if sl != -1 {
+            let n = sublist_length(sl)
+            if n > 0 {
+                let last = sublist_get(sl, n - 1)
+                let lk = node_kind(last)
+                if lk == NodeKind.ExprStmt {
+                    return rhs_is_arena_value(node_value(last))
+                }
+                return rhs_is_arena_value(last)
+            }
+        }
+    }
+    0
+}
+
+@allow(UnrestoredMutation, IncompleteStateRestore)
+fn emit_escape(node: Int, category: Str) ! Diag.Report {
+    let saved = diag_source_file
+    diag_source_file = diag_file_for_node(node)
+    diag_error_at(
+        "ArenaValueEscapes", "E0700",
+        "value allocated in 'with arena \{ }' escapes via {category}",
+        node,
+        "copy the value explicitly before it leaves the arena scope, or remove '! Arena' and let it be GC-managed"
+    )
+    diag_source_file = saved
+}
+
+fn expr_is_arena_value(node: Int) -> Int {
+    if node == -1 { return 0 }
+    let k = node_kind(node)
+    if is_alloc_expr(k) != 0 { return 1 }
+    if k == NodeKind.Ident {
+        let n = node_name(node)
+        if ea_is_local_in_top(n) != 0 { return 1 }
+    }
+    0
+}
+
+fn walk_elements(sl: Int) ! Diag.Report {
+    if sl == -1 { return }
+    let mut i = 0
+    while i < sublist_length(sl) {
+        walk_expr(sublist_get(sl, i), 0)
+        i = i + 1
+    }
+}
+
+fn walk_assignment(node: Int) ! Diag.Report {
+    let target = node_target(node)
+    let val = node_value(node)
+    if ea_in_arena() != 0 {
+        if val != -1 {
+            if expr_is_arena_value(val) != 0 {
+                if target != -1 {
+                    let tk = node_kind(target)
+                    if tk == NodeKind.Ident {
+                        let tname = node_name(target)
+                        if ea_is_local_in_top(tname) == 0 {
+                            emit_escape(node, "global assignment")
+                        }
+                    }
+                    if tk == NodeKind.FieldAccess || tk == NodeKind.IndexExpr {
+                        let obj = node_obj(target)
+                        if obj != -1 {
+                            if node_kind(obj) == NodeKind.Ident {
+                                if ea_is_local_in_top(node_name(obj)) == 0 {
+                                    emit_escape(node, "field store")
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    walk_expr(node_value(node), 0)
+    if target != -1 {
+        let tk = node_kind(target)
+        if tk == NodeKind.FieldAccess || tk == NodeKind.IndexExpr {
+            walk_expr(node_obj(target), 0)
+        }
+    }
+}
+
+fn walk_method_call(node: Int) ! Diag.Report {
+    let obj = node_obj(node)
+    walk_expr(obj, 0)
+    let args_sl = node_args(node)
+    if ea_in_arena() != 0 {
+        if args_sl != -1 {
+            let mut receiver_local = 0
+            if obj != -1 {
+                if node_kind(obj) == NodeKind.Ident {
+                    if ea_is_local_in_top(node_name(obj)) != 0 {
+                        receiver_local = 1
+                    }
+                }
+            }
+            if receiver_local == 0 {
+                let mut ai = 0
+                while ai < sublist_length(args_sl) {
+                    let arg = sublist_get(args_sl, ai)
+                    if expr_is_arena_value(arg) != 0 {
+                        emit_escape(arg, "function argument")
+                    }
+                    ai = ai + 1
+                }
+            }
+        }
+    }
+    if args_sl != -1 {
+        let mut ai = 0
+        while ai < sublist_length(args_sl) {
+            walk_expr(sublist_get(args_sl, ai), 0)
+            ai = ai + 1
+        }
+    }
+}
+
+fn walk_call(node: Int) ! Diag.Report {
+    let callee = node_left(node)
+    let mut callee_name = ""
+    if callee != -1 {
+        if node_kind(callee) == NodeKind.Ident {
+            callee_name = node_name(callee)
+        }
+    }
+    let args_sl = node_args(node)
+    if ea_in_arena() != 0 {
+        if args_sl != -1 {
+            if callee_name != "" {
+                if callee_is_safe(callee_name) == 0 {
+                    let mut ai = 0
+                    while ai < sublist_length(args_sl) {
+                        let arg = sublist_get(args_sl, ai)
+                        if expr_is_arena_value(arg) != 0 {
+                            emit_escape(arg, "function argument")
+                        }
+                        ai = ai + 1
+                    }
+                }
+            }
+        }
+    }
+    walk_expr(callee, 0)
+    if args_sl != -1 {
+        let mut ai = 0
+        while ai < sublist_length(args_sl) {
+            walk_expr(sublist_get(args_sl, ai), 0)
+            ai = ai + 1
+        }
+    }
+}
+
+fn walk_block_stmts(block_node: Int, tail_flag: Int) ! Diag.Report {
+    let stmts_sl = node_stmts(block_node)
+    if stmts_sl == -1 { return }
+    let n = sublist_length(stmts_sl)
+    let mut i = 0
+    while i < n {
+        let stmt = sublist_get(stmts_sl, i)
+        let is_last = if i == n - 1 { 1 } else { 0 }
+        let stmt_tail = if is_last != 0 { tail_flag } else { 0 }
+        walk_expr(stmt, stmt_tail)
+        i = i + 1
+    }
+}
+
+fn walk_with_block(node: Int, outer_tail: Int) ! Diag.Report {
+    let handlers_sl = node_handlers(node)
+    let body = node_body(node)
+    if handlers_sl != -1 {
+        let mut hi = 0
+        while hi < sublist_length(handlers_sl) {
+            walk_expr(sublist_get(handlers_sl, hi), 0)
+            hi = hi + 1
+        }
+    }
+    let mut is_arena = 0
+    if handlers_sl != -1 {
+        let mut i = 0
+        while i < sublist_length(handlers_sl) {
+            let item = sublist_get(handlers_sl, i)
+            if node_kind(item) == NodeKind.Ident {
+                if node_name(item) == "arena" {
+                    is_arena = 1
+                }
+            }
+            i = i + 1
+        }
+    }
+    if is_arena != 0 {
+        ea_push_frame()
+        walk_expr(body, 1)
+        ea_pop_frame()
+    } else {
+        walk_expr(body, outer_tail)
+    }
+}
+
+fn walk_expr(node: Int, tail_flag: Int) ! Diag.Report {
+    if node == -1 { return }
+    let kind = node_kind(node)
+
+    if ea_in_arena() != 0 {
+        if is_alloc_expr(kind) != 0 {
+            if tail_flag != 0 {
+                record_promote(node, infer_alloc_type(node))
+            }
+        }
+    }
+
+    if kind == NodeKind.Assignment {
+        walk_assignment(node)
+        return
+    }
+    if kind == NodeKind.CompoundAssign {
+        walk_assignment(node)
+        return
+    }
+    if kind == NodeKind.MethodCall {
+        walk_method_call(node)
+        return
+    }
+    if kind == NodeKind.Call {
+        walk_call(node)
+        return
+    }
+    if kind == NodeKind.Closure {
+        if ea_in_arena() != 0 {
+            check_closure_captures(node)
+        }
+        walk_expr(node_body(node), 0)
+        return
+    }
+    if kind == NodeKind.BinOp {
+        walk_expr(node_left(node), 0)
+        walk_expr(node_right(node), 0)
+        return
+    }
+    if kind == NodeKind.UnaryOp {
+        walk_expr(node_left(node), 0)
+        return
+    }
+    if kind == NodeKind.IfExpr {
+        walk_expr(node_condition(node), 0)
+        walk_expr(node_then_body(node), tail_flag)
+        walk_expr(node_else_body(node), tail_flag)
+        return
+    }
+    if kind == NodeKind.MatchExpr {
+        walk_expr(node_scrutinee(node), 0)
+        let arms_sl = node_arms(node)
+        if arms_sl != -1 {
+            let mut ai = 0
+            while ai < sublist_length(arms_sl) {
+                let arm = sublist_get(arms_sl, ai)
+                walk_expr(node_guard(arm), 0)
+                walk_expr(node_body(arm), tail_flag)
+                ai = ai + 1
+            }
+        }
+        return
+    }
+    if kind == NodeKind.Block {
+        walk_block_stmts(node, tail_flag)
+        return
+    }
+    if kind == NodeKind.LetBinding {
+        let val = node_value(node)
+        walk_expr(val, 0)
+        if ea_in_arena() != 0 {
+            if rhs_is_arena_value(val) != 0 {
+                let name = node_name(node)
+                if name != "" {
+                    ea_mark_local(name)
+                }
+            }
+        }
+        return
+    }
+    if kind == NodeKind.ExprStmt {
+        walk_expr(node_value(node), tail_flag)
+        return
+    }
+    if kind == NodeKind.Return {
+        walk_expr(node_value(node), 1)
+        return
+    }
+    if kind == NodeKind.ForIn {
+        walk_expr(node_iterable(node), 0)
+        walk_expr(node_body(node), 0)
+        return
+    }
+    if kind == NodeKind.WhileLoop {
+        walk_expr(node_condition(node), 0)
+        walk_expr(node_body(node), 0)
+        return
+    }
+    if kind == NodeKind.LoopExpr {
+        walk_expr(node_body(node), 0)
+        return
+    }
+    if kind == NodeKind.FieldAccess {
+        walk_expr(node_obj(node), 0)
+        return
+    }
+    if kind == NodeKind.IndexExpr {
+        walk_expr(node_obj(node), 0)
+        walk_expr(node_right(node), 0)
+        return
+    }
+    if kind == NodeKind.TupleLit {
+        walk_elements(node_elements(node))
+        return
+    }
+    if kind == NodeKind.ListLit {
+        walk_elements(node_elements(node))
+        return
+    }
+    if kind == NodeKind.StructLit {
+        let fields_sl = node_fields(node)
+        if fields_sl != -1 {
+            let mut fi = 0
+            while fi < sublist_length(fields_sl) {
+                let fld = sublist_get(fields_sl, fi)
+                walk_expr(node_value(fld), 0)
+                fi = fi + 1
+            }
+        }
+        return
+    }
+    if kind == NodeKind.InterpString {
+        walk_elements(node_elements(node))
+        return
+    }
+    if kind == NodeKind.RangeLit {
+        walk_expr(node_left(node), 0)
+        walk_expr(node_right(node), 0)
+        return
+    }
+    if kind == NodeKind.WithBlock {
+        walk_with_block(node, tail_flag)
+        return
+    }
+}
+
+fn cc_scan_elements(sl: Int, locals: List[Str]) ! Diag.Report {
+    if sl == -1 { return }
+    let mut i = 0
+    while i < sublist_length(sl) {
+        cc_scan(sublist_get(sl, i), locals)
+        i = i + 1
+    }
+}
+
+fn cc_recurse(node: Int, locals: List[Str]) ! Diag.Report {
+    let k = node_kind(node)
+    if k == NodeKind.Assignment {
+        cc_scan(node_target(node), locals)
+        cc_scan(node_value(node), locals)
+        return
+    }
+    if k == NodeKind.CompoundAssign {
+        cc_scan(node_target(node), locals)
+        cc_scan(node_value(node), locals)
+        return
+    }
+    if k == NodeKind.Call {
+        cc_scan(node_left(node), locals)
+        let args_sl = node_args(node)
+        if args_sl != -1 {
+            let mut i = 0
+            while i < sublist_length(args_sl) {
+                cc_scan(sublist_get(args_sl, i), locals)
+                i = i + 1
+            }
+        }
+        return
+    }
+    if k == NodeKind.MethodCall {
+        cc_scan(node_obj(node), locals)
+        let args_sl = node_args(node)
+        if args_sl != -1 {
+            let mut i = 0
+            while i < sublist_length(args_sl) {
+                cc_scan(sublist_get(args_sl, i), locals)
+                i = i + 1
+            }
+        }
+        return
+    }
+    if k == NodeKind.BinOp {
+        cc_scan(node_left(node), locals)
+        cc_scan(node_right(node), locals)
+        return
+    }
+    if k == NodeKind.UnaryOp {
+        cc_scan(node_left(node), locals)
+        return
+    }
+    if k == NodeKind.IfExpr {
+        cc_scan(node_condition(node), locals)
+        cc_scan(node_then_body(node), locals)
+        cc_scan(node_else_body(node), locals)
+        return
+    }
+    if k == NodeKind.Return {
+        cc_scan(node_value(node), locals)
+        return
+    }
+    if k == NodeKind.ExprStmt {
+        cc_scan(node_value(node), locals)
+        return
+    }
+    if k == NodeKind.FieldAccess {
+        cc_scan(node_obj(node), locals)
+        return
+    }
+    if k == NodeKind.IndexExpr {
+        cc_scan(node_obj(node), locals)
+        cc_scan(node_right(node), locals)
+        return
+    }
+    if k == NodeKind.TupleLit {
+        cc_scan_elements(node_elements(node), locals)
+        return
+    }
+    if k == NodeKind.ListLit {
+        cc_scan_elements(node_elements(node), locals)
+        return
+    }
+    if k == NodeKind.StructLit {
+        let fields_sl = node_fields(node)
+        if fields_sl != -1 {
+            let mut i = 0
+            while i < sublist_length(fields_sl) {
+                cc_scan(node_value(sublist_get(fields_sl, i)), locals)
+                i = i + 1
+            }
+        }
+        return
+    }
+    if k == NodeKind.InterpString {
+        cc_scan_elements(node_elements(node), locals)
+        return
+    }
+    if k == NodeKind.MatchExpr {
+        cc_scan(node_scrutinee(node), locals)
+        let arms_sl = node_arms(node)
+        if arms_sl != -1 {
+            let mut i = 0
+            while i < sublist_length(arms_sl) {
+                let arm = sublist_get(arms_sl, i)
+                cc_scan(node_body(arm), locals)
+                i = i + 1
+            }
+        }
+        return
+    }
+    if k == NodeKind.WhileLoop {
+        cc_scan(node_condition(node), locals)
+        cc_scan(node_body(node), locals)
+        return
+    }
+    if k == NodeKind.ForIn {
+        cc_scan(node_iterable(node), locals)
+        cc_scan(node_body(node), locals)
+        return
+    }
+    if k == NodeKind.LoopExpr {
+        cc_scan(node_body(node), locals)
+        return
+    }
+    if k == NodeKind.WithBlock {
+        let hs = node_handlers(node)
+        if hs != -1 {
+            let mut i = 0
+            while i < sublist_length(hs) {
+                cc_scan(sublist_get(hs, i), locals)
+                i = i + 1
+            }
+        }
+        cc_scan(node_body(node), locals)
+        return
+    }
+    if k == NodeKind.Closure {
+        cc_scan(node_body(node), locals)
+        return
+    }
+    if k == NodeKind.RangeLit {
+        cc_scan(node_left(node), locals)
+        cc_scan(node_right(node), locals)
+        return
+    }
+}
+
+fn cc_scan(node: Int, locals: List[Str]) ! Diag.Report {
+    if node == -1 { return }
+    let k = node_kind(node)
+    if k == NodeKind.Ident {
+        let n = node_name(node)
+        if ident_in_list(n, locals) == 0 {
+            if ea_is_local_anywhere(n) != 0 {
+                emit_escape(node, "closure capture")
+            }
+        }
+        return
+    }
+    if k == NodeKind.Block {
+        let sl = node_stmts(node)
+        if sl == -1 { return }
+        let mut cur_locals = locals
+        let mut i = 0
+        while i < sublist_length(sl) {
+            let s = sublist_get(sl, i)
+            if node_kind(s) == NodeKind.LetBinding {
+                cc_scan(node_value(s), cur_locals)
+                cur_locals.push(node_name(s))
+            } else {
+                cc_scan(s, cur_locals)
+            }
+            i = i + 1
+        }
+        return
+    }
+    cc_recurse(node, locals)
+}
+
+fn check_closure_captures(closure_node: Int) ! Diag.Report {
+    let body = node_body(closure_node)
+    if body == -1 { return }
+    let mut pnames: List[Str] = []
+    let params_sl = node_params(closure_node)
+    if params_sl != -1 {
+        let mut pi = 0
+        while pi < sublist_length(params_sl) {
+            let p = sublist_get(params_sl, pi)
+            pnames.push(node_name(p))
+            pi = pi + 1
+        }
+    }
+    cc_scan(body, pnames)
+}
+
+fn ident_in_list(name: Str, names: List[Str]) -> Int {
+    let mut i = 0
+    while i < names.len() {
+        if names.get(i).unwrap() == name { return 1 }
+        i = i + 1
+    }
+    0
+}
+
+@allow(UnrestoredMutation, IncompleteStateRestore)
+fn analyze_fn(fn_node: Int) ! Diag.Report {
+    let saved_source = diag_source_file
+    diag_source_file = diag_file_for_node(fn_node)
+    diag_push_allows(fn_node)
+    ea_local_names = []
+    ea_frame_starts = []
+    let body = node_body(fn_node)
+    if body != -1 {
+        walk_expr(body, 0)
+    }
+    diag_clear_allows()
+    diag_source_file = saved_source
+}
+
+pub fn analyze_escapes(program: Int) ! Diag.Report {
+    init_safe_intrinsics()
+    ea_promote_nodes = []
+    ea_promote_types = []
+    ea_local_names = []
+    ea_frame_starts = []
+
+    let fns_sl = node_params(program)
+    if fns_sl == -1 { return }
+    let mut i = 0
+    while i < sublist_length(fns_sl) {
+        analyze_fn(sublist_get(fns_sl, i))
+        i = i + 1
+    }
+}
