@@ -1,6 +1,6 @@
 import codegen_types.{
     Codegen,
-    CT_BOOL, CT_FLOAT, CT_INT, CT_LIST, CT_STRING, CT_VOID,
+    CT_BOOL, CT_FLOAT, CT_INT, CT_LIST, CT_MAP, CT_STRING, CT_STRUCT, CT_VOID,
     cg_indent,
     emit_line,
     fresh_temp,
@@ -11,6 +11,7 @@ import codegen_types.{
     has_derive_method,
     get_struct_field_tp_id,
     tp_child1_kind, tp_child1_sname,
+    tp_child2_kind, tp_child2_sname,
     get_variant_field_name, get_variant_field_type_str,
     derive_serialize_types, derive_deserialize_types,
     derive_eq_types, derive_clone_types,
@@ -671,6 +672,317 @@ fn emit_enum_clone(type_name: Str) ! Codegen.Emit {
     emit_line("{c_type_c_name(type_name)} {c_type_c_name(type_name)}_clone({c_type_c_name(type_name)} self) \{")
     cg_indent = cg_indent + 1
     emit_line("return self;")
+    cg_indent = cg_indent - 1
+    emit_line("}")
+    emit_line("")
+}
+
+// ── Arena promotion walkers ──────────────────────────────────────────
+//
+// For every type T that crosses a `with arena { }` expression boundary,
+// emit `blink_promote_<Mangled>(blink_arena_t* target, <CType> src) -> <CType>`.
+// Mangling (net-new vs @derive, which bottoms out in struct-name field recursion):
+//   Struct Foo       → blink_promote_Foo        (key = "Foo")
+//   List[T]          → blink_promote_List_<T>   (key = "List_<T_key>")
+//   Map[K, V]        → blink_promote_Map_<K>_<V>
+// Str / primitives don't get walkers — Str uses the runtime blink_promote_str;
+// primitives copy by value inline in the parent walker.
+//
+// Types are queued via a descriptor string:
+//   "S:<name>"   → struct
+//   "L:<inner>"  → list (inner is itself a descriptor)
+//   "M:<k>|<v>"  → map (k / v are descriptors; | separator picked to avoid
+//                  colliding with ':' used internally)
+//   "P:<tag>"    → primitive (Str, Int, Float, Bool) — never queued, used in dispatch
+
+pub let mut promote_types: List[Str] = []
+pub let mut promote_emitted: Map[Str, Int] = Map()
+
+pub fn ct_to_descriptor(ct: Int, sname: Str) -> Str {
+    if ct == CT_INT { return "P:Int" }
+    if ct == CT_FLOAT { return "P:Float" }
+    if ct == CT_BOOL { return "P:Bool" }
+    if ct == CT_STRING { return "P:Str" }
+    if ct == CT_STRUCT || ct == CT_VOID {
+        if sname != "" { return "S:{sname}" }
+        return "P:Int"
+    }
+    "P:Int"
+}
+
+pub fn descriptor_mangle(desc: Str) -> Str {
+    if desc.starts_with("S:") { return desc.slice(2, desc.len()) }
+    if desc.starts_with("P:") { return desc.slice(2, desc.len()) }
+    if desc.starts_with("L:") {
+        let inner = desc.slice(2, desc.len())
+        return "List_{descriptor_mangle(inner)}"
+    }
+    if desc.starts_with("M:") {
+        let rest = desc.slice(2, desc.len())
+        let bar = rest.index_of("|")
+        if bar >= 0 {
+            let k = rest.slice(0, bar)
+            let v = rest.slice(bar + 1, rest.len())
+            return "Map_{descriptor_mangle(k)}_{descriptor_mangle(v)}"
+        }
+    }
+    "Int"
+}
+
+pub fn descriptor_c_type(desc: Str) -> Str {
+    if desc == "P:Int" { return "int64_t" }
+    if desc == "P:Float" { return "double" }
+    if desc == "P:Bool" { return "int64_t" }
+    if desc == "P:Str" { return "const char*" }
+    if desc.starts_with("S:") {
+        let name = desc.slice(2, desc.len())
+        return c_type_c_name(name)
+    }
+    if desc.starts_with("L:") { return "blink_list*" }
+    if desc.starts_with("M:") { return "blink_map*" }
+    "int64_t"
+}
+
+pub fn queue_promote_type(desc: Str) {
+    if desc == "" { return }
+    if desc.starts_with("P:") { return }
+    if promote_emitted.contains_key(desc) { return }
+    promote_emitted.insert(desc, 1)
+    promote_types.push(desc)
+    if desc.starts_with("S:") {
+        let sname = desc.slice(2, desc.len())
+        let mut i = 0
+        while i < sf_entries.len() {
+            let sf = sf_entries.get(i).unwrap()
+            if sf.struct_name == sname {
+                queue_field_type(sf.field_type, sf.stype, sf.tp_id)
+            }
+            i = i + 1
+        }
+        return
+    }
+    if desc.starts_with("L:") {
+        let inner = desc.slice(2, desc.len())
+        queue_promote_type(inner)
+        return
+    }
+    if desc.starts_with("M:") {
+        let rest = desc.slice(2, desc.len())
+        let bar = rest.index_of("|")
+        if bar >= 0 {
+            let k = rest.slice(0, bar)
+            let v = rest.slice(bar + 1, rest.len())
+            queue_promote_type(k)
+            queue_promote_type(v)
+        }
+    }
+}
+
+fn queue_field_type(field_ct: Int, stype: Str, tp_id: Int) {
+    if field_ct == CT_STRUCT || (field_ct == CT_VOID && stype != "") {
+        if stype != "" { queue_promote_type("S:{stype}") }
+        return
+    }
+    if field_ct == CT_LIST {
+        let ek = if tp_id >= 0 { tp_child1_kind(tp_id) } else { -1 }
+        let es = if tp_id >= 0 { tp_child1_sname(tp_id) } else { "" }
+        let inner = ct_to_descriptor(ek, es)
+        queue_promote_type("L:{inner}")
+        return
+    }
+    if field_ct == CT_MAP {
+        let kk = if tp_id >= 0 { tp_child1_kind(tp_id) } else { -1 }
+        let ks = if tp_id >= 0 { tp_child1_sname(tp_id) } else { "" }
+        let vk = if tp_id >= 0 { tp_child2_kind(tp_id) } else { -1 }
+        let vs = if tp_id >= 0 { tp_child2_sname(tp_id) } else { "" }
+        let kd = ct_to_descriptor(kk, ks)
+        let vd = ct_to_descriptor(vk, vs)
+        queue_promote_type("M:{kd}|{vd}")
+    }
+}
+
+pub let mut promote_fwd_emitted: Int = 0
+
+@allow(UnrestoredMutation)
+pub fn emit_promote_forward_decls() ! Codegen.Emit {
+    let mut i = promote_fwd_emitted
+    while i < promote_types.len() {
+        let desc = promote_types.get(i).unwrap()
+        let mangle = descriptor_mangle(desc)
+        let cty = descriptor_c_type(desc)
+        emit_line("static {cty} blink_promote_{mangle}(blink_arena_t* target, {cty} src);")
+        i = i + 1
+    }
+    promote_fwd_emitted = promote_types.len()
+}
+
+
+pub fn emit_promote_fn_defs() ! Codegen.Emit {
+    let mut i = 0
+    while i < promote_types.len() {
+        let desc = promote_types.get(i).unwrap()
+        if desc.starts_with("S:") {
+            emit_promote_struct(desc)
+        } else if desc.starts_with("L:") {
+            emit_promote_list(desc)
+        } else if desc.starts_with("M:") {
+            emit_promote_map(desc)
+        }
+        i = i + 1
+    }
+}
+
+fn emit_promote_field_copy(access: Str, field_ct: Int, stype: Str, tp_id: Int, dst: Str) ! Codegen.Emit {
+    if field_ct == CT_STRING {
+        emit_line("{dst} = blink_promote_str(target, {access});")
+        return
+    }
+    if field_ct == CT_STRUCT || (field_ct == CT_VOID && stype != "") {
+        if stype != "" {
+            emit_line("{dst} = blink_promote_{stype}(target, {access});")
+            return
+        }
+        emit_line("{dst} = {access};")
+        return
+    }
+    if field_ct == CT_LIST {
+        let ek = if tp_id >= 0 { tp_child1_kind(tp_id) } else { -1 }
+        let es = if tp_id >= 0 { tp_child1_sname(tp_id) } else { "" }
+        let inner = ct_to_descriptor(ek, es)
+        let mangle = "List_{descriptor_mangle(inner)}"
+        emit_line("{dst} = blink_promote_{mangle}(target, {access});")
+        return
+    }
+    if field_ct == CT_MAP {
+        let kk = if tp_id >= 0 { tp_child1_kind(tp_id) } else { -1 }
+        let ks = if tp_id >= 0 { tp_child1_sname(tp_id) } else { "" }
+        let vk = if tp_id >= 0 { tp_child2_kind(tp_id) } else { -1 }
+        let vs = if tp_id >= 0 { tp_child2_sname(tp_id) } else { "" }
+        let kd = ct_to_descriptor(kk, ks)
+        let vd = ct_to_descriptor(vk, vs)
+        let mangle = "Map_{descriptor_mangle(kd)}_{descriptor_mangle(vd)}"
+        emit_line("{dst} = blink_promote_{mangle}(target, {access});")
+        return
+    }
+    emit_line("{dst} = {access};")
+}
+
+fn emit_promote_struct(desc: Str) ! Codegen.Emit {
+    let sname = desc.slice(2, desc.len())
+    let cty = c_type_c_name(sname)
+    emit_line("static {cty} blink_promote_{sname}(blink_arena_t* target, {cty} src) \{")
+    cg_indent = cg_indent + 1
+    emit_line("{cty} dst = src;")
+    let mut i = 0
+    while i < sf_entries.len() {
+        let sf = sf_entries.get(i).unwrap()
+        if sf.struct_name == sname {
+            emit_promote_field_copy("src.{sf.field_name}", sf.field_type, sf.stype, sf.tp_id, "dst.{sf.field_name}")
+        }
+        i = i + 1
+    }
+    emit_line("return dst;")
+    cg_indent = cg_indent - 1
+    emit_line("}")
+    emit_line("")
+}
+
+// Element-copy emission: source expression is read from blink_list_get / blink_map_get,
+// destination is pushed back into the new container. Returns the emitted C expression
+// that evaluates to the stored void* pointer for the promoted element.
+fn emit_promote_elem_into(src_expr: Str, ct: Int, desc: Str) -> Str ! Codegen.Emit {
+    if ct == CT_INT || ct == CT_BOOL {
+        return "(void*)(intptr_t){src_expr}"
+    }
+    if ct == CT_STRING {
+        return "(void*)blink_promote_str(target, (const char*){src_expr})"
+    }
+    if ct == CT_FLOAT {
+        let box = fresh_temp("_fbox_")
+        emit_line("double* {box} = (double*)blink_promote_alloc_atomic(target, sizeof(double));")
+        emit_line("*{box} = *(double*){src_expr};")
+        return "(void*){box}"
+    }
+    // Struct / nested list / nested map — descriptor chose the walker
+    let mangle = descriptor_mangle(desc)
+    if desc.starts_with("S:") {
+        let sname = desc.slice(2, desc.len())
+        let cty = c_type_c_name(sname)
+        let tmp = fresh_temp("_ps_")
+        emit_line("{cty}* {tmp} = ({cty}*)blink_promote_alloc(target, sizeof({cty}));")
+        emit_line("*{tmp} = blink_promote_{mangle}(target, *({cty}*){src_expr});")
+        return "(void*){tmp}"
+    }
+    // Nested collection: pointer stored directly
+    return "(void*)blink_promote_{mangle}(target, (void*){src_expr})"
+}
+
+pub fn inner_desc_of(desc: Str) -> Str {
+    if desc.starts_with("L:") { return desc.slice(2, desc.len()) }
+    ""
+}
+
+pub fn desc_primary_ct(desc: Str) -> Int {
+    if desc == "P:Int" { return CT_INT }
+    if desc == "P:Float" { return CT_FLOAT }
+    if desc == "P:Bool" { return CT_BOOL }
+    if desc == "P:Str" { return CT_STRING }
+    if desc.starts_with("S:") { return CT_STRUCT }
+    if desc.starts_with("L:") { return CT_LIST }
+    if desc.starts_with("M:") { return CT_MAP }
+    CT_VOID
+}
+
+fn emit_promote_list(desc: Str) ! Codegen.Emit {
+    let inner = inner_desc_of(desc)
+    let mangle = descriptor_mangle(desc)
+    emit_line("static blink_list* blink_promote_{mangle}(blink_arena_t* target, blink_list* src) \{")
+    cg_indent = cg_indent + 1
+    emit_line("if (src == NULL) return NULL;")
+    emit_line("blink_arena_t* __save = __blink_current_arena;")
+    emit_line("__blink_current_arena = target;")
+    emit_line("blink_list* dst = blink_list_new();")
+    emit_line("__blink_current_arena = __save;")
+    emit_line("int64_t _n = blink_list_len(src);")
+    emit_line("for (int64_t _i = 0; _i < _n; _i++) \{")
+    cg_indent = cg_indent + 1
+    let ct = desc_primary_ct(inner)
+    let stored = emit_promote_elem_into("blink_list_get(src, _i)", ct, inner)
+    emit_line("__blink_current_arena = target;")
+    emit_line("blink_list_push(dst, {stored});")
+    emit_line("__blink_current_arena = __save;")
+    cg_indent = cg_indent - 1
+    emit_line("}")
+    emit_line("return dst;")
+    cg_indent = cg_indent - 1
+    emit_line("}")
+    emit_line("")
+}
+
+fn emit_promote_map(desc: Str) ! Codegen.Emit {
+    let rest = desc.slice(2, desc.len())
+    let bar = rest.index_of("|")
+    let vd = rest.slice(bar + 1, rest.len())
+    let mangle = descriptor_mangle(desc)
+    emit_line("static blink_map* blink_promote_{mangle}(blink_arena_t* target, blink_map* src) \{")
+    cg_indent = cg_indent + 1
+    emit_line("if (src == NULL) return NULL;")
+    emit_line("blink_arena_t* __save = __blink_current_arena;")
+    emit_line("__blink_current_arena = target;")
+    emit_line("blink_map* dst = blink_map_new();")
+    emit_line("__blink_current_arena = __save;")
+    emit_line("for (int64_t _i = 0; _i < src->cap; _i++) \{")
+    cg_indent = cg_indent + 1
+    emit_line("if (src->states[_i] != 1) continue;")
+    emit_line("const char* _k = blink_promote_str(target, src->keys[_i]);")
+    let vct = desc_primary_ct(vd)
+    let stored = emit_promote_elem_into("src->values[_i]", vct, vd)
+    emit_line("__blink_current_arena = target;")
+    emit_line("blink_map_set(dst, _k, {stored});")
+    emit_line("__blink_current_arena = __save;")
+    cg_indent = cg_indent - 1
+    emit_line("}")
+    emit_line("return dst;")
     cg_indent = cg_indent - 1
     emit_line("}")
     emit_line("")

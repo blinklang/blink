@@ -26,7 +26,7 @@ import codegen_types.{
     get_fn_ret, get_fn_ret_struct, get_fn_ret_struct_inner, get_fn_ret_type,
     get_generic_fn_node, get_list_elem_struct, get_list_elem_type,
     get_list_nested_elem_struct, get_list_nested_elem_type,
-    get_map_value_type,
+    get_map_key_type, get_map_value_struct, get_map_value_type,
     get_struct_field_stype, get_struct_field_type, get_var_channel_inner,
     get_var_enum, get_var_handle_inner, get_var_handle_inner2,
     get_var_handler_is_ue, get_var_handler_vtable_field,
@@ -68,6 +68,7 @@ import codegen_expr.{
     expr_result_ok_struct, expr_result_ok_type, expr_result_str,
     expr_result_type
 }
+import codegen_derive.{ct_to_descriptor, desc_primary_ct, descriptor_c_type, descriptor_mangle, inner_desc_of, queue_promote_type}
 
 fn strip_outer_parens(s: Str) -> Str {
     if s.starts_with("(") && s.ends_with(")") {
@@ -2213,19 +2214,31 @@ fn emit_bh_setup(struct_name: Str, handler_str: Str, binding: Str, bh_state_vars
     bh_state_vars.push(st_var)
 }
 
+pub fn emit_with_block(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
+    emit_with_block_core(node, 0, "")
+}
+
+// Shared body emission for `with { … }` in both statement and expression form.
+// is_expr=1 requests capture-and-promote at the end: the body's tail expression
+// is copied into `result_sink` (a caller-allocated C variable) via the walker
+// for `result_desc`, after which the inner arena is torn down manually rather
+// than via the __attribute__((cleanup)) path. For is_expr=0 the arena handler
+// uses the RAII cleanup attribute as before.
 @allow(UnrestoredMutation, IncompleteStateRestore)
-fn emit_with_block(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
+fn emit_with_block_core(node: Int, is_expr: Int, result_sink: Str) -> Str ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
     let handlers_sl = node_handlers(node)
     let body = node_body(node)
     if handlers_sl == -1 {
         emit_block(body)
-        return
+        return ""
     }
     let count = sublist_length(handlers_sl)
     let mut resource_names: List[Str] = []
     let mut resource_vars: List[Str] = []
     let mut num_installed_fields = 0
     let mut bh_state_vars: List[Str] = []
+    let mut arena_tmp = ""
+    let mut arena_prev = ""
     emit_line("\{")
     cg_indent = cg_indent + 1
     let ev_copy = fresh_temp("__ev_with_")
@@ -2235,12 +2248,23 @@ fn emit_with_block(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
         let item = sublist_get(handlers_sl, i)
         let item_kind = node_kind(item)
         if item_kind == NodeKind.Ident && node_name(item) == "arena" {
-            emit_arena_restore_helper()
-            let ar_tmp = fresh_temp("__arena_")
-            let ar_st = fresh_temp("__arena_st_")
-            emit_line("blink_arena_t* {ar_tmp} = blink_arena_create(BLINK_ARENA_DEFAULT_CHUNK_SIZE);")
-            emit_line("__blink_arena_restore_t {ar_st} __attribute__((cleanup(__blink_arena_restore))) = \{ .prev = __blink_current_arena, .arena = {ar_tmp} };")
-            emit_line("__blink_current_arena = {ar_tmp};")
+            if is_expr != 0 {
+                // Manual arena lifecycle: defer destroy until after promotion.
+                let ar_tmp = fresh_temp("__arena_")
+                let ar_prev = fresh_temp("__arena_prev_")
+                emit_line("blink_arena_t* {ar_tmp} = blink_arena_create(BLINK_ARENA_DEFAULT_CHUNK_SIZE);")
+                emit_line("blink_arena_t* {ar_prev} = __blink_current_arena;")
+                emit_line("__blink_current_arena = {ar_tmp};")
+                arena_tmp = ar_tmp
+                arena_prev = ar_prev
+            } else {
+                emit_arena_restore_helper()
+                let ar_tmp = fresh_temp("__arena_")
+                let ar_st = fresh_temp("__arena_st_")
+                emit_line("blink_arena_t* {ar_tmp} = blink_arena_create(BLINK_ARENA_DEFAULT_CHUNK_SIZE);")
+                emit_line("__blink_arena_restore_t {ar_st} __attribute__((cleanup(__blink_arena_restore))) = \{ .prev = __blink_current_arena, .arena = {ar_tmp} };")
+                emit_line("__blink_current_arena = {ar_tmp};")
+            }
             i = i + 1
             continue
         }
@@ -2329,7 +2353,12 @@ fn emit_with_block(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
         emit_line("blink_ev* __ev = &{ev_copy};")
         cg_current_fn_has_ev = 1
     }
-    emit_block(body)
+    let mut actual_desc = ""
+    if is_expr != 0 {
+        actual_desc = emit_block_then_capture(body, result_sink, arena_prev)
+    } else {
+        emit_block(body)
+    }
     cg_current_fn_has_ev = saved_has_ev
     let mut bhi = 0
     while bhi < bh_state_vars.len() {
@@ -2345,9 +2374,170 @@ fn emit_with_block(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
         }
         rri = rri - 1
     }
+    if is_expr != 0 && arena_tmp != "" {
+        emit_line("__blink_current_arena = {arena_prev};")
+        emit_line("blink_arena_destroy({arena_tmp});")
+    }
     cg_indent = cg_indent - 1
     emit_line("}")
+    actual_desc
 }
+
+fn descriptor_from_expr_state() -> Str {
+    let ct = expr_result_type
+    if ct == CT_INT || ct == CT_FLOAT || ct == CT_BOOL || ct == CT_STRING {
+        return ct_to_descriptor(ct, "")
+    }
+    if ct == CT_STRUCT || ct == CT_VOID {
+        let sname = get_var_struct(expr_result_str)
+        if sname != "" { return "S:{sname}" }
+        return ""
+    }
+    if ct == CT_LIST {
+        let et = if expr_list_elem_type >= 0 { expr_list_elem_type } else { get_list_elem_type(expr_result_str) }
+        let es = if expr_list_elem_struct != "" { expr_list_elem_struct } else { get_list_elem_struct(expr_result_str) }
+        return "L:{ct_to_descriptor(et, es)}"
+    }
+    if ct == CT_MAP {
+        let kt = if expr_map_key_type >= 0 { expr_map_key_type } else { get_map_key_type(expr_result_str) }
+        let vt = if expr_map_val_type >= 0 { expr_map_val_type } else { get_map_value_type(expr_result_str) }
+        let vs = get_map_value_struct(expr_result_str)
+        return "M:{ct_to_descriptor(kt, "")}|{ct_to_descriptor(vt, vs)}"
+    }
+    ""
+}
+
+// Emit the body of an expression-form `with { … }`: run leading statements,
+// evaluate the tail expression with the inner arena still active, then
+// promote into `result_sink`. Returns the promote descriptor actually used
+// so the caller can publish correct metadata.
+@allow(UnrestoredMutation, IncompleteStateRestore)
+fn emit_block_then_capture(block: Int, result_sink: Str, arena_prev: Str) -> Str ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
+    if block == -1 {
+        return ""
+    }
+    let stmts_sl = node_stmts(block)
+    if stmts_sl == -1 {
+        return ""
+    }
+    let count = sublist_length(stmts_sl)
+    if count == 0 {
+        return ""
+    }
+    let mut i = 0
+    while i < count - 1 {
+        emit_stmt(sublist_get(stmts_sl, i))
+        i = i + 1
+    }
+    let last = sublist_get(stmts_sl, count - 1)
+    let last_kind = node_kind(last)
+    let tail_node = if last_kind == NodeKind.ExprStmt { node_value(last) } else { last }
+    emit_expr(tail_node)
+    let tail_str = expr_result_str
+    let desc = descriptor_from_expr_state()
+    if result_sink != "" && desc != "" {
+        let target = if arena_prev != "" { arena_prev } else { "NULL" }
+        if desc == "P:Str" {
+            emit_line("{result_sink} = blink_promote_str({target}, {tail_str});")
+        } else if desc.starts_with("P:") {
+            emit_line("{result_sink} = {tail_str};")
+        } else {
+            let mangle = descriptor_mangle(desc)
+            queue_promote_type(desc)
+            emit_line("{result_sink} = blink_promote_{mangle}({target}, {tail_str});")
+        }
+    }
+    desc
+}
+
+@allow(UnrestoredMutation, IncompleteStateRestore)
+pub fn emit_with_block_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
+    let sink = fresh_temp("__with_result_")
+    // Buffer the body emission so we can discover the tail descriptor,
+    // then prepend a correctly-typed sink declaration.
+    let saved_lines = cg_lines
+    cg_lines = []
+    let desc = emit_with_block_core(node, 1, sink)
+    let body_lines = cg_lines
+    cg_lines = saved_lines
+    if desc == "" {
+        // Not promotion-eligible — emit as statement form and publish void.
+        let mut bi = 0
+        while bi < body_lines.len() {
+            cg_lines.push(body_lines.get(bi).unwrap())
+            bi = bi + 1
+        }
+        expr_result_str = "0"
+        expr_result_type = CT_VOID
+        return
+    }
+    emit_line("{descriptor_c_type(desc)} {sink};")
+    let mut bi = 0
+    while bi < body_lines.len() {
+        cg_lines.push(body_lines.get(bi).unwrap())
+        bi = bi + 1
+    }
+    expr_result_str = sink
+    publish_descriptor_as_var(sink, desc)
+}
+
+fn prim_desc_ct(desc: Str) -> Int {
+    let ct = desc_primary_ct(desc)
+    if ct == CT_BOOL { return CT_INT }
+    ct
+}
+
+@allow(UnrestoredMutation)
+fn publish_descriptor_as_var(sink: Str, desc: Str) ! Codegen.Register, Codegen.Scope {
+    let ct = desc_primary_ct(desc)
+    if ct == CT_INT || ct == CT_FLOAT || ct == CT_STRING {
+        expr_result_type = ct
+        return
+    }
+    if ct == CT_BOOL {
+        expr_result_type = CT_INT
+        return
+    }
+    if ct == CT_STRUCT {
+        expr_result_type = CT_VOID
+        set_var(sink, CT_VOID, 1)
+        set_var_struct(sink, desc.slice(2, desc.len()))
+        return
+    }
+    if ct == CT_LIST {
+        expr_result_type = CT_LIST
+        set_var(sink, CT_LIST, 1)
+        let inner = inner_desc_of(desc)
+        let et = prim_desc_ct(inner)
+        expr_list_elem_type = et
+        set_list_elem_type(sink, et)
+        if inner.starts_with("S:") {
+            let sn = inner.slice(2, inner.len())
+            expr_list_elem_struct = sn
+            set_list_elem_struct(sink, sn)
+        }
+        return
+    }
+    if ct == CT_MAP {
+        expr_result_type = CT_MAP
+        set_var(sink, CT_MAP, 1)
+        let rest = desc.slice(2, desc.len())
+        let bar = rest.index_of("|")
+        let k = rest.slice(0, bar)
+        let v = rest.slice(bar + 1, rest.len())
+        let kt = prim_desc_ct(k)
+        let vt = prim_desc_ct(v)
+        let mut vs: Str = ""
+        if v.starts_with("S:") { vs = v.slice(2, v.len()) }
+        expr_map_key_type = kt
+        expr_map_val_type = vt
+        set_map_types(sink, kt, vt, vs)
+        if vs != "" { set_map_value_struct(sink, vs) }
+        return
+    }
+    expr_result_type = CT_VOID
+}
+
 
 // ── Function codegen ────────────────────────────────────────────────
 
