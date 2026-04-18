@@ -4,6 +4,7 @@ import parser.{
     node_then_body, node_else_body, node_scrutinee, node_guard, node_value,
     node_target, node_iterable, node_obj, node_method, node_params, node_args,
     node_stmts, node_arms, node_fields, node_elements, node_handlers,
+    node_type_name,
     sublist_get, sublist_length,
 }
 import diagnostics.{
@@ -43,6 +44,125 @@ fn record_promote(node_id: Int, type_name: Str) {
     }
     ea_promote_nodes.push(node_id)
     ea_promote_types.push(type_name)
+}
+
+// E0701 cycle detection: when a struct type is required for arena promotion,
+// walk its transitive struct-typed fields with a visited set. A cycle means
+// the per-type blink_promote_<T> walker would recurse forever, so reject.
+//
+// We build our own lightweight struct -> [field-struct-names] map by
+// scanning the program's TypeDef nodes at the start of analyze_escapes.
+// codegen_types.sf_entries is only populated during codegen (runs later).
+let mut ea_struct_fields: Map[Str, List[Str]] = Map()
+let mut ea_known_structs: Map[Str, Int] = Map()
+let mut ea_cycle_cache: Map[Str, Int] = Map()
+let mut ea_cycle_reported: Map[Str, Int] = Map()
+
+fn collect_type_names_from_ann(ann: Int, out: List[Str]) {
+    if ann == -1 { return }
+    let n = node_name(ann)
+    if n != "" { out.push(n) }
+    let elems = node_elements(ann)
+    if elems != -1 {
+        let mut i = 0
+        while i < sublist_length(elems) {
+            collect_type_names_from_ann(sublist_get(elems, i), out)
+            i = i + 1
+        }
+    }
+}
+
+fn ea_scan_program_structs(program: Int) {
+    ea_struct_fields = Map()
+    ea_known_structs = Map()
+    let types_sl = node_fields(program)
+    if types_sl == -1 { return }
+    let mut i = 0
+    while i < sublist_length(types_sl) {
+        let top = sublist_get(types_sl, i)
+        if node_kind(top) == NodeKind.TypeDef {
+            let sname = node_name(top)
+            let flds = node_fields(top)
+            if sname != "" && flds != -1 {
+                ea_known_structs.insert(sname, 1)
+                let mut refs: List[Str] = []
+                let mut fi = 0
+                while fi < sublist_length(flds) {
+                    let f = sublist_get(flds, fi)
+                    if node_kind(f) == NodeKind.TypeField {
+                        collect_type_names_from_ann(node_value(f), refs)
+                    }
+                    fi = fi + 1
+                }
+                ea_struct_fields.insert(sname, refs)
+            }
+        }
+        i = i + 1
+    }
+}
+
+fn is_struct_type_name(name: Str) -> Int {
+    if ea_known_structs.contains_key(name) { 1 } else { 0 }
+}
+
+fn struct_has_cycle_walk(name: Str, visiting: List[Str]) -> Int {
+    let mut vi = 0
+    while vi < visiting.len() {
+        if visiting.get(vi).unwrap() == name { return 1 }
+        vi = vi + 1
+    }
+    if ea_cycle_cache.contains_key(name) {
+        return ea_cycle_cache.get(name).unwrap()
+    }
+    let mut next_visiting: List[Str] = []
+    let mut ci = 0
+    while ci < visiting.len() {
+        next_visiting.push(visiting.get(ci).unwrap())
+        ci = ci + 1
+    }
+    next_visiting.push(name)
+    if ea_struct_fields.contains_key(name) {
+        let refs = ea_struct_fields.get(name).unwrap()
+        let mut ri = 0
+        while ri < refs.len() {
+            let r = refs.get(ri).unwrap()
+            if is_struct_type_name(r) != 0 {
+                if struct_has_cycle_walk(r, next_visiting) != 0 {
+                    return 1
+                }
+            }
+            ri = ri + 1
+        }
+    }
+    ea_cycle_cache.insert(name, 0)
+    0
+}
+
+fn struct_has_cycle(name: Str) -> Int {
+    if ea_cycle_cache.contains_key(name) {
+        return ea_cycle_cache.get(name).unwrap()
+    }
+    let empty: List[Str] = []
+    struct_has_cycle_walk(name, empty)
+}
+
+@allow(UnrestoredMutation, IncompleteStateRestore)
+fn check_promote_cycle(node: Int, type_name: Str) ! Diag.Report {
+    if type_name == "" { return }
+    if type_name == "List" || type_name == "Tuple" || type_name == "Str" { return }
+    if is_struct_type_name(type_name) == 0 { return }
+    if struct_has_cycle(type_name) == 0 { return }
+    if ea_cycle_reported.contains_key(type_name) { return }
+    ea_cycle_reported.insert(type_name, 1)
+    let saved = diag_source_file
+    diag_source_file = diag_file_for_node(node)
+    diag_error_at(
+        "ArenaTypeContainsCycle", "E0701",
+        "type '{type_name}' contains a cyclic reference; arena promotion cannot walk cyclic structures",
+        node,
+        "allocate this value outside the 'with arena \{ }' block, or break the cycle"
+    )
+    diag_source_file = saved
 }
 
 let mut ea_safe_intrinsics: Map[Str, Int] = Map()
@@ -119,7 +239,7 @@ fn is_alloc_expr(kind: Int) -> Int {
 fn infer_alloc_type(node: Int) -> Str {
     let k = node_kind(node)
     if k == NodeKind.StructLit {
-        let n = node_name(node)
+        let n = node_type_name(node)
         if n != "" { return n }
         return "?"
     }
@@ -354,7 +474,9 @@ fn walk_expr(node: Int, tail_flag: Int) ! Diag.Report {
     if ea_in_arena() != 0 {
         if is_alloc_expr(kind) != 0 {
             if tail_flag != 0 {
-                record_promote(node, infer_alloc_type(node))
+                let tname = infer_alloc_type(node)
+                record_promote(node, tname)
+                check_promote_cycle(node, tname)
             }
         }
     }
@@ -720,6 +842,9 @@ pub fn analyze_escapes(program: Int) ! Diag.Report {
     ea_promote_nodes = []
     ea_promote_types = []
     ea_frames = []
+    ea_cycle_cache = Map()
+    ea_cycle_reported = Map()
+    ea_scan_program_structs(program)
 
     let fns_sl = node_params(program)
     if fns_sl == -1 { return }

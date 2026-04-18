@@ -133,6 +133,31 @@ BLINK_UNUSED static char* blink_strdup(const char* s) {
     return p;
 }
 
+/* Promotion allocation: target==NULL means GC heap; else allocate in target
+   arena. Bypasses __blink_current_arena because during promotion the TLS may
+   still reference the inner (dying) arena. */
+BLINK_UNUSED static void* blink_promote_alloc(blink_arena_t* target, int64_t size) {
+    if (target != NULL) return blink_arena_alloc(target, size);
+    void* p = GC_MALLOC((size_t)size);
+    if (!p) { fprintf(stderr, "blink: out of memory\n"); exit(1); }
+    return p;
+}
+
+BLINK_UNUSED static void* blink_promote_alloc_atomic(blink_arena_t* target, int64_t size) {
+    if (target != NULL) return blink_arena_alloc(target, size);
+    void* p = GC_MALLOC_ATOMIC((size_t)size);
+    if (!p) { fprintf(stderr, "blink: out of memory\n"); exit(1); }
+    return p;
+}
+
+BLINK_UNUSED static const char* blink_promote_str(blink_arena_t* target, const char* s) {
+    if (!s) return NULL;
+    size_t len = strlen(s) + 1;
+    char* p = (char*)blink_promote_alloc_atomic(target, (int64_t)len);
+    memcpy(p, s, len);
+    return p;
+}
+
 typedef struct {
     void** items;
     int64_t len;
