@@ -1,3 +1,5 @@
+type PromPoint { x: Int; y: Int }
+
 fn expect_compile_error(src: Str, tag: Str, error_code: Str) {
     write_file(".tmp/_test_{tag}.bl", src)
     let args = [".tmp/_test_{tag}.bl", "/dev/null", "--format", "json"]
@@ -7,12 +9,90 @@ fn expect_compile_error(src: Str, tag: Str, error_code: Str) {
     shell_exec("rm -f .tmp/_test_{tag}.bl")
 }
 
-test "closure literal as with-arena tail emits E0702" {
-    let src = "fn main() \{\n    let f = with arena \{\n        fn(x: Int) -> Int \{ x + 1 }\n    }\n    let _ = f\n}\n"
-    expect_compile_error(src, "with_arena_closure_literal", "E0702")
+test "closure literal tail, no captures — promotes out of inner arena" {
+    let g = with arena {
+        fn(x: Int) -> Int { x + 1 }
+    }
+    assert(g(41) == 42)
+    assert(g(-1) == 0)
 }
 
-test "closure-typed variable as with-arena tail emits E0702" {
-    let src = "fn main() \{\n    let g = with arena \{\n        let h = fn(x: Int) -> Int \{ x * 2 }\n        h\n    }\n    let _ = g\n}\n"
-    expect_compile_error(src, "with_arena_closure_var", "E0702")
+test "closure literal tail with Int capture — promotes immutable value" {
+    let n = 10
+    let g = with arena {
+        fn(x: Int) -> Int { x + n }
+    }
+    assert(g(5) == 15)
+    assert(g(100) == 110)
+}
+
+test "closure literal tail with Str capture — uses blink_promote_str" {
+    let prefix = "hello-"
+    let g = with arena {
+        fn(x: Int) -> Int { prefix.len() + x }
+    }
+    assert(g(4) == 10)
+    assert(g(0) == 6)
+}
+
+test "closure literal tail with Float capture — uses promote_alloc_atomic" {
+    let f = 2.5
+    let g = with arena {
+        fn(x: Float) -> Float { x + f }
+    }
+    let r = g(1.5)
+    assert(r > 3.99 && r < 4.01)
+}
+
+test "closure literal tail with Struct capture — copies struct into target arena" {
+    let p = PromPoint { x: 10, y: 20 }
+    let g = with arena {
+        fn(d: Int) -> Int { p.x + p.y + d }
+    }
+    assert(g(5) == 35)
+    assert(g(-30) == 0)
+}
+
+test "let-alias tail resolves to the literal bound in this block" {
+    let g = with arena {
+        let h = fn(x: Int) -> Int { x * 2 }
+        h
+    }
+    assert(g(7) == 14)
+    assert(g(0) == 0)
+}
+
+test "lifetime regression: captures survive inner arena destruction + GC pressure" {
+    let n = 42
+    let g = with arena {
+        fn(x: Int) -> Int { x + n }
+    }
+    // Force GC pressure after the inner arena is gone. If `n` was not
+    // promoted out of the inner arena, bdwgc would reuse the freed region
+    // and the capture would read corrupted memory.
+    let mut sum = 0
+    let mut pressure: List[Int] = []
+    let mut j = 0
+    while j < 5000 {
+        pressure.push(j * 3)
+        sum = sum + g(j)
+        j = j + 1
+    }
+    // sum(0..4999) + 5000*42 = 12497500 + 210000 = 12707500
+    assert(sum == 12707500)
+}
+
+test "residual: tail from a function call emits E0702a" {
+    let src = "fn make() -> fn(Int) -> Int \{ fn(x: Int) -> Int \{ x + 1 } }\nfn main() \{\n    let g = with arena \{ make() }\n    let _ = g\n}\n"
+    expect_compile_error(src, "with_arena_call_origin", "E0702a")
+}
+
+test "residual: tail closure with mutable capture emits E0702b" {
+    let src = "fn main() \{\n    let mut c = 0\n    let g = with arena \{\n        fn() -> Int \{ c = c + 1; c }\n    }\n    let _ = g\n}\n"
+    expect_compile_error(src, "with_arena_mut_cap", "E0702b")
+}
+
+test "residual: tail closure capturing another closure emits E0702c" {
+    let src = "fn main() \{\n    let inner = fn(x: Int) -> Int \{ x * 2 }\n    let g = with arena \{\n        fn(x: Int) -> Int \{ inner(x) + 1 }\n    }\n    let _ = g\n}\n"
+    expect_compile_error(src, "with_arena_nested", "E0702c")
 }

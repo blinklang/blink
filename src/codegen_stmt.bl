@@ -30,7 +30,7 @@ import codegen_types.{
     get_struct_field_stype, get_struct_field_type, get_var_channel_inner,
     get_var_enum, get_var_handle_inner, get_var_handle_inner2,
     get_var_handler_is_ue, get_var_handler_vtable_field,
-    get_var_handler_vtable_type,
+    get_var_closure_sig, get_var_handler_vtable_type,
     get_var_handle_sname, get_var_handle_sname2, get_var_iter_next_fn,
     get_var_iterator_inner, get_var_option_inner, get_var_option_inner_struct,
     get_var_result_err, get_var_result_err_struct, get_var_result_ok,
@@ -56,8 +56,11 @@ import codegen_types.{
     set_var_struct, sf_closure_sigs, sf_entries,
     struct_field_defaults, struct_invariants, struct_option_c_type,
     struct_reg_names, struct_reg_set, struct_result_c_type, sv_tp, tp_from_ann,
-    split_result_compound, tp_child1_kind, tp_child2_kind, type_from_name, type_from_name_tag,
-    type_name_from_ct, is_compound_tag, var_enums
+    split_result_compound, tp_child1_kind, tp_child1_sname, tp_child2_kind, tp_child2_sname,
+    tp_get_kind, tp_get_sname, type_from_name, type_from_name_tag,
+    type_name_from_ct, is_compound_tag, var_enums,
+    CaptureEntry, ClosureCapInfo,
+    closure_captures, closure_cap_infos, lookup_closure_lit_cap_idx
 }
 import codegen_expr.{
     emit_expr, expr_closure_sig, expr_list_elem_struct, expr_list_elem_type,
@@ -68,7 +71,7 @@ import codegen_expr.{
     expr_result_ok_struct, expr_result_ok_type, expr_result_str,
     expr_result_type
 }
-import codegen_derive.{ct_to_descriptor, desc_primary_ct, descriptor_c_type, descriptor_mangle, inner_desc_of, queue_promote_type}
+import codegen_derive.{ct_to_descriptor, desc_primary_ct, descriptor_c_type, descriptor_mangle, emit_promote_elem_into, inner_desc_of, queue_promote_type}
 import diagnostics.{Diag, diag_error_at, diag_file_for_node}
 
 fn strip_outer_parens(s: Str) -> Str {
@@ -2408,6 +2411,117 @@ fn descriptor_from_expr_state() -> Str {
     ""
 }
 
+// Returns "" for unsupported kinds (caller maps to an E0702 variant).
+fn descriptor_from_capture(entry: CaptureEntry) -> Str {
+    let k = tp_get_kind(entry.tp_id)
+    if k == CT_INT { return "P:Int" }
+    if k == CT_BOOL { return "P:Bool" }
+    if k == CT_FLOAT { return "P:Float" }
+    if k == CT_STRING { return "P:Str" }
+    if k == CT_STRUCT {
+        let sn = tp_get_sname(entry.tp_id)
+        if sn != "" { return "S:{sn}" }
+        return ""
+    }
+    if k == CT_LIST {
+        let ek = tp_child1_kind(entry.tp_id)
+        let es = tp_child1_sname(entry.tp_id)
+        return "L:{ct_to_descriptor(ek, es)}"
+    }
+    if k == CT_MAP {
+        let vk = tp_child2_kind(entry.tp_id)
+        let vs = tp_child2_sname(entry.tp_id)
+        return "M:P:Str|{ct_to_descriptor(vk, vs)}"
+    }
+    ""
+}
+
+// `closure_src` must be a C expression of type `blink_closure*` pointing at
+// the inner-arena closure. Returns 1 on success, 0 if a carve-out E0702*
+// diagnostic was reported instead.
+@allow(UnrestoredMutation)
+fn emit_closure_tail_promotion(
+    closure_src: Str,
+    cap_idx: Int,
+    tail_node: Int,
+    result_sink: Str,
+    arena_prev: Str,
+) -> Int ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
+    let info = closure_cap_infos.get(cap_idx).unwrap()
+    let target = if arena_prev != "" { arena_prev } else { "NULL" }
+
+    let mut ci = 0
+    while ci < info.count {
+        let e = closure_captures.get(info.start + ci).unwrap()
+        if e.is_mut != 0 {
+            diag_error_at(
+                "ArenaClosureMutCapture", "E0702b",
+                "cannot promote closure tail of 'with arena \{ expr }': mutable capture promotion is not yet implemented",
+                tail_node,
+                "make the captured binding immutable, or construct the closure outside the 'with arena \{ }' block"
+            )
+            return 0
+        }
+        let k = tp_get_kind(e.tp_id)
+        if k == CT_CLOSURE {
+            diag_error_at(
+                "ArenaClosureNestedCapture", "E0702c",
+                "cannot promote closure tail of 'with arena \{ expr }': nested closure captures are not yet implemented",
+                tail_node,
+                "refactor to avoid capturing another closure, or construct the outer closure outside the 'with arena \{ }' block"
+            )
+            return 0
+        }
+        if descriptor_from_capture(e) == "" {
+            diag_error_at(
+                "ArenaClosureUnsupportedCapture", "E0702d",
+                "cannot promote closure tail of 'with arena \{ expr }': capture of unsupported kind",
+                tail_node,
+                "construct the closure outside the 'with arena \{ }' block"
+            )
+            return 0
+        }
+        ci = ci + 1
+    }
+
+    // Bind closure_src to a temp — it may be an rvalue (e.g. blink_closure_new(...))
+    // and we reference it repeatedly below.
+    let src_tmp = fresh_temp("__acl_src_")
+    emit_line("blink_closure* {src_tmp} = {closure_src};")
+
+    if info.count == 0 {
+        emit_line("{result_sink} = blink_closure_new({src_tmp}->fn_ptr, NULL, 0);")
+        return 1
+    }
+
+    let p_caps = fresh_temp("__acl_caps_")
+    emit_line("void** {p_caps} = (void**)blink_promote_alloc({target}, sizeof(void*) * {info.count});")
+    emit_line("\{")
+    cg_indent = cg_indent + 1
+    // emit_promote_elem_into's struct/list/map walkers reference a local
+    // `target` identifier, mirroring the @derive promote functions they inline.
+    emit_line("blink_arena_t* target = {target};")
+    emit_line("blink_arena_t* __acl_save = __blink_current_arena;")
+    emit_line("__blink_current_arena = target;")
+    let mut i = 0
+    while i < info.count {
+        let e = closure_captures.get(info.start + i).unwrap()
+        let desc = descriptor_from_capture(e)
+        let ct = desc_primary_ct(desc)
+        if ct == CT_STRUCT || ct == CT_LIST || ct == CT_MAP {
+            queue_promote_type(desc)
+        }
+        let stored = emit_promote_elem_into("{src_tmp}->captures[{i}]", ct, desc)
+        emit_line("{p_caps}[{i}] = {stored};")
+        i = i + 1
+    }
+    emit_line("{result_sink} = blink_closure_new({src_tmp}->fn_ptr, {p_caps}, {info.count});")
+    emit_line("__blink_current_arena = __acl_save;")
+    cg_indent = cg_indent - 1
+    emit_line("}")
+    1
+}
+
 // Emit the body of an expression-form `with { … }`: run leading statements,
 // evaluate the tail expression with the inner arena still active, then
 // promote into `result_sink`. Returns the promote descriptor actually used
@@ -2425,9 +2539,21 @@ fn emit_block_then_capture(block: Int, result_sink: Str, arena_prev: Str) -> Str
     if count == 0 {
         return ""
     }
+    // Block-local `let x = <ClosureLit>` aliases let a tail Ident resolve to
+    // its originating literal for the cap-info lookup below.
+    let mut let_alias_names: List[Str] = []
+    let mut let_alias_nodes: List[Int] = []
     let mut i = 0
     while i < count - 1 {
-        emit_stmt(sublist_get(stmts_sl, i))
+        let stmt = sublist_get(stmts_sl, i)
+        if node_kind(stmt) == NodeKind.LetBinding {
+            let init = node_value(stmt)
+            if init != -1 && node_kind(init) == NodeKind.Closure {
+                let_alias_names.push(node_name(stmt))
+                let_alias_nodes.push(init)
+            }
+        }
+        emit_stmt(stmt)
         i = i + 1
     }
     let last = sublist_get(stmts_sl, count - 1)
@@ -2436,12 +2562,44 @@ fn emit_block_then_capture(block: Int, result_sink: Str, arena_prev: Str) -> Str
     emit_expr(tail_node)
     let tail_str = expr_result_str
     if expr_result_type == CT_CLOSURE {
-        diag_error_at(
-            "ArenaClosureTailUnsupported", "E0702",
-            "tail of 'with arena \{ expr }' evaluates to a closure; promoting closures out of an inner arena is not yet supported",
-            tail_node,
-            "construct the closure outside the 'with arena \{ }' block, or return a non-closure value"
-        )
+        let mut lit_node = -1
+        let tk = node_kind(tail_node)
+        if tk == NodeKind.Closure {
+            lit_node = tail_node
+        } else if tk == NodeKind.Ident {
+            let tname = node_name(tail_node)
+            let mut ai = 0
+            while ai < let_alias_names.len() {
+                if let_alias_names.get(ai).unwrap() == tname {
+                    lit_node = let_alias_nodes.get(ai).unwrap()
+                }
+                ai = ai + 1
+            }
+            // Ident lookup doesn't populate expr_closure_sig; fetch it from the
+            // var table so the outer let binding can record the right call sig.
+            let sig_from_var = get_var_closure_sig(tname)
+            if sig_from_var != "" {
+                expr_closure_sig = sig_from_var
+            }
+        }
+        let cap_idx = if lit_node == -1 { -1 } else { lookup_closure_lit_cap_idx(lit_node) }
+        if cap_idx == -1 {
+            diag_error_at(
+                "ArenaClosureTailNonLiteral", "E0702a",
+                "cannot promote closure tail of 'with arena \{ expr }' whose origin is not a closure literal bound in this block",
+                tail_node,
+                "construct the closure outside the 'with arena \{ }' block, or bind it via `let <name> = fn(…) \{ … }` immediately inside this block"
+            )
+            return ""
+        }
+        if result_sink == "" {
+            return ""
+        }
+        let ok = emit_closure_tail_promotion(tail_str, cap_idx, tail_node, result_sink, arena_prev)
+        if ok == 0 {
+            return ""
+        }
+        return "C:Closure"
     }
     let desc = descriptor_from_expr_state()
     if result_sink != "" && desc != "" {
@@ -2505,6 +2663,14 @@ fn publish_descriptor_as_var(sink: Str, desc: Str) ! Codegen.Register, Codegen.S
     }
     if ct == CT_BOOL {
         expr_result_type = CT_INT
+        return
+    }
+    if ct == CT_CLOSURE {
+        expr_result_type = CT_CLOSURE
+        set_var(sink, CT_CLOSURE, 0)
+        if expr_closure_sig != "" {
+            set_var_closure(sink, expr_closure_sig)
+        }
         return
     }
     if ct == CT_STRUCT {
