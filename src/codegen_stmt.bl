@@ -2454,25 +2454,6 @@ fn emit_closure_tail_promotion(
     let mut ci = 0
     while ci < info.count {
         let e = closure_captures.get(info.start + ci).unwrap()
-        if e.is_mut != 0 {
-            let mut declared_in_block = 0
-            let mut bi = 0
-            while bi < block_local_muts.len() {
-                if block_local_muts.get(bi).unwrap() == e.name {
-                    declared_in_block = 1
-                }
-                bi = bi + 1
-            }
-            if declared_in_block == 0 {
-                diag_error_at(
-                    "ArenaClosureMutCaptureAliased", "E0702b-aliased",
-                    "cannot promote closure tail of 'with arena \{ expr }': mutable capture `{e.name}` is declared outside the block and may be referenced after the block ends",
-                    tail_node,
-                    "move the `let mut {e.name}` declaration inside the 'with arena \{ }' block, or use an immutable capture"
-                )
-                return 0
-            }
-        }
         let k = tp_get_kind(e.tp_id)
         if k == CT_CLOSURE {
             diag_error_at(
@@ -2523,20 +2504,35 @@ fn emit_closure_tail_promotion(
             queue_promote_type(desc)
         }
         if e.is_mut != 0 {
-            let cell_c = if ct == CT_STRUCT { c_type_c_name(tp_get_sname(e.tp_id)) } else { c_type_str(ct) }
-            let src_cell = fresh_temp("__acl_sc_")
-            let new_cell = fresh_temp("__acl_nc_")
-            emit_line("{cell_c}* {src_cell} = ({cell_c}*){src_tmp}->captures[{i}];")
-            emit_line("{cell_c}* {new_cell} = ({cell_c}*)blink_promote_alloc(target, sizeof({cell_c}));")
-            if ct == CT_INT || ct == CT_BOOL || ct == CT_FLOAT {
-                emit_line("*{new_cell} = *{src_cell};")
-            } else if ct == CT_STRING {
-                emit_line("*{new_cell} = blink_promote_str(target, *{src_cell});")
-            } else {
-                let mangle = descriptor_mangle(desc)
-                emit_line("*{new_cell} = blink_promote_{mangle}(target, *{src_cell});")
+            let mut declared_in_block = 0
+            let mut bi = 0
+            while bi < block_local_muts.len() {
+                if block_local_muts.get(bi).unwrap() == e.name {
+                    declared_in_block = 1
+                }
+                bi = bi + 1
             }
-            emit_line("{p_caps}[{i}] = (void*){new_cell};")
+            if declared_in_block != 0 {
+                let cell_c = if ct == CT_STRUCT { c_type_c_name(tp_get_sname(e.tp_id)) } else { c_type_str(ct) }
+                let src_cell = fresh_temp("__acl_sc_")
+                let new_cell = fresh_temp("__acl_nc_")
+                emit_line("{cell_c}* {src_cell} = ({cell_c}*){src_tmp}->captures[{i}];")
+                emit_line("{cell_c}* {new_cell} = ({cell_c}*)blink_promote_alloc(target, sizeof({cell_c}));")
+                if ct == CT_INT || ct == CT_BOOL || ct == CT_FLOAT {
+                    emit_line("*{new_cell} = *{src_cell};")
+                } else if ct == CT_STRING {
+                    emit_line("*{new_cell} = blink_promote_str(target, *{src_cell});")
+                } else {
+                    let mangle = descriptor_mangle(desc)
+                    emit_line("*{new_cell} = blink_promote_{mangle}(target, *{src_cell});")
+                }
+                emit_line("{p_caps}[{i}] = (void*){new_cell};")
+            } else {
+                // Outside-block mut: cell lives on GC heap (blink_alloc ran before
+                // the inner arena was active), so alias the same pointer — spec
+                // §2.8 shared-cell semantics between closure and outer scope.
+                emit_line("{p_caps}[{i}] = {src_tmp}->captures[{i}];")
+            }
         } else {
             let stored = emit_promote_elem_into("{src_tmp}->captures[{i}]", ct, desc)
             emit_line("{p_caps}[{i}] = {stored};")
