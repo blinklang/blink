@@ -31,14 +31,18 @@
 #define BLINK_ARENA_DEFAULT_CHUNK_SIZE ((int64_t)(64 * 1024))
 #define BLINK_ARENA_ALIGN ((int64_t)16)
 
+/* The header must be GC-scanned (GC_MALLOC) so bdwgc follows `next` and
+   `data` during mark. Packing header+payload into one GC_MALLOC_ATOMIC
+   allocation — as the original layout did — hides the intra-chunk `next`
+   pointer from the scanner, and any collection that fires mid-arena reclaims
+   non-head chunks behind the arena's back. Teardown then GC_FREEs
+   already-freed large blocks (k6s1nc). The payload stays atomic so user
+   bytes don't falsely retain unrelated GC objects. */
 typedef struct blink_arena_chunk {
     struct blink_arena_chunk* next;
+    char* data;
     int64_t capacity;
     int64_t used;
-    /* _Alignas keeps data[] at a BLINK_ARENA_ALIGN boundary; without it the
-       24-byte header on 64-bit lands data[] at 8-aligned, violating the
-       per-allocation alignment contract used by blink_arena_alloc. */
-    _Alignas(16) char data[];
 } blink_arena_chunk;
 
 typedef struct blink_arena_t {
@@ -49,9 +53,17 @@ typedef struct blink_arena_t {
 static __thread blink_arena_t* __blink_current_arena = NULL;
 
 BLINK_UNUSED static blink_arena_chunk* blink_arena_chunk_new(int64_t capacity) {
-    blink_arena_chunk* c = (blink_arena_chunk*)GC_MALLOC_ATOMIC(sizeof(blink_arena_chunk) + (size_t)capacity);
+    blink_arena_chunk* c = (blink_arena_chunk*)GC_MALLOC(sizeof(blink_arena_chunk));
     if (!c) { fprintf(stderr, "blink: out of memory\n"); exit(1); }
+    /* Pad by BLINK_ARENA_ALIGN so we can re-align the payload start: bdwgc
+       guarantees granule alignment (8 on 32-bit, 16 on 64-bit), and callers
+       need a 16-byte boundary for their allocations. */
+    char* raw = (char*)GC_MALLOC_ATOMIC((size_t)capacity + BLINK_ARENA_ALIGN);
+    if (!raw) { fprintf(stderr, "blink: out of memory\n"); exit(1); }
+    uintptr_t aligned = ((uintptr_t)raw + BLINK_ARENA_ALIGN - 1)
+                        & ~(uintptr_t)(BLINK_ARENA_ALIGN - 1);
     c->next = NULL;
+    c->data = (char*)aligned;
     c->capacity = capacity;
     c->used = 0;
     return c;
@@ -70,6 +82,7 @@ BLINK_UNUSED static void blink_arena_destroy(blink_arena_t* a) {
     blink_arena_chunk* c = a->head;
     while (c) {
         blink_arena_chunk* next = c->next;
+        GC_FREE(c->data);
         GC_FREE(c);
         c = next;
     }
