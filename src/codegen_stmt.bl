@@ -2446,6 +2446,7 @@ fn emit_closure_tail_promotion(
     tail_node: Int,
     result_sink: Str,
     arena_prev: Str,
+    block_local_muts: List[Str],
 ) -> Int ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
     let info = closure_cap_infos.get(cap_idx).unwrap()
     let target = if arena_prev != "" { arena_prev } else { "NULL" }
@@ -2454,13 +2455,23 @@ fn emit_closure_tail_promotion(
     while ci < info.count {
         let e = closure_captures.get(info.start + ci).unwrap()
         if e.is_mut != 0 {
-            diag_error_at(
-                "ArenaClosureMutCapture", "E0702b",
-                "cannot promote closure tail of 'with arena \{ expr }': mutable capture promotion is not yet implemented",
-                tail_node,
-                "make the captured binding immutable, or construct the closure outside the 'with arena \{ }' block"
-            )
-            return 0
+            let mut declared_in_block = 0
+            let mut bi = 0
+            while bi < block_local_muts.len() {
+                if block_local_muts.get(bi).unwrap() == e.name {
+                    declared_in_block = 1
+                }
+                bi = bi + 1
+            }
+            if declared_in_block == 0 {
+                diag_error_at(
+                    "ArenaClosureMutCaptureAliased", "E0702b-aliased",
+                    "cannot promote closure tail of 'with arena \{ expr }': mutable capture `{e.name}` is declared outside the block and may be referenced after the block ends",
+                    tail_node,
+                    "move the `let mut {e.name}` declaration inside the 'with arena \{ }' block, or use an immutable capture"
+                )
+                return 0
+            }
         }
         let k = tp_get_kind(e.tp_id)
         if k == CT_CLOSURE {
@@ -2511,8 +2522,25 @@ fn emit_closure_tail_promotion(
         if ct == CT_STRUCT || ct == CT_LIST || ct == CT_MAP {
             queue_promote_type(desc)
         }
-        let stored = emit_promote_elem_into("{src_tmp}->captures[{i}]", ct, desc)
-        emit_line("{p_caps}[{i}] = {stored};")
+        if e.is_mut != 0 {
+            let cell_c = if ct == CT_STRUCT { c_type_c_name(tp_get_sname(e.tp_id)) } else { c_type_str(ct) }
+            let src_cell = fresh_temp("__acl_sc_")
+            let new_cell = fresh_temp("__acl_nc_")
+            emit_line("{cell_c}* {src_cell} = ({cell_c}*){src_tmp}->captures[{i}];")
+            emit_line("{cell_c}* {new_cell} = ({cell_c}*)blink_promote_alloc(target, sizeof({cell_c}));")
+            if ct == CT_INT || ct == CT_BOOL || ct == CT_FLOAT {
+                emit_line("*{new_cell} = *{src_cell};")
+            } else if ct == CT_STRING {
+                emit_line("*{new_cell} = blink_promote_str(target, *{src_cell});")
+            } else {
+                let mangle = descriptor_mangle(desc)
+                emit_line("*{new_cell} = blink_promote_{mangle}(target, *{src_cell});")
+            }
+            emit_line("{p_caps}[{i}] = (void*){new_cell};")
+        } else {
+            let stored = emit_promote_elem_into("{src_tmp}->captures[{i}]", ct, desc)
+            emit_line("{p_caps}[{i}] = {stored};")
+        }
         i = i + 1
     }
     emit_line("{result_sink} = blink_closure_new({src_tmp}->fn_ptr, {p_caps}, {info.count});")
@@ -2543,6 +2571,10 @@ fn emit_block_then_capture(block: Int, result_sink: Str, arena_prev: Str) -> Str
     // its originating literal for the cap-info lookup below.
     let mut let_alias_names: List[Str] = []
     let mut let_alias_nodes: List[Int] = []
+    // Names of `let mut` bindings introduced *inside* this block. Only these
+    // are safe to promote as closure-tail mut captures — an outside-block
+    // binding may still be referenced after the with-arena block ends.
+    let mut block_local_muts: List[Str] = []
     let mut i = 0
     while i < count - 1 {
         let stmt = sublist_get(stmts_sl, i)
@@ -2551,6 +2583,9 @@ fn emit_block_then_capture(block: Int, result_sink: Str, arena_prev: Str) -> Str
             if init != -1 && node_kind(init) == NodeKind.Closure {
                 let_alias_names.push(node_name(stmt))
                 let_alias_nodes.push(init)
+            }
+            if node_is_mut(stmt) != 0 {
+                block_local_muts.push(node_name(stmt))
             }
         }
         emit_stmt(stmt)
@@ -2595,7 +2630,7 @@ fn emit_block_then_capture(block: Int, result_sink: Str, arena_prev: Str) -> Str
         if result_sink == "" {
             return ""
         }
-        let ok = emit_closure_tail_promotion(tail_str, cap_idx, tail_node, result_sink, arena_prev)
+        let ok = emit_closure_tail_promotion(tail_str, cap_idx, tail_node, result_sink, arena_prev, block_local_muts)
         if ok == 0 {
             return ""
         }
