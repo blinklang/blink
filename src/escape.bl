@@ -4,11 +4,12 @@ import parser.{
     node_then_body, node_else_body, node_scrutinee, node_guard, node_value,
     node_target, node_iterable, node_obj, node_method, node_params, node_args,
     node_stmts, node_arms, node_fields, node_elements, node_handlers,
-    node_type_name,
+    node_type_name, node_effects,
     sublist_get, sublist_length,
 }
 import diagnostics.{
-    Diag, diag_error_at, diag_source_file, diag_file_for_node,
+    Diag, diag_error_at, diag_warn_at, diag_set_last_fix,
+    diag_source_file, diag_file_for_node,
     diag_push_allows, diag_clear_allows,
 }
 import typecheck.{tc_get_fn_effects}
@@ -177,15 +178,25 @@ fn init_safe_intrinsics() {
     ea_safe_intrinsics.insert("assert_ne", 1)
 }
 
-fn callee_is_safe(name: Str) -> Int {
-    if ea_safe_intrinsics.contains_key(name) { return 1 }
+fn callee_has_arena_effect(name: Str) -> Int {
     let effs = tc_get_fn_effects(name)
     if effs.is_some() {
-        let s = effs.unwrap()
-        if s.contains("Arena") { return 1 }
+        if effs.unwrap().contains("Arena") { return 1 }
     }
     0
 }
+
+fn callee_is_safe(name: Str) -> Int {
+    if ea_safe_intrinsics.contains_key(name) { return 1 }
+    callee_has_arena_effect(name)
+}
+
+// W0701 ArenaEffectRedundant: per-fn counters populated during walk_call.
+// If the enclosing fn declares `! Arena` and every Arena-effectful callsite
+// observed inside its body is lexically nested in a `with arena { }` frame,
+// the outer `! Arena` marker is redundant.
+let mut ea_fn_arena_calls_total: Int = 0
+let mut ea_fn_arena_calls_in_with: Int = 0
 
 // Arena frame scope stack: each frame owns the names allocated inside its
 // `with arena { }` block. Popping a frame drops its names.
@@ -399,6 +410,14 @@ fn walk_call(node: Int) ! Diag.Report {
         }
     }
     let args_sl = node_args(node)
+    if callee_name != "" {
+        if callee_has_arena_effect(callee_name) != 0 {
+            ea_fn_arena_calls_total = ea_fn_arena_calls_total + 1
+            if ea_in_arena() != 0 {
+                ea_fn_arena_calls_in_with = ea_fn_arena_calls_in_with + 1
+            }
+        }
+    }
     if ea_in_arena() != 0 {
         if args_sl != -1 {
             if callee_name != "" {
@@ -833,12 +852,45 @@ fn analyze_fn(fn_node: Int) ! Diag.Report {
     diag_source_file = diag_file_for_node(fn_node)
     diag_push_allows(fn_node)
     ea_frames = []
+    ea_fn_arena_calls_total = 0
+    ea_fn_arena_calls_in_with = 0
     let body = node_body(fn_node)
     if body != -1 {
         walk_expr(body, 0)
     }
+    check_redundant_arena_effect(fn_node)
     diag_clear_allows()
     diag_source_file = saved_source
+}
+
+// Locate the `! Arena` marker node inside a fn signature's effects sublist,
+// returning its node id (for diagnostic location) or -1 if not declared.
+fn find_arena_effect_node(fn_node: Int) -> Int {
+    let effs_sl = node_effects(fn_node)
+    if effs_sl == -1 { return -1 }
+    let mut i = 0
+    while i < sublist_length(effs_sl) {
+        let eff = sublist_get(effs_sl, i)
+        if node_name(eff) == "Arena" { return eff }
+        i = i + 1
+    }
+    -1
+}
+
+@allow(UnrestoredMutation, IncompleteStateRestore)
+fn check_redundant_arena_effect(fn_node: Int) ! Diag.Report {
+    let arena_eff = find_arena_effect_node(fn_node)
+    if arena_eff == -1 { return }
+    if ea_fn_arena_calls_total == 0 { return }
+    if ea_fn_arena_calls_in_with != ea_fn_arena_calls_total { return }
+    let fname = node_name(fn_node)
+    diag_warn_at(
+        "ArenaEffectRedundant", "W0701",
+        "function '{fname}' declares '! Arena' but every Arena-effectful call is already contained inside 'with arena \{ }' — the marker is redundant",
+        arena_eff,
+        "remove '! Arena' from the signature of '{fname}'"
+    )
+    diag_set_last_fix("remove", "! Arena")
 }
 
 pub fn analyze_escapes(program: Int) ! Diag.Report {

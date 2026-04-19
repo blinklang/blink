@@ -1,0 +1,52 @@
+// W0701 ArenaEffectRedundant: if every `! Arena` callsite in a fn body is
+// contained inside `with arena { }`, the outer `! Arena` annotation is
+// redundant. A single bare call outside any `with arena { }` must silence
+// the lint.
+
+fn expect_compile_output(src: Str, tag: Str, needle: Str, should_contain: Int) {
+    write_file(".tmp/_test_{tag}.bl", src)
+    let args = [".tmp/_test_{tag}.bl", "/dev/null", "--format", "json"]
+    let result = process_run("build/blinkc", args)
+    let output = "{result.out}{result.err_out}"
+    if should_contain == 1 {
+        assert(output.contains(needle))
+    } else {
+        assert(!output.contains(needle))
+    }
+    shell_exec("rm -f .tmp/_test_{tag}.bl")
+}
+
+test "W0701 fires: all Arena callsites inside with arena" {
+    let src = "fn consume(xs: List[Int]) -> Int ! Arena \{\n    xs.len()\n\}\nfn wrapper() -> Int ! Arena \{\n    let mut result = 0\n    with arena \{\n        let xs = [1, 2, 3]\n        result = consume(xs)\n    \}\n    result\n\}\nfn main() \{\n    assert_eq(wrapper(), 3)\n\}\n"
+    expect_compile_output(src, "arena_redundant_pos", "W0701", 1)
+}
+
+test "W0701 silent: one bare Arena callsite outside any with arena" {
+    let src = "fn consume(xs: List[Int]) -> Int ! Arena \{\n    xs.len()\n\}\nfn wrapper() -> Int ! Arena \{\n    let bare_xs = [9, 9, 9]\n    let bare = consume(bare_xs)\n    with arena \{\n        let xs = [1, 2, 3]\n        let _ = consume(xs)\n    \}\n    bare\n\}\nfn main() \{\n    assert_eq(wrapper(), 3)\n\}\n"
+    expect_compile_output(src, "arena_redundant_neg_bare", "W0701", 0)
+}
+
+test "W0701 silent: fn does not declare ! Arena" {
+    let src = "fn consume(xs: List[Int]) -> Int ! Arena \{\n    xs.len()\n\}\nfn wrapper() \{\n    with arena \{\n        let xs = [1, 2, 3]\n        let _ = consume(xs)\n    \}\n\}\nfn main() \{\n    wrapper()\n\}\n"
+    expect_compile_output(src, "arena_redundant_neg_no_decl", "W0701", 0)
+}
+
+test "W0701 silent: no Arena callsites at all" {
+    let src = "fn wrapper() -> Int ! Arena \{\n    42\n\}\nfn main() \{\n    assert_eq(wrapper(), 42)\n\}\n"
+    expect_compile_output(src, "arena_redundant_neg_no_sites", "W0701", 0)
+}
+
+test "W0701 fires: nested with arena, all sites covered" {
+    let src = "fn consume(xs: List[Int]) -> Int ! Arena \{\n    xs.len()\n\}\nfn wrapper() -> Int ! Arena \{\n    let mut total = 0\n    with arena \{\n        let xs = [1, 2]\n        total = consume(xs)\n        with arena \{\n            let ys = [3, 4, 5]\n            total = total + consume(ys)\n        \}\n    \}\n    total\n\}\nfn main() \{\n    assert_eq(wrapper(), 5)\n\}\n"
+    expect_compile_output(src, "arena_redundant_pos_nested", "W0701", 1)
+}
+
+test "W0701 silent: bare call through conditional before with arena" {
+    let src = "fn consume(xs: List[Int]) -> Int ! Arena \{\n    xs.len()\n\}\nfn wrapper(flag: Int) -> Int ! Arena \{\n    if flag == 1 \{\n        let outside = consume([7])\n        return outside\n    \}\n    let mut result = 0\n    with arena \{\n        let xs = [1, 2]\n        result = consume(xs)\n    \}\n    result\n\}\nfn main() \{\n    assert_eq(wrapper(0), 2)\n    assert_eq(wrapper(1), 1)\n\}\n"
+    expect_compile_output(src, "arena_redundant_neg_conditional", "W0701", 0)
+}
+
+test "W0701 can be suppressed via @allow(ArenaEffectRedundant)" {
+    let src = "fn consume(xs: List[Int]) -> Int ! Arena \{\n    xs.len()\n\}\n@allow(ArenaEffectRedundant)\nfn wrapper() -> Int ! Arena \{\n    let mut result = 0\n    with arena \{\n        let xs = [1, 2, 3]\n        result = consume(xs)\n    \}\n    result\n\}\nfn main() \{\n    assert_eq(wrapper(), 3)\n\}\n"
+    expect_compile_output(src, "arena_redundant_allow", "W0701", 0)
+}
