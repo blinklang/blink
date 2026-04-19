@@ -124,6 +124,26 @@ BLINK_UNUSED static void* blink_alloc(int64_t size) {
     return p;
 }
 
+/* Arena-aware realloc. When a `with arena` block is active, GC_REALLOC on
+   an interior pointer into a GC_MALLOC_ATOMIC arena chunk will free the
+   whole chunk out from under us and crash on arena destroy. Allocate fresh
+   inside the arena and copy instead; the old buffer is reclaimed wholesale
+   on arena tear-down. Outside an arena, fall back to GC_REALLOC. */
+BLINK_UNUSED static void* blink_realloc(void* ptr, int64_t old_size, int64_t new_size) {
+    blink_arena_t* a = __blink_current_arena;
+    if (a != NULL) {
+        void* np = blink_arena_alloc(a, new_size);
+        if (ptr && old_size > 0) {
+            int64_t copy = old_size < new_size ? old_size : new_size;
+            memcpy(np, ptr, (size_t)copy);
+        }
+        return np;
+    }
+    void* p = GC_REALLOC(ptr, (size_t)new_size);
+    if (!p) { fprintf(stderr, "blink: out of memory\n"); exit(1); }
+    return p;
+}
+
 BLINK_UNUSED static char* blink_strdup(const char* s) {
     if (!s) return NULL;
     size_t len = strlen(s) + 1;
@@ -174,12 +194,11 @@ BLINK_UNUSED static blink_list* blink_list_new(void) {
 
 BLINK_UNUSED static void blink_list_push(blink_list* l, void* item) {
     if (l->len >= l->cap) {
+        int64_t old_cap = l->cap;
         l->cap *= 2;
-        l->items = (void**)GC_REALLOC(l->items, sizeof(void*) * (size_t)l->cap);
-        if (!l->items) {
-            fprintf(stderr, "blink: out of memory\n");
-            exit(1);
-        }
+        l->items = (void**)blink_realloc(l->items,
+            sizeof(void*) * (size_t)old_cap,
+            sizeof(void*) * (size_t)l->cap);
     }
     l->items[l->len++] = item;
 }
@@ -326,9 +345,11 @@ BLINK_UNUSED static void blink_map_grow(blink_map* m) {
             m->len++;
         }
     }
-    GC_FREE(old_keys);
-    GC_FREE(old_values);
-    GC_FREE(old_states);
+    if (__blink_current_arena == NULL) {
+        GC_FREE(old_keys);
+        GC_FREE(old_values);
+        GC_FREE(old_states);
+    }
 }
 
 BLINK_UNUSED static void blink_map_set(blink_map* m, const char* key, void* value) {
@@ -482,8 +503,10 @@ BLINK_UNUSED static void blink_set_grow(blink_set* s) {
             s->len++;
         }
     }
-    GC_FREE(old_items);
-    GC_FREE(old_states);
+    if (__blink_current_arena == NULL) {
+        GC_FREE(old_items);
+        GC_FREE(old_states);
+    }
 }
 
 BLINK_UNUSED static int64_t blink_set_insert(blink_set* s, const char* item) {
@@ -591,9 +614,9 @@ BLINK_UNUSED static blink_bytes* blink_bytes_new(void) {
 
 BLINK_UNUSED static void blink_bytes_push(blink_bytes* b, int64_t byte) {
     if (b->len >= b->cap) {
+        int64_t old_cap = b->cap;
         b->cap *= 2;
-        b->data = (uint8_t*)GC_REALLOC(b->data, (size_t)b->cap);
-        if (!b->data) { fprintf(stderr, "blink: out of memory\n"); exit(1); }
+        b->data = (uint8_t*)blink_realloc(b->data, (size_t)old_cap, (size_t)b->cap);
     }
     b->data[b->len++] = (uint8_t)(byte & 0xFF);
 }
@@ -623,8 +646,9 @@ BLINK_UNUSED static blink_bytes* blink_bytes_concat(const blink_bytes* a, const 
     blink_bytes* r = blink_bytes_new();
     int64_t total = a->len + b->len;
     if (total > r->cap) {
+        int64_t old_cap = r->cap;
         r->cap = total;
-        r->data = (uint8_t*)GC_REALLOC(r->data, (size_t)r->cap);
+        r->data = (uint8_t*)blink_realloc(r->data, (size_t)old_cap, (size_t)r->cap);
     }
     if (a->len > 0) memcpy(r->data, a->data, (size_t)a->len);
     if (b->len > 0) memcpy(r->data + a->len, b->data, (size_t)b->len);
@@ -640,8 +664,9 @@ BLINK_UNUSED static blink_bytes* blink_bytes_slice(const blink_bytes* b, int64_t
     int64_t slen = end - start;
     if (slen > 0) {
         if (slen > r->cap) {
+            int64_t old_cap = r->cap;
             r->cap = slen;
-            r->data = (uint8_t*)GC_REALLOC(r->data, (size_t)r->cap);
+            r->data = (uint8_t*)blink_realloc(r->data, (size_t)old_cap, (size_t)r->cap);
         }
         memcpy(r->data, b->data + start, (size_t)slen);
         r->len = slen;
@@ -685,8 +710,9 @@ BLINK_UNUSED static blink_bytes* blink_bytes_from_str(const char* s) {
     blink_bytes* b = blink_bytes_new();
     int64_t slen = (int64_t)strlen(s);
     if (slen > b->cap) {
+        int64_t old_cap = b->cap;
         b->cap = slen;
-        b->data = (uint8_t*)GC_REALLOC(b->data, (size_t)b->cap);
+        b->data = (uint8_t*)blink_realloc(b->data, (size_t)old_cap, (size_t)b->cap);
     }
     memcpy(b->data, s, (size_t)slen);
     b->len = slen;
@@ -731,11 +757,11 @@ BLINK_UNUSED static void blink_sb_write_n(blink_sb* sb, const char* s, int64_t s
     if (slen == 0) return;
     int64_t needed = sb->len + slen + 1;
     if (needed > sb->cap) {
+        int64_t old_cap = sb->cap;
         int64_t new_cap = sb->cap * 2;
         while (new_cap < needed) new_cap *= 2;
         sb->cap = new_cap;
-        sb->data = (char*)GC_REALLOC(sb->data, (size_t)sb->cap);
-        if (!sb->data) { fprintf(stderr, "blink: out of memory\n"); exit(1); }
+        sb->data = (char*)blink_realloc(sb->data, (size_t)old_cap, (size_t)sb->cap);
     }
     memcpy(sb->data + sb->len, s, (size_t)slen);
     sb->len += slen;
