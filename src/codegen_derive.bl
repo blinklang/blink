@@ -4,7 +4,7 @@ import codegen_types.{
     cg_indent,
     emit_line,
     fresh_temp,
-    c_fn_name, c_type_c_name,
+    c_fn_name, c_type_c_name, c_type_tag,
     type_from_name,
     ensure_struct_result_type,
     is_struct_type, is_enum_type, is_data_enum,
@@ -718,6 +718,18 @@ pub fn descriptor_mangle(desc: Str) -> Str {
         let inner = desc.slice(2, desc.len())
         return "List_{descriptor_mangle(inner)}"
     }
+    if desc.starts_with("O:") {
+        return "Option_{descriptor_mangle(inner_desc_of(desc))}"
+    }
+    if desc.starts_with("R:") {
+        let rest = desc.slice(2, desc.len())
+        let bar = rest.index_of("|")
+        if bar >= 0 {
+            let ok = rest.slice(0, bar)
+            let err = rest.slice(bar + 1, rest.len())
+            return "Result_{descriptor_mangle(ok)}_{descriptor_mangle(err)}"
+        }
+    }
     if desc.starts_with("M:") {
         let rest = desc.slice(2, desc.len())
         let bar = rest.index_of("|")
@@ -742,7 +754,24 @@ pub fn descriptor_c_type(desc: Str) -> Str {
     }
     if desc.starts_with("L:") { return "blink_list*" }
     if desc.starts_with("M:") { return "blink_map*" }
+    if desc.starts_with("O:") {
+        return "blink_Option_{descriptor_typedef_tag(inner_desc_of(desc))}"
+    }
+    if desc.starts_with("R:") {
+        let rest = desc.slice(2, desc.len())
+        let bar = rest.index_of("|")
+        if bar >= 0 {
+            let ok = rest.slice(0, bar)
+            let err = rest.slice(bar + 1, rest.len())
+            return "blink_Result_{descriptor_typedef_tag(ok)}_{descriptor_typedef_tag(err)}"
+        }
+    }
     "int64_t"
+}
+
+pub fn descriptor_typedef_tag(desc: Str) -> Str {
+    if desc.starts_with("S:") { return desc.slice(2, desc.len()) }
+    c_type_tag(desc_primary_ct(desc))
 }
 
 pub fn queue_promote_type(desc: Str) {
@@ -776,6 +805,21 @@ pub fn queue_promote_type(desc: Str) {
             let v = rest.slice(bar + 1, rest.len())
             queue_promote_type(k)
             queue_promote_type(v)
+        }
+        return
+    }
+    if desc.starts_with("O:") {
+        queue_promote_type(inner_desc_of(desc))
+        return
+    }
+    if desc.starts_with("R:") {
+        let rest = desc.slice(2, desc.len())
+        let bar = rest.index_of("|")
+        if bar >= 0 {
+            let ok = rest.slice(0, bar)
+            let err = rest.slice(bar + 1, rest.len())
+            queue_promote_type(ok)
+            queue_promote_type(err)
         }
         return
     }
@@ -831,9 +875,69 @@ pub fn emit_promote_fn_defs() ! Codegen.Emit {
             emit_promote_list(desc)
         } else if desc.starts_with("M:") {
             emit_promote_map(desc)
+        } else if desc.starts_with("O:") {
+            emit_promote_option(desc)
+        } else if desc.starts_with("R:") {
+            emit_promote_result(desc)
         }
         i = i + 1
     }
+}
+
+fn emit_promote_desc_copy(access: Str, desc: Str, dst: Str) ! Codegen.Emit {
+    if desc == "P:Str" {
+        emit_line("{dst} = blink_promote_str(target, {access});")
+        return
+    }
+    if desc.starts_with("P:") {
+        emit_line("{dst} = {access};")
+        return
+    }
+    let mangle = descriptor_mangle(desc)
+    emit_line("{dst} = blink_promote_{mangle}(target, {access});")
+}
+
+fn emit_promote_option(desc: Str) ! Codegen.Emit {
+    let inner = inner_desc_of(desc)
+    let mangle = descriptor_mangle(desc)
+    let cty = descriptor_c_type(desc)
+    emit_line("static {cty} blink_promote_{mangle}(blink_arena_t* target, {cty} src) \{")
+    cg_indent = cg_indent + 1
+    emit_line("{cty} dst = src;")
+    emit_line("if (src.tag == 1) \{")
+    cg_indent = cg_indent + 1
+    emit_promote_desc_copy("src.value", inner, "dst.value")
+    cg_indent = cg_indent - 1
+    emit_line("}")
+    emit_line("return dst;")
+    cg_indent = cg_indent - 1
+    emit_line("}")
+    emit_line("")
+}
+
+fn emit_promote_result(desc: Str) ! Codegen.Emit {
+    let rest = desc.slice(2, desc.len())
+    let bar = rest.index_of("|")
+    let ok_d = rest.slice(0, bar)
+    let err_d = rest.slice(bar + 1, rest.len())
+    let mangle = descriptor_mangle(desc)
+    let cty = descriptor_c_type(desc)
+    emit_line("static {cty} blink_promote_{mangle}(blink_arena_t* target, {cty} src) \{")
+    cg_indent = cg_indent + 1
+    emit_line("{cty} dst = src;")
+    emit_line("if (src.tag == 0) \{")
+    cg_indent = cg_indent + 1
+    emit_promote_desc_copy("src.ok", ok_d, "dst.ok")
+    cg_indent = cg_indent - 1
+    emit_line("} else \{")
+    cg_indent = cg_indent + 1
+    emit_promote_desc_copy("src.err", err_d, "dst.err")
+    cg_indent = cg_indent - 1
+    emit_line("}")
+    emit_line("return dst;")
+    cg_indent = cg_indent - 1
+    emit_line("}")
+    emit_line("")
 }
 
 fn emit_promote_field_copy(access: Str, field_ct: Int, stype: Str, tp_id: Int, dst: Str) ! Codegen.Emit {
@@ -930,6 +1034,7 @@ pub fn emit_promote_elem_into(src_expr: Str, ct: Int, desc: Str) -> Str ! Codege
 
 pub fn inner_desc_of(desc: Str) -> Str {
     if desc.starts_with("L:") { return desc.slice(2, desc.len()) }
+    if desc.starts_with("O:") { return desc.slice(2, desc.len()) }
     ""
 }
 
@@ -942,6 +1047,8 @@ pub fn desc_primary_ct(desc: Str) -> Int {
     if desc.starts_with("S:") { return CT_STRUCT }
     if desc.starts_with("L:") { return CT_LIST }
     if desc.starts_with("M:") { return CT_MAP }
+    if desc.starts_with("O:") { return CT_OPTION }
+    if desc.starts_with("R:") { return CT_RESULT }
     CT_VOID
 }
 

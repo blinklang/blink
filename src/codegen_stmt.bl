@@ -2410,6 +2410,7 @@ fn emit_with_block_core(node: Int, is_expr: Int, result_sink: Str) -> Str ! Code
     actual_desc
 }
 
+@allow(UnrestoredMutation)
 fn descriptor_from_expr_state() -> Str {
     let ct = expr_result_type
     if ct == CT_INT || ct == CT_FLOAT || ct == CT_BOOL || ct == CT_STRING {
@@ -2431,7 +2432,50 @@ fn descriptor_from_expr_state() -> Str {
         let vs = get_map_value_struct(expr_result_str)
         return "M:{ct_to_descriptor(kt, "")}|{ct_to_descriptor(vt, vs)}"
     }
+    if ct == CT_OPTION {
+        let inner_ct = expr_option_inner
+        let inner_s = expr_option_inner_struct
+        if inner_s != "" {
+            ensure_struct_option_type(inner_s)
+            return "O:S:{inner_s}"
+        }
+        ensure_option_type(inner_ct)
+        return "O:{payload_desc_for(inner_ct, "")}"
+    }
+    if ct == CT_RESULT {
+        let ok_t = expr_result_ok_type
+        let err_t = expr_result_err_type
+        let ok_s = expr_result_ok_struct
+        let err_s = expr_result_err_struct
+        if ok_s != "" || err_s != "" {
+            let ok_tag = if ok_s != "" { ok_s } else { c_type_tag(ok_t) }
+            let err_tag = if err_s != "" { err_s } else { c_type_tag(err_t) }
+            ensure_struct_result_type(ok_tag, err_tag)
+        } else {
+            ensure_result_type(ok_t, err_t)
+        }
+        let ok_d = payload_desc_for(ok_t, ok_s)
+        let err_d = payload_desc_for(err_t, err_s)
+        return "R:{ok_d}|{err_d}"
+    }
     ""
+}
+
+// Option/Result payloads hold a compound literal for expr_result_str (not a
+// var), so list/map metadata can only be read from the last-published globals.
+fn payload_desc_for(ct: Int, sname: Str) -> Str {
+    if sname != "" { return "S:{sname}" }
+    if ct == CT_LIST {
+        let et = if expr_list_elem_type >= 0 { expr_list_elem_type } else { -1 }
+        let es = expr_list_elem_struct
+        return "L:{ct_to_descriptor(et, es)}"
+    }
+    if ct == CT_MAP {
+        let kt = if expr_map_key_type >= 0 { expr_map_key_type } else { CT_STRING }
+        let vt = if expr_map_val_type >= 0 { expr_map_val_type } else { -1 }
+        return "M:{ct_to_descriptor(kt, "")}|{ct_to_descriptor(vt, "")}"
+    }
+    ct_to_descriptor(ct, "")
 }
 
 // Returns "" for unsupported kinds (caller maps to an E0702 variant).
@@ -2774,6 +2818,44 @@ fn publish_descriptor_as_var(sink: Str, desc: Str) ! Codegen.Register, Codegen.S
         expr_map_val_type = vt
         set_map_types(sink, kt, vt, vs)
         if vs != "" { set_map_value_struct(sink, vs) }
+        return
+    }
+    if ct == CT_OPTION {
+        expr_result_type = CT_OPTION
+        let inner = desc.slice(2, desc.len())
+        let inner_ct = prim_desc_ct(inner)
+        let mut inner_s: Str = ""
+        if inner.starts_with("S:") { inner_s = inner.slice(2, inner.len()) }
+        if inner_s != "" {
+            set_var_option_struct(sink, inner_ct, inner_s)
+        } else {
+            set_var_option(sink, inner_ct)
+        }
+        expr_option_inner = inner_ct
+        expr_option_inner_struct = inner_s
+        return
+    }
+    if ct == CT_RESULT {
+        expr_result_type = CT_RESULT
+        let rest = desc.slice(2, desc.len())
+        let bar = rest.index_of("|")
+        let ok_d = rest.slice(0, bar)
+        let err_d = rest.slice(bar + 1, rest.len())
+        let ok_t = prim_desc_ct(ok_d)
+        let err_t = prim_desc_ct(err_d)
+        let mut ok_s: Str = ""
+        let mut err_s: Str = ""
+        if ok_d.starts_with("S:") { ok_s = ok_d.slice(2, ok_d.len()) }
+        if err_d.starts_with("S:") { err_s = err_d.slice(2, err_d.len()) }
+        if ok_s != "" || err_s != "" {
+            set_var_result_struct(sink, ok_t, err_t, ok_s, err_s)
+        } else {
+            set_var_result(sink, ok_t, err_t)
+        }
+        expr_result_ok_type = ok_t
+        expr_result_err_type = err_t
+        expr_result_ok_struct = ok_s
+        expr_result_err_struct = err_s
         return
     }
     expr_result_type = CT_VOID
