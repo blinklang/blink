@@ -992,6 +992,25 @@ Opt-in bump allocation via the `! Arena` effect. See spec §5.2 / §5.2.1 for th
 full semantics; this topic covers the one rule you cannot derive from prose:
 **handler composition order around `arena`**.
 
+### The `! Arena` effect marker
+
+Functions that allocate into the caller's arena carry `! Arena` in their
+effect row:
+
+```blink
+fn build_node(x: i32) -> Node ! Arena {
+    Node { value: x, next: none }   // allocated in caller's arena
+}
+```
+
+Callers inside `with arena { }` satisfy the effect automatically. Callers
+outside must either propagate the effect (by carrying `! Arena` themselves)
+or wrap the call in `with arena { }` so the allocation has a target.
+
+**Lint W0701** warns when `! Arena` is redundant — e.g. a function whose body
+is a single `with arena { }` already captures the effect at the block level,
+so the outer signature doesn't need it.
+
 ### When to reach for `with arena { }`
 
 Wrap a hot path where GC pressure is measurable and all transient allocations
@@ -1059,6 +1078,15 @@ Each `with arena { }` snapshots its own outer target at `enter()`. Inner
 tails promote into the outer arena; the outermost block promotes into the
 GC heap. No handler-stack walk, no extra TLS slots — see spec §5.2.1 pt 4.
 
+### Nested closure captures
+
+Closure-typed tails whose captures include other closures (or arena-allocated
+values reachable through those closures) now promote correctly. Each
+`blink_closure` carries a per-capture type-descriptor table; the generated
+`blink_promote_closure_<Mangled>` walks it and recurses structurally, so a
+closure capturing a closure capturing a list-of-records deep-copies in one
+pass. See `decisions/arena-nested-closure-capture-promotion.md`.
+
 ### Early exits
 
 `return expr` and `expr?` inside `with arena { body }` promote `expr` into
@@ -1074,7 +1102,14 @@ still destroys the inner arena), then propagate. See spec §5.2.1 pt 2.
   escapes are debuggable.
 - `E0701 ArenaTypeHasCycle` — a type crossing the boundary has a cyclic
   field graph; the walker cannot materialize it into another allocator.
-- `E0702 ArenaClosureTailUnsupported` — tail evaluates to a closure; promoting
-  closures requires deep-copying captured cells, currently unsupported.
+- `E0702a ArenaClosureTailNonLiteral` — the tail evaluates to a closure whose
+  origin isn't a closure literal bound in this block (e.g. returned from a
+  call, or reassigned through a variable). Fix: construct the closure outside
+  the `with arena { }` block, or bind it via
+  `let f = fn(…) { … }` immediately inside the block.
+- `E0702d ArenaClosureUnsupportedCapture` — a closure-tail capture is of a
+  kind the descriptor walker can't materialize. Rare after the nested-closure
+  capture work (see "Nested closure captures" above); fix by constructing the
+  closure outside the arena block.
 
 See §5.2.1 "Expression-form semantics" point 3 for the spec cross-reference.
