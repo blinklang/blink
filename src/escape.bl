@@ -200,6 +200,12 @@ let mut ea_fn_arena_bare_call: Int = 0
 // `with arena { }` block. Popping a frame drops its names.
 let mut ea_frames: List[Map[Str, Int]] = []
 
+// Tracks `with X as name { }` bindings live inside the current arena frame,
+// so §5.2.1 clause 6 can emit E0700 when the promoted tail captures them.
+// Kept separate from `ea_frames` because scope lifetimes don't align —
+// multiple WithResource scopes can stack inside one arena frame.
+let mut ea_closeable_scopes: List[List[Str]] = []
+
 fn ea_push_frame() {
     ea_frames.push(Map())
 }
@@ -207,6 +213,38 @@ fn ea_push_frame() {
 fn ea_pop_frame() {
     if ea_frames.len() == 0 { return }
     ea_frames.pop()
+}
+
+fn ea_push_closeable_scope() {
+    let empty: List[Str] = []
+    ea_closeable_scopes.push(empty)
+}
+
+fn ea_pop_closeable_scope() {
+    if ea_closeable_scopes.len() == 0 { return }
+    ea_closeable_scopes.pop()
+}
+
+fn ea_register_closeable(name: Str) {
+    if name == "" { return }
+    if ea_closeable_scopes.len() == 0 { return }
+    let top = ea_closeable_scopes.len() - 1
+    let mut scope = ea_closeable_scopes.get(top).unwrap()
+    scope.push(name)
+}
+
+fn ea_is_closeable_binding(name: Str) -> Int {
+    let mut si = 0
+    while si < ea_closeable_scopes.len() {
+        let scope = ea_closeable_scopes.get(si).unwrap()
+        let mut i = 0
+        while i < scope.len() {
+            if scope.get(i).unwrap() == name { return 1 }
+            i = i + 1
+        }
+        si = si + 1
+    }
+    0
 }
 
 fn ea_in_arena() -> Int {
@@ -318,6 +356,26 @@ fn expr_is_arena_value(node: Int) -> Int {
     0
 }
 
+// True when `node` is a projection (FieldAccess / IndexExpr chain) whose
+// root ident names an in-scope Closeable binding. Promoting such a value
+// out of the arena would retain a reference into the resource's buffers
+// after its close() runs — §5.2.1 clause 6 / E0700.
+fn expr_captures_closeable(node: Int) -> Int {
+    if node == -1 { return 0 }
+    let k = node_kind(node)
+    if k == NodeKind.Ident {
+        if ea_is_closeable_binding(node_name(node)) != 0 { return 1 }
+        return 0
+    }
+    if k == NodeKind.FieldAccess {
+        return expr_captures_closeable(node_obj(node))
+    }
+    if k == NodeKind.IndexExpr {
+        return expr_captures_closeable(node_obj(node))
+    }
+    0
+}
+
 fn walk_elements(sl: Int) ! Diag.Report {
     if sl == -1 { return }
     let mut i = 0
@@ -332,13 +390,16 @@ fn walk_assignment(node: Int) ! Diag.Report {
     let val = node_value(node)
     if ea_in_arena() != 0 {
         if val != -1 {
-            if expr_is_arena_value(val) != 0 {
+            let rhs_arena = expr_is_arena_value(val)
+            let rhs_closeable = expr_captures_closeable(val)
+            if rhs_arena != 0 || rhs_closeable != 0 {
                 if target != -1 {
                     let tk = node_kind(target)
                     if tk == NodeKind.Ident {
                         let tname = node_name(target)
                         if ea_is_local_in_top(tname) == 0 {
-                            emit_escape(node, "global assignment")
+                            let cat = if rhs_closeable != 0 { "Closeable buffer" } else { "global assignment" }
+                            emit_escape(node, cat)
                         }
                     }
                     if tk == NodeKind.FieldAccess || tk == NodeKind.IndexExpr {
@@ -346,7 +407,8 @@ fn walk_assignment(node: Int) ! Diag.Report {
                         if obj != -1 {
                             if node_kind(obj) == NodeKind.Ident {
                                 if ea_is_local_in_top(node_name(obj)) == 0 {
-                                    emit_escape(node, "field store")
+                                    let cat = if rhs_closeable != 0 { "Closeable buffer" } else { "field store" }
+                                    emit_escape(node, cat)
                                 }
                             }
                         }
@@ -483,10 +545,38 @@ fn walk_with_block(node: Int, outer_tail: Int) ! Diag.Report {
     }
     if is_arena != 0 {
         ea_push_frame()
+        ea_push_closeable_scope()
         walk_expr(body, 1)
+        ea_pop_closeable_scope()
         ea_pop_frame()
     } else {
+        // Non-arena `with`: if we're inside an arena frame and any handler is a
+        // WithResource `expr as name`, that binding names a Closeable whose
+        // buffers must not be captured into the promoted tail (clause 6).
+        let mut pushed_scope = 0
+        if ea_in_arena() != 0 {
+            if handlers_sl != -1 {
+                let mut hi2 = 0
+                while hi2 < sublist_length(handlers_sl) {
+                    let item2 = sublist_get(handlers_sl, hi2)
+                    if node_kind(item2) == NodeKind.WithResource {
+                        let bname = node_name(item2)
+                        if bname != "" {
+                            if pushed_scope == 0 {
+                                ea_push_closeable_scope()
+                                pushed_scope = 1
+                            }
+                            ea_register_closeable(bname)
+                        }
+                    }
+                    hi2 = hi2 + 1
+                }
+            }
+        }
         walk_expr(body, outer_tail)
+        if pushed_scope != 0 {
+            ea_pop_closeable_scope()
+        }
     }
 }
 
@@ -852,6 +942,7 @@ fn analyze_fn(fn_node: Int) ! Diag.Report {
     diag_source_file = diag_file_for_node(fn_node)
     diag_push_allows(fn_node)
     ea_frames = []
+    ea_closeable_scopes = []
     let arena_eff_node = find_arena_effect_node(fn_node)
     ea_fn_declares_arena = if arena_eff_node != -1 { 1 } else { 0 }
     ea_fn_arena_any_call = 0
@@ -897,6 +988,7 @@ pub fn analyze_escapes(program: Int) ! Diag.Report {
     ea_promote_nodes = []
     ea_promote_types = []
     ea_frames = []
+    ea_closeable_scopes = []
     ea_cycle_cache = Map()
     ea_cycle_reported = Map()
     ea_scan_program_structs(program)
