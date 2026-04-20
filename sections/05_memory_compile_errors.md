@@ -160,7 +160,7 @@ Because the nearest enclosing arena is the promotion target, `blink_promote_<Typ
 
 ##### Expression-form semantics
 
-The six points below fix how `with arena { body }` behaves as an expression,
+The seven points below fix how `with arena { body }` behaves as an expression,
 how early exits interact with promotion, and how the promotion target is
 discovered. See [Arena Expression-Form Semantics](../decisions/arena-expression-form-semantics.md).
 
