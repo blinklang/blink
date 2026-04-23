@@ -1587,9 +1587,14 @@ let mut nr_scope_types: List[Int] = []
 let mut nr_scope_reads: List[Int] = []
 let mut nr_scope_writes: List[Int] = []
 let mut nr_scope_nodes: List[Int] = []
+// Sticky-read flag: if set, nr_mark_written won't clear the read flag. Used
+// for vars captured by a closure — subsequent writes are observable through
+// closure calls, so the original read shouldn't be dismissed as "dead".
+let mut nr_scope_captured: List[Int] = []
 let mut nr_scope_frames: List[Int] = []
 let mut nr_scope_depth: Int = 0
 let mut nr_loop_depth: Int = 0
+let mut nr_in_closure_depth: Int = 0
 let mut nr_warn_unused: Int = 0
 
 fn nr_push_scope() {
@@ -1628,6 +1633,7 @@ fn nr_pop_scope() ! Diag.Report {
         nr_scope_reads.pop()
         nr_scope_writes.pop()
         nr_scope_nodes.pop()
+        nr_scope_captured.pop()
     }
     nr_scope_depth = nr_scope_depth - 1
 }
@@ -1639,6 +1645,7 @@ fn nr_define(name: Str) {
     nr_scope_reads.push(0)
     nr_scope_writes.push(1)
     nr_scope_nodes.push(-1)
+    nr_scope_captured.push(0)
 }
 
 fn nr_check_shadow(name: Str, node: Int) ! Diag.Report {
@@ -1669,6 +1676,7 @@ fn nr_define_at(name: Str, node: Int) ! Diag.Report {
     nr_scope_reads.push(0)
     nr_scope_writes.push(1)
     nr_scope_nodes.push(node)
+    nr_scope_captured.push(0)
 }
 
 fn nr_define_mut(name: Str, is_mut: Int) {
@@ -1678,6 +1686,7 @@ fn nr_define_mut(name: Str, is_mut: Int) {
     nr_scope_reads.push(0)
     nr_scope_writes.push(1)
     nr_scope_nodes.push(-1)
+    nr_scope_captured.push(0)
 }
 
 fn nr_define_mut_at(name: Str, is_mut: Int, node: Int) ! Diag.Report {
@@ -1691,6 +1700,7 @@ fn nr_define_mut_at(name: Str, is_mut: Int, node: Int) ! Diag.Report {
     nr_scope_reads.push(0)
     nr_scope_writes.push(1)
     nr_scope_nodes.push(node)
+    nr_scope_captured.push(0)
 }
 
 fn nr_define_typed(name: Str, is_mut: Int, tid: Int) {
@@ -1700,6 +1710,7 @@ fn nr_define_typed(name: Str, is_mut: Int, tid: Int) {
     nr_scope_reads.push(0)
     nr_scope_writes.push(1)
     nr_scope_nodes.push(-1)
+    nr_scope_captured.push(0)
 }
 
 fn nr_is_defined(name: Str) -> Int {
@@ -1707,6 +1718,21 @@ fn nr_is_defined(name: Str) -> Int {
     while i >= 0 {
         if nr_scope_names.get(i).unwrap() == name {
             nr_scope_reads.set(i, 1)
+            // If the read happens inside a closure body, the capture may be
+            // observed on a later call — don't let subsequent writes in the
+            // enclosing scope cancel this read (W0601 false positive).
+            if nr_in_closure_depth > 0 {
+                // Only mark entries in enclosing scopes (outside the closure
+                // frame) as captured. Locals inside the closure are walked
+                // the normal way.
+                let mut frame_start = 0
+                if nr_scope_frames.len() > 0 {
+                    frame_start = nr_scope_frames.get(nr_scope_frames.len() - 1).unwrap()
+                }
+                if i < frame_start {
+                    nr_scope_captured.set(i, 1)
+                }
+            }
             return 1
         }
         i = i - 1
@@ -1733,7 +1759,7 @@ fn nr_mark_written(name: Str, _node: Int) ! Diag.Report {
     let mut i = nr_scope_names.len() - 1
     while i >= 0 {
         if nr_scope_names.get(i).unwrap() == name {
-            if nr_loop_depth == 0 {
+            if nr_loop_depth == 0 && nr_scope_captured.get(i).unwrap() == 0 {
                 nr_scope_reads.set(i, 0)
             }
             nr_scope_writes.set(i, nr_scope_writes.get(i).unwrap() + 1)
@@ -2099,9 +2125,11 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, Diag.Report {
     nr_scope_reads = []
     nr_scope_writes = []
     nr_scope_nodes = []
+    nr_scope_captured = []
     nr_scope_frames = []
     nr_scope_depth = 0
     nr_loop_depth = 0
+    nr_in_closure_depth = 0
     nr_warn_unused = 1
     nr_impl_type_names = []
     nr_impl_method_names = []
@@ -2855,7 +2883,9 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, Diag.Report {
                 i = i + 1
             }
         }
+        nr_in_closure_depth = nr_in_closure_depth + 1
         nr_check_node(node_body(node))
+        nr_in_closure_depth = nr_in_closure_depth - 1
         nr_pop_scope()
         return
     }
