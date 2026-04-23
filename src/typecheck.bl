@@ -109,10 +109,13 @@ type FnSigEntry {
     params_count: Int
     type_params_start: Int
     type_params_count: Int
+    effects_start: Int
+    effects_count: Int
 }
 let mut fnsig_pool: List[FnSigEntry] = []
 let mut fnsig_param_list: List[Int] = []
 let mut fnsig_type_param_names: List[Str] = []
+let mut fnsig_effect_names: List[Str] = []
 
 let mut tc_trait_names: List[Str] = []
 let mut tc_trait_method_names: List[Str] = []
@@ -131,8 +134,6 @@ type TraitMethodSigEntry {
 let mut tc_tmsig_pool: List[TraitMethodSigEntry] = []
 let mut tc_tmsig_param_names: List[Str] = []
 let mut tc_trait_tparam_names: List[Str] = []
-
-let mut tc_fn_effects: List[Str] = []
 
 let mut tc_current_fn_ret: Int = -1
 let mut tc_current_fn_name: Str = ""
@@ -601,22 +602,19 @@ fn register_fn_sig(fn_node: Int) ! TypeCheck.Register, TypeCheck.Resolve {
             ti = ti + 1
         }
     }
-    fnsig_pool.push(FnSigEntry { name: name, ret: ret_tid, params_start: start, params_count: count, type_params_start: tp_start, type_params_count: tp_count })
-
+    let eff_start = fnsig_effect_names.len()
     let effects_sl = node_effects(fn_node)
-    let mut effs = ""
+    let mut eff_count = 0
     if effects_sl != -1 {
         let mut ei = 0
         while ei < sublist_length(effects_sl) {
             let eff = sublist_get(effects_sl, ei)
-            if ei > 0 {
-                effs = effs.concat(",")
-            }
-            effs = effs.concat(node_name(eff))
+            fnsig_effect_names.push(node_name(eff))
+            eff_count = eff_count + 1
             ei = ei + 1
         }
     }
-    tc_fn_effects.push(effs)
+    fnsig_pool.push(FnSigEntry { name: name, ret: ret_tid, params_start: start, params_count: count, type_params_start: tp_start, type_params_count: tp_count, effects_start: eff_start, effects_count: eff_count })
 
     if has_annotation(fn_node, "deprecated") != 0 {
         depr_fn_nodes.insert(name, fn_node)
@@ -803,26 +801,25 @@ fn validate_capabilities_budget(program: Int, fns_sl: Int) ! Diag.Report {
         let fn_mod = node_module(fn_node)
         if fn_name != "main" && !fn_name.starts_with("__test_") && (fn_mod == "__main__") {
             let sig = lookup_fnsig(fn_name)
-            if sig != -1 && sig < tc_fn_effects.len() {
-                let effs_str = tc_fn_effects.get(sig).unwrap()
-                if effs_str != "" {
-                    let effs = effs_str.split(",")
-                    let mut ei = 0
-                    while ei < effs.len() {
-                        let eff = effs.get(ei).unwrap()
-                        let mut allowed = 0
-                        let mut bi = 0
-                        while bi < budget_names.len() {
-                            if budget_effect_satisfies(budget_names.get(bi).unwrap(), eff) != 0 {
-                                allowed = 1
-                            }
-                            bi = bi + 1
+            if sig != -1 && sig < fnsig_pool.len() {
+                let fs = fnsig_pool.get(sig).unwrap()
+                let eff_start = fs.effects_start
+                let eff_count = fs.effects_count
+                let mut ei = 0
+                while ei < eff_count {
+                    let eff = fnsig_effect_names.get(eff_start + ei).unwrap()
+                    let mut allowed = 0
+                    let mut bi = 0
+                    while bi < budget_names.len() {
+                        if budget_effect_satisfies(budget_names.get(bi).unwrap(), eff) != 0 {
+                            allowed = 1
                         }
-                        if allowed == 0 {
-                            diag_error_at("CapabilityBudgetExceeded", "E0501", "function '{fn_name}' uses effect '{eff}' which is not in @capabilities budget", fn_node, "add '{eff}' to @capabilities")
-                        }
-                        ei = ei + 1
+                        bi = bi + 1
                     }
+                    if allowed == 0 {
+                        diag_error_at("CapabilityBudgetExceeded", "E0501", "function '{fn_name}' uses effect '{eff}' which is not in @capabilities budget", fn_node, "add '{eff}' to @capabilities")
+                    }
+                    ei = ei + 1
                 }
             }
         }
@@ -830,20 +827,13 @@ fn validate_capabilities_budget(program: Int, fns_sl: Int) ! Diag.Report {
     }
 }
 
-pub fn tc_get_fn_effects(name: Str) -> Option[Str] {
-    let sig = lookup_fnsig(name)
-    if sig == -1 { return None }
-    if sig >= tc_fn_effects.len() { return None }
-    Some(tc_fn_effects.get(sig).unwrap())
-}
-
 pub fn tc_fn_has_effect(name: Str, eff: Str) -> Int {
-    let effs = tc_get_fn_effects(name)
-    if effs.is_none() { return 0 }
-    let parts = effs.unwrap().split(",")
+    let sig = lookup_fnsig(name)
+    if sig == -1 { return 0 }
+    let fs = fnsig_pool.get(sig).unwrap()
     let mut i = 0
-    while i < parts.len() {
-        if parts.get(i).unwrap() == eff { return 1 }
+    while i < fs.effects_count {
+        if fnsig_effect_names.get(fs.effects_start + i).unwrap() == eff { return 1 }
         i = i + 1
     }
     0
@@ -1068,13 +1058,13 @@ fn init_types() ! TypeCheck.Register {
     fnsig_map.clear()
     fnsig_param_list.clear()
     fnsig_type_param_names.clear()
+    fnsig_effect_names.clear()
     tc_trait_names.clear()
     tc_trait_method_names.clear()
     tc_trait_assoc_names.clear()
     tc_tmsig_pool.clear()
     tc_tmsig_param_names.clear()
     tc_trait_tparam_names.clear()
-    tc_fn_effects.clear()
     tc_current_fn_ret = -1
     tc_current_fn_name = ""
     tc_errors.clear()
