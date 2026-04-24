@@ -97,6 +97,21 @@ With universal interpolation, `"Hello, {name}!"` just works. When no `{expr}` is
 | `\{` | literal `{` (suppresses interpolation) |
 | `\}` | literal `}` |
 
+**Char literal escape sequences.** Char literals (`'x'`) accept a subset of string escapes (no interpolation-related `\{`/`\}`, no `\"`, adds `\'`):
+
+| Escape | Produces |
+|--------|----------|
+| `\n` | newline |
+| `\r` | carriage return |
+| `\t` | tab |
+| `\\` | literal `\` |
+| `\b` | backspace |
+| `\f` | form feed |
+| `\0` | NUL byte |
+| `\'` | literal `'` |
+
+A char literal must contain exactly one Unicode scalar value; `''` (empty) and `'ab'` (multi-char) are lexer errors. Surrogate codepoints (0xD800–0xDFFF) are rejected. Unicode/hex escapes (`\u{...}`) are deferred (task 19v5gb); use `Char.from_code_point(n)` until then.
+
 **Context-sensitive interpolation.** When an interpolated string literal appears where `Template[C]` is expected (e.g., `db.query_one("SELECT * FROM users WHERE id = {id}")`), the compiler extracts `{expr}` as bound parameters instead of concatenating. The *receiving type* determines behavior: `{id}` in a `Str` context is concatenation, `{id}` in a `Template[DB]` context is parameterization. No new string syntax is needed — the same `"..."` literal does the right thing based on where it appears. See section 3.12 for details.
 
 #### 2.4.1 Compile-Time Intrinsics (`#`)

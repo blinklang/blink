@@ -396,6 +396,7 @@ Full deliberation records for each decision. Each file contains expert votes, re
 | Arena Allocation Semantics | [decisions/arena-allocation-semantics.md](decisions/arena-allocation-semantics.md) |
 | Arena Expression-Form Semantics | [decisions/arena-expression-form-semantics.md](decisions/arena-expression-form-semantics.md) |
 | Arena Nested Closure Capture Promotion | [decisions/arena-nested-closure-capture-promotion.md](decisions/arena-nested-closure-capture-promotion.md) |
+| Char Literal Escapes | [decisions/char-literal-escapes.md](decisions/char-literal-escapes.md) |
 
 ---
 

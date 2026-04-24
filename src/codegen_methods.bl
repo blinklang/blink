@@ -1,6 +1,6 @@
 import codegen_types.{
     CT_BOOL, CT_BYTES, CT_CHANNEL, CT_CLOSURE, CT_DURATION, CT_FFI_SCOPE,
-    CT_FLOAT, CT_HANDLE, CT_HANDLER, CT_I8, CT_I16, CT_I32, CT_U8, CT_U16, CT_U32, CT_U64, CT_INSTANT, CT_INT, CT_ITERATOR, CT_LIST, CT_MAP,
+    CT_CHAR, CT_FLOAT, CT_HANDLE, CT_HANDLER, CT_I8, CT_I16, CT_I32, CT_U8, CT_U16, CT_U32, CT_U64, CT_INSTANT, CT_INT, CT_ITERATOR, CT_LIST, CT_MAP,
     CT_OPTION, CT_PTR, CT_RESULT, CT_SET, CT_STRING, CT_STRINGBUILDER,
     CT_ENUM, CT_STRUCT, CT_TEMPLATE, CT_VOID,
     c_fn_name, c_type_c_name, c_type_str, c_type_tag,
@@ -137,6 +137,8 @@ fn emit_result_unwrap_inner(
         expr_result_str = "{tmp}.{field}"
         if inner_t == CT_FLOAT {
             expr_result_type = CT_FLOAT
+        } else if inner_t == CT_CHAR {
+            expr_result_type = CT_CHAR
         } else {
             expr_result_type = CT_INT
         }
@@ -168,6 +170,19 @@ fn emit_str_method(node: Int, obj_str: Str, _obj_node: Int, method: Str) -> Int 
         let idx_str = expr_result_str
         expr_result_str = "blink_str_char_at({obj_str}, {idx_str})"
         expr_result_type = CT_INT
+        return 1
+    }
+    if method == "char_at_opt" {
+        let args_sl = node_args(node)
+        emit_expr(sublist_get(args_sl, btc_arg_offset))
+        let idx_str = expr_result_str
+        let tmp = fresh_temp("_chaopt_")
+        ensure_option_type(CT_CHAR)
+        let opt_ty = option_c_type(CT_CHAR)
+        emit_line("int64_t {tmp} = blink_char_at_opt_raw({obj_str}, {idx_str});")
+        expr_result_str = "({tmp} < 0 ? ({opt_ty})\{.tag = 0} : ({opt_ty})\{.tag = 1, .value = (int32_t){tmp}})"
+        expr_result_type = CT_OPTION
+        expr_option_inner = CT_CHAR
         return 1
     }
     if method == "substring" || method == "substr" {
@@ -1404,7 +1419,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
         }
     }
 
-    // Char.from_code_point(n) — static constructor
+    // Char static constructors
     if node_kind(obj_node) == NodeKind.Ident && node_name(obj_node) == "Char" {
         if method == "from_code_point" {
             let args_sl = node_args(node)
@@ -1413,6 +1428,27 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                 let arg_str = expr_result_str
                 expr_result_str = "blink_str_from_char_code({arg_str})"
                 expr_result_type = CT_STRING
+                return
+            }
+        }
+        if method == "try_from_code_point" {
+            let args_sl = node_args(node)
+            if args_sl != -1 && sublist_length(args_sl) > 0 {
+                emit_expr(sublist_get(args_sl, 0))
+                let arg_str = expr_result_str
+                let tmp = fresh_temp("_chcp_")
+                let res_tmp = fresh_temp("_chres_")
+                ensure_struct_result_type("char", "ConversionError")
+                let res_type = struct_result_c_type("char", "ConversionError")
+                emit_line("int64_t {tmp} = blink_char_validate_code_point({arg_str});")
+                emit_line("{res_type} {res_tmp};")
+                emit_line("if ({tmp} >= 0) \{ {res_tmp}.tag = 0; {res_tmp}.ok = (int32_t){tmp}; } else \{ {res_tmp}.tag = 1; {res_tmp}.err = (blink_ConversionError)\{.message = \"not a valid Unicode scalar value\", .source_type = \"Int\", .target_type = \"Char\"}; }")
+                expr_result_str = res_tmp
+                expr_result_type = CT_RESULT
+                expr_result_ok_type = CT_CHAR
+                expr_result_err_type = CT_STRUCT
+                expr_result_ok_struct = ""
+                expr_result_err_struct = "ConversionError"
                 return
             }
         }
@@ -2517,6 +2553,19 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
         }
     }
 
+    if obj_type == CT_CHAR {
+        if method == "to_int" {
+            expr_result_str = "(int64_t){obj_str}"
+            expr_result_type = CT_INT
+            return
+        }
+        if method == "to_str" {
+            expr_result_str = "blink_char_to_str((int64_t){obj_str})"
+            expr_result_type = CT_STRING
+            return
+        }
+    }
+
     // Trait-based builtin method dispatch
     if emit_builtin_trait_method(node, obj_str, obj_type, obj_node, method) != 0 {
         return
@@ -3239,6 +3288,12 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                     emit_panic_tag_check(tmp, 0, "unwrap called on None", loc_line)
                     expr_result_str = "{tmp}.value"
                     expr_result_type = CT_FLOAT
+                } else if inner == CT_CHAR {
+                    let opt_c = option_c_type(CT_CHAR)
+                    emit_line("{opt_c} {tmp} = {obj_str};")
+                    emit_panic_tag_check(tmp, 0, "unwrap called on None", loc_line)
+                    expr_result_str = "{tmp}.value"
+                    expr_result_type = CT_CHAR
                 } else {
                     let opt_c = option_c_type(CT_INT)
                     emit_line("{opt_c} {tmp} = {obj_str};")

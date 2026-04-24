@@ -1043,6 +1043,40 @@ BLINK_UNUSED static const char* blink_str_from_char_code(int64_t code) {
     return buf;
 }
 
+BLINK_UNUSED static int64_t blink_char_validate_code_point(int64_t code) {
+    if (code < 0 || code > 0x10FFFF) return -1;
+    if (code >= 0xD800 && code <= 0xDFFF) return -1;
+    return code;
+}
+
+BLINK_UNUSED static const char* blink_char_to_str(int64_t code) {
+    return blink_str_from_char_code(code);
+}
+
+BLINK_UNUSED static int64_t blink_char_at_opt_raw(const char* s, int64_t i) {
+    int64_t slen = blink_str_len(s);
+    if (i < 0 || i >= slen) return -1;
+    unsigned char c = (unsigned char)s[i];
+    if (c < 0x80) return (int64_t)c;
+    if ((c & 0xE0) == 0xC0 && i + 1 < slen) {
+        int64_t cp = ((int64_t)(c & 0x1F) << 6) | (s[i+1] & 0x3F);
+        return cp;
+    }
+    if ((c & 0xF0) == 0xE0 && i + 2 < slen) {
+        int64_t cp = ((int64_t)(c & 0x0F) << 12) | ((int64_t)(s[i+1] & 0x3F) << 6) | (s[i+2] & 0x3F);
+        return cp;
+    }
+    if ((c & 0xF8) == 0xF0 && i + 3 < slen) {
+        int64_t cp = ((int64_t)(c & 0x07) << 18) | ((int64_t)(s[i+1] & 0x3F) << 12) | ((int64_t)(s[i+2] & 0x3F) << 6) | (s[i+3] & 0x3F);
+        return cp;
+    }
+    return -1;
+}
+
+BLINK_UNUSED static int64_t blink_char_hash(int64_t code) {
+    return code * (int64_t)2654435761LL;
+}
+
 BLINK_UNUSED static const char* blink_str_concat(const char* a, const char* b) {
     int64_t la = blink_str_len(a);
     int64_t lb = blink_str_len(b);
