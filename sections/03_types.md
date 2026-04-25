@@ -104,6 +104,7 @@ trait StrOps {
     fn to_upper(self) -> Str
     fn to_lower(self) -> Str
     fn trim(self) -> Str
+    fn trim_left(self) -> Str
     fn trim_right(self) -> Str
     fn replace(self, needle: Str, replacement: Str) -> Str
 
@@ -129,6 +130,7 @@ The full method surface (15 core methods from `Sized` + `StrOps`, plus byte-acce
 | `to_upper` | `fn(self) -> Str` | Uppercase (Unicode-aware) |
 | `to_lower` | `fn(self) -> Str` | Lowercase (Unicode-aware) |
 | `trim` | `fn(self) -> Str` | Strip leading/trailing whitespace |
+| `trim_left` | `fn(self) -> Str` | Strip leading whitespace only |
 | `trim_right` | `fn(self) -> Str` | Strip trailing whitespace only |
 | `replace` | `fn(self, Str, Str) -> Str` | Replace all occurrences |
 | `index_of` | `fn(self, Str) -> Option[Int]` | Codepoint index of first match |
