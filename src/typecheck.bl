@@ -3,7 +3,7 @@ import parser.{
     get_annotation, has_annotation,
     node_args, node_assoc_types, node_arms, node_body, node_captures, node_col, node_condition,
     node_effects, node_elements, node_else_body, node_end, node_fields, node_guard,
-    node_handlers, node_index, node_is_mut, node_is_pub, node_iterable, node_kind,
+    node_handlers, node_index, node_int_val, node_is_mut, node_is_pub, node_iterable, node_kind,
     node_left, node_line, node_method, node_methods, node_module, node_name, node_obj,
     node_op, node_params, node_pattern, node_return_type, node_right, node_scrutinee,
     node_start, node_stmts, node_str_val, node_target, node_then_body, node_trait_name,
@@ -1265,40 +1265,7 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
         while ei < sublist_length(effects_decl_sl) {
             let ed = sublist_get(effects_decl_sl, ei)
             let eff_name = node_name(ed)
-            let mut handle = ""
-            let mut hi = 0
-            while hi < eff_name.len() {
-                let ch = eff_name.char_at(hi)
-                if ch == 65 { handle = handle.concat("a") }
-                else if ch == 66 { handle = handle.concat("b") }
-                else if ch == 67 { handle = handle.concat("c") }
-                else if ch == 68 { handle = handle.concat("d") }
-                else if ch == 69 { handle = handle.concat("e") }
-                else if ch == 70 { handle = handle.concat("f") }
-                else if ch == 71 { handle = handle.concat("g") }
-                else if ch == 72 { handle = handle.concat("h") }
-                else if ch == 73 { handle = handle.concat("i") }
-                else if ch == 74 { handle = handle.concat("j") }
-                else if ch == 75 { handle = handle.concat("k") }
-                else if ch == 76 { handle = handle.concat("l") }
-                else if ch == 77 { handle = handle.concat("m") }
-                else if ch == 78 { handle = handle.concat("n") }
-                else if ch == 79 { handle = handle.concat("o") }
-                else if ch == 80 { handle = handle.concat("p") }
-                else if ch == 81 { handle = handle.concat("q") }
-                else if ch == 82 { handle = handle.concat("r") }
-                else if ch == 83 { handle = handle.concat("s") }
-                else if ch == 84 { handle = handle.concat("t") }
-                else if ch == 85 { handle = handle.concat("u") }
-                else if ch == 86 { handle = handle.concat("v") }
-                else if ch == 87 { handle = handle.concat("w") }
-                else if ch == 88 { handle = handle.concat("x") }
-                else if ch == 89 { handle = handle.concat("y") }
-                else if ch == 90 { handle = handle.concat("z") }
-                else { handle = handle.concat(eff_name.substring(hi, 1)) }
-                hi = hi + 1
-            }
-            register_ue_handle(handle)
+            register_ue_handle(str_to_lower(eff_name))
             ei = ei + 1
         }
     }
@@ -1635,7 +1602,7 @@ fn nr_pop_scope() ! Diag.Report {
         let mut i = nr_scope_names.len() - 1
         while i >= start {
             let vname = nr_scope_names.get(i).unwrap()
-            if nr_scope_reads.get(i).unwrap() == 0 && vname.len() > 0 && vname.char_at(0) != 95 {
+            if nr_scope_reads.get(i).unwrap() == 0 && vname.len() > 0 && vname.char_at_opt(0).unwrap() != '_' {
                 let nd = nr_scope_nodes.get(i).unwrap()
                 if nd != -1 {
                     if nr_scope_writes.get(i).unwrap() > 1 {
@@ -1673,7 +1640,7 @@ fn nr_define(name: Str) {
 fn nr_check_shadow(name: Str, node: Int) ! Diag.Report {
     if nr_warn_unused == 0 { return }
     if name.len() == 0 { return }
-    if name.char_at(0) == 95 { return }
+    if name.char_at_opt(0).unwrap() == '_' { return }
     if nr_scope_depth <= 1 { return }
     if nr_scope_frames.len() == 0 { return }
     let frame_start = nr_scope_frames.get(nr_scope_frames.len() - 1).unwrap()
@@ -2925,7 +2892,14 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, Diag.Report {
     if kind == NodeKind.StructLit {
         let type_name = node_type_name(node)
         if type_name != "" {
-            nr_check_type_ref(type_name)
+            let dot_pos = type_name.index_of(".")
+            if dot_pos >= 0 {
+                // Enum.Variant struct-style construction: check the enum type only
+                let enum_part = type_name.substr(0, dot_pos)
+                nr_check_type_ref(enum_part)
+            } else {
+                nr_check_type_ref(type_name)
+            }
         }
         let flds_sl = node_fields(node)
         if flds_sl != -1 {
@@ -3062,9 +3036,21 @@ fn nr_check_pattern(node: Int) ! TypeCheck.Resolve, Diag.Report {
     if kind == NodeKind.EnumPattern {
         let flds_sl = node_fields(node)
         if flds_sl != -1 {
+            let is_struct_pat = node_int_val(node)
             let mut i = 0
             while i < sublist_length(flds_sl) {
-                nr_check_pattern(sublist_get(flds_sl, i))
+                let f = sublist_get(flds_sl, i)
+                if is_struct_pat != 0 {
+                    // Struct-style fields are StructLitField nodes; bind by name
+                    let fpat = node_pattern(f)
+                    if fpat != -1 {
+                        nr_check_pattern(fpat)
+                    } else {
+                        nr_define_at(node_name(f), f)
+                    }
+                } else {
+                    nr_check_pattern(f)
+                }
                 i = i + 1
             }
         }
@@ -4038,9 +4024,21 @@ fn tc_check_pattern_types(node: Int) ! TypeCheck.Resolve {
         }
         let flds_sl = node_fields(node)
         if flds_sl != -1 {
+            let is_struct_pat = node_int_val(node)
             let mut i = 0
             while i < sublist_length(flds_sl) {
-                tc_check_pattern_types(sublist_get(flds_sl, i))
+                let f = sublist_get(flds_sl, i)
+                if is_struct_pat != 0 {
+                    // Struct-style fields: StructLitField nodes; define field names as vars
+                    let fpat = node_pattern(f)
+                    if fpat != -1 {
+                        tc_check_pattern_types(fpat)
+                    } else {
+                        nr_define(node_name(f))
+                    }
+                } else {
+                    tc_check_pattern_types(f)
+                }
                 i = i + 1
             }
         }

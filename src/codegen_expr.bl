@@ -417,8 +417,11 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
         emit_expr(fa_obj)
         let obj_str = expr_result_str
         let mut c_field = fa_field
-        if fa_field.len() > 0 && fa_field.char_at(0) >= 48 && fa_field.char_at(0) <= 57 {
-            c_field = "_{fa_field}"
+        if fa_field.len() > 0 {
+            let fa_first = fa_field.char_at_opt(0).unwrap()
+            if fa_first >= '0' && fa_first <= '9' {
+                c_field = "_{fa_field}"
+            }
         }
         expr_result_str = "{obj_str}.{c_field}"
         let mut fa_type = CT_VOID
@@ -1314,6 +1317,8 @@ fn emit_binop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.R
     emit_expr(node_left(node))
     let left_str = expr_result_str
     let left_type = expr_result_type
+    let left_opt_inner = expr_option_inner
+    let left_opt_inner_struct = expr_option_inner_struct
 
     if op == "&&" || op == "||" {
         let pre_len = cg_lines.len()
@@ -1364,6 +1369,21 @@ fn emit_binop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.R
     emit_expr(node_right(node))
     let right_str = expr_result_str
     let right_type = expr_result_type
+
+    if (op == "==" || op == "!=") && left_type == CT_OPTION && right_type == CT_OPTION && left_opt_inner_struct == "" && expr_option_inner_struct == "" && left_opt_inner == expr_option_inner {
+        let opt_c = option_c_type(left_opt_inner)
+        let ltmp = fresh_temp("__oeql")
+        let rtmp = fresh_temp("__oeqr")
+        emit_line("{opt_c} {ltmp} = {left_str};")
+        emit_line("{opt_c} {rtmp} = {right_str};")
+        if op == "==" {
+            expr_result_str = "({ltmp}.tag == {rtmp}.tag && ({ltmp}.tag == 0 || {ltmp}.value == {rtmp}.value))"
+        } else {
+            expr_result_str = "({ltmp}.tag != {rtmp}.tag || ({ltmp}.tag != 0 && {ltmp}.value != {rtmp}.value))"
+        }
+        expr_result_type = CT_BOOL
+        return
+    }
 
     if op == "==" && left_type == CT_STRING && right_type == CT_STRING {
         expr_result_str = "blink_str_eq({left_str}, {right_str})"
@@ -3002,6 +3022,51 @@ fn infer_struct_type_args(type_name: Str, field_types: List[Int]) -> Option[Str]
 fn emit_struct_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
     let raw_sname = node_type_name(node)
     let sname = strip_module_qualifier(raw_sname)
+
+    // raw_sname contains a dot when this is Enum.Variant { ... }; sname is the variant name only.
+    let dot_pos = raw_sname.index_of(".")
+    if dot_pos >= 0 {
+        let possible_enum = raw_sname.substr(0, dot_pos)
+        let resolved = resolve_variant(sname)
+        let variant_enum = if resolved != "" { resolved } else { possible_enum }
+        let vidx = get_variant_index(variant_enum, sname)
+        if variant_enum != "" && is_data_enum(variant_enum) != 0 && vidx >= 0 {
+            let tag = get_variant_tag(variant_enum, sname)
+            let flds_sl_sv = node_fields(node)
+            let enum_c_name = c_type_c_name(variant_enum)
+            let mut init_str = "({enum_c_name})\{.tag = {tag}"
+            if flds_sl_sv != -1 && sublist_length(flds_sl_sv) > 0 {
+                init_str = init_str.concat(", .data.{sname} = \{")
+                let mut fi = 0
+                while fi < sublist_length(flds_sl_sv) {
+                    if fi > 0 {
+                        init_str = init_str.concat(", ")
+                    }
+                    let sf = sublist_get(flds_sl_sv, fi)
+                    let field_name = node_name(sf)
+                    emit_expr(node_value(sf))
+                    let arg_str = expr_result_str
+                    let field_type = get_variant_field_type_str(vidx, fi)
+                    if field_type.is_some() && field_type.unwrap() == variant_enum {
+                        let box_tmp = fresh_temp("_ebox")
+                        emit_line("{enum_c_name}* {box_tmp} = ({enum_c_name}*)blink_alloc(sizeof({enum_c_name}));")
+                        emit_line("*{box_tmp} = {arg_str};")
+                        init_str = init_str.concat(".{field_name} = (int64_t)(intptr_t){box_tmp}")
+                    } else {
+                        init_str = init_str.concat(".{field_name} = {arg_str}")
+                    }
+                    fi = fi + 1
+                }
+                init_str = init_str.concat("}")
+            }
+            init_str = init_str.concat("}")
+            expr_result_str = init_str
+            expr_result_type = CT_STRUCT
+            set_var_struct(init_str, variant_enum)
+            return
+        }
+    }
+
     let mut c_type = c_type_c_name(sname)
     let tmp = fresh_temp("_s")
     let flds_sl = node_fields(node)

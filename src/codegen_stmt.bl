@@ -84,10 +84,10 @@ fn strip_outer_parens(s: Str) -> Str {
         let mut i = 0
         let mut balanced = 1
         while i < inner.len() {
-            let ch = inner.char_at(i)
-            if ch == 40 {
+            let ch = inner.char_at_opt(i).unwrap()
+            if ch == '(' {
                 depth = depth + 1
-            } else if ch == 41 {
+            } else if ch == ')' {
                 if depth == 0 {
                     balanced = 0
                 }
@@ -913,59 +913,125 @@ fn bind_pattern_vars(pat: Int, scrut_off: Int, scrut_len: Int) ! Codegen.Emit, C
             if vidx >= 0 {
                 let fcount = get_variant_field_count(vidx)
                 let scrut = match_scruts.get(scrut_off).unwrap().str_val
-                let mut fi = 0
-                while fi < sublist_length(ep_flds_sl) && fi < fcount {
-                    let sub_pat = sublist_get(ep_flds_sl, fi)
-                    let sub_pk = node_kind(sub_pat)
-                    let field_name = get_variant_field_name(vidx, fi).unwrap()
-                    let field_type_name = get_variant_field_type_str(vidx, fi).unwrap()
-                    let field_ct = type_from_name(field_type_name)
-                    if sub_pk == NodeKind.IdentPattern {
-                        let bind_name = node_name(sub_pat)
-                        if bind_name != "_" {
-                            let c_bind = c_safe_name(bind_name)
-                            if field_type_name == resolved_enum {
-                                let fc_name = c_type_c_name(field_type_name)
+                let is_struct_pat = node_int_val(pat)
+                if is_struct_pat != 0 {
+                    // Struct-style pattern: { field, field2 } — bind by field name
+                    let mut sfi = 0
+                    while sfi < sublist_length(ep_flds_sl) {
+                        let sf_node = sublist_get(ep_flds_sl, sfi)
+                        let field_name = node_name(sf_node)
+                        let fpat_node = node_pattern(sf_node)
+                        let mut found_ft = ""
+                        let mut vfi = 0
+                        while vfi < fcount {
+                            let vfn = get_variant_field_name(vidx, vfi)
+                            if vfn.is_some() && vfn.unwrap() == field_name {
+                                let vft = get_variant_field_type_str(vidx, vfi)
+                                if vft.is_some() {
+                                    found_ft = vft.unwrap()
+                                }
+                                break
+                            }
+                            vfi = vfi + 1
+                        }
+                        let field_ct = type_from_name(found_ft)
+                        if fpat_node != -1 {
+                            let saved_scruts = match_scruts
+                            match_scruts = [MatchScrutEntry { str_val: "{scrut}.data.{resolved_variant}.{field_name}", scrut_type: field_ct }]
+                            bind_pattern_vars(fpat_node, 0, 1)
+                            match_scruts = saved_scruts
+                        } else {
+                            let c_bind = c_safe_name(field_name)
+                            if found_ft == resolved_enum {
+                                let fc_name = c_type_c_name(found_ft)
                                 emit_line("{fc_name} {c_bind} = *({fc_name}*)(intptr_t){scrut}.data.{resolved_variant}.{field_name};")
-                                set_var(bind_name, CT_VOID, 0)
-                                set_var_struct(bind_name, field_type_name)
-                                var_enums.push(VarEnumEntry { name: bind_name, enum_type: field_type_name })
-                            } else if is_struct_type(field_type_name) != 0 {
-                                emit_line("{c_type_c_name(field_type_name)} {c_bind} = {scrut}.data.{resolved_variant}.{field_name};")
-                                set_var(bind_name, CT_VOID, 0)
-                                set_var_struct(bind_name, field_type_name)
-                            } else if is_enum_type(field_type_name) != 0 {
-                                emit_line("{c_type_c_name(field_type_name)} {c_bind} = {scrut}.data.{resolved_variant}.{field_name};")
-                                set_var(bind_name, CT_INT, 0)
-                                var_enums.push(VarEnumEntry { name: bind_name, enum_type: field_type_name })
+                                set_var(field_name, CT_VOID, 0)
+                                set_var_struct(field_name, found_ft)
+                                var_enums.push(VarEnumEntry { name: field_name, enum_type: found_ft })
+                            } else if is_struct_type(found_ft) != 0 {
+                                emit_line("{c_type_c_name(found_ft)} {c_bind} = {scrut}.data.{resolved_variant}.{field_name};")
+                                set_var(field_name, CT_VOID, 0)
+                                set_var_struct(field_name, found_ft)
+                            } else if is_enum_type(found_ft) != 0 {
+                                emit_line("{c_type_c_name(found_ft)} {c_bind} = {scrut}.data.{resolved_variant}.{field_name};")
+                                set_var(field_name, CT_INT, 0)
+                                var_enums.push(VarEnumEntry { name: field_name, enum_type: found_ft })
                             } else if field_ct == CT_LIST {
                                 emit_line("blink_list* {c_bind} = {scrut}.data.{resolved_variant}.{field_name};")
-                                set_var(bind_name, CT_LIST, 0)
-                                let bracket_pos = field_type_name.index_of("[")
+                                set_var(field_name, CT_LIST, 0)
+                                let bracket_pos = found_ft.index_of("[")
                                 if bracket_pos > 0 {
-                                    let inner_name = field_type_name.substr(bracket_pos + 1, field_type_name.len() - bracket_pos - 2)
+                                    let inner_name = found_ft.substr(bracket_pos + 1, found_ft.len() - bracket_pos - 2)
                                     let inner_ct = type_from_name(inner_name)
                                     if inner_ct != CT_VOID {
-                                        set_list_elem_type(bind_name, inner_ct)
+                                        set_list_elem_type(field_name, inner_ct)
                                     } else if is_enum_type(inner_name) != 0 || is_struct_type(inner_name) != 0 {
-                                        set_list_elem_struct(bind_name, inner_name)
-                                        set_list_elem_type(bind_name, CT_VOID)
+                                        set_list_elem_struct(field_name, inner_name)
+                                        set_list_elem_type(field_name, CT_VOID)
                                     }
                                 }
                             } else {
                                 emit_line("{c_type_str(field_ct)} {c_bind} = {scrut}.data.{resolved_variant}.{field_name};")
-                                set_var(bind_name, field_ct, 0)
+                                set_var(field_name, field_ct, 0)
                             }
                         }
-                    } else if sub_pk == NodeKind.WildcardPattern {
-                        let _skip = 0
-                    } else {
-                        let saved_scruts = match_scruts
-                        match_scruts = [MatchScrutEntry { str_val: "{scrut}.data.{resolved_variant}.{field_name}", scrut_type: field_ct }]
-                        bind_pattern_vars(sub_pat, 0, 1)
-                        match_scruts = saved_scruts
+                        sfi = sfi + 1
                     }
-                    fi = fi + 1
+                } else {
+                    let mut fi = 0
+                    while fi < sublist_length(ep_flds_sl) && fi < fcount {
+                        let sub_pat = sublist_get(ep_flds_sl, fi)
+                        let sub_pk = node_kind(sub_pat)
+                        let field_name = get_variant_field_name(vidx, fi).unwrap()
+                        let field_type_name = get_variant_field_type_str(vidx, fi).unwrap()
+                        let field_ct = type_from_name(field_type_name)
+                        if sub_pk == NodeKind.IdentPattern {
+                            let bind_name = node_name(sub_pat)
+                            if bind_name != "_" {
+                                let c_bind = c_safe_name(bind_name)
+                                if field_type_name == resolved_enum {
+                                    let fc_name = c_type_c_name(field_type_name)
+                                    emit_line("{fc_name} {c_bind} = *({fc_name}*)(intptr_t){scrut}.data.{resolved_variant}.{field_name};")
+                                    set_var(bind_name, CT_VOID, 0)
+                                    set_var_struct(bind_name, field_type_name)
+                                    var_enums.push(VarEnumEntry { name: bind_name, enum_type: field_type_name })
+                                } else if is_struct_type(field_type_name) != 0 {
+                                    emit_line("{c_type_c_name(field_type_name)} {c_bind} = {scrut}.data.{resolved_variant}.{field_name};")
+                                    set_var(bind_name, CT_VOID, 0)
+                                    set_var_struct(bind_name, field_type_name)
+                                } else if is_enum_type(field_type_name) != 0 {
+                                    emit_line("{c_type_c_name(field_type_name)} {c_bind} = {scrut}.data.{resolved_variant}.{field_name};")
+                                    set_var(bind_name, CT_INT, 0)
+                                    var_enums.push(VarEnumEntry { name: bind_name, enum_type: field_type_name })
+                                } else if field_ct == CT_LIST {
+                                    emit_line("blink_list* {c_bind} = {scrut}.data.{resolved_variant}.{field_name};")
+                                    set_var(bind_name, CT_LIST, 0)
+                                    let bracket_pos = field_type_name.index_of("[")
+                                    if bracket_pos > 0 {
+                                        let inner_name = field_type_name.substr(bracket_pos + 1, field_type_name.len() - bracket_pos - 2)
+                                        let inner_ct = type_from_name(inner_name)
+                                        if inner_ct != CT_VOID {
+                                            set_list_elem_type(bind_name, inner_ct)
+                                        } else if is_enum_type(inner_name) != 0 || is_struct_type(inner_name) != 0 {
+                                            set_list_elem_struct(bind_name, inner_name)
+                                            set_list_elem_type(bind_name, CT_VOID)
+                                        }
+                                    }
+                                } else {
+                                    emit_line("{c_type_str(field_ct)} {c_bind} = {scrut}.data.{resolved_variant}.{field_name};")
+                                    set_var(bind_name, field_ct, 0)
+                                }
+                            }
+                        } else if sub_pk == NodeKind.WildcardPattern {
+                            let _skip = 0
+                        } else {
+                            let saved_scruts = match_scruts
+                            match_scruts = [MatchScrutEntry { str_val: "{scrut}.data.{resolved_variant}.{field_name}", scrut_type: field_ct }]
+                            bind_pattern_vars(sub_pat, 0, 1)
+                            match_scruts = saved_scruts
+                        }
+                        fi = fi + 1
+                    }
                 }
             }
         }
@@ -3922,7 +3988,7 @@ pub fn resolve_type_param(param_name: Str, tparams_sl: Int, concrete_args: Str) 
             let mut _seg_idx = 0
             let mut ci = 0
             while ci <= concrete_args.len() {
-                if ci == concrete_args.len() || concrete_args.char_at(ci) == 44 {
+                if ci == concrete_args.len() || concrete_args.char_at_opt(ci).unwrap() == ',' {
                     if _seg_idx == _arg_idx {
                         return concrete_args.substring(_seg_start, ci - _seg_start)
                     }
