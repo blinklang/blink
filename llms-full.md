@@ -270,7 +270,7 @@ let nested = ##"contains #"inner"#"##   // depth-2 nesting
 | `get_arg(idx)` | Str | CLI argument by index |
 | `time_ms()` | Int | Current time in milliseconds |
 | `getpid()` | Int | Process ID |
-| `Char.from_code_point(n)` | Str | Convert char code to 1-char string (was `str_from_char_code`) |
+| `str_from_code_point(n)` | Str | Convert char code to 1-char string (was `str_from_char_code`) |
 | `unix_socket_listen(path)` | Int | Listen on Unix domain socket |
 | `unix_socket_connect(path)` | Int | Connect to Unix domain socket |
 | `unix_socket_accept(fd)` | Int | Accept incoming connection |
@@ -418,7 +418,8 @@ net.set_timeout(fd, ms)         // -> Void (set read timeout)
 | `.replace(old, new)` | Str | Replace all occurrences |
 | `.to_int()` | Int | Parse as integer |
 | `.parse_float()` | Float | Parse as float |
-| `.char_at(idx)` | Int | Char code at index |
+| `.char_at(idx)` | Option[Char] | Char at index, `None` if out of range or mid-codepoint |
+| `.byte_at(idx)` | Int | Raw byte at index |
 
 ## List[T] Methods
 
