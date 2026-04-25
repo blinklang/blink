@@ -1,6 +1,6 @@
 # Blink Language Reference
 
-> Blink is a statically-typed, effect-tracked language compiling to C. **Compiler v0.38.0**.
+> Blink is a statically-typed, effect-tracked language compiling to C. **Compiler v0.39.0**.
 
 ## Install
 
@@ -12,7 +12,7 @@ docker pull ghcr.io/blinklang/blink:latest
 docker run --rm -v "$PWD":/workspace ghcr.io/blinklang/blink run myfile.bl
 ```
 
-Tags: `latest`, `0.38`, `0.38.0` (semver). Image is `debian:bookworm-slim` with `gcc`, `zig`, `blink`, `libgc-dev`, and `libsqlite3-dev`.
+Tags: `latest`, `0.39`, `0.39.0` (semver). Image is `debian:bookworm-slim` with `gcc`, `zig`, `blink`, `libgc-dev`, and `libsqlite3-dev`.
 
 ## Recent Changes
 
@@ -179,6 +179,7 @@ test "addition works" {
 | Int | `42`, `-1` | 64-bit signed integer |
 | Float | `3.14`, `-0.5` | 64-bit double |
 | Str | `"hello"` | Immutable UTF-8 string |
+| Char | `'a'`, `'\n'` | Unicode scalar value (single-quote literal) |
 | Bool | `true`, `false` | Boolean |
 | List[T] | `[1, 2, 3]` | Dynamic array |
 | Map[K, V] | `Map()` | Hash map (construct with `Map()`, not `{}`) |
@@ -220,6 +221,7 @@ No implicit promotion between sized types and `Int`. Always use `.to_int()` to w
 | `\t` | tab |
 | `\\` | literal `\` |
 | `\"` | literal `"` |
+| `\'` | literal `'` (in Char literals) |
 | `\b` | backspace |
 | `\f` | form feed |
 | `\{` | literal `{` (suppresses interpolation) |
@@ -412,7 +414,9 @@ net.set_timeout(fd, ms)         // -> Void (set read timeout)
 | `.slice(start, end)` | Str | Extract by range |
 | `.split(sep)` | List[Str] | Split by separator |
 | `.lines()` | List[Str] | Split by newlines |
-| `.trim()` | Str | Strip whitespace |
+| `.trim()` | Str | Strip leading and trailing whitespace |
+| `.trim_right()` | Str | Strip trailing whitespace |
+| `.trim_left()` | Str | Strip leading whitespace |
 | `.to_upper()` | Str | Uppercase |
 | `.to_lower()` | Str | Lowercase |
 | `.replace(old, new)` | Str | Replace all occurrences |
@@ -420,6 +424,22 @@ net.set_timeout(fd, ms)         // -> Void (set read timeout)
 | `.parse_float()` | Float | Parse as float |
 | `.char_at(idx)` | Option[Char] | Char at index, `None` if out of range or mid-codepoint |
 | `.byte_at(idx)` | Int | Raw byte at index |
+
+## Char Methods
+
+`Char` is a Unicode scalar value. Literal: `'a'`, `'\n'`, `'\t'`, `'\\'`, `'\''`.
+
+| Method | Returns | Purpose |
+|--------|---------|---------|
+| `.to_int()` | Int | Unicode code point as integer |
+| `.to_str()` | Str | Single-character string |
+
+**Construction:**
+```blink
+let c: Char = 'a'
+let result = Char.from_code_point(65)   // -> Result[Char, ConversionError]
+let s = str_from_code_point(65)         // -> Str ("A"), from std.str
+```
 
 ## List[T] Methods
 

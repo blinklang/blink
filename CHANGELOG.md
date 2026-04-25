@@ -2,6 +2,48 @@
 
 Single source of truth for release history. `blink llms` and `blink llms --full` both append this file after the reference text, and every release version is indexed as a topic (e.g. `blink llms --topic v0.36`). **Edit only here** — `llms.md` and `llms-full.md` hold only a `## Recent Changes` stub pointing at this file.
 
+## Breaking Changes (v0.39)
+
+- **`Str.char_at(i)` now returns `Option[Char]`** (was `Int`). Returns `None` if
+  out of range or `i` points at a UTF-8 continuation byte. Use `Str.byte_at(i)`
+  for raw byte access.
+- **`Char.from_code_point(n)` now returns `Result[Char, ConversionError]`** (was `Str`).
+  Use `str_from_code_point(n)` (from `std.str`) to get the old `Str` behaviour.
+
+## What's New (v0.39)
+
+- **`Char` primitive type** — Unicode scalar value with single-quote literals
+  (`'a'`, `'\n'`, `'\t'`, `'\\'`, `'\''`). Instance methods: `.to_int()`, `.to_str()`.
+  `Char.from_code_point(n)` returns `Result[Char, ConversionError]`; use
+  `str_from_code_point(n)` for the single-character `Str`.
+- **Struct-style enum variants** — enums may now declare struct variants:
+  `enum E { Variant { field: Type } }`. Construct as `E.Variant { field: val }`,
+  destructure in `match` with `Variant { field } =>`.
+- **`Str.byte_at(i) -> Int`** — raw byte access for byte-indexed scanning
+  (replaces the old `char_at` when byte values are what you actually want).
+- **`Str.trim_right()` / `Str.trim_left()`** — strip trailing / leading
+  whitespace. Complement to the existing `.trim()`.
+- **Parser diagnostics** — error messages now show token names ("expected IDENT,
+  got `let`") instead of numeric kind IDs, and include a Rust-style source line
+  with a caret gutter. Multi-character tokens produce `^^^^^` underlines.
+
+### Fixes
+
+- `str_to_upper` / `str_to_lower` no longer corrupt non-ASCII text. They now
+  iterate codepoints instead of raw bytes.
+- Qualified struct literals `module.Type { field: val }` now compile correctly
+  (were rejected with "unknown type 'module'").
+- Formatter idempotency: wrapped multi-line method calls and block-like
+  expressions (`match`, `if`, closures, handlers, `async.scope`/`async.spawn`)
+  in expression position now round-trip cleanly. `format(format(x)) == format(x)`.
+- Truncated or malformed input (unterminated string interpolations, unclosed
+  `match`/`impl`/`trait`/struct-lit/list-lit/`type` blocks) no longer panics
+  or OOMs the parser — a structured diagnostic is emitted instead.
+- `assert(cond, msg)` now prints `msg` on failure. Previously codegen dropped the
+  second argument and hardcoded "assertion failed".
+- `assert(cond, msg)` / `debug_assert(cond, msg)` evaluate `msg` lazily — only
+  when the assertion actually fails, matching Rust/C semantics.
+
 ## What's New (v0.38)
 
 - **Sized scalar integer types** — `I8`, `I16`, `I32`, `U8`, `U16`, `U32`, `U64`
