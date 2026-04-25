@@ -5,7 +5,8 @@ blinkc="$2"
 skip_file="$3"
 name=$(basename "$f" .bl)
 [ -f "$skip_file" ] && grep -qw "$name" "$skip_file" && { echo "SKIP sem_${name}"; exit 0; }
-fmt_src=$(mktemp .tmp/fmt-sem-XXXXXX.bl)
+src_dir=$(dirname "$f")
+fmt_src=$(mktemp "$src_dir/fmt-sem-XXXXXX.bl")
 fmt_c=$(mktemp .tmp/fmt-sem-XXXXXX.c)
 fmt_bin=$(mktemp .tmp/fmt-sem-XXXXXX)
 if ! "$blinkc" "$f" "$fmt_src" --emit blink 2>/dev/null; then
