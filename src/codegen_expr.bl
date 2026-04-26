@@ -59,7 +59,7 @@ import codegen_types.{
     sf_entries, struct_field_defaults, struct_invariants, struct_option_c_type,
     tp_child1_kind, tp_child1_sname, tp_child2_kind, tp_child2_sname, tp_get_child1, tp_get_child2, tp_get_kind, tp_get_sname,
     resolve_effect_field, resolve_effect_is_ue, resolve_effect_vtable,
-    split_result_compound, tuple_c_type_name, type_from_name, type_from_name_tag, type_name_from_ct, ue_effects, c_type_from_tag,
+    split_result_compound, tuple_c_type_name, type_from_name, type_from_name_tag, type_name_from_ct, ue_effects, c_type_from_tag, is_sized_int_ct,
     var_enums
 }
 import codegen_derive.{ct_to_descriptor, descriptor_mangle, queue_promote_type}
@@ -1420,6 +1420,38 @@ fn emit_binop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.R
         return
     }
 
+    // Sized-integer arithmetic: trap on overflow per spec §03_types.md:739-760.
+    if is_sized_int_ct(left_type) && (op == "+" || op == "-" || op == "*" || op == "/" || op == "%") {
+        let lc = c_type_str(left_type)
+        let tname = type_name_from_ct(left_type)
+        let loc_line = node_line(node)
+        let result_tmp = fresh_temp("__sov")
+        let lhs_tmp = fresh_temp("__sov_l")
+        let rhs_tmp = fresh_temp("__sov_r")
+        emit_line("{lc} {lhs_tmp} = ({lc})({left_str});")
+        emit_line("{lc} {rhs_tmp} = ({lc})({right_str});")
+        if op == "/" || op == "%" {
+            emit_line("if ({rhs_tmp} == 0) \{ fprintf(stderr, \"panic: {tname} division by zero at {diag_source_file}:{loc_line}\\n\"); exit(1); }")
+            // Signed INT_MIN / -1 traps as overflow.
+            if left_type == CT_I8 {
+                emit_line("if ({lhs_tmp} == (int8_t)0x80 && {rhs_tmp} == -1) \{ fprintf(stderr, \"panic: {tname} overflow in {op} at {diag_source_file}:{loc_line}\\n\"); exit(1); }")
+            } else if left_type == CT_I16 {
+                emit_line("if ({lhs_tmp} == (int16_t)0x8000 && {rhs_tmp} == -1) \{ fprintf(stderr, \"panic: {tname} overflow in {op} at {diag_source_file}:{loc_line}\\n\"); exit(1); }")
+            } else if left_type == CT_I32 {
+                emit_line("if ({lhs_tmp} == (int32_t)0x80000000 && {rhs_tmp} == -1) \{ fprintf(stderr, \"panic: {tname} overflow in {op} at {diag_source_file}:{loc_line}\\n\"); exit(1); }")
+            }
+            emit_line("{lc} {result_tmp} = {lhs_tmp} {op} {rhs_tmp};")
+        } else {
+            // +, -, * use __builtin_*_overflow.
+            let builtin_name = if op == "+" { "add" } else if op == "-" { "sub" } else { "mul" }
+            emit_line("{lc} {result_tmp};")
+            emit_line("if (__builtin_{builtin_name}_overflow({lhs_tmp}, {rhs_tmp}, &{result_tmp})) \{ fprintf(stderr, \"panic: {tname} overflow in {op} (%lld {op} %lld) at {diag_source_file}:{loc_line}\\n\", (long long){lhs_tmp}, (long long){rhs_tmp}); exit(1); }")
+        }
+        expr_result_str = result_tmp
+        expr_result_type = left_type
+        return
+    }
+
     expr_result_str = "({left_str} {op} {right_str})"
     if op == "==" || op == "!=" || op == "<" || op == ">" || op == "<=" || op == ">=" {
         expr_result_type = CT_BOOL
@@ -1435,6 +1467,24 @@ fn emit_unaryop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag
     let operand_type = expr_result_type
     let op = node_op(node)
     if op == "-" {
+        if is_sized_int_ct(operand_type) {
+            let lc = c_type_str(operand_type)
+            let tname = type_name_from_ct(operand_type)
+            let loc_line = node_line(node)
+            let result_tmp = fresh_temp("__sneg")
+            let in_tmp = fresh_temp("__sneg_in")
+            emit_line("{lc} {in_tmp} = ({lc})({operand_str});")
+            if operand_type == CT_U8 || operand_type == CT_U16 || operand_type == CT_U32 || operand_type == CT_U64 {
+                emit_line("if ({in_tmp} != 0) \{ fprintf(stderr, \"panic: {tname} overflow in unary - at {diag_source_file}:{loc_line}\\n\"); exit(1); }")
+                emit_line("{lc} {result_tmp} = 0;")
+            } else {
+                emit_line("{lc} {result_tmp};")
+                emit_line("if (__builtin_sub_overflow(({lc})0, {in_tmp}, &{result_tmp})) \{ fprintf(stderr, \"panic: {tname} overflow in unary - at {diag_source_file}:{loc_line}\\n\"); exit(1); }")
+            }
+            expr_result_str = result_tmp
+            expr_result_type = operand_type
+            return
+        }
         expr_result_str = "(-{operand_str})"
         expr_result_type = operand_type
     } else if op == "!" {
