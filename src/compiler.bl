@@ -5,7 +5,7 @@ import typecheck.{tc_import_modules, tc_import_nodes, tc_reexport_source, tc_ree
 import diagnostics.{Diag, diag_register_file_range, lint_set_override, diag_normalize_path, diag_set_last_fix, diag_error_no_loc, diag_warn_at, diag_reset, diag_source_file, diag_module_files}
 import pkg.lockfile.{lockfile_load, lockfile_find_pkg, lockfile_pkg_count, lock_pkg_sources, lock_pkg_names, lock_pkg_versions}
 import pkg.manifest.{manifest_clear, manifest_load, manifest_has_dep, manifest_name, lint_names, lint_levels}
-import std.path.{path_join, path_dirname}
+import std.path.{path_join, path_dirname, path_basename, path_stem}
 import comment_attach.{attach_comments_pass}
 
 // compiler.bl — Self-hosting Blink compiler driver
@@ -175,7 +175,9 @@ pub fn find_src_root(source_path: Str) -> Str {
     if source_path.len() >= 4 && source_path.substring(0, 4) == "src/" {
         return "src/"
     }
-    // For files outside src/ (e.g. tests/), walk up to find the project root via blink.toml
+    // For files outside src/ (e.g. tests/), walk up to find the package root
+    // via blink.toml. No fallback — orphan files (no enclosing blink.toml)
+    // return "" and the resolver rejects bare external imports with E1010.
     let mut dir = path_dirname(source_path)
     while dir != "" && dir != "." && dir != "/" {
         if file_exists(path_join(dir, "blink.toml")) == 1 {
@@ -186,7 +188,7 @@ pub fn find_src_root(source_path: Str) -> Str {
     if file_exists("blink.toml") == 1 {
         return "src/"
     }
-    path_dirname(source_path)
+    ""
 }
 
 pub let mut trace_mode: Str = ""
@@ -195,6 +197,117 @@ pub fn trace(phase: Str, msg: Str) {
     if trace_mode == phase || trace_mode == "all" {
         io.eprintln("[trace:{phase}] {msg}")
     }
+}
+
+// Read [package].name from a blink.toml without touching the global toml
+// or manifest parsers (which would clobber state used by the lint loader).
+// Caches results — the same manifest is consulted once per import that
+// resolves into the package, so a workspace with many bare imports of
+// `mathlib` would otherwise re-parse mathlib/blink.toml N times.
+let mut pkg_name_cache_paths: List[Str] = []
+let mut pkg_name_cache_values: List[Str] = []
+
+fn read_pkg_name_from_toml(path: Str) -> Str {
+    let mut ci = 0
+    while ci < pkg_name_cache_paths.len() {
+        if pkg_name_cache_paths.get(ci).unwrap() == path {
+            return pkg_name_cache_values.get(ci).unwrap()
+        }
+        ci = ci + 1
+    }
+    let value = parse_pkg_name_from_toml(path)
+    pkg_name_cache_paths.push(path)
+    pkg_name_cache_values.push(value)
+    value
+}
+
+fn parse_pkg_name_from_toml(path: Str) -> Str {
+    if file_exists(path) == 0 {
+        return ""
+    }
+    let content = read_file(path)
+    let mut in_package = 0
+    let mut line_start = 0
+    let mut i = 0
+    while i <= content.len() {
+        let at_eol = if i == content.len() { 1 } else if content.byte_at(i) == 10 { 1 } else { 0 }
+        if at_eol == 1 {
+            let mut s = line_start
+            while s < i && (content.byte_at(s) == 32 || content.byte_at(s) == 9) {
+                s = s + 1
+            }
+            if s < i && content.byte_at(s) != 35 { // '#'
+                if content.byte_at(s) == 91 { // '['
+                    let mut e = s + 1
+                    while e < i && content.byte_at(e) != 93 { // ']'
+                        e = e + 1
+                    }
+                    let header = content.substring(s + 1, e - s - 1)
+                    if header == "package" {
+                        in_package = 1
+                    } else {
+                        in_package = 0
+                    }
+                } else if in_package == 1 {
+                    // Match `name <ws>* = <ws>* "..."`. Require the byte after
+                    // "name" to be terminator-ish so `nameservers = ...` doesn't
+                    // false-match.
+                    if i - s >= 4 && content.substring(s, 4) == "name" {
+                        let mut after: Int = 0
+                        if s + 4 < i {
+                            after = content.byte_at(s + 4)
+                        }
+                        let after_ok = after == 32 || after == 9 || after == 61 || after == 0
+                        if after_ok {
+                            let mut k = s + 4
+                            while k < i && (content.byte_at(k) == 32 || content.byte_at(k) == 9) {
+                                k = k + 1
+                            }
+                            if k < i && content.byte_at(k) == 61 { // '='
+                                k = k + 1
+                                while k < i && (content.byte_at(k) == 32 || content.byte_at(k) == 9) {
+                                    k = k + 1
+                                }
+                                if k < i && content.byte_at(k) == 34 { // '"'
+                                    let value_start = k + 1
+                                    let mut q = value_start
+                                    while q < i && content.byte_at(q) != 34 {
+                                        q = q + 1
+                                    }
+                                    if q < i {
+                                        return content.substring(value_start, q - value_start)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            line_start = i + 1
+        }
+        i = i + 1
+    }
+    ""
+}
+
+// Given a src_root like "examples/with_deps/mathlib/src/", return the
+// package name from the sibling blink.toml. Returns "" if no manifest.
+fn entry_pkg_for_src_root(src_root: Str) -> Str {
+    if src_root == "" {
+        return ""
+    }
+    let mut pkg_dir = src_root
+    if pkg_dir.ends_with("/") {
+        pkg_dir = pkg_dir.substring(0, pkg_dir.len() - 1)
+    }
+    if pkg_dir.ends_with("src") {
+        pkg_dir = path_dirname(pkg_dir)
+    }
+    if pkg_dir == "" {
+        pkg_dir = "."
+    }
+    let manifest_path = path_join(pkg_dir, "blink.toml")
+    read_pkg_name_from_toml(manifest_path)
 }
 
 fn validate_lockfile_versions() ! Diag.Report {
@@ -275,7 +388,7 @@ fn compiler_get_home() -> Str {
     env.var("HOME") ?? ""
 }
 
-fn resolve_from_lockfile(dotted_path: Str, _src_root: Str) -> Option[Str] {
+fn resolve_from_lockfile(dotted_path: Str, _src_root: Str) -> Option[Str] ! Diag.Report {
     if lockfile_pkg_count() == 0 {
         return None
     }
@@ -402,15 +515,31 @@ fn resolve_from_lockfile(dotted_path: Str, _src_root: Str) -> Option[Str] {
     }
 
     if sub_path == "" {
-        let lib_path_bl = path_join(base_dir, "src/lib.bl")
-        if file_exists(lib_path_bl) == 1 {
-            return Some(lib_path_bl)
+        // Spec §10.5: the bare-package entry file is <pkg-root>/src/<name>.bl
+        // where <name> is [package].name from the package's blink.toml.
+        // Fall back to the lockfile-recorded name if the package has no
+        // manifest at base_dir (e.g. cached registry entries that ship
+        // without a full manifest in their tree).
+        let manifest_path = path_join(base_dir, "blink.toml")
+        let mut entry_name = ""
+        if file_exists(manifest_path) == 1 {
+            entry_name = read_pkg_name_from_toml(manifest_path)
         }
-        let lib_path = path_join(base_dir, "src/lib.pact")
-        if file_exists(lib_path) == 1 {
-            return Some(lib_path)
+        if entry_name == "" {
+            entry_name = pkg_name
         }
-        return None
+        if entry_name == "" {
+            return None
+        }
+        // entry_name comes either from validate_package_name'd manifest or
+        // from the lockfile; in both cases dots are forbidden, so no
+        // dots-to-slashes translation is needed here.
+        let entry_path = path_join(base_dir, path_join("src", entry_name.concat(".bl")))
+        if file_exists(entry_path) == 1 {
+            return Some(entry_path)
+        }
+        diag_error_no_loc("PackageEntryNotFound", "E1009", "package entry not found: '{dotted_path}' — expected '{entry_path}'", "create '{entry_path}', or check the 'name' field in '{manifest_path}'")
+        return Some("")
     }
 
     let sub_rel = dots_to_slashes(sub_path)
@@ -426,13 +555,23 @@ fn resolve_from_lockfile(dotted_path: Str, _src_root: Str) -> Option[Str] {
 }
 
 pub fn resolve_module_path(dotted_path: Str, src_root: Str) -> Str ! Diag.Report {
+    let is_std_ns = dotted_path.starts_with("std.")
+    let is_pkg_ns = dotted_path.starts_with("pkg.")
+
+    // Orphan-file guard: a source file with no enclosing blink.toml has
+    // src_root == "". Bare external imports from such a file are E1010 —
+    // only stdlib (std.*) and bundled package-manager modules (pkg.*) are
+    // allowed without a package context.
+    if src_root == "" && !is_std_ns && !is_pkg_ns {
+        diag_error_no_loc("OrphanFile", "E1010", "import '{dotted_path}' is not allowed — file has no enclosing blink.toml so it is not part of any package", "create a blink.toml above this file, or import only std.* / pkg.* modules")
+        return ""
+    }
+
     let rel = dots_to_slashes(dotted_path)
     let full_bl = path_join(src_root, rel.concat(".bl"))
     let bl_exists = file_exists(full_bl) == 1
     let full_pact = path_join(src_root, rel.concat(".pact"))
     let full = if bl_exists { full_bl } else { full_pact }
-
-    let is_std_ns = dotted_path.starts_with("std.")
 
     // Step 1: Check local src/ (skip for std.* — reserved stdlib namespace)
     let local_exists = if is_std_ns { 0 } else if bl_exists { 1 } else { file_exists(full_pact) == 1 }
@@ -443,7 +582,7 @@ pub fn resolve_module_path(dotted_path: Str, src_root: Str) -> Str ! Diag.Report
 
     // If local exists, use it (but warn if it shadows a dependency)
     if local_exists {
-        if dep_path.is_some() {
+        if dep_path.is_some() && dep_path.unwrap() != "" {
             io.println("warning[W1000]: local module shadows dependency")
             io.println(" --> {full}")
             io.println("  = note: import '{dotted_path}' matches both local file and a dependency")
@@ -924,6 +1063,8 @@ pub fn reset_compiler_state() {
     current_import_file = ""
     current_import_module = "__main__"
     lockfile_loaded = 0
+    pkg_name_cache_paths.clear()
+    pkg_name_cache_values.clear()
 }
 
 fn find_module_key(file_path: Str) -> Str {
@@ -979,6 +1120,25 @@ fn load_module(dotted_path: Str, file_path: Str, src_root: Str, all_programs: Li
                 diag_source_file = display_path
                 diag_error_no_loc("InvalidModuleAnnotation", "E1008", "@module(\"{ann_val}\") is invalid — file is in package '{pkg}', @module can only use the parent package name '{pkg}'", "use @module(\"{pkg}\") or remove the annotation")
                 diag_source_file = saved_diag
+            } else {
+                // Spec §10.5: the package entry file is <root>/src/<name>.bl.
+                // If this file's basename matches its own package's
+                // [package].name, it IS the entry file — its @module argument
+                // must equal the package name. Non-entry files remain
+                // unconstrained at the root level. Works whether the file is
+                // in the current package (pkg == "__root__") or in a
+                // dependency (pkg == "" because file_path is outside src_root).
+                let own_src_root = find_src_root(file_path)
+                let entry_pkg = entry_pkg_for_src_root(own_src_root)
+                if entry_pkg != "" {
+                    let basename = path_stem(file_path)
+                    if basename == entry_pkg && ann_val != entry_pkg {
+                        let saved_diag = diag_source_file
+                        diag_source_file = display_path
+                        diag_error_no_loc("InvalidModuleAnnotation", "E1008", "@module(\"{ann_val}\") is invalid — entry file of package '{entry_pkg}' must declare @module(\"{entry_pkg}\") or omit the annotation", "use @module(\"{entry_pkg}\") or remove the annotation")
+                        diag_source_file = saved_diag
+                    }
+                }
             }
             qualifier = ann_val
         } else {

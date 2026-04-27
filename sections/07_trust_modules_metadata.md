@@ -944,7 +944,7 @@ import pg                    // resolves to libs/pg/src/pg.bl
 import pg.protocol           // resolves to libs/pg/src/protocol.bl
 ```
 
-**Package name grammar.** The `[package].name` field must match `[a-z][a-z0-9_]*`. Hyphens are forbidden. Dots are forbidden in the bare name (dots are the import sub-path separator and are reserved for registry paths per §8.9.2). The constraint exists so that the four-way invariant — `[package].name` = directory name = entry filename stem = `@module(...)` argument — holds character-for-character with no transformation table.
+**Package name grammar.** The `[package].name` field must match `[a-z][a-z0-9_]*` (validated as `error[E1011]`). Hyphens are forbidden. Dots are forbidden in the bare name (dots are the import sub-path separator and are reserved for registry paths per §8.9.2). The constraint exists so that the four-way invariant — `[package].name` = directory name = entry filename stem = `@module(...)` argument — holds character-for-character with no transformation table.
 
 **Project root discovery.** A source file's package root is the nearest ancestor directory containing a `blink.toml`, walking up from the file being compiled. `src/` beneath the package root is the source root. Files under `tests/`, `examples/`, and `bench/` are *peers* of `src/`, not children: their imports resolve against the same package root that walking up from `src/` would find. This rule applies uniformly to first-party (self-package) and third-party imports — there is no special-case "self-import" branch.
 
@@ -959,14 +959,14 @@ libs/pg/
                           import pg → libs/pg/src/pg.bl
 ```
 
-A source file with no enclosing `blink.toml` is not part of any package. Bare external imports from such a file are a compile error (E1006); only stdlib imports (`std.*`) and absolute file paths from the compiler driver are allowed.
+A source file with no enclosing `blink.toml` is not part of any package. Bare external imports from such a file are a compile error (E1010); only stdlib imports (`std.*`) and absolute file paths from the compiler driver are allowed.
 
-**`@module` on the entry file.** The entry file's `@module(...)` argument, if present, must equal `[package].name`. If they disagree, the compiler rejects with `error[E1002]`. The annotation may be omitted on the entry file — its meaning is implied by location — but conforming style is to declare it explicitly for parity with non-entry files.
+**`@module` on the entry file.** The entry file's `@module(...)` argument, if present, must equal `[package].name`. If they disagree, the compiler rejects with `error[E1008]`. The annotation may be omitted on the entry file — its meaning is implied by location — but conforming style is to declare it explicitly for parity with non-entry files.
 
 **Failure mode.** When the entry file is missing, the compiler reports a single path:
 
 ```
-error[E1003]: package entry not found
+error[E1009]: package entry not found
   --> tests/test_connect.bl:3:8
    |
  3 | import pg
@@ -1112,6 +1112,10 @@ import codegen_common.{emit_line, CT_INT, CT_STRING, c_fn_name}
 | E1003 | Item not found | Named item doesn't exist or isn't `pub` in the target module |
 | E1004 | Version conflict | Diamond dependency with incompatible versions |
 | E1005 | Ambiguous import | Item name exists in multiple imported modules (use qualified path) |
+| E1008 | Invalid module annotation | `@module(...)` disagrees with parent package or entry file's `[package].name` |
+| E1009 | Package entry not found | Bare `import <pkg>` resolved to a package whose `src/<name>.bl` does not exist |
+| E1010 | Orphan file | Bare external import from a file with no enclosing `blink.toml` |
+| E1011 | Invalid package name | `[package].name` violates the `[a-z][a-z0-9_]*` grammar |
 | E1012 | Duplicate public symbol | Module both defines and re-exports the same public name |
 
 ```
