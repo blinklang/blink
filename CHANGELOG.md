@@ -2,6 +2,35 @@
 
 Single source of truth for release history. `blink llms` and `blink llms --full` both append this file after the reference text, and every release version is indexed as a topic (e.g. `blink llms --topic v0.36`). **Edit only here** — `llms.md` and `llms-full.md` hold only a `## Recent Changes` stub pointing at this file.
 
+## What's New (v0.42)
+
+### Runtime contracts (spec §refinement-contracts)
+
+- **`@ensures(expr)`** — postcondition runtime-checked at every return site. `result` binds to the return value.
+- **`@where(expr)`** — runtime-checked at refined-type boundaries (param coercion, return coercion).
+- **`old(expr)`** — inside `@ensures`, snapshot an argument's value at fn entry; the C codegen materializes `__old_N` locals at the prologue.
+- **`@pure`** — declares the fn has no effects, no mutation, no FFI; calls only other `@pure` fns. Recursion allowed. Enforced at typecheck.
+- **`@modifies(...)`** — parses-and-validates only (stub reserving syntax for the future SMT backend).
+- New diagnostics: `E1300`–`E1306` (predicate validator — rejects loops, assignments, effectful/impure calls in predicates), `E1307` (purity check), `E1308` (`@modifies` shape check).
+
+### Stdlib
+
+- **`std.libc.poll(fds, timeout_ms) -> Result[List[Pollfd], Str] ! IO`** — first curated libc syscall wrapper (γ-doctrine). Exposes `Pollfd`, `POLL_EVT_IN/PRI/OUT/ERR/HUP/NVAL`. `timeout_ms` semantics match `poll(2)`.
+- `std.float.fabs` and `std.float.is_nan` now annotated `@pure`; `std.float.close_to` carries an `@ensures` clause.
+
+### FFI
+
+- **`Ptr[T]`** is now accepted in `@ffi` signatures when `T` is `@ffi.struct` (E0810 message updated to mention `@ffi.struct`).
+- When an `@ffi(..., header: "X")` references a header that an `@ffi.struct` already `#include`'d, the compiler suppresses its redundant `extern` declaration — the system header's prototype is the only one in scope.
+
+### Fixes
+
+- **String interpolation of sized integers (`I8`/`I16`/`I32`/`U8`/`U16`/`U32`/`U64`) no longer segfaults.** Previously fell through to a `%s` catch-all that passed the integer as a pointer.
+- **`Result` `match` arms now bind the inner type.** `match res { Ok(out) => out.get(0)... }` no longer decays to `Option[Int]`.
+- **`Option[List[T]]` returned from a fn now carries `T` through `match Some(out)` binding** — struct field access on the unwrapped value no longer fails C compile.
+- **`if/else` and `match` branches now unify concrete payload types.** `if b { Ok(1) } else { Err(false) }` correctly infers `Result[Int, Bool]` instead of `Result[Int, ?]`, and let-annotation type checks now catch mismatched declarations.
+- **`type Port = Int`** aliases now lower correctly at fn params/returns (was emitting `void` instead of `int64_t`).
+
 ## Breaking Changes (v0.41)
 
 - **`return val` is now type-checked against the declared return type.**

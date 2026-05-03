@@ -1,6 +1,6 @@
 # Blink Language Reference
 
-> Blink is a statically-typed, effect-tracked language compiling to C. **Compiler v0.41.0**.
+> Blink is a statically-typed, effect-tracked language compiling to C. **Compiler v0.42.0**.
 
 ## Install
 
@@ -12,7 +12,7 @@ docker pull ghcr.io/blinklang/blink:latest
 docker run --rm -v "$PWD":/workspace ghcr.io/blinklang/blink run myfile.bl
 ```
 
-Tags: `latest`, `0.41`, `0.41.0` (semver). Image is `debian:bookworm-slim` with `gcc`, `zig`, `blink`, `libgc-dev`, and `libsqlite3-dev`.
+Tags: `latest`, `0.42`, `0.42.0` (semver). Image is `debian:bookworm-slim` with `gcc`, `zig`, `blink`, `libgc-dev`, and `libsqlite3-dev`.
 
 ## Recent Changes
 
@@ -794,9 +794,11 @@ Selective imports (`import mod.{a, b}`) restrict which *unqualified* items are v
 | `@derive(...)` | type | Auto-generate traits (Serialize, Deserialize, Eq, Ord, Hash, Debug, Clone, Display) |
 | `@src(req)` | fn | Requirement traceability |
 | `@requires(expr)` | fn | Precondition |
-| `@ensures(expr)` | fn | Postcondition (`result` = return value) |
-| `@where(expr)` | fn, type | Type constraint |
+| `@ensures(expr)` | fn | Postcondition runtime-checked at every return (`result` = return value). Inside the predicate, `old(arg)` snapshots an argument's value at fn entry. |
+| `@where(expr)` | fn, type | Type constraint; on a fn, runtime-checked at param/return coercion |
 | `@invariant(expr)` | type | Type invariant |
+| `@pure` | fn | No effects, no mutation, no FFI; may only call other `@pure` fns. Recursion allowed. |
+| `@modifies(...)` | fn | Reserves syntax for the future SMT backend (parses-and-validates only) |
 | `@ffi("lib", "sym")` | fn | FFI binding — link to C function |
 | `@trusted` | fn | FFI audit marker — function reviewed for safety |
 | `@allow(W0600)` | fn, type | Suppress specific diagnostic warning |
@@ -958,9 +960,10 @@ impl BlockHandler for Transaction {
 | `std.args` | CLI argument parsing (flags, options, commands) | `import std.args` |
 | `std.arena` | Arena introspection: `bytes_used()` returns live bytes in the innermost active `with arena { }` block | `import std.arena` |
 | `std.db` | SQLite database with effect-based API (`DB.Read`, `DB.Write`), `Template[DB]` parameterization, `Row`, `Stmt`, `DBError`, transactions | `import std.db` |
-| `std.float` | Float helpers: `fabs(x)` (pure-Blink absolute value), `is_nan(x)` (IEEE check), `close_to(x, y, tol)` (non-panicking proximity test). Methods: `x.fabs()`, `x.is_nan()`, `x.close_to(y, t)` | `import std.float` |
+| `std.float` | Float helpers: `fabs(x)` and `is_nan(x)` are `@pure`; `close_to(x, y, tol)` carries an `@ensures` clause. Methods: `x.fabs()`, `x.is_nan()`, `x.close_to(y, t)` | `import std.float` |
 | `std.http` | HTTP client and server | `import std.http` |
 | `std.json` | JSON parser and serializer | `import std.json` |
+| `std.libc` | Curated libc syscall wrappers. `Pollfd`, `POLL_EVT_IN/PRI/OUT/ERR/HUP/NVAL`, `poll(fds, timeout_ms) -> Result[List[Pollfd], Str] ! IO` (semantics match `poll(2)`) | `import std.libc` |
 | `std.net` | TCP networking: `TcpSocket`, `TcpListener`, `NetError` (`Timeout`, `ConnectionRefused`, `DnsFailure`, `TlsError`, `InvalidUrl`, `BindError`, `ProtocolError`, `IoError`), `tcp_listen`, `tcp_connect`, `tcp_accept`, `tcp_read`, `tcp_write`, `tcp_read_bytes`, `tcp_write_bytes` | `import std.net` |
 | `std.path` | Path utilities: `path_join(a, b)`, `path_dirname(path)`, `path_basename(path)`, `path_parent(path)` (POSIX `dirname(1)` semantics — strips trailing slashes before walking up) | `import std.path` |
 | `std.process` | Process spawning: `spawn(cmd, args) -> Pid`, `Pid.wait()`, `Pid.kill()`, `Pid.send_signal(sig)`. POSIX signal constants: `SIGHUP`, `SIGINT`, `SIGQUIT`, `SIGKILL`, `SIGTERM` | `import std.process` |
