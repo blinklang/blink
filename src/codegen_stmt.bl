@@ -17,7 +17,8 @@ import codegen_types.{
     cg_handler_vtable_field, cg_handler_vtable_type,
     cg_in_handler_body, cg_indent, cg_let_target_ann,
     cg_let_target_name, cg_let_target_type, cg_lines, cg_program_node,
-    cg_temp_counter, cg_trace_codegen, compound_name_from_ann,
+    cg_temp_counter, cg_trace_codegen, cg_ensures_result_var, cg_old_snapshot_vars,
+    compound_name_from_ann,
     emit_arena_restore_helper, emit_bh_cleanup_for_type, emit_cl_cleanup_for_type, emit_ev_restore_helper, emit_handle_cleanup, emit_line, ev_field, fn_node_has_effects,
     emit_struct_option_typedef,
     emitted_let_names, emitted_let_set, ensure_iter_type,
@@ -62,7 +63,7 @@ import codegen_types.{
     struct_reg_names, struct_reg_set, struct_result_c_type, sv_tp, tp_from_ann,
     split_result_compound, tp_child1_kind, tp_child1_sname, tp_child2_kind, tp_child2_sname,
     tp_get_kind, tp_get_sname, type_from_name, type_from_name_tag,
-    type_name_from_ct, is_compound_tag, var_enums,
+    type_name_from_ct, type_where_preds, cg_where_self_var, is_compound_tag, var_enums,
     CaptureEntry, ClosureCapInfo,
     closure_captures, closure_cap_infos, lookup_closure_lit_cap_idx,
     closure_sig_hash
@@ -3287,6 +3288,180 @@ fn emit_requires_assertions(fn_node: Int) ! Codegen.Emit, Codegen.Register, Code
 }
 
 @allow(UnrestoredMutation, IncompleteStateRestore)
+fn collect_old_snapshots(expr: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
+    if expr == -1 { return }
+    let k = node_kind(expr)
+    if k == NodeKind.Call {
+        let callee = node_left(expr)
+        if callee != -1 && node_name(callee) == "old" {
+            let args_sl = node_args(expr)
+            if args_sl != -1 && sublist_length(args_sl) > 0 {
+                let inner = sublist_get(args_sl, 0)
+                emit_expr(inner)
+                let v = expr_result_str
+                let snap = fresh_temp("__old_")
+                emit_line("int64_t {snap} = (int64_t)({v});")
+                cg_old_snapshot_vars.insert("{expr}", snap)
+            }
+            return
+        }
+        // Walk args of non-old calls.
+        let args_sl = node_args(expr)
+        if args_sl != -1 {
+            let mut i = 0
+            while i < sublist_length(args_sl) {
+                collect_old_snapshots(sublist_get(args_sl, i))
+                i = i + 1
+            }
+        }
+        return
+    }
+    if k == NodeKind.MethodCall {
+        collect_old_snapshots(node_obj(expr))
+        let m_args_sl = node_args(expr)
+        if m_args_sl != -1 {
+            let mut i = 0
+            while i < sublist_length(m_args_sl) {
+                collect_old_snapshots(sublist_get(m_args_sl, i))
+                i = i + 1
+            }
+        }
+        return
+    }
+    if k == NodeKind.BinOp {
+        collect_old_snapshots(node_left(expr))
+        collect_old_snapshots(node_right(expr))
+        return
+    }
+    if k == NodeKind.UnaryOp {
+        collect_old_snapshots(node_left(expr))
+        return
+    }
+    if k == NodeKind.FieldAccess {
+        collect_old_snapshots(node_obj(expr))
+        return
+    }
+    if k == NodeKind.IndexExpr {
+        collect_old_snapshots(node_obj(expr))
+        collect_old_snapshots(node_index(expr))
+        return
+    }
+    if k == NodeKind.RangeLit {
+        collect_old_snapshots(node_start(expr))
+        collect_old_snapshots(node_end(expr))
+        return
+    }
+    if k == NodeKind.IfExpr {
+        collect_old_snapshots(node_condition(expr))
+        collect_old_snapshots(node_then_body(expr))
+        collect_old_snapshots(node_else_body(expr))
+        return
+    }
+    if k == NodeKind.MatchExpr {
+        collect_old_snapshots(node_scrutinee(expr))
+        let arms_sl = node_arms(expr)
+        if arms_sl != -1 {
+            let mut i = 0
+            while i < sublist_length(arms_sl) {
+                let arm = sublist_get(arms_sl, i)
+                let g = node_guard(arm)
+                if g != -1 { collect_old_snapshots(g) }
+                collect_old_snapshots(node_body(arm))
+                i = i + 1
+            }
+        }
+        return
+    }
+    if k == NodeKind.Block {
+        let stmts_sl = node_stmts(expr)
+        if stmts_sl != -1 {
+            let mut i = 0
+            while i < sublist_length(stmts_sl) {
+                collect_old_snapshots(sublist_get(stmts_sl, i))
+                i = i + 1
+            }
+        }
+        return
+    }
+    if k == NodeKind.ExprStmt {
+        collect_old_snapshots(node_value(expr))
+        return
+    }
+}
+
+pub fn fn_has_ensures(fn_node: Int) -> Int {
+    has_annotation(fn_node, "ensures")
+}
+
+@allow(UnrestoredMutation, IncompleteStateRestore)
+fn emit_old_snapshots(fn_node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
+    let anns_sl = node_handlers(fn_node)
+    if anns_sl == -1 { return }
+    let mut i = 0
+    while i < sublist_length(anns_sl) {
+        let ann = sublist_get(anns_sl, i)
+        if node_name(ann) == "ensures" {
+            let args_sl = node_args(ann)
+            if args_sl != -1 && sublist_length(args_sl) > 0 {
+                collect_old_snapshots(sublist_get(args_sl, 0))
+            }
+        }
+        i = i + 1
+    }
+}
+
+@allow(UnrestoredMutation, IncompleteStateRestore)
+pub fn emit_ensures_assertions(fn_node: Int, result_var_c: Str) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
+    let anns_sl = node_handlers(fn_node)
+    if anns_sl == -1 { return }
+    let saved_result = cg_ensures_result_var
+    cg_ensures_result_var = result_var_c
+    let mut i = 0
+    while i < sublist_length(anns_sl) {
+        let ann = sublist_get(anns_sl, i)
+        if node_name(ann) == "ensures" {
+            let args_sl = node_args(ann)
+            if args_sl != -1 && sublist_length(args_sl) > 0 {
+                let pred_node = sublist_get(args_sl, 0)
+                emit_expr(pred_node)
+                let cond = expr_result_str
+                emit_line("if (!({cond})) \{ fprintf(stderr, \"postcondition failed: @ensures in %s\\n\", \"{cg_current_fn_name}\"); exit(1); }")
+            }
+        }
+        i = i + 1
+    }
+    cg_ensures_result_var = saved_result
+}
+
+@allow(UnrestoredMutation, IncompleteStateRestore)
+pub fn emit_where_assert(type_name: Str, c_val: Str) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
+    if !type_where_preds.contains_key(type_name) { return }
+    let pred = type_where_preds.get(type_name).unwrap()
+    let saved_self = cg_where_self_var
+    cg_where_self_var = c_val
+    emit_expr(pred)
+    let cond = expr_result_str
+    emit_line("if (!({cond})) \{ fprintf(stderr, \"refinement violated: @where on %s\\n\", \"{type_name}\"); exit(1); }")
+    cg_where_self_var = saved_self
+}
+
+@allow(UnrestoredMutation, IncompleteStateRestore)
+pub fn emit_param_where_checks(fn_node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
+    let params_sl = node_params(fn_node)
+    if params_sl == -1 { return }
+    let mut i = 0
+    while i < sublist_length(params_sl) {
+        let p = sublist_get(params_sl, i)
+        let ptype = node_type_name(p)
+        if type_where_preds.contains_key(ptype) {
+            let pname = c_safe_name(node_name(p))
+            emit_where_assert(ptype, pname)
+        }
+        i = i + 1
+    }
+}
+
+@allow(UnrestoredMutation, IncompleteStateRestore)
 pub fn emit_impl_method_def(fn_node: Int, impl_type: Str, im_node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
     push_scope()
     cg_temp_counter = 0
@@ -3448,6 +3623,11 @@ pub fn emit_impl_method_def(fn_node: Int, impl_type: Str, im_node: Int) ! Codege
     emit_trace_enter(fn_node, mname, cg_current_module, trace_file)
 
     emit_requires_assertions(fn_node)
+    emit_param_where_checks(fn_node)
+    if fn_has_ensures(fn_node) != 0 {
+        cg_old_snapshot_vars = Map()
+        emit_old_snapshots(fn_node)
+    }
     emit_fn_body(node_body(fn_node), body_ret)
     if ret_type == CT_VOID {
         emit_trace_exit_void()
@@ -3650,7 +3830,7 @@ fn emit_trace_exit_with_val(val_expr: Str, ret_str: Str) ! Codegen.Emit {
 }
 
 @allow(UnrestoredMutation)
-pub fn emit_return_with_trace(val_str: Str, ret_type: Int) ! Codegen.Emit {
+pub fn emit_return_with_trace(val_str: Str, ret_type: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
     let mut actual_val = val_str
     if cg_in_handler_body != 0 && cg_handler_body_is_ue != 0 && ret_type == CT_RESULT && cg_current_fn_option_inner == CT_PTR {
         let fsi = get_fn_ret_struct_inner(cg_current_fn_name)
@@ -3682,14 +3862,39 @@ pub fn emit_return_with_trace(val_str: Str, ret_type: Int) ! Codegen.Emit {
         }
     }
     let ret_name = type_name_from_ct(ret_type)
+    let mut ret_alias = ""
+    let mut has_ensures = 0
+    if cg_current_fn_node != -1 {
+        let rname = node_return_type(cg_current_fn_node)
+        if type_where_preds.contains_key(rname) { ret_alias = rname }
+        has_ensures = fn_has_ensures(cg_current_fn_node)
+    }
     if cg_in_traced_fn != 0 && trace_ret_is_primitive(ret_name) != 0 {
         let ret_tmp = fresh_temp("__trace_rv_")
         emit_line("{c_type_str(ret_type)} {ret_tmp} = {actual_val};")
+        if ret_alias != "" {
+            emit_where_assert(ret_alias, ret_tmp)
+        }
+        if has_ensures != 0 {
+            emit_ensures_assertions(cg_current_fn_node, ret_tmp)
+        }
         emit_trace_exit_with_val(ret_tmp, ret_name)
         emit_line("return {ret_tmp};")
     } else {
-        emit_trace_exit_with_val(actual_val, ret_name)
-        emit_line("return {actual_val};")
+        let mut rv_var = actual_val
+        if has_ensures != 0 || ret_alias != "" {
+            let ret_tmp2 = fresh_temp("__ens_rv_")
+            emit_line("{c_type_str(ret_type)} {ret_tmp2} = {actual_val};")
+            if ret_alias != "" {
+                emit_where_assert(ret_alias, ret_tmp2)
+            }
+            if has_ensures != 0 {
+                emit_ensures_assertions(cg_current_fn_node, ret_tmp2)
+            }
+            rv_var = ret_tmp2
+        }
+        emit_trace_exit_with_val(rv_var, ret_name)
+        emit_line("return {rv_var};")
     }
 }
 
@@ -4015,6 +4220,11 @@ pub fn emit_fn_def(fn_node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope
     emit_trace_enter(fn_node, name, cg_current_module, trace_file)
 
     emit_requires_assertions(fn_node)
+    emit_param_where_checks(fn_node)
+    if fn_has_ensures(fn_node) != 0 {
+        cg_old_snapshot_vars = Map()
+        emit_old_snapshots(fn_node)
+    }
     emit_fn_body(node_body(fn_node), body_ret)
     if ret_type == CT_VOID {
         emit_trace_exit_void()

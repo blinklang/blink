@@ -1,0 +1,95 @@
+// Phase 0 of the runtime-contracts project: predicate sublanguage validator.
+//
+// Predicates inside @requires / @ensures / @where must lie in the
+// SMT-decidable subset so that today's runtime checks can later be
+// promoted to compile-time proofs without rewriting every contract.
+
+import compile_test_helpers
+
+// ── Acceptance: shapes the validator must allow ───────────────────────
+
+test "predicate accepts comparison + boolean op + arithmetic" {
+    let src = "@requires(x > 0 && x < 100)\nfn pv_check(x: Int) -> Int \{ x + 1 }\nfn main() \{ pv_check(1) }\n"
+    let out = compile_test_helpers.compile_and_capture(src, "_pv_basic")
+    assert(!out.contains("E1300"))
+    assert(!out.contains("E1301"))
+    assert(!out.contains("E1302"))
+    assert(!out.contains("E1303"))
+    assert(!out.contains("E1306"))
+}
+
+test "predicate accepts range membership" {
+    let src = "@requires(x in 0..100)\nfn pv_check(x: Int) -> Int \{ x }\nfn main() \{ pv_check(1) }\n"
+    let out = compile_test_helpers.compile_and_capture(src, "_pv_range")
+    assert(!out.contains("E1300"))
+}
+
+test "predicate accepts FieldAccess on a parameter" {
+    let src = "type Pt \{ x: Int, y: Int }\n@requires(p.x > 0)\nfn pv_check(p: Pt) -> Int \{ p.x }\nfn main() \{ pv_check(Pt \{ x: 1, y: 2 }) }\n"
+    let out = compile_test_helpers.compile_and_capture(src, "_pv_field")
+    assert(!out.contains("E1300"))
+}
+
+test "predicate accepts IfExpr" {
+    let src = "@requires(if x > 0 \{ x < 100 } else \{ x > -100 })\nfn pv_check(x: Int) -> Int \{ x }\nfn main() \{ pv_check(1) }\n"
+    let out = compile_test_helpers.compile_and_capture(src, "_pv_if")
+    assert(!out.contains("E1300"))
+}
+
+test "predicate accepts MatchExpr" {
+    let src = "@requires(match x \{ 0 => false, _ => true })\nfn pv_check(x: Int) -> Int \{ x }\nfn main() \{ pv_check(1) }\n"
+    let out = compile_test_helpers.compile_and_capture(src, "_pv_match")
+    assert(!out.contains("E1300"))
+}
+
+test "predicate accepts bootstrap-whitelisted len() method" {
+    let src = "@requires(xs.len() > 0)\nfn pv_first(xs: List[Int]) -> Int \{ xs.get(0).unwrap() }\nfn main() \{ pv_first([1, 2]) }\n"
+    let out = compile_test_helpers.compile_and_capture(src, "_pv_len")
+    assert(!out.contains("E1302"))
+}
+
+test "predicate accepts multiple @requires (regression for current behavior)" {
+    let src = "@requires(a >= 0)\n@requires(b >= 0)\nfn pv_add(a: Int, b: Int) -> Int \{ a + b }\nfn main() \{ pv_add(1, 2) }\n"
+    let out = compile_test_helpers.compile_and_capture(src, "_pv_multi")
+    assert(!out.contains("E1300"))
+}
+
+// ── Rejection: one fixture per E130x diagnostic ───────────────────────
+
+test "E1304: result identifier rejected inside @requires" {
+    let src = "@requires(result > 0)\nfn pv_check(x: Int) -> Int \{ x }\nfn main() \{ pv_check(1) }\n"
+    let out = compile_test_helpers.compile_and_capture(src, "_pv_result_req")
+    assert(out.contains("E1304"))
+}
+
+test "E1305: old() rejected inside @requires" {
+    let src = "@requires(old(x) > 0)\nfn pv_check(x: Int) -> Int \{ x }\nfn main() \{ pv_check(1) }\n"
+    let out = compile_test_helpers.compile_and_capture(src, "_pv_old")
+    assert(out.contains("E1305"))
+}
+
+test "E1301: effectful FFI call rejected in predicate" {
+    let src = "@ffi(\"getpid\")\n@trusted\nfn pv_c_getpid() -> Int ! FFI \{ }\n@requires(pv_c_getpid() > 0)\nfn pv_check(x: Int) -> Int \{ x }\nfn main() \{ pv_check(1) }\n"
+    let out = compile_test_helpers.compile_and_capture(src, "_pv_eff")
+    assert(out.contains("E1301"))
+}
+
+test "E1302: non-pure user helper rejected in predicate" {
+    let src = "fn pv_helper(x: Int) -> Int \{ x + 1 }\n@requires(pv_helper(x) > 0)\nfn pv_check(x: Int) -> Int \{ x }\nfn main() \{ pv_check(1) }\n"
+    let out = compile_test_helpers.compile_and_capture(src, "_pv_impure")
+    assert(out.contains("E1302"))
+}
+
+// ── @where on type alias is also gated by the validator ───────────────
+
+test "@where accepts a simple predicate over self" {
+    let src = "type Pos = Int @where(self > 0)\nfn pv_use(p: Pos) -> Pos \{ p }\nfn main() \{ pv_use(5) }\n"
+    let out = compile_test_helpers.compile_and_capture(src, "_pv_where_ok")
+    assert(!out.contains("E1300"))
+}
+
+test "@where rejects result identifier (E1304)" {
+    let src = "type Bad = Int @where(result > 0)\nfn main() \{ }\n"
+    let out = compile_test_helpers.compile_and_capture(src, "_pv_where_result")
+    assert(out.contains("E1304"))
+}

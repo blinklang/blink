@@ -1,0 +1,96 @@
+// Phase 1 of the runtime-contracts project: @pure annotation + purity check.
+//
+// `@pure` is a conservative purity marker. A function is @pure iff:
+//   - it declares no effects on its signature
+//   - its body contains no assignment, no mutating method (push, pop,
+//     append, clear, insert, remove, set), no while/for/loop, no FFI
+//     call, no List/Map/Set allocation
+//   - every fn it calls is itself @pure or on the bootstrap whitelist
+//     (len, is_empty, unwrap, abs, fabs)
+//
+// Recursion is allowed; termination is not checked (deferred to SMT).
+
+import compile_test_helpers
+
+// ── Acceptance ────────────────────────────────────────────────────────
+
+test "@pure: simple arithmetic body is pure" {
+    let src = "@pure\nfn pv_double(x: Int) -> Int \{ x * 2 }\nfn main() \{ pv_double(3) }\n"
+    let out = compile_test_helpers.compile_and_capture(src, "_pure_arith")
+    assert(!out.contains("E1307"))
+}
+
+test "@pure: recursive body is allowed" {
+    let src = "@pure\nfn pv_fact(n: Int) -> Int \{\n    if n <= 1 \{ 1 } else \{ n * pv_fact(n - 1) }\n}\nfn main() \{ pv_fact(5) }\n"
+    let out = compile_test_helpers.compile_and_capture(src, "_pure_rec")
+    assert(!out.contains("E1307"))
+}
+
+test "@pure: @pure function calling another @pure function is allowed" {
+    let src = "@pure\nfn pv_inc(x: Int) -> Int \{ x + 1 }\n@pure\nfn pv_inc2(x: Int) -> Int \{ pv_inc(pv_inc(x)) }\nfn main() \{ pv_inc2(0) }\n"
+    let out = compile_test_helpers.compile_and_capture(src, "_pure_chain")
+    assert(!out.contains("E1307"))
+}
+
+test "@pure: bootstrap whitelist allows len()" {
+    let src = "@pure\nfn pv_size(xs: List[Int]) -> Int \{ xs.len() }\nfn main() \{ pv_size([1, 2, 3]) }\n"
+    let out = compile_test_helpers.compile_and_capture(src, "_pure_len")
+    assert(!out.contains("E1307"))
+}
+
+// ── Rejection ─────────────────────────────────────────────────────────
+
+test "E1307: @pure rejected when fn declares an effect" {
+    let src = "@pure\nfn pv_io() -> Int ! IO \{ 1 }\nfn main() \{ pv_io() }\n"
+    let out = compile_test_helpers.compile_and_capture(src, "_pure_eff")
+    assert(out.contains("E1307"))
+}
+
+test "E1307: @pure rejected with assignment" {
+    let src = "@pure\nfn pv_assign() -> Int \{\n    let mut y = 0\n    y = 1\n    y\n}\nfn main() \{ pv_assign() }\n"
+    let out = compile_test_helpers.compile_and_capture(src, "_pure_assign")
+    assert(out.contains("E1307"))
+}
+
+test "E1307: @pure rejected with while loop" {
+    let src = "@pure\nfn pv_loop(n: Int) -> Int \{\n    let mut i = 0\n    while i < n \{ i = i + 1 }\n    i\n}\nfn main() \{ pv_loop(3) }\n"
+    let out = compile_test_helpers.compile_and_capture(src, "_pure_while")
+    assert(out.contains("E1307"))
+}
+
+test "E1307: @pure rejected when calling a non-@pure helper" {
+    let src = "fn pv_helper(x: Int) -> Int \{ x + 1 }\n@pure\nfn pv_caller(x: Int) -> Int \{ pv_helper(x) }\nfn main() \{ pv_caller(0) }\n"
+    let out = compile_test_helpers.compile_and_capture(src, "_pure_calls_impure")
+    assert(out.contains("E1307"))
+}
+
+test "E1307: @pure rejected with mutating method (push)" {
+    let src = "@pure\nfn pv_grow(xs: List[Int]) -> List[Int] \{\n    xs.push(1)\n    xs\n}\nfn main() \{ pv_grow([1]) }\n"
+    let out = compile_test_helpers.compile_and_capture(src, "_pure_push")
+    assert(out.contains("E1307"))
+}
+
+// ── Validator handoff: @pure unlocks predicate calls ──────────────────
+
+test "@pure helper is callable inside @requires (no E1302)" {
+    let src = "@pure\nfn pv_pos(x: Int) -> Bool \{ x > 0 }\n@requires(pv_pos(x))\nfn pv_check(x: Int) -> Int \{ x }\nfn main() \{ pv_check(1) }\n"
+    let out = compile_test_helpers.compile_and_capture(src, "_pure_in_requires")
+    assert(!out.contains("E1302"))
+}
+
+test "non-@pure helper still rejected inside @requires (E1302)" {
+    let src = "fn pv_helper(x: Int) -> Int \{ x + 1 }\n@requires(pv_helper(x) > 0)\nfn pv_check(x: Int) -> Int \{ x }\nfn main() \{ pv_check(1) }\n"
+    let out = compile_test_helpers.compile_and_capture(src, "_pure_handoff_neg")
+    assert(out.contains("E1302"))
+}
+
+// ── Bootstrap whitelist: fabs is allowed in predicates ────────────────
+
+test "fabs is on the predicate bootstrap whitelist" {
+    let src = "@ffi(\"fabs\")\n@trusted\nfn pv_fabs(x: Float) -> Float ! FFI \{ }\n@requires(pv_fabs(x) >= 0.0)\nfn pv_use(x: Float) -> Float \{ x }\nfn main() \{ pv_use(1.0) }\n"
+    let out = compile_test_helpers.compile_and_capture(src, "_pure_fabs")
+    assert(!out.contains("E1302"))
+    // fabs is FFI, so calling it normally would be E1301 — but the
+    // whitelist short-circuits both checks.
+    assert(!out.contains("E1301"))
+}

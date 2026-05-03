@@ -1,6 +1,6 @@
-import ast.{NodeKind}
+import ast.{NodeKind, node_kind_name}
 import parser.{
-    get_annotation, has_annotation,
+    get_annotation, has_annotation, is_literal_string_part,
     node_args, node_assoc_types, node_arms, node_body, node_captures, node_col, node_condition,
     node_effects, node_elements, node_else_body, node_end, node_fields, node_guard,
     node_handlers, node_index, node_int_val, node_is_mut, node_is_pub, node_iterable, node_kind,
@@ -23,6 +23,11 @@ import diagnostics.{
     TRAIT_CONTRACT_900, TRAIT_CONTRACT_901, TRAIT_CONTRACT_902,
     TRAIT_CONTRACT_903, TRAIT_CONTRACT_904, TRAIT_CONTRACT_905,
     TRAIT_CONTRACT_906,
+    CONTRACT_PREDICATE_NOT_DECIDABLE, EFFECTFUL_CALL_IN_PREDICATE,
+    IMPURE_CALL_IN_PREDICATE, LOOP_IN_PREDICATE,
+    RESULT_OUTSIDE_ENSURES, OLD_OUTSIDE_ENSURES,
+    ASSIGNMENT_IN_PREDICATE, IMPURE_BODY_FOR_PURE_ANNOTATION,
+    MODIFIES_ARG_NOT_SIMPLE_PATH,
     PRIVATE_ITEM_ACCESS, AMBIGUOUS_IMPORT, IMPORT_NOT_SELECTED,
     MODULE_QUALIFIED_TYPE,
     UNKNOWN_METHOD, UNUSED_VARIABLE, SET_BUT_NOT_READ, SHADOWED_VARIABLE,
@@ -776,6 +781,519 @@ fn check_ptr_in_type_name(type_name: Str, node: Int, has_ffi: Int) ! Diag.Report
     }
 }
 
+// ── Phase 0: Contract predicate validator ─────────────────────────────
+//
+// Predicates inside @requires / @ensures / @where must lie in an
+// SMT-decidable subset so that today's runtime checks can later be
+// promoted to compile-time proofs without rewriting every contract.
+//
+// Allowed: literals, identifiers, parameter refs, `result` (in @ensures),
+// `old(_)` (in @ensures), arithmetic / comparison / boolean / equality
+// binops, unary `!` and unary `-`, FieldAccess, IndexExpr, RangeLit,
+// IfExpr, MatchExpr, calls/method-calls to either a hardcoded bootstrap
+// whitelist (`len`, `is_empty`, `unwrap`, `abs`) or to a @pure function.
+//
+// Rejected (each maps to a distinct diagnostic in E1300-E1306):
+//   - LetBinding, Assignment/CompoundAssign            → E1306 / E1300
+//   - Closure, ForIn, WhileLoop, LoopExpr              → E1303 / E1300
+//   - Break, Continue, Return                          → E1300
+//   - WithBlock, AsyncSpawn, AwaitExpr, ChannelNew     → E1300
+//   - Allocation (ListLit, StructLit non-trivially)    → E1300
+//   - Calls into effectful fns                         → E1301
+//   - Calls into non-pure user fns (no effects, but
+//     not @pure / not on bootstrap whitelist)          → E1302
+
+fn pv_is_whitelisted_call(name: Str) -> Int {
+    if name == "len" { return 1 }
+    if name == "is_empty" { return 1 }
+    if name == "unwrap" { return 1 }
+    if name == "abs" { return 1 }
+    if name == "fabs" { return 1 }
+    0
+}
+
+fn pv_fn_has_any_effect(name: Str) -> Int {
+    let sig = lookup_fnsig(name)
+    if sig == -1 { return 0 }
+    let fs = fnsig_pool.get(sig).unwrap()
+    if fs.effects_count > 0 { return 1 }
+    0
+}
+
+// Depth counter set transiently when walking the argument(s) of an
+// `old(_)` call. Used to reject nested `old(old(_))`.
+let mut pv_in_old_depth: Int = 0
+
+fn pv_validate_call_target(call_name: Str, call_node: Int, in_ensures: Int) ! Diag.Report {
+    if call_name == "old" {
+        if in_ensures == 0 {
+            diag_error_at("OldOutsideEnsures", OLD_OUTSIDE_ENSURES, "`old(_)` is only valid inside @ensures predicates", call_node, "move the `old(_)` reference into an @ensures predicate")
+        } else if pv_in_old_depth != 0 {
+            diag_error_at("OldOutsideEnsures", OLD_OUTSIDE_ENSURES, "`old(_)` may not be nested — `old(old(_))` is not meaningful", call_node, "remove the outer `old(_)`")
+        }
+        return
+    }
+    if pv_is_whitelisted_call(call_name) != 0 { return }
+    if pv_is_whitelisted_ffi_wrapper(call_name) != 0 { return }
+    if tc_fn_is_pure(call_name) != 0 { return }
+    if pv_fn_has_any_effect(call_name) != 0 {
+        diag_error_at("EffectfulCallInPredicate", EFFECTFUL_CALL_IN_PREDICATE, "predicate calls effectful function '{call_name}' — predicates must be pure", call_node, "call only @pure helpers (or compute the value in the function body)")
+        return
+    }
+    let sig = lookup_fnsig(call_name)
+    if sig == -1 { return }
+    diag_error_at("ImpureCallInPredicate", IMPURE_CALL_IN_PREDICATE, "predicate calls non-pure function '{call_name}' — predicates may only call @pure helpers or the bootstrap whitelist (len, is_empty, unwrap, abs, fabs)", call_node, "mark '{call_name}' as @pure if it qualifies, or inline the computation")
+}
+
+@allow(UnrestoredMutation, IncompleteStateRestore)
+fn pv_walk(expr: Int, in_ensures: Int) ! Diag.Report {
+    if expr == -1 { return }
+    let k = node_kind(expr)
+
+    // Literals — always fine.
+    if k == NodeKind.IntLit { return }
+    if k == NodeKind.FloatLit { return }
+    if k == NodeKind.BoolLit { return }
+    if k == NodeKind.CharLit { return }
+
+    // Strings: literal Str is allowed, but interpolation is a control-flow
+    // artifact we don't want in predicates today.
+    if k == NodeKind.InterpString {
+        diag_error_at("ContractPredicateNotDecidable", CONTRACT_PREDICATE_NOT_DECIDABLE, "interpolated strings are not allowed in contract predicates", expr, "use a plain string literal or move the formatting into the function body")
+        return
+    }
+
+    // Identifiers — `result` is gated to @ensures, everything else is fine.
+    if k == NodeKind.Ident {
+        let nm = node_name(expr)
+        if nm == "result" {
+            if in_ensures == 0 {
+                diag_error_at("ResultOutsideEnsures", RESULT_OUTSIDE_ENSURES, "`result` is only valid inside @ensures predicates", expr, "rename the local, or move the reference into @ensures(...)")
+            }
+        }
+        return
+    }
+
+    // Operators.
+    if k == NodeKind.BinOp {
+        pv_walk(node_left(expr), in_ensures)
+        pv_walk(node_right(expr), in_ensures)
+        return
+    }
+    if k == NodeKind.UnaryOp {
+        pv_walk(node_left(expr), in_ensures)
+        return
+    }
+
+    // Read-only access.
+    if k == NodeKind.FieldAccess {
+        pv_walk(node_obj(expr), in_ensures)
+        return
+    }
+    if k == NodeKind.IndexExpr {
+        pv_walk(node_obj(expr), in_ensures)
+        pv_walk(node_index(expr), in_ensures)
+        return
+    }
+
+    // Range membership / construction (rhs of `in`).
+    if k == NodeKind.RangeLit {
+        pv_walk(node_start(expr), in_ensures)
+        pv_walk(node_end(expr), in_ensures)
+        return
+    }
+
+    // If / Match — accepted (per design: SMT can encode as ite).
+    if k == NodeKind.IfExpr {
+        pv_walk(node_condition(expr), in_ensures)
+        pv_walk(node_then_body(expr), in_ensures)
+        pv_walk(node_else_body(expr), in_ensures)
+        return
+    }
+    if k == NodeKind.MatchExpr {
+        pv_walk(node_scrutinee(expr), in_ensures)
+        let arms_sl = node_arms(expr)
+        if arms_sl != -1 {
+            let mut i = 0
+            while i < sublist_length(arms_sl) {
+                let arm = sublist_get(arms_sl, i)
+                let g = node_guard(arm)
+                if g != -1 { pv_walk(g, in_ensures) }
+                pv_walk(node_body(arm), in_ensures)
+                i = i + 1
+            }
+        }
+        return
+    }
+
+    // A bare Block can wrap a single expression; if it contains statements
+    // (let, assignment, loops...), the recursive walk will surface the
+    // appropriate diagnostic against each child.
+    if k == NodeKind.Block {
+        let stmts_sl = node_stmts(expr)
+        if stmts_sl != -1 {
+            let mut i = 0
+            while i < sublist_length(stmts_sl) {
+                pv_walk(sublist_get(stmts_sl, i), in_ensures)
+                i = i + 1
+            }
+        }
+        return
+    }
+
+    // Block bodies wrap their tail expression in ExprStmt; descend.
+    if k == NodeKind.ExprStmt {
+        pv_walk(node_value(expr), in_ensures)
+        return
+    }
+
+    // Calls. Parser stores callee in `left` (typically an Ident).
+    if k == NodeKind.Call {
+        let callee = node_left(expr)
+        let mut call_name = ""
+        if callee != -1 {
+            call_name = node_name(callee)
+        }
+        pv_validate_call_target(call_name, expr, in_ensures)
+        let is_old = if call_name == "old" { 1 } else { 0 }
+        if is_old != 0 { pv_in_old_depth = pv_in_old_depth + 1 }
+        let args_sl = node_args(expr)
+        if args_sl != -1 {
+            let mut i = 0
+            while i < sublist_length(args_sl) {
+                pv_walk(sublist_get(args_sl, i), in_ensures)
+                i = i + 1
+            }
+        }
+        if is_old != 0 { pv_in_old_depth = pv_in_old_depth - 1 }
+        return
+    }
+    if k == NodeKind.MethodCall {
+        let mname = node_method(expr)
+        // Method calls bypass the impurity check when on the whitelist
+        // (`xs.len()`, `o.unwrap()`, etc.). For everything else we have no
+        // way today to know which trait/impl the method resolves to without
+        // running full method dispatch — so we accept conservatively and
+        // leave precise checking to the @pure registry.
+        if pv_is_whitelisted_call(mname) == 0 {
+            // Best-effort: if there is a top-level fn with this exact name
+            // and it has effects, surface E1301.
+            if pv_fn_has_any_effect(mname) != 0 {
+                diag_error_at("EffectfulCallInPredicate", EFFECTFUL_CALL_IN_PREDICATE, "predicate calls effectful method '{mname}' — predicates must be pure", expr, "call only @pure helpers (or compute the value in the function body)")
+            }
+        }
+        pv_walk(node_obj(expr), in_ensures)
+        let m_args_sl = node_args(expr)
+        if m_args_sl != -1 {
+            let mut i = 0
+            while i < sublist_length(m_args_sl) {
+                pv_walk(sublist_get(m_args_sl, i), in_ensures)
+                i = i + 1
+            }
+        }
+        return
+    }
+
+    // Hard rejections — distinct codes for the structurally-disqualifying
+    // forms; everything else funnels into E1300.
+    if k == NodeKind.WhileLoop || k == NodeKind.ForIn || k == NodeKind.LoopExpr {
+        diag_error_at("LoopInPredicate", LOOP_IN_PREDICATE, "loops are not allowed in contract predicates — predicates must terminate and be quantifier-free", expr, "replace iteration with a recursive @pure helper or a quantifier-free expression")
+        return
+    }
+    if k == NodeKind.Assignment || k == NodeKind.CompoundAssign {
+        diag_error_at("AssignmentInPredicate", ASSIGNMENT_IN_PREDICATE, "assignments are not allowed in contract predicates — predicates must be referentially transparent", expr, "rewrite as a pure comparison; bind values outside the predicate if needed")
+        return
+    }
+
+    // Catch-all: every other shape is outside the decidable subset.
+    let kname = node_kind_name(k)
+    diag_error_at("ContractPredicateNotDecidable", CONTRACT_PREDICATE_NOT_DECIDABLE, "construct '{kname}' is not allowed in contract predicates — predicates must lie in the SMT-decidable subset", expr, "rewrite the predicate as a pure expression over parameters, comparisons, and @pure calls")
+}
+
+fn pv_validate_annotation(ann: Int, in_ensures: Int) ! Diag.Report {
+    let args_sl = node_args(ann)
+    if args_sl == -1 { return }
+    if sublist_length(args_sl) == 0 { return }
+    let pred = sublist_get(args_sl, 0)
+    pv_in_old_depth = 0
+    pv_walk(pred, in_ensures)
+}
+
+fn pv_validate_fn_contracts(fn_node: Int) ! Diag.Report {
+    let anns_sl = node_handlers(fn_node)
+    if anns_sl == -1 { return }
+    let mut i = 0
+    while i < sublist_length(anns_sl) {
+        let ann = sublist_get(anns_sl, i)
+        let nm = node_name(ann)
+        if nm == "requires" {
+            pv_validate_annotation(ann, 0)
+        } else if nm == "ensures" {
+            pv_validate_annotation(ann, 1)
+        } else if nm == "modifies" {
+            pv_validate_modifies(ann)
+        }
+        i = i + 1
+    }
+}
+
+// Validate that every @modifies argument is a simple path
+// (`ident`, `ident.field`, or `nothing`). Reject kv-pair forms.
+fn pv_validate_modifies(ann: Int) ! Diag.Report {
+    let args_sl = node_args(ann)
+    if args_sl == -1 { return }
+    let mut i = 0
+    while i < sublist_length(args_sl) {
+        let arg = sublist_get(args_sl, i)
+        let nm = node_name(arg)
+        if nm.contains(":") {
+            diag_error_at("ModifiesArgNotSimplePath", MODIFIES_ARG_NOT_SIMPLE_PATH,
+                "@modifies argument must be a simple path (ident, ident.field, or 'nothing'), got '{nm}'",
+                arg, "remove the kv-pair form")
+        }
+        i = i + 1
+    }
+}
+
+fn pv_validate_type_alias(td: Int) ! Diag.Report {
+    let where_pred = node_condition(td)
+    if where_pred == -1 { return }
+    pv_walk(where_pred, 0)
+}
+
+// ── @pure annotation + minimal purity check ─────────────────────────
+//
+// `tc_pure_fns` is populated in a first pass over all fns *before* any
+// body is walked, so recursive and mutually-recursive @pure fns work.
+// `pv_validate_call_target` consults this registry to decide whether a
+// non-effectful, non-bootstrap call is allowed in a predicate.
+
+pub let mut tc_pure_fns: Map[Str, Int] = Map()
+pub let mut tc_fn_node_by_name: Map[Str, Int] = Map()
+
+pub fn tc_fn_is_pure(name: Str) -> Int {
+    if tc_pure_fns.contains_key(name) { return 1 }
+    0
+}
+
+// True if `name` is a Blink wrapper around a C symbol on the predicate
+// bootstrap whitelist (today: just `fabs`). The wrapper is FFI and would
+// otherwise be rejected as effectful — the whitelist short-circuits.
+fn pv_is_whitelisted_ffi_wrapper(name: Str) -> Int {
+    if !tc_fn_node_by_name.contains_key(name) { return 0 }
+    let fn_node = tc_fn_node_by_name.get(name).unwrap()
+    let ffi_ann = get_annotation(fn_node, "ffi")
+    if ffi_ann == -1 { return 0 }
+    let args_sl = node_args(ffi_ann)
+    if args_sl == -1 { return 0 }
+    let mut i = 0
+    while i < sublist_length(args_sl) {
+        let arg = sublist_get(args_sl, i)
+        if node_kind(arg) == NodeKind.InterpString && node_name(arg) == "" {
+            let parts_sl = node_elements(arg)
+            if parts_sl != -1 && sublist_length(parts_sl) == 1 {
+                let part = sublist_get(parts_sl, 0)
+                if is_literal_string_part(part) != 0 {
+                    let sym = node_str_val(part)
+                    if pv_is_whitelisted_call(sym) != 0 { return 1 }
+                }
+            }
+            return 0
+        }
+        i = i + 1
+    }
+    0
+}
+
+fn pp_is_mutating_method(name: Str) -> Int {
+    if name == "push" { return 1 }
+    if name == "pop" { return 1 }
+    if name == "append" { return 1 }
+    if name == "clear" { return 1 }
+    if name == "insert" { return 1 }
+    if name == "remove" { return 1 }
+    if name == "set" { return 1 }
+    0
+}
+
+fn pp_is_collection_constructor(name: Str) -> Int {
+    if name == "List" { return 1 }
+    if name == "Map" { return 1 }
+    if name == "Set" { return 1 }
+    0
+}
+
+@allow(UnrestoredMutation, IncompleteStateRestore)
+fn pp_walk(node: Int, fn_name: Str, anchor: Int) ! Diag.Report {
+    if node == -1 { return }
+    let k = node_kind(node)
+
+    // Reject loops outright — non-terminating constructs.
+    if k == NodeKind.WhileLoop || k == NodeKind.ForIn || k == NodeKind.LoopExpr {
+        diag_error_at("ImpureBodyForPureAnnotation", IMPURE_BODY_FOR_PURE_ANNOTATION, "@pure function '{fn_name}' contains a loop — @pure forbids while/for/loop", anchor, "remove the loop or drop the @pure annotation")
+        return
+    }
+    // Reject assignments.
+    if k == NodeKind.Assignment || k == NodeKind.CompoundAssign {
+        diag_error_at("ImpureBodyForPureAnnotation", IMPURE_BODY_FOR_PURE_ANNOTATION, "@pure function '{fn_name}' contains an assignment — @pure forbids mutation", anchor, "rewrite without assignment or drop the @pure annotation")
+        return
+    }
+    // Reject List/Map/Set allocation in literal form.
+    if k == NodeKind.ListLit {
+        diag_error_at("ImpureBodyForPureAnnotation", IMPURE_BODY_FOR_PURE_ANNOTATION, "@pure function '{fn_name}' allocates a List — @pure forbids List/Map/Set allocation", anchor, "compute on existing inputs or drop the @pure annotation")
+        return
+    }
+
+    if k == NodeKind.Call {
+        let callee = node_left(node)
+        let mut call_name = ""
+        if callee != -1 { call_name = node_name(callee) }
+        if pp_is_collection_constructor(call_name) != 0 {
+            diag_error_at("ImpureBodyForPureAnnotation", IMPURE_BODY_FOR_PURE_ANNOTATION, "@pure function '{fn_name}' allocates a '{call_name}' — @pure forbids List/Map/Set allocation", anchor, "compute on existing inputs or drop the @pure annotation")
+        } else if pv_fn_has_any_effect(call_name) != 0 {
+            diag_error_at("ImpureBodyForPureAnnotation", IMPURE_BODY_FOR_PURE_ANNOTATION, "@pure function '{fn_name}' calls effectful function '{call_name}' — @pure may only call @pure helpers (or len/is_empty/unwrap/abs/fabs)", anchor, "drop the @pure annotation or rewrite without the effectful call")
+        } else if pv_is_whitelisted_call(call_name) == 0 && tc_fn_is_pure(call_name) == 0 {
+            // Skip if the callee is unresolvable — could be a stdlib helper
+            // (e.g. assert) or a builtin we don't track. Only complain when
+            // we can prove it's a defined non-pure user function.
+            if lookup_fnsig(call_name) != -1 {
+                diag_error_at("ImpureBodyForPureAnnotation", IMPURE_BODY_FOR_PURE_ANNOTATION, "@pure function '{fn_name}' calls non-@pure function '{call_name}' — mark it @pure or drop the annotation", anchor, "add @pure to '{call_name}' if it qualifies, or remove @pure from '{fn_name}'")
+            }
+        }
+        // Still recurse into args — a pure-looking call could embed impurity.
+        let cargs_sl = node_args(node)
+        if cargs_sl != -1 {
+            let mut i = 0
+            while i < sublist_length(cargs_sl) {
+                pp_walk(sublist_get(cargs_sl, i), fn_name, anchor)
+                i = i + 1
+            }
+        }
+        return
+    }
+
+    if k == NodeKind.MethodCall {
+        let mname = node_method(node)
+        if pp_is_mutating_method(mname) != 0 {
+            diag_error_at("ImpureBodyForPureAnnotation", IMPURE_BODY_FOR_PURE_ANNOTATION, "@pure function '{fn_name}' calls mutating method '.{mname}()' — @pure forbids mutation", anchor, "rewrite without the mutating call or drop the @pure annotation")
+        }
+        pp_walk(node_obj(node), fn_name, anchor)
+        let margs_sl = node_args(node)
+        if margs_sl != -1 {
+            let mut i = 0
+            while i < sublist_length(margs_sl) {
+                pp_walk(sublist_get(margs_sl, i), fn_name, anchor)
+                i = i + 1
+            }
+        }
+        return
+    }
+
+    // Recurse into children. Replicates the structure of pv_walk.
+    if k == NodeKind.BinOp {
+        pp_walk(node_left(node), fn_name, anchor)
+        pp_walk(node_right(node), fn_name, anchor)
+        return
+    }
+    if k == NodeKind.UnaryOp {
+        pp_walk(node_left(node), fn_name, anchor)
+        return
+    }
+    if k == NodeKind.FieldAccess {
+        pp_walk(node_obj(node), fn_name, anchor)
+        return
+    }
+    if k == NodeKind.IndexExpr {
+        pp_walk(node_obj(node), fn_name, anchor)
+        pp_walk(node_index(node), fn_name, anchor)
+        return
+    }
+    if k == NodeKind.RangeLit {
+        pp_walk(node_start(node), fn_name, anchor)
+        pp_walk(node_end(node), fn_name, anchor)
+        return
+    }
+    if k == NodeKind.IfExpr {
+        pp_walk(node_condition(node), fn_name, anchor)
+        pp_walk(node_then_body(node), fn_name, anchor)
+        pp_walk(node_else_body(node), fn_name, anchor)
+        return
+    }
+    if k == NodeKind.MatchExpr {
+        pp_walk(node_scrutinee(node), fn_name, anchor)
+        let arms_sl = node_arms(node)
+        if arms_sl != -1 {
+            let mut i = 0
+            while i < sublist_length(arms_sl) {
+                let arm = sublist_get(arms_sl, i)
+                let g = node_guard(arm)
+                if g != -1 { pp_walk(g, fn_name, anchor) }
+                pp_walk(node_body(arm), fn_name, anchor)
+                i = i + 1
+            }
+        }
+        return
+    }
+    if k == NodeKind.Block {
+        let stmts_sl = node_stmts(node)
+        if stmts_sl != -1 {
+            let mut i = 0
+            while i < sublist_length(stmts_sl) {
+                pp_walk(sublist_get(stmts_sl, i), fn_name, anchor)
+                i = i + 1
+            }
+        }
+        return
+    }
+    if k == NodeKind.ExprStmt {
+        pp_walk(node_value(node), fn_name, anchor)
+        return
+    }
+    if k == NodeKind.LetBinding {
+        // `let x = expr` itself is fine; the RHS is the only thing that
+        // could carry impurity.
+        pp_walk(node_value(node), fn_name, anchor)
+        return
+    }
+    if k == NodeKind.Return {
+        pp_walk(node_value(node), fn_name, anchor)
+        return
+    }
+    // Literals + identifiers — leaves, nothing to check.
+}
+
+fn tc_register_pure_fns(fns_sl: Int) {
+    if fns_sl == -1 { return }
+    let mut i = 0
+    while i < sublist_length(fns_sl) {
+        let fn_node = sublist_get(fns_sl, i)
+        let fn_name = node_name(fn_node)
+        tc_fn_node_by_name.insert(fn_name, fn_node)
+        if has_annotation(fn_node, "pure") != 0 {
+            tc_pure_fns.insert(fn_name, 1)
+        }
+        i = i + 1
+    }
+}
+
+fn tc_check_pure(fn_node: Int) ! Diag.Report {
+    if has_annotation(fn_node, "pure") == 0 { return }
+    let fn_name = node_name(fn_node)
+    let pure_ann = get_annotation(fn_node, "pure")
+    let anchor = if pure_ann != -1 { pure_ann } else { fn_node }
+
+    // Reject @pure on a fn that declares any effects.
+    let effects_sl = node_effects(fn_node)
+    if effects_sl != -1 && sublist_length(effects_sl) > 0 {
+        diag_error_at("ImpureBodyForPureAnnotation", IMPURE_BODY_FOR_PURE_ANNOTATION, "@pure function '{fn_name}' declares effects — @pure forbids declared effects", anchor, "drop the effect declaration or remove @pure")
+        return
+    }
+
+    let body = node_body(fn_node)
+    if body == -1 { return }
+    pp_walk(body, fn_name, anchor)
+}
+
 fn validate_ffi_fn(fn_node: Int) ! Diag.Report {
     let name = node_name(fn_node)
     let ffi_node = get_annotation(fn_node, "ffi")
@@ -1134,6 +1652,9 @@ fn init_types() ! TypeCheck.Register {
     tc_symbol_module.clear()
     tc_used_modules.clear()
     tc_hints.clear()
+    tc_pure_fns.clear()
+    tc_fn_node_by_name.clear()
+    pv_in_old_depth = 0
     tc_build_import_map()
 
     TYPE_INT = new_type(TK_INT, "Int")
@@ -1193,6 +1714,39 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
         let mut i = 0
         while i < sublist_length(fns_sl) {
             validate_ffi_fn(sublist_get(fns_sl, i))
+            i = i + 1
+        }
+    }
+
+    // Build the @pure registry first so the predicate validator can
+    // consult it when a contract calls a user helper.
+    if fns_sl != -1 {
+        tc_register_pure_fns(fns_sl)
+    }
+
+    // Validate contract predicates against the SMT-decidable subset.
+    // Runs before name resolution so reserved names (`result`, `old`)
+    // surface as E1304/E1305 rather than as generic E0506/E0504.
+    if fns_sl != -1 {
+        let mut i = 0
+        while i < sublist_length(fns_sl) {
+            pv_validate_fn_contracts(sublist_get(fns_sl, i))
+            i = i + 1
+        }
+    }
+    if types_sl != -1 {
+        let mut i = 0
+        while i < sublist_length(types_sl) {
+            pv_validate_type_alias(sublist_get(types_sl, i))
+            i = i + 1
+        }
+    }
+
+    // Enforce @pure body constraints.
+    if fns_sl != -1 {
+        let mut i = 0
+        while i < sublist_length(fns_sl) {
+            tc_check_pure(sublist_get(fns_sl, i))
             i = i + 1
         }
     }

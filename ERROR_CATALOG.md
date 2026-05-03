@@ -41,8 +41,9 @@ error[NonExhaustiveMatch]: non-exhaustive match
 | E06xx | Resource scope / closures |
 | E07xx | Method resolution / arena / coherence |
 | E08xx | FFI |
-| E09xx | Module capabilities |
+| E09xx | Module capabilities / trait contracts |
 | E10xx | Module resolution / imports |
+| E13xx | Refinement contracts (predicate sublanguage) |
 | I00xx | Internal compiler errors (ICE) |
 
 ---
@@ -124,6 +125,15 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | NonConstStructDefault | E1103 | Struct field default is not a const expression | Const | §2.20 |
 | NonConstKeywordDefault | E1104 | Keyword argument default is not a const expression | Const | §2.20 |
 | NonConstRangeBound | E1105 | Range pattern bound is not a const expression | Const | §2.20 |
+| ContractPredicateNotDecidable | E1300 | Contract predicate uses construct outside SMT-decidable subset | Refinement contracts | §3b |
+| EffectfulCallInPredicate | E1301 | Predicate calls a function with declared effects | Refinement contracts | §3b |
+| ImpureCallInPredicate | E1302 | Predicate calls a function not marked `@pure` | Refinement contracts | §3b |
+| LoopInPredicate | E1303 | Predicate uses `while`/`for`/`loop` | Refinement contracts | §3b |
+| ResultOutsideEnsures | E1304 | `result` referenced outside an `@ensures` predicate | Refinement contracts | §3b |
+| OldOutsideEnsures | E1305 | `old(_)` referenced outside an `@ensures` predicate | Refinement contracts | §3b |
+| AssignmentInPredicate | E1306 | Predicate contains an assignment | Refinement contracts | §3b |
+| ImpureBodyForPureAnnotation | E1307 | `@pure` function body contains a non-pure construct | Refinement contracts | §3b |
+| ModifiesArgNotSimplePath | E1308 | `@modifies` argument is not a simple path | Refinement contracts | §3b |
 
 ---
 
