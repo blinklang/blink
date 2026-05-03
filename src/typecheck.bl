@@ -3442,6 +3442,65 @@ fn types_compatible(a: Int, b: Int) -> Int {
     0
 }
 
+// Picks the more concrete of two compatible types. Used by branch
+// unification (if/else, match) so that a Result[Int, ?] merged with a
+// Result[?, Bool] yields Result[Int, Bool] instead of dropping the
+// concrete payload from one side. Caller must have already validated
+// `types_compatible(a, b)`.
+fn type_merge(a: Int, b: Int) -> Int {
+    if a == TYPE_UNKNOWN { return b }
+    if b == TYPE_UNKNOWN { return a }
+    if a == b { return a }
+    if a < 0 || b < 0 { return a }
+    if a >= ty_pool.len() || b >= ty_pool.len() { return a }
+    let ta = ty_pool.get(a).unwrap()
+    let tb = ty_pool.get(b).unwrap()
+    if ta.kind != tb.kind { return a }
+    if ta.kind == TK_LIST {
+        let inner = type_merge(ta.inner1, tb.inner1)
+        if inner == ta.inner1 { return a }
+        if inner == tb.inner1 { return b }
+        return make_list_type(inner)
+    }
+    if ta.kind == TK_OPTION {
+        let inner = type_merge(ta.inner1, tb.inner1)
+        if inner == ta.inner1 { return a }
+        if inner == tb.inner1 { return b }
+        return make_option_type(inner)
+    }
+    if ta.kind == TK_SET {
+        let inner = type_merge(ta.inner1, tb.inner1)
+        if inner == ta.inner1 { return a }
+        if inner == tb.inner1 { return b }
+        return make_set_type(inner)
+    }
+    if ta.kind == TK_RESULT {
+        let i1 = type_merge(ta.inner1, tb.inner1)
+        let i2 = type_merge(ta.inner2, tb.inner2)
+        if i1 == ta.inner1 && i2 == ta.inner2 { return a }
+        if i1 == tb.inner1 && i2 == tb.inner2 { return b }
+        return make_result_type(i1, i2)
+    }
+    if ta.kind == TK_MAP {
+        let k = type_merge(ta.inner1, tb.inner1)
+        let v = type_merge(ta.inner2, tb.inner2)
+        if k == ta.inner1 && v == ta.inner2 { return a }
+        if k == tb.inner1 && v == tb.inner2 { return b }
+        return make_map_type(k, v)
+    }
+    a
+}
+
+// Short-form arm bodies parse as ExprStmt; unwrap so infer_type sees the expression.
+fn infer_arm_body(arm: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let b = node_body(arm)
+    if b == -1 { return TYPE_UNKNOWN }
+    if node_kind(b) == NodeKind.ExprStmt {
+        return infer_type(node_value(b))
+    }
+    infer_type(b)
+}
+
 fn type_kind(tid: Int) -> Int {
     if tid < 0 || tid >= ty_pool.len() { return TK_UNKNOWN }
     ty_pool.get(tid).unwrap().kind
@@ -3947,8 +4006,9 @@ fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repo
                     tc_error_at("if branches have incompatible types: {type_to_str(then_t)} vs {type_to_str(else_t)}", node)
                 }
             }
-            if then_t != TYPE_UNKNOWN { return then_t }
-            return else_t
+            if then_t == TYPE_UNKNOWN { return else_t }
+            if else_t == TYPE_UNKNOWN { return then_t }
+            return type_merge(then_t, else_t)
         }
         return then_t
     }
@@ -3956,8 +4016,18 @@ fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repo
     if kind == NodeKind.MatchExpr {
         let arms_sl = node_arms(node)
         if arms_sl != -1 && sublist_length(arms_sl) > 0 {
-            let first_arm = sublist_get(arms_sl, 0)
-            return infer_type(node_body(first_arm))
+            let mut merged = infer_arm_body(sublist_get(arms_sl, 0))
+            let mut i = 1
+            while i < sublist_length(arms_sl) {
+                let arm_t = infer_arm_body(sublist_get(arms_sl, i))
+                if merged == TYPE_UNKNOWN {
+                    merged = arm_t
+                } else {
+                    if arm_t != TYPE_UNKNOWN { merged = type_merge(merged, arm_t) }
+                }
+                i = i + 1
+            }
+            return merged
         }
         return TYPE_UNKNOWN
     }
