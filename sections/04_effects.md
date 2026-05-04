@@ -222,7 +222,7 @@ fn read_only() ! FS.Read {
 ```
 
 ```
-error[InsufficientCapability]: insufficient effect capability
+error[UndeclaredEffect]: insufficient effect capability
  --> config.bl:3:5
   |
 3 |     fs.write("config.toml", data)

@@ -76,18 +76,17 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | InconsistentPatternBindings | E0311 | Inconsistent bindings in OR-pattern | Pattern matching | §3.5 |
 | MissingDisplayImpl | E0312 | Type does not implement `Display` for interpolation | Type checking | §3.6.1 |
 | UndeclaredEffect | E0500 | Callee requires effect not declared by caller | Effects | §4.5 |
-| InsufficientCapability | E0501 | Effect operation exceeds declared capability | Effects | §4.4 |
+| CapabilityBudgetExceeded | E0501 | Function effect exceeds module `@capabilities` budget | Effects | §4.8 |
 | QuestionMarkInvalidOperand | E0502 | `?` operator used on non-Result, non-Option type | Type checking | §3c.2 |
-| CoalesceRequiresOption | E0503 | `??` operator used on non-Option value | Type checking | §3c.2 |
 | UndefinedFunction | E0504 | Call to undefined function | Name resolution | §6.3 |
 | UnresolvedMethod | E0505 | Unresolved method call on variable | Name resolution | §6.3, §3c.4 |
 | UndefinedVariable | E0506 | Reference to undefined variable | Name resolution | §6.3 |
 | UnknownType | E0507 | Reference to undefined type | Name resolution | §6.3 |
 | QuestionMarkResultInNonResult | E0508 | `?` on Result in function not returning Result | Type checking | §3c.2 |
 | QuestionMarkOptionInNonOption | E0509 | `?` on Option in function not returning Option | Type checking | §3c.2 |
-| CapabilityBudgetExceeded | E0510 | Function effect exceeds module `@capabilities` budget | Effects | §4.8 |
 | EffectMismatchInFnType | E0511 | Effect mismatch between expected and actual function type | Effects | §4.15 |
 | QuestionMarkErrorMismatch | E0512 | `?` error type mismatch — inner E1 ≠ function return E2 | Type checking | §3c.2 |
+| CoalesceRequiresOption | E0513 | `??` operator used on non-Option value | Type checking | §3c.2 |
 | InvalidHandlerTypeParam | E0520 | `Handler[E]` used with non-effect type parameter | Effects | §4.7.1 |
 | InsufficientHandlerCoverage | E0521 | Handler lacks required effect operations | Effects | §4.7.1 |
 | UnhandledEffectInTest | E0540 | Unhandled effect in test block | Effects | §2.19 |
@@ -161,9 +160,9 @@ The self-hosting compiler (`src/codegen_types.bl`, `src/codegen_expr.bl`) curren
 | Code | Name | Implementation |
 |------|------|---------------|
 | E0500 | UndeclaredEffect | `codegen_types.bl` — effect propagation check |
-| E0501 | InsufficientCapability | `codegen_types.bl` — `@capabilities` budget check |
+| E0501 | CapabilityBudgetExceeded | `typecheck.bl` — `@capabilities` budget check |
 | E0502 | QuestionMarkInvalidOperand | `codegen_expr.bl` — `?` operator type check (to move to typecheck phase) |
-| E0503 | CoalesceRequiresOption | `codegen_expr.bl` — `??` operator type check |
+| E0513 | CoalesceRequiresOption | `codegen_expr.bl` — `??` operator type check |
 | E0508 | QuestionMarkResultInNonResult | `codegen_expr.bl` — `?` on Result in non-Result function |
 | E0509 | QuestionMarkOptionInNonOption | `codegen_expr.bl` — `?` on Option in non-Option function |
 | E0512 | QuestionMarkErrorMismatch | Not yet implemented — requires type checker |
