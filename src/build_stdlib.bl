@@ -1,0 +1,213 @@
+// Stdlib archive build orchestrator (br tc83pp, phase 1, step D1).
+//
+// Produces `build/libblink_std.a` (a symlink into a content-hashed
+// `build/std-cache/<hash>/`). D1 only handles the monolith case
+// (`peeled = []`): a single fat `monolith.o` with all of stdlib.
+// Monolith.c includes the inlined runtime.h directly, same as a normal
+// blink build, so the shared `libblink_std.h` isn't needed yet — the
+// archive header pass is deferred to D2 because calling generate()
+// twice in one process triggers br 7x73yy (state leak between passes).
+//
+// D2 (later) wires the per-module peel loop. The same cache key
+// already includes `peeled` so cache invalidation is free.
+
+import lexer.{Lex}
+import parser.{Parse}
+import typecheck.{TypeCheck, check_types}
+import compiler.{compile_to_program, check_unused_imports}
+import codegen.{Codegen, generate, cg_runtime_header}
+import codegen_types.{cg_emit_only_module, cg_skip_modules, cg_archive_object_mode}
+import mutation_analysis.{analyze_mutations, analyze_save_restore}
+import diagnostics.{Diag, diag_count, diag_ice_count, diag_flush}
+import cli.{resolve_runtime_header, run_cc}
+import std.path.{path_join}
+
+fn resolve_under_root(rel: Str) -> Str {
+    let blink_root = env.var("BLINK_ROOT") ?? ""
+    if blink_root != "" {
+        let p = path_join(blink_root, rel)
+        if file_exists(p) == 1 {
+            return p
+        }
+    }
+    if file_exists(rel) == 1 {
+        return rel
+    }
+    ""
+}
+
+fn resolve_blinkc_path() -> Str {
+    resolve_under_root("build/blinkc")
+}
+
+fn resolve_stdlib_dir() -> Str {
+    let blink_root = env.var("BLINK_ROOT") ?? ""
+    if blink_root != "" {
+        return path_join(blink_root, "lib/std")
+    }
+    "lib/std"
+}
+
+fn list_stdlib_modules() -> List[Str] {
+    let std_dir = resolve_stdlib_dir()
+    let entries = fs.list_dir(std_dir)
+    let mut out: List[Str] = []
+    let mut i = 0
+    while i < entries.len() {
+        let entry = entries.get(i).unwrap()
+        if entry.ends_with(".bl") {
+            let stem = entry.substring(0, entry.len() - 3)
+            out.push("std.{stem}")
+        }
+        i = i + 1
+    }
+    sort_strs(out)
+    out
+}
+
+fn sort_strs(xs: List[Str]) {
+    // Insertion sort. Small N (~38), no need for anything fancier.
+    let mut i = 1
+    while i < xs.len() {
+        let cur = xs.get(i).unwrap()
+        let mut j = i
+        while j > 0 && xs.get(j - 1).unwrap() > cur {
+            xs.set(j, xs.get(j - 1).unwrap())
+            j = j - 1
+        }
+        xs.set(j, cur)
+        i = i + 1
+    }
+}
+
+fn synthesize_entry_source(modules: List[Str]) -> Str {
+    let mut sb = StringBuilder.new()
+    let mut i = 0
+    while i < modules.len() {
+        sb.write("import ")
+        sb.write(modules.get(i).unwrap())
+        sb.write("\n")
+        i = i + 1
+    }
+    sb.write("\n")
+    sb.write("fn main() \{\}\n")
+    sb.to_str()
+}
+
+fn build_manifest(blinkc: Str, std_dir: Str, modules: List[Str], rt_path: Str, peeled: List[Str]) -> Str {
+    let mut sb = StringBuilder.new()
+    sb.write("blinkc-path:")
+    sb.write(blinkc)
+    sb.write("\n")
+    sb.write("std-dir:")
+    sb.write(std_dir)
+    sb.write("\n")
+    let mut i = 0
+    while i < modules.len() {
+        sb.write("mod:")
+        sb.write(modules.get(i).unwrap())
+        sb.write("\n")
+        i = i + 1
+    }
+    sb.write("runtime-path:")
+    sb.write(rt_path)
+    sb.write("\n")
+    sb.write("peeled:")
+    let mut p = 0
+    while p < peeled.len() {
+        if p > 0 { sb.write(",") }
+        sb.write(peeled.get(p).unwrap())
+        p = p + 1
+    }
+    sb.write("\n")
+    sb.to_str()
+}
+
+fn compute_cache_key(blinkc: Str, std_dir: Str, rt_path: Str, manifest: Str) -> Str {
+    // Cache key = sha256 over manifest + content of compiler binary,
+    // stdlib sources, runtime.h, cc version. Manifest is fed inline via
+    // a heredoc so we don't touch the disk on the cache-hit path.
+    let mut cmd = StringBuilder.new()
+    cmd.write("(cat <<'__BLINK_MANIFEST_EOF__'\n")
+    cmd.write(manifest)
+    cmd.write("__BLINK_MANIFEST_EOF__\n")
+    if blinkc != "" {
+        cmd.write("sha256sum {blinkc} 2>/dev/null\n")
+    }
+    cmd.write("sha256sum {std_dir}/*.bl 2>/dev/null\n")
+    if rt_path != "" {
+        cmd.write("sha256sum {rt_path} 2>/dev/null\n")
+    }
+    cmd.write("cc --version 2>&1 | head -1) | sha256sum | cut -c1-16")
+
+    let res = process_run("sh", ["-c", cmd.to_str()])
+    res.out.trim()
+}
+
+fn relink_archive(cache_dir_rel: Str) {
+    shell_exec("ln -sfn {cache_dir_rel}/libblink_std.a build/libblink_std.a")
+}
+
+pub fn build_stdlib_archive(peeled: List[Str]) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Codegen {
+    let blinkc = resolve_blinkc_path()
+    let std_dir = resolve_stdlib_dir()
+    let rt_path = resolve_under_root("build/runtime.h")
+    let rt_path_final = if rt_path != "" { rt_path } else { resolve_under_root("bootstrap/runtime.h") }
+
+    let modules = list_stdlib_modules()
+    let manifest = build_manifest(blinkc, std_dir, modules, rt_path_final, peeled)
+    let hash = compute_cache_key(blinkc, std_dir, rt_path_final, manifest)
+    if hash == "" {
+        io.eprintln("error: failed to compute stdlib-archive cache key")
+        return 1
+    }
+    let cache_dir = "build/std-cache/{hash}"
+    let stamp = "{cache_dir}/.stamp"
+    if file_exists(stamp) == 1 {
+        relink_archive("std-cache/{hash}")
+        return 0
+    }
+    shell_exec("mkdir -p {cache_dir}")
+
+    let entry_bl = "{cache_dir}/__archive_main.bl"
+    write_file(entry_bl, synthesize_entry_source(modules))
+    let program = compile_to_program(entry_bl, 1)
+    let _tc_err = check_types(program)
+    check_unused_imports()
+    if diag_ice_count > 0 {
+        diag_flush()
+        return 101
+    }
+    if diag_count > 0 {
+        diag_flush()
+        return 1
+    }
+    analyze_mutations(program)
+    analyze_save_restore(program)
+
+    cg_runtime_header = resolve_runtime_header()
+    cg_emit_only_module = ""
+    cg_skip_modules = Map()
+    cg_archive_object_mode = 0
+    let monolith_c = generate(program)
+    if diag_ice_count > 0 {
+        diag_flush()
+        return 101
+    }
+    if diag_count > 0 {
+        diag_flush()
+        return 1
+    }
+    write_file("{cache_dir}/monolith.c", monolith_c)
+    let cc_args = "-c -ffunction-sections -fdata-sections -o {cache_dir}/monolith.o {cache_dir}/monolith.c -I{cache_dir}"
+    let rc = run_cc(cc_args, 0, 1, "")
+    if rc != 0 {
+        io.eprintln("error: cc failed building stdlib monolith (rc={rc})")
+        return rc
+    }
+
+    shell_exec("ar rcs {cache_dir}/libblink_std.a {cache_dir}/monolith.o")
+    write_file(stamp, "")
+    relink_archive("std-cache/{hash}")
+    0
+}
