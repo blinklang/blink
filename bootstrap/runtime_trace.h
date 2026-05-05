@@ -25,7 +25,15 @@ typedef struct {
     int event_count;
 } blink_trace_state;
 
+#ifdef BLINK_USE_EXTERN_RUNTIME_STORAGE
+  #ifdef BLINK_RUNTIME_STORAGE_DEFINE
+    blink_trace_state __blink_trace = {0};
+  #else
+    extern blink_trace_state __blink_trace;
+  #endif
+#else
 static blink_trace_state __blink_trace = {0};
+#endif
 
 BLINK_UNUSED static int64_t blink_trace_ts_us(void) {
     struct timespec now;

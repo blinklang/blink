@@ -12,8 +12,18 @@ typedef struct {
     int64_t exit_code;
 } blink_ProcessResult;
 
+#ifdef BLINK_USE_EXTERN_RUNTIME_STORAGE
+  #ifdef BLINK_RUNTIME_STORAGE_DEFINE
+    volatile pid_t blink_child_pid = 0;
+    volatile sig_atomic_t blink_got_sigint = 0;
+  #else
+    extern volatile pid_t blink_child_pid;
+    extern volatile sig_atomic_t blink_got_sigint;
+  #endif
+#else
 static volatile pid_t blink_child_pid = 0;
 static volatile sig_atomic_t blink_got_sigint = 0;
+#endif
 
 static void blink_sigint_handler(int sig) {
     (void)sig;
@@ -158,9 +168,21 @@ typedef struct {
 
 #define BLINK_PID_TABLE_CAP 4096
 
+#ifdef BLINK_USE_EXTERN_RUNTIME_STORAGE
+  #ifdef BLINK_RUNTIME_STORAGE_DEFINE
+    blink_pid_slot blink_pid_table[BLINK_PID_TABLE_CAP];
+    int64_t blink_pid_table_len = 0;
+    pthread_mutex_t blink_pid_table_mu = PTHREAD_MUTEX_INITIALIZER;
+  #else
+    extern blink_pid_slot blink_pid_table[BLINK_PID_TABLE_CAP];
+    extern int64_t blink_pid_table_len;
+    extern pthread_mutex_t blink_pid_table_mu;
+  #endif
+#else
 static blink_pid_slot blink_pid_table[BLINK_PID_TABLE_CAP];
 static int64_t blink_pid_table_len = 0;
 static pthread_mutex_t blink_pid_table_mu = PTHREAD_MUTEX_INITIALIZER;
+#endif
 
 static int64_t blink_pid_table_alloc(void) {
     pthread_mutex_lock(&blink_pid_table_mu);
@@ -286,7 +308,15 @@ BLINK_UNUSED static int64_t blink_process_pid_send_signal(int64_t handle, int64_
  * the signal to the default handler so the parent unwinds normally.
  * Idempotent: safe to call more than once.
  */
+#ifdef BLINK_USE_EXTERN_RUNTIME_STORAGE
+  #ifdef BLINK_RUNTIME_STORAGE_DEFINE
+    volatile sig_atomic_t blink_process_signal_installed = 0;
+  #else
+    extern volatile sig_atomic_t blink_process_signal_installed;
+  #endif
+#else
 static volatile sig_atomic_t blink_process_signal_installed = 0;
+#endif
 
 static void blink_process_forward_signal(int sig) {
     /* Async-signal-safe: only kill() and write() to a known table.

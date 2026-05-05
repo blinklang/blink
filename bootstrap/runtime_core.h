@@ -50,7 +50,15 @@ typedef struct blink_arena_t {
     int64_t default_chunk_size;
 } blink_arena_t;
 
+#ifdef BLINK_USE_EXTERN_RUNTIME_STORAGE
+  #ifdef BLINK_RUNTIME_STORAGE_DEFINE
+    __thread blink_arena_t* __blink_current_arena = NULL;
+  #else
+    extern __thread blink_arena_t* __blink_current_arena;
+  #endif
+#else
 static __thread blink_arena_t* __blink_current_arena = NULL;
+#endif
 
 BLINK_UNUSED static blink_arena_chunk* blink_arena_chunk_new(int64_t capacity) {
     blink_arena_chunk* c = (blink_arena_chunk*)GC_MALLOC(sizeof(blink_arena_chunk));
