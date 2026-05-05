@@ -37,7 +37,7 @@ import compiler.{
     collect_imports, collect_root_imports, inject_prelude, merge_programs,
     set_strict_struct_layout,
 }
-import codegen.{Codegen, generate, cg_debug_mode, cg_runtime_header, cg_trace_codegen}
+import codegen.{Codegen, generate, generate_archive_header, cg_debug_mode, cg_runtime_header, cg_trace_codegen}
 import codegen_types.{cg_emit_only_module, cg_skip_modules}
 import codegen_stmt.{ann_str_val, positional_str_arg, positional_str_arg_count}
 import ast_dump.{ast_to_json}
@@ -1759,6 +1759,48 @@ fn cmd_check(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
     }
 }
 
+fn cmd_emit_archive_header(args_list: List[Str]) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Codegen {
+    if args_list.len() < 2 {
+        io.println("error: __emit-archive-header requires <entry.bl> <out.h>")
+        exit(1)
+    }
+    let source_path = args_list.get(0).unwrap()
+    let out_path = args_list.get(1).unwrap()
+
+    let final_program = compile_to_program(source_path, 1)
+    let _tc_err_count = check_types(final_program)
+    check_unused_imports()
+    if diag_ice_count > 0 {
+        diag_flush()
+        exit(101)
+    }
+    if diag_count > 0 {
+        diag_flush()
+        exit(1)
+    }
+
+    analyze_mutations(final_program)
+    analyze_save_restore(final_program)
+
+    cg_runtime_header = resolve_runtime_header()
+    cg_emit_only_module = ""
+    cg_skip_modules = Map()
+
+    let header = generate_archive_header(final_program)
+
+    if diag_ice_count > 0 {
+        diag_flush()
+        exit(101)
+    }
+    if diag_count > 0 {
+        diag_flush()
+        exit(1)
+    }
+
+    write_file(out_path, header)
+    diag_flush()
+}
+
 fn cmd_audit(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report {
     let source_path = args_positional(a, 0)
     let baseline_path = args_get(a, "baseline")
@@ -2705,6 +2747,18 @@ fn cmd_shim_bare(p: ArgParser, _a: Args) {
 
 fn main() {
     init_embedded_stdlib()
+
+    if arg_count() >= 2 && get_arg(1) == "__emit-archive-header" {
+        let mut hidden_args: List[Str] = []
+        let mut hi = 2
+        while hi < arg_count() {
+            hidden_args.push(get_arg(hi))
+            hi = hi + 1
+        }
+        cmd_emit_archive_header(hidden_args)
+        return
+    }
+
     let mut p = argparser_new("blink", "The Blink programming language compiler and toolchain")
     p = add_command(p, "init", "Initialize a new Blink project")
     p = add_command(p, "build", "Compile Blink source to native binary")

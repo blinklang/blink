@@ -40,7 +40,7 @@ import codegen_types.{
     emit_str_iter_typedef, emit_tuple_types_from,
     emitted_chain_iters, emitted_filter_iters, emitted_flat_map_iters,
     emitted_fn_names, emitted_fn_set, emitted_iter_set, emitted_iter_types,
-    fn_reg_set, cg_emit_only_module, cg_skip_modules,
+    fn_reg_set, cg_archive_header_mode, cg_emit_only_module, cg_skip_modules,
     emitted_let_names, emitted_let_set, emitted_map_iters,
     emitted_option_set, emitted_option_types, emitted_range_iter,
     emitted_result_set, emitted_result_types, emitted_skip_iters,
@@ -192,6 +192,30 @@ fn skip_module(module_name: Str) -> Bool {
         return true
     }
     cg_skip_modules.contains_key(module_name)
+}
+
+fn is_stdlib_source_module(module_name: Str) -> Bool {
+    module_name.starts_with("std_")
+}
+
+fn prepend_extern_range(start_idx: Int) {
+    let mut k = start_idx
+    while k < cg_lines.len() {
+        let line = cg_lines.get(k).unwrap()
+        if line != "" {
+            cg_lines.set(k, "extern {line}")
+        }
+        k = k + 1
+    }
+}
+
+fn prepend_extern_one(idx: Int) {
+    if idx < cg_lines.len() {
+        let line = cg_lines.get(idx).unwrap()
+        if line != "" {
+            cg_lines.set(idx, "extern {line}")
+        }
+    }
 }
 
 @allow(UnrestoredMutation, IncompleteStateRestore)
@@ -654,7 +678,10 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
         }
     }
 
-    // Preamble: include runtime
+    if cg_archive_header_mode != 0 {
+        cg_lines.push("#ifndef BLINK_LIBBLINK_STD_H")
+        cg_lines.push("#define BLINK_LIBBLINK_STD_H")
+    }
     if cg_runtime_header != "" {
         cg_lines.push(cg_runtime_header)
     } else {
@@ -888,7 +915,7 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
 
     // Top-level let bindings (deduplicated)
     let lets_sl = node_stmts(program)
-    if lets_sl != -1 {
+    if lets_sl != -1 && cg_archive_header_mode == 0 {
         let mut i = 0
         while i < sublist_length(lets_sl) {
             let let_node = sublist_get(lets_sl, i)
@@ -1123,14 +1150,23 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
             let fn_node = sublist_get(fns_sl, i)
             let fn_name = node_name(fn_node)
             let fn_mod = node_module(fn_node)
-            if skip_module(node_source_module(fn_node)) {
+            let fn_src_mod = node_source_module(fn_node)
+            if skip_module(fn_src_mod) {
+                i = i + 1
+                continue
+            }
+            if cg_archive_header_mode != 0 && !is_stdlib_source_module(fn_src_mod) {
                 i = i + 1
                 continue
             }
             cg_current_module = fn_mod
             let emit_key = make_emit_key(fn_mod, fn_name)
             if emitted_fn_set.contains_key(emit_key) == 0 && is_generic_fn(fn_name) == 0 {
+                let pre_len = cg_lines.len()
                 emit_fn_decl(fn_node)
+                if cg_archive_header_mode != 0 {
+                    prepend_extern_one(pre_len)
+                }
                 emitted_fn_names.push(fn_name)
                 emitted_fn_set.insert(emit_key, 1)
                 emitted_fn_set.insert(fn_name, 1)
@@ -1145,7 +1181,12 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
         while i < sublist_length(impls_sl) {
             let im = sublist_get(impls_sl, i)
             let im_mod = node_module(im)
-            if skip_module(node_source_module(im)) {
+            let im_src_mod = node_source_module(im)
+            if skip_module(im_src_mod) {
+                i = i + 1
+                continue
+            }
+            if cg_archive_header_mode != 0 && !is_stdlib_source_module(im_src_mod) {
                 i = i + 1
                 continue
             }
@@ -1160,6 +1201,7 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
                     let mangled = mangle_impl_method(im, impl_type, mname)
                     let params = format_impl_params(m, impl_type)
                     let enum_ret = get_fn_enum_ret(mangled)
+                    let pre_len = cg_lines.len()
                     if enum_ret != "" {
                         emit_line("{c_type_c_name(enum_ret)} {c_fn_name(mangled)}({params});")
                     } else {
@@ -1177,14 +1219,20 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
                             }
                         }
                     }
+                    if cg_archive_header_mode != 0 {
+                        prepend_extern_one(pre_len)
+                    }
                     j = j + 1
                 }
             }
             i = i + 1
         }
     }
-    // Derive forward declarations
+    let pre_derive_len = cg_lines.len()
     emit_derive_forward_decls()
+    if cg_archive_header_mode != 0 {
+        prepend_extern_range(pre_derive_len)
+    }
     emit_line("")
 
     // Emit tuple types discovered during forward declarations, then merge
@@ -1196,6 +1244,14 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
     while fwd_i < fwd_lines.len() {
         cg_lines.push(fwd_lines.get(fwd_i).unwrap())
         fwd_i = fwd_i + 1
+    }
+
+    if cg_archive_header_mode != 0 {
+        cg_lines.push("")
+        cg_lines.push("#endif")
+        pop_scope()
+        if trace_mode != "" { trace("codegen", "archive-header done ({cg_lines.len()} lines)") }
+        return join_lines()
     }
 
     // Function definitions (deduplicated) — emit into temp buffer
@@ -1571,4 +1627,12 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
 
     if trace_mode != "" { trace("codegen", "done ({cg_lines.len()} lines)") }
     join_lines()
+}
+
+@allow(UnrestoredMutation, IncompleteStateRestore)
+pub fn generate_archive_header(program: Int) -> Str ! Codegen, Diag.Report {
+    cg_archive_header_mode = 1
+    let out = generate(program)
+    cg_archive_header_mode = 0
+    out
 }
