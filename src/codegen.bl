@@ -932,14 +932,18 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
         }
     }
 
-    // Top-level let bindings (deduplicated)
+    // Top-level let bindings (deduplicated). In archive-object mode (user
+    // TU linked against libblink_std.a) stdlib globals are skipped — they
+    // live in the monolith and are reached via extern decls in the
+    // archive header.
     let lets_sl = node_stmts(program)
-    if lets_sl != -1 && cg_archive_header_mode == 0 {
+    if lets_sl != -1 {
         let mut i = 0
         while i < sublist_length(lets_sl) {
             let let_node = sublist_get(lets_sl, i)
             let let_name = node_name(let_node)
-            if is_emitted_let(let_name) == 0 {
+            let let_mod = node_source_module(let_node)
+            if is_emitted_let(let_name) == 0 && !skip_module(let_mod) {
                 emit_top_level_let(let_node)
                 emitted_let_names.push(let_name)
                 emitted_let_set.insert(let_name, 1)
@@ -1266,6 +1270,11 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
     }
 
     if cg_archive_header_mode != 0 {
+        // The earlier top-level-let loop already emitted extern decls for
+        // stdlib globals (header mode flips emit_top_level_let into
+        // decl-only). Add the init function decl that the user TU calls.
+        emit_line("")
+        emit_line("extern void __blink_init_stdlib_globals(void);")
         cg_lines.push("")
         cg_lines.push("#endif")
         pop_scope()
@@ -1571,9 +1580,16 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
         emit_line("")
     }
 
-    // Global init function (if needed)
+    // Global init function (if needed). The archive monolith exports its
+    // init under a distinct name so the user TU can call both its own
+    // local init and the stdlib's.
     if cg_global_inits.len() > 0 {
-        emit_line("static void __blink_init_globals(void) \{")
+        let init_decl = if cg_archive_build_mode != 0 {
+            "void __blink_init_stdlib_globals(void) \{"
+        } else {
+            "static void __blink_init_globals(void) \{"
+        }
+        emit_line(init_decl)
         let mut gi = 0
         while gi < cg_global_inits.len() {
             cg_lines.push(cg_global_inits.get(gi).unwrap())
@@ -1597,6 +1613,12 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
         }
         if cg_uses_async != 0 {
             emit_line("__blink_pool = blink_threadpool_init(4);")
+        }
+        // Stdlib init must run before user init: user globals may
+        // reference stdlib state (e.g. construct lists whose ctors hit
+        // stdlib helpers).
+        if cg_archive_object_mode != 0 {
+            emit_line("__blink_init_stdlib_globals();")
         }
         if cg_global_inits.len() > 0 {
             emit_line("__blink_init_globals();")

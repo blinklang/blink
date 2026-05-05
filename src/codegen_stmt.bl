@@ -20,7 +20,7 @@ import codegen_types.{
     cg_temp_counter, cg_trace_codegen, cg_ensures_result_var, cg_old_snapshot_vars,
     compound_name_from_ann,
     emit_arena_restore_helper, emit_bh_cleanup_for_type, emit_cl_cleanup_for_type, emit_ev_restore_helper, emit_handle_cleanup, emit_line, ev_field, fn_node_has_effects,
-    cg_archive_build_mode,
+    cg_archive_build_mode, cg_archive_header_mode,
     emit_struct_option_typedef, emit_td_guard_open, emit_td_guard_close,
     emitted_let_names, emitted_let_set, ensure_iter_type,
     ensure_option_type, ensure_range_iter, ensure_result_type,
@@ -5188,6 +5188,17 @@ pub fn emit_top_level_let(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.S
     cg_lines = saved_lines
     let name = node_name(node)
     let is_mut = node_is_mut(node)
+    // Header mode: emit decl-only and bail before any of the var/type
+    // tracking side effects below — those are body-emission state, not
+    // header concerns.
+    if cg_archive_header_mode != 0 {
+        let ts_h = c_type_str(val_type)
+        let cname_h = c_safe_name(name)
+        let needs_init_h = helper_lines.len() > 0 || val_type == CT_LIST || val_type == CT_MAP || val_type == CT_CHANNEL
+        let const_q_h = if is_mut == 0 && !needs_init_h && val_type != CT_STRING { "const " } else { "" }
+        emit_line("extern {const_q_h}{ts_h} {cname_h};")
+        return
+    }
     set_var(name, val_type, is_mut)
     // Track list element type from annotation
     let type_ann = node_target(node)
@@ -5271,8 +5282,13 @@ pub fn emit_top_level_let(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.S
     let ts = c_type_str(val_type)
     let cname = c_safe_name(name)
     let needs_init = helper_lines.len() > 0 || val_type == CT_LIST || val_type == CT_MAP || val_type == CT_CHANNEL
+    let is_const = is_mut == 0 && !needs_init && val_type != CT_STRING
+    // archive_build_mode drops `static` so the monolith's symbols are
+    // visible to user TUs that see them as `extern` via libblink_std.h.
+    let storage = if cg_archive_build_mode != 0 { "BLINK_UNUSED " } else { "BLINK_UNUSED static " }
+    let const_q = if is_const { "const " } else { "" }
     if needs_init {
-        emit_line("BLINK_UNUSED static {ts} {cname};")
+        emit_line("{storage}{ts} {cname};")
         let mut hi = 0
         while hi < helper_lines.len() {
             cg_global_inits.push(helper_lines.get(hi).unwrap())
@@ -5280,9 +5296,8 @@ pub fn emit_top_level_let(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.S
         }
         cg_global_inits.push("    ".concat(cname).concat(" = ").concat(val_str).concat(";"))
     } else if is_mut != 0 {
-        emit_line("BLINK_UNUSED static ".concat(ts).concat(" ").concat(cname).concat(" = ").concat(val_str).concat(";"))
+        emit_line(storage.concat(ts).concat(" ").concat(cname).concat(" = ").concat(val_str).concat(";"))
     } else {
-        let qualifier = if val_type == CT_STRING { "BLINK_UNUSED static " } else { "BLINK_UNUSED static const " }
-        emit_line(qualifier.concat(ts).concat(" ").concat(cname).concat(" = ").concat(val_str).concat(";"))
+        emit_line(storage.concat(const_q).concat(ts).concat(" ").concat(cname).concat(" = ").concat(val_str).concat(";"))
     }
 }
