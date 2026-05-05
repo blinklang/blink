@@ -40,6 +40,7 @@ import codegen_types.{
     emit_str_iter_typedef, emit_tuple_types_from,
     emitted_chain_iters, emitted_filter_iters, emitted_flat_map_iters,
     emitted_fn_names, emitted_fn_set, emitted_iter_set, emitted_iter_types,
+    fn_node_has_effects,
     fn_reg_set, cg_archive_header_mode, cg_archive_build_mode, cg_archive_object_mode, cg_emit_only_module, cg_skip_modules,
     emitted_let_names, emitted_let_set, emitted_map_iters,
     emitted_option_set, emitted_option_types, emitted_range_iter,
@@ -198,6 +199,16 @@ fn skip_module(module_name: Str) -> Bool {
 
 fn is_stdlib_source_module(module_name: Str) -> Bool {
     module_name.starts_with("std_")
+}
+
+// A stdlib fn must live in the user TU (not the shared archive) when
+// its body touches program-specific evidence: declared effects (`! IO`,
+// `! DB`, …) or a Handler[...] return (handler ctors read __blink_ev).
+// FFI shims carry `! FFI` but are pure C wrappers, so stay in the archive.
+fn fn_is_archive_excluded(fn_node: Int) -> Bool {
+    if has_annotation(fn_node, "ffi") != 0 { return false }
+    if fn_node_has_effects(fn_node) != 0 { return true }
+    node_return_type(fn_node).starts_with("Handler[")
 }
 
 fn prepend_extern_range(start_idx: Int) {
@@ -808,48 +819,69 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
         uei = uei + 1
     }
 
-    // Emit evidence struct (combines built-in + user-defined effect vtables)
-    push_td_guard_open("blink_ev")
-    cg_lines.push("typedef struct \{")
-    cg_lines.push("    blink_io_vtable*      io;")
-    cg_lines.push("    blink_fs_vtable*      fs;")
-    cg_lines.push("    blink_net_vtable*     net;")
-    cg_lines.push("    blink_crypto_vtable*  crypto;")
-    cg_lines.push("    blink_rand_vtable*    rand;")
-    cg_lines.push("    blink_time_vtable*    time;")
-    cg_lines.push("    blink_env_vtable*     env;")
-    cg_lines.push("    blink_process_vtable* process;")
-    let mut ev_uei = 0
-    while ev_uei < ue_effects.len() {
-        let ev_ue = ue_effects.get(ev_uei).unwrap()
-        cg_lines.push("    blink_ue_{ev_ue.handle}_vtable* ue_{ev_ue.handle};")
-        ev_uei = ev_uei + 1
-    }
-    cg_lines.push("\} blink_ev;")
-    push_td_guard_close()
-    cg_lines.push("")
+    // Evidence struct emission. Header mode skips entirely (user TU emits
+    // its own larger typedef). Archive-build mode emits a private typedef
+    // + extern decl. Normal mode emits the typedef, default-initializer,
+    // and the __blink_ev definition.
     if cg_archive_header_mode == 0 {
-    cg_lines.push("BLINK_UNUSED static blink_ev blink_ev_default(void) \{")
-    cg_lines.push("    blink_ev ev;")
-    cg_lines.push("    ev.io      = &blink_io_vtable_default;")
-    cg_lines.push("    ev.fs      = &blink_fs_vtable_default;")
-    cg_lines.push("    ev.net     = &blink_net_vtable_default;")
-    cg_lines.push("    ev.crypto  = &blink_crypto_vtable_default;")
-    cg_lines.push("    ev.rand    = &blink_rand_vtable_default;")
-    cg_lines.push("    ev.time    = &blink_time_vtable_default;")
-    cg_lines.push("    ev.env     = &blink_env_vtable_default;")
-    cg_lines.push("    ev.process = &blink_process_vtable_default;")
-    ev_uei = 0
-    while ev_uei < ue_effects.len() {
-        let ev_ue2 = ue_effects.get(ev_uei).unwrap()
-        cg_lines.push("    ev.ue_{ev_ue2.handle} = &blink_ue_{ev_ue2.handle}_vtable_default;")
-        ev_uei = ev_uei + 1
-    }
-    cg_lines.push("    return ev;")
-    cg_lines.push("\}")
-    cg_lines.push("")
-    cg_lines.push("static blink_ev __blink_ev;")
-    cg_lines.push("")
+        if cg_archive_build_mode != 0 {
+            cg_lines.push("typedef struct \{")
+        } else {
+            push_td_guard_open("blink_ev")
+            cg_lines.push("typedef struct \{")
+        }
+        cg_lines.push("    blink_io_vtable*      io;")
+        cg_lines.push("    blink_fs_vtable*      fs;")
+        cg_lines.push("    blink_net_vtable*     net;")
+        cg_lines.push("    blink_crypto_vtable*  crypto;")
+        cg_lines.push("    blink_rand_vtable*    rand;")
+        cg_lines.push("    blink_time_vtable*    time;")
+        cg_lines.push("    blink_env_vtable*     env;")
+        cg_lines.push("    blink_process_vtable* process;")
+        let mut ev_uei = 0
+        while ev_uei < ue_effects.len() {
+            let ev_ue = ue_effects.get(ev_uei).unwrap()
+            cg_lines.push("    blink_ue_{ev_ue.handle}_vtable* ue_{ev_ue.handle};")
+            ev_uei = ev_uei + 1
+        }
+        cg_lines.push("\} blink_ev;")
+        if cg_archive_build_mode == 0 {
+            push_td_guard_close()
+        }
+        cg_lines.push("")
+
+        if cg_archive_build_mode != 0 {
+            cg_lines.push("extern blink_ev __blink_ev;")
+            cg_lines.push("")
+        } else {
+            cg_lines.push("BLINK_UNUSED static blink_ev blink_ev_default(void) \{")
+            cg_lines.push("    blink_ev ev;")
+            cg_lines.push("    ev.io      = &blink_io_vtable_default;")
+            cg_lines.push("    ev.fs      = &blink_fs_vtable_default;")
+            cg_lines.push("    ev.net     = &blink_net_vtable_default;")
+            cg_lines.push("    ev.crypto  = &blink_crypto_vtable_default;")
+            cg_lines.push("    ev.rand    = &blink_rand_vtable_default;")
+            cg_lines.push("    ev.time    = &blink_time_vtable_default;")
+            cg_lines.push("    ev.env     = &blink_env_vtable_default;")
+            cg_lines.push("    ev.process = &blink_process_vtable_default;")
+            ev_uei = 0
+            while ev_uei < ue_effects.len() {
+                let ev_ue2 = ue_effects.get(ev_uei).unwrap()
+                cg_lines.push("    ev.ue_{ev_ue2.handle} = &blink_ue_{ev_ue2.handle}_vtable_default;")
+                ev_uei = ev_uei + 1
+            }
+            cg_lines.push("    return ev;")
+            cg_lines.push("\}")
+            cg_lines.push("")
+            // archive-object mode: __blink_ev must be non-static so the
+            // monolith's `extern` decl resolves at link time.
+            if cg_archive_object_mode != 0 {
+                cg_lines.push("blink_ev __blink_ev;")
+            } else {
+                cg_lines.push("static blink_ev __blink_ev;")
+            }
+            cg_lines.push("")
+        }
     }
 
     // Populate module prefix registries
@@ -933,9 +965,10 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
     }
 
     // Top-level let bindings (deduplicated). In archive-object mode (user
-    // TU linked against libblink_std.a) stdlib globals are skipped — they
-    // live in the monolith and are reached via extern decls in the
-    // archive header.
+    // TU linked against libblink_std.a) stdlib globals still need codegen
+    // metadata registered (so receivers like `toml_keys.len()` resolve
+    // their list element type), but their C definitions live in the
+    // monolith. emit_top_level_let routes those to an extern-decl path.
     let lets_sl = node_stmts(program)
     if lets_sl != -1 {
         let mut i = 0
@@ -943,8 +976,10 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
             let let_node = sublist_get(lets_sl, i)
             let let_name = node_name(let_node)
             let let_mod = node_source_module(let_node)
-            if is_emitted_let(let_name) == 0 && !skip_module(let_mod) {
-                emit_top_level_let(let_node)
+            let mod_is_skipped = skip_module(let_mod)
+            let extern_only = if cg_archive_object_mode != 0 && mod_is_skipped { 1 } else { 0 }
+            if is_emitted_let(let_name) == 0 && (!mod_is_skipped || extern_only != 0) {
+                emit_top_level_let(let_node, extern_only)
                 emitted_let_names.push(let_name)
                 emitted_let_set.insert(let_name, 1)
             }
@@ -1167,6 +1202,7 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
     cg_lines = []
     emitted_fn_names = []
     emitted_fn_set = Map()
+    let archive_excludes_effectful = if cg_archive_header_mode != 0 || cg_archive_build_mode != 0 { 1 } else { 0 }
     if fns_sl != -1 {
         let mut i = 0
         while i < sublist_length(fns_sl) {
@@ -1174,11 +1210,17 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
             let fn_name = node_name(fn_node)
             let fn_mod = node_module(fn_node)
             let fn_src_mod = node_source_module(fn_node)
-            if skip_module(fn_src_mod) {
+            let fn_is_effectful = fn_is_archive_excluded(fn_node)
+            let fn_keep_for_user = cg_archive_object_mode != 0 && fn_is_effectful
+            if skip_module(fn_src_mod) && !fn_keep_for_user {
                 i = i + 1
                 continue
             }
             if cg_archive_header_mode != 0 && !is_stdlib_source_module(fn_src_mod) {
+                i = i + 1
+                continue
+            }
+            if archive_excludes_effectful != 0 && fn_is_effectful {
                 i = i + 1
                 continue
             }
@@ -1205,7 +1247,7 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
             let im = sublist_get(impls_sl, i)
             let im_mod = node_module(im)
             let im_src_mod = node_source_module(im)
-            if skip_module(im_src_mod) {
+            if skip_module(im_src_mod) && cg_archive_object_mode == 0 {
                 i = i + 1
                 continue
             }
@@ -1218,8 +1260,18 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
             let methods_sl = node_methods(im)
             if methods_sl != -1 {
                 let mut j = 0
+                let im_in_skipped_mod = cg_archive_object_mode != 0 && skip_module(im_src_mod)
                 while j < sublist_length(methods_sl) {
                     let m = sublist_get(methods_sl, j)
+                    let m_is_effectful = fn_is_archive_excluded(m)
+                    if archive_excludes_effectful != 0 && m_is_effectful {
+                        j = j + 1
+                        continue
+                    }
+                    if im_in_skipped_mod && !m_is_effectful {
+                        j = j + 1
+                        continue
+                    }
                     let mname = node_name(m)
                     let mangled = mangle_impl_method(im, impl_type, mname)
                     let params = format_impl_params(m, impl_type)
@@ -1294,7 +1346,14 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
             let fn_node = sublist_get(fns_sl, i)
             let fn_name = node_name(fn_node)
             let fn_mod = node_module(fn_node)
-            if skip_module(node_source_module(fn_node)) {
+            let fn_src_mod_d = node_source_module(fn_node)
+            let fn_is_eff_d = fn_is_archive_excluded(fn_node)
+            if cg_archive_build_mode != 0 && fn_is_eff_d {
+                i = i + 1
+                continue
+            }
+            let fn_keep_for_user_d = cg_archive_object_mode != 0 && fn_is_eff_d
+            if skip_module(fn_src_mod_d) && !fn_keep_for_user_d {
                 i = i + 1
                 continue
             }
@@ -1316,7 +1375,8 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
         while i < sublist_length(impls_sl) {
             let im = sublist_get(impls_sl, i)
             let im_mod = node_module(im)
-            if skip_module(node_source_module(im)) {
+            let im_src_mod_d = node_source_module(im)
+            if skip_module(im_src_mod_d) && cg_archive_object_mode == 0 {
                 i = i + 1
                 continue
             }
@@ -1325,8 +1385,18 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
             let methods_sl = node_methods(im)
             if methods_sl != -1 {
                 let mut j = 0
+                let im_in_skipped_mod_d = cg_archive_object_mode != 0 && skip_module(im_src_mod_d)
                 while j < sublist_length(methods_sl) {
                     let m = sublist_get(methods_sl, j)
+                    let m_is_eff_d = fn_is_archive_excluded(m)
+                    if cg_archive_build_mode != 0 && m_is_eff_d {
+                        j = j + 1
+                        continue
+                    }
+                    if im_in_skipped_mod_d && !m_is_eff_d {
+                        j = j + 1
+                        continue
+                    }
                     emit_impl_method_def(m, impl_type, im)
                     emit_line("")
                     j = j + 1
