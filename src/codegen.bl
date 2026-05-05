@@ -40,7 +40,7 @@ import codegen_types.{
     emit_str_iter_typedef, emit_tuple_types_from,
     emitted_chain_iters, emitted_filter_iters, emitted_flat_map_iters,
     emitted_fn_names, emitted_fn_set, emitted_iter_set, emitted_iter_types,
-    fn_reg_set, cg_archive_header_mode, cg_archive_object_mode, cg_emit_only_module, cg_skip_modules,
+    fn_reg_set, cg_archive_header_mode, cg_archive_build_mode, cg_archive_object_mode, cg_emit_only_module, cg_skip_modules,
     emitted_let_names, emitted_let_set, emitted_map_iters,
     emitted_option_set, emitted_option_types, emitted_range_iter,
     emitted_result_set, emitted_result_types, emitted_skip_iters,
@@ -48,6 +48,7 @@ import codegen_types.{
     emitted_struct_result_types, emitted_take_iters,
     emitted_tuple_entries, emitted_tuple_set,
     emit_option_typedef, option_typedef_emitted, reset_result_typedef_emitted,
+    push_td_guard_open, push_td_guard_close,
     c_type_tag, emit_struct_option_typedef, emit_struct_result_typedef,
     ensure_compound_type_from_ann, find_type_def_node,
     ensure_mixed_result_type, ensure_option_type, ensure_struct_option_type,
@@ -732,6 +733,7 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
     while uei < ue_effects.len() {
         let ue = ue_effects.get(uei).unwrap()
         let vt_type = "blink_ue_{ue.handle}_vtable"
+        push_td_guard_open(vt_type)
         cg_lines.push("typedef struct \{")
         let mut mi = 0
         while mi < ue_methods.len() {
@@ -743,6 +745,7 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
         }
         cg_lines.push("    void* __userdata;")
         cg_lines.push("} {vt_type};")
+        push_td_guard_close()
         cg_lines.push("")
         if cg_archive_header_mode != 0 {
             uei = uei + 1
@@ -806,6 +809,7 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
     }
 
     // Emit evidence struct (combines built-in + user-defined effect vtables)
+    push_td_guard_open("blink_ev")
     cg_lines.push("typedef struct \{")
     cg_lines.push("    blink_io_vtable*      io;")
     cg_lines.push("    blink_fs_vtable*      fs;")
@@ -822,6 +826,7 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
         ev_uei = ev_uei + 1
     }
     cg_lines.push("\} blink_ev;")
+    push_td_guard_close()
     cg_lines.push("")
     if cg_archive_header_mode == 0 {
     cg_lines.push("BLINK_UNUSED static blink_ev blink_ev_default(void) \{")
@@ -1578,49 +1583,52 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
         emit_line("")
     }
 
-    // C main wrapper
-    emit_line("int main(int argc, char** argv) \{")
-    cg_indent = cg_indent + 1
-    emit_line("GC_INIT();")
-    emit_line("blink_g_argc = argc;")
-    emit_line("blink_g_argv = (const char**)argv;")
-    emit_line("__blink_ev = blink_ev_default();")
-    if cg_trace_codegen != 0 {
-        emit_line("blink_trace_init(argc, argv);")
-    }
-    if cg_uses_async != 0 {
-        emit_line("__blink_pool = blink_threadpool_init(4);")
-    }
-    if cg_global_inits.len() > 0 {
-        emit_line("__blink_init_globals();")
-    }
-    let has_main = is_emitted_fn("main")
-    if test_count > 0 && has_main != 0 {
-        emit_line("for (int i = 1; i < argc; i++) \{")
+    // Archive monolith has no entry point — user TU owns main(). Falls
+    // through to the prepend block so SQLite/FFI markers still land here.
+    if cg_archive_build_mode == 0 {
+        emit_line("int main(int argc, char** argv) \{")
         cg_indent = cg_indent + 1
-        emit_line("if (strcmp(argv[i], \"--test\") == 0) \{")
-        cg_indent = cg_indent + 1
-        emit_line("__blink_run_tests(argc, (const char**)argv);")
+        emit_line("GC_INIT();")
+        emit_line("blink_g_argc = argc;")
+        emit_line("blink_g_argv = (const char**)argv;")
+        emit_line("__blink_ev = blink_ev_default();")
+        if cg_trace_codegen != 0 {
+            emit_line("blink_trace_init(argc, argv);")
+        }
+        if cg_uses_async != 0 {
+            emit_line("__blink_pool = blink_threadpool_init(4);")
+        }
+        if cg_global_inits.len() > 0 {
+            emit_line("__blink_init_globals();")
+        }
+        let has_main = is_emitted_fn("main")
+        if test_count > 0 && has_main != 0 {
+            emit_line("for (int i = 1; i < argc; i++) \{")
+            cg_indent = cg_indent + 1
+            emit_line("if (strcmp(argv[i], \"--test\") == 0) \{")
+            cg_indent = cg_indent + 1
+            emit_line("__blink_run_tests(argc, (const char**)argv);")
+            if cg_uses_async != 0 {
+                emit_line("blink_threadpool_shutdown(__blink_pool);")
+            }
+            emit_line("return 0;")
+            cg_indent = cg_indent - 1
+            emit_line("}")
+            cg_indent = cg_indent - 1
+            emit_line("}")
+        }
+        if has_main != 0 {
+            emit_line("blink_main(&__blink_ev);")
+        } else if test_count > 0 {
+            emit_line("__blink_run_tests(argc, (const char**)argv);")
+        }
         if cg_uses_async != 0 {
             emit_line("blink_threadpool_shutdown(__blink_pool);")
         }
         emit_line("return 0;")
         cg_indent = cg_indent - 1
         emit_line("}")
-        cg_indent = cg_indent - 1
-        emit_line("}")
     }
-    if has_main != 0 {
-        emit_line("blink_main(&__blink_ev);")
-    } else if test_count > 0 {
-        emit_line("__blink_run_tests(argc, (const char**)argv);")
-    }
-    if cg_uses_async != 0 {
-        emit_line("blink_threadpool_shutdown(__blink_pool);")
-    }
-    emit_line("return 0;")
-    cg_indent = cg_indent - 1
-    emit_line("}")
 
     pop_scope()
 

@@ -311,6 +311,11 @@ pub let mut cg_archive_header_mode: Int = 0
 // of the inlined runtime header. Used by the stdlib-archive build to
 // share typedefs/extern decls across the monolith and peeled .o files.
 pub let mut cg_archive_object_mode: Int = 0
+// When non-zero, we're producing the stdlib archive's monolith.o itself —
+// so the C `int main` wrapper and the synthesized `fn main()`'s blink_main
+// body are suppressed (the archive has no entry point; the user's TU
+// owns main()).
+pub let mut cg_archive_build_mode: Int = 0
 pub let mut emitted_let_set: Map[Str, Int] = Map()
 pub let mut emitted_option_set: Map[Str, Int] = Map()
 pub let mut emitted_result_set: Map[Str, Int] = Map()
@@ -3737,6 +3742,7 @@ pub fn ensure_tuple_type(c_name: Str, arity: Int, elem_types: Str, elem_structs:
 }
 
 fn emit_tuple_typedef(entry: TupleEntry) ! Codegen.Emit {
+    emit_td_guard_open(c_type_c_name(entry.c_name))
     emit_line("typedef struct \{")
     cg_indent = cg_indent + 1
     let mut i = 0
@@ -3753,6 +3759,7 @@ fn emit_tuple_typedef(entry: TupleEntry) ! Codegen.Emit {
     }
     cg_indent = cg_indent - 1
     emit_line("} {c_type_c_name(entry.c_name)};")
+    emit_td_guard_close()
     emit_line("")
 }
 
@@ -4360,13 +4367,37 @@ pub fn reset_result_typedef_emitted() {
     result_typedef_emitted = Map()
 }
 
+// Wrap each typedef in #ifndef/#define/#endif guards so the same typedef
+// can appear in libblink_std.h (when the archive header is generated) and
+// in user .c files (regular compile path) without redeclaration errors.
+pub fn emit_td_guard_open(tname: Str) ! Codegen.Emit {
+    emit_line("#ifndef BLINK_TD_{tname}")
+    emit_line("#define BLINK_TD_{tname}")
+}
+pub fn emit_td_guard_close() ! Codegen.Emit {
+    emit_line("#endif")
+}
+
+// Same as emit_td_guard_*, but appends to cg_lines directly (call sites
+// that build their own un-indented lines via cg_lines.push instead of
+// going through emit_line).
+pub fn push_td_guard_open(tname: Str) {
+    cg_lines.push("#ifndef BLINK_TD_{tname}")
+    cg_lines.push("#define BLINK_TD_{tname}")
+}
+pub fn push_td_guard_close() {
+    cg_lines.push("#endif")
+}
+
 pub fn emit_option_typedef(inner: Int) ! Codegen.Emit {
     let tag = c_type_tag(inner)
     let tname = "blink_Option_{tag}"
     if option_typedef_emitted.contains_key(tname) != 0 { return }
     option_typedef_emitted.insert(tname, 1)
     let c_inner = c_type_str(inner)
+    emit_td_guard_open(tname)
     emit_line("typedef struct \{ int tag; {c_inner} value; } {tname};")
+    emit_td_guard_close()
     emit_line("")
 }
 
@@ -4382,7 +4413,9 @@ fn emit_result_typedef(ok_t: Int, err_t: Int) ! Codegen.Emit {
     }
     let c_ok = if ok_t == CT_VOID { "int64_t" } else { c_type_str(ok_t) }
     let c_err = c_type_str(err_t)
+    emit_td_guard_open(tname)
     emit_line("typedef struct \{ int tag; union \{ {c_ok} ok; {c_err} err; }; } {tname};")
+    emit_td_guard_close()
     emit_line("")
 }
 
@@ -4391,11 +4424,13 @@ pub fn emit_struct_option_typedef(struct_name: Str) ! Codegen.Emit {
     if option_typedef_emitted.contains_key(tname) != 0 { return }
     option_typedef_emitted.insert(tname, 1)
     let inner_c = c_type_from_tag(struct_name)
+    emit_td_guard_open(tname)
     if inner_c.ends_with("*") {
         emit_line("typedef struct \{ int tag; {inner_c} value; } {tname};")
     } else {
         emit_line("typedef struct \{ int tag; {inner_c}* value; } {tname};")
     }
+    emit_td_guard_close()
     emit_line("")
 }
 
@@ -4429,7 +4464,9 @@ pub fn emit_struct_result_typedef(ok_tag: Str, err_tag: Str) ! Codegen.Emit {
     }
     let c_ok = if ok_tag == "void" || ok_tag == "Void" { "int64_t" } else { c_type_from_tag(ok_tag) }
     let c_err = c_type_from_tag(err_tag)
+    emit_td_guard_open(tname)
     emit_line("typedef struct \{ int tag; union \{ {c_ok} ok; {c_err} err; }; } {tname};")
+    emit_td_guard_close()
     emit_line("")
 }
 
@@ -4506,7 +4543,9 @@ pub fn ensure_str_iter() {
 }
 
 pub fn emit_range_iter_typedef() ! Codegen.Emit {
+    emit_td_guard_open("blink_RangeIterator")
     emit_line("typedef struct \{ int64_t current; int64_t end; int is_inclusive; } blink_RangeIterator;")
+    emit_td_guard_close()
     emit_line("")
     emit_line("static blink_Option_int blink_RangeIterator_next(blink_RangeIterator* self) \{")
     emit_line("    int in_range = self->is_inclusive ? (self->current <= self->end) : (self->current < self->end);")
@@ -4521,7 +4560,9 @@ pub fn emit_range_iter_typedef() ! Codegen.Emit {
 }
 
 pub fn emit_str_iter_typedef() ! Codegen.Emit {
+    emit_td_guard_open("blink_StrIterator")
     emit_line("typedef struct \{ const char* str; int64_t index; int64_t len; } blink_StrIterator;")
+    emit_td_guard_close()
     emit_line("")
     emit_line("static blink_Option_str blink_StrIterator_next(blink_StrIterator* self) \{")
     emit_line("    if (self->index < self->len) \{")
@@ -4543,7 +4584,9 @@ fn emit_list_iter_typedef(inner: Int) ! Codegen.Emit {
     let tname = "blink_ListIterator_{tag}"
     let opt_name = option_c_type(inner)
     let c_inner = c_type_str(inner)
+    emit_td_guard_open(tname)
     emit_line("typedef struct \{ blink_list* items; int64_t index; } {tname};")
+    emit_td_guard_close()
     emit_line("")
     emit_line("static {opt_name} {tname}_next({tname}* self) \{")
     emit_line("    if (self->index < blink_list_len(self->items)) \{")
@@ -4701,7 +4744,9 @@ fn emit_map_iter_typedef(inner: Int) ! Codegen.Emit {
     let tag = c_type_tag(inner)
     let opt = option_c_type(inner)
     let c_inner = c_type_str(inner)
+    emit_td_guard_open("blink_MapIterator_{tag}")
     emit_line("typedef struct \{ void* source; {opt} (*source_next)(void*); blink_closure* fn; } blink_MapIterator_{tag};")
+    emit_td_guard_close()
     emit_line("")
     emit_line("static {opt} blink_MapIterator_{tag}_next(void* __self) \{")
     emit_line("    blink_MapIterator_{tag}* self = (blink_MapIterator_{tag}*)__self;")
@@ -4717,7 +4762,9 @@ fn emit_filter_iter_typedef(inner: Int) ! Codegen.Emit {
     let tag = c_type_tag(inner)
     let opt = option_c_type(inner)
     let c_inner = c_type_str(inner)
+    emit_td_guard_open("blink_FilterIterator_{tag}")
     emit_line("typedef struct \{ void* source; {opt} (*source_next)(void*); blink_closure* fn; } blink_FilterIterator_{tag};")
+    emit_td_guard_close()
     emit_line("")
     emit_line("static {opt} blink_FilterIterator_{tag}_next(void* __self) \{")
     emit_line("    blink_FilterIterator_{tag}* self = (blink_FilterIterator_{tag}*)__self;")
@@ -4735,7 +4782,9 @@ fn emit_filter_iter_typedef(inner: Int) ! Codegen.Emit {
 fn emit_take_iter_typedef(inner: Int) ! Codegen.Emit {
     let tag = c_type_tag(inner)
     let opt = option_c_type(inner)
+    emit_td_guard_open("blink_TakeIterator_{tag}")
     emit_line("typedef struct \{ void* source; {opt} (*source_next)(void*); int64_t limit; int64_t count; } blink_TakeIterator_{tag};")
+    emit_td_guard_close()
     emit_line("")
     emit_line("static {opt} blink_TakeIterator_{tag}_next(void* __self) \{")
     emit_line("    blink_TakeIterator_{tag}* self = (blink_TakeIterator_{tag}*)__self;")
@@ -4751,7 +4800,9 @@ fn emit_take_iter_typedef(inner: Int) ! Codegen.Emit {
 fn emit_skip_iter_typedef(inner: Int) ! Codegen.Emit {
     let tag = c_type_tag(inner)
     let opt = option_c_type(inner)
+    emit_td_guard_open("blink_SkipIterator_{tag}")
     emit_line("typedef struct \{ void* source; {opt} (*source_next)(void*); int64_t skip_n; int64_t skipped; } blink_SkipIterator_{tag};")
+    emit_td_guard_close()
     emit_line("")
     emit_line("static {opt} blink_SkipIterator_{tag}_next(void* __self) \{")
     emit_line("    blink_SkipIterator_{tag}* self = (blink_SkipIterator_{tag}*)__self;")
@@ -4768,7 +4819,9 @@ fn emit_skip_iter_typedef(inner: Int) ! Codegen.Emit {
 fn emit_chain_iter_typedef(inner: Int) ! Codegen.Emit {
     let tag = c_type_tag(inner)
     let opt = option_c_type(inner)
+    emit_td_guard_open("blink_ChainIterator_{tag}")
     emit_line("typedef struct \{ void* source_a; {opt} (*next_a)(void*); void* source_b; {opt} (*next_b)(void*); int phase; } blink_ChainIterator_{tag};")
+    emit_td_guard_close()
     emit_line("")
     emit_line("static {opt} blink_ChainIterator_{tag}_next(void* __self) \{")
     emit_line("    blink_ChainIterator_{tag}* self = (blink_ChainIterator_{tag}*)__self;")
@@ -4786,7 +4839,9 @@ fn emit_flat_map_iter_typedef(inner: Int) ! Codegen.Emit {
     let tag = c_type_tag(inner)
     let opt = option_c_type(inner)
     let c_inner = c_type_str(inner)
+    emit_td_guard_open("blink_FlatMapIterator_{tag}")
     emit_line("typedef struct \{ void* source; {opt} (*source_next)(void*); blink_closure* fn; blink_list* buffer; int64_t buf_idx; } blink_FlatMapIterator_{tag};")
+    emit_td_guard_close()
     emit_line("")
     emit_line("static {opt} blink_FlatMapIterator_{tag}_next(void* __self) \{")
     emit_line("    blink_FlatMapIterator_{tag}* self = (blink_FlatMapIterator_{tag}*)__self;")
