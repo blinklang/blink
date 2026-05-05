@@ -1,21 +1,19 @@
-// Stdlib archive build orchestrator (br tc83pp, phase 1, step D1).
+// Stdlib archive build orchestrator.
 //
 // Produces `build/libblink_std.a` (a symlink into a content-hashed
-// `build/std-cache/<hash>/`). D1 only handles the monolith case
-// (`peeled = []`): a single fat `monolith.o` with all of stdlib.
-// Monolith.c includes the inlined runtime.h directly, same as a normal
-// blink build, so the shared `libblink_std.h` isn't needed yet — the
-// archive header pass is deferred to D2 because calling generate()
-// twice in one process triggers br 7x73yy (state leak between passes).
+// `build/std-cache/<hash>/`) plus `libblink_std.h` (extern decls +
+// typedefs) and `monolith.o` (all stdlib bodies). The header is
+// consumed by the per-module peel loop — when `peeled` is non-empty,
+// each peeled module compiles into its own `.o` that includes
+// `libblink_std.h` and links against the shrunk monolith.
 //
-// D2 (later) wires the per-module peel loop. The same cache key
-// already includes `peeled` so cache invalidation is free.
+// Cache key includes `peeled` so invalidation is automatic.
 
 import lexer.{Lex}
 import parser.{Parse}
 import typecheck.{TypeCheck, check_types}
 import compiler.{compile_to_program, check_unused_imports}
-import codegen.{Codegen, generate, cg_runtime_header}
+import codegen.{Codegen, generate, generate_archive_header, cg_runtime_header}
 import codegen_types.{cg_emit_only_module, cg_skip_modules, cg_archive_object_mode}
 import mutation_analysis.{analyze_mutations, analyze_save_restore}
 import diagnostics.{Diag, diag_count, diag_ice_count, diag_flush}
@@ -148,6 +146,18 @@ fn relink_archive(cache_dir_rel: Str) {
     shell_exec("ln -sfn {cache_dir_rel}/libblink_std.a build/libblink_std.a")
 }
 
+fn bail_on_diag() -> Int ! Diag.Report {
+    if diag_ice_count > 0 {
+        diag_flush()
+        return 101
+    }
+    if diag_count > 0 {
+        diag_flush()
+        return 1
+    }
+    0
+}
+
 pub fn build_stdlib_archive(peeled: List[Str]) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Codegen {
     let blinkc = resolve_blinkc_path()
     let std_dir = resolve_stdlib_dir()
@@ -174,14 +184,8 @@ pub fn build_stdlib_archive(peeled: List[Str]) -> Int ! Lex.Tokenize, Parse, Par
     let program = compile_to_program(entry_bl, 1)
     let _tc_err = check_types(program)
     check_unused_imports()
-    if diag_ice_count > 0 {
-        diag_flush()
-        return 101
-    }
-    if diag_count > 0 {
-        diag_flush()
-        return 1
-    }
+    let tc_rc = bail_on_diag()
+    if tc_rc != 0 { return tc_rc }
     analyze_mutations(program)
     analyze_save_restore(program)
 
@@ -189,15 +193,15 @@ pub fn build_stdlib_archive(peeled: List[Str]) -> Int ! Lex.Tokenize, Parse, Par
     cg_emit_only_module = ""
     cg_skip_modules = Map()
     cg_archive_object_mode = 0
+
+    let header = generate_archive_header(program)
+    let hdr_rc = bail_on_diag()
+    if hdr_rc != 0 { return hdr_rc }
+    write_file("{cache_dir}/libblink_std.h", header)
+
     let monolith_c = generate(program)
-    if diag_ice_count > 0 {
-        diag_flush()
-        return 101
-    }
-    if diag_count > 0 {
-        diag_flush()
-        return 1
-    }
+    let mono_rc = bail_on_diag()
+    if mono_rc != 0 { return mono_rc }
     write_file("{cache_dir}/monolith.c", monolith_c)
     let cc_args = "-c -ffunction-sections -fdata-sections -o {cache_dir}/monolith.o {cache_dir}/monolith.c -I{cache_dir}"
     let rc = run_cc(cc_args, 0, 1, "")
