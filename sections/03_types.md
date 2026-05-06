@@ -1408,7 +1408,12 @@ Traits define shared behavior. They are the sole polymorphism mechanism in Blink
 
 ```blink
 trait Display {
-    fn display(self) -> Str
+    fn fmt(self, sb: StringBuilder) ! StringBuilderPure
+    final fn display(self) -> Str {
+        let sb = StringBuilder.new()
+        self.fmt(sb)
+        sb.to_str()
+    }
 }
 
 trait Eq {
@@ -1481,7 +1486,12 @@ error[SelfOutsideTraitOrImpl]: `Self` outside trait or impl
 
 ```blink
 trait Display {
-    fn display(self) -> Str          // self: Self, enables x.display()
+    fn fmt(self, sb: StringBuilder) ! StringBuilderPure   // self: Self, enables x.fmt(sb)
+    final fn display(self) -> Str {                        // sealed default, enables x.display()
+        let sb = StringBuilder.new()
+        self.fmt(sb)
+        sb.to_str()
+    }
 }
 
 trait Combiner {
@@ -1902,6 +1912,69 @@ Key differences:
 
 String interpolation (`"{value}"`) invokes `Display`. Explicit `value.debug()` is required for the structural form.
 
+##### Display Trait Shape
+
+`Display` has two surfaces, exactly one of which is user-implementable. Implementors write `fmt`; the trait derives `display` from it.
+
+```blink
+trait Display {
+    fn fmt(self, sb: StringBuilder) ! StringBuilderPure
+    final fn display(self) -> Str {
+        let sb = StringBuilder.new()
+        self.fmt(sb)
+        sb.to_str()
+    }
+}
+```
+
+**`fmt` (push, required).** Pushes the rendered representation into a caller-provided `StringBuilder`. Recursive impls call `child.fmt(sb)` into the *same* builder, giving O(n) composition with no intermediate allocations:
+
+```blink
+@derive(Display)
+type Point { x: Int, y: Int }
+
+impl Display for Point {
+    fn fmt(self, sb: StringBuilder) {
+        sb.write("(")
+        sb.write(self.x)
+        sb.write(", ")
+        sb.write(self.y)
+        sb.write(")")
+    }
+}
+```
+
+**`display` (pull, sealed default).** Marked `final` — it cannot be overridden in any `impl` block. Provides Str-producing ergonomics for sites where no builder is in scope (error paths, test assertions, match arms):
+
+```blink
+let p = Point{ x: 3, y: 4 }
+let s: Str = p.display()       // "(3, 4)"
+```
+
+```
+error[SealedMethodOverride]: cannot override sealed method `display`
+  --> graphics.bl:18:5
+   |
+18 |     fn display(self) -> Str { "<custom>" }
+   |     ^^^^^^^^^^^^^^^^^^^^^^^ `Display.display` is `final`; only `fmt` is implementable
+   |
+   = help: implement `fmt(self, sb)` instead — `display` is derived from it
+```
+
+**Sealing rationale.** A sealed default makes drift mechanically impossible: `value.display()` and any push-style consumption (interpolation, `sb.write(value)`) are guaranteed to produce identical output, because both route through the same `fmt`. Without sealing, a user `impl` could provide a `display` that diverges from `fmt` — different string for the same value depending on call site.
+
+**Three call shapes, one impl.** Every `T: Display` is consumable three ways, all routing through `fmt`:
+
+| Shape | Lowering | When to use |
+|-------|----------|-------------|
+| `"{x}"` interpolation | `x.fmt(sb_internal)` | Building a Str literal |
+| `x.display()` | `let sb = ...; x.fmt(sb); sb.to_str()` | Need a Str directly |
+| `sb.write(x)` | `x.fmt(sb)` | Building into a builder you already own |
+
+The interpolation lowering (built-in fast-path optimization aside) and the `display` derivation share the same call: `x.fmt(sb)`. They cannot disagree.
+
+**`StringBuilderPure` effect.** `fmt` is declared with the `StringBuilderPure` effect (§4.x): it may write into the supplied `StringBuilder`, but it cannot read external state, perform IO, allocate observably, or mutate any state outside the builder. This makes `fmt` referentially transparent given a fixed `(self, sb_initial_state)`, which is what makes the sealed `display` derivation safe and the interpolation cache-friendly.
+
 ##### Display Format Protocol
 
 String interpolation `"hello {name}"` desugars to a string concatenation where each `{expr}` requires `T: Display` at compile time. The protocol has three aspects: requirement enforcement, desugaring mechanism, and context-sensitive behavior.
@@ -1928,7 +2001,7 @@ Built-in types (`Int`, `Float`, `Bool`, `Str`, `Char`) have compiler-provided `D
 2. **Codegen phase:** Optimize based on type knowledge:
    - **Built-in types** (`Int`, `Float`, `Bool`, `Char`): emit direct format specifiers (`%d`, `%f`, `%s`, etc. in C backend). No function call overhead.
    - **`Str`**: emit direct string concatenation. No conversion needed.
-   - **User types**: emit `Display.display(expr)` — a qualified trait call producing a `Str`, then concatenate.
+   - **User types**: emit `expr.fmt(sb_internal)` — a direct push into the interpolation's internal `StringBuilder`. No intermediate `Str` allocation per interpolation slot, even for deeply nested types.
 
 Example desugaring:
 
@@ -1951,8 +2024,10 @@ let msg = "at {p}"
 
 // Type check: Point: Display ✓ (via @derive)
 // Codegen (conceptual C):
-//   char* tmp = Display_display_Point(p);
-//   snprintf(buf, ..., "at %s", tmp)
+//   StringBuilder sb = sb_new();
+//   sb_write_str(sb, "at ");
+//   Display_fmt_Point(p, sb);     // pushes "Point { x: 1.0, y: 2.5 }" into sb
+//   Str msg = sb_to_str(sb);
 ```
 
 The two-phase approach preserves the semantic guarantee (every interpolated type has a Display impl) while allowing the C backend to use efficient format specifiers for built-in types. This matches the current compiler's existing snprintf-based codegen.
@@ -2019,7 +2094,7 @@ Per-trait product type rules:
 | `Ord` | Lexicographic: compare `f1`, if `Equal` compare `f2`, ... |
 | `Hash` | Combine field hashes with mixing: `hash(f1) ^ hash(f2) ^ ...` |
 | `Clone` | `Type { f1: self.f1, f2: self.f2, ... }` (value copy, no recursive clone) |
-| `Display` | `"{f1}, {f2}, ..."` comblink comma-separated |
+| `Display` | `fmt`: `sb.write(self.f1); sb.write(", "); sb.write(self.f2); ...` (comma-separated, push-style) |
 | `Debug` | `"TypeName { f1: {f1.debug()}, f2: {f2.debug()}, ... }"` |
 
 ##### Sum Type Codegen (Enums)

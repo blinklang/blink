@@ -189,6 +189,7 @@ Decided by expert panel vote. See [OPEN_QUESTIONS.md](OPEN_QUESTIONS.md) for ful
 | Display interpolation requirement | Strict: `{expr}` requires `T: Display` at compile time. No fallback, no auto-synthesis. Built-ins have compiler-provided impls | 5-0 |
 | Display desugaring mechanism | Two-phase: type checker verifies `T: Display`, codegen optimizes built-ins to format specifiers, emits `Display.display()` for user types | 5-0 |
 | Display and Template[C] interaction | Display is Str-context only. `Template[C]` interpolation passes raw typed values as decomposed parts/values, not Display-stringified strings. Compiler-known param type set | 5-0 |
+| Display trait shape | Push primary `fmt(self, sb: StringBuilder) ! StringBuilderPure` (required) + sealed pull-derived `final fn display(self) -> Str`. One impl point, three call shapes (`"{x}"`, `x.display()`, `sb.write(x)`) all routing through `fmt`. Independent of `wk9gab` | 4-2 R2 (Q1 `display` over `to_str`/`to_string`); 6-0 R2 (Q4 sealed default method); 5-1 R1 soft-consensus (Q2 push+pull); 6-0 R1 (Q3 wk9gab-independent) |
 | FFI pointer type model | `Ptr[T]` non-null default, `Ptr[T]?` for nullable via `Option`. `Void` opaque type for `Ptr[Void]`. No const/mut distinction | 4-1 (Sys/Web/PLT/DevOps for B; AI for A) |
 | FFI pointer operations | Minimal + deref/write/null: `alloc_ptr`, `as_cstr`, `addr`, `deref() -> Option[T]`, `write(T)`, `is_null()`, `null_ptr[T]()`, `to_str()` | 5-0 |
 | FFI pointer lifetime | Scoped `ffi.scope()` via Closeable integration. `scope.take()` for ownership transfer. Standalone `alloc_ptr` with GC finalizer as fallback | 3-2 (PLT/DevOps/AI for scope; Sys/Web for hybrid) |
@@ -344,6 +345,7 @@ Full deliberation records for each decision. Each file contains expert votes, re
 | String Methods | [decisions/string-methods.md](decisions/string-methods.md) |
 | Collection Methods | [decisions/collection-methods.md](decisions/collection-methods.md) |
 | Display Format Protocol | [decisions/display-format-protocol.md](decisions/display-format-protocol.md) |
+| Display Trait Shape | [decisions/display-trait-shape.md](decisions/display-trait-shape.md) |
 | FFI Type Mapping | [decisions/ffi-type-mapping.md](decisions/ffi-type-mapping.md) |
 | FFI Struct Construction & Buffer Bridges | [decisions/ffi-struct-construction.md](decisions/ffi-struct-construction.md) |
 | Error Catalog | [decisions/error-catalog.md](decisions/error-catalog.md) |
