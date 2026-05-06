@@ -48,7 +48,9 @@ typedef struct {
     pthread_cond_t recv_cond;
 } blink_channel;
 
-BLINK_UNUSED static void* blink_threadpool_worker(void* arg) {
+BLINK_RT_FN void* blink_threadpool_worker(void* arg);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void* blink_threadpool_worker(void* arg) {
     blink_threadpool* pool = (blink_threadpool*)arg;
     while (1) {
         pthread_mutex_lock(&pool->mutex);
@@ -70,8 +72,11 @@ BLINK_UNUSED static void* blink_threadpool_worker(void* arg) {
     }
     return NULL;
 }
+#endif
 
-BLINK_UNUSED static blink_threadpool* blink_threadpool_init(int thread_count) {
+BLINK_RT_FN blink_threadpool* blink_threadpool_init(int thread_count);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN blink_threadpool* blink_threadpool_init(int thread_count) {
     if (thread_count <= 0) {
         thread_count = 4;
     }
@@ -88,8 +93,11 @@ BLINK_UNUSED static blink_threadpool* blink_threadpool_init(int thread_count) {
     }
     return pool;
 }
+#endif
 
-BLINK_UNUSED static void blink_threadpool_submit(blink_threadpool* pool, void (*fn)(void*), void* arg) {
+BLINK_RT_FN void blink_threadpool_submit(blink_threadpool* pool, void (*fn)(void*), void* arg);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_threadpool_submit(blink_threadpool* pool, void (*fn)(void*), void* arg) {
     blink_task* task = (blink_task*)blink_alloc(sizeof(blink_task));
     task->fn = fn;
     task->arg = arg;
@@ -104,8 +112,11 @@ BLINK_UNUSED static void blink_threadpool_submit(blink_threadpool* pool, void (*
     pthread_cond_signal(&pool->cond);
     pthread_mutex_unlock(&pool->mutex);
 }
+#endif
 
-BLINK_UNUSED static void blink_threadpool_shutdown(blink_threadpool* pool) {
+BLINK_RT_FN void blink_threadpool_shutdown(blink_threadpool* pool);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_threadpool_shutdown(blink_threadpool* pool) {
     pthread_mutex_lock(&pool->mutex);
     pool->shutdown = 1;
     pthread_cond_broadcast(&pool->cond);
@@ -118,10 +129,13 @@ BLINK_UNUSED static void blink_threadpool_shutdown(blink_threadpool* pool) {
     GC_FREE(pool->threads);
     GC_FREE(pool);
 }
+#endif
 
 /* ── Handle operations ──────────────────────────────────────────────── */
 
-BLINK_UNUSED static blink_handle* blink_handle_new(void) {
+BLINK_RT_FN blink_handle* blink_handle_new(void);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN blink_handle* blink_handle_new(void) {
     blink_handle* h = (blink_handle*)blink_alloc(sizeof(blink_handle));
     memset(&h->thread, 0, sizeof(pthread_t));
     h->result = NULL;
@@ -130,16 +144,22 @@ BLINK_UNUSED static blink_handle* blink_handle_new(void) {
     pthread_cond_init(&h->cond, NULL);
     return h;
 }
+#endif
 
-BLINK_UNUSED static void blink_handle_set_result(blink_handle* h, void* result) {
+BLINK_RT_FN void blink_handle_set_result(blink_handle* h, void* result);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_handle_set_result(blink_handle* h, void* result) {
     pthread_mutex_lock(&h->mutex);
     h->result = result;
     h->status = BLINK_HANDLE_DONE;
     pthread_cond_broadcast(&h->cond);
     pthread_mutex_unlock(&h->mutex);
 }
+#endif
 
-BLINK_UNUSED static void* blink_handle_await(blink_handle* h) {
+BLINK_RT_FN void* blink_handle_await(blink_handle* h);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void* blink_handle_await(blink_handle* h) {
     pthread_mutex_lock(&h->mutex);
     while (h->status == BLINK_HANDLE_RUNNING) {
         pthread_cond_wait(&h->cond, &h->mutex);
@@ -148,10 +168,13 @@ BLINK_UNUSED static void* blink_handle_await(blink_handle* h) {
     pthread_mutex_unlock(&h->mutex);
     return result;
 }
+#endif
 
 /* ── Channel operations ─────────────────────────────────────────────── */
 
-BLINK_UNUSED static blink_channel* blink_channel_new(int64_t capacity) {
+BLINK_RT_FN blink_channel* blink_channel_new(int64_t capacity);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN blink_channel* blink_channel_new(int64_t capacity) {
     if (capacity <= 0) capacity = 16;
     blink_channel* ch = (blink_channel*)blink_alloc(sizeof(blink_channel));
     ch->buffer = (void**)blink_alloc(sizeof(void*) * (size_t)capacity);
@@ -165,8 +188,11 @@ BLINK_UNUSED static blink_channel* blink_channel_new(int64_t capacity) {
     pthread_cond_init(&ch->recv_cond, NULL);
     return ch;
 }
+#endif
 
-BLINK_UNUSED static int blink_channel_send(blink_channel* ch, void* value) {
+BLINK_RT_FN int blink_channel_send(blink_channel* ch, void* value);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int blink_channel_send(blink_channel* ch, void* value) {
     pthread_mutex_lock(&ch->mutex);
     while (ch->count >= ch->capacity && !ch->closed) {
         pthread_cond_wait(&ch->send_cond, &ch->mutex);
@@ -182,8 +208,11 @@ BLINK_UNUSED static int blink_channel_send(blink_channel* ch, void* value) {
     pthread_mutex_unlock(&ch->mutex);
     return 0;
 }
+#endif
 
-BLINK_UNUSED static void* blink_channel_recv(blink_channel* ch) {
+BLINK_RT_FN void* blink_channel_recv(blink_channel* ch);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void* blink_channel_recv(blink_channel* ch) {
     pthread_mutex_lock(&ch->mutex);
     while (ch->count == 0 && !ch->closed) {
         pthread_cond_wait(&ch->recv_cond, &ch->mutex);
@@ -199,13 +228,17 @@ BLINK_UNUSED static void* blink_channel_recv(blink_channel* ch) {
     pthread_mutex_unlock(&ch->mutex);
     return value;
 }
+#endif
 
-BLINK_UNUSED static void blink_channel_close(blink_channel* ch) {
+BLINK_RT_FN void blink_channel_close(blink_channel* ch);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_channel_close(blink_channel* ch) {
     pthread_mutex_lock(&ch->mutex);
     ch->closed = 1;
     pthread_cond_broadcast(&ch->send_cond);
     pthread_cond_broadcast(&ch->recv_cond);
     pthread_mutex_unlock(&ch->mutex);
 }
+#endif
 
 #endif

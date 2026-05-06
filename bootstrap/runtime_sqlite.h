@@ -13,7 +13,9 @@ typedef struct {
     int64_t rc;            /* sqlite3 return code (0 = SQLITE_OK) */
 } blink_sqlite3_result;
 
-BLINK_UNUSED static void* blink_sqlite3_open(const char* path) {
+BLINK_RT_FN void* blink_sqlite3_open(const char* path);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void* blink_sqlite3_open(const char* path) {
     sqlite3* db = NULL;
     int rc = sqlite3_open(path, &db);
     if (rc != SQLITE_OK) {
@@ -22,8 +24,13 @@ BLINK_UNUSED static void* blink_sqlite3_open(const char* path) {
     }
     return (void*)db;
 }
+#endif
 
-BLINK_UNUSED static int64_t blink_sqlite3_exec(void* db, const char* sql,
+BLINK_RT_FN int64_t blink_sqlite3_exec(void* db, const char* sql,
+                                  int (*callback)(void*, int, char**, char**),
+                                  void* arg, const char** errmsg);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int64_t blink_sqlite3_exec(void* db, const char* sql,
                                   int (*callback)(void*, int, char**, char**),
                                   void* arg, const char** errmsg) {
     char* err = NULL;
@@ -34,8 +41,11 @@ BLINK_UNUSED static int64_t blink_sqlite3_exec(void* db, const char* sql,
     if (err) sqlite3_free(err);
     return (int64_t)rc;
 }
+#endif
 
-BLINK_UNUSED static int blink_sqlite3_query_cb(void* ud, int ncols, char** values, char** names) {
+BLINK_RT_FN int blink_sqlite3_query_cb(void* ud, int ncols, char** values, char** names);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int blink_sqlite3_query_cb(void* ud, int ncols, char** values, char** names) {
     blink_sqlite3_result* res = (blink_sqlite3_result*)ud;
     if (res->num_rows == 0) {
         for (int i = 0; i < ncols; i++) {
@@ -51,8 +61,11 @@ BLINK_UNUSED static int blink_sqlite3_query_cb(void* ud, int ncols, char** value
     res->num_rows++;
     return 0;
 }
+#endif
 
-BLINK_UNUSED static void* blink_sqlite3_query(void* db, const char* sql) {
+BLINK_RT_FN void* blink_sqlite3_query(void* db, const char* sql);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void* blink_sqlite3_query(void* db, const char* sql) {
     blink_sqlite3_result* res = (blink_sqlite3_result*)blink_alloc(sizeof(blink_sqlite3_result));
     res->rows = blink_list_new();
     res->columns = blink_list_new();
@@ -65,8 +78,11 @@ BLINK_UNUSED static void* blink_sqlite3_query(void* db, const char* sql) {
     if (err) sqlite3_free(err);
     return res;
 }
+#endif
 
-BLINK_UNUSED static void* blink_sqlite3_prepare(void* db, const char* sql) {
+BLINK_RT_FN void* blink_sqlite3_prepare(void* db, const char* sql);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void* blink_sqlite3_prepare(void* db, const char* sql) {
     sqlite3_stmt* stmt = NULL;
     int rc = sqlite3_prepare_v2((sqlite3*)db, sql, -1, &stmt, NULL);
     if (rc != SQLITE_OK) {
@@ -74,120 +90,190 @@ BLINK_UNUSED static void* blink_sqlite3_prepare(void* db, const char* sql) {
     }
     return (void*)stmt;
 }
+#endif
 
-BLINK_UNUSED static int64_t blink_sqlite3_bind_int(void* stmt, int64_t idx, int64_t val) {
+BLINK_RT_FN int64_t blink_sqlite3_bind_int(void* stmt, int64_t idx, int64_t val);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int64_t blink_sqlite3_bind_int(void* stmt, int64_t idx, int64_t val) {
     return (int64_t)sqlite3_bind_int64((sqlite3_stmt*)stmt, (int)idx, (sqlite3_int64)val);
 }
+#endif
 
-BLINK_UNUSED static int64_t blink_sqlite3_bind_text(void* stmt, int64_t idx, const char* val) {
+BLINK_RT_FN int64_t blink_sqlite3_bind_text(void* stmt, int64_t idx, const char* val);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int64_t blink_sqlite3_bind_text(void* stmt, int64_t idx, const char* val) {
     return (int64_t)sqlite3_bind_text((sqlite3_stmt*)stmt, (int)idx, val, -1, SQLITE_TRANSIENT);
 }
+#endif
 
-BLINK_UNUSED static int64_t blink_sqlite3_step(void* stmt) {
+BLINK_RT_FN int64_t blink_sqlite3_step(void* stmt);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int64_t blink_sqlite3_step(void* stmt) {
     return (int64_t)sqlite3_step((sqlite3_stmt*)stmt);
 }
+#endif
 
-BLINK_UNUSED static int64_t blink_sqlite3_column_int(void* stmt, int64_t col) {
+BLINK_RT_FN int64_t blink_sqlite3_column_int(void* stmt, int64_t col);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int64_t blink_sqlite3_column_int(void* stmt, int64_t col) {
     return (int64_t)sqlite3_column_int64((sqlite3_stmt*)stmt, (int)col);
 }
+#endif
 
-BLINK_UNUSED static const char* blink_sqlite3_column_text(void* stmt, int64_t col) {
+BLINK_RT_FN const char* blink_sqlite3_column_text(void* stmt, int64_t col);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN const char* blink_sqlite3_column_text(void* stmt, int64_t col) {
     const unsigned char* text = sqlite3_column_text((sqlite3_stmt*)stmt, (int)col);
     if (!text) return blink_strdup("");
     return blink_strdup((const char*)text);
 }
+#endif
 
-BLINK_UNUSED static int64_t blink_sqlite3_reset(void* stmt) {
+BLINK_RT_FN int64_t blink_sqlite3_reset(void* stmt);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int64_t blink_sqlite3_reset(void* stmt) {
     return (int64_t)sqlite3_reset((sqlite3_stmt*)stmt);
 }
+#endif
 
-BLINK_UNUSED static int64_t blink_sqlite3_finalize(void* stmt) {
+BLINK_RT_FN int64_t blink_sqlite3_finalize(void* stmt);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int64_t blink_sqlite3_finalize(void* stmt) {
     return (int64_t)sqlite3_finalize((sqlite3_stmt*)stmt);
 }
+#endif
 
-BLINK_UNUSED static int64_t blink_sqlite3_bind_double(void* stmt, int64_t idx, double val) {
+BLINK_RT_FN int64_t blink_sqlite3_bind_double(void* stmt, int64_t idx, double val);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int64_t blink_sqlite3_bind_double(void* stmt, int64_t idx, double val) {
     return (int64_t)sqlite3_bind_double((sqlite3_stmt*)stmt, (int)idx, val);
 }
+#endif
 
-BLINK_UNUSED static int64_t blink_sqlite3_column_count(void* stmt) {
+BLINK_RT_FN int64_t blink_sqlite3_column_count(void* stmt);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int64_t blink_sqlite3_column_count(void* stmt) {
     return (int64_t)sqlite3_column_count((sqlite3_stmt*)stmt);
 }
+#endif
 
-BLINK_UNUSED static const char* blink_sqlite3_column_name_str(void* stmt, int64_t idx) {
+BLINK_RT_FN const char* blink_sqlite3_column_name_str(void* stmt, int64_t idx);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN const char* blink_sqlite3_column_name_str(void* stmt, int64_t idx) {
     const char* name = sqlite3_column_name((sqlite3_stmt*)stmt, (int)idx);
     return name ? blink_strdup(name) : blink_strdup("");
 }
+#endif
 
-BLINK_UNUSED static int64_t blink_sqlite3_last_insert_rowid(void* db) {
+BLINK_RT_FN int64_t blink_sqlite3_last_insert_rowid(void* db);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int64_t blink_sqlite3_last_insert_rowid(void* db) {
     return (int64_t)sqlite3_last_insert_rowid((sqlite3*)db);
 }
+#endif
 
-BLINK_UNUSED static int64_t blink_sqlite3_close(void* db) {
+BLINK_RT_FN int64_t blink_sqlite3_close(void* db);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int64_t blink_sqlite3_close(void* db) {
     return (int64_t)sqlite3_close((sqlite3*)db);
 }
+#endif
 
-BLINK_UNUSED static const char* blink_sqlite3_errmsg(void* db) {
+BLINK_RT_FN const char* blink_sqlite3_errmsg(void* db);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN const char* blink_sqlite3_errmsg(void* db) {
     const char* msg = sqlite3_errmsg((sqlite3*)db);
     return msg ? blink_strdup(msg) : blink_strdup("");
 }
+#endif
 
-BLINK_UNUSED static int64_t blink_sqlite3_begin(void* db) {
+BLINK_RT_FN int64_t blink_sqlite3_begin(void* db);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int64_t blink_sqlite3_begin(void* db) {
     return (int64_t)sqlite3_exec((sqlite3*)db, "BEGIN", NULL, NULL, NULL);
 }
+#endif
 
-BLINK_UNUSED static int64_t blink_sqlite3_commit(void* db) {
+BLINK_RT_FN int64_t blink_sqlite3_commit(void* db);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int64_t blink_sqlite3_commit(void* db) {
     return (int64_t)sqlite3_exec((sqlite3*)db, "COMMIT", NULL, NULL, NULL);
 }
+#endif
 
-BLINK_UNUSED static int64_t blink_sqlite3_rollback(void* db) {
+BLINK_RT_FN int64_t blink_sqlite3_rollback(void* db);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int64_t blink_sqlite3_rollback(void* db) {
     return (int64_t)sqlite3_exec((sqlite3*)db, "ROLLBACK", NULL, NULL, NULL);
 }
+#endif
 
 int64_t blink_sqlite3_result_rc(blink_handle* r) {
     blink_sqlite3_result* res = (blink_sqlite3_result*)r;
     return res->rc;
 }
 
-BLINK_UNUSED static int64_t blink_sqlite3_exec_void(void* db, const char* sql) {
+BLINK_RT_FN int64_t blink_sqlite3_exec_void(void* db, const char* sql);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int64_t blink_sqlite3_exec_void(void* db, const char* sql) {
     char* err = NULL;
     int rc = sqlite3_exec((sqlite3*)db, sql, NULL, NULL, &err);
     if (err) sqlite3_free(err);
     return (int64_t)rc;
 }
+#endif
 
-BLINK_UNUSED static int64_t blink_sqlite3_execute(void* db, const char* sql) {
+BLINK_RT_FN int64_t blink_sqlite3_execute(void* db, const char* sql);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int64_t blink_sqlite3_execute(void* db, const char* sql) {
     int64_t rc = blink_sqlite3_exec_void(db, sql);
     if (rc != SQLITE_OK) return -1;
     return (int64_t)sqlite3_last_insert_rowid((sqlite3*)db);
 }
+#endif
 
-BLINK_UNUSED static int64_t blink_sqlite3_result_num_rows(void* r) {
+BLINK_RT_FN int64_t blink_sqlite3_result_num_rows(void* r);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int64_t blink_sqlite3_result_num_rows(void* r) {
     blink_sqlite3_result* res = (blink_sqlite3_result*)r;
     return res->num_rows;
 }
+#endif
 
-BLINK_UNUSED static int64_t blink_sqlite3_result_num_cols(void* r) {
+BLINK_RT_FN int64_t blink_sqlite3_result_num_cols(void* r);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int64_t blink_sqlite3_result_num_cols(void* r) {
     blink_sqlite3_result* res = (blink_sqlite3_result*)r;
     return res->num_cols;
 }
+#endif
 
-BLINK_UNUSED static const char* blink_sqlite3_result_column_name(void* r, int64_t idx) {
+BLINK_RT_FN const char* blink_sqlite3_result_column_name(void* r, int64_t idx);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN const char* blink_sqlite3_result_column_name(void* r, int64_t idx) {
     blink_sqlite3_result* res = (blink_sqlite3_result*)r;
     if (idx < 0 || idx >= res->num_cols) return "";
     return (const char*)blink_list_get(res->columns, idx);
 }
+#endif
 
-BLINK_UNUSED static const char* blink_sqlite3_result_cell(void* r, int64_t row, int64_t col) {
+BLINK_RT_FN const char* blink_sqlite3_result_cell(void* r, int64_t row, int64_t col);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN const char* blink_sqlite3_result_cell(void* r, int64_t row, int64_t col) {
     blink_sqlite3_result* res = (blink_sqlite3_result*)r;
     if (row < 0 || row >= res->num_rows) return "";
     blink_list* row_data = (blink_list*)blink_list_get(res->rows, row);
     if (col < 0 || col >= blink_list_len(row_data)) return "";
     return (const char*)blink_list_get(row_data, col);
 }
+#endif
 
-BLINK_UNUSED static void blink_sqlite3_result_free(void* r) {
+BLINK_RT_FN void blink_sqlite3_result_free(void* r);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_sqlite3_result_free(void* r) {
     (void)r; /* GC-managed — blink_alloc uses GC_MALLOC, no manual free needed */
 }
+#endif
 
 #endif /* BLINK_USE_SQLITE */
 

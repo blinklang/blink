@@ -58,16 +58,21 @@ static char* blink_read_fd_to_string(int fd) {
     return buf;
 }
 
-BLINK_UNUSED static void blink_process_exec(const char* cmd, const blink_list* args) {
+BLINK_RT_FN void blink_process_exec(const char* cmd, const blink_list* args);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_process_exec(const char* cmd, const blink_list* args) {
     char** argv = blink_process_build_argv(cmd, args);
     execvp(cmd, argv);
     perror("execvp");
     _exit(127);
 }
+#endif
 
 // Note: writes all stdin before reading stdout/stderr. May deadlock if
 // stdin + stdout together exceed pipe buffer (~64KB). Fine for small payloads.
-BLINK_UNUSED static blink_ProcessResult blink_process_run_with_stdin(const char* cmd, const blink_list* args, const char* stdin_data) {
+BLINK_RT_FN blink_ProcessResult blink_process_run_with_stdin(const char* cmd, const blink_list* args, const char* stdin_data);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN blink_ProcessResult blink_process_run_with_stdin(const char* cmd, const blink_list* args, const char* stdin_data) {
     blink_ProcessResult result = { "", "", -1 };
     int stdin_pipe[2] = {-1, -1}, stdout_pipe[2] = {-1, -1}, stderr_pipe[2] = {-1, -1};
     if (pipe(stdin_pipe) < 0 || pipe(stdout_pipe) < 0 || pipe(stderr_pipe) < 0) {
@@ -142,10 +147,14 @@ BLINK_UNUSED static blink_ProcessResult blink_process_run_with_stdin(const char*
     }
     return result;
 }
+#endif
 
-BLINK_UNUSED static blink_ProcessResult blink_process_run(const char* cmd, const blink_list* args) {
+BLINK_RT_FN blink_ProcessResult blink_process_run(const char* cmd, const blink_list* args);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN blink_ProcessResult blink_process_run(const char* cmd, const blink_list* args) {
     return blink_process_run_with_stdin(cmd, args, NULL);
 }
+#endif
 
 /* ── Non-blocking spawn + pid handles ─────────────────────────────────
  * Used by lib/std/process and cmd_test for signal propagation.
@@ -208,7 +217,9 @@ static blink_pid_slot* blink_pid_table_get(int64_t h) {
     return &blink_pid_table[h];
 }
 
-BLINK_UNUSED static int64_t blink_process_spawn(const char* cmd, const blink_list* args) {
+BLINK_RT_FN int64_t blink_process_spawn(const char* cmd, const blink_list* args);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int64_t blink_process_spawn(const char* cmd, const blink_list* args) {
     int64_t h = blink_pid_table_alloc();
     if (h < 0) return -1;
     blink_pid_slot* slot = &blink_pid_table[h];
@@ -253,8 +264,11 @@ BLINK_UNUSED static int64_t blink_process_spawn(const char* cmd, const blink_lis
     slot->err_fd = err_pipe[0];
     return h;
 }
+#endif
 
-BLINK_UNUSED static blink_ProcessResult blink_process_pid_wait(int64_t handle) {
+BLINK_RT_FN blink_ProcessResult blink_process_pid_wait(int64_t handle);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN blink_ProcessResult blink_process_pid_wait(int64_t handle) {
     blink_pid_slot* slot = blink_pid_table_get(handle);
     if (!slot) {
         blink_ProcessResult r = { "", blink_strdup("invalid pid handle"), -1 };
@@ -284,6 +298,7 @@ BLINK_UNUSED static blink_ProcessResult blink_process_pid_wait(int64_t handle) {
     slot->reaped = 1;
     return slot->cached;
 }
+#endif
 
 static int64_t blink_pid_dispatch_signal(int64_t handle, int sig) {
     blink_pid_slot* slot = blink_pid_table_get(handle);
@@ -294,13 +309,19 @@ static int64_t blink_pid_dispatch_signal(int64_t handle, int sig) {
 
 // kill() with sig=0 is the POSIX existence check; we override that to SIGKILL
 // so callers don't need a separate "force-kill" entry point.
-BLINK_UNUSED static int64_t blink_process_pid_kill(int64_t handle, int64_t sig) {
+BLINK_RT_FN int64_t blink_process_pid_kill(int64_t handle, int64_t sig);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int64_t blink_process_pid_kill(int64_t handle, int64_t sig) {
     return blink_pid_dispatch_signal(handle, sig == 0 ? SIGKILL : (int)sig);
 }
+#endif
 
-BLINK_UNUSED static int64_t blink_process_pid_send_signal(int64_t handle, int64_t sig) {
+BLINK_RT_FN int64_t blink_process_pid_send_signal(int64_t handle, int64_t sig);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int64_t blink_process_pid_send_signal(int64_t handle, int64_t sig) {
     return blink_pid_dispatch_signal(handle, (int)sig);
 }
+#endif
 
 /* ── Signal forwarding to live spawned children ───────────────────────
  * Installs a SIGINT/SIGTERM handler that walks the pid handle table
@@ -338,7 +359,9 @@ static void blink_process_forward_signal(int sig) {
     raise(sig);
 }
 
-BLINK_UNUSED static void blink_process_install_signal_forwarding(void) {
+BLINK_RT_FN void blink_process_install_signal_forwarding(void);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_process_install_signal_forwarding(void) {
     if (blink_process_signal_installed) return;
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
@@ -348,6 +371,7 @@ BLINK_UNUSED static void blink_process_install_signal_forwarding(void) {
     sigaction(SIGTERM, &sa, NULL);
     blink_process_signal_installed = 1;
 }
+#endif
 
 /*
  * Undefine POSIX signal macros after the runtime body is parsed so

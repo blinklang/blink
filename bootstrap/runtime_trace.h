@@ -35,7 +35,9 @@ typedef struct {
 static blink_trace_state __blink_trace = {0};
 #endif
 
-BLINK_UNUSED static int64_t blink_trace_ts_us(void) {
+BLINK_RT_FN int64_t blink_trace_ts_us(void);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int64_t blink_trace_ts_us(void) {
     struct timespec now;
 #ifdef __APPLE__
     clock_gettime(CLOCK_MONOTONIC, &now);
@@ -46,8 +48,11 @@ BLINK_UNUSED static int64_t blink_trace_ts_us(void) {
     int64_t nsec_diff = (int64_t)(now.tv_nsec - __blink_trace.start.tv_nsec);
     return sec_diff * 1000000 + nsec_diff / 1000;
 }
+#endif
 
-BLINK_UNUSED static void blink_trace_parse_filters(const char* filter_str) {
+BLINK_RT_FN void blink_trace_parse_filters(const char* filter_str);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_trace_parse_filters(const char* filter_str) {
     if (!filter_str || !*filter_str) return;
     __blink_trace.event_enter = 1;
     __blink_trace.event_exit = 1;
@@ -91,8 +96,11 @@ BLINK_UNUSED static void blink_trace_parse_filters(const char* filter_str) {
         __blink_trace.filter_count++;
     }
 }
+#endif
 
-BLINK_UNUSED static void blink_trace_init(int argc, char** argv) {
+BLINK_RT_FN void blink_trace_init(int argc, char** argv);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_trace_init(int argc, char** argv) {
     __blink_trace.active = 0;
     __blink_trace.depth = 0;
     __blink_trace.filter_count = 0;
@@ -137,8 +145,11 @@ BLINK_UNUSED static void blink_trace_init(int argc, char** argv) {
     (void)argc; (void)argv;
 #endif
 }
+#endif
 
-BLINK_UNUSED static int blink_trace_match(const char* fn, const char* module, int depth) {
+BLINK_RT_FN int blink_trace_match(const char* fn, const char* module, int depth);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int blink_trace_match(const char* fn, const char* module, int depth) {
     if (!__blink_trace.active) return 0;
     if (__blink_trace.filter_count == 0) return 1;
     for (int i = 0; i < __blink_trace.filter_count; i++) {
@@ -170,8 +181,11 @@ BLINK_UNUSED static int blink_trace_match(const char* fn, const char* module, in
     }
     return 1;
 }
+#endif
 
-BLINK_UNUSED static int blink_trace_match_effect(const char* fn, const char* module, int depth, const char* effect) {
+BLINK_RT_FN int blink_trace_match_effect(const char* fn, const char* module, int depth, const char* effect);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int blink_trace_match_effect(const char* fn, const char* module, int depth, const char* effect) {
     if (!blink_trace_match(fn, module, depth)) return 0;
     for (int i = 0; i < __blink_trace.filter_count; i++) {
         blink_trace_filter* f = &__blink_trace.filters[i];
@@ -185,8 +199,11 @@ BLINK_UNUSED static int blink_trace_match_effect(const char* fn, const char* mod
     }
     return 1;
 }
+#endif
 
-BLINK_UNUSED static int blink_trace_match_state(const char* fn, const char* module, int depth, const char* var) {
+BLINK_RT_FN int blink_trace_match_state(const char* fn, const char* module, int depth, const char* var);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int blink_trace_match_state(const char* fn, const char* module, int depth, const char* var) {
     if (!blink_trace_match(fn, module, depth)) return 0;
     for (int i = 0; i < __blink_trace.filter_count; i++) {
         blink_trace_filter* f = &__blink_trace.filters[i];
@@ -200,8 +217,11 @@ BLINK_UNUSED static int blink_trace_match_state(const char* fn, const char* modu
     }
     return 1;
 }
+#endif
 
-BLINK_UNUSED static void blink_trace_write_escaped(FILE* out, const char* s, int max_len) {
+BLINK_RT_FN void blink_trace_write_escaped(FILE* out, const char* s, int max_len);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_trace_write_escaped(FILE* out, const char* s, int max_len) {
     int written = 0;
     while (*s && written < max_len) {
         switch (*s) {
@@ -218,14 +238,21 @@ BLINK_UNUSED static void blink_trace_write_escaped(FILE* out, const char* s, int
         /* signal truncation — caller adds truncated field */
     }
 }
+#endif
 
-BLINK_UNUSED static int blink_trace_str_truncated(const char* s) {
+BLINK_RT_FN int blink_trace_str_truncated(const char* s);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int blink_trace_str_truncated(const char* s) {
     int len = 0;
     while (s[len]) { len++; if (len > BLINK_TRACE_MAX_VALUE_LEN) return 1; }
     return 0;
 }
+#endif
 
-BLINK_UNUSED static void blink_trace_enter(const char* fn, const char* module, int depth,
+BLINK_RT_FN void blink_trace_enter(const char* fn, const char* module, int depth,
+    const char* file, int line, int col, const char* args_json);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_trace_enter(const char* fn, const char* module, int depth,
     const char* file, int line, int col, const char* args_json) {
     if (!__blink_trace.event_enter) return;
     if (__blink_trace.event_limit > 0 && __blink_trace.event_count >= __blink_trace.event_limit) return;
@@ -240,8 +267,12 @@ BLINK_UNUSED static void blink_trace_enter(const char* fn, const char* module, i
     fprintf(stderr, "}\n");
     fflush(stderr);
 }
+#endif
 
-BLINK_UNUSED static void blink_trace_exit(const char* fn, const char* module, int depth,
+BLINK_RT_FN void blink_trace_exit(const char* fn, const char* module, int depth,
+    int64_t enter_ts, const char* ret_str);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_trace_exit(const char* fn, const char* module, int depth,
     int64_t enter_ts, const char* ret_str) {
     if (!__blink_trace.event_exit) return;
     if (__blink_trace.event_limit > 0 && __blink_trace.event_count >= __blink_trace.event_limit) return;
@@ -263,8 +294,12 @@ BLINK_UNUSED static void blink_trace_exit(const char* fn, const char* module, in
     fputs("}\n", stderr);
     fflush(stderr);
 }
+#endif
 
-BLINK_UNUSED static void blink_trace_state_event(const char* fn, const char* module, int depth,
+BLINK_RT_FN void blink_trace_state_event(const char* fn, const char* module, int depth,
+    const char* var, const char* op, const char* value);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_trace_state_event(const char* fn, const char* module, int depth,
     const char* var, const char* op, const char* value) {
     if (!__blink_trace.event_state) return;
     if (__blink_trace.event_limit > 0 && __blink_trace.event_count >= __blink_trace.event_limit) return;
@@ -283,8 +318,12 @@ BLINK_UNUSED static void blink_trace_state_event(const char* fn, const char* mod
     fputs("}\n", stderr);
     fflush(stderr);
 }
+#endif
 
-BLINK_UNUSED static void blink_trace_effect(const char* fn, const char* module, int depth,
+BLINK_RT_FN void blink_trace_effect(const char* fn, const char* module, int depth,
+    const char* effect, const char* op, const char* args_json);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_trace_effect(const char* fn, const char* module, int depth,
     const char* effect, const char* op, const char* args_json) {
     if (!__blink_trace.event_effect) return;
     if (__blink_trace.event_limit > 0 && __blink_trace.event_count >= __blink_trace.event_limit) return;
@@ -299,8 +338,12 @@ BLINK_UNUSED static void blink_trace_effect(const char* fn, const char* module, 
     fputs("}\n", stderr);
     fflush(stderr);
 }
+#endif
 
-BLINK_UNUSED static void blink_trace_arena_event(const char* fn, const char* module, int depth,
+BLINK_RT_FN void blink_trace_arena_event(const char* fn, const char* module, int depth,
+    const char* op, int64_t slot, const char* desc, int line, int col);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_trace_arena_event(const char* fn, const char* module, int depth,
     const char* op, int64_t slot, const char* desc, int line, int col) {
     if (!__blink_trace.active) return;
     if (__blink_trace.event_limit > 0 && __blink_trace.event_count >= __blink_trace.event_limit) return;
@@ -311,13 +354,18 @@ BLINK_UNUSED static void blink_trace_arena_event(const char* fn, const char* mod
         (long long)ts, fn, module, depth, op, (long long)slot, desc ? desc : "", line, col);
     fflush(stderr);
 }
+#endif
 
 // Emitted by codegen at the closing `}` of a `with arena { expr }` block.
 // `phase` is "begin" (pre-promotion, inner arena still live) or "end"
 // (post-promotion, inner arena destroyed). `target` is the human-readable
 // promotion target — either "outer arena" or "GC heap". `desc` is the
 // promoted tail's type descriptor (e.g. "P:Int", "S:MyStruct", "C:<hash>").
-BLINK_UNUSED static void blink_trace_arena_promote(const char* fn, const char* module, int depth,
+BLINK_RT_FN void blink_trace_arena_promote(const char* fn, const char* module, int depth,
+    const char* phase, const char* target, const char* desc,
+    const char* file, int line, int col);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_trace_arena_promote(const char* fn, const char* module, int depth,
     const char* phase, const char* target, const char* desc,
     const char* file, int line, int col) {
     if (!__blink_trace.active) return;
@@ -331,5 +379,6 @@ BLINK_UNUSED static void blink_trace_arena_promote(const char* fn, const char* m
         desc ? desc : "", file ? file : "", line, col);
     fflush(stderr);
 }
+#endif
 
 #endif /* BLINK_RUNTIME_TRACE_H */
