@@ -1,6 +1,6 @@
 import parser.{
     node_effects, node_elements, node_fields, node_module, node_name, node_params, node_return_type,
-    node_trait_name, node_type_ann, node_type_name, node_type_params,
+    node_source_module, node_trait_name, node_type_ann, node_type_name, node_type_params,
     sublist_get, sublist_length
 }
 import diagnostics.{
@@ -335,6 +335,19 @@ pub let mut cg_ffi_lib_set: Map[Str, Int] = Map()
 
 pub let mut mod_fn_prefix: Map[Str, Str] = Map()
 pub let mut mod_type_prefix: Map[Str, Str] = Map()
+// Built-in types defined by the runtime (e.g. ConversionError, ProcessResult)
+// keep their bare `blink_<name>` mangling regardless of whether a Blink-source
+// declaration of the same name lives in some module's source_module bucket.
+pub let mut builtin_type_set: Map[Str, Int] = Map()
+
+// Mangling key for a top-level decl. Defaults to the file-derived
+// source_module so per-file .o builds get distinct C symbols, but treats
+// `@module("")` as a no-prefix override that binds the decl to a bare
+// `blink_<name>` runtime symbol (used by lib/std/time.bl for Instant/Duration,
+// etc.). Returns "" to mean "do not register a module prefix".
+pub fn mangling_module(node: Int) -> Str {
+    if node_module(node) == "" { "" } else { node_source_module(node) }
+}
 
 pub let mut type_alias_base: Map[Str, Str] = Map()
 pub let mut type_where_preds: Map[Str, Int] = Map()
@@ -763,6 +776,11 @@ pub fn c_fn_name(name: Str) -> Str {
 
 fn c_fn_name_in(name: Str, caller_module: Str) -> Str {
     let resolved = resolve_import_alias(name)
+    // FFI declarations bind directly to a runtime-provided C symbol; never
+    // mangle them with a module prefix.
+    if is_fn_ffi(resolved) != 0 {
+        return "blink_{resolved}"
+    }
     if caller_module != "" {
         let qualified = "{caller_module}:{resolved}"
         match mod_fn_prefix.get(qualified) {
@@ -791,6 +809,11 @@ fn c_fn_name_in(name: Str, caller_module: Str) -> Str {
 pub fn c_type_c_name(name: Str) -> Str {
     let bare = strip_module_qualifier(name)
     let resolved = resolve_import_alias(bare)
+    // Built-in types live as runtime typedefs with no module prefix even if a
+    // Blink-source declaration of the same name appears in a stdlib module.
+    if builtin_type_set.contains_key(resolved) {
+        return "blink_{resolved}"
+    }
     match mod_type_prefix.get(resolved) {
         Some(prefix) => {
             if prefix != "" {
