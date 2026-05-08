@@ -1898,17 +1898,18 @@ fn cmd_emit_per_module(args_list: List[Str]) ! Lex.Tokenize, Parse, Parse.Build,
     cg_archive_object_mode = 0
 
     let modules = enumerate_program_modules(final_program)
-    let owner = "__main__"
 
-    // First pass: emit each module's header. We need all headers on disk
-    // before generating the .c files, because each .c includes the
-    // aggregator that pulls every module header in.
+    // First pass: emit each module's header AND build the aggregator
+    // (every module .c #includes this so cross-module fn calls and
+    // typedefs resolve). Each module .h is #ifndef-guarded so multi-include
+    // is safe. The aggregator's own guard prevents recursion when one
+    // module .h transitively includes another (none do today, but
+    // forward-compat). All headers must be on disk before pass 2.
+    let mut agg = StringBuilder.new()
+    agg.write("#ifndef BLINK_PROGRAM_ALL_H\n#define BLINK_PROGRAM_ALL_H\n")
     let mut mi = 0
     while mi < modules.len() {
         let m = modules.get(mi).unwrap()
-        let header_name = "{m}.h"
-        let header_path = "{out_dir}/{header_name}"
-
         let header = generate_module_header(final_program, m)
         if diag_ice_count > 0 {
             diag_flush()
@@ -1918,33 +1919,20 @@ fn cmd_emit_per_module(args_list: List[Str]) ! Lex.Tokenize, Parse, Parse.Build,
             diag_flush()
             exit(1)
         }
-        write_file(header_path, header)
+        write_file("{out_dir}/{m}.h", header)
+        agg.write("#include \"{m}.h\"\n")
         mi = mi + 1
     }
-
-    // Aggregator header: every module .c #includes this so cross-module
-    // fn calls and typedefs resolve. Each module .h is #ifndef-guarded so
-    // multi-include is safe. The aggregator's own guard prevents recursion
-    // when one module .h transitively includes another (none do today,
-    // but guard for forward-compat).
-    let mut agg = "#ifndef BLINK_PROGRAM_ALL_H\n#define BLINK_PROGRAM_ALL_H\n"
-    let mut ai = 0
-    while ai < modules.len() {
-        let am = modules.get(ai).unwrap()
-        agg = agg.concat("#include \"{am}.h\"\n")
-        ai = ai + 1
-    }
-    agg = agg.concat("#endif\n")
-    write_file("{out_dir}/_blink_all.h", agg)
+    agg.write("#endif\n")
+    write_file("{out_dir}/_blink_all.h", agg.to_str())
 
     // Second pass: emit each module's .c. Pass the aggregator header as
     // the self-include so every TU sees every other module's pub surface.
+    // The "__main__" entry module owns __blink_ev; everyone else externs it.
     let mut ci = 0
     while ci < modules.len() {
         let m = modules.get(ci).unwrap()
-        let obj_c_path = "{out_dir}/{m}.c"
-
-        if m != owner {
+        if m != "__main__" {
             cg_blink_ev_extern_only = 1
         } else {
             cg_blink_ev_extern_only = 0
@@ -1959,7 +1947,7 @@ fn cmd_emit_per_module(args_list: List[Str]) ! Lex.Tokenize, Parse, Parse.Build,
             diag_flush()
             exit(1)
         }
-        write_file(obj_c_path, obj_c)
+        write_file("{out_dir}/{m}.c", obj_c)
         ci = ci + 1
     }
 
