@@ -287,7 +287,9 @@ Desugars to:
 }
 ```
 
-The compiler inserts `name.close()` on **all** exit paths: normal completion, `?` early return, and any other control flow that leaves the block.
+The compiler inserts `name.close()` on **every catchable unwind**: normal completion, `?` propagation, `return`, assertion failure, and `skip()` in test blocks. The catchable-unwind set is closed and runtime-defined — see §4.6.3 for the exhaustive enumeration and the soundness fence around future user-level panic recovery. Uncaught panics (process-terminating divergence) bypass `close()` entirely.
+
+This rule is uniform with `BlockHandler.exit()` (§4.6.3): both run on every structured catchable exit, and both bypass on uncaught divergence. A `with conn = db.connect() { assert(...) }` block releases `conn` on assertion failure inside a test block, because the test runner's per-test frame is a runtime catch boundary.
 
 #### Multiple resources
 

@@ -1195,7 +1195,7 @@ test "assertions demo" {
 
 **Note:** `assert_matches` is a compiler intrinsic whose second argument is a **pattern** (same syntax as `match` arms), not an expression. It cannot be passed as a higher-order function.
 
-Assertion failure panics — unwinding to the test runner, which marks the test as failed and continues running other tests. This is the one context where Blink uses panic semantics, since tests are controlled environments where unwinding is safe.
+Assertion failure panics — unwinding to the test runner, which marks the test as failed and continues running other tests. This is the one context where Blink uses panic semantics, since tests are controlled environments where unwinding is safe. The test runner's per-test frame is a **runtime catch boundary** in the sense of §4.6.3, so `BlockHandler.exit(false)` and `Closeable.close()` run during the unwind — `with db.transaction() { assert_eq(...) }` rolls back the transaction on assertion failure.
 
 **Panel vote: 4-1** for three built-ins (original §2.20 vote). PLT dissented (assert_ne is `assert(a != b)` — Principle 2 violation). See [DECISIONS.md](../DECISIONS.md). Testing framework deliberation added `assert_matches` (4-1, AI/ML dissented) and optional messages (3-2). See [DECISIONS.md](../DECISIONS.md).
 
@@ -1375,7 +1375,7 @@ test "platform specific" {
 }
 ```
 
-`skip(reason: Str) -> Never` is a built-in available in test blocks. It unwinds to the test runner (same machinery as assertion failure panics) and marks the test as `"skipped"` with the given reason. Use `skip()` for decisions that depend on runtime state: platform detection, environment variables, feature flags.
+`skip(reason: Str) -> Never` is a built-in available in test blocks. It unwinds to the test runner (same machinery as assertion failure panics) and marks the test as `"skipped"` with the given reason. Use `skip()` for decisions that depend on runtime state: platform detection, environment variables, feature flags. Like assertion failure, `skip()` is a catchable unwind in the sense of §4.6.3 — `Closeable.close()` and `BlockHandler.exit(false)` run for any in-scope resources before the test runner records the skip. A test that allocates a temp directory and then `skip()`s on platform mismatch will release the temp directory.
 
 **When to use which:**
 

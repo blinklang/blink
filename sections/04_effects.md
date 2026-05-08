@@ -1153,7 +1153,24 @@ trait BlockHandler {
 }
 ```
 
-**`enter()`** is called before the block body executes. Its return value is bound via `as` (or discarded if `as` is absent). **`exit(ok)`** is called after the block body completes — `ok` is `true` for normal completion, `false` if the block exited via `?` propagation or `return`.
+**`enter()`** is called before the block body executes. Its return value is bound via `as` (or discarded if `as` is absent). **`exit(ok)`** is called after the block body completes — `ok` is `true` for normal completion, `false` for any **catchable unwind** (see below).
+
+#### Catchable unwind
+
+`exit(self, false)` runs on every exit path that terminates at a runtime-defined catch boundary. The set is closed and exhaustively defined:
+
+| Path | `ok` value |
+|------|-----------|
+| Normal block completion | `true` |
+| `?` propagation | `false` |
+| `return` from enclosing function | `false` |
+| Assertion failure (`assert`, `assert_eq`, `assert_ne`, `assert_matches`) | `false` |
+| `skip()` in a test block | `false` |
+| Uncaught panic (`panic()`, arithmetic overflow, OOB index, OOM, abort) outside a runtime catch frame | *bypasses `exit()` entirely* |
+
+Today the only runtime catch frames are the test runner's per-test boundary and the `?`/`return` desugar. The set of runtime catch boundaries is **exhaustively defined by this spec and cannot be extended by user code**. Introducing user-level panic recovery (e.g., `recover`, `catch_panic`) would require a separate spec amendment that re-evaluates `exit()`/`close()` semantics under the new boundary set.
+
+This rule is uniform across `BlockHandler.exit()` and `Closeable.close()` (§5.5) — every catchable structured unwind runs registered cleanup; uncaught divergence does not.
 
 #### Block semantics
 
@@ -1217,10 +1234,13 @@ with Timer { label: "db_query", start: time.now() } {
 
 `exit()` is a finalizer, not a control flow mechanism. It **cannot**:
 
-- **Suppress panics** — panics bypass `exit()` entirely (same as `Closeable.close()`)
+- **Inspect or suppress the unwind value** — `exit(self, ok: Bool)` receives only the success bit; it cannot read the panic message, the propagated error, or the `skip()` reason
 - **Retry the block** — no mechanism to re-enter the block body
 - **Transform the block's result** — `exit()` returns `()`, not a modified value
-- **Replace errors** — if `exit()` itself panics, the original error is lost (same as a panic in `Closeable.close()`)
+- **Replace errors** — if `exit()` itself panics on a catchable-unwind path, the original failure is preserved as the test runner's reported result; the cleanup panic is recorded as a secondary diagnostic (see `E0824`)
+- **Catch uncaught panics** — process-terminating panics bypass `exit()` entirely
+
+Because `exit(false)` cannot observe *which* path triggered the unwind, handler authors must design `exit` to be safe under every catchable-unwind path. A handler that should commit on success and roll back on any failure pattern-matches on `ok`; a handler that always releases (timer, lock) ignores `ok`.
 
 #### Interaction with async
 

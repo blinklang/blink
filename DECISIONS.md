@@ -314,6 +314,9 @@ Decided by expert panel vote. See [OPEN_QUESTIONS.md](OPEN_QUESTIONS.md) for ful
 | Nested closure captures in `with arena { }` tail | A: typed capture slots (closure ABI extension) — promotion recurses on closure-typed captures | 3-2 (Web/PLT/AI for A; Sys/DevOps for C) |
 | std.testing user API expansion | Library helpers only: `assert_close` + `assert_close_rel` (Float, required tolerance, NaN/Inf reject, body delegates to `assert(...)` for power-assert), `for_each[T](cases: List[(Str, T)], body)` for table-driven tests. No stdlib snapshot testing. `defer` builtin for fixtures filed separately. `assert_panics` deferred to spec on recoverable-panic semantics | 5-0 R2 (Q4 floats; AI/ML R1 dissent), 5-0 (Q2 for_each), 5-0 (Q3 reject snapshots), 4-1 (Q1 defer; PLT dissent), 5-0 (defer assert_panics) |
 | Package entry-point convention | `import <pkg>` resolves to `<pkg-root>/src/<pkg>.bl` where `<pkg>` is `[package].name`. `src/lib.bl` not recognized — no fallback. Project root = nearest ancestor `blink.toml` walked up from source file; `tests/`/`examples/`/`bench/` are peers of `src/`. Package name grammar `[a-z][a-z0-9_]*`. `@module` on entry file is redundant-and-checked. Migration ship-gate: 3-step bootstrap rename of `libs/redis/src/lib.bl` → `redis.bl` and delete compiler.bl:407-416 | 5-0 Q1 (filename = pkg name), 5-0 Q3 (walk-up settled in Phase A), 4-1 Q2 sub (Sys A2; Web/PLT/DevOps/AI A1 — soft consensus 5-0 on substance, dissent on migration mechanics absorbed by ship-gate) |
+| Defer keyword (rejection) | Reject a dedicated `defer` keyword. `with` blocks already handle scoped cleanup via `Closeable` and `BlockHandler`. Stdlib helper `testing.cleanup(fn)` covers ad-hoc test teardown for non-`Closeable` actions. Rejected as redundant syntax | 6-0 (REJECT_WITH_AMENDMENT — see BlockHandler catchable-unwind) |
+| BlockHandler catchable-unwind | `BlockHandler.exit(self, ok: Bool)` and `Closeable.close(self)` run on every **catchable unwind**: normal completion, `?` propagation, `return`, assertion failure, and `skip()`. The catch-boundary set is closed and runtime-defined; user-level panic recovery requires a separate spec amendment that re-evaluates these semantics. Uncaught/process-terminating panics still bypass `exit()`/`close()`. `panic: Never` axiom preserved (the `exit(false)` body cannot inspect/transform/suppress the panic — analogous to Rust `Drop` on unwind) | 6-0 Q1, 6-0 Q2 separability, 6-0 Q3 closed-set fence, 5-1 Q4 (`testing.cleanup` over both-forms; devops dissent), 6-0 Q5 (skip triggers cleanup) |
+| `testing.cleanup` helper | Stdlib `testing.cleanup(fn() -> Void) -> Cleanup` BlockHandler that runs the closure on every catchable unwind out of `with cleanup(fn) { ... }`. For non-`Closeable` test teardown (temp paths, env-var resets, mock restores). Single HOF; `testing.scope() as s` registrar form deferred as follow-up | 5-1 (devops: wanted both-forms registrar shipped together) |
 
 ---
 
@@ -405,6 +408,8 @@ Full deliberation records for each decision. Each file contains expert votes, re
 | Char Literal Escapes | [decisions/char-literal-escapes.md](decisions/char-literal-escapes.md) |
 | std.testing User API | [decisions/std-testing-user-api.md](decisions/std-testing-user-api.md) |
 | Package Entry-Point Convention | [decisions/package-entry-point-convention.md](decisions/package-entry-point-convention.md) |
+| Defer Keyword Rejection | [decisions/defer-keyword-rejection.md](decisions/defer-keyword-rejection.md) |
+| BlockHandler Catchable-Unwind | [decisions/blockhandler-catchable-unwind.md](decisions/blockhandler-catchable-unwind.md) |
 
 ---
 
