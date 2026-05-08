@@ -37,8 +37,8 @@ import compiler.{
     collect_imports, collect_root_imports, inject_prelude, merge_programs,
     set_strict_struct_layout,
 }
-import codegen.{Codegen, generate, generate_archive_header, cg_debug_mode, cg_runtime_header, cg_trace_codegen}
-import codegen_types.{cg_emit_only_module, cg_skip_modules, cg_archive_object_mode}
+import codegen.{Codegen, generate, generate_archive_header, generate_module_header, generate_module_object, enumerate_program_modules, cg_debug_mode, cg_runtime_header, cg_trace_codegen}
+import codegen_types.{cg_emit_only_module, cg_skip_modules, cg_archive_object_mode, cg_blink_ev_extern_only}
 import build_stdlib.{build_stdlib_archive, list_stdlib_module_keys}
 import codegen_stmt.{ann_str_val, positional_str_arg, positional_str_arg_count}
 import ast_dump.{ast_to_json}
@@ -1862,6 +1862,110 @@ fn cmd_emit_archive_header(args_list: List[Str]) ! Lex.Tokenize, Parse, Parse.Bu
     diag_flush()
 }
 
+// Hidden subcommand `__emit-per-module <entry.bl> <out_dir>`: emit a .h
+// and .c per source module discovered in the merged program. The entry
+// file's source module ("__main__") owns __blink_ev; every other module
+// emits with cg_blink_ev_extern_only=1 so the linker resolves the single
+// definition. Each .c #includes its own .h. Headers are #ifndef-guarded
+// so cross-module #includes (added by callers driving cc) compose safely.
+fn cmd_emit_per_module(args_list: List[Str]) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Codegen {
+    if args_list.len() < 2 {
+        io.println("error: __emit-per-module requires <entry.bl> <out_dir>")
+        exit(1)
+    }
+    let source_path = args_list.get(0).unwrap()
+    let out_dir = args_list.get(1).unwrap()
+    shell_exec("mkdir -p {out_dir}")
+
+    let final_program = compile_to_program(source_path, 1)
+    let _tc_err_count = check_types(final_program)
+    check_unused_imports()
+    if diag_ice_count > 0 {
+        diag_flush()
+        exit(101)
+    }
+    if diag_count > 0 {
+        diag_flush()
+        exit(1)
+    }
+
+    analyze_mutations(final_program)
+    analyze_save_restore(final_program)
+
+    cg_runtime_header = resolve_runtime_header()
+    cg_emit_only_module = ""
+    cg_skip_modules = Map()
+    cg_archive_object_mode = 0
+
+    let modules = enumerate_program_modules(final_program)
+    let owner = "__main__"
+
+    // First pass: emit each module's header. We need all headers on disk
+    // before generating the .c files, because each .c includes the
+    // aggregator that pulls every module header in.
+    let mut mi = 0
+    while mi < modules.len() {
+        let m = modules.get(mi).unwrap()
+        let header_name = "{m}.h"
+        let header_path = "{out_dir}/{header_name}"
+
+        let header = generate_module_header(final_program, m)
+        if diag_ice_count > 0 {
+            diag_flush()
+            exit(101)
+        }
+        if diag_count > 0 {
+            diag_flush()
+            exit(1)
+        }
+        write_file(header_path, header)
+        mi = mi + 1
+    }
+
+    // Aggregator header: every module .c #includes this so cross-module
+    // fn calls and typedefs resolve. Each module .h is #ifndef-guarded so
+    // multi-include is safe. The aggregator's own guard prevents recursion
+    // when one module .h transitively includes another (none do today,
+    // but guard for forward-compat).
+    let mut agg = "#ifndef BLINK_PROGRAM_ALL_H\n#define BLINK_PROGRAM_ALL_H\n"
+    let mut ai = 0
+    while ai < modules.len() {
+        let am = modules.get(ai).unwrap()
+        agg = agg.concat("#include \"{am}.h\"\n")
+        ai = ai + 1
+    }
+    agg = agg.concat("#endif\n")
+    write_file("{out_dir}/_blink_all.h", agg)
+
+    // Second pass: emit each module's .c. Pass the aggregator header as
+    // the self-include so every TU sees every other module's pub surface.
+    let mut ci = 0
+    while ci < modules.len() {
+        let m = modules.get(ci).unwrap()
+        let obj_c_path = "{out_dir}/{m}.c"
+
+        if m != owner {
+            cg_blink_ev_extern_only = 1
+        } else {
+            cg_blink_ev_extern_only = 0
+        }
+        let obj_c = generate_module_object(final_program, m, "_blink_all.h")
+        cg_blink_ev_extern_only = 0
+        if diag_ice_count > 0 {
+            diag_flush()
+            exit(101)
+        }
+        if diag_count > 0 {
+            diag_flush()
+            exit(1)
+        }
+        write_file(obj_c_path, obj_c)
+        ci = ci + 1
+    }
+
+    diag_flush()
+}
+
 fn cmd_audit(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report {
     let source_path = args_positional(a, 0)
     let baseline_path = args_get(a, "baseline")
@@ -2817,6 +2921,17 @@ fn main() {
             hi = hi + 1
         }
         cmd_emit_archive_header(hidden_args)
+        return
+    }
+
+    if arg_count() >= 2 && get_arg(1) == "__emit-per-module" {
+        let mut hidden_args: List[Str] = []
+        let mut hi = 2
+        while hi < arg_count() {
+            hidden_args.push(get_arg(hi))
+            hi = hi + 1
+        }
+        cmd_emit_per_module(hidden_args)
         return
     }
 
