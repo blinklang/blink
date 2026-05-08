@@ -41,7 +41,7 @@ import codegen_types.{
     emitted_chain_iters, emitted_filter_iters, emitted_flat_map_iters,
     emitted_fn_names, emitted_fn_set, emitted_iter_set, emitted_iter_types,
     fn_node_has_effects,
-    fn_reg_set, cg_archive_header_mode, cg_archive_build_mode, cg_archive_object_mode, cg_emit_only_module, cg_skip_modules,
+    fn_reg_set, cg_archive_header_mode, cg_archive_build_mode, cg_archive_object_mode, cg_emit_only_module, cg_module_header_guard, cg_module_object_self_header, cg_skip_modules,
     emitted_let_names, emitted_let_set, emitted_map_iters,
     emitted_option_set, emitted_option_types, emitted_range_iter,
     emitted_result_set, emitted_result_types, emitted_skip_iters,
@@ -279,12 +279,13 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
     debug_assert(scope_frame_starts.len() == 0, "scope_frame_starts not reset")
 
     // Emission-mode tripwire. Archive modes (cg_archive_*_mode) are
-    // mutually exclusive, and cg_emit_only_module/cg_skip_modules are
-    // archive-only — they must be clean in non-archive (bootstrap) calls.
+    // mutually exclusive. cg_emit_only_module composes with archive header
+    // mode (per-module .h via generate_module_header) and may also be set
+    // standalone for per-module .c emission via generate_module_object —
+    // but cg_skip_modules is archive-only.
     let mut __arch_modes = cg_archive_header_mode + cg_archive_build_mode + cg_archive_object_mode
     debug_assert(__arch_modes <= 1, "multiple cg_archive_*_mode set simultaneously")
-    if __arch_modes == 0 {
-        debug_assert(cg_emit_only_module == "", "cg_emit_only_module leaked into non-archive generate()")
+    if __arch_modes == 0 && cg_emit_only_module == "" {
         debug_assert(cg_skip_modules.len() == 0, "cg_skip_modules leaked into non-archive generate()")
     }
 
@@ -714,8 +715,9 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
     }
 
     if cg_archive_header_mode != 0 {
-        cg_lines.push("#ifndef BLINK_LIBBLINK_STD_H")
-        cg_lines.push("#define BLINK_LIBBLINK_STD_H")
+        let guard = if cg_module_header_guard != "" { cg_module_header_guard } else { "BLINK_LIBBLINK_STD_H" }
+        cg_lines.push("#ifndef {guard}")
+        cg_lines.push("#define {guard}")
     }
     if cg_archive_header_mode != 0 || cg_archive_object_mode != 0 || cg_archive_build_mode != 0 {
         cg_lines.push("#define BLINK_USE_EXTERN_RUNTIME_STORAGE 1")
@@ -729,6 +731,9 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
         cg_lines.push(cg_runtime_header)
     } else {
         cg_lines.push("#include \"runtime.h\"")
+    }
+    if cg_module_object_self_header != "" {
+        cg_lines.push("#include \"{cg_module_object_self_header}\"")
     }
     cg_lines.push("")
 
@@ -1240,7 +1245,7 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
                 i = i + 1
                 continue
             }
-            if cg_archive_header_mode != 0 && !is_stdlib_source_module(fn_src_mod) {
+            if cg_archive_header_mode != 0 && cg_emit_only_module == "" && !is_stdlib_source_module(fn_src_mod) {
                 i = i + 1
                 continue
             }
@@ -1275,7 +1280,7 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
                 i = i + 1
                 continue
             }
-            if cg_archive_header_mode != 0 && !is_stdlib_source_module(im_src_mod) {
+            if cg_archive_header_mode != 0 && cg_emit_only_module == "" && !is_stdlib_source_module(im_src_mod) {
                 i = i + 1
                 continue
             }
@@ -1347,10 +1352,13 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
 
     if cg_archive_header_mode != 0 {
         // The earlier top-level-let loop already emitted extern decls for
-        // stdlib globals (header mode flips emit_top_level_let into
-        // decl-only). Add the init function decl that the user TU calls.
+        // globals (header mode flips emit_top_level_let into decl-only).
+        // The stdlib monolith adds the init fn decl the user TU calls; a
+        // per-module header (cg_emit_only_module set) does not.
         emit_line("")
-        emit_line("extern void __blink_init_stdlib_globals(void);")
+        if cg_emit_only_module == "" {
+            emit_line("extern void __blink_init_stdlib_globals(void);")
+        }
         cg_lines.push("")
         cg_lines.push("#endif")
         pop_scope()
@@ -1772,5 +1780,35 @@ pub fn generate_archive_header(program: Int) -> Str ! Codegen, Diag.Report {
     cg_archive_header_mode = 1
     let out = generate(program)
     cg_archive_header_mode = 0
+    out
+}
+
+// Emit a header (.h) for a single module: extern decls + typedefs only,
+// no fn/let definitions. The header guard is "BLINK_MOD_<module_key>_H".
+// Composes with cg_archive_header_mode so the existing header pipeline
+// runs unchanged; cg_emit_only_module narrows emission to one module.
+@allow(UnrestoredMutation, IncompleteStateRestore)
+pub fn generate_module_header(program: Int, module_key: Str) -> Str ! Codegen, Diag.Report {
+    cg_archive_header_mode = 1
+    cg_emit_only_module = module_key
+    cg_module_header_guard = "BLINK_MOD_{module_key}_H"
+    let out = generate(program)
+    cg_archive_header_mode = 0
+    cg_emit_only_module = ""
+    cg_module_header_guard = ""
+    out
+}
+
+// Emit a translation unit (.c) for a single module: definitions only, with
+// `#include "<module>.h"` so it picks up its own typedefs and extern decls.
+// The caller is responsible for emitting per-dependency `#include`s — this
+// entry point only handles the self-include.
+@allow(UnrestoredMutation, IncompleteStateRestore)
+pub fn generate_module_object(program: Int, module_key: Str, self_header: Str) -> Str ! Codegen, Diag.Report {
+    cg_emit_only_module = module_key
+    cg_module_object_self_header = self_header
+    let out = generate(program)
+    cg_emit_only_module = ""
+    cg_module_object_self_header = ""
     out
 }
