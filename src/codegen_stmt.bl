@@ -20,7 +20,7 @@ import codegen_types.{
     cg_temp_counter, cg_trace_codegen, cg_ensures_result_var, cg_old_snapshot_vars,
     compound_name_from_ann,
     emit_arena_restore_helper, emit_bh_cleanup_for_type, emit_cl_cleanup_for_type, emit_ev_restore_helper, emit_handle_cleanup, emit_line, ev_field, fn_node_has_effects,
-    cg_archive_build_mode, cg_archive_header_mode,
+    cg_archive_build_mode, cg_archive_header_mode, cg_archive_object_mode,
     emit_struct_option_typedef, emit_td_guard_open, emit_td_guard_close,
     emitted_let_names, emitted_let_set, ensure_iter_type,
     ensure_option_type, ensure_range_iter, ensure_result_type,
@@ -43,7 +43,7 @@ import codegen_types.{
     impl_method_self_name, builtin_receiver_type_name,
     is_compound_ct, is_data_enum, is_enum_type,
     is_intrinsic_method, is_named_type, is_runtime_header_fn, is_struct_type, is_trait_type, list_contains_str, list_iter_c_type,
-    lookup_assoc_type, lookup_impl_type_for_trait, mangle_generic_name, mangle_impl_method, match_scrut_enum,
+    lookup_assoc_type, lookup_impl_type_for_trait, mangle_generic_name, mangle_impl_method, mangling_module, match_scrut_enum,
     match_scruts, mono_fns, mono_instances, mut_captured_vars, option_c_type,
     option_c_type_mixed, pop_scope, ptr_inner_c_type, push_scope,
     reg_sf_entry, resolve_effect_field, resolve_effect_is_ue, resolve_effect_vtable,
@@ -3652,6 +3652,27 @@ fn ffi_c_ret_type(fn_node: Int) -> Str {
     c_type_str(ret_type)
 }
 
+// Visibility storage class for a top-level fn. Returns "static " when the fn
+// must not escape its TU under per-module .o linkage, "" when it crosses TU
+// boundaries. Carve-outs:
+//   - main is always external
+//   - @module("") fns bind to bare blink_<name> runtime symbols
+//   - FFI fns are external by definition
+//   - stdlib fns under any archive mode: the monolith and user TU both
+//     emit/consume these as external, since effectful fns peel into the
+//     user TU and may call private pure fns left in the monolith
+// Header mode skips the prefix — header lines get rewritten by prepend_extern_*.
+fn fn_storage_class(fn_node: Int, name: Str) -> Str {
+    if cg_archive_header_mode != 0 { return "" }
+    if name == "main" { return "" }
+    if get_ffi_ann(fn_node) != -1 { return "" }
+    if mangling_module(fn_node) == "" { return "" }
+    if node_is_pub(fn_node) != 0 { return "" }
+    if (cg_archive_build_mode != 0 || cg_archive_object_mode != 0) &&
+        node_source_module(fn_node).starts_with("std_") { return "" }
+    "static "
+}
+
 pub fn emit_fn_decl(fn_node: Int) ! Codegen.Emit {
     let name = node_name(fn_node)
     let ffi_ann = get_ffi_ann(fn_node)
@@ -3678,21 +3699,22 @@ pub fn emit_fn_decl(fn_node: Int) ! Codegen.Emit {
         emit_line("void blink_main(blink_ev* __ev);")
         return
     }
+    let storage = fn_storage_class(fn_node, name)
     let params = format_params(fn_node)
     let enum_ret = get_fn_enum_ret(name)
     if enum_ret != "" {
-        emit_line("{c_type_c_name(enum_ret)} {c_fn_name(name)}({params});")
+        emit_line("{storage}{c_type_c_name(enum_ret)} {c_fn_name(name)}({params});")
     } else {
         let ret_str = node_return_type(fn_node)
         if is_struct_type(ret_str) != 0 {
-            emit_line("{c_type_c_name(ret_str)} {c_fn_name(name)}({params});")
+            emit_line("{storage}{c_type_c_name(ret_str)} {c_fn_name(name)}({params});")
         } else {
             let resolved = resolve_ret_type_from_ann(fn_node)
             if resolved != "" {
-                emit_line("{resolved} {c_fn_name(name)}({params});")
+                emit_line("{storage}{resolved} {c_fn_name(name)}({params});")
             } else {
                 let ret_type = type_from_name(ret_str)
-                emit_line("{c_type_str(ret_type)} {c_fn_name(name)}({params});")
+                emit_line("{storage}{c_type_str(ret_type)} {c_fn_name(name)}({params});")
             }
         }
     }
@@ -4046,18 +4068,19 @@ pub fn emit_fn_def(fn_node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope
     if name == "main" {
         sig = "void blink_main(blink_ev* __ev)"
     } else {
+        let storage = fn_storage_class(fn_node, name)
         let params = format_params(fn_node)
         let enum_ret = get_fn_enum_ret(name)
         if enum_ret != "" {
-            sig = "{c_type_c_name(enum_ret)} {c_fn_name(name)}({params})"
+            sig = "{storage}{c_type_c_name(enum_ret)} {c_fn_name(name)}({params})"
         } else if is_struct_type(ret_str) != 0 {
-            sig = "{c_type_c_name(ret_str)} {c_fn_name(name)}({params})"
+            sig = "{storage}{c_type_c_name(ret_str)} {c_fn_name(name)}({params})"
         } else {
             let resolved = resolve_ret_type_from_ann(fn_node)
             if resolved != "" {
-                sig = "{resolved} {c_fn_name(name)}({params})"
+                sig = "{storage}{resolved} {c_fn_name(name)}({params})"
             } else {
-                sig = "{c_type_str(ret_type)} {c_fn_name(name)}({params})"
+                sig = "{storage}{c_type_str(ret_type)} {c_fn_name(name)}({params})"
             }
         }
     }
@@ -5285,7 +5308,15 @@ pub fn emit_top_level_let(node: Int, extern_only: Int) ! Codegen.Emit, Codegen.R
     let is_const = is_mut == 0 && !needs_init && val_type != CT_STRING
     // archive_build_mode drops `static` so the monolith's symbols are
     // visible to user TUs that see them as `extern` via libblink_std.h.
-    let storage = if cg_archive_build_mode != 0 { "BLINK_UNUSED " } else { "BLINK_UNUSED static " }
+    // pub lets and @module("") runtime-bound lets must cross TU boundaries,
+    // so they drop `static` too (same rationale as fn_storage_class).
+    // Under archive modes, stdlib lets stay external to match the archive ABI.
+    let let_is_pub = node_is_pub(node) != 0
+    let let_runtime_bound = mangling_module(node) == ""
+    let archive_active = cg_archive_build_mode != 0 || cg_archive_object_mode != 0
+    let let_in_stdlib = archive_active && node_source_module(node).starts_with("std_")
+    let drop_static = cg_archive_build_mode != 0 || let_is_pub || let_runtime_bound || let_in_stdlib
+    let storage = if drop_static { "BLINK_UNUSED " } else { "BLINK_UNUSED static " }
     let const_q = if is_const { "const " } else { "" }
     if extern_only != 0 {
         let const_q_e = if is_mut == 0 && !needs_init && val_type != CT_STRING { "const " } else { "" }
