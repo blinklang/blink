@@ -3684,6 +3684,33 @@ fn let_storage_class(node: Int) -> Str {
     "static "
 }
 
+// Build a mono struct name from a generic-struct type annotation.
+// Returns the mangled name (e.g. "Box_Int") if `base_name` is a generic
+// user-defined struct/enum and `ann_node` carries its type-arg annotations.
+// Returns "" if `base_name` isn't generic or the annotation lacks type args.
+fn mono_name_from_ann(base_name: Str, ann_node: Int, tparams_sl: Int, concrete_args: Str) -> Str {
+    let td = find_type_def(base_name)
+    if td == -1 { return "" }
+    let td_tparams = node_type_params(td)
+    if td_tparams == -1 || sublist_length(td_tparams) == 0 { return "" }
+    if ann_node == -1 { return "" }
+    let elems = node_elements(ann_node)
+    if elems == -1 || sublist_length(elems) == 0 { return "" }
+    let mut mono_args = ""
+    let mut ai = 0
+    while ai < sublist_length(elems) {
+        let elem = sublist_get(elems, ai)
+        let raw_name = node_name(elem)
+        let resolved_arg = resolve_tparam(raw_name, tparams_sl, concrete_args)
+        if ai > 0 {
+            mono_args = mono_args.concat(",")
+        }
+        mono_args = mono_args.concat(resolved_arg)
+        ai = ai + 1
+    }
+    mangle_generic_name(base_name, mono_args)
+}
+
 pub fn emit_fn_decl(fn_node: Int) ! Codegen.Emit {
     let name = node_name(fn_node)
     let ffi_ann = get_ffi_ann(fn_node)
@@ -4606,35 +4633,10 @@ fn emit_mono_fn_def(fn_node: Int, concrete_args: Str) ! Codegen.Emit, Codegen.Re
             }
         }
     } else if is_struct_type(resolved_ret) != 0 || is_enum_type(resolved_ret) != 0 {
-        let td = find_type_def(resolved_ret)
-        let mut is_generic_ret = 0
-        if td != -1 {
-            let td_tparams = node_type_params(td)
-            if td_tparams != -1 && sublist_length(td_tparams) > 0 {
-                is_generic_ret = 1
-                let ret_ann = node_type_ann(fn_node)
-                if ret_ann != -1 {
-                    let ret_elems = node_elements(ret_ann)
-                    if ret_elems != -1 {
-                        let mut mono_args = ""
-                        let mut ai = 0
-                        while ai < sublist_length(ret_elems) {
-                            let elem = sublist_get(ret_elems, ai)
-                            let raw_name = node_name(elem)
-                            let resolved_arg = resolve_tparam(raw_name, tparams_sl, concrete_args)
-                            if ai > 0 {
-                                mono_args = mono_args.concat(",")
-                            }
-                            mono_args = mono_args.concat(resolved_arg)
-                            ai = ai + 1
-                        }
-                        let mono_name = mangle_generic_name(resolved_ret, mono_args)
-                        ret_c_str = c_type_c_name(mono_name)
-                    }
-                }
-            }
-        }
-        if is_generic_ret == 0 {
+        let mono_name = mono_name_from_ann(resolved_ret, node_type_ann(fn_node), tparams_sl, concrete_args)
+        if mono_name != "" {
+            ret_c_str = c_type_c_name(mono_name)
+        } else {
             ret_c_str = c_type_c_name(resolved_ret)
         }
     }
@@ -4654,7 +4656,9 @@ fn emit_mono_fn_def(fn_node: Int, concrete_args: Str) ! Codegen.Emit, Codegen.Re
                 params_c = params_c.concat(", ")
             }
             if is_struct_type(resolved_ptype) != 0 {
-                params_c = params_c.concat("{c_type_c_name(resolved_ptype)} {pname}")
+                let p_mono_name = mono_name_from_ann(resolved_ptype, node_type_ann(p), tparams_sl, concrete_args)
+                let p_c_type = if p_mono_name != "" { c_type_c_name(p_mono_name) } else { c_type_c_name(resolved_ptype) }
+                params_c = params_c.concat("{p_c_type} {pname}")
             } else if is_enum_type(resolved_ptype) != 0 {
                 params_c = params_c.concat("{c_type_c_name(resolved_ptype)} {pname}")
             } else {
@@ -4689,7 +4693,9 @@ fn emit_mono_fn_def(fn_node: Int, concrete_args: Str) ! Codegen.Emit, Codegen.Re
                 let param_ct = if is_enum_type(resolved_ptype) != 0 { CT_INT } else { type_from_name(resolved_ptype) }
                 set_var(pname, param_ct, 1)
                 if is_struct_type(resolved_ptype) != 0 {
-                    set_var_struct(pname, resolved_ptype)
+                    let p_mono_name = mono_name_from_ann(resolved_ptype, node_type_ann(p), tparams_sl, concrete_args)
+                    let mono_struct_name = if p_mono_name != "" { p_mono_name } else { resolved_ptype }
+                    set_var_struct(pname, mono_struct_name)
                 }
                 if is_enum_type(resolved_ptype) != 0 {
                     var_enums.push(VarEnumEntry { name: pname, enum_type: resolved_ptype })
