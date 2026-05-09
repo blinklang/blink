@@ -20,7 +20,7 @@ import codegen_types.{
     cg_temp_counter, cg_trace_codegen, cg_ensures_result_var, cg_old_snapshot_vars,
     compound_name_from_ann,
     emit_arena_restore_helper, emit_bh_cleanup_for_type, emit_cl_cleanup_for_type, emit_ev_restore_helper, emit_handle_cleanup, emit_line, ev_field, fn_node_has_effects,
-    cg_archive_build_mode, cg_archive_header_mode, cg_archive_object_mode,
+    cg_archive_build_mode, cg_archive_header_mode, cg_archive_object_mode, in_per_module_object,
     emit_struct_option_typedef, emit_td_guard_open, emit_td_guard_close,
     emitted_let_names, emitted_let_set, ensure_iter_type,
     ensure_option_type, ensure_range_iter, ensure_result_type,
@@ -3673,6 +3673,17 @@ fn fn_storage_class(fn_node: Int, name: Str) -> Str {
     "static "
 }
 
+// Storage class for emitted generic-mono fn definitions. Generic monos
+// don't have a fixed home TU — every TU that instantiates with a given
+// type-arg set emits its own copy under the same mangled name. Under
+// per-module .o linkage that produces duplicate-symbol errors, so prefix
+// `static inline ` and let the linker merge / discard duplicates.
+// Whole-program (single TU), archive-monolith, and header passes all
+// keep the extern default.
+fn mono_storage_class(_fn_node: Int) -> Str {
+    if in_per_module_object() { "static inline " } else { "" }
+}
+
 // Same rationale as fn_storage_class for top-level lets. archive_build_mode
 // drops `static` so the monolith's symbols are visible to user TUs as
 // `extern` via libblink_std.h.
@@ -4561,6 +4572,7 @@ fn emit_mono_fn_def(fn_node: Int, concrete_args: Str) ! Codegen.Emit, Codegen.Re
     let base_name = node_name(fn_node)
     let mangled = mangle_generic_name(base_name, concrete_args)
     let tparams_sl = node_type_params(fn_node)
+    let storage = mono_storage_class(fn_node)
 
     // Resolve return type
     let ret_str = node_return_type(fn_node)
@@ -4642,8 +4654,9 @@ fn emit_mono_fn_def(fn_node: Int, concrete_args: Str) ! Codegen.Emit, Codegen.Re
         }
     }
 
-    // Forward declaration
-    emit_line("{ret_c_str} {c_fn_name(mangled)}({params_c});")
+    // Forward decl carries the same storage class as the def below;
+    // otherwise C rejects `static inline` following a non-static proto.
+    emit_line("{storage}{ret_c_str} {c_fn_name(mangled)}({params_c});")
 
     // Register params in scope
     push_scope()
@@ -4753,7 +4766,7 @@ fn emit_mono_fn_def(fn_node: Int, concrete_args: Str) ! Codegen.Emit, Codegen.Re
     cg_current_fn_name = mangled
     cg_current_fn_has_ev = if fn_node_has_effects(fn_node) != 0 { 1 } else { 0 }
     cg_current_fn_ret = ret_type
-    emit_line("{ret_c_str} {c_fn_name(mangled)}({params_c}) \{")
+    emit_line("{storage}{ret_c_str} {c_fn_name(mangled)}({params_c}) \{")
     cg_indent = cg_indent + 1
 
     emit_unused_param_voids(params_sl)
