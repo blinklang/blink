@@ -62,6 +62,7 @@ import codegen_types.{
     from_entries, generic_fns, get_fn_enum_ret,
     impl_entries, impl_method_idx, init_builtin_effects,
     is_emitted_fn, is_emitted_let, is_enum_type, is_generic_fn, is_struct_type,
+    in_per_module_header, in_per_module_object,
     is_stdlib_source_module, join_lines, make_emit_key, mangle_impl_method, mangling_module, mod_fn_prefix, mod_type_prefix, builtin_type_set, mono_fns, mono_idx, mono_instances, skip_private_in_module_header,
     mono_rev_idx,
     mut_captured_vars, pop_scope, push_scope,
@@ -719,10 +720,13 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
         cg_lines.push("#ifndef {guard}")
         cg_lines.push("#define {guard}")
     }
-    if cg_archive_header_mode != 0 || cg_archive_object_mode != 0 || cg_archive_build_mode != 0 {
+    if cg_archive_header_mode != 0 || cg_archive_object_mode != 0 || cg_archive_build_mode != 0 || cg_emit_only_module != "" {
         cg_lines.push("#define BLINK_USE_EXTERN_RUNTIME_STORAGE 1")
     }
-    if cg_archive_build_mode != 0 {
+    // Per-module: __main__.c owns runtime storage (defines globals); other
+    // module .c files extern them. Headers never define storage.
+    let owns_runtime_storage = in_per_module_object() && cg_emit_only_module == "__main__"
+    if cg_archive_build_mode != 0 || owns_runtime_storage {
         cg_lines.push("#define BLINK_RUNTIME_STORAGE_DEFINE 1")
     }
     if cg_archive_object_mode != 0 {
@@ -847,13 +851,11 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
         uei = uei + 1
     }
 
-    // Evidence struct emission. Header mode skips entirely (user TU emits
-    // its own larger typedef). Archive-build mode emits a private typedef
-    // + extern decl. cg_blink_ev_extern_only emits guarded typedef +
-    // extern decl (this TU is a non-owner under per-module linkage).
-    // Normal mode emits the typedef, default-initializer, and the
-    // __blink_ev definition.
-    if cg_archive_header_mode == 0 {
+    // Whole-program archive header skips evidence struct entirely (user
+    // TU emits its own larger typedef). All other modes emit at least the
+    // typedef + extern decl; only the owning TU emits the default
+    // initializer and __blink_ev storage.
+    if cg_archive_header_mode == 0 || in_per_module_header() {
         if cg_archive_build_mode != 0 {
             cg_lines.push("typedef struct \{")
         } else {
@@ -880,7 +882,7 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
         }
         cg_lines.push("")
 
-        if cg_archive_build_mode != 0 || cg_blink_ev_extern_only != 0 {
+        if cg_archive_build_mode != 0 || cg_blink_ev_extern_only != 0 || in_per_module_header() {
             cg_lines.push("extern blink_ev __blink_ev;")
             cg_lines.push("")
         } else {
@@ -903,9 +905,9 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
             cg_lines.push("    return ev;")
             cg_lines.push("\}")
             cg_lines.push("")
-            // archive-object mode: __blink_ev must be non-static so the
-            // monolith's `extern` decl resolves at link time.
-            if cg_archive_object_mode != 0 {
+            // archive-object mode and per-module-object mode for the owner
+            // both require non-static so peer TUs' `extern` resolves.
+            if cg_archive_object_mode != 0 || in_per_module_object() {
                 cg_lines.push("blink_ev __blink_ev;")
             } else {
                 cg_lines.push("static blink_ev __blink_ev;")
@@ -964,22 +966,31 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
     // Topologically sorted so dependencies emit before dependents
     // (otherwise C compilation fails when an earlier-declared ADT
     // has a value-typed field referencing a later-declared ADT).
+    let in_per_module_object_types = in_per_module_object() && cg_archive_build_mode == 0
     if types_sl != -1 {
         let order = topo_sort_type_indices(types_sl)
         let mut oi = 0
         while oi < order.len() {
             let i = order.get(oi).unwrap()
             let td = sublist_get(types_sl, i)
-            if owned_by_other_module(node_source_module(td)) {
+            let td_foreign = owned_by_other_module(node_source_module(td))
+            // In per-module-object mode, foreign types still need their
+            // sf_entries / enum_variants registered so cross-module field
+            // access (e.g. `fsi.ok_struct`) resolves to the right type at
+            // codegen time. We run the same emit path but discard the
+            // generated C — the .h aggregator already provides the typedef.
+            if td_foreign && in_per_module_object_types == 0 {
                 oi = oi + 1
                 continue
             }
             let td_flds = node_fields(td)
             if td_flds == -1 && node_value(td) != -1 {
-                let alias_name = node_name(td)
-                let base_name = type_alias_base.get(alias_name).unwrap()
-                let c_base = c_type_for_alias(base_name)
-                emit_line("typedef {c_base} blink_{alias_name};")
+                if !td_foreign {
+                    let alias_name = node_name(td)
+                    let base_name = type_alias_base.get(alias_name).unwrap()
+                    let c_base = c_type_for_alias(base_name)
+                    emit_line("typedef {c_base} blink_{alias_name};")
+                }
                 oi = oi + 1
                 continue
             }
@@ -989,10 +1000,17 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
                     is_enum = 1
                 }
             }
+            let saved_lines = cg_lines
+            if td_foreign {
+                cg_lines = []
+            }
             if is_enum != 0 {
                 emit_enum_typedef(td)
             } else {
                 emit_struct_typedef(td)
+            }
+            if td_foreign {
+                cg_lines = saved_lines
             }
             oi = oi + 1
         }
@@ -1005,14 +1023,34 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
     // monolith. emit_top_level_let routes those to an extern-decl path.
     let lets_sl = node_stmts(program)
     if lets_sl != -1 {
+        // Two-pass: emit owned definitions first (prefer them on name
+        // collision with foreign externs — same C symbol could be a
+        // private local in this TU and an extern reference for other
+        // modules' private lets sharing the name; the definition wins).
         let mut i = 0
         while i < sublist_length(lets_sl) {
             let let_node = sublist_get(lets_sl, i)
             let let_name = node_name(let_node)
             let let_mod = node_source_module(let_node)
             let mod_is_skipped = skip_module(let_mod)
-            let extern_only = if cg_archive_object_mode != 0 && mod_is_skipped { 1 } else { 0 }
-            if is_emitted_let(let_name) == 0 && (!mod_is_skipped || extern_only != 0) {
+            if is_emitted_let(let_name) == 0 && !mod_is_skipped {
+                emit_top_level_let(let_node, 0)
+                emitted_let_names.push(let_name)
+                emitted_let_set.insert(let_name, 1)
+            }
+            i = i + 1
+        }
+        // Second pass: foreign-owned lets need extern decls + codegen
+        // metadata so cross-module receivers resolve their value type.
+        let needs_foreign_extern = cg_archive_object_mode != 0 || in_per_module_object()
+        i = 0
+        while i < sublist_length(lets_sl) {
+            let let_node = sublist_get(lets_sl, i)
+            let let_name = node_name(let_node)
+            let let_mod = node_source_module(let_node)
+            let mod_is_skipped = skip_module(let_mod)
+            let extern_only = if needs_foreign_extern && mod_is_skipped { 1 } else { 0 }
+            if is_emitted_let(let_name) == 0 && extern_only != 0 {
                 emit_top_level_let(let_node, extern_only)
                 emitted_let_names.push(let_name)
                 emitted_let_set.insert(let_name, 1)
@@ -1237,7 +1275,11 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
     cg_lines = []
     emitted_fn_names = []
     emitted_fn_set = Map()
-    let archive_excludes_effectful = if cg_archive_header_mode != 0 || cg_archive_build_mode != 0 { 1 } else { 0 }
+    // Archive (whole-program) header and archive monolith both exclude
+    // effectful fns — those land in the user TU instead. Per-module
+    // header (cg_emit_only_module set + header mode) needs effectful
+    // pub fns so other modules can call them via the aggregator.
+    let archive_excludes_effectful = if (cg_archive_header_mode != 0 || cg_archive_build_mode != 0) && !in_per_module_header() { 1 } else { 0 }
     if fns_sl != -1 {
         let mut i = 0
         while i < sublist_length(fns_sl) {
@@ -1699,10 +1741,18 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
 
     // Global init function (if needed). The archive monolith exports its
     // init under a distinct name so the user TU can call both its own
-    // local init and the stdlib's.
-    if cg_global_inits.len() > 0 {
+    // local init and the stdlib's. Per-module-object mode does the same
+    // for every module: each .c exposes `__blink_init_<mod>_globals` so
+    // the entry-point TU can dispatch them in module order. Always emit
+    // the function in per-module mode (even when empty) so __main__ can
+    // call it without first knowing which modules carry inits.
+    let in_pm_object = in_per_module_object() && cg_archive_build_mode == 0
+    let needs_init_emit = cg_global_inits.len() > 0 || in_pm_object
+    if needs_init_emit {
         let init_decl = if cg_archive_build_mode != 0 {
             "void __blink_init_stdlib_globals(void) \{"
+        } else if in_pm_object {
+            "void __blink_init_{cg_emit_only_module}_globals(void) \{"
         } else {
             "static void __blink_init_globals(void) \{"
         }
@@ -1742,7 +1792,30 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
         if cg_archive_object_mode != 0 {
             emit_line("__blink_init_stdlib_globals();")
         }
-        if cg_global_inits.len() > 0 {
+        // Per-module-object mode: dispatch each module's init in module
+        // order (deterministic via enumerate_program_modules). __main__ is
+        // called last so it can reference state initialized by stdlib +
+        // user-side modules. Externs are emitted ahead-of-call.
+        if in_pm_object {
+            let pm_modules = enumerate_program_modules(program)
+            let mut pmi = 0
+            while pmi < pm_modules.len() {
+                let pm_m = pm_modules.get(pmi).unwrap()
+                if pm_m != cg_emit_only_module {
+                    emit_line("extern void __blink_init_{pm_m}_globals(void);")
+                }
+                pmi = pmi + 1
+            }
+            pmi = 0
+            while pmi < pm_modules.len() {
+                let pm_m = pm_modules.get(pmi).unwrap()
+                if pm_m != cg_emit_only_module {
+                    emit_line("__blink_init_{pm_m}_globals();")
+                }
+                pmi = pmi + 1
+            }
+            emit_line("__blink_init_{cg_emit_only_module}_globals();")
+        } else if cg_global_inits.len() > 0 {
             emit_line("__blink_init_globals();")
         }
         let has_main = is_emitted_fn("main")
