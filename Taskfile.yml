@@ -228,10 +228,10 @@ tasks:
         # Monolith reference run.
         bin/blink run tests/multifile/src/main.bl > "$TMPDIR/monolith.out" 2>&1
 
-        # Per-module emit + cc link.
+        # Per-module emit + cc link with pinned (sorted) link order.
         mkdir -p "$TMPDIR/per_mod"
         bin/blink __emit-per-module tests/multifile/src/main.bl "$TMPDIR/per_mod"
-        cc -o "$TMPDIR/per_mod/bin" "$TMPDIR"/per_mod/*.c -lm -lgc
+        cc -o "$TMPDIR/per_mod/bin" $(ls "$TMPDIR"/per_mod/*.c | sort) -lm -lgc
         "$TMPDIR/per_mod/bin" > "$TMPDIR/per_module.out" 2>&1
 
         if diff -u "$TMPDIR/monolith.out" "$TMPDIR/per_module.out" > /dev/null; then
@@ -246,10 +246,12 @@ tasks:
         fi
 
         # Self-host: per-module emit on the compiler itself must produce a
-        # working blink binary that can typecheck a sample program.
+        # working blink binary that can typecheck a sample program. We use
+        # this same emit dir for the regen-invariant gen1/gen2 diff below.
         mkdir -p "$TMPDIR/cli_pm"
         bin/blink __emit-per-module src/cli.bl "$TMPDIR/cli_pm"
-        cc -o "$TMPDIR/cli_pm/blink-pm" "$TMPDIR"/cli_pm/*.c -lm -lgc
+        # Pinned link order (sorted glob) so the final binary is also stable.
+        cc -o "$TMPDIR/cli_pm/blink-pm" $(ls "$TMPDIR"/cli_pm/*.c | sort) -lm -lgc
         "$TMPDIR/cli_pm/blink-pm" check tests/multifile/src/main.bl > "$TMPDIR/selfhost.out" 2>&1
         if /usr/bin/grep -q "^ok:" "$TMPDIR/selfhost.out"; then
           echo "ci-per-module: ok (cli.bl self-host)"
@@ -258,6 +260,36 @@ tasks:
           cat "$TMPDIR/selfhost.out"
           exit 1
         fi
+
+        # bc004e regen invariant: per-module emit must be deterministic
+        # across runs AND byte-equal between gen1 (current bin/blink)
+        # and gen2 (the per-module-built compiler from the self-host
+        # step). Combined check — re-emit with bin/blink for determinism,
+        # emit with blink-pm for the regen leg, diff both against cli_pm.
+        mkdir -p "$TMPDIR/det" "$TMPDIR/gen2"
+        bin/blink __emit-per-module src/cli.bl "$TMPDIR/det"
+        "$TMPDIR/cli_pm/blink-pm" __emit-per-module src/cli.bl "$TMPDIR/gen2"
+        diff_dirs() {
+          fail=0
+          for f in "$TMPDIR/cli_pm"/*.c "$TMPDIR/cli_pm"/*.h; do
+            bn=$(basename "$f")
+            if ! diff -q "$f" "$1/$bn" > /dev/null 2>&1; then
+              echo "  DIFF $bn"
+              fail=1
+            fi
+          done
+          return $fail
+        }
+        if ! diff_dirs "$TMPDIR/det"; then
+          echo "FAIL ci-per-module: per-module emit is not deterministic across runs"
+          exit 1
+        fi
+        echo "ci-per-module: ok (per-module emit is deterministic across runs)"
+        if ! diff_dirs "$TMPDIR/gen2"; then
+          echo "FAIL ci-per-module: gen1 vs gen2 per-module .c/.h are not byte-equal"
+          exit 1
+        fi
+        echo "ci-per-module: ok (gen1 vs gen2 per-module byte-equal)"
 
   gen-stdlib-registry:
     desc: Regenerate src/embedded_stdlib_registry.bl from lib/std and lib/pkg
