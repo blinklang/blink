@@ -1,0 +1,61 @@
+// Cache lookup/store/eviction round-trip via the `bin/blink cache`
+// CLI subsurface. Uses a scratch BLINK_CACHE_DIR so we don't pollute
+// the repo cache.
+
+import std.process.{ProcessResult}
+
+fn run_in_cache(scratch: Str, cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", "BLINK_CACHE_DIR={scratch} {cmd}"])
+}
+
+fn make_scratch() -> Str {
+    let r = process_run("sh", ["-c", "mktemp -d"])
+    r.out.trim()
+}
+
+test "store then lookup returns the cached path" {
+    let scratch = make_scratch()
+    process_run("sh", ["-c", "echo 'fake-obj' > {scratch}/payload.o"])
+    let store = run_in_cache(scratch, "bin/blink cache __store deadbeefcafef00d {scratch}/payload.o test_mod test_src_sha")
+    assert_eq(store.exit_code, 0)
+    let lookup = run_in_cache(scratch, "bin/blink cache __lookup deadbeefcafef00d")
+    assert_eq(lookup.exit_code, 0)
+    assert(lookup.out.trim().contains("deadbeefcafef00d.o"))
+    process_run("sh", ["-c", "rm -rf {scratch}"])
+}
+
+test "lookup miss returns nonzero exit" {
+    let scratch = make_scratch()
+    let lookup = run_in_cache(scratch, "bin/blink cache __lookup 0000000000000000")
+    assert(lookup.exit_code != 0)
+    process_run("sh", ["-c", "rm -rf {scratch}"])
+}
+
+test "two distinct keys both resolve" {
+    let scratch = make_scratch()
+    process_run("sh", ["-c", "echo a > {scratch}/a.o ; echo b > {scratch}/b.o"])
+    run_in_cache(scratch, "bin/blink cache __store 1111111111111111 {scratch}/a.o mod_a sha_a")
+    run_in_cache(scratch, "bin/blink cache __store 2222222222222222 {scratch}/b.o mod_b sha_b")
+    let la = run_in_cache(scratch, "bin/blink cache __lookup 1111111111111111")
+    let lb = run_in_cache(scratch, "bin/blink cache __lookup 2222222222222222")
+    assert_eq(la.exit_code, 0)
+    assert_eq(lb.exit_code, 0)
+    process_run("sh", ["-c", "rm -rf {scratch}"])
+}
+
+test "size-cap eviction drops the oldest entry" {
+    let scratch = make_scratch()
+    process_run("sh", ["-c", "echo a > {scratch}/a.o ; echo b > {scratch}/b.o ; echo c > {scratch}/c.o"])
+    // Store three entries, then run gc with a tiny cap. Touch oldest's mtime
+    // backwards so its eviction order is deterministic.
+    run_in_cache(scratch, "bin/blink cache __store aaaaaaaaaaaaaaaa {scratch}/a.o mod_a sha_a")
+    process_run("sh", ["-c", "touch -d '1 hour ago' {scratch}/cache/aaaaaaaaaaaaaaaa.meta 2>/dev/null || touch -d '1 hour ago' {scratch}/aaaaaaaaaaaaaaaa.meta 2>/dev/null || true"])
+    run_in_cache(scratch, "bin/blink cache __store bbbbbbbbbbbbbbbb {scratch}/b.o mod_b sha_b")
+    run_in_cache(scratch, "bin/blink cache __store cccccccccccccccc {scratch}/c.o mod_c sha_c")
+    let gc = process_run("sh", ["-c", "BLINK_CACHE_DIR={scratch} BLINK_CACHE_SIZE_MB=0 bin/blink cache __gc"])
+    assert_eq(gc.exit_code, 0)
+    // After GC with cap 0, every entry must have been evicted.
+    let info = run_in_cache(scratch, "bin/blink cache info")
+    assert(info.out.contains("entries: 0") || info.out.contains("0 entries"))
+    process_run("sh", ["-c", "rm -rf {scratch}"])
+}

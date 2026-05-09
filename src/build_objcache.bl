@@ -1,0 +1,311 @@
+// Per-module .o content-addressed cache.
+//
+// Cache key = 16-hex SHA-256 over a deterministic manifest (schema,
+// module key, src sha, sorted import shas, runtime sha, blinkc sha,
+// cc id, sorted flags, target). Layout under obj_cache_dir():
+//
+//   <16-hex>.o                — the cached object
+//   <16-hex>.meta             — "<unix-mtime> <module_key> <src_sha>"
+//   tmp/<pid>.<rand>.o        — atomic-write staging
+//
+// Hits touch .meta mtime so LRU-by-mtime survives stdlib re-reads.
+// Stores rename(2) into place. Two parallel jobs racing on the same
+// key both compile and both rename — content is byte-identical.
+
+import build_stdlib.{sha256_of_manifest}
+
+pub fn obj_cache_dir() -> Str {
+    let override_val = env.var("BLINK_CACHE_DIR") ?? ""
+    if override_val == "" {
+        return "build/obj-cache"
+    }
+    override_val
+}
+
+pub fn cache_enabled() -> Bool {
+    // Empty BLINK_CACHE_DIR explicitly disables the cache (used by the
+    // bootstrap loop). Unset uses the default `build/obj-cache`.
+    (env.var("BLINK_CACHE_DIR") ?? "x") != ""
+}
+
+fn cache_size_cap_mb() -> Int {
+    let v = env.var("BLINK_CACHE_SIZE_MB") ?? ""
+    if v == "" {
+        return 2048
+    }
+    v.to_int()
+}
+
+pub fn ensure_dir() {
+    let dir = obj_cache_dir()
+    shell_exec("mkdir -p {dir}/tmp")
+}
+
+// Per-process counter so each call to make_staging_path is unique even
+// when invoked back-to-back inside the same build.
+let mut stage_counter: Int = 0
+
+// Produce a per-process unique staging path under tmp/. The header
+// comment promises tmp/<pid>.<rand>.o atomicity — parallel jobs that
+// hit the same key must not collide on the staging file.
+pub fn make_staging_path(label: Str) -> Str {
+    stage_counter = stage_counter + 1
+    let pid = getpid()
+    "{obj_cache_dir()}/tmp/{label}.{pid}.{stage_counter}.o"
+}
+
+fn sha256_of_file(path: Str) -> Str {
+    if file_exists(path) == 0 {
+        return ""
+    }
+    let res = process_run("sh", ["-c", "sha256sum {path} 2>/dev/null | awk '\{print $1}'"])
+    res.out.trim()
+}
+
+fn sha256_of_string(s: Str) -> Str {
+    let cmd = "printf '%s' \"{s}\" | sha256sum | awk '\{print $1}'"
+    let res = process_run("sh", ["-c", cmd])
+    res.out.trim()
+}
+
+fn cc_identity() -> Str {
+    let res = process_run("sh", ["-c", "cc --version 2>&1 | head -1"])
+    res.out.trim()
+}
+
+fn sort_lines(s: Str) -> Str {
+    if s == "" {
+        return ""
+    }
+    let cmd = "printf '%s' \"{s}\" | sort"
+    let res = process_run("sh", ["-c", cmd])
+    res.out
+}
+
+// Build the manifest text, then hash it. Caller passes pre-computed
+// shas where possible to avoid re-reading files on every call.
+pub fn compute_obj_key(
+    module_key: Str,
+    src_sha: Str,
+    dep_header_lines: List[Str],
+    runtime_sha: Str,
+    blinkc_sha: Str,
+    cc_id: Str,
+    flags: List[Str],
+    target: Str,
+) -> Str {
+    let mut imp = StringBuilder.new()
+    let mut i = 0
+    while i < dep_header_lines.len() {
+        if i > 0 { imp.write("\n") }
+        imp.write(dep_header_lines.get(i).unwrap())
+        i = i + 1
+    }
+    let imports_sorted = sort_lines(imp.to_str()).trim()
+
+    let mut fl = StringBuilder.new()
+    let mut k = 0
+    while k < flags.len() {
+        if k > 0 { fl.write("\n") }
+        fl.write(flags.get(k).unwrap())
+        k = k + 1
+    }
+    let flags_sorted = sort_lines(fl.to_str()).trim()
+
+    let mut m = StringBuilder.new()
+    m.write("schema:1\n")
+    m.write("mod:{module_key}\n")
+    m.write("src_sha:{src_sha}\n")
+    m.write("imports:{imports_sorted}\n")
+    m.write("runtime_sha:{runtime_sha}\n")
+    m.write("blinkc_sha:{blinkc_sha}\n")
+    m.write("cc_id:{cc_id}\n")
+    m.write("flags:{flags_sorted}\n")
+    m.write("target:{target}\n")
+    sha256_of_manifest(m.to_str())
+}
+
+// Hash an arbitrary manifest passed as a string. Used by `blink cache
+// key <manifest>` for tests and for tooling that wants to drive the
+// digest directly.
+pub fn key_from_text(text: Str) -> Str {
+    sha256_of_manifest(text)
+}
+
+// Look up by key. On hit, touches .meta mtime and returns the .o path.
+// On miss, returns "".
+pub fn lookup_obj(key: Str) -> Str {
+    if !cache_enabled() {
+        return ""
+    }
+    let dir = obj_cache_dir()
+    let obj = "{dir}/{key}.o"
+    if file_exists(obj) == 0 {
+        return ""
+    }
+    let meta = "{dir}/{key}.meta"
+    shell_exec("touch {meta} 2>/dev/null || true")
+    obj
+}
+
+// Atomically install obj_tmp_path as <key>.o under the cache, plus
+// write the .meta sidecar. Caller is responsible for putting a fresh
+// obj at obj_tmp_path; we rename it (so the temp path is consumed).
+// Returns true iff a new entry was installed (signal for maybe_gc).
+pub fn store(key: Str, obj_tmp_path: Str, module_key: Str, src_sha: Str) -> Bool {
+    if !cache_enabled() {
+        return false
+    }
+    ensure_dir()
+    let dir = obj_cache_dir()
+    let final_obj = "{dir}/{key}.o"
+    shell_exec("mv -f {obj_tmp_path} {final_obj}")
+    let now_res = process_run("sh", ["-c", "date +%s"])
+    let now = now_res.out.trim()
+    let meta_path = "{dir}/{key}.meta"
+    write_file(meta_path, "{now} {module_key} {src_sha}\n")
+    true
+}
+
+fn cache_total_kb(dir: Str) -> Int {
+    if file_exists(dir) == 0 {
+        return 0
+    }
+    let res = process_run("sh", ["-c", "du -sk {dir} 2>/dev/null | awk '\{print $1}'"])
+    let v = res.out.trim()
+    if v == "" { 0 } else { v.to_int() }
+}
+
+fn file_kb(path: Str) -> Int {
+    let res = process_run("sh", ["-c", "du -sk {path} 2>/dev/null | awk '\{print $1}'"])
+    let v = res.out.trim()
+    if v == "" { 0 } else { v.to_int() }
+}
+
+fn cache_entry_count(dir: Str) -> Int {
+    if file_exists(dir) == 0 {
+        return 0
+    }
+    // Only count 16-hex-named .o files — those are real cache entries.
+    // Other .o files in the directory (e.g. user-staged files in tests
+    // that point BLINK_CACHE_DIR at an arbitrary scratch dir) are
+    // ignored.
+    let res = process_run("sh", ["-c", "ls -1 {dir}/[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f].o 2>/dev/null | wc -l"])
+    let v = res.out.trim()
+    if v == "" { 0 } else { v.to_int() }
+}
+
+// Opportunistic LRU eviction by .meta mtime until total <= cap_mb.
+// Caller invokes this once at end of a build that stored anything.
+pub fn maybe_gc() {
+    if !cache_enabled() {
+        return
+    }
+    let dir = obj_cache_dir()
+    let cap_kb = cache_size_cap_mb() * 1024
+    let mut total_kb = cache_total_kb(dir)
+    if total_kb <= cap_kb {
+        return
+    }
+    let listing = process_run("sh", ["-c", "ls -1tr {dir}/*.meta 2>/dev/null"])
+    let lines = listing.out.split("\n")
+    let mut idx = 0
+    // Subtract per-entry size as we evict — re-walking the tree per
+    // delete is O(N²) on big caches.
+    while idx < lines.len() && total_kb > cap_kb {
+        let meta_path = lines.get(idx).unwrap().trim()
+        if meta_path != "" {
+            let obj_path = meta_path.replace(".meta", ".o")
+            let freed = file_kb(obj_path) + file_kb(meta_path)
+            shell_exec("rm -f {obj_path} {meta_path}")
+            total_kb = total_kb - freed
+        }
+        idx = idx + 1
+    }
+}
+
+pub fn cmd_info() -> Int {
+    let dir = obj_cache_dir()
+    let count = cache_entry_count(dir)
+    let total_kb = cache_total_kb(dir)
+    let total_mb = total_kb / 1024
+    io.println("blink object cache")
+    io.println("  location: {dir}")
+    io.println("  entries: {count}")
+    io.println("  size: {total_mb} MiB ({total_kb} KiB)")
+    io.println("  cap: {cache_size_cap_mb()} MiB")
+    0
+}
+
+pub fn cmd_clean(older_than: Str) -> Int {
+    let dir = obj_cache_dir()
+    if file_exists(dir) == 0 {
+        return 0
+    }
+    if older_than == "" {
+        shell_exec("rm -rf {dir}/*.o {dir}/*.meta 2>/dev/null")
+        return 0
+    }
+    // older_than format: "Nd" / "Nh" / "Nm". Convert to find -mtime / -mmin.
+    let n_text = older_than.slice(0, older_than.len() - 1)
+    let unit = older_than.slice(older_than.len() - 1, older_than.len())
+    let n = n_text.to_int()
+    let mut find_arg = ""
+    if unit == "d" {
+        find_arg = "-mtime +{n - 1}"
+    } else if unit == "h" {
+        find_arg = "-mmin +{n * 60}"
+    } else if unit == "m" {
+        find_arg = "-mmin +{n}"
+    } else {
+        io.eprintln("error: --older-than expects format like '7d', '12h', or '30m'")
+        return 1
+    }
+    let prune = "find {dir} -maxdepth 1 -name '*.meta' {find_arg} -print"
+    let listing = process_run("sh", ["-c", prune])
+    let lines = listing.out.split("\n")
+    let mut i = 0
+    while i < lines.len() {
+        let meta = lines.get(i).unwrap().trim()
+        if meta != "" {
+            let obj = meta.replace(".meta", ".o")
+            shell_exec("rm -f {meta} {obj}")
+        }
+        i = i + 1
+    }
+    0
+}
+
+// Hidden sub-subcommands used by tests to drive the cache directly.
+// Return 0/1 so the test can assert exit codes.
+pub fn cmd_internal_lookup(key: Str) -> Int {
+    let p = lookup_obj(key)
+    if p == "" {
+        return 1
+    }
+    io.println(p)
+    0
+}
+
+pub fn cmd_internal_store(key: Str, src_obj: Str, module_key: Str, src_sha: Str) -> Int {
+    if file_exists(src_obj) == 0 {
+        io.eprintln("error: source obj does not exist: {src_obj}")
+        return 1
+    }
+    ensure_dir()
+    let staging = make_staging_path(module_key)
+    shell_exec("cp {src_obj} {staging}")
+    store(key, staging, module_key, src_sha)
+    0
+}
+
+pub fn cmd_internal_gc() -> Int {
+    maybe_gc()
+    0
+}
+
+pub fn cmd_key(text: Str) -> Int {
+    let k = key_from_text(text)
+    io.println(k)
+    0
+}
