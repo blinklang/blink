@@ -415,7 +415,7 @@ fn ensure_deps_resolved() {
     }
 }
 
-fn do_compile(source_path: Str, c_path: Str, format_flag: Str, debug_mode: Int, strict_mode: Int, use_stdlib_archive: Int) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen {
+fn do_compile(source_path: Str, c_path: Str, format_flag: Str, debug_mode: Int, strict_mode: Int) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen {
     if format_flag == "blink" {
         reset_compiler_state()
         diag_reset()
@@ -474,19 +474,14 @@ fn do_compile(source_path: Str, c_path: Str, format_flag: Str, debug_mode: Int, 
             si = si + 1
         }
     }
-    if use_stdlib_archive != 0 {
-        let archived = list_stdlib_module_keys()
-        let mut ai = 0
-        while ai < archived.len() {
-            cg_skip_modules.insert(archived.get(ai).unwrap(), 1)
-            ai = ai + 1
-        }
-        cg_archive_object_mode = 1
-        cg_runtime_header = ""
-    } else {
-        cg_archive_object_mode = 0
-        cg_runtime_header = resolve_runtime_header()
+    let archived = list_stdlib_module_keys()
+    let mut ai = 0
+    while ai < archived.len() {
+        cg_skip_modules.insert(archived.get(ai).unwrap(), 1)
+        ai = ai + 1
     }
+    cg_archive_object_mode = 1
+    cg_runtime_header = ""
 
     let c_output = generate(final_program)
 
@@ -507,6 +502,36 @@ fn do_compile(source_path: Str, c_path: Str, format_flag: Str, debug_mode: Int, 
 
     write_file(c_path, c_output)
     return 0
+}
+
+// Returns the directory holding `libblink_std.{a,h}`. Probes in order:
+// 1. $BLINK_ROOT/build (set by the bin/blink wrapper).
+// 2. The directory containing this binary itself (via /proc/self/exe).
+//    This handles users who invoke the toolchain binary directly without
+//    going through the wrapper, including from arbitrary working dirs.
+// 3. Cwd-relative "build" as a final fallback for in-repo development.
+pub fn resolve_archive_dir() -> Str {
+    let blink_root = env.var("BLINK_ROOT") ?? ""
+    if blink_root != "" {
+        let candidate = "{blink_root}/build/libblink_std.a"
+        if file_exists(candidate) == 1 {
+            return "{blink_root}/build"
+        }
+    }
+    // The toolchain binary always sits under `<root>/build/`, so the
+    // archive lives in the same directory as the binary itself. We get
+    // our own exe path by asking sh to readlink /proc/$PPID/exe — sh's
+    // parent is the blink binary that just spawned it.
+    let exe_result = process_run("sh", ["-c", "readlink -f /proc/$PPID/exe 2>/dev/null || echo ''"])
+    let exe_path = exe_result.out.trim()
+    if exe_path != "" {
+        let exe_dir = path_dirname(exe_path)
+        let candidate = "{exe_dir}/libblink_std.a"
+        if file_exists(candidate) == 1 {
+            return exe_dir
+        }
+    }
+    "build"
 }
 
 pub fn resolve_runtime_header() -> Str {
@@ -730,7 +755,7 @@ fn resolve_vendored_includes(has_sqlite: Int, target: Str) -> Str {
     includes.join(" ")
 }
 
-fn do_link_target(out: Str, c_path: Str, link_flags: Str, obj_files: List[Str], include_flags: Str, debug_mode: Int, release_mode: Int, target: Str, use_stdlib_archive: Int) -> Int {
+fn do_link_target(out: Str, c_path: Str, link_flags: Str, obj_files: List[Str], include_flags: Str, debug_mode: Int, release_mode: Int, target: Str) -> Int {
     let mut objs = ""
     if obj_files.len() > 0 {
         objs = " {obj_files.join(" ")}"
@@ -739,32 +764,30 @@ fn do_link_target(out: Str, c_path: Str, link_flags: Str, obj_files: List[Str], 
     if include_flags != "" {
         includes = " {include_flags}"
     }
-    let mut archive = ""
+    let arc_dir = resolve_archive_dir()
+    let archive = " -I{arc_dir} {arc_dir}/libblink_std.a -Wl,--gc-sections"
     let mut effective_link_flags = link_flags
-    if use_stdlib_archive != 0 {
-        archive = " -Ibuild build/libblink_std.a -Wl,--gc-sections"
-        // Archive contains every stdlib body including db.sqlite + async — force
-        // their link deps even if user code doesn't reference them directly,
-        // because the archive's monolith.o is treated atomically by the linker.
-        let arch_objs = resolve_vendored_objects(1, debug_mode, release_mode, target)
-        if arch_objs.len() > 0 {
-            objs = "{objs} {arch_objs.join(" ")}"
-        }
-        let arch_includes = resolve_vendored_includes(1, target)
-        if arch_includes != "" {
-            includes = "{includes} {arch_includes}"
-        }
-        let mut extras: List[Str] = []
-        if !link_flags.contains("-pthread") {
-            extras.push("-pthread")
-        }
-        let sqlite_flags = resolve_ffi_link_flags("sqlite3", target)
-        if sqlite_flags != "" && !link_flags.contains(sqlite_flags) {
-            extras.push(sqlite_flags)
-        }
-        if extras.len() > 0 {
-            effective_link_flags = "{link_flags} {extras.join(" ")}"
-        }
+    // Archive contains every stdlib body including db.sqlite + async — force
+    // their link deps even if user code doesn't reference them directly,
+    // because the archive's monolith.o is treated atomically by the linker.
+    let arch_objs = resolve_vendored_objects(1, debug_mode, release_mode, target)
+    if arch_objs.len() > 0 {
+        objs = "{objs} {arch_objs.join(" ")}"
+    }
+    let arch_includes = resolve_vendored_includes(1, target)
+    if arch_includes != "" {
+        includes = "{includes} {arch_includes}"
+    }
+    let mut extras: List[Str] = []
+    if !link_flags.contains("-pthread") {
+        extras.push("-pthread")
+    }
+    let sqlite_flags = resolve_ffi_link_flags("sqlite3", target)
+    if sqlite_flags != "" && !link_flags.contains(sqlite_flags) {
+        extras.push(sqlite_flags)
+    }
+    if extras.len() > 0 {
+        effective_link_flags = "{link_flags} {extras.join(" ")}"
     }
     let rc = run_cc("-o {out} {c_path}{objs}{includes}{archive} {effective_link_flags}", debug_mode, release_mode, target)
     if rc != 0 {
@@ -844,9 +867,9 @@ fn stamp_blink_version() {
     }
 }
 
-fn do_build(source_path: Str, output_path: Str, c_path: Str, format_flag: Str, debug_mode: Int, release_mode: Int, emit_mode: Str, targets: List[Str], json_output: Int, strict_mode: Int, use_stdlib_archive: Int) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen {
+fn do_build(source_path: Str, output_path: Str, c_path: Str, format_flag: Str, debug_mode: Int, release_mode: Int, emit_mode: Str, targets: List[Str], json_output: Int, strict_mode: Int) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen {
     shell_exec("rm -f {output_path}")
-    let rc = do_compile(source_path, c_path, format_flag, debug_mode, strict_mode, use_stdlib_archive)
+    let rc = do_compile(source_path, c_path, format_flag, debug_mode, strict_mode)
     if rc != 0 {
         return rc
     }
@@ -887,7 +910,7 @@ fn do_build(source_path: Str, output_path: Str, c_path: Str, format_flag: Str, d
         let link_flags = build_link_flags(target, has_async, has_sqlite, ffi_libs)
         let obj_files = resolve_vendored_objects(has_sqlite, debug_mode, release_mode, target)
         let inc_flags = resolve_vendored_includes(has_sqlite, target)
-        let lrc = do_link_target(output_path, c_path, link_flags, obj_files, inc_flags, debug_mode, release_mode, target, use_stdlib_archive)
+        let lrc = do_link_target(output_path, c_path, link_flags, obj_files, inc_flags, debug_mode, release_mode, target)
         if lrc != 0 {
             return lrc
         }
@@ -912,7 +935,7 @@ fn do_build(source_path: Str, output_path: Str, c_path: Str, format_flag: Str, d
         let obj_files = resolve_vendored_objects(has_sqlite, debug_mode, release_mode, triple)
         let out = "{output_path}-{alias}"
         shell_exec("rm -f {out}")
-        let lrc = do_link_target(out, c_path, link_flags, obj_files, inc_flags, debug_mode, release_mode, triple, use_stdlib_archive)
+        let lrc = do_link_target(out, c_path, link_flags, obj_files, inc_flags, debug_mode, release_mode, triple)
         if lrc != 0 {
             return lrc
         }
@@ -1291,7 +1314,6 @@ fn cmd_build(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
     let strict_struct_layout_flag = if args_has(a, "strict-struct-layout") { 1 } else { 0 }
     set_strict_struct_layout(strict_struct_layout_flag)
     let json_output = if args_has(a, "json") { 1 } else { 0 }
-    let use_archive_flag = if args_has(a, "use-stdlib-archive") { 1 } else { 0 }
     let emit_flag = args_get(a, "emit")
     let targets = args_get_all(a, "target")
     let mut format_flag = args_get(a, "format")
@@ -1321,7 +1343,7 @@ fn cmd_build(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
     let out_base = strip_extension(path_basename(output_path))
     let c_path = "{out_dir}/{out_base}.c"
     ensure_deps_resolved()
-    let rc = do_build(source_path, output_path, c_path, format_flag, debug_flag, release_flag, emit_flag, targets, json_output, strict_flag, use_archive_flag)
+    let rc = do_build(source_path, output_path, c_path, format_flag, debug_flag, release_flag, emit_flag, targets, json_output, strict_flag)
     if rc == 0 {
         if emit_flag == "c" {
             if json_output != 0 {
@@ -1351,7 +1373,6 @@ fn cmd_run(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Repor
     let strict_flag = if args_has(a, "strict") { 1 } else { 0 }
     let strict_struct_layout_flag = if args_has(a, "strict-struct-layout") { 1 } else { 0 }
     set_strict_struct_layout(strict_struct_layout_flag)
-    let use_archive_flag = if args_has(a, "use-stdlib-archive") { 1 } else { 0 }
     let targets = args_get_all(a, "target")
     let mut format_flag = args_get(a, "format")
     if debug_flag != 0 && release_flag != 0 {
@@ -1382,7 +1403,7 @@ fn cmd_run(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Repor
         cg_trace_codegen = 1
     }
     ensure_deps_resolved()
-    let rc = do_build(source_path, output_path, c_path, format_flag, debug_flag, release_flag, "", targets, 0, strict_flag, use_archive_flag)
+    let rc = do_build(source_path, output_path, c_path, format_flag, debug_flag, release_flag, "", targets, 0, strict_flag)
     if rc != 0 {
         exit(1)
     }
@@ -1420,24 +1441,12 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
     }
     let targets = args_get_all(a, "target")
     let format_flag = args_get(a, "format")
-    let mut use_archive_flag = if args_has(a, "use-stdlib-archive") { 1 } else { 0 }
-    // BLINK_NO_STDLIB_ARCHIVE=1 forces the whole-program emit path even
-    // when --use-stdlib-archive was passed. Useful for bisecting an
-    // archive-only regression against the legacy code path.
-    if use_archive_flag != 0 {
-        let bypass = env.var("BLINK_NO_STDLIB_ARCHIVE") ?? ""
-        if bypass == "1" {
-            use_archive_flag = 0
-        }
-    }
 
     ensure_deps_resolved()
-    if use_archive_flag != 0 {
-        let arc_rc = build_stdlib_archive([])
-        if arc_rc != 0 {
-            io.eprintln("error: failed to build stdlib archive (rc={arc_rc})")
-            exit(arc_rc)
-        }
+    let arc_rc = build_stdlib_archive([])
+    if arc_rc != 0 {
+        io.eprintln("error: failed to build stdlib archive (rc={arc_rc})")
+        exit(arc_rc)
     }
     if source_path != "" {
         check_file_exists(source_path)
@@ -1448,7 +1457,7 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
         shell_exec("mkdir -p build")
         let c_path = "build/{name}.c"
         let output_path = "build/{name}"
-        let rc = do_build(source_path, output_path, c_path, format_flag, 1, 0, "", targets, 0, 0, use_archive_flag)
+        let rc = do_build(source_path, output_path, c_path, format_flag, 1, 0, "", targets, 0, 0)
         if rc != 0 {
             exit(1)
         }
@@ -1531,9 +1540,6 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
         output_bins.push(tf_out)
 
         let mut ba: List[Str] = ["build", tf, "-o", tf_out, "--debug"]
-        if use_archive_flag != 0 {
-            ba.push("--use-stdlib-archive")
-        }
         build_args.push(ba)
 
         let source = read_file(tf)
@@ -2014,7 +2020,7 @@ fn cmd_fmt(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Repo
                 let fname = fmt_files.get(fi).unwrap()
                 let tmp_name = strip_extension(path_basename(fname))
                 let tmp_path = ".tmp/fmt_check_{tmp_name}.bl"
-                let rc = do_compile(fname, tmp_path, "blink", 0, 0, 0)
+                let rc = do_compile(fname, tmp_path, "blink", 0, 0)
                 if rc == 0 {
                     let original = read_file(fname)
                     let formatted = read_file(tmp_path)
@@ -2036,7 +2042,7 @@ fn cmd_fmt(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Repo
             }
         } else {
             let tmp_path = ".tmp/fmt_check_{name}.bl"
-            let rc = do_compile(source_path, tmp_path, "blink", 0, 0, 0)
+            let rc = do_compile(source_path, tmp_path, "blink", 0, 0)
             if rc == 0 {
                 let original = read_file(source_path)
                 let formatted = read_file(tmp_path)
@@ -2094,7 +2100,7 @@ fn cmd_fmt(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Repo
             let mut fi = 0
             while fi < fmt_files.len() {
                 let fname = fmt_files.get(fi).unwrap()
-                let rc = do_compile(fname, fname, "blink", 0, 0, 0)
+                let rc = do_compile(fname, fname, "blink", 0, 0)
                 if rc == 0 {
                     if json_output == 0 {
                         io.println("formatted: {fname}")
@@ -2132,7 +2138,7 @@ fn cmd_fmt(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Repo
                 io.println("\{\"formatted\":{ok_json},\"errors\":{err_json}}")
             }
         } else {
-            let rc = do_compile(source_path, source_path, "blink", 0, 0, 0)
+            let rc = do_compile(source_path, source_path, "blink", 0, 0)
             if rc == 0 {
                 if json_output != 0 {
                     io.println("\{\"formatted\":[\"{source_path}\"],\"errors\":[]}")
@@ -3016,10 +3022,6 @@ fn main() {
     p = command_add_flag(p, "build", "--strict-struct-layout", "", "Enforce @ffi.struct layout asserts and header declarations")
     p = command_add_flag(p, "check", "--strict-struct-layout", "", "Enforce @ffi.struct layout asserts and header declarations")
     p = command_add_flag(p, "run", "--strict-struct-layout", "", "Enforce @ffi.struct layout asserts and header declarations")
-
-    p = command_add_flag(p, "build", "--use-stdlib-archive", "", "Link against build/libblink_std.a instead of inlining stdlib (experimental)")
-    p = command_add_flag(p, "run", "--use-stdlib-archive", "", "Link against build/libblink_std.a instead of inlining stdlib (experimental)")
-    p = command_add_flag(p, "test", "--use-stdlib-archive", "", "Link against build/libblink_std.a instead of inlining stdlib (experimental)")
 
     p = command_add_flag(p, "fmt", "--check", "-c", "Check formatting without modifying files")
 
