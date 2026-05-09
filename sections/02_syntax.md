@@ -1216,6 +1216,68 @@ fn divide(a: Int, b: Int) -> Int {
 
 **Panel vote: 5-0 unanimous.** See [DECISIONS.md](../DECISIONS.md).
 
+#### Sub-tests and Parameterized Tests
+
+Blink does **not** ship a `subtest` block, a `subtest(label, fn)` HOF, or any other "test-within-a-test" primitive. The test toolbox is intentionally two primitives — `test "..." { }` (§2.20) and `testing.for_each(cases, body)` (§8.10.2) — plus ordinary `fn` helpers for shared setup. Three patterns cover the parameterized-test design space:
+
+**Pattern 1 — homogeneous parametric cases: `for_each`.** When the same assertions run against many inputs of the same shape, use `for_each` with explicit `(label, value)` pairs:
+
+```blink
+test "add handles signs" {
+    testing.for_each([
+        ("zero",     (0, 0, 0)),
+        ("positive", (1, 2, 3)),
+        ("negative", (-1, -2, -3)),
+    ], fn(case) {
+        let (a, b, expected) = case
+        assert_eq(add(a, b), expected)
+    })
+}
+```
+
+**Pattern 2 — heterogeneous phases: multiple `test` blocks with shared setup.** When phases of a workflow exercise different assertions and don't share an iteration shape, write each phase as its own top-level `test` block and factor the shared construction into a helper `fn`:
+
+```blink
+fn fresh_parser() -> Parser {
+    Parser.new(default_config())
+}
+
+test "parser handles empty input" {
+    let p = fresh_parser()
+    assert_eq(p.parse(""), Ok([]))
+}
+
+test "parser handles whitespace-only input" {
+    let p = fresh_parser()
+    assert_eq(p.parse("   \n\t"), Ok([]))
+}
+
+test "parser handles unmatched delimiters" {
+    let p = fresh_parser()
+    assert(p.parse("(foo").is_err())
+}
+```
+
+This is the canonical idiom for what other ecosystems use `subtest` / `t.Run` / `describe` for. Three flat tests give the runner three independent failures, each with its own name and stack frame, instead of one composite failure that masks which phase broke.
+
+**Pattern 3 — shared effectful resources: `with` handlers around the body.** When all phases need the same effectful setup (database, mocked network, temp directory), put the `with` block inside each `test`, or factor it into a wrapper `fn` that takes the test body as a closure:
+
+```blink
+test "deposit then withdraw" {
+    with mock_db(fixtures), capture_log([]) {
+        let acct = open_account(1, "Test")
+        assert_eq(deposit(acct, 500).unwrap().balance, 500)
+        assert_eq(withdraw(acct, 200).unwrap().balance, 300)
+    }
+}
+```
+
+`with` handlers run their `exit(false)` on assertion failure (§4.6.3 / `BlockHandler` catchable-unwind), so transactional rollback, log capture, and temp-path cleanup all behave correctly across the unwind.
+
+**Why no `subtest` primitive.** Adding `subtest` as either a stdlib HOF or a compiler-recognized block was deliberated and rejected. The shapes that go beyond `for_each` + flat `test` blocks all require either (a) a second catch-site for `panic` inside `test` (so siblings could continue after one fails), which would contradict §2.20's "panic is untracked divergence; only the test runner catches it" and §4.6.3's deferral of recoverable panics, or (b) sugar that adds language surface without expressivity gain. Future evidence-driven re-evaluation may reopen the question; the current evidence (no shipped feature missing it, `for_each` covers parametric, helper `fn` covers heterogeneous) is that the gap is documentation-shaped, not syntax-shaped.
+
+**Panel vote: 5-1** (sys dissent for compiler builtin with static enumerability). See [DECISIONS.md](../DECISIONS.md) and [decisions/sub-tests.md](../decisions/sub-tests.md).
+
 #### Assertion Failure Output
 
 Assertion failures use **expression introspection** (Power Assert style). The compiler captures the source text, file/line/col, and decomposes sub-expressions to show their values:

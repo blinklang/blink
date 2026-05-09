@@ -317,6 +317,7 @@ Decided by expert panel vote. See [OPEN_QUESTIONS.md](OPEN_QUESTIONS.md) for ful
 | Defer keyword (rejection) | Reject a dedicated `defer` keyword. `with` blocks already handle scoped cleanup via `Closeable` and `BlockHandler`. Stdlib helper `testing.cleanup(fn)` covers ad-hoc test teardown for non-`Closeable` actions. Rejected as redundant syntax | 6-0 (REJECT_WITH_AMENDMENT — see BlockHandler catchable-unwind) |
 | BlockHandler catchable-unwind | `BlockHandler.exit(self, ok: Bool)` and `Closeable.close(self)` run on every **catchable unwind**: normal completion, `?` propagation, `return`, assertion failure, and `skip()`. The catch-boundary set is closed and runtime-defined; user-level panic recovery requires a separate spec amendment that re-evaluates these semantics. Uncaught/process-terminating panics still bypass `exit()`/`close()`. `panic: Never` axiom preserved (the `exit(false)` body cannot inspect/transform/suppress the panic — analogous to Rust `Drop` on unwind) | 6-0 Q1, 6-0 Q2 separability, 6-0 Q3 closed-set fence, 5-1 Q4 (`testing.cleanup` over both-forms; devops dissent), 6-0 Q5 (skip triggers cleanup) |
 | `testing.cleanup` helper | Stdlib `testing.cleanup(fn() -> Void) -> Cleanup` BlockHandler that runs the closure on every catchable unwind out of `with cleanup(fn) { ... }`. For non-`Closeable` test teardown (temp paths, env-var resets, mock restores). Single HOF; `testing.scope() as s` registrar form deferred as follow-up | 5-1 (devops: wanted both-forms registrar shipped together) |
+| Sub-tests / `subtest` (rejection) | Reject both compiler-builtin `subtest "label" { }` and stdlib HOF `testing.subtest(label, fn)`. The parameterized-test space is covered by `for_each` (§8.10.2), multiple flat `test` blocks, and helper `fn`s for shared setup; documented in §2.20 *Sub-tests and Parameterized Tests*. `for_each` gains runtime label-uniqueness enforcement. Per-iteration NDJSON `case` records and full label-prefixed failure attribution tracked as a follow-up `type:bug` on the runner. `--collect-only` static enumerability and `--enumerate-cases` deferred pending usage signal | 5-1 Q1 (sys dissent → compiler builtin), 5-1 Q2 (V2 in-scope; sys dissent → sibling-task), 5-1 Q3 (V3 punt; sys dissent → required) |
 
 ---
 
@@ -410,6 +411,7 @@ Full deliberation records for each decision. Each file contains expert votes, re
 | Package Entry-Point Convention | [decisions/package-entry-point-convention.md](decisions/package-entry-point-convention.md) |
 | Defer Keyword Rejection | [decisions/defer-keyword-rejection.md](decisions/defer-keyword-rejection.md) |
 | BlockHandler Catchable-Unwind | [decisions/blockhandler-catchable-unwind.md](decisions/blockhandler-catchable-unwind.md) |
+| Sub-tests | [decisions/sub-tests.md](decisions/sub-tests.md) |
 
 ---
 

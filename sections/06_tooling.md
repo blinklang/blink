@@ -815,11 +815,22 @@ test "add handles signs" {
 }
 ```
 
-On failure, the panic message is prefixed with `case "<label>":` so the failing case is identifiable in the test runner's output without consulting source.
+**Label uniqueness.** Duplicate labels within the same `for_each` call panic at the start of the offending iteration with `for_each: duplicate case label "<label>" at indices <j> and <i>`. Uniqueness is checked at runtime — labels are arbitrary `Str` values and may be computed, so static checking would be over-constrained. Empty-string labels are allowed but two empty strings still collide.
+
+**Failure attribution.** Failures inside the body unwind through the test runner's per-test catch boundary (§2.20) and mark the parent `test` as failed. The current runner does not yet emit per-iteration `case` records in NDJSON output, so a failure shows the parent test's name without naming the failing case. Until the runner change lands (tracked separately as a `type:bug` against `lib/std/testing.bl` and the runner reporter), tests that need per-case attribution should include the label in the assertion message:
+
+```blink
+testing.for_each(cases, fn(case) {
+    let (label, expected) = case
+    assert_eq(compute(case), expected, "case {label}")
+})
+```
 
 **Why explicit labels, not auto-generated names.** Two cases that stringify the same way (`(1.0, 1.0)` and `(1.0, 1.0)` from different file lines) would collide if names were auto-generated from `Display`. Forcing a label makes the case identifier deterministic and meaningful in CI logs. The two-token cost (`"label",`) is the price of unambiguous failure attribution.
 
 **Relationship to `prop_check`.** `for_each` is for **deterministic** parameterization — a fixed list of explicit cases, every one run on every test invocation. `prop_check` (§2.20) is for **random** parameterization — the runner generates inputs from the closure's parameter types and runs the body many times. Use `for_each` when the cases are known and small; use `prop_check` when the property should hold for arbitrary inputs.
+
+**Why no `subtest` primitive.** A `testing.subtest(label, fn)` HOF and a compiler-recognized `subtest "label" { }` block were both deliberated and rejected. `for_each` + multiple flat `test` blocks + helper `fn`s cover the parameterized-test design space (see §2.20 *Sub-tests and Parameterized Tests*). See [decisions/sub-tests.md](../decisions/sub-tests.md).
 
 ##### Snapshot testing — not in stdlib
 
