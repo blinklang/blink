@@ -1,8 +1,6 @@
 #!/bin/sh
 set -e
 
-# Legacy escape hatch — keep one revision's worth of fallback while the
-# archive-based bootstrap proves itself in CI.
 if [ -n "$BLINK_BOOTSTRAP_LEGACY" ]; then
     exec "$(dirname "$0")/bootstrap_legacy.sh"
 fi
@@ -48,11 +46,8 @@ cp "$ROOT_DIR/lib/std/"*.bl "$BUILD_DIR/lib/std/"
 mkdir -p "$BUILD_DIR/lib/pkg"
 cp "$ROOT_DIR/lib/pkg/"*.bl "$BUILD_DIR/lib/pkg/"
 
-# --- Gen 0: resolve a working compiler PAIR ---
-#
-# Two-stage gen0: we need both a bare blinkc (to emit gen1.c) and a
-# blink CLI (to call __build-stdlib-archive). Existing build/* are
-# preferred; otherwise host `blink` builds fresh gen0 binaries.
+# Gen 0 needs both: blinkc (emits gen1.c) and the CLI (runs
+# __build-stdlib-archive). Prefer existing build/*; else host `blink`.
 GEN0_BLINKC=""
 GEN0_BLINK=""
 if [ -f "$BUILD_DIR/blinkc" ] && [ -x "$BUILD_DIR/blink" ]; then
@@ -72,18 +67,15 @@ else
     exit 1
 fi
 
-# --- Stdlib archive (gen0 builds it; gen1+gen2 reuse) ---
 echo "Building stdlib archive..."
 "$GEN0_BLINK" __build-stdlib-archive
 
-# --- Gen 1: compile blinkc against the archive ---
 echo "Self-compiling blinkc (Gen 1)..."
 "$GEN0_BLINKC" --link-archive "$BUILD_DIR/libblink_std.h" \
     "$ROOT_DIR/src/blinkc_main.bl" "$BUILD_DIR/blinkc_gen1.c"
 cc -o "$BUILD_DIR/blinkc_gen1" "$BUILD_DIR/blinkc_gen1.c" \
     -I"$BUILD_DIR" "$BUILD_DIR/libblink_std.a" -lm -lgc -pthread -Wl,--gc-sections
 
-# --- Gen 2: same, with gen1 blinkc ---
 echo "Verifying bootstrap chain (Gen 2)..."
 "$BUILD_DIR/blinkc_gen1" --link-archive "$BUILD_DIR/libblink_std.h" \
     "$ROOT_DIR/src/blinkc_main.bl" "$BUILD_DIR/blinkc_gen2.c"
@@ -93,9 +85,8 @@ if ! diff -q "$BUILD_DIR/blinkc_gen1.c" "$BUILD_DIR/blinkc_gen2.c" > /dev/null 2
     exit 1
 fi
 
-# Archive determinism: extract monolith.o, force a rebuild, extract again,
-# and bit-compare. Tests the layer under our control (monolith.c + cc),
-# sidestepping ar/strip-nondeterminism platform variation.
+# monolith.o byte-equality across rebuilds — sidesteps platform
+# variation in `ar` itself.
 ARCH_CHECK_DIR="$BUILD_DIR/.archive-check"
 mkdir -p "$ARCH_CHECK_DIR"
 ar p "$BUILD_DIR/libblink_std.a" monolith.o > "$ARCH_CHECK_DIR/mono1.o"
