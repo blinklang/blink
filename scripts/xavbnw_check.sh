@@ -5,6 +5,14 @@
 # annotation, run `task regen` + `task test`, and report pass/fail.
 # Files are restored on EXIT so a Ctrl-C mid-iteration can't leave the
 # stdlib mutated.
+#
+# list.bl deliberately omitted: list_concat/list_slice are runtime-bridge
+# symbols (build/runtime.h provides BLINK_RT_FN blink_list_concat), and
+# method dispatch in codegen_methods.bl emits c_fn_name("list_concat")
+# expecting the bare runtime form. Stripping @module("") from list.bl
+# breaks that pairing until C-mangling is driven by node_source_module()
+# instead of the @module-as-codegen-hack — tracked by br gcec5v
+# (project:tc83pp).
 
 set -u
 
@@ -16,7 +24,6 @@ declare -A FILES=(
   ["lib/std/sb.bl"]="A — bare cross-module calls"
   ["lib/std/bytes.bl"]="A — bare cross-module calls"
   ["lib/std/num.bl"]="B — codegen_derive hardcoded literals"
-  ["lib/std/list.bl"]="C — method-dispatch lowering"
 )
 
 if ! git diff --quiet -- "${!FILES[@]}"; then
