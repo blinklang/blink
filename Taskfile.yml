@@ -57,10 +57,21 @@ tasks:
     generates:
       - '{{.BUILD_DIR}}/blink'
     cmds:
-      - '{{.BLINKC}} src/cli.bl {{.BUILD_DIR}}/cli.c'
-      - sed -i 's/blink_cli_version = "dev"/blink_cli_version = "{{.VERSION}}-dev+'"$(date +%Y%m%d%H%M%S)"'"/' {{.BUILD_DIR}}/cli.c
-      - 'cc -o {{.BUILD_DIR}}/blink {{.BUILD_DIR}}/cli.c -lm -lgc'
-      - echo "CLI built at {{.BUILD_DIR}}/blink ({{.VERSION}}-dev)"
+      - |
+        # Seed: first-ever build has no build/blink to drive __build-stdlib-archive.
+        # Bootstrap that case with a one-shot whole-program build of cli.bl.
+        if [ ! -x "{{.BUILD_DIR}}/blink" ]; then
+          {{.BLINKC}} src/cli.bl {{.BUILD_DIR}}/cli.c
+          sed -i 's/blink_cli_version = "dev"/blink_cli_version = "{{.VERSION}}-dev+'"$(date +%Y%m%d%H%M%S)"'"/' {{.BUILD_DIR}}/cli.c
+          cc -o {{.BUILD_DIR}}/blink {{.BUILD_DIR}}/cli.c -lm -lgc
+        fi
+        # Build/refresh the stdlib archive (cache-hit short-circuits).
+        {{.BUILD_DIR}}/blink __build-stdlib-archive
+        # Re-emit cli.c against the archive, then link.
+        {{.BLINKC}} --link-archive {{.BUILD_DIR}}/libblink_std.h src/cli.bl {{.BUILD_DIR}}/cli.c
+        sed -i 's/blink_cli_version = "dev"/blink_cli_version = "{{.VERSION}}-dev+'"$(date +%Y%m%d%H%M%S)"'"/' {{.BUILD_DIR}}/cli.c
+        cc -o {{.BUILD_DIR}}/blink {{.BUILD_DIR}}/cli.c -I{{.BUILD_DIR}} {{.BUILD_DIR}}/libblink_std.a -lm -lgc -pthread -Wl,--gc-sections
+        echo "CLI built at {{.BUILD_DIR}}/blink ({{.VERSION}}-dev, archive-linked)"
 
   build:
     desc: Build and install blink to ~/.local/bin/
@@ -161,9 +172,16 @@ tasks:
         fi
       - task: check-stdlib-registry
       - |
-        {{.BLINKC}} src/cli.bl {{.BUILD_DIR}}/cli.c 2>/dev/null
+        # Seed if needed, then refresh archive, then re-emit + link.
+        if [ ! -x "{{.BUILD_DIR}}/blink" ]; then
+          {{.BLINKC}} src/cli.bl {{.BUILD_DIR}}/cli.c 2>/dev/null
+          sed -i 's/blink_cli_version = "dev"/blink_cli_version = "{{.VERSION}}-dev+'"$(date +%Y%m%d%H%M%S)"'"/' {{.BUILD_DIR}}/cli.c
+          cc -o {{.BUILD_DIR}}/blink {{.BUILD_DIR}}/cli.c -lm -lgc
+        fi
+        {{.BUILD_DIR}}/blink __build-stdlib-archive
+        {{.BLINKC}} --link-archive {{.BUILD_DIR}}/libblink_std.h src/cli.bl {{.BUILD_DIR}}/cli.c 2>/dev/null
         sed -i 's/blink_cli_version = "dev"/blink_cli_version = "{{.VERSION}}-dev+'"$(date +%Y%m%d%H%M%S)"'"/' {{.BUILD_DIR}}/cli.c
-        cc -o {{.BUILD_DIR}}/blink {{.BUILD_DIR}}/cli.c -lm -lgc
+        cc -o {{.BUILD_DIR}}/blink {{.BUILD_DIR}}/cli.c -I{{.BUILD_DIR}} {{.BUILD_DIR}}/libblink_std.a -lm -lgc -pthread -Wl,--gc-sections
       - '{{.BUILD_DIR}}/blink test tests/ --parallel {{.JOBS}} --quiet'
       - |
         mkdir -p .tmp
