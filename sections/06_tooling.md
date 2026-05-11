@@ -866,6 +866,170 @@ A `defer` keyword for in-test (and general) teardown is being deliberated separa
 
 **Panel vote: 5-0** for `assert_close` library pair (Round 2; Round 1 was 3-2 with all five voters flagging the float gap). **5-0** for `for_each` library helper. **5-0** rejecting stdlib snapshot testing. **5-0** deferring `assert_panics` to a separate spec deliberation. AI/ML dissented on Q1 form (preferred a method-on-`Float` predicate over the matcher pair) before converging on the library-fn-with-inner-`assert` shape that gives both. PLT dissented on the hypothetical `defer` mechanism (separate ticket). See [DECISIONS.md](../DECISIONS.md) and [decisions/std-testing-user-api.md](../decisions/std-testing-user-api.md).
 
+#### 8.10.3 Effect mocks: `mock_clock` and `mock_env`
+
+Beyond the stateless IO capture handlers (§8.10.1), `std.testing` ships controller-style mocks for the two effects whose default-handler behavior is hostile to tests: `Time` (the real clock is nondeterministic) and `Env` (the real `env.exit` terminates the test runner).
+
+```blink
+import std.testing.{mock_clock, mock_env}
+```
+
+`mock_clock` and `mock_env` are **controller structs**, not free-fn factories. Each returns a value with both `.handler()` (to plug into `with`) and stateful methods on the controller itself. This shape is deliberately different from `capture_log` — see the *Two shapes, one rule* note below.
+
+##### `mock_clock` — deterministic `Time` handler
+
+```blink
+pub type MockClock {
+    mut now: Instant
+    mut slept: List[Duration]
+}
+
+impl MockClock {
+    pub fn handler(self) -> Handler[Time]
+    pub fn advance(self, d: Duration)
+    pub fn elapsed(self) -> List[Duration]
+}
+
+pub fn mock_clock(start: Instant) -> MockClock
+```
+
+Construct the controller with a starting instant, plug `.handler()` into a `with` block, and (optionally) `.advance(d)` the clock between calls to the code under test to drive time-based control flow:
+
+```blink
+test "retry backoff sleeps with increasing delay" {
+    let mc = mock_clock(Instant.from_epoch_secs(0))
+    with mc.handler() {
+        retry_with_backoff(fn() { Err("transient") })
+    }
+    assert_eq(mc.elapsed().len(), 3)
+    assert_eq(mc.elapsed()[0], Duration.ms(100))
+    assert_eq(mc.elapsed()[1], Duration.ms(200))
+    assert_eq(mc.elapsed()[2], Duration.ms(400))
+}
+
+test "timeout fires after configured interval" {
+    let mc = mock_clock(Instant.from_epoch_secs(0))
+    with mc.handler() {
+        let token = start_token(Duration.seconds(30))
+        mc.advance(Duration.seconds(29))
+        assert(!token.expired())
+        mc.advance(Duration.seconds(2))
+        assert(token.expired())
+    }
+}
+```
+
+**`time.read()`** returns `self.now`. **`time.sleep(d)`** appends `d` to `self.slept` and does not block. **`.advance(d)`** advances `self.now` by `d` — used by tests that need to drive a timeout, retry loop, or rate-limiter past a threshold without consuming wall-clock time. **`.elapsed()`** returns the recorded `List[Duration]` of `time.sleep` calls observed during the `with` block; tests assert on the sequence of sleeps the code under test issued.
+
+##### `mock_env` — capturing `Env` handler that does not terminate the runner
+
+```blink
+pub type MockEnv {
+    mut vars: Map[Str, Str]
+    mut writes: List[(Str, Str)]
+}
+
+impl MockEnv {
+    pub fn handler(self) -> Handler[Env]
+    pub fn set(self, name: Str, value: Str)
+    pub fn writes(self) -> List[(Str, Str)]
+}
+
+pub fn mock_env(initial: Map[Str, Str]) -> MockEnv
+```
+
+Construct with the initial environment, plug `.handler()` into a `with` block, optionally call `.set(name, value)` to mutate the environment between CUT calls, and inspect `.writes()` afterward to see what the CUT wrote:
+
+```blink
+test "loader reads DATABASE_URL with fallback" {
+    let me = mock_env(Map.from([("DATABASE_URL", "postgres://test")]))
+    with me.handler() {
+        let cfg = load_config()
+        assert_eq(cfg.db_url, "postgres://test")
+    }
+}
+
+test "CLI exits 1 on missing argument" {
+    let me = mock_env(Map.new())
+    let result = try {
+        with me.handler() {
+            run_cli([])
+        }
+    }
+    assert(result.is_err())  // exit(1) became a panic, not a process termination
+}
+
+test "setup writes log path before reload" {
+    let me = mock_env(Map.from([("LOG_PATH", "/var/log/old")]))
+    with me.handler() {
+        configure()
+        me.set("LOG_PATH", "/var/log/new")
+        reload()
+    }
+    assert_eq(me.writes().len(), 0)  // no env.set_var by CUT itself
+}
+```
+
+**Important: `mock_env`'s `Env.exit(code)` op panics with the captured code rather than terminating the process.** The real `env.exit` is non-resumable (returns `Never`) — if a test's CUT calls `env.exit(1)` and the handler auto-delegates, the test runner dies. `mock_env` papers over this in one place so every test author does not write the same five-line `let mut exit_code = -1; handler Env { ... fn exit(...) { exit_code = code; abort } }` shim. Tests that want to *observe* an exit should run the CUT inside a `try { with me.handler() { ... } }` and assert on the error.
+
+**`env.var(name)`** projects `self.vars`. **`env.vars()`** returns `self.vars` as a snapshot. **`env.set_var(name, value)`** updates `self.vars` *and* appends `(name, value)` to `self.writes` — this lets tests distinguish setup-driven environment state from environment writes performed by the CUT. `.set(name, value)` is the test-author-facing mutation that does **not** record into `.writes`; it is for staging environment changes between calls to the CUT.
+
+**`mock_env` does not currently mock `env.args()` or `env.cwd()`.** Tests that need `args` or `cwd` should either pass them in as function arguments to the CUT (preferred) or fork the controller after `mock_env`'s implementation lands — a `mock_env(initial, args: List[Str], cwd: Str)` overload is a likely follow-up if the usage signal emerges.
+
+##### Why controller structs, not free-fn factories — two shapes, one rule
+
+`capture_log` is a free-fn factory: `fn capture_log(messages: List[Str]) -> Handler[IO.Log]`. `mock_clock` and `mock_env` are controller structs returned by `mock_clock(start)` / `mock_env(initial)`. **The shapes diverge deliberately:**
+
+- **Free-fn factory for stateless sinks.** `IO.Log`, `IO.Print`, `IO.Eprint` are write-only — the test passes in a `List[Str]`, the handler appends, the test asserts on the list. There is no state to inspect beyond the captured list. The free-fn factory shape is the minimum surface that does the job.
+- **Controller struct for stateful mocks.** `Time` and `Env` have mock state that the test wants to read *and* manipulate: `mock_clock` needs `.advance(d)` to drive timeouts past thresholds; `mock_env` needs `.set(name, value)` for mid-test mutation and `.writes()` for CUT-write observation. A free-fn factory `frozen_clock(i: Instant) -> Handler[Time]` with module-level `mut` state for recording would break under nested `with` blocks (the inner `frozen_clock(t2)` would overwrite the outer `_clock_fixed`, and the outer scope's resumption would read inner time on inner exit). Per-instance struct state on the controller closes over `self`, isolating nested mocks correctly. The `Cleanup` precedent in `lib/std/testing.bl` (`type Cleanup { action: fn() -> Void }` with `impl BlockHandler for Cleanup`) proves the controller pattern is library-deliverable today.
+
+**Rule for AI generation and for adding future mocks:**
+
+> Use a free-fn factory when the mocked effect's user-facing state is exactly the captured list. Use a controller struct when the test needs to *manipulate* mock state (advance the clock, set a variable mid-test) or *observe* mock-driven state (read recorded writes) beyond the simple captured-list shape.
+
+This rule applies forward to `MockFs`, `MockNet`, `MockRand` and any future effect mocks: controllers when the test interacts with the mock during the `with` block; free-fn factories when the test only assembles the list afterward.
+
+##### Composing with `capture_log`
+
+The mocks compose with each other and with the IO capture handlers via the standard `with a, b, c` handler chain:
+
+```blink
+test "scheduled job logs progress with mocked clock and env" {
+    let mc = mock_clock(Instant.from_epoch_secs(1735689600))
+    let me = mock_env(Map.from([("BATCH_SIZE", "100")]))
+    let logs: List[Str] = []
+    with mc.handler(), me.handler(), capture_log(logs) {
+        run_scheduled_job()
+        mc.advance(Duration.hours(1))
+        run_scheduled_job()
+    }
+    assert_eq(logs.len(), 2)
+    assert(logs[0].contains("batch_size=100"))
+}
+```
+
+Each handler intercepts only its own effect; auto-delegation forwards the rest. The handler ordering follows the leftmost-wins rule from §4 — handlers earlier in the `with` clause take precedence for any effect operation either could service.
+
+##### `record_calls[E]` — rejected outright
+
+A polymorphic `record_calls[E]() -> (Handler[E], List[OpCall[E]])` was considered and rejected unanimously (6-0). Constraint #9 in `DECISIONS.md` (no effect-kinded generics in v1) makes the polymorphic version literally inexpressible — `Handler[E]` is not a value-kinded generic parameter. Per-effect surrogates (`record_log_calls`, `record_env_calls`, ...) would fragment the API and the inline pattern is shorter than the stdlib call site would be:
+
+```blink
+test "logger calls audit hook on warn-or-higher" {
+    let mut calls: List[Str] = []
+    with handler IO.Log {
+        fn log(msg: Str) { calls.push(msg) }
+    } {
+        warn_about(thing)
+    }
+    assert_eq(calls.len(), 1)
+}
+```
+
+Use the inline `handler E { fn op(...) { calls.push(...) } }` pattern at the test site when you need ad-hoc op recording for an effect the stdlib does not (yet) ship a mock for. The pattern is shorter than the corresponding `record_calls` import-and-destructure would be.
+
+**Panel vote (br j21b6c): 5-1** for shipping both `mock_clock` and `mock_env` (Round 2; Round 1 was 4-1-1 — minimalism conceded A2→A3 with the `Env.exit` footgun argument). **5-1** for central `std.testing` placement (sys dissent on binary-size compounding). **5-1 R2** for controller-struct shape on `mock_clock` (Round 2 after aiml's nesting concession; min dissent). **4-2 R2** for controller-struct shape on `mock_env` (Round 2 after web's procedural D2 disambiguation and aiml's internal-consistency concession; devops and min held D1). **6-0** rejecting `record_calls[E]`. See [DECISIONS.md](../DECISIONS.md) and [decisions/mocking-helpers-beyond-io.md](../decisions/mocking-helpers-beyond-io.md).
+
 ---
 
 ### 8.11 Token Efficiency Analysis
