@@ -22,9 +22,9 @@ the archive. Two conventions coexist:
 - **Default**: `pub fn parse(...)` in `std.json` emits as
   `blink_std_json_parse`. Module prefix is auto-applied via
   `c_fn_name` in `src/codegen_types.bl:744`.
-- **`@module("")` opt-out**: e.g. `lib/std/float.bl` and
-  `lib/std/list.bl` strip the prefix. `pub fn fabs(...)` emits as
-  `blink_fabs`. Symbol is namespaced only by the `blink_*` family
+- **`@module("")` opt-out**: e.g. `lib/std/str.bl` and
+  `lib/std/list.bl` strip the prefix. `pub fn str_len(...)` emits as
+  `blink_str_len`. Symbol is namespaced only by the `blink_*` family
   prefix.
 
 Both emit with **external C linkage** (no `static`). Trait/impl
