@@ -1569,6 +1569,13 @@ BLINK_RT_FN int blink_str_eq(const char* a, const char* b) {
 }
 #endif
 
+BLINK_RT_FN int blink_str_cmp(const char* a, const char* b);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int blink_str_cmp(const char* a, const char* b) {
+    return strcmp(a, b);
+}
+#endif
+
 BLINK_RT_FN int blink_str_contains(const char* s, const char* needle);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN int blink_str_contains(const char* s, const char* needle) {
