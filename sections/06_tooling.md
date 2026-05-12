@@ -1030,6 +1030,115 @@ Use the inline `handler E { fn op(...) { calls.push(...) } }` pattern at the tes
 
 **Panel vote (br j21b6c): 5-1** for shipping both `mock_clock` and `mock_env` (Round 2; Round 1 was 4-1-1 — minimalism conceded A2→A3 with the `Env.exit` footgun argument). **5-1** for central `std.testing` placement (sys dissent on binary-size compounding). **5-1 R2** for controller-struct shape on `mock_clock` (Round 2 after aiml's nesting concession; min dissent). **4-2 R2** for controller-struct shape on `mock_env` (Round 2 after web's procedural D2 disambiguation and aiml's internal-consistency concession; devops and min held D1). **6-0** rejecting `record_calls[E]`. See [DECISIONS.md](../DECISIONS.md) and [decisions/mocking-helpers-beyond-io.md](../decisions/mocking-helpers-beyond-io.md).
 
+#### 8.10.4 Deterministic randomness: `--seed` and `mock_rand`
+
+Tests that call `rand.int`/`rand.float`/`rand.bytes` (the `Rand` effect, §4.3), and `prop_check` blocks that generate random inputs, are nondeterministic by default. A failure in CI cannot be reproduced locally without the inputs that triggered it. `std.testing` and the test runner together close this gap with two coupled mechanisms: a runner-level `--seed` flag for reproducing whole runs, and an in-test `mock_rand` controller for asserting on deterministic streams.
+
+##### Runner flag: `blink test --seed <u64>`
+
+```sh
+blink test --seed 0xDEADBEEFCAFE1234   # fixed seed
+blink test                              # entropy-seeded; seed printed on failure
+```
+
+The `--seed` flag accepts either a `0x`-prefixed hex literal or a decimal integer. Without `--seed`, the runner picks a fresh seed from OS entropy at the start of each invocation. In both cases the seed is the **suite seed** — it is the root from which every property test's input stream and every effect-handler installation derives a deterministic sub-seed.
+
+**Per-property sub-seed derivation.** Inside a test that uses `prop_check`, the runner does not pass the suite seed directly to the property's RNG. Instead it derives a stable per-property sub-seed:
+
+```
+sub_seed = splitmix64(suite_seed XOR siphash24(property_name))
+```
+
+The bare property name is hashed (no module prefix) so that moving a test between modules does not invalidate a reproducer. Within a binary, two `prop_check` blocks with the same `test "<name>"` are rejected by the runner — the runner emits a diagnostic listing both locations and exits with non-zero status, because A1 derivation would otherwise have them silently share a stream.
+
+Reordering tests, filtering with `--filter`, or running shards in parallel does **not** perturb any test's sub-seed — every test is reproducible in isolation given `--seed <suite> --filter '<name>'`.
+
+##### Failure output (the reproduce line)
+
+Every test failure includes the suite seed and a copy-pasteable rerun command, in both human-readable and JSON output. This is the load-bearing UX property of the design: a flaky CI failure becomes a one-line local reproducer.
+
+Human-readable form:
+
+```
+FAIL  tests/test_parser.bl::"reverse is involutive"
+  seed: 0xDEADBEEFCAFE1234
+  shrunk input: [1, 2, 2, -9]
+  rerun: blink test --seed 0xDEADBEEFCAFE1234 --filter 'reverse is involutive'
+```
+
+NDJSON form (`blink test --json`):
+
+```json
+{"event": "test_fail",
+ "name": "reverse is involutive",
+ "module": "test_parser",
+ "seed": "0xDEADBEEFCAFE1234",
+ "shrunk_input": "[1, 2, 2, -9]",
+ "reproduce": "blink test --seed 0xDEADBEEFCAFE1234 --filter 'reverse is involutive'",
+ "loc": {"file": "tests/test_parser.bl", "line": 42, "col": 3}}
+```
+
+The seed surfaces in **every** failure output mode — `--quiet`, `--json`, and color-stripped CI logs all include it. The reproduce line uses the suite seed as printed: `0x` + 16 hex digits, zero-padded.
+
+##### In-test seeded RNG: `MockRand` controller
+
+For tests that want to install a deterministic `Rand` handler in a `with` block (independent of the runner's suite seed), `std.testing` exposes a controller struct following the `mock_clock` / `mock_env` shape (see §8.10.2 sibling subsection):
+
+```blink
+pub type MockRand { mut state: U64, mut draw_count: Int }
+
+impl MockRand {
+    pub fn handler(self) -> Handler[Rand]
+    pub fn draws(self) -> Int
+    pub fn reseed(self, seed: U64)
+}
+
+pub fn mock_rand(seed: U64) -> MockRand
+```
+
+Usage:
+
+```blink
+import std.testing.{mock_rand}
+
+test "shuffle preserves length" {
+    let r = mock_rand(0x1234)
+    with r.handler() {
+        let ys = shuffle([1, 2, 3, 4, 5])
+        assert_eq(ys.len(), 5)
+    }
+    assert_eq(r.draws(), 4)
+}
+```
+
+**`.handler()` semantics.** Calling `handler()` returns a `Handler[Rand]` that mutates the controller's internal `state` in place on every `rand.int`/`rand.float`/`rand.bytes` call. The method is **idempotent**: calling `r.handler()` twice on the same `MockRand` returns two handles to the same underlying state, not two independent streams. A second `with r.handler() { ... }` block continues the stream where the first one left off. For an independent stream from the same seed, construct a second `MockRand`.
+
+**`.draws()` semantics.** Returns the number of `rand.*` operations that have been served by this handler since construction or the last `reseed`. **One op call = one draw**, regardless of how many bytes or how many random values the op produces internally (`rand.bytes(64)` counts as one draw). The `.draws()` counter is intended as a coarse audit hook — "did this code path reach the RNG?" — and is explicitly **not stable across compiler versions**: a future PRNG-algorithm change or runtime optimization may change how individual ops decompose. Do not commit regression tests that assert exact draw counts as part of the property under test; use it for shape-of-behavior checks only.
+
+**`.reseed(seed)`.** Resets `state` to the given seed and zeroes `draw_count`. Useful for sub-loops in a single test that want fresh streams without constructing a new `MockRand`.
+
+**Why a controller struct, not a free-fn handler factory.** Stateful mocks ship as controller structs in `std.testing` (the j21b6c rule, see [decisions/mocking-helpers-beyond-io.md](../decisions/mocking-helpers-beyond-io.md)) — uniform shape across `mock_clock`, `mock_env`, `mock_rand`. A free-fn `mock_rand(seed) -> Handler[Rand]` would lose the `.draws()` audit hook and break the family pattern for one effect. Authors who only want determinism and do not need draw-count introspection write `with mock_rand(seed).handler() { ... }` as a single line and discard the controller.
+
+**Why not `seeded_rng`.** The name `mock_rand` parallels `mock_clock` and `mock_env`; a parallel `seeded_rng` free-fn would split the surface across two names for one primitive without removing anything. The j21b6c rule already established "one controller per mocked effect" as the consistency invariant — `seeded_rng` is rejected on those grounds.
+
+##### PRNG algorithm
+
+`MockRand` and the runner's per-property RNG are **implementation-defined, deterministic given seed**. The current implementation uses `xoshiro256**` initialized from a `U64` seed via SplitMix64 expansion. The choice is intentionally not in the spec surface — if a future `Rand` resolution (currently tracked in br `2jersy`) names a specific generator for the production handler, the testing-side implementation will align without breaking the user-facing API. The reproduce-by-seed contract holds for any single compiler version; the spec does not guarantee bit-identical reproduction across major versions.
+
+##### Stated assumption about the `Rand` effect
+
+This design assumes the `Rand` effect (§4.3) keeps ops `rand.int` / `rand.float` / `rand.bytes` and gains no user-visible seeding op such as `rand.reseed(seed: U64)`. Seeding is a handler-installation concern — `mock_rand(seed).handler()` and `--seed`-derived runner handlers are both ways of installing a deterministic interpretation. If a future revision adds a stateful seeding op to the effect surface, `MockRand` will specify whether it traps or honors it as a follow-up.
+
+##### Out of scope
+
+The following are intentionally out of scope for this subsection and are tracked separately:
+
+- **Persisted counterexamples** (proptest-regressions-style files). A complementary mechanism to `--seed` for shrinking-stable failure replay across compiler versions.
+- **`--rerun-failed`**. Re-reads the previous run's NDJSON and replays only the failing tests at their recorded sub-seeds. Distinct from `--seed`.
+- **`unseeded_rand_in_test` lint**. Warn when a test installs the real `rand` handler without seeding.
+
+**Panel vote: 6-0** for the `MockRand` controller struct shape, `mock_rand` naming, resolving now (not deferring on `Rand` effect finalization), and SplitMix64-of-name-hash sub-seed derivation. **5-1** for shipping `--seed` (Minimalism dissent: pure-addition without removal, prefers persisted counterexamples as the reproducibility primitive). See [DECISIONS.md](../DECISIONS.md) and [decisions/test-seed-determinism.md](../decisions/test-seed-determinism.md).
+
 ---
 
 ### 8.11 Token Efficiency Analysis
@@ -1190,6 +1299,7 @@ The AI gets structured feedback — result value, type, effects actually perform
 | `blink test --prop` | Run property tests only |
 | `blink test --doc` | Run doc-tests only |
 | `blink test --coverage` | Run with coverage reporting |
+| `blink test --seed <u64>` | Fix the suite seed (hex `0x...` or decimal) for reproducible random tests (§8.10.4) |
 | `blink test --json` | Output results as structured JSON |
 | **Formatting & Style** | |
 | `blink fmt` | Format all files (canonical style) |
