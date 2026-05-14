@@ -1,0 +1,65 @@
+// Regression (br 6mxehg): formatter must preserve `\}` in string literals so
+// that strings containing matched `\{` / `\}` escapes round-trip through fmt.
+//
+// Input source contains a string literal `"a \{ b \} c"`. The formatter must
+// emit the same `\}` escape — not drop the backslash and emit a bare `}`.
+// This is required for symmetry with `\{` (which the formatter must escape so
+// the literal `{` is not re-lexed as interpolation), and for idempotency:
+// format(format(x)) MUST equal format(x).
+
+fn main() {
+    let blink_root = process_run("sh", ["-c", "pwd -P"]).out.trim_right()
+    let blinkc = "{blink_root}/build/blinkc"
+
+    let base = ".tmp/_test_fmt_brace_escape"
+    shell_exec("rm -rf {base}")
+    shell_exec("mkdir -p {base}")
+
+    // Source contains a string literal with both `\{` and `\}` escapes.
+    let src_path = "{base}/in.bl"
+    let src_body = "fn main() \{\n    let s = \"a \\\{ b \\\} c\"\n    io.println(s)\n\}\n"
+    write_file(src_path, src_body)
+
+    // Single format pass.
+    let fmt1_path = "{base}/fmt1.bl"
+    let r1 = process_run(blinkc, [src_path, fmt1_path, "--emit", "blink"])
+    if r1.exit_code != 0 {
+        io.println("FAIL: blinkc --emit blink (pass 1) exited {r1.exit_code}: {r1.out}")
+        shell_exec("rm -rf {base}")
+        return
+    }
+    let fmt1 = read_file(fmt1_path)
+
+    // Formatted output must preserve `\}` (not drop the backslash).
+    if !fmt1.contains("\\\}") {
+        io.println("FAIL: formatted output dropped `\\\}` escape — got: {fmt1}")
+        shell_exec("rm -rf {base}")
+        return
+    }
+    // And must still escape `\{` for symmetry.
+    if !fmt1.contains("\\\{") {
+        io.println("FAIL: formatted output dropped `\\\{` escape — got: {fmt1}")
+        shell_exec("rm -rf {base}")
+        return
+    }
+
+    // Idempotency: format(format(x)) == format(x).
+    let fmt2_path = "{base}/fmt2.bl"
+    let r2 = process_run(blinkc, [fmt1_path, fmt2_path, "--emit", "blink"])
+    if r2.exit_code != 0 {
+        io.println("FAIL: blinkc --emit blink (pass 2) exited {r2.exit_code}: {r2.out}")
+        shell_exec("rm -rf {base}")
+        return
+    }
+    let fmt2 = read_file(fmt2_path)
+    if fmt1 != fmt2 {
+        io.println("FAIL: formatter not idempotent")
+        io.println("pass 1: {fmt1}")
+        io.println("pass 2: {fmt2}")
+        shell_exec("rm -rf {base}")
+        return
+    }
+
+    io.println("PASS: formatter preserves `\\\}` escape and round-trips")
+    shell_exec("rm -rf {base}")
+}
