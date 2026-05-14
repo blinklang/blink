@@ -41,7 +41,7 @@ import codegen_types.{
     emitted_chain_iters, emitted_filter_iters, emitted_flat_map_iters,
     emitted_fn_names, emitted_fn_set, emitted_iter_set, emitted_iter_types,
     fn_node_has_effects,
-    fn_reg_set, cg_archive_header_mode, cg_archive_build_mode, cg_archive_object_mode, cg_blink_ev_extern_only, cg_emit_only_module, cg_module_header_guard, cg_module_object_self_header, cg_skip_modules,
+    fn_reg_set, cg_archive_header_mode, cg_archive_build_mode, cg_user_tu_mode, cg_blink_ev_extern_only, cg_emit_only_module, cg_module_header_guard, cg_module_object_self_header, cg_skip_modules,
     emitted_let_names, emitted_let_set, emitted_map_iters,
     emitted_option_set, emitted_option_types, emitted_range_iter,
     emitted_result_set, emitted_result_types, emitted_skip_iters,
@@ -279,14 +279,15 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
     debug_assert(scope_vars.len() == 0, "scope_vars not reset")
     debug_assert(scope_frame_starts.len() == 0, "scope_frame_starts not reset")
 
-    // Emission-mode tripwire. Archive modes (cg_archive_*_mode) are
-    // mutually exclusive. cg_emit_only_module composes with archive header
-    // mode (per-module .h via generate_module_header) and may also be set
-    // standalone for per-module .c emission via generate_module_object —
-    // but cg_skip_modules is archive-only.
-    let mut __arch_modes = cg_archive_header_mode + cg_archive_build_mode + cg_archive_object_mode
-    debug_assert(__arch_modes <= 1, "multiple cg_archive_*_mode set simultaneously")
-    if __arch_modes == 0 && cg_emit_only_module == "" {
+    // Emission-mode tripwire. cg_user_tu_mode, cg_archive_build_mode, and
+    // cg_archive_header_mode are mutually exclusive. cg_emit_only_module
+    // composes with archive header mode (per-module .h via
+    // generate_module_header) and may also be set standalone for per-module
+    // .c emission via generate_module_object — but cg_skip_modules is only
+    // consumed by user-TU and archive-build paths.
+    let mut __emit_modes = cg_archive_header_mode + cg_archive_build_mode + cg_user_tu_mode
+    debug_assert(__emit_modes <= 1, "multiple cg emission-mode flags set simultaneously")
+    if __emit_modes == 0 && cg_emit_only_module == "" {
         debug_assert(cg_skip_modules.len() == 0, "cg_skip_modules leaked into non-archive generate()")
     }
 
@@ -720,7 +721,11 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
         cg_lines.push("#ifndef {guard}")
         cg_lines.push("#define {guard}")
     }
-    if cg_archive_header_mode != 0 || cg_archive_object_mode != 0 || cg_archive_build_mode != 0 || cg_emit_only_module != "" {
+    // User TU, archive monolith build, archive header pass, and per-module
+    // passes all share runtime globals via the archive monolith TU. The
+    // legacy standalone path (blinkc without --link-archive) emits its own
+    // runtime storage inline and so leaves the extern flag unset.
+    if cg_user_tu_mode != 0 || cg_archive_header_mode != 0 || cg_archive_build_mode != 0 || cg_emit_only_module != "" {
         cg_lines.push("#define BLINK_USE_EXTERN_RUNTIME_STORAGE 1")
     }
     // Per-module: __main__.c owns runtime storage (defines globals); other
@@ -729,7 +734,7 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
     if cg_archive_build_mode != 0 || owns_runtime_storage {
         cg_lines.push("#define BLINK_RUNTIME_STORAGE_DEFINE 1")
     }
-    if cg_archive_object_mode != 0 {
+    if cg_user_tu_mode != 0 {
         cg_lines.push("#include \"libblink_std.h\"")
     } else {
         cg_lines.push("#include \"runtime.h\"")
@@ -903,9 +908,9 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
             cg_lines.push("    return ev;")
             cg_lines.push("\}")
             cg_lines.push("")
-            // archive-object mode and per-module-object mode for the owner
-            // both require non-static so peer TUs' `extern` resolves.
-            if cg_archive_object_mode != 0 || in_per_module_object() {
+            // User TU and per-module-object mode for the owner both require
+            // non-static so peer TUs' `extern` resolves.
+            if cg_user_tu_mode != 0 || in_per_module_object() {
                 cg_lines.push("blink_ev __blink_ev;")
             } else {
                 cg_lines.push("static blink_ev __blink_ev;")
@@ -1051,14 +1056,14 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
         // metadata so cross-module receivers resolve their value type.
         // Non-pub stdlib lets are file-local in monolith.o (no symbol to
         // extern-link to), so they're filtered out via stdlib_private.
-        let needs_foreign_extern = cg_archive_object_mode != 0 || in_per_module_object()
+        let needs_foreign_extern = cg_user_tu_mode != 0 || in_per_module_object()
         i = 0
         while i < sublist_length(lets_sl) {
             let let_node = sublist_get(lets_sl, i)
             let let_name = node_name(let_node)
             let let_mod = node_source_module(let_node)
             let mod_is_skipped = skip_module(let_mod)
-            let stdlib_private = cg_archive_object_mode != 0 && is_stdlib_source_module(let_mod) && node_is_pub(let_node) == 0
+            let stdlib_private = cg_user_tu_mode != 0 && is_stdlib_source_module(let_mod) && node_is_pub(let_node) == 0
             let extern_only = if needs_foreign_extern && mod_is_skipped && !stdlib_private { 1 } else { 0 }
             if is_emitted_let(let_name) == 0 && extern_only != 0 {
                 emit_top_level_let(let_node, extern_only)
@@ -1312,7 +1317,7 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
             let fn_mod = node_module(fn_node)
             let fn_src_mod = node_source_module(fn_node)
             let fn_is_effectful = fn_is_archive_excluded(fn_node)
-            let fn_keep_for_user = cg_archive_object_mode != 0 && fn_is_effectful
+            let fn_keep_for_user = cg_user_tu_mode != 0 && fn_is_effectful
             if skip_module(fn_src_mod) && !fn_keep_for_user {
                 i = i + 1
                 continue
@@ -1461,7 +1466,7 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
                 i = i + 1
                 continue
             }
-            let fn_keep_for_user_d = cg_archive_object_mode != 0 && fn_is_eff_d
+            let fn_keep_for_user_d = cg_user_tu_mode != 0 && fn_is_eff_d
             if skip_module(fn_src_mod_d) && !fn_keep_for_user_d {
                 i = i + 1
                 continue
@@ -1805,7 +1810,7 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
         // Stdlib init must run before user init: user globals may
         // reference stdlib state (e.g. construct lists whose ctors hit
         // stdlib helpers).
-        if cg_archive_object_mode != 0 {
+        if cg_user_tu_mode != 0 {
             emit_line("__blink_init_stdlib_globals();")
         }
         // Per-module-object mode: dispatch each module's init in module
