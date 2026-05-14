@@ -114,6 +114,22 @@ A char literal must contain exactly one Unicode scalar value; `''` (empty) and `
 
 **Context-sensitive interpolation.** When an interpolated string literal appears where `Template[C]` is expected (e.g., `db.query_one("SELECT * FROM users WHERE id = {id}")`), the compiler extracts `{expr}` as bound parameters instead of concatenating. The *receiving type* determines behavior: `{id}` in a `Str` context is concatenation, `{id}` in a `Template[DB]` context is parameterization. No new string syntax is needed — the same `"..."` literal does the right thing based on where it appears. See section 3.12 for details.
 
+**Backticks are literal.** Backtick characters (`` ` ``) have **no special meaning** inside `"..."` or `#"..."#`. They are ordinary characters, even when used in markdown-style code spans inside test names or docstrings. Interpolation rules apply uniformly — a `{` inside a backtick-quoted region of a string still triggers interpolation. For strings that contain code snippets with literal `{` characters, write either:
+
+```blink
+// Short inline span — use \{ to escape the brace:
+test "pool usage: `with pool.scoped() \{ pg.query(...) }`" {
+    assert(true)
+}
+
+// Prose-heavy span — use #"..."# (extended delimiter), where { is literal:
+test #"pool usage: `with pool.scoped() { pg.query(...) }`"# {
+    assert(true)
+}
+```
+
+When the compiler fails to parse an interpolation expression inside `"..."`, the diagnostic suggests both `\{` and `#"..."#` as alternatives. **Panel vote: 6-0** to reject backtick-suppression (would break `Template[C]` hole-bijection and add unbounded-distance lexer state). **3-2-1 soft consensus** on docs + targeted diagnostic over docs-only or docs + lint warning. See [DECISIONS.md](../DECISIONS.md).
+
 #### 2.4.1 Compile-Time Intrinsics (`#`)
 
 Blink uses the `#` prefix for **compile-time intrinsics** — expressions evaluated by the compiler during compilation, not at runtime. The `#` sigil visually distinguishes compile-time evaluation from runtime function calls, following Swift's precedent (`#file`, `#line`, `#embed`).

@@ -268,6 +268,7 @@ Decided by expert panel vote. See [OPEN_QUESTIONS.md](OPEN_QUESTIONS.md) for ful
 | Char → Str conversion | `From[Char] for Str` + `Char.to_str()` named method. Infallible | 5-0 |
 | List pattern matching | `[pattern, ...]` in match, wildcard-only rest (no binding), length-based exhaustiveness with mandatory catch-all | 5-0 patterns, 4-1 wildcard rest |
 | Extended delimiter strings | `#"..."#` with `#{expr}` interpolation. `"` and `\` literal inside. Adjustable `#` depth (max 3). Same `Str` type. Parametric extension, not second syntax | 5-0 |
+| Backticks in string literals | Backticks have no special meaning inside `"..."` or `#"..."#` — ordinary characters, no interpolation suppression. Use `\{` for inline literal `{`; use `#"..."#` for prose with many literal `{`. Targeted diagnostic on interp-parse-failure suggests both | 6-0 Q1 reject suppression; 3-2-1 soft consensus β (β/γ/α) Q2 |
 | Inline module blocks | No `mod name { }`. File = Module is absolute (§10.1.1). `mod` keyword reserved but unused. Separate files for sub-modules | 4-1 (Web: file-scoped namespaces) |
 | Native dep manifest declaration | `[native-dependencies]` section in `blink.toml` for user `@ffi` C libraries. `@ffi` without manifest entry is compile error | 5-0 |
 | Cross-compilation linking | Static by default for cross-targets (vendored source), dynamic for host. `link = "dynamic"` override available | 5-0 |
@@ -380,6 +381,7 @@ Full deliberation records for each decision. Each file contains expert votes, re
 | Char Conversions | [decisions/char-conversions.md](decisions/char-conversions.md) |
 | List Pattern Matching | [decisions/list-pattern-matching.md](decisions/list-pattern-matching.md) |
 | Inline String Escape (Extended Delimiters) | [decisions/inline-string-escape.md](decisions/inline-string-escape.md) |
+| Backticks in String Literals | [decisions/backticks-in-strings.md](decisions/backticks-in-strings.md) |
 | Inline Module Blocks | [decisions/inline-module-blocks.md](decisions/inline-module-blocks.md) |
 | Native C Dependency Resolution | [decisions/native-c-dependency-resolution.md](decisions/native-c-dependency-resolution.md) |
 | Mutation Analysis Suppression | [decisions/mutation-analysis-suppression.md](decisions/mutation-analysis-suppression.md) |
