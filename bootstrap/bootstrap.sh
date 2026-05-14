@@ -76,29 +76,35 @@ echo "Self-compiling blinkc (Gen 1)..."
 cc -o "$BUILD_DIR/blinkc_gen1" "$BUILD_DIR/blinkc_gen1.c" \
     -I"$BUILD_DIR" "$BUILD_DIR/libblink_std.a" -lm -lgc -pthread -Wl,--gc-sections
 
-echo "Verifying bootstrap chain (Gen 2)..."
+echo "Self-compiling blinkc (Gen 2)..."
 "$BUILD_DIR/blinkc_gen1" --link-archive "$BUILD_DIR/libblink_std.h" \
     "$ROOT_DIR/src/blinkc_main.bl" "$BUILD_DIR/blinkc_gen2.c"
 
-if ! diff -q "$BUILD_DIR/blinkc_gen1.c" "$BUILD_DIR/blinkc_gen2.c" > /dev/null 2>&1; then
-    echo "ERROR: Bootstrap verification failed — Gen 1 and Gen 2 .c differ!" >&2
-    exit 1
-fi
-
-# monolith.o byte-equality across rebuilds — sidesteps platform
-# variation in `ar` itself.
+# Compare extracted member bytes — `ar` member timestamps make raw .a
+# comparison flaky.
 ARCH_CHECK_DIR="$BUILD_DIR/.archive-check"
 mkdir -p "$ARCH_CHECK_DIR"
-ar p "$BUILD_DIR/libblink_std.a" monolith.o > "$ARCH_CHECK_DIR/mono1.o"
+ar p "$BUILD_DIR/libblink_std.a" monolith.o > "$ARCH_CHECK_DIR/mono_gen1.o"
+
 BLINK_FORCE_STDLIB_REBUILD=1 "$GEN0_BLINK" __build-stdlib-archive
-ar p "$BUILD_DIR/libblink_std.a" monolith.o > "$ARCH_CHECK_DIR/mono2.o"
-if ! cmp "$ARCH_CHECK_DIR/mono1.o" "$ARCH_CHECK_DIR/mono2.o" > /dev/null 2>&1; then
-    echo "ERROR: stdlib archive monolith.o is not deterministic across rebuilds!" >&2
+ar p "$BUILD_DIR/libblink_std.a" monolith.o > "$ARCH_CHECK_DIR/mono_gen2.o"
+
+fail=0
+if ! diff -q "$BUILD_DIR/blinkc_gen1.c" "$BUILD_DIR/blinkc_gen2.c" > /dev/null 2>&1; then
+    echo "  blinkc_gen1.c != blinkc_gen2.c" >&2
+    fail=1
+fi
+if ! cmp -s "$ARCH_CHECK_DIR/mono_gen1.o" "$ARCH_CHECK_DIR/mono_gen2.o"; then
+    echo "  libblink_std.a:monolith.o not deterministic" >&2
+    fail=1
+fi
+if [ "$fail" -ne 0 ]; then
+    echo "ERROR: gen1/gen2 invariant failed" >&2
     exit 1
 fi
 rm -rf "$ARCH_CHECK_DIR"
 
-echo "Bootstrap verified — self-compilation is stable."
+echo "Bootstrap verified — (blinkc.c, monolith.o) pair stable across gen1/gen2."
 rm -f "$BUILD_DIR/blinkc"
 cp "$BUILD_DIR/blinkc_gen1" "$BUILD_DIR/blinkc"
 rm -f "$BUILD_DIR/blinkc_gen0" "$BUILD_DIR/blink_gen0" \
