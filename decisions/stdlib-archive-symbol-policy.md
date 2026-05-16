@@ -16,27 +16,23 @@ and what the orchestrator must respect.
 
 ### 1. Symbol naming follows existing codegen rules unchanged
 
-Stdlib functions emit with the same names today as they will inside
-the archive. Two conventions coexist:
+Stdlib functions emit with names derived from the source file path.
+`pub fn parse(...)` in `lib/std/json.bl` emits as
+`blink_std_json_parse`. The module prefix is auto-applied via
+`c_fn_name` (driven by `node_source_module()` in
+`src/codegen_types.bl`).
 
-- **Default**: `pub fn parse(...)` in `std.json` emits as
-  `blink_std_json_parse`. Module prefix is auto-applied via
-  `c_fn_name` in `src/codegen_types.bl:744`.
-- **`@module("")` opt-out**: e.g. `lib/std/str.bl` and
-  `lib/std/list.bl` strip the prefix. `pub fn str_len(...)` emits as
-  `blink_str_len`. Symbol is namespaced only by the `blink_*` family
-  prefix.
+Bridges to runtime C helpers use `@ffi("blink_<name>")` to route a
+Blink-source declaration to a bare runtime symbol — e.g. `lib/std/str.bl`'s
+`str_len` is `@ffi("blink_str_len")` and dispatches to the runtime
+`blink_str_len` defined in `bootstrap/runtime_core.h`.
 
-Both emit with **external C linkage** (no `static`). Trait/impl
-methods follow the same rules via `c_fn_name`. The archive does
-nothing special — it simply collects the same symbols the
-whole-program build would have produced.
-
-**Implication**: collisions across `@module("")` modules would silently
-clobber. Today no two `@module("")` stdlib modules share a function
-name. The orchestrator runs `nm libblink_std.a | sort | uniq -c` and
-fails the build if any symbol appears more than once. Cheap insurance
-against future stdlib additions that violate the convention.
+All Blink-source pub fns emit with **external C linkage** (no
+`static`). Trait/impl methods follow the same rules via `c_fn_name`.
+The archive does nothing special — it simply collects the same
+symbols the whole-program build would have produced. The orchestrator
+runs `nm libblink_std.a | sort | uniq -c` and fails the build if any
+symbol appears more than once.
 
 ### 2. Generic monomorphizations are owned by the monolith `.o`
 
