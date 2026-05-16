@@ -585,14 +585,90 @@ User code is **forbidden** from constructing a `Ptr[U8]` that aliases a `Bytes`'
 The sanctioned paths for Bytes ↔ FFI interop are:
 
 1. `Bytes.with_ptr(fn(p) { ... })` — closure-scoped, in-stdlib `! FFI` use only.
-2. `libc.copy_to_buf(b: Bytes) -> Buf[U8]` — copies bytes into a freshly-allocated `Buf[U8]`. (`Buf` is reserved for a future N-cell typed buffer; in v1 the result is opaque.)
-3. `libc.copy_from_buf(buf: Buf[U8]) -> Bytes` — copies bytes out of a `Buf[U8]` into a fresh `Bytes`.
+2. `libc.copy_to_buf(b: Bytes) -> Buf[U8]` — copies bytes into a freshly-allocated, scope-tied `Buf[U8]`. See §9.1.3.2 for the runtime representation, surface, and naming rules.
+3. `libc.copy_from_buf(buf: Buf[U8]) -> Bytes` — copies bytes out of a `Buf[U8]` into a fresh `Bytes`. The byte count is read from the buffer's internal length field.
+4. `libc.copy_from_buf_n(buf: Buf[U8], n: I64) -> Bytes` — truncating copy: copies up to `n` bytes (or fewer if the buffer is shorter) into a fresh `Bytes`. Used by syscalls whose return value reports the actual byte count (`read(2)`, `recv(2)`).
 
 The copies are the soundness witness: bytes cross the firewall, addresses do not. The cost is one `memcpy` per call; high-throughput byte-payload bindings (`read`, `write`, `recv`, `send`) avoid it by using `with_ptr` directly.
 
 ##### Why the bridge is forbidden in user code
 
 Two reasons. First, `Bytes.data` is `GC_MALLOC`/`GC_REALLOC`-managed (see `bootstrap/runtime_core.h:146-174`); a `Ptr[U8]` aliasing it is invalidated by any growth-effecting call on the source `Bytes`, and the panel rejected the alias analysis required to detect such a call across helper boundaries. Second, the language goal is preserving the moving-GC migration option as a future possibility — keeping `Ptr` and `Buf` from naming GC-managed memory in user code makes that migration mechanical rather than ABI-breaking.
+
+##### 9.1.3.2 `Buf[T]` runtime representation
+
+Resolves the v1 ambiguity in §9.1.3 about what `Buf` actually *is*. Decided by panel deliberation [`buf-u8-runtime-representation`](../decisions/buf-u8-runtime-representation.md).
+
+**One generic type.** `Buf[T]^σ` is a single generic nominal type, σ-tagged to the enclosing `ffi.scope` (same region calculus as §9.1.3's `Ptr[T]^σ`). The typechecker accepts any `T` at declaration sites inside `@ffi.fn` and `@ffi.struct`. There is no separate `Buf[U8]` sibling type.
+
+**Bridge alphabet.** A spec-encoded, closed set of element types — `{U8}` in v1 — is permitted to flow through the byte-bridge primitives (`copy_to_buf`, `copy_from_buf`, `copy_from_buf_n`). The bridge alphabet is a property of the **language version**, not of stdlib version, and is not user-extensible. Expanding the bridge alphabet is a language-version change requiring panel deliberation.
+
+**Sealed user surface.** `Buf[T]^σ` has no public methods. Specifically:
+
+- No `.len()` (length lives in the runtime struct and is read by bridge primitives only).
+- No `.as_ptr()`, `.read(i)`, `.write(i, v)`.
+- No public constructors. The only ways to obtain a `Buf[T]^σ` are `libc.copy_to_buf(b)` (returning `Buf[U8]^σ`) and `scope.alloc_n[T](n)` (returning `Buf[T]^σ`, §9.1.3).
+
+**Runtime representation.** A `Buf[T]^σ` value is a pointer to a heap-allocated struct of the shape:
+
+```c
+typedef struct {
+    void*  data;     /* malloc'd, sizeof(T) * len bytes */
+    int64_t len;     /* element count, not byte count */
+    int64_t cap;     /* element capacity */
+} blink_buf_t;
+```
+
+The struct and its `data` payload are `malloc`'d (not GC-managed), registered with the enclosing `ffi.scope`, and freed in LIFO order on scope unwind. No finalizer is registered; lifetime is purely lexical.
+
+**Nameability — the V3 carve-out.** Whether `Buf` can be named in source depends on the syntactic context:
+
+| Context | Naming `Buf[T]` |
+|---|---|
+| `@ffi.fn` parameter and return types | **Legal** |
+| `@ffi.struct` field types | **Legal** |
+| Inferred `let` binding (`let b = libc.copy_to_buf(bs)`) | **Legal** (the type is computed by the typechecker, never written) |
+| Annotated `let` / `var` binding (`let b: Buf[U8] = ...`) | **Error `E0822`** |
+| Function parameter or return type in user Blink code | **Error `E0822`** |
+| Struct field type in user Blink code | **Error `E0822`** |
+| Generic parameter bound | **Error `E0822`** |
+
+`E0822` fires only on user-authored references to the name `Buf` outside the `@ffi.fn` / `@ffi.struct` surface. Help text directs the user to `libc.recv_bytes` / `libc.read_bytes` / `libc.getentropy_bytes` (for byte-payload syscalls) or `scope.alloc_n[T]` (for typed regions).
+
+**Source-deterministic warning `W0816`.** When a `Buf[T]` appears in an `@ffi.fn` signature or `@ffi.struct` field for a `T` outside the bridge alphabet, the compiler emits:
+
+```
+W0816: Buf[i32] declared in @ffi.fn signature; the byte-bridge primitives
+       only accept Buf[U8] in language v1. For a typed scope-tied region
+       use `scope.alloc_n[i32](n)` instead.
+```
+
+`W0816` is **source-deterministic**: it depends only on `(source, language-version)`, not on stdlib version. The bridge alphabet is the language-version-encoded set; stdlib helpers do not influence the warning. Help text never says "wait for v2" — the workaround is `scope.alloc_n[T]`, which is the working answer indefinitely.
+
+`W0816` is per-declaration suppressible with `@allow(W0816)`. Suppression at a binding-author's discretion is expected for vendored bindings that intentionally use a non-`U8` element type for typed-region work.
+
+**Curated `libc.*_bytes` helpers — the primary user-facing API.** Most user code never names `Buf`. The recommended path is:
+
+```blink
+let bs = libc.recv_bytes(fd, 4096)?       // Bytes-in, Bytes-out
+let entropy = libc.getentropy_bytes(32)?  // no fd, no Buf, no scope
+let chunk = libc.read_bytes(fd, 8192)?    // read up to 8192 bytes
+```
+
+These wrap `copy_to_buf` / `copy_from_buf_n` internally inside an `ffi.scope`. The v1 minimum wrapper set is panel-ratified; growth of this set is governed by demonstrated high-frequency Bytes-in/Bytes-out usage in stdlib or audited third-party code.
+
+**Audit category.** `blink audit` reports a `bytes-bridge` category with two subcategories:
+
+- `bridge-call` — call sites of `copy_to_buf` / `copy_from_buf` / `copy_from_buf_n`.
+- `buf-mention` — any source mention of `Buf` (legally, inside `@ffi.fn` / `@ffi.struct`).
+
+CI may use `blink build --no-unaudited-bridges` to require every `bytes-bridge` subcategory entry outside `lib/std/` to be approved by `blink audit approve`.
+
+**Doc / LSP.** `blink doc` and the LSP hover for `Buf[T]^σ` render a fixed banner:
+
+> **Opaque, σ-tagged, bridge-only.**
+> `Buf[T]^σ` is a region-tied buffer used by FFI bridge primitives.
+> User code should prefer `libc.*_bytes` helpers; for typed regions, use `scope.alloc_n[T]`.
 
 #### Static layout assertions
 
@@ -640,7 +716,9 @@ For C surfaces β cannot reach (varargs, signal handlers, glibc-version-conditio
 | `E0814` | error | growth-effecting call on `Bytes` inside its `with_ptr` closure body |
 | `E0815` | error | pinned `Bytes` passed as argument inside `with_ptr` closure body |
 | `E0817` | error | `Bytes` ↔ `Ptr[U8]` cast or `as_ptr` use in user code (use `with_ptr`, `libc.copy_to_buf`, or `libc.copy_from_buf`) |
+| `E0822` | error | `Buf` named in user Blink-typed code outside `@ffi.fn` / `@ffi.struct` declarations (§9.1.3.2) |
 | `W0812` | warning | `@ffi.struct` declared without canonical header in `[native-dependencies].headers`; escalated to error under `--strict-struct-layout` (default-on for `@ffi` modules) |
+| `W0816` | warning | `Buf[T]` declared in `@ffi.fn` / `@ffi.struct` for `T` outside the v1 bridge alphabet `{U8}`; redirects to `scope.alloc_n[T]` (§9.1.3.2). Per-decl suppressible with `@allow(W0816)`. |
 
 `E0601` (existing) gains two sub-kinds for the σ-tag/scope-escape interactions raised by `Ptr` aliasing across `ffi.scope` boundaries:
 
