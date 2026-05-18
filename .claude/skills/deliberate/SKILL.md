@@ -195,6 +195,11 @@ Write the new spec content into the appropriate `sections/*.md` file:
 ### Bridge Task
 - Close the br task: `br close <id>`.
 
+### Implementation ticket
+- File a `type:project` (or `type:feature` if it's narrow enough for one PR) ticket in `br` to implement the resolved spec. Title: `Implement: <feature> (<spec-ticket-id> spec)`. Description: list the spec sections that govern, the components that need changes (typecheck / codegen / stdlib / runner / docs / tests), and any "concerns" the panel raised in Phase C that the implementation must address (e.g. regression fixtures, sealing invariants, lowering hygiene).
+- The deliberation closes the *spec* gap; implementation is a separate workstream. Without an impl ticket the spec sits unimplemented and the ticket queue loses sight of it.
+- If the resolved decision is "reject" or "do nothing" (no code change required), skip this step — note in Step 12 that no impl is needed.
+
 ### DECISIONS.md
 1. **Resolved Questions table** — Add a row in the existing table format:
    ```
@@ -270,7 +275,8 @@ Summarize what changed:
 - The decision and vote (R1 only or R1 + R2).
 - Which files were modified and where.
 - Any downstream impacts on other unresolved gaps.
-- Any follow-up `br` tickets filed (deferred sub-questions, implementation tickets, ship-gate verifications, etc.).
+- The implementation `br` ticket filed in Step 10 (required unless the decision was "reject / do nothing").
+- Any other follow-up `br` tickets filed (deferred sub-questions, ship-gate verifications, sibling improvements raised during deliberation, etc.).
 - Suggested next gap to deliberate.
 
 ---

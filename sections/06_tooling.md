@@ -644,18 +644,38 @@ blink test --json
     },
     {
       "name": "login rejects after rate limit",
-      "status": "fail",
+      "status": "failed",
+      "cause": "assertion",
       "assertion": "assert_eq(result, Err(RateLimit))",
       "expected": "Err(RateLimit)",
       "actual": "Ok(AuthSuccess { ... })",
       "span": {"file": "src/auth.bl", "line": 58, "col": 5}
+    },
+    {
+      "name": "connect and query",
+      "status": "failed",
+      "cause": "propagated_error",
+      "error": {
+        "message": "connection refused: 127.0.0.1:5432",
+        "error_type": "pg.ConnectError"
+      },
+      "span": {"file": "src/db_test.bl", "line": 12, "col": 21}
     }
   ],
-  "summary": {"total": 14, "pass": 13, "fail": 1, "duration_ms": 340}
+  "summary": {"total": 14, "passed": 12, "failed": 2, "duration_ms": 340}
 }
 ```
 
 The AI reads structured test failures the same way it reads structured compiler errors — exact location, expected vs actual values, no string parsing.
+
+**Failure `cause` discriminator.** Records with `"status": "failed"` carry a `cause` field whose value is one of a closed enum:
+
+| `cause` value | Meaning |
+|--------------|---------|
+| `"assertion"` | An `assert*` built-in failed. The record carries `assertion`, `expected`/`actual`, and `introspection` fields (§2.20 Assertion Failure Output). |
+| `"propagated_error"` | The test body returned `Err(TestError { ... })` via `?` propagation (§2.20 Error Propagation). The record carries an `error` object with `message` (the `Display`-rendered error string) and `error_type` (the static name of the source error type at the `?` site). |
+
+`"status": "panicked"` and `"status": "skipped"` records have no `cause` field — the status itself identifies the path. The four top-level statuses (`passed | failed | panicked | skipped`) remain unchanged.
 
 ```sh
 blink test                       # run all tests

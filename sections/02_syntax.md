@@ -1187,6 +1187,74 @@ Pure-by-default enables the compiler to safely parallelize test execution — te
 
 **Panel vote: 5-0 unanimous** for pure by default. See [DECISIONS.md](../DECISIONS.md).
 
+#### Error Propagation: `?` in Test Bodies
+
+A test body may use the `?` operator on `Result[T, E]` or `Option[T]` without an explicit return-type annotation. When `?` appears anywhere in the body, the compiler implicitly elaborates the test body's return type to `Result[Void, TestError]`. The surface form (`test "name" { body }`) is unchanged — no annotation is written, none is permitted (see [DECISIONS.md](../DECISIONS.md)).
+
+```blink
+test "connect and query" {
+    let conn = pg.connect(url)?
+    let row = pg.query(conn, "SELECT 1")?
+    assert_eq(row.get_int(0), 1)
+}
+```
+
+`TestError` is a sealed stdlib type carrying a rendered error message plus diagnostic context:
+
+```blink
+pub type TestError {
+    message: Str,
+    error_type: Str,
+    origin: SourceLocation,
+}
+```
+
+`TestError` is opaque to user code — it cannot be pattern-matched on, constructed, or extended. The runner is its sole consumer.
+
+**Lowering.** At each `?` site inside a test body, the `Err(e)` arm of the desugar (§3c.2 Rule 2) is rewritten to invoke `Display.display(e)` and return `Err(TestError { ... })`. For an operand of type `Result[T, E]`, the lowering is:
+
+```blink
+// expr? where expr : Result[T, E] inside a test body desugars to:
+match expr {
+    Ok(val) => val
+    Err(e) => return Err(TestError {
+        message: Display.display(e),
+        error_type: "<static name of E>",
+        origin: <span of `?`>,
+    })
+}
+```
+
+For `Option[T]` operands, the lowering is identical except the `None` arm produces a `TestError` whose `message` is `"None"` and `error_type` is `"Option"`. Allocation occurs only on the error path; passing tests pay zero cost for this elaboration.
+
+**`Display` is required at each `?` site.** If `E` does not implement `Display`, the test fails to compile with E0512 pointing at the `?` site. This is the same rule the compiler uses for `?` outside tests under the exact-structural-match constraint (§3c.2 Rule 4): the test author must guarantee the error type can be rendered. The diagnostic suggests deriving or implementing `Display` for `E`.
+
+**Hygiene.** The elaborated return type is internal to the test grammar form. User code cannot name it, dot into it, or observe it from outside. The runner is the sole caller of a test body and consumes the elaborated `Result[Void, TestError]` directly.
+
+**Composition with HOFs.** Closures passed to `for_each`, `prop_check`, and similar higher-order functions follow the normal `?` rules from §3c.2 — the closure's own return type governs whether `?` is valid inside it, **not** the enclosing test body. A closure that uses `?` must itself return `Result[T, E]` or `Option[T]`:
+
+```blink
+test "all rows parse" {
+    for_each([("a", "1"), ("b", "2")], fn(case) {
+        let (label, raw) = case
+        // E0508: `?` inside a closure returning Void.
+        // Fix: change closure return to Result, or call .unwrap() / match.
+        let n = parse_int(raw)?
+        assert_eq(n.to_str().len(), 1, label)
+    })
+}
+```
+
+The fix is to lift fallible work out of the closure or change the closure's return type. Test-body elaboration does **not** propagate inward into nested closures.
+
+**Composition with `with`, `skip()`, panics, assertions.** `?` propagating an `Err` is one of the **catchable unwinds** of §4.6.3 — it runs `BlockHandler.exit(false)` and `Closeable.close()` on the way out, identical to assertion failure and `skip()`. Doc-tests are compiled as ordinary tests and obey the same rule.
+
+**Validation symmetry.** `blink check` and `blink test` apply the same elaboration rule — `?` is valid in a test body iff the body would type-check after the implicit `Result[Void, TestError]` elaboration. The two pipelines never disagree.
+
+**Failure rendering.** A test that returns `Err(TestError { ... })` produces NDJSON `status: "failed"` with a new `cause` discriminator field (see §8.10 Runner Output). The `cause` enum is closed: `"assertion" | "propagated_error"`. Power-assert introspection is not applied to `?`-propagated errors (there is no source `assert(...)` to decompose); the `TestError.message` field provides the rendered context.
+
+**Panel vote: 6-0 (Q1, Q2, Q3, Q4, Q6), 5-1 (Q5: aiml dissent on rejecting the annotation form).** See [decisions/test-block-question-mark.md](../decisions/test-block-question-mark.md).
+
 #### Built-in Assertions
 
 Four assertion functions are compiler built-ins, available in any test block without import:
@@ -1497,6 +1565,7 @@ Doc-tests verify that documentation stays in sync with implementation. They are 
 - `test` is a keyword — first-class syntax, not a macro or library
 - Test names are static `Str` literals (no interpolation)
 - Pure by default — no implicit effects. Use `with` handlers for effectful tests
+- `?` operator is valid inside a test body — the body is implicitly elaborated to `Result[Void, TestError]`. `TestError` is sealed; `Display[E]` is required at each `?` site. No annotation form (`test "name" -> Result[...] { }`) exists or will be added
 - Four built-in assertions: `assert`, `assert_eq`, `assert_ne`, `assert_matches`
 - All assertions accept an optional trailing `Str` message for context
 - `assert_matches` takes a pattern (not an expression) as its second argument

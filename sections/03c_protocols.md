@@ -436,6 +436,8 @@ fn load_user(id: Int) -> Result[User, AppError] ! DB {
 
 **Why type checking, not codegen.** `?` validation requires type information (is this a Result or Option? what are its type parameters?). Placing validation in the type checking phase ensures codegen only processes fully-validated programs, matching the phase gate architecture (§6.3). Invalid `?` usage that reaches codegen previously generated broken C output — the type checker eliminates this entire class of bugs. (Vote: 5-0.)
 
+**`?` inside test bodies.** A `test "..." { body }` block has no written return type, but `?` is permitted inside its body. The compiler implicitly elaborates the body to `Result[Void, TestError]` whenever any `?` appears, and rewrites each `Err`/`None` arm to render via `Display[E]` into a sealed `TestError` carrier. `Display[E]` is required at every `?` site (E0512 if missing). The same elaboration rule applies in both `blink check` and `blink test`. See §2.20 *Error Propagation: `?` in Test Bodies* for the full lowering; closures passed to higher-order functions (`for_each`, `prop_check`) do **not** inherit this elaboration and continue to obey Rules 2 and 3 against their own return types. (Vote: 6-0 implicit elaboration, 6-0 `TestError` carrier shape, 5-1 explicit reject of annotation form.)
+
 ---
 
 ### 3c.3 Numeric Conversions
