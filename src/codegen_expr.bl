@@ -8,7 +8,7 @@ import codegen_types.{
     cg_arena_expr_prev_stack, cg_arena_expr_tmp_stack,
     cg_async_scope_counter, cg_async_scope_stack,
     cg_closure_cap_count, cg_closure_cap_start, cg_closure_defs,
-    cg_current_fn_has_ev, cg_current_fn_name, cg_current_fn_node, cg_current_fn_option_inner, cg_current_fn_option_inner_struct, cg_current_fn_ret,
+    cg_current_fn_has_ev, cg_current_fn_name, cg_current_fn_node, cg_current_fn_option_inner, cg_current_fn_option_inner_struct, cg_current_fn_ret, cg_in_test_body,
     cg_let_target_ann,
     cg_debug_mode, cg_handler_body_field, cg_handler_body_idx,
     cg_handler_body_is_ue, cg_handler_body_vtable_type,
@@ -174,6 +174,24 @@ fn emit_ok_result(ok_str: Str, ok_type: Int, err_type: Int, ok_s: Str, err_s: St
         expr_result_ok_struct = ""
         expr_result_err_struct = ""
     }
+}
+
+// Struct/enum err types fall back to a placeholder until Display lands (br 4q2etk).
+fn test_render_err_message(err_ct: Int, err_struct: Str, err_expr: Str) -> Str ! Codegen.Emit {
+    if err_ct == CT_STRING || err_ct == CT_INT || err_ct == CT_FLOAT || err_ct == CT_BOOL || err_ct == CT_CHAR {
+        return coerce_to_c_str(err_expr, err_ct)
+    }
+    let tag = if err_struct != "" { err_struct } else { "<error>" }
+    "\"<{tag}>\""
+}
+
+fn test_err_type_display_name(err_ct: Int, err_struct: Str) -> Str {
+    if err_ct == CT_STRING { return "Str" }
+    if err_ct == CT_INT { return "Int" }
+    if err_ct == CT_BOOL { return "Bool" }
+    if err_ct == CT_FLOAT { return "Float" }
+    if err_struct != "" { return err_struct }
+    "<error>"
 }
 
 fn set_bare_none_struct_result(inner_tag: Str) {
@@ -1564,7 +1582,32 @@ fn emit_unaryop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag
     } else if op == "?" {
         let tmp = fresh_temp("__res")
         if operand_type == CT_RESULT {
-            if cg_current_fn_ret != CT_RESULT {
+            if cg_in_test_body != 0 {
+                // Spec §2.20: test body using `?` is elaborated to
+                // Result[Void, TestError]; propagation runs cleanup via
+                // longjmp into the test runner (same path as assert_fail).
+                // Render the error value to a string for NDJSON `error.message`.
+                let rok = expr_result_ok_type
+                let rerr = expr_result_err_type
+                let rok_s = expr_result_ok_struct
+                let rerr_s = expr_result_err_struct
+                let res_c = result_c_type_mixed(rok, rerr, rok_s, rerr_s)
+                emit_line("{res_c} {tmp} = {operand_str};")
+                let qm_line = node_line(node)
+                let qm_col = node_col(node)
+                let err_msg_expr = test_render_err_message(rerr, rerr_s, "{tmp}.err")
+                let err_type_name = test_err_type_display_name(rerr, rerr_s)
+                emit_line("if ({tmp}.tag == 1) __blink_test_propagate_result({err_msg_expr}, \"{err_type_name}\", \"{diag_source_file}\", {qm_line}, {qm_col});")
+                expr_result_str = "{tmp}.ok"
+                if rok_s != "" {
+                    expr_result_type = CT_INT
+                    set_var_struct(expr_result_str, rok_s)
+                } else {
+                    expr_result_type = rok
+                }
+                expr_result_ok_struct = ""
+                expr_result_err_struct = ""
+            } else if cg_current_fn_ret != CT_RESULT {
                 diag_error_at("QuestionMarkResultInNonResult", QM_RESULT_IN_NON_RESULT, "'?' on Result in function '{cg_current_fn_name}' which does not return Result", node, "change the return type to Result")
                 diag_set_last_fix("replace", "-> Result[T, E]")
                 expr_result_str = "0"
@@ -1623,7 +1666,40 @@ fn emit_unaryop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag
                 expr_result_err_struct = ""
             }
         } else if operand_type == CT_OPTION {
-            if cg_current_fn_ret != CT_OPTION {
+            if cg_in_test_body != 0 {
+                // Spec §2.20: test-scope ? on Option None propagates with
+                // a fixed message="None" / error_type="Option" TestError.
+                let opt_inner = expr_option_inner
+                let opt_inner_s = expr_option_inner_struct
+                if opt_inner_s != "" {
+                    let opt_c = struct_option_c_type(opt_inner_s)
+                    emit_line("{opt_c} {tmp} = {operand_str};")
+                } else {
+                    let inner = if opt_inner >= 0 { opt_inner } else { CT_INT }
+                    let opt_c = option_c_type(inner)
+                    emit_line("{opt_c} {tmp} = {operand_str};")
+                }
+                let qm_line = node_line(node)
+                let qm_col = node_col(node)
+                emit_line("if ({tmp}.tag == 0) __blink_test_propagate_result(\"None\", \"Option\", \"{diag_source_file}\", {qm_line}, {qm_col});")
+                if opt_inner_s != "" {
+                    let inner_c = c_type_from_tag(opt_inner_s)
+                    if inner_c.ends_with("*") {
+                        expr_result_str = "{tmp}.value"
+                        expr_result_type = opt_inner
+                    } else {
+                        expr_result_str = "(*{tmp}.value)"
+                        expr_result_type = CT_INT
+                        set_var_struct(expr_result_str, opt_inner_s)
+                    }
+                } else {
+                    let inner = if opt_inner >= 0 { opt_inner } else { CT_INT }
+                    expr_result_str = "{tmp}.value"
+                    expr_result_type = inner
+                }
+                expr_option_inner = -1
+                expr_option_inner_struct = ""
+            } else if cg_current_fn_ret != CT_OPTION {
                 diag_error_at("QuestionMarkOptionInNonOption", QM_OPTION_IN_NON_OPTION, "'?' on Option in function '{cg_current_fn_name}' which does not return Option", node, "change the return type to Option")
                 diag_set_last_fix("replace", "-> Option[T]")
                 expr_result_str = "0"

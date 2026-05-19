@@ -26,6 +26,12 @@ BLINK_UNUSED static char __blink_test_fail_intro[BLINK_PA_INTRO_BUF_SIZE];
 BLINK_UNUSED static char __blink_test_fail_file[256];
 BLINK_UNUSED static int __blink_test_fail_col;
 BLINK_UNUSED static char __blink_test_fail_user_msg[256];
+/* Cause discriminator for NDJSON output. Default "assertion"; set to
+ * "propagated_error" by __blink_test_propagate_result for spec §2.20
+ * test-body `?` propagation. Reset at the start of each test iteration. */
+BLINK_UNUSED static const char* __blink_test_fail_cause = "assertion";
+BLINK_UNUSED static char __blink_test_fail_error_type[128];
+BLINK_UNUSED static char __blink_test_fail_error_message[512];
 /* Active for_each case label. Set by std.testing.for_each before invoking
  * each case body; cleared after a case returns successfully. On unwind via
  * __blink_assert_fail*, the buffer retains the failing case label so the
@@ -81,6 +87,31 @@ BLINK_UNUSED static void __blink_assert_fail_intro(const char* assertion,
     BLINK_COPY_OR_EMPTY(__blink_test_fail_intro, intro);
     BLINK_COPY_OR_EMPTY(__blink_test_fail_file, file);
     BLINK_COPY_OR_EMPTY(__blink_test_fail_user_msg, user_msg);
+    longjmp(__blink_test_jmp, 1);
+}
+
+/* Spec §2.20: a `?` in a test body propagates the operand error out of
+ * the test as a TestError-shaped failure. Codegen emits a call to this
+ * helper at each `?` site. Same setjmp-driven path as assert_fail, but
+ * the runner uses __blink_test_fail_cause to choose NDJSON shape. */
+BLINK_UNUSED static void __blink_test_propagate_result(const char* message,
+                                                       const char* error_type,
+                                                       const char* file,
+                                                       int line, int col) {
+    __blink_test_failed = 1;
+    __blink_test_fail_cause = "propagated_error";
+    BLINK_COPY_OR_EMPTY(__blink_test_fail_error_message, message);
+    BLINK_COPY_OR_EMPTY(__blink_test_fail_error_type, error_type);
+    snprintf(__blink_test_fail_msg, sizeof(__blink_test_fail_msg),
+             "propagated %s: %s",
+             (error_type && error_type[0]) ? error_type : "error",
+             (message && message[0]) ? message : "");
+    __blink_test_fail_line = line;
+    __blink_test_fail_col = col;
+    BLINK_COPY_OR_EMPTY(__blink_test_fail_file, file);
+    __blink_test_fail_assertion[0] = '\0';
+    __blink_test_fail_intro[0] = '\0';
+    __blink_test_fail_user_msg[0] = '\0';
     longjmp(__blink_test_jmp, 1);
 }
 
@@ -169,6 +200,9 @@ BLINK_UNUSED static void blink_test_run(const blink_test_entry* tests, int count
         __blink_test_fail_col = 0;
         __blink_test_fail_user_msg[0] = '\0';
         __blink_test_case_label[0] = '\0';
+        __blink_test_fail_cause = "assertion";
+        __blink_test_fail_error_type[0] = '\0';
+        __blink_test_fail_error_message[0] = '\0';
         if (setjmp(__blink_test_jmp) == 0) {
             tests[i].fn();
         }
@@ -178,6 +212,7 @@ BLINK_UNUSED static void blink_test_run(const blink_test_entry* tests, int count
                 if (total > 1) printf(",");
                 printf("{\"name\":\"%s\",\"status\":\"fail\",\"line\":%d",
                        tests[i].name, __blink_test_fail_line);
+                printf(",\"cause\":\"%s\"", __blink_test_fail_cause);
                 if (__blink_test_case_label[0]) {
                     printf(",\"case\":\"%s\"", __blink_test_json_escape(__blink_test_case_label));
                 }
@@ -190,6 +225,12 @@ BLINK_UNUSED static void blink_test_run(const blink_test_entry* tests, int count
                 }
                 if (__blink_test_fail_user_msg[0]) {
                     printf(",\"user_message\":\"%s\"", __blink_test_json_escape(__blink_test_fail_user_msg));
+                }
+                if (__blink_test_fail_error_type[0] || __blink_test_fail_error_message[0]) {
+                    printf(",\"error\":{\"message\":\"%s\"",
+                           __blink_test_json_escape(__blink_test_fail_error_message));
+                    printf(",\"error_type\":\"%s\"}",
+                           __blink_test_json_escape(__blink_test_fail_error_type));
                 }
                 if (__blink_test_fail_file[0]) {
                     printf(",\"span\":{\"file\":\"%s\",\"line\":%d,\"col\":%d}",

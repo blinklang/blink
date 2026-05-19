@@ -17,6 +17,7 @@ import diagnostics.{
     TYPE_ERROR, CAPABILITY_BUDGET, QM_INVALID_OPERAND, UNDEFINED_FUNCTION,
     UNDEFINED_VARIABLE, UNKNOWN_TYPE, QM_RESULT_IN_NON_RESULT,
     QM_OPTION_IN_NON_OPTION, QM_ERROR_MISMATCH,
+    QM_TEST_DISPLAY_REQUIRED, TEST_ANNOTATED_RETURN,
     PUB_FFI, FFI_NO_EFFECTS, CONTRACT_ON_FFI, INVALID_PTR_TYPE,
     PTR_OUTSIDE_FFI, FFI_STRUCT_GC_FIELD, BYTES_GROW_IN_WITH_PTR,
     PINNED_BYTES_ESCAPE, BYTES_PTR_CAST_FORBIDDEN,
@@ -3310,6 +3311,7 @@ fn nogrow_scan(node: Int, recv: Str, with_ptr_site: Int) ! Diag.Report {
     }
 }
 
+@allow(UnrestoredMutation, IncompleteStateRestore)
 fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     if node == -1 { return }
     let kind = node_kind(node)
@@ -3716,9 +3718,15 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                 i = i + 1
             }
         }
+        // Spec §3c.2: a closure body does not inherit the surrounding
+        // test-body elaboration. `?` inside the closure must be gated
+        // against the closure's own (or enclosing fn's) return type.
+        let saved_in_test = tc_in_test_body
+        tc_in_test_body = 0
         nr_in_closure_depth = nr_in_closure_depth + 1
         nr_check_node(node_body(node))
         nr_in_closure_depth = nr_in_closure_depth - 1
+        tc_in_test_body = saved_in_test
         nr_pop_scope()
         return
     }
@@ -4242,7 +4250,11 @@ fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repo
                 return ty_pool.get(operand).unwrap().inner1
             }
             if ok == TK_OPTION {
-                if tc_current_fn_ret >= 0 && tc_current_fn_ret < ty_pool.len() {
+                // Spec §2.20: in a test body `?` on Option is permitted —
+                // None propagates as a fixed-message TestError. The
+                // elaborated return is Result[Void, TestError] (not Option),
+                // so suppress the QM-Option-in-non-Option gate here.
+                if tc_in_test_body == 0 && tc_current_fn_ret >= 0 && tc_current_fn_ret < ty_pool.len() {
                     let ret_kind = ty_pool.get(tc_current_fn_ret).unwrap().kind
                     if ret_kind != TK_OPTION && ret_kind != TK_UNKNOWN {
                         tc_errors.push("'?' on Option in function '{tc_current_fn_name}' which does not return Option")
@@ -5116,6 +5128,211 @@ fn tc_check_pattern_types(node: Int) ! TypeCheck.Resolve {
     let _skip = 0
 }
 
+// ── Test-block elaboration (spec §2.20 ?-in-test-body) ──────────────
+//
+// A test body using `?` is implicitly elaborated to return
+// Result[Void, TestError]. The body itself has no surface return-type;
+// any `->` annotation is rejected (E0515). When `?` appears anywhere in
+// the body, tc_current_fn_ret is set to a synthetic Result[Void, TestError]
+// for the duration of the body walk so the QM gate at infer_type accepts
+// it. Otherwise the body remains void.
+
+fn tc_node_contains_question_op(node: Int) -> Int {
+    if node == -1 { return 0 }
+    let kind = node_kind(node)
+    if kind == NodeKind.UnaryOp {
+        if node_op(node) == "?" { return 1 }
+        return tc_node_contains_question_op(node_left(node))
+    }
+    if kind == NodeKind.BinOp {
+        if tc_node_contains_question_op(node_left(node)) != 0 { return 1 }
+        return tc_node_contains_question_op(node_right(node))
+    }
+    if kind == NodeKind.LetBinding {
+        if tc_node_contains_question_op(node_value(node)) != 0 { return 1 }
+        return tc_node_contains_question_op(node_target(node))
+    }
+    if kind == NodeKind.ExprStmt {
+        return tc_node_contains_question_op(node_value(node))
+    }
+    if kind == NodeKind.Return {
+        return tc_node_contains_question_op(node_value(node))
+    }
+    if kind == NodeKind.Block {
+        let stmts_sl = node_stmts(node)
+        if stmts_sl == -1 { return 0 }
+        let mut i = 0
+        while i < sublist_length(stmts_sl) {
+            if tc_node_contains_question_op(sublist_get(stmts_sl, i)) != 0 { return 1 }
+            i = i + 1
+        }
+        return 0
+    }
+    if kind == NodeKind.IfExpr {
+        if tc_node_contains_question_op(node_condition(node)) != 0 { return 1 }
+        if tc_node_contains_question_op(node_then_body(node)) != 0 { return 1 }
+        return tc_node_contains_question_op(node_else_body(node))
+    }
+    if kind == NodeKind.WhileLoop {
+        if tc_node_contains_question_op(node_condition(node)) != 0 { return 1 }
+        return tc_node_contains_question_op(node_body(node))
+    }
+    if kind == NodeKind.ForIn {
+        if tc_node_contains_question_op(node_iterable(node)) != 0 { return 1 }
+        return tc_node_contains_question_op(node_body(node))
+    }
+    if kind == NodeKind.LoopExpr {
+        return tc_node_contains_question_op(node_body(node))
+    }
+    if kind == NodeKind.WithBlock {
+        return tc_node_contains_question_op(node_body(node))
+    }
+    if kind == NodeKind.Call {
+        let args_sl = node_args(node)
+        if args_sl != -1 {
+            let mut i = 0
+            while i < sublist_length(args_sl) {
+                if tc_node_contains_question_op(sublist_get(args_sl, i)) != 0 { return 1 }
+                i = i + 1
+            }
+        }
+        return 0
+    }
+    if kind == NodeKind.MethodCall {
+        if tc_node_contains_question_op(node_obj(node)) != 0 { return 1 }
+        let args_sl = node_args(node)
+        if args_sl != -1 {
+            let mut i = 0
+            while i < sublist_length(args_sl) {
+                if tc_node_contains_question_op(sublist_get(args_sl, i)) != 0 { return 1 }
+                i = i + 1
+            }
+        }
+        return 0
+    }
+    if kind == NodeKind.MatchExpr {
+        if tc_node_contains_question_op(node_scrutinee(node)) != 0 { return 1 }
+        let arms_sl = node_arms(node)
+        if arms_sl != -1 {
+            let mut i = 0
+            while i < sublist_length(arms_sl) {
+                if tc_node_contains_question_op(node_body(sublist_get(arms_sl, i))) != 0 { return 1 }
+                i = i + 1
+            }
+        }
+        return 0
+    }
+    if kind == NodeKind.ListLit {
+        let elems_sl = node_elements(node)
+        if elems_sl == -1 { return 0 }
+        let mut i = 0
+        while i < sublist_length(elems_sl) {
+            if tc_node_contains_question_op(sublist_get(elems_sl, i)) != 0 { return 1 }
+            i = i + 1
+        }
+        return 0
+    }
+    if kind == NodeKind.TupleLit {
+        let elems_sl = node_elements(node)
+        if elems_sl == -1 { return 0 }
+        let mut i = 0
+        while i < sublist_length(elems_sl) {
+            if tc_node_contains_question_op(sublist_get(elems_sl, i)) != 0 { return 1 }
+            i = i + 1
+        }
+        return 0
+    }
+    if kind == NodeKind.StructLit {
+        let flds_sl = node_fields(node)
+        if flds_sl == -1 { return 0 }
+        let mut i = 0
+        while i < sublist_length(flds_sl) {
+            if tc_node_contains_question_op(node_value(sublist_get(flds_sl, i))) != 0 { return 1 }
+            i = i + 1
+        }
+        return 0
+    }
+    if kind == NodeKind.IndexExpr {
+        if tc_node_contains_question_op(node_obj(node)) != 0 { return 1 }
+        return tc_node_contains_question_op(node_index(node))
+    }
+    if kind == NodeKind.FieldAccess {
+        return tc_node_contains_question_op(node_obj(node))
+    }
+    if kind == NodeKind.InterpString {
+        let parts_sl = node_elements(node)
+        if parts_sl == -1 { return 0 }
+        let mut i = 0
+        while i < sublist_length(parts_sl) {
+            if tc_node_contains_question_op(sublist_get(parts_sl, i)) != 0 { return 1 }
+            i = i + 1
+        }
+        return 0
+    }
+    0
+}
+
+let mut tc_in_test_body: Int = 0
+
+@allow(UnrestoredMutation, IncompleteStateRestore)
+pub fn sanitize_test_name(name: Str) -> Str {
+    let mut out = ""
+    let mut i = 0
+    while i < name.len() {
+        let ch = name.byte_at(i)
+        if ch == 32 || ch == 95 {
+            out = out.concat("_")
+        } else if (ch >= 48 && ch <= 57) || (ch >= 65 && ch <= 90) || (ch >= 97 && ch <= 122) {
+            out = out.concat(name.substring(i, 1))
+        }
+        i = i + 1
+    }
+    out
+}
+
+@allow(UnrestoredMutation, IncompleteStateRestore)
+fn tc_check_test_block(tb: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    // Reject surface annotation (E0515). Today the parser already rejects
+    // '->' after a test header, but we re-check here so any future parser
+    // recovery path still produces the typed error.
+    let tann = node_type_ann(tb)
+    if tann != -1 {
+        diag_error_at("AnnotatedTestReturnTypeRejected", TEST_ANNOTATED_RETURN,
+            "test blocks do not declare a return type",
+            tb, "remove the '-> ...' annotation")
+    }
+
+    let tbody = node_body(tb)
+    if tbody == -1 { return }
+
+    let test_name = node_str_val(tb)
+    let sanitized = sanitize_test_name(test_name)
+    let prev_fn_name = tc_current_fn_name
+    let prev_fn_ret = tc_current_fn_ret
+    let prev_in_test = tc_in_test_body
+    tc_current_fn_name = "__test_{sanitized}"
+    tc_in_test_body = 1
+
+    if tc_node_contains_question_op(tbody) != 0 {
+        // Elaborate to Result[Void, TestError]. TestError must be visible
+        // (lib/std/testing.bl is loaded transitively for any test build).
+        let test_error_tid = resolve_type_name("TestError")
+        let err_tid = if test_error_tid != -1 { test_error_tid } else { TYPE_UNKNOWN }
+        tc_current_fn_ret = make_result_type(TYPE_VOID, err_tid)
+    } else {
+        tc_current_fn_ret = TYPE_VOID
+    }
+
+    nr_push_scope()
+    tc_check_body(tbody)
+    nr_pop_scope()
+
+    tc_current_fn_name = prev_fn_name
+    tc_current_fn_ret = prev_fn_ret
+    tc_in_test_body = prev_in_test
+}
+
+
 // ── Phase 2: Top-level driver ───────────────────────────────────────
 
 fn tc_infer_program(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
@@ -5187,6 +5404,17 @@ fn tc_infer_program(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Re
                     j = j + 1
                 }
             }
+            i = i + 1
+        }
+    }
+
+    // Type check test block bodies under elaborated return type
+    let tests_sl = node_captures(program)
+    if tests_sl != -1 {
+        nr_current_module = "__main__"
+        let mut i = 0
+        while i < sublist_length(tests_sl) {
+            tc_check_test_block(sublist_get(tests_sl, i))
             i = i + 1
         }
     }
