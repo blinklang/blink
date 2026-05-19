@@ -71,11 +71,13 @@ Strings are not bare character arrays. They are UTF-8 encoded, GC-managed, immut
 ```blink
 trait Sized {
     fn len(self) -> Int
-    fn is_empty(self) -> Bool {
+    final fn is_empty(self) -> Bool {
         self.len() == 0
     }
 }
 ```
+
+`is_empty` is `final` (§3.6 *The `final` Modifier*): it is a fixed derived view of `len`. No `impl Sized` may override it — implementors provide `len` only, and `is_empty` is mechanically derived from `len() == 0`. This guarantees that `x.is_empty()` and `x.len() == 0` always agree.
 
 For `Str`, `.len()` returns the **codepoint count** — the number of Unicode scalar values, not the number of bytes. This is O(n) for general UTF-8 (the implementation may cache the result), but it gives the semantically correct answer: `"café".len()` is `4`, not `5`.
 
@@ -1418,7 +1420,7 @@ trait Display {
 
 trait Eq {
     fn eq(self, other: Self) -> Bool
-    fn ne(self, other: Self) -> Bool {
+    final fn ne(self, other: Self) -> Bool {
         !self.eq(other)
     }
 }
@@ -1450,6 +1452,74 @@ type Ordering {
 }
 ```
 
+#### The `final` Modifier
+
+A trait may declare a default method as `final` to seal it against override. The `final` keyword is a method-level modifier on trait default methods only — it appears nowhere else in the language.
+
+```blink
+trait Eq {
+    fn eq(self, other: Self) -> Bool
+    final fn ne(self, other: Self) -> Bool {
+        !self.eq(other)
+    }
+}
+```
+
+**Default policy: overridable.** A trait default method without `final` is overridable. Any `impl` block may shadow the trait's default with an impl-site body of the same signature. The impl's body fully replaces the default at every call site for that implementing type.
+
+**Opt-in sealing.** A trait author writes `final fn name(...) { body }` to forbid override. Sealed methods route to the trait's body at every call site, regardless of which type implements the trait. Use `final` for defaults that are *definitional derivations* from required methods — bodies whose correctness depends on matching the required methods exactly. Leave defaults open when the body is a *performance-overridable adapter* (e.g., Iterator adapter defaults, §3c.1) where a concrete impl can supply a faster specialization without changing observable behavior.
+
+**Sealing requires a body.** `final` on a body-less (required) method is a parse error:
+
+```
+error[FinalRequiresBody]: `final` cannot apply to a required method
+ --> shapes.bl:3:5
+  |
+3 |     final fn area(self) -> Float
+  |     ^^^^^ `final` may only modify a default method (one with a body)
+  |
+  = help: either provide a body, or remove `final`
+```
+
+**Override semantics: replace-only.** When an open default is overridden in an `impl`, the impl's body fully replaces the default. There is no super-call mechanism to reach the original default from inside an override — Blink has no inheritance and no method-resolution-order chain to walk. To reuse the default's body, factor it into a free helper function and call that from both the default and the override.
+
+```blink
+trait Numeric {
+    fn value(self) -> Float
+    fn double(self) -> Float {           // open default
+        self.value() * 2.0
+    }
+}
+
+impl Numeric for Distance {
+    fn value(self) -> Float { self.meters }
+    fn double(self) -> Float {           // OK: replaces the default
+        self.meters * 2.0
+    }
+}
+```
+
+**Monotonic sealing under trait extension.** If `SubTrait : SuperTrait` and `SuperTrait` seals method `m`, then `SubTrait` cannot un-seal `m`, and no `impl SubTrait` may override `m`. Sealing is preserved down the supertrait chain. Strengthening an open supertrait default to `final` in a subtrait is not supported in v1 — it requires re-stating the body and creates two methods with the same name visible to impls.
+
+```
+error[SealedMethodOverride]: cannot override sealed method `ne`
+  --> ord_ext.bl:8:5
+   |
+8 |     fn ne(self, other: Self) -> Bool { ... }
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `Eq.ne` is `final` and `Ord : Eq`
+   |
+   = help: `final` defaults on supertraits remain sealed on subtraits and their impls
+```
+
+**Effect-row subtype for open overrides.** When an open default declares effect row `R_d` and an `impl` provides an override declaring row `R_o`, the typechecker requires `R_o ⊆ R_d`. An override may *narrow* the effect signature (drop effects the default declares but the override does not use) but may not *widen* it (introduce effects the default does not declare). See §4.5 *Effect Composition Rules* for the subtyping lattice. `final` defaults are effect-monomorphic at their declaration site — no override exists to widen them.
+
+**Migration: `@deprecate_override` warning hop.** Flipping a stdlib default from open to sealed is a breaking change for downstream impls. The transition path is a two-step deprecate-then-seal:
+
+1. The trait author marks the open default with `@deprecate_override`. Existing impls that override it still compile, but the compiler emits `W0731 OverrideOfDeprecatedDefault` at the override site.
+2. In the next release, `@deprecate_override` is removed and `final` is added. Override sites that ignored the warning now hit `E0731 SealedMethodOverride`.
+
+Flipping a sealed default to open is non-breaking and requires no migration.
+
 #### The `Self` Type
 
 `Self` is a built-in type alias that refers to the implementing type. It is valid in exactly two contexts:
@@ -1462,7 +1532,7 @@ Outside these contexts, `Self` is a compile error.
 ```blink
 trait Eq {
     fn eq(self, other: Self) -> Bool       // Self = the implementing type
-    fn ne(self, other: Self) -> Bool {
+    final fn ne(self, other: Self) -> Bool {
         !self.eq(other)
     }
 }
@@ -2025,6 +2095,8 @@ impl Display for Point {
 let p = Point{ x: 3, y: 4 }
 let s: Str = p.display()       // "(3, 4)"
 ```
+
+**Diagnostic: general form.** `E0731 SealedMethodOverride` is the canonical error for any attempt to override a `final` trait default — `Display.display` is the running example here, but the diagnostic shape is the same for every sealed method (`Eq.ne`, `Sized.is_empty`, and user-authored `final` defaults). The span points at the offending `fn` declaration in the `impl` block; the message names the trait and method; the help line points the reader at the method whose body the sealed default derives from (`fmt` for `Display.display`, `eq` for `Eq.ne`, `len` for `Sized.is_empty`).
 
 ```
 error[SealedMethodOverride]: cannot override sealed method `display`

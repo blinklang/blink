@@ -862,6 +862,8 @@ DB.Read + DB.Write = DB
 
 This is standard capability attenuation: you can always pass a more-powerful capability where a less-powerful one is expected, but never the reverse.
 
+**Effect rows on trait default overrides.** When a trait declares an open default method with effect row `R_d`, any `impl` block providing an override must declare a row `R_o` such that `R_o ⊆ R_d` under the lattice above. An override may *narrow* the signature (drop effects the default declares but the override does not use) but may not *widen* it (introduce effects the default does not declare). This preserves the trait's stated capability contract for every implementation: callers parameterized over `T: Trait` can rely on the trait's row as a sound upper bound on `m`'s effects across all `T`. Sealed (`final`) defaults have no override site and are therefore effect-monomorphic at their declaration. See §3.6 *The `final` Modifier* for the override-prevention semantics.
+
 ---
 
 ### 4.6 Effects on `main`

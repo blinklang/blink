@@ -710,6 +710,8 @@ fn show[T: Display](val: T) -> Str {
 
 Qualified syntax is also useful for calling a specific trait's default method, or a `final` (sealed) default whose body is fixed by the trait — like `Display.display`, which is always defined as `let sb = StringBuilder.new(); self.fmt(sb); sb.to_str()` regardless of which type implements `Display`.
 
+Qualified call is a *call-site* mechanism, not a *super-call* mechanism. Inside an `impl` block overriding an open trait default, writing `Trait.method(self, ...)` does not reach the trait's default body — it resolves to the same method the call site sees, which is the impl's override. Blink has no method-resolution-order chain to walk back through. If an override needs the default's body, factor that body into a free helper function and call the helper from both sites. See §3.6 *The `final` Modifier* for the replace-only override rule.
+
 #### Effect Handle Operations
 
 Effect handles (`io`, `db`, `fs`, `net`, `env`, `time`, `rand`, `crypto`, `process`, and user-defined effect handles) occupy a **reserved namespace** separate from local variables. When a function declares effects via `!`, the corresponding handle names are reserved within that function's scope. Local variables cannot shadow them.

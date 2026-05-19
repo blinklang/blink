@@ -86,6 +86,8 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | ArenaClosureTailUnsupported | E0702 | Closure-typed arena tail cannot be promoted (umbrella) | Arena | §5.2 |
 | ArenaClosureTailNonLiteral | E0702a | Closure-typed arena tail isn't a literal bound in this block | Arena | §5.2 |
 | ArenaClosureUnsupportedCapture | E0702d | Closure-tail capture kind unsupported by descriptor walker | Arena | §5.2 |
+| SealedMethodOverride | E0731 | `impl` overrides a trait default method declared `final` | Trait sealing | §3.6 |
+| FinalRequiresBody | E0732 | `final` modifier applied to a body-less (required) trait method | Trait sealing | §3.6 |
 | FfiFunctionPublic | E0801 | FFI function cannot be `pub` | FFI | §9.1 |
 | FfiNoEffects | E0802 | `@ffi` function declares no effects | FFI | §9.1 |
 | ContractOnFfi | E0803 | `@requires`/`@ensures` not allowed on `@ffi` function | FFI | §9.1, §3b |
@@ -157,6 +159,7 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | UnreachableCode | W0700 | Code follows an unconditional return/break/continue | Linting | §6 |
 | ArenaEffectRedundant | W0701 | `! Arena` on a function where every Arena call is already inside `with arena { }` | Arena | §5.2 |
 | BitwisePrecedence | W0702 | Bitwise `&`/`|` mixed with comparison without parentheses | Linting | §6 |
+| OverrideOfDeprecatedDefault | W0731 | `impl` overrides a trait default marked `@deprecate_override` | Trait sealing | §3.6 |
 | UnauditedFfi | W0800 | Unaudited foreign function call | FFI | §9.1 |
 | MissingCanonicalHeader | W0812 | `@ffi.struct` header not declared in blink.toml | FFI | §9.2.1 |
 | DeprecatedUsage | W2000 | Use of an item annotated `@deprecated` | Linting | §6 |
