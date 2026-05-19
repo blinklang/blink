@@ -1163,6 +1163,11 @@ pub let mut cg_let_target_ann: Int = -1
 
 pub let mut ffi_alloc_n_pending: Int = 0
 pub let mut ffi_offset_pending_struct: Str = ""
+// Origin scope binding name for the Ptr produced by the most-recent
+// scope.alloc/alloc_n/cstr. Consumed by let-binding codegen to stamp
+// ScopeVar.extra so value-escape checks can resolve the source scope.
+// "" when receiver isn't an Ident, or after scope.take(p) clears it.
+pub let mut ffi_origin_pending: Str = ""
 
 // Handler vtable metadata set by emit_handler_expr for emit_with_block / let binding
 pub let mut cg_handler_vtable_type: Str = ""
@@ -1326,12 +1331,57 @@ pub fn sv_tp(ctype: Int, inner1: Int, inner2: Int, sname: Str) -> Int {
 pub let mut scope_vars: List[ScopeVar] = []
 pub let mut scope_frame_starts: List[Int] = []
 
+// ScopeVar.extra encoding for CT_PTR vars: "struct|arr|origin"
+//   struct: @ffi.struct typedef name (or "")
+//   arr:    "n" for scope.alloc_n[T](n), "" for singleton
+//   origin: name of the `let mut s = ffi_scope()` binding the Ptr came from
+//           ("" when unknown -- e.g. parameter, scope.take(p), non-Ident receiver).
+// Backward-compatible: older two-field "struct|n" parses with origin "".
+
+fn ffi_ptr_field(extra: Str, idx: Int) -> Str {
+    // Hand-rolled split-by-pipe: avoids List allocation in a hot codegen path.
+    // Returns "" for out-of-range index. Matches Str.split("|") semantics.
+    let mut start = 0
+    let mut field = 0
+    let len = extra.len()
+    let mut i = 0
+    while i < len {
+        if extra.byte_at(i) == 124 { // '|'
+            if field == idx {
+                return extra.substring(start, i - start)
+            }
+            field = field + 1
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if field == idx {
+        return extra.substring(start, len - start)
+    }
+    ""
+}
+
+pub fn set_var_ffi_ptr_extra(name: Str, struct_name: Str, arr: Str, origin: Str) {
+    let encoded = "{struct_name}|{arr}|{origin}"
+    let mut i = scope_vars.len() - 1
+    while i >= 0 {
+        let sv = scope_vars.get(i).unwrap()
+        if sv.name == name && sv.ctype == CT_PTR {
+            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: sv.inner2, sname: sv.sname, sname2: sv.sname2, extra: encoded, tp_id: sv.tp_id })
+            return
+        }
+        i = i - 1
+    }
+}
+
 pub fn set_var_ffi_ptr_struct(name: Str, struct_name: Str) {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
         if sv.name == name && sv.ctype == CT_PTR {
-            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: sv.inner2, sname: sv.sname, sname2: sv.sname2, extra: struct_name, tp_id: sv.tp_id })
+            let arr = ffi_ptr_field(sv.extra, 1)
+            let origin = ffi_ptr_field(sv.extra, 2)
+            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: sv.inner2, sname: sv.sname, sname2: sv.sname2, extra: "{struct_name}|{arr}|{origin}", tp_id: sv.tp_id })
             return
         }
         i = i - 1
@@ -1343,11 +1393,7 @@ pub fn get_var_ffi_ptr_struct(name: Str) -> Str {
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
         if sv.name == name && sv.ctype == CT_PTR {
-            let pipe_pos = sv.extra.index_of("|")
-            if pipe_pos >= 0 {
-                return sv.extra.substr(0, pipe_pos)
-            }
-            return sv.extra
+            return ffi_ptr_field(sv.extra, 0)
         }
         i = i - 1
     }
@@ -1359,9 +1405,9 @@ pub fn set_var_ffi_ptr_array(name: Str) {
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
         if sv.name == name && sv.ctype == CT_PTR {
-            let pipe_pos = sv.extra.index_of("|")
-            let base = if pipe_pos >= 0 { sv.extra.substr(0, pipe_pos) } else { sv.extra }
-            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: sv.inner2, sname: sv.sname, sname2: sv.sname2, extra: "{base}|n", tp_id: sv.tp_id })
+            let struct_name = ffi_ptr_field(sv.extra, 0)
+            let origin = ffi_ptr_field(sv.extra, 2)
+            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: sv.inner2, sname: sv.sname, sname2: sv.sname2, extra: "{struct_name}|n|{origin}", tp_id: sv.tp_id })
             return
         }
         i = i - 1
@@ -1373,8 +1419,37 @@ pub fn is_ffi_ptr_array_var(name: Str) -> Int {
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
         if sv.name == name && sv.ctype == CT_PTR {
-            if sv.extra.index_of("|n") >= 0 { return 1 }
+            if ffi_ptr_field(sv.extra, 1) == "n" { return 1 }
             return 0
+        }
+        i = i - 1
+    }
+    0
+}
+
+pub fn get_var_ffi_ptr_origin(name: Str) -> Str {
+    let mut i = scope_vars.len() - 1
+    while i >= 0 {
+        let sv = scope_vars.get(i).unwrap()
+        if sv.name == name && sv.ctype == CT_PTR {
+            return ffi_ptr_field(sv.extra, 2)
+        }
+        i = i - 1
+    }
+    ""
+}
+
+// True iff `name` is currently bound to a CT_FFI_SCOPE in some active scope frame.
+// Used by E0601 value-escape: if a Ptr's origin tag still resolves to a live
+// FFIScope binding at the return site, the scope is local to the current
+// function and the Ptr will dangle when the function returns.
+pub fn is_local_ffi_scope_binding(name: Str) -> Int {
+    if name == "" { return 0 }
+    let mut i = scope_vars.len() - 1
+    while i >= 0 {
+        let sv = scope_vars.get(i).unwrap()
+        if sv.name == name && sv.ctype == CT_FFI_SCOPE {
+            return 1
         }
         i = i - 1
     }

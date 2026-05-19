@@ -35,8 +35,8 @@ import codegen_types.{
     builtin_receiver_type_name,
     is_sized_int_ct, lookup_builtin_trait_impl, lookup_impl_method, mangle_generic_name, mangle_from_method, wrapping_unsigned_c_type,
     option_c_type, reg_fn, register_mono_fn, register_mono_instance,
-    resolve_import_alias, resolve_ptr_inner_c, resolve_struct_from_c_name, get_var_ffi_ptr_struct, is_ffi_ptr_array_var,
-    ffi_alloc_n_pending, ffi_offset_pending_struct,
+    resolve_import_alias, resolve_ptr_inner_c, resolve_struct_from_c_name, get_var_ffi_ptr_struct, get_var_ffi_ptr_origin, is_ffi_ptr_array_var,
+    ffi_alloc_n_pending, ffi_offset_pending_struct, ffi_origin_pending,
     result_c_type, result_c_type_mixed,
     set_list_elem_struct, set_list_elem_type, set_list_nested_elem_type,
     push_scope, pop_scope,
@@ -2933,15 +2933,19 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
         }
         if method == "offset" {
             let mut struct_name = ""
+            let mut origin = ""
             if node_kind(obj_node) == NodeKind.Ident {
                 let recv_name = node_name(obj_node)
-                if is_ffi_ptr_array_var(recv_name) == 0 && get_var_ffi_ptr_struct(recv_name) != "" {
+                struct_name = get_var_ffi_ptr_struct(recv_name)
+                origin = get_var_ffi_ptr_origin(recv_name)
+                if is_ffi_ptr_array_var(recv_name) == 0 && struct_name != "" {
                     diag_error_at("FfiOffsetOnSingleton", FFI_OFFSET_ON_SINGLETON, "Ptr.offset() called on Ptr from scope.alloc[T]() — use scope.alloc_n[T](n) for arrays", node, "use scope.alloc_n[T](n) instead of scope.alloc[T]()")
                 }
-                struct_name = get_var_ffi_ptr_struct(recv_name)
             } else {
-                // Chained call (e.g. p.offset(1).offset(2)): inner offset just set ffi_offset_pending_struct
+                // Chained call (e.g. p.offset(1).offset(2)): inner offset already
+                // populated ffi_offset_pending_struct and ffi_origin_pending.
                 struct_name = ffi_offset_pending_struct
+                origin = ffi_origin_pending
             }
             if struct_name == "" {
                 diag_error_at("FfiOffsetUnknownStride", FFI_OFFSET_UNKNOWN_STRIDE, "Ptr.offset() requires a Ptr to an @ffi.struct typedef so the stride is known", node, "use a Ptr[T] where T is annotated @ffi.struct")
@@ -2953,6 +2957,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             expr_result_str = "(({inner_c}*)({obj_str}) + ({i_str}))"
             expr_result_type = CT_PTR
             ffi_offset_pending_struct = struct_name
+            ffi_origin_pending = origin
             return
         }
         if method == "to_str" {
@@ -2970,10 +2975,12 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
     }
 
     if obj_type == CT_FFI_SCOPE {
+        let scope_origin = if node_kind(obj_node) == NodeKind.Ident { node_name(obj_node) } else { "" }
         if method == "alloc" {
             let inner_c = resolve_ptr_inner_c()
             expr_result_str = "({inner_c}*)blink_ffi_scope_track({obj_str}, calloc(1, sizeof({inner_c})))"
             expr_result_type = CT_PTR
+            ffi_origin_pending = scope_origin
             return
         }
         if method == "alloc_n" {
@@ -2984,6 +2991,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             expr_result_str = "({inner_c}*)blink_ffi_scope_track({obj_str}, calloc((size_t)({n_str}), sizeof({inner_c})))"
             expr_result_type = CT_PTR
             ffi_alloc_n_pending = 1
+            ffi_origin_pending = scope_origin
             return
         }
         if method == "cstr" {
@@ -2992,6 +3000,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             let arg_str = expr_result_str
             expr_result_str = "(uint8_t*)blink_ffi_scope_track({obj_str}, blink_strdup({arg_str}))"
             expr_result_type = CT_PTR
+            ffi_origin_pending = scope_origin
             return
         }
         if method == "take" {
@@ -3000,6 +3009,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             let arg_str = expr_result_str
             expr_result_str = "blink_ffi_scope_take({obj_str}, {arg_str})"
             expr_result_type = CT_PTR
+            ffi_origin_pending = ""
             return
         }
     }

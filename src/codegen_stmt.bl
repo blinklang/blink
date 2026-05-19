@@ -51,8 +51,9 @@ import codegen_types.{
     resolve_self_type, resolve_tparam, resolve_tuple_ann, resolve_variant, result_c_type,
     result_c_type_mixed, set_list_elem_struct, set_list_elem_type,
     set_list_nested_elem_struct, set_list_nested_elem_type, set_map_types, set_map_value_list_elem, set_map_value_struct, copy_map_value_meta, set_set_elem_type,
-    find_type_def_node, set_var_ffi_ptr_struct, set_var_ffi_ptr_array,
-    ffi_alloc_n_pending, ffi_offset_pending_struct,
+    find_type_def_node, set_var_ffi_ptr_struct, set_var_ffi_ptr_array, set_var_ffi_ptr_extra,
+    get_var_ffi_ptr_origin, is_local_ffi_scope_binding,
+    ffi_alloc_n_pending, ffi_offset_pending_struct, ffi_origin_pending,
     set_var, set_var_alias, set_var_channel, set_var_closure, set_var_handle,
     set_var_handler,
     set_var_handle_full, set_var_iterator, set_var_option,
@@ -83,6 +84,7 @@ import codegen_derive.{ct_to_descriptor, desc_primary_ct, descriptor_c_type, des
 import diagnostics.{
     Diag, diag_error_at, diag_warn_at, diag_file_for_node,
     ARENA_CLOSURE_TAIL_NONLITERAL, ARENA_CLOSURE_UNSUPPORTED_CAP,
+    CLOSEABLE_ESCAPES_SCOPE,
     MISSING_CANONICAL_HEADER,
 }
 import pkg.manifest.{manifest_header_is_declared, manifest_name}
@@ -1335,6 +1337,7 @@ fn emit_block_value(block: Int) -> Str ! Codegen.Emit, Codegen.Register, Codegen
     if last_kind == NodeKind.Return {
         if node_value(last) != -1 {
             emit_expr(node_value(last))
+            check_ptr_value_escape(node_value(last))
             emit_return_with_trace(expr_result_str, cg_current_fn_ret)
         } else {
             emit_trace_exit_void()
@@ -1732,6 +1735,7 @@ fn emit_stmt(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
     if kind == NodeKind.Return {
         if node_value(node) != -1 {
             emit_expr(node_value(node))
+            check_ptr_value_escape(node_value(node))
             emit_return_with_trace(expr_result_str, cg_current_fn_ret)
         } else {
             emit_trace_exit_void()
@@ -1944,18 +1948,17 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
             let inner_ann_name = node_name(sublist_get(pelems_ann, 0))
             let inner_td = find_type_def_node(inner_ann_name)
             if inner_td != -1 && has_annotation(inner_td, "ffi.struct") != 0 {
-                set_var_ffi_ptr_struct(name, inner_ann_name)
-                if ffi_alloc_n_pending != 0 {
-                    set_var_ffi_ptr_array(name)
-                }
+                let arr = if ffi_alloc_n_pending != 0 { "n" } else { "" }
+                set_var_ffi_ptr_extra(name, inner_ann_name, arr, ffi_origin_pending)
             }
         }
     }
     if val_type == CT_PTR && ffi_offset_pending_struct != "" {
-        set_var_ffi_ptr_struct(name, ffi_offset_pending_struct)
-        set_var_ffi_ptr_array(name)
+        // Ptr.offset() forwards origin through the chain via ffi_origin_pending.
+        set_var_ffi_ptr_extra(name, ffi_offset_pending_struct, "n", ffi_origin_pending)
     }
     ffi_alloc_n_pending = 0
+    ffi_origin_pending = ""
     if val_type == CT_HANDLER {
         let mut h_vtt = cg_handler_vtable_type
         let mut h_vtf = cg_handler_vtable_field
@@ -4049,6 +4052,21 @@ fn emit_trace_exit_with_val(val_expr: Str, ret_str: Str) ! Codegen.Emit {
     emit_line("}")
 }
 
+// E0601: a Ptr minted from a locally-bound ffi_scope() must not escape the
+// function — the scope's arena frees it on return, leaving a dangling pointer.
+@allow(UnrestoredMutation)
+pub fn check_ptr_value_escape(val_node: Int) ! Diag.Report {
+    if expr_result_type != CT_PTR { return }
+    let mut origin = ffi_origin_pending
+    if origin == "" && val_node != -1 && node_kind(val_node) == NodeKind.Ident {
+        origin = get_var_ffi_ptr_origin(node_name(val_node))
+    }
+    if origin == "" { return }
+    if is_local_ffi_scope_binding(origin) == 0 { return }
+    let anchor = if val_node != -1 { val_node } else { cg_current_fn_node }
+    diag_error_at("PtrEscapesFfiScope", CLOSEABLE_ESCAPES_SCOPE, "Ptr from local ffi_scope '{origin}' cannot escape — use scope.take(p) to detach before returning", anchor, "wrap the return value in {origin}.take(...)")
+}
+
 @allow(UnrestoredMutation)
 pub fn emit_return_with_trace(val_str: Str, ret_type: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
     let mut actual_val = val_str
@@ -4484,15 +4502,19 @@ pub fn emit_fn_body(block: Int, ret_type: Int) ! Codegen.Emit, Codegen.Register,
     let last_kind = node_kind(last)
     if ret_type != CT_VOID && last_kind == NodeKind.ExprStmt {
         emit_expr(node_value(last))
+        check_ptr_value_escape(node_value(last))
         emit_return_with_trace(expr_result_str, cg_current_fn_ret)
     } else if ret_type != CT_VOID && last_kind == NodeKind.IfExpr {
         emit_if_expr(last)
+        check_ptr_value_escape(-1)
         emit_return_with_trace(expr_result_str, cg_current_fn_ret)
     } else if ret_type != CT_VOID && last_kind == NodeKind.MatchExpr {
         emit_match_expr(last)
+        check_ptr_value_escape(-1)
         emit_return_with_trace(expr_result_str, cg_current_fn_ret)
     } else if ret_type != CT_VOID && last_kind == NodeKind.WithBlock {
         emit_with_block_expr(last)
+        check_ptr_value_escape(-1)
         emit_return_with_trace(expr_result_str, cg_current_fn_ret)
     } else {
         emit_stmt(last)
