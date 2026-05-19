@@ -8,7 +8,8 @@ import codegen_types.{
     cg_arena_expr_prev_stack, cg_arena_expr_tmp_stack,
     cg_async_scope_counter, cg_async_scope_stack,
     cg_closure_cap_count, cg_closure_cap_start, cg_closure_defs,
-    cg_current_fn_has_ev, cg_current_fn_name, cg_current_fn_option_inner, cg_current_fn_ret,
+    cg_current_fn_has_ev, cg_current_fn_name, cg_current_fn_node, cg_current_fn_option_inner, cg_current_fn_option_inner_struct, cg_current_fn_ret,
+    cg_let_target_ann,
     cg_debug_mode, cg_handler_body_field, cg_handler_body_idx,
     cg_handler_body_is_ue, cg_handler_body_vtable_type,
     cg_handler_caps, HandlerCapture,
@@ -41,7 +42,7 @@ import codegen_types.{
     get_var_struct, get_var_tp, get_var_type,
     get_variant_field_count, get_variant_field_name,
     get_variant_field_type_str, get_variant_index, get_variant_tag,
-    infer_fn_type_args_from_types, is_compound_ct, is_compound_tag, is_data_enum,
+    infer_fn_type_args_from_types, is_compound_ct, is_compound_tag, is_data_enum, is_named_typedef_tag,
     is_emitted_let, is_enum_type, is_fn_registered, is_generic_fn,
     is_struct_type, is_trait_type,
     list_contains_str, list_iter_c_type, lookup_mono_base, mangle_generic_name,
@@ -175,6 +176,15 @@ fn emit_ok_result(ok_str: Str, ok_type: Int, err_type: Int, ok_s: Str, err_s: St
     }
 }
 
+fn set_bare_none_struct_result(inner_tag: Str) {
+    ensure_struct_option_type(inner_tag)
+    let opt_type = struct_option_c_type(inner_tag)
+    expr_result_str = "({opt_type})\{.tag = 0}"
+    expr_result_type = CT_OPTION
+    expr_option_inner = CT_INT
+    expr_option_inner_struct = inner_tag
+}
+
 @allow(UnrestoredMutation, IncompleteStateRestore)
 pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
     let kind = node_kind(node)
@@ -262,6 +272,8 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
                     expr_option_inner = inner_ct
                     expr_option_inner_struct = ""
                 }
+            } else if cg_current_fn_option_inner_struct != "" {
+                set_bare_none_struct_result(cg_current_fn_option_inner_struct)
             } else {
                 let none_inner = if cg_current_fn_option_inner != 0 { cg_current_fn_option_inner } else { CT_INT }
                 ensure_option_type(none_inner)
@@ -3447,6 +3459,7 @@ fn emit_struct_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
     expr_result_type = CT_STRUCT
 }
 
+@allow(UnrestoredMutation, IncompleteStateRestore)
 fn emit_tuple_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
     let elems_sl = node_elements(node)
     if elems_sl == -1 {
@@ -3455,12 +3468,55 @@ fn emit_tuple_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Di
         return
     }
     let arity = sublist_length(elems_sl)
+
+    // Plumb per-slot Option[T] target into the fn-level channels: fn return is
+    // Tuple (not Option), so cg_current_fn_option_inner stays 0 and a bare None
+    // slot would default to Option[int]. Derive parent ann from let-target or
+    // fn return-ann; per-slot override drives the bare-None branch in emit_expr.
+    let mut parent_elems_sl: Int = -1
+    if cg_let_target_ann != -1 && node_name(cg_let_target_ann) == "Tuple" {
+        let cand = node_elements(cg_let_target_ann)
+        if cand != -1 && sublist_length(cand) == arity {
+            parent_elems_sl = cand
+        }
+    }
+    if parent_elems_sl == -1 && cg_current_fn_node != -1 && node_return_type(cg_current_fn_node) == "Tuple" {
+        let ret_ann = node_type_ann(cg_current_fn_node)
+        if ret_ann != -1 {
+            let cand = node_elements(ret_ann)
+            if cand != -1 && sublist_length(cand) == arity {
+                parent_elems_sl = cand
+            }
+        }
+    }
+
+    let saved_fn_option_inner = cg_current_fn_option_inner
+    let saved_fn_option_inner_struct = cg_current_fn_option_inner_struct
     let mut val_strs: List[Str] = []
     let mut val_types: List[Int] = []
     let mut val_structs: List[Str] = []
     let mut val_compound_tags: List[Str] = []
     let mut i = 0
     while i < arity {
+        cg_current_fn_option_inner = saved_fn_option_inner
+        cg_current_fn_option_inner_struct = saved_fn_option_inner_struct
+        if parent_elems_sl != -1 {
+            let slot_ann = sublist_get(parent_elems_sl, i)
+            if node_name(slot_ann) == "Option" {
+                let slot_inner_elems = node_elements(slot_ann)
+                if slot_inner_elems != -1 && sublist_length(slot_inner_elems) >= 1 {
+                    let inner_ann = sublist_get(slot_inner_elems, 0)
+                    let inner_name = node_name(inner_ann)
+                    if is_named_typedef_tag(inner_name) != 0 {
+                        cg_current_fn_option_inner = CT_INT
+                        cg_current_fn_option_inner_struct = inner_name
+                    } else {
+                        cg_current_fn_option_inner = type_from_name(inner_name)
+                        cg_current_fn_option_inner_struct = ""
+                    }
+                }
+            }
+        }
         emit_expr(sublist_get(elems_sl, i))
         val_strs.push(expr_result_str)
         val_types.push(expr_result_type)
@@ -3508,6 +3564,8 @@ fn emit_tuple_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Di
         inits = inits.concat("._{i} = {val_strs.get(i).unwrap()}")
         i = i + 1
     }
+    cg_current_fn_option_inner = saved_fn_option_inner
+    cg_current_fn_option_inner_struct = saved_fn_option_inner_struct
     let tup_name = tuple_c_type_name(tags, arity)
     ensure_tuple_type(tup_name, arity, elem_types_enc, elem_structs_enc)
     let tmp = fresh_temp("_tup")
