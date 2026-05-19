@@ -1814,6 +1814,81 @@ This means the compiler's impl search is: for `x.foo()` where `x: T`, find all i
 
 ---
 
+#### Polymorphic Trait Implementations
+
+A polymorphic impl is parameterized over one or more type variables and may apply to a generic builtin type or to a user-defined generic type. The canonical form:
+
+```blink
+impl[T] Display for List[T] where T: Display {
+    fn fmt(self, sb: StringBuilder) ! Fmt {
+        sb.write("[")
+        let mut first = true
+        for item in self {
+            if !first { sb.write(", ") }
+            item.fmt(sb)
+            first = false
+        }
+        sb.write("]")
+    }
+}
+```
+
+The `[T]` after `impl` introduces the type parameter; the `where` clause states the bounds it must satisfy.
+
+**Compilation model: monomorphization.** Each distinct instantiation referenced in the program (`List[Int]`, `List[Str]`, `List[User]`, etc.) compiles to a separate function. The compiler substitutes the concrete type for `T` before codegen, so each instantiation has type-appropriate storage and method dispatch baked in. The linker's dead-code stripping (`--gc-sections`) removes instantiations the final binary does not call. Stdlib monomorphizations live in the stdlib archive's `monolith.o`; user-code monomorphizations live as `static inline` in each `.o` that instantiates them. See [generic-mono-ownership-per-module](../decisions/generic-mono-ownership-per-module.md) for the storage rules.
+
+**No runtime type information.** Blink exposes no `size_of[T]`, `is_pointer_kind[T]`, `TypeRepr[T]`, `align_of[T]`, or `TypeId[T]` forms — neither to user code nor as `@compiler_internal` primitives. The compiler decides layout and dispatch entirely at codegen time. Stdlib needs that require a layout query at the C level route through `@ffi` to a runtime C helper, not through a Blink intrinsic.
+
+**Parametricity (normative).** A polymorphic impl body must be **parametric in its type parameters**. The body may not:
+
+- **Dispatch on `T`'s identity.** `if T == Int { ... }`, `match T { ... }`, and equivalent constructs are compile errors.
+- **Inspect `T`'s runtime layout, size, alignment, or pointer-kind.** No `sizeof`-like form exists in the source language for type parameters.
+- **Call any function that exposes `T`'s runtime shape.** This rules out reading `T` from any reflective API.
+
+The **only legal way** for a polymorphic impl body to vary behavior based on `T` is to introduce a trait bound and call a method on that bound. `(x: T).display()` is permitted when `T: Display` — it is dispatched at monomorphization time and resolves to the bound type's `Display` impl, not to a runtime type check.
+
+```blink
+// Allowed: behavior varies via trait bound, not via T's identity
+impl[T] Sum for List[T] where T: Add[T, Output = T] + Zero {
+    fn sum(self) -> T {
+        let mut acc = T.zero()
+        for item in self {
+            acc = acc + item
+        }
+        acc
+    }
+}
+
+// Compile error: body inspects T's identity
+impl[T] Display for List[T] where T: Display {
+    fn fmt(self, sb: StringBuilder) ! Fmt {
+        if T == Int { sb.write("(ints)") }  // ERROR: cannot dispatch on T
+        // ...
+    }
+}
+```
+
+The diagnostic for a parametricity violation reads:
+
+```
+error[E0701]: cannot inspect type parameter T
+  --> mymod.bl:3:9
+   |
+3  |         if T == Int { ... }
+   |         ^^^^^^^^^^^ T's identity is not available at runtime
+   |
+   = note: user impl bodies must be parametric in T (§3.6 Polymorphic Trait
+     Implementations)
+   = help: to vary behavior based on T's properties, add a trait bound:
+     `where T: Eq` and call `(t: T).eq(other)` instead
+```
+
+**Why parametricity is normative, not just mechanical.** Monomorphization removes `T` before codegen, so a violation can't physically reach the C output. But parametricity is the *language guarantee* user code is allowed to assume about `T`, not just a consequence of how today's backend lowers generics. Spec-level enforcement preserves the compiler's freedom to change builtin layouts (e.g., niche-filled `Option[Int]`, future tagged-union changes), to add alternate backends (a `blink check` interpreter, JIT, or alternate linkage), or to evolve monomorphization strategy — none of which can silently weaken what user code is permitted to do. Without the spec rule, the first `@trusted` block or FFI shim that peeks at `T`'s lowered representation has no principled rejection, and every layout decision becomes a backward-compatibility commitment by accident.
+
+**Interaction with coherence.** Polymorphic impls follow the same orphan, overlap, and placement rules as concrete impls. `impl[T] Trait for BuiltinGeneric[T] where T: Bound` and `impl Trait for BuiltinGeneric[Int]` overlap (because `Int` satisfies any reasonable `Bound`), and the program is rejected with `error[OverlappingImpls]` — Blink does not specialize. See [Trait Coherence](#trait-coherence) above for the full rules. See [polymorphic-builtin-generic-impls](../decisions/polymorphic-builtin-generic-impls.md) for the panel rationale.
+
+---
+
 #### Compiler-Known Traits
 
 Certain traits have special meaning to the compiler. They are defined in the standard library but the compiler understands their semantics and can generate or enforce behavior based on them.
