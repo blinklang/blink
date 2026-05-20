@@ -617,6 +617,336 @@ BLINK_RT_FN void blink_map_clear(blink_map* m) {
 }
 #endif
 
+/* ── Generic hash map (kops vtable) ──────────────────────────────────── */
+/* See decisions/map-runtime-architecture.md. One runtime, per-K kops table.
+   Coexists with blink_map above during Phase 1 of h0geg9; collapsed in Phase 5. */
+
+typedef struct {
+    uint64_t (*hash)(const void* k);
+    int      (*eq)  (const void* a, const void* b);
+    size_t   key_size;     /* size of K in bytes (used when inline_key=1) */
+    uint8_t  inline_key;   /* 1 = bytes stored inline in slot; 0 = pointer slot */
+} blink_kops;
+
+/* cap is always a power of two; the probe loop wraps with `& (cap-1)`. */
+typedef struct {
+    void* keys;            /* cap * (inline_key ? key_size : sizeof(void*)) bytes */
+    void** values;
+    uint8_t* states;       /* 0=empty, 1=occupied, 2=tombstone */
+    int64_t len;
+    int64_t cap;
+    const blink_kops* kops;
+} blink_map_v2;
+
+/* `static inline` so the compiler can fold the kops->inline_key branch
+   and stride computation into the probe-loop callsites. */
+static inline size_t blink_kops_stride(const blink_kops* k) {
+    return k->inline_key ? k->key_size : sizeof(void*);
+}
+
+static inline const void* blink_map2_key_slot(const blink_map_v2* m, int64_t i, size_t stride) {
+    void* slot = (void*)((char*)m->keys + (size_t)i * stride);
+    return m->kops->inline_key ? (const void*)slot : *(const void**)slot;
+}
+
+BLINK_RT_FN blink_map_v2* blink_map2_new(const blink_kops* kops);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN blink_map_v2* blink_map2_new(const blink_kops* kops) {
+    blink_map_v2* m = (blink_map_v2*)blink_alloc(sizeof(blink_map_v2));
+    m->cap = 16;
+    m->len = 0;
+    m->kops = kops;
+    size_t stride = blink_kops_stride(kops);
+    m->keys = blink_alloc((int64_t)(stride * (size_t)m->cap));
+    m->values = (void**)blink_alloc(sizeof(void*) * (size_t)m->cap);
+    m->states = (uint8_t*)blink_alloc(sizeof(uint8_t) * (size_t)m->cap);
+    memset(m->states, 0, (size_t)m->cap);
+    return m;
+}
+#endif
+
+BLINK_RT_FN void blink_map2_grow(blink_map_v2* m);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_map2_grow(blink_map_v2* m) {
+    const blink_kops* k = m->kops;
+    int64_t old_cap = m->cap;
+    void* old_keys = m->keys;
+    void** old_values = m->values;
+    uint8_t* old_states = m->states;
+    size_t stride = blink_kops_stride(k);
+    m->cap = old_cap * 2;
+    int64_t mask = m->cap - 1;
+    m->keys = blink_alloc((int64_t)(stride * (size_t)m->cap));
+    m->values = (void**)blink_alloc(sizeof(void*) * (size_t)m->cap);
+    m->states = (uint8_t*)blink_alloc(sizeof(uint8_t) * (size_t)m->cap);
+    memset(m->states, 0, (size_t)m->cap);
+    m->len = 0;
+    for (int64_t i = 0; i < old_cap; i++) {
+        if (old_states[i] != 1) continue;
+        void* old_slot = (void*)((char*)old_keys + (size_t)i * stride);
+        const void* kptr = k->inline_key ? (const void*)old_slot : *(const void**)old_slot;
+        uint64_t h = k->hash(kptr);
+        int64_t idx = (int64_t)(h & (uint64_t)mask);
+        while (m->states[idx] != 0) idx = (idx + 1) & mask;
+        void* new_slot = (void*)((char*)m->keys + (size_t)idx * stride);
+        memcpy(new_slot, old_slot, stride);
+        m->values[idx] = old_values[i];
+        m->states[idx] = 1;
+        m->len++;
+    }
+    if (__blink_current_arena == NULL) {
+        GC_FREE(old_keys);
+        GC_FREE(old_values);
+        GC_FREE(old_states);
+    }
+}
+#endif
+
+BLINK_RT_FN void blink_map2_set(blink_map_v2* m, const void* key, void* value);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_map2_set(blink_map_v2* m, const void* key, void* value) {
+    if (m->len * 10 >= m->cap * 7) blink_map2_grow(m);
+    const blink_kops* k = m->kops;
+    size_t stride = blink_kops_stride(k);
+    int64_t mask = m->cap - 1;
+    uint64_t h = k->hash(key);
+    int64_t idx = (int64_t)(h & (uint64_t)mask);
+    int64_t first_tombstone = -1;
+    while (1) {
+        if (m->states[idx] == 0) {
+            int64_t ins = (first_tombstone >= 0) ? first_tombstone : idx;
+            void* slot = (void*)((char*)m->keys + (size_t)ins * stride);
+            if (k->inline_key) {
+                memcpy(slot, key, k->key_size);
+            } else {
+                *(const void**)slot = key;
+            }
+            m->values[ins] = value;
+            m->states[ins] = 1;
+            m->len++;
+            return;
+        }
+        if (m->states[idx] == 2) {
+            if (first_tombstone < 0) first_tombstone = idx;
+        } else {
+            const void* existing = blink_map2_key_slot(m, idx, stride);
+            if (k->eq(existing, key)) {
+                m->values[idx] = value;
+                return;
+            }
+        }
+        idx = (idx + 1) & mask;
+    }
+}
+#endif
+
+BLINK_RT_FN void* blink_map2_get(const blink_map_v2* m, const void* key);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void* blink_map2_get(const blink_map_v2* m, const void* key) {
+    const blink_kops* k = m->kops;
+    size_t stride = blink_kops_stride(k);
+    int64_t mask = m->cap - 1;
+    uint64_t h = k->hash(key);
+    int64_t idx = (int64_t)(h & (uint64_t)mask);
+    while (m->states[idx] != 0) {
+        if (m->states[idx] == 1) {
+            const void* existing = blink_map2_key_slot(m, idx, stride);
+            if (k->eq(existing, key)) return m->values[idx];
+        }
+        idx = (idx + 1) & mask;
+    }
+    return NULL;
+}
+#endif
+
+BLINK_RT_FN int64_t blink_map2_has(const blink_map_v2* m, const void* key);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int64_t blink_map2_has(const blink_map_v2* m, const void* key) {
+    const blink_kops* k = m->kops;
+    size_t stride = blink_kops_stride(k);
+    int64_t mask = m->cap - 1;
+    uint64_t h = k->hash(key);
+    int64_t idx = (int64_t)(h & (uint64_t)mask);
+    while (m->states[idx] != 0) {
+        if (m->states[idx] == 1) {
+            const void* existing = blink_map2_key_slot(m, idx, stride);
+            if (k->eq(existing, key)) return 1;
+        }
+        idx = (idx + 1) & mask;
+    }
+    return 0;
+}
+#endif
+
+BLINK_RT_FN int64_t blink_map2_remove(blink_map_v2* m, const void* key);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int64_t blink_map2_remove(blink_map_v2* m, const void* key) {
+    const blink_kops* k = m->kops;
+    size_t stride = blink_kops_stride(k);
+    int64_t mask = m->cap - 1;
+    uint64_t h = k->hash(key);
+    int64_t idx = (int64_t)(h & (uint64_t)mask);
+    while (m->states[idx] != 0) {
+        if (m->states[idx] == 1) {
+            const void* existing = blink_map2_key_slot(m, idx, stride);
+            if (k->eq(existing, key)) {
+                m->states[idx] = 2;
+                m->len--;
+                return 1;
+            }
+        }
+        idx = (idx + 1) & mask;
+    }
+    return 0;
+}
+#endif
+
+BLINK_RT_FN int64_t blink_map2_len(const blink_map_v2* m);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int64_t blink_map2_len(const blink_map_v2* m) { return m->len; }
+#endif
+
+BLINK_RT_FN void blink_map2_clear(blink_map_v2* m);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_map2_clear(blink_map_v2* m) {
+    m->len = 0;
+    memset(m->states, 0, sizeof(uint8_t) * (size_t)m->cap);
+}
+#endif
+
+/* For inline keys, allocates one bulk buffer sized `len * key_size` and pushes
+   pointers into it (avoids N small allocations on large maps). For pointer keys,
+   pushes the stored pointer directly. Caller must know K to interpret. */
+BLINK_RT_FN blink_list* blink_map2_keys(const blink_map_v2* m);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN blink_list* blink_map2_keys(const blink_map_v2* m) {
+    blink_list* result = blink_list_new();
+    const blink_kops* k = m->kops;
+    size_t stride = blink_kops_stride(k);
+    if (k->inline_key && m->len > 0) {
+        char* buf = (char*)blink_alloc((int64_t)((size_t)m->len * k->key_size));
+        size_t out = 0;
+        for (int64_t i = 0; i < m->cap; i++) {
+            if (m->states[i] != 1) continue;
+            void* slot = (void*)((char*)m->keys + (size_t)i * stride);
+            char* dst = buf + out * k->key_size;
+            memcpy(dst, slot, k->key_size);
+            blink_list_push(result, (void*)dst);
+            out++;
+        }
+    } else {
+        for (int64_t i = 0; i < m->cap; i++) {
+            if (m->states[i] != 1) continue;
+            void* slot = (void*)((char*)m->keys + (size_t)i * stride);
+            blink_list_push(result, *(void**)slot);
+        }
+    }
+    return result;
+}
+#endif
+
+BLINK_RT_FN blink_list* blink_map2_values(const blink_map_v2* m);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN blink_list* blink_map2_values(const blink_map_v2* m) {
+    blink_list* result = blink_list_new();
+    for (int64_t i = 0; i < m->cap; i++) {
+        if (m->states[i] == 1) blink_list_push(result, m->values[i]);
+    }
+    return result;
+}
+#endif
+
+/* ── Built-in kops tables ────────────────────────────────────────────── */
+
+BLINK_RT_FN uint64_t blink_kops_hash_str(const void* k);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN uint64_t blink_kops_hash_str(const void* k) {
+    return blink_map_hash((const char*)k);
+}
+#endif
+
+BLINK_RT_FN int blink_kops_eq_str(const void* a, const void* b);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int blink_kops_eq_str(const void* a, const void* b) {
+    return blink_str_eq((const char*)a, (const char*)b);
+}
+#endif
+
+/* splitmix64 finalizer — shared body for all integer widths. */
+BLINK_RT_FN uint64_t blink_kops_mix_u64(uint64_t x);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN uint64_t blink_kops_mix_u64(uint64_t x) {
+    x ^= x >> 30;
+    x *= 0xbf58476d1ce4e5b9ULL;
+    x ^= x >> 27;
+    x *= 0x94d049bb133111ebULL;
+    x ^= x >> 31;
+    return x;
+}
+#endif
+
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+static uint64_t blink_kops_hash_i64(const void* k) { return blink_kops_mix_u64((uint64_t)*(const int64_t*)k); }
+static int      blink_kops_eq_i64  (const void* a, const void* b) { return *(const int64_t*)a == *(const int64_t*)b; }
+static uint64_t blink_kops_hash_u64(const void* k) { return blink_kops_mix_u64(*(const uint64_t*)k); }
+static int      blink_kops_eq_u64  (const void* a, const void* b) { return *(const uint64_t*)a == *(const uint64_t*)b; }
+static uint64_t blink_kops_hash_i32(const void* k) { return blink_kops_mix_u64((uint64_t)(int64_t)*(const int32_t*)k); }
+static int      blink_kops_eq_i32  (const void* a, const void* b) { return *(const int32_t*)a == *(const int32_t*)b; }
+static uint64_t blink_kops_hash_u32(const void* k) { return blink_kops_mix_u64((uint64_t)*(const uint32_t*)k); }
+static int      blink_kops_eq_u32  (const void* a, const void* b) { return *(const uint32_t*)a == *(const uint32_t*)b; }
+static uint64_t blink_kops_hash_i16(const void* k) { return blink_kops_mix_u64((uint64_t)(int64_t)*(const int16_t*)k); }
+static int      blink_kops_eq_i16  (const void* a, const void* b) { return *(const int16_t*)a == *(const int16_t*)b; }
+static uint64_t blink_kops_hash_u16(const void* k) { return blink_kops_mix_u64((uint64_t)*(const uint16_t*)k); }
+static int      blink_kops_eq_u16  (const void* a, const void* b) { return *(const uint16_t*)a == *(const uint16_t*)b; }
+static uint64_t blink_kops_hash_i8 (const void* k) { return blink_kops_mix_u64((uint64_t)(int64_t)*(const int8_t*)k); }
+static int      blink_kops_eq_i8   (const void* a, const void* b) { return *(const int8_t*)a == *(const int8_t*)b; }
+static uint64_t blink_kops_hash_u8 (const void* k) { return blink_kops_mix_u64((uint64_t)*(const uint8_t*)k); }
+static int      blink_kops_eq_u8   (const void* a, const void* b) { return *(const uint8_t*)a == *(const uint8_t*)b; }
+static uint64_t blink_kops_hash_bool(const void* k) { return blink_kops_mix_u64(*(const uint8_t*)k ? 1u : 0u); }
+static int      blink_kops_eq_bool (const void* a, const void* b) { return (*(const uint8_t*)a != 0) == (*(const uint8_t*)b != 0); }
+/* Char is U32 in Blink (codepoint). */
+static uint64_t blink_kops_hash_char(const void* k) { return blink_kops_mix_u64((uint64_t)*(const uint32_t*)k); }
+static int      blink_kops_eq_char (const void* a, const void* b) { return *(const uint32_t*)a == *(const uint32_t*)b; }
+#endif
+
+/* Built-in kops tables — storage follows the same archive/extern pattern as
+   __blink_current_arena. Single-TU build (no archive): per-TU `static`. */
+#ifdef BLINK_USE_EXTERN_RUNTIME_STORAGE
+  #ifdef BLINK_RUNTIME_STORAGE_DEFINE
+    #define BLINK_KOPS_STORAGE
+  #else
+    #define BLINK_KOPS_STORAGE extern
+  #endif
+#else
+  #define BLINK_KOPS_STORAGE BLINK_UNUSED static
+#endif
+
+#if defined(BLINK_USE_EXTERN_RUNTIME_STORAGE) && !defined(BLINK_RUNTIME_STORAGE_DEFINE)
+BLINK_KOPS_STORAGE const blink_kops blink_kops_str;
+BLINK_KOPS_STORAGE const blink_kops blink_kops_i64;
+BLINK_KOPS_STORAGE const blink_kops blink_kops_u64;
+BLINK_KOPS_STORAGE const blink_kops blink_kops_i32;
+BLINK_KOPS_STORAGE const blink_kops blink_kops_u32;
+BLINK_KOPS_STORAGE const blink_kops blink_kops_i16;
+BLINK_KOPS_STORAGE const blink_kops blink_kops_u16;
+BLINK_KOPS_STORAGE const blink_kops blink_kops_i8;
+BLINK_KOPS_STORAGE const blink_kops blink_kops_u8;
+BLINK_KOPS_STORAGE const blink_kops blink_kops_bool;
+BLINK_KOPS_STORAGE const blink_kops blink_kops_char;
+#else
+BLINK_KOPS_STORAGE const blink_kops blink_kops_str  = { blink_kops_hash_str, blink_kops_eq_str, sizeof(void*), 0 };
+BLINK_KOPS_STORAGE const blink_kops blink_kops_i64  = { blink_kops_hash_i64, blink_kops_eq_i64, sizeof(int64_t), 1 };
+BLINK_KOPS_STORAGE const blink_kops blink_kops_u64  = { blink_kops_hash_u64, blink_kops_eq_u64, sizeof(uint64_t), 1 };
+BLINK_KOPS_STORAGE const blink_kops blink_kops_i32  = { blink_kops_hash_i32, blink_kops_eq_i32, sizeof(int32_t), 1 };
+BLINK_KOPS_STORAGE const blink_kops blink_kops_u32  = { blink_kops_hash_u32, blink_kops_eq_u32, sizeof(uint32_t), 1 };
+BLINK_KOPS_STORAGE const blink_kops blink_kops_i16  = { blink_kops_hash_i16, blink_kops_eq_i16, sizeof(int16_t), 1 };
+BLINK_KOPS_STORAGE const blink_kops blink_kops_u16  = { blink_kops_hash_u16, blink_kops_eq_u16, sizeof(uint16_t), 1 };
+BLINK_KOPS_STORAGE const blink_kops blink_kops_i8   = { blink_kops_hash_i8,  blink_kops_eq_i8,  sizeof(int8_t),  1 };
+BLINK_KOPS_STORAGE const blink_kops blink_kops_u8   = { blink_kops_hash_u8,  blink_kops_eq_u8,  sizeof(uint8_t), 1 };
+BLINK_KOPS_STORAGE const blink_kops blink_kops_bool = { blink_kops_hash_bool,blink_kops_eq_bool,sizeof(uint8_t), 1 };
+BLINK_KOPS_STORAGE const blink_kops blink_kops_char = { blink_kops_hash_char,blink_kops_eq_char,sizeof(uint32_t), 1 };
+#endif
+
 /* ── Hash set (string-keyed) ─────────────────────────────────────────── */
 
 typedef struct {
