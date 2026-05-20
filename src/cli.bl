@@ -149,6 +149,7 @@ fn extract_embedded_gc() -> Str {
 
 let mut ccache_checked: Int = 0
 let mut ccache_available: Int = 0
+let mut install_root_cached: Str = "<unset>"
 
 fn strip_extension(filename: Str) -> Str {
     if filename.ends_with(".bl") {
@@ -503,32 +504,43 @@ fn do_compile(source_path: Str, c_path: Str, format_flag: Str, debug_mode: Int, 
     return 0
 }
 
-// Best-effort resolution of the toolchain install root (the directory
-// whose `build/` holds the archive and whose `lib/std` holds stdlib
-// sources). Returns "" if neither $BLINK_ROOT nor the exe-dir probe
-// succeed — callers fall back to cwd-relative paths.
-//
-// The exe probe asks sh to readlink /proc/$PPID/exe — sh's parent is
-// the blink binary that just spawned us, so PPID's exe IS our exe.
+// Returns the install prefix: $BLINK_ROOT (dev wrapper sets it), or
+// realpath(argv[0]) walked up two dirs (bin/blink → prefix). "" if
+// neither resolves — callers then fall back to cwd-relative paths.
 pub fn resolve_install_root() -> Str {
+    if install_root_cached != "<unset>" {
+        return install_root_cached
+    }
     let blink_root = env.var("BLINK_ROOT") ?? ""
     if blink_root != "" {
+        install_root_cached = blink_root
         return blink_root
     }
-    let exe_result = process_run("sh", ["-c", "readlink -f /proc/$PPID/exe 2>/dev/null || echo ''"])
-    let exe_path = exe_result.out.trim()
-    if exe_path != "" {
-        return path_dirname(path_dirname(exe_path))
+    let argv0 = get_arg(0)
+    if argv0 == "" {
+        install_root_cached = ""
+        return ""
     }
-    ""
+    let resolved = process_run("readlink", ["-f", argv0])
+    let exe_path = resolved.out.trim()
+    if exe_path == "" {
+        install_root_cached = ""
+        return ""
+    }
+    install_root_cached = path_dirname(path_dirname(exe_path))
+    install_root_cached
 }
 
 pub fn resolve_archive_dir() -> Str {
     let root = resolve_install_root()
     if root != "" {
-        let candidate = path_join(root, "build/libblink_std.a")
-        if file_exists(candidate) == 1 {
+        let dev_archive = path_join(root, "build/libblink_std.a")
+        if file_exists(dev_archive) == 1 {
             return path_join(root, "build")
+        }
+        let installed_archive = path_join(root, "share/blink/libblink_std.a")
+        if file_exists(installed_archive) == 1 {
+            return path_join(root, "share/blink")
         }
     }
     "build"
