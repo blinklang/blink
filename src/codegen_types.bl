@@ -1029,11 +1029,12 @@ pub type StructInvariant {
 }
 pub let mut struct_invariants: List[StructInvariant] = []
 
-// @derive(Serialize/Deserialize/Eq/Clone) registries
+// @derive(Serialize/Deserialize/Eq/Clone/Hash) registries
 pub let mut derive_serialize_types: List[Str] = []
 pub let mut derive_deserialize_types: List[Str] = []
 pub let mut derive_eq_types: List[Str] = []
 pub let mut derive_clone_types: List[Str] = []
+pub let mut derive_hash_types: List[Str] = []
 
 pub type DeriveMethodEntry {
     type_name: Str
@@ -2727,7 +2728,14 @@ pub fn set_map_types(name: Str, key_type: Int, value_type: Int, value_name: Str)
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
         if sv.name == name && tp_get_kind(sv.tp_id) == CT_MAP {
-            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: key_type, inner2: value_type, sname: sv.sname, sname2: sv.sname2, extra: sv.extra, tp_id: sv_tp(sv.ctype, key_type, value_type, sv.sname) })
+            let prior_k_sname = tp_child1_sname(sv.tp_id)
+            let new_tp = if prior_k_sname != "" {
+                let new_v = if value_type >= 0 { sv_tp(value_type, -1, -1, sv.sname2) } else { type_int() }
+                type_map(type_struct(prior_k_sname), new_v)
+            } else {
+                sv_tp(sv.ctype, key_type, value_type, sv.sname)
+            }
+            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: key_type, inner2: value_type, sname: sv.sname, sname2: sv.sname2, extra: sv.extra, tp_id: new_tp })
             if (value_type == CT_VOID || value_type == CT_STRUCT || value_type == CT_ENUM) && value_name != "" && is_named_type(value_name) != 0 {
                 set_map_value_struct(name, value_name)
             }
@@ -2765,6 +2773,44 @@ pub fn get_map_key_type(name: Str) -> Int {
         }
     }
     CT_STRING
+}
+
+pub fn get_map_key_struct(name: Str) -> Str {
+    let mut i = scope_vars.len() - 1
+    while i >= 0 {
+        let sv = scope_vars.get(i).unwrap()
+        if sv.name == name && tp_get_kind(sv.tp_id) == CT_MAP {
+            return tp_child1_sname(sv.tp_id)
+        }
+        i = i - 1
+    }
+    if cg_closure_cap_start >= 0 {
+        let mut ci = 0
+        while ci < cg_closure_cap_count {
+            let cap = closure_captures.get(cg_closure_cap_start + ci).unwrap()
+            if cap.name == name && tp_get_kind(cap.tp_id) == CT_MAP {
+                return tp_child1_sname(cap.tp_id)
+            }
+            ci = ci + 1
+        }
+    }
+    ""
+}
+
+pub fn set_map_key_struct(name: Str, struct_name: Str) {
+    let mut i = scope_vars.len() - 1
+    while i >= 0 {
+        let sv = scope_vars.get(i).unwrap()
+        if sv.name == name && tp_get_kind(sv.tp_id) == CT_MAP {
+            let v = if sv.inner2 >= 0 { sv.inner2 } else { CT_INT }
+            let new_k = type_struct(struct_name)
+            let new_v = if v >= 0 { sv_tp(v, -1, -1, sv.sname2) } else { type_int() }
+            let new_tp = type_map(new_k, new_v)
+            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: sv.inner2, sname: sv.sname, sname2: sv.sname2, extra: sv.extra, tp_id: new_tp })
+            return
+        }
+        i = i - 1
+    }
 }
 
 pub fn get_map_value_type(name: Str) -> Int {
@@ -3830,9 +3876,11 @@ pub fn c_type_str(ct: Int) -> Str {
     else { "void" }
 }
 
-/// Return the static const blink_kops table name for a Map key CT.
-/// Phase 2b supports built-in K types only. Struct/tuple K lands in Phase 4.
-pub fn kops_table_name(ct: Int) -> Str {
+/// Return the static const blink_kops table name for a Map key.
+/// For built-in K types: references runtime tables like blink_kops_i64.
+/// For user struct K (with @derive(Hash, Eq)): references the
+/// per-type kops_<mangled> table that codegen_derive emits.
+pub fn kops_table_name(ct: Int, sname: Str) -> Str {
     if ct == CT_STRING { return "blink_kops_str" }
     if ct == CT_INT { return "blink_kops_i64" }
     if ct == CT_I8 { return "blink_kops_i8" }
@@ -3844,11 +3892,18 @@ pub fn kops_table_name(ct: Int) -> Str {
     if ct == CT_U64 { return "blink_kops_u64" }
     if ct == CT_BOOL { return "blink_kops_bool" }
     if ct == CT_CHAR { return "blink_kops_char" }
-    // Phase 4 (struct/tuple K) will add a path here; until then typecheck
-    // rejects unsupported K with E1400, so reaching this branch is an
-    // internal bug. Emit an undefined C symbol so the C compiler surfaces
-    // the kops table that codegen tried to use.
-    "BLINK_COMPILER_BUG_kops_unsupported_K_ct{ct}"
+    if sname != "" && list_contains_str(derive_hash_types, sname) != 0 {
+        return "kops_{c_type_c_name(sname)}"
+    }
+    // typecheck E1400 should have rejected unsupported K (Float/Double,
+    // or a struct without @derive(Hash)). Reaching here means typecheck
+    // and codegen disagree — emit an undefined C symbol so the C compiler
+    // surfaces the broken site.
+    "BLINK_COMPILER_BUG_kops_unsupported_K_ct{ct}_{sname}"
+}
+
+pub fn kops_is_struct_key(sname: Str) -> Bool {
+    sname != "" && list_contains_str(derive_hash_types, sname) != 0
 }
 
 /// 1 if the kops table stores keys inline (key copied into slot, e.g. integers);

@@ -1,6 +1,7 @@
 import codegen_types.{
     Codegen,
-    CT_BOOL, CT_CLOSURE, CT_FLOAT, CT_INT, CT_LIST, CT_MAP, CT_OPTION, CT_RESULT, CT_STRING, CT_STRUCT, CT_VOID,
+    CT_BOOL, CT_CHAR, CT_CLOSURE, CT_FLOAT, CT_INT, CT_LIST, CT_MAP, CT_OPTION, CT_RESULT, CT_STRING, CT_STRUCT, CT_VOID,
+    CT_I8, CT_I16, CT_I32, CT_U8, CT_U16, CT_U32, CT_U64,
     cg_indent,
     emit_line,
     fresh_temp,
@@ -14,7 +15,7 @@ import codegen_types.{
     tp_child2_kind, tp_child2_sname,
     get_variant_field_name, get_variant_field_type_str,
     derive_serialize_types, derive_deserialize_types,
-    derive_eq_types, derive_clone_types,
+    derive_eq_types, derive_clone_types, derive_hash_types,
     derive_method_entries,
     DeriveMethodEntry,
     sf_entries,
@@ -24,7 +25,7 @@ import parser.{node_args, node_handlers, node_name, sublist_get, sublist_length}
 import diagnostics.{diag_error_at, UNKNOWN_DERIVE_NAME, Diag}
 
 fn is_known_derive(name: Str) -> Bool {
-    name == "Serialize" || name == "Deserialize" || name == "Eq" || name == "Clone"
+    name == "Serialize" || name == "Deserialize" || name == "Eq" || name == "Clone" || name == "Hash"
 }
 
 pub fn register_derive_annotations(types_sl: Int) ! Diag.Report {
@@ -78,8 +79,16 @@ pub fn register_derive_annotations(types_sl: Int) ! Diag.Report {
                                     ret_type: CT_VOID
                                 })
                             }
+                            if dname == "Hash" {
+                                derive_hash_types.push(tname)
+                                derive_method_entries.push(DeriveMethodEntry {
+                                    type_name: tname,
+                                    method_name: "hash",
+                                    ret_type: CT_INT
+                                })
+                            }
                             if !is_known_derive(dname) {
-                                diag_error_at("UnknownDerive", UNKNOWN_DERIVE_NAME, "unknown @derive name '{dname}'; expected one of Serialize, Deserialize, Eq, Clone", darg, "remove or replace this derive name")
+                                diag_error_at("UnknownDerive", UNKNOWN_DERIVE_NAME, "unknown @derive name '{dname}'; expected one of Serialize, Deserialize, Eq, Clone, Hash", darg, "remove or replace this derive name")
                             }
                             di = di + 1
                         }
@@ -127,6 +136,16 @@ pub fn emit_derive_forward_decls() ! Codegen.Emit {
         emit_line("{c_type_c_name(tname)} {c_type_c_name(tname)}_clone({c_type_c_name(tname)} self);")
         ci = ci + 1
     }
+    let mut hi = 0
+    while hi < derive_hash_types.len() {
+        let tname = derive_hash_types.get(hi).unwrap()
+        emit_line("uint64_t {c_type_c_name(tname)}_hash({c_type_c_name(tname)} self);")
+        let cn = c_type_c_name(tname)
+        emit_line("static uint64_t kops_hash_{cn}(const void* k) \{ return {cn}_hash(*(const {cn}*)k); }")
+        emit_line("static int kops_eq_{cn}(const void* a, const void* b) \{ return {cn}_eq(*(const {cn}*)a, *(const {cn}*)b); }")
+        emit_line("static const blink_kops kops_{cn} = \{ kops_hash_{cn}, kops_eq_{cn}, sizeof({cn}), 0 };")
+        hi = hi + 1
+    }
 }
 
 pub fn emit_derive_fn_defs() ! Codegen.Emit {
@@ -170,6 +189,43 @@ pub fn emit_derive_fn_defs() ! Codegen.Emit {
         }
         ci = ci + 1
     }
+    let mut hi = 0
+    while hi < derive_hash_types.len() {
+        let tname = derive_hash_types.get(hi).unwrap()
+        if is_enum_type(tname) == 0 {
+            emit_struct_hash(tname)
+        }
+        hi = hi + 1
+    }
+}
+
+fn emit_struct_hash(type_name: Str) ! Codegen.Emit {
+    // Order-sensitive: mix accumulator and per-field hash separately so (a, b)
+    // and (b, a) field layouts produce distinct hashes.
+    emit_line("uint64_t {c_type_c_name(type_name)}_hash({c_type_c_name(type_name)} self) \{")
+    cg_indent = cg_indent + 1
+    emit_line("uint64_t h = 0xcbf29ce484222325ULL;")
+    let mut i = 0
+    while i < sf_entries.len() {
+        let sf = sf_entries.get(i).unwrap()
+        if sf.struct_name == type_name {
+            if sf.field_type == CT_STRING {
+                emit_line("h = blink_kops_mix_u64(h ^ blink_map_hash(self.{sf.field_name}));")
+            } else if sf.field_type == CT_INT || sf.field_type == CT_BOOL || sf.field_type == CT_CHAR || sf.field_type == CT_I8 || sf.field_type == CT_I16 || sf.field_type == CT_I32 || sf.field_type == CT_U8 || sf.field_type == CT_U16 || sf.field_type == CT_U32 || sf.field_type == CT_U64 {
+                emit_line("h = blink_kops_mix_u64(h ^ (uint64_t)self.{sf.field_name});")
+            } else if sf.field_type == CT_VOID && sf.stype != "" && has_derive_method(sf.stype, "hash") != 0 {
+                emit_line("h = blink_kops_mix_u64(h ^ {c_type_c_name(sf.stype)}_hash(self.{sf.field_name}));")
+            } else {
+                emit_line("/* BLINK_COMPILER_BUG: field {sf.field_name} of {type_name} has unhashable type — typecheck E1400 should have rejected this */")
+                emit_line("h = blink_kops_mix_u64(h ^ 0xBADBADBADBADBADBULL);")
+            }
+        }
+        i = i + 1
+    }
+    emit_line("return h;")
+    cg_indent = cg_indent - 1
+    emit_line("}")
+    emit_line("")
 }
 
 fn emit_struct_to_json(type_name: Str) ! Codegen.Emit {

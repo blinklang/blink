@@ -20,8 +20,8 @@ import codegen_types.{
     get_impl_method_ret, get_list_elem_map_key_type, get_list_elem_map_val_type,
     get_list_elem_struct, get_list_elem_type,
     get_list_nested_elem_struct, get_list_nested_elem_type,
-    get_map_key_type, get_map_value_list_elem, get_map_value_struct, get_map_value_type, get_set_elem_type,
-    kops_table_name, kops_is_inline_key,
+    get_map_key_type, get_map_key_struct, get_map_value_list_elem, get_map_value_struct, get_map_value_type, get_set_elem_type,
+    kops_table_name, kops_is_inline_key, kops_is_struct_key,
     get_struct_field_closure_sig, get_struct_field_type,
     get_var_channel_inner, get_var_enum, get_var_iterator_inner,
     get_var_option_inner, get_var_option_inner2, get_var_option_inner2_struct,
@@ -560,7 +560,19 @@ fn is_map_builtin_intercept(ct: Int, method: Str) -> Bool {
     ct == CT_MAP && (method == "clear" || method == "contains_key" || method == "remove" || method == "len" || method == "is_empty")
 }
 
-fn map_key_expr(key_str: Str, key_ct: Int) -> Str ! Codegen.Emit, Codegen.Register {
+fn map_key_expr_inner(key_str: Str, key_ct: Int, key_sname: Str, for_insert: Bool) -> Str ! Codegen.Emit, Codegen.Register {
+    if kops_is_struct_key(key_sname) {
+        let key_c = c_type_c_name(key_sname)
+        let tmp = fresh_temp("_mkey")
+        if for_insert {
+            // Insert stores the pointer in the slot — needs stable GC memory.
+            emit_line("{key_c}* {tmp} = ({key_c}*)blink_alloc(sizeof({key_c}));")
+            emit_line("*{tmp} = {key_str};")
+            return "{tmp}"
+        }
+        emit_line("{key_c} {tmp} = {key_str};")
+        return "&{tmp}"
+    }
     if kops_is_inline_key(key_ct) == 0 {
         return "{key_str}"
     }
@@ -570,6 +582,14 @@ fn map_key_expr(key_str: Str, key_ct: Int) -> Str ! Codegen.Emit, Codegen.Regist
     "&{tmp}"
 }
 
+fn map_key_expr(key_str: Str, key_ct: Int, key_sname: Str) -> Str ! Codegen.Emit, Codegen.Register {
+    map_key_expr_inner(key_str, key_ct, key_sname, true)
+}
+
+fn map_key_expr_lookup(key_str: Str, key_ct: Int, key_sname: Str) -> Str ! Codegen.Emit, Codegen.Register {
+    map_key_expr_inner(key_str, key_ct, key_sname, false)
+}
+
 @allow(UnrestoredMutation, IncompleteStateRestore)
 fn emit_map_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
     let mut map_var_name = obj_str
@@ -577,6 +597,7 @@ fn emit_map_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int !
         map_var_name = node_name(obj_node)
     }
     let key_ct = get_map_key_type(map_var_name)
+    let key_sname = if key_ct == CT_VOID || key_ct == CT_STRUCT { get_map_key_struct(map_var_name) } else { "" }
 
     if method == "insert" {
         let mut set_var_name = ""
@@ -586,7 +607,7 @@ fn emit_map_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int !
         let args_sl = node_args(node)
         emit_expr(sublist_get(args_sl, btc_arg_offset))
         let key_str = expr_result_str
-        let key_expr = map_key_expr(key_str, key_ct)
+        let key_expr = map_key_expr(key_str, key_ct, key_sname)
         emit_expr(sublist_get(args_sl, 1 + btc_arg_offset))
         let val_str2 = expr_result_str
         let val_type2 = expr_result_type
@@ -627,7 +648,7 @@ fn emit_map_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int !
         let args_sl = node_args(node)
         emit_expr(sublist_get(args_sl, btc_arg_offset))
         let key_str = expr_result_str
-        let key_expr = map_key_expr(key_str, key_ct)
+        let key_expr = map_key_expr_lookup(key_str, key_ct, key_sname)
         let vtype = get_map_value_type(map_var_name)
         let vstruct = get_map_value_struct(map_var_name)
         let res = fresh_temp("_mgetopt_")
@@ -725,7 +746,7 @@ fn emit_map_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int !
         let args_sl = node_args(node)
         emit_expr(sublist_get(args_sl, btc_arg_offset))
         let key_str = expr_result_str
-        let key_expr = map_key_expr(key_str, key_ct)
+        let key_expr = map_key_expr_lookup(key_str, key_ct, key_sname)
         expr_result_str = "(blink_map2_has({obj_str}, {key_expr}) != 0)"
         expr_result_type = CT_BOOL
         return 1
@@ -734,7 +755,7 @@ fn emit_map_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int !
         let args_sl = node_args(node)
         emit_expr(sublist_get(args_sl, btc_arg_offset))
         let key_str = expr_result_str
-        let key_expr = map_key_expr(key_str, key_ct)
+        let key_expr = map_key_expr_lookup(key_str, key_ct, key_sname)
         expr_result_str = "(blink_map2_remove({obj_str}, {key_expr}) != 0)"
         expr_result_type = CT_BOOL
         return 1
