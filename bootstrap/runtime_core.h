@@ -844,17 +844,6 @@ typedef struct {
     int64_t cap;
 } blink_set;
 
-BLINK_RT_FN const char* blink_int_to_key(int64_t val);
-#ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN const char* blink_int_to_key(int64_t val) {
-    char buf[32];
-    snprintf(buf, sizeof(buf), "%lld", (long long)val);
-    size_t len = strlen(buf);
-    char* s = (char*)blink_alloc(len + 1);
-    memcpy(s, buf, len + 1);
-    return s;
-}
-#endif
 
 BLINK_RT_FN blink_set* blink_set_new(void);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
