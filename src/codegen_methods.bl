@@ -20,7 +20,8 @@ import codegen_types.{
     get_impl_method_ret, get_list_elem_map_key_type, get_list_elem_map_val_type,
     get_list_elem_struct, get_list_elem_type,
     get_list_nested_elem_struct, get_list_nested_elem_type,
-    get_map_value_list_elem, get_map_value_struct, get_map_value_type, get_set_elem_type,
+    get_map_key_type, get_map_value_list_elem, get_map_value_struct, get_map_value_type, get_set_elem_type,
+    kops_table_name, kops_is_inline_key,
     get_struct_field_closure_sig, get_struct_field_type,
     get_var_channel_inner, get_var_enum, get_var_iterator_inner,
     get_var_option_inner, get_var_option_inner2, get_var_option_inner2_struct,
@@ -146,7 +147,7 @@ fn emit_result_unwrap_inner(
     } else if inner_t == CT_MAP {
         emit_panic_tag_check(tmp, panic_tag, panic_msg, loc_line)
         let val_tmp = fresh_temp(if is_ok { "_runv_" } else { "_ruerr_" })
-        emit_line("blink_map* {val_tmp} = {tmp}.{field};")
+        emit_line("blink_map_v2* {val_tmp} = {tmp}.{field};")
         set_var(val_tmp, CT_MAP, 0)
         expr_result_str = val_tmp
         expr_result_type = CT_MAP
@@ -351,7 +352,7 @@ fn emit_list_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int 
             let opt_type = struct_option_c_type(map_struct)
             emit_line("{opt_type} {res};")
             emit_line("if (blink_list_len({obj_str}) > 0) \{")
-            emit_line("    {res}.tag = 1; {res}.value = (blink_map*)blink_list_pop({obj_str});")
+            emit_line("    {res}.tag = 1; {res}.value = (blink_map_v2*)blink_list_pop({obj_str});")
             emit_line("} else \{ {res}.tag = 0; }")
             set_var_option_struct(res, CT_MAP, map_struct)
             expr_result_str = res
@@ -465,7 +466,7 @@ fn emit_list_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int 
             let opt_type = struct_option_c_type(map_struct)
             emit_line("{opt_type} {res};")
             emit_line("if (blink_list_in_bounds({obj_str}, {idx_tmp})) \{")
-            emit_line("    {res}.tag = 1; {res}.value = (blink_map*)blink_list_get({obj_str}, {idx_tmp});")
+            emit_line("    {res}.tag = 1; {res}.value = (blink_map_v2*)blink_list_get({obj_str}, {idx_tmp});")
             emit_line("} else \{ {res}.tag = 0; }")
             set_var_option_struct(res, CT_MAP, map_struct)
             expr_result_str = res
@@ -546,8 +547,37 @@ fn emit_list_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int 
     0
 }
 
+/// Materialize a Map key for the v2 + kops runtime API:
+///   - Str keys: pass the const char* pointer directly (inline_key=0).
+///   - Inline keys (Int and friends, Bool, Char): bind to a stack temp and pass &tmp.
+///     blink_map2_* hashes/eq's `key_size` bytes starting at the pointer.
+/// Returns the C expression to pass as the `const void* key` argument.
+// MapPure + Sized methods that codegen routes through emit_map_method
+// (direct blink_map2_* calls), bypassing the stdlib trait impl which
+// only handles Str keys. Single source of truth — keep both dispatch
+// sites in emit_method_call in sync via this predicate.
+fn is_map_builtin_intercept(ct: Int, method: Str) -> Bool {
+    ct == CT_MAP && (method == "clear" || method == "contains_key" || method == "remove" || method == "len" || method == "is_empty")
+}
+
+fn map_key_expr(key_str: Str, key_ct: Int) -> Str ! Codegen.Emit, Codegen.Register {
+    if kops_is_inline_key(key_ct) == 0 {
+        return "{key_str}"
+    }
+    let key_c = c_type_str(key_ct)
+    let tmp = fresh_temp("_mkey")
+    emit_line("{key_c} {tmp} = ({key_c})({key_str});")
+    "&{tmp}"
+}
+
 @allow(UnrestoredMutation, IncompleteStateRestore)
 fn emit_map_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
+    let mut map_var_name = obj_str
+    if node_kind(obj_node) == NodeKind.Ident {
+        map_var_name = node_name(obj_node)
+    }
+    let key_ct = get_map_key_type(map_var_name)
+
     if method == "insert" {
         let mut set_var_name = ""
         if node_kind(obj_node) == NodeKind.Ident {
@@ -556,6 +586,7 @@ fn emit_map_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int !
         let args_sl = node_args(node)
         emit_expr(sublist_get(args_sl, btc_arg_offset))
         let key_str = expr_result_str
+        let key_expr = map_key_expr(key_str, key_ct)
         emit_expr(sublist_get(args_sl, 1 + btc_arg_offset))
         let val_str2 = expr_result_str
         let val_type2 = expr_result_type
@@ -566,22 +597,22 @@ fn emit_map_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int !
             let box_tmp = fresh_temp("_sbox")
             emit_line("{struct_c}* {box_tmp} = ({struct_c}*)blink_alloc(sizeof({struct_c}));")
             emit_line("*{box_tmp} = {val_str2};")
-            emit_line("blink_map_set({obj_str}, {key_str}, (void*){box_tmp});")
+            emit_line("blink_map2_set({obj_str}, {key_expr}, (void*){box_tmp});")
         } else if val_type2 == CT_INT {
-            emit_line("blink_map_set({obj_str}, {key_str}, (void*)(intptr_t){val_str2});")
+            emit_line("blink_map2_set({obj_str}, {key_expr}, (void*)(intptr_t){val_str2});")
         } else if val_type2 == CT_FLOAT {
             let box_tmp = fresh_temp("_fbox")
             emit_line("double* {box_tmp} = (double*)blink_alloc(sizeof(double));")
             emit_line("*{box_tmp} = {val_str2};")
-            emit_line("blink_map_set({obj_str}, {key_str}, (void*){box_tmp});")
+            emit_line("blink_map2_set({obj_str}, {key_expr}, (void*){box_tmp});")
         } else {
-            emit_line("blink_map_set({obj_str}, {key_str}, (void*){val_str2});")
+            emit_line("blink_map2_set({obj_str}, {key_expr}, (void*){val_str2});")
         }
         if set_var_name != "" {
             emit_trace_state(set_var_name, "insert", val_str2, val_type2)
         }
         let map_name_for_set = if set_var_name != "" { set_var_name } else { obj_str }
-        set_map_types(map_name_for_set, CT_STRING, val_type2, "")
+        set_map_types(map_name_for_set, key_ct, val_type2, "")
         if val_struct != "" {
             set_map_value_struct(map_name_for_set, val_struct)
         }
@@ -596,10 +627,7 @@ fn emit_map_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int !
         let args_sl = node_args(node)
         emit_expr(sublist_get(args_sl, btc_arg_offset))
         let key_str = expr_result_str
-        let mut map_var_name = obj_str
-        if node_kind(obj_node) == NodeKind.Ident {
-            map_var_name = node_name(obj_node)
-        }
+        let key_expr = map_key_expr(key_str, key_ct)
         let vtype = get_map_value_type(map_var_name)
         let vstruct = get_map_value_struct(map_var_name)
         let res = fresh_temp("_mgetopt_")
@@ -607,8 +635,8 @@ fn emit_map_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int !
             ensure_struct_option_type(vstruct)
             let opt_type = struct_option_c_type(vstruct)
             emit_line("{opt_type} {res};")
-            emit_line("if (blink_map_has({obj_str}, {key_str})) \{")
-            emit_line("    {res}.tag = 1; {res}.value = ({c_type_c_name(vstruct)}*)blink_map_get({obj_str}, {key_str});")
+            emit_line("if (blink_map2_has({obj_str}, {key_expr})) \{")
+            emit_line("    {res}.tag = 1; {res}.value = ({c_type_c_name(vstruct)}*)blink_map2_get({obj_str}, {key_expr});")
             emit_line("} else \{ {res}.tag = 0; }")
             set_var_option_struct(res, CT_VOID, vstruct)
             expr_result_str = res
@@ -619,8 +647,8 @@ fn emit_map_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int !
             ensure_option_type(CT_STRING)
             let opt_type = option_c_type(CT_STRING)
             emit_line("{opt_type} {res};")
-            emit_line("if (blink_map_has({obj_str}, {key_str})) \{")
-            emit_line("    {res}.tag = 1; {res}.value = (const char*)blink_map_get({obj_str}, {key_str});")
+            emit_line("if (blink_map2_has({obj_str}, {key_expr})) \{")
+            emit_line("    {res}.tag = 1; {res}.value = (const char*)blink_map2_get({obj_str}, {key_expr});")
             emit_line("} else \{ {res}.tag = 0; }")
             set_var_option(res, CT_STRING)
             expr_result_str = res
@@ -631,8 +659,8 @@ fn emit_map_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int !
             ensure_option_type(CT_LIST)
             let opt_type = option_c_type(CT_LIST)
             emit_line("{opt_type} {res};")
-            emit_line("if (blink_map_has({obj_str}, {key_str})) \{")
-            emit_line("    {res}.tag = 1; {res}.value = (blink_list*)blink_map_get({obj_str}, {key_str});")
+            emit_line("if (blink_map2_has({obj_str}, {key_expr})) \{")
+            emit_line("    {res}.tag = 1; {res}.value = (blink_list*)blink_map2_get({obj_str}, {key_expr});")
             emit_line("} else \{ {res}.tag = 0; }")
             set_var_option(res, CT_LIST)
             let list_elem = get_map_value_list_elem(map_var_name)
@@ -648,8 +676,8 @@ fn emit_map_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int !
             ensure_option_type(CT_MAP)
             let opt_type = option_c_type(CT_MAP)
             emit_line("{opt_type} {res};")
-            emit_line("if (blink_map_has({obj_str}, {key_str})) \{")
-            emit_line("    {res}.tag = 1; {res}.value = (blink_map*)blink_map_get({obj_str}, {key_str});")
+            emit_line("if (blink_map2_has({obj_str}, {key_expr})) \{")
+            emit_line("    {res}.tag = 1; {res}.value = (blink_map_v2*)blink_map2_get({obj_str}, {key_expr});")
             emit_line("} else \{ {res}.tag = 0; }")
             set_var_option(res, CT_MAP)
             let map_val_struct = get_map_value_struct(map_var_name)
@@ -670,8 +698,8 @@ fn emit_map_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int !
             ensure_option_type(CT_FLOAT)
             let opt_type = option_c_type(CT_FLOAT)
             emit_line("{opt_type} {res};")
-            emit_line("if (blink_map_has({obj_str}, {key_str})) \{")
-            emit_line("    {res}.tag = 1; {res}.value = *(double*)blink_map_get({obj_str}, {key_str});")
+            emit_line("if (blink_map2_has({obj_str}, {key_expr})) \{")
+            emit_line("    {res}.tag = 1; {res}.value = *(double*)blink_map2_get({obj_str}, {key_expr});")
             emit_line("} else \{ {res}.tag = 0; }")
             set_var_option(res, CT_FLOAT)
             expr_result_str = res
@@ -682,8 +710,8 @@ fn emit_map_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int !
             ensure_option_type(CT_INT)
             let opt_type = option_c_type(CT_INT)
             emit_line("{opt_type} {res};")
-            emit_line("if (blink_map_has({obj_str}, {key_str})) \{")
-            emit_line("    {res}.tag = 1; {res}.value = (int64_t)(intptr_t)blink_map_get({obj_str}, {key_str});")
+            emit_line("if (blink_map2_has({obj_str}, {key_expr})) \{")
+            emit_line("    {res}.tag = 1; {res}.value = (int64_t)(intptr_t)blink_map2_get({obj_str}, {key_expr});")
             emit_line("} else \{ {res}.tag = 0; }")
             set_var_option(res, CT_INT)
             expr_result_str = res
@@ -693,19 +721,49 @@ fn emit_map_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int !
         }
         return 1
     }
+    if method == "contains_key" {
+        let args_sl = node_args(node)
+        emit_expr(sublist_get(args_sl, btc_arg_offset))
+        let key_str = expr_result_str
+        let key_expr = map_key_expr(key_str, key_ct)
+        expr_result_str = "(blink_map2_has({obj_str}, {key_expr}) != 0)"
+        expr_result_type = CT_BOOL
+        return 1
+    }
+    if method == "remove" {
+        let args_sl = node_args(node)
+        emit_expr(sublist_get(args_sl, btc_arg_offset))
+        let key_str = expr_result_str
+        let key_expr = map_key_expr(key_str, key_ct)
+        expr_result_str = "(blink_map2_remove({obj_str}, {key_expr}) != 0)"
+        expr_result_type = CT_BOOL
+        return 1
+    }
+    if method == "len" {
+        expr_result_str = "blink_map2_len({obj_str})"
+        expr_result_type = CT_INT
+        return 1
+    }
+    if method == "is_empty" {
+        expr_result_str = "(blink_map2_len({obj_str}) == 0)"
+        expr_result_type = CT_BOOL
+        return 1
+    }
+    if method == "clear" {
+        emit_line("blink_map2_clear({obj_str});")
+        expr_result_str = "0"
+        expr_result_type = CT_VOID
+        return 1
+    }
     if method == "keys" {
-        expr_result_str = "blink_map_keys({obj_str})"
+        expr_result_str = "blink_map2_keys({obj_str})"
         expr_result_type = CT_LIST
-        expr_list_elem_type = CT_STRING
+        expr_list_elem_type = key_ct
         return 1
     }
     if method == "values" {
-        let mut values_var_name = obj_str
-        if node_kind(obj_node) == NodeKind.Ident {
-            values_var_name = node_name(obj_node)
-        }
-        let vtype = get_map_value_type(values_var_name)
-        expr_result_str = "blink_map_values({obj_str})"
+        let vtype = get_map_value_type(map_var_name)
+        expr_result_str = "blink_map2_values({obj_str})"
         expr_result_type = CT_LIST
         expr_list_elem_type = vtype
         return 1
@@ -1766,6 +1824,12 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                     expr_result_type = get_impl_method_ret(type_name, method)
                     return
                 }
+                if is_map_builtin_intercept(first_type, method) {
+                    btc_arg_offset = 1
+                    let mh = emit_map_method(node, first_str, obj_node, method)
+                    btc_arg_offset = 0
+                    if mh != 0 { return }
+                }
                 // User trait impl on a builtin receiver wins over the codegen-emitted
                 // builtin methods, so a stdlib `impl SomeTrait for Str` gets used here too.
                 let bi_recv_name = builtin_receiver_type_name(first_type)
@@ -2138,6 +2202,10 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             expr_result_type = CT_VOID
             return
         }
+    }
+
+    if is_map_builtin_intercept(obj_type, method) {
+        if emit_map_method(node, obj_str, obj_node, method) != 0 { return }
     }
 
     // User trait impl on a builtin receiver wins over hardcoded builtin emitters,
@@ -3065,7 +3133,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                 emit_line("{opt_c} {tmp} = {obj_str};")
                 emit_panic_tag_check(tmp, 0, "unwrap called on None", loc_line)
                 let val_tmp = fresh_temp("_ounv_")
-                emit_line("blink_map* {val_tmp} = {tmp}.value;")
+                emit_line("blink_map_v2* {val_tmp} = {tmp}.value;")
                 set_var(val_tmp, CT_MAP, 0)
                 let map_nested = get_var_option_inner2(obj_str)
                 if map_nested >= 0 {
