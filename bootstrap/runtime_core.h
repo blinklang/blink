@@ -690,6 +690,10 @@ BLINK_RT_FN blink_list* blink_map_values(const blink_map* m) {
 
 /* ── Built-in kops tables ────────────────────────────────────────────── */
 
+/* Seeded FNV-1a 64-bit offset basis. Used by @derive(Hash) emitters and by
+   any user code that wants the same seed-mixing contract as built-in keys. */
+#define BLINK_HASH_INIT (blink_map_seed ^ 0xcbf29ce484222325ULL)
+
 BLINK_RT_FN void blink_map_set_seed(uint64_t s);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN void blink_map_set_seed(uint64_t s) { blink_map_seed = s; }
