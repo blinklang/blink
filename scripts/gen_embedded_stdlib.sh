@@ -39,8 +39,7 @@ trap 'rm -f "$TMP"' EXIT
     for f in $FILES; do
         ns=${f#lib/}; ns=${ns%%/*}
         base=$(basename "$f" .bl)
-        if [ "$ns" = "pkg" ]; then key="pkg_${base}"; else key="${base}"; fi
-        echo "    embedded_stdlib.insert(\"${key}\", embedded_${ns}_${base})"
+        echo "    embedded_stdlib.insert(\"${ns}/${base}\", embedded_${ns}_${base})"
     done
     echo "}"
 } > "$TMP"
