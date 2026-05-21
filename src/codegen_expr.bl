@@ -10,6 +10,7 @@ import codegen_types.{
     cg_closure_cap_count, cg_closure_cap_start, cg_closure_defs,
     cg_current_fn_has_ev, cg_current_fn_name, cg_current_fn_node, cg_current_fn_option_inner, cg_current_fn_option_inner_struct, cg_current_fn_ret, cg_in_test_body,
     cg_let_target_ann,
+    cg_mono_tparams_sl, cg_mono_concrete_args,
     cg_debug_mode, cg_handler_body_field, cg_handler_body_idx,
     cg_handler_body_is_ue, cg_handler_body_vtable_type,
     cg_handler_caps, HandlerCapture,
@@ -28,7 +29,8 @@ import codegen_types.{
     get_fn_ret_handler, get_fn_ret_struct_inner, get_fn_ret_type,
     get_generic_fn_node,
     get_impl_method_ret, get_list_elem_struct, get_list_elem_type,
-    get_map_value_list_elem, get_map_value_struct,
+    get_map_key_type, get_map_key_struct,
+    get_map_value_list_elem, get_map_value_struct, get_map_value_type,
     get_struct_field_closure_sig,
     get_struct_field_stype,
     get_struct_field_tp_id, get_struct_field_type,
@@ -1913,6 +1915,21 @@ fn arg_struct_name_for(rt: Int, rs: Str, list_elem_struct: Str) -> Str {
     ""
 }
 
+type ArgMapInfo {
+    kt: Int
+    ks: Str
+    vt: Int
+    vs: Str
+}
+
+fn arg_map_info_for(arg_node: Int, rt: Int) -> ArgMapInfo {
+    if rt != CT_MAP || node_kind(arg_node) != NodeKind.Ident {
+        return ArgMapInfo { kt: -1, ks: "", vt: -1, vs: "" }
+    }
+    let nm = node_name(arg_node)
+    ArgMapInfo { kt: get_map_key_type(nm), ks: get_map_key_struct(nm), vt: get_map_value_type(nm), vs: get_map_value_struct(nm) }
+}
+
 @allow(UnrestoredMutation, IncompleteStateRestore)
 fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
     let func_node = node_left(node)
@@ -2504,7 +2521,7 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                 let ta_elems = node_elements(cg_let_target_ann)
                 if ta_elems != -1 && sublist_length(ta_elems) >= 1 {
                     let k_ann = sublist_get(ta_elems, 0)
-                    let k_name = node_name(k_ann)
+                    let k_name = resolve_tparam(node_name(k_ann), cg_mono_tparams_sl, cg_mono_concrete_args)
                     if k_name == "Tuple" {
                         key_sname = key_struct_sname_from_ann(k_ann)
                         key_ct = CT_VOID
@@ -2630,6 +2647,10 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
         let mut arg_elem_types: List[Int] = []
         let mut arg_closure_sigs: List[Str] = []
         let mut arg_struct_names: List[Str] = []
+        let mut arg_map_key_types: List[Int] = []
+        let mut arg_map_key_structs: List[Str] = []
+        let mut arg_map_val_types: List[Int] = []
+        let mut arg_map_val_structs: List[Str] = []
         let is_generic = is_generic_fn(fn_name)
         reorder_named_args(fn_name, args_sl, node)
         if reorder_result.len() > 0 {
@@ -2650,6 +2671,11 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                     arg_elem_types.push(expr_list_elem_type)
                     arg_closure_sigs.push(expr_closure_sig)
                     arg_struct_names.push(arg_struct_name_for(expr_result_type, expr_result_str, expr_list_elem_struct))
+                    let map_info = arg_map_info_for(actual, expr_result_type)
+                    arg_map_key_types.push(map_info.kt)
+                    arg_map_key_structs.push(map_info.ks)
+                    arg_map_val_types.push(map_info.vt)
+                    arg_map_val_structs.push(map_info.vs)
                 }
                 i = i + 1
             }
@@ -2659,13 +2685,19 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                 if i > 0 {
                     args_str = args_str.concat(", ")
                 }
-                emit_expr(sublist_get(args_sl, i))
+                let arg_node_i = sublist_get(args_sl, i)
+                emit_expr(arg_node_i)
                 args_str = args_str.concat(expr_result_str)
                 if is_generic != 0 {
                     arg_types.push(expr_result_type)
                     arg_elem_types.push(expr_list_elem_type)
                     arg_closure_sigs.push(expr_closure_sig)
                     arg_struct_names.push(arg_struct_name_for(expr_result_type, expr_result_str, expr_list_elem_struct))
+                    let map_info = arg_map_info_for(arg_node_i, expr_result_type)
+                    arg_map_key_types.push(map_info.kt)
+                    arg_map_key_structs.push(map_info.ks)
+                    arg_map_val_types.push(map_info.vt)
+                    arg_map_val_structs.push(map_info.vs)
                 }
                 i = i + 1
             }
@@ -2674,7 +2706,7 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
         // Check for generic function call
         if is_generic != 0 {
             let gfn_node = get_generic_fn_node(fn_name)
-            let type_args = infer_fn_type_args_from_types(gfn_node, arg_types, arg_elem_types, arg_closure_sigs, arg_struct_names)
+            let type_args = infer_fn_type_args_from_types(gfn_node, arg_types, arg_elem_types, arg_closure_sigs, arg_struct_names, arg_map_key_types, arg_map_key_structs, arg_map_val_types, arg_map_val_structs)
             if type_args.is_some() {
                 let ta_str = type_args.unwrap()
                 let mangled = mangle_generic_name(fn_name, ta_str)
@@ -2742,6 +2774,19 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                             let inner_name_raw = node_name(inner_ann)
                             let inner_name = resolve_tparam(inner_name_raw, tparams_sl, ta_str)
                             expr_list_elem_type = type_from_name(inner_name)
+                        }
+                    }
+                } else if ret_type == CT_MAP {
+                    let ret_ann = node_type_ann(gfn_node)
+                    if ret_ann != -1 {
+                        let elems_sl = node_elements(ret_ann)
+                        if elems_sl != -1 && sublist_length(elems_sl) >= 2 {
+                            let k_ann = sublist_get(elems_sl, 0)
+                            let v_ann = sublist_get(elems_sl, 1)
+                            let k_name = resolve_tparam(node_name(k_ann), tparams_sl, ta_str)
+                            let v_name = resolve_tparam(node_name(v_ann), tparams_sl, ta_str)
+                            expr_map_key_type = type_from_name(k_name)
+                            expr_map_val_type = type_from_name(v_name)
                         }
                     }
                 } else if ret_type == CT_VOID && resolved_ret != "Void" && resolved_ret != "" {
