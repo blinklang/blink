@@ -67,11 +67,14 @@ typedef struct blink_arena_t {
 #ifdef BLINK_USE_EXTERN_RUNTIME_STORAGE
   #ifdef BLINK_RUNTIME_STORAGE_DEFINE
     __thread blink_arena_t* __blink_current_arena = NULL;
+    uint64_t blink_map_seed = 0;
   #else
     extern __thread blink_arena_t* __blink_current_arena;
+    extern uint64_t blink_map_seed;
   #endif
 #else
 static __thread blink_arena_t* __blink_current_arena = NULL;
+static uint64_t blink_map_seed = 0;
 #endif
 
 BLINK_RT_FN blink_arena_chunk* blink_arena_chunk_new(int64_t capacity);
@@ -432,12 +435,6 @@ BLINK_RT_FN uint64_t blink_map_hash(const char* key) {
 }
 #endif
 
-/* `blink_map` is the user-visible name; the underlying struct is the kops-aware
-   `blink_map_v2`. Defined below. A typedef collapses them so codegen output that
-   still uses the legacy `blink_map*` C name stays compatible with the v2 struct
-   layout. The legacy `blink_map_*` C functions are provided as kops_str-bound
-   thin wrappers below the v2 definitions. */
-
 /* ── Generic hash map (kops vtable) ──────────────────────────────────── */
 /* See decisions/map-runtime-architecture.md. One runtime, per-K kops table. */
 
@@ -456,10 +453,7 @@ typedef struct {
     int64_t len;
     int64_t cap;
     const blink_kops* kops;
-} blink_map_v2;
-
-/* Legacy name — same struct as blink_map_v2. Codegen may emit either spelling. */
-typedef blink_map_v2 blink_map;
+} blink_map;
 
 /* `static inline` so the compiler can fold the kops->inline_key branch
    and stride computation into the probe-loop callsites. */
@@ -467,15 +461,15 @@ static inline size_t blink_kops_stride(const blink_kops* k) {
     return k->inline_key ? k->key_size : sizeof(void*);
 }
 
-static inline const void* blink_map2_key_slot(const blink_map_v2* m, int64_t i, size_t stride) {
+static inline const void* blink_map_key_slot(const blink_map* m, int64_t i, size_t stride) {
     void* slot = (void*)((char*)m->keys + (size_t)i * stride);
     return m->kops->inline_key ? (const void*)slot : *(const void**)slot;
 }
 
-BLINK_RT_FN blink_map_v2* blink_map2_new(const blink_kops* kops);
+BLINK_RT_FN blink_map* blink_map_new(const blink_kops* kops);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN blink_map_v2* blink_map2_new(const blink_kops* kops) {
-    blink_map_v2* m = (blink_map_v2*)blink_alloc(sizeof(blink_map_v2));
+BLINK_RT_FN blink_map* blink_map_new(const blink_kops* kops) {
+    blink_map* m = (blink_map*)blink_alloc(sizeof(blink_map));
     m->cap = 16;
     m->len = 0;
     m->kops = kops;
@@ -488,9 +482,9 @@ BLINK_RT_FN blink_map_v2* blink_map2_new(const blink_kops* kops) {
 }
 #endif
 
-BLINK_RT_FN void blink_map2_grow(blink_map_v2* m);
+BLINK_RT_FN void blink_map_grow(blink_map* m);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN void blink_map2_grow(blink_map_v2* m) {
+BLINK_RT_FN void blink_map_grow(blink_map* m) {
     /* cap is always a power of two: initial cap is 16, this is the only
        mutator, and it doubles. The probe paths replace `% cap` with
        `& (cap - 1)` — break the pow2 invariant and lookups silently corrupt. */
@@ -528,10 +522,10 @@ BLINK_RT_FN void blink_map2_grow(blink_map_v2* m) {
 }
 #endif
 
-BLINK_RT_FN void blink_map2_set(blink_map_v2* m, const void* key, void* value);
+BLINK_RT_FN void blink_map_set(blink_map* m, const void* key, void* value);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN void blink_map2_set(blink_map_v2* m, const void* key, void* value) {
-    if (m->len * 10 >= m->cap * 7) blink_map2_grow(m);
+BLINK_RT_FN void blink_map_set(blink_map* m, const void* key, void* value) {
+    if (m->len * 10 >= m->cap * 7) blink_map_grow(m);
     const blink_kops* k = m->kops;
     size_t stride = blink_kops_stride(k);
     int64_t mask = m->cap - 1;
@@ -555,7 +549,7 @@ BLINK_RT_FN void blink_map2_set(blink_map_v2* m, const void* key, void* value) {
         if (m->states[idx] == 2) {
             if (first_tombstone < 0) first_tombstone = idx;
         } else {
-            const void* existing = blink_map2_key_slot(m, idx, stride);
+            const void* existing = blink_map_key_slot(m, idx, stride);
             if (k->eq(existing, key)) {
                 m->values[idx] = value;
                 return;
@@ -566,9 +560,9 @@ BLINK_RT_FN void blink_map2_set(blink_map_v2* m, const void* key, void* value) {
 }
 #endif
 
-BLINK_RT_FN void* blink_map2_get(const blink_map_v2* m, const void* key);
+BLINK_RT_FN void* blink_map_get(const blink_map* m, const void* key);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN void* blink_map2_get(const blink_map_v2* m, const void* key) {
+BLINK_RT_FN void* blink_map_get(const blink_map* m, const void* key) {
     const blink_kops* k = m->kops;
     size_t stride = blink_kops_stride(k);
     int64_t mask = m->cap - 1;
@@ -576,7 +570,7 @@ BLINK_RT_FN void* blink_map2_get(const blink_map_v2* m, const void* key) {
     int64_t idx = (int64_t)(h & (uint64_t)mask);
     while (m->states[idx] != 0) {
         if (m->states[idx] == 1) {
-            const void* existing = blink_map2_key_slot(m, idx, stride);
+            const void* existing = blink_map_key_slot(m, idx, stride);
             if (k->eq(existing, key)) return m->values[idx];
         }
         idx = (idx + 1) & mask;
@@ -585,9 +579,9 @@ BLINK_RT_FN void* blink_map2_get(const blink_map_v2* m, const void* key) {
 }
 #endif
 
-BLINK_RT_FN int64_t blink_map2_has(const blink_map_v2* m, const void* key);
+BLINK_RT_FN int64_t blink_map_has(const blink_map* m, const void* key);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN int64_t blink_map2_has(const blink_map_v2* m, const void* key) {
+BLINK_RT_FN int64_t blink_map_has(const blink_map* m, const void* key) {
     const blink_kops* k = m->kops;
     size_t stride = blink_kops_stride(k);
     int64_t mask = m->cap - 1;
@@ -595,7 +589,7 @@ BLINK_RT_FN int64_t blink_map2_has(const blink_map_v2* m, const void* key) {
     int64_t idx = (int64_t)(h & (uint64_t)mask);
     while (m->states[idx] != 0) {
         if (m->states[idx] == 1) {
-            const void* existing = blink_map2_key_slot(m, idx, stride);
+            const void* existing = blink_map_key_slot(m, idx, stride);
             if (k->eq(existing, key)) return 1;
         }
         idx = (idx + 1) & mask;
@@ -604,9 +598,9 @@ BLINK_RT_FN int64_t blink_map2_has(const blink_map_v2* m, const void* key) {
 }
 #endif
 
-BLINK_RT_FN int64_t blink_map2_remove(blink_map_v2* m, const void* key);
+BLINK_RT_FN int64_t blink_map_remove(blink_map* m, const void* key);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN int64_t blink_map2_remove(blink_map_v2* m, const void* key) {
+BLINK_RT_FN int64_t blink_map_remove(blink_map* m, const void* key) {
     const blink_kops* k = m->kops;
     size_t stride = blink_kops_stride(k);
     int64_t mask = m->cap - 1;
@@ -614,7 +608,7 @@ BLINK_RT_FN int64_t blink_map2_remove(blink_map_v2* m, const void* key) {
     int64_t idx = (int64_t)(h & (uint64_t)mask);
     while (m->states[idx] != 0) {
         if (m->states[idx] == 1) {
-            const void* existing = blink_map2_key_slot(m, idx, stride);
+            const void* existing = blink_map_key_slot(m, idx, stride);
             if (k->eq(existing, key)) {
                 m->states[idx] = 2;
                 m->len--;
@@ -627,14 +621,14 @@ BLINK_RT_FN int64_t blink_map2_remove(blink_map_v2* m, const void* key) {
 }
 #endif
 
-BLINK_RT_FN int64_t blink_map2_len(const blink_map_v2* m);
+BLINK_RT_FN int64_t blink_map_len(const blink_map* m);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN int64_t blink_map2_len(const blink_map_v2* m) { return m->len; }
+BLINK_RT_FN int64_t blink_map_len(const blink_map* m) { return m->len; }
 #endif
 
-BLINK_RT_FN void blink_map2_clear(blink_map_v2* m);
+BLINK_RT_FN void blink_map_clear(blink_map* m);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN void blink_map2_clear(blink_map_v2* m) {
+BLINK_RT_FN void blink_map_clear(blink_map* m) {
     m->len = 0;
     memset(m->states, 0, sizeof(uint8_t) * (size_t)m->cap);
 }
@@ -643,9 +637,9 @@ BLINK_RT_FN void blink_map2_clear(blink_map_v2* m) {
 /* For inline keys, allocates one bulk buffer sized `len * key_size` and pushes
    pointers into it (avoids N small allocations on large maps). For pointer keys,
    pushes the stored pointer directly. Caller must know K to interpret. */
-BLINK_RT_FN blink_list* blink_map2_keys(const blink_map_v2* m);
+BLINK_RT_FN blink_list* blink_map_keys(const blink_map* m);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN blink_list* blink_map2_keys(const blink_map_v2* m) {
+BLINK_RT_FN blink_list* blink_map_keys(const blink_map* m) {
     blink_list* result = blink_list_new();
     const blink_kops* k = m->kops;
     size_t stride = blink_kops_stride(k);
@@ -683,9 +677,9 @@ BLINK_RT_FN blink_list* blink_map2_keys(const blink_map_v2* m) {
 }
 #endif
 
-BLINK_RT_FN blink_list* blink_map2_values(const blink_map_v2* m);
+BLINK_RT_FN blink_list* blink_map_values(const blink_map* m);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN blink_list* blink_map2_values(const blink_map_v2* m) {
+BLINK_RT_FN blink_list* blink_map_values(const blink_map* m) {
     blink_list* result = blink_list_new();
     for (int64_t i = 0; i < m->cap; i++) {
         if (m->states[i] == 1) blink_list_push(result, m->values[i]);
@@ -696,10 +690,31 @@ BLINK_RT_FN blink_list* blink_map2_values(const blink_map_v2* m) {
 
 /* ── Built-in kops tables ────────────────────────────────────────────── */
 
+BLINK_RT_FN void blink_map_set_seed(uint64_t s);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_map_set_seed(uint64_t s) { blink_map_seed = s; }
+#endif
+
+/* Default-seed initialization. `deterministic` non-zero pins seed=0; otherwise
+   the seed is drawn from BLINK_MAP_SEED if set, else time^pid. Called once
+   from generated main() before any user code runs. */
+BLINK_RT_FN void blink_map_init_seed(int deterministic);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_map_init_seed(int deterministic) {
+    if (deterministic) { blink_map_seed = 0; return; }
+    const char* env_s = getenv("BLINK_MAP_SEED");
+    if (env_s && *env_s) {
+        blink_map_seed = (uint64_t)strtoull(env_s, NULL, 10);
+        return;
+    }
+    blink_map_seed = (uint64_t)time(NULL) ^ ((uint64_t)getpid() << 16);
+}
+#endif
+
 BLINK_RT_FN uint64_t blink_kops_hash_str(const void* k);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN uint64_t blink_kops_hash_str(const void* k) {
-    return blink_map_hash((const char*)k);
+    return blink_map_hash((const char*)k) ^ blink_map_seed;
 }
 #endif
 
@@ -724,26 +739,26 @@ BLINK_RT_FN uint64_t blink_kops_mix_u64(uint64_t x) {
 #endif
 
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-static uint64_t blink_kops_hash_i64(const void* k) { return blink_kops_mix_u64((uint64_t)*(const int64_t*)k); }
+static uint64_t blink_kops_hash_i64(const void* k) { return blink_kops_mix_u64(blink_map_seed ^ (uint64_t)*(const int64_t*)k); }
 static int      blink_kops_eq_i64  (const void* a, const void* b) { return *(const int64_t*)a == *(const int64_t*)b; }
-static uint64_t blink_kops_hash_u64(const void* k) { return blink_kops_mix_u64(*(const uint64_t*)k); }
+static uint64_t blink_kops_hash_u64(const void* k) { return blink_kops_mix_u64(blink_map_seed ^ *(const uint64_t*)k); }
 static int      blink_kops_eq_u64  (const void* a, const void* b) { return *(const uint64_t*)a == *(const uint64_t*)b; }
-static uint64_t blink_kops_hash_i32(const void* k) { return blink_kops_mix_u64((uint64_t)(int64_t)*(const int32_t*)k); }
+static uint64_t blink_kops_hash_i32(const void* k) { return blink_kops_mix_u64(blink_map_seed ^ (uint64_t)(int64_t)*(const int32_t*)k); }
 static int      blink_kops_eq_i32  (const void* a, const void* b) { return *(const int32_t*)a == *(const int32_t*)b; }
-static uint64_t blink_kops_hash_u32(const void* k) { return blink_kops_mix_u64((uint64_t)*(const uint32_t*)k); }
+static uint64_t blink_kops_hash_u32(const void* k) { return blink_kops_mix_u64(blink_map_seed ^ (uint64_t)*(const uint32_t*)k); }
 static int      blink_kops_eq_u32  (const void* a, const void* b) { return *(const uint32_t*)a == *(const uint32_t*)b; }
-static uint64_t blink_kops_hash_i16(const void* k) { return blink_kops_mix_u64((uint64_t)(int64_t)*(const int16_t*)k); }
+static uint64_t blink_kops_hash_i16(const void* k) { return blink_kops_mix_u64(blink_map_seed ^ (uint64_t)(int64_t)*(const int16_t*)k); }
 static int      blink_kops_eq_i16  (const void* a, const void* b) { return *(const int16_t*)a == *(const int16_t*)b; }
-static uint64_t blink_kops_hash_u16(const void* k) { return blink_kops_mix_u64((uint64_t)*(const uint16_t*)k); }
+static uint64_t blink_kops_hash_u16(const void* k) { return blink_kops_mix_u64(blink_map_seed ^ (uint64_t)*(const uint16_t*)k); }
 static int      blink_kops_eq_u16  (const void* a, const void* b) { return *(const uint16_t*)a == *(const uint16_t*)b; }
-static uint64_t blink_kops_hash_i8 (const void* k) { return blink_kops_mix_u64((uint64_t)(int64_t)*(const int8_t*)k); }
+static uint64_t blink_kops_hash_i8 (const void* k) { return blink_kops_mix_u64(blink_map_seed ^ (uint64_t)(int64_t)*(const int8_t*)k); }
 static int      blink_kops_eq_i8   (const void* a, const void* b) { return *(const int8_t*)a == *(const int8_t*)b; }
-static uint64_t blink_kops_hash_u8 (const void* k) { return blink_kops_mix_u64((uint64_t)*(const uint8_t*)k); }
+static uint64_t blink_kops_hash_u8 (const void* k) { return blink_kops_mix_u64(blink_map_seed ^ (uint64_t)*(const uint8_t*)k); }
 static int      blink_kops_eq_u8   (const void* a, const void* b) { return *(const uint8_t*)a == *(const uint8_t*)b; }
-static uint64_t blink_kops_hash_bool(const void* k) { return blink_kops_mix_u64(*(const uint8_t*)k ? 1u : 0u); }
+static uint64_t blink_kops_hash_bool(const void* k) { return blink_kops_mix_u64(blink_map_seed ^ (*(const uint8_t*)k ? 1u : 0u)); }
 static int      blink_kops_eq_bool (const void* a, const void* b) { return (*(const uint8_t*)a != 0) == (*(const uint8_t*)b != 0); }
 /* Char is U32 in Blink (codepoint). */
-static uint64_t blink_kops_hash_char(const void* k) { return blink_kops_mix_u64((uint64_t)*(const uint32_t*)k); }
+static uint64_t blink_kops_hash_char(const void* k) { return blink_kops_mix_u64(blink_map_seed ^ (uint64_t)*(const uint32_t*)k); }
 static int      blink_kops_eq_char (const void* a, const void* b) { return *(const uint32_t*)a == *(const uint32_t*)b; }
 #endif
 
@@ -783,56 +798,6 @@ BLINK_KOPS_STORAGE const blink_kops blink_kops_i8   = { blink_kops_hash_i8,  bli
 BLINK_KOPS_STORAGE const blink_kops blink_kops_u8   = { blink_kops_hash_u8,  blink_kops_eq_u8,  sizeof(uint8_t), 1 };
 BLINK_KOPS_STORAGE const blink_kops blink_kops_bool = { blink_kops_hash_bool,blink_kops_eq_bool,sizeof(uint8_t), 1 };
 BLINK_KOPS_STORAGE const blink_kops blink_kops_char = { blink_kops_hash_char,blink_kops_eq_char,sizeof(uint32_t), 1 };
-#endif
-
-/* ── Legacy blink_map_* C API (Str-keyed kops_str shim) ──────────────── */
-/* Provided so codegen that still emits the legacy `blink_map_*` symbols continues
-   to link. `blink_map` is a typedef for `blink_map_v2`; these are thin shims to
-   the v2 entry points with `&blink_kops_str` pre-bound. */
-
-BLINK_RT_FN blink_map* blink_map_new(void);
-#ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN blink_map* blink_map_new(void) { return blink_map2_new(&blink_kops_str); }
-#endif
-
-BLINK_RT_FN void blink_map_set(blink_map* m, const char* key, void* value);
-#ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN void blink_map_set(blink_map* m, const char* key, void* value) { blink_map2_set(m, (const void*)key, value); }
-#endif
-
-BLINK_RT_FN void* blink_map_get(const blink_map* m, const char* key);
-#ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN void* blink_map_get(const blink_map* m, const char* key) { return blink_map2_get(m, (const void*)key); }
-#endif
-
-BLINK_RT_FN int64_t blink_map_has(const blink_map* m, const char* key);
-#ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN int64_t blink_map_has(const blink_map* m, const char* key) { return blink_map2_has(m, (const void*)key); }
-#endif
-
-BLINK_RT_FN int64_t blink_map_remove(blink_map* m, const char* key);
-#ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN int64_t blink_map_remove(blink_map* m, const char* key) { return blink_map2_remove(m, (const void*)key); }
-#endif
-
-BLINK_RT_FN int64_t blink_map_len(const blink_map* m);
-#ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN int64_t blink_map_len(const blink_map* m) { return blink_map2_len(m); }
-#endif
-
-BLINK_RT_FN void blink_map_clear(blink_map* m);
-#ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN void blink_map_clear(blink_map* m) { blink_map2_clear(m); }
-#endif
-
-BLINK_RT_FN blink_list* blink_map_keys(const blink_map* m);
-#ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN blink_list* blink_map_keys(const blink_map* m) { return blink_map2_keys(m); }
-#endif
-
-BLINK_RT_FN blink_list* blink_map_values(const blink_map* m);
-#ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN blink_list* blink_map_values(const blink_map* m) { return blink_map2_values(m); }
 #endif
 
 /* ── Hash set (string-keyed) ─────────────────────────────────────────── */
