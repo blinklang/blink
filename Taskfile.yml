@@ -136,17 +136,38 @@ tasks:
             io.println(s.to_str())
         }
         BLINK
+        EXPECTED=$(printf 'hello/world\nok')
+
+        # Case 1: invoke via full path (covers absolute argv[0]).
         cd "$TMPDIR"
         OUTPUT=$(env -u BLINK_ROOT "$INSTALL_PREFIX/bin/blink" run "$TMPDIR/test_standalone.bl" 2>&1)
-        EXPECTED=$(printf 'hello/world\nok')
-        if [ "$OUTPUT" = "$EXPECTED" ]; then
-          echo "PASS test-installed"
-        else
-          echo "FAIL test-installed"
+        if [ "$OUTPUT" != "$EXPECTED" ]; then
+          echo "FAIL test-installed (full-path invocation)"
           echo "Expected: $EXPECTED"
           echo "Got: $OUTPUT"
           exit 1
         fi
+        echo "PASS test-installed (full-path invocation)"
+
+        # Case 2: invoke as bare `blink` from a project subdir (covers
+        # PATH-resolved argv[0] = "blink"). Mimics a real user running
+        # `blink build src/main.bl` from their project root. This is the
+        # path that broke in 8gtzx8 — readlink -f on a bare basename
+        # joined cwd onto it and resolved share/blink/ relative to the
+        # wrong root, falling through to "build" (the user's project
+        # build dir, which has no archive).
+        PROJECT_DIR="$TMPDIR/userproj"
+        mkdir -p "$PROJECT_DIR/src"
+        cp "$TMPDIR/test_standalone.bl" "$PROJECT_DIR/src/main.bl"
+        cd "$PROJECT_DIR"
+        OUTPUT=$(env -u BLINK_ROOT PATH="$INSTALL_PREFIX/bin:$PATH" blink run src/main.bl 2>&1)
+        if [ "$OUTPUT" != "$EXPECTED" ]; then
+          echo "FAIL test-installed (PATH-resolved invocation)"
+          echo "Expected: $EXPECTED"
+          echo "Got: $OUTPUT"
+          exit 1
+        fi
+        echo "PASS test-installed (PATH-resolved invocation)"
 
   ci:
     desc: Full CI — regen bootstrap + run all tests
@@ -367,7 +388,37 @@ tasks:
       - zig cc -O2 -Wno-parentheses-equality -I{{.GC_INC}} -I{{.SQLITE_INC}} -I{{.BUILD_DIR}} -target x86_64-linux-gnu -o {{.BUILD_DIR}}/blink-linux-x86_64 {{.BUILD_DIR}}/cli.c .tmp/monolith-linux-x86_64.o .tmp/sqlite3-linux-x86_64.o .tmp/gc-linux-x86_64.o -lm -Wl,--gc-sections
       - zig cc -O2 -Wno-parentheses-equality -I{{.GC_STUBS}} -I{{.GC_INC}} -I{{.SQLITE_INC}} -I{{.BUILD_DIR}} -target x86_64-macos -o {{.BUILD_DIR}}/blink-macos-x86_64 {{.BUILD_DIR}}/cli.c .tmp/monolith-macos-x86_64.o .tmp/sqlite3-macos-x86_64.o .tmp/gc-macos-x86_64.o -lm -Wl,-dead_strip
       - zig cc -O2 -Wno-parentheses-equality -I{{.GC_STUBS}} -I{{.GC_INC}} -I{{.SQLITE_INC}} -I{{.BUILD_DIR}} -target aarch64-macos -o {{.BUILD_DIR}}/blink-macos-aarch64 {{.BUILD_DIR}}/cli.c .tmp/monolith-macos-aarch64.o .tmp/sqlite3-macos-aarch64.o .tmp/gc-macos-aarch64.o -lm -Wl,-dead_strip
-      - echo "Built binaries for linux-x86_64, macos-x86_64, macos-aarch64 ({{.VERSION}})"
+      # Per-target stdlib archives, assembled from the matching monolith.o so
+      # the released `blink` can link user code at user-compile time. The host
+      # archive's libblink_std.a is single-object (just monolith.o), so we
+      # produce the same shape here per target. zig ar emits a portable
+      # ranlib'd archive regardless of host toolchain.
+      - |
+        for t in linux-x86_64 macos-x86_64 macos-aarch64; do
+          rm -f .tmp/libblink_std-$t.a
+          zig ar rcs .tmp/libblink_std-$t.a .tmp/monolith-$t.o
+        done
+      # Stage release layout per target: bin/blink + share/blink/{archive,headers}.
+      # This matches `task install` layout (bin/, share/blink/) so the
+      # binary's resolve_install_root() finds share/blink/ via argv[0].
+      - |
+        ARC_REL="{{.BUILD_DIR}}/$(readlink {{.BUILD_DIR}}/libblink_std.a | xargs dirname)"
+        rm -rf {{.BUILD_DIR}}/dist
+        for t in linux-x86_64 macos-x86_64 macos-aarch64; do
+          d={{.BUILD_DIR}}/dist/blink-$t
+          mkdir -p $d/bin $d/share/blink
+          cp {{.BUILD_DIR}}/blink-$t $d/bin/blink
+          cp .tmp/libblink_std-$t.a $d/share/blink/libblink_std.a
+          cp "$ARC_REL/libblink_std.h" $d/share/blink/libblink_std.h
+          cp {{.BUILD_DIR}}/runtime.h $d/share/blink/runtime.h
+        done
+      # Tar each layout for upload. Use `-C` so the top-level dir inside the
+      # tar is blink-<target>/, giving extractors a clean rename target.
+      - |
+        for t in linux-x86_64 macos-x86_64 macos-aarch64; do
+          tar -czf {{.BUILD_DIR}}/blink-$t.tar.gz -C {{.BUILD_DIR}}/dist blink-$t
+        done
+      - echo "Built binaries + dist tarballs for linux-x86_64, macos-x86_64, macos-aarch64 ({{.VERSION}})"
 
   release:
     desc: "Create a GitHub release (usage: task release -- v0.5.0)"
@@ -387,9 +438,10 @@ tasks:
       - git push origin {{.CLI_ARGS}}
       - |
         gh release create {{.CLI_ARGS}} \
-          {{.BUILD_DIR}}/blink-linux-x86_64 \
-          {{.BUILD_DIR}}/blink-macos-x86_64 \
-          {{.BUILD_DIR}}/blink-macos-aarch64 \
+          {{.BUILD_DIR}}/blink-linux-x86_64.tar.gz \
+          {{.BUILD_DIR}}/blink-macos-x86_64.tar.gz \
+          {{.BUILD_DIR}}/blink-macos-aarch64.tar.gz \
+          install.sh \
           llms-full.md \
           --title "{{.CLI_ARGS}}" \
           --generate-notes

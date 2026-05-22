@@ -2,6 +2,21 @@
 
 Single source of truth for release history. `blink llms` and `blink llms --full` both append this file after the reference text, and every release version is indexed as a topic (e.g. `blink llms --topic v0.36`). **Edit only here** — `llms.md` and `llms-full.md` hold only a `## Recent Changes` stub pointing at this file.
 
+## Fixes (v0.44)
+
+- **`blink build` / `blink run` invoked as bare `blink` from a user project now finds the stdlib archive.** v0.43 fixed the `~/.local/bin/blink` invocation by full path, but PATH-resolved invocation (`blink build src/main.bl`) still failed with `fatal error: libblink_std.h: No such file or directory`. `resolve_install_root()` ran `readlink -f blink`, which joined the bare basename onto the user's cwd and produced a nonexistent path; the dirname walk then resolved `share/blink/` against the wrong root and fell through to the relative `"build"` fallback. Now bare argv[0] is resolved via `command -v` before `readlink -f`, and the resolved path is verified to exist. (Closes 8gtzx8.)
+
+## What's New (v0.44)
+
+### Install / Distribution
+
+- **Release binaries downloaded from GitHub can now compile user programs out of the box.** Each release ships a per-target tarball (`blink-<target>.tar.gz`) containing `bin/blink` plus `share/blink/{libblink_std.a, libblink_std.h, runtime.h}`. The binary locates the archive via `realpath(argv[0])` — no `BLINK_ROOT`, no `task install`, no missing `libblink_std.a` errors. Layout matches Go's `GOROOT` and `task install`.
+- **`install.sh`** for one-line install: `curl -sSL https://github.com/blinklang/blink/releases/latest/download/install.sh | sh`. Detects platform (linux-x86_64, macos-x86_64, macos-aarch64), resolves the latest tag (or `--version vX.Y.Z`), and extracts to `$HOME/.local` by default (override with `--prefix` or `BLINK_PREFIX`; auto-sudo for non-writable prefixes).
+
+### CI
+
+- **`task test-installed` now covers PATH-resolved invocation** (`blink build` from a project subdir with the install prefix on `$PATH`), not just full-path invocation. This is the path that broke in 8gtzx8 and slipped past CI in v0.43.
+
 ## Breaking Changes (v0.43)
 
 - **`Map[K, V]` key type now enforced at typecheck.** `Float`/`F32`/`F64` keys, and user struct/enum keys without `@derive(Hash, Eq)`, are rejected with `E1400 MapKeyNotHashable`. Previously these compiled and produced a `BLINK_COMPILER_BUG_kops_unsupported_K` sentinel or a cryptic C error. Generic K passes through to monomorphization.
