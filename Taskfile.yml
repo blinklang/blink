@@ -340,16 +340,33 @@ tasks:
       GC_STUBS: bootstrap/vendor/gc/include/zig-stubs
       GC_DEFS: -DGC_THREADS -DGC_BUILTIN_ATOMIC -DUSE_MMAP -DUSE_MUNMAP
       GC_MACOS_DEFS: -DGC_THREADS -DGC_BUILTIN_ATOMIC -DUSE_MMAP -DUSE_MUNMAP -DNO_MPROTECT_VDB
+      SQLITE_SRC: lib/native/sqlite3/sqlite3.c
+      SQLITE_INC: lib/native/sqlite3
+      SQLITE_DEFS: -DSQLITE_THREADSAFE=1
+      MONO_DEFS: -ffunction-sections -fdata-sections -DBLINK_USE_SQLITE=1
     cmds:
-      - bin/blink build src/cli.bl --emit c
+      # Emit the user-TU cli.c in archive mode (matches build-cli).
+      - "{{.BLINKC}} --link-archive {{.BUILD_DIR}}/libblink_std.h src/cli.bl {{.BUILD_DIR}}/cli.c"
       - sed -i 's/blink_cli_version = "[^"]*"/blink_cli_version = "{{.VERSION}}"/' {{.BUILD_DIR}}/cli.c
       - mkdir -p .tmp
+      # GC per target
       - zig cc -c -O2 {{.GC_DEFS}} -I{{.GC_INC}} -target x86_64-linux-gnu -o .tmp/gc-linux-x86_64.o {{.GC_SRC}}
       - zig cc -c -O2 {{.GC_MACOS_DEFS}} -I{{.GC_STUBS}} -I{{.GC_INC}} -target x86_64-macos -o .tmp/gc-macos-x86_64.o {{.GC_SRC}}
       - zig cc -c -O2 {{.GC_MACOS_DEFS}} -I{{.GC_STUBS}} -I{{.GC_INC}} -target aarch64-macos -o .tmp/gc-macos-aarch64.o {{.GC_SRC}}
-      - zig cc -O2 -Wno-parentheses-equality -I{{.GC_INC}} -target x86_64-linux-gnu -o {{.BUILD_DIR}}/blink-linux-x86_64 {{.BUILD_DIR}}/cli.c .tmp/gc-linux-x86_64.o -lm
-      - zig cc -O2 -Wno-parentheses-equality -I{{.GC_STUBS}} -I{{.GC_INC}} -target x86_64-macos -o {{.BUILD_DIR}}/blink-macos-x86_64 {{.BUILD_DIR}}/cli.c .tmp/gc-macos-x86_64.o -lm
-      - zig cc -O2 -Wno-parentheses-equality -I{{.GC_STUBS}} -I{{.GC_INC}} -target aarch64-macos -o {{.BUILD_DIR}}/blink-macos-aarch64 {{.BUILD_DIR}}/cli.c .tmp/gc-macos-aarch64.o -lm
+      # sqlite3 per target
+      - zig cc -c -O2 {{.SQLITE_DEFS}} -target x86_64-linux-gnu -o .tmp/sqlite3-linux-x86_64.o {{.SQLITE_SRC}}
+      - zig cc -c -O2 {{.SQLITE_DEFS}} -target x86_64-macos -o .tmp/sqlite3-macos-x86_64.o {{.SQLITE_SRC}}
+      - zig cc -c -O2 {{.SQLITE_DEFS}} -target aarch64-macos -o .tmp/sqlite3-macos-aarch64.o {{.SQLITE_SRC}}
+      # stdlib monolith per target (uses the same archive sources that build-cli compiled host-side via __build-stdlib-archive)
+      - |
+        ARC_REL="{{.BUILD_DIR}}/$(readlink {{.BUILD_DIR}}/libblink_std.a | xargs dirname)"
+        zig cc -c -O2 {{.MONO_DEFS}} -target x86_64-linux-gnu -I{{.GC_INC}} -I{{.SQLITE_INC}} -I"$ARC_REL" -o .tmp/monolith-linux-x86_64.o "$ARC_REL/monolith.c"
+        zig cc -c -O2 {{.MONO_DEFS}} -target x86_64-macos -I{{.GC_STUBS}} -I{{.GC_INC}} -I{{.SQLITE_INC}} -I"$ARC_REL" -o .tmp/monolith-macos-x86_64.o "$ARC_REL/monolith.c"
+        zig cc -c -O2 {{.MONO_DEFS}} -target aarch64-macos -I{{.GC_STUBS}} -I{{.GC_INC}} -I{{.SQLITE_INC}} -I"$ARC_REL" -o .tmp/monolith-macos-aarch64.o "$ARC_REL/monolith.c"
+      # Link each target binary against its own GC + sqlite + stdlib monolith.
+      - zig cc -O2 -Wno-parentheses-equality -I{{.GC_INC}} -I{{.SQLITE_INC}} -I{{.BUILD_DIR}} -target x86_64-linux-gnu -o {{.BUILD_DIR}}/blink-linux-x86_64 {{.BUILD_DIR}}/cli.c .tmp/monolith-linux-x86_64.o .tmp/sqlite3-linux-x86_64.o .tmp/gc-linux-x86_64.o -lm -Wl,--gc-sections
+      - zig cc -O2 -Wno-parentheses-equality -I{{.GC_STUBS}} -I{{.GC_INC}} -I{{.SQLITE_INC}} -I{{.BUILD_DIR}} -target x86_64-macos -o {{.BUILD_DIR}}/blink-macos-x86_64 {{.BUILD_DIR}}/cli.c .tmp/monolith-macos-x86_64.o .tmp/sqlite3-macos-x86_64.o .tmp/gc-macos-x86_64.o -lm -Wl,-dead_strip
+      - zig cc -O2 -Wno-parentheses-equality -I{{.GC_STUBS}} -I{{.GC_INC}} -I{{.SQLITE_INC}} -I{{.BUILD_DIR}} -target aarch64-macos -o {{.BUILD_DIR}}/blink-macos-aarch64 {{.BUILD_DIR}}/cli.c .tmp/monolith-macos-aarch64.o .tmp/sqlite3-macos-aarch64.o .tmp/gc-macos-aarch64.o -lm -Wl,-dead_strip
       - echo "Built binaries for linux-x86_64, macos-x86_64, macos-aarch64 ({{.VERSION}})"
 
   release:
