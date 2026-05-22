@@ -1,6 +1,6 @@
 # Blink Language Reference
 
-> Blink is a statically-typed, effect-tracked language compiling to C. **Compiler v0.42.0**.
+> Blink is a statically-typed, effect-tracked language compiling to C. **Compiler v0.43.0**.
 
 ## Install
 
@@ -12,7 +12,7 @@ docker pull ghcr.io/blinklang/blink:latest
 docker run --rm -v "$PWD":/workspace ghcr.io/blinklang/blink run myfile.bl
 ```
 
-Tags: `latest`, `0.42`, `0.42.0` (semver). Image is `debian:bookworm-slim` with `gcc`, `zig`, `blink`, `libgc-dev`, and `libsqlite3-dev`.
+Tags: `latest`, `0.43`, `0.43.0` (semver). Image is `debian:bookworm-slim` with `gcc`, `zig`, `blink`, `libgc-dev`, and `libsqlite3-dev`.
 
 ## Recent Changes
 
@@ -531,6 +531,8 @@ let s = str_from_code_point(65)         // -> Str ("A"), from std.str
 
 ## Map[K, V] Methods
 
+`K` may be `Str`, `Int`, `Bool`, `Char`, any sized-int (`I8`..`U64`), a tuple of hashable types, or a user `struct`/`enum` with `@derive(Hash, Eq)`. `Float`/`F32`/`F64` keys and user types without `@derive(Hash, Eq)` are rejected with `E1400 MapKeyNotHashable`. Tuples auto-derive `Hash`/`Eq` structurally.
+
 | Method | Returns | Purpose |
 |--------|---------|---------|
 | `Map()` | Map[K,V] | Create empty map (NOT `{}`) |
@@ -791,7 +793,7 @@ Selective imports (`import mod.{a, b}`) restrict which *unqualified* items are v
 |------------|--------|---------|
 | `@module(name)` | module | Module declaration |
 | `@capabilities(...)` | module | Effect ceiling |
-| `@derive(...)` | type | Auto-generate traits (Serialize, Deserialize, Eq, Ord, Hash, Debug, Clone, Display) |
+| `@derive(...)` | type | Auto-generate traits. Accepted names: `Serialize`, `Deserialize`, `Eq`, `Clone`, `Hash`. Unknown names rejected as `E1112 UnknownDerive`. |
 | `@src(req)` | fn | Requirement traceability |
 | `@requires(expr)` | fn | Precondition |
 | `@ensures(expr)` | fn | Postcondition runtime-checked at every return (`result` = return value). Inside the predicate, `old(arg)` snapshots an argument's value at fn entry. |
@@ -978,7 +980,7 @@ impl BlockHandler for Transaction {
 |--------|-----------|
 | `std.str` | `str_split`, `str_join`, `str_replace`, `str_lines`, `str_trim`, `str_to_upper`, `str_to_lower`, `json_escape_str` |
 | `std.list` | `list_map[T,U]`, `list_filter[T]`, `list_fold[T,U]`, `list_any[T]`, `list_all[T]`, `list_for_each[T]`, `list_concat[T]`, `list_slice[T]` |
-| `std.map` | `map_for_each[V]`, `map_filter[V]`, `map_fold[V,U]`, `map_map_values[V,U]`, `map_merge[V]` |
+| `std.map` | `map_for_each[K,V]`, `map_filter[K,V]`, `map_fold[K,V,U]`, `map_map_values[K,V,U]`, `map_merge[K,V]` |
 | `std.num` | `parse_int`, `parse_float`, `int_to_str`, `float_to_str` |
 | `std.sb` | StringBuilder extensions |
 | `std.bytes` | Bytes type operations |
@@ -1018,6 +1020,11 @@ bin/blink update                  # update deps + blink-version in blink.toml
 # Release builds (optimized with -O2)
 bin/blink build src/main.bl --release
 bin/blink build src/main.bl -R
+
+# Deterministic map iteration — pin Map hash seed to 0 for reproducible builds/runs
+# (default: reads $BLINK_MAP_SEED, falls back to time(NULL) ^ (getpid()<<16))
+bin/blink build src/main.bl --deterministic
+bin/blink run src/main.bl --deterministic
 
 # Cross-compilation (single target)
 bin/blink build src/main.bl --target linux

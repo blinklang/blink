@@ -2,6 +2,54 @@
 
 Single source of truth for release history. `blink llms` and `blink llms --full` both append this file after the reference text, and every release version is indexed as a topic (e.g. `blink llms --topic v0.36`). **Edit only here** — `llms.md` and `llms-full.md` hold only a `## Recent Changes` stub pointing at this file.
 
+## Breaking Changes (v0.43)
+
+- **`Map[K, V]` key type now enforced at typecheck.** `Float`/`F32`/`F64` keys, and user struct/enum keys without `@derive(Hash, Eq)`, are rejected with `E1400 MapKeyNotHashable`. Previously these compiled and produced a `BLINK_COMPILER_BUG_kops_unsupported_K` sentinel or a cryptic C error. Generic K passes through to monomorphization.
+- **`@module("")` is rejected as `E1008 InvalidModuleAnnotation`.** Never spec-authorized; existed only as an internal codegen carve-out. No in-tree uses remain.
+- **Unknown `@derive(...)` names are rejected as `E1112 UnknownDerive`.** Only `Serialize`, `Deserialize`, `Eq`, `Clone`, `Hash` are accepted; bogus names previously silently no-op'd.
+- **`?` in a test body now requires `Display` for the error type (`E0514 DisplayRequiredForQuestionMark`).** The error message is rendered via `Display.display(e)` at the propagation site.
+- **Annotated test return type rejected (`E0515 AnnotatedTestReturnTypeRejected`).** `test "x" -> Result[Void, E] {}` is no longer accepted; elaboration is implicit when `?` appears in the body.
+- **`impl Trait[T] for U` with unbound `T` is now rejected at typecheck.** Previously slipped past the single-letter carve-out and lowered T to `void` in codegen, producing C that failed to compile. Help text directs users to the canonical `impl[T] Trait[T] for Recv[T]` form.
+
+## What's New (v0.43)
+
+### Language
+
+- **`Map[K, V]` over arbitrary key types.** `Int`, `Bool`, `Char`, all sized-int widths, user structs with `@derive(Hash, Eq)`, user enums (including data enums) with `@derive(Hash, Eq)`, and tuples of any combination of the above. Tuple `Hash`/`Eq` are structurally auto-derived (no annotation needed). (Closes h0geg9.)
+- **`@derive(Hash)`** on structs and enums emits a structural hasher compatible with Map keys.
+- **`?` operator in `test {}` bodies.** When `?` appears in a test body, the body is implicitly elaborated to `Result[Void, TestError]`. Propagated errors emit NDJSON `cause:"propagated_error"` with `{message, error_type}`. `blink check` and `blink test` now agree on what's a valid test program.
+
+### CLI
+
+- **`--deterministic`** on `build`/`run` — pins the map hash seed to 0 for reproducible iteration order. Default policy reads `$BLINK_MAP_SEED` or falls back to `time(NULL) ^ (getpid()<<16)`.
+
+### Stdlib / Testing
+
+- **`testing.for_each` runtime label-uniqueness check** — duplicate case labels panic with index info.
+- **Test runner emits `"case":"<label>"`** alongside the parent test name when a `for_each` case body fails an assertion. Human-readable output gets a `(case "X")` suffix.
+- **Map stdlib HOFs widened to `[K, V]`** — `map_for_each`, `map_filter`, `map_fold`, `map_map_values`, `map_merge` now generic over K (was `Map[Str, V]` only).
+
+### Installed-binary improvements
+
+- **`blink` installed at `~/.local/bin/` no longer requires `BLINK_ROOT`.** `task build` now ships `libblink_std.{a,h}` and `runtime.h` to `~/.local/share/blink/`. Resolution via `realpath(argv[0])`.
+- **Embedded stdlib registry auto-generated from disk** — no more drift between `#embed` consts and `lib/std/*.bl`. Includes previously-missing `std.arena`, `std.float`, `std.libc`.
+
+### Fixes
+
+- **`Str` ordering operators (`<`, `<=`, `>`, `>=`)** now compare contents via `strcmp`. Previously emitted raw `const char*` pointer comparison, returning arbitrary results based on data-segment layout.
+- **`Option[T]` / `Result[T, E]` in tuple element position** now lowers correctly. Previously type-erased to `int`/`void`, breaking any `update` fn returning `(Model, Option[Cmd])`.
+- **Bare `None` in a tuple slot** now picks up the surrounding fn's tuple return ann instead of falling back to `Option[Int]`.
+- **`.unwrap()` / `.unwrap_or()` / `.unwrap_err()`** on any `Option`/`Result` receiver (method-chained, if-expr tail, block-tailed) now infers the correct return type. Previously fell through to `Void` and emitted `const void s = 0;`, segfaulting on use.
+- **`Option[UserEnum]`** compiles — `Some(<enum-value>)` now routes through the struct-option carrier.
+- **`@derive(Eq)` on structs/enums with sized-int (`I8`..`U64`/`Char`) fields** now compares those fields. Previously skipped, with hash/eq divergence on Map keys.
+- **`type Alias = T` at fn params/returns** now lowers correctly (was emitting `void`).
+- **Closures with explicit tuple-typed parameters** (`fn(c: (Int, Int)) { ... }`) now compile (param type was lowering to `void`).
+- **`for_each[T]` over a list of tuples** infers T correctly through the tuple element.
+- **String interpolation of escaped quote (`"{f(\"x\")}"`)** now lexes correctly.
+- **`\}` escape in string literals** preserved through `fmt` round-trip.
+- **`Bytes.with_ptr(fn(p) -> I64 { ... })`** return-type propagation fixed.
+- **Test-block names containing `\"` / `\\`** survive formatter round-trip.
+
 ## What's New (v0.42)
 
 ### Runtime contracts (spec §refinement-contracts)
