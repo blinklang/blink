@@ -673,6 +673,44 @@ pub fn emit_match_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scop
     }
 }
 
+// Resolve the C-level payload carrier for Some/Ok/Err unwrap.
+// `enum_name` must be one of "Some" / "Ok" / "Err"; `scrut_type` is the
+// scrutinee's compound carrier (CT_OPTION / CT_RESULT). Returns the field
+// name on the carrier ("value" / "ok" / "err"), the inner CT, the inner
+// struct name (or ""), and the payload expression — an enum-by-value box
+// is auto-dereferenced for "value" when the inner is an enum type.
+type UnwrapCarrier {
+    field: Str
+    inner_ct: Int
+    inner_struct: Str
+    payload_expr: Str
+}
+
+fn unwrap_carrier(enum_name: Str, scrut: Str, scrut_type: Int) -> UnwrapCarrier {
+    let field = if enum_name == "Some" { "value" } else if enum_name == "Ok" { "ok" } else { "err" }
+    let mut inner_ct = CT_VOID
+    let mut inner_struct = ""
+    if enum_name == "Some" && scrut_type == CT_OPTION {
+        inner_ct = expr_option_inner
+        inner_struct = expr_option_inner_struct
+    } else if enum_name == "Ok" && scrut_type == CT_RESULT {
+        inner_ct = expr_result_ok_type
+        inner_struct = expr_result_ok_struct
+    } else if enum_name == "Err" && scrut_type == CT_RESULT {
+        inner_ct = expr_result_err_type
+        inner_struct = expr_result_err_struct
+    }
+    let inner_is_enum = inner_struct != "" && is_enum_type(inner_struct) != 0
+    let payload_expr = if field == "value" && inner_is_enum {
+        "(*({c_type_c_name(inner_struct)}*){scrut}.value)"
+    } else if field == "value" {
+        "{scrut}.value"
+    } else {
+        "{scrut}.{field}"
+    }
+    UnwrapCarrier { field: field, inner_ct: inner_ct, inner_struct: inner_struct, payload_expr: payload_expr }
+}
+
 // Build a C condition string for a pattern.
 // scrut_off/scrut_len index into match_scruts.
 // Returns "" when the pattern always matches (wildcard/ident).
@@ -728,39 +766,14 @@ fn pattern_condition(pat: Int, scrut_off: Int, scrut_len: Int) -> Str {
                 let sub_pat2 = sublist_get(ep_flds_sl2, 0)
                 let sub_pk2 = node_kind(sub_pat2)
                 if sub_pk2 == NodeKind.EnumPattern || sub_pk2 == NodeKind.IntPattern || sub_pk2 == NodeKind.StringPattern {
-                    let mut inner_ct = CT_VOID
-                    let mut inner_struct = ""
                     let scrut_type = match_scruts.get(scrut_off).unwrap().scrut_type
-                    if enum_name == "Some" {
-                        if scrut_type == CT_OPTION {
-                            inner_ct = expr_option_inner
-                            inner_struct = expr_option_inner_struct
-                        }
-                    } else if enum_name == "Ok" {
-                        if scrut_type == CT_RESULT {
-                            inner_ct = expr_result_ok_type
-                            inner_struct = expr_result_ok_struct
-                        }
-                    } else {
-                        if scrut_type == CT_RESULT {
-                            inner_ct = expr_result_err_type
-                            inner_struct = expr_result_err_struct
-                        }
-                    }
-                    let field_name = if enum_name == "Some" { "value" } else if enum_name == "Ok" { "ok" } else { "err" }
-                    let inner_is_enum = inner_struct != "" && is_enum_type(inner_struct) != 0
-                    let payload_expr = if field_name == "value" && inner_is_enum {
-                        "(*({c_type_c_name(inner_struct)}*){scrut}.value)"
-                    } else if field_name == "value" {
-                        "{scrut}.value"
-                    } else {
-                        "{scrut}.{field_name}"
-                    }
+                    let uc = unwrap_carrier(enum_name, scrut, scrut_type)
+                    let inner_is_enum = uc.inner_struct != "" && is_enum_type(uc.inner_struct) != 0
                     let saved_scruts = match_scruts
-                    match_scruts = [MatchScrutEntry { str_val: payload_expr, scrut_type: inner_ct }]
+                    match_scruts = [MatchScrutEntry { str_val: uc.payload_expr, scrut_type: uc.inner_ct }]
                     let saved_enum = match_scrut_enum
                     if inner_is_enum {
-                        match_scrut_enum = inner_struct
+                        match_scrut_enum = uc.inner_struct
                     } else {
                         match_scrut_enum = ""
                     }
@@ -937,27 +950,10 @@ fn bind_pattern_vars(pat: Int, scrut_off: Int, scrut_len: Int) ! Codegen.Emit, C
                 let bind_name = node_name(sub_pat)
                 if bind_name != "_" {
                     let c_bind = c_safe_name(bind_name)
-                    let mut field = "ok"
-                    let mut inner_ct = CT_STRING
-                    let mut inner_struct = ""
-                    if enum_name == "Err" {
-                        field = "err"
-                        if scrut_type == CT_RESULT {
-                            inner_ct = expr_result_err_type
-                            inner_struct = expr_result_err_struct
-                        }
-                    } else if enum_name == "Ok" {
-                        if scrut_type == CT_RESULT {
-                            inner_ct = expr_result_ok_type
-                            inner_struct = expr_result_ok_struct
-                        }
-                    } else if enum_name == "Some" {
-                        field = "value"
-                        if scrut_type == CT_OPTION {
-                            inner_ct = expr_option_inner
-                            inner_struct = expr_option_inner_struct
-                        }
-                    }
+                    let uc = unwrap_carrier(enum_name, scrut, scrut_type)
+                    let field = uc.field
+                    let inner_ct = uc.inner_ct
+                    let inner_struct = uc.inner_struct
                     if inner_struct != "" && inner_ct == CT_RESULT {
                         if field == "value" {
                             emit_line("{c_type_c_name(inner_struct)} {c_bind} = *{scrut}.{field};")
@@ -1043,6 +1039,22 @@ fn bind_pattern_vars(pat: Int, scrut_off: Int, scrut_len: Int) ! Codegen.Emit, C
                 }
             } else if sub_pk == NodeKind.WildcardPattern {
                 let _skip = 0
+            } else if sub_pk == NodeKind.EnumPattern {
+                // Nested EnumPattern inside Ok/Err/Some: recurse with the unwrapped
+                // payload as scrutinee so the inner variant's field bindings emit.
+                let uc = unwrap_carrier(enum_name, scrut, scrut_type)
+                let inner_is_enum = uc.inner_struct != "" && is_enum_type(uc.inner_struct) != 0
+                let saved_scruts = match_scruts
+                let saved_enum = match_scrut_enum
+                match_scruts = [MatchScrutEntry { str_val: uc.payload_expr, scrut_type: uc.inner_ct }]
+                if inner_is_enum {
+                    match_scrut_enum = uc.inner_struct
+                } else {
+                    match_scrut_enum = ""
+                }
+                bind_pattern_vars(sub_pat, 0, 1)
+                match_scruts = saved_scruts
+                match_scrut_enum = saved_enum
             }
             return
         }

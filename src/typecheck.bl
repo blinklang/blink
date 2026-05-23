@@ -375,6 +375,32 @@ fn get_variant_by_name(enum_tid: Int, vname: Str) -> Int {
     -1
 }
 
+fn lookup_evfield_type_by_index(var_idx: Int, idx: Int) -> Int {
+    let mut i = 0
+    let mut seen = 0
+    while i < evfield_pool.len() {
+        let ef = evfield_pool.get(i).unwrap()
+        if ef.var_idx == var_idx {
+            if seen == idx { return ef.type_id }
+            seen = seen + 1
+        }
+        i = i + 1
+    }
+    -1
+}
+
+fn lookup_evfield_type_by_name(var_idx: Int, name: Str) -> Int {
+    let mut i = 0
+    while i < evfield_pool.len() {
+        let ef = evfield_pool.get(i).unwrap()
+        if ef.var_idx == var_idx && ef.name == name {
+            return ef.type_id
+        }
+        i = i + 1
+    }
+    -1
+}
+
 fn lookup_fnsig(name: Str) -> Int {
     if nr_current_module != "" {
         let qualified = "{nr_current_module}:{name}"
@@ -5133,7 +5159,17 @@ fn tc_check_pattern_types(node: Int) ! TypeCheck.Resolve {
     }
     if kind == NodeKind.EnumPattern {
         let vname = node_name(node)
+        let tname = node_type_name(node)
         let saved_binding = tc_pattern_binding_type
+        // short_name is the variant's declared name; for qualified `E.A(...)` it's `tname`,
+        // for unqualified `A(...)` it's `vname`. enum_tid is resolved from the qualifier when
+        // present, otherwise from the outer binding hint, otherwise via global lookup.
+        let mut short_name = vname
+        let mut variant_enum_tid = -1
+        if tname != "" {
+            short_name = tname
+            variant_enum_tid = named_type_map.get(vname) ?? -1
+        }
         if vname == "Some" && tc_pattern_binding_type >= 0 && type_kind(tc_pattern_binding_type) == TK_OPTION {
             tc_pattern_binding_type = ty_pool.get(tc_pattern_binding_type).unwrap().inner1
         } else if vname == "Ok" && tc_pattern_binding_type >= 0 && type_kind(tc_pattern_binding_type) == TK_RESULT {
@@ -5142,6 +5178,19 @@ fn tc_check_pattern_types(node: Int) ! TypeCheck.Resolve {
             tc_pattern_binding_type = ty_pool.get(tc_pattern_binding_type).unwrap().inner2
         } else {
             tc_pattern_binding_type = -1
+        }
+        let mut var_idx = -1
+        if variant_enum_tid >= 0 {
+            var_idx = get_variant_by_name(variant_enum_tid, short_name)
+        }
+        if var_idx == -1 && saved_binding >= 0 && type_kind(saved_binding) == TK_ENUM {
+            var_idx = get_variant_by_name(saved_binding, short_name)
+        }
+        if var_idx == -1 {
+            let fallback_tid = get_variant_enum_tid(short_name)
+            if fallback_tid != TYPE_UNKNOWN {
+                var_idx = get_variant_by_name(fallback_tid, short_name)
+            }
         }
         let flds_sl = node_fields(node)
         if flds_sl != -1 {
@@ -5152,12 +5201,25 @@ fn tc_check_pattern_types(node: Int) ! TypeCheck.Resolve {
                 if is_struct_pat != 0 {
                     // Struct-style fields: StructLitField nodes; define field names as vars
                     let fpat = node_pattern(f)
+                    let fname = node_name(f)
+                    let mut sub_t = -1
+                    if var_idx >= 0 { sub_t = lookup_evfield_type_by_name(var_idx, fname) }
+                    if sub_t < 0 { sub_t = tc_pattern_binding_type }
                     if fpat != -1 {
+                        tc_pattern_binding_type = sub_t
                         tc_check_pattern_types(fpat)
                     } else {
-                        nr_define(node_name(f))
+                        if sub_t >= 0 {
+                            nr_define_typed(fname, 0, sub_t)
+                        } else {
+                            nr_define(fname)
+                        }
                     }
                 } else {
+                    let mut sub_t = -1
+                    if var_idx >= 0 { sub_t = lookup_evfield_type_by_index(var_idx, i) }
+                    if sub_t < 0 { sub_t = tc_pattern_binding_type }
+                    tc_pattern_binding_type = sub_t
                     tc_check_pattern_types(f)
                 }
                 i = i + 1
