@@ -1,0 +1,48 @@
+// Subprocess + side-file pattern: ? propagation makes the inner test fail
+// (inner binary exits non-zero). We can't observe that in-process, so
+// Timer.exit() flushes its observation to a file before the runner exits;
+// the outer test reads the file and asserts the cleanup ran.
+
+test "? inside with-block runs BlockHandler.exit(false) before failing the test" {
+    let src = "let mut log: List[Str] = []\n" +
+              "fn flush_log() \{\n" +
+              "    let mut s = \"\"\n" +
+              "    let mut i = 0\n" +
+              "    while i < log.len() \{\n" +
+              "        s = s + log.get(i).unwrap() + \"\\n\"\n" +
+              "        i = i + 1\n" +
+              "    }\n" +
+              "    write_file(\".tmp/_qm_with_log.txt\", s)\n" +
+              "}\n" +
+              "type Timer \{ id: Int }\n" +
+              "impl BlockHandler for Timer \{\n" +
+              "    type Context = Int\n" +
+              "    fn enter(self) -> Int \{ log.push(\"enter:\" + self.id.to_string()); 0 }\n" +
+              "    fn exit(self, ok: Bool) \{\n" +
+              "        if ok \{ log.push(\"exit:\" + self.id.to_string() + \":ok=true\") }\n" +
+              "        else \{ log.push(\"exit:\" + self.id.to_string() + \":ok=false\") }\n" +
+              "        flush_log()\n" +
+              "    }\n" +
+              "}\n" +
+              "fn fail() -> Result[Int, Str] \{ Err(\"boom\") }\n" +
+              "test \"qm_in_with\" \{\n" +
+              "    with Timer \{ id: 9 } as _t \{\n" +
+              "        let _v = fail()?\n" +
+              "    }\n" +
+              "}\n"
+
+    shell_exec("rm -f .tmp/_qm_with_log.txt")
+    write_file(".tmp/_test_qm_with_inner.bl", src)
+    let build_res = process_run("bin/blink", ["build", ".tmp/_test_qm_with_inner.bl"])
+    assert_eq(build_res.exit_code, 0)
+
+    // Inner binary will exit 1 (test failed via ?), but BEFORE exit, the
+    // Timer.exit() must run with ok=false and flush the log.
+    let _ = process_run("build/_test_qm_with_inner", [])
+
+    let log = read_file(".tmp/_qm_with_log.txt")
+    assert(log.contains("enter:9"))
+    assert(log.contains("exit:9:ok=false"))
+
+    shell_exec("rm -f build/_test_qm_with_inner .tmp/_test_qm_with_inner.bl .tmp/_qm_with_log.txt")
+}

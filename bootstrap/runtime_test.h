@@ -14,7 +14,20 @@ typedef struct {
 } blink_test_entry;
 
 BLINK_UNUSED static jmp_buf __blink_test_jmp;
+/* __blink_test_failed and __blink_test_skipped must be shared across TUs
+ * because for_each (monomorphized into the stdlib monolith TU) polls them
+ * via the @ffi accessors below — the runner that writes them lives in the
+ * user TU. Other __blink_test_* state stays per-TU since only the user TU
+ * touches it. */
+#ifdef BLINK_USE_EXTERN_RUNTIME_STORAGE
+  #ifdef BLINK_RUNTIME_STORAGE_DEFINE
+    int __blink_test_failed = 0;
+  #else
+    extern int __blink_test_failed;
+  #endif
+#else
 BLINK_UNUSED static int __blink_test_failed;
+#endif
 BLINK_UNUSED static char __blink_test_fail_msg[512];
 BLINK_UNUSED static int __blink_test_fail_line;
 /* Power-assert introspection. When non-empty, these supplement the legacy
@@ -27,7 +40,7 @@ BLINK_UNUSED static char __blink_test_fail_file[256];
 BLINK_UNUSED static int __blink_test_fail_col;
 BLINK_UNUSED static char __blink_test_fail_user_msg[256];
 /* Cause discriminator for NDJSON output. Default "assertion"; set to
- * "propagated_error" by __blink_test_propagate_result for spec §2.20
+ * "propagated_error" by __blink_test_set_propagate for spec §2.20
  * test-body `?` propagation. Reset at the start of each test iteration. */
 BLINK_UNUSED static const char* __blink_test_fail_cause = "assertion";
 BLINK_UNUSED static char __blink_test_fail_error_type[128];
@@ -37,6 +50,21 @@ BLINK_UNUSED static char __blink_test_fail_error_message[512];
  * __blink_assert_fail*, the buffer retains the failing case label so the
  * runner can emit it in the JSON "case" field. */
 BLINK_UNUSED static char __blink_test_case_label[256];
+
+/* Skip state. Propagated via Result-sentinel (set globals + plain `return`)
+ * so __attribute__((cleanup)) destructors fire for in-scope `with` blocks.
+ * `__blink_test_skipped` is shared across TUs (see comment on
+ * `__blink_test_failed` above). The reason is user-TU-only. */
+#ifdef BLINK_USE_EXTERN_RUNTIME_STORAGE
+  #ifdef BLINK_RUNTIME_STORAGE_DEFINE
+    int __blink_test_skipped = 0;
+  #else
+    extern int __blink_test_skipped;
+  #endif
+#else
+BLINK_UNUSED static int __blink_test_skipped;
+#endif
+BLINK_UNUSED static char __blink_test_skip_reason[256];
 
 BLINK_UNUSED static void __blink_assert_fail(const char* msg, int line) {
     __blink_test_failed = 1;
@@ -90,14 +118,12 @@ BLINK_UNUSED static void __blink_assert_fail_intro(const char* assertion,
     longjmp(__blink_test_jmp, 1);
 }
 
-/* Spec §2.20: a `?` in a test body propagates the operand error out of
- * the test as a TestError-shaped failure. Codegen emits a call to this
- * helper at each `?` site. Same setjmp-driven path as assert_fail, but
- * the runner uses __blink_test_fail_cause to choose NDJSON shape. */
-BLINK_UNUSED static void __blink_test_propagate_result(const char* message,
-                                                       const char* error_type,
-                                                       const char* file,
-                                                       int line, int col) {
+/* Spec §2.20: ?-in-test propagation. No longjmp — caller emits `return;`
+ * so cleanup destructors run for in-scope `with` bindings. */
+BLINK_UNUSED static void __blink_test_set_propagate(const char* message,
+                                                    const char* error_type,
+                                                    const char* file,
+                                                    int line, int col) {
     __blink_test_failed = 1;
     __blink_test_fail_cause = "propagated_error";
     BLINK_COPY_OR_EMPTY(__blink_test_fail_error_message, message);
@@ -112,8 +138,19 @@ BLINK_UNUSED static void __blink_test_propagate_result(const char* message,
     __blink_test_fail_assertion[0] = '\0';
     __blink_test_fail_intro[0] = '\0';
     __blink_test_fail_user_msg[0] = '\0';
-    longjmp(__blink_test_jmp, 1);
 }
+
+/* No longjmp — caller emits `return;` so cleanup destructors run. */
+BLINK_UNUSED static void __blink_test_set_skipped(const char* reason) {
+    __blink_test_skipped = 1;
+    BLINK_COPY_OR_EMPTY(__blink_test_skip_reason, reason);
+}
+
+/* Polled by std.testing.for_each between case-body iterations so that a
+ * failing/skipped case stops the loop instead of running every remaining
+ * case under a poisoned global state. int64_t signature matches Blink Int. */
+BLINK_UNUSED static int64_t __blink_test_is_failed(void) { return (int64_t)__blink_test_failed; }
+BLINK_UNUSED static int64_t __blink_test_is_skipped(void) { return (int64_t)__blink_test_skipped; }
 
 /* JSON-escape a string into a static buffer. Each call overwrites the previous
  * result, so callers must consume the output before invoking again. */
@@ -203,8 +240,29 @@ BLINK_UNUSED static void blink_test_run(const blink_test_entry* tests, int count
         __blink_test_fail_cause = "assertion";
         __blink_test_fail_error_type[0] = '\0';
         __blink_test_fail_error_message[0] = '\0';
+        __blink_test_skipped = 0;
+        __blink_test_skip_reason[0] = '\0';
         if (setjmp(__blink_test_jmp) == 0) {
             tests[i].fn();
+        }
+        if (__blink_test_skipped) {
+            skip++;
+            if (json_output) {
+                if (total > 1) printf(",");
+                printf("{\"name\":\"%s\",\"status\":\"skipped\"", tests[i].name);
+                if (__blink_test_skip_reason[0]) {
+                    printf(",\"reason\":\"%s\"", __blink_test_json_escape(__blink_test_skip_reason));
+                }
+                __blink_test_print_tags_json(&tests[i]);
+                printf("}");
+            } else {
+                if (__blink_test_skip_reason[0]) {
+                    printf("test %s ... \033[33mskipped\033[0m (%s)\n", tests[i].name, __blink_test_skip_reason);
+                } else {
+                    printf("test %s ... \033[33mskipped\033[0m\n", tests[i].name);
+                }
+            }
+            continue;
         }
         if (__blink_test_failed) {
             fail++;

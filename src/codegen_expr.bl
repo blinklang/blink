@@ -1549,6 +1549,17 @@ fn emit_binop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.R
     }
 }
 
+fn emit_arena_expr_unwind() ! Codegen.Emit {
+    let mut di = cg_arena_expr_tmp_stack.len() - 1
+    while di >= 0 {
+        let inner_tmp = cg_arena_expr_tmp_stack.get(di).unwrap()
+        let inner_prev = cg_arena_expr_prev_stack.get(di).unwrap()
+        emit_line("__blink_current_arena = {inner_prev};")
+        emit_line("blink_arena_destroy({inner_tmp});")
+        di = di - 1
+    }
+}
+
 @allow(UnrestoredMutation, IncompleteStateRestore)
 fn emit_unaryop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
     emit_expr(node_left(node))
@@ -1587,9 +1598,9 @@ fn emit_unaryop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag
         if operand_type == CT_RESULT {
             if cg_in_test_body != 0 {
                 // Spec §2.20: test body using `?` is elaborated to
-                // Result[Void, TestError]; propagation runs cleanup via
-                // longjmp into the test runner (same path as assert_fail).
-                // Render the error value to a string for NDJSON `error.message`.
+                // Result[Void, TestError]. Result-sentinel propagation
+                // (set globals + plain `return`) so __attribute__((cleanup))
+                // destructors run on the way out.
                 let rok = expr_result_ok_type
                 let rerr = expr_result_err_type
                 let rok_s = expr_result_ok_struct
@@ -1600,7 +1611,13 @@ fn emit_unaryop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag
                 let qm_col = node_col(node)
                 let err_msg_expr = test_render_err_message(rerr, rerr_s, "{tmp}.err")
                 let err_type_name = test_err_type_display_name(rerr, rerr_s)
-                emit_line("if ({tmp}.tag == 1) __blink_test_propagate_result({err_msg_expr}, \"{err_type_name}\", \"{diag_source_file}\", {qm_line}, {qm_col});")
+                emit_line("if ({tmp}.tag == 1) \{")
+                cg_indent = cg_indent + 1
+                emit_line("__blink_test_set_propagate({err_msg_expr}, \"{err_type_name}\", \"{diag_source_file}\", {qm_line}, {qm_col});")
+                emit_arena_expr_unwind()
+                emit_line("return;")
+                cg_indent = cg_indent - 1
+                emit_line("}")
                 expr_result_str = "{tmp}.ok"
                 if rok_s != "" {
                     expr_result_type = CT_INT
@@ -1670,8 +1687,8 @@ fn emit_unaryop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag
             }
         } else if operand_type == CT_OPTION {
             if cg_in_test_body != 0 {
-                // Spec §2.20: test-scope ? on Option None propagates with
-                // a fixed message="None" / error_type="Option" TestError.
+                // Spec §2.20: test-scope ? on Option None propagates
+                // via the Result-sentinel path so cleanup destructors run.
                 let opt_inner = expr_option_inner
                 let opt_inner_s = expr_option_inner_struct
                 if opt_inner_s != "" {
@@ -1684,7 +1701,13 @@ fn emit_unaryop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag
                 }
                 let qm_line = node_line(node)
                 let qm_col = node_col(node)
-                emit_line("if ({tmp}.tag == 0) __blink_test_propagate_result(\"None\", \"Option\", \"{diag_source_file}\", {qm_line}, {qm_col});")
+                emit_line("if ({tmp}.tag == 0) \{")
+                cg_indent = cg_indent + 1
+                emit_line("__blink_test_set_propagate(\"None\", \"Option\", \"{diag_source_file}\", {qm_line}, {qm_col});")
+                emit_arena_expr_unwind()
+                emit_line("return;")
+                cg_indent = cg_indent - 1
+                emit_line("}")
                 if opt_inner_s != "" {
                     let inner_c = c_type_from_tag(opt_inner_s)
                     if inner_c.ends_with("*") {
@@ -2075,6 +2098,19 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
             if args_sl != -1 && sublist_length(args_sl) > 0 {
                 emit_expr(sublist_get(args_sl, 0))
             }
+            return
+        }
+
+        if fn_name == "skip" {
+            // Plain `return` (not longjmp) so __attribute__((cleanup))
+            // destructors fire for in-scope `with` bindings.
+            // Typecheck (E0516) guarantees arg_count == 1, type Str.
+            emit_expr(sublist_get(node_args(node), 0))
+            emit_line("__blink_test_set_skipped({expr_result_str});")
+            emit_arena_expr_unwind()
+            emit_line("return;")
+            expr_result_str = ""
+            expr_result_type = CT_VOID
             return
         }
 
