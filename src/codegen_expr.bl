@@ -1909,7 +1909,7 @@ fn pa_op_renderable(op: Str) -> Int {
     0
 }
 
-fn arg_struct_name_for(rt: Int, rs: Str, list_elem_struct: Str) -> Str {
+pub fn arg_struct_name_for(rt: Int, rs: Str, list_elem_struct: Str) -> Str {
     if rt == CT_STRUCT { return get_var_struct(rs) }
     if rt == CT_LIST { return list_elem_struct }
     ""
@@ -1922,12 +1922,147 @@ type ArgMapInfo {
     vs: Str
 }
 
-fn arg_map_info_for(arg_node: Int, rt: Int) -> ArgMapInfo {
+pub fn arg_map_info_for(arg_node: Int, rt: Int) -> ArgMapInfo {
     if rt != CT_MAP || node_kind(arg_node) != NodeKind.Ident {
         return ArgMapInfo { kt: -1, ks: "", vt: -1, vs: "" }
     }
     let nm = node_name(arg_node)
     ArgMapInfo { kt: get_map_key_type(nm), ks: get_map_key_struct(nm), vt: get_map_value_type(nm), vs: get_map_value_struct(nm) }
+}
+
+// Shared tail for emitting a call to a generic fn[T]. Used by both the
+// bare-name call path (`fn(...)`) and the module-qualified path (`mod.fn(...)`).
+// On success it mangles the name, registers the monomorphization, emits the
+// call expression into expr_result_str, sets expr_result_type plus any
+// option/result/list/map inner-type fields, and returns 1. On failure
+// (type-arg inference returned None) it returns 0 and leaves globals as the
+// caller set them so the caller can fall through to non-generic handling.
+@allow(UnrestoredMutation, IncompleteStateRestore)
+pub fn emit_generic_fn_call_tail(fn_name: Str, args_str: Str, arg_types: List[Int], arg_elem_types: List[Int], arg_closure_sigs: List[Str], arg_struct_names: List[Str], arg_map_key_types: List[Int], arg_map_key_structs: List[Str], arg_map_val_types: List[Int], arg_map_val_structs: List[Str]) -> Int ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
+    let gfn_node = get_generic_fn_node(fn_name)
+    let type_args = infer_fn_type_args_from_types(gfn_node, arg_types, arg_elem_types, arg_closure_sigs, arg_struct_names, arg_map_key_types, arg_map_key_structs, arg_map_val_types, arg_map_val_structs)
+    if type_args.is_none() {
+        return 0
+    }
+    let ta_str = type_args.unwrap()
+    let mangled = mangle_generic_name(fn_name, ta_str)
+    register_mono_fn(fn_name, ta_str)
+    register_mono_instance(fn_name, ta_str)
+    let ret_str = node_return_type(gfn_node)
+    let tparams_sl = node_type_params(gfn_node)
+    let resolved_ret = resolve_tparam(ret_str, tparams_sl, ta_str)
+    let ret_type = type_from_name(resolved_ret)
+    reg_fn(mangled, ret_type)
+    if ret_type == CT_OPTION {
+        let ret_ann = node_type_ann(gfn_node)
+        if ret_ann != -1 {
+            let elems_sl = node_elements(ret_ann)
+            if elems_sl != -1 && sublist_length(elems_sl) >= 1 {
+                let inner_ann = sublist_get(elems_sl, 0)
+                let inner_name_raw = node_name(inner_ann)
+                let inner_name = resolve_tparam(inner_name_raw, tparams_sl, ta_str)
+                let inner_ct = type_from_name(inner_name)
+                expr_option_inner = inner_ct
+                ensure_option_type(inner_ct)
+                reg_fn_ret_type(mangled, CT_OPTION, inner_ct, -1)
+                if inner_ct == CT_VOID && is_struct_type(inner_name) != 0 {
+                    ensure_struct_option_type(inner_name)
+                    expr_option_inner_struct = inner_name
+                }
+            }
+        }
+    } else if ret_type == CT_RESULT {
+        let ret_ann = node_type_ann(gfn_node)
+        if ret_ann != -1 {
+            let elems_sl = node_elements(ret_ann)
+            if elems_sl != -1 && sublist_length(elems_sl) >= 2 {
+                let ok_ann = sublist_get(elems_sl, 0)
+                let err_ann = sublist_get(elems_sl, 1)
+                let ok_name = resolve_tparam(node_name(ok_ann), tparams_sl, ta_str)
+                let err_name = resolve_tparam(node_name(err_ann), tparams_sl, ta_str)
+                let ok_ct = type_from_name(ok_name)
+                let err_ct = type_from_name(err_name)
+                expr_result_ok_type = ok_ct
+                expr_result_err_type = err_ct
+                let ok_is_type = is_struct_type(ok_name) != 0 || is_enum_type(ok_name) != 0
+                let err_is_type = is_struct_type(err_name) != 0 || is_enum_type(err_name) != 0
+                if ok_is_type || err_is_type {
+                    let ok_s = if ok_is_type { ok_name } else { "" }
+                    let err_s = if err_is_type { err_name } else { "" }
+                    reg_fn_ret_struct_inner(mangled, ok_s, err_s)
+                    ensure_mixed_result_type(ok_ct, err_ct, ok_s, err_s)
+                    expr_result_ok_struct = ok_s
+                    expr_result_err_struct = err_s
+                } else {
+                    ensure_result_type(ok_ct, err_ct)
+                    expr_result_ok_struct = ""
+                    expr_result_err_struct = ""
+                }
+                reg_fn_ret_type(mangled, CT_RESULT, ok_ct, err_ct)
+            }
+        }
+    } else if ret_type == CT_LIST {
+        let ret_ann = node_type_ann(gfn_node)
+        if ret_ann != -1 {
+            let elems_sl = node_elements(ret_ann)
+            if elems_sl != -1 && sublist_length(elems_sl) >= 1 {
+                let inner_ann = sublist_get(elems_sl, 0)
+                let inner_name_raw = node_name(inner_ann)
+                let inner_name = resolve_tparam(inner_name_raw, tparams_sl, ta_str)
+                expr_list_elem_type = type_from_name(inner_name)
+            }
+        }
+    } else if ret_type == CT_MAP {
+        let ret_ann = node_type_ann(gfn_node)
+        if ret_ann != -1 {
+            let elems_sl = node_elements(ret_ann)
+            if elems_sl != -1 && sublist_length(elems_sl) >= 2 {
+                let k_ann = sublist_get(elems_sl, 0)
+                let v_ann = sublist_get(elems_sl, 1)
+                let k_name = resolve_tparam(node_name(k_ann), tparams_sl, ta_str)
+                let v_name = resolve_tparam(node_name(v_ann), tparams_sl, ta_str)
+                expr_map_key_type = type_from_name(k_name)
+                expr_map_val_type = type_from_name(v_name)
+            }
+        }
+    } else if ret_type == CT_VOID && resolved_ret != "Void" && resolved_ret != "" {
+        let ret_ann = node_type_ann(gfn_node)
+        let mut ret_struct_name = ""
+        if ret_ann != -1 {
+            let ret_elems = node_elements(ret_ann)
+            if ret_elems != -1 && sublist_length(ret_elems) > 0 {
+                let mut mono_args = ""
+                let mut ai = 0
+                while ai < sublist_length(ret_elems) {
+                    let elem = sublist_get(ret_elems, ai)
+                    let raw_name = node_name(elem)
+                    let resolved_arg = resolve_tparam(raw_name, tparams_sl, ta_str)
+                    if ai > 0 {
+                        mono_args = mono_args.concat(",")
+                    }
+                    mono_args = mono_args.concat(resolved_arg)
+                    ai = ai + 1
+                }
+                ret_struct_name = register_mono_instance(resolved_ret, mono_args)
+                set_var_struct("{c_fn_name(mangled)}({args_str})", ret_struct_name)
+            }
+        }
+        // Plain T → user struct/enum: emit a temp + struct binding so the
+        // caller's `let x = call()` sees a concrete struct type.
+        if ret_struct_name == "" && (is_struct_type(resolved_ret) != 0 || is_enum_type(resolved_ret) != 0) {
+            reg_fn_struct_ret(mangled, resolved_ret)
+            let g_tmp = fresh_temp("_gsr")
+            emit_line("{c_type_c_name(resolved_ret)} {g_tmp} = {c_fn_name(mangled)}({args_str});")
+            set_var(g_tmp, CT_STRUCT, 0)
+            set_var_struct(g_tmp, resolved_ret)
+            expr_result_str = g_tmp
+            expr_result_type = CT_STRUCT
+            return 1
+        }
+    }
+    expr_result_str = "{c_fn_name(mangled)}({args_str})"
+    expr_result_type = ret_type
+    1
 }
 
 @allow(UnrestoredMutation, IncompleteStateRestore)
@@ -2703,116 +2838,9 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
             }
         }
         args_str = append_ev_arg(fn_name, args_str)
-        // Check for generic function call
         if is_generic != 0 {
-            let gfn_node = get_generic_fn_node(fn_name)
-            let type_args = infer_fn_type_args_from_types(gfn_node, arg_types, arg_elem_types, arg_closure_sigs, arg_struct_names, arg_map_key_types, arg_map_key_structs, arg_map_val_types, arg_map_val_structs)
-            if type_args.is_some() {
-                let ta_str = type_args.unwrap()
-                let mangled = mangle_generic_name(fn_name, ta_str)
-                register_mono_fn(fn_name, ta_str)
-                register_mono_instance(fn_name, ta_str)
-                let ret_str = node_return_type(gfn_node)
-                let tparams_sl = node_type_params(gfn_node)
-                let resolved_ret = resolve_tparam(ret_str, tparams_sl, ta_str)
-                let ret_type = type_from_name(resolved_ret)
-                reg_fn(mangled, ret_type)
-                if ret_type == CT_OPTION {
-                    let ret_ann = node_type_ann(gfn_node)
-                    if ret_ann != -1 {
-                        let elems_sl = node_elements(ret_ann)
-                        if elems_sl != -1 && sublist_length(elems_sl) >= 1 {
-                            let inner_ann = sublist_get(elems_sl, 0)
-                            let inner_name_raw = node_name(inner_ann)
-                            let inner_name = resolve_tparam(inner_name_raw, tparams_sl, ta_str)
-                            let inner_ct = type_from_name(inner_name)
-                            expr_option_inner = inner_ct
-                            ensure_option_type(inner_ct)
-                            reg_fn_ret_type(mangled, CT_OPTION, inner_ct, -1)
-                            if inner_ct == CT_VOID && is_struct_type(inner_name) != 0 {
-                                ensure_struct_option_type(inner_name)
-                                expr_option_inner_struct = inner_name
-                            }
-                        }
-                    }
-                } else if ret_type == CT_RESULT {
-                    let ret_ann = node_type_ann(gfn_node)
-                    if ret_ann != -1 {
-                        let elems_sl = node_elements(ret_ann)
-                        if elems_sl != -1 && sublist_length(elems_sl) >= 2 {
-                            let ok_ann = sublist_get(elems_sl, 0)
-                            let err_ann = sublist_get(elems_sl, 1)
-                            let ok_name = resolve_tparam(node_name(ok_ann), tparams_sl, ta_str)
-                            let err_name = resolve_tparam(node_name(err_ann), tparams_sl, ta_str)
-                            let ok_ct = type_from_name(ok_name)
-                            let err_ct = type_from_name(err_name)
-                            expr_result_ok_type = ok_ct
-                            expr_result_err_type = err_ct
-                            let ok_is_type = is_struct_type(ok_name) != 0 || is_enum_type(ok_name) != 0
-                            let err_is_type = is_struct_type(err_name) != 0 || is_enum_type(err_name) != 0
-                            if ok_is_type || err_is_type {
-                                let ok_s = if ok_is_type { ok_name } else { "" }
-                                let err_s = if err_is_type { err_name } else { "" }
-                                reg_fn_ret_struct_inner(mangled, ok_s, err_s)
-                                ensure_mixed_result_type(ok_ct, err_ct, ok_s, err_s)
-                                expr_result_ok_struct = ok_s
-                                expr_result_err_struct = err_s
-                            } else {
-                                ensure_result_type(ok_ct, err_ct)
-                                expr_result_ok_struct = ""
-                                expr_result_err_struct = ""
-                            }
-                            reg_fn_ret_type(mangled, CT_RESULT, ok_ct, err_ct)
-                        }
-                    }
-                } else if ret_type == CT_LIST {
-                    let ret_ann = node_type_ann(gfn_node)
-                    if ret_ann != -1 {
-                        let elems_sl = node_elements(ret_ann)
-                        if elems_sl != -1 && sublist_length(elems_sl) >= 1 {
-                            let inner_ann = sublist_get(elems_sl, 0)
-                            let inner_name_raw = node_name(inner_ann)
-                            let inner_name = resolve_tparam(inner_name_raw, tparams_sl, ta_str)
-                            expr_list_elem_type = type_from_name(inner_name)
-                        }
-                    }
-                } else if ret_type == CT_MAP {
-                    let ret_ann = node_type_ann(gfn_node)
-                    if ret_ann != -1 {
-                        let elems_sl = node_elements(ret_ann)
-                        if elems_sl != -1 && sublist_length(elems_sl) >= 2 {
-                            let k_ann = sublist_get(elems_sl, 0)
-                            let v_ann = sublist_get(elems_sl, 1)
-                            let k_name = resolve_tparam(node_name(k_ann), tparams_sl, ta_str)
-                            let v_name = resolve_tparam(node_name(v_ann), tparams_sl, ta_str)
-                            expr_map_key_type = type_from_name(k_name)
-                            expr_map_val_type = type_from_name(v_name)
-                        }
-                    }
-                } else if ret_type == CT_VOID && resolved_ret != "Void" && resolved_ret != "" {
-                    let ret_ann = node_type_ann(gfn_node)
-                    if ret_ann != -1 {
-                        let ret_elems = node_elements(ret_ann)
-                        if ret_elems != -1 && sublist_length(ret_elems) > 0 {
-                            let mut mono_args = ""
-                            let mut ai = 0
-                            while ai < sublist_length(ret_elems) {
-                                let elem = sublist_get(ret_elems, ai)
-                                let raw_name = node_name(elem)
-                                let resolved_arg = resolve_tparam(raw_name, tparams_sl, ta_str)
-                                if ai > 0 {
-                                    mono_args = mono_args.concat(",")
-                                }
-                                mono_args = mono_args.concat(resolved_arg)
-                                ai = ai + 1
-                            }
-                            let ret_mono = register_mono_instance(resolved_ret, mono_args)
-                            set_var_struct("{c_fn_name(mangled)}({args_str})", ret_mono)
-                        }
-                    }
-                }
-                expr_result_str = "{c_fn_name(mangled)}({args_str})"
-                expr_result_type = ret_type
+            let handled = emit_generic_fn_call_tail(fn_name, args_str, arg_types, arg_elem_types, arg_closure_sigs, arg_struct_names, arg_map_key_types, arg_map_key_structs, arg_map_val_types, arg_map_val_structs)
+            if handled != 0 {
                 return
             }
         }

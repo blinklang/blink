@@ -245,6 +245,7 @@ tasks:
         fi
       - task: ci-per-module
       - task: test-installed
+      - task: __build-binaries-smoke
 
   ci-per-module:
     desc: Verify per-module .o pipeline produces a binary identical in behaviour to monolith mode
@@ -437,6 +438,31 @@ tasks:
           tar -czf {{.BUILD_DIR}}/blink-$t.tar.gz -C {{.BUILD_DIR}}/dist blink-$t
         done
       - echo "Built binaries + dist tarballs for linux-x86_64, macos-x86_64, macos-aarch64 ({{.VERSION}})"
+
+  __build-binaries-smoke:
+    desc: One-target cross-compile smoke. Catches archive-mode regressions in the build-binaries pipeline at PR time (vs at release-cut).
+    deps: [build-cli]
+    vars:
+      GC_SRC: bootstrap/vendor/gc/extra/gc.c
+      GC_INC: bootstrap/vendor/gc/include
+      GC_DEFS: -DGC_THREADS -DGC_BUILTIN_ATOMIC -DUSE_MMAP -DUSE_MUNMAP
+      SQLITE_SRC: lib/native/sqlite3/sqlite3.c
+      SQLITE_INC: lib/native/sqlite3
+      SQLITE_DEFS: -DSQLITE_THREADSAFE=1
+      MONO_DEFS: -ffunction-sections -fdata-sections -DBLINK_USE_SQLITE=1
+    cmds:
+      - |
+        set -e
+        TMPDIR=$(mktemp -d)
+        trap "rm -rf $TMPDIR" EXIT
+        # Re-emit cli.c in archive mode (same as build-binaries does first).
+        {{.BLINKC}} --link-archive {{.BUILD_DIR}}/libblink_std.h src/cli.bl "$TMPDIR/cli.c"
+        ARC_REL="{{.BUILD_DIR}}/$(readlink {{.BUILD_DIR}}/libblink_std.a | xargs dirname)"
+        zig cc -c -O2 {{.GC_DEFS}} -I{{.GC_INC}} -target x86_64-linux-gnu -o "$TMPDIR/gc.o" {{.GC_SRC}}
+        zig cc -c -O2 {{.SQLITE_DEFS}} -target x86_64-linux-gnu -o "$TMPDIR/sqlite3.o" {{.SQLITE_SRC}}
+        zig cc -c -O2 {{.MONO_DEFS}} -target x86_64-linux-gnu -I{{.GC_INC}} -I{{.SQLITE_INC}} -I"$ARC_REL" -o "$TMPDIR/monolith.o" "$ARC_REL/monolith.c"
+        zig cc -O2 -Wno-parentheses-equality -I{{.GC_INC}} -I{{.SQLITE_INC}} -I{{.BUILD_DIR}} -target x86_64-linux-gnu -o "$TMPDIR/blink-smoke" "$TMPDIR/cli.c" "$TMPDIR/monolith.o" "$TMPDIR/sqlite3.o" "$TMPDIR/gc.o" -lm -Wl,--gc-sections
+        echo "build-binaries-smoke: ok (x86_64-linux archive-mode link)"
 
   release:
     desc: "Create a GitHub release (usage: task release -- v0.5.0)"
