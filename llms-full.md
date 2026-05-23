@@ -1,6 +1,6 @@
 # Blink Language Reference
 
-> Blink is a statically-typed, effect-tracked language compiling to C. **Compiler v0.44.1**.
+> Blink is a statically-typed, effect-tracked language compiling to C. **Compiler v0.44.2**.
 
 ## Install
 
@@ -12,7 +12,7 @@ docker pull ghcr.io/blinklang/blink:latest
 docker run --rm -v "$PWD":/workspace ghcr.io/blinklang/blink run myfile.bl
 ```
 
-Tags: `latest`, `0.44`, `0.44.1` (semver). Image is `debian:bookworm-slim` with `gcc`, `zig`, `blink`, `libgc-dev`, and `libsqlite3-dev`.
+Tags: `latest`, `0.44`, `0.44.2` (semver). Image is `debian:bookworm-slim` with `gcc`, `zig`, `blink`, `libgc-dev`, and `libsqlite3-dev`.
 
 ## Recent Changes
 
@@ -970,7 +970,7 @@ impl BlockHandler for Transaction {
 | `std.path` | Path utilities: `path_join(a, b)`, `path_dirname(path)`, `path_basename(path)`, `path_parent(path)` (POSIX `dirname(1)` semantics — strips trailing slashes before walking up) | `import std.path` |
 | `std.process` | Process spawning: `spawn(cmd, args) -> Pid`, `Pid.wait()`, `Pid.kill()`, `Pid.send_signal(sig)`. POSIX signal constants: `SIGHUP`, `SIGINT`, `SIGQUIT`, `SIGKILL`, `SIGTERM` | `import std.process` |
 | `std.semver` | Semantic version parsing and constraints | `import std.semver` |
-| `std.testing` | Test helpers: `capture_log`, `capture_print`, `capture_eprint` (handler factories that intercept IO for assertions); `assert_close(a, b, tol)`, `assert_close_rel(a, b, rel)` (float assertions, panic on NaN / negative tol); `for_each[T](cases: List[(Str, T)], body: fn(T))` (table-driven test helper) | `import std.testing` |
+| `std.testing` | Test helpers: `capture_log`, `capture_print`, `capture_eprint` (handler factories that intercept IO for assertions); `assert_close(a, b, tol)`, `assert_close_rel(a, b, rel)` (float assertions, panic on NaN / negative tol); `for_each[T](cases: List[(Str, T)], body: fn(T))` (table-driven test helper); `skip(reason: Str)` (skip a test from its body; rejected outside tests as `E0516`); `cleanup(fn: fn())` (register a teardown to run at end of test) | `import std.testing` |
 | `std.term` | Terminal styling and control: ANSI colors (`red`, `green`, `blue`, etc.), text styles (`bold`, `dim`, `italic`, `underline`, `strikethrough`), background colors, TTY detection (`is_tty`, `terminal_width`, `terminal_height`), cursor control (`move_up`, `clear_screen`, `hide_cursor`, etc.) | `import std.term` |
 | `std.toml` | TOML parser | `import std.toml` |
 

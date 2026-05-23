@@ -2,6 +2,13 @@
 
 Single source of truth for release history. `blink llms` and `blink llms --full` both append this file after the reference text, and every release version is indexed as a topic (e.g. `blink llms --topic v0.36`). **Edit only here** — `llms.md` and `llms-full.md` hold only a `## Recent Changes` stub pointing at this file.
 
+## Fixes (v0.44.2)
+
+- **Nested enum patterns inside `Some(...)` / `Ok(...)` / `Err(...)` now typecheck and codegen.** Arms like `Err(E.A(msg))` previously left `msg` untyped (typecheck only narrowed the outer Some/Ok/Err binding) and never declared `msg` from the unwrapped payload (codegen's recursive bind only handled bare ident / wildcard sub-patterns under the outer carrier). User code matching a user enum nested in a Result or Option payload no longer fails to compile.
+- **`with` cleanup destructors now fire when `skip()` or `?` propagates out of a test body.** Per spec §2.20 these belong to the catchable-unwind set alongside `return`, but the longjmp-based exit path skipped C `__attribute__((cleanup))` destructors. A `with db.transaction() { let _ = q()? }` inside a `test {}` silently lost its rollback. The runner now uses a Result-sentinel propagation (plain `return` after setting runner globals) so destructors at every `with` site fire on the way out.
+- **`std.testing.skip(reason: Str)` is now exposed as the canonical way to skip a test from its body.** Calls outside a test body are rejected as `E0516 SkipOutsideTestBody`. `testing.for_each` polls the runner between iterations so a failing or skipped case stops the loop.
+- **Module-qualified generic-fn calls (`mod.fn[T](args)`) now compile correctly.** The MQ-call branch was a parallel implementation that never picked up generic-fn handling from the bare-name path, so the symbol came out unmangled and the result typed as void. Same-module generic-fn calls whose plain-T return resolved to a user struct or enum were silently miscompiled by the same shared inference gap and are also fixed.
+
 ## Fixes (v0.44.1)
 
 - **`Option[E]` and `Result[E, _]` where `E` is a user enum now compile as fn parameters and return types.** v0.44.0 widened struct payloads through Option/Result codegen but left enum payloads on the type-erased path, so any user program passing or returning `Option[MyEnum]` failed to compile with `blink_Option_void` errors. Enum payloads now drive struct-tagged Option/Result emission across the coupled codegen sites.
