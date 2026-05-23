@@ -2,6 +2,13 @@
 
 Single source of truth for release history. `blink llms` and `blink llms --full` both append this file after the reference text, and every release version is indexed as a topic (e.g. `blink llms --topic v0.36`). **Edit only here** — `llms.md` and `llms-full.md` hold only a `## Recent Changes` stub pointing at this file.
 
+## Fixes (v0.44.1)
+
+- **`Option[E]` and `Result[E, _]` where `E` is a user enum now compile as fn parameters and return types.** v0.44.0 widened struct payloads through Option/Result codegen but left enum payloads on the type-erased path, so any user program passing or returning `Option[MyEnum]` failed to compile with `blink_Option_void` errors. Enum payloads now drive struct-tagged Option/Result emission across the coupled codegen sites.
+- **Nested patterns inside `Some(...)`, `Ok(...)`, `Err(...)` are now actually tested.** Previously `Some(Cmd.Continue)` would also match `Some(Cmd.Quit)` because the arm only checked the outer tag and silently dropped the sub-pattern. The condition now recursively tests the sub-pattern against the unboxed payload.
+- **`blink test` against an installed compiler no longer crashes building the stdlib archive.** The install layout puts `runtime.h` at `share/blink/runtime.h`, but the lookup only knew about `BLINK_ROOT/bootstrap` and `./bootstrap` and ultimately handed an empty path to `read_file`. Now resolves across five locations (`BLINK_ROOT/build`, `BLINK_ROOT/bootstrap`, `<install-root>/share/blink`, `./build`, `./bootstrap`) with an actionable diagnostic if all miss.
+- **Docker image builds again.** v0.44.0 moved releases from bare per-platform binaries to per-target tarballs, and the Dockerfile still curled the old bare-binary URL and 404'd. The build now downloads the `.tar.gz` and extracts under `/usr/local/{bin,share}` so argv[0]-based stdlib resolution finds the archive. Stale default tag bumped from `v0.23.3` to current.
+
 ## Fixes (v0.44)
 
 - **`blink build` / `blink run` invoked as bare `blink` from a user project now finds the stdlib archive.** v0.43 fixed the `~/.local/bin/blink` invocation by full path, but PATH-resolved invocation (`blink build src/main.bl`) still failed with `fatal error: libblink_std.h: No such file or directory`. `resolve_install_root()` ran `readlink -f blink`, which joined the bare basename onto the user's cwd and produced a nonexistent path; the dirname walk then resolved `share/blink/` against the wrong root and fell through to the relative `"build"` fallback. Now bare argv[0] is resolved via `command -v` before `readlink -f`, and the resolved path is verified to exist. (Closes 8gtzx8.)
