@@ -43,7 +43,7 @@ import codegen_types.{
     get_variant_field_type_str, get_variant_index, get_variant_tag,
     impl_method_self_name, builtin_receiver_type_name,
     is_compound_ct, is_data_enum, is_enum_type,
-    is_intrinsic_method, is_named_type, is_runtime_header_fn, is_stdlib_source_module, is_struct_type, is_trait_type, list_contains_str, list_iter_c_type, skip_private_in_module_header,
+    is_intrinsic_method, is_named_type, is_runtime_header_fn, is_stdlib_source_module, is_struct_or_enum_type, is_struct_type, is_trait_type, list_contains_str, list_iter_c_type, skip_private_in_module_header,
     lookup_assoc_type, lookup_impl_type_for_trait, mangle_generic_name, mangle_impl_method, match_scrut_enum,
     match_scruts, mono_fns, mono_instances, mono_name_from_ann, mut_captured_vars, option_c_type,
     option_c_type_mixed, pop_scope, ptr_inner_c_type, push_scope,
@@ -719,14 +719,60 @@ fn pattern_condition(pat: Int, scrut_off: Int, scrut_len: Int) -> Str {
     if pk == NodeKind.EnumPattern {
         let enum_name = node_name(pat)
         let variant_name = node_type_name(pat)
-        if enum_name == "Ok" {
-            return "({match_scruts.get(scrut_off).unwrap().str_val}.tag == 0)"
-        }
-        if enum_name == "Err" {
-            return "({match_scruts.get(scrut_off).unwrap().str_val}.tag == 1)"
-        }
-        if enum_name == "Some" {
-            return "({match_scruts.get(scrut_off).unwrap().str_val}.tag == 1)"
+        if enum_name == "Ok" || enum_name == "Err" || enum_name == "Some" {
+            let tag = if enum_name == "Err" { 1 } else if enum_name == "Some" { 1 } else { 0 }
+            let scrut = match_scruts.get(scrut_off).unwrap().str_val
+            let mut base = "({scrut}.tag == {tag})"
+            let ep_flds_sl2 = node_fields(pat)
+            if ep_flds_sl2 != -1 && sublist_length(ep_flds_sl2) >= 1 {
+                let sub_pat2 = sublist_get(ep_flds_sl2, 0)
+                let sub_pk2 = node_kind(sub_pat2)
+                if sub_pk2 == NodeKind.EnumPattern || sub_pk2 == NodeKind.IntPattern || sub_pk2 == NodeKind.StringPattern {
+                    let mut inner_ct = CT_VOID
+                    let mut inner_struct = ""
+                    let scrut_type = match_scruts.get(scrut_off).unwrap().scrut_type
+                    if enum_name == "Some" {
+                        if scrut_type == CT_OPTION {
+                            inner_ct = expr_option_inner
+                            inner_struct = expr_option_inner_struct
+                        }
+                    } else if enum_name == "Ok" {
+                        if scrut_type == CT_RESULT {
+                            inner_ct = expr_result_ok_type
+                            inner_struct = expr_result_ok_struct
+                        }
+                    } else {
+                        if scrut_type == CT_RESULT {
+                            inner_ct = expr_result_err_type
+                            inner_struct = expr_result_err_struct
+                        }
+                    }
+                    let field_name = if enum_name == "Some" { "value" } else if enum_name == "Ok" { "ok" } else { "err" }
+                    let inner_is_enum = inner_struct != "" && is_enum_type(inner_struct) != 0
+                    let payload_expr = if field_name == "value" && inner_is_enum {
+                        "(*({c_type_c_name(inner_struct)}*){scrut}.value)"
+                    } else if field_name == "value" {
+                        "{scrut}.value"
+                    } else {
+                        "{scrut}.{field_name}"
+                    }
+                    let saved_scruts = match_scruts
+                    match_scruts = [MatchScrutEntry { str_val: payload_expr, scrut_type: inner_ct }]
+                    let saved_enum = match_scrut_enum
+                    if inner_is_enum {
+                        match_scrut_enum = inner_struct
+                    } else {
+                        match_scrut_enum = ""
+                    }
+                    let sub_cond = pattern_condition(sub_pat2, 0, 1)
+                    match_scruts = saved_scruts
+                    match_scrut_enum = saved_enum
+                    if sub_cond != "" {
+                        base = "({base} && {sub_cond})"
+                    }
+                }
+            }
+            return base
         }
         if variant_name != "" {
             if is_data_enum(enum_name) != 0 {
@@ -4403,8 +4449,8 @@ pub fn emit_fn_def(fn_node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope
                             let err_name = node_name(err_ann)
                             let ok_t = type_from_name(ok_name)
                             let err_t = type_from_name(err_name)
-                            let ok_is_s = is_struct_type(ok_name) != 0
-                            let err_is_s = is_struct_type(err_name) != 0
+                            let ok_is_s = is_struct_or_enum_type(ok_name) != 0
+                            let err_is_s = is_struct_or_enum_type(err_name) != 0
                             if ok_is_s || err_is_s {
                                 let ok_s = if ok_is_s { ok_name } else { "" }
                                 let err_s = if err_is_s { err_name } else { "" }
@@ -4423,7 +4469,7 @@ pub fn emit_fn_def(fn_node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope
                             let inner_ann = sublist_get(elems_sl, 0)
                             let inner_name = node_name(inner_ann)
                             let inner_t = type_from_name(inner_name)
-                            if is_struct_type(inner_name) != 0 {
+                            if is_struct_or_enum_type(inner_name) != 0 {
                                 set_var_option_struct(pname, inner_t, inner_name)
                             } else {
                                 set_var_option(pname, inner_t)
