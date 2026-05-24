@@ -1,0 +1,99 @@
+// k4qp2c: `?` on Result[Option[Struct], E] and let-binding of closure calls
+// that return compound types lose compound-inner metadata, so downstream
+// match arms / method calls resolve against Void.
+
+type UserRow {
+    email: Str
+    age: Int
+}
+
+type PgError {
+    msg: Str
+}
+
+fn make_row(e: Str, a: Int) -> UserRow {
+    UserRow { email: e, age: a }
+}
+
+fn query_one_some() -> Result[Option[UserRow], PgError] {
+    Ok(Some(make_row("a@b.com", 42)))
+}
+
+fn query_one_none() -> Result[Option[UserRow], PgError] {
+    Ok(None)
+}
+
+// Case 2: `?` on Result[Option[Struct], E] inside a test body.
+test "case 2: ? on Result[Option[Struct], E] preserves Option-inner struct" {
+    let row = query_one_some()?
+    match row {
+        Some(r) => {
+            assert_eq(r.email, "a@b.com")
+            assert_eq(r.age, 42)
+        }
+        None => assert_eq(0, 1)
+    }
+}
+
+test "case 2: ? on Result[Option[Struct], E] None branch" {
+    let row = query_one_none()?
+    match row {
+        Some(_) => assert_eq(0, 1)
+        None => assert_eq(1, 1)
+    }
+}
+
+// Case 3a: let-binding of a closure call returning Option[Struct].
+test "case 3a: let-binding of closure returning Option[Struct]" {
+    let opt = fn() -> Option[UserRow] {
+        Some(make_row("x@y.z", 7))
+    }()
+    match opt {
+        Some(r) => {
+            assert_eq(r.email, "x@y.z")
+            assert_eq(r.age, 7)
+        }
+        None => assert_eq(0, 1)
+    }
+}
+
+// Case 3b: let-binding of a closure call returning Result[Int, Err].
+test "case 3b: let-binding of closure returning Result" {
+    let result = fn() -> Result[Int, PgError] {
+        Ok(99)
+    }()
+    match result {
+        Ok(v) => assert_eq(v, 99)
+        Err(_) => assert_eq(0, 1)
+    }
+}
+
+// Case 3b alternative: closure returning Result[Struct, Err].
+test "case 3b: let-binding of closure returning Result[Struct, Err]" {
+    let result = fn() -> Result[UserRow, PgError] {
+        Ok(make_row("c@d.e", 1))
+    }()
+    match result {
+        Ok(r) => {
+            assert_eq(r.email, "c@d.e")
+            assert_eq(r.age, 1)
+        }
+        Err(_) => assert_eq(0, 1)
+    }
+}
+
+// Regression coverage: case 2 in a regular (non-test) fn.
+fn driver() -> Result[Int, PgError] {
+    let row = query_one_some()?
+    match row {
+        Some(r) => Ok(r.age)
+        None => Ok(-1)
+    }
+}
+
+test "case 2 regression: ? on Result[Option[Struct], E] in non-test fn" {
+    match driver() {
+        Ok(v) => assert_eq(v, 42)
+        Err(_) => assert_eq(0, 1)
+    }
+}
