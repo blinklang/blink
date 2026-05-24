@@ -21,8 +21,8 @@ import codegen_types.{
     cg_ensures_result_var, cg_old_snapshot_vars,
     closure_cap_infos, closure_captures, closure_param_names,
     closure_ret_ct, closure_sig_ret_part,
-    compound_inner_ct_from_tag, compound_inner_struct_from_tag,
     compound_name_from_ann, compound_option_inner_name,
+    option_inner_ct_from_tag, option_inner_struct_from_tag,
     emit_line, ensure_iter_type, ensure_mixed_result_type, ev_field,
     ensure_option_type, ensure_result_type, ensure_struct_option_type,
     ensure_tuple_type, find_type_def_node, fresh_temp,
@@ -205,6 +205,79 @@ fn set_bare_none_struct_result(inner_tag: Str) {
     expr_result_type = CT_OPTION
     expr_option_inner = CT_INT
     expr_option_inner_struct = inner_tag
+}
+
+fn closure_ret_tag_is_recognized(sname: Str) -> Int {
+    if sname.starts_with("Option_") { return 1 }
+    if sname.starts_with("Result_") { return 1 }
+    if resolve_struct_from_c_name(sname) != "" { return 1 }
+    0
+}
+
+// Reseat expr globals from a closure return type tag (`Option_X`, `Result_X_Y`,
+// or a struct name). Returns 1 if `sname` was recognized as a compound/struct,
+// 0 otherwise (caller falls back to closure_ret_ct).
+fn reseat_from_closure_ret_tag(sname: Str, tmp: Str) -> Int ! Codegen.Scope {
+    if sname.starts_with("Option_") {
+        let inner_ct = option_inner_ct_from_tag(sname)
+        let inner_s = option_inner_struct_from_tag(sname)
+        expr_result_str = tmp
+        expr_result_type = CT_OPTION
+        expr_option_inner = inner_ct
+        expr_option_inner_struct = inner_s
+        if inner_s != "" {
+            ensure_struct_option_type(inner_s)
+        } else {
+            ensure_option_type(inner_ct)
+        }
+        return 1
+    }
+    if sname.starts_with("Result_") {
+        let split = split_result_compound(sname)
+        expr_result_str = tmp
+        expr_result_type = CT_RESULT
+        expr_result_ok_type = type_from_name_tag(split.first)
+        expr_result_err_type = type_from_name_tag(split.second)
+        expr_result_ok_struct = if is_named_typedef_tag(split.first) != 0 { split.first } else { "" }
+        expr_result_err_struct = if is_named_typedef_tag(split.second) != 0 { split.second } else { "" }
+        return 1
+    }
+    let resolved = resolve_struct_from_c_name(sname)
+    if resolved != "" {
+        set_var(tmp, CT_STRUCT, 0)
+        set_var_struct(tmp, resolved)
+        expr_result_str = tmp
+        expr_result_type = CT_STRUCT
+        return 1
+    }
+    0
+}
+
+// Reseat compound-inner expr globals after `?` on `Result[T, E]`.
+// `tmp` is the C tmp holding the result; `rok`/`rok_s` describe the Ok payload.
+// Downstream let/match needs to know T when it's Option/Result/struct.
+fn reseat_after_q_on_result(tmp: Str, rok: Int, rok_s: Str) {
+    expr_result_str = "{tmp}.ok"
+    if rok == CT_OPTION {
+        expr_result_type = CT_OPTION
+        expr_option_inner = option_inner_ct_from_tag(rok_s)
+        expr_option_inner_struct = option_inner_struct_from_tag(rok_s)
+    } else if rok == CT_RESULT {
+        expr_result_type = CT_RESULT
+        let split = split_result_compound(rok_s)
+        expr_result_ok_type = type_from_name_tag(split.first)
+        expr_result_err_type = type_from_name_tag(split.second)
+        expr_result_ok_struct = if is_named_typedef_tag(split.first) != 0 { split.first } else { "" }
+        expr_result_err_struct = if is_named_typedef_tag(split.second) != 0 { split.second } else { "" }
+        return
+    } else if rok_s != "" {
+        expr_result_type = CT_INT
+        set_var_struct(expr_result_str, rok_s)
+    } else {
+        expr_result_type = rok
+    }
+    expr_result_ok_struct = ""
+    expr_result_err_struct = ""
 }
 
 @allow(UnrestoredMutation, IncompleteStateRestore)
@@ -1619,33 +1692,7 @@ fn emit_unaryop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag
                 emit_line("return;")
                 cg_indent = cg_indent - 1
                 emit_line("}")
-                expr_result_str = "{tmp}.ok"
-                if rok == CT_OPTION {
-                    // k4qp2c: Ok is Option[T] — reseat option-inner globals so
-                    // downstream let-bindings / match know the inner type.
-                    expr_result_type = CT_OPTION
-                    expr_option_inner = compound_inner_ct_from_tag(rok_s, "Option_")
-                    expr_option_inner_struct = compound_inner_struct_from_tag(rok_s, "Option_")
-                    expr_result_ok_struct = ""
-                    expr_result_err_struct = ""
-                } else if rok == CT_RESULT {
-                    // k4qp2c: nested Result[Result[..],..] — decode inner ok/err.
-                    expr_result_type = CT_RESULT
-                    let split = split_result_compound(rok_s)
-                    expr_result_ok_type = type_from_name_tag(split.first)
-                    expr_result_err_type = type_from_name_tag(split.second)
-                    expr_result_ok_struct = if is_named_typedef_tag(split.first) != 0 { split.first } else { "" }
-                    expr_result_err_struct = if is_named_typedef_tag(split.second) != 0 { split.second } else { "" }
-                } else if rok_s != "" {
-                    expr_result_type = CT_INT
-                    set_var_struct(expr_result_str, rok_s)
-                    expr_result_ok_struct = ""
-                    expr_result_err_struct = ""
-                } else {
-                    expr_result_type = rok
-                    expr_result_ok_struct = ""
-                    expr_result_err_struct = ""
-                }
+                reseat_after_q_on_result(tmp, rok, rok_s)
             } else if cg_current_fn_ret != CT_RESULT {
                 diag_error_at("QuestionMarkResultInNonResult", QM_RESULT_IN_NON_RESULT, "'?' on Result in function '{cg_current_fn_name}' which does not return Result", node, "change the return type to Result")
                 diag_set_last_fix("replace", "-> Result[T, E]")
@@ -1694,33 +1741,7 @@ fn emit_unaryop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag
                     cg_indent = cg_indent - 1
                     emit_line("}")
                 }
-                expr_result_str = "{tmp}.ok"
-                if rok == CT_OPTION {
-                    // k4qp2c: Ok is Option[T] — reseat option-inner globals so
-                    // downstream let-bindings / match know the inner type.
-                    expr_result_type = CT_OPTION
-                    expr_option_inner = compound_inner_ct_from_tag(rok_s, "Option_")
-                    expr_option_inner_struct = compound_inner_struct_from_tag(rok_s, "Option_")
-                    expr_result_ok_struct = ""
-                    expr_result_err_struct = ""
-                } else if rok == CT_RESULT {
-                    // k4qp2c: nested Result[Result[..],..] — decode inner ok/err.
-                    expr_result_type = CT_RESULT
-                    let split = split_result_compound(rok_s)
-                    expr_result_ok_type = type_from_name_tag(split.first)
-                    expr_result_err_type = type_from_name_tag(split.second)
-                    expr_result_ok_struct = if is_named_typedef_tag(split.first) != 0 { split.first } else { "" }
-                    expr_result_err_struct = if is_named_typedef_tag(split.second) != 0 { split.second } else { "" }
-                } else if rok_s != "" {
-                    expr_result_type = CT_INT
-                    set_var_struct(expr_result_str, rok_s)
-                    expr_result_ok_struct = ""
-                    expr_result_err_struct = ""
-                } else {
-                    expr_result_type = rok
-                    expr_result_ok_struct = ""
-                    expr_result_err_struct = ""
-                }
+                reseat_after_q_on_result(tmp, rok, rok_s)
             }
         } else if operand_type == CT_OPTION {
             if cg_in_test_body != 0 {
@@ -2650,12 +2671,12 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                 }
                 let ok_var_s = get_var_struct(ok_str)
                 let fsi = get_fn_ret_struct_inner(cg_current_fn_name)
-                // k4qp2c: when the Ok payload is itself compound (CT_OPTION
-                // or CT_RESULT), get_var_struct returns the inner struct
-                // (e.g. "Item" for Option[Item]) which would be the wrong
-                // Ok-tag. Prefer the function-stated fsi.ok_struct (which
-                // may be a generic placeholder like "Option_ptr" for effect
-                // handlers); fall back to synthesizing the compound tag.
+                // When the Ok payload is itself compound (CT_OPTION or
+                // CT_RESULT), get_var_struct returns the inner struct (e.g.
+                // "Item" for Option[Item]) which would be the wrong Ok-tag.
+                // Prefer the function-stated fsi.ok_struct (which may be a
+                // generic placeholder like "Option_ptr" for effect handlers);
+                // fall back to synthesizing the compound tag.
                 let compound_ok_s = if ok_type == CT_OPTION {
                     let opt_s = expr_option_inner_struct
                     if opt_s != "" {
@@ -2860,45 +2881,13 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
             let ret_part = closure_sig_ret_part(closure_sig)
             if ret_part.starts_with("blink_") {
                 let sname = ret_part.substring(6, ret_part.len() - 6)
-                // k4qp2c: decode compound returns (Option_/Result_/Map_) BEFORE
+                // Decode compound returns (Option_/Result_/Map_) BEFORE
                 // falling back to struct resolution — resolve_struct_from_c_name
                 // would otherwise misread "Option_UserRow" as the struct "UserRow".
-                if sname.starts_with("Option_") {
+                if closure_ret_tag_is_recognized(sname) != 0 {
                     let tmp = fresh_temp("_cls_ret_")
                     emit_line("{ret_part} {tmp} = (({closure_sig}){cls_expr}->fn_ptr)({args_str});")
-                    let inner_ct = compound_inner_ct_from_tag(sname, "Option_")
-                    let inner_s = compound_inner_struct_from_tag(sname, "Option_")
-                    expr_result_str = tmp
-                    expr_result_type = CT_OPTION
-                    expr_option_inner = inner_ct
-                    expr_option_inner_struct = inner_s
-                    if inner_s != "" {
-                        ensure_struct_option_type(inner_s)
-                    } else {
-                        ensure_option_type(inner_ct)
-                    }
-                    return
-                }
-                if sname.starts_with("Result_") {
-                    let tmp = fresh_temp("_cls_ret_")
-                    emit_line("{ret_part} {tmp} = (({closure_sig}){cls_expr}->fn_ptr)({args_str});")
-                    let split = split_result_compound(sname)
-                    expr_result_str = tmp
-                    expr_result_type = CT_RESULT
-                    expr_result_ok_type = type_from_name_tag(split.first)
-                    expr_result_err_type = type_from_name_tag(split.second)
-                    expr_result_ok_struct = if is_named_typedef_tag(split.first) != 0 { split.first } else { "" }
-                    expr_result_err_struct = if is_named_typedef_tag(split.second) != 0 { split.second } else { "" }
-                    return
-                }
-                let resolved = resolve_struct_from_c_name(sname)
-                if resolved != "" {
-                    let tmp = fresh_temp("_cls_ret_")
-                    emit_line("{ret_part} {tmp} = (({closure_sig}){cls_expr}->fn_ptr)({args_str});")
-                    set_var(tmp, CT_STRUCT, 0)
-                    set_var_struct(tmp, resolved)
-                    expr_result_str = tmp
-                    expr_result_type = CT_STRUCT
+                    reseat_from_closure_ret_tag(sname, tmp)
                     return
                 }
             }
@@ -3125,45 +3114,13 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
         let ret_part = closure_sig_ret_part(func_cls_sig)
         if ret_part.starts_with("blink_") {
             let sname = ret_part.substring(6, ret_part.len() - 6)
-            // k4qp2c: decode compound returns (Option_/Result_/Map_) BEFORE
+            // Decode compound returns (Option_/Result_/Map_) BEFORE
             // falling back to struct resolution — resolve_struct_from_c_name
             // would otherwise misread "Option_UserRow" as the struct "UserRow".
-            if sname.starts_with("Option_") {
+            if closure_ret_tag_is_recognized(sname) != 0 {
                 let tmp = fresh_temp("_cls_ret_")
                 emit_line("{ret_part} {tmp} = (({func_cls_sig}){func_str}->fn_ptr)({args_str});")
-                let inner_ct = compound_inner_ct_from_tag(sname, "Option_")
-                let inner_s = compound_inner_struct_from_tag(sname, "Option_")
-                expr_result_str = tmp
-                expr_result_type = CT_OPTION
-                expr_option_inner = inner_ct
-                expr_option_inner_struct = inner_s
-                if inner_s != "" {
-                    ensure_struct_option_type(inner_s)
-                } else {
-                    ensure_option_type(inner_ct)
-                }
-                return
-            }
-            if sname.starts_with("Result_") {
-                let tmp = fresh_temp("_cls_ret_")
-                emit_line("{ret_part} {tmp} = (({func_cls_sig}){func_str}->fn_ptr)({args_str});")
-                let split = split_result_compound(sname)
-                expr_result_str = tmp
-                expr_result_type = CT_RESULT
-                expr_result_ok_type = type_from_name_tag(split.first)
-                expr_result_err_type = type_from_name_tag(split.second)
-                expr_result_ok_struct = if is_named_typedef_tag(split.first) != 0 { split.first } else { "" }
-                expr_result_err_struct = if is_named_typedef_tag(split.second) != 0 { split.second } else { "" }
-                return
-            }
-            let resolved = resolve_struct_from_c_name(sname)
-            if resolved != "" {
-                let tmp = fresh_temp("_cls_ret_")
-                emit_line("{ret_part} {tmp} = (({func_cls_sig}){func_str}->fn_ptr)({args_str});")
-                set_var(tmp, CT_STRUCT, 0)
-                set_var_struct(tmp, resolved)
-                expr_result_str = tmp
-                expr_result_type = CT_STRUCT
+                reseat_from_closure_ret_tag(sname, tmp)
             } else {
                 expr_result_type = CT_STRUCT
             }
