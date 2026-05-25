@@ -77,7 +77,8 @@ import codegen_derive.{ct_to_descriptor, descriptor_mangle, queue_promote_type}
 import codegen_methods.{emit_method_call, resolve_push_struct}
 import codegen_closures.{analyze_captures, emit_closure, emit_fn_value_shim_if_needed}
 import diagnostics.{
-    diag_error, diag_error_at, diag_warn_at, diag_set_last_fix, diag_source_file,
+    diag_error, diag_error_at, diag_warn_at, diag_set_last_fix,
+    diag_file_for_node, diag_source_file,
     COALESCE_REQUIRES_OPT, QM_INVALID_OPERAND, UNDEFINED_FUNCTION,
     QM_RESULT_IN_NON_RESULT, QM_OPTION_IN_NON_OPTION,
     MISSING_KEYWORD_ARG, INVALID_KEYWORD_ARG,
@@ -1607,8 +1608,9 @@ fn emit_binop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.R
             let amt = fresh_temp("__sh_amt")
             let val = fresh_temp("__sh_val")
             let loc_line = node_line(node)
+            let file = panic_file_for(node)
             emit_line("uint32_t {amt} = (uint32_t)({right_str});")
-            emit_line("if ({amt} >= {bw}) \{ fprintf(stderr, \"panic: shift amount %u exceeds bit width {bw} at {diag_source_file}:{loc_line}\\n\", {amt}); exit(1); }")
+            emit_line("if ({amt} >= {bw}) \{ fprintf(stderr, \"panic: shift amount %u exceeds bit width {bw} at {file}:{loc_line}\\n\", {amt}); exit(1); }")
             emit_line("{lc} {val} = ({lc})({left_str}) {op} {amt};")
             expr_result_str = val
         }
@@ -1621,27 +1623,28 @@ fn emit_binop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.R
         let lc = c_type_str(left_type)
         let tname = type_name_from_ct(left_type)
         let loc_line = node_line(node)
+        let file = panic_file_for(node)
         let result_tmp = fresh_temp("__sov")
         let lhs_tmp = fresh_temp("__sov_l")
         let rhs_tmp = fresh_temp("__sov_r")
         emit_line("{lc} {lhs_tmp} = ({lc})({left_str});")
         emit_line("{lc} {rhs_tmp} = ({lc})({right_str});")
         if op == "/" || op == "%" {
-            emit_line("if ({rhs_tmp} == 0) \{ fprintf(stderr, \"panic: {tname} division by zero at {diag_source_file}:{loc_line}\\n\"); exit(1); }")
+            emit_line("if ({rhs_tmp} == 0) \{ fprintf(stderr, \"panic: {tname} division by zero at {file}:{loc_line}\\n\"); exit(1); }")
             // Signed INT_MIN / -1 traps as overflow.
             if left_type == CT_I8 {
-                emit_line("if ({lhs_tmp} == (int8_t)0x80 && {rhs_tmp} == -1) \{ fprintf(stderr, \"panic: {tname} overflow in {op} at {diag_source_file}:{loc_line}\\n\"); exit(1); }")
+                emit_line("if ({lhs_tmp} == (int8_t)0x80 && {rhs_tmp} == -1) \{ fprintf(stderr, \"panic: {tname} overflow in {op} at {file}:{loc_line}\\n\"); exit(1); }")
             } else if left_type == CT_I16 {
-                emit_line("if ({lhs_tmp} == (int16_t)0x8000 && {rhs_tmp} == -1) \{ fprintf(stderr, \"panic: {tname} overflow in {op} at {diag_source_file}:{loc_line}\\n\"); exit(1); }")
+                emit_line("if ({lhs_tmp} == (int16_t)0x8000 && {rhs_tmp} == -1) \{ fprintf(stderr, \"panic: {tname} overflow in {op} at {file}:{loc_line}\\n\"); exit(1); }")
             } else if left_type == CT_I32 {
-                emit_line("if ({lhs_tmp} == (int32_t)0x80000000 && {rhs_tmp} == -1) \{ fprintf(stderr, \"panic: {tname} overflow in {op} at {diag_source_file}:{loc_line}\\n\"); exit(1); }")
+                emit_line("if ({lhs_tmp} == (int32_t)0x80000000 && {rhs_tmp} == -1) \{ fprintf(stderr, \"panic: {tname} overflow in {op} at {file}:{loc_line}\\n\"); exit(1); }")
             }
             emit_line("{lc} {result_tmp} = {lhs_tmp} {op} {rhs_tmp};")
         } else {
             // +, -, * use __builtin_*_overflow.
             let builtin_name = if op == "+" { "add" } else if op == "-" { "sub" } else { "mul" }
             emit_line("{lc} {result_tmp};")
-            emit_line("if (__builtin_{builtin_name}_overflow({lhs_tmp}, {rhs_tmp}, &{result_tmp})) \{ fprintf(stderr, \"panic: {tname} overflow in {op} (%lld {op} %lld) at {diag_source_file}:{loc_line}\\n\", (long long){lhs_tmp}, (long long){rhs_tmp}); exit(1); }")
+            emit_line("if (__builtin_{builtin_name}_overflow({lhs_tmp}, {rhs_tmp}, &{result_tmp})) \{ fprintf(stderr, \"panic: {tname} overflow in {op} (%lld {op} %lld) at {file}:{loc_line}\\n\", (long long){lhs_tmp}, (long long){rhs_tmp}); exit(1); }")
         }
         expr_result_str = result_tmp
         expr_result_type = left_type
@@ -1678,15 +1681,16 @@ fn emit_unaryop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag
             let lc = c_type_str(operand_type)
             let tname = type_name_from_ct(operand_type)
             let loc_line = node_line(node)
+            let file = panic_file_for(node)
             let result_tmp = fresh_temp("__sneg")
             let in_tmp = fresh_temp("__sneg_in")
             emit_line("{lc} {in_tmp} = ({lc})({operand_str});")
             if operand_type == CT_U8 || operand_type == CT_U16 || operand_type == CT_U32 || operand_type == CT_U64 {
-                emit_line("if ({in_tmp} != 0) \{ fprintf(stderr, \"panic: {tname} overflow in unary - at {diag_source_file}:{loc_line}\\n\"); exit(1); }")
+                emit_line("if ({in_tmp} != 0) \{ fprintf(stderr, \"panic: {tname} overflow in unary - at {file}:{loc_line}\\n\"); exit(1); }")
                 emit_line("{lc} {result_tmp} = 0;")
             } else {
                 emit_line("{lc} {result_tmp};")
-                emit_line("if (__builtin_sub_overflow(({lc})0, {in_tmp}, &{result_tmp})) \{ fprintf(stderr, \"panic: {tname} overflow in unary - at {diag_source_file}:{loc_line}\\n\"); exit(1); }")
+                emit_line("if (__builtin_sub_overflow(({lc})0, {in_tmp}, &{result_tmp})) \{ fprintf(stderr, \"panic: {tname} overflow in unary - at {file}:{loc_line}\\n\"); exit(1); }")
             }
             expr_result_str = result_tmp
             expr_result_type = operand_type
@@ -1716,11 +1720,12 @@ fn emit_unaryop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag
                 emit_line("{res_c} {tmp} = {operand_str};")
                 let qm_line = node_line(node)
                 let qm_col = node_col(node)
+                let qm_file = panic_file_for(node)
                 let err_msg_expr = test_render_err_message(rerr, rerr_s, "{tmp}.err")
                 let err_type_name = test_err_type_display_name(rerr, rerr_s)
                 emit_line("if ({tmp}.tag == 1) \{")
                 cg_indent = cg_indent + 1
-                emit_line("__blink_test_set_propagate({err_msg_expr}, \"{err_type_name}\", \"{diag_source_file}\", {qm_line}, {qm_col});")
+                emit_line("__blink_test_set_propagate({err_msg_expr}, \"{err_type_name}\", \"{qm_file}\", {qm_line}, {qm_col});")
                 emit_arena_expr_unwind()
                 emit_line("return;")
                 cg_indent = cg_indent - 1
@@ -1792,9 +1797,10 @@ fn emit_unaryop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag
                 }
                 let qm_line = node_line(node)
                 let qm_col = node_col(node)
+                let qm_file = panic_file_for(node)
                 emit_line("if ({tmp}.tag == 0) \{")
                 cg_indent = cg_indent + 1
-                emit_line("__blink_test_set_propagate(\"None\", \"Option\", \"{diag_source_file}\", {qm_line}, {qm_col});")
+                emit_line("__blink_test_set_propagate(\"None\", \"Option\", \"{qm_file}\", {qm_line}, {qm_col});")
                 emit_arena_expr_unwind()
                 emit_line("return;")
                 cg_indent = cg_indent - 1
@@ -2239,7 +2245,7 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
 
                 let assert_src = "assert({format_expr(cond_node)})"
                 let assert_src_lit = escape_c_string(assert_src)
-                let file_lit = escape_c_string(diag_source_file)
+                let file_lit = panic_file_for(func_node)
                 let call_col = node_col(func_node)
 
                 emit_line("\{")
@@ -2331,7 +2337,8 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                     emit_expr(sublist_get(args_sl, 1))
                     msg_str = expr_result_str
                 }
-                emit_line("__blink_debug_assert_fail(\"{diag_source_file}\", {call_line}, \"{cg_current_fn_name}\", \"{cond_str}\", {msg_str});")
+                let dbg_file = panic_file_for(func_node)
+                emit_line("__blink_debug_assert_fail(\"{dbg_file}\", {call_line}, \"{cg_current_fn_name}\", \"{cond_str}\", {msg_str});")
                 cg_indent = cg_indent - 1
                 emit_line("}")
                 cg_indent = cg_indent - 1
@@ -3203,6 +3210,15 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
         expr_result_str = "{func_str}({args_str})"
         expr_result_type = CT_VOID
     }
+}
+
+// Resolve the owning source file for a node and escape it for embedding
+// into emitted C string literals. Falls back to diag_source_file when the
+// node has no registered range (e.g. synthesized nodes).
+pub fn panic_file_for(node: Int) -> Str {
+    let raw = diag_file_for_node(node)
+    let resolved = if raw != "" { raw } else { diag_source_file }
+    escape_c_string(resolved)
 }
 
 pub fn escape_c_string(s: Str) -> Str {
