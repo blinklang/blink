@@ -248,6 +248,132 @@ tasks:
       - task: test-installed
       - task: __build-binaries-smoke
 
+  ci-profile:
+    desc: |
+      Measure wall-clock per phase of `task ci`. Re-runnable. Outputs:
+        build/ci-timings.<mode>.tsv          — one row per phase (cmd, elapsed_s, max_rss_kb, exit_code)
+        .tmp/fmt-{golden,idem,sem}.<mode>.joblog — GNU parallel per-file timings
+      Modes:
+        MODE=warm (default) — run as-is; reuses Taskfile `sources:` cache, std-cache, etc.
+        MODE=cold           — wipes Taskfile cache + bootstrap outputs + .tmp/ first so every phase
+                              pays its true cost. Do not run other build commands concurrently —
+                              cold mode shares .tmp/ with other tasks and concurrent writes will
+                              cause multi-definition link errors.
+      Use both back-to-back to attribute: (cold − warm) = work the cache saves us; warm = work that always pays.
+    silent: true
+    cmds:
+      - |
+        MODE="${MODE:-warm}"
+        TSV="{{.BUILD_DIR}}/ci-timings.${MODE}.tsv"
+        mkdir -p {{.BUILD_DIR}} .tmp
+        # /usr/bin/time output appended per-phase. -f: format. -a: append. -o: file.
+        # %e elapsed seconds (wall), %M max RSS in KB, %C the command.
+        # We pass a stable phase label via env so the TSV is grep-friendly even
+        # when the command itself is a long heredoc.
+        TIME_BIN="/usr/bin/time"
+        if [ ! -x "$TIME_BIN" ]; then
+          echo "ERROR: /usr/bin/time not found — install GNU time"
+          exit 1
+        fi
+        # We tag the format line so we can pick it out even when /usr/bin/time
+        # prepends a "Command exited with non-zero status N" diagnostic. We
+        # also keep going on phase failures — a single broken phase shouldn't
+        # cost us the timings for everything after it. The TSV records
+        # exit_code as a 4th column so failed rows are visible.
+        printf 'phase\telapsed_s\tmax_rss_kb\texit_code\n' > "$TSV"
+        time_phase() {
+          phase="$1"; shift
+          time_file=$(mktemp .tmp/ci-profile-time-XXXX)
+          rc=0
+          "$TIME_BIN" -f "__CIPROFILE__\t%e\t%M" -o "$time_file" sh -c "$*" || rc=$?
+          line=$(grep '^__CIPROFILE__' "$time_file" | tail -1)
+          es=$(printf '%s' "$line" | awk -F'\t' '{print $2}')
+          mr=$(printf '%s' "$line" | awk -F'\t' '{print $3}')
+          printf '%s\t%s\t%s\t%s\n' "$phase" "${es:-NA}" "${mr:-NA}" "$rc" >> "$TSV"
+          rm -f "$time_file"
+          if [ "$rc" != "0" ]; then
+            echo "ci-profile: phase '$phase' failed (rc=$rc) — continuing to keep timings useful" >&2
+          fi
+        }
+
+        if [ "$MODE" = "cold" ]; then
+          # Invalidate Taskfile's sources/generates cache and the bootstrap
+          # outputs so every phase actually re-runs. We deliberately keep
+          # vendored object files (bootstrap/vendor/) and the std-cache so
+          # the cold run reflects what a real "edit-and-rerun-ci" cycle does,
+          # not a from-scratch checkout.
+          rm -rf {{.BUILD_DIR}}/.task {{.BUILD_DIR}}/blinkc {{.BUILD_DIR}}/blink {{.BUILD_DIR}}/libblink_std.a {{.BUILD_DIR}}/libblink_std.h
+          rm -rf {{.BUILD_DIR}}/std-cache {{.BUILD_DIR}}/smoke
+          # Also wipe .tmp/ leftover object files from any prior run — the
+          # build-binaries-smoke phase re-emits .tmp/{gc,sqlite3,monolith}.o
+          # and will multi-define everything if stale copies linger.
+          find .tmp -type f ! -name '.gitkeep' -delete 2>/dev/null || true
+          # Force bootstrap.sh's gen0 path to recompile from installed `blink`.
+          echo "ci-profile: cold mode — cleared {{.BUILD_DIR}}/.task + bootstrap outputs + .tmp/"
+        fi
+
+        # Phase 1: .tmp cleanup (trivial, kept for parity with `ci`).
+        find .tmp -type f ! -name '.gitkeep' -delete 2>/dev/null || true
+
+        # Phase 2: bootstrap (Gen0 → archive → Gen1 → archive(force) → Gen2).
+        time_phase bootstrap './bootstrap/bootstrap.sh > /dev/null'
+
+        # Phase 3: stdlib registry freshness.
+        time_phase check-stdlib-registry 'task check-stdlib-registry > /dev/null'
+
+        # Phase 4: rebuild build/blink (CLI), archive-linked.
+        time_phase build-cli '
+          if [ ! -x "{{.BUILD_DIR}}/blink" ]; then
+            {{.BLINKC}} src/cli.bl {{.BUILD_DIR}}/cli.c 2>/dev/null
+            sed -i "s/blink_cli_version = \"dev\"/blink_cli_version = \"{{.VERSION}}-dev+$(date +%Y%m%d%H%M%S)\"/" {{.BUILD_DIR}}/cli.c
+            cc -o {{.BUILD_DIR}}/blink {{.BUILD_DIR}}/cli.c -lm -lgc
+          fi
+          {{.BUILD_DIR}}/blink __build-stdlib-archive
+          {{.BLINKC}} --link-archive {{.BUILD_DIR}}/libblink_std.h src/cli.bl {{.BUILD_DIR}}/cli.c 2>/dev/null
+          sed -i "s/blink_cli_version = \"dev\"/blink_cli_version = \"{{.VERSION}}-dev+$(date +%Y%m%d%H%M%S)\"/" {{.BUILD_DIR}}/cli.c
+          cc -o {{.BUILD_DIR}}/blink {{.BUILD_DIR}}/cli.c -I{{.BUILD_DIR}} {{.BUILD_DIR}}/libblink_std.a -lm -lgc -pthread -Wl,--gc-sections
+        '
+
+        # Phase 5: full test suite (429-ish files).
+        time_phase blink-test "{{.BUILD_DIR}}/blink test tests/ --parallel {{.JOBS}} --quiet"
+
+        # Phase 6: fmt waves — each parallel invocation timed separately and
+        # given its own --joblog so per-file timings are available for free.
+        printf "%s\n" test_hof test_lazy_iter test_semver test_toml test_manifest test_lockfile test_http_types test_http_error test_json test_json_builder test_args test_args_cli test_derive_nested test_embed test_combining_iterators test_http_client test_iterators test_match_void_if test_multifile_visibility test_question_ops test_string_iter test_audit test_e2e_gitdep test_e2e_transitive test_e2e_pub_visibility test_async_spawn_types test_tcp_socket test_pub_import test_std_testing test_c_reserved_names test_module_qualified_types test_ue_complex_returns test_effects test_effect_vtable test_sqlite test_builtin_methods test_priv_access test_unused_import test_cross_module_effects test_cross_module_effects_helper test_test_compile_errors > .tmp/fmt_skip.txt
+
+        time_phase fmt-golden "systemd-run --user --scope -p MemoryMax=50G --quiet parallel --joblog .tmp/fmt-golden.${MODE}.joblog -j {{.JOBS}} --halt never ./scripts/run_fmt_golden.sh {} {{.BLINKC}} ::: tests/fmt/input_*.bl > /dev/null 2>&1 || true"
+        time_phase fmt-idempotent "systemd-run --user --scope -p MemoryMax=50G --quiet parallel --joblog .tmp/fmt-idem.${MODE}.joblog -j {{.JOBS}} --halt never ./scripts/run_fmt_idempotent.sh {} {{.BLINKC}} .tmp/fmt_skip.txt ::: tests/test_*.bl > /dev/null 2>&1 || true"
+        time_phase fmt-semantic "systemd-run --user --scope -p MemoryMax=50G --quiet parallel --joblog .tmp/fmt-sem.${MODE}.joblog -j {{.JOBS}} --halt never ./scripts/run_fmt_semantic.sh {} {{.BLINKC}} .tmp/fmt_skip.txt ::: tests/test_*.bl > /dev/null 2>&1 || true"
+
+        # Phase 7: per-module .o pipeline + gen1/gen2 byte-equality.
+        time_phase ci-per-module 'task ci-per-module > /dev/null'
+
+        # Phase 8: installed-binary smoke.
+        time_phase test-installed 'task test-installed > /dev/null'
+
+        # Phase 9: cross-compile smoke.
+        time_phase build-binaries-smoke 'task __build-binaries-smoke > /dev/null'
+
+        # Final report — sorted desc by elapsed. "NA" rows (phase crashed
+        # before time was captured) sort to the bottom via -g.
+        echo ""
+        echo "=== ci-profile (${MODE}) — phases sorted by wall-clock ==="
+        printf 'phase\telapsed_s\tmax_rss_kb\texit_code\n'
+        tail -n +2 "$TSV" | sort -t$'\t' -k2 -gr
+        total=$(tail -n +2 "$TSV" | awk -F'\t' '$2 != "NA" {s+=$2} END {printf "%.2f", s}')
+        failures=$(tail -n +2 "$TSV" | awk -F'\t' '$4 != "0" {print $1}' | tr '\n' ' ')
+        echo ""
+        echo "TOTAL: ${total}s"
+        if [ -n "$failures" ]; then
+          echo "FAILED phases (still timed): $failures"
+        fi
+        echo "TSV:     $TSV"
+        echo "Joblogs: .tmp/fmt-{golden,idem,sem}.${MODE}.joblog"
+        echo ""
+        echo "To compare cold vs warm:"
+        echo "  MODE=cold task ci-profile && MODE=warm task ci-profile"
+        echo "  paste {{.BUILD_DIR}}/ci-timings.cold.tsv {{.BUILD_DIR}}/ci-timings.warm.tsv"
+
   ci-per-module:
     desc: Verify per-module .o pipeline produces a binary identical in behaviour to monolith mode
     silent: true
