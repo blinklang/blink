@@ -731,7 +731,9 @@ fn format_block_inline(node: Int) -> Str {
             return "\{ ".concat(format_expr(stmt)).concat(" }")
         }
     }
-    "\{ ... }"
+    io.eprintln("formatter: format_block_inline reached non-inline-able block; caller must gate on block_needs_multiline")
+    exit(101)
+    ""
 }
 
 fn is_simple_expr_kind(kind: Int) -> Int {
@@ -1026,11 +1028,13 @@ fn block_stmt_expr_needs_multiline(inner: Int) -> Int {
     let k = node_kind(inner)
     if k == NodeKind.MatchExpr { return 1 }
     if k == NodeKind.HandlerExpr { return 1 }
+    if k == NodeKind.WithBlock { return 1 }
     if k == NodeKind.Closure { return block_needs_multiline(inner) }
     if k == NodeKind.Block { return block_needs_multiline(inner) }
     if k == NodeKind.IfExpr { return block_needs_multiline(inner) }
     if k == NodeKind.AsyncScope { return block_needs_multiline(inner) }
     if k == NodeKind.AsyncSpawn { return block_needs_multiline(inner) }
+    if k == NodeKind.Call || k == NodeKind.MethodCall { return block_needs_multiline(inner) }
     0
 }
 
@@ -1071,6 +1075,12 @@ fn block_needs_multiline(node: Int) -> Int {
         let then_b = node_then_body(node)
         if then_b == -1 { return 0 }
         return check_stmts_multiline(node_stmts(then_b))
+    }
+    if kind == NodeKind.Call {
+        return block_needs_multiline(node_left(node))
+    }
+    if kind == NodeKind.MethodCall {
+        return block_needs_multiline(node_obj(node))
     }
     0
 }
@@ -1192,6 +1202,39 @@ fn emit_closure_wrapped(node: Int, prefix: Str, suffix: Str) ! Format.Emit {
     fmt_emit("}{suffix}")
 }
 
+fn emit_iife_wrapped(call_node: Int, callee: Int, prefix: Str, suffix: Str) ! Format.Emit {
+    let header = format_closure_header(callee)
+    let body = node_body(callee)
+    let args_sl = node_args(call_node)
+    let kind = node_kind(call_node)
+    let mut close_open = "}("
+    if kind == NodeKind.MethodCall {
+        let method = node_method(call_node)
+        close_open = ").{method}("
+    }
+    fmt_emit("{prefix}{header} \{")
+    fmt_indent = fmt_indent + 1
+    format_block_body(body)
+    fmt_indent = fmt_indent - 1
+    if args_sl == -1 || sublist_length(args_sl) == 0 {
+        fmt_emit("{close_open}){suffix}")
+        return
+    }
+    let mut sb = StringBuilder.new()
+    sb.write(close_open)
+    let mut i = 0
+    while i < sublist_length(args_sl) {
+        if i > 0 {
+            sb.write(", ")
+        }
+        sb.write(format_expr(sublist_get(args_sl, i)))
+        i = i + 1
+    }
+    sb.write(")")
+    sb.write(suffix)
+    fmt_emit(sb.to_str())
+}
+
 fn emit_block_expr_wrapped(node: Int, prefix: Str) ! Format.Emit {
     fmt_emit("{prefix}\{")
     fmt_indent = fmt_indent + 1
@@ -1241,6 +1284,20 @@ fn emit_expr_wrapped(node: Int, prefix: Str, suffix: Str) ! Format.Emit {
         if kind == NodeKind.Closure {
             emit_closure_wrapped(node, prefix, suffix)
             return
+        }
+        if kind == NodeKind.Call {
+            let callee = node_left(node)
+            if node_kind(callee) == NodeKind.Closure {
+                emit_iife_wrapped(node, callee, prefix, suffix)
+                return
+            }
+        }
+        if kind == NodeKind.MethodCall {
+            let recv = node_obj(node)
+            if node_kind(recv) == NodeKind.Closure {
+                emit_iife_wrapped(node, recv, prefix, suffix)
+                return
+            }
         }
         if suffix == "" {
             if kind == NodeKind.HandlerExpr {
