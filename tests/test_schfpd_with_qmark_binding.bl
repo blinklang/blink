@@ -1,0 +1,102 @@
+// schfpd / k4qp2c case 1: `with expr? as conn` binding inside a test body
+// must give `conn` the unwrapped struct type (the Ok-payload of the Result),
+// not Int. Pre-fix the binding was mis-typed and `.field` / method calls on
+// `conn` failed against the wrong type.
+//
+// Shape mirrors the libs/pg repro:
+//   with connect_handle(url)? as conn { let _ = conn.query("SELECT 1")? }
+
+import std.traits
+
+type Connection {
+    fd: Int
+}
+
+type PgError {
+    msg: Str
+}
+
+trait Query {
+    fn query(self, sql: Str) -> Result[Int, PgError]
+}
+
+impl Query for Connection {
+    fn query(self, sql: Str) -> Result[Int, PgError] {
+        let _ = sql
+        Ok(self.fd)
+    }
+}
+
+impl Closeable for Connection {
+    fn close(self) {}
+}
+
+fn connect_handle(url: Str) -> Result[Connection, PgError] {
+    let _ = url
+    Ok(Connection { fd: 7 })
+}
+
+fn connect_fail(url: Str) -> Result[Connection, PgError] {
+    let _ = url
+    Err(PgError { msg: "boom" })
+}
+
+// Helper-fn shapes — exercise `with..? as` from a regular fn that returns Result.
+fn use_conn_field() -> Result[Int, PgError] {
+    with connect_handle("postgres://x")? as conn {
+        Ok(conn.fd)
+    }
+}
+
+fn use_conn_method() -> Result[Int, PgError] {
+    with connect_handle("postgres://x")? as conn {
+        let v = conn.query("SELECT 1")?
+        Ok(v)
+    }
+}
+
+fn use_conn_err_short_circuit() -> Result[Int, PgError] {
+    with connect_fail("postgres://x")? as conn {
+        Ok(conn.fd)
+    }
+}
+
+// Case 1a: field access through the `with..? as` binding (via helper).
+test "with expr? as conn: field access typed correctly (helper)" {
+    match use_conn_field() {
+        Ok(v) => assert_eq(v, 7)
+        Err(_) => assert_eq(0, 1)
+    }
+}
+
+// Case 1b: trait method call through the `with..? as` binding (via helper).
+test "with expr? as conn: method call typed correctly (helper)" {
+    match use_conn_method() {
+        Ok(v) => assert_eq(v, 7)
+        Err(_) => assert_eq(0, 1)
+    }
+}
+
+// Case 1c: `?` propagates the Err through `with..? as` (binding never enters).
+test "with expr? as conn: Err short-circuits before binding (helper)" {
+    match use_conn_err_short_circuit() {
+        Ok(_) => assert_eq(0, 1)
+        Err(e) => assert_eq(e.msg, "boom")
+    }
+}
+
+// Case 1d (the original k4qp2c repro shape): `with..? as conn` directly inside
+// a test body. Pre-fix, `conn` typed as Int and `conn.fd` failed.
+test "with expr? as conn: field access directly in test body" {
+    with connect_handle("postgres://x")? as conn {
+        assert_eq(conn.fd, 7)
+    }
+}
+
+// Case 1e: trait method call directly in test body (the libs/pg repro).
+test "with expr? as conn: method call directly in test body" {
+    with connect_handle("postgres://x")? as conn {
+        let v = conn.query("SELECT 1")?
+        assert_eq(v, 7)
+    }
+}
