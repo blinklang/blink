@@ -20,7 +20,9 @@ import codegen_types.{
     reg_fn_struct_ret, reg_fn_ret_from_ann,
     resolve_ret_type_from_ann, resolve_option_inner_from_ann, build_closure_sig_from_type_ann,
     resolve_tuple_ann, tuple_c_name_from_ann,
+    append_ev_arg, fn_node_has_effects,
     cg_closure_counter, cg_closure_defs, cg_closure_promoter_defs, cg_closure_param_type_hint,
+    cg_fn_shim_emitted,
     cg_closure_cap_start, cg_closure_cap_count,
     cg_current_fn_has_ev, cg_current_fn_name, cg_current_fn_ret, cg_current_fn_option_inner, cg_in_test_body,
     cg_indent, cg_lines, cg_temp_counter,
@@ -716,6 +718,89 @@ pub fn prescan_mut_captures(block: Int) {
         }
         i = i + 1
     }
+}
+
+// Synthesizes a closure-ABI shim for a bare-fn reference passed where a
+// `fn(...)` formal is expected. The shim has signature
+// `RET(*)(const blink_closure*, args...)`, drops __self, and forwards to
+// the mangled target. For effectful targets it threads `&__blink_ev` —
+// the shim sets cg_current_fn_has_ev=0 so ev_arg_for_callee picks the
+// global ev fallback rather than emitting an ev param the shim doesn't
+// have. Deduped per mangled name; returns the shim's C identifier.
+@allow(UnrestoredMutation, IncompleteStateRestore)
+pub fn emit_fn_value_shim_if_needed(fn_node: Int, mangled: Str) -> Str ! Codegen.Emit, Diag.Report {
+    let cached = cg_fn_shim_emitted.get(mangled)
+    if cached.is_some() {
+        return cached.unwrap()
+    }
+    let shim_name = "__fn_shim_{mangled}"
+    cg_fn_shim_emitted.insert(mangled, shim_name)
+
+    let blink_name = node_name(fn_node)
+    let params_sl = node_params(fn_node)
+    let has_ev = fn_node_has_effects(fn_node) != 0
+
+    let mut params_c = "const blink_closure* __self"
+    let mut call_args = ""
+    let mut have_args = 0
+    if params_sl != -1 && sublist_length(params_sl) > 0 {
+        let mut i = 0
+        while i < sublist_length(params_sl) {
+            let p = sublist_get(params_sl, i)
+            let ptype = node_type_name(p)
+            let pname = "__a{i}"
+            params_c = params_c.concat(", ")
+            if ptype == "Fn" {
+                params_c = params_c.concat("blink_closure* {pname}")
+            } else if is_enum_type(ptype) != 0 {
+                params_c = params_c.concat("{c_type_c_name(ptype)} {pname}")
+            } else if is_struct_type(ptype) != 0 {
+                params_c = params_c.concat("{c_type_c_name(ptype)} {pname}")
+            } else if ptype == "Tuple" {
+                params_c = params_c.concat("{tuple_c_name_from_ann(node_type_ann(p), \"void\")} {pname}")
+            } else {
+                params_c = params_c.concat("{c_type_str(type_from_name(ptype))} {pname}")
+            }
+            if have_args != 0 {
+                call_args = call_args.concat(", ")
+            }
+            call_args = call_args.concat(pname)
+            have_args = 1
+            i = i + 1
+        }
+    }
+
+    let ret_str = node_return_type(fn_node)
+    let ret_type = type_from_name(ret_str)
+    let resolved_ret = resolve_ret_type_from_ann(fn_node)
+    let mut ret_c_str = if resolved_ret != "" { resolved_ret } else { c_type_str(ret_type) }
+    if ret_type == CT_VOID && ret_str != "Void" && ret_str != "" {
+        if is_struct_type(ret_str) != 0 {
+            ret_c_str = c_type_c_name(ret_str)
+        } else if is_enum_type(ret_str) != 0 {
+            ret_c_str = c_type_c_name(ret_str)
+        }
+    }
+
+    let saved_fn_has_ev = cg_current_fn_has_ev
+    cg_current_fn_has_ev = 0
+    let final_call_args = if has_ev != 0 { append_ev_arg(blink_name, call_args) } else { call_args }
+    cg_current_fn_has_ev = saved_fn_has_ev
+
+    let is_void_ret = ret_type == CT_VOID && (ret_str == "" || ret_str == "Void")
+
+    cg_closure_defs.push("static {ret_c_str} {shim_name}({params_c});")
+    cg_closure_defs.push("static {ret_c_str} {shim_name}({params_c}) \{")
+    cg_closure_defs.push("    (void)__self;")
+    if is_void_ret != 0 {
+        cg_closure_defs.push("    {mangled}({final_call_args});")
+    } else {
+        cg_closure_defs.push("    return {mangled}({final_call_args});")
+    }
+    cg_closure_defs.push("}")
+    cg_closure_defs.push("")
+
+    shim_name
 }
 
 @allow(UnrestoredMutation, IncompleteStateRestore)

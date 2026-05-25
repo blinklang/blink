@@ -19,6 +19,8 @@ import codegen_types.{
     cg_in_handler_body, cg_indent, cg_lines, cg_program_node,
     cg_temp_counter, cg_uses_async, cg_where_self_var,
     cg_ensures_result_var, cg_old_snapshot_vars,
+    cg_expect_fn_value_sig,
+    build_closure_sig_from_type_ann, fn_node_has_effects, is_fn_ffi,
     closure_cap_infos, closure_captures, closure_param_names,
     closure_ret_ct, closure_sig_ret_part,
     compound_name_from_ann, compound_option_inner_name,
@@ -45,8 +47,10 @@ import codegen_types.{
     get_var_struct, get_var_tp, get_var_type,
     get_variant_field_count, get_variant_field_name,
     get_variant_field_type_str, get_variant_index, get_variant_tag,
+    get_callee_params_sl,
     infer_fn_type_args_from_types, is_compound_ct, is_compound_tag, is_data_enum, is_named_typedef_tag, typedef_tag_or_empty,
     is_emitted_let, is_enum_type, is_fn_registered, is_generic_fn,
+    is_scope_var,
     is_struct_or_enum_type, is_struct_type, is_trait_type,
     list_contains_str, list_iter_c_type, lookup_mono_base, mangle_generic_name,
     mut_captured_vars,
@@ -71,13 +75,14 @@ import codegen_types.{
 }
 import codegen_derive.{ct_to_descriptor, descriptor_mangle, queue_promote_type}
 import codegen_methods.{emit_method_call, resolve_push_struct}
-import codegen_closures.{analyze_captures, emit_closure}
+import codegen_closures.{analyze_captures, emit_closure, emit_fn_value_shim_if_needed}
 import diagnostics.{
     diag_error, diag_error_at, diag_warn_at, diag_set_last_fix, diag_source_file,
     COALESCE_REQUIRES_OPT, QM_INVALID_OPERAND, UNDEFINED_FUNCTION,
     QM_RESULT_IN_NON_RESULT, QM_OPTION_IN_NON_OPTION,
     MISSING_KEYWORD_ARG, INVALID_KEYWORD_ARG,
     CLOSEABLE_ESCAPES_SCOPE, FILE_NOT_FOUND, RAW_BYPASSES_PARAM,
+    BARE_GENERIC_FN_AS_VALUE,
 }
 import std.path.{path_dirname}
 import formatter.{format_expr}
@@ -420,6 +425,34 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
             if is_closure_param == 0 {
                 expr_result_str = "(*{safe}_cell)"
                 expr_result_type = get_var_type(name)
+                return
+            }
+        }
+        // Bare-fn-as-value: callers in Call-arg loops set
+        // cg_expect_fn_value_sig before each emit_expr when the formal at
+        // that position is `fn(...)`. A local var with the same name wins
+        // (is_scope_var guard); FFI bail-out keeps unsafe ABI shimming off
+        // the table; generics need an explicit closure literal so type-args
+        // can flow from context.
+        if cg_expect_fn_value_sig != "" && is_scope_var(name) == 0 && is_fn_registered(name) != 0 && is_fn_ffi(name) == 0 {
+            if is_generic_fn(name) != 0 {
+                diag_error_at(
+                    "BareGenericFnAsValue",
+                    BARE_GENERIC_FN_AS_VALUE,
+                    "cannot pass generic fn '{name}' as a closure value",
+                    node,
+                    "wrap it in a closure literal that names the type, e.g. `\{x => {name}(x)\}`"
+                )
+                expr_result_str = "0"
+                expr_result_type = CT_INT
+                return
+            }
+            let target_fn_node = get_fn_node(name)
+            if target_fn_node != -1 {
+                let shim_name = emit_fn_value_shim_if_needed(target_fn_node, c_fn_name(name))
+                expr_result_str = "blink_closure_new_typed((void*){shim_name}, NULL, NULL, 0, NULL)"
+                expr_result_type = CT_CLOSURE
+                expr_closure_sig = cg_expect_fn_value_sig
                 return
             }
         }
@@ -2011,6 +2044,27 @@ pub fn arg_map_info_for(arg_node: Int, rt: Int) -> ArgMapInfo {
     ArgMapInfo { kt: get_map_key_type(nm), ks: get_map_key_struct(nm), vt: get_map_value_type(nm), vs: get_map_value_struct(nm) }
 }
 
+// Returns the closure-signature string for the i-th formal when it has a
+// `fn(...)` type, otherwise "". Used by the Call-arg loops to hint the
+// Ident arm that a bare-fn reference should be shimmed.
+pub fn arg_fn_value_hint(params_sl: Int, i: Int) -> Str {
+    if params_sl == -1 {
+        return ""
+    }
+    if i < 0 || i >= sublist_length(params_sl) {
+        return ""
+    }
+    let p = sublist_get(params_sl, i)
+    if node_type_name(p) != "Fn" {
+        return ""
+    }
+    let ta = node_type_ann(p)
+    if ta == -1 {
+        return ""
+    }
+    build_closure_sig_from_type_ann(ta)
+}
+
 // Returns 0 if type-arg inference yields None so the caller can fall through
 // to non-generic handling; on success registers the monomorphization, writes
 // expr_result_str / expr_result_type plus container inner-type globals, and
@@ -2906,6 +2960,7 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
         let mut arg_map_val_types: List[Int] = []
         let mut arg_map_val_structs: List[Str] = []
         let is_generic = is_generic_fn(fn_name)
+        let callee_params_sl = get_callee_params_sl(fn_name)
         reorder_named_args(fn_name, args_sl, node)
         if reorder_result.len() > 0 {
             let mut i = 0
@@ -2918,7 +2973,10 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                 if node_kind(arg_node) == NodeKind.NamedArg {
                     actual = node_value(arg_node)
                 }
+                let saved_hint = cg_expect_fn_value_sig
+                cg_expect_fn_value_sig = arg_fn_value_hint(callee_params_sl, i)
                 emit_expr(actual)
+                cg_expect_fn_value_sig = saved_hint
                 args_str = args_str.concat(expr_result_str)
                 if is_generic != 0 {
                     arg_types.push(expr_result_type)
@@ -2940,7 +2998,10 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                     args_str = args_str.concat(", ")
                 }
                 let arg_node_i = sublist_get(args_sl, i)
+                let saved_hint = cg_expect_fn_value_sig
+                cg_expect_fn_value_sig = arg_fn_value_hint(callee_params_sl, i)
                 emit_expr(arg_node_i)
+                cg_expect_fn_value_sig = saved_hint
                 args_str = args_str.concat(expr_result_str)
                 if is_generic != 0 {
                     arg_types.push(expr_result_type)
