@@ -557,7 +557,9 @@ pub fn format_expr(node: Int) -> Str {
     }
 
     if kind == NodeKind.MatchExpr {
-        return format_match_inline(node)
+        io.eprintln("formatter: format_expr reached MatchExpr; caller must route through emit_expr_wrapped (match has no single-line form)")
+        exit(101)
+        return ""
     }
 
     if kind == NodeKind.Block {
@@ -609,7 +611,9 @@ pub fn format_expr(node: Int) -> Str {
     }
 
     if kind == NodeKind.HandlerExpr {
-        return format_handler_inline(node)
+        io.eprintln("formatter: format_expr reached HandlerExpr; caller must route through emit_expr_wrapped (handler has no single-line form)")
+        exit(101)
+        return ""
     }
 
     if kind == NodeKind.SpreadExpr {
@@ -775,17 +779,8 @@ fn format_if_inline(node: Int) -> Str {
     sb.to_str()
 }
 
-fn format_match_inline(node: Int) -> Str {
-    return "match ".concat(format_expr(node_scrutinee(node))).concat(" \{ ... }")
-}
-
-fn format_handler_inline(node: Int) -> Str {
-    let name = node_name(node)
-    return "handler {name} \{ ... }"
-}
-
 fn format_handler_full(node: Int) ! Format.Emit {
-    emit_handler_wrapped(node, "")
+    emit_handler_wrapped(node, "", "")
 }
 
 // ── Wrapped emission helpers ────────────────────────────────────────
@@ -810,6 +805,35 @@ fn emit_args_with_trailing_block(open: Str, args_sl: Int) ! Format.Emit {
     fmt_emit(")")
 }
 
+fn emit_args_with_block_args(open: Str, args_sl: Int) ! Format.Emit {
+    // Each arg renders on its own indented region. Block-like args route through
+    // emit_expr_wrapped so handler/match/closure bodies stay reparseable; plain
+    // args fall back to format_expr. Suffix is "," for non-last, "" for last;
+    // closing ")" is emitted on its own line after dedent.
+    let total = sublist_length(args_sl)
+    fmt_emit(open)
+    fmt_indent = fmt_indent + 1
+    let mut i = 0
+    while i < total {
+        let arg = sublist_get(args_sl, i)
+        let is_last = i == total - 1
+        if block_needs_multiline(arg) != 0 {
+            let suffix = if is_last { "" } else { "," }
+            emit_expr_wrapped(arg, "", suffix)
+        } else {
+            let s = format_expr(arg)
+            if is_last {
+                fmt_emit(s)
+            } else {
+                fmt_emit(s.concat(","))
+            }
+        }
+        i = i + 1
+    }
+    fmt_indent = fmt_indent - 1
+    fmt_emit(")")
+}
+
 fn emit_call_wrapped(node: Int, prefix: Str) ! Format.Emit {
     let kind = node_kind(node)
     if kind == NodeKind.Call {
@@ -820,17 +844,22 @@ fn emit_call_wrapped(node: Int, prefix: Str) ! Format.Emit {
             fmt_emit(open.concat(")"))
             return
         }
-        let last_arg = sublist_get(args_sl, sublist_length(args_sl) - 1)
-        if block_needs_multiline(last_arg) != 0 {
+        let total = sublist_length(args_sl)
+        let last_arg = sublist_get(args_sl, total - 1)
+        if block_needs_multiline(last_arg) != 0 && any_non_last_arg_needs_multiline(args_sl) == 0 {
             emit_args_with_trailing_block(open, args_sl)
+            return
+        }
+        if any_arg_needs_multiline(args_sl) != 0 {
+            emit_args_with_block_args(open, args_sl)
             return
         }
         fmt_emit(open)
         fmt_indent = fmt_indent + 1
         let mut i = 0
-        while i < sublist_length(args_sl) {
+        while i < total {
             let arg_str = format_expr(sublist_get(args_sl, i))
-            if i < sublist_length(args_sl) - 1 {
+            if i < total - 1 {
                 fmt_emit(arg_str.concat(","))
             } else {
                 fmt_emit(arg_str)
@@ -850,17 +879,22 @@ fn emit_call_wrapped(node: Int, prefix: Str) ! Format.Emit {
             fmt_emit(open.concat(")"))
             return
         }
-        let last_arg = sublist_get(args_sl, sublist_length(args_sl) - 1)
-        if block_needs_multiline(last_arg) != 0 {
+        let total = sublist_length(args_sl)
+        let last_arg = sublist_get(args_sl, total - 1)
+        if block_needs_multiline(last_arg) != 0 && any_non_last_arg_needs_multiline(args_sl) == 0 {
             emit_args_with_trailing_block(open, args_sl)
+            return
+        }
+        if any_arg_needs_multiline(args_sl) != 0 {
+            emit_args_with_block_args(open, args_sl)
             return
         }
         fmt_emit(open)
         fmt_indent = fmt_indent + 1
         let mut i = 0
-        while i < sublist_length(args_sl) {
+        while i < total {
             let arg_str = format_expr(sublist_get(args_sl, i))
-            if i < sublist_length(args_sl) - 1 {
+            if i < total - 1 {
                 fmt_emit(arg_str.concat(","))
             } else {
                 fmt_emit(arg_str)
@@ -1054,6 +1088,33 @@ fn check_stmts_multiline(stmts_sl: Int) -> Int {
     is_simple_expr_kind(sk) == 0
 }
 
+fn any_arg_needs_multiline(args_sl: Int) -> Int {
+    if args_sl == -1 { return 0 }
+    let n = sublist_length(args_sl)
+    let mut i = 0
+    while i < n {
+        if block_needs_multiline(sublist_get(args_sl, i)) != 0 {
+            return 1
+        }
+        i = i + 1
+    }
+    0
+}
+
+fn any_non_last_arg_needs_multiline(args_sl: Int) -> Int {
+    if args_sl == -1 { return 0 }
+    let n = sublist_length(args_sl)
+    if n <= 1 { return 0 }
+    let mut i = 0
+    while i < n - 1 {
+        if block_needs_multiline(sublist_get(args_sl, i)) != 0 {
+            return 1
+        }
+        i = i + 1
+    }
+    0
+}
+
 fn block_needs_multiline(node: Int) -> Int {
     let kind = node_kind(node)
     if kind == NodeKind.MatchExpr { return 1 }
@@ -1077,10 +1138,12 @@ fn block_needs_multiline(node: Int) -> Int {
         return check_stmts_multiline(node_stmts(then_b))
     }
     if kind == NodeKind.Call {
-        return block_needs_multiline(node_left(node))
+        if block_needs_multiline(node_left(node)) != 0 { return 1 }
+        return any_arg_needs_multiline(node_args(node))
     }
     if kind == NodeKind.MethodCall {
-        return block_needs_multiline(node_obj(node))
+        if block_needs_multiline(node_obj(node)) != 0 { return 1 }
+        return any_arg_needs_multiline(node_args(node))
     }
     0
 }
@@ -1175,7 +1238,7 @@ fn emit_if_expr_wrapped(node: Int, prefix: Str, suffix: Str) ! Format.Emit {
     emit_if_else_tail(node_else_body(node), suffix)
 }
 
-fn emit_handler_wrapped(node: Int, prefix: Str) ! Format.Emit {
+fn emit_handler_wrapped(node: Int, prefix: Str, suffix: Str) ! Format.Emit {
     let name = node_name(node)
     let methods_sl = node_methods(node)
     fmt_emit("{prefix}handler {name} \{")
@@ -1189,7 +1252,7 @@ fn emit_handler_wrapped(node: Int, prefix: Str) ! Format.Emit {
         }
     }
     fmt_indent = fmt_indent - 1
-    fmt_emit("}")
+    fmt_emit("}{suffix}")
 }
 
 fn emit_closure_wrapped(node: Int, prefix: Str, suffix: Str) ! Format.Emit {
@@ -1261,13 +1324,10 @@ fn emit_async_spawn_wrapped(node: Int, prefix: Str) ! Format.Emit {
     fmt_emit("}")
 }
 
-fn call_has_trailing_block_arg(node: Int) -> Int {
+fn call_has_any_block_arg(node: Int) -> Int {
     let kind = node_kind(node)
-    let args_sl = node_args(node)
     if kind != NodeKind.Call && kind != NodeKind.MethodCall { return 0 }
-    if args_sl == -1 || sublist_length(args_sl) == 0 { return 0 }
-    let last_arg = sublist_get(args_sl, sublist_length(args_sl) - 1)
-    block_needs_multiline(last_arg)
+    any_arg_needs_multiline(node_args(node))
 }
 
 fn emit_expr_wrapped(node: Int, prefix: Str, suffix: Str) ! Format.Emit {
@@ -1299,11 +1359,11 @@ fn emit_expr_wrapped(node: Int, prefix: Str, suffix: Str) ! Format.Emit {
                 return
             }
         }
+        if kind == NodeKind.HandlerExpr {
+            emit_handler_wrapped(node, prefix, suffix)
+            return
+        }
         if suffix == "" {
-            if kind == NodeKind.HandlerExpr {
-                emit_handler_wrapped(node, prefix)
-                return
-            }
             if kind == NodeKind.Block {
                 emit_block_expr_wrapped(node, prefix)
                 return
@@ -1318,7 +1378,7 @@ fn emit_expr_wrapped(node: Int, prefix: Str, suffix: Str) ! Format.Emit {
             }
         }
     }
-    if suffix == "" && call_has_trailing_block_arg(node) != 0 {
+    if suffix == "" && call_has_any_block_arg(node) != 0 {
         emit_call_wrapped(node, prefix)
         return
     }
