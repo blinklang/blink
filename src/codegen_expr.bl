@@ -1607,7 +1607,7 @@ fn emit_binop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.R
             let bw = ct_bit_width(left_type)
             let amt = fresh_temp("__sh_amt")
             let val = fresh_temp("__sh_val")
-            let loc_line = node_line(node)
+            let loc_line = panic_line_str(node)
             let file = panic_file_for(node)
             emit_line("uint32_t {amt} = (uint32_t)({right_str});")
             emit_line("if ({amt} >= {bw}) \{ fprintf(stderr, \"panic: shift amount %u exceeds bit width {bw} at {file}:{loc_line}\\n\", {amt}); exit(1); }")
@@ -1622,7 +1622,7 @@ fn emit_binop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.R
     if is_sized_int_ct(left_type) && (op == "+" || op == "-" || op == "*" || op == "/" || op == "%") {
         let lc = c_type_str(left_type)
         let tname = type_name_from_ct(left_type)
-        let loc_line = node_line(node)
+        let loc_line = panic_line_str(node)
         let file = panic_file_for(node)
         let result_tmp = fresh_temp("__sov")
         let lhs_tmp = fresh_temp("__sov_l")
@@ -1680,7 +1680,7 @@ fn emit_unaryop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag
         if is_sized_int_ct(operand_type) {
             let lc = c_type_str(operand_type)
             let tname = type_name_from_ct(operand_type)
-            let loc_line = node_line(node)
+            let loc_line = panic_line_str(node)
             let file = panic_file_for(node)
             let result_tmp = fresh_temp("__sneg")
             let in_tmp = fresh_temp("__sneg_in")
@@ -1718,6 +1718,15 @@ fn emit_unaryop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag
                 let rerr_s = expr_result_err_struct
                 let res_c = result_c_type_mixed(rok, rerr, rok_s, rerr_s)
                 emit_line("{res_c} {tmp} = {operand_str};")
+                // WHY raw node_line here (no panic_line_str defensive fallback):
+                // __blink_test_set_propagate takes a typed Int line, not a
+                // string-formatted location. The UnaryOp `?` node is created
+                // only by the parser (src/parser.bl: parse postfix; see also
+                // br 272w17 audit), and the parser always inherits the line
+                // from a real inner expression, so node_line(node) > 0 here.
+                // If a future transform synthesizes a `?` node, it must
+                // propagate a real line (or this site + the runtime helper
+                // need a sentinel like -1 mapped to "<synthesized>").
                 let qm_line = node_line(node)
                 let qm_col = node_col(node)
                 let qm_file = panic_file_for(node)
@@ -1795,6 +1804,10 @@ fn emit_unaryop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag
                     let opt_c = option_c_type(inner)
                     emit_line("{opt_c} {tmp} = {operand_str};")
                 }
+                // WHY raw node_line here: same invariant as the Result `?`
+                // site above — UnaryOp `?` is parser-only and always inherits
+                // a real line. See the longer comment above for the audit
+                // (br 272w17).
                 let qm_line = node_line(node)
                 let qm_col = node_col(node)
                 let qm_file = panic_file_for(node)
@@ -3219,6 +3232,15 @@ pub fn panic_file_for(node: Int) -> Str {
     let raw = diag_file_for_node(node)
     let resolved = if raw != "" { raw } else { diag_source_file }
     escape_c_string(resolved)
+}
+
+// Render the line-number portion of a runtime panic location.
+// Returns the decimal line for real source nodes; for synthesized nodes
+// whose line did not propagate (line <= 0) returns "<synthesized>" so
+// the embedded panic message does not lie about a source position.
+pub fn panic_line_str(node: Int) -> Str {
+    let l = node_line(node)
+    if l <= 0 { "<synthesized>" } else { "{l}" }
 }
 
 pub fn escape_c_string(s: Str) -> Str {

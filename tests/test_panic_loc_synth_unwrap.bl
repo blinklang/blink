@@ -1,0 +1,58 @@
+// br 272w17: synthesized .unwrap() panics must not lie about their line.
+//
+// Real .unwrap() sites continue to report a precise file:line. Synthesized
+// nodes whose line did not propagate (line <= 0) fall back to
+// <synthesized> in the panic message rather than printing a misleading
+// numeric line (which historically could attribute to a blank line
+// between function definitions).
+//
+// We can't exercise the synth path from Blink source alone (the parser
+// always populates a real line), so this test guards the regression case:
+// the real-source emit path still produces the correct numeric line.
+
+fn main() {
+    let pwd_res = process_run("sh", ["-c", "pwd -P"])
+    let blink_root = pwd_res.out.trim_right()
+
+    let base = ".tmp/_test_panic_loc_synth_unwrap_{getpid()}"
+    shell_exec("rm -rf {base}")
+    shell_exec("mkdir -p {base}/src")
+
+    write_file("{base}/blink.toml", "[package]\nname = \"panicloc\"\nversion = \"0.1.0\"\n\n[dependencies]\n")
+
+    // Note: o.unwrap() is on line 4 of util.bl (1=pub fn, 2=let, 3=blank
+    // line check below; we put unwrap on line 4 deliberately).
+    let util_src = "pub fn boom() -> Int \{\n    let o: Option[Int] = None\n\n    o.unwrap()\n\}\n"
+    write_file("{base}/src/util.bl", util_src)
+
+    let main_src = "import util.\{boom\}\n\nfn main() \{\n    io.println(boom())\n\}\n"
+    write_file("{base}/src/main.bl", main_src)
+
+    let cmd = "cd {base} && {blink_root}/build/blink run src/main.bl 2>&1"
+    let result = process_run("sh", ["-c", cmd])
+    let combined = "{result.out}{result.err_out}"
+
+    shell_exec("rm -rf {base}")
+
+    if !combined.contains("unwrap called on None") {
+        io.println("FAIL: expected 'unwrap called on None' panic, got:")
+        io.println(combined)
+        return
+    }
+    if !combined.contains("util.bl:4") {
+        io.println("FAIL: expected panic to reference util.bl:4 (the unwrap call site), got:")
+        io.println(combined)
+        return
+    }
+    if combined.contains("<synthesized>") {
+        io.println("FAIL: real-source unwrap should not render as <synthesized>, got:")
+        io.println(combined)
+        return
+    }
+    if combined.contains("util.bl:3") {
+        io.println("FAIL: panic should not attribute to blank line 3, got:")
+        io.println(combined)
+        return
+    }
+    io.println("PASS: real .unwrap() panic reports the correct numeric line")
+}
