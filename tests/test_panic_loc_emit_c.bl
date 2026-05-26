@@ -1,0 +1,74 @@
+// br 272w17: panic location encoding must be correct at the codegen layer.
+//
+// Companion to tests/test_panic_loc_synth_unwrap.bl (which exercises the
+// happy path end-to-end at runtime). This test inspects the EMITTED C
+// directly via `bin/blink build --emit c`, asserting structural
+// properties of panic_line_str's output without needing the runtime.
+//
+// What this guards (happy-path encoding):
+//   - A real .unwrap() at a known source line emits the panic-location
+//     format string `panic: <msg> at <file>:<numeric-line>` with the
+//     correct numeric line (the helper's `l > 0` branch).
+//   - The literal `"<synthesized>"` does NOT appear in the emitted C
+//     when every panic site has a real source line — confirming the
+//     defensive branch is not over-firing.
+//
+// Known gap (the synth branch):
+//   panic_line_str's `l <= 0` branch (which renders `<synthesized>`)
+//   has no organic trigger in current compiler source: every node that
+//   reaches the helper inherits a real line from the parser. Structural
+//   verification that the helper actually emits the literal string
+//   "<synthesized>" when chosen requires either a compiler-internal
+//   unit-test harness for codegen helpers, or a parser/transform path
+//   that synthesizes a panic-emitting node with stale/zero line. See
+//   the chore ticket linked on br 272w17 for follow-up.
+
+fn emit_c(tag: Str, src: Str) -> Str {
+    let bl_path = ".tmp/_test_{tag}.bl"
+    write_file(bl_path, src)
+    let _ = process_run("bin/blink", ["build", bl_path, "--emit", "c"])
+    let c_src = read_file("build/_test_{tag}.c")
+    shell_exec("rm -f {bl_path} build/_test_{tag}.c")
+    c_src
+}
+
+test "panic_line_str emits numeric line for real .unwrap() site" {
+    // .unwrap() is on line 3 of this fixture.
+    let src = "fn main() \{\n" +
+              "    let o: Option[Int] = None\n" +
+              "    let _ = o.unwrap()\n" +
+              "\}\n"
+    let c = emit_c("panic_loc_unwrap", src)
+    // The emit_panic_tag_check helper produces:
+    //   fprintf(stderr, "panic: <msg> at <file>:<line>\n"); exit(1);
+    // For a real source line, <line> is the decimal node_line.
+    assert(c.contains("unwrap called on None"))
+    assert(c.contains("_test_panic_loc_unwrap.bl:3"))
+}
+
+test "panic_line_str does not render <synthesized> for real source nodes" {
+    // Any panic-emitting construct with a real source line must NOT
+    // trip the `l <= 0` defensive branch. This guards against the
+    // helper over-firing (e.g. if a future refactor accidentally
+    // zeroes out lines for parsed nodes).
+    let src = "fn main() \{\n" +
+              "    let o: Option[Int] = None\n" +
+              "    let _ = o.unwrap()\n" +
+              "\}\n"
+    let c = emit_c("panic_loc_no_synth", src)
+    assert(!c.contains("<synthesized>"))
+}
+
+test "panic_line_str emits numeric line for sized-int overflow trap" {
+    // Sized-integer arithmetic also flows through panic_line_str
+    // (codegen_expr.bl:1625). Distinct emit site, same helper.
+    // The arithmetic op is on line 3.
+    let src = "fn main() \{\n" +
+              "    let a: I32 = 2147483647\n" +
+              "    let _ = a + a\n" +
+              "\}\n"
+    let c = emit_c("panic_loc_i32_ovf", src)
+    assert(c.contains("I32 overflow"))
+    assert(c.contains("_test_panic_loc_i32_ovf.bl:3"))
+    assert(!c.contains("<synthesized>"))
+}
