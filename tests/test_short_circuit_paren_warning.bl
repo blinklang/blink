@@ -1,0 +1,53 @@
+// br 2zwsg3: the short-circuit lowering for `&&`/`||` in codegen_expr.bl
+// splices the left operand into an emitted `if (...)` line. The left
+// operand comes back from emit_expr already wrapped in parens by
+// emit_binop's `({l} {op} {r})` template, so without stripping we get
+//
+//     if ((_ounw_0.value == idx)) { ... }
+//
+// which clang flags as -Wparentheses-equality (the inner parens look
+// like the common `if ((x = y))` typo). The stmt-level emit_if and
+// friends already strip via strip_outer_parens; the short-circuit
+// branch must do the same.
+//
+// These tests inspect the emitted C directly so we don't depend on the
+// runtime to surface the warning.
+
+fn emit_c(tag: Str, src: Str) -> Str {
+    let bl_path = ".tmp/_test_{tag}.bl"
+    write_file(bl_path, src)
+    let _ = process_run("bin/blink", ["build", bl_path, "--emit", "c"])
+    let c_src = read_file("build/_test_{tag}.c")
+    shell_exec("rm -f {bl_path} build/_test_{tag}.c")
+    c_src
+}
+
+test "short-circuit and-op left operand has no extraneous parens" {
+    let src = "fn main() \{\n    let o: Option[Int] = Some(7)\n    let idx = 7\n    let k: Option[Int] = Some(3)\n    let key = 3\n    if o.unwrap() == idx && k.unwrap() == key \{\n        io.println(\"match\")\n    \}\n\}\n"
+    let c = emit_c("sc_and_parens", src)
+    // The bug: `if ((_ounw_0.value == idx))` — double parens.
+    assert(!c.contains("if ((_ounw_0.value == idx))"))
+    // The fix: single parens.
+    assert(c.contains("if (_ounw_0.value == idx) \{"))
+}
+
+test "short-circuit or-op left operand has no extraneous parens" {
+    // For `||`, the helper emits `if (!(left))`. To force the
+    // short-circuit lowering (not the inline `({l} || {r})` path),
+    // the RHS must emit its own statement lines — another .unwrap()
+    // call does so via its tag-check panic.
+    let src = "fn main() \{\n    let o: Option[Int] = Some(7)\n    let idx = 7\n    let k: Option[Int] = Some(3)\n    let key = 3\n    if o.unwrap() == idx || k.unwrap() == key \{\n        io.println(\"match\")\n    \}\n\}\n"
+    let c = emit_c("sc_or_parens", src)
+    assert(!c.contains("if (!((_ounw_0.value == idx)"))
+    assert(c.contains("if (!(_ounw_0.value == idx)) \{"))
+}
+
+test "plain if comparison still single-parened (regression guard)" {
+    // Negative control: emit_if_stmt's strip_outer_parens already
+    // handled the non-short-circuit case. Make sure we didn't break
+    // it by over-stripping or otherwise.
+    let src = "fn main() \{\n    let o: Option[Int] = Some(7)\n    let idx = 7\n    if o.unwrap() == idx \{\n        io.println(\"match\")\n    \}\n\}\n"
+    let c = emit_c("sc_plain_if", src)
+    assert(!c.contains("if ((_ounw_0.value == idx))"))
+    assert(c.contains("if (_ounw_0.value == idx) \{"))
+}
