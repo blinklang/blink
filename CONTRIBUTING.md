@@ -14,7 +14,7 @@ cd blink
 ./bootstrap/bootstrap.sh
 ```
 
-This builds the compiler toolchain. The `bin/blink` wrapper auto-builds the CLI on first use.
+This builds the compiler toolchain, producing `build/blinkc` and `build/blink`. Re-run `task build-cli` to rebuild the CLI after editing `src/cli.bl`.
 
 ## Project Structure
 
@@ -36,9 +36,9 @@ tests/                      # All test_*.bl files
 ## Compiling Programs
 
 ```sh
-bin/blink build examples/hello.bl
-bin/blink run examples/hello.bl
-bin/blink check examples/hello.bl
+build/blink build examples/hello.bl
+build/blink run examples/hello.bl
+build/blink check examples/hello.bl
 ```
 
 ## Updating the Bootstrap

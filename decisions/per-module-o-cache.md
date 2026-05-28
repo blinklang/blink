@@ -117,7 +117,7 @@ LRU-by-mtime is good enough — no need to track real access counts.
 
 ### 6. Bootstrap protocol impact
 
-`task ci-per-module` invokes `bin/blink __emit-per-module` directly and
+`task ci-per-module` invokes `build/blink __emit-per-module` directly and
 calls `cc` itself in the script. It does not call `do_build` and so does
 not consult the cache by default. We additionally export
 `BLINK_CACHE_DIR=` (empty) inside the `ci-per-module` script as

@@ -100,7 +100,7 @@ unused `static inline` copies the linker decided not to call.
    the same fixture — exercises the policy on real-world generic use.
 3. **Emit determinism**: re-emitting per-module from the same compiler
    produces byte-equal `.c`/`.h`.
-4. **Gen1 vs Gen2 byte equality**: per-module emit from `bin/blink` and
+4. **Gen1 vs Gen2 byte equality**: per-module emit from `build/blink` and
    from the per-module-built compiler are byte-equal — bootstrap
    fixed-point preserved.
 

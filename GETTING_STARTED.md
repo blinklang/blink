@@ -28,7 +28,7 @@ cd blink
 ./bootstrap/bootstrap.sh
 ```
 
-This compiles the bootstrap C file with your system's C compiler, then uses it to compile the Blink compiler source, verifying the self-compilation is stable. After bootstrap, `bin/blink` is ready to use (auto-builds the CLI on first invocation).
+This compiles the bootstrap C file with your system's C compiler, then uses it to compile the Blink compiler source, verifying the self-compilation is stable. After bootstrap, `build/blink` is ready to use.
 
 ## Your First Program
 
@@ -49,7 +49,7 @@ fn main() {
 Run it:
 
 ```sh
-bin/blink run hello.bl
+build/blink run hello.bl
 # Hello, world!
 # Welcome to Blink.
 ```
@@ -59,17 +59,17 @@ bin/blink run hello.bl
 Build a native binary:
 
 ```sh
-bin/blink build hello.bl
+build/blink build hello.bl
 # built: build/hello
 
-bin/blink build hello.bl --output ./hello
+build/blink build hello.bl --output ./hello
 # built: ./hello
 ```
 
 Check for errors without producing a binary:
 
 ```sh
-bin/blink check hello.bl
+build/blink check hello.bl
 # ok: hello.bl
 ```
 
@@ -184,30 +184,30 @@ blink update                # re-resolve all deps
 Debug builds enable `debug_assert` and include debug symbols:
 
 ```sh
-bin/blink build hello.bl --debug
-bin/blink run hello.bl -d
+build/blink build hello.bl --debug
+build/blink run hello.bl -d
 ```
 
 Trace runtime execution with structured NDJSON output to stderr:
 
 ```sh
 # Trace all function calls, effects, and state mutations
-bin/blink run hello.bl --trace all
+build/blink run hello.bl --trace all
 
 # Filter by function or module
-bin/blink run hello.bl --trace "fn:main"
-bin/blink run hello.bl --trace "module:parser,depth:2"
+build/blink run hello.bl --trace "fn:main"
+build/blink run hello.bl --trace "module:parser,depth:2"
 
 # Trace only specific event types
-bin/blink run hello.bl --trace "event:effect"       # IO/FS/DB operations
-bin/blink run hello.bl --trace "event:state"        # variable mutations
+build/blink run hello.bl --trace "event:effect"       # IO/FS/DB operations
+build/blink run hello.bl --trace "event:state"        # variable mutations
 
 # Filter by effect type or variable name
-bin/blink run hello.bl --trace "effect:FS.Write"
-bin/blink run hello.bl --trace "state:count"
+build/blink run hello.bl --trace "effect:FS.Write"
+build/blink run hello.bl --trace "state:count"
 
 # Cap output to avoid runaway traces
-bin/blink run hello.bl --trace all --trace-limit 100
+build/blink run hello.bl --trace all --trace-limit 100
 ```
 
 Trace can also be enabled via environment variables: `BLINK_TRACE=all` and `BLINK_TRACE_LIMIT=100`.
@@ -215,8 +215,8 @@ Trace can also be enabled via environment variables: `BLINK_TRACE=all` and `BLIN
 Inspect the parsed AST:
 
 ```sh
-bin/blink ast hello.bl              # JSON AST dump
-bin/blink ast hello.bl --imports    # with resolved imports
+build/blink ast hello.bl              # JSON AST dump
+build/blink ast hello.bl --imports    # with resolved imports
 ```
 
 ## Next Steps

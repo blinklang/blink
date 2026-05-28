@@ -28,23 +28,23 @@ Build output: build/ (gitignored). Temp files: .tmp/ (gitignored, use instead of
 
 Bootstrap: `task bootstrap` — builds blinkc at `build/blinkc`. Requires `blink` on PATH or existing build/blinkc + build/blink (gen0 needs both: blinkc to emit gen1.c, blink to build the stdlib archive).
 Regen: `task regen` — rebuild compiler from source + verify (Gen1 vs Gen2 fixed-point).
-CLI: `bin/blink build <file.bl>` | `bin/blink run <file.bl>` | `bin/blink check <file.bl>` | `bin/blink doc <module>`
-Build CLI: `task build-cli` (or auto-built on first `bin/blink` invocation)
+CLI: `build/blink build <file.bl>` | `build/blink run <file.bl>` | `build/blink check <file.bl>` | `build/blink doc <module>`
+Build CLI: `task build-cli` — produces `build/blink`
 Test: `task test` — compile+run all test_*.bl in tests/
 Test formatter: `task test-fmt` — golden outputs + idempotency + semantic checks
 Single test: `task compile-test -- test_name`
 Verify: `task ci` — regen + test + test-fmt. Always run after compiler changes.
-Quick run: `bin/blink run <file.bl>` — compiles and runs in one step. Prefer this over manual blinkc+cc.
+Quick run: `build/blink run <file.bl>` — compiles and runs in one step. Prefer this over manual blinkc+cc.
 Low-level (dev): `build/blinkc <file.bl> <output.c>` then `cc -o <binary> <output.c> -lm`
 Archive-linked (dev): `build/blinkc --link-archive build/libblink_std.h <file.bl> <out.c>` then `cc -o <bin> <out.c> -Ibuild build/libblink_std.a -lm -lgc -pthread -Wl,--gc-sections`
 After modifying compiler sources: `task regen` then `task ci` to verify.
 
 ## Debugging
 
-Inspect generated C: `bin/blink build --emit c <file.bl>` — output goes to `build/<name>.c`.
-Trace compiler phases: `bin/blink run --blink-trace codegen <file.bl>` (also: lex, parse, typecheck, all).
-Runtime trace: `bin/blink run --trace all <file.bl>` (NDJSON to stderr, filter: `fn:name`, `module:mod`, `depth:N`).
-Debug build: `bin/blink run --debug <file.bl>` — enables debug_assert, compiles with `-g -O0`.
+Inspect generated C: `build/blink build --emit c <file.bl>` — output goes to `build/<name>.c`.
+Trace compiler phases: `build/blink run --blink-trace codegen <file.bl>` (also: lex, parse, typecheck, all).
+Runtime trace: `build/blink run --trace all <file.bl>` (NDJSON to stderr, filter: `fn:name`, `module:mod`, `depth:N`).
+Debug build: `build/blink run --debug <file.bl>` — enables debug_assert, compiles with `-g -O0`.
 When debugging codegen bugs, inspect the emitted C first (`--emit c`), then use `--blink-trace codegen`.
 
 ## Self-Hosting Bootstrap Protocol

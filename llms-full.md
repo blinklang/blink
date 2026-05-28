@@ -103,7 +103,7 @@ b.with_ptr(fn(p) { libc_memcpy(p, src_ptr, 64) })
 ### blink shim init (third-tier FFI escape hatch)
 
 ```sh
-bin/blink shim init <name>
+build/blink shim init <name>
 ```
 
 Scaffolds `vendor/<name>.c`, `vendor/<name>.h`, and `src/<name>.bl` with a `@trusted(audit:"TODO")` Blink wrapper around vendored C. Use this when neither `std.libc.*` nor `@ffi.struct` covers the case — varargs, signal handlers, packed structs, alignment overrides.
@@ -119,7 +119,7 @@ libcurl = { system = true }
 ### blink audit
 
 ```sh
-bin/blink audit src/main.bl          # FFI audit report
+build/blink audit src/main.bl          # FFI audit report
 ```
 
 Lists all `@ffi` calls, their audit status (`@trusted` or unaudited), and pointer operations.
@@ -1006,36 +1006,36 @@ Run `blink doc --list` to list available modules.
 ## Build & Run
 
 ```sh
-bin/blink build src/main.bl     # compile to build/main
-bin/blink run src/main.bl       # compile + run
-bin/blink test                    # discover + run all test blocks
-bin/blink check src/main.bl     # typecheck without compiling
-bin/blink fmt src/main.bl       # format in place
-bin/blink doc --list              # list available stdlib modules
-bin/blink doc std.args            # print module documentation
-bin/blink doc std.json --json     # module docs as JSON
-bin/blink audit src/main.bl     # FFI audit report
-bin/blink update                  # update deps + blink-version in blink.toml
+build/blink build src/main.bl     # compile to build/main
+build/blink run src/main.bl       # compile + run
+build/blink test                    # discover + run all test blocks
+build/blink check src/main.bl     # typecheck without compiling
+build/blink fmt src/main.bl       # format in place
+build/blink doc --list              # list available stdlib modules
+build/blink doc std.args            # print module documentation
+build/blink doc std.json --json     # module docs as JSON
+build/blink audit src/main.bl     # FFI audit report
+build/blink update                  # update deps + blink-version in blink.toml
 
 # Release builds (optimized with -O2)
-bin/blink build src/main.bl --release
-bin/blink build src/main.bl -R
+build/blink build src/main.bl --release
+build/blink build src/main.bl -R
 
 # Deterministic map iteration — pin Map hash seed to 0 for reproducible builds/runs
 # (default: reads $BLINK_MAP_SEED, falls back to time(NULL) ^ (getpid()<<16))
-bin/blink build src/main.bl --deterministic
-bin/blink run src/main.bl --deterministic
+build/blink build src/main.bl --deterministic
+build/blink run src/main.bl --deterministic
 
 # Cross-compilation (single target)
-bin/blink build src/main.bl --target linux
-bin/blink build src/main.bl -T macos-arm64
+build/blink build src/main.bl --target linux
+build/blink build src/main.bl -T macos-arm64
 
 # Multi-target builds (compile to C once, link per target)
-bin/blink build src/main.bl -T linux -T macos-arm64
+build/blink build src/main.bl -T linux -T macos-arm64
 # Produces: build/main-linux, build/main-macos-arm64
 
 # Combined
-bin/blink build src/main.bl --release -T linux -T macos-arm64
+build/blink build src/main.bl --release -T linux -T macos-arm64
 # Aliases: linux, linux-arm64, macos, macos-arm64, macos-amd64
 # Also accepts raw zig target triples: x86_64-linux-gnu, aarch64-macos, etc.
 ```
@@ -1063,20 +1063,20 @@ Start the daemon at the beginning of iterative development sessions for signific
 
 ```sh
 # Debug builds (debug_assert enabled, -g -O0)
-bin/blink build src/main.bl --debug
-bin/blink build src/main.bl -d
+build/blink build src/main.bl --debug
+build/blink build src/main.bl -d
 
 # AST dump (JSON) — inspect parsed syntax tree
-bin/blink ast src/main.bl                    # full AST as JSON
-bin/blink ast src/main.bl --imports          # resolve imports, show merged AST
-bin/blink ast src/main.bl --node 42          # dump subtree for node ID 42
+build/blink ast src/main.bl                    # full AST as JSON
+build/blink ast src/main.bl --imports          # resolve imports, show merged AST
+build/blink ast src/main.bl --node 42          # dump subtree for node ID 42
 
 # Compiler phase tracing — trace lex/parse/typecheck/codegen phases
-bin/blink build src/main.bl --blink-trace all
-bin/blink build src/main.bl --blink-trace parse    # single phase
+build/blink build src/main.bl --blink-trace all
+build/blink build src/main.bl --blink-trace parse    # single phase
 
 # Treat warnings as errors
-bin/blink build src/main.bl --strict
+build/blink build src/main.bl --strict
 ```
 
 ### Runtime Execution Tracing (`--trace`)
@@ -1085,28 +1085,28 @@ Emits structured NDJSON to stderr with function enter/exit, state mutations, and
 
 ```sh
 # Trace everything
-bin/blink run app.bl --trace all
+build/blink run app.bl --trace all
 
 # Filter by function, module, or depth
-bin/blink run app.bl --trace "fn:parse_expr"
-bin/blink run app.bl --trace "module:parser,depth:2"
-bin/blink run app.bl --trace "fn:skip_ws+parse_block"   # OR with +
+build/blink run app.bl --trace "fn:parse_expr"
+build/blink run app.bl --trace "module:parser,depth:2"
+build/blink run app.bl --trace "fn:skip_ws+parse_block"   # OR with +
 
 # Filter by event type
-bin/blink run app.bl --trace "event:enter+exit"          # only enter/exit
-bin/blink run app.bl --trace "event:effect"              # only effect invocations
-bin/blink run app.bl --trace "event:state"               # only state mutations
+build/blink run app.bl --trace "event:enter+exit"          # only enter/exit
+build/blink run app.bl --trace "event:effect"              # only effect invocations
+build/blink run app.bl --trace "event:state"               # only state mutations
 
 # Filter by effect or state variable
-bin/blink run app.bl --trace "effect:FS.Write"
-bin/blink run app.bl --trace "state:count"
+build/blink run app.bl --trace "effect:FS.Write"
+build/blink run app.bl --trace "state:count"
 
 # Cap output to N events
-bin/blink run app.bl --trace all --trace-limit 100
+build/blink run app.bl --trace all --trace-limit 100
 
 # Environment variable (same filter syntax)
-BLINK_TRACE=all bin/blink run app.bl
-BLINK_TRACE_LIMIT=50 BLINK_TRACE=all bin/blink run app.bl
+BLINK_TRACE=all build/blink run app.bl
+BLINK_TRACE_LIMIT=50 BLINK_TRACE=all build/blink run app.bl
 ```
 
 Trace event types:
