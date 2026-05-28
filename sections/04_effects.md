@@ -1239,7 +1239,7 @@ with Timer { label: "db_query", start: time.now() } {
 - **Inspect or suppress the unwind value** — `exit(self, ok: Bool)` receives only the success bit; it cannot read the panic message, the propagated error, or the `skip()` reason
 - **Retry the block** — no mechanism to re-enter the block body
 - **Transform the block's result** — `exit()` returns `()`, not a modified value
-- **Replace errors** — if `exit()` itself panics on a catchable-unwind path, the original failure is preserved as the test runner's reported result; the cleanup panic is recorded as a secondary diagnostic (see `E0824`)
+- **Replace errors** — if `exit()` itself panics on a catchable-unwind path, the original panic is preserved as the unwind cause; the test runner reports the original failure as the test's result, not the cleanup panic. The cleanup panic surfaces as a secondary `warning`-severity `E0824` (`CleanupPanickedDuringUnwind`) on the same trace frame, so the author can see the cleanup bug without losing the primary cause. On a stacked `with...as` chain, remaining handlers in the LIFO stack still run — the ordering matches the multi-cleanup test registrar decision's Q2 ruling (`continue-drain`, 6-0): short-circuiting would leak resources held by deeper-stacked handlers
 - **Catch uncaught panics** — process-terminating panics bypass `exit()` entirely
 
 Because `exit(false)` cannot observe *which* path triggered the unwind, handler authors must design `exit` to be safe under every catchable-unwind path. A handler that should commit on success and roll back on any failure pattern-matches on `ok`; a handler that always releases (timer, lock) ignores `ok`.

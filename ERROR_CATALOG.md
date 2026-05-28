@@ -103,6 +103,12 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | MissingNativeDep | E0820 | `@ffi` references undeclared native dependency | FFI | §9.2.1 |
 | NativeDepUnavailableCrossTarget | E0821 | Native dependency unavailable for cross-target | FFI | §9.2.1 |
 | FfiOffsetUnknownStride | E0822 | `Ptr.offset` requires `@ffi.struct` element type | FFI | §9.1.1 |
+| CleanupPanickedDuringUnwind | E0824 | `exit(false)`/`close()` panicked during catchable unwind; original panic preserved, cleanup surfaces as warning | Test runner | §4.6.3 |
+| SkipOutsideTest | E0827 | `skip()` called outside a test (spec-canonical alias for E0516) | Test runner | §2.20 |
+| AssertPanicsBodyReturned | E0831 | `assert_panics` body returned normally instead of panicking | Test runner | §2.20 |
+| AssertPanicsMessageMismatch | E0832 | `assert_panics` panic message did not match expected pattern | Test runner | §2.20 |
+| AssertPanicsOutsideTest | E0833 | `assert_panics` called outside a test | Test runner | §2.20 |
+| AssertPanicsNestedExpectPanic | E0834 | `assert_panics` nested inside another `assert_panics` | Test runner | §2.20 |
 | TraitContractMissingMethod | E0900 | Trait contract: required method not implemented | Trait contract | §3.6 |
 | TraitContractWrongArity | E0901 | Trait contract: method has wrong argument arity | Trait contract | §3.6 |
 | TraitContractParamMismatch | E0902 | Trait contract: method parameter type mismatch | Trait contract | §3.6 |

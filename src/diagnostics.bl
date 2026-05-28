@@ -68,6 +68,22 @@ pub const MISSING_NATIVE_DEP       = "E0820"
 pub const NATIVE_DEP_UNAVAILABLE_CROSS = "E0821"
 pub const FFI_OFFSET_UNKNOWN_STRIDE = "E0822"
 
+// E0823+ — unwind / cleanup
+pub const CLEANUP_PANICKED_DURING_UNWIND = "E0824"
+
+// E0827, E0831-E0834 — test runner diagnostics (br cbk2wq)
+// E0827 is the spec-canonical short-name for "skip() called outside a test".
+// Compiler still emits E0516 (SkipOutsideTestBody) at the typecheck site; the
+// two names refer to the same condition pending a one-release migration.
+pub const SKIP_OUTSIDE_TEST                = "E0827"
+// E0831-E0834 reserved for assert_panics; assert_panics is not yet
+// implemented in the parser/typecheck/stdlib (see decisions/std-testing-user-api.md Q4),
+// so these consts are catalog-only until the feature lands.
+pub const ASSERT_PANICS_BODY_RETURNED      = "E0831"
+pub const ASSERT_PANICS_MESSAGE_MISMATCH   = "E0832"
+pub const ASSERT_PANICS_OUTSIDE_TEST       = "E0833"
+pub const ASSERT_PANICS_NESTED_EXPECT_PANIC = "E0834"
+
 // E0900–E0906 — trait contract (one short-name spans 7 codes)
 pub const TRAIT_CONTRACT_900 = "E0900"
 pub const TRAIT_CONTRACT_901 = "E0901"
@@ -725,6 +741,24 @@ pub fn diag_explain(code: Str) -> Str {
     }
     if code == FFI_OFFSET_UNKNOWN_STRIDE {
         return "E0822 -- FfiOffsetUnknownStride\n\nPtr.offset(i) requires the pointer's element type to be an\n@ffi.struct typedef so the stride (size in bytes) is known at\ncompile time. Pointers to opaque or non-FFI types cannot be\nadvanced safely.\n\nFix: use Ptr[T] where T is annotated @ffi.struct.\n\n  @ffi.struct(header: \"poll.h\", name: \"pollfd\")\n  pub type Pollfd \{ fd: I32, events: I16, revents: I16 \}\n  let p: Ptr[Pollfd] = scope.alloc_n(8)\n  let q = p.offset(3)   // OK -- stride = sizeof(pollfd)"
+    }
+    if code == CLEANUP_PANICKED_DURING_UNWIND {
+        return "E0824 -- CleanupPanickedDuringUnwind\n\nA `BlockHandler.exit(false)` body or `Closeable.close()` body itself\npanicked while running on a catchable-unwind path (`?` propagation,\n`return`, assertion failure, or `skip()`). The original panic is the\nload-bearing failure — the test runner reports it as the test's\nresult and preserves it as the unwind cause. The cleanup panic is\nrecorded as a secondary warning on the same trace frame so the\nauthor can fix the cleanup bug without losing the primary cause.\n\nOn a stacked `with...as` chain, remaining handlers in the LIFO stack\nstill run (continue-drain ordering, per the multi-cleanup test\nregistrar decision); short-circuiting would leak resources held by\ndeeper-stacked handlers.\n\nFix: make the cleanup body robust to partially-initialized state.\nGuard mutating calls behind `if !ok \{ ... }` if they only make\nsense on the success path, and avoid raising new panics from inside\nan `exit`/`close` body.\n\n  type Tx \{ committed: Bool }\n  impl BlockHandler for Tx \{\n      fn exit(self, ok: Bool) \{\n          if ok \{ self.commit() } else \{ self.rollback() }\n          // a panic in commit/rollback here surfaces as E0824 warning\n      }\n  }"
+    }
+    if code == SKIP_OUTSIDE_TEST {
+        return "E0827 -- SkipOutsideTest\n\nspec-canonical alias for the SkipOutsideTestBody check (E0516).\n`skip()` is a test-only helper; calling it from `main()`, a regular\nfunction, or any non-test context is rejected.\n\nThe compiler currently emits E0516 at the typecheck site; both codes\nname the same condition pending a one-release rename. See the\nE0516 entry for the long-form explanation and examples."
+    }
+    if code == ASSERT_PANICS_BODY_RETURNED {
+        return "E0831 -- AssertPanicsBodyReturned\n\nThe body passed to `assert_panics` returned normally instead of\npanicking. `assert_panics` requires its body to terminate with a\npanic (assertion failure, explicit `panic(_)`, or any other\nunwinding failure); a normal return is a test failure.\n\nFix: ensure the body actually triggers the expected panic, or\nremove the `assert_panics` wrapper if no panic is expected.\n\n  test \"divides by zero panics\" \{\n      assert_panics(\{ \n          let _ = 10 / 0      // expected panic\n      })\n  }\n\nNote: `assert_panics` is not yet implemented (see br cbk2wq);\nthis diagnostic is catalog-only until the feature lands."
+    }
+    if code == ASSERT_PANICS_MESSAGE_MISMATCH {
+        return "E0832 -- AssertPanicsMessageMismatch\n\nThe body passed to `assert_panics(matching: pattern)` did panic, but\nthe panic message did not match the supplied pattern. The actual\nmessage is included in the runner output so the author can update\neither the pattern or the panic message.\n\nFix: align the expected pattern with the actual panic message, or\nthe panic message with the test's intent.\n\n  assert_panics(matching: \"index out of bounds\", \{\n      let xs: List[Int] = []\n      xs.get(0).unwrap()\n  })\n\nNote: `assert_panics` is not yet implemented (see br cbk2wq);\nthis diagnostic is catalog-only until the feature lands."
+    }
+    if code == ASSERT_PANICS_OUTSIDE_TEST {
+        return "E0833 -- AssertPanicsOutsideTest\n\n`assert_panics` is a test-only helper, like `skip()` and the\nother `assert_*` matchers. Calling it from `main()`, a library\nfunction, or any non-test context is rejected at the parser/\ntypecheck layer.\n\nFix: move the call into a `test \{ ... }` block. If you need\npanic capture in non-test code, that is a separate (and currently\nunavailable) feature — track br cbk2wq.\n\n  test \"bad input panics\" \{\n      assert_panics(\{ parse(\"not a number\").unwrap() })\n  }\n\n  fn helper() \{ assert_panics(\{ ... }) }  // E0833 -- not in a test\n\nNote: `assert_panics` is not yet implemented (see br cbk2wq);\nthis diagnostic is catalog-only until the feature lands."
+    }
+    if code == ASSERT_PANICS_NESTED_EXPECT_PANIC {
+        return "E0834 -- AssertPanicsNestedExpectPanic\n\nAn `assert_panics(\{ ... })` call appears inside another\n`assert_panics` body. Nesting is rejected because the outer matcher\nwould swallow the inner's mechanism and the semantics of which\npanic counts as \"the\" expected panic become ambiguous.\n\nFix: split the assertions into two separate tests, or restructure\nthe body so only the outer call is asserting on a panic.\n\n  test \"a\" \{ assert_panics(\{ foo() }) }\n  test \"b\" \{ assert_panics(\{ bar() }) }     // not nested -- OK\n\n  test \"bad\" \{\n      assert_panics(\{\n          assert_panics(\{ baz() })          // E0834\n      })\n  }\n\nNote: `assert_panics` is not yet implemented (see br cbk2wq);\nthis diagnostic is catalog-only until the feature lands."
     }
     if code == DEPRECATED_USAGE {
         return "W2000 -- DeprecatedUsage\n\nA function or type marked @deprecated was used.\n\nThe @deprecated annotation signals that an API is scheduled for\nremoval. The warning includes the deprecation edition (if known)\nand a suggested replacement.\n\nFix: migrate to the replacement API shown in the help message.\n\n  @deprecated(replacement: \"new_fn\")\n  fn old_fn() \{ \}\n\n  fn main() \{\n      old_fn()   // W2000: use of deprecated function 'old_fn'\n                 // help: use 'new_fn' instead\n  \}"
