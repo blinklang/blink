@@ -1,0 +1,79 @@
+// hkd8p3: assert/assert_eq/assert_ne nodes must anchor at the keyword's
+// source line/col, not at whatever token follows the closing paren of the
+// call. Codegen uses node_line(func_node)/node_col(func_node) of the
+// synthetic Ident node to populate the failure-location arguments passed
+// to __blink_assert_fail / __blink_assert_fail_intro. Pre-fix the parser
+// captured those coordinates after consuming the arg list, so a multi-line
+// `assert(...)` would report the line of `)` instead of the keyword.
+
+fn emit_c(tag: Str, src: Str) -> Str {
+    let bl_path = ".tmp/_test_{tag}.bl"
+    write_file(bl_path, src)
+    let _ = process_run("bin/blink", ["build", bl_path, "--emit", "c"])
+    let c_src = read_file("build/_test_{tag}.c")
+    shell_exec("rm -f {bl_path} build/_test_{tag}.c")
+    c_src
+}
+
+test "multi-line assert anchors at keyword line not closing paren" {
+    // `assert` keyword is on line 2. `)` is on line 5. The emitted
+    // __blink_assert_fail_intro call carries `..., <file>, <line>, <col>, <msg>`
+    // and must reference line 2 not line 5.
+    let src = "fn main() \{\n" +
+              "    assert(\n" +
+              "        1 == 1,\n" +
+              "        \"multiline\"\n" +
+              "    )\n" +
+              "\}\n"
+    let c = emit_c("assert_anchor_multiline", src)
+    assert(c.contains("__blink_assert_fail_intro"))
+    let bl_path_lit = "\".tmp/_test_assert_anchor_multiline.bl\""
+    assert(c.contains("{bl_path_lit}, 2,"))
+    assert(!c.contains("{bl_path_lit}, 5,"))
+}
+
+fn assert_fail_line(c: Str) -> Int {
+    // Extract <line> from the first `__blink_assert_fail(<msg>, <line>);`
+    // emitted by codegen. Returns -1 if not found.
+    let parts = c.split("__blink_assert_fail(")
+    if parts.len() < 2 {
+        return -1
+    }
+    let tail = parts.get(1).unwrap()
+    let end = tail.index_of(");")
+    if end < 0 {
+        return -1
+    }
+    let call_args = tail.slice(0, end)
+    let comma_segments = call_args.split(", ")
+    if comma_segments.len() < 2 {
+        return -1
+    }
+    comma_segments.get(comma_segments.len() - 1).unwrap().to_int()
+}
+
+test "multi-line assert_eq anchors at keyword line not closing paren" {
+    // `assert_eq` is on line 2. `)` is on line 5.
+    let src = "fn main() \{\n" +
+              "    assert_eq(\n" +
+              "        1,\n" +
+              "        1\n" +
+              "    )\n" +
+              "\}\n"
+    let c = emit_c("assert_eq_anchor_multiline", src)
+    let line = assert_fail_line(c)
+    assert_eq(line, 2)
+}
+
+test "multi-line assert_ne anchors at keyword line not closing paren" {
+    // `assert_ne` is on line 2. `)` is on line 5.
+    let src = "fn main() \{\n" +
+              "    assert_ne(\n" +
+              "        1,\n" +
+              "        2\n" +
+              "    )\n" +
+              "\}\n"
+    let c = emit_c("assert_ne_anchor_multiline", src)
+    let line = assert_fail_line(c)
+    assert_eq(line, 2)
+}
