@@ -61,7 +61,7 @@ For each friction item:
 ### type:feature — Confirm first, parallelizable
 1. Present all selected features with brief proposed approaches
 2. Wait for user approval of the batch
-3. Each feature: plan → implement → `task regen` → `task ci` → `/code-review` → `task ci` → `br close <id>`
+3. Each feature: plan → implement → `task regen` → `task ci` → `/code-review` → `br close <id>`
 
 When working multiple features: use parallel agents with worktrees. Each agent gets one feature.
 
