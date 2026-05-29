@@ -18,6 +18,48 @@ import parser.{
 // match comments to the correct scope, then node line positions to
 // match to specific children within each scope.
 
+// Built once per attach_comments_pass() so find_brace_range's
+// "first token at-or-after line L" lookup is O(1); the old linear
+// scan from token 0 dominated compile time on large modules.
+let mut line_to_first_tok: List[Int] = []
+
+fn build_line_index() {
+    line_to_first_tok = []
+    let n_tokens = tokens.len()
+    if n_tokens == 0 { return }
+    // Tokens are line-monotonic (lexer appends in scan order), so the
+    // last token's line is the max.
+    let max_line = tokens.get(n_tokens - 1).unwrap().line
+    let mut slot = 0
+    while slot <= max_line + 1 {
+        line_to_first_tok.push(n_tokens)
+        slot = slot + 1
+    }
+    // Single pass: on each line transition, back-fill slots
+    // (last_line+1 .. tl) with this token's index. This covers blank-
+    // line gaps without a separate sweep.
+    let mut ti = 0
+    let mut last_line = 0
+    while ti < n_tokens {
+        let tl = tokens.get(ti).unwrap().line
+        if tl > last_line && tl >= 1 && tl <= max_line {
+            let mut k = last_line + 1
+            while k <= tl {
+                line_to_first_tok.set(k, ti)
+                k = k + 1
+            }
+            last_line = tl
+        }
+        ti = ti + 1
+    }
+}
+
+fn first_tok_at_or_after_line(start_line: Int) -> Int {
+    if start_line <= 0 { return 0 }
+    if start_line >= line_to_first_tok.len() { return tokens.len() }
+    line_to_first_tok.get(start_line).unwrap()
+}
+
 fn append_leading(node: Int, text: Str) {
     let existing = node_leading_comments(node)
     if existing == "" {
@@ -492,33 +534,30 @@ fn find_brace_range(node: Int) -> List[Int] {
         return result
     }
 
-    // Find opening { near the node's start line
-    let mut ti = 0
+    let mut ti = first_tok_at_or_after_line(start_line)
     while ti < tokens.len() {
         let tok = tokens.get(ti).unwrap()
         let tl = tok.line
-        if tl >= start_line {
-            if tok.kind == TokenKind.LBrace {
-                let open = ti + 1
+        if tok.kind == TokenKind.LBrace {
+            let open = ti + 1
 
-                // Find matching } — should be at end_line, end_col
-                let mut close = ti + 1
-                let mut depth = 1
-                while close < tokens.len() && depth > 0 {
-                    let k = tokens.get(close).unwrap().kind
-                    if k == TokenKind.LBrace {
-                        depth = depth + 1
-                    } else if k == TokenKind.RBrace {
-                        depth = depth - 1
-                    }
-                    if depth > 0 {
-                        close = close + 1
-                    }
+            // Find matching } — should be at end_line, end_col
+            let mut close = ti + 1
+            let mut depth = 1
+            while close < tokens.len() && depth > 0 {
+                let k = tokens.get(close).unwrap().kind
+                if k == TokenKind.LBrace {
+                    depth = depth + 1
+                } else if k == TokenKind.RBrace {
+                    depth = depth - 1
                 }
-                result.push(open)
-                result.push(close)
-                return result
+                if depth > 0 {
+                    close = close + 1
+                }
             }
+            result.push(open)
+            result.push(close)
+            return result
         }
         if tl > start_line + 1 {
             return result
@@ -529,6 +568,7 @@ fn find_brace_range(node: Int) -> List[Int] {
 }
 
 pub fn attach_comments_pass(program: Int, _first_node: Int) {
+    build_line_index()
     process_scope(program, 0, tokens.len())
 }
 
