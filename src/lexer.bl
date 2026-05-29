@@ -84,16 +84,20 @@ fn is_whitespace(c: Int) -> Int {
 
 // ── Peek helpers ─────────────────────────────────────────────────────
 
-fn peek(source: Str, scan_pos: Int) -> Int {
-    if scan_pos >= source.len() {
+// Str.len() lowers to strlen() — a full O(N) scan of source. The lexer hot
+// loop hits this >75 times per byte (direct .len() checks + peek/peek_at),
+// turning lexing into O(N²). source_len is hoisted once in lex() and threaded
+// through these helpers so the inner loop stays O(1) per byte.
+fn peek(source: Str, source_len: Int, scan_pos: Int) -> Int {
+    if scan_pos >= source_len {
         0
     } else {
         source.byte_at(scan_pos)
     }
 }
 
-fn peek_at(source: Str, scan_pos: Int, offset: Int) -> Int {
-    peek(source, scan_pos + offset)
+fn peek_at(source: Str, source_len: Int, scan_pos: Int, offset: Int) -> Int {
+    peek(source, source_len, scan_pos + offset)
 }
 
 // ── Lexer output: module-level global ─────────────────────────────────
@@ -104,7 +108,8 @@ pub let mut tokens: List[Token] = []
 // ── Main lexer ───────────────────────────────────────────────────────
 
 pub fn lex(source: Str) ! Lex.Tokenize, Diag.Report {
-    if trace_mode != "" { trace("lex", "start ({source.len()} chars)") }
+    let source_len = source.len()
+    if trace_mode != "" { trace("lex", "start ({source_len} chars)") }
     // Reset output
     tokens.clear()
 
@@ -133,13 +138,13 @@ pub fn lex(source: Str) ! Lex.Tokenize, Diag.Report {
     // (Ugly, but the C backend doesn't support closures that capture.)
 
     // ── Main loop ─────────────────────────────────────────────────
-    while scan_pos < source.len() {
+    while scan_pos < source_len {
         let mode = mode_stack.get(mode_stack.len() - 1).unwrap()
 
         if mode == MODE_NORMAL {
             // ── NORMAL MODE ───────────────────────────────────────
             let brace_depth = brace_depth_stack.get(brace_depth_stack.len() - 1).unwrap()
-            let ch = peek(source, scan_pos)
+            let ch = peek(source, source_len, scan_pos)
 
             // Skip whitespace (not newline)
             if is_whitespace(ch) {
@@ -149,10 +154,10 @@ pub fn lex(source: Str) ! Lex.Tokenize, Diag.Report {
             }
 
             // Comments: // or ///
-            if ch == CH_SLASH && peek_at(source, scan_pos, 1) == CH_SLASH {
+            if ch == CH_SLASH && peek_at(source, source_len, scan_pos, 1) == CH_SLASH {
                 let t_line = line
                 let t_col = col
-                let is_doc = peek_at(source, scan_pos, 2) == CH_SLASH
+                let is_doc = peek_at(source, source_len, scan_pos, 2) == CH_SLASH
                 if is_doc {
                     scan_pos = scan_pos + 3
                     col = col + 3
@@ -161,7 +166,7 @@ pub fn lex(source: Str) ! Lex.Tokenize, Diag.Report {
                     col = col + 2
                 }
                 let text_start = scan_pos
-                while scan_pos < source.len() && peek(source, scan_pos) != CH_NEWLINE {
+                while scan_pos < source_len && peek(source, source_len, scan_pos) != CH_NEWLINE {
                     scan_pos = scan_pos + 1
                     col = col + 1
                 }
@@ -173,7 +178,7 @@ pub fn lex(source: Str) ! Lex.Tokenize, Diag.Report {
                     tokens.push(Token { kind: TokenKind.Comment, value: text, line: t_line, col: t_col, end_col: col })
                     _last_kind = TokenKind.Comment
                 }
-                if scan_pos < source.len() && peek(source, scan_pos) == CH_NEWLINE {
+                if scan_pos < source_len && peek(source, source_len, scan_pos) == CH_NEWLINE {
                     scan_pos = scan_pos + 1
                     line = line + 1
                     col = 1
@@ -187,7 +192,7 @@ pub fn lex(source: Str) ! Lex.Tokenize, Diag.Report {
                 let t_col = col
                 scan_pos = scan_pos + 1
                 col = col + 1
-                if scan_pos < source.len() && peek(source, scan_pos) == CH_EQUALS {
+                if scan_pos < source_len && peek(source, source_len, scan_pos) == CH_EQUALS {
                     scan_pos = scan_pos + 1
                     col = col + 1
                     tokens.push(Token { kind: TokenKind.SlashEq, value: "/=", line: t_line, col: t_col, end_col: col })
@@ -234,20 +239,20 @@ pub fn lex(source: Str) ! Lex.Tokenize, Diag.Report {
                 let t_col = col
                 scan_pos = scan_pos + 1
                 col = col + 1
-                if scan_pos >= source.len() {
+                if scan_pos >= source_len {
                     io.eprintln("lexer error: unterminated char literal at line {t_line} col {t_col}")
                     continue
                 }
                 let mut codepoint = 0
-                let ch2 = peek(source, scan_pos)
+                let ch2 = peek(source, source_len, scan_pos)
                 if ch2 == CH_BACKSLASH {
                     scan_pos = scan_pos + 1
                     col = col + 1
-                    if scan_pos >= source.len() {
+                    if scan_pos >= source_len {
                         io.eprintln("lexer error: unterminated char escape at line {t_line} col {t_col}")
                         continue
                     }
-                    let esc = peek(source, scan_pos)
+                    let esc = peek(source, source_len, scan_pos)
                     scan_pos = scan_pos + 1
                     col = col + 1
                     if esc == CH_n { codepoint = 10 }
@@ -268,7 +273,7 @@ pub fn lex(source: Str) ! Lex.Tokenize, Diag.Report {
                     scan_pos = scan_pos + 1
                     col = col + 1
                 }
-                if scan_pos >= source.len() || peek(source, scan_pos) != CH_SQUOTE {
+                if scan_pos >= source_len || peek(source, source_len, scan_pos) != CH_SQUOTE {
                     io.eprintln("lexer error: char literal must contain exactly one character at line {t_line} col {t_col}")
                     continue
                 }
@@ -348,7 +353,7 @@ pub fn lex(source: Str) ! Lex.Tokenize, Diag.Report {
                 let t_col = col
                 scan_pos = scan_pos + 1
                 col = col + 1
-                if scan_pos < source.len() && peek(source, scan_pos) == CH_QUESTION {
+                if scan_pos < source_len && peek(source, source_len, scan_pos) == CH_QUESTION {
                     scan_pos = scan_pos + 1
                     col = col + 1
                     tokens.push(Token { kind: TokenKind.DoubleQuestion, value: "??", line: t_line, col: t_col, end_col: col })
@@ -364,17 +369,17 @@ pub fn lex(source: Str) ! Lex.Tokenize, Diag.Report {
             if ch == CH_MINUS {
                 let t_line = line
                 let t_col = col
-                if peek_at(source, scan_pos, 1) == CH_GREATER {
+                if peek_at(source, source_len, scan_pos, 1) == CH_GREATER {
                     scan_pos = scan_pos + 2
                     col = col + 2
                     tokens.push(Token { kind: TokenKind.Arrow, value: "->", line: t_line, col: t_col, end_col: col })
                     _last_kind = TokenKind.Arrow
-                } else if peek_at(source, scan_pos, 1) == CH_EQUALS {
+                } else if peek_at(source, source_len, scan_pos, 1) == CH_EQUALS {
                     scan_pos = scan_pos + 2
                     col = col + 2
                     tokens.push(Token { kind: TokenKind.MinusEq, value: "-=", line: t_line, col: t_col, end_col: col })
                     _last_kind = TokenKind.MinusEq
-                } else if peek_at(source, scan_pos, 1) == CH_MINUS {
+                } else if peek_at(source, source_len, scan_pos, 1) == CH_MINUS {
                     scan_pos = scan_pos + 2
                     col = col + 2
                     tokens.push(Token { kind: TokenKind.DashDash, value: "--", line: t_line, col: t_col, end_col: col })
@@ -394,7 +399,7 @@ pub fn lex(source: Str) ! Lex.Tokenize, Diag.Report {
                 let t_col = col
                 scan_pos = scan_pos + 1
                 col = col + 1
-                if scan_pos < source.len() && peek(source, scan_pos) == CH_EQUALS {
+                if scan_pos < source_len && peek(source, source_len, scan_pos) == CH_EQUALS {
                     scan_pos = scan_pos + 1
                     col = col + 1
                     tokens.push(Token { kind: TokenKind.PlusEq, value: "+=", line: t_line, col: t_col, end_col: col })
@@ -412,7 +417,7 @@ pub fn lex(source: Str) ! Lex.Tokenize, Diag.Report {
                 let t_col = col
                 scan_pos = scan_pos + 1
                 col = col + 1
-                if scan_pos < source.len() && peek(source, scan_pos) == CH_EQUALS {
+                if scan_pos < source_len && peek(source, source_len, scan_pos) == CH_EQUALS {
                     scan_pos = scan_pos + 1
                     col = col + 1
                     tokens.push(Token { kind: TokenKind.StarEq, value: "*=", line: t_line, col: t_col, end_col: col })
@@ -430,12 +435,12 @@ pub fn lex(source: Str) ! Lex.Tokenize, Diag.Report {
                 let t_col = col
                 scan_pos = scan_pos + 1
                 col = col + 1
-                if scan_pos < source.len() && peek(source, scan_pos) == CH_GREATER {
+                if scan_pos < source_len && peek(source, source_len, scan_pos) == CH_GREATER {
                     scan_pos = scan_pos + 1
                     col = col + 1
                     tokens.push(Token { kind: TokenKind.FatArrow, value: "=>", line: t_line, col: t_col, end_col: col })
                     _last_kind = TokenKind.FatArrow
-                } else if scan_pos < source.len() && peek(source, scan_pos) == CH_EQUALS {
+                } else if scan_pos < source_len && peek(source, source_len, scan_pos) == CH_EQUALS {
                     scan_pos = scan_pos + 1
                     col = col + 1
                     tokens.push(Token { kind: TokenKind.EqEq, value: "==", line: t_line, col: t_col, end_col: col })
@@ -448,12 +453,12 @@ pub fn lex(source: Str) ! Lex.Tokenize, Diag.Report {
             }
 
             // Dot: ., .., ..=
-            if ch == CH_DOT && peek_at(source, scan_pos, 1) == CH_DOT {
+            if ch == CH_DOT && peek_at(source, source_len, scan_pos, 1) == CH_DOT {
                 let t_line = line
                 let t_col = col
                 scan_pos = scan_pos + 2
                 col = col + 2
-                if scan_pos < source.len() && peek(source, scan_pos) == CH_EQUALS {
+                if scan_pos < source_len && peek(source, source_len, scan_pos) == CH_EQUALS {
                     scan_pos = scan_pos + 1
                     col = col + 1
                     tokens.push(Token { kind: TokenKind.DotDoteq, value: "..=", line: t_line, col: t_col, end_col: col })
@@ -481,7 +486,7 @@ pub fn lex(source: Str) ! Lex.Tokenize, Diag.Report {
                 let t_col = col
                 scan_pos = scan_pos + 1
                 col = col + 1
-                if scan_pos < source.len() && peek(source, scan_pos) == CH_EQUALS {
+                if scan_pos < source_len && peek(source, source_len, scan_pos) == CH_EQUALS {
                     scan_pos = scan_pos + 1
                     col = col + 1
                     tokens.push(Token { kind: TokenKind.NotEq, value: "!=", line: t_line, col: t_col, end_col: col })
@@ -499,12 +504,12 @@ pub fn lex(source: Str) ! Lex.Tokenize, Diag.Report {
                 let t_col = col
                 scan_pos = scan_pos + 1
                 col = col + 1
-                if scan_pos < source.len() && peek(source, scan_pos) == CH_EQUALS {
+                if scan_pos < source_len && peek(source, source_len, scan_pos) == CH_EQUALS {
                     scan_pos = scan_pos + 1
                     col = col + 1
                     tokens.push(Token { kind: TokenKind.LessEq, value: "<=", line: t_line, col: t_col, end_col: col })
                     _last_kind = TokenKind.LessEq
-                } else if scan_pos < source.len() && peek(source, scan_pos) == CH_LESS {
+                } else if scan_pos < source_len && peek(source, source_len, scan_pos) == CH_LESS {
                     scan_pos = scan_pos + 1
                     col = col + 1
                     tokens.push(Token { kind: TokenKind.Shl, value: "<<", line: t_line, col: t_col, end_col: col })
@@ -522,12 +527,12 @@ pub fn lex(source: Str) ! Lex.Tokenize, Diag.Report {
                 let t_col = col
                 scan_pos = scan_pos + 1
                 col = col + 1
-                if scan_pos < source.len() && peek(source, scan_pos) == CH_EQUALS {
+                if scan_pos < source_len && peek(source, source_len, scan_pos) == CH_EQUALS {
                     scan_pos = scan_pos + 1
                     col = col + 1
                     tokens.push(Token { kind: TokenKind.GreaterEq, value: ">=", line: t_line, col: t_col, end_col: col })
                     _last_kind = TokenKind.GreaterEq
-                } else if scan_pos < source.len() && peek(source, scan_pos) == CH_GREATER {
+                } else if scan_pos < source_len && peek(source, source_len, scan_pos) == CH_GREATER {
                     scan_pos = scan_pos + 1
                     col = col + 1
                     tokens.push(Token { kind: TokenKind.Shr, value: ">>", line: t_line, col: t_col, end_col: col })
@@ -543,7 +548,7 @@ pub fn lex(source: Str) ! Lex.Tokenize, Diag.Report {
             if ch == CH_AMP {
                 let t_line = line
                 let t_col = col
-                if peek_at(source, scan_pos, 1) == CH_AMP {
+                if peek_at(source, source_len, scan_pos, 1) == CH_AMP {
                     scan_pos = scan_pos + 2
                     col = col + 2
                     tokens.push(Token { kind: TokenKind.And, value: "&&", line: t_line, col: t_col, end_col: col })
@@ -585,12 +590,12 @@ pub fn lex(source: Str) ! Lex.Tokenize, Diag.Report {
                 let t_col = col
                 scan_pos = scan_pos + 1
                 col = col + 1
-                if scan_pos < source.len() && peek(source, scan_pos) == CH_PIPE {
+                if scan_pos < source_len && peek(source, source_len, scan_pos) == CH_PIPE {
                     scan_pos = scan_pos + 1
                     col = col + 1
                     tokens.push(Token { kind: TokenKind.Or, value: "||", line: t_line, col: t_col, end_col: col })
                     _last_kind = TokenKind.Or
-                } else if scan_pos < source.len() && peek(source, scan_pos) == CH_GREATER {
+                } else if scan_pos < source_len && peek(source, source_len, scan_pos) == CH_GREATER {
                     scan_pos = scan_pos + 1
                     col = col + 1
                     tokens.push(Token { kind: TokenKind.PipeArrow, value: "|>", line: t_line, col: t_col, end_col: col })
@@ -680,11 +685,11 @@ pub fn lex(source: Str) ! Lex.Tokenize, Diag.Report {
                 let t_col = col
                 // Count consecutive # chars
                 let mut hash_count = 0
-                while scan_pos + hash_count < source.len() && peek(source, scan_pos + hash_count) == CH_HASH {
+                while scan_pos + hash_count < source_len && peek(source, source_len, scan_pos + hash_count) == CH_HASH {
                     hash_count = hash_count + 1
                 }
                 // Check if followed by " — extended string start
-                if hash_count <= 3 && scan_pos + hash_count < source.len() && peek(source, scan_pos + hash_count) == CH_DQUOTE {
+                if hash_count <= 3 && scan_pos + hash_count < source_len && peek(source, source_len, scan_pos + hash_count) == CH_DQUOTE {
                     // Extended string: consume all # chars + the "
                     scan_pos = scan_pos + hash_count + 1
                     col = col + hash_count + 1
@@ -709,7 +714,7 @@ pub fn lex(source: Str) ! Lex.Tokenize, Diag.Report {
                 let t_line = line
                 let t_col = col
                 let start = scan_pos
-                while scan_pos < source.len() && is_alnum(peek(source, scan_pos)) {
+                while scan_pos < source_len && is_alnum(peek(source, source_len, scan_pos)) {
                     scan_pos = scan_pos + 1
                     col = col + 1
                 }
@@ -725,14 +730,14 @@ pub fn lex(source: Str) ! Lex.Tokenize, Diag.Report {
                 let t_line = line
                 let t_col = col
                 let start = scan_pos
-                while scan_pos < source.len() && is_digit(peek(source, scan_pos)) {
+                while scan_pos < source_len && is_digit(peek(source, source_len, scan_pos)) {
                     scan_pos = scan_pos + 1
                     col = col + 1
                 }
-                if scan_pos < source.len() && peek(source, scan_pos) == CH_DOT && is_digit(peek_at(source, scan_pos, 1)) {
+                if scan_pos < source_len && peek(source, source_len, scan_pos) == CH_DOT && is_digit(peek_at(source, source_len, scan_pos, 1)) {
                     scan_pos = scan_pos + 1
                     col = col + 1
-                    while scan_pos < source.len() && is_digit(peek(source, scan_pos)) {
+                    while scan_pos < source_len && is_digit(peek(source, source_len, scan_pos)) {
                         scan_pos = scan_pos + 1
                         col = col + 1
                     }
@@ -750,7 +755,7 @@ pub fn lex(source: Str) ! Lex.Tokenize, Diag.Report {
             // iteration's `"` handler starts a nested string. The matching
             // closing `\"` is handled symmetrically in the MODE_STRING
             // backslash branch below.
-            if ch == CH_BACKSLASH && brace_depth > 0 && peek_at(source, scan_pos, 1) == CH_DQUOTE {
+            if ch == CH_BACKSLASH && brace_depth > 0 && peek_at(source, source_len, scan_pos, 1) == CH_DQUOTE {
                 scan_pos = scan_pos + 1
                 col = col + 1
                 continue
@@ -766,7 +771,7 @@ pub fn lex(source: Str) ! Lex.Tokenize, Diag.Report {
 
         } else {
             // ── STRING MODE ───────────────────────────────────────
-            let ch = peek(source, scan_pos)
+            let ch = peek(source, source_len, scan_pos)
 
             // Interpolation start: { (or #{...} for extended strings)
             if ch == CH_LBRACE {
@@ -851,11 +856,11 @@ pub fn lex(source: Str) ! Lex.Tokenize, Diag.Report {
                 } else {
                     // Extended string: check for exactly sdepth # chars after "
                     let mut match_count = 0
-                    while match_count < sdepth && scan_pos + 1 + match_count < source.len() && peek(source, scan_pos + 1 + match_count) == CH_HASH {
+                    while match_count < sdepth && scan_pos + 1 + match_count < source_len && peek(source, source_len, scan_pos + 1 + match_count) == CH_HASH {
                         match_count = match_count + 1
                     }
                     let after_hashes = scan_pos + 1 + match_count
-                    let next_is_brace = after_hashes < source.len() && peek(source, after_hashes) == CH_LBRACE
+                    let next_is_brace = after_hashes < source_len && peek(source, source_len, after_hashes) == CH_LBRACE
                     if match_count == sdepth && next_is_brace == false {
                         // End of extended string: consume " + all # chars
                         scan_pos = scan_pos + 1 + sdepth
@@ -899,18 +904,18 @@ pub fn lex(source: Str) ! Lex.Tokenize, Diag.Report {
                 // treated as a bare `"`. Skip the backslash and let the
                 // `"` handler emit StringEnd. mode_stack.len() > 2 means
                 // this string sits inside at least one `{ ... }` frame.
-                if mode_stack.len() > 2 && peek_at(source, scan_pos, 1) == CH_DQUOTE {
+                if mode_stack.len() > 2 && peek_at(source, source_len, scan_pos, 1) == CH_DQUOTE {
                     scan_pos = scan_pos + 1
                     col = col + 1
                     continue
                 }
                 scan_pos = scan_pos + 1
                 col = col + 1
-                if scan_pos >= source.len() {
+                if scan_pos >= source_len {
                     io.println("lexer error: unexpected end of string after backslash")
                     continue
                 }
-                let esc = peek(source, scan_pos)
+                let esc = peek(source, source_len, scan_pos)
                 scan_pos = scan_pos + 1
                 col = col + 1
                 if esc == CH_n {
