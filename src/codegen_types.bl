@@ -1349,15 +1349,35 @@ pub fn sv_tp(ctype: Int, inner1: Int, inner2: Int, sname: Str) -> Int {
 }
 pub let mut scope_vars: List[ScopeVar] = []
 pub let mut scope_frame_starts: List[Int] = []
-// Count of CT_ITERATOR entries in scope_vars so get_var_alias can
-// skip its linear scan when none are in scope (the common case).
-// Reset together with scope_vars in reset_scope_state.
-let mut scope_iter_count: Int = 0
+// Per-ctype counts of entries currently in scope_vars. Lets the get_sv_*
+// helpers and get_var_alias short-circuit when zero (the common case for
+// rare ctypes like CT_CLOSURE / CT_ITERATOR / CT_HANDLE).
+let mut scope_ct_counts: List[Int] = []
+
+fn scope_ct_count(ctype: Int) -> Int {
+    if ctype < 0 || ctype >= scope_ct_counts.len() { return 0 }
+    scope_ct_counts.get(ctype).unwrap()
+}
+
+fn bump_scope_ct(ctype: Int, delta: Int) {
+    if ctype < 0 { return }
+    while scope_ct_counts.len() <= ctype {
+        scope_ct_counts.push(0)
+    }
+    scope_ct_counts.set(ctype, scope_ct_counts.get(ctype).unwrap() + delta)
+}
+
+// Push a ScopeVar and bump its per-ctype counter atomically. Always use
+// this instead of scope_vars.push to keep scope_ct_counts in sync.
+fn push_scope_var(sv: ScopeVar) {
+    scope_vars.push(sv)
+    bump_scope_ct(sv.ctype, 1)
+}
 
 pub fn reset_scope_state() {
     scope_vars.clear()
     scope_frame_starts.clear()
-    scope_iter_count = 0
+    scope_ct_counts.clear()
 }
 
 // ScopeVar.extra encoding for CT_PTR vars: "struct|arr|origin"
@@ -1620,9 +1640,7 @@ pub fn pop_scope() ! Codegen.Scope {
     scope_frame_starts.pop()
     while scope_vars.len() > start {
         let sv = scope_vars.get(scope_vars.len() - 1).unwrap()
-        if tp_get_kind(sv.tp_id) == CT_ITERATOR {
-            scope_iter_count = scope_iter_count - 1
-        }
+        bump_scope_ct(sv.ctype, -1)
         scope_vars.pop()
     }
     let ve_start = var_enum_frame_starts.get(var_enum_frame_starts.len() - 1).unwrap()
@@ -1633,7 +1651,7 @@ pub fn pop_scope() ! Codegen.Scope {
 }
 
 pub fn set_var(name: Str, ctype: Int, is_mut: Int) ! Codegen.Scope {
-    scope_vars.push(ScopeVar { name: name, ctype: ctype, is_mut: is_mut, inner1: -1, inner2: -1, sname: "", sname2: "", extra: "", tp_id: sv_tp(ctype, -1, -1, "") })
+    push_scope_var(ScopeVar { name: name, ctype: ctype, is_mut: is_mut, inner1: -1, inner2: -1, sname: "", sname2: "", extra: "", tp_id: sv_tp(ctype, -1, -1, "") })
 }
 
 pub fn get_var_tp(name: Str) -> Int {
@@ -1676,6 +1694,7 @@ fn get_var_mut(name: Str) -> Int {
 }
 
 fn get_sv_inner1(name: Str, ctype: Int) -> Int {
+    if scope_ct_count(ctype) <= 0 { return -1 }
     let mut i = scope_vars.len() - 1
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
@@ -1699,6 +1718,7 @@ fn get_sv_inner1(name: Str, ctype: Int) -> Int {
 }
 
 fn get_sv_inner2(name: Str, ctype: Int) -> Int {
+    if scope_ct_count(ctype) <= 0 { return -1 }
     let mut i = scope_vars.len() - 1
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
@@ -1722,6 +1742,7 @@ fn get_sv_inner2(name: Str, ctype: Int) -> Int {
 }
 
 fn get_sv_sname(name: Str, ctype: Int) -> Str {
+    if scope_ct_count(ctype) <= 0 { return "" }
     let mut i = scope_vars.len() - 1
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
@@ -1745,6 +1766,7 @@ fn get_sv_sname(name: Str, ctype: Int) -> Str {
 }
 
 fn get_sv_sname2(name: Str, ctype: Int) -> Str {
+    if scope_ct_count(ctype) <= 0 { return "" }
     let mut i = scope_vars.len() - 1
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
@@ -2575,7 +2597,7 @@ pub fn set_list_elem_type(name: Str, elem_type: Int) {
         }
         i = i - 1
     }
-    scope_vars.push(ScopeVar { name: name, ctype: CT_LIST, is_mut: 0, inner1: elem_type, inner2: -1, sname: "", sname2: "", extra: "", tp_id: sv_tp(CT_LIST, elem_type, -1, "") })
+    push_scope_var(ScopeVar { name: name, ctype: CT_LIST, is_mut: 0, inner1: elem_type, inner2: -1, sname: "", sname2: "", extra: "", tp_id: sv_tp(CT_LIST, elem_type, -1, "") })
 }
 
 pub fn get_list_elem_type(name: Str) -> Int {
@@ -2639,7 +2661,7 @@ pub fn set_list_nested_elem_struct(name: Str, struct_name: Str) {
         }
         i = i - 1
     }
-    scope_vars.push(ScopeVar { name: name, ctype: CT_LIST, is_mut: 0, inner1: -1, inner2: -1, sname: "", sname2: "", extra: struct_name, tp_id: sv_tp(CT_LIST, -1, -1, "") })
+    push_scope_var(ScopeVar { name: name, ctype: CT_LIST, is_mut: 0, inner1: -1, inner2: -1, sname: "", sname2: "", extra: struct_name, tp_id: sv_tp(CT_LIST, -1, -1, "") })
 }
 
 pub fn get_list_nested_elem_struct(name: Str) -> Str {
@@ -2696,7 +2718,7 @@ pub fn set_list_elem_struct(name: Str, struct_name: Str) {
         }
         i = i - 1
     }
-    scope_vars.push(ScopeVar { name: name, ctype: CT_LIST, is_mut: 0, inner1: -1, inner2: -1, sname: "", sname2: struct_name, extra: "", tp_id: sv_tp(CT_LIST, -1, -1, "") })
+    push_scope_var(ScopeVar { name: name, ctype: CT_LIST, is_mut: 0, inner1: -1, inner2: -1, sname: "", sname2: struct_name, extra: "", tp_id: sv_tp(CT_LIST, -1, -1, "") })
 }
 
 pub fn get_list_elem_struct(name: Str) -> Str {
@@ -2732,7 +2754,7 @@ pub fn set_set_elem_type(name: Str, elem_type: Int) {
         }
         i = i - 1
     }
-    scope_vars.push(ScopeVar { name: name, ctype: CT_SET, is_mut: 0, inner1: elem_type, inner2: -1, sname: "", sname2: "", extra: "", tp_id: sv_tp(CT_SET, elem_type, -1, "") })
+    push_scope_var(ScopeVar { name: name, ctype: CT_SET, is_mut: 0, inner1: elem_type, inner2: -1, sname: "", sname2: "", extra: "", tp_id: sv_tp(CT_SET, elem_type, -1, "") })
 }
 
 pub fn get_set_elem_type(name: Str) -> Int {
@@ -2781,7 +2803,7 @@ pub fn set_map_types(name: Str, key_type: Int, value_type: Int, value_name: Str)
         }
         i = i - 1
     }
-    scope_vars.push(ScopeVar { name: name, ctype: CT_MAP, is_mut: 0, inner1: key_type, inner2: value_type, sname: "", sname2: "", extra: "", tp_id: sv_tp(CT_MAP, key_type, value_type, "") })
+    push_scope_var(ScopeVar { name: name, ctype: CT_MAP, is_mut: 0, inner1: key_type, inner2: value_type, sname: "", sname2: "", extra: "", tp_id: sv_tp(CT_MAP, key_type, value_type, "") })
     if (value_type == CT_VOID || value_type == CT_STRUCT || value_type == CT_ENUM) && value_name != "" && is_named_type(value_name) != 0 {
         set_map_value_struct(name, value_name)
     }
@@ -3151,7 +3173,7 @@ pub fn set_var_struct(name: Str, type_name: Str) {
         }
         i = i - 1
     }
-    scope_vars.push(ScopeVar { name: name, ctype: CT_VOID, is_mut: 0, inner1: -1, inner2: -1, sname: type_name, sname2: "", extra: "", tp_id: sv_tp(CT_VOID, -1, -1, type_name) })
+    push_scope_var(ScopeVar { name: name, ctype: CT_VOID, is_mut: 0, inner1: -1, inner2: -1, sname: type_name, sname2: "", extra: "", tp_id: sv_tp(CT_VOID, -1, -1, type_name) })
 }
 
 pub fn get_var_struct(name: Str) -> Str {
@@ -3264,10 +3286,11 @@ pub fn set_var_closure(name: Str, sig: Str) {
         }
         i = i - 1
     }
-    scope_vars.push(ScopeVar { name: name, ctype: CT_CLOSURE, is_mut: 0, inner1: -1, inner2: -1, sname: sig, sname2: "", extra: "", tp_id: sv_tp(CT_CLOSURE, -1, -1, sig) })
+    push_scope_var(ScopeVar { name: name, ctype: CT_CLOSURE, is_mut: 0, inner1: -1, inner2: -1, sname: sig, sname2: "", extra: "", tp_id: sv_tp(CT_CLOSURE, -1, -1, sig) })
 }
 
 pub fn get_var_closure_sig(name: Str) -> Str {
+    if scope_ct_count(CT_CLOSURE) <= 0 { return "" }
     let mut i = scope_vars.len() - 1
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
@@ -4635,7 +4658,7 @@ pub fn set_var_option(name: Str, inner: Int) {
         }
         i = i - 1
     }
-    scope_vars.push(ScopeVar { name: name, ctype: CT_OPTION, is_mut: 0, inner1: inner, inner2: -1, sname: "", sname2: "", extra: "", tp_id: sv_tp(CT_OPTION, inner, -1, "") })
+    push_scope_var(ScopeVar { name: name, ctype: CT_OPTION, is_mut: 0, inner1: inner, inner2: -1, sname: "", sname2: "", extra: "", tp_id: sv_tp(CT_OPTION, inner, -1, "") })
 }
 
 pub fn set_var_option_inner2(name: Str, val: Int) {
@@ -4718,7 +4741,7 @@ pub fn set_var_option_struct(name: Str, inner: Int, struct_name: Str) {
         }
         i = i - 1
     }
-    scope_vars.push(ScopeVar { name: name, ctype: CT_OPTION, is_mut: 0, inner1: inner, inner2: -1, sname: struct_name, sname2: "", extra: "", tp_id: sv_tp(CT_OPTION, inner, -1, struct_name) })
+    push_scope_var(ScopeVar { name: name, ctype: CT_OPTION, is_mut: 0, inner1: inner, inner2: -1, sname: struct_name, sname2: "", extra: "", tp_id: sv_tp(CT_OPTION, inner, -1, struct_name) })
 }
 
 pub fn get_var_option_inner(name: Str) -> Int {
@@ -4739,7 +4762,7 @@ pub fn set_var_result(name: Str, ok_t: Int, err_t: Int) {
         }
         i = i - 1
     }
-    scope_vars.push(ScopeVar { name: name, ctype: CT_RESULT, is_mut: 0, inner1: ok_t, inner2: err_t, sname: "", sname2: "", extra: "", tp_id: sv_tp(CT_RESULT, ok_t, err_t, "") })
+    push_scope_var(ScopeVar { name: name, ctype: CT_RESULT, is_mut: 0, inner1: ok_t, inner2: err_t, sname: "", sname2: "", extra: "", tp_id: sv_tp(CT_RESULT, ok_t, err_t, "") })
 }
 
 pub fn set_var_result_struct(name: Str, ok_t: Int, err_t: Int, ok_s: Str, err_s: Str) {
@@ -4752,7 +4775,7 @@ pub fn set_var_result_struct(name: Str, ok_t: Int, err_t: Int, ok_s: Str, err_s:
         }
         i = i - 1
     }
-    scope_vars.push(ScopeVar { name: name, ctype: CT_RESULT, is_mut: 0, inner1: ok_t, inner2: err_t, sname: ok_s, sname2: err_s, extra: "", tp_id: sv_tp(CT_RESULT, ok_t, err_t, ok_s) })
+    push_scope_var(ScopeVar { name: name, ctype: CT_RESULT, is_mut: 0, inner1: ok_t, inner2: err_t, sname: ok_s, sname2: err_s, extra: "", tp_id: sv_tp(CT_RESULT, ok_t, err_t, ok_s) })
 }
 
 // Precondition: fs.starts_with("Option_")
@@ -4838,8 +4861,7 @@ pub fn set_var_iterator(name: Str, inner: Int, next_fn: Str) {
         }
         i = i - 1
     }
-    scope_vars.push(ScopeVar { name: name, ctype: CT_ITERATOR, is_mut: 0, inner1: inner, inner2: -1, sname: "", sname2: "", extra: next_fn, tp_id: sv_tp(CT_ITERATOR, inner, -1, "") })
-    scope_iter_count = scope_iter_count + 1
+    push_scope_var(ScopeVar { name: name, ctype: CT_ITERATOR, is_mut: 0, inner1: inner, inner2: -1, sname: "", sname2: "", extra: next_fn, tp_id: sv_tp(CT_ITERATOR, inner, -1, "") })
 }
 
 pub fn get_var_iterator_inner(name: Str) -> Int {
@@ -4863,7 +4885,7 @@ pub fn set_var_alias(name: Str, target: Str) {
 }
 
 pub fn get_var_alias(name: Str) -> Str {
-    if scope_iter_count == 0 { return "" }
+    if scope_ct_count(CT_ITERATOR) <= 0 { return "" }
     let mut i = scope_vars.len() - 1
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
@@ -4885,7 +4907,7 @@ pub fn set_var_handle(name: Str, inner: Int) {
         }
         i = i - 1
     }
-    scope_vars.push(ScopeVar { name: name, ctype: CT_HANDLE, is_mut: 0, inner1: inner, inner2: -1, sname: "", sname2: "", extra: "", tp_id: sv_tp(CT_HANDLE, inner, -1, "") })
+    push_scope_var(ScopeVar { name: name, ctype: CT_HANDLE, is_mut: 0, inner1: inner, inner2: -1, sname: "", sname2: "", extra: "", tp_id: sv_tp(CT_HANDLE, inner, -1, "") })
 }
 
 pub fn get_var_handle_inner(name: Str) -> Int {
@@ -4903,7 +4925,7 @@ pub fn set_var_handle_full(name: Str, inner: Int, inner2: Int, extra1: Str, extr
         }
         i = i - 1
     }
-    scope_vars.push(ScopeVar { name: name, ctype: CT_HANDLE, is_mut: 0, inner1: inner, inner2: inner2, sname: "", sname2: "", extra: encoded_extra, tp_id: sv_tp(CT_HANDLE, inner, -1, "") })
+    push_scope_var(ScopeVar { name: name, ctype: CT_HANDLE, is_mut: 0, inner1: inner, inner2: inner2, sname: "", sname2: "", extra: encoded_extra, tp_id: sv_tp(CT_HANDLE, inner, -1, "") })
 }
 
 pub fn get_var_handle_inner2(name: Str) -> Int {
@@ -4944,7 +4966,7 @@ pub fn set_var_channel(name: Str, inner: Int) {
         }
         i = i - 1
     }
-    scope_vars.push(ScopeVar { name: name, ctype: CT_CHANNEL, is_mut: 0, inner1: inner, inner2: -1, sname: "", sname2: "", extra: "", tp_id: sv_tp(CT_CHANNEL, inner, -1, "") })
+    push_scope_var(ScopeVar { name: name, ctype: CT_CHANNEL, is_mut: 0, inner1: inner, inner2: -1, sname: "", sname2: "", extra: "", tp_id: sv_tp(CT_CHANNEL, inner, -1, "") })
 }
 
 pub fn get_var_channel_inner(name: Str) -> Int {
