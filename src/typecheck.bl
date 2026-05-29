@@ -2278,12 +2278,42 @@ let mut nr_scope_nodes: List[Int] = []
 // for vars captured by a closure — subsequent writes are observable through
 // closure calls, so the original read shouldn't be dismissed as "dead".
 let mut nr_scope_captured: List[Int] = []
+// Shadow chain: nr_scope_prev[i] is the index of the previous entry with the
+// same name (the one this entry shadows), or -1 if none. Lets nr_pop_scope
+// restore nr_name_top to the prior binding without a linear scan.
+let mut nr_scope_prev: List[Int] = []
+// Top-of-stack index per name: O(1) lookup for nr_is_defined / nr_is_mut /
+// nr_get_type / nr_mark_written. Keys absent ⇒ name not currently in scope.
+let mut nr_name_top: Map[Str, Int] = Map()
 let mut nr_scope_frames: List[Int] = []
 let mut nr_scope_depth: Int = 0
 let mut nr_loop_depth: Int = 0
 let mut nr_in_closure_depth: Int = 0
 let mut nr_with_ptr_depth: Int = 0
 let mut nr_warn_unused: Int = 0
+
+// Push a new entry into the parallel scope arrays and update nr_name_top.
+// All nr_define* functions must route through here to keep the shadow chain
+// intact. The .insert at the end overwrites any prior nr_name_top entry by
+// design — we captured the displaced index in nr_scope_prev so pop can
+// restore it.
+fn nr_scope_push_entry(name: Str, is_mut: Int, tid: Int, node: Int) {
+    let new_idx = nr_scope_names.len()
+    let mut prev = -1
+    match nr_name_top.get(name) {
+        Some(p) => prev = p
+        None => {}
+    }
+    nr_scope_names.push(name)
+    nr_scope_muts.push(is_mut)
+    nr_scope_types.push(tid)
+    nr_scope_reads.push(0)
+    nr_scope_writes.push(1)
+    nr_scope_nodes.push(node)
+    nr_scope_captured.push(0)
+    nr_scope_prev.push(prev)
+    nr_name_top.insert(name, new_idx)
+}
 
 fn nr_push_scope() {
     nr_scope_frames.push(nr_scope_names.len())
@@ -2296,25 +2326,30 @@ fn nr_pop_scope() ! Diag.Report {
     }
     let start = nr_scope_frames.get(nr_scope_frames.len() - 1).unwrap()
     nr_scope_frames.pop()
-    // Emit unused variable warnings for locals (depth > 1 = inside a function)
-    if nr_warn_unused != 0 && nr_scope_depth > 1 {
-        let mut i = nr_scope_names.len() - 1
-        while i >= start {
-            let vname = nr_scope_names.get(i).unwrap()
-            if nr_scope_reads.get(i).unwrap() == 0 && vname.len() > 0 && vname.byte_at(0) != 95 { // '_'
-                let nd = nr_scope_nodes.get(i).unwrap()
+    let emit_unused = nr_warn_unused != 0 && nr_scope_depth > 1
+    // Fused loop: emit unused-variable warnings AND restore nr_name_top AND
+    // pop the parallel arrays in a single back-to-front pass over [start, len).
+    while nr_scope_names.len() > start {
+        let idx = nr_scope_names.len() - 1
+        let nm = nr_scope_names.get(idx).unwrap()
+        if emit_unused {
+            if nr_scope_reads.get(idx).unwrap() == 0 && nm.len() > 0 && nm.byte_at(0) != 95 { // '_'
+                let nd = nr_scope_nodes.get(idx).unwrap()
                 if nd != -1 {
-                    if nr_scope_writes.get(i).unwrap() > 1 {
-                        diag_warn_at("SetButNotRead", SET_BUT_NOT_READ, "variable '{vname}' is assigned a value that is never read", nd, "remove the unused assignment, or prefix with '_' to suppress")
+                    if nr_scope_writes.get(idx).unwrap() > 1 {
+                        diag_warn_at("SetButNotRead", SET_BUT_NOT_READ, "variable '{nm}' is assigned a value that is never read", nd, "remove the unused assignment, or prefix with '_' to suppress")
                     } else {
-                        diag_warn_at("UnusedVariable", UNUSED_VARIABLE, "variable '{vname}' is never read", nd, "prefix with '_' to suppress this warning")
+                        diag_warn_at("UnusedVariable", UNUSED_VARIABLE, "variable '{nm}' is never read", nd, "prefix with '_' to suppress this warning")
                     }
                 }
             }
-            i = i - 1
         }
-    }
-    while nr_scope_names.len() > start {
+        let prev = nr_scope_prev.get(idx).unwrap()
+        if prev == -1 {
+            nr_name_top.remove(nm)
+        } else {
+            nr_name_top.insert(nm, prev)
+        }
         nr_scope_names.pop()
         nr_scope_muts.pop()
         nr_scope_types.pop()
@@ -2322,18 +2357,13 @@ fn nr_pop_scope() ! Diag.Report {
         nr_scope_writes.pop()
         nr_scope_nodes.pop()
         nr_scope_captured.pop()
+        nr_scope_prev.pop()
     }
     nr_scope_depth = nr_scope_depth - 1
 }
 
 fn nr_define(name: Str) {
-    nr_scope_names.push(name)
-    nr_scope_muts.push(0)
-    nr_scope_types.push(TYPE_UNKNOWN)
-    nr_scope_reads.push(0)
-    nr_scope_writes.push(1)
-    nr_scope_nodes.push(-1)
-    nr_scope_captured.push(0)
+    nr_scope_push_entry(name, 0, TYPE_UNKNOWN, -1)
 }
 
 fn nr_check_shadow(name: Str, node: Int) ! Diag.Report {
@@ -2343,14 +2373,18 @@ fn nr_check_shadow(name: Str, node: Int) ! Diag.Report {
     if nr_scope_depth <= 1 { return }
     if nr_scope_frames.len() == 0 { return }
     let frame_start = nr_scope_frames.get(nr_scope_frames.len() - 1).unwrap()
-    let mut i = 0
-    while i < frame_start {
-        if nr_scope_names.get(i).unwrap() == name {
-            diag_warn_at("ShadowedVariable", SHADOWED_VARIABLE, "variable '{name}' shadows a variable from an outer scope", node, "rename the variable or prefix with '_' to suppress")
-            return
-        }
-        i = i + 1
+    // Walk the shadow chain from the newest entry back to the first one
+    // that lives outside this frame — that's the shadowed outer binding.
+    let mut idx = -1
+    match nr_name_top.get(name) {
+        Some(t) => idx = t
+        None => return
     }
+    while idx >= frame_start {
+        idx = nr_scope_prev.get(idx).unwrap()
+        if idx == -1 { return }
+    }
+    diag_warn_at("ShadowedVariable", SHADOWED_VARIABLE, "variable '{name}' shadows a variable from an outer scope", node, "rename the variable or prefix with '_' to suppress")
 }
 
 fn nr_define_at(name: Str, node: Int) ! Diag.Report {
@@ -2358,23 +2392,11 @@ fn nr_define_at(name: Str, node: Int) ! Diag.Report {
         node_set_module(node, nr_current_module)
     }
     nr_check_shadow(name, node)
-    nr_scope_names.push(name)
-    nr_scope_muts.push(0)
-    nr_scope_types.push(TYPE_UNKNOWN)
-    nr_scope_reads.push(0)
-    nr_scope_writes.push(1)
-    nr_scope_nodes.push(node)
-    nr_scope_captured.push(0)
+    nr_scope_push_entry(name, 0, TYPE_UNKNOWN, node)
 }
 
 fn nr_define_mut(name: Str, is_mut: Int) {
-    nr_scope_names.push(name)
-    nr_scope_muts.push(is_mut)
-    nr_scope_types.push(TYPE_UNKNOWN)
-    nr_scope_reads.push(0)
-    nr_scope_writes.push(1)
-    nr_scope_nodes.push(-1)
-    nr_scope_captured.push(0)
+    nr_scope_push_entry(name, is_mut, TYPE_UNKNOWN, -1)
 }
 
 fn nr_define_mut_at(name: Str, is_mut: Int, node: Int) ! Diag.Report {
@@ -2382,29 +2404,20 @@ fn nr_define_mut_at(name: Str, is_mut: Int, node: Int) ! Diag.Report {
         node_set_module(node, nr_current_module)
     }
     nr_check_shadow(name, node)
-    nr_scope_names.push(name)
-    nr_scope_muts.push(is_mut)
-    nr_scope_types.push(TYPE_UNKNOWN)
-    nr_scope_reads.push(0)
-    nr_scope_writes.push(1)
-    nr_scope_nodes.push(node)
-    nr_scope_captured.push(0)
+    nr_scope_push_entry(name, is_mut, TYPE_UNKNOWN, node)
 }
 
 fn nr_define_typed(name: Str, is_mut: Int, tid: Int) {
-    nr_scope_names.push(name)
-    nr_scope_muts.push(is_mut)
-    nr_scope_types.push(tid)
-    nr_scope_reads.push(0)
-    nr_scope_writes.push(1)
-    nr_scope_nodes.push(-1)
-    nr_scope_captured.push(0)
+    nr_scope_push_entry(name, is_mut, tid, -1)
 }
 
+// match-with-return per arm (instead of `let x = match { ... }` as an
+// expression) is a workaround for a codegen issue where binding a match
+// expression whose arms `return` from the enclosing fn produces wrong C.
+// Applies to nr_is_mut / nr_get_type / nr_check_shadow below too.
 fn nr_is_defined(name: Str) -> Int {
-    let mut i = nr_scope_names.len() - 1
-    while i >= 0 {
-        if nr_scope_names.get(i).unwrap() == name {
+    match nr_name_top.get(name) {
+        Some(i) => {
             nr_scope_reads.set(i, 1)
             // If the read happens inside a closure body, the capture may be
             // observed on a later call — don't let subsequent writes in the
@@ -2423,47 +2436,35 @@ fn nr_is_defined(name: Str) -> Int {
             }
             return 1
         }
-        i = i - 1
+        None => {}
     }
     0
 }
 
 fn nr_is_mut(name: Str) -> Int {
-    let mut i = nr_scope_names.len() - 1
-    while i >= 0 {
-        if nr_scope_names.get(i).unwrap() == name {
-            return nr_scope_muts.get(i).unwrap()
-        }
-        i = i - 1
+    match nr_name_top.get(name) {
+        Some(i) => return nr_scope_muts.get(i).unwrap()
+        None => {}
     }
     0
 }
 
 fn nr_mark_written(name: Str, _node: Int) ! Diag.Report {
-    let mut _fn_frame_start = 0
-    if nr_scope_frames.len() > 1 {
-        _fn_frame_start = nr_scope_frames.get(1).unwrap()
-    }
-    let mut i = nr_scope_names.len() - 1
-    while i >= 0 {
-        if nr_scope_names.get(i).unwrap() == name {
+    match nr_name_top.get(name) {
+        Some(i) => {
             if nr_loop_depth == 0 && nr_scope_captured.get(i).unwrap() == 0 {
                 nr_scope_reads.set(i, 0)
             }
             nr_scope_writes.set(i, nr_scope_writes.get(i).unwrap() + 1)
-            return
         }
-        i = i - 1
+        None => {}
     }
 }
 
 fn nr_get_type(name: Str) -> Int {
-    let mut i = nr_scope_names.len() - 1
-    while i >= 0 {
-        if nr_scope_names.get(i).unwrap() == name {
-            return nr_scope_types.get(i).unwrap()
-        }
-        i = i - 1
+    match nr_name_top.get(name) {
+        Some(i) => return nr_scope_types.get(i).unwrap()
+        None => {}
     }
     TYPE_UNKNOWN
 }
@@ -2865,6 +2866,8 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repor
     nr_scope_writes = []
     nr_scope_nodes = []
     nr_scope_captured = []
+    nr_scope_prev = []
+    nr_name_top.clear()
     nr_scope_frames = []
     nr_scope_depth = 0
     nr_loop_depth = 0
@@ -5508,6 +5511,9 @@ fn tc_infer_program(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Re
     nr_scope_reads = []
     nr_scope_writes = []
     nr_scope_nodes = []
+    nr_scope_captured = []
+    nr_scope_prev = []
+    nr_name_top.clear()
     nr_scope_frames = []
     nr_scope_depth = 0
     nr_loop_depth = 0
