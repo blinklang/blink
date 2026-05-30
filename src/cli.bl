@@ -38,7 +38,7 @@ import compiler.{
     set_strict_struct_layout,
 }
 import codegen.{Codegen, generate, generate_archive_header, generate_module_header, generate_module_object, enumerate_program_modules, cg_debug_mode, cg_trace_codegen, cg_deterministic}
-import codegen_types.{cg_emit_only_module, cg_skip_modules, cg_user_tu_mode, cg_blink_ev_extern_only}
+import codegen_types.{cg_emit_only_module, cg_skip_modules, cg_user_tu_mode, cg_blink_ev_extern_only, list_contains_str}
 import build_stdlib.{build_stdlib_archive, list_stdlib_module_keys, resolve_blinkc_path}
 import stdlib_native_deps.{
     stdlib_native_dep_names, stdlib_native_dep_gate_macro, stdlib_native_dep_source_paths,
@@ -748,40 +748,26 @@ fn resolve_vendored_objects(used_deps: List[Str], debug_mode: Int, release_mode:
     let mut i = 0
     while i < count {
         let name = manifest_native_dep_name_at(i)
-        let dep_type = manifest_native_dep_type(name)
-        if dep_type == "vendored" {
-            // Skip if the user-vendored dep already came in via used_deps
-            // (registry-managed). Otherwise the same .o would be compiled
-            // and linked twice.
-            let mut already_handled = 0
-            let mut k = 0
-            while k < used_deps.len() {
-                if used_deps.get(k).unwrap() == name {
-                    already_handled = 1
-                    k = used_deps.len()
-                }
-                k = k + 1
-            }
-            if already_handled == 0 {
-                let dep_path = manifest_native_dep_path(name)
-                if dep_path != "" {
-                    if did_mkdir == 0 {
-                        shell_exec("mkdir -p .tmp")
-                        did_mkdir = 1
-                    }
-                    let mut o_path = ".tmp/{name}.o"
-                    if target != "" {
-                        o_path = ".tmp/{name}-{target}.o"
-                    }
-                    let rc = compile_vendored_source(dep_path, o_path, debug_mode, release_mode, target)
-                    if rc != 0 {
-                        return objects
-                    }
-                    objects.push(o_path)
-                }
-            }
-        }
         i = i + 1
+        if manifest_native_dep_type(name) != "vendored" { continue }
+        // Registry-managed deps already came in via used_deps above; skip
+        // the manifest entry so the same .o isn't compiled and linked twice.
+        if list_contains_str(used_deps, name) == 1 { continue }
+        let dep_path = manifest_native_dep_path(name)
+        if dep_path == "" { continue }
+        if did_mkdir == 0 {
+            shell_exec("mkdir -p .tmp")
+            did_mkdir = 1
+        }
+        let mut o_path = ".tmp/{name}.o"
+        if target != "" {
+            o_path = ".tmp/{name}-{target}.o"
+        }
+        let rc = compile_vendored_source(dep_path, o_path, debug_mode, release_mode, target)
+        if rc != 0 {
+            return objects
+        }
+        objects.push(o_path)
     }
 
     objects
@@ -817,25 +803,12 @@ fn resolve_vendored_includes(used_deps: List[Str], target: Str) -> Str {
     let mut i = 0
     while i < count {
         let name = manifest_native_dep_name_at(i)
-        let dep_type = manifest_native_dep_type(name)
-        if dep_type == "vendored" {
-            let mut already_handled = 0
-            let mut k = 0
-            while k < used_deps.len() {
-                if used_deps.get(k).unwrap() == name {
-                    already_handled = 1
-                    k = used_deps.len()
-                }
-                k = k + 1
-            }
-            if already_handled == 0 {
-                let dep_path = manifest_native_dep_path(name)
-                if dep_path != "" {
-                    includes.push("-I{path_dirname(dep_path)}")
-                }
-            }
-        }
         i = i + 1
+        if manifest_native_dep_type(name) != "vendored" { continue }
+        if list_contains_str(used_deps, name) == 1 { continue }
+        let dep_path = manifest_native_dep_path(name)
+        if dep_path == "" { continue }
+        includes.push("-I{path_dirname(dep_path)}")
     }
 
     if includes.len() == 0 {
@@ -943,9 +916,10 @@ fn do_link_target(out: Str, c_path: Str, link_flags: Str, obj_files: List[Str], 
     let arc_dir = resolve_archive_dir()
     let archive = " -I{arc_dir} {arc_dir}/libblink_std.a -Wl,--gc-sections"
     let mut effective_link_flags = link_flags
-    // obj_files / include_flags already carry per-build vendored deps the
-    // caller computed via detect_native_deps(c_source). Archive no longer
-    // contains sqlite (or any peeled module), so no force-include needed.
+    // obj_files / include_flags carry per-build vendored deps the caller
+    // resolved via detect_native_deps(c_source); the archive itself owns
+    // only non-peeled stdlib bodies, so the link set is just user .c +
+    // vendored objs + archive.
     if !link_flags.contains("-pthread") {
         effective_link_flags = "{link_flags} -pthread"
     }
