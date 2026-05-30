@@ -175,6 +175,21 @@ tasks:
       - mv ~/.local/bin/blink ~/.local/bin/blink.bak 2>/dev/null || true
       - cp {{.BUILD_DIR}}/blink ~/.local/bin/blink
       - cp {{.BUILD_DIR}}/libblink_std.a {{.BUILD_DIR}}/libblink_std.h {{.BUILD_DIR}}/runtime.h ~/.local/share/blink/
+      # Copy each registered native dep's source + headers as a sidecar so
+      # the installed blink can compile a user TU that imports a peeled
+      # stdlib module (e.g. std/db_sqlite). Layout mirrors the dev tree:
+      # share/blink/native/<name>/{<file>.c, <file>.h}. Driven by the
+      # __native-deps registry so adding a dep needs no Taskfile edit.
+      - |
+        {{.BUILD_DIR}}/blink __native-deps | while IFS='|' read -r NAME SRCS HDR_DIR _DEFS _GATE; do
+          [ -z "$NAME" ] && continue
+          DEST=~/.local/share/blink/native/"$NAME"
+          mkdir -p "$DEST"
+          IFS=',' ; for SRC in $SRCS; do cp "$SRC" "$DEST/" ; done ; unset IFS
+          if [ -d "$HDR_DIR" ]; then
+            find "$HDR_DIR" -maxdepth 1 -name '*.h' -exec cp {} "$DEST/" \;
+          fi
+        done
       - echo "Installed blink to ~/.local/bin/blink (stdlib archive in ~/.local/share/blink/)"
 
   test-fmt:
@@ -220,6 +235,18 @@ tasks:
         mkdir -p "$INSTALL_PREFIX/bin" "$INSTALL_PREFIX/share/blink"
         cp {{.BUILD_DIR}}/blink "$INSTALL_PREFIX/bin/blink"
         cp {{.BUILD_DIR}}/libblink_std.a {{.BUILD_DIR}}/libblink_std.h {{.BUILD_DIR}}/runtime.h "$INSTALL_PREFIX/share/blink/"
+        # Mirror the install pipeline: drop each registered native dep
+        # under <prefix>/share/blink/native/<name>/ so resolve_native_dep_source
+        # finds the sidecar copy instead of falling through to the dev tree.
+        {{.BUILD_DIR}}/blink __native-deps | while IFS='|' read -r NAME SRCS HDR_DIR _DEFS _GATE; do
+          [ -z "$NAME" ] && continue
+          DEST="$INSTALL_PREFIX/share/blink/native/$NAME"
+          mkdir -p "$DEST"
+          IFS=',' ; for SRC in $SRCS; do cp "$SRC" "$DEST/" ; done ; unset IFS
+          if [ -d "$HDR_DIR" ]; then
+            find "$HDR_DIR" -maxdepth 1 -name '*.h' -exec cp {} "$DEST/" \;
+          fi
+        done
         cat > "$TMPDIR/test_standalone.bl" << 'BLINK'
         import std.path.{path_join}
         import std.sb.{sb_new, sb_write}
@@ -282,6 +309,27 @@ tasks:
           exit 1
         fi
         echo "PASS test-installed (blink test runs without empty-path crash)"
+
+        # Case 4: a program that imports std.db_sqlite — exercises the
+        # peeled-module path. resolve_native_dep_source must find the
+        # sqlite source under share/blink/native/sqlite3/, NOT fall through
+        # to lib/native/sqlite3/ (which doesn't exist in install layout).
+        cat > "$PROJECT_DIR/src/main.bl" << 'BLINK'
+        import std.db_sqlite.{sqlite_open, sqlite_close}
+
+        fn main() ! IO {
+            let handle = sqlite_open(":memory:")
+            let _ = sqlite_close(handle)
+            io.println("sidecar-ok")
+        }
+        BLINK
+        SQLITE_OUT=$(env -u BLINK_ROOT PATH="$INSTALL_PREFIX/bin:$PATH" blink run src/main.bl 2>&1)
+        if [ "$SQLITE_OUT" != "sidecar-ok" ]; then
+          echo "FAIL test-installed (sqlite sidecar)"
+          echo "Got: $SQLITE_OUT"
+          exit 1
+        fi
+        echo "PASS test-installed (sqlite sidecar — peeled-module resolves from share/blink/native/)"
 
   ci:
     desc: Full CI — regen bootstrap + run all tests

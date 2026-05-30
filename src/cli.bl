@@ -654,11 +654,11 @@ fn compile_vendored_source(c_path: Str, o_path: Str, debug_mode: Int, release_mo
     return 0
 }
 
-// Resolve where to find a registered native dep's C source. Lookup order
-// matches the existing sqlite carve-out: user manifest [native-dependencies]
-// override → dev-tree `lib/native/<name>/<file>`. Step 7 layers the
-// installed-sidecar path between those two. Returns "" if no source can
-// be located, leaving the caller to error out.
+// Resolve where to find a registered native dep's C source. Lookup order:
+// (1) user manifest [native-dependencies] override (lets a user pin a
+// custom build), (2) installed sidecar at `<install_root>/share/blink/native/<name>/`,
+// (3) dev-tree `lib/native/<name>/`. Returns "" if no source can be
+// located, leaving the caller to error out.
 fn resolve_native_dep_source(name: Str) -> Str {
     let dep_type = manifest_native_dep_type(name)
     let dep_path = manifest_native_dep_path(name)
@@ -667,9 +667,18 @@ fn resolve_native_dep_source(name: Str) -> Str {
     }
     if dep_type == "" {
         let paths = stdlib_native_dep_source_paths(name)
+        let install_root = resolve_install_root()
         let mut i = 0
         while i < paths.len() {
             let p = paths.get(i).unwrap()
+            if install_root != "" {
+                // Map `lib/native/<name>/<file>` → `<root>/share/blink/native/<name>/<file>`.
+                let base = path_basename(p)
+                let sidecar = path_join(install_root, "share/blink/native/{name}/{base}")
+                if file_exists(sidecar) == 1 {
+                    return sidecar
+                }
+            }
             if file_exists(p) == 1 {
                 return p
             }
@@ -3076,6 +3085,25 @@ fn main() {
         let rc = build_stdlib_archive(peeled_module_keys())
         if rc != 0 {
             exit(rc)
+        }
+        return
+    }
+
+    // Pipe-separated record per registered native dep, sourced from the
+    // stdlib_native_deps registry. Taskfile install + cross-compile loops
+    // consume this so they never hardcode a dep name.
+    // Format: name|source_paths(comma)|header_dir|compile_defs(comma)|gate_macro
+    if arg_count() >= 2 && get_arg(1) == "__native-deps" {
+        let names = stdlib_native_dep_names()
+        let mut ni = 0
+        while ni < names.len() {
+            let n = names.get(ni).unwrap()
+            let srcs = stdlib_native_dep_source_paths(n).join(",")
+            let hdr = stdlib_native_dep_header_dir(n)
+            let defs = stdlib_native_dep_compile_defs(n).join(",")
+            let gate = stdlib_native_dep_gate_macro(n)
+            io.println("{n}|{srcs}|{hdr}|{defs}|{gate}")
+            ni = ni + 1
         }
         return
     }
