@@ -290,10 +290,16 @@ tasks:
         fi
         echo "PASS test-installed (blink test runs without empty-path crash)"
 
-        # Case 4: a program that imports std.db_sqlite — exercises the
-        # peeled-module path. resolve_native_dep_source must find the
-        # sqlite source under share/blink/native/sqlite3/, NOT fall through
-        # to lib/native/sqlite3/ (which doesn't exist in install layout).
+        # Case 4: program importing std.db_sqlite — exercises the peeled-
+        # module path and the cold-bootstrap double-link regression (edq96x).
+        # Pre-seeds .tmp/sqlite3.o (the "leftover from prior build" condition
+        # in the bug report) so compile_vendored_source's mtime-skip reuses
+        # it instead of recompiling. v0.44.2-class regressions emit two
+        # copies of .tmp/sqlite3.o on the cc line → ld "multiple definition
+        # of sqlite3_*". Asserts:
+        #   (a) no "multiple definition" in stderr (named diagnostic for edq96x)
+        #   (b) blink run exits 0 with stdout "sidecar-ok" (peeled-module
+        #       resolves from share/blink/native/ + functional link)
         cat > "$PROJECT_DIR/src/main.bl" << 'BLINK'
         import std.db_sqlite.{sqlite_open, sqlite_close}
 
@@ -303,13 +309,22 @@ tasks:
             io.println("sidecar-ok")
         }
         BLINK
-        SQLITE_OUT=$(env -u BLINK_ROOT PATH="$INSTALL_PREFIX/bin:$PATH" blink run src/main.bl 2>&1)
+        mkdir -p "$PROJECT_DIR/.tmp"
+        cc -c -o "$PROJECT_DIR/.tmp/sqlite3.o" \
+            "$INSTALL_PREFIX/share/blink/native/sqlite3/sqlite3.c"
+        touch "$PROJECT_DIR/.tmp/sqlite3.o"
+        SQLITE_OUT=$(env -u BLINK_ROOT PATH="$INSTALL_PREFIX/bin:$PATH" blink run src/main.bl 2>&1 || true)
+        if echo "$SQLITE_OUT" | grep -q "multiple definition"; then
+          echo "FAIL test-installed (sqlite sidecar — edq96x cold-bootstrap double-link regression)"
+          echo "$SQLITE_OUT" | grep "multiple definition" | head -5
+          exit 1
+        fi
         if [ "$SQLITE_OUT" != "sidecar-ok" ]; then
           echo "FAIL test-installed (sqlite sidecar)"
           echo "Got: $SQLITE_OUT"
           exit 1
         fi
-        echo "PASS test-installed (sqlite sidecar — peeled-module resolves from share/blink/native/)"
+        echo "PASS test-installed (sqlite sidecar — peeled-module + edq96x regression)"
 
   ci:
     desc: Full CI — regen bootstrap + run all tests
