@@ -650,10 +650,12 @@ tasks:
       GC_STUBS: bootstrap/vendor/gc/include/zig-stubs
       GC_DEFS: -DGC_THREADS -DGC_BUILTIN_ATOMIC -DUSE_MMAP -DUSE_MUNMAP
       GC_MACOS_DEFS: -DGC_THREADS -DGC_BUILTIN_ATOMIC -DUSE_MMAP -DUSE_MUNMAP -DNO_MPROTECT_VDB
-      SQLITE_SRC: lib/native/sqlite3/sqlite3.c
-      SQLITE_INC: lib/native/sqlite3
-      SQLITE_DEFS: -DSQLITE_THREADSAFE=1
-      MONO_DEFS: -ffunction-sections -fdata-sections -DBLINK_USE_SQLITE=1
+      # Peeled native deps (e.g. sqlite3) are NOT linked into the released
+      # CLI — the archive monolith excludes them and the CLI itself doesn't
+      # import std.db_sqlite. Each registered dep's source ships as a
+      # sidecar under share/blink/native/<name>/ (see dist layout below)
+      # so user programs that DO import a peeled module can find them.
+      MONO_DEFS: -ffunction-sections -fdata-sections
     cmds:
       # Emit the user-TU cli.c in archive mode (matches build-cli).
       - "{{.BLINKC}} --link-archive {{.BUILD_DIR}}/libblink_std.h src/cli.bl {{.BUILD_DIR}}/cli.c"
@@ -663,20 +665,17 @@ tasks:
       - zig cc -c -O2 {{.GC_DEFS}} -I{{.GC_INC}} -target x86_64-linux-gnu -o .tmp/gc-linux-x86_64.o {{.GC_SRC}}
       - zig cc -c -O2 {{.GC_MACOS_DEFS}} -I{{.GC_STUBS}} -I{{.GC_INC}} -target x86_64-macos -o .tmp/gc-macos-x86_64.o {{.GC_SRC}}
       - zig cc -c -O2 {{.GC_MACOS_DEFS}} -I{{.GC_STUBS}} -I{{.GC_INC}} -target aarch64-macos -o .tmp/gc-macos-aarch64.o {{.GC_SRC}}
-      # sqlite3 per target
-      - zig cc -c -O2 {{.SQLITE_DEFS}} -target x86_64-linux-gnu -o .tmp/sqlite3-linux-x86_64.o {{.SQLITE_SRC}}
-      - zig cc -c -O2 {{.SQLITE_DEFS}} -target x86_64-macos -o .tmp/sqlite3-macos-x86_64.o {{.SQLITE_SRC}}
-      - zig cc -c -O2 {{.SQLITE_DEFS}} -target aarch64-macos -o .tmp/sqlite3-macos-aarch64.o {{.SQLITE_SRC}}
       # stdlib monolith per target (uses the same archive sources that build-cli compiled host-side via __build-stdlib-archive)
       - |
         ARC_REL="{{.BUILD_DIR}}/$(readlink {{.BUILD_DIR}}/libblink_std.a | xargs dirname)"
-        zig cc -c -O2 {{.MONO_DEFS}} -target x86_64-linux-gnu -I{{.GC_INC}} -I{{.SQLITE_INC}} -I"$ARC_REL" -o .tmp/monolith-linux-x86_64.o "$ARC_REL/monolith.c"
-        zig cc -c -O2 {{.MONO_DEFS}} -target x86_64-macos -I{{.GC_STUBS}} -I{{.GC_INC}} -I{{.SQLITE_INC}} -I"$ARC_REL" -o .tmp/monolith-macos-x86_64.o "$ARC_REL/monolith.c"
-        zig cc -c -O2 {{.MONO_DEFS}} -target aarch64-macos -I{{.GC_STUBS}} -I{{.GC_INC}} -I{{.SQLITE_INC}} -I"$ARC_REL" -o .tmp/monolith-macos-aarch64.o "$ARC_REL/monolith.c"
-      # Link each target binary against its own GC + sqlite + stdlib monolith.
-      - zig cc -O2 -Wno-parentheses-equality -I{{.GC_INC}} -I{{.SQLITE_INC}} -I{{.BUILD_DIR}} -target x86_64-linux-gnu -o {{.BUILD_DIR}}/blink-linux-x86_64 {{.BUILD_DIR}}/cli.c .tmp/monolith-linux-x86_64.o .tmp/sqlite3-linux-x86_64.o .tmp/gc-linux-x86_64.o -lm -Wl,--gc-sections
-      - zig cc -O2 -Wno-parentheses-equality -I{{.GC_STUBS}} -I{{.GC_INC}} -I{{.SQLITE_INC}} -I{{.BUILD_DIR}} -target x86_64-macos -o {{.BUILD_DIR}}/blink-macos-x86_64 {{.BUILD_DIR}}/cli.c .tmp/monolith-macos-x86_64.o .tmp/sqlite3-macos-x86_64.o .tmp/gc-macos-x86_64.o -lm -Wl,-dead_strip
-      - zig cc -O2 -Wno-parentheses-equality -I{{.GC_STUBS}} -I{{.GC_INC}} -I{{.SQLITE_INC}} -I{{.BUILD_DIR}} -target aarch64-macos -o {{.BUILD_DIR}}/blink-macos-aarch64 {{.BUILD_DIR}}/cli.c .tmp/monolith-macos-aarch64.o .tmp/sqlite3-macos-aarch64.o .tmp/gc-macos-aarch64.o -lm -Wl,-dead_strip
+        zig cc -c -O2 {{.MONO_DEFS}} -target x86_64-linux-gnu -I{{.GC_INC}} -I"$ARC_REL" -o .tmp/monolith-linux-x86_64.o "$ARC_REL/monolith.c"
+        zig cc -c -O2 {{.MONO_DEFS}} -target x86_64-macos -I{{.GC_STUBS}} -I{{.GC_INC}} -I"$ARC_REL" -o .tmp/monolith-macos-x86_64.o "$ARC_REL/monolith.c"
+        zig cc -c -O2 {{.MONO_DEFS}} -target aarch64-macos -I{{.GC_STUBS}} -I{{.GC_INC}} -I"$ARC_REL" -o .tmp/monolith-macos-aarch64.o "$ARC_REL/monolith.c"
+      # Link each target binary against its own GC + stdlib monolith. The
+      # CLI doesn't import any peeled native dep, so no sqlite3.o here.
+      - zig cc -O2 -Wno-parentheses-equality -I{{.GC_INC}} -I{{.BUILD_DIR}} -target x86_64-linux-gnu -o {{.BUILD_DIR}}/blink-linux-x86_64 {{.BUILD_DIR}}/cli.c .tmp/monolith-linux-x86_64.o .tmp/gc-linux-x86_64.o -lm -Wl,--gc-sections
+      - zig cc -O2 -Wno-parentheses-equality -I{{.GC_STUBS}} -I{{.GC_INC}} -I{{.BUILD_DIR}} -target x86_64-macos -o {{.BUILD_DIR}}/blink-macos-x86_64 {{.BUILD_DIR}}/cli.c .tmp/monolith-macos-x86_64.o .tmp/gc-macos-x86_64.o -lm -Wl,-dead_strip
+      - zig cc -O2 -Wno-parentheses-equality -I{{.GC_STUBS}} -I{{.GC_INC}} -I{{.BUILD_DIR}} -target aarch64-macos -o {{.BUILD_DIR}}/blink-macos-aarch64 {{.BUILD_DIR}}/cli.c .tmp/monolith-macos-aarch64.o .tmp/gc-macos-aarch64.o -lm -Wl,-dead_strip
       # Per-target stdlib archives, assembled from the matching monolith.o so
       # the released `blink` can link user code at user-compile time. The host
       # archive's libblink_std.a is single-object (just monolith.o), so we
@@ -687,9 +686,12 @@ tasks:
           rm -f .tmp/libblink_std-$t.a
           zig ar rcs .tmp/libblink_std-$t.a .tmp/monolith-$t.o
         done
-      # Stage release layout per target: bin/blink + share/blink/{archive,headers}.
+      # Stage release layout per target: bin/blink + share/blink/{archive,headers,native/}.
       # This matches `task install` layout (bin/, share/blink/) so the
       # binary's resolve_install_root() finds share/blink/ via argv[0].
+      # Each registered native dep ships under share/blink/native/<name>/ so
+      # user programs that import a peeled module (e.g. std.db_sqlite) can
+      # find the vendored source at compile time.
       - |
         ARC_REL="{{.BUILD_DIR}}/$(readlink {{.BUILD_DIR}}/libblink_std.a | xargs dirname)"
         rm -rf {{.BUILD_DIR}}/dist
@@ -700,6 +702,15 @@ tasks:
           cp .tmp/libblink_std-$t.a $d/share/blink/libblink_std.a
           cp "$ARC_REL/libblink_std.h" $d/share/blink/libblink_std.h
           cp {{.BUILD_DIR}}/runtime.h $d/share/blink/runtime.h
+          {{.BUILD_DIR}}/blink __native-deps | while IFS='|' read -r NAME SRCS HDR_DIR _DEFS _GATE; do
+            [ -z "$NAME" ] && continue
+            DEST="$d/share/blink/native/$NAME"
+            mkdir -p "$DEST"
+            IFS=',' ; for SRC in $SRCS; do cp "$SRC" "$DEST/" ; done ; unset IFS
+            if [ -d "$HDR_DIR" ]; then
+              find "$HDR_DIR" -maxdepth 1 -name '*.h' -exec cp {} "$DEST/" \;
+            fi
+          done
         done
       # Tar each layout for upload. Use `-C` so the top-level dir inside the
       # tar is blink-<target>/, giving extractors a clean rename target.
@@ -716,10 +727,7 @@ tasks:
       GC_SRC: bootstrap/vendor/gc/extra/gc.c
       GC_INC: bootstrap/vendor/gc/include
       GC_DEFS: -DGC_THREADS -DGC_BUILTIN_ATOMIC -DUSE_MMAP -DUSE_MUNMAP
-      SQLITE_SRC: lib/native/sqlite3/sqlite3.c
-      SQLITE_INC: lib/native/sqlite3
-      SQLITE_DEFS: -DSQLITE_THREADSAFE=1
-      MONO_DEFS: -ffunction-sections -fdata-sections -DBLINK_USE_SQLITE=1
+      MONO_DEFS: -ffunction-sections -fdata-sections
     sources:
       - src/cli.bl
       - '{{.BUILD_DIR}}/blinkc'
@@ -727,8 +735,6 @@ tasks:
       - '{{.BUILD_DIR}}/libblink_std.h'
       - bootstrap/vendor/gc/extra/gc.c
       - bootstrap/vendor/gc/include/**/*.h
-      - lib/native/sqlite3/sqlite3.c
-      - lib/native/sqlite3/sqlite3.h
       - Taskfile.yml
     generates:
       - '{{.BUILD_DIR}}/smoke/blink-smoke'
@@ -748,10 +754,16 @@ tasks:
         fi
         ARC_REL="$(dirname "$(readlink -f {{.BUILD_DIR}}/libblink_std.a)")"
         zig cc -c -O2 {{.GC_DEFS}} -I{{.GC_INC}} -target x86_64-linux-gnu -o "$OUTDIR/gc.o" {{.GC_SRC}}
-        zig cc -c -O2 {{.SQLITE_DEFS}} -target x86_64-linux-gnu -o "$OUTDIR/sqlite3.o" {{.SQLITE_SRC}}
-        zig cc -c -O2 {{.MONO_DEFS}} -target x86_64-linux-gnu -I{{.GC_INC}} -I{{.SQLITE_INC}} -I"$ARC_REL" -o "$OUTDIR/monolith.o" "$ARC_REL/monolith.c"
-        zig cc -O2 -Wno-parentheses-equality -I{{.GC_INC}} -I{{.SQLITE_INC}} -I{{.BUILD_DIR}} -target x86_64-linux-gnu -o "$OUTDIR/blink-smoke" "$OUTDIR/cli.c" "$OUTDIR/monolith.o" "$OUTDIR/sqlite3.o" "$OUTDIR/gc.o" -lm -Wl,--gc-sections
-        echo "build-binaries-smoke: ok (x86_64-linux archive-mode link)"
+        # No sqlite3.o — peeled out of the archive, CLI doesn't import std.db_sqlite.
+        zig cc -c -O2 {{.MONO_DEFS}} -target x86_64-linux-gnu -I{{.GC_INC}} -I"$ARC_REL" -o "$OUTDIR/monolith.o" "$ARC_REL/monolith.c"
+        zig cc -O2 -Wno-parentheses-equality -I{{.GC_INC}} -I{{.BUILD_DIR}} -target x86_64-linux-gnu -o "$OUTDIR/blink-smoke" "$OUTDIR/cli.c" "$OUTDIR/monolith.o" "$OUTDIR/gc.o" -lm -Wl,--gc-sections
+        # Smoke binary must not contain sqlite symbols.
+        SQL_SYMS=$(nm "$OUTDIR/blink-smoke" 2>/dev/null | grep -c -E '^[0-9a-f]+ T (blink_)?sqlite3_' || true)
+        if [ "$SQL_SYMS" -ne 0 ]; then
+          echo "build-binaries-smoke: FAIL — smoke binary contains $SQL_SYMS sqlite text symbols" >&2
+          exit 1
+        fi
+        echo "build-binaries-smoke: ok (x86_64-linux archive-mode link, zero sqlite symbols)"
 
   release:
     desc: "Create a GitHub release (usage: task release -- v0.5.0)"
