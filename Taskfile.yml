@@ -32,50 +32,31 @@ tasks:
 
   test-bootstrap-cold:
     desc: |
-      Regression for 64x8bp — `build/blink build --output X` (archive mode)
-      must not double-link .tmp/sqlite3.o against the stdlib archive's
-      monolith. Verified RED on main (d6b24fa^): without the dedupe fix
-      every `blink build` of a sqlite-using target fails with
-      "multiple definition of sqlite3_*" because the same .tmp/sqlite3.o
-      appears in both obj_files (user has_sqlite=1) and arch_objs
-      (resolve_vendored_objects(forced=1)). The test asserts:
-        (a) a fresh build (no .tmp/sqlite3*.o) of src/blinkc_main.bl
-            succeeds and writes .tmp/sqlite3.o, and
-        (b) a second back-to-back build that re-sees that .o still
-            succeeds — i.e. the dedupe in do_link_target holds.
+      Regression for 64x8bp by construction — once sqlite is peeled out
+      of the stdlib archive (no blink_sqlite3_* refs in monolith.o), the
+      old double-link path is unreachable: nothing forces sqlite3.o into
+      a user link unless the user actually imports std.db_sqlite, and the
+      CLI itself doesn't. This target now asserts the stronger invariant
+      that supersedes the original 64x8bp dedupe check:
+        build/blink must contain zero sqlite text symbols.
+      If this fails, sqlite leaked back into the archive monolith or
+      into the CLI's user TU and the peel is broken.
     deps: [build-cli]
     silent: true
     cmds:
       - |
         set -e
-        mkdir -p .tmp/64x8bp
-        find .tmp -maxdepth 1 -name 'sqlite3*.o' -delete 2>/dev/null || true
-        OUT1=".tmp/64x8bp/blinkc_a"
-        OUT2=".tmp/64x8bp/blinkc_b"
-        LOG=".tmp/64x8bp/build.log"
-        rm -f "$OUT1" "$OUT2"
-
-        # First build seeds .tmp/sqlite3.o.
-        if ! {{.BUILD_DIR}}/blink build src/blinkc_main.bl --output "$OUT1" > "$LOG" 2>&1; then
-          echo "test-bootstrap-cold: FAIL — first build/blink build failed"
-          tail -40 "$LOG" >&2
+        if [ ! -x "{{.BUILD_DIR}}/blink" ]; then
+          echo "test-bootstrap-cold: FAIL — {{.BUILD_DIR}}/blink not built"
           exit 1
         fi
-        if [ ! -f .tmp/sqlite3.o ]; then
-          echo "test-bootstrap-cold: FAIL — first build did not produce .tmp/sqlite3.o"
+        SQL_TEXT=$(nm "{{.BUILD_DIR}}/blink" 2>/dev/null | grep -c -E '^[0-9a-f]+ T (blink_)?sqlite3_' || true)
+        if [ "$SQL_TEXT" -ne 0 ]; then
+          echo "test-bootstrap-cold: FAIL — build/blink contains $SQL_TEXT sqlite text symbols (expect 0)"
+          nm "{{.BUILD_DIR}}/blink" | grep -E '^[0-9a-f]+ T (blink_)?sqlite3_' | head -5 >&2
           exit 1
         fi
-
-        # Second build reuses .tmp/sqlite3.o. With the 64x8bp bug, the
-        # linker would see it twice (obj_files + arch_objs) and emit
-        # "multiple definition of sqlite3_*".
-        if ! {{.BUILD_DIR}}/blink build src/blinkc_main.bl --output "$OUT2" > "$LOG" 2>&1; then
-          echo "test-bootstrap-cold: FAIL — second build/blink build failed (sqlite3 double-link)"
-          tail -40 "$LOG" >&2
-          exit 1
-        fi
-        rm -f "$OUT1" "$OUT2"
-        echo "test-bootstrap-cold: PASS"
+        echo "test-bootstrap-cold: PASS (build/blink has zero sqlite symbols)"
 
   test-sqlite-peel:
     desc: |
@@ -86,7 +67,6 @@ tasks:
       every user link. GREEN after the native-dep registry peels
       owner_module=std/db_sqlite + transitive bodies out of monolith.o
       and codegen emits them per-TU only when the user imports them.
-      Not yet wired into `ci`; flips in during step-9 repurpose.
     deps: [build-cli]
     silent: true
     cmds:
@@ -369,6 +349,7 @@ tasks:
         cc -o {{.BUILD_DIR}}/blink {{.BUILD_DIR}}/cli.c -I{{.BUILD_DIR}} {{.BUILD_DIR}}/libblink_std.a -lm -lgc -pthread -Wl,--gc-sections
       - '{{.BUILD_DIR}}/blink test tests/ --parallel {{.JOBS}} --quiet'
       - task: test-bootstrap-cold
+      - task: test-sqlite-peel
       - |
         mkdir -p .tmp
         printf '%s\n' test_hof test_lazy_iter test_semver test_toml test_manifest test_lockfile test_http_types test_http_error test_json test_json_builder test_args test_args_cli test_derive_nested test_embed test_combining_iterators test_http_client test_iterators test_match_void_if test_multifile_visibility test_question_ops test_string_iter test_audit test_e2e_gitdep test_e2e_transitive test_e2e_pub_visibility test_async_spawn_types test_tcp_socket test_pub_import test_std_testing test_c_reserved_names test_module_qualified_types test_ue_complex_returns test_effects test_effect_vtable test_sqlite test_builtin_methods test_priv_access test_unused_import test_cross_module_effects test_cross_module_effects_helper test_map_seed_deterministic > .tmp/fmt_skip.txt
