@@ -18,6 +18,7 @@ import codegen_types.{cg_emit_only_module, cg_skip_modules, cg_archive_build_mod
 import mutation_analysis.{analyze_mutations, analyze_save_restore}
 import diagnostics.{Diag, diag_count, diag_ice_count, diag_flush}
 import cli.{resolve_install_root, run_cc}
+import stdlib_native_deps.{peeled_module_keys, peeled_module_dotted, peeled_module_underscored}
 import std.path.{path_join}
 
 fn resolve_under_root(rel: Str) -> Str {
@@ -104,12 +105,25 @@ pub fn list_stdlib_modules() -> List[Str] {
 // Same module list as list_stdlib_modules() but in the underscore form
 // node_source_module() yields ("std_json", not "std.json"). Used to
 // populate cg_skip_modules so the archive provides those bodies.
+//
+// Peeled modules (those backed by a vendored native dep, see
+// stdlib_native_deps) are excluded here because they're NOT in the
+// archive — codegen must emit their bodies into the user TU. Subtracting
+// them from the skip set is how that emission gets triggered.
 pub fn list_stdlib_module_keys() -> List[Str] {
     let mods = list_stdlib_modules()
+    let peeled = peeled_module_underscored()
     let mut out: List[Str] = []
     let mut i = 0
     while i < mods.len() {
-        out.push(mods.get(i).unwrap().replace(".", "_"))
+        let key = mods.get(i).unwrap().replace(".", "_")
+        let mut is_peeled = false
+        let mut p = 0
+        while p < peeled.len() {
+            if peeled.get(p).unwrap() == key { is_peeled = true }
+            p = p + 1
+        }
+        if !is_peeled { out.push(key) }
         i = i + 1
     }
     out
@@ -248,7 +262,25 @@ pub fn build_stdlib_archive(peeled: List[Str]) -> Int ! Lex.Tokenize, Parse, Par
         return 1
     }
 
-    let modules = list_stdlib_modules()
+    let all_modules = list_stdlib_modules()
+    // Strip peeled (dotted-form) modules from the archive entry imports.
+    // Their bodies are excluded from monolith.o; codegen emits them into
+    // the user TU on demand (gated by cg_skip_modules subtraction in
+    // list_stdlib_module_keys).
+    let peeled_set = peeled_module_dotted()
+    let mut modules: List[Str] = []
+    let mut mi = 0
+    while mi < all_modules.len() {
+        let m = all_modules.get(mi).unwrap()
+        let mut skip = false
+        let mut pi = 0
+        while pi < peeled_set.len() {
+            if peeled_set.get(pi).unwrap() == m { skip = true }
+            pi = pi + 1
+        }
+        if !skip { modules.push(m) }
+        mi = mi + 1
+    }
     let manifest = build_manifest(blinkc, std_dir, modules, rt_path_final, peeled)
     let hash = compute_cache_key(blinkc, std_dir, rt_path_final, manifest)
     if hash == "" {
@@ -290,7 +322,11 @@ pub fn build_stdlib_archive(peeled: List[Str]) -> Int ! Lex.Tokenize, Parse, Par
     let mono_rc = bail_on_diag()
     if mono_rc != 0 { return mono_rc }
     write_file("{cache_dir}/monolith.c", monolith_c)
-    let cc_args = "-c -ffunction-sections -fdata-sections -DBLINK_USE_SQLITE=1 -o {cache_dir}/monolith.o {cache_dir}/monolith.c -I{cache_dir}"
+    // Peeled modules (e.g. std/db_sqlite) are excluded from monolith.c
+    // entirely, so no BLINK_USE_<dep> macros are needed for the archive.
+    // The user TU defines those macros itself when codegen emits a peeled
+    // module body that references the vendored runtime header.
+    let cc_args = "-c -ffunction-sections -fdata-sections -o {cache_dir}/monolith.o {cache_dir}/monolith.c -I{cache_dir}"
     let rc = run_cc(cc_args, 0, 1, "")
     if rc != 0 {
         io.eprintln("error: cc failed building stdlib monolith (rc={rc})")
