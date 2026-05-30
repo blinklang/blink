@@ -77,6 +77,54 @@ tasks:
         rm -f "$OUT1" "$OUT2"
         echo "test-bootstrap-cold: PASS"
 
+  test-sqlite-peel:
+    desc: |
+      Asserts sqlite is peeled out of the stdlib archive — building a
+      non-sqlite program must (a) not produce `.tmp/sqlite3.o`, and (b)
+      yield a binary with zero sqlite text symbols. RED on main because
+      `do_link_target` unconditionally force-includes sqlite3.o into
+      every user link. GREEN after the native-dep registry peels
+      owner_module=std/db_sqlite + transitive bodies out of monolith.o
+      and codegen emits them per-TU only when the user imports them.
+      Not yet wired into `ci`; flips in during step-9 repurpose.
+    deps: [build-cli]
+    silent: true
+    cmds:
+      - |
+        set -e
+        mkdir -p .tmp/peel
+        LOG=".tmp/peel/probe.log"
+
+        cat > .tmp/peel/hello.bl <<'EOF'
+        fn main() ! IO {
+            io.println("hello from peel probe")
+        }
+        EOF
+        find .tmp -maxdepth 1 -name 'sqlite3*.o' -delete 2>/dev/null || true
+        rm -f .tmp/peel/hello
+        if ! {{.BUILD_DIR}}/blink build .tmp/peel/hello.bl --output .tmp/peel/hello > "$LOG" 2>&1; then
+          echo "test-sqlite-peel: FAIL — hello-world build failed"
+          tail -40 "$LOG" >&2
+          exit 1
+        fi
+
+        # (a) non-sqlite build must NOT produce .tmp/sqlite3.o.
+        if [ -f .tmp/sqlite3.o ]; then
+          echo "test-sqlite-peel: FAIL — non-sqlite build produced .tmp/sqlite3.o"
+          exit 1
+        fi
+
+        # (b) resulting binary must contain zero sqlite text symbols.
+        SQL_TEXT=$(nm .tmp/peel/hello 2>/dev/null | grep -c -E '^[0-9a-f]+ T (blink_)?sqlite3_' || true)
+        if [ "$SQL_TEXT" -ne 0 ]; then
+          echo "test-sqlite-peel: FAIL — non-sqlite binary contains $SQL_TEXT sqlite text symbols (expect 0)"
+          nm .tmp/peel/hello | grep -E '^[0-9a-f]+ T (blink_)?sqlite3_' | head -5 >&2
+          exit 1
+        fi
+
+        rm -f .tmp/peel/hello
+        echo "test-sqlite-peel: PASS"
+
   compile-test:
     desc: "Compile a single test file (usage: task compile-test -- test_name)"
     deps: [build-cli]

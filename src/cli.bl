@@ -40,6 +40,10 @@ import compiler.{
 import codegen.{Codegen, generate, generate_archive_header, generate_module_header, generate_module_object, enumerate_program_modules, cg_debug_mode, cg_trace_codegen, cg_deterministic}
 import codegen_types.{cg_emit_only_module, cg_skip_modules, cg_user_tu_mode, cg_blink_ev_extern_only}
 import build_stdlib.{build_stdlib_archive, list_stdlib_module_keys, resolve_blinkc_path}
+import stdlib_native_deps.{
+    stdlib_native_dep_names, stdlib_native_dep_gate_macro, stdlib_native_dep_source_paths,
+    stdlib_native_dep_header_dir, stdlib_native_dep_compile_defs, stdlib_native_dep_link_flag_dynamic,
+}
 import build_objcache
 import codegen_stmt.{ann_str_val, positional_str_arg, positional_str_arg_count}
 import ast_dump.{ast_to_json}
@@ -208,11 +212,23 @@ fn detect_async(source: Str) -> Int {
 }
 
 
-fn detect_sqlite(c_source: Str) -> Int {
-    if c_source.contains("BLINK_USE_SQLITE") {
-        return 1
+// Returns the list of native-dep names whose gate macro appears in the
+// emitted C. Codegen prepends `#define BLINK_USE_<gate> 1` to TUs that
+// touch a registered dep, so this scan answers "which native sources
+// must the link line pull in?"
+fn detect_native_deps(c_source: Str) -> List[Str] {
+    let mut used: List[Str] = []
+    let names = stdlib_native_dep_names()
+    let mut i = 0
+    while i < names.len() {
+        let name = names.get(i).unwrap()
+        let gate = stdlib_native_dep_gate_macro(name)
+        if gate != "" && c_source.contains(gate) {
+            used.push(name)
+        }
+        i = i + 1
     }
-    return 0
+    used
 }
 
 fn detect_ffi_libs(c_source: Str) -> List[Str] {
@@ -304,7 +320,7 @@ fn resolve_gc_include() -> Str {
     "{base}/include"
 }
 
-fn build_link_flags(target: Str, has_async: Int, has_sqlite: Int, ffi_libs: List[Str]) -> Str {
+fn build_link_flags(target: Str, has_async: Int, used_deps: List[Str], ffi_libs: List[Str]) -> Str {
     let mut flags = "-lm"
     if target == "" {
         flags = "{flags} -lgc"
@@ -312,11 +328,13 @@ fn build_link_flags(target: Str, has_async: Int, has_sqlite: Int, ffi_libs: List
     if has_async != 0 {
         flags = "{flags} -pthread"
     }
-    if has_sqlite != 0 {
-        let sqlite_flags = resolve_ffi_link_flags("sqlite3", target)
-        if sqlite_flags != "" {
-            flags = "{flags} {sqlite_flags}"
+    let mut di = 0
+    while di < used_deps.len() {
+        let dep_flags = resolve_ffi_link_flags(used_deps.get(di).unwrap(), target)
+        if dep_flags != "" {
+            flags = "{flags} {dep_flags}"
         }
+        di = di + 1
     }
     let mut i = 0
     while i < ffi_libs.len() {
@@ -635,22 +653,32 @@ fn compile_vendored_source(c_path: Str, o_path: Str, debug_mode: Int, release_mo
     return 0
 }
 
-fn resolve_sqlite_source(has_sqlite: Int) -> Option[Str] {
-    if has_sqlite == 0 {
-        return None
+// Resolve where to find a registered native dep's C source. Lookup order
+// matches the existing sqlite carve-out: user manifest [native-dependencies]
+// override → dev-tree `lib/native/<name>/<file>`. Step 7 layers the
+// installed-sidecar path between those two. Returns "" if no source can
+// be located, leaving the caller to error out.
+fn resolve_native_dep_source(name: Str) -> Str {
+    let dep_type = manifest_native_dep_type(name)
+    let dep_path = manifest_native_dep_path(name)
+    if dep_type == "vendored" && dep_path != "" {
+        return dep_path
     }
-    let sqlite_type = manifest_native_dep_type("sqlite3")
-    let sqlite_path = manifest_native_dep_path("sqlite3")
-    if sqlite_type == "vendored" && sqlite_path != "" {
-        return Some(sqlite_path)
+    if dep_type == "" {
+        let paths = stdlib_native_dep_source_paths(name)
+        let mut i = 0
+        while i < paths.len() {
+            let p = paths.get(i).unwrap()
+            if file_exists(p) == 1 {
+                return p
+            }
+            i = i + 1
+        }
     }
-    if sqlite_type == "" && file_exists("lib/native/sqlite3/sqlite3.c") == 1 {
-        return Some("lib/native/sqlite3/sqlite3.c")
-    }
-    None
+    ""
 }
 
-fn resolve_vendored_objects(has_sqlite: Int, debug_mode: Int, release_mode: Int, target: Str) -> List[Str] {
+fn resolve_vendored_objects(used_deps: List[Str], debug_mode: Int, release_mode: Int, target: Str) -> List[Str] {
     let mut objects: List[Str] = []
     let mut did_mkdir = 0
 
@@ -684,19 +712,26 @@ fn resolve_vendored_objects(has_sqlite: Int, debug_mode: Int, release_mode: Int,
         }
     }
 
-    let sqlite_src = resolve_sqlite_source(has_sqlite)
-    if sqlite_src.is_some() {
-        shell_exec("mkdir -p .tmp")
-        did_mkdir = 1
-        let mut o_path = ".tmp/sqlite3.o"
-        if target != "" {
-            o_path = ".tmp/sqlite3-{target}.o"
+    let mut di = 0
+    while di < used_deps.len() {
+        let name = used_deps.get(di).unwrap()
+        let src = resolve_native_dep_source(name)
+        if src != "" {
+            if did_mkdir == 0 {
+                shell_exec("mkdir -p .tmp")
+                did_mkdir = 1
+            }
+            let mut o_path = ".tmp/{name}.o"
+            if target != "" {
+                o_path = ".tmp/{name}-{target}.o"
+            }
+            let rc = compile_vendored_source(src, o_path, debug_mode, release_mode, target)
+            if rc != 0 {
+                return objects
+            }
+            objects.push(o_path)
         }
-        let rc = compile_vendored_source(sqlite_src.unwrap(), o_path, debug_mode, release_mode, target)
-        if rc != 0 {
-            return objects
-        }
-        objects.push(o_path)
+        di = di + 1
     }
 
     let count = manifest_native_dep_count()
@@ -728,7 +763,7 @@ fn resolve_vendored_objects(has_sqlite: Int, debug_mode: Int, release_mode: Int,
     objects
 }
 
-fn resolve_vendored_includes(has_sqlite: Int, target: Str) -> Str {
+fn resolve_vendored_includes(used_deps: List[Str], target: Str) -> Str {
     let mut includes: List[Str] = []
 
     if target != "" {
@@ -744,9 +779,14 @@ fn resolve_vendored_includes(has_sqlite: Int, target: Str) -> Str {
         }
     }
 
-    let sqlite_src = resolve_sqlite_source(has_sqlite)
-    if sqlite_src.is_some() {
-        includes.push("-I{path_dirname(sqlite_src.unwrap())}")
+    let mut di = 0
+    while di < used_deps.len() {
+        let name = used_deps.get(di).unwrap()
+        let src = resolve_native_dep_source(name)
+        if src != "" {
+            includes.push("-I{path_dirname(src)}")
+        }
+        di = di + 1
     }
 
     let count = manifest_native_dep_count()
@@ -871,9 +911,12 @@ fn do_link_target(out: Str, c_path: Str, link_flags: Str, obj_files: List[Str], 
     // Archive contains every stdlib body including db.sqlite + async — force
     // their link deps even if user code doesn't reference them directly,
     // because the archive's monolith.o is treated atomically by the linker.
-    let arch_objs = resolve_vendored_objects(1, debug_mode, release_mode, target)
+    // (Step 6 of the peel removes this once owner_module=std/db_sqlite is
+    // excluded from the archive and codegen emits its body into the user TU.)
+    let all_deps = stdlib_native_dep_names()
+    let arch_objs = resolve_vendored_objects(all_deps, debug_mode, release_mode, target)
     // Dedupe: when user code already pulled in a vendored object (e.g.
-    // user's `has_sqlite=1` produced .tmp/sqlite3.o in obj_files), don't
+    // a registered dep produced .tmp/sqlite3.o in obj_files), don't
     // pass the same .o twice — that would cause multi-def link errors.
     let mut filtered_arch: List[Str] = []
     let mut ai = 0
@@ -897,7 +940,7 @@ fn do_link_target(out: Str, c_path: Str, link_flags: Str, obj_files: List[Str], 
     if filtered_arch.len() > 0 {
         objs = "{objs} {filtered_arch.join(" ")}"
     }
-    let arch_includes = resolve_vendored_includes(1, target)
+    let arch_includes = resolve_vendored_includes(all_deps, target)
     if arch_includes != "" {
         includes = "{includes} {arch_includes}"
     }
@@ -1011,7 +1054,7 @@ fn do_build(source_path: Str, output_path: Str, c_path: Str, format_flag: Str, d
     let source = read_file(source_path)
     let c_source = read_file(c_path)
     let has_async = detect_async(source)
-    let has_sqlite = detect_sqlite(c_source)
+    let used_deps = detect_native_deps(c_source)
     let ffi_libs = detect_ffi_libs(c_source)
 
     let has_toml = if resolve_manifest_path() != "" { 1 } else { 0 }
@@ -1037,9 +1080,9 @@ fn do_build(source_path: Str, output_path: Str, c_path: Str, format_flag: Str, d
         if targets.len() == 1 {
             target = resolve_target_triple(targets.get(0).unwrap())
         }
-        let link_flags = build_link_flags(target, has_async, has_sqlite, ffi_libs)
-        let obj_files = resolve_vendored_objects(has_sqlite, debug_mode, release_mode, target)
-        let inc_flags = resolve_vendored_includes(has_sqlite, target)
+        let link_flags = build_link_flags(target, has_async, used_deps, ffi_libs)
+        let obj_files = resolve_vendored_objects(used_deps, debug_mode, release_mode, target)
+        let inc_flags = resolve_vendored_includes(used_deps, target)
         let lrc = do_link_target(output_path, c_path, link_flags, obj_files, inc_flags, debug_mode, release_mode, target)
         if lrc != 0 {
             return lrc
@@ -1053,7 +1096,7 @@ fn do_build(source_path: Str, output_path: Str, c_path: Str, format_flag: Str, d
     }
 
     let first_triple = resolve_target_triple(targets.get(0).unwrap())
-    let inc_flags = resolve_vendored_includes(has_sqlite, first_triple)
+    let inc_flags = resolve_vendored_includes(used_deps, first_triple)
     if json_output != 0 {
         io.print_raw("\{\"status\":\"ok\",\"outputs\":[")
     }
@@ -1061,8 +1104,8 @@ fn do_build(source_path: Str, output_path: Str, c_path: Str, format_flag: Str, d
     while i < targets.len() {
         let alias = targets.get(i).unwrap()
         let triple = resolve_target_triple(alias)
-        let link_flags = build_link_flags(triple, has_async, has_sqlite, ffi_libs)
-        let obj_files = resolve_vendored_objects(has_sqlite, debug_mode, release_mode, triple)
+        let link_flags = build_link_flags(triple, has_async, used_deps, ffi_libs)
+        let obj_files = resolve_vendored_objects(used_deps, debug_mode, release_mode, triple)
         let out = "{output_path}-{alias}"
         shell_exec("rm -f {out}")
         let lrc = do_link_target(out, c_path, link_flags, obj_files, inc_flags, debug_mode, release_mode, triple)

@@ -1,0 +1,202 @@
+// Registry of stdlib modules that pull in a vendored C source.
+//
+// "Peeled" modules are excluded from the stdlib archive monolith and
+// emitted into the user TU on demand: their bodies sit in the embedded
+// .bl registry, codegen drops them in when the user imports them, and
+// the link line pulls in the named native source iff the user actually
+// touched the module (detected via `BLINK_USE_<gate_macro>` macros that
+// codegen emits when an `@ffi` call lives in a registered module).
+//
+// `owner_module` is the module that owns the `@ffi` declarations
+// (e.g. "std/db_sqlite"). `transitive_modules` are modules whose bodies
+// reference the owner's types — they share the same fate (peel together
+// or the archive will link-fail on dangling refs).
+//
+// Add a new dep: append a `NativeDep` literal to `stdlib_native_deps()`,
+// drop the C source under `lib/native/<name>/`, and the build picks it
+// up. Taskfile cross-compile + install copy iterate this registry via
+// the `__native-deps` hidden CLI subcommand.
+
+type NativeDep {
+    name: Str
+    owner_module: Str
+    transitive_modules: List[Str]
+    source_paths: List[Str]
+    header_dir: Str
+    compile_defs: List[Str]
+    runtime_header: Str
+    gate_macro: Str
+    link_flag_dynamic: Str
+    ffi_symbol_prefix: Str
+}
+
+fn stdlib_native_deps() -> List[NativeDep] {
+    let mut out: List[NativeDep] = []
+    out.push(NativeDep {
+        name: "sqlite3",
+        owner_module: "std/db_sqlite",
+        transitive_modules: ["std/db_stmt", "std/db", "std/db_row", "std/db_error"],
+        source_paths: ["lib/native/sqlite3/sqlite3.c"],
+        header_dir: "lib/native/sqlite3",
+        compile_defs: ["-DSQLITE_THREADSAFE=1"],
+        runtime_header: "runtime_sqlite.h",
+        gate_macro: "BLINK_USE_SQLITE",
+        link_flag_dynamic: "-lsqlite3",
+        ffi_symbol_prefix: "blink_sqlite3_",
+    })
+    out
+}
+
+// Lookups return the dep `name` (e.g. "sqlite3") or empty string if not
+// found. Returning `Str` instead of `Option[NativeDep]` keeps the
+// per-module C aggregator headers from needing `NativeDep`'s typedef in
+// every TU — callers that need fields go back through the registry.
+pub fn stdlib_native_dep_name_by_module(module_key: Str) -> Str {
+    let deps = stdlib_native_deps()
+    let mut i = 0
+    while i < deps.len() {
+        let d = deps.get(i).unwrap()
+        if d.owner_module == module_key { return d.name }
+        let mut j = 0
+        while j < d.transitive_modules.len() {
+            if d.transitive_modules.get(j).unwrap() == module_key { return d.name }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    ""
+}
+
+// Fallback detector when the FFI declaration lives outside the registered
+// modules (e.g. compiler-internal probe code). The `blink_sqlite3_*`
+// prefix is unique enough to survive future additions.
+pub fn stdlib_native_dep_name_by_ffi_symbol(sym: Str) -> Str {
+    let deps = stdlib_native_deps()
+    let mut i = 0
+    while i < deps.len() {
+        let d = deps.get(i).unwrap()
+        if d.ffi_symbol_prefix != "" && sym.starts_with(d.ffi_symbol_prefix) { return d.name }
+        i = i + 1
+    }
+    ""
+}
+
+// Field accessors keyed on `name`. Return "" / empty list if not found.
+// Pull these instead of holding a NativeDep value to avoid leaking the
+// struct's typedef into TUs that only need a single field.
+pub fn stdlib_native_dep_gate_macro(name: Str) -> Str {
+    let deps = stdlib_native_deps()
+    let mut i = 0
+    while i < deps.len() {
+        let d = deps.get(i).unwrap()
+        if d.name == name { return d.gate_macro }
+        i = i + 1
+    }
+    ""
+}
+
+pub fn stdlib_native_dep_source_paths(name: Str) -> List[Str] {
+    let deps = stdlib_native_deps()
+    let mut i = 0
+    while i < deps.len() {
+        let d = deps.get(i).unwrap()
+        if d.name == name { return d.source_paths }
+        i = i + 1
+    }
+    []
+}
+
+pub fn stdlib_native_dep_header_dir(name: Str) -> Str {
+    let deps = stdlib_native_deps()
+    let mut i = 0
+    while i < deps.len() {
+        let d = deps.get(i).unwrap()
+        if d.name == name { return d.header_dir }
+        i = i + 1
+    }
+    ""
+}
+
+pub fn stdlib_native_dep_compile_defs(name: Str) -> List[Str] {
+    let deps = stdlib_native_deps()
+    let mut i = 0
+    while i < deps.len() {
+        let d = deps.get(i).unwrap()
+        if d.name == name { return d.compile_defs }
+        i = i + 1
+    }
+    []
+}
+
+pub fn stdlib_native_dep_link_flag_dynamic(name: Str) -> Str {
+    let deps = stdlib_native_deps()
+    let mut i = 0
+    while i < deps.len() {
+        let d = deps.get(i).unwrap()
+        if d.name == name { return d.link_flag_dynamic }
+        i = i + 1
+    }
+    ""
+}
+
+// All registered dep names — used by the CLI to populate native-dep
+// detection (`detect_native_deps`) and by the install pipeline to know
+// which `lib/native/<name>/` dirs to copy.
+pub fn stdlib_native_dep_names() -> List[Str] {
+    let deps = stdlib_native_deps()
+    let mut out: List[Str] = []
+    let mut i = 0
+    while i < deps.len() {
+        out.push(deps.get(i).unwrap().name)
+        i = i + 1
+    }
+    out
+}
+
+// Flat list of every module key (slash form) that gets peeled from the
+// archive. Passed to `build_stdlib_archive(peeled)` as the canonical
+// peel list. Order: owner first, then transitive — stable across builds
+// because `stdlib_native_deps()` is a fixed literal.
+pub fn peeled_module_keys() -> List[Str] {
+    let deps = stdlib_native_deps()
+    let mut out: List[Str] = []
+    let mut i = 0
+    while i < deps.len() {
+        let d = deps.get(i).unwrap()
+        out.push(d.owner_module)
+        let mut j = 0
+        while j < d.transitive_modules.len() {
+            out.push(d.transitive_modules.get(j).unwrap())
+            j = j + 1
+        }
+        i = i + 1
+    }
+    out
+}
+
+// Same list as `peeled_module_keys()` but in the dotted form
+// `synthesize_entry_source` consumes ("std.db_sqlite", not "std/db_sqlite").
+pub fn peeled_module_dotted() -> List[Str] {
+    let keys = peeled_module_keys()
+    let mut out: List[Str] = []
+    let mut i = 0
+    while i < keys.len() {
+        out.push(keys.get(i).unwrap().replace("/", "."))
+        i = i + 1
+    }
+    out
+}
+
+// Same list in the underscore form `cg_skip_modules` keys on
+// ("std_db_sqlite"). Used by `list_stdlib_module_keys` to subtract
+// peeled modules from the skip set so the user TU emits their bodies.
+pub fn peeled_module_underscored() -> List[Str] {
+    let keys = peeled_module_keys()
+    let mut out: List[Str] = []
+    let mut i = 0
+    while i < keys.len() {
+        out.push(keys.get(i).unwrap().replace("/", "_"))
+        i = i + 1
+    }
+    out
+}
