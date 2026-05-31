@@ -1350,6 +1350,12 @@ pub let mut scope_frame_starts: List[Int] = []
 // helpers and get_var_alias short-circuit when zero (the common case for
 // rare ctypes like CT_CLOSURE / CT_ITERATOR / CT_HANDLE).
 let mut scope_ct_counts: List[Int] = []
+// Side-index: name -> stack of scope_vars indices (most recent last). Lets
+// get_var_*/is_scope_var avoid linear-scanning scope_vars on every lookup.
+// Invariant: the top of the stack is the most-recently-pushed binding for
+// that name (shadowing semantics). Maintained by push_scope_var/pop_scope/
+// reset_scope_state.
+let mut scope_name_idx: Map[Str, List[Int]] = Map()
 
 fn scope_ct_count(ctype: Int) -> Int {
     if ctype < 0 || ctype >= scope_ct_counts.len() { return 0 }
@@ -1367,14 +1373,37 @@ fn bump_scope_ct(ctype: Int, delta: Int) {
 // Push a ScopeVar and bump its per-ctype counter atomically. Always use
 // this instead of scope_vars.push to keep scope_ct_counts in sync.
 fn push_scope_var(sv: ScopeVar) {
+    let idx = scope_vars.len()
+    let name = sv.name
     scope_vars.push(sv)
     bump_scope_ct(sv.ctype, 1)
+    match scope_name_idx.get(name) {
+        Some(stack) => { stack.push(idx) }
+        None => {
+            let s: List[Int] = [idx]
+            scope_name_idx.insert(name, s)
+        }
+    }
 }
 
 pub fn reset_scope_state() {
     scope_vars.clear()
     scope_frame_starts.clear()
     scope_ct_counts.clear()
+    scope_name_idx.clear()
+}
+
+// Topmost scope_vars index bound to `name`, or -1 if none. O(1) via scope_name_idx.
+fn find_scope_var(name: Str) -> Int {
+    match scope_name_idx.get(name) {
+        Some(stack) => {
+            let n = stack.len()
+            if n == 0 { return -1 }
+            return stack.get(n - 1).unwrap()
+        }
+        None => {}
+    }
+    -1
 }
 
 // ScopeVar.extra encoding for CT_PTR vars: "struct|arr|origin"
@@ -1642,6 +1671,10 @@ pub fn pop_scope() ! Codegen.Scope {
     while scope_vars.len() > start {
         let sv = scope_vars.get(scope_vars.len() - 1).unwrap()
         bump_scope_ct(sv.ctype, -1)
+        match scope_name_idx.get(sv.name) {
+            Some(stack) => { stack.pop() }
+            None => {}
+        }
         scope_vars.pop()
     }
     let ve_start = var_enum_frame_starts.get(var_enum_frame_starts.len() - 1).unwrap()
@@ -1656,26 +1689,15 @@ pub fn set_var(name: Str, ctype: Int, is_mut: Int) ! Codegen.Scope {
 }
 
 pub fn get_var_tp(name: Str) -> Int {
-    let mut i = scope_vars.len() - 1
-    while i >= 0 {
-        let sv = scope_vars.get(i).unwrap()
-        if sv.name == name {
-            return sv.tp_id
-        }
-        i = i - 1
+    let idx = find_scope_var(name)
+    if idx >= 0 {
+        return scope_vars.get(idx).unwrap().tp_id
     }
     type_int()
 }
 
 pub fn is_scope_var(name: Str) -> Int {
-    let mut i = scope_vars.len() - 1
-    while i >= 0 {
-        if scope_vars.get(i).unwrap().name == name {
-            return 1
-        }
-        i = i - 1
-    }
-    0
+    if find_scope_var(name) >= 0 { 1 } else { 0 }
 }
 
 pub fn get_var_type(name: Str) -> Int {
@@ -1683,13 +1705,9 @@ pub fn get_var_type(name: Str) -> Int {
 }
 
 fn get_var_mut(name: Str) -> Int {
-    let mut i = scope_vars.len() - 1
-    while i >= 0 {
-        let sv = scope_vars.get(i).unwrap()
-        if sv.name == name {
-            return sv.is_mut
-        }
-        i = i - 1
+    let idx = find_scope_var(name)
+    if idx >= 0 {
+        return scope_vars.get(idx).unwrap().is_mut
     }
     0
 }
@@ -1835,10 +1853,6 @@ fn update_sv_sname2(name: Str, ctype: Int, val: Str) {
         }
         i = i - 1
     }
-}
-
-fn set_var_full(name: Str, ctype: Int, is_mut: Int, inner1: Int, inner2: Int, sname: Str, sname2: Str, extra: Str) ! Codegen.Scope {
-    scope_vars.push(ScopeVar { name: name, ctype: ctype, is_mut: is_mut, inner1: inner1, inner2: inner2, sname: sname, sname2: sname2, extra: extra, tp_id: sv_tp(ctype, inner1, inner2, sname) })
 }
 
 pub fn list_contains_str(lst: List[Str], val: Str) -> Int {
