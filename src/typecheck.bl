@@ -187,6 +187,11 @@ let mut depr_type_nodes: Map[Str, Int] = Map()
 // Names of @ffi.struct types (consulted by is_valid_ptr_inner so Ptr[T] is allowed for them).
 let mut ffi_struct_type_set: Map[Str, Int] = Map()
 
+// Maps a type-alias name (e.g. `type Port = Int`) to its underlying type id.
+// Consulted by types_compatible so refinement aliases stay compatible with their base type.
+// Keyed by name (not type id) because type ids are pass-dependent across the dual codegen passes.
+let mut tc_alias_underlying: Map[Str, Int] = Map()
+
 // ── Import alias maps ──────────────────────────────────────────────
 pub let mut tc_alias_to_original: Map[Str, Str] = Map()
 let mut tc_original_to_alias: Map[Str, Str] = Map()
@@ -444,6 +449,39 @@ fn instantiate_return_type(sig: Int, args_sl: Int) -> Int ! TypeCheck.Resolve, T
     ret
 }
 
+fn is_int_literal_node(node: Int) -> Int {
+    if node_kind(node) == NodeKind.IntLit { return 1 }
+    if node_kind(node) == NodeKind.UnaryOp && node_op(node) == "-" {
+        let operand = node_left(node)
+        if operand != -1 && node_kind(operand) == NodeKind.IntLit { return 1 }
+    }
+    0
+}
+
+fn check_arg_shapes(fn_name: Str, sig: Int, args_sl: Int, node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    if args_sl == -1 { return }
+    let fs = fnsig_pool.get(sig).unwrap()
+    let param_start = fs.params_start
+    let param_count = fs.params_count
+    let n = sublist_length(args_sl)
+    let mut i = 0
+    while i < n {
+        if i < param_count {
+            let ptid = fnsig_param_list.get(param_start + i).unwrap()
+            let arg_node = sublist_get(args_sl, i)
+            let arg_t = infer_type(arg_node)
+            let mut lit_to_int = 0
+            if is_int_literal_node(arg_node) != 0 && is_integer_type(resolve_alias_tid(ptid)) != 0 {
+                lit_to_int = 1
+            }
+            if lit_to_int == 0 && types_compatible(arg_t, ptid) == 0 {
+                tc_error_at("argument {i + 1} of '{fn_name}' expects {type_to_str(ptid)}, got {type_to_str(arg_t)}", arg_node)
+            }
+        }
+        i = i + 1
+    }
+}
+
 // ── Error reporting ─────────────────────────────────────────────────
 
 fn tc_error(msg: Str) ! TypeCheck.Report, Diag.Report {
@@ -532,6 +570,17 @@ fn resolve_type_ann(ann_node: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
         }
         return make_set_type(TYPE_UNKNOWN)
     }
+    if name == "Tuple" {
+        if elems_sl != -1 && sublist_length(elems_sl) >= 1 {
+            let mut elem_types: List[Int] = []
+            let mut i = 0
+            while i < sublist_length(elems_sl) {
+                elem_types.push(resolve_type_ann(sublist_get(elems_sl, i)))
+                i = i + 1
+            }
+            return make_tuple_type(elem_types)
+        }
+    }
     if name == "Bytes" {
         return new_type(TK_BYTES, "Bytes")
     }
@@ -615,6 +664,10 @@ fn register_struct_type(td: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.R
     named_type_names.push(name)
     named_type_ids.push(tid)
     named_type_map.insert(name, tid)
+    let alias_ann = node_value(td)
+    if alias_ann != -1 {
+        tc_alias_underlying.insert(name, resolve_type_ann(alias_ann))
+    }
     if type_has_derive_hash(td) != 0 {
         tc_hashable_types.insert(name, 1)
     }
@@ -1735,6 +1788,7 @@ fn init_types() ! TypeCheck.Register {
     named_type_ids.clear()
     named_type_map.clear()
     tc_hashable_types.clear()
+    tc_alias_underlying = Map()
     sfield_pool.clear()
     nr_callable_field_names.clear()
     evar_pool.clear()
@@ -4078,7 +4132,16 @@ fn nr_check_pattern(node: Int) ! TypeCheck.Resolve, Diag.Report {
 
 // ── Phase 2: Type compatibility ─────────────────────────────────────
 
-fn types_compatible(a: Int, b: Int) -> Int {
+fn resolve_alias_tid(tid: Int) -> Int {
+    if tc_alias_underlying.len() == 0 { return tid }
+    if tid < 0 || tid >= ty_pool.len() { return tid }
+    let name = ty_pool.get(tid).unwrap().name
+    tc_alias_underlying.get(name) ?? tid
+}
+
+fn types_compatible(a0: Int, b0: Int) -> Int {
+    let a = resolve_alias_tid(a0)
+    let b = resolve_alias_tid(b0)
     if a == b { return 1 }
     if a == TYPE_UNKNOWN || b == TYPE_UNKNOWN { return 1 }
     if a < 0 || b < 0 { return 1 }
@@ -4107,6 +4170,17 @@ fn types_compatible(a: Int, b: Int) -> Int {
         if ka == TK_RESULT {
             if types_compatible(ta.inner1, tb.inner1) == 0 { return 0 }
             return types_compatible(ta.inner2, tb.inner2)
+        }
+        if ka == TK_TUPLE {
+            if ta.params_count != tb.params_count { return 0 }
+            let mut i = 0
+            while i < ta.params_count {
+                let ea = ty_param_list.get(ta.params_start + i).unwrap()
+                let eb = ty_param_list.get(tb.params_start + i).unwrap()
+                if types_compatible(ea, eb) == 0 { return 0 }
+                i = i + 1
+            }
+            return 1
         }
         if ka == TK_STRUCT || ka == TK_ENUM {
             return 0
@@ -4462,6 +4536,7 @@ fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repo
                         let expected = fs.params_count
                         tc_error_at("function '{fn_name}' expects {expected} argument(s), got {arg_count}", node)
                     }
+                    check_arg_shapes(fn_name, sig, args_sl, node)
                     if fs.type_params_count > 0 {
                         return instantiate_return_type(sig, args_sl)
                     }

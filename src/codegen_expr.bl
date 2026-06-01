@@ -9,7 +9,7 @@ import codegen_types.{
     cg_async_scope_counter, cg_async_scope_stack,
     cg_closure_cap_count, cg_closure_cap_start, cg_closure_defs,
     cg_current_fn_has_ev, cg_current_fn_name, cg_current_fn_node, cg_current_fn_option_inner, cg_current_fn_option_inner_struct, cg_current_fn_ret, cg_in_test_body,
-    cg_let_target_ann,
+    cg_let_target_ann, cg_expect_arg_ann,
     cg_mono_tparams_sl, cg_mono_concrete_args,
     cg_debug_mode, cg_handler_body_field, cg_handler_body_idx,
     cg_handler_body_is_ue, cg_handler_body_vtable_type,
@@ -186,6 +186,23 @@ fn emit_ok_result(ok_str: Str, ok_type: Int, err_type: Int, ok_s: Str, err_s: St
     }
 }
 
+fn emit_err_result(err_str: Str, ok_type: Int, err_type: Int, ok_s: Str, err_s: Str) {
+    if ok_s != "" || err_s != "" {
+        ensure_mixed_result_type(ok_type, err_type, ok_s, err_s)
+        let res_type = result_c_type_mixed(ok_type, err_type, ok_s, err_s)
+        expr_result_str = "({res_type})\{.tag = 1, .err = {err_str}}"
+    } else {
+        ensure_result_type(ok_type, err_type)
+        let res_type = result_c_type(ok_type, err_type)
+        expr_result_str = "({res_type})\{.tag = 1, .err = {err_str}}"
+    }
+    expr_result_type = CT_RESULT
+    expr_result_ok_type = ok_type
+    expr_result_err_type = err_type
+    expr_result_ok_struct = ok_s
+    expr_result_err_struct = err_s
+}
+
 // Struct/enum err types fall back to a placeholder until Display lands (br 4q2etk).
 fn test_render_err_message(err_ct: Int, err_struct: Str, err_expr: Str) -> Str ! Codegen.Emit {
     if err_ct == CT_STRING || err_ct == CT_INT || err_ct == CT_FLOAT || err_ct == CT_BOOL || err_ct == CT_CHAR {
@@ -338,6 +355,12 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
             return
         }
         if name == "None" {
+            let expect_struct = expect_arg_option_inner_struct()
+            if expect_struct != "" {
+                set_bare_none_struct_result(expect_struct)
+                expr_option_is_none = 1
+                return
+            }
             let fsi = get_fn_ret_struct_inner(cg_current_fn_name)
             let fn_rt = get_fn_ret_type(cg_current_fn_name)
             if fsi.ok_struct != "" && cg_current_fn_ret == CT_OPTION {
@@ -2077,12 +2100,41 @@ type ArgMapInfo {
     vs: Str
 }
 
+// Carrier type for one side of a Result/Option from a type-annotation element
+// name: a struct/enum name carries as CT_INT with sname set; everything else
+// carries as `fallback` with no struct.
+type CarrierType {
+    sname: Str
+    ct: Int
+}
+
+fn carrier_from_elem_name(name: Str, fallback: Int) -> CarrierType {
+    if is_struct_type(name) != 0 || is_enum_type(name) != 0 {
+        return CarrierType { sname: name, ct: CT_INT }
+    }
+    CarrierType { sname: "", ct: fallback }
+}
+
 pub fn arg_map_info_for(arg_node: Int, rt: Int) -> ArgMapInfo {
     if rt != CT_MAP || node_kind(arg_node) != NodeKind.Ident {
         return ArgMapInfo { kt: -1, ks: "", vt: -1, vs: "" }
     }
     let nm = node_name(arg_node)
     ArgMapInfo { kt: get_map_key_type(nm), ks: get_map_key_struct(nm), vt: get_map_value_type(nm), vs: get_map_value_struct(nm) }
+}
+
+// Resolves the inner struct/enum name from the expected call-argument annotation
+// (cg_expect_arg_ann) when it is `Option[Struct]`/`Result[Struct, _]`. Lets bare
+// carrier constructors at a call site pick the parameter's expected carrier.
+// Returns "" when there is no struct-typed carrier to adopt.
+fn expect_arg_option_inner_struct() -> Str {
+    if cg_expect_arg_ann == -1 { return "" }
+    if node_name(cg_expect_arg_ann) != "Option" { return "" }
+    let elems = node_elements(cg_expect_arg_ann)
+    if elems == -1 || sublist_length(elems) < 1 { return "" }
+    let inner = node_name(sublist_get(elems, 0))
+    if is_struct_type(inner) != 0 || is_enum_type(inner) != 0 { return inner }
+    ""
 }
 
 // Returns the closure-signature string for the i-th formal when it has a
@@ -2104,6 +2156,24 @@ pub fn arg_fn_value_hint(params_sl: Int, i: Int) -> Str {
         return ""
     }
     build_closure_sig_from_type_ann(ta)
+}
+
+// Returns the i-th callee parameter's type-annotation node, or -1.
+pub fn arg_type_ann_at(params_sl: Int, i: Int) -> Int {
+    if params_sl == -1 { return -1 }
+    if i < 0 || i >= sublist_length(params_sl) { return -1 }
+    node_type_ann(sublist_get(params_sl, i))
+}
+
+// When cg_expect_arg_ann is `Result[Ok, Err]`, returns the element annotation at
+// `slot` (0 = Ok, 1 = Err), else -1. Lets Ok/Err constructors at a call site
+// adopt the parameter's expected Result inner types.
+fn expect_arg_result_elem(slot: Int) -> Int {
+    if cg_expect_arg_ann == -1 { return -1 }
+    if node_name(cg_expect_arg_ann) != "Result" { return -1 }
+    let elems = node_elements(cg_expect_arg_ann)
+    if elems == -1 || sublist_length(elems) < 2 { return -1 }
+    sublist_get(elems, slot)
 }
 
 // Returns 0 if type-arg inference yields None so the caller can fall through
@@ -2732,6 +2802,21 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
         if fn_name == "Ok" {
             let args_sl = node_args(node)
             let arity = if args_sl != -1 { sublist_length(args_sl) } else { 0 }
+            let exp_ok_ann = expect_arg_result_elem(0)
+            if exp_ok_ann != -1 && arity > 0 {
+                let exp_err_ann = expect_arg_result_elem(1)
+                let ok_name = node_name(exp_ok_ann)
+                let err_name = node_name(exp_err_ann)
+                let saved_arg_ann = cg_expect_arg_ann
+                cg_expect_arg_ann = -1
+                emit_expr(sublist_get(args_sl, 0))
+                cg_expect_arg_ann = saved_arg_ann
+                let ok_str = expr_result_str
+                let ok_c = carrier_from_elem_name(ok_name, expr_result_type)
+                let err_c = carrier_from_elem_name(err_name, type_from_name(err_name))
+                emit_ok_result(ok_str, ok_c.ct, err_c.ct, ok_c.sname, err_c.sname)
+                return
+            }
             if arity == 0 {
                 let fn_rt = get_fn_ret_type(cg_current_fn_name)
                 let mut ok_type = CT_VOID
@@ -2816,6 +2901,21 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
         }
         if fn_name == "Err" {
             let args_sl = node_args(node)
+            let exp_err_result_ann = expect_arg_result_elem(0)
+            if exp_err_result_ann != -1 && args_sl != -1 && sublist_length(args_sl) > 0 {
+                let exp_err_ann = expect_arg_result_elem(1)
+                let ok_name = node_name(exp_err_result_ann)
+                let err_name = node_name(exp_err_ann)
+                let saved_arg_ann = cg_expect_arg_ann
+                cg_expect_arg_ann = -1
+                emit_expr(sublist_get(args_sl, 0))
+                cg_expect_arg_ann = saved_arg_ann
+                let err_str = expr_result_str
+                let ok_c = carrier_from_elem_name(ok_name, type_from_name(ok_name))
+                let err_c = carrier_from_elem_name(err_name, expr_result_type)
+                emit_err_result(err_str, ok_c.ct, err_c.ct, ok_c.sname, err_c.sname)
+                return
+            }
             if args_sl != -1 && sublist_length(args_sl) > 0 {
                 emit_expr(sublist_get(args_sl, 0))
                 let err_str = expr_result_str
@@ -3017,7 +3117,10 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                 }
                 let saved_hint = cg_expect_fn_value_sig
                 cg_expect_fn_value_sig = arg_fn_value_hint(callee_params_sl, i)
+                let saved_arg_ann = cg_expect_arg_ann
+                cg_expect_arg_ann = arg_type_ann_at(callee_params_sl, i)
                 emit_expr(actual)
+                cg_expect_arg_ann = saved_arg_ann
                 cg_expect_fn_value_sig = saved_hint
                 args_str = args_str.concat(expr_result_str)
                 if is_generic != 0 {
@@ -3042,7 +3145,10 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                 let arg_node_i = sublist_get(args_sl, i)
                 let saved_hint = cg_expect_fn_value_sig
                 cg_expect_fn_value_sig = arg_fn_value_hint(callee_params_sl, i)
+                let saved_arg_ann = cg_expect_arg_ann
+                cg_expect_arg_ann = arg_type_ann_at(callee_params_sl, i)
                 emit_expr(arg_node_i)
+                cg_expect_arg_ann = saved_arg_ann
                 cg_expect_fn_value_sig = saved_hint
                 args_str = args_str.concat(expr_result_str)
                 if is_generic != 0 {
