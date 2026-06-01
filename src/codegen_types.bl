@@ -2194,8 +2194,10 @@ pub fn resolve_ret_type_from_ann(fn_node: Int) -> Str {
     }
     if ret_str == "Tuple" {
         if ta != -1 {
-            let tn = resolve_tuple_ann(ta, -1, "").unwrap()
-            return c_type_c_name(tn)
+            let tn_opt = resolve_tuple_ann(ta, -1, "")
+            if tn_opt.is_some() {
+                return c_type_c_name(tn_opt.unwrap())
+            }
         }
     }
     if ret_str == "Ptr" {
@@ -2293,6 +2295,9 @@ pub fn resolve_tuple_ann(ta: Int, tparams_sl: Int, concrete_args: Str) -> Option
         let elem_name_raw = node_name(elem_ann)
         let elem_name = resolve_tparam(elem_name_raw, tparams_sl, concrete_args)
         let elem_t = type_from_name(elem_name)
+        if elem_t == CT_VOID && is_struct_type(elem_name) == 0 && is_enum_type(elem_name) == 0 {
+            return None
+        }
         if i > 0 {
             tags = tags.concat("_")
             elem_types_enc = elem_types_enc.concat(",")
@@ -4835,6 +4840,64 @@ pub fn set_var_result_from_struct_tag(name: Str, fs: Str) {
         } else {
             set_var_result(name, ok_ct, err_ct)
         }
+    }
+}
+
+// Convert an annotation-form type string (`Option[Str]`, `Result[Int, Str]`,
+// `Map[Str, Str]`, `Foo`, `Int`) into its carrier/struct tag form
+// (`Option_str`, `Result_int_str`, `Map_str_str`, `Foo`, `int`). Recurses on
+// nested compound inners so the tag matches the emitted typedef.
+fn compound_tag_from_type_str(s: Str) -> Str {
+    let ct = type_from_name(s)
+    let bracket_pos = s.index_of("[")
+    if is_compound_ct(ct) != 0 && bracket_pos > 0 {
+        let inner = s.substr(bracket_pos + 1, s.len() - bracket_pos - 2)
+        let parts = split_top_level_commas(inner)
+        if ct == CT_OPTION && parts.len() >= 1 {
+            return "Option_{compound_tag_from_type_str(parts.get(0).unwrap())}"
+        } else if ct == CT_RESULT && parts.len() >= 2 {
+            return "Result_{compound_tag_from_type_str(parts.get(0).unwrap())}_{compound_tag_from_type_str(parts.get(1).unwrap())}"
+        } else if ct == CT_MAP && parts.len() >= 2 {
+            return "Map_{compound_tag_from_type_str(parts.get(0).unwrap())}_{compound_tag_from_type_str(parts.get(1).unwrap())}"
+        }
+    }
+    let bare = strip_module_qualifier(s)
+    if is_struct_type(bare) != 0 || is_enum_type(bare) != 0 {
+        return bare
+    }
+    c_type_tag(ct)
+}
+
+fn split_top_level_commas(s: Str) -> List[Str] {
+    let mut out: List[Str] = []
+    let mut seg_start = 0
+    let mut depth = 0
+    let mut i = 0
+    while i < s.len() {
+        let b = s.byte_at(i)
+        if b == 91 {
+            depth = depth + 1
+        } else if b == 93 {
+            depth = depth - 1
+        } else if b == 44 && depth == 0 {
+            out.push(s.substr(seg_start, i - seg_start).trim())
+            seg_start = i + 1
+        }
+        i = i + 1
+    }
+    out.push(s.substr(seg_start, s.len() - seg_start).trim())
+    out
+}
+
+// Register compound-carrier inner-type metadata on a bound variable from its
+// annotation-form field type string (`Option[Str]`, `Result[Int, Str]`).
+pub fn register_var_compound_inner_from_str(name: Str, type_str: Str) {
+    let ct = type_from_name(type_str)
+    let tag = compound_tag_from_type_str(type_str)
+    if ct == CT_OPTION && tag.starts_with("Option_") {
+        set_var_option_from_struct_tag(name, tag)
+    } else if ct == CT_RESULT && tag.starts_with("Result_") {
+        set_var_result_from_struct_tag(name, tag)
     }
 }
 

@@ -23,7 +23,7 @@ import codegen_types.{
     emit_arena_restore_helper, emit_bh_cleanup_for_type, emit_cl_cleanup_for_type, emit_ev_restore_helper, emit_handle_cleanup, emit_line, ev_field, fn_node_has_effects,
     cg_archive_build_mode, cg_archive_header_mode, cg_user_tu_mode, in_per_module_object,
     emit_struct_option_typedef, emit_td_guard_open, emit_td_guard_close,
-    emitted_let_names, emitted_let_set, ensure_iter_type,
+    emitted_let_names, emitted_let_set, ensure_compound_type_from_ann, ensure_iter_type,
     ensure_option_type, ensure_range_iter, ensure_result_type,
     ensure_str_iter, ensure_struct_option_type, ensure_struct_result_type,
     enum_reg_set, enum_regs, enum_str_backed_set, enum_variants,
@@ -48,7 +48,7 @@ import codegen_types.{
     lookup_assoc_type, lookup_impl_type_for_trait, mangle_generic_name, mangle_impl_method, match_scrut_enum,
     match_scruts, mono_fns, mono_instances, mono_name_from_ann, mut_captured_vars, option_c_type,
     option_c_type_mixed, pop_scope, ptr_inner_c_type, push_scope,
-    reg_sf_entry, resolve_effect_field, resolve_effect_is_ue, resolve_effect_vtable,
+    reg_sf_entry, register_var_compound_inner_from_str, resolve_effect_field, resolve_effect_is_ue, resolve_effect_vtable,
     resolve_import_alias, resolve_option_inner_from_ann, resolve_ret_type_from_ann,
     resolve_self_type, resolve_tparam, resolve_tuple_ann, resolve_variant, result_c_type,
     result_c_type_mixed, set_list_elem_struct, set_list_elem_type,
@@ -809,17 +809,29 @@ fn pattern_condition(pat: Int, scrut_off: Int, scrut_len: Int) -> Str {
         if flds_sl == -1 {
             return ""
         }
+        let scrut = match_scruts.get(scrut_off).unwrap().str_val
+        // A bare `Variant { .. }` pattern is parsed as StructPattern; when the
+        // name resolves to a data-enum variant, gate on the tag and read any
+        // sub-field conditions through the variant member.
+        let sp_variant = node_type_name(pat)
+        let sp_enum = resolve_variant(sp_variant)
+        let sp_is_enum = sp_enum != "" && is_data_enum(sp_enum) != 0
         let mut parts = ""
         let mut _parts_n = 0
-        let scrut = match_scruts.get(scrut_off).unwrap().str_val
+        if sp_is_enum {
+            let tag = get_variant_tag(sp_enum, sp_variant)
+            parts = "({scrut}.tag == {tag})"
+            _parts_n = 1
+        }
         let mut j = 0
         while j < sublist_length(flds_sl) {
             let sf = sublist_get(flds_sl, j)
             let fname = node_name(sf)
             let fpat = node_pattern(sf)
             if fpat != -1 {
+                let field_scrut = if sp_is_enum { "{scrut}.data.{sp_variant}.{fname}" } else { "{scrut}.{fname}" }
                 let saved_scruts = match_scruts
-                match_scruts = [MatchScrutEntry { str_val: "{scrut}.{fname}", scrut_type: CT_VOID }]
+                match_scruts = [MatchScrutEntry { str_val: field_scrut, scrut_type: CT_VOID }]
                 let sub_cond = pattern_condition(fpat, 0, 1)
                 match_scruts = saved_scruts
                 if sub_cond != "" {
@@ -932,6 +944,80 @@ fn pattern_condition(pat: Int, scrut_off: Int, scrut_len: Int) -> Str {
         return parts
     }
     ""
+}
+
+// Bind the named fields of a struct-style enum variant pattern
+// (`Variant { field, field2: pat, .. }`) through the variant member
+// (`{scrut}.data.{variant}.{field}`). Shared by the qualified
+// `Type.Variant { .. }` EnumPattern path and the bare `Variant { .. }`
+// StructPattern path so both lower identically.
+@allow(UnrestoredMutation, IncompleteStateRestore)
+fn bind_struct_style_variant_fields(vidx: Int, fcount: Int, resolved_enum: Str, resolved_variant: Str, scrut: Str, flds_sl: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
+    let mut sfi = 0
+    while sfi < sublist_length(flds_sl) {
+        let sf_node = sublist_get(flds_sl, sfi)
+        let field_name = node_name(sf_node)
+        let fpat_node = node_pattern(sf_node)
+        let mut found_ft = ""
+        let mut vfi = 0
+        while vfi < fcount {
+            let vfn = get_variant_field_name(vidx, vfi)
+            if vfn.is_some() && vfn.unwrap() == field_name {
+                let vft = get_variant_field_type_str(vidx, vfi)
+                if vft.is_some() {
+                    found_ft = vft.unwrap()
+                }
+                break
+            }
+            vfi = vfi + 1
+        }
+        let field_ct = type_from_name(found_ft)
+        if fpat_node != -1 {
+            let saved_scruts = match_scruts
+            match_scruts = [MatchScrutEntry { str_val: "{scrut}.data.{resolved_variant}.{field_name}", scrut_type: field_ct }]
+            bind_pattern_vars(fpat_node, 0, 1)
+            match_scruts = saved_scruts
+        } else {
+            let c_bind = c_safe_name(field_name)
+            if found_ft == resolved_enum {
+                let fc_name = c_type_c_name(found_ft)
+                emit_line("{fc_name} {c_bind} = *({fc_name}*)(intptr_t){scrut}.data.{resolved_variant}.{field_name};")
+                set_var(field_name, CT_VOID, 0)
+                set_var_struct(field_name, found_ft)
+                var_enums.push(VarEnumEntry { name: field_name, enum_type: found_ft })
+            } else if is_struct_type(found_ft) != 0 {
+                emit_line("{c_type_c_name(found_ft)} {c_bind} = {scrut}.data.{resolved_variant}.{field_name};")
+                set_var(field_name, CT_VOID, 0)
+                set_var_struct(field_name, found_ft)
+            } else if is_enum_type(found_ft) != 0 {
+                emit_line("{c_type_c_name(found_ft)} {c_bind} = {scrut}.data.{resolved_variant}.{field_name};")
+                set_var(field_name, CT_INT, 0)
+                var_enums.push(VarEnumEntry { name: field_name, enum_type: found_ft })
+            } else if field_ct == CT_LIST {
+                emit_line("blink_list* {c_bind} = {scrut}.data.{resolved_variant}.{field_name};")
+                set_var(field_name, CT_LIST, 0)
+                let bracket_pos = found_ft.index_of("[")
+                if bracket_pos > 0 {
+                    let inner_name = found_ft.substr(bracket_pos + 1, found_ft.len() - bracket_pos - 2)
+                    let inner_ct = type_from_name(inner_name)
+                    if inner_ct != CT_VOID {
+                        set_list_elem_type(field_name, inner_ct)
+                    } else if is_enum_type(inner_name) != 0 || is_struct_type(inner_name) != 0 {
+                        set_list_elem_struct(field_name, inner_name)
+                        set_list_elem_type(field_name, CT_VOID)
+                    }
+                }
+            } else if field_ct == CT_OPTION || field_ct == CT_RESULT {
+                emit_line("__typeof__({scrut}.data.{resolved_variant}.{field_name}) {c_bind} = {scrut}.data.{resolved_variant}.{field_name};")
+                set_var(field_name, field_ct, 0)
+                register_var_compound_inner_from_str(field_name, found_ft)
+            } else {
+                emit_line("{c_type_str(field_ct)} {c_bind} = {scrut}.data.{resolved_variant}.{field_name};")
+                set_var(field_name, field_ct, 0)
+            }
+        }
+        sfi = sfi + 1
+    }
 }
 
 // Emit C variable bindings for ident sub-patterns within a pattern.
@@ -1073,68 +1159,7 @@ fn bind_pattern_vars(pat: Int, scrut_off: Int, scrut_len: Int) ! Codegen.Emit, C
                 let scrut = match_scruts.get(scrut_off).unwrap().str_val
                 let is_struct_pat = node_int_val(pat)
                 if is_struct_pat != 0 {
-                    // Struct-style pattern: { field, field2 } — bind by field name
-                    let mut sfi = 0
-                    while sfi < sublist_length(ep_flds_sl) {
-                        let sf_node = sublist_get(ep_flds_sl, sfi)
-                        let field_name = node_name(sf_node)
-                        let fpat_node = node_pattern(sf_node)
-                        let mut found_ft = ""
-                        let mut vfi = 0
-                        while vfi < fcount {
-                            let vfn = get_variant_field_name(vidx, vfi)
-                            if vfn.is_some() && vfn.unwrap() == field_name {
-                                let vft = get_variant_field_type_str(vidx, vfi)
-                                if vft.is_some() {
-                                    found_ft = vft.unwrap()
-                                }
-                                break
-                            }
-                            vfi = vfi + 1
-                        }
-                        let field_ct = type_from_name(found_ft)
-                        if fpat_node != -1 {
-                            let saved_scruts = match_scruts
-                            match_scruts = [MatchScrutEntry { str_val: "{scrut}.data.{resolved_variant}.{field_name}", scrut_type: field_ct }]
-                            bind_pattern_vars(fpat_node, 0, 1)
-                            match_scruts = saved_scruts
-                        } else {
-                            let c_bind = c_safe_name(field_name)
-                            if found_ft == resolved_enum {
-                                let fc_name = c_type_c_name(found_ft)
-                                emit_line("{fc_name} {c_bind} = *({fc_name}*)(intptr_t){scrut}.data.{resolved_variant}.{field_name};")
-                                set_var(field_name, CT_VOID, 0)
-                                set_var_struct(field_name, found_ft)
-                                var_enums.push(VarEnumEntry { name: field_name, enum_type: found_ft })
-                            } else if is_struct_type(found_ft) != 0 {
-                                emit_line("{c_type_c_name(found_ft)} {c_bind} = {scrut}.data.{resolved_variant}.{field_name};")
-                                set_var(field_name, CT_VOID, 0)
-                                set_var_struct(field_name, found_ft)
-                            } else if is_enum_type(found_ft) != 0 {
-                                emit_line("{c_type_c_name(found_ft)} {c_bind} = {scrut}.data.{resolved_variant}.{field_name};")
-                                set_var(field_name, CT_INT, 0)
-                                var_enums.push(VarEnumEntry { name: field_name, enum_type: found_ft })
-                            } else if field_ct == CT_LIST {
-                                emit_line("blink_list* {c_bind} = {scrut}.data.{resolved_variant}.{field_name};")
-                                set_var(field_name, CT_LIST, 0)
-                                let bracket_pos = found_ft.index_of("[")
-                                if bracket_pos > 0 {
-                                    let inner_name = found_ft.substr(bracket_pos + 1, found_ft.len() - bracket_pos - 2)
-                                    let inner_ct = type_from_name(inner_name)
-                                    if inner_ct != CT_VOID {
-                                        set_list_elem_type(field_name, inner_ct)
-                                    } else if is_enum_type(inner_name) != 0 || is_struct_type(inner_name) != 0 {
-                                        set_list_elem_struct(field_name, inner_name)
-                                        set_list_elem_type(field_name, CT_VOID)
-                                    }
-                                }
-                            } else {
-                                emit_line("{c_type_str(field_ct)} {c_bind} = {scrut}.data.{resolved_variant}.{field_name};")
-                                set_var(field_name, field_ct, 0)
-                            }
-                        }
-                        sfi = sfi + 1
-                    }
+                    bind_struct_style_variant_fields(vidx, fcount, resolved_enum, resolved_variant, scrut, ep_flds_sl)
                 } else {
                     let mut fi = 0
                     while fi < sublist_length(ep_flds_sl) && fi < fcount {
@@ -1175,6 +1200,10 @@ fn bind_pattern_vars(pat: Int, scrut_off: Int, scrut_len: Int) ! Codegen.Emit, C
                                             set_list_elem_type(bind_name, CT_VOID)
                                         }
                                     }
+                                } else if field_ct == CT_OPTION || field_ct == CT_RESULT {
+                                    emit_line("__typeof__({scrut}.data.{resolved_variant}.{field_name}) {c_bind} = {scrut}.data.{resolved_variant}.{field_name};")
+                                    set_var(bind_name, field_ct, 0)
+                                    register_var_compound_inner_from_str(bind_name, field_type_name)
                                 } else {
                                     emit_line("{c_type_str(field_ct)} {c_bind} = {scrut}.data.{resolved_variant}.{field_name};")
                                     set_var(bind_name, field_ct, 0)
@@ -1218,6 +1247,17 @@ fn bind_pattern_vars(pat: Int, scrut_off: Int, scrut_len: Int) ! Codegen.Emit, C
         }
         let scrut = match_scruts.get(scrut_off).unwrap().str_val
         let stype_name = node_type_name(pat)
+        // A bare `Variant { .. }` pattern is parsed as StructPattern; route it
+        // through the variant member when the name resolves to a data-enum variant.
+        let sp_enum = resolve_variant(stype_name)
+        if sp_enum != "" && is_data_enum(sp_enum) != 0 {
+            let vidx = get_variant_index(sp_enum, stype_name)
+            if vidx >= 0 {
+                let fcount = get_variant_field_count(vidx)
+                bind_struct_style_variant_fields(vidx, fcount, sp_enum, stype_name, scrut, flds_sl)
+            }
+            return
+        }
         let mut j = 0
         while j < sublist_length(flds_sl) {
             let sf = sublist_get(flds_sl, j)
@@ -1965,6 +2005,10 @@ fn emit_tuple_destructure(pat_node: Int, source_var: Str, struct_name: Str, is_m
     let mut di = 0
     while di < sublist_length(elems_sl) {
         let sub_pat = sublist_get(elems_sl, di)
+        if node_kind(sub_pat) == NodeKind.WildcardPattern {
+            di = di + 1
+            continue
+        }
         let elem_name = node_name(sub_pat)
         let field_name = "_{di}"
         let ft = get_struct_field_type(struct_name, field_name)
@@ -2030,6 +2074,9 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
     let mut name = node_name(node)
     if name == "_destructure" {
         name = fresh_temp("_destr")
+    }
+    if name == "_" {
+        name = fresh_temp("_unused")
     }
     let is_mut = node_is_mut(node)
     set_var(name, val_type, is_mut)
@@ -4849,6 +4896,13 @@ fn build_closure_sig_resolved_mono(ta: Int, tparams_sl: Int, concrete_args: Str)
                 sig_params = sig_params.concat(c_type_c_name(ename))
             } else if is_struct_type(ename) != 0 {
                 sig_params = sig_params.concat(c_type_c_name(ename))
+            } else if ename == "Tuple" {
+                let tup_opt = resolve_tuple_ann(elem, tparams_sl, concrete_args)
+                if tup_opt.is_some() {
+                    sig_params = sig_params.concat(c_type_c_name(tup_opt.unwrap()))
+                } else {
+                    sig_params = sig_params.concat("void")
+                }
             } else {
                 sig_params = sig_params.concat(c_type_str(type_from_name(ename)))
             }
@@ -4860,6 +4914,14 @@ fn build_closure_sig_resolved_mono(ta: Int, tparams_sl: Int, concrete_args: Str)
         ret_str = c_type_c_name(ret_name)
     } else if is_enum_type(ret_name) != 0 {
         ret_str = c_type_c_name(ret_name)
+    } else if ret_name == "Tuple" {
+        let ret_ann = node_type_ann(ta)
+        if ret_ann != -1 {
+            let tup_opt = resolve_tuple_ann(ret_ann, tparams_sl, concrete_args)
+            if tup_opt.is_some() {
+                ret_str = c_type_c_name(tup_opt.unwrap())
+            }
+        }
     }
     "{ret_str}(*)({sig_params})"
 }
@@ -5240,8 +5302,13 @@ pub fn emit_struct_typedef(td_node: Int) ! Codegen.Emit, Diag.Report {
                 reg_sf_entry(name, fname, CT_VOID, type_name, sv_tp(CT_VOID, -1, -1, type_name))
             } else {
                 let ct = type_from_name(type_name)
-                emit_line("{c_type_str(ct)} {fname};")
                 let field_tp = tp_from_ann(type_ann_node)
+                if ct == CT_OPTION || ct == CT_RESULT {
+                    ensure_compound_type_from_ann(type_ann_node)
+                    emit_line("{c_type_c_name(compound_name_from_ann(type_ann_node))} {fname};")
+                } else {
+                    emit_line("{c_type_str(ct)} {fname};")
+                }
                 reg_sf_entry(name, fname, ct, "", field_tp)
             }
         } else {
@@ -5441,7 +5508,13 @@ pub fn emit_enum_typedef(td_node: Int) ! Codegen.Emit {
                                 vf_c_type = "{c_type_c_name(vf_type_name)}"
                             }
                         } else {
-                            vf_c_type = c_type_str(type_from_name(vf_type_name))
+                            let vf_ct = type_from_name(vf_type_name)
+                            if vf_ct == CT_OPTION || vf_ct == CT_RESULT {
+                                ensure_compound_type_from_ann(vf_type_ann)
+                                vf_c_type = c_type_c_name(compound_name_from_ann(vf_type_ann))
+                            } else {
+                                vf_c_type = c_type_str(vf_ct)
+                            }
                         }
                     }
                     emit_line("{vf_c_type} {vf_name};")
