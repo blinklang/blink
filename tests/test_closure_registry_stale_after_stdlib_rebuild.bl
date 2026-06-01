@@ -1,0 +1,29 @@
+// Regression for b76a1j: closure codegen registries (closure_captures,
+// closure_cap_infos, closure_lit_cap_idx) must be cleared between the two
+// in-process compiles a single `blink test --json` performs (stdlib archive
+// build then fixture), mirroring the ms8q16 fn_node_registry fix.
+//
+// closure_lit_cap_idx maps an AST-node-id to an absolute index into
+// closure_cap_infos; closure_cap_infos[i].start indexes closure_captures. If the
+// registries are not cleared, compile #2 accumulates on top of compile #1's
+// entries — the hazard is a node-id reused across compiles resolving to a stale
+// cap-info index in the `with arena { closure }` promotion path.
+//
+// BLINK_FORCE_STDLIB_REBUILD=1 forces compile #1 ahead of compile #2 in the SAME
+// process. We assert the fixture (a capturing closure passed to for_each) builds
+// and runs correctly under the forced rebuild — the captured value must survive.
+// The child runs in an isolated scratch cwd with its own build/ so the forced
+// rebuild writes build/std-cache there instead of clobbering the shared archive.
+test "stale closure registries do not survive in-process stdlib rebuild" {
+    let root = process_run("sh", ["-c", "pwd -P"]).out.trim()
+    let scratch = "{root}/.tmp/_test_clreg_{getpid()}"
+    shell_exec("rm -rf {scratch}")
+    shell_exec("mkdir -p {scratch}/build")
+    write_file("{scratch}/fe.bl", "import std.testing.\{for_each\}\n\ntest \"f\" \{\n    let base = 100\n    for_each([(\"a\", 1), (\"b\", 2)], fn(v: Int) \{ assert(v + base > base, \"capture lost\") \})\n\}\n")
+    let cmd = "cd {scratch} && BLINK_ROOT={root} BLINK_FORCE_STDLIB_REBUILD=1 {root}/build/blink test --json fe.bl"
+    let result = process_run("sh", ["-c", cmd])
+    let output = result.out.concat(result.err_out)
+    assert(!output.contains("out of bounds"), "stale closure registry index leaked into fixture compile: {output}")
+    assert(output.contains("\"status\":\"pass\""), "capturing-closure fixture must build and pass under forced stdlib rebuild: {output}")
+    shell_exec("rm -rf {scratch}")
+}
