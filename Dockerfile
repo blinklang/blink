@@ -1,13 +1,12 @@
 FROM debian:bookworm-slim
 
-ARG BLINK_VERSION=v0.44.0
+ARG BLINK_VERSION=v0.45.0
 ARG ZIG_VERSION=0.13.0
 
 RUN apt-get update && apt-get install -y \
     gcc \
     libc6-dev \
     libgc-dev \
-    libsqlite3-dev \
     git \
     curl \
     xz-utils \
@@ -29,6 +28,7 @@ RUN curl -fsSL "https://github.com/blinklang/blink/releases/download/${BLINK_VER
           /tmp/blink-linux-x86_64/share/blink/libblink_std.h \
           /tmp/blink-linux-x86_64/share/blink/runtime.h \
           /usr/local/share/blink/ \
+    && cp -R /tmp/blink-linux-x86_64/share/blink/native /usr/local/share/blink/ \
     && rm -rf /tmp/blink.tar.gz /tmp/blink-linux-x86_64
 
 WORKDIR /workspace

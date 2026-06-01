@@ -331,7 +331,21 @@ fn build_link_flags(target: Str, has_async: Int, used_deps: List[Str], ffi_libs:
     }
     let mut di = 0
     while di < used_deps.len() {
-        let dep_flags = resolve_ffi_link_flags(used_deps.get(di).unwrap(), target)
+        let dep_name = used_deps.get(di).unwrap()
+        // A registry native dep that resolves to a vendored static .o (the
+        // sidecar / dev-tree source) is already fully linked from that object
+        // — appending the dynamic `-l<name>` is both redundant and harmful:
+        // it forces a system shared lib onto the link line, leaving undefined
+        // `U <name>_*` symbols resolved dynamically and a needless ldd dep, and
+        // it hard-fails the link (`cannot find -l<name>`) on any host without
+        // the system dev package (e.g. the Docker image after the SQLite peel).
+        // The dynamic `-l` is the right thing only for a `{ system = true }`
+        // manifest override, where resolve_native_dep_source returns "". (br vhgt3s)
+        if resolve_native_dep_source(dep_name) != "" {
+            di = di + 1
+            continue
+        }
+        let dep_flags = resolve_ffi_link_flags(dep_name, target)
         if dep_flags != "" {
             flags = "{flags} {dep_flags}"
         }
@@ -924,8 +938,17 @@ fn do_link_target(out: Str, c_path: Str, link_flags: Str, obj_files: List[Str], 
         effective_link_flags = "{link_flags} -pthread"
     }
     // Try the .o cache for the user .c — on hit we skip `cc -c` and link
-    // the cached .o; on miss we cc-compile, store, then link.
-    let cached_o = cache_compile_user_c(c_path, debug_mode, release_mode, target, "-I{arc_dir}")
+    // the cached .o; on miss we cc-compile, store, then link. The user TU
+    // includes the archive header AND, when it imports a peeled native dep,
+    // that dep's header (runtime.h does `#include <sqlite3.h>`), so the
+    // compile needs the vendored `-I` too — otherwise the `cc -c` fails with
+    // `fatal error: sqlite3.h: No such file or directory`, the cache silently
+    // misses, and we only succeed by falling through to the combined link
+    // below (which does pass includes). On a host without the system header
+    // that surfaced a scary fatal error on every db build; on a cache hit it
+    // would never have produced the .o at all.
+    let cache_includes = if include_flags != "" { "-I{arc_dir} {include_flags}" } else { "-I{arc_dir}" }
+    let cached_o = cache_compile_user_c(c_path, debug_mode, release_mode, target, cache_includes)
     let compile_input = if cached_o != "" { cached_o } else { c_path }
     let rc = run_cc("-o {out} {compile_input}{objs}{includes}{archive} {effective_link_flags}", debug_mode, release_mode, target)
     if rc != 0 {

@@ -209,6 +209,8 @@ tasks:
     cmds:
       - |
         set -e
+        REPO_ROOT="$(pwd)"
+        REPO_BUILD="$REPO_ROOT/{{.BUILD_DIR}}"
         TMPDIR=$(mktemp -d)
         trap "rm -rf $TMPDIR" EXIT
         INSTALL_PREFIX="$TMPDIR/install"
@@ -325,6 +327,108 @@ tasks:
           exit 1
         fi
         echo "PASS test-installed (sqlite sidecar — peeled-module + edq96x regression)"
+
+        # Case 5: std.db_sqlite against an install.sh-style layout. Unlike
+        # Cases 1-4 (which stage $INSTALL_PREFIX with the full native sidecar
+        # loop, mirroring `task install`), this case stages a SEPARATE prefix
+        # using ONLY the copy steps the public install.sh / Dockerfiles run.
+        # The shell block below is kept in sync with install.sh's copy logic:
+        # the GREEN install.sh copies share/blink/native/ recursively, so this
+        # mirror does too. Two release blockers converge here:
+        #
+        #   (1) install.sh / Dockerfile must copy share/blink/native/ so
+        #       resolve_native_dep_source finds the vendored sqlite source
+        #       (else it returns "" — no sidecar, no manifest, no dev tree).
+        #   (2) the CLI must NOT also append the dynamic `-lsqlite3` for a
+        #       registry dep it links statically from the sidecar — otherwise
+        #       the build pulls sqlite from the system libsqlite3.so (leaving
+        #       undefined `U sqlite3_` symbols + an ldd dependency), and once
+        #       libsqlite3-dev is dropped from the Docker image the link fails
+        #       with `ld: cannot find -lsqlite3`. (br vhgt3s)
+        #
+        # The assertion below is host-independent: it requires the produced
+        # binary to have ZERO undefined `U sqlite3_` symbols, i.e. sqlite is
+        # fully satisfied by the vendored sidecar .o, not the system .so. On a
+        # host WITH libsqlite3-dev (where the build would otherwise "work"
+        # dynamically) this still goes RED for blocker (2) pre-fix.
+        SH_PREFIX="$TMPDIR/install_sh"
+        mkdir -p "$SH_PREFIX/bin" "$SH_PREFIX/share/blink"
+        cp "$REPO_BUILD/blink" "$SH_PREFIX/bin/blink"
+        # The release tarball stages share/blink/native/ next to the three
+        # core files; install.sh copies from that tarball. We don't have a
+        # tarball here, so we reconstruct the tarball's share/blink/ contents
+        # in $SH_TARBALL using the SAME files build-binaries stages, then run
+        # the install.sh copy logic against it. Keep the copy block below in
+        # exact sync with install.sh:114 — that is what this case guards.
+        SH_TARBALL="$TMPDIR/sh_tarball/share/blink"
+        mkdir -p "$SH_TARBALL"
+        cp "$REPO_BUILD/libblink_std.a" "$REPO_BUILD/libblink_std.h" "$REPO_BUILD/runtime.h" "$SH_TARBALL/"
+        ( cd "$REPO_ROOT" && "$REPO_BUILD/blink" __native-deps | while IFS='|' read -r NAME SRCS HDR_DIR _DEFS _GATE; do
+            [ -z "$NAME" ] && continue
+            DEST="$SH_TARBALL/native/$NAME"
+            mkdir -p "$DEST"
+            IFS=',' ; for SRC in $SRCS; do cp "$SRC" "$DEST/" ; done ; unset IFS
+            if [ -d "$HDR_DIR" ]; then
+              find "$HDR_DIR" -maxdepth 1 -name '*.h' -exec cp {} "$DEST/" \;
+            fi
+          done )
+        # --- begin install.sh copy mirror (keep in sync with install.sh:114) ---
+        cp "$SH_TARBALL/libblink_std.a" \
+           "$SH_TARBALL/libblink_std.h" \
+           "$SH_TARBALL/runtime.h" \
+           "$SH_PREFIX/share/blink/"
+        if [ -d "$SH_TARBALL/native" ]; then
+          cp -R "$SH_TARBALL/native" "$SH_PREFIX/share/blink/"
+        fi
+        # --- end install.sh copy mirror ---
+        SH_PROJECT="$TMPDIR/sh_userproj"
+        mkdir -p "$SH_PROJECT/src"
+        cat > "$SH_PROJECT/src/main.bl" << 'BLINK'
+        import std.db_sqlite.{sqlite_open, sqlite_close}
+
+        fn main() ! IO {
+            let handle = sqlite_open(":memory:")
+            let _ = sqlite_close(handle)
+            io.println("install-sh-ok")
+        }
+        BLINK
+        cd "$SH_PROJECT"
+        SH_BIN="$SH_PROJECT/main"
+        SH_BUILD_LOG=$(env -u BLINK_ROOT PATH="$SH_PREFIX/bin:$PATH" blink build src/main.bl --output "$SH_BIN" 2>&1 || true)
+        if [ ! -x "$SH_BIN" ]; then
+          echo "FAIL test-installed (install.sh layout — std.db_sqlite build failed)"
+          echo "$SH_BUILD_LOG" | tail -20
+          exit 1
+        fi
+        # Blocker (3): the user-TU obj-cache compile must pass the vendored -I
+        # so it can resolve the peeled dep's header (runtime.h does
+        # `#include <sqlite3.h>`). Without it, hosts lacking a system sqlite3.h
+        # print `fatal error: sqlite3.h: No such file or directory` and only
+        # succeed by falling through to the combined link. Reject that stderr
+        # noise even when the build exits 0. (br r04433) NOTE: this only goes
+        # RED on a host without a system sqlite3.h (e.g. a clean CI container);
+        # on a dev host with libsqlite3-dev the header resolves from the system
+        # path and masks the bug — the Docker in-image check is the real gate.
+        if echo "$SH_BUILD_LOG" | grep -q "fatal error:.*sqlite3.h"; then
+          echo "FAIL test-installed (install.sh layout — user-TU cache compile could not find the sidecar sqlite3.h; vendored -I not threaded into the obj-cache compile — br r04433)"
+          echo "$SH_BUILD_LOG" | grep "fatal error" | head -3
+          exit 1
+        fi
+        # Blocker (2): no undefined sqlite symbols — the sidecar .o must
+        # statically satisfy sqlite, not the system libsqlite3.so.
+        SH_U=$(nm "$SH_BIN" 2>/dev/null | grep -c -E '^ +U sqlite3_' || true)
+        if [ "$SH_U" -ne 0 ]; then
+          echo "FAIL test-installed (install.sh layout — $SH_U undefined 'U sqlite3_' symbols; sqlite resolved dynamically via -lsqlite3 instead of the vendored sidecar — br vhgt3s)"
+          nm "$SH_BIN" | grep -E '^ +U sqlite3_' | head -5 >&2
+          exit 1
+        fi
+        SH_OUT=$(env -u BLINK_ROOT PATH="$SH_PREFIX/bin:$PATH" "$SH_BIN" 2>&1 || true)
+        if [ "$SH_OUT" != "install-sh-ok" ]; then
+          echo "FAIL test-installed (install.sh layout — runtime output)"
+          echo "Got: $SH_OUT"
+          exit 1
+        fi
+        echo "PASS test-installed (install.sh layout — std.db_sqlite statically vendored from sidecar)"
 
   ci:
     desc: Full CI — regen bootstrap + run all tests

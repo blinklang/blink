@@ -2,6 +2,31 @@
 
 Single source of truth for release history. `blink llms` and `blink llms --full` both append this file after the reference text, and every release version is indexed as a topic (e.g. `blink llms --topic v0.36`). **Edit only here** — `llms.md` and `llms-full.md` hold only a `## Recent Changes` stub pointing at this file.
 
+## Breaking Changes (v0.45.0)
+
+- **SQLite is no longer bundled in the compiler binary.** Programs link SQLite only when they `import std.db_sqlite` (or a transitive db module). It ships as a sidecar under `share/blink/native/sqlite3/` and is resolved automatically by installed binaries. Pin your own build with `[native-dependencies] sqlite3 = { path = "vendor/sqlite3.c" }`. **Upgrading from ≤0.44.x:** reinstall via the v0.45.0 installer so the sidecar is present; if you maintain a custom layout, ensure `share/blink/native/` ships alongside the binary, or use the manifest override.
+- **Stray `;` is now a hard error (E1113).** Previously the lexer printed a warning to stdout and the file still compiled (exit 0); now it is rejected and the build fails.
+- **`blink --emit blink` (the formatter) exits non-zero on parser errors.** Tooling/CI that shelled out to the formatter and ignored exit codes will now observe failures.
+
+## What's New (v0.45.0)
+
+- **New diagnostic E0824** — cleanup body (BlockHandler/Closeable) that panics during unwind is now reported.
+- **Parser tolerates newlines** inside `@where(...)`, `Fn(...)`, `#embed(...)`, `channel.new(...)`, and `assert(...)` argument lists, so these can wrap across lines.
+
+## Fixes (v0.45.0)
+
+- **Block-arm `match` type inference** now works for non-Int scalar arms (was Int-only).
+- **`assert` failure messages report the correct source location** (anchored at the keyword, not the closing paren).
+- **Panic messages report the originating file** and use canonical `lib/std/X.bl` paths instead of internal `<embedded:...>` forms.
+- **Formatter emits reparseable output** for handler-expression bodies passed as call arguments and for IIFE bodies (previously emitted unparseable `{ ... }`).
+- **Bare function name passed as a closure-typed argument** now synthesizes an ABI shim instead of failing.
+- **Generic-function monomorphs propagate effect annotations** correctly.
+- **Compound carrier names are disambiguated** when user and stdlib types collide.
+- **`&&`/`||` short-circuit codegen strips redundant outer parens**, fixing builds under clang `-Wparentheses-equality`.
+- **Forward declarations for `promote` are emitted before closure definitions.**
+- **A peeled native dependency linked statically from its sidecar no longer also emits the dynamic `-l<name>` flag.** Importing `std.db_sqlite` previously appended `-lsqlite3` even though the vendored amalgamation already satisfied every symbol, leaving an undefined-symbol/`libsqlite3.so` dependency and breaking the link (`cannot find -lsqlite3`) on any host without `libsqlite3-dev` — including the v0.45.0 Docker image. The dynamic `-l` now applies only to a `{ system = true }` manifest override.
+- **The user-TU object-cache compile now resolves a peeled dependency's header.** Building a program that imports `std.db_sqlite` on a host without a system `sqlite3.h` previously printed `fatal error: sqlite3.h: No such file or directory` (the cached `cc -c` lacked the sidecar `-I`) and only succeeded by falling through to the combined link. The vendored include path is now threaded into the cached compile.
+
 ## Fixes (v0.44.2)
 
 - **Nested enum patterns inside `Some(...)` / `Ok(...)` / `Err(...)` now typecheck and codegen.** Arms like `Err(E.A(msg))` previously left `msg` untyped (typecheck only narrowed the outer Some/Ok/Err binding) and never declared `msg` from the unwrapped payload (codegen's recursive bind only handled bare ident / wildcard sub-patterns under the outer carrier). User code matching a user enum nested in a Result or Option payload no longer fails to compile.

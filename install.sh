@@ -115,6 +115,14 @@ $sudo_cmd cp "$src/share/blink/libblink_std.a" \
             "$src/share/blink/libblink_std.h" \
             "$src/share/blink/runtime.h" \
             "$PREFIX/share/blink/"
+# Peeled native deps (e.g. sqlite3) ship as a sidecar under
+# share/blink/native/<name>/. Programs that import a peeled stdlib module
+# (e.g. std.db_sqlite) need the vendored C source at compile time;
+# resolve_native_dep_source() looks for it here. Copy recursively. Guard
+# for absence so installing an older tarball (pre-sidecar) still succeeds.
+if [ -d "$src/share/blink/native" ]; then
+    $sudo_cmd cp -R "$src/share/blink/native" "$PREFIX/share/blink/"
+fi
 
 info "Installed blink to $PREFIX/bin/blink"
 case ":$PATH:" in

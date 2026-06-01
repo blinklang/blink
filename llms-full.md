@@ -1,6 +1,6 @@
 # Blink Language Reference
 
-> Blink is a statically-typed, effect-tracked language compiling to C. **Compiler v0.44.2**.
+> Blink is a statically-typed, effect-tracked language compiling to C. **Compiler v0.45.0**.
 
 ## Install
 
@@ -12,7 +12,7 @@ docker pull ghcr.io/blinklang/blink:latest
 docker run --rm -v "$PWD":/workspace ghcr.io/blinklang/blink run myfile.bl
 ```
 
-Tags: `latest`, `0.44`, `0.44.2` (semver). Image is `debian:bookworm-slim` with `gcc`, `zig`, `blink`, `libgc-dev`, and `libsqlite3-dev`.
+Tags: `latest`, `0.45`, `0.45.0` (semver). Image is `debian:bookworm-slim` with `gcc`, `zig`, `blink`, and `libgc-dev`.
 
 ## Recent Changes
 
@@ -115,6 +115,8 @@ Scaffolds `vendor/<name>.c`, `vendor/<name>.h`, and `src/<name>.bl` with a `@tru
 sqlite3 = { vendored = "vendor/sqlite3.c" }
 libcurl = { system = true }
 ```
+
+SQLite is itself a registry-resolved native dep: installed binaries ship a default sidecar under `share/blink/native/sqlite3/` and link it statically only when a program imports `std.db_sqlite`. The `sqlite3 = { ... }` entry above is the override path — use it to pin your own build (`vendored`) or force the system shared library (`system`).
 
 ### blink audit
 
