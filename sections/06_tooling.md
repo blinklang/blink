@@ -1644,6 +1644,8 @@ edition = "2026"
 
 **How editions interact with dependencies:** The compiler resolves each package's edition independently. If package A (edition 2028) depends on package B (edition 2026), the compiler checks A against 2028 rules and B against 2026 rules. No edition leaks across package boundaries. This is why editions can only gate per-package concerns (stdlib, keywords, lint) — they cannot change type system semantics or effect resolution, which are cross-package.
 
+**Editions vs. the language version.** The cross-package type-system constants that editions cannot reach are fixed by the **language version** — the compiler/spec revision reported by `blink --version` (§9.1.3, line `blink 0.3.0 (stdlib 0.3.0)`), not the per-package `edition` and not package semver. The bridge alphabet (§9.1.3.2) is the first such constant: the set of element types `T` that flow through the byte-bridge primitives is identical for every package in a build regardless of any package's edition. Your edition does not and cannot change it — there is no per-package opt-in. The language version is not a third versioning *knob*: it is simply which `blink` binary you are running, the way `node`/`python` version is fixed by the interpreter you invoke, never declared in a manifest.
+
 #### 8.16.2 `@deprecated` Semantics
 
 The `@deprecated` annotation marks functions, types, and methods for eventual removal. It carries structured metadata enabling automated migration:

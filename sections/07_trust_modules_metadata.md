@@ -601,7 +601,13 @@ Resolves the v1 ambiguity in §9.1.3 about what `Buf` actually *is*. Decided by 
 
 **One generic type.** `Buf[T]^σ` is a single generic nominal type, σ-tagged to the enclosing `ffi.scope` (same region calculus as §9.1.3's `Ptr[T]^σ`). The typechecker accepts any `T` at declaration sites inside `@ffi.fn` and `@ffi.struct`. There is no separate `Buf[U8]` sibling type.
 
-**Bridge alphabet.** A spec-encoded, closed set of element types — `{U8}` in v1 — is permitted to flow through the byte-bridge primitives (`copy_to_buf`, `copy_from_buf`, `copy_from_buf_n`). The bridge alphabet is a property of the **language version**, not of stdlib version, and is not user-extensible. Expanding the bridge alphabet is a language-version change requiring panel deliberation.
+**Bridge alphabet.** A spec-encoded, closed set of element types — `{U8}` in v1 — is permitted to flow through the byte-bridge primitives (`copy_to_buf`, `copy_from_buf`, `copy_from_buf_n`). Formally, `BridgeAlpha(λ)` is a function from the language version `λ` to a finite, spec-enumerated set of element types, with `BridgeAlpha(v1) = {U8}`. Membership is consulted **only** to decide whether `W0816` fires; it is *not* an instantiation gate — `Buf[T]` type-checks for every `T` (any element type may back a `scope.alloc_n[T]` region, §9.1.3), and the alphabet narrows nothing about the type, it governs only which `T` cross the byte-bridge primitives without a diagnostic.
+
+Here "**language version**" denotes the compiler/spec revision reported by `blink --version` (the `blink 0.3.0` field of `blink 0.3.0 (stdlib 0.3.0)`), **not** the per-package `edition` (§8.16.1) and **not** package semver. The bridge alphabet is governed by three guarantees:
+
+- **G1 — Language-version constant.** `BridgeAlpha` is a function of the language version alone. It does not depend on edition, package semver, stdlib version, compiler flag, environment variable, manifest field, or any link-time or runtime input. This is what makes `W0816` source-deterministic — a function of `(source, language version)` only (see also `W0816` below).
+- **G2 — Expansion = deliberation + version bump.** Adding an element type to the bridge alphabet is a language-version change: it requires panel deliberation recorded in `DECISIONS.md` and ships only in a new compiler release that carries a language-version bump. Membership is monotonically non-shrinking across versions — once `T ∈ BridgeAlpha(λ)`, `T ∈ BridgeAlpha(λ')` for every later `λ' ≥ λ` — so every expansion is a conservative extension: an `@ffi` declaration that previously drew `W0816` only ever *loses* the warning on upgrade, never the reverse. Introducing any bridge-membership declaration form is itself such a change, never an incremental addition.
+- **G3 — No third-party or link-time extension.** No third-party crate, stdlib helper, `@ffi` declaration, build script, edition, or linked object may add an element type to the alphabet. The set is closed **by construction**: Blink provides no surface syntax — no attribute, trait, keyword, manifest key, or registration API — by which membership could be declared. You cannot extend what has no extension point; this is a stronger guarantee than a rejection rule, and no diagnostic is reserved for an extension attempt (there is no construct to reject).
 
 **Sealed user surface.** `Buf[T]^σ` has no public methods. Specifically:
 
@@ -638,12 +644,14 @@ The struct and its `data` payload are `malloc`'d (not GC-managed), registered wi
 **Source-deterministic warning `W0816`.** When a `Buf[T]` appears in an `@ffi.fn` signature or `@ffi.struct` field for a `T` outside the bridge alphabet, the compiler emits:
 
 ```
-W0816: Buf[i32] declared in @ffi.fn signature; the byte-bridge primitives
-       only accept Buf[U8] in language v1. For a typed scope-tied region
-       use `scope.alloc_n[i32](n)` instead.
+W0816: Buf[i32] declared in @ffi.fn signature; only Buf[U8] crosses the
+       byte bridge in this version of Blink. The bridge alphabet is fixed
+       by the compiler version and cannot be extended by a package, stdlib
+       helper, edition, or build flag. For a typed scope-tied region use
+       `scope.alloc_n[i32](n)` instead. See `blink doc bytes-bridge`.
 ```
 
-`W0816` is **source-deterministic**: it depends only on `(source, language-version)`, not on stdlib version. The bridge alphabet is the language-version-encoded set; stdlib helpers do not influence the warning. Help text never says "wait for v2" — the workaround is `scope.alloc_n[T]`, which is the working answer indefinitely.
+`W0816` is **source-deterministic**: it depends only on `(source, language version)`, not on stdlib version, edition, or package semver. The bridge alphabet is the language-version-encoded set `BridgeAlpha(λ)` (§9.1.3.2 G1); stdlib helpers do not influence the warning. The message is self-contained and edition-invariant — it names the working path (`scope.alloc_n[T]`) inline and never says "wait for v2," because `scope.alloc_n[T]` is the answer indefinitely.
 
 `W0816` is per-declaration suppressible with `@allow(W0816)`. Suppression at a binding-author's discretion is expected for vendored bindings that intentionally use a non-`U8` element type for typed-region work.
 
@@ -666,9 +674,38 @@ CI may use `blink build --no-unaudited-bridges` to require every `bytes-bridge` 
 
 **Doc / LSP.** `blink doc` and the LSP hover for `Buf[T]^σ` render a fixed banner:
 
-> **Opaque, σ-tagged, bridge-only.**
+> **Opaque, σ-tagged, bridge-only.** Bridge alphabet (v1): `{U8}`.
 > `Buf[T]^σ` is a region-tied buffer used by FFI bridge primitives.
 > User code should prefer `libc.*_bytes` helpers; for typed regions, use `scope.alloc_n[T]`.
+> See `blink doc bytes-bridge`.
+
+The `bytes-bridge` doc page (`blink doc bytes-bridge`) is the single canonical explainer for the byte bridge, and the `W0816` and `E0822` diagnostic explain-texts both deep-link it. It answers, in order: (1) most code never names `Buf` — use `libc.recv_bytes` / `read_bytes` / `getentropy_bytes`; (2) `Buf` is bridge-only and `U8`-only, fixed by the compiler version; (3) for a typed region use `scope.alloc_n[T]`.
+
+**Machine-queryable alphabet — one constant, three projections.** The bridge alphabet exists as exactly one normative source: a compile-time constant in the compiler (the same constant `W0816` consults). Every reporting surface is a projection of that constant, never an independently-maintained list. A build-time test asserts each surface equals the constant the typechecker reads, so they cannot drift on a future expansion:
+
+1. **`blink --version --json`** — the normative machine surface, for CI and humans:
+
+   ```json
+   {
+     "compiler": "0.3.0",
+     "stdlib": "0.3.0",
+     "bridge_alphabet": ["U8"],
+     "bridge_alphabet_extensible": false
+   }
+   ```
+
+   A CI pipeline pins the alphabet in one line — `blink --version --json | jq -e '.bridge_alphabet == ["U8"]'` — and fails the build if a toolchain upgrade ever silently widened it.
+
+2. **`llms.txt` `language:` stanza** — a derived view for AI agents reading the offline doc bundle (§8.16.4), so a tool generating an `@ffi.fn` knows which `T` are bridge-legal without trial-and-error:
+
+   ```
+   language:
+     bridge_alphabet: [U8]              # T legal in Buf[T] through byte-bridge primitives
+     bridge_alphabet_extensible: false
+     bridge_diag: W0816                 # fires on any other T in @ffi.fn/@ffi.struct
+   ```
+
+3. **`W0816` firing set + help text** — the at-the-caret surface for the binding author.
 
 #### Static layout assertions
 
