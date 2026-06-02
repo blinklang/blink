@@ -361,6 +361,17 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
                 expr_option_is_none = 1
                 return
             }
+            let expect_inner_ct = expect_arg_option_inner_ct()
+            if expect_inner_ct != CT_VOID {
+                ensure_option_type(expect_inner_ct)
+                let opt_type = option_c_type(expect_inner_ct)
+                expr_result_str = "({opt_type})\{.tag = 0}"
+                expr_result_type = CT_OPTION
+                expr_option_inner = expect_inner_ct
+                expr_option_inner_struct = ""
+                expr_option_is_none = 1
+                return
+            }
             let fsi = get_fn_ret_struct_inner(cg_current_fn_name)
             let fn_rt = get_fn_ret_type(cg_current_fn_name)
             if fsi.ok_struct != "" && cg_current_fn_ret == CT_OPTION {
@@ -1206,7 +1217,7 @@ pub fn emit_async_spawn_closure(closure_node: Int, wrapper_idx: Int, wrapper_nam
                 let inner_ann = sublist_get(elems_sl, 0)
                 let inner_name = node_name(inner_ann)
                 let inner_ct = type_from_name(inner_name)
-                if inner_ct == CT_VOID && is_struct_type(inner_name) != 0 {
+                if inner_ct == CT_VOID && is_struct_or_enum_type(inner_name) != 0 {
                     ensure_struct_option_type(inner_name)
                     task_ret_c = struct_option_c_type(inner_name)
                 } else if is_compound_ct(inner_ct) != 0 {
@@ -2137,6 +2148,43 @@ fn expect_arg_option_inner_struct() -> Str {
     ""
 }
 
+// Returns the declared type-annotation node for field `fname` from a struct's
+// field-def sublist `td_flds`, or -1 if the sublist is empty or the field
+// isn't found. Used by emit_struct_lit to thread the field's expected carrier
+// (e.g. Option[Str]) into emit_expr via cg_expect_arg_ann so a bare `None`
+// field adopts it. Callers resolve `td_flds` once via
+// `node_fields(find_type_def_node(sname))` rather than per field.
+fn struct_field_type_ann(td_flds: Int, fname: Str) -> Int {
+    if td_flds == -1 { return -1 }
+    let mut fi = 0
+    while fi < sublist_length(td_flds) {
+        let f = sublist_get(td_flds, fi)
+        if node_name(f) == fname {
+            return node_value(f)
+        }
+        fi = fi + 1
+    }
+    -1
+}
+
+// When cg_expect_arg_ann is `Option[Prim]` with a primitive (non-struct,
+// non-enum, non-compound) inner, returns that inner's C-type kind. Returns
+// CT_VOID otherwise — including when the inner is a struct/enum (handled by
+// expect_arg_option_inner_struct) or when there is no annotation. Lets a bare
+// `None` adopt e.g. `Option[Str]`'s carrier instead of defaulting to int.
+fn expect_arg_option_inner_ct() -> Int {
+    if cg_expect_arg_ann == -1 { return CT_VOID }
+    if node_name(cg_expect_arg_ann) != "Option" { return CT_VOID }
+    let elems = node_elements(cg_expect_arg_ann)
+    if elems == -1 || sublist_length(elems) < 1 { return CT_VOID }
+    let inner_ann = sublist_get(elems, 0)
+    let inner = node_name(inner_ann)
+    if is_struct_or_enum_type(inner) != 0 { return CT_VOID }
+    let inner_ct = type_from_name(inner)
+    if is_compound_ct(inner_ct) != 0 { return CT_VOID }
+    inner_ct
+}
+
 // Returns the closure-signature string for the i-th formal when it has a
 // `fn(...)` type, otherwise "". Used by the Call-arg loops to hint the
 // Ident arm that a bare-fn reference should be shimmed.
@@ -2211,7 +2259,7 @@ pub fn emit_generic_fn_call_tail(fn_name: Str, args_str: Str, arg_types: List[In
                 expr_option_inner = inner_ct
                 ensure_option_type(inner_ct)
                 reg_fn_ret_type(mangled, CT_OPTION, inner_ct, -1)
-                if inner_ct == CT_VOID && is_struct_type(inner_name) != 0 {
+                if inner_ct == CT_VOID && is_struct_or_enum_type(inner_name) != 0 {
                     ensure_struct_option_type(inner_name)
                     expr_option_inner_struct = inner_name
                 }
@@ -3863,6 +3911,8 @@ fn emit_struct_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
     let mut c_type = c_type_c_name(sname)
     let tmp = fresh_temp("_s")
     let flds_sl = node_fields(node)
+    let td = find_type_def_node(sname)
+    let td_flds = if td != -1 { node_fields(td) } else { -1 }
     let mut inits = ""
     let mut field_types: List[Int] = []
     let mut provided_fields: List[Str] = []
@@ -3880,7 +3930,10 @@ fn emit_struct_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
             }
             let fname = node_name(sf)
             provided_fields.push(fname)
+            let saved_arg_ann = cg_expect_arg_ann
+            cg_expect_arg_ann = struct_field_type_ann(td_flds, fname)
             emit_expr(node_value(sf))
+            cg_expect_arg_ann = saved_arg_ann
             let val_str = expr_result_str
             field_types.push(expr_result_type)
             if _init_count > 0 {
@@ -3932,7 +3985,10 @@ fn emit_struct_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
                 pi = pi + 1
             }
             if found == 0 {
+                let saved_dfl_arg_ann = cg_expect_arg_ann
+                cg_expect_arg_ann = struct_field_type_ann(td_flds, dfl.field_name)
                 emit_expr(dfl.default_node)
+                cg_expect_arg_ann = saved_dfl_arg_ann
                 let dval = expr_result_str
                 field_types.push(expr_result_type)
                 if _init_count > 0 {
@@ -4030,10 +4086,18 @@ fn emit_tuple_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Di
                 }
             }
         }
+        let saved_arg_ann = cg_expect_arg_ann
+        if parent_elems_sl != -1 {
+            cg_expect_arg_ann = sublist_get(parent_elems_sl, i)
+        }
         emit_expr(sublist_get(elems_sl, i))
+        cg_expect_arg_ann = saved_arg_ann
         val_strs.push(expr_result_str)
         val_types.push(expr_result_type)
-        let sn = get_var_struct(expr_result_str)
+        let mut sn = get_var_struct(expr_result_str)
+        if sn == "" {
+            sn = get_var_enum(expr_result_str)
+        }
         val_structs.push(sn)
         let mut ctag = ""
         if sn == "" && is_compound_ct(expr_result_type) != 0 {
