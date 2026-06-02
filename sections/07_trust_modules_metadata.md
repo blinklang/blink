@@ -658,19 +658,68 @@ W0816: Buf[i32] declared in @ffi.fn signature; only Buf[U8] crosses the
 **Curated `libc.*_bytes` helpers — the primary user-facing API.** Most user code never names `Buf`. The recommended path is:
 
 ```blink
-let bs = libc.recv_bytes(fd, 4096)?       // Bytes-in, Bytes-out
-let entropy = libc.getentropy_bytes(32)?  // no fd, no Buf, no scope
-let chunk = libc.read_bytes(fd, 8192)?    // read up to 8192 bytes
+let bs = libc.recv_bytes(fd, 4096)?       // recv up to 4096 bytes from a socket
+let entropy = libc.getentropy_bytes(32)?  // 32 CSPRNG bytes, no fd, no Buf, no scope
+let chunk = libc.read_bytes(fd, 8192)?    // read up to 8192 bytes from any fd
+libc.write_bytes(out_fd, chunk)?          // write raw bytes to a file/pipe/socket fd
 ```
 
-These wrap `copy_to_buf` / `copy_from_buf_n` internally inside an `ffi.scope`. The v1 minimum wrapper set is panel-ratified; growth of this set is governed by demonstrated high-frequency Bytes-in/Bytes-out usage in stdlib or audited third-party code.
+These wrappers do **not** use the byte-bridge primitives. They are built on `Bytes.with_ptr` (§9.1.1, the sanctioned `Bytes → Ptr[U8]` borrow): a read pins a `Bytes.zeroed(n)` buffer to receive into and returns `buf.slice(0, got)`; a write pins the caller's `Bytes` read-only and hands C a `const uint8_t*`. `copy_to_buf` / `copy_from_buf` / `copy_from_buf_n` are reserved **exclusively** for the sealed-`Buf` path (where the user can never name `Buf`); the curated wrappers never call them. The boundary is *user-owned `Bytes` (→ `with_ptr`)* vs *unnameable sealed `Buf` (→ bridge primitives)*, not reads-vs-writes.
 
-**Audit category.** `blink audit` reports a `bytes-bridge` category with two subcategories:
+##### 9.1.3.3 The v1 `libc.*_bytes` minimum set (A2 ship gate)
 
-- `bridge-call` — call sites of `copy_to_buf` / `copy_from_buf` / `copy_from_buf_n`.
+Decided by panel deliberation [`libc-bytes-wrapper-coverage`](../decisions/libc-bytes-wrapper-coverage.md). Resolves the A2 ship gate flagged in §9.1.3.2 — the `libc.*_bytes` family is the primary user-facing surface, so v1 must ship a coherent minimum set or users are stranded at the sealed bridge with no power-user fallback.
+
+**The ratified v1 set is exactly these five wrappers** (the four base-shape direction × domain quadrants — file/socket × read/write — plus the standalone CSPRNG fill):
+
+```blink
+fn read_bytes(fd: Int, max: Int) -> Result[Bytes, Errno] ! IO
+fn recv_bytes(fd: Int, max: Int) -> Result[Bytes, Errno] ! IO
+fn write_bytes(fd: Int, data: Bytes) -> Result[Int, Errno] ! IO
+fn send_bytes(fd: Int, data: Bytes) -> Result[Int, Errno] ! IO
+fn getentropy_bytes(n: Int) -> Result[Bytes, Errno] ! IO
+```
+
+Each member ships at v1; the set **blocks the v1 release**.
+
+**Directional return-typing rule (normative).** The actual byte count is always carried *in the return type*, never out-of-band:
+
+- **Bytes-out** (`read_bytes`, `recv_bytes`, `getentropy_bytes`) → `Result[Bytes, Errno]`, where the returned `Bytes.len()` *is* the syscall's reported count (`slice(0, got)`). A short read is success with a shorter `Bytes`; only a `-1`/errno return is `Err`. `getentropy_bytes` is all-or-nothing (`.len() == n` on success, no truncation arm).
+- **Bytes-in** (`write_bytes`, `send_bytes`) → `Result[Int, Errno]`, where the `Int` is the count actually written. Short writes are normal and surfaced as `Ok(n < data.len())` — the caller must loop; collapsing this to `Result[(), Errno]` would be unsound for the partial-write contract.
+
+**`recv_bytes` / `send_bytes` take no `flags` argument in v1** — they pass `flags = 0` internally, matching the examples above. A flagged variant ships post-v1 alongside the UDP/socket-semantics work.
+
+**Error type.** Every member returns `Result[_, Errno]`, where `Errno` is a thin, transparent, zero-cost newtype over the OS errno `Int` (no boxing, no tag, monomorphizes to a bare int). It carries a name/projection (`.code() -> Int`, named errno constants) so callers match on errno meaningfully rather than on a bare `Int`, and so a `write`'s two return arms (count-written vs errno) are nominally distinct. A rich variant `IoError` hierarchy is **not** part of this gate — it is a separate post-v1 task, layered additively on `Errno` (e.g. `.kind()`) without changing any wrapper signature. `Errno` is domain-neutral; a file read's `ENOSPC` is *not* typed as a network error.
+
+**Naming law (normative).** Every `libc` byte-moving syscall wrapper conforms to a fixed shape, so the family is name-predictable and post-v1 additions are mechanical rather than designed:
+
+- **Name** = `libc.<posix_syscall_name>_bytes` (e.g. `recvfrom` → `recvfrom_bytes`, never `recv_from_bytes`).
+- **Arguments** = POSIX C argument order with the `(void* buf, size_t len)` pair replaced by a trailing `max: Int` (reads) or a `data: Bytes` argument (writes; length is `data.len()`, never passed explicitly).
+- **Return** = `Result[Bytes, Errno]` (Bytes-out) or `Result[Int, Errno]` (Bytes-in), bound to direction — a write may not be typed `Result[Bytes, Errno]`.
+- **Effect** = `! IO`.
+- **Mechanism** = `Bytes.with_ptr`, never the byte-bridge primitives.
+
+The law governs only the *shape* of a wrapper; it is not a license to auto-add wrappers (see growth governance below). `getentropy_bytes` is the one principled exception to the arg rule (no fd, no `(buf, len)` pair) — it takes `n: Int` and fills exactly `n`. Syscalls that cannot conform — vectored I/O (`readv`/`writev`, which need an `iovec[]` array), `recvmsg`/`sendmsg` (`msghdr`), or any surface requiring a non-`Bytes` buffer shape — are **out of scope of the law** and must not be forced into a `*_bytes` wrapper; they get their own deliberated API.
+
+**Deferred, with the reason recorded** (so the line is defensible, not arbitrary):
+
+- `recvfrom_bytes` / `sendto_bytes` — require a `SockAddr` peer-address type that does not yet exist, and have no v1 caller (no datagram socket type ships in v1). They ship together with `SockAddr` as one post-v1 UDP gate.
+- `pread_bytes` / `pwrite_bytes` — positional variants add only an `off_t` argument over `read`/`write` (same buffer-fill shape, no new crossing) and have no demonstrated v1 caller. They ship under the demonstrated-demand gate.
+- `readv_bytes` / `writev_bytes` — vectored I/O needs an `iovec[]` bridge that has not been designed and is excluded by the naming law.
+
+**Growth governance.** A `libc.*_bytes` wrapper is added beyond the v1 set only on **demonstrated high-frequency Bytes-in/Bytes-out usage where the allocate-before-call asymmetry makes `scope.alloc_n[T]` ergonomically prohibitive** — never as a default for every `uint8_t*` C function, and never speculatively ahead of a real caller. Any addition must conform to the naming law above.
+
+**`read_fully_bytes` is not a `libc` member.** Reading exactly `n` bytes (looping over `read_bytes` until `n` or EOF) is a derived combinator with no syscall and no bridge crossing of its own; it lives in `std.io` as ordinary Blink (`std.io.read_fully`), preserving the "`libc.*` is exactly one syscall, 1:1" invariant that keeps the `libc` surface auditable. It ships at v1 (a hard, gate-coupled deliverable — `read_bytes` alone is a short-read footgun), and the `read_bytes` doc/hover **must** cross-reference it: "`read_bytes` may return fewer than `max`; for read-until-`n` use `std.io.read_fully`."
+
+**Audit category.** `blink audit` reports a `bytes-bridge` category with three subcategories:
+
+- `bridge-call` — call sites of `copy_to_buf` / `copy_from_buf` / `copy_from_buf_n` (the sealed-`Buf` path).
 - `buf-mention` — any source mention of `Buf` (legally, inside `@ffi.fn` / `@ffi.struct`).
+- `byte-pin` — `Bytes.with_ptr` call sites (the `libc.*_bytes` family's crossings, both read-side and write-side pins).
 
-CI may use `blink build --no-unaudited-bridges` to require every `bytes-bridge` subcategory entry outside `lib/std/` to be approved by `blink audit approve`.
+A single `blink audit bytes-bridge` query therefore returns *every* raw-byte crossing in a module — sealed-`Buf` copies and `with_ptr` pins alike — with no direction asymmetry. CI may use `blink build --no-unaudited-bridges` to require every `bytes-bridge` subcategory entry outside `lib/std/` to be approved by `blink audit approve`.
+
+A curated `*_bytes` wrapper **must keep its `@ffi` syscall call inline inside the `with_ptr` closure body** — the closure-lexical no-grow / no-escape check (§9.1.3.1) is syntactic and does not descend into helper functions, so factoring the call out would defeat the `E0814`/`E0815`/`E0817` pin guarantees.
 
 **Doc / LSP.** `blink doc` and the LSP hover for `Buf[T]^σ` render a fixed banner:
 
