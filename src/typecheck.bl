@@ -34,6 +34,7 @@ import diagnostics.{
     MODULE_QUALIFIED_TYPE,
     UNKNOWN_METHOD, UNUSED_VARIABLE, SET_BUT_NOT_READ, SHADOWED_VARIABLE,
     BITWISE_PRECEDENCE, UNREACHABLE_CODE, UNAUDITED_FFI, DEPRECATED_USAGE,
+    NAME_COLLISION, AMBIGUOUS_CONSTRUCTION,
 }
 
 effect TypeCheck {
@@ -183,6 +184,14 @@ let mut tc_warnings: List[Str] = []
 // ── Deprecation tracking ───────────────────────────────────────────
 let mut depr_fn_nodes: Map[Str, Int] = Map()
 let mut depr_type_nodes: Map[Str, Int] = Map()
+
+// ── Kind A name-collision tracking (struct name == enum variant name) ──
+// Decl nodes captured at registration so the E0518 diagnostic can point a
+// primary span at the struct decl and a secondary span at the enum decl.
+let mut tc_struct_decl_nodes: Map[Str, Int] = Map()
+let mut tc_variant_enum_decl_nodes: Map[Str, Int] = Map()
+// Dedupe so each colliding name is reported once, not per use site.
+let mut tc_collision_reported: Map[Str, Int] = Map()
 
 // Names of @ffi.struct types (consulted by is_valid_ptr_inner so Ptr[T] is allowed for them).
 let mut ffi_struct_type_set: Map[Str, Int] = Map()
@@ -458,7 +467,8 @@ fn is_int_literal_node(node: Int) -> Int {
     0
 }
 
-fn check_arg_shapes(fn_name: Str, sig: Int, args_sl: Int, node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+@allow(UnrestoredMutation)
+fn check_arg_shapes(fn_name: Str, sig: Int, args_sl: Int, _node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     if args_sl == -1 { return }
     let fs = fnsig_pool.get(sig).unwrap()
     let param_start = fs.params_start
@@ -469,7 +479,10 @@ fn check_arg_shapes(fn_name: Str, sig: Int, args_sl: Int, node: Int) ! TypeCheck
         if i < param_count {
             let ptid = fnsig_param_list.get(param_start + i).unwrap()
             let arg_node = sublist_get(args_sl, i)
+            let saved_hint = tc_construct_hint
+            tc_construct_hint = resolve_alias_tid(ptid)
             let arg_t = infer_type(arg_node)
+            tc_construct_hint = saved_hint
             let mut lit_to_int = 0
             if is_int_literal_node(arg_node) != 0 && is_integer_type(resolve_alias_tid(ptid)) != 0 {
                 lit_to_int = 1
@@ -664,6 +677,7 @@ fn register_struct_type(td: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.R
     named_type_names.push(name)
     named_type_ids.push(tid)
     named_type_map.insert(name, tid)
+    tc_struct_decl_nodes.insert(name, td)
     let alias_ann = node_value(td)
     if alias_ann != -1 {
         tc_alias_underlying.insert(name, resolve_type_ann(alias_ann))
@@ -740,6 +754,9 @@ fn register_enum_type(td: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Rep
                 }
             }
             evar_pool.push(EnumVariantEntry { enum_id: tid, name: vname, tag: _tag, has_data: _has_data })
+            if tc_variant_enum_decl_nodes.contains_key(vname) == 0 {
+                tc_variant_enum_decl_nodes.insert(vname, td)
+            }
 
             _tag = _tag + 1
             i = i + 1
@@ -748,6 +765,29 @@ fn register_enum_type(td: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Rep
 
     if has_annotation(td, "deprecated") != 0 {
         depr_type_nodes.insert(name, td)
+    }
+}
+
+// Kind A collision: a struct type whose name equals an enum variant name. This is the
+// NARROW invariant — two enums sharing a variant name (e.g. `Pending` in JobState and
+// NetState) stays legal and is resolved by the hint, so we only fire when the colliding
+// name is registered as a TK_STRUCT in named_type_map. Whole-program: both tables are
+// merged across all modules at registration, so cross-module collisions are caught.
+fn tc_check_name_collisions() ! TypeCheck.Register, Diag.Report {
+    let mut i = 0
+    while i < evar_pool.len() {
+        let vname = evar_pool.get(i).unwrap().name
+        let stid = named_type_map.get(vname) ?? -1
+        if tc_collision_reported.contains_key(vname) == 0 && stid != -1 && type_kind(stid) == TK_STRUCT {
+            tc_collision_reported.insert(vname, 1)
+            let struct_node = tc_struct_decl_nodes.get(vname) ?? -1
+            let enum_node = tc_variant_enum_decl_nodes.get(vname) ?? -1
+            diag_error_at("NameCollision", NAME_COLLISION, "struct '{vname}' has the same name as an enum variant '{vname}'; bare construction would be ambiguous (note: two different enums MAY share a variant name — only a struct-vs-variant clash is rejected)", struct_node, "rename either the struct or the variant")
+            if enum_node != -1 {
+                diag_error_at("NameCollision", NAME_COLLISION, "the conflicting variant '{vname}' is declared here", enum_node, "rename either the struct or the variant")
+            }
+        }
+        i = i + 1
     }
 }
 
@@ -1810,6 +1850,9 @@ fn init_types() ! TypeCheck.Register {
     tc_warnings.clear()
     depr_fn_nodes.clear()
     depr_type_nodes.clear()
+    tc_struct_decl_nodes.clear()
+    tc_variant_enum_decl_nodes.clear()
+    tc_collision_reported.clear()
     ffi_struct_type_set.clear()
     tc_symbol_module.clear()
     tc_used_modules.clear()
@@ -1860,6 +1903,10 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
             i = i + 1
         }
     }
+
+    // Kind A: a struct name equal to an enum variant name is a hard error (E0518).
+    // Detected over the whole-program symbol table (catches cross-module collisions).
+    tc_check_name_collisions()
 
     // Register all function signatures
     let fns_sl = node_params(program)
@@ -2855,6 +2902,87 @@ fn get_variant_enum_tid(name: Str) -> Int {
         i = i + 1
     }
     TYPE_UNKNOWN
+}
+
+// Count the number of DISTINCT enums that declare a variant named `name`.
+// get_variant_enum_tid returns only the first match, so it cannot detect
+// non-uniqueness; this is what the bare-construction cascade uses to decide
+// between a unique-variant fallback and an E0519 AmbiguousConstruction.
+fn count_enums_with_variant(name: Str) -> Int {
+    let mut seen: Map[Int, Int] = Map()
+    let mut count = 0
+    let mut i = 0
+    while i < evar_pool.len() {
+        let ev = evar_pool.get(i).unwrap()
+        if ev.name == name && seen.contains_key(ev.enum_id) == 0 {
+            seen.insert(ev.enum_id, 1)
+            count = count + 1
+            if count > 1 { return count }
+        }
+        i = i + 1
+    }
+    count
+}
+
+// Iterative two-row Levenshtein edit distance between two strings.
+fn str_levenshtein(a: Str, b: Str) -> Int {
+    let alen = a.len()
+    let blen = b.len()
+    if alen == 0 { return blen }
+    if blen == 0 { return alen }
+    let mut prev: List[Int] = []
+    let mut j = 0
+    while j <= blen {
+        prev.push(j)
+        j = j + 1
+    }
+    let mut i = 0
+    while i < alen {
+        let mut curr: List[Int] = []
+        curr.push(i + 1)
+        let ac = a.slice(i, i + 1)
+        let mut k = 0
+        while k < blen {
+            let bc = b.slice(k, k + 1)
+            let cost = if ac == bc { 0 } else { 1 }
+            let del = prev.get(k + 1).unwrap() + 1
+            let ins = curr.get(k).unwrap() + 1
+            let sub = prev.get(k).unwrap() + cost
+            let mut best = del
+            if ins < best { best = ins }
+            if sub < best { best = sub }
+            curr.push(best)
+            k = k + 1
+        }
+        prev = curr
+        i = i + 1
+    }
+    prev.get(blen).unwrap()
+}
+
+// Suggest the closest known variant name (as `Enum.Variant`) to `name`,
+// scanning evar_pool. Returns "" when no candidate is within the confidence
+// threshold, so a far-off typo gets no bogus suggestion.
+fn suggest_variant(name: Str) -> Str {
+    let mut best_dist = -1
+    let mut best_enum = ""
+    let mut best_var = ""
+    let mut i = 0
+    while i < evar_pool.len() {
+        let ev = evar_pool.get(i).unwrap()
+        let d = str_levenshtein(name, ev.name)
+        if best_dist == -1 || d < best_dist {
+            best_dist = d
+            best_var = ev.name
+            best_enum = type_to_str(ev.enum_id)
+        }
+        i = i + 1
+    }
+    if best_dist == -1 { return "" }
+    let mut threshold = name.len() / 3
+    if threshold < 1 { threshold = 1 }
+    if best_dist > threshold { return "" }
+    "{best_enum}.{best_var}"
 }
 
 fn is_trait_name(name: Str) -> Int {
@@ -3915,7 +4043,22 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                     nr_check_type_ref(prefix)
                 }
             } else {
-                nr_check_type_ref(type_name)
+                if is_variant_name(type_name) != 0 {
+                    // bare struct-style variant construction; resolved in infer_type.
+                    // This gate only suppresses the false UnknownType — it never picks a winner.
+                } else {
+                    let stid = lookup_named_type(type_name)
+                    if stid == -1 {
+                        let suggestion = suggest_variant(type_name)
+                        if suggestion != "" {
+                            diag_error_at("UnknownType", UNKNOWN_TYPE, "unknown type '{type_name}'", node, "did you mean {suggestion}? construct as {suggestion} \{ ... }")
+                        } else {
+                            nr_check_type_ref(type_name)
+                        }
+                    } else {
+                        nr_check_type_ref(type_name)
+                    }
+                }
             }
         }
         let flds_sl = node_fields(node)
@@ -4311,6 +4454,24 @@ fn is_comparison_op(op: Str) -> Int {
 
 // ── Phase 2: Expression type inference ──────────────────────────────
 
+// Infer a carrier argument (Some/Ok/Err) with the construction hint unwrapped to the carried
+// inner type, so a bare struct-style variant inside the carrier resolves against the right enum.
+// Mirrors the pattern-path carrier unwrap. carrier is "Some" | "Ok" | "Err".
+@allow(UnrestoredMutation)
+fn infer_carrier_arg(arg_node: Int, carrier: Str) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let saved_hint = tc_construct_hint
+    let k = type_kind(tc_construct_hint)
+    if carrier == "Err" {
+        if tc_construct_hint >= 0 && k == TK_RESULT { tc_construct_hint = ty_pool.get(tc_construct_hint).unwrap().inner2 }
+    } else if (carrier == "Some" && k == TK_OPTION) || (carrier == "Ok" && k == TK_RESULT) {
+        if tc_construct_hint >= 0 { tc_construct_hint = ty_pool.get(tc_construct_hint).unwrap().inner1 }
+    }
+    let inner = infer_type(arg_node)
+    tc_construct_hint = saved_hint
+    inner
+}
+
+@allow(UnrestoredMutation)
 fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     if node == -1 { return TYPE_UNKNOWN }
     let kind = node_kind(node)
@@ -4471,7 +4632,7 @@ fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repo
                 if fn_name == "Some" {
                     let args_sl = node_args(node)
                     if args_sl != -1 && sublist_length(args_sl) >= 1 {
-                        let inner = infer_type(sublist_get(args_sl, 0))
+                        let inner = infer_carrier_arg(sublist_get(args_sl, 0), "Some")
                         return make_option_type(inner)
                     }
                     return make_option_type(TYPE_UNKNOWN)
@@ -4479,7 +4640,7 @@ fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repo
                 if fn_name == "Ok" {
                     let args_sl = node_args(node)
                     if args_sl != -1 && sublist_length(args_sl) >= 1 {
-                        let inner = infer_type(sublist_get(args_sl, 0))
+                        let inner = infer_carrier_arg(sublist_get(args_sl, 0), "Ok")
                         return make_result_type(inner, TYPE_UNKNOWN)
                     }
                     return make_result_type(TYPE_UNKNOWN, TYPE_UNKNOWN)
@@ -4487,7 +4648,7 @@ fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repo
                 if fn_name == "Err" {
                     let args_sl = node_args(node)
                     if args_sl != -1 && sublist_length(args_sl) >= 1 {
-                        let inner = infer_type(sublist_get(args_sl, 0))
+                        let inner = infer_carrier_arg(sublist_get(args_sl, 0), "Err")
                         return make_result_type(TYPE_UNKNOWN, inner)
                     }
                     return make_result_type(TYPE_UNKNOWN, TYPE_UNKNOWN)
@@ -4752,10 +4913,36 @@ fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repo
     if kind == NodeKind.StructLit {
         let sname = node_type_name(node)
         if sname != "" {
-            let tid = lookup_named_type(sname)
-            if tid != -1 {
-                check_deprecated_type(sname, node)
-                return tid
+            let dot = sname.index_of(".")
+            if dot >= 0 {
+                // Qualified `E.V { .. }`: resolve the enum from the prefix (lookup_named_type
+                // strips the qualifier itself).
+                let etid = lookup_named_type(sname)
+                if etid != -1 {
+                    check_deprecated_type(sname, node)
+                    return etid
+                }
+            } else {
+                // 1) hint FIRST (monotonicity: a distant enum decl must never retroactively
+                //    rebind a locally-determined site).
+                if tc_construct_hint >= 0 && type_kind(tc_construct_hint) == TK_ENUM && get_variant_by_name(tc_construct_hint, sname) != -1 {
+                    return tc_construct_hint
+                }
+                // 2) struct (Kind A guarantees a name is never both a struct AND a variant).
+                let stid = lookup_named_type(sname)
+                if stid != -1 {
+                    check_deprecated_type(sname, node)
+                    return stid
+                }
+                // 3) global-unique variant.
+                let n = count_enums_with_variant(sname)
+                if n == 1 {
+                    return get_variant_enum_tid(sname)
+                }
+                if n > 1 {
+                    diag_error_at("AmbiguousConstruction", AMBIGUOUS_CONSTRUCTION, "bare construction of '{sname}' is ambiguous: '{sname}' is a variant of {n} enums; qualify it (e.g. SomeEnum.{sname} \{ ... }) or add a type annotation", node, "qualify with the enum name or annotate the binding")
+                    return TYPE_UNKNOWN
+                }
             }
         }
         return TYPE_UNKNOWN
@@ -5019,7 +5206,10 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
 
         let mut inferred_tid = TYPE_UNKNOWN
         if val != -1 {
+            let saved_hint = tc_construct_hint
+            if declared_tid != TYPE_UNKNOWN { tc_construct_hint = resolve_alias_tid(declared_tid) }
             inferred_tid = infer_type(val)
+            tc_construct_hint = saved_hint
             tc_check_body(val)
         }
 
@@ -5221,7 +5411,10 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     if kind == NodeKind.Return {
         let val = node_value(node)
         if val != -1 {
+            let saved_hint = tc_construct_hint
+            if tc_current_fn_ret != TYPE_VOID && tc_current_fn_ret != TYPE_UNKNOWN { tc_construct_hint = resolve_alias_tid(tc_current_fn_ret) }
             let val_t = infer_type(val)
+            tc_construct_hint = saved_hint
             if tc_current_fn_ret != TYPE_VOID && tc_current_fn_ret != TYPE_UNKNOWN && val_t != TYPE_UNKNOWN {
                 if types_compatible(tc_current_fn_ret, val_t) == 0 {
                     tc_error_at("return value type {type_to_str(val_t)} does not match function '{tc_current_fn_name}' return type {type_to_str(tc_current_fn_ret)}", node)
@@ -5239,6 +5432,12 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
 }
 
 let mut tc_pattern_binding_type: Int = -1
+
+// Expected enum tid for a bare struct-style construction site (`Name { ... }`).
+// Set before infer_type at the four hint sources (binding annotation, return type,
+// fn-arg param, Ok/Err/Some carrier) and consulted FIRST among the unqualified
+// resolution rules. -1 = no hint. Mirrors the tc_pattern_binding_type discipline.
+let mut tc_construct_hint: Int = -1
 
 @allow(UnrestoredMutation)
 fn tc_check_pattern_types(node: Int) ! TypeCheck.Resolve {

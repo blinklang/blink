@@ -1,0 +1,77 @@
+// Negative + diagnostic tests for bare struct-style enum-variant construction (wzhx8z).
+// Spec: decisions/bare-struct-variant-construction.md, sections/03_types.md §3.4.
+//
+// Kind A (struct name == variant name) → E0518 NameCollision (declaration-time, whole-program).
+// Kind B (same variant in two enums) → legal; no-hint residual = E0519 AmbiguousConstruction.
+// Plus the construction-aware UnknownType suggester (edit-distance + threshold).
+
+import compile_test_helpers
+
+// #8 — Kind B residual: two enums define `Pending`, bare `Pending {}` with no hint → E0519.
+test "ambiguous bare construction across two enums emits E0519" {
+    let src = "type JobState \{ Pending \{ id: Int }, Done }\ntype NetState \{ Pending \{ port: Int }, Closed }\nfn main() \{\n    let s = Pending \{ id: 1 }\n    let _ = s\n}\n"
+    compile_test_helpers.expect_compile_error(src, "bare_ambiguous", "E0519")
+}
+
+// #9 — Kind A same-module: struct `NotFound` + enum variant `NotFound` → E0518.
+test "struct name equal to variant name emits E0518 (same module)" {
+    let src = "type NotFound \{ code: Int }\ntype QueryError \{ NotFound \{ msg: Str } }\nfn main() \{ let _ = 1 }\n"
+    compile_test_helpers.expect_compile_error(src, "bare_collision_same_mod", "E0518")
+}
+
+// #10 — Kind A cross-module: struct in a helper module, variant in the entry → E0518 (whole-program).
+test "struct name equal to variant name emits E0518 (cross module)" {
+    let helper = "pub type NotFound \{ code: Int }\n"
+    let entry = "import helper_mod.\{NotFound}\ntype QueryError \{ NotFound \{ msg: Str } }\nfn main() \{ let _ = NotFound \{ code: 1 } }\n"
+    compile_test_helpers.expect_compile_error_xmod(entry, "helper_mod", helper, "bare_collision_xmod", "E0518")
+}
+
+// #11 — narrowness: two enums sharing a variant name (no struct) → NO E0518.
+test "two enums sharing a variant name do not emit E0518" {
+    let src = "type JobState \{ Pending, Done }\ntype NetState \{ Pending, Closed }\nfn main() \{ let _ = 1 }\n"
+    compile_test_helpers.expect_no_error(src, "bare_narrowness", "E0518")
+}
+
+// #11 (wording) — the E0518 message must not imply global uniqueness; it must state that two
+// enums may share a variant name.
+test "E0518 message states two enums may share a variant name" {
+    let src = "type NotFound \{ code: Int }\ntype QueryError \{ NotFound \{ msg: Str } }\nfn main() \{ let _ = 1 }\n"
+    let output = compile_test_helpers.compile_and_capture(src, "bare_collision_wording")
+    assert(output.contains("two different enums MAY share a variant name"))
+}
+
+// #13 — suggester hit: a near-miss variant name gets a `Enum.Variant` suggestion.
+test "unknown bare construction name suggests Enum.Variant" {
+    let src = "type QueryError \{ NotFound \{ msg: Str } }\nfn main() \{ let _ = NotFund \{ msg: \"x\" } }\n"
+    let output = compile_test_helpers.compile_and_capture(src, "bare_suggest_hit")
+    assert(output.contains("QueryError.NotFound"))
+}
+
+// #14 — suggester miss: a far-off name gets a plain UnknownType, no bogus suggestion.
+test "far-off bare construction name has no suggestion" {
+    let src = "type QueryError \{ NotFound \{ msg: Str } }\nfn main() \{ let _ = Xyzzy \{ a: 1 } }\n"
+    let output = compile_test_helpers.compile_and_capture(src, "bare_suggest_miss")
+    assert(output.contains("E0507"))
+    assert(!output.contains("did you mean"))
+}
+
+// #16 — silent struct-wins is gone (regression): the decision-doc scenario yields E0518,
+// never a silent struct value.
+test "decision-doc collision scenario emits E0518 not a silent struct" {
+    let src = "type NotFound \{ code: Int }\ntype QueryError \{ NotFound \{ msg: Str } }\nfn main() \{\n    let x = NotFound \{ code: 404 }\n    let _ = x\n}\n"
+    compile_test_helpers.expect_compile_error(src, "bare_silent_winner_gone", "E0518")
+}
+
+// #12 — golden-C: bare and qualified construction emit byte-identical tagged-union
+// initializers (the critical-finding codegen guard, codegen_expr.bl emit_struct_lit).
+test "bare and qualified construction emit identical tagged-union C" {
+    let bare = "type QueryError \{ NotFound \{ msg: Str } }\nfn main() \{\n    let e = NotFound \{ msg: \"x\" }\n    let _ = e\n}\n"
+    let qual = "type QueryError \{ NotFound \{ msg: Str } }\nfn main() \{\n    let e = QueryError.NotFound \{ msg: \"x\" }\n    let _ = e\n}\n"
+    let c_bare = compile_test_helpers.compile_and_emit_c(bare, "bare_golden_c")
+    let c_qual = compile_test_helpers.compile_and_emit_c(qual, "qual_golden_c")
+    // Both must take the tagged-union path (tag + .data.<variant> payload), not a plain
+    // struct initializer, and produce the same emitted C.
+    assert(c_bare.contains(".data.NotFound"))
+    assert(c_qual.contains(".data.NotFound"))
+    assert_eq(c_bare, c_qual)
+}

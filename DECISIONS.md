@@ -155,6 +155,7 @@ Decided by expert panel vote. See [OPEN_QUESTIONS.md](OPEN_QUESTIONS.md) for ful
 | Range patterns | `..`/`..=` in patterns. Int/sized ints/Char only, compile-time constant bounds | 5-0 |
 | Pattern binding | `as` keyword (`name as pattern`). Not `@` (conflicts with annotations) | 4-1 (AI/ML: defer) |
 | Struct patterns in match | Full: field punning, `..` rest, literal field values. Nominal (type name required) | 5-0 |
+| Bare struct-style variant construction | Support it; hint-first resolution; Kind-A struct/variant name collision = declaration-time error, Kind-B cross-enum sharing legal via hint + use-site AmbiguousConstruction; no silent winner | 6-0 (all Qs) |
 | Refutable vs irrefutable | Strict compile error on refutable `let`. `let`/`for` = irrefutable, `match` = refutable | 5-0 |
 | `Self` type scope | Valid in trait declarations + impl blocks only. Compile error elsewhere | 5-0 |
 | `self` keyword sugar | `self` desugars to `self: Self`. `.method()` requires literal `self` first param | 5-0 |
@@ -430,6 +431,7 @@ Full deliberation records for each decision. Each file contains expert votes, re
 | Trait Sealed-Default Method Semantics | [decisions/trait-sealed-default-methods.md](decisions/trait-sealed-default-methods.md) |
 | Multi-Cleanup Test Registrar | [decisions/multi-cleanup-test-registrar.md](decisions/multi-cleanup-test-registrar.md) |
 | Expected-Failure Tests + Parking | [decisions/xfail-and-parking.md](decisions/xfail-and-parking.md) |
+| Bare Struct-Style Variant Construction | [decisions/bare-struct-variant-construction.md](decisions/bare-struct-variant-construction.md) |
 
 ---
 

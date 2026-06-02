@@ -998,6 +998,69 @@ Most languages split these: `struct` + `enum` (Rust), `data class` + `sealed cla
 
 In Blink, `type` is `type`. If it has variants, it's a sum. If it has fields, it's a product. If it has variants where some carry fields, it's a sum of products. The compiler doesn't care about the taxonomy; it cares about the structure.
 
+#### Variant Construction
+
+Enum variants are constructed by naming the variant and supplying its payload. A variant may be constructed in either of two forms:
+
+```blink
+type QueryError {
+    NotFound { msg: Str }
+    Timeout { ms: Int }
+}
+
+let a = QueryError.NotFound { msg: "id 0" }   // qualified
+let b = NotFound { msg: "id 0" }              // bare — resolves to QueryError.NotFound
+```
+
+The bare form (`NotFound { msg: "x" }`) and the qualified form (`QueryError.NotFound { msg: "x" }`) are equivalent: they construct the same value and emit identical code. Bare construction mirrors the forms that already exist elsewhere in the language — bare tuple-style construction (`Leaf(1)`, see *Generic Types* below) and bare struct-style patterns (`NotFound { msg }` in a `match` arm, §3.5). Construction and pattern matching are duals; both accept the bare and qualified spellings.
+
+**Resolution order.** At a bare struct-style construction site `Name { ... }`, the compiler resolves `Name` in this order:
+
+1. **Qualified** — if the site is already written `Enum.Variant { ... }`, that names the variant directly.
+2. **Hint-directed** — the expected type at the site (a binding annotation, a function return type, a function parameter type, or a `Result`/`Option` carrier such as `Ok`/`Err`/`Some`) names an enum that has a variant `Name`. The hint is consulted *first* among the unqualified rules so that resolution is determined locally: a distant enum declaration can never retroactively change which variant a site resolves to.
+3. **Global-unique** — if no hint applies, `Name` resolves to the one enum variant of that name across the whole program. If the name is not globally unique, see the ambiguity rule below.
+
+Resolution is entirely compile-time; there is no runtime dispatch.
+
+**Name collisions** fall into two distinct kinds:
+
+- **A struct name equal to an enum variant name** is a **compile error at declaration time** (`error[NameCollision]`), reported over the whole program (so it catches collisions across modules). A name is either a product type or a sum injection — never both. This rule is narrowly scoped to the struct-vs-variant case only; it does not require all constructible names to be globally unique.
+
+- **The same variant name in two different enums is legal.** For example, `Pending` may appear in both `JobState` and `NetState`. Such a name is resolved by the hint:
+
+  ```blink
+  type JobState { Pending, Running, Done }
+  type NetState { Pending, Connected }
+
+  let s: JobState = Pending   // hint (binding annotation) selects JobState.Pending
+  ```
+
+  When a bare construction of a name shared across enums has no hint to resolve it, that specific site is a **compile error** (`error[AmbiguousConstruction]`) requiring qualification:
+
+  ```blink
+  fn f() {
+      let x = Pending   // error[AmbiguousConstruction]: 'Pending' is a variant of both
+                        // JobState and NetState; qualify as JobState.Pending or NetState.Pending
+  }
+  ```
+
+No path ever silently picks a winner: every collision is either a declaration-time error (struct vs variant) or a use-site error requiring qualification (variant vs variant with no hint).
+
+A bare struct-style construction with a payload in carrier position resolves through the carrier's expected type:
+
+```blink
+fn lookup(id: Int) -> Result[Str, QueryError] {
+    if id == 0 {
+        return Err(NotFound { msg: "id 0" })   // Err's carrier expects QueryError
+    }
+    Ok("found")
+}
+```
+
+The `..` rest sigil is a pattern-only construct (§3.5); it has no meaning in construction, where every field must be supplied (or defaulted, see *Product Types*).
+
+`blink fmt` does not canonicalize between the bare and qualified forms in either direction — a formatter must never change which entity a name resolves to.
+
 #### Generic Types
 
 Type parameters use square brackets:
