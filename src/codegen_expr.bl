@@ -2117,6 +2117,19 @@ pub fn arg_elem_type_for(rt: Int, list_elem: Int) -> Int {
     list_elem
 }
 
+// Err-side carrier for a Result call argument: the struct name / payload kind
+// in the Err(...) position, threaded via GenericCallArgs.err_struct_names /
+// err_elem_types so a generic `Result[T,E]` param can infer E. Option has no
+// err position, so it contributes nothing.
+pub fn arg_err_struct_name_for(rt: Int) -> Str {
+    if rt == CT_RESULT { return expr_result_err_struct }
+    ""
+}
+pub fn arg_err_elem_type_for(rt: Int) -> Int {
+    if rt == CT_RESULT { return expr_result_err_type }
+    CT_VOID
+}
+
 type ArgMapInfo {
     kt: Int
     ks: Str
@@ -2137,6 +2150,24 @@ fn carrier_from_elem_name(name: Str, fallback: Int) -> CarrierType {
         return CarrierType { sname: name, ct: CT_INT }
     }
     CarrierType { sname: "", ct: fallback }
+}
+
+// Carrier for a just-emitted argument expression. Used when the carrier's
+// annotation name is an unresolved generic param (e.g. the `E` in
+// `Result[Int, E]`), so it can't name the concrete type — we recover it from
+// the emitted value: a struct/enum value carries its name via get_var_struct/
+// get_var_enum, everything else carries its scalar kind. Lets a generic
+// `Result[T,E]` param infer E from the `Err(...)` arg's actual payload.
+fn carrier_from_emitted(expr_str: Str, ct: Int) -> CarrierType {
+    if ct == CT_STRUCT {
+        let sn = get_var_struct(expr_str)
+        if sn != "" { return CarrierType { sname: sn, ct: CT_INT } }
+    }
+    if ct == CT_ENUM {
+        let en = get_var_enum(expr_str)
+        if en != "" { return CarrierType { sname: en, ct: CT_INT } }
+    }
+    CarrierType { sname: "", ct: ct }
 }
 
 pub fn arg_map_info_for(arg_node: Int, rt: Int) -> ArgMapInfo {
@@ -2983,7 +3014,10 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                 cg_expect_arg_ann = saved_arg_ann
                 let err_str = expr_result_str
                 let ok_c = carrier_from_elem_name(ok_name, type_from_name(ok_name))
-                let err_c = carrier_from_elem_name(err_name, expr_result_type)
+                let mut err_c = carrier_from_elem_name(err_name, expr_result_type)
+                if err_c.sname == "" {
+                    err_c = carrier_from_emitted(err_str, expr_result_type)
+                }
                 emit_err_result(err_str, ok_c.ct, err_c.ct, ok_c.sname, err_c.sname)
                 return
             }
@@ -3166,8 +3200,10 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
         let mut args_str = ""
         let mut arg_types: List[Int] = []
         let mut arg_elem_types: List[Int] = []
+        let mut arg_err_elem_types: List[Int] = []
         let mut arg_closure_sigs: List[Str] = []
         let mut arg_struct_names: List[Str] = []
+        let mut arg_err_struct_names: List[Str] = []
         let mut arg_map_key_types: List[Int] = []
         let mut arg_map_key_structs: List[Str] = []
         let mut arg_map_val_types: List[Int] = []
@@ -3197,8 +3233,10 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                 if is_generic != 0 {
                     arg_types.push(expr_result_type)
                     arg_elem_types.push(arg_elem_type_for(expr_result_type, expr_list_elem_type))
+                    arg_err_elem_types.push(arg_err_elem_type_for(expr_result_type))
                     arg_closure_sigs.push(expr_closure_sig)
                     arg_struct_names.push(arg_struct_name_for(expr_result_type, expr_result_str, expr_list_elem_struct))
+                    arg_err_struct_names.push(arg_err_struct_name_for(expr_result_type))
                     let map_info = arg_map_info_for(actual, expr_result_type)
                     arg_map_key_types.push(map_info.kt)
                     arg_map_key_structs.push(map_info.ks)
@@ -3225,8 +3263,10 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                 if is_generic != 0 {
                     arg_types.push(expr_result_type)
                     arg_elem_types.push(arg_elem_type_for(expr_result_type, expr_list_elem_type))
+                    arg_err_elem_types.push(arg_err_elem_type_for(expr_result_type))
                     arg_closure_sigs.push(expr_closure_sig)
                     arg_struct_names.push(arg_struct_name_for(expr_result_type, expr_result_str, expr_list_elem_struct))
+                    arg_err_struct_names.push(arg_err_struct_name_for(expr_result_type))
                     let map_info = arg_map_info_for(arg_node_i, expr_result_type)
                     arg_map_key_types.push(map_info.kt)
                     arg_map_key_structs.push(map_info.ks)
@@ -3241,8 +3281,10 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
             let ca = GenericCallArgs {
                 types: arg_types,
                 elem_types: arg_elem_types,
+                err_elem_types: arg_err_elem_types,
                 closure_sigs: arg_closure_sigs,
                 struct_names: arg_struct_names,
+                err_struct_names: arg_err_struct_names,
                 map_key_types: arg_map_key_types,
                 map_key_structs: arg_map_key_structs,
                 map_val_types: arg_map_val_types,

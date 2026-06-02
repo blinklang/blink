@@ -1133,11 +1133,16 @@ pub let mut generic_fns_by_name: Map[Str, Int] = Map()
 // Bundled per-argument metadata for a generic-fn call, threaded into
 // infer_fn_type_args_from_types / emit_generic_fn_call_tail. Each list is
 // indexed by argument position (parallel to the callee's params).
+// For Result/Option carriers the ok/inner slot is (elem_types, struct_names);
+// the err slot is (err_elem_types, err_struct_names). Option leaves the err
+// slot empty (no err position).
 pub type GenericCallArgs {
     types: List[Int]
     elem_types: List[Int]
+    err_elem_types: List[Int]
     closure_sigs: List[Str]
     struct_names: List[Str]
+    err_struct_names: List[Str]
     map_key_types: List[Int]
     map_key_structs: List[Str]
     map_val_types: List[Int]
@@ -3552,14 +3557,13 @@ pub fn infer_fn_type_args_from_types(fn_node: Int, ca: GenericCallArgs) -> Optio
                     }
                 }
             } else if ptype == "Result" || ptype == "Option" {
-                // Generic Result[T,E] / Option[T] param: infer T from the
-                // ok/inner payload of the Ok(...)/Some(...) call argument.
-                // The carrier struct name lands in arg_struct_names[fi] and
-                // the scalar payload kind in arg_elem_types[fi] (both set by
-                // arg_struct_name_for / arg_elem_type_for at the call site).
-                // NOTE: only the ok/inner position (index 0) is inferable —
-                // the Err position would need a second carrier slot. See the
-                // Err-position follow-up ticket dependent on ssnf6p.
+                // Generic Result[T,E] / Option[T] param: infer from the
+                // payload of the Ok(...)/Some(...)/Err(...) call argument.
+                // Both positions thread now: the ok/inner side via
+                // struct_names[fi] / elem_types[fi] and the err side via
+                // err_struct_names[fi] / err_elem_types[fi] (all set at the
+                // call site by arg_struct_name_for / arg_elem_type_for and
+                // their arg_err_* counterparts).
                 let ta = node_type_ann(p)
                 if ta != -1 {
                     let elems_sl = node_elements(ta)
@@ -3573,6 +3577,20 @@ pub fn infer_fn_type_args_from_types(fn_node: Int, ca: GenericCallArgs) -> Optio
                                 let elt = ca.elem_types.get(fi).unwrap()
                                 if elt >= 0 && elt != CT_VOID {
                                     resolved = type_name_from_ct(elt)
+                                }
+                            }
+                        }
+                        if ptype == "Result" && sublist_length(elems_sl) >= 2 {
+                            let err_ann = sublist_get(elems_sl, 1)
+                            if node_name(err_ann) == param_name {
+                                let err_sn = ca.err_struct_names.get(fi).unwrap()
+                                if err_sn != "" {
+                                    resolved = err_sn
+                                } else {
+                                    let eet = ca.err_elem_types.get(fi).unwrap()
+                                    if eet >= 0 && eet != CT_VOID {
+                                        resolved = type_name_from_ct(eet)
+                                    }
                                 }
                             }
                         }
@@ -5157,7 +5175,7 @@ fn emit_result_typedef(ok_t: Int, err_t: Int) ! Codegen.Emit {
         return
     }
     let c_ok = if ok_t == CT_VOID { "int64_t" } else { c_type_str(ok_t) }
-    let c_err = c_type_str(err_t)
+    let c_err = if err_t == CT_VOID { "int64_t" } else { c_type_str(err_t) }
     emit_td_guard_open(tname)
     emit_line("typedef struct \{ int tag; union \{ {c_ok} ok; {c_err} err; }; } {tname};")
     emit_td_guard_close()
@@ -5250,7 +5268,7 @@ pub fn emit_struct_result_typedef(ok_tag: Str, err_tag: Str) ! Codegen.Emit {
         return
     }
     let c_ok = if ok_tag == "void" || ok_tag == "Void" { "int64_t" } else { c_type_from_tag(ok_tag) }
-    let c_err = c_type_from_tag(err_tag)
+    let c_err = if err_tag == "void" || err_tag == "Void" { "int64_t" } else { c_type_from_tag(err_tag) }
     emit_td_guard_open(tname)
     emit_line("typedef struct \{ int tag; union \{ {c_ok} ok; {c_err} err; }; } {tname};")
     emit_td_guard_close()
