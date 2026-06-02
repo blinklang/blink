@@ -1127,6 +1127,20 @@ pub type GenericFnEntry {
 }
 pub let mut generic_fns: List[GenericFnEntry] = []
 
+// Bundled per-argument metadata for a generic-fn call, threaded into
+// infer_fn_type_args_from_types / emit_generic_fn_call_tail. Each list is
+// indexed by argument position (parallel to the callee's params).
+pub type GenericCallArgs {
+    types: List[Int]
+    elem_types: List[Int]
+    closure_sigs: List[Str]
+    struct_names: List[Str]
+    map_key_types: List[Int]
+    map_key_structs: List[Str]
+    map_val_types: List[Int]
+    map_val_structs: List[Str]
+}
+
 // Mono function instances to emit: (base_fn_name, concrete_args)
 type MonoFnInstance {
     base: Str
@@ -3445,7 +3459,7 @@ pub fn register_mono_fn(base: Str, args: Str) ! Codegen.Register {
     mono_fns.push(MonoFnInstance { base: base, args: args })
 }
 
-pub fn infer_fn_type_args_from_types(fn_node: Int, arg_types: List[Int], arg_elem_types: List[Int], arg_closure_sigs: List[Str], arg_struct_names: List[Str], arg_map_key_types: List[Int], arg_map_key_structs: List[Str], arg_map_val_types: List[Int], arg_map_val_structs: List[Str]) -> Option[Str] {
+pub fn infer_fn_type_args_from_types(fn_node: Int, ca: GenericCallArgs) -> Option[Str] {
     let tparams_sl = node_type_params(fn_node)
     if tparams_sl == -1 {
         return None
@@ -3464,12 +3478,12 @@ pub fn infer_fn_type_args_from_types(fn_node: Int, arg_types: List[Int], arg_ele
         let param_name = node_name(sublist_get(tparams_sl, pi))
         let mut resolved = "Void"
         let mut fi = 0
-        while fi < sublist_length(fn_params_sl) && fi < arg_types.len() {
+        while fi < sublist_length(fn_params_sl) && fi < ca.types.len() {
             let p = sublist_get(fn_params_sl, fi)
             let ptype = node_type_name(p)
             if ptype == param_name {
-                let arg_ct = arg_types.get(fi).unwrap()
-                let arg_sn = arg_struct_names.get(fi).unwrap()
+                let arg_ct = ca.types.get(fi).unwrap()
+                let arg_sn = ca.struct_names.get(fi).unwrap()
                 if (arg_ct == CT_STRUCT || arg_ct == CT_ENUM) && arg_sn != "" {
                     resolved = arg_sn
                 } else {
@@ -3483,12 +3497,12 @@ pub fn infer_fn_type_args_from_types(fn_node: Int, arg_types: List[Int], arg_ele
                         let elem_ann = sublist_get(elems_sl, 0)
                         let elem_name = node_name(elem_ann)
                         if elem_name == param_name {
-                            let elt = arg_elem_types.get(fi).unwrap()
+                            let elt = ca.elem_types.get(fi).unwrap()
                             if elt >= 0 {
                                 resolved = type_name_from_ct(elt)
                             }
-                        } else if elem_name == "Tuple" && fi < arg_struct_names.len() {
-                            let arg_tuple_cname = arg_struct_names.get(fi).unwrap()
+                        } else if elem_name == "Tuple" && fi < ca.struct_names.len() {
+                            let arg_tuple_cname = ca.struct_names.get(fi).unwrap()
                             let tup_elems_sl = if arg_tuple_cname != "" { node_elements(elem_ann) } else { -1 }
                             let entry_idx = if tup_elems_sl != -1 { find_tuple_entry(arg_tuple_cname) } else { -1 }
                             if entry_idx >= 0 {
@@ -3521,23 +3535,23 @@ pub fn infer_fn_type_args_from_types(fn_node: Int, arg_types: List[Int], arg_ele
                     if elems_sl != -1 && sublist_length(elems_sl) >= 2 {
                         let key_ann = sublist_get(elems_sl, 0)
                         let val_ann = sublist_get(elems_sl, 1)
-                        if node_name(key_ann) == param_name && fi < arg_map_key_types.len() {
-                            let aks = arg_map_key_structs.get(fi).unwrap()
+                        if node_name(key_ann) == param_name && fi < ca.map_key_types.len() {
+                            let aks = ca.map_key_structs.get(fi).unwrap()
                             if aks != "" {
                                 resolved = aks
                             } else {
-                                let akt = arg_map_key_types.get(fi).unwrap()
+                                let akt = ca.map_key_types.get(fi).unwrap()
                                 if akt >= 0 && akt != CT_VOID {
                                     resolved = type_name_from_ct(akt)
                                 }
                             }
                         }
-                        if node_name(val_ann) == param_name && fi < arg_map_val_types.len() {
-                            let avs = arg_map_val_structs.get(fi).unwrap()
+                        if node_name(val_ann) == param_name && fi < ca.map_val_types.len() {
+                            let avs = ca.map_val_structs.get(fi).unwrap()
                             if avs != "" {
                                 resolved = avs
                             } else {
-                                let avt = arg_map_val_types.get(fi).unwrap()
+                                let avt = ca.map_val_types.get(fi).unwrap()
                                 if avt >= 0 && avt != CT_VOID {
                                     resolved = type_name_from_ct(avt)
                                 }
@@ -3560,11 +3574,11 @@ pub fn infer_fn_type_args_from_types(fn_node: Int, arg_types: List[Int], arg_ele
                     if elems_sl != -1 && sublist_length(elems_sl) >= 1 {
                         let ok_ann = sublist_get(elems_sl, 0)
                         if node_name(ok_ann) == param_name {
-                            let arg_sn = arg_struct_names.get(fi).unwrap()
+                            let arg_sn = ca.struct_names.get(fi).unwrap()
                             if arg_sn != "" {
                                 resolved = arg_sn
                             } else {
-                                let elt = arg_elem_types.get(fi).unwrap()
+                                let elt = ca.elem_types.get(fi).unwrap()
                                 if elt >= 0 && elt != CT_VOID {
                                     resolved = type_name_from_ct(elt)
                                 }
@@ -3576,8 +3590,8 @@ pub fn infer_fn_type_args_from_types(fn_node: Int, arg_types: List[Int], arg_ele
                 // Generic user struct param like Box[T] — extract concrete
                 // type-args from the actual argument's mono struct name.
                 let ta = node_type_ann(p)
-                if ta != -1 && fi < arg_struct_names.len() {
-                    let arg_sname = arg_struct_names.get(fi).unwrap()
+                if ta != -1 && fi < ca.struct_names.len() {
+                    let arg_sname = ca.struct_names.get(fi).unwrap()
                     if arg_sname != "" {
                         let mi = lookup_mono_base(arg_sname)
                         if mi.base == ptype && mi.args != "" {
@@ -3608,7 +3622,7 @@ pub fn infer_fn_type_args_from_types(fn_node: Int, arg_types: List[Int], arg_ele
                             let fp_ann = sublist_get(fn_elems_sl, fpi)
                             let fp_name = node_name(fp_ann)
                             if fp_name == param_name {
-                                let csig = arg_closure_sigs.get(fi).unwrap()
+                                let csig = ca.closure_sigs.get(fi).unwrap()
                                 let inner_ct = infer_closure_param_type(csig, fpi)
                                 if inner_ct != CT_VOID {
                                     resolved = type_name_from_ct(inner_ct)
@@ -3619,7 +3633,7 @@ pub fn infer_fn_type_args_from_types(fn_node: Int, arg_types: List[Int], arg_ele
                     }
                     let fn_ret = node_return_type(ta)
                     if fn_ret == param_name {
-                        let csig = arg_closure_sigs.get(fi).unwrap()
+                        let csig = ca.closure_sigs.get(fi).unwrap()
                         let ret_ct = infer_closure_ret_type(csig)
                         if ret_ct != CT_VOID {
                             resolved = type_name_from_ct(ret_ct)
