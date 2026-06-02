@@ -15,7 +15,7 @@ import codegen_types.{
     ensure_map_iter, ensure_mixed_result_type, ensure_option_type, ev_field,
     ensure_result_type, ensure_skip_iter, ensure_struct_option_type,
     ensure_struct_result_type, ensure_take_iter,
-    find_from_impl, find_impl_method_node, find_tryfrom_impl, fresh_temp,
+    find_from_impl, find_impl_method_node, impl_method_self_name, find_tryfrom_impl, fresh_temp,
     get_fn_ret, get_fn_ret_struct, get_fn_ret_struct_inner, get_fn_ret_type,
     get_impl_method_ret, get_list_elem_map_key_type, get_list_elem_map_val_type,
     get_list_elem_struct, get_list_elem_type,
@@ -33,7 +33,7 @@ import codegen_types.{
     get_variant_field_type_str, get_variant_index, get_variant_tag,
     has_derive_method, is_compound_ct, is_data_enum, is_enum_type, is_fn_registered, is_scope_var, is_str_backed_enum,
     is_generic_fn, is_struct_type, is_trait_type, is_user_effect_handle,
-    cg_expect_fn_value_sig, get_callee_params_sl,
+    cg_expect_fn_value_sig, cg_expect_arg_ann, arg_type_ann_at, get_callee_params_sl,
     builtin_receiver_type_name,
     is_sized_int_ct, lookup_builtin_trait_impl, lookup_impl_method, mangle_generic_name, mangle_from_method, wrapping_unsigned_c_type,
     option_c_type, reg_fn, register_mono_fn, register_mono_instance,
@@ -73,11 +73,22 @@ fn emit_user_impl_call(node: Int, type_name: Str, method: Str, obj_str: Str) ! C
     let mangled = "{type_name}_{method}"
     let args_sl = node_args(node)
     let mut args_str = obj_str
+    // Callee param sublist for carrier hints. The method node's params include
+    // `self` at index 0, so call arg i maps to method param i + self_offset.
+    let m_def = find_impl_method_node(type_name, method)
+    let m_params_sl = if m_def != -1 { node_params(m_def) } else { -1 }
+    let self_offset = if m_def != -1 && impl_method_self_name(m_def) != "" { 1 } else { 0 }
     if args_sl != -1 {
         let mut i = 0
         while i < sublist_length(args_sl) {
             args_str = args_str.concat(", ")
+            let saved_hint = cg_expect_fn_value_sig
+            cg_expect_fn_value_sig = arg_fn_value_hint(m_params_sl, i + self_offset)
+            let saved_arg_ann = cg_expect_arg_ann
+            cg_expect_arg_ann = arg_type_ann_at(m_params_sl, i + self_offset)
             emit_expr(sublist_get(args_sl, i))
+            cg_expect_arg_ann = saved_arg_ann
+            cg_expect_fn_value_sig = saved_hint
             args_str = args_str.concat(expr_result_str)
             i = i + 1
         }
@@ -89,7 +100,7 @@ fn emit_user_impl_call(node: Int, type_name: Str, method: Str, obj_str: Str) ! C
     // type_from_name() returns CT_VOID. Detect that here and bind a
     // temporary so the resulting variable carries the correct C type.
     if ret_ct == CT_VOID {
-        let m_node = find_impl_method_node(type_name, method)
+        let m_node = m_def
         if m_node != -1 {
             let ret_str = node_return_type(m_node)
             if ret_str != "" && ret_str != "Void" {
@@ -2257,12 +2268,15 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                         let mq_arg_node = sublist_get(args_sl, mqi)
                         let mq_saved_hint = cg_expect_fn_value_sig
                         cg_expect_fn_value_sig = arg_fn_value_hint(mq_callee_params_sl, mqi)
+                        let mq_saved_arg_ann = cg_expect_arg_ann
+                        cg_expect_arg_ann = arg_type_ann_at(mq_callee_params_sl, mqi)
                         emit_expr(mq_arg_node)
+                        cg_expect_arg_ann = mq_saved_arg_ann
                         cg_expect_fn_value_sig = mq_saved_hint
                         mq_args_str = mq_args_str.concat(expr_result_str)
                         if mq_is_generic != 0 {
                             mq_arg_types.push(expr_result_type)
-                            mq_arg_elem_types.push(expr_list_elem_type)
+                            mq_arg_elem_types.push(arg_elem_type_for(expr_result_type, expr_list_elem_type))
                             mq_arg_closure_sigs.push(expr_closure_sig)
                             mq_arg_struct_names.push(arg_struct_name_for(expr_result_type, expr_result_str, expr_list_elem_struct))
                             let mq_map_info = arg_map_info_for(mq_arg_node, expr_result_type)

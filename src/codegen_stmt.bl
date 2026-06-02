@@ -3388,6 +3388,139 @@ fn get_ffi_ann(fn_node: Int) -> Int {
     get_annotation(fn_node, "ffi")
 }
 
+// Resolves the C type string (no parameter name) for a single function
+// parameter `p` whose already-resolved (self/tparam-substituted) type name is
+// `ptype`. Centralizes compound-carrier resolution (Option/Result/Ptr/Tuple/
+// Handler/Fn) so every param-emitting path — top-level fns, impl methods, and
+// generic monomorphization — agrees on the lowering. Falls back to
+// c_type_str(type_from_name(ptype)) for plain scalar/builtin types.
+pub fn param_c_type(p: Int, ptype: Str) -> Str {
+    if ptype == "Fn" {
+        return "blink_closure*"
+    } else if ptype == "Ptr" {
+        let pta = node_type_ann(p)
+        if pta != -1 {
+            let pelems_sl = node_elements(pta)
+            if pelems_sl != -1 && sublist_length(pelems_sl) > 0 {
+                let inner_ann = sublist_get(pelems_sl, 0)
+                let inner_name = node_name(inner_ann)
+                return "{ptr_inner_c_type(inner_name)}*"
+            }
+        }
+        return "void*"
+    } else if ptype == "Tuple" {
+        let ta = node_type_ann(p)
+        if ta != -1 {
+            let tup_name = resolve_tuple_ann(ta, -1, "").unwrap()
+            return c_type_c_name(tup_name)
+        }
+        return "void"
+    } else if is_enum_type(ptype) != 0 {
+        return c_type_c_name(ptype)
+    } else if is_struct_type(ptype) != 0 {
+        return c_type_c_name(ptype)
+    } else if ptype == "Result" {
+        let ta = node_type_ann(p)
+        if ta != -1 {
+            let elems_sl = node_elements(ta)
+            if elems_sl != -1 && sublist_length(elems_sl) >= 2 {
+                let ok_ann = sublist_get(elems_sl, 0)
+                let err_ann = sublist_get(elems_sl, 1)
+                let ok_name = node_name(ok_ann)
+                let err_name = node_name(err_ann)
+                let ok_t = type_from_name(ok_name)
+                let err_t = type_from_name(err_name)
+                let ok_is_type = is_struct_type(ok_name) != 0 || is_enum_type(ok_name) != 0
+                let err_is_type = is_struct_type(err_name) != 0 || is_enum_type(err_name) != 0
+                if ok_is_type || err_is_type {
+                    let ok_tag = if ok_is_type { canonical_struct_tag(ok_name) } else { c_type_tag(ok_t) }
+                    let err_tag = if err_is_type { canonical_struct_tag(err_name) } else { c_type_tag(err_t) }
+                    return "blink_Result_{ok_tag}_{err_tag}"
+                }
+                return result_c_type(ok_t, err_t)
+            }
+            return result_c_type(CT_INT, CT_STRING)
+        }
+        return result_c_type(CT_INT, CT_STRING)
+    } else if ptype == "Option" {
+        let ta = node_type_ann(p)
+        if ta != -1 {
+            let elems_sl = node_elements(ta)
+            if elems_sl != -1 && sublist_length(elems_sl) >= 1 {
+                let inner_ann = sublist_get(elems_sl, 0)
+                let inner_name = node_name(inner_ann)
+                let inner_t = type_from_name(inner_name)
+                if is_struct_type(inner_name) != 0 || is_enum_type(inner_name) != 0 {
+                    return "blink_Option_{canonical_struct_tag(inner_name)}"
+                }
+                return option_c_type(inner_t)
+            }
+            return option_c_type(CT_INT)
+        }
+        return option_c_type(CT_INT)
+    } else if ptype == "Handler" {
+        let ta = node_type_ann(p)
+        if ta != -1 {
+            let elems_sl = node_elements(ta)
+            if elems_sl != -1 && sublist_length(elems_sl) >= 1 {
+                let effect_ann = sublist_get(elems_sl, 0)
+                let effect_name = node_name(effect_ann)
+                let vt = resolve_effect_vtable(effect_name)
+                if vt != "" {
+                    return "{vt}*"
+                }
+            }
+        }
+        return "void*"
+    }
+    c_type_str(type_from_name(ptype))
+}
+
+// Carrier C type for an Option/Result parameter in a monomorphized generic
+// function. Unlike param_c_type (which reads the annotation's inner names
+// verbatim), this resolves type-param inners against the concrete args first
+// — e.g. `Result[T, Str]` with T=SomeStruct lowers to
+// blink_Result_SomeStruct_str — and queues the carrier typedef so it is
+// emitted. Mirrors the mono return-type resolution above.
+fn mono_option_result_param_c_type(p: Int, ptype: Str, tparams_sl: Int, concrete_args: Str) -> Str {
+    let ta = node_type_ann(p)
+    if ta == -1 {
+        if ptype == "Option" { return option_c_type(CT_INT) }
+        return result_c_type(CT_INT, CT_STRING)
+    }
+    let elems_sl = node_elements(ta)
+    if ptype == "Option" {
+        if elems_sl == -1 || sublist_length(elems_sl) < 1 {
+            return option_c_type(CT_INT)
+        }
+        let inner_name = resolve_tparam(node_name(sublist_get(elems_sl, 0)), tparams_sl, concrete_args)
+        let inner_ct = type_from_name(inner_name)
+        if is_struct_type(inner_name) != 0 || is_enum_type(inner_name) != 0 {
+            ensure_struct_option_type(inner_name)
+            return struct_option_c_type(inner_name)
+        }
+        ensure_option_type(inner_ct)
+        return option_c_type(inner_ct)
+    }
+    if elems_sl == -1 || sublist_length(elems_sl) < 2 {
+        return result_c_type(CT_INT, CT_STRING)
+    }
+    let ok_name = resolve_tparam(node_name(sublist_get(elems_sl, 0)), tparams_sl, concrete_args)
+    let err_name = resolve_tparam(node_name(sublist_get(elems_sl, 1)), tparams_sl, concrete_args)
+    let ok_t = type_from_name(ok_name)
+    let err_t = type_from_name(err_name)
+    let ok_is_type = is_struct_type(ok_name) != 0 || is_enum_type(ok_name) != 0
+    let err_is_type = is_struct_type(err_name) != 0 || is_enum_type(err_name) != 0
+    if ok_is_type || err_is_type {
+        let ok_tag = if ok_is_type { canonical_struct_tag(ok_name) } else { c_type_tag(ok_t) }
+        let err_tag = if err_is_type { canonical_struct_tag(err_name) } else { c_type_tag(err_t) }
+        ensure_struct_result_type(ok_tag, err_tag)
+        return "blink_Result_{ok_tag}_{err_tag}"
+    }
+    ensure_result_type(ok_t, err_t)
+    result_c_type(ok_t, err_t)
+}
+
 fn format_params(fn_node: Int) -> Str {
     let has_ev = fn_node_has_effects(fn_node) != 0 && get_ffi_ann(fn_node) == -1
     let params_sl = node_params(fn_node)
@@ -3413,102 +3546,7 @@ fn format_params(fn_node: Int) -> Str {
         if i > 0 {
             result = result.concat(", ")
         }
-        if ptype == "Fn" {
-            result = result.concat("blink_closure* {pname}")
-        } else if ptype == "Ptr" {
-            let pta = node_type_ann(p)
-            if pta != -1 {
-                let pelems_sl = node_elements(pta)
-                if pelems_sl != -1 && sublist_length(pelems_sl) > 0 {
-                    let inner_ann = sublist_get(pelems_sl, 0)
-                    let inner_name = node_name(inner_ann)
-                    result = result.concat("{ptr_inner_c_type(inner_name)}* {pname}")
-                } else {
-                    result = result.concat("void* {pname}")
-                }
-            } else {
-                result = result.concat("void* {pname}")
-            }
-        } else if ptype == "Tuple" {
-            let ta = node_type_ann(p)
-            if ta != -1 {
-                let tup_name = resolve_tuple_ann(ta, -1, "").unwrap()
-                result = result.concat("{c_type_c_name(tup_name)} {pname}")
-            } else {
-                result = result.concat("void {pname}")
-            }
-        } else if is_enum_type(ptype) != 0 {
-            result = result.concat("{c_type_c_name(ptype)} {pname}")
-        } else if is_struct_type(ptype) != 0 {
-            result = result.concat("{c_type_c_name(ptype)} {pname}")
-        } else if ptype == "Result" {
-            let ta = node_type_ann(p)
-            if ta != -1 {
-                let elems_sl = node_elements(ta)
-                if elems_sl != -1 && sublist_length(elems_sl) >= 2 {
-                    let ok_ann = sublist_get(elems_sl, 0)
-                    let err_ann = sublist_get(elems_sl, 1)
-                    let ok_name = node_name(ok_ann)
-                    let err_name = node_name(err_ann)
-                    let ok_t = type_from_name(ok_name)
-                    let err_t = type_from_name(err_name)
-                    let ok_is_type = is_struct_type(ok_name) != 0 || is_enum_type(ok_name) != 0
-                    let err_is_type = is_struct_type(err_name) != 0 || is_enum_type(err_name) != 0
-                    if ok_is_type || err_is_type {
-                        let ok_tag = if ok_is_type { canonical_struct_tag(ok_name) } else { c_type_tag(ok_t) }
-                        let err_tag = if err_is_type { canonical_struct_tag(err_name) } else { c_type_tag(err_t) }
-                        result = result.concat("blink_Result_{ok_tag}_{err_tag} {pname}")
-                    } else {
-                        result = result.concat("{result_c_type(ok_t, err_t)} {pname}")
-                    }
-                } else {
-                    result = result.concat("{result_c_type(CT_INT, CT_STRING)} {pname}")
-                }
-            } else {
-                result = result.concat("{result_c_type(CT_INT, CT_STRING)} {pname}")
-            }
-        } else if ptype == "Option" {
-            let ta = node_type_ann(p)
-            if ta != -1 {
-                let elems_sl = node_elements(ta)
-                if elems_sl != -1 && sublist_length(elems_sl) >= 1 {
-                    let inner_ann = sublist_get(elems_sl, 0)
-                    let inner_name = node_name(inner_ann)
-                    let inner_t = type_from_name(inner_name)
-                    if is_struct_type(inner_name) != 0 || is_enum_type(inner_name) != 0 {
-                        result = result.concat("blink_Option_{canonical_struct_tag(inner_name)} {pname}")
-                    } else {
-                        result = result.concat("{option_c_type(inner_t)} {pname}")
-                    }
-                } else {
-                    result = result.concat("{option_c_type(CT_INT)} {pname}")
-                }
-            } else {
-                result = result.concat("{option_c_type(CT_INT)} {pname}")
-            }
-        } else if ptype == "Handler" {
-            let ta = node_type_ann(p)
-            if ta != -1 {
-                let elems_sl = node_elements(ta)
-                if elems_sl != -1 && sublist_length(elems_sl) >= 1 {
-                    let effect_ann = sublist_get(elems_sl, 0)
-                    let effect_name = node_name(effect_ann)
-                    let vt = resolve_effect_vtable(effect_name)
-                    if vt != "" {
-                        result = result.concat("{vt}* {pname}")
-                    } else {
-                        result = result.concat("void* {pname}")
-                    }
-                } else {
-                    result = result.concat("void* {pname}")
-                }
-            } else {
-                result = result.concat("void* {pname}")
-            }
-        } else {
-            let ct = type_from_name(ptype)
-            result = result.concat("{c_type_str(ct)} {pname}")
-        }
+        result = result.concat("{param_c_type(p, ptype)} {pname}")
         i = i + 1
     }
     if has_ev {
@@ -3550,24 +3588,7 @@ pub fn format_impl_params(fn_node: Int, impl_type: Str) -> Str {
                     result = result.concat(", ")
                 }
                 _first = 0
-                if ptype == "Fn" {
-                    result = result.concat("blink_closure* {pname}")
-                } else if ptype == "Tuple" {
-                    let ta = node_type_ann(p)
-                    if ta != -1 {
-                        let tup_name = resolve_tuple_ann(ta, -1, "").unwrap()
-                        result = result.concat("{c_type_c_name(tup_name)} {pname}")
-                    } else {
-                        result = result.concat("void {pname}")
-                    }
-                } else if is_struct_type(ptype) != 0 {
-                    result = result.concat("{c_type_c_name(ptype)} {pname}")
-                } else if is_enum_type(ptype) != 0 {
-                    result = result.concat("{c_type_c_name(ptype)} {pname}")
-                } else {
-                    let ct = type_from_name(ptype)
-                    result = result.concat("{c_type_str(ct)} {pname}")
-                }
+                result = result.concat("{param_c_type(p, ptype)} {pname}")
             }
             i = i + 1
         }
@@ -5014,6 +5035,9 @@ fn emit_mono_fn_def(fn_node: Int, concrete_args: Str) ! Codegen.Emit, Codegen.Re
                 params_c = params_c.concat("{p_c_type} {pname}")
             } else if is_enum_type(resolved_ptype) != 0 {
                 params_c = params_c.concat("{c_type_c_name(resolved_ptype)} {pname}")
+            } else if resolved_ptype == "Option" || resolved_ptype == "Result" {
+                let p_c_type = mono_option_result_param_c_type(p, resolved_ptype, tparams_sl, concrete_args)
+                params_c = params_c.concat("{p_c_type} {pname}")
             } else {
                 let ct = type_from_name(resolved_ptype)
                 params_c = params_c.concat("{c_type_str(ct)} {pname}")
@@ -5131,6 +5155,40 @@ fn emit_mono_fn_def(fn_node: Int, concrete_args: Str) ! Codegen.Emit, Codegen.Re
                     if ta != -1 {
                         let tup_name = resolve_tuple_ann(ta, tparams_sl, concrete_args).unwrap()
                         set_var_struct(pname, tup_name)
+                    }
+                }
+                if resolved_ptype == "Option" {
+                    let ta = node_type_ann(p)
+                    if ta != -1 {
+                        let elems_sl = node_elements(ta)
+                        if elems_sl != -1 && sublist_length(elems_sl) >= 1 {
+                            let inner_name = resolve_tparam(node_name(sublist_get(elems_sl, 0)), tparams_sl, concrete_args)
+                            let inner_ct = type_from_name(inner_name)
+                            if is_struct_type(inner_name) != 0 || is_enum_type(inner_name) != 0 {
+                                set_var_option_struct(pname, CT_INT, inner_name)
+                            } else {
+                                set_var_option(pname, inner_ct)
+                            }
+                        }
+                    }
+                }
+                if resolved_ptype == "Result" {
+                    let ta = node_type_ann(p)
+                    if ta != -1 {
+                        let elems_sl = node_elements(ta)
+                        if elems_sl != -1 && sublist_length(elems_sl) >= 2 {
+                            let ok_name = resolve_tparam(node_name(sublist_get(elems_sl, 0)), tparams_sl, concrete_args)
+                            let err_name = resolve_tparam(node_name(sublist_get(elems_sl, 1)), tparams_sl, concrete_args)
+                            let ok_ct = type_from_name(ok_name)
+                            let err_ct = type_from_name(err_name)
+                            let ok_s = if is_struct_type(ok_name) != 0 || is_enum_type(ok_name) != 0 { ok_name } else { "" }
+                            let err_s = if is_struct_type(err_name) != 0 || is_enum_type(err_name) != 0 { err_name } else { "" }
+                            if ok_s != "" || err_s != "" {
+                                set_var_result_struct(pname, ok_ct, err_ct, ok_s, err_s)
+                            } else {
+                                set_var_result(pname, ok_ct, err_ct)
+                            }
+                        }
                     }
                 }
             }

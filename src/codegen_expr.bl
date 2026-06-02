@@ -720,7 +720,7 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
                         }
                     } else if fa_type == CT_OPTION {
                         expr_option_inner = tp_child1_kind(fa_tp)
-                        let fa_opt_sname = tp_get_sname(fa_tp)
+                        let fa_opt_sname = tp_child1_sname(fa_tp)
                         expr_option_inner_struct = if fa_opt_sname != "" { fa_opt_sname } else { "" }
                     } else if fa_type == CT_RESULT {
                         expr_result_ok_type = tp_child1_kind(fa_tp)
@@ -2101,7 +2101,20 @@ fn pa_op_renderable(op: Str) -> Int {
 pub fn arg_struct_name_for(rt: Int, rs: Str, list_elem_struct: Str) -> Str {
     if rt == CT_STRUCT { return get_var_struct(rs) }
     if rt == CT_LIST { return list_elem_struct }
+    if rt == CT_RESULT { return expr_result_ok_struct }
+    if rt == CT_OPTION { return expr_option_inner_struct }
     ""
+}
+
+// Carrier element-type for a generic call argument: the inner type-kind to
+// thread into infer_fn_type_args_from_types via arg_elem_types[fi]. For a
+// List it's the element kind (carried by emit_expr in expr_list_elem_type);
+// for a Result/Option carrier it's the ok/inner payload kind. Lets a generic
+// `Result[T,E]`/`Option[T]` param infer T from an `Ok(7)`/`Some(7)` scalar arg.
+pub fn arg_elem_type_for(rt: Int, list_elem: Int) -> Int {
+    if rt == CT_RESULT { return expr_result_ok_type }
+    if rt == CT_OPTION { return expr_option_inner }
+    list_elem
 }
 
 type ArgMapInfo {
@@ -2860,7 +2873,17 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                 emit_expr(sublist_get(args_sl, 0))
                 cg_expect_arg_ann = saved_arg_ann
                 let ok_str = expr_result_str
-                let ok_c = carrier_from_elem_name(ok_name, expr_result_type)
+                let ok_inner_ct = expr_result_type
+                let ok_inner_struct = get_var_struct(ok_str)
+                let mut ok_c = carrier_from_elem_name(ok_name, ok_inner_ct)
+                // When the expected ok ann is a generic type-param (e.g.
+                // `Result[T, Str]`), carrier_from_elem_name leaves sname empty
+                // (it only sets it for a concrete struct/enum) — recover the
+                // carrier from the emitted argument's own struct/enum so the
+                // Ok payload keeps its real type.
+                if ok_c.sname == "" && ok_inner_struct != "" {
+                    ok_c = CarrierType { sname: ok_inner_struct, ct: CT_INT }
+                }
                 let err_c = carrier_from_elem_name(err_name, type_from_name(err_name))
                 emit_ok_result(ok_str, ok_c.ct, err_c.ct, ok_c.sname, err_c.sname)
                 return
@@ -3173,7 +3196,7 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                 args_str = args_str.concat(expr_result_str)
                 if is_generic != 0 {
                     arg_types.push(expr_result_type)
-                    arg_elem_types.push(expr_list_elem_type)
+                    arg_elem_types.push(arg_elem_type_for(expr_result_type, expr_list_elem_type))
                     arg_closure_sigs.push(expr_closure_sig)
                     arg_struct_names.push(arg_struct_name_for(expr_result_type, expr_result_str, expr_list_elem_struct))
                     let map_info = arg_map_info_for(actual, expr_result_type)
@@ -3201,7 +3224,7 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                 args_str = args_str.concat(expr_result_str)
                 if is_generic != 0 {
                     arg_types.push(expr_result_type)
-                    arg_elem_types.push(expr_list_elem_type)
+                    arg_elem_types.push(arg_elem_type_for(expr_result_type, expr_list_elem_type))
                     arg_closure_sigs.push(expr_closure_sig)
                     arg_struct_names.push(arg_struct_name_for(expr_result_type, expr_result_str, expr_list_elem_struct))
                     let map_info = arg_map_info_for(arg_node_i, expr_result_type)
