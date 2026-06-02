@@ -1285,6 +1285,37 @@ A four-case decision rule, mechanical enough for AI code generators to apply wit
 
 ---
 
+#### 8.10.7 Map/Set hash seed determinism
+
+`Map` and `Set` randomize their hash seed per process by default (§3.6, Hash Contract and Seeding). Iteration order therefore varies between runs. Two mechanisms pin it for cases that need byte-stable output — golden-file tests, fixture-driven runners, and the self-hosting Gen1/Gen2 diff:
+
+- **`--deterministic`** (a `build` / `run` / `test` flag): pins the hash seed to `0`. The pin is baked into the emitted program, so a `--deterministic`-built binary reproduces its iteration order regardless of environment. This is the knob golden-file and self-host-diff runs pass.
+- **`BLINK_MAP_SEED=<u64>`** (environment variable, decimal): pins the hash seed to an arbitrary value at runtime, without recompiling. It is the no-rebuild reproduction path — capture the seed a failing run reports and re-run with `BLINK_MAP_SEED=<value>` — and, unlike a flag, it propagates across `process_run`/`exec` boundaries to child processes.
+
+Precedence, highest first: `--deterministic` (pins `0`) > `BLINK_MAP_SEED` (pins its value) > entropy (`time ^ pid`, the default). Both are **reproducibility mechanisms, not security controls**: the seed grants no capability and the value is not part of any program's observable semantics (§3.6).
+
+**Relationship to `--seed`.** The test runner's `--seed` (§8.10.4) is a separate knob: it seeds the RNG / `prop_check` input streams, and does **not** affect `Map`/`Set` hash seeding. Map-iteration determinism is controlled only by `--deterministic` / `BLINK_MAP_SEED`. The two are independent because reproducing a random *draw* and reproducing hash *bucketing* are different concerns; pinning one does not pin the other (panel: 3-2-1, resolved NO / keep-distinct by user tiebreak — see [decisions/hash-seed-iteration-order.md](../decisions/hash-seed-iteration-order.md)).
+
+##### `W1401 MapOrderAssumption`
+
+Because the default seed is randomized, code that asserts on or indexes into `Map`/`Set` iteration order is a latent bug. The compiler emits the default-on warning `W1401 MapOrderAssumption` when a `keys()`, `values()`, or `entries()` result flows into a positional index or an equality assertion with **no intervening `sort()`/`sorted()`**, with a machine-applicable fix that inserts the sort:
+
+```
+warning[W1401]: this compares Map iteration order, which is unspecified
+  --> test_config.bl:18:5
+   |
+18 |     assert_eq(m.keys(), ["a", "b"])
+   |               ^^^^^^^^ Map/Set iteration order is randomized and not stable across runs
+   |
+   = fix: sort before comparing
+   |       assert_eq(m.keys().sorted(), ["a", "b"])
+   = note: run with --deterministic only to pin a specific order intentionally
+```
+
+The analysis is **intraprocedural and direct-flow only**: order that reaches an assertion through a helper function, a closure, or a collection round-trip is **not** analyzed and will not warn. This bound is deliberate — it caps the maintenance surface and keeps the false-positive rate low enough to ship the lint default-on. Iterating a `Map`/`Set` to fold, sum, or print does not warn; only positional / equality assumptions do (panel: 5-1, Minimalism dissent — prefers deferring the lint until a friction signal shows the randomized default isn't catching the mistake at runtime).
+
+---
+
 ### 8.11 Token Efficiency Analysis
 
 Blink's AI-efficiency gains come from three compounding layers. Each layer delivers real savings; together they are transformative.

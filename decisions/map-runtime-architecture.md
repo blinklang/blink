@@ -47,10 +47,12 @@ and passes its address into `blink_map_new(&kops_<K>)`.
 
 ## Float keys
 
-Rejected at typecheck (`E1301 MapKeyNotHashable`). Float does not implement Hash.
-Hint: "consider rounding to Int first."
+Rejected at typecheck (`E1400 MapKeyNotHashable`). Float does not implement Hash.
+Hint: "round the key to an Int (or another integer width) before inserting."
 
 ## Hash seed
 
-Phase 5 adds `blink_map_set_seed(uint64_t)` + `--deterministic` CLI flag.
-Default seed is 0 until tn17vz /deliberate ratifies the seed contract.
+`blink_map_set_seed(uint64_t)` + `--deterministic` CLI flag + `BLINK_MAP_SEED` env.
+Default seed is **randomized per process** (`time ^ pid`); `--deterministic` pins 0.
+The seed contract is ratified by tn17vz — see
+[decisions/hash-seed-iteration-order.md](hash-seed-iteration-order.md).

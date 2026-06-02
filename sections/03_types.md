@@ -1515,6 +1515,28 @@ type Ordering {
 }
 ```
 
+#### Hash Contract and Seeding
+
+`hash(self) -> U64` returns a **pre-seed** value. Implementations must satisfy the coherence law with `Eq`: for any `a` and `b`, `a == b` implies `a.hash() == b.hash()`. Coherence holds at the trait level and is **independent of any runtime seed** — it is a property of `hash` against `eq`, not of how the runtime stores keys.
+
+`Map` and `Set` mix a **process-global seed** into hash values before bucket selection. The seed is drawn once at process start and is **randomized per process by default**: iteration order over a `Map` or `Set`, and the concrete bucket a key lands in, vary from run to run, build to build, and across compiler versions. This is deliberate — randomization forces accidental order-dependence to fail early rather than rot silently (vote: 6-0; see [Hash Seed & Iteration Order rationale](../decisions/hash-seed-iteration-order.md)).
+
+The seed perturbs **only** bucket placement. It is never observable through `hash()`, never stored, serialized, or compared, and is set once before `main` runs — it is not an effect, not a capability, and there is no API that reads or sets it from Blink code. Programs therefore **must not** depend on iteration order; code that needs a stable order must sort the keys or entries explicitly:
+
+```blink
+let mut names = scores.keys()
+names.sort()
+for name in names {
+    io.println("{name}: {scores.get(name).unwrap()}")
+}
+```
+
+A function whose result depends on unsorted `Map`/`Set` iteration order is **not** referentially transparent with respect to its `Map`/`Set` arguments, even though it has no effect annotation. The compiler's purity analysis (§4 effects, truly-pure classification) treats iteration over a `Map`/`Set` as an opaque-order read of process state: any function that iterates a `Map` or `Set` is conservatively excluded from memoization and reordering. Iteration order is **not** part of a `Map`/`Set` value's identity — two maps with equal entry sets are `==`-equal regardless of insertion history or seed.
+
+**Float keys.** `F32`/`F64` do not implement `Hash`, and a `Float` (or any type transitively containing one) used as a `Map`/`Set` key is rejected at type-check as `E1400 MapKeyNotHashable`. This is a permanent contract, not a missing impl: float equality cannot satisfy the `Eq`/`Hash` coherence law — `-0.0 == 0.0` holds while the two have distinct bit patterns, so a bitwise hash would map equal values to different buckets. Round to an integer key instead.
+
+For pinning the seed (golden-file tests, fixture-driven runners, self-hosting diff stability) and for the `--deterministic` flag and `BLINK_MAP_SEED` environment variable, see §8.10.
+
 #### The `final` Modifier
 
 A trait may declare a default method as `final` to seal it against override. The `final` keyword is a method-level modifier on trait default methods only — it appears nowhere else in the language.
@@ -1720,7 +1742,7 @@ Operands must be the same type. Mixed-type arithmetic (`Int + Float`) is a compi
 - `NaN == NaN` is `true` (restores reflexivity)
 - `NaN` sorts greater than all other values
 - `-0.0 == 0.0` is `true`
-- `Float` does **not** implement `Hash` (float equality is fraught for hashing)
+- `Float` does **not** implement `Hash` — bitwise hashing cannot stay coherent with `Eq` (e.g. `-0.0 == 0.0` with distinct bit patterns), so `Float` keys are rejected as `E1400` (see Hash Contract and Seeding, §3.6)
 
 For IEEE 754-strict comparison where `NaN != NaN` and `-0.0 != 0.0`: use `float.ieee_eq(other)` from stdlib.
 
