@@ -2,6 +2,23 @@
 
 Single source of truth for release history. `blink llms` and `blink llms --full` both append this file after the reference text, and every release version is indexed as a topic (e.g. `blink llms --topic v0.36`). **Edit only here** — `llms.md` and `llms-full.md` hold only a `## Recent Changes` stub pointing at this file.
 
+## What's New (v0.46.0)
+
+- **Bare struct-style enum-variant construction.** `Variant { field: x }` now works without an enum qualifier, mirroring the long-supported bare tuple construction and bare struct-style *patterns*. Resolution is hint-first (binding annotation, return type, fn-arg param, or `Ok`/`Err`/`Some` carrier), falling back to a global-unique variant lookup. Bare and qualified forms emit byte-identical C.
+- **New diagnostic E0518 (NameCollision)** — a struct type whose name equals an enum variant name is now a declaration-time error (bare construction would be ambiguous). Narrow: two enums may still share a variant name.
+- **New diagnostic E0519 (AmbiguousConstruction)** — a bare `Variant { ... }` naming a variant that exists in more than one enum, with no expected type to disambiguate, is now a use-site error instead of silently picking one. (Replaces the prior silent struct-wins miscompile hazard.)
+
+## Fixes (v0.46.0)
+
+- **Call arguments are now type-checked.** Passing the wrong shape (e.g. `List[Int]` where `List[(Str, T)]` is expected) previously compiled and segfaulted at runtime; calls now verify each argument against its parameter type. (`resolve_type_ann` gained a Tuple case; `types_compatible` gained tuple recursion. Alias-underlying refinements and integer literals stay compatible.)
+- **Bare `None`/`Some`/`Ok`/`Err` now adopt the correct carrier from context** — struct/enum fields, tuple slots, struct-literal fields, call arguments, method-call arguments, and generic-fn parameters. Previously these defaulted to `Option_int`/`Result_int_str`/`Option_void` and failed at C-compile time (errors the type-checker couldn't catch).
+- **`Option[T]`/`Result[T,E]` typed parameters in methods and generic functions** no longer lower to a bare `void`; they emit their proper carrier C type.
+- **Generic `Result[T, E]` infers `T` from the `Err` position** of a `Result` argument, not just the `Ok` position. `handle(Err(SomeErr { ... }))` against `handle[E](r: Result[Int, E])` now compiles.
+- **Tuple carrier element tags are canonicalized at the annotation path** (return types, params, closures, map keys), so a type used both inside its module and at a selective-import site no longer produces two distinct mangled tuple-carrier C names ("incompatible types").
+- **`let _ = expr` no longer collides** ("redefinition of '_'") when multiple discards appear in one scope.
+- **Bare struct-style enum-variant patterns** (`QueryError { a, b, .. }` with no `Type.` qualifier) now bind and match correctly, routing field access through the variant's data union.
+- **Generic closures returning a tuple** (`fn(T) -> (T, U)`) resolve the tuple carrier instead of lowering to `void`.
+
 ## Breaking Changes (v0.45.0)
 
 - **SQLite is no longer bundled in the compiler binary.** Programs link SQLite only when they `import std.db_sqlite` (or a transitive db module). It ships as a sidecar under `share/blink/native/sqlite3/` and is resolved automatically by installed binaries. Pin your own build with `[native-dependencies] sqlite3 = { path = "vendor/sqlite3.c" }`. **Upgrading from ≤0.44.x:** reinstall via the v0.45.0 installer so the sidecar is present; if you maintain a custom layout, ensure `share/blink/native/` ships alongside the binary, or use the manifest override.
