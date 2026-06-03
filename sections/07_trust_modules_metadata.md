@@ -1554,7 +1554,7 @@ All built-in types are in the prelude. They are available in every module withou
 
 #### Prelude Traits
 
-All compiler-known traits are in the prelude. These traits participate in operator desugaring, `for` loop expansion, `@derive`, string interpolation, and conversion protocols. Requiring imports for them would mean every file using `==`, `<`, `for`, or `"{value}"` needs boilerplate imports.
+All compiler-known traits are in the prelude. They are compiler-known for one of two reasons: they participate in operator desugaring, `for` loop expansion, `@derive`, string interpolation, and conversion protocols; **or** they back the method surface of a built-in type (`"x".len()`, `sb.write(...)`). Requiring imports for either would mean every file using `==`, `<`, `for`, `"{value}"`, or `.len()` needs boilerplate imports.
 
 | Trait | Used by |
 |-------|---------|
@@ -1570,6 +1570,14 @@ All compiler-known traits are in the prelude. These traits participate in operat
 | `Closeable` | `with...as` scoped resources |
 | `Iterator[T]` | Lazy iteration, adapter methods |
 | `IntoIterator[T]` | `for x in expr` desugaring |
+| `Sized` | `.len()` / `.is_empty()` on built-in types |
+| `Contains` | `.contains()` element membership (`Set`; `List`/`Map` planned) |
+| `StrOps`, `BytesOps`, `StringBuildOps` | methods on `Str` / `Bytes` / `StringBuilder` |
+| `ListOps`, `MapOps`, `SetOps`, `Joinable` | methods on `List` / `Map` / `Set` |
+
+The built-in method-surface traits (`Sized`, `Contains`, `StrOps`, `BytesOps`, `StringBuildOps`, `ListOps`, `MapOps`, `SetOps`, `Joinable`) are **sealed**: their implementations are compiler-provided for the built-in types, and user code may neither implement nor redefine them (see §3.2.2 for the full method surface and the sealing rule). Method dispatch on a built-in receiver is resolved intrinsically and never depends on the trait name being imported.
+
+Because every prelude name is unconditionally in scope, **importing a prelude name is permitted and has no effect** — it binds nothing new and is not an error.
 
 #### Test Builtins
 

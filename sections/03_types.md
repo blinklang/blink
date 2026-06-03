@@ -246,7 +246,7 @@ fn build_json(fields: List[(Str, Str)]) -> Str {
 }
 ```
 
-`StringBuilder` is a mutable buffer backed by a contiguous byte array with amortized O(1) append. It lives in `std.str` (Tier 1) and requires explicit import. Methods are on the compiler-known `StringBuildOps` trait:
+`StringBuilder` is a mutable buffer backed by a contiguous byte array with amortized O(1) append. It is a compiler-known built-in type: like `Str`/`List`/`Map`/`Set`, both the type name (including `StringBuilder.new()` / `StringBuilder.with_capacity(n)`) and its methods are in the prelude and require no import. Methods are on the compiler-known `StringBuildOps` trait:
 
 ```blink
 trait StringBuildOps {
@@ -318,16 +318,17 @@ trait Contains[T] {
 }
 ```
 
-| Type | `contains` semantics |
-|------|---------------------|
-| `List[T]` | Linear scan for element equality |
-| `Map[K, V]` | Key presence check (equivalent to `contains_key`) |
-| `Set[T]` | Hash-based membership test |
-| `Str` | Substring presence (already in `StrOps`, `Contains` not applied) |
+| Type | `contains` semantics | Status |
+|------|---------------------|--------|
+| `Set[T]` | Hash-based membership test | Implemented |
+| `List[T]` | Linear scan for element equality | **Not yet implemented** |
+| `Map[K, V]` | Key presence check (equivalent to `contains_key`) | **Not yet implemented** |
 
 **Why a shared trait.** Containment is a universal set-theoretic predicate — "is X in this collection?" Every collection answers it, and generic code benefits: `fn has_item[C: Contains[T], T](c: C, item: T) -> Bool { c.contains(item) }`. The alternative — putting `contains` in each per-type trait — prevents writing functions generic over "any collection that can test membership." (Vote: 5-0.)
 
-**Note on `Str`.** `Str` implements `StrOps.contains(Str)` for substring search (§3.2.1). `Str` does not implement `Contains[Char]` — use `StrOps.contains("{c}")` for character search. This avoids confusion between "contains substring" and "contains element" semantics.
+**Implementation status.** Currently only `Set` implements `Contains`. `List.contains` and `Map.contains` are part of the intended design (above) but are **not yet implemented** — calling `.contains()` on a list or map is currently a compile error (`UnresolvedMethod`). Use `MapOps.contains_key` for maps in the meantime; list membership is expressible via `xs.into_iter().filter(...)` until the impls land.
+
+**Note on `Str`.** `Str` exposes substring search as `"hello".contains("ell")` — semantically "contains substring," not "contains element." This routes through `StrOps` (§3.2.1); `Str` is not a meaningful `Contains[Char]` element-membership type. For character search use `someStr.contains("{c}")`.
 
 ##### The `ListOps` Trait
 
@@ -359,7 +360,7 @@ The full `List[T]` method surface (13 methods from `ListOps` + 2 from `Sized` + 
 |--------|-----------|---------|-------|
 | `len` | `fn(self) -> Int` | no | Via `Sized` |
 | `is_empty` | `fn(self) -> Bool` | no | Via `Sized` |
-| `contains` | `fn(self, T) -> Bool` | no | Via `Contains`, linear scan |
+| `contains` | `fn(self, T) -> Bool` | no | Via `Contains`, linear scan — **not yet implemented** (see §3.2.2 *The `Contains` Trait*) |
 | `get` | `fn(self, Int) -> Option[T]` | no | Safe indexed access |
 | `last` | `fn(self) -> Option[T]` | no | Last element |
 | `index_of` | `fn(self, T) -> Option[Int]` | no | First occurrence |
@@ -386,7 +387,7 @@ let sorted = items.sort()            // [1, 1, 4, 5, 99] — new list
 let rev = items.reverse()            // [5, 1, 4, 1, 99] — new list
 let combined = items.append([6, 7])  // [99, 1, 4, 1, 5, 6, 7] — new list
 
-items.contains(4)                    // true
+items.contains(4)                    // intended: true — but not yet implemented (§3.2.2)
 items.index_of(1)                    // Some(1) — first occurrence
 items.last()                         // Some(5)
 items.clear()                        // items is now [], capacity retained
@@ -421,7 +422,7 @@ The full `Map[K, V]` method surface (9 methods from `MapOps` + 2 from `Sized` + 
 |--------|-----------|---------|-------|
 | `len` | `fn(self) -> Int` | no | Via `Sized` |
 | `is_empty` | `fn(self) -> Bool` | no | Via `Sized` |
-| `contains` | `fn(self, K) -> Bool` | no | Via `Contains`, key presence |
+| `contains` | `fn(self, K) -> Bool` | no | Via `Contains`, key presence — **not yet implemented**; use `contains_key` (see §3.2.2 *The `Contains` Trait*) |
 | `get` | `fn(self, K) -> Option[V]` | no | Lookup by key |
 | `get_or_default` | `fn(self, K, V) -> V` | no | Lookup with fallback |
 | `keys` | `fn(self) -> List[K]` | no | All keys (unspecified order) |
@@ -440,7 +441,7 @@ config.insert("port", "8080")
 let host = config.get("host")              // Some("localhost")
 let timeout = config.get_or_default("timeout", "30")  // "30"
 config.contains_key("port")                // true
-config.contains("port")                    // true (Contains trait, same as contains_key)
+config.contains("port")                    // intended: true (Contains, same as contains_key) — not yet implemented (§3.2.2)
 
 let ks = config.keys()                     // ["host", "port"] (unspecified order)
 let vs = config.values()                   // ["localhost", "8080"] (unspecified order)
@@ -495,18 +496,28 @@ let combined = a.union(b)                  // all elements from both
 
 ##### Trait Summary
 
+These are the **built-in method-surface traits** — the traits that host the method API of the built-in types. Like every compiler-known trait, they are in the prelude (§10.6): the trait names are in scope without import, and method dispatch on a built-in receiver (`"x".len()`, `sb.write(...)`) is resolved intrinsically by the compiler to a direct call — it never consults whether the trait name is imported.
+
 | Trait | Applies to | Methods | In prelude |
 |-------|-----------|---------|------------|
-| `Sized` | Str, List, Map, Set, StringBuilder | `len`, `is_empty` | Yes |
-| `Contains[T]` | List, Map, Set | `contains` | Yes |
+| `Sized` | Str, List, Map, Set, Bytes, StringBuilder | `len`, `is_empty` | Yes |
+| `Contains[T]` | Set | `contains` (element membership) | Yes |
+| `StrOps` | Str | string methods (`char_at`, `byte_at`, `contains`, `split`, `to_upper`, `trim`, `replace`, …) | Yes |
+| `BytesOps` | Bytes | byte methods (`push`, `get`, `slice`, `to_str`, `to_hex`, `read_u32_be`, …) | Yes |
 | `ListOps[T]` | List | 13 methods | Yes |
 | `MapOps[K, V]` | Map | 9 methods | Yes |
 | `SetOps[T]` | Set | 3 methods | Yes |
 | `IntoIterator[T]` | List, Map, Set, Str, Range | `into_iter` | Yes (§3c.1) |
 | `Joinable` | List[Str] | `join` | Yes (§3.2.1) |
-| `StringBuildOps` | StringBuilder | `write`, `write_char`, `to_str`, `len`, `capacity`, `clear` | No (import `std.str`) |
+| `StringBuildOps` | StringBuilder | `write`, `write_char`, `to_str`, `len`, `capacity`, `clear` | Yes |
 
-All collection traits are in the prelude — no import required. This matches the rationale from §10.6: operators like `for` desugar through `IntoIterator`, method calls resolve through traits, and requiring imports for built-in collection methods would add ceremony with no information value.
+> **`Contains` element membership is implemented for `Set` only.** `List` and `Map` are part of the intended `Contains` design (§3.2.2 *The `Contains` Trait*) but are **not yet implemented** — `[1, 2, 3].contains(2)` is currently a compile error (`UnresolvedMethod`); use `MapOps.contains_key` for maps in the meantime. Substring search on `Str` (`"hello".contains("ell")`) is a separate operation hosted by `StrOps` (§3.2.1), not element membership. This table reflects what compiles today.
+
+All built-in method-surface traits are in the prelude — no import required. This matches the rationale from §10.6: operators like `for` desugar through `IntoIterator`, method calls resolve through traits, and requiring imports for built-in collection methods would add ceremony with no information value.
+
+**These traits are sealed.** Their implementations are compiler-provided for the built-in types listed above; user code may not implement them (`impl StrOps for MyType`) or redefine them (`trait StrOps { … }`). Both are compile errors — the trait names are reserved by the prelude (§10.6), and a user implementation would create a second meaning for a method the compiler dispatches intrinsically. To add string-like or collection-like behavior to your own type, define your own trait with a different name.
+
+A sealed trait may still be named in a generic bound — e.g. `fn f[T: Sized](x: T) -> Int { x.len() }`. `Sized` spans several built-in types, so a bound on it is genuinely polymorphic. A bound on a single-implementor trait (`StrOps`, `BytesOps`, `StringBuildOps`) is legal but degenerate: it is satisfiable only by the one built-in type that implements it (e.g. `[T: StrOps]` admits only `Str`), so it carries no more abstraction than naming that type directly.
 
 ---
 
