@@ -3850,9 +3850,19 @@ pub fn is_trait_type(name: Str) -> Int {
 }
 
 pub fn lookup_impl_method(type_name: Str, method: Str) -> Int {
-    let key = type_name + "\t" + method
-    if impl_method_idx.contains_key(key) { return 1 }
+    if impl_method_idx.contains_key(type_name + "\t" + method) { return 1 }
+    let bare = strip_module_qualifier(type_name)
+    if bare != type_name && impl_method_idx.contains_key(bare + "\t" + method) { return 1 }
     0
+}
+
+// The name under which `method`'s impl is registered for receiver `type_name`:
+// the qualified name if registered there, else the bare name (impls register
+// under the bare `node_name(im)`). Callers mangle the C symbol from this, so a
+// `mod.Type` receiver resolves to the same symbol as the bare impl.
+pub fn impl_method_reg_name(type_name: Str, method: Str) -> Str {
+    if impl_method_idx.contains_key(type_name + "\t" + method) { return type_name }
+    strip_module_qualifier(type_name)
 }
 
 pub fn lookup_impl_type_for_trait(trait_name: Str, type_name: Str) -> Int {
@@ -4409,7 +4419,23 @@ pub fn ensure_tuple_type(c_name: Str, arity: Int, elem_types: Str, elem_structs:
     }
 }
 
+pub let mut tuple_typedef_emitted: Map[Str, Int] = Map()
+
+// A struct-result/option typedef embeds its inner tag BY VALUE, so when that
+// inner is a tuple the tuple's typedef must precede it in the C output. The
+// global emit order (option/result before tuples) handles the common case of
+// a tuple embedding a compound, but not the reverse. Emit the tuple eagerly
+// here; the BLINK_TD_ guard + this set keep it idempotent regardless of order.
+fn emit_tuple_typedef_for_tag(tag: Str) ! Codegen.Emit {
+    match emitted_tuple_set.get(tag) {
+        Some(idx) => emit_tuple_typedef(emitted_tuple_entries.get(idx).unwrap())
+        None => {}
+    }
+}
+
 fn emit_tuple_typedef(entry: TupleEntry) ! Codegen.Emit {
+    if tuple_typedef_emitted.contains_key(entry.c_name) != 0 { return }
+    tuple_typedef_emitted.insert(entry.c_name, 1)
     emit_td_guard_open(c_type_c_name(entry.c_name))
     emit_line("typedef struct \{")
     cg_indent = cg_indent + 1
@@ -4528,8 +4554,25 @@ pub fn is_compound_ct(ct: Int) -> Int {
     }
 }
 
+// Canonical tuple tag (e.g. `Tuple2_int_bytes`) for a tuple annotation, or ""
+// if `ann` isn't a tuple. type_from_name("Tuple") is CT_VOID, so the compound
+// resolvers can't recognize tuples by CT — they dispatch on the annotation
+// node name and delegate here. Also registers the tuple struct as a side
+// effect (resolve_tuple_ann → ensure_tuple_type), matching the non-? path.
+fn resolve_tuple_tag(ann: Int) -> Str {
+    if node_name(ann) != "Tuple" { return "" }
+    let opt = resolve_tuple_ann(ann, -1, "")
+    if opt.is_some() { return opt.unwrap() }
+    ""
+}
+
 fn resolve_ann_tag(ann: Int, name: Str) -> Str {
     let ct = type_from_name(name)
+    if node_name(ann) == "Tuple" {
+        let t = resolve_tuple_tag(ann)
+        if t != "" { return t }
+        return c_type_tag(ct)
+    }
     if is_compound_ct(ct) != 0 {
         compound_name_from_ann(ann)
     } else if is_struct_type(name) != 0 || is_enum_type(name) != 0 {
@@ -4575,6 +4618,10 @@ pub fn compound_name_from_ann(ann_node: Int) -> Str {
             return "Map_{key_tag}_{val_tag}"
         }
         "map"
+    } else if name == "Tuple" {
+        let t = resolve_tuple_tag(ann_node)
+        if t != "" { return t }
+        return c_type_tag(ct)
     } else {
         c_type_tag(ct)
     }
@@ -4686,6 +4733,11 @@ fn ensure_mixed_option_type(inner: Int, inner_struct: Str) {
 }
 
 pub fn resolve_result_inner_tag(ann: Int, name: Str, ct: Int) -> Str {
+    if node_name(ann) == "Tuple" {
+        // A tuple OK/Err side would otherwise fall through to "" and erase its
+        // element types; "" is also the correct sentinel if it's not a tuple.
+        return resolve_tuple_tag(ann)
+    }
     if is_compound_ct(ct) != 0 {
         compound_name_from_ann(ann)
     } else if is_struct_type(name) != 0 || is_enum_type(name) != 0 {
@@ -5125,6 +5177,7 @@ let mut result_typedef_emitted: Map[Str, Int] = Map()
 
 pub fn reset_result_typedef_emitted() {
     result_typedef_emitted = Map()
+    tuple_typedef_emitted = Map()
 }
 
 // Wrap each typedef in #ifndef/#define/#endif guards so the same typedef
@@ -5267,6 +5320,12 @@ pub fn emit_struct_result_typedef(ok_tag: Str, err_tag: Str) ! Codegen.Emit {
         // Pre-declared in runtime_core.h so runtime helpers can return it.
         return
     }
+    // A struct-result carries its ok/err tuple BY VALUE, so emit those tuple
+    // typedefs now rather than relying on the global emit order (which puts
+    // option/result before tuples — correct only for the reverse nesting). See
+    // tests/test_295z9x and test_tuple_destr_q_propagate.
+    emit_tuple_typedef_for_tag(ok_tag)
+    emit_tuple_typedef_for_tag(err_tag)
     let c_ok = if ok_tag == "void" || ok_tag == "Void" { "int64_t" } else { c_type_from_tag(ok_tag) }
     let c_err = if err_tag == "void" || err_tag == "Void" { "int64_t" } else { c_type_from_tag(err_tag) }
     emit_td_guard_open(tname)
