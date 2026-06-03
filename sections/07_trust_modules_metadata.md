@@ -1580,7 +1580,7 @@ Inside `test` blocks, the following functions are auto-available without import:
 | `assert(cond)` | `fn assert(cond: Bool)` |
 | `assert_eq(a, b)` | `fn assert_eq[T: Eq + Display](left: T, right: T)` |
 | `assert_ne(a, b)` | `fn assert_ne[T: Eq + Display](left: T, right: T)` |
-| `prop_check(f)` | `fn prop_check[...](f: fn(...) -> ())` |
+| `prop_check(f)` | `fn prop_check[...](f: fn(...) -> ())` — the property closure given directly to the intrinsic may use `?`; it is elaborated to `fn(...) -> Result[Void, TestError]` like a test body (§2.20) |
 
 These are compiler intrinsics — not library functions. They capture source locations, generate diffs, and are stripped from release builds. They are scoped to `test` blocks; using them outside a test block is a compile error.
 

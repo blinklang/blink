@@ -673,7 +673,7 @@ The AI reads structured test failures the same way it reads structured compiler 
 | `cause` value | Meaning |
 |--------------|---------|
 | `"assertion"` | An `assert*` built-in failed. The record carries `assertion`, `expected`/`actual`, and `introspection` fields (§2.20 Assertion Failure Output). |
-| `"propagated_error"` | The test body returned `Err(TestError { ... })` via `?` propagation (§2.20 Error Propagation). The record carries an `error` object with `message` (the `Display`-rendered error string) and `error_type` (the static name of the source error type at the `?` site). |
+| `"propagated_error"` | The test body — **or a `prop_check` property closure** (§2.20 Error Propagation, Property-Based Testing) — returned `Err(TestError { ... })` via `?` propagation. The record carries an `error` object with `message` (the `Display`-rendered error string) and `error_type` (the static name of the source error type at the `?` site). When the failure comes from a property closure, the record *additionally* carries the property failure fields (`seed`, `shrunk_input`, `reproduce`); the `cause` axis (assertion vs propagated error) is orthogonal to whether the test is a property, so no new `cause` value is added. |
 
 `"status": "panicked"` and `"status": "skipped"` records have no `cause` field — the status itself identifies the path. The four top-level statuses (`passed | failed | panicked | skipped`) remain unchanged.
 
@@ -1096,6 +1096,31 @@ NDJSON form (`blink test --json`):
  "shrunk_input": "[1, 2, 2, -9]",
  "reproduce": "blink test --seed 0xDEADBEEFCAFE1234 --filter 'reverse is involutive'",
  "loc": {"file": "tests/test_parser.bl", "line": 42, "col": 3}}
+```
+
+When a property fails because a `?` inside the property closure propagated an `Err` (rather than an assertion failing), the same `test_fail` event additionally carries the `cause` discriminator and the `error` object — the property fields and the propagated-error fields co-exist in one record:
+
+```json
+{"event": "test_fail",
+ "name": "port strings round-trip",
+ "module": "test_net",
+ "cause": "propagated_error",
+ "error": {"message": "invalid port: 70000", "error_type": "net.ParseError"},
+ "seed": "0xDEADBEEFCAFE1234",
+ "shrunk_input": "70000",
+ "reproduce": "blink test --seed 0xDEADBEEFCAFE1234 --filter 'port strings round-trip'",
+ "loc": {"file": "tests/test_net.bl", "line": 18, "col": 21}}
+```
+
+The human-readable form mirrors an assertion failure, with the rendered error directly beneath the shrunk input:
+
+```
+FAIL  tests/test_net.bl::"port strings round-trip"
+  seed: 0xDEADBEEFCAFE1234
+  shrunk input: 70000
+  propagated error: invalid port: 70000
+    error type: net.ParseError
+  rerun: blink test --seed 0xDEADBEEFCAFE1234 --filter 'port strings round-trip'
 ```
 
 The seed surfaces in **every** failure output mode — `--quiet`, `--json`, and color-stripped CI logs all include it. The reproduce line uses the suite seed as printed: `0x` + 16 hex digits, zero-padded.

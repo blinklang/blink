@@ -1231,7 +1231,7 @@ For `Option[T]` operands, the lowering is identical except the `None` arm produc
 
 **Hygiene.** The elaborated return type is internal to the test grammar form. User code cannot name it, dot into it, or observe it from outside. The runner is the sole caller of a test body and consumes the elaborated `Result[Void, TestError]` directly.
 
-**Composition with HOFs.** Closures passed to `for_each`, `prop_check`, and similar higher-order functions follow the normal `?` rules from §3c.2 — the closure's own return type governs whether `?` is valid inside it, **not** the enclosing test body. A closure that uses `?` must itself return `Result[T, E]` or `Option[T]`:
+**Composition with HOFs.** Ordinary higher-order functions are *not* a test grammar form. A closure passed to `for_each` or any user-callable HOF follows the normal `?` rules from §3c.2 — the closure's own return type governs whether `?` is valid inside it, **not** the enclosing test body. A closure that uses `?` must itself return `Result[T, E]` or `Option[T]`:
 
 ```blink
 test "all rows parse" {
@@ -1246,6 +1246,37 @@ test "all rows parse" {
 ```
 
 The fix is to lift fallible work out of the closure or change the closure's return type. Test-body elaboration does **not** propagate inward into nested closures.
+
+**`?` inside a `prop_check` property closure.** The property closure passed as the **direct syntactic argument** of the `prop_check` intrinsic (§2.20 *Property-Based Testing*) is the one exception, and it is not a propagation of the enclosing test body's elaboration — it is the *same* closed-surface elaboration applied on its own account. `prop_check` is a compiler intrinsic, not an ordinary HOF: the runner is the sole caller of the property closure and the user can never name or invoke it. When that closure contains `?`, its body is implicitly elaborated to `Result[Void, TestError]` exactly as a test body is — no annotation, no trailing `Ok(())`:
+
+```blink
+fn parse_port(s: Str) -> Result[Int, ParseError] { /* ... */ }
+
+test "port strings round-trip" {
+    prop_check(fn(p: Int) {
+        let s = p.to_str()
+        let back = parse_port(s)?           // Err here = property failed for this input
+        assert_eq(back, p)
+    })
+}
+```
+
+The trigger is **syntactic**: elaboration applies only when the closure literally appears as the argument in the `prop_check(...)` call. A closure bound to a `let` and then passed in is a first-class value that has already been type-checked against its own written return type, so it obeys plain §3c.2 Rules 2 and 3 (and `?` in it requires it to return `Result`/`Option`):
+
+```blink
+test "let-bound property closure is not elaborated" {
+    // E0508: `?` inside a closure returning Void — `prop` is a value, not
+    // the direct argument of `prop_check`, so it is not elaborated.
+    // Fix: inline the closure into the prop_check(...) call.
+    let prop = fn(p: Int) {
+        let back = parse_port(p.to_str())?
+        assert_eq(back, p)
+    }
+    prop_check(prop)
+}
+```
+
+Each `?` site inside an elaborated property closure renders via `Display[E]` and stamps `TestError.error_type` with the static name of `E` **at that site** — distinct `?` sites in one property may produce distinct `error_type` values (something a single declared error type could not express, since `?` performs no implicit conversion, §3c.2 Rule 4). `?` on an `Option[T]` operand is covered by the same elaboration: the `None` arm yields `TestError { message: "None", error_type: "Option", origin: <span> }`, identical to the test-body lowering. The runner ABI is unchanged — every property iteration returns `Result[Void, TestError]`, so the elaborated property closure and an assertion-only one share one monomorphic shape; the closure's `E` never reaches the runner. A returned `Err(TestError { ... })` is treated as "property failed for this input": the shrinker minimizes the generated input exactly as it does for an assertion failure, and the failure block prints the rendered error beneath the same `shrunk input:` line (see §8.10 Runner Output). This elaboration applies in both `blink check` and `blink test`.
 
 **Composition with `with`, `skip()`, panics, assertions.** `?` propagating an `Err` is one of the **catchable unwinds** of §4.6.3 — it runs `BlockHandler.exit(false)` and `Closeable.close()` on the way out, identical to assertion failure and `skip()`. Doc-tests are compiled as ordinary tests and obey the same rule.
 
@@ -1420,6 +1451,17 @@ test "sort is idempotent" {
 ```
 
 `prop_check` is available in test blocks without import. The compiler infers generator strategies from parameter types. Run property tests specifically with `blink test --prop`.
+
+A property body may use `?` directly — a fallible call inside the property is a first-class way to express "this must succeed for the property to hold." Because the property closure given as the direct argument of `prop_check` is elaborated like a test body (see *Error Propagation: `?` in Test Bodies* above), a propagated `Err` is reported as a property failure with the shrunk counterexample, not as a panic:
+
+```blink
+test "decoded bytes round-trip" {
+    prop_check(fn(raw: [U8]) {
+        let decoded = decode(encode(raw))?
+        assert_eq(decoded, raw)
+    })
+}
+```
 
 #### Test Scope
 
