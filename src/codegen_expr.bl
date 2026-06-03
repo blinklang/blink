@@ -70,7 +70,7 @@ import codegen_types.{
     sf_entries, struct_field_defaults, struct_invariants, struct_option_c_type,
     tp_child1_kind, tp_child1_sname, tp_child2_kind, tp_child2_sname, tp_get_child1, tp_get_child2, tp_get_kind, tp_get_sname,
     resolve_effect_field, resolve_effect_is_ue, resolve_effect_vtable,
-    split_result_compound, tuple_c_type_name, type_from_name, type_from_name_tag, type_name_from_ct, ue_effects, c_type_from_tag, is_sized_int_ct,
+    resolve_tuple_ann, split_result_compound, tuple_c_type_name, type_from_name, type_from_name_tag, type_name_from_ct, ue_effects, c_type_from_tag, is_sized_int_ct,
     var_enums
 }
 import codegen_derive.{ct_to_descriptor, descriptor_mangle, queue_promote_type}
@@ -2268,6 +2268,19 @@ fn expect_arg_result_elem(slot: Int) -> Int {
     sublist_get(elems, slot)
 }
 
+// Bind a generic fn's struct/tuple return into a temp so the caller's
+// `let x = call()` sees a concrete struct type, and write the expr_result
+// globals. Shared by the tuple-return and plain struct/enum-return paths.
+fn emit_generic_struct_ret_temp(mangled: Str, struct_name: Str, temp_prefix: Str, call_args: Str) ! Codegen.Emit, Codegen.Register, Codegen.Scope {
+    reg_fn_struct_ret(mangled, struct_name)
+    let g_tmp = fresh_temp(temp_prefix)
+    emit_line("{c_type_c_name(struct_name)} {g_tmp} = {c_fn_name(mangled)}({call_args});")
+    set_var(g_tmp, CT_STRUCT, 0)
+    set_var_struct(g_tmp, struct_name)
+    expr_result_str = g_tmp
+    expr_result_type = CT_STRUCT
+}
+
 // Returns 0 if type-arg inference yields None so the caller can fall through
 // to non-generic handling; on success registers the monomorphization, writes
 // expr_result_str / expr_result_type plus container inner-type globals, and
@@ -2365,6 +2378,17 @@ pub fn emit_generic_fn_call_tail(fn_name: Str, args_str: Str, ca: GenericCallArg
         }
     } else if ret_type == CT_VOID && resolved_ret != "Void" && resolved_ret != "" {
         let ret_ann = node_type_ann(gfn_node)
+        // Generic fn returning a tuple: route through resolve_tuple_ann so the
+        // caller binds the canonical tuple name (with Option[T] preserved)
+        // instead of treating it as a generic struct and dropping the type arg
+        // (bug 295z9x, Site A).
+        if resolved_ret == "Tuple" && ret_ann != -1 {
+            let tup_opt = resolve_tuple_ann(ret_ann, tparams_sl, ta_str)
+            if tup_opt.is_some() {
+                emit_generic_struct_ret_temp(mangled, tup_opt.unwrap(), "_gtr", call_args)
+                return 1
+            }
+        }
         let mut ret_struct_name = ""
         if ret_ann != -1 {
             let ret_elems = node_elements(ret_ann)
@@ -2388,13 +2412,7 @@ pub fn emit_generic_fn_call_tail(fn_name: Str, args_str: Str, ca: GenericCallArg
         // Plain T → user struct/enum: emit a temp + struct binding so the
         // caller's `let x = call()` sees a concrete struct type.
         if ret_struct_name == "" && is_struct_or_enum_type(resolved_ret) != 0 {
-            reg_fn_struct_ret(mangled, resolved_ret)
-            let g_tmp = fresh_temp("_gsr")
-            emit_line("{c_type_c_name(resolved_ret)} {g_tmp} = {c_fn_name(mangled)}({call_args});")
-            set_var(g_tmp, CT_STRUCT, 0)
-            set_var_struct(g_tmp, resolved_ret)
-            expr_result_str = g_tmp
-            expr_result_type = CT_STRUCT
+            emit_generic_struct_ret_temp(mangled, resolved_ret, "_gsr", call_args)
             return 1
         }
     }
@@ -3954,6 +3972,26 @@ fn emit_struct_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
             let tag = get_variant_tag(variant_enum, sname)
             let flds_sl_sv = node_fields(node)
             let enum_c_name = c_type_c_name(variant_enum)
+            // Resolve this variant's field-def sublist so bare `None` fields
+            // adopt their declared Option[T] carrier instead of defaulting to
+            // Option[int] (bug 264p4n). node_fields(vnode) is the same shape
+            // struct_field_type_ann consumes (typecheck.bl:742-752).
+            let enum_td = find_type_def_node(variant_enum)
+            let mut variant_flds = -1
+            if enum_td != -1 {
+                let variants_sl = node_fields(enum_td)
+                if variants_sl != -1 {
+                    let mut vj = 0
+                    while vj < sublist_length(variants_sl) {
+                        let vnode = sublist_get(variants_sl, vj)
+                        if node_name(vnode) == sname {
+                            variant_flds = node_fields(vnode)
+                            break
+                        }
+                        vj = vj + 1
+                    }
+                }
+            }
             let mut init_str = "({enum_c_name})\{.tag = {tag}"
             if flds_sl_sv != -1 && sublist_length(flds_sl_sv) > 0 {
                 init_str = init_str.concat(", .data.{sname} = \{")
@@ -3964,7 +4002,10 @@ fn emit_struct_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
                     }
                     let sf = sublist_get(flds_sl_sv, fi)
                     let field_name = node_name(sf)
+                    let saved_arg_ann = cg_expect_arg_ann
+                    cg_expect_arg_ann = struct_field_type_ann(variant_flds, field_name)
                     emit_expr(node_value(sf))
+                    cg_expect_arg_ann = saved_arg_ann
                     let arg_str = expr_result_str
                     let field_type = get_variant_field_type_str(vidx, fi)
                     if field_type.is_some() && field_type.unwrap() == variant_enum {
@@ -4122,10 +4163,12 @@ fn emit_tuple_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Di
     // slot would default to Option[int]. Derive parent ann from let-target or
     // fn return-ann; per-slot override drives the bare-None branch in emit_expr.
     let mut parent_elems_sl: Int = -1
+    let mut parent_tuple_ann: Int = -1
     if cg_let_target_ann != -1 && node_name(cg_let_target_ann) == "Tuple" {
         let cand = node_elements(cg_let_target_ann)
         if cand != -1 && sublist_length(cand) == arity {
             parent_elems_sl = cand
+            parent_tuple_ann = cg_let_target_ann
         }
     }
     if parent_elems_sl == -1 && cg_current_fn_node != -1 && node_return_type(cg_current_fn_node) == "Tuple" {
@@ -4134,6 +4177,7 @@ fn emit_tuple_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Di
             let cand = node_elements(ret_ann)
             if cand != -1 && sublist_length(cand) == arity {
                 parent_elems_sl = cand
+                parent_tuple_ann = ret_ann
             }
         }
     }
@@ -4222,8 +4266,20 @@ fn emit_tuple_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Di
     }
     cg_current_fn_option_inner = saved_fn_option_inner
     cg_current_fn_option_inner_struct = saved_fn_option_inner_struct
-    let tup_name = tuple_c_type_name(tags, arity)
-    ensure_tuple_type(tup_name, arity, elem_types_enc, elem_structs_enc)
+    // Prefer the canonical tuple name from the parent annotation so Option[T]'s
+    // T is preserved; the per-element value tags drop it (get_var_struct returns
+    // the inner struct for an Option-typed var), yielding e.g. Tuple2_Model_Cmd
+    // with a bare-Cmd field (bug 295z9x, Site C). The inits stay valid — only
+    // the type name + field tags now come from the annotation.
+    let mut tup_name = ""
+    if parent_tuple_ann != -1 {
+        let tup_opt = resolve_tuple_ann(parent_tuple_ann, cg_mono_tparams_sl, cg_mono_concrete_args)
+        if tup_opt.is_some() { tup_name = tup_opt.unwrap() }
+    }
+    if tup_name == "" {
+        tup_name = tuple_c_type_name(tags, arity)
+        ensure_tuple_type(tup_name, arity, elem_types_enc, elem_structs_enc)
+    }
     let tmp = fresh_temp("_tup")
     emit_line("{c_type_c_name(tup_name)} {tmp} = \{ {inits} };")
     set_var_struct(tmp, tup_name)
