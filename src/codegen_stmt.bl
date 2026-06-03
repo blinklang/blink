@@ -184,57 +184,95 @@ fn infer_node_struct_name(node: Int) -> Str {
     ""
 }
 
-// Companion to infer_carrier_inner: resolves the struct-payload name of an
-// Option[T] / Result[T, E] expression's inner1 (which=1) or inner2 (which=2).
-// Returns "" when not a struct or unable to resolve.
-fn infer_carrier_inner_struct(node: Int, which: Int) -> Str {
+type CarrierInfo {
+    type_const: Int
+    struct_name: Str
+}
+
+// Single shared dispatch for infer_carrier_inner / infer_carrier_inner_struct:
+// resolves an Option[T] / Result[T, E] expression's inner1 (which=1) or
+// inner2 (which=2). At each leaf it computes both the inner CT (CT_VOID on
+// failure) and the inner struct-payload name ("" on failure) using each
+// original helper's leaf logic verbatim.
+fn walk_carrier_receiver(node: Int, which: Int) -> CarrierInfo {
     if node == -1 {
-        return ""
+        return CarrierInfo { type_const: CT_VOID, struct_name: "" }
     }
     let k = node_kind(node)
     if k == NodeKind.Ident {
         let obj_name = node_name(node)
         let obj_type = get_var_type(obj_name)
-        if obj_type == CT_OPTION && which == 1 {
-            return get_var_option_inner_struct(obj_name)
+        let is_option_inner1 = obj_type == CT_OPTION && which == 1
+        let mut tc = CT_VOID
+        let mut sn = ""
+        if is_option_inner1 {
+            let inner = get_var_option_inner(obj_name)
+            if inner != -1 { tc = inner }
+            sn = get_var_option_inner_struct(obj_name)
+        } else if obj_type == CT_RESULT {
+            if which == 1 {
+                let ok_t = get_var_result_ok(obj_name)
+                if ok_t != -1 { tc = ok_t }
+                sn = get_var_result_ok_struct(obj_name)
+            } else {
+                let err_t = get_var_result_err(obj_name)
+                if err_t != -1 { tc = err_t }
+                sn = get_var_result_err_struct(obj_name)
+            }
         }
-        if obj_type == CT_RESULT {
-            if which == 1 { return get_var_result_ok_struct(obj_name) }
-            return get_var_result_err_struct(obj_name)
-        }
-        return ""
+        return CarrierInfo { type_const: tc, struct_name: sn }
     }
     if k == NodeKind.Call {
         let func_node = node_left(node)
+        let mut tc = CT_VOID
+        let mut sn = ""
         if node_kind(func_node) == NodeKind.Ident {
+            let rt = get_fn_ret_type(node_name(func_node))
+            if rt.kind == CT_OPTION && which == 1 && rt.inner1 != -1 { tc = rt.inner1 }
+            if rt.kind == CT_RESULT {
+                if which == 1 && rt.inner1 != -1 { tc = rt.inner1 }
+                if which == 2 && rt.inner2 != -1 { tc = rt.inner2 }
+            }
             let fsi = get_fn_ret_struct_inner(node_name(func_node))
-            if which == 1 { return fsi.ok_struct }
-            return fsi.err_struct
+            if which == 1 { sn = fsi.ok_struct } else { sn = fsi.err_struct }
         }
-        return ""
+        return CarrierInfo { type_const: tc, struct_name: sn }
     }
     if k == NodeKind.MethodCall {
         let mc_obj2 = node_obj(node)
         let mc_method2 = node_method(node)
+        let mut tc = CT_VOID
+        let mut sn = ""
+        // Map.get returns Option[V] — inner1 is V.
         if mc_method2 == "get" && which == 1 && mc_obj2 != -1 && node_kind(mc_obj2) == NodeKind.Ident {
             if get_var_type(node_name(mc_obj2)) == CT_MAP {
-                return get_map_value_struct(node_name(mc_obj2))
+                let v_t = get_map_value_type(node_name(mc_obj2))
+                if v_t != CT_VOID { tc = v_t }
+                sn = get_map_value_struct(node_name(mc_obj2))
             }
         }
+        // Struct method returning Option/Result — chase its registered return type.
         if mc_obj2 != -1 && node_kind(mc_obj2) == NodeKind.Ident {
             let obj_struct2 = get_var_struct(node_name(mc_obj2))
             if obj_struct2 != "" {
+                let rt2 = get_fn_ret_type("{obj_struct2}_{mc_method2}")
+                if rt2.kind == CT_OPTION && which == 1 && rt2.inner1 != -1 { tc = rt2.inner1 }
+                if rt2.kind == CT_RESULT {
+                    if which == 1 && rt2.inner1 != -1 { tc = rt2.inner1 }
+                    if which == 2 && rt2.inner2 != -1 { tc = rt2.inner2 }
+                }
                 let fsi2 = get_fn_ret_struct_inner("{obj_struct2}_{mc_method2}")
-                if which == 1 { return fsi2.ok_struct }
-                return fsi2.err_struct
+                if which == 1 { sn = fsi2.ok_struct } else { sn = fsi2.err_struct }
             }
         }
-        return ""
+        return CarrierInfo { type_const: tc, struct_name: sn }
     }
     if k == NodeKind.IfExpr {
-        let r = infer_carrier_inner_struct(node_then_body(node), which)
-        if r != "" { return r }
-        return infer_carrier_inner_struct(node_else_body(node), which)
+        let tb = walk_carrier_receiver(node_then_body(node), which)
+        let eb = walk_carrier_receiver(node_else_body(node), which)
+        let tc = if tb.type_const != CT_VOID { tb.type_const } else { eb.type_const }
+        let sn = if tb.struct_name != "" { tb.struct_name } else { eb.struct_name }
+        return CarrierInfo { type_const: tc, struct_name: sn }
     }
     if k == NodeKind.Block {
         let stmts_sl = node_stmts(node)
@@ -243,14 +281,21 @@ fn infer_carrier_inner_struct(node: Int, which: Int) -> Str {
             if count > 0 {
                 let last = sublist_get(stmts_sl, count - 1)
                 if node_kind(last) == NodeKind.ExprStmt {
-                    return infer_carrier_inner_struct(node_value(last), which)
+                    return walk_carrier_receiver(node_value(last), which)
                 }
-                return infer_carrier_inner_struct(last, which)
+                return walk_carrier_receiver(last, which)
             }
         }
-        return ""
+        return CarrierInfo { type_const: CT_VOID, struct_name: "" }
     }
-    ""
+    CarrierInfo { type_const: CT_VOID, struct_name: "" }
+}
+
+// Companion to infer_carrier_inner: resolves the struct-payload name of an
+// Option[T] / Result[T, E] expression's inner1 (which=1) or inner2 (which=2).
+// Returns "" when not a struct or unable to resolve.
+fn infer_carrier_inner_struct(node: Int, which: Int) -> Str {
+    walk_carrier_receiver(node, which).struct_name
 }
 
 fn infer_block_struct_name(block: Int) -> Str {
@@ -1614,85 +1659,7 @@ fn infer_enum_pattern_binding(pat: Int) -> Str {
 // Option[T] or Result[T, E]. `which` selects: 1 = inner1 (Option's T or
 // Result's OK), 2 = inner2 (Result's ERR). Returns CT_VOID on failure.
 fn infer_carrier_inner(node: Int, which: Int) -> Int {
-    if node == -1 {
-        return CT_VOID
-    }
-    let k = node_kind(node)
-    if k == NodeKind.Ident {
-        let obj_name = node_name(node)
-        let obj_type = get_var_type(obj_name)
-        if obj_type == CT_OPTION && which == 1 {
-            let inner = get_var_option_inner(obj_name)
-            if inner != -1 { return inner }
-        }
-        if obj_type == CT_RESULT {
-            if which == 1 {
-                let ok_t = get_var_result_ok(obj_name)
-                if ok_t != -1 { return ok_t }
-            } else {
-                let err_t = get_var_result_err(obj_name)
-                if err_t != -1 { return err_t }
-            }
-        }
-        return CT_VOID
-    }
-    if k == NodeKind.Call {
-        let func_node = node_left(node)
-        if node_kind(func_node) == NodeKind.Ident {
-            let rt = get_fn_ret_type(node_name(func_node))
-            if rt.kind == CT_OPTION && which == 1 && rt.inner1 != -1 { return rt.inner1 }
-            if rt.kind == CT_RESULT {
-                if which == 1 && rt.inner1 != -1 { return rt.inner1 }
-                if which == 2 && rt.inner2 != -1 { return rt.inner2 }
-            }
-        }
-        return CT_VOID
-    }
-    if k == NodeKind.MethodCall {
-        let mc_obj2 = node_obj(node)
-        let mc_method2 = node_method(node)
-        // Map.get returns Option[V] — inner1 is V.
-        if mc_method2 == "get" && which == 1 && mc_obj2 != -1 && node_kind(mc_obj2) == NodeKind.Ident {
-            if get_var_type(node_name(mc_obj2)) == CT_MAP {
-                let v_t = get_map_value_type(node_name(mc_obj2))
-                if v_t != CT_VOID { return v_t }
-            }
-        }
-        // Struct method returning Option/Result — chase its registered return type.
-        if mc_obj2 != -1 && node_kind(mc_obj2) == NodeKind.Ident {
-            let obj_name2 = node_name(mc_obj2)
-            let obj_struct2 = get_var_struct(obj_name2)
-            if obj_struct2 != "" {
-                let rt2 = get_fn_ret_type("{obj_struct2}_{mc_method2}")
-                if rt2.kind == CT_OPTION && which == 1 && rt2.inner1 != -1 { return rt2.inner1 }
-                if rt2.kind == CT_RESULT {
-                    if which == 1 && rt2.inner1 != -1 { return rt2.inner1 }
-                    if which == 2 && rt2.inner2 != -1 { return rt2.inner2 }
-                }
-            }
-        }
-        return CT_VOID
-    }
-    if k == NodeKind.IfExpr {
-        let t1 = infer_carrier_inner(node_then_body(node), which)
-        if t1 != CT_VOID { return t1 }
-        return infer_carrier_inner(node_else_body(node), which)
-    }
-    if k == NodeKind.Block {
-        let stmts_sl = node_stmts(node)
-        if stmts_sl != -1 {
-            let count = sublist_length(stmts_sl)
-            if count > 0 {
-                let last = sublist_get(stmts_sl, count - 1)
-                if node_kind(last) == NodeKind.ExprStmt {
-                    return infer_carrier_inner(node_value(last), which)
-                }
-                return infer_carrier_inner(last, which)
-            }
-        }
-        return CT_VOID
-    }
-    CT_VOID
+    walk_carrier_receiver(node, which).type_const
 }
 
 fn infer_expr_type(node: Int) -> Int {
