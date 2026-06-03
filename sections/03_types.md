@@ -1584,7 +1584,12 @@ impl Numeric for Distance {
 }
 ```
 
-**Monotonic sealing under trait extension.** If `SubTrait : SuperTrait` and `SuperTrait` seals method `m`, then `SubTrait` cannot un-seal `m`, and no `impl SubTrait` may override `m`. Sealing is preserved down the supertrait chain. Strengthening an open supertrait default to `final` in a subtrait is not supported in v1 — it requires re-stating the body and creates two methods with the same name visible to impls.
+**Monotonic sealing: one legal direction.** A method's sealed-ness is fixed at the trait that first declares its body, and no subtrait may flip it in either direction. Concretely, where `SubTrait : SuperTrait`:
+
+- **Down the chain (un-sealing forbidden).** If `SuperTrait` seals method `m`, then `SubTrait` cannot un-seal `m`, and no `impl SubTrait` may override `m`. Sealing is preserved down the supertrait chain.
+- **Up the chain (strengthening forbidden).** If `SuperTrait` declares `m` as an *open* default, a subtrait may not re-declare `m` to seal it. Writing `final fn m { body }` (or any redeclaration of `m`) in `SubTrait` is rejected with `E0733 SubtraitMethodRedeclaration`.
+
+Strengthening is forbidden because Blink resolves trait methods statically against the trait the bound names, with no method-resolution order (§3.6 *Why Traits Over Inheritance*). If a subtrait could re-seal `m` with a different body, the same receiver would dispatch to two different bodies depending on whether it is viewed through the `SuperTrait` bound or the `SubTrait` bound — `via_super[T: SuperTrait](x).m()` and `via_sub[T: SubTrait](x).m()` would disagree for the same `x`, breaking the `SubTrait <: SuperTrait` coherence the seal exists to protect. This is the symmetric closure of the down-the-chain rule: the seal lives where the method is born.
 
 ```
 error[SealedMethodOverride]: cannot override sealed method `ne`
@@ -1595,6 +1600,34 @@ error[SealedMethodOverride]: cannot override sealed method `ne`
    |
    = help: `final` defaults on supertraits remain sealed on subtraits and their impls
 ```
+
+A subtrait that tries to strengthen an open supertrait default is rejected at the declaration site:
+
+```blink
+trait Greeter {
+    fn greet(self) -> Str { "hello" }          // open default
+}
+
+trait LoudGreeter : Greeter {
+    final fn greet(self) -> Str { "HELLO" }    // E0733 — rejected at this declaration
+}
+```
+
+```
+error[SubtraitMethodRedeclaration]: cannot seal inherited open default `greet`
+  --> greet.bl:6:5
+   |
+6 |     final fn greet(self) -> Str { "HELLO" }
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `Greeter.greet` is an open default; `LoudGreeter : Greeter` may not re-seal it
+   |
+   = note: sealing is monotonic — a subtrait cannot strengthen a supertrait's open
+           default, because `x.greet()` would resolve differently through the
+           `Greeter` view than the `LoudGreeter` view
+   = help: to seal `greet` for every implementor, mark it `final` on `Greeter` itself
+   = help: to specialize behavior for one type, override `greet` normally in its `impl`
+```
+
+`E0733` fires at the subtrait's redeclaration site, not at any call site, and applies only to redeclaring a method a supertrait already provides as an open default. A normal `impl`-block override of that open default (without `final`) is unaffected — that is the ordinary replace-only override of §3.6 *The `final` Modifier*.
 
 **Effect-row subtype for open overrides.** When an open default declares effect row `R_d` and an `impl` provides an override declaring row `R_o`, the typechecker requires `R_o ⊆ R_d`. An override may *narrow* the effect signature (drop effects the default declares but the override does not use) but may not *widen* it (introduce effects the default does not declare). See §4.5 *Effect Composition Rules* for the subtyping lattice. `final` defaults are effect-monomorphic at their declaration site — no override exists to widen them.
 
