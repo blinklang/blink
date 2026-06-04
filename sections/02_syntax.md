@@ -1331,6 +1331,58 @@ fn divide(a: Int, b: Int) -> Int {
 
 **Panel vote: 5-0 unanimous.** See [DECISIONS.md](../DECISIONS.md).
 
+#### `assert_panics` — Asserting Expected Panics
+
+`assert_panics` verifies that a block of code panics. It is the fifth test assertion, in the same family as `assert_matches`: a **compiler-recognized block**, not a function and not a closure value.
+
+```blink
+test "division by zero panics" {
+    assert_panics {
+        let _ = 10 / 0
+    }
+}
+
+test "unwrap on empty list panics with the expected message" {
+    assert_panics(matching: "index out of bounds") {
+        let xs: [Int] = []
+        let _ = xs.get(0).unwrap()
+    }
+}
+```
+
+**Form.** The body is a `{ ... }` block, *not* a `fn() { }` closure. It can appear only as the operand of `assert_panics` — it cannot be bound to a variable, passed as a higher-order argument, returned, or stored. This is the same syntactic discipline as the pattern argument of `assert_matches`: the construct is operand-only, so no first-class panic-catching handle ever exists. `assert_panics` itself yields no value (its type is `()`); you cannot write `let x = assert_panics { ... }`. There is no `PanicInfo` binding, no `Result`, no `Bool` — the only observable outcome is whether the surrounding test passes or fails.
+
+**Optional `matching:`.** The optional `matching:` keyword argument takes a `Str` and is a **literal substring test**, not a pattern or regular-expression language. The assertion passes only if the panic message *contains* that substring. Substring (rather than exact) matching is deliberate: panic messages carry a volatile ` at file:line` suffix, and a substring matches the stable part (`"index out of bounds"`) while ignoring the location. There is no anchoring, glob, or regex syntax — `matching:` is a plain substring and will not grow metacharacter semantics. String interpolation in the `matching:` argument follows the standard rules.
+
+**Test-only.** `assert_panics` is rejected outside a test block at the parser/typecheck layer (**E0833** `AssertPanicsOutsideTest`), exactly like `skip()`. It is privileged test syntax, not a general-purpose primitive — there is no way to reach it from `main()`, a library function, or any production code.
+
+**No nesting.** An `assert_panics` block lexically nested inside another `assert_panics` block is a compile error (**E0834** `AssertPanicsNestedExpectPanic`). The outer matcher would swallow the inner's mechanism, making "which panic is *the* expected panic" ambiguous.
+
+**Failure modes.** Two runtime diagnostics, both reported through the test runner:
+
+- **E0831** `AssertPanicsBodyReturned` — the body returned normally without panicking. A `?`-propagated `Err` that exits the body without panicking is *also* a body-returned failure, not the expected panic.
+- **E0832** `AssertPanicsMessageMismatch` — the body panicked, but the panic message did not contain the `matching:` substring. The failure output renders the expected substring, the **full actual panic message**, and the source location where the panic fired, so the author can correct either the pattern or the message.
+
+**Pass semantics.** A passing `assert_panics` *consumes* the expected panic: the test's status is `"pass"`, **not** `"panicked"`. The top-level `"panicked"` status is reserved for an *unexpected* panic that escapes a test body. See §8.10 for runner output.
+
+**Resource cleanup on the expected panic.** A panic caught by `assert_panics` is a **catchable unwind** in the sense of §4.6.3: in-scope `with`/`Closeable` resources opened *inside* the block run `BlockHandler.exit(false)` / `Closeable.close()` during the unwind, before the runner records the pass.
+
+```blink
+test "rolls back on the expected panic" {
+    assert_panics(matching: "insufficient funds") {
+        with db.transaction() {
+            force_withdraw(acct, 9999)   // panics
+        }   // transaction.exit(ok=false) runs → rollback, then the panic is consumed
+    }
+}
+```
+
+This is the one place in the language where a `panic` unwind runs cleanup. An *unexpected* panic (outside any `assert_panics` body) still terminates the process and bypasses cleanup, exactly as before. See §4.6.3 for the catchable-unwind set and the fence amendment.
+
+**Why a block, not a closure.** A closure (`fn() { ... }`) is a first-class value: a user could bind it (`let g = ...`) and hold a value whose invocation is panic-catchable, leaking panic recovery into ordinary code. A recognized block is never a value, so the panic continuation is observable only by the test runner — which is what keeps `panic: Never` (this section, *`panic()` Function*) sound. It also keeps the surface familiar: like `pytest.raises(...)` / Rust `#[should_panic(expected = "...")]`, you wrap the region and optionally assert the message.
+
+**Panel vote: 6-0** (all four questions). Resolved the deferred `assert_panics` question from the std.testing deliberation. See [DECISIONS.md](../DECISIONS.md) and [decisions/assert-panics-semantics.md](../decisions/assert-panics-semantics.md).
+
 #### Sub-tests and Parameterized Tests
 
 Blink does **not** ship a `subtest` block, a `subtest(label, fn)` HOF, or any other "test-within-a-test" primitive. The test toolbox is intentionally two primitives — `test "..." { }` (§2.20) and `testing.for_each(cases, body)` (§8.10.2) — plus ordinary `fn` helpers for shared setup. Three patterns cover the parameterized-test design space:
@@ -1611,6 +1663,7 @@ Doc-tests verify that documentation stays in sync with implementation. They are 
 - Four built-in assertions: `assert`, `assert_eq`, `assert_ne`, `assert_matches`
 - All assertions accept an optional trailing `Str` message for context
 - `assert_matches` takes a pattern (not an expression) as its second argument
+- `assert_panics { ... }` (optional `matching: Str` substring) asserts the block panics — a compiler-recognized block, test-only, valueless, non-nestable
 - Assertion failure panics (unwind to test runner, expression introspection on failure)
 - `panic(msg: Str) -> Never` available everywhere — untracked divergence, not an effect
 - Test runner distinguishes assertion failures from unexpected panics in JSON output

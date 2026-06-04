@@ -111,6 +111,7 @@ Decided by expert panel vote. See [OPEN_QUESTIONS.md](OPEN_QUESTIONS.md) for ful
 | Assertion messages | Optional trailing `Str` message on all assertions. Interpolation via standard string syntax | 3-2 (Sys/PLT/AI for B; Web/DevOps for C) |
 | `panic()` function | `panic(msg: Str) -> Never` available everywhere. Untracked divergence, not an effect. Test runner catches; production terminates | 5-0 |
 | `assert_matches` | Fourth compiler intrinsic. Second arg is a pattern, not an expression. No binding support v1 | 4-1 (AI/ML: thin training data, pattern-as-arg confuses LLMs) |
+| `assert_panics` | Fifth assertion. Compiler-recognized BLOCK (not closure/value), test-only (E0833), valueless, non-nestable (E0834), optional `matching:` substring (E0831/E0832). In-process; armed panic→longjmp. Extends the catchable-unwind set as a compiler-managed, no-user-nameable-symbol boundary (§4.6.3 amendment); in-body `with`/`Closeable` run `exit(false)` on the expected panic; `panic: Never` preserved. Reject C (`catch_panic->Result`)/D (effect)/E (subprocess-only) | 6-0 (all four Qs) |
 | Assertion output format | Expression introspection (Power Assert). Sub-expression values on failure. Left/right for `assert_eq`. One-level bounded depth | 4-1 (PLT: left/right is structurally honest, introspection is ad-hoc) |
 | Comparison chaining | Rejected. `a < b < c` is compile error. Use `a < b && b < c` | 4-1 |
 | `From[T]` trait | Single method `fn from(value: T) -> Self`. Compiler-known trait | 5-0 |
@@ -428,6 +429,7 @@ Full deliberation records for each decision. Each file contains expert votes, re
 | Arena Nested Closure Capture Promotion | [decisions/arena-nested-closure-capture-promotion.md](decisions/arena-nested-closure-capture-promotion.md) |
 | Char Literal Escapes | [decisions/char-literal-escapes.md](decisions/char-literal-escapes.md) |
 | std.testing User API | [decisions/std-testing-user-api.md](decisions/std-testing-user-api.md) |
+| `assert_panics` Semantics & Form | [decisions/assert-panics-semantics.md](decisions/assert-panics-semantics.md) |
 | Package Entry-Point Convention | [decisions/package-entry-point-convention.md](decisions/package-entry-point-convention.md) |
 | Defer Keyword Rejection | [decisions/defer-keyword-rejection.md](decisions/defer-keyword-rejection.md) |
 | BlockHandler Catchable-Unwind | [decisions/blockhandler-catchable-unwind.md](decisions/blockhandler-catchable-unwind.md) |
