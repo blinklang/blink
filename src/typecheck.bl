@@ -505,6 +505,30 @@ fn check_arg_shapes(fn_name: Str, sig: Int, args_sl: Int, _node: Int) ! TypeChec
     }
 }
 
+// Validate a single argument to a built-in intrinsic method (List/Set/Str/Map).
+// These methods are pure codegen intrinsics with no fnsig backing, so we cannot
+// reuse check_arg_shapes; we validate inline against the container's elem/key type.
+// DEFERRED (need closure-signature checking): List.map/filter/find/fold/for_each/
+// any/all and Bytes.with_ptr. Bytes integer-arg methods also deferred.
+@allow(UnrestoredMutation)
+fn check_builtin_arg(method: Str, arg_idx: Int, expected_t: Int, args_sl: Int, container_label: Str) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    if args_sl == -1 { return }
+    if arg_idx >= sublist_length(args_sl) { return }
+    if expected_t == TYPE_UNKNOWN { return }
+    let arg_node = sublist_get(args_sl, arg_idx)
+    let saved_hint = tc_construct_hint
+    tc_construct_hint = resolve_alias_tid(expected_t)
+    let arg_t = infer_type(arg_node)
+    tc_construct_hint = saved_hint
+    let mut lit_to_int = 0
+    if is_int_literal_node(arg_node) != 0 && is_integer_type(resolve_alias_tid(expected_t)) != 0 {
+        lit_to_int = 1
+    }
+    if lit_to_int == 0 && types_compatible(arg_t, expected_t) == 0 {
+        tc_error_at("argument {arg_idx + 1} of '{container_label}.{method}' expects {type_to_str(expected_t)}, got {type_to_str(arg_t)}", arg_node)
+    }
+}
+
 // ── Error reporting ─────────────────────────────────────────────────
 
 fn tc_error(msg: Str) ! TypeCheck.Report, Diag.Report {
@@ -4760,16 +4784,46 @@ fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repo
         let obj_k = type_kind(obj_t)
 
         if obj_k == TK_LIST {
+            let args_sl = node_args(node)
+            let elem = ty_pool.get(obj_t).unwrap().inner1
             if method == "len" || method == "count" { return TYPE_INT }
-            if method == "get" { return make_option_type(ty_pool.get(obj_t).unwrap().inner1) }
-            if method == "push" || method == "set" || method == "pop" || method == "for_each" || method == "clear" { return TYPE_VOID }
-            if method == "map" || method == "filter" || method == "take" || method == "skip" || method == "collect" || method == "concat" || method == "slice" {
+            if method == "get" {
+                check_builtin_arg(method, 0, TYPE_INT, args_sl, "List")
+                return make_option_type(elem)
+            }
+            if method == "push" {
+                check_builtin_arg(method, 0, elem, args_sl, "List")
+                return TYPE_VOID
+            }
+            if method == "set" {
+                check_builtin_arg(method, 0, TYPE_INT, args_sl, "List")
+                check_builtin_arg(method, 1, elem, args_sl, "List")
+                return TYPE_VOID
+            }
+            if method == "pop" || method == "for_each" || method == "clear" { return TYPE_VOID }
+            if method == "take" || method == "skip" {
+                check_builtin_arg(method, 0, TYPE_INT, args_sl, "List")
                 return obj_t
             }
-            if method == "contains" || method == "any" || method == "all" || method == "is_empty" { return TYPE_BOOL }
-            if method == "find" { return make_option_type(ty_pool.get(obj_t).unwrap().inner1) }
+            if method == "slice" {
+                check_builtin_arg(method, 0, TYPE_INT, args_sl, "List")
+                check_builtin_arg(method, 1, TYPE_INT, args_sl, "List")
+                return obj_t
+            }
+            if method == "concat" {
+                check_builtin_arg(method, 0, obj_t, args_sl, "List")
+                return obj_t
+            }
+            if method == "map" || method == "filter" || method == "collect" {
+                return obj_t
+            }
+            if method == "contains" {
+                check_builtin_arg(method, 0, elem, args_sl, "List")
+                return TYPE_BOOL
+            }
+            if method == "any" || method == "all" || method == "is_empty" { return TYPE_BOOL }
+            if method == "find" { return make_option_type(elem) }
             if method == "fold" {
-                let args_sl = node_args(node)
                 if args_sl != -1 && sublist_length(args_sl) >= 1 {
                     return infer_type(sublist_get(args_sl, 0))
                 }
@@ -4778,14 +4832,46 @@ fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repo
         }
 
         if obj_k == TK_STR {
+            let args_sl = node_args(node)
             if method == "len" { return TYPE_INT }
-            if method == "contains" || method == "starts_with" || method == "ends_with" { return TYPE_BOOL }
-            if method == "substring" || method == "concat" || method == "trim" || method == "trim_right" || method == "trim_left" || method == "to_lower" || method == "to_upper" || method == "replace" || method == "slice" {
+            if method == "contains" || method == "starts_with" || method == "ends_with" {
+                check_builtin_arg(method, 0, TYPE_STR, args_sl, "Str")
+                return TYPE_BOOL
+            }
+            if method == "replace" {
+                check_builtin_arg(method, 0, TYPE_STR, args_sl, "Str")
+                check_builtin_arg(method, 1, TYPE_STR, args_sl, "Str")
                 return TYPE_STR
             }
-            if method == "byte_at" || method == "index_of" || method == "to_int" { return TYPE_INT }
-            if method == "char_at" { return make_option_type(TYPE_CHAR) }
-            if method == "split" { return make_list_type(TYPE_STR) }
+            if method == "concat" {
+                check_builtin_arg(method, 0, TYPE_STR, args_sl, "Str")
+                return TYPE_STR
+            }
+            if method == "substring" || method == "slice" {
+                check_builtin_arg(method, 0, TYPE_INT, args_sl, "Str")
+                check_builtin_arg(method, 1, TYPE_INT, args_sl, "Str")
+                return TYPE_STR
+            }
+            if method == "trim" || method == "trim_right" || method == "trim_left" || method == "to_lower" || method == "to_upper" {
+                return TYPE_STR
+            }
+            if method == "byte_at" {
+                check_builtin_arg(method, 0, TYPE_INT, args_sl, "Str")
+                return TYPE_INT
+            }
+            if method == "index_of" {
+                check_builtin_arg(method, 0, TYPE_STR, args_sl, "Str")
+                return TYPE_INT
+            }
+            if method == "to_int" { return TYPE_INT }
+            if method == "char_at" {
+                check_builtin_arg(method, 0, TYPE_INT, args_sl, "Str")
+                return make_option_type(TYPE_CHAR)
+            }
+            if method == "split" {
+                check_builtin_arg(method, 0, TYPE_STR, args_sl, "Str")
+                return make_list_type(TYPE_STR)
+            }
             if method == "lines" { return make_list_type(TYPE_STR) }
             if method == "parse_float" { return TYPE_FLOAT }
             if method == "parse_int" { return TYPE_INT }
@@ -4836,19 +4922,41 @@ fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repo
         }
 
         if obj_k == TK_MAP {
+            let args_sl = node_args(node)
+            let key_t = ty_pool.get(obj_t).unwrap().inner1
+            let val_t = ty_pool.get(obj_t).unwrap().inner2
             if method == "len" { return TYPE_INT }
-            if method == "contains_key" || method == "remove" { return TYPE_BOOL }
-            if method == "insert" || method == "clear" { return TYPE_VOID }
-            if method == "get" { return make_option_type(ty_pool.get(obj_t).unwrap().inner2) }
-            if method == "keys" { return make_list_type(ty_pool.get(obj_t).unwrap().inner1) }
-            if method == "values" { return make_list_type(ty_pool.get(obj_t).unwrap().inner2) }
+            if method == "contains_key" || method == "contains" || method == "remove" {
+                check_builtin_arg(method, 0, key_t, args_sl, "Map")
+                return TYPE_BOOL
+            }
+            if method == "insert" {
+                check_builtin_arg(method, 0, key_t, args_sl, "Map")
+                check_builtin_arg(method, 1, val_t, args_sl, "Map")
+                return TYPE_VOID
+            }
+            if method == "clear" { return TYPE_VOID }
+            if method == "get" {
+                check_builtin_arg(method, 0, key_t, args_sl, "Map")
+                return make_option_type(val_t)
+            }
+            if method == "keys" { return make_list_type(key_t) }
+            if method == "values" { return make_list_type(val_t) }
         }
 
         if obj_k == TK_SET {
+            let args_sl = node_args(node)
+            let elem = ty_pool.get(obj_t).unwrap().inner1
             if method == "len" { return TYPE_INT }
             if method == "is_empty" { return TYPE_BOOL }
-            if method == "contains" || method == "insert" || method == "remove" { return TYPE_BOOL }
-            if method == "union" { return obj_t }
+            if method == "contains" || method == "insert" || method == "remove" {
+                check_builtin_arg(method, 0, elem, args_sl, "Set")
+                return TYPE_BOOL
+            }
+            if method == "union" {
+                check_builtin_arg(method, 0, obj_t, args_sl, "Set")
+                return obj_t
+            }
         }
 
         if obj_k == TK_BYTES {
