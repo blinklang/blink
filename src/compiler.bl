@@ -1,7 +1,7 @@
 import ast.{NodeKind}
 import lexer.{Lex, lex}
 import parser.{Parse, parser_reset, parse_program, new_node, new_sublist, sublist_push, finalize_sublist, sublist_get, sublist_length, pos, node_count, node_kind, node_name, node_args, node_elements, node_handlers, node_params, node_fields, node_stmts, node_arms, node_methods, node_module, node_captures, node_str_val, node_is_pub, node_set_module, node_set_is_pub, node_set_name, node_set_handlers, node_set_params, node_set_fields, node_set_stmts, node_set_arms, node_set_methods, node_set_args, node_set_captures, record_source_module}
-import typecheck.{tc_import_modules, tc_import_nodes, tc_reexport_source, tc_reexport_modules, tc_is_module_used}
+import typecheck.{tc_import_modules, tc_import_nodes, tc_reexport_source, tc_reexport_modules, tc_is_module_used, tc_get_symbol_module}
 import diagnostics.{
     Diag, diag_register_file_range, lint_set_override, diag_normalize_path,
     diag_set_last_fix, diag_error_no_loc, diag_warn_at, diag_reset,
@@ -1307,8 +1307,27 @@ pub fn build_reexport_map(imported_programs: List[Int]) {
     }
 }
 
+// The modules injected into every program's scope. Single source of truth —
+// both inject_prelude and is_prelude_module read it so they can't drift.
+pub fn prelude_module_list() -> List[Str] {
+    ["std.num", "std.time", "std.str", "std.sb", "std.bytes", "std.list", "std.map", "std.set", "std.traits", "std.int_conv", "std.char"]
+}
+
+// Accepts either the dotted form ("std.traits") or the mangled module key
+// ("std_traits") that tc_symbol_module stores.
+pub fn is_prelude_module(mod_name: Str) -> Int {
+    let mods = prelude_module_list()
+    let mut i = 0
+    while i < mods.len() {
+        let m = mods.get(i).unwrap()
+        if m == mod_name || dots_to_underscores(m) == mod_name { return 1 }
+        i = i + 1
+    }
+    0
+}
+
 pub fn inject_prelude(src_root: Str, all_programs: List[Int]) ! Lex.Tokenize, Parse, Diag.Report {
-    let prelude_modules = ["std.num", "std.time", "std.str", "std.sb", "std.bytes", "std.list", "std.map", "std.set", "std.traits", "std.int_conv", "std.char"]
+    let prelude_modules = prelude_module_list()
     let mut pi = 0
     while pi < prelude_modules.len() {
         let dotted_path = prelude_modules.get(pi).unwrap()
@@ -1318,6 +1337,23 @@ pub fn inject_prelude(src_root: Str, all_programs: List[Int]) ! Lex.Tokenize, Pa
         }
         pi = pi + 1
     }
+}
+
+// A selective import (`import mod.{a, b}`) is redundant rather than dead when
+// every listed name is already prelude-visible (yze3de). Bare `import mod` is
+// not covered — node_args is -1 — so a genuinely-unused module still warns.
+fn selective_import_all_prelude(imp_node: Int) -> Int {
+    let names_sl = node_args(imp_node)
+    if names_sl == -1 { return 0 }
+    let n = sublist_length(names_sl)
+    if n == 0 { return 0 }
+    let mut i = 0
+    while i < n {
+        let name = node_name(sublist_get(names_sl, i))
+        if is_prelude_module(tc_get_symbol_module(name)) == 0 { return 0 }
+        i = i + 1
+    }
+    1
 }
 
 pub fn check_unused_imports() ! Diag.Report {
@@ -1331,7 +1367,7 @@ pub fn check_unused_imports() ! Diag.Report {
         }
         if tc_is_module_used(mod_key) == 0 && tc_is_module_used(qualifier) == 0 {
             let imp_node = root_import_nodes.get(ii).unwrap()
-            if node_is_pub(imp_node) == 0 {
+            if node_is_pub(imp_node) == 0 && selective_import_all_prelude(imp_node) == 0 {
                 let display_name = if qualifier != "" { qualifier } else { mod_key }
                 diag_warn_at("UnusedImport", UNUSED_IMPORT, "module '{display_name}' is imported but not used", imp_node, "remove the unused import")
                 diag_set_last_fix("Remove unused import", "")

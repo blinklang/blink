@@ -23,7 +23,7 @@ import diagnostics.{
     PINNED_BYTES_ESCAPE, BYTES_PTR_CAST_FORBIDDEN,
     TRAIT_CONTRACT_900, TRAIT_CONTRACT_901, TRAIT_CONTRACT_902,
     TRAIT_CONTRACT_903, TRAIT_CONTRACT_904, TRAIT_CONTRACT_905,
-    TRAIT_CONTRACT_906,
+    TRAIT_CONTRACT_906, TRAIT_CONTRACT_907,
     CONTRACT_PREDICATE_NOT_DECIDABLE, EFFECTFUL_CALL_IN_PREDICATE,
     IMPURE_CALL_IN_PREDICATE, LOOP_IN_PREDICATE,
     RESULT_OUTSIDE_ENSURES, OLD_OUTSIDE_ENSURES,
@@ -224,6 +224,16 @@ fn tc_mark_symbol_used(name: Str) {
     match tc_symbol_module.get(name) {
         Some(mod_name) => tc_used_modules.insert(mod_name, 1)
         None => {}
+    }
+}
+
+// The dotted module a top-level symbol resolves to, or "" if unknown.
+// Lets the unused-import check (compiler.bl) tell whether a selectively
+// imported name is prelude-visible (yze3de).
+pub fn tc_get_symbol_module(name: Str) -> Str {
+    match tc_symbol_module.get(name) {
+        Some(mod_name) => mod_name
+        None => ""
     }
 }
 
@@ -1600,6 +1610,25 @@ pub fn tc_fn_has_effect(name: Str, eff: Str) -> Int {
     0
 }
 
+// The built-in method-surface traits are prelude + sealed (nrbq84, §3.2.2 /
+// §10.6): user code may neither redefine them nor write an impl of them.
+// Single source of truth for both the redefinition check (trait-registration
+// loop) and the impl check (validate_trait_impls).
+fn is_sealed_builtin_trait(name: Str) -> Int {
+    if name == "StrOps" || name == "BytesOps" || name == "StringBuildOps" || name == "Sized" { return 1 }
+    if name == "Contains" || name == "ListOps" || name == "MapOps" || name == "SetOps" || name == "Joinable" { return 1 }
+    0
+}
+
+// A declaration is user-sourced when its module is empty or the synthetic
+// main module — the stdlib defs that legitimately back the sealed traits
+// carry their dotted module (e.g. "std.traits") during this pass.
+fn is_user_sourced(node: Int) -> Int {
+    let m = node_module(node)
+    if m == "" || m == "__main__" { return 1 }
+    0
+}
+
 fn register_trait(tr_node: Int) ! TypeCheck.Register {
     let name = node_name(tr_node)
     tc_trait_names.push(name)
@@ -1698,6 +1727,11 @@ fn validate_trait_impls(program: Int) ! TypeCheck.Register, Diag.Report {
         let impl_type = node_name(im)
         if is_trait_name(trait_name) == 0 {
             diag_error_at("TraitContract", TRAIT_CONTRACT_904, "trait '{trait_name}' is not defined", im, "check the trait name or define 'trait {trait_name} \{ ... }'")
+            ii = ii + 1
+            continue
+        }
+        if is_sealed_builtin_trait(trait_name) != 0 && is_user_sourced(im) != 0 {
+            diag_error_at("TraitContract", TRAIT_CONTRACT_907, "trait '{trait_name}' is a sealed built-in trait and cannot be implemented for user types", im, "define your own trait with the methods you need and impl that instead")
             ii = ii + 1
             continue
         }
@@ -2019,7 +2053,11 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
     if traits_sl != -1 {
         let mut i = 0
         while i < sublist_length(traits_sl) {
-            register_trait(sublist_get(traits_sl, i))
+            let tr = sublist_get(traits_sl, i)
+            if is_sealed_builtin_trait(node_name(tr)) != 0 && is_user_sourced(tr) != 0 {
+                diag_error_at("TraitContract", TRAIT_CONTRACT_907, "trait '{node_name(tr)}' is a sealed built-in trait and cannot be redefined", tr, "rename your trait, or define your own trait with the methods you need")
+            }
+            register_trait(tr)
             i = i + 1
         }
     }

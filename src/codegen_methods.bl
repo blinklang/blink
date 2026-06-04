@@ -548,6 +548,38 @@ fn emit_list_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int 
         expr_result_type = CT_VOID
         return 1
     }
+    if method == "contains" {
+        // Element membership by linear scan. MVP covers primitive element
+        // types (Int, Bool, Str, Float) — the equality types the language
+        // already defines. Struct/enum/nested-collection elements fall
+        // through to UnresolvedMethod (kk0mv7: deep collection/struct
+        // equality is a separate concern; `==` on boxed structs is pointer
+        // identity today, so a field-wise `.contains` would diverge from it).
+        let elem_type = get_list_elem_type(obj_str)
+        if elem_type != CT_INT && elem_type != CT_BOOL && elem_type != CT_STRING && elem_type != CT_FLOAT {
+            return 0
+        }
+        let args_sl = node_args(node)
+        emit_expr(sublist_get(args_sl, btc_arg_offset))
+        let needle = expr_result_str
+        let res = fresh_temp("_lc_")
+        let idx = fresh_temp("_lci_")
+        let n = fresh_temp("_lcn_")
+        emit_line("int {res} = 0;")
+        emit_line("int64_t {n} = blink_list_len({obj_str});")
+        emit_line("for (int64_t {idx} = 0; {idx} < {n}; {idx}++) \{")
+        if elem_type == CT_STRING {
+            emit_line("    if (blink_str_eq((const char*)blink_list_get({obj_str}, {idx}), {needle})) \{ {res} = 1; break; }")
+        } else if elem_type == CT_FLOAT {
+            emit_line("    if (*(double*)blink_list_get({obj_str}, {idx}) == ({needle})) \{ {res} = 1; break; }")
+        } else {
+            emit_line("    if ((int64_t)(intptr_t)blink_list_get({obj_str}, {idx}) == ({needle})) \{ {res} = 1; break; }")
+        }
+        emit_line("}")
+        expr_result_str = res
+        expr_result_type = CT_BOOL
+        return 1
+    }
     if method == "get" {
         let args_sl = node_args(node)
         emit_expr(sublist_get(args_sl, btc_arg_offset))
@@ -717,7 +749,7 @@ fn emit_list_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int 
 // only handles Str keys. Single source of truth — keep both dispatch
 // sites in emit_method_call in sync via this predicate.
 fn is_map_builtin_intercept(ct: Int, method: Str) -> Bool {
-    ct == CT_MAP && (method == "clear" || method == "contains_key" || method == "remove" || method == "len" || method == "is_empty")
+    ct == CT_MAP && (method == "clear" || method == "contains_key" || method == "contains" || method == "remove" || method == "len" || method == "is_empty")
 }
 
 fn map_key_expr_inner(key_str: Str, key_ct: Int, key_sname: Str, for_insert: Bool) -> Str ! Codegen.Emit, Codegen.Register {
@@ -902,7 +934,7 @@ fn emit_map_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int !
         }
         return 1
     }
-    if method == "contains_key" {
+    if method == "contains_key" || method == "contains" {
         let args_sl = node_args(node)
         emit_expr(sublist_get(args_sl, btc_arg_offset))
         let key_str = expr_result_str
