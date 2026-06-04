@@ -477,8 +477,12 @@ fn is_int_literal_node(node: Int) -> Int {
     0
 }
 
+// Validate call args against a fnsig's param types (type only, no arity).
+// `self_offset` skips leading implicit params: 0 for free functions, 1 for
+// methods whose fnsig carries `self` as param 0 (so explicit arg `i` aligns to
+// fnsig param `i + self_offset`). Params typed TYPE_UNKNOWN are skipped.
 @allow(UnrestoredMutation)
-fn check_arg_shapes(fn_name: Str, sig: Int, args_sl: Int, _node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+fn check_arg_shapes(fn_name: Str, sig: Int, args_sl: Int, self_offset: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     if args_sl == -1 { return }
     let fs = fnsig_pool.get(sig).unwrap()
     let param_start = fs.params_start
@@ -486,19 +490,22 @@ fn check_arg_shapes(fn_name: Str, sig: Int, args_sl: Int, _node: Int) ! TypeChec
     let n = sublist_length(args_sl)
     let mut i = 0
     while i < n {
-        if i < param_count {
-            let ptid = fnsig_param_list.get(param_start + i).unwrap()
-            let arg_node = sublist_get(args_sl, i)
-            let saved_hint = tc_construct_hint
-            tc_construct_hint = resolve_alias_tid(ptid)
-            let arg_t = infer_type(arg_node)
-            tc_construct_hint = saved_hint
-            let mut lit_to_int = 0
-            if is_int_literal_node(arg_node) != 0 && is_integer_type(resolve_alias_tid(ptid)) != 0 {
-                lit_to_int = 1
-            }
-            if lit_to_int == 0 && types_compatible(arg_t, ptid) == 0 {
-                tc_error_at("argument {i + 1} of '{fn_name}' expects {type_to_str(ptid)}, got {type_to_str(arg_t)}", arg_node)
+        let pidx = i + self_offset
+        if pidx < param_count {
+            let ptid = fnsig_param_list.get(param_start + pidx).unwrap()
+            if ptid != TYPE_UNKNOWN {
+                let arg_node = sublist_get(args_sl, i)
+                let saved_hint = tc_construct_hint
+                tc_construct_hint = resolve_alias_tid(ptid)
+                let arg_t = infer_type(arg_node)
+                tc_construct_hint = saved_hint
+                let mut lit_to_int = 0
+                if is_int_literal_node(arg_node) != 0 && is_integer_type(resolve_alias_tid(ptid)) != 0 {
+                    lit_to_int = 1
+                }
+                if lit_to_int == 0 && types_compatible(arg_t, ptid) == 0 {
+                    tc_error_at("argument {i + 1} of '{fn_name}' expects {type_to_str(ptid)}, got {type_to_str(arg_t)}", arg_node)
+                }
             }
         }
         i = i + 1
@@ -526,6 +533,45 @@ fn check_builtin_arg(method: Str, arg_idx: Int, expected_t: Int, args_sl: Int, c
     }
     if lit_to_int == 0 && types_compatible(arg_t, expected_t) == 0 {
         tc_error_at("argument {arg_idx + 1} of '{container_label}.{method}' expects {type_to_str(expected_t)}, got {type_to_str(arg_t)}", arg_node)
+    }
+}
+
+// The closure argument at `idx`, or -1 if absent. The closure validators below
+// tolerate -1 (they no-op on a non-Closure node), so call sites need no guard.
+fn closure_arg_at(args_sl: Int, idx: Int) -> Int {
+    if args_sl == -1 || idx >= sublist_length(args_sl) { return -1 }
+    sublist_get(args_sl, idx)
+}
+
+// Validate one explicitly-annotated closure parameter against the type the HOF
+// expects there (derived from the container element type). Unannotated params
+// (TYPE_UNKNOWN) and unknown expected types are skipped — annotation validation
+// only, no inference (that is gkr3fs Part B).
+fn check_closure_param(closure_node: Int, param_idx: Int, expected_t: Int, method: Str, container_label: Str) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    if expected_t == TYPE_UNKNOWN { return }
+    if closure_node == -1 || node_kind(closure_node) != NodeKind.Closure { return }
+    let params_sl = node_params(closure_node)
+    if params_sl == -1 || param_idx >= sublist_length(params_sl) { return }
+    let p = sublist_get(params_sl, param_idx)
+    let ptid = resolve_param_type(p)
+    if ptid == TYPE_UNKNOWN { return }
+    if types_compatible(ptid, expected_t) == 0 {
+        tc_error_at("closure parameter {param_idx + 1} of '{container_label}.{method}' expects {type_to_str(expected_t)}, got {type_to_str(ptid)}", p)
+    }
+}
+
+// Validate an explicitly-annotated closure return type against the type the HOF
+// requires (e.g. Bool for filter/any/all). Skipped when the closure has no
+// declared return or the expected type is unknown.
+fn check_closure_ret(closure_node: Int, expected_ret: Int, method: Str, container_label: Str) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    if expected_ret == TYPE_UNKNOWN { return }
+    if closure_node == -1 || node_kind(closure_node) != NodeKind.Closure { return }
+    let ret_str = node_return_type(closure_node)
+    if ret_str == "" { return }
+    let rt = resolve_type_name(ret_str)
+    if rt == -1 { return }
+    if types_compatible(rt, expected_ret) == 0 {
+        tc_error_at("closure of '{container_label}.{method}' must return {type_to_str(expected_ret)}, got {type_to_str(rt)}", closure_node)
     }
 }
 
@@ -4759,7 +4805,7 @@ fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repo
                         let expected = fs.params_count
                         tc_error_at("function '{fn_name}' expects {expected} argument(s), got {arg_count}", node)
                     }
-                    check_arg_shapes(fn_name, sig, args_sl, node)
+                    check_arg_shapes(fn_name, sig, args_sl, 0)
                     if fs.type_params_count > 0 {
                         return instantiate_return_type(sig, args_sl)
                     }
@@ -4800,7 +4846,11 @@ fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repo
                 check_builtin_arg(method, 1, elem, args_sl, "List")
                 return TYPE_VOID
             }
-            if method == "pop" || method == "for_each" || method == "clear" { return TYPE_VOID }
+            if method == "pop" || method == "clear" { return TYPE_VOID }
+            if method == "for_each" {
+                check_closure_param(closure_arg_at(args_sl, 0), 0, elem, method, "List")
+                return TYPE_VOID
+            }
             if method == "take" || method == "skip" {
                 check_builtin_arg(method, 0, TYPE_INT, args_sl, "List")
                 return obj_t
@@ -4814,17 +4864,46 @@ fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repo
                 check_builtin_arg(method, 0, obj_t, args_sl, "List")
                 return obj_t
             }
-            if method == "map" || method == "filter" || method == "collect" {
+            if method == "map" {
+                check_closure_param(closure_arg_at(args_sl, 0), 0, elem, method, "List")
+                return obj_t
+            }
+            if method == "filter" {
+                let cls = closure_arg_at(args_sl, 0)
+                check_closure_param(cls, 0, elem, method, "List")
+                check_closure_ret(cls, TYPE_BOOL, method, "List")
+                return obj_t
+            }
+            if method == "collect" {
+                // No closure argument — nothing to validate.
                 return obj_t
             }
             if method == "contains" {
                 check_builtin_arg(method, 0, elem, args_sl, "List")
                 return TYPE_BOOL
             }
-            if method == "any" || method == "all" || method == "is_empty" { return TYPE_BOOL }
-            if method == "find" { return make_option_type(elem) }
+            if method == "is_empty" { return TYPE_BOOL }
+            if method == "any" || method == "all" {
+                let cls = closure_arg_at(args_sl, 0)
+                check_closure_param(cls, 0, elem, method, "List")
+                check_closure_ret(cls, TYPE_BOOL, method, "List")
+                return TYPE_BOOL
+            }
+            if method == "find" {
+                let cls = closure_arg_at(args_sl, 0)
+                check_closure_param(cls, 0, elem, method, "List")
+                check_closure_ret(cls, TYPE_BOOL, method, "List")
+                return make_option_type(elem)
+            }
             if method == "fold" {
-                if args_sl != -1 && sublist_length(args_sl) >= 1 {
+                if args_sl != -1 && sublist_length(args_sl) >= 2 {
+                    let acc_t = infer_type(sublist_get(args_sl, 0))
+                    let cls = sublist_get(args_sl, 1)
+                    check_closure_param(cls, 0, acc_t, method, "List")
+                    check_closure_param(cls, 1, elem, method, "List")
+                    check_closure_ret(cls, acc_t, method, "List")
+                    return acc_t
+                } else if args_sl != -1 && sublist_length(args_sl) >= 1 {
                     return infer_type(sublist_get(args_sl, 0))
                 }
                 return TYPE_UNKNOWN
@@ -4960,19 +5039,50 @@ fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repo
         }
 
         if obj_k == TK_BYTES {
+            let args_sl = node_args(node)
             if method == "len" { return TYPE_INT }
-            if method == "get" { return make_option_type(TYPE_INT) }
+            if method == "get" {
+                check_builtin_arg(method, 0, TYPE_INT, args_sl, "Bytes")
+                return make_option_type(TYPE_INT)
+            }
             if method == "is_empty" { return TYPE_BOOL }
-            if method == "push" || method == "set" { return TYPE_VOID }
-            if method == "slice" || method == "concat" { return obj_t }
+            if method == "push" {
+                check_builtin_arg(method, 0, TYPE_INT, args_sl, "Bytes")
+                return TYPE_VOID
+            }
+            if method == "set" {
+                check_builtin_arg(method, 0, TYPE_INT, args_sl, "Bytes")
+                check_builtin_arg(method, 1, TYPE_INT, args_sl, "Bytes")
+                return TYPE_VOID
+            }
+            if method == "slice" {
+                check_builtin_arg(method, 0, TYPE_INT, args_sl, "Bytes")
+                check_builtin_arg(method, 1, TYPE_INT, args_sl, "Bytes")
+                return obj_t
+            }
+            if method == "concat" {
+                check_builtin_arg(method, 0, obj_t, args_sl, "Bytes")
+                return obj_t
+            }
             if method == "to_str" { return make_result_type(TYPE_STR, TYPE_STR) }
             if method == "to_hex" { return TYPE_STR }
-            if method == "read_u16_be" || method == "read_u32_be" || method == "read_i32_be" || method == "read_i64_be" { return make_result_type(TYPE_INT, TYPE_STR) }
-            if method == "read_u16_le" || method == "read_u32_le" || method == "read_i32_le" || method == "read_i64_le" { return make_result_type(TYPE_INT, TYPE_STR) }
-            if method == "write_u16_be" || method == "write_u32_be" || method == "write_i32_be" || method == "write_i64_be" { return TYPE_VOID }
-            if method == "write_u16_le" || method == "write_u32_le" || method == "write_i32_le" || method == "write_i64_le" { return TYPE_VOID }
+            if method == "read_u16_be" || method == "read_u32_be" || method == "read_i32_be" || method == "read_i64_be" {
+                check_builtin_arg(method, 0, TYPE_INT, args_sl, "Bytes")
+                return make_result_type(TYPE_INT, TYPE_STR)
+            }
+            if method == "read_u16_le" || method == "read_u32_le" || method == "read_i32_le" || method == "read_i64_le" {
+                check_builtin_arg(method, 0, TYPE_INT, args_sl, "Bytes")
+                return make_result_type(TYPE_INT, TYPE_STR)
+            }
+            if method == "write_u16_be" || method == "write_u32_be" || method == "write_i32_be" || method == "write_i64_be" {
+                check_builtin_arg(method, 0, TYPE_INT, args_sl, "Bytes")
+                return TYPE_VOID
+            }
+            if method == "write_u16_le" || method == "write_u32_le" || method == "write_i32_le" || method == "write_i64_le" {
+                check_builtin_arg(method, 0, TYPE_INT, args_sl, "Bytes")
+                return TYPE_VOID
+            }
             if method == "with_ptr" {
-                let args_sl = node_args(node)
                 if args_sl == -1 || sublist_length(args_sl) < 1 { return TYPE_VOID }
                 let cls_node = sublist_get(args_sl, 0)
                 if node_kind(cls_node) != NodeKind.Closure { return TYPE_VOID }
@@ -4989,6 +5099,7 @@ fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repo
             let sig_name = "{tname}_{method}"
             let sig = lookup_fnsig(sig_name)
             if sig != -1 {
+                check_arg_shapes("{tname}.{method}", sig, node_args(node), 1)
                 return fnsig_pool.get(sig).unwrap().ret
             }
         }
