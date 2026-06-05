@@ -31,6 +31,7 @@ import diagnostics.{
     ASSIGNMENT_IN_PREDICATE, IMPURE_BODY_FOR_PURE_ANNOTATION,
     MODIFIES_ARG_NOT_SIMPLE_PATH,
     MAP_KEY_NOT_HASHABLE,
+    DERIVE_DEBUG_FIELD_NO_DEBUG,
     PRIVATE_ITEM_ACCESS, AMBIGUOUS_IMPORT, IMPORT_NOT_SELECTED,
     MODULE_QUALIFIED_TYPE,
     UNKNOWN_METHOD, UNUSED_VARIABLE, SET_BUT_NOT_READ, SHADOWED_VARIABLE,
@@ -142,6 +143,12 @@ let mut fnsig_map: Map[Str, Int] = Map()
 // Set of struct/enum names that carry @derive(Hash). Used to reject
 // Map[K, V] at typecheck when K is a user type without the derive.
 let mut tc_hashable_types: Map[Str, Int] = Map()
+
+// Set of struct/enum names that carry @derive(Debug). Used to reject
+// @derive(Debug) on a type whose field's user-type does not also derive Debug.
+let mut tc_debug_types: Map[Str, Int] = Map()
+// type name -> its declaration node, for field-derive validation spans.
+let mut tc_type_decl_nodes: Map[Str, Int] = Map()
 
 type FnSigEntry {
     name: Str
@@ -760,14 +767,14 @@ fn validate_map_key(key_ann: Int) ! Diag.Report {
     }
 }
 
-fn type_has_derive_hash(td: Int) -> Int {
+fn type_has_derive(td: Int, derive_name: Str) -> Int {
     let ann = get_annotation(td, "derive")
     if ann == -1 { return 0 }
     let args_sl = node_args(ann)
     if args_sl == -1 { return 0 }
     let mut j = 0
     while j < sublist_length(args_sl) {
-        if node_name(sublist_get(args_sl, j)) == "Hash" { return 1 }
+        if node_name(sublist_get(args_sl, j)) == derive_name { return 1 }
         j = j + 1
     }
     0
@@ -780,12 +787,16 @@ fn register_struct_type(td: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.R
     named_type_ids.push(tid)
     named_type_map.insert(name, tid)
     tc_struct_decl_nodes.insert(name, td)
+    tc_type_decl_nodes.insert(name, td)
     let alias_ann = node_value(td)
     if alias_ann != -1 {
         tc_alias_underlying.insert(name, resolve_type_ann(alias_ann))
     }
-    if type_has_derive_hash(td) != 0 {
+    if type_has_derive(td, "Hash") != 0 {
         tc_hashable_types.insert(name, 1)
+    }
+    if type_has_derive(td, "Debug") != 0 {
+        tc_debug_types.insert(name, 1)
     }
 
     let is_ffi_struct = has_annotation(td, "ffi.struct")
@@ -828,8 +839,12 @@ fn register_enum_type(td: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Rep
     named_type_names.push(name)
     named_type_ids.push(tid)
     named_type_map.insert(name, tid)
-    if type_has_derive_hash(td) != 0 {
+    tc_type_decl_nodes.insert(name, td)
+    if type_has_derive(td, "Hash") != 0 {
         tc_hashable_types.insert(name, 1)
+    }
+    if type_has_derive(td, "Debug") != 0 {
+        tc_debug_types.insert(name, 1)
     }
 
     let flds_sl = node_fields(td)
@@ -867,6 +882,50 @@ fn register_enum_type(td: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Rep
 
     if has_annotation(td, "deprecated") != 0 {
         depr_type_nodes.insert(name, td)
+    }
+}
+
+// A field of a @derive(Debug) type whose own type is a user struct/enum must
+// itself derive Debug — the generated debug() renders each field via its
+// debug(). Containers (List/Option/...) of non-Debug types are a known v1
+// limitation and are not flagged here.
+fn tc_debug_field_ok(ftype_name: Str) -> Int {
+    if named_type_map.contains_key(ftype_name) == 0 { return 1 }
+    if tc_debug_types.contains_key(ftype_name) != 0 { return 1 }
+    0
+}
+
+// Reject one field `f` of a @derive(Debug) type `tname` whose type does not derive Debug.
+fn tc_check_one_debug_field(f: Int, tname: Str) ! Diag.Report {
+    let ftype_name = node_name(node_value(f))
+    if tc_debug_field_ok(ftype_name) == 0 {
+        diag_error_at("DeriveDebugFieldNoDebug", DERIVE_DEBUG_FIELD_NO_DEBUG, "@derive(Debug) on '{tname}': field '{node_name(f)}' has type '{ftype_name}' which does not derive Debug", f, "add @derive(Debug) to '{ftype_name}'")
+    }
+}
+
+fn tc_check_derive_debug() ! Diag.Report {
+    let mut ti = 0
+    while ti < named_type_names.len() {
+        let tname = named_type_names.get(ti).unwrap()
+        if tc_debug_types.contains_key(tname) != 0 {
+            let flds_sl = node_fields(tc_type_decl_nodes.get(tname).unwrap())
+            let mut i = 0
+            while flds_sl != -1 && i < sublist_length(flds_sl) {
+                let f = sublist_get(flds_sl, i)
+                if node_kind(f) == NodeKind.TypeVariant {
+                    let vflds_sl = node_fields(f)
+                    let mut vi = 0
+                    while vflds_sl != -1 && vi < sublist_length(vflds_sl) {
+                        tc_check_one_debug_field(sublist_get(vflds_sl, vi), tname)
+                        vi = vi + 1
+                    }
+                } else {
+                    tc_check_one_debug_field(f, tname)
+                }
+                i = i + 1
+            }
+        }
+        ti = ti + 1
     }
 }
 
@@ -1954,6 +2013,8 @@ fn init_types() ! TypeCheck.Register {
     named_type_ids.clear()
     named_type_map.clear()
     tc_hashable_types.clear()
+    tc_debug_types.clear()
+    tc_type_decl_nodes.clear()
     tc_alias_underlying = Map()
     sfield_pool.clear()
     nr_callable_field_names.clear()
@@ -2034,6 +2095,9 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
     // Kind A: a struct name equal to an enum variant name is a hard error (E0518).
     // Detected over the whole-program symbol table (catches cross-module collisions).
     tc_check_name_collisions()
+
+    // @derive(Debug) requires every user-type field to also derive Debug.
+    tc_check_derive_debug()
 
     // Register all function signatures
     let fns_sl = node_params(program)

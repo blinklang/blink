@@ -16,7 +16,7 @@ import codegen_types.{
     tp_child2_kind, tp_child2_sname,
     get_variant_field_name, get_variant_field_type_str,
     derive_serialize_types, derive_deserialize_types,
-    derive_eq_types, derive_clone_types, derive_hash_types,
+    derive_eq_types, derive_clone_types, derive_hash_types, derive_debug_types,
     derive_method_entries,
     DeriveMethodEntry,
     sf_entries,
@@ -26,7 +26,7 @@ import parser.{node_args, node_handlers, node_name, sublist_get, sublist_length}
 import diagnostics.{diag_error_at, UNKNOWN_DERIVE_NAME, Diag}
 
 fn is_known_derive(name: Str) -> Bool {
-    name == "Serialize" || name == "Deserialize" || name == "Eq" || name == "Clone" || name == "Hash"
+    name == "Serialize" || name == "Deserialize" || name == "Eq" || name == "Clone" || name == "Hash" || name == "Debug"
 }
 
 pub fn register_derive_annotations(types_sl: Int) ! Diag.Report {
@@ -88,8 +88,16 @@ pub fn register_derive_annotations(types_sl: Int) ! Diag.Report {
                                     ret_type: CT_INT
                                 })
                             }
+                            if dname == "Debug" {
+                                derive_debug_types.push(tname)
+                                derive_method_entries.push(DeriveMethodEntry {
+                                    type_name: tname,
+                                    method_name: "debug",
+                                    ret_type: CT_STRING
+                                })
+                            }
                             if !is_known_derive(dname) {
-                                diag_error_at("UnknownDerive", UNKNOWN_DERIVE_NAME, "unknown @derive name '{dname}'; expected one of Serialize, Deserialize, Eq, Clone, Hash", darg, "remove or replace this derive name")
+                                diag_error_at("UnknownDerive", UNKNOWN_DERIVE_NAME, "unknown @derive name '{dname}'; expected one of Serialize, Deserialize, Eq, Clone, Hash, Debug", darg, "remove or replace this derive name")
                             }
                             di = di + 1
                         }
@@ -150,6 +158,12 @@ pub fn emit_derive_forward_decls() ! Codegen.Emit {
         let cn = c_type_c_name(tname)
         emit_line("extern const blink_kops kops_{cn};")
         hi = hi + 1
+    }
+    let mut dbi = 0
+    while dbi < derive_debug_types.len() {
+        let tname = derive_debug_types.get(dbi).unwrap()
+        emit_line("const char* {c_type_c_name(tname)}_debug({c_type_c_name(tname)} self);")
+        dbi = dbi + 1
     }
 }
 
@@ -219,6 +233,16 @@ pub fn emit_derive_fn_defs() ! Codegen.Emit {
             emit_struct_hash(tname)
         }
         hi = hi + 1
+    }
+    let mut dbi = 0
+    while dbi < derive_debug_types.len() {
+        let tname = derive_debug_types.get(dbi).unwrap()
+        if is_enum_type(tname) != 0 {
+            emit_enum_debug(tname)
+        } else {
+            emit_struct_debug(tname)
+        }
+        dbi = dbi + 1
     }
 }
 
@@ -473,6 +497,123 @@ fn emit_enum_to_json(type_name: Str) ! Codegen.Emit {
             i = i + 1
         }
         emit_line("default: return \"null\";")
+        cg_indent = cg_indent - 1
+        emit_line("}")
+        cg_indent = cg_indent - 1
+        emit_line("}")
+        emit_line("")
+    }
+}
+
+// Emit one value's Debug rendering, concatenated onto `result`.
+// Nested fields whose type does not derive Debug are rejected earlier in
+// typecheck (E0520); by codegen the nested debug() always exists.
+fn emit_field_debug(access: Str, field_type: Int, stype: Str) ! Codegen.Emit {
+    if field_type == CT_STRING {
+        emit_line("result = blink_str_concat(result, {c_fn_name("json_escape_str")}({access}));")
+    } else if field_type == CT_BOOL {
+        emit_line("result = blink_str_concat(result, {access} ? \"true\" : \"false\");")
+    } else if field_type == CT_FLOAT {
+        emit_line("result = blink_str_concat(result, {c_fn_name("float_to_str")}({access}));")
+    } else if is_hash_scalar_ct(field_type) != 0 {
+        emit_line("result = blink_str_concat(result, {c_fn_name("int_to_str")}({access}));")
+    } else if field_type == CT_VOID && stype != "" && has_derive_method(stype, "debug") != 0 {
+        emit_line("result = blink_str_concat(result, {c_type_c_name(stype)}_debug({access}));")
+    } else {
+        emit_line("result = blink_str_concat(result, \"<?>\");")
+    }
+}
+
+fn emit_struct_debug(type_name: Str) ! Codegen.Emit {
+    emit_line("const char* {c_type_c_name(type_name)}_debug({c_type_c_name(type_name)} self) \{")
+    cg_indent = cg_indent + 1
+    emit_line("const char* result = \"{type_name} \{ \";")
+    let mut _field_idx = 0
+    let mut i = 0
+    while i < sf_entries.len() {
+        let sf = sf_entries.get(i).unwrap()
+        if sf.struct_name == type_name {
+            if _field_idx > 0 {
+                emit_line("result = blink_str_concat(result, \", \");")
+            }
+            emit_line("result = blink_str_concat(result, \"{sf.field_name}: \");")
+            emit_field_debug("self.{sf.field_name}", sf.field_type, sf.stype)
+            _field_idx = _field_idx + 1
+        }
+        i = i + 1
+    }
+    emit_line("result = blink_str_concat(result, \" }\");")
+    emit_line("return result;")
+    cg_indent = cg_indent - 1
+    emit_line("}")
+    emit_line("")
+}
+
+fn emit_enum_debug(type_name: Str) ! Codegen.Emit {
+    let eidx = get_enum_reg_idx(type_name)
+    if eidx == -1 { return }
+    let is_data = is_data_enum(type_name)
+
+    if is_data == 0 {
+        emit_line("const char* {c_type_c_name(type_name)}_debug({c_type_c_name(type_name)} self) \{")
+        cg_indent = cg_indent + 1
+        emit_line("switch (self) \{")
+        cg_indent = cg_indent + 1
+        let mut i = 0
+        while i < enum_variants.len() {
+            let evar = enum_variants.get(i).unwrap()
+            if evar.enum_idx == eidx {
+                emit_line("case {c_type_c_name(type_name)}_{evar.name}: return \"{evar.name}\";")
+            }
+            i = i + 1
+        }
+        emit_line("default: return \"<unknown>\";")
+        cg_indent = cg_indent - 1
+        emit_line("}")
+        cg_indent = cg_indent - 1
+        emit_line("}")
+        emit_line("")
+    } else {
+        emit_line("const char* {c_type_c_name(type_name)}_debug({c_type_c_name(type_name)} self) \{")
+        cg_indent = cg_indent + 1
+        emit_line("const char* result = \"\";")
+        emit_line("switch (self.tag) \{")
+        cg_indent = cg_indent + 1
+        let mut _tag = 0
+        let mut i = 0
+        while i < enum_variants.len() {
+            let evar = enum_variants.get(i).unwrap()
+            if evar.enum_idx == eidx {
+                emit_line("case {_tag}: \{")
+                cg_indent = cg_indent + 1
+                if evar.field_count > 0 {
+                    emit_line("result = \"{evar.name}(\";")
+                    let vidx = i
+                    let mut fi = 0
+                    while fi < evar.field_count {
+                        let fname = get_variant_field_name(vidx, fi).unwrap()
+                        let ftype_str = get_variant_field_type_str(vidx, fi).unwrap()
+                        let fct = type_from_name(ftype_str)
+                        if fi > 0 {
+                            emit_line("result = blink_str_concat(result, \", \");")
+                        }
+                        let access = "self.data.{evar.name}.{fname}"
+                        let fstype = if is_struct_type(ftype_str) != 0 || is_enum_type(ftype_str) != 0 { ftype_str } else { "" }
+                        emit_field_debug(access, fct, fstype)
+                        fi = fi + 1
+                    }
+                    emit_line("result = blink_str_concat(result, \")\");")
+                } else {
+                    emit_line("result = \"{evar.name}\";")
+                }
+                emit_line("return result;")
+                cg_indent = cg_indent - 1
+                emit_line("}")
+                _tag = _tag + 1
+            }
+            i = i + 1
+        }
+        emit_line("default: return \"<unknown>\";")
         cg_indent = cg_indent - 1
         emit_line("}")
         cg_indent = cg_indent - 1
