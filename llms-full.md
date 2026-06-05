@@ -1,6 +1,6 @@
 # Blink Language Reference
 
-> Blink is a statically-typed, effect-tracked language compiling to C. **Compiler v0.46.0**.
+> Blink is a statically-typed, effect-tracked language compiling to C. **Compiler v0.47.0**.
 
 ## Install
 
@@ -12,7 +12,7 @@ docker pull ghcr.io/blinklang/blink:latest
 docker run --rm -v "$PWD":/workspace ghcr.io/blinklang/blink run myfile.bl
 ```
 
-Tags: `latest`, `0.46`, `0.46.0` (semver). Image is `debian:bookworm-slim` with `gcc`, `zig`, `blink`, and `libgc-dev`.
+Tags: `latest`, `0.47`, `0.47.0` (semver). Image is `debian:bookworm-slim` with `gcc`, `zig`, `blink`, and `libgc-dev`.
 
 ## Recent Changes
 
@@ -511,6 +511,7 @@ let s = str_from_code_point(65)         // -> Str ("A"), from std.str
 | `.pop()` | Option[T] | Remove last |
 | `.get(idx)` | Option[T] | Element at index (None if OOB) |
 | `.set(idx, val)` | Void | Set element (mutates) |
+| `.contains(elem)` | Bool | Membership check (primitive elements: Int/Bool/Str/Float) |
 | `.concat(other)` | List[T] | Concatenate lists |
 | `.slice(start, end)` | List[T] | Sub-list |
 | `.join(sep)` | Str | Join as string (List[Str]) |
@@ -542,6 +543,7 @@ let s = str_from_code_point(65)         // -> Str ("A"), from std.str
 | `.insert(key, val)` | Void | Insert/update (method form) |
 | `.get(key)` | Option[V] | Safe lookup — pattern-match `Some(v)` / `None` |
 | `.contains_key(key)` | Bool | Key exists? |
+| `.contains(key)` | Bool | Key exists? (alias of `contains_key`) |
 | `.remove(key)` | Bool | Remove key, returns `true` if removed |
 | `.len()` | Int | Entry count |
 | `.keys()` | List[K] | All keys |

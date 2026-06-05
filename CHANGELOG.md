@@ -2,6 +2,26 @@
 
 Single source of truth for release history. `blink llms` and `blink llms --full` both append this file after the reference text, and every release version is indexed as a topic (e.g. `blink llms --topic v0.36`). **Edit only here** — `llms.md` and `llms-full.md` hold only a `## Recent Changes` stub pointing at this file.
 
+## Breaking Changes (v0.47.0)
+
+- **Bare calls to stdlib free functions now require an explicit `import` (E0504).** `list_map`, `parse_int`, `str_trim`, and every other stdlib *free function* previously resolved with no import because the prelude auto-loaded whole stdlib modules into name scope. Per §3.2.3 the prelude provides only compiler-known types, constructors, and traits — not library free functions. A bare call to one now errors with a hint naming the import to add. **Built-in method dispatch is unaffected** — `"hi".trim()`, `[1,2].map(...)`, etc. still need no import; only the standalone free-function forms changed.
+
+## What's New (v0.47.0)
+
+- **Built-in method-surface traits are now sealed (E0907).** `StrOps`, `BytesOps`, `StringBuildOps`, `Sized`, `Contains`, `ListOps`, `MapOps`, `SetOps`, and `Joinable` are prelude traits that back built-in method dispatch on `Str`/`List`/`Map`/`Set`/`Bytes`. User code may neither redefine one nor write an `impl` of one — both are now a hard error. (Naming one in a generic bound is still legal.)
+- **`List.contains()` and `Map.contains()`.** `List.contains(x)` does a per-element linear scan for primitive element types (`Int`/`Bool`/`Str`/`Float`); `Map.contains(k)` mirrors `contains_key`. Struct/enum/nested-collection list elements remain unsupported (`==` on boxed values is pointer identity today).
+- **A redundant selective import of a prelude trait no longer warns `UnusedImport`.** Importing a name that resolves to a prelude module is a no-op rather than dead code. Mixed and bare imports still warn.
+
+## Fixes (v0.47.0)
+
+- **Arguments are now type-checked across the board.** Built-in container methods (`[1,2,3].contains(2.0)`, `"hi".contains(5)`, `Map[Str,Int].get(5)`), user struct/enum trait methods (`p.add_to(2.0)` where `add_to` expects `Int`), `Bytes` intrinsic methods (`b.push(2.0)`), and explicitly-annotated closure params/returns of List HOFs (`map`/`filter`/`find`/`for_each`/`any`/`all`/`fold`) and `Bytes.with_ptr` all validate their arguments now. Mismatches previously rode the codegen-intrinsic path with an implicit C cast and could segfault; they now error at compile time with E0300.
+- **`Bytes.new()` is now typed.** `let b = Bytes.new()` previously resolved to an unknown type, silently disabling every downstream `b.method(...)` argument check. It now resolves correctly.
+- **Type-changing `map(...).collect()` keeps the new element type.** `map(fn(T) -> U).collect()` previously lost `U` and mistyped the result as `List[T]` — rejecting correct code and accepting wrong assignments. `map` now derives the element type from the closure's declared return (flat names; nested generics still fall back to `List[T]`).
+- **Trait methods on stdlib-imported types now resolve in codegen.** A method called on a `mod.Type`-typed value (e.g. `net.TcpSocket`) passed `check` but failed `build` with `UnresolvedMethod` because the impl was registered under the bare type name. The qualified→bare strip is now centralized.
+- **`Option[T]`'s type argument is preserved through tuple and enum-variant C lowering.** A bare `None` in a struct-style enum field, a `Result[(T, U), E]` destructured through `?`, and a monomorphized generic fn returning a tuple containing `Option[UserEnum]` all previously dropped `Option`'s argument (emitting `blink_Option_int`/`void`), passing `check` but failing the C compile with references to types the user never wrote. All now route through the canonical carrier name.
+- **A struct-returning call in an `if`-expression branch no longer emits `const void`.** `let c = if cond { make(1) } else { make(0) }` (where `make` returns a struct) discarded both branch values and broke downstream member access. The same gap is closed for `match`-arm tails and nested `if`-expr branches.
+- **`Bytes` intrinsic methods validate their `Int` offset/value arguments** — matching the List/Str/Map/Set treatment.
+
 ## What's New (v0.46.0)
 
 - **Bare struct-style enum-variant construction.** `Variant { field: x }` now works without an enum qualifier, mirroring the long-supported bare tuple construction and bare struct-style *patterns*. Resolution is hint-first (binding annotation, return type, fn-arg param, or `Ok`/`Err`/`Some` carrier), falling back to a global-unique variant lookup. Bare and qualified forms emit byte-identical C.
