@@ -505,9 +505,12 @@ fn emit_enum_to_json(type_name: Str) ! Codegen.Emit {
     }
 }
 
-// Emit one value's Debug rendering, concatenated onto `result`.
-// Nested fields whose type does not derive Debug are rejected earlier in
-// typecheck (E0520); by codegen the nested debug() always exists.
+// Emit one SCALAR / Str / user-type value's Debug rendering, concatenated onto
+// `result`. Containers (List/Option/Map) are handled by emit_field_debug_struct
+// on the struct path; on the enum-variant path a container field is rejected at
+// typecheck (E0520), so by codegen the only field types reaching here are
+// scalars, Str, and Debug-deriving user types. Nested non-Debug user types are
+// likewise rejected earlier (E0520) — the nested debug() always exists.
 fn emit_field_debug(access: Str, field_type: Int, stype: Str) ! Codegen.Emit {
     if field_type == CT_STRING {
         emit_line("result = blink_str_concat(result, {c_fn_name("json_escape_str")}({access}));")
@@ -520,7 +523,138 @@ fn emit_field_debug(access: Str, field_type: Int, stype: Str) ! Codegen.Emit {
     } else if field_type == CT_VOID && stype != "" && has_derive_method(stype, "debug") != 0 {
         emit_line("result = blink_str_concat(result, {c_type_c_name(stype)}_debug({access}));")
     } else {
+        // Unreachable: containers dispatch via emit_field_debug_struct and
+        // enum-variant containers / non-Debug fields are rejected by typecheck
+        // (E0520). Mirror emit_struct_hash's compiler-bug marker rather than a
+        // silent placeholder so a typecheck/codegen disagreement surfaces.
+        emit_line("/* BLINK_COMPILER_BUG: @derive(Debug) field reached emit_field_debug with an un-renderable type — typecheck E0520 should have rejected this */")
         emit_line("result = blink_str_concat(result, \"<?>\");")
+    }
+}
+
+// Emit Debug rendering of one container ELEMENT / value, read from a void* slot
+// expression `slot` (the raw stored pointer/intptr, exactly as blink_list_get or
+// map values yield it). Mirrors emit_list_serialize's boxing conventions but in
+// debug-form. `elem_ct` is the element kind; `elem_struct` is the user-type name
+// (or ""). Typecheck (E0520) guarantees no nested container reaches here, so
+// there is no placeholder branch.
+fn emit_debug_elem_from_slot(slot: Str, elem_ct: Int, elem_struct: Str) ! Codegen.Emit {
+    if elem_struct != "" {
+        emit_line("{c_type_c_name(elem_struct)} _elem = *({c_type_c_name(elem_struct)}*){slot};")
+        emit_line("result = blink_str_concat(result, {c_type_c_name(elem_struct)}_debug(_elem));")
+    } else if elem_ct == CT_STRING {
+        emit_line("result = blink_str_concat(result, {c_fn_name("json_escape_str")}((const char*){slot}));")
+    } else if elem_ct == CT_FLOAT {
+        emit_line("result = blink_str_concat(result, {c_fn_name("float_to_str")}(*(double*){slot}));")
+    } else if elem_ct == CT_BOOL {
+        emit_line("result = blink_str_concat(result, (int64_t)(intptr_t){slot} ? \"true\" : \"false\");")
+    } else {
+        // Int / sized-int / Char — stored as intptr-packed scalar.
+        emit_line("result = blink_str_concat(result, {c_fn_name("int_to_str")}((int64_t)(intptr_t){slot}));")
+    }
+}
+
+fn emit_list_debug(access: Str, struct_name: Str, field_name: Str) ! Codegen.Emit {
+    let fa_tp = get_struct_field_tp_id(struct_name, field_name)
+    let elem_struct = if fa_tp >= 0 { tp_child1_sname(fa_tp) } else { "" }
+    let elem_type = if fa_tp >= 0 { tp_child1_kind(fa_tp) } else { CT_INT }
+    emit_line("result = blink_str_concat(result, \"[\");")
+    emit_line("\{")
+    cg_indent = cg_indent + 1
+    emit_line("int64_t _len = blink_list_len({access});")
+    emit_line("for (int64_t _i = 0; _i < _len; _i++) \{")
+    cg_indent = cg_indent + 1
+    emit_line("if (_i > 0) result = blink_str_concat(result, \", \");")
+    emit_debug_elem_from_slot("blink_list_get({access}, _i)", elem_type, elem_struct)
+    cg_indent = cg_indent - 1
+    emit_line("}")
+    cg_indent = cg_indent - 1
+    emit_line("}")
+    emit_line("result = blink_str_concat(result, \"]\");")
+}
+
+fn emit_option_debug(access: Str, struct_name: Str, field_name: Str) ! Codegen.Emit {
+    let fa_tp = get_struct_field_tp_id(struct_name, field_name)
+    let inner_struct = if fa_tp >= 0 { tp_child1_sname(fa_tp) } else { "" }
+    let inner_type = if fa_tp >= 0 { tp_child1_kind(fa_tp) } else { CT_INT }
+    emit_line("if (({access}).tag == 1) \{")
+    cg_indent = cg_indent + 1
+    emit_line("result = blink_str_concat(result, \"Some(\");")
+    if inner_struct != "" {
+        emit_line("result = blink_str_concat(result, {c_type_c_name(inner_struct)}_debug(({access}).value));")
+    } else if inner_type == CT_STRING {
+        emit_line("result = blink_str_concat(result, {c_fn_name("json_escape_str")}(({access}).value));")
+    } else if inner_type == CT_FLOAT {
+        emit_line("result = blink_str_concat(result, {c_fn_name("float_to_str")}(({access}).value));")
+    } else if inner_type == CT_BOOL {
+        emit_line("result = blink_str_concat(result, ({access}).value ? \"true\" : \"false\");")
+    } else {
+        emit_line("result = blink_str_concat(result, {c_fn_name("int_to_str")}((int64_t)({access}).value));")
+    }
+    emit_line("result = blink_str_concat(result, \")\");")
+    cg_indent = cg_indent - 1
+    emit_line("} else \{")
+    cg_indent = cg_indent + 1
+    emit_line("result = blink_str_concat(result, \"None\");")
+    cg_indent = cg_indent - 1
+    emit_line("}")
+}
+
+// Emit Debug rendering of one Map KEY read from the kops storage slot. Keys are
+// stored per the kops vtable: inline_key=0 (Str) → the slot holds a pointer;
+// inline_key=1 (Int/Bool/sized) → the slot holds the bytes inline. We read the
+// raw slot via blink_map_key_slot(...) and cast by K kind. Typecheck restricts
+// K to Str/Int/Bool/sized-int.
+fn emit_debug_map_key(slot: Str, key_ct: Int) ! Codegen.Emit {
+    if key_ct == CT_STRING {
+        emit_line("result = blink_str_concat(result, {c_fn_name("json_escape_str")}((const char*){slot}));")
+    } else if key_ct == CT_BOOL {
+        emit_line("result = blink_str_concat(result, (*(const int64_t*){slot}) ? \"true\" : \"false\");")
+    } else {
+        // Int / sized-int — stored inline as the integer bytes.
+        emit_line("result = blink_str_concat(result, {c_fn_name("int_to_str")}(*(const int64_t*){slot}));")
+    }
+}
+
+fn emit_map_debug(access: Str, struct_name: Str, field_name: Str) ! Codegen.Emit {
+    let fa_tp = get_struct_field_tp_id(struct_name, field_name)
+    let key_type = if fa_tp >= 0 { tp_child1_kind(fa_tp) } else { CT_STRING }
+    let val_struct = if fa_tp >= 0 { tp_child2_sname(fa_tp) } else { "" }
+    let val_type = if fa_tp >= 0 { tp_child2_kind(fa_tp) } else { CT_INT }
+    emit_line("result = blink_str_concat(result, \"\{\");")
+    emit_line("\{")
+    cg_indent = cg_indent + 1
+    emit_line("blink_map* _m = {access};")
+    emit_line("size_t _stride = blink_kops_stride(_m->kops);")
+    emit_line("int _first = 1;")
+    emit_line("for (int64_t _i = 0; _i < _m->cap; _i++) \{")
+    cg_indent = cg_indent + 1
+    emit_line("if (_m->states[_i] != 1) continue;")
+    emit_line("if (!_first) result = blink_str_concat(result, \", \");")
+    emit_line("_first = 0;")
+    emit_debug_map_key("blink_map_key_slot(_m, _i, _stride)", key_type)
+    emit_line("result = blink_str_concat(result, \": \");")
+    emit_debug_elem_from_slot("_m->values[_i]", val_type, val_struct)
+    cg_indent = cg_indent - 1
+    emit_line("}")
+    cg_indent = cg_indent - 1
+    emit_line("}")
+    emit_line("result = blink_str_concat(result, \"}\");")
+}
+
+// Struct-field Debug dispatch. Scalars / Str / user-types delegate to
+// emit_field_debug (unchanged, shared with the enum path). Container fields
+// (List/Option/Map) render their elements via the per-container emitters,
+// using the field's tp_id (available only at the struct call site).
+fn emit_field_debug_struct(access: Str, field_type: Int, stype: Str, struct_name: Str, field_name: Str) ! Codegen.Emit {
+    if field_type == CT_LIST {
+        emit_list_debug(access, struct_name, field_name)
+    } else if field_type == CT_OPTION {
+        emit_option_debug(access, struct_name, field_name)
+    } else if field_type == CT_MAP {
+        emit_map_debug(access, struct_name, field_name)
+    } else {
+        emit_field_debug(access, field_type, stype)
     }
 }
 
@@ -537,7 +671,7 @@ fn emit_struct_debug(type_name: Str) ! Codegen.Emit {
                 emit_line("result = blink_str_concat(result, \", \");")
             }
             emit_line("result = blink_str_concat(result, \"{sf.field_name}: \");")
-            emit_field_debug("self.{sf.field_name}", sf.field_type, sf.stype)
+            emit_field_debug_struct("self.{sf.field_name}", sf.field_type, sf.stype, type_name, sf.field_name)
             _field_idx = _field_idx + 1
         }
         i = i + 1

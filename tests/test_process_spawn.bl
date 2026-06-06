@@ -51,3 +51,27 @@ test "double-wait on already-reaped pid returns cached result" {
     assert_eq(r1.exit_code, 0)
     assert_eq(r2.exit_code, 0)
 }
+
+// A child that writes more than one pipe buffer (~64KB) to STDERR while the
+// parent is reading must not deadlock. pid_wait must drain stdout and stderr
+// concurrently — draining stdout to EOF first blocks the child on its stderr
+// write (EOF on stdout never arrives), hanging both sides. Regression for the
+// cmd_test hang on chatty --debug builds (e.g. test_bytes.bl).
+test "spawn with large stderr does not deadlock" {
+    let pid = process_spawn("sh", ["-c", "i=0; while [ $i -lt 4000 ]; do echo 'padding padding padding padding padding padding padding' 1>&2; i=$((i+1)); done; echo small-stdout"])
+    let r = process_pid_wait(pid)
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("small-stdout"), "expected stdout captured, got len {r.out.len()}")
+    assert(r.err_out.len() > 100000, "expected large stderr captured, got len {r.err_out.len()}")
+}
+
+// Symmetric case: a child that writes more than one pipe buffer to STDOUT
+// while also writing stderr. Guards against a fix that only reorders the two
+// sequential drains instead of interleaving them.
+test "spawn with large stdout does not deadlock" {
+    let pid = process_spawn("sh", ["-c", "i=0; while [ $i -lt 4000 ]; do echo 'padding padding padding padding padding padding padding'; i=$((i+1)); done; echo small-err 1>&2"])
+    let r = process_pid_wait(pid)
+    assert_eq(r.exit_code, 0)
+    assert(r.out.len() > 100000, "expected large stdout captured, got len {r.out.len()}")
+    assert(r.err_out.contains("small-err"), "expected stderr captured, got len {r.err_out.len()}")
+}

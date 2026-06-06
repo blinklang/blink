@@ -2183,8 +2183,17 @@ Key differences:
 | `Int` | `"42"` | `"42"` |
 | `Bool` | `"true"` | `"true"` |
 | Struct | `"User { name: \"Alice\", age: 30 }"` | User-defined |
+| `List[T]` (iff `T: Debug`) | `"[1, 2, 3]"` | — |
+| `Option[T]` (iff `T: Debug`) | `"Some(42)"` / `"None"` | — |
+| `Map[K,V]` (iff `K: Debug`, `V: Debug`) | `"{\"a\": 1}"` | — |
 
 String interpolation (`"{value}"`) invokes `Display`. Explicit `value.debug()` is required for the structural form.
+
+`List`, `Option`, and `Map` implement `Debug` **conditionally** — a `List[T]` is `Debug` iff its
+element type `T` is `Debug`; an `Option[T]` iff `T` is `Debug`; a `Map[K,V]` iff **both** `K` and
+`V` are `Debug`. These are the only conditional (constrained) built-in `Debug` instances; their
+element-wise rendering and the v1 nesting boundary are specified in *Container Debug Rendering*
+below.
 
 ##### Display Trait Shape
 
@@ -2421,6 +2430,75 @@ Per-trait sum type rules:
 | `Display` | Variant name for unit variants; `"Variant(f1, f2)"` for data-carrying |
 | `Debug` | `"Variant"` for unit variants; `"Variant({f1.debug()}, {f2.debug()})"` for data-carrying |
 
+##### Container Debug Rendering
+
+A field of a `@derive(Debug)` type may be a container — `List[T]`, `Option[T]`, or `Map[K,V]`. The
+uniform per-field model (each field renders via `{field.debug()}`) holds: the container's own
+`debug()` renders its contents, with every element, key, and value rendered in **debug-form** (so a
+`Str` element is quoted and escaped, matching `Str.debug()`). The compiler provides these `debug()`
+implementations as **conditional (constrained) built-in instances** — a container is
+Debug-renderable iff its type argument(s) are themselves `Debug`.
+
+**Format.** Each container renders as follows. Separators are `, ` between elements/entries and `: `
+between a map key and its value; there is no inner padding.
+
+| Type | `debug()` format | Empty |
+|------|------------------|-------|
+| `List[T]` | `"[" + elems.join(", ") + "]"`, each elem via its own `.debug()` | `"[]"` |
+| `Option[T]` | `"Some(" + inner.debug() + ")"` when present | `"None"` (bare, no parens) |
+| `Map[K,V]` | `"{" + entries.join(", ") + "}"`, each entry `key.debug() + ": " + value.debug()` | `"{}"` |
+
+```blink
+@derive(Debug)
+type Inventory { items: List[Str], count: Option[Int], tags: Map[Str, Int] }
+
+let tags: Map[Str, Int] = Map()
+tags["rare"] = 1
+let inv = Inventory { items: ["sword", "shield"], count: Some(2), tags: tags }
+inv.debug()
+// => "Inventory { items: [\"sword\", \"shield\"], count: Some(2), tags: {\"rare\": 1} }"
+```
+
+`Str` elements render quoted because the elements use debug-form: `List[Str]` of `["a", "b"]`
+renders `["a", "b"]` (with the inner quotes), and a `Map[Str, Int]` with the entry `"a" -> 1`
+renders `{"a": 1}`. Scalar elements render bare: `List[Int]` of `[1, 2, 3]` renders `[1, 2, 3]`.
+
+**Conditional Debug — non-Debug element, key, or value.** A container field is Debug-renderable
+only when its type argument(s) are `Debug`. If an element type, a map key type, or a map value type
+does not itself implement `Debug`, the derive is rejected with **`E0520`** (`DeriveDebugFieldNoDebug`,
+the same code raised for a direct non-Debug field in *Error Reporting* below) naming the offending
+inner type. The check peels the container and recurses on the element type — and on **both** `K` and
+`V` for a `Map`. There is no placeholder for the
+non-Debug case: rendering `<?>` (or any silent stand-in) is forbidden, because it would relocate the
+banned silent fallback (the panel's 5-0 rule against `[object Object]`-style fallbacks, *Display
+Format Protocol*) one level down.
+
+```blink
+type Plain { a: Int }              // does NOT derive Debug
+
+@derive(Debug)
+type Bad { items: List[Plain] }    // E0520 — element type `Plain` does not derive Debug
+```
+
+**One container level for v1.** v1 renders exactly one container level. A nested container —
+`List[List[T]]`, `Option[List[T]]`, `Map[K, List[V]]`, and any other container whose element, key,
+or value type is itself a container — is rejected with a **hard `E0520` at depth+1**. The diagnostic
+names the v1 one-level limit and the tracking ticket for the deferred fully-recursive renderer; it
+is **never** a placeholder.
+
+```blink
+@derive(Debug)
+type Nested { grid: List[List[Int]] }   // E0520 — nested container Debug is v1-limited to one level
+```
+
+The no-silent-fallback invariant is carried by the **typecheck rule**, which is fully inductive: the
+typechecker recurses to prove every nested element's type is `Debug` (the same recursion that
+rejects a non-Debug element), so it can equally reject a container nested inside a container at
+depth+1. The v1 *emitter* is capped at one level; the fully-recursive per-monomorphization `debug()`
+emitter is the deferred end-state (a follow-up ticket), to land with dedicated nested-container
+codegen tests. See [Container Debug rendering](../decisions/debug-container-rendering.md) for the
+full deliberation, including why the v1 boundary is a hard error rather than a placeholder.
+
 ##### Generic Type Bound Inference
 
 When deriving for a generic type, the compiler **infers** trait bounds on type parameters from field usage:
@@ -2473,6 +2551,13 @@ error[NonDerivableTrait]: cannot derive `Hash` for `Measurement`
 ```
 
 All failing fields are reported in one pass so the developer can fix everything at once.
+
+For `@derive(Debug)` specifically, the per-field check fires **`E0520 DeriveDebugFieldNoDebug`** when
+a field's type has no `debug()` to call. For a **container** field (`List[T]` / `Option[T]` /
+`Map[K,V]`), the check peels the container and recurses on the element type — and on **both** `K`
+and `V` for a `Map` — so `E0520` also names a non-Debug *element/key/value* type, and a container
+nested inside a container (depth+1) raises `E0520` under the v1 one-level limit. See *Container Debug
+Rendering* above.
 
 #### §3.6.2 Serialization Traits
 

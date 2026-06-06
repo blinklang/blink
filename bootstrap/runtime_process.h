@@ -4,6 +4,7 @@
 #ifndef _WIN32
 #include <sys/wait.h>
 #include <signal.h>
+#include <poll.h>
 #endif
 
 typedef struct {
@@ -43,19 +44,48 @@ static char** blink_process_build_argv(const char* cmd, const blink_list* args) 
     return argv;
 }
 
-static char* blink_read_fd_to_string(int fd) {
-    int64_t cap = 4096, len = 0;
-    char* buf = (char*)blink_alloc(cap);
-    while (1) {
-        if (len + 1024 > cap) { cap *= 2; buf = (char*)GC_REALLOC(buf, (size_t)cap); }
-        ssize_t n = read(fd, buf + len, (size_t)(cap - len - 1));
-        if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) break;
-        len += n;
+/* Read-pump for one fd when poll() reports it ready. Grows `*buf` as needed
+ * and appends; on EOF/error closes the fd and clears `*open`. `pfd` is the
+ * poll entry for this fd, or NULL when the fd is not being polled (skipped). */
+static void blink_pump_fd(int fd, int* open, struct pollfd* pfd, char** buf, int64_t* cap, int64_t* len) {
+    if (!*open || pfd == NULL || !(pfd->revents & (POLLIN | POLLHUP | POLLERR))) return;
+    if (*len + 1024 > *cap) { *cap *= 2; *buf = (char*)GC_REALLOC(*buf, (size_t)*cap); }
+    ssize_t rc = read(fd, *buf + *len, (size_t)(*cap - *len - 1));
+    if (rc < 0 && errno == EINTR) return; /* retry next loop */
+    if (rc <= 0) { close(fd); *open = 0; return; }
+    *len += rc;
+}
+
+/* Drain two child fds (stdout, stderr) CONCURRENTLY into freshly-allocated
+ * GC strings. Draining one fd to EOF before touching the other deadlocks
+ * when the child fills the second pipe's buffer (~64KB) while we block on
+ * the first: the child blocks on write(), so it never closes the first fd,
+ * so our read() never sees EOF. poll() lets us read whichever fd has data,
+ * so neither pipe can fill. Either fd may be < 0 (skipped, yields ""). Both
+ * fds are closed on return. Caller passes back the two NUL-terminated buffers. */
+static void blink_drain_two_fds(int fd_a, int fd_b, char** out_a, char** out_b) {
+    int open_a = fd_a >= 0, open_b = fd_b >= 0;
+    int64_t cap_a = 4096, len_a = 0, cap_b = 4096, len_b = 0;
+    char* buf_a = open_a ? (char*)blink_alloc(cap_a) : (char*)"";
+    char* buf_b = open_b ? (char*)blink_alloc(cap_b) : (char*)"";
+    while (open_a || open_b) {
+        struct pollfd pfds[2];
+        int n = 0;
+        struct pollfd* pfd_a = NULL;
+        struct pollfd* pfd_b = NULL;
+        if (open_a) { pfds[n].fd = fd_a; pfds[n].events = POLLIN; pfd_a = &pfds[n]; n++; }
+        if (open_b) { pfds[n].fd = fd_b; pfds[n].events = POLLIN; pfd_b = &pfds[n]; n++; }
+        int pr = poll(pfds, (nfds_t)n, -1);
+        if (pr < 0) { if (errno == EINTR) continue; break; }
+        blink_pump_fd(fd_a, &open_a, pfd_a, &buf_a, &cap_a, &len_a);
+        blink_pump_fd(fd_b, &open_b, pfd_b, &buf_b, &cap_b, &len_b);
     }
-    buf[len] = '\0';
-    close(fd);
-    return buf;
+    /* Skipped fds keep the "" literal (already terminated); only real
+     * buffers need the NUL written. */
+    if (fd_a >= 0) buf_a[len_a] = '\0';
+    if (fd_b >= 0) buf_b[len_b] = '\0';
+    *out_a = buf_a;
+    *out_b = buf_b;
 }
 
 BLINK_RT_FN void blink_process_exec(const char* cmd, const blink_list* args);
@@ -122,8 +152,13 @@ BLINK_RT_FN blink_ProcessResult blink_process_run_with_stdin(const char* cmd, co
         sigaction(SIGPIPE, &sa_old, NULL);
     }
     close(stdin_pipe[1]);
-    result.out = blink_read_fd_to_string(stdout_pipe[0]);
-    result.err_out = blink_read_fd_to_string(stderr_pipe[0]);
+    /* Drain stdout + stderr concurrently — sequential draining deadlocks
+     * when the child fills the not-yet-read pipe (see blink_drain_two_fds). */
+    char* run_out = (char*)"";
+    char* run_err = (char*)"";
+    blink_drain_two_fds(stdout_pipe[0], stderr_pipe[0], &run_out, &run_err);
+    result.out = run_out;
+    result.err_out = run_err;
     blink_child_pid = pid;
     blink_got_sigint = 0;
     struct sigaction sa_int_old, sa_int_new;
@@ -276,8 +311,11 @@ BLINK_RT_FN blink_ProcessResult blink_process_pid_wait(int64_t handle) {
     }
     if (slot->reaped) return slot->cached;
 
-    char* out = slot->out_fd >= 0 ? blink_read_fd_to_string(slot->out_fd) : (char*)"";
-    char* err = slot->err_fd >= 0 ? blink_read_fd_to_string(slot->err_fd) : (char*)"";
+    /* Drain stdout + stderr concurrently — sequential draining deadlocks
+     * when the child fills the not-yet-read pipe (see blink_drain_two_fds). */
+    char* out = (char*)"";
+    char* err = (char*)"";
+    blink_drain_two_fds(slot->out_fd, slot->err_fd, &out, &err);
     slot->out_fd = -1;
     slot->err_fd = -1;
     int status = 0;
