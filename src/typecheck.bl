@@ -604,6 +604,36 @@ fn check_closure_ret(closure_node: Int, expected_ret: Int, method: Str, containe
     }
 }
 
+// gkr3fs Part B — type-check the BODY of a closure with params bound to the types
+// the HOF supplies (`p0_t`/`p1_t`, -1 = absent). Unannotated params would otherwise
+// bind to TYPE_UNKNOWN, so a wrong body (e.g. `Str` param used as `Int`) leaks past
+// typecheck to the C compiler. When a param IS explicitly annotated we bind the
+// declared type instead — this preserves Part A's annotation validation and never
+// contradicts it. Walks the body exactly once via tc_check_body, mirroring its own
+// Closure handler's scope dance.
+fn check_closure_body(cls: Int, p0_t: Int, p1_t: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    if cls == -1 || node_kind(cls) != NodeKind.Closure { return }
+    nr_push_scope()
+    let params_sl = node_params(cls)
+    if params_sl != -1 {
+        let nparams = sublist_length(params_sl)
+        if nparams >= 1 {
+            let p0 = sublist_get(params_sl, 0)
+            let decl0 = resolve_param_type(p0)
+            let bind0 = if decl0 != TYPE_UNKNOWN { decl0 } else { p0_t }
+            nr_define_typed(node_name(p0), 0, bind0)
+        }
+        if nparams >= 2 {
+            let p1 = sublist_get(params_sl, 1)
+            let decl1 = resolve_param_type(p1)
+            let bind1 = if decl1 != TYPE_UNKNOWN { decl1 } else { p1_t }
+            nr_define_typed(node_name(p1), 0, bind1)
+        }
+    }
+    tc_check_body(node_body(cls))
+    nr_pop_scope()
+}
+
 // ── Error reporting ─────────────────────────────────────────────────
 
 fn tc_error(msg: Str) ! TypeCheck.Report, Diag.Report {
@@ -5884,6 +5914,15 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         let val = node_value(node)
         if val != -1 {
             infer_type(val)
+            // Statement-position HOFs (l.for_each(fn(x){...})) need the MethodCall
+            // branch below to walk the closure body. Binding-position calls already
+            // get this via tc_check_body(val) in the LetBinding handler. Scoped to
+            // MethodCall rather than recursing unconditionally: the Assignment handler
+            // lacks LetBinding's literal-to-sized-int coercion, so walking arbitrary
+            // statement values would surface spurious errors (br: separate ticket).
+            if node_kind(val) == NodeKind.MethodCall {
+                tc_check_body(val)
+            }
         }
         return
     }
@@ -5903,6 +5942,28 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         } else {
             if tc_current_fn_ret != TYPE_VOID && tc_current_fn_ret != TYPE_UNKNOWN {
                 tc_error_at("function '{tc_current_fn_name}' returns {type_to_str(tc_current_fn_ret)} but bare 'return' has no value", node)
+            }
+        }
+        return
+    }
+
+    if kind == NodeKind.MethodCall {
+        // infer_type already validated explicit closure annotations (Part A) and
+        // ran arg/method checks during the binding/ExprStmt inference. Here we add
+        // the Part B body walk: bind unannotated closure params to the elem/acc
+        // type and type-check the body once. Only List has closure-taking HOFs.
+        let obj_t = infer_type(node_obj(node))
+        if type_kind(obj_t) == TK_LIST {
+            let method = node_method(node)
+            let args_sl = node_args(node)
+            let elem = ty_pool.get(obj_t).unwrap().inner1
+            if method == "map" || method == "filter" || method == "for_each" || method == "any" || method == "all" || method == "find" {
+                check_closure_body(closure_arg_at(args_sl, 0), elem, -1)
+            } else if method == "fold" {
+                if args_sl != -1 && sublist_length(args_sl) >= 2 {
+                    let acc_t = infer_type(sublist_get(args_sl, 0))
+                    check_closure_body(sublist_get(args_sl, 1), acc_t, elem)
+                }
             }
         }
         return
