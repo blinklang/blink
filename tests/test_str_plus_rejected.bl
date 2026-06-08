@@ -1,0 +1,64 @@
+// E0521 -- '+' does not work on Str. The spec (sections/02_syntax.md:1101-1112,
+// vote 5-0) is explicit: use interpolation or .concat() to join strings. '+' on
+// Str is rejected whenever EITHER operand is Str -- including Str + Str -- because
+// it encourages O(n^2) loops and creates ambiguity with numeric '+'.
+
+fn main() {
+    let blink_root = process_run("sh", ["-c", "pwd -P"]).out.trim_right()
+
+    let base = ".tmp/_test_str_plus_rejected"
+    shell_exec("rm -rf {base}")
+    shell_exec("mkdir -p {base}")
+    write_file("{base}/blink.toml", "[package]\nname = \"spr\"\nversion = \"0.1.0\"\n\n[dependencies]\n")
+
+    // Each case is a program body that must be rejected with E0521.
+    let cases = [
+        "let a: Str = \"x\"\n    let _c = a + 1",
+        "let _c = \"x\" + 1",
+        "let _c = 1 + \"x\"",
+        "let a: Str = \"x\"\n    let b: Str = \"y\"\n    let _c = a + b",
+    ]
+    let mut ci = 0
+    while ci < cases.len() {
+        let body = cases.get(ci).unwrap()
+        let src = "fn main() \{\n    {body}\n    io.println(\"unreachable\")\n\}\n"
+        write_file("{base}/case_{ci}.bl", src)
+
+        let cmd = "cd {base} && {blink_root}/build/blink check case_{ci}.bl 2>&1"
+        let result = process_run("sh", ["-c", cmd])
+
+        if result.exit_code == 0 {
+            io.println("FAIL: case {ci} should be rejected, but check exited 0")
+            shell_exec("rm -rf {base}")
+            return
+        }
+        if !result.out.contains("E0521") && !result.out.contains("StrPlusUnsupported") {
+            io.println("FAIL: case {ci} did not emit E0521 / StrPlusUnsupported")
+            io.println("got: {result.out}")
+            shell_exec("rm -rf {base}")
+            return
+        }
+        ci = ci + 1
+    }
+
+    // Positive guard: .concat() is the supported idiom and must still compile + run.
+    let ok_src = "fn main() \{\n    let a: Str = \"x\"\n    let b: Str = \"y\"\n    io.println(a.concat(b))\n\}\n"
+    write_file("{base}/ok.bl", ok_src)
+    let ok_cmd = "cd {base} && {blink_root}/build/blink run ok.bl 2>&1"
+    let ok_result = process_run("sh", ["-c", ok_cmd])
+    if ok_result.exit_code != 0 {
+        io.println("FAIL: a.concat(b) should compile + run, exited {ok_result.exit_code}")
+        io.println("got: {ok_result.out}")
+        shell_exec("rm -rf {base}")
+        return
+    }
+    if !ok_result.out.contains("xy") {
+        io.println("FAIL: a.concat(b) should print 'xy'")
+        io.println("got: {ok_result.out}")
+        shell_exec("rm -rf {base}")
+        return
+    }
+
+    io.println("PASS: E0521 rejects Str + <anything>; .concat() still works")
+    shell_exec("rm -rf {base}")
+}

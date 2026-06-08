@@ -31,7 +31,7 @@ import diagnostics.{
     ASSIGNMENT_IN_PREDICATE, IMPURE_BODY_FOR_PURE_ANNOTATION,
     MODIFIES_ARG_NOT_SIMPLE_PATH,
     MAP_KEY_NOT_HASHABLE,
-    DERIVE_DEBUG_FIELD_NO_DEBUG,
+    DERIVE_DEBUG_FIELD_NO_DEBUG, STR_PLUS_UNSUPPORTED,
     PRIVATE_ITEM_ACCESS, AMBIGUOUS_IMPORT, IMPORT_NOT_SELECTED,
     MODULE_QUALIFIED_TYPE,
     UNKNOWN_METHOD, UNUSED_VARIABLE, SET_BUT_NOT_READ, SHADOWED_VARIABLE,
@@ -3961,6 +3961,15 @@ fn nogrow_scan(node: Int, recv: Str, with_ptr_site: Int) ! Diag.Report {
     }
 }
 
+// A literal text run inside an InterpString. parse_interp_string emits these as
+// Ident nodes with both str_val and name set to the literal text, so an embedded
+// `{expr}` (name set, str_val empty) is distinguishable. Used to skip literal
+// runs when walking interpolation parts for name resolution and type checks.
+fn is_interp_literal_part(part: Int) -> Int {
+    if node_kind(part) == NodeKind.Ident && node_str_val(part) == node_name(part) { return 1 }
+    0
+}
+
 @allow(UnrestoredMutation, IncompleteStateRestore)
 fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     if node == -1 { return }
@@ -4104,9 +4113,8 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             let mut i = 0
             while i < sublist_length(elems_sl) {
                 let part = sublist_get(elems_sl, i)
-                let pk = node_kind(part)
-                if pk == NodeKind.Ident && node_str_val(part) == node_name(part) {
-                    // Simple interpolation like {var} — mark as read but skip full check
+                if is_interp_literal_part(part) != 0 {
+                    // Literal text run — mark as read but skip full check
                     let iname = node_name(part)
                     if nr_is_defined(iname) != 0 {
                         let _skip = 0
@@ -4846,7 +4854,23 @@ fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repo
     if kind == NodeKind.FloatLit { return TYPE_FLOAT }
     if kind == NodeKind.BoolLit { return TYPE_BOOL }
     if kind == NodeKind.CharLit { return TYPE_CHAR }
-    if kind == NodeKind.InterpString { return TYPE_STR }
+    if kind == NodeKind.InterpString {
+        // Infer each embedded expression so per-expression checks (e.g. the
+        // '+'-on-Str rejection) fire inside interpolations. Skip literal text
+        // runs to avoid resolving them as variables.
+        let parts_sl = node_elements(node)
+        if parts_sl != -1 {
+            let mut pi = 0
+            while pi < sublist_length(parts_sl) {
+                let part = sublist_get(parts_sl, pi)
+                if is_interp_literal_part(part) == 0 {
+                    infer_type(part)
+                }
+                pi = pi + 1
+            }
+        }
+        return TYPE_STR
+    }
     if kind == NodeKind.EmbedExpr { return TYPE_STR }
 
     if kind == NodeKind.Ident {
@@ -4876,10 +4900,13 @@ fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repo
             }
             return TYPE_BOOL
         }
-        if op == "+" {
-            if type_kind(lt) == TK_STR || type_kind(rt) == TK_STR {
-                return TYPE_STR
+        if op == "+" && (type_kind(lt) == TK_STR || type_kind(rt) == TK_STR) {
+            if lt != TYPE_UNKNOWN && rt != TYPE_UNKNOWN {
+                diag_error_at("StrPlusUnsupported", STR_PLUS_UNSUPPORTED,
+                    "'+' does not work on Str", node,
+                    "use .concat() to join two strings, or string interpolation to embed a value")
             }
+            return TYPE_STR
         }
         if op == "+" || op == "-" || op == "*" || op == "/" || op == "%" {
             if lt != TYPE_UNKNOWN && rt != TYPE_UNKNOWN {
@@ -5930,7 +5957,15 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             // MethodCall rather than recursing unconditionally: the Assignment handler
             // lacks LetBinding's literal-to-sized-int coercion, so walking arbitrary
             // statement values would surface spurious errors (br: separate ticket).
-            if node_kind(val) == NodeKind.MethodCall {
+            //
+            // Block-bearing control-flow (match/loop/with) in statement position must
+            // also be walked: infer_type only visits a block's tail, so non-tail
+            // statements inside their bodies (e.g. `result = result + x`) would skip
+            // every per-statement check otherwise. `if` is already a bare IfExpr node
+            // (parse_stmt does not wrap it in ExprStmt), so it routes through the
+            // IfExpr handler directly and is not listed here.
+            let vk = node_kind(val)
+            if vk == NodeKind.MethodCall || vk == NodeKind.MatchExpr || vk == NodeKind.WithBlock || vk == NodeKind.LoopExpr || vk == NodeKind.WhileLoop || vk == NodeKind.ForIn {
                 tc_check_body(val)
             }
         }
