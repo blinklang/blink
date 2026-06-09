@@ -81,7 +81,7 @@ import codegen_closures.{prescan_mut_captures}
 import codegen_stmt.{
     emit_all_mono_fns, emit_all_mono_typedefs, emit_block,
     emit_enum_typedef, emit_fn_decl, emit_fn_def,
-    emit_impl_method_def, emit_mono_fns_from, emit_mono_typedefs_from,
+    emit_impl_method_def, emit_mono_fn_decls_range, emit_mono_fns_from, emit_mono_typedefs_from,
     emit_struct_typedef, emit_top_level_let, format_impl_params,
     reset_typedef_emitted_stmt,
 }
@@ -241,15 +241,32 @@ fn flush_mono_fns_with_typedefs(start_idx: Int) ! Codegen.Emit, Codegen.Register
     let pre_s_option_count = emitted_struct_option_types.len()
     let pre_s_result_count = emitted_struct_result_types.len()
     let pre_tuple_count = emitted_tuple_entries.len()
+    let pre_closure_count = cg_closure_defs.len()
     let pre_lines = cg_lines
     cg_lines = []
 
+    // emit_mono_fns_from re-reads mono_fns.len() each iteration, so monos
+    // discovered transitively during body emission are emitted in this same
+    // pass. After it returns, mono_fns holds the pass's full closure.
     emit_mono_fns_from(start_idx)
+    let mono_end = mono_fns.len()
     let body_lines = cg_lines
     cg_lines = pre_lines
 
     emit_tuple_types_from(pre_tuple_count)
     emit_option_result_types_from(pre_option_count, pre_result_count, pre_s_option_count, pre_s_result_count)
+
+    // Closeable cleanup-state typedefs registered while emitting mono bodies
+    // must precede the bodies that reference them (bug bshj6h).
+    let mut ci = pre_closure_count
+    while ci < cg_closure_defs.len() {
+        cg_lines.push(cg_closure_defs.get(ci).unwrap())
+        ci = ci + 1
+    }
+
+    // Forward decls for every mono in the pass's closure, so a mono calling
+    // another mono sees a declaration before the callsite (bug szh3cy).
+    emit_mono_fn_decls_range(start_idx, mono_end)
 
     let mut i = 0
     while i < body_lines.len() {
@@ -1573,6 +1590,10 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
     // Emit iterator type definitions discovered during codegen
     emit_all_iter_types()
 
+    // Closure defs registered during the mono flush are emitted inside it,
+    // before the bodies that reference them; the loop below emits only the
+    // pre-mono defs (from non-test fn bodies).
+    let pre_mono0_closure_count = cg_closure_defs.len()
     flush_mono_fns_with_typedefs(0)
 
     // Promote walker forward decls (phase 1): covers walkers needed by
@@ -1581,9 +1602,9 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
     emit_promote_forward_decls()
 
     // Emit closure definitions (lifted from function bodies) before fn defs
-    if cg_closure_defs.len() > 0 {
+    if pre_mono0_closure_count > 0 {
         let mut ci = 0
-        while ci < cg_closure_defs.len() {
+        while ci < pre_mono0_closure_count {
             cg_lines.push(cg_closure_defs.get(ci).unwrap())
             ci = ci + 1
         }
@@ -1695,6 +1716,10 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
         emit_str_iter_typedef()
     }
 
+    // Closure defs registered during this mono flush are emitted inside it,
+    // before the bodies that reference them; the loop below emits only the
+    // defs discovered during test-body emission.
+    let pre_test_mono_closure_count = cg_closure_defs.len()
     flush_mono_fns_with_typedefs(pre_test_mono_fn_count)
 
     // Promote walker forward decls (phase 2): emits only new walkers
@@ -1704,9 +1729,9 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
     emit_promote_forward_decls()
 
     // Flush closure defs discovered during test block emission
-    if cg_closure_defs.len() > pre_test_closure_count {
+    if pre_test_mono_closure_count > pre_test_closure_count {
         let mut tci = pre_test_closure_count
-        while tci < cg_closure_defs.len() {
+        while tci < pre_test_mono_closure_count {
             cg_lines.push(cg_closure_defs.get(tci).unwrap())
             tci = tci + 1
         }

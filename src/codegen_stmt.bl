@@ -303,25 +303,58 @@ pub fn emit_if_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
     let tmp = fresh_temp("_if_")
     let then_type = infer_block_type(node_then_body(node))
     if then_type == CT_VOID || then_type == CT_STRUCT {
-        let mut ret_struct = get_fn_ret_struct(cg_current_fn_name)
-        if ret_struct == "" {
-            ret_struct = infer_block_struct_name(node_then_body(node))
+        // The pre-pass (infer_block_type) leaves CT_VOID for builtin heap
+        // constructors (Bytes.new(), Map(), StringBuilder.new(), ...) and for
+        // user structs it can't resolve. Buffer-emit the then-branch to read
+        // the authoritative result type instead of trusting the pre-pass, which
+        // would otherwise discard the values and declare `const void {tmp} = 0;`
+        // (bug h906fg). Same idiom as flush_mono_fns_with_typedefs.
+        let saved_lines = cg_lines
+        cg_lines = []
+        cg_indent = cg_indent + 1
+        let then_val = emit_block_value(node_then_body(node))
+        cg_indent = cg_indent - 1
+        let real_type = expr_result_type
+        let needs_struct = real_type == CT_VOID || real_type == CT_STRUCT
+        let elem_type = expr_list_elem_type
+        let elem_struct = expr_list_elem_struct
+        let map_key_type = expr_map_key_type
+        let map_val_type = expr_map_val_type
+        let then_lines = cg_lines
+        cg_lines = saved_lines
+
+        // Determine the temp's C type from the emitted value. A struct value is
+        // CT_VOID with a non-empty struct name (set_var convention); the fn's
+        // return struct is a last-resort fallback only when the branch itself
+        // produced no struct, never before it.
+        let mut struct_name = if needs_struct { get_var_struct(then_val) } else { "" }
+        if needs_struct && struct_name == "" {
+            struct_name = infer_block_struct_name(node_then_body(node))
+            if struct_name == "" && node_else_body(node) != -1 {
+                struct_name = infer_block_struct_name(node_else_body(node))
+            }
+            if struct_name == "" {
+                struct_name = get_fn_ret_struct(cg_current_fn_name)
+            }
         }
-        if ret_struct == "" && node_else_body(node) != -1 {
-            ret_struct = infer_block_struct_name(node_else_body(node))
-        }
-        if ret_struct == "" {
+        if real_type == CT_VOID && struct_name == "" {
             emit_if_stmt(node)
             expr_result_str = "0"
             expr_result_type = CT_VOID
             return
         }
-        emit_line("{c_type_c_name(ret_struct)} {tmp};")
+        let decl_type = if struct_name != "" { c_type_c_name(struct_name) } else { c_type_str(real_type) }
+
         emit_expr(node_condition(node))
         let cond_str = strip_outer_parens(expr_result_str)
+        emit_line("{decl_type} {tmp};")
         emit_line("if ({cond_str}) \{")
         cg_indent = cg_indent + 1
-        let then_val = emit_block_value(node_then_body(node))
+        let mut li = 0
+        while li < then_lines.len() {
+            cg_lines.push(then_lines.get(li).unwrap())
+            li = li + 1
+        }
         emit_line("{tmp} = {then_val};")
         cg_indent = cg_indent - 1
         if node_else_body(node) != -1 {
@@ -332,10 +365,25 @@ pub fn emit_if_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
             cg_indent = cg_indent - 1
         }
         emit_line("}")
-        set_var(tmp, CT_VOID, 1)
-        set_var_struct(tmp, ret_struct)
+        if struct_name != "" {
+            set_var(tmp, CT_VOID, 1)
+            set_var_struct(tmp, struct_name)
+            expr_result_str = tmp
+            expr_result_type = CT_VOID
+            return
+        }
+        set_var(tmp, real_type, 1)
+        if real_type == CT_LIST && elem_type >= 0 {
+            set_list_elem_type(tmp, elem_type)
+            if elem_struct != "" {
+                set_list_elem_struct(tmp, elem_struct)
+            }
+        }
+        if real_type == CT_MAP && map_key_type >= 0 {
+            set_map_types(tmp, map_key_type, map_val_type, "")
+        }
         expr_result_str = tmp
-        expr_result_type = CT_VOID
+        expr_result_type = real_type
         return
     }
     if then_type == CT_RESULT {
@@ -4925,8 +4973,22 @@ fn build_closure_sig_resolved_mono(ta: Int, tparams_sl: Int, concrete_args: Str)
     "{ret_str}(*)({sig_params})"
 }
 
+type MonoSig {
+    sig: Str
+    storage: Str
+    ret_c_str: Str
+    params_c: Str
+    mangled: Str
+    ret_type: Int
+    resolved_ret: Str
+}
+
+// Build the C signature for a monomorphized fn instance. Shared by the forward
+// decl and the def so the two never drift. Runs the idempotent ensure_* type
+// registrations and sets cg_current_fn_option_inner* as a side effect (the def
+// body reads them; the decl pass overwrites them harmlessly).
 @allow(UnrestoredMutation, IncompleteStateRestore)
-fn emit_mono_fn_def(fn_node: Int, concrete_args: Str) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
+fn mono_fn_signature(fn_node: Int, concrete_args: Str) -> MonoSig ! Codegen.Register, Diag.Report {
     cg_handler_vtable_type = ""
     cg_handler_vtable_field = ""
     cg_handler_is_user_effect = 0
@@ -5037,9 +5099,37 @@ fn emit_mono_fn_def(fn_node: Int, concrete_args: Str) ! Codegen.Emit, Codegen.Re
         }
     }
 
+    MonoSig {
+        sig: "{storage}{ret_c_str} {c_fn_name(mangled)}({params_c})",
+        storage: storage,
+        ret_c_str: ret_c_str,
+        params_c: params_c,
+        mangled: mangled,
+        ret_type: ret_type,
+        resolved_ret: resolved_ret,
+    }
+}
+
+fn emit_mono_fn_decl(fn_node: Int, concrete_args: Str) ! Codegen.Emit, Codegen.Register, Diag.Report {
+    let sig = mono_fn_signature(fn_node, concrete_args)
+    emit_line("{sig.sig};")
+}
+
+@allow(UnrestoredMutation, IncompleteStateRestore)
+fn emit_mono_fn_def(fn_node: Int, concrete_args: Str) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
+    let sig = mono_fn_signature(fn_node, concrete_args)
+    let storage = sig.storage
+    let ret_c_str = sig.ret_c_str
+    let params_c = sig.params_c
+    let mangled = sig.mangled
+    let ret_type = sig.ret_type
+    let resolved_ret = sig.resolved_ret
+    let tparams_sl = node_type_params(fn_node)
+    let params_sl = node_params(fn_node)
+
     // Forward decl carries the same storage class as the def below;
     // otherwise C rejects `static inline` following a non-static proto.
-    emit_line("{storage}{ret_c_str} {c_fn_name(mangled)}({params_c});")
+    emit_line("{sig.sig};")
 
     // Register params in scope
     push_scope()
@@ -5266,6 +5356,18 @@ pub fn emit_mono_fns_from(start: Int) ! Codegen.Emit, Codegen.Register, Codegen.
         let fn_node = get_generic_fn_node(mf.base)
         if fn_node != -1 {
             emit_mono_fn_def(fn_node, mf.args)
+        }
+        i = i + 1
+    }
+}
+
+pub fn emit_mono_fn_decls_range(start: Int, end: Int) ! Codegen.Emit, Codegen.Register, Diag.Report {
+    let mut i = start
+    while i < end {
+        let mf = mono_fns.get(i).unwrap()
+        let fn_node = get_generic_fn_node(mf.base)
+        if fn_node != -1 {
+            emit_mono_fn_decl(fn_node, mf.args)
         }
         i = i + 1
     }
