@@ -2,6 +2,23 @@
 
 Single source of truth for release history. `blink llms` and `blink llms --full` both append this file after the reference text, and every release version is indexed as a topic (e.g. `blink llms --topic v0.36`). **Edit only here** — `llms.md` and `llms-full.md` hold only a `## Recent Changes` stub pointing at this file.
 
+## Breaking Changes (v0.48.0)
+
+- **`+` on `Str` is now rejected (E0521).** Concatenating strings with `+` (`"a" + "b"`, or even `"x" + 1`) previously type-checked and silently compiled to a string concat. Per §02 (5-0 vote) `+` does not work on `Str` — it encourages O(n²) loops and is ambiguous with numeric `+`. Use interpolation `"{a}{b}"` or `.concat()` instead. The rejection now fires everywhere a `Str`-`+` could appear, including interpolation parts (`"{a + b}"`) and statement-position `match`/loop bodies that previously slipped through to a broken C compile.
+
+## What's New (v0.48.0)
+
+- **`@derive(Debug)` for structs and enums.** `@derive(Debug)` now auto-generates `fn debug(self) -> Str` (spec §3.6). Structs render as `Point { x: 5, y: 10 }`, unit enum variants as `Green`, data variants positionally as `Rect(3, 4)`; `Str` fields are quoted and escaped, and user-type fields recurse through their own `debug()`. A field whose user-type does not itself derive `Debug` is rejected at typecheck with E0520. **Container fields now render** too: `List` as `[a, b]`, `Option` as `Some(x)`/`None`, `Map` as `{k: v}` — conditionally on the element/key/value types being `Debug` (Map checks both `K` and `V`), with `[]`/`{}` for empties. v1 renders one container level; a nested container is a hard E0520 rather than a silent placeholder.
+
+## Fixes (v0.48.0)
+
+- **Module-global arguments are now type-checked.** A top-level `let` registered with no resolved type (`TYPE_UNKNOWN`), so passing a module global to a built-in that checks element types (List/Map/Set, `Str`) skipped the check entirely — bad arguments passed `blink check` and compiled to broken C. Globals now resolve their declared type at registration (annotation, then named type, then scalar-literal RHS), so the existing argument checks fire.
+- **Assigning an int literal to a sized-int target now works.** `let x: I8 = -1` compiled but `x = -1` (and `x += 5`) was rejected with "cannot assign Int to I8". The assignment handler now mirrors the `let`-binding carve-out — gated on a literal RHS, so non-literal `Int` variables and incompatible types (e.g. `Str`) still error.
+- **Unannotated closure bodies in List HOFs are now type-checked.** A genuinely-wrong body in an unannotated closure passed to `map`/`filter`/`for_each`/`any`/`all`/`find`/`fold` (e.g. using a `Str` element arithmetically) previously slipped past typecheck and surfaced as a raw C-compiler error. The body is now bound to the element/accumulator types the HOF supplies and walked once, producing a `TypeError` at compile time.
+- **No more spurious "unknown method" warning (W0501) on `@derive`-generated methods.** Calling a derived method (`clone`, `eq`, `hash`, `debug`, `to_json`, `from_json`) emitted "unknown method — may fail at compile time" because derived names were only registered in codegen, after typecheck. They are now registered during name resolution; genuinely unknown methods still warn.
+- **No more spurious "unrestored mutation" warning (W0551).** Seeding a local from a module-global sentinel (`let mut x = SENTINEL`) followed by a broad-write call was misread as an unrestored save/restore and flagged at every such call site. W0551 now requires real restore evidence (a `global = saved_local` assignment), so the false positive is gone while genuine unrestored-mutation detection is preserved.
+- **`process.run()` no longer deadlocks on chatty children.** A child writing more than a pipe buffer's worth to both stdout and stderr could hang: the runtime drained stdout to EOF before reading stderr, so the child blocked on `write()` while the parent blocked on a `read()` that never saw EOF. Both descriptors are now drained concurrently via `poll()`.
+
 ## Breaking Changes (v0.47.0)
 
 - **Bare calls to stdlib free functions now require an explicit `import` (E0504).** `list_map`, `parse_int`, `str_trim`, and every other stdlib *free function* previously resolved with no import because the prelude auto-loaded whole stdlib modules into name scope. Per §3.2.3 the prelude provides only compiler-known types, constructors, and traits — not library free functions. A bare call to one now errors with a hint naming the import to add. **Built-in method dispatch is unaffected** — `"hi".trim()`, `[1,2].map(...)`, etc. still need no import; only the standalone free-function forms changed.

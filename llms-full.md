@@ -1,6 +1,6 @@
 # Blink Language Reference
 
-> Blink is a statically-typed, effect-tracked language compiling to C. **Compiler v0.47.0**.
+> Blink is a statically-typed, effect-tracked language compiling to C. **Compiler v0.48.0**.
 
 ## Install
 
@@ -12,7 +12,7 @@ docker pull ghcr.io/blinklang/blink:latest
 docker run --rm -v "$PWD":/workspace ghcr.io/blinklang/blink run myfile.bl
 ```
 
-Tags: `latest`, `0.47`, `0.47.0` (semver). Image is `debian:bookworm-slim` with `gcc`, `zig`, `blink`, and `libgc-dev`.
+Tags: `latest`, `0.48`, `0.48.0` (semver). Image is `debian:bookworm-slim` with `gcc`, `zig`, `blink`, and `libgc-dev`.
 
 ## Recent Changes
 
@@ -797,7 +797,7 @@ Selective imports (`import mod.{a, b}`) restrict which *unqualified* items are v
 |------------|--------|---------|
 | `@module(name)` | module | Module declaration |
 | `@capabilities(...)` | module | Effect ceiling |
-| `@derive(...)` | type | Auto-generate traits. Accepted names: `Serialize`, `Deserialize`, `Eq`, `Clone`, `Hash`. Unknown names rejected as `E1112 UnknownDerive`. |
+| `@derive(...)` | type | Auto-generate traits. Accepted names: `Serialize`, `Deserialize`, `Eq`, `Clone`, `Hash`, `Debug`. Unknown names rejected as `E1112 UnknownDerive`. |
 | `@src(req)` | fn | Requirement traceability |
 | `@requires(expr)` | fn | Precondition |
 | `@ensures(expr)` | fn | Postcondition runtime-checked at every return (`result` = return value). Inside the predicate, `old(arg)` snapshots an argument's value at fn entry. |
