@@ -6364,6 +6364,7 @@ fn tc_check_test_block(tb: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repo
 
 // ── Phase 2: Top-level driver ───────────────────────────────────────
 
+@allow(UnrestoredMutation, IncompleteStateRestore)
 fn tc_infer_program(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     nr_scope_names = []
     nr_scope_muts = []
@@ -6379,13 +6380,36 @@ fn tc_infer_program(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Re
     nr_loop_depth = 0
     nr_push_scope()
 
-    // Register top-level let bindings
+    // Register top-level let bindings WITH their declared types so fn bodies that
+    // reference a module-global see its real type (ticket y0709p). Annotated type is
+    // resolved directly (never forward-references other globals, so order-independent).
+    // For unannotated globals we infer ONLY a scalar-literal RHS (also order-safe);
+    // a non-literal RHS could forward-reference and stays UNKNOWN (same as before).
+    // We deliberately do NOT run assignment_types_compatible here (RHS is validated
+    // elsewhere; adding validation at this site risks the self-hosting bootstrap).
     let lets_sl = node_stmts(program)
     if lets_sl != -1 {
         let mut i = 0
         while i < sublist_length(lets_sl) {
             let l = sublist_get(lets_sl, i)
-            nr_define(node_name(l))
+            let l_ann = node_target(l)
+            let l_type_str = node_type_name(l)
+            let mut l_tid = TYPE_UNKNOWN
+            if l_ann != -1 {
+                l_tid = resolve_type_ann(l_ann)
+            } else if l_type_str != "" {
+                let rt = resolve_type_name(l_type_str)
+                if rt != -1 { l_tid = rt }
+            } else {
+                let l_val = node_value(l)
+                if l_val != -1 {
+                    let vk = node_kind(l_val)
+                    if vk == NodeKind.IntLit || vk == NodeKind.FloatLit || vk == NodeKind.BoolLit || vk == NodeKind.InterpString {
+                        l_tid = infer_type(l_val)
+                    }
+                }
+            }
+            nr_define_typed(node_name(l), node_is_mut(l), l_tid)
             i = i + 1
         }
     }
