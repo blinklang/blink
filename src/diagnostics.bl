@@ -179,6 +179,7 @@ pub type DiagEntry {
     end_col: Int
     fix_action: Str
     fix_text: Str
+    notes: List[Str]
 }
 
 type FileRange {
@@ -290,7 +291,8 @@ pub fn diag_set_last_fix(action: Str, text: Str) {
             severity: d.severity, name: d.name, code: d.code,
             message: d.message, file: d.file, line: d.line,
             col: d.col, help: d.help, end_line: d.end_line,
-            end_col: d.end_col, fix_action: action, fix_text: text
+            end_col: d.end_col, fix_action: action, fix_text: text,
+            notes: d.notes
         })
     }
 }
@@ -354,6 +356,16 @@ pub fn diag_warn_at(name: Str, code: Str, message: Str, node_id: Int, help: Str)
     diag_source_file = saved_file
 }
 
+@allow(UnrestoredMutation, IncompleteStateRestore)
+pub fn diag_warn_at_notes(name: Str, code: Str, message: Str, node_id: Int, help: Str, notes: List[Str]) ! Diag.Report {
+    let line = node_line(node_id)
+    let col = node_col(node_id)
+    let saved_file = diag_source_file
+    diag_source_file = diag_file_for_node(node_id)
+    diag_emit_range_notes("warning", name, code, message, line, col, 0, 0, help, notes)
+    diag_source_file = saved_file
+}
+
 pub fn diag_ice(name: Str, code: Str, message: Str, line: Int, col: Int, help: Str) ! Diag.Report {
     diag_emit("ice", name, code, message, line, col, help)
 }
@@ -373,6 +385,10 @@ pub fn diag_ice_at(name: Str, code: Str, message: Str, node_id: Int, help: Str) 
 }
 
 fn diag_emit_range(severity: Str, name: Str, code: Str, message: Str, line: Int, col: Int, end_line: Int, end_col: Int, help: Str) ! Diag.Report {
+    diag_emit_range_notes(severity, name, code, message, line, col, end_line, end_col, help, [])
+}
+
+fn diag_emit_range_notes(severity: Str, name: Str, code: Str, message: Str, line: Int, col: Int, end_line: Int, end_col: Int, help: Str, notes: List[Str]) ! Diag.Report {
     let effective_severity = if severity == "ice" { severity } else { lint_apply_override(severity, name) }
     if effective_severity == "off" {
         return
@@ -381,7 +397,7 @@ fn diag_emit_range(severity: Str, name: Str, code: Str, message: Str, line: Int,
         severity: effective_severity, name: name, code: code,
         message: message, file: diag_source_file, line: line,
         col: col, help: help, end_line: end_line, end_col: end_col,
-        fix_action: "", fix_text: ""
+        fix_action: "", fix_text: "", notes: notes
     })
     if effective_severity == "error" {
         diag_count = diag_count + 1
@@ -462,6 +478,16 @@ fn diag_print_json(idx: Int) ! Diag.Report {
     if help != "" {
         json = json.concat(",\"help\":\"").concat(json_escape(help)).concat("\"")
     }
+    if d.notes.len() > 0 {
+        json = json.concat(",\"notes\":[")
+        let mut ni = 0
+        while ni < d.notes.len() {
+            if ni > 0 { json = json.concat(",") }
+            json = json.concat("\"").concat(json_escape(d.notes.get(ni).unwrap())).concat("\"")
+            ni = ni + 1
+        }
+        json = json.concat("]")
+    }
     let fix_act = d.fix_action
     if fix_act != "" {
         let fix_txt = json_escape(d.fix_text)
@@ -524,6 +550,11 @@ fn diag_print_human(idx: Int) ! Diag.Report {
             let caret_pad = str_repeat(" ", caret_col)
             io.eprintln("{gutter_pad}| {caret_pad}{str_repeat("^", caret_len)}")
         }
+    }
+    let mut ni = 0
+    while ni < d.notes.len() {
+        io.eprintln("  note: {d.notes.get(ni).unwrap()}")
+        ni = ni + 1
     }
     if d.severity == "ice" {
         if d.help != "" {

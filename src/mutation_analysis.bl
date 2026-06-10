@@ -1,4 +1,5 @@
 import ast.{NodeKind}
+import std.str.{str_join}
 import parser.{
     node_kind, node_name, node_left, node_right, node_body, node_condition,
     node_then_body, node_else_body, node_scrutinee, node_guard, node_value,
@@ -8,7 +9,7 @@ import parser.{
     sublist_get, sublist_length,
 }
 import diagnostics.{
-    Diag, diag_error_at, diag_source_file, diag_file_for_node,
+    Diag, diag_warn_at_notes, diag_source_file, diag_file_for_node,
     diag_push_allows, diag_clear_allows,
     INCOMPLETE_STATE_RESTORE, UNRESTORED_MUTATION,
 }
@@ -567,53 +568,42 @@ fn sr_check_call(call_node: Int, callee_name: Str) ! Diag.Report {
     }
 
     let wstart = ma_write_starts.get(callee_idx).unwrap()
-    let mut saved_count = 0
+    let mut write_items: List[Str] = []
     let mut unsaved: List[Str] = []
+    let mut restored: List[Str] = []
 
     let mut wi = 0
     while wi < wcount {
         let gname = ma_write_items.get(wstart + wi).unwrap()
+        write_items.push(gname)
         if sr_is_saved_global(gname) != 0 {
-            saved_count = saved_count + 1
+            restored.push(gname)
         } else {
             unsaved.push(gname)
         }
         wi = wi + 1
     }
+    let saved_count = restored.len()
 
     if saved_count > 0 && unsaved.len() > 0 {
-        let mut missing = ""
-        let mut ui = 0
-        while ui < unsaved.len() {
-            if ui > 0 {
-                missing = missing.concat(", ")
-            }
-            missing = missing.concat(unsaved.get(ui).unwrap())
-            ui = ui + 1
-        }
-        diag_error_at(
+        let missing = str_join(unsaved, ", ")
+        diag_warn_at_notes(
             "IncompleteStateRestore", INCOMPLETE_STATE_RESTORE,
             "call to '{callee_name}' in '{sr_current_fn}' mutates [{missing}] which are not saved/restored (write-set: {wcount} globals, saved: {saved_count})",
             call_node,
-            "save and restore [{missing}] around this call, or verify the mutation is intentional"
+            "also save and restore [{missing}] around this call, or verify the mutation is intentional",
+            ["`{callee_name}` writes \{{str_join(write_items, ", ")}}", "only [{str_join(restored, ", ")}] is restored after the call"]
         )
     }
 
     if saved_count == 0 && sr_restore_globals.len() > 0 {
-        let mut all_writes = ""
-        wi = 0
-        while wi < wcount {
-            if wi > 0 {
-                all_writes = all_writes.concat(", ")
-            }
-            all_writes = all_writes.concat(ma_write_items.get(wstart + wi).unwrap())
-            wi = wi + 1
-        }
-        diag_error_at(
+        let all_writes = str_join(write_items, ", ")
+        diag_warn_at_notes(
             "UnrestoredMutation", UNRESTORED_MUTATION,
-            "call to '{callee_name}' in '{sr_current_fn}' mutates [{all_writes}] with no save/restore pattern",
+            "call to '{callee_name}' in '{sr_current_fn}' mutates [{all_writes}]; these are not saved/restored for this call, though this function uses a save/restore pattern elsewhere",
             call_node,
-            "if this call is speculative, save/restore affected globals"
+            "if this call is speculative, save and restore the affected globals; otherwise verify the mutation is intentional",
+            ["`{callee_name}` writes \{{all_writes}}"]
         )
     }
 }
