@@ -1,6 +1,6 @@
 # Blink Language Reference
 
-> Blink is a statically-typed, effect-tracked language compiling to C. **Compiler v0.48.0**.
+> Blink is a statically-typed, effect-tracked language compiling to C. **Compiler v0.49.0**.
 
 ## Install
 
@@ -12,7 +12,7 @@ docker pull ghcr.io/blinklang/blink:latest
 docker run --rm -v "$PWD":/workspace ghcr.io/blinklang/blink run myfile.bl
 ```
 
-Tags: `latest`, `0.48`, `0.48.0` (semver). Image is `debian:bookworm-slim` with `gcc`, `zig`, `blink`, and `libgc-dev`.
+Tags: `latest`, `0.49`, `0.49.0` (semver). Image is `debian:bookworm-slim` with `gcc`, `zig`, `blink`, and `libgc-dev`.
 
 ## Recent Changes
 
@@ -195,12 +195,10 @@ let val = parse(input)?           // propagate error (in Result-returning fn)
 let val = maybe_val ?? "default"  // unwrap Option with default
 
 // Traits
-trait Display {
-    fn display(self) -> Str
-}
 impl Display for Point {
-    fn display(self) -> Str { "({self.x}, {self.y})" }
+    fn fmt(self, sb: StringBuilder) { sb.write("({self.x}, {self.y})") }
 }
+let s = Point { x: 1, y: 2 }.display()   // "(1, 2)" — display() is synthesized from fmt
 
 // Tests (built-in, no framework needed)
 test "addition works" {
@@ -958,6 +956,37 @@ impl BlockHandler for Transaction {
     fn exit(self, ok: Bool) { ... }
 }
 ```
+
+## Display Trait
+
+`Display` (from `std.traits`) is the canonical "make my type printable" trait. You implement **one** method — `fn fmt(self, sb: StringBuilder)` — rendering your value into the given `StringBuilder`. The compiler synthesizes a sealed `fn display(self) -> Str` for every impl (it allocates a fresh `StringBuilder`, calls your `fmt`, and returns the result), so you never write `display()` yourself.
+
+```blink
+import std.traits
+
+impl Display for Point {
+    fn fmt(self, sb: StringBuilder) {
+        sb.write("({self.x}, {self.y})")
+    }
+}
+
+let p = Point { x: 1, y: 2 }
+io.println(p.display())   // "(1, 2)" — display() is synthesized, not written
+
+// Built in for the scalar types
+42.display()      // "42"
+3.5.display()     // "3.5"
+true.display()    // "true"
+'x'.display()     // "x"
+"hi".display()    // "hi"
+
+// Usable as a generic bound
+fn show[T: Display](x: T) -> Str { x.display() }
+show(p)           // "(1, 2)"
+show(42)          // "42"
+```
+
+`display()` is **sealed** — writing your own `fn display(self) -> Str` inside an `impl Display` is rejected with E0731. Implement `fmt` and delete the override; `display()` is derived from it.
 
 ## Standard Library
 
