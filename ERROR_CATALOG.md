@@ -116,6 +116,9 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | TraitContractEffectMismatch | E0904 | Trait contract: method effect mismatch | Trait contract | §3.6 |
 | TraitContractExtraMethod | E0905 | Trait contract: impl declares method not in trait | Trait contract | §3.6 |
 | TraitContractGenericMismatch | E0906 | Trait contract: generic-parameter mismatch | Trait contract | §3.6 |
+| TraitContractSealedBuiltin | E0907 | Sealed built-in trait cannot be redefined or implemented for user types | Trait contract | §3.6 |
+| PolyImplUnsupported | E0908 | Polymorphic impl header parses but is not yet compiled (project b1bdnh) | Trait contract | §3.6 |
+| ImplBinderUnused | E0909 | Impl type-parameter binder unused in the impl header's type positions | Trait contract | §3.6 |
 | CircularPackageDep | E1002 | Circular package dependency | Modules | §10.5 |
 | PrivateItemAccess | E1003 | Access to private item in another module | Modules | §10.5 |
 | VersionConflict | E1004 | Diamond dependency — incompatible package versions | Modules | §10.5 |

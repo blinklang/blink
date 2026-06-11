@@ -1,0 +1,63 @@
+// cd7zvd -- impl binder hygiene:
+//   1. `impl[T] Tr0 for Holder` with T appearing nowhere in the header's
+//      type positions must report E0909 (unused impl binder).
+//   2. `impl[T] Tr1[U] for Box[T]` must still report E0507 for the unbound
+//      name U, while the declared binder T is excluded from E0507.
+
+fn main() {
+    let blink_root = process_run("sh", ["-c", "pwd -P"]).out.trim_right()
+
+    let base = ".tmp/_test_impl_poly_binder_unused"
+    shell_exec("rm -rf {base}")
+    shell_exec("mkdir -p {base}")
+    write_file("{base}/blink.toml", "[package]\nname = \"ipbu\"\nversion = \"0.1.0\"\n\n[dependencies]\n")
+
+    // Case 1: unused binder -> E0909
+    let src1 = "pub trait Tr0 \{\n    fn op(self) -> Int\n\}\n\ntype Holder \{ value: Int \}\n\nimpl[T] Tr0 for Holder \{\n    fn op(self) -> Int \{ self.value \}\n\}\n\nfn main() \{\n    io.println(\"unreachable\")\n\}\n"
+    write_file("{base}/mvce1.bl", src1)
+    let cmd1 = "cd {base} && {blink_root}/build/blink check --json mvce1.bl 2>&1"
+    let result1 = process_run("sh", ["-c", cmd1])
+    if result1.exit_code == 0 {
+        io.println("FAIL: impl[T] Tr0 for Holder (T unused) should be rejected, but check exited 0")
+        shell_exec("rm -rf {base}")
+        return
+    }
+    if !result1.out.contains("\"code\":\"E0909\"") {
+        io.println("FAIL: expected E0909 for unused impl binder 'T'")
+        io.println("got: {result1.out}")
+        shell_exec("rm -rf {base}")
+        return
+    }
+
+    // Case 2: unbound name U still caught by E0507; binder T excluded
+    let src2 = "pub trait Tr1[T] \{\n    fn op(self, x: T) -> Int\n\}\n\ntype Box[V] \{ value: V \}\n\nimpl[T] Tr1[U] for Box[T] \{\n    fn op(self, _x: U) -> Int \{ 0 \}\n\}\n\nfn main() \{\n    io.println(\"unreachable\")\n\}\n"
+    write_file("{base}/mvce2.bl", src2)
+    let cmd2 = "cd {base} && {blink_root}/build/blink check --json mvce2.bl 2>&1"
+    let result2 = process_run("sh", ["-c", cmd2])
+    if result2.exit_code == 0 {
+        io.println("FAIL: impl[T] Tr1[U] for Box[T] should be rejected, but check exited 0")
+        shell_exec("rm -rf {base}")
+        return
+    }
+    if !result2.out.contains("\"code\":\"E0507\"") {
+        io.println("FAIL: expected E0507 for unbound 'U' in trait type args")
+        io.println("got: {result2.out}")
+        shell_exec("rm -rf {base}")
+        return
+    }
+    if !result2.out.contains("'U'") && !result2.out.contains("`U`") {
+        io.println("FAIL: E0507 diagnostic should name the offending type 'U'")
+        io.println("got: {result2.out}")
+        shell_exec("rm -rf {base}")
+        return
+    }
+    if result2.out.contains("unknown type 'T'") {
+        io.println("FAIL: declared binder 'T' must be excluded from the E0507 unbound check")
+        io.println("got: {result2.out}")
+        shell_exec("rm -rf {base}")
+        return
+    }
+
+    io.println("PASS: unused binder -> E0909; unbound U -> E0507; binder T excluded")
+    shell_exec("rm -rf {base}")
+}
