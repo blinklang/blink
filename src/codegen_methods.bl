@@ -36,7 +36,7 @@ import codegen_types.{
     is_generic_fn, is_struct_type, is_trait_type, is_user_effect_handle,
     cg_expect_fn_value_sig, cg_expect_arg_ann, arg_type_ann_at, get_callee_params_sl,
     builtin_receiver_type_name,
-    is_sized_int_ct, lookup_builtin_trait_impl, lookup_impl_method, impl_method_reg_name, mangle_generic_name, mangle_from_method, wrapping_unsigned_c_type,
+    is_sized_int_ct, lookup_builtin_trait_impl, lookup_impl_method, lookup_impl_type_for_trait, impl_method_reg_name, mangle_generic_name, mangle_from_method, wrapping_unsigned_c_type,
     option_c_type, reg_fn, register_mono_fn, register_mono_instance,
     resolve_import_alias, resolve_ptr_inner_c, resolve_struct_from_c_name, get_var_ffi_ptr_struct, get_var_ffi_ptr_origin, is_ffi_ptr_array_var,
     ffi_alloc_n_pending, ffi_offset_pending_struct, ffi_origin_pending,
@@ -2807,6 +2807,62 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
         }
     }
 
+    // 4q2etk: replaced by mwxtyj — builtin scalar Display: display() -> Str
+    // and fmt(sb) on Int/Float/Bool/Str/Char. Uses the same helpers as
+    // string interpolation. A user trait impl on the builtin receiver wins
+    // (it is intercepted earlier). Simple enums lower to CT_INT, so the
+    // enum guard keeps their Display impls routed to trait resolution below.
+    if method == "display" && get_var_enum(obj_str) == "" {
+        if obj_type == CT_INT {
+            expr_result_str = "{c_fn_name("int_to_str")}({obj_str})"
+            expr_result_type = CT_STRING
+            return
+        }
+        if obj_type == CT_FLOAT {
+            expr_result_str = "{c_fn_name("float_to_str")}({obj_str})"
+            expr_result_type = CT_STRING
+            return
+        }
+        if obj_type == CT_BOOL {
+            expr_result_str = "(({obj_str}) ? \"true\" : \"false\")"
+            expr_result_type = CT_STRING
+            return
+        }
+        if obj_type == CT_CHAR {
+            expr_result_str = "blink_char_to_str((int64_t){obj_str})"
+            expr_result_type = CT_STRING
+            return
+        }
+        if obj_type == CT_STRING {
+            expr_result_str = "({obj_str})"
+            expr_result_type = CT_STRING
+            return
+        }
+    }
+    if method == "fmt" && get_var_enum(obj_str) == "" && (obj_type == CT_INT || obj_type == CT_FLOAT || obj_type == CT_BOOL || obj_type == CT_CHAR || obj_type == CT_STRING) {
+        let fmt_args_sl = node_args(node)
+        if fmt_args_sl != -1 && sublist_length(fmt_args_sl) > 0 {
+            emit_expr(sublist_get(fmt_args_sl, 0))
+            let fmt_sb_str = expr_result_str
+            if obj_type == CT_INT {
+                emit_line("blink_sb_write_int({fmt_sb_str}, {obj_str});")
+            } else if obj_type == CT_FLOAT {
+                emit_line("blink_sb_write_float({fmt_sb_str}, {obj_str});")
+            } else if obj_type == CT_BOOL {
+                emit_line("blink_sb_write_bool({fmt_sb_str}, {obj_str});")
+            } else if obj_type == CT_CHAR {
+                // blink_sb_write_char takes const char* (see br ticket for
+                // the Char-arg write_char bug); render via blink_char_to_str.
+                emit_line("blink_sb_write({fmt_sb_str}, blink_char_to_str((int64_t){obj_str}));")
+            } else {
+                emit_line("blink_sb_write({fmt_sb_str}, {obj_str});")
+            }
+            expr_result_str = "0"
+            expr_result_type = CT_VOID
+            return
+        }
+    }
+
     // Trait-based builtin method dispatch
     if emit_builtin_trait_method(node, obj_str, obj_type, obj_node, method) != 0 {
         return
@@ -3731,6 +3787,18 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
     let mut struct_type = get_var_struct(obj_str)
     if struct_type == "" {
         struct_type = get_var_enum(obj_str)
+    }
+    // 4q2etk: replaced by mwxtyj — synthesized sealed Display.display().
+    // Resolves before lookup_impl_method: E0731 guarantees the Display impl
+    // itself never defines display, and a display owned by a DIFFERENT impl
+    // block keeps the symbol (synthesis is skipped), so it falls through.
+    if struct_type != "" && method == "display" {
+        let disp_reg = impl_method_reg_name(struct_type, "fmt")
+        if lookup_impl_type_for_trait("Display", disp_reg) != 0 && lookup_impl_method(struct_type, "display") == 0 {
+            expr_result_str = "{c_fn_name("{disp_reg}_display")}({obj_str})"
+            expr_result_type = CT_STRING
+            return
+        }
     }
     if struct_type != "" && lookup_impl_method(struct_type, method) != 0 {
         // Params typed `mod.Type` store a qualified var-struct, but impls

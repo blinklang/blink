@@ -25,7 +25,7 @@ import diagnostics.{
     PINNED_BYTES_ESCAPE, BYTES_PTR_CAST_FORBIDDEN,
     TRAIT_CONTRACT_900, TRAIT_CONTRACT_901, TRAIT_CONTRACT_902,
     TRAIT_CONTRACT_903, TRAIT_CONTRACT_904, TRAIT_CONTRACT_905,
-    TRAIT_CONTRACT_906, TRAIT_CONTRACT_907,
+    TRAIT_CONTRACT_906, TRAIT_CONTRACT_907, SEALED_METHOD_OVERRIDE,
     POLY_IMPL_UNSUPPORTED, IMPL_BINDER_UNUSED,
     CONTRACT_PREDICATE_NOT_DECIDABLE, EFFECTFUL_CALL_IN_PREDICATE,
     IMPURE_CALL_IN_PREDICATE, LOOP_IN_PREDICATE,
@@ -170,6 +170,19 @@ let mut fnsig_effect_names: List[Str] = []
 let mut tc_trait_names: List[Str] = []
 let mut tc_trait_method_names: List[Str] = []
 let mut tc_trait_assoc_names: List[Str] = []
+
+// 4q2etk: replaced by mwxtyj — types with an `impl Display`, for which the
+// compiler synthesizes a sealed `display() -> Str`.
+let mut tc_display_impl_types: List[Str] = []
+
+fn tc_type_has_display_impl(tname: Str) -> Int {
+    let mut i = 0
+    while i < tc_display_impl_types.len() {
+        if tc_display_impl_types.get(i).unwrap() == tname { return 1 }
+        i = i + 1
+    }
+    0
+}
 
 // Trait method signature registry (for contract validation)
 type TraitMethodSigEntry {
@@ -2010,6 +2023,38 @@ fn type_ann_mentions(ann: Int, name: Str) -> Int {
     0
 }
 
+// True when `name` is mentioned by any type annotation in `args_sl`.
+fn type_args_mention(args_sl: Int, name: Str) -> Int {
+    if args_sl == -1 { return 0 }
+    let mut i = 0
+    while i < sublist_length(args_sl) {
+        if type_ann_mentions(sublist_get(args_sl, i), name) != 0 {
+            return 1
+        }
+        i = i + 1
+    }
+    0
+}
+
+// Report E0507-style unknown-name errors for each type argument in `args_sl`
+// that is neither a declared impl binder, a known type, nor a trait name.
+// `where` distinguishes the trait-args site from the receiver-args site.
+fn check_impl_type_arg_names(args_sl: Int, binders_sl: Int, trait_name: Str, where: Str, im: Int) ! Diag.Report {
+    if args_sl == -1 { return }
+    let mut i = 0
+    while i < sublist_length(args_sl) {
+        let arg_name = node_name(sublist_get(args_sl, i))
+        if arg_name != "" && impl_binder_declared(binders_sl, arg_name) == 0 && is_known_type(arg_name) == 0 && is_trait_name(arg_name) == 0 {
+            if where == "receiver" {
+                diag_error_at("UnknownType", UNKNOWN_TYPE, "unknown type '{arg_name}' in receiver of impl '{trait_name}'", im, "receiver type arguments must be concrete types or names declared in 'impl[...]' binders")
+            } else {
+                diag_error_at("UnknownType", UNKNOWN_TYPE, "unknown type '{arg_name}' in impl '{trait_name}'", im, "trait type arguments must be concrete types; for a polymorphic impl write 'impl[{arg_name}] {trait_name}[{arg_name}] for ReceiverType[{arg_name}]'")
+            }
+        }
+        i = i + 1
+    }
+}
+
 fn validate_trait_impls(program: Int) ! TypeCheck.Register, Diag.Report {
     let impls_sl = node_methods(program)
     if impls_sl == -1 { return }
@@ -2038,25 +2083,8 @@ fn validate_trait_impls(program: Int) ! TypeCheck.Register, Diag.Report {
             let mut bi = 0
             while bi < sublist_length(binders_sl) {
                 let bname = node_name(sublist_get(binders_sl, bi))
-                let mut used = 0
-                if trait_args_sl != -1 {
-                    let mut bti = 0
-                    while bti < sublist_length(trait_args_sl) {
-                        if type_ann_mentions(sublist_get(trait_args_sl, bti), bname) != 0 {
-                            used = 1
-                        }
-                        bti = bti + 1
-                    }
-                }
-                if used == 0 && recv_args_sl != -1 {
-                    let mut bri = 0
-                    while bri < sublist_length(recv_args_sl) {
-                        if type_ann_mentions(sublist_get(recv_args_sl, bri), bname) != 0 {
-                            used = 1
-                        }
-                        bri = bri + 1
-                    }
-                }
+                let mut used = type_args_mention(trait_args_sl, bname)
+                if used == 0 { used = type_args_mention(recv_args_sl, bname) }
                 if used == 0 {
                     diag_error_at("ImplBinderUnused", IMPL_BINDER_UNUSED, "impl binder '{bname}' is not used in the impl header", im, "use '{bname}' in the trait's or the receiver's type arguments, or remove the binder")
                 }
@@ -2067,28 +2095,8 @@ fn validate_trait_impls(program: Int) ! TypeCheck.Register, Diag.Report {
         // single-letter carve-out in nr_check_type_ref and silently lower to
         // `void` in codegen. Names declared as impl binders are bound (§3.6)
         // and excluded.
-        if trait_args_sl != -1 {
-            let mut tai = 0
-            while tai < sublist_length(trait_args_sl) {
-                let targ = sublist_get(trait_args_sl, tai)
-                let targ_name = node_name(targ)
-                if targ_name != "" && impl_binder_declared(binders_sl, targ_name) == 0 && is_known_type(targ_name) == 0 && is_trait_name(targ_name) == 0 {
-                    diag_error_at("UnknownType", UNKNOWN_TYPE, "unknown type '{targ_name}' in impl '{trait_name}'", im, "trait type arguments must be concrete types; for a polymorphic impl write 'impl[{targ_name}] {trait_name}[{targ_name}] for ReceiverType[{targ_name}]'")
-                }
-                tai = tai + 1
-            }
-        }
-        if recv_args_sl != -1 {
-            let mut rai = 0
-            while rai < sublist_length(recv_args_sl) {
-                let rarg = sublist_get(recv_args_sl, rai)
-                let rarg_name = node_name(rarg)
-                if rarg_name != "" && impl_binder_declared(binders_sl, rarg_name) == 0 && is_known_type(rarg_name) == 0 && is_trait_name(rarg_name) == 0 {
-                    diag_error_at("UnknownType", UNKNOWN_TYPE, "unknown type '{rarg_name}' in receiver of impl '{trait_name}'", im, "receiver type arguments must be concrete types or names declared in 'impl[...]' binders")
-                }
-                rai = rai + 1
-            }
-        }
+        check_impl_type_arg_names(trait_args_sl, binders_sl, trait_name, "trait", im)
+        check_impl_type_arg_names(recv_args_sl, binders_sl, trait_name, "receiver", im)
         // Polymorphic impl headers parse (spec §3.6) but codegen support is
         // tracked under project b1bdnh. Abort before codegen so nothing
         // miscompiles, and skip the method-contract checks to avoid noise.
@@ -2096,6 +2104,23 @@ fn validate_trait_impls(program: Int) ! TypeCheck.Register, Diag.Report {
             diag_error_at("PolyImplUnsupported", POLY_IMPL_UNSUPPORTED, "polymorphic impls are not yet compiled", im, "spec §3.6 defines 'impl[T] {trait_name}[T] for Recv[T]', but compiled support is still in progress (project b1bdnh); write a separate impl per concrete type for now")
             ii = ii + 1
             continue
+        }
+        // 4q2etk: replaced by mwxtyj — Display.display is a synthesized sealed
+        // method (decision 344dnd): the compiler derives it from the impl's
+        // `fmt`, so a user impl may not define it. The remaining contract
+        // checks below still run (a missing `fmt` also reports E0900).
+        if trait_name == "Display" {
+            let disp_methods_sl = node_methods(im)
+            if disp_methods_sl != -1 {
+                let mut dmi = 0
+                while dmi < sublist_length(disp_methods_sl) {
+                    let dm = sublist_get(disp_methods_sl, dmi)
+                    if node_name(dm) == "display" {
+                        diag_error_at("SealedMethodOverride", SEALED_METHOD_OVERRIDE, "method 'display' of trait 'Display' is sealed and cannot be overridden — it is synthesized from 'fmt'", dm, "implement 'fn fmt(self, sb: StringBuilder)' and remove 'display'; 'display()' is generated from 'fmt'")
+                    }
+                    dmi = dmi + 1
+                }
+            }
         }
         // Check each trait method signature against this impl
         let impl_methods_sl = node_methods(im)
@@ -2223,6 +2248,7 @@ fn init_types() ! TypeCheck.Register {
     tc_trait_names.clear()
     tc_trait_method_names.clear()
     tc_trait_assoc_names.clear()
+    tc_display_impl_types.clear()
     tc_tmsig_pool.clear()
     tc_tmsig_param_names.clear()
     tc_trait_tparam_names.clear()
@@ -2433,6 +2459,11 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
         while i < sublist_length(impls_sl) {
             let im = sublist_get(impls_sl, i)
             let impl_type = node_name(im)
+            // 4q2etk: replaced by mwxtyj — record Display impls so infer_type
+            // can resolve the synthesized display() to Str.
+            if node_trait_name(im) == "Display" {
+                tc_display_impl_types.push(impl_type)
+            }
             let methods_sl = node_methods(im)
             if methods_sl != -1 {
                 let mut j = 0
@@ -3048,6 +3079,10 @@ fn is_builtin_fn(name: Str) -> Int {
 }
 
 fn is_builtin_method(name: Str) -> Int {
+    // 4q2etk: replaced by mwxtyj — Display: synthesized display() and
+    // builtin scalar fmt()/display() (Int/Float/Bool/Str/Char)
+    if name == "display" { return 1 }
+    if name == "fmt" { return 1 }
     // String methods
     if name == "len" { return 1 }
     if name == "contains" { return 1 }
@@ -3710,6 +3745,12 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repor
                     nr_impl_method_names.push(node_name(m))
                     j = j + 1
                 }
+            }
+            // 4q2etk: replaced by mwxtyj — the compiler synthesizes a sealed
+            // display() for every Display impl; register it so calls resolve.
+            if node_trait_name(im) == "Display" {
+                nr_impl_type_names.push(impl_type)
+                nr_impl_method_names.push("display")
             }
             i = i + 1
         }
@@ -5198,6 +5239,13 @@ fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repo
         let obj_t = infer_type(obj_node)
         let obj_k = type_kind(obj_t)
 
+        // 4q2etk: replaced by mwxtyj — builtin scalar Display:
+        // display() -> Str and fmt(sb) on Int/Float/Bool/Str/Char.
+        if obj_k == TK_INT || obj_k == TK_FLOAT || obj_k == TK_BOOL || obj_k == TK_STR || obj_k == TK_CHAR {
+            if method == "display" { return TYPE_STR }
+            if method == "fmt" { return TYPE_VOID }
+        }
+
         if obj_k == TK_LIST {
             let args_sl = node_args(node)
             let elem = ty_pool.get(obj_t).unwrap().inner1
@@ -5476,6 +5524,11 @@ fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repo
             if sig != -1 {
                 check_arg_shapes("{tname}.{method}", sig, node_args(node), 1)
                 return fnsig_pool.get(sig).unwrap().ret
+            }
+            // 4q2etk: replaced by mwxtyj — synthesized sealed Display.display()
+            // has no user-written fnsig; it always returns Str.
+            if method == "display" && tc_type_has_display_impl(tname) != 0 {
+                return TYPE_STR
             }
         }
 
