@@ -23,8 +23,6 @@ import comment_attach.{attach_comments_pass}
 // Usage (once compiled): ./blinkc <source.bl> [output.c]
 // If no output file given, writes to stdout.
 
-let mut lint_cache_mtime: Int = -1
-
 // Set by cli.bl when --strict-struct-layout is passed; escalates W0812
 // (MissingCanonicalHeader) to error. Applied after manifest [lints]
 // overrides so the flag wins regardless of manifest configuration.
@@ -34,24 +32,22 @@ pub fn set_strict_struct_layout(flag: Int) {
     compiler_strict_struct_layout = flag
 }
 
-fn load_lint_overrides() {
-    let manifest_path = "blink.toml"
-    let mut mtime = file_mtime(manifest_path)
-    if mtime == -1 {
-        return
-    }
-    if mtime != lint_cache_mtime {
-        lint_cache_mtime = mtime
+// Load [lints] overrides from the blink.toml sibling to `src_root`
+// (falling back to cwd for loose files, src_root == ""). No caching: other
+// callers of manifest_load() (resolver, pathdeps, cli) repopulate
+// lint_names/lint_levels with a different manifest's contents, so a cache
+// keyed on this file's mtime could re-apply stale overrides.
+pub fn load_lint_overrides(src_root: Str) {
+    let manifest_path = manifest_path_for_src_root(src_root)
+    if file_exists(manifest_path) == 1 {
         manifest_clear()
-        let rc = manifest_load(manifest_path)
-        if rc != 0 {
-            return
+        if manifest_load(manifest_path) == 0 {
+            let mut i = 0
+            while i < lint_names.len() {
+                lint_set_override(lint_names.get(i).unwrap(), lint_levels.get(i).unwrap())
+                i = i + 1
+            }
         }
-    }
-    let mut i = 0
-    while i < lint_names.len() {
-        lint_set_override(lint_names.get(i).unwrap(), lint_levels.get(i).unwrap())
-        i = i + 1
     }
     if compiler_strict_struct_layout != 0 {
         lint_set_override("MissingCanonicalHeader", "error")
@@ -69,7 +65,8 @@ pub fn compile_to_program(file_path: Str, use_prelude: Int) -> Int ! Lex.Tokeniz
     check_file_exists(file_path)
     reset_compiler_state()
     diag_reset()
-    load_lint_overrides()
+    let src_root = find_src_root(file_path)
+    load_lint_overrides(src_root)
     diag_source_file = file_path
 
     let source = read_file(file_path)
@@ -81,7 +78,6 @@ pub fn compile_to_program(file_path: Str, use_prelude: Int) -> Int ! Lex.Tokeniz
 
     reject_empty_module_annotation(program)
 
-    let src_root = find_src_root(file_path)
     let mut imported_programs: List[Int] = []
     collect_root_imports(program)
     current_import_file = file_path
@@ -265,11 +261,12 @@ fn read_pkg_name_from_toml(path: Str) -> Str {
     toml_read_value(content, "package", "name") ?? ""
 }
 
-// Given a src_root like "examples/with_deps/mathlib/src/", return the
-// package name from the sibling blink.toml. Returns "" if no manifest.
-fn entry_pkg_for_src_root(src_root: Str) -> Str {
+// Given a src_root like "examples/with_deps/mathlib/src/", return the path
+// of the sibling blink.toml. Falls back to cwd "blink.toml" for loose files
+// (src_root == "").
+fn manifest_path_for_src_root(src_root: Str) -> Str {
     if src_root == "" {
-        return ""
+        return "blink.toml"
     }
     let mut pkg_dir = src_root
     if pkg_dir.ends_with("/") {
@@ -282,8 +279,16 @@ fn entry_pkg_for_src_root(src_root: Str) -> Str {
     if pkg_dir == "" {
         pkg_dir = "."
     }
-    let manifest_path = path_join(pkg_dir, "blink.toml")
-    read_pkg_name_from_toml(manifest_path)
+    path_join(pkg_dir, "blink.toml")
+}
+
+// Given a src_root like "examples/with_deps/mathlib/src/", return the
+// package name from the sibling blink.toml. Returns "" if no manifest.
+fn entry_pkg_for_src_root(src_root: Str) -> Str {
+    if src_root == "" {
+        return ""
+    }
+    read_pkg_name_from_toml(manifest_path_for_src_root(src_root))
 }
 
 fn validate_lockfile_versions() ! Diag.Report {
