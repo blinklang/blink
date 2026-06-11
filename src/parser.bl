@@ -3,10 +3,11 @@ import ast.{NodeKind, AstNode}
 import lexer.{tokens}
 import diagnostics.{
     Diag, diag_error, diag_error_range, diag_source_file,
+    diag_count, diag_entry_count, diag_truncate,
     INLINE_MODULE_NOT_SUPPORTED, UNEXPECTED_ANNOTATION, UNEXPECTED_TOKEN,
     UNEXPECTED_TOKEN_STRING, UNEXPECTED_TOKEN_PATTERN, KEYWORD_AS_IDENTIFIER,
     EMPTY_BRACE_EXPR, UNKNOWN_INTRINSIC, MUT_FIELD_NOT_SUPPORTED,
-    INVALID_STRING_BACKED_ENUM,
+    INVALID_STRING_BACKED_ENUM, INTERP_PARSE_FAILURE,
 }
 
 effect Parse {
@@ -2998,9 +2999,44 @@ fn parse_interp_string() -> Int ! Diag.Report, Parse.Advance, Parse.Build {
             nodes.push(AstNode { kind: NodeKind.Ident, str_val: s, name: s, line: sp_line, col: sp_col })
             sublist_push(parts, sn)
         } else if at(TokenKind.InterpStart) {
+            let br_line = peek_line()
+            let br_col = peek_col()
+            let br_end_col = peek_end_col()
+            let errs_before = diag_count
+            let entries_before = diag_entry_count()
             advance()
-            sublist_push(parts, parse_expr())
-            expect(TokenKind.InterpEnd)
+            let interp_expr = parse_expr()
+            let mut interp_failed = 0
+            if diag_count > errs_before {
+                interp_failed = 1
+            } else if !at(TokenKind.InterpEnd) {
+                interp_failed = 1
+            }
+            if interp_failed == 1 {
+                // Collapse whatever cascade parse_expr produced into one
+                // focused error at the opening brace, pointing at both
+                // escape hatches (decisions/backticks-in-strings.md).
+                diag_truncate(entries_before)
+                diag_error_range("InterpParseFailure", INTERP_PARSE_FAILURE, "could not parse interpolation expression — '\{' starts interpolation inside \"...\" strings", br_line, br_col, br_end_col, "for a literal brace, escape it as '\\\{'; or use an extended string #\"...\"# where braces are literal")
+                let mut interp_depth = 0
+                while !at(TokenKind.StringEnd) && !at(TokenKind.EOF) {
+                    if at(TokenKind.InterpStart) {
+                        interp_depth = interp_depth + 1
+                    } else if at(TokenKind.InterpEnd) {
+                        if interp_depth == 0 {
+                            break
+                        }
+                        interp_depth = interp_depth - 1
+                    }
+                    advance()
+                }
+                if at(TokenKind.InterpEnd) {
+                    advance()
+                }
+            } else {
+                sublist_push(parts, interp_expr)
+                expect(TokenKind.InterpEnd)
+            }
         } else {
             diag_error_range("UnexpectedToken", UNEXPECTED_TOKEN_STRING, "unexpected token in string: {token_kind_name(peek_kind())}", peek_line(), peek_col(), peek_end_col(), "")
             advance()

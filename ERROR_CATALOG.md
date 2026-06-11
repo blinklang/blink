@@ -132,6 +132,7 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | UnexpectedTokenString | E1101 | Unexpected token inside string interpolation | Parser | §2 |
 | UnexpectedTokenPattern | E1102 | Unexpected token inside match pattern | Parser | §2 |
 | KeywordAsIdentifier | E1103 | Reserved keyword used where an identifier was expected | Parser | §2 |
+| InterpParseFailure | E1106 | Interpolation expression inside a string failed to parse | Parser | §2.4 |
 | EmptyBraceExpr | E1107 | Empty `{}` used in expression position (use `Map()`) | Parser | §2 |
 | FileNotFound | E1108 | `#embed(...)` referenced a file that does not exist | Parser | §2.20 |
 | MutFieldNotSupported | E1109 | `mut` keyword on struct field declaration | Parser | §2 |
