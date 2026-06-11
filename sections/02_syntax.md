@@ -1227,7 +1227,7 @@ match expr {
 
 For `Option[T]` operands, the lowering is identical except the `None` arm produces a `TestError` whose `message` is `"None"` and `error_type` is `"Option"`. Allocation occurs only on the error path; passing tests pay zero cost for this elaboration.
 
-**`Display` is required at each `?` site.** If `E` does not implement `Display`, the test fails to compile with E0512 pointing at the `?` site. This is the same rule the compiler uses for `?` outside tests under the exact-structural-match constraint (§3c.2 Rule 4): the test author must guarantee the error type can be rendered. The diagnostic suggests deriving or implementing `Display` for `E`.
+**`Display` is required at each `?` site.** If `E` does not implement `Display`, the test fails to compile with E0514 pointing at the `?` site. This is the same rule the compiler uses for `?` outside tests under the exact-structural-match constraint (§3c.2 Rule 4): the test author must guarantee the error type can be rendered. The diagnostic suggests deriving or implementing `Display` for `E`.
 
 **Hygiene.** The elaborated return type is internal to the test grammar form. User code cannot name it, dot into it, or observe it from outside. The runner is the sole caller of a test body and consumes the elaborated `Result[Void, TestError]` directly.
 

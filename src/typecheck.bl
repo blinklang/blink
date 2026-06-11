@@ -184,6 +184,17 @@ fn tc_type_has_display_impl(tname: Str) -> Int {
     0
 }
 
+// E0514 helper (5q5jwz/wbf74w): does a type id have a usable Display impl?
+// Returns 1 for builtin-scalar Display (Int/Float/Bool/Char/Str) or a user
+// type with `impl Display`. Returns 0 for TK_UNKNOWN / TK_TYPEVAR so callers
+// SKIP the check (Display is unknowable for unresolved/generic types).
+fn tc_type_id_has_display(tid: Int) -> Int {
+    let k = type_kind(tid)
+    if k == TK_UNKNOWN || k == TK_TYPEVAR { return 0 }
+    if k == TK_INT || k == TK_FLOAT || k == TK_BOOL || k == TK_CHAR || k == TK_STR { return 1 }
+    tc_type_has_display_impl(type_to_str(tid))
+}
+
 // Trait method signature registry (for contract validation)
 type TraitMethodSigEntry {
     trait_name: Str
@@ -5101,13 +5112,23 @@ fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repo
         if op == "?" {
             let ok = type_kind(operand)
             if ok == TK_RESULT {
-                if tc_current_fn_ret >= 0 && tc_current_fn_ret < ty_pool.len() {
+                let operand_err = ty_pool.get(operand).unwrap().inner2
+                if tc_in_test_body == 1 {
+                    // Spec §2.20 / §3c.2: inside a test body E is rendered via
+                    // Display.display(e), not structurally propagated. Skip the
+                    // E0512/E0508 gates; require Display[E] (E0514). Skip when E
+                    // is unresolved/generic (helper returns 0 there).
+                    let k = type_kind(operand_err)
+                    if k != TK_UNKNOWN && k != TK_TYPEVAR && tc_type_id_has_display(operand_err) == 0 {
+                        tc_errors.push("'?' on Result in test body requires error type '{type_to_str(operand_err)}' to implement Display")
+                        diag_error_at("QuestionMarkTestDisplayRequired", QM_TEST_DISPLAY_REQUIRED, "'?' in a test body requires the error type '{type_to_str(operand_err)}' to implement Display", node, "implement 'impl Display for {type_to_str(operand_err)}' or '.unwrap()' the Result explicitly")
+                    }
+                } else if tc_current_fn_ret >= 0 && tc_current_fn_ret < ty_pool.len() {
                     let ret_kind = ty_pool.get(tc_current_fn_ret).unwrap().kind
                     if ret_kind != TK_RESULT && ret_kind != TK_UNKNOWN {
                         tc_errors.push("'?' on Result in function '{tc_current_fn_name}' which does not return Result")
                         diag_error_at("QuestionMarkResultInNonResult", QM_RESULT_IN_NON_RESULT, "'?' on Result in function '{tc_current_fn_name}' which does not return Result", node, "change the return type to Result[T, E]")
                     } else if ret_kind == TK_RESULT {
-                        let operand_err = ty_pool.get(operand).unwrap().inner2
                         let ret_err = ty_pool.get(tc_current_fn_ret).unwrap().inner2
                         if types_compatible(operand_err, ret_err) == 0 {
                             tc_errors.push("'?' error type mismatch in function '{tc_current_fn_name}'")
