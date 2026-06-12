@@ -79,7 +79,7 @@ import codegen_expr.{
     expr_map_key_type, expr_map_val_type, expr_option_inner,
     expr_option_inner_list_elem, expr_option_inner_list_struct,
     expr_option_inner_map_val_struct, expr_option_inner_map_val_list_elem,
-    expr_option_inner_struct, expr_result_err_struct, expr_result_err_type,
+    expr_option_inner_struct, expr_option_is_none, expr_result_err_struct, expr_result_err_type,
     expr_result_ok_struct, expr_result_ok_type, expr_result_str,
     expr_result_type
 }
@@ -298,29 +298,124 @@ fn infer_block_struct_name(block: Int) -> Str {
     infer_node_struct_name(block)
 }
 
+// Snapshot of the carrier-shaping `expr_*` globals taken immediately after an
+// `emit_expr`/`emit_block_value`/`emit_arm_value` call. These globals are
+// overwritten by the next emit, so a branch/arm whose value is Option[T] or
+// Result[T, E] must be captured before its sibling is emitted. `ct` is the
+// post-emit `expr_result_type` — when `?` reseats a Result branch to its Ok
+// type (e.g. `read_one()?` → CT_BYTES) the snapshot reflects the unwrapped
+// type, not the carrier, so the caller falls through to the scalar/struct path.
+type IfCarrier {
+    ct: Int
+    option_inner: Int
+    option_inner_struct: Str
+    option_is_none: Int
+    ok_type: Int
+    ok_struct: Str
+    err_type: Int
+    err_struct: Str
+}
+
+fn snapshot_carrier() -> IfCarrier {
+    IfCarrier {
+        ct: expr_result_type,
+        option_inner: expr_option_inner,
+        option_inner_struct: expr_option_inner_struct,
+        option_is_none: expr_option_is_none,
+        ok_type: expr_result_ok_type,
+        ok_struct: expr_result_ok_struct,
+        err_type: expr_result_err_type,
+        err_struct: expr_result_err_struct,
+    }
+}
+
+// True when this snapshot carries a concrete Option element — i.e. a real
+// `Some(value)` whose inner type is known, not a placeholder bare `None`.
+fn carrier_option_concrete(ci: IfCarrier) -> Int {
+    if ci.ct == CT_OPTION && ci.option_is_none == 0 { 1 } else { 0 }
+}
+
+// True when this snapshot carries a Result with a resolved struct ok/err
+// payload — preferred over a bare Ok/Err whose struct names are empty.
+fn carrier_result_concrete(ci: IfCarrier) -> Int {
+    if ci.ct == CT_RESULT && (ci.ok_struct != "" || ci.err_struct != "") { 1 } else { 0 }
+}
+
+// Fallback carrier derived from the enclosing fn's return type, used when both
+// branches/arms of a carrier-typed if/match are placeholders (bare Ok/Err/Some
+// /None) — the h906fg build_option/build_result shape, where the only authority
+// for the inner type is the fn's declared return. Mirrors the historical
+// fn-return hint path.
+fn carrier_from_fn_ret_option() -> IfCarrier {
+    let rt = get_fn_ret_type(cg_current_fn_name)
+    let fsi = get_fn_ret_struct_inner(cg_current_fn_name)
+    let rt_c1 = tp_child1_kind(rt.tp_id)
+    let mut inner = if rt_c1 >= 0 { rt_c1 } else { cg_current_fn_option_inner }
+    if inner == 0 { inner = CT_INT }
+    let inner_struct = if fsi.ok_struct != "" { fsi.ok_struct } else { cg_current_fn_option_inner_struct }
+    IfCarrier { ct: CT_OPTION, option_inner: inner, option_inner_struct: inner_struct, option_is_none: 0, ok_type: -1, ok_struct: "", err_type: -1, err_struct: "" }
+}
+
+fn carrier_from_fn_ret_result() -> IfCarrier {
+    let rt = get_fn_ret_type(cg_current_fn_name)
+    let fsi = get_fn_ret_struct_inner(cg_current_fn_name)
+    let rt_c1 = tp_child1_kind(rt.tp_id)
+    let rt_c2 = tp_child2_kind(rt.tp_id)
+    let ok_t = if rt_c1 >= 0 { rt_c1 } else { CT_INT }
+    let err_t = if rt_c2 >= 0 { rt_c2 } else { CT_STRING }
+    IfCarrier { ct: CT_RESULT, option_inner: -1, option_inner_struct: "", option_is_none: 0, ok_type: ok_t, err_type: err_t, ok_struct: fsi.ok_struct, err_struct: fsi.err_struct }
+}
+
+// The physical Option carrier inside a ptr-erased context (UE handler body
+// returning Option[Struct]): every Option is represented as blink_Option_ptr.
+fn carrier_ptr_option() -> IfCarrier {
+    IfCarrier { ct: CT_OPTION, option_inner: CT_PTR, option_inner_struct: "", option_is_none: 0, ok_type: -1, ok_struct: "", err_type: -1, err_struct: "" }
+}
+
 @allow(UnrestoredMutation, IncompleteStateRestore)
 pub fn emit_if_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
     let tmp = fresh_temp("_if_")
     let then_type = infer_block_type(node_then_body(node))
-    if then_type == CT_VOID || then_type == CT_STRUCT {
+    if then_type == CT_VOID || then_type == CT_STRUCT || then_type == CT_RESULT || then_type == CT_OPTION {
         // The pre-pass (infer_block_type) leaves CT_VOID for builtin heap
         // constructors (Bytes.new(), Map(), StringBuilder.new(), ...) and for
-        // user structs it can't resolve. Buffer-emit the then-branch to read
-        // the authoritative result type instead of trusting the pre-pass, which
-        // would otherwise discard the values and declare `const void {tmp} = 0;`
-        // (bug h906fg). Same idiom as flush_mono_fns_with_typedefs.
+        // user structs it can't resolve. It is also blind to `?`, which unwraps
+        // a Result/Option branch to its inner type (read_one()? : Bytes, not
+        // Result). Buffer-emit both branches to read the authoritative result
+        // type and carrier shape from the values that actually flow out, instead
+        // of trusting the pre-pass or the enclosing fn's return type (bugs h906fg,
+        // k849am). Same idiom as flush_mono_fns_with_typedefs.
         let saved_lines = cg_lines
+        let saved_temp_before = cg_temp_counter
         cg_lines = []
         cg_indent = cg_indent + 1
-        let then_val = emit_block_value(node_then_body(node))
+        let mut then_val = emit_block_value(node_then_body(node))
         cg_indent = cg_indent - 1
         let real_type = expr_result_type
+        let then_carrier = snapshot_carrier()
         let needs_struct = real_type == CT_VOID || real_type == CT_STRUCT
         let elem_type = expr_list_elem_type
         let elem_struct = expr_list_elem_struct
         let map_key_type = expr_map_key_type
         let map_val_type = expr_map_val_type
-        let then_lines = cg_lines
+        let mut then_lines = cg_lines
+
+        // Buffer-emit the else branch too so its carrier shape is observable
+        // before we declare the temp. A bare-`None`/bare-`Ok` branch yields a
+        // placeholder carrier; the concrete sibling (Some(value)/struct Ok)
+        // wins. Both buffers are replayed below so values emit exactly once.
+        let mut else_val = ""
+        let mut else_lines: List[Str] = []
+        let mut else_carrier = then_carrier
+        let has_else = node_else_body(node) != -1
+        if has_else {
+            cg_lines = []
+            cg_indent = cg_indent + 1
+            else_val = emit_block_value(node_else_body(node))
+            cg_indent = cg_indent - 1
+            else_carrier = snapshot_carrier()
+            else_lines = cg_lines
+        }
         cg_lines = saved_lines
 
         // Determine the temp's C type from the emitted value. A struct value is
@@ -343,7 +438,79 @@ pub fn emit_if_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
             expr_result_type = CT_VOID
             return
         }
-        let decl_type = if struct_name != "" { c_type_c_name(struct_name) } else { c_type_str(real_type) }
+
+        // For a carrier result, pick the branch that actually carries a concrete
+        // payload: for Option prefer the non-`None` branch; for Result prefer the
+        // struct-bearing Ok/Err. When neither branch is concrete (bare Ok/Err/Some
+        // /None on both sides — the h906fg build_option/build_result cases) fall
+        // back to the enclosing fn's return type.
+        //
+        // Exception: a ptr-erased Option context (UE handler bodies returning
+        // Option[Struct] — cg_current_fn_option_inner == CT_PTR) physically
+        // represents every Option as blink_Option_ptr regardless of the branch's
+        // logical struct inner. Following the branch carrier there would declare
+        // blink_Option_<Struct> while the branches emit blink_Option_ptr. Keep the
+        // fn-return (ptr) carrier so declaration and values agree.
+        let ptr_erased_option = real_type == CT_OPTION && cg_current_fn_option_inner == CT_PTR
+        let mut carrier = then_carrier
+        if real_type == CT_OPTION {
+            if ptr_erased_option {
+                carrier = carrier_ptr_option()
+            } else {
+                if carrier_option_concrete(then_carrier) == 0 && carrier_option_concrete(else_carrier) != 0 {
+                    carrier = else_carrier
+                }
+                if carrier_option_concrete(carrier) == 0 {
+                    carrier = carrier_from_fn_ret_option()
+                }
+            }
+        } else if real_type == CT_RESULT {
+            if carrier_result_concrete(then_carrier) == 0 && carrier_result_concrete(else_carrier) != 0 {
+                carrier = else_carrier
+            }
+            if carrier_result_concrete(carrier) == 0 {
+                carrier = carrier_from_fn_ret_result()
+            }
+        }
+
+        // A bare-`None` branch was emitted during discovery against whatever
+        // carrier context was in scope (often the default Option[int]); now that
+        // the concrete sibling has revealed the real inner type, re-emit both
+        // branches with that inner installed so the `None` literal adopts the
+        // matching `blink_Option_<T>` instead of the placeholder. Reset the temp
+        // counter first so the replayed numbering matches the discovery pass.
+        if real_type == CT_OPTION && (then_carrier.option_is_none != 0 || else_carrier.option_is_none != 0) {
+            let saved_inner = cg_current_fn_option_inner
+            let saved_inner_struct = cg_current_fn_option_inner_struct
+            cg_current_fn_option_inner = carrier.option_inner
+            cg_current_fn_option_inner_struct = carrier.option_inner_struct
+            cg_temp_counter = saved_temp_before
+            cg_lines = []
+            cg_indent = cg_indent + 1
+            then_val = emit_block_value(node_then_body(node))
+            cg_indent = cg_indent - 1
+            then_lines = cg_lines
+            if has_else {
+                cg_lines = []
+                cg_indent = cg_indent + 1
+                else_val = emit_block_value(node_else_body(node))
+                cg_indent = cg_indent - 1
+                else_lines = cg_lines
+            }
+            cg_lines = saved_lines
+            cg_current_fn_option_inner = saved_inner
+            cg_current_fn_option_inner_struct = saved_inner_struct
+        }
+
+        let decl_type = if struct_name != "" {
+            c_type_c_name(struct_name)
+        } else if real_type == CT_OPTION {
+            if carrier.option_inner_struct != "" { struct_option_c_type(carrier.option_inner_struct) } else { option_c_type(carrier.option_inner) }
+        } else if real_type == CT_RESULT {
+            result_c_type_mixed(carrier.ok_type, carrier.err_type, carrier.ok_struct, carrier.err_struct)
+        } else {
+            c_type_str(real_type)
+        }
 
         emit_expr(node_condition(node))
         let cond_str = strip_outer_parens(expr_result_str)
@@ -357,10 +524,14 @@ pub fn emit_if_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
         }
         emit_line("{tmp} = {then_val};")
         cg_indent = cg_indent - 1
-        if node_else_body(node) != -1 {
+        if has_else {
             emit_line("} else \{")
             cg_indent = cg_indent + 1
-            let else_val = emit_block_value(node_else_body(node))
+            let mut ei = 0
+            while ei < else_lines.len() {
+                cg_lines.push(else_lines.get(ei).unwrap())
+                ei = ei + 1
+            }
             emit_line("{tmp} = {else_val};")
             cg_indent = cg_indent - 1
         }
@@ -370,6 +541,35 @@ pub fn emit_if_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
             set_var_struct(tmp, struct_name)
             expr_result_str = tmp
             expr_result_type = CT_VOID
+            return
+        }
+        if real_type == CT_OPTION {
+            set_var(tmp, CT_OPTION, 1)
+            if carrier.option_inner_struct != "" {
+                set_var_option_struct(tmp, carrier.option_inner, carrier.option_inner_struct)
+                expr_option_inner_struct = carrier.option_inner_struct
+            } else {
+                set_var_option(tmp, carrier.option_inner)
+                expr_option_inner_struct = ""
+            }
+            expr_option_inner = carrier.option_inner
+            expr_result_str = tmp
+            expr_result_type = CT_OPTION
+            return
+        }
+        if real_type == CT_RESULT {
+            set_var(tmp, CT_RESULT, 1)
+            if carrier.ok_struct != "" || carrier.err_struct != "" {
+                set_var_result_struct(tmp, carrier.ok_type, carrier.err_type, carrier.ok_struct, carrier.err_struct)
+            } else {
+                set_var_result(tmp, carrier.ok_type, carrier.err_type)
+            }
+            expr_result_ok_type = carrier.ok_type
+            expr_result_err_type = carrier.err_type
+            expr_result_ok_struct = carrier.ok_struct
+            expr_result_err_struct = carrier.err_struct
+            expr_result_str = tmp
+            expr_result_type = CT_RESULT
             return
         }
         set_var(tmp, real_type, 1)
@@ -386,36 +586,7 @@ pub fn emit_if_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
         expr_result_type = real_type
         return
     }
-    if then_type == CT_RESULT {
-        let rt = get_fn_ret_type(cg_current_fn_name)
-        let fsi = get_fn_ret_struct_inner(cg_current_fn_name)
-        let rt_c1 = tp_child1_kind(rt.tp_id)
-        let rt_c2 = tp_child2_kind(rt.tp_id)
-        if fsi.ok_struct != "" || fsi.err_struct != "" {
-            emit_line("{result_c_type_mixed(rt_c1, rt_c2, fsi.ok_struct, fsi.err_struct)} {tmp};")
-        } else if rt_c1 >= 0 {
-            emit_line("{result_c_type(rt_c1, rt_c2)} {tmp};")
-        } else {
-            emit_line("{result_c_type(CT_INT, CT_STRING)} {tmp};")
-        }
-    } else if then_type == CT_OPTION {
-        let rt = get_fn_ret_type(cg_current_fn_name)
-        let fsi = get_fn_ret_struct_inner(cg_current_fn_name)
-        let rt_c1 = tp_child1_kind(rt.tp_id)
-        if fsi.ok_struct != "" {
-            emit_line("{struct_option_c_type(fsi.ok_struct)} {tmp};")
-        } else if cg_current_fn_option_inner_struct != "" {
-            emit_line("{struct_option_c_type(cg_current_fn_option_inner_struct)} {tmp};")
-        } else if rt_c1 >= 0 {
-            emit_line("{option_c_type(rt_c1)} {tmp};")
-        } else if cg_current_fn_option_inner != 0 {
-            emit_line("{option_c_type(cg_current_fn_option_inner)} {tmp};")
-        } else {
-            emit_line("{option_c_type(CT_INT)} {tmp};")
-        }
-    } else {
-        emit_line("{c_type_str(then_type)} {tmp};")
-    }
+    emit_line("{c_type_str(then_type)} {tmp};")
     emit_expr(node_condition(node))
     let cond_str = strip_outer_parens(expr_result_str)
     emit_line("if ({cond_str}) \{")
@@ -432,33 +603,6 @@ pub fn emit_if_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
     }
     emit_line("}")
     set_var(tmp, then_type, 1)
-    if then_type == CT_RESULT {
-        let rt2 = get_fn_ret_type(cg_current_fn_name)
-        let fsi2 = get_fn_ret_struct_inner(cg_current_fn_name)
-        let rt2_c1 = tp_child1_kind(rt2.tp_id)
-        let rt2_c2 = tp_child2_kind(rt2.tp_id)
-        if fsi2.ok_struct != "" || fsi2.err_struct != "" {
-            set_var_result_struct(tmp, rt2_c1, rt2_c2, fsi2.ok_struct, fsi2.err_struct)
-            expr_result_ok_struct = fsi2.ok_struct
-            expr_result_err_struct = fsi2.err_struct
-        } else {
-            set_var_result(tmp, rt2_c1, rt2_c2)
-        }
-        expr_result_ok_type = rt2_c1
-        expr_result_err_type = rt2_c2
-    }
-    if then_type == CT_OPTION {
-        let rt3 = get_fn_ret_type(cg_current_fn_name)
-        let fsi3 = get_fn_ret_struct_inner(cg_current_fn_name)
-        let rt3_c1 = tp_child1_kind(rt3.tp_id)
-        if fsi3.ok_struct != "" {
-            set_var_option_struct(tmp, rt3_c1, fsi3.ok_struct)
-            expr_option_inner_struct = fsi3.ok_struct
-        } else {
-            set_var_option(tmp, rt3_c1)
-        }
-        expr_option_inner = rt3_c1
-    }
     expr_result_str = tmp
     expr_result_type = then_type
 }
@@ -571,6 +715,72 @@ pub fn emit_match_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scop
     let first_arm = sublist_get(arms_sl, 0)
     let mut result_type = infer_arm_type(first_arm)
     let result_var = fresh_temp("_match_")
+
+    // Buffer-emit pre-pass: harvest each arm's authoritative post-emit carrier.
+    // The static infer_arm_type pre-pass is blind to `?` (which unwraps a
+    // Result/Option arm to its inner type — read_one()? : Bytes, not Result) and
+    // to builtin-heap constructors (Bytes.new() : CT_VOID), so it would declare
+    // the wrong result temp (bug k849am, match variant). We emit each arm value
+    // into a throwaway buffer, snapshot the carrier, then discard the lines and
+    // reset the temp counter so the real loop below re-emits identically.
+    // bind_pattern_vars mutates scope, so the whole pre-pass is scoped.
+    let saved_pp_lines = cg_lines
+    let saved_pp_temp = cg_temp_counter
+    push_scope()
+    let mut pp_type = CT_VOID
+    let mut pp_carrier = snapshot_carrier()
+    let mut pp_all_value = 1
+    let mut ppi = 0
+    while ppi < sublist_length(arms_sl) {
+        expr_result_ok_type = saved_ok_type
+        expr_result_err_type = saved_err_type
+        expr_option_inner = saved_option_inner
+        expr_result_ok_struct = saved_ok_struct
+        expr_result_err_struct = saved_err_struct
+        expr_option_inner_struct = saved_option_inner_struct
+        expr_option_inner_map_val_struct = saved_option_inner_map_val_struct
+        expr_option_inner_map_val_list_elem = saved_option_inner_map_val_list_elem
+        expr_list_elem_type = saved_list_elem_type
+        expr_list_elem_struct = saved_list_elem_struct
+        let pp_arm = sublist_get(arms_sl, ppi)
+        cg_lines = []
+        cg_indent = cg_indent + 1
+        let saved_pp_scruts = match_scruts
+        let saved_pp_scrut_enum = match_scrut_enum
+        bind_pattern_vars(node_pattern(pp_arm), 0, match_scruts.len())
+        let pp_arm_val = emit_arm_value(node_body(pp_arm))
+        match_scruts = saved_pp_scruts
+        match_scrut_enum = saved_pp_scrut_enum
+        cg_indent = cg_indent - 1
+        let arm_carrier = snapshot_carrier()
+        // An arm that yields no value (`0`/empty, e.g. a body that only assigns or
+        // early-returns) means the match is in statement position — keep it void
+        // so the existing `(void)arm_val` discard path runs unchanged.
+        if arm_carrier.ct == CT_VOID || pp_arm_val == "0" || pp_arm_val == "" {
+            pp_all_value = 0
+        }
+        if pp_type == CT_VOID && arm_carrier.ct != CT_VOID {
+            pp_type = arm_carrier.ct
+            pp_carrier = arm_carrier
+        } else if pp_type != CT_VOID {
+            if pp_type == CT_OPTION && carrier_option_concrete(pp_carrier) == 0 && carrier_option_concrete(arm_carrier) != 0 {
+                pp_carrier = arm_carrier
+            } else if pp_type == CT_RESULT && carrier_result_concrete(pp_carrier) == 0 && carrier_result_concrete(arm_carrier) != 0 {
+                pp_carrier = arm_carrier
+            }
+        }
+        ppi = ppi + 1
+    }
+    pop_scope()
+    cg_lines = saved_pp_lines
+    cg_temp_counter = saved_pp_temp
+
+    // Resolve a struct-valued match (arms produce a user struct) exactly as
+    // before, against the static result_type. This must run before the harvest
+    // override so the override never demotes a genuine struct match to a scalar:
+    // the pre-pass emits a struct arm whose tail is a pattern-bound ident (e.g.
+    // `Ok(b) => { b }`) as CT_INT (the binding isn't typed in the throwaway
+    // scope), which would otherwise mislead the harvest.
     let mut match_struct_name = ""
     if result_type == CT_STRUCT || result_type == CT_VOID {
         match_struct_name = infer_arm_struct_name(first_arm)
@@ -594,30 +804,43 @@ pub fn emit_match_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scop
             }
         }
     }
+
+    // The harvested type overrides the static guess only for a non-struct match
+    // where every arm produced a value of the same concrete carrier/scalar — i.e.
+    // the match is genuinely value-producing and the static guess was wrong about
+    // the element type. This fires for `?`-unwrapped arms (CT_VOID guess →
+    // concrete scalar, bug k849am) and carrier arms whose inner type must come
+    // from the values, not the fn return. Struct-valued and statement-position
+    // matches are left untouched.
+    if match_struct_name == "" && pp_type != CT_VOID && pp_all_value != 0 && pp_type != CT_STRUCT && (result_type == CT_VOID || result_type == CT_RESULT || result_type == CT_OPTION) {
+        result_type = pp_type
+    }
+    // The carrier shaping the result temp: harvested from the arms when concrete,
+    // else the enclosing fn's return type (the bare Ok/Err/Some/None fallback).
+    // A ptr-erased Option context (UE handler returning Option[Struct]) keeps the
+    // physical blink_Option_ptr representation — same exception as emit_if_expr.
+    let mut mcarrier = pp_carrier
+    if result_type == CT_OPTION {
+        if cg_current_fn_option_inner == CT_PTR {
+            mcarrier = carrier_ptr_option()
+        } else if carrier_option_concrete(pp_carrier) == 0 {
+            mcarrier = carrier_from_fn_ret_option()
+        }
+    } else if result_type == CT_RESULT {
+        if carrier_result_concrete(pp_carrier) == 0 {
+            mcarrier = carrier_from_fn_ret_result()
+        }
+    }
+
     if match_struct_name != "" {
         emit_line("{c_type_c_name(match_struct_name)} {result_var};")
     } else if result_type == CT_RESULT {
-        let rt = get_fn_ret_type(cg_current_fn_name)
-        let fsi = get_fn_ret_struct_inner(cg_current_fn_name)
-        let rt_c1 = tp_child1_kind(rt.tp_id)
-        let rt_c2 = tp_child2_kind(rt.tp_id)
-        if fsi.ok_struct != "" || fsi.err_struct != "" {
-            emit_line("{result_c_type_mixed(rt_c1, rt_c2, fsi.ok_struct, fsi.err_struct)} {result_var};")
-        } else if rt_c1 >= 0 {
-            emit_line("{result_c_type(rt_c1, rt_c2)} {result_var};")
-        } else {
-            emit_line("{result_c_type(CT_INT, CT_STRING)} {result_var};")
-        }
+        emit_line("{result_c_type_mixed(mcarrier.ok_type, mcarrier.err_type, mcarrier.ok_struct, mcarrier.err_struct)} {result_var};")
     } else if result_type == CT_OPTION {
-        let rt = get_fn_ret_type(cg_current_fn_name)
-        let fsi = get_fn_ret_struct_inner(cg_current_fn_name)
-        let rt_c1 = tp_child1_kind(rt.tp_id)
-        if fsi.ok_struct != "" {
-            emit_line("{struct_option_c_type(fsi.ok_struct)} {result_var};")
-        } else if rt_c1 >= 0 {
-            emit_line("{option_c_type(rt_c1)} {result_var};")
+        if mcarrier.option_inner_struct != "" {
+            emit_line("{struct_option_c_type(mcarrier.option_inner_struct)} {result_var};")
         } else {
-            emit_line("{option_c_type(CT_INT)} {result_var};")
+            emit_line("{option_c_type(mcarrier.option_inner)} {result_var};")
         }
     } else if result_type != CT_VOID {
         emit_line("{c_type_str(result_type)} {result_var};")
@@ -634,6 +857,16 @@ pub fn emit_match_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scop
 
     if has_guards {
         emit_line("int _mg_ = 0;")
+    }
+
+    // Install the harvested Option inner so a bare-`None` arm emits the matching
+    // blink_Option_<T> instead of the default placeholder (mirrors the if-expr
+    // bare-None re-emit). Restored after the arm loop.
+    let saved_loop_option_inner = cg_current_fn_option_inner
+    let saved_loop_option_inner_struct = cg_current_fn_option_inner_struct
+    if result_type == CT_OPTION {
+        cg_current_fn_option_inner = mcarrier.option_inner
+        cg_current_fn_option_inner_struct = mcarrier.option_inner_struct
     }
 
     let mut _first = 1
@@ -725,6 +958,8 @@ pub fn emit_match_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scop
         i = i + 1
     }
     emit_line("}")
+    cg_current_fn_option_inner = saved_loop_option_inner
+    cg_current_fn_option_inner_struct = saved_loop_option_inner_struct
     if match_struct_name != "" {
         set_var(result_var, CT_VOID, 1)
         set_var_struct(result_var, match_struct_name)
@@ -732,33 +967,29 @@ pub fn emit_match_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scop
         expr_result_type = CT_VOID
     } else if result_type == CT_RESULT {
         set_var(result_var, result_type, 1)
-        let rt2 = get_fn_ret_type(cg_current_fn_name)
-        let fsi2 = get_fn_ret_struct_inner(cg_current_fn_name)
-        let rt2_c1 = tp_child1_kind(rt2.tp_id)
-        let rt2_c2 = tp_child2_kind(rt2.tp_id)
-        if fsi2.ok_struct != "" || fsi2.err_struct != "" {
-            set_var_result_struct(result_var, rt2_c1, rt2_c2, fsi2.ok_struct, fsi2.err_struct)
-            expr_result_ok_struct = fsi2.ok_struct
-            expr_result_err_struct = fsi2.err_struct
+        if mcarrier.ok_struct != "" || mcarrier.err_struct != "" {
+            set_var_result_struct(result_var, mcarrier.ok_type, mcarrier.err_type, mcarrier.ok_struct, mcarrier.err_struct)
+            expr_result_ok_struct = mcarrier.ok_struct
+            expr_result_err_struct = mcarrier.err_struct
         } else {
-            set_var_result(result_var, rt2_c1, rt2_c2)
+            set_var_result(result_var, mcarrier.ok_type, mcarrier.err_type)
+            expr_result_ok_struct = ""
+            expr_result_err_struct = ""
         }
-        expr_result_ok_type = rt2_c1
-        expr_result_err_type = rt2_c2
+        expr_result_ok_type = mcarrier.ok_type
+        expr_result_err_type = mcarrier.err_type
         expr_result_str = result_var
         expr_result_type = result_type
     } else if result_type == CT_OPTION {
         set_var(result_var, result_type, 1)
-        let rt3 = get_fn_ret_type(cg_current_fn_name)
-        let fsi3 = get_fn_ret_struct_inner(cg_current_fn_name)
-        let rt3_c1 = tp_child1_kind(rt3.tp_id)
-        if fsi3.ok_struct != "" {
-            set_var_option_struct(result_var, rt3_c1, fsi3.ok_struct)
-            expr_option_inner_struct = fsi3.ok_struct
+        if mcarrier.option_inner_struct != "" {
+            set_var_option_struct(result_var, mcarrier.option_inner, mcarrier.option_inner_struct)
+            expr_option_inner_struct = mcarrier.option_inner_struct
         } else {
-            set_var_option(result_var, rt3_c1)
+            set_var_option(result_var, mcarrier.option_inner)
+            expr_option_inner_struct = ""
         }
-        expr_option_inner = rt3_c1
+        expr_option_inner = mcarrier.option_inner
         expr_result_str = result_var
         expr_result_type = result_type
     } else if result_type != CT_VOID {
@@ -4674,7 +4905,7 @@ pub fn emit_fn_def(fn_node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope
 // calling convention: emit_fn_body must return the tail expression as a value,
 // so body_ret is forced to a non-void carrier (CT_INT). Shared by the generic
 // (emit_mono_fn_def) and non-generic fn/method emitters.
-fn ret_needs_struct_body(ret_str: Str) -> Int {
+pub fn ret_needs_struct_body(ret_str: Str) -> Int {
     if is_struct_type(ret_str) != 0 || is_enum_type(ret_str) != 0 || ret_str == "Tuple" { 1 } else { 0 }
 }
 
