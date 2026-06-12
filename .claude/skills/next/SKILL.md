@@ -42,7 +42,7 @@ For each bug:
 3. Write a failing test that reproduces the bug (test_*.bl)
 4. Fix the bug
 5. `task regen` then `task ci`
-6. run `/simplify`
+6. run `/code-review --fix`
 6. `br close <id>`
 
 When working multiple bugs: use parallel agents with worktrees. Each agent gets one bug.
@@ -61,7 +61,7 @@ For each friction item:
 ### type:feature — Confirm first, parallelizable
 1. Present all selected features with brief proposed approaches
 2. Wait for user approval of the batch
-3. Each feature: plan → implement → `task regen` → `task ci` → `/simplify` → `br close <id>`
+3. Each feature: plan → implement → `task regen` → `task ci` → `/code-review --fix` → `br close <id>`
 
 When working multiple features: use parallel agents with worktrees. Each agent gets one feature.
 
@@ -84,7 +84,7 @@ For each chore item:
 1. `br start <id>`
 2. Read the task, find relevant info
 3. Do the task
-4. `/simplify`
+4. `/code-review --fix`
 5. `br close <id>`
 
 ## Step 4: Ship it

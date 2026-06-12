@@ -28,6 +28,7 @@ Build output: build/ (gitignored). Temp files: .tmp/ (gitignored, use instead of
 
 Bootstrap: `task bootstrap` — builds blinkc at `build/blinkc`. Requires `blink` on PATH or existing build/blinkc + build/blink (gen0 needs both: blinkc to emit gen1.c, blink to build the stdlib archive).
 Regen: `task regen` — rebuild compiler from source + verify (Gen1 vs Gen2 fixed-point).
+Adding a lib/std or lib/pkg module: just run `task regen` — the embedded registry refresh is automatic (no manual edit to src/embedded_stdlib_registry.bl).
 CLI: `build/blink build <file.bl>` | `build/blink run <file.bl>` | `build/blink check <file.bl>` | `build/blink doc <module>`
 Build CLI: `task build-cli` — produces `build/blink`
 Test: `task test` — compile+run all test_*.bl in tests/
