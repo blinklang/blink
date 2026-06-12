@@ -192,7 +192,7 @@ The self-hosting compiler (`src/codegen_types.bl`, `src/codegen_expr.bl`) curren
 | E0509 | QuestionMarkOptionInNonOption | `codegen_expr.bl` — `?` on Option in non-Option function |
 | E0512 | QuestionMarkErrorMismatch | Not yet implemented — requires type checker |
 | E0504 | UndefinedFunction | `typecheck.bl` — name resolution + `codegen_expr.bl` — codegen |
-| E0505 | UnresolvedMethod | `codegen_methods.bl` — method dispatch (codegen phase) |
+| E0505 | UnresolvedMethod | `typecheck.bl` — unresolved method on a known struct/enum (primary) + `codegen_methods.bl` — method dispatch (fail-open backstop) |
 | E0506 | UndefinedVariable | `typecheck.bl` — name resolution |
 | E0507 | UnknownType | `typecheck.bl` — name resolution |
 | W0501 | UnknownMethod | `typecheck.bl` — name resolution (warning, may be false positive for struct field closures) |

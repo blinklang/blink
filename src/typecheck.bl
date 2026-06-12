@@ -17,6 +17,7 @@ import diagnostics.{
     Diag, diag_clear_allows, diag_error_at, diag_error_no_loc,
     diag_push_allows, diag_warn_at,
     TYPE_ERROR, CAPABILITY_BUDGET, QM_INVALID_OPERAND, UNDEFINED_FUNCTION,
+    UNRESOLVED_METHOD,
     UNDEFINED_VARIABLE, UNKNOWN_TYPE, QM_RESULT_IN_NON_RESULT,
     QM_OPTION_IN_NON_OPTION, QM_ERROR_MISMATCH,
     QM_TEST_DISPLAY_REQUIRED, TEST_ANNOTATED_RETURN, SKIP_OUTSIDE_TEST_BODY,
@@ -180,6 +181,57 @@ fn tc_type_has_display_impl(tname: Str) -> Int {
     while i < tc_display_impl_types.len() {
         if tc_display_impl_types.get(i).unwrap() == tname { return 1 }
         i = i + 1
+    }
+    0
+}
+
+// mrwgz4: can `.{method}()` resolve on a KNOWN struct/enum type `tname`?
+// Allowlist-style and biased FAIL-OPEN: every path that resolves at codegen
+// must return 1 here, but any path we cannot model at typecheck also returns 1
+// (the codegen E0505 backstop catches genuine misses). Returning 0 emits a hard
+// typecheck error, so over-strictness would reject valid programs — including
+// the compiler typechecking itself during `task regen`. When unsure: return 1.
+fn tc_method_resolvable_on_type(obj_k: Int, tname: Str, method: Str) -> Int {
+    // (a) user method + ALL trait-impl methods — `impl Trait for T { fn m }`
+    //     registers a fnsig `T_m`, same as inherent impls. The sole caller
+    //     (infer_type's struct/enum branch) already returns on this lookup, so
+    //     this clause is redundant there; kept so the predicate stays correct
+    //     and self-contained for any future caller.
+    if lookup_fnsig("{tname}_{method}") != -1 { return 1 }
+    // (b) sealed synthesized Display.display() (no user fnsig).
+    if method == "display" && tc_type_has_display_impl(tname) != 0 { return 1 }
+    // (c) @derive-generated methods — query the annotation via the decl node.
+    //     tc_type_decl_nodes covers BOTH structs (850) and enums (902).
+    let td = tc_type_decl_nodes.get(tname) ?? -1
+    if td != -1 {
+        if method == "to_json"   && type_has_derive(td, "Serialize")   != 0 { return 1 }
+        if method == "from_json" && type_has_derive(td, "Deserialize") != 0 { return 1 }
+        if method == "eq"        && type_has_derive(td, "Eq")          != 0 { return 1 }
+        if method == "clone"     && type_has_derive(td, "Clone")       != 0 { return 1 }
+        if method == "hash"      && type_has_derive(td, "Hash")        != 0 { return 1 }
+        if method == "debug"     && type_has_derive(td, "Debug")       != 0 { return 1 }
+    }
+    // (c') str-backed enum intrinsics (to_str/from_str) are synthesized in
+    //      codegen (codegen_stmt.bl:5983) and not modeled here → fail-open.
+    if obj_k == TK_ENUM && (method == "to_str" || method == "from_str") { return 1 }
+    // (d) closure-typed struct field invoked like a method. Closure fields lower
+    //     to TK_TYPEVAR("Fn"), not a closure kind, so reuse the callable-field
+    //     name registry (the same signal that suppresses W0501).
+    if obj_k == TK_STRUCT && is_callable_field_name(method) != 0 { return 1 }
+    // (e) trait/stdlib methods whose receiver-type resolution is not modeled at
+    //     typecheck: `.into()` (From-trait auto-conversion), stdlib-type methods
+    //     like `Instant.to_rfc3339()`, channel ops, etc. This is the SAME name
+    //     allowlist that suppresses the W0501 name-only warning — reusing it keeps
+    //     the hard E0505 and the soft W0501 consistent (no name warns-but-errors).
+    //
+    //     EXCLUDE `display`/`to_str`/`from_str`: those names live in is_builtin_method
+    //     too, but on a struct/enum receiver they are SYNTHESIZED conditionally —
+    //     `display` only with an `impl Display` (clause b), `to_str`/`from_str` only
+    //     on enums (clause c'). Letting the name-only check resolve them would defeat
+    //     the whole point: `.display()` on a type WITHOUT a Display impl must error
+    //     here at typecheck (j2xxyd/mrwgz4), not fall open to the codegen backstop.
+    if method != "display" && method != "to_str" && method != "from_str" {
+        if is_builtin_method(method) != 0 { return 1 }
     }
     0
 }
@@ -5552,6 +5604,20 @@ fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repo
             // has no user-written fnsig; it always returns Str.
             if method == "display" && tc_type_has_display_impl(tname) != 0 {
                 return TYPE_STR
+            }
+            // mrwgz4: the receiver type is KNOWN, but no resolution path matched.
+            // Emit E0505 here (typecheck) instead of deferring to the codegen
+            // backstop — name resolution belongs with E0504/E0506/E0507. Display
+            // rides along with its actionable help (4q2etk); blinkc_main aborts
+            // on diag_count > 0 before codegen, so the backstop never re-fires.
+            if tc_method_resolvable_on_type(obj_k, tname, method) == 0 {
+                let help = if method == "display" {
+                    "add an `impl Display for {tname}` (with `fn fmt(self, sb: StringBuilder)`)"
+                } else {
+                    ""
+                }
+                diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "unresolved method '.{method}' on type {tname}", node, help)
+                return TYPE_UNKNOWN
             }
         }
 
