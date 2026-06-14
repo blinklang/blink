@@ -1,0 +1,39 @@
+// Spec §8.10: the test-runner NDJSON for an assertion failure must use the
+// canonical shape — top-level "results" (not "tests"), per-record
+// "status":"failed" (not "fail"), cause:"assertion", separate
+// "expected"/"actual" fields (RHS = expected, LHS = actual per the spec
+// example), a per-record "duration_ms", and a summary "duration_ms". The
+// legacy "tests":[ / "status":"fail" strings must be absent. (br a654gs)
+
+test "runner JSON assertion failure matches spec 8.10 shape" {
+    // Fixture basename must be unique per worker: `build/blink build` writes the
+    // compiled binary to `build/<basename>`, and sibling workers racing on the
+    // same path hit ETXTBSY on execvp.
+    let tag = "_test_runner_assert_{getpid()}"
+    let fixture = ".tmp/{tag}.bl"
+    let src = "test \"a\" \{ assert_eq(1, 2) \}\n"
+    write_file(fixture, src)
+
+    let build_res = process_run("build/blink", ["build", fixture])
+    assert_eq(build_res.exit_code, 0)
+
+    let run = process_run("build/{tag}", ["--test-json"])
+    let output = run.out.concat(run.err_out)
+    let diag = "exit_code={run.exit_code}; captured:\n{output}"
+
+    // Spec-canonical keys/strings present.
+    assert(output.contains("\"results\":["), "no top-level results array; {diag}")
+    assert(output.contains("\"status\":\"failed\""), "status not 'failed'; {diag}")
+    assert(output.contains("\"cause\":\"assertion\""), "no cause:assertion; {diag}")
+    assert(output.contains("\"expected\":\"2\""), "expected (RHS) not rendered; {diag}")
+    assert(output.contains("\"actual\":\"1\""), "actual (LHS) not rendered; {diag}")
+    assert(output.contains("\"duration_ms\":"), "no duration_ms field; {diag}")
+    // Summary must carry its own duration_ms (distinct from per-record).
+    assert(output.contains("\"summary\":"), "no summary object; {diag}")
+
+    // Legacy shape must be gone.
+    assert(!output.contains("\"tests\":["), "legacy 'tests' array still present; {diag}")
+    assert(!output.contains("\"status\":\"fail\""), "legacy 'fail' status still present; {diag}")
+
+    shell_exec("rm -f build/{tag} {fixture}")
+}

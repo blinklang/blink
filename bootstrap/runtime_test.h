@@ -2,6 +2,7 @@
 #define BLINK_RUNTIME_TEST_H
 
 #include <setjmp.h>
+#include <time.h>
 
 typedef struct {
     const char* name;
@@ -30,6 +31,11 @@ BLINK_UNUSED static int __blink_test_failed;
 #endif
 BLINK_UNUSED static char __blink_test_fail_msg[512];
 BLINK_UNUSED static int __blink_test_fail_line;
+/* assert_eq separate expected/actual rendering (spec §8.10): expected = the
+ * RHS argument, actual = the LHS argument. Non-empty only when the failure
+ * came through __blink_assert_fail_eq; plain assert(...) leaves them empty. */
+BLINK_UNUSED static char __blink_test_fail_expected[256];
+BLINK_UNUSED static char __blink_test_fail_actual[256];
 /* Power-assert introspection. When non-empty, these supplement the legacy
  * fail_msg with structured assertion text, sub-expression values, and a
  * span. The runner uses them for human and JSON output. */
@@ -80,6 +86,8 @@ BLINK_UNUSED static void __blink_assert_fail(const char* msg, int line) {
     __blink_test_fail_file[0] = '\0';
     __blink_test_fail_col = 0;
     __blink_test_fail_user_msg[0] = '\0';
+    __blink_test_fail_expected[0] = '\0';
+    __blink_test_fail_actual[0] = '\0';
     longjmp(__blink_test_jmp, 1);
 }
 
@@ -94,6 +102,25 @@ BLINK_UNUSED static void __blink_assert_fail(const char* msg, int line) {
 
 BLINK_UNUSED static void blink_set_case_label(const char* s) {
     BLINK_COPY_OR_EMPTY(__blink_test_case_label, s);
+}
+
+/* assert_eq failure: like __blink_assert_fail but also records the separately
+ * rendered expected (RHS) and actual (LHS) operands for spec §8.10 JSON. */
+BLINK_UNUSED static void __blink_assert_fail_eq(const char* msg,
+                                                const char* expected,
+                                                const char* actual,
+                                                int line) {
+    __blink_test_failed = 1;
+    BLINK_COPY_OR_EMPTY(__blink_test_fail_msg, msg);
+    __blink_test_fail_line = line;
+    __blink_test_fail_assertion[0] = '\0';
+    __blink_test_fail_intro[0] = '\0';
+    __blink_test_fail_file[0] = '\0';
+    __blink_test_fail_col = 0;
+    __blink_test_fail_user_msg[0] = '\0';
+    BLINK_COPY_OR_EMPTY(__blink_test_fail_expected, expected);
+    BLINK_COPY_OR_EMPTY(__blink_test_fail_actual, actual);
+    longjmp(__blink_test_jmp, 1);
 }
 
 BLINK_UNUSED static void __blink_assert_fail_intro(const char* assertion,
@@ -115,6 +142,8 @@ BLINK_UNUSED static void __blink_assert_fail_intro(const char* assertion,
     BLINK_COPY_OR_EMPTY(__blink_test_fail_intro, intro);
     BLINK_COPY_OR_EMPTY(__blink_test_fail_file, file);
     BLINK_COPY_OR_EMPTY(__blink_test_fail_user_msg, user_msg);
+    __blink_test_fail_expected[0] = '\0';
+    __blink_test_fail_actual[0] = '\0';
     longjmp(__blink_test_jmp, 1);
 }
 
@@ -138,6 +167,8 @@ BLINK_UNUSED static void __blink_test_set_propagate(const char* message,
     __blink_test_fail_assertion[0] = '\0';
     __blink_test_fail_intro[0] = '\0';
     __blink_test_fail_user_msg[0] = '\0';
+    __blink_test_fail_expected[0] = '\0';
+    __blink_test_fail_actual[0] = '\0';
 }
 
 /* No longjmp — caller emits `return;` so cleanup destructors run. */
@@ -210,8 +241,9 @@ BLINK_UNUSED static void blink_test_run(const blink_test_entry* tests, int count
     }
 
     int pass = 0, fail = 0, skip = 0, total = 0;
+    double total_ms = 0.0;
 
-    if (json_output) printf("{\"tests\":[");
+    if (json_output) printf("{\"results\":[");
 
     for (int i = 0; i < count; i++) {
         if (filter && !strstr(tests[i].name, filter)) continue;
@@ -220,6 +252,7 @@ BLINK_UNUSED static void blink_test_run(const blink_test_entry* tests, int count
             if (json_output) {
                 if (total > 1) printf(",");
                 printf("{\"name\":\"%s\",\"status\":\"skipped\"", tests[i].name);
+                printf(",\"duration_ms\":%g", 0.0);
                 __blink_test_print_tags_json(&tests[i]);
                 printf("}");
             } else {
@@ -236,15 +269,23 @@ BLINK_UNUSED static void blink_test_run(const blink_test_entry* tests, int count
         __blink_test_fail_file[0] = '\0';
         __blink_test_fail_col = 0;
         __blink_test_fail_user_msg[0] = '\0';
+        __blink_test_fail_expected[0] = '\0';
+        __blink_test_fail_actual[0] = '\0';
         __blink_test_case_label[0] = '\0';
         __blink_test_fail_cause = "assertion";
         __blink_test_fail_error_type[0] = '\0';
         __blink_test_fail_error_message[0] = '\0';
         __blink_test_skipped = 0;
         __blink_test_skip_reason[0] = '\0';
+        struct timespec __t0, __t1;
+        clock_gettime(CLOCK_MONOTONIC, &__t0);
         if (setjmp(__blink_test_jmp) == 0) {
             tests[i].fn();
         }
+        clock_gettime(CLOCK_MONOTONIC, &__t1);
+        double dur_ms = (double)(__t1.tv_sec - __t0.tv_sec) * 1000.0
+                      + (double)(__t1.tv_nsec - __t0.tv_nsec) / 1000000.0;
+        total_ms += dur_ms;
         if (__blink_test_skipped) {
             skip++;
             if (json_output) {
@@ -253,6 +294,7 @@ BLINK_UNUSED static void blink_test_run(const blink_test_entry* tests, int count
                 if (__blink_test_skip_reason[0]) {
                     printf(",\"reason\":\"%s\"", __blink_test_json_escape(__blink_test_skip_reason));
                 }
+                printf(",\"duration_ms\":%g", dur_ms);
                 __blink_test_print_tags_json(&tests[i]);
                 printf("}");
             } else {
@@ -268,7 +310,7 @@ BLINK_UNUSED static void blink_test_run(const blink_test_entry* tests, int count
             fail++;
             if (json_output) {
                 if (total > 1) printf(",");
-                printf("{\"name\":\"%s\",\"status\":\"fail\",\"line\":%d",
+                printf("{\"name\":\"%s\",\"status\":\"failed\",\"line\":%d",
                        tests[i].name, __blink_test_fail_line);
                 printf(",\"cause\":\"%s\"", __blink_test_fail_cause);
                 if (__blink_test_case_label[0]) {
@@ -277,6 +319,12 @@ BLINK_UNUSED static void blink_test_run(const blink_test_entry* tests, int count
                 printf(",\"message\":\"%s\"", __blink_test_json_escape(__blink_test_fail_msg));
                 if (__blink_test_fail_assertion[0]) {
                     printf(",\"assertion\":\"%s\"", __blink_test_json_escape(__blink_test_fail_assertion));
+                }
+                if (__blink_test_fail_expected[0]) {
+                    printf(",\"expected\":\"%s\"", __blink_test_json_escape(__blink_test_fail_expected));
+                }
+                if (__blink_test_fail_actual[0]) {
+                    printf(",\"actual\":\"%s\"", __blink_test_json_escape(__blink_test_fail_actual));
                 }
                 if (__blink_test_fail_intro[0]) {
                     printf(",\"introspection\":\"%s\"", __blink_test_json_escape(__blink_test_fail_intro));
@@ -295,6 +343,7 @@ BLINK_UNUSED static void blink_test_run(const blink_test_entry* tests, int count
                            __blink_test_json_escape(__blink_test_fail_file),
                            __blink_test_fail_line, __blink_test_fail_col);
                 }
+                printf(",\"duration_ms\":%g", dur_ms);
                 __blink_test_print_tags_json(&tests[i]);
                 printf("}");
             } else {
@@ -328,6 +377,7 @@ BLINK_UNUSED static void blink_test_run(const blink_test_entry* tests, int count
             if (json_output) {
                 if (total > 1) printf(",");
                 printf("{\"name\":\"%s\",\"status\":\"pass\"", tests[i].name);
+                printf(",\"duration_ms\":%g", dur_ms);
                 __blink_test_print_tags_json(&tests[i]);
                 printf("}");
             } else {
@@ -337,7 +387,7 @@ BLINK_UNUSED static void blink_test_run(const blink_test_entry* tests, int count
     }
 
     if (json_output) {
-        printf("],\"summary\":{\"total\":%d,\"passed\":%d,\"failed\":%d,\"skipped\":%d}}\n", total, pass, fail, skip);
+        printf("],\"summary\":{\"total\":%d,\"passed\":%d,\"failed\":%d,\"skipped\":%d,\"duration_ms\":%g}}\n", total, pass, fail, skip, total_ms);
     } else {
         printf("\n%d passed, %d failed", pass, fail);
         if (skip > 0) printf(", %d skipped", skip);
