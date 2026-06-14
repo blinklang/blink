@@ -1,20 +1,45 @@
 // Spec §2.20 + §8.10: NDJSON failure record for `?` propagation in a
-// test body carries cause:"propagated_error" and an error subobject
-// with the rendered message and static type name.
+// test body carries cause:"propagated_error", an `error` subobject with the
+// rendered message and static type name, and a sibling `span` object. The
+// error{} and span{} shapes are pinned as units below so a field reorder,
+// missing brace, or accidental nesting of span under error is caught.
 
 test "runner JSON encodes propagated_error cause" {
+    // Fixture basename must be unique per worker: `build/blink build` writes the
+    // compiled binary to `build/<basename>`, and sibling workers racing on the
+    // same path hit ETXTBSY ("Text file busy") on execvp.
+    let tag = "_test_runner_qm_{getpid()}"
+    let fixture = ".tmp/{tag}.bl"
     let src = "fn fail() -> Result[Int, Str] \{ Err(\"boom\") \}\n"
               .concat("test \"x\" \{ let _ = fail()?\n  assert_eq(1, 1)\n \}\n")
-    write_file(".tmp/_test_runner_qm.bl", src)
+    write_file(fixture, src)
 
     // Build via build/blink so the C compile picks up runtime.h + libs.
-    let build_res = process_run("build/blink", ["build", ".tmp/_test_runner_qm.bl"])
+    let build_res = process_run("build/blink", ["build", fixture])
     assert_eq(build_res.exit_code, 0)
 
-    let run = process_run("build/_test_runner_qm", ["--test-json"])
-    assert(run.out.contains("\"cause\":\"propagated_error\""))
-    assert(run.out.contains("\"error_type\":\"Str\""))
-    assert(run.out.contains("\"message\":\"boom\""))
+    let run = process_run("build/{tag}", ["--test-json"])
+    let output = run.out.concat(run.err_out)
+    let diag = "exit_code={run.exit_code}; captured:\n{output}"
 
-    shell_exec("rm -f build/_test_runner_qm .tmp/_test_runner_qm.bl")
+    assert(output.contains("\"cause\":\"propagated_error\""),
+           "no cause:propagated_error; {diag}")
+    // Pin the error{} subobject as a unit. The runtime emits these fields in a
+    // fixed printf order (runtime_test.h), so an exact substring catches an
+    // emit-order swap or a missing brace — not just presence of `boom`/`Str`
+    // somewhere in the record. Literal braces are escaped as \{ \}; bare braces
+    // start interpolation inside "..." strings.
+    assert(output.contains("\"error\":\{\"message\":\"boom\",\"error_type\":\"Str\"\}"),
+           "error subobject not in spec-canonical shape; {diag}")
+    // Pin the sibling span object (guards against an accidental nesting of span
+    // under error). The file value is dynamic, so anchor on the opening
+    // "span":{"file": . The "col": key is span-exclusive in the emit (the
+    // top-level record emits "line" but never "col"), so its presence confirms
+    // the span object reached the col field rather than being truncated.
+    assert(output.contains("\"span\":\{\"file\":"),
+           "no sibling span with file key; {diag}")
+    assert(output.contains("\"col\":"),
+           "span missing col key; {diag}")
+
+    shell_exec("rm -f build/{tag} {fixture}")
 }
