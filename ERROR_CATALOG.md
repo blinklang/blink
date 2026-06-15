@@ -80,7 +80,6 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | InvalidKeywordArg | E0511 | Keyword argument name does not match any parameter | Name resolution | §2 |
 | QuestionMarkErrorMismatch | E0512 | `?` error type mismatch — inner E1 ≠ function return E2 | Type checking | §3c.2 |
 | CoalesceRequiresOption | E0513 | `??` operator used on non-Option value | Type checking | §3c.2 |
-| SkipOutsideTestBody | E0516 | `skip()` called outside a `test { ... }` block | Type checking | §2.20 |
 | CloseableEscapesScope | E0601 | `Closeable` value escapes `with...as` scope | Resources | §5.5 |
 | ArenaValueEscapes | E0700 | Arena-scoped value escapes arena scope | Arena | §5.2 |
 | ArenaTypeContainsCycle | E0701 | Type crossing `with arena { }` boundary contains a cycle | Arena | §5.2 |
@@ -104,7 +103,7 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | NativeDepUnavailableCrossTarget | E0821 | Native dependency unavailable for cross-target | FFI | §9.2.1 |
 | FfiOffsetUnknownStride | E0822 | `Ptr.offset` requires `@ffi.struct` element type | FFI | §9.1.1 |
 | CleanupPanickedDuringUnwind | E0824 | `exit(false)`/`close()` panicked during catchable unwind; original panic preserved, cleanup surfaces as warning | Test runner | §4.6.3 |
-| SkipOutsideTest | E0827 | `skip()` called outside a test (spec-canonical alias for E0516) | Test runner | §2.20 |
+| SkipOutsideTest | E0827 | `skip()` called outside a `test { ... }` block | Type checking | §2.20 |
 | AssertPanicsBodyReturned | E0831 | `assert_panics` body returned normally instead of panicking | Test runner | §2.20 |
 | AssertPanicsMessageMismatch | E0832 | `assert_panics` panic message did not match expected pattern | Test runner | §2.20 |
 | AssertPanicsOutsideTest | E0833 | `assert_panics` called outside a test | Test runner | §2.20 |
@@ -187,7 +186,7 @@ The self-hosting compiler (`src/codegen_types.bl`, `src/codegen_expr.bl`) curren
 | E0501 | CapabilityBudgetExceeded | `typecheck.bl` — `@capabilities` budget check |
 | E0502 | QuestionMarkInvalidOperand | `codegen_expr.bl` — `?` operator type check (to move to typecheck phase) |
 | E0513 | CoalesceRequiresOption | `codegen_expr.bl` — `??` operator type check |
-| E0516 | SkipOutsideTestBody | `typecheck.bl` — rejects `skip()` outside a test body |
+| E0827 | SkipOutsideTest | `typecheck.bl` — rejects `skip()` outside a test body (via the §2.20 test-only symbol fence) |
 | E0508 | QuestionMarkResultInNonResult | `codegen_expr.bl` — `?` on Result in non-Result function |
 | E0509 | QuestionMarkOptionInNonOption | `codegen_expr.bl` — `?` on Option in non-Option function |
 | E0512 | QuestionMarkErrorMismatch | Not yet implemented — requires type checker |

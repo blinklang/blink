@@ -3902,6 +3902,52 @@ pub fn synthesized_display_call(type_name: Str, value_expr: Str) -> Str {
     ""
 }
 
+// Coerce a C value expression of CT `ct` to a `const char*` C expression for
+// embedding into a `%s` printf vararg. Scalars are snprintf'd into a fresh
+// buffer (emitted before the return); Str passes through. Non-coercible types
+// fall through unchanged (caller must guard).
+pub fn coerce_to_c_str(expr: Str, ct: Int) -> Str ! Codegen.Emit {
+    if ct == CT_STRING {
+        return expr
+    }
+    if ct == CT_INT {
+        let tmp = fresh_temp("_rci_")
+        emit_line("char {tmp}[32]; snprintf({tmp}, 32, \"%lld\", (long long){expr});")
+        return tmp
+    }
+    if ct == CT_FLOAT {
+        let tmp = fresh_temp("_rcf_")
+        emit_line("char {tmp}[64]; snprintf({tmp}, 64, \"%g\", {expr});")
+        return tmp
+    }
+    if ct == CT_BOOL {
+        return "({expr} ? \"true\" : \"false\")"
+    }
+    if ct == CT_CHAR {
+        return "blink_char_to_str((int64_t){expr})"
+    }
+    expr
+}
+
+// Render a Result arm value (the panicked-on arm of an unwrap/unwrap_err, or
+// the propagated err of a test-body `?`) to a `const char*` C expression for a
+// `%s` printf vararg. Builtin scalars coerce directly; struct/enum arms with an
+// `impl Display` render through the synthesized sealed `{T}_display`. An arm
+// type with no usable Display falls back to a literal `"<TypeName>"` — this is
+// intentionally non-fatal: `.unwrap()` has no Display gate (unlike test-body
+// `?`, whose E0514 guarantees a Display impl exists upstream).
+pub fn render_result_arm_value(ct: Int, struct_name: Str, value_expr: Str) -> Str ! Codegen.Emit {
+    if ct == CT_STRING || ct == CT_INT || ct == CT_FLOAT || ct == CT_BOOL || ct == CT_CHAR {
+        return coerce_to_c_str(value_expr, ct)
+    }
+    if struct_name != "" {
+        let disp_call = synthesized_display_call(struct_name, value_expr)
+        if disp_call != "" { return disp_call }
+    }
+    let tag = if struct_name != "" { struct_name } else { "<error>" }
+    "\"<{tag}>\""
+}
+
 pub fn lookup_builtin_trait_impl(trait_name: Str, ct_type: Int) -> Int {
     let mut i = 0
     while i < builtin_trait_impls.len() {

@@ -20,7 +20,7 @@ import diagnostics.{
     UNRESOLVED_METHOD,
     UNDEFINED_VARIABLE, UNKNOWN_TYPE, QM_RESULT_IN_NON_RESULT,
     QM_OPTION_IN_NON_OPTION, QM_ERROR_MISMATCH,
-    QM_TEST_DISPLAY_REQUIRED, TEST_ANNOTATED_RETURN, SKIP_OUTSIDE_TEST_BODY,
+    QM_TEST_DISPLAY_REQUIRED, TEST_ANNOTATED_RETURN, SKIP_OUTSIDE_TEST,
     PUB_FFI, FFI_NO_EFFECTS, CONTRACT_ON_FFI, INVALID_PTR_TYPE,
     PTR_OUTSIDE_FFI, FFI_STRUCT_GC_FIELD, BYTES_GROW_IN_WITH_PTR,
     PINNED_BYTES_ESCAPE, BYTES_PTR_CAST_FORBIDDEN,
@@ -3092,6 +3092,33 @@ fn nr_set_last_type(tid: Int) {
     }
 }
 
+// §2.20 test-only symbol allowlist. Append future test-only symbols here
+// (e.g. assert_panics) — membership means the symbol may only be called inside
+// a literal 'test { ... }' block (tc_in_test_body == 1). This predicate is the
+// single source of truth for *which* symbols are fenced; the *fence itself*
+// (tc_fence_test_only_symbol) is shared. A new symbol whose Call has its own
+// signature/arg-count checks still needs its own `if fn_name == ...` dispatch
+// branch in infer_type that calls tc_fence_test_only_symbol with its code —
+// the list-append removes fence duplication, not the per-symbol dispatch.
+fn is_test_only_symbol(name: Str) -> Int {
+    if name == "skip" { return 1 }
+    0
+}
+
+// Shared fence for §2.20 test-only symbols. `code`/`short_name` are
+// parameterized so a future symbol (assert_panics) can fence with E0833.
+// tc_in_test_body is 1 inside the test block (and inside closures lexically
+// within it — testing.for_each's case body relies on this); it is 0 in a
+// regular fn, so calling a test-only symbol from a helper fn is fenced even
+// when that helper is reachable from a test.
+fn tc_fence_test_only_symbol(name: Str, code: Str, short_name: Str, node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    if is_test_only_symbol(name) != 0 && tc_in_test_body == 0 {
+        diag_error_at(short_name, code,
+            "{name}() can only be called inside a test body",
+            node, "move the call into a 'test \{ ... }' block")
+    }
+}
+
 fn is_builtin_fn(name: Str) -> Int {
     if name == "arg_count" { return 1 }
     if name == "get_arg" { return 1 }
@@ -5254,11 +5281,7 @@ fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repo
                     return TYPE_STR
                 }
                 if fn_name == "skip" {
-                    if tc_in_test_body == 0 {
-                        diag_error_at("SkipOutsideTestBody", SKIP_OUTSIDE_TEST_BODY,
-                            "skip() can only be called inside a test body",
-                            node, "move the call into a 'test \{ ... }' block")
-                    }
+                    tc_fence_test_only_symbol("skip", SKIP_OUTSIDE_TEST, "SkipOutsideTest", node)
                     let args_sl = node_args(node)
                     let arg_count = if args_sl != -1 { sublist_length(args_sl) } else { 0 }
                     if arg_count != 1 {

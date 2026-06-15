@@ -36,7 +36,7 @@ import codegen_types.{
     is_generic_fn, is_struct_type, is_trait_type, is_user_effect_handle,
     cg_expect_fn_value_sig, cg_expect_arg_ann, arg_type_ann_at, get_callee_params_sl,
     builtin_receiver_type_name,
-    is_sized_int_ct, lookup_builtin_trait_impl, lookup_impl_method, impl_method_reg_name, mangle_generic_name, mangle_from_method, synthesized_display_call, wrapping_unsigned_c_type,
+    is_sized_int_ct, lookup_builtin_trait_impl, lookup_impl_method, impl_method_reg_name, mangle_generic_name, mangle_from_method, synthesized_display_call, render_result_arm_value, wrapping_unsigned_c_type,
     option_c_type, reg_fn, register_mono_fn, register_mono_instance,
     resolve_import_alias, resolve_ptr_inner_c, resolve_struct_from_c_name, get_var_ffi_ptr_struct, get_var_ffi_ptr_origin, is_ffi_ptr_array_var,
     ffi_alloc_n_pending, ffi_offset_pending_struct, ffi_origin_pending,
@@ -67,6 +67,17 @@ fn emit_panic_tag_check(tmp: Str, tag_val: Int, msg: Str, node: Int) ! Codegen.E
     let file = panic_file_for(node)
     let loc = panic_line_str(node)
     emit_line("if ({tmp}.tag == {tag_val}) \{ fprintf(stderr, \"panic: {msg} at {file}:{loc}\\n\"); exit(1); }")
+}
+
+// Same guard as emit_panic_tag_check, but embeds the Display-rendered value of
+// the panicked-on arm: `rendered_expr` is a `const char*` C expression (from
+// render_result_arm_value) passed as the `%s` printf vararg. Used by the
+// Result unwrap/unwrap_err panic path; the Option/None path keeps the
+// payload-free emit_panic_tag_check.
+fn emit_panic_tag_check_render(tmp: Str, tag_val: Int, msg_prefix: Str, rendered_expr: Str, node: Int) ! Codegen.Emit {
+    let file = panic_file_for(node)
+    let loc = panic_line_str(node)
+    emit_line("if ({tmp}.tag == {tag_val}) \{ fprintf(stderr, \"panic: {msg_prefix}: %s at {file}:{loc}\\n\", {rendered_expr}); exit(1); }")
 }
 
 @allow(UnrestoredMutation, IncompleteStateRestore)
@@ -127,26 +138,32 @@ fn emit_result_unwrap_inner(
     inner_t: Int, inner_s: Str,
     field: Str,
     elem_kind: Int, elem_sname: Str,
-    propagate_option: Int
+    propagate_option: Int,
+    other_t: Int, other_s: Str
 ) ! Codegen.Emit, Codegen.Scope {
     let is_ok = field == "ok"
     let panic_tag = if is_ok { 1 } else { 0 }
     let panic_msg = if is_ok { "unwrap called on Err" } else { "unwrap_err called on Ok" }
     let tmp = fresh_temp(if is_ok { "_runw_" } else { "_ruew_" })
     emit_line("__typeof__({obj_str}) {tmp} = {obj_str};")
+    // The panicked-on arm is the OTHER arm: `.unwrap()` panics on Err, so we
+    // render `tmp.err`; `.unwrap_err()` panics on Ok, so we render `tmp.ok`.
+    let panic_field = if is_ok { "err" } else { "ok" }
+    let rendered = render_result_arm_value(other_t, other_s, "{tmp}.{panic_field}")
+    // The guard is byte-identical across every inner-type branch and always
+    // precedes the value binding, so emit it once here. Branches differ only in
+    // how they bind and type the success value.
+    emit_panic_tag_check_render(tmp, panic_tag, panic_msg, rendered, node)
     if inner_s != "" && is_compound_ct(inner_t) == 0 {
-        emit_panic_tag_check(tmp, panic_tag, panic_msg, node)
         let val_tmp = fresh_temp(if is_ok { "_runv_" } else { "_ruerr_" })
         emit_line("{c_type_c_name(inner_s)} {val_tmp} = {tmp}.{field};")
         set_var_struct(val_tmp, inner_s)
         expr_result_str = val_tmp
         expr_result_type = CT_VOID
     } else if inner_t == CT_STRING {
-        emit_panic_tag_check(tmp, panic_tag, panic_msg, node)
         expr_result_str = "{tmp}.{field}"
         expr_result_type = CT_STRING
     } else if inner_t == CT_LIST {
-        emit_panic_tag_check(tmp, panic_tag, panic_msg, node)
         let val_tmp = fresh_temp(if is_ok { "_runv_" } else { "_ruerr_" })
         emit_line("blink_list* {val_tmp} = {tmp}.{field};")
         set_var(val_tmp, CT_LIST, 0)
@@ -160,21 +177,18 @@ fn emit_result_unwrap_inner(
         expr_result_str = val_tmp
         expr_result_type = CT_LIST
     } else if inner_t == CT_MAP {
-        emit_panic_tag_check(tmp, panic_tag, panic_msg, node)
         let val_tmp = fresh_temp(if is_ok { "_runv_" } else { "_ruerr_" })
         emit_line("blink_map* {val_tmp} = {tmp}.{field};")
         set_var(val_tmp, CT_MAP, 0)
         expr_result_str = val_tmp
         expr_result_type = CT_MAP
     } else if inner_t == CT_BYTES {
-        emit_panic_tag_check(tmp, panic_tag, panic_msg, node)
         let val_tmp = fresh_temp(if is_ok { "_runv_" } else { "_ruerr_" })
         emit_line("blink_bytes* {val_tmp} = {tmp}.{field};")
         set_var(val_tmp, CT_BYTES, 0)
         expr_result_str = val_tmp
         expr_result_type = CT_BYTES
     } else if propagate_option != 0 && inner_t == CT_OPTION && inner_s != "" {
-        emit_panic_tag_check(tmp, panic_tag, panic_msg, node)
         let val_tmp = fresh_temp(if is_ok { "_runv_" } else { "_ruerr_" })
         emit_line("{c_type_c_name(inner_s)} {val_tmp} = {tmp}.{field};")
         set_var(val_tmp, CT_OPTION, 0)
@@ -188,7 +202,6 @@ fn emit_result_unwrap_inner(
         expr_result_str = val_tmp
         expr_result_type = CT_OPTION
     } else {
-        emit_panic_tag_check(tmp, panic_tag, panic_msg, node)
         expr_result_str = "{tmp}.{field}"
         if inner_t == CT_FLOAT {
             expr_result_type = CT_FLOAT
@@ -3678,8 +3691,15 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             let ok_elem = if sv_elem != -1 { sv_elem } else { expr_list_elem_type }
             let sv_elem_s = get_var_result_ok_elem_struct(obj_str)
             let ok_elem_s = if sv_elem_s != "" { sv_elem_s } else { expr_list_elem_struct }
+            // The panicked-on arm is the err arm; fetch its type/struct to render
+            // the value embedded in the panic message.
+            let sv_err = get_var_result_err(obj_str)
+            let err_t = if sv_err != -1 { sv_err } else { expr_result_err_type }
+            let sv_err_s = get_var_result_err_struct(obj_str)
+            let err_s = if sv_err_s != "" { sv_err_s } else { expr_result_err_struct }
             emit_result_unwrap_inner(
                 obj_str, node, ok_t, ok_s, "ok", ok_elem, ok_elem_s, 1,
+                err_t, err_s,
             )
             return
         }
@@ -3688,8 +3708,15 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             let err_t = if sv_err != -1 { sv_err } else { expr_result_err_type }
             let sv_err_s = get_var_result_err_struct(obj_str)
             let err_s = if sv_err_s != "" { sv_err_s } else { expr_result_err_struct }
+            // The panicked-on arm is the ok arm; fetch its type/struct to render
+            // the value embedded in the panic message.
+            let sv_ok = get_var_result_ok(obj_str)
+            let ok_t = if sv_ok != -1 { sv_ok } else { expr_result_ok_type }
+            let sv_ok_s = get_var_result_ok_struct(obj_str)
+            let ok_s = if sv_ok_s != "" { sv_ok_s } else { expr_result_ok_struct }
             emit_result_unwrap_inner(
                 obj_str, node, err_t, err_s, "err", -1, "", 0,
+                ok_t, ok_s,
             )
             return
         }

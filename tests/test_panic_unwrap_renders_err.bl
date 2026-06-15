@@ -1,0 +1,82 @@
+// kh3rct: .unwrap() / .unwrap_err() panic messages must embed the
+// Display-rendered value of the panicked-on arm.
+//
+//   .unwrap()     on Err(e) -> "panic: unwrap called on Err: <rendered> at file:line"
+//   .unwrap_err() on Ok(v)  -> "panic: unwrap_err called on Ok: <rendered> at file:line"
+//
+// Three cases are exercised against a freshly-built `blink run`:
+//   1. struct Err with `impl Display` (token "boom-42")
+//   2. scalar Str Err ("disk full")
+//   3. .unwrap_err() on a Display-able Ok value
+//
+// Each must still embed the file:line location (regression guard for the
+// existing panic-location behavior).
+
+fn run_case(blink_root: Str, base: Str, util_src: Str) -> Str {
+    shell_exec("rm -rf {base}")
+    shell_exec("mkdir -p {base}/src")
+    write_file("{base}/blink.toml", "[package]\nname = \"unwraprender\"\nversion = \"0.1.0\"\n\n[dependencies]\n")
+    write_file("{base}/src/util.bl", util_src)
+    let main_src = "import util.\{boom\}\n\nfn main() \{\n    io.println(boom())\n\}\n"
+    write_file("{base}/src/main.bl", main_src)
+    let cmd = "cd {base} && {blink_root}/build/blink run src/main.bl 2>&1"
+    let result = process_run("sh", ["-c", cmd])
+    let combined = "{result.out}{result.err_out}"
+    shell_exec("rm -rf {base}")
+    return combined
+}
+
+fn main() {
+    let pwd_res = process_run("sh", ["-c", "pwd -P"])
+    let blink_root = pwd_res.out.trim_right()
+    let pid = getpid()
+
+    // Case 1: struct Err with impl Display.
+    let case1_util = "type MyErr \{ code: Int }\n\nimpl Display for MyErr \{\n    fn fmt(self, sb: StringBuilder) \{ sb.write(\"boom-\{self.code}\") \}\n\}\n\nfn make() -> Result[Int, MyErr] \{\n    return Err(MyErr \{ code: 42 \})\n\}\n\npub fn boom() -> Int \{\n    let r = make()\n    return r.unwrap()\n\}\n"
+    let c1 = run_case(blink_root, ".tmp/_test_unwrap_render_c1_{pid}", case1_util)
+    if !c1.contains("unwrap called on Err") {
+        io.println("FAIL case1: expected 'unwrap called on Err', got:")
+        io.println(c1)
+        return
+    }
+    if !c1.contains("boom-42") {
+        io.println("FAIL case1: expected rendered Err value 'boom-42', got:")
+        io.println(c1)
+        return
+    }
+    if !c1.contains("util.bl:") {
+        io.println("FAIL case1: expected file:line location (util.bl:), got:")
+        io.println(c1)
+        return
+    }
+
+    // Case 2: scalar Str Err.
+    let case2_util = "pub fn boom() -> Int \{\n    let r: Result[Int, Str] = Err(\"disk full\")\n    return r.unwrap()\n\}\n"
+    let c2 = run_case(blink_root, ".tmp/_test_unwrap_render_c2_{pid}", case2_util)
+    if !c2.contains("unwrap called on Err") {
+        io.println("FAIL case2: expected 'unwrap called on Err', got:")
+        io.println(c2)
+        return
+    }
+    if !c2.contains("disk full") {
+        io.println("FAIL case2: expected rendered Err value 'disk full', got:")
+        io.println(c2)
+        return
+    }
+
+    // Case 3: .unwrap_err() on a Display-able Ok value (scalar Int).
+    let case3_util = "pub fn boom() -> Int \{\n    let r: Result[Int, Str] = Ok(777)\n    let _e = r.unwrap_err()\n    return 0\n\}\n"
+    let c3 = run_case(blink_root, ".tmp/_test_unwrap_render_c3_{pid}", case3_util)
+    if !c3.contains("unwrap_err called on Ok") {
+        io.println("FAIL case3: expected 'unwrap_err called on Ok', got:")
+        io.println(c3)
+        return
+    }
+    if !c3.contains("777") {
+        io.println("FAIL case3: expected rendered Ok value '777', got:")
+        io.println(c3)
+        return
+    }
+
+    io.println("PASS: unwrap/unwrap_err panics embed the rendered arm value")
+}

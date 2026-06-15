@@ -37,7 +37,6 @@ pub const QM_ERROR_MISMATCH       = "E0512"
 pub const COALESCE_REQUIRES_OPT   = "E0513"
 pub const QM_TEST_DISPLAY_REQUIRED = "E0514"
 pub const TEST_ANNOTATED_RETURN   = "E0515"
-pub const SKIP_OUTSIDE_TEST_BODY  = "E0516"
 pub const BARE_GENERIC_FN_AS_VALUE = "E0517"
 pub const NAME_COLLISION          = "E0518"
 pub const AMBIGUOUS_CONSTRUCTION  = "E0519"
@@ -79,9 +78,9 @@ pub const FFI_OFFSET_UNKNOWN_STRIDE = "E0822"
 pub const CLEANUP_PANICKED_DURING_UNWIND = "E0824"
 
 // E0827, E0831-E0834 — test runner diagnostics (br cbk2wq)
-// E0827 is the spec-canonical short-name for "skip() called outside a test".
-// Compiler still emits E0516 (SkipOutsideTestBody) at the typecheck site; the
-// two names refer to the same condition pending a one-release migration.
+// E0827 is the sole live code for "skip() called outside a test"; it is
+// emitted at the typecheck site via the §2.20 test-only symbol fence
+// (is_test_only_symbol / tc_fence_test_only_symbol in src/typecheck.bl).
 pub const SKIP_OUTSIDE_TEST                = "E0827"
 // E0831-E0834 reserved for assert_panics; assert_panics is not yet
 // implemented in the parser/typecheck/stdlib (see decisions/std-testing-user-api.md Q4),
@@ -658,9 +657,6 @@ pub fn diag_explain(code: Str) -> Str {
     if code == TEST_ANNOTATED_RETURN {
         return "E0515 -- AnnotatedTestReturnTypeRejected\n\nA test block declared an explicit return type with '->'. Test bodies\ndo not name their return type: if the body uses '?' anywhere, it is\nimplicitly elaborated to Result[Void, TestError]; otherwise the\nimplicit return type is Void. User-supplied return annotations are\nrejected to keep the rule unambiguous.\n\nFix: remove the '-> ...' annotation.\n\n  test \"x\" \{ ... \}                       // OK\n  test \"x\" -> Result[Void, Str] \{ ... \}  // E0515 -- drop the arrow"
     }
-    if code == SKIP_OUTSIDE_TEST_BODY {
-        return "E0516 -- SkipOutsideTestBody\n\nskip() is a test-only helper that marks the current test as skipped\nand triggers Result-sentinel propagation back to the test runner. It\nis only meaningful inside a 'test \{ ... }' block; calling it from\nmain(), a regular function, or any non-test context is rejected.\n\nFix: move the call into a test block, or use a different control-flow\nprimitive (return / Err / exit) outside tests.\n\n  test \"network-bound\" \{\n      if !have_network() \{ skip(\"requires network\") }\n      // ... test body ...\n  \}\n\n  fn helper() \{ skip(\"nope\") }  // E0516 -- not in a test body"
-    }
     if code == BARE_GENERIC_FN_AS_VALUE {
         return "E0517 -- BareGenericFnAsValue\n\nA generic function 'fn name[T](...)' was passed by bare name as a\nclosure-typed argument. Generic functions are templates and have no\nsingle C-level signature, so codegen cannot synthesize a closure\nshim for a bare reference without picking a specific instantiation.\n\nFix: wrap the call in a closure literal that names the type, which\nlets the type-args flow from context.\n\n  fn identity[T](x: T) -> T \{ x }\n  fn take(f: fn(Int) -> Int) -> Int \{ f(7) }\n\n  take(identity)             // E0517 -- bare generic fn as value\n  take(\{ x => identity(x) }) // OK -- closure literal monomorphizes\n\nNon-generic fns may be passed by bare name; only generics need the\nwrapping closure literal."
     }
@@ -827,7 +823,7 @@ pub fn diag_explain(code: Str) -> Str {
         return "E0824 -- CleanupPanickedDuringUnwind\n\nA `BlockHandler.exit(false)` body or `Closeable.close()` body itself\npanicked while running on a catchable-unwind path (`?` propagation,\n`return`, assertion failure, or `skip()`). The original panic is the\nload-bearing failure — the test runner reports it as the test's\nresult and preserves it as the unwind cause. The cleanup panic is\nrecorded as a secondary warning on the same trace frame so the\nauthor can fix the cleanup bug without losing the primary cause.\n\nOn a stacked `with...as` chain, remaining handlers in the LIFO stack\nstill run (continue-drain ordering, per the multi-cleanup test\nregistrar decision); short-circuiting would leak resources held by\ndeeper-stacked handlers.\n\nFix: make the cleanup body robust to partially-initialized state.\nGuard mutating calls behind `if !ok \{ ... }` if they only make\nsense on the success path, and avoid raising new panics from inside\nan `exit`/`close` body.\n\n  type Tx \{ committed: Bool }\n  impl BlockHandler for Tx \{\n      fn exit(self, ok: Bool) \{\n          if ok \{ self.commit() } else \{ self.rollback() }\n          // a panic in commit/rollback here surfaces as E0824 warning\n      }\n  }"
     }
     if code == SKIP_OUTSIDE_TEST {
-        return "E0827 -- SkipOutsideTest\n\nspec-canonical alias for the SkipOutsideTestBody check (E0516).\n`skip()` is a test-only helper; calling it from `main()`, a regular\nfunction, or any non-test context is rejected.\n\nThe compiler currently emits E0516 at the typecheck site; both codes\nname the same condition pending a one-release rename. See the\nE0516 entry for the long-form explanation and examples."
+        return "E0827 -- SkipOutsideTest\n\nskip() is a test-only helper that marks the current test as skipped\nand triggers Result-sentinel propagation back to the test runner. It\nis only meaningful inside a 'test \{ ... }' block; calling it from\nmain(), a regular function, or any non-test context is rejected.\n\nFix: move the call into a test block, or use a different control-flow\nprimitive (return / Err / exit) outside tests.\n\n  test \"network-bound\" \{\n      if !have_network() \{ skip(\"requires network\") }\n      // ... test body ...\n  \}\n\n  fn helper() \{ skip(\"nope\") }  // E0827 -- not in a test body"
     }
     if code == ASSERT_PANICS_BODY_RETURNED {
         return "E0831 -- AssertPanicsBodyReturned\n\nThe body passed to `assert_panics` returned normally instead of\npanicking. `assert_panics` requires its body to terminate with a\npanic (assertion failure, explicit `panic(_)`, or any other\nunwinding failure); a normal return is a test failure.\n\nFix: ensure the body actually triggers the expected panic, or\nremove the `assert_panics` wrapper if no panic is expected.\n\n  test \"divides by zero panics\" \{\n      assert_panics(\{ \n          let _ = 10 / 0      // expected panic\n      })\n  }\n\nNote: `assert_panics` is not yet implemented (see br cbk2wq);\nthis diagnostic is catalog-only until the feature lands."
