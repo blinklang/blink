@@ -3021,6 +3021,19 @@ fn nr_check_shadow(name: Str, node: Int) ! Diag.Report {
         idx = nr_scope_prev.get(idx).unwrap()
         if idx == -1 { return }
     }
+    // A local binding that "shadows" a same-named top-level symbol from a
+    // DIFFERENT module is not a real lexical shadow — it's a cross-module name
+    // collision (e.g. a stdlib param colliding with a user's top-level free
+    // fn). Suppress W0603 only in that case (br xfbezd). A genuine same-module
+    // top-level shadow (a function-local rebinding a module-level let/fn) still
+    // warns. Module unknown ("") ⇒ warn (conservative; preserves prior behavior).
+    if nr_scope_frames.len() >= 2 {
+        let first_inner = nr_scope_frames.get(1).unwrap()
+        if idx < first_inner {
+            let sym_mod = tc_get_symbol_module(name)
+            if sym_mod != "" && sym_mod != nr_current_module { return }
+        }
+    }
     diag_warn_at("ShadowedVariable", SHADOWED_VARIABLE, "variable '{name}' shadows a variable from an outer scope", node, "rename the variable or prefix with '_' to suppress")
 }
 
@@ -3076,6 +3089,25 @@ fn nr_is_defined(name: Str) -> Int {
         None => {}
     }
     0
+}
+
+// Whether `name`'s current top binding lives in the global frame (depth 1).
+// A cross-module private-access violation can only legitimately apply to a
+// real top-level free-fn/let reference (global frame); when a name resolves to
+// an inner frame (a param/local that merely shadows a same-named private
+// top-level symbol in another module) it is NOT a cross-module access, so
+// E1003 must not fire (br xfbezd). Pure inspection — must not call
+// nr_is_defined (which has read/capture side effects).
+fn nr_top_binding_is_global(name: Str) -> Int {
+    let idx = match nr_name_top.get(name) {
+        Some(i) => i
+        None => return 0
+    }
+    if nr_scope_frames.len() < 2 {
+        return 1
+    }
+    let first_inner = nr_scope_frames.get(1).unwrap()
+    if idx < first_inner { 1 } else { 0 }
 }
 
 fn nr_is_mut(name: Str) -> Int {
@@ -4295,7 +4327,7 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         if name == "true" || name == "false" || name == "None" { return }
         if nr_is_defined(name) != 0 {
             if nr_check_selective_access(name, node) != 0 { return }
-            if is_private_access(name) != 0 {
+            if nr_top_binding_is_global(name) != 0 && is_private_access(name) != 0 {
                 tc_errors.push("cannot access private item '{name}'")
                 diag_error_at("PrivateItemAccess", PRIVATE_ITEM_ACCESS, "cannot access private item '{name}' from another module", node, "mark the item as 'pub' in its module")
                 return
@@ -4374,10 +4406,10 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             if callee_kind == NodeKind.Ident {
                 let fn_name = node_name(callee)
                 if nr_check_selective_access(fn_name, node) == 0 {
-                    if nr_is_defined(fn_name) != 0 && is_private_access(fn_name) != 0 {
+                    if nr_is_defined(fn_name) != 0 && nr_top_binding_is_global(fn_name) != 0 && is_private_access(fn_name) != 0 {
                         tc_errors.push("cannot access private function '{fn_name}'")
                         diag_error_at("PrivateItemAccess", PRIVATE_ITEM_ACCESS, "cannot access private function '{fn_name}' from another module", node, "mark the function as 'pub' in its module")
-                    } else if is_variant_name(fn_name) != 0 && is_private_access(fn_name) != 0 {
+                    } else if nr_is_defined(fn_name) == 0 && is_variant_name(fn_name) != 0 && is_private_access(fn_name) != 0 {
                         tc_errors.push("cannot access private variant '{fn_name}'")
                         diag_error_at("PrivateItemAccess", PRIVATE_ITEM_ACCESS, "cannot access private variant '{fn_name}' from another module", node, "mark the enum as 'pub' in its module")
                     } else if nr_is_unimported_prelude_free_fn(fn_name) != 0 {
