@@ -1,0 +1,28 @@
+// m7mh29 -- §4.6.3 (normative): an armed assert_panics is per-test thread-local
+// state. It must NOT catch a sibling spawned task's panic.
+//
+// The spawned task runs on a pool worker thread where __blink_panic_armed == 0,
+// so its panic takes the unarmed branch (fprintf;exit(1)) and faults the whole
+// process deterministically during scope-exit join (spec §04_effects.md: scope
+// exit waits for spawned tasks; a task panic propagates to the scope) -- before
+// the parent body returns. The parent's catch frame lives on a different thread
+// and is never longjmp'd into. So we assert on exit_code + stdout, not on a
+// parsed parent-frame JSON status (the process may die before clean JSON).
+//
+// The `!status:pass` assertion is the load-bearing one: a `status:pass` would
+// mean the parent assert_panics wrongly swallowed the sibling's panic.
+
+import compile_test_helpers.{compile_and_run_test_json}
+
+test "armed assert_panics does not catch a sibling task's panic" {
+    let src = "test \"t\" \{\n    assert_panics \{\n        async.scope \{\n            let _ = async.spawn(fn() \{\n                let xs: [Int] = []\n                let _ = xs.get(99).unwrap()\n                0\n            }).await\n        }\n    }\n}\n"
+    let r = compile_and_run_test_json(src, "_m7mh29_isolation")
+    // Load-bearing: the sibling task's panic must escape as a process fault, NOT
+    // be swallowed into a parent-frame pass. exit_code + absence of status:pass
+    // alone would also be satisfied by a fixture that fails to COMPILE, so we
+    // also require the runtime panic message on stderr to prove the spawned task
+    // actually ran and faulted (the unarmed-terminate path on the worker thread).
+    assert(r.exit_code != 0)
+    assert(!r.out.contains("\"status\":\"pass\""))
+    assert(r.err_out.contains("None"))
+}

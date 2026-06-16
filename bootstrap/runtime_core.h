@@ -434,12 +434,7 @@ BLINK_RT_FN void* blink_list_get(const blink_list* l, int64_t index);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN void* blink_list_get(const blink_list* l, int64_t index) {
     if (index < 0 || index >= l->len) {
-#ifdef BLINK_TEST_BUILD
         __blink_panic_dispatchf("blink: list index out of bounds: idx=%lld len=%lld", (long long)index, (long long)l->len);
-#else
-        fprintf(stderr, "blink: list index out of bounds: idx=%lld len=%lld\n", (long long)index, (long long)l->len);
-        exit(1);
-#endif
     }
     return l->items[index];
 }
@@ -463,12 +458,7 @@ BLINK_RT_FN void blink_list_set(blink_list* l, int64_t index, void* item);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN void blink_list_set(blink_list* l, int64_t index, void* item) {
     if (index < 0 || index >= l->len) {
-#ifdef BLINK_TEST_BUILD
         __blink_panic_dispatchf("blink: list set index out of bounds: %lld", (long long)index);
-#else
-        fprintf(stderr, "blink: list set index out of bounds: %lld\n", (long long)index);
-        exit(1);
-#endif
     }
     l->items[index] = item;
 }
@@ -478,12 +468,7 @@ BLINK_RT_FN void* blink_list_pop(blink_list* l);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN void* blink_list_pop(blink_list* l) {
     if (l->len <= 0) {
-#ifdef BLINK_TEST_BUILD
         __blink_panic_dispatch("blink: list pop on empty list");
-#else
-        fprintf(stderr, "blink: list pop on empty list\n");
-        exit(1);
-#endif
     }
     l->len--;
     return l->items[l->len];
@@ -1154,12 +1139,7 @@ BLINK_RT_FN void blink_bytes_set(blink_bytes* b, int64_t index, int64_t byte);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN void blink_bytes_set(blink_bytes* b, int64_t index, int64_t byte) {
     if (index < 0 || index >= b->len) {
-#ifdef BLINK_TEST_BUILD
         __blink_panic_dispatchf("blink: bytes set index out of bounds: %lld", (long long)index);
-#else
-        fprintf(stderr, "blink: bytes set index out of bounds: %lld\n", (long long)index);
-        exit(1);
-#endif
     }
     b->data[index] = (uint8_t)(byte & 0xFF);
 }
@@ -2007,12 +1987,7 @@ BLINK_RT_FN const char* blink_get_arg(int64_t index);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN const char* blink_get_arg(int64_t index) {
     if (index < 0 || index >= blink_g_argc) {
-#ifdef BLINK_TEST_BUILD
         __blink_panic_dispatchf("blink: arg index out of bounds: %lld", (long long)index);
-#else
-        fprintf(stderr, "blink: arg index out of bounds: %lld\n", (long long)index);
-        exit(1);
-#endif
     }
     return blink_g_argv[index];
 }
