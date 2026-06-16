@@ -40,7 +40,7 @@ import compiler.{
 }
 import codegen.{Codegen, generate, generate_archive_header, generate_module_header, generate_module_object, enumerate_program_modules, cg_debug_mode, cg_trace_codegen, cg_deterministic}
 import codegen_types.{cg_emit_only_module, cg_skip_modules, cg_user_tu_mode, cg_blink_ev_extern_only, list_contains_str}
-import build_stdlib.{build_stdlib_archive, list_stdlib_module_keys, resolve_blinkc_path}
+import build_stdlib.{build_stdlib_archive, list_stdlib_module_keys, resolve_blinkc_path, resolve_runtime_h}
 import stdlib_native_deps.{
     stdlib_native_dep_names, stdlib_native_dep_gate_macro, stdlib_native_dep_source_paths,
     stdlib_native_dep_header_dir, stdlib_native_dep_compile_defs, stdlib_native_dep_link_flag_dynamic,
@@ -57,7 +57,7 @@ import diagnostics.{
     Diag, diag_count, diag_warn_count, diag_ice_count, diag_flush, diag_reset,
     diag_source_file, diag_error_no_loc, diag_format, diag_explain,
     embedded_inner_key,
-    MISSING_NATIVE_DEP, NATIVE_DEP_UNAVAILABLE_CROSS,
+    MISSING_NATIVE_DEP, NATIVE_DEP_UNAVAILABLE_CROSS, INCOMPATIBLE_STDLIB_ARCHIVE,
 }
 import daemon.{Daemon, daemon_start}
 import docgen.{generate_doc}
@@ -66,7 +66,7 @@ import comment_attach.{attach_comments_pass}
 // Generated registry; refresh via scripts/gen_embedded_stdlib.sh (auto-run by `task regen`).
 import embedded_stdlib_registry.{init_embedded_stdlib}
 
-let blink_cli_version: Str = "dev"
+pub let blink_cli_version: Str = "dev"
 const embedded_llms_full: Str = #embed("../llms-full.md")
 const embedded_llms_short: Str = #embed("../llms.md")
 const embedded_changelog: Str = #embed("../CHANGELOG.md")
@@ -850,7 +850,7 @@ let mut cached_blinkc_sha_init: Int = 0
 let mut cached_cc_id: Str = ""
 let mut cached_cc_id_init: Int = 0
 
-fn sha256_of_file_first(path: Str) -> Str {
+pub fn sha256_of_file_first(path: Str) -> Str {
     if path == "" || file_exists(path) == 0 {
         return ""
     }
@@ -858,7 +858,7 @@ fn sha256_of_file_first(path: Str) -> Str {
     r.out.trim()
 }
 
-fn process_blinkc_sha() -> Str {
+pub fn process_blinkc_sha() -> Str {
     if cached_blinkc_sha_init == 0 {
         cached_blinkc_sha = sha256_of_file_first(resolve_blinkc_path())
         cached_blinkc_sha_init = 1
@@ -920,7 +920,63 @@ fn cache_compile_user_c(c_path: Str, debug_mode: Int, release_mode: Int, target:
     "{dir}/{key}.o"
 }
 
-fn do_link_target(out: Str, c_path: Str, link_flags: Str, obj_files: List[Str], include_flags: Str, debug_mode: Int, release_mode: Int, target: Str) -> Int {
+fn sha8(sha: Str) -> Str {
+    if sha.len() >= 8 { sha.substring(0, 8) } else { sha }
+}
+
+// Reject a stale *installed* stdlib archive before it can be linked into a
+// user binary. The dev `build/` archive lives at build/std-cache/<hash>/ and
+// is self-consistent by construction (the hash is sha256 of compiler binary +
+// stdlib sources + runtime.h + cc version), so it needs no check. An
+// *installed* archive (copied out of the cache into <prefix>/share/blink/,
+// losing the hash-named directory) carries a `.archive-id` stamp instead:
+// runtime.h SHA | blinkc SHA | version.
+//
+// The decisive checks are the runtime.h SHA and the archive-header
+// (libblink_std.h) SHA. BOTH headers are #included by the freshly emitted user
+// TU and define the structs it shares with the archive's monolith.o:
+// runtime.h carries the runtime struct layouts; libblink_std.h carries the
+// stdlib struct typedefs (e.g. the db Row that surfaced br 105z02, std.args.*)
+// which are emitted by codegen and so can diverge when the compiler changes
+// even if runtime.h is byte-identical. If either disagrees, boxed values are
+// read at the wrong offsets and the binary corrupts memory at runtime (the
+// reported Option[Row] UAF was exactly this skew: a stale 161789-byte install
+// vs the current 172853-byte runtime.h). Both headers are resolvable on the
+// link side (they ship next to the archive in share/blink/), so both are
+// re-checked. The blinkc SHA is recorded for forensics but NOT re-checked —
+// an installed tree ships only `bin/blink`, no `blinkc` to hash — and is
+// unnecessary once both header surfaces are pinned. The version is shown in
+// the diagnostic only.
+//
+// Returns 0 when the link may proceed (dev archive, or matching installed
+// stamp), 1 when an installed archive is incompatible or unstamped (a
+// diagnostic is emitted and the caller must not produce a binary).
+fn verify_installed_archive(arc_dir: Str) -> Int ! Diag.Report {
+    if !arc_dir.ends_with("share/blink") {
+        return 0
+    }
+    let stamp_path = path_join(arc_dir, ".archive-id")
+    let cur_rt_sha = sha256_of_file_first(resolve_runtime_h())
+    let cur_hdr_sha = sha256_of_file_first(path_join(arc_dir, "libblink_std.h"))
+    if file_exists(stamp_path) == 0 {
+        diag_error_no_loc("IncompatibleStdlibArchive", INCOMPATIBLE_STDLIB_ARCHIVE, "installed stdlib archive is missing its identity stamp ({stamp_path})", "reinstall: task install   (or rebuild against the current toolchain)")
+        diag_flush()
+        return 1
+    }
+    let stamp = read_file(stamp_path).trim()
+    let parts = stamp.split("|")
+    let arc_rt_sha = if parts.len() > 0 { parts.get(0).unwrap() } else { "" }
+    let arc_hdr_sha = if parts.len() > 1 { parts.get(1).unwrap() } else { "" }
+    let arc_ver = if parts.len() > 3 { parts.get(3).unwrap() } else { "?" }
+    if arc_rt_sha == cur_rt_sha && arc_hdr_sha == cur_hdr_sha {
+        return 0
+    }
+    diag_error_no_loc("IncompatibleStdlibArchive", INCOMPATIBLE_STDLIB_ARCHIVE, "installed stdlib archive is incompatible with this compiler\n  archive built by blink {arc_ver} (runtime {sha8(arc_rt_sha)}, header {sha8(arc_hdr_sha)}), current blink is {blink_cli_version} (runtime {sha8(cur_rt_sha)}, header {sha8(cur_hdr_sha)})", "reinstall: task install   (or rebuild against the current toolchain)")
+    diag_flush()
+    1
+}
+
+fn do_link_target(out: Str, c_path: Str, link_flags: Str, obj_files: List[Str], include_flags: Str, debug_mode: Int, release_mode: Int, target: Str) -> Int ! Diag.Report {
     let mut objs = ""
     if obj_files.len() > 0 {
         objs = " {obj_files.join(" ")}"
@@ -930,6 +986,10 @@ fn do_link_target(out: Str, c_path: Str, link_flags: Str, obj_files: List[Str], 
         includes = " {include_flags}"
     }
     let arc_dir = resolve_archive_dir()
+    let vrc = verify_installed_archive(arc_dir)
+    if vrc != 0 {
+        return vrc
+    }
     let archive = " -I{arc_dir} {arc_dir}/libblink_std.a -Wl,--gc-sections"
     let mut effective_link_flags = link_flags
     // obj_files / include_flags carry per-build vendored deps the caller

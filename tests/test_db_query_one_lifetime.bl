@@ -1,0 +1,32 @@
+import std.db { DB }
+
+// Regression for 105z02: holding the columns of a FIRST query_one() row alive in
+// live let-bindings, then reading a SECOND query_one() (via a helper) returned a
+// dangling Row in released v0.49.0 — rendering "(null)" then SIGSEGV.
+fn name_via_query_one(id: Str) -> Str {
+    let row = db.query_one("SELECT p.name FROM projects p JOIN tasks t ON t.project_id = p.id WHERE t.id = {id}").unwrap()
+    match row {
+        Some(r) => r.get_at(0) ?? ""
+        None => ""
+    }
+}
+
+test "query_one row survives a second query_one held across live bindings" {
+    with db.connect(":memory:") {
+        db.exec("CREATE TABLE projects (id TEXT PRIMARY KEY, name TEXT)").unwrap()
+        db.exec("CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, closed_at TEXT, project_id TEXT)").unwrap()
+        db.exec("INSERT INTO projects (id, name) VALUES ('p1', 'demo')").unwrap()
+        db.exec("INSERT INTO tasks (id, title, project_id) VALUES ('jt', 'Joined', 'p1')").unwrap()
+
+        let id = "jt"
+        let detail = db.query_one("SELECT id, title, closed_at FROM tasks WHERE id = {id}").unwrap().unwrap()
+        let title = detail.get_at(1) ?? ""
+        let closed_at = detail.get_at(2) ?? ""
+        let project = name_via_query_one(id)
+
+        assert_eq(title, "Joined")
+        assert_eq(closed_at, "")
+        assert_eq(project, "demo")
+        assert_eq(project.len(), 4)
+    }
+}

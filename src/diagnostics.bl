@@ -90,6 +90,15 @@ pub const ASSERT_PANICS_MESSAGE_MISMATCH   = "E0832"
 pub const ASSERT_PANICS_OUTSIDE_TEST       = "E0833"
 pub const ASSERT_PANICS_NESTED_EXPECT_PANIC = "E0834"
 
+// E0840+ — toolchain / link integrity
+// Guards the ABI-skew class of bug where a stdlib archive that is stale
+// relative to the linking compiler is silently linked into a user binary,
+// producing a memory-corrupting executable (br 105z02). The installed
+// archive carries a `.archive-id` stamp (runtime.h SHA | libblink_std.h SHA |
+// blinkc SHA | version); do_link_target verifies both header SHAs before
+// producing a binary.
+pub const INCOMPATIBLE_STDLIB_ARCHIVE = "E0840"
+
 // E0900–E0906 — trait contract (one short-name spans 7 codes)
 pub const TRAIT_CONTRACT_900 = "E0900"
 pub const TRAIT_CONTRACT_901 = "E0901"
@@ -818,6 +827,9 @@ pub fn diag_explain(code: Str) -> Str {
     }
     if code == FFI_OFFSET_UNKNOWN_STRIDE {
         return "E0822 -- FfiOffsetUnknownStride\n\nPtr.offset(i) requires the pointer's element type to be an\n@ffi.struct typedef so the stride (size in bytes) is known at\ncompile time. Pointers to opaque or non-FFI types cannot be\nadvanced safely.\n\nFix: use Ptr[T] where T is annotated @ffi.struct.\n\n  @ffi.struct(header: \"poll.h\", name: \"pollfd\")\n  pub type Pollfd \{ fd: I32, events: I16, revents: I16 \}\n  let p: Ptr[Pollfd] = scope.alloc_n(8)\n  let q = p.offset(3)   // OK -- stride = sizeof(pollfd)"
+    }
+    if code == INCOMPATIBLE_STDLIB_ARCHIVE {
+        return "E0840 -- IncompatibleStdlibArchive\n\nThe installed stdlib archive (libblink_std.a in\n<prefix>/share/blink/) was built by a different blink toolchain\nthan the one now linking your program. The archive and the freshly\nemitted C disagree on struct layout / runtime ABI; linking them\nwould produce a binary that reads boxed values at the wrong offsets\nand corrupts memory at runtime (dangling reads, SIGSEGV).\n\nThe archive carries a `.archive-id` stamp (runtime.h SHA |\nlibblink_std.h SHA | blinkc SHA | version). The decisive checks are\nthe two header SHAs -- runtime.h and libblink_std.h together define\nevery struct layout the user TU shares with the archive. When the\nlinking compiler's resolved headers do not match the stamp, the\nlink is rejected before a binary is produced. (An installed tree\nships no blinkc, so its SHA is recorded for forensics only.)\n\nFix: reinstall the stdlib so the archive matches the compiler:\n\n  task install\n\nOr rebuild against the current toolchain. If you see this from a\nrelease tarball, the tarball's bin/ and share/blink/ are mismatched\n-- reinstall a consistent release."
     }
     if code == CLEANUP_PANICKED_DURING_UNWIND {
         return "E0824 -- CleanupPanickedDuringUnwind\n\nA `BlockHandler.exit(false)` body or `Closeable.close()` body itself\npanicked while running on a catchable-unwind path (`?` propagation,\n`return`, assertion failure, or `skip()`). The original panic is the\nload-bearing failure — the test runner reports it as the test's\nresult and preserves it as the unwind cause. The cleanup panic is\nrecorded as a secondary warning on the same trace frame so the\nauthor can fix the cleanup bug without losing the primary cause.\n\nOn a stacked `with...as` chain, remaining handlers in the LIFO stack\nstill run (continue-drain ordering, per the multi-cleanup test\nregistrar decision); short-circuiting would leak resources held by\ndeeper-stacked handlers.\n\nFix: make the cleanup body robust to partially-initialized state.\nGuard mutating calls behind `if !ok \{ ... }` if they only make\nsense on the success path, and avoid raising new panics from inside\nan `exit`/`close` body.\n\n  type Tx \{ committed: Bool }\n  impl BlockHandler for Tx \{\n      fn exit(self, ok: Bool) \{\n          if ok \{ self.commit() } else \{ self.rollback() }\n          // a panic in commit/rollback here surfaces as E0824 warning\n      }\n  }"

@@ -115,6 +115,13 @@ $sudo_cmd cp "$src/share/blink/libblink_std.a" \
             "$src/share/blink/libblink_std.h" \
             "$src/share/blink/runtime.h" \
             "$PREFIX/share/blink/"
+# Identity stamp: the installed blink verifies this against its own runtime.h
+# SHA at link time and rejects a stale/mismatched archive instead of silently
+# linking an ABI-skewed (memory-corrupting) binary (br 105z02). Guard for
+# absence so an older tarball (pre-stamp) still installs.
+if [ -f "$src/share/blink/.archive-id" ]; then
+    $sudo_cmd cp "$src/share/blink/.archive-id" "$PREFIX/share/blink/"
+fi
 # Peeled native deps (e.g. sqlite3) ship as a sidecar under
 # share/blink/native/<name>/. Programs that import a peeled stdlib module
 # (e.g. std.db_sqlite) need the vendored C source at compile time;

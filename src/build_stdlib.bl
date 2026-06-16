@@ -17,7 +17,7 @@ import codegen.{Codegen, generate, generate_archive_header}
 import codegen_types.{cg_emit_only_module, cg_skip_modules, cg_archive_build_mode, list_contains_str}
 import mutation_analysis.{analyze_mutations, analyze_save_restore}
 import diagnostics.{Diag, diag_count, diag_ice_count, diag_flush}
-import cli.{resolve_install_root, run_cc}
+import cli.{resolve_install_root, run_cc, sha256_of_file_first, process_blinkc_sha, blink_cli_version}
 import stdlib_native_deps.{peeled_module_keys, peeled_module_dotted, peeled_module_underscored}
 import std.path.{path_join}
 
@@ -222,6 +222,7 @@ fn relink_archive(cache_dir_rel: Str) {
     shell_exec("ln -sfn {cache_dir_rel}/libblink_std.a build/libblink_std.a")
     shell_exec("ln -sfn {cache_dir_rel}/libblink_std.h build/libblink_std.h")
     shell_exec("ln -sfn {cache_dir_rel}/skip_modules.txt build/skip_modules.txt")
+    shell_exec("ln -sfn {cache_dir_rel}/.archive-id build/.archive-id")
 }
 
 fn write_skip_modules_file(path: Str, keys: List[Str]) {
@@ -279,6 +280,11 @@ pub fn build_stdlib_archive(peeled: List[Str]) -> Int ! Lex.Tokenize, Parse, Par
     let stamp = "{cache_dir}/.stamp"
     let force_rebuild = (env.var("BLINK_FORCE_STDLIB_REBUILD") ?? "") != ""
     if file_exists(stamp) == 1 && !force_rebuild {
+        // Backfill the identity stamp for caches built before .archive-id
+        // existed, so relink_archive's symlink never dangles (br 105z02).
+        if file_exists("{cache_dir}/.archive-id") == 0 {
+            write_archive_id("{cache_dir}/.archive-id", rt_path_final, "{cache_dir}/libblink_std.h")
+        }
         relink_archive("std-cache/{hash}")
         return 0
     }
@@ -323,7 +329,33 @@ pub fn build_stdlib_archive(peeled: List[Str]) -> Int ! Lex.Tokenize, Parse, Par
 
     shell_exec("ar rcs {cache_dir}/libblink_std.a {cache_dir}/monolith.o")
     write_skip_modules_file("{cache_dir}/skip_modules.txt", list_stdlib_module_keys())
+    write_archive_id("{cache_dir}/.archive-id", rt_path_final, "{cache_dir}/libblink_std.h")
     write_file(stamp, "")
     relink_archive("std-cache/{hash}")
     0
+}
+
+// Compatibility identity for the built archive: runtime.h SHA + the archive
+// header (libblink_std.h) SHA + blinkc SHA + the CLI version. These are the
+// same inputs the std-cache hash already covers, so a dev build is
+// self-consistent by construction. The stamp exists so an *installed* archive
+// (copied out of the cache dir, losing the hash-named directory) can still be
+// checked against the compiler that links a user TU — guarding the ABI-skew
+// class of bug where a stale installed archive is silently linked (br 105z02).
+//
+// BOTH headers are load-bearing ABI. runtime.h carries the runtime struct
+// layouts; libblink_std.h carries the stdlib struct typedefs (e.g. db Row,
+// std.args.* — emitted by codegen, so they can diverge when codegen changes
+// even if runtime.h is byte-identical). The user TU `#include`s both, so the
+// verify side gates on both SHAs. blinkc SHA is recorded for forensics but
+// not re-checked (an installed tree ships no blinkc to hash).
+fn archive_id_string(rt_path: Str, hdr_path: Str) -> Str {
+    let rt_sha = sha256_of_file_first(rt_path)
+    let hdr_sha = sha256_of_file_first(hdr_path)
+    let bc_sha = process_blinkc_sha()
+    "{rt_sha}|{hdr_sha}|{bc_sha}|{blink_cli_version}"
+}
+
+fn write_archive_id(path: Str, rt_path: Str, hdr_path: Str) {
+    write_file(path, "{archive_id_string(rt_path, hdr_path)}\n")
 }
