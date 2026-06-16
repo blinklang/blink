@@ -1,6 +1,6 @@
 # Blink Language Reference
 
-> Blink is a statically-typed, effect-tracked language compiling to C. **Compiler v0.49.0**.
+> Blink is a statically-typed, effect-tracked language compiling to C. **Compiler v0.50.0**.
 
 ## Install
 
@@ -12,7 +12,7 @@ docker pull ghcr.io/blinklang/blink:latest
 docker run --rm -v "$PWD":/workspace ghcr.io/blinklang/blink run myfile.bl
 ```
 
-Tags: `latest`, `0.49`, `0.49.0` (semver). Image is `debian:bookworm-slim` with `gcc`, `zig`, `blink`, and `libgc-dev`.
+Tags: `latest`, `0.50`, `0.50.0` (semver). Image is `debian:bookworm-slim` with `gcc`, `zig`, `blink`, and `libgc-dev`.
 
 ## Recent Changes
 
@@ -613,7 +613,7 @@ let s = str_from_code_point(65)         // -> Str ("A"), from std.str
 | `StringBuilder.new()` | StringBuilder | Create empty builder |
 | `StringBuilder.with_capacity(n)` | StringBuilder | Create with pre-allocated capacity |
 | `.write(s)` | Void | Append string |
-| `.write_char(ch)` | Void | Append single character |
+| `.write_char(ch)` | Void | Append single character (`ch` may be a `Str` or a `Char`) |
 | `.write_int(n)` | Void | Append integer as string |
 | `.write_float(f)` | Void | Append float as string |
 | `.write_bool(b)` | Void | Append bool as string |
@@ -692,17 +692,15 @@ result.exit_code    // Int — exit code
 |--------|---------|---------|
 | `time.read()` | Instant | Current time |
 | `Instant.from_epoch_secs(n)` | Instant | From unix timestamp |
-| `.elapsed()` | Duration | Time since this instant |
-| `.since(other)` | Duration | Difference between instants |
+| `.since(other)` | Duration | Difference between instants (`later.since(earlier)`) |
 | `.add(dur)` | Instant | Add duration |
 | `.to_unix_ms()` | Int | As unix milliseconds |
 | `.to_unix_secs()` | Int | As unix seconds |
-| `.to_rfc3339()` | Str | ISO-8601 formatted string |
 
 ```blink
 let start = time.read()
 // ... work ...
-let elapsed = start.elapsed()
+let elapsed = time.read().since(start)
 io.println("Took {elapsed.to_ms()} ms")
 
 let d = Duration.seconds(5)
@@ -1035,6 +1033,7 @@ Run `blink doc --list` to list available modules.
 - `let mut` required for any variable you want to reassign
 - Function args separated by commas in calls, but by newlines in multi-line definitions
 - `assert`, `assert_eq`, `assert_ne` only available inside `test` blocks and debug mode
+- `assert_panics { ... }` (and `assert_panics(matching: "substr") { ... }`) is a compiler-recognized, test-only block assertion that passes only if its body panics — valueless and non-nestable
 
 ## Build & Run
 
