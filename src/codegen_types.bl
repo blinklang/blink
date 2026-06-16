@@ -337,6 +337,13 @@ pub let mut cg_archive_build_mode: Int = 0
 // effectful stdlib fns inline. The standalone path (legacy single-TU
 // blinkc with no --link-archive) leaves this at 0.
 pub let mut cg_user_tu_mode: Int = 0
+// When non-zero, this is a test build (`blink test`): panic sites lower to the
+// thread-local catch dispatch (__blink_panic_dispatch) instead of the historic
+// inline `fprintf; exit(1)`, and the generated C `#define`s BLINK_TEST_BUILD so
+// the runtime_core.h trap sites switch to the dispatch too. A non-test build
+// leaves this 0 and emits byte-identical panic sites + a BLINK_TEST_BUILD-free
+// runtime (the assert_panics zero-cost guarantee, spec §2.20).
+pub let mut cg_test_mode: Int = 0
 pub let mut emitted_let_set: Map[Str, Int] = Map()
 pub let mut emitted_option_set: Map[Str, Int] = Map()
 pub let mut emitted_result_set: Map[Str, Int] = Map()
@@ -1664,6 +1671,14 @@ pub let mut cg_current_fn_option_inner_struct: Str = ""
 // instead of emitting `return ...` (test fns are still void per the
 // runtime descriptor — propagation goes through longjmp into the runner).
 pub let mut cg_in_test_body: Int = 0
+// Nonzero while emitting the inline body of an `assert_panics { ... }` block.
+// Holds the label suffix (n) of the enclosing block's E0831 landing label
+// `__ap_returned_<n>`. A `?`-propagated Err inside the body means the body
+// exited WITHOUT panicking, which is E0831 (spec §2.20) — so the `?` lowering
+// redirects its sentinel exit to `goto __ap_returned_<n>` instead of `return`.
+// 0 = not inside an assert_panics body.
+pub let mut cg_in_assert_panics: Int = 0
+pub let mut cg_assert_panics_counter: Int = 0
 
 // > 0 inside a `with arena { }` body; suppresses `! Arena` propagation
 // to the enclosing fn (decisions/arena-expression-form-semantics.md Q5).
@@ -5967,12 +5982,23 @@ pub fn emit_bh_cleanup_for_type(struct_name: Str) ! Codegen.Emit {
     cg_closure_defs.push("    {c_type} handler;")
     cg_closure_defs.push("    int64_t ok;")
     cg_closure_defs.push("    int64_t entered;")
+    cg_closure_defs.push("    int done;")
     cg_closure_defs.push("} __blink_bh_state_{c_type};")
     cg_closure_defs.push("")
+    // Run-once exit: shared by the normal-exit attribute-cleanup and the
+    // assert_panics longjmp dispatch (spec §2.20). `done` guarantees exactly
+    // one exit() per handler regardless of which path fires first.
+    cg_closure_defs.push("static void __blink_bh_run_{c_type}(void* p, int ok) \{")
+    cg_closure_defs.push("    __blink_bh_state_{c_type}* st = (__blink_bh_state_{c_type}*)p;")
+    cg_closure_defs.push("    if (st->done) \{ return; }")
+    cg_closure_defs.push("    st->done = 1;")
+    cg_closure_defs.push("    if (st->entered) \{ {exit_fn}(st->handler, ok); }")
+    cg_closure_defs.push("}")
     cg_closure_defs.push("static void __blink_bh_cleanup_{c_type}(__blink_bh_state_{c_type}* st) \{")
-    cg_closure_defs.push("    if (st->entered) \{")
-    cg_closure_defs.push("        {exit_fn}(st->handler, st->ok);")
-    cg_closure_defs.push("    }")
+    // Normal scope exit: pop our own cleanup-stack entry (if we pushed one
+    // while armed) so a sibling's dispatch never re-runs it, then exit.
+    cg_closure_defs.push("    __blink_cleanup_pop((void*)st);")
+    cg_closure_defs.push("    __blink_bh_run_{c_type}((void*)st, (int)st->ok);")
     cg_closure_defs.push("}")
     cg_closure_defs.push("")
 }
@@ -5986,10 +6012,22 @@ pub fn emit_cl_cleanup_for_type(struct_name: Str) ! Codegen.Emit {
     let close_fn = c_fn_name("{struct_name}_close")
     cg_closure_defs.push("typedef struct \{")
     cg_closure_defs.push("    {c_type} resource;")
+    cg_closure_defs.push("    int done;")
     cg_closure_defs.push("} __blink_cl_state_{c_type};")
     cg_closure_defs.push("")
-    cg_closure_defs.push("static void __blink_cl_cleanup_{c_type}(__blink_cl_state_{c_type}* st) \{")
+    // Run-once close: shared by the normal-exit attribute-cleanup and the
+    // assert_panics longjmp dispatch (spec §2.20). Closeable.close() ignores
+    // the ok flag, so the `ok` parameter is unused here.
+    cg_closure_defs.push("static void __blink_cl_run_{c_type}(void* p, int ok) \{")
+    cg_closure_defs.push("    (void)ok;")
+    cg_closure_defs.push("    __blink_cl_state_{c_type}* st = (__blink_cl_state_{c_type}*)p;")
+    cg_closure_defs.push("    if (st->done) \{ return; }")
+    cg_closure_defs.push("    st->done = 1;")
     cg_closure_defs.push("    {close_fn}(st->resource);")
+    cg_closure_defs.push("}")
+    cg_closure_defs.push("static void __blink_cl_cleanup_{c_type}(__blink_cl_state_{c_type}* st) \{")
+    cg_closure_defs.push("    __blink_cleanup_pop((void*)st);")
+    cg_closure_defs.push("    __blink_cl_run_{c_type}((void*)st, 0);")
     cg_closure_defs.push("}")
     cg_closure_defs.push("")
 }

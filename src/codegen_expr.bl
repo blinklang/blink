@@ -8,7 +8,7 @@ import codegen_types.{
     cg_arena_expr_prev_stack, cg_arena_expr_tmp_stack,
     cg_async_scope_counter, cg_async_scope_stack,
     cg_closure_cap_count, cg_closure_cap_start, cg_closure_defs,
-    cg_current_fn_has_ev, cg_current_fn_name, cg_current_fn_node, cg_current_fn_option_inner, cg_current_fn_option_inner_struct, cg_current_fn_ret, cg_in_test_body,
+    cg_current_fn_has_ev, cg_current_fn_name, cg_current_fn_node, cg_current_fn_option_inner, cg_current_fn_option_inner_struct, cg_current_fn_ret, cg_in_test_body, cg_test_mode, cg_in_assert_panics,
     cg_let_target_ann, cg_expect_arg_ann,
     cg_mono_tparams_sl, cg_mono_concrete_args,
     cg_debug_mode, cg_handler_body_field, cg_handler_body_idx,
@@ -1037,6 +1037,15 @@ fn emit_handler_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope,
             let saved_fn_has_ev_h = cg_current_fn_has_ev
             let saved_handler_caps = cg_handler_caps
             let saved_in_traced = cg_in_traced_fn
+            // An inline handler body is its own C function; it must not inherit
+            // the enclosing test/assert_panics elaboration, or a `?` inside it
+            // would emit `__blink_test_set_propagate; return` (wrong frame) or
+            // `goto __ap_returned_<n>` into a label that lives in the test
+            // function, not this static fn. Mirrors the closure emitter.
+            let saved_in_test_h = cg_in_test_body
+            let saved_in_ap_h = cg_in_assert_panics
+            cg_in_test_body = 0
+            cg_in_assert_panics = 0
             cg_in_traced_fn = 0
             cg_lines = []
             cg_indent = 1
@@ -1125,6 +1134,8 @@ fn emit_handler_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope,
             cg_current_fn_name = saved_fn_name
             cg_current_fn_has_ev = saved_fn_has_ev_h
             cg_in_traced_fn = saved_in_traced
+            cg_in_test_body = saved_in_test_h
+            cg_in_assert_panics = saved_in_ap_h
             mi = mi + 1
         }
     }
@@ -1667,7 +1678,7 @@ fn emit_binop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.R
             let loc_line = panic_line_str(node)
             let file = panic_file_for(node)
             emit_line("uint32_t {amt} = (uint32_t)({right_str});")
-            emit_line("if ({amt} >= {bw}) \{ fprintf(stderr, \"panic: shift amount %u exceeds bit width {bw} at {file}:{loc_line}\\n\", {amt}); exit(1); }")
+            emit_line("if ({amt} >= {bw}) \{ {emit_panic_site(\"panic: shift amount %u exceeds bit width {bw} at {file}:{loc_line}\", \", {amt}\")} }")
             emit_line("{lc} {val} = ({lc})({left_str}) {op} {amt};")
             expr_result_str = val
         }
@@ -1684,24 +1695,28 @@ fn emit_binop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.R
         let result_tmp = fresh_temp("__sov")
         let lhs_tmp = fresh_temp("__sov_l")
         let rhs_tmp = fresh_temp("__sov_r")
+        // The panic message is a printf format; `%` (modulo) is a literal here
+        // and must be escaped as `%%` so vsnprintf/fprintf don't read it as a
+        // conversion spec (the message is matched by assert_panics).
+        let op_msg = if op == "%" { "%%" } else { op }
         emit_line("{lc} {lhs_tmp} = ({lc})({left_str});")
         emit_line("{lc} {rhs_tmp} = ({lc})({right_str});")
         if op == "/" || op == "%" {
-            emit_line("if ({rhs_tmp} == 0) \{ fprintf(stderr, \"panic: {tname} division by zero at {file}:{loc_line}\\n\"); exit(1); }")
+            emit_line("if ({rhs_tmp} == 0) \{ {emit_panic_site(\"panic: {tname} division by zero at {file}:{loc_line}\", \"\")} }")
             // Signed INT_MIN / -1 traps as overflow.
             if left_type == CT_I8 {
-                emit_line("if ({lhs_tmp} == (int8_t)0x80 && {rhs_tmp} == -1) \{ fprintf(stderr, \"panic: {tname} overflow in {op} at {file}:{loc_line}\\n\"); exit(1); }")
+                emit_line("if ({lhs_tmp} == (int8_t)0x80 && {rhs_tmp} == -1) \{ {emit_panic_site(\"panic: {tname} overflow in {op_msg} at {file}:{loc_line}\", \"\")} }")
             } else if left_type == CT_I16 {
-                emit_line("if ({lhs_tmp} == (int16_t)0x8000 && {rhs_tmp} == -1) \{ fprintf(stderr, \"panic: {tname} overflow in {op} at {file}:{loc_line}\\n\"); exit(1); }")
+                emit_line("if ({lhs_tmp} == (int16_t)0x8000 && {rhs_tmp} == -1) \{ {emit_panic_site(\"panic: {tname} overflow in {op_msg} at {file}:{loc_line}\", \"\")} }")
             } else if left_type == CT_I32 {
-                emit_line("if ({lhs_tmp} == (int32_t)0x80000000 && {rhs_tmp} == -1) \{ fprintf(stderr, \"panic: {tname} overflow in {op} at {file}:{loc_line}\\n\"); exit(1); }")
+                emit_line("if ({lhs_tmp} == (int32_t)0x80000000 && {rhs_tmp} == -1) \{ {emit_panic_site(\"panic: {tname} overflow in {op_msg} at {file}:{loc_line}\", \"\")} }")
             }
             emit_line("{lc} {result_tmp} = {lhs_tmp} {op} {rhs_tmp};")
         } else {
             // +, -, * use __builtin_*_overflow.
             let builtin_name = if op == "+" { "add" } else if op == "-" { "sub" } else { "mul" }
             emit_line("{lc} {result_tmp};")
-            emit_line("if (__builtin_{builtin_name}_overflow({lhs_tmp}, {rhs_tmp}, &{result_tmp})) \{ fprintf(stderr, \"panic: {tname} overflow in {op} (%lld {op} %lld) at {file}:{loc_line}\\n\", (long long){lhs_tmp}, (long long){rhs_tmp}); exit(1); }")
+            emit_line("if (__builtin_{builtin_name}_overflow({lhs_tmp}, {rhs_tmp}, &{result_tmp})) \{ {emit_panic_site(\"panic: {tname} overflow in {op_msg} (%lld {op_msg} %lld) at {file}:{loc_line}\", \", (long long){lhs_tmp}, (long long){rhs_tmp}\")} }")
         }
         expr_result_str = result_tmp
         expr_result_type = left_type
@@ -1743,11 +1758,11 @@ fn emit_unaryop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag
             let in_tmp = fresh_temp("__sneg_in")
             emit_line("{lc} {in_tmp} = ({lc})({operand_str});")
             if operand_type == CT_U8 || operand_type == CT_U16 || operand_type == CT_U32 || operand_type == CT_U64 {
-                emit_line("if ({in_tmp} != 0) \{ fprintf(stderr, \"panic: {tname} overflow in unary - at {file}:{loc_line}\\n\"); exit(1); }")
+                emit_line("if ({in_tmp} != 0) \{ {emit_panic_site(\"panic: {tname} overflow in unary - at {file}:{loc_line}\", \"\")} }")
                 emit_line("{lc} {result_tmp} = 0;")
             } else {
                 emit_line("{lc} {result_tmp};")
-                emit_line("if (__builtin_sub_overflow(({lc})0, {in_tmp}, &{result_tmp})) \{ fprintf(stderr, \"panic: {tname} overflow in unary - at {file}:{loc_line}\\n\"); exit(1); }")
+                emit_line("if (__builtin_sub_overflow(({lc})0, {in_tmp}, &{result_tmp})) \{ {emit_panic_site(\"panic: {tname} overflow in unary - at {file}:{loc_line}\", \"\")} }")
             }
             expr_result_str = result_tmp
             expr_result_type = operand_type
@@ -1791,9 +1806,17 @@ fn emit_unaryop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag
                 let err_type_name = test_err_type_display_name(rerr, rerr_s)
                 emit_line("if ({tmp}.tag == 1) \{")
                 cg_indent = cg_indent + 1
-                emit_line("__blink_test_set_propagate({err_msg_expr}, \"{err_type_name}\", \"{qm_file}\", {qm_line}, {qm_col});")
-                emit_arena_expr_unwind()
-                emit_line("return;")
+                if cg_in_assert_panics != 0 {
+                    // §2.20: a `?`-propagated Err exiting the body WITHOUT a
+                    // panic is E0831 (body returned). Jump to the block's E0831
+                    // landing label instead of propagating to the runner.
+                    emit_arena_expr_unwind()
+                    emit_line("goto __ap_returned_{cg_in_assert_panics};")
+                } else {
+                    emit_line("__blink_test_set_propagate({err_msg_expr}, \"{err_type_name}\", \"{qm_file}\", {qm_line}, {qm_col});")
+                    emit_arena_expr_unwind()
+                    emit_line("return;")
+                }
                 cg_indent = cg_indent - 1
                 emit_line("}")
                 reseat_after_q_on_result(tmp, rok, rok_s)
@@ -1870,9 +1893,17 @@ fn emit_unaryop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag
                 let qm_file = panic_file_for(node)
                 emit_line("if ({tmp}.tag == 0) \{")
                 cg_indent = cg_indent + 1
-                emit_line("__blink_test_set_propagate(\"None\", \"Option\", \"{qm_file}\", {qm_line}, {qm_col});")
-                emit_arena_expr_unwind()
-                emit_line("return;")
+                if cg_in_assert_panics != 0 {
+                    // §2.20: a `?`-propagated None exiting the body WITHOUT a
+                    // panic is E0831 (body returned). Jump to the block's E0831
+                    // landing label instead of propagating to the runner.
+                    emit_arena_expr_unwind()
+                    emit_line("goto __ap_returned_{cg_in_assert_panics};")
+                } else {
+                    emit_line("__blink_test_set_propagate(\"None\", \"Option\", \"{qm_file}\", {qm_line}, {qm_col});")
+                    emit_arena_expr_unwind()
+                    emit_line("return;")
+                }
                 cg_indent = cg_indent - 1
                 emit_line("}")
                 if opt_inner_s != "" {
@@ -3542,6 +3573,22 @@ pub fn panic_file_for(node: Int) -> Str {
 pub fn panic_line_str(node: Int) -> Str {
     let l = node_line(node)
     if l <= 0 { "<synthesized>" } else { "{l}" }
+}
+
+// Lower a panic site. `msg_fmt_c` is a C printf format WITHOUT a trailing
+// newline; `fmt_args_c` is the comma-prefixed argument list (e.g.
+// ", (long long)x") or "" when the format is literal. In a non-test build
+// this emits the historic inline `fprintf(stderr, "...\n"...); exit(1);` —
+// byte-identical to before, so non-test panic sites stay zero-cost. In a test
+// build (cg_test_mode) it routes to the thread-local catch dispatch so an
+// armed assert_panics can consume the panic (spec §2.20). The caller keeps the
+// surrounding `if (cond) { ... }` guard. Returns the C statement string.
+pub fn emit_panic_site(msg_fmt_c: Str, fmt_args_c: Str) -> Str {
+    if cg_test_mode != 0 {
+        "__blink_panic_dispatchf(\"{msg_fmt_c}\"{fmt_args_c});"
+    } else {
+        "fprintf(stderr, \"{msg_fmt_c}\\n\"{fmt_args_c}); exit(1);"
+    }
 }
 
 pub fn escape_c_string(s: Str) -> Str {

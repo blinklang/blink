@@ -19,6 +19,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/time.h>
+#include <setjmp.h>
+#include <stdarg.h>
 #define GC_THREADS
 #include <gc.h>
 
@@ -75,6 +77,134 @@ typedef struct blink_arena_t {
 #else
 static __thread blink_arena_t* __blink_current_arena = NULL;
 static uint64_t blink_map_seed = 0;
+#endif
+
+/* ── assert_panics infrastructure (spec §2.20, decisions/assert-panics-semantics.md) ──
+ *
+ * `assert_panics { ... }` arms a thread-local catch frame. Inside an armed
+ * frame, panic sites longjmp to the frame's setjmp landing pad instead of
+ * `fprintf; exit(1)`. The state is per-test / thread-local (normative): an
+ * armed assert_panics in one task must never catch a sibling task's panic.
+ *
+ * Cleanup-on-caught-panic: C `__attribute__((cleanup))` does NOT run on
+ * `longjmp` (longjmp abandons intervening automatic storage without
+ * unwinding). So `with`/`Closeable` resources opened inside an armed body
+ * also push a manual cleanup entry; the dispatch runs those entries (with
+ * ok=false) BEFORE longjmping. On the non-panic path the ordinary
+ * attribute-cleanup runs and pops its own entry (the `done` flag prevents
+ * a double exit). This is the actual mechanism behind §2.20's
+ * "rolls back on the expected panic" guarantee. */
+#define BLINK_PANIC_MSG_SIZE 1024
+#define BLINK_PANIC_CLEANUP_MAX 256
+
+typedef struct {
+    void* state;                    /* points at the per-type bh/cl state struct */
+    void (*run)(void* state, int ok); /* per-type thunk → <Type>_exit / <Type>_close */
+    int* done;                      /* set to 1 once run, by whichever path runs first */
+} __blink_panic_cleanup_entry;
+
+#ifdef BLINK_USE_EXTERN_RUNTIME_STORAGE
+  #ifdef BLINK_RUNTIME_STORAGE_DEFINE
+    __thread int __blink_panic_armed = 0;
+    __thread jmp_buf __blink_panic_jmp;
+    __thread char __blink_panic_msg[BLINK_PANIC_MSG_SIZE] = {0};
+    __thread __blink_panic_cleanup_entry __blink_panic_cleanup_stack[BLINK_PANIC_CLEANUP_MAX];
+    __thread size_t __blink_panic_cleanup_top = 0;
+    __thread size_t __blink_panic_cleanup_mark = 0;
+  #else
+    extern __thread int __blink_panic_armed;
+    extern __thread jmp_buf __blink_panic_jmp;
+    extern __thread char __blink_panic_msg[BLINK_PANIC_MSG_SIZE];
+    extern __thread __blink_panic_cleanup_entry __blink_panic_cleanup_stack[BLINK_PANIC_CLEANUP_MAX];
+    extern __thread size_t __blink_panic_cleanup_top;
+    extern __thread size_t __blink_panic_cleanup_mark;
+  #endif
+#else
+static __thread int __blink_panic_armed = 0;
+static __thread jmp_buf __blink_panic_jmp;
+static __thread char __blink_panic_msg[BLINK_PANIC_MSG_SIZE] = {0};
+static __thread __blink_panic_cleanup_entry __blink_panic_cleanup_stack[BLINK_PANIC_CLEANUP_MAX];
+static __thread size_t __blink_panic_cleanup_top = 0;
+static __thread size_t __blink_panic_cleanup_mark = 0;
+#endif
+
+BLINK_RT_FN size_t __blink_cleanup_depth(void);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN size_t __blink_cleanup_depth(void) { return __blink_panic_cleanup_top; }
+#endif
+
+/* Push a cleanup entry. Only called from emitted with/Closeable setup when
+ * __blink_panic_armed is nonzero. Silently drops past the cap (the cap is far
+ * beyond any real test's nesting; overflow would only under-clean on a
+ * pathological body and never corrupts memory). */
+BLINK_RT_FN void __blink_cleanup_push(void* state, void (*run)(void*, int), int* done);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void __blink_cleanup_push(void* state, void (*run)(void*, int), int* done) {
+    if (__blink_panic_cleanup_top >= BLINK_PANIC_CLEANUP_MAX) { return; }
+    __blink_panic_cleanup_stack[__blink_panic_cleanup_top].state = state;
+    __blink_panic_cleanup_stack[__blink_panic_cleanup_top].run = run;
+    __blink_panic_cleanup_stack[__blink_panic_cleanup_top].done = done;
+    __blink_panic_cleanup_top++;
+}
+#endif
+
+/* Pop the top entry if it belongs to `state` (the normal-exit path: the
+ * attribute-cleanup fires in LIFO order, so its entry is at the top). No-op
+ * if dispatch already truncated past it. */
+BLINK_RT_FN void __blink_cleanup_pop(void* state);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void __blink_cleanup_pop(void* state) {
+    if (__blink_panic_cleanup_top > 0 &&
+        __blink_panic_cleanup_stack[__blink_panic_cleanup_top - 1].state == state) {
+        __blink_panic_cleanup_top--;
+    }
+}
+#endif
+
+/* Run cleanup entries from the top down to `mark` (exclusive), each with
+ * ok=0, then truncate. Sets each entry's `done` flag so the abandoned
+ * attribute-cleanup (if it ever runs) won't double-exit. */
+BLINK_RT_FN void __blink_cleanup_run_to(size_t mark);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void __blink_cleanup_run_to(size_t mark) {
+    while (__blink_panic_cleanup_top > mark) {
+        __blink_panic_cleanup_top--;
+        __blink_panic_cleanup_entry* e = &__blink_panic_cleanup_stack[__blink_panic_cleanup_top];
+        if (e->done && *e->done) { continue; }
+        /* The per-type thunk owns the `done` flag: it sets done=1 then runs
+         * exit/close exactly once. Do NOT pre-set done here, or the thunk
+         * sees it already set and skips the cleanup it was pushed to run. */
+        if (e->run) { e->run(e->state, 0); }
+    }
+}
+#endif
+
+/* Shared panic dispatch. If armed: capture the message, run in-body cleanup
+ * down to the armed frame's mark, then longjmp into assert_panics. If not
+ * armed: terminate the process exactly as the historic inline panic did. */
+BLINK_RT_FN void __blink_panic_dispatch(const char* msg);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void __blink_panic_dispatch(const char* msg) {
+    if (__builtin_expect(__blink_panic_armed, 0)) {
+        snprintf(__blink_panic_msg, BLINK_PANIC_MSG_SIZE, "%s", msg ? msg : "");
+        __blink_cleanup_run_to(__blink_panic_cleanup_mark);
+        longjmp(__blink_panic_jmp, 1);
+    }
+    fprintf(stderr, "%s\n", msg ? msg : "panic");
+    exit(1);
+}
+#endif
+
+BLINK_RT_FN void __blink_panic_dispatchf(const char* fmt, ...);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void __blink_panic_dispatchf(const char* fmt, ...) {
+    char __buf[BLINK_PANIC_MSG_SIZE];
+    va_list __ap;
+    va_start(__ap, fmt);
+    vsnprintf(__buf, BLINK_PANIC_MSG_SIZE, fmt, __ap);
+    va_end(__ap);
+    __blink_panic_dispatch(__buf);
+}
 #endif
 
 BLINK_RT_FN blink_arena_chunk* blink_arena_chunk_new(int64_t capacity);
@@ -304,8 +434,12 @@ BLINK_RT_FN void* blink_list_get(const blink_list* l, int64_t index);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN void* blink_list_get(const blink_list* l, int64_t index) {
     if (index < 0 || index >= l->len) {
+#ifdef BLINK_TEST_BUILD
+        __blink_panic_dispatchf("blink: list index out of bounds: idx=%lld len=%lld", (long long)index, (long long)l->len);
+#else
         fprintf(stderr, "blink: list index out of bounds: idx=%lld len=%lld\n", (long long)index, (long long)l->len);
         exit(1);
+#endif
     }
     return l->items[index];
 }
@@ -329,8 +463,12 @@ BLINK_RT_FN void blink_list_set(blink_list* l, int64_t index, void* item);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN void blink_list_set(blink_list* l, int64_t index, void* item) {
     if (index < 0 || index >= l->len) {
+#ifdef BLINK_TEST_BUILD
+        __blink_panic_dispatchf("blink: list set index out of bounds: %lld", (long long)index);
+#else
         fprintf(stderr, "blink: list set index out of bounds: %lld\n", (long long)index);
         exit(1);
+#endif
     }
     l->items[index] = item;
 }
@@ -340,8 +478,12 @@ BLINK_RT_FN void* blink_list_pop(blink_list* l);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN void* blink_list_pop(blink_list* l) {
     if (l->len <= 0) {
+#ifdef BLINK_TEST_BUILD
+        __blink_panic_dispatch("blink: list pop on empty list");
+#else
         fprintf(stderr, "blink: list pop on empty list\n");
         exit(1);
+#endif
     }
     l->len--;
     return l->items[l->len];
@@ -1012,8 +1154,12 @@ BLINK_RT_FN void blink_bytes_set(blink_bytes* b, int64_t index, int64_t byte);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN void blink_bytes_set(blink_bytes* b, int64_t index, int64_t byte) {
     if (index < 0 || index >= b->len) {
+#ifdef BLINK_TEST_BUILD
+        __blink_panic_dispatchf("blink: bytes set index out of bounds: %lld", (long long)index);
+#else
         fprintf(stderr, "blink: bytes set index out of bounds: %lld\n", (long long)index);
         exit(1);
+#endif
     }
     b->data[index] = (uint8_t)(byte & 0xFF);
 }
@@ -1861,8 +2007,12 @@ BLINK_RT_FN const char* blink_get_arg(int64_t index);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN const char* blink_get_arg(int64_t index) {
     if (index < 0 || index >= blink_g_argc) {
+#ifdef BLINK_TEST_BUILD
+        __blink_panic_dispatchf("blink: arg index out of bounds: %lld", (long long)index);
+#else
         fprintf(stderr, "blink: arg index out of bounds: %lld\n", (long long)index);
         exit(1);
+#endif
     }
     return blink_g_argv[index];
 }

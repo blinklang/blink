@@ -119,3 +119,38 @@ Scored against the five criteria:
 5. **Token Efficiency** — Pass. Far cheaper than the subprocess status quo; `matching:` is pay-for-what-you-assert.
 
 0 fails — proceed.
+
+### Implementation Notes (q58zw1)
+
+**Correction to a Phase-A claim.** Phase A SYS-1 stated that an in-body `with`
+binding's cleanup "fires during the longjmp unwind" via its
+`__attribute__((cleanup))` destructor. **This is factually wrong** and was
+verified empirically (`.tmp/q58zw1/`): C `__attribute__((cleanup))` does **not**
+run on `longjmp` — `longjmp` abandons intervening automatic storage without
+unwinding (confirmed under `-O2`, `-fexceptions`, and with the body inline in
+the `setjmp` frame). So the §2.20 "rolls back on the expected panic" guarantee
+is **not** delivered by the attribute-cleanup path.
+
+**The actual mechanism is a manual cleanup-stack** (`bootstrap/runtime_core.h`):
+when armed (inside an `assert_panics` body), `with`/`Closeable` setup pushes a
+`{state, run, done}` entry onto a thread-local stack. `__blink_panic_dispatch`
+walks the stack top-down — running each handler's `exit(false)`/`close()` — down
+to the armed frame's mark **before** it `longjmp`s. On the normal (non-panic)
+exit path the ordinary attribute-cleanup runs and pops its own entry; a `done`
+flag guarantees each handler runs exactly once regardless of which path fires
+first. This is what makes the rollback guarantee real.
+
+**Lowering shape.** Panic sites are dual-mode: in a non-test build they emit the
+historic `fprintf(stderr, "panic: ...\n"); exit(1)` (byte-identical, zero-cost);
+in a test build (codegen `cg_test_mode`, set when the program has `test` blocks)
+they route to `__blink_panic_dispatch`, and the generated C `#define`s
+`BLINK_TEST_BUILD` so the `runtime_core.h` trap sites switch too. `assert_panics`
+lowers to an inline `setjmp` landing pad in the test frame; `__blink_panic_armed`
+is a thread-local counter (`{0,1}` — E0833/E0834 keep it bounded).
+
+**Known gaps at landing** (tracked as follow-up bugs): plain `Int` (not sized)
+division-by-zero still SIGFPEs rather than panicking, so the doc's literal
+`10 / 0` example is uncatchable until that guard is added; and `runtime_core.h`
+trap sites compiled into the prebuilt stdlib archive are not caught (the archive
+is built without `BLINK_TEST_BUILD`) — inline user-TU panic sites (unwrap,
+sized-int overflow/div, shift) are caught.

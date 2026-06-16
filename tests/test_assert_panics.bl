@@ -1,0 +1,73 @@
+// assert_panics block form — pass-case + cleanup behavior (spec §2.20,
+// decisions/assert-panics-semantics.md, q9cv25 6-0). These are real passing
+// tests: a passing assert_panics CONSUMES the expected panic, so the test
+// status is "pass". The E0831/E0832 failure-rendering and E0833/E0834
+// compile-time fences live in tests/test_e0831..e0834_assert_panics_*.bl.
+
+let mut ap_log: List[Str] = []
+
+fn ap_log_has(needle: Str) -> Bool {
+    let mut i = 0
+    while i < ap_log.len() {
+        if ap_log.get(i).unwrap() == needle { return true }
+        i = i + 1
+    }
+    false
+}
+
+type ApTx { id: Int }
+
+impl BlockHandler for ApTx {
+    type Context = Int
+    fn enter(self) -> Int {
+        ap_log.push("enter:{self.id}")
+        0
+    }
+    fn exit(self, ok: Bool) {
+        if ok { ap_log.push("commit:{self.id}") } else { ap_log.push("rollback:{self.id}") }
+    }
+}
+
+test "unwrap on empty list panics — bare block consumes the panic" {
+    assert_panics {
+        let xs: [Int] = []
+        let _ = xs.get(0).unwrap()
+    }
+}
+
+test "panic message contains the matching substring" {
+    assert_panics(matching: "None") {
+        let xs: [Int] = []
+        let _ = xs.get(0).unwrap()
+    }
+}
+
+test "sized-int overflow panics" {
+    assert_panics(matching: "overflow") {
+        let big: I8 = 127
+        let _ = big + big
+    }
+}
+
+// The verified-blocker guarantee: a `with`/BlockHandler opened inside the body
+// runs exit(false) on the caught panic (C __attribute__((cleanup)) does NOT
+// fire on longjmp; a manual cleanup-stack delivers the rollback). Two-test
+// pattern: test A panics under a transaction; test B (sorted after A) inspects
+// the shared log to prove the rollback ran before the pass was recorded.
+test "a_rollback_runs_on_caught_panic" {
+    assert_panics(matching: "None") {
+        with ApTx { id: 1 } as _t {
+            ap_log.push("before-panic")
+            let xs: [Int] = []
+            let _ = xs.get(0).unwrap()
+            ap_log.push("SHOULD-NOT-REACH")
+        }
+    }
+}
+
+test "b_verify_rollback_ran_with_ok_false" {
+    assert(ap_log_has("before-panic"))
+    assert(ap_log_has("rollback:1"))
+    assert(!ap_log_has("commit:1"))
+    assert(!ap_log_has("SHOULD-NOT-REACH"))
+}

@@ -16,7 +16,7 @@ import codegen_types.{
     cg_handler_body_is_ue, cg_handler_cleanup_fn, cg_handler_cleanup_var,
     cg_handler_is_user_effect,
     cg_handler_vtable_field, cg_handler_vtable_type,
-    cg_in_handler_body, cg_indent, cg_let_target_ann,
+    cg_in_handler_body, cg_indent, cg_test_mode, cg_in_assert_panics, cg_assert_panics_counter, cg_let_target_ann,
     cg_mono_tparams_sl, cg_mono_concrete_args,
     cg_let_target_name, cg_let_target_type, cg_lines, cg_program_node,
     cg_temp_counter, cg_trace_codegen, cg_ensures_result_var, cg_old_snapshot_vars,
@@ -81,7 +81,7 @@ import codegen_expr.{
     expr_option_inner_map_val_struct, expr_option_inner_map_val_list_elem,
     expr_option_inner_struct, expr_option_is_none, expr_result_err_struct, expr_result_err_type,
     expr_result_ok_struct, expr_result_ok_type, expr_result_str,
-    expr_result_type
+    expr_result_type, panic_file_for
 }
 import codegen_derive.{ct_to_descriptor, desc_primary_ct, descriptor_c_type, descriptor_mangle, emit_promote_elem_into, inner_desc_of, queue_promote_type}
 import diagnostics.{
@@ -2204,12 +2204,82 @@ fn emit_stmt(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
         return
     }
 
+    if kind == NodeKind.AssertPanics {
+        emit_assert_panics(node)
+        return
+    }
+
     // Fallback: treat as expression
     emit_expr(node)
     let s = expr_result_str
     if s != "" {
         emit_line("{s};")
     }
+}
+
+// Emit an `assert_panics { ... }` block (spec §2.20). Arms the thread-local
+// catch frame, emits the body inline so in-body `with` setup can push onto the
+// cleanup-stack, and lands E0831 (body returned) / E0832 (message mismatch).
+@allow(UnrestoredMutation, IncompleteStateRestore)
+fn emit_assert_panics(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
+    cg_assert_panics_counter = cg_assert_panics_counter + 1
+    let n = cg_assert_panics_counter
+    let body = node_body(node)
+    let match_node = node_value(node)
+    let file = panic_file_for(node)
+    let line = node_line(node)
+    let col = node_col(node)
+    let mark_var = "__ap_mark_{n}"
+
+    // Evaluate the matching substring (if any) BEFORE arming, so its own
+    // evaluation can never be caught by this frame.
+    let mut match_c = ""
+    if match_node != -1 {
+        emit_expr(match_node)
+        match_c = expr_result_str
+    }
+
+    emit_line("\{")
+    cg_indent = cg_indent + 1
+    emit_line("__blink_panic_armed++;")
+    emit_line("size_t {mark_var} = __blink_cleanup_depth();")
+    emit_line("size_t __ap_prev_mark_{n} = __blink_panic_cleanup_mark;")
+    emit_line("__blink_panic_cleanup_mark = {mark_var};")
+    emit_line("if (setjmp(__blink_panic_jmp) == 0) \{")
+    cg_indent = cg_indent + 1
+
+    let prev_in_ap = cg_in_assert_panics
+    cg_in_assert_panics = n
+    emit_block(body)
+    cg_in_assert_panics = prev_in_ap
+
+    // Fall-through (body returned normally) and the `?`-Err `goto` both land
+    // here: the body exited WITHOUT panicking → E0831. Disarm + restore the
+    // mark at the label so both entry paths run them. The dead `if (0) goto`
+    // keeps the label "used" when the body has no `?` (silences -Wunused-label).
+    emit_line("if (0) goto __ap_returned_{n};")
+    emit_line("__ap_returned_{n}: ;")
+    emit_line("__blink_panic_armed--;")
+    emit_line("__blink_panic_cleanup_mark = __ap_prev_mark_{n};")
+    emit_line("__blink_assert_panics_returned(\"{file}\", {line}, {col});")
+    cg_indent = cg_indent - 1
+    emit_line("} else \{")
+    cg_indent = cg_indent + 1
+    // Caught path: dispatch already ran the in-body cleanup down to the mark.
+    emit_line("__blink_panic_armed--;")
+    emit_line("__blink_panic_cleanup_mark = __ap_prev_mark_{n};")
+    if match_node != -1 {
+        emit_line("if (!strstr(__blink_panic_msg, {match_c})) \{")
+        cg_indent = cg_indent + 1
+        emit_line("__blink_assert_panics_mismatch({match_c}, __blink_panic_msg, \"{file}\", {line}, {col});")
+        cg_indent = cg_indent - 1
+        emit_line("}")
+    }
+    // pass: the expected panic was consumed; test status stays "pass".
+    cg_indent = cg_indent - 1
+    emit_line("}")
+    cg_indent = cg_indent - 1
+    emit_line("}")
 }
 
 fn infer_enum_from_node(val_node: Int) -> Str {
@@ -2889,7 +2959,7 @@ fn emit_bh_setup(struct_name: Str, handler_str: Str, binding: Str, bh_state_vars
     let bh_tmp = fresh_temp("__bh_")
     emit_line("{c_type} {bh_tmp} = {handler_str};")
     let st_var = fresh_temp("__bh_st_")
-    emit_line("__blink_bh_state_{c_type} {st_var} __attribute__((cleanup(__blink_bh_cleanup_{c_type}))) = \{ .handler = {bh_tmp}, .ok = 0, .entered = 0 };")
+    emit_line("__blink_bh_state_{c_type} {st_var} __attribute__((cleanup(__blink_bh_cleanup_{c_type}))) = \{ .handler = {bh_tmp}, .ok = 0, .entered = 0, .done = 0 };")
     if binding != "" {
         let ctx_type_name = lookup_assoc_type(struct_name, "Context")
         if ctx_type_name != "" {
@@ -2908,6 +2978,13 @@ fn emit_bh_setup(struct_name: Str, handler_str: Str, binding: Str, bh_state_vars
         emit_line("{enter_fn}({bh_tmp});")
     }
     emit_line("{st_var}.entered = 1;")
+    if cg_in_assert_panics != 0 {
+        // §2.20 cleanup-on-caught-panic: register this handler so the
+        // assert_panics dispatch runs its exit(false) on the longjmp (C
+        // __attribute__((cleanup)) does NOT fire on longjmp). The normal-exit
+        // attribute-cleanup pops this entry; `done` prevents a double exit.
+        emit_line("__blink_cleanup_push((void*)&{st_var}, __blink_bh_run_{c_type}, &{st_var}.done);")
+    }
     bh_state_vars.push(st_var)
 }
 
@@ -2983,7 +3060,12 @@ fn emit_with_block_core(node: Int, is_expr: Int, result_sink: Str) -> Str ! Code
                 let cl_c_type = c_type_c_name(res_struct)
                 emit_line("{c_decl} {tmp} = {res_str};")
                 let cl_st = fresh_temp("__cl_st_")
-                emit_line("__blink_cl_state_{cl_c_type} {cl_st} __attribute__((cleanup(__blink_cl_cleanup_{cl_c_type}))) = \{ .resource = {tmp} };")
+                emit_line("__blink_cl_state_{cl_c_type} {cl_st} __attribute__((cleanup(__blink_cl_cleanup_{cl_c_type}))) = \{ .resource = {tmp}, .done = 0 };")
+                if cg_in_assert_panics != 0 {
+                    // §2.20 cleanup-on-caught-panic: register so the dispatch
+                    // runs close() on the longjmp (attribute-cleanup won't).
+                    emit_line("__blink_cleanup_push((void*)&{cl_st}, __blink_cl_run_{cl_c_type}, &{cl_st}.done);")
+                }
                 emitted_let_names.push(binding)
                 emitted_let_set.insert(binding, 1)
                 emit_line("{c_decl} {binding} = {tmp};")

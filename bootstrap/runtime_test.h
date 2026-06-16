@@ -177,6 +177,33 @@ BLINK_UNUSED static void __blink_test_set_skipped(const char* reason) {
     BLINK_COPY_OR_EMPTY(__blink_test_skip_reason, reason);
 }
 
+/* Spec §2.20 — assert_panics failures. Both reuse __blink_assert_fail_intro,
+ * so they land in the existing __blink_test_fail_* record + JSON/human render
+ * with zero new runner code, and longjmp to the per-test runner frame. */
+
+/* E0831 — the block returned normally instead of panicking. */
+BLINK_UNUSED static void __blink_assert_panics_returned(const char* file, int line, int col) {
+    __blink_assert_fail_intro(
+        "assert_panics: expected the block to panic, but it returned normally",
+        "", file, line, col, "");
+}
+
+/* E0832 — the block panicked but the message lacked the matching substring.
+ * Renders the expected substring + the FULL actual panic message + origin. */
+BLINK_UNUSED static void __blink_assert_panics_mismatch(const char* expected,
+                                                        const char* actual,
+                                                        const char* file,
+                                                        int line, int col) {
+    char __intro[BLINK_PA_INTRO_BUF_SIZE];
+    snprintf(__intro, sizeof(__intro),
+             "  expected panic message to contain: %s\n  actual panic message: %s",
+             expected ? expected : "",
+             actual ? actual : "");
+    __blink_assert_fail_intro(
+        "assert_panics: panic message did not contain the expected substring",
+        __intro, file, line, col, "");
+}
+
 /* Polled by std.testing.for_each between case-body iterations so that a
  * failing/skipped case stops the loop instead of running every remaining
  * case under a poisoned global state. int64_t signature matches Blink Int. */
@@ -277,6 +304,14 @@ BLINK_UNUSED static void blink_test_run(const blink_test_entry* tests, int count
         __blink_test_fail_error_message[0] = '\0';
         __blink_test_skipped = 0;
         __blink_test_skip_reason[0] = '\0';
+        /* Defensive reset of the assert_panics catch state (spec §2.20): a body
+         * that exits via `return`/`break`/`continue` (rather than panicking or
+         * falling through) bypasses the block's own armed-- / mark restore, so
+         * re-zero here to bound the blast radius to a single test rather than
+         * poisoning every subsequent test on this thread. */
+        __blink_panic_armed = 0;
+        __blink_panic_cleanup_top = 0;
+        __blink_panic_cleanup_mark = 0;
         struct timespec __t0, __t1;
         clock_gettime(CLOCK_MONOTONIC, &__t0);
         if (setjmp(__blink_test_jmp) == 0) {

@@ -21,6 +21,7 @@ import diagnostics.{
     UNDEFINED_VARIABLE, UNKNOWN_TYPE, QM_RESULT_IN_NON_RESULT,
     QM_OPTION_IN_NON_OPTION, QM_ERROR_MISMATCH,
     QM_TEST_DISPLAY_REQUIRED, TEST_ANNOTATED_RETURN, SKIP_OUTSIDE_TEST,
+    ASSERT_PANICS_OUTSIDE_TEST, ASSERT_PANICS_NESTED_EXPECT_PANIC,
     PUB_FFI, FFI_NO_EFFECTS, CONTRACT_ON_FFI, INVALID_PTR_TYPE,
     PTR_OUTSIDE_FFI, FFI_STRUCT_GC_FIELD, BYTES_GROW_IN_WITH_PTR,
     PINNED_BYTES_ESCAPE, BYTES_PTR_CAST_FORBIDDEN,
@@ -4772,6 +4773,17 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         return
     }
 
+    if kind == NodeKind.AssertPanics {
+        let ap_match = node_value(node)
+        if ap_match != -1 {
+            nr_check_node(ap_match)
+        }
+        nr_push_scope()
+        nr_check_node(node_body(node))
+        nr_pop_scope()
+        return
+    }
+
     if kind == NodeKind.WithResource {
         nr_check_node(node_value(node))
         return
@@ -6234,6 +6246,34 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         return
     }
 
+    if kind == NodeKind.AssertPanics {
+        if tc_in_test_body == 0 {
+            diag_error_at("AssertPanicsOutsideTest", ASSERT_PANICS_OUTSIDE_TEST,
+                "assert_panics can only be used inside a test body",
+                node, "move it into a 'test \{ ... }' block")
+        }
+        if tc_in_assert_panics != 0 {
+            diag_error_at("AssertPanicsNestedExpectPanic", ASSERT_PANICS_NESTED_EXPECT_PANIC,
+                "assert_panics cannot be nested inside another assert_panics block",
+                node, "split the assertions into two separate tests")
+        }
+        let ap_match = node_value(node)
+        if ap_match != -1 {
+            tc_check_body(ap_match)
+            let mt = infer_type(ap_match)
+            if mt != TYPE_UNKNOWN && mt != TYPE_STR {
+                tc_error_at("assert_panics matching: must be Str, got {type_to_str(mt)}", node)
+            }
+        }
+        let prev_in_ap = tc_in_assert_panics
+        tc_in_assert_panics = 1
+        nr_push_scope()
+        tc_check_body(node_body(node))
+        nr_pop_scope()
+        tc_in_assert_panics = prev_in_ap
+        return
+    }
+
     if kind == NodeKind.AsyncScope {
         tc_check_body(node_body(node))
         return
@@ -6617,6 +6657,7 @@ fn tc_node_contains_question_op(node: Int) -> Int {
 }
 
 let mut tc_in_test_body: Int = 0
+let mut tc_in_assert_panics: Int = 0
 
 pub fn sanitize_test_name(name: Str) -> Str {
     let mut out = ""
