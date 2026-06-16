@@ -77,7 +77,7 @@ All tasks use `repo:blink` + one type tag:
 - `type:feature` - plan → confirm → implement.
 - `type:project` - break down into subtasks.
 - `type:friction` - triage → create bug/spec/feature tasks.
-- `type:spec` - panel deliberation via `/deliberate`. This task type is specically for programming language changes. Things that change the spec of the language itself. Things that effect blink users, not just this codebase.
+- `type:spec` - panel deliberation via `/deliberate`. This task type is specically for deliberating on programming language changes. Things that change the spec of the language itself. Things that effect blink users, not just this codebase. Not feature work. Spec "discussion".
 - `type:chore` - carry out task
 
 ## Friction Log
