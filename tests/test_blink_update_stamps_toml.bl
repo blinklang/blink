@@ -1,0 +1,100 @@
+// End-to-end regression test for `blink update` stamping [package].blink-version
+// into blink.toml (bug 8b2zd4).
+//
+// `blink update --help` promises to update the blink-version, and `blink init`
+// stamps it. But `stamp_blink_version`'s non-empty branch used to search for the
+// dead `pact-version` field, so a modern toml carrying `blink-version = "..."`
+// was left stale. This drives the real CLI and asserts on-disk toml state.
+//
+// stamp_blink_version is a private fn in cli.bl, so we exercise it through the
+// `blink update` surface (matching how test_cli_shim_init.bl tests init).
+
+fn trim_newlines(s: Str) -> Str {
+    let mut end = s.len()
+    while end > 0 {
+        let ch = s.byte_at(end - 1)
+        if ch == 10 || ch == 13 {
+            end = end - 1
+        } else {
+            return s.substring(0, end)
+        }
+    }
+    ""
+}
+
+// `blink --version` prints "blink <version>\n"; strip the prefix + newlines.
+fn parse_version(raw: Str) -> Str {
+    let trimmed = trim_newlines(raw)
+    let prefix = "blink "
+    if trimmed.contains(prefix) {
+        let idx = trimmed.index_of(prefix)
+        return trimmed.substring(idx + prefix.len(), trimmed.len() - (idx + prefix.len()))
+    }
+    trimmed
+}
+
+fn main() {
+    let base = ".tmp/_test_blink_update_stamps_toml"
+    shell_exec("rm -rf {base}")
+    shell_exec("mkdir -p {base}/src")
+
+    let pwd = process_run("sh", ["-c", "pwd -P"])
+    let blink_root = trim_newlines(pwd.out)
+
+    // The version the running compiler will stamp (matches what the lockfile gets).
+    let ver_result = process_run("sh", ["-c", "{blink_root}/build/blink --version 2>&1"])
+    let expected_version = parse_version(ver_result.out)
+    if expected_version == "" {
+        io.println("FAIL: could not read compiler version")
+        shell_exec("rm -rf {base}")
+        return
+    }
+
+    // Step 1: project whose [package].blink-version is an OLD value.
+    let toml = "[package]\nname = \"updproj\"\nversion = \"0.1.0\"\nblink-version = \"0.0.1-old\"\n\n[dependencies]\n"
+    write_file("{base}/blink.toml", toml)
+    write_file("{base}/src/main.bl", "fn main() \{\n    io.println(\"hi\")\n\}\n")
+
+    // Step 2: run `blink update` in the scratch project.
+    let upd = process_run("sh", ["-c", "cd {base} && {blink_root}/build/blink update 2>&1"])
+    if upd.exit_code != 0 {
+        io.println("FAIL: blink update exited {upd.exit_code}: {upd.out}")
+        shell_exec("rm -rf {base}")
+        return
+    }
+    io.println("PASS: blink update exit=0")
+
+    // Step 3: the stale value is gone and the live version is stamped.
+    let after = read_file("{base}/blink.toml")
+    if after.contains("0.0.1-old") {
+        io.println("FAIL: blink.toml still contains stale '0.0.1-old':\n{after}")
+        shell_exec("rm -rf {base}")
+        return
+    }
+    io.println("PASS: stale blink-version removed")
+
+    let stamped = "blink-version = \"{expected_version}\""
+    if !after.contains(stamped) {
+        io.println("FAIL: blink.toml missing '{stamped}':\n{after}")
+        shell_exec("rm -rf {base}")
+        return
+    }
+    io.println("PASS: live blink-version stamped")
+
+    // Step 4: a second update is harmless (idempotent) and keeps the stamp.
+    let upd2 = process_run("sh", ["-c", "cd {base} && {blink_root}/build/blink update 2>&1"])
+    if upd2.exit_code != 0 {
+        io.println("FAIL: second blink update exited {upd2.exit_code}: {upd2.out}")
+        shell_exec("rm -rf {base}")
+        return
+    }
+    let after2 = read_file("{base}/blink.toml")
+    if !after2.contains(stamped) {
+        io.println("FAIL: idempotent update lost the stamp:\n{after2}")
+        shell_exec("rm -rf {base}")
+        return
+    }
+    io.println("PASS: update is idempotent")
+
+    shell_exec("rm -rf {base}")
+}
