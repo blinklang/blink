@@ -1,0 +1,62 @@
+// E1003 PrivateItemAccess must be enforced uniformly across ALL call/reference
+// forms, not just the bare unqualified `Ident` callee (br 3hez6b).
+//
+// Spec grounding (the rule is form-agnostic):
+//   §6.3.4 (sections/05_memory_compile_errors.md): pub enforcement happens at
+//     name resolution; "Using a non-pub item from outside its module produces E1003".
+//   §7 (sections/07_trust_modules_metadata.md): "When a function call or type
+//     reference crosses a module boundary, the resolver checks pub status… pub is
+//     a hard guarantee, not advisory."
+//   decisions/qualified-access-semantics.md: access control is pub's job, not the
+//     import form's — qualified access (mod.fn) is NOT exempt.
+//
+// Forms covered:
+//   1. Qualified call      priv_mod.secret(x)   — MethodCall, obj = Ident("priv_mod")
+//   2. Value reference      priv_mod.secret      — FieldAccess, obj = Ident("priv_mod")
+//   3. Bare call (control)  secret(x)            — already enforced; locks the baseline
+//   4. No-false-positive    priv_mod.pub_fn(x)   — a pub fn via the qualified form is clean
+//
+// (Type.method() is intentionally out of scope: proven that form cannot resolve a
+// free fn through the nr_private_imports surface — it goes through method
+// resolution and yields UnknownMethod, never reaching a tracked private symbol.)
+
+import compile_test_helpers
+
+// 1 — Qualified call reaches a non-pub free fn: must emit E1003.
+test "qualified call to private fn emits E1003" {
+    let helper = "fn secret(x: Int) -> Int \{ x + 1 }\n"
+    let entry = "import priv_mod\nfn consumer(x: Int) -> Int \{ priv_mod.secret(x) }\nfn main() \{ let _ = consumer(1) }\n"
+    compile_test_helpers.expect_compile_error_xmod(entry, "priv_mod", helper, "e1003_qual_call", "E1003")
+}
+
+// 2 — Value reference (uncalled) to a non-pub free fn: must emit E1003 (FieldAccess path).
+test "qualified value reference to private fn emits E1003" {
+    let helper = "fn secret(x: Int) -> Int \{ x + 1 }\n"
+    let entry = "import priv_mod\nfn main() \{ let f = priv_mod.secret\n    let _ = f }\n"
+    compile_test_helpers.expect_compile_error_xmod(entry, "priv_mod", helper, "e1003_qual_ref", "E1003")
+}
+
+// 3 — Control: the already-enforced bare-Ident form still emits E1003.
+test "bare call to private fn still emits E1003 (control)" {
+    let helper = "fn secret(x: Int) -> Int \{ x + 1 }\n"
+    let entry = "import priv_mod.\{secret}\nfn consumer(x: Int) -> Int \{ secret(x) }\nfn main() \{ let _ = consumer(1) }\n"
+    compile_test_helpers.expect_compile_error_xmod(entry, "priv_mod", helper, "e1003_bare_call", "E1003")
+}
+
+// 4 — No false positive: a pub fn reached via the qualified form must NOT emit E1003.
+test "qualified call to pub fn does not emit E1003" {
+    let helper = "pub fn pub_fn(x: Int) -> Int \{ x + 1 }\n"
+    let entry = "import priv_mod\nfn consumer(x: Int) -> Int \{ priv_mod.pub_fn(x) }\nfn main() \{ let _ = consumer(1) }\n"
+    compile_test_helpers.expect_no_error_xmod(entry, "priv_mod", helper, "e1003_qual_pub", "E1003")
+}
+
+// 5 — Noun discrimination: a private TYPE reached via the qualified value-reference
+// form must say "private type", not "private function" — matching the bare-Ident
+// handler. (Regression guard for the message-noun fix; the code alone is E1003 for
+// every kind, so this asserts the rendered message.)
+test "qualified ref to private type says 'private type'" {
+    let helper = "type Secret \{ n: Int }\n"
+    let entry = "import priv_mod\nfn main() \{ let x = priv_mod.Secret\n    let _ = x }\n"
+    let output = compile_test_helpers.compile_xmod_capture(entry, "priv_mod", helper, "e1003_qual_type")
+    assert(output.contains("cannot access private type 'Secret'"))
+}
