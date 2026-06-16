@@ -1,0 +1,55 @@
+// A source file path containing a literal `%` must be percent-escaped (`%%`)
+// before it is embedded into a printf/vsnprintf FORMAT string for a runtime
+// panic (div/mod/shift/overflow guards). Otherwise the `%` becomes an
+// unmatched conversion spec with no vararg -> UB / garbage / crash (ticket
+// 4d3m46). The path arguments passed verbatim to runtime helpers stay raw;
+// only the panic FORMAT strings get the doubling.
+// C-emission check (deterministic): a div-by-zero fixture at a `%`-containing
+// path must emit the DOUBLED path into the panic format string, never the raw
+// single-`%` form.
+test "panic file path with percent is doubled in emitted C" {
+    let dir = ".tmp/pct%dir_{getpid()}"
+    shell_exec("rm -rf '{dir}'")
+    shell_exec("mkdir -p '{dir}'")
+    let src = "fn main() \{\n    let z = 0\n    let _ = 1 / z\n\}\n"
+    // Unique basename so the emitted build/<base>.c does not collide with
+    // sibling test workers (basename, not just dir, must be unique).
+    let fixture = "{dir}/pctfmt_{getpid()}.bl"
+    write_file(fixture, src)
+    let result = process_run("build/blink", ["build", fixture, "--emit", "c"])
+    let output = "{result.out}{result.err_out}"
+    // `emitted: build/<base>.c` -> recover the exact path it wrote.
+    let marker = "emitted: "
+    let idx = output.index_of(marker)
+    assert(idx >= 0)
+    let after = output.slice(idx + marker.len(), output.len())
+    let c_path = after.trim_right()
+    let c_src = read_file(c_path)
+    // The escaped path lands inside the panic format string as `pct%%dir`.
+    assert(c_src.contains("pct%%dir"))
+    // And the raw single-`%` form must NOT appear in a panic location string.
+    assert(!c_src.contains("at .tmp/pct%dir"))
+    shell_exec("rm -rf '{dir}'")
+    shell_exec("rm -f '{c_path}'")
+}
+
+// Runtime check (proves no UB): running the same fixture must emit the
+// `division by zero` panic with the literal intact path (printf un-doubles
+// `%%` back to a single `%`).
+test "panic at percent path runs without UB and prints intact path" {
+    let dir = ".tmp/pctrun%dir_{getpid()}"
+    shell_exec("rm -rf '{dir}'")
+    shell_exec("mkdir -p '{dir}'")
+    let src = "fn main() \{\n    let z = 0\n    let _ = 1 / z\n\}\n"
+    let fixture = "{dir}/pctrun_{getpid()}.bl"
+    write_file(fixture, src)
+    let result = process_run("build/blink", ["run", fixture])
+    let combined = "{result.out}{result.err_out}"
+    assert(combined.contains("division by zero"))
+    // printf collapses `%%` -> `%`, so the displayed path is the literal one.
+    assert(combined.contains("pctrun%dir"))
+    shell_exec("rm -rf '{dir}'")
+    // `blink run` derives its outputs from the fixture basename -> build/<base>{.c}.
+    let base = "pctrun_{getpid()}"
+    shell_exec("rm -f 'build/{base}' 'build/{base}.c'")
+}
