@@ -1,0 +1,136 @@
+// br ja9jev: thin transparent zero-cost Errno(Int) newtype.
+//
+// Errno is a single-variant positional-payload enum used as the error arm of
+// Result[Int, Errno] / Result[Bytes, Errno] by the libc *_bytes wrappers
+// (m70k8x). It must be:
+//   1. Behaviorally a Result error arm carrying an Int errno — round-trips.
+//   2. Nominally DISTINCT from Int (the panel rejected raw `Result[Int, Int]`
+//      because count-written and errno would be indistinguishable).
+//
+// Transparency (no boxing in the emitted Result union) is asserted separately
+// in tests/test_errno_transparent_emit.bl — that's the codegen ship-gate.
+//
+// These tests define Errno inline (standalone) rather than importing
+// lib/std/errno.bl, so they exercise the language behavior independent of
+// stdlib packaging.
+import compile_test_helpers
+
+test "Result[Int, Errno] round-trips both arms" {
+    let src = "pub type Errno \{ Errno(Int) \}\n"
+        .concat("fn may_fail(x: Int) -> Result[Int, Errno] \{\n")
+        .concat("    if x < 0 \{ Err(Errno(22)) \} else \{ Ok(x * 2) \}\n")
+        .concat("\}\n")
+        .concat("fn main() \{\n")
+        .concat("    match may_fail(-1) \{\n")
+        .concat("        Err(Errno(rc)) => io.println(\"err \{rc\}\")\n")
+        .concat("        Ok(n) => io.println(\"ok \{n\}\")\n")
+        .concat("    \}\n")
+        .concat("    match may_fail(5) \{\n")
+        .concat("        Err(Errno(rc)) => io.println(\"err \{rc\}\")\n")
+        .concat("        Ok(n) => io.println(\"ok \{n\}\")\n")
+        .concat("    \}\n")
+        .concat("\}\n")
+    let r = compile_test_helpers.compile_and_run(src, "_errno_int")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("err 22"))
+    assert(r.out.contains("ok 10"))
+}
+
+test "Result[Bytes, Errno] round-trips both arms" {
+    let src = "pub type Errno \{ Errno(Int) \}\n"
+        .concat("fn read_it(ok: Bool) -> Result[Bytes, Errno] \{\n")
+        .concat("    if ok \{ Ok(Bytes.from_str(\"hi\")) \} else \{ Err(Errno(5)) \}\n")
+        .concat("\}\n")
+        .concat("fn main() \{\n")
+        .concat("    match read_it(false) \{\n")
+        .concat("        Err(Errno(rc)) => io.println(\"err \{rc\}\")\n")
+        .concat("        Ok(b) => io.println(\"len \{b.len()\}\")\n")
+        .concat("    \}\n")
+        .concat("    match read_it(true) \{\n")
+        .concat("        Err(Errno(rc)) => io.println(\"err \{rc\}\")\n")
+        .concat("        Ok(b) => io.println(\"len \{b.len()\}\")\n")
+        .concat("    \}\n")
+        .concat("\}\n")
+    let r = compile_test_helpers.compile_and_run(src, "_errno_bytes")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("err 5"))
+    assert(r.out.contains("len 2"))
+}
+
+test "Errno is nominally distinct from Int (Errno not assignable to Int)" {
+    let src = "pub type Errno \{ Errno(Int) \}\n"
+        .concat("fn main() \{\n")
+        .concat("    let e: Errno = Errno(1)\n")
+        .concat("    let n: Int = e\n")
+        .concat("    let _ = n\n")
+        .concat("\}\n")
+    let out = compile_test_helpers.compile_and_capture(src, "_errno_nominal_e_to_int")
+    assert(out.contains("\"severity\":\"error\""))
+}
+
+test "Errno is nominally distinct from Int (Int not assignable to Errno)" {
+    let src = "pub type Errno \{ Errno(Int) \}\n"
+        .concat("fn takes_errno(e: Errno) -> Int \{ 0 \}\n")
+        .concat("fn main() \{\n")
+        .concat("    let _ = takes_errno(22)\n")
+        .concat("\}\n")
+    let out = compile_test_helpers.compile_and_capture(src, "_errno_nominal_int_to_e")
+    assert(out.contains("\"severity\":\"error\""))
+}
+
+// Regression (code-review): a LITERAL sub-pattern inside the transparent newtype
+// must keep its value guard. Before the fix, the transparent carve-out returned
+// an empty match condition, so `Err(Errno(11))` and `Err(Errno(rc))` produced
+// identical conditions and the first arm always won — a SILENT miscompile.
+test "transparent newtype literal sub-pattern keeps its value guard" {
+    let src = "pub type Errno \{ Errno(Int) \}\n"
+        .concat("fn classify(x: Int) -> Result[Int, Errno] \{\n")
+        .concat("    if x < 0 \{ Err(Errno(99)) \} else \{ Ok(x) \}\n")
+        .concat("\}\n")
+        .concat("fn main() \{\n")
+        .concat("    match classify(-1) \{\n")
+        .concat("        Err(Errno(11)) => io.println(\"eleven\")\n")
+        .concat("        Err(Errno(rc)) => io.println(\"other \{rc\}\")\n")
+        .concat("        Ok(n) => io.println(\"ok \{n\}\")\n")
+        .concat("    \}\n")
+        .concat("\}\n")
+    let r = compile_test_helpers.compile_and_run(src, "_errno_literal_guard")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("other 99"))
+}
+
+// Regression (code-review): a bare transparent-newtype binding outside a carrier
+// (`let e = Errno(5)`) must declare `e` as int64_t — matching the construction
+// and the identity match-binding — not the boxed enum struct (which failed C
+// compilation: `const blink_Errno e = 5`).
+test "transparent newtype as a bare let-binding round-trips" {
+    let src = "pub type Errno \{ Errno(Int) \}\n"
+        .concat("fn main() \{\n")
+        .concat("    let e = Errno(5)\n")
+        .concat("    match e \{ Errno(rc) => io.println(\"rc \{rc\}\") \}\n")
+        .concat("\}\n")
+    let r = compile_test_helpers.compile_and_run(src, "_errno_bare_binding")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("rc 5"))
+}
+
+// Regression (code-review): the transparency rule is keyed on STRUCTURE, not just
+// the name `Errno`. A user-defined `Errno` of a different shape (multi-variant /
+// non-Int payload) must fall through to normal boxed enum codegen, not be
+// silently flattened (which produced invalid C).
+test "differently-shaped user Errno is not flattened (structural gate)" {
+    let src = "pub type Errno \{ Errno(Str) NotFound \}\n"
+        .concat("fn classify(x: Int) -> Result[Int, Errno] \{\n")
+        .concat("    if x < 0 \{ Err(Errno(\"neg\")) \} else \{ Ok(x) \}\n")
+        .concat("\}\n")
+        .concat("fn main() \{\n")
+        .concat("    match classify(-1) \{\n")
+        .concat("        Err(Errno(msg)) => io.println(\"err \{msg\}\")\n")
+        .concat("        Err(NotFound) => io.println(\"nf\")\n")
+        .concat("        Ok(n) => io.println(\"ok \{n\}\")\n")
+        .concat("    \}\n")
+        .concat("\}\n")
+    let r = compile_test_helpers.compile_and_run(src, "_errno_user_shape")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("err neg"))
+}

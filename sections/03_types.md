@@ -1072,6 +1072,35 @@ The `..` rest sigil is a pattern-only construct (§3.5); it has no meaning in co
 
 `blink fmt` does not canonicalize between the bare and qualified forms in either direction — a formatter must never change which entity a name resolves to.
 
+#### Enums Are Nominally Distinct from `Int`
+
+An enum is a distinct type from `Int`. Although a variant lowers to an integer tag at runtime, the tag's representation does not make the enum *assignable* to `Int`, exactly as a `U8`'s 8-bit representation does not make it assignable to `Int` (see *Sized Integer Types*). An enum value is not assignable to an `Int` target, and an `Int` is not assignable to an enum target — at let-bindings, function arguments, and function returns:
+
+```blink
+type State { Idle, Running, Done }
+
+fn step(s: State) -> State { s }
+
+fn main() {
+    let n: Int = State.Idle   // error[TypeError]: declared type Int but got State
+    let bad = step(2)         // error[TypeError]: argument 1 expects State, got Int
+    let s: State = 7          // error[TypeError]: declared type State but got Int
+}
+```
+
+This is what makes a single-payload enum a real newtype: `type Errno { Errno(Int) }` used as the error arm of `Result[Int, Errno]` cannot be confused with a plain `Int` count, which is the entire reason to prefer it over `Result[Int, Int]`.
+
+**Comparison is unaffected.** The comparison operators (`==`, `!=`, `<`, `<=`, `>`, `>=`) remain defined between an enum and `Int`: they compare the shared tag representation and yield `Bool`. This is a representation-level operation, not an assignability claim, so it does not weaken the nominal distinctness above.
+
+```blink
+let s = State.Running
+if s == State.Running { }   // OK — comparison, not assignment
+```
+
+**Crossing the boundary is explicit.** To obtain the tag as an `Int`, use `Enum.to_int()` (total). To go the other way, `Enum.from_int(n) -> Option[Enum]` is fallible — an arbitrary `Int` may not be a valid tag — so it returns `Option`. There is no implicit coercion and no cast operator.
+
+> Pattern matching an `Int` scrutinee against enum-variant patterns (`match someInt { State.Idle => ... }`) is the pattern-side dual of the assignability rule and is likewise ill-typed. Enforcement of that case is staged behind the compiler's internal `kind: Int → NodeKind` representation migration; the rule itself holds from this decision.
+
 #### Generic Types
 
 Type parameters use square brackets:

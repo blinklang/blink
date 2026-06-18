@@ -1,0 +1,54 @@
+// br ja9jev: TRANSPARENCY ship-gate for the Errno(Int) newtype.
+//
+// The panel locked "transparent / zero-cost" as a HARD codegen invariant:
+// Errno must NOT box/tag over Int on the syscall return path. In emitted C,
+// a Result whose error arm is Errno must hold a BARE `int64_t err;` — never a
+// `blink_Errno err;` wrapper struct nor a tagged-enum member.
+//
+// This is the authoritative gate (the invariant is about the emitted union
+// member type, which a runtime check can't directly observe). Patterned on
+// the compile_and_emit_c helper.
+
+import compile_test_helpers
+
+test "Result[Int, Errno] emits a bare int64_t err member, not a boxed blink_Errno" {
+    let src = "pub type Errno \{ Errno(Int) }\n"
+        .concat("fn may_fail(x: Int) -> Result[Int, Errno] \{\n")
+        .concat("    if x < 0 \{ Err(Errno(22)) } else \{ Ok(x * 2) }\n")
+        .concat("}\n")
+        .concat("fn main() \{ let _ = may_fail(1) }\n")
+    let c = compile_test_helpers.compile_and_emit_c(src, "_errno_emit_int")
+    // Nominal name distinct from Result_int_int (no collision).
+    assert(c.contains("blink_Result_int_Errno"))
+    // Transparent: the err member is a bare int64_t, NOT a boxed blink_Errno.
+    assert(c.contains("int64_t err;"))
+    assert(!c.contains("blink_Errno err;"))
+    // Construction stores the bare payload, never a tagged-enum literal into .err.
+    assert(!c.contains(".err = (blink_Errno)"))
+}
+
+test "Result[Bytes, Errno] emits a bare int64_t err member, no boxing" {
+    let src = "pub type Errno \{ Errno(Int) }\n"
+        .concat("fn read_it(ok: Bool) -> Result[Bytes, Errno] \{\n")
+        .concat("    if ok \{ Ok(Bytes.from_str(\"hi\")) } else \{ Err(Errno(5)) }\n")
+        .concat("}\n")
+        .concat("fn main() \{ let _ = read_it(true) }\n")
+    let c = compile_test_helpers.compile_and_emit_c(src, "_errno_emit_bytes")
+    assert(c.contains("blink_Result_bytes_Errno"))
+    assert(c.contains("int64_t err;"))
+    assert(!c.contains("blink_Errno err;"))
+    assert(!c.contains(".err = (blink_Errno)"))
+}
+
+test "a non-transparent enum still boxes (rule is scoped to Errno)" {
+    // Proves the rule did not globally flatten enums: a normal multi-variant
+    // enum used as a Result error arm keeps its boxed tagged-struct member.
+    let src = "pub type Status \{ Good(Int) Bad(Int) }\n"
+        .concat("fn classify(x: Int) -> Result[Int, Status] \{\n")
+        .concat("    if x < 0 \{ Err(Bad(1)) } else \{ Ok(x) }\n")
+        .concat("}\n")
+        .concat("fn main() \{ let _ = classify(1) }\n")
+    let c = compile_test_helpers.compile_and_emit_c(src, "_errno_emit_other")
+    assert(c.contains("blink_Status err;"))
+    assert(c.contains("blink_Status"))
+}

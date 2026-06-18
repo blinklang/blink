@@ -44,7 +44,7 @@ import codegen_types.{
     get_variant_field_count, get_variant_field_name,
     get_variant_field_type_str, get_variant_index, get_variant_tag,
     impl_method_self_name, builtin_receiver_type_name,
-    is_compound_ct, is_data_enum, is_enum_type,
+    is_compound_ct, is_data_enum, is_enum_type, is_transparent_newtype,
     is_intrinsic_method, is_named_type, is_runtime_header_fn, is_stdlib_source_module, is_struct_or_enum_type, is_struct_type, is_trait_type, list_contains_str, list_iter_c_type, skip_private_in_module_header,
     lookup_assoc_type, lookup_impl_type_for_trait, mangle_generic_name, mangle_impl_method, match_scrut_enum,
     match_scruts, mono_fns, mono_instances, mono_name_from_ann, mut_captured_vars, option_c_type,
@@ -1054,6 +1054,28 @@ fn resolve_arm_enum(variant: Str) -> Str {
     resolve_variant(variant)
 }
 
+// Condition for a transparent-newtype enum pattern (`Errno(<sub>)`). The
+// scrutinee at scrut_off is already the bare int64_t payload, so the condition
+// is entirely the inner sub-pattern's condition against that scrutinee:
+// `Errno(rc)`/`Errno(_)` → "" (always match); `Errno(11)` → `(scrut == 11)`.
+fn transparent_payload_condition(pat: Int, scrut_off: Int) -> Str {
+    let flds_sl = node_fields(pat)
+    if flds_sl == -1 || sublist_length(flds_sl) == 0 { return "" }
+    let sub_pat = sublist_get(flds_sl, 0)
+    let sub_pk = node_kind(sub_pat)
+    if sub_pk == NodeKind.IdentPattern || sub_pk == NodeKind.WildcardPattern { return "" }
+    // Literal / range / nested sub-pattern: recurse against the bare scrutinee.
+    let scrut = match_scruts.get(scrut_off).unwrap().str_val
+    let saved_scruts = match_scruts
+    let saved_enum = match_scrut_enum
+    match_scruts = [MatchScrutEntry { str_val: scrut, scrut_type: CT_INT }]
+    match_scrut_enum = ""
+    let cond = pattern_condition(sub_pat, 0, 1)
+    match_scruts = saved_scruts
+    match_scrut_enum = saved_enum
+    cond
+}
+
 // Build a C condition string for a pattern.
 // scrut_off/scrut_len index into match_scruts.
 // Returns "" when the pattern always matches (wildcard/ident).
@@ -1137,6 +1159,13 @@ fn pattern_condition(pat: Int, scrut_off: Int, scrut_len: Int) -> Str {
             return base
         }
         if variant_name != "" {
+            // Transparent newtype (br ja9jev): single variant, no tag — the scrutinee
+            // IS the bare int64_t payload, so there is no `.tag` to test. The pattern
+            // matches on its inner sub-pattern: `Errno(rc)`/`Errno(_)` always match
+            // (empty condition), but `Errno(11)` must still gate on `scrut == 11`.
+            if is_transparent_newtype(enum_name) != 0 {
+                return transparent_payload_condition(pat, scrut_off)
+            }
             if is_data_enum(enum_name) != 0 {
                 let tag = get_variant_tag(enum_name, variant_name)
                 return "({match_scruts.get(scrut_off).unwrap().str_val}.tag == {tag})"
@@ -1145,6 +1174,9 @@ fn pattern_condition(pat: Int, scrut_off: Int, scrut_len: Int) -> Str {
         }
         let pat_name = node_name(pat)
         let resolved = resolve_arm_enum(pat_name)
+        if resolved != "" && is_transparent_newtype(resolved) != 0 {
+            return transparent_payload_condition(pat, scrut_off)
+        }
         if resolved != "" && is_data_enum(resolved) != 0 {
             let tag = get_variant_tag(resolved, pat_name)
             return "({match_scruts.get(scrut_off).unwrap().str_val}.tag == {tag})"
@@ -1519,6 +1551,23 @@ fn bind_pattern_vars(pat: Int, scrut_off: Int, scrut_len: Int) ! Codegen.Emit, C
                 let fcount = get_variant_field_count(vidx)
                 let scrut = match_scruts.get(scrut_off).unwrap().str_val
                 let is_struct_pat = node_int_val(pat)
+                if is_transparent_newtype(resolved_enum) != 0 {
+                    // Transparent newtype (br ja9jev): `Errno(rc)` binds its single
+                    // scalar payload by IDENTITY — the scrutinee IS the bare int64_t
+                    // (e.g. `_scrut.err`), not a tagged struct, so read it directly
+                    // rather than `.data.Errno._0`.
+                    if sublist_length(ep_flds_sl) > 0 {
+                        let sub_pat0 = sublist_get(ep_flds_sl, 0)
+                        if node_kind(sub_pat0) == NodeKind.IdentPattern {
+                            let bn = node_name(sub_pat0)
+                            if bn != "_" {
+                                emit_line("int64_t {c_safe_name(bn)} = {scrut};")
+                                set_var(bn, CT_INT, 0)
+                            }
+                        }
+                    }
+                    return
+                }
                 if is_struct_pat != 0 {
                     bind_struct_style_variant_fields(vidx, fcount, resolved_enum, resolved_variant, scrut, ep_flds_sl)
                 } else {
@@ -2426,6 +2475,14 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
     let mut val_type = expr_result_type
     if val_type == CT_RESULT {
         enum_type = ""
+    }
+    // A transparent newtype (br ja9jev) lowers to a bare int64_t even as a
+    // standalone binding — `let e = Errno(5)` is `int64_t e = 5`, not the boxed
+    // struct. Clear the inferred enum_type so the var is declared as Int,
+    // matching the construction (CT_INT) and the identity match-binding.
+    if enum_type != "" && is_transparent_newtype(enum_type) != 0 {
+        enum_type = ""
+        val_type = CT_INT
     }
     if val_type == CT_INT && (ann_ct == CT_I8 || ann_ct == CT_I16 || ann_ct == CT_I32 || ann_ct == CT_U8 || ann_ct == CT_U16 || ann_ct == CT_U32 || ann_ct == CT_U64) {
         val_type = ann_ct
