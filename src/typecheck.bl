@@ -3510,6 +3510,36 @@ fn get_variant_enum_tid(name: Str) -> Int {
     TYPE_UNKNOWN
 }
 
+// Index of the first variant named `name` in evar_pool. This index is the
+// `var_idx` key used by evfield_pool (registration stores var_idx =
+// evar_pool.len() just before pushing the variant), so it lets variant_field_count
+// look up the declared field count for that variant. Returns -1 if not found.
+fn get_variant_var_idx(name: Str) -> Int {
+    let mut i = 0
+    while i < evar_pool.len() {
+        if evar_pool.get(i).unwrap().name == name {
+            return i
+        }
+        i = i + 1
+    }
+    -1
+}
+
+// Number of declared fields for the variant at the given evar_pool index, by
+// counting evfield_pool entries keyed on that var_idx (mirrors the traversal in
+// lookup_evfield_type_by_index). A bare variant with no payload has 0 fields.
+fn variant_field_count(var_idx: Int) -> Int {
+    let mut i = 0
+    let mut count = 0
+    while i < evfield_pool.len() {
+        if evfield_pool.get(i).unwrap().var_idx == var_idx {
+            count = count + 1
+        }
+        i = i + 1
+    }
+    count
+}
+
 // Count the number of DISTINCT enums that declare a variant named `name`.
 // get_variant_enum_tid returns only the first match, so it cannot detect
 // non-uniqueness; this is what the bare-construction cascade uses to decide
@@ -5382,6 +5412,21 @@ fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repo
                     return get_builtin_fn_ret(fn_name)
                 }
                 if is_variant_name(fn_name) != 0 {
+                    // Arity-check only when the variant name is unambiguous. An
+                    // ambiguous name (declared by >1 enum) keeps deferring to the
+                    // existing E0519 AmbiguousConstruction cascade rather than
+                    // guessing which variant's field count to compare against.
+                    if count_enums_with_variant(fn_name) == 1 {
+                        let var_idx = get_variant_var_idx(fn_name)
+                        if var_idx != -1 {
+                            let expected = variant_field_count(var_idx)
+                            let args_sl = node_args(node)
+                            let arg_count = if args_sl != -1 { sublist_length(args_sl) } else { 0 }
+                            if arg_count != expected {
+                                tc_error_at("variant '{fn_name}' expects {expected} argument(s), got {arg_count}", node)
+                            }
+                        }
+                    }
                     return get_variant_enum_tid(fn_name)
                 }
                 let sig = lookup_fnsig(fn_name)

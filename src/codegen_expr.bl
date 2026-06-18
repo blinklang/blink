@@ -2904,11 +2904,38 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
         if fn_name == "Some" {
             let args_sl = node_args(node)
             if args_sl != -1 && sublist_length(args_sl) > 0 {
+                // Resolve a transparent-newtype inner (e.g. Some(Errno(rc))) from
+                // the arg node BEFORE emit_expr collapses its type to CT_INT. The
+                // carrier stays Option_Errno with a bare int64_t value member (no
+                // box), mirroring the transparent Result treatment (br e8n2n3).
+                let mut transparent_enum = transparent_newtype_arg_enum(sublist_get(args_sl, 0))
                 emit_expr(sublist_get(args_sl, 0))
                 let inner_str = expr_result_str
                 let inner_type = expr_result_type
                 let inner_is_none = expr_option_is_none
                 expr_option_is_none = 0
+                // When the arg is a transparent-typed VARIABLE (e.g. `let e =
+                // Errno(5); Some(e)`) the carve-out at emit_let_binding already
+                // lowered `e` to a bare int64_t and cleared its enum tracking, so
+                // transparent_newtype_arg_enum sees only a CT_INT Ident. Recover
+                // the inner from the enclosing function's Option[Errno] return
+                // annotation so the carrier still resolves to Option_Errno rather
+                // than Option_int.
+                if transparent_enum == "" && inner_type == CT_INT && cg_current_fn_node != -1 {
+                    let ann_inner = option_inner_struct_from_fn(cg_current_fn_node)
+                    if ann_inner != "" && is_transparent_newtype(ann_inner) != 0 {
+                        transparent_enum = ann_inner
+                    }
+                }
+                if transparent_enum != "" {
+                    ensure_struct_option_type(transparent_enum)
+                    let opt_type = struct_option_c_type(transparent_enum)
+                    expr_result_str = "({opt_type})\{.tag = 1, .value = {inner_str}}"
+                    expr_result_type = CT_OPTION
+                    expr_option_inner = inner_type
+                    expr_option_inner_struct = transparent_enum
+                    return
+                }
                 let mut inner_s = get_var_struct(inner_str)
                 if inner_s == "" {
                     let ve_name = get_var_enum(inner_str)
@@ -3811,6 +3838,36 @@ fn is_raw_call(node: Int) -> Int {
     if args_sl == -1 { return 0 }
     if sublist_length(args_sl) != 1 { return 0 }
     1
+}
+
+// If `arg` is a transparent-newtype variant constructor call (e.g. `Errno(rc)`),
+// return the enum name (so the Option carrier can stay Option_Errno with a bare
+// scalar member). Otherwise "". This must be checked BEFORE emit_expr flattens
+// the constructor's expr_result_type to CT_INT (the transparent carve-out at the
+// top of the Call handler), which erases the type signal the Some wrapper needs.
+fn transparent_newtype_arg_enum(arg: Int) -> Str {
+    if node_kind(arg) != NodeKind.Call { return "" }
+    let callee = node_left(arg)
+    if callee == -1 || node_kind(callee) != NodeKind.Ident { return "" }
+    let variant_enum = resolve_variant(node_name(callee))
+    if variant_enum != "" && is_transparent_newtype(variant_enum) != 0 {
+        return variant_enum
+    }
+    ""
+}
+
+// Inner element NAME of a function's `Option[T]` return annotation, or "" if the
+// function does not return an Option. Parallels resolve_option_inner_from_ann
+// (which discards the name down to a CT const) — the Some construction path needs
+// the name to keep a transparent-newtype carrier (Option_Errno) when the payload
+// reaches it as a bare scalar variable rather than a literal constructor call.
+fn option_inner_struct_from_fn(fn_node: Int) -> Str {
+    if node_return_type(fn_node) != "Option" { return "" }
+    let ta = node_type_ann(fn_node)
+    if ta == -1 { return "" }
+    let elems_sl = node_elements(ta)
+    if elems_sl == -1 || sublist_length(elems_sl) < 1 { return "" }
+    node_name(sublist_get(elems_sl, 0))
 }
 
 fn flush_template_part(tpl: Str, raw_prefix: Str, current_literal: Str) ! Codegen.Emit {
