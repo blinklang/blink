@@ -1,0 +1,165 @@
+// br pbnys8: transparent-newtype Errno must lower to int64_t at EVERY function
+// boundary — return, parameter, and @ffi return — matching the already-correct
+// body/call-site/carrier lowering (br ja9jev, e8n2n3).
+//
+// The bug: bare-enum return/param sites mapped Errno via c_type_c_name(tag),
+// emitting `blink_Errno` in the C signature while the body/call-site used a bare
+// `int64_t`. The emitted C then failed to compile:
+//   error: incompatible types when returning type 'int64_t' but 'blink_Errno'
+//   error: incompatible type for argument
+// The fix routes those sites through c_type_from_tag, which returns "int64_t"
+// for transparent newtypes and is otherwise identical to c_type_c_name.
+//
+// `compile_and_run` is the red/green gate: the bug is a C-compile failure, so an
+// exit_code of 0 (plus the expected stdout) proves the boundary lowered cleanly.
+// `compile_and_emit_c` pins the exact C signature tokens (white-box).
+import compile_test_helpers
+
+// 1. Bare Errno return (the MVCE). Body constructs Errno(rc); main matches it.
+test "bare Errno return compiles and round-trips" {
+    let src = "pub type Errno \{ Errno(Int) \}\n"
+        .concat("fn make(rc: Int) -> Errno \{ Errno(rc) \}\n")
+        .concat("fn main() \{\n")
+        .concat("    match make(9) \{ Errno(rc) => io.println(\"rc \{rc\}\") \}\n")
+        .concat("\}\n")
+    let r = compile_test_helpers.compile_and_run(src, "_pbnys8_ret")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("rc 9"))
+}
+
+// 2. White-box: the return signature is int64_t, not blink_Errno.
+test "bare Errno return emits int64_t signature, not blink_Errno" {
+    let src = "pub type Errno \{ Errno(Int) \}\n"
+        .concat("fn make(rc: Int) -> Errno \{ Errno(rc) \}\n")
+        .concat("fn main() \{ let _ = make(1) \}\n")
+    let c = compile_test_helpers.compile_and_emit_c(src, "_pbnys8_ret_wb")
+    assert(c.contains("int64_t blink_u_make(int64_t rc)"))
+    assert(!c.contains("blink_Errno blink_u_make"))
+}
+
+// 3. Bare Errno parameter. Caller passes a bare int64_t; body unpacks it.
+test "bare Errno parameter compiles and round-trips" {
+    let src = "pub type Errno \{ Errno(Int) \}\n"
+        .concat("fn make(rc: Int) -> Errno \{ Errno(rc) \}\n")
+        .concat("fn show(e: Errno) \{ match e \{ Errno(rc) => io.println(\"rc \{rc\}\") \} \}\n")
+        .concat("fn main() \{ show(make(8)) \}\n")
+    let r = compile_test_helpers.compile_and_run(src, "_pbnys8_param")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("rc 8"))
+}
+
+// 3b. White-box: the parameter signature is int64_t, not blink_Errno.
+test "bare Errno parameter emits int64_t signature, not blink_Errno" {
+    let src = "pub type Errno \{ Errno(Int) \}\n"
+        .concat("fn show(e: Errno) \{ match e \{ Errno(rc) => io.println(\"rc \{rc\}\") \} \}\n")
+        .concat("fn main() \{ show(Errno(8)) \}\n")
+    let c = compile_test_helpers.compile_and_emit_c(src, "_pbnys8_param_wb")
+    assert(c.contains("blink_u_show(int64_t e)"))
+    assert(!c.contains("blink_u_show(blink_Errno"))
+}
+
+// 4. Errno returned through a relay fn (return flows back out of a second fn).
+test "bare Errno re-returned through another fn round-trips" {
+    let src = "pub type Errno \{ Errno(Int) \}\n"
+        .concat("fn make(rc: Int) -> Errno \{ Errno(rc) \}\n")
+        .concat("fn relay(rc: Int) -> Errno \{ make(rc) \}\n")
+        .concat("fn main() \{\n")
+        .concat("    match relay(7) \{ Errno(rc) => io.println(\"rc \{rc\}\") \}\n")
+        .concat("\}\n")
+    let r = compile_test_helpers.compile_and_run(src, "_pbnys8_relay")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("rc 7"))
+}
+
+// 5. impl method returning bare Errno — exercises the impl-method definition
+// signature (codegen_stmt.bl:4272) and the mangled forward decl (codegen.bl:1480).
+test "impl method returning bare Errno round-trips" {
+    let src = "pub type Errno \{ Errno(Int) \}\n"
+        .concat("type Box \{ v: Int \}\n")
+        .concat("trait BoxOps \{ fn err(self) -> Errno \}\n")
+        .concat("impl BoxOps for Box \{\n")
+        .concat("    fn err(self) -> Errno \{ Errno(self.v) \}\n")
+        .concat("\}\n")
+        .concat("fn main() \{\n")
+        .concat("    let b = Box \{ v: 4 \}\n")
+        .concat("    match b.err() \{ Errno(rc) => io.println(\"rc \{rc\}\") \}\n")
+        .concat("\}\n")
+    let r = compile_test_helpers.compile_and_run(src, "_pbnys8_impl")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("rc 4"))
+}
+
+// 5b. Regression (code-review): an impl-method Errno result captured into a
+// tuple must store a bare int64_t field — matching direct `(Errno(n), x)`
+// construction — not be registered as a boxed-enum var. A var->enum entry on
+// the method-result temp made tuple/struct field emit treat the bare int as a
+// blink_Errno field, producing invalid C (`int64_t _scrut = pair._0;` against a
+// `blink_Errno _0;` field).
+test "impl-method Errno result in a tuple round-trips" {
+    let src = "pub type Errno \{ Errno(Int) \}\n"
+        .concat("type Box \{ v: Int \}\n")
+        .concat("trait BoxOps \{ fn err(self) -> Errno \}\n")
+        .concat("impl BoxOps for Box \{\n")
+        .concat("    fn err(self) -> Errno \{ Errno(self.v) \}\n")
+        .concat("\}\n")
+        .concat("fn main() \{\n")
+        .concat("    let b = Box \{ v: 42 \}\n")
+        .concat("    let pair = (b.err(), 7)\n")
+        .concat("    match pair._0 \{ Errno(rc) => io.println(\"rc \{rc\}\") \}\n")
+        .concat("\}\n")
+    let r = compile_test_helpers.compile_and_run(src, "_pbnys8_impl_tuple")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("rc 42"))
+}
+
+// 6. @ffi fn declared -> Errno lowers the return type to int64_t at the
+// ffi_c_ret_type chokepoint — both the generated forward decl AND the extern
+// for the underlying symbol. A non-header symbol is used so the `extern` line
+// is actually emitted (a known libc symbol like `labs` would be elided).
+// White-box on emitted C. (The empty-body `void` wrapper that discards the
+// return is a separate, pre-existing FFI quirk — out of scope here.)
+test "@ffi fn returning bare Errno emits int64_t return, not blink_Errno" {
+    let src = "pub type Errno \{ Errno(Int) \}\n"
+        .concat("@ffi(\"pbnys8_ffi_err\")\n")
+        .concat("@trusted\n")
+        .concat("fn c_err(n: Int) -> Errno ! FFI \{ \}\n")
+        .concat("fn main() \{ let _ = c_err(-1) \}\n")
+    let c = compile_test_helpers.compile_and_emit_c(src, "_pbnys8_ffi")
+    assert(c.contains("int64_t blink_c_err(int64_t n)"))
+    assert(c.contains("extern int64_t pbnys8_ffi_err(int64_t n)"))
+    assert(!c.contains("blink_Errno blink_c_err"))
+    assert(!c.contains("extern blink_Errno pbnys8_ffi_err"))
+}
+
+// 7. Regression: a non-Errno single-variant Int-payload enum must STILL box
+// (the transparency gate is name + structure, scoped to Errno). Proves the
+// substitution did not flatten other single-variant enums.
+test "non-Errno single-variant enum return still boxes" {
+    let src = "pub type Foo \{ Foo(Int) \}\n"
+        .concat("fn mk(n: Int) -> Foo \{ Foo(n) \}\n")
+        .concat("fn main() \{\n")
+        .concat("    match mk(3) \{ Foo(n) => io.println(\"n \{n\}\") \}\n")
+        .concat("\}\n")
+    let c = compile_test_helpers.compile_and_emit_c(src, "_pbnys8_foo_wb")
+    assert(c.contains("blink_Foo blink_u_mk"))
+    let r = compile_test_helpers.compile_and_run(src, "_pbnys8_foo_run")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("n 3"))
+}
+
+// 8. Regression: a multi-variant enum return stays boxed.
+test "multi-variant enum return stays boxed" {
+    let src = "pub type Status \{ Good(Int) Bad(Int) \}\n"
+        .concat("fn classify(x: Int) -> Status \{ if x < 0 \{ Bad(1) \} else \{ Good(x) \} \}\n")
+        .concat("fn main() \{\n")
+        .concat("    match classify(5) \{\n")
+        .concat("        Good(n) => io.println(\"good \{n\}\")\n")
+        .concat("        Bad(n) => io.println(\"bad \{n\}\")\n")
+        .concat("    \}\n")
+        .concat("\}\n")
+    let c = compile_test_helpers.compile_and_emit_c(src, "_pbnys8_status_wb")
+    assert(c.contains("blink_Status blink_u_classify"))
+    let r = compile_test_helpers.compile_and_run(src, "_pbnys8_status_run")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("good 5"))
+}
