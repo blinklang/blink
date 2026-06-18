@@ -4,6 +4,10 @@
 // a `Ptr[T]` value.
 //
 // Spec: decisions/ffi-struct-construction.md (panel A — β + γ).
+//       decisions/libc-bytes-wrapper-coverage.md (the five `*_bytes` wrappers);
+//       sections/07_trust_modules_metadata.md §07.532-545, §07.675-708.
+
+import std.errno.{Errno}
 
 @ffi.struct(header: "poll.h", name: "pollfd")
 pub type Pollfd {
@@ -70,4 +74,139 @@ pub fn poll(fds: List[Pollfd], timeout_ms: Int) -> Result[List[Pollfd], Str] ! I
         j = j + 1
     }
     Ok(out)
+}
+
+// ── Byte-payload syscall wrappers (the v1 `*_bytes` family) ──────────────────
+//
+// Five curated wrappers around the byte-moving syscalls, ratified by panel
+// deliberation (decisions/libc-bytes-wrapper-coverage.md): the four
+// direction × domain quadrants (file/socket × read/write) plus the standalone
+// CSPRNG fill. Mechanism is uniform `Bytes.with_ptr` (§07.532-545) — never the
+// sealed-`Buf` byte-bridge primitives.
+//
+// The `@ffi` syscall MUST stay lexically inline inside the `with_ptr` closure:
+// the §9.1.3.1 closure-lexical no-grow / no-escape check (E0814/E0815/E0817) is
+// syntactic and does not descend into helpers, so factoring the call out would
+// defeat the pin guarantee.
+
+// EINVAL (22 on Linux): returned for an invalid argument — here, a negative
+// count handed to the byte-reading wrappers, rejected before it can reach the
+// syscall as a huge `size_t`. Named `ERR_INVAL` rather than `EINVAL` because the
+// transitively-included `<errno.h>` defines `EINVAL` as a C macro, which would
+// rewrite the emitted `const int64_t EINVAL = 22;` into invalid C (same reason
+// the `POLL_EVT_*` constants above avoid the libc `POLL*` macro names).
+pub let ERR_INVAL: Int = 22
+
+// Raw libc bindings. POSIX signatures; the `(void* buf, size_t len)` pair is
+// `Ptr[U8]` (the with_ptr closure param) + `U64` (size_t).
+@ffi("read", header: "unistd.h")
+@trusted(audit: "Wraps read(2). buf is a Ptr[U8] pinned by Bytes.with_ptr in read_bytes; count is bounded by the receiving Bytes.zeroed(max) buffer.")
+fn c_read(fd: I32, buf: Ptr[U8], count: U64) -> I64 ! FFI {}
+
+@ffi("write", header: "unistd.h")
+@trusted(audit: "Wraps write(2). buf is a Ptr[U8] pinned (read-only) by Bytes.with_ptr in write_bytes; count is exactly data.len().")
+fn c_write(fd: I32, buf: Ptr[U8], count: U64) -> I64 ! FFI {}
+
+@ffi("recv", header: "sys/socket.h")
+@trusted(audit: "Wraps recv(2). buf is a Ptr[U8] pinned by Bytes.with_ptr in recv_bytes; len is bounded by the receiving Bytes.zeroed(max) buffer; flags is fixed to 0.")
+fn c_recv(fd: I32, buf: Ptr[U8], len: U64, flags: I32) -> I64 ! FFI {}
+
+@ffi("send", header: "sys/socket.h")
+@trusted(audit: "Wraps send(2). buf is a Ptr[U8] pinned (read-only) by Bytes.with_ptr in send_bytes; len is exactly data.len(); flags is fixed to 0.")
+fn c_send(fd: I32, buf: Ptr[U8], len: U64, flags: I32) -> I64 ! FFI {}
+
+@ffi("getentropy", header: "sys/random.h")
+@trusted(audit: "Wraps getentropy(2). buf is a Ptr[U8] pinned by Bytes.with_ptr in getentropy_bytes; buflen is exactly n (getentropy caps at 256, which the caller is responsible for).")
+fn c_getentropy(buf: Ptr[U8], buflen: U64) -> I32 ! FFI {}
+
+// glibc thread-local errno accessor: `*__errno_location()` is `errno`. Read it
+// immediately after a failed syscall, before any other libc call clobbers it.
+@ffi("__errno_location")
+@trusted(audit: "Wraps glibc __errno_location(). Pure thread-local-address accessor with no side effects; deref reads the current errno on the failure path right after a syscall.")
+fn c_errno_location() -> Ptr[I32] ! FFI {}
+
+// Read up to `max` bytes from `fd` into a fresh `Bytes`.
+//
+// On success the returned `Bytes.len()` is the syscall's reported count, which
+// may be FEWER than `max` (a short read) or 0 at EOF — both are `Ok`, not `Err`.
+// Only a `-1` syscall return is `Err(Errno(code))`. To read exactly `n` bytes
+// (looping until `n` or EOF), use `std.io.read_fully` — `read_bytes` alone is a
+// short-read footgun.
+pub fn read_bytes(fd: Int, max: Int) -> Result[Bytes, Errno] ! IO {
+    // A negative `max` would reach the syscall as a huge unsigned `size_t`
+    // (`to_u64` is a reinterpreting cast) over a buffer `Bytes.zeroed` clamps to
+    // length 0 — a heap overflow if `fd` is readable. Reject as ERR_INVAL up front.
+    if max < 0 {
+        return Err(Errno(ERR_INVAL))
+    }
+    let buf = Bytes.zeroed(max)
+    let rc = buf.with_ptr(fn(p) -> I64 { c_read(fd.to_i32(), p, max.to_u64()) })
+    if rc < 0 {
+        return Err(Errno(c_errno_location().deref()))
+    }
+    Ok(buf.slice(0, rc))
+}
+
+// Receive up to `max` bytes from socket `fd` into a fresh `Bytes` (`flags = 0`).
+//
+// Like `read_bytes`, a short receive is `Ok` with a shorter `Bytes`; only a
+// `-1` return is `Err(Errno(code))`.
+pub fn recv_bytes(fd: Int, max: Int) -> Result[Bytes, Errno] ! IO {
+    // Reject a negative `max` before it becomes a huge `size_t` over a 0-length
+    // buffer (see `read_bytes`).
+    if max < 0 {
+        return Err(Errno(ERR_INVAL))
+    }
+    let buf = Bytes.zeroed(max)
+    let rc = buf.with_ptr(fn(p) -> I64 { c_recv(fd.to_i32(), p, max.to_u64(), 0) })
+    if rc < 0 {
+        return Err(Errno(c_errno_location().deref()))
+    }
+    Ok(buf.slice(0, rc))
+}
+
+// Write `data` to `fd`, returning the count actually written.
+//
+// A short write is normal and surfaced as `Ok(n)` where `n < data.len()` — the
+// caller must loop to write the remainder. Only a `-1` return is
+// `Err(Errno(code))`.
+pub fn write_bytes(fd: Int, data: Bytes) -> Result[Int, Errno] ! IO {
+    let rc = data.with_ptr(fn(p) -> I64 { c_write(fd.to_i32(), p, data.len().to_u64()) })
+    if rc < 0 {
+        return Err(Errno(c_errno_location().deref()))
+    }
+    Ok(rc)
+}
+
+// Send `data` to socket `fd` (`flags = 0`), returning the count actually sent.
+//
+// Like `write_bytes`, a short send is `Ok(n)` with `n < data.len()`; only a
+// `-1` return is `Err(Errno(code))`.
+pub fn send_bytes(fd: Int, data: Bytes) -> Result[Int, Errno] ! IO {
+    let rc = data.with_ptr(fn(p) -> I64 { c_send(fd.to_i32(), p, data.len().to_u64(), 0) })
+    if rc < 0 {
+        return Err(Errno(c_errno_location().deref()))
+    }
+    Ok(rc)
+}
+
+// Fill a fresh `Bytes` of length `n` with `n` cryptographically-secure random
+// bytes from the OS CSPRNG.
+//
+// getentropy is all-or-nothing: it returns 0 (success, the buffer is fully
+// filled) or -1 (failure). There is no short-fill arm — on success the returned
+// `Bytes.len()` is always `n`. (getentropy caps a single call at 256 bytes; a
+// larger `n` fails with `Err(Errno(code))`.)
+pub fn getentropy_bytes(n: Int) -> Result[Bytes, Errno] ! IO {
+    // Reject a negative `n` before it becomes a huge `size_t` over a 0-length
+    // buffer (see `read_bytes`).
+    if n < 0 {
+        return Err(Errno(ERR_INVAL))
+    }
+    let buf = Bytes.zeroed(n)
+    let rc = buf.with_ptr(fn(p) -> I32 { c_getentropy(p, n.to_u64()) })
+    if rc != 0 {
+        return Err(Errno(c_errno_location().deref()))
+    }
+    Ok(buf)
 }

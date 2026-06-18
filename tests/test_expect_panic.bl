@@ -1,0 +1,66 @@
+// @expect_panic — parser-only desugar to assert_panics (spec br cbk2wq,
+// ticket jnzmnx). `@expect_panic fn/test ... { body }` rewrites, BEFORE
+// typecheck, to `fn/test ... { assert_panics { body } }`; the
+// `@expect_panic("sub")` form rewrites to `assert_panics(matching: "sub")`.
+// Because the desugar produces a REAL AssertPanics node pre-typecheck, all of
+// the existing assert_panics machinery (E0831/E0832/E0834, pass-consumes-panic)
+// applies for free. These are real emit-site / compile-error tests.
+
+import compile_test_helpers.{compile_and_run_test_json, compile_and_capture, expect_compile_error}
+
+// ── Positive: @expect_panic on a panicking test passes ──────────────────────
+
+test "expect_panic test that panics passes (status pass)" {
+    let src = "@expect_panic\ntest \"t\" \{\n    let xs: [Int] = []\n    let _ = xs.get(0).unwrap()\n}\n"
+    let r = compile_and_run_test_json(src, "_ep_pass")
+    assert(r.out.contains("\"status\":\"pass\""))
+    assert(r.out.contains("\"passed\":1"))
+    assert(r.out.contains("\"failed\":0"))
+}
+
+// ── @expect_panic("sub") matching ───────────────────────────────────────────
+
+test "expect_panic with matching substring passes when message matches" {
+    let src = "@expect_panic(\"None\")\ntest \"t\" \{\n    let xs: [Int] = []\n    let _ = xs.get(0).unwrap()\n}\n"
+    let r = compile_and_run_test_json(src, "_ep_match_pass")
+    assert(r.out.contains("\"status\":\"pass\""))
+    assert(r.out.contains("\"passed\":1"))
+}
+
+test "expect_panic with non-matching substring -> E0832-class failure" {
+    let src = "@expect_panic(\"wrong substring\")\ntest \"t\" \{\n    let xs: [Int] = []\n    let _ = xs.get(0).unwrap()\n}\n"
+    let r = compile_and_run_test_json(src, "_ep_match_fail")
+    assert(r.out.contains("\"status\":\"failed\""))
+    assert(r.out.contains("wrong substring"))
+    assert(r.out.contains("did not contain the expected substring"))
+}
+
+// ── E0831: body does not panic, span points at the DECL line ────────────────
+
+test "expect_panic over non-panicking body -> E0831, span at decl line" {
+    // Line 1: @expect_panic ; Line 2: test "t" { ...  → the AssertPanics span
+    // is the DECL line (2), not the original body's interior.
+    let src = "@expect_panic\ntest \"t\" \{\n    let _ = 1 + 1\n}\n"
+    let r = compile_and_run_test_json(src, "_ep_e0831")
+    assert(r.out.contains("\"status\":\"failed\""))
+    assert(r.out.contains("returned normally"))
+    assert(r.out.contains("\"line\":2"))
+}
+
+// ── E0834: nested assert_panics inside an @expect_panic body is rejected ─────
+
+test "assert_panics nested inside an @expect_panic body is E0834" {
+    let src = "@expect_panic\ntest \"t\" \{\n    assert_panics \{\n        let xs: [Int] = []\n        let _ = xs.get(0).unwrap()\n    }\n}\n"
+    expect_compile_error(src, "_ep_e0834", "E0834")
+}
+
+// ── @expect_panic on a plain fn ─────────────────────────────────────────────
+// A plain fn with @expect_panic desugars to an assert_panics in a non-test fn.
+// assert_panics is test-only (E0833), so the desugar must surface E0833 rather
+// than crash — confirming the desugar wires a real AssertPanics node.
+
+test "expect_panic on a plain (non-test) fn surfaces E0833" {
+    let src = "@expect_panic\nfn helper() \{\n    let xs: [Int] = []\n    let _ = xs.get(0).unwrap()\n}\n"
+    let out = compile_and_capture(src, "_ep_e0833_fn")
+    assert(out.contains("E0833"))
+}

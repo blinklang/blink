@@ -33,6 +33,14 @@ let mut sl_stack: List[Int] = []
 let mut annotation_nodes: List[Int] = []
 let mut program_annotation_nodes: List[Int] = []
 
+// `@expect_panic` desugars to a real AssertPanics node during parse so the
+// compile path gets all the assert_panics machinery for free. The FORMAT path
+// disables it (set to 0 before parse_program, restored after) so the formatter
+// round-trips the original `@expect_panic` surface syntax instead of printing
+// the desugared `assert_panics` body — which would otherwise double-wrap on the
+// next format and is non-idempotent.
+pub let mut parse_desugar_enabled: Int = 1
+
 // Side table: dotted-path-derived module key per top-level decl node.
 // Populated during merge_programs from the import graph. Used by
 // codegen's archive-mode emission filter to route decls by source
@@ -48,6 +56,7 @@ pub fn parser_reset() {
     program_annotation_nodes.clear()
     source_module_for_node.clear()
     pos = 0
+    parse_desugar_enabled = 1
 }
 
 pub fn record_source_module(node_id: Int, key: Str) {
@@ -639,6 +648,63 @@ fn attach_pending_annotations(node: Int) ! Parse.Build {
     }
 }
 
+// First InterpString argument of an annotation, positional or `matching:`-named
+// (both forms of `@expect_panic("sub")` / `@expect_panic(matching: "sub")`).
+// Returns the arg expr node id, reusable directly as the assert_panics matching
+// expr, or -1 when the annotation has no string argument (the bare form).
+fn first_str_ann_arg(ann: Int) -> Int {
+    let args_sl = node_args(ann)
+    if args_sl == -1 { return -1 }
+    let mut i = 0
+    while i < sublist_length(args_sl) {
+        let arg = sublist_get(args_sl, i)
+        if node_kind(arg) == NodeKind.InterpString { return arg }
+        i = i + 1
+    }
+    -1
+}
+
+// `@expect_panic`-desugar (spec br cbk2wq): rewrite, BEFORE typecheck, a fn or
+// test decl carrying `@expect_panic[("sub")]` so its body is wrapped in a real
+// AssertPanics node — `assert_panics { body }` (or `assert_panics(matching:
+// "sub") { body }`). The whole assert_panics machinery (E0831/E0832/E0834,
+// pass-consumes-panic) then applies for free. The AssertPanics span is the
+// DECL's line/col so an E0831 "body returned" failure points at the decl, not
+// the body interior. No-op when `@expect_panic` is absent or the decl has no
+// body (a `?`-recovered/empty decl).
+fn maybe_desugar_expect_panic(decl: Int) ! Parse.Build {
+    if parse_desugar_enabled == 0 { return }
+    let ann = get_annotation(decl, "expect_panic")
+    if ann == -1 { return }
+    let body = node_body(decl)
+    if body == -1 { return }
+
+    let match_expr = first_str_ann_arg(ann)
+    let decl_line = node_line(decl)
+    let decl_col = node_col(decl)
+    let body_end_l = node_end_line(body)
+    let body_end_c = node_end_col(body)
+
+    let ap_id = node_count()
+    nodes.push(AstNode {
+        kind: NodeKind.AssertPanics,
+        body: body, value: match_expr,
+        line: decl_line, col: decl_col,
+        end_line: body_end_l, end_col: body_end_c,
+    })
+
+    let stmts = new_sublist()
+    sublist_push(stmts, ap_id)
+    finalize_sublist(stmts)
+    let block_id = node_count()
+    nodes.push(AstNode {
+        kind: NodeKind.Block, stmts: stmts,
+        line: decl_line, col: decl_col,
+        end_line: body_end_l, end_col: body_end_c,
+    })
+    node_set_body(decl, block_id)
+}
+
 // ── Import statements ────────────────────────────────────────────────
 
 fn parse_import_stmt() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
@@ -824,6 +890,7 @@ pub fn parse_program() -> Int ! Parse, Diag.Report {
                 let f = parse_fn_def()
                 node_set_is_pub(f, 1)
                 attach_pending_annotations(f)
+                maybe_desugar_expect_panic(f)
                 fn_nodes.push(f)
             } else if at(TokenKind.Type) {
                 let td = parse_type_def()
@@ -868,10 +935,12 @@ pub fn parse_program() -> Int ! Parse, Diag.Report {
             advance()
             let tb = parse_test_block()
             attach_pending_annotations(tb)
+            maybe_desugar_expect_panic(tb)
             test_nodes.push(tb)
         } else if at(TokenKind.Fn) {
             let f = parse_fn_def()
             attach_pending_annotations(f)
+            maybe_desugar_expect_panic(f)
             fn_nodes.push(f)
         } else if at(TokenKind.Mod) {
             let mod_line = peek_line()
