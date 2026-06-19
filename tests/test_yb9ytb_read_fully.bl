@@ -1,0 +1,117 @@
+// Tests for std.io.read_fully (yb9ytb).
+//
+// read_fully loops libc.read_bytes until exactly `n` bytes are accumulated or
+// EOF (a 0-length read) is reached — unlike read_bytes, a short read does NOT
+// terminate it. A negative `n` is rejected up front as Err(Errno(ERR_INVAL)),
+// mirroring read_bytes's guard.
+//
+// Spec: sections/07_trust_modules_metadata.md §9.1.3.3;
+//       decisions/libc-bytes-wrapper-coverage.md.
+//
+// Hermetic fds: an anonymous in-memory fd from memfd_create(2) (no filesystem
+// path, auto-cleaned on close) keeps `task test` reproducible. lseek/close/
+// memfd_create are test-local @ffi bindings, NOT part of the v1 libc surface.
+import std.io.{read_fully}
+import std.libc.{write_bytes, ERR_INVAL}
+
+@ffi("memfd_create", header: "sys/mman.h")
+@trusted(audit: "yb9ytb-test: anonymous in-memory fd for hermetic read_fully tests")
+fn t_memfd_create(name: Ptr[U8], flags: U32) -> I32 ! FFI {}
+
+@ffi("lseek", header: "unistd.h")
+@trusted(audit: "yb9ytb-test: rewind the in-memory fd between write and read")
+fn t_lseek(fd: I32, offset: I64, whence: I32) -> I64 ! FFI {}
+
+@ffi("close", header: "unistd.h")
+@trusted(audit: "yb9ytb-test: close the in-memory fd")
+fn t_close(fd: I32) -> I32 ! FFI {}
+
+fn open_memfd() -> Int ! IO {
+    let mut scope = ffi_scope()
+    let name = scope.cstr("blink_read_fully_test")
+    t_memfd_create(name, 0.to_u32()).to_int()
+}
+
+test "read_fully reads exactly n when n bytes are available" {
+    let fd = open_memfd()
+    let payload = Bytes.from_str("exactly twenty bytes")
+    let _ = write_bytes(fd, payload)
+    let _ = t_lseek(fd.to_i32(), 0, 0)
+    match read_fully(fd, payload.len()) {
+        Ok(b) => {
+            assert_eq(b.len(), payload.len())
+            match b.to_str() {
+                Ok(s) => assert_eq(s, "exactly twenty bytes")
+                Err(_) => assert(false)
+            }
+        }
+        Err(Errno(_)) => assert(false)
+    }
+    let _ = t_close(fd.to_i32())
+}
+
+test "read_fully returns Ok with fewer than n bytes on EOF" {
+    let fd = open_memfd()
+    let _ = write_bytes(fd, Bytes.from_str("12345"))
+    let _ = t_lseek(fd.to_i32(), 0, 0)
+    // ask for 100, only 5 available -> Ok with len 5 (EOF before n), NOT Err
+    match read_fully(fd, 100) {
+        Ok(b) => assert_eq(b.len(), 5)
+        Err(Errno(_)) => assert(false)
+    }
+    let _ = t_close(fd.to_i32())
+}
+
+test "two sequential read_fully calls assemble across reads" {
+    let fd = open_memfd()
+    let _ = write_bytes(fd, Bytes.from_str("first-second"))
+    let _ = t_lseek(fd.to_i32(), 0, 0)
+    // First call consumes "first" (5 bytes), second consumes "-second" (7 bytes).
+    // Exercises the subtract-and-loop accounting across distinct fd offsets.
+    match read_fully(fd, 5) {
+        Ok(b) => {
+            assert_eq(b.len(), 5)
+            match b.to_str() {
+                Ok(s) => assert_eq(s, "first")
+                Err(_) => assert(false)
+            }
+        }
+        Err(Errno(_)) => assert(false)
+    }
+    match read_fully(fd, 7) {
+        Ok(b) => {
+            assert_eq(b.len(), 7)
+            match b.to_str() {
+                Ok(s) => assert_eq(s, "-second")
+                Err(_) => assert(false)
+            }
+        }
+        Err(Errno(_)) => assert(false)
+    }
+    let _ = t_close(fd.to_i32())
+}
+
+test "read_fully on a bad fd (-1) returns Err(Errno) with EBADF (9)" {
+    match read_fully(-1, 8) {
+        Ok(_) => assert(false)
+        Err(Errno(e)) => assert_eq(e, 9)
+    }
+}
+
+test "read_fully with n == 0 returns Ok(empty) without reading" {
+    let fd = open_memfd()
+    let _ = write_bytes(fd, Bytes.from_str("ignored"))
+    let _ = t_lseek(fd.to_i32(), 0, 0)
+    match read_fully(fd, 0) {
+        Ok(b) => assert_eq(b.len(), 0)
+        Err(Errno(_)) => assert(false)
+    }
+    let _ = t_close(fd.to_i32())
+}
+
+test "read_fully with n < 0 is rejected with Err(Errno(EINVAL))" {
+    match read_fully(0, -1) {
+        Ok(_) => assert(false)
+        Err(Errno(e)) => assert_eq(e, ERR_INVAL)
+    }
+}

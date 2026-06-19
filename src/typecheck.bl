@@ -2830,6 +2830,17 @@ fn tc_qualifier_for_module(mod_key: Str) -> Str {
     mod_key
 }
 
+// Inverse of tc_qualifier_for_module: an import qualifier (the leaf the user
+// writes before `.`, e.g. "libc") -> the module key stored in tc_symbol_module
+// values (e.g. "std_libc"). Falls back to the qualifier when no alias mapping
+// exists (qual == key).
+pub fn tc_qualifier_to_module_or_self(qualifier: Str) -> Str {
+    match tc_qualifier_to_module.get(qualifier) {
+        Some(mod_name) => mod_name
+        None => qualifier
+    }
+}
+
 fn nr_check_selective_access(name: Str, node: Int) -> Int ! Diag.Report {
     if nr_current_module == "" { return 0 }
     if is_builtin_name(name) != 0 { return 0 }
@@ -3621,6 +3632,42 @@ fn suggest_variant(name: Str) -> Str {
     if threshold < 1 { threshold = 1 }
     if best_dist > threshold { return "" }
     "{best_enum}.{best_var}"
+}
+
+// Suggest the closest known member of `mod_name` (a module key, e.g. "std_libc")
+// to `member`, scanning tc_symbol_module for symbols whose source module equals
+// `mod_name`. Returns "" when nothing is within the threshold, so a far-off typo
+// gets no bogus suggestion. `pub` so codegen's module-qualified-call path (which
+// has the scope-var guard `infer_type` lacks) can offer the suggestion.
+//
+// Threshold is stricter than suggest_variant's: a longer name (threshold > 1)
+// must be edit-distance STRICTLY under member.len()/3, not merely <=. This keeps
+// a single-char typo on a short name (`read_byte` -> `read_bytes`, dist 1) while
+// rejecting a name that is a deferred *feature*, not a typo: `recvfrom_bytes`
+// (14 chars, threshold 4) is exactly dist 4 from `recv_bytes` and must NOT
+// suggest it (a UDP wrapper is post-v1, not a misspelling of TCP recv).
+pub fn suggest_module_member(mod_name: Str, member: Str) -> Str {
+    let mut best_dist = -1
+    let mut best_name = ""
+    let keys = tc_symbol_module.keys()
+    let mut i = 0
+    while i < keys.len() {
+        let sym = keys.get(i).unwrap()
+        if tc_symbol_module.get(sym).unwrap() == mod_name {
+            let d = str_levenshtein(member, sym)
+            if best_dist == -1 || d < best_dist {
+                best_dist = d
+                best_name = sym
+            }
+        }
+        i = i + 1
+    }
+    if best_dist == -1 { return "" }
+    let mut threshold = member.len() / 3
+    if threshold < 1 { threshold = 1 }
+    if best_dist > threshold { return "" }
+    if threshold > 1 && best_dist >= threshold { return "" }
+    best_name
 }
 
 fn is_trait_name(name: Str) -> Int {
