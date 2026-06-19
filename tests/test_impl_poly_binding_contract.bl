@@ -1,0 +1,113 @@
+// sgrefz -- typecheck binding for polymorphic impls. The impl-header binder
+// `T` must be resolvable inside method signatures so the trait-contract check
+// runs for poly impls (Self == Box[T], param/return T == T), while codegen
+// support is still in progress (project b1bdnh) so E0908 still fires.
+//
+// Cases:
+//   1. consistent  impl[T] MyTrait[T] for Box[T] { fn op(self, x: T) -> T }
+//      -> E0908 only; NO contract error (E0900/E0901/E0902/E0903).
+//   2. bad param   fn op(self, x: Int) -> T
+//      -> E0908 AND E0902 (param type mismatch). Proves the contract loop runs.
+//   3. missing fn  empty impl body
+//      -> E0908 AND E0900 (missing method).
+import std.process { ProcessResult }
+
+fn run_check(blink_root: Str, base: Str, fname: Str, src: Str) -> ProcessResult {
+    write_file("{base}/{fname}", src)
+    let cmd = "cd {base} && {blink_root}/build/blink check --json {fname} 2>&1"
+    return process_run("sh", ["-c", cmd])
+}
+
+fn main() {
+    let blink_root = process_run("sh", ["-c", "pwd -P"]).out.trim_right()
+    let base = ".tmp/_test_impl_poly_binding_contract"
+    shell_exec("rm -rf {base}")
+    shell_exec("mkdir -p {base}")
+    write_file(
+        "{base}/blink.toml",
+        "[package]\nname = \"ipbc\"\nversion = \"0.1.0\"\n\n[dependencies]\n"
+    )
+    // Case 1: consistent poly impl -> contract check passes under binding,
+    // only the codegen-not-ready gate (E0908) fires.
+    let src1 = "pub trait MyTrait[T] \{\n    fn op(self, x: T) -> T\n\}\n\ntype Box[V] \{ value: V \}\n\nimpl[T] MyTrait[T] for Box[T] \{\n    fn op(self, x: T) -> T \{ x \}\n\}\n\nfn main() \{\n    io.println(\"unreachable\")\n\}\n"
+    let r1 = run_check(blink_root, base, "mvce1.bl", src1)
+    if r1.exit_code == 0 {
+        io.println(
+            "FAIL: case 1 consistent poly impl should be rejected (E0908), but check exited 0"
+        )
+        shell_exec("rm -rf {base}")
+        return
+    }
+    if !r1.out.contains("\"code\":\"E0908\"") {
+        io.println("FAIL: case 1 should report E0908 (polymorphic impls not yet compiled)")
+        io.println("got: {r1.out}")
+        shell_exec("rm -rf {base}")
+        return
+    }
+    if r1.out.contains("\"code\":\"E0900\"") || r1.out.contains("\"code\":\"E0901\"") {
+        io.println(
+            "FAIL: case 1 consistent poly impl must NOT report a contract error (E0900/E0901)"
+        )
+        io.println("got: {r1.out}")
+        shell_exec("rm -rf {base}")
+        return
+    }
+    if r1.out.contains("\"code\":\"E0902\"") || r1.out.contains("\"code\":\"E0903\"") {
+        io.println(
+            "FAIL: case 1 consistent poly impl must NOT report a contract error (E0902/E0903)"
+        )
+        io.println("got: {r1.out}")
+        shell_exec("rm -rf {base}")
+        return
+    }
+    // Case 2: param type Int where trait says T -> contract loop must run for
+    // poly impls and flag E0902, in addition to the E0908 gate.
+    let src2 = "pub trait MyTrait[T] \{\n    fn op(self, x: T) -> T\n\}\n\ntype Box[V] \{ value: V \}\n\nimpl[T] MyTrait[T] for Box[T] \{\n    fn op(self, x: Int) -> T \{ x \}\n\}\n\nfn main() \{\n    io.println(\"unreachable\")\n\}\n"
+    let r2 = run_check(blink_root, base, "mvce2.bl", src2)
+    if r2.exit_code == 0 {
+        io.println("FAIL: case 2 malformed-param poly impl should be rejected, but check exited 0")
+        shell_exec("rm -rf {base}")
+        return
+    }
+    if !r2.out.contains("\"code\":\"E0908\"") {
+        io.println("FAIL: case 2 should still report the E0908 codegen-not-ready gate")
+        io.println("got: {r2.out}")
+        shell_exec("rm -rf {base}")
+        return
+    }
+    if !r2.out.contains("\"code\":\"E0902\"") {
+        io.println(
+            "FAIL: case 2 should report E0902 (param type mismatch) -- contract loop must run for poly impls"
+        )
+        io.println("got: {r2.out}")
+        shell_exec("rm -rf {base}")
+        return
+    }
+    // Case 3: missing method -> contract loop must run and flag E0900,
+    // in addition to the E0908 gate.
+    let src3 = "pub trait MyTrait[T] \{\n    fn op(self, x: T) -> T\n\}\n\ntype Box[V] \{ value: V \}\n\nimpl[T] MyTrait[T] for Box[T] \{\n\}\n\nfn main() \{\n    io.println(\"unreachable\")\n\}\n"
+    let r3 = run_check(blink_root, base, "mvce3.bl", src3)
+    if r3.exit_code == 0 {
+        io.println("FAIL: case 3 missing-method poly impl should be rejected, but check exited 0")
+        shell_exec("rm -rf {base}")
+        return
+    }
+    if !r3.out.contains("\"code\":\"E0908\"") {
+        io.println("FAIL: case 3 should still report the E0908 codegen-not-ready gate")
+        io.println("got: {r3.out}")
+        shell_exec("rm -rf {base}")
+        return
+    }
+    if !r3.out.contains("\"code\":\"E0900\"") {
+        io.println(
+            "FAIL: case 3 should report E0900 (missing method) -- contract loop must run for poly impls"
+        )
+        io.println("got: {r3.out}")
+        shell_exec("rm -rf {base}")
+        return
+    }
+    io.println(
+        "PASS: poly-impl binding runs the trait-contract check (E0902/E0900) while E0908 still gates codegen"
+    )
+    shell_exec("rm -rf {base}")
+}
