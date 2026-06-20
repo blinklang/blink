@@ -1,0 +1,97 @@
+// Spec §07:250-319 — `with ffi.scope() as scope { ... }` block form.
+//
+// The blessed FFI scoped-allocation surface: a `with`-bound scope whose
+// allocations are freed deterministically when the block exits (normal
+// return, `?` early return, or fall-through). Exercises the namespaced
+// `ffi.scope()` form (not the off-spec bare `ffi_scope()`), runtime cleanup
+// without crashing, and the E0601 origin bookkeeping.
+
+import compile_test_helpers
+
+@ffi.struct(header: "poll.h", name: "pollfd")
+pub type Pollfd { fd: I32, events: I16, revents: I16 }
+
+// ── Happy path: alloc / write / deref inside the with-block ──────────────
+
+test "with ffi.scope: alloc, write, deref" {
+    with ffi.scope() as scope {
+        let p: Ptr[Int] = scope.alloc()
+        p.write(99)
+        assert_eq(p.deref(), 99)
+        assert_eq(p.is_null(), false)
+    }
+    assert(true)
+}
+
+test "with ffi.scope: cstr, alloc_n, take inside the block" {
+    with ffi.scope() as scope {
+        let s = scope.cstr("scoped string")
+        assert_eq(s.is_null(), false)
+        let a: Ptr[Int] = scope.alloc()
+        a.write(1)
+        let taken: Ptr[Int] = scope.take(a)
+        assert_eq(taken.deref(), 1)
+    }
+    assert(true)
+}
+
+// ── Runtime cleanup must not crash (br 2df18y) ──────────────────────────
+//
+// Cleanup frees calloc'd allocations (scope.alloc/alloc_n) and the cstr
+// copy. The whole point of the with-form is that cleanup runs at block exit;
+// a GC_FREE-on-calloc mismatch segfaults. Assert the program exits cleanly.
+
+test "with ffi.scope: cleanup at block exit does not crash" {
+    let src = "@trusted(audit: \"test\")\nfn go() ! FFI \{\n    with ffi.scope() as scope \{\n        let p: Ptr[Int] = scope.alloc()\n        p.write(7)\n        let s = scope.cstr(\"hello\")\n        let _ = s.is_null()\n        let arr: Ptr[Int] = scope.alloc_n(4)\n        let _ = arr.is_null()\n    }\n}\nfn main() \{ go()\n io.println(\"ok\") }\n"
+    let r = compile_test_helpers.compile_and_run(src, "ffi_scope_with_cleanup")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("ok"))
+}
+
+// ── Cleanup fires on early-return / `?` exit paths (br c90c7x) ───────────
+//
+// Spec §07:274: scope frees on "normal return, ? early return, or any other
+// exit path". A tail-emitted cleanup is dead code after a return.
+
+test "with ffi.scope: cleanup fires on early return path" {
+    let src = "@trusted(audit: \"test\")\nfn go(early: Int) -> Int ! FFI \{\n    with ffi.scope() as scope \{\n        let p: Ptr[Int] = scope.alloc()\n        p.write(7)\n        if early == 1 \{ return 100 }\n        return p.deref()\n    }\n}\nfn main() \{\n    io.println(\"a=\{go(0)}\")\n    io.println(\"b=\{go(1)}\")\n}\n"
+    let r = compile_test_helpers.compile_and_run(src, "ffi_scope_with_early_return")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("a=7"))
+    assert(r.out.contains("b=100"))
+}
+
+test "with ffi.scope: cleanup fires on `?` propagation path" {
+    let src = "@trusted(audit: \"test\")\nfn inner(fail: Int) -> Result[Int, Str] ! FFI \{\n    with ffi.scope() as scope \{\n        let p: Ptr[Int] = scope.alloc()\n        p.write(5)\n        if fail == 1 \{ return Err(\"boom\") }\n        Ok(p.deref())\n    }\n}\nfn go(fail: Int) -> Result[Int, Str] ! FFI \{\n    let v = inner(fail)?\n    Ok(v + 1)\n}\nfn main() \{\n    match go(0) \{ Ok(v) => io.println(\"ok=\{v}\")\n Err(e) => io.println(\"err=\{e}\") }\n    match go(1) \{ Ok(v) => io.println(\"ok=\{v}\")\n Err(e) => io.println(\"err=\{e}\") }\n}\n"
+    let r = compile_test_helpers.compile_and_run(src, "ffi_scope_with_question")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("ok=6"))
+    assert(r.out.contains("err=boom"))
+}
+
+// ── E0601 origin bookkeeping under the with-form ────────────────────────
+//
+// The positive escape error (returning a scope Ptr) is latent behind E0811
+// PtrOutsideFFI in today's surface (see test_ffi_scope_escape.bl). These
+// codify that the with-form's origin tracking does not false-positive on
+// legitimate within-block use, and that scope.take() clears the origin.
+
+test "with ffi.scope: same-scope offset chain does not report E0601" {
+    let src = "@ffi.struct(header: \"poll.h\", name: \"pollfd\")\npub type Pollfd \{ fd: I32, events: I16, revents: I16 }\n@trusted(audit: \"test\")\nfn use_scope() ! FFI \{\n    with ffi.scope() as scope \{\n        let buf: Ptr[Pollfd] = scope.alloc_n(4)\n        let cell = buf.offset(1)\n        cell.fd.write(0)\n    }\n}\nfn main() \{ use_scope() }\n"
+    compile_test_helpers.expect_no_error(src, "ffi_scope_with_offset_chain", "E0601")
+}
+
+test "with ffi.scope: scope.take() clears the origin so the Ptr is detached" {
+    let src = "@ffi.struct(header: \"poll.h\", name: \"pollfd\")\npub type Pollfd \{ fd: I32, events: I16, revents: I16 }\n@trusted(audit: \"test\")\nfn use_scope() ! FFI \{\n    with ffi.scope() as scope \{\n        let p: Ptr[Pollfd] = scope.take(scope.alloc())\n        let _ = p.is_null()\n    }\n}\nfn main() \{ use_scope() }\n"
+    compile_test_helpers.expect_no_error(src, "ffi_scope_with_take_clears", "E0601")
+}
+
+// ── E0819: ffi.scope() is only valid as a with-resource (§07:257) ───────
+//
+// A bare `let s = ffi.scope()` wires no cleanup — every allocation would
+// leak — so it is rejected at compile time.
+
+test "ffi.scope: bare binding (no `with`) is rejected with E0819" {
+    let src = "@trusted(audit: \"test\")\nfn go() ! FFI \{\n    let s = ffi.scope()\n    let p: Ptr[Int] = s.alloc()\n    p.write(1)\n}\nfn main() \{ go() }\n"
+    compile_test_helpers.expect_compile_error(src, "ffi_scope_bare_binding", "E0819")
+}

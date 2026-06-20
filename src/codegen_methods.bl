@@ -9,7 +9,7 @@ import codegen_types.{
     cg_closure_param_type_hint, cg_current_fn_name, cg_handler_body_idx,
     cg_handler_cleanup_fn, cg_handler_cleanup_var,
     cg_handler_is_user_effect, cg_handler_vtable_field, cg_handler_vtable_type,
-    cg_in_handler_body, cg_indent, cg_let_target_name, cg_let_target_type,
+    cg_in_handler_body, cg_in_ffi_scope_resource, cg_indent, cg_let_target_name, cg_let_target_type,
     cg_uses_async,
     closure_cap_infos, closure_captures, closure_ret_ct, closure_sig_ret_part,
     emit_line, ensure_chain_iter, ensure_filter_iter, ensure_flat_map_iter,
@@ -57,7 +57,7 @@ import diagnostics.{
     diag_error_at,
     TEMPLATE_MISMATCH, UNRESOLVED_METHOD,
     FFI_OFFSET_ON_SINGLETON, FFI_OFFSET_UNKNOWN_STRIDE,
-    WITH_PTR_BODY_TOO_COMPLEX,
+    WITH_PTR_BODY_TOO_COMPLEX, FFI_SCOPE_NOT_WITH_RESOURCE,
 }
 
 // Arg offset for trait-qualified builtin calls: MapOps.contains_key(m, k) has receiver at args[0]
@@ -1717,6 +1717,22 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             expr_result_type = CT_VOID
             return
         }
+    }
+
+    // ffi.scope() — intrinsic namespace constructor for a scoped FFI arena.
+    // Valid only as a `with`-resource (§07:257); the WithResource codegen wires
+    // the attribute((cleanup)) destructor that frees the arena on block exit.
+    // Outside `with`, nothing wires cleanup and every allocation leaks, so a
+    // bare `let s = ffi.scope()` binding is rejected (E0819).
+    if node_kind(obj_node) == NodeKind.Ident && node_name(obj_node) == "ffi" && mc_obj_is_local == 0 && method == "scope" {
+        let in_with = cg_in_ffi_scope_resource
+        cg_in_ffi_scope_resource = 0
+        if in_with == 0 {
+            diag_error_at("FfiScopeNotWithResource", FFI_SCOPE_NOT_WITH_RESOURCE, "ffi.scope() is only valid as a `with`-resource — its allocations are freed at block exit", node, "use `with ffi.scope() as scope \{ ... }`")
+        }
+        expr_result_str = "blink_ffi_scope_new()"
+        expr_result_type = CT_FFI_SCOPE
+        return
     }
 
     // ── net.* operations — old blocks removed, see blink_tcp_* blocks below ──
@@ -3560,7 +3576,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             let args_sl = node_args(node)
             emit_expr(sublist_get(args_sl, 0))
             let arg_str = expr_result_str
-            expr_result_str = "(uint8_t*)blink_ffi_scope_track({obj_str}, blink_strdup({arg_str}))"
+            expr_result_str = "(uint8_t*)blink_ffi_scope_cstr({obj_str}, {arg_str})"
             expr_result_type = CT_PTR
             ffi_origin_pending = scope_origin
             return

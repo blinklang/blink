@@ -70,6 +70,7 @@ pub const BYTES_GROW_IN_WITH_PTR   = "E0814"
 pub const PINNED_BYTES_ESCAPE      = "E0815"
 pub const WITH_PTR_BODY_TOO_COMPLEX = "E0816"
 pub const BYTES_PTR_CAST_FORBIDDEN = "E0817"
+pub const FFI_SCOPE_NOT_WITH_RESOURCE = "E0819"
 pub const MISSING_NATIVE_DEP       = "E0820"
 pub const NATIVE_DEP_UNAVAILABLE_CROSS = "E0821"
 pub const FFI_OFFSET_UNKNOWN_STRIDE = "E0822"
@@ -819,6 +820,9 @@ pub fn diag_explain(code: Str) -> Str {
     if code == BYTES_PTR_CAST_FORBIDDEN {
         return "E0817 -- BytesPtrCastForbidden\n\nBytes cannot be cast or coerced to Ptr[U8] outside a with_ptr\nclosure. Bytes is a GC-managed buffer and may be relocated by\nthe garbage collector; raw Ptr[U8] aliases would dangle.\n\nFix: use Bytes.with_ptr to pin the buffer for the duration of\nthe call, and pass the pinned pointer to the FFI:\n\n  b.with_ptr(fn(p) \{ c_read(fd, p, b.len()) })   // OK"
     }
+    if code == FFI_SCOPE_NOT_WITH_RESOURCE {
+        return "E0819 -- FfiScopeNotWithResource\n\nffi.scope() was bound directly (e.g. `let s = ffi.scope()`) instead\nof as a `with`-resource. A scope frees its allocations when the\nwith-block exits; outside a `with` there is no block to exit, so\nnothing would ever free the arena and every allocation leaks.\n\nFix: bind the scope with `with ... as`:\n\n  with ffi.scope() as scope \{\n      let p: Ptr[Pollfd] = scope.alloc()\n      // p is freed here, at block exit\n  \}"
+    }
     if code == MISSING_NATIVE_DEP {
         return "E0820 -- MissingNativeDep\n\nAn @ffi annotation references a C library that is not declared in\nthe [native-dependencies] section of blink.toml.\n\nFix: add the library to blink.toml:\n\n  [native-dependencies]\n  libname = \{ system = true \}"
     }
@@ -892,7 +896,7 @@ pub fn diag_explain(code: Str) -> Str {
         return "E0511 -- InvalidKeywordArg\n\nA keyword argument at the call site does not correspond to any\nparameter on the called function. The name is misspelled or the\nfunction does not accept that keyword.\n\nFix: check the parameter list of the called function and correct\nthe argument name.\n\n  fn greet(name: Str) \{ ... \}\n  greet(nmae: \"Skippy\")   // E0511 -- did you mean 'name'?"
     }
     if code == CLOSEABLE_ESCAPES_SCOPE {
-        return "E0601 -- CloseableEscapesScope / PtrEscapesFfiScope\n\nCloseableEscapesScope: a `Closeable` value escapes the `with ... as`\nblock that owns it. Closeable resources are released when the\nwith-block exits, so references that survive would be use-after-close.\n\nFix: keep the value inside the with-block, or copy out only the\ndata you need before the block ends.\n\n  with open(\"f.txt\") as f \{\n      let bytes = f.read_all()  // OK -- bytes is plain data\n      // return f               // E0601 -- f outlives the scope\n  \}\n\nPtrEscapesFfiScope: a `Ptr` minted from a locally-bound `ffi_scope()`\nis returned from the function that owns the scope. The scope's arena\nfrees its allocations on cleanup, leaving the caller with a dangling\npointer.\n\nFix: call `scope.take(p)` to detach the Ptr from the scope before\nreturning it.\n\n  fn f() -> Ptr[Pollfd] \{\n      let mut s = ffi_scope()\n      let p: Ptr[Pollfd] = s.alloc()\n      s.take(p)                 // OK -- detached from scope\n  \}"
+        return "E0601 -- CloseableEscapesScope / PtrEscapesFfiScope\n\nCloseableEscapesScope: a `Closeable` value escapes the `with ... as`\nblock that owns it. Closeable resources are released when the\nwith-block exits, so references that survive would be use-after-close.\n\nFix: keep the value inside the with-block, or copy out only the\ndata you need before the block ends.\n\n  with open(\"f.txt\") as f \{\n      let bytes = f.read_all()  // OK -- bytes is plain data\n      // return f               // E0601 -- f outlives the scope\n  \}\n\nPtrEscapesFfiScope: a `Ptr` allocated inside a `with ffi.scope() as\nscope` block escapes the block. The scope frees its allocations when\nthe block exits, so the escaped Ptr would dangle.\n\nFix: call `scope.take(p)` to detach the Ptr from the scope before it\nleaves the block.\n\n  with ffi.scope() as scope \{\n      let p: Ptr[Pollfd] = scope.alloc()\n      scope.take(p)             // OK -- detached, may now escape\n  \}"
     }
     if code == ARENA_TYPE_CONTAINS_CYCLE {
         return "E0701 -- ArenaTypeContainsCycle\n\nA value crossing the `with arena \{ \}` boundary has a type that\ncontains a reference cycle. The arena promotion walker copies\nreachable cells; a cycle would either loop forever or alias the\nsource.\n\nFix: break the cycle (e.g. via an Option indirection or a manual\ncopy step), or promote the value before exiting the arena.\n\n  type Node \{ next: Option[Node] \}   // OK -- Option breaks the cycle"

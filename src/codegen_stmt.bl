@@ -17,7 +17,7 @@ import codegen_types.{
     cg_handler_body_is_ue, cg_handler_cleanup_fn, cg_handler_cleanup_var,
     cg_handler_is_user_effect,
     cg_handler_vtable_field, cg_handler_vtable_type,
-    cg_in_handler_body, cg_indent, cg_test_mode, cg_in_assert_panics, cg_assert_panics_counter, cg_let_target_ann,
+    cg_in_handler_body, cg_in_ffi_scope_resource, cg_indent, cg_test_mode, cg_in_assert_panics, cg_assert_panics_counter, cg_let_target_ann,
     cg_mono_tparams_sl, cg_mono_concrete_args,
     cg_let_target_name, cg_let_target_type, cg_lines, cg_program_node,
     cg_temp_counter, cg_trace_codegen, cg_ensures_result_var, cg_old_snapshot_vars,
@@ -3111,8 +3111,6 @@ fn emit_with_block_core(node: Int, is_expr: Int, result_sink: Str) -> Str ! Code
         return ""
     }
     let count = sublist_length(handlers_sl)
-    let mut resource_names: List[Str] = []
-    let mut resource_vars: List[Str] = []
     let mut num_installed_fields = 0
     let mut bh_state_vars: List[Str] = []
     let mut arena_tmp = ""
@@ -3151,7 +3149,9 @@ fn emit_with_block_core(node: Int, is_expr: Int, result_sink: Str) -> Str ! Code
         if item_kind == NodeKind.WithResource {
             let binding = node_name(item)
             let res_expr = node_value(item)
+            cg_in_ffi_scope_resource = 1
             emit_expr(res_expr)
+            cg_in_ffi_scope_resource = 0
             let res_str = expr_result_str
             let res_type = expr_result_type
             let res_struct = get_var_struct(res_str)
@@ -3175,6 +3175,21 @@ fn emit_with_block_core(node: Int, is_expr: Int, result_sink: Str) -> Str ! Code
                 emit_line("{c_decl} {binding} = {tmp};")
                 set_var(binding, res_type, 0)
                 set_var_struct(binding, res_struct)
+            } else if res_type == CT_FFI_SCOPE {
+                // Spec §07:274 — scope frees on every exit path (fall-through,
+                // return, ? early return, caught panic). Ride the same
+                // attribute((cleanup)) + longjmp dispatch the Closeable path
+                // uses; a tail-emitted cleanup would be dead code after a return.
+                emit_line("{c_decl} {tmp} = {res_str};")
+                let fs_st = fresh_temp("__fs_st_")
+                emit_line("__blink_ffi_scope_state {fs_st} __attribute__((cleanup(__blink_ffi_scope_attr_cleanup))) = \{ .scope = {tmp}, .done = 0 };")
+                if cg_in_assert_panics != 0 {
+                    emit_line("__blink_cleanup_push((void*)&{fs_st}, __blink_ffi_scope_run, &{fs_st}.done);")
+                }
+                emitted_let_names.push(binding)
+                emitted_let_set.insert(binding, 1)
+                emit_line("{c_decl} {binding} = {tmp};")
+                set_var(binding, res_type, 0)
             } else {
                 emit_line("{c_decl} {tmp} = {res_str};")
                 emitted_let_names.push(binding)
@@ -3184,8 +3199,6 @@ fn emit_with_block_core(node: Int, is_expr: Int, result_sink: Str) -> Str ! Code
                 if res_struct != "" {
                     set_var_struct(binding, res_struct)
                 }
-                resource_names.push(binding)
-                resource_vars.push(tmp)
             }
         } else {
             emit_expr(item)
@@ -3267,15 +3280,6 @@ fn emit_with_block_core(node: Int, is_expr: Int, result_sink: Str) -> Str ! Code
     while bhi < bh_state_vars.len() {
         emit_line("{bh_state_vars.get(bhi).unwrap()}.ok = 1;")
         bhi = bhi + 1
-    }
-    let mut rri = resource_names.len() - 1
-    while rri >= 0 {
-        let rname = resource_names.get(rri).unwrap()
-        let rvar_type = get_var_type(rname)
-        if rvar_type == CT_FFI_SCOPE {
-            emit_line("blink_ffi_scope_cleanup({rname});")
-        }
-        rri = rri - 1
     }
     if is_expr != 0 && arena_tmp != "" {
         emit_line("__blink_current_arena = {arena_prev};")
@@ -4656,8 +4660,9 @@ fn emit_trace_exit_with_val(val_expr: Str, ret_str: Str) ! Codegen.Emit {
     emit_line("}")
 }
 
-// E0601: a Ptr minted from a locally-bound ffi_scope() must not escape the
-// function — the scope's arena frees it on return, leaving a dangling pointer.
+// E0601 (§07:276): a Ptr allocated inside a `with ffi.scope() as scope` block
+// must not escape the block — the scope frees its allocations at block exit, so
+// the escaped Ptr would dangle. `scope.take(p)` detaches a Ptr to let it escape.
 @allow(UnrestoredMutation)
 pub fn check_ptr_value_escape(val_node: Int) ! Diag.Report {
     if expr_result_type != CT_PTR { return }
@@ -4668,7 +4673,7 @@ pub fn check_ptr_value_escape(val_node: Int) ! Diag.Report {
     if origin == "" { return }
     if is_local_ffi_scope_binding(origin) == 0 { return }
     let anchor = if val_node != -1 { val_node } else { cg_current_fn_node }
-    diag_error_at("PtrEscapesFfiScope", CLOSEABLE_ESCAPES_SCOPE, "Ptr from local ffi_scope '{origin}' cannot escape — use scope.take(p) to detach before returning", anchor, "wrap the return value in {origin}.take(...)")
+    diag_error_at("PtrEscapesFfiScope", CLOSEABLE_ESCAPES_SCOPE, "Ptr from 'with ffi.scope() as {origin}' cannot escape the block — use {origin}.take(p) to detach it first", anchor, "wrap the escaping value in {origin}.take(...)")
 }
 
 @allow(UnrestoredMutation)

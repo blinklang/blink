@@ -2580,6 +2580,22 @@ BLINK_RT_FN void* blink_ffi_scope_track(blink_list* scope, void* ptr) {
 }
 #endif
 
+/* Scoped C-string copy. Scope-tracked memory is handed to C and must be
+   libc-allocated so blink_ffi_scope_cleanup can free() it (a GC copy via
+   blink_strdup could not be freed with libc free(), and freeing libc
+   memory with GC_FREE is UB). */
+BLINK_RT_FN void* blink_ffi_scope_cstr(blink_list* scope, const char* s);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void* blink_ffi_scope_cstr(blink_list* scope, const char* s) {
+    if (!s) { return blink_ffi_scope_track(scope, NULL); }
+    size_t len = strlen(s) + 1;
+    char* p = (char*)malloc(len);
+    if (!p) { fprintf(stderr, "blink: out of memory\n"); exit(1); }
+    memcpy(p, s, len);
+    return blink_ffi_scope_track(scope, p);
+}
+#endif
+
 BLINK_RT_FN void* blink_ffi_scope_take(blink_list* scope, void* ptr);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN void* blink_ffi_scope_take(blink_list* scope, void* ptr) {
@@ -2599,11 +2615,42 @@ BLINK_RT_FN void* blink_ffi_scope_take(blink_list* scope, void* ptr) {
 BLINK_RT_FN void blink_ffi_scope_cleanup(blink_list* scope);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN void blink_ffi_scope_cleanup(blink_list* scope) {
+    /* Tracked items are libc-allocated FFI memory (calloc via scope.alloc/
+       alloc_n, malloc via blink_ffi_scope_cstr) — free them with libc free().
+       GC_FREE here would be UB on non-GC pointers and segfaults. The list
+       backing store and the list struct are GC memory; let the collector
+       reclaim them (GC_FREE is a no-op hint at best and risks double-handling
+       if the list is still reachable). */
     for (int64_t i = 0; i < scope->len; i++) {
-        GC_FREE(scope->items[i]);
+        free(scope->items[i]);
     }
-    GC_FREE(scope->items);
-    GC_FREE(scope);
+    scope->len = 0;
+}
+#endif
+
+/* Attribute-cleanup state for `with ffi.scope() as scope { ... }`. Cleanup
+   must fire on EVERY exit path — fall-through, return, ? early return, and a
+   caught panic (longjmp). __attribute__((cleanup)) covers the C control-flow
+   exits; the longjmp dispatch (§2.20 cleanup-stack) covers the panic path,
+   mirroring the Closeable with-resource machinery. */
+typedef struct { blink_list* scope; int done; } __blink_ffi_scope_state;
+
+BLINK_RT_FN void __blink_ffi_scope_run(void* p, int ok);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void __blink_ffi_scope_run(void* p, int ok) {
+    (void)ok;
+    __blink_ffi_scope_state* st = (__blink_ffi_scope_state*)p;
+    if (st->done) { return; }
+    st->done = 1;
+    blink_ffi_scope_cleanup(st->scope);
+}
+#endif
+
+BLINK_RT_FN void __blink_ffi_scope_attr_cleanup(__blink_ffi_scope_state* st);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void __blink_ffi_scope_attr_cleanup(__blink_ffi_scope_state* st) {
+    __blink_cleanup_pop((void*)st);
+    __blink_ffi_scope_run((void*)st, 0);
 }
 #endif
 

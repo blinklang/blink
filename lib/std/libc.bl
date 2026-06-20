@@ -1,6 +1,6 @@
 // γ-doctrine: curated user-facing wrappers around libc syscalls. First binding
 // is `poll(2)` — drives wink.app's I/O multiplexing. Internal layout uses
-// β-minimal (`@ffi.struct`) plus `ffi_scope`'s arena, so user code never names
+// β-minimal (`@ffi.struct`) plus `ffi.scope()`'s arena, so user code never names
 // a `Ptr[T]` value.
 //
 // Spec: decisions/ffi-struct-construction.md (panel A — β + γ).
@@ -29,7 +29,7 @@ pub let POLL_EVT_HUP: Int = 16
 pub let POLL_EVT_NVAL: Int = 32
 
 @ffi("poll", header: "poll.h")
-@trusted(audit: "Wraps poll(2). All inputs come from a typed @ffi.struct buffer allocated via ffi_scope; nfds is bounded by fds.len() at the call site.")
+@trusted(audit: "Wraps poll(2). All inputs come from a typed @ffi.struct buffer allocated via ffi.scope(); nfds is bounded by fds.len() at the call site.")
 fn c_poll(fds: Ptr[Pollfd], nfds: U64, timeout_ms: I32) -> I32 ! FFI {}
 
 // Block until one of `fds` becomes ready or `timeout_ms` elapses.
@@ -43,37 +43,38 @@ pub fn poll(fds: List[Pollfd], timeout_ms: Int) -> Result[List[Pollfd], Str] ! I
     if n == 0 {
         return Ok([])
     }
-    let mut scope = ffi_scope()
-    let buf: Ptr[Pollfd] = scope.alloc_n(n)
-    let mut i = 0
-    while i < n {
-        match fds.get(i) {
-            Some(pfd) => {
-                let cell = buf.offset(i)
-                cell.fd.write(pfd.fd)
-                cell.events.write(pfd.events)
-                cell.revents.write(0)
+    with ffi.scope() as scope {
+        let buf: Ptr[Pollfd] = scope.alloc_n(n)
+        let mut i = 0
+        while i < n {
+            match fds.get(i) {
+                Some(pfd) => {
+                    let cell = buf.offset(i)
+                    cell.fd.write(pfd.fd)
+                    cell.events.write(pfd.events)
+                    cell.revents.write(0)
+                }
+                None => {}
             }
-            None => {}
+            i = i + 1
         }
-        i = i + 1
+        let rc = c_poll(buf, n.to_u64(), timeout_ms.to_i32())
+        if rc < 0 {
+            return Err("poll failed")
+        }
+        let mut out: List[Pollfd] = []
+        let mut j = 0
+        while j < n {
+            let cell = buf.offset(j)
+            out.push(Pollfd {
+                fd: cell.fd.read(),
+                events: cell.events.read(),
+                revents: cell.revents.read(),
+            })
+            j = j + 1
+        }
+        Ok(out)
     }
-    let rc = c_poll(buf, n.to_u64(), timeout_ms.to_i32())
-    if rc < 0 {
-        return Err("poll failed")
-    }
-    let mut out: List[Pollfd] = []
-    let mut j = 0
-    while j < n {
-        let cell = buf.offset(j)
-        out.push(Pollfd {
-            fd: cell.fd.read(),
-            events: cell.events.read(),
-            revents: cell.revents.read(),
-        })
-        j = j + 1
-    }
-    Ok(out)
 }
 
 // ── Byte-payload syscall wrappers (the v1 `*_bytes` family) ──────────────────
