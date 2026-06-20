@@ -3116,6 +3116,7 @@ fn emit_with_block_core(node: Int, is_expr: Int, result_sink: Str) -> Str ! Code
     let mut arena_tmp = ""
     let mut arena_prev = ""
     let mut has_arena_handler = 0
+    let mut ffi_scope_names: List[Str] = []
     emit_line("\{")
     cg_indent = cg_indent + 1
     let ev_copy = fresh_temp("__ev_with_")
@@ -3190,6 +3191,7 @@ fn emit_with_block_core(node: Int, is_expr: Int, result_sink: Str) -> Str ! Code
                 emitted_let_set.insert(binding, 1)
                 emit_line("{c_decl} {binding} = {tmp};")
                 set_var(binding, res_type, 0)
+                ffi_scope_names.push(binding)
             } else {
                 emit_line("{c_decl} {tmp} = {res_str};")
                 emitted_let_names.push(binding)
@@ -3263,7 +3265,7 @@ fn emit_with_block_core(node: Int, is_expr: Int, result_sink: Str) -> Str ! Code
     if is_expr != 0 {
         let target_expr = if arena_prev != "" { arena_prev } else { "NULL" }
         emit_and_log_promote_phase("begin", target_expr, "", node)
-        actual_desc = emit_block_then_capture(body, result_sink, arena_prev)
+        actual_desc = emit_block_then_capture(body, result_sink, arena_prev, ffi_scope_names)
         emit_and_log_promote_phase("end", target_expr, actual_desc, node)
     } else {
         emit_block(body)
@@ -3501,7 +3503,7 @@ fn emit_and_log_promote_phase(phase: Str, target_expr: Str, desc: Str, node: Int
 // promote into `result_sink`. Returns the promote descriptor actually used
 // so the caller can publish correct metadata.
 @allow(UnrestoredMutation, IncompleteStateRestore)
-fn emit_block_then_capture(block: Int, result_sink: Str, arena_prev: Str) -> Str ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
+fn emit_block_then_capture(block: Int, result_sink: Str, arena_prev: Str, owning_scopes: List[Str]) -> Str ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
     if block == -1 {
         return ""
     }
@@ -3535,12 +3537,18 @@ fn emit_block_then_capture(block: Int, result_sink: Str, arena_prev: Str) -> Str
             }
         }
         emit_stmt(stmt)
+        // A discarded scope-allocating ExprStmt (e.g. `scope.alloc()` not bound
+        // to a let) sets ffi_origin_pending but nothing consumes it — only
+        // emit_let_binding clears the flag. Clear it here so the leftover origin
+        // is not mis-attributed to the tail expression's value-escape check.
+        ffi_origin_pending = ""
         i = i + 1
     }
     let last = sublist_get(stmts_sl, count - 1)
     let last_kind = node_kind(last)
     let tail_node = if last_kind == NodeKind.ExprStmt { node_value(last) } else { last }
     emit_expr(tail_node)
+    check_ptr_value_escape_for_scope(tail_node, owning_scopes)
     let tail_str = expr_result_str
     if expr_result_type == CT_CLOSURE {
         let mut lit_node = -1
@@ -4660,20 +4668,57 @@ fn emit_trace_exit_with_val(val_expr: Str, ret_str: Str) ! Codegen.Emit {
     emit_line("}")
 }
 
-// E0601 (§07:276): a Ptr allocated inside a `with ffi.scope() as scope` block
-// must not escape the block — the scope frees its allocations at block exit, so
-// the escaped Ptr would dangle. `scope.take(p)` detaches a Ptr to let it escape.
-@allow(UnrestoredMutation)
-pub fn check_ptr_value_escape(val_node: Int) ! Diag.Report {
-    if expr_result_type != CT_PTR { return }
+// Resolve the originating `with ffi.scope() as <name>` of the just-emitted
+// Ptr value, or "" when it is not a scope-minted Ptr. Reads ffi_origin_pending
+// (set by the immediately-preceding scope method emit) first, then falls back
+// to the per-var origin table for a bare-Ident tail.
+fn resolve_ptr_escape_origin(val_node: Int) -> Str {
+    if expr_result_type != CT_PTR { return "" }
     let mut origin = ffi_origin_pending
     if origin == "" && val_node != -1 && node_kind(val_node) == NodeKind.Ident {
         origin = get_var_ffi_ptr_origin(node_name(val_node))
     }
-    if origin == "" { return }
-    if is_local_ffi_scope_binding(origin) == 0 { return }
+    origin
+}
+
+@allow(UnrestoredMutation)
+fn emit_ptr_escape_diag(val_node: Int, origin: Str) ! Diag.Report {
     let anchor = if val_node != -1 { val_node } else { cg_current_fn_node }
     diag_error_at("PtrEscapesFfiScope", CLOSEABLE_ESCAPES_SCOPE, "Ptr from 'with ffi.scope() as {origin}' cannot escape the block — use {origin}.take(p) to detach it first", anchor, "wrap the escaping value in {origin}.take(...)")
+}
+
+// E0601 (§07:276): a Ptr allocated inside a `with ffi.scope() as scope` block
+// must not escape the block — the scope frees its allocations at block exit, so
+// the escaped Ptr would dangle. `scope.take(p)` detaches a Ptr to let it escape.
+// Function-return form: a returned Ptr escapes *every* enclosing scope, so any
+// still-live scope origin is an escape.
+@allow(UnrestoredMutation)
+pub fn check_ptr_value_escape(val_node: Int) ! Diag.Report {
+    let origin = resolve_ptr_escape_origin(val_node)
+    if origin == "" { return }
+    if is_local_ffi_scope_binding(origin) == 0 { return }
+    emit_ptr_escape_diag(val_node, origin)
+}
+
+// E0601 for the `with ffi.scope() as scope { … }`-as-expression tail-capture
+// form. A with-expr tail escapes only *this* block, not every enclosing scope:
+// a Ptr minted by an OUTER still-live scope, threaded through as an inner
+// block's tail, does not dangle (the outer scope outlives this block). So fire
+// only when the Ptr's origin is one of the scopes this very block opened
+// (a block may open several, e.g. `with ffi.scope() as a, ffi.scope() as b`).
+@allow(UnrestoredMutation)
+pub fn check_ptr_value_escape_for_scope(val_node: Int, owning_scopes: List[Str]) ! Diag.Report {
+    if owning_scopes.len() == 0 { return }
+    let origin = resolve_ptr_escape_origin(val_node)
+    if origin == "" { return }
+    let mut i = 0
+    while i < owning_scopes.len() {
+        if owning_scopes.get(i).unwrap() == origin {
+            emit_ptr_escape_diag(val_node, origin)
+            return
+        }
+        i = i + 1
+    }
 }
 
 @allow(UnrestoredMutation)

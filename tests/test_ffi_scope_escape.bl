@@ -5,11 +5,15 @@
 // case where a Ptr minted inside a `with ffi.scope() as scope` block would
 // escape the block (be returned from the function that owns the scope).
 //
-// In today's surface syntax, returning a bare `Ptr[T]` from a non-@ffi
-// function is already blocked by E0811 PtrOutsideFFI in typecheck, so
-// the value-escape rule is latent — the check is defensive code that
-// activates when Ptr-in-signature restrictions are relaxed (or when an
-// internal pass otherwise produces a Ptr-returning fn without @ffi).
+// Returning a bare `Ptr[T]` from a non-@ffi function is blocked by E0811
+// PtrOutsideFFI in typecheck, so the *function-return* value-escape rule is
+// latent — defensive code that activates when Ptr-in-signature restrictions
+// relax (or when an internal pass produces a Ptr-returning fn without @ffi).
+//
+// The *with-block-as-expression* tail-capture path (gz8wjc), by contrast, is
+// reachable from surface syntax today: the with-expr result binds to a local
+// `let`, not a function return, so E0811 does not apply. A bare scope Ptr
+// captured there escapes the block and must report E0601.
 //
 // Reachable today: confirm the bookkeeping (origin tag, scope.take()
 // reset, parameter-Ptr exemption) does not false-positive on legitimate
@@ -35,4 +39,60 @@ test "scope.take() clears origin so the Ptr no longer reports value-escape" {
 test "scope.alloc inside a function body that returns non-Ptr compiles" {
     let src = "@ffi.struct(header: \"poll.h\", name: \"pollfd\")\npub type Pollfd \{ fd: I32, events: I16, revents: I16 }\nfn make() -> Int \{\n    with ffi.scope() as scope \{\n        let p: Ptr[Pollfd] = scope.alloc()\n        if p.is_null() \{ 0 } else \{ 1 }\n    }\n}\nfn main() \{\n    let _ = make()\n}\n"
     compile_test_helpers.expect_no_error(src, "ffi_scope_internal_use", "E0601")
+}
+
+// gz8wjc: the with-block-as-expression tail-capture path
+// (emit_block_then_capture) was missing the E0601 check that every
+// function-return tail path already has. A scope Ptr captured as the tail
+// of `let _ = with ffi.scope() as scope \{ … p }` escapes the block — the
+// scope frees it at block exit, so the captured Ptr dangles. This case is
+// reachable from surface syntax (the with-expr result is bound to a local
+// `let`, not a function return, so E0811 PtrOutsideFFI does not apply).
+
+test "bare scope Ptr as with-expr tail reports value-escape" {
+    let src = "@ffi.struct(header: \"poll.h\", name: \"pollfd\")\npub type Pollfd \{ fd: I32, events: I16, revents: I16 }\nfn main() \{\n    let _ = with ffi.scope() as scope \{\n        let p: Ptr[Pollfd] = scope.alloc()\n        p\n    }\n}\n"
+    compile_test_helpers.expect_compile_error(src, "ffi_scope_expr_tail_escape", "E0601")
+}
+
+test "with-expr tail offset chain (non-Ptr) does not false-positive" {
+    let src = "@ffi.struct(header: \"poll.h\", name: \"pollfd\")\npub type Pollfd \{ fd: I32, events: I16, revents: I16 }\nfn main() \{\n    let _ = with ffi.scope() as scope \{\n        let buf: Ptr[Pollfd] = scope.alloc_n(4)\n        let cell = buf.offset(1)\n        cell.fd.read()\n    }\n}\n"
+    compile_test_helpers.expect_no_error(src, "ffi_scope_expr_tail_offset", "E0601")
+}
+
+test "scope.take() as with-expr tail does not false-positive" {
+    let src = "@ffi.struct(header: \"poll.h\", name: \"pollfd\")\npub type Pollfd \{ fd: I32, events: I16, revents: I16 }\nfn main() \{\n    let _ = with ffi.scope() as scope \{\n        scope.take(scope.alloc())\n    }\n}\n"
+    compile_test_helpers.expect_no_error(src, "ffi_scope_expr_tail_take", "E0601")
+}
+
+// A discarded scope-allocating ExprStmt (`scope.alloc()` not bound to a let)
+// leaves ffi_origin_pending set; the with-expr tail check must not mistake that
+// stale origin for the tail value's own. Here the tail `p` was take()-detached,
+// so it legitimately escapes — no E0601 despite the following bare alloc.
+test "discarded scope alloc does not leak origin onto take()-detached tail" {
+    let src = "@ffi.struct(header: \"poll.h\", name: \"pollfd\")\npub type Pollfd \{ fd: I32, events: I16, revents: I16 }\nfn main() \{\n    let _ = with ffi.scope() as scope \{\n        let p: Ptr[Pollfd] = scope.take(scope.alloc())\n        scope.alloc()\n        p\n    }\n}\n"
+    compile_test_helpers.expect_no_error(src, "ffi_scope_expr_tail_stale_origin", "E0601")
+}
+
+// Per-block ownership: a Ptr minted by an OUTER still-live scope, threaded
+// through an INNER `with ffi.scope()` expression as its tail, does not dangle
+// (the outer scope outlives the inner block) — no E0601.
+test "outer-scope Ptr through inner with-expr tail does not false-positive" {
+    let src = "@ffi.struct(header: \"poll.h\", name: \"pollfd\")\npub type Pollfd \{ fd: I32, events: I16, revents: I16 }\nfn main() \{\n    let _ = with ffi.scope() as outer \{\n        let op: Ptr[Pollfd] = outer.alloc()\n        let _x = with ffi.scope() as inner \{\n            op\n        }\n        _x.fd.read()\n    }\n}\n"
+    compile_test_helpers.expect_no_error(src, "ffi_scope_outer_thru_inner", "E0601")
+}
+
+// The flip side of per-block ownership: a Ptr minted by the INNER scope that
+// escapes its OWN block via the tail still dangles — E0601 must fire.
+test "inner-scope Ptr escaping its own with-expr tail reports value-escape" {
+    let src = "@ffi.struct(header: \"poll.h\", name: \"pollfd\")\npub type Pollfd \{ fd: I32, events: I16, revents: I16 }\nfn main() \{\n    let _ = with ffi.scope() as outer \{\n        let _x = with ffi.scope() as inner \{\n            let ip: Ptr[Pollfd] = inner.alloc()\n            ip\n        }\n        _x.fd.read()\n    }\n}\n"
+    compile_test_helpers.expect_compile_error(src, "ffi_scope_inner_own_escape", "E0601")
+}
+
+// A block may open several scopes (`with ffi.scope() as a, ffi.scope() as b`).
+// The owning-scope check must fire for a tail Ptr from ANY of them — including
+// the non-last scope `a`, which is freed at this same block's exit, not just
+// the last-opened `b`.
+test "non-last scope Ptr as multi-scope with-expr tail reports value-escape" {
+    let src = "@ffi.struct(header: \"poll.h\", name: \"pollfd\")\npub type Pollfd \{ fd: I32, events: I16, revents: I16 }\nfn main() \{\n    let _ = with ffi.scope() as a, ffi.scope() as b \{\n        let pa: Ptr[Pollfd] = a.alloc()\n        pa\n    }\n}\n"
+    compile_test_helpers.expect_compile_error(src, "ffi_scope_multi_nonlast_escape", "E0601")
 }
