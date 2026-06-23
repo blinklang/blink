@@ -33,7 +33,7 @@ import codegen_types.{
     get_fn_ret, get_fn_ret_struct, get_fn_ret_struct_inner, get_fn_ret_type,
     get_generic_fn_node, get_list_elem_struct, get_list_elem_type,
     get_list_nested_elem_struct, get_list_nested_elem_type,
-    get_map_key_type, get_map_value_struct, get_map_value_type,
+    get_map_key_type, get_map_key_type_raw, get_map_value_struct, get_map_value_type, is_map_scalar_ct,
     get_struct_field_stype, get_struct_field_type, get_var_channel_inner,
     get_var_enum, get_var_handle_inner, get_var_handle_inner2,
     get_var_handler_is_ue, get_var_handler_vtable_field,
@@ -54,9 +54,9 @@ import codegen_types.{
     resolve_import_alias, resolve_option_inner_from_ann, resolve_ret_type_from_ann,
     resolve_self_type, resolve_tparam, resolve_tuple_ann, resolve_variant, result_c_type,
     result_c_type_mixed, set_list_elem_struct, set_list_elem_type,
-    set_list_nested_elem_struct, set_list_nested_elem_type, set_map_types, set_map_key_struct, key_struct_sname_from_ann, set_map_value_list_elem, set_map_value_struct, copy_map_value_meta, set_set_elem_type,
+    set_list_nested_elem_struct, set_list_nested_elem_type, set_list_elem_map_types, set_map_types, set_map_key_struct, key_struct_sname_from_ann, set_map_value_list_elem, set_map_value_struct, copy_map_value_meta, set_set_elem_type,
     find_type_def_node, set_var_ffi_ptr_struct, set_var_ffi_ptr_array, set_var_ffi_ptr_extra,
-    ffi_alloc_n_pending, ffi_offset_pending_struct, ffi_origin_pending,
+    ffi_alloc_n_pending, ffi_offset_pending_struct,
     set_var, set_var_alias, set_var_channel, set_var_closure, set_var_handle,
     set_var_handler,
     set_var_handle_full, set_var_iterator, set_var_option,
@@ -126,6 +126,21 @@ fn propagate_map_list_elem(var_name: Str, val_ct: Int, val_ann: Int) {
             let inner_name = node_name(inner_ann)
             set_map_value_list_elem(var_name, type_from_name(inner_name))
         }
+    }
+}
+
+// wx184m: stamp a List[Map[K,V]] element-map's key+value types from the `Map[K,V]`
+// element annotation onto the list var. Shared by every List[T] annotation-lowering
+// site (let / top-level let / fn + impl + mono params) so the value type survives
+// get()/pop() instead of defaulting to Int.
+fn set_list_elem_map_ann(var_name: Str, elem_ann: Int) {
+    let map_sl = node_elements(elem_ann)
+    if map_sl != -1 && sublist_length(map_sl) >= 2 {
+        let mk_ann = sublist_get(map_sl, 0)
+        let mv_ann = sublist_get(map_sl, 1)
+        let mk_name = resolve_tparam(node_name(mk_ann), cg_mono_tparams_sl, cg_mono_concrete_args)
+        let mv_name = resolve_tparam(node_name(mv_ann), cg_mono_tparams_sl, cg_mono_concrete_args)
+        set_list_elem_map_types(var_name, type_from_name(mk_name), type_from_name(mv_name), mv_name)
     }
 }
 
@@ -2509,16 +2524,14 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
             let inner_td = find_type_def_node(inner_ann_name)
             if inner_td != -1 && has_annotation(inner_td, "ffi.struct") != 0 {
                 let arr = if ffi_alloc_n_pending != 0 { "n" } else { "" }
-                set_var_ffi_ptr_extra(name, inner_ann_name, arr, ffi_origin_pending)
+                set_var_ffi_ptr_extra(name, inner_ann_name, arr, "")
             }
         }
     }
     if val_type == CT_PTR && ffi_offset_pending_struct != "" {
-        // Ptr.offset() forwards origin through the chain via ffi_origin_pending.
-        set_var_ffi_ptr_extra(name, ffi_offset_pending_struct, "n", ffi_origin_pending)
+        set_var_ffi_ptr_extra(name, ffi_offset_pending_struct, "n", "")
     }
     ffi_alloc_n_pending = 0
-    ffi_origin_pending = ""
     if val_type == CT_HANDLER {
         let mut h_vtt = cg_handler_vtable_type
         let mut h_vtf = cg_handler_vtable_field
@@ -2683,6 +2696,9 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
                         }
                     }
                 }
+                if elem_ct == CT_MAP {
+                    set_list_elem_map_ann(name, elem_ann)
+                }
             }
         }
     }
@@ -2715,6 +2731,20 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
     }
     if val_type == CT_MAP {
         copy_map_value_meta(val_str, name)
+        // wx184m: with no explicit annotation, carry the RHS map's scalar key+value
+        // across (e.g. recovered through List[Map[K,V]].get().unwrap()) so
+        // `name.get(k)` returns Option[V] (not Option[Int]) and boxes the key per
+        // its real type. Only adopt the RHS key when it was genuinely recovered
+        // (raw >= 0); otherwise keep `name`'s own key so a default Str doesn't
+        // clobber a generic Map[Int,V] return's key.
+        if type_ann == -1 {
+            let src_val = get_map_value_type(val_str)
+            if is_map_scalar_ct(src_val) != 0 {
+                let src_key_raw = get_map_key_type_raw(val_str)
+                let use_key = if src_key_raw >= 0 { src_key_raw } else { get_map_key_type(name) }
+                set_map_types(name, use_key, src_val, "")
+            }
+        }
     }
     if val_type == CT_LIST && expr_list_elem_type >= 0 && type_ann == -1 {
         set_list_elem_type(name, expr_list_elem_type)
@@ -3531,11 +3561,6 @@ fn emit_block_then_capture(block: Int, result_sink: Str, arena_prev: Str) -> Str
             }
         }
         emit_stmt(stmt)
-        // A discarded scope-allocating ExprStmt (e.g. `scope.alloc()` not bound
-        // to a let) sets ffi_origin_pending but nothing consumes it — only
-        // emit_let_binding clears the flag. Clear it here so the leftover origin
-        // is not mis-attributed to the tail expression's value-escape check.
-        ffi_origin_pending = ""
         i = i + 1
     }
     let last = sublist_get(stmts_sl, count - 1)
@@ -4352,6 +4377,9 @@ pub fn emit_impl_method_def(fn_node: Int, impl_type: Str, im_node: Int) ! Codege
                                         }
                                     }
                                 }
+                                if elem_ct == CT_MAP {
+                                    set_list_elem_map_ann(pname, elem_ann)
+                                }
                             }
                         }
                     }
@@ -4955,6 +4983,9 @@ pub fn emit_fn_def(fn_node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope
                                         set_list_nested_elem_struct(pname, nested_name)
                                     }
                                 }
+                            }
+                            if elem_ct == CT_MAP {
+                                set_list_elem_map_ann(pname, elem_ann)
                             }
                         }
                     }
@@ -5601,6 +5632,9 @@ fn emit_mono_fn_def(fn_node: Int, concrete_args: Str) ! Codegen.Emit, Codegen.Re
                                     }
                                 }
                             }
+                            if elem_ct == CT_MAP {
+                                set_list_elem_map_ann(pname, elem_ann)
+                            }
                         }
                     }
                 }
@@ -6222,6 +6256,9 @@ pub fn emit_top_level_let(node: Int, extern_only: Int) ! Codegen.Emit, Codegen.R
                         }
                     }
                 }
+                if elem_ct == CT_MAP {
+                    set_list_elem_map_ann(name, elem_ann)
+                }
             }
         }
     }
@@ -6254,6 +6291,20 @@ pub fn emit_top_level_let(node: Int, extern_only: Int) ! Codegen.Emit, Codegen.R
     }
     if val_type == CT_MAP {
         copy_map_value_meta(val_str, name)
+        // wx184m: with no explicit annotation, carry the RHS map's scalar key+value
+        // across (e.g. recovered through List[Map[K,V]].get().unwrap()) so
+        // `name.get(k)` returns Option[V] (not Option[Int]) and boxes the key per
+        // its real type. Only adopt the RHS key when it was genuinely recovered
+        // (raw >= 0); otherwise keep `name`'s own key so a default Str doesn't
+        // clobber a generic Map[Int,V] return's key.
+        if type_ann == -1 {
+            let src_val = get_map_value_type(val_str)
+            if is_map_scalar_ct(src_val) != 0 {
+                let src_key_raw = get_map_key_type_raw(val_str)
+                let use_key = if src_key_raw >= 0 { src_key_raw } else { get_map_key_type(name) }
+                set_map_types(name, use_key, src_val, "")
+            }
+        }
     }
     if val_type == CT_LIST && expr_list_elem_type >= 0 && type_ann == -1 {
         set_list_elem_type(name, expr_list_elem_type)

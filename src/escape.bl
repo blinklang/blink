@@ -179,6 +179,13 @@ fn init_safe_intrinsics() {
     ea_safe_intrinsics.insert("assert", 1)
     ea_safe_intrinsics.insert("assert_eq", 1)
     ea_safe_intrinsics.insert("assert_ne", 1)
+    // Qualified safe sinks: io.* output methods consume their arg without
+    // letting it escape, same as the bare println surface (aj0cwb).
+    ea_safe_intrinsics.insert("io.print", 1)
+    ea_safe_intrinsics.insert("io.println", 1)
+    ea_safe_intrinsics.insert("io.eprint", 1)
+    ea_safe_intrinsics.insert("io.eprintln", 1)
+    ea_safe_intrinsics.insert("io.log", 1)
 }
 
 // W0701 ArenaEffectRedundant state. `declares_arena` gates the hot-path
@@ -243,9 +250,9 @@ fn ea_is_closeable_binding(name: Str) -> Int {
 // the block exits, so it must not escape. Two semantics (gz8wjc):
 //   - function-return escape  → fire on ANY still-live local scope origin
 //   - with-expr tail escape    → fire only on the tail block's OWN scopes
-// `s.take(p)` detaches the origin. This mirrors the codegen tracking
-// (ffi_origin_pending / get_var_ffi_ptr_origin / is_local_ffi_scope_binding)
-// at the AST level so check/LSP report the same E0601 as build.
+// `s.take(p)` detaches the origin. This AST pass is the single source for
+// E0601 across build/check/LSP (the old codegen-side origin tracking was
+// removed once the emit moved here).
 
 // Per-with-block stack of the scope-handle names opened by that block. The top
 // is the innermost block's own scopes (= codegen's `owning_scopes`); flattened,
@@ -349,8 +356,7 @@ fn ffi_scope_method_obj(node: Int) -> Str {
 }
 
 // Resolve the originating `with ffi.scope() as <s>` of a Ptr-valued expression,
-// or "" when it is not a live scope-minted Ptr. Mirrors codegen's
-// resolve_ptr_escape_origin (ffi_origin_pending + per-var origin table):
+// or "" when it is not a live scope-minted Ptr:
 //   - `s.alloc()/alloc_n()/cstr()`  → s   (scope-minted)
 //   - `s.take(...)`                  → ""  (detached)
 //   - `p.offset(...)`                → origin of p (forwarded)
@@ -637,14 +643,20 @@ fn walk_method_call(node: Int) ! Diag.Report {
     if ea_in_arena() != 0 {
         if args_sl != -1 {
             let mut receiver_local = 0
+            let mut is_safe_method = 0
             if obj != -1 {
                 if node_kind(obj) == NodeKind.Ident {
-                    if ea_is_local_in_top(node_name(obj)) != 0 {
+                    let obj_name = node_name(obj)
+                    if ea_is_local_in_top(obj_name) != 0 {
                         receiver_local = 1
+                    }
+                    let qualified = "{obj_name}.{node_method(node)}"
+                    if ea_safe_intrinsics.contains_key(qualified) != 0 {
+                        is_safe_method = 1
                     }
                 }
             }
-            if receiver_local == 0 {
+            if receiver_local == 0 && is_safe_method == 0 {
                 let mut ai = 0
                 while ai < sublist_length(args_sl) {
                     let arg = sublist_get(args_sl, ai)

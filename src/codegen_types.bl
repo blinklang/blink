@@ -1236,11 +1236,6 @@ pub let mut cg_mono_concrete_args: Str = ""
 
 pub let mut ffi_alloc_n_pending: Int = 0
 pub let mut ffi_offset_pending_struct: Str = ""
-// Origin scope binding name for the Ptr produced by the most-recent
-// scope.alloc/alloc_n/cstr. Consumed by let-binding codegen to stamp
-// ScopeVar.extra so value-escape checks can resolve the source scope.
-// "" when receiver isn't an Ident, or after scope.take(p) clears it.
-pub let mut ffi_origin_pending: Str = ""
 
 // Handler vtable metadata set by emit_handler_expr for emit_with_block / let binding
 pub let mut cg_handler_vtable_type: Str = ""
@@ -1557,18 +1552,6 @@ pub fn is_ffi_ptr_array_var(name: Str) -> Int {
         i = i - 1
     }
     0
-}
-
-pub fn get_var_ffi_ptr_origin(name: Str) -> Str {
-    let mut i = scope_vars.len() - 1
-    while i >= 0 {
-        let sv = scope_vars.get(i).unwrap()
-        if sv.name == name && sv.ctype == CT_PTR {
-            return ffi_ptr_field(sv.extra, 2)
-        }
-        i = i - 1
-    }
-    ""
 }
 
 // Function registry: parallel lists (fn name -> return type, param count)
@@ -2784,6 +2767,26 @@ pub fn get_list_elem_map_val_type(name: Str) -> Int {
     -1
 }
 
+// wx184m: record a List's element-map key+value types as a full nested type
+// (`type_list(type_map(k, v))`). The flat inner1/inner2 ScopeVar slots can't
+// hold three type params (list→map→{k,v}); set_list_elem_type(CT_MAP) lowers
+// the map value to the default Int. Building the tp_id directly preserves V so
+// List[Map[K,V]].get()/pop() carry the right value type.
+pub fn set_list_elem_map_types(name: Str, key_ct: Int, val_ct: Int, val_name: Str) {
+    let map_tp = sv_tp(CT_MAP, key_ct, val_ct, val_name)
+    let list_tp = type_list(map_tp)
+    let mut i = scope_vars.len() - 1
+    while i >= 0 {
+        let sv = scope_vars.get(i).unwrap()
+        if sv.name == name && tp_get_kind(sv.tp_id) == CT_LIST {
+            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: CT_MAP, inner2: sv.inner2, sname: sv.sname, sname2: sv.sname2, extra: sv.extra, tp_id: list_tp })
+            return
+        }
+        i = i - 1
+    }
+    push_scope_var(ScopeVar { name: name, ctype: CT_LIST, is_mut: 0, inner1: CT_MAP, inner2: -1, sname: "", sname2: "", extra: "", tp_id: list_tp })
+}
+
 pub fn set_list_elem_struct(name: Str, struct_name: Str) {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
@@ -2883,6 +2886,21 @@ pub fn set_map_types(name: Str, key_type: Int, value_type: Int, value_name: Str)
     if (value_type == CT_VOID || value_type == CT_STRUCT || value_type == CT_ENUM) && value_name != "" && is_named_type(value_name) != 0 {
         set_map_value_struct(name, value_name)
     }
+}
+
+// Raw map key type: the tp child1 kind, or -1 when the key type was never set.
+// Unlike get_map_key_type this does NOT mask an unset key as CT_STRING, so callers
+// can tell a genuinely-recovered key apart from the default (wx184m).
+pub fn get_map_key_type_raw(name: Str) -> Int {
+    let mut i = scope_vars.len() - 1
+    while i >= 0 {
+        let sv = scope_vars.get(i).unwrap()
+        if sv.name == name && tp_get_kind(sv.tp_id) == CT_MAP {
+            return tp_child1_kind(sv.tp_id)
+        }
+        i = i - 1
+    }
+    -1
 }
 
 pub fn get_map_key_type(name: Str) -> Int {
@@ -5485,6 +5503,51 @@ pub fn type_from_name_tag(tag: Str) -> Int {
     else if tag == "u32" { CT_U32 }
     else if tag == "u64" { CT_U64 }
     else { CT_VOID }
+}
+
+pub type MapKvCt {
+    first: Int
+    second: Int
+}
+
+// Decode the key+value CT of a scalar `Map_<ktag>_<vtag>` struct tag, as built
+// by `Map_{c_type_tag(k)}_{c_type_tag(v)}`. Returns first = -1 when the tag is
+// not a scalar two-field map (e.g. struct/nested value types whose tag has a
+// different shape) so callers can fall back to their existing recovery paths.
+pub fn map_struct_scalar_kv(tag: Str) -> MapKvCt {
+    if tag.starts_with("Map_") == false { return MapKvCt { first: -1, second: -1 } }
+    let rest = tag.slice(4, tag.len())
+    let mut sep = -1
+    let mut i = 0
+    while i < rest.len() {
+        if rest.byte_at(i) == 95 { // '_'
+            sep = i
+            i = rest.len()
+        } else {
+            i = i + 1
+        }
+    }
+    if sep <= 0 { return MapKvCt { first: -1, second: -1 } }
+    let k_tag = rest.slice(0, sep)
+    let v_tag = rest.slice(sep + 1, rest.len())
+    let k_ct = type_from_name_tag(k_tag)
+    let v_ct = type_from_name_tag(v_tag)
+    if k_ct == CT_VOID || v_ct == CT_VOID {
+        return MapKvCt { first: -1, second: -1 }
+    }
+    // Only scalar key+value are recoverable from the tag alone; compound types
+    // (list/map/bytes/ptr/option/result) carry extra metadata that the tag does
+    // not encode, so leave those to the caller's other recovery paths.
+    if is_map_scalar_ct(k_ct) == 0 || is_map_scalar_ct(v_ct) == 0 {
+        return MapKvCt { first: -1, second: -1 }
+    }
+    MapKvCt { first: k_ct, second: v_ct }
+}
+
+pub fn is_map_scalar_ct(ct: Int) -> Int {
+    if ct == CT_INT || ct == CT_STRING || ct == CT_FLOAT || ct == CT_BOOL || ct == CT_CHAR { return 1 }
+    if is_sized_int_ct(ct) != 0 { return 1 }
+    0
 }
 
 pub type CompoundSplit {
