@@ -54,6 +54,15 @@ test "bare scope Ptr as with-expr tail reports value-escape" {
     compile_test_helpers.expect_compile_error(src, "ffi_scope_expr_tail_escape", "E0601")
 }
 
+// xc802k: E0601 now lives in analyze_escapes (not codegen), so `blink check`
+// — which runs the escape pass but not codegen — must report the same
+// value-escape it did on `build`. Pre-relocation `check` returned ok exit 0.
+test "with-expr tail value-escape fires via blink check (phase-correct)" {
+    let src = "@ffi.struct(header: \"poll.h\", name: \"pollfd\")\npub type Pollfd \{ fd: I32, events: I16, revents: I16 }\nfn main() \{\n    let _ = with ffi.scope() as scope \{\n        let p: Ptr[Pollfd] = scope.alloc()\n        p\n    }\n}\n"
+    let out = compile_test_helpers.check_via_cli(src, "ffi_scope_check_path")
+    assert(out.contains("E0601"))
+}
+
 test "with-expr tail offset chain (non-Ptr) does not false-positive" {
     let src = "@ffi.struct(header: \"poll.h\", name: \"pollfd\")\npub type Pollfd \{ fd: I32, events: I16, revents: I16 }\nfn main() \{\n    let _ = with ffi.scope() as scope \{\n        let buf: Ptr[Pollfd] = scope.alloc_n(4)\n        let cell = buf.offset(1)\n        cell.fd.read()\n    }\n}\n"
     compile_test_helpers.expect_no_error(src, "ffi_scope_expr_tail_offset", "E0601")
@@ -95,4 +104,35 @@ test "inner-scope Ptr escaping its own with-expr tail reports value-escape" {
 test "non-last scope Ptr as multi-scope with-expr tail reports value-escape" {
     let src = "@ffi.struct(header: \"poll.h\", name: \"pollfd\")\npub type Pollfd \{ fd: I32, events: I16, revents: I16 }\nfn main() \{\n    let _ = with ffi.scope() as a, ffi.scope() as b \{\n        let pa: Ptr[Pollfd] = a.alloc()\n        pa\n    }\n}\n"
     compile_test_helpers.expect_compile_error(src, "ffi_scope_multi_nonlast_escape", "E0601")
+}
+
+// xc802k origin-tracking edge cases (regressions guarded by the block-scoped
+// Ptr-origin frames in analyze_escapes; codegen's flat tracking missed some):
+
+// Re-binding the SAME name to a take()-detached Ptr must clear the earlier
+// scope-minted origin — the tail no longer escapes. A flat per-fn origin map
+// that only records non-empty origins would keep the stale `p -> outer` and
+// false-positive here.
+test "rebind same name to take() clears prior scope origin (no false escape)" {
+    let src = "@ffi.struct(header: \"poll.h\", name: \"pollfd\")\npub type Pollfd \{ fd: I32, events: I16, revents: I16 }\nfn main() \{\n    let _ = with ffi.scope() as outer \{\n        let p: Ptr[Pollfd] = outer.alloc()\n        let _u = p.is_null()\n        let p: Ptr[Pollfd] = outer.take(outer.alloc())\n        p\n    }\n}\n"
+    compile_test_helpers.expect_no_error(src, "ffi_scope_rebind_take", "E0601")
+}
+
+// An inner block re-binding a name used in the outer block must not leak its
+// origin past the inner block's exit: the outer `p` (origin = outer) still
+// escapes the OUTER block via its tail and must report E0601. A flat map keyed
+// only by name would have the inner `p -> inner` overwrite outer's entry and
+// silently miss the escape after the inner block pops.
+test "inner-block name shadow does not mask outer-scope tail escape" {
+    let src = "@ffi.struct(header: \"poll.h\", name: \"pollfd\")\npub type Pollfd \{ fd: I32, events: I16, revents: I16 }\nfn main() \{\n    let _ = with ffi.scope() as outer \{\n        let p: Ptr[Pollfd] = outer.alloc()\n        let _inner = with ffi.scope() as inner \{\n            let p: Ptr[Pollfd] = inner.alloc()\n            p.is_null()\n        }\n        p\n    }\n}\n"
+    compile_test_helpers.expect_compile_error(src, "ffi_scope_inner_shadow", "E0601")
+}
+
+// A plain alias `let q = p` of a scope-minted Ptr carries the origin: aliasing
+// then escaping the alias dangles exactly as escaping `p` would. (The escape
+// pass catches this; the former codegen tracking did not record origin onto a
+// bare-Ident alias and missed it.)
+test "alias of a scope Ptr that escapes the tail reports value-escape" {
+    let src = "@ffi.struct(header: \"poll.h\", name: \"pollfd\")\npub type Pollfd \{ fd: I32, events: I16, revents: I16 }\nfn main() \{\n    let _ = with ffi.scope() as scope \{\n        let p: Ptr[Pollfd] = scope.alloc()\n        let q = p\n        q\n    }\n}\n"
+    compile_test_helpers.expect_compile_error(src, "ffi_scope_alias_escape", "E0601")
 }

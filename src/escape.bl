@@ -4,7 +4,7 @@ import parser.{
     node_then_body, node_else_body, node_scrutinee, node_guard, node_value,
     node_target, node_iterable, node_obj, node_method, node_params, node_args,
     node_stmts, node_arms, node_fields, node_elements, node_handlers,
-    node_type_name, node_effects,
+    node_type_name, node_effects, node_str_val,
     sublist_get, sublist_length,
 }
 import diagnostics.{
@@ -12,6 +12,7 @@ import diagnostics.{
     diag_source_file, diag_file_for_node,
     diag_push_allows, diag_clear_allows,
     ARENA_VALUE_ESCAPES, ARENA_TYPE_CONTAINS_CYCLE, ARENA_EFFECT_REDUNDANT,
+    CLOSEABLE_ESCAPES_SCOPE,
 }
 import typecheck.{tc_fn_has_effect}
 import codegen_types.{list_contains_str}
@@ -237,6 +238,146 @@ fn ea_is_closeable_binding(name: Str) -> Int {
     0
 }
 
+// ── E0601 FFI-scope value-escape (PtrEscapesFfiScope) ──────────────────────
+// A Ptr minted by `with ffi.scope() as s` (s.alloc/alloc_n/cstr) is freed when
+// the block exits, so it must not escape. Two semantics (gz8wjc):
+//   - function-return escape  → fire on ANY still-live local scope origin
+//   - with-expr tail escape    → fire only on the tail block's OWN scopes
+// `s.take(p)` detaches the origin. This mirrors the codegen tracking
+// (ffi_origin_pending / get_var_ffi_ptr_origin / is_local_ffi_scope_binding)
+// at the AST level so check/LSP report the same E0601 as build.
+
+// Per-with-block stack of the scope-handle names opened by that block. The top
+// is the innermost block's own scopes (= codegen's `owning_scopes`); flattened,
+// it is the set of all still-live local scopes (= is_local_ffi_scope_binding).
+let mut ea_ffi_scope_blocks: List[List[Str]] = []
+
+// Block-scoped stack of `Ptr binding name → originating scope-handle name`
+// frames. One frame per lexical block (pushed/popped in walk_block_stmts), so a
+// rebinding in an inner block shadows the outer binding while live and is
+// dropped at block exit — mirroring codegen's scope_vars stack. An empty origin
+// means the Ptr is not scope-minted or was detached via scope.take(); it is
+// still recorded so it shadows a stale outer entry of the same name.
+let mut ea_ptr_origin_frames: List[Map[Str, Str]] = []
+
+fn ea_push_origin_frame() {
+    ea_ptr_origin_frames.push(Map())
+}
+
+fn ea_pop_origin_frame() {
+    if ea_ptr_origin_frames.len() == 0 { return }
+    ea_ptr_origin_frames.pop()
+}
+
+fn ea_push_ffi_scope_block() {
+    let empty: List[Str] = []
+    ea_ffi_scope_blocks.push(empty)
+}
+
+fn ea_pop_ffi_scope_block() {
+    if ea_ffi_scope_blocks.len() == 0 { return }
+    ea_ffi_scope_blocks.pop()
+}
+
+fn ea_register_ffi_scope(name: Str) {
+    if name == "" { return }
+    if ea_ffi_scope_blocks.len() == 0 { return }
+    let top = ea_ffi_scope_blocks.len() - 1
+    let mut block = ea_ffi_scope_blocks.get(top).unwrap()
+    block.push(name)
+}
+
+// The scope handles opened by the innermost still-open ffi.scope block.
+fn ea_current_block_scopes() -> List[Str] {
+    if ea_ffi_scope_blocks.len() == 0 {
+        let empty: List[Str] = []
+        return empty
+    }
+    ea_ffi_scope_blocks.get(ea_ffi_scope_blocks.len() - 1).unwrap()
+}
+
+// True iff `name` is a scope handle opened by any still-open ffi.scope block in
+// the current function — the function-return escape semantic.
+fn ea_ffi_scope_live(name: Str) -> Int {
+    if name == "" { return 0 }
+    let mut bi = 0
+    while bi < ea_ffi_scope_blocks.len() {
+        let block = ea_ffi_scope_blocks.get(bi).unwrap()
+        let mut i = 0
+        while i < block.len() {
+            if block.get(i).unwrap() == name { return 1 }
+            i = i + 1
+        }
+        bi = bi + 1
+    }
+    0
+}
+
+fn ea_set_ptr_origin(name: Str, origin: Str) {
+    if name == "" { return }
+    if ea_ptr_origin_frames.len() == 0 { return }
+    let top = ea_ptr_origin_frames.len() - 1
+    let mut frame = ea_ptr_origin_frames.get(top).unwrap()
+    frame.insert(name, origin)
+}
+
+// Resolve a Ptr binding's origin, innermost frame first (shadowing). A frame
+// that binds the name wins even when its origin is "" (a take-detached or
+// non-scope rebind shadows a stale outer scope origin).
+fn ea_ptr_origin_of(name: Str) -> Str {
+    let mut i = ea_ptr_origin_frames.len() - 1
+    while i >= 0 {
+        let frame: Map[Str, Str] = ea_ptr_origin_frames.get(i).unwrap()
+        if frame.contains_key(name) {
+            let origin = frame.get(name) ?? ""
+            return origin
+        }
+        i = i - 1
+    }
+    ""
+}
+
+// True when `node` is a method call whose object is the bare scope handle `s`
+// (i.e. `s.<method>(...)`). Used to recognise scope-minting calls.
+fn ffi_scope_method_obj(node: Int) -> Str {
+    if node == -1 { return "" }
+    if node_kind(node) != NodeKind.MethodCall { return "" }
+    let obj = node_obj(node)
+    if obj == -1 { return "" }
+    if node_kind(obj) != NodeKind.Ident { return "" }
+    node_name(obj)
+}
+
+// Resolve the originating `with ffi.scope() as <s>` of a Ptr-valued expression,
+// or "" when it is not a live scope-minted Ptr. Mirrors codegen's
+// resolve_ptr_escape_origin (ffi_origin_pending + per-var origin table):
+//   - `s.alloc()/alloc_n()/cstr()`  → s   (scope-minted)
+//   - `s.take(...)`                  → ""  (detached)
+//   - `p.offset(...)`                → origin of p (forwarded)
+//   - bare Ident p                   → recorded origin of p
+fn ffi_ptr_origin_of_node(node: Int) -> Str {
+    if node == -1 { return "" }
+    let k = node_kind(node)
+    if k == NodeKind.Ident {
+        return ea_ptr_origin_of(node_name(node))
+    }
+    if k == NodeKind.MethodCall {
+        let method = node_method(node)
+        let obj = node_obj(node)
+        let scope_name = ffi_scope_method_obj(node)
+        if scope_name != "" && ea_ffi_scope_live(scope_name) != 0 {
+            if method == "take" { return "" }
+            if method == "alloc" || method == "alloc_n" || method == "cstr" {
+                return scope_name
+            }
+        }
+        if method == "offset" {
+            return ffi_ptr_origin_of_node(obj)
+        }
+    }
+    ""
+}
+
 fn ea_in_arena() -> Int {
     if ea_frames.len() > 0 { 1 } else { 0 }
 }
@@ -272,6 +413,39 @@ fn is_alloc_expr(kind: Int) -> Int {
     0
 }
 
+// True when an InterpString node is a pure (non-interpolated) string literal —
+// every element is a literal text chunk, with no expression parts. Such a node
+// codegens to a static C string constant (codegen_expr.bl `all_literal` fast
+// path), not an arena allocation, so it must not be classified as an arena
+// value. The discriminator mirrors codegen exactly: a literal text chunk is an
+// Ident part whose str_val equals its name. An empty element list is the empty
+// string, also a pure literal.
+fn interp_is_pure_literal(node: Int) -> Int {
+    let parts_sl = node_elements(node)
+    if parts_sl == -1 { return 1 }
+    let mut i = 0
+    while i < sublist_length(parts_sl) {
+        let part = sublist_get(parts_sl, i)
+        if node_kind(part) != NodeKind.Ident { return 0 }
+        if node_str_val(part) != node_name(part) { return 0 }
+        i = i + 1
+    }
+    1
+}
+
+// Node-aware allocation classification: a pure-literal InterpString is a static
+// constant, never an arena allocation. All other InterpStrings (interpolated)
+// and the other literal kinds delegate to the kind-only `is_alloc_expr`.
+fn node_is_alloc_expr(node: Int) -> Int {
+    if node == -1 { return 0 }
+    let k = node_kind(node)
+    if k == NodeKind.InterpString {
+        if interp_is_pure_literal(node) != 0 { return 0 }
+        return 1
+    }
+    is_alloc_expr(k)
+}
+
 fn infer_alloc_type(node: Int) -> Str {
     let k = node_kind(node)
     if k == NodeKind.StructLit {
@@ -288,7 +462,7 @@ fn infer_alloc_type(node: Int) -> Str {
 fn rhs_is_arena_value(rhs: Int) -> Int {
     if rhs == -1 { return 0 }
     let k = node_kind(rhs)
-    if is_alloc_expr(k) != 0 { return 1 }
+    if node_is_alloc_expr(rhs) != 0 { return 1 }
     if k == NodeKind.Ident {
         let n = node_name(rhs)
         if ea_is_local_in_top(n) != 0 { return 1 }
@@ -338,12 +512,52 @@ fn emit_escape(node: Int, category: Str) ! Diag.Report {
 fn expr_is_arena_value(node: Int) -> Int {
     if node == -1 { return 0 }
     let k = node_kind(node)
-    if is_alloc_expr(k) != 0 { return 1 }
+    if node_is_alloc_expr(node) != 0 { return 1 }
     if k == NodeKind.Ident {
         let n = node_name(node)
         if ea_is_local_in_top(n) != 0 { return 1 }
     }
     0
+}
+
+@allow(UnrestoredMutation, IncompleteStateRestore)
+fn emit_ffi_scope_escape(node: Int, origin: Str) ! Diag.Report {
+    let saved = diag_source_file
+    diag_source_file = diag_file_for_node(node)
+    diag_error_at(
+        "PtrEscapesFfiScope", CLOSEABLE_ESCAPES_SCOPE,
+        "Ptr from 'with ffi.scope() as {origin}' cannot escape the block — use {origin}.take(p) to detach it first",
+        node,
+        "wrap the escaping value in {origin}.take(...)"
+    )
+    diag_source_file = saved
+}
+
+// Function-return escape: a returned Ptr whose origin resolves to ANY still-live
+// local ffi.scope binding will dangle once the function returns. (Latent behind
+// E0811 PtrOutsideFFI today, mirrored from codegen for consistency.)
+fn check_ffi_ptr_return_escape(val_node: Int) ! Diag.Report {
+    let origin = ffi_ptr_origin_of_node(val_node)
+    if origin == "" { return }
+    if ea_ffi_scope_live(origin) == 0 { return }
+    emit_ffi_scope_escape(val_node, origin)
+}
+
+// With-expr tail escape: fire only when the tail Ptr's origin is one of the
+// scopes THIS block opened — a Ptr minted by an outer still-live scope threaded
+// through as an inner block's tail does not dangle (per-block ownership).
+fn check_ffi_ptr_tail_escape(val_node: Int, owning_scopes: List[Str]) ! Diag.Report {
+    if owning_scopes.len() == 0 { return }
+    let origin = ffi_ptr_origin_of_node(val_node)
+    if origin == "" { return }
+    let mut i = 0
+    while i < owning_scopes.len() {
+        if owning_scopes.get(i).unwrap() == origin {
+            emit_ffi_scope_escape(val_node, origin)
+            return
+        }
+        i = i + 1
+    }
 }
 
 // True when `node` is a projection (FieldAccess / IndexExpr chain) whose
@@ -497,9 +711,26 @@ fn walk_call(node: Int) ! Diag.Report {
 }
 
 fn walk_block_stmts(block_node: Int, tail_flag: Int) ! Diag.Report {
+    walk_block_stmts_ffi(block_node, tail_flag, empty_str_list())
+}
+
+fn empty_str_list() -> List[Str] {
+    let e: List[Str] = []
+    e
+}
+
+// Walk a block's statements within their own Ptr-origin frame. `owning_scopes`,
+// when non-empty, names the ffi.scope handles this block opened; the tail
+// expression's E0601 escape is checked against them *before* the frame is
+// popped (the tail Ptr's origin lives in this frame).
+fn walk_block_stmts_ffi(block_node: Int, tail_flag: Int, owning_scopes: List[Str]) ! Diag.Report {
     let stmts_sl = node_stmts(block_node)
     if stmts_sl == -1 { return }
     let n = sublist_length(stmts_sl)
+    // Each lexical block gets its own Ptr-origin frame so a rebinding inside it
+    // shadows the outer scope and is dropped at block exit (mirrors codegen's
+    // scope_vars stack). Pushed before walking statements, popped after.
+    ea_push_origin_frame()
     let mut i = 0
     while i < n {
         let stmt = sublist_get(stmts_sl, i)
@@ -508,6 +739,41 @@ fn walk_block_stmts(block_node: Int, tail_flag: Int) ! Diag.Report {
         walk_expr(stmt, stmt_tail)
         i = i + 1
     }
+    if owning_scopes.len() != 0 {
+        check_ffi_ptr_tail_escape(block_tail_node(block_node), owning_scopes)
+    }
+    ea_pop_origin_frame()
+}
+
+// True when a WithResource handler's value is an `ffi.scope()` call — i.e. the
+// binding is a scope handle. Returns the binding name, or "" otherwise.
+fn ffi_scope_resource_name(item: Int) -> Str {
+    if item == -1 { return "" }
+    if node_kind(item) != NodeKind.WithResource { return "" }
+    let val = node_value(item)
+    if val == -1 { return "" }
+    if node_kind(val) != NodeKind.MethodCall { return "" }
+    if node_method(val) != "scope" { return "" }
+    let obj = node_obj(val)
+    if obj == -1 { return "" }
+    if node_kind(obj) != NodeKind.Ident { return "" }
+    if node_name(obj) != "ffi" { return "" }
+    node_name(item)
+}
+
+// The tail expression node of a `with`-block body, or -1. Mirrors codegen's
+// emit_block_then_capture tail selection: the last statement's value (for an
+// ExprStmt) or the statement itself.
+fn block_tail_node(body: Int) -> Int {
+    if body == -1 { return -1 }
+    if node_kind(body) != NodeKind.Block { return -1 }
+    let sl = node_stmts(body)
+    if sl == -1 { return -1 }
+    let n = sublist_length(sl)
+    if n == 0 { return -1 }
+    let last = sublist_get(sl, n - 1)
+    if node_kind(last) == NodeKind.ExprStmt { return node_value(last) }
+    last
 }
 
 fn walk_with_block(node: Int, outer_tail: Int) ! Diag.Report {
@@ -543,27 +809,46 @@ fn walk_with_block(node: Int, outer_tail: Int) ! Diag.Report {
         // Non-arena `with`: if we're inside an arena frame and any handler is a
         // WithResource `expr as name`, that binding names a Closeable whose
         // buffers must not be captured into the promoted tail (clause 6).
+        // Independently, an `ffi.scope()` resource opens an FFI scope block whose
+        // scope-minted Ptrs must not escape via the with-expr tail (E0601).
         let mut pushed_scope = 0
-        if ea_in_arena() != 0 {
-            if handlers_sl != -1 {
-                let mut hi2 = 0
-                while hi2 < sublist_length(handlers_sl) {
-                    let item2 = sublist_get(handlers_sl, hi2)
-                    if node_kind(item2) == NodeKind.WithResource {
-                        let bname = node_name(item2)
-                        if bname != "" {
-                            if pushed_scope == 0 {
-                                ea_push_closeable_scope()
-                                pushed_scope = 1
-                            }
-                            ea_register_closeable(bname)
+        let mut pushed_ffi = 0
+        if handlers_sl != -1 {
+            let mut hi2 = 0
+            while hi2 < sublist_length(handlers_sl) {
+                let item2 = sublist_get(handlers_sl, hi2)
+                if node_kind(item2) == NodeKind.WithResource {
+                    let bname = node_name(item2)
+                    if bname != "" && ea_in_arena() != 0 {
+                        if pushed_scope == 0 {
+                            ea_push_closeable_scope()
+                            pushed_scope = 1
                         }
+                        ea_register_closeable(bname)
                     }
-                    hi2 = hi2 + 1
+                    let fname = ffi_scope_resource_name(item2)
+                    if fname != "" {
+                        if pushed_ffi == 0 {
+                            ea_push_ffi_scope_block()
+                            pushed_ffi = 1
+                        }
+                        ea_register_ffi_scope(fname)
+                    }
                 }
+                hi2 = hi2 + 1
             }
         }
-        walk_expr(body, outer_tail)
+        // For an ffi.scope body, walk the statements directly so the with-expr
+        // tail escape is checked while the body's Ptr-origin frame is still live
+        // (block_tail_node's origin lives in that frame). Otherwise walk normally.
+        if pushed_ffi != 0 && node_kind(body) == NodeKind.Block {
+            walk_block_stmts_ffi(body, outer_tail, ea_current_block_scopes())
+        } else {
+            walk_expr(body, outer_tail)
+        }
+        if pushed_ffi != 0 {
+            ea_pop_ffi_scope_block()
+        }
         if pushed_scope != 0 {
             ea_pop_closeable_scope()
         }
@@ -575,7 +860,7 @@ fn walk_expr(node: Int, tail_flag: Int) ! Diag.Report {
     let kind = node_kind(node)
 
     if ea_in_arena() != 0 {
-        if is_alloc_expr(kind) != 0 {
+        if node_is_alloc_expr(node) != 0 {
             if tail_flag != 0 {
                 let tname = infer_alloc_type(node)
                 record_promote(node, tname)
@@ -651,6 +936,13 @@ fn walk_expr(node: Int, tail_flag: Int) ! Diag.Report {
                 }
             }
         }
+        let bname = node_name(node)
+        if bname != "" {
+            // Record unconditionally (including "") so a rebind — e.g.
+            // `let p = scope.take(...)` after `let p = scope.alloc()` — clears the
+            // stale origin instead of leaving it to false-positive at the tail.
+            ea_set_ptr_origin(bname, ffi_ptr_origin_of_node(val))
+        }
         return
     }
     if kind == NodeKind.ExprStmt {
@@ -658,7 +950,9 @@ fn walk_expr(node: Int, tail_flag: Int) ! Diag.Report {
         return
     }
     if kind == NodeKind.Return {
-        walk_expr(node_value(node), 1)
+        let rv = node_value(node)
+        walk_expr(rv, 1)
+        check_ffi_ptr_return_escape(rv)
         return
     }
     if kind == NodeKind.ForIn {
@@ -924,6 +1218,8 @@ fn analyze_fn(fn_node: Int) ! Diag.Report {
     diag_push_allows(fn_node)
     ea_frames = []
     ea_closeable_scopes = []
+    ea_ffi_scope_blocks = []
+    ea_ptr_origin_frames = []
     let arena_eff_node = find_arena_effect_node(fn_node)
     ea_fn_declares_arena = if arena_eff_node != -1 { 1 } else { 0 }
     ea_fn_arena_any_call = 0
@@ -972,6 +1268,8 @@ pub fn analyze_escapes(program: Int) ! Diag.Report {
     ea_promote_types = []
     ea_frames = []
     ea_closeable_scopes = []
+    ea_ffi_scope_blocks = []
+    ea_ptr_origin_frames = []
     ea_cycle_cache = Map()
     ea_cycle_reported = Map()
     ea_scan_program_structs(program)
