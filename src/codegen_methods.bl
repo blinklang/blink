@@ -4,7 +4,7 @@ import codegen_types.{
     CT_OPTION, CT_PTR, CT_RESULT, CT_SET, CT_STRING, CT_STRINGBUILDER,
     CT_ENUM, CT_STRUCT, CT_TEMPLATE, CT_VOID,
     GenericCallArgs,
-    append_ev_arg, c_fn_name, c_type_c_name, c_type_from_tag, c_type_str, c_type_tag, canonical_struct_tag,
+    append_ev_arg, c_fn_name, c_type_c_name, c_type_from_tag, c_type_str, c_type_tag, c_type_tag_for_struct, canonical_struct_tag,
     cg_async_scope_stack, cg_async_wrapper_counter, cg_closure_defs,
     cg_closure_param_type_hint, cg_current_fn_name, cg_handler_body_idx,
     cg_handler_cleanup_fn, cg_handler_cleanup_var,
@@ -18,10 +18,10 @@ import codegen_types.{
     ensure_struct_result_type, ensure_take_iter,
     find_from_impl, find_impl_method_node, impl_method_self_name, find_tryfrom_impl, fresh_temp,
     get_fn_ret, get_fn_ret_struct, get_fn_ret_struct_inner, get_fn_ret_type,
-    get_impl_method_ret, get_list_elem_map_key_type, get_list_elem_map_val_type, set_list_elem_map_types, is_map_scalar_ct,
+    get_impl_method_ret, get_list_elem_map_key_type, get_list_elem_map_val_type, get_list_elem_map_val_struct, set_list_elem_map_types, is_map_scalar_ct,
     get_list_elem_struct, get_list_elem_type,
     get_list_nested_elem_struct, get_list_nested_elem_type,
-    get_map_key_type, get_map_key_struct, get_map_value_list_elem, get_map_value_struct, get_map_value_type, get_set_elem_type,
+    get_map_key_type, get_map_key_type_raw, get_map_key_struct, get_map_value_list_elem, get_map_value_struct, get_map_value_type, get_map_value_type_raw, get_set_elem_type,
     kops_table_name, kops_is_inline_key, kops_is_struct_key,
     get_struct_field_closure_sig, get_struct_field_type,
     get_var_channel_inner, get_var_enum, get_var_iterator_inner,
@@ -410,6 +410,13 @@ fn emit_list_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int 
         emit_expr(sublist_get(args_sl, btc_arg_offset))
         let val_str = expr_result_str
         let val_type = expr_result_type
+        // d7es5j: capture the list's recorded element-map K/V BEFORE
+        // set_list_elem_type(CT_MAP) collapses them (the flat slot can't hold
+        // list→map→{k,v}). Used below to preserve an annotated List[Map[K,V]]
+        // value type when an untyped `Map()` is pushed.
+        let pre_list_map_k = if val_type == CT_MAP { get_list_elem_map_key_type(obj_str) } else { -1 }
+        let pre_list_map_v = if val_type == CT_MAP { get_list_elem_map_val_type(obj_str) } else { -1 }
+        let pre_list_map_vs = if val_type == CT_MAP { get_list_elem_map_val_struct(obj_str) } else { "" }
         if val_type != CT_INT {
             set_list_elem_type(obj_str, val_type)
         }
@@ -417,10 +424,23 @@ fn emit_list_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int 
         // value type to the default Int (the flat slot can't hold list→map→{k,v}).
         // Carry the pushed map's scalar key+value through so List[Map[K,V]].get()
         // keeps V instead of defaulting to Int.
+        // d7es5j: an empty `Map()` literal is genuinely untyped (raw k/v == -1),
+        // so its default Int value must NOT clobber the list's annotated value
+        // type. Prefer the pushed map's types only where it actually has them;
+        // otherwise restore the list's pre-collapse element-map types.
         if val_type == CT_MAP {
-            let pushed_v = get_map_value_type(val_str)
-            if is_map_scalar_ct(pushed_v) != 0 {
-                set_list_elem_map_types(obj_str, get_map_key_type(val_str), pushed_v, "")
+            let pushed_k_raw = get_map_key_type_raw(val_str)
+            let pushed_v_raw = get_map_value_type_raw(val_str)
+            let pushed_vs = get_map_value_struct(val_str)
+            let use_k = if pushed_k_raw >= 0 { pushed_k_raw } else { pre_list_map_k }
+            let use_v = if pushed_v_raw >= 0 { pushed_v_raw } else { pre_list_map_v }
+            let use_vs = if pushed_vs != "" { pushed_vs } else { pre_list_map_vs }
+            if use_vs != "" {
+                set_list_elem_map_types(obj_str, use_k, CT_STRUCT, use_vs)
+            } else if use_v >= 0 && is_map_scalar_ct(use_v) != 0 {
+                set_list_elem_map_types(obj_str, use_k, use_v, "")
+            } else if pre_list_map_k >= 0 || pre_list_map_v >= 0 {
+                set_list_elem_map_types(obj_str, pre_list_map_k, pre_list_map_v, pre_list_map_vs)
             }
         }
         let val_struct = resolve_push_struct(val_str, obj_str)
@@ -547,8 +567,11 @@ fn emit_list_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int 
         } else if elem_type == CT_MAP {
             let pop_map_k = get_list_elem_map_key_type(obj_str)
             let pop_map_v = get_list_elem_map_val_type(obj_str)
+            let pop_map_vs = get_list_elem_map_val_struct(obj_str)
             let k_tag = if pop_map_k >= 0 { c_type_tag(pop_map_k) } else { "str" }
-            let v_tag = if pop_map_v >= 0 { c_type_tag(pop_map_v) } else { "int" }
+            // mvfd3m: mirror the .get() path — a struct map value tags the carrier
+            // by struct name and forwards the value-struct through inner2_struct.
+            let v_tag = if pop_map_vs != "" { c_type_tag_for_struct(pop_map_vs) } else if pop_map_v >= 0 { c_type_tag(pop_map_v) } else { "int" }
             let map_struct = "Map_{k_tag}_{v_tag}"
             ensure_struct_option_type(map_struct)
             let opt_type = struct_option_c_type(map_struct)
@@ -557,6 +580,10 @@ fn emit_list_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int 
             emit_line("    {res}.tag = 1; {res}.value = (blink_map*)blink_list_pop({obj_str});")
             emit_line("} else \{ {res}.tag = 0; }")
             set_var_option_struct(res, CT_MAP, map_struct)
+            if pop_map_vs != "" {
+                set_var_option_inner2_struct(res, pop_map_vs)
+                expr_option_inner_map_val_struct = pop_map_vs
+            }
             expr_result_str = res
             expr_result_type = CT_OPTION
             expr_option_inner = CT_MAP
@@ -693,8 +720,12 @@ fn emit_list_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int 
         } else if elem_type == CT_MAP {
             let map_k = get_list_elem_map_key_type(obj_str)
             let map_v = get_list_elem_map_val_type(obj_str)
+            let map_vs = get_list_elem_map_val_struct(obj_str)
             let k_tag = if map_k >= 0 { c_type_tag(map_k) } else { "str" }
-            let v_tag = if map_v >= 0 { c_type_tag(map_v) } else { "int" }
+            // mvfd3m: a struct map value names the carrier by its struct tag
+            // (Map_{k}_{Point}) and forwards the value-struct name through the
+            // option's inner2_struct channel so the later unwrap recovers it.
+            let v_tag = if map_vs != "" { c_type_tag_for_struct(map_vs) } else if map_v >= 0 { c_type_tag(map_v) } else { "int" }
             let map_struct = "Map_{k_tag}_{v_tag}"
             ensure_struct_option_type(map_struct)
             let opt_type = struct_option_c_type(map_struct)
@@ -703,6 +734,10 @@ fn emit_list_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int 
             emit_line("    {res}.tag = 1; {res}.value = (blink_map*)blink_list_get({obj_str}, {idx_tmp});")
             emit_line("} else \{ {res}.tag = 0; }")
             set_var_option_struct(res, CT_MAP, map_struct)
+            if map_vs != "" {
+                set_var_option_inner2_struct(res, map_vs)
+                expr_option_inner_map_val_struct = map_vs
+            }
             expr_result_str = res
             expr_result_type = CT_OPTION
             expr_option_inner = CT_MAP
