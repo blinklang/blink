@@ -10,28 +10,36 @@ Pick ready tasks from Bridge and execute the appropriate workflow based on type.
 
 ---
 
-## Step 1: Fetch Ready Tasks
+## Step 1: Fetch the Task Graph
 
-Run `br ready -t repo:blink` to get all unblocked tasks.
+Run `br graph -t repo:blink` to get the dependency forest scoped to blink. Unlike a flat
+ready list, the graph nests each unblocked root (`[ ]`) above the blocked children (`[!]`)
+it gates — so you can see what each ready task *unblocks*, which is the tie-breaker in Step 2.
 
-If no tasks are ready, run `br blocked -t repo:blink`, report what's stuck, and ask the user how to proceed.
+One quirk to handle:
+- **Workable tasks are the unblocked roots — rows marked `[ ]`, not `[!]`.** The nested
+  `[!]` rows are *blocked* children; never select them. They exist only to show what a
+  root unblocks (and to feed the leverage tie-break below).
+
+If no `[ ]` blink roots exist, run `br blocked -t repo:blink`, report what's stuck, and ask the user how to proceed.
 
 ## Step 2: Select Tasks
 
-Sort ALL ready tasks by priority first (P0 > P1 > P2 > P3 > P4), then by type preference within the same priority level (bug > friction > feature > project > spec).
+Sort the unblocked blink roots by priority first (P0 > P1 > P2 > P3 > P4), then by type preference within the same priority level (bug > friction > feature > project > spec), then by leverage.
 
 If `$ARGUMENTS` is provided, filter tasks whose title matches the argument (case-insensitive substring).
 
-**Selection logic — priority-first, then type:**
+**Selection logic — priority, then type, then leverage:**
 
-1. Sort the full ready list by priority. Within the same priority, prefer: bug > friction > feature > project > spec.
-2. Walk the sorted list and pick up to 5 tasks, applying type rules:
+1. Sort the unblocked roots by priority. Within the same priority, prefer: bug > friction > feature > project > spec (chore alongside bug).
+2. **Leverage tie-breaker:** within the same (priority, type) bucket, a root that unblocks more downstream work ranks higher. Count the blocked `[!]` descendants nested under each root in the graph; a root with downstream dependents outranks an equal-priority, equal-type leaf with none.
+3. Walk the sorted list and pick up to 5 tasks, applying type rules:
    - `type:bug` / `type:friction` — auto-start, no confirmation needed.
    - `type:feature` — requires confirmation before starting.
    - `type:project` — requires confirmation; pick at most 1 project.
    - `type:spec` — tell the user to run `/deliberate` for this item. Only work it directly if the user confirms.
    - `type:chore` - auto-start, no confirmation needed.
-3. YOU MUST NOT skip a higher-priority task just because of its type. A P2 spec should be surfaced before a P4 feature.
+4. YOU MUST NOT skip a higher-priority task just because of its type. A P2 spec should be surfaced before a P4 feature.
 
 ## Step 3: Route by Type
 
