@@ -1,6 +1,6 @@
 # Blink Language Reference
 
-> Blink is a statically-typed, effect-tracked language compiling to C. **Compiler v0.50.0**.
+> Blink is a statically-typed, effect-tracked language compiling to C. **Compiler v0.51.0**.
 
 ## Install
 
@@ -12,7 +12,7 @@ docker pull ghcr.io/blinklang/blink:latest
 docker run --rm -v "$PWD":/workspace ghcr.io/blinklang/blink run myfile.bl
 ```
 
-Tags: `latest`, `0.50`, `0.50.0` (semver). Image is `debian:bookworm-slim` with `gcc`, `zig`, `blink`, and `libgc-dev`.
+Tags: `latest`, `0.51`, `0.51.0` (semver). Image is `debian:bookworm-slim` with `gcc`, `zig`, `blink`, and `libgc-dev`.
 
 ## Recent Changes
 
@@ -66,16 +66,26 @@ fn malloc(size: Int) -> Ptr[Int]
 
 ### ffi.scope() Resource Management
 
+`ffi.scope()` is a `Closeable` — bind it with `with ... as` (§9.1.1). All allocations made through the scope are freed when the `with` block exits (normal return, `?` early return, or any other exit path). Binding it directly (`let s = ffi.scope()`) is rejected with **E0819**: without a block to exit, the arena would never be freed.
+
 ```blink
-ffi.scope(fn(scope) {
-    let cstr = scope.cstr("hello")          // allocate C string (auto-freed)
-    let buf = scope.alloc(1024)             // allocate raw memory (auto-freed)
+with ffi.scope() as scope {
+    let cstr = scope.cstr("hello")          // C string copy (auto-freed)
+    let buf: Ptr[U8] = scope.alloc[U8]()    // zero-initialized cell (auto-freed)
     let arr = scope.alloc_n[MyStruct](16)   // contiguous array of 16 cells, returns Ptr[MyStruct] to first
-    let result = scope.take(ptr)            // take ownership of pointer
-})
+    let kept = scope.take(buf)              // transfer ownership out of scope (not freed at exit)
+}
+// scope frees every allocation here, at block exit
 ```
 
-`ffi.scope()` provides automatic memory management for FFI operations. All allocations are freed when the scope exits. `scope.alloc_n[T](n)` allocates a contiguous array of `n` cells of `T`; combine with `Ptr.offset(i)` for stride-correct iteration.
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `scope.alloc[T]()` | `fn alloc[T](self) -> Ptr[T]` | Allocate one zero-initialized cell of `T`, tracked by the scope |
+| `scope.alloc_n[T](n)` | `fn alloc_n[T](self, n: Int) -> Ptr[T]` | Allocate a contiguous array of `n` cells; combine with `Ptr.offset(i)` for stride-correct iteration |
+| `scope.cstr(s)` | `fn cstr(self, s: Str) -> Ptr[U8]` | Scoped null-terminated C string copy |
+| `scope.take(ptr)` | `fn take[T](self, ptr: Ptr[T]) -> Ptr[T]` | Transfer ownership out of the scope so it survives block exit (wrap in a `Closeable` for long-lived handles) |
+
+A scope-allocated pointer that escapes the block without `.take()` is a compile error (E0601, reused from `Closeable`).
 
 ### @ffi.struct (C struct layout twin)
 
@@ -228,6 +238,11 @@ test "addition works" {
 | Template[C] | `"SELECT * FROM t WHERE id = {id}"` | Parameterized template string (context `C` = `DB`, etc.). Interpolated values auto-extracted as parameters. `Raw(expr)` escapes parameterization. |
 | I8 / I16 / I32 | — | Sized signed integers (8/16/32-bit). C-style wrapping casts. FFI use. |
 | U8 / U16 / U32 / U64 | — | Sized unsigned integers. C-style wrapping casts. FFI use. |
+| Errno | `Errno(rc)` | Transparent zero-cost newtype over `Int` (`pub type Errno { Errno(Int) }`, `import std.errno`). The error arm of the libc `*_bytes` wrappers. Extract the code by matching `Errno(rc)`; no methods in v1. See **Transparent newtypes** below. |
+
+**Enums are nominally distinct from `Int`.** An enum value is not interchangeable with `Int` at `let` / argument / return positions — passing one where the other is expected is a type error. Convert explicitly with `.to_int()` / `Type.from_int(n)`. (`==` between an enum and its int still works.)
+
+**Transparent newtypes.** A single-variant enum wrapping exactly one `Int` payload (`pub type Errno { Errno(Int) }`) is lowered to a bare `int64_t` in carriers and at FFI boundaries — no box, no tag. It stays nominally distinct in the type system (so `Result[Int, Errno]` can't confuse the count with the errno) while costing nothing at runtime.
 
 ### Sized Integer Type Methods
 
@@ -337,7 +352,6 @@ let nested = ##"contains #"inner"#"##   // depth-2 nesting
 | `unix_socket_close(fd)` | Void | Close socket |
 | `socket_read_line(fd)` | Str | Read line from socket |
 | `socket_write(fd, data)` | Void | Write data to socket |
-| `ffi_scope(fn)` | Void | FFI resource scope — auto-frees allocations on exit |
 | `tcp_listen(host, port)` | Int | Listen on TCP socket |
 | `tcp_connect(host, port)` | Int | Connect to TCP host:port |
 | `tcp_accept(fd)` | Int | Accept incoming TCP connection |
@@ -995,8 +1009,10 @@ show(42)          // "42"
 | `std.db` | SQLite database with effect-based API (`DB.Read`, `DB.Write`), `Template[DB]` parameterization, `Row`, `Stmt`, `DBError`, transactions | `import std.db` |
 | `std.float` | Float helpers: `fabs(x)` and `is_nan(x)` are `@pure`; `close_to(x, y, tol)` carries an `@ensures` clause. Methods: `x.fabs()`, `x.is_nan()`, `x.close_to(y, t)` | `import std.float` |
 | `std.http` | HTTP client and server | `import std.http` |
+| `std.io` | Derived I/O combinators. `read_fully(fd: Int, n: Int) -> Result[Bytes, Errno] ! IO` loops `libc.read_bytes` until exactly `n` bytes are read or EOF (a short read keeps looping; fewer than `n` is returned only at EOF, still `Ok`) | `import std.io` |
+| `std.errno` | `Errno` — transparent zero-cost newtype over `Int` (`pub type Errno { Errno(Int) }`), the error arm of the `*_bytes` syscall wrappers. Match `Errno(rc)` to read the code | `import std.errno` |
 | `std.json` | JSON parser and serializer | `import std.json` |
-| `std.libc` | Curated libc syscall wrappers. `Pollfd`, `POLL_EVT_IN/PRI/OUT/ERR/HUP/NVAL`, `poll(fds, timeout_ms) -> Result[List[Pollfd], Str] ! IO` (semantics match `poll(2)`) | `import std.libc` |
+| `std.libc` | Curated libc syscall wrappers. `Pollfd`, `POLL_EVT_IN/PRI/OUT/ERR/HUP/NVAL`, `poll(fds, timeout_ms) -> Result[List[Pollfd], Str] ! IO` (semantics match `poll(2)`). Binary syscall wrappers returning `Result[…, Errno] ! IO`: `read_bytes(fd, max)` / `recv_bytes(fd, max)` / `getentropy_bytes(n)` → `Result[Bytes, Errno]`, `write_bytes(fd, data)` / `send_bytes(fd, data)` → `Result[Int, Errno]` (count written). A short read/write is `Ok` with a shorter `Bytes` / smaller count; only a `-1` syscall return is `Err(Errno(code))` | `import std.libc` |
 | `std.net` | TCP networking: `TcpSocket`, `TcpListener`, `NetError` (`Timeout`, `ConnectionRefused`, `DnsFailure`, `TlsError`, `InvalidUrl`, `BindError`, `ProtocolError`, `IoError`), `tcp_listen`, `tcp_connect`, `tcp_accept`, `tcp_read`, `tcp_write`, `tcp_read_bytes`, `tcp_write_bytes` | `import std.net` |
 | `std.path` | Path utilities: `path_join(a, b)`, `path_dirname(path)`, `path_basename(path)`, `path_parent(path)` (POSIX `dirname(1)` semantics — strips trailing slashes before walking up) | `import std.path` |
 | `std.process` | Process spawning: `spawn(cmd, args) -> Pid`, `Pid.wait()`, `Pid.kill()`, `Pid.send_signal(sig)`. POSIX signal constants: `SIGHUP`, `SIGINT`, `SIGQUIT`, `SIGKILL`, `SIGTERM` | `import std.process` |

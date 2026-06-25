@@ -80,6 +80,7 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | InvalidKeywordArg | E0511 | Keyword argument name does not match any parameter | Name resolution | §2 |
 | QuestionMarkErrorMismatch | E0512 | `?` error type mismatch — inner E1 ≠ function return E2 | Type checking | §3c.2 |
 | CoalesceRequiresOption | E0513 | `??` operator used on non-Option value | Type checking | §3c.2 |
+| AmbiguousMethodCall | E0522 | Unqualified method call resolves to a method defined by two or more implemented traits | Name resolution | §3.6 |
 | CloseableEscapesScope | E0601 | `Closeable` value escapes `with...as` scope | Resources | §5.5 |
 | ArenaValueEscapes | E0700 | Arena-scoped value escapes arena scope | Arena | §5.2 |
 | ArenaTypeContainsCycle | E0701 | Type crossing `with arena { }` boundary contains a cycle | Arena | §5.2 |
@@ -99,10 +100,12 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | PinnedBytesEscape | E0815 | Pinned Bytes receiver escapes its `with_ptr` closure | FFI | §9.1.1 |
 | WithPtrBodyTooComplex | E0816 | `Bytes.with_ptr` body is not a single inlinable expression | FFI | §9.1.1 |
 | BytesPtrCastForbidden | E0817 | Bytes coerced to `Ptr[U8]` outside `with_ptr` | FFI | §9.1.1 |
+| FfiScopeNotWithResource | E0819 | `ffi.scope()` bound directly instead of via `with ... as` (allocations would never be freed) | FFI | §9.1.1 |
 | MissingNativeDep | E0820 | `@ffi` references undeclared native dependency | FFI | §9.2.1 |
 | NativeDepUnavailableCrossTarget | E0821 | Native dependency unavailable for cross-target | FFI | §9.2.1 |
 | FfiOffsetUnknownStride | E0822 | `Ptr.offset` requires `@ffi.struct` element type | FFI | §9.1.1 |
 | CleanupPanickedDuringUnwind | E0824 | `exit(false)`/`close()` panicked during catchable unwind; original panic preserved, cleanup surfaces as warning | Test runner | §4.6.3 |
+| IncompatibleStdlibArchive | E0840 | Installed stdlib archive built by a different toolchain than the linking compiler (ABI/struct-layout mismatch) — rejected at link time | FFI | §9.2.1 |
 | SkipOutsideTest | E0827 | `skip()` called outside a `test { ... }` block | Type checking | §2.20 |
 | AssertPanicsBodyReturned | E0831 | `assert_panics` body returned normally instead of panicking | Test runner | §2.20 |
 | AssertPanicsMessageMismatch | E0832 | `assert_panics` panic message did not match expected pattern | Test runner | §2.20 |
