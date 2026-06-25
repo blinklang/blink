@@ -1,0 +1,166 @@
+// cty7c4 — assert_panics / @expect_panic Phase C concern lock-in.
+//
+// Spec: §2.20 (assert_panics block form), §4.6.3 (cleanup / R3-fence asymmetry),
+// decisions/assert-panics-semantics.md (Phase C, 6-0). The five Phase C concerns
+// carried into the impl ticket are pinned here so a regression in the panic-catch
+// path, the @expect_panic desugar, or the substring matcher is caught.
+//
+// Concern → test map:
+//   (a) substring discipline   → the "substring …" tests below (literal
+//       containment, full-actual-message-on-failure, divide/divider prefix pair).
+//   (b) cleanup asymmetry       → the in-file BlockHandler two-test log pattern
+//       (outer-scope `with` COMMITS; closure-internal `with` rolls back — the
+//       rollback half lives in tests/test_assert_panics.bl:74-90, see comment).
+//   (c) span at decl line       → the E0832 (@expect_panic mismatch) test; the
+//       E0831 (non-panicking body) decl-span case is in test_expect_panic.bl:40-48.
+//   (d) E0834 nested            → ALREADY COVERED in test_expect_panic.bl:52-55;
+//       not re-added here (see comment in that section).
+//   (e) body is a block         → the two parser-rejection tests.
+//
+// Framing note for (e): the concern's ticket text says rejection happens "via
+// `fn() -> Never` enforcement." It does not — the body is a compiler-recognized
+// block, never a reified `fn` value, so there is no `fn() -> Never` to typecheck.
+// The guarantee (can't pass a closure, can't bind/store the body) is enforced at
+// the PARSER layer: E1100 AssertPanicsCallForm for `assert_panics(fn(){})`, and a
+// parse rejection (E1100 UnexpectedToken) for `let x = assert_panics {}`. Both are
+// asserted below against the real diagnostics, not a fictional `fn() -> Never`.
+import compile_test_helpers { compile_and_run_test_json, compile_and_capture, expect_compile_error }
+
+type CtxTx {
+    id: Int
+}
+
+// ── (b) Cleanup ordering: outer-scope `with` vs closure-internal `with` ──────
+// §4.6.3 asymmetry. A `with` opened INSIDE the assert_panics body rolls back on
+// the caught panic (covered in tests/test_assert_panics.bl:74-90, the
+// a_rollback_runs / b_verify pair). A `with` opened OUTSIDE the body does NOT
+// roll back: the panic is consumed inside assert_panics, so the outer block
+// completes normally and exit(ok=true) commits. The two-test log pattern below
+// proves the COMMIT half; together with that file the pair pins the asymmetry.
+let mut cl_log: List[Str] = []
+
+impl BlockHandler for CtxTx {
+    type Context = Int
+
+    fn enter(self) -> Int {
+        cl_log.push("enter:{self.id}")
+        0
+    }
+
+    fn exit(self, ok: Bool) {
+        if ok {
+            cl_log.push("commit:{self.id}")
+        } else {
+            cl_log.push("rollback:{self.id}")
+        }
+    }
+}
+
+fn cl_log_has(needle: Str) -> Bool {
+    let mut i = 0
+    while i < cl_log.len() {
+        if cl_log.get(i).unwrap() == needle {
+            return true
+        }
+        i = i + 1
+    }
+    false
+}
+
+// ── (a) Substring discipline ────────────────────────────────────────────────
+// Matching is literal substring containment against the full panic message
+// (`panic: Int division by zero at <file>:<line>`). A stable phrase matches and
+// ignores the volatile ` at file:line` suffix; a wrong phrase fails AND the full
+// actual message is always rendered (the DevOps mitigation for substring's known
+// "too-loose substring silently passes" weakness).
+test "matching: a stable substring of the panic passes" {
+    let src = "test \"t\" \{\n    assert_panics(matching: \"division by zero\") \{\n        let z = 0\n        let _ = 1 / z\n    \}\n\}\n"
+    let r = compile_and_run_test_json(src, "_cty7c4_sub_pass")
+    assert(r.out.contains("\"status\":\"pass\""))
+    assert(r.out.contains("\"passed\":1"))
+    assert(r.out.contains("\"failed\":0"))
+}
+
+test "matching: a wrong substring fails and prints the full actual message" {
+    let src = "test \"t\" \{\n    assert_panics(matching: \"totally different\") \{\n        let z = 0\n        let _ = 1 / z\n    \}\n\}\n"
+    let r = compile_and_run_test_json(src, "_cty7c4_sub_fail")
+    assert(r.out.contains("\"status\":\"failed\""))
+    assert(r.out.contains("did not contain the expected substring"))
+    // The full actual message is rendered in the failure introspection — not just
+    // "assertion failed" — so a too-loose match is diagnosable.
+    assert(r.out.contains("Int division by zero"))
+}
+
+// The divide/divider pair: matching is literal containment with NO word
+// anchoring or regex. "division" IS a substring of "Int division by zero" so it
+// passes; "divider" is NOT (it is not a prefix-anchored word match) so it fails.
+test "matching: 'division' is a literal substring -> passes" {
+    let src = "test \"t\" \{\n    assert_panics(matching: \"division\") \{\n        let z = 0\n        let _ = 1 / z\n    \}\n\}\n"
+    let r = compile_and_run_test_json(src, "_cty7c4_disc_pass")
+    assert(r.out.contains("\"status\":\"pass\""))
+    assert(r.out.contains("\"passed\":1"))
+}
+
+test "matching: 'divider' is not contained -> fails (no regex/anchoring)" {
+    let src = "test \"t\" \{\n    assert_panics(matching: \"divider\") \{\n        let z = 0\n        let _ = 1 / z\n    \}\n\}\n"
+    let r = compile_and_run_test_json(src, "_cty7c4_disc_fail")
+    assert(r.out.contains("\"status\":\"failed\""))
+    assert(r.out.contains("did not contain the expected substring"))
+}
+
+test "a_outer_with_around_assert_panics_consumes_panic" {
+    with CtxTx { id: 9 } as _t {
+        cl_log.push("outer-before")
+        assert_panics(matching: "None") {
+            let xs: List[Int] = []
+            let _ = xs.get(0).unwrap()
+        }
+        cl_log.push("outer-after")
+    }
+}
+
+test "b_verify_outer_with_committed_not_rolled_back" {
+    assert(cl_log_has("outer-before"))
+    assert(cl_log_has("outer-after"))
+    assert(cl_log_has("commit:9"))
+    assert(!cl_log_has("rollback:9"))
+}
+
+// ── (c) Span at decl line — E0832 (message-mismatch) variant ─────────────────
+// Mirrors the E0831 decl-span test in test_expect_panic.bl:40-48, but on the
+// mismatch path: @expect_panic("...") over a PANICKING body whose message does
+// not contain the substring. The failure span is the DECL line (line 2: the
+// `test "…"` line; line 1 is `@expect_panic`), not the panic's interior (line 4).
+test "expect_panic mismatch -> E0832-class failure, span at decl line" {
+    let src = "@expect_panic(\"this will not match\")\ntest \"t\" \{\n    let xs: [Int] = []\n    let _ = xs.get(0).unwrap()\n\}\n"
+    let r = compile_and_run_test_json(src, "_cty7c4_e0832_decl")
+    assert(r.out.contains("\"status\":\"failed\""))
+    assert(r.out.contains("did not contain the expected substring"))
+    // Trailing comma anchors the match so it can't be a prefix of "line":2X.
+    assert(r.out.contains("\"line\":2,"))
+    // The panic actually fires on line 4, but the failure is reported at the
+    // desugared assert_panics decl span (line 2), not the interior.
+}
+
+// ── (d) E0834 nested ─────────────────────────────────────────────────────────
+// Already covered: tests/test_expect_panic.bl:52-55 asserts that an
+// assert_panics nested inside an @expect_panic body is rejected with E0834. Not
+// re-added here — this comment keeps the Phase C checklist traceable.
+// ── (e) Body is a block, not a closure; not bindable ─────────────────────────
+// See the framing note in the file header: enforced at the PARSER, not via a
+// `fn() -> Never` type. Both forms must be hard compile errors.
+test "assert_panics with a closure argument is E1100 AssertPanicsCallForm" {
+    let src = "test \"t\" \{\n    assert_panics(fn() \{ let _ = 1 + 1 \})\n\}\n"
+    expect_compile_error(src, "_cty7c4_e1100_closure", "E1100")
+}
+
+test "binding the assert_panics body is a compile error (no first-class value)" {
+    let src = "test \"t\" \{\n    let x = assert_panics \{ let _ = 1 + 1 \}\n\}\n"
+    let out = compile_and_capture(src, "_cty7c4_bind_reject")
+    // Assert the specific parse-rejection (E1100), not merely that SOME error
+    // exists — a bare "severity":"error" check would pass green even if the RHS
+    // started parsing and failed for an unrelated reason, masking a regression
+    // that re-allowed binding the body.
+    assert(out.contains("E1100"))
+    assert(out.contains("\"severity\":\"error\""))
+}
