@@ -36,7 +36,7 @@ import codegen_types.{
     is_generic_fn, is_struct_type, is_trait_type, is_transparent_newtype, is_user_effect_handle,
     cg_expect_fn_value_sig, cg_expect_arg_ann, arg_type_ann_at, get_callee_params_sl,
     builtin_receiver_type_name,
-    is_sized_int_ct, lookup_builtin_trait_impl, lookup_impl_method, impl_method_reg_name, mangle_generic_name, mangle_from_method, synthesized_display_call, render_result_arm_value, wrapping_unsigned_c_type,
+    is_sized_int_ct, lookup_builtin_trait_impl, lookup_impl_method, impl_method_reg_name, impl_trait_for_method, impl_type_implements_trait_method, mangle_generic_name, mangle_impl_method_q, mangle_from_method, synthesized_display_call, render_result_arm_value, wrapping_unsigned_c_type,
     option_c_type, reg_fn, register_mono_fn, register_mono_instance,
     resolve_import_alias, resolve_ptr_inner_c, resolve_struct_from_c_name, get_var_ffi_ptr_struct, is_ffi_ptr_array_var,
     ffi_alloc_n_pending, ffi_offset_pending_struct,
@@ -83,7 +83,12 @@ fn emit_panic_tag_check_render(tmp: Str, tag_val: Int, msg_prefix: Str, rendered
 
 @allow(UnrestoredMutation, IncompleteStateRestore)
 fn emit_user_impl_call(node: Int, type_name: Str, method: Str, obj_str: Str) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
-    let mangled = "{type_name}_{method}"
+    // Resolve the owning trait so the symbol matches the trait-qualified
+    // definition (sb3125). Ambiguous calls are rejected at typecheck, so a
+    // resolved trait here is unique; "" (e.g. inherent/synthesized paths) keeps
+    // the bare symbol.
+    let call_trait = impl_trait_for_method(type_name, method)
+    let mangled = if call_trait != "" { mangle_impl_method_q(type_name, call_trait, method) } else { "{type_name}_{method}" }
     let args_sl = node_args(node)
     let mut args_str = obj_str
     // Callee param sublist for carrier hints. The method node's params include
@@ -2273,8 +2278,26 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                 let first_str = expr_result_str
                 let first_type = expr_result_type
                 let type_name = get_var_struct(first_str)
-                if type_name != "" {
-                    let mangled = "{type_name}_{method}"
+                // Sealed builtin ops-traits (StrOps/ListOps/BytesOps/…) on a
+                // builtin receiver dispatch to codegen intrinsics, not to a user
+                // impl symbol — check this FIRST so the trait-qualified user path
+                // below never claims a builtin (sb3125 regression).
+                if lookup_builtin_trait_impl(trait_name, first_type) != 0 {
+                    btc_arg_offset = 1
+                    let bt_handled = emit_builtin_trait_method(node, first_str, first_type, obj_node, method)
+                    btc_arg_offset = 0
+                    if bt_handled != 0 { return }
+                }
+                // Genuine user impl: build the trait-qualified symbol — this is
+                // the escape hatch that selects between two traits sharing a
+                // method name (sb3125). The qualifier names the intended trait,
+                // but only honor it when that trait actually defines the method;
+                // otherwise (e.g. ListOps.is_empty, where is_empty lives in
+                // ListPure) resolve the real owner so the symbol matches the def.
+                if type_name != "" && lookup_impl_method(type_name, method) != 0 {
+                    let reg_name = impl_method_reg_name(type_name, method)
+                    let owner_trait = if impl_type_implements_trait_method(reg_name, trait_name, method) != 0 { trait_name } else { impl_trait_for_method(reg_name, method) }
+                    let mangled = if owner_trait != "" { mangle_impl_method_q(reg_name, owner_trait, method) } else { "{reg_name}_{method}" }
                     let mut args_str = first_str
                     let mut i = 1
                     while i < sublist_length(args_sl) {
@@ -2299,7 +2322,11 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                 // builtin methods, so a stdlib `impl SomeTrait for Str` gets used here too.
                 let bi_recv_name = builtin_receiver_type_name(first_type)
                 if bi_recv_name != "" && lookup_impl_method(bi_recv_name, method) != 0 {
-                    let mangled = "{bi_recv_name}_{method}"
+                    // The qualifier may name a sibling trait that doesn't own the
+                    // method (ListOps.is_empty, where is_empty lives in ListPure);
+                    // resolve the real owner so the symbol matches the definition.
+                    let bi_owner_trait = if impl_type_implements_trait_method(bi_recv_name, trait_name, method) != 0 { trait_name } else { impl_trait_for_method(bi_recv_name, method) }
+                    let mangled = if bi_owner_trait != "" { mangle_impl_method_q(bi_recv_name, bi_owner_trait, method) } else { "{bi_recv_name}_{method}" }
                     let mut args_str = first_str
                     let mut bi_i = 1
                     while bi_i < sublist_length(args_sl) {
@@ -2313,15 +2340,6 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                     expr_list_elem_struct = ""
                     expr_result_type = get_impl_method_ret(bi_recv_name, method)
                     return
-                }
-                // Builtin trait dispatch: e.g. MapOps.contains_key(m, k)
-                if lookup_builtin_trait_impl(trait_name, first_type) != 0 {
-                    btc_arg_offset = 1
-                    let handled = emit_builtin_trait_method(node, first_str, first_type, obj_node, method)
-                    btc_arg_offset = 0
-                    if handled != 0 {
-                        return
-                    }
                 }
             }
         }

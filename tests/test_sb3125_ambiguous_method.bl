@@ -1,0 +1,40 @@
+import compile_test_helpers
+
+// sb3125 — §3c rule-3 AmbiguousMethodCall (E0522).
+// When `x.m()` resolves to a method `m` defined in two or more traits the
+// receiver type implements, it is a compile error. The escape hatch is the
+// qualified call `Trait.method(receiver, ...)`.
+
+// Spec MVCE: two user traits define `serialize` for the same type.
+test "two traits with same method makes unqualified call ambiguous" {
+    let src = "trait Serializable \{ fn serialize(self) -> Str }\ntrait Debuggable \{ fn serialize(self) -> Str }\ntype Config \{ x: Int }\nimpl Serializable for Config \{ fn serialize(self) -> Str \{ \"json\" } }\nimpl Debuggable for Config \{ fn serialize(self) -> Str \{ \"debug\" } }\nfn main() \{ let c = Config \{ x: 1 }\n io.println(c.serialize()) }\n"
+    compile_test_helpers.expect_compile_error(src, "sb3125_two_traits", "E0522")
+}
+
+// bsn3s9 trigger: synthesized sealed Display.display() collides with a foreign
+// trait's `fn display(self) -> Str` on the same type.
+test "Display synthesis collides with foreign display is ambiguous" {
+    let src = "trait Printable \{ fn display(self) -> Str }\ntype Point \{ x: Int, y: Int }\nimpl Display for Point \{ fn fmt(self, sb: StringBuilder) \{ sb.write(\"p\") } }\nimpl Printable for Point \{ fn display(self) -> Str \{ \"custom\" } }\nfn main() \{ let p = Point \{ x: 1, y: 2 }\n io.println(p.display()) }\n"
+    compile_test_helpers.expect_compile_error(src, "sb3125_display_foreign", "E0522")
+}
+
+// Single trait → no ambiguity, unqualified call still resolves.
+test "single trait method resolves without ambiguity" {
+    let src = "trait Serializable \{ fn serialize(self) -> Str }\ntype Config \{ x: Int }\nimpl Serializable for Config \{ fn serialize(self) -> Str \{ \"json\" } }\nfn main() \{ let c = Config \{ x: 1 }\n io.println(c.serialize()) }\n"
+    compile_test_helpers.expect_no_error(src, "sb3125_single_trait_ok", "E0522")
+}
+
+// Escape hatch: qualified call on the otherwise-ambiguous type compiles clean.
+test "qualified call disambiguates the ambiguous method" {
+    let src = "trait Serializable \{ fn serialize(self) -> Str }\ntrait Debuggable \{ fn serialize(self) -> Str }\ntype Config \{ x: Int }\nimpl Serializable for Config \{ fn serialize(self) -> Str \{ \"json\" } }\nimpl Debuggable for Config \{ fn serialize(self) -> Str \{ \"debug\" } }\nfn main() \{ let c = Config \{ x: 1 }\n io.println(Serializable.serialize(c)) }\n"
+    compile_test_helpers.expect_no_error(src, "sb3125_qualified_ok", "E0522")
+}
+
+// Escape hatch returns the correct trait's value at runtime.
+test "qualified call selects the named trait's implementation" {
+    let src = "trait Serializable \{ fn serialize(self) -> Str }\ntrait Debuggable \{ fn serialize(self) -> Str }\ntype Config \{ x: Int }\nimpl Serializable for Config \{ fn serialize(self) -> Str \{ \"json\" } }\nimpl Debuggable for Config \{ fn serialize(self) -> Str \{ \"debug\" } }\nfn main() \{ let c = Config \{ x: 1 }\n io.println(Serializable.serialize(c))\n io.println(Debuggable.serialize(c)) }\n"
+    let r = compile_test_helpers.compile_and_run(src, "sb3125_qualified_run")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("json"))
+    assert(r.out.contains("debug"))
+}

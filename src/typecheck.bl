@@ -18,7 +18,7 @@ import diagnostics.{
     Diag, diag_clear_allows, diag_error_at, diag_error_no_loc,
     diag_push_allows, diag_warn_at,
     TYPE_ERROR, CAPABILITY_BUDGET, QM_INVALID_OPERAND, UNDEFINED_FUNCTION,
-    UNRESOLVED_METHOD,
+    UNRESOLVED_METHOD, AMBIGUOUS_METHOD_CALL,
     UNDEFINED_VARIABLE, UNKNOWN_TYPE, QM_RESULT_IN_NON_RESULT,
     QM_OPTION_IN_NON_OPTION, QM_ERROR_MISMATCH,
     QM_TEST_DISPLAY_REQUIRED, TEST_ANNOTATED_RETURN, SKIP_OUTSIDE_TEST,
@@ -178,6 +178,56 @@ let mut tc_trait_assoc_names: List[Str] = []
 // compiler synthesizes a sealed `display() -> Str`.
 let mut tc_display_impl_types: List[Str] = []
 
+// sb3125 — typecheck-phase index of which traits define a given method for a
+// given type. Built while walking impls (the codegen impl_entries registry is
+// empty during typecheck). Drives both the trait-qualified fnsig key and the
+// E0522 ambiguity check. tc_method_trait_count holds the distinct-trait count;
+// tc_method_trait_names holds " and "-joined names for the diagnostic message.
+// Both keyed "{type}\t{method}".
+let mut tc_method_trait_count_idx: Map[Str, Int] = Map()
+let mut tc_method_trait_names_idx: Map[Str, Str] = Map()
+
+fn tc_method_traits_key(tname: Str, method: Str) -> Str {
+    "{tname}\t{method}"
+}
+
+fn tc_record_method_trait(tname: Str, method: Str, trait_name: Str) {
+    let key = tc_method_traits_key(tname, method)
+    let prev_n = tc_method_trait_count_idx.get(key) ?? 0
+    tc_method_trait_count_idx.insert(key, prev_n + 1)
+    let prev_names = tc_method_trait_names_idx.get(key) ?? ""
+    if prev_names == "" {
+        tc_method_trait_names_idx.insert(key, trait_name)
+    } else {
+        tc_method_trait_names_idx.insert(key, "{prev_names} and {trait_name}")
+    }
+}
+
+// Count of distinct traits defining `method` for `tname` (the synthesized
+// sealed Display.display() is folded in at record time). >=2 ⇒ ambiguous.
+fn tc_method_trait_count(tname: Str, method: Str) -> Int {
+    tc_method_trait_count_idx.get(tc_method_traits_key(tname, method)) ?? 0
+}
+
+fn tc_method_trait_names(tname: Str, method: Str) -> Str {
+    tc_method_trait_names_idx.get(tc_method_traits_key(tname, method)) ?? ""
+}
+
+// Typecheck-side mirror of codegen's mangle_impl_method: the fnsig key for an
+// impl method. Must match the codegen C symbol exactly so arg-shape/return-type
+// lookups resolve. From/TryFrom keep `{type}_{method}_{src}`; all other traits
+// use the trait-qualified `{type}_{trait}_{method}`.
+fn tc_mangle_impl_fnsig(impl_type: Str, trait_name: Str, mname: Str, im: Int) -> Str {
+    if trait_name == "From" || trait_name == "TryFrom" {
+        let tparams = node_type_params(im)
+        if tparams != -1 && sublist_length(tparams) > 0 {
+            let src = node_name(sublist_get(tparams, 0))
+            return "{impl_type}_{mname}_{src}"
+        }
+    }
+    "{impl_type}_{trait_name}_{mname}"
+}
+
 fn tc_type_has_display_impl(tname: Str) -> Int {
     let mut i = 0
     while i < tc_display_impl_types.len() {
@@ -194,11 +244,10 @@ fn tc_type_has_display_impl(tname: Str) -> Int {
 // typecheck error, so over-strictness would reject valid programs — including
 // the compiler typechecking itself during `task regen`. When unsure: return 1.
 fn tc_method_resolvable_on_type(obj_k: Int, tname: Str, method: Str) -> Int {
-    // (a) user method + ALL trait-impl methods — `impl Trait for T { fn m }`
-    //     registers a fnsig `T_m`, same as inherent impls. The sole caller
-    //     (infer_type's struct/enum branch) already returns on this lookup, so
-    //     this clause is redundant there; kept so the predicate stays correct
-    //     and self-contained for any future caller.
+    // (a) user method + ALL trait-impl methods. Trait-impl methods register
+    //     under the trait-qualified key `{T}_{trait}_{m}` (sb3125), so consult
+    //     the method→traits index; a bare inherent fnsig `{T}_{m}` still counts.
+    if tc_method_trait_count(tname, method) >= 1 { return 1 }
     if lookup_fnsig("{tname}_{method}") != -1 { return 1 }
     // (b) sealed synthesized Display.display() (no user fnsig).
     if method == "display" && tc_type_has_display_impl(tname) != 0 { return 1 }
@@ -2317,6 +2366,8 @@ fn init_types() ! TypeCheck.Register {
     tc_trait_method_names.clear()
     tc_trait_assoc_names.clear()
     tc_display_impl_types.clear()
+    tc_method_trait_count_idx.clear()
+    tc_method_trait_names_idx.clear()
     tc_tmsig_pool.clear()
     tc_tmsig_param_names.clear()
     tc_trait_tparam_names.clear()
@@ -2527,10 +2578,15 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
         while i < sublist_length(impls_sl) {
             let im = sublist_get(impls_sl, i)
             let impl_type = node_name(im)
+            let trait_name = node_trait_name(im)
             // 4q2etk: replaced by mwxtyj — record Display impls so infer_type
             // can resolve the synthesized display() to Str.
-            if node_trait_name(im) == "Display" {
+            if trait_name == "Display" {
                 tc_display_impl_types.push(impl_type)
+                // The synthesized sealed `display()` makes `display` resolvable
+                // on this type; record it as a Display-owned method so a foreign
+                // trait's `display` registers as a second owner (sb3125/bsn3s9).
+                tc_record_method_trait(impl_type, "display", "Display")
             }
             let methods_sl = node_methods(im)
             if methods_sl != -1 {
@@ -2538,7 +2594,12 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
                 while j < sublist_length(methods_sl) {
                     let m = sublist_get(methods_sl, j)
                     let orig_name = node_name(m)
-                    node_set_name(m, "{impl_type}_{orig_name}")
+                    // From/TryFrom keep their source-typed symbol scheme; all
+                    // other impl methods register under the trait-qualified key
+                    // so two traits sharing a method name don't overwrite.
+                    let mangled = tc_mangle_impl_fnsig(impl_type, trait_name, orig_name, im)
+                    tc_record_method_trait(impl_type, orig_name, trait_name)
+                    node_set_name(m, mangled)
                     register_fn_sig(m)
                     node_set_name(m, orig_name)
                     j = j + 1
@@ -2572,13 +2633,14 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
             let mod_name = node_module(im)
             if mod_name != "" && mod_name != "__main__" {
                 let impl_type = node_name(im)
+                let trait_name = node_trait_name(im)
                 tc_symbol_module.insert(impl_type, mod_name)
                 let methods_sl_sym = node_methods(im)
                 if methods_sl_sym != -1 {
                     let mut j = 0
                     while j < sublist_length(methods_sl_sym) {
                         let m = sublist_get(methods_sl_sym, j)
-                        tc_symbol_module.insert("{impl_type}_{node_name(m)}", mod_name)
+                        tc_symbol_module.insert(tc_mangle_impl_fnsig(impl_type, trait_name, node_name(m), im), mod_name)
                         j = j + 1
                     }
                 }
@@ -5471,6 +5533,17 @@ fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repo
                     return TYPE_VOID
                 }
                 if is_builtin_fn(fn_name) != 0 {
+                    // Infer args so nested expressions (e.g. a method call passed
+                    // to println) are type-checked — variadic builtins otherwise
+                    // skip arg inference, hiding errors like E0522 (sb3125).
+                    let bf_args = node_args(node)
+                    if bf_args != -1 {
+                        let mut bai = 0
+                        while bai < sublist_length(bf_args) {
+                            infer_type(sublist_get(bf_args, bai))
+                            bai = bai + 1
+                        }
+                    }
                     return get_builtin_fn_ret(fn_name)
                 }
                 if is_variant_name(fn_name) != 0 {
@@ -5511,6 +5584,17 @@ fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repo
                     return fs.ret
                 }
             } else if callee_kind == NodeKind.FieldAccess {
+                // Infer args so nested expressions in a module-qualified call
+                // (e.g. io.println(x.m())) are type-checked — otherwise this
+                // branch returns without descending, hiding E0522 (sb3125).
+                let fa_args = node_args(node)
+                if fa_args != -1 {
+                    let mut fai = 0
+                    while fai < sublist_length(fa_args) {
+                        infer_type(sublist_get(fa_args, fai))
+                        fai = fai + 1
+                    }
+                }
                 let obj = node_obj(callee)
                 if obj != -1 && node_kind(obj) == NodeKind.Ident {
                     let type_name = node_name(obj)
@@ -5808,7 +5892,19 @@ fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repo
 
         if obj_k == TK_STRUCT || obj_k == TK_ENUM {
             let tname = ty_pool.get(obj_t).unwrap().name
-            let sig_name = "{tname}_{method}"
+            // sb3125 §3c rule-3: an unqualified call to a method defined by two
+            // or more traits this type implements is ambiguous. Reject before
+            // resolving — the qualified call `Trait.method(receiver)` selects one.
+            if tc_method_trait_count(tname, method) >= 2 {
+                let names = tc_method_trait_names(tname, method)
+                diag_error_at("AmbiguousMethodCall", AMBIGUOUS_METHOD_CALL, "ambiguous method call: '.{method}' is defined in multiple traits implemented by {tname} ({names})", node, "use a qualified call to disambiguate, e.g. `Trait.{method}(receiver)`")
+                return TYPE_UNKNOWN
+            }
+            // Resolve through the trait-qualified fnsig key. From/TryFrom register
+            // under their source-typed key (handled via the builtin-method path
+            // below), so a bare-key fallback keeps any non-trait inherent sig.
+            let sole_trait = tc_method_trait_names(tname, method)
+            let sig_name = if sole_trait != "" { "{tname}_{sole_trait}_{method}" } else { "{tname}_{method}" }
             let sig = lookup_fnsig(sig_name)
             if sig != -1 {
                 check_arg_shapes("{tname}.{method}", sig, node_args(node), 1)
@@ -5854,7 +5950,15 @@ fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repo
                 return get_builtin_fn_ret(obj_name)
             }
             // Static method on a builtin/named type: Type.from(x), Type.try_from(x), etc.
-            // The fnsig is registered as `{TypeName}_{method}` by the impl emitter.
+            // Trait-impl methods register under `{Type}_{trait}_{method}` (sb3125);
+            // From/TryFrom and inherent sigs keep the bare `{Type}_{method}` key.
+            let static_trait = tc_method_trait_names(obj_name, method)
+            if static_trait != "" && tc_method_trait_count(obj_name, method) == 1 {
+                let q_sig = lookup_fnsig("{obj_name}_{static_trait}_{method}")
+                if q_sig != -1 {
+                    return fnsig_pool.get(q_sig).unwrap().ret
+                }
+            }
             let static_sig_name = "{obj_name}_{method}"
             let static_sig = lookup_fnsig(static_sig_name)
             if static_sig != -1 {
@@ -5862,6 +5966,19 @@ fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repo
             }
         }
 
+        // Fall-through (e.g. module-qualified calls like io.println(...)): the
+        // type-specific branches above returned for their own receivers, so any
+        // call reaching here had its args unchecked. Infer them so nested method
+        // calls are validated — this is what surfaces E0522 for x.m() passed to
+        // io.println (sb3125).
+        let mc_args = node_args(node)
+        if mc_args != -1 {
+            let mut mci = 0
+            while mci < sublist_length(mc_args) {
+                infer_type(sublist_get(mc_args, mci))
+                mci = mci + 1
+            }
+        }
         return TYPE_UNKNOWN
     }
 

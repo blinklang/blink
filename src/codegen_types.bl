@@ -3819,19 +3819,34 @@ pub fn mangle_generic_name(base: Str, args: Str) -> Str {
 }
 
 /// Compute the mangled C name for an impl method.
-/// For `From`/`TryFrom` impls, includes the source type so multiple impls
-/// targeting the same type don't collide (e.g. `From[I8] for I16` vs `From[U8] for I16`).
+/// The trait name is part of the symbol so two traits that define the same
+/// method for one type (§3c rule-3) get distinct symbols and the qualified
+/// escape hatch `Trait.method(x)` can select between them.
+///
+/// From/TryFrom are excepted: they are one trait with many source-typed
+/// instances (`From[I8] for Int`, `From[I16] for Int`, ...), already
+/// disambiguated by the source type via their own def+call path
+/// (mangle_from_method). Routing them through the trait-qualified form would
+/// collide (all share trait `From`, method `from`), so they keep their proven
+/// `{target}_{method}_{source}` scheme.
 pub fn mangle_impl_method(im: Int, impl_type: Str, mname: Str) -> Str {
     let trait_name = node_trait_name(im)
     if trait_name == "From" || trait_name == "TryFrom" {
         let trait_tparams = node_type_params(im)
         if trait_tparams != -1 && sublist_length(trait_tparams) > 0 {
-            let src_node = sublist_get(trait_tparams, 0)
-            let src = node_name(src_node)
-            return "{impl_type}_{mname}_{src}"
+            let src = node_name(sublist_get(trait_tparams, 0))
+            return mangle_from_method(src, impl_type, mname)
         }
     }
-    "{impl_type}_{mname}"
+    mangle_impl_method_q(impl_type, trait_name, mname)
+}
+
+// Symbol builder keyed on the resolved trait name. Call sites that know the
+// trait (qualified calls; unqualified calls after impl_trait_for_method) build
+// the symbol through this; `mangle_impl_method` is the impl-node wrapper.
+// Not for From/TryFrom (see mangle_impl_method).
+pub fn mangle_impl_method_q(impl_type: Str, trait_name: Str, mname: Str) -> Str {
+    "{impl_type}_{trait_name}_{mname}"
 }
 
 pub fn mangle_from_method(source: Str, target: Str, mname: Str) -> Str {
@@ -3945,6 +3960,54 @@ pub fn impl_method_reg_name(type_name: Str, method: Str) -> Str {
     strip_module_qualifier(type_name)
 }
 
+// Count how many distinct traits define `method` for receiver `type_name`,
+// and (out) capture the names of the colliding traits. Drives both symbol
+// resolution (count==1 ⇒ unique owner) and the E0522 ambiguity diagnostic
+// (count>=2). Iterates impl_entries, which stores trait per (trait,type) entry.
+pub fn impl_traits_with_method(type_name: Str, method: Str) -> List[Str] {
+    let bare = strip_module_qualifier(type_name)
+    let mut out: List[Str] = []
+    let mut i = 0
+    while i < impl_entries.len() {
+        let ie = impl_entries.get(i).unwrap()
+        if ie.type_name == type_name || ie.type_name == bare {
+            let mut j = 0
+            while j < sublist_length(ie.methods_sl) {
+                if node_name(sublist_get(ie.methods_sl, j)) == method {
+                    out.push(ie.trait_name)
+                    j = sublist_length(ie.methods_sl)
+                } else {
+                    j = j + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    out
+}
+
+// The unique trait that defines `method` for `type_name`, or "" if zero or
+// more than one (ambiguous) own it. Unqualified call sites use this to build
+// the trait-qualified C symbol; ambiguity is rejected upstream at typecheck.
+pub fn impl_trait_for_method(type_name: Str, method: Str) -> Str {
+    let traits = impl_traits_with_method(type_name, method)
+    if traits.len() == 1 { return traits.get(0).unwrap() }
+    ""
+}
+
+// Does `type_name` implement `method` specifically via `trait_name`? Lets a
+// qualified call (Trait.method(x)) confirm the named trait truly owns the
+// method before building the trait-qualified symbol from that name.
+pub fn impl_type_implements_trait_method(type_name: Str, trait_name: Str, method: Str) -> Int {
+    let traits = impl_traits_with_method(type_name, method)
+    let mut i = 0
+    while i < traits.len() {
+        if traits.get(i).unwrap() == trait_name { return 1 }
+        i = i + 1
+    }
+    0
+}
+
 pub fn lookup_impl_type_for_trait(trait_name: Str, type_name: Str) -> Int {
     let mut i = 0
     while i < impl_entries.len() {
@@ -3966,7 +4029,7 @@ pub fn lookup_impl_type_for_trait(trait_name: Str, type_name: Str) -> Int {
 pub fn synthesized_display_call(type_name: Str, value_expr: Str) -> Str {
     let disp_reg = impl_method_reg_name(type_name, "fmt")
     if lookup_impl_type_for_trait("Display", disp_reg) != 0 && lookup_impl_method(type_name, "display") == 0 {
-        return "{c_fn_name("{disp_reg}_display")}({value_expr})"
+        return "{c_fn_name(mangle_impl_method_q(disp_reg, "Display", "display"))}({value_expr})"
     }
     ""
 }
@@ -6139,7 +6202,7 @@ pub fn emit_bh_cleanup_for_type(struct_name: Str) ! Codegen.Emit {
     }
     cg_bh_cleanup_set.insert(struct_name, 1)
     let c_type = c_type_c_name(struct_name)
-    let exit_fn = c_fn_name("{struct_name}_exit")
+    let exit_fn = c_fn_name(mangle_impl_method_q(struct_name, "BlockHandler", "exit"))
     cg_closure_defs.push("typedef struct \{")
     cg_closure_defs.push("    {c_type} handler;")
     cg_closure_defs.push("    int64_t ok;")
@@ -6171,7 +6234,7 @@ pub fn emit_cl_cleanup_for_type(struct_name: Str) ! Codegen.Emit {
     }
     cg_cl_cleanup_set.insert(struct_name, 1)
     let c_type = c_type_c_name(struct_name)
-    let close_fn = c_fn_name("{struct_name}_close")
+    let close_fn = c_fn_name(mangle_impl_method_q(struct_name, "Closeable", "close"))
     cg_closure_defs.push("typedef struct \{")
     cg_closure_defs.push("    {c_type} resource;")
     cg_closure_defs.push("    int done;")
