@@ -637,6 +637,7 @@ tasks:
       - src/*.bl
       - lib/std/*.bl
       - tests/multifile/src/*.bl
+      - tests/multifile_stdlib_priv/src/*.bl
     cmds:
       - |
         set -e
@@ -664,6 +665,33 @@ tasks:
           cat "$TMPDIR/monolith.out"
           echo "--- per-module"
           cat "$TMPDIR/per_module.out"
+          exit 1
+        fi
+
+        # br yk0mha: non-pub stdlib `let`s must stay file-local (`static`) under
+        # per-module emit and must NOT be declared `extern` in a consuming TU
+        # (the definition is static — a foreign extern references an undefined
+        # symbol). Fixture pulls std.semver (non-pub CH_*/OP_* consts) into two
+        # user TUs; emit per-module, link, and assert no private extern leak.
+        {{.BUILD_DIR}}/blink run tests/multifile_stdlib_priv/src/main.bl > "$TMPDIR/priv_mono.out" 2>&1
+        mkdir -p "$TMPDIR/priv_pm"
+        {{.BUILD_DIR}}/blink __emit-per-module tests/multifile_stdlib_priv/src/main.bl "$TMPDIR/priv_pm"
+        # No non-pub stdlib symbol (semver's CH_*/OP_*) may be declared extern in
+        # any consumer TU (everything except the owning std_semver.c).
+        LEAK=$(/usr/bin/grep -rnE 'extern .*\b(CH_[A-Z0-9]+|OP_[A-Z]+)\b' "$TMPDIR"/priv_pm/*.c | /usr/bin/grep -v '/std_semver.c:' || true)
+        if [ -n "$LEAK" ]; then
+          echo "FAIL ci-per-module: non-pub stdlib let leaked as extern into a consumer TU (br yk0mha)"
+          echo "$LEAK"
+          exit 1
+        fi
+        cc -o "$TMPDIR/priv_pm/bin" $(ls "$TMPDIR"/priv_pm/*.c | sort) -Ibuild -lm -lgc
+        "$TMPDIR/priv_pm/bin" > "$TMPDIR/priv_pm.out" 2>&1
+        if diff -u "$TMPDIR/priv_mono.out" "$TMPDIR/priv_pm.out" > /dev/null; then
+          echo "ci-per-module: ok (stdlib-priv: no private extern leak, output matches monolith)"
+        else
+          echo "FAIL ci-per-module: stdlib-priv per-module output differs from monolith"
+          echo "--- monolith"; cat "$TMPDIR/priv_mono.out"
+          echo "--- per-module"; cat "$TMPDIR/priv_pm.out"
           exit 1
         fi
 

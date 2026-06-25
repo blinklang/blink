@@ -19,6 +19,16 @@ needed. It documents the policy the existing codegen already implements
 (commit `1da102b` for fns; `BLINK_TD_*` typedef guards predate that for
 struct typedefs) and the test surface that protects it.
 
+> **Audit 2026-06 (br `7akctz`):** the `BLINK_TD_*` typedef guards were
+> re-audited under the per-module emit model after stdlib monos moved to
+> the archive monolith and user monos moved to `static inline`. Confirmed
+> **load-bearing and retained** — they dedup the same generic typedef
+> within a single TU when multiple call sites pull it in (typedefs carry no
+> link symbol, so the guard is the only thing preventing a same-TU
+> redeclaration error). Line references above updated to current source
+> positions (`emit_td_guard_open` → `codegen_types.bl:5389`,
+> `mono_storage_class` → `codegen_stmt.bl:4497`).
+
 ## Decision: hybrid (stdlib in archive, user monos `static inline`)
 
 Two disjoint mono populations, two different storage strategies.
@@ -44,11 +54,11 @@ quietly merges duplicates:
 - **Generic fn definitions** prepend `static inline ` whenever
   `in_per_module_object()` is true. The forward-decl carries the same
   storage class. Implemented in `mono_storage_class` at
-  `src/codegen_stmt.bl:3683`. Whole-program (single TU), archive
+  `src/codegen_stmt.bl:4497`. Whole-program (single TU), archive
   monolith, and shared-header passes all keep the extern default.
 - **Generic struct typedefs** wrap output in a `BLINK_TD_<mangled>`
   `#ifndef`/`#define` guard via `emit_td_guard_open` at
-  `src/codegen_types.bl:4503`. Typedefs aren't link symbols, so
+  `src/codegen_types.bl:5389`. Typedefs aren't link symbols, so
   duplication across `.o` is harmless; the guard only protects the
   same TU from emitting the typedef twice when multiple call sites
   pull it in.
