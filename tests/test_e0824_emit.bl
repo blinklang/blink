@@ -9,11 +9,127 @@
 //   - the explanation references the spec-defined behavior
 //     (original panic preserved, secondary warning, continue-drain)
 
-import compile_test_helpers.{verify_catalog_entry}
+import compile_test_helpers.{compile_and_run_test_json, verify_catalog_entry}
 
 test "blink explain E0824 returns the catalog entry" {
     verify_catalog_entry("E0824", "CleanupPanickedDuringUnwind")
     let res = process_run("build/blink", ["explain", "E0824"])
     assert(res.out.contains("original panic"))
     assert(res.out.contains("continue-drain"))
+}
+
+// Runtime emit-site behavior (br z50hwm). The reachable E0824 site is the
+// assert_panics armed-unwind path (cleanup-stack wired only under
+// cg_in_assert_panics): a BlockHandler.exit(false) that itself panics while
+// the original panic unwinds must (1) leave the original panic load-bearing
+// — the assert_panics still consumes the EXPECTED panic, so the test stays
+// pass — and (2) surface the cleanup panic as a secondary cleanup_warnings[]
+// entry with code "E0824" on the SAME record.
+test "cleanup panic during armed unwind -> pass + E0824 warning" {
+    let src = "type BadTx \{ id: Int }\n"
+        .concat("impl BlockHandler for BadTx \{\n")
+        .concat("    type Context = Int\n")
+        .concat("    fn enter(self) -> Int \{ 0 }\n")
+        .concat("    fn exit(self, ok: Bool) \{\n")
+        .concat("        let xs: [Int] = []\n")
+        .concat("        let _ = xs.get(0).unwrap()\n")
+        .concat("    }\n")
+        .concat("}\n")
+        .concat("test \"t\" \{\n")
+        .concat("    assert_panics(matching: \"None\") \{\n")
+        .concat("        with BadTx \{ id: 1 } as _t \{\n")
+        .concat("            let ys: [Int] = []\n")
+        .concat("            let _ = ys.get(0).unwrap()\n")
+        .concat("        }\n")
+        .concat("    }\n")
+        .concat("}\n")
+    let r = compile_and_run_test_json(src, "_e0824_warn_{getpid()}")
+    let diag = "exit_code={r.exit_code}; captured:\n{r.out}{r.err_out}"
+    // Original panic is the expected one -> assert_panics consumes it -> pass.
+    assert(r.out.contains("\"status\":\"pass\""), "test should stay pass; {diag}")
+    // Cleanup panic surfaces as an E0824 secondary warning on the same record.
+    assert(r.out.contains("\"cleanup_warnings\":["), "no cleanup_warnings array; {diag}")
+    assert(r.out.contains("\"code\":\"E0824\""), "no E0824 warning code; {diag}")
+}
+
+// Stacked `with a; with b`: the OUTER handler panics during the drain. The
+// INNER (LIFO-first) handler must still have run (continue-drain, no
+// short-circuit) and a warning must be captured. A module-level sentinel
+// list proves the inner cleanup fired before the outer one panicked.
+test "stacked cleanup: outer panic still drains inner (continue-drain)" {
+    let src = "let mut z_log: List[Str] = []\n"
+        .concat("type Inner \{ id: Int }\n")
+        .concat("impl BlockHandler for Inner \{\n")
+        .concat("    type Context = Int\n")
+        .concat("    fn enter(self) -> Int \{ 0 }\n")
+        .concat("    fn exit(self, ok: Bool) \{ z_log.push(\"inner-ran\") }\n")
+        .concat("}\n")
+        .concat("type Outer \{ id: Int }\n")
+        .concat("impl BlockHandler for Outer \{\n")
+        .concat("    type Context = Int\n")
+        .concat("    fn enter(self) -> Int \{ 0 }\n")
+        .concat("    fn exit(self, ok: Bool) \{\n")
+        .concat("        let xs: [Int] = []\n")
+        .concat("        let _ = xs.get(0).unwrap()\n")
+        .concat("    }\n")
+        .concat("}\n")
+        .concat("test \"a_stack\" \{\n")
+        .concat("    assert_panics(matching: \"None\") \{\n")
+        .concat("        with Outer \{ id: 1 } as _o \{\n")
+        .concat("            with Inner \{ id: 2 } as _i \{\n")
+        .concat("                let ys: [Int] = []\n")
+        .concat("                let _ = ys.get(0).unwrap()\n")
+        .concat("            }\n")
+        .concat("        }\n")
+        .concat("    }\n")
+        .concat("}\n")
+        .concat("test \"b_verify\" \{\n")
+        .concat("    assert(z_log.contains(\"inner-ran\"))\n")
+        .concat("}\n")
+    let r = compile_and_run_test_json(src, "_e0824_stack_{getpid()}")
+    let diag = "exit_code={r.exit_code}; captured:\n{r.out}{r.err_out}"
+    // Both tests pass: a_stack consumes the expected panic; b_verify confirms
+    // the inner cleanup fired despite the outer cleanup panicking.
+    assert(r.out.contains("\"cleanup_warnings\":["), "no cleanup_warnings array; {diag}")
+    assert(r.out.contains("\"code\":\"E0824\""), "no E0824 warning code; {diag}")
+    assert(!r.out.contains("\"status\":\"failed\""), "no record should fail; {diag}")
+}
+
+// A cleanup body that panics via a bounds-checked runtime primitive (.set on an
+// out-of-range index → blink_list_set) must NOT run its post-panic
+// fall-through. The dispatch swallow-path longjmps out of the panicking thunk
+// instead of returning, so the unsafe `items[idx] = ...` store and any
+// statements after the panic are abandoned. A sentinel push placed AFTER the
+// panicking call proves the fall-through never executed (regression for the OOB
+// hazard the bare-return design introduced — br z50hwm code review).
+test "cleanup panic abandons thunk fall-through (no OOB store)" {
+    let src = "let mut oob_log: List[Str] = []\n"
+        .concat("type OobTx \{ id: Int }\n")
+        .concat("impl BlockHandler for OobTx \{\n")
+        .concat("    type Context = Int\n")
+        .concat("    fn enter(self) -> Int \{ 0 }\n")
+        .concat("    fn exit(self, ok: Bool) \{\n")
+        .concat("        let mut xs = [10, 20, 30]\n")
+        .concat("        let bad = 99\n")
+        .concat("        xs.set(bad, 7)\n")
+        .concat("        oob_log.push(\"AFTER-PANIC-SHOULD-NOT-REACH\")\n")
+        .concat("    }\n")
+        .concat("}\n")
+        .concat("test \"a_oob\" \{\n")
+        .concat("    assert_panics(matching: \"None\") \{\n")
+        .concat("        with OobTx \{ id: 1 } as _t \{\n")
+        .concat("            let ys: [Int] = []\n")
+        .concat("            let _ = ys.get(0).unwrap()\n")
+        .concat("        }\n")
+        .concat("    }\n")
+        .concat("}\n")
+        .concat("test \"b_no_fallthrough\" \{\n")
+        .concat("    assert(!oob_log.contains(\"AFTER-PANIC-SHOULD-NOT-REACH\"))\n")
+        .concat("}\n")
+    let r = compile_and_run_test_json(src, "_e0824_oob_{getpid()}")
+    let diag = "exit_code={r.exit_code}; captured:\n{r.out}{r.err_out}"
+    assert(r.out.contains("\"cleanup_warnings\":["), "no cleanup_warnings array; {diag}")
+    assert(r.out.contains("out of bounds"), "cleanup panic message not captured; {diag}")
+    // b_no_fallthrough passes only if the post-panic push was abandoned.
+    assert(!r.out.contains("\"status\":\"failed\""), "fall-through ran (record failed); {diag}")
 }

@@ -96,6 +96,13 @@ static uint64_t blink_map_seed = 0;
  * "rolls back on the expected panic" guarantee. */
 #define BLINK_PANIC_MSG_SIZE 1024
 #define BLINK_PANIC_CLEANUP_MAX 256
+/* Secondary cleanup-panic (E0824) buffer. A cleanup body (BlockHandler.exit /
+ * Closeable.close) that itself panics during an armed unwind has its message
+ * captured here instead of re-entering dispatch; the test runner drains these
+ * into the per-test record's `cleanup_warnings[]`. Cap is conservative and
+ * drop-past-cap is silent, mirroring the cleanup-stack convention. */
+#define BLINK_CLEANUP_WARN_MAX 16
+#define BLINK_CLEANUP_WARN_MSG_SIZE 1024
 
 typedef struct {
     void* state;                    /* points at the per-type bh/cl state struct */
@@ -111,6 +118,10 @@ typedef struct {
     __thread __blink_panic_cleanup_entry __blink_panic_cleanup_stack[BLINK_PANIC_CLEANUP_MAX];
     __thread size_t __blink_panic_cleanup_top = 0;
     __thread size_t __blink_panic_cleanup_mark = 0;
+    __thread int __blink_in_cleanup_drain = 0;
+    __thread jmp_buf __blink_cleanup_thunk_jmp;
+    __thread char __blink_cleanup_warnings[BLINK_CLEANUP_WARN_MAX][BLINK_CLEANUP_WARN_MSG_SIZE];
+    __thread int __blink_cleanup_warning_count = 0;
   #else
     extern __thread int __blink_panic_armed;
     extern __thread jmp_buf __blink_panic_jmp;
@@ -118,6 +129,10 @@ typedef struct {
     extern __thread __blink_panic_cleanup_entry __blink_panic_cleanup_stack[BLINK_PANIC_CLEANUP_MAX];
     extern __thread size_t __blink_panic_cleanup_top;
     extern __thread size_t __blink_panic_cleanup_mark;
+    extern __thread int __blink_in_cleanup_drain;
+    extern __thread jmp_buf __blink_cleanup_thunk_jmp;
+    extern __thread char __blink_cleanup_warnings[BLINK_CLEANUP_WARN_MAX][BLINK_CLEANUP_WARN_MSG_SIZE];
+    extern __thread int __blink_cleanup_warning_count;
   #endif
 #else
 static __thread int __blink_panic_armed = 0;
@@ -126,6 +141,10 @@ static __thread char __blink_panic_msg[BLINK_PANIC_MSG_SIZE] = {0};
 static __thread __blink_panic_cleanup_entry __blink_panic_cleanup_stack[BLINK_PANIC_CLEANUP_MAX];
 static __thread size_t __blink_panic_cleanup_top = 0;
 static __thread size_t __blink_panic_cleanup_mark = 0;
+static __thread int __blink_in_cleanup_drain = 0;
+static __thread jmp_buf __blink_cleanup_thunk_jmp;
+static __thread char __blink_cleanup_warnings[BLINK_CLEANUP_WARN_MAX][BLINK_CLEANUP_WARN_MSG_SIZE];
+static __thread int __blink_cleanup_warning_count = 0;
 #endif
 
 BLINK_RT_FN size_t __blink_cleanup_depth(void);
@@ -167,24 +186,75 @@ BLINK_RT_FN void __blink_cleanup_pop(void* state) {
 BLINK_RT_FN void __blink_cleanup_run_to(size_t mark);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN void __blink_cleanup_run_to(size_t mark) {
+    /* Mark the drain so a panic raised by a cleanup thunk (E0824) is captured
+     * as a secondary warning and unwinds back here instead of re-entering the
+     * armed assert_panics frame (see __blink_panic_dispatch). Save/restore the
+     * flag and the per-thunk recovery buffer for nesting: a thunk may open its
+     * own non-armed `with` whose own dispatch re-enters this drain. */
+    int __prev_in_drain = __blink_in_cleanup_drain;
+    jmp_buf __prev_thunk_jmp;
+    memcpy(__prev_thunk_jmp, __blink_cleanup_thunk_jmp, sizeof(jmp_buf));
+    __blink_in_cleanup_drain = 1;
     while (__blink_panic_cleanup_top > mark) {
         __blink_panic_cleanup_top--;
         __blink_panic_cleanup_entry* e = &__blink_panic_cleanup_stack[__blink_panic_cleanup_top];
         if (e->done && *e->done) { continue; }
         /* The per-type thunk owns the `done` flag: it sets done=1 then runs
          * exit/close exactly once. Do NOT pre-set done here, or the thunk
-         * sees it already set and skips the cleanup it was pushed to run. */
-        if (e->run) { e->run(e->state, 0); }
+         * sees it already set and skips the cleanup it was pushed to run.
+         *
+         * Set a recovery point BEFORE invoking the thunk: if its exit/close
+         * body panics, dispatch longjmps back here (returning nonzero) rather
+         * than RETURNING into the panicking thunk — a bare return would let the
+         * thunk run its post-panic fall-through, and runtime panic-callers
+         * (blink_list_get/_set/_pop, bytes set, arg index) execute their
+         * unsafe OOB access right after dispatch. The longjmp abandons that
+         * frame; `done` was already set, so we never re-run it; the loop then
+         * proceeds to the next handler (continue-drain). */
+        if (e->run) {
+            if (setjmp(__blink_cleanup_thunk_jmp) == 0) {
+                e->run(e->state, 0);
+            }
+        }
     }
+    __blink_in_cleanup_drain = __prev_in_drain;
+    memcpy(__blink_cleanup_thunk_jmp, __prev_thunk_jmp, sizeof(jmp_buf));
 }
 #endif
 
-/* Shared panic dispatch. If armed: capture the message, run in-body cleanup
- * down to the armed frame's mark, then longjmp into assert_panics. If not
- * armed: terminate the process exactly as the historic inline panic did. */
+/* Append a cleanup-panic message to the E0824 secondary-warning buffer. Drops
+ * silently past the cap (mirrors the cleanup-stack drop-past-cap convention);
+ * the count keeps incrementing so the runner can report how many were lost. */
+BLINK_RT_FN void __blink_cleanup_warn_push(const char* msg);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void __blink_cleanup_warn_push(const char* msg) {
+    if (__blink_cleanup_warning_count < BLINK_CLEANUP_WARN_MAX) {
+        snprintf(__blink_cleanup_warnings[__blink_cleanup_warning_count],
+                 BLINK_CLEANUP_WARN_MSG_SIZE, "%s", msg ? msg : "");
+    }
+    __blink_cleanup_warning_count++;
+}
+#endif
+
+/* Shared panic dispatch. If a cleanup thunk is currently draining (E0824): the
+ * original panic is already load-bearing, so capture this secondary message as
+ * a warning and longjmp back to the per-thunk recovery point in
+ * __blink_cleanup_run_to — NOT a bare return. The longjmp abandons the
+ * panicking exit/close frame (so its unsafe post-panic fall-through never
+ * runs), and the drain loop then continues to the next handler (continue-drain).
+ * `assert_panics` can only appear directly in a `test {}` body, so a cleanup
+ * thunk can never open a nested armed frame — the drain branch never steals a
+ * panic that an inner assert_panics should have caught. Else if armed: capture
+ * the message, run in-body cleanup down to the armed frame's mark, then longjmp
+ * into assert_panics. If not armed: terminate the process exactly as the
+ * historic inline panic did. */
 BLINK_RT_FN void __blink_panic_dispatch(const char* msg);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN void __blink_panic_dispatch(const char* msg) {
+    if (__builtin_expect(__blink_in_cleanup_drain, 0)) {
+        __blink_cleanup_warn_push(msg);
+        longjmp(__blink_cleanup_thunk_jmp, 1);
+    }
     if (__builtin_expect(__blink_panic_armed, 0)) {
         snprintf(__blink_panic_msg, BLINK_PANIC_MSG_SIZE, "%s", msg ? msg : "");
         __blink_cleanup_run_to(__blink_panic_cleanup_mark);

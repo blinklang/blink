@@ -253,6 +253,45 @@ BLINK_UNUSED static void __blink_test_print_tags_json(const blink_test_entry* te
     printf("]");
 }
 
+/* E0824 (br z50hwm): emit the secondary cleanup-panic warnings captured during
+ * this test's armed unwind as a `cleanup_warnings[]` array. Additive — a
+ * cleanup panic does not by itself change pass/fail (the original panic already
+ * set the status), so this rides whatever record branch is active. Buffered
+ * messages past the cap were dropped at capture time; the count still reflects
+ * the true total, so emit a synthetic overflow marker for the lost remainder. */
+BLINK_UNUSED static void __blink_test_print_cleanup_warnings_json(void) {
+    if (__blink_cleanup_warning_count <= 0) { return; }
+    int n = __blink_cleanup_warning_count;
+    int shown = n < BLINK_CLEANUP_WARN_MAX ? n : BLINK_CLEANUP_WARN_MAX;
+    printf(",\"cleanup_warnings\":[");
+    for (int w = 0; w < shown; w++) {
+        if (w > 0) printf(",");
+        printf("{\"code\":\"E0824\",\"message\":\"%s\"}",
+               __blink_test_json_escape(__blink_cleanup_warnings[w]));
+    }
+    if (n > BLINK_CLEANUP_WARN_MAX) {
+        printf(",{\"code\":\"E0824\",\"message\":\"... %d more cleanup panic(s) dropped (buffer cap %d)\"}",
+               n - BLINK_CLEANUP_WARN_MAX, BLINK_CLEANUP_WARN_MAX);
+    }
+    printf("]");
+}
+
+/* Human-readable counterpart: one `warning: E0824 ...` line per captured
+ * cleanup panic, printed under the test's result line. */
+BLINK_UNUSED static void __blink_test_print_cleanup_warnings_human(void) {
+    if (__blink_cleanup_warning_count <= 0) { return; }
+    int n = __blink_cleanup_warning_count;
+    int shown = n < BLINK_CLEANUP_WARN_MAX ? n : BLINK_CLEANUP_WARN_MAX;
+    for (int w = 0; w < shown; w++) {
+        fprintf(stderr, "  warning: E0824 cleanup panicked during unwind: %s\n",
+                __blink_cleanup_warnings[w]);
+    }
+    if (n > BLINK_CLEANUP_WARN_MAX) {
+        fprintf(stderr, "  warning: E0824 ... %d more cleanup panic(s) dropped (buffer cap %d)\n",
+                n - BLINK_CLEANUP_WARN_MAX, BLINK_CLEANUP_WARN_MAX);
+    }
+}
+
 BLINK_UNUSED static void blink_test_run(const blink_test_entry* tests, int count, int argc, const char** argv) {
     const char* filter = NULL;
     const char* tags_filter = NULL;
@@ -312,6 +351,10 @@ BLINK_UNUSED static void blink_test_run(const blink_test_entry* tests, int count
         __blink_panic_armed = 0;
         __blink_panic_cleanup_top = 0;
         __blink_panic_cleanup_mark = 0;
+        /* Reset the E0824 cleanup-panic capture (br z50hwm) per test: secondary
+         * warnings ride a single record and must not leak into the next. */
+        __blink_in_cleanup_drain = 0;
+        __blink_cleanup_warning_count = 0;
         struct timespec __t0, __t1;
         clock_gettime(CLOCK_MONOTONIC, &__t0);
         if (setjmp(__blink_test_jmp) == 0) {
@@ -331,6 +374,7 @@ BLINK_UNUSED static void blink_test_run(const blink_test_entry* tests, int count
                 }
                 printf(",\"duration_ms\":%g", dur_ms);
                 __blink_test_print_tags_json(&tests[i]);
+                __blink_test_print_cleanup_warnings_json();
                 printf("}");
             } else {
                 if (__blink_test_skip_reason[0]) {
@@ -338,6 +382,7 @@ BLINK_UNUSED static void blink_test_run(const blink_test_entry* tests, int count
                 } else {
                     printf("test %s ... \033[33mskipped\033[0m\n", tests[i].name);
                 }
+                __blink_test_print_cleanup_warnings_human();
             }
             continue;
         }
@@ -380,6 +425,7 @@ BLINK_UNUSED static void blink_test_run(const blink_test_entry* tests, int count
                 }
                 printf(",\"duration_ms\":%g", dur_ms);
                 __blink_test_print_tags_json(&tests[i]);
+                __blink_test_print_cleanup_warnings_json();
                 printf("}");
             } else {
                 if (__blink_test_case_label[0]) {
@@ -406,6 +452,7 @@ BLINK_UNUSED static void blink_test_run(const blink_test_entry* tests, int count
                 } else if (__blink_test_fail_msg[0]) {
                     fprintf(stderr, "  %s (line %d)\n", __blink_test_fail_msg, __blink_test_fail_line);
                 }
+                __blink_test_print_cleanup_warnings_human();
             }
         } else {
             pass++;
@@ -414,9 +461,11 @@ BLINK_UNUSED static void blink_test_run(const blink_test_entry* tests, int count
                 printf("{\"name\":\"%s\",\"status\":\"pass\"", tests[i].name);
                 printf(",\"duration_ms\":%g", dur_ms);
                 __blink_test_print_tags_json(&tests[i]);
+                __blink_test_print_cleanup_warnings_json();
                 printf("}");
             } else {
                 printf("test %s ... \033[32mok\033[0m\n", tests[i].name);
+                __blink_test_print_cleanup_warnings_human();
             }
         }
     }

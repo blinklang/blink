@@ -1181,7 +1181,7 @@ The cleanup asymmetry is intentional and must be read carefully: an **armed** (e
 
 **Concurrency.** The armed state is **per-test (thread-local)**. An `assert_panics` in one test or task must never catch a panic raised on a different spawned task; arming is scoped to the calling frame's thread. This is normative, not implementation-defined.
 
-**Cleanup that itself panics during an armed unwind.** If an in-scope `exit(false)`/`close()` *itself* panics while unwinding an armed expected panic, the original body panic remains "the expected panic" for `matching:` (E0832) purposes; the cleanup fault surfaces as a **separate** `panicked` record (see E0824, §5.5), never folded into the `assert_panics` assertion record.
+**Cleanup that itself panics during an armed unwind.** If an in-scope `exit(false)`/`close()` *itself* panics while unwinding an armed expected panic, the original body panic remains "the expected panic" for `matching:` (E0832) purposes and stays load-bearing as the test's result and unwind cause; the cleanup fault surfaces as a **secondary `warning`-severity `E0824`** on the **same trace frame** (the test runner records it in the per-test record's `cleanup_warnings[]`, additive to the original status — see E0824, §5.5), not as a separate failing record. The panicking cleanup body's own control flow is abandoned at the panic point; remaining LIFO handlers still run (`continue-drain`, per line below).
 
 This rule is uniform across `BlockHandler.exit()` and `Closeable.close()` (§5.5) — every catchable structured unwind runs registered cleanup; uncaught divergence does not.
 
