@@ -49,6 +49,7 @@ import codegen_types.{
     is_intrinsic_method, is_named_type, is_runtime_header_fn, is_stdlib_source_module, is_struct_or_enum_type, is_struct_type, is_trait_type, list_contains_str, list_iter_c_type, skip_private_in_module_header,
     lookup_assoc_type, lookup_impl_type_for_trait, mangle_generic_name, mangle_impl_method, mangle_impl_method_q, match_scrut_enum,
     match_scruts, mono_fns, mono_instances, mono_name_from_ann, mut_captured_vars, option_c_type,
+    poly_impl_method_node, poly_impl_block_node, is_poly_impl_base,
     option_c_type_mixed, pop_scope, ptr_inner_c_type, push_scope,
     reg_sf_entry, register_var_compound_inner_from_str, resolve_effect_field, resolve_effect_is_ue, resolve_effect_vtable,
     resolve_import_alias, resolve_option_inner_from_ann, resolve_ret_type_from_ann,
@@ -5763,14 +5764,282 @@ fn emit_mono_fn_def(fn_node: Int, concrete_args: Str) ! Codegen.Emit, Codegen.Re
     pop_scope()
 }
 
+// ms4ctb: build the C signature for a monomorphized poly-impl method
+// (`impl[T] Trait[T] for List[T]`). Like mono_fn_signature, but the type
+// params are the impl binders (node_impl_binders), not the fn's own tparams,
+// and the `self: List[T]` receiver lowers to `blink_list*` through the scalar
+// branch. Option/Result params and returns route through
+// mono_option_result_param_c_type so their carrier typedefs are queued before
+// the body (flush_mono_fns_with_typedefs orders typedefs → decls → bodies).
+fn poly_impl_method_signature(im: Int, method_node: Int, concrete_args: Str) -> MonoSig ! Codegen.Register, Diag.Report {
+    cg_handler_vtable_type = ""
+    cg_handler_vtable_field = ""
+    cg_handler_is_user_effect = 0
+    cg_current_fn_option_inner_struct = ""
+    cg_current_module = node_source_module(method_node)
+    let composed = mangle_impl_method_q(node_name(im), node_trait_name(im), node_name(method_node))
+    let mangled = mangle_generic_name(composed, concrete_args)
+    let tparams_sl = node_impl_binders(im)
+    let storage = mono_storage_class(method_node)
+
+    let ret_str = node_return_type(method_node)
+    let resolved_ret = resolve_tparam(ret_str, tparams_sl, concrete_args)
+    let ret_type = type_from_name(resolved_ret)
+    let mut ret_c_str = c_type_str(ret_type)
+    if ret_type == CT_OPTION || ret_type == CT_RESULT {
+        ret_c_str = mono_option_result_param_c_type(method_node, resolved_ret, tparams_sl, concrete_args)
+    } else if is_struct_type(resolved_ret) != 0 || is_enum_type(resolved_ret) != 0 {
+        ret_c_str = c_type_c_name(resolved_ret)
+    }
+
+    let params_sl = node_params(method_node)
+    let mono_has_ev = fn_node_has_effects(method_node) != 0 && get_ffi_ann(method_node) == -1
+    let mut params_c = "void"
+    if params_sl != -1 && sublist_length(params_sl) > 0 {
+        params_c = ""
+        let recv_ct = type_from_name(node_name(im))
+        let mut i = 0
+        while i < sublist_length(params_sl) {
+            let p = sublist_get(params_sl, i)
+            let raw_pname = node_name(p)
+            let pname = c_safe_name(raw_pname)
+            if i > 0 {
+                params_c = params_c.concat(", ")
+            }
+            if raw_pname == "self" || raw_pname == "_self" {
+                // The receiver `self: List[T]` lowers to the builtin C type
+                // (blink_list*), exactly as format_impl_params does for the
+                // single-symbol path.
+                params_c = params_c.concat("{c_type_str(recv_ct)} {pname}")
+                i = i + 1
+                continue
+            }
+            let ptype = resolve_tparam(node_type_name(p), tparams_sl, concrete_args)
+            if is_struct_type(ptype) != 0 {
+                params_c = params_c.concat("{c_type_c_name(ptype)} {pname}")
+            } else if is_enum_type(ptype) != 0 {
+                params_c = params_c.concat("{c_type_c_name(ptype)} {pname}")
+            } else if ptype == "Option" || ptype == "Result" {
+                let p_c_type = mono_option_result_param_c_type(p, ptype, tparams_sl, concrete_args)
+                params_c = params_c.concat("{p_c_type} {pname}")
+            } else {
+                let ct = type_from_name(ptype)
+                params_c = params_c.concat("{c_type_str(ct)} {pname}")
+            }
+            i = i + 1
+        }
+    }
+    if mono_has_ev {
+        if params_c == "void" || params_c == "" {
+            params_c = "blink_ev* __ev"
+        } else {
+            params_c = params_c.concat(", blink_ev* __ev")
+        }
+    }
+
+    MonoSig {
+        sig: "{storage}{ret_c_str} {c_fn_name(mangled)}({params_c})",
+        storage: storage,
+        ret_c_str: ret_c_str,
+        params_c: params_c,
+        mangled: mangled,
+        ret_type: ret_type,
+        resolved_ret: resolved_ret,
+    }
+}
+
+fn emit_poly_impl_method_decl(im: Int, method_node: Int, concrete_args: Str) ! Codegen.Emit, Codegen.Register, Diag.Report {
+    let sig = poly_impl_method_signature(im, method_node, concrete_args)
+    emit_line("{sig.sig};")
+}
+
+@allow(UnrestoredMutation, IncompleteStateRestore)
+fn emit_poly_impl_method_def(im: Int, method_node: Int, concrete_args: Str) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
+    let sig = poly_impl_method_signature(im, method_node, concrete_args)
+    let storage = sig.storage
+    let ret_c_str = sig.ret_c_str
+    let params_c = sig.params_c
+    let mangled = sig.mangled
+    let ret_type = sig.ret_type
+    let resolved_ret = sig.resolved_ret
+    let tparams_sl = node_impl_binders(im)
+    let params_sl = node_params(method_node)
+
+    emit_line("{sig.sig};")
+
+    push_scope()
+    cg_temp_counter = 0
+    // The receiver's concrete element type (the impl binder's concrete arg),
+    // used to register both `self` and any List[T] param.
+    let recv_elem_name = if sublist_length(tparams_sl) > 0 { resolve_tparam(node_name(sublist_get(tparams_sl, 0)), tparams_sl, concrete_args) } else { "" }
+    if params_sl != -1 {
+        let mut i = 0
+        while i < sublist_length(params_sl) {
+            let p = sublist_get(params_sl, i)
+            let pname = node_name(p)
+            if pname == "self" || pname == "_self" {
+                // `self: List[T]` — register as a List with the resolved element
+                // type so body method calls on self see the concrete element.
+                set_var(pname, CT_LIST, 0)
+                let elem_ct = type_from_name(recv_elem_name)
+                set_list_elem_type(pname, elem_ct)
+                if elem_ct != CT_VOID {
+                    ensure_option_type(elem_ct)
+                }
+                if elem_ct == CT_VOID && is_named_type(recv_elem_name) != 0 {
+                    set_list_elem_struct(pname, recv_elem_name)
+                }
+                i = i + 1
+                continue
+            }
+            let ptype = resolve_tparam(node_type_name(p), tparams_sl, concrete_args)
+            if ptype == "Fn" {
+                set_var(pname, CT_CLOSURE, 1)
+                let ta = node_type_ann(p)
+                if ta != -1 {
+                    let sig_str = build_closure_sig_resolved_mono(ta, tparams_sl, concrete_args)
+                    set_var_closure(pname, sig_str)
+                }
+            } else if ptype == "List" {
+                // The `self: List[T]` receiver (and any other List[T] param):
+                // register the resolved element type so body method calls on it
+                // see the concrete element, not a bare tparam.
+                set_var(pname, CT_LIST, 1)
+                let ta = node_type_ann(p)
+                if ta != -1 {
+                    let elems_sl = node_elements(ta)
+                    if elems_sl != -1 && sublist_length(elems_sl) > 0 {
+                        let elem_name = resolve_tparam(node_name(sublist_get(elems_sl, 0)), tparams_sl, concrete_args)
+                        let elem_ct = type_from_name(elem_name)
+                        set_list_elem_type(pname, elem_ct)
+                        if elem_ct != CT_VOID {
+                            ensure_option_type(elem_ct)
+                        }
+                        if elem_ct == CT_VOID && is_named_type(elem_name) != 0 {
+                            set_list_elem_struct(pname, elem_name)
+                        }
+                    }
+                }
+            } else {
+                let param_ct = if is_enum_type(ptype) != 0 { CT_INT } else { type_from_name(ptype) }
+                set_var(pname, param_ct, 1)
+                if is_struct_type(ptype) != 0 {
+                    set_var_struct(pname, ptype)
+                }
+                if is_enum_type(ptype) != 0 {
+                    var_enums.push(VarEnumEntry { name: pname, enum_type: ptype })
+                }
+                if ptype == "Option" {
+                    let ta = node_type_ann(p)
+                    if ta != -1 {
+                        let elems_sl = node_elements(ta)
+                        if elems_sl != -1 && sublist_length(elems_sl) >= 1 {
+                            let inner_name = resolve_tparam(node_name(sublist_get(elems_sl, 0)), tparams_sl, concrete_args)
+                            let inner_ct = type_from_name(inner_name)
+                            if is_struct_type(inner_name) != 0 || is_enum_type(inner_name) != 0 {
+                                set_var_option_struct(pname, CT_INT, inner_name)
+                            } else {
+                                set_var_option(pname, inner_ct)
+                            }
+                        }
+                    }
+                }
+                if ptype == "Result" {
+                    let ta = node_type_ann(p)
+                    if ta != -1 {
+                        let elems_sl = node_elements(ta)
+                        if elems_sl != -1 && sublist_length(elems_sl) >= 2 {
+                            let ok_name = resolve_tparam(node_name(sublist_get(elems_sl, 0)), tparams_sl, concrete_args)
+                            let err_name = resolve_tparam(node_name(sublist_get(elems_sl, 1)), tparams_sl, concrete_args)
+                            let ok_ct = type_from_name(ok_name)
+                            let err_ct = type_from_name(err_name)
+                            let ok_s = if is_struct_type(ok_name) != 0 || is_enum_type(ok_name) != 0 { ok_name } else { "" }
+                            let err_s = if is_struct_type(err_name) != 0 || is_enum_type(err_name) != 0 { err_name } else { "" }
+                            if ok_s != "" || err_s != "" {
+                                set_var_result_struct(pname, ok_ct, err_ct, ok_s, err_s)
+                            } else {
+                                set_var_result(pname, ok_ct, err_ct)
+                            }
+                        }
+                    }
+                }
+            }
+            i = i + 1
+        }
+    }
+
+    let saved_trace_fn = cg_trace_fn_qualified
+    let saved_trace_mod = cg_trace_module
+    let saved_in_traced = cg_in_traced_fn
+    cg_in_traced_fn = 0
+    let saved_fn_name = cg_current_fn_name
+    let saved_fn_has_ev = cg_current_fn_has_ev
+    let saved_fn_ret = cg_current_fn_ret
+    let saved_fn_option_inner = cg_current_fn_option_inner
+    let saved_fn_node = cg_current_fn_node
+    cg_current_fn_name = mangled
+    cg_current_fn_has_ev = if fn_node_has_effects(method_node) != 0 { 1 } else { 0 }
+    cg_current_fn_ret = ret_type
+    cg_current_fn_node = method_node
+    emit_line("{storage}{ret_c_str} {c_fn_name(mangled)}({params_c}) \{")
+    cg_indent = cg_indent + 1
+
+    emit_unused_param_voids(params_sl)
+
+    let trace_mod = node_source_module(method_node)
+    let trace_file = diag_file_for_node(method_node)
+    emit_trace_enter(method_node, mangled, trace_mod, trace_file)
+
+    let mut body_ret = ret_type
+    if ret_needs_struct_body(resolved_ret) != 0 {
+        body_ret = CT_INT
+    }
+    let saved_mono_tparams = cg_mono_tparams_sl
+    let saved_mono_args = cg_mono_concrete_args
+    cg_mono_tparams_sl = tparams_sl
+    cg_mono_concrete_args = concrete_args
+    emit_fn_body(node_body(method_node), body_ret)
+    cg_mono_tparams_sl = saved_mono_tparams
+    cg_mono_concrete_args = saved_mono_args
+    if ret_type == CT_VOID && body_ret == CT_VOID {
+        emit_trace_exit_void()
+    }
+    cg_indent = cg_indent - 1
+    emit_line("}")
+    emit_line("")
+    cg_current_fn_name = saved_fn_name
+    cg_current_fn_has_ev = saved_fn_has_ev
+    cg_current_fn_ret = saved_fn_ret
+    cg_current_fn_option_inner = saved_fn_option_inner
+    cg_current_fn_node = saved_fn_node
+    cg_trace_fn_qualified = saved_trace_fn
+    cg_trace_module = saved_trace_mod
+    cg_in_traced_fn = saved_in_traced
+    pop_scope()
+}
+
+// ms4ctb: emit one mono_fns entry, routing poly-impl bases (registered in
+// poly_impl_method_node) to the poly emitter and everything else to the
+// generic-fn emitter. A poly base has no generic-fn node, so it MUST branch
+// here or get_generic_fn_node would return -1 and silently drop the body.
+fn emit_mono_fn_entry_def(base: Str, args: Str) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
+    if is_poly_impl_base(base) != 0 {
+        let im = poly_impl_block_node.get(base).unwrap()
+        let method_node = poly_impl_method_node.get(base).unwrap()
+        emit_poly_impl_method_def(im, method_node, args)
+        return
+    }
+    let fn_node = get_generic_fn_node(base)
+    if fn_node != -1 {
+        emit_mono_fn_def(fn_node, args)
+    }
+}
+
 pub fn emit_all_mono_fns() ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
     let mut i = 0
     while i < mono_fns.len() {
         let mf = mono_fns.get(i).unwrap()
-        let fn_node = get_generic_fn_node(mf.base)
-        if fn_node != -1 {
-            emit_mono_fn_def(fn_node, mf.args)
-        }
+        emit_mono_fn_entry_def(mf.base, mf.args)
         i = i + 1
     }
 }
@@ -5796,10 +6065,7 @@ pub fn emit_mono_fns_from(start: Int) ! Codegen.Emit, Codegen.Register, Codegen.
     let mut i = start
     while i < mono_fns.len() {
         let mf = mono_fns.get(i).unwrap()
-        let fn_node = get_generic_fn_node(mf.base)
-        if fn_node != -1 {
-            emit_mono_fn_def(fn_node, mf.args)
-        }
+        emit_mono_fn_entry_def(mf.base, mf.args)
         i = i + 1
     }
 }
@@ -5808,9 +6074,18 @@ pub fn emit_mono_fn_decls_range(start: Int, end: Int) ! Codegen.Emit, Codegen.Re
     let mut i = start
     while i < end {
         let mf = mono_fns.get(i).unwrap()
-        let fn_node = get_generic_fn_node(mf.base)
-        if fn_node != -1 {
-            emit_mono_fn_decl(fn_node, mf.args)
+        // ms4ctb: poly-impl bases branch to the poly decl emitter; otherwise the
+        // generic-fn path returns -1 for the missing fn node and the prototype
+        // is dropped, leaving the body referencing an undeclared symbol.
+        if is_poly_impl_base(mf.base) != 0 {
+            let im = poly_impl_block_node.get(mf.base).unwrap()
+            let method_node = poly_impl_method_node.get(mf.base).unwrap()
+            emit_poly_impl_method_decl(im, method_node, mf.args)
+        } else {
+            let fn_node = get_generic_fn_node(mf.base)
+            if fn_node != -1 {
+                emit_mono_fn_decl(fn_node, mf.args)
+            }
         }
         i = i + 1
     }

@@ -37,7 +37,8 @@ import codegen_types.{
     cg_expect_fn_value_sig, cg_expect_arg_ann, arg_type_ann_at, get_callee_params_sl,
     builtin_receiver_type_name,
     is_sized_int_ct, lookup_builtin_trait_impl, lookup_impl_method, impl_method_reg_name, impl_trait_for_method, impl_type_implements_trait_method, mangle_generic_name, mangle_impl_method_q, mangle_from_method, synthesized_display_call, render_result_arm_value, wrapping_unsigned_c_type,
-    option_c_type, reg_fn, register_mono_fn, register_mono_instance,
+    option_c_type, reg_fn, reg_fn_with_effects, register_mono_fn, register_mono_instance,
+    resolve_tparam, poly_impl_method_node, poly_impl_block_node, is_poly_impl_base,
     resolve_import_alias, resolve_ptr_inner_c, resolve_struct_from_c_name, get_var_ffi_ptr_struct, is_ffi_ptr_array_var,
     ffi_alloc_n_pending, ffi_offset_pending_struct,
     result_c_type, result_c_type_mixed,
@@ -81,6 +82,88 @@ fn emit_panic_tag_check_render(tmp: Str, tag_val: Int, msg_prefix: Str, rendered
     emit_line("if ({tmp}.tag == {tag_val}) \{ {emit_panic_site(\"panic: {msg_prefix}: %s at {file}:{loc}\", \", {rendered_expr}\")} }")
 }
 
+// ms4ctb: build the concrete type-args CSV for a poly-impl call on a builtin
+// List receiver. The canonical form `impl[T] Trait[T] for List[T]` has each
+// impl binder appear as the List's element type, so every binder resolves to
+// the receiver list's concrete element type. Struct/enum elements use their
+// type name; scalars use the CT-derived name. CSV order follows binder order
+// (mangle_generic_name / resolve_tparam both index positionally by binder).
+fn poly_impl_concrete_args(im: Int, obj_str: Str) -> Str {
+    let binders_sl = node_impl_binders(im)
+    let elem_ct = get_list_elem_type(obj_str)
+    let elem_struct = get_list_elem_struct(obj_str)
+    let elem_name = if elem_struct != "" { elem_struct } else { type_name_from_ct(elem_ct) }
+    let mut csv = ""
+    let mut bi = 0
+    while bi < sublist_length(binders_sl) {
+        if bi > 0 { csv = csv.concat(",") }
+        csv = csv.concat(elem_name)
+        bi = bi + 1
+    }
+    csv
+}
+
+@allow(UnrestoredMutation, IncompleteStateRestore)
+fn emit_poly_impl_call(node: Int, composed_base: Str, obj_str: Str) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
+    let im = poly_impl_block_node.get(composed_base).unwrap()
+    let m_def = poly_impl_method_node.get(composed_base).unwrap()
+    let tparams_sl = node_impl_binders(im)
+    let concrete_args = poly_impl_concrete_args(im, obj_str)
+    let mangled = mangle_generic_name(composed_base, concrete_args)
+    register_mono_fn(composed_base, concrete_args)
+    register_mono_instance(composed_base, concrete_args)
+
+    // Resolve the return type through the binder substitution so the result
+    // temp carries the concrete C type (a bare-T return becomes the element's
+    // concrete type, not void).
+    let ret_str_raw = node_return_type(m_def)
+    let ret_str = resolve_tparam(ret_str_raw, tparams_sl, concrete_args)
+    let ret_ct = type_from_name(ret_str)
+    let fn_eff_sl = node_effects(m_def)
+    let fn_trusted = has_annotation(m_def, "trusted")
+    reg_fn_with_effects(mangled, ret_ct, fn_eff_sl, fn_trusted)
+
+    // Emit args with the same carrier hints the single-symbol path uses. The
+    // method node's params include `self` at index 0, so call arg i maps to
+    // method param i + self_offset.
+    let args_sl = node_args(node)
+    let m_params_sl = node_params(m_def)
+    let self_offset = if impl_method_self_name(m_def) != "" { 1 } else { 0 }
+    let mut args_str = obj_str
+    if args_sl != -1 {
+        let mut i = 0
+        while i < sublist_length(args_sl) {
+            args_str = args_str.concat(", ")
+            let saved_hint = cg_expect_fn_value_sig
+            cg_expect_fn_value_sig = arg_fn_value_hint(m_params_sl, i + self_offset)
+            let saved_arg_ann = cg_expect_arg_ann
+            cg_expect_arg_ann = arg_type_ann_at(m_params_sl, i + self_offset)
+            emit_expr(sublist_get(args_sl, i))
+            cg_expect_arg_ann = saved_arg_ann
+            cg_expect_fn_value_sig = saved_hint
+            args_str = args_str.concat(expr_result_str)
+            i = i + 1
+        }
+    }
+
+    expr_list_elem_type = -1
+    expr_list_elem_struct = ""
+    // Bind a struct/enum return into a temp so the caller sees a concrete type.
+    if ret_ct == CT_VOID && ret_str != "" && ret_str != "Void" {
+        if is_struct_type(ret_str) != 0 || is_enum_type(ret_str) != 0 {
+            let s_tmp = fresh_temp("_psr")
+            emit_line("{c_type_c_name(ret_str)} {s_tmp} = {c_fn_name(mangled)}({args_str});")
+            set_var(s_tmp, CT_STRUCT, 0)
+            set_var_struct(s_tmp, ret_str)
+            expr_result_str = s_tmp
+            expr_result_type = CT_STRUCT
+            return
+        }
+    }
+    expr_result_str = "{c_fn_name(mangled)}({args_str})"
+    expr_result_type = ret_ct
+}
+
 @allow(UnrestoredMutation, IncompleteStateRestore)
 fn emit_user_impl_call(node: Int, type_name: Str, method: Str, obj_str: Str) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
     // Resolve the owning trait so the symbol matches the trait-qualified
@@ -89,6 +172,14 @@ fn emit_user_impl_call(node: Int, type_name: Str, method: Str, obj_str: Str) ! C
     // the bare symbol.
     let call_trait = impl_trait_for_method(type_name, method)
     let mangled = if call_trait != "" { mangle_impl_method_q(type_name, call_trait, method) } else { "{type_name}_{method}" }
+    // ms4ctb: a polymorphic impl on a builtin generic receiver
+    // (`impl[T] Trait[T] for List[T]`) is monomorphized per concrete T at the
+    // use site — registered here, emitted by the deferred mono pass — exactly
+    // like a generic free fn. Routed before the single-symbol path below.
+    if call_trait != "" && is_poly_impl_base(mangled) != 0 {
+        emit_poly_impl_call(node, mangled, obj_str)
+        return
+    }
     let args_sl = node_args(node)
     let mut args_str = obj_str
     // Callee param sublist for carrier hints. The method node's params include

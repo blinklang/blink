@@ -2,7 +2,7 @@ import ast.{NodeKind}
 import parser.{
     get_annotation, has_annotation,
     node_args, node_assoc_types, node_arms, node_body, node_captures, node_condition, node_effects,
-    node_elements, node_fields, node_handlers, node_kind, node_methods, node_module, node_source_module,
+    node_elements, node_fields, node_handlers, node_impl_binders, node_kind, node_methods, node_module, node_recv_type_args, node_source_module,
     node_is_pub, node_name, node_params, node_return_type, node_stmts, node_trait_name,
     node_type_ann, node_type_name, node_type_params, node_value,
     sublist_get, sublist_length,
@@ -66,6 +66,7 @@ import codegen_types.{
     in_per_module_header, in_per_module_object,
     is_stdlib_source_module, join_lines, make_emit_key, mangle_impl_method, mangle_impl_method_q, mangling_module, mod_fn_prefix, mod_type_prefix, builtin_type_set, mono_fns, mono_idx, mono_instances, skip_private_in_module_header,
     mono_rev_idx,
+    poly_impl_method_node, poly_impl_block_node, is_poly_impl_base,
     mut_captured_vars, pop_scope, push_scope,
     reg_effect, reg_fn, reg_fn_as_ffi, reg_fn_node, reg_fn_ret_from_ann, reset_closure_codegen_state, reset_fn_node_registry,
     reg_fn_struct_ret, reg_fn_with_effects, reg_impl_entry, reg_sf_entry,
@@ -102,6 +103,36 @@ import stdlib_native_deps.{stdlib_native_dep_gate_macro}
 // codegen_expr (expression/closure emission), and
 // codegen_stmt (statement/function/type emission).
 // This file contains only generate() — the top-level entry point.
+
+// ms4ctb: detect the canonical builtin poly form `impl[T] Trait[T] for List[T]`
+// (impl binders + a parameterized builtin List receiver) and register each of
+// its methods under the trait-qualified composed base so the deferred mono pass
+// can instantiate them per concrete T. Non-poly impls and unsupported poly
+// shapes (Map/Set receivers, user generic-struct receivers) are skipped — they
+// keep their existing single-symbol eager path (or are rejected at typecheck).
+fn register_poly_impl_methods(im: Int, impl_trait: Str, impl_type: Str) {
+    if impl_type != "List" { return }
+    let binders_sl = node_impl_binders(im)
+    let recv_args_sl = node_recv_type_args(im)
+    if binders_sl == -1 || recv_args_sl == -1 { return }
+    // Mirror the typecheck E0908 gate exactly: exactly one binder, a List
+    // receiver with exactly one type arg, and that arg IS the binder. Codegen
+    // maps the single binder to the List element type, so anything looser would
+    // mis-monomorphize (and typecheck would have rejected it with E0908 anyway).
+    if sublist_length(binders_sl) != 1 || sublist_length(recv_args_sl) != 1 { return }
+    let binder_name = node_name(sublist_get(binders_sl, 0))
+    if binder_name == "" || node_name(sublist_get(recv_args_sl, 0)) != binder_name { return }
+    let methods_sl = node_methods(im)
+    if methods_sl == -1 { return }
+    let mut j = 0
+    while j < sublist_length(methods_sl) {
+        let m = sublist_get(methods_sl, j)
+        let composed = mangle_impl_method_q(impl_type, impl_trait, node_name(m))
+        poly_impl_method_node.insert(composed, m)
+        poly_impl_block_node.insert(composed, im)
+        j = j + 1
+    }
+}
 
 fn collect_ann_type_names(ann: Int, out: List[Str]) {
     if ann == -1 { return }
@@ -381,6 +412,8 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
     mono_instances.clear()
     mono_idx.clear()
     mono_rev_idx.clear()
+    poly_impl_method_node.clear()
+    poly_impl_block_node.clear()
     cg_closure_defs.clear()
     cg_closure_promoter_defs.clear()
     cg_closure_counter = 0
@@ -1236,6 +1269,7 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
             let impl_trait = node_trait_name(im)
             let impl_type = node_name(im)
             reg_impl_entry(impl_trait, impl_type, node_methods(im))
+            register_poly_impl_methods(im, impl_trait, impl_type)
             let assoc_sl = node_assoc_types(im)
             if assoc_sl != -1 {
                 let mut ai = 0
@@ -1293,6 +1327,13 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
                 while j < sublist_length(methods_sl) {
                     let m = sublist_get(methods_sl, j)
                     let mname = node_name(m)
+                    // ms4ctb: poly-impl methods have no bare un-mono symbol;
+                    // their per-T instances register at the call site. Skip the
+                    // bare-symbol metadata + module-prefix registration here.
+                    if is_poly_impl_base(mangle_impl_method_q(impl_type, impl_trait, mname)) != 0 {
+                        j = j + 1
+                        continue
+                    }
                     let mangled = mangle_impl_method(im, impl_type, mname)
                     match mod_type_prefix.get(impl_type) {
                         Some(m_mod) => {
@@ -1474,6 +1515,14 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
                     // surface that other modules need to call. Free fns
                     // still get the filter applied at their own site.
                     let mname = node_name(m)
+                    // ms4ctb: canonical builtin poly-impl methods have no single
+                    // bare symbol — they are monomorphized per concrete T. The
+                    // deferred mono pass emits their forward decls; emitting a
+                    // bare decl here would lower T to void (broken signature).
+                    if is_poly_impl_base(mangle_impl_method_q(impl_type, node_trait_name(im), mname)) != 0 {
+                        j = j + 1
+                        continue
+                    }
                     let mangled = mangle_impl_method(im, impl_type, mname)
                     let params = format_impl_params(m, impl_type)
                     let enum_ret = get_fn_enum_ret(mangled)
@@ -1584,6 +1633,7 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
             let im_src_mod_d = node_source_module(im)
             cg_current_module = im_mod
             let impl_type = node_name(im)
+            let im_trait = node_trait_name(im)
             let methods_sl = node_methods(im)
             if methods_sl != -1 {
                 let mut j = 0
@@ -1596,6 +1646,13 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
                         continue
                     }
                     if im_in_skipped_mod_d && !m_is_eff_d {
+                        j = j + 1
+                        continue
+                    }
+                    // ms4ctb: canonical builtin poly-impl methods are emitted on
+                    // demand per concrete T by the deferred mono pass, never
+                    // eagerly here (an eager emit would lower T to void).
+                    if is_poly_impl_base(mangle_impl_method_q(impl_type, im_trait, node_name(m))) != 0 {
                         j = j + 1
                         continue
                     }

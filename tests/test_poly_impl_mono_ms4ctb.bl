@@ -1,0 +1,48 @@
+// ms4ctb -- a polymorphic impl on a builtin generic receiver
+//   impl[T] Echoable[T] for List[T] { fn echo(self, x: T) -> T { x } }
+// must be MONOMORPHIZED per concrete T at each use site, exactly like a
+// generic free function. Calling `.echo()` on a List[Int] and a List[Str]
+// must emit TWO distinct C functions with distinct signatures:
+//   - blink_List_Echoable_echo_Int  taking/returning int64_t
+//   - blink_List_Echoable_echo_Str  taking/returning const char* (Blink's Str)
+//
+// This inspects the EMITTED C directly via `build/blink build --emit c`
+// (mirrors tests/test_panic_loc_emit_c.bl), so it needs no runtime — it
+// asserts the structural fact that the two instantiations exist as
+// separate symbols. The `echo` body returns the bare `T` argument, which
+// deliberately avoids the List.push void*-boxing intrinsic (that boxed
+// stdlib body is k68v0r, a separate ticket).
+
+fn emit_c(tag: Str, src: Str) -> Str {
+    let bl_path = ".tmp/_test_{tag}.bl"
+    write_file(bl_path, src)
+    let _ = process_run("build/blink", ["build", bl_path, "--emit", "c"])
+    let c_src = read_file("build/_test_{tag}.c")
+    shell_exec("rm -f {bl_path} build/_test_{tag}.c")
+    c_src
+}
+
+test "poly impl on List[T] monomorphizes per concrete T" {
+    let src = "trait Echoable[T] \{\n"
+              .concat("    fn echo(self, x: T) -> T\n")
+              .concat("\}\n")
+              .concat("impl[T] Echoable[T] for List[T] \{\n")
+              .concat("    fn echo(self, x: T) -> T \{ x \}\n")
+              .concat("\}\n")
+              .concat("fn main() \{\n")
+              .concat("    let ints: List[Int] = [1, 2, 3]\n")
+              .concat("    let _i = ints.echo(7)\n")
+              .concat("    let strs: List[Str] = [\"a\", \"b\"]\n")
+              .concat("    let _s = strs.echo(\"z\")\n")
+              .concat("\}\n")
+    let c = emit_c("poly_impl_mono", src)
+    // Both monomorphized symbols exist as distinct functions.
+    assert(c.contains("List_Echoable_echo_Int"))
+    assert(c.contains("List_Echoable_echo_Str"))
+    // The Int instance carries an int64_t signature; the Str instance a
+    // const char* signature (Blink's Str lowering). Distinct C types prove
+    // they are separate monos, not one void-erased symbol — and that the
+    // `self: List[T]` receiver lowers to blink_list*, not void.
+    assert(c.contains("int64_t blink_List_Echoable_echo_Int(blink_list* self, int64_t x)"))
+    assert(c.contains("const char* blink_List_Echoable_echo_Str(blink_list* self, const char* x)"))
+}
