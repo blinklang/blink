@@ -57,6 +57,18 @@ BLINK_UNUSED static char __blink_test_fail_error_message[512];
  * runner can emit it in the JSON "case" field. */
 BLINK_UNUSED static char __blink_test_case_label[256];
 
+/* Per-iteration `for_each` case records (br afazzf). std.testing.for_each calls
+ * blink_record_case after each case that *returns* (pass/skip); the runner
+ * synthesizes the trailing failed entry from __blink_test_case_label (which
+ * survives the longjmp). Accumulate-then-emit, mirroring __blink_cleanup_warnings.
+ * Plain per-TU statics: for_each monomorphizes into the same TU as blink_test_run
+ * (both in the user/monolith TU, neither in the stdlib archive), so no
+ * BLINK_USE_EXTERN_RUNTIME_STORAGE treatment is needed. Reset per test. */
+#define BLINK_TEST_CASE_MAX 256
+BLINK_UNUSED static char __blink_test_case_labels[BLINK_TEST_CASE_MAX][256];
+BLINK_UNUSED static int  __blink_test_case_status[BLINK_TEST_CASE_MAX]; /* 0=pass 1=fail 2=skip */
+BLINK_UNUSED static int  __blink_test_case_record_count;
+
 /* Skip state. Propagated via Result-sentinel (set globals + plain `return`)
  * so __attribute__((cleanup)) destructors fire for in-scope `with` blocks.
  * `__blink_test_skipped` is shared across TUs (see comment on
@@ -102,6 +114,17 @@ BLINK_UNUSED static void __blink_assert_fail(const char* msg, int line) {
 
 BLINK_UNUSED static void blink_set_case_label(const char* s) {
     BLINK_COPY_OR_EMPTY(__blink_test_case_label, s);
+}
+
+/* Append a finished for_each case record (br afazzf). status: 0=pass 1=fail
+ * 2=skip. Count keeps incrementing past the cap so the JSON helper can emit an
+ * accurate overflow marker for the dropped remainder. */
+BLINK_UNUSED static void blink_record_case(const char* label, int64_t status) {
+    if (__blink_test_case_record_count < BLINK_TEST_CASE_MAX) {
+        BLINK_COPY_OR_EMPTY(__blink_test_case_labels[__blink_test_case_record_count], label);
+        __blink_test_case_status[__blink_test_case_record_count] = (int)status;
+    }
+    __blink_test_case_record_count++;
 }
 
 /* assert_eq failure: like __blink_assert_fail but also records the separately
@@ -292,6 +315,31 @@ BLINK_UNUSED static void __blink_test_print_cleanup_warnings_human(void) {
     }
 }
 
+/* Emit the accumulated for_each case records as a `cases[]` array (br afazzf).
+ * Comma-prefixed per the field convention so it rides whatever record branch is
+ * active. Early-return when no cases ran (plain tests emit no field). Each entry
+ * escapes exactly one string per printf — the shared __blink_test_json_escape
+ * buffer is overwritten on every call. */
+BLINK_UNUSED static void __blink_test_print_case_records_json(void) {
+    if (__blink_test_case_record_count <= 0) { return; }
+    int n = __blink_test_case_record_count;
+    int shown = n < BLINK_TEST_CASE_MAX ? n : BLINK_TEST_CASE_MAX;
+    printf(",\"cases\":[");
+    for (int w = 0; w < shown; w++) {
+        if (w > 0) printf(",");
+        const char* st = __blink_test_case_status[w] == 1 ? "failed"
+                       : __blink_test_case_status[w] == 2 ? "skipped"
+                       : "pass";
+        printf("{\"label\":\"%s\"", __blink_test_json_escape(__blink_test_case_labels[w]));
+        printf(",\"status\":\"%s\"}", st);
+    }
+    if (n > BLINK_TEST_CASE_MAX) {
+        printf(",{\"label\":\"... %d more case(s) dropped (buffer cap %d)\",\"status\":\"dropped\"}",
+               n - BLINK_TEST_CASE_MAX, BLINK_TEST_CASE_MAX);
+    }
+    printf("]");
+}
+
 BLINK_UNUSED static void blink_test_run(const blink_test_entry* tests, int count, int argc, const char** argv) {
     const char* filter = NULL;
     const char* tags_filter = NULL;
@@ -338,6 +386,7 @@ BLINK_UNUSED static void blink_test_run(const blink_test_entry* tests, int count
         __blink_test_fail_expected[0] = '\0';
         __blink_test_fail_actual[0] = '\0';
         __blink_test_case_label[0] = '\0';
+        __blink_test_case_record_count = 0;
         __blink_test_fail_cause = "assertion";
         __blink_test_fail_error_type[0] = '\0';
         __blink_test_fail_error_message[0] = '\0';
@@ -375,6 +424,7 @@ BLINK_UNUSED static void blink_test_run(const blink_test_entry* tests, int count
                 printf(",\"duration_ms\":%g", dur_ms);
                 __blink_test_print_tags_json(&tests[i]);
                 __blink_test_print_cleanup_warnings_json();
+                __blink_test_print_case_records_json();
                 printf("}");
             } else {
                 if (__blink_test_skip_reason[0]) {
@@ -426,10 +476,17 @@ BLINK_UNUSED static void blink_test_run(const blink_test_entry* tests, int count
                 printf(",\"duration_ms\":%g", dur_ms);
                 __blink_test_print_tags_json(&tests[i]);
                 __blink_test_print_cleanup_warnings_json();
+                /* The failing case longjmp'd out of for_each before it could
+                 * self-report; synthesize its entry from the surviving label so
+                 * cases[] ends with the correctly-failed case (br afazzf). */
+                if (__blink_test_case_label[0]) {
+                    blink_record_case(__blink_test_case_label, 1);
+                }
+                __blink_test_print_case_records_json();
                 printf("}");
             } else {
                 if (__blink_test_case_label[0]) {
-                    printf("test %s (case \"%s\") ... \033[31mFAIL\033[0m\n", tests[i].name, __blink_test_case_label);
+                    printf("test %s::case[%s] ... \033[31mFAIL\033[0m\n", tests[i].name, __blink_test_case_label);
                 } else {
                     printf("test %s ... \033[31mFAIL\033[0m\n", tests[i].name);
                 }
@@ -462,6 +519,7 @@ BLINK_UNUSED static void blink_test_run(const blink_test_entry* tests, int count
                 printf(",\"duration_ms\":%g", dur_ms);
                 __blink_test_print_tags_json(&tests[i]);
                 __blink_test_print_cleanup_warnings_json();
+                __blink_test_print_case_records_json();
                 printf("}");
             } else {
                 printf("test %s ... \033[32mok\033[0m\n", tests[i].name);

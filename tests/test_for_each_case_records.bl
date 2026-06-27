@@ -1,0 +1,101 @@
+// Per-iteration NDJSON `case` records (br afazzf). Each started case in a
+// `for_each` must produce a nested `{label,status}` entry under its parent test
+// in a `"cases":[...]` array — passes, the trailing failure, and skips. We shell
+// out to `build/blink test --json` on fixture files and inspect the JSON.
+//
+// Fixture basenames must be unique per worker: `build/blink test` writes the
+// compiled child binary to `build/<basename>`, and sibling workers racing on the
+// same path hit ETXTBSY ("Text file busy") on execvp.
+
+test "for_each all-pass emits a cases[] entry per case" {
+    let tag = "fe_rec_allpass_{getpid()}"
+    let scratch = ".tmp/_test_for_each_records_{getpid()}_allpass"
+    shell_exec("rm -rf {scratch}")
+    shell_exec("mkdir -p {scratch}")
+    let fixture = "{scratch}/{tag}.bl"
+    let src = "import std.testing.\{for_each\}\n\ntest \"allpass\" \{\n    for_each([\n        (\"first\", 1),\n        (\"second\", 2),\n    ], fn(v: Int) \{\n        assert(v > 0)\n    \})\n\}\n"
+    write_file(fixture, src)
+    let result = process_run("build/blink", ["test", "--json", fixture])
+    let output = result.out.concat(result.err_out)
+    let diag = "exit_code={result.exit_code}; captured:\n{output}"
+    assert(result.exit_code == 0, "child should exit 0; {diag}")
+    assert(output.contains("\"cases\":["), "no cases[] array; {diag}")
+    assert(output.contains("\"label\":\"first\""), "no label:first; {diag}")
+    assert(output.contains("\"label\":\"second\""), "no label:second; {diag}")
+    assert(output.contains("\"status\":\"pass\""), "no parent status:pass; {diag}")
+    shell_exec("rm -rf {scratch}")
+}
+
+test "for_each mid-failure records prior pass and the failing case, not later cases" {
+    let tag = "fe_rec_midfail_{getpid()}"
+    let scratch = ".tmp/_test_for_each_records_{getpid()}_midfail"
+    shell_exec("rm -rf {scratch}")
+    shell_exec("mkdir -p {scratch}")
+    let fixture = "{scratch}/{tag}.bl"
+    let src = "import std.testing.\{for_each\}\n\ntest \"midfail\" \{\n    for_each([\n        (\"a\", 1),\n        (\"b\", 2),\n        (\"c\", 3),\n    ], fn(v: Int) \{\n        assert(v == 1)\n    \})\n\}\n"
+    write_file(fixture, src)
+    let result = process_run("build/blink", ["test", "--json", fixture])
+    let output = result.out.concat(result.err_out)
+    let diag = "exit_code={result.exit_code}; captured:\n{output}"
+    assert(output.contains("\"status\":\"failed\""), "no parent status:failed; {diag}")
+    assert(output.contains("\"case\":\"b\""), "no parent case:b; {diag}")
+    assert(output.contains("\"cases\":["), "no cases[] array; {diag}")
+    assert(output.contains("\"label\":\"a\""), "no label:a (prior pass); {diag}")
+    assert(output.contains("\"label\":\"b\""), "no label:b (failing case); {diag}")
+    assert(!output.contains("\"label\":\"c\""), "label:c should not appear (never started); {diag}")
+    shell_exec("rm -rf {scratch}")
+}
+
+test "for_each skip stops the loop and records the skipped case" {
+    let tag = "fe_rec_skip_{getpid()}"
+    let scratch = ".tmp/_test_for_each_records_{getpid()}_skip"
+    shell_exec("rm -rf {scratch}")
+    shell_exec("mkdir -p {scratch}")
+    let fixture = "{scratch}/{tag}.bl"
+    let src = "import std.testing.\{for_each, skip\}\n\ntest \"skipstops\" \{\n    for_each([\n        (\"a\", 1),\n        (\"b\", 2),\n        (\"c\", 3),\n    ], fn(v: Int) \{\n        if v == 2 \{ skip(\"stop\") \}\n    \})\n\}\n"
+    write_file(fixture, src)
+    let result = process_run("build/blink", ["test", "--json", fixture])
+    let output = result.out.concat(result.err_out)
+    let diag = "exit_code={result.exit_code}; captured:\n{output}"
+    assert(output.contains("\"cases\":["), "no cases[] array; {diag}")
+    assert(output.contains("\"label\":\"a\""), "no label:a (pass before skip); {diag}")
+    assert(output.contains("\"label\":\"b\""), "no label:b (skipped case); {diag}")
+    assert(!output.contains("\"label\":\"c\""), "label:c should not appear (never started); {diag}")
+    assert(output.contains("\"status\":\"skipped\""), "no skipped status anywhere; {diag}")
+    shell_exec("rm -rf {scratch}")
+}
+
+test "for_each cases[] accumulates across two for_each calls in one test" {
+    let tag = "fe_rec_accum_{getpid()}"
+    let scratch = ".tmp/_test_for_each_records_{getpid()}_accum"
+    shell_exec("rm -rf {scratch}")
+    shell_exec("mkdir -p {scratch}")
+    let fixture = "{scratch}/{tag}.bl"
+    let src = "import std.testing.\{for_each\}\n\ntest \"accum\" \{\n    for_each([\n        (\"one\", 1),\n        (\"two\", 2),\n    ], fn(v: Int) \{\n        assert(v > 0)\n    \})\n    for_each([\n        (\"three\", 3),\n        (\"four\", 4),\n    ], fn(v: Int) \{\n        assert(v > 0)\n    \})\n\}\n"
+    write_file(fixture, src)
+    let result = process_run("build/blink", ["test", "--json", fixture])
+    let output = result.out.concat(result.err_out)
+    let diag = "exit_code={result.exit_code}; captured:\n{output}"
+    assert(result.exit_code == 0, "child should exit 0; {diag}")
+    assert(output.contains("\"label\":\"one\""), "no label:one; {diag}")
+    assert(output.contains("\"label\":\"two\""), "no label:two; {diag}")
+    assert(output.contains("\"label\":\"three\""), "no label:three; {diag}")
+    assert(output.contains("\"label\":\"four\""), "no label:four; {diag}")
+    shell_exec("rm -rf {scratch}")
+}
+
+test "plain test without for_each emits no cases[] field" {
+    let tag = "fe_rec_none_{getpid()}"
+    let scratch = ".tmp/_test_for_each_records_{getpid()}_none"
+    shell_exec("rm -rf {scratch}")
+    shell_exec("mkdir -p {scratch}")
+    let fixture = "{scratch}/{tag}.bl"
+    let src = "test \"plain\" \{\n    assert(1 == 1)\n\}\n"
+    write_file(fixture, src)
+    let result = process_run("build/blink", ["test", "--json", fixture])
+    let output = result.out.concat(result.err_out)
+    let diag = "exit_code={result.exit_code}; captured:\n{output}"
+    assert(result.exit_code == 0, "child should exit 0; {diag}")
+    assert(!output.contains("\"cases\":["), "plain test should not emit cases[]; {diag}")
+    shell_exec("rm -rf {scratch}")
+}
