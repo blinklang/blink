@@ -1,5 +1,5 @@
 import codegen_types.{
-    CT_BOOL, CT_BYTES, CT_CHANNEL, CT_CLOSURE, CT_FFI_SCOPE, CT_FLOAT,
+    CT_BOOL, CT_BYTES, CT_CHANNEL, CT_CLOSURE, CT_FFI_SCOPE, CT_FLOAT, CT_INSTANT, CT_DURATION,
     CT_HANDLER, CT_I8, CT_I16, CT_I32, CT_U8, CT_U16, CT_U32, CT_U64, CT_INT, CT_ITERATOR, CT_LIST, CT_MAP, CT_OPTION, CT_PTR,
     CT_CHAR, CT_ENUM, CT_RESULT, CT_SET, CT_STRING, CT_STRINGBUILDER, CT_STRUCT, CT_TEMPLATE, CT_VOID,
     CarrierInfo, CaptureEntry, ClosureCapInfo, GenericCallArgs, VarEnumEntry,
@@ -31,7 +31,7 @@ import codegen_types.{
     get_capture_index, get_fn_node, get_fn_ret, get_fn_ret_struct,
     get_fn_ret_handler, get_fn_ret_struct_inner, get_fn_ret_type,
     get_generic_fn_node,
-    get_impl_method_ret, impl_method_reg_name, impl_trait_for_method, impl_type_implements_trait_method, lookup_impl_method, mangle_impl_method_q, get_list_elem_struct, get_list_elem_type,
+    get_impl_method_ret, has_derive_method, impl_method_reg_name, impl_trait_for_method, impl_type_implements_trait_method, lookup_impl_method, mangle_impl_method_q, get_list_elem_struct, get_list_elem_type,
     get_map_key_type, get_map_key_struct,
     get_map_value_list_elem, get_map_value_struct, get_map_value_type,
     get_struct_field_closure_sig,
@@ -1757,12 +1757,128 @@ fn emit_binop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.R
         return
     }
 
+    // vfgp72: comparison operators desugar to Eq.eq / Ord.cmp for types whose
+    // C representation has no usable raw `==`/`<` (structs, Bytes, builtin
+    // Instant/Duration, data enums). Simple enums lower to integer tags, so they
+    // fall through to raw C below. Typecheck (Stage 4) has already validated
+    // that both operands share the type and carry the required impl.
+    let is_cmp = op == "==" || op == "!=" || op == "<" || op == ">" || op == "<=" || op == ">="
+    if is_cmp {
+        // Instant/Duration: `{ int64_t nanos; }` — compare the field directly.
+        if left_type == CT_INSTANT || left_type == CT_DURATION {
+            expr_result_str = "(({left_str}).nanos {op} ({right_str}).nanos)"
+            expr_result_type = CT_BOOL
+            return
+        }
+        // Bytes: runtime structural comparison.
+        if left_type == CT_BYTES && right_type == CT_BYTES {
+            if op == "==" {
+                expr_result_str = "(blink_bytes_eq({left_str}, {right_str}))"
+            } else if op == "!=" {
+                expr_result_str = "(!blink_bytes_eq({left_str}, {right_str}))"
+            } else {
+                expr_result_str = "(blink_bytes_cmp({left_str}, {right_str}) {op} 0)"
+            }
+            expr_result_type = CT_BOOL
+            return
+        }
+        // Struct, or data-enum carrying a custom Eq/Ord: route to the eq/cmp
+        // function. The name resolves through the user impl first (mangled,
+        // trait-qualified) then the @derive-synthesized `{T}_eq`/`{T}_cmp`.
+        let cmp_tname = cmp_operand_type_name(left_type, left_str, right_str)
+        if cmp_tname != "" {
+            let relational = op != "==" && op != "!="
+            if relational == 0 {
+                let eq_call = cmp_eq_call(cmp_tname, left_str, right_str)
+                if eq_call != "" {
+                    expr_result_str = if op == "==" { eq_call } else { "(!{eq_call})" }
+                    expr_result_type = CT_BOOL
+                    return
+                }
+            } else {
+                let cmp_call = cmp_cmp_call(cmp_tname, left_str, right_str)
+                if cmp_call != "" {
+                    let ord_t = c_type_c_name("Ordering")
+                    let ct = fresh_temp("__ord")
+                    emit_line("{ord_t} {ct} = {cmp_call};")
+                    // Desugar table (03_types.md:1804-1807).
+                    if op == "<" {
+                        expr_result_str = "({ct} == {ord_t}_Less)"
+                    } else if op == ">" {
+                        expr_result_str = "({ct} == {ord_t}_Greater)"
+                    } else if op == "<=" {
+                        expr_result_str = "({ct} != {ord_t}_Greater)"
+                    } else {
+                        expr_result_str = "({ct} != {ord_t}_Less)"
+                    }
+                    expr_result_type = CT_BOOL
+                    return
+                }
+            }
+        }
+    }
+
     expr_result_str = "({left_str} {op} {right_str})"
     if op == "==" || op == "!=" || op == "<" || op == ">" || op == "<=" || op == ">=" {
         expr_result_type = CT_BOOL
     } else {
         expr_result_type = left_type
     }
+}
+
+// vfgp72: the struct/data-enum type name a comparison should dispatch through,
+// or "" to fall through to raw C. Simple enums (int tags) return "" — raw C
+// works. A struct/data-enum returns its name only when it actually carries an
+// Eq/Ord (user impl or @derive); otherwise "" (typecheck already rejected the
+// genuinely-uncomparable cases, so this just guards the dispatch).
+fn cmp_operand_type_name(lt: Int, ls: Str, rs: Str) -> Str {
+    if lt == CT_STRUCT {
+        let n = get_var_struct(ls)
+        if n != "" { return n }
+        let nr = get_var_struct(rs)
+        if nr != "" { return nr }
+    }
+    if lt == CT_ENUM {
+        let n = get_var_enum(ls)
+        // Only data-enums with a real Eq/Ord need dispatch; simple enums and
+        // un-derived data-enums fall through (raw tag compare / typecheck-gated).
+        if n != "" && is_data_enum(n) != 0 {
+            if has_derive_method(n, "eq") != 0 || lookup_impl_method(n, "eq") != 0 {
+                return n
+            }
+        }
+    }
+    ""
+}
+
+// vfgp72: C call for `a.eq(b)`. User `impl Eq` wins (trait-qualified mangled
+// symbol); else the @derive-synthesized `{T}_eq`. "" if neither exists.
+fn cmp_eq_call(tname: Str, ls: Str, rs: Str) -> Str {
+    if lookup_impl_method(tname, "eq") != 0 {
+        let reg = impl_method_reg_name(tname, "eq")
+        let owner = if impl_type_implements_trait_method(reg, "Eq", "eq") != 0 { "Eq" } else { impl_trait_for_method(reg, "eq") }
+        let mangled = if owner != "" { mangle_impl_method_q(reg, owner, "eq") } else { "{reg}_eq" }
+        return "{c_fn_name(mangled)}({ls}, {rs})"
+    }
+    if has_derive_method(tname, "eq") != 0 {
+        return "{c_fn_name("{tname}_eq")}({ls}, {rs})"
+    }
+    ""
+}
+
+// vfgp72: C call for `a.cmp(b)` -> Ordering. User `impl Ord` wins; else the
+// @derive-synthesized `{T}_cmp`. "" if neither exists.
+fn cmp_cmp_call(tname: Str, ls: Str, rs: Str) -> Str {
+    if lookup_impl_method(tname, "cmp") != 0 {
+        let reg = impl_method_reg_name(tname, "cmp")
+        let owner = if impl_type_implements_trait_method(reg, "Ord", "cmp") != 0 { "Ord" } else { impl_trait_for_method(reg, "cmp") }
+        let mangled = if owner != "" { mangle_impl_method_q(reg, owner, "cmp") } else { "{reg}_cmp" }
+        return "{c_fn_name(mangled)}({ls}, {rs})"
+    }
+    if has_derive_method(tname, "cmp") != 0 {
+        return "{c_fn_name("{tname}_cmp")}({ls}, {rs})"
+    }
+    ""
 }
 
 fn emit_arena_expr_unwind() ! Codegen.Emit {
@@ -2164,6 +2280,17 @@ fn pa_op_renderable(op: Str) -> Int {
     0
 }
 
+// vfgp72: a CT whose value the assert predicate-analysis can decompose into a
+// raw-C comparison + %-formatted intro line. Structs, enums, Option, Bytes,
+// Instant/Duration carry no usable raw `==`/`<` and no scalar %-format, so an
+// assert over them must emit the whole (already-desugared) condition instead.
+fn pa_ct_renderable(ct: Int) -> Int {
+    if ct == CT_INT || ct == CT_BOOL || ct == CT_FLOAT || ct == CT_CHAR || ct == CT_STRING { return 1 }
+    if ct == CT_I8 || ct == CT_I16 || ct == CT_I32 { return 1 }
+    if ct == CT_U8 || ct == CT_U16 || ct == CT_U32 || ct == CT_U64 { return 1 }
+    0
+}
+
 pub fn arg_struct_name_for(rt: Int, rs: Str, list_elem_struct: Str) -> Str {
     if rt == CT_STRUCT { return get_var_struct(rs) }
     if rt == CT_LIST { return list_elem_struct }
@@ -2543,6 +2670,8 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                     let lhs_src = format_expr(lhs)
                     let rhs_src = format_expr(rhs)
 
+                    // Emit operands speculatively to learn their CTs.
+                    let pre_len = cg_lines.len()
                     emit_expr(lhs)
                     let lhs_c = expr_result_str
                     let lhs_ct = expr_result_type
@@ -2550,22 +2679,42 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                     let rhs_c = expr_result_str
                     let rhs_ct = expr_result_type
 
-                    let lhs_tmp = fresh_temp("_pa_l")
-                    let rhs_tmp = fresh_temp("_pa_r")
-                    emit_line("{c_type_str(lhs_ct)} {lhs_tmp} = ({lhs_c});")
-                    emit_line("{c_type_str(rhs_ct)} {rhs_tmp} = ({rhs_c});")
+                    // Only decompose a relational/equality comparison when both
+                    // operands are scalar/Str-renderable. Aggregate operands
+                    // (struct, enum, Option, Bytes, Instant/Duration) have no
+                    // raw-C compare and no %-format, so the whole (already
+                    // Eq/Ord-desugared) condition must be emitted instead — &&/||
+                    // always decompose as before (vfgp72).
+                    let renderable = pa_ct_renderable(lhs_ct) != 0 && pa_ct_renderable(rhs_ct) != 0
+                    let logical = cond_op == "&&" || cond_op == "||"
+                    if renderable != 0 || logical != 0 {
+                        let lhs_tmp = fresh_temp("_pa_l")
+                        let rhs_tmp = fresh_temp("_pa_r")
+                        emit_line("{c_type_str(lhs_ct)} {lhs_tmp} = ({lhs_c});")
+                        emit_line("{c_type_str(rhs_ct)} {rhs_tmp} = ({rhs_c});")
 
-                    if lhs_ct == CT_STRING && rhs_ct == CT_STRING && (cond_op == "==" || cond_op == "!=") {
-                        let neg = if cond_op == "!=" { "!" } else { "" }
-                        cond_c_expr = "{neg}blink_str_eq({lhs_tmp}, {rhs_tmp})"
-                    } else if lhs_ct == CT_STRING && rhs_ct == CT_STRING && (cond_op == "<" || cond_op == "<=" || cond_op == ">" || cond_op == ">=") {
-                        cond_c_expr = "(blink_str_cmp({lhs_tmp}, {rhs_tmp}) {cond_op} 0)"
+                        if lhs_ct == CT_STRING && rhs_ct == CT_STRING && (cond_op == "==" || cond_op == "!=") {
+                            let neg = if cond_op == "!=" { "!" } else { "" }
+                            cond_c_expr = "{neg}blink_str_eq({lhs_tmp}, {rhs_tmp})"
+                        } else if lhs_ct == CT_STRING && rhs_ct == CT_STRING && (cond_op == "<" || cond_op == "<=" || cond_op == ">" || cond_op == ">=") {
+                            cond_c_expr = "(blink_str_cmp({lhs_tmp}, {rhs_tmp}) {cond_op} 0)"
+                        } else {
+                            cond_c_expr = "({lhs_tmp}) {cond_op} ({rhs_tmp})"
+                        }
+
+                        intro_fmt = "{pa_intro_line(lhs_src, lhs_ct)}\\n{pa_intro_line(rhs_src, rhs_ct)}"
+                        intro_arg_list = ", {pa_fmt_for_ct(lhs_tmp, lhs_ct)}, {pa_fmt_for_ct(rhs_tmp, rhs_ct)}"
                     } else {
-                        cond_c_expr = "({lhs_tmp}) {cond_op} ({rhs_tmp})"
+                        // Discard the speculative operand emission and emit the
+                        // full condition through emit_binop (Eq/Ord desugaring).
+                        let mut di = cg_lines.len() - 1
+                        while di >= pre_len {
+                            cg_lines.pop()
+                            di = di - 1
+                        }
+                        emit_expr(cond_node)
+                        cond_c_expr = expr_result_str
                     }
-
-                    intro_fmt = "{pa_intro_line(lhs_src, lhs_ct)}\\n{pa_intro_line(rhs_src, rhs_ct)}"
-                    intro_arg_list = ", {pa_fmt_for_ct(lhs_tmp, lhs_ct)}, {pa_fmt_for_ct(rhs_tmp, rhs_ct)}"
                 } else {
                     emit_expr(cond_node)
                     cond_c_expr = expr_result_str

@@ -1,0 +1,70 @@
+// vfgp72 -- comparison operators must type-check their operands (E0300).
+//
+// Before this fix, `is_comparison_op(op)` short-circuited to Bool with ZERO
+// operand checking, so `Instant > 0`, `"str" > 5`, and a bare struct compare
+// all passed `blink check` then emitted invalid C. The spec (sections/
+// 03_types.md:1809) requires "operands must be the same type"; relational
+// comparison additionally requires the type to be ordered.
+//
+// The enum-vs-Int exception (03_types.md:1093) MUST survive: an enum tag stays
+// comparable to an Int (representation-level). That path is exercised by the
+// positive test + the compiler self-host (191 `node_kind(x) == NodeKind.Y`).
+
+fn main() {
+    let blink_root = process_run("sh", ["-c", "pwd -P"]).out.trim_right()
+
+    let base = ".tmp/_test_vfgp72_tc"
+    shell_exec("rm -rf {base}")
+    shell_exec("mkdir -p {base}")
+
+    // Each case is a full program that must be REJECTED with E0300.
+    let cases = [
+        // 1. Instant vs Int (the original ticket leak, with import)
+        "@module(\"m\")\nimport std.time\npub fn main() \{\n    let now: Instant = time.read()\n    if now > 0 \{ io.println(\"x\") }\n}\n",
+        // 2. Str vs Int, both orders
+        "@module(\"m\")\npub fn main() \{\n    if \"str\" > 5 \{ io.println(\"x\") }\n}\n",
+        "@module(\"m\")\npub fn main() \{\n    if 5 < \"str\" \{ io.println(\"x\") }\n}\n",
+        // 3. struct without derive: relational and equality
+        "@module(\"m\")\ntype P \{ x: Int }\npub fn main() \{\n    let p = P \{ x: 1 }\n    if p > 0 \{ io.println(\"x\") }\n}\n",
+        "@module(\"m\")\ntype P \{ x: Int }\npub fn main() \{\n    let p = P \{ x: 1 }\n    let q = P \{ x: 2 }\n    if p == q \{ io.println(\"x\") }\n}\n",
+        // 4. Option relational (codegen only lowers ==/!= on Option)
+        "@module(\"m\")\npub fn main() \{\n    let a: Option[Int] = Some(1)\n    let b: Option[Int] = Some(2)\n    if a < b \{ io.println(\"x\") }\n}\n",
+        // 5. time.read() WITHOUT import -- gated by Stage 6 typing the intrinsic
+        "@module(\"m\")\npub fn main() \{\n    let now = time.read()\n    if now > 0 \{ io.println(\"x\") }\n}\n",
+    ]
+    let mut ci = 0
+    while ci < cases.len() {
+        let src = cases.get(ci).unwrap()
+        write_file("{base}/case_{ci}.bl", src)
+        let cmd = "cd {base} && {blink_root}/build/blink check case_{ci}.bl 2>&1"
+        let result = process_run("sh", ["-c", cmd])
+        if result.exit_code == 0 {
+            io.println("FAIL: case {ci} should be rejected, but check exited 0")
+            io.println("src was:\n{src}")
+            shell_exec("rm -rf {base}")
+            return
+        }
+        if !result.out.contains("E0300") && !result.out.contains("TypeError") {
+            io.println("FAIL: case {ci} did not emit E0300/TypeError")
+            io.println("got: {result.out}")
+            shell_exec("rm -rf {base}")
+            return
+        }
+        ci = ci + 1
+    }
+
+    // Positive guard: enum-vs-Int comparison must STILL check + run (the
+    // representation-level exception). Both operand orders.
+    let ok_src = "@module(\"m\")\ntype State \{ Idle Running }\npub fn main() \{\n    let s = State.Running\n    if s == 1 \{ io.println(\"a\") }\n    if 0 == s \{ io.println(\"b\") }\n    if s > 0 \{ io.println(\"c\") }\n}\n"
+    write_file("{base}/ok.bl", ok_src)
+    let ok = process_run("sh", ["-c", "cd {base} && {blink_root}/build/blink check ok.bl 2>&1"])
+    if ok.exit_code != 0 {
+        io.println("FAIL: enum-vs-Int comparison should check OK")
+        io.println("got: {ok.out}")
+        shell_exec("rm -rf {base}")
+        return
+    }
+
+    io.println("PASS: E0300 rejects incompatible comparison operands; enum-vs-Int survives")
+    shell_exec("rm -rf {base}")
+}

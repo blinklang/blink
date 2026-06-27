@@ -16,9 +16,10 @@ import codegen_types.{
     tp_child2_kind, tp_child2_sname,
     get_variant_field_name, get_variant_field_type_str,
     derive_serialize_types, derive_deserialize_types,
-    derive_eq_types, derive_clone_types, derive_hash_types, derive_debug_types,
+    derive_eq_types, derive_ord_types, derive_clone_types, derive_hash_types, derive_debug_types,
     derive_method_entries, display_impl_types, lookup_impl_method, mangle_impl_method_q,
     DeriveMethodEntry,
+    list_contains_str,
     sf_entries,
     enum_regs, enum_variants,
 }
@@ -26,7 +27,7 @@ import parser.{node_args, node_handlers, node_name, sublist_get, sublist_length}
 import diagnostics.{diag_error_at, UNKNOWN_DERIVE_NAME, Diag}
 
 fn is_known_derive(name: Str) -> Bool {
-    name == "Serialize" || name == "Deserialize" || name == "Eq" || name == "Clone" || name == "Hash" || name == "Debug"
+    name == "Serialize" || name == "Deserialize" || name == "Eq" || name == "Ord" || name == "Clone" || name == "Hash" || name == "Debug"
 }
 
 pub fn register_derive_annotations(types_sl: Int) ! Diag.Report {
@@ -65,12 +66,37 @@ pub fn register_derive_annotations(types_sl: Int) ! Diag.Report {
                                 ensure_struct_result_type(tname, "str")
                             }
                             if dname == "Eq" {
-                                derive_eq_types.push(tname)
-                                derive_method_entries.push(DeriveMethodEntry {
-                                    type_name: tname,
-                                    method_name: "eq",
-                                    ret_type: CT_BOOL
-                                })
+                                if list_contains_str(derive_eq_types, tname) == 0 {
+                                    derive_eq_types.push(tname)
+                                    derive_method_entries.push(DeriveMethodEntry {
+                                        type_name: tname,
+                                        method_name: "eq",
+                                        ret_type: CT_BOOL
+                                    })
+                                }
+                            }
+                            // vfgp72: Ord: Eq (spec §3.6). Deriving Ord implies Eq —
+                            // auto-include so `a == b` works alongside `a < b` without
+                            // forcing the user to write both derives. cmp returns
+                            // Ordering; ret_type CT_VOID here, typecheck resolves the
+                            // real Ordering tid (mirrors Deserialize's from_json).
+                            if dname == "Ord" {
+                                if list_contains_str(derive_ord_types, tname) == 0 {
+                                    derive_ord_types.push(tname)
+                                    derive_method_entries.push(DeriveMethodEntry {
+                                        type_name: tname,
+                                        method_name: "cmp",
+                                        ret_type: CT_VOID
+                                    })
+                                }
+                                if list_contains_str(derive_eq_types, tname) == 0 {
+                                    derive_eq_types.push(tname)
+                                    derive_method_entries.push(DeriveMethodEntry {
+                                        type_name: tname,
+                                        method_name: "eq",
+                                        ret_type: CT_BOOL
+                                    })
+                                }
                             }
                             if dname == "Clone" {
                                 derive_clone_types.push(tname)
@@ -97,7 +123,7 @@ pub fn register_derive_annotations(types_sl: Int) ! Diag.Report {
                                 })
                             }
                             if !is_known_derive(dname) {
-                                diag_error_at("UnknownDerive", UNKNOWN_DERIVE_NAME, "unknown @derive name '{dname}'; expected one of Serialize, Deserialize, Eq, Clone, Hash, Debug", darg, "remove or replace this derive name")
+                                diag_error_at("UnknownDerive", UNKNOWN_DERIVE_NAME, "unknown @derive name '{dname}'; expected one of Serialize, Deserialize, Eq, Ord, Clone, Hash, Debug", darg, "remove or replace this derive name")
                             }
                             di = di + 1
                         }
@@ -139,6 +165,12 @@ pub fn emit_derive_forward_decls() ! Codegen.Emit {
             emit_line("int {c_type_c_name(tname)}_eq({c_type_c_name(tname)} self, {c_type_c_name(tname)} other);")
         }
         ei = ei + 1
+    }
+    let mut oi = 0
+    while oi < derive_ord_types.len() {
+        let tname = derive_ord_types.get(oi).unwrap()
+        emit_line("{c_type_c_name("Ordering")} {c_type_c_name(tname)}_cmp({c_type_c_name(tname)} self, {c_type_c_name(tname)} other);")
+        oi = oi + 1
     }
     let mut ci = 0
     while ci < derive_clone_types.len() {
@@ -252,6 +284,16 @@ pub fn emit_derive_fn_defs() ! Codegen.Emit {
             emit_struct_eq(tname)
         }
         ei = ei + 1
+    }
+    let mut oi = 0
+    while oi < derive_ord_types.len() {
+        let tname = derive_ord_types.get(oi).unwrap()
+        if is_enum_type(tname) != 0 {
+            emit_enum_cmp(tname)
+        } else {
+            emit_struct_cmp(tname)
+        }
+        oi = oi + 1
     }
     let mut ci = 0
     while ci < derive_clone_types.len() {
@@ -1106,6 +1148,118 @@ fn emit_enum_eq(type_name: Str) ! Codegen.Emit {
             i = i + 1
         }
         emit_line("default: return 0;")
+        cg_indent = cg_indent - 1
+        emit_line("}")
+    }
+
+    cg_indent = cg_indent - 1
+    emit_line("}")
+    emit_line("")
+}
+
+// vfgp72: lexicographic Ord.cmp synthesis. Returns an Ordering enum value
+// (Less/Equal/Greater). Scalar/Float/Str fields compare directly; nested
+// struct/enum fields recurse through their own derived `_cmp`. A field type
+// without Ord is rejected at derive time (validate_derive_ord_fields).
+fn ord_c(variant: Str) -> Str {
+    "{c_type_c_name("Ordering")}_{variant}"
+}
+
+// Emit the per-field "<,> short-circuit" comparison for a struct or enum
+// payload field. `lhs`/`rhs` are the C lvalue expressions (e.g. "self.x",
+// "self.data.Circle.radius"). `ftype_str` names a nested Ord type, else "".
+// A field that is neither a scalar/Float/Str nor a derived-Ord type is left
+// uncompared here — validate_derive_ord_fields already rejected it at derive
+// time, so this only runs for valid fields.
+fn emit_cmp_field(lhs: Str, rhs: Str, fct: Int, ftype_str: Str) ! Codegen.Emit {
+    if fct == CT_STRING {
+        emit_line("\{ int64_t __c = blink_str_cmp({lhs}, {rhs}); if (__c < 0) return {ord_c("Less")}; if (__c > 0) return {ord_c("Greater")}; }")
+    } else if is_hash_scalar_ct(fct) != 0 {
+        emit_line("if ({lhs} < {rhs}) return {ord_c("Less")};")
+        emit_line("if ({lhs} > {rhs}) return {ord_c("Greater")};")
+    } else if fct == CT_FLOAT {
+        emit_line("if ({lhs} < {rhs}) return {ord_c("Less")};")
+        emit_line("if ({lhs} > {rhs}) return {ord_c("Greater")};")
+    } else if ftype_str != "" && has_derive_method(ftype_str, "cmp") != 0 {
+        emit_line("\{ {c_type_c_name("Ordering")} __o = {c_type_c_name(ftype_str)}_cmp({lhs}, {rhs}); if (__o != {ord_c("Equal")}) return __o; }")
+    }
+}
+
+// vfgp72: a field type usable by @derive(Ord) is a scalar, Float, Str, or a
+// type that itself derives Ord. Bool is excluded — it has Eq but not Ord
+// (spec §3.6 built-in trait table).
+fn cmp_field_type_ok(fct: Int, ftype_str: Str) -> Int {
+    if fct == CT_STRING { return 1 }
+    if is_hash_scalar_ct(fct) != 0 { return 1 }
+    if fct == CT_FLOAT { return 1 }
+    if ftype_str != "" && has_derive_method(ftype_str, "cmp") != 0 { return 1 }
+    0
+}
+
+fn emit_struct_cmp(type_name: Str) ! Codegen.Emit {
+    emit_line("{c_type_c_name("Ordering")} {c_type_c_name(type_name)}_cmp({c_type_c_name(type_name)} self, {c_type_c_name(type_name)} other) \{")
+    cg_indent = cg_indent + 1
+    let mut i = 0
+    while i < sf_entries.len() {
+        let sf = sf_entries.get(i).unwrap()
+        if sf.struct_name == type_name {
+            let fts = if sf.field_type == CT_VOID { sf.stype } else { "" }
+            emit_cmp_field("self.{sf.field_name}", "other.{sf.field_name}", sf.field_type, fts)
+        }
+        i = i + 1
+    }
+    emit_line("return {ord_c("Equal")};")
+    cg_indent = cg_indent - 1
+    emit_line("}")
+    emit_line("")
+}
+
+fn emit_enum_cmp(type_name: Str) ! Codegen.Emit {
+    let eidx = get_enum_reg_idx(type_name)
+    if eidx == -1 { return }
+    let is_data = is_data_enum(type_name)
+
+    emit_line("{c_type_c_name("Ordering")} {c_type_c_name(type_name)}_cmp({c_type_c_name(type_name)} self, {c_type_c_name(type_name)} other) \{")
+    cg_indent = cg_indent + 1
+
+    if is_data == 0 {
+        emit_line("if (self < other) return {ord_c("Less")};")
+        emit_line("if (self > other) return {ord_c("Greater")};")
+        emit_line("return {ord_c("Equal")};")
+    } else {
+        emit_line("if (self.tag < other.tag) return {ord_c("Less")};")
+        emit_line("if (self.tag > other.tag) return {ord_c("Greater")};")
+        emit_line("switch (self.tag) \{")
+        cg_indent = cg_indent + 1
+        let mut _tag = 0
+        let mut i = 0
+        while i < enum_variants.len() {
+            let evar = enum_variants.get(i).unwrap()
+            if evar.enum_idx == eidx {
+                emit_line("case {_tag}: \{")
+                cg_indent = cg_indent + 1
+                if evar.field_count > 0 {
+                    let vidx = i
+                    let mut fi = 0
+                    while fi < evar.field_count {
+                        let fname = get_variant_field_name(vidx, fi).unwrap()
+                        let ftype_str = get_variant_field_type_str(vidx, fi).unwrap()
+                        let fct = type_from_name(ftype_str)
+                        let lhs = "self.data.{evar.name}.{fname}"
+                        let rhs = "other.data.{evar.name}.{fname}"
+                        let fts = if is_struct_type(ftype_str) != 0 || is_enum_type(ftype_str) != 0 { ftype_str } else { "" }
+                        emit_cmp_field(lhs, rhs, fct, fts)
+                        fi = fi + 1
+                    }
+                }
+                emit_line("return {ord_c("Equal")};")
+                cg_indent = cg_indent - 1
+                emit_line("}")
+                _tag = _tag + 1
+            }
+            i = i + 1
+        }
+        emit_line("default: return {ord_c("Equal")};")
         cg_indent = cg_indent - 1
         emit_line("}")
     }

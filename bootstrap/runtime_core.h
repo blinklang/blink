@@ -1238,6 +1238,37 @@ BLINK_RT_FN int64_t blink_bytes_is_empty(const blink_bytes* b) {
 }
 #endif
 
+/* vfgp72: structural equality / ordering for Bytes (spec §3.6 Eq+Ord).
+ * Lexicographic over the byte sequence; the shorter prefix sorts first. */
+BLINK_RT_FN int64_t blink_bytes_eq(const blink_bytes* a, const blink_bytes* b);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int64_t blink_bytes_eq(const blink_bytes* a, const blink_bytes* b) {
+    if (a == b) { return 1; }
+    if (a == NULL || b == NULL) { return 0; }
+    if (a->len != b->len) { return 0; }
+    if (a->len == 0) { return 1; }
+    return memcmp(a->data, b->data, (size_t)a->len) == 0;
+}
+#endif
+
+BLINK_RT_FN int64_t blink_bytes_cmp(const blink_bytes* a, const blink_bytes* b);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int64_t blink_bytes_cmp(const blink_bytes* a, const blink_bytes* b) {
+    if (a == b) { return 0; }
+    int64_t alen = (a == NULL) ? 0 : a->len;
+    int64_t blen = (b == NULL) ? 0 : b->len;
+    int64_t n = (alen < blen) ? alen : blen;
+    if (n > 0) {
+        int c = memcmp(a->data, b->data, (size_t)n);
+        if (c < 0) { return -1; }
+        if (c > 0) { return 1; }
+    }
+    if (alen < blen) { return -1; }
+    if (alen > blen) { return 1; }
+    return 0;
+}
+#endif
+
 BLINK_RT_FN blink_bytes* blink_bytes_concat(const blink_bytes* a, const blink_bytes* b);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN blink_bytes* blink_bytes_concat(const blink_bytes* a, const blink_bytes* b) {

@@ -228,6 +228,31 @@ fn tc_mangle_impl_fnsig(impl_type: Str, trait_name: Str, mname: Str, im: Int) ->
     "{impl_type}_{trait_name}_{mname}"
 }
 
+// vfgp72: does `tname` carry an Eq impl usable by the `==`/`!=` operators?
+// Covers BOTH @derive(Eq)/@derive(Ord) (Ord: Eq) and a user `impl Eq for T`.
+// The user-impl signal is the sb3125 trait→method index: an `impl Eq for T`
+// records method `eq` under trait `Eq` for `T`.
+fn tc_type_has_eq_impl(tname: Str) -> Int {
+    let td = tc_type_decl_nodes.get(tname) ?? -1
+    if td != -1 {
+        if type_has_derive(td, "Eq") != 0 { return 1 }
+        if type_has_derive(td, "Ord") != 0 { return 1 }
+    }
+    if tc_method_trait_names(tname, "eq").contains("Eq") != 0 { return 1 }
+    0
+}
+
+// vfgp72: does `tname` carry an Ord impl usable by `<`/`>`/`<=`/`>=`?
+// Covers @derive(Ord) and a user `impl Ord for T` (records `cmp` under `Ord`).
+fn tc_type_has_ord_impl(tname: Str) -> Int {
+    let td = tc_type_decl_nodes.get(tname) ?? -1
+    if td != -1 {
+        if type_has_derive(td, "Ord") != 0 { return 1 }
+    }
+    if tc_method_trait_names(tname, "cmp").contains("Ord") != 0 { return 1 }
+    0
+}
+
 fn tc_type_has_display_impl(tname: Str) -> Int {
     let mut i = 0
     while i < tc_display_impl_types.len() {
@@ -258,6 +283,9 @@ fn tc_method_resolvable_on_type(obj_k: Int, tname: Str, method: Str) -> Int {
         if method == "to_json"   && type_has_derive(td, "Serialize")   != 0 { return 1 }
         if method == "from_json" && type_has_derive(td, "Deserialize") != 0 { return 1 }
         if method == "eq"        && type_has_derive(td, "Eq")          != 0 { return 1 }
+        // Ord: Eq (spec §3.6) — deriving Ord synthesizes both cmp and eq.
+        if method == "eq"        && type_has_derive(td, "Ord")         != 0 { return 1 }
+        if method == "cmp"       && type_has_derive(td, "Ord")         != 0 { return 1 }
         if method == "clone"     && type_has_derive(td, "Clone")       != 0 { return 1 }
         if method == "hash"      && type_has_derive(td, "Hash")        != 0 { return 1 }
         if method == "debug"     && type_has_derive(td, "Debug")       != 0 { return 1 }
@@ -937,15 +965,27 @@ fn validate_map_key(key_ann: Int) ! Diag.Report {
     }
 }
 
+// vfgp72: scan EVERY @derive annotation, not just the first. get_annotation
+// returns only the first match, so `@derive(Eq)` + `@derive(Ord)` on separate
+// lines hid the second derive (codegen's register_derive_annotations already
+// walks all of node_handlers, so this aligns typecheck with codegen).
 fn type_has_derive(td: Int, derive_name: Str) -> Int {
-    let ann = get_annotation(td, "derive")
-    if ann == -1 { return 0 }
-    let args_sl = node_args(ann)
-    if args_sl == -1 { return 0 }
-    let mut j = 0
-    while j < sublist_length(args_sl) {
-        if node_name(sublist_get(args_sl, j)) == derive_name { return 1 }
-        j = j + 1
+    let anns = node_handlers(td)
+    if anns == -1 { return 0 }
+    let mut i = 0
+    while i < sublist_length(anns) {
+        let ann = sublist_get(anns, i)
+        if node_name(ann) == "derive" {
+            let args_sl = node_args(ann)
+            if args_sl != -1 {
+                let mut j = 0
+                while j < sublist_length(args_sl) {
+                    if node_name(sublist_get(args_sl, j)) == derive_name { return 1 }
+                    j = j + 1
+                }
+            }
+        }
+        i = i + 1
     }
     0
 }
@@ -4089,6 +4129,10 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repor
             let td = sublist_get(derive_types_sl, i)
             if type_has_derive(td, "Clone") != 0 { nr_impl_method_names.push("clone") }
             if type_has_derive(td, "Eq") != 0 { nr_impl_method_names.push("eq") }
+            if type_has_derive(td, "Ord") != 0 {
+                nr_impl_method_names.push("cmp")
+                nr_impl_method_names.push("eq")
+            }
             if type_has_derive(td, "Hash") != 0 { nr_impl_method_names.push("hash") }
             if type_has_derive(td, "Debug") != 0 { nr_impl_method_names.push("debug") }
             if type_has_derive(td, "Serialize") != 0 { nr_impl_method_names.push("to_json") }
@@ -5276,6 +5320,122 @@ fn is_shift_amount_type(tid: Int, rhs_node: Int) -> Int {
     0
 }
 
+fn tc_type_name(tid: Int) -> Str {
+    if tid < 0 || tid >= ty_pool.len() { return "" }
+    ty_pool.get(tid).unwrap().name
+}
+
+// vfgp72: the spec enum-vs-Int comparison exception (03_types.md:1093). An
+// enum value stays comparable to an Int (shared tag representation), in EITHER
+// operand order. This is what keeps the compiler's own 191 `node_kind(x) ==
+// NodeKind.Y` comparisons legal after operand type-checking lands.
+fn cmp_is_enum_int_pair(lt: Int, rt: Int) -> Int {
+    let lk = type_kind(lt)
+    let rk = type_kind(rt)
+    // Int side may be plain Int OR a sized int; the enum side is TK_ENUM.
+    let l_int = lk == TK_INT || is_sized_int(lk) != 0
+    let r_int = rk == TK_INT || is_sized_int(rk) != 0
+    if lk == TK_ENUM && r_int != 0 { return 1 }
+    if rk == TK_ENUM && l_int != 0 { return 1 }
+    0
+}
+
+// vfgp72: builtin types that implement Eq+Ord per spec §3.6 (03_types.md:1822)
+// but are represented as plain structs/kinds in the type pool (no @derive, no
+// user impl). Instant/Duration are `{ nanos: Int }` structs; Bytes is TK_BYTES.
+fn is_builtin_eq_ord_type(tid: Int) -> Int {
+    let k = type_kind(tid)
+    if k == TK_BYTES { return 1 }
+    if k == TK_STRUCT {
+        let n = tc_type_name(tid)
+        if n == "Instant" || n == "Duration" { return 1 }
+    }
+    0
+}
+
+// vfgp72: are `lt`/`rt` valid comparison operands? `relational` distinguishes
+// `<`/`>`/`<=`/`>=` (needs Ord) from `==`/`!=` (needs Eq). Callers handle the
+// enum-vs-Int exception and int-literal coercion BEFORE calling this.
+fn cmp_operands_ok(lt: Int, rt: Int, relational: Int) -> Int {
+    let a = resolve_alias_tid(lt)
+    let b = resolve_alias_tid(rt)
+    let ka = type_kind(a)
+    let kb = type_kind(b)
+
+    // Fail-open on types we cannot model here, mirroring types_compatible:
+    //   - TK_TYPEVAR: generic `T <op> T` resolves at monomorphization (the
+    //     concrete type's Eq/Ord is checked there).
+    //   - TK_VOID: an under-inferred value (e.g. an un-annotated closure return
+    //     flowing through Bytes.with_ptr) types as Void; rejecting it would
+    //     break programs that compiled before operand checking landed.
+    if ka == TK_TYPEVAR || kb == TK_TYPEVAR { return 1 }
+    if ka == TK_VOID || kb == TK_VOID { return 1 }
+
+    // Int and Bool are interchangeable (C-style truthiness, mirroring
+    // types_compatible:5132). `flag == 0`, `set.contains(x) != 0`, and
+    // `true == false` are all pervasive Blink idioms. Bool participates only in
+    // equality — it has Eq but not Ord (spec §3.6) — so relational against a Bool
+    // operand falls through to the reject path below.
+    let a_intbool = ka == TK_INT || ka == TK_BOOL
+    let b_intbool = kb == TK_INT || kb == TK_BOOL
+    if a_intbool != 0 && b_intbool != 0 {
+        if relational != 0 && (ka == TK_BOOL || kb == TK_BOOL) { return 0 }
+        return 1
+    }
+
+    // Scalars: same kind only (no implicit promotion), mirroring types_compatible.
+    // Int<->sized-int literal coercion is handled by the caller. Float/Char and
+    // sized ints compare within their own kind.
+    let a_scalar = is_sized_int(ka) != 0 || ka == TK_FLOAT || ka == TK_CHAR
+    let b_scalar = is_sized_int(kb) != 0 || kb == TK_FLOAT || kb == TK_CHAR
+    if a_scalar != 0 && b_scalar != 0 {
+        if ka == kb { return 1 }
+        return 0
+    }
+
+    // Str: full Eq + Ord.
+    if ka == TK_STR && kb == TK_STR { return 1 }
+
+    // Option[T]: codegen only lowers ==/!= on matching inner; relational is rejected.
+    if ka == TK_OPTION && kb == TK_OPTION {
+        if relational != 0 { return 0 }
+        return types_compatible(a, b)
+    }
+
+    // Same-enum comparison is intrinsic: an enum lowers to an integer tag, so
+    // ==/!=/<… on two values of the SAME enum compares tags directly. This has
+    // always been legal in Blink (no @derive required) and is what the bulk of
+    // the compiler's own enum comparisons rely on. @derive(Eq/Ord) on an enum
+    // only customizes semantics; it is not a precondition for comparing.
+    if ka == TK_ENUM && kb == TK_ENUM {
+        let an = tc_type_name(a)
+        let bn = tc_type_name(b)
+        if an == "" || an != bn { return 0 }
+        return 1
+    }
+
+    // Builtin Eq+Ord types (Instant/Duration/Bytes): same type, any comparison.
+    if is_builtin_eq_ord_type(a) != 0 && ka == kb {
+        if ka == TK_STRUCT && tc_type_name(a) != tc_type_name(b) { return 0 }
+        return 1
+    }
+
+    // User struct: must be the SAME nominal type and carry the right impl
+    // (equality needs Eq, relational needs Ord) — structs have no intrinsic
+    // comparison, so a bare struct compare is the genuine error case.
+    if ka == TK_STRUCT && kb == TK_STRUCT {
+        let an = tc_type_name(a)
+        let bn = tc_type_name(b)
+        if an != bn || an == "" { return 0 }
+        if relational != 0 {
+            return tc_type_has_ord_impl(an)
+        }
+        return tc_type_has_eq_impl(an)
+    }
+
+    0
+}
+
 fn type_bit_width(tid: Int) -> Int {
     let k = type_kind(tid)
     if k == TK_I8 || k == TK_U8 { return 8 }
@@ -5362,7 +5522,25 @@ fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repo
         let lt = infer_type(node_left(node))
         let rt = infer_type(node_right(node))
 
-        if is_comparison_op(op) { return TYPE_BOOL }
+        if is_comparison_op(op) {
+            // vfgp72: comparison operators desugar to Eq.eq / Ord.cmp and require
+            // same-type operands (spec 03_types.md:1809). Validate when both sides
+            // are known, preserving the enum-vs-Int representation exception
+            // (03_types.md:1093) and untyped-int-literal coercion to a sized int.
+            if lt != TYPE_UNKNOWN && rt != TYPE_UNKNOWN {
+                if cmp_is_enum_int_pair(lt, rt) == 0 {
+                    let lit_r = is_sized_int(type_kind(lt)) != 0 && rt == TYPE_INT && is_int_literal_node(node_right(node)) != 0
+                    let lit_l = is_sized_int(type_kind(rt)) != 0 && lt == TYPE_INT && is_int_literal_node(node_left(node)) != 0
+                    if lit_r == 0 && lit_l == 0 {
+                        let relational = if op == "==" || op == "!=" { 0 } else { 1 }
+                        if cmp_operands_ok(lt, rt, relational) == 0 {
+                            tc_error_at("binary '{op}': incompatible types {type_to_str(lt)} and {type_to_str(rt)}", node)
+                        }
+                    }
+                }
+            }
+            return TYPE_BOOL
+        }
         if op == "&&" || op == "||" {
             if is_bool_compat(lt) == 0 {
                 tc_error_at("logical operator '{op}' requires Bool operands, got {type_to_str(lt)}", node)
@@ -5395,6 +5573,13 @@ fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repo
                     tc_error_at("binary '{op}': incompatible types {type_to_str(lt)} and {type_to_str(rt)}", node)
                 }
             }
+            // Arithmetic on a Bool operand yields an integer count, not a Bool
+            // (e.g. `(a != 0) + (b != 0)`). Without this, the sum is typed Bool
+            // and a later `sum <= 1` would wrongly look like a Bool relational
+            // (vfgp72). Bool is int64_t-repped, so this matches the emitted C.
+            if lt == TYPE_BOOL && rt == TYPE_BOOL { return TYPE_INT }
+            if lt == TYPE_BOOL && rt != TYPE_UNKNOWN { return rt }
+            if rt == TYPE_BOOL && lt != TYPE_UNKNOWN { return lt }
             if lt != TYPE_UNKNOWN { return lt }
             return rt
         }
@@ -5977,6 +6162,17 @@ fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repo
             if method == "display" && tc_type_has_display_impl(tname) != 0 {
                 return TYPE_STR
             }
+            // vfgp72: synthesized @derive(Eq)/@derive(Ord) methods have no user
+            // fnsig. eq -> Bool, cmp -> Ordering. (User `impl Eq/Ord` resolves
+            // through the trait-qualified fnsig above; this is the derive path.)
+            if method == "eq" && tc_type_has_eq_impl(tname) != 0 {
+                return TYPE_BOOL
+            }
+            if method == "cmp" && tc_type_has_ord_impl(tname) != 0 {
+                let ot = lookup_named_type("Ordering")
+                if ot != -1 { return ot }
+                return TYPE_UNKNOWN
+            }
             // mrwgz4: the receiver type is KNOWN, but no resolution path matched.
             // Emit E0505 here (typecheck) instead of deferring to the codegen
             // backstop — name resolution belongs with E0504/E0506/E0507. Display
@@ -5999,6 +6195,18 @@ fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repo
                 if method == "from_code_point" {
                     return make_result_type(TYPE_CHAR, lookup_named_type("ConversionError"))
                 }
+            }
+            // vfgp72: intrinsic time.* methods type even without `import std.time`
+            // (they emit as codegen intrinsics like io.println). Typing read() as
+            // Instant lets the comparison check (Stage 4) catch `time.read() > 0`
+            // at `blink check` instead of leaking an Instant into invalid C — the
+            // original ticket bug.
+            if is_import_module_name(obj_name) != 0 && nr_is_defined(obj_name) == 0 && is_intrinsic_method(obj_name, method) != 0 {
+                if obj_name == "time" && method == "read" {
+                    let it = lookup_named_type("Instant")
+                    if it != -1 { return it }
+                }
+                if obj_name == "time" && method == "sleep" { return TYPE_VOID }
             }
             if is_import_module_name(obj_name) != 0 && nr_is_defined(obj_name) == 0 && is_intrinsic_method(obj_name, method) == 0 {
                 let sig = lookup_fnsig(method)
