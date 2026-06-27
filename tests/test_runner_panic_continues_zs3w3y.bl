@@ -1,0 +1,48 @@
+// Regression for zs3w3y: an uncaught panic in one test body must NOT kill the
+// whole test binary. The panicking test is reported as FAIL and every later
+// test still runs. Before the fix, __blink_panic_dispatch fell through to
+// exit(1) when not armed/draining, so the panicking test's FAIL line and all
+// subsequent tests vanished. The runtime now installs a test-hook that records
+// the failure and longjmps back to the per-test runner frame.
+
+test "runner continues after an uncaught panic" {
+    // Fixture basename must be unique per worker: `build/blink build` writes the
+    // compiled binary to `build/<basename>`, and sibling workers racing on the
+    // same path hit ETXTBSY ("Text file busy") on execvp.
+    let tag = "_test_runner_panic_{getpid()}"
+    let fixture = ".tmp/{tag}.bl"
+    let src = "test \"alpha_first\" \{ assert(1 == 1) \}\n"
+              .concat("test \"beta_panics\" \{ let xs: List[Int] = []\n  let _v = xs.get(99).unwrap()\n  assert(true) \}\n")
+              .concat("test \"gamma_after\" \{ assert(2 == 2) \}\n")
+    write_file(fixture, src)
+
+    // Build via build/blink so the C compile picks up runtime.h + libs.
+    let build_res = process_run("build/blink", ["build", fixture])
+    assert_eq(build_res.exit_code, 0)
+
+    let run = process_run("build/{tag}", [])
+    let output = run.out.concat(run.err_out)
+    let diag = "exit_code={run.exit_code}; captured:\n{output}"
+
+    // 1. alpha_first ran (status is ANSI-wrapped, so check name-prefix and the
+    //    status word separately).
+    assert(output.contains("test alpha_first ... "), "alpha_first did not run; {diag}")
+    assert(output.contains("ok"), "alpha_first missing ok status; {diag}")
+
+    // 2. beta_panics is reported as FAIL — NOT silently dropped.
+    assert(output.contains("beta_panics"), "beta_panics not reported; {diag}")
+    assert(output.contains("FAIL"), "beta_panics not marked FAIL; {diag}")
+
+    // 3. gamma_after RAN — the load-bearing regression proof. Before the fix the
+    //    binary died mid-loop and this line never appeared.
+    assert(output.contains("test gamma_after ... "), "gamma_after never ran (binary died mid-loop); {diag}")
+
+    // 4. The panic message surfaced rather than being swallowed.
+    assert(output.contains("unwrap called on None"), "panic message not surfaced; {diag}")
+
+    // 5. Summary reflects exactly one failed test out of two non-panicking passes.
+    assert(output.contains("2 passed"), "summary wrong pass count; {diag}")
+    assert(output.contains("1 failed"), "summary wrong fail count; {diag}")
+
+    shell_exec("rm -f build/{tag} {fixture}")
+}

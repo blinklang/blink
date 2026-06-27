@@ -227,6 +227,28 @@ BLINK_UNUSED static void __blink_assert_panics_mismatch(const char* expected,
         __intro, file, line, col, "");
 }
 
+/* zs3w3y: installed as __blink_panic_test_hook by blink_test_run. An uncaught
+ * panic in a test body lands here instead of terminating the binary: record it
+ * as a plain-message ("panic" cause) failure and longjmp to the per-test
+ * setjmp frame so the runner reports FAIL and continues with the next test.
+ * Clears the assertion-shaped fields so emit takes the plain-message path. */
+BLINK_UNUSED static void __blink_test_panic_handler(const char* msg) {
+    __blink_test_failed = 1;
+    __blink_test_fail_cause = "panic";
+    BLINK_COPY_OR_EMPTY(__blink_test_fail_msg, msg);
+    BLINK_COPY_OR_EMPTY(__blink_test_fail_error_message, msg);
+    __blink_test_fail_error_type[0] = '\0';
+    __blink_test_fail_line = 0;
+    __blink_test_fail_assertion[0] = '\0';
+    __blink_test_fail_intro[0] = '\0';
+    __blink_test_fail_file[0] = '\0';
+    __blink_test_fail_col = 0;
+    __blink_test_fail_user_msg[0] = '\0';
+    __blink_test_fail_expected[0] = '\0';
+    __blink_test_fail_actual[0] = '\0';
+    longjmp(__blink_test_jmp, 1);
+}
+
 /* Polled by std.testing.for_each between case-body iterations so that a
  * failing/skipped case stops the loop instead of running every remaining
  * case under a poisoned global state. int64_t signature matches Blink Int. */
@@ -353,6 +375,8 @@ BLINK_UNUSED static void blink_test_run(const blink_test_entry* tests, int count
             json_output = 1;
         }
     }
+
+    __blink_panic_test_hook = __blink_test_panic_handler;
 
     int pass = 0, fail = 0, skip = 0, total = 0;
     double total_ms = 0.0;
@@ -507,7 +531,14 @@ BLINK_UNUSED static void blink_test_run(const blink_test_entry* tests, int count
                         fprintf(stderr, "  (line %d)\n", __blink_test_fail_line);
                     }
                 } else if (__blink_test_fail_msg[0]) {
-                    fprintf(stderr, "  %s (line %d)\n", __blink_test_fail_msg, __blink_test_fail_line);
+                    /* zs3w3y: a panic carries its own origin inside the message
+                     * and clears fail_line to 0; suppress the bogus "(line 0)"
+                     * suffix when no line is known. */
+                    if (__blink_test_fail_line) {
+                        fprintf(stderr, "  %s (line %d)\n", __blink_test_fail_msg, __blink_test_fail_line);
+                    } else {
+                        fprintf(stderr, "  %s\n", __blink_test_fail_msg);
+                    }
                 }
                 __blink_test_print_cleanup_warnings_human();
             }

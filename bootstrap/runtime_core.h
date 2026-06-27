@@ -122,6 +122,7 @@ typedef struct {
     __thread jmp_buf __blink_cleanup_thunk_jmp;
     __thread char __blink_cleanup_warnings[BLINK_CLEANUP_WARN_MAX][BLINK_CLEANUP_WARN_MSG_SIZE];
     __thread int __blink_cleanup_warning_count = 0;
+    __thread void (*__blink_panic_test_hook)(const char* msg) = NULL;
   #else
     extern __thread int __blink_panic_armed;
     extern __thread jmp_buf __blink_panic_jmp;
@@ -133,6 +134,7 @@ typedef struct {
     extern __thread jmp_buf __blink_cleanup_thunk_jmp;
     extern __thread char __blink_cleanup_warnings[BLINK_CLEANUP_WARN_MAX][BLINK_CLEANUP_WARN_MSG_SIZE];
     extern __thread int __blink_cleanup_warning_count;
+    extern __thread void (*__blink_panic_test_hook)(const char* msg);
   #endif
 #else
 static __thread int __blink_panic_armed = 0;
@@ -145,6 +147,7 @@ static __thread int __blink_in_cleanup_drain = 0;
 static __thread jmp_buf __blink_cleanup_thunk_jmp;
 static __thread char __blink_cleanup_warnings[BLINK_CLEANUP_WARN_MAX][BLINK_CLEANUP_WARN_MSG_SIZE];
 static __thread int __blink_cleanup_warning_count = 0;
+static __thread void (*__blink_panic_test_hook)(const char* msg) = NULL;
 #endif
 
 BLINK_RT_FN size_t __blink_cleanup_depth(void);
@@ -246,8 +249,11 @@ BLINK_RT_FN void __blink_cleanup_warn_push(const char* msg) {
  * thunk can never open a nested armed frame — the drain branch never steals a
  * panic that an inner assert_panics should have caught. Else if armed: capture
  * the message, run in-body cleanup down to the armed frame's mark, then longjmp
- * into assert_panics. If not armed: terminate the process exactly as the
- * historic inline panic did. */
+ * into assert_panics. Else if a test-hook is installed (zs3w3y): the test
+ * runner registered it to record the failure and longjmp back to its per-test
+ * frame so an uncaught panic fails one test instead of killing the whole binary.
+ * If none of those: terminate the process exactly as the historic inline panic
+ * did. */
 BLINK_RT_FN void __blink_panic_dispatch(const char* msg);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN void __blink_panic_dispatch(const char* msg) {
@@ -259,6 +265,9 @@ BLINK_RT_FN void __blink_panic_dispatch(const char* msg) {
         snprintf(__blink_panic_msg, BLINK_PANIC_MSG_SIZE, "%s", msg ? msg : "");
         __blink_cleanup_run_to(__blink_panic_cleanup_mark);
         longjmp(__blink_panic_jmp, 1);
+    }
+    if (__builtin_expect(__blink_panic_test_hook != NULL, 0)) {
+        __blink_panic_test_hook(msg);   /* zs3w3y: records failure + longjmps; never returns */
     }
     fprintf(stderr, "%s\n", msg ? msg : "panic");
     exit(1);

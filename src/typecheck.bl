@@ -669,6 +669,25 @@ fn check_arg_shapes(fn_name: Str, sig: Int, args_sl: Int, self_offset: Int) ! Ty
     }
 }
 
+// Validate a single already-unwrapped argument value against an expected type,
+// applying the construction hint + int-literal coercion escape, and emit the
+// shared "argument N of 'LABEL' expects X, got Y" diagnostic on mismatch. Shared
+// by check_builtin_arg and the qualified-variant-construction guard (8v0cpr).
+fn check_arg_value(label: Str, arg_idx: Int, expected_t: Int, value_node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    if expected_t == TYPE_UNKNOWN { return }
+    let saved_hint = tc_construct_hint
+    tc_construct_hint = resolve_alias_tid(expected_t)
+    let arg_t = infer_type(value_node)
+    tc_construct_hint = saved_hint
+    let mut lit_to_int = 0
+    if is_int_literal_node(value_node) != 0 && is_integer_type(resolve_alias_tid(expected_t)) != 0 {
+        lit_to_int = 1
+    }
+    if lit_to_int == 0 && types_compatible(arg_t, expected_t) == 0 {
+        tc_error_at("argument {arg_idx + 1} of '{label}' expects {type_to_str(expected_t)}, got {type_to_str(arg_t)}", value_node)
+    }
+}
+
 // Validate a single argument to a built-in intrinsic method (List/Set/Str/Map).
 // These methods are pure codegen intrinsics with no fnsig backing, so we cannot
 // reuse check_arg_shapes; we validate inline against the container's elem/key type.
@@ -677,19 +696,7 @@ fn check_arg_shapes(fn_name: Str, sig: Int, args_sl: Int, self_offset: Int) ! Ty
 fn check_builtin_arg(method: Str, arg_idx: Int, expected_t: Int, args_sl: Int, container_label: Str) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     if args_sl == -1 { return }
     if arg_idx >= sublist_length(args_sl) { return }
-    if expected_t == TYPE_UNKNOWN { return }
-    let arg_node = sublist_get(args_sl, arg_idx)
-    let saved_hint = tc_construct_hint
-    tc_construct_hint = resolve_alias_tid(expected_t)
-    let arg_t = infer_type(arg_node)
-    tc_construct_hint = saved_hint
-    let mut lit_to_int = 0
-    if is_int_literal_node(arg_node) != 0 && is_integer_type(resolve_alias_tid(expected_t)) != 0 {
-        lit_to_int = 1
-    }
-    if lit_to_int == 0 && types_compatible(arg_t, expected_t) == 0 {
-        tc_error_at("argument {arg_idx + 1} of '{container_label}.{method}' expects {type_to_str(expected_t)}, got {type_to_str(arg_t)}", arg_node)
-    }
+    check_arg_value("{container_label}.{method}", arg_idx, expected_t, sublist_get(args_sl, arg_idx))
 }
 
 // The closure argument at `idx`, or -1 if absent. The closure validators below
@@ -5628,6 +5635,42 @@ fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repo
     if kind == NodeKind.MethodCall {
         let obj_node = node_obj(node)
         let method = node_method(node)
+
+        // 8v0cpr: a variant name (e.g. `Key`) can shadow an enum type name when
+        // `Key` is also a variant of another enum (`Event.Key`). For qualified
+        // construction `Enum.Variant(...)`, resolve the obj as a TYPE first when
+        // there is no real local of that name — otherwise Ident inference picks
+        // the shadowing variant's enum and `.Variant` fails to resolve.
+        if obj_node != -1 && node_kind(obj_node) == NodeKind.Ident {
+            let cname = node_name(obj_node)
+            if nr_get_type(cname) == TYPE_UNKNOWN {
+                let ctor_tid = lookup_named_type(cname)
+                if ctor_tid != -1 && type_kind(ctor_tid) == TK_ENUM {
+                    let cvar_idx = get_variant_by_name(ctor_tid, method)
+                    if cvar_idx != -1 {
+                        let cargs_sl = node_args(node)
+                        if cargs_sl != -1 {
+                            let mut i = 0
+                            while i < sublist_length(cargs_sl) {
+                                let carg = sublist_get(cargs_sl, i)
+                                let mut cval = carg
+                                let mut cftid = TYPE_UNKNOWN
+                                if node_kind(carg) == NodeKind.NamedArg {
+                                    cval = node_value(carg)
+                                    cftid = lookup_evfield_type_by_name(cvar_idx, node_name(carg))
+                                } else {
+                                    cftid = lookup_evfield_type_by_index(cvar_idx, i)
+                                }
+                                check_arg_value("{cname}.{method}", i, cftid, cval)
+                                i = i + 1
+                            }
+                        }
+                        return ctor_tid
+                    }
+                }
+            }
+        }
+
         let obj_t = infer_type(obj_node)
         let obj_k = type_kind(obj_t)
 
