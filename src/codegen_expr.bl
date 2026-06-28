@@ -3,7 +3,7 @@ import codegen_types.{
     CT_HANDLER, CT_I8, CT_I16, CT_I32, CT_U8, CT_U16, CT_U32, CT_U64, CT_INT, CT_ITERATOR, CT_LIST, CT_MAP, CT_OPTION, CT_PTR,
     CT_CHAR, CT_ENUM, CT_RESULT, CT_SET, CT_STRING, CT_STRINGBUILDER, CT_STRUCT, CT_TEMPLATE, CT_VOID,
     CarrierInfo, CaptureEntry, ClosureCapInfo, GenericCallArgs, VarEnumEntry,
-    c_fn_name, c_safe_name, c_type_c_name, c_type_str, c_type_tag, canonical_struct_tag, ct_bit_width,
+    c_fn_name, c_safe_name, c_type_c_name, c_type_str, c_type_tag, canonical_struct_tag, ct_bit_width, derive_method_cname,
     append_ev_arg, capture_cast_expr,
     cg_arena_expr_prev_stack, cg_arena_expr_tmp_stack,
     cg_async_scope_counter, cg_async_scope_stack,
@@ -1861,7 +1861,7 @@ fn cmp_eq_call(tname: Str, ls: Str, rs: Str) -> Str {
         return "{c_fn_name(mangled)}({ls}, {rs})"
     }
     if has_derive_method(tname, "eq") != 0 {
-        return "{c_fn_name("{tname}_eq")}({ls}, {rs})"
+        return "{derive_method_cname(tname, "eq")}({ls}, {rs})"
     }
     ""
 }
@@ -1876,7 +1876,7 @@ fn cmp_cmp_call(tname: Str, ls: Str, rs: Str) -> Str {
         return "{c_fn_name(mangled)}({ls}, {rs})"
     }
     if has_derive_method(tname, "cmp") != 0 {
-        return "{c_fn_name("{tname}_cmp")}({ls}, {rs})"
+        return "{derive_method_cname(tname, "cmp")}({ls}, {rs})"
     }
     ""
 }
@@ -1890,6 +1890,25 @@ fn emit_arena_expr_unwind() ! Codegen.Emit {
         emit_line("blink_arena_destroy({inner_tmp});")
         di = di - 1
     }
+}
+
+// brvx89: shared emission for the test `skip(reason)` intrinsic, reached from
+// both the bare-Ident call path (emit_call) and the qualified `testing.skip(...)`
+// path (emit_method_call). Plain `return` (not longjmp) so __attribute__((cleanup))
+// destructors fire for in-scope `with` bindings. Typecheck (E0827, §2.20
+// test-only fence) guarantees skip() only reaches codegen from inside a test.
+// NOTE: a codegen-side re-check of cg_in_test_body is NOT a valid backstop —
+// cg_in_test_body is deliberately reset to 0 inside closure bodies (spec §3c.2,
+// codegen_closures.bl), yet skip() inside a test-nested closure (e.g.
+// testing.for_each's case body) is legal, so such a guard would reject valid
+// code. Enforcement lives at typecheck.
+pub fn emit_skip_intrinsic(reason_arg: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
+    emit_expr(reason_arg)
+    emit_line("__blink_test_set_skipped({expr_result_str});")
+    emit_arena_expr_unwind()
+    emit_line("return;")
+    expr_result_str = ""
+    expr_result_type = CT_VOID
 }
 
 @allow(UnrestoredMutation, IncompleteStateRestore)
@@ -2626,21 +2645,7 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
         }
 
         if fn_name == "skip" {
-            // Plain `return` (not longjmp) so __attribute__((cleanup))
-            // destructors fire for in-scope `with` bindings.
-            // Typecheck (E0827, §2.20 test-only fence) guarantees skip() only
-            // reaches codegen from inside a test. NOTE: a codegen-side re-check
-            // of cg_in_test_body is NOT a valid backstop here — cg_in_test_body
-            // is deliberately reset to 0 inside closure bodies (spec §3c.2,
-            // codegen_closures.bl), yet skip() inside a test-nested closure
-            // (e.g. testing.for_each's case body) is legal, so such a guard
-            // would reject valid code. Enforcement lives at typecheck.
-            emit_expr(sublist_get(node_args(node), 0))
-            emit_line("__blink_test_set_skipped({expr_result_str});")
-            emit_arena_expr_unwind()
-            emit_line("return;")
-            expr_result_str = ""
-            expr_result_type = CT_VOID
+            emit_skip_intrinsic(sublist_get(node_args(node), 0))
             return
         }
 
@@ -2837,7 +2842,28 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                     }
                     emit_line("{res_c} _left = {left_str};")
                     emit_line("{res_c} _right = {right_str};")
-                    emit_line("if (memcmp(&_left, &_right, sizeof({res_c})) != 0) \{")
+                    // 6d1913: tag-first, then compare only the ACTIVE arm. A
+                    // whole-struct memcmp over the union reads junk in the
+                    // inactive arm and falsely reports equal values unequal. Pick
+                    // the comparator per arm type: String → blink_str_eq, struct →
+                    // memcmp of that one arm, other scalar/ptr/void → `!=`. (Ok =
+                    // tag 0, Err = tag 1; CT_VOID arms lower to int64_t storage so
+                    // the scalar `!=` form is correct for them.)
+                    let ok_cmp = if left_ok == CT_STRING {
+                        "!blink_str_eq(_left.ok, _right.ok)"
+                    } else if left_ok_s != "" {
+                        "memcmp(&_left.ok, &_right.ok, sizeof(_left.ok)) != 0"
+                    } else {
+                        "_left.ok != _right.ok"
+                    }
+                    let err_cmp = if left_err == CT_STRING {
+                        "!blink_str_eq(_left.err, _right.err)"
+                    } else if left_err_s != "" {
+                        "memcmp(&_left.err, &_right.err, sizeof(_left.err)) != 0"
+                    } else {
+                        "_left.err != _right.err"
+                    }
+                    emit_line("if (_left.tag != _right.tag || (_left.tag == 0 ? ({ok_cmp}) : ({err_cmp}))) \{")
                     cg_indent = cg_indent + 1
                     let msg_tmp4 = fresh_temp("_msg")
                     let exp_tmp4 = fresh_temp("_exp")
@@ -2862,7 +2888,12 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                         let inner_c = c_type_c_name(left_opt_inner_s)
                         emit_line("if (_left.tag != _right.tag || (_left.tag == 1 && memcmp(_left.value, _right.value, sizeof({inner_c})) != 0)) \{")
                     } else {
-                        emit_line("if (memcmp(&_left, &_right, sizeof({opt_c})) != 0) \{")
+                        // 6d1913: tag-first, then compare only the active (Some)
+                        // arm's scalar value. A whole-struct memcmp reads junk in
+                        // the `value` slot of a None (tag 0) and falsely reports
+                        // two Nones unequal. Scalar branch ⇒ scalar inner, so `!=`
+                        // is valid (mirrors the float != path).
+                        emit_line("if (_left.tag != _right.tag || (_left.tag == 1 && _left.value != _right.value)) \{")
                     }
                     cg_indent = cg_indent + 1
                     let msg_tmp5 = fresh_temp("_msg")
