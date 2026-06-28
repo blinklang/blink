@@ -1,0 +1,101 @@
+// zdczwc: assert_eq on an Option/Result whose payload is a struct containing
+// Str fields must compare field-wise (blink_str_eq for Str fields), NOT raw
+// memcmp over the payload bytes. memcmp compares the char* pointers of Str
+// fields instead of their contents, so two content-equal values stored at
+// different heap addresses (the normal case for runtime-built strings) falsely
+// compare unequal and the assertion fails when it should pass.
+//
+// Two signals here:
+//  1. RUNTIME equality cases — Str fields are built at runtime (interpolation)
+//     so the two structs hold DISTINCT char* pointers with equal contents. A
+//     memcmp would see different pointers and abort the test; field-wise
+//     blink_str_eq passes. (An assert_eq FAILURE aborts the test, so the
+//     unequal direction can't be exercised as a passing runtime case — it is
+//     locked at the C-emission level below instead.)
+//  2. C-EMISSION cases — assert the emitted compare uses blink_str_eq on the
+//     struct arm's Str field (proving field-wise comparison is generated, which
+//     is exactly what makes inequality detectable) and is NOT a memcmp of the
+//     payload.
+//
+// SCOPE: the Result Err struct-arm (Result[Int, StructType]) is blocked by a
+// separate carrier-inference bug (br xr0qrn): Err(struct) drops the struct type
+// at construction, so the assert_eq Err arm never sees a struct carrier. Covered
+// here are the two carriers that DO reach the struct path today: Result Ok and
+// Option Some. The Err struct-arm field-wise comparison is fixed in codegen by
+// this change too, but cannot be exercised until xr0qrn lands.
+
+import compile_test_helpers.{compile_and_emit_c}
+
+type P {
+    name: Str
+    age: Int
+}
+
+type Inner {
+    x: Int
+}
+
+// A struct payload carrying a NESTED struct field (Inner). The field-wise
+// comparison must NOT emit C `!=` on the inline struct value (illegal C); it
+// shallow-compares via per-field memcmp instead. Before that handling, the Str
+// fix regressed this into invalid C that failed to compile.
+type Nest {
+    name: Str
+    inner: Inner
+}
+
+fn make_p(n: Int) -> P {
+    return P { name: "Alice_{n}", age: 30 }
+}
+
+fn make_nest(n: Int) -> Nest {
+    return Nest { name: "N_{n}", inner: Inner { x: n } }
+}
+
+// ── Runtime equality (distinct pointers, equal contents) ──────────────
+
+test "assert_eq Result Ok struct-arm equal (runtime-built Str)" {
+    let a: Result[P, Int] = Ok(make_p(1))
+    let b: Result[P, Int] = Ok(make_p(1))
+    assert_eq(a, b)
+}
+
+test "assert_eq Option Some struct-arm equal (runtime-built Str)" {
+    let a: Option[P] = Some(make_p(3))
+    let b: Option[P] = Some(make_p(3))
+    assert_eq(a, b)
+}
+
+test "assert_eq Option None equal (tag-0 deref safety)" {
+    let a: Option[P] = None
+    let b: Option[P] = None
+    assert_eq(a, b)
+}
+
+test "assert_eq Result Ok struct-arm with nested struct field (must compile + pass)" {
+    let a: Result[Nest, Int] = Ok(make_nest(1))
+    let b: Result[Nest, Int] = Ok(make_nest(1))
+    assert_eq(a, b)
+}
+
+test "assert_eq Option Some struct-arm with nested struct field (must compile + pass)" {
+    let a: Option[Nest] = Some(make_nest(2))
+    let b: Option[Nest] = Some(make_nest(2))
+    assert_eq(a, b)
+}
+
+// ── C-emission: field-wise compare generated, not payload memcmp ───────
+
+test "Result Ok struct-arm emits field-wise blink_str_eq, not payload memcmp" {
+    let src = "type P \{ name: Str, age: Int \}\ntest \"r\" \{\n    let a: Result[P, Int] = Ok(P \{ name: \"x\", age: 1 \})\n    let b: Result[P, Int] = Ok(P \{ name: \"x\", age: 1 \})\n    assert_eq(a, b)\n\}\n"
+    let c = compile_and_emit_c(src, "zdczwc_result_ok_emit")
+    assert(c.contains("blink_str_eq(_left.ok.name, _right.ok.name)"))
+    assert(!c.contains("memcmp(&_left.ok, &_right.ok"))
+}
+
+test "Option Some struct-arm emits field-wise blink_str_eq, not payload memcmp" {
+    let src = "type P \{ name: Str, age: Int \}\ntest \"o\" \{\n    let a: Option[P] = Some(P \{ name: \"x\", age: 1 \})\n    let b: Option[P] = Some(P \{ name: \"x\", age: 1 \})\n    assert_eq(a, b)\n\}\n"
+    let c = compile_and_emit_c(src, "zdczwc_option_some_emit")
+    assert(c.contains("blink_str_eq(_left.value->name, _right.value->name)"))
+    assert(!c.contains("memcmp(_left.value, _right.value"))
+}
