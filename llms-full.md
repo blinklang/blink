@@ -1088,6 +1088,36 @@ build/blink build src/main.bl --release -T linux -T macos-arm64
 # Also accepts raw zig target triples: x86_64-linux-gnu, aarch64-macos, etc.
 ```
 
+### Emit modes (`--emit`)
+
+`blink build --emit <mode>` selects the output shape:
+
+```sh
+# Default: emit a linked native binary.
+build/blink build src/main.bl
+
+# Emit a single monolith C file (build/main.c). Use this to inspect
+# generated C, or to bisect a codegen regression against one TU.
+build/blink build src/main.bl --emit c
+
+# Emit one .c and .h per program module into a directory, plus an
+# aggregator header (_blink_all.h). The output target is a DIRECTORY:
+# pass it as the second positional, or via -o.
+build/blink build src/main.bl --emit per-module-dir build/main_modules
+build/blink build src/main.bl --emit per-module-dir -o build/main_modules
+
+# Link the per-module set with a pinned (sorted) link order:
+cc -o build/main_modules/bin $(ls build/main_modules/*.c | sort) -Ibuild -lm -lgc
+```
+
+`per-module-dir` is the documented surface for per-module emit. Each module
+`.c` includes the aggregator header so cross-module calls and typedefs
+resolve; the entry module owns runtime globals and every other module
+externs them. The legacy hidden `__emit-per-module <file.bl> <outdir>`
+subcommand still works as a deprecation alias for one release. See
+`decisions/per-module-o-default.md` for the rationale and the path to making
+per-module the default build path.
+
 ### Compiler Daemon
 
 The compiler daemon is a persistent background process that maintains a live dependency graph with file watching and incremental recheck. When running, `blink check` and `blink query` use it automatically for faster responses.

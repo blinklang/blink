@@ -441,8 +441,26 @@ tasks:
         fi
         echo "PASS test-installed (install.sh layout — std.db_sqlite statically vendored from sidecar)"
 
+  # `ci` is the canonical gate: it runs the full monolith verification
+  # (`ci-monolith`) AND the four per-module emit invariants
+  # (`ci-per-module-checks`). Per-module .c/.h emit is the path we are
+  # promoting toward default — see decisions/per-module-o-default.md. The
+  # monolith path stays reachable via `task ci-monolith` so a codegen
+  # regression can be bisected against the single-TU output.
   ci:
-    desc: Full CI — regen bootstrap + run all tests
+    desc: Full CI — monolith verification + per-module emit invariants
+    silent: true
+    cmds:
+      - task: ci-monolith
+      - task: ci-per-module-checks
+
+  # Legacy monolith-only verification: regen bootstrap + run all tests on
+  # the single-TU (monolith) codegen path. Kept green as a fallback so users
+  # / CI can bisect codegen regressions against monolith output. The
+  # per-module invariants live in `ci` via `ci-per-module-checks`.
+  # See decisions/per-module-o-default.md.
+  ci-monolith:
+    desc: Monolith-path CI — regen bootstrap + run all tests (per-module fallback)
     silent: true
     sources:
       - src/*.bl
@@ -499,7 +517,6 @@ tasks:
           echo "$all_results" | grep "^FAIL" | sed 's/^/  /'
           exit 1
         fi
-      - task: ci-per-module
       - task: test-installed
       - task: __build-binaries-smoke
 
@@ -601,7 +618,7 @@ tasks:
         time_phase fmt-semantic "systemd-run --user --scope -p MemoryMax=50G --quiet parallel --joblog .tmp/fmt-sem.${MODE}.joblog -j {{.JOBS}} --halt never ./scripts/run_fmt_semantic.sh {} {{.BLINKC}} .tmp/fmt_skip.txt ::: tests/test_*.bl > /dev/null 2>&1 || true"
 
         # Phase 7: per-module .o pipeline + gen1/gen2 byte-equality.
-        time_phase ci-per-module 'task ci-per-module > /dev/null'
+        time_phase ci-per-module-checks 'task ci-per-module-checks > /dev/null'
 
         # Phase 8: installed-binary smoke.
         time_phase test-installed 'task test-installed > /dev/null'
@@ -629,8 +646,15 @@ tasks:
         echo "  MODE=cold task ci-profile && MODE=warm task ci-profile"
         echo "  paste {{.BUILD_DIR}}/ci-timings.cold.tsv {{.BUILD_DIR}}/ci-timings.warm.tsv"
 
-  ci-per-module:
-    desc: Verify per-module .o pipeline produces a binary identical in behaviour to monolith mode
+  # The four per-module emit invariants run by `task ci`:
+  #   1. monolith-vs-per-module byte-equality (output matches monolith)
+  #   2. cli.bl self-host (per-module-built compiler typechecks a program)
+  #   3. determinism (re-emit is byte-identical across runs)
+  #   4. gen1/gen2 byte-equality (regen fixed-point on the .c/.h set)
+  # This is the per-module half of `ci`; the monolith half is `ci-monolith`.
+  # See decisions/per-module-o-default.md for why this is the path to default.
+  ci-per-module-checks:
+    desc: Verify per-module .c/.h emit — four invariants (byte-equality, self-host, determinism, gen1/gen2)
     silent: true
     deps: [build-cli]
     sources:
@@ -658,9 +682,9 @@ tasks:
         "$TMPDIR/per_mod/bin" > "$TMPDIR/per_module.out" 2>&1
 
         if diff -u "$TMPDIR/monolith.out" "$TMPDIR/per_module.out" > /dev/null; then
-          echo "ci-per-module: ok (multifile, output matches monolith)"
+          echo "ci-per-module-checks: ok (multifile, output matches monolith)"
         else
-          echo "FAIL ci-per-module: per-module binary output differs from monolith"
+          echo "FAIL ci-per-module-checks: per-module binary output differs from monolith"
           echo "--- monolith"
           cat "$TMPDIR/monolith.out"
           echo "--- per-module"
@@ -680,16 +704,16 @@ tasks:
         # any consumer TU (everything except the owning std_semver.c).
         LEAK=$(/usr/bin/grep -rnE 'extern .*\b(CH_[A-Z0-9]+|OP_[A-Z]+)\b' "$TMPDIR"/priv_pm/*.c | /usr/bin/grep -v '/std_semver.c:' || true)
         if [ -n "$LEAK" ]; then
-          echo "FAIL ci-per-module: non-pub stdlib let leaked as extern into a consumer TU (br yk0mha)"
+          echo "FAIL ci-per-module-checks: non-pub stdlib let leaked as extern into a consumer TU (br yk0mha)"
           echo "$LEAK"
           exit 1
         fi
         cc -o "$TMPDIR/priv_pm/bin" $(ls "$TMPDIR"/priv_pm/*.c | sort) -Ibuild -lm -lgc
         "$TMPDIR/priv_pm/bin" > "$TMPDIR/priv_pm.out" 2>&1
         if diff -u "$TMPDIR/priv_mono.out" "$TMPDIR/priv_pm.out" > /dev/null; then
-          echo "ci-per-module: ok (stdlib-priv: no private extern leak, output matches monolith)"
+          echo "ci-per-module-checks: ok (stdlib-priv: no private extern leak, output matches monolith)"
         else
-          echo "FAIL ci-per-module: stdlib-priv per-module output differs from monolith"
+          echo "FAIL ci-per-module-checks: stdlib-priv per-module output differs from monolith"
           echo "--- monolith"; cat "$TMPDIR/priv_mono.out"
           echo "--- per-module"; cat "$TMPDIR/priv_pm.out"
           exit 1
@@ -704,9 +728,9 @@ tasks:
         cc -o "$TMPDIR/cli_pm/blink-pm" $(ls "$TMPDIR"/cli_pm/*.c | sort) -Ibuild -lm -lgc
         "$TMPDIR/cli_pm/blink-pm" check tests/multifile/src/main.bl > "$TMPDIR/selfhost.out" 2>&1
         if /usr/bin/grep -q "^ok:" "$TMPDIR/selfhost.out"; then
-          echo "ci-per-module: ok (cli.bl self-host)"
+          echo "ci-per-module-checks: ok (cli.bl self-host)"
         else
-          echo "FAIL ci-per-module: per-module-built compiler failed self-host check"
+          echo "FAIL ci-per-module-checks: per-module-built compiler failed self-host check"
           cat "$TMPDIR/selfhost.out"
           exit 1
         fi
@@ -731,15 +755,15 @@ tasks:
           return $fail
         }
         if ! diff_dirs "$TMPDIR/det"; then
-          echo "FAIL ci-per-module: per-module emit is not deterministic across runs"
+          echo "FAIL ci-per-module-checks: per-module emit is not deterministic across runs"
           exit 1
         fi
-        echo "ci-per-module: ok (per-module emit is deterministic across runs)"
+        echo "ci-per-module-checks: ok (per-module emit is deterministic across runs)"
         if ! diff_dirs "$TMPDIR/gen2"; then
-          echo "FAIL ci-per-module: gen1 vs gen2 per-module .c/.h are not byte-equal"
+          echo "FAIL ci-per-module-checks: gen1 vs gen2 per-module .c/.h are not byte-equal"
           exit 1
         fi
-        echo "ci-per-module: ok (gen1 vs gen2 per-module byte-equal)"
+        echo "ci-per-module-checks: ok (gen1 vs gen2 per-module byte-equal)"
 
   gen-stdlib-registry:
     desc: Regenerate src/embedded_stdlib_registry.bl from lib/std and lib/pkg
