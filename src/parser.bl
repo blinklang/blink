@@ -266,6 +266,7 @@ pub fn node_end_col(id: Int) -> Int { node_or_die(id, "node_end_col").end_col }
 pub fn node_assoc_types(id: Int) -> Int { node_or_die(id, "node_assoc_types").assoc_types }
 pub fn node_impl_binders(id: Int) -> Int { node_or_die(id, "node_impl_binders").impl_binders }
 pub fn node_recv_type_args(id: Int) -> Int { node_or_die(id, "node_recv_type_args").recv_type_args }
+pub fn node_impl_where_bounds(id: Int) -> Int { node_or_die(id, "node_impl_where_bounds").impl_where_bounds }
 
 // ── Node setter functions ───────────────────────────────────────────
 // Retained for post-parse mutations performed by comment_attach, typecheck,
@@ -1121,6 +1122,31 @@ fn parse_type_params() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
     sl
 }
 
+// Parse a single `where` constraint: `Ident: Bound (+ Bound)*`. Stored as a
+// TypeParam node (name + bounds in `elements`), mirroring the `[T: Bound]`
+// binder shape so the formatter can reuse format_type_param_binder.
+fn parse_where_constraint() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
+    let cname = expect_value(TokenKind.Ident)
+    let mut bounds_sl = -1
+    if at(TokenKind.Colon) {
+        advance()
+        bounds_sl = new_sublist()
+        sublist_push(bounds_sl, parse_type_annotation())
+        while at(TokenKind.Plus) {
+            advance()
+            skip_newlines()
+            sublist_push(bounds_sl, parse_type_annotation())
+        }
+        finalize_sublist(bounds_sl)
+    }
+    let tp = node_count()
+    nodes.push(AstNode {
+        kind: NodeKind.TypeParam, name: cname, elements: bounds_sl,
+        line: peek_line(), col: peek_col(),
+    })
+    tp
+}
+
 // ── Type definitions ────────────────────────────────────────────────
 
 fn parse_type_def() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
@@ -1880,6 +1906,24 @@ fn parse_impl_block() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         }
     }
     skip_newlines_and_comments()
+    // Optional `where` clause: `where T: Bound, U: A + B` (parse+store only;
+    // enforcement of these bounds is follow-up work). `where` is not a lexer
+    // keyword, so peek for the bare ident before the opening brace. Each
+    // constraint mirrors a `[T: Bound]` binder, so reuse the TypeParam shape.
+    let mut impl_where_bounds = -1
+    if at(TokenKind.Ident) && peek_value() == "where" {
+        advance()
+        skip_newlines()
+        impl_where_bounds = new_sublist()
+        sublist_push(impl_where_bounds, parse_where_constraint())
+        while at(TokenKind.Comma) {
+            advance()
+            skip_newlines()
+            sublist_push(impl_where_bounds, parse_where_constraint())
+        }
+        finalize_sublist(impl_where_bounds)
+        skip_newlines_and_comments()
+    }
     expect(TokenKind.LBrace)
     skip_newlines_and_comments()
     let assoc_types = new_sublist()
@@ -1918,6 +1962,7 @@ fn parse_impl_block() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         methods: methods, assoc_types: assoc_types,
         type_params: trait_type_args,
         impl_binders: impl_binders, recv_type_args: recv_type_args,
+        impl_where_bounds: impl_where_bounds,
         line: impl_start_line, col: impl_start_col,
         end_line: impl_end_line, end_col: impl_end_col,
     })
