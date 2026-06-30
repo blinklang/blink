@@ -518,32 +518,26 @@ fn fn_writes_to(fn_name: Str, global_name: Str) -> Int {
 
 // ── W0550/W0551 Save/Restore pattern detection ──────────────────────
 
-// Per-block analysis scratch state
-let mut sr_save_local: List[Str] = []
+// Per-block analysis scratch state. Only the saved globals are tracked: W0550's
+// per-call gate reads sr_save_global, and W0551's function-scoped gate is
+// precomputed by the sr_scan_for_patterns pre-pass (which owns its own scratch).
 let mut sr_save_global: List[Str] = []
-let mut sr_restore_globals: Map[Str, Int] = Map()
 let mut sr_current_fn: Str = ""
 
+// Function-scoped gating flag (§4.16.7): 1 if ANY block in the current function
+// exhibits at least one save→restore pairing. W0551's gating predicate is
+// function-wide ("save/restore patterns elsewhere in the function indicates
+// speculative intent"), so this is computed in a pre-pass over the whole body
+// before any call is checked, then read at each call site.
+let mut sr_fn_has_pattern: Int = 0
+
 fn sr_reset() {
-    sr_save_local = []
     sr_save_global = []
-    sr_restore_globals = Map()
+    sr_fn_has_pattern = 0
 }
 
-fn sr_add_save(local_name: Str, global_name: Str) {
-    sr_save_local.push(local_name)
+fn sr_add_save(global_name: Str) {
     sr_save_global.push(global_name)
-}
-
-fn sr_is_save_local(name: Str) -> Str {
-    let mut i = 0
-    while i < sr_save_local.len() {
-        if sr_save_local.get(i).unwrap() == name {
-            return sr_save_global.get(i).unwrap()
-        }
-        i = i + 1
-    }
-    ""
 }
 
 fn sr_is_saved_global(name: Str) -> Int {
@@ -555,6 +549,135 @@ fn sr_is_saved_global(name: Str) -> Int {
         i = i + 1
     }
     0
+}
+
+// ── Function-scoped save/restore pattern pre-pass ───────────────────
+//
+// W0551 gates on whether the function is speculative (§4.16.7: "save/restore
+// patterns elsewhere in the function"), but the emitting scan checks calls
+// interleaved with its block walk — so a call in an early block can't yet know
+// a save/restore pattern lives in a later block. This separate pre-pass settles
+// sr_fn_has_pattern over the whole body first. It owns private scratch lists so
+// it never disturbs the emitting scan's sr_save_global.
+
+let mut srp_save_local: List[Str] = []
+let mut srp_save_global: List[Str] = []
+
+fn srp_is_save_local(name: Str) -> Str {
+    let mut i = 0
+    while i < srp_save_local.len() {
+        if srp_save_local.get(i).unwrap() == name {
+            return srp_save_global.get(i).unwrap()
+        }
+        i = i + 1
+    }
+    ""
+}
+
+// Block branch saves/restores srp_save_local/global around the nested scan;
+// the recursive descent also sets sr_fn_has_pattern (the accumulated output of
+// this pre-pass), an intended broad write outside that pattern.
+@allow(UnrestoredMutation, IncompleteStateRestore)
+fn sr_scan_for_patterns_block(stmts_sl: Int) {
+    if stmts_sl == -1 {
+        return
+    }
+    let outer_l = srp_save_local
+    let outer_g = srp_save_global
+    srp_save_local = []
+    srp_save_global = []
+
+    let num_stmts = sublist_length(stmts_sl)
+    let mut i = 0
+    while i < num_stmts {
+        let stmt = sublist_get(stmts_sl, i)
+        let kind = node_kind(stmt)
+
+        if kind == NodeKind.LetBinding {
+            let local_name = node_name(stmt)
+            let val = node_value(stmt)
+            if val != -1 && node_kind(val) == NodeKind.Ident {
+                let val_name = node_name(val)
+                if is_global(val_name) != 0 {
+                    srp_save_local.push(local_name)
+                    srp_save_global.push(val_name)
+                }
+            }
+        }
+
+        if kind == NodeKind.Assignment {
+            let target = node_target(stmt)
+            let val = node_value(stmt)
+            if target != -1 && val != -1 {
+                if node_kind(target) == NodeKind.Ident && node_kind(val) == NodeKind.Ident {
+                    let tname = node_name(target)
+                    let vname = node_name(val)
+                    let mapped = srp_is_save_local(vname)
+                    if mapped != "" && mapped == tname {
+                        sr_fn_has_pattern = 1
+                    }
+                }
+            }
+        }
+
+        i = i + 1
+    }
+
+    // Recurse into nested blocks so a pattern anywhere in the function is found.
+    i = 0
+    while i < num_stmts {
+        sr_scan_for_patterns_node(sublist_get(stmts_sl, i))
+        i = i + 1
+    }
+
+    srp_save_local = outer_l
+    srp_save_global = outer_g
+}
+
+fn sr_scan_for_patterns_node(node: Int) {
+    if node == -1 {
+        return
+    }
+    let kind = node_kind(node)
+
+    if kind == NodeKind.Block {
+        sr_scan_for_patterns_block(node_stmts(node))
+        return
+    }
+
+    if kind == NodeKind.IfExpr {
+        sr_scan_for_patterns_node(node_then_body(node))
+        sr_scan_for_patterns_node(node_else_body(node))
+        return
+    }
+
+    if kind == NodeKind.WhileLoop {
+        sr_scan_for_patterns_node(node_body(node))
+        return
+    }
+
+    if kind == NodeKind.ForIn {
+        sr_scan_for_patterns_node(node_body(node))
+        return
+    }
+
+    if kind == NodeKind.LoopExpr {
+        sr_scan_for_patterns_node(node_body(node))
+        return
+    }
+
+    if kind == NodeKind.MatchExpr {
+        let arms_sl = node_arms(node)
+        if arms_sl != -1 {
+            let mut ai = 0
+            while ai < sublist_length(arms_sl) {
+                let arm = sublist_get(arms_sl, ai)
+                sr_scan_for_patterns_node(node_body(arm))
+                ai = ai + 1
+            }
+        }
+        return
+    }
 }
 
 fn sr_check_call(call_node: Int, callee_name: Str) ! Diag.Report {
@@ -596,7 +719,7 @@ fn sr_check_call(call_node: Int, callee_name: Str) ! Diag.Report {
         )
     }
 
-    if saved_count == 0 && sr_restore_globals.len() > 0 {
+    if saved_count == 0 && sr_fn_has_pattern != 0 {
         let all_writes = str_join(write_items, ", ")
         diag_warn_at_notes(
             "UnrestoredMutation", UNRESTORED_MUTATION,
@@ -615,33 +738,19 @@ fn sr_scan_stmts(stmts_sl: Int) ! Diag.Report {
     let num_stmts = sublist_length(stmts_sl)
     let mut i = 0
 
-    // Pass 1: collect all saves and restores in this block
+    // Pass 1: collect the block's saves (`let local = global`). Restores are
+    // not tracked here — W0550's per-call gate reads sr_save_global directly,
+    // and W0551's function-scoped gate is precomputed by sr_scan_for_patterns.
     while i < num_stmts {
         let stmt = sublist_get(stmts_sl, i)
         let kind = node_kind(stmt)
 
         if kind == NodeKind.LetBinding {
-            let local_name = node_name(stmt)
             let val = node_value(stmt)
             if val != -1 && node_kind(val) == NodeKind.Ident {
                 let val_name = node_name(val)
                 if is_global(val_name) != 0 {
-                    sr_add_save(local_name, val_name)
-                }
-            }
-        }
-
-        if kind == NodeKind.Assignment {
-            let target = node_target(stmt)
-            let val = node_value(stmt)
-            if target != -1 && val != -1 {
-                if node_kind(target) == NodeKind.Ident && node_kind(val) == NodeKind.Ident {
-                    let tname = node_name(target)
-                    let vname = node_name(val)
-                    let mapped = sr_is_save_local(vname)
-                    if mapped != "" && mapped == tname {
-                        sr_restore_globals.insert(tname, 1)
-                    }
+                    sr_add_save(val_name)
                 }
             }
         }
@@ -689,9 +798,9 @@ fn sr_scan_stmts(stmts_sl: Int) ! Diag.Report {
     }
 }
 
-// Block branch saves/restores sr_save_local/global/restore_globals around the
-// nested scan; sr_scan_stmts also writes diag_* globals outside that pattern,
-// which the analyzer correctly flags.
+// Block branch saves/restores sr_save_global around the nested scan;
+// sr_scan_stmts also writes diag_* globals outside that pattern, which the
+// analyzer correctly flags.
 @allow(UnrestoredMutation, IncompleteStateRestore)
 fn sr_scan_node(node: Int) ! Diag.Report {
     if node == -1 {
@@ -700,16 +809,10 @@ fn sr_scan_node(node: Int) ! Diag.Report {
     let kind = node_kind(node)
 
     if kind == NodeKind.Block {
-        let outer_saves_l = sr_save_local
         let outer_saves_g = sr_save_global
-        let outer_restores = sr_restore_globals
-        sr_save_local = []
         sr_save_global = []
-        sr_restore_globals = Map()
         sr_scan_stmts(node_stmts(node))
-        sr_save_local = outer_saves_l
         sr_save_global = outer_saves_g
-        sr_restore_globals = outer_restores
         return
     }
 
@@ -765,6 +868,10 @@ fn sr_analyze_fn(fn_node: Int) ! Diag.Report {
     let body_kind = node_kind(body)
     if body_kind == NodeKind.Block {
         let body_stmts = node_stmts(body)
+        // Pre-pass: determine whether the function is speculative (has any
+        // save/restore pattern) before any call is checked, since the pattern
+        // may live in a block scanned after an early call (§4.16.7).
+        sr_scan_for_patterns_block(body_stmts)
         sr_scan_stmts(body_stmts)
     }
     diag_clear_allows()
