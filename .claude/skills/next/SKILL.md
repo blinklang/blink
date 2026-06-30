@@ -6,15 +6,48 @@ description: Next: Pick and Work Blink Tasks
 
 Pick ready tasks from Bridge and execute the appropriate workflow based on type.
 
-**Usage:** `/next` (auto-picks) or `/next $ARGUMENTS` (match by keyword)
+**Usage:** `/next` (auto-picks, repo-scoped) · `/next <keyword>` (title match) · `/next <project>` (scope to a project)
 
 ---
 
+## Step 0: Resolve Scope
+
+Before fetching the graph, decide whether this run is **repo-scoped** or **project-scoped**.
+
+Run `br project ls --json` once. It returns the active projects with their progress, e.g.:
+
+```json
+[{"id":"c9nw1f","name":"dataset-merge","status":"active","done":"4","total":"9"}]
+```
+
+Then:
+
+- **If `$ARGUMENTS` is given and case-insensitively matches a project `name` or `id`** →
+  **project-scoped mode**. Capture that project's `id`. Step 1 uses
+  `br graph --project <id>` as the forest, and the in-flight tie-break in Step 2 is **skipped**
+  (you're already inside one project, so every candidate shares it).
+
+- **Otherwise** → **repo-scoped mode** (the default). Step 1 uses `br graph -t repo:blink`.
+  Compute the **in-flight set**: project ids where `status == "active"` AND `0 < done < total`
+  (a project that's started but not finished — note `0/N` is *not* in-flight, nothing's done yet).
+  For a `4/9` active project, `0 < 4 < 9` → in-flight. Then resolve which **tasks** belong to each
+  in-flight project by running `br ls --project <id>` per in-flight id (the authoritative source —
+  `br edit --project` membership does **not** surface the project name in `br graph`'s `[...]` tag
+  column, so don't scan that). The union of those task ids is the in-flight set the Step 2 tie-break
+  consults.
+
+  If `$ARGUMENTS` is given but matches no project, stay in repo-scoped mode and treat the
+  argument as a **title keyword** (case-insensitive substring) for the filter in Step 2.
+
 ## Step 1: Fetch the Task Graph
 
-Run `br graph -t repo:blink` to get the dependency forest scoped to blink. Unlike a flat
-ready list, the graph nests each unblocked root (`[ ]`) above the blocked children (`[!]`)
-it gates — so you can see what each ready task *unblocks*, which is the tie-breaker in Step 2.
+Run the command chosen in Step 0:
+- **repo-scoped:** `br graph -t repo:blink`
+- **project-scoped:** `br graph --project <id>`
+
+This gives the dependency forest. Unlike a flat ready list, the graph nests each unblocked
+root (`[ ]`) above the blocked children (`[!]`) it gates — so you can see what each ready task
+*unblocks*, which is the tie-breaker in Step 2.
 
 One quirk to handle:
 - **Workable tasks are the unblocked roots — rows marked `[ ]`, not `[!]`.** The nested
@@ -25,21 +58,23 @@ If no `[ ]` blink roots exist, run `br blocked -t repo:blink`, report what's stu
 
 ## Step 2: Select Tasks
 
-Sort the unblocked blink roots by priority first (P0 > P1 > P2 > P3 > P4), then by type preference within the same priority level (bug > friction > feature > project > spec), then by leverage.
+Sort the unblocked roots by **priority → in-flight-project → type → leverage**. Priority is never overridden — a P0 bug still beats a P2 in-flight task.
 
-If `$ARGUMENTS` is provided, filter tasks whose title matches the argument (case-insensitive substring).
+If you're in repo-scoped mode and `$ARGUMENTS` was a keyword (matched no project in Step 0), filter tasks whose title matches the argument (case-insensitive substring).
 
-**Selection logic — priority, then type, then leverage:**
+**Selection logic — priority, then in-flight project, then type, then leverage:**
 
-1. Sort the unblocked roots by priority. Within the same priority, prefer: bug > friction > feature > project > spec (chore alongside bug).
-2. **Leverage tie-breaker:** within the same (priority, type) bucket, a root that unblocks more downstream work ranks higher. Count the blocked `[!]` descendants nested under each root in the graph; a root with downstream dependents outranks an equal-priority, equal-type leaf with none.
-3. Walk the sorted list and pick up to 5 tasks, applying type rules:
+1. Sort the unblocked roots by priority (P0 > P1 > P2 > P3 > P4).
+2. **In-flight tie-breaker:** within the same priority, prefer tasks belonging to an **in-flight project** (the Step 0 set) over those that don't — so `/next` finishes work it has already started rather than scattering across projects. In **project-scoped mode this tie-break is inert** (all candidates share the one project), so skip it.
+3. **Type preference:** within the same (priority, in-flight) bucket, prefer: bug > friction > feature > project > spec (chore alongside bug).
+4. **Leverage tie-breaker:** within the same (priority, in-flight, type) bucket, a root that unblocks more downstream work ranks higher. Count the blocked `[!]` descendants nested under each root in the graph; a root with downstream dependents outranks an equal leaf with none.
+5. Walk the sorted list and pick up to 5 tasks, applying type rules:
    - `type:bug` / `type:friction` — auto-start, no confirmation needed.
    - `type:feature` — requires confirmation before starting.
    - `type:project` — requires confirmation; pick at most 1 project.
    - `type:spec` — tell the user to run `/deliberate` for this item. Only work it directly if the user confirms.
    - `type:chore` - auto-start, no confirmation needed.
-4. YOU MUST NOT skip a higher-priority task just because of its type. A P2 spec should be surfaced before a P4 feature.
+6. YOU MUST NOT skip a higher-priority task just because of its type. A P2 spec should be surfaced before a P4 feature.
 
 ## Step 3: Route by Type
 
@@ -74,13 +109,20 @@ For each friction item:
 When working multiple features: use parallel agents with worktrees. Each agent gets one feature.
 
 ### type:project — Confirm first, single task
-1. Present the task to the user
-2. Break it down into subtasks with type tags
-3. `br add` each subtask with `-t repo:blink -t type:*`
-4. Add dependencies: `br dep add <blocker> <blocked>`
-5. Set priorities
-6. Report breakdown
-7. `br close <id>` or keep as tracker
+A `type:project` epic becomes a **first-class `br project`**, not a loose tag.
+
+1. Present the task to the user and confirm the breakdown.
+2. `br project add "<name>" -d "<desc>"` — derive a short kebab-case `<name>` from the epic
+   title. Capture the project **id** it returns.
+3. `br add` each subtask with `-t repo:blink -t type:* --project <id>`.
+4. Wire dependencies: `br dep add <blocker> <blocked>`.
+5. Set priorities on the subtasks.
+6. Keep the original `type:project` task as the tracker, **or** close it if the project fully
+   represents it (`br close <id>`) — operator's call.
+7. Report the breakdown and tell the user they can now run `/next <project-name>` to drain it.
+
+**Do not** use the legacy `project:X` *tag* for new work — assign tasks to the project with
+`--project <id>` instead.
 
 ### type:spec — Defer to /deliberate
 1. Tell user to run `/deliberate` for this item
