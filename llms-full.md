@@ -1,6 +1,6 @@
 # Blink Language Reference
 
-> Blink is a statically-typed, effect-tracked language compiling to C. **Compiler v0.51.0**.
+> Blink is a statically-typed, effect-tracked language compiling to C. **Compiler v0.52.0**.
 
 ## Install
 
@@ -12,7 +12,7 @@ docker pull ghcr.io/blinklang/blink:latest
 docker run --rm -v "$PWD":/workspace ghcr.io/blinklang/blink run myfile.bl
 ```
 
-Tags: `latest`, `0.51`, `0.51.0` (semver). Image is `debian:bookworm-slim` with `gcc`, `zig`, `blink`, and `libgc-dev`.
+Tags: `latest`, `0.52`, `0.52.0` (semver). Image is `debian:bookworm-slim` with `gcc`, `zig`, `blink`, and `libgc-dev`.
 
 ## Recent Changes
 
@@ -230,6 +230,7 @@ test "addition works" {
 | Set[T] | `Set()` | Hash set (construct with `Set()`) |
 | Option[T] | `Some(v)`, `None` | Nullable value |
 | Result[T, E] | `Ok(v)`, `Err(e)` | Error-or-value |
+| Ordering | `Less`, `Equal`, `Greater` | Result of `.cmp(other)`; prelude enum auto-imported via `std.traits`. Produced by `@derive(Ord)` and the ordering operators. |
 | Bytes | `Bytes.new()` | Byte buffer |
 | StringBuilder | `StringBuilder.new()` | Mutable string builder |
 | Instant | `time.read()` | Point in time |
@@ -309,7 +310,7 @@ let nested = ##"contains #"inner"#"##   // depth-2 nesting
 | Op | Types | Notes |
 |----|-------|-------|
 | `+` `-` `*` `/` `%` | Int, Float | Arithmetic (NO `+` on Str) |
-| `==` `!=` `<` `>` `<=` `>=` | Int, Float, Str | Comparison |
+| `==` `!=` `<` `>` `<=` `>=` | Int, Float, Str, `Instant`/`Duration`, `Bytes`, and any struct/enum with `@derive(Eq)` (for `==`/`!=`) or `@derive(Ord)` (for ordering) | Comparison. Operands are type-checked (`E0300` on mismatched/unordered types); struct/enum comparisons desugar to derived `eq`/`cmp`. |
 | `&&` `\|\|` `!` | Bool | Logical |
 | `?` | Result[T,E] | Propagate error — enclosing fn must return Result |
 | `??` | Option[T] | Unwrap or default |
@@ -807,7 +808,7 @@ Selective imports (`import mod.{a, b}`) restrict which *unqualified* items are v
 |------------|--------|---------|
 | `@module(name)` | module | Module declaration |
 | `@capabilities(...)` | module | Effect ceiling |
-| `@derive(...)` | type | Auto-generate traits. Accepted names: `Serialize`, `Deserialize`, `Eq`, `Clone`, `Hash`, `Debug`. Unknown names rejected as `E1112 UnknownDerive`. |
+| `@derive(...)` | type | Auto-generate traits. Accepted names: `Serialize`, `Deserialize`, `Eq`, `Ord`, `Clone`, `Hash`, `Debug`. `Ord` synthesizes a lexicographic `.cmp(other) -> Ordering` and auto-includes `Eq` (`Ord: Eq`); enables `<`/`>`/`<=`/`>=`. Unknown names rejected as `E1112 UnknownDerive`. |
 | `@src(req)` | fn | Requirement traceability |
 | `@requires(expr)` | fn | Precondition |
 | `@ensures(expr)` | fn | Postcondition runtime-checked at every return (`result` = return value). Inside the predicate, `old(arg)` snapshots an argument's value at fn entry. |
