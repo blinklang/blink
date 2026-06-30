@@ -28,8 +28,13 @@ import parser.{
     node_count, node_kind, node_name, node_params, node_args, node_type_name,
     node_type_ann, node_elements, node_return_type, node_line,
     node_is_pub, node_str_val,
+    node_obj, node_method, node_value, node_stmts, node_body,
+    node_condition, node_then_body, node_else_body, node_scrutinee,
+    node_arms, node_guard, node_target, node_iterable, node_left,
+    node_right, node_index, node_fields, node_handlers, node_start, node_end,
     sublist_length, sublist_get, get_annotation,
 }
+import ast.{NodeKind}
 import typecheck.{TypeCheck, check_types}
 import compiler.{
     compile_to_program, reset_compiler_state, resolve_module_path,
@@ -1392,11 +1397,212 @@ fn ffi_extract_trusted_info(fn_node: Int) -> Str {
     result
 }
 
+// Recursively walk an AST subtree and record every `Bytes.with_ptr` call site
+// (line number) into `out_lines`. This is the `byte-pin` subcategory of the
+// `bytes-bridge` audit category (spec §9.1.3.3) — the libc.*_bytes family's
+// raw-byte FFI crossings, both read-side and write-side pins. The audit is a
+// reporting tool, not a type checker, so a `with_ptr` method name match is the
+// detection condition (mirrors typecheck.bl's syntactic with_ptr handling).
+// Like the rest of the compiler's AST passes this is a hand-rolled descent (no
+// generic visitor exists); it covers every node kind that can hold a MethodCall
+// in its subtree — blocks, match arms, if/else, loops, closures, with-blocks
+// and their resource expressions, named/spread args, ranges, await, nested
+// calls. NOTE: do_ffi_audit only feeds it top-level fn bodies (matching the
+// @ffi loop's scope), so with_ptr inside impl methods / test blocks / top-level
+// let initializers is not yet reached (follow-up).
+fn collect_byte_pin_sites(node: Int, out_lines: List[Int]) {
+    if node == -1 { return }
+    let kind = node_kind(node)
+
+    if kind == NodeKind.MethodCall {
+        if node_method(node) == "with_ptr" {
+            out_lines.push(node_line(node))
+        }
+        let mc_obj = node_obj(node)
+        if mc_obj != -1 { collect_byte_pin_sites(mc_obj, out_lines) }
+        let args_sl = node_args(node)
+        if args_sl != -1 {
+            let mut i = 0
+            while i < sublist_length(args_sl) {
+                collect_byte_pin_sites(sublist_get(args_sl, i), out_lines)
+                i = i + 1
+            }
+        }
+        return
+    }
+
+    if kind == NodeKind.Call {
+        let cobj = node_obj(node)
+        if cobj != -1 { collect_byte_pin_sites(cobj, out_lines) }
+        let args_sl = node_args(node)
+        if args_sl != -1 {
+            let mut i = 0
+            while i < sublist_length(args_sl) {
+                collect_byte_pin_sites(sublist_get(args_sl, i), out_lines)
+                i = i + 1
+            }
+        }
+        return
+    }
+
+    if kind == NodeKind.Block {
+        let stmts_sl = node_stmts(node)
+        if stmts_sl != -1 {
+            let mut i = 0
+            while i < sublist_length(stmts_sl) {
+                collect_byte_pin_sites(sublist_get(stmts_sl, i), out_lines)
+                i = i + 1
+            }
+        }
+        return
+    }
+
+    if kind == NodeKind.LetBinding {
+        collect_byte_pin_sites(node_value(node), out_lines)
+        return
+    }
+
+    if kind == NodeKind.ExprStmt {
+        collect_byte_pin_sites(node_value(node), out_lines)
+        return
+    }
+
+    if kind == NodeKind.Assignment || kind == NodeKind.CompoundAssign {
+        collect_byte_pin_sites(node_target(node), out_lines)
+        collect_byte_pin_sites(node_value(node), out_lines)
+        return
+    }
+
+    if kind == NodeKind.Return {
+        collect_byte_pin_sites(node_value(node), out_lines)
+        return
+    }
+
+    if kind == NodeKind.IfExpr {
+        collect_byte_pin_sites(node_condition(node), out_lines)
+        collect_byte_pin_sites(node_then_body(node), out_lines)
+        collect_byte_pin_sites(node_else_body(node), out_lines)
+        return
+    }
+
+    if kind == NodeKind.MatchExpr {
+        collect_byte_pin_sites(node_scrutinee(node), out_lines)
+        let arms_sl = node_arms(node)
+        if arms_sl != -1 {
+            let mut i = 0
+            while i < sublist_length(arms_sl) {
+                let arm = sublist_get(arms_sl, i)
+                collect_byte_pin_sites(node_guard(arm), out_lines)
+                collect_byte_pin_sites(node_body(arm), out_lines)
+                i = i + 1
+            }
+        }
+        return
+    }
+
+    if kind == NodeKind.WhileLoop {
+        collect_byte_pin_sites(node_condition(node), out_lines)
+        collect_byte_pin_sites(node_body(node), out_lines)
+        return
+    }
+
+    if kind == NodeKind.LoopExpr || kind == NodeKind.AsyncScope || kind == NodeKind.AssertPanics {
+        collect_byte_pin_sites(node_body(node), out_lines)
+        return
+    }
+
+    if kind == NodeKind.ForIn {
+        collect_byte_pin_sites(node_iterable(node), out_lines)
+        collect_byte_pin_sites(node_body(node), out_lines)
+        return
+    }
+
+    if kind == NodeKind.AwaitExpr {
+        collect_byte_pin_sites(node_obj(node), out_lines)
+        return
+    }
+
+    if kind == NodeKind.NamedArg || kind == NodeKind.SpreadExpr {
+        collect_byte_pin_sites(node_value(node), out_lines)
+        return
+    }
+
+    if kind == NodeKind.RangeLit {
+        collect_byte_pin_sites(node_start(node), out_lines)
+        collect_byte_pin_sites(node_end(node), out_lines)
+        return
+    }
+
+    if kind == NodeKind.WithBlock {
+        let handlers_sl = node_handlers(node)
+        if handlers_sl != -1 {
+            let mut i = 0
+            while i < sublist_length(handlers_sl) {
+                collect_byte_pin_sites(sublist_get(handlers_sl, i), out_lines)
+                i = i + 1
+            }
+        }
+        collect_byte_pin_sites(node_body(node), out_lines)
+        return
+    }
+
+    if kind == NodeKind.WithResource {
+        collect_byte_pin_sites(node_value(node), out_lines)
+        return
+    }
+
+    if kind == NodeKind.BinOp {
+        collect_byte_pin_sites(node_left(node), out_lines)
+        collect_byte_pin_sites(node_right(node), out_lines)
+        return
+    }
+
+    if kind == NodeKind.UnaryOp {
+        collect_byte_pin_sites(node_value(node), out_lines)
+        return
+    }
+
+    if kind == NodeKind.FieldAccess || kind == NodeKind.IndexExpr {
+        collect_byte_pin_sites(node_obj(node), out_lines)
+        collect_byte_pin_sites(node_index(node), out_lines)
+        return
+    }
+
+    if kind == NodeKind.TupleLit || kind == NodeKind.ListLit || kind == NodeKind.InterpString {
+        let elems_sl = node_elements(node)
+        if elems_sl != -1 {
+            let mut i = 0
+            while i < sublist_length(elems_sl) {
+                collect_byte_pin_sites(sublist_get(elems_sl, i), out_lines)
+                i = i + 1
+            }
+        }
+        return
+    }
+
+    if kind == NodeKind.StructLit {
+        let fields_sl = node_fields(node)
+        if fields_sl != -1 {
+            let mut i = 0
+            while i < sublist_length(fields_sl) {
+                collect_byte_pin_sites(node_value(sublist_get(fields_sl, i)), out_lines)
+                i = i + 1
+            }
+        }
+        return
+    }
+
+    if kind == NodeKind.Closure {
+        collect_byte_pin_sites(node_body(node), out_lines)
+        return
+    }
+}
+
 fn do_ffi_audit(program: Int, json_output: Int) {
     let fns_sl = node_params(program)
     if fns_sl == -1 {
         if json_output != 0 {
-            io.println("\{\"ffi_functions\":[],\"summary\":\{\"total\":0,\"audited\":0,\"unaudited\":0,\"ptr_params\":0,\"ptr_returns\":0}}")
+            io.println("\{\"ffi_functions\":[],\"bytes_bridge\":\{\"byte-pin\":[]},\"summary\":\{\"total\":0,\"audited\":0,\"unaudited\":0,\"ptr_params\":0,\"ptr_returns\":0,\"byte_pin\":0}}")
         } else {
             io.println("No FFI functions found.")
         }
@@ -1467,6 +1673,18 @@ fn do_ffi_audit(program: Int, json_output: Int) {
     let total = names.len()
     let unaudited = total - audited
 
+    // bytes-bridge / byte-pin subcategory: walk every fn body for Bytes.with_ptr
+    // crossings. The flat @ffi loop above only inspects top-level fn signatures;
+    // with_ptr sites are MethodCalls inside bodies, so a recursive descent is
+    // required. (bridge-call / buf-mention subcategories are not yet implemented;
+    // the JSON object is keyed by subcategory so they can slot in additively.)
+    let mut byte_pin_lines: List[Int] = []
+    let mut bp = 0
+    while bp < sublist_length(fns_sl) {
+        collect_byte_pin_sites(node_body(sublist_get(fns_sl, bp)), byte_pin_lines)
+        bp = bp + 1
+    }
+
     if json_output != 0 {
         let mut out = "\{\"ffi_functions\":["
         let mut k = 0
@@ -1498,7 +1716,17 @@ fn do_ffi_audit(program: Int, json_output: Int) {
             out = out.concat(",\"file\":\"{file}\",\"line\":{line}}")
             k = k + 1
         }
-        out = out.concat("],\"summary\":\{\"total\":{total},\"audited\":{audited},\"unaudited\":{unaudited},\"ptr_params\":{ptr_param_count},\"ptr_returns\":{ptr_ret_count}}}")
+        out = out.concat("],\"bytes_bridge\":\{\"byte-pin\":[")
+        let mut bpj = 0
+        while bpj < byte_pin_lines.len() {
+            if bpj > 0 {
+                out = out.concat(",")
+            }
+            let bline = byte_pin_lines.get(bpj).unwrap()
+            out = out.concat("\{\"file\":\"{diag_source_file}\",\"line\":{bline}}")
+            bpj = bpj + 1
+        }
+        out = out.concat("]},\"summary\":\{\"total\":{total},\"audited\":{audited},\"unaudited\":{unaudited},\"ptr_params\":{ptr_param_count},\"ptr_returns\":{ptr_ret_count},\"byte_pin\":{byte_pin_lines.len()}}}")
         io.println(out)
     } else {
         if total == 0 {
@@ -1538,6 +1766,17 @@ fn do_ffi_audit(program: Int, json_output: Int) {
         io.println("Summary: {total} FFI function(s), {audited} audited, {unaudited} unaudited")
         if ptr_param_count > 0 || ptr_ret_count > 0 {
             io.println("Pointers: {ptr_param_count} with ptr params, {ptr_ret_count} with ptr returns")
+        }
+        if byte_pin_lines.len() > 0 {
+            io.println("")
+            io.println("bytes-bridge")
+            io.println("============")
+            let mut bph = 0
+            while bph < byte_pin_lines.len() {
+                let bline = byte_pin_lines.get(bph).unwrap()
+                io.println("  byte-pin: {diag_source_file}:{bline}")
+                bph = bph + 1
+            }
         }
     }
 }

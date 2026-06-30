@@ -1,0 +1,113 @@
+import compile_test_helpers
+
+// A fixture with an @ffi function and two Bytes.with_ptr crossings: one
+// read-side (a fresh Bytes.zeroed buffer pinned for a fill) and one
+// write-side (an existing Bytes pinned read-only).
+fn fixture_two_pins() -> Str {
+    #"@ffi("c", "do_io")
+fn c_io(p: Ptr[U8], n: U64) -> I64
+
+fn read_side(n: Int) -> Int {
+    let buf = Bytes.zeroed(n)
+    let rc = buf.with_ptr(fn(p) -> I64 { c_io(p, n.to_u64()) })
+    rc.to_int()
+}
+
+fn write_side(data: Bytes) -> Int {
+    let rc = data.with_ptr(fn(p) -> I64 { c_io(p, data.len().to_u64()) })
+    rc.to_int()
+}
+
+fn main() {
+    let _ = read_side(8)
+}
+"#
+}
+
+// A with_ptr nested inside a match arm, to prove the collector descends
+// through control flow (not just top-level let statements).
+fn fixture_nested_pin() -> Str {
+    #"@ffi("c", "do_io")
+fn c_io(p: Ptr[U8], n: U64) -> I64
+
+fn maybe(flag: Int, data: Bytes) -> Int {
+    let rc = match flag {
+        0 => 0
+        _ => data.with_ptr(fn(p) -> I64 { c_io(p, data.len().to_u64()) })
+    }
+    rc.to_int()
+}
+
+fn main() {
+    let _ = maybe(1, Bytes.zeroed(4))
+}
+"#
+}
+
+// A with_ptr inside a loop body, to prove the collector descends into
+// LoopExpr (a gap the initial nogrow_scan-modeled traversal missed).
+fn fixture_loop_pin() -> Str {
+    #"@ffi("c", "do_io")
+fn c_io(p: Ptr[U8], n: U64) -> I64
+
+fn drain(data: Bytes) -> Int {
+    let mut total = 0
+    loop {
+        let rc = data.with_ptr(fn(p) -> I64 { c_io(p, data.len().to_u64()) })
+        total = total + rc.to_int()
+        break
+    }
+    total
+}
+
+fn main() {
+    let _ = drain(Bytes.zeroed(4))
+}
+"#
+}
+
+fn fixture_no_pin() -> Str {
+    #"@ffi("c", "do_io")
+fn c_io(p: Ptr[U8], n: U64) -> I64
+
+fn main() {
+    io.println("no pins here")
+}
+"#
+}
+
+test "audit --ffi --json reports byte-pin sites under bytes-bridge" {
+    let out = compile_test_helpers.audit_ffi_via_cli(fixture_two_pins(), "byte_pin_json", 1)
+    assert(out.contains("bytes_bridge"))
+    assert(out.contains("byte-pin"))
+    // Two with_ptr crossings -> two byte-pin entries.
+    let first = out.contains("\"line\":6")
+    let second = out.contains("\"line\":11")
+    assert(first)
+    assert(second)
+}
+
+test "audit --ffi human output shows bytes-bridge byte-pin section" {
+    let out = compile_test_helpers.audit_ffi_via_cli(fixture_two_pins(), "byte_pin_human", 0)
+    assert(out.contains("bytes-bridge"))
+    assert(out.contains("byte-pin:"))
+}
+
+test "audit --ffi descends into match arms to find nested byte-pin" {
+    let out = compile_test_helpers.audit_ffi_via_cli(fixture_nested_pin(), "byte_pin_nested", 1)
+    assert(out.contains("byte-pin"))
+    assert(out.contains("\"line\":7"))
+}
+
+test "audit --ffi descends into loop bodies to find nested byte-pin" {
+    let out = compile_test_helpers.audit_ffi_via_cli(fixture_loop_pin(), "byte_pin_loop", 1)
+    assert(out.contains("byte-pin"))
+    assert(out.contains("\"line\":7"))
+}
+
+test "audit --ffi reports no byte-pin when there are no with_ptr sites" {
+    let out = compile_test_helpers.audit_ffi_via_cli(fixture_no_pin(), "byte_pin_none", 1)
+    // The bytes_bridge object is present but its byte-pin list is empty.
+    assert(out.contains("bytes_bridge"))
+    assert(out.contains("\"byte-pin\":[]"))
+}
