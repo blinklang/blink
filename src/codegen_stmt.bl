@@ -704,6 +704,16 @@ pub fn emit_match_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scop
                 set_list_elem_struct(scrut_tmp, lstruct)
             }
             match_scruts.push(MatchScrutEntry { str_val: scrut_tmp, scrut_type: CT_LIST })
+        } else if expr_result_type == CT_STRING {
+            // Bind a string scrutinee to a temp so each arm's condition
+            // (blink_str_eq({scrut}, "x")) re-reads a variable instead of
+            // re-embedding the scrutinee expression. An interpolated string
+            // lowers to a side-effecting blink_str_format(...) call, so without
+            // this its interpolants would run once per arm tested.
+            let scrut_tmp = fresh_temp("_scrut_")
+            emit_line("const char* {scrut_tmp} = {expr_result_str};")
+            set_var(scrut_tmp, CT_STRING, 1)
+            match_scruts.push(MatchScrutEntry { str_val: scrut_tmp, scrut_type: CT_STRING })
         } else {
             match_scruts.push(MatchScrutEntry { str_val: expr_result_str, scrut_type: expr_result_type })
         }
@@ -6523,7 +6533,13 @@ pub fn emit_top_level_let(node: Int, extern_only: Int) ! Codegen.Emit, Codegen.R
     }
     let saved_lines = cg_lines
     cg_lines = []
+    // Thread the binding's type annotation so constructors that key off it
+    // (e.g. `Map()` choosing key-ops) see Map[K, V] instead of defaulting to
+    // string key-ops — mirrors emit_let_binding for local bindings.
+    let saved_let_target_ann = cg_let_target_ann
+    cg_let_target_ann = node_target(node)
     emit_expr(node_value(node))
+    cg_let_target_ann = saved_let_target_ann
     let val_str = expr_result_str
     let val_type = expr_result_type
     let helper_lines = cg_lines

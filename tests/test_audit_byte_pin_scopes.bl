@@ -1,0 +1,86 @@
+import compile_test_helpers
+
+// Bug f7svnd: `audit --ffi` byte-pin collection walked only top-level fn
+// bodies (node_params). with_ptr crossings living in impl methods, test
+// blocks, or top-level let initializers were invisible. These fixtures place
+// exactly one `Bytes.with_ptr(fn(p) { p.addr() })` pin in each of those three
+// scopes and assert it is reported.
+//
+// Assertions check the summary count `"byte_pin":1` and the precise byte-pin
+// entry tuple `{"file":"<path>","line":N}`. A bare `"line":N` substring is NOT
+// collision-proof: `audit --ffi` dumps the whole prelude (70+ FFI fns), so an
+// unrelated prelude line happens to match almost any N. The summary count and
+// the file+line tuple (the file path is the fixture the helper wrote) pin the
+// assertion to the fixture's own pin. With the bug present the count is 0 and
+// the array is empty, so both assertions fail (red).
+
+// (A) with_ptr inside an impl method body. Pin is on line 10.
+fn fixture_impl_method_pin() -> Str {
+    #"@ffi("c", "do_io")
+fn c_io(p: Ptr[U8], n: U64) -> I64
+
+type Holder {
+    data: Bytes
+}
+
+impl Holder {
+    fn pin(self) -> Int {
+        let addr = self.data.with_ptr(fn(p) { p.addr() })
+        addr
+    }
+}
+
+fn main() {
+    let h = Holder { data: Bytes.zeroed(4) }
+    let _ = h.pin()
+}
+"#
+}
+
+// (B) with_ptr inside a test block body. Pin is on line 10.
+fn fixture_test_block_pin() -> Str {
+    #"@ffi("c", "do_io")
+fn c_io(p: Ptr[U8], n: U64) -> I64
+
+fn main() {
+    io.println("main")
+}
+
+test "pins a buffer for FFI" {
+    let b = Bytes.zeroed(4)
+    let addr = b.with_ptr(fn(p) { p.addr() })
+    assert(addr != 0)
+}
+"#
+}
+
+// (C) with_ptr inside a top-level let initializer. Pin is on line 4.
+fn fixture_top_level_let_pin() -> Str {
+    #"@ffi("c", "do_io")
+fn c_io(p: Ptr[U8], n: U64) -> I64
+
+let pinned_addr: Int = Bytes.zeroed(4).with_ptr(fn(p) { p.addr() })
+
+fn main() {
+    io.println("addr is {pinned_addr}")
+}
+"#
+}
+
+test "audit --ffi finds byte-pin inside impl method body" {
+    let out = compile_test_helpers.audit_ffi_via_cli(fixture_impl_method_pin(), "byte_pin_impl", 1)
+    assert(out.contains("\"byte_pin\":1"))
+    assert(out.contains("\{\"file\":\".tmp/_audit_byte_pin_impl.bl\",\"line\":10}"))
+}
+
+test "audit --ffi finds byte-pin inside test block body" {
+    let out = compile_test_helpers.audit_ffi_via_cli(fixture_test_block_pin(), "byte_pin_testblock", 1)
+    assert(out.contains("\"byte_pin\":1"))
+    assert(out.contains("\{\"file\":\".tmp/_audit_byte_pin_testblock.bl\",\"line\":10}"))
+}
+
+test "audit --ffi finds byte-pin inside top-level let initializer" {
+    let out = compile_test_helpers.audit_ffi_via_cli(fixture_top_level_let_pin(), "byte_pin_toplevel_let", 1)
+    assert(out.contains("\"byte_pin\":1"))
+    assert(out.contains("\{\"file\":\".tmp/_audit_byte_pin_toplevel_let.bl\",\"line\":4}"))
+}

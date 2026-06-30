@@ -32,6 +32,7 @@ import parser.{
     node_condition, node_then_body, node_else_body, node_scrutinee,
     node_arms, node_guard, node_target, node_iterable, node_left,
     node_right, node_index, node_fields, node_handlers, node_start, node_end,
+    node_methods, node_captures,
     sublist_length, sublist_get, get_annotation,
 }
 import ast.{NodeKind}
@@ -61,7 +62,7 @@ import symbol_index.{collect_effects, si_build, si_reset}
 import query.{query_filtered_layer}
 import diagnostics.{
     Diag, diag_count, diag_warn_count, diag_ice_count, diag_flush, diag_reset,
-    diag_source_file, diag_error_no_loc, diag_format, diag_explain,
+    diag_source_file, diag_file_for_node, diag_error_no_loc, diag_format, diag_explain,
     embedded_inner_key,
     MISSING_NATIVE_DEP, NATIVE_DEP_UNAVAILABLE_CROSS, INCOMPATIBLE_STDLIB_ARCHIVE,
 }
@@ -1407,24 +1408,27 @@ fn ffi_extract_trusted_info(fn_node: Int) -> Str {
 // generic visitor exists); it covers every node kind that can hold a MethodCall
 // in its subtree — blocks, match arms, if/else, loops, closures, with-blocks
 // and their resource expressions, named/spread args, ranges, await, nested
-// calls. NOTE: do_ffi_audit only feeds it top-level fn bodies (matching the
-// @ffi loop's scope), so with_ptr inside impl methods / test blocks / top-level
-// let initializers is not yet reached (follow-up).
-fn collect_byte_pin_sites(node: Int, out_lines: List[Int]) {
+// calls. `file` is the source path the enclosing body was parsed from (resolved
+// per-node by the driver via diag_file_for_node so multi-file programs attribute
+// each pin to its own file); it is pushed onto `out_files` in lockstep with
+// `out_lines` at every with_ptr hit. do_ffi_audit feeds this every body the
+// Program node holds (top-level fns, impl methods, test blocks, top-level lets).
+fn collect_byte_pin_sites(node: Int, file: Str, out_lines: List[Int], out_files: List[Str]) {
     if node == -1 { return }
     let kind = node_kind(node)
 
     if kind == NodeKind.MethodCall {
         if node_method(node) == "with_ptr" {
             out_lines.push(node_line(node))
+            out_files.push(file)
         }
         let mc_obj = node_obj(node)
-        if mc_obj != -1 { collect_byte_pin_sites(mc_obj, out_lines) }
+        if mc_obj != -1 { collect_byte_pin_sites(mc_obj, file, out_lines, out_files) }
         let args_sl = node_args(node)
         if args_sl != -1 {
             let mut i = 0
             while i < sublist_length(args_sl) {
-                collect_byte_pin_sites(sublist_get(args_sl, i), out_lines)
+                collect_byte_pin_sites(sublist_get(args_sl, i), file, out_lines, out_files)
                 i = i + 1
             }
         }
@@ -1433,12 +1437,12 @@ fn collect_byte_pin_sites(node: Int, out_lines: List[Int]) {
 
     if kind == NodeKind.Call {
         let cobj = node_obj(node)
-        if cobj != -1 { collect_byte_pin_sites(cobj, out_lines) }
+        if cobj != -1 { collect_byte_pin_sites(cobj, file, out_lines, out_files) }
         let args_sl = node_args(node)
         if args_sl != -1 {
             let mut i = 0
             while i < sublist_length(args_sl) {
-                collect_byte_pin_sites(sublist_get(args_sl, i), out_lines)
+                collect_byte_pin_sites(sublist_get(args_sl, i), file, out_lines, out_files)
                 i = i + 1
             }
         }
@@ -1450,7 +1454,7 @@ fn collect_byte_pin_sites(node: Int, out_lines: List[Int]) {
         if stmts_sl != -1 {
             let mut i = 0
             while i < sublist_length(stmts_sl) {
-                collect_byte_pin_sites(sublist_get(stmts_sl, i), out_lines)
+                collect_byte_pin_sites(sublist_get(stmts_sl, i), file, out_lines, out_files)
                 i = i + 1
             }
         }
@@ -1458,42 +1462,42 @@ fn collect_byte_pin_sites(node: Int, out_lines: List[Int]) {
     }
 
     if kind == NodeKind.LetBinding {
-        collect_byte_pin_sites(node_value(node), out_lines)
+        collect_byte_pin_sites(node_value(node), file, out_lines, out_files)
         return
     }
 
     if kind == NodeKind.ExprStmt {
-        collect_byte_pin_sites(node_value(node), out_lines)
+        collect_byte_pin_sites(node_value(node), file, out_lines, out_files)
         return
     }
 
     if kind == NodeKind.Assignment || kind == NodeKind.CompoundAssign {
-        collect_byte_pin_sites(node_target(node), out_lines)
-        collect_byte_pin_sites(node_value(node), out_lines)
+        collect_byte_pin_sites(node_target(node), file, out_lines, out_files)
+        collect_byte_pin_sites(node_value(node), file, out_lines, out_files)
         return
     }
 
     if kind == NodeKind.Return {
-        collect_byte_pin_sites(node_value(node), out_lines)
+        collect_byte_pin_sites(node_value(node), file, out_lines, out_files)
         return
     }
 
     if kind == NodeKind.IfExpr {
-        collect_byte_pin_sites(node_condition(node), out_lines)
-        collect_byte_pin_sites(node_then_body(node), out_lines)
-        collect_byte_pin_sites(node_else_body(node), out_lines)
+        collect_byte_pin_sites(node_condition(node), file, out_lines, out_files)
+        collect_byte_pin_sites(node_then_body(node), file, out_lines, out_files)
+        collect_byte_pin_sites(node_else_body(node), file, out_lines, out_files)
         return
     }
 
     if kind == NodeKind.MatchExpr {
-        collect_byte_pin_sites(node_scrutinee(node), out_lines)
+        collect_byte_pin_sites(node_scrutinee(node), file, out_lines, out_files)
         let arms_sl = node_arms(node)
         if arms_sl != -1 {
             let mut i = 0
             while i < sublist_length(arms_sl) {
                 let arm = sublist_get(arms_sl, i)
-                collect_byte_pin_sites(node_guard(arm), out_lines)
-                collect_byte_pin_sites(node_body(arm), out_lines)
+                collect_byte_pin_sites(node_guard(arm), file, out_lines, out_files)
+                collect_byte_pin_sites(node_body(arm), file, out_lines, out_files)
                 i = i + 1
             }
         }
@@ -1501,35 +1505,35 @@ fn collect_byte_pin_sites(node: Int, out_lines: List[Int]) {
     }
 
     if kind == NodeKind.WhileLoop {
-        collect_byte_pin_sites(node_condition(node), out_lines)
-        collect_byte_pin_sites(node_body(node), out_lines)
+        collect_byte_pin_sites(node_condition(node), file, out_lines, out_files)
+        collect_byte_pin_sites(node_body(node), file, out_lines, out_files)
         return
     }
 
     if kind == NodeKind.LoopExpr || kind == NodeKind.AsyncScope || kind == NodeKind.AssertPanics {
-        collect_byte_pin_sites(node_body(node), out_lines)
+        collect_byte_pin_sites(node_body(node), file, out_lines, out_files)
         return
     }
 
     if kind == NodeKind.ForIn {
-        collect_byte_pin_sites(node_iterable(node), out_lines)
-        collect_byte_pin_sites(node_body(node), out_lines)
+        collect_byte_pin_sites(node_iterable(node), file, out_lines, out_files)
+        collect_byte_pin_sites(node_body(node), file, out_lines, out_files)
         return
     }
 
     if kind == NodeKind.AwaitExpr {
-        collect_byte_pin_sites(node_obj(node), out_lines)
+        collect_byte_pin_sites(node_obj(node), file, out_lines, out_files)
         return
     }
 
     if kind == NodeKind.NamedArg || kind == NodeKind.SpreadExpr {
-        collect_byte_pin_sites(node_value(node), out_lines)
+        collect_byte_pin_sites(node_value(node), file, out_lines, out_files)
         return
     }
 
     if kind == NodeKind.RangeLit {
-        collect_byte_pin_sites(node_start(node), out_lines)
-        collect_byte_pin_sites(node_end(node), out_lines)
+        collect_byte_pin_sites(node_start(node), file, out_lines, out_files)
+        collect_byte_pin_sites(node_end(node), file, out_lines, out_files)
         return
     }
 
@@ -1538,33 +1542,33 @@ fn collect_byte_pin_sites(node: Int, out_lines: List[Int]) {
         if handlers_sl != -1 {
             let mut i = 0
             while i < sublist_length(handlers_sl) {
-                collect_byte_pin_sites(sublist_get(handlers_sl, i), out_lines)
+                collect_byte_pin_sites(sublist_get(handlers_sl, i), file, out_lines, out_files)
                 i = i + 1
             }
         }
-        collect_byte_pin_sites(node_body(node), out_lines)
+        collect_byte_pin_sites(node_body(node), file, out_lines, out_files)
         return
     }
 
     if kind == NodeKind.WithResource {
-        collect_byte_pin_sites(node_value(node), out_lines)
+        collect_byte_pin_sites(node_value(node), file, out_lines, out_files)
         return
     }
 
     if kind == NodeKind.BinOp {
-        collect_byte_pin_sites(node_left(node), out_lines)
-        collect_byte_pin_sites(node_right(node), out_lines)
+        collect_byte_pin_sites(node_left(node), file, out_lines, out_files)
+        collect_byte_pin_sites(node_right(node), file, out_lines, out_files)
         return
     }
 
     if kind == NodeKind.UnaryOp {
-        collect_byte_pin_sites(node_value(node), out_lines)
+        collect_byte_pin_sites(node_value(node), file, out_lines, out_files)
         return
     }
 
     if kind == NodeKind.FieldAccess || kind == NodeKind.IndexExpr {
-        collect_byte_pin_sites(node_obj(node), out_lines)
-        collect_byte_pin_sites(node_index(node), out_lines)
+        collect_byte_pin_sites(node_obj(node), file, out_lines, out_files)
+        collect_byte_pin_sites(node_index(node), file, out_lines, out_files)
         return
     }
 
@@ -1573,7 +1577,7 @@ fn collect_byte_pin_sites(node: Int, out_lines: List[Int]) {
         if elems_sl != -1 {
             let mut i = 0
             while i < sublist_length(elems_sl) {
-                collect_byte_pin_sites(sublist_get(elems_sl, i), out_lines)
+                collect_byte_pin_sites(sublist_get(elems_sl, i), file, out_lines, out_files)
                 i = i + 1
             }
         }
@@ -1585,7 +1589,7 @@ fn collect_byte_pin_sites(node: Int, out_lines: List[Int]) {
         if fields_sl != -1 {
             let mut i = 0
             while i < sublist_length(fields_sl) {
-                collect_byte_pin_sites(node_value(sublist_get(fields_sl, i)), out_lines)
+                collect_byte_pin_sites(node_value(sublist_get(fields_sl, i)), file, out_lines, out_files)
                 i = i + 1
             }
         }
@@ -1593,7 +1597,7 @@ fn collect_byte_pin_sites(node: Int, out_lines: List[Int]) {
     }
 
     if kind == NodeKind.Closure {
-        collect_byte_pin_sites(node_body(node), out_lines)
+        collect_byte_pin_sites(node_body(node), file, out_lines, out_files)
         return
     }
 }
@@ -1622,6 +1626,10 @@ fn do_ffi_audit(program: Int, json_output: Int) {
     let mut ptr_param_count = 0
     let mut ptr_ret_count = 0
 
+    // @ffi DISCOVERY is intentionally top-level-only: validate_ffi_fn (typecheck)
+    // and codegen lower @ffi over top-level fns alone — no path lowers @ffi on an
+    // impl method — so widening discovery here would report fns that never
+    // typecheck. Only byte-pin COLLECTION is widened (below) to all body scopes.
     let mut i = 0
     while i < sublist_length(fns_sl) {
         let fn_node = sublist_get(fns_sl, i)
@@ -1630,7 +1638,7 @@ fn do_ffi_audit(program: Int, json_output: Int) {
             let fn_name = node_name(fn_node)
             names.push(fn_name)
             lines.push(node_line(fn_node))
-            files.push(diag_source_file)
+            files.push(diag_file_for_node(fn_node))
 
             let ffi_args_sl = node_args(ffi_ann)
             let mut lib = ""
@@ -1673,16 +1681,74 @@ fn do_ffi_audit(program: Int, json_output: Int) {
     let total = names.len()
     let unaudited = total - audited
 
-    // bytes-bridge / byte-pin subcategory: walk every fn body for Bytes.with_ptr
-    // crossings. The flat @ffi loop above only inspects top-level fn signatures;
-    // with_ptr sites are MethodCalls inside bodies, so a recursive descent is
-    // required. (bridge-call / buf-mention subcategories are not yet implemented;
-    // the JSON object is keyed by subcategory so they can slot in additively.)
+    // bytes-bridge / byte-pin subcategory: walk every body the Program node holds
+    // for Bytes.with_ptr crossings. The flat @ffi loop above only inspects
+    // top-level fn signatures; with_ptr sites are MethodCalls inside bodies, so a
+    // recursive descent is required. A with_ptr pin can live in any body — a
+    // top-level fn, an impl method, a test block, or a top-level let initializer
+    // — so all four Program sublists are walked. Each pin's file is resolved
+    // per-node via diag_file_for_node so multi-file programs attribute pins to
+    // their own source file (not the last-parsed diag_source_file). (bridge-call /
+    // buf-mention subcategories are not yet implemented; the JSON object is keyed
+    // by subcategory so they can slot in additively.)
     let mut byte_pin_lines: List[Int] = []
+    let mut byte_pin_files: List[Str] = []
+
+    // top-level fn bodies
     let mut bp = 0
     while bp < sublist_length(fns_sl) {
-        collect_byte_pin_sites(node_body(sublist_get(fns_sl, bp)), byte_pin_lines)
+        let fnode = sublist_get(fns_sl, bp)
+        collect_byte_pin_sites(node_body(fnode), diag_file_for_node(fnode), byte_pin_lines, byte_pin_files)
         bp = bp + 1
+    }
+
+    // impl-method bodies (node_methods(program) -> each impl's node_methods)
+    let impls_sl = node_methods(program)
+    if impls_sl != -1 {
+        let mut ii = 0
+        while ii < sublist_length(impls_sl) {
+            let im = sublist_get(impls_sl, ii)
+            let methods_sl = node_methods(im)
+            if methods_sl != -1 {
+                let mut mi = 0
+                while mi < sublist_length(methods_sl) {
+                    let m = sublist_get(methods_sl, mi)
+                    let mbody = node_body(m)
+                    if mbody != -1 {
+                        collect_byte_pin_sites(mbody, diag_file_for_node(m), byte_pin_lines, byte_pin_files)
+                    }
+                    mi = mi + 1
+                }
+            }
+            ii = ii + 1
+        }
+    }
+
+    // test-block bodies (node_captures)
+    let tests_sl = node_captures(program)
+    if tests_sl != -1 {
+        let mut ti = 0
+        while ti < sublist_length(tests_sl) {
+            let tb = sublist_get(tests_sl, ti)
+            let tbody = node_body(tb)
+            if tbody != -1 {
+                collect_byte_pin_sites(tbody, diag_file_for_node(tb), byte_pin_lines, byte_pin_files)
+            }
+            ti = ti + 1
+        }
+    }
+
+    // top-level let nodes directly (node_stmts; collect handles LetBinding via node_value)
+    let lets_sl = node_stmts(program)
+    if lets_sl != -1 {
+        let mut li = 0
+        while li < sublist_length(lets_sl) {
+            let ln = sublist_get(lets_sl, li)
+            if ln != -1 {
+                collect_byte_pin_sites(ln, diag_file_for_node(ln), byte_pin_lines, byte_pin_files)
+            }
+            li = li + 1
+        }
     }
 
     if json_output != 0 {
@@ -1723,7 +1789,8 @@ fn do_ffi_audit(program: Int, json_output: Int) {
                 out = out.concat(",")
             }
             let bline = byte_pin_lines.get(bpj).unwrap()
-            out = out.concat("\{\"file\":\"{diag_source_file}\",\"line\":{bline}}")
+            let bfile = byte_pin_files.get(bpj).unwrap()
+            out = out.concat("\{\"file\":\"{bfile}\",\"line\":{bline}}")
             bpj = bpj + 1
         }
         out = out.concat("]},\"summary\":\{\"total\":{total},\"audited\":{audited},\"unaudited\":{unaudited},\"ptr_params\":{ptr_param_count},\"ptr_returns\":{ptr_ret_count},\"byte_pin\":{byte_pin_lines.len()}}}")
@@ -1774,7 +1841,8 @@ fn do_ffi_audit(program: Int, json_output: Int) {
             let mut bph = 0
             while bph < byte_pin_lines.len() {
                 let bline = byte_pin_lines.get(bph).unwrap()
-                io.println("  byte-pin: {diag_source_file}:{bline}")
+                let bfile = byte_pin_files.get(bph).unwrap()
+                io.println("  byte-pin: {bfile}:{bline}")
                 bph = bph + 1
             }
         }

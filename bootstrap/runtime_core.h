@@ -1974,6 +1974,21 @@ BLINK_RT_FN const char* blink_str_concat(const char* a, const char* b) {
 }
 #endif
 
+BLINK_RT_FN const char* blink_str_format(const char* fmt, ...);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN const char* blink_str_format(const char* fmt, ...) {
+    va_list ap; va_start(ap, fmt);
+    va_list ap2; va_copy(ap2, ap);
+    int needed = vsnprintf(NULL, 0, fmt, ap);
+    va_end(ap);
+    if (needed < 0) { va_end(ap2); return ""; }
+    char* buf = (char*)blink_alloc((int64_t)needed + 1);
+    vsnprintf(buf, (size_t)needed + 1, fmt, ap2);
+    va_end(ap2);
+    return buf;
+}
+#endif
+
 BLINK_RT_FN int blink_str_eq(const char* a, const char* b);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN int blink_str_eq(const char* a, const char* b) {

@@ -4015,9 +4015,10 @@ fn emit_interp_string(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope
         return
     }
 
-    // Slow path: use snprintf for strings with expression parts
-    let buf_name = fresh_temp("_si_")
-    emit_line("char {buf_name}[4096];")
+    // Slow path: build the interpolated string with blink_str_format, a
+    // GC-allocating variadic helper that sizes the buffer exactly (vsnprintf
+    // two-pass). Spec §2.4: interpolation is concatenation with no length cap,
+    // so no fixed buffer may be used here.
     let mut fmt = ""
     let mut args = ""
     let mut has_args = 0
@@ -4086,13 +4087,10 @@ fn emit_interp_string(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope
         i = i + 1
     }
     if has_args {
-        let line = "snprintf(".concat(buf_name).concat(", 4096, \"").concat(fmt).concat("\", ").concat(args).concat(");")
-        emit_line(line)
+        expr_result_str = "blink_str_format(\"".concat(fmt).concat("\", ").concat(args).concat(")")
     } else {
-        let line = "snprintf(".concat(buf_name).concat(", 4096, \"").concat(fmt).concat("\");")
-        emit_line(line)
+        expr_result_str = "blink_str_format(\"".concat(fmt).concat("\")")
     }
-    expr_result_str = "blink_strdup(".concat(buf_name).concat(")")
     expr_result_type = CT_STRING
 }
 
@@ -4140,10 +4138,7 @@ fn option_inner_struct_from_fn(fn_node: Int) -> Str {
 
 fn flush_template_part(tpl: Str, raw_prefix: Str, current_literal: Str) ! Codegen.Emit {
     if raw_prefix != "" {
-        let pfx_tmp = fresh_temp("_rpfx_")
-        emit_line("char {pfx_tmp}[4096];")
-        emit_line("snprintf({pfx_tmp}, 4096, \"%s%s\", {raw_prefix}, \"{current_literal}\");")
-        emit_line("blink_list_push({tpl}->parts, (void*)blink_strdup({pfx_tmp}));")
+        emit_line("blink_list_push({tpl}->parts, (void*)blink_str_format(\"%s%s\", {raw_prefix}, \"{current_literal}\"));")
     } else {
         emit_line("blink_list_push({tpl}->parts, (void*)\"{current_literal}\");")
     }
@@ -4188,20 +4183,19 @@ pub fn emit_template_construction(node: Int) ! Codegen.Emit, Codegen.Register, C
         if pk == NodeKind.Ident && node_str_val(part) == node_name(part) {
             current_literal = current_literal.concat(escape_c_string(node_str_val(part)))
         } else if is_raw_call(part) != 0 {
-            diag_warn_at("RawBypassesParam", RAW_BYPASSES_PARAM, "Raw() bypasses query parameterization", part, "add @allow(RawBypassesParam) to suppress")
+            if has_annotation(cg_current_fn_node, "trusted") == 0 {
+                diag_warn_at("RawBypassesParam", RAW_BYPASSES_PARAM, "Raw() bypasses query parameterization", part, "add @trusted(audit: \"AUDIT-ID\") to suppress")
+            }
             let inner = sublist_get(node_args(part), 0)
             emit_expr(inner)
             let raw_str = expr_result_str
             let raw_type = expr_result_type
             let coerced = coerce_to_c_str(raw_str, raw_type)
-            let tmp = fresh_temp("_raw_")
-            emit_line("char {tmp}[4096];")
             if raw_prefix != "" {
-                emit_line("snprintf({tmp}, 4096, \"%s%s%s\", {raw_prefix}, \"{current_literal}\", {coerced});")
+                raw_prefix = "blink_str_format(\"%s%s%s\", ".concat(raw_prefix).concat(", \"").concat(current_literal).concat("\", ").concat(coerced).concat(")")
             } else {
-                emit_line("snprintf({tmp}, 4096, \"%s%s\", \"{current_literal}\", {coerced});")
+                raw_prefix = "blink_str_format(\"%s%s\", \"".concat(current_literal).concat("\", ").concat(coerced).concat(")")
             }
-            raw_prefix = "blink_strdup(".concat(tmp).concat(")")
             current_literal = ""
         } else {
             flush_template_part(tpl, raw_prefix, current_literal)
