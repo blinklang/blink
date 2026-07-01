@@ -14,7 +14,8 @@ Pick ready tasks from Bridge and execute the appropriate workflow based on type.
 
 Before fetching the graph, decide whether this run is **repo-scoped** or **project-scoped**.
 
-Run `br project ls --json` once. It returns the active projects with their progress, e.g.:
+Run `br project ls -t repo:blink --json` once. It returns only projects that have
+`repo:blink` tasks, with their progress, e.g.:
 
 ```json
 [{"id":"c9nw1f","name":"dataset-merge","status":"active","done":"4","total":"9"}]
@@ -28,13 +29,11 @@ Then:
   (you're already inside one project, so every candidate shares it).
 
 - **Otherwise** → **repo-scoped mode** (the default). Step 1 uses `br graph -t repo:blink`.
-  Compute the **in-flight set**: project ids where `status == "active"` AND `0 < done < total`
-  (a project that's started but not finished — note `0/N` is *not* in-flight, nothing's done yet).
-  For a `4/9` active project, `0 < 4 < 9` → in-flight. Then resolve which **tasks** belong to each
-  in-flight project by running `br ls --project <id>` per in-flight id (the authoritative source —
-  `br edit --project` membership does **not** surface the project name in `br graph`'s `[...]` tag
-  column, so don't scan that). The union of those task ids is the in-flight set the Step 2 tie-break
-  consults.
+  The returned project list already contains **only** projects with `repo:blink` tasks, so the
+  **in-flight set** = project ids where `status == "active"` AND `0 < done < total` (a project
+  that's started but not finished — note `0/N` is *not* in-flight, nothing's done yet). For a
+  `4/9` active project, `0 < 4 < 9` → in-flight. This filtered list is authoritative; the Step 2
+  tie-break consults it directly.
 
   If `$ARGUMENTS` is given but matches no project, stay in repo-scoped mode and treat the
   argument as a **title keyword** (case-insensitive substring) for the filter in Step 2.

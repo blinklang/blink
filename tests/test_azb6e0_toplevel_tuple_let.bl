@@ -1,0 +1,56 @@
+// br azb6e0: a top-level `let` of a Tuple type was declared with C type `void`
+// (`void pair;`) and failed to compile. emit_top_level_let computed its C type
+// via c_type_str(val_type), and a tuple literal returns CT_STRUCT whose
+// c_type_str default is "void" — the top-level path never tracked the tuple's
+// dynamically-generated struct name the way the local emit_let_binding path
+// does. This pins the global to its real Tuple<N>_... C type.
+
+fn emit_c(tag: Str, src: Str) -> Str {
+    let bl_path = ".tmp/_test_{tag}.bl"
+    write_file(bl_path, src)
+    let _ = process_run("build/blink", ["build", bl_path, "--emit", "c"])
+    let c_src = read_file("build/_test_{tag}.c")
+    shell_exec("rm -f {bl_path} build/_test_{tag}.c")
+    c_src
+}
+
+test "top-level tuple let is not declared void" {
+    let src = "let pair: Tuple[Int, Str] = (7, \"hi\")\nfn main() \{ io.println(\"ok\") \}\n"
+    let c = emit_c("azb6e0_void", src)
+    // The bug: `void pair;` — a void-typed global.
+    assert(!c.contains("void pair;"))
+    // The fix: declared with the generated tuple struct C type.
+    assert(c.contains("blink_Tuple2_int_str pair;"))
+}
+
+test "top-level tuple let compiles and its fields are readable" {
+    let src = "let pair: Tuple[Int, Str] = (7, \"hi\")\nfn main() \{\n    let n = pair.0\n    let s = pair.1\n    io.println(\"\{n\} \{s\}\")\n\}\n"
+    let bl_path = ".tmp/_azb6e0_run.bl"
+    write_file(bl_path, src)
+    let bin = ".tmp/_azb6e0_run"
+    let build = process_run("build/blink", ["build", bl_path, "-o", bin])
+    assert_eq(build.exit_code, 0)
+    let r = process_run(bin, [])
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("7 hi"))
+    shell_exec("rm -f {bl_path} {bin}")
+}
+
+// Regression for the nested-compound ordering hazard surfaced during review:
+// a tuple element that is Option[UserStruct] embeds its carrier typedef
+// (blink_Option_Pt) BY VALUE, so that carrier must be emitted before the tuple
+// typedef — which itself must precede the global decl. The carrier is usually
+// registered (by emit_expr on the value) before the tuple is resolved, so the
+// fix flushes all registered option/result carriers ahead of the tuple typedef.
+test "top-level tuple let with Option[struct] element compiles and runs" {
+    let src = "pub type Pt \{ x: Int y: Int \}\nlet p: Tuple[Int, Option[Pt]] = (1, Some(Pt \{ x: 2, y: 3 \}))\nfn main() \{\n    let a = p.0\n    io.println(\"a \{a\}\")\n\}\n"
+    let bl_path = ".tmp/_azb6e0_nested.bl"
+    write_file(bl_path, src)
+    let bin = ".tmp/_azb6e0_nested"
+    let build = process_run("build/blink", ["build", bl_path, "-o", bin])
+    assert_eq(build.exit_code, 0)
+    let r = process_run(bin, [])
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("a 1"))
+    shell_exec("rm -f {bl_path} {bin}")
+}

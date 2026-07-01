@@ -1,0 +1,51 @@
+// br j8z2tj: `match` over a side-effecting non-string scalar scrutinee
+// (Int/Float/Bool/Char) must evaluate the scrutinee exactly ONCE, not
+// once per arm. The scalar else-branch in emit_match_expr pushed the raw
+// scrutinee expression into match_scruts without binding it to a temp, so
+// each arm's pattern_condition() re-embedded (and thus re-evaluated) it.
+//
+// Every other scrutinee kind (String, List, Result/Option, data-enum,
+// tuple-lit) already binds a `_scrut_` temp first; this pins the scalar
+// path to the same shape.
+
+let mut calls = 0
+
+fn bump() -> Int {
+    calls = calls + 1
+    99
+}
+
+test "match over side-effecting Int scrutinee evaluates it once" {
+    calls = 0
+    match bump() {
+        1 => { }
+        2 => { }
+        _ => { }
+    }
+    assert_eq(calls, 1)
+}
+
+fn emit_c(tag: Str, src: Str) -> Str {
+    let bl_path = ".tmp/_test_{tag}.bl"
+    write_file(bl_path, src)
+    let _ = process_run("build/blink", ["build", bl_path, "--emit", "c"])
+    let c_src = read_file("build/_test_{tag}.c")
+    shell_exec("rm -f {bl_path} build/_test_{tag}.c")
+    c_src
+}
+
+test "scalar match scrutinee call emitted exactly once in C" {
+    let src = "let mut calls = 0\nfn bump() -> Int \{\n    calls = calls + 1\n    99\n\}\nfn main() \{\n    match bump() \{\n        1 => \{ \}\n        2 => \{ \}\n        _ => \{ \}\n    \}\n\}\n"
+    let c = emit_c("j8z2tj_once", src)
+    // The scrutinee call `bump()` must appear exactly once in the emitted C
+    // (bound into a `_scrut_` temp), not re-embedded per arm.
+    let mut count = 0
+    let mut rest = c
+    let mut idx = rest.index_of("bump()")
+    while idx != -1 {
+        count = count + 1
+        rest = rest.substring(idx + 6, rest.len() - idx - 6)
+        idx = rest.index_of("bump()")
+    }
+    assert_eq(count, 1)
+}
