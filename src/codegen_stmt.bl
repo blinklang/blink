@@ -682,9 +682,17 @@ pub fn emit_match_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scop
             while ei < sublist_length(elems_sl) {
                 emit_expr(sublist_get(elems_sl, ei))
                 let tmp = fresh_temp("_tup_")
-                emit_line("{c_type_str(expr_result_type)} {tmp} = {expr_result_str};")
-                set_var(tmp, expr_result_type, 1)
-                match_scruts.push(MatchScrutEntry { str_val: tmp, scrut_type: expr_result_type })
+                let elem_sname = if expr_result_type == CT_STRUCT { get_var_struct(expr_result_str) } else { "" }
+                if elem_sname != "" {
+                    emit_line("{c_type_c_name(elem_sname)} {tmp} = {expr_result_str};")
+                    set_var(tmp, CT_STRUCT, 1)
+                    set_var_struct(tmp, elem_sname)
+                    match_scruts.push(MatchScrutEntry { str_val: tmp, scrut_type: expr_result_type, scrut_sname: elem_sname })
+                } else {
+                    emit_line("{c_type_str(expr_result_type)} {tmp} = {expr_result_str};")
+                    set_var(tmp, expr_result_type, 1)
+                    match_scruts.push(MatchScrutEntry { str_val: tmp, scrut_type: expr_result_type })
+                }
                 ei = ei + 1
             }
         }
@@ -801,7 +809,7 @@ pub fn emit_match_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scop
                 let fs = get_struct_field_stype(tup_s, field_name)
                 let elem_expr = "{scrut_tmp}.{field_name}"
                 if fs != "" {
-                    match_scruts.push(MatchScrutEntry { str_val: elem_expr, scrut_type: CT_STRUCT })
+                    match_scruts.push(MatchScrutEntry { str_val: elem_expr, scrut_type: CT_STRUCT, scrut_sname: fs })
                 } else {
                     match_scruts.push(MatchScrutEntry { str_val: elem_expr, scrut_type: ft })
                 }
@@ -1825,12 +1833,29 @@ fn bind_pattern_vars(pat: Int, scrut_off: Int, scrut_len: Int) ! Codegen.Emit, C
     if pk == NodeKind.AsPattern {
         let bind_name = node_name(pat)
         let c_bind = c_safe_name(bind_name)
-        let st = match_scruts.get(scrut_off).unwrap().scrut_type
-        let scrut_str = match_scruts.get(scrut_off).unwrap().str_val
+        let entry = match_scruts.get(scrut_off).unwrap()
+        let st = entry.scrut_type
+        let sn = entry.scrut_sname
+        let scrut_str = entry.str_val
         if match_scrut_enum != "" {
             emit_line("{c_type_c_name(match_scrut_enum)} {c_bind} = {scrut_str};")
             set_var(bind_name, CT_INT, 1)
             var_enums.push(VarEnumEntry { name: bind_name, enum_type: match_scrut_enum })
+        } else if sn != "" {
+            emit_line("{c_type_c_name(sn)} {c_bind} = {scrut_str};")
+            if sn.starts_with("Option_") {
+                set_var(bind_name, CT_OPTION, 1)
+                set_var_option_from_struct_tag(bind_name, sn)
+            } else if sn.starts_with("Result_") {
+                set_var(bind_name, CT_RESULT, 1)
+                set_var_result_from_struct_tag(bind_name, sn)
+            } else {
+                set_var(bind_name, CT_VOID, 1)
+                set_var_struct(c_bind, sn)
+                if is_data_enum(sn) != 0 {
+                    var_enums.push(VarEnumEntry { name: bind_name, enum_type: sn })
+                }
+            }
         } else {
             emit_line("{c_type_str(st)} {c_bind} = {scrut_str};")
             set_var(bind_name, st, 1)
@@ -1849,9 +1874,28 @@ fn bind_pattern_vars(pat: Int, scrut_off: Int, scrut_len: Int) ! Codegen.Emit, C
         }
         if scrut_len == 1 {
             let c_bind = c_safe_name(bind_name)
-            let st = match_scruts.get(scrut_off).unwrap().scrut_type
-            emit_line("{c_type_str(st)} {c_bind} = {match_scruts.get(scrut_off).unwrap().str_val};")
-            set_var(bind_name, st, 1)
+            let entry = match_scruts.get(scrut_off).unwrap()
+            let st = entry.scrut_type
+            let sn = entry.scrut_sname
+            if sn != "" {
+                emit_line("{c_type_c_name(sn)} {c_bind} = {entry.str_val};")
+                if sn.starts_with("Option_") {
+                    set_var(bind_name, CT_OPTION, 1)
+                    set_var_option_from_struct_tag(bind_name, sn)
+                } else if sn.starts_with("Result_") {
+                    set_var(bind_name, CT_RESULT, 1)
+                    set_var_result_from_struct_tag(bind_name, sn)
+                } else {
+                    set_var(bind_name, CT_VOID, 1)
+                    set_var_struct(c_bind, sn)
+                    if is_data_enum(sn) != 0 {
+                        var_enums.push(VarEnumEntry { name: bind_name, enum_type: sn })
+                    }
+                }
+            } else {
+                emit_line("{c_type_str(st)} {c_bind} = {entry.str_val};")
+                set_var(bind_name, st, 1)
+            }
         }
         return
     }
@@ -6323,6 +6367,17 @@ pub fn emit_struct_typedef(td_node: Int) ! Codegen.Emit, Diag.Report {
                     emit_line("int64_t {fname};")
                 }
                 reg_sf_entry(name, fname, CT_VOID, type_name, sv_tp(CT_VOID, -1, -1, type_name))
+            } else if type_name == "Tuple" {
+                let tup_opt = resolve_tuple_ann(type_ann_node, -1, "")
+                if tup_opt.is_some() {
+                    let tup_tag = tup_opt.unwrap()
+                    emit_line("{c_type_c_name(tup_tag)} {fname};")
+                    reg_sf_entry(name, fname, CT_VOID, tup_tag, sv_tp(CT_VOID, -1, -1, tup_tag))
+                } else {
+                    let ct = type_from_name(type_name)
+                    emit_line("{c_type_str(ct)} {fname};")
+                    reg_sf_entry(name, fname, ct, "", tp_from_ann(type_ann_node))
+                }
             } else {
                 let ct = type_from_name(type_name)
                 let field_tp = tp_from_ann(type_ann_node)
