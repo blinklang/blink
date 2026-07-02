@@ -21,7 +21,7 @@ import codegen_types.{
     cg_mono_tparams_sl, cg_mono_concrete_args,
     cg_let_target_name, cg_let_target_type, cg_lines, cg_program_node,
     cg_temp_counter, cg_trace_codegen, cg_ensures_result_var, cg_old_snapshot_vars,
-    compound_name_from_ann,
+    compound_name_from_ann, resolve_result_inner_tag,
     emit_arena_restore_helper, emit_bh_cleanup_for_type, emit_cl_cleanup_for_type, emit_ev_restore_helper, emit_handle_cleanup, emit_line, ev_field, fn_node_has_effects,
     cg_archive_build_mode, cg_archive_header_mode, cg_user_tu_mode, in_per_module_object,
     emit_struct_option_typedef, emit_td_guard_open, emit_td_guard_close,
@@ -688,6 +688,35 @@ pub fn emit_match_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scop
                     set_var(tmp, CT_STRUCT, 1)
                     set_var_struct(tmp, elem_sname)
                     match_scruts.push(MatchScrutEntry { str_val: tmp, scrut_type: expr_result_type, scrut_sname: elem_sname })
+                } else if expr_result_type == CT_OPTION {
+                    let oi = expr_option_inner
+                    let oi_s = expr_option_inner_struct
+                    let opt_c = if oi_s != "" { struct_option_c_type(oi_s) } else { option_c_type(oi) }
+                    // Build the carrier tag from the captured expr metadata (oi_s
+                    // is the canonical inner tag), mirroring the CT_RESULT branch's
+                    // res_tag. compound_option_inner_name re-derives it from a
+                    // scope-var lookup on expr_result_str, which is "" for a
+                    // non-registered element expression (e.g. a call result).
+                    let opt_tag = if oi_s != "" { "Option_{oi_s}" } else { "Option_{c_type_tag(oi)}" }
+                    emit_line("{opt_c} {tmp} = {expr_result_str};")
+                    set_var(tmp, CT_OPTION, 1)
+                    set_var_option(tmp, oi)
+                    if oi_s != "" { set_var_option_struct(tmp, oi, oi_s) }
+                    match_scruts.push(MatchScrutEntry { str_val: tmp, scrut_type: expr_result_type, scrut_sname: opt_tag })
+                } else if expr_result_type == CT_RESULT {
+                    let rok = expr_result_ok_type
+                    let rerr = expr_result_err_type
+                    let rok_s = expr_result_ok_struct
+                    let rerr_s = expr_result_err_struct
+                    let res_c = if rok_s != "" || rerr_s != "" { result_c_type_mixed(rok, rerr, rok_s, rerr_s) } else { result_c_type(rok, rerr) }
+                    let ok_tag = if rok_s != "" { rok_s } else { c_type_tag(rok) }
+                    let err_tag = if rerr_s != "" { rerr_s } else { c_type_tag(rerr) }
+                    let res_tag = "Result_{ok_tag}_{err_tag}"
+                    emit_line("{res_c} {tmp} = {expr_result_str};")
+                    set_var(tmp, CT_RESULT, 1)
+                    set_var_result(tmp, rok, rerr)
+                    if rok_s != "" || rerr_s != "" { set_var_result_struct(tmp, rok, rerr, rok_s, rerr_s) }
+                    match_scruts.push(MatchScrutEntry { str_val: tmp, scrut_type: expr_result_type, scrut_sname: res_tag })
                 } else {
                     emit_line("{c_type_str(expr_result_type)} {tmp} = {expr_result_str};")
                     set_var(tmp, expr_result_type, 1)
@@ -1078,6 +1107,9 @@ pub fn emit_match_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scop
                 emit_line("(void){arm_val};")
             }
             cg_indent = cg_indent - 1
+            if is_wildcard {
+                break
+            }
         }
 
         _first = 0
@@ -2747,7 +2779,7 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
                     if is_struct_type(inner_name) != 0 || is_enum_type(inner_name) != 0 {
                         opt_inner_s = inner_name
                         opt_inner_ct = inner_ct
-                    } else if is_compound_ct(inner_ct) != 0 {
+                    } else if is_compound_ct(inner_ct) != 0 || inner_name == "Tuple" {
                         opt_inner_s = compound_name_from_ann(inner_ann)
                         opt_inner_ct = inner_ct
                     } else {
@@ -2792,17 +2824,35 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
             let ann_elems = node_elements(type_ann)
             if ann_elems != -1 && sublist_length(ann_elems) >= 2 {
                 if rok_s == "" {
-                    let ok_name = node_name(sublist_get(ann_elems, 0))
+                    let ok_ann = sublist_get(ann_elems, 0)
+                    let ok_name = node_name(ok_ann)
+                    // A struct/enum or a Tuple ok side is carried by its tag as a
+                    // by-value member (rok_t=CT_INT). Map/Option/List inners keep
+                    // their own CT/struct from expr_result_ok_* — do NOT override
+                    // them to CT_INT (that erases the Map/List element type).
                     if is_struct_type(ok_name) != 0 || is_enum_type(ok_name) != 0 {
                         rok_s = ok_name
                         rok_t = CT_INT
+                    } else if ok_name == "Tuple" {
+                        let ok_tag = resolve_result_inner_tag(ok_ann, ok_name, type_from_name(ok_name))
+                        if ok_tag != "" {
+                            rok_s = ok_tag
+                            rok_t = CT_INT
+                        }
                     }
                 }
                 if rerr_s == "" {
-                    let err_name = node_name(sublist_get(ann_elems, 1))
+                    let err_ann = sublist_get(ann_elems, 1)
+                    let err_name = node_name(err_ann)
                     if is_struct_type(err_name) != 0 || is_enum_type(err_name) != 0 {
                         rerr_s = err_name
                         rerr_t = CT_INT
+                    } else if err_name == "Tuple" {
+                        let err_tag = resolve_result_inner_tag(err_ann, err_name, type_from_name(err_name))
+                        if err_tag != "" {
+                            rerr_s = err_tag
+                            rerr_t = CT_INT
+                        }
                     }
                 }
             }
