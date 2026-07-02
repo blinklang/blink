@@ -10,7 +10,7 @@ import parser.{
 import codegen_types.{
     Codegen,
     CT_BOOL, CT_BYTES, CT_CHAR, CT_FFI_SCOPE, CT_FLOAT, CT_INT, CT_LIST, CT_MAP, CT_OPTION, CT_PTR, CT_RESULT, CT_SET,
-    CT_STRING, CT_STRINGBUILDER, CT_TEMPLATE, CT_VOID,
+    CT_STRING, CT_STRINGBUILDER, CT_STRUCT, CT_TEMPLATE, CT_VOID,
     AssocTypeBinding,
     BuiltinTraitImpl, FnEnumRetEntry, FromImplEntry, GenericFnEntry,
     ImplEntry, StructFieldEntry, TraitEntry, TryFromImplEntry,
@@ -62,7 +62,7 @@ import codegen_types.{
     fn_ret_structs, fn_ret_structs_idx, fn_ret_types, fn_ret_types_idx,
     from_entries, generic_fns, generic_fns_by_name, get_fn_enum_ret,
     impl_entries, impl_method_idx, init_builtin_effects,
-    is_emitted_fn, is_emitted_let, is_enum_type, is_generic_fn, is_struct_or_enum_type, is_struct_type,
+    is_data_enum, is_emitted_fn, is_emitted_let, is_enum_type, is_generic_fn, is_struct_or_enum_type, is_struct_type, is_transparent_newtype,
     in_per_module_header, in_per_module_object,
     is_stdlib_source_module, join_lines, make_emit_key, mangle_impl_method, mangle_impl_method_q, mangling_module, mod_fn_prefix, mod_type_prefix, builtin_type_set, mono_fns, mono_idx, mono_instances, skip_private_in_module_header,
     mono_rev_idx,
@@ -1229,8 +1229,20 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
                     if is_enum_type(ret_str) != 0 {
                         fn_enum_rets.push(FnEnumRetEntry { name: emit_key, enum_type: ret_str })
                         fn_enum_rets.push(FnEnumRetEntry { name: fn_name, enum_type: ret_str })
-                        reg_fn_with_effects(emit_key, CT_INT, fn_eff_sl, fn_trusted)
-                        reg_fn_with_effects(fn_name, CT_INT, fn_eff_sl, fn_trusted)
+                        // A NON-transparent data enum has a `blink_<Enum>` struct
+                        // representation, so value-typing must report CT_STRUCT to
+                        // match the C signature (bug 7g2zd9). The transparent
+                        // newtype Errno legitimately lowers to bare int64_t, so it
+                        // stays CT_INT with no struct-ret registration.
+                        if is_data_enum(ret_str) != 0 && is_transparent_newtype(ret_str) == 0 {
+                            reg_fn_with_effects(emit_key, CT_STRUCT, fn_eff_sl, fn_trusted)
+                            reg_fn_with_effects(fn_name, CT_STRUCT, fn_eff_sl, fn_trusted)
+                            reg_fn_struct_ret(emit_key, ret_str)
+                            reg_fn_struct_ret(fn_name, ret_str)
+                        } else {
+                            reg_fn_with_effects(emit_key, CT_INT, fn_eff_sl, fn_trusted)
+                            reg_fn_with_effects(fn_name, CT_INT, fn_eff_sl, fn_trusted)
+                        }
                     } else {
                         let ret_ct = type_from_name(ret_str)
                         reg_fn_with_effects(emit_key, ret_ct, fn_eff_sl, fn_trusted)
@@ -1349,7 +1361,12 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
                     let ret_str = resolve_self_type(ret_str_raw, impl_type)
                     if is_enum_type(ret_str) != 0 {
                         fn_enum_rets.push(FnEnumRetEntry { name: mangled, enum_type: ret_str })
-                        reg_fn(mangled, CT_INT)
+                        if is_data_enum(ret_str) != 0 && is_transparent_newtype(ret_str) == 0 {
+                            reg_fn(mangled, CT_STRUCT)
+                            reg_fn_struct_ret(mangled, ret_str)
+                        } else {
+                            reg_fn(mangled, CT_INT)
+                        }
                     } else if is_struct_type(ret_str) != 0 {
                         reg_fn(mangled, CT_VOID)
                         reg_fn_struct_ret(mangled, ret_str)

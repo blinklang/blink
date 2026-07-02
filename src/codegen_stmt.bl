@@ -56,7 +56,7 @@ import codegen_types.{
     reg_sf_entry, register_var_compound_inner_from_str, resolve_effect_field, resolve_effect_is_ue, resolve_effect_vtable,
     resolve_import_alias, resolve_option_inner_from_ann, resolve_ret_type_from_ann,
     resolve_self_type, resolve_tparam, resolve_tuple_ann, resolve_variant, result_c_type,
-    result_c_type_mixed, set_list_elem_struct, set_list_elem_type,
+    result_c_type_mixed, tuple_struct_arity, set_list_elem_struct, set_list_elem_type,
     set_list_nested_elem_struct, set_list_nested_elem_type, set_list_elem_map_types, set_map_types, set_map_key_struct, key_struct_sname_from_ann, set_map_value_list_elem, set_map_value_struct, copy_map_value_meta, set_set_elem_type,
     find_type_def_node, set_var_ffi_ptr_struct, set_var_ffi_ptr_array, set_var_ffi_ptr_extra,
     ffi_alloc_n_pending, ffi_offset_pending_struct,
@@ -767,17 +767,46 @@ pub fn emit_match_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scop
             // arm tested. Mirrors the String branch above. The `!= "void"` gate
             // is primary — c_type_str maps only genuine scalar CTs to real C
             // types; struct/enum/void CTs fall through to the raw-push fallback.
-            // The match_arms_need_struct guard covers data-enum-returning calls
-            // whose result type is misreported CT_INT (a get_fn_ret bug, br
-            // pending) and whose arms are variant patterns that read `.tag`. It
-            // does NOT catch such a call matched against bare scalar patterns
-            // (`match data_enum_call() { 0 => .. }`) — but that program is
-            // already rejected downstream (cc: struct assigned to int64_t) and
-            // was equally broken before this branch, so it is not a regression.
+            // The `!= CT_STRUCT` gate now excludes data-enum-returning calls: bug
+            // 7g2zd9 made get_fn_ret report such calls as CT_STRUCT, so they route
+            // to the data-enum branch above (via match_scrut_enum) rather than
+            // being mis-bound as scalars here. The match_arms_need_struct guard
+            // stays as defence-in-depth for any residual variant-pattern arm that
+            // reads `.tag` on a scrutinee that still reports a scalar CT.
             let scrut_tmp = fresh_temp("_scrut_")
             emit_line("{c_type_str(expr_result_type)} {scrut_tmp} = {expr_result_str};")
             set_var(scrut_tmp, expr_result_type, 1)
             match_scruts.push(MatchScrutEntry { str_val: scrut_tmp, scrut_type: expr_result_type })
+        } else if expr_result_type == CT_STRUCT && tuple_struct_arity(get_var_struct(expr_result_str)) >= 0 {
+            // A tuple-typed NON-literal scrutinee (call/ident/field). The
+            // TupleLit fast path splits a literal into one match_scruts entry per
+            // element; a tuple-returning call/ident falls here as CT_STRUCT and
+            // would otherwise push a single whole-tuple entry, so a TuplePattern
+            // arm indexing scrut_off + j past element 0 unwraps a None
+            // match_scruts entry (bug hnkrcz). Materialize the tuple into one temp
+            // (no re-evaluation of a side-effecting call) and push one `._i`
+            // field-access entry per element, mirroring the fast path. Element
+            // types/carrier metadata come from the tuple's registered fields,
+            // exactly as emit_tuple_destructure resolves them.
+            let tup_s = get_var_struct(expr_result_str)
+            let arity = tuple_struct_arity(tup_s)
+            let scrut_tmp = fresh_temp("_scrut_")
+            emit_line("{c_type_c_name(tup_s)} {scrut_tmp} = {expr_result_str};")
+            set_var(scrut_tmp, CT_STRUCT, 1)
+            set_var_struct(scrut_tmp, tup_s)
+            let mut ti = 0
+            while ti < arity {
+                let field_name = "_{ti}"
+                let ft = get_struct_field_type(tup_s, field_name)
+                let fs = get_struct_field_stype(tup_s, field_name)
+                let elem_expr = "{scrut_tmp}.{field_name}"
+                if fs != "" {
+                    match_scruts.push(MatchScrutEntry { str_val: elem_expr, scrut_type: CT_STRUCT })
+                } else {
+                    match_scruts.push(MatchScrutEntry { str_val: elem_expr, scrut_type: ft })
+                }
+                ti = ti + 1
+            }
         } else {
             match_scruts.push(MatchScrutEntry { str_val: expr_result_str, scrut_type: expr_result_type })
         }
@@ -2135,7 +2164,16 @@ fn infer_expr_type(node: Int) -> Int {
         if iname == "None" {
             return CT_OPTION
         }
-        if resolve_variant(iname) != "" {
+        let variant_enum = resolve_variant(iname)
+        if variant_enum != "" {
+            // A bare variant of a NON-transparent data enum is value-typed as a
+            // struct (blink_<Enum>) so infer_block_type / emit_if_expr open their
+            // struct-discovery gate for a data-enum branch (bug 7g2zd9). Plain
+            // C-like/str-backed enums and the transparent newtype Errno stay
+            // CT_INT (bare int64_t).
+            if is_data_enum(variant_enum) != 0 && is_transparent_newtype(variant_enum) == 0 {
+                return CT_STRUCT
+            }
             return CT_INT
         }
         return get_var_type(iname)
