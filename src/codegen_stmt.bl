@@ -908,10 +908,13 @@ pub fn emit_match_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scop
         match_scrut_enum = saved_pp_scrut_enum
         cg_indent = cg_indent - 1
         let arm_carrier = snapshot_carrier()
-        // An arm that yields no value (`0`/empty, e.g. a body that only assigns or
-        // early-returns) means the match is in statement position — keep it void
-        // so the existing `(void)arm_val` discard path runs unchanged.
-        if arm_carrier.ct == CT_VOID || pp_arm_val == "0" || pp_arm_val == "" {
+        // An arm that yields no value (empty, or a body that only assigns) means
+        // the match is in statement position — keep it void so the existing
+        // `(void)arm_val` discard path runs unchanged. Use a structural check
+        // (arm_body_is_valueless) rather than a `pp_arm_val == "0"` string compare:
+        // a literal `0` in value position (`None => 0`) also emits "0" but is a
+        // genuine value (bug 90c0fz).
+        if arm_carrier.ct == CT_VOID || pp_arm_val == "" || arm_body_is_valueless(node_body(pp_arm)) != 0 {
             pp_all_value = 0
         }
         if pp_type == CT_VOID && arm_carrier.ct != CT_VOID {
@@ -2084,6 +2087,23 @@ fn block_tail_expr(block: Int) -> Int {
         return node_value(last)
     }
     -1
+}
+
+// Structural test for a match arm body that produces no value (statement
+// position), so `emit_match_expr`'s harvest override must not treat the match as
+// value-producing. Mirrors emit_block_expr's `v == "0" && infer_block_type ==
+// CT_VOID` precedent rather than string-comparing the emitted arm text against
+// "0" — a literal `0` in value position (`None => 0`) also emits "0" but IS a
+// value. An assignment/compound-assignment arm, or a block whose tail is
+// value-less, is genuinely void.
+fn arm_body_is_valueless(body: Int) -> Int {
+    if body == -1 { return 1 }
+    let k = node_kind(body)
+    if k == NodeKind.Assignment || k == NodeKind.CompoundAssign { return 1 }
+    if k == NodeKind.Block {
+        if infer_block_type(body) == CT_VOID { return 1 }
+    }
+    0
 }
 
 pub fn infer_block_type(block: Int) -> Int {
@@ -4144,12 +4164,13 @@ pub fn param_c_type(p: Int, ptype: Str) -> Str {
                 let err_name = node_name(err_ann)
                 let ok_t = type_from_name(ok_name)
                 let err_t = type_from_name(err_name)
-                let ok_is_type = is_struct_type(ok_name) != 0 || is_enum_type(ok_name) != 0
-                let err_is_type = is_struct_type(err_name) != 0 || is_enum_type(err_name) != 0
-                if ok_is_type || err_is_type {
-                    let ok_tag = if ok_is_type { canonical_struct_tag(ok_name) } else { c_type_tag(ok_t) }
-                    let err_tag = if err_is_type { canonical_struct_tag(err_name) } else { c_type_tag(err_t) }
-                    return "blink_Result_{ok_tag}_{err_tag}"
+                let ok_tag = resolve_result_inner_tag(ok_ann, ok_name, ok_t)
+                let err_tag = resolve_result_inner_tag(err_ann, err_name, err_t)
+                if ok_tag != "" || err_tag != "" {
+                    let ok_t_tag = if ok_tag != "" { canonical_struct_tag(ok_tag) } else { c_type_tag(ok_t) }
+                    let err_t_tag = if err_tag != "" { canonical_struct_tag(err_tag) } else { c_type_tag(err_t) }
+                    ensure_struct_result_type(ok_t_tag, err_t_tag)
+                    return "blink_Result_{ok_t_tag}_{err_t_tag}"
                 }
                 return result_c_type(ok_t, err_t)
             }
@@ -4166,6 +4187,11 @@ pub fn param_c_type(p: Int, ptype: Str) -> Str {
                 let inner_t = type_from_name(inner_name)
                 if is_struct_type(inner_name) != 0 || is_enum_type(inner_name) != 0 {
                     return "blink_Option_{canonical_struct_tag(inner_name)}"
+                }
+                if is_compound_ct(inner_t) != 0 || inner_name == "Tuple" {
+                    let cn = compound_name_from_ann(inner_ann)
+                    ensure_struct_option_type(cn)
+                    return struct_option_c_type(cn)
                 }
                 return option_c_type(inner_t)
             }
@@ -4207,11 +4233,17 @@ fn mono_option_result_param_c_type(p: Int, ptype: Str, tparams_sl: Int, concrete
         if elems_sl == -1 || sublist_length(elems_sl) < 1 {
             return option_c_type(CT_INT)
         }
-        let inner_name = resolve_tparam(node_name(sublist_get(elems_sl, 0)), tparams_sl, concrete_args)
+        let inner_ann = sublist_get(elems_sl, 0)
+        let inner_name = resolve_tparam(node_name(inner_ann), tparams_sl, concrete_args)
         let inner_ct = type_from_name(inner_name)
         if is_struct_type(inner_name) != 0 || is_enum_type(inner_name) != 0 {
             ensure_struct_option_type(inner_name)
             return struct_option_c_type(inner_name)
+        }
+        if is_compound_ct(inner_ct) != 0 || node_name(inner_ann) == "Tuple" {
+            let cn = compound_name_from_ann(inner_ann)
+            ensure_struct_option_type(cn)
+            return struct_option_c_type(cn)
         }
         ensure_option_type(inner_ct)
         return option_c_type(inner_ct)
@@ -4219,17 +4251,19 @@ fn mono_option_result_param_c_type(p: Int, ptype: Str, tparams_sl: Int, concrete
     if elems_sl == -1 || sublist_length(elems_sl) < 2 {
         return result_c_type(CT_INT, CT_STRING)
     }
-    let ok_name = resolve_tparam(node_name(sublist_get(elems_sl, 0)), tparams_sl, concrete_args)
-    let err_name = resolve_tparam(node_name(sublist_get(elems_sl, 1)), tparams_sl, concrete_args)
+    let ok_ann = sublist_get(elems_sl, 0)
+    let err_ann = sublist_get(elems_sl, 1)
+    let ok_name = resolve_tparam(node_name(ok_ann), tparams_sl, concrete_args)
+    let err_name = resolve_tparam(node_name(err_ann), tparams_sl, concrete_args)
     let ok_t = type_from_name(ok_name)
     let err_t = type_from_name(err_name)
-    let ok_is_type = is_struct_type(ok_name) != 0 || is_enum_type(ok_name) != 0
-    let err_is_type = is_struct_type(err_name) != 0 || is_enum_type(err_name) != 0
-    if ok_is_type || err_is_type {
-        let ok_tag = if ok_is_type { canonical_struct_tag(ok_name) } else { c_type_tag(ok_t) }
-        let err_tag = if err_is_type { canonical_struct_tag(err_name) } else { c_type_tag(err_t) }
-        ensure_struct_result_type(ok_tag, err_tag)
-        return "blink_Result_{ok_tag}_{err_tag}"
+    let ok_tag = resolve_result_inner_tag(ok_ann, ok_name, ok_t)
+    let err_tag = resolve_result_inner_tag(err_ann, err_name, err_t)
+    if ok_tag != "" || err_tag != "" {
+        let ok_t_tag = if ok_tag != "" { canonical_struct_tag(ok_tag) } else { c_type_tag(ok_t) }
+        let err_t_tag = if err_tag != "" { canonical_struct_tag(err_tag) } else { c_type_tag(err_t) }
+        ensure_struct_result_type(ok_t_tag, err_t_tag)
+        return "blink_Result_{ok_t_tag}_{err_t_tag}"
     }
     ensure_result_type(ok_t, err_t)
     result_c_type(ok_t, err_t)
@@ -5276,13 +5310,31 @@ pub fn emit_fn_def(fn_node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope
                             let err_ann = sublist_get(elems_sl, 1)
                             let ok_name = node_name(ok_ann)
                             let err_name = node_name(err_ann)
-                            let ok_t = type_from_name(ok_name)
-                            let err_t = type_from_name(err_name)
-                            let ok_is_s = is_struct_or_enum_type(ok_name) != 0
-                            let err_is_s = is_struct_or_enum_type(err_name) != 0
-                            if ok_is_s || err_is_s {
-                                let ok_s = if ok_is_s { ok_name } else { "" }
-                                let err_s = if err_is_s { err_name } else { "" }
+                            let mut ok_t = type_from_name(ok_name)
+                            let mut err_t = type_from_name(err_name)
+                            let mut ok_s = ""
+                            let mut err_s = ""
+                            // A Tuple ok/err side is carried by its tag as a by-value
+                            // member (ct=CT_INT); mirrors emit_let_binding's r9bbmk path.
+                            if is_struct_or_enum_type(ok_name) != 0 {
+                                ok_s = ok_name
+                            } else if ok_name == "Tuple" {
+                                let ok_tag = resolve_result_inner_tag(ok_ann, ok_name, ok_t)
+                                if ok_tag != "" {
+                                    ok_s = ok_tag
+                                    ok_t = CT_INT
+                                }
+                            }
+                            if is_struct_or_enum_type(err_name) != 0 {
+                                err_s = err_name
+                            } else if err_name == "Tuple" {
+                                let err_tag = resolve_result_inner_tag(err_ann, err_name, err_t)
+                                if err_tag != "" {
+                                    err_s = err_tag
+                                    err_t = CT_INT
+                                }
+                            }
+                            if ok_s != "" || err_s != "" {
                                 set_var_result_struct(pname, ok_t, err_t, ok_s, err_s)
                             } else {
                                 set_var_result(pname, ok_t, err_t)
@@ -5300,6 +5352,8 @@ pub fn emit_fn_def(fn_node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope
                             let inner_t = type_from_name(inner_name)
                             if is_struct_or_enum_type(inner_name) != 0 {
                                 set_var_option_struct(pname, inner_t, inner_name)
+                            } else if is_compound_ct(inner_t) != 0 || inner_name == "Tuple" {
+                                set_var_option_struct(pname, inner_t, compound_name_from_ann(inner_ann))
                             } else {
                                 set_var_option(pname, inner_t)
                             }
