@@ -599,6 +599,8 @@ fn emit_field_debug(access: Str, field_type: Int, stype: Str) ! Codegen.Emit {
         emit_line("result = blink_str_concat(result, {access} ? \"true\" : \"false\");")
     } else if field_type == CT_FLOAT {
         emit_line("result = blink_str_concat(result, {c_fn_name("float_to_str")}({access}));")
+    } else if field_type == CT_CHAR {
+        emit_line("result = blink_str_concat(result, blink_char_debug((int64_t){access}));")
     } else if is_hash_scalar_ct(field_type) != 0 {
         emit_line("result = blink_str_concat(result, {c_fn_name("int_to_str")}({access}));")
     } else if field_type == CT_VOID && stype != "" && has_derive_method(stype, "debug") != 0 {
@@ -629,8 +631,10 @@ fn emit_debug_elem_from_slot(slot: Str, elem_ct: Int, elem_struct: Str) ! Codege
         emit_line("result = blink_str_concat(result, {c_fn_name("float_to_str")}(*(double*){slot}));")
     } else if elem_ct == CT_BOOL {
         emit_line("result = blink_str_concat(result, (int64_t)(intptr_t){slot} ? \"true\" : \"false\");")
+    } else if elem_ct == CT_CHAR {
+        emit_line("result = blink_str_concat(result, blink_char_debug((int64_t)(intptr_t){slot}));")
     } else {
-        // Int / sized-int / Char — stored as intptr-packed scalar.
+        // Int / sized-int — stored as intptr-packed scalar.
         emit_line("result = blink_str_concat(result, {c_fn_name("int_to_str")}((int64_t)(intptr_t){slot}));")
     }
 }
@@ -669,6 +673,8 @@ fn emit_option_debug(access: Str, struct_name: Str, field_name: Str) ! Codegen.E
         emit_line("result = blink_str_concat(result, {c_fn_name("float_to_str")}(({access}).value));")
     } else if inner_type == CT_BOOL {
         emit_line("result = blink_str_concat(result, ({access}).value ? \"true\" : \"false\");")
+    } else if inner_type == CT_CHAR {
+        emit_line("result = blink_str_concat(result, blink_char_debug((int64_t)({access}).value));")
     } else {
         emit_line("result = blink_str_concat(result, {c_fn_name("int_to_str")}((int64_t)({access}).value));")
     }
@@ -683,18 +689,42 @@ fn emit_option_debug(access: Str, struct_name: Str, field_name: Str) ! Codegen.E
 
 // Emit Debug rendering of one Map KEY read from the kops storage slot. Keys are
 // stored per the kops vtable: inline_key=0 (Str) → the slot holds a pointer;
-// inline_key=1 (Int/Bool/sized) → the slot holds the bytes inline. We read the
-// raw slot via blink_map_key_slot(...) and cast by K kind. Typecheck restricts
-// K to Str/Int/Bool/sized-int.
+// inline_key=1 (Char/Int/Bool/sized) → the slot holds the bytes inline at the
+// kops stride (= sizeof(K)'s C type). We read the raw slot via blink_map_key_slot(...)
+// and MUST cast to the exact width blink_kops_eq_* uses for K — reading a narrow
+// key as int64_t over-reads the slot (up to 7 bytes) and, for signed narrow keys,
+// mis-renders the value (e.g. I8 -1 as 255). Typecheck restricts K to
+// Str/Char/Int/Bool/sized-int.
 fn emit_debug_map_key(slot: Str, key_ct: Int) ! Codegen.Emit {
     if key_ct == CT_STRING {
         emit_line("result = blink_str_concat(result, {c_fn_name("json_escape_str")}((const char*){slot}));")
     } else if key_ct == CT_BOOL {
-        emit_line("result = blink_str_concat(result, (*(const int64_t*){slot}) ? \"true\" : \"false\");")
+        // 1-byte kops stride (blink_kops_bool); read uint8_t like blink_kops_eq_bool.
+        emit_line("result = blink_str_concat(result, (*(const uint8_t*){slot}) ? \"true\" : \"false\");")
+    } else if key_ct == CT_CHAR {
+        // 4-byte kops stride (blink_kops_char, sizeof(uint32_t)); read uint32_t.
+        emit_line("result = blink_str_concat(result, blink_char_debug((int64_t)*(const uint32_t*){slot}));")
     } else {
-        // Int / sized-int — stored inline as the integer bytes.
-        emit_line("result = blink_str_concat(result, {c_fn_name("int_to_str")}(*(const int64_t*){slot}));")
+        // Int / sized-int: read at the key's native width (matching blink_kops_eq_*)
+        // then widen to int64_t for int_to_str — signed types sign-extend.
+        emit_line("result = blink_str_concat(result, {c_fn_name("int_to_str")}((int64_t){map_key_read_expr(key_ct, slot)}));")
     }
+}
+
+// The width-correct dereference of an inline integer Map-key slot, matching the
+// kops stride for `key_ct` (blink_kops_eq_* casts). Int/U64 are 8-byte; the
+// narrower sized ints read their exact C type so the value is not corrupted by
+// adjacent slot bytes (over-read) or wrong signedness.
+fn map_key_read_expr(key_ct: Int, slot: Str) -> Str {
+    if key_ct == CT_I8 { return "*(const int8_t*){slot}" }
+    if key_ct == CT_I16 { return "*(const int16_t*){slot}" }
+    if key_ct == CT_I32 { return "*(const int32_t*){slot}" }
+    if key_ct == CT_U8 { return "*(const uint8_t*){slot}" }
+    if key_ct == CT_U16 { return "*(const uint16_t*){slot}" }
+    if key_ct == CT_U32 { return "*(const uint32_t*){slot}" }
+    if key_ct == CT_U64 { return "*(const uint64_t*){slot}" }
+    // CT_INT (and any other 8-byte integer key): full-width read.
+    "*(const int64_t*){slot}"
 }
 
 fn emit_map_debug(access: Str, struct_name: Str, field_name: Str) ! Codegen.Emit {

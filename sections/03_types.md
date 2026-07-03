@@ -2211,6 +2211,7 @@ Key differences:
 | `Str` | `"\"Alice\""` (quoted) | `"Alice"` (unquoted) |
 | `Int` | `"42"` | `"42"` |
 | `Bool` | `"true"` | `"true"` |
+| `Char` | `"'a'"` (single-quoted) | `"a"` (bare) |
 | Struct | `"User { name: \"Alice\", age: 30 }"` | User-defined |
 | `List[T]` (iff `T: Debug`) | `"[1, 2, 3]"` | — |
 | `Option[T]` (iff `T: Debug`) | `"Some(42)"` / `"None"` | — |
@@ -2223,6 +2224,38 @@ element type `T` is `Debug`; an `Option[T]` iff `T` is `Debug`; a `Map[K,V]` iff
 `V` are `Debug`. These are the only conditional (constrained) built-in `Debug` instances; their
 element-wise rendering and the v1 nesting boundary are specified in *Container Debug Rendering*
 below.
+
+**Scalar debug-forms.** The scalar leaf forms split by whether the type is textual or not. `Int`,
+`Float`, `Bool`, and the sized integers render **bare** — their `debug()` equals their `display()`.
+The textual scalars render **quoted and escaped** in their own source-literal syntax, so a debug
+string is re-readable and unambiguous about its type: `Str.debug()` is double-quoted (`"a".debug()`
+is `"\"a\""`), and `Char.debug()` is single-quoted (`'a'.debug()` is `"'a'"`). The single-quote
+delimiter keeps a `Char` distinct from a one-character `Str` in debug output, and — because it treats
+the character as text rather than its integer code point — keeps `Debug` consistent with `Char` not
+being a numeric type (§3c). A `Char` is **never** rendered as its bare code point: `'a'.debug()` is
+`'a'`, not `97`.
+
+`Char.debug()` escapes exactly the ratified `Char` literal escape set (§2, char literals): `\n`,
+`\r`, `\t`, `\\`, `\b`, `\f`, `\0`, and `\'`. Every other scalar — all printable ASCII and every
+non-ASCII Unicode scalar — is emitted as its literal UTF-8 character between the quotes. This gives
+the invariant that **`Char.debug()` emits only escapes the lexer already accepts**: for any `Char`
+`c` in the ratified literal set, `c.debug()` is a valid `Char` literal that reconstructs `c`
+(round-trip). The one v1 gap is a non-printable scalar that has no named escape (e.g. `U+0007` BEL):
+it is emitted as its raw byte(s) between the quotes, which is faithful but not always legible and not
+re-readable. A `'\u{N}'` output form for those is deferred to the task that adds `\u{...}` as input
+syntax (tracked in `qvan6m`), so input and output escaping land together.
+
+| `Char` value | `debug()` | | `Char` value | `debug()` |
+|---|---|---|---|---|
+| `'a'` | `'a'` | | `'\n'` | `'\n'` |
+| `'1'` | `'1'` (≠ `Int` `1` → `1`) | | `'\''` | `'\''` |
+| `' '` | `' '` | | `'\\'` | `'\\'` |
+| `'😀'` | `'😀'` (raw UTF-8) | | `'\0'` | `'\0'` |
+
+The `Char` debug-form flows unchanged into every container position — a `Char` struct field, a
+`List[Char]` element, an `Option[Char]` inner value, and a `Map[Char, V]` key all render via the same
+`Char.debug()`, so they agree by construction. A `Map[Char, Int]` with the entry `'a' -> 1` renders
+`{'a': 1}`; a `List[Char]` of `['h', 'i']` renders `['h', 'i']`.
 
 ##### Display Trait Shape
 
@@ -2490,7 +2523,9 @@ inv.debug()
 
 `Str` elements render quoted because the elements use debug-form: `List[Str]` of `["a", "b"]`
 renders `["a", "b"]` (with the inner quotes), and a `Map[Str, Int]` with the entry `"a" -> 1`
-renders `{"a": 1}`. Scalar elements render bare: `List[Int]` of `[1, 2, 3]` renders `[1, 2, 3]`.
+renders `{"a": 1}`. `Char` elements likewise render single-quoted (`List[Char]` of `['a', 'b']`
+renders `['a', 'b']`), per the scalar debug-forms rule above. Numeric scalar elements render bare:
+`List[Int]` of `[1, 2, 3]` renders `[1, 2, 3]`.
 
 **Conditional Debug — non-Debug element, key, or value.** A container field is Debug-renderable
 only when its type argument(s) are `Debug`. If an element type, a map key type, or a map value type

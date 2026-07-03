@@ -1931,6 +1931,49 @@ BLINK_RT_FN const char* blink_char_to_str(int64_t code) {
 }
 #endif
 
+/* Debug-form of a Char: the character in single quotes, escaping exactly the
+ * ratified Char-literal escape set (\n \r \t \\ \b \f \0 \'); every other scalar
+ * (printable ASCII + all non-ASCII) is emitted as its literal UTF-8 char between
+ * the quotes. Sole owner of Char quote/escape logic across every @derive(Debug)
+ * site. See decisions/char-debug-form.md. A '\u{N}' form for non-printable
+ * scalars with no named escape is deferred (task qvan6m); until then such a
+ * scalar is emitted as its raw byte(s). */
+BLINK_RT_FN const char* blink_char_debug(int64_t code);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN const char* blink_char_debug(int64_t code) {
+    const char* esc = 0;
+    switch (code) {
+        case '\n': esc = "\\n"; break;
+        case '\r': esc = "\\r"; break;
+        case '\t': esc = "\\t"; break;
+        case '\\': esc = "\\\\"; break;
+        case '\b': esc = "\\b"; break;
+        case '\f': esc = "\\f"; break;
+        case '\0': esc = "\\0"; break;
+        case '\'': esc = "\\'"; break;
+        default: break;
+    }
+    if (esc) {
+        char* buf = (char*)blink_alloc(5);
+        buf[0] = '\'';
+        buf[1] = esc[0];
+        buf[2] = esc[1];
+        buf[3] = '\'';
+        buf[4] = '\0';
+        return buf;
+    }
+    const char* body = blink_str_from_char_code(code);
+    int64_t n = 0;
+    while (body[n] != '\0') n++;
+    char* buf = (char*)blink_alloc(n + 3);
+    buf[0] = '\'';
+    for (int64_t i = 0; i < n; i++) buf[i + 1] = body[i];
+    buf[n + 1] = '\'';
+    buf[n + 2] = '\0';
+    return buf;
+}
+#endif
+
 BLINK_RT_FN int64_t blink_char_at_opt_raw(const char* s, int64_t i);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN int64_t blink_char_at_opt_raw(const char* s, int64_t i) {
