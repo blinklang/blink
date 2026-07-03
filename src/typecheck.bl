@@ -36,6 +36,7 @@ import diagnostics.{
     ASSIGNMENT_IN_PREDICATE, IMPURE_BODY_FOR_PURE_ANNOTATION,
     MODIFIES_ARG_NOT_SIMPLE_PATH,
     MAP_KEY_NOT_HASHABLE,
+    NON_DERIVABLE_TRAIT,
     DERIVE_DEBUG_FIELD_NO_DEBUG, STR_PLUS_UNSUPPORTED,
     PRIVATE_ITEM_ACCESS, AMBIGUOUS_IMPORT, IMPORT_NOT_SELECTED,
     MODULE_QUALIFIED_TYPE,
@@ -1217,6 +1218,122 @@ fn tc_check_derive_debug() ! Diag.Report {
         }
         ti = ti + 1
     }
+}
+
+// ---------------------------------------------------------------------------
+// E1401 NonDerivableTrait — spec §3.6.6: a @derive(Hash/Eq/Ord) type may only
+// contain fields whose type itself implements the derived trait. Modeled on
+// tc_check_derive_debug (the Debug-field pass). Fail-open on generic /
+// unresolved names so the compiler's own generic code keeps typechecking.
+//
+// v1 policy (spec §3.4:329): collections (List/Map/Set/Option/Result) have no
+// value-equality/hash/ordering — `==` is pointer identity and there is no
+// Eq/Hash/Ord impl for them as value types — so they are rejected under any of
+// the three derives. Per-scalar: Float is not Hashable; Bool is not Orderable.
+
+// Is a bare scalar type name integer-like (Int / sized ints / Char)?
+fn tc_is_integer_scalar(n: Str) -> Int {
+    if n == "Int" || n == "Char" { return 1 }
+    if n == "I8" || n == "I16" || n == "I32" || n == "I64" { return 1 }
+    if n == "U8" || n == "U16" || n == "U32" || n == "U64" { return 1 }
+    0
+}
+
+fn tc_is_float_scalar(n: Str) -> Int {
+    if n == "Float" || n == "F32" || n == "F64" { return 1 }
+    0
+}
+
+// Does the named field type satisfy `tr` ("Hash"/"Eq"/"Ord")? Returns 1 for
+// OK, 0 for reject. Fails OPEN (returns 1) for names that are neither a builtin
+// scalar nor a known user type — generics / type params we can't resolve here.
+fn tc_field_type_derivable(ftype_name: Str, tr: Str) -> Int {
+    // Collections are never value-comparable/hashable/orderable in v1.
+    if tc_is_container_name(ftype_name) != 0 { return 0 }
+
+    // Tuple struct fields: a tuple is structurally Hash/Eq/Ord when its
+    // elements are, but codegen (emit_struct_hash/_eq/_cmp) cannot synthesize a
+    // per-tuple adapter for a struct FIELD today — it emits a BLINK_COMPILER_BUG
+    // sentinel and a degenerate constant hash. Reject here so the failure is a
+    // clear E1401 instead of a silent hash collapse. (Tuples as Map KEYS take a
+    // different codegen path and remain supported.) Follow-up: sr04fj-class.
+    if ftype_name == "Tuple" { return 0 }
+
+    if tc_is_integer_scalar(ftype_name) != 0 { return 1 }
+    if ftype_name == "Str" {
+        // Str is Hash + Eq + Ord.
+        return 1
+    }
+    if ftype_name == "Bool" {
+        // Bool: Hash + Eq, but NOT Ord.
+        if tr == "Ord" { return 0 }
+        return 1
+    }
+    if tc_is_float_scalar(ftype_name) != 0 {
+        // Float: Eq + Ord, but NOT Hash.
+        if tr == "Hash" { return 0 }
+        return 1
+    }
+
+    // User type: it must itself carry the trait (derive or hand-impl).
+    let bare = strip_module_qualifier(ftype_name)
+    if named_type_map.contains_key(ftype_name) || named_type_map.contains_key(bare) {
+        if tr == "Hash" {
+            if tc_hashable_types.contains_key(ftype_name) || tc_hashable_types.contains_key(bare) { return 1 }
+            return 0
+        }
+        if tr == "Eq" {
+            if tc_type_has_eq_impl(ftype_name) != 0 || tc_type_has_eq_impl(bare) != 0 { return 1 }
+            return 0
+        }
+        // Ord
+        if tc_type_has_ord_impl(ftype_name) != 0 || tc_type_has_ord_impl(bare) != 0 { return 1 }
+        return 0
+    }
+
+    // Generic type param / unknown name — fail open.
+    1
+}
+
+fn tc_check_one_derive_trait_field(f: Int, tname: Str, tr: Str) ! Diag.Report {
+    let ann = node_value(f)
+    let ftype_name = node_name(ann)
+    if tc_field_type_derivable(ftype_name, tr) == 0 {
+        diag_error_at("NonDerivableTrait", NON_DERIVABLE_TRAIT, "@derive({tr}) on '{tname}': field '{node_name(f)}' has type '{ftype_name}' which does not implement {tr}", f, "remove the field from the derive, give it a type that implements {tr}, or implement {tr} by hand")
+    }
+}
+
+fn tc_check_one_derive_trait(tr: Str) ! Diag.Report {
+    let mut ti = 0
+    while ti < named_type_names.len() {
+        let tname = named_type_names.get(ti).unwrap()
+        let td = tc_type_decl_nodes.get(tname) ?? -1
+        if td != -1 && type_has_derive(td, tr) != 0 {
+            let flds_sl = node_fields(td)
+            let mut i = 0
+            while flds_sl != -1 && i < sublist_length(flds_sl) {
+                let f = sublist_get(flds_sl, i)
+                if node_kind(f) == NodeKind.TypeVariant {
+                    let vflds_sl = node_fields(f)
+                    let mut vi = 0
+                    while vflds_sl != -1 && vi < sublist_length(vflds_sl) {
+                        tc_check_one_derive_trait_field(sublist_get(vflds_sl, vi), tname, tr)
+                        vi = vi + 1
+                    }
+                } else {
+                    tc_check_one_derive_trait_field(f, tname, tr)
+                }
+                i = i + 1
+            }
+        }
+        ti = ti + 1
+    }
+}
+
+fn tc_check_derive_hash_eq_ord() ! Diag.Report {
+    tc_check_one_derive_trait("Hash")
+    tc_check_one_derive_trait("Eq")
+    tc_check_one_derive_trait("Ord")
 }
 
 // Kind A collision: a struct type whose name equals an enum variant name. This is the
@@ -2511,6 +2628,10 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
 
     // @derive(Debug) requires every user-type field to also derive Debug.
     tc_check_derive_debug()
+
+    // @derive(Hash/Eq/Ord) requires every field's type to implement that trait
+    // (spec §3.6.6 NonDerivableTrait, E1401).
+    tc_check_derive_hash_eq_ord()
 
     // Register all function signatures
     let fns_sl = node_params(program)

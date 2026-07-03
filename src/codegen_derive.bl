@@ -8,6 +8,7 @@ import codegen_types.{
     c_fn_name, c_type_c_name, c_type_tag, canonical_struct_tag,
     type_from_name,
     is_hash_scalar_ct,
+    kops_table_name, c_type_str,
     ensure_struct_result_type,
     is_struct_type, is_enum_type, is_data_enum,
     has_derive_method,
@@ -1718,27 +1719,58 @@ fn emit_promote_list(desc: Str) ! Codegen.Emit {
     emit_line("")
 }
 
+// Emit the key argument for blink_map_set inside a map-promote loop and return
+// the C expression to pass as the `const void* key`.
+//   Str  → promote the pointer into `target` (kops stores the pointer).
+//   Bool → exact 1-byte temp (key_size==1); blink_map_set memcpy's key_size bytes.
+//   Int / sized-int / Char → width-exact temp read via map_key_read_expr.
+// Struct/tuple keys aren't reachable here yet (descriptor can't encode them);
+// the kops_table_name sentinel would surface the disagreement at C-compile time.
+fn emit_promote_map_key(kct: Int, slot: Str) -> Str ! Codegen.Emit {
+    if kct == CT_STRING {
+        // blink_map_key_slot already dereferences the pointer slot for non-inline
+        // keys, so it yields the stored `const char*` directly.
+        emit_line("const char* _k = blink_promote_str(target, (const char*)({slot}));")
+        return "_k"
+    }
+    if kct == CT_BOOL {
+        emit_line("uint8_t _k = *(const uint8_t*)({slot});")
+        return "&_k"
+    }
+    // Int / sized-int / Char: read the inline key at its exact width.
+    emit_line("{c_type_str(kct)} _k = {map_key_read_expr(kct, slot)};")
+    "&_k"
+}
+
 fn emit_promote_map(desc: Str) ! Codegen.Emit {
     let rest = desc.slice(2, desc.len())
     let bar = rest.index_of("|")
+    let kd = rest.slice(0, bar)
     let vd = rest.slice(bar + 1, rest.len())
+    let kct = desc_primary_ct(kd)
+    let kops = kops_table_name(kct, "")
     let mangle = descriptor_mangle(desc)
     emit_line("static blink_map* blink_promote_{mangle}(blink_arena_t* target, blink_map* src) \{")
     cg_indent = cg_indent + 1
     emit_line("if (src == NULL) return NULL;")
     emit_line("blink_arena_t* __save = __blink_current_arena;")
     emit_line("__blink_current_arena = target;")
-    emit_line("blink_map* dst = blink_map_new(&blink_kops_str);")
+    emit_line("blink_map* dst = blink_map_new(&{kops});")
     emit_line("__blink_current_arena = __save;")
+    emit_line("size_t _stride = blink_kops_stride(src->kops);")
     emit_line("for (int64_t _i = 0; _i < src->cap; _i++) \{")
     cg_indent = cg_indent + 1
     emit_line("if (src->states[_i] != 1) continue;")
-    emit_line("const char* _k = blink_promote_str(target, ((const char**)src->keys)[_i]);")
+    emit_line("\{")
+    cg_indent = cg_indent + 1
+    let key_arg = emit_promote_map_key(kct, "blink_map_key_slot(src, _i, _stride)")
     let vct = desc_primary_ct(vd)
     let stored = emit_promote_elem_into("src->values[_i]", vct, vd)
     emit_line("__blink_current_arena = target;")
-    emit_line("blink_map_set(dst, _k, {stored});")
+    emit_line("blink_map_set(dst, {key_arg}, {stored});")
     emit_line("__blink_current_arena = __save;")
+    cg_indent = cg_indent - 1
+    emit_line("}")
     cg_indent = cg_indent - 1
     emit_line("}")
     emit_line("return dst;")
