@@ -1344,6 +1344,12 @@ pub fn ct_to_descriptor(ct: Int, sname: Str) -> Str {
     if ct == CT_FLOAT { return "P:Float" }
     if ct == CT_BOOL { return "P:Bool" }
     if ct == CT_STRING { return "P:Str" }
+    // Narrow ints and Char must carry their exact width through the descriptor;
+    // collapsing them to "P:Int" picks blink_kops_i64 (8-byte stride) and an
+    // 8-byte over-read for a narrow inline map key, corrupting it (bug 2aw8mt).
+    if ct == CT_CHAR { return "P:{c_type_tag(ct)}" }
+    if ct == CT_I8 || ct == CT_I16 || ct == CT_I32 { return "P:{c_type_tag(ct)}" }
+    if ct == CT_U8 || ct == CT_U16 || ct == CT_U32 || ct == CT_U64 { return "P:{c_type_tag(ct)}" }
     if ct == CT_STRUCT || ct == CT_VOID {
         if sname != "" { return "S:{sname}" }
         return "P:Int"
@@ -1388,6 +1394,11 @@ pub fn descriptor_c_type(desc: Str) -> Str {
     if desc == "P:Float" { return "double" }
     if desc == "P:Bool" { return "int64_t" }
     if desc == "P:Str" { return "const char*" }
+    // Narrow int / Char primitive tags (bug 2aw8mt): the exact-match primitive
+    // branches above handled Int/Float/Bool/Str, so any remaining "P:" here is a
+    // narrow tag — emit its exact C type so a narrow int used as a Map value or
+    // Option/Result inner declares the right field width instead of int64_t.
+    if desc.starts_with("P:") { return c_type_str(desc_primary_ct(desc)) }
     if desc.starts_with("C:") { return "blink_closure*" }
     if desc.starts_with("S:") {
         let name = desc.slice(2, desc.len())
@@ -1640,9 +1651,16 @@ fn emit_promote_struct(desc: Str) ! Codegen.Emit {
 // destination is pushed back into the new container. Returns the emitted C expression
 // that evaluates to the stored void* pointer for the promoted element.
 pub fn emit_promote_elem_into(src_expr: Str, ct: Int, desc: Str) -> Str ! Codegen.Emit {
+    // Int, Bool, and every narrow int / Char store their value inline in the
+    // list's void* element slot; none has a blink_promote_<tag> walker. Since
+    // ct_to_descriptor now carries narrow widths (bug 2aw8mt), guard them here
+    // too or the compound catch-all below emits a nonexistent blink_promote_i32.
     if ct == CT_INT || ct == CT_BOOL {
         return "(void*)(intptr_t){src_expr}"
     }
+    if ct == CT_I8 || ct == CT_I16 || ct == CT_I32 { return "(void*)(intptr_t){src_expr}" }
+    if ct == CT_U8 || ct == CT_U16 || ct == CT_U32 || ct == CT_U64 { return "(void*)(intptr_t){src_expr}" }
+    if ct == CT_CHAR { return "(void*)(intptr_t){src_expr}" }
     if ct == CT_STRING {
         return "(void*)blink_promote_str(target, (const char*){src_expr})"
     }
@@ -1684,6 +1702,17 @@ pub fn desc_primary_ct(desc: Str) -> Int {
     if desc == "P:Float" { return CT_FLOAT }
     if desc == "P:Bool" { return CT_BOOL }
     if desc == "P:Str" { return CT_STRING }
+    // Narrow int / Char tags carried by ct_to_descriptor (bug 2aw8mt); decode
+    // to the exact CT so kops_table_name / map_key_read_expr pick the right
+    // stride and width.
+    if desc == "P:i8" { return CT_I8 }
+    if desc == "P:i16" { return CT_I16 }
+    if desc == "P:i32" { return CT_I32 }
+    if desc == "P:u8" { return CT_U8 }
+    if desc == "P:u16" { return CT_U16 }
+    if desc == "P:u32" { return CT_U32 }
+    if desc == "P:u64" { return CT_U64 }
+    if desc == "P:char" { return CT_CHAR }
     if desc == "C:Closure" { return CT_CLOSURE }
     if desc.starts_with("S:") { return CT_STRUCT }
     if desc.starts_with("L:") { return CT_LIST }
