@@ -14,6 +14,11 @@
 //   2. poly impl, correct arity (2 args for 2 tparams) -> NO E0910.
 //   3. CONCRETE impl, arity mismatch -> E0910 fires without the E0908 poly gate,
 //      and still no leaked 'U' (guard holds even without impl binders).
+//   4. (wz48pq) METHODLESS generic trait, arity mismatch -> E0910 fires; the
+//      trait tparam count comes from the declaration, not per-method sigs.
+//   5. (wz48pq) METHODLESS generic trait, correct arity -> NO E0910.
+//   6. (wz48pq) METHODLESS generic trait, bracketless under-supply (0 args) ->
+//      E0910 fires via the node_type_params(im) == -1 branch.
 import std.process { ProcessResult }
 
 fn run_check(blink_root: Str, base: Str, fname: Str, src: Str) -> ProcessResult {
@@ -89,6 +94,53 @@ fn main() {
     if r3.out.contains("expected 'U'") {
         io.println("FAIL: case 3 leaks the raw unbound trait tparam 'U' into a message")
         io.println("got: {r3.out}")
+        shell_exec("rm -rf {base}")
+        return
+    }
+    // Case 4 (wz48pq): a METHODLESS generic trait with wrong arity. The trait has
+    // no method sigs, so the pre-fix arity check -- which derived the trait tparam
+    // count from tc_tmsig_pool (per-method entries) -- found no entry and silently
+    // skipped E0910. The count must instead come from the trait declaration
+    // (node_type_params at register_trait), so a 2-arg impl of a 1-tparam trait
+    // reports E0910 even with no methods to contract-check.
+    let src4 = "pub trait Marker[T] \{\}\n\ntype Foo \{ x: Int \}\n\nimpl Marker[Int, Str] for Foo \{\}\n\nfn main() \{\n    io.println(\"unreachable\")\n\}\n"
+    let r4 = run_check(blink_root, base, "mvce4.bl", src4)
+    if r4.exit_code == 0 {
+        io.println("FAIL: case 4 methodless wrong-arity impl should be rejected, but check exited 0")
+        shell_exec("rm -rf {base}")
+        return
+    }
+    if !r4.out.contains("\"code\":\"E0910\"") {
+        io.println("FAIL: case 4 methodless generic-trait wrong arity should report E0910")
+        io.println("got: {r4.out}")
+        shell_exec("rm -rf {base}")
+        return
+    }
+    // Case 5 (wz48pq): correct arity on a methodless generic trait must NOT trip
+    // E0910 -- the fix reports on true arity mismatch, not on all methodless impls.
+    let src5 = "pub trait Marker[T] \{\}\n\ntype Foo \{ x: Int \}\n\nimpl Marker[Int] for Foo \{\}\n\nfn main() \{\n    io.println(\"ok\")\n\}\n"
+    let r5 = run_check(blink_root, base, "mvce5.bl", src5)
+    if r5.out.contains("\"code\":\"E0910\"") {
+        io.println("FAIL: case 5 correct-arity methodless impl must NOT report E0910")
+        io.println("got: {r5.out}")
+        shell_exec("rm -rf {base}")
+        return
+    }
+    // Case 6 (wz48pq): bracketless UNDER-supply -- `impl Marker for Foo` on a
+    // 1-tparam trait supplies zero trait args. This hits a distinct branch
+    // (node_type_params(im) == -1 -> supplied_trait_args stays 0), separate from
+    // the over-supply path in case 4; the count still comes from the declaration,
+    // so E0910 fires for "supplies 0 but declares 1".
+    let src6 = "pub trait Marker[T] \{\}\n\ntype Foo \{ x: Int \}\n\nimpl Marker for Foo \{\}\n\nfn main() \{\n    io.println(\"unreachable\")\n\}\n"
+    let r6 = run_check(blink_root, base, "mvce6.bl", src6)
+    if r6.exit_code == 0 {
+        io.println("FAIL: case 6 bracketless zero-arg impl of a generic trait should be rejected, but check exited 0")
+        shell_exec("rm -rf {base}")
+        return
+    }
+    if !r6.out.contains("\"code\":\"E0910\"") {
+        io.println("FAIL: case 6 bracketless under-supply should report E0910")
+        io.println("got: {r6.out}")
         shell_exec("rm -rf {base}")
         return
     }

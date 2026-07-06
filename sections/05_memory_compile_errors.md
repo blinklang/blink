@@ -2,9 +2,11 @@
 
 ### 5.1 Tracing GC as Default
 
-Blink uses a modern tracing garbage collector as its default memory management strategy. The GC is generational, concurrent, and optimized for low pause times (sub-millisecond target).
+Blink uses a tracing garbage collector as its default memory management strategy. The shipping collector is the Boehm-Demers-Weiser conservative collector: tracing, stop-the-world, and non-generational.
 
 The programmer does not think about memory. There are no lifetime annotations, no ownership transfers, no borrow checker. You allocate, you use, the runtime cleans up.
+
+**Forward-looking:** Generational, concurrent, and low-pause (sub-millisecond) collection is a Phase 3 migration target -- a custom precise GC that replaces Boehm behind the `blink_alloc` abstraction if and when pause times become a measured bottleneck. The intervening Phase 2 introduces static reuse analysis, where the compiler inserts deterministic frees where provably safe. See `decisions/memory-management-gc.md` for the ratified Phase 1/2/3 path.
 
 ```blink
 fn process_request(req: Request) -> Response ! DB, IO {
@@ -26,7 +28,7 @@ No annotation on `summary`. No `Box`, `Rc`, `Arc`. No `&'a`. It just works.
 
 3. **Cognitive overhead destroys locality.** A function with three lifetime parameters requires understanding the lifetime relationships of its entire call graph. This is the opposite of "a function's behavior is determinable from its signature."
 
-4. **GC is proven at scale.** Go serves millions of RPS with sub-millisecond GC pauses. Discord moved from Go to Rust for specific tail-latency reasons -- most services never hit that bar. Java runs the world's financial infrastructure. The "GC is slow" argument died somewhere around 2015.
+4. **GC is proven at scale.** Go serves millions of RPS with sub-millisecond GC pauses in its own collector; Java runs the world's financial infrastructure. That is industry evidence that GC at scale is viable -- the "GC is slow" argument died somewhere around 2015 -- not a claim about Blink's current Boehm collector. Discord moved from Go to Rust for specific tail-latency reasons; most services never hit that bar.
 
 5. **Deterministic resource cleanup is orthogonal to GC.** File handles, sockets, database connections -- these are managed through the `Closeable` trait and `with...as` scoped resource blocks, not GC finalization. The GC manages memory. `Closeable` manages resources. See section 5.5.
 
@@ -252,7 +254,7 @@ fn process_all(items: List[Item]) -> List[Result] {
 }
 ```
 
-**Generational hypothesis:** Short-lived objects (most objects) are collected cheaply in the young generation. Long-lived objects are promoted to old generation and collected infrequently. The effect system provides scope information that helps the GC tune generation boundaries.
+**Generational collection (forward-looking):** The shipping Boehm collector is non-generational — it does not segregate young from old objects. A future precise collector (the Phase 3 target in §5.1) could exploit the generational hypothesis: short-lived objects (most objects) collected cheaply in a young generation, long-lived objects promoted and collected infrequently, with the effect system's scope information helping tune generation boundaries. This is not current behavior; see `decisions/memory-management-gc.md`.
 
 ### 5.5 Deterministic Resource Cleanup: `Closeable` + `with...as`
 

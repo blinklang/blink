@@ -187,6 +187,11 @@ let mut tc_display_impl_types: List[Str] = []
 // Both keyed "{type}\t{method}".
 let mut tc_method_trait_count_idx: Map[Str, Int] = Map()
 let mut tc_method_trait_names_idx: Map[Str, Str] = Map()
+// wz48pq: trait-level type-param count keyed by trait NAME, populated in
+// register_trait for EVERY trait (methodless or not). validate_trait_impls
+// reads this for the E0910 arg-arity check; deriving it from tc_tmsig_pool
+// (per-method sigs) missed methodless traits, which have no sig entry.
+let mut tc_trait_tparam_count_idx: Map[Str, Int] = Map()
 
 fn tc_method_traits_key(tname: Str, method: Str) -> Str {
     "{tname}\t{method}"
@@ -2201,6 +2206,9 @@ fn register_trait(tr_node: Int) ! TypeCheck.Register {
             ti = ti + 1
         }
     }
+    // wz48pq: record the declared tparam count by trait name for the E0910
+    // arity check, independent of whether the trait has any methods.
+    tc_trait_tparam_count_idx.insert(name, tp_count)
     let methods_sl = node_methods(tr_node)
     if methods_sl != -1 {
         let mut i = 0
@@ -2413,18 +2421,12 @@ fn validate_trait_impls(program: Int) ! TypeCheck.Register, Diag.Report {
         // subst_trait_type below returns its raw name and the per-param check
         // prints a bogus `expected 'U'`. Report a dedicated arity error instead
         // and skip the per-param comparison (trait_arg_arity_ok) so no unbound
-        // name leaks. tparams_count is trait-level, so any method sig carries it;
-        // a methodless trait has no sig and no method contract to check.
-        let mut trait_tparam_count = -1
-        let mut tsi = 0
-        while tsi < tc_tmsig_pool.len() {
-            let ts = tc_tmsig_pool.get(tsi).unwrap()
-            if ts.trait_name == trait_name {
-                trait_tparam_count = ts.tparams_count
-                break
-            }
-            tsi = tsi + 1
-        }
+        // name leaks.
+        // wz48pq: the count comes from the trait DECLARATION (register_trait
+        // records node_type_params by name), not from tc_tmsig_pool -- a
+        // methodless trait has no sig entry, so the old per-method scan left
+        // trait_tparam_count at -1 and silently skipped the arity check.
+        let trait_tparam_count = tc_trait_tparam_count_idx.get(trait_name) ?? -1
         let mut supplied_trait_args = 0
         if trait_args_sl != -1 {
             supplied_trait_args = sublist_length(trait_args_sl)
@@ -2590,6 +2592,7 @@ fn init_types() ! TypeCheck.Register {
     tc_tmsig_pool.clear()
     tc_tmsig_param_names.clear()
     tc_trait_tparam_names.clear()
+    tc_trait_tparam_count_idx.clear()
     tc_current_fn_ret = -1
     tc_current_fn_name = ""
     tc_errors.clear()
@@ -2793,6 +2796,15 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
     tc_trait_names.push("Into")
     tc_trait_names.push("Iterator")
     tc_trait_names.push("IntoIterator")
+    // wz48pq: these builtins are single-tparam (From[T], Into[T], ...); record
+    // their arity so E0910 fires for impls that supply the wrong count. From/
+    // Into/TryFrom are also declared in lib/std/traits.bl and pass through
+    // register_trait -- the Map is keyed by name so last-write-wins agrees (1).
+    tc_trait_tparam_count_idx.insert("From", 1)
+    tc_trait_tparam_count_idx.insert("TryFrom", 1)
+    tc_trait_tparam_count_idx.insert("Into", 1)
+    tc_trait_tparam_count_idx.insert("Iterator", 1)
+    tc_trait_tparam_count_idx.insert("IntoIterator", 1)
 
     // Register impl method signatures
     let impls_sl = node_methods(program)
