@@ -29,7 +29,7 @@ import diagnostics.{
     TRAIT_CONTRACT_900, TRAIT_CONTRACT_901, TRAIT_CONTRACT_902,
     TRAIT_CONTRACT_903, TRAIT_CONTRACT_904, TRAIT_CONTRACT_905,
     TRAIT_CONTRACT_906, TRAIT_CONTRACT_907, SEALED_METHOD_OVERRIDE,
-    POLY_IMPL_UNSUPPORTED, IMPL_BINDER_UNUSED,
+    POLY_IMPL_UNSUPPORTED, IMPL_BINDER_UNUSED, TRAIT_ARG_ARITY,
     CONTRACT_PREDICATE_NOT_DECIDABLE, EFFECTFUL_CALL_IN_PREDICATE,
     IMPURE_CALL_IN_PREDICATE, LOOP_IN_PREDICATE,
     RESULT_OUTSIDE_ENSURES, OLD_OUTSIDE_ENSURES,
@@ -2409,6 +2409,31 @@ fn validate_trait_impls(program: Int) ! TypeCheck.Register, Diag.Report {
                 }
             }
         }
+        // 9jq7qx: a wrong trait-arg count would leave a trait tparam unbound, so
+        // subst_trait_type below returns its raw name and the per-param check
+        // prints a bogus `expected 'U'`. Report a dedicated arity error instead
+        // and skip the per-param comparison (trait_arg_arity_ok) so no unbound
+        // name leaks. tparams_count is trait-level, so any method sig carries it;
+        // a methodless trait has no sig and no method contract to check.
+        let mut trait_tparam_count = -1
+        let mut tsi = 0
+        while tsi < tc_tmsig_pool.len() {
+            let ts = tc_tmsig_pool.get(tsi).unwrap()
+            if ts.trait_name == trait_name {
+                trait_tparam_count = ts.tparams_count
+                break
+            }
+            tsi = tsi + 1
+        }
+        let mut supplied_trait_args = 0
+        if trait_args_sl != -1 {
+            supplied_trait_args = sublist_length(trait_args_sl)
+        }
+        let mut trait_arg_arity_ok = 1
+        if trait_tparam_count >= 0 && supplied_trait_args != trait_tparam_count {
+            trait_arg_arity_ok = 0
+            diag_error_at("TraitContract", TRAIT_ARG_ARITY, "impl of trait '{trait_name}' supplies {supplied_trait_args} type argument(s) but '{trait_name}' declares {trait_tparam_count}", im, "supply one type argument per trait type parameter: 'impl {trait_name}[...] for {impl_type}'")
+        }
         // 4q2etk: replaced by mwxtyj — Display.display is a synthesized sealed
         // method (decision 344dnd): the compiler derives it from the impl's
         // `fmt`, so a user impl may not define it. The remaining contract
@@ -2449,7 +2474,11 @@ fn validate_trait_impls(program: Int) ! TypeCheck.Register, Diag.Report {
                             }
                             if trait_pcount != impl_pcount {
                                 diag_error_at("TraitContract", TRAIT_CONTRACT_901, "method '{expected_method}' in impl {trait_name} for {impl_type} has {impl_pcount} params, expected {trait_pcount}", impl_m, "trait requires {trait_pcount} parameters (including self)")
-                            } else {
+                            } else if trait_arg_arity_ok != 0 {
+                                // Skipped when the impl's trait-arg arity is
+                                // wrong (E0910 already reported): subst_trait_type
+                                // would otherwise leak an unbound trait tparam
+                                // name into the expected type (9jq7qx).
                                 // Check param types
                                 let tp_start = tmsig.params_start
                                 let mut pi = 0

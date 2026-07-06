@@ -1,0 +1,99 @@
+// 9jq7qx -- a poly impl that supplies fewer trait-args than the trait has
+// tparams must report a DEDICATED arity error (E0910), not leak a raw unbound
+// trait tparam name into an E0902 "expected '<tparam>'" message.
+//
+// MVCE: trait From2[T, U] implemented as `impl[T] From2[T] for Box[T]` supplies
+// ONE trait arg (From2[T]) for a TWO-tparam trait. Before the fix,
+// subst_trait_type fell through for the unbound 'U' and returned the raw name,
+// so the contract loop reported: param has type 'Int', expected 'U' -- 'U' being
+// an unbound trait tparam, not a concrete type.
+//
+// Cases:
+//   1. poly impl, arity mismatch (1 arg for 2 tparams) -> E0910 fires; the
+//      misleading "expected 'U'" (raw unbound tparam) MUST NOT appear.
+//   2. poly impl, correct arity (2 args for 2 tparams) -> NO E0910.
+//   3. CONCRETE impl, arity mismatch -> E0910 fires without the E0908 poly gate,
+//      and still no leaked 'U' (guard holds even without impl binders).
+import std.process { ProcessResult }
+
+fn run_check(blink_root: Str, base: Str, fname: Str, src: Str) -> ProcessResult {
+    write_file("{base}/{fname}", src)
+    let cmd = "cd {base} && {blink_root}/build/blink check --json {fname} 2>&1"
+    return process_run("sh", ["-c", cmd])
+}
+
+fn main() {
+    let blink_root = process_run("sh", ["-c", "pwd -P"]).out.trim_right()
+    let base = ".tmp/_test_impl_trait_arg_arity"
+    shell_exec("rm -rf {base}")
+    shell_exec("mkdir -p {base}")
+    write_file(
+        "{base}/blink.toml",
+        "[package]\nname = \"itaa\"\nversion = \"0.1.0\"\n\n[dependencies]\n"
+    )
+    // Case 1: one trait-arg for a two-tparam trait -> dedicated arity error.
+    let src1 = "pub trait From2[T, U] \{\n    fn op(self, x: T, y: U) -> T\n\}\n\ntype Box[V] \{ value: V \}\n\nimpl[T] From2[T] for Box[T] \{\n    fn op(self, x: T, y: Int) -> T \{ x \}\n\}\n\nfn main() \{\n    io.println(\"unreachable\")\n\}\n"
+    let r1 = run_check(blink_root, base, "mvce1.bl", src1)
+    if r1.exit_code == 0 {
+        io.println("FAIL: case 1 arity-mismatch impl should be rejected, but check exited 0")
+        shell_exec("rm -rf {base}")
+        return
+    }
+    if !r1.out.contains("\"code\":\"E0910\"") {
+        io.println("FAIL: case 1 should report E0910 (trait-arg arity mismatch)")
+        io.println("got: {r1.out}")
+        shell_exec("rm -rf {base}")
+        return
+    }
+    // The core regression: the raw unbound tparam 'U' must no longer leak into
+    // any diagnostic message as a bogus "expected" concrete type.
+    if r1.out.contains("expected 'U'") {
+        io.println("FAIL: case 1 leaks the raw unbound trait tparam 'U' into a message")
+        io.println("got: {r1.out}")
+        shell_exec("rm -rf {base}")
+        return
+    }
+    // Case 2: correct arity (both trait args supplied) must NOT trip E0910. It
+    // still hits the E0908 codegen-not-ready gate for poly impls, which is fine.
+    let src2 = "pub trait From2[T, U] \{\n    fn op(self, x: T, y: U) -> T\n\}\n\ntype Box[V] \{ value: V \}\n\nimpl[T, U] From2[T, U] for Box[T] \{\n    fn op(self, x: T, y: U) -> T \{ x \}\n\}\n\nfn main() \{\n    io.println(\"unreachable\")\n\}\n"
+    let r2 = run_check(blink_root, base, "mvce2.bl", src2)
+    if r2.out.contains("\"code\":\"E0910\"") {
+        io.println("FAIL: case 2 correct-arity impl must NOT report E0910")
+        io.println("got: {r2.out}")
+        shell_exec("rm -rf {base}")
+        return
+    }
+    // Case 3: a CONCRETE (non-poly) impl of a generic trait with wrong arity.
+    // This isolates E0910 from the E0908 poly-codegen gate (which case 1 also
+    // trips), and confirms the per-param check stays suppressed so the raw
+    // unbound tparam 'U' does not leak even without any impl binders.
+    let src3 = "pub trait From2[T, U] \{\n    fn op(self, x: T, y: U) -> T\n\}\n\ntype Holder \{ v: Int \}\n\nimpl From2[Int] for Holder \{\n    fn op(self, x: Int, y: Int) -> Int \{ x \}\n\}\n\nfn main() \{\n    io.println(\"unreachable\")\n\}\n"
+    let r3 = run_check(blink_root, base, "mvce3.bl", src3)
+    if r3.exit_code == 0 {
+        io.println("FAIL: case 3 concrete wrong-arity impl should be rejected, but check exited 0")
+        shell_exec("rm -rf {base}")
+        return
+    }
+    if !r3.out.contains("\"code\":\"E0910\"") {
+        io.println("FAIL: case 3 concrete generic-trait wrong arity should report E0910")
+        io.println("got: {r3.out}")
+        shell_exec("rm -rf {base}")
+        return
+    }
+    if r3.out.contains("\"code\":\"E0908\"") {
+        io.println("FAIL: case 3 is a concrete impl, must NOT trip the E0908 poly-codegen gate")
+        io.println("got: {r3.out}")
+        shell_exec("rm -rf {base}")
+        return
+    }
+    if r3.out.contains("expected 'U'") {
+        io.println("FAIL: case 3 leaks the raw unbound trait tparam 'U' into a message")
+        io.println("got: {r3.out}")
+        shell_exec("rm -rf {base}")
+        return
+    }
+    io.println(
+        "PASS: trait-arg arity mismatch reports E0910 and no longer leaks a raw unbound tparam"
+    )
+    shell_exec("rm -rf {base}")
+}
