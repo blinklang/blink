@@ -6,6 +6,11 @@ description: Next: Pick and Work Blink Tasks
 
 Pick ready tasks from Bridge and execute the appropriate workflow based on type.
 
+`/next` **triages every picked task against the spec before working it** (Step 2.5). A ticket
+is a signal, not a mandate — past-you filing it can be speculative or contradict the spec.
+**Declining or reshaping a ticket is a valid, expected outcome**, not a failed run: the correct
+answer is sometimes "this shouldn't be done as written," and that counts as work done.
+
 **Usage:** `/next` (auto-picks, repo-scoped) · `/next <keyword>` (title match) · `/next <project>` (scope to a project)
 
 ---
@@ -75,9 +80,68 @@ If you're in repo-scoped mode and `$ARGUMENTS` was a keyword (matched no project
    - `type:chore` - auto-start, no confirmation needed.
 6. YOU MUST NOT skip a higher-priority task just because of its type. A P2 spec should be surfaced before a P4 feature.
 
+## Step 2.5: Triage Gate (MANDATORY before any `br start`)
+
+Every ticket selected in Step 2 passes through this gate **before** Step 3 runs `br start`.
+The gate is mandatory for `type:bug`, `type:chore`, `type:friction`, and `type:feature`.
+(`type:spec` already defers to `/deliberate`; `type:project` already requires confirmation —
+the spec-check still applies to their subtasks, but the "worth doing?" question is the user's
+call there.)
+
+**A ticket existing does not mean it must be done.** Past-you filing a ticket recorded observed
+behavior plus a *guessed* root cause or fix — the guess can violate the spec, be obsolete, or be
+subsumed by other work. DECLINE / RESHAPE / DEFER are first-class outcomes; the agent is **not
+failing** by not writing code.
+
+**Keep it lightweight — scale depth to the ticket.** For a sound, clearly-scoped ticket this is a
+~30-second spec probe ending in PROCEED, *not* a mini-deliberation. Go deep only when the ticket
+proposes a specific fix, looks speculative, or its premise smells off. Don't turn every run into a
+panel.
+
+### Part A — Verify against the spec (read-only first)
+
+1. `br show <id>` — read the ticket body in full. **Note existing agent notes**: a prior triage
+   may already have reached a verdict. If so, surface that verdict and confirm it rather than
+   re-litigating from scratch (unless the user has since overridden it).
+2. `rg` the relevant `sections/*.md` for the feature / warning code / behavior the ticket touches,
+   and read the governing rule in full. Also check `decisions/*.md` and `DECISIONS.md` for any past
+   vote that constrains this ticket (e.g. a 5-1 rejection of the intrinsics a migration would need).
+3. Confirm the ticket's **expected behavior** *and* its **proposed fix/approach** both match the
+   spec. Watch the axis-confusion trap: if the title says "X outside Y", verify which `Y` actually
+   exists in code before spec-hunting.
+4. If the ticket describes a fix that contradicts the spec, the real bug is often a *different* one
+   (e.g. a diagnostic / help-text bug, not the behavior the ticket asserts) — surface that.
+
+### Part B — Decide the verdict (exactly one per ticket)
+
+| Verdict | When | Action |
+|---|---|---|
+| **PROCEED** | Premise + approach match the spec; worth doing as written. | Continue to Step 3, route by type as normal. |
+| **RESHAPE** | Worth doing, but not the way the ticket says (wrong approach, over-scoped, partially spec-blocked). | `br note <id>` the corrected scope/approach + spec citations, then `br edit <id>` (`--title` / `--desc` / `--append`) to reflect the reshaped work. Then proceed with the reshaped version. |
+| **DEFER-TO-SPEC** | Needs a language-design decision (spec gap, or contradicts a normative rule only a panel can change). | `br note <id>` the finding + spec citations, re-tag `type:spec` (`br tag <id> type:spec` + `br untag <id> type:<old>`), tell the user to run `/deliberate`. Do NOT implement. |
+| **DECLINE** | Not worth doing at all — obsolete, already fixed in git, spec-blessed as-is, or subsumed by other work. | `br note <id>` the reasoning **with evidence** (git commit, spec line, superseding ticket id), then `br cancel <id>`. Report it as a legitimate `/next` outcome. |
+| **UNBLOCK-ONLY** | Really blocked — a soft-block stated in the body whose dependency was never wired. | Verify the blocker exists (`br show`), `br dep add <blocker> <blocked>` to silence it, drop it from this run, pick the next candidate. |
+
+### Rules for the gate
+
+- **Record the verdict on the ticket with `br note`** — not in a memory file. Include spec citations
+  (`sections/NN_*.md:line`) as evidence. This is the same format existing triage notes use.
+- **DECLINE and DEFER-TO-SPEC require user confirmation.** They change the backlog, so the user
+  keeps the final call: surface the verdict + spec evidence and **wait for the user's OK** before
+  running `br cancel` (DECLINE) or the re-tag to `type:spec` (DEFER).
+- **PROCEED, RESHAPE, and UNBLOCK-ONLY act without a pause.** RESHAPE keeps the ticket open and
+  merely corrects it via `br note` + `br edit`; UNBLOCK-ONLY just wires the dep and moves on.
+- **Batch runs:** collect all DECLINE / DEFER verdicts and confirm them together in **one** prompt
+  rather than blocking per-ticket — then proceed with the PROCEED / RESHAPE tickets.
+- If a prior agent note already reached a DECLINE / DEFER / RESHAPE verdict and the user hasn't
+  overridden it, surface that verdict and confirm rather than re-doing the whole analysis.
+
 ## Step 3: Route by Type
 
 ### type:bug — Auto-start, parallelizable
+(Step 2.5 triage must read PROCEED for this ticket — if it read RESHAPE, work the reshaped scope.
+The failing test encodes the **spec's** expected behavior, not merely the ticket's asserted
+behavior; they can differ, and the spec wins.)
 For each bug:
 1. `br start <id>`
 2. Read the task description, find relevant source files
@@ -85,7 +149,7 @@ For each bug:
 4. Fix the bug
 5. `task regen` then `task ci`
 6. run `/code-review --fix`
-6. `br close <id>`
+7. `br close <id>`
 
 When working multiple bugs: use parallel agents with worktrees. Each agent gets one bug.
 
@@ -101,6 +165,8 @@ For each friction item:
 5. Report what was created
 
 ### type:feature — Confirm first, parallelizable
+(Step 2.5 triage applies here too — implement the PROCEED scope, or the reshaped scope if it read
+RESHAPE, and build to what the spec says rather than the ticket's asserted approach.)
 1. Present all selected features with brief proposed approaches
 2. Wait for user approval of the batch
 3. Each feature: plan → implement → `task regen` → `task ci` → `/code-review --fix` → `br close <id>`
@@ -128,6 +194,8 @@ A `type:project` epic becomes a **first-class `br project`**, not a loose tag.
 2. Only work it directly if nothing else is available
 
 ### type:chore - Auto-start, parallelizable
+(Step 2.5 triage must read PROCEED — a chore that turns out spec-blessed-as-is or subsumed by other
+work is a DECLINE, not a grind. Work the reshaped scope if it read RESHAPE.)
 You can do chores and bugs at the same time.
 For each chore item:
 1. `br start <id>`
