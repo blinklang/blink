@@ -227,25 +227,25 @@ a per-capture descriptor slot for this purpose; details in
 
 ### 5.3 Compiler-Driven Optimization
 
-The compiler performs several optimizations that reduce GC pressure without programmer intervention:
+The current default path is plain Boehm GC: every heap allocation routes through `blink_alloc`, which is an unconditional `GC_MALLOC` (the arena effect in §5.2 is the only redirection). The optimizations below reduce GC pressure without programmer intervention, but they are the Phase 2 static-reuse-analysis roadmap from `decisions/memory-management-gc.md`, not current behavior.
 
-**Escape analysis:** Values proven not to escape a function are stack-allocated. No GC involvement. This is invisible to the programmer but handles the common case of temporary values.
+**Escape analysis (forward-looking):** A future compiler pass could prove that values do not escape a function and stack-allocate them, sidestepping the GC entirely for the common case of temporary values. Today the shipping Boehm path heap-allocates every list, map, and template through `blink_alloc` and does not stack-allocate non-escaping values; the stack-allocation comments in the example below describe the intended Phase 2 behavior, not today's codegen. This is a whole-function GC-avoidance analysis, distinct from the opt-in `with arena` escape analysis (§5.2, `src/escape.bl`), which classifies allocations inside a `with arena { }` block as promoted or escaped. This is not current behavior; see `decisions/memory-management-gc.md`.
 
 ```blink
 fn distance(a: Point, b: Point) -> Float {
-    let dx = a.x - b.x   // stack-allocated, never escapes
-    let dy = a.y - b.y   // stack-allocated, never escapes
+    let dx = a.x - b.x   // future: stack-allocated, never escapes
+    let dy = a.y - b.y   // future: stack-allocated, never escapes
     math.sqrt(dx * dx + dy * dy)
 }
 ```
 
-**Region inference:** The compiler identifies groups of allocations with correlated lifetimes and batches their deallocation. Within a loop body, temporaries created per iteration are freed together rather than individually traced.
+**Region inference (forward-looking):** A future compiler pass could identify groups of allocations with correlated lifetimes and batch their deallocation — within a loop body, temporaries created per iteration freed together rather than individually traced. This automatic batching is not current behavior; the shipping way to get batched/region deallocation today is the explicit `with arena { }` effect (§5.2), which frees the whole arena in one shot on scope exit. The example below illustrates the intended Phase 2 optimization. This is not current behavior; see `decisions/memory-management-gc.md`.
 
 ```blink
 fn process_all(items: List[Item]) -> List[Result] {
     items.map(fn(item) {
-        // The compiler infers that `parsed`, `validated`, and `enriched`
-        // all die at the end of this closure. They are batch-freed.
+        // Future: the compiler infers that `parsed`, `validated`, and
+        // `enriched` all die at the end of this closure and batch-frees them.
         let parsed = parse(item)
         let validated = validate(parsed)
         let enriched = enrich(validated)
