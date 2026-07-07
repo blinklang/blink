@@ -535,9 +535,32 @@ fn resolve_from_lockfile(dotted_path: Str, _src_root: Str) -> Option[Str] ! Diag
     None
 }
 
+// The reserved `blink.*` namespace (§07:1659) names compiler-internal
+// pseudo-modules — `blink.ffi` (FFI pointer types + intrinsic namespace) and
+// `blink.core` (ConversionError et al). These are part of the language
+// definition, not distributable packages, so they resolve to no file: the
+// `ffi` namespace and the `blink.core` types are compiler-known and usable
+// WITHOUT any import. `import blink.ffi[.{...}]` / `import blink.core[.{...}]`
+// are OPTIONAL documentation markers that must resolve as recognized inert
+// no-ops — never ModuleNotFound (q0brkj, 6-0; the two real FFI gates are
+// PtrOutsideFFI/E0811 and the #275 native-dependencies manifest requirement).
+fn is_blink_pseudo_module(dotted_path: Str) -> Int {
+    if dotted_path == "blink.ffi" { return 1 }
+    if dotted_path == "blink.core" { return 1 }
+    0
+}
+
 pub fn resolve_module_path(dotted_path: Str, src_root: Str) -> Str ! Diag.Report {
     let is_std_ns = dotted_path.starts_with("std.")
     let is_pkg_ns = dotted_path.starts_with("pkg.")
+
+    // Reserved blink.* pseudo-modules resolve to an inert sentinel before the
+    // orphan-file guard, so `import blink.ffi` from a file with no enclosing
+    // blink.toml is accepted (it names a compiler-internal module, not an
+    // external package). Nothing is loaded or parsed for this sentinel.
+    if is_blink_pseudo_module(dotted_path) {
+        return "<blink-pseudo:{dotted_path}>"
+    }
 
     // Orphan-file guard: a source file with no enclosing blink.toml has
     // src_root == "". Bare external imports from such a file are E1010 —
@@ -1188,7 +1211,11 @@ pub fn collect_imports(program: Int, src_root: Str, all_programs: List[Int]) ! L
         let imp_node = sublist_get(imports_sl, i)
         let dotted_path = node_str_val(imp_node)
         let file_path = resolve_module_path(dotted_path, src_root)
-        if file_path != "" {
+        // blink.* pseudo-modules resolve to an inert sentinel with no backing
+        // source — record the import for selective-name resolution but never
+        // load/parse a file for it.
+        let is_pseudo = file_path.starts_with("<blink-pseudo:")
+        if file_path != "" && is_pseudo == 0 {
             let tgt_pkg = extract_package(file_path, src_root)
             if src_pkg != "" && tgt_pkg != "" && src_pkg != tgt_pkg {
                 pkg_edges_from.push(src_pkg)
@@ -1199,7 +1226,7 @@ pub fn collect_imports(program: Int, src_root: Str, all_programs: List[Int]) ! L
             }
         }
         let mut target_mod = ""
-        if file_path != "" {
+        if file_path != "" && is_pseudo == 0 {
             target_mod = find_module_key(file_path)
         }
         if target_mod == "" {
@@ -1360,7 +1387,10 @@ pub fn inject_prelude(src_root: Str, all_programs: List[Int]) ! Lex.Tokenize, Pa
     while pi < prelude_modules.len() {
         let dotted_path = prelude_modules.get(pi).unwrap()
         let file_path = resolve_module_path(dotted_path, src_root)
-        if file_path != "" && is_file_loaded(file_path) == 0 {
+        // A blink.* pseudo-module resolves to an inert sentinel with no source;
+        // never hand it to load_module/read_file. (The prelude list is std.*
+        // today, so this is a defensive guard against a future prelude entry.)
+        if file_path != "" && !file_path.starts_with("<blink-pseudo:") && is_file_loaded(file_path) == 0 {
             load_module(dotted_path, file_path, src_root, all_programs, -1, "prelude")
         }
         pi = pi + 1
@@ -1395,7 +1425,12 @@ pub fn check_unused_imports() ! Diag.Report {
         }
         if tc_is_module_used(mod_key) == 0 && tc_is_module_used(qualifier) == 0 {
             let imp_node = root_import_nodes.get(ii).unwrap()
-            if node_is_pub(imp_node) == 0 && selective_import_all_prelude(imp_node) == 0 {
+            // blink.* pseudo-modules are OPTIONAL documentation markers (§9.1.1,
+            // q0brkj) — the `ffi` namespace and blink.core types are usable
+            // without them, so such an import is never "unused" in a way worth
+            // warning about.
+            let is_pseudo = is_blink_pseudo_module(node_str_val(imp_node))
+            if node_is_pub(imp_node) == 0 && selective_import_all_prelude(imp_node) == 0 && is_pseudo == 0 {
                 let display_name = if qualifier != "" { qualifier } else { mod_key }
                 diag_warn_at("UnusedImport", UNUSED_IMPORT, "module '{display_name}' is imported but not used", imp_node, "remove the unused import")
                 diag_set_last_fix("Remove unused import", "")

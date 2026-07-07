@@ -152,6 +152,19 @@ This output is structured JSON when `--json` is passed. CI pipelines can enforce
 
 This section formally defines the pointer types, operations, and lifetime semantics used by FFI bindings. These types exist **exclusively for C interop** — they are not general-purpose Blink types and are not available in the module prelude.
 
+#### FFI import resolution and the real gates
+
+The `ffi` namespace and the FFI pointer types are **compiler-known intrinsics**, not a distributable module. This has two consequences future readers must not re-derive a phantom gate from:
+
+**Resolution.** `import blink.ffi` and `import blink.core` resolve as **recognized, inert, optional no-ops** — accepted, never required, and never `ModuleNotFound`. The `ffi` namespace works with **no import at all**, exactly like `io`/`net`/`time`. Selective forms such as `import blink.ffi.{Ptr, Void, alloc_ptr, null_ptr}` are satisfiable no-ops: the names they list are compiler-known regardless, so the import is a documentation marker (signalling "this file does FFI") and never a capability gate. This follows the `blink.*` reservation in §10.7 (Standard Library Resolution).
+
+**The two real gates.** The unsafe FFI surface is gated twice, and these are the *only* gates:
+
+1. **`PtrOutsideFFI` (E0811)** — a `Ptr[T]` may appear only inside an `@ffi`/`@trusted` context. This is a per-function capability gate on *where* pointer types are allowed, checked structurally regardless of imports.
+2. **`#275` native-dependency manifest** — an `@ffi` declaration without a matching `[native-dependencies]` entry in `blink.toml` is a compile error (§10.5.4).
+
+There is **no import gate** on FFI. A per-file `import blink.ffi` requirement would be strictly weaker than `rg '@ffi'` and would make `import` a capability boundary it is nowhere else in the language. See [FFI import namespace resolution](../decisions/ffi-import-namespace-resolution.md).
+
 #### The `Ptr[T]` Type
 
 `Ptr[T]` is a compiler-known generic type representing a typed C pointer. It maps directly to `T*` in the generated C code.
@@ -159,6 +172,8 @@ This section formally defines the pointer types, operations, and lifetime semant
 ```blink
 import blink.ffi.{Ptr, Void, alloc_ptr, null_ptr}
 ```
+
+This import is **optional** — a documentation marker, not a requirement. `Ptr[T]`, `Void`, and the pointer operations are compiler-known and available without it; the `ffi` namespace is a no-import intrinsic like `io`/`net`/`time`. See *FFI import resolution and the real gates* below.
 
 **Nullability:** `Ptr[T]` is **non-null by default**. A `Ptr[T]` value is guaranteed to point to valid memory. Nullable pointers use `Ptr[T]?` (sugar for `Option[Ptr[T]]`), consistent with Blink's existing `Option` semantics.
 
@@ -193,7 +208,7 @@ error[E0810]: invalid Ptr type parameter
 
 #### Pointer Operations
 
-All pointer operations are methods on `Ptr[T]` and functions in the `blink.ffi` module. They are available only in modules that `import blink.ffi`.
+All pointer operations are methods on `Ptr[T]` and compiler-known functions in the `ffi` namespace. They are available **without any import** — `ffi` is a no-import intrinsic namespace like `io`/`net`/`time`, and `import blink.ffi[.{...}]` is an **optional documentation marker**, never a requirement. The capability gate is on *where* a `Ptr[T]` may appear — inside an `@ffi`/`@trusted` context (`PtrOutsideFFI`, E0811) — not on any import (see *FFI import resolution and the real gates* above).
 
 | Operation | Signature | C Mapping | Description |
 |-----------|-----------|-----------|-------------|
@@ -1656,7 +1671,7 @@ import std.toml.{toml_parse, toml_get}  // selective import
 
 The `std` prefix is mandatory. There are no bare stdlib imports — `import toml` resolves only to local `src/toml.bl`, never to stdlib. This avoids the ambiguity that plagues Python's stdlib (is `json` local or stdlib?) and matches Rust's `std::` convention.
 
-The `blink.*` namespace remains reserved for compiler-internal pseudo-modules (`blink.core`, `blink.ffi`) that are part of the language definition, not distributable packages.
+The `blink.*` namespace remains reserved for compiler-internal pseudo-modules (`blink.core`, `blink.ffi`) that are part of the language definition, not distributable packages. Imports from this reserved namespace resolve as **recognized no-ops** — accepted, inert, never required, and never `ModuleNotFound`. The pseudo-modules' contents (`ffi`'s pointer types and operations per §9.1.1, and `blink.core`'s `ConversionError` per §10.6 *What Is NOT in the Prelude*) are compiler-known and usable without importing them; the import is an optional documentation marker (see [FFI import namespace resolution](../decisions/ffi-import-namespace-resolution.md)).
 
 #### Resolution Order
 
