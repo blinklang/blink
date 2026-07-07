@@ -2537,6 +2537,13 @@ non-Debug case: rendering `<?>` (or any silent stand-in) is forbidden, because i
 banned silent fallback (the panel's 5-0 rule against `[object Object]`-style fallbacks, *Display
 Format Protocol*) one level down.
 
+Two container shapes stay rejected with `E0520` at **every** level of nesting (not just the top
+field): `Set` and `Result` are not Debug-renderable, and a `Map` whose **key** type is itself a
+container (`Map[List[Int], V]`, etc.) is rejected — map keys must be a scalar (`Str` / `Char` /
+`Int` / `Bool` / sized-int) or a `@derive(Debug, Hash, Eq)` struct. (Container-typed map *values*
+render fine; only container keys are excluded, because the renderer reads keys back through the map's
+key-ops storage layer, which has no descriptor for a container key.)
+
 ```blink
 type Plain { a: Int }              // does NOT derive Debug
 
@@ -2544,24 +2551,38 @@ type Plain { a: Int }              // does NOT derive Debug
 type Bad { items: List[Plain] }    // E0520 — element type `Plain` does not derive Debug
 ```
 
-**One container level for v1.** v1 renders exactly one container level. A nested container —
-`List[List[T]]`, `Option[List[T]]`, `Map[K, List[V]]`, and any other container whose element, key,
-or value type is itself a container — is rejected with a **hard `E0520` at depth+1**. The diagnostic
-names the v1 one-level limit and the tracking ticket for the deferred fully-recursive renderer; it
-is **never** a placeholder.
+**Nested containers.** Container Debug is **fully recursive** by composition: a container whose
+element, key, or value type is itself a (renderable) container renders through the composed
+`debug()` of each level. There is no depth cap.
 
 ```blink
 @derive(Debug)
-type Nested { grid: List[List[Int]] }   // E0520 — nested container Debug is v1-limited to one level
+type Nested { grid: List[List[Int]] }
+Nested { grid: [[1, 2], [3]] }.debug()   // => "Nested { grid: [[1, 2], [3]] }"
+
+@derive(Debug)
+type Deep { m: Map[Str, List[Int]] }     // => "Deep { m: {\"a\": [1, 2]} }"
+
+@derive(Debug)
+type Maybe { xs: Option[List[Int]] }     // Some([1, 2]) => "Maybe { xs: Some([1, 2]) }"
 ```
 
-The no-silent-fallback invariant is carried by the **typecheck rule**, which is fully inductive: the
-typechecker recurses to prove every nested element's type is `Debug` (the same recursion that
-rejects a non-Debug element), so it can equally reject a container nested inside a container at
-depth+1. The v1 *emitter* is capped at one level; the fully-recursive per-monomorphization `debug()`
-emitter is the deferred end-state (a follow-up ticket), to land with dedicated nested-container
-codegen tests. See [Container Debug rendering](../decisions/debug-container-rendering.md) for the
-full deliberation, including why the v1 boundary is a hard error rather than a placeholder.
+The rule is fully inductive in both the **typecheck** and the **emitter**. The typechecker recurses
+to prove every nested element / key / value type is `Debug` (rejecting non-Debug, `Set`/`Result`,
+and container map keys at any level). The emitter materializes one recursive per-monomorphization
+`debug()` function per distinct nested container shape (mirroring the arena-promotion descriptor
+walker); these functions call each other, so an arbitrarily deep type renders through a chain of
+composed calls with the no-silent-fallback invariant preserved at every level. See
+[Container Debug rendering](../decisions/debug-container-rendering.md) for the full deliberation.
+
+**Enum-variant fields.** Container Debug applies to struct fields **and** enum-variant fields alike;
+both routes share the same generated recursive `debug()` functions.
+
+```blink
+@derive(Debug)
+type E { V(items: List[Int]) }
+E.V([1, 2]).debug()                      // => "V([1, 2])"
+```
 
 ##### Generic Type Bound Inference
 

@@ -1154,14 +1154,20 @@ fn tc_debug_map_key_ok(key_name: Str) -> Int {
     0
 }
 
-// Check one element / key / value of a v1-renderable container field.
-// `container_base` is the container's own name (e.g. "List") used only in
-// the depth+1 diagnostic. A non-Debug element → E0520; an element that is
-// itself a container → hard E0520 at depth+1 (one container level for v1).
-fn tc_check_debug_element(elem_ann: Int, f: Int, tname: Str, container_base: Str) ! Diag.Report {
+// Check one element / value of a Debug-renderable container field. The rule is
+// fully inductive (spec §3.6): a non-Debug leaf → E0520; a Set/Result element →
+// E0520 (not renderable at any level); a List/Option/Map element recurses into
+// its own element/key/value checks so arbitrary nesting is proven Debug.
+fn tc_check_debug_element(elem_ann: Int, f: Int, tname: Str) ! Diag.Report {
     let elem_name = node_name(elem_ann)
     if tc_is_container_name(elem_name) != 0 {
-        diag_error_at("DeriveDebugFieldNoDebug", DERIVE_DEBUG_FIELD_NO_DEBUG, "@derive(Debug) on '{tname}': field '{node_name(f)}' nests a container ('{container_base}' of '{elem_name}'); @derive(Debug) renders one container level in v1 — nested-container rendering is tracked in ticket ye9ty9", f, "flatten the nesting, or implement Debug manually until ye9ty9 lands")
+        // Nested container: Set/Result are still rejected at every level; the
+        // renderable containers (List/Option/Map) recurse.
+        if elem_name == "Set" || elem_name == "Result" {
+            diag_error_at("DeriveDebugFieldNoDebug", DERIVE_DEBUG_FIELD_NO_DEBUG, "@derive(Debug) on '{tname}': field '{node_name(f)}' has element type '{elem_name}' which is not Debug-renderable (only List/Option/Map containers render)", f, "implement Debug manually for this field's type")
+            return
+        }
+        tc_check_container_elems(elem_ann, f, tname)
         return
     }
     if tc_debug_field_ok(elem_name) == 0 {
@@ -1169,12 +1175,47 @@ fn tc_check_debug_element(elem_ann: Int, f: Int, tname: Str, container_base: Str
     }
 }
 
+// Peel a List/Option/Map container annotation `ann` and check its element (or
+// key + value) types. Shared between the top-level field check and the nested
+// recursion in tc_check_debug_element, so nesting is pure composition. The
+// caller guarantees `ann` names List / Option / Map (Set/Result rejected first).
+fn tc_check_container_elems(ann: Int, f: Int, tname: Str) ! Diag.Report {
+    let ftype_name = node_name(ann)
+    let elems_sl = node_elements(ann)
+    if ftype_name == "Map" {
+        if elems_sl != -1 && sublist_length(elems_sl) >= 2 {
+            let key_ann = sublist_get(elems_sl, 0)
+            let key_name = node_name(key_ann)
+            if tc_debug_map_key_ok(key_name) != 0 {
+                tc_check_debug_element(key_ann, f, tname)
+            } else if tc_type_is_struct(key_name) != 0 {
+                // A user STRUCT key that isn't Debug (tc_debug_map_key_ok gates
+                // the Debug ones above): let tc_check_debug_element emit the
+                // precise "does not derive Debug" diagnostic.
+                tc_check_debug_element(key_ann, f, tname)
+            } else {
+                // Container map keys (List/Map/Option/Set/Result) and other
+                // unsupported keys land here — container keys stay rejected,
+                // which is why the map-debug emitter never recurses on keys.
+                diag_error_at("DeriveDebugFieldNoDebug", DERIVE_DEBUG_FIELD_NO_DEBUG, "@derive(Debug) on '{tname}': field '{node_name(f)}' has Map key type '{key_name}' which v1 Debug cannot render (Str/Char/Int/Bool/sized-int keys, or a @derive(Debug, Hash, Eq) struct key)", f, "use a supported scalar key or a Debug struct key, or implement Debug manually")
+            }
+            tc_check_debug_element(sublist_get(elems_sl, 1), f, tname)
+        }
+        return
+    }
+
+    // List / Option: peel element 0.
+    if elems_sl != -1 && sublist_length(elems_sl) >= 1 {
+        tc_check_debug_element(sublist_get(elems_sl, 0), f, tname)
+    }
+}
+
 // Reject one field `f` of a @derive(Debug) type `tname` whose type — or whose
 // container element/key/value type — does not derive Debug. `is_variant_field`
-// is 1 when `f` is a field of an enum variant: enum-variant container fields
-// are descoped in v1 (no tp_id at the codegen call site), so a container-typed
-// variant field is rejected with E0520 (follow-up ticket).
-fn tc_check_one_debug_field(f: Int, tname: Str, is_variant_field: Int) ! Diag.Report {
+// is 1 when `f` is a field of an enum variant; container Debug rendering applies
+// to struct fields AND enum-variant fields (x112x7), so the param is threaded
+// only to keep call sites unchanged.
+fn tc_check_one_debug_field(f: Int, tname: Str, _is_variant_field: Int) ! Diag.Report {
     let ann = node_value(f)
     let ftype_name = node_name(ann)
 
@@ -1185,41 +1226,13 @@ fn tc_check_one_debug_field(f: Int, tname: Str, is_variant_field: Int) ! Diag.Re
         return
     }
 
-    // Field is a container type.
-    if is_variant_field != 0 {
-        diag_error_at("DeriveDebugFieldNoDebug", DERIVE_DEBUG_FIELD_NO_DEBUG, "@derive(Debug) on '{tname}': enum-variant field '{node_name(f)}' has container type '{ftype_name}' — container Debug rendering on enum-variant fields is not supported in v1", f, "move the container into a struct field, or implement Debug manually")
-        return
-    }
-
+    // Field is a container type. Set/Result are not renderable at any level.
     if ftype_name == "Set" || ftype_name == "Result" {
         diag_error_at("DeriveDebugFieldNoDebug", DERIVE_DEBUG_FIELD_NO_DEBUG, "@derive(Debug) on '{tname}': field '{node_name(f)}' has type '{ftype_name}' which is not Debug-renderable in v1 (only List/Option/Map containers render)", f, "implement Debug manually for this field's type")
         return
     }
 
-    let elems_sl = node_elements(ann)
-    if ftype_name == "Map" {
-        if elems_sl != -1 && sublist_length(elems_sl) >= 2 {
-            let key_ann = sublist_get(elems_sl, 0)
-            let key_name = node_name(key_ann)
-            if tc_debug_map_key_ok(key_name) != 0 {
-                tc_check_debug_element(key_ann, f, tname, ftype_name)
-            } else if tc_type_is_struct(key_name) != 0 {
-                // A user STRUCT key that isn't Debug (tc_debug_map_key_ok gates
-                // the Debug ones above): let tc_check_debug_element emit the
-                // precise "does not derive Debug" diagnostic.
-                tc_check_debug_element(key_ann, f, tname, ftype_name)
-            } else {
-                diag_error_at("DeriveDebugFieldNoDebug", DERIVE_DEBUG_FIELD_NO_DEBUG, "@derive(Debug) on '{tname}': field '{node_name(f)}' has Map key type '{key_name}' which v1 Debug cannot render (Str/Char/Int/Bool/sized-int keys, or a @derive(Debug, Hash, Eq) struct key)", f, "use a supported scalar key or a Debug struct key, or implement Debug manually")
-            }
-            tc_check_debug_element(sublist_get(elems_sl, 1), f, tname, ftype_name)
-        }
-        return
-    }
-
-    // List / Option: peel element 0.
-    if elems_sl != -1 && sublist_length(elems_sl) >= 1 {
-        tc_check_debug_element(sublist_get(elems_sl, 0), f, tname, ftype_name)
-    }
+    tc_check_container_elems(ann, f, tname)
 }
 
 fn tc_check_derive_debug() ! Diag.Report {

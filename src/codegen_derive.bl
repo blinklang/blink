@@ -5,7 +5,7 @@ import codegen_types.{
     cg_indent,
     emit_line,
     fresh_temp,
-    c_fn_name, c_type_c_name, c_type_tag, canonical_struct_tag,
+    c_fn_name, c_type_c_name, c_type_tag, canonical_struct_tag, strip_module_qualifier,
     type_from_name,
     is_hash_scalar_ct,
     kops_table_name, c_type_str,
@@ -15,6 +15,7 @@ import codegen_types.{
     get_struct_field_tp_id,
     tp_child1_kind, tp_child1_sname,
     tp_child2_kind, tp_child2_sname,
+    tp_get_child1, tp_get_child2, tp_get_kind, tp_get_sname,
     get_variant_field_name, get_variant_field_type_str,
     derive_serialize_types, derive_deserialize_types,
     derive_eq_types, derive_ord_types, derive_clone_types, derive_hash_types, derive_debug_types,
@@ -587,6 +588,378 @@ fn emit_enum_to_json(type_name: Str) ! Codegen.Emit {
     }
 }
 
+// ── Recursive @derive(Debug) container walkers ───────────────────────
+//
+// For every nested container monomorphization reachable from a @derive(Debug)
+// type, emit a top-level `blink_debug_<Mangled>(<CType> v) -> const char*` that
+// recursively calls the walkers for its element/key/value types. Mirrors the
+// arena-promote machinery (blink_promote_{mangle}) in SHAPE — recursive
+// top-level fns, descriptor-keyed dedup, two-phase forward-decl/def — but not
+// its arena semantics: Debug returns const char* and builds via blink_str_concat
+// (no arena threading).
+//
+// Two entry points converge on the SAME descriptor vocabulary (P:/L:/O:/M:/S:)
+// and therefore the SAME generated fns:
+//   - struct fields (ye9ty9): tp_to_descriptor walks the field's tp_id tree.
+//   - enum-variant fields (x112x7): parse_type_str_to_descriptor parses the
+//     field's type STRING (no tp_id at that codegen site).
+// Both route scalar leaves through ct_to_descriptor so narrow-int / Char widths
+// survive (bug 2aw8mt). For the same type they MUST mangle identically.
+
+pub let mut debug_types: List[Str] = []
+pub let mut debug_emitted: Map[Str, Int] = Map()
+pub let mut debug_fwd_emitted: Int = 0
+
+// Walk a resolved tp_id type tree into a descriptor (struct-field entry). Unlike
+// ct_to_descriptor (which lacks tp children and collapses nested containers to
+// P:Int), this recurses through tp_get_child1/child2. Scalar leaves defer to
+// ct_to_descriptor so narrow widths / Char are preserved.
+pub fn tp_to_descriptor(tp_id: Int) -> Str {
+    if tp_id < 0 { return "P:Int" }
+    let k = tp_get_kind(tp_id)
+    if k == CT_LIST {
+        let c1 = tp_get_child1(tp_id)
+        return "L:{tp_to_descriptor(c1)}"
+    }
+    if k == CT_OPTION {
+        let c1 = tp_get_child1(tp_id)
+        return "O:{tp_to_descriptor(c1)}"
+    }
+    if k == CT_MAP {
+        let c1 = tp_get_child1(tp_id)
+        let c2 = tp_get_child2(tp_id)
+        return "M:{tp_to_descriptor(c1)}|{tp_to_descriptor(c2)}"
+    }
+    if k == CT_STRUCT || k == CT_VOID {
+        let sn = tp_get_sname(tp_id)
+        // Canonicalize to the bare name so a module-qualified struct produces
+        // the same S:<name> descriptor (and same mangled C fn name) as the
+        // enum-variant string parser, and never a '.' in a C identifier.
+        if sn != "" { return "S:{strip_module_qualifier(sn)}" }
+        return ct_to_descriptor(k, "")
+    }
+    ct_to_descriptor(k, "")
+}
+
+// Index of the top-level comma in `s` (bracket-depth 0), or -1. Mirrors the
+// depth counter in get_variant_field_type_str (bytes: '[' 91, ']' 93, ',' 44).
+fn top_level_comma(s: Str) -> Int {
+    let mut depth = 0
+    let mut i = 0
+    while i < s.len() {
+        let b = s.byte_at(i)
+        if b == 91 { depth = depth + 1 }
+        else if b == 93 { depth = depth - 1 }
+        else if b == 44 && depth == 0 { return i }
+        i = i + 1
+    }
+    -1
+}
+
+// Parse an enum-variant field type STRING into a descriptor (enum-variant
+// entry). Recursive-descent, bracket-depth-aware, whitespace-tolerant. MUST
+// mangle identically to tp_to_descriptor for the same type so struct and enum
+// paths share one generated fn.
+pub fn parse_type_str_to_descriptor(raw: Str) -> Str {
+    let s = raw.trim()
+    if s.starts_with("List[") {
+        // strip "List[" .. trailing "]"
+        let inner = s.slice(5, s.len() - 1)
+        return "L:{parse_type_str_to_descriptor(inner)}"
+    }
+    if s.starts_with("Option[") {
+        let inner = s.slice(7, s.len() - 1)
+        return "O:{parse_type_str_to_descriptor(inner)}"
+    }
+    if s.starts_with("Map[") {
+        let inner = s.slice(4, s.len() - 1)
+        let comma = top_level_comma(inner)
+        if comma >= 0 {
+            let k = inner.slice(0, comma)
+            let v = inner.slice(comma + 1, inner.len())
+            return "M:{parse_type_str_to_descriptor(k)}|{parse_type_str_to_descriptor(v)}"
+        }
+        return "P:Int"
+    }
+    // Leaf: scalar / Str / user struct. Route through ct_to_descriptor so narrow
+    // widths / Char survive; pass the BARE name as sname (matching the struct
+    // path's strip_module_qualifier) so a struct becomes S:<name> identically
+    // and never yields a '.' in the mangled C fn name.
+    let ct = type_from_name(s)
+    ct_to_descriptor(ct, strip_module_qualifier(s))
+}
+
+// Recursively queue a descriptor + every nested container it reaches. Near-clone
+// of queue_promote_type. Skips P: (inline leaves) and C: (closures aren't Debug).
+// For S:<name>, does NOT emit a blink_debug_S_* fn (structs get {cn}_debug from
+// the derive loop); instead queues each container-typed struct field so those
+// nested walkers exist.
+pub fn queue_debug_type(desc: Str) {
+    if desc == "" { return }
+    if desc.starts_with("P:") { return }
+    if desc.starts_with("C:") { return }
+    if debug_emitted.contains_key(desc) { return }
+    debug_emitted.insert(desc, 1)
+    if desc.starts_with("S:") {
+        let sname = desc.slice(2, desc.len())
+        let mut i = 0
+        while i < sf_entries.len() {
+            let sf = sf_entries.get(i).unwrap()
+            if sf.struct_name == sname {
+                if sf.field_type == CT_LIST || sf.field_type == CT_OPTION || sf.field_type == CT_MAP {
+                    queue_debug_type(tp_to_descriptor(sf.tp_id))
+                }
+            }
+            i = i + 1
+        }
+        return
+    }
+    // L: / O: / M: get their own generated walker.
+    debug_types.push(desc)
+    if desc.starts_with("L:") {
+        queue_debug_type(desc.slice(2, desc.len()))
+        return
+    }
+    if desc.starts_with("O:") {
+        queue_debug_type(inner_desc_of(desc))
+        return
+    }
+    if desc.starts_with("M:") {
+        let rest = desc.slice(2, desc.len())
+        let bar = rest.index_of("|")
+        if bar >= 0 {
+            let k = rest.slice(0, bar)
+            let v = rest.slice(bar + 1, rest.len())
+            // Keys are always scalar/struct (container keys rejected at
+            // typecheck) — struct keys still need their debug fn queued via S:.
+            queue_debug_type(k)
+            queue_debug_type(v)
+        }
+        return
+    }
+}
+
+// Emit Debug rendering of one container ELEMENT / value read from a void* slot
+// (blink_list_get, _m->values[_i]). Scalars/Str/Char read inline (intptr-packed
+// or pointer); a struct is boxed behind the slot (deref); nested List/Map store
+// the container pointer directly in the slot (cast, no deref); nested Option is
+// boxed behind the slot (deref, like a struct).
+fn emit_debug_slot(slot: Str, desc: Str) ! Codegen.Emit {
+    let ct = desc_primary_ct(desc)
+    if desc.starts_with("S:") {
+        let sname = desc.slice(2, desc.len())
+        emit_line("result = blink_str_concat(result, {c_type_c_name(sname)}_debug(*({c_type_c_name(sname)}*){slot}));")
+        return
+    }
+    if desc.starts_with("L:") || desc.starts_with("M:") {
+        // List/Map elements store the container pointer directly in the slot.
+        emit_line("result = blink_str_concat(result, blink_debug_{descriptor_mangle(desc)}(({descriptor_c_type(desc)}){slot}));")
+        return
+    }
+    if desc.starts_with("O:") {
+        // Option elements are boxed behind the slot pointer (like a struct).
+        let cty = descriptor_c_type(desc)
+        emit_line("result = blink_str_concat(result, blink_debug_{descriptor_mangle(desc)}(*({cty}*){slot}));")
+        return
+    }
+    if ct == CT_STRING {
+        emit_line("result = blink_str_concat(result, {c_fn_name("json_escape_str")}((const char*){slot}));")
+    } else if ct == CT_FLOAT {
+        emit_line("result = blink_str_concat(result, {c_fn_name("float_to_str")}(*(double*){slot}));")
+    } else if ct == CT_BOOL {
+        emit_line("result = blink_str_concat(result, (int64_t)(intptr_t){slot} ? \"true\" : \"false\");")
+    } else if ct == CT_CHAR {
+        emit_line("result = blink_str_concat(result, blink_char_debug((int64_t)(intptr_t){slot}));")
+    } else {
+        // Int / sized-int — stored as intptr-packed scalar.
+        emit_line("result = blink_str_concat(result, {c_fn_name("int_to_str")}((int64_t)(intptr_t){slot}));")
+    }
+}
+
+// Emit Debug rendering of one container element / field held as a typed C VALUE
+// (Option.value, enum-variant field self.data.V.f). Nested containers pass the
+// value directly (no cast); scalars/Str/Char render by value; structs call
+// {cn}_debug directly.
+fn emit_debug_value(access: Str, desc: Str) ! Codegen.Emit {
+    let ct = desc_primary_ct(desc)
+    if desc.starts_with("S:") {
+        let sname = desc.slice(2, desc.len())
+        emit_line("result = blink_str_concat(result, {c_type_c_name(sname)}_debug({access}));")
+        return
+    }
+    if desc.starts_with("L:") || desc.starts_with("M:") || desc.starts_with("O:") {
+        emit_line("result = blink_str_concat(result, blink_debug_{descriptor_mangle(desc)}({access}));")
+        return
+    }
+    if ct == CT_STRING {
+        emit_line("result = blink_str_concat(result, {c_fn_name("json_escape_str")}({access}));")
+    } else if ct == CT_FLOAT {
+        emit_line("result = blink_str_concat(result, {c_fn_name("float_to_str")}({access}));")
+    } else if ct == CT_BOOL {
+        emit_line("result = blink_str_concat(result, ({access}) ? \"true\" : \"false\");")
+    } else if ct == CT_CHAR {
+        emit_line("result = blink_str_concat(result, blink_char_debug((int64_t)({access})));")
+    } else {
+        emit_line("result = blink_str_concat(result, {c_fn_name("int_to_str")}((int64_t)({access})));")
+    }
+}
+
+fn emit_debug_list_fn(desc: Str) ! Codegen.Emit {
+    let inner = inner_desc_of(desc)
+    let mangle = descriptor_mangle(desc)
+    emit_line("const char* blink_debug_{mangle}(blink_list* v) \{")
+    cg_indent = cg_indent + 1
+    emit_line("const char* result = \"[\";")
+    emit_line("int64_t _len = blink_list_len(v);")
+    emit_line("for (int64_t _i = 0; _i < _len; _i++) \{")
+    cg_indent = cg_indent + 1
+    emit_line("if (_i > 0) result = blink_str_concat(result, \", \");")
+    emit_debug_slot("blink_list_get(v, _i)", inner)
+    cg_indent = cg_indent - 1
+    emit_line("}")
+    emit_line("result = blink_str_concat(result, \"]\");")
+    emit_line("return result;")
+    cg_indent = cg_indent - 1
+    emit_line("}")
+    emit_line("")
+}
+
+// The Option carrier stores its inner value inline when the inner's C type is
+// already a pointer (List/Map → blink_list*/blink_map*) or a scalar; but it BOXES
+// a struct / nested-Option / nested-Result inner behind a pointer
+// (emit_struct_option_typedef: `{inner_c}* value` when inner_c does not end in
+// `*`). So `v.value` for those inners is a `T*` and must be dereferenced before
+// handing it to the by-value {cn}_debug / blink_debug_ walker.
+fn option_inner_is_boxed(inner: Str) -> Int {
+    if inner.starts_with("S:") { return 1 }
+    if inner.starts_with("O:") { return 1 }
+    if inner.starts_with("R:") { return 1 }
+    0
+}
+
+fn emit_debug_option_fn(desc: Str) ! Codegen.Emit {
+    let inner = inner_desc_of(desc)
+    let mangle = descriptor_mangle(desc)
+    let cty = descriptor_c_type(desc)
+    emit_line("const char* blink_debug_{mangle}({cty} v) \{")
+    cg_indent = cg_indent + 1
+    emit_line("const char* result = \"\";")
+    emit_line("if (v.tag == 1) \{")
+    cg_indent = cg_indent + 1
+    emit_line("result = \"Some(\";")
+    let val_access = if option_inner_is_boxed(inner) != 0 { "(*v.value)" } else { "v.value" }
+    emit_debug_value(val_access, inner)
+    emit_line("result = blink_str_concat(result, \")\");")
+    cg_indent = cg_indent - 1
+    emit_line("} else \{")
+    cg_indent = cg_indent + 1
+    emit_line("result = \"None\";")
+    cg_indent = cg_indent - 1
+    emit_line("}")
+    emit_line("return result;")
+    cg_indent = cg_indent - 1
+    emit_line("}")
+    emit_line("")
+}
+
+fn emit_debug_map_fn(desc: Str) ! Codegen.Emit {
+    let rest = desc.slice(2, desc.len())
+    let bar = rest.index_of("|")
+    let kd = rest.slice(0, bar)
+    let vd = rest.slice(bar + 1, rest.len())
+    let kct = desc_primary_ct(kd)
+    let kstruct = if kd.starts_with("S:") { kd.slice(2, kd.len()) } else { "" }
+    let mangle = descriptor_mangle(desc)
+    emit_line("const char* blink_debug_{mangle}(blink_map* v) \{")
+    cg_indent = cg_indent + 1
+    emit_line("const char* result = \"\{\";")
+    emit_line("blink_map* _m = v;")
+    emit_line("size_t _stride = blink_kops_stride(_m->kops);")
+    emit_line("int _first = 1;")
+    emit_line("for (int64_t _i = 0; _i < _m->cap; _i++) \{")
+    cg_indent = cg_indent + 1
+    emit_line("if (_m->states[_i] != 1) continue;")
+    emit_line("if (!_first) result = blink_str_concat(result, \", \");")
+    emit_line("_first = 0;")
+    emit_debug_map_key("blink_map_key_slot(_m, _i, _stride)", kct, kstruct)
+    emit_line("result = blink_str_concat(result, \": \");")
+    emit_debug_slot("_m->values[_i]", vd)
+    cg_indent = cg_indent - 1
+    emit_line("}")
+    emit_line("result = blink_str_concat(result, \"}\");")
+    emit_line("return result;")
+    cg_indent = cg_indent - 1
+    emit_line("}")
+    emit_line("")
+}
+
+@allow(UnrestoredMutation)
+pub fn emit_debug_forward_decls() ! Codegen.Emit {
+    let mut i = debug_fwd_emitted
+    while i < debug_types.len() {
+        let desc = debug_types.get(i).unwrap()
+        let mangle = descriptor_mangle(desc)
+        let cty = descriptor_c_type(desc)
+        emit_line("const char* blink_debug_{mangle}({cty} v);")
+        i = i + 1
+    }
+    debug_fwd_emitted = debug_types.len()
+}
+
+pub fn emit_debug_fn_defs() ! Codegen.Emit {
+    let mut i = 0
+    while i < debug_types.len() {
+        let desc = debug_types.get(i).unwrap()
+        if desc.starts_with("L:") {
+            emit_debug_list_fn(desc)
+        } else if desc.starts_with("O:") {
+            emit_debug_option_fn(desc)
+        } else if desc.starts_with("M:") {
+            emit_debug_map_fn(desc)
+        }
+        i = i + 1
+    }
+}
+
+// Queue every container descriptor reachable from the @derive(Debug) types so
+// emit_debug_forward_decls can run in the forward-decl phase. Walks struct
+// fields via tp_to_descriptor and enum-variant fields via the type-string
+// parser — both front doors converge on the shared descriptor set.
+pub fn queue_all_debug_types() {
+    let mut dbi = 0
+    while dbi < derive_debug_types.len() {
+        let tname = derive_debug_types.get(dbi).unwrap()
+        if is_enum_type(tname) != 0 {
+            queue_debug_types_for_enum(tname)
+        } else {
+            queue_debug_type("S:{tname}")
+        }
+        dbi = dbi + 1
+    }
+}
+
+fn queue_debug_types_for_enum(type_name: Str) {
+    let eidx = get_enum_reg_idx(type_name)
+    if eidx == -1 { return }
+    let mut i = 0
+    while i < enum_variants.len() {
+        let evar = enum_variants.get(i).unwrap()
+        if evar.enum_idx == eidx {
+            let vidx = i
+            let mut fi = 0
+            while fi < evar.field_count {
+                let ftype_str = get_variant_field_type_str(vidx, fi).unwrap()
+                let fct = type_from_name(ftype_str)
+                if fct == CT_LIST || fct == CT_OPTION || fct == CT_MAP {
+                    queue_debug_type(parse_type_str_to_descriptor(ftype_str))
+                }
+                fi = fi + 1
+            }
+        }
+        i = i + 1
+    }
+}
+
 // Emit one SCALAR / Str / user-type value's Debug rendering, concatenated onto
 // `result`. Containers (List/Option/Map) are handled by emit_field_debug_struct
 // on the struct path; on the enum-variant path a container field is rejected at
@@ -616,76 +989,20 @@ fn emit_field_debug(access: Str, field_type: Int, stype: Str) ! Codegen.Emit {
     }
 }
 
-// Emit Debug rendering of one container ELEMENT / value, read from a void* slot
-// expression `slot` (the raw stored pointer/intptr, exactly as blink_list_get or
-// map values yield it). Mirrors emit_list_serialize's boxing conventions but in
-// debug-form. `elem_ct` is the element kind; `elem_struct` is the user-type name
-// (or ""). Typecheck (E0520) guarantees no nested container reaches here, so
-// there is no placeholder branch.
-fn emit_debug_elem_from_slot(slot: Str, elem_ct: Int, elem_struct: Str) ! Codegen.Emit {
-    if elem_struct != "" {
-        emit_line("{c_type_c_name(elem_struct)} _elem = *({c_type_c_name(elem_struct)}*){slot};")
-        emit_line("result = blink_str_concat(result, {c_type_c_name(elem_struct)}_debug(_elem));")
-    } else if elem_ct == CT_STRING {
-        emit_line("result = blink_str_concat(result, {c_fn_name("json_escape_str")}((const char*){slot}));")
-    } else if elem_ct == CT_FLOAT {
-        emit_line("result = blink_str_concat(result, {c_fn_name("float_to_str")}(*(double*){slot}));")
-    } else if elem_ct == CT_BOOL {
-        emit_line("result = blink_str_concat(result, (int64_t)(intptr_t){slot} ? \"true\" : \"false\");")
-    } else if elem_ct == CT_CHAR {
-        emit_line("result = blink_str_concat(result, blink_char_debug((int64_t)(intptr_t){slot}));")
-    } else {
-        // Int / sized-int — stored as intptr-packed scalar.
-        emit_line("result = blink_str_concat(result, {c_fn_name("int_to_str")}((int64_t)(intptr_t){slot}));")
-    }
-}
-
+// Struct-field container Debug now routes through the recursive descriptor
+// walkers (blink_debug_{mangle}) so top-level and nested containers render via
+// the same depth-agnostic generated fn. The field's tp_id gives the exact
+// descriptor (queued during the codegen pre-pass, so the walker exists).
 fn emit_list_debug(access: Str, struct_name: Str, field_name: Str) ! Codegen.Emit {
     let fa_tp = get_struct_field_tp_id(struct_name, field_name)
-    let elem_struct = if fa_tp >= 0 { tp_child1_sname(fa_tp) } else { "" }
-    let elem_type = if fa_tp >= 0 { tp_child1_kind(fa_tp) } else { CT_INT }
-    emit_line("result = blink_str_concat(result, \"[\");")
-    emit_line("\{")
-    cg_indent = cg_indent + 1
-    emit_line("int64_t _len = blink_list_len({access});")
-    emit_line("for (int64_t _i = 0; _i < _len; _i++) \{")
-    cg_indent = cg_indent + 1
-    emit_line("if (_i > 0) result = blink_str_concat(result, \", \");")
-    emit_debug_elem_from_slot("blink_list_get({access}, _i)", elem_type, elem_struct)
-    cg_indent = cg_indent - 1
-    emit_line("}")
-    cg_indent = cg_indent - 1
-    emit_line("}")
-    emit_line("result = blink_str_concat(result, \"]\");")
+    let desc = tp_to_descriptor(fa_tp)
+    emit_line("result = blink_str_concat(result, blink_debug_{descriptor_mangle(desc)}({access}));")
 }
 
 fn emit_option_debug(access: Str, struct_name: Str, field_name: Str) ! Codegen.Emit {
     let fa_tp = get_struct_field_tp_id(struct_name, field_name)
-    let inner_struct = if fa_tp >= 0 { tp_child1_sname(fa_tp) } else { "" }
-    let inner_type = if fa_tp >= 0 { tp_child1_kind(fa_tp) } else { CT_INT }
-    emit_line("if (({access}).tag == 1) \{")
-    cg_indent = cg_indent + 1
-    emit_line("result = blink_str_concat(result, \"Some(\");")
-    if inner_struct != "" {
-        emit_line("result = blink_str_concat(result, {c_type_c_name(inner_struct)}_debug(({access}).value));")
-    } else if inner_type == CT_STRING {
-        emit_line("result = blink_str_concat(result, {c_fn_name("json_escape_str")}(({access}).value));")
-    } else if inner_type == CT_FLOAT {
-        emit_line("result = blink_str_concat(result, {c_fn_name("float_to_str")}(({access}).value));")
-    } else if inner_type == CT_BOOL {
-        emit_line("result = blink_str_concat(result, ({access}).value ? \"true\" : \"false\");")
-    } else if inner_type == CT_CHAR {
-        emit_line("result = blink_str_concat(result, blink_char_debug((int64_t)({access}).value));")
-    } else {
-        emit_line("result = blink_str_concat(result, {c_fn_name("int_to_str")}((int64_t)({access}).value));")
-    }
-    emit_line("result = blink_str_concat(result, \")\");")
-    cg_indent = cg_indent - 1
-    emit_line("} else \{")
-    cg_indent = cg_indent + 1
-    emit_line("result = blink_str_concat(result, \"None\");")
-    cg_indent = cg_indent - 1
-    emit_line("}")
+    let desc = tp_to_descriptor(fa_tp)
+    emit_line("result = blink_str_concat(result, blink_debug_{descriptor_mangle(desc)}({access}));")
 }
 
 // Emit Debug rendering of one Map KEY read from the kops storage slot. Keys are
@@ -703,7 +1020,7 @@ fn emit_debug_map_key(slot: Str, key_ct: Int, key_struct: Str) ! Codegen.Emit {
         // (codegen_derive.bl:253), so the key is stored by pointer and
         // blink_map_key_slot already dereferences it — `slot` is a {cn}*. Read
         // the struct by value and render via its debug(), mirroring
-        // emit_debug_elem_from_slot's struct branch for values.
+        // emit_debug_slot's S: branch for values.
         emit_line("{c_type_c_name(key_struct)} _k = *({c_type_c_name(key_struct)}*){slot};")
         emit_line("result = blink_str_concat(result, {c_type_c_name(key_struct)}_debug(_k));")
     } else if key_ct == CT_STRING {
@@ -739,29 +1056,8 @@ fn map_key_read_expr(key_ct: Int, slot: Str) -> Str {
 
 fn emit_map_debug(access: Str, struct_name: Str, field_name: Str) ! Codegen.Emit {
     let fa_tp = get_struct_field_tp_id(struct_name, field_name)
-    let key_type = if fa_tp >= 0 { tp_child1_kind(fa_tp) } else { CT_STRING }
-    let key_struct = if fa_tp >= 0 { tp_child1_sname(fa_tp) } else { "" }
-    let val_struct = if fa_tp >= 0 { tp_child2_sname(fa_tp) } else { "" }
-    let val_type = if fa_tp >= 0 { tp_child2_kind(fa_tp) } else { CT_INT }
-    emit_line("result = blink_str_concat(result, \"\{\");")
-    emit_line("\{")
-    cg_indent = cg_indent + 1
-    emit_line("blink_map* _m = {access};")
-    emit_line("size_t _stride = blink_kops_stride(_m->kops);")
-    emit_line("int _first = 1;")
-    emit_line("for (int64_t _i = 0; _i < _m->cap; _i++) \{")
-    cg_indent = cg_indent + 1
-    emit_line("if (_m->states[_i] != 1) continue;")
-    emit_line("if (!_first) result = blink_str_concat(result, \", \");")
-    emit_line("_first = 0;")
-    emit_debug_map_key("blink_map_key_slot(_m, _i, _stride)", key_type, key_struct)
-    emit_line("result = blink_str_concat(result, \": \");")
-    emit_debug_elem_from_slot("_m->values[_i]", val_type, val_struct)
-    cg_indent = cg_indent - 1
-    emit_line("}")
-    cg_indent = cg_indent - 1
-    emit_line("}")
-    emit_line("result = blink_str_concat(result, \"}\");")
+    let desc = tp_to_descriptor(fa_tp)
+    emit_line("result = blink_str_concat(result, blink_debug_{descriptor_mangle(desc)}({access}));")
 }
 
 // Struct-field Debug dispatch. Scalars / Str / user-types delegate to
@@ -854,8 +1150,16 @@ fn emit_enum_debug(type_name: Str) ! Codegen.Emit {
                             emit_line("result = blink_str_concat(result, \", \");")
                         }
                         let access = "self.data.{evar.name}.{fname}"
-                        let fstype = if is_struct_type(ftype_str) != 0 || is_enum_type(ftype_str) != 0 { ftype_str } else { "" }
-                        emit_field_debug(access, fct, fstype)
+                        if fct == CT_LIST || fct == CT_OPTION || fct == CT_MAP {
+                            // Enum-variant container field (x112x7): parse the
+                            // type STRING into a descriptor (no tp_id here) and
+                            // render the typed value via the shared walker.
+                            let desc = parse_type_str_to_descriptor(ftype_str)
+                            emit_debug_value(access, desc)
+                        } else {
+                            let fstype = if is_struct_type(ftype_str) != 0 || is_enum_type(ftype_str) != 0 { ftype_str } else { "" }
+                            emit_field_debug(access, fct, fstype)
+                        }
                         fi = fi + 1
                     }
                     emit_line("result = blink_str_concat(result, \")\");")
@@ -1433,6 +1737,24 @@ pub fn descriptor_c_type(desc: Str) -> Str {
 
 pub fn descriptor_typedef_tag(desc: Str) -> Str {
     if desc.starts_with("S:") { return canonical_struct_tag(desc.slice(2, desc.len())) }
+    // Compound inners must recurse so a nested carrier is named the way the
+    // Option/Result carrier machinery names it: Option[Option[Int]] →
+    // blink_Option_Option_int, not blink_Option_option. Flattening via
+    // c_type_tag(CT_OPTION)="option" names an undeclared type (bug found in the
+    // ye9ty9/x112x7 review — the shared flat form was latent until nested Debug
+    // routed a nested Option/Result through descriptor_c_type).
+    if desc.starts_with("O:") {
+        return "Option_{descriptor_typedef_tag(inner_desc_of(desc))}"
+    }
+    if desc.starts_with("R:") {
+        let rest = desc.slice(2, desc.len())
+        let bar = rest.index_of("|")
+        if bar >= 0 {
+            let ok = rest.slice(0, bar)
+            let err = rest.slice(bar + 1, rest.len())
+            return "Result_{descriptor_typedef_tag(ok)}_{descriptor_typedef_tag(err)}"
+        }
+    }
     c_type_tag(desc_primary_ct(desc))
 }
 

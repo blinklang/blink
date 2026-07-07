@@ -397,15 +397,34 @@ Locked design points:
   iff its type argument(s) are `Debug`; otherwise **E0520** names the offending inner type. `Map`
   requires **both** `K` and `V`. The placeholder is never reintroduced for this case — that would
   relocate the banned silent fallback one level down.
-- **One container level for v1.** Nested containers (`List[List[T]]`, `Option[List[T]]`,
-  `Map[K, List[V]]`, …) are rejected with a **hard E0520 at depth+1** — never a placeholder. The
-  message names the v1 limit and the tracking ticket so the cap reads as temporary, not permanent.
-- **Full recursion is the deferred end-state.** The soundness / no-silent-fallback invariant lives
-  in the **typecheck rule** (already inductive via Q3: the typechecker recurses to prove every nested
-  element's type is `Debug`), not in the emitter. The fully-recursive per-monomorphization `debug()`
-  emitter is deferred to a follow-up ticket, to land with dedicated nested-container codegen tests
-  (regen proves self-host stability, not codegen correctness). SYS's template hint: mirror the
-  `blink_promote_{mangle}` recursive descriptor emitter (`codegen_derive.bl:1338+`).
+- **One container level for v1** *(superseded — see Resolution below)*. v1 rendered exactly one
+  container level; nested containers were a **hard E0520 at depth+1**. The cap was a policy decision,
+  not a structural limit: the typecheck rule was already inductive, so the boundary was a temporary
+  emitter cap named after a tracking ticket.
+- **Full recursion is the deferred end-state** *(now landed — see Resolution below)*. The soundness /
+  no-silent-fallback invariant lives in the **typecheck rule** (already inductive via Q3: the
+  typechecker recurses to prove every nested element's type is `Debug`), not in the emitter. SYS's
+  template hint (used by the landing change): mirror the `blink_promote_{mangle}` recursive
+  descriptor emitter (`codegen_derive.bl:1338+`).
+
+### Resolution (ye9ty9 + x112x7)
+
+The two deferred follow-ups landed together as one change:
+
+- **ye9ty9** lifted the one-level cap: nested containers (`List[List[T]]`, `Option[List[T]]`,
+  `Map[K, List[V]]`, …) now render fully recursively. The depth+1 E0520 is gone.
+- **x112x7** lifted the enum-variant restriction: container Debug now applies to enum-variant fields
+  as well as struct fields.
+
+**Mechanism.** A descriptor-driven per-monomorphization emitter mirroring the arena-promote machinery
+(`blink_promote_{mangle}`): each distinct nested container shape gets a top-level recursive
+`blink_debug_<mangle>()` fn that calls the walkers for its element/key/value types. The two front
+doors converge on one shared descriptor vocabulary and therefore one generated fn per shape — struct
+fields walk the resolved `tp_id` tree (`tp_to_descriptor`); enum-variant fields, which have no
+`tp_id` at the codegen site, parse the field's type *string* (`parse_type_str_to_descriptor`), and
+both mangle identically. What stays rejected at every level: non-Debug elements, `Set`/`Result`, and
+container-typed `Map` keys. The no-silent-fallback invariant (Q3, 5-0) holds at every level — every
+`else` arm is a `BLINK_COMPILER_BUG` marker, never a placeholder.
 
 ### Vote summary
 
