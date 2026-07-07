@@ -695,9 +695,18 @@ fn emit_option_debug(access: Str, struct_name: Str, field_name: Str) ! Codegen.E
 // and MUST cast to the exact width blink_kops_eq_* uses for K — reading a narrow
 // key as int64_t over-reads the slot (up to 7 bytes) and, for signed narrow keys,
 // mis-renders the value (e.g. I8 -1 as 255). Typecheck restricts K to
-// Str/Char/Int/Bool/sized-int.
-fn emit_debug_map_key(slot: Str, key_ct: Int) ! Codegen.Emit {
-    if key_ct == CT_STRING {
+// Str/Char/Int/Bool/sized-int, or a @derive(Debug, Hash, Eq) user struct
+// (key_struct != "", handled first).
+fn emit_debug_map_key(slot: Str, key_ct: Int, key_struct: Str) ! Codegen.Emit {
+    if key_struct != "" {
+        // @derive(Debug, Hash, Eq) user-struct key. Struct kops set inline_key=0
+        // (codegen_derive.bl:253), so the key is stored by pointer and
+        // blink_map_key_slot already dereferences it — `slot` is a {cn}*. Read
+        // the struct by value and render via its debug(), mirroring
+        // emit_debug_elem_from_slot's struct branch for values.
+        emit_line("{c_type_c_name(key_struct)} _k = *({c_type_c_name(key_struct)}*){slot};")
+        emit_line("result = blink_str_concat(result, {c_type_c_name(key_struct)}_debug(_k));")
+    } else if key_ct == CT_STRING {
         emit_line("result = blink_str_concat(result, {c_fn_name("json_escape_str")}((const char*){slot}));")
     } else if key_ct == CT_BOOL {
         // 1-byte kops stride (blink_kops_bool); read uint8_t like blink_kops_eq_bool.
@@ -731,6 +740,7 @@ fn map_key_read_expr(key_ct: Int, slot: Str) -> Str {
 fn emit_map_debug(access: Str, struct_name: Str, field_name: Str) ! Codegen.Emit {
     let fa_tp = get_struct_field_tp_id(struct_name, field_name)
     let key_type = if fa_tp >= 0 { tp_child1_kind(fa_tp) } else { CT_STRING }
+    let key_struct = if fa_tp >= 0 { tp_child1_sname(fa_tp) } else { "" }
     let val_struct = if fa_tp >= 0 { tp_child2_sname(fa_tp) } else { "" }
     let val_type = if fa_tp >= 0 { tp_child2_kind(fa_tp) } else { CT_INT }
     emit_line("result = blink_str_concat(result, \"\{\");")
@@ -744,7 +754,7 @@ fn emit_map_debug(access: Str, struct_name: Str, field_name: Str) ! Codegen.Emit
     emit_line("if (_m->states[_i] != 1) continue;")
     emit_line("if (!_first) result = blink_str_concat(result, \", \");")
     emit_line("_first = 0;")
-    emit_debug_map_key("blink_map_key_slot(_m, _i, _stride)", key_type)
+    emit_debug_map_key("blink_map_key_slot(_m, _i, _stride)", key_type, key_struct)
     emit_line("result = blink_str_concat(result, \": \");")
     emit_debug_elem_from_slot("_m->values[_i]", val_type, val_struct)
     cg_indent = cg_indent - 1

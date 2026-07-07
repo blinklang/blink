@@ -1125,14 +1125,32 @@ fn tc_is_container_name(n: Str) -> Int {
     0
 }
 
-// The scalar Map-key kinds the v1 renderer can read back through the kops
-// storage layer (Str / Char / Int / Bool / sized ints). Char renders in
-// single-quoted debug-form (decisions/char-debug-form.md). @derive(Hash,Eq)
-// user-struct keys are still descoped (follow-up ticket 4dbjfr).
+// Is `tname` a user STRUCT (not an enum)? A struct decl's fields are plain
+// TypeField nodes; an enum decl's first field is a TypeVariant (same shape used
+// at whole-program registration, typecheck.bl:2644). Returns 0 for unknown /
+// non-user names.
+fn tc_type_is_struct(tname: Str) -> Int {
+    let td = tc_type_decl_nodes.get(tname) ?? -1
+    if td == -1 { return 0 }
+    let flds = node_fields(td)
+    if flds != -1 && sublist_length(flds) > 0 {
+        if node_kind(sublist_get(flds, 0)) == NodeKind.TypeVariant { return 0 }
+    }
+    1
+}
+
+// The Map-key types the v1 renderer can read back through the kops storage
+// layer. Two families: (a) scalars — Str / Char / Int / Bool / sized ints,
+// stored inline (Char in single-quoted debug-form, decisions/char-debug-form.md);
+// (b) @derive(Debug, Hash, Eq) user STRUCTS, read via blink_map_key_slot (which
+// dereferences the inline_key=0 pointer) and rendered via {sname}_debug (mirrors
+// the struct-VALUE path). Enums and non-Debug user types are still rejected
+// (E0520 via tc_check_debug_element).
 fn tc_debug_map_key_ok(key_name: Str) -> Int {
     if key_name == "Str" || key_name == "Char" || key_name == "Int" || key_name == "Bool" { return 1 }
     if key_name == "I8" || key_name == "I16" || key_name == "I32" || key_name == "I64" { return 1 }
     if key_name == "U8" || key_name == "U16" || key_name == "U32" || key_name == "U64" { return 1 }
+    if tc_type_is_struct(key_name) != 0 && tc_debug_types.contains_key(key_name) != 0 { return 1 }
     0
 }
 
@@ -1183,10 +1201,15 @@ fn tc_check_one_debug_field(f: Int, tname: Str, is_variant_field: Int) ! Diag.Re
         if elems_sl != -1 && sublist_length(elems_sl) >= 2 {
             let key_ann = sublist_get(elems_sl, 0)
             let key_name = node_name(key_ann)
-            if tc_debug_map_key_ok(key_name) == 0 {
-                diag_error_at("DeriveDebugFieldNoDebug", DERIVE_DEBUG_FIELD_NO_DEBUG, "@derive(Debug) on '{tname}': field '{node_name(f)}' has Map key type '{key_name}' which v1 Debug cannot render (only Str/Int/Bool/sized-int keys are supported)", f, "use a Str/Int/Bool key, or implement Debug manually")
-            } else {
+            if tc_debug_map_key_ok(key_name) != 0 {
                 tc_check_debug_element(key_ann, f, tname, ftype_name)
+            } else if tc_type_is_struct(key_name) != 0 {
+                // A user STRUCT key that isn't Debug (tc_debug_map_key_ok gates
+                // the Debug ones above): let tc_check_debug_element emit the
+                // precise "does not derive Debug" diagnostic.
+                tc_check_debug_element(key_ann, f, tname, ftype_name)
+            } else {
+                diag_error_at("DeriveDebugFieldNoDebug", DERIVE_DEBUG_FIELD_NO_DEBUG, "@derive(Debug) on '{tname}': field '{node_name(f)}' has Map key type '{key_name}' which v1 Debug cannot render (Str/Char/Int/Bool/sized-int keys, or a @derive(Debug, Hash, Eq) struct key)", f, "use a supported scalar key or a Debug struct key, or implement Debug manually")
             }
             tc_check_debug_element(sublist_get(elems_sl, 1), f, tname, ftype_name)
         }
