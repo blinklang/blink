@@ -75,7 +75,7 @@ import codegen_types.{
     var_enums
 }
 import codegen_derive.{ct_to_descriptor, descriptor_mangle, queue_promote_type}
-import codegen_methods.{emit_method_call, resolve_push_struct}
+import codegen_methods.{emit_boxed_container_store, emit_method_call, resolve_push_struct}
 import codegen_closures.{analyze_captures, emit_closure, emit_fn_value_shim_if_needed}
 import diagnostics.{
     diag_error, diag_error_at, diag_warn_at, diag_set_last_fix,
@@ -2468,6 +2468,18 @@ pub fn arg_type_ann_at(params_sl: Int, i: Int) -> Int {
     node_type_ann(sublist_get(params_sl, i))
 }
 
+// Returns the element type-annotation of the enclosing `let`-target when it is
+// `List[Elem]` (br 4yzsfc). Used by emit_list_lit to thread the declared element
+// carrier into cg_expect_arg_ann so a bare `None`/`Ok`/`Err` literal element
+// adopts it. Returns -1 when there is no List-typed let target.
+fn list_lit_elem_ann() -> Int {
+    if cg_let_target_ann == -1 { return -1 }
+    if node_name(cg_let_target_ann) != "List" { return -1 }
+    let elems = node_elements(cg_let_target_ann)
+    if elems == -1 || sublist_length(elems) < 1 { return -1 }
+    sublist_get(elems, 0)
+}
+
 // When cg_expect_arg_ann is `Result[Ok, Err]`, returns the element annotation at
 // `slot` (0 = Ok, 1 = Err), else -1. Lets Ok/Err constructors at a call site
 // adopt the parameter's expected Result inner types.
@@ -4253,7 +4265,17 @@ fn emit_list_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
                     first_elem_struct = get_list_elem_struct(src_str)
                 }
             } else {
+                // Sub-issue A (br 4yzsfc): thread the list's declared element
+                // annotation (from `let xs: List[Option[T]]` via cg_let_target_ann)
+                // so a bare `None`/`Ok`/`Err` element adopts the right carrier
+                // instead of defaulting to blink_Option_int.
+                let saved_arg_ann = cg_expect_arg_ann
+                let elem_ann = list_lit_elem_ann()
+                if elem_ann != -1 {
+                    cg_expect_arg_ann = elem_ann
+                }
                 emit_expr(elem_node)
+                cg_expect_arg_ann = saved_arg_ann
                 let e_str = expr_result_str
                 let e_type = expr_result_type
                 if i == 0 {
@@ -4261,26 +4283,14 @@ fn emit_list_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
                     first_elem_struct = resolve_push_struct(e_str, tmp)
                 }
                 let e_struct = resolve_push_struct(e_str, tmp)
+                // For a struct literal element whose type isn't recorded on a
+                // temp yet, recover its name from the StructLit node.
                 let box_struct = if e_type == CT_STRUCT && e_struct == "" && node_kind(elem_node) == NodeKind.StructLit {
                     strip_module_qualifier(node_type_name(elem_node))
                 } else {
                     e_struct
                 }
-                if (e_type == CT_STRUCT || e_type == CT_VOID) && box_struct != "" {
-                    let box_tmp = fresh_temp("_box")
-                    emit_line("{c_type_c_name(box_struct)}* {box_tmp} = ({c_type_c_name(box_struct)}*)blink_alloc(sizeof({c_type_c_name(box_struct)}));")
-                    emit_line("*{box_tmp} = {e_str};")
-                    emit_line("blink_list_push({tmp}, (void*){box_tmp});")
-                } else if e_type == CT_INT {
-                    emit_line("blink_list_push({tmp}, (void*)(intptr_t){e_str});")
-                } else if e_type == CT_FLOAT {
-                    let box_tmp = fresh_temp("_fbox")
-                    emit_line("double* {box_tmp} = (double*)blink_alloc(sizeof(double));")
-                    emit_line("*{box_tmp} = {e_str};")
-                    emit_line("blink_list_push({tmp}, (void*){box_tmp});")
-                } else {
-                    emit_line("blink_list_push({tmp}, (void*){e_str});")
-                }
+                emit_boxed_container_store("blink_list_push({tmp}, ", e_str, e_type, box_struct, tmp)
             }
             i = i + 1
         }

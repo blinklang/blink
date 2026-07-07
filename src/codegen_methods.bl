@@ -37,7 +37,7 @@ import codegen_types.{
     cg_expect_fn_value_sig, cg_expect_arg_ann, arg_type_ann_at, get_callee_params_sl,
     builtin_receiver_type_name,
     is_sized_int_ct, lookup_builtin_trait_impl, lookup_impl_method, impl_method_reg_name, impl_trait_for_method, impl_type_implements_trait_method, mangle_generic_name, mangle_impl_method_q, mangle_from_method, synthesized_display_call, render_result_arm_value, wrapping_unsigned_c_type,
-    option_c_type, reg_fn, reg_fn_with_effects, register_mono_fn, register_mono_instance,
+    option_c_type, option_inner_ct_from_tag, option_inner_struct_from_tag, reg_fn, reg_fn_with_effects, register_mono_fn, register_mono_instance,
     resolve_tparam, poly_impl_method_node, poly_impl_block_node, is_poly_impl_base,
     resolve_import_alias, resolve_ptr_inner_c, resolve_struct_from_c_name, get_var_ffi_ptr_struct, is_ffi_ptr_array_var,
     ffi_alloc_n_pending, ffi_offset_pending_struct,
@@ -338,6 +338,114 @@ pub fn resolve_push_struct(val_str: Str, list_name: Str) -> Str {
     get_list_elem_struct(list_name)
 }
 
+// Heap-box a value already evaluated into the expr_result_* globals and emit the
+// container write. `emit_prefix` is the C insert call up to (but not including)
+// the value argument — e.g. "blink_list_push(_l0, " / "blink_list_set(xs, 0, " /
+// "blink_map_set(m, key, " — so the helper closes it with the boxed pointer
+// (or the inline int form) and a trailing ");".
+//
+// Single source of truth for compound-element boxing across list.push,
+// list.set, map.insert, and list-literal (br 4yzsfc): compound values
+// (struct/enum/Option/Result) must be heap-allocated and stored behind a void*,
+// never cast struct-to-pointer directly (cc rejects that). Mirrors the branch
+// structure of the list.push reference. `elem_container` is the list name to
+// record element metadata on (set_list_elem_struct/type); pass "" for map
+// values, which track their value type separately.
+//
+// `val_struct` is the pre-resolved struct/enum name for the CT_STRUCT case
+// (callers resolve it differently: resolve_push_struct for push/set/map, the
+// StructLit fallback for list literals), or "" if none applies.
+pub fn emit_boxed_container_store(emit_prefix: Str, val_str: Str, val_type: Int, val_struct: Str, elem_container: Str) ! Codegen.Emit, Codegen.Register {
+    if (val_type == CT_STRUCT || val_type == CT_VOID) && val_struct != "" {
+        if elem_container != "" {
+            set_list_elem_struct(elem_container, val_struct)
+            set_list_elem_type(elem_container, CT_VOID)
+        }
+        let box_tmp = fresh_temp("_box")
+        emit_line("{c_type_c_name(val_struct)}* {box_tmp} = ({c_type_c_name(val_struct)}*)blink_alloc(sizeof({c_type_c_name(val_struct)}));")
+        emit_line("*{box_tmp} = {val_str};")
+        emit_line("{emit_prefix}(void*){box_tmp});")
+    } else if val_type == CT_INT {
+        emit_line("{emit_prefix}(void*)(intptr_t){val_str});")
+    } else if val_type == CT_FLOAT {
+        let box_tmp = fresh_temp("_fbox")
+        emit_line("double* {box_tmp} = (double*)blink_alloc(sizeof(double));")
+        emit_line("*{box_tmp} = {val_str};")
+        emit_line("{emit_prefix}(void*){box_tmp});")
+    } else if val_type == CT_OPTION {
+        let opt_inner_s = expr_option_inner_struct
+        let opt_tag = if opt_inner_s != "" { canonical_struct_tag(opt_inner_s) } else { c_type_tag(expr_option_inner) }
+        let opt_sname = "Option_{opt_tag}"
+        if opt_inner_s != "" {
+            ensure_struct_option_type(opt_inner_s)
+        } else {
+            ensure_option_type(expr_option_inner)
+        }
+        if elem_container != "" {
+            set_list_elem_struct(elem_container, opt_sname)
+            set_list_elem_type(elem_container, CT_VOID)
+        }
+        let opt_c = c_type_c_name(opt_sname)
+        let box_tmp = fresh_temp("_obox")
+        emit_line("{opt_c}* {box_tmp} = ({opt_c}*)blink_alloc(sizeof({opt_c}));")
+        emit_line("*{box_tmp} = {val_str};")
+        emit_line("{emit_prefix}(void*){box_tmp});")
+    } else if val_type == CT_RESULT {
+        let res_ok_s = expr_result_ok_struct
+        let res_err_s = expr_result_err_struct
+        let ok_tag = if res_ok_s != "" { canonical_struct_tag(res_ok_s) } else { c_type_tag(expr_result_ok_type) }
+        let err_tag = if res_err_s != "" { canonical_struct_tag(res_err_s) } else { c_type_tag(expr_result_err_type) }
+        let res_sname = "Result_{ok_tag}_{err_tag}"
+        ensure_mixed_result_type(expr_result_ok_type, expr_result_err_type, res_ok_s, res_err_s)
+        if elem_container != "" {
+            set_list_elem_struct(elem_container, res_sname)
+            set_list_elem_type(elem_container, CT_VOID)
+        }
+        let res_c = c_type_c_name(res_sname)
+        let box_tmp = fresh_temp("_rbox")
+        emit_line("{res_c}* {box_tmp} = ({res_c}*)blink_alloc(sizeof({res_c}));")
+        emit_line("*{box_tmp} = {val_str};")
+        emit_line("{emit_prefix}(void*){box_tmp});")
+    } else {
+        emit_line("{emit_prefix}(void*){val_str});")
+    }
+}
+
+// Sub-issue A (br 4yzsfc): a bare `None` written into List[Option[X]] via
+// push/set defaults its carrier to blink_Option_int (codegen_expr.bl None path)
+// because no expected annotation is threaded. When the receiver list already
+// records its element carrier as an `Option_X` tag, reseat the just-emitted
+// bare-None result to that carrier so emit_boxed_container_store allocates the
+// right struct. No-op when the value isn't a defaulted bare None or the list
+// has no recorded Option carrier yet (the empty-list-then-None-first residual
+// gap is tracked separately). Returns nothing; mutates expr_result_* globals.
+@allow(UnrestoredMutation, IncompleteStateRestore)
+fn reseat_bare_none_from_list_elem(obj_str: Str) ! Codegen.Register {
+    if expr_option_is_none == 0 { return }
+    // Only correct a carrier that defaulted to plain int with no struct inner.
+    if expr_option_inner_struct != "" || expr_option_inner != CT_INT { return }
+    let elem_tag = get_list_elem_struct(obj_str)
+    if !elem_tag.starts_with("Option_") { return }
+    let inner_ct = option_inner_ct_from_tag(elem_tag)
+    let inner_s = option_inner_struct_from_tag(elem_tag)
+    if inner_s != "" {
+        ensure_struct_option_type(inner_s)
+        let opt_type = struct_option_c_type(inner_s)
+        expr_result_str = "({opt_type})\{.tag = 0}"
+        expr_option_inner = CT_INT
+        expr_option_inner_struct = inner_s
+    } else {
+        // Same-carrier no-op guard: already Option_int, nothing to change.
+        if inner_ct == CT_INT { return }
+        ensure_option_type(inner_ct)
+        let opt_type = option_c_type(inner_ct)
+        expr_result_str = "({opt_type})\{.tag = 0}"
+        expr_option_inner = inner_ct
+        expr_option_inner_struct = ""
+    }
+    expr_result_type = CT_OPTION
+}
+
 @allow(UnrestoredMutation, IncompleteStateRestore)
 fn emit_str_method(node: Int, obj_str: Str, _obj_node: Int, method: Str) -> Int ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
     if method == "as_cstr" {
@@ -505,6 +613,7 @@ fn emit_list_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int 
         }
         let args_sl = node_args(node)
         emit_expr(sublist_get(args_sl, btc_arg_offset))
+        reseat_bare_none_from_list_elem(obj_str)
         let val_str = expr_result_str
         let val_type = expr_result_type
         // d7es5j: capture the list's recorded element-map K/V BEFORE
@@ -541,53 +650,7 @@ fn emit_list_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int 
             }
         }
         let val_struct = resolve_push_struct(val_str, obj_str)
-        if val_struct != "" {
-            set_list_elem_struct(obj_str, val_struct)
-            set_list_elem_type(obj_str, CT_VOID)
-            let box_tmp = fresh_temp("_box")
-            emit_line("{c_type_c_name(val_struct)}* {box_tmp} = ({c_type_c_name(val_struct)}*)blink_alloc(sizeof({c_type_c_name(val_struct)}));")
-            emit_line("*{box_tmp} = {val_str};")
-            emit_line("blink_list_push({obj_str}, (void*){box_tmp});")
-        } else if val_type == CT_INT {
-            emit_line("blink_list_push({obj_str}, (void*)(intptr_t){val_str});")
-        } else if val_type == CT_FLOAT {
-            let box_tmp = fresh_temp("_fbox")
-            emit_line("double* {box_tmp} = (double*)blink_alloc(sizeof(double));")
-            emit_line("*{box_tmp} = {val_str};")
-            emit_line("blink_list_push({obj_str}, (void*){box_tmp});")
-        } else if val_type == CT_OPTION {
-            let opt_inner_s = expr_option_inner_struct
-            let opt_tag = if opt_inner_s != "" { canonical_struct_tag(opt_inner_s) } else { c_type_tag(expr_option_inner) }
-            let opt_sname = "Option_{opt_tag}"
-            if opt_inner_s != "" {
-                ensure_struct_option_type(opt_inner_s)
-            } else {
-                ensure_option_type(expr_option_inner)
-            }
-            set_list_elem_struct(obj_str, opt_sname)
-            set_list_elem_type(obj_str, CT_VOID)
-            let opt_c = c_type_c_name(opt_sname)
-            let box_tmp = fresh_temp("_obox")
-            emit_line("{opt_c}* {box_tmp} = ({opt_c}*)blink_alloc(sizeof({opt_c}));")
-            emit_line("*{box_tmp} = {val_str};")
-            emit_line("blink_list_push({obj_str}, (void*){box_tmp});")
-        } else if val_type == CT_RESULT {
-            let res_ok_s = expr_result_ok_struct
-            let res_err_s = expr_result_err_struct
-            let ok_tag = if res_ok_s != "" { canonical_struct_tag(res_ok_s) } else { c_type_tag(expr_result_ok_type) }
-            let err_tag = if res_err_s != "" { canonical_struct_tag(res_err_s) } else { c_type_tag(expr_result_err_type) }
-            let res_sname = "Result_{ok_tag}_{err_tag}"
-            ensure_mixed_result_type(expr_result_ok_type, expr_result_err_type, res_ok_s, res_err_s)
-            set_list_elem_struct(obj_str, res_sname)
-            set_list_elem_type(obj_str, CT_VOID)
-            let res_c = c_type_c_name(res_sname)
-            let box_tmp = fresh_temp("_rbox")
-            emit_line("{res_c}* {box_tmp} = ({res_c}*)blink_alloc(sizeof({res_c}));")
-            emit_line("*{box_tmp} = {val_str};")
-            emit_line("blink_list_push({obj_str}, (void*){box_tmp});")
-        } else {
-            emit_line("blink_list_push({obj_str}, (void*){val_str});")
-        }
+        emit_boxed_container_store("blink_list_push({obj_str}, ", val_str, val_type, val_struct, obj_str)
         if push_var_name != "" {
             emit_trace_state(push_var_name, "push", val_str, val_type)
         }
@@ -848,24 +911,11 @@ fn emit_list_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int 
         emit_expr(sublist_get(args_sl, btc_arg_offset))
         let idx_str = expr_result_str
         emit_expr(sublist_get(args_sl, 1 + btc_arg_offset))
+        reseat_bare_none_from_list_elem(obj_str)
         let val_str2 = expr_result_str
         let val_type2 = expr_result_type
-        let val_struct2 = get_var_struct(val_str2)
-        if val_type2 == CT_STRUCT && val_struct2 != "" {
-            let box_tmp = fresh_temp("_box")
-            emit_line("{c_type_c_name(val_struct2)}* {box_tmp} = ({c_type_c_name(val_struct2)}*)blink_alloc(sizeof({c_type_c_name(val_struct2)}));")
-            emit_line("*{box_tmp} = {val_str2};")
-            emit_line("blink_list_set({obj_str}, {idx_str}, (void*){box_tmp});")
-        } else if val_type2 == CT_INT {
-            emit_line("blink_list_set({obj_str}, {idx_str}, (void*)(intptr_t){val_str2});")
-        } else if val_type2 == CT_FLOAT {
-            let box_tmp = fresh_temp("_fbox")
-            emit_line("double* {box_tmp} = (double*)blink_alloc(sizeof(double));")
-            emit_line("*{box_tmp} = {val_str2};")
-            emit_line("blink_list_set({obj_str}, {idx_str}, (void*){box_tmp});")
-        } else {
-            emit_line("blink_list_set({obj_str}, {idx_str}, (void*){val_str2});")
-        }
+        let val_struct2 = resolve_push_struct(val_str2, obj_str)
+        emit_boxed_container_store("blink_list_set({obj_str}, {idx_str}, ", val_str2, val_type2, val_struct2, obj_str)
         expr_result_str = "0"
         expr_result_type = CT_VOID
         return 1
@@ -965,22 +1015,7 @@ fn emit_map_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int !
         let val_type2 = expr_result_type
         let val_list_elem = expr_list_elem_type
         let val_struct = if val_type2 == CT_STRUCT { resolve_push_struct(val_str2, "") } else { "" }
-        if val_struct != "" {
-            let struct_c = c_type_c_name(val_struct)
-            let box_tmp = fresh_temp("_sbox")
-            emit_line("{struct_c}* {box_tmp} = ({struct_c}*)blink_alloc(sizeof({struct_c}));")
-            emit_line("*{box_tmp} = {val_str2};")
-            emit_line("blink_map_set({obj_str}, {key_expr}, (void*){box_tmp});")
-        } else if val_type2 == CT_INT {
-            emit_line("blink_map_set({obj_str}, {key_expr}, (void*)(intptr_t){val_str2});")
-        } else if val_type2 == CT_FLOAT {
-            let box_tmp = fresh_temp("_fbox")
-            emit_line("double* {box_tmp} = (double*)blink_alloc(sizeof(double));")
-            emit_line("*{box_tmp} = {val_str2};")
-            emit_line("blink_map_set({obj_str}, {key_expr}, (void*){box_tmp});")
-        } else {
-            emit_line("blink_map_set({obj_str}, {key_expr}, (void*){val_str2});")
-        }
+        emit_boxed_container_store("blink_map_set({obj_str}, {key_expr}, ", val_str2, val_type2, val_struct, "")
         if set_var_name != "" {
             emit_trace_state(set_var_name, "insert", val_str2, val_type2)
         }

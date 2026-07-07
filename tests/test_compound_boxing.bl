@@ -1,0 +1,78 @@
+// Regression for 4yzsfc: compound values (Option/Result/struct) written through
+// list-literal, map.insert, and list.set must be heap-boxed the same way the
+// list.push path already boxes them. Before the fix these three sibling write
+// paths cast a struct value straight to void*, which cc rejects
+// ("cannot convert to a pointer type"). Bare None/Ok/Err at these sites must
+// also adopt the container's declared carrier (sub-issue A), and @derive(Debug)
+// on a struct holding List[Option[Struct]] must emit the carrier typedef before
+// its debug walker (sub-issue B).
+//
+// Correctness of the boxed payload is asserted primarily through @derive(Debug)
+// render, which reads each boxed slot back and prints its contents. Reading a
+// nested Option straight back via `.get(i).unwrap()` is a separate, orthogonal
+// value-type-threading gap (tracked elsewhere), so these tests avoid it.
+
+@derive(Debug)
+type PT { x: Int }
+
+@derive(Debug)
+type OptIntList { xs: List[Option[Int]] }
+
+@derive(Debug)
+type BoxHolder { xs: List[Option[PT]] }
+
+// 1. list literal of Option elements — was: unboxed (void*)(blink_Option_int){...}
+test "list literal of Option[Int] boxes each element" {
+    let xs: List[Option[Int]] = [Some(1), None]
+    assert_eq(xs.len(), 2)
+    let w = OptIntList { xs: xs }
+    assert_eq(w.debug(), "OptIntList \{ xs: [Some(1), None] }")
+}
+
+// 2. map.insert of a compound value — was: unboxed blink_map_set(..., (void*){...})
+test "Map[Str, Option[Int]] insert boxes the value" {
+    let mut m: Map[Str, Option[Int]] = Map()
+    m.insert("a", Some(5))
+    m.insert("b", None)
+    assert_eq(m.len(), 2)
+}
+
+// 3. list literal of Result elements. The defect is a cc-rejected struct→void*
+//    cast at the write site, so the assertion is that the literal compiles and
+//    holds both elements. (@derive(Debug) doesn't render Result containers, and
+//    reading a nested Result back via .get().unwrap() is an orthogonal
+//    value-threading gap, so len() is the focused signal here.)
+test "list literal of Result[Int, Str] boxes each element" {
+    let xs: List[Result[Int, Str]] = [Ok(1), Err("e")]
+    assert_eq(xs.len(), 2)
+}
+
+// 4. list.set of a compound value — was: unboxed (void*){...} else-branch
+test "list.set of Option[Int] boxes the stored value" {
+    let mut xs: List[Option[Int]] = [Some(1), Some(2)]
+    xs.set(1, Some(9))
+    xs.set(0, None)
+    assert_eq(xs.len(), 2)
+    let w = OptIntList { xs: xs }
+    assert_eq(w.debug(), "OptIntList \{ xs: [None, Some(9)] }")
+}
+
+// 5. push of Some(struct) AND bare None into List[Option[Struct]] (sub-issue A):
+//    the bare None must adopt the list's declared Option[PT] carrier, not
+//    default to blink_Option_int.
+test "push Some(struct) then bare None into List[Option[Struct]]" {
+    let mut xs: List[Option[PT]] = []
+    xs.push(Some(PT { x: 9 }))
+    xs.push(None)
+    assert_eq(xs.len(), 2)
+    let h = BoxHolder { xs: xs }
+    assert_eq(h.debug(), "BoxHolder \{ xs: [Some(PT \{ x: 9 }), None] }")
+}
+
+// 6. @derive(Debug) on a struct holding List[Option[Struct]] built from a
+//    literal (sub-issue B): the blink_Option_PT carrier typedef must precede
+//    its debug walker fn.
+test "@derive(Debug) renders List[Option[Struct]] literal" {
+    let h = BoxHolder { xs: [Some(PT { x: 9 }), None] }
+    assert_eq(h.debug(), "BoxHolder \{ xs: [Some(PT \{ x: 9 }), None] }")
+}

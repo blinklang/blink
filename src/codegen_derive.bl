@@ -6,10 +6,10 @@ import codegen_types.{
     emit_line,
     fresh_temp,
     c_fn_name, c_type_c_name, c_type_tag, canonical_struct_tag, strip_module_qualifier,
-    type_from_name,
+    type_from_name, type_from_name_tag,
     is_hash_scalar_ct,
     kops_table_name, c_type_str,
-    ensure_struct_result_type,
+    ensure_struct_result_type, ensure_struct_option_type, ensure_option_type, ensure_mixed_result_type,
     is_struct_type, is_enum_type, is_data_enum,
     has_derive_method,
     get_struct_field_tp_id,
@@ -694,6 +694,23 @@ pub fn parse_type_str_to_descriptor(raw: Str) -> Str {
 // For S:<name>, does NOT emit a blink_debug_S_* fn (structs get {cn}_debug from
 // the derive loop); instead queues each container-typed struct field so those
 // nested walkers exist.
+// Register the Option carrier typedef for a debug walker over Option[inner]
+// (br 4yzsfc sub-issue B). `inner` is the descriptor of the Option's inner type.
+// Mirrors descriptor_typedef_tag: a struct/enum inner registers the struct-tagged
+// carrier (blink_Option_<canonical tag>); a scalar/Str leaf registers the
+// primitive carrier (blink_Option_<c_type_tag>). Nested-compound inners already
+// have their carriers registered by the container/field machinery, so they are
+// left alone here.
+fn register_debug_option_carrier(inner: Str) {
+    if inner.starts_with("S:") {
+        ensure_struct_option_type(inner.slice(2, inner.len()))
+        return
+    }
+    if inner.starts_with("P:") || (!inner.starts_with("O:") && !inner.starts_with("R:") && !inner.starts_with("M:") && !inner.starts_with("L:") && !inner.starts_with("C:")) {
+        ensure_option_type(desc_primary_ct(inner))
+    }
+}
+
 pub fn queue_debug_type(desc: Str) {
     if desc == "" { return }
     if desc.starts_with("P:") { return }
@@ -721,6 +738,13 @@ pub fn queue_debug_type(desc: Str) {
         return
     }
     if desc.starts_with("O:") {
+        // br 4yzsfc (sub-issue B): register the Option carrier typedef the debug
+        // walker references (blink_Option_<tag>, per descriptor_c_type) so
+        // emit_option_result_types_from emits it before the walker's forward
+        // decl. Without this, a List[Option[Struct]] whose carrier is only
+        // discovered late leaves the debug fwd-decl referencing an undeclared
+        // type. Mirrors descriptor_typedef_tag's S:/P: leaf handling.
+        register_debug_option_carrier(inner_desc_of(desc))
         queue_debug_type(inner_desc_of(desc))
         return
     }
