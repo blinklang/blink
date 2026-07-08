@@ -376,6 +376,11 @@ BLINK_UNUSED static void blink_test_run(const blink_test_entry* tests, int count
         }
     }
 
+    /* zs3w3y: line-buffer stdout so each per-test line flushes on its trailing
+     * newline and survives a later C-level crash (SIGSEGV / _exit / forwarded
+     * SIGTERM) that bypasses the atexit flush. Must precede every printf here. */
+    setvbuf(stdout, NULL, _IOLBF, 0);
+
     __blink_panic_test_hook = __blink_test_panic_handler;
 
     int pass = 0, fail = 0, skip = 0, total = 0;
