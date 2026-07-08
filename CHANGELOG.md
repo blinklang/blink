@@ -2,6 +2,10 @@
 
 Single source of truth for release history. `blink llms` and `blink llms --full` both append this file after the reference text, and every release version is indexed as a topic (e.g. `blink llms --topic v0.36`). **Edit only here** — `llms.md` and `llms-full.md` hold only a `## Recent Changes` stub pointing at this file.
 
+## Fixes (v0.53.1)
+
+- **`blink test` no longer loses per-test output when a test file crashes at the C level.** The runner captures each compiled test binary's stdout through a pipe, which made glibc fully block-buffer it; a hardware-signal crash (stack overflow, out-of-bounds, null deref) skipped the atexit flush and discarded every buffered `test NAME ... ok/FAIL` line, so a run that had partly succeeded read as a total wipeout. Test stdout is now line-buffered, so each completed per-test line survives the crash — you see which tests ran before the file went down (the case summary still won't print on a mid-run crash, because the run didn't finish).
+
 ## What's New (v0.53.0)
 
 - **`@derive(Debug)` renders arbitrarily-nested containers and enum-variant fields.** The one-level cap is gone. `@derive(Debug)` now renders `List[List[T]]`, `Option[List[T]]`, `Map[K, List[V]]`, `Option[Option[T]]`, and container-typed enum-variant fields — at any nesting depth — through one shared set of generated recursive functions. `List[Option[T]]`, `Map[K, Option[V]]`, list literals of `Option`/`Result`, and `list.set` of a compound value now box their elements correctly instead of being a typecheck-accepts-but-`cc`-fails trap. A `Map` key of user-struct type (carrying `@derive(Debug, Hash, Eq)`) also renders now — `{Point{x:1, y:2}: 1}` — per §3.6.1's "renderable iff both K and V are Debug".

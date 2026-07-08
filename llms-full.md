@@ -1,6 +1,6 @@
 # Blink Language Reference
 
-> Blink is a statically-typed, effect-tracked language compiling to C. **Compiler v0.53.0**.
+> Blink is a statically-typed, effect-tracked language compiling to C. **Compiler v0.53.1**.
 
 ## Install
 
@@ -12,7 +12,7 @@ docker pull ghcr.io/blinklang/blink:latest
 docker run --rm -v "$PWD":/workspace ghcr.io/blinklang/blink run myfile.bl
 ```
 
-Tags: `latest`, `0.53`, `0.53.0` (semver). Image is `debian:bookworm-slim` with `gcc`, `zig`, `blink`, and `libgc-dev`.
+Tags: `latest`, `0.53`, `0.53.1` (semver). Image is `debian:bookworm-slim` with `gcc`, `zig`, `blink`, and `libgc-dev`.
 
 ## Recent Changes
 
