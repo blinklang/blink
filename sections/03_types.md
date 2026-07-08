@@ -2329,7 +2329,7 @@ String interpolation `"hello {name}"` desugars to a string concatenation where e
 **Requirement: strict compile error.** Every `{expr}` in a string literal requires the expression's type to satisfy `T: Display`. If the type does not implement `Display`, the compiler emits an error:
 
 ```
-error[MissingDisplayImpl]: type `Matrix` does not implement `Display`
+error[E0523]: type `Matrix` does not implement `Display`
   --> app.bl:12:34
    |
 12 |     let s = "result: {matrix}"

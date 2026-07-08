@@ -18,7 +18,7 @@ import diagnostics.{
     Diag, diag_clear_allows, diag_error_at, diag_error_no_loc,
     diag_push_allows, diag_warn_at,
     TYPE_ERROR, CAPABILITY_BUDGET, QM_INVALID_OPERAND, UNDEFINED_FUNCTION,
-    UNRESOLVED_METHOD, AMBIGUOUS_METHOD_CALL,
+    UNRESOLVED_METHOD, AMBIGUOUS_METHOD_CALL, MISSING_DISPLAY_IMPL,
     UNDEFINED_VARIABLE, UNKNOWN_TYPE, QM_RESULT_IN_NON_RESULT,
     QM_OPTION_IN_NON_OPTION, QM_ERROR_MISMATCH,
     QM_TEST_DISPLAY_REQUIRED, TEST_ANNOTATED_RETURN, SKIP_OUTSIDE_TEST,
@@ -329,6 +329,26 @@ fn tc_type_id_has_display(tid: Int) -> Int {
     let k = type_kind(tid)
     if k == TK_UNKNOWN || k == TK_TYPEVAR { return 0 }
     if k == TK_INT || k == TK_FLOAT || k == TK_BOOL || k == TK_CHAR || k == TK_STR { return 1 }
+    // Sized integers are Display-able scalars — interpolation lowers them to
+    // %lld/%llu just like Int (codegen_expr emit_interp_string CT_I8..CT_U64).
+    if is_sized_int(k) != 0 { return 1 }
+    // Tuples derive Display structurally when every element is Display (spec
+    // §3.6); codegen renders them "(e0, e1, ...)". An empty tuple has nothing
+    // non-Display, so it is trivially Display.
+    if k == TK_TUPLE {
+        let te = ty_pool.get(tid).unwrap()
+        let mut i = 0
+        while i < te.params_count {
+            let et = ty_param_list.get(te.params_start + i).unwrap()
+            let ek = type_kind(et)
+            // Fail-open on unresolved/generic elements — unknowable, not absent.
+            if ek != TK_UNKNOWN && ek != TK_TYPEVAR && tc_type_id_has_display(et) == 0 {
+                return 0
+            }
+            i = i + 1
+        }
+        return 1
+    }
     tc_type_has_display_impl(type_to_str(tid))
 }
 
@@ -5721,7 +5741,17 @@ fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repo
             while pi < sublist_length(parts_sl) {
                 let part = sublist_get(parts_sl, pi)
                 if is_interp_literal_part(part) == 0 {
-                    infer_type(part)
+                    let ptid = infer_type(part)
+                    // Spec §3.6 (DECISIONS.md:191-192): every interpolated
+                    // expression must be Display. No Debug fallback. Skip
+                    // unresolved/generic types (helper returns 0 there, but
+                    // Display is unknowable — erroring would false-reject and
+                    // brick `task regen`).
+                    let pk = type_kind(ptid)
+                    if pk != TK_UNKNOWN && pk != TK_TYPEVAR && tc_type_id_has_display(ptid) == 0 {
+                        tc_errors.push("interpolated value of type '{type_to_str(ptid)}' does not implement Display")
+                        diag_error_at("MissingDisplayImpl", MISSING_DISPLAY_IMPL, "type '{type_to_str(ptid)}' does not implement Display", part, "add '@derive(Display)' or implement Display manually; use '.debug()' for structural form")
+                    }
                 }
                 pi = pi + 1
             }
@@ -7254,14 +7284,25 @@ fn tc_check_pattern_types(node: Int) ! TypeCheck.Resolve {
         return
     }
     if kind == NodeKind.ListPattern {
+        let saved_binding = tc_pattern_binding_type
+        // Each fixed-position element binder is typed against the list's
+        // element type, not the whole list. Without this a `[cmd]` binder is
+        // typed as List[T] and any consumer that reads the binding's type
+        // (e.g. the Display interpolation gate) sees the wrong type.
+        let mut elem_t = -1
+        if saved_binding >= 0 && type_kind(saved_binding) == TK_LIST {
+            elem_t = ty_pool.get(saved_binding).unwrap().inner1
+        }
         let elems_sl = node_elements(node)
         if elems_sl != -1 {
             let mut i = 0
             while i < sublist_length(elems_sl) {
+                tc_pattern_binding_type = elem_t
                 tc_check_pattern_types(sublist_get(elems_sl, i))
                 i = i + 1
             }
         }
+        tc_pattern_binding_type = saved_binding
         return
     }
     if kind == NodeKind.OrPattern {

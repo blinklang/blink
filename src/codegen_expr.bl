@@ -27,7 +27,7 @@ import codegen_types.{
     option_inner_ct_from_tag, option_inner_struct_from_tag,
     emit_line, ensure_iter_type, ensure_mixed_result_type, ev_field,
     ensure_option_type, ensure_result_type, ensure_struct_option_type,
-    ensure_tuple_type, find_type_def_node, fresh_temp,
+    ensure_tuple_type, tuple_struct_arity, tuple_elem_ct, tuple_elem_struct, find_type_def_node, fresh_temp,
     get_capture_index, get_fn_node, get_fn_ret, get_fn_ret_struct,
     get_fn_ret_handler, get_fn_ret_struct_inner, get_fn_ret_type,
     get_generic_fn_node,
@@ -3998,6 +3998,92 @@ fn escape_fmt_percent(s: Str) -> Str {
     sb.to_str()
 }
 
+// A single interpolated value's contribution to the blink_str_format call:
+// `fmt` is the printf-format fragment, `arg` the matching vararg expression
+// (empty when the fragment carries no %-specifier, e.g. an inlined literal).
+type InterpFrag {
+    fmt: Str
+    arg: Str
+}
+
+// Render one C value expression `e_str` of C-type `e_type` for interpolation.
+// Scalars map to a printf specifier + coerced arg; user structs/enums route
+// through their synthesized Display.display(); tuples expand inline to
+// "(e0, e1, ...)" by recursing per element (spec §3.6 structural tuple
+// Display). The E0523 typecheck gate guarantees every value is Display, so the
+// no-Display branch is defensive and emits a placeholder literal — NEVER the
+// raw aggregate into %s (which would SIGSEGV — bug fmj80a).
+fn interp_render_value(e_str: Str, e_type: Int, known_struct: Str) -> InterpFrag ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
+    if e_type == CT_INT || e_type == CT_I8 || e_type == CT_I16 || e_type == CT_I32 {
+        return InterpFrag { fmt: "%lld", arg: "(long long)".concat(e_str) }
+    }
+    if e_type == CT_U8 || e_type == CT_U16 || e_type == CT_U32 || e_type == CT_U64 {
+        return InterpFrag { fmt: "%llu", arg: "(unsigned long long)".concat(e_str) }
+    }
+    if e_type == CT_FLOAT {
+        return InterpFrag { fmt: "%g", arg: e_str }
+    }
+    if e_type == CT_BOOL {
+        return InterpFrag { fmt: "%s", arg: e_str.concat(" ? \"true\" : \"false\"") }
+    }
+    if e_type == CT_CHAR {
+        return InterpFrag { fmt: "%s", arg: "blink_char_to_str((int64_t)".concat(e_str).concat(")") }
+    }
+    if e_type == CT_STRUCT || e_type == CT_ENUM || e_type == CT_VOID {
+        // `known_struct` is the tag supplied by a tuple-element recursion —
+        // `e_str` there is a field-access expr (e.g. `t._1`) that get_var_struct
+        // cannot resolve, so trust the caller's tag. Top-level calls pass "".
+        let sname = if known_struct != "" {
+            known_struct
+        } else if get_var_struct(e_str) != "" {
+            get_var_struct(e_str)
+        } else if is_data_enum(get_var_enum(e_str)) != 0 {
+            get_var_enum(e_str)
+        } else {
+            ""
+        }
+        // Anonymous tuple: no impl Display, render structurally as (e0, e1, ...).
+        let arity = if sname != "" { tuple_struct_arity(sname) } else { -1 }
+        if arity >= 0 {
+            let mut tfmt = "("
+            let mut targ = ""
+            let mut ti = 0
+            while ti < arity {
+                if ti > 0 { tfmt = tfmt.concat(", ") }
+                let elem_struct = tuple_elem_struct(sname, ti)
+                let elem_ct = if elem_struct != "" { CT_STRUCT } else { tuple_elem_ct(sname, ti) }
+                let elem_expr = e_str.concat("._{ti}")
+                let sub = interp_render_value(elem_expr, elem_ct, elem_struct)
+                tfmt = tfmt.concat(sub.fmt)
+                if sub.arg != "" {
+                    if targ != "" { targ = targ.concat(", ") }
+                    targ = targ.concat(sub.arg)
+                }
+                ti = ti + 1
+            }
+            tfmt = tfmt.concat(")")
+            return InterpFrag { fmt: tfmt, arg: targ }
+        }
+        let disp = if sname != "" { synthesized_display_call(sname, e_str) } else { "" }
+        if disp != "" {
+            return InterpFrag { fmt: "%s", arg: disp }
+        }
+        let tag = if sname != "" { sname } else { "value" }
+        return InterpFrag { fmt: "%s", arg: "\"<".concat(tag).concat(">\"") }
+    }
+    // CT_STRING is a genuine const char* — raw %s is correct.
+    if e_type == CT_STRING {
+        return InterpFrag { fmt: "%s", arg: e_str }
+    }
+    // Any other CT reaching here is a non-Display aggregate the typecheck gate
+    // should have rejected (e.g. a List/Map/Option element inside a tuple typed
+    // via an un-substituted generic typevar — E0523 fails open on typevars).
+    // NEVER pass such a value to %s: that reinterprets its bytes as a char*
+    // (type confusion / SIGSEGV — the whole point of fmj80a). Emit a safe
+    // placeholder literal instead so codegen can never crash on it.
+    InterpFrag { fmt: "%s", arg: "\"<value>\"" }
+}
+
 @allow(UnrestoredMutation, IncompleteStateRestore)
 fn emit_interp_string(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
     let parts_sl = node_elements(node)
@@ -4049,54 +4135,13 @@ fn emit_interp_string(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope
         } else {
             // Expression part
             emit_expr(part)
-            let e_str = expr_result_str
-            let e_type = expr_result_type
-            if e_type == CT_INT || e_type == CT_I8 || e_type == CT_I16 || e_type == CT_I32 {
-                fmt = fmt.concat("%lld")
+            let frag = interp_render_value(expr_result_str, expr_result_type, "")
+            fmt = fmt.concat(frag.fmt)
+            if frag.arg != "" {
                 if has_args {
                     args = args.concat(", ")
                 }
-                args = args.concat("(long long)")
-                args = args.concat(e_str)
-                has_args = 1
-            } else if e_type == CT_U8 || e_type == CT_U16 || e_type == CT_U32 || e_type == CT_U64 {
-                fmt = fmt.concat("%llu")
-                if has_args {
-                    args = args.concat(", ")
-                }
-                args = args.concat("(unsigned long long)")
-                args = args.concat(e_str)
-                has_args = 1
-            } else if e_type == CT_FLOAT {
-                fmt = fmt.concat("%g")
-                if has_args {
-                    args = args.concat(", ")
-                }
-                args = args.concat(e_str)
-                has_args = 1
-            } else if e_type == CT_BOOL {
-                fmt = fmt.concat("%s")
-                if has_args {
-                    args = args.concat(", ")
-                }
-                args = args.concat(e_str)
-                args = args.concat(" ? \"true\" : \"false\"")
-                has_args = 1
-            } else if e_type == CT_CHAR {
-                fmt = fmt.concat("%s")
-                if has_args {
-                    args = args.concat(", ")
-                }
-                args = args.concat("blink_char_to_str((int64_t)")
-                args = args.concat(e_str)
-                args = args.concat(")")
-                has_args = 1
-            } else {
-                fmt = fmt.concat("%s")
-                if has_args {
-                    args = args.concat(", ")
-                }
-                args = args.concat(e_str)
+                args = args.concat(frag.arg)
                 has_args = 1
             }
         }

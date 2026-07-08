@@ -1,0 +1,97 @@
+import compile_test_helpers
+
+// fmj80a: string interpolation `{expr}` requires `T: Display` at compile time.
+// Two-phase spec (DECISIONS.md:191-192, sections/03_types.md §3.6):
+//   half-1 typecheck gate rejects non-Display interpolands (E0523),
+//   half-2 codegen routes user structs/enums through Display.display().
+
+// --- Struct WITH Display: renders via display(), not a raw-struct %s crash ---
+
+type Point {
+    x: Int
+    y: Int
+}
+
+impl Display for Point {
+    fn fmt(self, sb: StringBuilder) {
+        sb.write("Point({self.x}, {self.y})")
+    }
+}
+
+test "struct with Display interpolates via display()" {
+    let p = Point { x: 1, y: 2 }
+    let s = "v={p}"
+    assert(s == "v=Point(1, 2)")
+}
+
+// --- Tuple of Display types renders "(a, b)" (spec §3.6 auto-derive) ---
+
+test "tuple of scalars interpolates as (a, b)" {
+    let point = (10, 20)
+    let s = "pt={point}"
+    assert(s == "pt=(10, 20)")
+}
+
+test "tuple of mixed Display types interpolates" {
+    let pair = (1, "hi")
+    let s = "v={pair}"
+    assert(s == "v=(1, hi)")
+}
+
+test "nested tuple interpolates recursively" {
+    let nested = (1, (2, 3))
+    let s = "n={nested}"
+    assert(s == "n=(1, (2, 3))")
+}
+
+test "tuple containing a struct-with-Display renders via display()" {
+    let p = Point { x: 7, y: 8 }
+    let t = (p, 9)
+    let s = "t={t}"
+    assert(s == "t=(Point(7, 8), 9)")
+}
+
+// --- Safety net: a non-Display aggregate that slips past the gate (generic
+// tuple with an un-substituted typevar element carrying a List) must NEVER
+// crash codegen. It renders a safe "<value>" placeholder, not a raw pointer
+// into %s. Guards the fmj80a "interpolation never SIGSEGVs" invariant totally. ---
+
+fn wrap_pair[T](x: T) -> (T, Int) {
+    (x, 1)
+}
+
+test "generic tuple with non-Display element does not crash interpolation" {
+    let t = wrap_pair([1, 2, 3])
+    let s = "x={t}"
+    assert(s.len() > 0)
+    assert(s.contains("<value>"))
+}
+
+// --- Negative: struct WITHOUT Display is rejected at check time (E0523) ---
+
+test "interp of struct without Display is E0523" {
+    let src = "type P \{ x: Int }\nfn main() \{\n  let p = P \{ x: 1 }\n  let s = \"v=\{p\}\"\n  io.println(s)\n}\n"
+    compile_test_helpers.expect_compile_error(src, "interp_no_display_struct", "E0523")
+}
+
+// --- Negative: containers are Debug-only, NOT Display → E0523 ---
+
+test "interp of List is E0523 (Debug-only, not Display)" {
+    let src = "fn main() \{\n  let xs = [1, 2, 3]\n  let s = \"v=\{xs\}\"\n  io.println(s)\n}\n"
+    compile_test_helpers.expect_compile_error(src, "interp_list_no_display", "E0523")
+}
+
+// --- Positive gate check: scalar interpolation must NOT over-fire ---
+
+test "interp of scalars does not fire E0523" {
+    let src = "fn main() \{\n  let n = 42\n  let name = \"blink\"\n  let s = \"n=\{n\} name=\{name\}\"\n  io.println(s)\n}\n"
+    compile_test_helpers.expect_no_error(src, "interp_scalar_ok", "E0523")
+}
+
+// --- MVCE regression (ticket fmj80a): interpolating a stdlib Instant.
+// Instant has no Display impl, so per the spec this is an E0523, not a print. ---
+
+test "interp of Instant (no Display) is E0523" {
+    let src = "import time\nfn main() \{\n  let now = time.Instant_from_epoch_secs(0)\n  let s = \"the time is \{now\}\"\n  io.println(s)\n}\n"
+    compile_test_helpers.expect_compile_error(src, "interp_instant_no_display", "E0523")
+}
