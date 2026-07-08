@@ -51,20 +51,60 @@ test "tuple containing a struct-with-Display renders via display()" {
     assert(s == "t=(Point(7, 8), 9)")
 }
 
-// --- Safety net: a non-Display aggregate that slips past the gate (generic
-// tuple with an un-substituted typevar element carrying a List) must NEVER
-// crash codegen. It renders a safe "<value>" placeholder, not a raw pointer
-// into %s. Guards the fmj80a "interpolation never SIGSEGVs" invariant totally. ---
+// --- qm01e7: a generic fn returning a compound type with a typevar element
+// (e.g. `wrap[T](x: T) -> (T, Int)`) must substitute the concrete arg type into
+// the return type at the call site — both for the interp Display gate (seam 1,
+// typecheck) and for tuple-element codegen (seam 2, no `blink_void`). ---
 
 fn wrap_pair[T](x: T) -> (T, Int) {
     (x, 1)
 }
 
-test "generic tuple with non-Display element does not crash interpolation" {
-    let t = wrap_pair([1, 2, 3])
+test "generic compound return substitutes typevar (Int) and renders" {
+    let t = wrap_pair(42)
     let s = "x={t}"
-    assert(s.len() > 0)
-    assert(s.contains("<value>"))
+    assert(s == "x=(42, 1)")
+}
+
+test "generic compound return with Map element compiles and runs" {
+    let m: Map[Str, Int] = Map()
+    m.insert("a", 1)
+    let t = wrap_pair(m)
+    assert(t.1 == 1)
+    assert(t.0.get("a").unwrap() == 1)
+}
+
+test "generic compound return with Option[Int] element compiles" {
+    let o: Option[Int] = Some(5)
+    let t = wrap_pair(o)
+    assert(t.1 == 1)
+    assert(t.0.unwrap() == 5)
+}
+
+// Str inner proves the mono key is distinct per inner type (no wrap_Option
+// collision) and the parameterized carrier resolves — previously both the
+// param and tuple slot defaulted the inner to Int and mis-lowered.
+test "generic compound return with Option[Str] element compiles" {
+    let o: Option[Str] = Some("hi")
+    let t = wrap_pair(o)
+    assert(t.1 == 1)
+    assert(t.0.unwrap() == "hi")
+}
+
+test "generic compound return with Result element compiles" {
+    let r: Result[Int, Str] = Ok(9)
+    let t = wrap_pair(r)
+    assert(t.1 == 1)
+    assert(t.0.unwrap() == 9)
+}
+
+// A generic tuple with a substituted List element is NOT Display (List is
+// Debug-only, spec §3.6 / DECISIONS.md:154). Once the return type is
+// substituted, the interp gate sees a concrete List and fires E0523 — it does
+// NOT render, and it must NOT reach the `<value>` codegen safety net.
+test "interp of generic tuple with List element is E0523" {
+    let src = "fn wrap[T](x: T) -> (T, Int) \{ (x, 1) }\nfn main() \{\n  let t = wrap([1, 2, 3])\n  let s = \"x=\{t\}\"\n  io.println(s)\n}\n"
+    compile_test_helpers.expect_compile_error(src, "interp_generic_tuple_list_no_display", "E0523")
 }
 
 // --- Negative: struct WITHOUT Display is rejected at check time (E0523) ---

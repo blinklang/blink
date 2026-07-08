@@ -2356,8 +2356,15 @@ pub fn resolve_tuple_ann(ta: Int, tparams_sl: Int, concrete_args: Str) -> Option
         let elem_ann = sublist_get(elems_sl, i)
         let elem_name_raw = node_name(elem_ann)
         let elem_name = resolve_tparam(elem_name_raw, tparams_sl, concrete_args)
-        let elem_t = type_from_name(elem_name)
-        if elem_t == CT_VOID && is_struct_type(elem_name) == 0 && is_enum_type(elem_name) == 0 {
+        // A typevar substituted to a whole Option/Result arrives as the canonical
+        // carrier tag (Option_str, Result_int_str) rather than an annotation with
+        // child nodes. Recognize it so the tuple slot gets the parameterized
+        // carrier (blink_Option_str) instead of bailing (type_from_name → CT_VOID
+        // → None) or lowering to `void`. Map tags stay bare ("Map") and fall to
+        // the uniform blink_map* scalar path below. (qm01e7)
+        let carrier_tag = if elem_name.starts_with("Option_") || elem_name.starts_with("Result_") { elem_name } else { "" }
+        let elem_t = if carrier_tag != "" { compound_tag_ct(carrier_tag) } else { type_from_name(elem_name) }
+        if carrier_tag == "" && elem_t == CT_VOID && is_struct_type(elem_name) == 0 && is_enum_type(elem_name) == 0 {
             return None
         }
         if i > 0 {
@@ -2365,16 +2372,29 @@ pub fn resolve_tuple_ann(ta: Int, tparams_sl: Int, concrete_args: Str) -> Option
             elem_types_enc = elem_types_enc.concat(",")
             elem_structs_enc = elem_structs_enc.concat(",")
         }
-        if is_struct_type(elem_name) != 0 || is_enum_type(elem_name) != 0 {
+        if carrier_tag != "" {
+            let canon = canonical_struct_tag(carrier_tag)
+            ensure_carrier_from_tag(canon)
+            tags = tags.concat(canon)
+            elem_structs_enc = elem_structs_enc.concat(canon)
+        } else if is_struct_type(elem_name) != 0 || is_enum_type(elem_name) != 0 {
             let struct_tag = c_type_tag_for_struct(elem_name)
             tags = tags.concat(struct_tag)
             elem_structs_enc = elem_structs_enc.concat(struct_tag)
-        } else if is_compound_ct(elem_t) != 0 {
+        } else if is_compound_ct(elem_t) != 0 && elem_name == elem_name_raw {
+            // Annotation genuinely spells the compound (e.g. `Map[Str, Int]`):
+            // read its inner shape from the node's child anns.
             ensure_compound_type_from_ann(elem_ann)
             let compound_name = canonical_struct_tag(compound_name_from_ann(elem_ann))
             tags = tags.concat(compound_name)
             elem_structs_enc = elem_structs_enc.concat(compound_name)
         } else {
+            // Scalar, OR a typevar substituted to a bare compound (`T` → `Map`).
+            // In the latter case the raw ann is the bare typevar node with no
+            // inner anns, so compound_name_from_ann would decode "void"; and the
+            // inner types were erased to the bare name upstream anyway (same as
+            // the param, which emits `blink_map*`). Use the type-erased tag so
+            // the tuple field type matches the parameter.
             tags = tags.concat(c_type_tag(elem_t))
             elem_structs_enc = elem_structs_enc.concat("-")
         }
@@ -3577,6 +3597,25 @@ pub fn register_mono_fn(base: Str, args: Str) ! Codegen.Register {
     mono_fns.push(MonoFnInstance { base: base, args: args })
 }
 
+// Canonical inner-carrying tag (Option_<inner>, Result_<ok>_<err>) for a whole
+// Option/Result argument at position `fi`, built from the inner types the call
+// site captured in GenericCallArgs. Uses the struct/enum name when present, else
+// the scalar tag — matching compound_option_inner_name / compound_name_from_ann
+// so downstream decoders (c_type_c_name, canonical_struct_tag) round-trip it to
+// blink_Option_<inner>. Keeps generic mono keys distinct per inner type.
+fn compound_tag_from_ca(ca: GenericCallArgs, fi: Int, arg_ct: Int) -> Str {
+    let ok_sn = ca.struct_names.get(fi).unwrap()
+    let ok_ct = ca.elem_types.get(fi).unwrap()
+    let ok_tag = if ok_sn != "" { ok_sn } else { c_type_tag(ok_ct) }
+    if arg_ct == CT_OPTION {
+        return "Option_{ok_tag}"
+    }
+    let err_sn = ca.err_struct_names.get(fi).unwrap()
+    let err_ct = ca.err_elem_types.get(fi).unwrap()
+    let err_tag = if err_sn != "" { err_sn } else { c_type_tag(err_ct) }
+    "Result_{ok_tag}_{err_tag}"
+}
+
 pub fn infer_fn_type_args_from_types(fn_node: Int, ca: GenericCallArgs) -> Option[Str] {
     let tparams_sl = node_type_params(fn_node)
     if tparams_sl == -1 {
@@ -3604,7 +3643,18 @@ pub fn infer_fn_type_args_from_types(fn_node: Int, ca: GenericCallArgs) -> Optio
                 let arg_sn = ca.struct_names.get(fi).unwrap()
                 if (arg_ct == CT_STRUCT || arg_ct == CT_ENUM) && arg_sn != "" {
                     resolved = arg_sn
+                } else if arg_ct == CT_OPTION || arg_ct == CT_RESULT {
+                    // Whole Option/Result bound to a bare-typevar param `x: T`.
+                    // type_name_from_ct returns "Void" for these; instead thread
+                    // the canonical inner-carrying tag (Option_str, Result_int_str)
+                    // built from the inner types the call site captured in `ca`.
+                    // This keeps mono keys distinct per inner (no wrap_Option
+                    // collision) and lets the param/return/tuple carriers resolve
+                    // to blink_Option_<inner> instead of blink_void (qm01e7).
+                    resolved = compound_tag_from_ca(ca, fi, arg_ct)
                 } else {
+                    // Map/List/Set etc. erase to a single uniform C carrier, so
+                    // the bare name (type_name_from_ct) is sufficient.
                     resolved = type_name_from_ct(arg_ct)
                 }
             } else if ptype == "List" {
@@ -4797,6 +4847,7 @@ pub fn c_type_tag(ct: Int) -> Str {
     else if ct == CT_HANDLE { "handle" }
     else if ct == CT_CHANNEL { "channel" }
     else if ct == CT_MAP { "map" }
+    else if ct == CT_SET { "set" }
     else if ct == CT_BYTES { "bytes" }
     else if ct == CT_STRINGBUILDER { "stringbuilder" }
     else if ct == CT_PTR { "ptr" }
@@ -4942,6 +4993,39 @@ pub fn ensure_option_type(inner: Int) {
     }
     emitted_option_set.insert(key, 1)
     emitted_option_types.push(inner)
+}
+
+// Ensure the carrier typedef for a canonical compound tag (Option_<inner>,
+// Result_<ok>_<err>) is registered for emission. Used when a generic typevar is
+// bound to a whole Option/Result: the resolved name is the tag, not an
+// annotation node. A SCALAR inner must route to the inline ensurer
+// (ensure_option_type / ensure_result_type) so the carrier keeps `int64_t
+// value`; only a struct/enum inner uses the pointer-boxing struct-carrier path.
+// The two paths share the `blink_Option_int` typedef name under one dedup guard,
+// so mis-routing a scalar to the struct path would emit `int64_t* value` and
+// diverge from every scalar Option construct/unwrap. Map tags need no ensure
+// (uniform blink_map*). Idempotent via the ensure_* dedup sets.
+pub fn ensure_carrier_from_tag(tag: Str) {
+    if tag.starts_with("Option_") {
+        let inner = tag.slice(7, tag.len())
+        let inner_ct = type_from_name_tag(inner)
+        if inner_ct != CT_VOID {
+            ensure_option_type(inner_ct)
+        } else {
+            ensure_struct_option_type(inner)
+        }
+    } else if tag.starts_with("Result_") {
+        let parts = split_result_compound(canonical_struct_tag(tag))
+        if parts.second != "" {
+            let ok_ct = type_from_name_tag(parts.first)
+            let err_ct = type_from_name_tag(parts.second)
+            if ok_ct != CT_VOID && err_ct != CT_VOID {
+                ensure_result_type(ok_ct, err_ct)
+            } else {
+                ensure_struct_result_type(parts.first, parts.second)
+            }
+        }
+    }
 }
 
 pub fn ensure_struct_option_type(struct_name: Str) {
@@ -5543,6 +5627,14 @@ pub fn is_compound_tag(tag: Str) -> Int {
     } else {
         0
     }
+}
+
+// The CT_* kind a canonical compound carrier tag denotes (Option_str → CT_OPTION).
+pub fn compound_tag_ct(tag: Str) -> Int {
+    if tag.starts_with("Option_") { CT_OPTION }
+    else if tag.starts_with("Result_") { CT_RESULT }
+    else if tag.starts_with("Map_") { CT_MAP }
+    else { CT_VOID }
 }
 
 pub fn is_named_typedef_tag(tag: Str) -> Int {

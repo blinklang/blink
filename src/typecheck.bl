@@ -648,36 +648,119 @@ fn lookup_fnsig(name: Str) -> Int {
     fnsig_map.get(name) ?? -1
 }
 
-fn instantiate_return_type(sig: Int, args_sl: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
-    let fs = fnsig_pool.get(sig).unwrap()
-    let ret = fs.ret
-    if ret < 0 || ret >= ty_pool.len() { return ret }
-    let ret_entry = ty_pool.get(ret).unwrap()
-    if ret_entry.kind != TK_TYPEVAR { return ret }
+// Recursively substitute typevar tids in `t` using the name→tid map `binds`
+// (typevar-name → concrete tid). Mirrors types_compatible's structural dispatch
+// and rebuilds compound shells via the make_* constructors so the returned tid
+// carries concrete elements. A kind with no embedded typevar — or an unbound
+// typevar — is returned unchanged; a new pool entry is allocated only when a
+// child actually changes (avoids ty_pool churn).
+fn substitute_typevar_tid(t: Int, binds: Map[Str, Int]) -> Int {
+    if t < 0 || t >= ty_pool.len() { return t }
+    let e = ty_pool.get(t).unwrap()
+    let k = e.kind
+    if k == TK_TYPEVAR {
+        match binds.get(e.name) {
+            Some(tid) => return tid
+            None => return t
+        }
+    }
+    if k == TK_LIST {
+        let inner = substitute_typevar_tid(e.inner1, binds)
+        if inner == e.inner1 { return t }
+        return make_list_type(inner)
+    }
+    if k == TK_OPTION {
+        let inner = substitute_typevar_tid(e.inner1, binds)
+        if inner == e.inner1 { return t }
+        return make_option_type(inner)
+    }
+    if k == TK_SET {
+        let inner = substitute_typevar_tid(e.inner1, binds)
+        if inner == e.inner1 { return t }
+        return make_set_type(inner)
+    }
+    if k == TK_RESULT {
+        let ok = substitute_typevar_tid(e.inner1, binds)
+        let er = substitute_typevar_tid(e.inner2, binds)
+        if ok == e.inner1 && er == e.inner2 { return t }
+        return make_result_type(ok, er)
+    }
+    if k == TK_MAP {
+        let kk = substitute_typevar_tid(e.inner1, binds)
+        let vv = substitute_typevar_tid(e.inner2, binds)
+        if kk == e.inner1 && vv == e.inner2 { return t }
+        return make_map_type(kk, vv)
+    }
+    if k == TK_TUPLE {
+        // Read every original element into `elems` BEFORE calling make_tuple_type:
+        // the constructor appends to ty_param_list, the same array we read
+        // e.params_start.. from, so finishing the read first avoids aliasing.
+        let mut elems: List[Int] = []
+        let mut changed = 0
+        let mut i = 0
+        while i < e.params_count {
+            let orig = ty_param_list.get(e.params_start + i).unwrap()
+            let sub = substitute_typevar_tid(orig, binds)
+            if sub != orig { changed = 1 }
+            elems.push(sub)
+            i = i + 1
+        }
+        if changed == 0 { return t }
+        return make_tuple_type(elems)
+    }
+    // TK_FN and every scalar/nominal kind: no embedded typevar to rewrite.
+    t
+}
 
-    let tp_name = ret_entry.name
+// Build a typevar-name → concrete-tid map from the call's args, using each param
+// that is itself a bare typevar (the whole-bare-typevar inference rule).
+// Nested-typevar params (`x: List[T]`) are NOT inferred here — see follow-up.
+fn build_typevar_binds(sig: Int, args_sl: Int) -> Map[Str, Int] ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let fs = fnsig_pool.get(sig).unwrap()
     let tp_start = fs.type_params_start
     let tp_count = fs.type_params_count
     let param_start = fs.params_start
     let param_count = fs.params_count
-
+    let mut binds: Map[Str, Int] = Map()
     let mut ti = 0
     while ti < tp_count {
-        if fnsig_type_param_names.get(tp_start + ti).unwrap() == tp_name {
-            let mut pi = 0
-            while pi < param_count {
-                let ptid = fnsig_param_list.get(param_start + pi).unwrap()
-                if ptid >= 0 && ptid < ty_pool.len() && ty_pool.get(ptid).unwrap().kind == TK_TYPEVAR && ty_pool.get(ptid).unwrap().name == tp_name {
-                    if args_sl != -1 && pi < sublist_length(args_sl) {
-                        return infer_type(sublist_get(args_sl, pi))
-                    }
+        let tp_name = fnsig_type_param_names.get(tp_start + ti).unwrap()
+        let mut pi = 0
+        while pi < param_count {
+            let ptid = fnsig_param_list.get(param_start + pi).unwrap()
+            if ptid >= 0 && ptid < ty_pool.len() && ty_pool.get(ptid).unwrap().kind == TK_TYPEVAR && ty_pool.get(ptid).unwrap().name == tp_name {
+                if args_sl != -1 && pi < sublist_length(args_sl) {
+                    binds.insert(tp_name, infer_type(sublist_get(args_sl, pi)))
                 }
-                pi = pi + 1
             }
+            pi = pi + 1
         }
         ti = ti + 1
     }
-    ret
+    binds
+}
+
+fn instantiate_return_type(sig: Int, args_sl: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let fs = fnsig_pool.get(sig).unwrap()
+    let ret = fs.ret
+    if ret < 0 || ret >= ty_pool.len() { return ret }
+    let binds = build_typevar_binds(sig, args_sl)
+    substitute_typevar_tid(ret, binds)
+}
+
+// Parse an all-digits field name ("0", "12") to its Int index, or -1 for any
+// non-numeric name (so struct field accesses never match the tuple path).
+fn str_to_tuple_index(name: Str) -> Int {
+    if name.len() == 0 { return -1 }
+    let mut acc = 0
+    let mut i = 0
+    while i < name.len() {
+        let ch = name.byte_at(i)
+        if ch < 48 || ch > 57 { return -1 }
+        acc = acc * 10 + (ch - 48)
+        i = i + 1
+    }
+    acc
 }
 
 fn is_int_literal_node(node: Int) -> Int {
@@ -6532,6 +6615,17 @@ fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repo
         if type_kind(obj_t) == TK_STRUCT {
             let ft = get_struct_field_tid(obj_t, fname)
             if ft != -1 { return ft }
+        }
+        // Tuple positional access `t.0`, `t.1`, ...: the field name is the
+        // numeric index into the tuple's element tids. Without this, a tuple
+        // element type is TYPE_UNKNOWN and method calls on it (e.g. `t.0.unwrap()`
+        // when element 0 is Option) fail to resolve (qm01e7).
+        if type_kind(obj_t) == TK_TUPLE {
+            let te = ty_pool.get(obj_t).unwrap()
+            let idx = str_to_tuple_index(fname)
+            if idx >= 0 && idx < te.params_count {
+                return ty_param_list.get(te.params_start + idx).unwrap()
+            }
         }
         return TYPE_UNKNOWN
     }

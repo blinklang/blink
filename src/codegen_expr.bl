@@ -27,7 +27,7 @@ import codegen_types.{
     option_inner_ct_from_tag, option_inner_struct_from_tag,
     emit_line, ensure_iter_type, ensure_mixed_result_type, ev_field,
     ensure_option_type, ensure_result_type, ensure_struct_option_type,
-    ensure_tuple_type, tuple_struct_arity, tuple_elem_ct, tuple_elem_struct, find_type_def_node, fresh_temp,
+    ensure_tuple_type, tuple_struct_arity, tuple_elem_ct, tuple_elem_struct, find_tuple_entry, find_type_def_node, fresh_temp,
     get_capture_index, get_fn_node, get_fn_ret, get_fn_ret_struct,
     get_fn_ret_handler, get_fn_ret_struct_inner, get_fn_ret_type,
     get_generic_fn_node,
@@ -644,6 +644,41 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
         expr_result_str = "{obj_str}{fa_accessor}{c_field}"
         let mut fa_type = CT_VOID
         let struct_type = get_var_struct(obj_str)
+        // Tuple positional access `t.0`: element types live in the tuple entry
+        // (elem_types/elem_structs), not the struct-field registry. Resolve the
+        // element CT + compound inner-type globals so a compound element (e.g.
+        // Option) can be method-called (`t.0.unwrap()`). qm01e7.
+        let fa_first_digit = fa_field.len() > 0 && fa_field.char_at(0).unwrap() >= '0' && fa_field.char_at(0).unwrap() <= '9'
+        if struct_type != "" && find_tuple_entry(struct_type) >= 0 && fa_first_digit {
+            let tidx = fa_field.to_int()
+            let te_struct = tuple_elem_struct(struct_type, tidx)
+            let te_ct = tuple_elem_ct(struct_type, tidx)
+            if te_struct.starts_with("Option_") {
+                fa_type = CT_OPTION
+                expr_option_inner = option_inner_ct_from_tag(te_struct)
+                expr_option_inner_struct = option_inner_struct_from_tag(te_struct)
+            } else if te_struct.starts_with("Result_") {
+                fa_type = CT_RESULT
+                let rparts = split_result_compound(canonical_struct_tag(te_struct))
+                let ok_ct = type_from_name_tag(rparts.first)
+                let err_ct = type_from_name_tag(rparts.second)
+                expr_result_ok_type = ok_ct
+                expr_result_err_type = err_ct
+                // A non-scalar (CT_VOID) tag is a struct/enum inner only when
+                // it's actually registered as one — mirror the sibling struct
+                // branch's positive test rather than treating any unknown tag
+                // as a struct name.
+                expr_result_ok_struct = if ok_ct == CT_VOID && (is_struct_type(rparts.first) != 0 || is_enum_type(rparts.first) != 0) { rparts.first } else { "" }
+                expr_result_err_struct = if err_ct == CT_VOID && (is_struct_type(rparts.second) != 0 || is_enum_type(rparts.second) != 0) { rparts.second } else { "" }
+            } else if te_struct != "" && te_struct != "-" {
+                fa_type = if is_enum_type(te_struct) != 0 || is_struct_type(te_struct) != 0 { CT_STRUCT } else { te_ct }
+                if fa_type == CT_STRUCT { set_var_struct(expr_result_str, te_struct) }
+            } else {
+                fa_type = te_ct
+            }
+            expr_result_type = fa_type
+            return
+        }
         if struct_type != "" {
             fa_type = get_struct_field_type(struct_type, c_field)
             if fa_type == CT_STRUCT || fa_type == CT_VOID {
