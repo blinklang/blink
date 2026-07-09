@@ -717,30 +717,69 @@ fn substitute_typevar_tid(t: Int, binds: Map[Str, Int]) -> Int {
     t
 }
 
-// Build a typevar-name → concrete-tid map from the call's args, using each param
-// that is itself a bare typevar (the whole-bare-typevar inference rule).
-// Nested-typevar params (`x: List[T]`) are NOT inferred here — see follow-up.
+// Structurally unify a param tid against a concrete arg tid, recording every
+// typevar→concrete binding into `binds`. The reverse of substitute_typevar_tid:
+// where that walks one tid rewriting typevars via `binds`, this walks the param
+// and arg tids in lockstep and *discovers* the bindings. A bare typevar param
+// binds directly; a compound param recurses into the matching children so a
+// typevar buried inside `List[T]` / `Option[T]` / `Set[T]` / `Result[T,E]` /
+// `Map[K,V]` / `(A, B)` is still inferred. Pure bind collection — allocates NO
+// pool entries (no make_* calls), so it never touches ty_param_list and is free
+// of the tuple aliasing hazard substitute_typevar_tid guards against. A first
+// binding wins; kind mismatches (arg not shaped like the param) bind nothing.
+fn unify_typevar_binds(ptid: Int, atid: Int, binds: Map[Str, Int]) {
+    if ptid < 0 || ptid >= ty_pool.len() { return }
+    if atid < 0 || atid >= ty_pool.len() { return }
+    let pe = ty_pool.get(ptid).unwrap()
+    let pk = pe.kind
+    if pk == TK_TYPEVAR {
+        if !binds.contains_key(pe.name) {
+            binds.insert(pe.name, atid)
+        }
+        return
+    }
+    let ae = ty_pool.get(atid).unwrap()
+    if ae.kind != pk { return }
+    if pk == TK_LIST || pk == TK_OPTION || pk == TK_SET {
+        unify_typevar_binds(pe.inner1, ae.inner1, binds)
+        return
+    }
+    if pk == TK_RESULT || pk == TK_MAP {
+        unify_typevar_binds(pe.inner1, ae.inner1, binds)
+        unify_typevar_binds(pe.inner2, ae.inner2, binds)
+        return
+    }
+    if pk == TK_TUPLE {
+        if pe.params_count != ae.params_count { return }
+        let mut i = 0
+        while i < pe.params_count {
+            let pc = ty_param_list.get(pe.params_start + i).unwrap()
+            let ac = ty_param_list.get(ae.params_start + i).unwrap()
+            unify_typevar_binds(pc, ac, binds)
+            i = i + 1
+        }
+        return
+    }
+}
+
+// Build a typevar-name → concrete-tid map from the call's args by structurally
+// unifying each param tid against its argument's inferred tid. Covers both the
+// whole-bare-typevar rule (`x: T`) and typevars nested inside a compound param
+// (`x: List[T]`, `x: (T, Int)`, `x: Map[K, V]`, …) via unify_typevar_binds.
 fn build_typevar_binds(sig: Int, args_sl: Int) -> Map[Str, Int] ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let fs = fnsig_pool.get(sig).unwrap()
-    let tp_start = fs.type_params_start
-    let tp_count = fs.type_params_count
     let param_start = fs.params_start
     let param_count = fs.params_count
     let mut binds: Map[Str, Int] = Map()
-    let mut ti = 0
-    while ti < tp_count {
-        let tp_name = fnsig_type_param_names.get(tp_start + ti).unwrap()
-        let mut pi = 0
-        while pi < param_count {
+    if args_sl == -1 { return binds }
+    let n = sublist_length(args_sl)
+    let mut pi = 0
+    while pi < param_count {
+        if pi < n {
             let ptid = fnsig_param_list.get(param_start + pi).unwrap()
-            if ptid >= 0 && ptid < ty_pool.len() && ty_pool.get(ptid).unwrap().kind == TK_TYPEVAR && ty_pool.get(ptid).unwrap().name == tp_name {
-                if args_sl != -1 && pi < sublist_length(args_sl) {
-                    binds.insert(tp_name, infer_type(sublist_get(args_sl, pi)))
-                }
-            }
-            pi = pi + 1
+            unify_typevar_binds(ptid, infer_type(sublist_get(args_sl, pi)), binds)
         }
-        ti = ti + 1
+        pi = pi + 1
     }
     binds
 }
@@ -1005,7 +1044,9 @@ fn resolve_type_ann(ann_node: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
     }
     if name == "Set" {
         if elems_sl != -1 && sublist_length(elems_sl) >= 1 {
-            let elem_t = resolve_type_ann(sublist_get(elems_sl, 0))
+            let elem_ann = sublist_get(elems_sl, 0)
+            let elem_t = resolve_type_ann(elem_ann)
+            validate_set_elem(elem_ann)
             return make_set_type(elem_t)
         }
         return make_set_type(TYPE_UNKNOWN)
@@ -1082,6 +1123,39 @@ fn validate_map_key(key_ann: Int) ! Diag.Report {
     // @derive(Hash), to avoid spurious errors on generics.
     if named_type_map.contains_key(key_name) || named_type_map.contains_key(bare) {
         diag_error_at("MapKeyNotHashable", MAP_KEY_NOT_HASHABLE, "Map key type '{key_name}' does not implement Hash — user types used as Map keys must carry the @derive(Hash, Eq) annotation", key_ann, "add @derive(Hash, Eq) to the '{key_name}' type definition")
+    }
+}
+
+// Verify that a Set element type annotation is hashable — a Set is a keys-only
+// hash table, so its element carries the same Hash requirement as a Map key.
+// Emits MAP_KEY_NOT_HASHABLE (E1400) with Set-worded messages. Same rules as
+// validate_map_key: built-in scalars OK; user structs/enums need @derive(Hash);
+// tuples OK iff every element is hashable; Float/Double rejected; generic type
+// params accepted (opaque at this point).
+fn validate_set_elem(elem_ann: Int) ! Diag.Report {
+    let elem_name = node_name(elem_ann)
+    if elem_name == "Float" || elem_name == "F32" || elem_name == "F64" {
+        diag_error_at("MapKeyNotHashable", MAP_KEY_NOT_HASHABLE, "Set element type '{elem_name}' is not hashable — Float/Double values cannot serve as Set elements (NaN-inequality and bit-equality hazards)", elem_ann, "round the value to an Int (or another integer width) before inserting")
+        return
+    }
+    if elem_name == "Tuple" {
+        let elems = node_elements(elem_ann)
+        if elems != -1 {
+            let mut i = 0
+            while i < sublist_length(elems) {
+                validate_set_elem(sublist_get(elems, i))
+                i = i + 1
+            }
+        }
+        return
+    }
+    if is_builtin_hashable(elem_name) != 0 { return }
+    let bare = strip_module_qualifier(elem_name)
+    if tc_hashable_types.contains_key(elem_name) || tc_hashable_types.contains_key(bare) {
+        return
+    }
+    if named_type_map.contains_key(elem_name) || named_type_map.contains_key(bare) {
+        diag_error_at("MapKeyNotHashable", MAP_KEY_NOT_HASHABLE, "Set element type '{elem_name}' does not implement Hash — user types used as Set elements must carry the @derive(Hash, Eq) annotation", elem_ann, "add @derive(Hash, Eq) to the '{elem_name}' type definition")
     }
 }
 

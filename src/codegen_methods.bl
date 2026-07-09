@@ -21,7 +21,7 @@ import codegen_types.{
     get_impl_method_ret, get_list_elem_map_key_type, get_list_elem_map_val_type, get_list_elem_map_val_struct, set_list_elem_map_types, is_map_scalar_ct,
     get_list_elem_struct, get_list_elem_type,
     get_list_nested_elem_struct, get_list_nested_elem_type,
-    get_map_key_type, get_map_key_type_raw, get_map_key_struct, get_map_value_list_elem, get_map_value_struct, get_map_value_type, get_map_value_type_raw, get_set_elem_type,
+    get_map_key_type, get_map_key_type_raw, get_map_key_struct, get_map_value_list_elem, get_map_value_struct, get_map_value_type, get_map_value_type_raw, get_set_elem_type, get_set_elem_struct,
     kops_table_name, kops_is_inline_key, kops_is_struct_key,
     get_struct_field_closure_sig, get_struct_field_type,
     get_var_channel_inner, get_var_enum, get_var_iterator_inner,
@@ -962,6 +962,13 @@ fn is_map_builtin_intercept(ct: Int, method: Str) -> Bool {
     ct == CT_MAP && (method == "clear" || method == "contains_key" || method == "contains" || method == "remove" || method == "len" || method == "is_empty")
 }
 
+// CT_SET methods codegen routes through emit_set_method (direct blink_set_*
+// calls with kops-boxed elements), bypassing the str-only SetPure/Sized trait
+// impls. Single source of truth — both dispatch sites in emit_method_call use it.
+fn is_set_builtin_intercept(ct: Int, method: Str) -> Bool {
+    ct == CT_SET && (method == "insert" || method == "contains" || method == "remove" || method == "len" || method == "is_empty" || method == "union")
+}
+
 fn map_key_expr_inner(key_str: Str, key_ct: Int, key_sname: Str, for_insert: Bool) -> Str ! Codegen.Emit, Codegen.Register {
     if kops_is_struct_key(key_sname) {
         let key_c = c_type_c_name(key_sname)
@@ -1179,20 +1186,67 @@ fn emit_map_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int !
     0
 }
 
+// Set elements box identically to Map keys (an element is a key with no value):
+// Str → raw pointer; inline scalar (Int/Char/bool/sized-int) → `T tmp = (T)key;
+// &tmp`; struct → heap-alloc for insert / stack tmp for lookup. Reuses
+// map_key_expr / map_key_expr_lookup so both surfaces share one boxing path.
 @allow(UnrestoredMutation, IncompleteStateRestore)
 fn emit_set_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
+    let mut set_var_name = obj_str
+    if node_kind(obj_node) == NodeKind.Ident {
+        set_var_name = node_name(obj_node)
+    }
+    let elem_ct = get_set_elem_type(set_var_name)
+    let elem_sname = if elem_ct == CT_VOID || elem_ct == CT_STRUCT { get_set_elem_struct(set_var_name) } else { "" }
+
+    if method == "insert" {
+        let args_sl = node_args(node)
+        emit_expr(sublist_get(args_sl, btc_arg_offset))
+        let elem_str = expr_result_str
+        let elem_expr = map_key_expr(elem_str, elem_ct, elem_sname)
+        expr_result_str = "(blink_set_insert({obj_str}, {elem_expr}) != 0)"
+        expr_result_type = CT_BOOL
+        return 1
+    }
+    if method == "contains" {
+        let args_sl = node_args(node)
+        emit_expr(sublist_get(args_sl, btc_arg_offset))
+        let elem_str = expr_result_str
+        let elem_expr = map_key_expr_lookup(elem_str, elem_ct, elem_sname)
+        expr_result_str = "(blink_set_contains({obj_str}, {elem_expr}) != 0)"
+        expr_result_type = CT_BOOL
+        return 1
+    }
+    if method == "remove" {
+        let args_sl = node_args(node)
+        emit_expr(sublist_get(args_sl, btc_arg_offset))
+        let elem_str = expr_result_str
+        let elem_expr = map_key_expr_lookup(elem_str, elem_ct, elem_sname)
+        expr_result_str = "(blink_set_remove({obj_str}, {elem_expr}) != 0)"
+        expr_result_type = CT_BOOL
+        return 1
+    }
+    if method == "len" {
+        expr_result_str = "blink_set_len({obj_str})"
+        expr_result_type = CT_INT
+        return 1
+    }
+    if method == "is_empty" {
+        expr_result_str = "(blink_set_len({obj_str}) == 0)"
+        expr_result_type = CT_BOOL
+        return 1
+    }
     if method == "union" {
-        let mut set_var_name = ""
-        if node_kind(obj_node) == NodeKind.Ident {
-            set_var_name = node_name(obj_node)
-        }
-        let elem_type = get_set_elem_type(if set_var_name != "" { set_var_name } else { obj_str })
         let args_sl = node_args(node)
         emit_expr(sublist_get(args_sl, btc_arg_offset))
         let other_str = expr_result_str
         expr_result_str = "blink_set_union({obj_str}, {other_str})"
         expr_result_type = CT_SET
-        expr_list_elem_type = elem_type
+        expr_list_elem_type = elem_ct
+        // Carry the struct/tuple element tag onto the union result so an
+        // unannotated binding (`let u = a.union(b)`) recovers it — else a
+        // struct-element set would box through the broken inline-scalar path.
+        expr_list_elem_struct = elem_sname
         return 1
     }
     0
@@ -2433,6 +2487,12 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                     btc_arg_offset = 0
                     if mh != 0 { return }
                 }
+                if is_set_builtin_intercept(first_type, method) {
+                    btc_arg_offset = 1
+                    let sh = emit_set_method(node, first_str, obj_node, method)
+                    btc_arg_offset = 0
+                    if sh != 0 { return }
+                }
                 // User trait impl on a builtin receiver wins over the codegen-emitted
                 // builtin methods, so a stdlib `impl SomeTrait for Str` gets used here too.
                 let bi_recv_name = builtin_receiver_type_name(first_type)
@@ -2869,6 +2929,10 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
 
     if is_map_builtin_intercept(obj_type, method) {
         if emit_map_method(node, obj_str, obj_node, method) != 0 { return }
+    }
+
+    if is_set_builtin_intercept(obj_type, method) {
+        if emit_set_method(node, obj_str, obj_node, method) != 0 { return }
     }
 
     // User trait impl on a builtin receiver wins over hardcoded builtin emitters,

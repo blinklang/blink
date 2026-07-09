@@ -1010,23 +1010,33 @@ BLINK_KOPS_STORAGE const blink_kops blink_kops_bool = { blink_kops_hash_bool,bli
 BLINK_KOPS_STORAGE const blink_kops blink_kops_char = { blink_kops_hash_char,blink_kops_eq_char,sizeof(uint32_t), 1 };
 #endif
 
-/* ── Hash set (string-keyed) ─────────────────────────────────────────── */
+/* ── Hash set (kops vtable) ──────────────────────────────────────────── */
+/* Set is Map minus the values array (decisions/set-type-implementation.md).
+   Same per-element kops table as blink_map: Str routes through &blink_kops_str
+   (inline_key=0, pointer slots); Int/Char/sized-ints/bool store bytes inline. */
 
 typedef struct {
-    const char** items;
-    uint8_t* states;   /* 0=empty, 1=occupied, 2=tombstone */
+    void* items;           /* cap * (inline_key ? key_size : sizeof(void*)) bytes */
+    uint8_t* states;       /* 0=empty, 1=occupied, 2=tombstone */
     int64_t len;
     int64_t cap;
+    const blink_kops* kops;
 } blink_set;
 
+static inline const void* blink_set_item_slot(const blink_set* s, int64_t i, size_t stride) {
+    void* slot = (void*)((char*)s->items + (size_t)i * stride);
+    return s->kops->inline_key ? (const void*)slot : *(const void**)slot;
+}
 
-BLINK_RT_FN blink_set* blink_set_new(void);
+BLINK_RT_FN blink_set* blink_set_new(const blink_kops* kops);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN blink_set* blink_set_new(void) {
+BLINK_RT_FN blink_set* blink_set_new(const blink_kops* kops) {
     blink_set* s = (blink_set*)blink_alloc(sizeof(blink_set));
     s->cap = 16;
     s->len = 0;
-    s->items = (const char**)blink_alloc(sizeof(const char*) * (size_t)s->cap);
+    s->kops = kops;
+    size_t stride = blink_kops_stride(kops);
+    s->items = blink_alloc((int64_t)(stride * (size_t)s->cap));
     s->states = (uint8_t*)blink_alloc(sizeof(uint8_t) * (size_t)s->cap);
     memset(s->states, 0, (size_t)s->cap);
     return s;
@@ -1036,25 +1046,30 @@ BLINK_RT_FN blink_set* blink_set_new(void) {
 BLINK_RT_FN void blink_set_grow(blink_set* s);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN void blink_set_grow(blink_set* s) {
+    /* cap is a power of two (initial 16, only doubled here); probe wraps with
+       `& (cap - 1)`. Mirrors blink_map_grow. */
+    const blink_kops* k = s->kops;
     int64_t old_cap = s->cap;
-    const char** old_items = s->items;
+    void* old_items = s->items;
     uint8_t* old_states = s->states;
+    size_t stride = blink_kops_stride(k);
     s->cap = old_cap * 2;
-    s->items = (const char**)blink_alloc(sizeof(const char*) * (size_t)s->cap);
+    int64_t mask = s->cap - 1;
+    s->items = blink_alloc((int64_t)(stride * (size_t)s->cap));
     s->states = (uint8_t*)blink_alloc(sizeof(uint8_t) * (size_t)s->cap);
     memset(s->states, 0, (size_t)s->cap);
     s->len = 0;
     for (int64_t i = 0; i < old_cap; i++) {
-        if (old_states[i] == 1) {
-            uint64_t h = blink_map_hash(old_items[i]);
-            int64_t idx = (int64_t)(h % (uint64_t)s->cap);
-            while (s->states[idx] != 0) {
-                idx = (idx + 1) % s->cap;
-            }
-            s->items[idx] = old_items[i];
-            s->states[idx] = 1;
-            s->len++;
-        }
+        if (old_states[i] != 1) continue;
+        void* old_slot = (void*)((char*)old_items + (size_t)i * stride);
+        const void* kptr = k->inline_key ? (const void*)old_slot : *(const void**)old_slot;
+        uint64_t h = k->hash(kptr);
+        int64_t idx = (int64_t)(h & (uint64_t)mask);
+        while (s->states[idx] != 0) idx = (idx + 1) & mask;
+        void* new_slot = (void*)((char*)s->items + (size_t)idx * stride);
+        memcpy(new_slot, old_slot, stride);
+        s->states[idx] = 1;
+        s->len++;
     }
     if (__blink_current_arena == NULL) {
         GC_FREE(old_items);
@@ -1063,60 +1078,77 @@ BLINK_RT_FN void blink_set_grow(blink_set* s) {
 }
 #endif
 
-BLINK_RT_FN int64_t blink_set_insert(blink_set* s, const char* item);
+BLINK_RT_FN int64_t blink_set_insert(blink_set* s, const void* item);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN int64_t blink_set_insert(blink_set* s, const char* item) {
-    if (s->len * 10 >= s->cap * 7) {
-        blink_set_grow(s);
-    }
-    uint64_t h = blink_map_hash(item);
-    int64_t idx = (int64_t)(h % (uint64_t)s->cap);
+BLINK_RT_FN int64_t blink_set_insert(blink_set* s, const void* item) {
+    if (s->len * 10 >= s->cap * 7) blink_set_grow(s);
+    const blink_kops* k = s->kops;
+    size_t stride = blink_kops_stride(k);
+    int64_t mask = s->cap - 1;
+    uint64_t h = k->hash(item);
+    int64_t idx = (int64_t)(h & (uint64_t)mask);
     int64_t first_tombstone = -1;
     while (1) {
         if (s->states[idx] == 0) {
             int64_t ins = (first_tombstone >= 0) ? first_tombstone : idx;
-            s->items[ins] = item;
+            void* slot = (void*)((char*)s->items + (size_t)ins * stride);
+            if (k->inline_key) {
+                memcpy(slot, item, k->key_size);
+            } else {
+                *(const void**)slot = item;
+            }
             s->states[ins] = 1;
             s->len++;
             return 1;
         }
         if (s->states[idx] == 2) {
             if (first_tombstone < 0) first_tombstone = idx;
-        } else if (blink_str_eq(s->items[idx], item)) {
-            return 0;
+        } else {
+            const void* existing = blink_set_item_slot(s, idx, stride);
+            if (k->eq(existing, item)) return 0;
         }
-        idx = (idx + 1) % s->cap;
+        idx = (idx + 1) & mask;
     }
 }
 #endif
 
-BLINK_RT_FN int64_t blink_set_contains(const blink_set* s, const char* item);
+BLINK_RT_FN int64_t blink_set_contains(const blink_set* s, const void* item);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN int64_t blink_set_contains(const blink_set* s, const char* item) {
-    uint64_t h = blink_map_hash(item);
-    int64_t idx = (int64_t)(h % (uint64_t)s->cap);
+BLINK_RT_FN int64_t blink_set_contains(const blink_set* s, const void* item) {
+    const blink_kops* k = s->kops;
+    size_t stride = blink_kops_stride(k);
+    int64_t mask = s->cap - 1;
+    uint64_t h = k->hash(item);
+    int64_t idx = (int64_t)(h & (uint64_t)mask);
     while (s->states[idx] != 0) {
-        if (s->states[idx] == 1 && blink_str_eq(s->items[idx], item)) {
-            return 1;
+        if (s->states[idx] == 1) {
+            const void* existing = blink_set_item_slot(s, idx, stride);
+            if (k->eq(existing, item)) return 1;
         }
-        idx = (idx + 1) % s->cap;
+        idx = (idx + 1) & mask;
     }
     return 0;
 }
 #endif
 
-BLINK_RT_FN int64_t blink_set_remove(blink_set* s, const char* item);
+BLINK_RT_FN int64_t blink_set_remove(blink_set* s, const void* item);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN int64_t blink_set_remove(blink_set* s, const char* item) {
-    uint64_t h = blink_map_hash(item);
-    int64_t idx = (int64_t)(h % (uint64_t)s->cap);
+BLINK_RT_FN int64_t blink_set_remove(blink_set* s, const void* item) {
+    const blink_kops* k = s->kops;
+    size_t stride = blink_kops_stride(k);
+    int64_t mask = s->cap - 1;
+    uint64_t h = k->hash(item);
+    int64_t idx = (int64_t)(h & (uint64_t)mask);
     while (s->states[idx] != 0) {
-        if (s->states[idx] == 1 && blink_str_eq(s->items[idx], item)) {
-            s->states[idx] = 2;
-            s->len--;
-            return 1;
+        if (s->states[idx] == 1) {
+            const void* existing = blink_set_item_slot(s, idx, stride);
+            if (k->eq(existing, item)) {
+                s->states[idx] = 2;
+                s->len--;
+                return 1;
+            }
         }
-        idx = (idx + 1) % s->cap;
+        idx = (idx + 1) & mask;
     }
     return 0;
 }
@@ -1129,31 +1161,58 @@ BLINK_RT_FN int64_t blink_set_len(const blink_set* s) {
 }
 #endif
 
+/* Re-inserts every element of `a` then `b` into a fresh set carrying a's kops.
+   Both operands must share the same element type (kops); the typechecker
+   enforces `union(self, other: Set[T])`. */
 BLINK_RT_FN blink_set* blink_set_union(const blink_set* a, const blink_set* b);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN blink_set* blink_set_union(const blink_set* a, const blink_set* b) {
-    blink_set* result = blink_set_new();
+    blink_set* result = blink_set_new(a->kops);
+    size_t stride = blink_kops_stride(a->kops);
     for (int64_t i = 0; i < a->cap; i++) {
-        if (a->states[i] == 1) {
-            blink_set_insert(result, a->items[i]);
-        }
+        if (a->states[i] == 1) blink_set_insert(result, blink_set_item_slot(a, i, stride));
     }
+    size_t bstride = blink_kops_stride(b->kops);
     for (int64_t i = 0; i < b->cap; i++) {
-        if (b->states[i] == 1) {
-            blink_set_insert(result, b->items[i]);
-        }
+        if (b->states[i] == 1) blink_set_insert(result, blink_set_item_slot(b, i, bstride));
     }
     return result;
 }
 #endif
 
+/* Element iteration — same inline-key packing contract as blink_map_keys:
+   inline keys that fit a pointer slot are packed directly into the List void*;
+   larger inline keys spill to a bulk buffer; pointer keys are pushed as-is. */
 BLINK_RT_FN blink_list* blink_set_to_list(const blink_set* s);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN blink_list* blink_set_to_list(const blink_set* s) {
     blink_list* result = blink_list_new();
-    for (int64_t i = 0; i < s->cap; i++) {
-        if (s->states[i] == 1) {
-            blink_list_push(result, (void*)s->items[i]);
+    const blink_kops* k = s->kops;
+    size_t stride = blink_kops_stride(k);
+    if (k->inline_key && k->key_size <= sizeof(void*)) {
+        for (int64_t i = 0; i < s->cap; i++) {
+            if (s->states[i] != 1) continue;
+            void* slot = (void*)((char*)s->items + (size_t)i * stride);
+            uintptr_t packed = 0;
+            memcpy(&packed, slot, k->key_size);
+            blink_list_push(result, (void*)packed);
+        }
+    } else if (k->inline_key && s->len > 0) {
+        char* buf = (char*)blink_alloc((int64_t)((size_t)s->len * k->key_size));
+        size_t out = 0;
+        for (int64_t i = 0; i < s->cap; i++) {
+            if (s->states[i] != 1) continue;
+            void* slot = (void*)((char*)s->items + (size_t)i * stride);
+            char* dst = buf + out * k->key_size;
+            memcpy(dst, slot, k->key_size);
+            blink_list_push(result, (void*)dst);
+            out++;
+        }
+    } else {
+        for (int64_t i = 0; i < s->cap; i++) {
+            if (s->states[i] != 1) continue;
+            void* slot = (void*)((char*)s->items + (size_t)i * stride);
+            blink_list_push(result, *(void**)slot);
         }
     }
     return result;
