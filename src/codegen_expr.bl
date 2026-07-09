@@ -64,7 +64,7 @@ import codegen_types.{
     result_c_type, result_c_type_mixed,
     scope_vars, set_list_elem_struct, set_list_elem_type,
     kops_table_name, key_struct_sname_from_ann,
-    set_map_types,
+    set_map_types, set_map_key_struct, set_set_elem_type, set_set_elem_struct,
     set_var, set_var_closure, set_var_option, set_var_struct,
     strip_blink_prefix, strip_module_qualifier,
     sf_entries, struct_field_defaults, struct_invariants, struct_option_c_type, synthesized_display_call,
@@ -88,7 +88,7 @@ import diagnostics.{
 }
 import std.path.{path_dirname}
 import formatter.{format_expr}
-import typecheck.{tc_mono_csv, is_import_module_name}
+import typecheck.{tc_mono_csv, is_import_module_name, tc_lookup_node_tid, tc_tid_set_elem_ct, tc_tid_set_elem_struct, tc_tid_map_key_ct, tc_tid_map_key_struct, tc_tid_map_val_ct, tc_tid_map_val_struct}
 
 // codegen_expr.bl — Expression codegen, closures, capture analysis
 
@@ -306,6 +306,23 @@ fn reseat_after_q_on_result(tmp: Str, rok: Int, rok_s: Str) {
     }
     expr_result_ok_struct = ""
     expr_result_err_struct = ""
+}
+
+// A Set[T] element reached through a type-erased boundary (tuple element or
+// struct field) loses its inner type: the carrier is shared across
+// monomorphizations, and the struct-field tp_id is reg-side-erased to -1. Both
+// the tuple-access and struct-field paths recover it identically from
+// typecheck's per-node tid memo, so they share this helper. A -1 elem CT
+// (unresolvable inner: typevar/tuple/fn) is a no-op — the caller's default
+// element type stands. jkdywb.
+fn recover_set_elem_from_tid(node: Int, var_name: Str) ! Codegen.Register, Codegen.Scope {
+    let etid = tc_lookup_node_tid(node)
+    let ect = tc_tid_set_elem_ct(etid)
+    if ect >= 0 {
+        set_set_elem_type(var_name, ect)
+        let es = tc_tid_set_elem_struct(etid)
+        if es != "" { set_set_elem_struct(var_name, es) }
+    }
 }
 
 @allow(UnrestoredMutation, IncompleteStateRestore)
@@ -677,6 +694,22 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
             } else {
                 fa_type = te_ct
             }
+            // The tuple carrier is type-erased AND shared across
+            // monomorphizations ((Set[Int],Int) and (Set[Str],Int) compile to
+            // the same carrier), so the element's inner type CANNOT live on
+            // te_ct/te_struct. Recover it from typecheck's per-node tid memo,
+            // which is keyed by node (this FieldAccess), not by carrier. jkdywb.
+            if fa_type == CT_SET {
+                recover_set_elem_from_tid(node, expr_result_str)
+            } else if fa_type == CT_MAP {
+                let mtid = tc_lookup_node_tid(node)
+                let kct = tc_tid_map_key_ct(mtid)
+                if kct >= 0 {
+                    set_map_types(expr_result_str, kct, tc_tid_map_val_ct(mtid), tc_tid_map_val_struct(mtid))
+                    let ks = tc_tid_map_key_struct(mtid)
+                    if ks != "" { set_map_key_struct(expr_result_str, ks) }
+                }
+            }
             expr_result_type = fa_type
             return
         }
@@ -776,6 +809,16 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
                         set_map_types(expr_result_str, mk_type, mv_type, mv_struct)
                     }
                 }
+            }
+            // Struct-field Set[T]: the monomorphized-generic struct field tp_id
+            // is reg-side-erased to -1 (codegen_stmt reg_sf_entry stores
+            // sv_tp(ct, -1, -1, "")), and the container tp-read block above only
+            // handles LIST/OPTION/RESULT/MAP — so a Set field never gets its
+            // element type set there. Recover it from the per-node tid memo,
+            // which covers both the generic and non-generic field cases with one
+            // mechanism. jkdywb (sibling of the tuple gap).
+            if fa_type == CT_SET {
+                recover_set_elem_from_tid(node, expr_result_str)
             }
         }
         expr_result_type = fa_type

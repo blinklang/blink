@@ -1,0 +1,114 @@
+// Bug jkdywb: an inline-keyed Set[Int]/Map[Int,_] reached through a generic-
+// tuple element (or a struct field) lost its inner element/key type at the
+// tuple boundary. resolve_tuple_ann type-erased the element to a bare
+// "set"/"map" tag (is_compound_ct excludes CT_SET; the CT_MAP else-branch
+// emits bare "map"), and the read block in emit_expr never re-recorded the
+// element/key CT on expr_result_str. Downstream emit_set_method/emit_map_method
+// then defaulted the key type to CT_STRING, so kops_is_inline_key returned 0
+// and `t.0.contains(3)` / `t.0.get(5)` emitted a BARE int to
+// blink_set_contains/blink_map_get(const void*) — C error "makes pointer from
+// integer without a cast". Str keys were unaffected (already pointer-shaped).
+//
+// The fix threads the element type from typecheck's node->tid memo
+// (tc_lookup_node_tid) rather than the type-erased tuple carrier: the carrier
+// name is SHARED across monomorphizations ((Set[Int],Int) and (Set[Str],Int)
+// compile to the same blink_Tuple2_set_int), so the inner type CANNOT live on
+// any carrier-keyed structure — only the per-node tid holds it. The read block
+// now calls set_set_elem_type/set_map_types with the CT recovered from the tid.
+//
+// Red before the fix (all six cases fail at cc); green after. The Str-keyed
+// cases prove the default path stays undisturbed. The collision case guards
+// against a future regression to a carrier-keyed fix.
+
+type NineBox { n: Int }
+type SetField { s: Set[Int] }
+type MapVField { m: Map[Int, NineBox] }
+
+@derive(Hash, Eq)
+type Point { x: Int, y: Int }
+
+fn wrap[T](x: T) -> (T, Int) { (x, 1) }
+
+fn make_set() -> (Set[Int], Int) {
+    let mut s: Set[Int] = Set()
+    s.insert(3)
+    (s, 1)
+}
+
+test "generic-tuple Set[Int] preserves inner key through tuple boundary" {
+    let mut s: Set[Int] = Set()
+    s.insert(3)
+    let t = wrap(s)
+    assert(t.0.contains(3))
+    assert(!t.0.contains(9))
+}
+
+test "generic-tuple Map[Int,Str] preserves inner key through tuple boundary" {
+    let m: Map[Int, Str] = Map()
+    m.insert(5, "five")
+    let t = wrap(m)
+    assert_eq(t.0.get(5).unwrap(), "five")
+}
+
+test "spelled (Set[Int], Int) preserves inner key through tuple boundary" {
+    let t = make_set()
+    assert(t.0.contains(3))
+}
+
+test "generic-tuple Map[Int,Struct] threads value struct through tuple boundary" {
+    let m: Map[Int, NineBox] = Map()
+    m.insert(5, NineBox { n: 9 })
+    let t = wrap(m)
+    assert_eq(t.0.get(5).unwrap().n, 9)
+}
+
+test "struct-field Set[Int] preserves inner key" {
+    let mut b = SetField { s: Set() }
+    b.s.insert(3)
+    assert(b.s.contains(3))
+    assert(!b.s.contains(9))
+}
+
+test "struct-field Map[Int,Struct] preserves inner key (sibling, already worked)" {
+    let b = MapVField { m: Map() }
+    b.m.insert(5, NineBox { n: 9 })
+    assert_eq(b.m.get(5).unwrap().n, 9)
+}
+
+test "carrier collision: (Set[Int],Int) and (Set[Str],Int) keep distinct inner types" {
+    let mut si: Set[Int] = Set()
+    si.insert(3)
+    let mut ss: Set[Str] = Set()
+    ss.insert("x")
+    let ti = wrap(si)
+    let ts = wrap(ss)
+    assert(ti.0.contains(3))
+    assert(ts.0.contains("x"))
+}
+
+test "string-keyed Set stays undisturbed (default path)" {
+    let mut s: Set[Str] = Set()
+    s.insert("x")
+    let t = wrap(s)
+    assert(t.0.contains("x"))
+}
+
+// The following two threaded a struct inner (not just a scalar) through the
+// tuple boundary. Recovering the struct NAME (not just the CT) via the tid
+// memo — set_set_elem_struct for the Set element, set_map_key_struct for the
+// Map key — is what makes the kops table resolve. Added when a code review
+// found the CT_MAP branch dropped the key struct name (jkdywb review pass).
+test "generic-tuple Set[Struct] threads element struct through tuple boundary" {
+    let mut s: Set[Point] = Set()
+    s.insert(Point { x: 1, y: 2 })
+    let t = wrap(s)
+    assert(t.0.contains(Point { x: 1, y: 2 }))
+    assert(!t.0.contains(Point { x: 9, y: 9 }))
+}
+
+test "generic-tuple Map[Struct,V] threads key struct through tuple boundary" {
+    let m: Map[Point, Int] = Map()
+    m.insert(Point { x: 1, y: 2 }, 9)
+    let t = wrap(m)
+    assert_eq(t.0.get(Point { x: 1, y: 2 }).unwrap(), 9)
+}
