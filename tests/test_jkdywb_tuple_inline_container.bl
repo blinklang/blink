@@ -27,6 +27,17 @@ type MapVField { m: Map[Int, NineBox] }
 @derive(Hash, Eq)
 type Point { x: Int, y: Int }
 
+// Bug vbhc4x: a Set[T]/Map[K,_] element reached through a GENERIC-STRUCT field
+// (typecheck does not monomorphize struct instances, so the FieldAccess tid is
+// Set[<typevar>]) lost its element/key type — the field access defaulted to
+// CT_STRING, so an int/struct element boxed through the wrong kops table and
+// emitted a bare int to blink_set_contains(const void*). The concrete Int lives
+// ONLY on the method-argument node's memoized tid (insert(3) → 3 infers TYPE_INT);
+// codegen recovers it via tc_lookup_node_tid on the arg (recover_elem_ct_from_arg),
+// gated on "still the erased default" so Set[Str]/concrete Set[Int] are untouched.
+type GBoxSet[T] { s: Set[T] }
+type GBoxMap[K] { m: Map[K, NineBox] }
+
 fn wrap[T](x: T) -> (T, Int) { (x, 1) }
 
 fn make_set() -> (Set[Int], Int) {
@@ -111,4 +122,36 @@ test "generic-tuple Map[Struct,V] threads key struct through tuple boundary" {
     m.insert(Point { x: 1, y: 2 }, 9)
     let t = wrap(m)
     assert_eq(t.0.get(Point { x: 1, y: 2 }).unwrap(), 9)
+}
+
+// ---- vbhc4x: generic-struct field Set/Map element recovery from arg tid ----
+
+test "vbhc4x generic-struct Set[Int] recovers Int elem from insert arg" {
+    let mut b = GBoxSet { s: Set() }
+    b.s.insert(3)
+    assert(b.s.contains(3))
+    assert(!b.s.contains(9))
+}
+
+test "vbhc4x generic-struct Map[Int,Struct] recovers Int key from insert arg" {
+    let b = GBoxMap { m: Map() }
+    b.m.insert(5, NineBox { n: 9 })
+    assert(b.m.contains_key(5))
+    assert_eq(b.m.get(5).unwrap().n, 9)
+}
+
+test "vbhc4x generic-struct Set[Point] recovers struct elem via tc_tid_struct" {
+    let mut b = GBoxSet { s: Set() }
+    b.s.insert(Point { x: 1, y: 2 })
+    assert(b.s.contains(Point { x: 1, y: 2 }))
+    assert(!b.s.contains(Point { x: 9, y: 9 }))
+}
+
+// GREEN control: generic-struct Set[Str] must stay on the natural pointer path —
+// the recovery gate ("still erased default") must NOT override a Str element.
+test "vbhc4x generic-struct Set[Str] stays undisturbed (default path)" {
+    let mut b = GBoxSet { s: Set() }
+    b.s.insert("x")
+    assert(b.s.contains("x"))
+    assert(!b.s.contains("y"))
 }

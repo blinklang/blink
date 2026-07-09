@@ -61,9 +61,31 @@ import diagnostics.{
     WITH_PTR_BODY_TOO_COMPLEX, FFI_SCOPE_NOT_WITH_RESOURCE,
 }
 import ast.{NodeKind, is_block_bearing}
+import typecheck.{tc_lookup_node_tid, tc_tid_ct, tc_tid_struct, is_import_module_name, tc_qualifier_to_module_or_self, suggest_module_member}
 
 // Arg offset for trait-qualified builtin calls: MapOps.contains_key(m, k) has receiver at args[0]
 let mut btc_arg_offset: Int = 0
+
+// vbhc4x: recover a Set element / Map key CT from the method-argument node's
+// memoized tid, for the case where the container is a generic-struct field
+// (Box[T] { s: Set[T] }). typecheck does NOT monomorphize struct instances, so
+// the FieldAccess tid for `b.s` is Set[<typevar>] and get_set_elem_type returns
+// the erased default (CT_STRING). The concrete element type lives only on the
+// argument node (`insert(3)` → 3 infers TYPE_INT). Fire ONLY when the element is
+// still that erased default (cur_ct == CT_STRING && cur_sname == "" for a Set,
+// or CT_VOID && "" for a Map key) — never override an already-resolved element
+// (protects Set[Str], concrete Set[Int] via node-tid, struct elements). Returns
+// the recovered (ct, sname); (-1, "") means "no recovery, keep the caller's".
+type ElemRecovery { ct: Int, sname: Str }
+fn recover_elem_ct_from_arg(node: Int, arg_pos: Int, is_erased_default: Bool) -> ElemRecovery ! Codegen.Register {
+    if !is_erased_default { return ElemRecovery { ct: -1, sname: "" } }
+    let args_sl = node_args(node)
+    if args_sl == -1 || arg_pos >= sublist_length(args_sl) { return ElemRecovery { ct: -1, sname: "" } }
+    let atid = tc_lookup_node_tid(sublist_get(args_sl, arg_pos))
+    let act = tc_tid_ct(atid)
+    if act < 0 { return ElemRecovery { ct: -1, sname: "" } }
+    ElemRecovery { ct: act, sname: tc_tid_struct(atid) }
+}
 
 fn emit_panic_tag_check(tmp: Str, tag_val: Int, msg: Str, node: Int) ! Codegen.Emit {
     let file = panic_file_for_fmt(node)
@@ -1005,8 +1027,21 @@ fn emit_map_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int !
     if node_kind(obj_node) == NodeKind.Ident {
         map_var_name = node_name(obj_node)
     }
-    let key_ct = get_map_key_type(map_var_name)
-    let key_sname = if key_ct == CT_VOID || key_ct == CT_STRUCT { get_map_key_struct(map_var_name) } else { "" }
+    let base_key_ct = get_map_key_type(map_var_name)
+    let base_key_sname = if base_key_ct == CT_VOID || base_key_ct == CT_STRUCT { get_map_key_struct(map_var_name) } else { "" }
+    // vbhc4x: a generic-struct field Map[K,V] erases its key. The erased key CT
+    // is CT_VOID when the field's key is a typevar (tp_child1_kind yields the
+    // typevar's void kind) or CT_STRING when the key CT is entirely unset — both
+    // are the "no concrete key" default. Recover the concrete key from the key
+    // argument's memoized tid for the key-taking methods, ONLY at that erased
+    // default (with no struct name) — so Map[Str,_] and a resolved Map[Int,_]
+    // stay untouched. The key is arg 0 (at btc_arg_offset) for insert/get/
+    // contains/contains_key/remove.
+    let map_key_erased_default = (base_key_ct == CT_STRING || base_key_ct == CT_VOID) && base_key_sname == ""
+    let key_taking = method == "insert" || method == "get" || method == "contains" || method == "contains_key" || method == "remove"
+    let key_rec = if key_taking { recover_elem_ct_from_arg(node, btc_arg_offset, map_key_erased_default) } else { ElemRecovery { ct: -1, sname: "" } }
+    let key_ct = if key_rec.ct >= 0 { key_rec.ct } else { base_key_ct }
+    let key_sname = if key_rec.ct >= 0 { key_rec.sname } else { base_key_sname }
 
     if method == "insert" {
         let mut set_var_name = ""
@@ -1199,29 +1234,46 @@ fn emit_set_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int !
     let elem_ct = get_set_elem_type(set_var_name)
     let elem_sname = if elem_ct == CT_VOID || elem_ct == CT_STRUCT { get_set_elem_struct(set_var_name) } else { "" }
 
+    // vbhc4x: a generic-struct field Set[T] erases its element. Like the Map key
+    // (emit_map_method), the erased element CT is CT_STRING (unknown field
+    // default) or CT_VOID (typevar element kind) — both mean "no concrete
+    // element". Recover from the insert/contains/remove argument's memoized tid,
+    // ONLY at that erased default with no struct name (so Set[Str] and a resolved
+    // Set[Int]/Set[Struct] are untouched). Scoped to these three element-taking
+    // methods — union/len/is_empty do not box an element.
+    let set_erased_default = (elem_ct == CT_STRING || elem_ct == CT_VOID) && elem_sname == ""
     if method == "insert" {
         let args_sl = node_args(node)
+        let rec = recover_elem_ct_from_arg(node, btc_arg_offset, set_erased_default)
+        let use_ct = if rec.ct >= 0 { rec.ct } else { elem_ct }
+        let use_sname = if rec.ct >= 0 { rec.sname } else { elem_sname }
         emit_expr(sublist_get(args_sl, btc_arg_offset))
         let elem_str = expr_result_str
-        let elem_expr = map_key_expr(elem_str, elem_ct, elem_sname)
+        let elem_expr = map_key_expr(elem_str, use_ct, use_sname)
         expr_result_str = "(blink_set_insert({obj_str}, {elem_expr}) != 0)"
         expr_result_type = CT_BOOL
         return 1
     }
     if method == "contains" {
         let args_sl = node_args(node)
+        let rec = recover_elem_ct_from_arg(node, btc_arg_offset, set_erased_default)
+        let use_ct = if rec.ct >= 0 { rec.ct } else { elem_ct }
+        let use_sname = if rec.ct >= 0 { rec.sname } else { elem_sname }
         emit_expr(sublist_get(args_sl, btc_arg_offset))
         let elem_str = expr_result_str
-        let elem_expr = map_key_expr_lookup(elem_str, elem_ct, elem_sname)
+        let elem_expr = map_key_expr_lookup(elem_str, use_ct, use_sname)
         expr_result_str = "(blink_set_contains({obj_str}, {elem_expr}) != 0)"
         expr_result_type = CT_BOOL
         return 1
     }
     if method == "remove" {
         let args_sl = node_args(node)
+        let rec = recover_elem_ct_from_arg(node, btc_arg_offset, set_erased_default)
+        let use_ct = if rec.ct >= 0 { rec.ct } else { elem_ct }
+        let use_sname = if rec.ct >= 0 { rec.sname } else { elem_sname }
         emit_expr(sublist_get(args_sl, btc_arg_offset))
         let elem_str = expr_result_str
-        let elem_expr = map_key_expr_lookup(elem_str, elem_ct, elem_sname)
+        let elem_expr = map_key_expr_lookup(elem_str, use_ct, use_sname)
         expr_result_str = "(blink_set_remove({obj_str}, {elem_expr}) != 0)"
         expr_result_type = CT_BOOL
         return 1

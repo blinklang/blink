@@ -88,7 +88,7 @@ import diagnostics.{
 }
 import std.path.{path_dirname}
 import formatter.{format_expr}
-import typecheck.{tc_mono_csv, is_import_module_name, tc_lookup_node_tid, tc_tid_set_elem_ct, tc_tid_set_elem_struct, tc_tid_map_key_ct, tc_tid_map_key_struct, tc_tid_map_val_ct, tc_tid_map_val_struct}
+import typecheck.{tc_mono_csv, is_import_module_name, tc_lookup_node_tid, tc_tid_set_elem_ct, tc_tid_set_elem_struct, tc_tid_map_key_ct, tc_tid_map_key_struct, tc_tid_map_val_ct, tc_tid_map_val_struct, tc_tid_ct, tc_tid_option_inner_ct, tc_tid_option_inner_struct, tc_tid_result_ok_ct, tc_tid_result_ok_struct, tc_tid_result_err_ct, tc_tid_result_err_struct}
 
 // codegen_expr.bl — Expression codegen, closures, capture analysis
 
@@ -2613,58 +2613,116 @@ pub fn emit_generic_fn_call_tail(node: Int, fn_name: Str, args_str: Str, ca: Gen
     let ret_str = node_return_type(gfn_node)
     let tparams_sl = node_type_params(gfn_node)
     let resolved_ret = resolve_tparam(ret_str, tparams_sl, ta_str)
-    let ret_type = type_from_name(resolved_ret)
+    // A bare-typevar return (`-> T`/`-> U`) bound to a compound resolves through
+    // the string tag to a carrier name (Option_int / Result_int_str / Map_..)
+    // whose type_from_name is CT_VOID — the tag has no `[` so the whole string
+    // is its base (codegen_types.bl `_ => CT_VOID`). typecheck already computed
+    // the correct substituted return tid and memoized it on the call node, so
+    // reroute ret_type off CT_VOID onto the real carrier CT. Structural fix for
+    // ma6n41 / tr5gcn (codegen-structured-tids epic). Only fires when the string
+    // path failed AND the tid is a compound — every already-working shape (the
+    // annotated `-> Option[T]` path below, tuples, structs) keeps its CT.
+    let ret_tid = tc_lookup_node_tid(node)
+    let tid_ct = tc_tid_ct(ret_tid)
+    let ret_name_ct = type_from_name(resolved_ret)
+    // `rerouted` records that ret_type was recovered from the memoized tid (bare
+    // typevar bound to a compound), NOT from a genuine `-> Option`/`-> Result`/
+    // `-> Map` annotation. The tid-recovery else branches below gate on it: a
+    // bracketless `-> Option` (resolved_ret == "Option", type_from_name already
+    // CT_OPTION) must stay the old no-op, not run tid recovery against a node
+    // whose tid isn't an Option — else it would register a carrier keyed on the
+    // -1 sentinel where the old code registered nothing.
+    let rerouted = ret_name_ct == CT_VOID && (tid_ct == CT_OPTION || tid_ct == CT_RESULT || tid_ct == CT_MAP)
+    let ret_type = if rerouted { tid_ct } else { ret_name_ct }
     let fn_eff_sl = node_effects(gfn_node)
     let fn_trusted = has_annotation(gfn_node, "trusted")
     reg_fn_with_effects(mangled, ret_type, fn_eff_sl, fn_trusted)
     let call_args = append_ev_arg(mangled, args_str)
     if ret_type == CT_OPTION {
         let ret_ann = node_type_ann(gfn_node)
-        if ret_ann != -1 {
-            let elems_sl = node_elements(ret_ann)
-            if elems_sl != -1 && sublist_length(elems_sl) >= 1 {
-                let inner_ann = sublist_get(elems_sl, 0)
-                let inner_name_raw = node_name(inner_ann)
-                let inner_name = resolve_tparam(inner_name_raw, tparams_sl, ta_str)
-                let inner_ct = type_from_name(inner_name)
-                expr_option_inner = inner_ct
-                ensure_option_type(inner_ct)
-                reg_fn_ret_type(mangled, CT_OPTION, inner_ct, -1)
-                if inner_ct == CT_VOID && is_struct_or_enum_type(inner_name) != 0 {
-                    ensure_struct_option_type(inner_name)
-                    expr_option_inner_struct = inner_name
-                }
+        let ann_elems = if ret_ann != -1 { node_elements(ret_ann) } else { -1 }
+        if ann_elems != -1 && sublist_length(ann_elems) >= 1 {
+            let inner_ann = sublist_get(ann_elems, 0)
+            let inner_name_raw = node_name(inner_ann)
+            let inner_name = resolve_tparam(inner_name_raw, tparams_sl, ta_str)
+            let inner_ct = type_from_name(inner_name)
+            expr_option_inner = inner_ct
+            ensure_option_type(inner_ct)
+            reg_fn_ret_type(mangled, CT_OPTION, inner_ct, -1)
+            if inner_ct == CT_VOID && is_struct_or_enum_type(inner_name) != 0 {
+                ensure_struct_option_type(inner_name)
+                expr_option_inner_struct = inner_name
+            }
+        } else if rerouted {
+            // Bare-typevar return `-> T` bound to Option[..]: no compound child
+            // in the annotation, so recover the inner from the memoized tid,
+            // mirroring the annotation path above (ma6n41 / tr5gcn). A struct/enum
+            // inner MUST be normalized to CT_VOID + a non-empty struct name, EXACTLY
+            // as the annotation path does (type_from_name(struct)==CT_VOID there):
+            // tc_tid_option_inner_ct returns CT_STRUCT for a struct, which would
+            // put a different inner CT into expr_option_inner / the fn-ret ledger
+            // than the annotated path for the same shape.
+            let raw_inner_ct = tc_tid_option_inner_ct(ret_tid)
+            let inner_struct = tc_tid_option_inner_struct(ret_tid)
+            let inner_ct = if inner_struct != "" { CT_VOID } else { raw_inner_ct }
+            expr_option_inner = inner_ct
+            ensure_option_type(inner_ct)
+            reg_fn_ret_type(mangled, CT_OPTION, inner_ct, -1)
+            if inner_struct != "" {
+                ensure_struct_option_type(inner_struct)
+                expr_option_inner_struct = inner_struct
             }
         }
     } else if ret_type == CT_RESULT {
         let ret_ann = node_type_ann(gfn_node)
-        if ret_ann != -1 {
-            let elems_sl = node_elements(ret_ann)
-            if elems_sl != -1 && sublist_length(elems_sl) >= 2 {
-                let ok_ann = sublist_get(elems_sl, 0)
-                let err_ann = sublist_get(elems_sl, 1)
-                let ok_name = resolve_tparam(node_name(ok_ann), tparams_sl, ta_str)
-                let err_name = resolve_tparam(node_name(err_ann), tparams_sl, ta_str)
-                let ok_ct = type_from_name(ok_name)
-                let err_ct = type_from_name(err_name)
-                expr_result_ok_type = ok_ct
-                expr_result_err_type = err_ct
-                let ok_is_type = is_struct_or_enum_type(ok_name) != 0
-                let err_is_type = is_struct_or_enum_type(err_name) != 0
-                if ok_is_type || err_is_type {
-                    let ok_s = if ok_is_type { ok_name } else { "" }
-                    let err_s = if err_is_type { err_name } else { "" }
-                    reg_fn_ret_struct_inner(mangled, ok_s, err_s)
-                    ensure_mixed_result_type(ok_ct, err_ct, ok_s, err_s)
-                    expr_result_ok_struct = ok_s
-                    expr_result_err_struct = err_s
-                } else {
-                    ensure_result_type(ok_ct, err_ct)
-                    expr_result_ok_struct = ""
-                    expr_result_err_struct = ""
-                }
-                reg_fn_ret_type(mangled, CT_RESULT, ok_ct, err_ct)
+        let ann_elems = if ret_ann != -1 { node_elements(ret_ann) } else { -1 }
+        if ann_elems != -1 && sublist_length(ann_elems) >= 2 {
+            let ok_ann = sublist_get(ann_elems, 0)
+            let err_ann = sublist_get(ann_elems, 1)
+            let ok_name = resolve_tparam(node_name(ok_ann), tparams_sl, ta_str)
+            let err_name = resolve_tparam(node_name(err_ann), tparams_sl, ta_str)
+            let ok_ct = type_from_name(ok_name)
+            let err_ct = type_from_name(err_name)
+            expr_result_ok_type = ok_ct
+            expr_result_err_type = err_ct
+            let ok_is_type = is_struct_or_enum_type(ok_name) != 0
+            let err_is_type = is_struct_or_enum_type(err_name) != 0
+            if ok_is_type || err_is_type {
+                let ok_s = if ok_is_type { ok_name } else { "" }
+                let err_s = if err_is_type { err_name } else { "" }
+                reg_fn_ret_struct_inner(mangled, ok_s, err_s)
+                ensure_mixed_result_type(ok_ct, err_ct, ok_s, err_s)
+                expr_result_ok_struct = ok_s
+                expr_result_err_struct = err_s
+            } else {
+                ensure_result_type(ok_ct, err_ct)
+                expr_result_ok_struct = ""
+                expr_result_err_struct = ""
             }
+            reg_fn_ret_type(mangled, CT_RESULT, ok_ct, err_ct)
+        } else if rerouted {
+            // Bare-typevar return `-> T` bound to Result[..]: recover ok/err
+            // from the memoized tid, mirroring the annotation path (ma6n41). As in
+            // the Option else, a struct/enum ok/err inner is normalized to CT_VOID
+            // + a non-empty struct name so the ledger + expr_* globals match the
+            // annotation path (which computes type_from_name(struct)==CT_VOID).
+            let ok_s = tc_tid_result_ok_struct(ret_tid)
+            let err_s = tc_tid_result_err_struct(ret_tid)
+            let ok_ct = if ok_s != "" { CT_VOID } else { tc_tid_result_ok_ct(ret_tid) }
+            let err_ct = if err_s != "" { CT_VOID } else { tc_tid_result_err_ct(ret_tid) }
+            expr_result_ok_type = ok_ct
+            expr_result_err_type = err_ct
+            if ok_s != "" || err_s != "" {
+                reg_fn_ret_struct_inner(mangled, ok_s, err_s)
+                ensure_mixed_result_type(ok_ct, err_ct, ok_s, err_s)
+                expr_result_ok_struct = ok_s
+                expr_result_err_struct = err_s
+            } else {
+                ensure_result_type(ok_ct, err_ct)
+                expr_result_ok_struct = ""
+                expr_result_err_struct = ""
+            }
+            reg_fn_ret_type(mangled, CT_RESULT, ok_ct, err_ct)
         }
     } else if ret_type == CT_LIST {
         let ret_ann = node_type_ann(gfn_node)
@@ -2679,16 +2737,27 @@ pub fn emit_generic_fn_call_tail(node: Int, fn_name: Str, args_str: Str, ca: Gen
         }
     } else if ret_type == CT_MAP {
         let ret_ann = node_type_ann(gfn_node)
-        if ret_ann != -1 {
-            let elems_sl = node_elements(ret_ann)
-            if elems_sl != -1 && sublist_length(elems_sl) >= 2 {
-                let k_ann = sublist_get(elems_sl, 0)
-                let v_ann = sublist_get(elems_sl, 1)
-                let k_name = resolve_tparam(node_name(k_ann), tparams_sl, ta_str)
-                let v_name = resolve_tparam(node_name(v_ann), tparams_sl, ta_str)
-                expr_map_key_type = type_from_name(k_name)
-                expr_map_val_type = type_from_name(v_name)
-            }
+        let ann_elems = if ret_ann != -1 { node_elements(ret_ann) } else { -1 }
+        if ann_elems != -1 && sublist_length(ann_elems) >= 2 {
+            let k_ann = sublist_get(ann_elems, 0)
+            let v_ann = sublist_get(ann_elems, 1)
+            let k_name = resolve_tparam(node_name(k_ann), tparams_sl, ta_str)
+            let v_name = resolve_tparam(node_name(v_ann), tparams_sl, ta_str)
+            expr_map_key_type = type_from_name(k_name)
+            expr_map_val_type = type_from_name(v_name)
+        } else if tid_ct == CT_MAP {
+            // Bare-typevar return `-> T` bound to Map[K,V]: recover key/value
+            // CTs from the memoized tid (ma6n41). Unlike Option/Result, a bare
+            // typevar bound to Map does NOT reroute — Map's top-level carrier tag
+            // erases to bare "Map", so type_from_name already yields CT_MAP and
+            // `rerouted` is false. The distinguisher from a genuine unparameterized
+            // `-> Map` is the tid: gate on tid_ct == CT_MAP (a real Map tid).
+            // A blink_map* is element-agnostic at the C level, but expr_map_*_type
+            // drives downstream method key boxing, so thread the real CTs through.
+            // tc_tid_map_key_ct returns -1 for an unmappable key, matching the
+            // "unset" default the downstream >= 0 gates already expect.
+            expr_map_key_type = tc_tid_map_key_ct(ret_tid)
+            expr_map_val_type = tc_tid_map_val_ct(ret_tid)
         }
     } else if ret_type == CT_VOID && resolved_ret != "Void" && resolved_ret != "" {
         let ret_ann = node_type_ann(gfn_node)

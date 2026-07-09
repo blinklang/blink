@@ -1,0 +1,133 @@
+// Bugs ma6n41 + tr5gcn (shared root cause): a generic fn with a BARE-TYPEVAR
+// return (`-> T` / `-> U`) bound at the call site to a COMPOUND type
+// (Option/Result/Map) re-derived its return C-type from the string tag:
+// resolve_tparam("T", [T], "Result_int_str") -> "Result_int_str", then
+// type_from_name("Result_int_str") -> CT_VOID (the carrier tag has no `[`, so
+// its base is the whole string, which falls to the `_ => CT_VOID` arm).
+//
+//   - Call site (emit_generic_fn_call_tail): the let-binding typed the local
+//     `const void r2 = blink_inner_Result_int_str(r)` — void though the callee
+//     returns Result[T,Str].
+//   - Def side (mono_fn_signature): the fn was emitted `void
+//     blink_inner_Result_int_str(...)` — void return though the body returns a
+//     Result carrier.
+//
+// tr5gcn is the SAME bug (NOT nesting-specific): a single-level Option[Int]
+// through a bare typevar return already fails — `w` types CT_VOID, so
+// `w.unwrap()` errors "unresolved method on type Void".
+//
+// The fix is STRUCTURAL (advances the codegen-structured-tids epic 4y09cs):
+//   - Call site reads the memoized substituted return tid (tc_lookup_node_tid)
+//     via new tid accessors (tc_tid_ct / tc_tid_option_inner_* /
+//     tc_tid_result_*), rerouting ret_type off CT_VOID onto the real carrier.
+//   - Def side has no call node (mono-registry driven), so it decodes the same
+//     carrier tag directly (is_compound_tag / compound_tag_ct / c_type_from_tag
+//     / ensure_carrier_from_tag), the precedent already used for compound params.
+//
+// Both loci derive the identical C carrier (blink_Result_int_str) from the same
+// mono tag segment, so caller-binding and callee-return C types agree and the
+// mangled symbols are byte-identical.
+//
+// RED before the fix (all single-level compound cases emit a CT_VOID receiver
+// or void return, failing at codegen/cc); GREEN after. The scalar /
+// annotated-non-typevar / generic-tuple controls must STAY GREEN to prove the
+// default paths are undisturbed.
+//
+// Scope note: this covers SINGLE-LEVEL compounds bound to a bare typevar
+// (Option[Int], Result[Int,Str], Option[Struct], Map[Int,Str]). Nested
+// compounds (Option[Option[Int]], Result[Option[Int],Str]) are excluded — they
+// depend on separate pre-existing nested-construction bugs, not on this fix.
+
+import test_ma6n41_modqual_helper
+
+@derive(Eq)
+type Payload { n: Int }
+
+fn identity[U](x: U) -> U { x }
+
+fn outer_result[T](t: T) -> Result[T, Str] {
+    let r: Result[T, Str] = Ok(t)
+    let r2 = identity(r)
+    r2
+}
+
+fn wrap[T](x: T) -> T { x }
+
+fn annotated_option() -> Option[Int] { Some(5) }
+
+fn make_pair[T](x: T) -> (T, Int) { (x, 1) }
+
+// ---- ma6n41: mono-calls-mono, generic compound return (Result) ----
+
+test "ma6n41 mono-calls-mono Result[Int,Str] Ok arm" {
+    let res = outer_result(7)
+    match res {
+        Ok(v) => { assert_eq(v, 7) }
+        Err(_e) => { assert(false) }
+    }
+}
+
+// ---- tr5gcn: bare-typevar generic return bound to a compound ----
+
+test "tr5gcn single-level Option[Int] through bare-typevar return" {
+    let o: Option[Int] = Some(5)
+    let w = wrap(o)
+    assert_eq(w.unwrap(), 5)
+}
+
+// NOTE: nested Option[Option[Int]] and Result[Option[Int],Str] through a
+// bare-typevar return are NOT covered here — they hit SEPARATE pre-existing
+// nested-compound construction/match bugs (fcqfhf: Some(Some(x)) unwrap
+// ordering; the Ok(Some(x)) match-binds `inner` as void) that are orthogonal
+// to the generic-return fix and independently ticketed. Once those land, add
+// the nested cases here as regression fence.
+
+test "bare-typevar return Result[Int,Str] Err arm" {
+    let r: Result[Int, Str] = Err("boom")
+    let w = wrap(r)
+    match w {
+        Ok(_v) => { assert(false) }
+        Err(e) => { assert_eq(e, "boom") }
+    }
+}
+
+test "bare-typevar return Option[Struct]" {
+    let o: Option[Payload] = Some(Payload { n: 9 })
+    let w = wrap(o)
+    assert_eq(w.unwrap().n, 9)
+}
+
+test "bare-typevar return Map[Int,Str]" {
+    let m: Map[Int, Str] = Map()
+    m.insert(3, "three")
+    let w = wrap(m)
+    assert_eq(w.get(3).unwrap(), "three")
+}
+
+// Review A#1: a module-defined struct inner makes canonical_struct_tag differ
+// from the stripped tag. The def-side must emit the CANONICAL carrier name so
+// the fn signature matches the typedef; the raw tag would name an undeclared
+// blink_Option_M9Thing (C compile error).
+test "bare-typevar return Option[module-qualified struct]" {
+    let o: Option[test_ma6n41_modqual_helper.M9Thing] = Some(test_ma6n41_modqual_helper.M9Thing { n: 9 })
+    let w = wrap(o)
+    assert_eq(w.unwrap().n, 9)
+}
+
+// ---- GREEN controls: default paths must stay undisturbed ----
+
+test "control scalar through bare-typevar return" {
+    let w = wrap(5)
+    assert_eq(w, 5)
+}
+
+test "control annotated non-typevar Option[Int] return" {
+    let w = annotated_option()
+    assert_eq(w.unwrap(), 5)
+}
+
+test "control generic-tuple return preserves CT_VOID Tuple fallback" {
+    let t = make_pair(7)
+    assert_eq(t.0, 7)
+    assert_eq(t.1, 1)
+}

@@ -52,6 +52,7 @@ import codegen_types.{
     lookup_assoc_type, lookup_impl_type_for_trait, mangle_generic_name, mangle_impl_method, mangle_impl_method_q, match_scrut_enum,
     match_scruts, mono_fns, mono_instances, mono_name_from_ann, mut_captured_vars, option_c_type,
     poly_impl_method_node, poly_impl_block_node, is_poly_impl_base,
+    compound_tag_ct, option_inner_ct_from_tag, option_inner_struct_from_tag,
     option_c_type_mixed, pop_scope, ptr_inner_c_type, push_scope,
     reg_sf_entry, register_var_compound_inner_from_str, resolve_effect_field, resolve_effect_is_ue, resolve_effect_vtable,
     resolve_import_alias, resolve_option_inner_from_ann, resolve_ret_type_from_ann,
@@ -5785,61 +5786,98 @@ fn mono_fn_signature(fn_node: Int, concrete_args: Str) -> MonoSig ! Codegen.Regi
     // Resolve return type
     let ret_str = node_return_type(fn_node)
     let resolved_ret = resolve_tparam(ret_str, tparams_sl, concrete_args)
-    let ret_type = type_from_name(resolved_ret)
+    // A bare-typevar return (`-> T`) bound to a compound resolves to the carrier
+    // tag (Option_int / Result_int_str / Map_..), whose type_from_name is
+    // CT_VOID (the tag has no `[`). No call node / tid exists here (this is the
+    // mono-registry-driven def side), so decode the carrier tag directly — the
+    // same precedent as the compound-param branch below (qm01e7) and
+    // resolve_tuple_ann. Reroute ret_type off CT_VOID so the arm fires (ma6n41 /
+    // tr5gcn). The return annotation for a bare `-> T` is the typevar node with
+    // no compound children, so the arms' annotation reads fall through to the
+    // tag-derived else branch.
+    let ret_name_ct = type_from_name(resolved_ret)
+    // `rerouted` marks that ret_type came from a bare-typevar compound carrier
+    // tag (Option_int / Result_..), NOT a genuine `-> Option`/`-> Result`. Only
+    // the tag-recovery else branches below run under it — a bracketless
+    // `-> Option` (resolved_ret == "Option", is_compound_tag == 0) never reroutes
+    // and keeps its prior behavior.
+    let rerouted = ret_name_ct == CT_VOID && is_compound_tag(resolved_ret) != 0
+    let ret_type = if rerouted { compound_tag_ct(resolved_ret) } else { ret_name_ct }
+    // The carrier tag from resolve_tparam has module-qualified struct/enum inners
+    // STRIPPED (e.g. `Option_Row`, not `Option_std_db_row_Row`). ensure_carrier_
+    // from_tag + the call site both canonicalize via canonical_struct_tag, but
+    // c_type_from_tag's compound branch emits `blink_{tag}` RAW — so the fn
+    // signature would name a carrier that was never typedef'd for a module-
+    // defined inner. Canonicalize the tag first so the emitted C name matches the
+    // typedef and the caller-side carrier (review A#1).
+    let canon_ret = if rerouted { canonical_struct_tag(resolved_ret) } else { resolved_ret }
     let mut ret_c_str = c_type_str(ret_type)
     if ret_type == CT_OPTION {
         let ret_ann = node_type_ann(fn_node)
-        if ret_ann != -1 {
-            let elems_sl = node_elements(ret_ann)
-            if elems_sl != -1 && sublist_length(elems_sl) >= 1 {
-                let inner_ann = sublist_get(elems_sl, 0)
-                let inner_name_raw = node_name(inner_ann)
-                let inner_name = resolve_tparam(inner_name_raw, tparams_sl, concrete_args)
-                let inner_ct = type_from_name(inner_name)
-                if inner_ct == CT_VOID && is_struct_or_enum_type(inner_name) != 0 {
-                    ensure_struct_option_type(inner_name)
-                    ret_c_str = struct_option_c_type(inner_name)
-                    cg_current_fn_option_inner_struct = inner_name
-                } else if is_compound_ct(inner_ct) != 0 {
-                    let compound_name = compound_name_from_ann(inner_ann)
-                    ensure_struct_option_type(compound_name)
-                    ret_c_str = struct_option_c_type(compound_name)
-                    cg_current_fn_option_inner_struct = compound_name
-                } else {
-                    ensure_option_type(inner_ct)
-                    ret_c_str = option_c_type(inner_ct)
-                    cg_current_fn_option_inner_struct = ""
-                }
-                cg_current_fn_option_inner = inner_ct
+        let ann_elems = if ret_ann != -1 { node_elements(ret_ann) } else { -1 }
+        if ann_elems != -1 && sublist_length(ann_elems) >= 1 {
+            let inner_ann = sublist_get(ann_elems, 0)
+            let inner_name_raw = node_name(inner_ann)
+            let inner_name = resolve_tparam(inner_name_raw, tparams_sl, concrete_args)
+            let inner_ct = type_from_name(inner_name)
+            if inner_ct == CT_VOID && is_struct_or_enum_type(inner_name) != 0 {
+                ensure_struct_option_type(inner_name)
+                ret_c_str = struct_option_c_type(inner_name)
+                cg_current_fn_option_inner_struct = inner_name
+            } else if is_compound_ct(inner_ct) != 0 {
+                let compound_name = compound_name_from_ann(inner_ann)
+                ensure_struct_option_type(compound_name)
+                ret_c_str = struct_option_c_type(compound_name)
+                cg_current_fn_option_inner_struct = compound_name
+            } else {
+                ensure_option_type(inner_ct)
+                ret_c_str = option_c_type(inner_ct)
+                cg_current_fn_option_inner_struct = ""
             }
+            cg_current_fn_option_inner = inner_ct
+        } else if rerouted {
+            // Bare-typevar `-> T` bound to Option[..]: derive the carrier + inner
+            // from the canonicalized tag (ma6n41). c_type_from_tag names the
+            // carrier (blink_Option_int / blink_Option_<canonical-struct>);
+            // ensure_carrier_from_tag emits the typedef; option_inner_*_from_tag
+            // recover the inner CT / struct for cg_current_fn_option_inner*.
+            ensure_carrier_from_tag(canon_ret)
+            ret_c_str = c_type_from_tag(canon_ret)
+            cg_current_fn_option_inner = option_inner_ct_from_tag(canon_ret)
+            cg_current_fn_option_inner_struct = option_inner_struct_from_tag(canon_ret)
         }
     } else if ret_type == CT_RESULT {
         let ret_ann = node_type_ann(fn_node)
-        if ret_ann != -1 {
-            let elems_sl = node_elements(ret_ann)
-            if elems_sl != -1 && sublist_length(elems_sl) >= 2 {
-                let ok_ann = sublist_get(elems_sl, 0)
-                let err_ann = sublist_get(elems_sl, 1)
-                let ok_name = resolve_tparam(node_name(ok_ann), tparams_sl, concrete_args)
-                let err_name = resolve_tparam(node_name(err_ann), tparams_sl, concrete_args)
-                let ok_ct = type_from_name(ok_name)
-                let err_ct = type_from_name(err_name)
-                // A struct/enum inner has CT_VOID/CT_STRUCT that result_c_type
-                // can't name, so it emitted `blink_Result_void_str` for the fn's
-                // return type while the body + call site used the correctly-named
-                // carrier — an invalid-initializer mismatch. Thread the struct
-                // names through the mixed carrier, mirroring the CT_OPTION branch
-                // above (7pfhc9: generic fn returning Result[UserStruct, _]).
-                let ok_struct = if is_struct_or_enum_type(ok_name) != 0 { ok_name } else { "" }
-                let err_struct = if is_struct_or_enum_type(err_name) != 0 { err_name } else { "" }
-                if ok_struct != "" || err_struct != "" {
-                    ensure_mixed_result_type(ok_ct, err_ct, ok_struct, err_struct)
-                    ret_c_str = result_c_type_mixed(ok_ct, err_ct, ok_struct, err_struct)
-                } else {
-                    ensure_result_type(ok_ct, err_ct)
-                    ret_c_str = result_c_type(ok_ct, err_ct)
-                }
+        let ann_elems = if ret_ann != -1 { node_elements(ret_ann) } else { -1 }
+        if ann_elems != -1 && sublist_length(ann_elems) >= 2 {
+            let ok_ann = sublist_get(ann_elems, 0)
+            let err_ann = sublist_get(ann_elems, 1)
+            let ok_name = resolve_tparam(node_name(ok_ann), tparams_sl, concrete_args)
+            let err_name = resolve_tparam(node_name(err_ann), tparams_sl, concrete_args)
+            let ok_ct = type_from_name(ok_name)
+            let err_ct = type_from_name(err_name)
+            // A struct/enum inner has CT_VOID/CT_STRUCT that result_c_type
+            // can't name, so it emitted `blink_Result_void_str` for the fn's
+            // return type while the body + call site used the correctly-named
+            // carrier — an invalid-initializer mismatch. Thread the struct
+            // names through the mixed carrier, mirroring the CT_OPTION branch
+            // above (7pfhc9: generic fn returning Result[UserStruct, _]).
+            let ok_struct = if is_struct_or_enum_type(ok_name) != 0 { ok_name } else { "" }
+            let err_struct = if is_struct_or_enum_type(err_name) != 0 { err_name } else { "" }
+            if ok_struct != "" || err_struct != "" {
+                ensure_mixed_result_type(ok_ct, err_ct, ok_struct, err_struct)
+                ret_c_str = result_c_type_mixed(ok_ct, err_ct, ok_struct, err_struct)
+            } else {
+                ensure_result_type(ok_ct, err_ct)
+                ret_c_str = result_c_type(ok_ct, err_ct)
             }
+        } else if rerouted {
+            // Bare-typevar `-> T` bound to Result[..]: derive the carrier from
+            // the canonicalized tag (ma6n41), mirroring the compound-param branch.
+            // canon_ret canonicalizes module-qualified struct/enum inners so the
+            // emitted C name matches the typedef ensure_carrier_from_tag emits.
+            ensure_carrier_from_tag(canon_ret)
+            ret_c_str = c_type_from_tag(canon_ret)
         }
     } else if is_struct_type(resolved_ret) != 0 || is_enum_type(resolved_ret) != 0 {
         let mono_name = mono_name_from_ann(resolved_ret, node_type_ann(fn_node), tparams_sl, concrete_args)
