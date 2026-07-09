@@ -6582,6 +6582,20 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             if is_import_module_name(obj_name) != 0 && nr_is_defined(obj_name) == 0 && is_intrinsic_method(obj_name, method) == 0 {
                 let sig = lookup_fnsig(method)
                 if sig != -1 {
+                    // Infer args before returning so their node→tid memo is
+                    // populated — the fall-through inference loop below is
+                    // unreachable past this early return, so a module-qualified
+                    // generic call (helper.cmg_identity(42)) would otherwise leave
+                    // its arg tids unset and codegen's tid-driven mono lowering
+                    // (tc_mono_csv) reads Void for a bare-typevar segment.
+                    let mq_gen_args = node_args(node)
+                    if mq_gen_args != -1 {
+                        let mut mgi = 0
+                        while mgi < sublist_length(mq_gen_args) {
+                            infer_type(sublist_get(mq_gen_args, mgi))
+                            mgi = mgi + 1
+                        }
+                    }
                     return fnsig_pool.get(sig).unwrap().ret
                 }
             }
@@ -7832,4 +7846,318 @@ fn type_to_str(tid: Int) -> Str {
     }
 
     name
+}
+
+// Lowercase scalar tag for a tid, mirroring codegen_types.c_type_tag. Used for
+// the INNER positions of a compound tag (Option_<inner>, Result_<ok>_<err>,
+// Map_<k>_<v>), where the codegen encoding is lowercase (Option_str, not
+// Option_Str). Struct/enum inners carry their stripped name, matching
+// compound_tag_from_ca's `if sn != "" { sn } else { c_type_tag(ct) }`.
+fn tc_tid_scalar_tag(tid: Int) -> Str {
+    if tid < 0 || tid >= ty_pool.len() { return "void" }
+    let k = ty_pool.get(tid).unwrap().kind
+    if k == TK_INT { return "int" }
+    if k == TK_FLOAT { return "double" }
+    if k == TK_BOOL { return "bool" }
+    if k == TK_STR { return "str" }
+    if k == TK_LIST { return "list" }
+    if k == TK_ITERATOR { return "iter" }
+    if k == TK_HANDLE { return "handle" }
+    if k == TK_CHANNEL { return "channel" }
+    if k == TK_MAP { return "map" }
+    if k == TK_SET { return "set" }
+    if k == TK_BYTES { return "bytes" }
+    if k == TK_OPTION { return "option" }
+    if k == TK_RESULT { return "result" }
+    if k == TK_I8 { return "i8" }
+    if k == TK_I16 { return "i16" }
+    if k == TK_I32 { return "i32" }
+    if k == TK_U8 { return "u8" }
+    if k == TK_U16 { return "u16" }
+    if k == TK_U32 { return "u32" }
+    if k == TK_U64 { return "u64" }
+    if k == TK_CHAR { return "char" }
+    "void"
+}
+
+// Codegen tag for the INNER of a compound carrier. Struct/enum → stripped name,
+// nested compound → recurse (Option[Result[..]]), else lowercase scalar tag.
+// Mirrors codegen_types.resolve_ann_tag's inner behavior but reads the tid
+// structurally instead of guessing from a flattened string.
+fn tc_tid_inner_tag(tid: Int) -> Str {
+    if tid < 0 || tid >= ty_pool.len() { return "void" }
+    let t = ty_pool.get(tid).unwrap()
+    let k = t.kind
+    if k == TK_STRUCT || k == TK_ENUM { return strip_module_qualifier(t.name) }
+    if k == TK_OPTION { return "Option_{tc_tid_inner_tag(t.inner1)}" }
+    if k == TK_RESULT { return "Result_{tc_tid_inner_tag(t.inner1)}_{tc_tid_inner_tag(t.inner2)}" }
+    if k == TK_MAP { return "Map_{tc_tid_inner_tag(t.inner1)}_{tc_tid_inner_tag(t.inner2)}" }
+    if k == TK_TUPLE { return tc_tid_tuple_tag(t) }
+    if k == TK_TYPEVAR { return "<tv>" }
+    tc_tid_scalar_tag(tid)
+}
+
+fn tc_tid_tuple_tag(t: TypePoolEntry) -> Str {
+    let start = t.params_start
+    let count = t.params_count
+    let mut tag = "Tuple{count}"
+    let mut i = 0
+    while i < count {
+        tag = tag.concat("_").concat(tc_tid_inner_tag(ty_param_list.get(start + i).unwrap()))
+        i = i + 1
+    }
+    tag
+}
+
+// TOP-LEVEL CSV-segment form for a tid: the string that, concatenated onto a
+// generic base by mangle_generic_name, reproduces the current monomorphized C
+// symbol. This is the tid-driven twin of infer_fn_type_args_from_types' per-
+// segment resolution:
+//   - struct/enum      → stripped name        (arg_sn branch)
+//   - Option/Result    → Option_/Result_ tag  (compound_tag_from_ca branch)
+//   - List/Set/Map/... → Pascal name          (type_name_from_ct erasure)
+//   - scalars          → Pascal name
+//   - typevar          → "<tv>" poison sentinel — a concrete call must never
+//                        carry an unsubstituted typevar; callers gate on
+//                        tc_tid_encodable (which rejects typevars) so this is
+//                        never reached via the mono path, but it stays as a
+//                        loud tell if some future caller skips the gate.
+// Note the asymmetry vs tc_tid_inner_tag: a top-level Map segment erases to the
+// bare carrier "Map", while a Map *inside* a compound keeps its Map_<k>_<v> tag.
+// There is deliberately no TK_TUPLE case — tc_tid_encodable defers tuples to the
+// string-tag path, so a top-level tuple never reaches here (would be "Void").
+pub fn tc_tid_to_c_tag(tid: Int) -> Str {
+    if tid < 0 || tid >= ty_pool.len() { return "Void" }
+    let t = ty_pool.get(tid).unwrap()
+    let k = t.kind
+
+    if k == TK_STRUCT || k == TK_ENUM { return strip_module_qualifier(t.name) }
+    if k == TK_OPTION { return "Option_{tc_tid_inner_tag(t.inner1)}" }
+    if k == TK_RESULT { return "Result_{tc_tid_inner_tag(t.inner1)}_{tc_tid_inner_tag(t.inner2)}" }
+    if k == TK_TYPEVAR { return "<tv>" }
+
+    if k == TK_INT { return "Int" }
+    if k == TK_FLOAT { return "Float" }
+    if k == TK_BOOL { return "Bool" }
+    if k == TK_STR { return "Str" }
+    if k == TK_LIST { return "List" }
+    if k == TK_ITERATOR { return "Iterator" }
+    if k == TK_HANDLE { return "Handle" }
+    if k == TK_CHANNEL { return "Channel" }
+    if k == TK_MAP { return "Map" }
+    if k == TK_SET { return "Set" }
+    if k == TK_BYTES { return "Bytes" }
+    if k == TK_I8 { return "I8" }
+    if k == TK_I16 { return "I16" }
+    if k == TK_I32 { return "I32" }
+    if k == TK_U8 { return "U8" }
+    if k == TK_U16 { return "U16" }
+    if k == TK_U32 { return "U32" }
+    if k == TK_U64 { return "U64" }
+    if k == TK_CHAR { return "Char" }
+    "Void"
+}
+
+// Whether tc_tid_to_c_tag can faithfully encode this tid into a CSV segment that
+// byte-matches the string-tag path. False (→ defer to the old path) for any tid
+// tc_tid_to_c_tag would lose or poison: an unsubstituted typevar or unknown
+// (mono-calls-mono; substitution happens later at codegen mono-expansion), a
+// top-level tuple (tc_tid_to_c_tag has no TK_TUPLE case → would emit "Void",
+// while the string path resolves the real Tuple<n>_... carrier), and any compound
+// whose inner is itself unencodable (a nested typevar would leak "<tv>" into the
+// symbol; a nested tuple would be lost). Struct/enum/scalar/list/set/map are all
+// encodable at the top level (list/set/map erase to their bare carrier).
+fn tc_tid_encodable(tid: Int) -> Bool {
+    if tid < 0 || tid >= ty_pool.len() { return false }
+    let t = ty_pool.get(tid).unwrap()
+    let k = t.kind
+    if k == TK_TYPEVAR || k == TK_UNKNOWN || k == TK_TUPLE { return false }
+    if k == TK_OPTION { return tc_tid_encodable(t.inner1) }
+    if k == TK_RESULT { return tc_tid_encodable(t.inner1) && tc_tid_encodable(t.inner2) }
+    if k == TK_MAP { return tc_tid_encodable(t.inner1) && tc_tid_encodable(t.inner2) }
+    true
+}
+
+// A binding tid resolves to a concrete CSV segment only when tc_tid_to_c_tag can
+// encode it byte-identically to the string-tag path; otherwise defer (None), and
+// the hybrid in emit_generic_fn_call_tail falls back to infer_fn_type_args_from_
+// types for that call.
+fn tc_seg_from_tid(tid: Int) -> Option[Str] {
+    if !tc_tid_encodable(tid) { return None }
+    Some(tc_tid_to_c_tag(tid))
+}
+
+// Resolve one generic type-param `param_name` to its CSV segment from the call's
+// argument tids, mirroring the positional param/arg matching in
+// infer_fn_type_args_from_types. Three-state result:
+//   None       - a param position mentions the type-param but the tid can't
+//                express its binding: generic user-struct Box[T] and nested
+//                List[Tuple[..T..]] (typecheck does not monomorphize struct
+//                instances, so `Int` for `Box[Int]` lives only in the codegen
+//                mono registry); an unsubstituted-typevar or unknown binding
+//                (mono-calls-mono, closure-literal args carry no TK_FN tid).
+//                tc_mono_csv turns this into an overall None so the call falls
+//                back to the string-tag path that reads the mono registry.
+//   Some("")   - no param position mentions the type-param (old code leaves the
+//                segment "Void"; the caller substitutes that).
+//   Some(tag)  - resolved to a concrete CSV segment.
+fn tc_resolve_tparam_seg(param_name: Str, fn_params_sl: Int, args_sl: Int) -> Option[Str] {
+    let np = sublist_length(fn_params_sl)
+    let na = sublist_length(args_sl)
+    let mut fi = 0
+    while fi < np && fi < na {
+        let p = sublist_get(fn_params_sl, fi)
+        let ptype = node_type_name(p)
+        let arg_tid = tc_lookup_node_tid(sublist_get(args_sl, fi))
+        if ptype == param_name {
+            return tc_seg_from_tid(arg_tid)
+        } else if ptype == "List" {
+            // `xs: List[T]` - the segment is the element type. Read inner1 of
+            // the arg's List tid so a List[Foo] arg yields the element tag.
+            if arg_tid >= 0 && arg_tid < ty_pool.len() {
+                let arg_ty = ty_pool.get(arg_tid).unwrap()
+                if arg_ty.kind == TK_LIST && tc_list_param_elem_is(p, param_name) {
+                    return tc_seg_from_tid(arg_ty.inner1)
+                }
+                // List[Tuple[..T..]] or other nested shape mentioning the param:
+                // structurally beyond the flat inner1 read - defer to old path.
+                if arg_ty.kind == TK_LIST && tc_ann_mentions_param(node_type_ann(p), param_name) {
+                    return None
+                }
+            }
+        } else if ptype == "Map" {
+            if arg_tid >= 0 && arg_tid < ty_pool.len() {
+                let arg_ty = ty_pool.get(arg_tid).unwrap()
+                if arg_ty.kind == TK_MAP {
+                    let which = tc_map_param_binds(p, param_name)
+                    if which == 1 { return tc_seg_from_tid(arg_ty.inner1) }
+                    if which == 2 { return tc_seg_from_tid(arg_ty.inner2) }
+                }
+            }
+        } else if ptype == "Result" || ptype == "Option" {
+            // `r: Result[T, E]` / `o: Option[T]` - the arg tid is the concrete
+            // Result/Option; read inner1 (ok/some) or inner2 (err) per which
+            // annotation slot names the type-param.
+            if arg_tid >= 0 && arg_tid < ty_pool.len() {
+                let arg_ty = ty_pool.get(arg_tid).unwrap()
+                if arg_ty.kind == TK_RESULT || arg_ty.kind == TK_OPTION {
+                    let which = tc_compound_param_binds(p, param_name)
+                    if which == 1 { return tc_seg_from_tid(arg_ty.inner1) }
+                    if which == 2 { return tc_seg_from_tid(arg_ty.inner2) }
+                }
+            }
+        } else if ptype == "Fn" {
+            // `f: Fn(T) -> U` names a type-param in a closure position. Closure-
+            // literal args carry no structured TK_FN tid (infer_type returns
+            // TYPE_UNKNOWN for a Closure), so the binding can't be read from the
+            // tid — defer to the string-tag path (which infers it from the
+            // closure's C signature).
+            if tc_fn_param_binds(p, param_name) != -1 {
+                return None
+            }
+        } else if tc_type_is_struct(ptype) != 0 {
+            // Generic user-struct param (Box[T]): the arg's TK_STRUCT tid is by
+            // name only and carries no type-args - cannot resolve from tids.
+            if tc_ann_mentions_param(node_type_ann(p), param_name) {
+                return None
+            }
+        }
+        fi = fi + 1
+    }
+    Some("")
+}
+
+// True when param `p`'s annotation is List[<param_name>].
+fn tc_list_param_elem_is(p: Int, param_name: Str) -> Bool {
+    let ta = node_type_ann(p)
+    if ta == -1 { return false }
+    let elems_sl = node_elements(ta)
+    if elems_sl == -1 || sublist_length(elems_sl) < 1 { return false }
+    node_name(sublist_get(elems_sl, 0)) == param_name
+}
+
+// 1 if param `p` is Map[<param_name>, _], 2 if Map[_, <param_name>], else 0.
+fn tc_map_param_binds(p: Int, param_name: Str) -> Int {
+    let ta = node_type_ann(p)
+    if ta == -1 { return 0 }
+    let elems_sl = node_elements(ta)
+    if elems_sl == -1 || sublist_length(elems_sl) < 2 { return 0 }
+    if node_name(sublist_get(elems_sl, 0)) == param_name { return 1 }
+    if node_name(sublist_get(elems_sl, 1)) == param_name { return 2 }
+    0
+}
+
+// 1 if param `p` is Result[<param_name>, _] / Option[<param_name>], 2 if
+// Result[_, <param_name>], else 0.
+fn tc_compound_param_binds(p: Int, param_name: Str) -> Int {
+    let ta = node_type_ann(p)
+    if ta == -1 { return 0 }
+    let elems_sl = node_elements(ta)
+    if elems_sl == -1 || sublist_length(elems_sl) < 1 { return 0 }
+    if node_name(sublist_get(elems_sl, 0)) == param_name { return 1 }
+    if sublist_length(elems_sl) >= 2 && node_name(sublist_get(elems_sl, 1)) == param_name { return 2 }
+    0
+}
+
+// For a `Fn(...) -> R` param annotation: -2 if the return slot names the param,
+// else the 0-based Fn-param index that names it, else -1.
+fn tc_fn_param_binds(p: Int, param_name: Str) -> Int {
+    let ta = node_type_ann(p)
+    if ta == -1 { return -1 }
+    if node_return_type(ta) == param_name { return -2 }
+    let elems_sl = node_elements(ta)
+    if elems_sl == -1 { return -1 }
+    let mut i = 0
+    while i < sublist_length(elems_sl) {
+        if node_name(sublist_get(elems_sl, i)) == param_name { return i }
+        i = i + 1
+    }
+    -1
+}
+
+// Whether a type annotation names `param_name` anywhere in its element tree.
+// Distinguishes "this position mentions the type-param but the tid can't express
+// it" (-> defer via None) from "this position is unrelated" (-> keep scanning).
+fn tc_ann_mentions_param(ann: Int, param_name: Str) -> Bool {
+    if ann == -1 { return false }
+    if node_name(ann) == param_name { return true }
+    let elems_sl = node_elements(ann)
+    if elems_sl == -1 { return false }
+    let mut i = 0
+    while i < sublist_length(elems_sl) {
+        if tc_ann_mentions_param(sublist_get(elems_sl, i), param_name) { return true }
+        i = i + 1
+    }
+    false
+}
+
+// tid-driven twin of infer_fn_type_args_from_types: build the per-type-param
+// CSV that mangle_generic_name consumes, resolving each segment from the call
+// argument's memoized tid instead of the codegen CT capture. Returns None when
+// any type-param can't be derived from tids (generic user-struct param, nested
+// List[Tuple], etc.) so the call falls back to the string-tag path - which is
+// also the non-generic fallthrough contract. Where it returns Some, the CSV is
+// byte-identical to the old path (enforced by the B.3 parity assert).
+pub fn tc_mono_csv(call_node: Int, fn_node: Int) -> Option[Str] {
+    let tparams_sl = node_type_params(fn_node)
+    if tparams_sl == -1 { return None }
+    let num_params = sublist_length(tparams_sl)
+    if num_params == 0 { return None }
+    let fn_params_sl = node_params(fn_node)
+    if fn_params_sl == -1 { return None }
+    let args_sl = node_args(call_node)
+    if args_sl == -1 { return None }
+
+    let mut csv = ""
+    let mut pi = 0
+    while pi < num_params {
+        if pi > 0 { csv = csv.concat(",") }
+        let param_name = node_name(sublist_get(tparams_sl, pi))
+        let seg_opt = tc_resolve_tparam_seg(param_name, fn_params_sl, args_sl)
+        if seg_opt.is_none() { return None }
+        let seg = seg_opt.unwrap()
+        csv = csv.concat(if seg != "" { seg } else { "Void" })
+        pi = pi + 1
+    }
+    Some(csv)
 }

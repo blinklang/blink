@@ -1,0 +1,68 @@
+// 7pfhc9 (subtask C): a generic fn whose monomorphized carrier is
+// Result[<struct with _ in its name>, ...]. The old canonical_struct_tag
+// heuristic canonicalized a Result_<ok>_<err> tag by SCANNING the flattened
+// string for the `_` boundary between ok and err — a struct name containing `_`
+// (Foo_Bar) could be split at the wrong underscore, yielding e.g. ok=Foo,
+// err=Bar_str. The tid path reads inner1 (ok) / inner2 (err) structurally from
+// ty_pool and never guesses, so an underscore-laden name round-trips correctly.
+
+type Foo_Bar {
+    a: Int
+}
+
+type Baz_Qux {
+    b: Int
+}
+
+// T bound by arg `ok`; err side is a scalar (Str). Exercises the
+// Result_<Foo_Bar>_str tag where the old boundary-guess is ambiguous.
+fn ok_of[T](x: T) -> Result[T, Str] {
+    Ok(x)
+}
+
+// Both type-params bound by arguments; returns Result[Foo_Bar, Baz_Qux] with a
+// struct on BOTH inner slots. The def-side return-carrier derivation used to
+// drop struct names (emitting blink_Result_void_str for the fn signature while
+// the body used blink_Result_Foo_Bar_Baz_Qux) — an invalid-initializer C error.
+fn pick[T, E](use_ok: Bool, ok: T, err: E) -> Result[T, E] {
+    if use_ok {
+        return Ok(ok)
+    }
+    Err(err)
+}
+
+test "Result[Foo_Bar, Str] mangles the underscore struct name structurally" {
+    let r: Result[Foo_Bar, Str] = ok_of(Foo_Bar { a: 41 })
+    match r {
+        Ok(v) => { assert_eq(v.a, 41) }
+        Err(_m) => { assert_eq(0, 1) }
+    }
+}
+
+test "Result[Foo_Bar, Baz_Qux] carries a struct on both inner slots" {
+    let r: Result[Foo_Bar, Baz_Qux] = pick(true, Foo_Bar { a: 41 }, Baz_Qux { b: 0 })
+    match r {
+        Ok(v) => { assert_eq(v.a, 41) }
+        Err(_e) => { assert_eq(0, 1) }
+    }
+
+    let r2: Result[Foo_Bar, Baz_Qux] = pick(false, Foo_Bar { a: 0 }, Baz_Qux { b: 7 })
+    match r2 {
+        Ok(_v) => { assert_eq(0, 1) }
+        Err(e) => { assert_eq(e.b, 7) }
+    }
+}
+
+// A tuple bound to a bare type-param `x: T`. tc_tid_to_c_tag has no TK_TUPLE
+// case (would emit "Void"), so tc_tid_encodable must DEFER tuples to the string-
+// tag path — which resolves the real Tuple<n>_... carrier. Without the defer the
+// call mangled `identity_Void` and the def emitted `blink_identity_Void(void x)`.
+fn identity[T](x: T) -> T {
+    x
+}
+
+test "tuple arg to a bare type-param defers to the string-tag carrier" {
+    let p = identity((1, 2))
+    assert_eq(p.0, 1)
+    assert_eq(p.1, 2)
+}

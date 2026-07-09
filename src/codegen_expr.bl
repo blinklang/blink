@@ -88,6 +88,7 @@ import diagnostics.{
 }
 import std.path.{path_dirname}
 import formatter.{format_expr}
+import typecheck.{tc_mono_csv, is_import_module_name}
 
 // codegen_expr.bl — Expression codegen, closures, capture analysis
 
@@ -2545,9 +2546,20 @@ fn emit_generic_struct_ret_temp(mangled: Str, struct_name: Str, temp_prefix: Str
 // expr_result_str / expr_result_type plus container inner-type globals, and
 // returns 1.
 @allow(UnrestoredMutation, IncompleteStateRestore)
-pub fn emit_generic_fn_call_tail(fn_name: Str, args_str: Str, ca: GenericCallArgs) -> Int ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
+pub fn emit_generic_fn_call_tail(node: Int, fn_name: Str, args_str: Str, ca: GenericCallArgs) -> Int ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
     let gfn_node = get_generic_fn_node(fn_name)
-    let type_args = infer_fn_type_args_from_types(gfn_node, ca)
+    // Subtask C (7pfhc9): derive the monomorphization CSV from the structured
+    // tids (tc_mono_csv) whenever they can express the binding; fall back to the
+    // string-tag inference (infer_fn_type_args_from_types) only for the shapes
+    // tids can't reach (generic user-struct param, closure-bound typevar, mono-
+    // calls-mono, tuple arg). tc_mono_csv returns Some only when it is
+    // byte-identical to the old path — tc_tid_encodable gates out every shape
+    // that would diverge — so this switch keeps Gen1==Gen2 while making the tid
+    // path the primary source: the qm01e7/295z9x/j9v92x compound-carrier cases
+    // now flow through it structurally instead of the canonical_struct_tag
+    // `_`-guess heuristic.
+    let tid_csv = tc_mono_csv(node, gfn_node)
+    let type_args = if tid_csv.is_some() { tid_csv } else { infer_fn_type_args_from_types(gfn_node, ca) }
     if type_args.is_none() {
         return 0
     }
@@ -3746,7 +3758,7 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                 map_val_types: arg_map_val_types,
                 map_val_structs: arg_map_val_structs,
             }
-            let handled = emit_generic_fn_call_tail(fn_name, args_str, ca)
+            let handled = emit_generic_fn_call_tail(node, fn_name, args_str, ca)
             if handled != 0 {
                 return
             }
