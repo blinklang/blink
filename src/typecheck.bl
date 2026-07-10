@@ -477,6 +477,19 @@ pub fn tc_is_module_used(mod_name: Str) -> Int {
 let mut tc_inc_enabled: Int = 0
 let mut tc_inc_filter: Map[Str, Int] = Map()
 
+// Set while the kvn6w8 off-path instance-tid producer re-resolves a struct's
+// type-args (`Box[Map[Float,Int]]` → recurse into `Map[Float,Int]`). Before that
+// producer existed, the struct branch of resolve_type_ann returned the bare tid
+// WITHOUT visiting the args, so validate_map_key / validate_set_elem never ran on
+// them. Those validators emit non-deduped E1400 diagnostics, so an un-suppressed
+// re-resolution would emit a net-new MapKeyNotHashable the old compiler didn't —
+// a byte-identity violation of typecheck decisions. The flag suppresses ONLY the
+// hashability diagnostics during that off-path pass; tid-building is unaffected,
+// so the captured instance tids are byte-identical either way. The live Map/Set
+// annotation (a real `let m: Map[Float,Int]`) is resolved with the flag clear and
+// still reports as before.
+let mut tc_suppress_ann_validation: Int = 0
+
 // ── Type creation ───────────────────────────────────────────────────
 
 fn new_type(kind: Int, name: Str) -> Int {
@@ -533,6 +546,30 @@ fn make_tuple_type(elem_types: List[Int]) -> Int {
     }
     let e = ty_pool.get(t).unwrap()
     ty_pool.set(t, TypePoolEntry { params_start: start, params_count: elem_types.len(), ..e })
+    t
+}
+
+// A monomorphized struct instance (`Box[Int]`): a fresh TK_STRUCT entry named
+// after the generic base, with its concrete type-args stored variadically in
+// ty_param_list[params_start .. +params_count] — exactly how make_tuple_type /
+// make_fn_type store their element/param tids. The generic base declared by a
+// `type Box[T] { .. }` keeps params_count=0; an instance carries params_count>=1.
+// This is the tid-pool representation decisions/compiler-type-representation.md
+// Q2 (5-0) mandates to close the "concrete inner lives only in codegen's string
+// mono registry" split. Foundation-only (br kvn6w8 spike): produced OFF-PATH
+// (memoized onto the annotation node's tc_node_tid slot) and read solely by the
+// tc_tid_struct_arg_* accessors — no emit reader consumes it yet, so it does not
+// intern (mirrors make_tuple_type: fresh entry per call) and stays byte-identical.
+fn make_struct_instance_type(base_name: Str, arg_types: List[Int]) -> Int {
+    let t = new_type(TK_STRUCT, base_name)
+    let start = ty_param_list.len()
+    let mut i = 0
+    while i < arg_types.len() {
+        ty_param_list.push(arg_types.get(i).unwrap())
+        i = i + 1
+    }
+    let e = ty_pool.get(t).unwrap()
+    ty_pool.set(t, TypePoolEntry { params_start: start, params_count: arg_types.len(), ..e })
     t
 }
 
@@ -1037,7 +1074,7 @@ fn resolve_type_ann(ann_node: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
             let key_ann = sublist_get(elems_sl, 0)
             let key_t = resolve_type_ann(key_ann)
             let val_t = resolve_type_ann(sublist_get(elems_sl, 1))
-            validate_map_key(key_ann)
+            if tc_suppress_ann_validation == 0 { validate_map_key(key_ann) }
             return make_map_type(key_t, val_t)
         }
         return make_map_type(TYPE_UNKNOWN, TYPE_UNKNOWN)
@@ -1046,7 +1083,7 @@ fn resolve_type_ann(ann_node: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
         if elems_sl != -1 && sublist_length(elems_sl) >= 1 {
             let elem_ann = sublist_get(elems_sl, 0)
             let elem_t = resolve_type_ann(elem_ann)
-            validate_set_elem(elem_ann)
+            if tc_suppress_ann_validation == 0 { validate_set_elem(elem_ann) }
             return make_set_type(elem_t)
         }
         return make_set_type(TYPE_UNKNOWN)
@@ -1068,10 +1105,55 @@ fn resolve_type_ann(ann_node: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
 
     let resolved = resolve_type_name(name)
     if resolved != -1 {
+        // A user struct named with concrete type-args (`Box[Int]`) also records an
+        // off-path structured instance tid; the live return is the bare generic tid,
+        // unchanged. See tc_produce_struct_instance_tid (br kvn6w8 spike).
+        if type_kind(resolved) == TK_STRUCT && elems_sl != -1 && sublist_length(elems_sl) >= 1 {
+            tc_produce_struct_instance_tid(ann_node, name, elems_sl)
+        }
         return resolved
     }
 
     make_typevar(name)
+}
+
+// OFF-PATH monomorphized-struct-instance producer (br kvn6w8 spike). Called only
+// when resolve_type_ann sees a user struct named with concrete type-args
+// (`Box[Int]`). resolve_type_ann's live return stays the bare generic tid; this
+// builds the structured instance tid and memoizes it onto the annotation node's
+// tc_node_tid slot for the tc_tid_struct_arg_* accessors to read. Byte-identical:
+// annotation nodes never reach infer_type, so this slot is otherwise -1, and no
+// emit/typecheck reader consumes an annotation-node tid (the mono CSV path reads
+// ARG-EXPRESSION node tids only). Skipped when every arg is a typevar (a generic
+// `Box[T]`): inference variables must not be interned
+// (compiler-type-representation.md:47), and an all-typevar instance carries no
+// more information than the bare tid.
+//
+// tc_suppress_ann_validation is raised over the arg re-resolution: this recursion
+// is net-new work the live struct path never did, and resolve_type_ann's Map/Set
+// branches emit non-deduped E1400 hashability diagnostics — suppressing them keeps
+// the pass byte-identical while leaving tid-building intact. Kept in its own fn
+// (not inlined into resolve_type_ann) so the save/restore idiom does not make the
+// effect analyzer flag resolve_type_ann's other unguarded mutating calls.
+fn tc_produce_struct_instance_tid(ann_node: Int, name: Str, elems_sl: Int) ! TypeCheck.Resolve, Diag.Report {
+    let saved_suppress = tc_suppress_ann_validation
+    tc_suppress_ann_validation = 1
+    let mut arg_tids: List[Int] = []
+    let mut has_concrete = 0
+    let mut ai = 0
+    while ai < sublist_length(elems_sl) {
+        let arg_t = resolve_type_ann(sublist_get(elems_sl, ai))
+        if type_kind(arg_t) != TK_TYPEVAR { has_concrete = 1 }
+        arg_tids.push(arg_t)
+        ai = ai + 1
+    }
+    tc_suppress_ann_validation = saved_suppress
+    if has_concrete != 0 {
+        let inst = make_struct_instance_type(name, arg_tids)
+        if ann_node < tc_node_tid.len() {
+            tc_node_tid.set(ann_node, inst)
+        }
+    }
 }
 
 // ── Registration from AST ───────────────────────────────────────────
@@ -2839,6 +2921,7 @@ fn init_types() ! TypeCheck.Register {
     tc_trait_tparam_count_idx.clear()
     tc_current_fn_ret = -1
     tc_current_fn_name = ""
+    tc_suppress_ann_validation = 0
     tc_errors.clear()
     tc_warnings.clear()
     depr_fn_nodes.clear()
@@ -8100,6 +8183,37 @@ pub fn tc_tid_struct(tid: Int) -> Str {
     let t = ty_pool.get(tid).unwrap()
     if t.kind == TK_STRUCT || t.kind == TK_ENUM { return strip_module_qualifier(t.name) }
     ""
+}
+
+// Monomorphized-struct-instance accessors (br kvn6w8 spike). Read the concrete
+// type-args of a struct-instance tid built by make_struct_instance_type — the
+// `Box[Int]` shape stored variadically in ty_param_list[params_start..]. These
+// are the OFF-PATH seam the later reader-switch increments consume; nothing on
+// the emit path calls them yet. Same -1 / "" sentinel contract as the inner
+// accessors above: a non-struct tid, an out-of-range idx, or a generic base
+// (params_count 0) yields 0 / -1 / "". A count of 0 distinguishes the bare
+// generic base (`Box`) from an instance (`Box[Int]`, count 1).
+pub fn tc_tid_struct_arg_count(tid: Int) -> Int {
+    if tid < 0 || tid >= ty_pool.len() { return 0 }
+    let t = ty_pool.get(tid).unwrap()
+    if t.kind != TK_STRUCT { return 0 }
+    t.params_count
+}
+
+pub fn tc_tid_struct_arg_ct(tid: Int, idx: Int) -> Int {
+    if tid < 0 || tid >= ty_pool.len() { return -1 }
+    let t = ty_pool.get(tid).unwrap()
+    if t.kind != TK_STRUCT { return -1 }
+    if idx < 0 || idx >= t.params_count { return -1 }
+    tid_inner_ct(ty_param_list.get(t.params_start + idx).unwrap())
+}
+
+pub fn tc_tid_struct_arg_struct(tid: Int, idx: Int) -> Str {
+    if tid < 0 || tid >= ty_pool.len() { return "" }
+    let t = ty_pool.get(tid).unwrap()
+    if t.kind != TK_STRUCT { return "" }
+    if idx < 0 || idx >= t.params_count { return "" }
+    tid_inner_struct(ty_param_list.get(t.params_start + idx).unwrap())
 }
 
 // mmegcb: the mangled tuple carrier name (Tuple2_int_str) for a TK_TUPLE tid,

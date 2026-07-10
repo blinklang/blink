@@ -1,0 +1,81 @@
+// Bug kvn6w8 (foundation spike): a generic struct has exactly ONE tid today
+// regardless of instantiation, so Box[Int] and Box[Str] share a tid and a
+// generic field `v: T` is stored as a permanent TK_TYPEVAR. The concrete inner
+// (Int for Box[Int]) lives only in codegen's string-CSV mono registry, never in
+// typecheck's tid pool — the "two type universes" split decisions/
+// compiler-type-representation.md Q2 (5-0) exists to close.
+//
+// The spike lands the additive representation only: a make_struct_instance_type
+// constructor (TK_STRUCT entry named "Box", params=[tid(Int)]) plus an OFF-PATH
+// producer at resolve_type_ann that memoizes the instance tid onto the
+// annotation node's tc_node_tid slot, plus read-only accessors
+// (tc_tid_struct_arg_count / _arg_ct / _arg_struct). No emit reader is switched,
+// so the change is byte-identical (Gen1==Gen2 holds; mono symbols unchanged).
+//
+// This test is the USER-FACING regression guard, NOT the spike's internal
+// verification (that is a throwaway --blink-trace probe, per the plan). It
+// locks the runtime behavior the later reader-switch increments must preserve:
+// distinct instantiations of a generic struct round-trip their own field values,
+// and the Str path is undisturbed. Green now (works via the string path); stays
+// green as readers move to the structured tid.
+
+type Box[T] {
+    value: T
+}
+
+type Pair[A, B] {
+    first: A
+    second: B
+}
+
+fn unbox[T](b: Box[T]) -> T {
+    b.value
+}
+
+test "distinct Box[Int] and Box[Str] round-trip their own field values" {
+    let bi: Box[Int] = Box { value: 42 }
+    let bs: Box[Str] = Box { value: "boxed" }
+    assert_eq(bi.value, 42)
+    assert_eq(bs.value, "boxed")
+}
+
+test "concrete-annotated Box[Int] flows through a generic fn" {
+    let bi: Box[Int] = Box { value: 7 }
+    assert_eq(unbox(bi), 7)
+}
+
+test "concrete-annotated Box[Str] control stays on the Str path" {
+    let bs: Box[Str] = Box { value: "wrapped" }
+    io.println(unbox(bs))
+    assert_eq(bs.value, "wrapped")
+}
+
+test "two-param Pair[Int, Str] keeps each field's own type" {
+    let p: Pair[Int, Str] = Pair { first: 5, second: "five" }
+    assert_eq(p.first, 5)
+    assert_eq(p.second, "five")
+}
+
+test "Pair[Str, Int] with swapped args keeps distinct field types" {
+    let p: Pair[Str, Int] = Pair { first: "count", second: 99 }
+    assert_eq(p.second, 99)
+    io.println(p.first)
+}
+
+// Regression guard (code-review finding): the off-path instance-tid producer
+// re-resolves a struct's type-args, and resolve_type_ann's Map/Set branches emit
+// non-deduped hashability diagnostics. A struct type-arg that transitively holds a
+// non-hashable Map key / Set element (Float) must NOT be rejected — the live
+// struct path never validated those args, so re-resolving them off-path must stay
+// silent (tc_suppress_ann_validation). This compiles iff the suppression holds; a
+// spurious MapKeyNotHashable would fail the build. The Map is never populated with
+// a Float key, so there is no real hashability hazard at runtime.
+test "struct type-arg holding Map[Float,_] is not spuriously rejected" {
+    let x: Box[Map[Float, Int]] = Box { value: Map() }
+    assert_eq(x.value.len(), 0)
+}
+
+test "struct type-arg holding Set[Float] is not spuriously rejected" {
+    let y: Box[Set[Float]] = Box { value: Set() }
+    assert_eq(y.value.len(), 0)
+}
