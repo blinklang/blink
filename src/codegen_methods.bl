@@ -1059,6 +1059,22 @@ fn emit_map_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int !
             set_var_name = node_name(obj_node)
         }
         let args_sl = node_args(node)
+        // A generic-struct field Map[K,V] with a typevar key is constructed with
+        // the string kops default (the concrete key type is only pinned here, by
+        // backward inference from the insert arg — hnyqe4). Rebind the still-empty
+        // map's kops to match the recovered key type before storing, so hash/eq
+        // agree with the int-keyed slot the per-op path materializes. Gated on the
+        // erased default + a concrete recovery, so a properly-typed Map[Int,Str]
+        // (erased_default=false) emits nothing — zero overhead for the common case.
+        if map_key_erased_default && key_rec.ct >= 0 {
+            let want_kops = kops_table_name(key_ct, key_sname)
+            // The map was built with blink_kops_str; only rebind when the recovered
+            // key needs a different table (a str key is already correct — skip the
+            // self-rebind no-op so Set[Str]/Map[Str,_] emit nothing).
+            if want_kops != "blink_kops_str" {
+                emit_line("blink_map_ensure_kops({obj_str}, &{want_kops});")
+            }
+        }
         emit_expr(sublist_get(args_sl, btc_arg_offset))
         let key_str = expr_result_str
         let key_expr = map_key_expr(key_str, key_ct, key_sname)
@@ -1257,6 +1273,15 @@ fn emit_set_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int !
         let rec = recover_elem_ct_from_arg(node, btc_arg_offset, set_erased_default)
         let use_ct = if rec.ct >= 0 { rec.ct } else { elem_ct }
         let use_sname = if rec.ct >= 0 { rec.sname } else { elem_sname }
+        // Rebind an erased-typevar Set's kops to the recovered element type before
+        // the first insert (hnyqe4; mirrors emit_map_method). Gated on the erased
+        // default so a resolved Set[Int]/Set[Str] emits nothing.
+        if set_erased_default && rec.ct >= 0 {
+            let want_kops = kops_table_name(use_ct, use_sname)
+            if want_kops != "blink_kops_str" {
+                emit_line("blink_set_ensure_kops({obj_str}, &{want_kops});")
+            }
+        }
         emit_expr(sublist_get(args_sl, btc_arg_offset))
         let elem_str = expr_result_str
         let elem_expr = map_key_expr(elem_str, use_ct, use_sname)

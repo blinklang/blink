@@ -688,6 +688,31 @@ BLINK_RT_FN blink_map* blink_map_new(const blink_kops* kops) {
 }
 #endif
 
+/* Rebind an as-yet-empty map's key-ops table. A generic-struct field
+   `Map[K,V]` whose key is an unresolved typevar is constructed with the string
+   kops default (the concrete key type isn't known until a later `insert` pins
+   it via backward inference — see decisions/map-runtime-architecture.md and
+   br hnyqe4). Codegen emits this call before the first insert so the map adopts
+   the correct hash/eq/stride once the key type is recovered. Only fires while
+   len==0 (no stored keys to reinterpret); if the stride changes, the keys
+   buffer is reallocated to match. A no-op when kops already matches. */
+BLINK_RT_FN void blink_map_ensure_kops(blink_map* m, const blink_kops* kops);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_map_ensure_kops(blink_map* m, const blink_kops* kops) {
+    if (m->kops == kops || m->len != 0) return;
+    size_t old_stride = blink_kops_stride(m->kops);
+    size_t new_stride = blink_kops_stride(kops);
+    m->kops = kops;
+    if (new_stride != old_stride) {
+        m->keys = blink_alloc((int64_t)(new_stride * (size_t)m->cap));
+    }
+    /* len==0 means no LIVE entries, but tombstones (state 2) from prior removes
+       may linger with stale key bytes that the new kops would misread. Clear the
+       slot states so the map is pristine for the rebound key type. */
+    memset(m->states, 0, (size_t)m->cap);
+}
+#endif
+
 BLINK_RT_FN void blink_map_grow(blink_map* m);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN void blink_map_grow(blink_map* m) {
@@ -1040,6 +1065,22 @@ BLINK_RT_FN blink_set* blink_set_new(const blink_kops* kops) {
     s->states = (uint8_t*)blink_alloc(sizeof(uint8_t) * (size_t)s->cap);
     memset(s->states, 0, (size_t)s->cap);
     return s;
+}
+#endif
+
+/* Set analogue of blink_map_ensure_kops (hnyqe4): rebind an empty set's kops
+   once the element type is pinned by the first insert's backward inference. */
+BLINK_RT_FN void blink_set_ensure_kops(blink_set* s, const blink_kops* kops);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_set_ensure_kops(blink_set* s, const blink_kops* kops) {
+    if (s->kops == kops || s->len != 0) return;
+    size_t old_stride = blink_kops_stride(s->kops);
+    size_t new_stride = blink_kops_stride(kops);
+    s->kops = kops;
+    if (new_stride != old_stride) {
+        s->items = blink_alloc((int64_t)(new_stride * (size_t)s->cap));
+    }
+    memset(s->states, 0, (size_t)s->cap);
 }
 #endif
 

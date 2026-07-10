@@ -4064,6 +4064,64 @@ pub fn mono_name_from_ann(base_name: Str, ann_node: Int, tparams_sl: Int, concre
     mangle_generic_name(base_name, mono_args)
 }
 
+// Concrete type-args CSV for a struct instance whose enclosing value context
+// names it with type arguments (e.g. `let b: GKV[Int, Str] = GKV { .. }`, or a
+// call arg `f(GKV { .. })` where f's param is `GKV[Int, Str]`). Each argument
+// name is resolved through the current fn's mono context so a nested
+// `GKV[T, Str]` inside a generic fn picks up T's concrete binding. Returns ""
+// when no in-scope annotation names this struct with the right arity.
+//
+// Prefers cg_expect_arg_ann (the call-arg/struct-field context) over
+// cg_let_target_ann, mirroring resolve_ctor_kops_elem (br 6ph073): a struct
+// literal nested inside a call arg leaves the OUTER let's cg_let_target_ann set,
+// so keying off it alone would wrongly stamp the outer instantiation onto the
+// inner literal (e.g. `let b: GKV[Int,_] = f(GKV { m: Map() })` where f wants
+// GKV[Str,_] — the inner must NOT become GKV[Int,_]). The arity check guards
+// against a same-named-but-different-shape annotation and a malformed target.
+//
+// Lets emit_struct_lit monomorphize a struct built from an empty container
+// field (Map()/Set()) — whose element type can't be inferred from field VALUES
+// — off the declared target, so the container ctor selects the right kops
+// vtable instead of the erased-typevar string default (hnyqe4).
+pub fn struct_concrete_args_from_target(sname: Str) -> Str {
+    let td = find_type_def_node(sname)
+    if td == -1 { return "" }
+    let td_tparams = node_type_params(td)
+    if td_tparams == -1 { return "" }
+    let nparams = sublist_length(td_tparams)
+    if nparams == 0 { return "" }
+    let mut ann = -1
+    if cg_expect_arg_ann != -1 && strip_module_qualifier(node_name(cg_expect_arg_ann)) == sname {
+        ann = cg_expect_arg_ann
+    } else if cg_let_target_ann != -1 && strip_module_qualifier(node_name(cg_let_target_ann)) == sname {
+        ann = cg_let_target_ann
+    }
+    if ann == -1 { return "" }
+    let elems = node_elements(ann)
+    if elems == -1 || sublist_length(elems) != nparams { return "" }
+    let mut args = ""
+    let mut ai = 0
+    while ai < sublist_length(elems) {
+        let elem = sublist_get(elems, ai)
+        // A compound arg (tuple `(Int,Str)`, `List[Int]`, `Map[..]`, `Option[..]`)
+        // flattens lossily here — node_name yields only the head ("Tuple"/"List"),
+        // dropping the inner types. That produces a wrong/undefined mono name and,
+        // for a compound Map key, an undeclared kops symbol. Bail so these fall back
+        // to field-value inference (mono tuple/struct-key support is br 0sh55p).
+        let sub = node_elements(elem)
+        if sub != -1 && sublist_length(sub) > 0 { return "" }
+        // Strip module qualifiers so the mono name matches the one the field-value
+        // inference path (type_name_from_ct) and field-access recovery compute for
+        // the same instantiation — else `GKV_othermod.Foo_Str` vs `GKV_Foo_Str`
+        // would register two divergent instances.
+        let resolved = strip_module_qualifier(resolve_tparam(node_name(elem), cg_mono_tparams_sl, cg_mono_concrete_args))
+        if ai > 0 { args = args.concat(",") }
+        args = args.concat(resolved)
+        ai = ai + 1
+    }
+    args
+}
+
 pub fn lookup_mono_instance(base: Str, args: Str) -> Str {
     let key = base.concat("\t").concat(args)
     match mono_idx.get(key) {
@@ -4510,6 +4568,27 @@ pub fn key_struct_sname_from_ann(k_ann: Int) -> Str ! Codegen.Emit {
         return kname
     }
     ""
+}
+
+// Register an already-resolved tuple C-name (e.g. "Tuple2_int_int") as a kops
+// key when it isn't yet in derive_hash_types. The annotation path
+// (key_struct_sname_from_ann) registers a tuple K from its `Tuple` annotation,
+// but a generic-fn mono over a tuple key reaches the Set()/Map() ctor with the
+// key already resolved to its C-name (the typevar substituted away), so that
+// path is skipped and the tuple never joins the hash/eq derive lists — leaving
+// kops_table_name to emit the BLINK_COMPILER_BUG sentinel (0sh55p, transitive
+// case). Registering here triggers emit_struct_hash/eq + the kops adapter emit.
+// Returns 1 when the name denotes a known tuple (registered or already present),
+// 0 otherwise (leaves non-tuple names to the caller's existing handling).
+pub fn ensure_tuple_kops_key(c_name: Str) -> Int {
+    if find_tuple_entry(c_name) < 0 { return 0 }
+    if list_contains_str(derive_hash_types, c_name) == 0 {
+        derive_hash_types.push(c_name)
+    }
+    if list_contains_str(derive_eq_types, c_name) == 0 {
+        derive_eq_types.push(c_name)
+    }
+    1
 }
 
 /// 1 if the kops table stores keys inline (key copied into slot, e.g. integers);
@@ -5819,6 +5898,14 @@ pub fn emit_struct_result_typedef(ok_tag: Str, err_tag: Str) ! Codegen.Emit {
 }
 
 pub fn type_from_name_tag(tag: Str) -> Int {
+    // Compound carrier tags (Option_.., Result_.., Map_..) name a nested
+    // container, not a scalar. Recognize their CT so a nested inner (e.g.
+    // Option[Option[Int]] whose inner tag is "Option_int") records the right
+    // compound CT instead of falling to the CT_VOID default — otherwise the
+    // middle .unwrap() dispatch guard (is_compound_ct == 0) mis-routes into the
+    // struct branch and the method is reported unresolved (msqtkd issue 2).
+    // Scoped to the same tags is_compound_tag / compound_tag_ct recognize.
+    if is_compound_tag(tag) != 0 { return compound_tag_ct(tag) }
     if tag == "int" { CT_INT }
     else if tag == "str" { CT_STRING }
     else if tag == "double" { CT_FLOAT }

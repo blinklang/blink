@@ -89,7 +89,7 @@ import codegen_stmt.{
 import typecheck.{sanitize_test_name}
 import codegen_derive.{
     deser_externs_emitted, emit_derive_fn_defs, emit_derive_fn_defs_from,
-    derive_counts_now, emit_kops_adapters_late, emit_kops_adapters_from,
+    derive_counts_now, emit_kops_adapters_late, emit_kops_adapters_from, emit_kops_forward_decls_from,
     emit_derive_forward_decls, emit_display_forward_decls, emit_display_fn_defs,
     register_derive_annotations,
     emit_promote_forward_decls, emit_promote_fn_defs,
@@ -277,6 +277,15 @@ fn flush_mono_fns_with_typedefs(start_idx: Int) ! Codegen.Emit, Codegen.Register
     let pre_s_result_count = emitted_struct_result_types.len()
     let pre_tuple_count = emitted_tuple_entries.len()
     let pre_closure_count = cg_closure_defs.len()
+    // A mono Set/Map ctor over a tuple/struct key (e.g. `seed[T]` instantiated as
+    // Set[(Int,Str)]) registers that key into derive_hash_types only while its
+    // body is emitted here — after the main emit_derive_forward_decls /
+    // emit_kops_adapters_late passes ran, and (for the pre-body flush) before the
+    // test-block pre-count is captured. Its `kops_<cn>` extern decl + adapter def
+    // are then never emitted, so the body references an undeclared symbol (0sh55p).
+    // Capture the pre-flush hash high-water mark; emit the delta's decls+defs
+    // below, positioned before the bodies (same discipline as the mono typedefs).
+    let pre_derive_counts = derive_counts_now()
     let pre_lines = cg_lines
     cg_lines = []
 
@@ -290,6 +299,13 @@ fn flush_mono_fns_with_typedefs(start_idx: Int) ! Codegen.Emit, Codegen.Register
 
     emit_tuple_types_from(pre_tuple_count)
     emit_option_result_types_from(pre_option_count, pre_result_count, pre_s_option_count, pre_s_result_count)
+
+    // kops adapter tables + derive fn defs for hash/derive types first seen in
+    // this flush's bodies (tuple/struct Set/Map keys). Emitted before the bodies
+    // so the extern decl and definition precede the referencing mono fn (0sh55p).
+    emit_derive_fn_defs_from(pre_derive_counts)
+    emit_kops_forward_decls_from(pre_derive_counts.hash)
+    emit_kops_adapters_from(pre_derive_counts.hash)
 
     // Closeable cleanup-state typedefs registered while emitting mono bodies
     // must precede the bodies that reference them (bug bshj6h).
@@ -1592,6 +1608,12 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
         }
     }
     let pre_derive_len = cg_lines.len()
+    // Hash high-water mark before the forward-decl pass. Any tuple/struct Set/Map
+    // key registered later (during a fn body — mono or not) misses the extern
+    // `kops_<cn>` decl emitted here, so its first user (e.g. a top-emitted mono
+    // fn body) references an undeclared symbol (0sh55p). A supplemental sweep
+    // after all bodies (below, at the pre-fn buffer restore) covers the delta.
+    let pre_body_hash_count = derive_counts_now().hash
     emit_derive_forward_decls()
     // Queue every nested-container Debug walker reachable from a @derive(Debug)
     // type (struct fields via tp_to_descriptor, enum-variant fields via the
@@ -1733,6 +1755,13 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
 
     let fn_def_lines = cg_lines
     cg_lines = pre_fn_lines
+
+    // Supplemental kops extern decls for tuple/struct Set/Map keys registered
+    // during fn-body emission (after emit_derive_forward_decls ran). Positioned
+    // in the top pre-fn region so the decl precedes every referencing body,
+    // including a mono fn body emitted by the flush below (0sh55p). The matching
+    // definitions come from emit_kops_adapters_late / the flush's adapter emit.
+    emit_kops_forward_decls_from(pre_body_hash_count)
 
     // Emit monomorphized type definitions discovered during function emission
     emit_all_mono_typedefs()

@@ -1,0 +1,61 @@
+// br 0sh55p: a generic-fn monomorphization that constructs a Set/Map over a
+// tuple/struct KEY (e.g. seed[T] instantiated as Set[(Int,Str)]) registers that
+// key into derive_hash_types only while its mono body is emitted — after the main
+// emit_derive_forward_decls / emit_kops_adapters_late passes. The mono body then
+// referenced `kops_<cn>` with no extern decl in scope (cc: undeclared). Fix: a
+// supplemental kops forward-decl sweep in the top pre-fn region covers keys
+// registered during fn-body emission, plus the mono flush emits decls+defs for
+// keys first-seen within the flush itself.
+
+@derive(Hash, Eq)
+type Point { x: Int, y: Int }
+
+fn seed_set[T](x: T) -> Int {
+    let mut s: Set[T] = Set()
+    s.insert(x)
+    s.len()
+}
+
+fn seed_map[K](k: K) -> Int {
+    let mut m: Map[K, Str] = Map()
+    m.insert(k, "v")
+    m.len()
+}
+
+// Two mono levels: the tuple key is discovered ONLY transitively during the mono
+// flush, never constructed at top level, so the annotation-path tuple registration
+// (key_struct_sname_from_ann) never fires — resolve_ctor_kops_elem must register
+// the resolved tuple C-name itself, else kops_table_name emits BLINK_COMPILER_BUG.
+fn inner_only[T](x: T) -> Int {
+    let mut s: Set[T] = Set()
+    s.insert(x)
+    s.len()
+}
+fn outer_only[U](y: U) -> Int { inner_only(y) }
+
+test "mono Set over tuple key links + works" {
+    assert_eq(seed_set((1, "a")), 1)
+    let mut s2: Set[(Int, Str)] = Set()
+    s2.insert((1, "a"))
+    assert(s2.contains((1, "a")))
+    assert(s2.contains((1, "a")) == true)
+}
+
+test "mono Map over tuple key links + works" {
+    assert_eq(seed_map((7, 8)), 1)
+    let mut m2: Map[(Int, Int), Str] = Map()
+    m2.insert((7, 8), "seven-eight")
+    assert_eq(m2.get((7, 8)).unwrap(), "seven-eight")
+}
+
+test "mono Set over @derive(Hash) struct key links + works" {
+    assert_eq(seed_set(Point { x: 1, y: 2 }), 1)
+    let mut sp: Set[Point] = Set()
+    sp.insert(Point { x: 1, y: 2 })
+    assert(sp.contains(Point { x: 1, y: 2 }))
+    assert(sp.contains(Point { x: 9, y: 9 }) == false)
+}
+
+test "transitive-only mono tuple key (never constructed at top level) links" {
+    assert_eq(outer_only((3, 4)), 1)
+}

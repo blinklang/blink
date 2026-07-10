@@ -60,10 +60,10 @@ import codegen_types.{
     register_mono_fn, register_mono_instance,
     resolve_import_alias, resolve_option_inner_from_ann,
     resolve_ptr_inner_c, resolve_result_inner_tag, resolve_ret_type_from_ann, resolve_struct_from_c_name,
-    resolve_tparam, resolve_variant,
+    resolve_tparam, resolve_variant, struct_concrete_args_from_target,
     result_c_type, result_c_type_mixed,
     scope_vars, set_list_elem_struct, set_list_elem_type,
-    kops_table_name, kops_elem_is_concrete, key_struct_sname_from_ann,
+    kops_table_name, kops_elem_is_concrete, key_struct_sname_from_ann, ensure_tuple_kops_key,
     set_map_types, set_map_key_struct, set_set_elem_type, set_set_elem_struct,
     set_var, set_var_closure, set_var_option, set_var_struct,
     strip_blink_prefix, strip_module_qualifier,
@@ -2480,6 +2480,12 @@ fn resolve_ctor_kops_elem(container: Str) -> CarrierInfo ! Codegen.Emit {
         return CarrierInfo { type_const: CT_VOID, struct_name: key_struct_sname_from_ann(e_ann) }
     }
     if kops_elem_is_concrete(e_name) {
+        // A generic-fn mono over a tuple key reaches here with e_name already the
+        // tuple C-name ("Tuple2_int_int") rather than the literal "Tuple", so the
+        // branch above (which registers the tuple into the hash/eq derive lists)
+        // is skipped. Register it here so kops_table_name resolves to a real
+        // adapter instead of the BLINK_COMPILER_BUG sentinel (0sh55p).
+        ensure_tuple_kops_key(e_name)
         return CarrierInfo { type_const: type_from_name(e_name), struct_name: e_name }
     }
     CarrierInfo { type_const: CT_STRING, struct_name: "" }
@@ -3532,9 +3538,18 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                 let ok_name = node_name(exp_ok_ann)
                 let err_name = node_name(exp_err_ann)
                 let saved_arg_ann = cg_expect_arg_ann
+                let saved_let_ann = cg_let_target_ann
+                // Narrow the value context to the Ok payload's own annotation
+                // before recursing. Merely clearing cg_expect_arg_ann leaves the
+                // OUTER cg_let_target_ann live, so a nested compound payload
+                // (Ok(Ok(x)) → Result[Result[..],..]) would emit the inner Ok with
+                // the OUTER carrier type (2bd4aa). Pushing exp_ok_ann makes the
+                // inner constructor's expect_arg_result_elem see its real type.
                 cg_expect_arg_ann = -1
+                cg_let_target_ann = exp_ok_ann
                 emit_expr(sublist_get(args_sl, 0))
                 cg_expect_arg_ann = saved_arg_ann
+                cg_let_target_ann = saved_let_ann
                 let ok_str = expr_result_str
                 let ok_inner_ct = expr_result_type
                 let ok_inner_struct = get_var_struct(ok_str)
@@ -3543,8 +3558,14 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                 // `Result[T, Str]`), carrier_from_elem_name leaves struct_name empty
                 // (it only sets it for a concrete struct/enum) — recover the
                 // carrier from the emitted argument's own struct/enum so the
-                // Ok payload keeps its real type.
-                if ok_c.struct_name == "" && ok_inner_struct != "" {
+                // Ok payload keeps its real type. Do NOT fire when the ok side is
+                // itself a compound (Option/Result): get_var_struct returns the
+                // compound's INNER struct ("Item" for Option[Item]), and stamping
+                // it here would make upgrade_compound_carrier's `struct_name != ""`
+                // guard early-return, erasing the carrier to blink_Result_Item_str
+                // instead of blink_Result_Option_Item_str (msqtkd). Let
+                // upgrade_compound_carrier build the compound tag from exp_ok_ann.
+                if ok_c.struct_name == "" && ok_inner_struct != "" && ok_name != "Option" && ok_name != "Result" {
                     ok_c = CarrierInfo { type_const: CT_INT, struct_name: ok_inner_struct }
                 }
                 // A compound ok/err annotation (`Result[Option[T], E]` etc.)
@@ -3649,9 +3670,15 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                 let ok_name = node_name(exp_err_result_ann)
                 let err_name = node_name(exp_err_ann)
                 let saved_arg_ann = cg_expect_arg_ann
+                let saved_let_ann = cg_let_target_ann
+                // Narrow to the Err payload's annotation (symmetric with the Ok
+                // path). Without this a nested Err(Ok(x)) → Result[.., Result[..]]
+                // emits the inner constructor with the OUTER carrier type (2bd4aa).
                 cg_expect_arg_ann = -1
+                cg_let_target_ann = exp_err_ann
                 emit_expr(sublist_get(args_sl, 0))
                 cg_expect_arg_ann = saved_arg_ann
+                cg_let_target_ann = saved_let_ann
                 let err_str = expr_result_str
                 let mut ok_c = carrier_from_elem_name(ok_name, type_from_name(ok_name))
                 // The ok side is not emitted in an Err construction; upgrade a
@@ -4725,6 +4752,23 @@ fn emit_struct_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
     let flds_sl = node_fields(node)
     let td = find_type_def_node(sname)
     let td_flds = if td != -1 { node_fields(td) } else { -1 }
+    // When the enclosing `let` target names this struct with concrete type
+    // arguments (`let b: GKV[Int, Str] = ..`), push them as the mono context for
+    // the duration of the field loop. A container field built from an empty
+    // ctor (`m: Map()`) has no field VALUE to infer its element type from, so
+    // resolve_ctor_kops_elem would see the field's key/elem typevar unresolved
+    // and fall to the string kops default → int keys hashed as strings collide
+    // (hnyqe4). With the struct's tparams bound here, resolve_tparam maps K→Int
+    // at the ctor and the right kops vtable is selected. (No-op when the target
+    // isn't annotated; the field-value inference below still runs as fallback.)
+    let target_args = struct_concrete_args_from_target(sname)
+    let td_tparams = if td != -1 { node_type_params(td) } else { -1 }
+    let saved_mono_tparams = cg_mono_tparams_sl
+    let saved_mono_args = cg_mono_concrete_args
+    if target_args != "" && td_tparams != -1 && sublist_length(td_tparams) > 0 {
+        cg_mono_tparams_sl = td_tparams
+        cg_mono_concrete_args = target_args
+    }
     let mut inits = ""
     let mut field_types: List[Int] = []
     let mut provided_fields: List[Str] = []
@@ -4812,14 +4856,27 @@ fn emit_struct_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
         }
         di = di + 1
     }
-    let type_args = infer_struct_type_args(sname, field_types)
+    cg_mono_tparams_sl = saved_mono_tparams
+    cg_mono_concrete_args = saved_mono_args
+    // The declared let-target args are authoritative when present (they name the
+    // instantiation directly); field-VALUE inference is the fallback for an
+    // unannotated `let b = GKV { .. }`. Preferring target_args also lets an empty
+    // container field (Map()/Set()) monomorphize the struct — register_mono_field_types
+    // then records the field's concrete key/value type so per-op recovery agrees
+    // with the ctor's kops choice (hnyqe4).
+    let mut mono_args = ""
+    if target_args != "" && td_tparams != -1 && sublist_length(td_tparams) > 0 {
+        mono_args = target_args
+    } else {
+        let type_args = infer_struct_type_args(sname, field_types)
+        if type_args.is_some() { mono_args = type_args.unwrap() }
+    }
     let mut struct_key = sname
-    if type_args.is_some() {
-        let ta_str = type_args.unwrap()
-        let mono_name = register_mono_instance(sname, ta_str)
+    if mono_args != "" {
+        let mono_name = register_mono_instance(sname, mono_args)
         c_type = c_type_c_name(mono_name)
         struct_key = mono_name
-        register_mono_field_types(sname, mono_name, ta_str)
+        register_mono_field_types(sname, mono_name, mono_args)
     }
     emit_line("{c_type} {tmp} = \{ {inits} };")
     set_var_struct(tmp, struct_key)

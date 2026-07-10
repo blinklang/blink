@@ -1,0 +1,60 @@
+// br msqtkd: two distinct compound-carrier bugs.
+//
+// Issue 1: Ok(<named Option var>) mis-routed the Result carrier. get_var_struct
+// on an Option-typed variable returns its INNER struct ("Item" for Option[Item]),
+// and the annotated Ok path stamped that onto ok_c.struct_name BEFORE
+// upgrade_compound_carrier, whose `struct_name != ""` guard then early-returned —
+// erasing the carrier to blink_Result_Item_str instead of blink_Result_Option_Item_str.
+// Fix: skip the inner-struct recovery when the ok side is itself Option/Result.
+//
+// Issue 2: Option[Option[T]] middle .unwrap() collapsed to Void. The nested inner
+// tag "Option_int" decoded via type_from_name_tag (scalar-only) fell to CT_VOID,
+// so the middle unwrap's dispatch guard (is_compound_ct == 0) mis-routed. Fix:
+// type_from_name_tag now maps Option_/Result_/Map_/List_/Set_ tags to their CT.
+
+type Item { id: Int }
+
+test "Ok(named Option[Item] var) keeps the Result carrier's Option payload" {
+    let it = Item { id: 9 }
+    let o: Option[Item] = Some(it)
+    let r: Result[Option[Item], Str] = Ok(o)
+    match r {
+        Ok(inner) => { assert_eq(inner.unwrap().id, 9) }
+        Err(_e) => { assert(false) }
+    }
+}
+
+test "Ok(inline Some(Item)) keeps the Result carrier's Option payload" {
+    let r: Result[Option[Item], Str] = Ok(Some(Item { id: 7 }))
+    match r {
+        Ok(inner) => { assert_eq(inner.unwrap().id, 7) }
+        Err(_e) => { assert(false) }
+    }
+}
+
+test "Option[Option[Int]] unwrap chain resolves the middle Option" {
+    let r: Result[Option[Option[Int]], Str] = Ok(Some(Some(5)))
+    match r {
+        Ok(inner) => {
+            let mid = inner.unwrap()
+            assert_eq(mid.unwrap(), 5)
+        }
+        Err(_e) => { assert(false) }
+    }
+}
+
+test "bare Option[Option[Int]] middle unwrap (no enclosing Result)" {
+    let oo: Option[Option[Int]] = Some(Some(42))
+    let mid = oo.unwrap()
+    assert_eq(mid.unwrap(), 42)
+}
+
+test "Err(named Option[Item] var) keeps the Result carrier's Option payload" {
+    let it = Item { id: 3 }
+    let o: Option[Item] = Some(it)
+    let r: Result[Int, Option[Item]] = Err(o)
+    match r {
+        Ok(_v) => { assert(false) }
+        Err(inner) => { assert_eq(inner.unwrap().id, 3) }
+    }
+}
