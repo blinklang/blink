@@ -8182,8 +8182,12 @@ pub fn tc_tid_result_err_struct(tid: Int) -> Str {
 //                        loud tell if some future caller skips the gate.
 // Note the asymmetry vs tc_tid_inner_tag: a top-level Map segment erases to the
 // bare carrier "Map", while a Map *inside* a compound keeps its Map_<k>_<v> tag.
-// There is deliberately no TK_TUPLE case — tc_tid_encodable defers tuples to the
-// string-tag path, so a top-level tuple never reaches here (would be "Void").
+// A top-level TK_TUPLE routes through tc_tid_tuple_tag — the same Tuple{n}_...
+// encoder the inner path uses — so a `x: T` param bound to a whole tuple mangles
+// to the identical carrier the string path builds from ca.struct_names (the
+// tuple's registered typedef name). tc_tid_encodable gates OUT tuples whose
+// elements are structs/enums, where the tid path's strip_module_qualifier would
+// diverge from c_type_tag_for_struct's module-prefixed spelling.
 pub fn tc_tid_to_c_tag(tid: Int) -> Str {
     if tid < 0 || tid >= ty_pool.len() { return "Void" }
     let t = ty_pool.get(tid).unwrap()
@@ -8192,6 +8196,7 @@ pub fn tc_tid_to_c_tag(tid: Int) -> Str {
     if k == TK_STRUCT || k == TK_ENUM { return strip_module_qualifier(t.name) }
     if k == TK_OPTION { return "Option_{tc_tid_inner_tag(t.inner1)}" }
     if k == TK_RESULT { return "Result_{tc_tid_inner_tag(t.inner1)}_{tc_tid_inner_tag(t.inner2)}" }
+    if k == TK_TUPLE { return tc_tid_tuple_tag(t) }
     if k == TK_TYPEVAR { return "<tv>" }
 
     if k == TK_INT { return "Int" }
@@ -8219,21 +8224,77 @@ pub fn tc_tid_to_c_tag(tid: Int) -> Str {
 // Whether tc_tid_to_c_tag can faithfully encode this tid into a CSV segment that
 // byte-matches the string-tag path. False (→ defer to the old path) for any tid
 // tc_tid_to_c_tag would lose or poison: an unsubstituted typevar or unknown
-// (mono-calls-mono; substitution happens later at codegen mono-expansion), a
-// top-level tuple (tc_tid_to_c_tag has no TK_TUPLE case → would emit "Void",
-// while the string path resolves the real Tuple<n>_... carrier), and any compound
-// whose inner is itself unencodable (a nested typevar would leak "<tv>" into the
-// symbol; a nested tuple would be lost). Struct/enum/scalar/list/set/map are all
-// encodable at the top level (list/set/map erase to their bare carrier).
+// (mono-calls-mono; substitution happens later at codegen mono-expansion), and
+// any compound whose inner is itself unencodable (a nested typevar would leak
+// "<tv>" into the symbol). Struct/enum/scalar/list/set/map are all encodable at
+// the top level (list/set/map erase to their bare carrier).
+//
+// A top-level tuple is encodable only when every element is tuple-element-safe
+// (tc_tid_tuple_encodable): the tid path spells a struct/enum element with the
+// module qualifier STRIPPED (tc_tid_inner_tag → strip_module_qualifier) while the
+// string path's c_type_tag_for_struct KEEPS the module prefix, so a tuple that
+// transitively contains a struct/enum would mangle to a different symbol. Those
+// still defer to the string path.
 fn tc_tid_encodable(tid: Int) -> Bool {
     if tid < 0 || tid >= ty_pool.len() { return false }
     let t = ty_pool.get(tid).unwrap()
     let k = t.kind
-    if k == TK_TYPEVAR || k == TK_UNKNOWN || k == TK_TUPLE { return false }
+    if k == TK_TYPEVAR || k == TK_UNKNOWN { return false }
+    if k == TK_TUPLE { return tc_tid_tuple_encodable(t) }
     if k == TK_OPTION { return tc_tid_encodable(t.inner1) }
     if k == TK_RESULT { return tc_tid_encodable(t.inner1) && tc_tid_encodable(t.inner2) }
     if k == TK_MAP { return tc_tid_encodable(t.inner1) && tc_tid_encodable(t.inner2) }
     true
+}
+
+// A tuple is encodable iff every element's tc_tid_inner_tag is byte-identical to
+// the string path's per-element tag. This slice deliberately allows only the
+// element shapes PROVEN identical, deferring the rest:
+//   - scalars (int/float/str/bool/sized-ints/char)   → same lowercase tag
+//   - List / Set / Bytes                             → tc_tid_inner_tag erases to
+//                                                       bare list/set/bytes, same
+//                                                       as resolve_tuple_ann
+//   - nested tuple over safe elements                → tc_tid_tuple_tag recurses
+//                                                       to Tuple{n}_...; the mono
+//                                                       binding matches the tuple's
+//                                                       registered carrier name
+//                                                       (verified byte-equal by A/B
+//                                                       for value-constructed args).
+//                                                       (A nested tuple in a `let`
+//                                                       TYPE ANNOTATION is a separate
+//                                                       pre-existing codegen crash,
+//                                                       br 5103fm — orthogonal here.)
+// Deferred (string path stays authoritative — the two tags DIVERGE):
+//   - struct/enum : tc_tid_inner_tag strips the module qualifier while
+//                   c_type_tag_for_struct keeps the module prefix (geo_Point vs
+//                   Point).
+//   - Map         : tc_tid_inner_tag keeps Map_<k>_<v>; a value-constructed tuple
+//                   element erases to bare "map" in resolve_tuple_ann.
+//   - Option/Result: match in the cases tested, but the string path's
+//                   erased-vs-structured spelling depends on construction context
+//                   (value vs annotation); kept deferring until proven in all.
+//   - typevar/unknown: no concrete binding yet.
+fn tc_tid_tuple_encodable(t: TypePoolEntry) -> Bool {
+    let start = t.params_start
+    let count = t.params_count
+    let mut i = 0
+    while i < count {
+        if !tc_tid_tuple_elem_encodable(ty_param_list.get(start + i).unwrap()) { return false }
+        i = i + 1
+    }
+    true
+}
+
+fn tc_tid_tuple_elem_encodable(tid: Int) -> Bool {
+    if tid < 0 || tid >= ty_pool.len() { return false }
+    let t = ty_pool.get(tid).unwrap()
+    let k = t.kind
+    if k == TK_TUPLE { return tc_tid_tuple_encodable(t) }
+    if k == TK_LIST || k == TK_SET || k == TK_BYTES { return true }
+    if k == TK_INT || k == TK_FLOAT || k == TK_BOOL || k == TK_STR || k == TK_CHAR { return true }
+    if k == TK_I8 || k == TK_I16 || k == TK_I32 { return true }
+    if k == TK_U8 || k == TK_U16 || k == TK_U32 || k == TK_U64 { return true }
+    false
 }
 
 // A binding tid resolves to a concrete CSV segment only when tc_tid_to_c_tag can
