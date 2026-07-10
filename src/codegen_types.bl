@@ -2363,8 +2363,14 @@ pub fn resolve_tuple_ann(ta: Int, tparams_sl: Int, concrete_args: Str) -> Option
         // → None) or lowering to `void`. Map tags stay bare ("Map") and fall to
         // the uniform blink_map* scalar path below. (qm01e7)
         let carrier_tag = if elem_name.starts_with("Option_") || elem_name.starts_with("Result_") { elem_name } else { "" }
+        // A nested-tuple element arrives as an annotation node named "Tuple" with
+        // no matching scalar/struct/enum type. Recurse to register the inner tuple
+        // typedef, then embed its C type BY VALUE (like a struct element). The
+        // recursion's own ensure_tuple_type runs before the outer one below, so the
+        // inner typedef is registered first; the BLINK_TD_ guard keeps emit order safe.
+        let nested_tuple = if carrier_tag == "" && elem_name_raw == "Tuple" { resolve_tuple_ann(elem_ann, tparams_sl, concrete_args) } else { None }
         let elem_t = if carrier_tag != "" { compound_tag_ct(carrier_tag) } else { type_from_name(elem_name) }
-        if carrier_tag == "" && elem_t == CT_VOID && is_struct_type(elem_name) == 0 && is_enum_type(elem_name) == 0 {
+        if carrier_tag == "" && nested_tuple.is_none() && elem_t == CT_VOID && is_struct_type(elem_name) == 0 && is_enum_type(elem_name) == 0 {
             return None
         }
         if i > 0 {
@@ -2372,7 +2378,11 @@ pub fn resolve_tuple_ann(ta: Int, tparams_sl: Int, concrete_args: Str) -> Option
             elem_types_enc = elem_types_enc.concat(",")
             elem_structs_enc = elem_structs_enc.concat(",")
         }
-        if carrier_tag != "" {
+        if nested_tuple.is_some() {
+            let inner_c_name = nested_tuple.unwrap()
+            tags = tags.concat(inner_c_name)
+            elem_structs_enc = elem_structs_enc.concat(inner_c_name)
+        } else if carrier_tag != "" {
             let canon = canonical_struct_tag(carrier_tag)
             ensure_carrier_from_tag(canon)
             tags = tags.concat(canon)
@@ -4893,6 +4903,20 @@ pub fn emit_tuple_typedef_for_tag(tag: Str) ! Codegen.Emit {
 fn emit_tuple_typedef(entry: TupleEntry) ! Codegen.Emit {
     if tuple_typedef_emitted.contains_key(entry.c_name) != 0 { return }
     tuple_typedef_emitted.insert(entry.c_name, 1)
+    // A nested-tuple element is embedded BY VALUE (its c_name lands in the `es`
+    // slot), so its typedef must precede this one. The global catch-all flush
+    // iterates in insertion order (inner registered before outer), but eager
+    // callers (emit_top_level_let, emit_struct_result/option_typedef) emit a
+    // single tag out of that order, leaving the by-value inner undeclared. Recurse
+    // into embedded tuples first; the BLINK_TD_ guard keeps it idempotent.
+    let mut d = 0
+    while d < entry.arity {
+        let dep = get_tuple_entry_elem_struct(entry.elem_structs, d)
+        if dep != "" && find_tuple_entry(dep) >= 0 {
+            emit_tuple_typedef(emitted_tuple_entries.get(find_tuple_entry(dep)).unwrap())
+        }
+        d = d + 1
+    }
     emit_td_guard_open(c_type_c_name(entry.c_name))
     emit_line("typedef struct \{")
     cg_indent = cg_indent + 1
