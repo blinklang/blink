@@ -61,7 +61,7 @@ import diagnostics.{
     WITH_PTR_BODY_TOO_COMPLEX, FFI_SCOPE_NOT_WITH_RESOURCE,
 }
 import ast.{NodeKind, is_block_bearing}
-import typecheck.{tc_lookup_node_tid, tc_tid_ct, tc_tid_struct, is_import_module_name, tc_qualifier_to_module_or_self, suggest_module_member}
+import typecheck.{tc_lookup_node_tid, tc_tid_ct, tc_tid_struct, tc_tid_tuple_sname, is_import_module_name, tc_qualifier_to_module_or_self, suggest_module_member}
 
 // Arg offset for trait-qualified builtin calls: MapOps.contains_key(m, k) has receiver at args[0]
 let mut btc_arg_offset: Int = 0
@@ -82,6 +82,16 @@ fn recover_elem_ct_from_arg(node: Int, arg_pos: Int, is_erased_default: Bool) ->
     let args_sl = node_args(node)
     if args_sl == -1 || arg_pos >= sublist_length(args_sl) { return ElemRecovery { ct: -1, sname: "" } }
     let atid = tc_lookup_node_tid(sublist_get(args_sl, arg_pos))
+    // mmegcb: a tuple element (Set[(Int,Str)] through a tuple boundary) has no
+    // scalar CT — tc_tid_ct returns -1 for TK_TUPLE. Recover its mangled carrier
+    // and route through the kops-struct box path (CT_STRUCT + sname), the same
+    // path the direct Set[(Int,Str)] uses. Guard on kops_is_struct_key so we
+    // only claim it when the tuple carrier is actually a registered kops key
+    // (the Set's construction registered it) — otherwise keep the -1 no-op.
+    let tup_sname = tc_tid_tuple_sname(atid)
+    if tup_sname != "" && kops_is_struct_key(tup_sname) {
+        return ElemRecovery { ct: CT_STRUCT, sname: tup_sname }
+    }
     let act = tc_tid_ct(atid)
     if act < 0 { return ElemRecovery { ct: -1, sname: "" } }
     ElemRecovery { ct: act, sname: tc_tid_struct(atid) }
@@ -3981,6 +3991,12 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                 }
                 expr_result_str = val_tmp
                 expr_result_type = CT_OPTION
+                // fcqfhf: refresh the option-inner ledger to describe the
+                // unwrapped result (one level shallower). Without this a chained
+                // `.unwrap().unwrap()` re-reads the stale outer-level struct tag
+                // and mis-emits the outer carrier for the second unwrap.
+                expr_option_inner = get_var_option_inner(val_tmp)
+                expr_option_inner_struct = get_var_option_inner_struct(val_tmp)
             } else if inner == CT_BYTES {
                 let opt_c = option_c_type(CT_BYTES)
                 emit_line("{opt_c} {tmp} = {obj_str};")

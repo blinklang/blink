@@ -25,7 +25,7 @@ import codegen_types.{
     closure_ret_ct, closure_sig_ret_part,
     compound_name_from_ann, compound_option_inner_name,
     option_inner_ct_from_tag, option_inner_struct_from_tag,
-    emit_line, ensure_iter_type, ensure_mixed_result_type, ev_field,
+    emit_line, ensure_carrier_from_tag, ensure_iter_type, ensure_mixed_result_type, ev_field,
     ensure_option_type, ensure_result_type, ensure_struct_option_type,
     ensure_tuple_type, tuple_struct_arity, tuple_elem_ct, tuple_elem_struct, find_tuple_entry, find_type_def_node, fresh_temp,
     get_capture_index, get_fn_node, get_fn_ret, get_fn_ret_struct,
@@ -63,7 +63,7 @@ import codegen_types.{
     resolve_tparam, resolve_variant,
     result_c_type, result_c_type_mixed,
     scope_vars, set_list_elem_struct, set_list_elem_type,
-    kops_table_name, key_struct_sname_from_ann,
+    kops_table_name, kops_elem_is_concrete, key_struct_sname_from_ann,
     set_map_types, set_map_key_struct, set_set_elem_type, set_set_elem_struct,
     set_var, set_var_closure, set_var_option, set_var_struct,
     strip_blink_prefix, strip_module_qualifier,
@@ -806,6 +806,10 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
                         let mk_type = tp_child1_kind(fa_tp)
                         let mv_type = tp_child2_kind(fa_tp)
                         let mv_struct = tp_child2_sname(fa_tp)
+                        // 37h7n3: a monomorphized generic-struct field Map[K,V]
+                        // reg-erases its typevar value to CT_VOID; set_map_types
+                        // keeps any value already resolved by insert rather than
+                        // downgrading it on this re-emit.
                         set_map_types(expr_result_str, mk_type, mv_type, mv_struct)
                     }
                 }
@@ -2438,6 +2442,49 @@ fn carrier_from_elem_name(name: Str, fallback: Int) -> CarrierInfo {
     CarrierInfo { type_const: fallback, struct_name: "" }
 }
 
+// Carrier for one side of a Result whose annotation is an Option/Result
+// (`Result[Option[T], E]` etc.). carrier_from_elem_name leaves such a side's
+// struct_name empty because the annotation name ("Option"/"Result") is neither a
+// struct nor an enum, which erases the carrier member to `blink_Result_option_…`
+// (`void ok`/`void err`) — the member is embedded by value, so it needs the
+// structured `Option_T`/`Result_.._..` tag. A `Map[K,V]` side is deliberately
+// excluded: its carrier member is a uniform `blink_map*` regardless of tag, so
+// the erased `map` tag is already correct and every other Map-result path (Err,
+// reassignment) keeps it — upgrading only one side would diverge the carrier
+// name and break assignment. Non-Option/Result sides are returned unchanged.
+fn upgrade_compound_carrier(c: CarrierInfo, ann_node: Int) -> CarrierInfo {
+    if c.struct_name != "" { return c }
+    if ann_node == -1 { return c }
+    let ct = type_from_name(node_name(ann_node))
+    if ct != CT_OPTION && ct != CT_RESULT { return c }
+    CarrierInfo { type_const: ct, struct_name: compound_name_from_ann(ann_node) }
+}
+
+// Select the kops element carrier (ct + sname) for a Set()/Map() constructor from
+// its declared container annotation. `container` is "Set" or "Map". A struct-field
+// initializer or call-arg supplies the type via cg_expect_arg_ann, not
+// cg_let_target_ann (br 6ph073); prefer it, but only when it actually names the
+// container — a let-RHS block-expr inside a call arg leaves cg_expect_arg_ann on the
+// OUTER param (e.g. Int), which must not shadow the block-local `let s: Set[..] =`'s
+// target. The string default (CT_STRING/"") is kept for an unresolved typevar
+// (generic-struct field Set[T]/Map[K,_], which typecheck never monomorphizes);
+// recover_elem_ct_from_arg corrects the kops downstream (br 6ph073/vbhc4x).
+fn resolve_ctor_kops_elem(container: Str) -> CarrierInfo ! Codegen.Emit {
+    let ann = if cg_expect_arg_ann != -1 && node_name(cg_expect_arg_ann) == container { cg_expect_arg_ann } else { cg_let_target_ann }
+    if ann == -1 || node_name(ann) != container { return CarrierInfo { type_const: CT_STRING, struct_name: "" } }
+    let ta_elems = node_elements(ann)
+    if ta_elems == -1 || sublist_length(ta_elems) < 1 { return CarrierInfo { type_const: CT_STRING, struct_name: "" } }
+    let e_ann = sublist_get(ta_elems, 0)
+    let e_name = resolve_tparam(node_name(e_ann), cg_mono_tparams_sl, cg_mono_concrete_args)
+    if e_name == "Tuple" {
+        return CarrierInfo { type_const: CT_VOID, struct_name: key_struct_sname_from_ann(e_ann) }
+    }
+    if kops_elem_is_concrete(e_name) {
+        return CarrierInfo { type_const: type_from_name(e_name), struct_name: e_name }
+    }
+    CarrierInfo { type_const: CT_STRING, struct_name: "" }
+}
+
 // Carrier for a just-emitted argument expression. Used when the carrier's
 // annotation name is an unresolved generic param (e.g. the `E` in
 // `Result[Int, E]`), so it can't name the concrete type — we recover it from
@@ -3500,7 +3547,15 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                 if ok_c.struct_name == "" && ok_inner_struct != "" {
                     ok_c = CarrierInfo { type_const: CT_INT, struct_name: ok_inner_struct }
                 }
-                let err_c = carrier_from_elem_name(err_name, type_from_name(err_name))
+                // A compound ok/err annotation (`Result[Option[T], E]` etc.)
+                // carries no struct/enum name; upgrade both sides so the carrier
+                // embeds the inner compound by value instead of erasing to
+                // `void ok`/`void err`. emit_expr above ensured the ok payload's
+                // inner typedef; ensure the (non-emitted) err side's too.
+                ok_c = upgrade_compound_carrier(ok_c, exp_ok_ann)
+                let mut err_c = carrier_from_elem_name(err_name, type_from_name(err_name))
+                err_c = upgrade_compound_carrier(err_c, exp_err_ann)
+                if err_c.struct_name != "" { ensure_carrier_from_tag(err_c.struct_name) }
                 emit_ok_result(ok_str, ok_c.type_const, err_c.type_const, ok_c.struct_name, err_c.struct_name)
                 return
             }
@@ -3598,11 +3653,17 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                 emit_expr(sublist_get(args_sl, 0))
                 cg_expect_arg_ann = saved_arg_ann
                 let err_str = expr_result_str
-                let ok_c = carrier_from_elem_name(ok_name, type_from_name(ok_name))
+                let mut ok_c = carrier_from_elem_name(ok_name, type_from_name(ok_name))
+                // The ok side is not emitted in an Err construction; upgrade a
+                // compound ok annotation and ensure its inner typedef so the
+                // carrier matches the Ok-construction of the same Result type.
+                ok_c = upgrade_compound_carrier(ok_c, exp_err_result_ann)
+                if ok_c.struct_name != "" { ensure_carrier_from_tag(ok_c.struct_name) }
                 let mut err_c = carrier_from_elem_name(err_name, expr_result_type)
                 if err_c.struct_name == "" {
                     err_c = carrier_from_emitted(err_str, expr_result_type)
                 }
+                err_c = upgrade_compound_carrier(err_c, exp_err_ann)
                 emit_err_result(err_str, ok_c.type_const, err_c.type_const, ok_c.struct_name, err_c.struct_name)
                 return
             }
@@ -3656,45 +3717,15 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
             }
         }
         if fn_name == "Map" {
-            let mut key_ct = CT_STRING
-            let mut key_sname = ""
-            if cg_let_target_ann != -1 && node_name(cg_let_target_ann) == "Map" {
-                let ta_elems = node_elements(cg_let_target_ann)
-                if ta_elems != -1 && sublist_length(ta_elems) >= 1 {
-                    let k_ann = sublist_get(ta_elems, 0)
-                    let k_name = resolve_tparam(node_name(k_ann), cg_mono_tparams_sl, cg_mono_concrete_args)
-                    if k_name == "Tuple" {
-                        key_sname = key_struct_sname_from_ann(k_ann)
-                        key_ct = CT_VOID
-                    } else {
-                        key_sname = k_name
-                        key_ct = type_from_name(key_sname)
-                    }
-                }
-            }
-            let kops = kops_table_name(key_ct, key_sname)
+            let ec = resolve_ctor_kops_elem("Map")
+            let kops = kops_table_name(ec.type_const, ec.struct_name)
             expr_result_str = "blink_map_new(&{kops})"
             expr_result_type = CT_MAP
             return
         }
         if fn_name == "Set" {
-            let mut elem_ct = CT_STRING
-            let mut elem_sname = ""
-            if cg_let_target_ann != -1 && node_name(cg_let_target_ann) == "Set" {
-                let ta_elems = node_elements(cg_let_target_ann)
-                if ta_elems != -1 && sublist_length(ta_elems) >= 1 {
-                    let e_ann = sublist_get(ta_elems, 0)
-                    let e_name = resolve_tparam(node_name(e_ann), cg_mono_tparams_sl, cg_mono_concrete_args)
-                    if e_name == "Tuple" {
-                        elem_sname = key_struct_sname_from_ann(e_ann)
-                        elem_ct = CT_VOID
-                    } else {
-                        elem_sname = e_name
-                        elem_ct = type_from_name(elem_sname)
-                    }
-                }
-            }
-            let kops = kops_table_name(elem_ct, elem_sname)
+            let ec = resolve_ctor_kops_elem("Set")
+            let kops = kops_table_name(ec.type_const, ec.struct_name)
             expr_result_str = "blink_set_new(&{kops})"
             expr_result_type = CT_SET
             // A fresh set carries no element type via the global; the let-block

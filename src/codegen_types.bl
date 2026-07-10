@@ -2993,13 +2993,22 @@ pub fn set_map_types(name: Str, key_type: Int, value_type: Int, value_name: Str)
         let sv = scope_vars.get(i).unwrap()
         if sv.name == name && tp_get_kind(sv.tp_id) == CT_MAP {
             let prior_k_sname = tp_child1_sname(sv.tp_id)
+            // 37h7n3: a re-emitted generic-struct field Map[K,V] carries an erased
+            // typevar value (CT_VOID, no struct name). Never let it clobber a
+            // value already resolved on this var — CT_VOID is not a storable map
+            // value, so an incoming erased-void with no name is always a
+            // re-registration, not a genuine reset. Mirrors the prior_k_sname
+            // key preservation above.
+            let prior_v = tp_child2_kind(sv.tp_id)
+            let val_erased = value_type == CT_VOID && value_name == ""
+            let eff_value_type = if val_erased && prior_v >= 0 && prior_v != CT_VOID { prior_v } else { value_type }
             let new_tp = if prior_k_sname != "" {
-                let new_v = if value_type >= 0 { sv_tp(value_type, -1, -1, sv.sname2) } else { type_int() }
+                let new_v = if eff_value_type >= 0 { sv_tp(eff_value_type, -1, -1, sv.sname2) } else { type_int() }
                 type_map(type_struct(prior_k_sname), new_v)
             } else {
-                sv_tp(sv.ctype, key_type, value_type, sv.sname)
+                sv_tp(sv.ctype, key_type, eff_value_type, sv.sname)
             }
-            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: key_type, inner2: value_type, sname: sv.sname, sname2: sv.sname2, extra: sv.extra, tp_id: new_tp })
+            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: key_type, inner2: eff_value_type, sname: sv.sname, sname2: sv.sname2, extra: sv.extra, tp_id: new_tp })
             if (value_type == CT_VOID || value_type == CT_STRUCT || value_type == CT_ENUM) && value_name != "" && is_named_type(value_name) != 0 {
                 set_map_value_struct(name, value_name)
             }
@@ -4448,6 +4457,17 @@ pub fn kops_table_name(ct: Int, sname: Str) -> Str {
 
 pub fn kops_is_struct_key(sname: Str) -> Bool {
     sname != "" && list_contains_str(derive_hash_types, sname) != 0
+}
+
+// True when a resolved Set/Map element name denotes a concrete type whose kops
+// table can be selected at the Set()/Map() ctor site: a recognized primitive
+// (type_from_name != CT_VOID) or a named struct/enum. Returns false for an
+// unresolved typevar (e.g. a generic-struct field's `Set[T]`, which typecheck
+// never monomorphizes) so the ctor keeps the string default and downstream
+// recover_elem_ct_from_arg picks the real kops (br 6ph073/vbhc4x).
+pub fn kops_elem_is_concrete(name: Str) -> Bool {
+    if type_from_name(name) != CT_VOID { return true }
+    is_named_type(name) != 0
 }
 
 /// Resolve a Map key type annotation to the C struct sname used by the kops
