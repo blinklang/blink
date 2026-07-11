@@ -354,6 +354,16 @@ fn tc_type_id_has_display(tid: Int) -> Int {
         }
         return 1
     }
+    // Key the Display-impl lookup on the struct/enum BASE name, not type_to_str:
+    // a monomorphized instance tid renders as "Box[Int]" but tc_display_impl_types
+    // is keyed on the bare declared name "Box" (node_name(im) at registration).
+    // Using type_to_str here would miss the impl for any generic struct value that
+    // now carries an instance tid (br qw7v90 regression). strip_module_qualifier
+    // mirrors the bare key form; for non-struct/enum kinds type_to_str already
+    // returns the plain scalar name, so fall back to it.
+    if k == TK_STRUCT || k == TK_ENUM {
+        return tc_type_has_display_impl(strip_module_qualifier(ty_pool.get(tid).unwrap().name))
+    }
     tc_type_has_display_impl(type_to_str(tid))
 }
 
@@ -630,15 +640,36 @@ fn resolve_type_name(name: Str) -> Int ! TypeCheck.Resolve {
 }
 
 fn get_struct_field_tid(struct_tid: Int, fname: Str) -> Int {
+    // Field entries are registered against the BASE declaration tid (register_
+    // struct_type). A monomorphized instance tid (Box[Int], a fresh entry sharing
+    // the base name — br qw7v90) must normalize back to that base before matching,
+    // or field lookups on any instance-typed value return -1. tc_struct_base_tid
+    // is a no-op for a bare tid.
+    let base = tc_struct_base_tid(struct_tid)
     let mut i = 0
     while i < sfield_pool.len() {
         let sf = sfield_pool.get(i).unwrap()
-        if sf.struct_id == struct_tid && sf.name == fname {
+        if sf.struct_id == base && sf.name == fname {
             return sf.type_id
         }
         i = i + 1
     }
     -1
+}
+
+// Normalize a possibly-monomorphized struct instance tid (Box[Int]) to its base
+// declaration tid (Box), by name (br qw7v90). Any consumer that maps a struct tid
+// back to declaration-level data keyed on the base tid (fields; anything using
+// sf.struct_id) must normalize first. A bare tid, a non-struct tid, or an
+// unresolvable name returns the input unchanged.
+fn tc_struct_base_tid(tid: Int) -> Int {
+    if tid < 0 || tid >= ty_pool.len() { return tid }
+    let t = ty_pool.get(tid).unwrap()
+    if t.kind != TK_STRUCT { return tid }
+    if t.params_count == 0 { return tid }
+    let base = lookup_named_type(strip_module_qualifier(t.name))
+    if base == -1 { return tid }
+    base
 }
 
 fn get_variant_by_name(enum_tid: Int, vname: Str) -> Int {
@@ -1105,11 +1136,19 @@ fn resolve_type_ann(ann_node: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
 
     let resolved = resolve_type_name(name)
     if resolved != -1 {
-        // A user struct named with concrete type-args (`Box[Int]`) also records an
-        // off-path structured instance tid; the live return is the bare generic tid,
-        // unchanged. See tc_produce_struct_instance_tid (br kvn6w8 spike).
+        // A user struct named with concrete type-args (`Box[Int]`) resolves to the
+        // structured instance tid on the LIVE path (br qw7v90, increment B): the
+        // annotation side must carry the specialization so a concrete param/let
+        // type (Box[Int]) compares by name+params against a reverse-inferred
+        // literal (Box[Str]) — the two must be able to mismatch. Consumers that map
+        // a struct tid back to its declaration (fields, derives) normalize
+        // instance→base by name, so the fresh instance entry is safe. The instance
+        // is still memoized onto the annotation node's tc_node_tid slot for the
+        // tc_tid_struct_arg_* accessors. Falls back to the bare tid when no concrete
+        // arg is present (all-typevar `Box[T]`).
         if type_kind(resolved) == TK_STRUCT && elems_sl != -1 && sublist_length(elems_sl) >= 1 {
-            tc_produce_struct_instance_tid(ann_node, name, elems_sl)
+            let inst = tc_produce_struct_instance_tid(ann_node, name, elems_sl)
+            if inst != -1 { return inst }
         }
         return resolved
     }
@@ -1135,7 +1174,7 @@ fn resolve_type_ann(ann_node: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
 // the pass byte-identical while leaving tid-building intact. Kept in its own fn
 // (not inlined into resolve_type_ann) so the save/restore idiom does not make the
 // effect analyzer flag resolve_type_ann's other unguarded mutating calls.
-fn tc_produce_struct_instance_tid(ann_node: Int, name: Str, elems_sl: Int) ! TypeCheck.Resolve, Diag.Report {
+fn tc_produce_struct_instance_tid(ann_node: Int, name: Str, elems_sl: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
     let saved_suppress = tc_suppress_ann_validation
     tc_suppress_ann_validation = 1
     let mut arg_tids: List[Int] = []
@@ -1153,7 +1192,74 @@ fn tc_produce_struct_instance_tid(ann_node: Int, name: Str, elems_sl: Int) ! Typ
         if ann_node < tc_node_tid.len() {
             tc_node_tid.set(ann_node, inst)
         }
+        return inst
     }
+    -1
+}
+
+// LIVE reverse-inference of a struct literal's concrete instance tid (br qw7v90,
+// increment B of the codegen-structured-tids epic). Given the bare generic tid
+// (`Box`) and the StructLit node, unify each declared generic field type (which
+// holds TK_TYPEVAR for a generic field, e.g. Box.value: T) against the inferred
+// type of the corresponding literal field VALUE, collecting typevar→concrete
+// binds. If at least one type-param binds to a concrete (non-typevar) type, build
+// the structured instance tid (make_struct_instance_type, args in the decl's
+// type-param order) and return it; otherwise fall back to the bare `stid`.
+//
+// Fallback (bare) is the correct answer when the literal carries no concrete
+// information: an all-typevar field, or an empty-collection field (`Box { value:
+// Map() }`) whose value infers Map[?,?] with no reachable concrete inner. The
+// instance tid meeting the bare tid stays compatible (types_compatible bare~any),
+// so returning bare never causes a spurious mismatch — it only forgoes the
+// stronger check when nothing is knowable, exactly like the annotation side.
+//
+// A missing decl node (should not happen for a resolved struct) or a non-generic
+// struct (no type params) short-circuits to bare — no instance is minted for a
+// monomorphic struct, keeping the pool free of redundant entries.
+fn tc_struct_lit_instance_tid(stid: Int, sname: Str, node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let bare = strip_module_qualifier(sname)
+    let decl = tc_struct_decl_nodes.get(bare) ?? -1
+    if decl == -1 { return stid }
+    let tparams_sl = node_type_params(decl)
+    if tparams_sl == -1 || sublist_length(tparams_sl) == 0 { return stid }
+    let flds_sl = node_fields(node)
+    if flds_sl == -1 { return stid }
+    let mut binds: Map[Str, Int] = Map()
+    let mut fi = 0
+    while fi < sublist_length(flds_sl) {
+        let f = sublist_get(flds_sl, fi)
+        let fname = node_name(f)
+        let declared = get_struct_field_tid(stid, fname)
+        if declared != -1 {
+            unify_typevar_binds(declared, infer_type(node_value(f)), binds)
+        }
+        fi = fi + 1
+    }
+    // Decide whether any type-param bound to a concrete (non-typevar) type BEFORE
+    // building the arg list, so the no-concrete fallback (empty Map(), all-typevar
+    // fields) does not mint throwaway typevar pool entries on the hot inference
+    // path — it returns the bare tid untouched.
+    let mut has_concrete = 0
+    let mut ci = 0
+    while ci < sublist_length(tparams_sl) {
+        let bound = binds.get(node_name(sublist_get(tparams_sl, ci))) ?? -1
+        if bound != -1 && type_kind(bound) != TK_TYPEVAR { has_concrete = 1 }
+        ci = ci + 1
+    }
+    if has_concrete == 0 { return stid }
+    let mut arg_tids: List[Int] = []
+    let mut ti = 0
+    while ti < sublist_length(tparams_sl) {
+        let tpname = node_name(sublist_get(tparams_sl, ti))
+        let bound = binds.get(tpname) ?? -1
+        if bound != -1 {
+            arg_tids.push(bound)
+        } else {
+            arg_tids.push(make_typevar(tpname))
+        }
+        ti = ti + 1
+    }
+    make_struct_instance_type(bare, arg_tids)
 }
 
 // ── Registration from AST ───────────────────────────────────────────
@@ -5734,7 +5840,30 @@ fn types_compatible(a0: Int, b0: Int) -> Int {
             return 1
         }
         if ka == TK_STRUCT || ka == TK_ENUM {
-            return 0
+            // Nominal equality by base name first (mirrors the TK_TUPLE branch
+            // above). Two struct/enum tids are compatible iff they name the same
+            // declaration; the module qualifier is stripped on both sides so a
+            // qualified and bare reference to the same type still match (precedent:
+            // strip_module_qualifier at tc_type_name callers below).
+            if strip_module_qualifier(ta.name) != strip_module_qualifier(tb.name) { return 0 }
+            // Same declaration: a generic struct carries its concrete type-args as
+            // params (Box[Int] built by make_struct_instance_type). If BOTH sides
+            // carry params, they must specialize identically — element-wise like a
+            // tuple (br 2bh76q). If EITHER is the bare generic (params_count 0), it
+            // is the un-specialized form and matches any specialization of the same
+            // name (bare Box ~ Box[Int]); enums have no params → this is a no-op and
+            // the branch reduces to the old name-only (a==b) behavior for them.
+            if ta.params_count > 0 && tb.params_count > 0 {
+                if ta.params_count != tb.params_count { return 0 }
+                let mut si = 0
+                while si < ta.params_count {
+                    let sea = ty_param_list.get(ta.params_start + si).unwrap()
+                    let seb = ty_param_list.get(tb.params_start + si).unwrap()
+                    if types_compatible(sea, seb) == 0 { return 0 }
+                    si = si + 1
+                }
+            }
+            return 1
         }
         return 1
     }
@@ -6939,7 +7068,12 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 let stid = lookup_named_type(sname)
                 if stid != -1 {
                     check_deprecated_type(sname, node)
-                    return stid
+                    // Reverse-infer the concrete instance tid (Box[Int]) from the
+                    // field values so the literal carries its specialization, not the
+                    // bare generic tid (br qw7v90). Falls back to the bare stid when
+                    // no concrete bind is discoverable (all-typevar / empty
+                    // collection fields).
+                    return tc_struct_lit_instance_tid(stid, sname, node)
                 }
                 // 3) global-unique variant.
                 let n = count_enums_with_variant(sname)
@@ -8026,7 +8160,27 @@ fn type_to_str(tid: Int) -> Str {
     if k == TK_U64 { return "U64" }
     if k == TK_UNKNOWN { return "?" }
     if k == TK_TYPEVAR { return name }
-    if k == TK_STRUCT { return name }
+    if k == TK_STRUCT {
+        // Monomorphized struct instance (Box[Int]): render its concrete type-args so
+        // diagnostics read "expects Box[Int], got Box[Str]" instead of an ambiguous
+        // bare "Box" on both sides (br qw7v90). A bare generic struct (params_count
+        // 0) renders as the plain name.
+        if t.params_count > 0 {
+            let start = t.params_start
+            let count = t.params_count
+            let mut targs = ""
+            let mut i = 0
+            while i < count {
+                if i > 0 {
+                    targs = targs.concat(", ")
+                }
+                targs = targs.concat(type_to_str(ty_param_list.get(start + i).unwrap()))
+                i = i + 1
+            }
+            return "{strip_module_qualifier(name)}[{targs}]"
+        }
+        return name
+    }
     if k == TK_ENUM { return name }
 
     if k == TK_LIST {
