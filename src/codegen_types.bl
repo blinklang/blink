@@ -4900,6 +4900,39 @@ pub fn emit_tuple_typedef_for_tag(tag: Str) ! Codegen.Emit {
     }
 }
 
+// A tuple element that is Option[T]/Result[T,E] embeds its carrier typedef
+// (blink_Option_Cmd / blink_Result_int_str) BY VALUE, so that carrier must be
+// declared before the tuple typedef. The global flush emits option/result
+// carriers before tuples, but the per-flush passes (flush_mono_fns_with_typedefs,
+// the fn-body flush) emit tuples first, and a carrier may be registered in the
+// same window; so recurse into the carrier the way emit_tuple_typedef already
+// recurses into nested-tuple deps. Mirrors the reverse dependency already coded
+// in emit_struct_option/result_typedef (which emit their inner tuple). Each
+// emitter dedups via option/result_typedef_emitted, so this is idempotent
+// regardless of emit order (mn55f7).
+fn emit_carrier_typedef_for_tag(tag: Str) ! Codegen.Emit {
+    if tag.starts_with("Option_") {
+        let inner = tag.slice(7, tag.len())
+        let inner_ct = type_from_name_tag(inner)
+        if inner_ct != CT_VOID {
+            emit_option_typedef(inner_ct)
+        } else {
+            emit_struct_option_typedef(inner)
+        }
+    } else if tag.starts_with("Result_") {
+        let parts = split_result_compound(canonical_struct_tag(tag))
+        if parts.second != "" {
+            let ok_ct = type_from_name_tag(parts.first)
+            let err_ct = type_from_name_tag(parts.second)
+            if ok_ct != CT_VOID && err_ct != CT_VOID {
+                emit_result_typedef(ok_ct, err_ct)
+            } else {
+                emit_struct_result_typedef(parts.first, parts.second)
+            }
+        }
+    }
+}
+
 fn emit_tuple_typedef(entry: TupleEntry) ! Codegen.Emit {
     if tuple_typedef_emitted.contains_key(entry.c_name) != 0 { return }
     tuple_typedef_emitted.insert(entry.c_name, 1)
@@ -4914,6 +4947,10 @@ fn emit_tuple_typedef(entry: TupleEntry) ! Codegen.Emit {
         let dep = get_tuple_entry_elem_struct(entry.elem_structs, d)
         if dep != "" && find_tuple_entry(dep) >= 0 {
             emit_tuple_typedef(emitted_tuple_entries.get(find_tuple_entry(dep)).unwrap())
+        } else if dep != "" && (dep.starts_with("Option_") || dep.starts_with("Result_")) {
+            // An Option[T]/Result[T,E] element embeds its carrier typedef by
+            // value; emit the carrier before this tuple (mn55f7).
+            emit_carrier_typedef_for_tag(dep)
         }
         d = d + 1
     }

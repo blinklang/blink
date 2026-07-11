@@ -1,0 +1,92 @@
+// Bug mn55f7: an Option[Struct]/Result[Struct,_] tuple element lost its carrier
+// typedef ORDERING at codegen. A tuple whose element is Option[Cmd] embeds the
+// carrier `blink_Option_Cmd` BY VALUE inside `blink_Tuple2_Option_Cmd_str`, but
+// the per-flush emit passes (flush_mono_fns_with_typedefs and the fn-body flush)
+// emit tuple typedefs BEFORE option/result carriers, so the carrier reference
+// landed undefined ("unknown type name 'blink_Option_Cmd'"; cc then read the
+// field init as `int` and rejected the match scrutinee `blink_Option_Cmd
+// _scrut = t._0;` with "invalid initializer").
+//
+// emit_tuple_typedef already recurses into embedded nested-tuple deps (and the
+// reverse dependency — a carrier embedding a tuple — was already coded in
+// emit_struct_option/result_typedef). The fix mirrors that: emit_tuple_typedef
+// now emits any embedded Option_*/Result_* carrier typedef before the tuple
+// (emit_carrier_typedef_for_tag), so the by-value dependency precedes the
+// referencing tuple regardless of the per-flush order.
+//
+// Both the flat literal `(Option[Cmd], Str)` and the generic-tuple path
+// (`wrap[T]` instantiated at Option[Cmd]) reproduced with the SAME undefined
+// carrier symptom; the read/scrutinee path was already correct in both. Red
+// before the fix (cc failure); green after.
+
+type Cmd { id: Int }
+type MyErr { code: Int }
+
+fn wrap[T](x: T) -> (T, Int) { (x, 1) }
+
+test "flat (Option[Struct], Str) tuple element matches through field access" {
+    let p: (Option[Cmd], Str) = (Some(Cmd { id: 42 }), "x")
+    let mut got = 0
+    match p.0 {
+        Some(cmd) => got = cmd.id
+        None => got = -1
+    }
+    assert_eq(got, 42)
+    assert_eq(p.1, "x")
+}
+
+test "generic-tuple Option[Struct] preserves carrier through tuple boundary" {
+    let o: Option[Cmd] = Some(Cmd { id: 7 })
+    let t = wrap(o)
+    let mut got = 0
+    match t.0 {
+        Some(cmd) => got = cmd.id
+        None => got = -1
+    }
+    assert_eq(got, 7)
+    assert_eq(t.1, 1)
+}
+
+test "generic-tuple Option[Struct] None arm" {
+    let o: Option[Cmd] = None
+    let t = wrap(o)
+    let mut got = 0
+    match t.0 {
+        Some(cmd) => got = cmd.id
+        None => got = -99
+    }
+    assert_eq(got, -99)
+}
+
+test "generic-tuple Result[Struct,Struct] preserves carrier through tuple boundary" {
+    let r: Result[Cmd, MyErr] = Ok(Cmd { id: 5 })
+    let t = wrap(r)
+    let mut got = 0
+    match t.0 {
+        Ok(c) => got = c.id
+        Err(e) => got = -e.code
+    }
+    assert_eq(got, 5)
+}
+
+test "flat (Result[Struct,Struct], Str) tuple element Err arm" {
+    let p: (Result[Cmd, MyErr], Str) = (Err(MyErr { code: 3 }), "z")
+    let mut got = 0
+    match p.0 {
+        Ok(c) => got = c.id
+        Err(e) => got = e.code
+    }
+    assert_eq(got, 3)
+    assert_eq(p.1, "z")
+}
+
+test "scalar Option[Int] tuple element stays undisturbed" {
+    let so: Option[Int] = Some(99)
+    let t = wrap(so)
+    let mut got = 0
+    match t.0 {
+        Some(n) => got = n
+        None => got = -1
+    }
+    assert_eq(got, 99)
+}
