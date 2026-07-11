@@ -1,0 +1,69 @@
+// br 365fqj (increment C of the codegen-structured-tids epic, kvn6w8): a generic
+// field accessed on a struct INSTANCE value must carry the concrete inner type,
+// not the bare declared typevar. `b.value` where `b: Box[Int]` should infer `Int`,
+// not `T`. Before C, FieldAccess returned the raw typevar field tid, so any
+// downstream consumer that needs the concrete type had to recover it from a
+// method-argument's memoized tid (the recover_elem_ct_from_arg fallback in
+// test_jkdywb / vbhc4x). C teaches infer_type to substitute the instance's
+// type-args into the field tid at the access site, so the FIELD tid itself now
+// carries the concrete inner.
+//
+// C is the TYPECHECK-side producer only (per the ticket: "infer_type must
+// substitute the field's declared TK_TYPEVAR with the instance's concrete arg …
+// downstream loses the type"). C's discriminating behavior — `b.value.value`
+// where `b: Box[Box[Int]]` now INFERS `Int` rather than a bare typevar — is
+// codegen-masked at runtime: the scalar-field C-type reader still resolves the
+// field through the string-mono universe (emits `void`), and switching that
+// reader is increment D (3xvjcy). The red/green proof of C therefore lives in the
+// parked file `.tmp/3xvjcy/test_3xvjcy_scalar_field_chain.bl`, where `blink check`
+// passes (C's inference) while `blink test` fails at cc (D's codegen gap); it
+// promotes into tests/ when D lands. xfail/parking (0e7152) is not yet implemented
+// to keep it as an xfail in-tree.
+//
+// The Set/Map cases below are REGRESSION GUARDS, not red/green proofs: they pass
+// both before and after C (int/struct element recovery already worked via the
+// vbhc4x arg-node fallback). With C the field access infers the concrete element
+// (`b.s : Set[Int]`) BEFORE that fallback runs, so recovery now flows through the
+// instance field tid — the observable output is identical, but the path is the
+// one D consumes. They lock in that the tid-substitution path keeps them green.
+
+type NineBox { n: Int }
+type SetField[T] { s: Set[T] }
+type MapField[K] { m: Map[K, NineBox] }
+
+@derive(Hash, Eq)
+type Point { x: Int, y: Int }
+
+// ── Set/Map field element recovery through the instance field tid ─────
+
+test "generic-struct Set[Int] field element recovered via instance tid" {
+    let mut b: SetField[Int] = SetField { s: Set() }
+    b.s.insert(256)
+    b.s.insert(512)
+    assert_eq(b.s.len(), 2)
+    assert(b.s.contains(256))
+    assert(!b.s.contains(9))
+}
+
+test "generic-struct Map[Int,Struct] key recovered via instance tid" {
+    let b: MapField[Int] = MapField { m: Map() }
+    b.m.insert(5, NineBox { n: 9 })
+    assert(b.m.contains_key(5))
+    assert_eq(b.m.get(5).unwrap().n, 9)
+}
+
+test "generic-struct Set[Point] struct element recovered via instance tid" {
+    let mut b: SetField[Point] = SetField { s: Set() }
+    b.s.insert(Point { x: 1, y: 2 })
+    assert(b.s.contains(Point { x: 1, y: 2 }))
+    assert(!b.s.contains(Point { x: 9, y: 9 }))
+}
+
+// GREEN control: a Str-keyed field must stay on the natural pointer path — the
+// substituted concrete inner must be Str, never overriding onto the int/kops path.
+test "generic-struct Set[Str] field stays undisturbed (default path)" {
+    let mut b: SetField[Str] = SetField { s: Set() }
+    b.s.insert("x")
+    assert(b.s.contains("x"))
+    assert(!b.s.contains("y"))
+}

@@ -781,6 +781,26 @@ fn substitute_typevar_tid(t: Int, binds: Map[Str, Int]) -> Int {
         if changed == 0 { return t }
         return make_tuple_type(elems)
     }
+    if k == TK_STRUCT {
+        // A monomorphized struct instance (`Box[T]`, params_count>=1) may embed a
+        // typevar in a type-arg; substitute each and rebuild via make_struct_
+        // instance_type. Same aliasing guard as TK_TUPLE: make_struct_instance_type
+        // appends to ty_param_list (the array we read e.params_start.. from), so
+        // finish the read into `elems` FIRST. The bare generic base (params_count 0)
+        // has no type-args — the loop is empty, changed stays 0, `t` returns as-is.
+        let mut elems: List[Int] = []
+        let mut changed = 0
+        let mut i = 0
+        while i < e.params_count {
+            let orig = ty_param_list.get(e.params_start + i).unwrap()
+            let sub = substitute_typevar_tid(orig, binds)
+            if sub != orig { changed = 1 }
+            elems.push(sub)
+            i = i + 1
+        }
+        if changed == 0 { return t }
+        return make_struct_instance_type(e.name, elems)
+    }
     // TK_FN and every scalar/nominal kind: no embedded typevar to rewrite.
     t
 }
@@ -818,6 +838,23 @@ fn unify_typevar_binds(ptid: Int, atid: Int, binds: Map[Str, Int]) {
         return
     }
     if pk == TK_TUPLE {
+        if pe.params_count != ae.params_count { return }
+        let mut i = 0
+        while i < pe.params_count {
+            let pc = ty_param_list.get(pe.params_start + i).unwrap()
+            let ac = ty_param_list.get(ae.params_start + i).unwrap()
+            unify_typevar_binds(pc, ac, binds)
+            i = i + 1
+        }
+        return
+    }
+    if pk == TK_STRUCT {
+        // A generic struct param (`b: Box[T]`) binds its typevars from a struct-
+        // instance arg (`Box[Int]`). Structs are nominal — the base names must match
+        // (module-qualifier-stripped) as well as the arity, unlike the structural
+        // tuple case above. Walk the type-args in lockstep. A bare generic base (no
+        // args, params_count 0) has nothing to bind and the loop is empty.
+        if strip_module_qualifier(pe.name) != strip_module_qualifier(ae.name) { return }
         if pe.params_count != ae.params_count { return }
         let mut i = 0
         while i < pe.params_count {
@@ -1235,15 +1272,21 @@ fn tc_struct_lit_instance_tid(stid: Int, sname: Str, node: Int) -> Int ! TypeChe
         }
         fi = fi + 1
     }
-    // Decide whether any type-param bound to a concrete (non-typevar) type BEFORE
-    // building the arg list, so the no-concrete fallback (empty Map(), all-typevar
-    // fields) does not mint throwaway typevar pool entries on the hot inference
-    // path — it returns the bare tid untouched.
+    // Decide whether any type-param bound to a concrete type BEFORE building the
+    // arg list, so the no-concrete fallback does not mint throwaway pool entries on
+    // the hot inference path — it returns the bare tid untouched. "Concrete" here
+    // excludes BOTH a typevar AND TYPE_UNKNOWN: an empty `Map()`/`Set()` field binds
+    // its param to TYPE_UNKNOWN (make_map_type(TYPE_UNKNOWN,..)), and an instance
+    // whose args are all unknown carries no more information than the bare tid.
+    // Minting it would produce a `GKV[?,?]` whose field access substitutes to a
+    // CT_VOID inner and defeats codegen's erased-default recovery (br 365fqj). A
+    // MIXED instance (one arg concrete, one unknown) still mints — the arg-list
+    // builder keeps the unknown arg, and the field-access consumer skips it.
     let mut has_concrete = 0
     let mut ci = 0
     while ci < sublist_length(tparams_sl) {
         let bound = binds.get(node_name(sublist_get(tparams_sl, ci))) ?? -1
-        if bound != -1 && type_kind(bound) != TK_TYPEVAR { has_concrete = 1 }
+        if bound != -1 && type_kind(bound) != TK_TYPEVAR && type_kind(bound) != TK_UNKNOWN { has_concrete = 1 }
         ci = ci + 1
     }
     if has_concrete == 0 { return stid }
@@ -7013,7 +7056,48 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         let obj_t = infer_type(obj_node)
         if type_kind(obj_t) == TK_STRUCT {
             let ft = get_struct_field_tid(obj_t, fname)
-            if ft != -1 { return ft }
+            if ft != -1 {
+                // A generic field on a struct INSTANCE (`b: Box[Int]`) carries the
+                // concrete inner, not the declared typevar: substitute the instance's
+                // type-args into the field tid so `b.value` infers `Int`, not `T`
+                // (br 365fqj). The pairing is DIRECT — the instance stores its args in
+                // declaration order, so name[i] ↔ arg[i] needs no unify_typevar_binds.
+                // A bare tid (arg_count 0) leaves the map empty and returns ft as-is.
+                //
+                // Bind ONLY genuinely-concrete args. An instance whose args are
+                // themselves unresolved — a typevar, or TYPE_UNKNOWN from an empty
+                // `Map()`/`Set()` literal (`let b = GKV { m: Map() }` mints a
+                // GKV[?,?] instance, tc_struct_lit_instance_tid) — must leave the
+                // field's typevar UNBOUND. Substituting `Map[K,V]` with `K→?` yields
+                // `Map[?,?]` whose key CT is CT_VOID, which defeats the codegen
+                // erased-default guard (recover_set_elem_from_tid keys on a -1 no-op
+                // for an unresolved inner) and regresses the arg-node element
+                // recovery (hnyqe4). Skipping the bind keeps the field typevar, so
+                // substitute_typevar_tid returns ft unchanged and the pre-C fallback
+                // path is byte-identical for the unknowable case.
+                if tc_tid_struct_arg_count(obj_t) >= 1 {
+                    let inst = ty_pool.get(obj_t).unwrap()
+                    let decl = tc_struct_decl_nodes.get(strip_module_qualifier(inst.name)) ?? -1
+                    if decl != -1 {
+                        let tparams_sl = node_type_params(decl)
+                        if tparams_sl != -1 {
+                            let mut binds: Map[Str, Int] = Map()
+                            let mut i = 0
+                            while i < sublist_length(tparams_sl) && i < inst.params_count {
+                                let tpname = node_name(sublist_get(tparams_sl, i))
+                                let arg_tid = ty_param_list.get(inst.params_start + i).unwrap()
+                                let ak = type_kind(arg_tid)
+                                if ak != TK_TYPEVAR && ak != TK_UNKNOWN {
+                                    binds.insert(tpname, arg_tid)
+                                }
+                                i = i + 1
+                            }
+                            return substitute_typevar_tid(ft, binds)
+                        }
+                    }
+                }
+                return ft
+            }
         }
         // Tuple positional access `t.0`, `t.1`, ...: the field name is the
         // numeric index into the tuple's element tids. Without this, a tuple
@@ -8586,6 +8670,17 @@ fn tc_tid_encodable(tid: Int) -> Bool {
     if k == TK_OPTION { return tc_tid_encodable(t.inner1) }
     if k == TK_RESULT { return tc_tid_encodable(t.inner1) && tc_tid_encodable(t.inner2) }
     if k == TK_MAP { return tc_tid_encodable(t.inner1) && tc_tid_encodable(t.inner2) }
+    // A module-qualified struct/enum diverges from the string path: tc_tid_to_c_tag
+    // strips the qualifier (line 8616) while c_type_tag_for_struct keeps the
+    // file-derived module prefix, so the two mangle to different mono symbols —
+    // exactly the trap the tuple-element guard (tc_tid_tuple_encodable) already
+    // defers. Top-level struct/enum args reach this path now that a generic field
+    // access on a struct instance memoizes a concrete struct tid (br 365fqj); an
+    // unqualified name (strip is a no-op) stays encodable, a qualified one defers
+    // to the string path. Same-module/user structs are unqualified → unaffected.
+    if k == TK_STRUCT || k == TK_ENUM {
+        if strip_module_qualifier(t.name) != t.name { return false }
+    }
     true
 }
 
