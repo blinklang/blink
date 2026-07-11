@@ -6295,6 +6295,50 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                     }
                     return get_variant_enum_tid(fn_name)
                 }
+                // Local lexical scope shadows module-level definitions
+                // (sections/02_syntax.md:671-680, 07_trust_modules_metadata.md:1042).
+                // A closure parameter named `f` (e.g. list_fold's `f: fn(U,T)->U`)
+                // must NOT resolve against a same-named top-level fn — doing so
+                // applied the global fn's arity to the closure call and produced a
+                // spurious TypeError inside the stdlib (br 3vfae9). When the name
+                // is bound in local scope, it wins: infer the args (so nested
+                // expressions are still type-checked) and, if the local binding is
+                // a structured fn type, arity/type-check against THAT; otherwise
+                // (closure params currently carry a bare typevar tid, not TK_FN)
+                // return its type without consulting the global fnsig.
+                let local_tid = nr_get_type(fn_name)
+                if local_tid != TYPE_UNKNOWN {
+                    let call_args_sl = node_args(node)
+                    if type_kind(local_tid) == TK_FN {
+                        let fn_ty = ty_pool.get(local_tid).unwrap()
+                        let expected = fn_ty.params_count
+                        let got = if call_args_sl != -1 { sublist_length(call_args_sl) } else { 0 }
+                        if got != expected {
+                            tc_error_at("function '{fn_name}' expects {expected} argument(s), got {got}", node)
+                        }
+                        let pstart = fn_ty.params_start
+                        let mut li = 0
+                        while li < got {
+                            let arg_tid = infer_type(sublist_get(call_args_sl, li))
+                            if li < expected {
+                                let ptid = ty_param_list.get(pstart + li).unwrap()
+                                if arg_tid != TYPE_UNKNOWN && ptid != TYPE_UNKNOWN && types_compatible(ptid, arg_tid) == 0 {
+                                    tc_error_at("function '{fn_name}' argument {li} expects {type_to_str(ptid)}, got {type_to_str(arg_tid)}", node)
+                                }
+                            }
+                            li = li + 1
+                        }
+                        return fn_ty.inner1
+                    }
+                    if call_args_sl != -1 {
+                        let mut li = 0
+                        while li < sublist_length(call_args_sl) {
+                            infer_type(sublist_get(call_args_sl, li))
+                            li = li + 1
+                        }
+                    }
+                    return TYPE_UNKNOWN
+                }
                 let sig = lookup_fnsig(fn_name)
                 if sig != -1 {
                     check_deprecated_fn(fn_name, node)

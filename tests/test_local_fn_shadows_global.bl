@@ -1,0 +1,41 @@
+// 3vfae9: a user-defined top-level fn whose name collides with a stdlib
+// higher-order fn's CLOSURE PARAMETER of the same name (e.g. list_fold's
+// `f: fn(U, T) -> U`) must NOT poison type-checking of that stdlib fn.
+//
+// Before the fix, the bare-Ident branch of infer_type's Call handling jumped
+// straight to lookup_fnsig(name) — the GLOBAL fn table — without consulting
+// local lexical scope. When list_fold's body called its closure param `f(_a, x)`
+// (2 args), the name `f` resolved to the user's global `fn f(x: Int)` (arity 1),
+// producing a spurious "function 'f' expects 1 argument(s), got 2" TypeError
+// pointing into lib/std/list.bl.
+//
+// Fix: local scope wins (sections/02_syntax.md:671-680,
+// sections/07_trust_modules_metadata.md:1042 "Local definitions shadow module
+// names"). The Call branch now consults nr_get_type(name) first; a name bound in
+// local scope bypasses the global-fnsig arity check entirely.
+import std.list { list_fold }
+
+// Global fn named `f` with arity 1 — same name as list_fold's closure param.
+fn f(x: Int) -> Int {
+    x + 1
+}
+
+fn main() {
+    // Mirror the MVCE shape: call the user global `f` on a folded value and
+    // print the pre-increment sum (3), proving both the stdlib HOF and the
+    // colliding user fn type-check and run correctly.
+    let sum = list_fold([1, 1, 1], 0, fn(acc: Int, x: Int) -> Int { acc + x })
+    let _ = f(sum)
+    io.println(sum.to_string())
+}
+
+test "user global fn f does not poison stdlib list_fold closure param f" {
+    // list_fold's closure `f` takes 2 args (acc, elem). This exercises the
+    // exact collision from br 3vfae9: type-checking list_fold must use the
+    // local closure param, not the user's arity-1 global `f`.
+    let sum = list_fold([1, 1, 1], 0, fn(acc: Int, x: Int) -> Int { acc + x })
+    // The user's own global `f` is still callable with its real arity (1).
+    let result = f(sum) // f(3) = 3 + 1 = 4
+    assert_eq(sum, 3)
+    assert_eq(result, 4)
+}
