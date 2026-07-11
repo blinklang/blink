@@ -71,7 +71,7 @@ import codegen_types.{
     set_var_struct, sf_closure_sigs, sf_entries,
     struct_field_defaults, struct_invariants, struct_option_c_type,
     struct_reg_names, struct_reg_set, struct_result_c_type, sv_tp, tp_from_ann,
-    split_result_compound, tp_child1_kind, tp_child1_sname, tp_child2_kind, tp_child2_sname,
+    split_result_compound, typedef_tag_or_empty, tp_child1_kind, tp_child1_sname, tp_child2_kind, tp_child2_sname,
     tp_get_kind, tp_get_sname, type_from_name, type_from_name_tag,
     type_name_from_ct, type_where_preds, cg_where_self_var, is_compound_tag, var_enums,
     CaptureEntry, ClosureCapInfo,
@@ -1208,6 +1208,29 @@ fn unwrap_carrier(enum_name: Str, scrut: Str, scrut_type: Int) -> UnwrapCarrier 
     UnwrapCarrier { field: field, inner_ct: inner_ct, inner_struct: inner_struct, payload_expr: payload_expr }
 }
 
+// Re-derive the carrier-shape globals (expr_result_ok/err_*, expr_option_inner_*)
+// for an INNER compound carrier when descending a collapsed nested pattern
+// (`Ok(Ok(v))`, `Some(Some(v))`, …). `unwrap_carrier` reads these globals to
+// decide the inner payload's C type; without this refresh the recursion sees the
+// OUTER carrier's shape and mistypes the innermost binder as the intermediate
+// carrier (br 5gjp2m). `inner_ct`/`inner_tag` are the just-unwrapped carrier's
+// ct + struct tag (`Result_int_str`, `Option_int`, …). Mirrors the tuple-access
+// decomposition in codegen_expr.bl.
+fn set_carrier_globals_from_inner(inner_ct: Int, inner_tag: Str) {
+    if inner_ct == CT_RESULT && inner_tag.starts_with("Result_") {
+        let rparts = split_result_compound(canonical_struct_tag(inner_tag))
+        let ok_ct = type_from_name_tag(rparts.first)
+        let err_ct = type_from_name_tag(rparts.second)
+        expr_result_ok_type = ok_ct
+        expr_result_err_type = err_ct
+        expr_result_ok_struct = if ok_ct == CT_VOID && (is_struct_type(rparts.first) != 0 || is_enum_type(rparts.first) != 0) { rparts.first } else { typedef_tag_or_empty(rparts.first) }
+        expr_result_err_struct = if err_ct == CT_VOID && (is_struct_type(rparts.second) != 0 || is_enum_type(rparts.second) != 0) { rparts.second } else { typedef_tag_or_empty(rparts.second) }
+    } else if inner_ct == CT_OPTION && inner_tag.starts_with("Option_") {
+        expr_option_inner = option_inner_ct_from_tag(inner_tag)
+        expr_option_inner_struct = option_inner_struct_from_tag(inner_tag)
+    }
+}
+
 // Resolve the owning enum of a bare (unqualified) variant pattern.
 // Prefer the statically-known scrutinee enum when it genuinely owns the
 // variant; only then is the global bare-name registry safe to consult.
@@ -1247,6 +1270,10 @@ fn transparent_payload_condition(pat: Int, scrut_off: Int) -> Str {
 // Build a C condition string for a pattern.
 // scrut_off/scrut_len index into match_scruts.
 // Returns "" when the pattern always matches (wildcard/ident).
+// The nested-carrier branch saves and restores the carrier-shape globals around
+// its recursion (br 5gjp2m); the analyzer can't see the restore across the
+// set_carrier_globals_from_inner call, hence the allow.
+@allow(UnrestoredMutation, IncompleteStateRestore)
 fn pattern_condition(pat: Int, scrut_off: Int, scrut_len: Int) -> Str {
     let pk = node_kind(pat)
     if pk == NodeKind.WildcardPattern {
@@ -1309,6 +1336,15 @@ fn pattern_condition(pat: Int, scrut_off: Int, scrut_len: Int) -> Str {
                     let uc = unwrap_carrier(enum_name, scrut, scrut_type)
                     let inner_is_enum = uc.inner_struct != "" && is_enum_type(uc.inner_struct) != 0
                     let saved_scruts = match_scruts
+                    // Re-derive the carrier-shape globals for the inner carrier
+                    // before recursing (br 5gjp2m) — otherwise the deeper
+                    // unwrap_carrier reads the OUTER carrier's shape.
+                    let saved_ok_type = expr_result_ok_type
+                    let saved_err_type = expr_result_err_type
+                    let saved_ok_struct = expr_result_ok_struct
+                    let saved_err_struct = expr_result_err_struct
+                    let saved_opt_inner = expr_option_inner
+                    let saved_opt_struct = expr_option_inner_struct
                     match_scruts = [MatchScrutEntry { str_val: uc.payload_expr, scrut_type: uc.inner_ct }]
                     let saved_enum = match_scrut_enum
                     if inner_is_enum {
@@ -1316,9 +1352,18 @@ fn pattern_condition(pat: Int, scrut_off: Int, scrut_len: Int) -> Str {
                     } else {
                         match_scrut_enum = ""
                     }
+                    if (uc.inner_ct == CT_RESULT || uc.inner_ct == CT_OPTION) && uc.inner_struct != "" {
+                        set_carrier_globals_from_inner(uc.inner_ct, uc.inner_struct)
+                    }
                     let sub_cond = pattern_condition(sub_pat2, 0, 1)
                     match_scruts = saved_scruts
                     match_scrut_enum = saved_enum
+                    expr_result_ok_type = saved_ok_type
+                    expr_result_err_type = saved_err_type
+                    expr_result_ok_struct = saved_ok_struct
+                    expr_result_err_struct = saved_err_struct
+                    expr_option_inner = saved_opt_inner
+                    expr_option_inner_struct = saved_opt_struct
                     if sub_cond != "" {
                         base = "({base} && {sub_cond})"
                     }
@@ -1695,15 +1740,33 @@ fn bind_pattern_vars(pat: Int, scrut_off: Int, scrut_len: Int) ! Codegen.Emit, C
                 let inner_is_enum = uc.inner_struct != "" && is_enum_type(uc.inner_struct) != 0
                 let saved_scruts = match_scruts
                 let saved_enum = match_scrut_enum
+                // Re-derive the carrier-shape globals for the inner carrier before
+                // recursing — unwrap_carrier reads them, and leaving the OUTER
+                // shape live mistypes the innermost binder (br 5gjp2m).
+                let saved_ok_type = expr_result_ok_type
+                let saved_err_type = expr_result_err_type
+                let saved_ok_struct = expr_result_ok_struct
+                let saved_err_struct = expr_result_err_struct
+                let saved_opt_inner = expr_option_inner
+                let saved_opt_struct = expr_option_inner_struct
                 match_scruts = [MatchScrutEntry { str_val: uc.payload_expr, scrut_type: uc.inner_ct }]
                 if inner_is_enum {
                     match_scrut_enum = uc.inner_struct
                 } else {
                     match_scrut_enum = ""
                 }
+                if (uc.inner_ct == CT_RESULT || uc.inner_ct == CT_OPTION) && uc.inner_struct != "" {
+                    set_carrier_globals_from_inner(uc.inner_ct, uc.inner_struct)
+                }
                 bind_pattern_vars(sub_pat, 0, 1)
                 match_scruts = saved_scruts
                 match_scrut_enum = saved_enum
+                expr_result_ok_type = saved_ok_type
+                expr_result_err_type = saved_err_type
+                expr_result_ok_struct = saved_ok_struct
+                expr_result_err_struct = saved_err_struct
+                expr_option_inner = saved_opt_inner
+                expr_option_inner_struct = saved_opt_struct
             }
             return
         }
