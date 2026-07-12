@@ -4595,7 +4595,7 @@ fn emit_list_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
     expr_result_type = CT_LIST
 }
 
-fn infer_struct_type_args(type_name: Str, field_types: List[Int]) -> Option[Str] {
+fn infer_struct_type_args(type_name: Str, field_types: List[Int], field_structs: List[Str]) -> Option[Str] {
     let types_sl = node_fields(cg_program_node)
     if types_sl == -1 {
         return None
@@ -4636,7 +4636,17 @@ fn infer_struct_type_args(type_name: Str, field_types: List[Int]) -> Option[Str]
             if type_ann_node != -1 {
                 let ann_name = node_name(type_ann_node)
                 if ann_name == param_name {
-                    resolved = type_name_from_ct(field_types.get(fi).unwrap())
+                    let fct = field_types.get(fi).unwrap()
+                    let fstruct = field_structs.get(fi).unwrap()
+                    // A struct/enum-instance field carries its concrete mono name
+                    // (e.g. "Box_Int") captured at the literal site; type_name_from_ct
+                    // has no CT_STRUCT/CT_ENUM case and would yield "Void", collapsing
+                    // Box[Box[Int]] to Box_Void with a `void value;` field (br 3xvjcy).
+                    if (fct == CT_STRUCT || fct == CT_ENUM) && fstruct != "" {
+                        resolved = fstruct
+                    } else {
+                        resolved = type_name_from_ct(fct)
+                    }
                 } else {
                     let sub_elems = node_elements(type_ann_node)
                     if sub_elems != -1 {
@@ -4771,6 +4781,7 @@ fn emit_struct_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
     }
     let mut inits = ""
     let mut field_types: List[Int] = []
+    let mut field_structs: List[Str] = []
     let mut provided_fields: List[Str] = []
     let mut _init_count = 0
     let mut spread_tmp = ""
@@ -4792,6 +4803,16 @@ fn emit_struct_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
             cg_expect_arg_ann = saved_arg_ann
             let val_str = expr_result_str
             field_types.push(expr_result_type)
+            // Capture the struct-instance's already-registered mono name (e.g.
+            // "Box_Int") so a struct-valued generic field infers its concrete
+            // inner instead of collapsing to type_name_from_ct(CT_STRUCT)="Void"
+            // (br 3xvjcy). Reuses the exact string the field's own literal
+            // registered via set_var_struct, so no re-spelling divergence.
+            if expr_result_type == CT_STRUCT {
+                field_structs.push(get_var_struct(val_str))
+            } else {
+                field_structs.push("")
+            }
             if _init_count > 0 {
                 inits = inits.concat(", ")
             }
@@ -4821,6 +4842,11 @@ fn emit_struct_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
                     inits = inits.concat(".{sfe.field_name} = {spread_tmp}.{sfe.field_name}")
                     provided_fields.push(sfe.field_name)
                     field_types.push(sfe.field_type)
+                    if sfe.field_type == CT_STRUCT {
+                        field_structs.push(sfe.stype)
+                    } else {
+                        field_structs.push("")
+                    }
                     _init_count = _init_count + 1
                 }
             }
@@ -4847,6 +4873,11 @@ fn emit_struct_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
                 cg_expect_arg_ann = saved_dfl_arg_ann
                 let dval = expr_result_str
                 field_types.push(expr_result_type)
+                if expr_result_type == CT_STRUCT {
+                    field_structs.push(get_var_struct(dval))
+                } else {
+                    field_structs.push("")
+                }
                 if _init_count > 0 {
                     inits = inits.concat(", ")
                 }
@@ -4868,7 +4899,7 @@ fn emit_struct_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
     if target_args != "" && td_tparams != -1 && sublist_length(td_tparams) > 0 {
         mono_args = target_args
     } else {
-        let type_args = infer_struct_type_args(sname, field_types)
+        let type_args = infer_struct_type_args(sname, field_types, field_structs)
         if type_args.is_some() { mono_args = type_args.unwrap() }
     }
     let mut struct_key = sname
