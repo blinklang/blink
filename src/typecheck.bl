@@ -8743,6 +8743,59 @@ fn tc_seg_from_tid(tid: Int) -> Option[Str] {
     Some(tc_tid_to_c_tag(tid))
 }
 
+// Whether a struct type-arg SLOT tid spells byte-identically to the string path's
+// stored mono segment (`nth_type_arg(mi.args, ei)`). This is STRICTER than the
+// general tc_tid_encodable: the string path stores a slot's segment as the arg
+// struct's registered mono name (`Box[Box[Int]]` → slot 0 = "Box_Int", the full
+// inner mono name), whereas tc_tid_to_c_tag erases a struct/enum instance to its
+// bare base ("Box"), and spells a top-level Option/Result/Map/List/Tuple slot with
+// its own carrier tag whose casing/erasure need not match what the arg registered.
+// So only the shapes PROVEN identical resolve here:
+//   - scalars (int/float/str/bool/sized-ints/char) → same Pascal tag both paths.
+//   - a BARE (params_count 0), UNQUALIFIED struct/enum → the string path stores
+//     the bare name; tc_tid_to_c_tag returns strip_module_qualifier(name) (a no-op
+//     when unqualified). This is the `Box[Inner]` case.
+// Everything else DEFERS to the string path (return false):
+//   - a struct/enum INSTANCE slot (params_count>=1, `Box[Box[Int]]`) — tid erases
+//     the inner args, string path keeps them (diverges: unbox_Box vs unbox_Box_Int).
+//   - a module-qualified struct/enum — strip diverges from the module-prefixed name.
+//   - Option/Result/Map/List/Set/Bytes/Tuple — carrier-tag spelling/casing is not
+//     provably equal to the arg's stored segment (e.g. Box[Option[Int]] diverges:
+//     tid Option_int vs string path Void/Option_Int); kept deferring until proven.
+//   - typevar/unknown — no concrete binding.
+fn tc_struct_slot_encodable(tid: Int) -> Bool {
+    if tid < 0 || tid >= ty_pool.len() { return false }
+    let t = ty_pool.get(tid).unwrap()
+    let k = t.kind
+    if k == TK_INT || k == TK_FLOAT || k == TK_BOOL || k == TK_STR || k == TK_CHAR { return true }
+    if k == TK_I8 || k == TK_I16 || k == TK_I32 { return true }
+    if k == TK_U8 || k == TK_U16 || k == TK_U32 || k == TK_U64 { return true }
+    if k == TK_STRUCT || k == TK_ENUM {
+        if t.params_count != 0 { return false }
+        return strip_module_qualifier(t.name) == t.name
+    }
+    false
+}
+
+// Resolve the CSV segment for type-arg slot `idx` of a struct-INSTANCE tid
+// (`Box[Int]`, `Pair[Int,Str]` built by make_struct_instance_type). Reads the raw
+// slot tid from ty_param_list — the same slot the dormant tc_tid_struct_arg_ct /
+// _struct accessors read. Gates the slot on tc_struct_slot_encodable (the STRICT
+// struct-slot spelling rule; NOT the general tc_tid_encodable, which would wrongly
+// accept a nested struct instance / Option slot and emit a divergent symbol) before
+// routing through tc_tid_to_c_tag. Yields None for a bare generic base (count 0),
+// an out-of-range idx, or an unencodable slot — the caller then defers to the
+// string path.
+fn tc_struct_seg_from_arg(tid: Int, idx: Int) -> Option[Str] {
+    let count = tc_tid_struct_arg_count(tid)
+    if count == 0 { return None }
+    if idx < 0 || idx >= count { return None }
+    let t = ty_pool.get(tid).unwrap()
+    let slot_tid = ty_param_list.get(t.params_start + idx).unwrap()
+    if !tc_struct_slot_encodable(slot_tid) { return None }
+    Some(tc_tid_to_c_tag(slot_tid))
+}
+
 // Resolve one generic type-param `param_name` to its CSV segment from the call's
 // argument tids, mirroring the positional param/arg matching in
 // infer_fn_type_args_from_types. Three-state result:
@@ -8812,8 +8865,31 @@ fn tc_resolve_tparam_seg(param_name: Str, fn_params_sl: Int, args_sl: Int) -> Op
                 return None
             }
         } else if tc_type_is_struct(ptype) != 0 {
-            // Generic user-struct param (Box[T]): the arg's TK_STRUCT tid is by
-            // name only and carries no type-args - cannot resolve from tids.
+            // Generic user-struct param (`Box[T]`, `Pair[A, B]`). Increments B/C
+            // (kvn6w8) give a concrete arg (`let b: Box[Int]`) a struct INSTANCE
+            // tid (TK_STRUCT, params_count>=1) carrying the type-args, so read the
+            // annotation slot that names this param, then the same slot of the arg
+            // instance tid, and resolve it through the shared tc_seg_from_tid gate.
+            // A bare generic base (count 0), an arity mismatch, or a param mentioned
+            // but inexpressible in a slot (nested compound, module-qualified struct)
+            // falls through to the existing tc_ann_mentions_param → None defer, so
+            // nothing that was on the string path starts emitting a divergent symbol.
+            if arg_tid >= 0 && arg_tid < ty_pool.len() {
+                let arg_ty = ty_pool.get(arg_tid).unwrap()
+                // Gate on the arg instance being the SAME struct base as the
+                // annotation (strip_module_qualifier(arg_ty.name) == ptype),
+                // mirroring the string path's `mi.base == ptype` guard
+                // (codegen_types.bl:3837). Without it, an arg tid that is a
+                // different struct instance (e.g. Pair[Int,Str] reaching a Box[T]
+                // param) would read the wrong slot and emit a divergent symbol.
+                if arg_ty.kind == TK_STRUCT && tc_tid_struct_arg_count(arg_tid) >= 1 && strip_module_qualifier(arg_ty.name) == ptype {
+                    let slot = tc_struct_param_binds(p, param_name)
+                    if slot >= 0 {
+                        let seg = tc_struct_seg_from_arg(arg_tid, slot)
+                        if seg.is_some() { return seg }
+                    }
+                }
+            }
             if tc_ann_mentions_param(node_type_ann(p), param_name) {
                 return None
             }
@@ -8841,6 +8917,26 @@ fn tc_map_param_binds(p: Int, param_name: Str) -> Int {
     if node_name(sublist_get(elems_sl, 0)) == param_name { return 1 }
     if node_name(sublist_get(elems_sl, 1)) == param_name { return 2 }
     0
+}
+
+// The 0-based type-arg slot in generic-struct param `p`'s annotation
+// (`Box[T]` → 0, `Pair[A, B]` → A=0 / B=1) that names `param_name`, or -1.
+// A struct can mention the param in any slot; when several do, return the LAST
+// match — mirrors the while-loop last-wins in infer_fn_type_args_from_types'
+// string-path struct branch (codegen_types.bl:3841-3850), where a later matching
+// slot overwrites `resolved`.
+fn tc_struct_param_binds(p: Int, param_name: Str) -> Int {
+    let ta = node_type_ann(p)
+    if ta == -1 { return -1 }
+    let elems_sl = node_elements(ta)
+    if elems_sl == -1 { return -1 }
+    let mut which = -1
+    let mut i = 0
+    while i < sublist_length(elems_sl) {
+        if node_name(sublist_get(elems_sl, i)) == param_name { which = i }
+        i = i + 1
+    }
+    which
 }
 
 // 1 if param `p` is Result[<param_name>, _] / Option[<param_name>], 2 if

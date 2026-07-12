@@ -1,0 +1,88 @@
+// D2 (6zmspt): a generic user-struct param `b: Box[T]` / `p: Pair[A, B]`
+// monomorphizes through tc_mono_csv on the structured-tid path. Previously the
+// STRUCT branch of tc_resolve_tparam_seg returned None (the arg's TK_STRUCT tid
+// was by-name-only), deferring every generic-struct-param call to the string-tag
+// path. Increments B/C (commits 98f5755 / a375c05) now give a `let b: Box[Int]`
+// a struct INSTANCE tid (TK_STRUCT, params_count>=1), so the call-site can read
+// the concrete inner from the arg tid and resolve the CSV segment through the
+// same tc_tid_encodable gate the tuple slice uses.
+//
+// The mono symbol must stay byte-identical to the string path
+// (blink_unbox_Int / blink_get_first_Int_Str / ...), so these lock the runtime
+// behavior: distinct instantiations round-trip their own field values, and
+// multi-tparam slot order is preserved. Module-qualified struct args still defer
+// (covered in test_cross_module_generic_fn.bl); this file exercises only the
+// unqualified same-module shapes the tid path now resolves.
+
+type Box[T] {
+    value: T
+}
+
+type Inner {
+    n: Int
+}
+
+type Pair[A, B] {
+    first: A
+    second: B
+}
+
+fn unbox[T](b: Box[T]) -> T {
+    b.value
+}
+
+fn get_first[A, B](p: Pair[A, B]) -> A {
+    p.first
+}
+
+fn get_second[A, B](p: Pair[A, B]) -> B {
+    p.second
+}
+
+test "unbox Box[Int] resolves the Int inner through the tid path" {
+    let bi: Box[Int] = Box { value: 42 }
+    assert_eq(unbox(bi), 42)
+}
+
+test "unbox Box[Str] resolves the Str inner (distinct from Int)" {
+    let bs: Box[Str] = Box { value: "boxed" }
+    assert_eq(unbox(bs), "boxed")
+}
+
+test "unbox Box[Inner] resolves a same-module struct inner" {
+    let bin: Box[Inner] = Box { value: Inner { n: 7 } }
+    let got = unbox(bin)
+    assert_eq(got.n, 7)
+}
+
+test "get_first over Pair[Int, Str] reads slot 0" {
+    let p: Pair[Int, Str] = Pair { first: 5, second: "five" }
+    assert_eq(get_first(p), 5)
+}
+
+test "get_second over Pair[Int, Str] reads slot 1" {
+    let p: Pair[Int, Str] = Pair { first: 5, second: "five" }
+    assert_eq(get_second(p), "five")
+}
+
+test "get_first over Pair[Str, Int] preserves swapped slot order" {
+    let q: Pair[Str, Int] = Pair { first: "count", second: 99 }
+    assert_eq(get_first(q), "count")
+}
+
+test "get_second over Pair[Str, Int] preserves swapped slot order" {
+    let q: Pair[Str, Int] = Pair { first: "count", second: 99 }
+    assert_eq(get_second(q), 99)
+}
+
+// NOTE on DEFER coverage: a slot that is itself a struct INSTANCE (`Box[Box[Int]]`)
+// or a compound (`Box[Option[Int]]`) must NOT resolve on the tid path —
+// tc_tid_to_c_tag would erase the inner mono args (unbox_Box vs the string path's
+// unbox_Box_Int) or spell a divergently-cased carrier. tc_struct_slot_encodable
+// defers those to the working string path (proven byte-identical: the tid path now
+// emits blink_unbox_Box_Int / blink_unbox_Void, matching pristine HEAD). These are
+// NOT runtime tests here because constructing/reading `Box[Box[Int]]` and
+// `Box[Option[Int]]` hits pre-existing codegen bugs (struct-instance-valued generic
+// field mis-monomorphizes to Box_Void; generic-fn-return-of-struct-instance loses
+// its struct type) that exist on both paths and are orthogonal to D2's call-site
+// migration. The defer is verified by the ci byte-equality gate, not a run here.
