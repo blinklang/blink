@@ -1331,8 +1331,19 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
                         reg_fn_with_effects(emit_key, ret_ct, fn_eff_sl, fn_trusted)
                         reg_fn_with_effects(fn_name, ret_ct, fn_eff_sl, fn_trusted)
                         if is_struct_type(ret_str) != 0 {
-                            reg_fn_struct_ret(emit_key, ret_str)
-                            reg_fn_struct_ret(fn_name, ret_str)
+                            // A concrete generic-struct INSTANCE return
+                            // (`-> Box[Str]`) must register its monomorphized
+                            // carrier (Box_Str), not the bare `Box`, so the
+                            // call-site `_sr` temp (get_fn_ret_struct) names
+                            // the typedef'd type. Read the instance tid the
+                            // typechecker memoized onto the return annotation
+                            // node and expand to the mono stem, mirroring the
+                            // param path (param_c_type). Empty stem (bare/
+                            // typevar/module-qualified) keeps ret_str (br ns7qdm).
+                            let ret_stem = tc_tid_struct_mono_name(tc_lookup_node_tid(node_type_ann(fn_node)))
+                            let reg_ret = if ret_stem != "" { ret_stem } else { ret_str }
+                            reg_fn_struct_ret(emit_key, reg_ret)
+                            reg_fn_struct_ret(fn_name, reg_ret)
                         }
                     }
                     reg_fn_ret_from_ann(emit_key, fn_node)
@@ -1452,7 +1463,14 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
                         }
                     } else if is_struct_type(ret_str) != 0 {
                         reg_fn(mangled, CT_VOID)
-                        reg_fn_struct_ret(mangled, ret_str)
+                        // Concrete generic-struct INSTANCE method return
+                        // (`-> Box[Str]`): register the mono carrier off the
+                        // return annotation tid so the `_sr` temp names the
+                        // typedef'd type. resolve_self_type still handles the
+                        // `Self` case (empty stem falls back) (br ns7qdm).
+                        let ret_stem = tc_tid_struct_mono_name(tc_lookup_node_tid(node_type_ann(m)))
+                        let reg_ret = if ret_stem != "" { ret_stem } else { ret_str }
+                        reg_fn_struct_ret(mangled, reg_ret)
                     } else {
                         reg_fn(mangled, type_from_name(ret_str))
                     }
@@ -1490,6 +1508,14 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
             let fn_node2 = sublist_get(fns_sl, pi)
             if is_generic_fn(node_name(fn_node2)) == 0 {
                 register_struct_instance_params(node_params(fn_node2))
+                // A concrete generic-struct instance RETURN (`-> Box[Str]`)
+                // lowers its signature/def to the mono carrier off the same
+                // return-annotation tid, so queue that carrier's typedef here
+                // too, before the fn-decl pass names it (br ns7qdm). Nesting
+                // is handled inner-first by the recursive registrar.
+                if is_struct_type(node_return_type(fn_node2)) != 0 {
+                    register_struct_instance_from_tid(tc_lookup_node_tid(node_type_ann(fn_node2)))
+                }
             }
             pi = pi + 1
         }
@@ -1497,8 +1523,10 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
     // Impl-method params reach the same param_c_type lowering via
     // format_impl_params, so their struct-instance carriers must register here
     // too — otherwise the method's forward decl names blink_Box_Str before its
-    // typedef (br wme0hh, review finding). Poly-impl (generic) methods lower T at
-    // the deferred mono pass, not here, so skip them.
+    // typedef (br wme0hh, review finding). Poly-impl (generic) methods are NOT
+    // filtered out here; they no-op safely because register_struct_instance_from_tid
+    // returns "" for a typevar-slot instance (`Box[T]`) or bare `T` — the deferred
+    // mono pass lowers those per concrete T instead.
     if impls_sl != -1 {
         let mut ii = 0
         while ii < sublist_length(impls_sl) {
@@ -1507,7 +1535,14 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
             if methods_sl != -1 {
                 let mut mj = 0
                 while mj < sublist_length(methods_sl) {
-                    register_struct_instance_params(node_params(sublist_get(methods_sl, mj)))
+                    let method_node = sublist_get(methods_sl, mj)
+                    register_struct_instance_params(node_params(method_node))
+                    // Method return carrier (`-> Box[Str]`), same rationale as
+                    // free fns above. Typevar-slot returns (poly-impl `-> T`)
+                    // and `Self` yield "" from the registrar → no-op (br ns7qdm).
+                    if is_struct_type(node_return_type(method_node)) != 0 {
+                        register_struct_instance_from_tid(tc_lookup_node_tid(node_type_ann(method_node)))
+                    }
                     mj = mj + 1
                 }
             }
@@ -1682,7 +1717,12 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
                         let ret_str_raw = node_return_type(m)
                         let ret_str = resolve_self_type(ret_str_raw, impl_type)
                         if is_struct_type(ret_str) != 0 {
-                            emit_line("{c_type_c_name(ret_str)} {c_fn_name(mangled)}({params});")
+                            // Mono carrier for a concrete generic-struct
+                            // instance method return, matching emit_impl_method_def
+                            // (br ns7qdm).
+                            let ret_stem = tc_tid_struct_mono_name(tc_lookup_node_tid(node_type_ann(m)))
+                            let ret_carrier = if ret_stem != "" { ret_stem } else { ret_str }
+                            emit_line("{c_type_c_name(ret_carrier)} {c_fn_name(mangled)}({params});")
                         } else {
                             let resolved = resolve_ret_type_from_ann(m)
                             if resolved != "" {

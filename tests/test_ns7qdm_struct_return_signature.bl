@@ -1,0 +1,85 @@
+// Bug ns7qdm (codegen-structured-tids epic, wme0hh follow-up): a NON-generic
+// function whose RETURN type is a concrete generic-struct INSTANCE
+// (`fn make_box() -> Box[Str]`) had every return seam lowered to the bare,
+// never-typedef'd `blink_Box` instead of the monomorphized `blink_Box_Str`.
+// The signature, the definition, and the call-site `_sr` temp all named the
+// bare carrier, so the emitted C failed to compile (`unknown type name
+// 'blink_Box'`). `Box[Int]` only worked by luck — the bare struct's default
+// field width is int64.
+//
+// Root cause: every return seam derived the C type from the bare annotation
+// string `node_return_type(fn_node)` (= "Box") via c_type_c_name, never
+// consulting the struct-instance tid typecheck memoized onto the return
+// annotation node. This is the return-side twin of the wme0hh param bug: the
+// param path (param_c_type) already reads that tid; the return path did not.
+// The fix mirrors the param path — read the instance tid off the return
+// annotation node and expand it to the full mono stem (Box_Str, and nested
+// Box_Box_Int correctly inner-first), else fall back to the bare string path.
+//
+// Gate: these MUST C-compile and run. Byte-identity intentionally breaks here
+// (blink_Box -> blink_Box_Str); the gate is per-symbol mono correctness.
+
+type Box[T] {
+    value: T
+}
+
+type Pair[A, B] {
+    first: A
+    second: B
+}
+
+type Maker {
+    id: Int
+}
+
+trait Makes {
+    fn make(_self) -> Box[Str]
+}
+
+fn make_str_box() -> Box[Str] {
+    Box { value: "hi" }
+}
+
+fn make_int_box() -> Box[Int] {
+    Box { value: 42 }
+}
+
+fn make_pair() -> Pair[Str, Int] {
+    Pair { first: "left", second: 7 }
+}
+
+fn make_nested() -> Box[Box[Int]] {
+    Box { value: Box { value: 99 } }
+}
+
+// Impl-method returns reach the same return lowering as free fns, so a
+// struct-instance return here must also register its carrier typedef before
+// the method's forward decl.
+impl Makes for Maker {
+    fn make(_self) -> Box[Str] {
+        Box { value: "via-impl" }
+    }
+}
+
+test "Str-instance struct return lowers to its mono carrier" {
+    assert_eq(make_str_box().value, "hi")
+}
+
+test "Int-instance struct return stays correct" {
+    assert_eq(make_int_box().value, 42)
+}
+
+test "two-param struct-instance return keeps each field type" {
+    let p = make_pair()
+    assert_eq(p.first, "left")
+    assert_eq(p.second, 7)
+}
+
+test "nested struct-instance return monomorphizes the inner (inner-first typedef)" {
+    assert_eq(make_nested().value.value, 99)
+}
+
+test "impl-method struct-instance return lowers to its mono carrier" {
+    let m = Maker { id: 1 }
+    assert_eq(m.make().value, "via-impl")
+}
