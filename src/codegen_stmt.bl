@@ -96,7 +96,7 @@ import diagnostics.{
 import pkg.manifest.{manifest_header_is_declared, manifest_name}
 import compiler.{trace}
 import stdlib_native_deps.{stdlib_native_dep_name_by_ffi_symbol}
-import typecheck.{is_import_module_name, tc_lookup_node_tid, tc_tid_struct_mono_name}
+import typecheck.{is_import_module_name, tc_lookup_node_tid, tc_tid_struct_mono_name, tc_seg_from_tid}
 
 fn strip_outer_parens(s: Str) -> Str {
     if s.starts_with("(") && s.ends_with(")") {
@@ -5631,7 +5631,37 @@ pub fn find_type_def(name: Str) -> Int {
     -1
 }
 
-pub fn register_mono_field_types(base_name: Str, mono_name: Str, concrete_args: Str) {
+// codegen-structured-tids D1b (br ec5qgb): tid-preferring twin of resolve_tparam.
+// When `param_name` is a type-param binder and the mono registry captured a
+// concrete tid for that binder's position (arg_tids, populated in Step 1), lower
+// the segment from the structured tid via tc_seg_from_tid instead of re-parsing
+// the concrete_args CSV. tc_seg_from_tid returns Some only when tc_tid_encodable
+// holds, and Step 1 populated arg_tids from the SAME tid that produced the CSV
+// segment, so the tid-derived string is byte-identical to resolve_tparam's for
+// every encodable slot — the fixed-point gate proves it. Every other case
+// (non-binder name, empty/short arg_tids, unencodable slot) falls back to the
+// string path, so a registry entry with [] arg_tids behaves exactly as before.
+fn resolve_tparam_via_tid(param_name: Str, tparams_sl: Int, concrete_args: Str, arg_tids: List[Int]) -> Str {
+    if tparams_sl != -1 {
+        let mut pi = 0
+        while pi < sublist_length(tparams_sl) {
+            if node_name(sublist_get(tparams_sl, pi)) == param_name {
+                if pi < arg_tids.len() {
+                    let seg = tc_seg_from_tid(arg_tids.get(pi).unwrap())
+                    if seg.is_some() {
+                        return seg.unwrap()
+                    }
+                }
+                pi = sublist_length(tparams_sl)
+            } else {
+                pi = pi + 1
+            }
+        }
+    }
+    resolve_tparam(param_name, tparams_sl, concrete_args)
+}
+
+pub fn register_mono_field_types(base_name: Str, mono_name: Str, concrete_args: Str, arg_tids: List[Int]) {
     // Check if already registered
     let mut check = 0
     while check < sf_entries.len() {
@@ -5659,7 +5689,7 @@ pub fn register_mono_field_types(base_name: Str, mono_name: Str, concrete_args: 
         let type_ann_node = node_value(f)
         if type_ann_node != -1 {
             let type_name = node_name(type_ann_node)
-            let resolved = resolve_tparam(type_name, tparams_sl, concrete_args)
+            let resolved = resolve_tparam_via_tid(type_name, tparams_sl, concrete_args, arg_tids)
             // A struct-INSTANCE concrete arg (e.g. Box[Box[Int]] → field arg
             // "Box_Int") has not yet entered struct_reg_set at construction time
             // (that happens at the final typedef flush), so is_struct_type is
@@ -5700,20 +5730,20 @@ pub fn register_mono_field_types(base_name: Str, mono_name: Str, concrete_args: 
                 let ct = type_from_name(resolved)
                 let inner_elems = node_elements(type_ann_node)
                 if (ct == CT_OPTION || ct == CT_LIST) && inner_elems != -1 && sublist_length(inner_elems) >= 1 {
-                    let inner_name = resolve_tparam(node_name(sublist_get(inner_elems, 0)), tparams_sl, concrete_args)
+                    let inner_name = resolve_tparam_via_tid(node_name(sublist_get(inner_elems, 0)), tparams_sl, concrete_args, arg_tids)
                     let inner_ct = type_from_name(inner_name)
                     let inner_sname = if is_struct_type(inner_name) != 0 || is_enum_type(inner_name) != 0 { inner_name } else { "" }
                     reg_sf_entry(mono_name, fname, ct, "", sv_tp(ct, inner_ct, -1, inner_sname))
                 } else if ct == CT_MAP && inner_elems != -1 && sublist_length(inner_elems) >= 2 {
-                    let key_name = resolve_tparam(node_name(sublist_get(inner_elems, 0)), tparams_sl, concrete_args)
-                    let val_name = resolve_tparam(node_name(sublist_get(inner_elems, 1)), tparams_sl, concrete_args)
+                    let key_name = resolve_tparam_via_tid(node_name(sublist_get(inner_elems, 0)), tparams_sl, concrete_args, arg_tids)
+                    let val_name = resolve_tparam_via_tid(node_name(sublist_get(inner_elems, 1)), tparams_sl, concrete_args, arg_tids)
                     let key_ct = type_from_name(key_name)
                     let val_ct = type_from_name(val_name)
                     let val_sname = if is_struct_type(val_name) != 0 || is_enum_type(val_name) != 0 { val_name } else { "" }
                     reg_sf_entry(mono_name, fname, ct, "", sv_tp(ct, key_ct, val_ct, val_sname))
                 } else if ct == CT_RESULT && inner_elems != -1 && sublist_length(inner_elems) >= 2 {
-                    let ok_name = resolve_tparam(node_name(sublist_get(inner_elems, 0)), tparams_sl, concrete_args)
-                    let err_name = resolve_tparam(node_name(sublist_get(inner_elems, 1)), tparams_sl, concrete_args)
+                    let ok_name = resolve_tparam_via_tid(node_name(sublist_get(inner_elems, 0)), tparams_sl, concrete_args, arg_tids)
+                    let err_name = resolve_tparam_via_tid(node_name(sublist_get(inner_elems, 1)), tparams_sl, concrete_args, arg_tids)
                     let ok_ct = type_from_name(ok_name)
                     let err_ct = type_from_name(err_name)
                     reg_sf_entry(mono_name, fname, ct, "", sv_tp(ct, ok_ct, err_ct, ""))
@@ -5728,7 +5758,7 @@ pub fn register_mono_field_types(base_name: Str, mono_name: Str, concrete_args: 
     }
 }
 
-fn emit_mono_struct_typedef(base_name: Str, concrete_args: Str) ! Codegen.Emit {
+fn emit_mono_struct_typedef(base_name: Str, concrete_args: Str, arg_tids: List[Int]) ! Codegen.Emit {
     let td = find_type_def(base_name)
     if td == -1 {
         return
@@ -5754,7 +5784,7 @@ fn emit_mono_struct_typedef(base_name: Str, concrete_args: Str) ! Codegen.Emit {
         let type_ann_node = node_value(f)
         if type_ann_node != -1 {
             let type_name = node_name(type_ann_node)
-            let resolved = resolve_tparam(type_name, tparams_sl, concrete_args)
+            let resolved = resolve_tparam_via_tid(type_name, tparams_sl, concrete_args, arg_tids)
             if is_struct_type(resolved) != 0 {
                 emit_line("{c_type_c_name(resolved)} {fname};")
                 reg_sf_entry(c_name, fname, CT_VOID, resolved, sv_tp(CT_VOID, -1, -1, resolved))
@@ -5763,7 +5793,7 @@ fn emit_mono_struct_typedef(base_name: Str, concrete_args: Str) ! Codegen.Emit {
                 if inner_elems != -1 && sublist_length(inner_elems) >= 1 {
                     let inner_ann = sublist_get(inner_elems, 0)
                     let inner_raw = node_name(inner_ann)
-                    let inner_resolved = resolve_tparam(inner_raw, tparams_sl, concrete_args)
+                    let inner_resolved = resolve_tparam_via_tid(inner_raw, tparams_sl, concrete_args, arg_tids)
                     let inner_ct = type_from_name(inner_resolved)
                     if is_struct_type(inner_resolved) != 0 || is_enum_type(inner_resolved) != 0 {
                         ensure_struct_option_type(inner_resolved)
@@ -5795,8 +5825,8 @@ fn emit_mono_struct_typedef(base_name: Str, concrete_args: Str) ! Codegen.Emit {
                     let err_ann = sublist_get(inner_elems, 1)
                     let ok_raw = node_name(ok_ann)
                     let err_raw = node_name(err_ann)
-                    let ok_resolved = resolve_tparam(ok_raw, tparams_sl, concrete_args)
-                    let err_resolved = resolve_tparam(err_raw, tparams_sl, concrete_args)
+                    let ok_resolved = resolve_tparam_via_tid(ok_raw, tparams_sl, concrete_args, arg_tids)
+                    let err_resolved = resolve_tparam_via_tid(err_raw, tparams_sl, concrete_args, arg_tids)
                     let ok_ct = type_from_name(ok_resolved)
                     let err_ct = type_from_name(err_resolved)
                     let ok_is_type = is_struct_type(ok_resolved) != 0 || is_enum_type(ok_resolved) != 0
@@ -5867,7 +5897,7 @@ pub fn emit_all_mono_typedefs() ! Codegen.Emit {
             let flds_sl = node_fields(td)
             if flds_sl != -1 && sublist_length(flds_sl) > 0 {
                 if node_kind(sublist_get(flds_sl, 0)) != NodeKind.TypeVariant {
-                    emit_mono_struct_typedef(mi.base, mi.args)
+                    emit_mono_struct_typedef(mi.base, mi.args, mi.arg_tids)
                 }
             }
         }
@@ -5875,9 +5905,9 @@ pub fn emit_all_mono_typedefs() ! Codegen.Emit {
     }
 }
 
-fn build_closure_sig_resolved_mono(ta: Int, tparams_sl: Int, concrete_args: Str) -> Str {
+fn build_closure_sig_resolved_mono(ta: Int, tparams_sl: Int, concrete_args: Str, arg_tids: List[Int]) -> Str {
     let ret_raw = node_return_type(ta)
-    let ret_name = resolve_tparam(ret_raw, tparams_sl, concrete_args)
+    let ret_name = resolve_tparam_via_tid(ret_raw, tparams_sl, concrete_args, arg_tids)
     let ret_type = type_from_name(ret_name)
     let elems_sl = node_elements(ta)
     let mut sig_params = "const blink_closure*"
@@ -5886,7 +5916,7 @@ fn build_closure_sig_resolved_mono(ta: Int, tparams_sl: Int, concrete_args: Str)
         while i < sublist_length(elems_sl) {
             let elem = sublist_get(elems_sl, i)
             let ename_raw = node_name(elem)
-            let ename = resolve_tparam(ename_raw, tparams_sl, concrete_args)
+            let ename = resolve_tparam_via_tid(ename_raw, tparams_sl, concrete_args, arg_tids)
             sig_params = sig_params.concat(", ")
             if is_enum_type(ename) != 0 {
                 sig_params = sig_params.concat(c_type_c_name(ename))
@@ -5937,7 +5967,7 @@ type MonoSig {
 // registrations and sets cg_current_fn_option_inner* as a side effect (the def
 // body reads them; the decl pass overwrites them harmlessly).
 @allow(UnrestoredMutation, IncompleteStateRestore)
-fn mono_fn_signature(fn_node: Int, concrete_args: Str) -> MonoSig ! Codegen.Register, Diag.Report {
+fn mono_fn_signature(fn_node: Int, concrete_args: Str, arg_tids: List[Int]) -> MonoSig ! Codegen.Register, Diag.Report {
     cg_handler_vtable_type = ""
     cg_handler_vtable_field = ""
     cg_handler_is_user_effect = 0
@@ -5950,7 +5980,7 @@ fn mono_fn_signature(fn_node: Int, concrete_args: Str) -> MonoSig ! Codegen.Regi
 
     // Resolve return type
     let ret_str = node_return_type(fn_node)
-    let resolved_ret = resolve_tparam(ret_str, tparams_sl, concrete_args)
+    let resolved_ret = resolve_tparam_via_tid(ret_str, tparams_sl, concrete_args, arg_tids)
     // A bare-typevar return (`-> T`) bound to a compound resolves to the carrier
     // tag (Option_int / Result_int_str / Map_..), whose type_from_name is
     // CT_VOID (the tag has no `[`). No call node / tid exists here (this is the
@@ -5983,7 +6013,7 @@ fn mono_fn_signature(fn_node: Int, concrete_args: Str) -> MonoSig ! Codegen.Regi
         if ann_elems != -1 && sublist_length(ann_elems) >= 1 {
             let inner_ann = sublist_get(ann_elems, 0)
             let inner_name_raw = node_name(inner_ann)
-            let inner_name = resolve_tparam(inner_name_raw, tparams_sl, concrete_args)
+            let inner_name = resolve_tparam_via_tid(inner_name_raw, tparams_sl, concrete_args, arg_tids)
             let inner_ct = type_from_name(inner_name)
             if inner_ct == CT_VOID && is_struct_or_enum_type(inner_name) != 0 {
                 ensure_struct_option_type(inner_name)
@@ -6017,8 +6047,8 @@ fn mono_fn_signature(fn_node: Int, concrete_args: Str) -> MonoSig ! Codegen.Regi
         if ann_elems != -1 && sublist_length(ann_elems) >= 2 {
             let ok_ann = sublist_get(ann_elems, 0)
             let err_ann = sublist_get(ann_elems, 1)
-            let ok_name = resolve_tparam(node_name(ok_ann), tparams_sl, concrete_args)
-            let err_name = resolve_tparam(node_name(err_ann), tparams_sl, concrete_args)
+            let ok_name = resolve_tparam_via_tid(node_name(ok_ann), tparams_sl, concrete_args, arg_tids)
+            let err_name = resolve_tparam_via_tid(node_name(err_ann), tparams_sl, concrete_args, arg_tids)
             let ok_ct = type_from_name(ok_name)
             let err_ct = type_from_name(err_name)
             // A struct/enum inner has CT_VOID/CT_STRUCT that result_c_type
@@ -6070,7 +6100,7 @@ fn mono_fn_signature(fn_node: Int, concrete_args: Str) -> MonoSig ! Codegen.Regi
             let p = sublist_get(params_sl, i)
             let pname = c_safe_name(node_name(p))
             let ptype = node_type_name(p)
-            let resolved_ptype = resolve_tparam(ptype, tparams_sl, concrete_args)
+            let resolved_ptype = resolve_tparam_via_tid(ptype, tparams_sl, concrete_args, arg_tids)
             if i > 0 {
                 params_c = params_c.concat(", ")
             }
@@ -6116,14 +6146,14 @@ fn mono_fn_signature(fn_node: Int, concrete_args: Str) -> MonoSig ! Codegen.Regi
     }
 }
 
-fn emit_mono_fn_decl(fn_node: Int, concrete_args: Str) ! Codegen.Emit, Codegen.Register, Diag.Report {
-    let sig = mono_fn_signature(fn_node, concrete_args)
+fn emit_mono_fn_decl(fn_node: Int, concrete_args: Str, arg_tids: List[Int]) ! Codegen.Emit, Codegen.Register, Diag.Report {
+    let sig = mono_fn_signature(fn_node, concrete_args, arg_tids)
     emit_line("{sig.sig};")
 }
 
 @allow(UnrestoredMutation, IncompleteStateRestore)
-fn emit_mono_fn_def(fn_node: Int, concrete_args: Str) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
-    let sig = mono_fn_signature(fn_node, concrete_args)
+fn emit_mono_fn_def(fn_node: Int, concrete_args: Str, arg_tids: List[Int]) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
+    let sig = mono_fn_signature(fn_node, concrete_args, arg_tids)
     let storage = sig.storage
     let ret_c_str = sig.ret_c_str
     let params_c = sig.params_c
@@ -6146,12 +6176,12 @@ fn emit_mono_fn_def(fn_node: Int, concrete_args: Str) ! Codegen.Emit, Codegen.Re
             let p = sublist_get(params_sl, i)
             let pname = node_name(p)
             let ptype = node_type_name(p)
-            let resolved_ptype = resolve_tparam(ptype, tparams_sl, concrete_args)
+            let resolved_ptype = resolve_tparam_via_tid(ptype, tparams_sl, concrete_args, arg_tids)
             if resolved_ptype == "Fn" {
                 set_var(pname, CT_CLOSURE, 1)
                 let ta = node_type_ann(p)
                 if ta != -1 {
-                    let sig_str = build_closure_sig_resolved_mono(ta, tparams_sl, concrete_args)
+                    let sig_str = build_closure_sig_resolved_mono(ta, tparams_sl, concrete_args, arg_tids)
                     set_var_closure(pname, sig_str)
                 }
             } else {
@@ -6172,7 +6202,7 @@ fn emit_mono_fn_def(fn_node: Int, concrete_args: Str) ! Codegen.Emit, Codegen.Re
                         if elems_sl != -1 && sublist_length(elems_sl) > 0 {
                             let elem_ann = sublist_get(elems_sl, 0)
                             let elem_name_raw = node_name(elem_ann)
-                            let elem_name = resolve_tparam(elem_name_raw, tparams_sl, concrete_args)
+                            let elem_name = resolve_tparam_via_tid(elem_name_raw, tparams_sl, concrete_args, arg_tids)
                             let elem_ct = type_from_name(elem_name)
                             set_list_elem_type(pname, elem_ct)
                             if elem_ct != CT_VOID {
@@ -6212,10 +6242,10 @@ fn emit_mono_fn_def(fn_node: Int, concrete_args: Str) ! Codegen.Emit, Codegen.Re
                             let key_ann = sublist_get(elems_sl, 0)
                             let val_ann = sublist_get(elems_sl, 1)
                             let key_name_raw = node_name(key_ann)
-                            let key_name = resolve_tparam(key_name_raw, tparams_sl, concrete_args)
+                            let key_name = resolve_tparam_via_tid(key_name_raw, tparams_sl, concrete_args, arg_tids)
                             let key_ct = type_from_name(key_name)
                             let val_name_raw = node_name(val_ann)
-                            let val_name = resolve_tparam(val_name_raw, tparams_sl, concrete_args)
+                            let val_name = resolve_tparam_via_tid(val_name_raw, tparams_sl, concrete_args, arg_tids)
                             let val_ct = type_from_name(val_name)
                             set_map_types(pname, key_ct, val_ct, val_name)
                             if key_ct == CT_VOID && is_named_type(key_name) != 0 {
@@ -6226,7 +6256,7 @@ fn emit_mono_fn_def(fn_node: Int, concrete_args: Str) ! Codegen.Emit, Codegen.Re
                                 if val_elems != -1 && sublist_length(val_elems) > 0 {
                                     let inner_ann = sublist_get(val_elems, 0)
                                     let inner_name_raw = node_name(inner_ann)
-                                    let inner_name = resolve_tparam(inner_name_raw, tparams_sl, concrete_args)
+                                    let inner_name = resolve_tparam_via_tid(inner_name_raw, tparams_sl, concrete_args, arg_tids)
                                     set_map_value_list_elem(pname, type_from_name(inner_name))
                                 }
                             }
@@ -6245,7 +6275,7 @@ fn emit_mono_fn_def(fn_node: Int, concrete_args: Str) ! Codegen.Emit, Codegen.Re
                     if ta != -1 {
                         let elems_sl = node_elements(ta)
                         if elems_sl != -1 && sublist_length(elems_sl) >= 1 {
-                            let inner_name = resolve_tparam(node_name(sublist_get(elems_sl, 0)), tparams_sl, concrete_args)
+                            let inner_name = resolve_tparam_via_tid(node_name(sublist_get(elems_sl, 0)), tparams_sl, concrete_args, arg_tids)
                             let inner_ct = type_from_name(inner_name)
                             if is_struct_type(inner_name) != 0 || is_enum_type(inner_name) != 0 {
                                 set_var_option_struct(pname, CT_INT, inner_name)
@@ -6260,8 +6290,8 @@ fn emit_mono_fn_def(fn_node: Int, concrete_args: Str) ! Codegen.Emit, Codegen.Re
                     if ta != -1 {
                         let elems_sl = node_elements(ta)
                         if elems_sl != -1 && sublist_length(elems_sl) >= 2 {
-                            let ok_name = resolve_tparam(node_name(sublist_get(elems_sl, 0)), tparams_sl, concrete_args)
-                            let err_name = resolve_tparam(node_name(sublist_get(elems_sl, 1)), tparams_sl, concrete_args)
+                            let ok_name = resolve_tparam_via_tid(node_name(sublist_get(elems_sl, 0)), tparams_sl, concrete_args, arg_tids)
+                            let err_name = resolve_tparam_via_tid(node_name(sublist_get(elems_sl, 1)), tparams_sl, concrete_args, arg_tids)
                             let ok_ct = type_from_name(ok_name)
                             let err_ct = type_from_name(err_name)
                             let ok_s = if is_struct_type(ok_name) != 0 || is_enum_type(ok_name) != 0 { ok_name } else { "" }
@@ -6336,7 +6366,7 @@ fn emit_mono_fn_def(fn_node: Int, concrete_args: Str) ! Codegen.Emit, Codegen.Re
 // branch. Option/Result params and returns route through
 // mono_option_result_param_c_type so their carrier typedefs are queued before
 // the body (flush_mono_fns_with_typedefs orders typedefs → decls → bodies).
-fn poly_impl_method_signature(im: Int, method_node: Int, concrete_args: Str) -> MonoSig ! Codegen.Register, Diag.Report {
+fn poly_impl_method_signature(im: Int, method_node: Int, concrete_args: Str, arg_tids: List[Int]) -> MonoSig ! Codegen.Register, Diag.Report {
     cg_handler_vtable_type = ""
     cg_handler_vtable_field = ""
     cg_handler_is_user_effect = 0
@@ -6348,7 +6378,7 @@ fn poly_impl_method_signature(im: Int, method_node: Int, concrete_args: Str) -> 
     let storage = mono_storage_class(method_node)
 
     let ret_str = node_return_type(method_node)
-    let resolved_ret = resolve_tparam(ret_str, tparams_sl, concrete_args)
+    let resolved_ret = resolve_tparam_via_tid(ret_str, tparams_sl, concrete_args, arg_tids)
     let ret_type = type_from_name(resolved_ret)
     let mut ret_c_str = c_type_str(ret_type)
     if ret_type == CT_OPTION || ret_type == CT_RESULT {
@@ -6379,7 +6409,7 @@ fn poly_impl_method_signature(im: Int, method_node: Int, concrete_args: Str) -> 
                 i = i + 1
                 continue
             }
-            let ptype = resolve_tparam(node_type_name(p), tparams_sl, concrete_args)
+            let ptype = resolve_tparam_via_tid(node_type_name(p), tparams_sl, concrete_args, arg_tids)
             if is_struct_type(ptype) != 0 {
                 params_c = params_c.concat("{c_type_c_name(ptype)} {pname}")
             } else if is_enum_type(ptype) != 0 {
@@ -6413,14 +6443,14 @@ fn poly_impl_method_signature(im: Int, method_node: Int, concrete_args: Str) -> 
     }
 }
 
-fn emit_poly_impl_method_decl(im: Int, method_node: Int, concrete_args: Str) ! Codegen.Emit, Codegen.Register, Diag.Report {
-    let sig = poly_impl_method_signature(im, method_node, concrete_args)
+fn emit_poly_impl_method_decl(im: Int, method_node: Int, concrete_args: Str, arg_tids: List[Int]) ! Codegen.Emit, Codegen.Register, Diag.Report {
+    let sig = poly_impl_method_signature(im, method_node, concrete_args, arg_tids)
     emit_line("{sig.sig};")
 }
 
 @allow(UnrestoredMutation, IncompleteStateRestore)
-fn emit_poly_impl_method_def(im: Int, method_node: Int, concrete_args: Str) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
-    let sig = poly_impl_method_signature(im, method_node, concrete_args)
+fn emit_poly_impl_method_def(im: Int, method_node: Int, concrete_args: Str, arg_tids: List[Int]) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
+    let sig = poly_impl_method_signature(im, method_node, concrete_args, arg_tids)
     let storage = sig.storage
     let ret_c_str = sig.ret_c_str
     let params_c = sig.params_c
@@ -6436,7 +6466,7 @@ fn emit_poly_impl_method_def(im: Int, method_node: Int, concrete_args: Str) ! Co
     cg_temp_counter = 0
     // The receiver's concrete element type (the impl binder's concrete arg),
     // used to register both `self` and any List[T] param.
-    let recv_elem_name = if sublist_length(tparams_sl) > 0 { resolve_tparam(node_name(sublist_get(tparams_sl, 0)), tparams_sl, concrete_args) } else { "" }
+    let recv_elem_name = if sublist_length(tparams_sl) > 0 { resolve_tparam_via_tid(node_name(sublist_get(tparams_sl, 0)), tparams_sl, concrete_args, arg_tids) } else { "" }
     if params_sl != -1 {
         let mut i = 0
         while i < sublist_length(params_sl) {
@@ -6457,12 +6487,12 @@ fn emit_poly_impl_method_def(im: Int, method_node: Int, concrete_args: Str) ! Co
                 i = i + 1
                 continue
             }
-            let ptype = resolve_tparam(node_type_name(p), tparams_sl, concrete_args)
+            let ptype = resolve_tparam_via_tid(node_type_name(p), tparams_sl, concrete_args, arg_tids)
             if ptype == "Fn" {
                 set_var(pname, CT_CLOSURE, 1)
                 let ta = node_type_ann(p)
                 if ta != -1 {
-                    let sig_str = build_closure_sig_resolved_mono(ta, tparams_sl, concrete_args)
+                    let sig_str = build_closure_sig_resolved_mono(ta, tparams_sl, concrete_args, arg_tids)
                     set_var_closure(pname, sig_str)
                 }
             } else if ptype == "List" {
@@ -6474,7 +6504,7 @@ fn emit_poly_impl_method_def(im: Int, method_node: Int, concrete_args: Str) ! Co
                 if ta != -1 {
                     let elems_sl = node_elements(ta)
                     if elems_sl != -1 && sublist_length(elems_sl) > 0 {
-                        let elem_name = resolve_tparam(node_name(sublist_get(elems_sl, 0)), tparams_sl, concrete_args)
+                        let elem_name = resolve_tparam_via_tid(node_name(sublist_get(elems_sl, 0)), tparams_sl, concrete_args, arg_tids)
                         let elem_ct = type_from_name(elem_name)
                         set_list_elem_type(pname, elem_ct)
                         if elem_ct != CT_VOID {
@@ -6499,7 +6529,7 @@ fn emit_poly_impl_method_def(im: Int, method_node: Int, concrete_args: Str) ! Co
                     if ta != -1 {
                         let elems_sl = node_elements(ta)
                         if elems_sl != -1 && sublist_length(elems_sl) >= 1 {
-                            let inner_name = resolve_tparam(node_name(sublist_get(elems_sl, 0)), tparams_sl, concrete_args)
+                            let inner_name = resolve_tparam_via_tid(node_name(sublist_get(elems_sl, 0)), tparams_sl, concrete_args, arg_tids)
                             let inner_ct = type_from_name(inner_name)
                             if is_struct_type(inner_name) != 0 || is_enum_type(inner_name) != 0 {
                                 set_var_option_struct(pname, CT_INT, inner_name)
@@ -6514,8 +6544,8 @@ fn emit_poly_impl_method_def(im: Int, method_node: Int, concrete_args: Str) ! Co
                     if ta != -1 {
                         let elems_sl = node_elements(ta)
                         if elems_sl != -1 && sublist_length(elems_sl) >= 2 {
-                            let ok_name = resolve_tparam(node_name(sublist_get(elems_sl, 0)), tparams_sl, concrete_args)
-                            let err_name = resolve_tparam(node_name(sublist_get(elems_sl, 1)), tparams_sl, concrete_args)
+                            let ok_name = resolve_tparam_via_tid(node_name(sublist_get(elems_sl, 0)), tparams_sl, concrete_args, arg_tids)
+                            let err_name = resolve_tparam_via_tid(node_name(sublist_get(elems_sl, 1)), tparams_sl, concrete_args, arg_tids)
                             let ok_ct = type_from_name(ok_name)
                             let err_ct = type_from_name(err_name)
                             let ok_s = if is_struct_type(ok_name) != 0 || is_enum_type(ok_name) != 0 { ok_name } else { "" }
@@ -6587,16 +6617,16 @@ fn emit_poly_impl_method_def(im: Int, method_node: Int, concrete_args: Str) ! Co
 // poly_impl_method_node) to the poly emitter and everything else to the
 // generic-fn emitter. A poly base has no generic-fn node, so it MUST branch
 // here or get_generic_fn_node would return -1 and silently drop the body.
-fn emit_mono_fn_entry_def(base: Str, args: Str) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
+fn emit_mono_fn_entry_def(base: Str, args: Str, arg_tids: List[Int]) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
     if is_poly_impl_base(base) != 0 {
         let im = poly_impl_block_node.get(base).unwrap()
         let method_node = poly_impl_method_node.get(base).unwrap()
-        emit_poly_impl_method_def(im, method_node, args)
+        emit_poly_impl_method_def(im, method_node, args, arg_tids)
         return
     }
     let fn_node = get_generic_fn_node(base)
     if fn_node != -1 {
-        emit_mono_fn_def(fn_node, args)
+        emit_mono_fn_def(fn_node, args, arg_tids)
     }
 }
 
@@ -6604,7 +6634,7 @@ pub fn emit_all_mono_fns() ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag
     let mut i = 0
     while i < mono_fns.len() {
         let mf = mono_fns.get(i).unwrap()
-        emit_mono_fn_entry_def(mf.base, mf.args)
+        emit_mono_fn_entry_def(mf.base, mf.args, mf.arg_tids)
         i = i + 1
     }
 }
@@ -6618,7 +6648,7 @@ pub fn emit_mono_typedefs_from(start: Int) ! Codegen.Emit {
             let flds_sl = node_fields(td)
             if flds_sl != -1 && sublist_length(flds_sl) > 0 {
                 if node_kind(sublist_get(flds_sl, 0)) != NodeKind.TypeVariant {
-                    emit_mono_struct_typedef(mi.base, mi.args)
+                    emit_mono_struct_typedef(mi.base, mi.args, mi.arg_tids)
                 }
             }
         }
@@ -6630,7 +6660,7 @@ pub fn emit_mono_fns_from(start: Int) ! Codegen.Emit, Codegen.Register, Codegen.
     let mut i = start
     while i < mono_fns.len() {
         let mf = mono_fns.get(i).unwrap()
-        emit_mono_fn_entry_def(mf.base, mf.args)
+        emit_mono_fn_entry_def(mf.base, mf.args, mf.arg_tids)
         i = i + 1
     }
 }
@@ -6645,11 +6675,11 @@ pub fn emit_mono_fn_decls_range(start: Int, end: Int) ! Codegen.Emit, Codegen.Re
         if is_poly_impl_base(mf.base) != 0 {
             let im = poly_impl_block_node.get(mf.base).unwrap()
             let method_node = poly_impl_method_node.get(mf.base).unwrap()
-            emit_poly_impl_method_decl(im, method_node, mf.args)
+            emit_poly_impl_method_decl(im, method_node, mf.args, mf.arg_tids)
         } else {
             let fn_node = get_generic_fn_node(mf.base)
             if fn_node != -1 {
-                emit_mono_fn_decl(fn_node, mf.args)
+                emit_mono_fn_decl(fn_node, mf.args, mf.arg_tids)
             }
         }
         i = i + 1
