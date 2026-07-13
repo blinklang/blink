@@ -88,7 +88,7 @@ import diagnostics.{
 }
 import std.path.{path_dirname}
 import formatter.{format_expr}
-import typecheck.{tc_mono_csv, is_import_module_name, tc_lookup_node_tid, tc_tid_set_elem_ct, tc_tid_set_elem_struct, tc_tid_map_key_ct, tc_tid_map_key_struct, tc_tid_map_val_ct, tc_tid_map_val_struct, tc_tid_ct, tc_tid_option_inner_ct, tc_tid_option_inner_struct, tc_tid_result_ok_ct, tc_tid_result_ok_struct, tc_tid_result_err_ct, tc_tid_result_err_struct}
+import typecheck.{tc_mono_csv, is_import_module_name, tc_lookup_node_tid, tc_tid_set_elem_ct, tc_tid_set_elem_struct, tc_tid_map_key_ct, tc_tid_map_key_struct, tc_tid_map_val_ct, tc_tid_map_val_struct, tc_tid_ct, tc_tid_option_inner_ct, tc_tid_option_inner_struct, tc_tid_result_ok_ct, tc_tid_result_ok_struct, tc_tid_result_err_ct, tc_tid_result_err_struct, tc_tid_to_c_tag, tc_tid_struct, tc_tid_struct_arg_count, tc_tid_struct_arg_tid, tc_tid_compound_slot_faithful}
 
 // codegen_expr.bl — Expression codegen, closures, capture analysis
 
@@ -2685,7 +2685,19 @@ pub fn emit_generic_fn_call_tail(node: Int, fn_name: Str, args_str: Str, ca: Gen
     // CT_OPTION) must stay the old no-op, not run tid recovery against a node
     // whose tid isn't an Option — else it would register a carrier keyed on the
     // -1 sentinel where the old code registered nothing.
-    let rerouted = ret_name_ct == CT_VOID && (tid_ct == CT_OPTION || tid_ct == CT_RESULT || tid_ct == CT_MAP)
+    // CT_STRUCT joins the reroute set, but ONLY for a BARE-TYPEVAR return `-> T`
+    // bound to a struct INSTANCE (`unbox(outer)` : Box[Int]): the string tag lowers
+    // it to the mono name `Box_Int` whose type_from_name is CT_VOID (no `[`), so the
+    // caller would type the result `void`. typecheck now substitutes T to the
+    // concrete instance and memoizes it (br 8wyq1k), so the tid says CT_STRUCT;
+    // reroute onto it and emit a struct-typed temp below (mirrors ma6n41's
+    // Option/Result/Map recovery). The `resolved_ret != ret_str` guard confines this
+    // to `-> T` (resolve_tparam substituted the whole return type): an ANNOTATED
+    // struct return `-> Wrapper[T]` keeps ret_str=="Wrapper" unchanged and MUST stay
+    // on the CT_VOID annotated-elements path below (which builds Wrapper_Int from the
+    // annotation), not this arm (which would emit the bare base "Wrapper").
+    let struct_reroute = tid_ct == CT_STRUCT && resolved_ret != ret_str
+    let rerouted = ret_name_ct == CT_VOID && (tid_ct == CT_OPTION || tid_ct == CT_RESULT || tid_ct == CT_MAP || struct_reroute)
     let ret_type = if rerouted { tid_ct } else { ret_name_ct }
     let fn_eff_sl = node_effects(gfn_node)
     let fn_trusted = has_annotation(gfn_node, "trusted")
@@ -2812,6 +2824,17 @@ pub fn emit_generic_fn_call_tail(node: Int, fn_name: Str, args_str: Str, ca: Gen
             expr_map_key_type = tc_tid_map_key_ct(ret_tid)
             expr_map_val_type = tc_tid_map_val_ct(ret_tid)
         }
+    } else if ret_type == CT_STRUCT && rerouted {
+        // Bare-typevar return `-> T` bound to a struct INSTANCE (unbox(outer) :
+        // Box[Int]): the string mono path already resolved the return spelling to
+        // the concrete mono name (`resolved_ret` == "Box_Int", the same symbol the
+        // fn was mangled under). Emit a struct-typed temp so the caller's
+        // `let got = call()` sees CT_STRUCT + the mono struct name, exactly like the
+        // non-generic struct-value reference path — instead of falling through to a
+        // `void` binding (br 8wyq1k). Mirrors emit_generic_struct_ret_temp's use at
+        // the annotated-tuple/plain-T sites below.
+        emit_generic_struct_ret_temp(mangled, resolved_ret, "_gsr", call_args)
+        return 1
     } else if ret_type == CT_VOID && resolved_ret != "Void" && resolved_ret != "" {
         let ret_ann = node_type_ann(gfn_node)
         // Generic fn returning a tuple: route through resolve_tuple_ann so the
@@ -4681,6 +4704,77 @@ fn infer_struct_type_args(type_name: Str, field_types: List[Int], field_structs:
     Some(args)
 }
 
+// Tid-native mono-args for a struct literal whose concrete inner is a COMPOUND
+// carrier (`Box[Option[Int]]`), the shape the string path (struct_concrete_args_from_target
+// bail + infer_struct_type_args' compound-blind bare-typevar branch) collapses to
+// "Void" (br zrybya). Reads the instance tid typecheck memoized on the literal node
+// (tc_struct_lit_instance_tid) and lowers each slot via tc_tid_to_c_tag, the epic's
+// D-layer carrier-name primitive — Option[Int] → "Option_int", byte-identical to the
+// blink_Option_int typedef the field value emits.
+//
+// Returns "" (defer to the string path, unchanged) unless the instance is a concrete
+// same-base struct AND at least one slot is a faithful compound-of-scalar AND every
+// slot is either a plain scalar or a faithful compound. A struct-INSTANCE slot
+// (`Box[Box[Int]]`) or a compound-of-struct slot keeps the string path authoritative
+// (tc_tid_to_c_tag would erase their inner). The at-least-one-compound guard confines
+// the change to the previously-broken shapes: a pure-scalar instance keeps its exact
+// current string output (byte-identity for every working shape).
+fn tid_native_struct_mono_args(node: Int, sname: Str) -> Str {
+    // Prefer the enclosing annotation's instance tid (`let oi: Box[Option[Int]]`)
+    // over the literal's own reverse-inferred tid: a bare `None` / `Ok(x)` field
+    // value infers the compound inner as UNKNOWN (Box[Option[?]]), but the
+    // annotation names the concrete inner. resolve_type_ann memoized the concrete
+    // Box[Option[Int]] instance onto the annotation node (tc_produce_struct_instance_tid).
+    // cg_expect_arg_ann wins when it names this struct (a call-arg position);
+    // otherwise cg_let_target_ann. Fall back to the literal node's own tid.
+    let mut inst_tid = -1
+    if cg_expect_arg_ann != -1 && strip_module_qualifier(node_name(cg_expect_arg_ann)) == sname {
+        inst_tid = tc_lookup_node_tid(cg_expect_arg_ann)
+    } else if cg_let_target_ann != -1 && strip_module_qualifier(node_name(cg_let_target_ann)) == sname {
+        inst_tid = tc_lookup_node_tid(cg_let_target_ann)
+    }
+    if inst_tid < 0 || tc_tid_struct(inst_tid) != sname {
+        inst_tid = tc_lookup_node_tid(node)
+    }
+    if inst_tid < 0 { return "" }
+    if tc_tid_struct(inst_tid) != sname { return "" }
+    let count = tc_tid_struct_arg_count(inst_tid)
+    if count < 1 { return "" }
+    let mut has_compound = 0
+    let mut i = 0
+    while i < count {
+        let slot = tc_tid_struct_arg_tid(inst_tid, i)
+        if tc_tid_compound_slot_faithful(slot) {
+            has_compound = 1
+        } else if !tid_slot_is_plain_scalar(slot) {
+            // A struct-instance / compound-of-struct / list / tuple slot — the
+            // string path (which reuses the field's registered mono name) stays
+            // authoritative. Bail so a mixed instance is never half-lowered.
+            return ""
+        }
+        i = i + 1
+    }
+    if has_compound == 0 { return "" }
+    let mut args = ""
+    let mut j = 0
+    while j < count {
+        if j > 0 { args = args.concat(",") }
+        args = args.concat(tc_tid_to_c_tag(tc_tid_struct_arg_tid(inst_tid, j)))
+        j = j + 1
+    }
+    args
+}
+
+// A slot tid whose tc_tid_to_c_tag is a plain scalar Pascal tag (Int/Str/…). Kept
+// local so the compound-args gate can pass scalar slots through unchanged while
+// bailing on anything structural.
+fn tid_slot_is_plain_scalar(slot: Int) -> Bool {
+    if slot < 0 { return false }
+    let ct = tc_tid_ct(slot)
+    if ct == CT_INT || ct == CT_FLOAT || ct == CT_BOOL || ct == CT_STRING || ct == CT_CHAR { return true }
+    is_sized_int_ct(ct) != 0
+}
+
 @allow(UnrestoredMutation, IncompleteStateRestore)
 fn emit_struct_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
     let raw_sname = node_type_name(node)
@@ -4899,8 +4993,17 @@ fn emit_struct_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
     if target_args != "" && td_tparams != -1 && sublist_length(td_tparams) > 0 {
         mono_args = target_args
     } else {
-        let type_args = infer_struct_type_args(sname, field_types, field_structs)
-        if type_args.is_some() { mono_args = type_args.unwrap() }
+        // A compound-valued generic field (`Box[Option[Int]]`) is lost by both string
+        // seams (struct_concrete_args_from_target bails on a compound annotation arg;
+        // infer_struct_type_args' bare-typevar-field branch has no compound case →
+        // "Void"). Recover it from the instance tid typecheck memoized on this literal
+        // (br zrybya). Returns "" for every shape the string path already handles, so
+        // the fallback below stays authoritative for scalar / struct-instance fields.
+        mono_args = tid_native_struct_mono_args(node, sname)
+        if mono_args == "" {
+            let type_args = infer_struct_type_args(sname, field_types, field_structs)
+            if type_args.is_some() { mono_args = type_args.unwrap() }
+        }
     }
     let mut struct_key = sname
     if mono_args != "" {

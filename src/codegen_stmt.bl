@@ -71,7 +71,7 @@ import codegen_types.{
     set_var_struct, sf_closure_sigs, sf_entries,
     struct_field_defaults, struct_invariants, struct_option_c_type,
     struct_reg_names, struct_reg_set, struct_result_c_type, sv_tp, tp_from_ann,
-    split_result_compound, typedef_tag_or_empty, tp_child1_kind, tp_child1_sname, tp_child2_kind, tp_child2_sname,
+    split_result_compound, CompoundSplit, map_struct_scalar_kv, MapKvCt, typedef_tag_or_empty, tp_child1_kind, tp_child1_sname, tp_child2_kind, tp_child2_sname,
     tp_get_kind, tp_get_sname, type_from_name, type_from_name_tag,
     type_name_from_ct, type_where_preds, cg_where_self_var, is_compound_tag, var_enums,
     CaptureEntry, ClosureCapInfo,
@@ -5633,6 +5633,29 @@ pub fn register_mono_field_types(base_name: Str, mono_name: Str, concrete_args: 
             let resolved_is_mono_struct = resolved_mono_base != "" && find_type_def(resolved_mono_base) != -1
             if is_struct_type(resolved) != 0 || is_enum_type(resolved) != 0 || resolved_is_mono_struct {
                 reg_sf_entry(mono_name, fname, CT_STRUCT, resolved, sv_tp(CT_STRUCT, -1, -1, resolved))
+            } else if is_compound_tag(resolved) != 0 {
+                // A bare-typevar field (`value: T`) whose concrete arg is a COMPOUND
+                // carrier (`Box[Option[Int]]` → resolved "Option_int"): the field
+                // annotation carries no inner_elems (it is just `T`), so the branches
+                // below — which read the compound shape from the ANNOTATION — cannot
+                // fire. Decode the carrier CT + scalar inners from the arg tag instead,
+                // so the field records CT_OPTION/RESULT/MAP rather than the CT_VOID
+                // default (br zrybya). The tid-native mono-args gate admits only
+                // compound-of-scalar slots, so the inner tag decoders are exact here.
+                let cct = compound_tag_ct(resolved)
+                if cct == CT_OPTION {
+                    let inner_ct = option_inner_ct_from_tag(resolved)
+                    let inner_sname = option_inner_struct_from_tag(resolved)
+                    reg_sf_entry(mono_name, fname, cct, "", sv_tp(cct, inner_ct, -1, inner_sname))
+                } else if cct == CT_RESULT {
+                    let split = split_result_compound(resolved)
+                    let ok_ct = type_from_name_tag(split.first)
+                    let err_ct = type_from_name_tag(split.second)
+                    reg_sf_entry(mono_name, fname, cct, "", sv_tp(cct, ok_ct, err_ct, ""))
+                } else {
+                    let kv = map_struct_scalar_kv(resolved)
+                    reg_sf_entry(mono_name, fname, cct, "", sv_tp(cct, kv.first, kv.second, ""))
+                }
             } else {
                 let ct = type_from_name(resolved)
                 let inner_elems = node_elements(type_ann_node)
@@ -5756,6 +5779,27 @@ fn emit_mono_struct_typedef(base_name: Str, concrete_args: Str) ! Codegen.Emit {
                     let res_c = result_c_type(CT_INT, CT_STRING)
                     emit_line("{res_c} {fname};")
                     reg_sf_entry(c_name, fname, CT_RESULT, "", sv_tp(CT_RESULT, CT_INT, CT_STRING, ""))
+                }
+            } else if is_compound_tag(resolved) != 0 {
+                // A bare-typevar field (`value: T`) whose concrete arg is a COMPOUND
+                // carrier: `resolved` is the carrier TAG ("Option_int"), not the
+                // bracketed annotation "Option" the branches above match, so emit the
+                // carrier C type directly (blink_Option_int) instead of the CT_VOID
+                // default `void value;` that mismatches the field value (br zrybya).
+                // ensure_carrier_from_tag makes the typedef self-contained (the field
+                // VALUE also emits it, so this is idempotent). Gate admits only
+                // compound-of-scalar tags, so the tag→CT decode is exact.
+                ensure_carrier_from_tag(resolved)
+                let cct = compound_tag_ct(resolved)
+                emit_line("{c_type_c_name(resolved)} {fname};")
+                if cct == CT_OPTION {
+                    reg_sf_entry(c_name, fname, cct, "", sv_tp(cct, option_inner_ct_from_tag(resolved), -1, option_inner_struct_from_tag(resolved)))
+                } else if cct == CT_RESULT {
+                    let split = split_result_compound(resolved)
+                    reg_sf_entry(c_name, fname, cct, "", sv_tp(cct, type_from_name_tag(split.first), type_from_name_tag(split.second), ""))
+                } else {
+                    let kv = map_struct_scalar_kv(resolved)
+                    reg_sf_entry(c_name, fname, cct, "", sv_tp(cct, kv.first, kv.second, ""))
                 }
             } else {
                 let ct = type_from_name(resolved)

@@ -1,0 +1,55 @@
+// br zrybya (codegen-structured-tids epic, kvn6w8): a generic struct field
+// whose concrete inner is a COMPOUND carrier (Option/Result) must monomorphize
+// the instance to the parameterized carrier, not collapse to Box_Void.
+//
+// Sibling of 3xvjcy (the struct-INSTANCE-valued field, closed). typecheck's
+// tc_struct_lit_instance_tid already reverse-infers `Box[Option[Int]]` from the
+// field value `Some(7)` and memoizes it on the StructLit node, but codegen's
+// emit_struct_lit derives its mono-args from the lossy string path:
+// struct_concrete_args_from_target bails on a compound annotation arg, and
+// infer_struct_type_args' bare-typevar-field branch has no compound case, so it
+// falls to type_name_from_ct(CT_OPTION) == "Void". The instance registered as
+// blink_Box_Void with a `void value;` field, mismatching the Option carrier the
+// field value emitted → cc "incompatible types" (and `.value.unwrap()` → "unwrap
+// on Void").
+//
+// Fix: emit_struct_lit consults the memoized instance tid and lowers each
+// compound-of-scalar slot via tc_tid_to_c_tag (Option[Int] → "Option_int"),
+// byte-identical to the blink_Option_int carrier the field value already emits.
+
+type Box[T] {
+    value: T
+}
+
+test "Box[Option[Int]] field monomorphizes to the Option carrier (annotated)" {
+    let oi: Box[Option[Int]] = Box { value: Some(7) }
+    assert_eq(oi.value.unwrap(), 7)
+}
+
+test "Box[Option[Int]] with a None value monomorphizes to the Option carrier" {
+    let oi: Box[Option[Int]] = Box { value: None }
+    assert(oi.value.is_none())
+}
+
+test "Box[Result[Int, Str]] field monomorphizes to the Result carrier" {
+    let br: Box[Result[Int, Str]] = Box { value: Ok(9) }
+    match br.value {
+        Ok(v) => { assert_eq(v, 9) }
+        Err(_e) => { assert(false) }
+    }
+}
+
+// GREEN control: a plain scalar field must stay on the working string path
+// (must never route the tid-compound branch and must not regress to Void).
+test "scalar Int field stays undisturbed (default path)" {
+    let b: Box[Int] = Box { value: 5 }
+    assert_eq(b.value, 5)
+}
+
+// GREEN control: a struct-INSTANCE-valued field must keep its 3xvjcy string-path
+// mono name (Box_Int), NOT be re-routed through the tid path (which erases the
+// inner to bare "Box").
+test "struct-instance field stays on the 3xvjcy path (Box[Box[Int]])" {
+    let b: Box[Box[Int]] = Box { value: Box { value: 42 } }
+    assert_eq(b.value.value, 42)
+}

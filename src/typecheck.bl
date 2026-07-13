@@ -1234,6 +1234,44 @@ fn tc_produce_struct_instance_tid(ann_node: Int, name: Str, elems_sl: Int) -> In
     -1
 }
 
+// A generic FN PARAM annotation (`b: Box[T]`) must intern as a STRUCTURAL instance
+// tid carrying its type-arg slots — even when every slot is a typevar — so
+// unify_typevar_binds' TK_STRUCT arm (which walks param/arg slots in lockstep) can
+// discover T from a `Box[Box[Int]]` argument (br 8wyq1k). This is the deliberate
+// EXCEPTION to tc_produce_struct_instance_tid's all-typevar skip: that skip guards
+// the annotation/inference HOT path (an all-typevar instance there carries no more
+// info than the bare tid and would only churn the pool). A fn-param annotation is
+// resolved ONCE at register_fn_sig — not hot — and the typevar slots are exactly
+// what the binder needs. Without the slots the fnsig param collapses to the bare
+// `Box` (params_count 0), the arity check in unify_typevar_binds fails, and a
+// bare-typevar return `-> T` bound to a struct instance stays unsubstituted →
+// codegen types the result `void`.
+//
+// Safe for check_arg_shapes: types_compatible treats a typevar slot as compatible
+// with anything (TK_TYPEVAR short-circuit + the element-wise struct-slot compare),
+// so `Box[Box[Int]]` still matches the `Box[T]` param. Returns -1 (caller keeps the
+// bare tid) unless the annotation is a generic user-struct with type-args.
+//
+// The make_struct_instance_type write to ty_pool/ty_param_list is INTENTIONAL (the
+// interned instance is the return value), not speculative — the save/restore here
+// covers only tc_suppress_ann_validation, so the mutation-analyzer flag is expected.
+@allow(UnrestoredMutation)
+fn tc_fnsig_param_instance_tid(ann_node: Int, bare_tid: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
+    if type_kind(bare_tid) != TK_STRUCT { return -1 }
+    let elems_sl = node_elements(ann_node)
+    if elems_sl == -1 || sublist_length(elems_sl) < 1 { return -1 }
+    let saved_suppress = tc_suppress_ann_validation
+    tc_suppress_ann_validation = 1
+    let mut arg_tids: List[Int] = []
+    let mut ai = 0
+    while ai < sublist_length(elems_sl) {
+        arg_tids.push(resolve_type_ann(sublist_get(elems_sl, ai)))
+        ai = ai + 1
+    }
+    tc_suppress_ann_validation = saved_suppress
+    make_struct_instance_type(strip_module_qualifier(node_name(ann_node)), arg_tids)
+}
+
 // LIVE reverse-inference of a struct literal's concrete instance tid (br qw7v90,
 // increment B of the codegen-structured-tids epic). Given the bare generic tid
 // (`Box`) and the StructLit node, unify each declared generic field type (which
@@ -1889,6 +1927,11 @@ fn register_fn_sig(fn_node: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.R
             let mut ptid = TYPE_UNKNOWN
             if ptype_ann != -1 {
                 ptid = resolve_type_ann(ptype_ann)
+                // A generic user-struct param (`Box[T]`) resolves to the BARE base
+                // tid; re-intern it as a structural instance carrying the typevar
+                // slots so unify_typevar_binds can bind T from the argument (8wyq1k).
+                let inst = tc_fnsig_param_instance_tid(ptype_ann, ptid)
+                if inst != -1 { ptid = inst }
             } else if ptype_str != "" {
                 ptid = resolve_type_name(ptype_str)
                 if ptid == -1 {
@@ -8526,6 +8569,57 @@ pub fn tc_tid_struct_arg_struct(tid: Int, idx: Int) -> Str {
     if t.kind != TK_STRUCT { return "" }
     if idx < 0 || idx >= t.params_count { return "" }
     tid_inner_struct(ty_param_list.get(t.params_start + idx).unwrap())
+}
+
+// The raw type-arg SLOT tid for a struct-instance tid, for the codegen struct-lit
+// mono-arg derivation (br zrybya): the sibling _ct / _struct accessors read this
+// slot internally but only surface a CT / bare name, whereas the compound-field
+// fix must feed the whole slot tid to tc_tid_to_c_tag (Option[Int] → "Option_int").
+// Same -1 sentinel contract: a non-struct tid, out-of-range idx, or bare generic
+// base (params_count 0) yields -1.
+pub fn tc_tid_struct_arg_tid(tid: Int, idx: Int) -> Int {
+    if tid < 0 || tid >= ty_pool.len() { return -1 }
+    let t = ty_pool.get(tid).unwrap()
+    if t.kind != TK_STRUCT { return -1 }
+    if idx < 0 || idx >= t.params_count { return -1 }
+    ty_param_list.get(t.params_start + idx).unwrap()
+}
+
+// Whether a struct-instance ARG SLOT tid can be lowered by tc_tid_to_c_tag to a
+// CSV segment that byte-matches the carrier the field VALUE emits — for the codegen
+// struct-lit compound-field fix (br zrybya). This is the compound analogue of
+// tc_struct_slot_encodable (which governs the fn-arg slot path): here we ADMIT a
+// compound (Option/Result/Map) whose inners are all scalars, because
+// tc_tid_to_c_tag then produces exactly the blink_Option_int / blink_Result_int_str
+// carrier the field value registers. We REJECT:
+//   - a struct/enum INSTANCE slot (`Box[Box[Int]]`): the 3xvjcy string path (which
+//     reuses the field's registered mono name) stays authoritative — tc_tid_to_c_tag
+//     erases the inner (bare "Box").
+//   - a compound whose inner is itself a struct/enum or another compound
+//     (`Option[Box[Int]]`, `Option[Option[Int]]`): tc_tid_inner_tag erases the inner
+//     struct to bare "Box" / can diverge; defer (orthogonal follow-up).
+//   - a bare scalar slot: handled by the existing string path unchanged.
+pub fn tc_tid_compound_slot_faithful(tid: Int) -> Bool {
+    if tid < 0 || tid >= ty_pool.len() { return false }
+    let t = ty_pool.get(tid).unwrap()
+    let k = t.kind
+    if k == TK_OPTION { return tc_tid_scalar_only(t.inner1) }
+    if k == TK_RESULT { return tc_tid_scalar_only(t.inner1) && tc_tid_scalar_only(t.inner2) }
+    if k == TK_MAP { return tc_tid_scalar_only(t.inner1) && tc_tid_scalar_only(t.inner2) }
+    false
+}
+
+// True iff `tid` is a plain scalar (int/float/bool/str/char/sized-int) — the shapes
+// whose tc_tid_inner_tag is a lowercase Pascal tag that matches the carrier the
+// field value emits. Excludes struct/enum (name erasure), compounds (nesting), and
+// list/set/bytes/tuple (carrier spelling divergence).
+fn tc_tid_scalar_only(tid: Int) -> Bool {
+    if tid < 0 || tid >= ty_pool.len() { return false }
+    let k = ty_pool.get(tid).unwrap().kind
+    if k == TK_INT || k == TK_FLOAT || k == TK_BOOL || k == TK_STR || k == TK_CHAR { return true }
+    if k == TK_I8 || k == TK_I16 || k == TK_I32 { return true }
+    if k == TK_U8 || k == TK_U16 || k == TK_U32 || k == TK_U64 { return true }
+    false
 }
 
 // mmegcb: the mangled tuple carrier name (Tuple2_int_str) for a TK_TUPLE tid,
