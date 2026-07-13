@@ -61,7 +61,7 @@ import diagnostics.{
     WITH_PTR_BODY_TOO_COMPLEX, FFI_SCOPE_NOT_WITH_RESOURCE,
 }
 import ast.{NodeKind, is_block_bearing}
-import typecheck.{tc_lookup_node_tid, tc_tid_ct, tc_tid_struct, tc_tid_struct_mono_name, tc_tid_tuple_sname, tc_tid_list_elem, is_import_module_name, tc_qualifier_to_module_or_self, suggest_module_member}
+import typecheck.{tc_lookup_node_tid, tc_tid_ct, tc_tid_struct, tc_tid_struct_mono_name, tc_tid_tuple_sname, tc_tid_list_elem, tc_struct_slot_encodable, is_import_module_name, tc_qualifier_to_module_or_self, suggest_module_member}
 
 // Arg offset for trait-qualified builtin calls: MapOps.contains_key(m, k) has receiver at args[0]
 let mut btc_arg_offset: Int = 0
@@ -138,16 +138,27 @@ fn poly_impl_concrete_args(im: Int, obj_str: Str) -> Str {
 // tid twin of poly_impl_concrete_args: the concrete element tid per binder. The
 // canonical `impl[T] Trait[T] for List[T]` binds every binder to the receiver
 // list's element type, so each binder's tid is inner1 of the receiver List tid
-// (memoized on the call's object node). Returns [] when the receiver tid is not
-// a resolvable List (defensive: the def-side emitters then keep the string path
-// for these slots). Positionally aligned with poly_impl_concrete_args' CSV.
+// (memoized on the call's object node). Positionally aligned with
+// poly_impl_concrete_args' CSV.
+//
+// Only carry the element tid when it is slot-encodable — a scalar or a bare
+// unqualified struct/enum, where tc_tid_to_c_tag round-trips to the same segment
+// the CSV twin spells via type_name_from_ct / get_list_elem_struct. Store -1 for
+// every other element (a struct-INSTANCE like Box[Int], or a compound like
+// Option[Int]): the CSV twin spells those as the bare carrier / "Void", so the
+// tid path's inner-carrying tag (tc_tid_to_c_tag -> "Box" / tc_seg_from_tid ->
+// "Option_int") would DIVERGE from the mangled symbol. -1 forces the def-side
+// emitter back onto the string seg, matching the CSV exactly (br ec5qgb; mirrors
+// the register_struct_instance_from_tid gate). Also -1 when the receiver tid is
+// not a resolvable List (tc_tid_list_elem = -1), so both cases stay byte-safe.
 fn poly_impl_concrete_arg_tids(im: Int, recv_node: Int) -> List[Int] {
     let mut tids: List[Int] = []
     let binders_sl = node_impl_binders(im)
     let elem_tid = tc_tid_list_elem(tc_lookup_node_tid(recv_node))
+    let carried = if tc_struct_slot_encodable(elem_tid) { elem_tid } else { -1 }
     let mut bi = 0
     while bi < sublist_length(binders_sl) {
-        tids.push(elem_tid)
+        tids.push(carried)
         bi = bi + 1
     }
     tids
