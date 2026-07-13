@@ -1,0 +1,89 @@
+// Bug wme0hh (codegen-structured-tids epic, def-side beachhead): a NON-generic
+// function whose parameter type is a concrete generic-struct INSTANCE
+// (`b: Box[Str]`) had its C signature lowered to the bare, never-typedef'd
+// `blink_Box` instead of the monomorphized `blink_Box_Str`. The call site
+// correctly built `blink_Box_Str`, so the emitted C failed to compile
+// (`unknown type name 'blink_Box'` / argument-type mismatch). `Box[Int]` only
+// worked by luck — the bare struct's default field width is int64.
+//
+// Root cause: param_c_type (codegen_stmt.bl) took `is_struct_type(ptype)` and
+// returned `c_type_c_name(ptype)` on the BARE head name, ignoring the `[Str]`
+// annotation. This is the "two type universes" split
+// (decisions/compiler-type-representation.md Q2, 5-0): the concrete inner lived
+// only in codegen's string mono registry, unreachable from the plain-fn param
+// path. The fix reads the struct-instance tid typecheck memoizes onto the param
+// annotation node (kvn6w8 make_struct_instance_type) and expands it to the full
+// mono name — so nesting (`Box[Box[Int]]` -> blink_Box_Box_Int) is correct too,
+// where the string helper would have dropped the inner (Box_Box).
+//
+// Gate: these MUST C-compile and run. Byte-identity intentionally breaks here
+// (blink_Box -> blink_Box_Str); the gate is per-symbol mono correctness.
+
+type Box[T] {
+    value: T
+}
+
+type Pair[A, B] {
+    first: A
+    second: B
+}
+
+type Reader {
+    id: Int
+}
+
+// Impl-method params reach the same param_c_type lowering as free fns (via
+// format_impl_params), so a struct-instance param here must also register its
+// carrier typedef before the method's forward decl (review finding on wme0hh).
+trait Reads {
+    fn read(_self, b: Box[Str]) -> Str
+}
+
+impl Reads for Reader {
+    fn read(_self, b: Box[Str]) -> Str {
+        b.value
+    }
+}
+
+fn want_str_box(b: Box[Str]) -> Str {
+    b.value
+}
+
+fn want_int_box(b: Box[Int]) -> Int {
+    b.value
+}
+
+fn want_pair(p: Pair[Str, Int]) -> Str {
+    p.first
+}
+
+fn want_pair_second(p: Pair[Str, Int]) -> Int {
+    p.second
+}
+
+fn unbox_outer(b: Box[Box[Int]]) -> Int {
+    b.value.value
+}
+
+test "Str-instance struct param lowers to its mono carrier" {
+    assert_eq(want_str_box(Box { value: "hi" }), "hi")
+}
+
+test "Int-instance struct param stays correct" {
+    assert_eq(want_int_box(Box { value: 42 }), 42)
+}
+
+test "two-param struct instance param keeps each field type" {
+    let p = Pair { first: "left", second: 7 }
+    assert_eq(want_pair(p), "left")
+    assert_eq(want_pair_second(p), 7)
+}
+
+test "nested struct-instance param monomorphizes the inner" {
+    assert_eq(unbox_outer(Box { value: Box { value: 99 } }), 99)
+}
+
+test "impl-method struct-instance param lowers to its mono carrier" {
+    let r = Reader { id: 1 }
+    assert_eq(r.read(Box { value: "via-impl" }), "via-impl")
+}

@@ -8585,6 +8585,58 @@ pub fn tc_tid_struct_arg_tid(tid: Int, idx: Int) -> Int {
     ty_param_list.get(t.params_start + idx).unwrap()
 }
 
+// The full monomorphized C name STEM for a struct-INSTANCE tid — the mangled
+// `Box_Str` / `Pair_Str_Int` / `Box_Box_Int` codegen prefixes with `blink_` to.
+// This is the def-side reader for the codegen-structured-tids epic (br wme0hh):
+// a NON-generic fn whose param type is a concrete generic-struct instance
+// (`b: Box[Str]`) must lower its C type off the instance tid typecheck memoized
+// onto the param annotation (kvn6w8 make_struct_instance_type), not the bare
+// head name (which codegen's param_c_type erroneously used → the never-typedef'd
+// `blink_Box`).
+//
+// Each arg slot is spelled via tc_tid_to_c_tag EXCEPT a struct-instance slot
+// (params_count>=1), which is expanded RECURSIVELY so nesting is preserved:
+// `Box[Box[Int]]` → outer base `Box` + inner stem `Box_Int` = `Box_Box_Int`,
+// where the string helper (mono_name_from_ann) would read only the inner head
+// name and collapse to `Box_Box`, dropping the `Int`.
+//
+// Returns "" (→ the caller keeps the string path) for a non-struct tid, a bare
+// generic base (params_count 0), or any tid whose transitive slots are not
+// concretely encodable (an unsubstituted typevar/unknown, or a module-qualified
+// struct/enum, which tc_tid_to_c_tag strips and would diverge from the string
+// path's file-derived prefix). The all-concrete same-module case is exactly the
+// wme0hh beachhead; everything else DEFERS, matching test_6zmspt / test_tid_tuple.
+pub fn tc_tid_struct_mono_name(tid: Int) -> Str {
+    if tid < 0 || tid >= ty_pool.len() { return "" }
+    let t = ty_pool.get(tid).unwrap()
+    if t.kind != TK_STRUCT || t.params_count == 0 { return "" }
+    let mut result = strip_module_qualifier(t.name)
+    let mut i = 0
+    while i < t.params_count {
+        let slot = ty_param_list.get(t.params_start + i).unwrap()
+        let seg = tc_tid_struct_slot_seg(slot)
+        if seg == "" { return "" }
+        result = result.concat("_").concat(seg)
+        i = i + 1
+    }
+    result
+}
+
+// The CSV segment a struct-instance arg SLOT contributes to the mono name: the
+// full recursive stem for a nested struct instance (Box_Int), else the plain tag
+// (Str/Int/Option_int) when the slot is faithfully encodable. Returns "" for an
+// unencodable slot (unsubstituted typevar, module-qualified struct/enum) so both
+// the codegen name-builder (tc_tid_struct_mono_name) and the def-side typedef
+// registrar (register_struct_instance_from_tid) DEFER identically to the string
+// path. Kept pub so codegen can gate without reaching the private
+// tc_tid_encodable.
+pub fn tc_tid_struct_slot_seg(slot: Int) -> Str {
+    let nested = tc_tid_struct_mono_name(slot)
+    if nested != "" { return nested }
+    if !tc_tid_encodable(slot) { return "" }
+    tc_tid_to_c_tag(slot)
+}
+
 // Whether a struct-instance ARG SLOT tid can be lowered by tc_tid_to_c_tag to a
 // CSV segment that byte-matches the carrier the field VALUE emits — for the codegen
 // struct-lit compound-field fix (br zrybya). This is the compound analogue of

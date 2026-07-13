@@ -70,6 +70,7 @@ import codegen_types.{
     mut_captured_vars, pop_scope, push_scope,
     reg_effect, reg_fn, reg_fn_as_ffi, reg_fn_node, reg_fn_ret_from_ann, reset_closure_codegen_state, reset_fn_node_registry,
     reg_fn_struct_ret, reg_fn_with_effects, reg_impl_entry, reg_sf_entry,
+    register_mono_instance,
     reset_scope_state, resolve_ret_type_from_ann, resolve_self_type,
     scope_frame_starts, scope_vars,
     sf_closure_sigs, sf_entries, sf_entries_idx, struct_field_defaults, struct_invariants,
@@ -86,7 +87,7 @@ import codegen_stmt.{
     emit_struct_typedef, emit_top_level_let, format_impl_params,
     reset_typedef_emitted_stmt,
 }
-import typecheck.{sanitize_test_name}
+import typecheck.{sanitize_test_name, tc_lookup_node_tid, tc_tid_struct_mono_name, tc_tid_struct, tc_tid_struct_arg_count, tc_tid_struct_arg_tid, tc_tid_struct_slot_seg}
 import codegen_derive.{
     deser_externs_emitted, emit_derive_fn_defs, emit_derive_fn_defs_from,
     derive_counts_now, emit_kops_adapters_late, emit_kops_adapters_from, emit_kops_forward_decls_from,
@@ -266,6 +267,61 @@ fn prepend_extern_one(idx: Int) {
         if line != "" {
             cg_lines.set(idx, "extern {line}")
         }
+    }
+}
+
+// Register the mono struct instance(s) a struct-instance tid names, INNER-FIRST,
+// so emit_mono_typedefs_from (which walks mono_instances in push order) emits the
+// inner typedef before the outer that embeds it by value (`Box[Box[Int]]` →
+// blink_Box_Int before blink_Box_Box_Int). Returns the outer mono name
+// (Box_Str / Box_Box_Int / Pair_Str_Int), or "" for a non-instance / bare /
+// non-encodable tid (the caller then keeps the bare-name string path).
+//
+// The def-side producer for the wme0hh beachhead: a NON-generic fn's / impl
+// method's signature names the instance carrier (param_c_type reading
+// tc_tid_struct_mono_name), so that carrier's typedef must be queued before the
+// fn decl. Each slot's CSV segment matches tc_tid_struct_mono_name /
+// mangle_generic_name exactly, so the registered mono name is byte-identical to
+// the signature's — the same key the call-site struct-lit path
+// (register_mono_instance at emit_struct_lit) mints, so the two dedup to one.
+fn register_struct_instance_from_tid(tid: Int) -> Str ! Codegen.Register {
+    let base = tc_tid_struct(tid)
+    if base == "" { return "" }
+    let count = tc_tid_struct_arg_count(tid)
+    if count < 1 { return "" }
+    let mut args = ""
+    let mut i = 0
+    while i < count {
+        let slot = tc_tid_struct_arg_tid(tid, i)
+        let mut seg = ""
+        if tc_tid_struct_arg_count(slot) >= 1 {
+            // Nested instance (Box[Box[Int]]): register the inner FIRST so its
+            // typedef precedes the outer that embeds it, and reuse its mono name.
+            seg = register_struct_instance_from_tid(slot)
+        } else {
+            seg = tc_tid_struct_slot_seg(slot)
+        }
+        if seg == "" { return "" }
+        if i > 0 { args = args.concat(",") }
+        args = args.concat(seg)
+        i = i + 1
+    }
+    register_mono_instance(base, args)
+}
+
+// Register the struct-instance carrier typedef for every struct-typed param in a
+// param list (free fn or impl method) so it precedes the fn/method forward decl.
+// A non-struct param, or a param whose annotation has no memoized instance tid
+// (bare/typevar), registers nothing (register_struct_instance_from_tid → "").
+fn register_struct_instance_params(params_sl: Int) ! Codegen.Register {
+    if params_sl == -1 { return }
+    let mut i = 0
+    while i < sublist_length(params_sl) {
+        let p = sublist_get(params_sl, i)
+        if is_struct_type(node_type_name(p)) != 0 {
+            register_struct_instance_from_tid(tc_lookup_node_tid(node_type_ann(p)))
+        }
+        i = i + 1
     }
 }
 
@@ -1419,6 +1475,45 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
         into_i = into_i + 1
     }
 
+    // Def-side struct-instance carriers (br wme0hh): a NON-generic fn or impl
+    // method whose PARAM type is a concrete generic-struct instance (`b: Box[Str]`)
+    // lowers its signature to the mono carrier (blink_Box_Str) off the instance
+    // tid — so that carrier's typedef must be registered here, before the fn-decl
+    // pass, and flushed into the pre-decl typedef region below. register_struct_
+    // instance_from_tid mints the inner-first mono_instances entries; the flush at
+    // pre_fn_struct_td_count emits them ahead of the decls that name them.
+    // (Return-typed instances need an extra call-site seam — deferred; see ticket.)
+    let pre_fn_struct_td_count = mono_instances.len()
+    if fns_sl != -1 {
+        let mut pi = 0
+        while pi < sublist_length(fns_sl) {
+            let fn_node2 = sublist_get(fns_sl, pi)
+            if is_generic_fn(node_name(fn_node2)) == 0 {
+                register_struct_instance_params(node_params(fn_node2))
+            }
+            pi = pi + 1
+        }
+    }
+    // Impl-method params reach the same param_c_type lowering via
+    // format_impl_params, so their struct-instance carriers must register here
+    // too — otherwise the method's forward decl names blink_Box_Str before its
+    // typedef (br wme0hh, review finding). Poly-impl (generic) methods lower T at
+    // the deferred mono pass, not here, so skip them.
+    if impls_sl != -1 {
+        let mut ii = 0
+        while ii < sublist_length(impls_sl) {
+            let im = sublist_get(impls_sl, ii)
+            let methods_sl = node_methods(im)
+            if methods_sl != -1 {
+                let mut mj = 0
+                while mj < sublist_length(methods_sl) {
+                    register_struct_instance_params(node_params(sublist_get(methods_sl, mj)))
+                    mj = mj + 1
+                }
+            }
+            ii = ii + 1
+        }
+    }
     if fns_sl != -1 {
         let mut pi = 0
         while pi < sublist_length(fns_sl) {
@@ -1631,6 +1726,10 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
     // Emit tuple types discovered during forward declarations, then merge
     let fwd_lines = cg_lines
     cg_lines = pre_fwd_lines
+    // Def-side struct-instance carriers registered above (br wme0hh): flush their
+    // typedefs into the pre-decl region so a fn signature naming blink_Box_Str
+    // sees the typedef before its own forward decl.
+    emit_mono_typedefs_from(pre_fn_struct_td_count)
     emit_tuple_types_from(early_tuple_count)
     early_tuple_count = emitted_tuple_entries.len()
     // br 4yzsfc (sub-issue B): flush Option/Result carriers registered while

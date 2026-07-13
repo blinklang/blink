@@ -96,6 +96,7 @@ import diagnostics.{
 import pkg.manifest.{manifest_header_is_declared, manifest_name}
 import compiler.{trace}
 import stdlib_native_deps.{stdlib_native_dep_name_by_ffi_symbol}
+import typecheck.{is_import_module_name, tc_lookup_node_tid, tc_tid_struct_mono_name}
 
 fn strip_outer_parens(s: Str) -> Str {
     if s.starts_with("(") && s.ends_with(")") {
@@ -4263,6 +4264,17 @@ pub fn param_c_type(p: Int, ptype: Str) -> Str {
     } else if is_enum_type(ptype) != 0 {
         return c_type_from_tag(ptype)
     } else if is_struct_type(ptype) != 0 {
+        // A concrete generic-struct INSTANCE param (`b: Box[Str]`) must lower to
+        // its monomorphized carrier (blink_Box_Str), not the bare, never-typedef'd
+        // `blink_Box`. Read the struct-instance tid typecheck memoized onto the
+        // annotation node (kvn6w8) and expand it to the full mono stem; this also
+        // gets nesting (Box[Box[Int]] -> blink_Box_Box_Int) right, where the
+        // string helper drops the inner. Empty stem (bare/typevar/module-qualified)
+        // falls back to the bare-name string path unchanged (br wme0hh).
+        let inst_stem = tc_tid_struct_mono_name(tc_lookup_node_tid(node_type_ann(p)))
+        if inst_stem != "" {
+            return c_type_c_name(inst_stem)
+        }
         return c_type_c_name(ptype)
     } else if ptype == "Result" {
         let ta = node_type_ann(p)
@@ -4737,7 +4749,12 @@ pub fn emit_impl_method_def(fn_node: Int, impl_type: Str, im_node: Int) ! Codege
                     let param_ct = if is_enum_type(ptype) != 0 { CT_INT } else { type_from_name(ptype) }
                     set_var(pname, param_ct, 1)
                     if is_struct_type(ptype) != 0 {
-                        set_var_struct(pname, ptype)
+                        // Mirror emit_fn_def / param_c_type: a struct-instance param
+                        // binds to its mono struct name so field reads resolve the
+                        // concrete inner, not the bare generic base (br wme0hh).
+                        let inst_stem = tc_tid_struct_mono_name(tc_lookup_node_tid(node_type_ann(p)))
+                        let struct_name = if inst_stem != "" { inst_stem } else { ptype }
+                        set_var_struct(pname, struct_name)
                     }
                     if is_enum_type(ptype) != 0 {
                         var_enums.push(VarEnumEntry { name: pname, enum_type: ptype })
@@ -5344,7 +5361,13 @@ pub fn emit_fn_def(fn_node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope
                 let param_ct = if is_enum_type(ptype) != 0 { CT_INT } else { type_from_name(ptype) }
                 set_var(pname, param_ct, 1)
                 if is_struct_type(ptype) != 0 {
-                    set_var_struct(pname, ptype)
+                    // Match the monomorphized carrier the signature emits (above):
+                    // a struct-instance param binds its var to the mono struct name
+                    // (Box_Str / Box_Box_Int) so field reads resolve the concrete
+                    // inner, not the bare generic `Box` (br wme0hh).
+                    let inst_stem = tc_tid_struct_mono_name(tc_lookup_node_tid(node_type_ann(p)))
+                    let struct_name = if inst_stem != "" { inst_stem } else { ptype }
+                    set_var_struct(pname, struct_name)
                 }
                 if is_enum_type(ptype) != 0 {
                     var_enums.push(VarEnumEntry { name: pname, enum_type: ptype })
