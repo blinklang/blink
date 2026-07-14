@@ -1,6 +1,6 @@
 import ast.{NodeKind, node_kind_name, is_block_bearing}
 import std.str.{str_to_lower}
-import codegen_types.{is_intrinsic_method, strip_module_qualifier, CT_INT, CT_FLOAT, CT_BOOL, CT_STRING, CT_LIST, CT_VOID, CT_OPTION, CT_RESULT, CT_ITERATOR, CT_HANDLE, CT_CHANNEL, CT_MAP, CT_BYTES, CT_SET, CT_STRUCT, CT_ENUM, CT_I8, CT_I16, CT_I32, CT_U8, CT_U16, CT_U32, CT_U64, CT_CHAR}
+import codegen_types.{is_intrinsic_method, strip_module_qualifier, c_type_tag_for_struct, CT_INT, CT_FLOAT, CT_BOOL, CT_STRING, CT_LIST, CT_VOID, CT_OPTION, CT_RESULT, CT_ITERATOR, CT_HANDLE, CT_CHANNEL, CT_MAP, CT_BYTES, CT_SET, CT_STRUCT, CT_ENUM, CT_I8, CT_I16, CT_I32, CT_U8, CT_U16, CT_U32, CT_U64, CT_CHAR}
 import parser.{
     get_annotation, has_annotation, is_literal_string_part,
     node_args, node_assoc_types, node_arms, node_body, node_captures, node_col, node_condition,
@@ -8400,7 +8400,7 @@ fn tc_tid_inner_tag(tid: Int) -> Str {
     if tid < 0 || tid >= ty_pool.len() { return "void" }
     let t = ty_pool.get(tid).unwrap()
     let k = t.kind
-    if k == TK_STRUCT || k == TK_ENUM { return strip_module_qualifier(t.name) }
+    if k == TK_STRUCT || k == TK_ENUM { return c_type_tag_for_struct(t.name) }
     if k == TK_OPTION { return "Option_{tc_tid_inner_tag(t.inner1)}" }
     if k == TK_RESULT { return "Result_{tc_tid_inner_tag(t.inner1)}_{tc_tid_inner_tag(t.inner2)}" }
     if k == TK_MAP { return "Map_{tc_tid_inner_tag(t.inner1)}_{tc_tid_inner_tag(t.inner2)}" }
@@ -8610,7 +8610,7 @@ pub fn tc_tid_struct_mono_name(tid: Int) -> Str {
     if tid < 0 || tid >= ty_pool.len() { return "" }
     let t = ty_pool.get(tid).unwrap()
     if t.kind != TK_STRUCT || t.params_count == 0 { return "" }
-    let mut result = strip_module_qualifier(t.name)
+    let mut result = c_type_tag_for_struct(t.name)
     let mut i = 0
     while i < t.params_count {
         let slot = ty_param_list.get(t.params_start + i).unwrap()
@@ -8775,7 +8775,21 @@ pub fn tc_tid_to_c_tag(tid: Int) -> Str {
     let t = ty_pool.get(tid).unwrap()
     let k = t.kind
 
-    if k == TK_STRUCT || k == TK_ENUM { return strip_module_qualifier(t.name) }
+    // A struct/enum INSTANCE (params_count>=1, e.g. Box[Int]) recurses its args
+    // to the full mono stem (Box_Int / Box_Box_Int) via tc_tid_struct_mono_name —
+    // the same recursion the def-side registrar uses — so the mono-CSV segment
+    // byte-matches the string path's registered mono name (blink_identity_Box_Int),
+    // not the erased bare head (blink_identity_Box, the nss31w bug). A bare generic
+    // base (params_count 0) or monomorphic struct keeps the bare short name, which
+    // the generic-fn mono suffix spells bare (matches get_var_struct); the module
+    // qualifier is stripped here because THIS consumer (tc_seg_from_tid → mono CSV)
+    // is module-scoped by its own fn symbol — the physical-prefix carrier speller
+    // is the separate tc_tid_inner_tag path (br bwyfy1: two-speller finding).
+    if k == TK_STRUCT || k == TK_ENUM {
+        let stem = tc_tid_struct_mono_name(tid)
+        if stem != "" { return stem }
+        return strip_module_qualifier(t.name)
+    }
     if k == TK_OPTION { return "Option_{tc_tid_inner_tag(t.inner1)}" }
     if k == TK_RESULT { return "Result_{tc_tid_inner_tag(t.inner1)}_{tc_tid_inner_tag(t.inner2)}" }
     if k == TK_TUPLE { return tc_tid_tuple_tag(t) }
@@ -8826,25 +8840,29 @@ fn tc_tid_encodable(tid: Int) -> Bool {
     if k == TK_OPTION { return tc_tid_encodable(t.inner1) }
     if k == TK_RESULT { return tc_tid_encodable(t.inner1) && tc_tid_encodable(t.inner2) }
     if k == TK_MAP { return tc_tid_encodable(t.inner1) && tc_tid_encodable(t.inner2) }
-    // A struct/enum INSTANCE (type-args present, params_count>0, e.g. Box[Int])
-    // diverges from the string path: tc_tid_to_c_tag erases its args to the bare
-    // head ("Box"), while the string inference path resolves the arg to its
-    // already-registered mono name ("Box_Int"). So a call-site CSV built from the
-    // tid would mangle to blink_identity_Box (never-typedef'd) instead of
-    // blink_identity_Box_Int — br nss31w. Defer INSTANCEs to the string path,
-    // mirroring tc_struct_slot_encodable's params_count guard for struct SLOTS.
+    // A struct/enum INSTANCE (type-args present, params_count>=1, e.g. Box[Int]) is
+    // ADMITTED (br bwyfy1 B1): the mono-CSV consumer (tc_seg_from_tid →
+    // tc_tid_to_c_tag) recurses its args to the full mono stem (Box_Int) via
+    // tc_tid_struct_mono_name, byte-matching the string path's registered mono name
+    // (blink_identity_Box_Int) instead of the erased bare head (blink_identity_Box,
+    // the old nss31w bug). Top-level struct/enum args reach this path once a generic
+    // field access on a struct instance memoizes a concrete struct tid (br 365fqj).
     //
-    // A module-qualified struct/enum also diverges: tc_tid_to_c_tag strips the
-    // qualifier (line 8616) while c_type_tag_for_struct keeps the file-derived
-    // module prefix, so the two mangle to different mono symbols — exactly the
-    // trap the tuple-element guard (tc_tid_tuple_encodable) already defers. Top-
-    // level struct/enum args reach this path now that a generic field access on a
-    // struct instance memoizes a concrete struct tid (br 365fqj); a bare
-    // unqualified name (strip is a no-op) stays encodable, an instance or
-    // qualified name defers to the string path. Same-module/user structs are
-    // unqualified → unaffected.
+    // A MODULE-QUALIFIED struct/enum still DEFERS to the string path: the mono-CSV
+    // path spells struct heads bare (this consumer is module-scoped by its own fn
+    // symbol), while the physical-prefix carrier speller (tc_tid_inner_tag) keeps the
+    // file-derived module prefix — the two diverge only for cross-module names. No
+    // fixture exercises a cross-module instance yet, and admitting it needs the
+    // two-speller encoder split (br bwyfy1 defers B2). Same-module/user structs are
+    // unqualified → strip is a no-op → admitted.
+    //
+    // An ENUM INSTANCE (TK_ENUM, params_count>=1) DEFERS: tc_tid_struct_mono_name is
+    // STRUCT-only (returns "" for TK_ENUM), so tc_tid_to_c_tag would fall back to the
+    // bare head and drop the args — the encoder cannot spell it. Generic user enums
+    // are not constructible today, so this is latent, but the guard must not claim a
+    // shape the encoder can't lower. A bare enum (params_count 0) stays admitted.
+    if k == TK_ENUM && t.params_count != 0 { return false }
     if k == TK_STRUCT || k == TK_ENUM {
-        if t.params_count != 0 { return false }
         if strip_module_qualifier(t.name) != t.name { return false }
     }
     true
@@ -8897,6 +8915,14 @@ fn tc_tid_tuple_elem_encodable(tid: Int) -> Bool {
     if k == TK_INT || k == TK_FLOAT || k == TK_BOOL || k == TK_STR || k == TK_CHAR { return true }
     if k == TK_I8 || k == TK_I16 || k == TK_I32 { return true }
     if k == TK_U8 || k == TK_U16 || k == TK_U32 || k == TK_U64 { return true }
+    // A BARE (monomorphic) struct/enum tuple element: tc_tid_inner_tag spells it via
+    // c_type_tag_for_struct (physical prefix), byte-identical to resolve_tuple_ann's
+    // struct-element tag (codegen_types.bl:2402-2405, also c_type_tag_for_struct) for
+    // BOTH same-module and cross-module names — the tuple carrier is a physical seam
+    // on both paths, so no two-speller divergence here (br bwyfy1 B3). A struct/enum
+    // INSTANCE (params_count>=1) still DEFERS: tc_tid_inner_tag erases its args to the
+    // bare head, so a tuple-of-instance would half-lower — keep it on the string path.
+    if k == TK_STRUCT || k == TK_ENUM { return t.params_count == 0 }
     false
 }
 
@@ -8921,10 +8947,15 @@ pub fn tc_seg_from_tid(tid: Int) -> Option[Str] {
 //   - a BARE (params_count 0), UNQUALIFIED struct/enum → the string path stores
 //     the bare name; tc_tid_to_c_tag returns strip_module_qualifier(name) (a no-op
 //     when unqualified). This is the `Box[Inner]` case.
+//   - a same-module STRUCT INSTANCE slot (params_count>=1, `Box[Box[Int]]`) is now
+//     ADMITTED (br bwyfy1 B4): tc_tid_to_c_tag recurses its args to the full mono
+//     stem (Box_Int) via tc_tid_struct_mono_name, so the def-side reader round-trips
+//     it byte-identically to the recursively-registered mono name — closing the -1
+//     hole so arg_tids can key the mono dedup (br 16z0s1).
 // Everything else DEFERS to the string path (return false):
-//   - a struct/enum INSTANCE slot (params_count>=1, `Box[Box[Int]]`) — tid erases
-//     the inner args, string path keeps them (diverges: unbox_Box vs unbox_Box_Int).
 //   - a module-qualified struct/enum — strip diverges from the module-prefixed name.
+//   - an ENUM INSTANCE (params_count>=1) — tc_tid_struct_mono_name is STRUCT-only,
+//     so the encoder can't spell it (generic user enums aren't constructible today).
 //   - Option/Result/Map/List/Set/Bytes/Tuple — carrier-tag spelling/casing is not
 //     provably equal to the arg's stored segment (e.g. Box[Option[Int]] diverges:
 //     tid Option_int vs string path Void/Option_Int); kept deferring until proven.
@@ -8936,8 +8967,11 @@ pub fn tc_struct_slot_encodable(tid: Int) -> Bool {
     if k == TK_INT || k == TK_FLOAT || k == TK_BOOL || k == TK_STR || k == TK_CHAR { return true }
     if k == TK_I8 || k == TK_I16 || k == TK_I32 { return true }
     if k == TK_U8 || k == TK_U16 || k == TK_U32 || k == TK_U64 { return true }
+    // An ENUM INSTANCE (TK_ENUM, params_count>=1) DEFERS: tc_tid_struct_mono_name is
+    // STRUCT-only so the encoder would erase its args to the bare head. Bare enums
+    // (params_count 0) stay admitted below.
+    if k == TK_ENUM && t.params_count != 0 { return false }
     if k == TK_STRUCT || k == TK_ENUM {
-        if t.params_count != 0 { return false }
         return strip_module_qualifier(t.name) == t.name
     }
     false
