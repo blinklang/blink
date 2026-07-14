@@ -10,7 +10,7 @@ import codegen_types.{
     cg_closure_cap_count, cg_closure_cap_start, cg_closure_defs,
     cg_current_fn_has_ev, cg_current_fn_name, cg_current_fn_node, cg_current_fn_option_inner, cg_current_fn_option_inner_struct, cg_current_fn_ret, cg_in_test_body, cg_test_mode, cg_in_assert_panics,
     cg_let_target_ann, cg_expect_arg_ann,
-    cg_mono_tparams_sl, cg_mono_concrete_args,
+    cg_mono_tparams_sl, cg_mono_concrete_args, cg_mono_arg_tids,
     cg_debug_mode, cg_handler_body_field, cg_handler_body_idx,
     cg_handler_body_is_ue, cg_handler_body_vtable_type,
     cg_handler_caps, HandlerCapture,
@@ -88,7 +88,7 @@ import diagnostics.{
 }
 import std.path.{path_dirname}
 import formatter.{format_expr}
-import typecheck.{tc_mono_csv, tc_mono_tids, is_import_module_name, tc_lookup_node_tid, tc_tid_set_elem_ct, tc_tid_set_elem_struct, tc_tid_map_key_ct, tc_tid_map_key_struct, tc_tid_map_val_ct, tc_tid_map_val_struct, tc_tid_ct, tc_tid_option_inner_ct, tc_tid_option_inner_struct, tc_tid_result_ok_ct, tc_tid_result_ok_struct, tc_tid_result_err_ct, tc_tid_result_err_struct, tc_tid_to_c_tag, tc_tid_struct, tc_tid_struct_arg_count, tc_tid_struct_arg_tid, tc_tid_compound_slot_faithful}
+import typecheck.{tc_mono_csv, tc_mono_tids, is_import_module_name, tc_lookup_node_tid, tc_tid_set_elem_ct, tc_tid_set_elem_struct, tc_tid_map_key_ct, tc_tid_map_key_struct, tc_tid_map_val_ct, tc_tid_map_val_struct, tc_tid_ct, tc_tid_option_inner_ct, tc_tid_option_inner_struct, tc_tid_result_ok_ct, tc_tid_result_ok_struct, tc_tid_result_err_ct, tc_tid_result_err_struct, tc_tid_to_c_tag, tc_tid_struct, tc_tid_struct_arg_count, tc_tid_struct_arg_tid, tc_tid_compound_slot_faithful, tc_struct_slot_encodable}
 
 // codegen_expr.bl — Expression codegen, closures, capture analysis
 
@@ -2871,7 +2871,8 @@ pub fn emit_generic_fn_call_tail(node: Int, fn_name: Str, args_str: Str, ca: Gen
                     mono_args = mono_args.concat(resolved_arg)
                     ai = ai + 1
                 }
-                ret_struct_name = register_mono_instance(resolved_ret, mono_args, [])
+                let ret_arg_tids = mono_instance_arg_tids_from_tid(ret_tid, resolved_ret, sublist_length(ret_elems))
+                ret_struct_name = register_mono_instance(resolved_ret, mono_args, ret_arg_tids)
                 set_var_struct("{c_fn_name(mangled)}({call_args})", ret_struct_name)
             }
         }
@@ -4726,14 +4727,18 @@ fn infer_struct_type_args(type_name: Str, field_types: List[Int], field_structs:
 // (tc_tid_to_c_tag would erase their inner). The at-least-one-compound guard confines
 // the change to the previously-broken shapes: a pure-scalar instance keeps its exact
 // current string output (byte-identity for every working shape).
-fn tid_native_struct_mono_args(node: Int, sname: Str) -> Str {
-    // Prefer the enclosing annotation's instance tid (`let oi: Box[Option[Int]]`)
-    // over the literal's own reverse-inferred tid: a bare `None` / `Ok(x)` field
-    // value infers the compound inner as UNKNOWN (Box[Option[?]]), but the
-    // annotation names the concrete inner. resolve_type_ann memoized the concrete
-    // Box[Option[Int]] instance onto the annotation node (tc_produce_struct_instance_tid).
-    // cg_expect_arg_ann wins when it names this struct (a call-arg position);
-    // otherwise cg_let_target_ann. Fall back to the literal node's own tid.
+// The struct-INSTANCE tid backing a struct literal, resolved with the same
+// precedence tid_native_struct_mono_args uses so a caller filling parallel
+// arg_tids agrees byte-for-byte on which instance was named. Prefer the
+// enclosing annotation's instance tid (`let oi: Box[Option[Int]]`) over the
+// literal's own reverse-inferred tid: a bare `None` / `Ok(x)` field value infers
+// the compound inner as UNKNOWN (Box[Option[?]]), but the annotation names the
+// concrete inner. resolve_type_ann memoized the concrete Box[Option[Int]]
+// instance onto the annotation node (tc_produce_struct_instance_tid).
+// cg_expect_arg_ann wins when it names this struct (a call-arg position);
+// otherwise cg_let_target_ann. Falls back to the literal node's own tid.
+// Returns -1 when no memoized tid names this struct.
+fn tid_native_struct_inst_tid(node: Int, sname: Str) -> Int {
     let mut inst_tid = -1
     if cg_expect_arg_ann != -1 && strip_module_qualifier(node_name(cg_expect_arg_ann)) == sname {
         inst_tid = tc_lookup_node_tid(cg_expect_arg_ann)
@@ -4743,8 +4748,14 @@ fn tid_native_struct_mono_args(node: Int, sname: Str) -> Str {
     if inst_tid < 0 || tc_tid_struct(inst_tid) != sname {
         inst_tid = tc_lookup_node_tid(node)
     }
+    if inst_tid < 0 { return -1 }
+    if tc_tid_struct(inst_tid) != sname { return -1 }
+    inst_tid
+}
+
+fn tid_native_struct_mono_args(node: Int, sname: Str) -> Str {
+    let inst_tid = tid_native_struct_inst_tid(node, sname)
     if inst_tid < 0 { return "" }
-    if tc_tid_struct(inst_tid) != sname { return "" }
     let count = tc_tid_struct_arg_count(inst_tid)
     if count < 1 { return "" }
     let mut has_compound = 0
@@ -4770,6 +4781,33 @@ fn tid_native_struct_mono_args(node: Int, sname: Str) -> Str {
         j = j + 1
     }
     args
+}
+
+// Recover the per-slot arg tids for a struct-INSTANCE tid, gated on
+// tc_struct_slot_encodable exactly like register_struct_instance_from_tid
+// (codegen.bl:315-319): an encodable scalar / bare struct slot carries its real
+// tid, an unencodable slot (struct-instance, module-qualified, typevar) stores
+// -1 so the def-side emitter falls back to the string seg. Returns [] unless the
+// tid names `expected_base` with exactly `expected_count` args — so a mismatched
+// or absent memoized tid degrades to the string path (byte-identical), never
+// half-lowers a mismatched instance (br dhrpxw / the -1-hole regression guards).
+fn mono_instance_arg_tids_from_tid(inst_tid: Int, expected_base: Str, expected_count: Int) -> List[Int] {
+    let mut out: List[Int] = []
+    if inst_tid < 0 { return out }
+    if tc_tid_struct(inst_tid) != expected_base { return out }
+    let count = tc_tid_struct_arg_count(inst_tid)
+    if count != expected_count { return out }
+    let mut i = 0
+    while i < count {
+        let slot = tc_tid_struct_arg_tid(inst_tid, i)
+        if tc_struct_slot_encodable(slot) {
+            out.push(slot)
+        } else {
+            out.push(-1)
+        }
+        i = i + 1
+    }
+    out
 }
 
 // A slot tid whose tc_tid_to_c_tag is a plain scalar Pascal tag (Int/Str/…). Kept
@@ -4876,6 +4914,12 @@ fn emit_struct_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
     let td_tparams = if td != -1 { node_type_params(td) } else { -1 }
     let saved_mono_tparams = cg_mono_tparams_sl
     let saved_mono_args = cg_mono_concrete_args
+    // Struct-lit field emission derives its mono context from the string target
+    // args, not a tid list — clear cg_mono_arg_tids so the group-A compound-inner
+    // sites reached during field emission fall back to the string path instead of
+    // reading a stale tid list from an enclosing generic-fn body.
+    let saved_mono_arg_tids = cg_mono_arg_tids
+    cg_mono_arg_tids = []
     if target_args != "" && td_tparams != -1 && sublist_length(td_tparams) > 0 {
         cg_mono_tparams_sl = td_tparams
         cg_mono_concrete_args = target_args
@@ -4990,6 +5034,7 @@ fn emit_struct_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
     }
     cg_mono_tparams_sl = saved_mono_tparams
     cg_mono_concrete_args = saved_mono_args
+    cg_mono_arg_tids = saved_mono_arg_tids
     // The declared let-target args are authoritative when present (they name the
     // instantiation directly); field-VALUE inference is the fallback for an
     // unannotated `let b = GKV { .. }`. Preferring target_args also lets an empty
@@ -4997,6 +5042,11 @@ fn emit_struct_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
     // then records the field's concrete key/value type so per-op recovery agrees
     // with the ctor's kops choice (hnyqe4).
     let mut mono_args = ""
+    // Parallel to mono_args: the concrete arg tids for this instance, filled only
+    // when the tid-native branch below wins (the string branches leave it [] and
+    // the def-side emitter falls back to the string seg). Gated on
+    // tc_struct_slot_encodable — an unencodable slot stores -1 (dhrpxw).
+    let mut mono_arg_tids: List[Int] = []
     if target_args != "" && td_tparams != -1 && sublist_length(td_tparams) > 0 {
         mono_args = target_args
     } else {
@@ -5010,14 +5060,20 @@ fn emit_struct_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
         if mono_args == "" {
             let type_args = infer_struct_type_args(sname, field_types, field_structs)
             if type_args.is_some() { mono_args = type_args.unwrap() }
+        } else {
+            // Tid-native path won: recover the parallel slot tids off the SAME
+            // instance tid it resolved, so the def-side typedef emitter can lower
+            // off tids for the encodable slots (byte-identical to the string seg).
+            let inst_tid = tid_native_struct_inst_tid(node, sname)
+            mono_arg_tids = mono_instance_arg_tids_from_tid(inst_tid, sname, tc_tid_struct_arg_count(inst_tid))
         }
     }
     let mut struct_key = sname
     if mono_args != "" {
-        let mono_name = register_mono_instance(sname, mono_args, [])
+        let mono_name = register_mono_instance(sname, mono_args, mono_arg_tids)
         c_type = c_type_c_name(mono_name)
         struct_key = mono_name
-        register_mono_field_types(sname, mono_name, mono_args, [])
+        register_mono_field_types(sname, mono_name, mono_args, mono_arg_tids)
     }
     emit_line("{c_type} {tmp} = \{ {inits} };")
     set_var_struct(tmp, struct_key)
