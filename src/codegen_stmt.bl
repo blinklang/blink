@@ -51,6 +51,7 @@ import codegen_types.{
     is_intrinsic_method, is_named_type, is_runtime_header_fn, is_stdlib_source_module, is_struct_or_enum_type, is_struct_type, is_trait_type, list_contains_str, list_iter_c_type, skip_private_in_module_header,
     lookup_assoc_type, lookup_impl_type_for_trait, lookup_mono_base, mangle_generic_name, mangle_impl_method, mangle_impl_method_q, match_scrut_enum,
     match_scruts, mono_fns, mono_instances, mono_name_from_ann, mut_captured_vars, option_c_type,
+    strip_module_qualifier,
     poly_impl_method_node, poly_impl_block_node, is_poly_impl_base,
     compound_tag_ct, option_inner_ct_from_tag, option_inner_struct_from_tag,
     option_c_type_mixed, pop_scope, ptr_inner_c_type, push_scope,
@@ -80,7 +81,7 @@ import codegen_types.{
 }
 import codegen_expr.{
     emit_expr, expr_closure_sig, expr_list_elem_struct, expr_list_elem_type,
-    expr_map_key_type, expr_map_val_type, expr_option_inner,
+    expr_map_key_type, expr_map_val_type, expr_map_val_struct, expr_map_key_struct, expr_option_inner,
     expr_option_inner_list_elem, expr_option_inner_list_struct,
     expr_option_inner_map_val_struct, expr_option_inner_map_val_list_elem,
     expr_option_inner_struct, expr_option_is_none, expr_result_err_struct, expr_result_err_type,
@@ -2753,6 +2754,22 @@ fn emit_tuple_destructure(pat_node: Int, source_var: Str, struct_name: Str, is_m
     }
 }
 
+// Stamp a Map let-binding target `name` with the current expr_map_* carrier meta,
+// then clear those globals so they can't leak into the next binding. A generic-
+// struct-INSTANCE Map value (Map[Str, Box[Int]] through a bare-typevar generic-fn
+// return) carries its value struct in expr_map_val_struct so name.get(k) returns
+// Option[Box_Int] instead of Option_int (1452w4). Shared by emit_let_binding and
+// emit_top_level_let, which had byte-identical copies.
+fn apply_map_binding_meta(name: Str) {
+    set_map_types(name, expr_map_key_type, expr_map_val_type, expr_map_val_struct)
+    if expr_map_val_struct != "" { set_map_value_struct(name, expr_map_val_struct) }
+    if expr_map_key_struct != "" { set_map_key_struct(name, expr_map_key_struct) }
+    expr_map_key_type = -1
+    expr_map_val_type = -1
+    expr_map_val_struct = ""
+    expr_map_key_struct = ""
+}
+
 @allow(UnrestoredMutation, IncompleteStateRestore)
 fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
     let val_node = node_value(node)
@@ -2869,7 +2886,19 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
                     let inner_name = node_name(inner_ann)
                     let inner_ct = type_from_name(inner_name)
                     if is_struct_type(inner_name) != 0 || is_enum_type(inner_name) != 0 {
-                        opt_inner_s = inner_name
+                        // A generic struct INSTANCE inner (Option[Box[Int]]) must
+                        // carry its recursive mono stem (Box_Int), not the erased
+                        // bare head (Box) — otherwise the option carrier embeds a
+                        // never-typedef'd blink_Box* (1452w4). Prefer the RHS-provided
+                        // struct (expr_option_inner_struct, already the fully-recursive
+                        // Box_Box_Int from the emitted Some payload) exactly as the
+                        // Result path prefers expr_result_ok_struct; only fall to the
+                        // annotation's one-level mono_name_from_ann when the RHS gave
+                        // nothing. Mirror resolve_ann_tag's fallback for the bare case.
+                        if opt_inner_s == "" {
+                            let mono = mono_name_from_ann(strip_module_qualifier(inner_name), inner_ann, -1, "")
+                            opt_inner_s = if mono != "" { mono } else { inner_name }
+                        }
                         opt_inner_ct = inner_ct
                     } else if is_compound_ct(inner_ct) != 0 || inner_name == "Tuple" {
                         opt_inner_s = compound_name_from_ann(inner_ann)
@@ -2923,7 +2952,8 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
                     // their own CT/struct from expr_result_ok_* — do NOT override
                     // them to CT_INT (that erases the Map/List element type).
                     if is_struct_type(ok_name) != 0 || is_enum_type(ok_name) != 0 {
-                        rok_s = ok_name
+                        let ok_mono = mono_name_from_ann(strip_module_qualifier(ok_name), ok_ann, -1, "")
+                        rok_s = if ok_mono != "" { ok_mono } else { ok_name }
                         rok_t = CT_INT
                     } else if ok_name == "Tuple" {
                         let ok_tag = resolve_result_inner_tag(ok_ann, ok_name, type_from_name(ok_name))
@@ -2937,7 +2967,8 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
                     let err_ann = sublist_get(ann_elems, 1)
                     let err_name = node_name(err_ann)
                     if is_struct_type(err_name) != 0 || is_enum_type(err_name) != 0 {
-                        rerr_s = err_name
+                        let err_mono = mono_name_from_ann(strip_module_qualifier(err_name), err_ann, -1, "")
+                        rerr_s = if err_mono != "" { err_mono } else { err_name }
                         rerr_t = CT_INT
                     } else if err_name == "Tuple" {
                         let err_tag = resolve_result_inner_tag(err_ann, err_name, type_from_name(err_name))
@@ -3104,9 +3135,7 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
         expr_list_elem_struct = ""
     }
     if val_type == CT_MAP && expr_map_key_type >= 0 {
-        set_map_types(name, expr_map_key_type, expr_map_val_type, "")
-        expr_map_key_type = -1
-        expr_map_val_type = -1
+        apply_map_binding_meta(name)
     }
     if val_type == CT_MAP {
         copy_map_value_meta(val_str, name)
@@ -7245,9 +7274,7 @@ pub fn emit_top_level_let(node: Int, extern_only: Int) ! Codegen.Emit, Codegen.R
         expr_list_elem_struct = ""
     }
     if val_type == CT_MAP && expr_map_key_type >= 0 {
-        set_map_types(name, expr_map_key_type, expr_map_val_type, "")
-        expr_map_key_type = -1
-        expr_map_val_type = -1
+        apply_map_binding_meta(name)
     }
     if val_type == CT_MAP {
         copy_map_value_meta(val_str, name)

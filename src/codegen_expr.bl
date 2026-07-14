@@ -53,6 +53,7 @@ import codegen_types.{
     is_scope_var,
     is_struct_or_enum_type, is_struct_type, is_trait_type,
     list_contains_str, list_iter_c_type, lookup_mono_base, mangle_generic_name,
+    mono_name_from_ann,
     mut_captured_vars,
     option_c_type, pop_scope, push_scope,
     reg_fn, reg_fn_ret_from_ann, reg_fn_ret_struct_inner,
@@ -109,6 +110,8 @@ pub let mut expr_list_elem_type: Int = -1
 pub let mut expr_list_elem_struct: Str = ""
 pub let mut expr_map_key_type: Int = -1
 pub let mut expr_map_val_type: Int = -1
+pub let mut expr_map_val_struct: Str = ""
+pub let mut expr_map_key_struct: Str = ""
 pub let mut expr_option_is_none: Int = 0
 pub let mut expr_option_inner_list_elem: Int = -1
 pub let mut expr_option_inner_list_struct: Str = ""
@@ -2435,8 +2438,15 @@ type ArgMapInfo {
 // Carrier type for one side of a Result/Option from a type-annotation element
 // name: a struct/enum name carries as CT_INT with struct_name set; everything
 // else carries as `fallback` with no struct.
-fn carrier_from_elem_name(name: Str, fallback: Int) -> CarrierInfo {
+fn carrier_from_elem_name(name: Str, fallback: Int, ann_node: Int) -> CarrierInfo {
     if is_struct_type(name) != 0 || is_enum_type(name) != 0 {
+        // A generic struct INSTANCE side (Box[Int]) must carry its recursive mono
+        // stem (Box_Int) by value, not the erased bare head (Box) — otherwise the
+        // carrier typedef embeds `blink_Box ok` which is never typedef'd (1452w4).
+        // The type-args live in ann_node's elements, invisible to the head name, so
+        // recurse the annotation exactly like resolve_result_inner_tag.
+        let mono = mono_name_from_ann(strip_module_qualifier(name), ann_node, -1, "")
+        if mono != "" { return CarrierInfo { type_const: CT_INT, struct_name: mono } }
         return CarrierInfo { type_const: CT_INT, struct_name: name }
     }
     CarrierInfo { type_const: fallback, struct_name: "" }
@@ -2710,6 +2720,8 @@ pub fn emit_generic_fn_call_tail(node: Int, fn_name: Str, args_str: Str, ca: Gen
     let fn_trusted = has_annotation(gfn_node, "trusted")
     reg_fn_with_effects(mangled, ret_type, fn_eff_sl, fn_trusted)
     let call_args = append_ev_arg(mangled, args_str)
+    let mut map_ret_val_struct = ""
+    let mut map_ret_key_struct = ""
     if ret_type == CT_OPTION {
         let ret_ann = node_type_ann(gfn_node)
         let ann_elems = if ret_ann != -1 { node_elements(ret_ann) } else { -1 }
@@ -2817,6 +2829,19 @@ pub fn emit_generic_fn_call_tail(node: Int, fn_name: Str, args_str: Str, ca: Gen
             let v_name = resolve_tparam(node_name(v_ann), tparams_sl, ta_str)
             expr_map_key_type = type_from_name(k_name)
             expr_map_val_type = type_from_name(v_name)
+            // An annotated generic Map return whose value is a struct INSTANCE
+            // (`-> Map[Str, Box[T]]`) erases the value to bare "Box" otherwise, so
+            // name.get(k) reads the pointer payload as a by-value struct (1452w4).
+            // Recover the recursive value/key stems from the annotation's mono, in
+            // the fn's mono context (tparams_sl/ta_str resolves the T binding).
+            if is_struct_type(v_name) != 0 || is_enum_type(v_name) != 0 {
+                map_ret_val_struct = mono_name_from_ann(strip_module_qualifier(v_name), v_ann, tparams_sl, ta_str)
+                if map_ret_val_struct == "" { map_ret_val_struct = strip_module_qualifier(v_name) }
+            }
+            if is_struct_type(k_name) != 0 || is_enum_type(k_name) != 0 {
+                map_ret_key_struct = mono_name_from_ann(strip_module_qualifier(k_name), k_ann, tparams_sl, ta_str)
+                if map_ret_key_struct == "" { map_ret_key_struct = strip_module_qualifier(k_name) }
+            }
         } else if tid_ct == CT_MAP {
             // Bare-typevar return `-> T` bound to Map[K,V]: recover key/value
             // CTs from the memoized tid (ma6n41). Unlike Option/Result, a bare
@@ -2830,6 +2855,13 @@ pub fn emit_generic_fn_call_tail(node: Int, fn_name: Str, args_str: Str, ca: Gen
             // "unset" default the downstream >= 0 gates already expect.
             expr_map_key_type = tc_tid_map_key_ct(ret_tid)
             expr_map_val_type = tc_tid_map_val_ct(ret_tid)
+            // A generic-struct-INSTANCE Map value (Map[Str, Box[Int]] through a
+            // bare-typevar return) loses its value struct otherwise, so `m2.get(k)`
+            // returns Option_int and reads the pointer payload as a by-value struct
+            // (1452w4). Register the recovered val/key structs on the map result
+            // string; the let-binding's copy_map_value_meta carries them onto the var.
+            map_ret_val_struct = tc_tid_map_val_struct(ret_tid)
+            map_ret_key_struct = tc_tid_map_key_struct(ret_tid)
         }
     } else if ret_type == CT_STRUCT && rerouted {
         // Bare-typevar return `-> T` bound to a struct INSTANCE (unbox(outer) :
@@ -2885,6 +2917,12 @@ pub fn emit_generic_fn_call_tail(node: Int, fn_name: Str, args_str: Str, ca: Gen
     }
     expr_result_str = "{c_fn_name(mangled)}({call_args})"
     expr_result_type = ret_type
+    // Always publish the map value/key struct globals (empty for a non-map or a
+    // scalar-valued map) so a struct-valued map call never leaks its stem into the
+    // NEXT map binding — mirrors the plain-fn path's unconditional struct resets
+    // (expr_result_ok_struct/expr_option_inner_struct) at emit_call (1452w4).
+    expr_map_val_struct = map_ret_val_struct
+    expr_map_key_struct = map_ret_key_struct
     1
 }
 
@@ -3584,7 +3622,7 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                 let ok_str = expr_result_str
                 let ok_inner_ct = expr_result_type
                 let ok_inner_struct = get_var_struct(ok_str)
-                let mut ok_c = carrier_from_elem_name(ok_name, ok_inner_ct)
+                let mut ok_c = carrier_from_elem_name(ok_name, ok_inner_ct, exp_ok_ann)
                 // When the expected ok ann is a generic type-param (e.g.
                 // `Result[T, Str]`), carrier_from_elem_name leaves struct_name empty
                 // (it only sets it for a concrete struct/enum) — recover the
@@ -3605,7 +3643,7 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                 // `void ok`/`void err`. emit_expr above ensured the ok payload's
                 // inner typedef; ensure the (non-emitted) err side's too.
                 ok_c = upgrade_compound_carrier(ok_c, exp_ok_ann)
-                let mut err_c = carrier_from_elem_name(err_name, type_from_name(err_name))
+                let mut err_c = carrier_from_elem_name(err_name, type_from_name(err_name), exp_err_ann)
                 err_c = upgrade_compound_carrier(err_c, exp_err_ann)
                 if err_c.struct_name != "" { ensure_carrier_from_tag(err_c.struct_name) }
                 emit_ok_result(ok_str, ok_c.type_const, err_c.type_const, ok_c.struct_name, err_c.struct_name)
@@ -3711,13 +3749,13 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                 cg_expect_arg_ann = saved_arg_ann
                 cg_let_target_ann = saved_let_ann
                 let err_str = expr_result_str
-                let mut ok_c = carrier_from_elem_name(ok_name, type_from_name(ok_name))
+                let mut ok_c = carrier_from_elem_name(ok_name, type_from_name(ok_name), exp_err_result_ann)
                 // The ok side is not emitted in an Err construction; upgrade a
                 // compound ok annotation and ensure its inner typedef so the
                 // carrier matches the Ok-construction of the same Result type.
                 ok_c = upgrade_compound_carrier(ok_c, exp_err_result_ann)
                 if ok_c.struct_name != "" { ensure_carrier_from_tag(ok_c.struct_name) }
-                let mut err_c = carrier_from_elem_name(err_name, expr_result_type)
+                let mut err_c = carrier_from_elem_name(err_name, expr_result_type, exp_err_ann)
                 if err_c.struct_name == "" {
                     err_c = carrier_from_emitted(err_str, expr_result_type)
                 }
@@ -4014,6 +4052,8 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
         expr_result_err_struct = ""
         expr_option_inner_struct = ""
         expr_list_elem_struct = ""
+        expr_map_val_struct = ""
+        expr_map_key_struct = ""
         if expr_result_type == CT_RESULT {
             expr_result_ok_type = tp_child1_kind(rt.tp_id)
             expr_result_err_type = tp_child2_kind(rt.tp_id)
