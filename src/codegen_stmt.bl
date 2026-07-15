@@ -50,7 +50,7 @@ import codegen_types.{
     is_compound_ct, is_data_enum, is_enum_type, is_transparent_newtype,
     is_intrinsic_method, is_named_type, is_runtime_header_fn, is_stdlib_source_module, is_struct_or_enum_type, is_struct_type, is_trait_type, list_contains_str, list_iter_c_type, skip_private_in_module_header,
     lookup_assoc_type, lookup_impl_type_for_trait, lookup_mono_base, mangle_generic_name, mangle_impl_method, mangle_impl_method_q, match_scrut_enum,
-    match_scruts, mono_fns, mono_instances, mono_name_from_ann, mono_phys_base, mut_captured_vars, option_c_type,
+    match_scruts, mono_fns, mono_instances, mono_name_from_ann, mono_phys_base, mut_captured_vars, option_c_type, register_mono_instance,
     strip_module_qualifier,
     poly_impl_method_node, poly_impl_block_node, is_poly_impl_base,
     compound_tag_ct, option_inner_ct_from_tag, option_inner_struct_from_tag,
@@ -97,7 +97,7 @@ import diagnostics.{
 import pkg.manifest.{manifest_header_is_declared, manifest_name}
 import compiler.{trace}
 import stdlib_native_deps.{stdlib_native_dep_name_by_ffi_symbol}
-import typecheck.{is_import_module_name, tc_lookup_node_tid, tc_tid_struct_mono_name, tc_seg_from_tid}
+import typecheck.{is_import_module_name, tc_lookup_node_tid, tc_tid_struct_mono_name, tc_seg_from_tid, tc_tid_struct, tc_tid_struct_arg_count, tc_tid_struct_arg_tid, tc_tid_struct_slot_seg, tc_struct_slot_encodable, tc_tid_result_ok_tid, tc_tid_result_err_tid, tc_tid_option_inner_tid}
 
 fn strip_outer_parens(s: Str) -> Str {
     if s.starts_with("(") && s.ends_with(")") {
@@ -2796,6 +2796,14 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
         cg_let_target_type = ann_ct
         cg_let_target_name = node_name(type_ann)
         cg_let_target_ann = type_ann
+        // A body-local carrier over struct instances (`let r: Result[RBox[Int],
+        // RBox[Str]] = Ok(..)`) is named in no signature, so the pre-fn pass never
+        // registered its leaves; a leaf appearing in no RHS literal (the RBox[Str]
+        // err arm above) is otherwise never registered at all and erases to `void`.
+        // Register the carrier's struct-instance leaves from the annotation tid
+        // before the RHS emits the carrier typedef (br f9mqbq). No-op for a scalar
+        // carrier or a non-carrier annotation (tid -1 / kind mismatch).
+        register_carrier_struct_instance_leaves(tc_lookup_node_tid(type_ann))
     } else {
         cg_let_target_type = 0
         cg_let_target_name = ""
@@ -5783,6 +5791,96 @@ pub fn register_mono_field_types(base_name: Str, mono_name: Str, concrete_args: 
             reg_sf_entry(mono_name, fname, CT_INT, "", sv_tp(CT_INT, -1, -1, ""))
         }
         i = i + 1
+    }
+}
+
+// Register the mono struct instance(s) a struct-instance tid names, INNER-FIRST,
+// so emit_mono_typedefs_from (which walks mono_instances in push order) emits the
+// inner typedef before the outer that embeds it by value (`Box[Box[Int]]` →
+// blink_Box_Int before blink_Box_Box_Int). Returns the outer mono name
+// (Box_Str / Box_Box_Int / Pair_Str_Int), or "" for a non-instance / bare /
+// non-encodable tid (the caller then keeps the bare-name string path).
+//
+// The def-side producer for the wme0hh beachhead: a NON-generic fn's / impl
+// method's signature names the instance carrier (param_c_type reading
+// tc_tid_struct_mono_name), so that carrier's typedef must be queued before the
+// fn decl. Each slot's CSV segment matches tc_tid_struct_mono_name /
+// mangle_generic_name exactly, so the registered mono name is byte-identical to
+// the signature's — the same key the call-site struct-lit path
+// (register_mono_instance at emit_struct_lit) mints, so the two dedup to one.
+// Lives here (not codegen.bl) so both the pre-fn signature pass AND the body-local
+// let pass (emit_let_binding) can register carrier leaves (br f9mqbq).
+pub fn register_struct_instance_from_tid(tid: Int) -> Str ! Codegen.Register {
+    let base = tc_tid_struct(tid)
+    if base == "" { return "" }
+    let count = tc_tid_struct_arg_count(tid)
+    if count < 1 { return "" }
+    let mut args = ""
+    let mut arg_tids: List[Int] = []
+    let mut i = 0
+    while i < count {
+        let slot = tc_tid_struct_arg_tid(tid, i)
+        let mut seg = ""
+        if tc_tid_struct_arg_count(slot) >= 1 {
+            // Nested instance (Box[Box[Int]]): register the inner FIRST so its
+            // typedef precedes the outer that embeds it, and reuse its mono name.
+            seg = register_struct_instance_from_tid(slot)
+        } else {
+            seg = tc_tid_struct_slot_seg(slot)
+        }
+        if seg == "" { return "" }
+        if i > 0 { args = args.concat(",") }
+        args = args.concat(seg)
+        // Carry the slot tid when it is slot-encodable. Post-bwyfy1-B1/B4 that now
+        // INCLUDES a same-module struct-INSTANCE slot (Box[Box[Int]] -> inner
+        // Box[Int], params_count>=1): tc_tid_to_c_tag recurses its args to the full
+        // mono stem (Box_Int), so the def-side reader (tc_seg_from_tid) round-trips
+        // to `seg` byte-identically, and arg_tids can key the mono dedup (br 16z0s1).
+        // A genuinely unencodable slot (module-qualified struct/enum — B2 deferred —
+        // or a typevar/unknown) still stores -1 so the def-side emitter falls back to
+        // the string seg (br ec5qgb / wme0hh regression guard).
+        if tc_struct_slot_encodable(slot) {
+            arg_tids.push(slot)
+        } else {
+            arg_tids.push(-1)
+        }
+        i = i + 1
+    }
+    register_mono_instance(base, args, arg_tids)
+}
+
+// Register any generic-struct INSTANCE leaves reachable inside an Option/Result
+// carrier tid, inner-first, so the carrier typedef that embeds them by value
+// (blink_Result_RBox_Int_RBox_Str) sees blink_RBox_Int/blink_RBox_Str already in
+// the mono registry — making is_mono_struct_instance recognize the member (else it
+// erases to `void`) and emit_mono_typedefs_from flush their typedefs ahead of the
+// carrier (br f9mqbq). Registration is TID-driven (register_struct_instance_from_tid),
+// so a multi-type-param leaf (Pair[Int,Str]) keeps its structured args — the mono
+// name string tag alone cannot recover the comma boundaries. A non-carrier / scalar
+// -leaf tid registers nothing. Recurses so a nested carrier
+// (Option[Result[RBox[Int],Str]]) is covered.
+pub fn register_carrier_struct_instance_leaves(tid: Int) ! Codegen.Register {
+    if tid < 0 { return }
+    let ok_tid = tc_tid_result_ok_tid(tid)
+    if ok_tid >= 0 {
+        register_carrier_leaf_or_instance(ok_tid)
+        register_carrier_leaf_or_instance(tc_tid_result_err_tid(tid))
+        return
+    }
+    let opt_tid = tc_tid_option_inner_tid(tid)
+    if opt_tid >= 0 {
+        register_carrier_leaf_or_instance(opt_tid)
+    }
+}
+
+// Register `leaf` when it is a struct instance; otherwise recurse in case it is
+// itself a nested carrier over instances.
+fn register_carrier_leaf_or_instance(leaf: Int) ! Codegen.Register {
+    if leaf < 0 { return }
+    if tc_tid_struct(leaf) != "" {
+        register_struct_instance_from_tid(leaf)
+    } else {
+        register_carrier_struct_instance_leaves(leaf)
     }
 }
 

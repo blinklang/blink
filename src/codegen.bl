@@ -86,8 +86,9 @@ import codegen_stmt.{
     emit_impl_method_def, emit_mono_fn_decls_range, emit_mono_fns_from, emit_mono_typedefs_from,
     emit_struct_typedef, emit_top_level_let, format_impl_params,
     reset_typedef_emitted_stmt,
+    register_struct_instance_from_tid, register_carrier_struct_instance_leaves,
 }
-import typecheck.{sanitize_test_name, tc_lookup_node_tid, tc_tid_struct_mono_name, tc_tid_struct, tc_tid_struct_arg_count, tc_tid_struct_arg_tid, tc_tid_struct_slot_seg, tc_struct_slot_encodable}
+import typecheck.{sanitize_test_name, tc_lookup_node_tid, tc_tid_struct_mono_name}
 import codegen_derive.{
     deser_externs_emitted, emit_derive_fn_defs, emit_derive_fn_defs_from,
     derive_counts_now, emit_kops_adapters_late, emit_kops_adapters_from, emit_kops_forward_decls_from,
@@ -284,56 +285,25 @@ fn prepend_extern_one(idx: Int) {
 // mangle_generic_name exactly, so the registered mono name is byte-identical to
 // the signature's — the same key the call-site struct-lit path
 // (register_mono_instance at emit_struct_lit) mints, so the two dedup to one.
-fn register_struct_instance_from_tid(tid: Int) -> Str ! Codegen.Register {
-    let base = tc_tid_struct(tid)
-    if base == "" { return "" }
-    let count = tc_tid_struct_arg_count(tid)
-    if count < 1 { return "" }
-    let mut args = ""
-    let mut arg_tids: List[Int] = []
-    let mut i = 0
-    while i < count {
-        let slot = tc_tid_struct_arg_tid(tid, i)
-        let mut seg = ""
-        if tc_tid_struct_arg_count(slot) >= 1 {
-            // Nested instance (Box[Box[Int]]): register the inner FIRST so its
-            // typedef precedes the outer that embeds it, and reuse its mono name.
-            seg = register_struct_instance_from_tid(slot)
-        } else {
-            seg = tc_tid_struct_slot_seg(slot)
-        }
-        if seg == "" { return "" }
-        if i > 0 { args = args.concat(",") }
-        args = args.concat(seg)
-        // Carry the slot tid when it is slot-encodable. Post-bwyfy1-B1/B4 that now
-        // INCLUDES a same-module struct-INSTANCE slot (Box[Box[Int]] -> inner
-        // Box[Int], params_count>=1): tc_tid_to_c_tag recurses its args to the full
-        // mono stem (Box_Int), so the def-side reader (tc_seg_from_tid) round-trips
-        // to `seg` byte-identically, and arg_tids can key the mono dedup (br 16z0s1).
-        // A genuinely unencodable slot (module-qualified struct/enum — B2 deferred —
-        // or a typevar/unknown) still stores -1 so the def-side emitter falls back to
-        // the string seg (br ec5qgb / wme0hh regression guard).
-        if tc_struct_slot_encodable(slot) {
-            arg_tids.push(slot)
-        } else {
-            arg_tids.push(-1)
-        }
-        i = i + 1
-    }
-    register_mono_instance(base, args, arg_tids)
-}
-
 // Register the struct-instance carrier typedef for every struct-typed param in a
 // param list (free fn or impl method) so it precedes the fn/method forward decl.
 // A non-struct param, or a param whose annotation has no memoized instance tid
 // (bare/typevar), registers nothing (register_struct_instance_from_tid → "").
+// register_struct_instance_from_tid / register_carrier_struct_instance_leaves live
+// in codegen_types so the body-local let path (codegen_stmt) can share them.
 fn register_struct_instance_params(params_sl: Int) ! Codegen.Register {
     if params_sl == -1 { return }
     let mut i = 0
     while i < sublist_length(params_sl) {
         let p = sublist_get(params_sl, i)
+        let ptid = tc_lookup_node_tid(node_type_ann(p))
         if is_struct_type(node_type_name(p)) != 0 {
-            register_struct_instance_from_tid(tc_lookup_node_tid(node_type_ann(p)))
+            register_struct_instance_from_tid(ptid)
+        } else {
+            // A carrier PARAM over struct instances (`x: Result[RBox[Int],..]`)
+            // names blink_RBox_Int by value in its typedef; register that leaf
+            // here too, symmetric to the return path (br f9mqbq).
+            register_carrier_struct_instance_leaves(ptid)
         }
         i = i + 1
     }
@@ -1527,8 +1497,15 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
                 // return-annotation tid, so queue that carrier's typedef here
                 // too, before the fn-decl pass names it (br ns7qdm). Nesting
                 // is handled inner-first by the recursive registrar.
+                let ret_tid = tc_lookup_node_tid(node_type_ann(fn_node2))
                 if is_struct_type(node_return_type(fn_node2)) != 0 {
-                    register_struct_instance_from_tid(tc_lookup_node_tid(node_type_ann(fn_node2)))
+                    register_struct_instance_from_tid(ret_tid)
+                } else {
+                    // A carrier RETURN over struct instances
+                    // (`-> Result[RBox[Int],RBox[Str]]`) names blink_RBox_Int by
+                    // value in the carrier typedef, so register those leaves here
+                    // ahead of the pre-decl flush (br f9mqbq).
+                    register_carrier_struct_instance_leaves(ret_tid)
                 }
             }
             pi = pi + 1
@@ -1554,8 +1531,11 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
                     // Method return carrier (`-> Box[Str]`), same rationale as
                     // free fns above. Typevar-slot returns (poly-impl `-> T`)
                     // and `Self` yield "" from the registrar → no-op (br ns7qdm).
+                    let m_ret_tid = tc_lookup_node_tid(node_type_ann(method_node))
                     if is_struct_type(node_return_type(method_node)) != 0 {
-                        register_struct_instance_from_tid(tc_lookup_node_tid(node_type_ann(method_node)))
+                        register_struct_instance_from_tid(m_ret_tid)
+                    } else {
+                        register_carrier_struct_instance_leaves(m_ret_tid)
                     }
                     mj = mj + 1
                 }
@@ -1620,6 +1600,16 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
         }
     }
 
+    // Flush the pre-fn mono struct-INSTANCE typedefs (registered above from
+    // param/return carriers over instances, br f9mqbq) BEFORE the option/result
+    // carrier flush, so a carrier like blink_Result_RBox_Int_RBox_Str sees
+    // blink_RBox_Int/blink_RBox_Str already declared instead of referencing them by
+    // value before their typedef. The later emit_mono_typedefs_from at the
+    // forward-decl merge re-covers the same range; its emitted lines are guarded by
+    // BLINK_TD_ (idempotent at the C level) and it still catches instances
+    // registered during the fn-decl pass. Same discipline as the existing
+    // multi-point option/result flushes.
+    emit_mono_typedefs_from(pre_fn_struct_td_count)
     emit_all_option_result_types()
     emit_all_tuple_types()
     let mut early_tuple_count = emitted_tuple_entries.len()

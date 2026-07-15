@@ -1108,6 +1108,42 @@ fn tc_should_check_fn(name: Str) -> Int {
 
 // ── Type annotation resolution ──────────────────────────────────────
 
+// Memoize a compound-carrier tid (Option/Result) onto its annotation node when it
+// carries a generic-struct INSTANCE leaf, so the codegen pre-fn / let-binding pass
+// can recurse the carrier's inners back through register_struct_instance_from_tid
+// and register blink_RBox_Int ahead of the carrier typedef that names it by value
+// (br f9mqbq). Like tc_produce_struct_instance_tid, this writes a slot that is
+// otherwise -1 for annotation nodes (they never reach infer_type), and only the new
+// codegen reader consumes it — so the pass stays byte-identical. Gated on an
+// instance leaf so a scalar carrier (Result[Int,Str]) leaves its slot -1.
+fn tc_memo_carrier_over_instance(ann_node: Int, carrier_tid: Int) {
+    if ann_node < 0 || ann_node >= tc_node_tid.len() { return }
+    if tc_carrier_has_instance_leaf(carrier_tid) == 0 { return }
+    tc_node_tid.set(ann_node, carrier_tid)
+}
+
+// True when an Option/Result carrier tid has (possibly nested) a struct/enum
+// INSTANCE leaf (params_count >= 1). A bare struct leaf (Box, no args) or scalar
+// returns 0 — those never need pre-registration.
+fn tc_carrier_has_instance_leaf(tid: Int) -> Int {
+    if tid < 0 || tid >= ty_pool.len() { return 0 }
+    let t = ty_pool.get(tid).unwrap()
+    if t.kind == TK_OPTION { return tc_leaf_is_instance_or_carrier(t.inner1) }
+    if t.kind == TK_RESULT {
+        if tc_leaf_is_instance_or_carrier(t.inner1) != 0 { return 1 }
+        return tc_leaf_is_instance_or_carrier(t.inner2)
+    }
+    0
+}
+
+fn tc_leaf_is_instance_or_carrier(tid: Int) -> Int {
+    if tid < 0 || tid >= ty_pool.len() { return 0 }
+    let t = ty_pool.get(tid).unwrap()
+    if t.kind == TK_STRUCT && t.params_count >= 1 { return 1 }
+    if t.kind == TK_OPTION || t.kind == TK_RESULT { return tc_carrier_has_instance_leaf(tid) }
+    0
+}
+
 fn resolve_type_ann(ann_node: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
     if ann_node == -1 {
         return TYPE_UNKNOWN
@@ -1125,7 +1161,9 @@ fn resolve_type_ann(ann_node: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
     if name == "Option" {
         if elems_sl != -1 && sublist_length(elems_sl) >= 1 {
             let inner = resolve_type_ann(sublist_get(elems_sl, 0))
-            return make_option_type(inner)
+            let opt = make_option_type(inner)
+            tc_memo_carrier_over_instance(ann_node, opt)
+            return opt
         }
         return make_option_type(TYPE_UNKNOWN)
     }
@@ -1133,7 +1171,9 @@ fn resolve_type_ann(ann_node: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
         if elems_sl != -1 && sublist_length(elems_sl) >= 2 {
             let ok_t = resolve_type_ann(sublist_get(elems_sl, 0))
             let err_t = resolve_type_ann(sublist_get(elems_sl, 1))
-            return make_result_type(ok_t, err_t)
+            let res = make_result_type(ok_t, err_t)
+            tc_memo_carrier_over_instance(ann_node, res)
+            return res
         }
         return make_result_type(TYPE_UNKNOWN, TYPE_UNKNOWN)
     }
@@ -8785,6 +8825,35 @@ pub fn tc_tid_result_err_struct(tid: Int) -> Str {
     let t = ty_pool.get(tid).unwrap()
     if t.kind != TK_RESULT { return "" }
     tid_inner_struct(t.inner2)
+}
+
+// Inner-TID accessors (not just ct/struct name) so codegen can recurse a carrier's
+// leaves back through register_struct_instance_from_tid — needed to register a
+// struct-INSTANCE leaf (RBox[Int]) nested inside an Option/Result carrier
+// (Result[RBox[Int],RBox[Str]]) before the carrier typedef names it, so the member
+// resolves to blink_RBox_Int rather than erasing to `void` (br f9mqbq). The tid
+// carries the structured type-args (a multi-param leaf Pair[Int,Str] keeps its two
+// slots), which the mono-name string tag cannot unambiguously recover. inner1 =
+// Option value / Result Ok; inner2 = Result Err. Return -1 on kind mismatch.
+pub fn tc_tid_option_inner_tid(tid: Int) -> Int {
+    if tid < 0 || tid >= ty_pool.len() { return -1 }
+    let t = ty_pool.get(tid).unwrap()
+    if t.kind != TK_OPTION { return -1 }
+    t.inner1
+}
+
+pub fn tc_tid_result_ok_tid(tid: Int) -> Int {
+    if tid < 0 || tid >= ty_pool.len() { return -1 }
+    let t = ty_pool.get(tid).unwrap()
+    if t.kind != TK_RESULT { return -1 }
+    t.inner1
+}
+
+pub fn tc_tid_result_err_tid(tid: Int) -> Int {
+    if tid < 0 || tid >= ty_pool.len() { return -1 }
+    let t = ty_pool.get(tid).unwrap()
+    if t.kind != TK_RESULT { return -1 }
+    t.inner2
 }
 
 // TOP-LEVEL CSV-segment form for a tid: the string that, concatenated onto a

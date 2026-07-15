@@ -1,0 +1,85 @@
+// br f9mqbq (codegen-structured-tids). A Result carrier whose BOTH ok+err leaves
+// are generic-struct INSTANCES: Result[RBox[Int], RBox[Str]]. The carrier NAME
+// spelled correctly (blink_Result_RBox_Int_RBox_Str), but both union members
+// erased to `void` — c_type_from_tag saw the mono-instance tag `RBox_Int`, matched
+// no branch (only the bare `RBox` is a registered struct), and fell to the CT_VOID
+// default. Additionally the mono struct typedefs blink_RBox_Int/blink_RBox_Str were
+// emitted AFTER the carrier that references them by value. The fix teaches
+// c_type_from_tag to recognize a registered mono struct instance (blink_<tag>) and
+// emit_struct_result_typedef to emit a struct-instance leaf's typedef before the
+// carrier, symmetric to the existing compound-leaf recursion (br gw4cyh).
+//
+// Spec §03_types.md:2066/2114 (monomorphization): each distinct instantiation is a
+// separate C type with the concrete type-arg substituted; an arg-erased `void`
+// member is a normative violation. Runtime field access, so this MUST run via
+// `task test` (archive-linked), not just compile.
+//
+// Model: test_gw4cyh_nested_carrier_typedef_order. Value access via `match`, not a
+// chained .unwrap() (a separate pre-existing typecheck erasure).
+
+type RBox[T] {
+    value: T
+}
+
+type TwoBox[A, B] {
+    a: A
+    b: B
+}
+
+type OBox[T] {
+    value: T
+}
+
+fn ok_case() -> Result[RBox[Int], RBox[Str]] { Ok(RBox { value: 5 }) }
+fn err_case() -> Result[RBox[Int], RBox[Str]] { Err(RBox { value: "boom" }) }
+
+test "Result[RBox[Int], RBox[Str]] ok member preserves concrete Int arg" {
+    let r = ok_case()
+    match r {
+        Ok(b) => { assert_eq(b.value, 5) }
+        Err(_e) => { assert(false) }
+    }
+}
+
+test "Result[RBox[Int], RBox[Str]] err member preserves concrete Str arg" {
+    let e = err_case()
+    match e {
+        Ok(_b) => { assert(false) }
+        Err(box) => { assert_eq(box.value, "boom") }
+    }
+}
+
+// Body-local carrier (never named in any signature): the err leaf RBox[Str]
+// appears in NO literal here, so it is never registered by the struct-lit path nor
+// the signature-driven pre-fn pass — exercising the body-local let registration
+// (emit_let_binding → register_carrier_struct_instance_leaves off the annotation
+// tid).
+test "body-local Result[RBox[Int], RBox[Str]] carrier resolves both members" {
+    let r: Result[RBox[Int], RBox[Str]] = Ok(RBox { value: 7 })
+    match r {
+        Ok(b) => { assert_eq(b.value, 7) }
+        Err(_e) => { assert(false) }
+    }
+}
+
+// Multi-type-param leaf: Pair[Str, Int] as the err arm appears in no literal, so
+// its typedef is built from the annotation TID (which keeps the two structured args
+// Str + Int). A tag-string split (Pair_Str_Int) cannot recover the comma boundary
+// and would erase both fields to void — this guards that regression (br f9mqbq).
+test "body-local Result over multi-type-param struct instances" {
+    let r: Result[TwoBox[Int, Str], TwoBox[Str, Int]] = Ok(TwoBox { a: 1, b: "x" })
+    match r {
+        Ok(p) => { assert_eq(p.a, 1) }
+        Err(e) => { assert_eq(e.b, 0) }
+    }
+}
+
+// Body-local Option over a struct instance whose inner appears in no literal
+// (None). The boxed `blink_OBox_Str* value` deref site needs the complete typedef.
+test "body-local Option[OBox[Str]] resolves the boxed instance" {
+    let o: Option[OBox[Str]] = None
+    match o {
+        Some(b) => { assert_eq(b.value, "z") }
+        None => { assert(true) }
+    }
+}
