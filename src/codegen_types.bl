@@ -1200,6 +1200,21 @@ type MonoInstance {
     c_name: Str
     arg_tids: List[Int]
 }
+
+// The PHYSICAL C-symbol stem for a mono base. For a generic STRUCT/ENUM base
+// (find_type_def_node hit) this is c_type_tag_for_struct(base) — the file-derived,
+// module-prefixed tag — so a cross-module generic instance (`helper.CmgBox[Int]`)
+// mangles by its DEFINING module (blink_helper_CmgBox_Int) and two same-named
+// generics in different modules stay distinct C types (br q4etvt). For a fn base
+// (not a type def) or a same-module/unqualified struct, c_type_tag_for_struct is a
+// no-op that returns `base` unchanged — so fn symbols and same-module struct
+// symbols are byte-identical to the pre-q4etvt bare spelling. The LOGICAL base
+// (MonoInstance.base) is kept separately for find_type_def / field-resolution,
+// which key on the type def's logical name; only the C-symbol stem goes physical.
+pub fn mono_phys_base(base: Str) -> Str {
+    if find_type_def_node(base) == -1 { return base }
+    c_type_tag_for_struct(base)
+}
 pub let mut mono_instances: List[MonoInstance] = []
 pub let mut mono_idx: Map[Str, Int] = Map()
 pub let mut mono_rev_idx: Map[Str, Int] = Map()
@@ -4020,8 +4035,15 @@ pub fn register_mono_instance(base: Str, args: Str, arg_tids: List[Int]) -> Str 
     if existing != "" {
         return existing
     }
-    let c_name = mangle_generic_name(base, args)
-    mono_idx.insert(base.concat("\t").concat(args), mono_instances.len())
+    // The C symbol is built off the PHYSICAL base (module-prefixed for a
+    // cross-module generic struct), and so is the dedup key — else two modules'
+    // `Box[Int]` (bare-equal base+args) would merge to one entry (br q4etvt). The
+    // logical `base` is still stored for find_type_def / field-resolution. For fns
+    // and same-module structs phys_base == base, so both the symbol and the key are
+    // byte-identical to before.
+    let phys_base = mono_phys_base(base)
+    let c_name = mangle_generic_name(phys_base, args)
+    mono_idx.insert(phys_base.concat("\t").concat(args), mono_instances.len())
     mono_rev_idx.insert(c_name, mono_instances.len())
     mono_instances.push(MonoInstance { base: base, args: args, c_name: c_name, arg_tids: arg_tids })
     c_name
@@ -4083,7 +4105,10 @@ pub fn mono_name_from_ann(base_name: Str, ann_node: Int, tparams_sl: Int, concre
         mono_args = mono_args.concat(resolved_arg)
         ai = ai + 1
     }
-    mangle_generic_name(base_name, mono_args)
+    // PHYSICAL base so this C-symbol producer byte-matches register_mono_instance's
+    // c_name for a cross-module instance (the carrier/typedef-order consumers feed
+    // the result to c_type_c_name); no-op for fn/same-module bases (q4etvt).
+    mangle_generic_name(mono_phys_base(base_name), mono_args)
 }
 
 // Concrete type-args CSV for a struct instance whose enclosing value context
@@ -4145,7 +4170,9 @@ pub fn struct_concrete_args_from_target(sname: Str) -> Str {
 }
 
 pub fn lookup_mono_instance(base: Str, args: Str) -> Str {
-    let key = base.concat("\t").concat(args)
+    // Key on the PHYSICAL base to match register_mono_instance's keying (q4etvt);
+    // phys_base == base for fns and same-module structs, so unchanged for them.
+    let key = mono_phys_base(base).concat("\t").concat(args)
     match mono_idx.get(key) {
         Some(idx) => return mono_instances.get(idx).unwrap().c_name
         None => {}

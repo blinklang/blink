@@ -8659,11 +8659,13 @@ pub fn tc_tid_struct_slot_seg(slot: Int) -> Str {
 // tc_tid_to_c_tag then produces exactly the blink_Option_int / blink_Result_int_str
 // carrier the field value registers. We REJECT:
 //   - a struct/enum INSTANCE slot (`Box[Box[Int]]`): the 3xvjcy string path (which
-//     reuses the field's registered mono name) stays authoritative — tc_tid_to_c_tag
-//     erases the inner (bare "Box").
+//     reuses the field's registered mono name) stays authoritative. (tc_tid_to_c_tag
+//     no longer erases the inner — since 1452w4 it recurses via tc_tid_struct_mono_name
+//     — but this compound-field seam still defers to keep the zrybya string path
+//     authoritative; not re-verified against the tid path here.)
 //   - a compound whose inner is itself a struct/enum or another compound
-//     (`Option[Box[Int]]`, `Option[Option[Int]]`): tc_tid_inner_tag erases the inner
-//     struct to bare "Box" / can diverge; defer (orthogonal follow-up).
+//     (`Option[Box[Int]]`, `Option[Option[Int]]`): can diverge in the field-value
+//     registration path; defer (orthogonal follow-up).
 //   - a bare scalar slot: handled by the existing string path unchanged.
 pub fn tc_tid_compound_slot_faithful(tid: Int) -> Bool {
     if tid < 0 || tid >= ty_pool.len() { return false }
@@ -8862,13 +8864,13 @@ fn tc_tid_encodable(tid: Int) -> Bool {
     // the old nss31w bug). Top-level struct/enum args reach this path once a generic
     // field access on a struct instance memoizes a concrete struct tid (br 365fqj).
     //
-    // A MODULE-QUALIFIED struct/enum still DEFERS to the string path: the mono-CSV
-    // path spells struct heads bare (this consumer is module-scoped by its own fn
-    // symbol), while the physical-prefix carrier speller (tc_tid_inner_tag) keeps the
-    // file-derived module prefix — the two diverge only for cross-module names. No
-    // fixture exercises a cross-module instance yet, and admitting it needs the
-    // two-speller encoder split (br bwyfy1 defers B2). Same-module/user structs are
-    // unqualified → strip is a no-op → admitted.
+    // A MODULE-QUALIFIED struct/enum is now ADMITTED (br q4etvt): after the mono-
+    // registry physical-base split, tc_tid_to_c_tag spells a cross-module struct
+    // INSTANCE via tc_tid_struct_mono_name PHYSICALLY (blink_<mod>_Box_Int) — exactly
+    // the c_name register_mono_instance now mints — and a bare cross-module struct as
+    // its bare head, matching the string path's bare arg segment. Either way the
+    // mono-CSV segment byte-matches the string path, so the module-qualifier no longer
+    // forces a defer.
     //
     // An ENUM INSTANCE (TK_ENUM, params_count>=1) DEFERS: tc_tid_struct_mono_name is
     // STRUCT-only (returns "" for TK_ENUM), so tc_tid_to_c_tag would fall back to the
@@ -8876,9 +8878,6 @@ fn tc_tid_encodable(tid: Int) -> Bool {
     // are not constructible today, so this is latent, but the guard must not claim a
     // shape the encoder can't lower. A bare enum (params_count 0) stays admitted.
     if k == TK_ENUM && t.params_count != 0 { return false }
-    if k == TK_STRUCT || k == TK_ENUM {
-        if strip_module_qualifier(t.name) != t.name { return false }
-    }
     true
 }
 
@@ -8933,9 +8932,14 @@ fn tc_tid_tuple_elem_encodable(tid: Int) -> Bool {
     // c_type_tag_for_struct (physical prefix), byte-identical to resolve_tuple_ann's
     // struct-element tag (codegen_types.bl:2402-2405, also c_type_tag_for_struct) for
     // BOTH same-module and cross-module names — the tuple carrier is a physical seam
-    // on both paths, so no two-speller divergence here (br bwyfy1 B3). A struct/enum
-    // INSTANCE (params_count>=1) still DEFERS: tc_tid_inner_tag erases its args to the
-    // bare head, so a tuple-of-instance would half-lower — keep it on the string path.
+    // on both paths, so no divergence here (br bwyfy1 B3; this guard never gated on
+    // the module qualifier). A struct/enum INSTANCE (params_count>=1) still DEFERS —
+    // NOT because of the tid path (tc_tid_inner_tag → tc_tid_struct_mono_name now
+    // spells it PHYSICALLY, correctly, post-q4etvt) but because the STRING path it
+    // must byte-match is itself broken for a tuple-of-instance: resolve_tuple_ann
+    // erases the element's instance args to the bare head (br 637sy9, reproduces
+    // same-module). Admitting instances here would make the tid path diverge from a
+    // buggy-but-authoritative string path; lift this once 637sy9 fixes both.
     if k == TK_STRUCT || k == TK_ENUM { return t.params_count == 0 }
     false
 }
@@ -8985,10 +8989,36 @@ pub fn tc_struct_slot_encodable(tid: Int) -> Bool {
     // STRUCT-only so the encoder would erase its args to the bare head. Bare enums
     // (params_count 0) stay admitted below.
     if k == TK_ENUM && t.params_count != 0 { return false }
+    // A struct/enum slot is admitted regardless of module qualifier (br q4etvt): the
+    // mono-registry physical-base split makes both paths spell a cross-module slot
+    // the SAME — a bare cross-module struct's segment is bare on both (tc_tid_to_c_tag
+    // → strip_module_qualifier == the string path's bare arg segment), and a
+    // cross-module struct INSTANCE's segment is PHYSICAL on both (tc_tid_struct_mono_name
+    // == register_mono_instance's physical c_name). This is what lets a cross-module
+    // instance SLOT carry a real tid so arg_tids can key the mono dedup (br 16z0s1).
     if k == TK_STRUCT || k == TK_ENUM {
-        return strip_module_qualifier(t.name) == t.name
+        return true
     }
     false
+}
+
+// STRICTER slot-encodability for the poly-impl List-element arg-tid path
+// (poly_impl_concrete_arg_tids). tc_struct_slot_encodable was relaxed by q4etvt to
+// admit MODULE-QUALIFIED struct/enum slots, because the struct-lit / fn-arg CSV twin
+// it must byte-match now spells them physically. The poly-impl CSV twin does NOT:
+// poly_impl_concrete_args spells a cross-module element via the raw QUALIFIED
+// get_list_elem_struct (dotted; br dwhm4v), which does not round-trip through
+// tc_seg_from_tid's strip_module_qualifier. So the poly-impl path keeps the
+// pre-q4etvt contract — carry a tid only for a scalar or a BARE UNQUALIFIED
+// struct/enum, and defer (-1 → string seg) everything else, including any
+// module-qualified struct/enum.
+pub fn tc_poly_elem_slot_encodable(tid: Int) -> Bool {
+    if !tc_struct_slot_encodable(tid) { return false }
+    let t = ty_pool.get(tid).unwrap()
+    if t.kind == TK_STRUCT || t.kind == TK_ENUM {
+        return strip_module_qualifier(t.name) == t.name
+    }
+    true
 }
 
 // Resolve the CSV segment for type-arg slot `idx` of a struct-INSTANCE tid
