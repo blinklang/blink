@@ -8,8 +8,8 @@ import codegen_types.{
     StructFieldDefault, StructFieldEntry,
     StructInvariant, VarEnumEntry, derive_method_entries,
     CarrierInfo,
-    build_closure_sig_from_type_ann, c_fn_name, c_safe_name, c_type_c_name,
-    c_type_from_tag,
+    build_closure_sig_from_type_ann, c_fn_name, c_safe_name, c_type_c_name, c_type_c_name_in,
+    c_type_from_tag, mangling_module,
     c_type_str, c_type_tag, canonical_struct_tag, cg_current_fn_has_ev, cg_current_fn_name, cg_current_fn_node, cg_current_module,
     cg_arena_expr_prev_stack, cg_arena_expr_tmp_stack,
     cg_current_fn_option_inner, cg_current_fn_option_inner_struct, cg_current_fn_ret, cg_ffi_lib_set, cg_with_arena_depth,
@@ -6840,10 +6840,34 @@ let mut ffi_includes_emitted: Map[Str, Int] = Map()
 // since `blink_T` and `struct <c_name>` are layout-equivalent but distinct C types.
 pub let mut ffi_struct_c_name: Map[Str, Str] = Map()
 
+// Module-resolved C name for a struct/enum typedef. Resolves against the type
+// node's OWN defining module (mangling_module) rather than the ambient
+// cg_current_module, so the name is identical no matter which caller triggers
+// the emit — the type-def emit loop (module set) or the early UE-vtable pass
+// (module unset). Used for BOTH the dedup key AND the emitted guard/typedef/tag
+// names, so a typedef's dedup identity, its `#ifndef` guard, and every self
+// reference in its body stay mutually consistent regardless of caller context.
+// Two modules' same-named types therefore key distinctly and both emit their
+// typedef under their own module-prefixed symbol (br eczcwr).
+fn typedef_c_name(td_node: Int, name: Str) -> Str {
+    let td_mod = mangling_module(td_node)
+    let mod_ctx = if td_mod != "__main__" { td_mod } else { "" }
+    c_type_c_name_in(name, mod_ctx)
+}
+
 pub fn emit_struct_typedef(td_node: Int) ! Codegen.Emit, Diag.Report {
     let name = node_name(td_node)
-    if struct_typedef_emitted.contains_key(name) != 0 { return }
-    struct_typedef_emitted.insert(name, 1)
+    // Resolve the C name against the TYPE'S OWN defining module (not the ambient
+    // cg_current_module) and use it for the dedup key, the `#ifndef` guard, and
+    // every self reference below. Two modules may each define a struct named
+    // `Ngx` (legal per §03_types.md:1038); keying/emitting on the bare name
+    // skipped the second module's typedef and mis-shaped its symbol → "has no
+    // member" (br eczcwr). Deriving from the defining module makes emission
+    // independent of the caller — the type-def loop (module set) and the early
+    // UE-vtable pass (module unset) both produce the same, correct symbol.
+    let td_cname = typedef_c_name(td_node, name)
+    if struct_typedef_emitted.contains_key(td_cname) != 0 { return }
+    struct_typedef_emitted.insert(td_cname, 1)
     // ConversionError's C typedef lives in runtime_core.h — skip emission to avoid duplication.
     if name == "ConversionError" { return }
     // ProcessResult's C typedef lives in runtime_process.h — skip emission to avoid duplication.
@@ -6882,7 +6906,7 @@ pub fn emit_struct_typedef(td_node: Int) ! Codegen.Emit, Diag.Report {
     if tparams_sl != -1 && sublist_length(tparams_sl) > 0 {
         return
     }
-    emit_td_guard_open(c_type_c_name(name))
+    emit_td_guard_open(td_cname)
     emit_line("typedef struct \{")
     cg_indent = cg_indent + 1
     let mut i = 0
@@ -6943,14 +6967,14 @@ pub fn emit_struct_typedef(td_node: Int) ! Codegen.Emit, Diag.Report {
         i = i + 1
     }
     cg_indent = cg_indent - 1
-    emit_line("} {c_type_c_name(name)};")
+    emit_line("} {td_cname};")
     emit_td_guard_close()
     emit_line("")
     if ffi_ann != -1 {
         let c_struct_name = get_str_named_arg(ffi_ann, "name")
         if c_struct_name != "" {
             ffi_struct_c_name.insert(name, c_struct_name)
-            let blink_t = c_type_c_name(name)
+            let blink_t = td_cname
             emit_line("_Static_assert(sizeof({blink_t}) == sizeof(struct {c_struct_name}), \"{blink_t} size mismatch with C struct {c_struct_name}\");")
             let mut fi = 0
             while fi < sublist_length(flds_sl) {
@@ -7009,8 +7033,13 @@ pub fn reset_typedef_emitted_stmt() {
 
 pub fn emit_enum_typedef(td_node: Int) ! Codegen.Emit {
     let name = node_name(td_node)
-    if enum_typedef_emitted.contains_key(name) != 0 { return }
-    enum_typedef_emitted.insert(name, 1)
+    // Same module-resolved C name as emit_struct_typedef, used for the dedup
+    // key, guard, and every self reference below, so two modules' same-named
+    // enums each emit their own typedef consistently regardless of the caller's
+    // ambient module (br eczcwr).
+    let td_cname = typedef_c_name(td_node, name)
+    if enum_typedef_emitted.contains_key(td_cname) != 0 { return }
+    enum_typedef_emitted.insert(td_cname, 1)
     let flds_sl = node_fields(td_node)
     if flds_sl == -1 {
         return
@@ -7088,15 +7117,15 @@ pub fn emit_enum_typedef(td_node: Int) ! Codegen.Emit {
             if i > 0 {
                 variants_str = variants_str.concat(", ")
             }
-            variants_str = variants_str.concat("{c_type_c_name(name)}_{vname}")
+            variants_str = variants_str.concat("{td_cname}_{vname}")
             i = i + 1
         }
-        emit_td_guard_open(c_type_c_name(name))
-        emit_line("typedef enum \{ {variants_str} } {c_type_c_name(name)};")
+        emit_td_guard_open(td_cname)
+        emit_line("typedef enum \{ {variants_str} } {td_cname};")
         emit_td_guard_close()
         emit_line("")
     } else {
-        emit_td_guard_open(c_type_c_name(name))
+        emit_td_guard_open(td_cname)
         emit_line("typedef struct \{")
         cg_indent = cg_indent + 1
         emit_line("int tag;")
@@ -7149,15 +7178,15 @@ pub fn emit_enum_typedef(td_node: Int) ! Codegen.Emit {
         cg_indent = cg_indent - 1
         emit_line("} data;")
         cg_indent = cg_indent - 1
-        emit_line("} {c_type_c_name(name)};")
+        emit_line("} {td_cname};")
         emit_td_guard_close()
         emit_line("")
         i = 0
         while i < sublist_length(flds_sl) {
             let v = sublist_get(flds_sl, i)
             let vname = node_name(v)
-            emit_line("#ifndef {c_type_c_name(name)}_{vname}_TAG")
-            emit_line("#define {c_type_c_name(name)}_{vname}_TAG {i}")
+            emit_line("#ifndef {td_cname}_{vname}_TAG")
+            emit_line("#define {td_cname}_{vname}_TAG {i}")
             emit_line("#endif")
             i = i + 1
         }
@@ -7165,7 +7194,7 @@ pub fn emit_enum_typedef(td_node: Int) ! Codegen.Emit {
     }
 
     if is_sb != 0 {
-        let cn = c_type_c_name(name)
+        let cn = td_cname
         emit_line("const char* {c_fn_name("{name}_to_str")}({cn} self) \{")
         cg_indent = cg_indent + 1
         emit_line("switch (self) \{")

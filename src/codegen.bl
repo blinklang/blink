@@ -629,6 +629,7 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
             let ptd_mod = mangling_module(ptd)
             if ptd_mod != "" && ptd_mod != "__main__" {
                 mod_type_prefix.insert(ptd_name, ptd_mod)
+                mod_type_prefix.insert("{ptd_mod}:{ptd_name}", ptd_mod)
             }
             let ptd_flds = node_fields(ptd)
             if ptd_flds != -1 && sublist_length(ptd_flds) > 0 {
@@ -1073,6 +1074,7 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
             let mod_name = mangling_module(td)
             if mod_name != "" && mod_name != "__main__" {
                 mod_type_prefix.insert(node_name(td), mod_name)
+                mod_type_prefix.insert("{mod_name}:{node_name(td)}", mod_name)
             }
             let td_flds = node_fields(td)
             if td_flds == -1 && node_value(td) != -1 {
@@ -1112,6 +1114,13 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
         while oi < order.len() {
             let i = order.get(oi).unwrap()
             let td = sublist_get(types_sl, i)
+            // Resolve typedef emission against the DEFINING module so that when
+            // two modules share a bare type name, each typedef (and every
+            // c_type_c_name inside it) picks up its own module prefix via the
+            // composite key rather than the last-writer bare entry (br eczcwr).
+            let saved_type_emit_module = cg_current_module
+            let td_emit_mod = mangling_module(td)
+            cg_current_module = if td_emit_mod != "__main__" { td_emit_mod } else { "" }
             let td_foreign = owned_by_other_module(node_source_module(td))
             // In per-module-object mode, foreign types still need their
             // sf_entries / enum_variants registered so cross-module field
@@ -1119,6 +1128,7 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
             // codegen time. We run the same emit path but discard the
             // generated C — the .h aggregator already provides the typedef.
             if td_foreign && in_per_module_object_types == 0 {
+                cg_current_module = saved_type_emit_module
                 oi = oi + 1
                 continue
             }
@@ -1130,6 +1140,7 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
                     let c_base = c_type_for_alias(base_name)
                     emit_line("typedef {c_base} blink_{alias_name};")
                 }
+                cg_current_module = saved_type_emit_module
                 oi = oi + 1
                 continue
             }
@@ -1184,6 +1195,7 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
             if td_foreign {
                 cg_lines = saved_lines
             }
+            cg_current_module = saved_type_emit_module
             oi = oi + 1
         }
     }
@@ -1379,6 +1391,16 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
             }
             let impl_mod = mangling_module(im)
             if impl_mod != "" && impl_mod != "__main__" && mod_type_prefix.contains_key(impl_type) == false {
+                // Bare-key fallback ONLY: this heuristic records the impl's
+                // module for a type whose own declaration didn't register a
+                // prefix (legacy behavior). Do NOT also write the composite key
+                // "{impl_mod}:{impl_type}" here — impl_type is a TYPE name whose
+                // module is where the TYPE is DECLARED, not where the impl lives.
+                // A cross-module (orphan) impl would otherwise poison the
+                // composite key so `self: T` resolves to the impl's module and
+                // mismatches the type's real C symbol (regression caught in
+                // eczcwr review). The type-decl sites (pre-register + main type
+                // loop) own the composite key.
                 mod_type_prefix.insert(impl_type, impl_mod)
             }
             // 4q2etk: replaced by mwxtyj — register Display impls; the
@@ -1387,13 +1409,12 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
             // resolves the same way the user's `{T}_Display_fmt` does.
             if impl_trait == "Display" {
                 display_impl_types.push(impl_type)
-                match mod_type_prefix.get(impl_type) {
-                    Some(d_mod) => {
-                        if d_mod != "" && d_mod != "__main__" {
-                            mod_fn_prefix.insert(mangle_impl_method_q(impl_type, "Display", "display"), d_mod)
-                        }
-                    }
-                    None => {}
+                // Use THIS impl's module directly, not mod_type_prefix.get(impl_type)
+                // (bare key, last-writer): when two modules share impl_type the
+                // bare entry would prefix the synthesized Display symbol with the
+                // wrong module (br eczcwr).
+                if impl_mod != "" && impl_mod != "__main__" {
+                    mod_fn_prefix.insert(mangle_impl_method_q(impl_type, "Display", "display"), impl_mod)
                 }
             }
             if impl_trait == "From" {
@@ -1426,14 +1447,13 @@ pub fn generate(program: Int) -> Str ! Codegen, Diag.Report {
                         continue
                     }
                     let mangled = mangle_impl_method(im, impl_type, mname)
-                    match mod_type_prefix.get(impl_type) {
-                        Some(m_mod) => {
-                            if m_mod != "" && m_mod != "__main__" {
-                                mod_fn_prefix.insert(mangled, m_mod)
-                                mod_fn_prefix.insert("{m_mod}:{mangled}", m_mod)
-                            }
-                        }
-                        None => {}
+                    // Prefix this impl's methods by THIS impl's module (impl_mod),
+                    // not mod_type_prefix.get(impl_type) (bare key, last-writer):
+                    // a colliding impl_type across modules would otherwise route
+                    // the method symbol to the wrong module (br eczcwr).
+                    if impl_mod != "" && impl_mod != "__main__" {
+                        mod_fn_prefix.insert(mangled, impl_mod)
+                        mod_fn_prefix.insert("{impl_mod}:{mangled}", impl_mod)
                     }
                     let ret_str_raw = node_return_type(m)
                     let ret_str = resolve_self_type(ret_str_raw, impl_type)

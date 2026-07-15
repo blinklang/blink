@@ -877,6 +877,18 @@ fn c_fn_name_in(name: Str, caller_module: Str) -> Str {
 }
 
 pub fn c_type_c_name(name: Str) -> Str {
+    c_type_c_name_in(name, cg_current_module)
+}
+
+// Module-aware core of c_type_c_name (mirrors c_fn_name_in). Two modules may
+// each define a struct/enum with the SAME bare name (`Ngx`) — LEGAL per
+// §03_types.md:1038 (the collision rule is struct-vs-variant only). Their C
+// symbols must stay DISTINCT (§07:1801-1816: `blink_<module_path>_<item>`).
+// mod_type_prefix keyed by bare name alone collapses them (last writer wins),
+// so consult the COMPOSITE key `"{caller_module}:{resolved}"` FIRST — populated
+// alongside the bare key at the type-registration sites — then fall back to the
+// bare key (same-module / single-definition callers unchanged). (br eczcwr)
+pub fn c_type_c_name_in(name: Str, caller_module: Str) -> Str {
     // Compound carrier name (Option_X, Result_X_Y, Map_K_V) — canonicalize the
     // nested struct/enum tags so the C type matches the actual emitted typedef.
     if name.starts_with("Option_") || name.starts_with("Result_") || name.starts_with("Map_") {
@@ -888,6 +900,17 @@ pub fn c_type_c_name(name: Str) -> Str {
     // Blink-source declaration of the same name appears in a stdlib module.
     if builtin_type_set.contains_key(resolved) {
         return "blink_{resolved}"
+    }
+    if caller_module != "" {
+        let qualified = "{caller_module}:{resolved}"
+        match mod_type_prefix.get(qualified) {
+            Some(prefix) => {
+                if prefix != "" {
+                    return "blink_{prefix}_{resolved}"
+                }
+            }
+            None => {}
+        }
     }
     match mod_type_prefix.get(resolved) {
         Some(prefix) => {
@@ -6031,6 +6054,12 @@ pub fn is_canonical_struct_tag(tag: Str) -> Int {
             let bare = tag.substring(i + 1, tag.len() - i - 1)
             let prefix = tag.substring(0, i)
             if struct_reg_set.contains_key(bare) != 0 || enum_reg_set.contains_key(bare) != 0 {
+                // Composite key first: when two modules share the bare name, the
+                // bare mod_type_prefix entry only holds the last writer's prefix,
+                // so a tag prefixed by the OTHER module would miss. The composite
+                // "{prefix}:{bare}" entry is written for every defining module,
+                // so it recognizes both (br eczcwr).
+                if mod_type_prefix.contains_key("{prefix}:{bare}") != 0 { return 1 }
                 match mod_type_prefix.get(bare) {
                     Some(p) => {
                         if p == prefix { return 1 }
