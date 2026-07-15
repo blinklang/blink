@@ -118,13 +118,38 @@ fn emit_panic_tag_check_render(tmp: Str, tag_val: Int, msg_prefix: Str, rendered
 // List receiver. The canonical form `impl[T] Trait[T] for List[T]` has each
 // impl binder appear as the List's element type, so every binder resolves to
 // the receiver list's concrete element type. Struct/enum elements use their
-// type name; scalars use the CT-derived name. CSV order follows binder order
+// CANONICAL C tag (c_type_tag_for_struct — dot-free, module-qualified so a
+// cross-module element yields a valid C identifier, br dwhm4v); scalars use the
+// CT-derived name. This CSV feeds mangle_generic_name and the mono-registry
+// (the PHYSICAL symbol), so it must be the dot-free physical spelling. For the
+// RESOLVABLE element name (return-type substitution) use
+// poly_impl_resolution_args instead. CSV order follows binder order
 // (mangle_generic_name / resolve_tparam both index positionally by binder).
 fn poly_impl_concrete_args(im: Int, obj_str: Str) -> Str {
     let binders_sl = node_impl_binders(im)
     let elem_ct = get_list_elem_type(obj_str)
     let elem_struct = get_list_elem_struct(obj_str)
+    let elem_name = if elem_struct != "" { c_type_tag_for_struct(elem_struct) } else { type_name_from_ct(elem_ct) }
+    build_binder_csv(binders_sl, elem_name)
+}
+
+// The RESOLVABLE twin of poly_impl_concrete_args: the element spelled as its
+// original struct name (dotted/qualified for cross-module, e.g.
+// `helper.CmgPoint`) rather than the canonical C tag. resolve_tparam +
+// type_from_name / is_struct_type strip the qualifier by SPLITTING ON `.`, so a
+// bare-T return only resolves to CT_STRUCT off the dotted name — the dot-free
+// physical tag (helper_CmgPoint) has no `.` to strip and collapses to CT_VOID
+// (br dwhm4v). Used solely for return-type substitution; the mangled symbol
+// still comes from poly_impl_concrete_args.
+fn poly_impl_resolution_args(im: Int, obj_str: Str) -> Str {
+    let binders_sl = node_impl_binders(im)
+    let elem_ct = get_list_elem_type(obj_str)
+    let elem_struct = get_list_elem_struct(obj_str)
     let elem_name = if elem_struct != "" { elem_struct } else { type_name_from_ct(elem_ct) }
+    build_binder_csv(binders_sl, elem_name)
+}
+
+fn build_binder_csv(binders_sl: Int, elem_name: Str) -> Str {
     let mut csv = ""
     let mut bi = 0
     while bi < sublist_length(binders_sl) {
@@ -182,9 +207,14 @@ fn emit_poly_impl_call(node: Int, composed_base: Str, obj_str: Str) ! Codegen.Em
 
     // Resolve the return type through the binder substitution so the result
     // temp carries the concrete C type (a bare-T return becomes the element's
-    // concrete type, not void).
+    // concrete type, not void). Substitute using the RESOLVABLE element spelling
+    // (poly_impl_resolution_args — dotted for cross-module), not the mangling
+    // CSV: type_from_name / is_struct_type only recover a struct by splitting the
+    // qualifier on `.`, so the dot-free physical tag would collapse to CT_VOID
+    // and drop the struct-return temp (br dwhm4v).
     let ret_str_raw = node_return_type(m_def)
-    let ret_str = resolve_tparam(ret_str_raw, tparams_sl, concrete_args)
+    let resolution_args = poly_impl_resolution_args(im, obj_str)
+    let ret_str = resolve_tparam(ret_str_raw, tparams_sl, resolution_args)
     let ret_ct = type_from_name(ret_str)
     let fn_eff_sl = node_effects(m_def)
     let fn_trusted = has_annotation(m_def, "trusted")
