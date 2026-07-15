@@ -1,0 +1,83 @@
+// br bd4mg6 (codegen-structured-tids). A bare-typevar generic fn returning a
+// carrier over its type-param (`wrap_opt[T](x: T) -> Option[T]`) where T binds to a
+// generic-struct INSTANCE produced by ANOTHER generic-fn call (`make_box(11)` →
+// LocBox[Int]). The whole monomorphization erased the arg: fn blink_wrap_opt_LocBox
+// (should be _LocBox_Int), param blink_LocBox, carrier blink_Option_LocBox /
+// blink_LocBox* value.
+//
+// Two coupled root causes:
+//  1. A generic fn's RETURN annotation `-> LocBox[T]` resolved to the BARE base tid
+//     (resolve_type_ann skips an all-typevar instance), so instantiate_return_type's
+//     substitute_typevar_tid had no T slot to rewrite — `make_box(11)` returned the
+//     bare `LocBox` tid, not `LocBox[Int]`. Fixed by re-interning the return
+//     annotation as a struct instance (register_fn_sig, mirroring the 8wyq1k param
+//     fix) so the call result carries the concrete instance.
+//  2. The annotated-Option/Result-return inner recovery in emit_generic_fn_call_tail
+//     checked is_struct_or_enum_type(inner_name), which is false for the mono-
+//     instance name `LocBox_Int` (only the bare `LocBox` is a registered struct), so
+//     the Option/Result inner erased and the caller typed the result Option_void.
+//     Fixed by also admitting is_mono_struct_instance.
+//
+// Spec §03_types.md:2066/2114 (monomorphization). Runtime access, so MUST run via
+// `task test` (archive-linked).
+
+type LocBox[T] {
+    value: T
+}
+
+type LPair[A, B] {
+    a: A
+    b: B
+}
+
+fn make_box[T](v: T) -> LocBox[T] { LocBox { value: v } }
+fn make_pair[A, B](x: A, y: B) -> LPair[A, B] { LPair { a: x, b: y } }
+fn wrap_opt[T](x: T) -> Option[T] { Some(x) }
+fn wrap_res[T](x: T) -> Result[T, Str] { Ok(x) }
+
+test "bare-typevar Option[T] over a struct instance from a generic-fn call" {
+    let b = make_box(11)
+    let o = wrap_opt(b)
+    match o {
+        Some(bx) => { assert_eq(bx.value, 11) }
+        None => { assert(false) }
+    }
+}
+
+test "bare-typevar Option[T] unwrap chain over a struct instance" {
+    let b = make_box(42)
+    let o = wrap_opt(b)
+    assert_eq(o.unwrap().value, 42)
+}
+
+test "bare-typevar Result[T, Str] over a struct instance from a generic-fn call" {
+    let b = make_box(7)
+    let r = wrap_res(b)
+    match r {
+        Ok(bx) => { assert_eq(bx.value, 7) }
+        Err(_e) => { assert(false) }
+    }
+}
+
+// Multi-type-param instance (LPair[Int, Str]) through the bare-typevar Option — the
+// mono stem must keep BOTH args (LPair_Int_Str), not collapse.
+test "bare-typevar Option[T] over a MULTI-param struct instance" {
+    let p = make_pair(3, "x")
+    let o = wrap_opt(p)
+    match o {
+        Some(pp) => { assert_eq(pp.a, 3) }
+        None => { assert(false) }
+    }
+}
+
+// Nested instance (LocBox[LocBox[Int]]) through the bare-typevar Option — the mono
+// stem must keep the full recursive depth (LocBox_LocBox_Int).
+test "bare-typevar Option[T] over a NESTED struct instance" {
+    let inner = make_box(5)
+    let outer = make_box(inner)
+    let o = wrap_opt(outer)
+    match o {
+        Some(bb) => { assert_eq(bb.value.value, 5) }
+        None => { assert(false) }
+    }
+}
