@@ -2415,7 +2415,15 @@ pub fn resolve_tuple_ann(ta: Int, tparams_sl: Int, concrete_args: Str) -> Option
             tags = tags.concat(canon)
             elem_structs_enc = elem_structs_enc.concat(canon)
         } else if is_struct_type(elem_name) != 0 || is_enum_type(elem_name) != 0 {
-            let struct_tag = c_type_tag_for_struct(elem_name)
+            // A struct/enum-INSTANCE element (`(LocBox[Int], Int)`) must carry its
+            // concrete type-args into the tuple field type (LocBox_Int), not the
+            // bare arg-erased head (LocBox) — else the field is typed blink_LocBox
+            // (never typedef'd) while the value is blink_LocBox_Int (br 637sy9).
+            // mono_name_from_ann recurses elem_ann's type-args through the current
+            // mono context, mirroring resolve_result_inner_tag. Falls back to the
+            // bare head for a truly generic element (unsubstituted typevar / no args).
+            let mono = mono_name_from_ann(strip_module_qualifier(elem_name), elem_ann, tparams_sl, concrete_args)
+            let struct_tag = if mono != "" { mono } else { c_type_tag_for_struct(elem_name) }
             tags = tags.concat(struct_tag)
             elem_structs_enc = elem_structs_enc.concat(struct_tag)
         } else if is_compound_ct(elem_t) != 0 && elem_name == elem_name_raw {
@@ -4099,10 +4107,22 @@ pub fn mono_name_from_ann(base_name: Str, ann_node: Int, tparams_sl: Int, concre
         let elem = sublist_get(elems, ai)
         let raw_name = node_name(elem)
         let resolved_arg = resolve_tparam(raw_name, tparams_sl, concrete_args)
+        // A NESTED generic-struct-instance arg (`Box[Box[Int]]` → outer arg
+        // `Box[Int]`) must spell its own full recursive stem (Box_Int), matching the
+        // tid-native tc_tid_struct_mono_name / register_struct_instance_from_tid the
+        // construction+typedef side use — a flat resolved_arg (`Box`) is one level
+        // short and would name a type that is never typedef'd (br 637sy9). Recurse
+        // when the arg annotation itself carries type-args over a generic struct;
+        // resolved_arg (bare head / substituted concrete) stays the fallback.
+        let mut arg_seg = resolved_arg
+        if (is_struct_type(resolved_arg) != 0 || is_enum_type(resolved_arg) != 0) {
+            let nested = mono_name_from_ann(strip_module_qualifier(resolved_arg), elem, tparams_sl, concrete_args)
+            if nested != "" { arg_seg = nested }
+        }
         if ai > 0 {
             mono_args = mono_args.concat(",")
         }
-        mono_args = mono_args.concat(resolved_arg)
+        mono_args = mono_args.concat(arg_seg)
         ai = ai + 1
     }
     // PHYSICAL base so this C-symbol producer byte-matches register_mono_instance's
