@@ -4961,9 +4961,18 @@ fn emit_carrier_typedef_for_tag(tag: Str) ! Codegen.Emit {
     } else if tag.starts_with("Result_") {
         let parts = split_result_compound(canonical_struct_tag(tag))
         if parts.second != "" {
+            // Take the scalar emit_result_typedef path ONLY when both parts are
+            // non-compound scalars with a concrete CT. A compound-inner part (e.g.
+            // Option_Box_Int) has type_from_name_tag → CT_OPTION (non-VOID), which
+            // the old ok_ct != CT_VOID gate wrongly sent down the scalar path —
+            // emitting a bogus blink_Result_option_str and never recursing into the
+            // inner carrier. A struct-instance part (CT_VOID) likewise needs the
+            // struct path. Everything else routes to emit_struct_result_typedef,
+            // whose compound recursion (br gw4cyh) emits the inner carrier first.
             let ok_ct = type_from_name_tag(parts.first)
             let err_ct = type_from_name_tag(parts.second)
-            if ok_ct != CT_VOID && err_ct != CT_VOID {
+            let both_scalar = is_compound_tag(parts.first) == 0 && is_compound_tag(parts.second) == 0 && ok_ct != CT_VOID && err_ct != CT_VOID
+            if both_scalar {
                 emit_result_typedef(ok_ct, err_ct)
             } else {
                 emit_struct_result_typedef(parts.first, parts.second)
@@ -5847,6 +5856,15 @@ pub fn emit_struct_option_typedef(struct_name: Str) ! Codegen.Emit {
     // own typedef must precede this one or C reads the unknown name as `int`.
     // Idempotent + a no-op if `tag` isn't a registered tuple.
     emit_tuple_typedef_for_tag(tag)
+    // Symmetric to the tuple recursion: an inner COMPOUND carrier leaf (e.g.
+    // Option[Result[Box[Int],Str]] whose inner tag is Result_Box_Int_str) must
+    // have its own carrier typedef emitted before this Option references it, or C
+    // reads the still-undeclared member as `int *` (br gw4cyh). The category flush
+    // otherwise emits struct-options before struct-results, inverting the
+    // outer→inner dependency. Idempotent via result/option_typedef_emitted.
+    if is_compound_tag(tag) != 0 {
+        emit_carrier_typedef_for_tag(tag)
+    }
     let inner_c = c_type_from_tag(tag)
     emit_td_guard_open(tname)
     if is_transparent_newtype(tag) != 0 {
@@ -5880,10 +5898,26 @@ pub fn compound_tag_ct(tag: Str) -> Int {
     else { CT_VOID }
 }
 
+// True when `tag` names a registered monomorphized struct/enum INSTANCE (e.g.
+// `Box_Int`) — one whose mono base resolves to a struct/enum type. The mono
+// registry (mono_rev_idx) is populated at registration time, EARLIER than the
+// mono struct typedef is physically emitted into struct_reg_set. A consumer that
+// runs during statement emission before the typedef flush (a match arm binding a
+// carrier-of-struct-instance payload, br gw4cyh) therefore can't rely on
+// is_struct_type — but the instance is already in the registry, so this recovers
+// it. Excludes generic-FN mono instances (base is not a struct/enum).
+pub fn is_mono_struct_instance(tag: Str) -> Int {
+    let base = lookup_mono_base(tag).base
+    if base == "" { return 0 }
+    if is_struct_type(base) != 0 || is_enum_type(base) != 0 { return 1 }
+    0
+}
+
 pub fn is_named_typedef_tag(tag: Str) -> Int {
     if is_compound_tag(tag) != 0 { return 1 }
     if is_struct_type(tag) != 0 || is_enum_type(tag) != 0 { return 1 }
     if is_canonical_struct_tag(tag) != 0 { return 1 }
+    if is_mono_struct_instance(tag) != 0 { return 1 }
     0
 }
 
@@ -5993,6 +6027,16 @@ pub fn emit_struct_result_typedef(ok_tag: Str, err_tag: Str) ! Codegen.Emit {
     // tests/test_295z9x and test_tuple_destr_q_propagate.
     emit_tuple_typedef_for_tag(ok_tag)
     emit_tuple_typedef_for_tag(err_tag)
+    // Symmetric to the tuple recursion: an ok/err leaf that is itself a COMPOUND
+    // carrier (e.g. Result[Option[Box[Int]],Str] whose ok_tag is Option_Box_Int)
+    // must have its own carrier typedef precede this one, or C reads the
+    // undeclared member as `int *` (br gw4cyh). Idempotent via the emitted guards.
+    if is_compound_tag(ok_tag) != 0 {
+        emit_carrier_typedef_for_tag(ok_tag)
+    }
+    if is_compound_tag(err_tag) != 0 {
+        emit_carrier_typedef_for_tag(err_tag)
+    }
     let c_ok = if ok_tag == "void" || ok_tag == "Void" { "int64_t" } else { c_type_from_tag(ok_tag) }
     let c_err = if err_tag == "void" || err_tag == "Void" { "int64_t" } else { c_type_from_tag(err_tag) }
     emit_td_guard_open(tname)

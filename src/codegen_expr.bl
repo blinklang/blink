@@ -89,7 +89,7 @@ import diagnostics.{
 }
 import std.path.{path_dirname}
 import formatter.{format_expr}
-import typecheck.{tc_mono_csv, tc_mono_tids, is_import_module_name, tc_lookup_node_tid, tc_tid_set_elem_ct, tc_tid_set_elem_struct, tc_tid_map_key_ct, tc_tid_map_key_struct, tc_tid_map_val_ct, tc_tid_map_val_struct, tc_tid_ct, tc_tid_option_inner_ct, tc_tid_option_inner_struct, tc_tid_result_ok_ct, tc_tid_result_ok_struct, tc_tid_result_err_ct, tc_tid_result_err_struct, tc_tid_to_c_tag, tc_tid_struct, tc_tid_struct_arg_count, tc_tid_struct_arg_tid, tc_tid_compound_slot_faithful, tc_struct_slot_encodable}
+import typecheck.{tc_mono_csv, tc_mono_tids, is_import_module_name, tc_lookup_node_tid, tc_tid_set_elem_ct, tc_tid_set_elem_struct, tc_tid_map_key_ct, tc_tid_map_key_struct, tc_tid_map_val_ct, tc_tid_map_val_struct, tc_tid_map_val_tid, tc_tid_map_key_tid, tc_tid_struct_slot_seg, tc_tid_ct, tc_tid_option_inner_ct, tc_tid_option_inner_struct, tc_tid_result_ok_ct, tc_tid_result_ok_struct, tc_tid_result_err_ct, tc_tid_result_err_struct, tc_tid_to_c_tag, tc_tid_struct, tc_tid_struct_arg_count, tc_tid_struct_arg_tid, tc_tid_compound_slot_faithful, tc_struct_slot_encodable}
 
 // codegen_expr.bl — Expression codegen, closures, capture analysis
 
@@ -2837,10 +2837,18 @@ pub fn emit_generic_fn_call_tail(node: Int, fn_name: Str, args_str: Str, ca: Gen
             if is_struct_type(v_name) != 0 || is_enum_type(v_name) != 0 {
                 map_ret_val_struct = mono_name_from_ann(strip_module_qualifier(v_name), v_ann, tparams_sl, ta_str)
                 if map_ret_val_struct == "" { map_ret_val_struct = strip_module_qualifier(v_name) }
+                // mono_name_from_ann yields only the mangled NAME; the value
+                // struct's mono instance was never registered, so its typedef was
+                // never emitted and emit_struct_option_typedef fell through to
+                // `void* value` (br h0n5qe). Register it here — rebuild mono_args
+                // from the annotation elements (the CT_VOID-return precedent below)
+                // and pass real arg tids off the return's value slot.
+                register_map_elem_struct_mono(strip_module_qualifier(v_name), v_ann, tparams_sl, ta_str, tc_tid_map_val_tid(ret_tid))
             }
             if is_struct_type(k_name) != 0 || is_enum_type(k_name) != 0 {
                 map_ret_key_struct = mono_name_from_ann(strip_module_qualifier(k_name), k_ann, tparams_sl, ta_str)
                 if map_ret_key_struct == "" { map_ret_key_struct = strip_module_qualifier(k_name) }
+                register_map_elem_struct_mono(strip_module_qualifier(k_name), k_ann, tparams_sl, ta_str, tc_tid_map_key_tid(ret_tid))
             }
         } else if tid_ct == CT_MAP {
             // Bare-typevar return `-> T` bound to Map[K,V]: recover key/value
@@ -2862,6 +2870,14 @@ pub fn emit_generic_fn_call_tail(node: Int, fn_name: Str, args_str: Str, ca: Gen
             // string; the let-binding's copy_map_value_meta carries them onto the var.
             map_ret_val_struct = tc_tid_map_val_struct(ret_tid)
             map_ret_key_struct = tc_tid_map_key_struct(ret_tid)
+            // Like the annotated branch: the value/key struct mono instance was
+            // never registered (the tc_tid_map_val_struct name is not enough), so
+            // its typedef never emitted and the carrier erased to void*/bare-head
+            // (br h0n5qe). Register off the memoized return tid's value/key slots —
+            // this covers nested value structs (Box[Box[Int]]) because the slot
+            // tid carries the full instance shape.
+            register_map_elem_struct_mono_from_tid(tc_tid_map_val_tid(ret_tid))
+            register_map_elem_struct_mono_from_tid(tc_tid_map_key_tid(ret_tid))
         }
     } else if ret_type == CT_STRUCT && rerouted {
         // Bare-typevar return `-> T` bound to a struct INSTANCE (unbox(outer) :
@@ -4858,6 +4874,104 @@ fn tid_slot_is_plain_scalar(slot: Int) -> Bool {
     let ct = tc_tid_ct(slot)
     if ct == CT_INT || ct == CT_FLOAT || ct == CT_BOOL || ct == CT_STRING || ct == CT_CHAR { return true }
     is_sized_int_ct(ct) != 0
+}
+
+// Whether `name` is one of the declared type-params in tparams_sl — i.e. still an
+// unresolved typevar after resolve_tparam (the caller is generic).
+fn tparams_sl_contains(tparams_sl: Int, name: Str) -> Int {
+    if tparams_sl == -1 { return 0 }
+    let mut i = 0
+    while i < sublist_length(tparams_sl) {
+        if node_name(sublist_get(tparams_sl, i)) == name { return 1 }
+        i = i + 1
+    }
+    0
+}
+
+// Register the mono instance for a generic Map's value/key struct at the generic-fn
+// call tail (br h0n5qe). The Map-return branch computes the value-struct NAME
+// (Box_Int) but, without this, never registers a mono instance for it — so the
+// struct typedef is never emitted, struct_reg_set lacks it, and
+// emit_struct_option_typedef falls through to `void* value`. register_mono_instance
+// dedups on (phys_base, args), so this is byte-neutral when the body already
+// registered the same instance.
+//
+// ANNOTATED branch: build mono_args the SAME way mono_name_from_ann does (the
+// annotation's elements through resolve_tparam), so the registered c_name
+// byte-matches the map_ret_val_struct name the annotated branch already published.
+// Skips when the type has no tparams / the annotation has no elements / an arg is
+// still an unresolved typevar (a caller that itself is generic — the pure-generic
+// caller edge is out of scope, tracked separately). arg_tids come off the return
+// tid's matching slot so encodable slots lower off tids.
+fn register_map_elem_struct_mono(base: Str, ann: Int, tparams_sl: Int, ta_str: Str, slot_tid: Int) ! Codegen.Register {
+    let td = find_type_def_node(base)
+    if td == -1 { return }
+    let td_tparams = node_type_params(td)
+    if td_tparams == -1 || sublist_length(td_tparams) == 0 { return }
+    if ann == -1 { return }
+    let elems = node_elements(ann)
+    if elems == -1 || sublist_length(elems) == 0 { return }
+    let mut mono_args = ""
+    let mut ai = 0
+    while ai < sublist_length(elems) {
+        let elem = sublist_get(elems, ai)
+        let resolved_arg = resolve_tparam(node_name(elem), tparams_sl, ta_str)
+        // An arg still spelled as a declared type-param means the caller is itself
+        // generic (no concrete binding here); registering would produce a bogus
+        // typevar-named instance. Defer (the pure-generic-caller edge, br follow-up).
+        if tparams_sl_contains(tparams_sl, resolved_arg) != 0 { return }
+        if ai > 0 { mono_args = mono_args.concat(",") }
+        mono_args = mono_args.concat(resolved_arg)
+        ai = ai + 1
+    }
+    let arg_tids = mono_instance_arg_tids_from_tid(slot_tid, base, sublist_length(elems))
+    register_mono_instance(base, mono_args, arg_tids)
+}
+
+// Register the mono instance for a generic Map's value/key struct off the raw slot
+// tid (br h0n5qe, bare-typevar `-> T` branch). The slot tid carries the full
+// concrete instance shape, so the args CSV is built via tc_tid_struct_slot_seg —
+// byte-identical to how tc_tid_struct_mono_name (which produced the published
+// map_ret_val_struct name) spells each slot. A nested instance slot (Box[Box[Int]])
+// is registered RECURSIVELY first so its typedef precedes the outer that embeds it,
+// mirroring register_struct_instance_from_tid (codegen.bl) — that superset lives in
+// codegen.bl, above this module in the import graph, so it can't be shared without a
+// cycle (dedup follow-up filed). A non-instance slot (scalar value, bare generic
+// base, absent tid) has arg_count 0 → no-op.
+fn register_map_elem_struct_mono_from_tid(slot_tid: Int) ! Codegen.Register {
+    let _name = register_map_elem_struct_mono_from_tid_named(slot_tid)
+}
+
+// Registers a struct-instance slot (and its nested instances, inner-first) and
+// RETURNS its mono name — the CSV segment a parent embeds. A nested instance slot
+// (Box[Box[Int]]) recurses so the inner typedef precedes the outer that embeds it,
+// mirroring register_struct_instance_from_tid (codegen.bl); that superset lives
+// above this module in the import graph, so it can't be shared without a cycle
+// (dedup follow-up filed). Returns "" for an unencodable/non-instance slot (scalar,
+// bare generic base, typevar, module-qualified) so the parent bails identically to
+// the def-side string path.
+fn register_map_elem_struct_mono_from_tid_named(slot_tid: Int) -> Str ! Codegen.Register {
+    if slot_tid < 0 { return "" }
+    let base = tc_tid_struct(slot_tid)
+    if base == "" { return "" }
+    let count = tc_tid_struct_arg_count(slot_tid)
+    if count < 1 { return "" }
+    let mut mono_args = ""
+    let mut i = 0
+    while i < count {
+        let slot = tc_tid_struct_arg_tid(slot_tid, i)
+        let seg = if tc_tid_struct_arg_count(slot) >= 1 {
+            register_map_elem_struct_mono_from_tid_named(slot)
+        } else {
+            tc_tid_struct_slot_seg(slot)
+        }
+        if seg == "" { return "" }
+        if i > 0 { mono_args = mono_args.concat(",") }
+        mono_args = mono_args.concat(seg)
+        i = i + 1
+    }
+    let arg_tids = mono_instance_arg_tids_from_tid(slot_tid, base, count)
+    register_mono_instance(base, mono_args, arg_tids)
 }
 
 @allow(UnrestoredMutation, IncompleteStateRestore)

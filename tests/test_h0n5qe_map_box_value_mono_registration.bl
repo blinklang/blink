@@ -1,0 +1,51 @@
+// br h0n5qe (codegen-structured-tids). A generic fn returning Map[K, Box[T]]
+// computed the value-struct NAME (Box_Int) but never registered a mono instance
+// for it, so its struct typedef was never emitted; emit_struct_option_typedef then
+// saw is_struct_type("Box_Int")==0 and fell through to `void* value`, and the
+// blink_Box_Int typedef was missing entirely (the _ounv GCC cascade). The fix
+// registers the concrete value/key struct mono in BOTH CT_MAP return sub-branches
+// (annotated `-> Map[Str, Box[T]]` and bare-typevar `-> T` bound to a Map). Runtime
+// field access, so this MUST run via `task test` (archive-linked), not just compile.
+//
+// The ANNOTATED branch is the sole-registrant reproduction: `mk`'s body constructs
+// `Box { value: v }` with v: T (typevar), registering only bare `Box` — so the
+// return-side registration is the ONLY place the concrete `Box_Int` comes into
+// existence. Before the fix this emitted `void* value`.
+//
+// A generic Map-returning fn called only from ANOTHER generic fn (passthru(mk(x)))
+// erases the value type-arg on the substituted return tid upstream of this fix — a
+// distinct out-of-scope edge, filed as a follow-up bug.
+//
+// Model: test_1452w4_map_struct_instance_value.
+
+type Box[T] {
+    value: T
+}
+
+// Annotated return `-> Map[Str, Box[T]]`. Sole registrant of the concrete Box_Int.
+fn mk[T](v: T) -> Map[Str, Box[T]] {
+    let mut m: Map[Str, Box[T]] = Map()
+    m.insert("k", Box { value: v })
+    m
+}
+
+fn passthru[T](m: T) -> T {
+    m
+}
+
+test "annotated -> Map[Str, Box[T]] registers value struct mono" {
+    let m = mk(99)
+    assert_eq(m.get("k").unwrap().value, 99)
+}
+
+test "bare-typevar -> T bound to a concrete Map[Str, Box[Int]] round-trips" {
+    let mut src: Map[Str, Box[Int]] = Map()
+    src.insert("k", Box { value: 7 })
+    let m2 = passthru(src)
+    assert_eq(m2.get("k").unwrap().value, 7)
+}
+
+test "nested value struct Map[Str, Box[Box[Int]]] via generic fn round-trips" {
+    let m = mk(Box { value: 55 })
+    assert_eq(m.get("k").unwrap().value.value, 55)
+}
