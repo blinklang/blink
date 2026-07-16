@@ -33,11 +33,11 @@ import codegen_types.{
     get_variant_field_count, get_variant_field_name,
     get_variant_field_type_str, get_variant_index, get_variant_tag,
     has_derive_method, is_compound_ct, is_data_enum, is_enum_type, is_fn_registered, is_scope_var, is_str_backed_enum,
-    is_generic_fn, is_struct_type, is_trait_type, is_transparent_newtype, is_user_effect_handle,
+    is_generic_fn, is_mono_struct_instance, is_struct_type, is_struct_or_enum_type, is_trait_type, is_transparent_newtype, is_user_effect_handle,
     cg_expect_fn_value_sig, cg_expect_arg_ann, arg_type_ann_at, get_callee_params_sl,
     builtin_receiver_type_name,
     is_sized_int_ct, lookup_builtin_trait_impl, lookup_impl_method, impl_method_reg_name, impl_trait_for_method, impl_type_implements_trait_method, mangle_generic_name, mangle_impl_method_q, mangle_from_method, synthesized_display_call, render_result_arm_value, wrapping_unsigned_c_type,
-    option_c_type, option_inner_ct_from_tag, option_inner_struct_from_tag, reg_fn, reg_fn_with_effects, register_mono_fn, register_mono_instance,
+    option_c_type, option_inner_ct_from_tag, option_inner_struct_from_tag, reg_fn, reg_fn_ret_type, reg_fn_ret_struct_inner, reg_fn_with_effects, register_mono_fn, register_mono_instance,
     resolve_tparam, poly_impl_method_node, poly_impl_block_node, is_poly_impl_base,
     resolve_import_alias, resolve_ptr_inner_c, resolve_struct_from_c_name, get_var_ffi_ptr_struct, is_ffi_ptr_array_var,
     ffi_alloc_n_pending, ffi_offset_pending_struct,
@@ -245,6 +245,68 @@ fn emit_poly_impl_call(node: Int, composed_base: Str, obj_str: Str) ! Codegen.Em
 
     expr_list_elem_type = -1
     expr_list_elem_struct = ""
+
+    // A compound-over-binder return (`-> Option[T]` / `-> Result[T, E]`) needs
+    // the concrete inner threaded into the caller's carrier globals, or the
+    // enclosing `let` binds the default `blink_Option_int` while the def side
+    // monomorphized `blink_Option_LocalPoint` — an invalid-initializer mismatch
+    // (br wkwj7e). node_return_type gives only the HEAD ("Option"), so read the
+    // return annotation's inner child(ren) and substitute through the same
+    // binder spelling the head used (resolution_args — dotted for cross-module).
+    // Mirrors the def-side mono_fn_signature CT_OPTION/CT_RESULT branch and the
+    // free-fn emit_generic_fn_call_tail; the tid resolvers live in codegen_stmt/
+    // codegen_expr (import cycle from here), so resolve via the string path the
+    // head already relies on and recover struct instances with
+    // is_mono_struct_instance (br bd4mg6). Runs AFTER the arg-emission loop:
+    // emit_expr on the args clobbers these same expr_* carrier globals, so
+    // setting them earlier would be overwritten (the free-fn path receives
+    // args_str pre-emitted for the same reason).
+    if ret_ct == CT_OPTION {
+        let ret_ann = node_type_ann(m_def)
+        let ann_elems = if ret_ann != -1 { node_elements(ret_ann) } else { -1 }
+        if ann_elems != -1 && sublist_length(ann_elems) >= 1 {
+            let inner_ann = sublist_get(ann_elems, 0)
+            let inner_name = resolve_tparam(node_name(inner_ann), tparams_sl, resolution_args)
+            let inner_ct = type_from_name(inner_name)
+            expr_option_inner = inner_ct
+            expr_option_inner_struct = ""
+            ensure_option_type(inner_ct)
+            reg_fn_ret_type(mangled, CT_OPTION, inner_ct, -1)
+            if inner_ct == CT_VOID && (is_struct_or_enum_type(inner_name) != 0 || is_mono_struct_instance(inner_name) != 0) {
+                ensure_struct_option_type(inner_name)
+                expr_option_inner_struct = inner_name
+            }
+        }
+    } else if ret_ct == CT_RESULT {
+        let ret_ann = node_type_ann(m_def)
+        let ann_elems = if ret_ann != -1 { node_elements(ret_ann) } else { -1 }
+        if ann_elems != -1 && sublist_length(ann_elems) >= 2 {
+            let ok_ann = sublist_get(ann_elems, 0)
+            let err_ann = sublist_get(ann_elems, 1)
+            let ok_name = resolve_tparam(node_name(ok_ann), tparams_sl, resolution_args)
+            let err_name = resolve_tparam(node_name(err_ann), tparams_sl, resolution_args)
+            let ok_ct = type_from_name(ok_name)
+            let err_ct = type_from_name(err_name)
+            expr_result_ok_type = ok_ct
+            expr_result_err_type = err_ct
+            let ok_is_type = is_struct_or_enum_type(ok_name) != 0 || is_mono_struct_instance(ok_name) != 0
+            let err_is_type = is_struct_or_enum_type(err_name) != 0 || is_mono_struct_instance(err_name) != 0
+            if ok_is_type || err_is_type {
+                let ok_s = if ok_is_type { ok_name } else { "" }
+                let err_s = if err_is_type { err_name } else { "" }
+                reg_fn_ret_struct_inner(mangled, ok_s, err_s)
+                ensure_mixed_result_type(ok_ct, err_ct, ok_s, err_s)
+                expr_result_ok_struct = ok_s
+                expr_result_err_struct = err_s
+            } else {
+                ensure_result_type(ok_ct, err_ct)
+                expr_result_ok_struct = ""
+                expr_result_err_struct = ""
+            }
+            reg_fn_ret_type(mangled, CT_RESULT, ok_ct, err_ct)
+        }
+    }
+
     // Bind a struct/enum return into a temp so the caller sees a concrete type.
     if ret_ct == CT_VOID && ret_str != "" && ret_str != "Void" {
         if is_struct_type(ret_str) != 0 || is_enum_type(ret_str) != 0 {

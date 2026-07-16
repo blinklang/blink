@@ -1,0 +1,66 @@
+// wkwj7e: a polymorphic trait impl whose method returns a COMPOUND over the
+// binder (`-> Option[T]` / `-> Result[T, E]`) erased the concrete inner type at
+// the CALL SITE. The def side monomorphized correctly
+// (blink_Option_LocalPoint), but emit_poly_impl_call stopped at the return
+// HEAD string ("Option") and never read the return annotation's inner child, so
+// the caller `let` bound the default carrier `blink_Option_int` — an
+// invalid-initializer gcc error, and a struct-field read on a non-struct.
+//
+// A struct inner never compiles under the erased Int carrier, so a runtime test
+// that reaches its asserts proves the call-tail threaded the concrete inner
+// (LocalPoint) into both the result-temp carrier and the caller's Option/Result
+// globals, matching the def side.
+
+trait Wrapper[T] {
+    fn wrap_one(self, x: T) -> Option[T]
+}
+
+impl[T] Wrapper[T] for List[T] {
+    fn wrap_one(_self, x: T) -> Option[T] { Some(x) }
+}
+
+trait Resulter[T] {
+    fn ok_one(self, x: T) -> Result[T, Str]
+}
+
+impl[T] Resulter[T] for List[T] {
+    fn ok_one(_self, x: T) -> Result[T, Str] { Ok(x) }
+}
+
+type LocalPoint { x: Int, y: Int }
+
+test "poly impl -> Option[T] over a local struct" {
+    let pts: List[LocalPoint] = [LocalPoint { x: 1, y: 2 }]
+    let w = pts.wrap_one(LocalPoint { x: 3, y: 4 })
+    let p = w.unwrap()
+    assert_eq(p.x, 3)
+    assert_eq(p.y, 4)
+}
+
+test "poly impl -> Result[T, Str] over a local struct" {
+    let pts: List[LocalPoint] = [LocalPoint { x: 1, y: 2 }]
+    let r = pts.ok_one(LocalPoint { x: 5, y: 6 })
+    let p = r.unwrap()
+    assert_eq(p.x, 5)
+    assert_eq(p.y, 6)
+}
+
+test "poly impl -> Option[Int] scalar-inner control" {
+    let ns: List[Int] = [1, 2, 3]
+    let o = ns.wrap_one(42)
+    assert_eq(o.unwrap(), 42)
+}
+
+// Ordering guard: the argument is itself an Option-unwrap expression, so
+// emitting it during the arg loop writes the expr_option_* carrier globals. The
+// return-carrier recovery MUST run AFTER arg emission, or the concrete inner
+// (LocalPoint) is clobbered by the argument's Option metadata and the caller
+// re-erases the temp. Reaches its asserts only if the carrier survived.
+test "poly impl -> Option[T] with an Option-emitting argument" {
+    let pts: List[LocalPoint] = [LocalPoint { x: 1, y: 2 }]
+    let src: Option[LocalPoint] = Some(LocalPoint { x: 7, y: 8 })
+    let w = pts.wrap_one(src.unwrap())
+    let p = w.unwrap()
+    assert_eq(p.x, 7)
+    assert_eq(p.y, 8)
+}
