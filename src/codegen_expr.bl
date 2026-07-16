@@ -2674,6 +2674,25 @@ fn resolve_tparam_via_tid_expr(param_name: Str, tparams_sl: Int, concrete_args: 
     resolve_tparam(param_name, tparams_sl, concrete_args)
 }
 
+// Slot-aligned resolver for building a mono-args CSV element-by-element off a
+// struct/tuple/return INSTANCE tid. `slot_tids` comes from
+// mono_instance_arg_tids_from_tid, which is aligned to the ANNOTATION's arg
+// positions (slot i = the type's i-th `[...]` arg) — NOT to the enclosing fn's
+// tparams_sl. So index it by the element position `ai`, not by the type-param's
+// position; using resolve_tparam_via_tid_expr here would misread the tid when the
+// annotation permutes the fn's type params (e.g. `fn f[A,B]() -> Pair[B,A]`).
+// Byte-parity: for an encodable slot tc_seg_from_tid reproduces resolve_tparam's
+// CSV segment; else fall back to the string path keyed on the same element.
+fn resolve_arg_seg_via_slot_tid(ai: Int, raw_name: Str, tparams_sl: Int, concrete_args: Str, slot_tids: List[Int]) -> Str {
+    if ai < slot_tids.len() {
+        let seg = tc_seg_from_tid(slot_tids.get(ai).unwrap())
+        if seg.is_some() {
+            return seg.unwrap()
+        }
+    }
+    resolve_tparam(raw_name, tparams_sl, concrete_args)
+}
+
 // Returns 0 if type-arg inference yields None so the caller can fall through
 // to non-generic handling; on success registers the monomorphization, writes
 // expr_result_str / expr_result_type plus container inner-type globals, and
@@ -2950,7 +2969,7 @@ pub fn emit_generic_fn_call_tail(node: Int, fn_name: Str, args_str: Str, ca: Gen
                 while ai < sublist_length(ret_elems) {
                     let elem = sublist_get(ret_elems, ai)
                     let raw_name = node_name(elem)
-                    let resolved_arg = resolve_tparam_via_tid_expr(raw_name, tparams_sl, ta_str, ret_arg_tids)
+                    let resolved_arg = resolve_arg_seg_via_slot_tid(ai, raw_name, tparams_sl, ta_str, ret_arg_tids)
                     if ai > 0 {
                         mono_args = mono_args.concat(",")
                     }
@@ -4948,16 +4967,18 @@ fn register_map_elem_struct_mono(base: Str, ann: Int, tparams_sl: Int, ta_str: S
     if ann == -1 { return }
     let elems = node_elements(ann)
     if elems == -1 || sublist_length(elems) == 0 { return }
-    // Per-element concrete tids off the return-tid's matching slot, hoisted above
-    // the loop so each arg resolves tid-first (byte-identical to resolve_tparam's
-    // CSV segment for every encodable slot) and reuse the same list for the
-    // register_mono_instance call below.
+    // Per-element concrete tids off the slot instance, hoisted above the loop so
+    // each arg resolves tid-first (byte-identical to resolve_tparam's CSV segment
+    // for every encodable slot) and reuse the same list for the
+    // register_mono_instance call below. arg_tids is aligned to the ANNOTATION's
+    // arg positions, so resolve by element index (resolve_arg_seg_via_slot_tid),
+    // NOT by type-param position.
     let arg_tids = mono_instance_arg_tids_from_tid(slot_tid, base, sublist_length(elems))
     let mut mono_args = ""
     let mut ai = 0
     while ai < sublist_length(elems) {
         let elem = sublist_get(elems, ai)
-        let resolved_arg = resolve_tparam_via_tid_expr(node_name(elem), tparams_sl, ta_str, arg_tids)
+        let resolved_arg = resolve_arg_seg_via_slot_tid(ai, node_name(elem), tparams_sl, ta_str, arg_tids)
         // An arg still spelled as a declared type-param means the caller is itself
         // generic (no concrete binding here); registering would produce a bogus
         // typevar-named instance. Defer (the pure-generic-caller edge, br follow-up).
