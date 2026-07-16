@@ -2212,7 +2212,7 @@ pub fn tp_from_ann(ann: Int) -> Int {
         return type_iterator(type_int())
     }
     if name == "Tuple" {
-        let tup_opt = resolve_tuple_ann(ann, -1, "")
+        let tup_opt = resolve_tuple_ann(ann, -1, "", [])
         if tup_opt.is_some() {
             return sv_tp(CT_VOID, -1, -1, tup_opt.unwrap())
         }
@@ -2306,7 +2306,7 @@ pub fn resolve_ret_type_from_ann(fn_node: Int) -> Str {
     }
     if ret_str == "Tuple" {
         if ta != -1 {
-            let tn_opt = resolve_tuple_ann(ta, -1, "")
+            let tn_opt = resolve_tuple_ann(ta, -1, "", [])
             if tn_opt.is_some() {
                 return c_type_c_name(tn_opt.unwrap())
             }
@@ -2386,13 +2386,43 @@ pub fn resolve_tparam(param_name: Str, tparams_sl: Int, concrete_args: Str) -> S
     param_name
 }
 
+// Tid-first counterpart of resolve_tparam for the codegen_types trio (resolve_tuple_ann /
+// mono_name_from_ann / struct_concrete_args_from_target). `segs` is a pre-lowered
+// segment list ALIGNED TO tparams_sl (segs[pi] = the concrete C-tag segment for the
+// pi-th type param, or "" when that slot has no encodable tid). The caller lowers it
+// via segs_from_arg_tids (codegen_expr) because codegen_types sits BELOW typecheck in
+// the import graph and cannot reach tc_seg_from_tid itself. When a param matches an
+// encodable slot we return its segment (byte-identical to resolve_tparam's CSV output
+// for that slot, by the tc_struct_slot_encodable contract); otherwise — empty segs,
+// short segs, or an unencodable slot ("") — we fall back to the string path, exactly
+// like resolve_tparam_via_tid / _expr. Empty segs ([]) makes this a pass-through to
+// resolve_tparam, so every caller that has no tid context stays unchanged.
+pub fn resolve_tparam_seg(param_name: Str, tparams_sl: Int, concrete_args: Str, segs: List[Str]) -> Str {
+    if tparams_sl != -1 {
+        let mut pi = 0
+        while pi < sublist_length(tparams_sl) {
+            if node_name(sublist_get(tparams_sl, pi)) == param_name {
+                if pi < segs.len() {
+                    let seg = segs.get(pi).unwrap()
+                    if seg != "" {
+                        return seg
+                    }
+                }
+                break
+            }
+            pi = pi + 1
+        }
+    }
+    resolve_tparam(param_name, tparams_sl, concrete_args)
+}
+
 pub fn tuple_c_name_from_ann(ta: Int, fallback: Str) -> Str {
     if ta == -1 { return fallback }
-    let opt = resolve_tuple_ann(ta, -1, "")
+    let opt = resolve_tuple_ann(ta, -1, "", [])
     if opt.is_some() { c_type_c_name(opt.unwrap()) } else { fallback }
 }
 
-pub fn resolve_tuple_ann(ta: Int, tparams_sl: Int, concrete_args: Str) -> Option[Str] {
+pub fn resolve_tuple_ann(ta: Int, tparams_sl: Int, concrete_args: Str, segs: List[Str]) -> Option[Str] {
     let elems_sl = node_elements(ta)
     if elems_sl == -1 {
         return None
@@ -2405,7 +2435,7 @@ pub fn resolve_tuple_ann(ta: Int, tparams_sl: Int, concrete_args: Str) -> Option
     while i < arity {
         let elem_ann = sublist_get(elems_sl, i)
         let elem_name_raw = node_name(elem_ann)
-        let elem_name = resolve_tparam(elem_name_raw, tparams_sl, concrete_args)
+        let elem_name = resolve_tparam_seg(elem_name_raw, tparams_sl, concrete_args, segs)
         // A typevar substituted to a whole Option/Result arrives as the canonical
         // carrier tag (Option_str, Result_int_str) rather than an annotation with
         // child nodes. Recognize it so the tuple slot gets the parameterized
@@ -2418,7 +2448,7 @@ pub fn resolve_tuple_ann(ta: Int, tparams_sl: Int, concrete_args: Str) -> Option
         // typedef, then embed its C type BY VALUE (like a struct element). The
         // recursion's own ensure_tuple_type runs before the outer one below, so the
         // inner typedef is registered first; the BLINK_TD_ guard keeps emit order safe.
-        let nested_tuple = if carrier_tag == "" && elem_name_raw == "Tuple" { resolve_tuple_ann(elem_ann, tparams_sl, concrete_args) } else { None }
+        let nested_tuple = if carrier_tag == "" && elem_name_raw == "Tuple" { resolve_tuple_ann(elem_ann, tparams_sl, concrete_args, segs) } else { None }
         let elem_t = if carrier_tag != "" { compound_tag_ct(carrier_tag) } else { type_from_name(elem_name) }
         if carrier_tag == "" && nested_tuple.is_none() && elem_t == CT_VOID && is_struct_type(elem_name) == 0 && is_enum_type(elem_name) == 0 {
             return None
@@ -2445,7 +2475,7 @@ pub fn resolve_tuple_ann(ta: Int, tparams_sl: Int, concrete_args: Str) -> Option
             // mono_name_from_ann recurses elem_ann's type-args through the current
             // mono context, mirroring resolve_result_inner_tag. Falls back to the
             // bare head for a truly generic element (unsubstituted typevar / no args).
-            let mono = mono_name_from_ann(strip_module_qualifier(elem_name), elem_ann, tparams_sl, concrete_args)
+            let mono = mono_name_from_ann(strip_module_qualifier(elem_name), elem_ann, tparams_sl, concrete_args, segs)
             let struct_tag = if mono != "" { mono } else { c_type_tag_for_struct(elem_name) }
             tags = tags.concat(struct_tag)
             elem_structs_enc = elem_structs_enc.concat(struct_tag)
@@ -2559,7 +2589,7 @@ pub fn reg_fn_ret_from_ann(name: Str, fn_node: Int) ! Codegen.Register {
         }
     }
     if ret_str == "Tuple" && ta != -1 {
-        let tup_c_name = resolve_tuple_ann(ta, -1, "")
+        let tup_c_name = resolve_tuple_ann(ta, -1, "", [])
         if tup_c_name.is_some() {
             reg_fn_struct_ret(name, tup_c_name.unwrap())
         }
@@ -4117,7 +4147,7 @@ pub fn find_type_def_node(name: Str) -> Int {
 // Returns the mangled name (e.g. "Box_Int") if `base_name` is a generic
 // user-defined type and `ann_node` carries its type-arg annotations.
 // Returns "" if `base_name` isn't generic or the annotation lacks type args.
-pub fn mono_name_from_ann(base_name: Str, ann_node: Int, tparams_sl: Int, concrete_args: Str) -> Str {
+pub fn mono_name_from_ann(base_name: Str, ann_node: Int, tparams_sl: Int, concrete_args: Str, segs: List[Str]) -> Str {
     let td = find_type_def_node(base_name)
     if td == -1 { return "" }
     let td_tparams = node_type_params(td)
@@ -4130,7 +4160,7 @@ pub fn mono_name_from_ann(base_name: Str, ann_node: Int, tparams_sl: Int, concre
     while ai < sublist_length(elems) {
         let elem = sublist_get(elems, ai)
         let raw_name = node_name(elem)
-        let resolved_arg = resolve_tparam(raw_name, tparams_sl, concrete_args)
+        let resolved_arg = resolve_tparam_seg(raw_name, tparams_sl, concrete_args, segs)
         // A NESTED generic-struct-instance arg (`Box[Box[Int]]` → outer arg
         // `Box[Int]`) must spell its own full recursive stem (Box_Int), matching the
         // tid-native tc_tid_struct_mono_name / register_struct_instance_from_tid the
@@ -4140,7 +4170,7 @@ pub fn mono_name_from_ann(base_name: Str, ann_node: Int, tparams_sl: Int, concre
         // resolved_arg (bare head / substituted concrete) stays the fallback.
         let mut arg_seg = resolved_arg
         if (is_struct_type(resolved_arg) != 0 || is_enum_type(resolved_arg) != 0) {
-            let nested = mono_name_from_ann(strip_module_qualifier(resolved_arg), elem, tparams_sl, concrete_args)
+            let nested = mono_name_from_ann(strip_module_qualifier(resolved_arg), elem, tparams_sl, concrete_args, segs)
             if nested != "" { arg_seg = nested }
         }
         if ai > 0 {
@@ -4174,7 +4204,7 @@ pub fn mono_name_from_ann(base_name: Str, ann_node: Int, tparams_sl: Int, concre
 // field (Map()/Set()) — whose element type can't be inferred from field VALUES
 // — off the declared target, so the container ctor selects the right kops
 // vtable instead of the erased-typevar string default (hnyqe4).
-pub fn struct_concrete_args_from_target(sname: Str) -> Str {
+pub fn struct_concrete_args_from_target(sname: Str, segs: List[Str]) -> Str {
     let td = find_type_def_node(sname)
     if td == -1 { return "" }
     let td_tparams = node_type_params(td)
@@ -4205,7 +4235,7 @@ pub fn struct_concrete_args_from_target(sname: Str) -> Str {
         // inference path (type_name_from_ct) and field-access recovery compute for
         // the same instantiation — else `GKV_othermod.Foo_Str` vs `GKV_Foo_Str`
         // would register two divergent instances.
-        let resolved = strip_module_qualifier(resolve_tparam(node_name(elem), cg_mono_tparams_sl, cg_mono_concrete_args))
+        let resolved = strip_module_qualifier(resolve_tparam_seg(node_name(elem), cg_mono_tparams_sl, cg_mono_concrete_args, segs))
         if ai > 0 { args = args.concat(",") }
         args = args.concat(resolved)
         ai = ai + 1
@@ -4634,7 +4664,7 @@ pub fn key_struct_sname_from_ann(k_ann: Int) -> Str ! Codegen.Emit {
     if k_ann == -1 { return "" }
     let kname = node_name(k_ann)
     if kname == "Tuple" {
-        let opt = resolve_tuple_ann(k_ann, -1, "")
+        let opt = resolve_tuple_ann(k_ann, -1, "", [])
         if opt.is_none() { return "" }
         let c_name = opt.unwrap()
         let cn = c_type_c_name(c_name)
@@ -5172,7 +5202,7 @@ pub fn is_compound_ct(ct: Int) -> Int {
 // effect (resolve_tuple_ann → ensure_tuple_type), matching the non-? path.
 fn resolve_tuple_tag(ann: Int) -> Str {
     if node_name(ann) != "Tuple" { return "" }
-    let opt = resolve_tuple_ann(ann, -1, "")
+    let opt = resolve_tuple_ann(ann, -1, "", [])
     if opt.is_some() { return opt.unwrap() }
     ""
 }
@@ -5188,7 +5218,7 @@ fn resolve_ann_tag(ann: Int, name: Str) -> Str {
         return compound_name_from_ann(ann)
     }
     if is_struct_type(name) != 0 || is_enum_type(name) != 0 {
-        let mono = mono_name_from_ann(strip_module_qualifier(name), ann, -1, "")
+        let mono = mono_name_from_ann(strip_module_qualifier(name), ann, -1, "", [])
         if mono != "" { return mono }
         return strip_module_qualifier(name)
     }
@@ -5388,7 +5418,7 @@ pub fn resolve_result_inner_tag(ann: Int, name: Str, ct: Int) -> Str {
         return compound_name_from_ann(ann)
     }
     if is_struct_type(name) != 0 || is_enum_type(name) != 0 {
-        let mono = mono_name_from_ann(strip_module_qualifier(name), ann, -1, "")
+        let mono = mono_name_from_ann(strip_module_qualifier(name), ann, -1, "", [])
         if mono != "" { return mono }
         return strip_module_qualifier(name)
     }

@@ -2445,7 +2445,7 @@ fn carrier_from_elem_name(name: Str, fallback: Int, ann_node: Int) -> CarrierInf
         // carrier typedef embeds `blink_Box ok` which is never typedef'd (1452w4).
         // The type-args live in ann_node's elements, invisible to the head name, so
         // recurse the annotation exactly like resolve_result_inner_tag.
-        let mono = mono_name_from_ann(strip_module_qualifier(name), ann_node, -1, "")
+        let mono = mono_name_from_ann(strip_module_qualifier(name), ann_node, -1, "", [])
         if mono != "" { return CarrierInfo { type_const: CT_INT, struct_name: mono } }
         return CarrierInfo { type_const: CT_INT, struct_name: name }
     }
@@ -2693,6 +2693,30 @@ fn resolve_arg_seg_via_slot_tid(ai: Int, raw_name: Str, tparams_sl: Int, concret
     resolve_tparam(raw_name, tparams_sl, concrete_args)
 }
 
+// Lower an arg_tids list (aligned to a fn/type's tparams_sl) into the pre-resolved
+// segment list the codegen_types trio (resolve_tuple_ann / mono_name_from_ann /
+// struct_concrete_args_from_target) consumes via resolve_tparam_seg. Slot pi holds
+// the concrete C-tag segment when arg_tids[pi] is encodable, else "" (the trio then
+// falls back to the string CSV for that slot). Lives here — not in codegen_types —
+// because tc_seg_from_tid is a typecheck fn and codegen_types sits below typecheck
+// in the import graph. Byte-parity: tc_seg_from_tid reproduces resolve_tparam's CSV
+// segment for every encodable slot, so feeding these segments to the trio matches
+// the string path exactly (the same invariant resolve_tparam_via_tid_expr relies on).
+pub fn segs_from_arg_tids(arg_tids: List[Int]) -> List[Str] {
+    let mut segs: List[Str] = []
+    let mut i = 0
+    while i < arg_tids.len() {
+        let seg = tc_seg_from_tid(arg_tids.get(i).unwrap())
+        if seg.is_some() {
+            segs.push(seg.unwrap())
+        } else {
+            segs.push("")
+        }
+        i = i + 1
+    }
+    segs
+}
+
 // Returns 0 if type-arg inference yields None so the caller can fall through
 // to non-generic handling; on success registers the monomorphization, writes
 // expr_result_str / expr_result_type plus container inner-type globals, and
@@ -2726,6 +2750,7 @@ pub fn emit_generic_fn_call_tail(node: Int, fn_name: Str, args_str: Str, ca: Gen
     }
     register_mono_fn(fn_name, ta_str, arg_tids)
     register_mono_instance(fn_name, ta_str, arg_tids)
+    let segs = segs_from_arg_tids(arg_tids)
     let ret_str = node_return_type(gfn_node)
     let tparams_sl = node_type_params(gfn_node)
     let resolved_ret = resolve_tparam_via_tid_expr(ret_str, tparams_sl, ta_str, arg_tids)
@@ -2891,7 +2916,7 @@ pub fn emit_generic_fn_call_tail(node: Int, fn_name: Str, args_str: Str, ca: Gen
             // Recover the recursive value/key stems from the annotation's mono, in
             // the fn's mono context (tparams_sl/ta_str resolves the T binding).
             if is_struct_type(v_name) != 0 || is_enum_type(v_name) != 0 {
-                map_ret_val_struct = mono_name_from_ann(strip_module_qualifier(v_name), v_ann, tparams_sl, ta_str)
+                map_ret_val_struct = mono_name_from_ann(strip_module_qualifier(v_name), v_ann, tparams_sl, ta_str, segs)
                 if map_ret_val_struct == "" { map_ret_val_struct = strip_module_qualifier(v_name) }
                 // mono_name_from_ann yields only the mangled NAME; the value
                 // struct's mono instance was never registered, so its typedef was
@@ -2902,7 +2927,7 @@ pub fn emit_generic_fn_call_tail(node: Int, fn_name: Str, args_str: Str, ca: Gen
                 register_map_elem_struct_mono(strip_module_qualifier(v_name), v_ann, tparams_sl, ta_str, tc_tid_map_val_tid(ret_tid))
             }
             if is_struct_type(k_name) != 0 || is_enum_type(k_name) != 0 {
-                map_ret_key_struct = mono_name_from_ann(strip_module_qualifier(k_name), k_ann, tparams_sl, ta_str)
+                map_ret_key_struct = mono_name_from_ann(strip_module_qualifier(k_name), k_ann, tparams_sl, ta_str, segs)
                 if map_ret_key_struct == "" { map_ret_key_struct = strip_module_qualifier(k_name) }
                 register_map_elem_struct_mono(strip_module_qualifier(k_name), k_ann, tparams_sl, ta_str, tc_tid_map_key_tid(ret_tid))
             }
@@ -2953,7 +2978,7 @@ pub fn emit_generic_fn_call_tail(node: Int, fn_name: Str, args_str: Str, ca: Gen
         // instead of treating it as a generic struct and dropping the type arg
         // (bug 295z9x, Site A).
         if resolved_ret == "Tuple" && ret_ann != -1 {
-            let tup_opt = resolve_tuple_ann(ret_ann, tparams_sl, ta_str)
+            let tup_opt = resolve_tuple_ann(ret_ann, tparams_sl, ta_str, segs)
             if tup_opt.is_some() {
                 emit_generic_struct_ret_temp(mangled, tup_opt.unwrap(), "_gtr", call_args)
                 return 1
@@ -5126,7 +5151,7 @@ fn emit_struct_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
     // (hnyqe4). With the struct's tparams bound here, resolve_tparam maps K→Int
     // at the ctor and the right kops vtable is selected. (No-op when the target
     // isn't annotated; the field-value inference below still runs as fallback.)
-    let target_args = struct_concrete_args_from_target(sname)
+    let target_args = struct_concrete_args_from_target(sname, segs_from_arg_tids(cg_mono_arg_tids))
     let td_tparams = if td != -1 { node_type_params(td) } else { -1 }
     let saved_mono_tparams = cg_mono_tparams_sl
     let saved_mono_args = cg_mono_concrete_args
@@ -5446,7 +5471,7 @@ fn emit_tuple_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Di
     // the type name + field tags now come from the annotation.
     let mut tup_name = ""
     if parent_tuple_ann != -1 {
-        let tup_opt = resolve_tuple_ann(parent_tuple_ann, cg_mono_tparams_sl, cg_mono_concrete_args)
+        let tup_opt = resolve_tuple_ann(parent_tuple_ann, cg_mono_tparams_sl, cg_mono_concrete_args, segs_from_arg_tids(cg_mono_arg_tids))
         if tup_opt.is_some() { tup_name = tup_opt.unwrap() }
     }
     if tup_name == "" {
