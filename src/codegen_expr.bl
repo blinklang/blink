@@ -61,7 +61,7 @@ import codegen_types.{
     register_mono_fn, register_mono_instance,
     resolve_import_alias, resolve_option_inner_from_ann,
     resolve_ptr_inner_c, resolve_result_inner_tag, resolve_ret_type_from_ann, resolve_struct_from_c_name,
-    resolve_tparam, resolve_variant, struct_concrete_args_from_target,
+    nth_type_arg, resolve_tparam, resolve_variant, struct_concrete_args_from_target,
     result_c_type, result_c_type_mixed,
     scope_vars, set_list_elem_struct, set_list_elem_type,
     kops_table_name, kops_elem_is_concrete, key_struct_sname_from_ann, ensure_tuple_kops_key,
@@ -76,7 +76,7 @@ import codegen_types.{
     var_enums
 }
 import codegen_derive.{ct_to_descriptor, descriptor_mangle, queue_promote_type}
-import codegen_methods.{emit_boxed_container_store, emit_method_call, resolve_push_struct}
+import codegen_methods.{emit_boxed_container_store, emit_method_call, listop_slot_tid, resolve_push_struct, resolve_tparam_via_tid}
 import codegen_closures.{analyze_captures, emit_closure, emit_fn_value_shim_if_needed}
 import diagnostics.{
     diag_error, diag_error_at, diag_warn_at, diag_set_last_fix,
@@ -733,14 +733,14 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
                                     let type_ann_node = node_value(f)
                                     if type_ann_node != -1 {
                                         let type_name = node_name(type_ann_node)
-                                        let resolved = resolve_tparam_via_tid_expr(type_name, td_tparams, mi.args, mi.arg_tids)
+                                        let resolved = resolve_tparam_via_tid(type_name, td_tparams, mi.args, mi.arg_tids)
                                         if resolved == "Option" {
                                             fa_type = CT_OPTION
                                             let inner_elems = node_elements(type_ann_node)
                                             if inner_elems != -1 && sublist_length(inner_elems) >= 1 {
                                                 let inner_ann = sublist_get(inner_elems, 0)
                                                 let inner_raw = node_name(inner_ann)
-                                                let inner_resolved = resolve_tparam_via_tid_expr(inner_raw, td_tparams, mi.args, mi.arg_tids)
+                                                let inner_resolved = resolve_tparam_via_tid(inner_raw, td_tparams, mi.args, mi.arg_tids)
                                                 let inner_ct = type_from_name(inner_resolved)
                                                 expr_option_inner = inner_ct
                                                 expr_option_inner_struct = ""
@@ -2485,7 +2485,7 @@ fn resolve_ctor_kops_elem(container: Str) -> CarrierInfo ! Codegen.Emit {
     let ta_elems = node_elements(ann)
     if ta_elems == -1 || sublist_length(ta_elems) < 1 { return CarrierInfo { type_const: CT_STRING, struct_name: "" } }
     let e_ann = sublist_get(ta_elems, 0)
-    let e_name = resolve_tparam_via_tid_expr(node_name(e_ann), cg_mono_tparams_sl, cg_mono_concrete_args, cg_mono_arg_tids)
+    let e_name = resolve_tparam_via_tid(node_name(e_ann), cg_mono_tparams_sl, cg_mono_concrete_args, cg_mono_arg_tids)
     if e_name == "Tuple" {
         return CarrierInfo { type_const: CT_VOID, struct_name: key_struct_sname_from_ann(e_ann) }
     }
@@ -2647,39 +2647,12 @@ fn emit_generic_struct_ret_temp(mangled: Str, struct_name: Str, temp_prefix: Str
     expr_result_type = CT_STRUCT
 }
 
-// Local twin of codegen_stmt.resolve_tparam_via_tid — codegen_stmt imports
-// codegen_expr, so the canonical copy can't be imported back here without a
-// module cycle, AND a same-named function here would collide with codegen_stmt's
-// own (import brings it into codegen_stmt's scope, shadowing its local def). So
-// this twin carries a distinct name. Same byte-parity contract: prefer the
-// structured tid (tc_seg_from_tid, which returns Some only when tc_tid_encodable
-// holds and the tid-derived segment byte-matches resolve_tparam's CSV output),
-// else fall back to the string path. Keep the two copies in lockstep.
-fn resolve_tparam_via_tid_expr(param_name: Str, tparams_sl: Int, concrete_args: Str, arg_tids: List[Int]) -> Str {
-    if tparams_sl != -1 {
-        let mut pi = 0
-        while pi < sublist_length(tparams_sl) {
-            if node_name(sublist_get(tparams_sl, pi)) == param_name {
-                if pi < arg_tids.len() {
-                    let seg = tc_seg_from_tid(arg_tids.get(pi).unwrap())
-                    if seg.is_some() {
-                        return seg.unwrap()
-                    }
-                }
-                break
-            }
-            pi = pi + 1
-        }
-    }
-    resolve_tparam(param_name, tparams_sl, concrete_args)
-}
-
 // Slot-aligned resolver for building a mono-args CSV element-by-element off a
 // struct/tuple/return INSTANCE tid. `slot_tids` comes from
 // mono_instance_arg_tids_from_tid, which is aligned to the ANNOTATION's arg
 // positions (slot i = the type's i-th `[...]` arg) — NOT to the enclosing fn's
 // tparams_sl. So index it by the element position `ai`, not by the type-param's
-// position; using resolve_tparam_via_tid_expr here would misread the tid when the
+// position; using resolve_tparam_via_tid here would misread the tid when the
 // annotation permutes the fn's type params (e.g. `fn f[A,B]() -> Pair[B,A]`).
 // Byte-parity: for an encodable slot tc_seg_from_tid reproduces resolve_tparam's
 // CSV segment; else fall back to the string path keyed on the same element.
@@ -2701,7 +2674,7 @@ fn resolve_arg_seg_via_slot_tid(ai: Int, raw_name: Str, tparams_sl: Int, concret
 // because tc_seg_from_tid is a typecheck fn and codegen_types sits below typecheck
 // in the import graph. Byte-parity: tc_seg_from_tid reproduces resolve_tparam's CSV
 // segment for every encodable slot, so feeding these segments to the trio matches
-// the string path exactly (the same invariant resolve_tparam_via_tid_expr relies on).
+// the string path exactly (the same invariant resolve_tparam_via_tid relies on).
 pub fn segs_from_arg_tids(arg_tids: List[Int]) -> List[Str] {
     let mut segs: List[Str] = []
     let mut i = 0
@@ -2741,19 +2714,32 @@ pub fn emit_generic_fn_call_tail(node: Int, fn_name: Str, args_str: Str, ca: Gen
     }
     let ta_str = type_args.unwrap()
     let mangled = mangle_generic_name(fn_name, ta_str)
-    // Carry the per-tparam concrete tids only when the CSV came from the tid path
-    // (tc_mono_csv); the string-inference fallback has no aligned tids, so leave
-    // arg_tids empty and let the def-side emitters stay on the string path.
+    // 0n07he Step 2b: carry the per-tparam concrete tids on EVERY slot the tid can
+    // faithfully spell, whether the CSV came from the tid path (tc_mono_csv) or the
+    // string-inference fallback (infer_fn_type_args_from_types). tc_mono_tids is
+    // per-slot (a real tid for an encodable slot, -1 for a deferred one), unlike the
+    // all-or-nothing tc_mono_csv — so it can upgrade the encodable slots of a CSV
+    // that string-inference produced. Byte-parity hazard: tc_mono_tids aligns to
+    // tc_resolve_tparam_seg's slot order, but the infer CSV is built by a DIFFERENT
+    // walker, so the two could disagree on slot content/order for some shape. Guard
+    // it: keep a slot's tid ONLY when tc_seg_from_tid reproduces THIS ta_str's
+    // segment byte-for-byte (nth_type_arg), else -1 → the def side stays on the
+    // string seg for that slot. Any residual divergence fails the Gen1==Gen2 gate
+    // immediately. When tid_csv.is_some() this is a no-op re-confirmation of the
+    // D1b invariant; when it is none, it is the coverage upgrade.
+    let raw_tids = tc_mono_tids(node, gfn_node)
     let mut arg_tids: List[Int] = []
-    if tid_csv.is_some() {
-        arg_tids = tc_mono_tids(node, gfn_node)
+    let mut ti = 0
+    while ti < raw_tids.len() {
+        arg_tids.push(listop_slot_tid(raw_tids.get(ti).unwrap(), nth_type_arg(ta_str, ti)))
+        ti = ti + 1
     }
     register_mono_fn(fn_name, ta_str, arg_tids)
     register_mono_instance(fn_name, ta_str, arg_tids)
     let segs = segs_from_arg_tids(arg_tids)
     let ret_str = node_return_type(gfn_node)
     let tparams_sl = node_type_params(gfn_node)
-    let resolved_ret = resolve_tparam_via_tid_expr(ret_str, tparams_sl, ta_str, arg_tids)
+    let resolved_ret = resolve_tparam_via_tid(ret_str, tparams_sl, ta_str, arg_tids)
     // A bare-typevar return (`-> T`/`-> U`) bound to a compound resolves through
     // the string tag to a carrier name (Option_int / Result_int_str / Map_..)
     // whose type_from_name is CT_VOID — the tag has no `[` so the whole string
@@ -2799,7 +2785,7 @@ pub fn emit_generic_fn_call_tail(node: Int, fn_name: Str, args_str: Str, ca: Gen
         if ann_elems != -1 && sublist_length(ann_elems) >= 1 {
             let inner_ann = sublist_get(ann_elems, 0)
             let inner_name_raw = node_name(inner_ann)
-            let inner_name = resolve_tparam_via_tid_expr(inner_name_raw, tparams_sl, ta_str, arg_tids)
+            let inner_name = resolve_tparam_via_tid(inner_name_raw, tparams_sl, ta_str, arg_tids)
             let inner_ct = type_from_name(inner_name)
             expr_option_inner = inner_ct
             ensure_option_type(inner_ct)
@@ -2840,8 +2826,8 @@ pub fn emit_generic_fn_call_tail(node: Int, fn_name: Str, args_str: Str, ca: Gen
         if ann_elems != -1 && sublist_length(ann_elems) >= 2 {
             let ok_ann = sublist_get(ann_elems, 0)
             let err_ann = sublist_get(ann_elems, 1)
-            let ok_name = resolve_tparam_via_tid_expr(node_name(ok_ann), tparams_sl, ta_str, arg_tids)
-            let err_name = resolve_tparam_via_tid_expr(node_name(err_ann), tparams_sl, ta_str, arg_tids)
+            let ok_name = resolve_tparam_via_tid(node_name(ok_ann), tparams_sl, ta_str, arg_tids)
+            let err_name = resolve_tparam_via_tid(node_name(err_ann), tparams_sl, ta_str, arg_tids)
             let ok_ct = type_from_name(ok_name)
             let err_ct = type_from_name(err_name)
             expr_result_ok_type = ok_ct
@@ -2896,7 +2882,7 @@ pub fn emit_generic_fn_call_tail(node: Int, fn_name: Str, args_str: Str, ca: Gen
             if elems_sl != -1 && sublist_length(elems_sl) >= 1 {
                 let inner_ann = sublist_get(elems_sl, 0)
                 let inner_name_raw = node_name(inner_ann)
-                let inner_name = resolve_tparam_via_tid_expr(inner_name_raw, tparams_sl, ta_str, arg_tids)
+                let inner_name = resolve_tparam_via_tid(inner_name_raw, tparams_sl, ta_str, arg_tids)
                 expr_list_elem_type = type_from_name(inner_name)
             }
         }
@@ -2906,8 +2892,8 @@ pub fn emit_generic_fn_call_tail(node: Int, fn_name: Str, args_str: Str, ca: Gen
         if ann_elems != -1 && sublist_length(ann_elems) >= 2 {
             let k_ann = sublist_get(ann_elems, 0)
             let v_ann = sublist_get(ann_elems, 1)
-            let k_name = resolve_tparam_via_tid_expr(node_name(k_ann), tparams_sl, ta_str, arg_tids)
-            let v_name = resolve_tparam_via_tid_expr(node_name(v_ann), tparams_sl, ta_str, arg_tids)
+            let k_name = resolve_tparam_via_tid(node_name(k_ann), tparams_sl, ta_str, arg_tids)
+            let v_name = resolve_tparam_via_tid(node_name(v_ann), tparams_sl, ta_str, arg_tids)
             expr_map_key_type = type_from_name(k_name)
             expr_map_val_type = type_from_name(v_name)
             // An annotated generic Map return whose value is a struct INSTANCE

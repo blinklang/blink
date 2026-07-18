@@ -197,7 +197,7 @@ fn poly_impl_concrete_arg_tids(im: Int, recv_node: Int) -> List[Int] {
 // pktmea: the RETURN-path twin of poly_impl_concrete_arg_tids. The four RETURN-type
 // substitution sites in emit_poly_impl_call recover the concrete element name for a
 // bare-T / compound-over-T return; this carries the concrete element tid per binder
-// so resolve_tparam_poly_via_tid can lower that name from the interned type_id pool
+// so resolve_tparam_via_tid can lower that name from the interned type_id pool
 // (tc_seg_from_tid) instead of the dotted string CSV (poly_impl_resolution_args).
 //
 // Unlike poly_impl_concrete_arg_tids, this does NOT apply the strict
@@ -205,7 +205,7 @@ fn poly_impl_concrete_arg_tids(im: Int, recv_node: Int) -> List[Int] {
 // byte-identical to the physical symbol, whereas the RETURN path only needs a valid
 // downstream name and BARE is the established convention (matching the 7 other
 // bare-storing RETURN-path producers). So carry the raw element tid and let
-// resolve_tparam_poly_via_tid's tc_seg_from_tid admission decide: an encodable tid
+// resolve_tparam_via_tid's tc_seg_from_tid admission decide: an encodable tid
 // (scalar / bare struct / struct instance) yields its bare-or-physical segment; an
 // unencodable tid (or -1 when the receiver is not a resolvable List) returns None and
 // the twin falls back to the string path. tc_seg_from_tid guards tid<0 internally.
@@ -221,19 +221,37 @@ fn poly_impl_return_elem_tids(im: Int, recv_node: Int) -> List[Int] {
     tids
 }
 
-// pktmea: tid-preferring twin of resolve_tparam for the poly-impl RETURN path.
-// Mirrors resolve_tparam_via_tid (codegen_stmt.bl) EXACTLY — a distinct name avoids
-// the import cycle the stmt/expr twins can't cross from here (codegen_methods already
-// imports typecheck for tc_seg_from_tid, so this resolver lives fine here). When
-// `param_name` is a binder and arg_tids captured a concrete tid for its position,
-// lower the segment from the structured tid via tc_seg_from_tid; otherwise fall back
-// to resolve_tparam over the string CSV. tc_seg_from_tid returns Some only when the
-// tid is encodable, and it spells a bare struct BARE / a struct instance as its
-// physical mono stem — the RETURN path's established convention (bare for a plain
-// struct, matching descriptor_mangle / the free-fn carrier producers). resolution_args
-// stays as the fallback tail, a strict superset: an unencodable slot still resolves
-// via the old dotted string path.
-fn resolve_tparam_poly_via_tid(param_name: Str, tparams_sl: Int, resolution_args: Str, arg_tids: List[Int]) -> Str {
+// 0n07he: byte-exact slot-tid admission guard shared by every mono-registration
+// site that carries per-slot tids alongside a string CSV (the stdlib list-ops
+// list_fold/for_each/any/all here, and emit_generic_fn_call_tail's free-fn path in
+// codegen_expr). A slot keeps its concrete tid ONLY when tc_seg_from_tid reproduces
+// the CSV segment (`csv_seg`) that mangling actually used, byte-for-byte. Any
+// divergence — an element the CT-tag path spelled "Void", an unencodable tid, a -1
+// from an unresolvable receiver, or an infer-CSV slot the tid can't reach — stores
+// -1, forcing the def-side resolver back onto the string seg (identical to the
+// pre-tid behavior). The Gen1==Gen2 fixed-point gate proves the equality.
+pub fn listop_slot_tid(tid: Int, csv_seg: Str) -> Int {
+    let seg = tc_seg_from_tid(tid)
+    if seg.is_some() && seg.unwrap() == csv_seg {
+        return tid
+    }
+    -1
+}
+
+// 6mhzya: the canonical tid-preferring twin of resolve_tparam, home to all three
+// codegen layers (stmt/expr/methods) after the three byte-identical twins collapsed
+// here. codegen_methods is the only safe home: it already imports typecheck for
+// tc_seg_from_tid and resolve_tparam (codegen_types), and it sits below both
+// codegen_expr (imports methods) and codegen_stmt (imports expr, plus a shortcut
+// import of methods for this name) in the DAG — so no import cycle. When `param_name`
+// is a binder and arg_tids captured a concrete tid for its position, lower the segment
+// from the structured tid via tc_seg_from_tid; otherwise fall back to resolve_tparam
+// over the string CSV. tc_seg_from_tid returns Some only when the tid is encodable,
+// and it spells a bare struct BARE / a struct instance as its physical mono stem —
+// the established convention (bare for a plain struct, matching descriptor_mangle /
+// the free-fn carrier producers). concrete_args stays as the fallback tail, a strict
+// superset: an unencodable slot still resolves via the old dotted string path.
+pub fn resolve_tparam_via_tid(param_name: Str, tparams_sl: Int, concrete_args: Str, arg_tids: List[Int]) -> Str {
     if tparams_sl != -1 {
         let mut pi = 0
         while pi < sublist_length(tparams_sl) {
@@ -249,7 +267,7 @@ fn resolve_tparam_poly_via_tid(param_name: Str, tparams_sl: Int, resolution_args
             pi = pi + 1
         }
     }
-    resolve_tparam(param_name, tparams_sl, resolution_args)
+    resolve_tparam(param_name, tparams_sl, concrete_args)
 }
 
 @allow(UnrestoredMutation, IncompleteStateRestore)
@@ -267,7 +285,7 @@ fn emit_poly_impl_call(node: Int, composed_base: Str, obj_str: Str) ! Codegen.Em
     // Resolve the return type through the binder substitution so the result
     // temp carries the concrete C type (a bare-T return becomes the element's
     // concrete type, not void). Prefer the interned type_id pool
-    // (resolve_tparam_poly_via_tid over ret_tids): tc_seg_from_tid spells a bare
+    // (resolve_tparam_via_tid over ret_tids): tc_seg_from_tid spells a bare
     // cross-module struct BARE (CmgPoint) — which type_from_name / is_struct_type
     // recover directly from struct_reg_set without a `.` to split — and a struct
     // instance as its physical mono stem. The dotted string CSV
@@ -278,7 +296,7 @@ fn emit_poly_impl_call(node: Int, composed_base: Str, obj_str: Str) ! Codegen.Em
     // with-arena tail (latent bug fixed here).
     let ret_str_raw = node_return_type(m_def)
     let resolution_args = poly_impl_resolution_args(im, obj_str)
-    let ret_str = resolve_tparam_poly_via_tid(ret_str_raw, tparams_sl, resolution_args, ret_tids)
+    let ret_str = resolve_tparam_via_tid(ret_str_raw, tparams_sl, resolution_args, ret_tids)
     let ret_ct = type_from_name(ret_str)
     let fn_eff_sl = node_effects(m_def)
     let fn_trusted = has_annotation(m_def, "trusted")
@@ -316,7 +334,7 @@ fn emit_poly_impl_call(node: Int, composed_base: Str, obj_str: Str) ! Codegen.Em
     // monomorphized `blink_Option_LocalPoint` — an invalid-initializer mismatch
     // (br wkwj7e). node_return_type gives only the HEAD ("Option"), so read the
     // return annotation's inner child(ren) and substitute through the same
-    // resolver the head used (resolve_tparam_poly_via_tid over ret_tids, dotted-
+    // resolver the head used (resolve_tparam_via_tid over ret_tids, dotted-
     // string fallback). The tid path spells a bare cross-module inner BARE, which
     // is the carrier convention the free-fn emit_generic_fn_call_tail and the 7
     // other RETURN-path producers already store (strip_module_qualifier); the
@@ -330,7 +348,7 @@ fn emit_poly_impl_call(node: Int, composed_base: Str, obj_str: Str) ! Codegen.Em
         let ann_elems = if ret_ann != -1 { node_elements(ret_ann) } else { -1 }
         if ann_elems != -1 && sublist_length(ann_elems) >= 1 {
             let inner_ann = sublist_get(ann_elems, 0)
-            let inner_name = resolve_tparam_poly_via_tid(node_name(inner_ann), tparams_sl, resolution_args, ret_tids)
+            let inner_name = resolve_tparam_via_tid(node_name(inner_ann), tparams_sl, resolution_args, ret_tids)
             let inner_ct = type_from_name(inner_name)
             expr_option_inner = inner_ct
             expr_option_inner_struct = ""
@@ -347,8 +365,8 @@ fn emit_poly_impl_call(node: Int, composed_base: Str, obj_str: Str) ! Codegen.Em
         if ann_elems != -1 && sublist_length(ann_elems) >= 2 {
             let ok_ann = sublist_get(ann_elems, 0)
             let err_ann = sublist_get(ann_elems, 1)
-            let ok_name = resolve_tparam_poly_via_tid(node_name(ok_ann), tparams_sl, resolution_args, ret_tids)
-            let err_name = resolve_tparam_poly_via_tid(node_name(err_ann), tparams_sl, resolution_args, ret_tids)
+            let ok_name = resolve_tparam_via_tid(node_name(ok_ann), tparams_sl, resolution_args, ret_tids)
+            let err_name = resolve_tparam_via_tid(node_name(err_ann), tparams_sl, resolution_args, ret_tids)
             let ok_ct = type_from_name(ok_name)
             let err_ct = type_from_name(err_name)
             expr_result_ok_type = ok_ct
@@ -3744,22 +3762,31 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                 ensure_option_type(elem_ct)
                 let stdlib_name = "list_{method}"
                 let args_sl = node_args(node)
-                // arg_tids stays [] for these stdlib list-op registrations: the
-                // element type is only available here as a CT_ tag (elem_ct via
-                // get_list_elem_type), not a structured instance tid, so no faithful
-                // tid can be reconstructed. The def-side emitter falls back to the
-                // string seg — correct and byte-identical (dhrpxw: pure string-inference).
+                // 0n07he Step 2a: recover the element binder's concrete tid from the
+                // receiver list (tc_tid_list_elem over the object node's memoized tid),
+                // carried through listop_slot_tid so it is fed as arg_tids ONLY when it
+                // byte-matches the type_name_from_ct CSV segment (else -1 → string seg,
+                // exactly as before). The reachable elements are scalars OR bare
+                // containers (List/Map/Set/Bytes) — the `elem_name != "Void"` guard above
+                // only excludes struct/enum (type_name_from_ct has no CT_STRUCT/CT_ENUM
+                // case → "Void"). For both admitted kinds tc_tid_to_c_tag spells a bare
+                // tag matching type_name_from_ct, so the byte-match holds; do NOT assume
+                // a scalar-only shape here (a List[List[Int]].fold carries elem_name
+                // "List"). The guard is what keeps every slot safe, not the element kind.
+                let elem_tid = tc_tid_list_elem(tc_lookup_node_tid(node_obj(node)))
                 if method == "fold" {
                     emit_expr(sublist_get(args_sl, 0))
                     let init_str = expr_result_str
                     let init_type = expr_result_type
                     let init_name = type_name_from_ct(init_type)
+                    let init_tid = tc_lookup_node_tid(sublist_get(args_sl, 0))
                     emit_expr(sublist_get(args_sl, 1))
                     let fn_str = expr_result_str
                     let ta_str = "{elem_name},{init_name}"
+                    let arg_tids = [listop_slot_tid(elem_tid, elem_name), listop_slot_tid(init_tid, init_name)]
                     let mangled = mangle_generic_name(stdlib_name, ta_str)
-                    register_mono_fn(stdlib_name, ta_str, [])
-                    register_mono_instance(stdlib_name, ta_str, [])
+                    register_mono_fn(stdlib_name, ta_str, arg_tids)
+                    register_mono_instance(stdlib_name, ta_str, arg_tids)
                     reg_fn(mangled, init_type)
                     let result_var = fresh_temp("__fold_")
                     emit_line("{c_type_str(init_type)} {result_var} = {c_fn_name(mangled)}({obj_str}, {init_str}, {fn_str});")
@@ -3769,9 +3796,10 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                     emit_expr(sublist_get(args_sl, 0))
                     let fn_str = expr_result_str
                     let ta_str = elem_name
+                    let arg_tids = [listop_slot_tid(elem_tid, elem_name)]
                     let mangled = mangle_generic_name(stdlib_name, ta_str)
-                    register_mono_fn(stdlib_name, ta_str, [])
-                    register_mono_instance(stdlib_name, ta_str, [])
+                    register_mono_fn(stdlib_name, ta_str, arg_tids)
+                    register_mono_instance(stdlib_name, ta_str, arg_tids)
                     if method == "for_each" {
                         reg_fn(mangled, CT_VOID)
                         emit_line("{c_fn_name(mangled)}({obj_str}, {fn_str});")
