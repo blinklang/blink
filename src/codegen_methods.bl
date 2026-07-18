@@ -61,7 +61,7 @@ import diagnostics.{
     WITH_PTR_BODY_TOO_COMPLEX, FFI_SCOPE_NOT_WITH_RESOURCE,
 }
 import ast.{NodeKind, is_block_bearing}
-import typecheck.{tc_lookup_node_tid, tc_tid_ct, tc_tid_struct, tc_tid_struct_mono_name, tc_tid_tuple_sname, tc_tid_list_elem, tc_struct_slot_encodable, tc_poly_elem_slot_encodable, is_import_module_name, tc_qualifier_to_module_or_self, suggest_module_member}
+import typecheck.{tc_lookup_node_tid, tc_tid_ct, tc_tid_struct, tc_tid_struct_mono_name, tc_tid_tuple_sname, tc_tid_list_elem, tc_struct_slot_encodable, tc_poly_elem_slot_encodable, tc_seg_from_tid, is_import_module_name, tc_qualifier_to_module_or_self, suggest_module_member}
 
 // Arg offset for trait-qualified builtin calls: MapOps.contains_key(m, k) has receiver at args[0]
 let mut btc_arg_offset: Int = 0
@@ -194,6 +194,64 @@ fn poly_impl_concrete_arg_tids(im: Int, recv_node: Int) -> List[Int] {
     tids
 }
 
+// pktmea: the RETURN-path twin of poly_impl_concrete_arg_tids. The four RETURN-type
+// substitution sites in emit_poly_impl_call recover the concrete element name for a
+// bare-T / compound-over-T return; this carries the concrete element tid per binder
+// so resolve_tparam_poly_via_tid can lower that name from the interned type_id pool
+// (tc_seg_from_tid) instead of the dotted string CSV (poly_impl_resolution_args).
+//
+// Unlike poly_impl_concrete_arg_tids, this does NOT apply the strict
+// tc_poly_elem_slot_encodable gate: that gate exists to keep the MANGLING CSV twin
+// byte-identical to the physical symbol, whereas the RETURN path only needs a valid
+// downstream name and BARE is the established convention (matching the 7 other
+// bare-storing RETURN-path producers). So carry the raw element tid and let
+// resolve_tparam_poly_via_tid's tc_seg_from_tid admission decide: an encodable tid
+// (scalar / bare struct / struct instance) yields its bare-or-physical segment; an
+// unencodable tid (or -1 when the receiver is not a resolvable List) returns None and
+// the twin falls back to the string path. tc_seg_from_tid guards tid<0 internally.
+fn poly_impl_return_elem_tids(im: Int, recv_node: Int) -> List[Int] {
+    let mut tids: List[Int] = []
+    let binders_sl = node_impl_binders(im)
+    let elem_tid = tc_tid_list_elem(tc_lookup_node_tid(recv_node))
+    let mut bi = 0
+    while bi < sublist_length(binders_sl) {
+        tids.push(elem_tid)
+        bi = bi + 1
+    }
+    tids
+}
+
+// pktmea: tid-preferring twin of resolve_tparam for the poly-impl RETURN path.
+// Mirrors resolve_tparam_via_tid (codegen_stmt.bl) EXACTLY — a distinct name avoids
+// the import cycle the stmt/expr twins can't cross from here (codegen_methods already
+// imports typecheck for tc_seg_from_tid, so this resolver lives fine here). When
+// `param_name` is a binder and arg_tids captured a concrete tid for its position,
+// lower the segment from the structured tid via tc_seg_from_tid; otherwise fall back
+// to resolve_tparam over the string CSV. tc_seg_from_tid returns Some only when the
+// tid is encodable, and it spells a bare struct BARE / a struct instance as its
+// physical mono stem — the RETURN path's established convention (bare for a plain
+// struct, matching descriptor_mangle / the free-fn carrier producers). resolution_args
+// stays as the fallback tail, a strict superset: an unencodable slot still resolves
+// via the old dotted string path.
+fn resolve_tparam_poly_via_tid(param_name: Str, tparams_sl: Int, resolution_args: Str, arg_tids: List[Int]) -> Str {
+    if tparams_sl != -1 {
+        let mut pi = 0
+        while pi < sublist_length(tparams_sl) {
+            if node_name(sublist_get(tparams_sl, pi)) == param_name {
+                if pi < arg_tids.len() {
+                    let seg = tc_seg_from_tid(arg_tids.get(pi).unwrap())
+                    if seg.is_some() {
+                        return seg.unwrap()
+                    }
+                }
+                break
+            }
+            pi = pi + 1
+        }
+    }
+    resolve_tparam(param_name, tparams_sl, resolution_args)
+}
+
 @allow(UnrestoredMutation, IncompleteStateRestore)
 fn emit_poly_impl_call(node: Int, composed_base: Str, obj_str: Str) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
     let im = poly_impl_block_node.get(composed_base).unwrap()
@@ -201,20 +259,26 @@ fn emit_poly_impl_call(node: Int, composed_base: Str, obj_str: Str) ! Codegen.Em
     let tparams_sl = node_impl_binders(im)
     let concrete_args = poly_impl_concrete_args(im, obj_str)
     let arg_tids = poly_impl_concrete_arg_tids(im, node_obj(node))
+    let ret_tids = poly_impl_return_elem_tids(im, node_obj(node))
     let mangled = mangle_generic_name(composed_base, concrete_args)
     register_mono_fn(composed_base, concrete_args, arg_tids)
     register_mono_instance(composed_base, concrete_args, arg_tids)
 
     // Resolve the return type through the binder substitution so the result
     // temp carries the concrete C type (a bare-T return becomes the element's
-    // concrete type, not void). Substitute using the RESOLVABLE element spelling
-    // (poly_impl_resolution_args — dotted for cross-module), not the mangling
-    // CSV: type_from_name / is_struct_type only recover a struct by splitting the
-    // qualifier on `.`, so the dot-free physical tag would collapse to CT_VOID
-    // and drop the struct-return temp (br dwhm4v).
+    // concrete type, not void). Prefer the interned type_id pool
+    // (resolve_tparam_poly_via_tid over ret_tids): tc_seg_from_tid spells a bare
+    // cross-module struct BARE (CmgPoint) — which type_from_name / is_struct_type
+    // recover directly from struct_reg_set without a `.` to split — and a struct
+    // instance as its physical mono stem. The dotted string CSV
+    // (poly_impl_resolution_args) stays as the fallback tail for unencodable slots;
+    // it is what the head relied on before pktmea (br dwhm4v). Bare is not just
+    // equivalent but MORE correct: the dotted spelling flowed into descriptor_mangle
+    // and produced the invalid promote symbol `blink_promote_helper.CmgPoint` for a
+    // with-arena tail (latent bug fixed here).
     let ret_str_raw = node_return_type(m_def)
     let resolution_args = poly_impl_resolution_args(im, obj_str)
-    let ret_str = resolve_tparam(ret_str_raw, tparams_sl, resolution_args)
+    let ret_str = resolve_tparam_poly_via_tid(ret_str_raw, tparams_sl, resolution_args, ret_tids)
     let ret_ct = type_from_name(ret_str)
     let fn_eff_sl = node_effects(m_def)
     let fn_trusted = has_annotation(m_def, "trusted")
@@ -252,21 +316,21 @@ fn emit_poly_impl_call(node: Int, composed_base: Str, obj_str: Str) ! Codegen.Em
     // monomorphized `blink_Option_LocalPoint` — an invalid-initializer mismatch
     // (br wkwj7e). node_return_type gives only the HEAD ("Option"), so read the
     // return annotation's inner child(ren) and substitute through the same
-    // binder spelling the head used (resolution_args — dotted for cross-module).
-    // Mirrors the def-side mono_fn_signature CT_OPTION/CT_RESULT branch and the
-    // free-fn emit_generic_fn_call_tail; the tid resolvers live in codegen_stmt/
-    // codegen_expr (import cycle from here), so resolve via the string path the
-    // head already relies on and recover struct instances with
-    // is_mono_struct_instance (br bd4mg6). Runs AFTER the arg-emission loop:
-    // emit_expr on the args clobbers these same expr_* carrier globals, so
-    // setting them earlier would be overwritten (the free-fn path receives
-    // args_str pre-emitted for the same reason).
+    // resolver the head used (resolve_tparam_poly_via_tid over ret_tids, dotted-
+    // string fallback). The tid path spells a bare cross-module inner BARE, which
+    // is the carrier convention the free-fn emit_generic_fn_call_tail and the 7
+    // other RETURN-path producers already store (strip_module_qualifier); the
+    // caller-side unwrap_carrier strips internally anyway, so bare is safe. Recovers
+    // struct instances with is_mono_struct_instance (br bd4mg6). Runs AFTER the
+    // arg-emission loop: emit_expr on the args clobbers these same expr_* carrier
+    // globals, so setting them earlier would be overwritten (the free-fn path
+    // receives args_str pre-emitted for the same reason).
     if ret_ct == CT_OPTION {
         let ret_ann = node_type_ann(m_def)
         let ann_elems = if ret_ann != -1 { node_elements(ret_ann) } else { -1 }
         if ann_elems != -1 && sublist_length(ann_elems) >= 1 {
             let inner_ann = sublist_get(ann_elems, 0)
-            let inner_name = resolve_tparam(node_name(inner_ann), tparams_sl, resolution_args)
+            let inner_name = resolve_tparam_poly_via_tid(node_name(inner_ann), tparams_sl, resolution_args, ret_tids)
             let inner_ct = type_from_name(inner_name)
             expr_option_inner = inner_ct
             expr_option_inner_struct = ""
@@ -283,8 +347,8 @@ fn emit_poly_impl_call(node: Int, composed_base: Str, obj_str: Str) ! Codegen.Em
         if ann_elems != -1 && sublist_length(ann_elems) >= 2 {
             let ok_ann = sublist_get(ann_elems, 0)
             let err_ann = sublist_get(ann_elems, 1)
-            let ok_name = resolve_tparam(node_name(ok_ann), tparams_sl, resolution_args)
-            let err_name = resolve_tparam(node_name(err_ann), tparams_sl, resolution_args)
+            let ok_name = resolve_tparam_poly_via_tid(node_name(ok_ann), tparams_sl, resolution_args, ret_tids)
+            let err_name = resolve_tparam_poly_via_tid(node_name(err_ann), tparams_sl, resolution_args, ret_tids)
             let ok_ct = type_from_name(ok_name)
             let err_ct = type_from_name(err_name)
             expr_result_ok_type = ok_ct
