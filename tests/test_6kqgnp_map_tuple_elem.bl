@@ -1,0 +1,73 @@
+// br 6kqgnp: a Map tuple element must spell its mono tag byte-identically on the
+// tid path (tc_tid_inner_tag → Map_str_int) and the value-constructed string path
+// (emit_tuple_lit). Before the fix the value path had no CT_MAP arm, so a Map
+// element fell through to c_type_tag(CT_MAP) = bare "map" → Tuple2_map_int, which
+// diverges from the tid path's Map_str_int; so tc_tid_tuple_elem_encodable DEFERRED
+// Map (returned false, slot tid -1) to keep the two paths agreeing on bare "map".
+//
+// The fix makes the value path spell Map_{key}_{val}, mirroring Option/Result, and
+// admits Map with scalar inners onto the tid path. The direct-literal cases are the
+// byte-parity guards (Gen1==Gen2 is the real proof); the List[(Map, Int)] case is
+// the true behavioral FLIP (pre-fix first[T] mangled to first_Void, the element
+// erased, and .0.get(...) failed to typecheck).
+
+fn take[T](x: T) -> T {
+    x
+}
+
+fn take_int[T](_x: T) -> Int {
+    99
+}
+
+fn first[T](xs: List[T]) -> T {
+    xs.get(0).unwrap()
+}
+
+// value-constructed (Map[Str, Int], Int): the Map element is spelled Map_str_int on
+// both the value path and the tid path.
+test "value-constructed (Map[Str, Int], Int) binds through tc_mono_csv" {
+    let mut m: Map[Str, Int] = Map()
+    m.insert("a", 1)
+    let p = (m, 7)
+    let n = take_int(p)
+    assert_eq(n, 99)
+}
+
+test "(Map[Str, Int], Int) round-trips through a bare-typevar param" {
+    let mut m: Map[Str, Int] = Map()
+    m.insert("a", 3)
+    let p = (m, 4)
+    let q = take(p)
+    assert_eq(q.0.get("a").unwrap(), 3)
+    assert_eq(q.1, 4)
+}
+
+// The behavioral FLIP: pre-fix the Map element tid deferred to -1, so first[T]
+// mangled to first_Void and the tuple element erased — q.0.get(...) failed to
+// typecheck. The scalar-inner gate resolves the element tid to Tuple2_Map_str_int_int.
+test "List[(Map[Str, Int], Int)] element resolves through first[T]" {
+    let mut m1: Map[Str, Int] = Map()
+    m1.insert("a", 1)
+    let mut m2: Map[Str, Int] = Map()
+    m2.insert("b", 2)
+    let xs = [(m1, 7), (m2, 8)]
+    let r = first(xs)
+    assert_eq(r.0.get("a").unwrap(), 1)
+    assert_eq(r.1, 7)
+}
+
+// A CALL-RETURNED map (Map[Int, Bool]) as a tuple element is NOT a scope var, so
+// the value path must spell it from the expr_map_* globals (populated by the
+// Map-return path), NOT the scope accessors — which would miss and default the
+// element to Map_str_int, diverging from the tid path's Tuple2_Map_int_bool_int
+// and erasing the param to void (a miscompile the code-review caught).
+fn make_map() -> Map[Int, Bool] {
+    let mut m: Map[Int, Bool] = Map()
+    m.insert(1, true)
+    m
+}
+
+test "call-returned Map[Int, Bool] tuple element resolves through take_int" {
+    let n = take_int((make_map(), 5))
+    assert_eq(n, 99)
+}
