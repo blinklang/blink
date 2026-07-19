@@ -8761,6 +8761,41 @@ pub fn tc_tid_compound_slot_faithful(tid: Int) -> Bool {
     false
 }
 
+// True iff, as the INNER of an Option/Result tuple-element carrier, `tid` spells
+// byte-identically across all THREE tuple-element name spellers — the tid path
+// (tc_tid_inner_tag), the annotation path (resolve_ann_tag / compound_name_from_ann),
+// AND the value path (emit_tuple_lit's CT_OPTION/CT_RESULT arms). Only then may the
+// enclosing Option/Result ride the tid path instead of deferring to the string CSV.
+//
+// The value path is the LIMITING speller: emit_tuple_lit's CT_OPTION arm spells the
+// inner via a SINGLE c_type_tag(expr_option_inner) — it does NOT recurse. So the
+// inner must be a kind whose one-level c_type_tag matches tc_tid_inner_tag:
+//   - scalar (int/float/bool/str/char/sized-int): tc_tid_scalar_tag == c_type_tag.
+//   - List / Set / Bytes: tc_tid_inner_tag → tc_tid_scalar_tag ("list"/"set"/"bytes");
+//     resolve_ann_tag → c_type_tag ("list"/"set"/"bytes"); value path → c_type_tag
+//     ("list"/"set"/"bytes"). Element dropped identically on all three.
+// DEFERS (the string path stays authoritative):
+//   - a NESTED Option/Result/Map inner (Option[Option[_]], Option[Result[_,_]],
+//     Option[Map]): tc_tid_inner_tag recurses to the full structured tag
+//     (Option_Result_list_int) but the value path spells only ONE level via
+//     c_type_tag(CT_RESULT/CT_OPTION/CT_MAP) = bare "result"/"option"/"map" — it does
+//     NOT recurse — so the value-constructed carrier (Option_result) diverges from the
+//     tid carrier (Option_Result_list_int) and the generic-fn mono param would erase
+//     to void. Reconciling the value path is br t5nvd4.
+//   - struct / enum (bare OR instance): tc_tid_inner_tag spells via
+//     c_type_tag_for_struct / tc_tid_struct_mono_name (physical, module-qualified)
+//     while the value/annotation paths route through canonical_struct_tag /
+//     mono_name_from_ann — not proven byte-equal at this seam.
+//   - tuple, typevar, iterator/handle/channel, unknown.
+pub fn tc_tid_inner_tag_faithful(tid: Int) -> Bool {
+    if tid < 0 || tid >= ty_pool.len() { return false }
+    // Exactly the scalar leaves (tc_tid_scalar_only) plus List/Set/Bytes — composed,
+    // not re-enumerated, so a new scalar kind stays in lockstep with the scalar gate.
+    if tc_tid_scalar_only(tid) { return true }
+    let k = ty_pool.get(tid).unwrap().kind
+    k == TK_LIST || k == TK_SET || k == TK_BYTES
+}
+
 // True iff `tid` is a plain scalar (int/float/bool/str/char/sized-int) — the shapes
 // whose tc_tid_inner_tag is a lowercase Pascal tag that matches the carrier the
 // field value emits. Excludes struct/enum (name erasure), compounds (nesting), and
@@ -9079,20 +9114,26 @@ fn tc_tid_tuple_elem_encodable(tid: Int) -> Bool {
     if k == TK_INT || k == TK_FLOAT || k == TK_BOOL || k == TK_STR || k == TK_CHAR { return true }
     if k == TK_I8 || k == TK_I16 || k == TK_I32 { return true }
     if k == TK_U8 || k == TK_U16 || k == TK_U32 || k == TK_U64 { return true }
-    // Option/Result tuple element with a SCALAR inner (br anaqc3): tc_tid_inner_tag
-    // spells Option_<scalar> / Result_<scalar>_<scalar>, byte-identical to BOTH the
-    // value path (emit_tuple_lit c_type_tag inner) and the annotation path
-    // (resolve_tuple_ann). Scalar-only: tc_tid_inner_tag has no List/Set/Bytes arm
-    // (erases to bare list/set/bytes) and erases Map/struct/nested inners differently
-    // from the value-constructed string path. Result needs BOTH inners scalar.
-    if k == TK_OPTION { return tc_tid_scalar_only(t.inner1) }
-    if k == TK_RESULT { return tc_tid_scalar_only(t.inner1) && tc_tid_scalar_only(t.inner2) }
-    // Map tuple element with SCALAR key AND value (br 6kqgnp): tc_tid_inner_tag spells
-    // Map_<scalar>_<scalar>, now byte-identical to the value path (emit_tuple_lit's
+    // Option/Result tuple element (br anaqc3 admitted SCALAR inners; br 9myrp2
+    // widened to List/Set/Bytes inners): tc_tid_inner_tag spells Option_<inner> /
+    // Result_<i1>_<i2>, byte-identical to the annotation path (resolve_tuple_ann →
+    // compound_name_from_ann → resolve_ann_tag) AND the value path (emit_tuple_lit's
+    // CT_OPTION/CT_RESULT arms) whenever every inner is tc_tid_inner_tag_faithful (a
+    // scalar or a List/Set/Bytes whose element is dropped identically on all three).
+    // A NESTED Option/Result/Map inner (Option[Option[_]], Option[Map]) is NOT
+    // faithful — the value path spells only ONE level (bare "option"/"result"/"map")
+    // while the tid path recurses (br t5nvd4) — so it DEFERS. A struct/enum inner also
+    // DEFERS (tc_tid_inner_tag routes through c_type_tag_for_struct /
+    // tc_tid_struct_mono_name vs the annotation path's mono_name_from_ann — not proven
+    // byte-equal at this seam), as does a tuple inner.
+    if k == TK_OPTION { return tc_tid_inner_tag_faithful(t.inner1) }
+    if k == TK_RESULT { return tc_tid_inner_tag_faithful(t.inner1) && tc_tid_inner_tag_faithful(t.inner2) }
+    // Top-level Map tuple element with SCALAR key AND value (br 6kqgnp): tc_tid_inner_tag
+    // spells Map_<scalar>_<scalar>, byte-identical to the value path (emit_tuple_lit's
     // CT_MAP arm) and the annotation path (compound_name_from_ann → Map_{key}_{val}).
-    // Scalar inners only — a struct inner would spell via tc_tid_struct_mono_name here
-    // vs canonical_struct_tag on the value/annotation side and could diverge (mirrors
-    // tc_tid_compound_slot_faithful's Map arm and the Result scalar-only gate above).
+    // Scalar inners only — a struct/compound inner would spell via tc_tid_struct_mono_name
+    // here vs canonical_struct_tag on the value/annotation side and could diverge (mirrors
+    // tc_tid_compound_slot_faithful's Map arm and the Option/Result scalar/compound gate above).
     if k == TK_MAP { return tc_tid_scalar_only(t.inner1) && tc_tid_scalar_only(t.inner2) }
     // A BARE (monomorphic) struct/enum tuple element: tc_tid_inner_tag spells it via
     // c_type_tag_for_struct (physical prefix), byte-identical to resolve_tuple_ann's

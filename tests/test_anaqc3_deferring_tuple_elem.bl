@@ -1,14 +1,22 @@
-// anaqc3 regression guards: tuple elements whose Option/Result inner is NOT a
-// scalar MUST stay on the string path (tc_tid_tuple_elem_encodable returns false
-// for them, so the slot tid stays -1 and resolve_tparam_via_tid falls back). If the
-// scalar-only guard ever loosens to admit these, the tid path (tc_tid_inner_tag)
-// would spell them differently from the value-constructed string path and break the
-// Gen1==Gen2 fixed point — these tests are the byte-stability tripwire.
+// Tuple elements whose Option/Result inner is a compound type. Two families:
+//   - inner is List/Set/Bytes (or a nested Option/Result over those): now RIDES the
+//     tid path (br 9myrp2 widened tc_tid_tuple_elem_encodable via
+//     tc_tid_inner_tag_faithful). tc_tid_inner_tag spells the inner byte-identically
+//     to BOTH the value path (emit_tuple_lit) and the annotation path
+//     (resolve_tuple_ann) — the List element is erased to bare "list" on all three.
+//   - inner is Map or a struct/enum: still DEFERS to the string path. The value path
+//     spells an Option[Map] carrier's Map inner BARE ("map") while the tid/annotation
+//     paths spell it structured (Map_k_v) — br t5nvd4; and a struct inner spells via
+//     tc_tid_struct_mono_name vs the value path's canonical_struct_tag. Admitting
+//     these would mint a tid carrier the value path can't produce (void-erased mono
+//     param), so they must defer until t5nvd4 reconciles the value path.
+// These tests exercise both families as a byte-stability + correctness tripwire: the
+// widened guard must keep the Gen1==Gen2 fixed point AND compile each shape.
 //
 // Kept in a SEPARATE TU from the scalar-inner cases
-// (test_anaqc3_option_result_tuple_elem.bl): co-locating a scalar Option seed with
-// these compound shapes trips an orthogonal, pre-existing tuple-literal carrier
-// collapse (br yap7h7). These shapes each compile correctly on their own.
+// (test_anaqc3_option_result_tuple_elem.bl) — originally to dodge an orthogonal
+// tuple-literal carrier collapse (br yap7h7, now FIXED). Retained separately only
+// for organization; these shapes each compile correctly on their own.
 
 type AnaqcPoint {
     x: Int,
@@ -19,10 +27,11 @@ fn take_int[T](_x: T) -> Int {
     99
 }
 
-// Option[List[Int]]: string path keeps the element → Tuple2_Option_list_int;
-// tc_tid_inner_tag has no TK_LIST arm and would erase the List inner via
-// tc_tid_scalar_tag to bare "list" — DIVERGES. Stays deferred.
-test "(Option[List[Int]], Int) stays on the string path" {
+// Option[List[Int]]: now RIDES the tid path (br 9myrp2). tc_tid_inner_tag erases the
+// List inner via tc_tid_scalar_tag to bare "list" → Option_list; resolve_tuple_ann
+// and emit_tuple_lit both spell the same bare "list" (element dropped), so all three
+// agree on Tuple2_Option_list_int.
+test "(Option[List[Int]], Int) rides the tid path" {
     let xs = [1, 2, 3]
     let p = (Some(xs), 7)
     let n = take_int(p)
@@ -40,12 +49,14 @@ test "(Option[AnaqcPoint], Int) stays on the string path" {
     assert_eq(n, 99)
 }
 
-// Option[Map]: even after br 6kqgnp reconciled the BARE Map spelling (both paths
-// now spell a top-level Map element Map_str_int), Option[Map] stays DEFERRED — the
-// TK_OPTION arm of tc_tid_tuple_elem_encodable requires a SCALAR inner
-// (tc_tid_scalar_only), and a Map inner is not scalar. A NESTED Map inside an
-// Option carrier still erases differently between the tid and value paths, so it
-// must not be admitted (mirrors Option[List]/Option[<struct>] above).
+// Option[Map]: stays DEFERRED even after br 6kqgnp reconciled the BARE top-level Map
+// element (both paths spell a TOP-LEVEL Map tuple element Map_str_int) and br 9myrp2
+// admitted List/Set/Bytes inners. A Map inside an Option carrier still DIVERGES: the
+// value path (emit_tuple_lit CT_OPTION arm → option_c_type → c_type_tag(CT_MAP))
+// spells the inner BARE "map" → Option_map, while the tid + annotation paths spell it
+// structured Map_str_int → Option_Map_str_int. So tc_tid_inner_tag_faithful returns
+// false for a Map inner and this stays on the string path until br t5nvd4 reconciles
+// the value-path compound carrier.
 test "(Option[Map[Str, Int]], Int) stays on the string path" {
     let mut m: Map[Str, Int] = Map()
     m.insert("a", 1)
@@ -54,10 +65,10 @@ test "(Option[Map[Str, Int]], Int) stays on the string path" {
     assert_eq(n, 99)
 }
 
-// Result[List[Int], Int]: the Ok inner is a List → string path
-// Tuple2_Result_list_int_int (bare "list"); a non-scalar inner1 means Result must
-// NOT be admitted (the guard requires BOTH inners scalar). Stays deferred.
-test "(Result[List[Int], Int], Int) stays on the string path" {
+// Result[List[Int], Int]: now RIDES the tid path (br 9myrp2). The Ok inner is a List
+// → tc_tid_inner_tag erases it to bare "list" (tc_tid_inner_tag_faithful admits List),
+// byte-identical to resolve_tuple_ann and emit_tuple_lit → Tuple2_Result_list_int_int.
+test "(Result[List[Int], Int], Int) rides the tid path" {
     let xs = [1, 2, 3]
     let r: Result[List[Int], Int] = Ok(xs)
     let p = (r, 7)
