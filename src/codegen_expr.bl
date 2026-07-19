@@ -3572,6 +3572,38 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                         transparent_enum = ann_inner
                     }
                 }
+                // Consult the live let-target annotation (`let x: Option[..] =
+                // Some(..)`). emit_let_binding derives a STRUCTURED carrier name
+                // from this same annotation for the declaration; the RHS Some cast
+                // must match it or C reports "invalid initializer" over two
+                // byte-identical-but-differently-named carriers (t5nvd4/kjpq9p).
+                // The Ok/Err path already consults the annotation this way; this
+                // brings Some to parity. Only fires when the annotation is present
+                // (fn-return / bare-scalar paths leave ann_inner_name empty, so
+                // their existing output is byte-identical).
+                let mut ann_inner_name = ""
+                if cg_let_target_ann != -1 && node_name(cg_let_target_ann) == "Option" {
+                    let lt_elems = node_elements(cg_let_target_ann)
+                    if lt_elems != -1 && sublist_length(lt_elems) >= 1 {
+                        let lt_inner_ann = sublist_get(lt_elems, 0)
+                        let lt_inner_name = node_name(lt_inner_ann)
+                        let lt_inner_ct = type_from_name(lt_inner_name)
+                        // Transparent-newtype scalar inner (kjpq9p): the arg reached
+                        // Some as a CT_INT variable, so transparent_newtype_arg_enum
+                        // and the fn-return recovery both missed it. Recover from the
+                        // annotation using the UN-STRIPPED node_name — exactly what
+                        // option_inner_struct_from_fn returns — so this mints the same
+                        // carrier token as the enclosing-fn recovery above.
+                        if transparent_enum == "" && inner_type == CT_INT && is_transparent_newtype(lt_inner_name) != 0 {
+                            transparent_enum = lt_inner_name
+                        } else if is_compound_ct(lt_inner_ct) != 0 || lt_inner_name == "Tuple" {
+                            // Compound/Tuple inner (t5nvd4): compute the STRUCTURED
+                            // name (Map_int_int, Option_int, ...) to feed the compound
+                            // branch's carrier-name chain as its first preference.
+                            ann_inner_name = compound_name_from_ann(lt_inner_ann)
+                        }
+                    }
+                }
                 if transparent_enum != "" {
                     ensure_struct_option_type(transparent_enum)
                     let opt_type = struct_option_c_type(transparent_enum)
@@ -3613,7 +3645,9 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                         expr_option_inner_struct = inner_s
                     }
                 } else if is_compound_ct(inner_type) != 0 {
-                    let compound_name = if inner_type == CT_OPTION && expr_option_inner_struct != "" {
+                    let compound_name = if ann_inner_name != "" {
+                        ann_inner_name
+                    } else if inner_type == CT_OPTION && expr_option_inner_struct != "" {
                         expr_option_inner_struct
                     } else if inner_type == CT_OPTION {
                         let opt_tag = c_type_tag(expr_option_inner)
