@@ -1,0 +1,117 @@
+// br e3js70: a Result[Map[K,V], E] value carrier was spelled BARE at construction
+// (blink_Result_map_int) by upgrade_compound_carrier, while the Some-ctor annotation-consult
+// structures the SAME carrier (blink_Result_Map_str_int_int). The two byte-identical typedefs
+// got different NAMES, so:
+//   - a nested Option[Result[Map,_]] is UNCONSTRUCTABLE (the Some inner-Result carrier and the
+//     Ok(map) value carrier collide with "incompatible types") on clean main.
+//   - a top-level Result[Map,_] tuple element (and reassignment) had to DEFER to the string CSV
+//     path (tc_tid_inner_tag_faithful's Result-direct-Map carve-out).
+//
+// After the fix ALL Result-Map construction sites (Ok / Err / reassignment) spell the Map side
+// STRUCTURED (Map_{key}_{val}), matching the annotation/tid path. Because the C layout is
+// identical (uniform blink_map* member), cross-constructor assignment stays legal, and the shape
+// rides the tid path (the two carve-outs at tc_tid_inner_tag_faithful / tc_tid_tuple_elem_encodable
+// are removed).
+
+fn u(o: Option[Result[Map[Str, Int], Int]]) -> Int {
+    if o.is_some() {
+        return 1
+    }
+    0
+}
+
+fn ok_map_get(r: Result[Map[Str, Int], Int], key: Str) -> Int {
+    match r {
+        Ok(got) => { return got.get(key).unwrap() }
+        Err(_) => { return -1 }
+    }
+    -2
+}
+
+fn err_val(r: Result[Map[Str, Int], Int]) -> Int {
+    match r {
+        Ok(_) => { return -1 }
+        Err(e) => { return e }
+    }
+    -2
+}
+
+fn err_map_get(r: Result[Int, Map[Str, Int]], key: Str) -> Int {
+    match r {
+        Ok(_) => { return -1 }
+        Err(got) => { return got.get(key).unwrap() }
+    }
+    -2
+}
+
+// The MVCE: Option-wrapped Result-with-direct-Map, unconstructable on clean main.
+test "Option[Result[Map[Str,Int],Int]] is constructable" {
+    let mut m: Map[Str, Int] = Map()
+    m.insert("a", 1)
+    let r: Result[Map[Str, Int], Int] = Ok(m)
+    let o: Option[Result[Map[Str, Int], Int]] = Some(r)
+    assert_eq(u(o), 1)
+}
+
+// The no-tuple direct form: a bare Result[Map,_] built via Ok must round-trip its Map payload.
+test "Result[Map[Str,Int],Int] Ok round-trips its map" {
+    let mut m: Map[Str, Int] = Map()
+    m.insert("k", 42)
+    let r: Result[Map[Str, Int], Int] = Ok(m)
+    assert_eq(ok_map_get(r, "k"), 42)
+}
+
+// Err side of a Result-with-Map-ok: exercises the Err construction carrier speller (must agree
+// with the Ok speller on the Map side name, or reassignment diverges).
+test "Result[Map[Str,Int],Int] Err round-trips its error" {
+    let r: Result[Map[Str, Int], Int] = Err(7)
+    assert_eq(err_val(r), 7)
+}
+
+// Reassignment between Ok and Err of the same Result[Map,_] type: both constructors must spell
+// the carrier identically or the second assignment is a C type mismatch.
+test "Result[Map[Str,Int],Int] Ok/Err reassignment shares the carrier" {
+    let mut m: Map[Str, Int] = Map()
+    m.insert("z", 9)
+    let mut r: Result[Map[Str, Int], Int] = Ok(m)
+    r = Err(3)
+    assert_eq(err_val(r), 3)
+}
+
+// Map in the ERR position: Result[Int, Map[Str,Int]] — the symmetric carve-out.
+test "Result[Int,Map[Str,Int]] Err round-trips its map" {
+    let mut m: Map[Str, Int] = Map()
+    m.insert("q", 5)
+    let r: Result[Int, Map[Str, Int]] = Err(m)
+    assert_eq(err_map_get(r, "q"), 5)
+}
+
+// GENERAL REASSIGNMENT TARGET-THREADING (uncovered while fixing e3js70): a
+// statement-level `r = Err(x)` / `o = None` has no RHS annotation, so a bare compound
+// constructor used to mint a scalar carrier (blink_Result_int_int / blink_Option_int)
+// that C rejects against the target's declared type. The Assignment path now threads the
+// target var name (cg_assign_target_name) into the ctors' annotation-less fallbacks, so
+// the RHS adopts the target's recorded carrier. Broken on clean main for ALL compound
+// types (Result/struct, Option/struct), not just Map — these guard the general fix.
+
+type ReasP { v: Int }
+
+fn reasp_result_err_val(r: Result[ReasP, Int]) -> Int {
+    match r {
+        Ok(_) => { return -1 }
+        Err(e) => { return e }
+    }
+    -2
+}
+
+test "reassign Result[Struct,Int] Ok -> Err adopts target carrier" {
+    let mut r: Result[ReasP, Int] = Ok(ReasP { v: 5 })
+    r = Err(3)
+    assert_eq(reasp_result_err_val(r), 3)
+}
+
+test "reassign Option[Struct] Some -> None adopts target carrier" {
+    let mut o: Option[ReasP] = Some(ReasP { v: 5 })
+    o = None
+    assert_eq(o.is_none(), true)
+}

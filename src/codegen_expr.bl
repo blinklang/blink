@@ -9,7 +9,7 @@ import codegen_types.{
     cg_async_scope_counter, cg_async_scope_stack,
     cg_closure_cap_count, cg_closure_cap_start, cg_closure_defs,
     cg_current_fn_has_ev, cg_current_fn_name, cg_current_fn_node, cg_current_fn_option_inner, cg_current_fn_option_inner_struct, cg_current_fn_ret, cg_in_test_body, cg_test_mode, cg_in_assert_panics,
-    cg_let_target_ann, cg_expect_arg_ann,
+    cg_let_target_ann, cg_expect_arg_ann, cg_assign_target_name,
     cg_mono_tparams_sl, cg_mono_concrete_args, cg_mono_arg_tids,
     cg_debug_mode, cg_handler_body_field, cg_handler_body_idx,
     cg_handler_body_is_ue, cg_handler_body_vtable_type,
@@ -383,6 +383,29 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
             let expect_struct = expect_arg_option_inner_struct()
             if expect_struct != "" {
                 set_bare_none_struct_result(expect_struct)
+                expr_option_is_none = 1
+                return
+            }
+            // Reassignment (`o = None`) adopts the target var's declared Option carrier
+            // — a statement-level reassignment has no cg_expect_arg_ann, so without this
+            // the fn-return fallbacks below mint a scalar carrier (blink_Option_int) that
+            // C rejects against the target's structured type (blink_Option_P). A
+            // struct/compound inner carries its tag in the var-struct slot; a scalar inner
+            // routes through the ct branch. Mirrors the annotation path's carrier choice.
+            if cg_assign_target_name != "" && get_var_type(cg_assign_target_name) == CT_OPTION {
+                let t_inner_s = get_var_option_inner_struct(cg_assign_target_name)
+                if t_inner_s != "" {
+                    set_bare_none_struct_result(t_inner_s)
+                    expr_option_is_none = 1
+                    return
+                }
+                let t_inner_ct = get_var_option_inner(cg_assign_target_name)
+                ensure_option_type(t_inner_ct)
+                let opt_type = option_c_type(t_inner_ct)
+                expr_result_str = "({opt_type})\{.tag = 0}"
+                expr_result_type = CT_OPTION
+                expr_option_inner = t_inner_ct
+                expr_option_inner_struct = ""
                 expr_option_is_none = 1
                 return
             }
@@ -2452,21 +2475,31 @@ fn carrier_from_elem_name(name: Str, fallback: Int, ann_node: Int) -> CarrierInf
     CarrierInfo { type_const: fallback, struct_name: "" }
 }
 
-// Carrier for one side of a Result whose annotation is an Option/Result
-// (`Result[Option[T], E]` etc.). carrier_from_elem_name leaves such a side's
-// struct_name empty because the annotation name ("Option"/"Result") is neither a
-// struct nor an enum, which erases the carrier member to `blink_Result_option_…`
-// (`void ok`/`void err`) — the member is embedded by value, so it needs the
-// structured `Option_T`/`Result_.._..` tag. A `Map[K,V]` side is deliberately
-// excluded: its carrier member is a uniform `blink_map*` regardless of tag, so
-// the erased `map` tag is already correct and every other Map-result path (Err,
-// reassignment) keeps it — upgrading only one side would diverge the carrier
-// name and break assignment. Non-Option/Result sides are returned unchanged.
+// Carrier for one side of a Result whose annotation is a compound (`Result[Option[T],
+// E]`, `Result[Map[K,V], E]`, ...). carrier_from_elem_name leaves such a side's
+// struct_name empty because the annotation name ("Option"/"Result"/"Map") is neither a
+// struct nor an enum, which erases the carrier member's tag to
+// `blink_Result_option_…`/`blink_Result_map_…` — the member is embedded by value (or,
+// for a Map, is a uniform `blink_map*`), so it needs the structured `Option_T` /
+// `Result_.._..` / `Map_{k}_{v}` tag.
+//
+// The Map side is now spelled STRUCTURED (`Map_{key}_{val}`) too, matching the annotation
+// path (param_c_type → resolve_result_inner_tag → compound_name_from_ann) and the tid
+// path — before br e3js70 it was deliberately left bare ("map") for "uniform blink_map*
+// cross-constructor assignment compat", but that only worked because EVERY Map-result
+// path erased identically; the moment the annotation/return path spelled it structured
+// (e.g. an `Option[Result[Map,_]]` param, or the Some-ctor inner-Result consult) the two
+// byte-identical typedefs got different NAMES → C "incompatible types" (unconstructable)
+// and the tuple-element tid path had to defer. Because the C layout is identical (the
+// `blink_map*` member is the same regardless of tag), spelling the Map side structured
+// keeps cross-constructor assignment legal AND lets the shape ride the tid path. Every
+// Map-result construction site (Ok / Err / reassignment) routes through here, so they all
+// agree on the structured name. Non-compound sides are returned unchanged.
 fn upgrade_compound_carrier(c: CarrierInfo, ann_node: Int) -> CarrierInfo {
     if c.struct_name != "" { return c }
     if ann_node == -1 { return c }
     let ct = type_from_name(node_name(ann_node))
-    if ct != CT_OPTION && ct != CT_RESULT { return c }
+    if ct != CT_OPTION && ct != CT_RESULT && ct != CT_MAP { return c }
     CarrierInfo { type_const: ct, struct_name: compound_name_from_ann(ann_node) }
 }
 
@@ -3830,6 +3863,18 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                 emit_expr(sublist_get(args_sl, 0))
                 let ok_str = expr_result_str
                 let mut ok_type = expr_result_type
+                // Reassignment (`r = Ok(m)`) adopts the target var's declared Result
+                // carrier, symmetric with the Err path — the fn-return fallback below
+                // has no annotation and would erase the ok side. The ok payload type
+                // (ok_type) still comes from the emitted arg; only the carrier NAME
+                // (ok_s/err_s) is taken from the target.
+                if cg_assign_target_name != "" && get_var_type(cg_assign_target_name) == CT_RESULT {
+                    let t_ok_s = get_var_result_ok_struct(cg_assign_target_name)
+                    let t_err_t = get_var_result_err(cg_assign_target_name)
+                    let t_err_s = get_var_result_err_struct(cg_assign_target_name)
+                    emit_ok_result(ok_str, ok_type, t_err_t, t_ok_s, t_err_s)
+                    return
+                }
                 let fn_rt = get_fn_ret_type(cg_current_fn_name)
                 if fn_rt.kind == CT_RESULT && fn_rt.inner1 == CT_VOID {
                     ok_type = CT_VOID
@@ -3919,6 +3964,20 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                 emit_expr(sublist_get(args_sl, 0))
                 let err_str = expr_result_str
                 let err_type = expr_result_type
+                // A statement-level reassignment (`r = Err(3)`) has no RHS annotation,
+                // so adopt the target var's declared Result carrier — otherwise the
+                // fsi/fn-return fallback below mints a scalar carrier
+                // (blink_Result_int_int) that C rejects against the target's structured
+                // type (blink_Result_Map_str_int_int). Mirrors the annotation path's
+                // emit_err_result with the target's recorded ok/err type+struct.
+                if cg_assign_target_name != "" && get_var_type(cg_assign_target_name) == CT_RESULT {
+                    let t_ok_t = get_var_result_ok(cg_assign_target_name)
+                    let t_err_t = get_var_result_err(cg_assign_target_name)
+                    let t_ok_s = get_var_result_ok_struct(cg_assign_target_name)
+                    let t_err_s = get_var_result_err_struct(cg_assign_target_name)
+                    emit_err_result(err_str, t_ok_t, t_err_t, t_ok_s, t_err_s)
+                    return
+                }
                 let err_enum = get_var_enum(err_str)
                 let fsi = get_fn_ret_struct_inner(cg_current_fn_name)
                 let mut err_s = if err_enum != "" { err_enum } else { fsi.err_struct }

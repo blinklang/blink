@@ -1307,6 +1307,16 @@ pub let mut cg_let_target_type: Int = 0
 pub let mut cg_let_target_name: Str = ""
 pub let mut cg_let_target_ann: Int = -1
 
+// The scope-var name being reassigned (`r = Err(3)`), or "" outside an assignment
+// RHS. A statement-level reassignment has no annotation node on the RHS, so a bare
+// compound constructor (Ok/Err/Some/None) can't consult cg_let_target_ann to pick
+// the target's carrier — it would fall back to a scalar carrier (blink_Result_int_int)
+// and diverge from the target's declared type (blink_Result_Map_str_int_int). The
+// ctors' annotation-less fallbacks consult this var's recorded compound carrier
+// (get_var_result_* / get_var_option_*) instead, so the RHS spells the target's exact
+// carrier. Keyed by var name, mirroring get_fn_ret_struct_inner(cg_current_fn_name).
+pub let mut cg_assign_target_name: Str = ""
+
 // Call-argument context: the callee parameter's type annotation node for the
 // argument currently being emitted. Lets bare carrier constructors (None / Ok /
 // Err) at a call site adopt the parameter's expected Option/Result inner struct
@@ -6247,18 +6257,61 @@ pub type CompoundSplit {
     second: Str
 }
 
+// Byte length of the FIRST complete compound-tag token at the start of `s`. A tag
+// is one of: a nested carrier (Map_K_V consumes two sub-tags; Option_T one; Result_O_E
+// two) or a leaf (a scalar word like "int"/"str", or a registered struct/enum name that
+// may itself contain underscores). Recursive-descent over the same grammar
+// tc_tid_inner_tag emits, so it splits `Result_int_Map_str_int` correctly (ok="int",
+// err="Map_str_int") where a naive rightmost-underscore scan mis-splits on the trailing
+// "_int" of the Map (br e3js70). Returns s.len() when the whole string is one tag.
+fn first_tag_len(s: Str) -> Int {
+    if s.starts_with("Map_") {
+        let after = s.slice(4, s.len())
+        let k_len = first_tag_len(after)
+        // after = "{K}_{V}..." ; skip K and its trailing '_', then consume V.
+        let rest_v = after.slice(k_len + 1, after.len())
+        let v_len = first_tag_len(rest_v)
+        return 4 + k_len + 1 + v_len
+    }
+    if s.starts_with("Option_") {
+        let after = s.slice(7, s.len())
+        return 7 + first_tag_len(after)
+    }
+    if s.starts_with("Result_") {
+        let after = s.slice(7, s.len())
+        let ok_len = first_tag_len(after)
+        let rest_e = after.slice(ok_len + 1, after.len())
+        let e_len = first_tag_len(rest_e)
+        return 7 + ok_len + 1 + e_len
+    }
+    // Leaf: a registered struct/enum name may span multiple underscore-groups
+    // (std_db_row_Row). Take the LONGEST prefix that names a known struct/enum; else
+    // fall back to a single scalar underscore-group (up to the first '_' or end).
+    let mut best = -1
+    let mut i = s.len()
+    while i > 0 {
+        let cand = s.slice(0, i)
+        if is_struct_type(cand) != 0 || is_enum_type(cand) != 0 || is_mono_struct_instance(cand) != 0 || is_canonical_struct_tag(cand) != 0 {
+            best = i
+            i = 0
+        } else {
+            i = i - 1
+        }
+    }
+    if best > 0 { return best }
+    let mut j = 0
+    while j < s.len() {
+        if s.byte_at(j) == 95 { return j }
+        j = j + 1
+    }
+    s.len()
+}
+
 pub fn split_result_compound(compound: Str) -> CompoundSplit {
     let rest = compound.slice(7, compound.len())
-    let mut last_sep = -1
-    let mut i = 0
-    while i < rest.len() {
-        if rest.byte_at(i) == 95 { // '_'
-            last_sep = i
-        }
-        i = i + 1
-    }
-    if last_sep > 0 {
-        CompoundSplit { first: rest.slice(0, last_sep), second: rest.slice(last_sep + 1, rest.len()) }
+    let ok_len = first_tag_len(rest)
+    if ok_len < rest.len() {
+        CompoundSplit { first: rest.slice(0, ok_len), second: rest.slice(ok_len + 1, rest.len()) }
     } else {
         CompoundSplit { first: rest, second: "" }
     }

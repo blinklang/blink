@@ -19,7 +19,7 @@ import codegen_types.{
     cg_handler_vtable_field, cg_handler_vtable_type,
     cg_in_handler_body, cg_in_ffi_scope_resource, cg_indent, cg_test_mode, cg_in_assert_panics, cg_assert_panics_counter, cg_let_target_ann, cg_expect_arg_ann,
     cg_mono_tparams_sl, cg_mono_concrete_args, cg_mono_arg_tids,
-    cg_let_target_name, cg_let_target_type, cg_lines, cg_program_node,
+    cg_let_target_name, cg_let_target_type, cg_assign_target_name, cg_lines, cg_program_node,
     cg_temp_counter, cg_trace_codegen, cg_ensures_result_var, cg_old_snapshot_vars,
     compound_name_from_ann, resolve_result_inner_tag,
     emit_arena_restore_helper, emit_bh_cleanup_for_type, emit_cl_cleanup_for_type, emit_ev_restore_helper, emit_handle_cleanup, emit_line, ev_field, fn_node_has_effects,
@@ -2533,7 +2533,18 @@ fn emit_stmt(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
         let assign_target_node = node_target(node)
         emit_expr(assign_target_node)
         let target_str = expr_result_str
+        // Thread the reassigned var's name so a bare compound RHS (`r = Err(3)`,
+        // `o = None`) adopts the target's declared carrier — a statement-level
+        // reassignment has no RHS annotation node, so the ctors would otherwise mint
+        // a scalar carrier (blink_Result_int_int) that C rejects against the target's
+        // structured type (blink_Result_Map_str_int_int / blink_Option_P). Only for an
+        // Ident target whose scope var is a compound; cleared right after the RHS.
+        let saved_assign_target = cg_assign_target_name
+        if node_kind(assign_target_node) == NodeKind.Ident {
+            cg_assign_target_name = node_name(assign_target_node)
+        }
         emit_expr(node_value(node))
+        cg_assign_target_name = saved_assign_target
         let val_str = expr_result_str
         let val_type = expr_result_type
         emit_line("{target_str} = {val_str};")
@@ -5608,6 +5619,13 @@ pub fn emit_fn_def(fn_node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope
                             let mut err_s = ""
                             // A Tuple ok/err side is carried by its tag as a by-value
                             // member (ct=CT_INT); mirrors emit_let_binding's r9bbmk path.
+                            // A compound (Map/Option/Result) side records its STRUCTURED
+                            // tag while keeping its CT so the scope-var speller
+                            // (result_c_type_mixed, the match scrutinee) matches the
+                            // structured carrier construction now spells (br e3js70) and
+                            // the annotation param type param_c_type declares — otherwise
+                            // a Result[Map,_] param's scrutinee erases to blink_Result_map_int
+                            // while the value is blink_Result_Map_str_int_int.
                             if is_struct_or_enum_type(ok_name) != 0 {
                                 ok_s = ok_name
                             } else if ok_name == "Tuple" {
@@ -5616,6 +5634,8 @@ pub fn emit_fn_def(fn_node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope
                                     ok_s = ok_tag
                                     ok_t = CT_INT
                                 }
+                            } else if is_compound_ct(ok_t) != 0 {
+                                ok_s = compound_name_from_ann(ok_ann)
                             }
                             if is_struct_or_enum_type(err_name) != 0 {
                                 err_s = err_name
@@ -5625,6 +5645,8 @@ pub fn emit_fn_def(fn_node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope
                                     err_s = err_tag
                                     err_t = CT_INT
                                 }
+                            } else if is_compound_ct(err_t) != 0 {
+                                err_s = compound_name_from_ann(err_ann)
                             }
                             if ok_s != "" || err_s != "" {
                                 set_var_result_struct(pname, ok_t, err_t, ok_s, err_s)

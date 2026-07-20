@@ -9000,14 +9000,20 @@ pub fn tc_tid_compound_slot_faithful(tid: Int) -> Bool {
 //   - Map / nested Option / nested Result whose OWN leaves are each faithful: the value
 //     path recurses via tc_tid_inner_tag (br yavhwc), so Option[Map[Str,Int]] spells
 //     Option_Map_str_int on all three, Option[Option[Int]] spells Option_Option_int, etc.
+//     A Result with a DIRECT Map ok/err side rides too (br e3js70) — the construction/
+//     param/reassignment speller now spells the Map side STRUCTURED (Result_Map_str_int_int),
+//     no longer the bare "map" that once forced a carve-out here.
+//   - BARE (params_count 0) struct / enum leaf (br 6q5mz2): admitted. When the enclosing
+//     Option/Result rides, emit_tuple_lit spells the inner via tc_tid_inner_tag (the SAME
+//     speller the tid path uses), so the value carrier and the mono param are byte-identical by
+//     construction — the 637sy9 equivalence for a DIRECT bare-struct tuple element, reused for
+//     the wrapped leaf. A Map/Option/Result inner CONTAINING a bare struct/enum leaf rides too.
 // DEFERS (the string path stays authoritative — a too-loose gate breaks the Gen1==Gen2
-// fixed point here):
-//   - struct / enum (bare OR instance) leaf: tc_tid_inner_tag spells via
-//     c_type_tag_for_struct / tc_tid_struct_mono_name (physical, module-qualified)
-//     while the value/annotation paths route through canonical_struct_tag /
-//     mono_name_from_ann — not proven byte-equal at this seam. Follow-up: the 295z9x
-//     family reconciles this. A Map/Option/Result inner CONTAINING a struct/enum leaf
-//     defers too, because the recursion below rejects that leaf.
+// fixed point OR emits divergent carriers):
+//   - a struct/enum INSTANCE leaf (params_count != 0): the Option/Result carrier typedef for an
+//     instance inner erases its value member to void*/bare-blink_QBox and mints a divergent bare
+//     carrier alongside the mono one — a carrier-member-emission gap deeper than this gate.
+//     Follow-up ticket. (An enum instance additionally waits on dbzy4r/82ajft.)
 //   - tuple, typevar, iterator/handle/channel, unknown.
 pub fn tc_tid_inner_tag_faithful(tid: Int) -> Bool {
     if tid < 0 || tid >= ty_pool.len() { return false }
@@ -9026,20 +9032,36 @@ pub fn tc_tid_inner_tag_faithful(tid: Int) -> Bool {
     if k == TK_MAP { return tc_tid_inner_tag_faithful(t.inner1) && tc_tid_inner_tag_faithful(t.inner2) }
     if k == TK_OPTION { return tc_tid_inner_tag_faithful(t.inner1) }
     if k == TK_RESULT {
-        // A Result carrier with a DIRECT Map ok/err side is NEVER faithful — anywhere,
-        // not just as a top-level tuple element. upgrade_compound_carrier (codegen_expr.bl)
-        // spells a Result[Map,_] value carrier's Map side BARE ("map") UNCONDITIONALLY
-        // (the member is a uniform blink_map* for cross-constructor assignment compat), so
-        // the value carrier is always blink_Result_map_int while the tid path would spell
-        // Result_Map_str_int_int. This divergence bites regardless of how deeply the Result
-        // is nested (e.g. Option[Result[Map,_]] — the OPTION arm above delegates here), so
-        // the carve-out must live in the predicate, not only in tc_tid_tuple_elem_encodable's
-        // top-level Result arm (br yavhwc; reconciling the Result-Map value carrier is the
-        // follow-up). A Map wrapped one level deeper inside the Result (Result[Option[Map],_])
-        // is fine — the Result's direct side is an Option, whose carrier IS structured.
-        if tc_tid_ct(t.inner1) == CT_MAP || tc_tid_ct(t.inner2) == CT_MAP { return false }
+        // br e3js70: a Result carrier with a DIRECT Map ok/err side is now faithful. The
+        // Result-Map value carrier used to be spelled BARE ("map") by upgrade_compound_carrier
+        // for uniform-blink_map* assignment compat, diverging from the tid path's structured
+        // Result_Map_str_int_int; that construction/param/reassignment speller now spells the
+        // Map side STRUCTURED (identical C layout → assignment stays legal), so the carve-out
+        // is gone and the shape rides the tid path. Recurse structurally — the Result's sides
+        // must each be faithful (a Map side bottoms out at faithful scalar/List/Set/Bytes
+        // key/val), rejecting only a struct/enum/tuple/typevar leaf.
         return tc_tid_inner_tag_faithful(t.inner1) && tc_tid_inner_tag_faithful(t.inner2)
     }
+    // br 6q5mz2: a BARE (params_count 0) struct/enum leaf is faithful. When the enclosing
+    // Option/Result rides, emit_tuple_lit spells the inner via tc_tid_inner_tag
+    // (codegen_expr.bl ~5626/5633) — the EXACT same speller the tid path uses — and for a bare
+    // struct/enum that bottoms out at c_type_tag_for_struct on BOTH the value carrier and the
+    // generic-fn mono param, byte-identical by construction. This is the equivalence br 637sy9
+    // proved for a DIRECT (non-wrapped) bare-struct tuple element; the Option/Result-wrapped
+    // bare leaf reuses it since the ride branch delegates to the same function rather than the
+    // divergent canonical_struct_tag fallback. Module qualifier is a non-issue: both sides call
+    // tc_tid_inner_tag on the SAME tid, so they agree whatever it spells.
+    //
+    // A struct/enum INSTANCE (params_count != 0) still DEFERS: the Option/Result carrier
+    // TYPEDEF for an instance inner erases its value member to `void*`/bare-`blink_QBox` (the
+    // mono stem QBox_Int is not threaded into emit_struct_option_typedef's member type), and a
+    // second bare `blink_Option_QBox` carrier is minted alongside `blink_Option_QBox_Int` —
+    // divergent, and the bare member references an undeclared `blink_QBox`. That is a carrier-
+    // member-emission gap, deeper than this tuple-element gate; deferring keeps the instance
+    // leaf on the string CSV (where it already compiles). Mirrors tc_tid_tuple_elem_encodable's
+    // enum-instance carve-out (:9415) and tc_struct_slot_encodable (:9464). Follow-up ticket.
+    if t.params_count != 0 { return false }
+    if k == TK_STRUCT || k == TK_ENUM { return true }
     false
 }
 
@@ -9371,24 +9393,18 @@ pub fn tc_tid_tuple_elem_encodable(tid: Int) -> Bool {
     // (Option[Map[Str,Int]] → Option_Map_str_int) and a nested Option/Result inner
     // (Option[Option[Int]] → Option_Option_int) whose own leaves are faithful.
     //
-    // Both arms delegate to tc_tid_inner_tag_faithful for their inners. The Result-Map
-    // carve-out (upgrade_compound_carrier spells a Result[Map,_] value carrier BARE "map"
-    // UNCONDITIONALLY → the structured tid carrier Result_Map_str_int_int diverges from the
-    // value carrier blink_Result_map_int) must be applied at BOTH levels:
-    //   - the OPTION arm delegates to the predicate, whose TK_RESULT branch carries the
-    //     carve-out — so a NESTED Result-Map (Option[Result[Map,_]]) defers.
-    //   - this TK_RESULT arm (a TOP-LEVEL Result tuple element) checks its OWN direct
-    //     sides here, because it calls the predicate on the Result's ok/err (where a Map
-    //     side IS faithful), not on the Result itself — so the carve-out would otherwise be
-    //     skipped for a top-level Result[Map,_]. Reconciling the Result-Map value carrier is
-    //     the yavhwc follow-up.
+    // Both arms delegate to tc_tid_inner_tag_faithful for their inners. br e3js70 removed
+    // the Result-Map carve-out: a Result[Map,_] value carrier is now spelled STRUCTURED
+    // (Result_Map_str_int_int) by the construction/param/reassignment speller — identical
+    // C layout to the bare "map" it replaced (uniform blink_map* member), so assignment
+    // stays legal AND it matches the tid path — so both the top-level Result arm here and
+    // the nested case (via the predicate's TK_RESULT branch) ride.
     // Still DEFERS: a struct/enum leaf anywhere in the inner (tc_tid_inner_tag routes
     // through c_type_tag_for_struct / tc_tid_struct_mono_name vs the annotation path's
     // mono_name_from_ann — not proven byte-equal at this seam; the 295z9x follow-up
     // reconciles it), as does a tuple inner.
     if k == TK_OPTION { return tc_tid_inner_tag_faithful(t.inner1) }
     if k == TK_RESULT {
-        if tc_tid_ct(t.inner1) == CT_MAP || tc_tid_ct(t.inner2) == CT_MAP { return false }
         return tc_tid_inner_tag_faithful(t.inner1) && tc_tid_inner_tag_faithful(t.inner2)
     }
     // Top-level Map tuple element with SCALAR key AND value (br 6kqgnp): tc_tid_inner_tag
