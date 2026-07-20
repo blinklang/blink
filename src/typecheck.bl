@@ -583,6 +583,24 @@ fn make_struct_instance_type(base_name: Str, arg_types: List[Int]) -> Int {
     t
 }
 
+// A generic-enum INSTANCE tid (`Tree[Int]`), the enum analogue of
+// make_struct_instance_type (jjhnf3). Records the concrete type-args variadically
+// in ty_param_list[params_start..] so tc_tid_struct_arg_* / tc_tid_struct_mono_name
+// (all kind-agnostic once widened to TK_ENUM) can recover them at codegen, minting
+// the mono typedef `blink_Tree_Int` instead of the erased bare `blink_Tree`.
+fn make_enum_instance_type(base_name: Str, arg_types: List[Int]) -> Int {
+    let t = new_type(TK_ENUM, base_name)
+    let start = ty_param_list.len()
+    let mut i = 0
+    while i < arg_types.len() {
+        ty_param_list.push(arg_types.get(i).unwrap())
+        i = i + 1
+    }
+    let e = ty_pool.get(t).unwrap()
+    ty_pool.set(t, TypePoolEntry { params_start: start, params_count: arg_types.len(), ..e })
+    t
+}
+
 
 fn make_map_type(key_type: Int, value_type: Int) -> Int {
     let t = new_type(TK_MAP, "Map")
@@ -848,12 +866,14 @@ fn unify_typevar_binds(ptid: Int, atid: Int, binds: Map[Str, Int]) {
         }
         return
     }
-    if pk == TK_STRUCT {
-        // A generic struct param (`b: Box[T]`) binds its typevars from a struct-
-        // instance arg (`Box[Int]`). Structs are nominal — the base names must match
-        // (module-qualifier-stripped) as well as the arity, unlike the structural
-        // tuple case above. Walk the type-args in lockstep. A bare generic base (no
-        // args, params_count 0) has nothing to bind and the loop is empty.
+    if pk == TK_STRUCT || pk == TK_ENUM {
+        // A generic struct/enum param (`b: Box[T]`, `n: Tree[T]`) binds its typevars
+        // from an instance arg (`Box[Int]`, `Tree[Int]`). Both are nominal — the base
+        // names must match (module-qualifier-stripped) as well as the arity, unlike
+        // the structural tuple case above. Walk the type-args in lockstep. A bare
+        // generic base (no args, params_count 0) has nothing to bind and the loop is
+        // empty. The TK_ENUM case covers a recursive generic-enum field (jjhnf3:
+        // `Branch(left: Tree[T], …)` unified against a `Tree[Int]` arg).
         if strip_module_qualifier(pe.name) != strip_module_qualifier(ae.name) { return }
         if pe.params_count != ae.params_count { return }
         let mut i = 0
@@ -1238,6 +1258,14 @@ fn resolve_type_ann(ann_node: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
             let inst = tc_produce_struct_instance_tid(ann_node, name, elems_sl)
             if inst != -1 { return inst }
         }
+        // A generic-enum instance annotation (`t: Tree[Int]`) likewise memoizes its
+        // structured instance tid onto the annotation node so codegen's param_c_type
+        // can lower it to the mono carrier (blink_Tree_Int), not the erased bare enum
+        // (jjhnf3). Same all-typevar skip as the struct producer.
+        if type_kind(resolved) == TK_ENUM && elems_sl != -1 && sublist_length(elems_sl) >= 1 {
+            let inst = tc_produce_enum_instance_tid(ann_node, name, elems_sl)
+            if inst != -1 { return inst }
+        }
         return resolved
     }
 
@@ -1285,6 +1313,33 @@ fn tc_produce_struct_instance_tid(ann_node: Int, name: Str, elems_sl: Int) -> In
     -1
 }
 
+// The enum analogue of tc_produce_struct_instance_tid (jjhnf3): mint+memoize a
+// generic-enum instance tid (`Tree[Int]`) onto the annotation node so codegen's
+// param_c_type reads the full mono stem. Same all-typevar skip and suppression.
+@allow(UnrestoredMutation)
+fn tc_produce_enum_instance_tid(ann_node: Int, name: Str, elems_sl: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
+    let saved_suppress = tc_suppress_ann_validation
+    tc_suppress_ann_validation = 1
+    let mut arg_tids: List[Int] = []
+    let mut has_concrete = 0
+    let mut ai = 0
+    while ai < sublist_length(elems_sl) {
+        let arg_t = resolve_type_ann(sublist_get(elems_sl, ai))
+        if type_kind(arg_t) != TK_TYPEVAR { has_concrete = 1 }
+        arg_tids.push(arg_t)
+        ai = ai + 1
+    }
+    tc_suppress_ann_validation = saved_suppress
+    if has_concrete != 0 {
+        let inst = make_enum_instance_type(name, arg_tids)
+        if ann_node < tc_node_tid.len() {
+            tc_node_tid.set(ann_node, inst)
+        }
+        return inst
+    }
+    -1
+}
+
 // A generic FN PARAM annotation (`b: Box[T]`) must intern as a STRUCTURAL instance
 // tid carrying its type-arg slots — even when every slot is a typevar — so
 // unify_typevar_binds' TK_STRUCT arm (which walks param/arg slots in lockstep) can
@@ -1321,6 +1376,31 @@ fn tc_fnsig_param_instance_tid(ann_node: Int, bare_tid: Int) -> Int ! TypeCheck.
     }
     tc_suppress_ann_validation = saved_suppress
     make_struct_instance_type(strip_module_qualifier(node_name(ann_node)), arg_tids)
+}
+
+// A generic-enum VARIANT-FIELD annotation (`Branch(left: Tree[T], …)`) must intern
+// as a STRUCTURAL enum instance carrying its type-arg slots — even all-typevar ones
+// — so unify_typevar_binds' TK_ENUM arm can walk the recursive-field param against a
+// concrete `Tree[Int]` construction arg and bind T (jjhnf3). The enum analogue of
+// tc_fnsig_param_instance_tid; same deliberate exception to the all-typevar skip
+// (a field decl is resolved once at register_enum_type, not on the hot path).
+// Returns -1 (caller keeps the bare resolved tid) unless the annotation is a
+// generic user-enum with type-args.
+@allow(UnrestoredMutation)
+fn tc_evfield_instance_tid(ann_node: Int, bare_tid: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
+    if type_kind(bare_tid) != TK_ENUM { return -1 }
+    let elems_sl = node_elements(ann_node)
+    if elems_sl == -1 || sublist_length(elems_sl) < 1 { return -1 }
+    let saved_suppress = tc_suppress_ann_validation
+    tc_suppress_ann_validation = 1
+    let mut arg_tids: List[Int] = []
+    let mut ai = 0
+    while ai < sublist_length(elems_sl) {
+        arg_tids.push(resolve_type_ann(sublist_get(elems_sl, ai)))
+        ai = ai + 1
+    }
+    tc_suppress_ann_validation = saved_suppress
+    make_enum_instance_type(strip_module_qualifier(node_name(ann_node)), arg_tids)
 }
 
 // LIVE reverse-inference of a struct literal's concrete instance tid (br qw7v90,
@@ -1611,7 +1691,12 @@ fn register_enum_type(td: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Rep
                     let vf = sublist_get(vflds_sl, fi)
                     let vf_name = node_name(vf)
                     let vf_type_ann = node_value(vf)
-                    let vf_type_id = resolve_type_ann(vf_type_ann)
+                    let mut vf_type_id = resolve_type_ann(vf_type_ann)
+                    // A generic-enum instance field (`Branch(left: Tree[T], …)`)
+                    // interns its typevar slots so reverse-inference can bind T from
+                    // a concrete `Tree[Int]` construction arg (jjhnf3).
+                    let inst = tc_evfield_instance_tid(vf_type_ann, vf_type_id)
+                    if inst != -1 { vf_type_id = inst }
                     evfield_pool.push(EnumVariantFieldEntry { var_idx: var_idx, name: vf_name, type_id: vf_type_id })
                     fi = fi + 1
                 }
@@ -4435,6 +4520,101 @@ fn get_variant_enum_tid(name: Str) -> Int {
     TYPE_UNKNOWN
 }
 
+// Reverse-infer a generic-enum INSTANCE tid (`Tree[Int]`) from a variant
+// construction (jjhnf3), the enum analogue of tc_struct_lit_instance_tid. Given
+// the bare enum tid, its decl node, the variant name, and the constructor's arg
+// list, unify each declared payload field tid (evfield_pool, keyed on the
+// variant's var_idx) against the inferred ctor arg type, collect the typevar binds
+// in the enum's tparam order, and mint make_enum_instance_type. Falls back to the
+// bare `enum_tid` when the enum is non-generic or no type-param bound to a concrete
+// type — mirroring the struct path's has_concrete gate so an all-typevar / bare
+// construction keeps the existing bare behavior unchanged. `args_sl` is the raw
+// call/ctor argument sublist (positional).
+fn tc_enum_ctor_instance_tid(enum_tid: Int, decl: Int, vname: Str, args_sl: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    if decl == -1 { return enum_tid }
+    let tparams_sl = node_type_params(decl)
+    if tparams_sl == -1 || sublist_length(tparams_sl) == 0 { return enum_tid }
+    if args_sl == -1 { return enum_tid }
+    let var_idx = get_variant_var_idx(vname)
+    if var_idx == -1 { return enum_tid }
+    let mut binds: Map[Str, Int] = Map()
+    let mut fi = 0
+    while fi < sublist_length(args_sl) {
+        let declared = lookup_evfield_type_by_index(var_idx, fi)
+        if declared != -1 {
+            unify_typevar_binds(declared, infer_type(sublist_get(args_sl, fi)), binds)
+        }
+        fi = fi + 1
+    }
+    // "Concrete" excludes a typevar AND TYPE_UNKNOWN — an all-typevar / all-unknown
+    // instance carries no more information than the bare tid, so the bare path stays
+    // authoritative (mirrors tc_struct_lit_instance_tid's has_concrete gate).
+    let mut has_concrete = 0
+    let mut ci = 0
+    while ci < sublist_length(tparams_sl) {
+        let bound = binds.get(node_name(sublist_get(tparams_sl, ci))) ?? -1
+        if bound != -1 && type_kind(bound) != TK_TYPEVAR && type_kind(bound) != TK_UNKNOWN { has_concrete = 1 }
+        ci = ci + 1
+    }
+    if has_concrete == 0 { return enum_tid }
+    let mut arg_tids: List[Int] = []
+    let mut ti = 0
+    while ti < sublist_length(tparams_sl) {
+        let tpname = node_name(sublist_get(tparams_sl, ti))
+        let bound = binds.get(tpname) ?? -1
+        if bound != -1 {
+            arg_tids.push(bound)
+        } else {
+            arg_tids.push(make_typevar(tpname))
+        }
+        ti = ti + 1
+    }
+    make_enum_instance_type(strip_module_qualifier(type_to_str(enum_tid)), arg_tids)
+}
+
+// Struct-style analogue of tc_enum_ctor_instance_tid for a `Variant { field: val }`
+// construction (a StructLit node). Unifies each declared payload field tid against
+// the inferred value by FIELD NAME (lookup_evfield_type_by_name) rather than by
+// position. Same bare-fallback / has_concrete contract (jjhnf3).
+fn tc_enum_structlit_instance_tid(enum_tid: Int, decl: Int, vname: Str, flds_sl: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    if decl == -1 { return enum_tid }
+    let tparams_sl = node_type_params(decl)
+    if tparams_sl == -1 || sublist_length(tparams_sl) == 0 { return enum_tid }
+    if flds_sl == -1 { return enum_tid }
+    let var_idx = get_variant_var_idx(vname)
+    if var_idx == -1 { return enum_tid }
+    let mut binds: Map[Str, Int] = Map()
+    let mut fi = 0
+    while fi < sublist_length(flds_sl) {
+        let f = sublist_get(flds_sl, fi)
+        let declared = lookup_evfield_type_by_name(var_idx, node_name(f))
+        if declared != -1 {
+            unify_typevar_binds(declared, infer_type(node_value(f)), binds)
+        }
+        fi = fi + 1
+    }
+    let mut has_concrete = 0
+    let mut ci = 0
+    while ci < sublist_length(tparams_sl) {
+        let bound = binds.get(node_name(sublist_get(tparams_sl, ci))) ?? -1
+        if bound != -1 && type_kind(bound) != TK_TYPEVAR && type_kind(bound) != TK_UNKNOWN { has_concrete = 1 }
+        ci = ci + 1
+    }
+    if has_concrete == 0 { return enum_tid }
+    let mut arg_tids: List[Int] = []
+    let mut ti = 0
+    while ti < sublist_length(tparams_sl) {
+        let bound = binds.get(node_name(sublist_get(tparams_sl, ti))) ?? -1
+        if bound != -1 {
+            arg_tids.push(bound)
+        } else {
+            arg_tids.push(make_typevar(node_name(sublist_get(tparams_sl, ti))))
+        }
+        ti = ti + 1
+    }
+    make_enum_instance_type(strip_module_qualifier(type_to_str(enum_tid)), arg_tids)
+}
+
 // Index of the first variant named `name` in evar_pool. This index is the
 // `var_idx` key used by evfield_pool (registration stores var_idx =
 // evar_pool.len() just before pushing the variant), so it lets variant_field_count
@@ -6600,7 +6780,12 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                             }
                         }
                     }
-                    return get_variant_enum_tid(fn_name)
+                    let venum = get_variant_enum_tid(fn_name)
+                    // A generic-enum variant (`Leaf(1)`) reverse-infers its concrete
+                    // instance tid (`Tree[Int]`) from the ctor args so codegen mono's
+                    // it; a non-generic enum keeps the bare tid (jjhnf3).
+                    let vdecl = tc_variant_enum_decl_nodes.get(fn_name) ?? -1
+                    return tc_enum_ctor_instance_tid(venum, vdecl, fn_name, node_args(node))
                 }
                 // Local lexical scope shadows module-level definitions
                 // (sections/02_syntax.md:671-680, 07_trust_modules_metadata.md:1042).
@@ -6729,7 +6914,11 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                                 i = i + 1
                             }
                         }
-                        return ctor_tid
+                        // A generic-enum qualified ctor (`Tree.Leaf(1)`) reverse-infers
+                        // its concrete instance tid; a non-generic enum keeps the bare
+                        // ctor_tid (jjhnf3).
+                        let cdecl = tc_type_decl_nodes.get(cname) ?? -1
+                        return tc_enum_ctor_instance_tid(ctor_tid, cdecl, method, cargs_sl)
                     }
                 }
             }
@@ -7267,7 +7456,11 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 // 3) global-unique variant.
                 let n = count_enums_with_variant(sname)
                 if n == 1 {
-                    return get_variant_enum_tid(sname)
+                    let venum = get_variant_enum_tid(sname)
+                    // A generic-enum struct-style ctor (`Leaf { value: 1 }`) reverse-
+                    // infers its concrete instance tid; non-generic keeps bare (jjhnf3).
+                    let vdecl = tc_variant_enum_decl_nodes.get(sname) ?? -1
+                    return tc_enum_structlit_instance_tid(venum, vdecl, sname, node_fields(node))
                 }
                 if n > 1 {
                     diag_error_at("AmbiguousConstruction", AMBIGUOUS_CONSTRUCTION, "bare construction of '{sname}' is ambiguous: '{sname}' is a variant of {n} enums; qualify it (e.g. SomeEnum.{sname} \{ ... }) or add a type annotation", node, "qualify with the enum name or annotate the binding")
@@ -8544,9 +8737,18 @@ fn tid_inner_struct(inner: Int) -> Str {
         // bare-typevar-return recovery (emit_generic_fn_call_tail) that types the
         // receiving `let` variable's carrier (1452w4). Mirror tc_tid_inner_tag /
         // the top-level branch; "" from tc_tid_struct_mono_name (bare base, typevar,
-        // module-qual, enum) keeps the bare fallback.
-        let stem = tc_tid_struct_mono_name(inner)
-        if stem != "" { return stem }
+        // module-qual) keeps the bare fallback.
+        //
+        // An ENUM INSTANCE inner keeps DEFERRING to its bare head here: jjhnf3 widened
+        // tc_tid_struct_mono_name to spell enum instances, but this Set/Map-element
+        // accessor feeds the kops element/decoder path whose encodability gates
+        // (tc_struct_slot_encodable et al.) still defer enum instances (dbzy4r). Surfacing
+        // Tree_Int here while those gates defer would reference an unemitted kops carrier;
+        // keep the bare fallback until dbzy4r relaxes the gates holistically.
+        if it.kind != TK_ENUM {
+            let stem = tc_tid_struct_mono_name(inner)
+            if stem != "" { return stem }
+        }
         return strip_module_qualifier(it.name)
     }
     ""
@@ -8638,6 +8840,15 @@ pub fn tc_tid_struct(tid: Int) -> Str {
     ""
 }
 
+// Whether `tid` is a TK_ENUM (bare or instance). Lets codegen distinguish a
+// generic-enum instance slot from a struct instance slot when both funnel through
+// the kind-agnostic tc_tid_struct/tc_tid_struct_arg_* accessors (jjhnf3).
+pub fn tc_tid_is_enum(tid: Int) -> Int {
+    if tid < 0 || tid >= ty_pool.len() { return 0 }
+    if ty_pool.get(tid).unwrap().kind == TK_ENUM { return 1 }
+    0
+}
+
 // Monomorphized-struct-instance accessors (br kvn6w8 spike). Read the concrete
 // type-args of a struct-instance tid built by make_struct_instance_type — the
 // `Box[Int]` shape stored variadically in ty_param_list[params_start..]. These
@@ -8649,7 +8860,9 @@ pub fn tc_tid_struct(tid: Int) -> Str {
 pub fn tc_tid_struct_arg_count(tid: Int) -> Int {
     if tid < 0 || tid >= ty_pool.len() { return 0 }
     let t = ty_pool.get(tid).unwrap()
-    if t.kind != TK_STRUCT { return 0 }
+    // TK_ENUM admitted so a generic-enum INSTANCE (`Tree[Int]`) surfaces its arg
+    // count to the codegen mono-name path, mirroring struct instances (jjhnf3).
+    if t.kind != TK_STRUCT && t.kind != TK_ENUM { return 0 }
     t.params_count
 }
 
@@ -8678,7 +8891,9 @@ pub fn tc_tid_struct_arg_struct(tid: Int, idx: Int) -> Str {
 pub fn tc_tid_struct_arg_tid(tid: Int, idx: Int) -> Int {
     if tid < 0 || tid >= ty_pool.len() { return -1 }
     let t = ty_pool.get(tid).unwrap()
-    if t.kind != TK_STRUCT { return -1 }
+    // TK_ENUM admitted so a generic-enum INSTANCE (`Tree[Int]`) surfaces its per-slot
+    // arg tids to the codegen mono-name / instance-registration path (jjhnf3).
+    if t.kind != TK_STRUCT && t.kind != TK_ENUM { return -1 }
     if idx < 0 || idx >= t.params_count { return -1 }
     ty_param_list.get(t.params_start + idx).unwrap()
 }
@@ -8707,7 +8922,15 @@ pub fn tc_tid_struct_arg_tid(tid: Int, idx: Int) -> Int {
 pub fn tc_tid_struct_mono_name(tid: Int) -> Str {
     if tid < 0 || tid >= ty_pool.len() { return "" }
     let t = ty_pool.get(tid).unwrap()
-    if t.kind != TK_STRUCT || t.params_count == 0 { return "" }
+    // TK_ENUM admitted (jjhnf3): a generic-enum INSTANCE (`Tree[Int]`) spells the same
+    // mono stem as a struct instance — c_type_tag_for_struct(base) + `_`-joined slot
+    // segs — since both the head tag and tc_tid_struct_slot_seg are kind-agnostic. This
+    // is what lets tc_tid_to_c_tag's shared TK_STRUCT|TK_ENUM branch produce `Tree_Int`.
+    // NOTE: the 3 encodable carve-outs (tc_tid_encodable / the tuple-element sibling /
+    // tc_struct_slot_encodable) still DEFER an enum instance by their own explicit
+    // `k == TK_ENUM && params_count != 0 → false` guards — widening this fn does not
+    // flip their result (dbzy4r owns relaxing those).
+    if (t.kind != TK_STRUCT && t.kind != TK_ENUM) || t.params_count == 0 { return "" }
     let mut result = c_type_tag_for_struct(t.name)
     let mut i = 0
     while i < t.params_count {

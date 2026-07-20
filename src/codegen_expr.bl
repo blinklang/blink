@@ -67,7 +67,7 @@ import codegen_types.{
     kops_table_name, kops_elem_is_concrete, key_struct_sname_from_ann, ensure_tuple_kops_key,
     set_map_types, set_map_key_struct, set_set_elem_type, set_set_elem_struct,
     set_var, set_var_closure, set_var_option, set_var_struct,
-    strip_blink_prefix, strip_module_qualifier,
+    strip_blink_prefix, strip_generic_args, strip_module_qualifier,
     sf_entries, struct_field_defaults, struct_invariants, struct_option_c_type, synthesized_display_call,
     coerce_to_c_str, render_result_arm_value,
     tp_child1_kind, tp_child1_sname, tp_child2_kind, tp_child2_sname, tp_get_child1, tp_get_child2, tp_get_kind, tp_get_sname,
@@ -89,7 +89,7 @@ import diagnostics.{
 }
 import std.path.{path_dirname}
 import formatter.{format_expr}
-import typecheck.{tc_mono_csv, tc_mono_tids, tc_seg_from_tid, is_import_module_name, tc_lookup_node_tid, tc_tid_set_elem_ct, tc_tid_set_elem_struct, tc_tid_map_key_ct, tc_tid_map_key_struct, tc_tid_map_val_ct, tc_tid_map_val_struct, tc_tid_map_val_tid, tc_tid_map_key_tid, tc_tid_struct_slot_seg, tc_tid_ct, tc_tid_option_inner_ct, tc_tid_option_inner_struct, tc_tid_result_ok_ct, tc_tid_result_ok_struct, tc_tid_result_err_ct, tc_tid_result_err_struct, tc_tid_to_c_tag, tc_tid_struct, tc_tid_struct_arg_count, tc_tid_struct_arg_tid, tc_tid_compound_slot_faithful, tc_struct_slot_encodable}
+import typecheck.{tc_mono_csv, tc_mono_tids, tc_seg_from_tid, is_import_module_name, tc_lookup_node_tid, tc_tid_set_elem_ct, tc_tid_set_elem_struct, tc_tid_map_key_ct, tc_tid_map_key_struct, tc_tid_map_val_ct, tc_tid_map_val_struct, tc_tid_map_val_tid, tc_tid_map_key_tid, tc_tid_struct_slot_seg, tc_tid_ct, tc_tid_option_inner_ct, tc_tid_option_inner_struct, tc_tid_result_ok_ct, tc_tid_result_ok_struct, tc_tid_result_err_ct, tc_tid_result_err_struct, tc_tid_to_c_tag, tc_tid_struct, tc_tid_struct_mono_name, tc_tid_is_enum, tc_tid_struct_arg_count, tc_tid_struct_arg_tid, tc_tid_compound_slot_faithful, tc_struct_slot_encodable}
 
 // codegen_expr.bl — Expression codegen, closures, capture analysis
 
@@ -3515,7 +3515,13 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
             let tag = get_variant_tag(variant_enum, fn_name)
             let fcount = get_variant_field_count(vidx)
             let args_sl = node_args(node)
-            let enum_c_name = c_type_c_name(variant_enum)
+            // A generic-enum instance (`Leaf(1)` → Tree[Int]) mono's to blink_Tree_Int;
+            // mono_name is the STEM (Tree_Int) or "" for a non-generic enum, which keeps
+            // the bare variant_enum name. Variant metadata (tag/field types) stays keyed
+            // on the bare name (jjhnf3).
+            let mono_name = register_mono_enum_from_node(node, variant_enum)
+            let sname = if mono_name != "" { mono_name } else { variant_enum }
+            let enum_c_name = c_type_c_name(sname)
             let mut init_str = "({enum_c_name})\{.tag = {tag}"
             if fcount > 0 && args_sl != -1 {
                 init_str = init_str.concat(", .data.{fn_name} = \{")
@@ -3528,7 +3534,7 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                     let field_type = get_variant_field_type_str(vidx, fi).unwrap()
                     emit_expr(sublist_get(args_sl, fi))
                     let arg_str = expr_result_str
-                    if field_type == variant_enum {
+                    if strip_generic_args(field_type) == variant_enum {
                         let box_tmp = fresh_temp("_ebox")
                         emit_line("{enum_c_name}* {box_tmp} = ({enum_c_name}*)blink_alloc(sizeof({enum_c_name}));")
                         emit_line("*{box_tmp} = {arg_str};")
@@ -3543,7 +3549,7 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
             init_str = init_str.concat("}")
             expr_result_str = init_str
             expr_result_type = CT_STRUCT
-            set_var_struct(init_str, variant_enum)
+            set_var_struct(init_str, sname)
             return
         }
         if fn_name == "Some" {
@@ -4969,6 +4975,48 @@ fn mono_instance_arg_tids_from_tid(inst_tid: Int, expected_base: Str, expected_c
         i = i + 1
     }
     out
+}
+
+// Register the mono instance for a generic-enum construction (`Branch(Leaf(1),…)`)
+// and return its mono C-name STEM (`Tree_Int`), so ctor/match can emit the mono
+// typedef name (blink_Tree_Int) instead of the erased bare `Tree` (jjhnf3). Reads the
+// enum-instance tid typecheck memoized onto the construction node (tc_lookup_node_tid);
+// returns "" (defer to the bare path) when the node carries no concretely-encodable
+// generic-enum instance. Mirrors register_enum_instance_from_tid but lives here to
+// avoid a codegen_expr→codegen_stmt import cycle. `expected_base` guards against a
+// mismatched memoized tid — the registered instance must name this variant's enum.
+fn register_mono_enum_from_node(node: Int, expected_base: Str) -> Str ! Codegen.Register {
+    let inst_tid = tc_lookup_node_tid(node)
+    if inst_tid < 0 { return "" }
+    if tc_tid_is_enum(inst_tid) == 0 { return "" }
+    if tc_tid_struct(inst_tid) != expected_base { return "" }
+    let count = tc_tid_struct_arg_count(inst_tid)
+    if count < 1 { return "" }
+    // Require the whole instance to spell concretely (mono name non-empty) — an
+    // unencodable slot (an unsubstituted typevar) keeps the bare path.
+    if tc_tid_struct_mono_name(inst_tid) == "" { return "" }
+    let mut args = ""
+    let mut arg_tids: List[Int] = []
+    let mut i = 0
+    while i < count {
+        let slot = tc_tid_struct_arg_tid(inst_tid, i)
+        let mut seg = ""
+        if tc_tid_struct_arg_count(slot) >= 1 {
+            seg = tc_tid_struct_mono_name(slot)
+        } else {
+            seg = tc_tid_struct_slot_seg(slot)
+        }
+        if seg == "" { return "" }
+        if i > 0 { args = args.concat(",") }
+        args = args.concat(seg)
+        if tc_struct_slot_encodable(slot) {
+            arg_tids.push(slot)
+        } else {
+            arg_tids.push(-1)
+        }
+        i = i + 1
+    }
+    register_mono_instance(expected_base, args, arg_tids)
 }
 
 // A slot tid whose tc_tid_to_c_tag is a plain scalar Pascal tag (Int/Str/…). Kept

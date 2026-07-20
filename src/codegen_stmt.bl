@@ -47,11 +47,11 @@ import codegen_types.{
     get_variant_field_count, get_variant_field_name,
     get_variant_field_type_str, get_variant_index, get_variant_tag,
     impl_method_self_name, builtin_receiver_type_name,
-    is_compound_ct, is_data_enum, is_enum_type, is_transparent_newtype,
+    is_compound_ct, is_data_enum, is_enum_type, is_mono_struct_instance, is_transparent_newtype,
     is_intrinsic_method, is_named_type, is_runtime_header_fn, is_stdlib_source_module, is_struct_or_enum_type, is_struct_type, is_trait_type, list_contains_str, list_iter_c_type, skip_private_in_module_header,
     lookup_assoc_type, lookup_impl_type_for_trait, lookup_mono_base, mangle_generic_name, mangle_impl_method, mangle_impl_method_q, match_scrut_enum,
     match_scruts, mono_fns, mono_instances, mono_name_from_ann, mono_phys_base, mut_captured_vars, option_c_type, register_mono_instance,
-    strip_module_qualifier,
+    strip_generic_args, strip_module_qualifier,
     poly_impl_method_node, poly_impl_block_node, is_poly_impl_base,
     compound_tag_ct, option_inner_ct_from_tag, option_inner_struct_from_tag,
     option_c_type_mixed, pop_scope, ptr_inner_c_type, push_scope,
@@ -98,7 +98,7 @@ import diagnostics.{
 import pkg.manifest.{manifest_header_is_declared, manifest_name}
 import compiler.{trace}
 import stdlib_native_deps.{stdlib_native_dep_name_by_ffi_symbol}
-import typecheck.{is_import_module_name, tc_lookup_node_tid, tc_tid_struct_mono_name, tc_tid_struct, tc_tid_struct_arg_count, tc_tid_struct_arg_tid, tc_tid_struct_slot_seg, tc_struct_slot_encodable, tc_tid_result_ok_tid, tc_tid_result_err_tid, tc_tid_option_inner_tid, tc_tid_tuple_arity, tc_tid_tuple_elem_tid}
+import typecheck.{is_import_module_name, tc_lookup_node_tid, tc_tid_struct_mono_name, tc_tid_struct, tc_tid_is_enum, tc_tid_struct_arg_count, tc_tid_struct_arg_tid, tc_tid_struct_slot_seg, tc_struct_slot_encodable, tc_tid_result_ok_tid, tc_tid_result_err_tid, tc_tid_option_inner_tid, tc_tid_tuple_arity, tc_tid_tuple_elem_tid}
 
 fn strip_outer_parens(s: Str) -> Str {
     if s.starts_with("(") && s.ends_with(")") {
@@ -740,13 +740,34 @@ pub fn emit_match_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scop
             let scrut_s = get_var_struct(expr_result_str)
             if scrut_s != "" && is_data_enum(scrut_s) != 0 {
                 match_scrut_enum = scrut_s
+            } else if scrut_s != "" && is_mono_struct_instance(scrut_s) != 0 {
+                // Inline generic-enum scrutinee (`match Branch(Leaf(1), Leaf(2)) {…}`):
+                // the ctor tagged the value string with the mono stem (Tree_Int), which
+                // is NOT in enum_reg_set at body-codegen time (only the typedef pass
+                // registers it). Recover the BARE base via lookup_mono_base so
+                // match_scrut_enum drives variant lookups; the mono C type comes from
+                // get_var_struct below (jjhnf3).
+                let base = lookup_mono_base(scrut_s).base
+                if base != "" && is_data_enum(base) != 0 {
+                    match_scrut_enum = base
+                }
             }
         }
         if match_scrut_enum != "" && is_data_enum(match_scrut_enum) != 0 {
             let scrut_tmp = fresh_temp("_scrut_")
-            emit_line("{c_type_from_tag(match_scrut_enum)} {scrut_tmp} = {expr_result_str};")
+            // A generic-enum scrutinee (`match t {…}` where t: Tree[Int]) declares the
+            // scrutinee temp with the mono instance C type (blink_Tree_Int), recovered
+            // from the scrutinee var's tracked struct name; match_scrut_enum itself stays
+            // BARE (`Tree`) so variant tag/field lookups keep working (jjhnf3). A named
+            // scrutinee (`match t`) reads the var's tracked struct; a non-Ident one
+            // (`match Branch(Leaf(1), Leaf(2))` inline) recovers the mono from the emitted
+            // value string, which the ctor tagged via set_var_struct.
+            let scrut_mono = if node_kind(scrut) == NodeKind.Ident { get_var_struct(node_name(scrut)) } else { get_var_struct(expr_result_str) }
+            let scrut_c = if scrut_mono != "" && is_mono_struct_instance(scrut_mono) != 0 { c_type_from_tag(scrut_mono) } else { c_type_from_tag(match_scrut_enum) }
+            emit_line("{scrut_c} {scrut_tmp} = {expr_result_str};")
             set_var(scrut_tmp, CT_INT, 1)
-            match_scruts.push(MatchScrutEntry { str_val: scrut_tmp, scrut_type: expr_result_type })
+            if scrut_mono != "" && is_mono_struct_instance(scrut_mono) != 0 { set_var_struct(scrut_tmp, scrut_mono) }
+            match_scruts.push(MatchScrutEntry { str_val: scrut_tmp, scrut_type: expr_result_type, scrut_sname: scrut_mono })
         } else if expr_result_type == CT_RESULT || expr_result_type == CT_OPTION {
             let scrut_tmp = fresh_temp("_scrut_")
             let rok = expr_result_ok_type
@@ -1624,6 +1645,23 @@ fn bind_struct_style_variant_fields(vidx: Int, fcount: Int, resolved_enum: Str, 
     }
 }
 
+// Resolve a generic-enum variant field's declared type NAME (`T`, `Tree`) to its
+// concrete type under the scrutinee's mono args (jjhnf3). `scrut_mono` is the
+// scrutinee's mono instance stem (`Tree_Int`); recovers the concrete args via
+// lookup_mono_base and substitutes the field typevar through the enum's tparam list.
+// Returns the resolved type name (e.g. `T` → `Int`) or the input unchanged when
+// scrut_mono is not a mono instance / the field type is not a tparam.
+fn resolve_variant_field_type_mono(field_type_name: Str, bare_enum: Str, scrut_mono: Str) -> Str {
+    if scrut_mono == "" { return field_type_name }
+    let ml = lookup_mono_base(scrut_mono)
+    if ml.base == "" { return field_type_name }
+    let td = find_type_def(bare_enum)
+    if td == -1 { return field_type_name }
+    let tparams_sl = node_type_params(td)
+    if tparams_sl == -1 { return field_type_name }
+    resolve_tparam_via_tid(field_type_name, tparams_sl, ml.args, ml.arg_tids)
+}
+
 // Emit C variable bindings for ident sub-patterns within a pattern.
 // scrut_off/scrut_len index into match_scruts.
 @allow(UnrestoredMutation, IncompleteStateRestore)
@@ -1805,23 +1843,38 @@ fn bind_pattern_vars(pat: Int, scrut_off: Int, scrut_len: Int) ! Codegen.Emit, C
                 if is_struct_pat != 0 {
                     bind_struct_style_variant_fields(vidx, fcount, resolved_enum, resolved_variant, scrut, ep_flds_sl)
                 } else {
+                    // A generic-enum scrutinee (Tree[Int]) carries its mono stem on the
+                    // scrutinee entry; payload fields whose declared type is a typevar
+                    // (`Leaf.value: T`) or the self-recursive enum (`Branch.left: Tree[T]`)
+                    // resolve against it so bindings get the concrete C type instead of
+                    // the erased `void` (jjhnf3).
+                    let scrut_mono = match_scruts.get(scrut_off).unwrap().scrut_sname
                     let mut fi = 0
                     while fi < sublist_length(ep_flds_sl) && fi < fcount {
                         let sub_pat = sublist_get(ep_flds_sl, fi)
                         let sub_pk = node_kind(sub_pat)
                         let field_name = get_variant_field_name(vidx, fi).unwrap()
-                        let field_type_name = get_variant_field_type_str(vidx, fi).unwrap()
+                        let field_type_raw = get_variant_field_type_str(vidx, fi).unwrap()
+                        // Self-recursive field (`Tree[T]`) keeps the enum name (base
+                        // matches); a typevar field resolves to its concrete arg.
+                        let field_type_name = if strip_generic_args(field_type_raw) == resolved_enum { resolved_enum } else { resolve_variant_field_type_mono(field_type_raw, resolved_enum, scrut_mono) }
                         let field_ct = type_from_name(field_type_name)
                         if sub_pk == NodeKind.IdentPattern {
                             let bind_name = node_name(sub_pat)
                             if bind_name != "_" {
                                 let c_bind = c_safe_name(bind_name)
                                 if field_type_name == resolved_enum {
-                                    let fc_name = c_type_c_name(field_type_name)
+                                    // Recursive-enum field: unbox with the scrutinee's
+                                    // mono C type (blink_Tree_Int) so `l`/`r` are typed
+                                    // Tree[Int], not the erased bare Tree. set_var_struct
+                                    // publishes the mono stem so a downstream fn call
+                                    // (leaf_value(l)) resolves the arg C type (jjhnf3).
+                                    let fc_type = if scrut_mono != "" && is_mono_struct_instance(scrut_mono) != 0 { scrut_mono } else { field_type_name }
+                                    let fc_name = c_type_c_name(fc_type)
                                     emit_line("{fc_name} {c_bind} = *({fc_name}*)(intptr_t){scrut}.data.{resolved_variant}.{field_name};")
                                     set_var(bind_name, CT_VOID, 0)
-                                    set_var_struct(bind_name, field_type_name)
-                                    var_enums.push(VarEnumEntry { name: bind_name, enum_type: field_type_name })
+                                    set_var_struct(bind_name, fc_type)
+                                    var_enums.push(VarEnumEntry { name: bind_name, enum_type: resolved_enum })
                                 } else if is_struct_type(field_type_name) != 0 {
                                     emit_line("{c_type_c_name(field_type_name)} {c_bind} = {scrut}.data.{resolved_variant}.{field_name};")
                                     set_var(bind_name, CT_VOID, 0)
@@ -1857,9 +1910,16 @@ fn bind_pattern_vars(pat: Int, scrut_off: Int, scrut_len: Int) ! Codegen.Emit, C
                             let _skip = 0
                         } else {
                             let saved_scruts = match_scruts
-                            match_scruts = [MatchScrutEntry { str_val: "{scrut}.data.{resolved_variant}.{field_name}", scrut_type: field_ct }]
+                            // Carry the field's mono stem so a nested pattern over a
+                            // generic-enum-instance field resolves its own payload types
+                            // (jjhnf3). A self-recursive field (Tree[T]) resolved to the
+                            // scrutinee's own mono earlier; a distinct generic-enum field
+                            // resolves to its instance stem when that names a mono. The
+                            // bare enum name is used for match_scrut_enum's variant lookups.
+                            let nested_mono = if is_mono_struct_instance(field_type_name) != 0 { field_type_name } else { "" }
+                            match_scruts = [MatchScrutEntry { str_val: "{scrut}.data.{resolved_variant}.{field_name}", scrut_type: field_ct, scrut_sname: nested_mono }]
                             let saved_enum = match_scrut_enum
-                            match_scrut_enum = if field_type_name != "" && is_enum_type(field_type_name) != 0 { field_type_name } else { "" }
+                            match_scrut_enum = if field_type_name != "" && is_enum_type(strip_generic_args(field_type_name)) != 0 { strip_generic_args(field_type_name) } else { "" }
                             bind_pattern_vars(sub_pat, 0, 1)
                             match_scrut_enum = saved_enum
                             match_scruts = saved_scruts
@@ -2820,6 +2880,18 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
     if val_type == CT_RESULT {
         enum_type = ""
     }
+    // A generic-enum construction (`let t = Branch(…)` → Tree[Int]) mono's the RHS to
+    // blink_Tree_Int and tracks that mono STEM on the value string. enum_type stays the
+    // BARE base (`Tree`) so var_enums / match variant lookups keep working; enum_mono is
+    // the mono name (or "") used only for the LHS C declaration type, so the var is
+    // declared blink_Tree_Int instead of the erased bare blink_Tree (jjhnf3).
+    let mut enum_mono = ""
+    if enum_type != "" && val_type == CT_STRUCT {
+        let mono_s = get_var_struct(val_str)
+        if mono_s != "" && strip_module_qualifier(mono_s) != strip_module_qualifier(enum_type) && is_mono_struct_instance(mono_s) != 0 {
+            enum_mono = mono_s
+        }
+    }
     // A transparent newtype (br ja9jev) lowers to a bare int64_t even as a
     // standalone binding — `let e = Errno(5)` is `int64_t e = 5`, not the boxed
     // struct. Clear the inferred enum_type so the var is declared as Int,
@@ -3221,10 +3293,13 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
             emit_line("const {res_c} {cname} = {val_str};")
         }
     } else if enum_type != "" {
+        // Declare with the mono instance C type (blink_Tree_Int) when the RHS was a
+        // generic-enum construction; else the bare enum type (jjhnf3).
+        let enum_decl = if enum_mono != "" { enum_mono } else { enum_type }
         if is_mut != 0 {
-            emit_line("{c_type_c_name(enum_type)} {cname} = {val_str};")
+            emit_line("{c_type_c_name(enum_decl)} {cname} = {val_str};")
         } else {
-            emit_line("const {c_type_c_name(enum_type)} {cname} = {val_str};")
+            emit_line("const {c_type_c_name(enum_decl)} {cname} = {val_str};")
         }
     } else if val_type == CT_HANDLER {
         let h_vtt = get_var_handler_vtable_type(name)
@@ -4300,6 +4375,14 @@ pub fn param_c_type(p: Int, ptype: Str) -> Str {
         }
         return "void"
     } else if is_enum_type(ptype) != 0 {
+        // A concrete generic-enum INSTANCE param (`t: Tree[Int]`) lowers to its mono
+        // carrier (blink_Tree_Int), read from the instance tid typecheck memoized onto
+        // the annotation node — mirroring the struct-instance branch below (jjhnf3).
+        // Empty stem (bare/monomorphic enum) keeps c_type_from_tag unchanged.
+        let einst_stem = tc_tid_struct_mono_name(tc_lookup_node_tid(node_type_ann(p)))
+        if einst_stem != "" {
+            return c_type_c_name(einst_stem)
+        }
         return c_type_from_tag(ptype)
     } else if is_struct_type(ptype) != 0 {
         // A concrete generic-struct INSTANCE param (`b: Box[Str]`) must lower to
@@ -4802,6 +4885,14 @@ pub fn emit_impl_method_def(fn_node: Int, impl_type: Str, im_node: Int) ! Codege
                     }
                     if is_enum_type(ptype) != 0 {
                         var_enums.push(VarEnumEntry { name: pname, enum_type: ptype })
+                        // Mirror emit_fn_def: a generic-enum instance param registers
+                        // its mono instance and tracks the mono stem (jjhnf3).
+                        let einst = tc_lookup_node_tid(node_type_ann(p))
+                        let einst_stem = tc_tid_struct_mono_name(einst)
+                        if einst_stem != "" {
+                            register_enum_instance_from_tid(einst)
+                            set_var_struct(pname, einst_stem)
+                        }
                     }
                     if ptype == "List" {
                         let ta = node_type_ann(p)
@@ -5428,6 +5519,16 @@ pub fn emit_fn_def(fn_node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope
                 }
                 if is_enum_type(ptype) != 0 {
                     var_enums.push(VarEnumEntry { name: pname, enum_type: ptype })
+                    // A generic-enum INSTANCE param (`t: Tree[Int]`) registers its mono
+                    // instance (so the blink_Tree_Int typedef is emitted even when this
+                    // fn is the only site naming it) and tracks the mono stem so a
+                    // `match t {…}` body reads the mono type via get_var_struct (jjhnf3).
+                    let einst = tc_lookup_node_tid(node_type_ann(p))
+                    let einst_stem = tc_tid_struct_mono_name(einst)
+                    if einst_stem != "" {
+                        register_enum_instance_from_tid(einst)
+                        set_var_struct(pname, einst_stem)
+                    }
                 }
                 if ptype == "List" {
                     let ta = node_type_ann(p)
@@ -5825,6 +5926,48 @@ pub fn register_struct_instance_from_tid(tid: Int) -> Str ! Codegen.Register {
     register_mono_instance(base, args, arg_tids)
 }
 
+// The enum analogue of register_struct_instance_from_tid (jjhnf3): register the mono
+// instance for a generic-enum INSTANCE tid (`Tree[Int]`) so its tagged-union typedef
+// (blink_Tree_Int) is emitted and c_type_from_tag / is_mono_struct_instance recognize
+// it. tc_tid_struct is kind-agnostic (returns the base for TK_ENUM too), as are the
+// now-widened tc_tid_struct_arg_* accessors and tc_tid_struct_slot_seg — so this is a
+// near-verbatim copy. Returns the mono c_name (`blink_Tree_Int`) or "" when the tid is
+// not a concretely-encodable enum instance.
+pub fn register_enum_instance_from_tid(tid: Int) -> Str ! Codegen.Register {
+    let base = tc_tid_struct(tid)
+    if base == "" { return "" }
+    let count = tc_tid_struct_arg_count(tid)
+    if count < 1 { return "" }
+    let mut args = ""
+    let mut arg_tids: List[Int] = []
+    let mut i = 0
+    while i < count {
+        let slot = tc_tid_struct_arg_tid(tid, i)
+        let mut seg = ""
+        if tc_tid_struct_arg_count(slot) >= 1 {
+            // Nested generic instance (a Tree[Int] arg to another generic): register
+            // it inner-first so its typedef precedes the outer, reusing its mono name.
+            if tc_tid_is_enum(slot) != 0 {
+                seg = register_enum_instance_from_tid(slot)
+            } else {
+                seg = register_struct_instance_from_tid(slot)
+            }
+        } else {
+            seg = tc_tid_struct_slot_seg(slot)
+        }
+        if seg == "" { return "" }
+        if i > 0 { args = args.concat(",") }
+        args = args.concat(seg)
+        if tc_struct_slot_encodable(slot) {
+            arg_tids.push(slot)
+        } else {
+            arg_tids.push(-1)
+        }
+        i = i + 1
+    }
+    register_mono_instance(base, args, arg_tids)
+}
+
 // Register any generic-struct INSTANCE leaves reachable inside an Option/Result
 // carrier tid, inner-first, so the carrier typedef that embeds them by value
 // (blink_Result_RBox_Int_RBox_Str) sees blink_RBox_Int/blink_RBox_Str already in
@@ -6004,6 +6147,126 @@ fn emit_mono_struct_typedef(base_name: Str, concrete_args: Str, arg_tids: List[I
     emit_line("")
 }
 
+// The enum analogue of emit_mono_struct_typedef (jjhnf3): emit a per-instance
+// tagged-union typedef (`blink_Tree_Int`) for a generic-enum instance, resolving
+// each variant payload field's type under T-substitution via resolve_tparam_via_tid
+// — the substitution the base emitter (emit_enum_typedef) can't do because it lacks
+// tparams_sl / arg_tids. Also registers the mono name in enum_reg_set so is_data_enum
+// / c_type_from_tag recognize the instance, and emits the per-variant `_TAG` macros
+// keyed on the mono C name.
+fn emit_mono_enum_typedef(base_name: Str, concrete_args: Str, arg_tids: List[Int]) ! Codegen.Emit {
+    let td = find_type_def(base_name)
+    if td == -1 { return }
+    let tparams_sl = node_type_params(td)
+    if tparams_sl == -1 { return }
+    let flds_sl = node_fields(td)
+    if flds_sl == -1 { return }
+    let c_name = mangle_generic_name(mono_phys_base(base_name), concrete_args)
+    let td_cname = c_type_c_name(c_name)
+    if enum_typedef_emitted.contains_key(td_cname) != 0 { return }
+    enum_typedef_emitted.insert(td_cname, 1)
+    // Register the mono name so is_data_enum(c_name) / c_type_from_tag recognize it.
+    // The variant metadata itself stays keyed on the BARE base (emit_enum_typedef
+    // populated it), which ctor/match reach by recovering the base via lookup_mono_base.
+    enum_reg_set.insert(c_name, 1)
+
+    emit_td_guard_open(td_cname)
+    emit_line("typedef struct \{")
+    cg_indent = cg_indent + 1
+    emit_line("int tag;")
+    emit_line("union \{")
+    cg_indent = cg_indent + 1
+    let mut i = 0
+    while i < sublist_length(flds_sl) {
+        let v = sublist_get(flds_sl, i)
+        let vname = node_name(v)
+        let vflds = node_fields(v)
+        if vflds != -1 && sublist_length(vflds) > 0 {
+            emit_line("struct \{")
+            cg_indent = cg_indent + 1
+            let mut fi = 0
+            while fi < sublist_length(vflds) {
+                let vf = sublist_get(vflds, fi)
+                let vf_name = node_name(vf)
+                let vf_type_ann = node_value(vf)
+                let mut vf_c_type = "int64_t"
+                if vf_type_ann != -1 {
+                    let vf_type_name = node_name(vf_type_ann)
+                    let resolved = resolve_tparam_via_tid(vf_type_name, tparams_sl, concrete_args, arg_tids)
+                    if resolved == base_name {
+                        // Self-recursive field (`Branch(left: Tree[T], …)`): the ctor
+                        // boxes it as (int64_t)(intptr_t)ptr, so the union member is a
+                        // bare int64_t (mirrors emit_enum_typedef's vf_type_name==name).
+                        vf_c_type = "int64_t"
+                    } else if is_struct_type(resolved) != 0 || is_enum_type(resolved) != 0 || is_mono_struct_instance(resolved) != 0 {
+                        vf_c_type = c_type_c_name(resolved)
+                    } else {
+                        let vf_ct = type_from_name(resolved)
+                        if vf_ct == CT_OPTION {
+                            // Resolve the Option inner under T-substitution so
+                            // `Some(x: Option[T])` on a Tree[Int] spells blink_Option_int,
+                            // not the erased blink_Option_T that compound_name_from_ann
+                            // would read off the un-substituted annotation (jjhnf3).
+                            let inner_elems = node_elements(vf_type_ann)
+                            if inner_elems != -1 && sublist_length(inner_elems) >= 1 {
+                                let inner_ann = sublist_get(inner_elems, 0)
+                                let inner_resolved = resolve_tparam_via_tid(node_name(inner_ann), tparams_sl, concrete_args, arg_tids)
+                                let inner_ct = type_from_name(inner_resolved)
+                                if is_struct_type(inner_resolved) != 0 || is_enum_type(inner_resolved) != 0 || is_mono_struct_instance(inner_resolved) != 0 {
+                                    ensure_struct_option_type(inner_resolved)
+                                    vf_c_type = struct_option_c_type(inner_resolved)
+                                } else {
+                                    ensure_option_type(inner_ct)
+                                    vf_c_type = option_c_type(inner_ct)
+                                }
+                            } else {
+                                ensure_option_type(CT_INT)
+                                vf_c_type = option_c_type(CT_INT)
+                            }
+                        } else if vf_ct == CT_RESULT {
+                            let inner_elems = node_elements(vf_type_ann)
+                            if inner_elems != -1 && sublist_length(inner_elems) >= 2 {
+                                let ok_resolved = resolve_tparam_via_tid(node_name(sublist_get(inner_elems, 0)), tparams_sl, concrete_args, arg_tids)
+                                let err_resolved = resolve_tparam_via_tid(node_name(sublist_get(inner_elems, 1)), tparams_sl, concrete_args, arg_tids)
+                                let ok_ct = type_from_name(ok_resolved)
+                                let err_ct = type_from_name(err_resolved)
+                                ensure_result_type(ok_ct, err_ct)
+                                vf_c_type = result_c_type(ok_ct, err_ct)
+                            } else {
+                                ensure_result_type(CT_INT, CT_STRING)
+                                vf_c_type = result_c_type(CT_INT, CT_STRING)
+                            }
+                        } else {
+                            vf_c_type = c_type_str(vf_ct)
+                        }
+                    }
+                }
+                emit_line("{vf_c_type} {vf_name};")
+                fi = fi + 1
+            }
+            cg_indent = cg_indent - 1
+            emit_line("} {vname};")
+        }
+        i = i + 1
+    }
+    cg_indent = cg_indent - 1
+    emit_line("} data;")
+    cg_indent = cg_indent - 1
+    emit_line("} {td_cname};")
+    emit_td_guard_close()
+    emit_line("")
+    i = 0
+    while i < sublist_length(flds_sl) {
+        let v = sublist_get(flds_sl, i)
+        let vname = node_name(v)
+        emit_line("#ifndef {td_cname}_{vname}_TAG")
+        emit_line("#define {td_cname}_{vname}_TAG {i}")
+        emit_line("#endif")
+        i = i + 1
+    }
+    emit_line("")
+}
+
 pub fn emit_all_mono_typedefs() ! Codegen.Emit {
     let mut i = 0
     while i < mono_instances.len() {
@@ -6014,6 +6277,8 @@ pub fn emit_all_mono_typedefs() ! Codegen.Emit {
             if flds_sl != -1 && sublist_length(flds_sl) > 0 {
                 if node_kind(sublist_get(flds_sl, 0)) != NodeKind.TypeVariant {
                     emit_mono_struct_typedef(mi.base, mi.args, mi.arg_tids)
+                } else {
+                    emit_mono_enum_typedef(mi.base, mi.args, mi.arg_tids)
                 }
             }
         }
@@ -6774,6 +7039,8 @@ pub fn emit_mono_typedefs_from(start: Int) ! Codegen.Emit {
             if flds_sl != -1 && sublist_length(flds_sl) > 0 {
                 if node_kind(sublist_get(flds_sl, 0)) != NodeKind.TypeVariant {
                     emit_mono_struct_typedef(mi.base, mi.args, mi.arg_tids)
+                } else {
+                    emit_mono_enum_typedef(mi.base, mi.args, mi.arg_tids)
                 }
             }
         }
@@ -7085,6 +7352,15 @@ pub fn emit_enum_typedef(td_node: Int) ! Codegen.Emit {
         }
         enum_variant_full_idx.insert(name.concat("|").concat(vname), gidx)
         i = i + 1
+    }
+
+    // Generic enum (`type Tree[T] {…}`): the variant metadata above is populated on
+    // the BARE name (`Tree`) so ctor/match lookups keep working, but the erased base
+    // typedef is skipped — per-instance mono typedefs (`blink_Tree_Int`) are emitted
+    // by emit_mono_enum_typedef instead (jjhnf3, mirrors emit_struct_typedef's skip).
+    let tparams_sl = node_type_params(td_node)
+    if tparams_sl != -1 && sublist_length(tparams_sl) > 0 {
+        return
     }
 
     if has_data == 0 {
