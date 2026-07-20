@@ -1,0 +1,85 @@
+// br 7s0vaj: constructing an Option/Result whose INNER is itself a nested
+// compound must spell the value carrier structurally so it matches the
+// annotation-derived declaration. Two independent defects lived under this
+// ticket; each shape below failed to compile on clean main:
+//
+//   Defect A — Result[Set[_], _]: c_type_tag(CT_SET) spells the ok side "set",
+//   but type_from_name_tag had no `set` case, so the Result typedef decoded the
+//   ok slot to CT_VOID and blink_Result_set_bytes was never declared
+//   (C: "unknown type name 'blink_Result_set_bytes'"). Map/List were symmetric;
+//   only Set was asymmetric on the encode/decode boundary.
+//
+//   Defect B — Option[Option[Map[..]]]: the Some ctor's nested-compound branch
+//   reused the INNER Some's bare carrier (expr_option_inner_struct, "Map_str_int")
+//   instead of the annotation-structured "Option_Map_str_int", so the value box
+//   became blink_map** and the cast dropped the outer Option_
+//   (C: "incompatible types" / "invalid initializer"). The fix makes the value
+//   path consult the let annotation (compound_name_from_ann) first, matching the
+//   carrier emit_let_binding already mints for the declaration.
+//
+// SCOPE: this is about making these shapes CONSTRUCTIBLE, not about admitting
+// them onto the tid mono path (that widening is the 9myrp2 endgame). The
+// tc_tid_inner_tag_faithful defer-predicate is intentionally unchanged.
+
+// Defect A: Result[Set[Int], Bytes] constructs and round-trips.
+test "Result[Set[Int], Bytes] = Ok(s) constructs and reads" {
+    let mut s: Set[Int] = Set()
+    s.insert(3)
+    s.insert(9)
+    let r: Result[Set[Int], Bytes] = Ok(s)
+    assert_eq(r.is_ok(), true)
+    let got = r.unwrap()
+    assert_eq(got.contains(3), true)
+    assert_eq(got.len(), 2)
+}
+
+// Defect A mirror: Set in the ERR position (Result[_, Set[_]]) — same encode/
+// decode boundary on the err slot.
+test "Result[Int, Set[Int]] = Err(s) constructs and reads" {
+    let mut s: Set[Int] = Set()
+    s.insert(5)
+    let r: Result[Int, Set[Int]] = Err(s)
+    assert_eq(r.is_ok(), false)
+}
+
+// Defect A sibling (Option-unwrap seam): Option[Set].unwrap() must recover the
+// Set as CT_SET, not erase it to Int. The Option unwrap handler needs the same
+// CT_SET branch the Result unwrap handler grew (mirror seam, code-review find).
+test "Option[Set[Int]] = Some(s) unwraps to a usable Set" {
+    let mut s: Set[Int] = Set()
+    s.insert(3)
+    s.insert(9)
+    let opt: Option[Set[Int]] = Some(s)
+    assert_eq(opt.is_some(), true)
+    let got = opt.unwrap()
+    assert_eq(got.contains(9), true)
+    assert_eq(got.len(), 2)
+}
+
+// Defect B: Option[Option[Map[Str,Int]]] constructs and both levels unwrap.
+test "Option[Option[Map[Str, Int]]] = Some(inner) constructs and reads" {
+    let mut m: Map[Str, Int] = Map()
+    m.insert("k", 7)
+    let inner: Option[Map[Str, Int]] = Some(m)
+    let opt: Option[Option[Map[Str, Int]]] = Some(inner)
+    assert_eq(opt.is_some(), true)
+    let mid = opt.unwrap()
+    assert_eq(mid.is_some(), true)
+    let mm = mid.unwrap()
+    assert_eq(mm.get("k").unwrap(), 7)
+}
+
+// Defect B mirror through the Ok/Err ctor: Result[Option[Map[..]], Bytes].
+// The Ok payload is itself an Option over a Map, so the ok-side carrier must
+// spell Option_Map_str_int structurally too.
+test "Result[Option[Map[Str, Int]], Bytes] = Ok(inner) constructs and reads" {
+    let mut m: Map[Str, Int] = Map()
+    m.insert("q", 42)
+    let inner: Option[Map[Str, Int]] = Some(m)
+    let r: Result[Option[Map[Str, Int]], Bytes] = Ok(inner)
+    assert_eq(r.is_ok(), true)
+    let got = r.unwrap()
+    assert_eq(got.is_some(), true)
+    let gm = got.unwrap()
+    assert_eq(gm.get("q").unwrap(), 42)
+}
