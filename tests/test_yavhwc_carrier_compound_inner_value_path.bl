@@ -1,0 +1,123 @@
+// br yavhwc: the VALUE path (emit_tuple_lit + the Some constructor + the bare-var
+// carrier) now recurses an OPTION carrier whose inner is itself a compound (a Map, or a
+// nested Option/Result over faithful leaves), spelling it with the SAME tc_tid_inner_tag
+// the tid path uses. So an Option tuple element carrying a Map or a nested compound now
+// RIDES the tid path — tc_tid_inner_tag_faithful admits it and tc_tid_tuple_elem_encodable
+// no longer defers to the string CSV.
+//
+// Each RIDE case is a byte-stability tripwire: the tid carrier the generic-fn mono mints
+// must match the value-constructed tuple, or the mono param erases to void and the emitted
+// C fails to compile — which the Gen1==Gen2 fixed point (task regen) would catch. Mirrors
+// test_9myrp2_compound_inner_tid_path.bl (the one-level List/Set/Bytes inners) for the
+// families yavhwc newly reconciled.
+//
+// SCOPE / STILL DEFERS (guarded below):
+//   - a RESULT carrier with a DIRECT Map ok/err side, at ANY nesting depth (Result[Map,_],
+//     Result[_,Map], Option[Result[Map,_]], ...): upgrade_compound_carrier spells the
+//     Result-Map value carrier BARE ("map") UNCONDITIONALLY (uniform blink_map* member for
+//     cross-constructor assignment compatibility), so the value carrier (blink_Result_map_int)
+//     can't be upgraded without the broader carrier-assignment redesign. The carve-out lives
+//     in tc_tid_inner_tag_faithful itself, so it defers whether the Result is a top-level
+//     tuple element OR wrapped under Option(s). Follow-up ticket. Stays on the string CSV.
+//   - a struct/enum leaf anywhere in the inner — tc_tid_inner_tag routes it through
+//     tc_tid_struct_mono_name while the value path uses canonical_struct_tag (not proven
+//     byte-equal; the 295z9x follow-up reconciles it).
+
+type AnaqcPoint {
+    x: Int,
+    y: Int,
+}
+
+fn take_int[T](_x: T) -> Int {
+    99
+}
+
+// Option[Map[Str,Int]] inner: the anaqc3 deferred case, now RIDES. The value path (the
+// Some constructor + the bare-var carrier) spells Option_Map_str_int via the map var's
+// key/val, byte-identical to the tid and annotation paths → Tuple2_Option_Map_str_int_int.
+test "(Option[Map[Str, Int]], Int) rides the tid path" {
+    let mut m: Map[Str, Int] = Map()
+    m.insert("a", 1)
+    let p = (Some(m), 7)
+    assert_eq(take_int(p), 99)
+}
+
+// Option[Option[Int]] nested: the value path recurses the inner Option → Option_Option_int.
+test "(Option[Option[Int]], Int) rides the tid path" {
+    let inner: Option[Int] = Some(5)
+    let o: Option[Option[Int]] = Some(inner)
+    let p = (o, 7)
+    assert_eq(take_int(p), 99)
+}
+
+// Option[Result[List[Int], Int]] nested: recurses two levels — Option over a Result whose
+// Ok leaf is a List (erased to bare "list") → Option_Result_list_int. The Result's direct
+// sides are List/Int (both faithful, neither a Map), so tc_tid_inner_tag_faithful admits it
+// and the whole element rides.
+test "(Option[Result[List[Int], Int]], Int) rides the tid path" {
+    let r: Result[List[Int], Int] = Ok([1, 2, 3])
+    let o: Option[Result[List[Int], Int]] = Some(r)
+    let p = (o, 7)
+    assert_eq(take_int(p), 99)
+}
+
+// Driven through a generic fn over List[(Option[Map[Str,Int]], Int)] — the exact seed
+// chain that forced the string CSV before yavhwc (the resolve_tparam blocker shape,
+// Tuple2_Option_Map_str_int_int).
+fn count_opt_map(xs: List[(Option[Map[Str, Int]], Int)]) -> Int {
+    xs.len()
+}
+
+test "generic-fn over List[(Option[Map[Str, Int]], Int)] seeds the tid carrier" {
+    let mut m: Map[Str, Int] = Map()
+    m.insert("a", 1)
+    let a: Option[Map[Str, Int]] = Some(m)
+    let xs: List[(Option[Map[Str, Int]], Int)] = [(a, 1)]
+    assert_eq(count_opt_map(xs), 1)
+}
+
+// DEFERRAL GUARD (Result-Map carve-out): a top-level Result tuple element with a DIRECT
+// Map inner must STILL compile by riding the string path. tc_tid_tuple_elem_encodable's
+// TK_RESULT arm returns false when either side is a direct Map, so the carrier defers to
+// the CSV fallback — the value carrier stays the bare blink_Result_map_int that
+// upgrade_compound_carrier mints, and no divergent tid carrier is created. Admitting it
+// would break the Gen1==Gen2 fixed point.
+test "(Result[Map[Str, Int], Int], Int) stays on the string path" {
+    let mut m: Map[Str, Int] = Map()
+    m.insert("a", 1)
+    let r: Result[Map[Str, Int], Int] = Ok(m)
+    let p = (r, 7)
+    assert_eq(take_int(p), 99)
+}
+
+// DEFERRAL GUARD: Map in the ERR position — same carve-out, exercises the second Result
+// inner check (tc_tid_ct(t.inner2) == CT_MAP).
+test "(Result[Int, Map[Str, Int]], Int) stays on the string path" {
+    let mut m: Map[Str, Int] = Map()
+    m.insert("a", 1)
+    let r: Result[Int, Map[Str, Int]] = Err(m)
+    let p = (r, 7)
+    assert_eq(take_int(p), 99)
+}
+
+// NOTE — Option[Result[Map,_]] (a Result-direct-Map wrapped in an Option) is deferred by
+// tc_tid_inner_tag_faithful's Result-direct-Map carve-out (the Option arm delegates to the
+// predicate, whose TK_RESULT branch rejects a direct Map side at any nesting depth). This is
+// the regression the code review caught: without the predicate-level carve-out the tuple
+// element would spell Option_Result_Map_str_int_int (tid) vs the bare blink_Result_map_int
+// value carrier → C "incompatible types". It has NO dedicated test here because the shape is
+// UNCONSTRUCTABLE today: `let o: Option[Result[Map,_]] = Some(r)` fails to compile on clean
+// main independently of yavhwc (the Some constructor's annotation-consult structures the
+// Option's inner Result while the Result value carrier stays bare) — filed as the Some-
+// construction Result-Map follow-up. The gate defers it correctly regardless.
+
+// DEFERRAL GUARD: a struct inner (Option[AnaqcPoint]) must STILL compile by riding the
+// string path — tc_tid_inner_tag_faithful returns false for a TK_STRUCT leaf, so the
+// carrier defers to the CSV fallback. A too-loose gate that admitted struct inners would
+// mint a tid carrier the value path can't reproduce (tc_tid_struct_mono_name vs
+// canonical_struct_tag) and break the Gen1==Gen2 fixed point here.
+test "(Option[AnaqcPoint], Int) stays on the string path" {
+    let pt = AnaqcPoint { x: 1, y: 2 }
+    let p = (Some(pt), 7)
+    assert_eq(take_int(p), 99)
+}

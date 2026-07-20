@@ -89,7 +89,7 @@ import diagnostics.{
 }
 import std.path.{path_dirname}
 import formatter.{format_expr}
-import typecheck.{tc_mono_csv, tc_mono_tids, tc_seg_from_tid, is_import_module_name, tc_lookup_node_tid, tc_tid_set_elem_ct, tc_tid_set_elem_struct, tc_tid_map_key_ct, tc_tid_map_key_struct, tc_tid_map_val_ct, tc_tid_map_val_struct, tc_tid_map_val_tid, tc_tid_map_key_tid, tc_tid_struct_slot_seg, tc_tid_ct, tc_tid_option_inner_ct, tc_tid_option_inner_struct, tc_tid_result_ok_ct, tc_tid_result_ok_struct, tc_tid_result_err_ct, tc_tid_result_err_struct, tc_tid_to_c_tag, tc_tid_struct, tc_tid_struct_mono_name, tc_tid_is_enum, tc_tid_struct_arg_count, tc_tid_struct_arg_tid, tc_tid_compound_slot_faithful, tc_struct_slot_encodable}
+import typecheck.{tc_mono_csv, tc_mono_tids, tc_seg_from_tid, is_import_module_name, tc_lookup_node_tid, tc_tid_set_elem_ct, tc_tid_set_elem_struct, tc_tid_map_key_ct, tc_tid_map_key_struct, tc_tid_map_val_ct, tc_tid_map_val_struct, tc_tid_map_val_tid, tc_tid_map_key_tid, tc_tid_struct_slot_seg, tc_tid_ct, tc_tid_option_inner_ct, tc_tid_option_inner_struct, tc_tid_result_ok_ct, tc_tid_result_ok_struct, tc_tid_result_err_ct, tc_tid_result_err_struct, tc_tid_to_c_tag, tc_tid_struct, tc_tid_struct_mono_name, tc_tid_is_enum, tc_tid_struct_arg_count, tc_tid_struct_arg_tid, tc_tid_compound_slot_faithful, tc_struct_slot_encodable, tc_tid_inner_tag, tc_tid_option_inner_tid, tc_tid_result_ok_tid, tc_tid_result_err_tid, tc_tid_tuple_elem_encodable}
 
 // codegen_expr.bl — Expression codegen, closures, capture analysis
 
@@ -3667,7 +3667,27 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                         if fsi_s.ok_struct != "" && fsi_s.ok_struct.starts_with("Map_") {
                             fsi_s.ok_struct
                         } else {
-                            compound_option_inner_name(inner_type, inner_str)
+                            // Spell the Map inner STRUCTURED (Map_{key}_{val}) so the value
+                            // carrier (blink_Option_Map_str_int) matches the tuple field the
+                            // tid path mints — compound_option_inner_name's bare "map" would
+                            // diverge → void-erased mono param (br yavhwc). Mirror the
+                            // tuple-lit CT_MAP arm: a scope-var map reads its key/val from the
+                            // scope accessors (keyed by the raw Blink name); a call/field
+                            // returned map reads the expr_map_* globals emit_expr just set.
+                            let sm_var = c_blink_name(inner_str)
+                            let mut sm_key_ct = expr_map_key_type
+                            let mut sm_val_ct = expr_map_val_type
+                            let mut sm_key_sn = expr_map_key_struct
+                            let mut sm_val_sn = expr_map_val_struct
+                            if is_scope_var(sm_var) != 0 {
+                                sm_key_ct = get_map_key_type(sm_var)
+                                sm_val_ct = get_map_value_type(sm_var)
+                                sm_key_sn = get_map_key_struct(sm_var)
+                                sm_val_sn = get_map_value_struct(sm_var)
+                            }
+                            let sm_key_tag = if sm_key_sn != "" { canonical_struct_tag(sm_key_sn) } else { c_type_tag(sm_key_ct) }
+                            let sm_val_tag = if sm_val_sn != "" { canonical_struct_tag(sm_val_sn) } else { c_type_tag(sm_val_ct) }
+                            "Map_{sm_key_tag}_{sm_val_tag}"
                         }
                     } else {
                         compound_option_inner_name(inner_type, inner_str)
@@ -5478,7 +5498,16 @@ fn emit_tuple_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Di
         if parent_elems_sl != -1 {
             let slot_ann = sublist_get(parent_elems_sl, i)
             cg_expect_arg_ann = slot_ann
-            if node_name(slot_ann) == "Tuple" {
+            // Promote to cg_let_target_ann for a compound slot too (br yavhwc). The
+            // Some/Ok/Err constructor derives its STRUCTURED value carrier from
+            // cg_let_target_ann (the t5nvd4/msqtkd annotation-consult), so a
+            // Some(m)/Ok(m) whose inner is a Map or nested compound must see the slot
+            // annotation on THAT channel — else it falls to compound_option_inner_name's
+            // bare "map" and the value carrier (blink_Option_map) diverges from the
+            // structured tuple field (blink_Option_Map_str_int) minted below. Tuple
+            // slots were already promoted for the same reason (nested-tuple carrier).
+            let slot_nm = node_name(slot_ann)
+            if slot_nm == "Tuple" || slot_nm == "Option" || slot_nm == "Result" {
                 cg_let_target_ann = slot_ann
             }
         }
@@ -5491,16 +5520,54 @@ fn emit_tuple_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Di
         if sn == "" {
             sn = get_var_enum(expr_result_str)
         }
+        let elem_tid = tc_lookup_node_tid(sublist_get(elems_sl, i))
+        // The value path must ride the tid-structured spelling EXACTLY when the typecheck
+        // gate (tc_tid_tuple_elem_encodable) says the generic-fn mono will — otherwise the
+        // value-constructed tuple and the mono param diverge → void-erased param. Consult
+        // the SAME predicate (br yavhwc) so the two paths can never drift: an Option carrier
+        // over a Map or nested faithful compound rides; a Result carrier with a DIRECT Map
+        // inner (the upgrade_compound_carrier assignment-compat carve-out) and any
+        // struct/enum leaf stay on the string CSV. Only meaningful for a compound carrier.
+        let elem_rides_tid = elem_tid >= 0 && is_compound_ct(expr_result_type) != 0 && tc_tid_tuple_elem_encodable(elem_tid)
+        // For a BARE-VAR compound-carrier element (`let a: Option[Map[Str,Int]] = ...;
+        // (a, 7)`), get_var_struct returns the carrier's INNER struct tag (Map_str_int),
+        // NOT the carrier — so it would drop the Option/Result wrapper and win over the
+        // structured ctag below. When the element rides the tid path, clear sn so the
+        // tid-driven ctag path spells the full carrier (Option_Map_str_int). A deferred
+        // element keeps its sn and rides the string CSV — no regression.
+        if sn != "" && elem_rides_tid { sn = "" }
         val_structs.push(sn)
         let mut ctag = ""
+        // The memoized element tid is the structured recursion source: it exists for
+        // every node (infer_type memoizes tc_node_tid) and is byte-identical to the tid
+        // path by construction. For an Option/Result carrier whose inner is itself a
+        // compound (a Map, or a nested Option/Result over faithful leaves), the flat
+        // c_type_tag below spells only ONE level (bare "map"/"option"/"result") and would
+        // diverge from the tid path (tc_tid_inner_tag recurses) → void-erased mono param.
+        // When the element RIDES the tid path (elem_rides_tid = tc_tid_tuple_elem_encodable,
+        // the SAME gate the generic-fn mono consults), spell the inner structurally via
+        // tc_tid_inner_tag — the SAME speller the tid path uses. Otherwise fall through to
+        // the existing one-level spelling (defends un-memoized nodes, deferred cases:
+        // struct/enum inners, the Result-direct-Map carve-out → still ride the string CSV).
+        // Reads only the tid — no scope or expr_* globals — so the kops-sensitive CT_MAP
+        // arm below is untouched. Reconciles the value path with the tid/annotation
+        // majority in lockstep with the typecheck gate (br yavhwc).
         if sn == "" && is_compound_ct(expr_result_type) != 0 {
             if expr_result_type == CT_OPTION {
-                let inner_tag = if expr_option_inner_struct != "" { canonical_struct_tag(expr_option_inner_struct) } else { c_type_tag(expr_option_inner) }
-                ctag = "Option_{inner_tag}"
+                if elem_rides_tid && tc_tid_ct(elem_tid) == CT_OPTION {
+                    ctag = "Option_{tc_tid_inner_tag(tc_tid_option_inner_tid(elem_tid))}"
+                } else {
+                    let inner_tag = if expr_option_inner_struct != "" { canonical_struct_tag(expr_option_inner_struct) } else { c_type_tag(expr_option_inner) }
+                    ctag = "Option_{inner_tag}"
+                }
             } else if expr_result_type == CT_RESULT {
-                let ok_tag = if expr_result_ok_struct != "" { canonical_struct_tag(expr_result_ok_struct) } else { c_type_tag(expr_result_ok_type) }
-                let err_tag = if expr_result_err_struct != "" { canonical_struct_tag(expr_result_err_struct) } else { c_type_tag(expr_result_err_type) }
-                ctag = "Result_{ok_tag}_{err_tag}"
+                if elem_rides_tid && tc_tid_ct(elem_tid) == CT_RESULT {
+                    ctag = "Result_{tc_tid_inner_tag(tc_tid_result_ok_tid(elem_tid))}_{tc_tid_inner_tag(tc_tid_result_err_tid(elem_tid))}"
+                } else {
+                    let ok_tag = if expr_result_ok_struct != "" { canonical_struct_tag(expr_result_ok_struct) } else { c_type_tag(expr_result_ok_type) }
+                    let err_tag = if expr_result_err_struct != "" { canonical_struct_tag(expr_result_err_struct) } else { c_type_tag(expr_result_err_type) }
+                    ctag = "Result_{ok_tag}_{err_tag}"
+                }
             } else if expr_result_type == CT_MAP {
                 // A Map tuple element (br 6kqgnp): spell it Map_{key}_{val} to match
                 // the tid path (tc_tid_inner_tag) and the annotation path
