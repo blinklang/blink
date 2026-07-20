@@ -11,11 +11,14 @@
 // mono mints must match the value-constructed tuple, or the mono param erases to void and
 // the emitted C fails to compile — which task regen catches.
 //
-// STILL DEFERS (see the guard tests at the bottom): a struct/enum INSTANCE inner
-// (Option[QBox[Int]]) — the Option carrier typedef for an instance inner erases its value
-// member to void*/bare-blink_QBox and mints a divergent bare carrier; that is a deeper
-// carrier-member-emission gap (follow-up ticket). It stays on the string CSV, where it
-// already compiles.
+// NOW RIDES TOO (br bee854, see the INSTANCE tests at the bottom): a struct INSTANCE inner
+// (Option[QBox[Int]]). It used to defer — the Option carrier typedef erased its value member
+// to void*/bare-blink_QBox and minted a divergent bare carrier. bee854 threads the mono stem
+// (QBox_Int) at every annotation-lowering site + registers the instance
+// (register_carrier_inner_mono_instance) and relaxes tc_tid_inner_tag_faithful to admit a
+// TK_STRUCT instance leaf, so both paths converge on the single blink_Option_QBox_Int.
+// A generic-ENUM instance inner still DEFERS (waits on br 82ajft/dbzy4r); a Result carrier
+// over a struct instance is a separate pre-existing gap (br z4tk66).
 
 type P {
     x: Int,
@@ -62,12 +65,32 @@ test "(Option[Color], Int) rides the tid path" {
     assert_eq(take_int(c), 99)
 }
 
-// DEFERRAL GUARD: a struct INSTANCE inner (Option[QBox[Int]]) must STILL compile by riding
-// the string CSV — tc_tid_inner_tag_faithful defers a params_count != 0 leaf. A too-loose
-// gate that admitted it would mint a divergent bare blink_Option_QBox carrier (void* member,
-// undeclared blink_QBox) alongside blink_Option_QBox_Int → C compile failure.
-test "(Option[QBox[Int]], Int) stays on the string path" {
+// br bee854: a struct INSTANCE inner (Option[QBox[Int]]) now RIDES the tid path — the
+// companion to the bare-struct ride above. The bug: the annotation-lowering sites read the
+// bare annotation head (is_struct_type(inner_name)) and thread strip_module_qualifier (= QBox),
+// dropping the [Int] type-arg, so the Option carrier typedef minted blink_Option_QBox with a
+// void*/undeclared-blink_QBox value member — divergent from the tid path's blink_Option_QBox_Int.
+// The fix threads the mono stem (QBox_Int) via mono_name_from_ann + registers the instance, so
+// BOTH the value carrier and the generic-fn mono param bottom out at the SAME
+// blink_Option_QBox_Int (blink_QBox_Int* value). Gen1==Gen2 byte-stability is the tripwire.
+
+// The MVCE (ticket): Option[QBox[Int]] tuple element, direct construction. Reuses the
+// QBox[T] declared at the top of this file — the generic-struct instance inner.
+test "(Option[QBox[Int]], Int) rides the tid path" {
     let b: QBox[Int] = QBox { v: 42 }
     let p = (Some(b), 7)
     assert_eq(take_int(p), 99)
+}
+
+// Driven through a generic fn over List[(Option[QBox[Int]], Int)] — the seed chain that mints
+// the tid carrier (Tuple2_Option_QBox_Int_int). The generic-fn mono param must spell the same
+// blink_Option_QBox_Int the value-constructed tuple field carries.
+fn count_opt_qbox(xs: List[(Option[QBox[Int]], Int)]) -> Int {
+    xs.len()
+}
+
+test "generic-fn over List[(Option[QBox[Int]], Int)] seeds the tid carrier" {
+    let a: Option[QBox[Int]] = Some(QBox { v: 5 })
+    let xs: List[(Option[QBox[Int]], Int)] = [(a, 1)]
+    assert_eq(count_opt_qbox(xs), 1)
 }

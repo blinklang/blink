@@ -2309,7 +2309,12 @@ pub fn resolve_ret_type_from_ann(fn_node: Int) -> Str {
                 let inner_name = node_name(inner_ann)
                 let inner_t = type_from_name(inner_name)
                 if is_struct_type(inner_name) != 0 || is_enum_type(inner_name) != 0 {
-                    return "blink_Option_{canonical_struct_tag(strip_module_qualifier(inner_name))}"
+                    // br bee854: a generic-struct INSTANCE inner spells the mono stem
+                    // (QBox_Int), matching the tid path; the bare head is the fallback
+                    // for a non-generic struct / typevar (mono_name_from_ann → "").
+                    let mono = mono_name_from_ann(strip_module_qualifier(inner_name), inner_ann, -1, "", [])
+                    let tag = if mono != "" { mono } else { strip_module_qualifier(inner_name) }
+                    return "blink_Option_{canonical_struct_tag(tag)}"
                 }
                 if is_compound_ct(inner_t) != 0 || inner_name == "Tuple" {
                     let compound_name = compound_name_from_ann(inner_ann)
@@ -2566,7 +2571,11 @@ pub fn reg_fn_ret_from_ann(name: Str, fn_node: Int) ! Codegen.Register {
                 let inner_t = type_from_name(inner_name)
                 reg_fn_ret_type_tp(name, CT_OPTION, inner_t, -1, tp_from_ann(ta))
                 if is_struct_type(inner_name) != 0 || is_enum_type(inner_name) != 0 {
-                    let bare_inner = strip_module_qualifier(inner_name)
+                    // br bee854: register the mono INSTANCE (QBox_Int) so the carrier
+                    // typedef's value member resolves to blink_QBox_Int, not an
+                    // undeclared blink_QBox. "" falls back to the bare head.
+                    let mono = register_carrier_inner_mono_instance(inner_name, inner_ann)
+                    let bare_inner = if mono != "" { mono } else { strip_module_qualifier(inner_name) }
                     reg_fn_ret_struct_inner(name, bare_inner, "")
                     ensure_struct_option_type(bare_inner)
                 } else if is_compound_ct(inner_t) != 0 {
@@ -3931,9 +3940,15 @@ pub fn infer_fn_type_args_from_types(fn_node: Int, ca: GenericCallArgs) -> Optio
                         }
                     }
                 }
-            } else if is_struct_type(ptype) != 0 {
-                // Generic user struct param like Box[T] — extract concrete
-                // type-args from the actual argument's mono struct name.
+            } else if is_struct_type(ptype) != 0 || is_enum_type(ptype) != 0 {
+                // Generic user struct/enum param (Box[T] / Tree[T]) — extract the
+                // concrete type-args from the actual argument's mono name. The arm is
+                // kind-agnostic: lookup_mono_base recovers (base, args CSV) for both a
+                // struct instance (Box_Int) and an enum instance (Tree_Int, br 82ajft),
+                // and the annotation slot naming param_name selects the arg. This is the
+                // codegen fallback the tid mono-CSV defers to for a recursive/forwarding
+                // self-call inside a generic body (`count(l)` where l's slot tid is still
+                // abstract) — without it the arg falls through with T unresolved (_Void).
                 let ta = node_type_ann(p)
                 if ta != -1 && fi < ca.struct_names.len() {
                     let arg_sname = ca.struct_names.get(fi).unwrap()
@@ -4200,6 +4215,54 @@ pub fn mono_name_from_ann(base_name: Str, ann_node: Int, tparams_sl: Int, concre
     // c_name for a cross-module instance (the carrier/typedef-order consumers feed
     // the result to c_type_c_name); no-op for fn/same-module bases (q4etvt).
     mangle_generic_name(mono_phys_base(base_name), mono_args)
+}
+
+// br bee854: an Option/Result carrier over a generic-struct INSTANCE inner
+// (`Option[QBox[Int]]`) must spell its value member with the mono stem (QBox_Int),
+// not the bare head (QBox) — else emit_struct_option_typedef's c_type_from_tag hits
+// the is_struct_type branch and emits an undeclared `blink_QBox*` member, minting a
+// divergent bare `blink_Option_QBox` carrier alongside the tid-path's
+// `blink_Option_QBox_Int`.
+//
+// This computes the mono stem for `inner_ann` over generic struct/enum `inner_name`
+// AND registers the instance into the mono registry, so is_mono_struct_instance
+// recognizes the tag when the carrier typedef emits its member (c_type_from_tag →
+// `blink_QBox_Int`). Registration is annotation-driven (codegen_types cannot reach
+// the tid accessors — typecheck imports it, not the reverse), mirroring
+// mono_name_from_ann's arg loop; a NESTED generic-instance arg is registered
+// inner-first (its typedef must precede the outer that names it). Returns the mono
+// stem (`QBox_Int`) or "" when inner_name isn't a generic instance (bare struct /
+// typevar) — the caller then keeps its existing bare-head spelling.
+pub fn register_carrier_inner_mono_instance(inner_name: Str, inner_ann: Int) -> Str ! Codegen.Register {
+    let base = strip_module_qualifier(inner_name)
+    let td = find_type_def_node(base)
+    if td == -1 { return "" }
+    let td_tparams = node_type_params(td)
+    if td_tparams == -1 || sublist_length(td_tparams) == 0 { return "" }
+    if inner_ann == -1 { return "" }
+    let elems = node_elements(inner_ann)
+    if elems == -1 || sublist_length(elems) == 0 { return "" }
+    let mut args = ""
+    let mut arg_tids: List[Int] = []
+    let mut ai = 0
+    while ai < sublist_length(elems) {
+        let elem = sublist_get(elems, ai)
+        let resolved = resolve_tparam_seg(node_name(elem), -1, "", [])
+        let mut arg_seg = resolved
+        // A nested generic-instance arg (`QBox[QBox[Int]]`) registers inner-first and
+        // reuses its own full mono stem, matching mono_name_from_ann's recursion.
+        if is_struct_type(resolved) != 0 || is_enum_type(resolved) != 0 {
+            let nested = register_carrier_inner_mono_instance(resolved, elem)
+            if nested != "" { arg_seg = nested }
+        }
+        if ai > 0 { args = args.concat(",") }
+        args = args.concat(arg_seg)
+        // Scalar/string-resolvable args carry no tid; the def-side typedef emitter
+        // (emit_mono_struct_typedef) resolves them from the concrete_args string.
+        arg_tids.push(-1)
+        ai = ai + 1
+    }
+    register_mono_instance(base, args, arg_tids)
 }
 
 // Concrete type-args CSV for a struct instance whose enclosing value context
@@ -5473,7 +5536,11 @@ pub fn ensure_compound_type_from_ann(ann_node: Int) {
             let inner_name = node_name(inner_ann)
             let inner_t = type_from_name(inner_name)
             if is_struct_type(inner_name) != 0 || is_enum_type(inner_name) != 0 {
-                ensure_struct_option_type(strip_module_qualifier(inner_name))
+                // br bee854: queue the carrier under the mono stem (QBox_Int) so the
+                // typedef name matches the tid path; "" keeps the bare head.
+                let mono = mono_name_from_ann(strip_module_qualifier(inner_name), inner_ann, -1, "", [])
+                let tag = if mono != "" { mono } else { strip_module_qualifier(inner_name) }
+                ensure_struct_option_type(tag)
             } else if is_compound_ct(inner_t) != 0 {
                 ensure_compound_type_from_ann(inner_ann)
                 ensure_struct_option_type(compound_name_from_ann(inner_ann))

@@ -1,0 +1,80 @@
+// br 82ajft item 1: a GENERIC fn over a generic-enum INSTANCE param
+// (`fn count[T](t: Tree[T])`) now monomorphizes correctly. Before, the caller mono
+// CSV filled the unresolved `""` segment with the literal "Void" and the def-side
+// param spelled the bare enum head, so the compiler emitted `blink_count_Void(blink_Tree t)`
+// — an undeclared bare `blink_Tree` and a `_Void`-suffixed symbol that failed to link.
+//
+// Two seams closed (mirroring the already-working generic-struct-param path):
+//   - CALLER mono CSV: tc_resolve_tparam_seg / tc_resolve_tparam_tid gained a TK_ENUM
+//     arm beside the TK_STRUCT one, reading the named slot off the arg's enum INSTANCE
+//     tid (the slot readers are kind-agnostic).
+//   - DEF-side param C type + scope binding: mono_fn_signature and emit_mono_fn_def
+//     use mono_name_from_ann to spell/bind the mono enum name (Tree_Int).
+// Plus the 3 encodable gates (tc_tid_encodable / tuple-element sibling /
+// tc_struct_slot_encodable) were relaxed to admit an enum INSTANCE now that
+// tc_tid_struct_mono_name spells it (jjhnf3). This closes the dbzy4r encoder tail.
+//
+// jjhnf3 already proved a CONCRETE (non-generic) `leaf_value(t: Tree[Int])` param.
+// This test drives the GENERIC caller edge: `count[T](t: Tree[T])`.
+
+type Tree[T] {
+    Leaf(value: T)
+    Branch(left: Tree[T], right: Tree[T])
+}
+
+fn count[T](t: Tree[T]) -> Int {
+    match t {
+        Leaf(_v) => return 1
+        Branch(l, r) => return count(l) + count(r)
+    }
+}
+
+test "generic fn over generic enum Tree[Int]" {
+    let t = Branch(Leaf(1), Leaf(2))
+    assert_eq(count(t), 2)
+}
+
+// A single-level generic-enum fn (no recursion) — the minimal shape the plan names.
+// Both variants carry T so the instance type is inferrable from the constructed
+// payload (Full(9)/Half(3) → Box[Int]); the annotation-only construction of a
+// non-T-carrying variant (`let e: Box[Int] = Empty()`) is a SEPARATE pre-existing
+// generic-enum-construction gap (fails identically on the pre-82ajft compiler),
+// tracked outside item 1.
+type Box[T] {
+    Full(value: T)
+    Half(value: T)
+}
+
+fn is_full[T](b: Box[T]) -> Int {
+    match b {
+        Full(_v) => return 1
+        Half(_v) => return 0
+    }
+}
+
+test "generic fn over single-level generic enum Box[Int]" {
+    let b: Box[Int] = Full(9)
+    assert_eq(is_full(b), 1)
+    let h: Box[Int] = Half(3)
+    assert_eq(is_full(h), 0)
+}
+
+// GENERIC-OVER-GENERIC forwarding: `indirect[T]` forwards its Tree[T] param to another
+// generic fn. Inside indirect_Int the arg's slot tid is still the abstract Tree[<tv>], so
+// the tid mono-CSV defers and the codegen fallback (infer_fn_type_args_from_types' enum arm)
+// must recover T=Int from the arg's tracked mono struct — which arg_struct_name_for now reads
+// for a data-enum var (it reports CT_INT but carries get_var_struct=Tree_Int). Without it the
+// forwarding call mangled blink_take_tree_Void(blink_Tree_Void). The struct twin already worked;
+// this is the enum parity. (Found by /code-review.)
+fn take_box[T](b: Box[T]) -> Int {
+    is_full(b)
+}
+
+fn forward_box[T](b: Box[T]) -> Int {
+    take_box(b)
+}
+
+test "generic-over-generic enum forwarding" {
+    let b: Box[Int] = Full(5)
+    assert_eq(forward_box(b), 1)
+}

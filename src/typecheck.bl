@@ -1363,7 +1363,14 @@ fn tc_produce_enum_instance_tid(ann_node: Int, name: Str, elems_sl: Int) -> Int 
 // covers only tc_suppress_ann_validation, so the mutation-analyzer flag is expected.
 @allow(UnrestoredMutation)
 fn tc_fnsig_param_instance_tid(ann_node: Int, bare_tid: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
-    if type_kind(bare_tid) != TK_STRUCT { return -1 }
+    let bk = type_kind(bare_tid)
+    // br 82ajft item 3: a generic-ENUM param/return (`t: Tree[T]` / `-> Tree[Int]`)
+    // must also re-intern as a structural instance carrying its type-arg slots — the
+    // enum twin of the struct case — so the codegen return/param mono seams read the
+    // instance tid (tc_lookup_node_tid → tc_tid_struct_mono_name → blink_Tree_Int)
+    // instead of the erased bare base. Without it a `-> Tree[Int]` return kept the
+    // bare Tree tid and lowered to the never-typedef'd blink_Tree.
+    if bk != TK_STRUCT && bk != TK_ENUM { return -1 }
     let elems_sl = node_elements(ann_node)
     if elems_sl == -1 || sublist_length(elems_sl) < 1 { return -1 }
     let saved_suppress = tc_suppress_ann_validation
@@ -1375,7 +1382,11 @@ fn tc_fnsig_param_instance_tid(ann_node: Int, bare_tid: Int) -> Int ! TypeCheck.
         ai = ai + 1
     }
     tc_suppress_ann_validation = saved_suppress
-    make_struct_instance_type(strip_module_qualifier(node_name(ann_node)), arg_tids)
+    let base = strip_module_qualifier(node_name(ann_node))
+    if bk == TK_ENUM {
+        return make_enum_instance_type(base, arg_tids)
+    }
+    make_struct_instance_type(base, arg_tids)
 }
 
 // A generic-enum VARIANT-FIELD annotation (`Branch(left: Tree[T], …)`) must intern
@@ -9052,15 +9063,24 @@ pub fn tc_tid_inner_tag_faithful(tid: Int) -> Bool {
     // divergent canonical_struct_tag fallback. Module qualifier is a non-issue: both sides call
     // tc_tid_inner_tag on the SAME tid, so they agree whatever it spells.
     //
-    // A struct/enum INSTANCE (params_count != 0) still DEFERS: the Option/Result carrier
-    // TYPEDEF for an instance inner erases its value member to `void*`/bare-`blink_QBox` (the
-    // mono stem QBox_Int is not threaded into emit_struct_option_typedef's member type), and a
-    // second bare `blink_Option_QBox` carrier is minted alongside `blink_Option_QBox_Int` —
-    // divergent, and the bare member references an undeclared `blink_QBox`. That is a carrier-
-    // member-emission gap, deeper than this tuple-element gate; deferring keeps the instance
-    // leaf on the string CSV (where it already compiles). Mirrors tc_tid_tuple_elem_encodable's
-    // enum-instance carve-out (:9415) and tc_struct_slot_encodable (:9464). Follow-up ticket.
-    if t.params_count != 0 { return false }
+    // br bee854: a struct INSTANCE leaf (params_count != 0, e.g. QBox[Int]) is now FAITHFUL.
+    // When the enclosing Option/Result rides, emit_tuple_lit spells the inner via
+    // tc_tid_inner_tag, whose struct/enum arm returns tc_tid_struct_mono_name (the mono stem
+    // QBox_Int) — byte-identical to the tid-path carrier (blink_Option_QBox_Int). The
+    // annotation-lowering erasure that used to mint a divergent bare blink_Option_QBox carrier
+    // (void*/undeclared-blink_QBox member) is fixed at the same time: the lowering sites now
+    // thread the mono stem + register the instance (register_carrier_inner_mono_instance), so
+    // both paths converge on the single blink_Option_QBox_Int (blink_QBox_Int* value).
+    //
+    // A generic-enum INSTANCE (TK_ENUM, params_count != 0) STILL DEFERS: its mono
+    // (blink_Tree_Int) rides only once generic-fn-over-enum + the encodable gates land
+    // (br 82ajft / dbzy4r). Admitting it here before those would mint an un-typedef'd enum
+    // mono member. Mirrors tc_tid_tuple_elem_encodable's enum-instance carve-out (:9425) and
+    // tc_struct_slot_encodable (:9474) — all three widen together with 82ajft item 1.
+    if t.params_count != 0 {
+        if k == TK_STRUCT { return true }
+        return false
+    }
     if k == TK_STRUCT || k == TK_ENUM { return true }
     false
 }
@@ -9309,12 +9329,13 @@ fn tc_tid_encodable(tid: Int) -> Bool {
     // mono-CSV segment byte-matches the string path, so the module-qualifier no longer
     // forces a defer.
     //
-    // An ENUM INSTANCE (TK_ENUM, params_count>=1) DEFERS: tc_tid_struct_mono_name is
-    // STRUCT-only (returns "" for TK_ENUM), so tc_tid_to_c_tag would fall back to the
-    // bare head and drop the args — the encoder cannot spell it. Generic user enums
-    // are not constructible today, so this is latent, but the guard must not claim a
-    // shape the encoder can't lower. A bare enum (params_count 0) stays admitted.
-    if k == TK_ENUM && t.params_count != 0 { return false }
+    // An ENUM INSTANCE (TK_ENUM, params_count>=1) is now ADMITTED (br 82ajft / dbzy4r):
+    // tc_tid_struct_mono_name was widened for TK_ENUM in jjhnf3 (c_type_tag_for_struct
+    // base + kind-agnostic slot segs → Tree_Int), so tc_tid_to_c_tag's shared
+    // TK_STRUCT|TK_ENUM branch spells the full mono stem, byte-matching the string
+    // path's registered mono name — exactly the struct-instance beachhead above. A
+    // slot that is itself inexpressible still bottoms out at tc_tid_struct_slot_seg ""
+    // (deferred there), so nothing that was on the string path starts diverging.
     true
 }
 
@@ -9423,12 +9444,11 @@ pub fn tc_tid_tuple_elem_encodable(tid: Int) -> Bool {
     // resolve_tuple_ann's element arm recovers the same mono stem via
     // mono_name_from_ann (br 637sy9, CLOSED) instead of erasing to the bare head — the
     // wzv72h fixed-point gate proves it (test_637sy9_*). An ENUM INSTANCE
-    // (TK_ENUM, params_count>=1) still DEFERS: tc_tid_struct_mono_name is STRUCT-only
-    // (returns "" for TK_ENUM), so the encoder would erase its args to the bare head
-    // while mono_name_from_ann keeps the full stem. Generic enums aren't constructible
-    // today so this is latent, but the guard must not claim a shape the encoder can't
-    // lower — mirrors tc_struct_slot_encodable's enum-instance carve-out.
-    if k == TK_ENUM && t.params_count != 0 { return false }
+    // (TK_ENUM, params_count>=1) is now ADMITTED too (br 82ajft / dbzy4r):
+    // tc_tid_struct_mono_name was widened for TK_ENUM in jjhnf3 (c_type_tag_for_struct
+    // base + kind-agnostic slot segs), so it spells the same full mono stem
+    // (Tree_Int) that resolve_tuple_ann's element arm recovers via mono_name_from_ann
+    // — the enum twin of the struct-instance case above.
     if k == TK_STRUCT || k == TK_ENUM { return true }
     false
 }
@@ -9474,10 +9494,11 @@ pub fn tc_struct_slot_encodable(tid: Int) -> Bool {
     if k == TK_INT || k == TK_FLOAT || k == TK_BOOL || k == TK_STR || k == TK_CHAR { return true }
     if k == TK_I8 || k == TK_I16 || k == TK_I32 { return true }
     if k == TK_U8 || k == TK_U16 || k == TK_U32 || k == TK_U64 { return true }
-    // An ENUM INSTANCE (TK_ENUM, params_count>=1) DEFERS: tc_tid_struct_mono_name is
-    // STRUCT-only so the encoder would erase its args to the bare head. Bare enums
-    // (params_count 0) stay admitted below.
-    if k == TK_ENUM && t.params_count != 0 { return false }
+    // An ENUM INSTANCE (TK_ENUM, params_count>=1) is now ADMITTED (br 82ajft / dbzy4r):
+    // tc_tid_struct_mono_name was widened for TK_ENUM in jjhnf3, so the encoder spells
+    // its full mono stem (Tree_Int) rather than erasing to the bare head — the enum
+    // twin of the struct-instance slot admitted below. (The poly-impl wrapper
+    // tc_poly_elem_slot_encodable still further restricts to BARE unqualified names.)
     // A struct/enum slot is admitted regardless of module qualifier (br q4etvt): the
     // mono-registry physical-base split makes both paths spell a cross-module slot
     // the SAME — a bare cross-module struct's segment is bare on both (tc_tid_to_c_tag
@@ -9626,10 +9647,46 @@ fn tc_resolve_tparam_seg(param_name: Str, fn_params_sl: Int, args_sl: Int) -> Op
             if tc_ann_mentions_param(node_type_ann(p), param_name) {
                 return None
             }
+        } else if tc_type_is_enum(ptype) != 0 {
+            // br 82ajft: generic user-ENUM param (`t: Tree[T]`). Exact twin of the
+            // struct arm above — a concrete arg (`let t: Tree[Int]`) has an enum
+            // INSTANCE tid (TK_ENUM, params_count>=1) carrying the type-args, and the
+            // slot readers (tc_struct_param_binds / tc_struct_seg_from_arg /
+            // tc_tid_struct_arg_count) are kind-agnostic, so read the annotation slot
+            // that names this param and the same slot of the arg instance tid. Without
+            // this the "" segment falls through to the literal "Void" fill below and
+            // the caller mangles blink_count_Void instead of blink_count_Int.
+            if arg_tid >= 0 && arg_tid < ty_pool.len() {
+                let arg_ty = ty_pool.get(arg_tid).unwrap()
+                if arg_ty.kind == TK_ENUM && tc_tid_struct_arg_count(arg_tid) >= 1 && strip_module_qualifier(arg_ty.name) == ptype {
+                    let slot = tc_struct_param_binds(p, param_name)
+                    if slot >= 0 {
+                        let seg = tc_struct_seg_from_arg(arg_tid, slot)
+                        if seg.is_some() { return seg }
+                    }
+                }
+            }
+            if tc_ann_mentions_param(node_type_ann(p), param_name) {
+                return None
+            }
         }
         fi = fi + 1
     }
     Some("")
+}
+
+// True when `tname` names a user-declared ENUM (first field is a TypeVariant) —
+// the complement of tc_type_is_struct, used to route a generic-enum param
+// (`Tree[T]`) through the same instance-tid slot read as a generic-struct param
+// (br 82ajft).
+fn tc_type_is_enum(tname: Str) -> Int {
+    let td = tc_type_decl_nodes.get(tname) ?? -1
+    if td == -1 { return 0 }
+    let flds = node_fields(td)
+    if flds != -1 && sublist_length(flds) > 0 {
+        if node_kind(sublist_get(flds, 0)) == NodeKind.TypeVariant { return 1 }
+    }
+    0
 }
 
 // True when param `p`'s annotation is List[<param_name>].
@@ -9801,6 +9858,24 @@ fn tc_resolve_tparam_tid(param_name: Str, fn_params_sl: Int, args_sl: Int) -> In
             if arg_tid >= 0 && arg_tid < ty_pool.len() {
                 let arg_ty = ty_pool.get(arg_tid).unwrap()
                 if arg_ty.kind == TK_STRUCT && tc_tid_struct_arg_count(arg_tid) >= 1 && strip_module_qualifier(arg_ty.name) == ptype {
+                    let slot = tc_struct_param_binds(p, param_name)
+                    if slot >= 0 && slot < tc_tid_struct_arg_count(arg_tid) {
+                        let slot_tid = ty_param_list.get(ty_pool.get(arg_tid).unwrap().params_start + slot).unwrap()
+                        if tc_struct_slot_encodable(slot_tid) { return slot_tid }
+                    }
+                }
+            }
+            if tc_ann_mentions_param(node_type_ann(p), param_name) {
+                return -1
+            }
+        } else if tc_type_is_enum(ptype) != 0 {
+            // br 82ajft: generic-enum param tid twin of the struct arm — read the
+            // named slot's concrete tid off the arg's enum INSTANCE tid (TK_ENUM), so
+            // the def-side mono emitter re-derives blink_Tree_Int from the structured
+            // tid rather than the "Void"-filled CSV.
+            if arg_tid >= 0 && arg_tid < ty_pool.len() {
+                let arg_ty = ty_pool.get(arg_tid).unwrap()
+                if arg_ty.kind == TK_ENUM && tc_tid_struct_arg_count(arg_tid) >= 1 && strip_module_qualifier(arg_ty.name) == ptype {
                     let slot = tc_struct_param_binds(p, param_name)
                     if slot >= 0 && slot < tc_tid_struct_arg_count(arg_tid) {
                         let slot_tid = ty_param_list.get(ty_pool.get(arg_tid).unwrap().params_start + slot).unwrap()
