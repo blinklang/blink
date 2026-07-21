@@ -5113,7 +5113,7 @@ fn arg_tids_match_mono_args(arg_tids: List[Int], mono_args: Str) -> Bool {
 // generic-enum instance. Mirrors register_enum_instance_from_tid but lives here to
 // avoid a codegen_expr→codegen_stmt import cycle. `expected_base` guards against a
 // mismatched memoized tid — the registered instance must name this variant's enum.
-fn register_mono_enum_from_node(node: Int, expected_base: Str) -> Str ! Codegen.Register {
+pub fn register_mono_enum_from_node(node: Int, expected_base: Str) -> Str ! Codegen.Register {
     let inst_tid = tc_lookup_node_tid(node)
     if inst_tid < 0 { return "" }
     if tc_tid_is_enum(inst_tid) == 0 { return "" }
@@ -5280,7 +5280,13 @@ fn emit_struct_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
         if variant_enum != "" && is_data_enum(variant_enum) != 0 && vidx >= 0 {
             let tag = get_variant_tag(variant_enum, sname)
             let flds_sl_sv = node_fields(node)
-            let enum_c_name = c_type_c_name(variant_enum)
+            // A generic-enum struct-style ctor (`First { value: 42 }` → Choice[Int,Str])
+            // mono's to blink_Choice_Int_Str, mirroring the call-style paths. Without
+            // this the struct-lit path emitted the erased bare enum (blink_Choice) —
+            // undeclared for a generic enum (br 7q3aj0). "" (non-generic) keeps bare.
+            let mono_name = register_mono_enum_from_node(node, variant_enum)
+            let enum_type_name = if mono_name != "" { mono_name } else { variant_enum }
+            let enum_c_name = c_type_c_name(enum_type_name)
             // Resolve this variant's field-def sublist so bare `None` fields
             // adopt their declared Option[T] carrier instead of defaulting to
             // Option[int] (bug 264p4n). node_fields(vnode) is the same shape
@@ -5317,7 +5323,12 @@ fn emit_struct_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
                     cg_expect_arg_ann = saved_arg_ann
                     let arg_str = expr_result_str
                     let field_type = get_variant_field_type_str(vidx, fi)
-                    if field_type.is_some() && field_type.unwrap() == variant_enum {
+                    // strip_generic_args so a self-referential generic-enum variant
+                    // (`Branch(Tree[T], Tree[T])`) heap-boxes its recursive payload
+                    // (field_type "Tree[T]" vs enum "Tree"), matching the bare-Call
+                    // and qualified paths. Without it the recursive field emits inline
+                    // into an int64_t pointer slot — a C type error (br 7q3aj0).
+                    if field_type.is_some() && strip_generic_args(field_type.unwrap()) == variant_enum {
                         let box_tmp = fresh_temp("_ebox")
                         emit_line("{enum_c_name}* {box_tmp} = ({enum_c_name}*)blink_alloc(sizeof({enum_c_name}));")
                         emit_line("*{box_tmp} = {arg_str};")
@@ -5332,7 +5343,7 @@ fn emit_struct_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
             init_str = init_str.concat("}")
             expr_result_str = init_str
             expr_result_type = CT_STRUCT
-            set_var_struct(init_str, variant_enum)
+            set_var_struct(init_str, enum_type_name)
             return
         }
     }

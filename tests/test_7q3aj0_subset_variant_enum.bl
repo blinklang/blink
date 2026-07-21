@@ -1,0 +1,147 @@
+// br 7q3aj0: a generic enum whose variant mentions only a SUBSET of the enum's
+// type params (the spec's canonical `Either[L, R] { Left(L) Right(R) }`) miscompiled
+// at construction even when fully annotated.
+//
+// At `let a: Either[Int, Str] = Left(42)`, the ctor's instance tid was inferred from
+// the variant's args ALONE. `Left(L)` mentions only L, so L=Int bound but R stayed
+// unbound → minted as a fresh typevar → `Either[Int, ?]`. Codegen's mono speller
+// returned "" on the typevar R slot → bailed to the bare, undeclared `blink_Either`
+// (gcc: `unknown type name 'blink_Either'`; payloads erased to `void`).
+//
+// Fix: the two make_typevar else-branches in tc_enum_ctor_instance_tid /
+// tc_enum_structlit_instance_tid now consult the enclosing annotation
+// (tc_construct_hint) via tc_hint_enum_slot to fill an unbound slot, so R=Str is
+// pinned and the node mints `blink_Either_Int_Str`. A miscompile surfaces as a C
+// build failure, so a green test == fix works.
+
+type Either[L, R] {
+    Left(L)
+    Right(R)
+}
+
+// Named-payload subset variant → exercises the struct-style (StructLit) path.
+type Choice[L, R] {
+    First(value: L)
+    Second(value: R)
+}
+
+// All-params control (regression): variant mentions every param, so the arg-only
+// unification already binds both. Must stay green.
+type Pair2[L, R] {
+    Both(L, R)
+}
+
+// All-params, NAMED-payload variant — for the all-params struct-style regression.
+type PairS[L, R] {
+    Boths(first: L, second: R)
+}
+
+// Self-referential generic enum — its recursive variant payload must be heap-boxed.
+// The qualified/struct-style codegen mono fix would otherwise skip the box branch
+// (field type "Tree[T]" never == the bare enum "Tree" without strip_generic_args),
+// emitting the recursive field inline into an int64_t pointer slot (C type error).
+type Tree[T] {
+    Leaf(T)
+    Branch(Tree[T], Tree[T])
+}
+
+fn tree_sum(t: Tree[Int]) -> Int {
+    match t {
+        Leaf(n) => return n
+        Branch(l, r) => return tree_sum(l) + tree_sum(r)
+    }
+}
+
+fn either_left(e: Either[Int, Str]) -> Int {
+    match e {
+        Left(n) => return n
+        Right(_s) => return 0
+    }
+}
+
+fn either_right(e: Either[Int, Str]) -> Str {
+    match e {
+        Left(_n) => return "none"
+        Right(s) => return s
+    }
+}
+
+test "call-style annotated subset variant Left(42)" {
+    let a: Either[Int, Str] = Left(42)
+    assert_eq(either_left(a), 42)
+}
+
+test "call-style annotated other subset slot Right(hi)" {
+    let b: Either[Int, Str] = Right("hi")
+    assert_eq(either_right(b), "hi")
+}
+
+test "qualified annotated subset variant Either.Left(42)" {
+    let a: Either[Int, Str] = Either.Left(42)
+    assert_eq(either_left(a), 42)
+}
+
+test "struct-style annotated subset variant First value 42" {
+    let c: Choice[Int, Str] = First { value: 42 }
+    match c {
+        First(n) => assert_eq(n, 42)
+        Second(_s) => assert(false, "should be First")
+    }
+}
+
+test "nested-carrier annotated Some(Left(42))" {
+    let a: Option[Either[Int, Str]] = Some(Left(42))
+    match a {
+        Some(e) => assert_eq(either_left(e), 42)
+        None => assert(false, "should be Some")
+    }
+}
+
+test "all-params control Both(42, hi) stays green" {
+    let p: Pair2[Int, Str] = Both(42, "hi")
+    match p {
+        Both(n, s) => {
+            assert_eq(n, 42)
+            assert_eq(s, "hi")
+        }
+    }
+}
+
+// The qualified and struct-style codegen mono was a GENERAL gap (both construction
+// paths emitted the bare, undeclared enum for ANY generic enum — not just subset
+// variants). These all-params cases mono the same paths the subset cases exercise,
+// proving the codegen fix is not subset-specific.
+
+test "all-params qualified Pair2.Both(42, hi)" {
+    let p: Pair2[Int, Str] = Pair2.Both(42, "hi")
+    match p {
+        Both(n, s) => {
+            assert_eq(n, 42)
+            assert_eq(s, "hi")
+        }
+    }
+}
+
+test "all-params struct-style Boths first 42 second hi" {
+    let p: PairS[Int, Str] = Boths { first: 42, second: "hi" }
+    match p {
+        Boths(n, s) => {
+            assert_eq(n, 42)
+            assert_eq(s, "hi")
+        }
+    }
+}
+
+// The mono fix must not break the self-referential-payload box branch: the recursive
+// Tree[Int] fields have to be heap-boxed, not emitted inline. Qualified + struct-style
+// construction both exercise the box-branch check the codegen fix touches.
+
+test "self-referential generic enum qualified Tree.Branch" {
+    let t: Tree[Int] = Tree.Branch(Tree.Leaf(3), Tree.Leaf(4))
+    assert_eq(tree_sum(t), 7)
+}
+
+test "self-referential generic enum bare-call Branch stays green" {
+    let t = Branch(Leaf(1), Leaf(2))
+    assert_eq(tree_sum(t), 3)
+}

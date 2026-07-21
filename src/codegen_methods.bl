@@ -32,7 +32,7 @@ import codegen_types.{
     get_var_result_ok_struct, get_var_struct,
     get_variant_field_count, get_variant_field_name,
     get_variant_field_type_str, get_variant_index, get_variant_tag,
-    has_derive_method, is_compound_ct, is_data_enum, is_enum_type, is_fn_registered, is_scope_var, is_str_backed_enum,
+    has_derive_method, is_compound_ct, is_data_enum, is_enum_type, is_fn_registered, is_scope_var, is_str_backed_enum, strip_generic_args,
     is_generic_fn, is_mono_struct_instance, is_struct_type, is_struct_or_enum_type, is_trait_type, is_transparent_newtype, is_user_effect_handle,
     cg_expect_fn_value_sig, cg_expect_arg_ann, arg_type_ann_at, get_callee_params_sl,
     builtin_receiver_type_name,
@@ -1997,7 +1997,14 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                 let tag = get_variant_tag(mc_obj_name, method)
                 let fcount = get_variant_field_count(vidx)
                 let args_sl = node_args(node)
-                let enum_c_name = c_type_c_name(mc_obj_name)
+                // A generic-enum qualified ctor (`Either.Left(42)` → Either[Int,Str])
+                // mono's to blink_Either_Int_Str, mirroring the bare-Call path
+                // (emit_expr's data-enum branch). Without this the qualified path
+                // emitted the erased bare enum (blink_Either) — undeclared for a
+                // generic enum (br 7q3aj0). "" (non-generic enum) keeps the bare name.
+                let mono_name = register_mono_enum_from_node(node, mc_obj_name)
+                let sname = if mono_name != "" { mono_name } else { mc_obj_name }
+                let enum_c_name = c_type_c_name(sname)
                 let mut init_str = "({enum_c_name})\{.tag = {tag}"
                 if fcount > 0 && args_sl != -1 {
                     init_str = init_str.concat(", .data.{method} = \{")
@@ -2010,7 +2017,13 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                         let field_type = get_variant_field_type_str(vidx, fi).unwrap()
                         emit_expr(sublist_get(args_sl, fi))
                         let arg_str = expr_result_str
-                        if field_type == mc_obj_name {
+                        // strip_generic_args so a self-referential generic-enum variant
+                        // (`Branch(Tree[T], Tree[T])`) heap-boxes its recursive payload:
+                        // field_type is "Tree[T]", the enum is "Tree". Matches the
+                        // bare-Call reference (emit_expr) — without the strip the box
+                        // branch is skipped and the recursive field emits inline into an
+                        // int64_t pointer slot (C type error) (br 7q3aj0).
+                        if strip_generic_args(field_type) == mc_obj_name {
                             let box_tmp = fresh_temp("_ebox")
                             emit_line("{enum_c_name}* {box_tmp} = ({enum_c_name}*)blink_alloc(sizeof({enum_c_name}));")
                             emit_line("*{box_tmp} = {arg_str};")
@@ -2024,8 +2037,13 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                 }
                 init_str = init_str.concat("}")
                 expr_result_str = init_str
-                expr_result_type = CT_VOID
-                set_var_struct(init_str, mc_obj_name)
+                // CT_STRUCT (not CT_VOID) so a `let a: Either[Int,Str] = Either.Left(42)`
+                // binding derives its LHS C type off the mono struct tag (emit_let_binding
+                // gates enum_mono pickup on val_type == CT_STRUCT) — matching the bare-Call
+                // path, which already returns CT_STRUCT. Otherwise the LHS erased to the
+                // bare blink_Either while the RHS was the mono instance (br 7q3aj0).
+                expr_result_type = CT_STRUCT
+                set_var_struct(init_str, sname)
                 return
             }
         }
