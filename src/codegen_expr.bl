@@ -5076,6 +5076,35 @@ fn mono_instance_arg_tids_from_tid(inst_tid: Int, expected_base: Str, expected_c
     out
 }
 
+// Whether a recovered arg_tids list is parallel to the already-chosen `mono_args`
+// CSV: every encodable slot (seg != "") must spell exactly the segment mono_args
+// holds for that index. A -1 / unencodable slot ("") is a don't-care — the def-side
+// emitter falls back to the string seg there, so it can never diverge. Used by the
+// phybxe Class-A recovery to reject a tid recovered off a MISMATCHED outer annotation
+// (bare-name matched but a different nesting level), which would otherwise mis-lower a
+// nested inner instance's field type. Returns true for an empty list (nothing to
+// contradict → the empty-list fallback stays authoritative).
+//
+// Per-slot alignment is sound because nth_type_arg splits mono_args naively on ',',
+// and every slot segment (whether from tc_tid_to_c_tag on the tid side or the string
+// producers on the CSV side) spells compound/nested types with UNDERSCORES
+// (Result_int_str, Box_Int), never commas — so one slot never injects a comma that
+// would desync the split. segs and the CSV are parallel: recovered's length is the
+// instance's params_count (or 0), and the string mono_args in this branch has exactly
+// one comma-segment per declared tparam.
+fn arg_tids_match_mono_args(arg_tids: List[Int], mono_args: Str) -> Bool {
+    let segs = segs_from_arg_tids(arg_tids)
+    let mut i = 0
+    while i < segs.len() {
+        let seg = segs.get(i).unwrap()
+        if seg != "" && seg != nth_type_arg(mono_args, i) {
+            return false
+        }
+        i = i + 1
+    }
+    true
+}
+
 // Register the mono instance for a generic-enum construction (`Branch(Leaf(1),…)`)
 // and return its mono C-name STEM (`Tree_Int`), so ctor/match can emit the mono
 // typedef name (blink_Tree_Int) instead of the erased bare `Tree` (jjhnf3). Reads the
@@ -5478,6 +5507,32 @@ fn emit_struct_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
             // off tids for the encodable slots (byte-identical to the string seg).
             let inst_tid = tid_native_struct_inst_tid(node, sname)
             mono_arg_tids = mono_instance_arg_tids_from_tid(inst_tid, sname, tc_tid_struct_arg_count(inst_tid))
+        }
+    }
+    // Class-A recovery (br phybxe): the string branches (target_args and
+    // infer_struct_type_args) leave mono_arg_tids [], so register_mono_instance
+    // captures an empty arg_tids list and every def-side resolve_tparam_via_tid for
+    // this instance falls to the string CSV. Recover the parallel slot tids off the
+    // construction node's memoized instance tid — the SAME call the tid-native branch
+    // above already makes. mono_instance_arg_tids_from_tid is a strict superset: it
+    // returns [] when the memoized tid is absent / base-mismatched / arity-mismatched
+    // (degrading to exactly today's empty-list fallback, byte-identical) and stores -1
+    // per unencodable slot; only provably-encodable scalar/struct-instance slots start
+    // carrying real tids so arg_tids can key the def-side tid lowering.
+    if mono_args != "" && mono_arg_tids.len() == 0 {
+        let inst_tid = tid_native_struct_inst_tid(node, sname)
+        let recovered = mono_instance_arg_tids_from_tid(inst_tid, sname, tc_tid_struct_arg_count(inst_tid))
+        // tid_native_struct_inst_tid matches an outer let/arg annotation by BARE
+        // struct name, so a NESTED inner literal (`Box{value:42}` inside a
+        // `let b: Box[Box[Int]]`) can recover the OUTER instance's tid — whose slot
+        // is `Box[Int]`, not the inner literal's `Int`. That would lower the inner
+        // `Box_Int` typedef's field to `blink_Box_Int value` (self-referential →
+        // undeclared type). Guard: every encodable recovered slot MUST spell the
+        // segment `mono_args` already chose for that slot; on any divergence the tid
+        // belongs to a different instance, so discard to [] (byte-identical to the
+        // pre-phybxe empty-list fallback).
+        if arg_tids_match_mono_args(recovered, mono_args) {
+            mono_arg_tids = recovered
         }
     }
     let mut struct_key = sname

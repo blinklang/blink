@@ -9479,13 +9479,17 @@ pub fn tc_seg_from_tid(tid: Int) -> Option[Str] {
 //     stem (Box_Int) via tc_tid_struct_mono_name, so the def-side reader round-trips
 //     it byte-identically to the recursively-registered mono name — closing the -1
 //     hole so arg_tids can key the mono dedup (br 16z0s1).
+//   - a module-qualified struct/enum is ADMITTED (br q4etvt) and an ENUM INSTANCE
+//     (params_count>=1) is ADMITTED (br 82ajft/dbzy4r) — see the TK_STRUCT|TK_ENUM
+//     branch's own comment below.
+//   - Option/Result over encodable inners, Tuple (tc_tid_tuple_encodable), Map over
+//     encodable inners, and Set are now ADMITTED (br kffj8d): the string path spells a
+//     compound slot via the SAME tc_tid_to_c_tag (tid_native_struct_mono_args' compound
+//     branch → "Option_int" / "Result_int_str" / "Tuple2_int_int" / bare "Map"/"Set"),
+//     and the def-side reader round-trips it byte-identically. Each shape's inner gate
+//     mirrors the general tc_tid_encodable's own arm, so admitting it here never widens
+//     past what the string path already spelled. See the per-shape arms below.
 // Everything else DEFERS to the string path (return false):
-//   - a module-qualified struct/enum — strip diverges from the module-prefixed name.
-//   - an ENUM INSTANCE (params_count>=1) — tc_tid_struct_mono_name is STRUCT-only,
-//     so the encoder can't spell it (generic user enums aren't constructible today).
-//   - Option/Result/Map/List/Set/Bytes/Tuple — carrier-tag spelling/casing is not
-//     provably equal to the arg's stored segment (e.g. Box[Option[Int]] diverges:
-//     tid Option_int vs string path Void/Option_Int); kept deferring until proven.
 //   - typevar/unknown — no concrete binding.
 pub fn tc_struct_slot_encodable(tid: Int) -> Bool {
     if tid < 0 || tid >= ty_pool.len() { return false }
@@ -9509,26 +9513,61 @@ pub fn tc_struct_slot_encodable(tid: Int) -> Bool {
     if k == TK_STRUCT || k == TK_ENUM {
         return true
     }
+    // Compound slots (br kffj8d): a struct type-arg SLOT that is itself an
+    // Option/Result over encodable inners is now ADMITTED. The string path spells the
+    // slot via the SAME tc_tid_to_c_tag (tid_native_struct_mono_args' compound branch
+    // → "Option_int" / "Result_int_str"), and the def-side reader (resolve_tparam_via_tid
+    // → tc_seg_from_tid → tc_tid_to_c_tag) round-trips it byte-identically, so carrying
+    // the real tid keys the mono dedup without changing emitted C. Gated on the general
+    // tc_tid_encodable for the inner, exactly like tc_tid_to_c_tag's own recursion — a
+    // nested typevar/unknown inner still defers. The Gen1==Gen2 fixed point is the
+    // byte-equality proof; a shape that breaks it is a genuine divergence and reverts.
+    if k == TK_OPTION { return tc_tid_encodable(t.inner1) }
+    if k == TK_RESULT { return tc_tid_encodable(t.inner1) && tc_tid_encodable(t.inner2) }
+    // A TUPLE slot (br kffj8d, test_0sh55p T=Tuple2_int_int): admitted when every
+    // element is tuple-element-safe (tc_tid_tuple_encodable), the same gate the general
+    // tc_tid_encodable uses. tc_tid_to_c_tag spells it via tc_tid_tuple_tag
+    // (Tuple2_int_int), byte-matching the struct-lit string path's registered tuple
+    // carrier segment.
+    if k == TK_TUPLE { return tc_tid_tuple_encodable(t) }
+    // A MAP slot (br kffj8d, test_kvn6w8 / test_qw7v90 T=Map): tc_tid_to_c_tag erases
+    // Map to the bare carrier tag "Map" (no inner spelling), matching the string path's
+    // bare "Map" segment. Admitted only when both inners are themselves encodable, like
+    // the general tc_tid_encodable Map arm.
+    if k == TK_MAP { return tc_tid_encodable(t.inner1) && tc_tid_encodable(t.inner2) }
+    // A SET slot (br kffj8d, test_kvn6w8 / test_qw7v90 T=Set): tc_tid_to_c_tag erases
+    // Set to the bare carrier tag "Set", matching the string path's bare "Set" segment
+    // — the twin of the Map arm above. tc_tid_encodable admits TK_SET unconditionally
+    // (it erases to the bare carrier), so no inner gate is needed here.
+    if k == TK_SET { return true }
     false
 }
 
 // STRICTER slot-encodability for the poly-impl List-element arg-tid path
 // (poly_impl_concrete_arg_tids). tc_struct_slot_encodable was relaxed by q4etvt to
-// admit MODULE-QUALIFIED struct/enum slots, because the struct-lit / fn-arg CSV twin
-// it must byte-match now spells them physically. The poly-impl CSV twin does NOT:
+// admit MODULE-QUALIFIED struct/enum slots, and by kffj8d to admit compound
+// (Option/Result) slots, because the struct-lit / fn-arg CSV twin it must byte-match
+// now spells them physically / structurally. The poly-impl CSV twin does NOT:
 // poly_impl_concrete_args spells a cross-module element via the raw QUALIFIED
 // get_list_elem_struct (dotted; br dwhm4v), which does not round-trip through
 // tc_seg_from_tid's strip_module_qualifier. So the poly-impl path keeps the
-// pre-q4etvt contract — carry a tid only for a scalar or a BARE UNQUALIFIED
+// pre-q4etvt contract — carry a tid ONLY for a scalar or a BARE UNQUALIFIED
 // struct/enum, and defer (-1 → string seg) everything else, including any
-// module-qualified struct/enum.
+// module-qualified struct/enum AND the compound slots kffj8d newly admitted for the
+// struct-lit path. This gate is now SELF-CONTAINED (it no longer delegates to the
+// relaxed tc_struct_slot_encodable) so the compound relaxation cannot leak into the
+// poly tail — its admission set is exactly the pre-kffj8d one.
 pub fn tc_poly_elem_slot_encodable(tid: Int) -> Bool {
-    if !tc_struct_slot_encodable(tid) { return false }
+    if tid < 0 || tid >= ty_pool.len() { return false }
     let t = ty_pool.get(tid).unwrap()
-    if t.kind == TK_STRUCT || t.kind == TK_ENUM {
+    let k = t.kind
+    if k == TK_INT || k == TK_FLOAT || k == TK_BOOL || k == TK_STR || k == TK_CHAR { return true }
+    if k == TK_I8 || k == TK_I16 || k == TK_I32 { return true }
+    if k == TK_U8 || k == TK_U16 || k == TK_U32 || k == TK_U64 { return true }
+    if k == TK_STRUCT || k == TK_ENUM {
         return strip_module_qualifier(t.name) == t.name
     }
-    true
+    false
 }
 
 // Resolve the CSV segment for type-arg slot `idx` of a struct-INSTANCE tid
