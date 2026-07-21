@@ -1,0 +1,98 @@
+// 4c3gts: a polymorphic trait impl over List[T] whose method returns the BARE
+// binder T, instantiated at a COMPOUND element (Option/Result/Map), erased the
+// return to Void — a typecheck-level miscompile AND a C-level symbol collision.
+//
+// `List[Option[Int]].first()` and `List[Option[Str]].first()` both mangled to the
+// single symbol `blink_List_WrapperZ_first_Void` and deduped to one body — two
+// incompatible instantiations sharing one C function (UB). The root leak is at
+// TYPECHECK: `c.first()` was typed as returning `Void` (the binder T bound to a
+// compound element was spelled "Void"), so the chained `.unwrap()` failed to
+// resolve before codegen even ran.
+//
+// Scalar and bare-struct elements always worked; only COMPOUND elements broke.
+// A runtime test that reaches its asserts proves the binder resolved to the
+// concrete compound element on BOTH the typecheck and codegen paths.
+//
+// DISTINCT from wkwj7e/xgm7jv (method returns a compound OVER the binder,
+// `-> Option[T]`, element scalar/instance) — here the RETURN is the bare binder
+// and the ELEMENT is the compound.
+
+trait WrapperY[T] {
+    fn first(self) -> T
+}
+
+impl[T] WrapperY[T] for List[T] {
+    fn first(self) -> T { self.get(0).unwrap() }
+}
+
+type LocElem { x: Int, y: Int }
+
+// ---- Functional: bare-T return over a compound element ---------------------
+
+test "poly impl bare-T first() over List[Option[Int]]" {
+    let c: List[Option[Int]] = [Some(9)]
+    let o = c.first()
+    assert_eq(o.unwrap(), 9)
+}
+
+test "poly impl bare-T first() over List[Option[Str]]" {
+    let c: List[Option[Str]] = [Some("hi")]
+    let o = c.first()
+    assert_eq(o.unwrap(), "hi")
+}
+
+test "poly impl bare-T first() over List[Result[Int, Str]]" {
+    let c: List[Result[Int, Str]] = [Ok(7)]
+    let r = c.first()
+    assert_eq(r.unwrap(), 7)
+}
+
+test "poly impl bare-T first() over List[Map[Int, Str]]" {
+    let mut m: Map[Int, Str] = Map()
+    m.insert(1, "one")
+    let c: List[Map[Int, Str]] = [m]
+    let got = c.first()
+    assert_eq(got.get(1).unwrap(), "one")
+}
+
+test "poly impl bare-T first() over List[Option[LocElem]]" {
+    let c: List[Option[LocElem]] = [Some(LocElem { x: 3, y: 4 })]
+    let o = c.first()
+    let p = o.unwrap()
+    assert_eq(p.x, 3)
+    assert_eq(p.y, 4)
+}
+
+// ---- Collision fence: two compound instantiations must be DISTINCT symbols --
+
+fn emit_c(tag: Str, src: Str) -> Str {
+    let bl_path = ".tmp/_test_{tag}.bl"
+    write_file(bl_path, src)
+    let _ = process_run("build/blink", ["build", bl_path, "--emit", "c"])
+    let c_src = read_file("build/_test_{tag}.c")
+    shell_exec("rm -f {bl_path} build/_test_{tag}.c")
+    c_src
+}
+
+test "poly impl compound elements emit distinct per-inner symbols (no Void collision)" {
+    let src = "trait WrapperZ[T] \{\n"
+              .concat("    fn first(self) -> T\n")
+              .concat("\}\n")
+              .concat("impl[T] WrapperZ[T] for List[T] \{\n")
+              .concat("    fn first(self) -> T \{ self.get(0).unwrap() \}\n")
+              .concat("\}\n")
+              .concat("fn use_int(c: List[Option[Int]]) -> Int \{ c.first().unwrap() \}\n")
+              .concat("fn use_str(c: List[Option[Str]]) -> Str \{ c.first().unwrap() \}\n")
+              .concat("fn main() \{\n")
+              .concat("    let a: List[Option[Int]] = [Some(9)]\n")
+              .concat("    let b: List[Option[Str]] = [Some(\"x\")]\n")
+              .concat("    let _i = use_int(a)\n")
+              .concat("    let _s = use_str(b)\n")
+              .concat("\}\n")
+    let c = emit_c("poly_compound_collision", src)
+    // Distinct per-inner mono symbols, NOT one void-erased symbol.
+    assert(c.contains("List_WrapperZ_first_Option_int"))
+    assert(c.contains("List_WrapperZ_first_Option_str"))
+    // The Void-collided symbol must be gone entirely.
+    assert(!c.contains("List_WrapperZ_first_Void"))
+}

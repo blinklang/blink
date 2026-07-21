@@ -10,7 +10,7 @@ import codegen_types.{
     CarrierInfo,
     build_closure_sig_from_type_ann, c_fn_name, c_safe_name, c_type_c_name, c_type_c_name_in,
     c_type_from_tag, mangling_module,
-    c_type_str, c_type_tag, canonical_struct_tag, cg_current_fn_has_ev, cg_current_fn_name, cg_current_fn_node, cg_current_module,
+    c_type_str, c_type_tag, c_type_tag_for_struct, canonical_struct_tag, cg_current_fn_has_ev, cg_current_fn_name, cg_current_fn_node, cg_current_module,
     cg_arena_expr_prev_stack, cg_arena_expr_tmp_stack,
     cg_current_fn_option_inner, cg_current_fn_option_inner_struct, cg_current_fn_ret, cg_ffi_lib_set, cg_with_arena_depth,
     cg_ffi_libs, cg_global_inits, cg_used_native_deps,
@@ -60,7 +60,7 @@ import codegen_types.{
     resolve_import_alias, resolve_option_inner_from_ann, resolve_ret_type_from_ann,
     resolve_self_type, resolve_tuple_ann, resolve_variant, result_c_type,
     result_c_type_mixed, tuple_struct_arity, set_list_elem_struct, set_list_elem_type,
-    set_list_nested_elem_struct, set_list_nested_elem_type, set_list_elem_map_types, set_map_types, set_map_key_struct, key_struct_sname_from_ann, set_map_value_list_elem, set_map_value_struct, copy_map_value_meta, set_set_elem_type, set_set_elem_struct,
+    set_list_nested_elem_struct, set_list_nested_elem_type, set_list_elem_map_types, set_list_elem_option, set_list_elem_result, get_list_elem_option_inner, get_list_elem_option_inner_struct, get_list_elem_result_ok, get_list_elem_result_err, get_list_elem_result_ok_struct, get_list_elem_result_err_struct, set_map_types, set_map_key_struct, key_struct_sname_from_ann, set_map_value_list_elem, set_map_value_struct, copy_map_value_meta, set_set_elem_type, set_set_elem_struct,
     find_type_def_node, set_var_ffi_ptr_struct, set_var_ffi_ptr_array, set_var_ffi_ptr_extra,
     ffi_alloc_n_pending, ffi_offset_pending_struct,
     set_var, set_var_alias, set_var_channel, set_var_closure, set_var_handle,
@@ -150,6 +150,46 @@ fn set_list_elem_map_ann(var_name: Str, elem_ann: Int) {
         let mv_name = resolve_tparam_via_tid(node_name(mv_ann), cg_mono_tparams_sl, cg_mono_concrete_args, cg_mono_arg_tids)
         set_list_elem_map_types(var_name, type_from_name(mk_name), type_from_name(mv_name), mv_name)
     }
+}
+
+// gemr3z: stamp a List[Option[T]] / List[Result[T,E]] element's INNER type(s)
+// from the element annotation onto the list var (the compound-element twin of
+// set_list_elem_map_ann). Without this, the plain set_list_elem_type(CT_OPTION)
+// at each annotation site defaults the Option inner to Int and get()/for-in emit
+// the undefined `blink_Option_option`. Resolves each inner name through the mono
+// resolver (so a mono param's typevar inner is substituted) and records the
+// nested type via set_list_elem_option / set_list_elem_result. A struct/enum inner
+// stamps its name so the carrier is named by struct tag; scalars pass "".
+// Returns 1 when it handled the element (Option/Result), 0 otherwise so the caller
+// keeps its existing dispatch for non-compound elements.
+fn set_list_elem_compound_ann(var_name: Str, elem_ann: Int, elem_ct: Int) -> Int {
+    if elem_ct == CT_OPTION {
+        let inner_sl = node_elements(elem_ann)
+        if inner_sl != -1 && sublist_length(inner_sl) >= 1 {
+            let inner_ann = sublist_get(inner_sl, 0)
+            let inner_name = resolve_tparam_via_tid(node_name(inner_ann), cg_mono_tparams_sl, cg_mono_concrete_args, cg_mono_arg_tids)
+            let inner_ct = type_from_name(inner_name)
+            let inner_struct = if is_struct_or_enum_type(inner_name) != 0 { inner_name } else { "" }
+            set_list_elem_option(var_name, inner_ct, inner_struct)
+        }
+        return 1
+    }
+    if elem_ct == CT_RESULT {
+        let inner_sl = node_elements(elem_ann)
+        if inner_sl != -1 && sublist_length(inner_sl) >= 2 {
+            let ok_ann = sublist_get(inner_sl, 0)
+            let err_ann = sublist_get(inner_sl, 1)
+            let ok_name = resolve_tparam_via_tid(node_name(ok_ann), cg_mono_tparams_sl, cg_mono_concrete_args, cg_mono_arg_tids)
+            let err_name = resolve_tparam_via_tid(node_name(err_ann), cg_mono_tparams_sl, cg_mono_concrete_args, cg_mono_arg_tids)
+            let ok_ct = type_from_name(ok_name)
+            let err_ct = type_from_name(err_name)
+            let ok_struct = if is_struct_or_enum_type(ok_name) != 0 { ok_name } else { "" }
+            let err_struct = if is_struct_or_enum_type(err_name) != 0 { err_name } else { "" }
+            set_list_elem_result(var_name, ok_ct, ok_struct, err_ct, err_struct)
+        }
+        return 1
+    }
+    0
 }
 
 fn infer_node_struct_name(node: Int) -> Str {
@@ -3169,6 +3209,7 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
                 if elem_ct == CT_MAP {
                     set_list_elem_map_ann(name, elem_ann)
                 }
+                let _ = set_list_elem_compound_ann(name, elem_ann, elem_ct)
             }
         }
     }
@@ -3407,7 +3448,67 @@ fn emit_for_in(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.
             if elem_type == -1 { elem_type = get_list_elem_type(iter_str) }
             if elem_type == -1 { elem_type = CT_INT }
             let elem_struct = get_list_elem_struct(iter_str)
-            if elem_struct != "" {
+            // gemr3z: a COMPOUND element (`for item in (List[Option[T]])`) is boxed by
+            // POINTER on the list. Iterate via the generic pointer iterator
+            // (blink_list_into_iter_int, values = intptr_t) and materialize each `item`
+            // as the concrete carrier, binding it as CT_OPTION/CT_RESULT so a body
+            // `match item { Some(v) => .. }` decodes the inner. Without this the bare
+            // `else` below keys the iterator on c_type_tag(CT_OPTION)="option" and
+            // emits the undefined blink_Option_option / blink_ListIterator_option_next.
+            if elem_type == CT_OPTION || elem_type == CT_RESULT {
+                let carrier = if elem_type == CT_OPTION {
+                    let oi_ct = get_list_elem_option_inner(iter_str)
+                    let oi_struct = get_list_elem_option_inner_struct(iter_str)
+                    let inner_tag = if oi_struct != "" { c_type_tag_for_struct(oi_struct) } else if oi_ct >= 0 { c_type_tag(oi_ct) } else { "int" }
+                    "Option_{inner_tag}"
+                } else {
+                    let rok_ct = get_list_elem_result_ok(iter_str)
+                    let rerr_ct = get_list_elem_result_err(iter_str)
+                    let rok_struct = get_list_elem_result_ok_struct(iter_str)
+                    let rerr_struct = get_list_elem_result_err_struct(iter_str)
+                    let ok_tag = if rok_struct != "" { c_type_tag_for_struct(rok_struct) } else if rok_ct >= 0 { c_type_tag(rok_ct) } else { "int" }
+                    let err_tag = if rerr_struct != "" { c_type_tag_for_struct(rerr_struct) } else if rerr_ct >= 0 { c_type_tag(rerr_ct) } else { "str" }
+                    "Result_{ok_tag}_{err_tag}"
+                }
+                ensure_carrier_from_tag(carrier)
+                ensure_iter_type(CT_INT)
+                let li_type = list_iter_c_type(CT_INT)
+                let opt_type = option_c_type(CT_INT)
+                let iter_var = fresh_temp("__iter_")
+                let next_var = fresh_temp("__next_")
+                emit_line("{li_type} {iter_var} = blink_list_into_iter_int({iter_str});")
+                emit_line("while (1) \{")
+                cg_indent = cg_indent + 1
+                emit_line("{opt_type} {next_var} = {li_type}_next(&{iter_var});")
+                emit_line("if ({next_var}.tag == 0) break;")
+                let carrier_c = c_type_from_tag(carrier)
+                emit_line("{carrier_c} {c_var_name} = *({carrier_c}*)(intptr_t){next_var}.value;")
+                push_scope()
+                if elem_type == CT_OPTION {
+                    let oi_ct = get_list_elem_option_inner(iter_str)
+                    let oi_struct = get_list_elem_option_inner_struct(iter_str)
+                    set_var(var_name, CT_OPTION, 0)
+                    if oi_struct != "" {
+                        set_var_option_struct(var_name, CT_INT, oi_struct)
+                    } else {
+                        set_var_option(var_name, if oi_ct >= 0 { oi_ct } else { CT_INT })
+                    }
+                } else {
+                    set_var(var_name, CT_RESULT, 0)
+                    let rok_ct = get_list_elem_result_ok(iter_str)
+                    let rerr_ct = get_list_elem_result_err(iter_str)
+                    let rok_struct = get_list_elem_result_ok_struct(iter_str)
+                    let rerr_struct = get_list_elem_result_err_struct(iter_str)
+                    set_var_result(var_name, if rok_ct >= 0 { rok_ct } else { CT_INT }, if rerr_ct >= 0 { rerr_ct } else { CT_STRING })
+                    if rok_struct != "" || rerr_struct != "" {
+                        set_var_result_struct(var_name, if rok_ct >= 0 { rok_ct } else { CT_INT }, if rerr_ct >= 0 { rerr_ct } else { CT_STRING }, rok_struct, rerr_struct)
+                    }
+                }
+                emit_block(node_body(node))
+                pop_scope()
+                cg_indent = cg_indent - 1
+                emit_line("}")
+            } else if elem_struct != "" {
                 ensure_iter_type(CT_INT)
                 let li_type = list_iter_c_type(CT_INT)
                 let opt_type = option_c_type(CT_INT)
@@ -3421,6 +3522,43 @@ fn emit_for_in(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.
                 let struct_c = c_type_c_name(elem_struct)
                 emit_line("{struct_c} {c_var_name} = *({struct_c}*)(intptr_t){next_var}.value;")
                 push_scope()
+                // gemr3z GAP 3: a push/.set-built compound list records the element via
+                // the struct-tag convention (elem_struct = "Option_int", elem_type
+                // CT_VOID) rather than the nested-tp convention the compound branch
+                // above keys on. The materialized item IS the compound carrier, so bind
+                // it as CT_OPTION/CT_RESULT (not a plain struct) so a body `match item`
+                // decodes the inner. ensure_carrier_from_tag guarantees the typedef.
+                if is_compound_tag(elem_struct) != 0 {
+                    ensure_carrier_from_tag(canonical_struct_tag(elem_struct))
+                    if elem_struct.starts_with("Option_") {
+                        let oi_ct = option_inner_ct_from_tag(elem_struct)
+                        let oi_struct = option_inner_struct_from_tag(elem_struct)
+                        set_var(var_name, CT_OPTION, 0)
+                        if oi_struct != "" {
+                            set_var_option_struct(var_name, CT_INT, oi_struct)
+                        } else {
+                            set_var_option(var_name, oi_ct)
+                        }
+                    } else if elem_struct.starts_with("Result_") {
+                        let parts = split_result_compound(elem_struct)
+                        let ok_struct = typedef_tag_or_empty(parts.first)
+                        let err_struct = typedef_tag_or_empty(parts.second)
+                        let ok_ct = type_from_name_tag(parts.first)
+                        let err_ct = type_from_name_tag(parts.second)
+                        set_var(var_name, CT_RESULT, 0)
+                        set_var_result(var_name, ok_ct, err_ct)
+                        if ok_struct != "" || err_struct != "" {
+                            set_var_result_struct(var_name, ok_ct, err_ct, ok_struct, err_struct)
+                        }
+                    } else {
+                        set_var(var_name, CT_VOID, 0)
+                        set_var_struct(c_var_name, elem_struct)
+                    }
+                    emit_block(node_body(node))
+                    pop_scope()
+                    cg_indent = cg_indent - 1
+                    emit_line("}")
+                } else {
                 set_var(var_name, CT_VOID, 0)
                 set_var_struct(c_var_name, elem_struct)
                 if is_enum_type(elem_struct) != 0 {
@@ -3434,6 +3572,7 @@ fn emit_for_in(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.
                 pop_scope()
                 cg_indent = cg_indent - 1
                 emit_line("}")
+                }
             } else {
                 ensure_iter_type(elem_type)
                 let tag = c_type_tag(elem_type)
@@ -4953,6 +5092,7 @@ pub fn emit_impl_method_def(fn_node: Int, impl_type: Str, im_node: Int) ! Codege
                                 if elem_ct == CT_MAP {
                                     set_list_elem_map_ann(pname, elem_ann)
                                 }
+                                let _ = set_list_elem_compound_ann(pname, elem_ann, elem_ct)
                             }
                         }
                     }
@@ -5602,6 +5742,7 @@ pub fn emit_fn_def(fn_node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope
                             if elem_ct == CT_MAP {
                                 set_list_elem_map_ann(pname, elem_ann)
                             }
+                            let _ = set_list_elem_compound_ann(pname, elem_ann, elem_ct)
                         }
                     }
                 }
@@ -6697,6 +6838,7 @@ fn emit_mono_fn_def(fn_node: Int, concrete_args: Str, arg_tids: List[Int]) ! Cod
                             if elem_ct == CT_MAP {
                                 set_list_elem_map_ann(pname, elem_ann)
                             }
+                            let _ = set_list_elem_compound_ann(pname, elem_ann, elem_ct)
                         }
                     }
                 }
@@ -6828,6 +6970,53 @@ fn emit_mono_fn_def(fn_node: Int, concrete_args: Str, arg_tids: List[Int]) ! Cod
     pop_scope()
 }
 
+// br 4c3gts: register the element type of a poly-impl `self`/List[T] param from
+// the resolved element NAME (a resolve_tparam_via_tid result). A scalar or a
+// struct/enum element registers exactly as before (byte-identical). A COMPOUND
+// element resolves to a carrier tag (Option_int / Result_int_str / Map_int_str)
+// whose type_from_name is CT_VOID; recover the real CT via compound_tag_ct and
+// stamp the list element as that compound so body method calls on the receiver
+// see the concrete element rather than a Void.
+fn register_poly_list_elem(pname: Str, elem_name: Str) ! Codegen.Register {
+    let name_ct = type_from_name(elem_name)
+    if name_ct == CT_VOID && is_compound_tag(elem_name) != 0 {
+        // A COMPOUND element (carrier tag Option_str / Result_int_str): decode the
+        // carrier's inner(s) from the tag and store the FULL nested element type via
+        // set_list_elem_option / set_list_elem_result (gemr3z). The flat
+        // set_list_elem_type(CT_OPTION) would default the inner to Int, re-erasing the
+        // element the very fix that makes List[Option[Str]] work is meant to preserve.
+        let canon = canonical_struct_tag(elem_name)
+        ensure_carrier_from_tag(canon)
+        if elem_name.starts_with("Option_") {
+            let inner_struct = option_inner_struct_from_tag(canon)
+            // A struct/enum inner must route sv_tp through its CT_STRUCT case (which
+            // carries the name); passing the option_inner_ct_from_tag sentinel CT_INT
+            // would drop the struct name. Scalars keep their real CT.
+            let inner_ct = if inner_struct != "" { CT_STRUCT } else { option_inner_ct_from_tag(canon) }
+            set_list_elem_option(pname, inner_ct, inner_struct)
+        } else if elem_name.starts_with("Result_") {
+            let parts = split_result_compound(canon)
+            let ok_struct = typedef_tag_or_empty(parts.first)
+            let err_struct = typedef_tag_or_empty(parts.second)
+            let ok_ct = if ok_struct != "" { CT_STRUCT } else { type_from_name_tag(parts.first) }
+            let err_ct = if err_struct != "" { CT_STRUCT } else { type_from_name_tag(parts.second) }
+            set_list_elem_result(pname, ok_ct, ok_struct, err_ct, err_struct)
+        } else {
+            // Map_ carrier: keep the existing bare CT_MAP registration (the flat
+            // slot + set_list_elem_map already handle Map via its own annotation path).
+            set_list_elem_type(pname, compound_tag_ct(elem_name))
+        }
+        return
+    }
+    set_list_elem_type(pname, name_ct)
+    if name_ct != CT_VOID {
+        ensure_option_type(name_ct)
+    }
+    if name_ct == CT_VOID && is_named_type(elem_name) != 0 {
+        set_list_elem_struct(pname, elem_name)
+    }
+}
+
 // ms4ctb: build the C signature for a monomorphized poly-impl method
 // (`impl[T] Trait[T] for List[T]`). Like mono_fn_signature, but the type
 // params are the impl binders (node_impl_binders), not the fn's own tparams,
@@ -6848,9 +7037,22 @@ fn poly_impl_method_signature(im: Int, method_node: Int, concrete_args: Str, arg
 
     let ret_str = node_return_type(method_node)
     let resolved_ret = resolve_tparam_via_tid(ret_str, tparams_sl, concrete_args, arg_tids)
-    let ret_type = type_from_name(resolved_ret)
+    // br 4c3gts: a bare-binder return (`-> T`) bound to a COMPOUND element resolves
+    // to the carrier tag (Option_int / Result_int_str / Map_int_str), whose
+    // type_from_name is CT_VOID (a tag is not a head name) — so the def-side
+    // signature would emit `void` while the call site expects the compound carrier.
+    // Reroute the CT off the tag exactly as the free-fn twin mono_fn_signature does,
+    // and emit the parameterized carrier C type (canonicalize a module-qualified
+    // inner so the name matches the typedef ensure_carrier_from_tag emits).
+    let ret_name_ct = type_from_name(resolved_ret)
+    let ret_rerouted = ret_name_ct == CT_VOID && is_compound_tag(resolved_ret) != 0
+    let ret_type = if ret_rerouted { compound_tag_ct(resolved_ret) } else { ret_name_ct }
     let mut ret_c_str = c_type_str(ret_type)
-    if ret_type == CT_OPTION || ret_type == CT_RESULT {
+    if ret_rerouted {
+        let canon = canonical_struct_tag(resolved_ret)
+        ensure_carrier_from_tag(canon)
+        ret_c_str = c_type_from_tag(canon)
+    } else if ret_type == CT_OPTION || ret_type == CT_RESULT {
         ret_c_str = mono_option_result_param_c_type(method_node, resolved_ret, tparams_sl, concrete_args, arg_tids)
     } else if is_struct_type(resolved_ret) != 0 || is_enum_type(resolved_ret) != 0 {
         ret_c_str = c_type_c_name(resolved_ret)
@@ -6883,6 +7085,15 @@ fn poly_impl_method_signature(im: Int, method_node: Int, concrete_args: Str, arg
                 params_c = params_c.concat("{c_type_c_name(ptype)} {pname}")
             } else if is_enum_type(ptype) != 0 {
                 params_c = params_c.concat("{c_type_c_name(ptype)} {pname}")
+            } else if is_compound_tag(ptype) != 0 {
+                // br 4c3gts: a bare-binder param (`x: T`) bound to a COMPOUND element
+                // resolves to the carrier tag (Option_int, ...), not "Option". Emit
+                // its parameterized carrier directly, mirroring mono_fn_signature's
+                // compound-param branch (qm01e7). c_type_from_tag names a Map tag as
+                // blink_map*; ensure_carrier_from_tag emits the Option/Result typedef.
+                let canon = canonical_struct_tag(ptype)
+                ensure_carrier_from_tag(canon)
+                params_c = params_c.concat("{c_type_from_tag(canon)} {pname}")
             } else if ptype == "Option" || ptype == "Result" {
                 let p_c_type = mono_option_result_param_c_type(p, ptype, tparams_sl, concrete_args, arg_tids)
                 params_c = params_c.concat("{p_c_type} {pname}")
@@ -6945,14 +7156,7 @@ fn emit_poly_impl_method_def(im: Int, method_node: Int, concrete_args: Str, arg_
                 // `self: List[T]` — register as a List with the resolved element
                 // type so body method calls on self see the concrete element.
                 set_var(pname, CT_LIST, 0)
-                let elem_ct = type_from_name(recv_elem_name)
-                set_list_elem_type(pname, elem_ct)
-                if elem_ct != CT_VOID {
-                    ensure_option_type(elem_ct)
-                }
-                if elem_ct == CT_VOID && is_named_type(recv_elem_name) != 0 {
-                    set_list_elem_struct(pname, recv_elem_name)
-                }
+                register_poly_list_elem(pname, recv_elem_name)
                 i = i + 1
                 continue
             }
@@ -6974,14 +7178,7 @@ fn emit_poly_impl_method_def(im: Int, method_node: Int, concrete_args: Str, arg_
                     let elems_sl = node_elements(ta)
                     if elems_sl != -1 && sublist_length(elems_sl) > 0 {
                         let elem_name = resolve_tparam_via_tid(node_name(sublist_get(elems_sl, 0)), tparams_sl, concrete_args, arg_tids)
-                        let elem_ct = type_from_name(elem_name)
-                        set_list_elem_type(pname, elem_ct)
-                        if elem_ct != CT_VOID {
-                            ensure_option_type(elem_ct)
-                        }
-                        if elem_ct == CT_VOID && is_named_type(elem_name) != 0 {
-                            set_list_elem_struct(pname, elem_name)
-                        }
+                        register_poly_list_elem(pname, elem_name)
                     }
                 }
             } else {
@@ -7688,6 +7885,7 @@ pub fn emit_top_level_let(node: Int, extern_only: Int) ! Codegen.Emit, Codegen.R
                 if elem_ct == CT_MAP {
                     set_list_elem_map_ann(name, elem_ann)
                 }
+                let _ = set_list_elem_compound_ann(name, elem_ann, elem_ct)
             }
         }
     }

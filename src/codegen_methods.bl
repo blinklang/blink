@@ -19,6 +19,7 @@ import codegen_types.{
     find_from_impl, find_impl_method_node, impl_method_self_name, find_tryfrom_impl, fresh_temp,
     get_fn_ret, get_fn_ret_struct, get_fn_ret_struct_inner, get_fn_ret_type,
     get_impl_method_ret, get_list_elem_map_key_type, get_list_elem_map_val_type, get_list_elem_map_val_struct, set_list_elem_map_types, is_map_scalar_ct,
+    get_list_elem_option_inner, get_list_elem_option_inner_struct, get_list_elem_result_ok, get_list_elem_result_err, get_list_elem_result_ok_struct, get_list_elem_result_err_struct,
     get_list_elem_struct, get_list_elem_type,
     get_list_nested_elem_struct, get_list_nested_elem_type,
     get_map_key_type, get_map_key_type_raw, get_map_key_struct, get_map_value_list_elem, get_map_value_struct, get_map_value_type, get_map_value_type_raw, get_set_elem_type, get_set_elem_struct,
@@ -52,6 +53,7 @@ import codegen_types.{
     struct_option_c_type, struct_result_c_type,
     tp_child1_kind, tp_child2_kind, tp_get_kind, tp_get_sname,
     type_from_name, type_from_name_tag, type_name_from_ct, is_compound_tag, is_intrinsic_method, ue_methods,
+    compound_tag_ct, ensure_carrier_from_tag, split_result_compound, CompoundSplit, typedef_tag_or_empty,
     var_enums, VarEnumEntry
 }
 import diagnostics.{
@@ -125,11 +127,31 @@ fn emit_panic_tag_check_render(tmp: Str, tag_val: Int, msg_prefix: Str, rendered
 // RESOLVABLE element name (return-type substitution) use
 // poly_impl_resolution_args instead. CSV order follows binder order
 // (mangle_generic_name / resolve_tparam both index positionally by binder).
-fn poly_impl_concrete_args(im: Int, obj_str: Str) -> Str {
+fn poly_impl_concrete_args(im: Int, obj_str: Str, recv_node: Int) -> Str {
     let binders_sl = node_impl_binders(im)
     let elem_ct = get_list_elem_type(obj_str)
     let elem_struct = get_list_elem_struct(obj_str)
-    let elem_name = if elem_struct != "" { c_type_tag_for_struct(elem_struct) } else { type_name_from_ct(elem_ct) }
+    // br 4c3gts: a COMPOUND element (`List[Option[Int]]`) has no struct name and
+    // its CT (CT_OPTION/CT_RESULT/CT_MAP) has no type_name_from_ct arm, so the
+    // string path below spells it "Void" — collapsing every compound instance to
+    // the single symbol `..._Void` (a C-level collision + Void-return miscompile).
+    // When the element tid is poly-slot-encodable (a same-module compound over
+    // bare inners), spell it via the tid path (tc_seg_from_tid → "Option_int"),
+    // which is the SAME segment poly_impl_concrete_arg_tids carries and the
+    // def-side resolve_tparam_via_tid resolves — byte-identical by construction.
+    // A cross-module compound stays unencodable and keeps the string spelling
+    // (defers to the tk8qbv path). tc_tid_to_c_tag already erases a scalar / bare
+    // struct element to the same tag the string path spells, so an encodable
+    // scalar/struct element is also safe here (no behavior change for those).
+    let elem_tid = tc_tid_list_elem(tc_lookup_node_tid(recv_node))
+    let tid_seg = if tc_poly_elem_slot_encodable(elem_tid) { tc_seg_from_tid(elem_tid) } else { None }
+    let elem_name = if tid_seg.is_some() {
+        tid_seg.unwrap()
+    } else if elem_struct != "" {
+        c_type_tag_for_struct(elem_struct)
+    } else {
+        type_name_from_ct(elem_ct)
+    }
     build_binder_csv(binders_sl, elem_name)
 }
 
@@ -141,11 +163,28 @@ fn poly_impl_concrete_args(im: Int, obj_str: Str) -> Str {
 // physical tag (helper_CmgPoint) has no `.` to strip and collapses to CT_VOID
 // (br dwhm4v). Used solely for return-type substitution; the mangled symbol
 // still comes from poly_impl_concrete_args.
-fn poly_impl_resolution_args(im: Int, obj_str: Str) -> Str {
+fn poly_impl_resolution_args(im: Int, obj_str: Str, recv_node: Int) -> Str {
     let binders_sl = node_impl_binders(im)
     let elem_ct = get_list_elem_type(obj_str)
     let elem_struct = get_list_elem_struct(obj_str)
-    let elem_name = if elem_struct != "" { elem_struct } else { type_name_from_ct(elem_ct) }
+    // br 4c3gts: a poly-slot-encodable COMPOUND element resolves to its carrier tag
+    // (Option_int) via the tid, matching the mangling twin. This is the string
+    // FALLBACK for return-type substitution; the primary path is the ret_tids tid
+    // path in emit_poly_impl_call, which already spells the same segment. Keeping
+    // the two twins aligned means the fallback never re-introduces the "Void"
+    // erasure if the tid path ever misses. Bare struct elements keep the DOTTED
+    // spelling (elem_struct) so resolve_tparam's type_from_name can split on `.`
+    // (br dwhm4v); only compounds route through the tid seg.
+    let elem_tid = tc_tid_list_elem(tc_lookup_node_tid(recv_node))
+    let elem_is_compound = elem_ct == CT_OPTION || elem_ct == CT_RESULT || elem_ct == CT_MAP
+    let compound_seg = if tc_poly_elem_slot_encodable(elem_tid) && elem_struct == "" && elem_is_compound { tc_seg_from_tid(elem_tid) } else { None }
+    let elem_name = if compound_seg.is_some() {
+        compound_seg.unwrap()
+    } else if elem_struct != "" {
+        elem_struct
+    } else {
+        type_name_from_ct(elem_ct)
+    }
     build_binder_csv(binders_sl, elem_name)
 }
 
@@ -275,7 +314,7 @@ fn emit_poly_impl_call(node: Int, composed_base: Str, obj_str: Str) ! Codegen.Em
     let im = poly_impl_block_node.get(composed_base).unwrap()
     let m_def = poly_impl_method_node.get(composed_base).unwrap()
     let tparams_sl = node_impl_binders(im)
-    let concrete_args = poly_impl_concrete_args(im, obj_str)
+    let concrete_args = poly_impl_concrete_args(im, obj_str, node_obj(node))
     let arg_tids = poly_impl_concrete_arg_tids(im, node_obj(node))
     let ret_tids = poly_impl_return_elem_tids(im, node_obj(node))
     let mangled = mangle_generic_name(composed_base, concrete_args)
@@ -295,9 +334,23 @@ fn emit_poly_impl_call(node: Int, composed_base: Str, obj_str: Str) ! Codegen.Em
     // and produced the invalid promote symbol `blink_promote_helper.CmgPoint` for a
     // with-arena tail (latent bug fixed here).
     let ret_str_raw = node_return_type(m_def)
-    let resolution_args = poly_impl_resolution_args(im, obj_str)
+    let resolution_args = poly_impl_resolution_args(im, obj_str, node_obj(node))
     let ret_str = resolve_tparam_via_tid(ret_str_raw, tparams_sl, resolution_args, ret_tids)
-    let ret_ct = type_from_name(ret_str)
+    // A bare-binder return (`-> T`) instantiated at a COMPOUND element
+    // (`List[Option[Int]]`) resolves ret_str to the inner-carrying carrier tag
+    // (`Option_int` / `Result_int_str` / `Map_int_str`) via the tid RETURN path
+    // (poly_impl_return_elem_tids -> tc_seg_from_tid). type_from_name of a carrier
+    // tag is CT_VOID (a tag is not a head name), so the result temp would carry
+    // CT_VOID and any chained method (`.first().unwrap()`) would fail to resolve
+    // (br 4c3gts). Reroute the CT off the tag exactly as the free-fn twin
+    // mono_fn_signature does (is_compound_tag -> compound_tag_ct), so the
+    // Option/Result carrier-threading branches below fire and the caller sees the
+    // concrete compound type. `canon_ret` canonicalizes a module-qualified inner so
+    // the emitted C name matches the typedef ensure_carrier_from_tag emits.
+    let ret_name_ct = type_from_name(ret_str)
+    let rerouted = ret_name_ct == CT_VOID && is_compound_tag(ret_str) != 0
+    let ret_ct = if rerouted { compound_tag_ct(ret_str) } else { ret_name_ct }
+    let canon_ret = if rerouted { canonical_struct_tag(ret_str) } else { ret_str }
     let fn_eff_sl = node_effects(m_def)
     let fn_trusted = has_annotation(m_def, "trusted")
     reg_fn_with_effects(mangled, ret_ct, fn_eff_sl, fn_trusted)
@@ -346,7 +399,19 @@ fn emit_poly_impl_call(node: Int, composed_base: Str, obj_str: Str) ! Codegen.Em
     if ret_ct == CT_OPTION {
         let ret_ann = node_type_ann(m_def)
         let ann_elems = if ret_ann != -1 { node_elements(ret_ann) } else { -1 }
-        if ann_elems != -1 && sublist_length(ann_elems) >= 1 {
+        if rerouted {
+            // Bare-binder `-> T` bound to an Option element: the return annotation
+            // is the typevar node (no compound children), so recover the carrier +
+            // inner from the canonicalized tag, mirroring mono_fn_signature's
+            // rerouted branch. ensure_carrier_from_tag emits the typedef;
+            // option_inner_*_from_tag recover the inner CT / struct (br 4c3gts).
+            ensure_carrier_from_tag(canon_ret)
+            let inner_ct = option_inner_ct_from_tag(canon_ret)
+            let inner_struct = option_inner_struct_from_tag(canon_ret)
+            expr_option_inner = inner_ct
+            expr_option_inner_struct = inner_struct
+            reg_fn_ret_type(mangled, CT_OPTION, inner_ct, -1)
+        } else if ann_elems != -1 && sublist_length(ann_elems) >= 1 {
             let inner_ann = sublist_get(ann_elems, 0)
             let inner_name = resolve_tparam_via_tid(node_name(inner_ann), tparams_sl, resolution_args, ret_tids)
             let inner_ct = type_from_name(inner_name)
@@ -362,7 +427,28 @@ fn emit_poly_impl_call(node: Int, composed_base: Str, obj_str: Str) ! Codegen.Em
     } else if ret_ct == CT_RESULT {
         let ret_ann = node_type_ann(m_def)
         let ann_elems = if ret_ann != -1 { node_elements(ret_ann) } else { -1 }
-        if ann_elems != -1 && sublist_length(ann_elems) >= 2 {
+        if rerouted {
+            // Bare-binder `-> T` bound to a Result element: derive both inners from
+            // the canonicalized tag (br 4c3gts), mirroring the Option branch above.
+            // split_result_compound splits `Result_int_str` into ok/err segments;
+            // a segment naming a struct/enum typedef tag (typedef_tag_or_empty)
+            // threads through the mixed-struct carrier globals so the caller binds
+            // the correctly-named carrier, matching the def side.
+            ensure_carrier_from_tag(canon_ret)
+            let parts = split_result_compound(canon_ret)
+            let ok_struct = typedef_tag_or_empty(parts.first)
+            let err_struct = typedef_tag_or_empty(parts.second)
+            let ok_ct = type_from_name_tag(parts.first)
+            let err_ct = type_from_name_tag(parts.second)
+            expr_result_ok_type = ok_ct
+            expr_result_err_type = err_ct
+            expr_result_ok_struct = ok_struct
+            expr_result_err_struct = err_struct
+            if ok_struct != "" || err_struct != "" {
+                reg_fn_ret_struct_inner(mangled, ok_struct, err_struct)
+            }
+            reg_fn_ret_type(mangled, CT_RESULT, ok_ct, err_ct)
+        } else if ann_elems != -1 && sublist_length(ann_elems) >= 2 {
             let ok_ann = sublist_get(ann_elems, 0)
             let err_ann = sublist_get(ann_elems, 1)
             let ok_name = resolve_tparam_via_tid(node_name(ok_ann), tparams_sl, resolution_args, ret_tids)
@@ -1005,6 +1091,48 @@ fn emit_list_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int 
             expr_result_type = CT_OPTION
             expr_option_inner = CT_MAP
             expr_option_inner_struct = map_struct
+        } else if elem_type == CT_OPTION {
+            // gemr3z: List[Option[T]].pop() -> Option[Option[T]] — mirror the .get()
+            // CT_OPTION branch (the element Option is pointer-boxed on the list).
+            let oi_ct = get_list_elem_option_inner(obj_str)
+            let oi_struct = get_list_elem_option_inner_struct(obj_str)
+            let inner_tag = if oi_struct != "" { c_type_tag_for_struct(oi_struct) } else if oi_ct >= 0 { c_type_tag(oi_ct) } else { "int" }
+            let opt_carrier = "Option_{inner_tag}"
+            ensure_struct_option_type(opt_carrier)
+            let opt_type = struct_option_c_type(opt_carrier)
+            emit_line("{opt_type} {res};")
+            emit_line("if (blink_list_len({obj_str}) > 0) \{")
+            emit_line("    {res}.tag = 1; {res}.value = ({c_type_from_tag(opt_carrier)}*)blink_list_pop({obj_str});")
+            emit_line("} else \{ {res}.tag = 0; }")
+            set_var_option_struct(res, CT_OPTION, opt_carrier)
+            set_var_option_inner2(res, if oi_ct >= 0 { oi_ct } else { CT_INT })
+            if oi_struct != "" {
+                set_var_option_inner2_struct(res, oi_struct)
+            }
+            expr_result_str = res
+            expr_result_type = CT_OPTION
+            expr_option_inner = CT_OPTION
+            expr_option_inner_struct = opt_carrier
+        } else if elem_type == CT_RESULT {
+            // gemr3z: List[Result[T,E]].pop() -> Option[Result[T,E]] — the Result twin.
+            let rok_ct = get_list_elem_result_ok(obj_str)
+            let rerr_ct = get_list_elem_result_err(obj_str)
+            let rok_struct = get_list_elem_result_ok_struct(obj_str)
+            let rerr_struct = get_list_elem_result_err_struct(obj_str)
+            let ok_tag = if rok_struct != "" { c_type_tag_for_struct(rok_struct) } else if rok_ct >= 0 { c_type_tag(rok_ct) } else { "int" }
+            let err_tag = if rerr_struct != "" { c_type_tag_for_struct(rerr_struct) } else if rerr_ct >= 0 { c_type_tag(rerr_ct) } else { "str" }
+            let res_carrier = "Result_{ok_tag}_{err_tag}"
+            ensure_struct_option_type(res_carrier)
+            let opt_type = struct_option_c_type(res_carrier)
+            emit_line("{opt_type} {res};")
+            emit_line("if (blink_list_len({obj_str}) > 0) \{")
+            emit_line("    {res}.tag = 1; {res}.value = ({c_type_from_tag(res_carrier)}*)blink_list_pop({obj_str});")
+            emit_line("} else \{ {res}.tag = 0; }")
+            set_var_option_struct(res, CT_RESULT, res_carrier)
+            expr_result_str = res
+            expr_result_type = CT_OPTION
+            expr_option_inner = CT_RESULT
+            expr_option_inner_struct = res_carrier
         } else {
             ensure_option_type(CT_INT)
             let opt_type = option_c_type(CT_INT)
@@ -1148,6 +1276,56 @@ fn emit_list_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int 
             expr_result_type = CT_OPTION
             expr_option_inner = CT_MAP
             expr_option_inner_struct = map_struct
+        } else if elem_type == CT_OPTION {
+            // gemr3z: List[Option[T]].get() returns Option[Option[T]]. The element
+            // Option is boxed by POINTER on the list (like a struct/map element), so
+            // read it back as a `blink_<carrier>*` and carry it in a struct-option
+            // whose inner IS the element's carrier tag. Mirrors the CT_MAP branch;
+            // the inner Option's own inner (T) is threaded via
+            // expr_option_inner + set_var_option_inner2 so the caller's match on the
+            // unwrapped `Option[T]` decodes T instead of the flattened default.
+            let oi_ct = get_list_elem_option_inner(obj_str)
+            let oi_struct = get_list_elem_option_inner_struct(obj_str)
+            let inner_tag = if oi_struct != "" { c_type_tag_for_struct(oi_struct) } else if oi_ct >= 0 { c_type_tag(oi_ct) } else { "int" }
+            let opt_carrier = "Option_{inner_tag}"
+            ensure_struct_option_type(opt_carrier)
+            let opt_type = struct_option_c_type(opt_carrier)
+            emit_line("{opt_type} {res};")
+            emit_line("if (blink_list_in_bounds({obj_str}, {idx_tmp})) \{")
+            emit_line("    {res}.tag = 1; {res}.value = ({c_type_from_tag(opt_carrier)}*)blink_list_get({obj_str}, {idx_tmp});")
+            emit_line("} else \{ {res}.tag = 0; }")
+            set_var_option_struct(res, CT_OPTION, opt_carrier)
+            let use_oi_ct = if oi_ct >= 0 { oi_ct } else { CT_INT }
+            set_var_option_inner2(res, use_oi_ct)
+            if oi_struct != "" {
+                set_var_option_inner2_struct(res, oi_struct)
+            }
+            expr_result_str = res
+            expr_result_type = CT_OPTION
+            expr_option_inner = CT_OPTION
+            expr_option_inner_struct = opt_carrier
+        } else if elem_type == CT_RESULT {
+            // gemr3z: List[Result[T,E]].get() returns Option[Result[T,E]] — the Result
+            // twin of the CT_OPTION branch. The element Result carrier is pointer-boxed
+            // on the list; carry it in a struct-option keyed on the Result carrier tag.
+            let rok_ct = get_list_elem_result_ok(obj_str)
+            let rerr_ct = get_list_elem_result_err(obj_str)
+            let rok_struct = get_list_elem_result_ok_struct(obj_str)
+            let rerr_struct = get_list_elem_result_err_struct(obj_str)
+            let ok_tag = if rok_struct != "" { c_type_tag_for_struct(rok_struct) } else if rok_ct >= 0 { c_type_tag(rok_ct) } else { "int" }
+            let err_tag = if rerr_struct != "" { c_type_tag_for_struct(rerr_struct) } else if rerr_ct >= 0 { c_type_tag(rerr_ct) } else { "str" }
+            let res_carrier = "Result_{ok_tag}_{err_tag}"
+            ensure_struct_option_type(res_carrier)
+            let opt_type = struct_option_c_type(res_carrier)
+            emit_line("{opt_type} {res};")
+            emit_line("if (blink_list_in_bounds({obj_str}, {idx_tmp})) \{")
+            emit_line("    {res}.tag = 1; {res}.value = ({c_type_from_tag(res_carrier)}*)blink_list_get({obj_str}, {idx_tmp});")
+            emit_line("} else \{ {res}.tag = 0; }")
+            set_var_option_struct(res, CT_RESULT, res_carrier)
+            expr_result_str = res
+            expr_result_type = CT_OPTION
+            expr_option_inner = CT_RESULT
+            expr_option_inner_struct = res_carrier
         } else {
             ensure_option_type(CT_INT)
             let opt_type = option_c_type(CT_INT)
@@ -4286,6 +4464,33 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                 // and mis-emits the outer carrier for the second unwrap.
                 expr_option_inner = get_var_option_inner(val_tmp)
                 expr_option_inner_struct = get_var_option_inner_struct(val_tmp)
+            } else if inner == CT_RESULT && inner_s != "" {
+                // gemr3z: Option[Result[T,E]].unwrap() -> Result[T,E]. The inner
+                // Result carrier (inner_s = Result_<ok>_<err>) is pointer-boxed in the
+                // struct-option value; deref it and rebuild the Result ledger from the
+                // carrier tag so a downstream match/unwrap on the Result decodes ok/err.
+                // Mirrors the CT_OPTION branch above (List[Result[T,E]].get().unwrap()).
+                let opt_c = struct_option_c_type(inner_s)
+                emit_line("{opt_c} {tmp} = {obj_str};")
+                emit_panic_tag_check(tmp, 0, "unwrap called on None", node)
+                let val_tmp = fresh_temp("_ounv_")
+                emit_line("{c_type_c_name(inner_s)} {val_tmp} = *{tmp}.value;")
+                set_var(val_tmp, CT_RESULT, 0)
+                let parts = split_result_compound(canonical_struct_tag(inner_s))
+                let ok_struct = typedef_tag_or_empty(parts.first)
+                let err_struct = typedef_tag_or_empty(parts.second)
+                let ok_ct = type_from_name_tag(parts.first)
+                let err_ct = type_from_name_tag(parts.second)
+                set_var_result(val_tmp, ok_ct, err_ct)
+                if ok_struct != "" || err_struct != "" {
+                    set_var_result_struct(val_tmp, ok_ct, err_ct, ok_struct, err_struct)
+                }
+                expr_result_str = val_tmp
+                expr_result_type = CT_RESULT
+                expr_result_ok_type = ok_ct
+                expr_result_err_type = err_ct
+                expr_result_ok_struct = ok_struct
+                expr_result_err_struct = err_struct
             } else if inner == CT_BYTES {
                 let opt_c = option_c_type(CT_BYTES)
                 emit_line("{opt_c} {tmp} = {obj_str};")
