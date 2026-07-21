@@ -9809,6 +9809,27 @@ fn tc_type_is_enum(tname: Str) -> Int {
     0
 }
 
+// For a `List[( .., <param_name>, .. )]` param, the 0-based slot of the list's
+// tuple ELEMENT that names `param_name` (`List[(Str, T)]` → T is slot 1), or -1
+// when the list element is not a tuple / does not name the param. Reads the
+// element annotation's Tuple children; the tuple annotation node's name is "Tuple".
+fn tc_list_tuple_elem_slot(p: Int, param_name: Str) -> Int {
+    let ta = node_type_ann(p)
+    if ta == -1 { return -1 }
+    let elems_sl = node_elements(ta)
+    if elems_sl == -1 || sublist_length(elems_sl) < 1 { return -1 }
+    let elem_ann = sublist_get(elems_sl, 0)
+    if node_name(elem_ann) != "Tuple" { return -1 }
+    let tup_sl = node_elements(elem_ann)
+    if tup_sl == -1 { return -1 }
+    let mut i = 0
+    while i < sublist_length(tup_sl) {
+        if node_name(sublist_get(tup_sl, i)) == param_name { return i }
+        i = i + 1
+    }
+    -1
+}
+
 // True when param `p`'s annotation is List[<param_name>].
 fn tc_list_param_elem_is(p: Int, param_name: Str) -> Bool {
     let ta = node_type_ann(p)
@@ -9924,6 +9945,30 @@ pub fn tc_mono_csv(call_node: Int, fn_node: Int) -> Option[Str] {
     Some(csv)
 }
 
+// Closure-signature scalar type NAME → its canonical tid, or -1 for anything else.
+// Pure (effect-free) so the Fn arm of tc_resolve_tparam_tid can lower a closure
+// literal's param/return annotation name without pulling in TypeCheck.Resolve (a
+// lookup_named_type fallback would force that effect virally up through tc_mono_tids).
+//
+// The admitted set is deliberately narrower than resolve_type_name's: ONLY the four
+// scalars the STRING path can recover from a closure's C signature — ct_from_c_type
+// (codegen_types.bl) maps back exactly int64_t→Int, double→Float, int→Bool,
+// const char*→Str and nothing else. Restricting to that set keeps the tid seg
+// BYTE-IDENTICAL to the string seg for every closure-bound slot (the D1b invariant).
+// A sized-int/Char annotation renders to int8_t/…/int32_t in the C signature, which
+// ct_from_c_type erases to "Void"; admitting those here would spell "I8"/"Char"
+// instead, a divergence the register-site listop_slot_tid would have to drop to -1 —
+// correct, but it makes the guard load-bearing for no capture gain (a closure typed
+// over a sized int / Char binds no target-corpus tparam). So they stay -1 here and
+// defer to the string path, keeping the tid arm and the string arm genuinely aligned.
+fn tc_scalar_tid_from_name(name: Str) -> Int {
+    if name == "Int" || name == "I64" { return TYPE_INT }
+    if name == "Float" { return TYPE_FLOAT }
+    if name == "Bool" { return TYPE_BOOL }
+    if name == "Str" { return TYPE_STR }
+    -1
+}
+
 // The tid twin of tc_resolve_tparam_seg: return the concrete arg tid that the
 // segment path resolved this type-param to, or -1 when the segment path either
 // found no param position (Some("")) or deferred (None). Positionally aligned
@@ -9932,7 +9977,18 @@ pub fn tc_mono_csv(call_node: Int, fn_node: Int) -> Option[Str] {
 // rely on: tid path == string path for every encodable slot). Mirrors the same
 // param-matching ladder; every arm returns the SAME tid tc_resolve_tparam_seg
 // fed to tc_seg_from_tid / tc_struct_seg_from_arg.
-fn tc_resolve_tparam_tid(param_name: Str, fn_params_sl: Int, args_sl: Int) -> Int {
+//
+// `binds` (typevar-name → concrete tid) resolves the mono-calls-mono case: inside a
+// monomorphized body the nested generic call's arg carries its ORIGINAL memoized tid,
+// which still embeds the enclosing fn's abstract typevar (`run[M]`'s body calls
+// `step(initial)` with initial:M; `outer_result[T]` calls `identity(r)` with
+// r:Result[T,Str]). tc_lookup_node_tid then returns a TK_TYPEVAR / typevar-embedding
+// tid that tc_tid_encodable rejects, forcing the string CSV. Substituting the arg tid
+// through the enclosing instantiation's binding (built at the codegen call site, the
+// only place the M→Model / T→Int map is known) concretizes it BEFORE the arm ladder
+// reads it, so every downstream arm works unchanged. An EMPTY map is a no-op
+// (substitute_typevar_tid returns the tid untouched) — the direct-call path.
+fn tc_resolve_tparam_tid(param_name: Str, fn_params_sl: Int, args_sl: Int, binds: Map[Str, Int]) -> Int {
     let np = sublist_length(fn_params_sl)
     let na = sublist_length(args_sl)
     let mut fi = 0
@@ -9940,7 +9996,7 @@ fn tc_resolve_tparam_tid(param_name: Str, fn_params_sl: Int, args_sl: Int) -> In
         let p = sublist_get(fn_params_sl, fi)
         let ptype = node_type_name(p)
         let arg_node = sublist_get(args_sl, fi)
-        let arg_tid = tc_lookup_node_tid(arg_node)
+        let arg_tid = substitute_typevar_tid(tc_lookup_node_tid(arg_node), binds)
         // monotid channel: the tid twin of the CSV resolver. When arg_tid is -1
         // here for a slot the csvresolve channel then reports, the tid was never
         // memoized onto arg_node — the upstream capture gap, not an encodability
@@ -9958,9 +10014,31 @@ fn tc_resolve_tparam_tid(param_name: Str, fn_params_sl: Int, args_sl: Int) -> In
                 if arg_ty.kind == TK_LIST && tc_list_param_elem_is(p, param_name) {
                     return arg_ty.inner1
                 }
-                if arg_ty.kind == TK_LIST && tc_ann_mentions_param(node_type_ann(p), param_name) {
-                    return -1
+                // `List[(.., T, ..)]` — the element is a TUPLE naming the param at a
+                // fixed slot (std.testing.for_each's `cases: List[(Str, T)]`). The arg's
+                // element tuple tid (arg_ty.inner1) carries the concrete slot type, so
+                // read the slot the annotation names. Mirrors infer_fn_type_args_from_
+                // types' List→Tuple arm (codegen_types.bl:3992), which extracts the same
+                // slot from the registered tuple entry. Only fires when the element tid
+                // is actually a tuple of the annotation's arity; anything else falls
+                // through to keep scanning (the closure param, etc.).
+                let lslot = tc_list_tuple_elem_slot(p, param_name)
+                if lslot >= 0 && arg_ty.kind == TK_LIST && arg_ty.inner1 >= 0 && arg_ty.inner1 < ty_pool.len() {
+                    let elem_ty = ty_pool.get(arg_ty.inner1).unwrap()
+                    if elem_ty.kind == TK_TUPLE && lslot < elem_ty.params_count {
+                        let slot_tid = ty_param_list.get(elem_ty.params_start + lslot).unwrap()
+                        if tc_struct_slot_encodable(slot_tid) { return slot_tid }
+                    }
                 }
+                // A `List[<nested>]` whose element mentions the param but is not the
+                // bare element (`List[(Str, T)]`, `List[Box[T]]`) can't be read from
+                // the flat inner1 slot. The seg twin returns None here — correct there,
+                // because a None aborts the ALL-OR-NOTHING tc_mono_csv and the whole
+                // call falls to infer_fn_type_args_from_types' last-wins scan. This tid
+                // twin is PER-SLOT, so a hard -1 would freeze the binding at this param
+                // even though a LATER param (`body: fn(T) -> Void`, the std.testing
+                // for_each shape) can bind it. Fall through instead — keep scanning; if
+                // no later param binds it the loop still returns -1 at the tail.
             }
         } else if ptype == "Map" {
             if arg_tid >= 0 && arg_tid < ty_pool.len() {
@@ -9981,7 +10059,29 @@ fn tc_resolve_tparam_tid(param_name: Str, fn_params_sl: Int, args_sl: Int) -> In
                 }
             }
         } else if ptype == "Fn" {
-            if tc_fn_param_binds(p, param_name) != -1 {
+            // `f: Fn(T) -> U` names a type-param in a closure position. A closure-
+            // LITERAL arg carries no structured TK_FN tid (infer_type → TYPE_UNKNOWN),
+            // so the binding is read off the literal's own annotations instead: the
+            // return_type string when the param names the Fn return (tc_fn_param_binds
+            // == -2), otherwise the naming Fn-param slot's declared type name. This is
+            // the tid twin of infer_fn_type_args_from_types' Fn arm (codegen_types.bl
+            // 4122), which derives U/T from the closure's C signature via
+            // infer_closure_ret_type / infer_closure_param_type. tc_scalar_tid_from_name
+            // admits only the four scalars that C-signature path can recover (Int/Float/
+            // Bool/Str), so the tid seg stays byte-identical to the string seg; any
+            // richer param/return returns -1 here and defers to the string path. The
+            // register site's listop_slot_tid is the final backstop regardless.
+            let fslot = tc_fn_param_binds(p, param_name)
+            if fslot != -1 {
+                if arg_node != -1 && node_kind(arg_node) == NodeKind.Closure {
+                    if fslot == -2 {
+                        return tc_scalar_tid_from_name(node_return_type(arg_node))
+                    }
+                    let cl_params = node_params(arg_node)
+                    if cl_params != -1 && fslot < sublist_length(cl_params) {
+                        return tc_scalar_tid_from_name(node_type_name(sublist_get(cl_params, fslot)))
+                    }
+                }
                 return -1
             }
         } else if tc_type_is_struct(ptype) != 0 {
@@ -10028,7 +10128,31 @@ fn tc_resolve_tparam_tid(param_name: Str, fn_params_sl: Int, args_sl: Int) -> In
 // where the segment came from a no-param "Void" fill or a deferred slot. Stored
 // on the mono registry (arg_tids) so the def-side emitters can re-derive that
 // slot from the structured tid instead of re-parsing the CSV string.
-pub fn tc_mono_tids(call_node: Int, fn_node: Int) -> List[Int] {
+//
+// mono-calls-mono variant: the same per-tparam derivation, but with the enclosing
+// instantiation's typevar bindings applied to each nested-call arg tid before the
+// arm ladder reads it (see tc_resolve_tparam_tid). `mono_tparams_sl` are the
+// ENCLOSING generic fn's type-param nodes and `mono_arg_tids` its concrete per-
+// tparam tids (cg_mono_tparams_sl / cg_mono_arg_tids at the codegen call site);
+// paired by position into the name→tid map. A -1 or out-of-range enclosing tid is
+// simply not inserted, so an un-captured enclosing slot leaves that typevar
+// abstract and the nested slot stays on the string path (never a wrong bind).
+pub fn tc_mono_tids_subst(call_node: Int, fn_node: Int, mono_tparams_sl: Int, mono_arg_tids: List[Int]) -> List[Int] {
+    let mut binds: Map[Str, Int] = Map()
+    if mono_tparams_sl != -1 {
+        let mut mi = 0
+        while mi < sublist_length(mono_tparams_sl) && mi < mono_arg_tids.len() {
+            let tid = mono_arg_tids.get(mi).unwrap()
+            if tid >= 0 {
+                binds.insert(node_name(sublist_get(mono_tparams_sl, mi)), tid)
+            }
+            mi = mi + 1
+        }
+    }
+    tc_mono_tids_core(call_node, fn_node, binds)
+}
+
+fn tc_mono_tids_core(call_node: Int, fn_node: Int, binds: Map[Str, Int]) -> List[Int] {
     let mut tids: List[Int] = []
     let tparams_sl = node_type_params(fn_node)
     if tparams_sl == -1 { return tids }
@@ -10041,7 +10165,7 @@ pub fn tc_mono_tids(call_node: Int, fn_node: Int) -> List[Int] {
     let mut pi = 0
     while pi < num_params {
         let param_name = node_name(sublist_get(tparams_sl, pi))
-        tids.push(tc_resolve_tparam_tid(param_name, fn_params_sl, args_sl))
+        tids.push(tc_resolve_tparam_tid(param_name, fn_params_sl, args_sl, binds))
         pi = pi + 1
     }
     tids
