@@ -2954,12 +2954,12 @@ pub fn emit_generic_fn_call_tail(node: Int, fn_name: Str, args_str: Str, ca: Gen
                 // `void* value` (br h0n5qe). Register it here — rebuild mono_args
                 // from the annotation elements (the CT_VOID-return precedent below)
                 // and pass real arg tids off the return's value slot.
-                register_map_elem_struct_mono(strip_module_qualifier(v_name), v_ann, tparams_sl, ta_str, tc_tid_map_val_tid(ret_tid))
+                register_map_elem_struct_mono(strip_module_qualifier(v_name), v_ann, tparams_sl, ta_str, tc_tid_map_val_tid(ret_tid), arg_tids)
             }
             if is_struct_type(k_name) != 0 || is_enum_type(k_name) != 0 {
                 map_ret_key_struct = mono_name_from_ann(strip_module_qualifier(k_name), k_ann, tparams_sl, ta_str, segs)
                 if map_ret_key_struct == "" { map_ret_key_struct = strip_module_qualifier(k_name) }
-                register_map_elem_struct_mono(strip_module_qualifier(k_name), k_ann, tparams_sl, ta_str, tc_tid_map_key_tid(ret_tid))
+                register_map_elem_struct_mono(strip_module_qualifier(k_name), k_ann, tparams_sl, ta_str, tc_tid_map_key_tid(ret_tid), arg_tids)
             }
         } else if tid_ct == CT_MAP {
             // Bare-typevar return `-> T` bound to Map[K,V]: recover key/value
@@ -5184,7 +5184,7 @@ fn tparams_sl_contains(tparams_sl: Int, name: Str) -> Int {
 // still an unresolved typevar (a caller that itself is generic — the pure-generic
 // caller edge is out of scope, tracked separately). arg_tids come off the return
 // tid's matching slot so encodable slots lower off tids.
-fn register_map_elem_struct_mono(base: Str, ann: Int, tparams_sl: Int, ta_str: Str, slot_tid: Int) ! Codegen.Register {
+fn register_map_elem_struct_mono(base: Str, ann: Int, tparams_sl: Int, ta_str: Str, slot_tid: Int, fn_arg_tids: List[Int]) ! Codegen.Register {
     let td = find_type_def_node(base)
     if td == -1 { return }
     let td_tparams = node_type_params(td)
@@ -5198,7 +5198,27 @@ fn register_map_elem_struct_mono(base: Str, ann: Int, tparams_sl: Int, ta_str: S
     // register_mono_instance call below. arg_tids is aligned to the ANNOTATION's
     // arg positions, so resolve by element index (resolve_arg_seg_via_slot_tid),
     // NOT by type-param position.
-    let arg_tids = mono_instance_arg_tids_from_tid(slot_tid, base, sublist_length(elems))
+    let mut arg_tids = mono_instance_arg_tids_from_tid(slot_tid, base, sublist_length(elems))
+    // A generic-fn return `-> Map[Str, Box[T]]` erases its value slot to the bare
+    // base `Box` at annotation time (tc_produce_struct_instance_tid skips an
+    // all-typevar instance per the interning rule), so slot_tid is the bare base and
+    // the recovery above returns [] — the def-side then falls to the string CSV
+    // (br msd9xq). Recover each element's tid from the fn-level binds instead: an
+    // element that is a bare tparam (`Box[T]` → `T`) resolves to fn_arg_tids[pi], the
+    // concrete tid inference bound for that tparam. This mirrors resolve_tparam_via_tid
+    // (the CSV segment already resolves the same way), so an encodable slot carries a
+    // real tid and a non-tparam / unencodable element stays -1 — degrading to the
+    // string seg byte-identically (per-slot parity is enforced inline by
+    // resolve_arg_seg_via_slot_tid; see the note above the register call below).
+    if arg_tids.len() == 0 {
+        let mut recovered: List[Int] = []
+        let mut ri = 0
+        while ri < sublist_length(elems) {
+            recovered.push(map_elem_tparam_tid(node_name(sublist_get(elems, ri)), tparams_sl, fn_arg_tids))
+            ri = ri + 1
+        }
+        arg_tids = recovered
+    }
     let mut mono_args = ""
     let mut ai = 0
     while ai < sublist_length(elems) {
@@ -5212,7 +5232,37 @@ fn register_map_elem_struct_mono(base: Str, ann: Int, tparams_sl: Int, ta_str: S
         mono_args = mono_args.concat(resolved_arg)
         ai = ai + 1
     }
+    // Per-slot parity is enforced INLINE, not by a trailing arg_tids_match_mono_args
+    // check: resolve_arg_seg_via_slot_tid (above) spells each slot from
+    // tc_seg_from_tid(arg_tids[ai]) when the recovered tid is encodable, and falls back
+    // to the string CSV segment otherwise. Since tc_seg_from_tid reproduces
+    // resolve_tparam's CSV segment for every encodable slot (the regen-enforced
+    // invariant), mono_args equals the pre-msd9xq CSV string byte-for-byte and every
+    // stored tid already agrees with the segment it produced. A trailing
+    // arg_tids_match_mono_args guard would be circular here (mono_args is DERIVED from
+    // arg_tids, so it can never contradict them) — unlike the struct-lit Class-A path,
+    // where mono_args is computed independently and the guard genuinely cross-checks.
     register_mono_instance(base, mono_args, arg_tids)
+}
+
+// The concrete tid an annotation element resolves to under a fn's tparam binds: when
+// `elem_name` is a declared type-param (`Box[T]` → element `T`), its fn-level bound
+// tid (fn_arg_tids[pi]); else -1 (a non-tparam element like a nested compound, whose
+// tid the caller recovers structurally or leaves to the string seg). Mirrors the
+// tparam-name → arg_tids[pi] lookup in resolve_tparam_via_tid (br msd9xq).
+fn map_elem_tparam_tid(elem_name: Str, tparams_sl: Int, fn_arg_tids: List[Int]) -> Int {
+    if tparams_sl == -1 { return -1 }
+    let mut pi = 0
+    while pi < sublist_length(tparams_sl) {
+        if node_name(sublist_get(tparams_sl, pi)) == elem_name {
+            if pi < fn_arg_tids.len() {
+                return fn_arg_tids.get(pi).unwrap()
+            }
+            return -1
+        }
+        pi = pi + 1
+    }
+    -1
 }
 
 // Register the mono instance for a generic Map's value/key struct off the raw slot
@@ -5544,6 +5594,24 @@ fn emit_struct_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
         // pre-phybxe empty-list fallback).
         if arg_tids_match_mono_args(recovered, mono_args) {
             mono_arg_tids = recovered
+        } else {
+            // The annotation-matched tid belonged to a DIFFERENT nesting level (the
+            // guard above rejected it). For a nested inner literal typecheck also
+            // memoizes the correct own-instance tid directly on the construction node
+            // (tc_struct_lit_instance_tid) — try THAT as a second source, still gated
+            // by the same segment-parity guard so a Void-degraded or mismatched node
+            // tid (e.g. `Box{value:None}` whose slot reverse-infers to Void) is
+            // discarded to [] and the def-side stays on the string seg (br msd9xq).
+            // Confined to this recovery site so the shared mono_args string selector
+            // (tid_native_struct_mono_args) is untouched — the zrybya compound-field
+            // path keeps choosing the faithful annotation slot.
+            let node_tid = tc_lookup_node_tid(node)
+            if node_tid != inst_tid {
+                let node_recovered = mono_instance_arg_tids_from_tid(node_tid, sname, tc_tid_struct_arg_count(node_tid))
+                if node_recovered.len() > 0 && arg_tids_match_mono_args(node_recovered, mono_args) {
+                    mono_arg_tids = node_recovered
+                }
+            }
         }
     }
     let mut struct_key = sname
