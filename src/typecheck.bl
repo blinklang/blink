@@ -1,4 +1,4 @@
-import ast.{NodeKind, node_kind_name, is_block_bearing}
+import ast.{NodeKind, node_kind_name, is_block_bearing, dbg_trace, dbg_channel_on}
 import std.str.{str_to_lower}
 import codegen_types.{is_intrinsic_method, strip_module_qualifier, c_type_tag_for_struct, CT_INT, CT_FLOAT, CT_BOOL, CT_STRING, CT_LIST, CT_VOID, CT_OPTION, CT_RESULT, CT_ITERATOR, CT_HANDLE, CT_CHANNEL, CT_MAP, CT_BYTES, CT_SET, CT_STRUCT, CT_ENUM, CT_I8, CT_I16, CT_I32, CT_U8, CT_U16, CT_U32, CT_U64, CT_CHAR}
 import parser.{
@@ -7317,13 +7317,32 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             if is_import_module_name(obj_name) != 0 && nr_is_defined(obj_name) == 0 && is_intrinsic_method(obj_name, method) == 0 {
                 let sig = lookup_fnsig(method)
                 if sig != -1 {
-                    // Infer args before returning so their node→tid memo is
-                    // populated — the fall-through inference loop below is
-                    // unreachable past this early return, so a module-qualified
-                    // generic call (helper.cmg_identity(42)) would otherwise leave
-                    // its arg tids unset and codegen's tid-driven mono lowering
-                    // (tc_mono_csv) reads Void for a bare-typevar segment.
                     let mq_gen_args = node_args(node)
+                    // A generic module-qualified call must SUBSTITUTE its type
+                    // params into the return type, exactly like the same-module
+                    // bare-Ident path (instantiate_return_type at the callee_kind ==
+                    // Ident arm). Returning the raw fnsig ret leaves a
+                    // generic-struct-instance return memoized as CmgBox[T] with T
+                    // unsubstituted — so the return node's tid carries the typevar
+                    // (unencodable), and every codegen consumer that recovers inner
+                    // tids off that return tid (mono_instance_arg_tids_from_tid ->
+                    // resolve_arg_seg_via_slot_tid / resolve_tparam_via_tid) misses
+                    // the tid path and falls back to the string CSV. Substituting
+                    // here binds T->Int so CmgBox[Int]'s inner slot is the concrete
+                    // Int tid the tid path can spell (br h4hpbq). The scalar-return
+                    // path (`-> T`, cmg_identity) already resolved correctly; this
+                    // additionally fixes the generic-struct-instance return.
+                    // instantiate_return_type infers each arg (build_typevar_binds)
+                    // as a side effect, so the generic path also populates the
+                    // node→tid memo the tid-driven mono lowering (tc_mono_csv) reads.
+                    let mq_fs = fnsig_pool.get(sig).unwrap()
+                    if mq_fs.type_params_count > 0 {
+                        return instantiate_return_type(sig, mq_gen_args)
+                    }
+                    // Non-generic module-qualified call: no substitution, but still
+                    // infer the args so their node→tid memo is populated (the
+                    // fall-through inference loop below is unreachable past this
+                    // early return).
                     if mq_gen_args != -1 {
                         let mut mgi = 0
                         while mgi < sublist_length(mq_gen_args) {
@@ -7331,7 +7350,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                             mgi = mgi + 1
                         }
                     }
-                    return fnsig_pool.get(sig).unwrap().ret
+                    return mq_fs.ret
                 }
             }
             // Static constructor on a sealed builtin type: Bytes.new(), Map.new(),
@@ -9885,7 +9904,17 @@ fn tc_resolve_tparam_tid(param_name: Str, fn_params_sl: Int, args_sl: Int) -> In
     while fi < np && fi < na {
         let p = sublist_get(fn_params_sl, fi)
         let ptype = node_type_name(p)
-        let arg_tid = tc_lookup_node_tid(sublist_get(args_sl, fi))
+        let arg_node = sublist_get(args_sl, fi)
+        let arg_tid = tc_lookup_node_tid(arg_node)
+        // monotid channel: the tid twin of the CSV resolver. When arg_tid is -1
+        // here for a slot the csvresolve channel then reports, the tid was never
+        // memoized onto arg_node — the upstream capture gap, not an encodability
+        // failure. Gated behind dbg_channel_on because this is the hot per-slot
+        // path and the interpolated message would otherwise be built on every
+        // generic-call resolution even with tracing off.
+        if dbg_channel_on("monotid") != 0 {
+            dbg_trace("monotid", "param={param_name} ptype={ptype} fi={fi} arg_node={arg_node} arg_tid={arg_tid}")
+        }
         if ptype == param_name {
             return arg_tid
         } else if ptype == "List" {

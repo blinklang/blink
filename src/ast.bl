@@ -191,3 +191,48 @@ pub fn is_block_bearing(kind: Int) -> Int {
     if kind == NodeKind.WithBlock { return 1 }
     0
 }
+
+// ── Fine-grained internal trace sink ────────────────────────────────
+//
+// The coarse phase tracer (`trace`/`--blink-trace` in compiler.bl) sits at the
+// TOP of the import DAG, so the modules doing the interesting work — typecheck,
+// codegen_types — cannot reach it without an import cycle. That is why the
+// monomorphization / tid-resolution paths have historically had zero
+// instrumentation and every debugging session reached for a throwaway printf +
+// recompile. This sink lives in ast.bl (the DAG root, imported transitively by
+// everyone) so ANY module can emit a fine-grained trace.
+//
+// Channels are opt-in via BLINK_TRACE_CHANNELS (comma-separated, or "all"),
+// wired once at CLI startup into dbg_channels. When unset the guard is a single
+// string compare and nothing is emitted — zero cost, and it never touches
+// generated C, so it is byte-neutral (Gen1==Gen2 unaffected). Taps ship in
+// source permanently: a future session sets the env var instead of editing code.
+pub let mut dbg_channels: Str = ""
+
+// Public so hot-path callers can gate the construction of an interpolated trace
+// message (eagerly evaluated in Blink) behind the channel check, paying nothing
+// when the channel is off.
+pub fn dbg_channel_on(ch: Str) -> Int {
+    if ch == "" { return 0 }
+    if dbg_channels == "" { return 0 }
+    if dbg_channels == "all" { return 1 }
+    // Exact per-channel match against the comma list so "monotid" does not
+    // match a hypothetical "monotidx". Scan comma-delimited segments.
+    let needle = dbg_channels
+    let mut seg_start = 0
+    let mut ci = 0
+    while ci <= needle.len() {
+        if ci == needle.len() || needle.byte_at(ci) == 44 {
+            if needle.substring(seg_start, ci - seg_start) == ch { return 1 }
+            seg_start = ci + 1
+        }
+        ci = ci + 1
+    }
+    0
+}
+
+pub fn dbg_trace(ch: Str, msg: Str) {
+    if dbg_channel_on(ch) != 0 {
+        io.eprintln("[dbg:{ch}] {msg}")
+    }
+}
