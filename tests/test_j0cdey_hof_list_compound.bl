@@ -44,12 +44,141 @@ test "List[Option[Int]] count" {
     assert_eq(c.count(), 4)
 }
 
-// NOTE: the lazy ADAPTER HOFs over a compound source — .map / .filter / .chain /
-// .flat_map / .enumerate / .zip — are deferred to a follow-up (the adapter C
-// templates blink_MapIterator/blink_FilterIterator/… are keyed on the element CT
-// and can't yet deref a per-carrier pointer-boxed compound). The EAGER consumers
-// below (for_each/fold/any/all/find/count/take/skip/collect) all decode the
-// compound element correctly.
+// z9gkt3: the lazy ADAPTER HOFs over a compound source — .map/.filter/.take/
+// .skip/.chain/.flat_map — now decode the pointer-boxed compound element via a
+// per-carrier adapter iterator (blink_MapIterator_Option_int, keyed on the
+// carrier tag not the element CT) that derefs the boxed carrier by value before
+// handing it to the closure. Below: one test per adapter over List[Option[Int]]
+// and List[Result[Int,Str]], plus nested-container compositions and the
+// scalar-forward List[Map[K,V]] path (guards the guard removal).
+
+test "List[Option[Int]] filter().count()" {
+    let c: List[Option[Int]] = [Some(1), None, Some(3)]
+    let n = c.filter(fn(x: Option[Int]) -> Bool { x.is_some() }).count()
+    assert_eq(n, 2)
+}
+
+test "List[Option[Int]] map(is_some).collect() decodes carrier" {
+    let c: List[Option[Int]] = [Some(1), None, Some(3)]
+    // closure RETURNS a scalar Bool — map forward element keys on the return.
+    let flags: List[Bool] = c.map(fn(x: Option[Int]) -> Bool { x.is_some() }).collect()
+    assert_eq(flags.len(), 3)
+    assert(flags.get(0).unwrap())
+    assert(!flags.get(1).unwrap())
+    assert(flags.get(2).unwrap())
+}
+
+test "List[Option[Int]] map(unwrap_or).collect() non-identity" {
+    let c: List[Option[Int]] = [Some(5), None, Some(7)]
+    let vals: List[Int] = c.map(fn(x: Option[Int]) -> Int {
+        match x {
+            Some(v) => v
+            None => 0
+        }
+    }).collect()
+    assert_eq(vals.len(), 3)
+    assert_eq(vals.get(0).unwrap(), 5)
+    assert_eq(vals.get(1).unwrap(), 0)
+    assert_eq(vals.get(2).unwrap(), 7)
+}
+
+test "List[Option[Int]] take(2).collect() keeps carrier" {
+    let c: List[Option[Int]] = [Some(1), None, Some(3), Some(4)]
+    let taken: List[Option[Int]] = c.take(2).collect()
+    assert_eq(taken.len(), 2)
+    match taken.get(0).unwrap() {
+        Some(v) => assert_eq(v, 1)
+        None => assert(false)
+    }
+    assert(taken.get(1).unwrap().is_none())
+}
+
+test "List[Option[Int]] skip(1).collect() keeps carrier" {
+    let c: List[Option[Int]] = [Some(1), None, Some(3)]
+    let rest: List[Option[Int]] = c.skip(1).collect()
+    assert_eq(rest.len(), 2)
+    assert(rest.get(0).unwrap().is_none())
+    match rest.get(1).unwrap() {
+        Some(v) => assert_eq(v, 3)
+        None => assert(false)
+    }
+}
+
+test "List[Option[Int]] chain().count() keeps carrier" {
+    let a: List[Option[Int]] = [Some(1), None]
+    let b: List[Option[Int]] = [Some(3), None, Some(5)]
+    assert_eq(a.chain(b).count(), 5)
+    let joined: List[Option[Int]] = a.chain(b).collect()
+    assert_eq(joined.len(), 5)
+    assert(joined.get(1).unwrap().is_none())
+    match joined.get(2).unwrap() {
+        Some(v) => assert_eq(v, 3)
+        None => assert(false)
+    }
+}
+
+test "List[Option[Int]] flat_map decodes carrier" {
+    let c: List[Option[Int]] = [Some(2), None, Some(3)]
+    let expanded: List[Int] = c.flat_map(fn(x: Option[Int]) -> List[Int] {
+        match x {
+            Some(v) => [v, v]
+            None => []
+        }
+    }).collect()
+    assert_eq(expanded.len(), 4)
+    assert_eq(expanded.get(0).unwrap(), 2)
+    assert_eq(expanded.get(1).unwrap(), 2)
+    assert_eq(expanded.get(2).unwrap(), 3)
+    assert_eq(expanded.get(3).unwrap(), 3)
+}
+
+test "List[Result[Int,Str]] filter().count()" {
+    let c: List[Result[Int, Str]] = [Ok(1), Err("x"), Ok(3)]
+    let n = c.filter(fn(x: Result[Int, Str]) -> Bool { x.is_ok() }).count()
+    assert_eq(n, 2)
+}
+
+test "List[Result[Int,Str]] map().collect()" {
+    let c: List[Result[Int, Str]] = [Ok(4), Err("x"), Ok(6)]
+    let vals: List[Int] = c.map(fn(x: Result[Int, Str]) -> Int {
+        match x {
+            Ok(v) => v
+            Err(_e) => -1
+        }
+    }).collect()
+    assert_eq(vals.len(), 3)
+    assert_eq(vals.get(0).unwrap(), 4)
+    assert_eq(vals.get(1).unwrap(), -1)
+    assert_eq(vals.get(2).unwrap(), 6)
+}
+
+test "List[Option[List[Int]]] filter().count() nested-container carrier" {
+    let a: List[Int] = [1, 2]
+    let b: List[Int] = [3]
+    let c: List[Option[List[Int]]] = [Some(a), None, Some(b)]
+    let n = c.filter(fn(x: Option[List[Int]]) -> Bool { x.is_some() }).count()
+    assert_eq(n, 2)
+}
+
+test "List[Option[Map[Int,Str]]] filter().count() nested-container carrier" {
+    let mut m: Map[Int, Str] = Map()
+    m.insert(1, "a")
+    let c: List[Option[Map[Int, Str]]] = [Some(m), None]
+    let n = c.filter(fn(x: Option[Map[Int, Str]]) -> Bool { x.is_some() }).count()
+    assert_eq(n, 1)
+}
+
+// List[Map[K,V]] element rides the SCALAR forward path (list_compound_carrier_tag
+// returns "" for a bare Map — Map is not Option/Result). Verify that path is
+// correct after the guard removal — do not assume.
+test "List[Map[Int,Str]] filter().count() scalar-forward path" {
+    let mut m1: Map[Int, Str] = Map()
+    m1.insert(1, "a")
+    let mut m2: Map[Int, Str] = Map()
+    let c: List[Map[Int, Str]] = [m1, m2]
+    let n = c.filter(fn(m: Map[Int, Str]) -> Bool { m.len() > 0 }).count()
+    assert_eq(n, 1)
+}
 
 test "List[Option[Int]] find first none" {
     let c: List[Option[Int]] = [Some(1), Some(2), None, Some(4)]
@@ -61,10 +190,11 @@ test "List[Option[Int]] find first none" {
     }
 }
 
-// NOTE: .take / .skip are also lazy ADAPTERS (return a CT_ITERATOR keyed on the
-// element CT) — deferred to z9gkt3 alongside .map/.filter/…: over a List[compound]
-// they lose the pointer-boxed carrier, so a downstream collect/decode is wrong.
-// They now fail loudly (guarded in emit_list_method), not silently.
+// z9gkt3: .take/.skip are lazy ADAPTERS too (return a CT_ITERATOR) — they carry
+// the boxed carrier through verbatim (only the typedef NAME changes so a
+// same-TU scalar iter can't collide) and store the carrier tag on the iterator
+// var's sname channel so a downstream collect/for-in re-decodes it. Exercised by
+// the take/skip .collect() tests above.
 
 test "List[Option[Str]] for_each accumulates" {
     let c: List[Option[Str]] = [Some("a"), None, Some("b")]

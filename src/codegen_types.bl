@@ -1293,6 +1293,20 @@ pub let mut emitted_skip_iters: List[Int] = []
 pub let mut emitted_chain_iters: List[Int] = []
 pub let mut emitted_flat_map_iters: List[Int] = []
 
+// z9gkt3: PARALLEL per-carrier adapter iterator registries, keyed on the carrier
+// tag (`Option_int`, `Result_int_str`, `Option_Map_int_str`) instead of the
+// element CT. A List[compound] element is pointer-boxed and iterated via the
+// CT_INT pointer iterator, so the scalar Int-keyed registries above cannot name a
+// distinct adapter for it. These hold the compound adapters; the scalar Int path
+// stays byte-identical. Each adapter names the typedef `blink_<Kind>Iterator_<tag>`
+// and derefs the boxed carrier by value before handing it to the closure.
+pub let mut emitted_map_iters_c: List[Str] = []
+pub let mut emitted_filter_iters_c: List[Str] = []
+pub let mut emitted_take_iters_c: List[Str] = []
+pub let mut emitted_skip_iters_c: List[Str] = []
+pub let mut emitted_chain_iters_c: List[Str] = []
+pub let mut emitted_flat_map_iters_c: List[Str] = []
+
 // Tuple type registry
 type TupleEntry {
     c_name: Str
@@ -3044,6 +3058,38 @@ pub fn set_list_elem_option_tp(name: Str, inner_tp: Int) {
 // double sv_tp(CT_OPTION, …) here would nest the element as Option[Option[T]].
 pub fn set_list_elem_option(name: Str, inner_ct: Int, inner_struct: Str) {
     set_list_elem_option_tp(name, sv_tp(inner_ct, -1, -1, inner_struct))
+}
+
+// z9gkt3: re-stamp a destination list's COMPOUND element from a carrier tag alone
+// (the iterator-source analogue of copy_list_compound_elem, which reads LIST
+// metadata a var-iterator doesn't have). Used by `collect` after a lazy adapter
+// over a List[compound] — the adapter forwarded the boxed carrier verbatim and
+// stored only its tag. The tag is lossless for Option/Result of scalars, structs,
+// and Maps (tp_carrier_tag spells those fully); a List/Set inner is intentionally
+// flat in the tag (`Option_list`), so its own element defaults — collect-then-
+// decode of a List/Set inner through an adapter is not reachable in the tested
+// surface and would need the source list's metadata, not the tag.
+pub fn set_list_elem_compound_from_tag(name: Str, carrier: Str) {
+    if carrier.starts_with("Option_") {
+        let inner_tag = carrier.slice(7, carrier.len())
+        let inner_ct = type_from_name_tag(inner_tag)
+        if is_compound_tag(inner_tag) != 0 {
+            set_list_elem_option_tp(name, sv_tp(inner_ct, -1, -1, inner_tag))
+        } else if is_struct_type(inner_tag) != 0 || is_enum_type(inner_tag) != 0 {
+            set_list_elem_option(name, CT_INT, inner_tag)
+        } else {
+            set_list_elem_option(name, inner_ct, "")
+        }
+    } else if carrier.starts_with("Result_") {
+        let parts = split_result_compound(canonical_struct_tag(carrier))
+        if parts.second != "" {
+            let ok_ct = type_from_name_tag(parts.first)
+            let err_ct = type_from_name_tag(parts.second)
+            let ok_struct = if is_struct_type(parts.first) != 0 || is_enum_type(parts.first) != 0 { parts.first } else { "" }
+            let err_struct = if is_struct_type(parts.second) != 0 || is_enum_type(parts.second) != 0 { parts.second } else { "" }
+            set_list_elem_result(name, ok_ct, ok_struct, err_ct, err_struct)
+        }
+    }
 }
 
 // whg65a: the Result twin of set_list_elem_option_tp — record
@@ -6174,6 +6220,28 @@ pub fn get_var_iter_next_fn(name: Str) -> Str {
     get_sv_extra(name, CT_ITERATOR)
 }
 
+// z9gkt3: an adapter over a List[compound] source keys its typedef on the carrier
+// tag but reports its element CT as CT_INT (pointer-boxed). Stash the carrier tag
+// on the CT_ITERATOR var's otherwise-unused `sname` slot so a chained downstream
+// adapter (via iter_from_source's var-iterator branch) or a collect/for-in
+// re-derives the deref and re-stamps the compound result element. Empty for a
+// scalar iterator.
+pub fn set_var_iter_carrier(name: Str, carrier: Str) {
+    let mut i = scope_vars.len() - 1
+    while i >= 0 {
+        let sv = scope_vars.get(i).unwrap()
+        if sv.name == name && tp_get_kind(sv.tp_id) == CT_ITERATOR {
+            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: sv.inner2, sname: carrier, sname2: sv.sname2, extra: sv.extra, tp_id: sv.tp_id })
+            return
+        }
+        i = i - 1
+    }
+}
+
+pub fn get_var_iter_carrier(name: Str) -> Str {
+    get_sv_sname(name, CT_ITERATOR)
+}
+
 pub fn set_var_alias(name: Str, target: Str) {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
@@ -6834,9 +6902,40 @@ pub fn emit_all_iter_types() ! Codegen.Emit {
         emit_flat_map_iter_typedef(emitted_flat_map_iters.get(i).unwrap())
         i = i + 1
     }
+    // z9gkt3: the per-carrier compound adapters (main pass drains from 0).
+    i = 0
+    while i < emitted_map_iters_c.len() {
+        emit_map_iter_typedef_c(emitted_map_iters_c.get(i).unwrap())
+        i = i + 1
+    }
+    i = 0
+    while i < emitted_filter_iters_c.len() {
+        emit_filter_iter_typedef_c(emitted_filter_iters_c.get(i).unwrap())
+        i = i + 1
+    }
+    i = 0
+    while i < emitted_take_iters_c.len() {
+        emit_take_iter_typedef_c(emitted_take_iters_c.get(i).unwrap())
+        i = i + 1
+    }
+    i = 0
+    while i < emitted_skip_iters_c.len() {
+        emit_skip_iter_typedef_c(emitted_skip_iters_c.get(i).unwrap())
+        i = i + 1
+    }
+    i = 0
+    while i < emitted_chain_iters_c.len() {
+        emit_chain_iter_typedef_c(emitted_chain_iters_c.get(i).unwrap())
+        i = i + 1
+    }
+    i = 0
+    while i < emitted_flat_map_iters_c.len() {
+        emit_flat_map_iter_typedef_c(emitted_flat_map_iters_c.get(i).unwrap())
+        i = i + 1
+    }
 }
 
-pub fn emit_iter_types_from(list_start: Int, map_start: Int, filter_start: Int, take_start: Int, skip_start: Int, chain_start: Int, flat_map_start: Int) ! Codegen.Emit {
+pub fn emit_iter_types_from(list_start: Int, map_start: Int, filter_start: Int, take_start: Int, skip_start: Int, chain_start: Int, flat_map_start: Int, map_c_start: Int, filter_c_start: Int, take_c_start: Int, skip_c_start: Int, chain_c_start: Int, flat_map_c_start: Int) ! Codegen.Emit {
     let mut i = list_start
     while i < emitted_iter_types.len() {
         emit_list_iter_typedef(emitted_iter_types.get(i).unwrap())
@@ -6870,6 +6969,39 @@ pub fn emit_iter_types_from(list_start: Int, map_start: Int, filter_start: Int, 
     i = flat_map_start
     while i < emitted_flat_map_iters.len() {
         emit_flat_map_iter_typedef(emitted_flat_map_iters.get(i).unwrap())
+        i = i + 1
+    }
+    // z9gkt3: the per-carrier compound adapters (the static _next fn is emitted
+    // OUTSIDE the #ifndef typedef guard, so re-emitting a compound iter in the same
+    // TU is a C redefinition error — drain from the per-test snapshot, not 0).
+    i = map_c_start
+    while i < emitted_map_iters_c.len() {
+        emit_map_iter_typedef_c(emitted_map_iters_c.get(i).unwrap())
+        i = i + 1
+    }
+    i = filter_c_start
+    while i < emitted_filter_iters_c.len() {
+        emit_filter_iter_typedef_c(emitted_filter_iters_c.get(i).unwrap())
+        i = i + 1
+    }
+    i = take_c_start
+    while i < emitted_take_iters_c.len() {
+        emit_take_iter_typedef_c(emitted_take_iters_c.get(i).unwrap())
+        i = i + 1
+    }
+    i = skip_c_start
+    while i < emitted_skip_iters_c.len() {
+        emit_skip_iter_typedef_c(emitted_skip_iters_c.get(i).unwrap())
+        i = i + 1
+    }
+    i = chain_c_start
+    while i < emitted_chain_iters_c.len() {
+        emit_chain_iter_typedef_c(emitted_chain_iters_c.get(i).unwrap())
+        i = i + 1
+    }
+    i = flat_map_c_start
+    while i < emitted_flat_map_iters_c.len() {
+        emit_flat_map_iter_typedef_c(emitted_flat_map_iters_c.get(i).unwrap())
         i = i + 1
     }
 }
@@ -6919,6 +7051,63 @@ pub fn ensure_flat_map_iter(inner: Int) {
     if has_int_in_list(emitted_flat_map_iters, inner) { return }
     emitted_flat_map_iters.push(inner)
     ensure_option_type(inner)
+}
+
+fn has_str_in_list(lst: List[Str], val: Str) -> Bool {
+    let mut i = 0
+    while i < lst.len() {
+        if lst.get(i).unwrap() == val {
+            return true
+        }
+        i = i + 1
+    }
+    false
+}
+
+// z9gkt3: register a per-carrier compound adapter. The carrier typedef the adapter
+// derefs is ensured (ensure_carrier_from_tag), and the boxed-pointer option the
+// iterator carries is blink_Option_int (the list stores compound elements as
+// intptr, iterated via the CT_INT pointer iterator).
+pub fn ensure_map_iter_c(carrier: Str) {
+    if has_str_in_list(emitted_map_iters_c, carrier) { return }
+    emitted_map_iters_c.push(carrier)
+    ensure_carrier_from_tag(carrier)
+    ensure_option_type(CT_INT)
+}
+
+pub fn ensure_filter_iter_c(carrier: Str) {
+    if has_str_in_list(emitted_filter_iters_c, carrier) { return }
+    emitted_filter_iters_c.push(carrier)
+    ensure_carrier_from_tag(carrier)
+    ensure_option_type(CT_INT)
+}
+
+pub fn ensure_take_iter_c(carrier: Str) {
+    if has_str_in_list(emitted_take_iters_c, carrier) { return }
+    emitted_take_iters_c.push(carrier)
+    ensure_carrier_from_tag(carrier)
+    ensure_option_type(CT_INT)
+}
+
+pub fn ensure_skip_iter_c(carrier: Str) {
+    if has_str_in_list(emitted_skip_iters_c, carrier) { return }
+    emitted_skip_iters_c.push(carrier)
+    ensure_carrier_from_tag(carrier)
+    ensure_option_type(CT_INT)
+}
+
+pub fn ensure_chain_iter_c(carrier: Str) {
+    if has_str_in_list(emitted_chain_iters_c, carrier) { return }
+    emitted_chain_iters_c.push(carrier)
+    ensure_carrier_from_tag(carrier)
+    ensure_option_type(CT_INT)
+}
+
+pub fn ensure_flat_map_iter_c(carrier: Str) {
+    if has_str_in_list(emitted_flat_map_iters_c, carrier) { return }
+    emitted_flat_map_iters_c.push(carrier)
+    ensure_carrier_from_tag(carrier)
+    ensure_option_type(CT_INT)
 }
 
 fn emit_map_iter_typedef(inner: Int) ! Codegen.Emit {
@@ -7043,6 +7232,128 @@ fn emit_flat_map_iter_typedef(inner: Int) ! Codegen.Emit {
     emit_line("        {opt} __src = self->source_next(self->source);")
     emit_line("        if (__src.tag == 0) return ({opt})\{ .tag = 0 };")
     emit_line("        self->buffer = ((blink_list* (*)(const blink_closure*, {c_inner}))self->fn->fn_ptr)(self->fn, __src.value);")
+    emit_line("        self->buf_idx = 0;")
+    emit_line("    }")
+    emit_line("}")
+    emit_line("")
+}
+
+// z9gkt3: the per-carrier compound adapter typedef emitters. Each names the
+// typedef `blink_<Kind>Iterator_<carrier>` (distinct from the scalar `_int`),
+// carries the boxed-pointer option `blink_Option_int` throughout, and — where the
+// scalar template reads `__src.value` as the raw element — derefs the boxed
+// carrier by value with `(*(blink_<carrier>*)(intptr_t)__src.value)` (the
+// hof_elem_value pattern) before handing it to the closure. take/skip/chain have
+// no closure — only the typedef NAME changes; they forward `__src` verbatim so the
+// boxed carrier survives to a downstream collect/for-in.
+fn emit_map_iter_typedef_c(carrier: Str) ! Codegen.Emit {
+    let opt = option_c_type(CT_INT)
+    let carrier_c = c_type_from_tag(carrier)
+    emit_td_guard_open("blink_MapIterator_{carrier}")
+    emit_line("typedef struct \{ void* source; {opt} (*source_next)(void*); blink_closure* fn; } blink_MapIterator_{carrier};")
+    emit_td_guard_close()
+    emit_line("")
+    emit_line("static {opt} blink_MapIterator_{carrier}_next(void* __self) \{")
+    emit_line("    blink_MapIterator_{carrier}* self = (blink_MapIterator_{carrier}*)__self;")
+    emit_line("    {opt} __src = self->source_next(self->source);")
+    emit_line("    if (__src.tag == 0) return ({opt})\{ .tag = 0 };")
+    emit_line("    int64_t __val = ((int64_t (*)(const blink_closure*, {carrier_c}))self->fn->fn_ptr)(self->fn, (*({carrier_c}*)(intptr_t)__src.value));")
+    emit_line("    return ({opt})\{ .tag = 1, .value = __val };")
+    emit_line("}")
+    emit_line("")
+}
+
+fn emit_filter_iter_typedef_c(carrier: Str) ! Codegen.Emit {
+    let opt = option_c_type(CT_INT)
+    let carrier_c = c_type_from_tag(carrier)
+    emit_td_guard_open("blink_FilterIterator_{carrier}")
+    emit_line("typedef struct \{ void* source; {opt} (*source_next)(void*); blink_closure* fn; } blink_FilterIterator_{carrier};")
+    emit_td_guard_close()
+    emit_line("")
+    emit_line("static {opt} blink_FilterIterator_{carrier}_next(void* __self) \{")
+    emit_line("    blink_FilterIterator_{carrier}* self = (blink_FilterIterator_{carrier}*)__self;")
+    emit_line("    while (1) \{")
+    emit_line("        {opt} __src = self->source_next(self->source);")
+    emit_line("        if (__src.tag == 0) return ({opt})\{ .tag = 0 };")
+    emit_line("        if (((int (*)(const blink_closure*, {carrier_c}))self->fn->fn_ptr)(self->fn, (*({carrier_c}*)(intptr_t)__src.value))) \{")
+    emit_line("            return __src;")
+    emit_line("        }")
+    emit_line("    }")
+    emit_line("}")
+    emit_line("")
+}
+
+fn emit_take_iter_typedef_c(carrier: Str) ! Codegen.Emit {
+    let opt = option_c_type(CT_INT)
+    emit_td_guard_open("blink_TakeIterator_{carrier}")
+    emit_line("typedef struct \{ void* source; {opt} (*source_next)(void*); int64_t limit; int64_t count; } blink_TakeIterator_{carrier};")
+    emit_td_guard_close()
+    emit_line("")
+    emit_line("static {opt} blink_TakeIterator_{carrier}_next(void* __self) \{")
+    emit_line("    blink_TakeIterator_{carrier}* self = (blink_TakeIterator_{carrier}*)__self;")
+    emit_line("    if (self->count >= self->limit) return ({opt})\{ .tag = 0 };")
+    emit_line("    {opt} __src = self->source_next(self->source);")
+    emit_line("    if (__src.tag == 0) return __src;")
+    emit_line("    self->count++;")
+    emit_line("    return __src;")
+    emit_line("}")
+    emit_line("")
+}
+
+fn emit_skip_iter_typedef_c(carrier: Str) ! Codegen.Emit {
+    let opt = option_c_type(CT_INT)
+    emit_td_guard_open("blink_SkipIterator_{carrier}")
+    emit_line("typedef struct \{ void* source; {opt} (*source_next)(void*); int64_t skip_n; int64_t skipped; } blink_SkipIterator_{carrier};")
+    emit_td_guard_close()
+    emit_line("")
+    emit_line("static {opt} blink_SkipIterator_{carrier}_next(void* __self) \{")
+    emit_line("    blink_SkipIterator_{carrier}* self = (blink_SkipIterator_{carrier}*)__self;")
+    emit_line("    while (self->skipped < self->skip_n) \{")
+    emit_line("        {opt} __src = self->source_next(self->source);")
+    emit_line("        if (__src.tag == 0) return __src;")
+    emit_line("        self->skipped++;")
+    emit_line("    }")
+    emit_line("    return self->source_next(self->source);")
+    emit_line("}")
+    emit_line("")
+}
+
+fn emit_chain_iter_typedef_c(carrier: Str) ! Codegen.Emit {
+    let opt = option_c_type(CT_INT)
+    emit_td_guard_open("blink_ChainIterator_{carrier}")
+    emit_line("typedef struct \{ void* source_a; {opt} (*next_a)(void*); void* source_b; {opt} (*next_b)(void*); int phase; } blink_ChainIterator_{carrier};")
+    emit_td_guard_close()
+    emit_line("")
+    emit_line("static {opt} blink_ChainIterator_{carrier}_next(void* __self) \{")
+    emit_line("    blink_ChainIterator_{carrier}* self = (blink_ChainIterator_{carrier}*)__self;")
+    emit_line("    if (self->phase == 0) \{")
+    emit_line("        {opt} __src = self->next_a(self->source_a);")
+    emit_line("        if (__src.tag != 0) return __src;")
+    emit_line("        self->phase = 1;")
+    emit_line("    }")
+    emit_line("    return self->next_b(self->source_b);")
+    emit_line("}")
+    emit_line("")
+}
+
+fn emit_flat_map_iter_typedef_c(carrier: Str) ! Codegen.Emit {
+    let opt = option_c_type(CT_INT)
+    let carrier_c = c_type_from_tag(carrier)
+    emit_td_guard_open("blink_FlatMapIterator_{carrier}")
+    emit_line("typedef struct \{ void* source; {opt} (*source_next)(void*); blink_closure* fn; blink_list* buffer; int64_t buf_idx; } blink_FlatMapIterator_{carrier};")
+    emit_td_guard_close()
+    emit_line("")
+    emit_line("static {opt} blink_FlatMapIterator_{carrier}_next(void* __self) \{")
+    emit_line("    blink_FlatMapIterator_{carrier}* self = (blink_FlatMapIterator_{carrier}*)__self;")
+    emit_line("    while (1) \{")
+    emit_line("        if (self->buffer && self->buf_idx < blink_list_len(self->buffer)) \{")
+    emit_line("            int64_t val = (int64_t)(intptr_t)blink_list_get(self->buffer, self->buf_idx);")
+    emit_line("            self->buf_idx++;")
+    emit_line("            return ({opt})\{ .tag = 1, .value = val };")
+    emit_line("        }")
+    emit_line("        {opt} __src = self->source_next(self->source);")
+    emit_line("        if (__src.tag == 0) return ({opt})\{ .tag = 0 };")
+    emit_line("        self->buffer = ((blink_list* (*)(const blink_closure*, {carrier_c}))self->fn->fn_ptr)(self->fn, (*({carrier_c}*)(intptr_t)__src.value));")
     emit_line("        self->buf_idx = 0;")
     emit_line("    }")
     emit_line("}")

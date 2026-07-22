@@ -14,6 +14,9 @@ import codegen_types.{
     closure_cap_infos, closure_captures, closure_ret_ct, closure_sig_ret_part,
     emit_line, ensure_chain_iter, ensure_filter_iter, ensure_flat_map_iter,
     ensure_map_iter, ensure_mixed_result_type, ensure_option_type, ev_field,
+    ensure_chain_iter_c, ensure_filter_iter_c, ensure_flat_map_iter_c,
+    ensure_map_iter_c, ensure_take_iter_c, ensure_skip_iter_c,
+    set_var_iter_carrier, set_list_elem_compound_from_tag,
     ensure_result_type, ensure_skip_iter, ensure_struct_option_type,
     ensure_struct_result_type, ensure_take_iter,
     find_from_impl, find_impl_method_node, impl_method_self_name, find_tryfrom_impl, fresh_temp,
@@ -3783,19 +3786,18 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
 
         // --- Adapter methods: return CT_ITERATOR ---
 
-        // j0cdey / z9gkt3: the lazy ADAPTER HOFs over a List whose element is a
-        // pointer-boxed COMPOUND (Option/Result) are not yet supported — the
-        // adapter iterator typedefs (blink_MapIterator_<tag> / _Filter_ / _Take_ /
-        // _Skip_ / _Chain_ / _FlatMap_) plus the eager _Enumerate_/_Zip_
-        // materializers are keyed on the element CT and would read the boxed
-        // carrier's pointer bits as an int64 (map/filter hand them to the closure —
-        // a SILENT miscompile; take/skip forward them into an iterator whose element
-        // CT is now wrong, so a downstream collect/decode fails). Fail LOUDLY here
-        // (the codebase's convention for a deferred path, cf. PolyImplUnsupported)
-        // instead of emitting wrong C; the EAGER consumers below (collect/for_each/…)
-        // already deref correctly.
-        if obj_type == CT_LIST && (method == "map" || method == "filter" || method == "take" || method == "skip" || method == "chain" || method == "flat_map" || method == "enumerate" || method == "zip") && is_compound_ct(get_list_elem_type(obj_str)) != 0 {
-            diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "'.{method}' over a List of Option/Result elements is not yet supported (br z9gkt3)", node, "collect into a concrete list first, or use an eager HOF (for_each/fold/filter-via-loop)")
+        // z9gkt3: the lazy ADAPTER HOFs .map/.filter/.take/.skip/.chain/.flat_map
+        // over a List[compound] now route through per-carrier adapter iterators
+        // (blink_MapIterator_Option_int, …) that deref the pointer-boxed carrier.
+        // .enumerate/.zip remain deferred (44xww4): they are EAGER inline
+        // materializers that build an inner pair list, and threading the compound
+        // element's metadata onto that inner pair channel (so a `for (i,x)`
+        // destructuring re-decodes it) is a separate piece. They still take the
+        // CT_INT branch and would push the boxed carrier's pointer bits without
+        // re-stamping the result element — fail LOUDLY (cf. PolyImplUnsupported)
+        // instead of emitting a silently wrong pair list.
+        if obj_type == CT_LIST && (method == "enumerate" || method == "zip") && is_compound_ct(get_list_elem_type(obj_str)) != 0 {
+            diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "'.{method}' over a List of Option/Result elements is not yet supported (br 44xww4)", node, "collect into a concrete list first, or use an eager HOF (for_each/fold/filter-via-loop)")
             expr_result_str = "0"
             expr_result_type = CT_VOID
             return
@@ -3805,10 +3807,46 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             let args_sl = node_args(node)
             emit_expr(sublist_get(args_sl, 0))
             let fn_str = expr_result_str
+            let map_ret_part = closure_sig_ret_part(expr_closure_sig)
             iter_from_source(obj_str, obj_type)
             let src_var = ifs_iter_var
             let src_next = ifs_next_fn
             let elem_type = ifs_elem_type
+            let carrier = ifs_carrier_tag
+            if carrier != "" {
+                // z9gkt3: a compound source. The adapter derefs the boxed carrier
+                // for the closure INPUT; its forward element keys on the closure
+                // RETURN (a scalar in the tested surface), carried as CT_INT in
+                // blink_Option_int exactly as the scalar map coerces every return
+                // to int64 (r1s7g2 re-derives the collect result type).
+                //
+                // s663bm: that int64 coercion is only sound for a single-register
+                // return (int64_t / double / const char* / int). A BY-VALUE
+                // multi-eightbyte return — a struct or a compound carrier
+                // (blink_Option_*, blink_Result_*) — is returned in RAX:RDX under
+                // SysV; the int64 cast captures only RAX and drops the payload
+                // eightbyte, so the collected element is garbage and the read-back
+                // deref segfaults. The SCALAR map path has the same latent bug
+                // (s663bm) but is shielded by a typecheck mismatch there; the
+                // compound path lost the old loud guard, so re-guard THIS case
+                // loudly rather than extend a silent miscompile. Remove once s663bm
+                // boxes the by-value return.
+                if map_ret_part.starts_with("blink_") {
+                    diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "'.map' over a List of Option/Result elements with a by-value struct/compound closure return is not yet supported (br s663bm)", node, "return a scalar (Int/Bool/Str/Float) from the closure, or collect first then map")
+                    expr_result_str = "0"
+                    expr_result_type = CT_VOID
+                    return
+                }
+                ensure_map_iter_c(carrier)
+                let adapter_var = fresh_temp("__map_")
+                emit_line("blink_MapIterator_{carrier} {adapter_var} = \{ .source = &{src_var}, .source_next = ({ifs_opt_type} (*)(void*)){src_next}, .fn = {fn_str} };")
+                set_var_iterator(adapter_var, CT_INT, "blink_MapIterator_{carrier}_next")
+                expr_result_str = adapter_var
+                expr_result_type = CT_ITERATOR
+                expr_iter_next_fn = "blink_MapIterator_{carrier}_next"
+                expr_list_elem_type = CT_INT
+                return
+            }
             let tag = c_type_tag(elem_type)
             ensure_map_iter(elem_type)
             let adapter_var = fresh_temp("__map_")
@@ -3828,6 +3866,23 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             let src_var = ifs_iter_var
             let src_next = ifs_next_fn
             let elem_type = ifs_elem_type
+            let carrier = ifs_carrier_tag
+            if carrier != "" {
+                // z9gkt3: predicate takes the derefed carrier by value; the boxed
+                // carrier passes through unchanged, so the result element is still
+                // the compound. Store the carrier on the iterator var so a chained
+                // adapter or terminal collect/for-in re-decodes it.
+                ensure_filter_iter_c(carrier)
+                let adapter_var = fresh_temp("__filter_")
+                emit_line("blink_FilterIterator_{carrier} {adapter_var} = \{ .source = &{src_var}, .source_next = ({ifs_opt_type} (*)(void*)){src_next}, .fn = {fn_str} };")
+                set_var_iterator(adapter_var, CT_INT, "blink_FilterIterator_{carrier}_next")
+                set_var_iter_carrier(adapter_var, carrier)
+                expr_result_str = adapter_var
+                expr_result_type = CT_ITERATOR
+                expr_iter_next_fn = "blink_FilterIterator_{carrier}_next"
+                expr_list_elem_type = compound_tag_ct(carrier)
+                return
+            }
             let tag = c_type_tag(elem_type)
             ensure_filter_iter(elem_type)
             let adapter_var = fresh_temp("__filter_")
@@ -3847,6 +3902,22 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             let src_var = ifs_iter_var
             let src_next = ifs_next_fn
             let elem_type = ifs_elem_type
+            let carrier = ifs_carrier_tag
+            if carrier != "" {
+                // z9gkt3: no closure — forward the boxed carrier verbatim (only the
+                // typedef NAME differs from the scalar _int, so a same-TU scalar
+                // take can't collide). Carrier stored on the var for the downstream.
+                ensure_take_iter_c(carrier)
+                let adapter_var = fresh_temp("__take_")
+                emit_line("blink_TakeIterator_{carrier} {adapter_var} = \{ .source = &{src_var}, .source_next = ({ifs_opt_type} (*)(void*)){src_next}, .limit = {n_str}, .count = 0 };")
+                set_var_iterator(adapter_var, CT_INT, "blink_TakeIterator_{carrier}_next")
+                set_var_iter_carrier(adapter_var, carrier)
+                expr_result_str = adapter_var
+                expr_result_type = CT_ITERATOR
+                expr_iter_next_fn = "blink_TakeIterator_{carrier}_next"
+                expr_list_elem_type = compound_tag_ct(carrier)
+                return
+            }
             let tag = c_type_tag(elem_type)
             ensure_take_iter(elem_type)
             let adapter_var = fresh_temp("__take_")
@@ -3866,6 +3937,19 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             let src_var = ifs_iter_var
             let src_next = ifs_next_fn
             let elem_type = ifs_elem_type
+            let carrier = ifs_carrier_tag
+            if carrier != "" {
+                ensure_skip_iter_c(carrier)
+                let adapter_var = fresh_temp("__skip_")
+                emit_line("blink_SkipIterator_{carrier} {adapter_var} = \{ .source = &{src_var}, .source_next = ({ifs_opt_type} (*)(void*)){src_next}, .skip_n = {n_str}, .skipped = 0 };")
+                set_var_iterator(adapter_var, CT_INT, "blink_SkipIterator_{carrier}_next")
+                set_var_iter_carrier(adapter_var, carrier)
+                expr_result_str = adapter_var
+                expr_result_type = CT_ITERATOR
+                expr_iter_next_fn = "blink_SkipIterator_{carrier}_next"
+                expr_list_elem_type = compound_tag_ct(carrier)
+                return
+            }
             let tag = c_type_tag(elem_type)
             ensure_skip_iter(elem_type)
             let adapter_var = fresh_temp("__skip_")
@@ -3887,10 +3971,27 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             let next_a = ifs_next_fn
             let elem_type = ifs_elem_type
             let opt_t = ifs_opt_type
+            let carrier = ifs_carrier_tag
             let tag = c_type_tag(elem_type)
             iter_from_source(other_str, other_type)
             let src_b_var = ifs_iter_var
             let next_b = ifs_next_fn
+            if carrier != "" {
+                // z9gkt3: both sources are the same List[compound] carrier and their
+                // pointer iterators both yield blink_Option_int, so a single
+                // carrier-keyed chain iter forwards the boxed carrier verbatim. opt_t
+                // is blink_Option_int (from the compound iter_from_source) for both.
+                ensure_chain_iter_c(carrier)
+                let adapter_var = fresh_temp("__chain_")
+                emit_line("blink_ChainIterator_{carrier} {adapter_var} = \{ .source_a = &{src_a_var}, .next_a = ({opt_t} (*)(void*)){next_a}, .source_b = &{src_b_var}, .next_b = ({opt_t} (*)(void*)){next_b}, .phase = 0 };")
+                set_var_iterator(adapter_var, CT_INT, "blink_ChainIterator_{carrier}_next")
+                set_var_iter_carrier(adapter_var, carrier)
+                expr_result_str = adapter_var
+                expr_result_type = CT_ITERATOR
+                expr_iter_next_fn = "blink_ChainIterator_{carrier}_next"
+                expr_list_elem_type = compound_tag_ct(carrier)
+                return
+            }
             ensure_chain_iter(elem_type)
             let adapter_var = fresh_temp("__chain_")
             emit_line("blink_ChainIterator_{tag} {adapter_var} = \{ .source_a = &{src_a_var}, .next_a = ({opt_t} (*)(void*)){next_a}, .source_b = &{src_b_var}, .next_b = ({opt_t} (*)(void*)){next_b}, .phase = 0 };")
@@ -3909,6 +4010,22 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             let src_var = ifs_iter_var
             let src_next = ifs_next_fn
             let elem_type = ifs_elem_type
+            let carrier = ifs_carrier_tag
+            if carrier != "" {
+                // z9gkt3: the callback takes the derefed carrier and returns a
+                // flattened List; the buffer elements are the flattened scalars
+                // (CT_INT slot in blink_Option_int), so the forward element is CT_INT
+                // — no compound carrier survives the flatten.
+                ensure_flat_map_iter_c(carrier)
+                let adapter_var = fresh_temp("__flatmap_")
+                emit_line("blink_FlatMapIterator_{carrier} {adapter_var} = \{ .source = &{src_var}, .source_next = ({ifs_opt_type} (*)(void*)){src_next}, .fn = {fn_str}, .buffer = NULL, .buf_idx = 0 };")
+                set_var_iterator(adapter_var, CT_INT, "blink_FlatMapIterator_{carrier}_next")
+                expr_result_str = adapter_var
+                expr_result_type = CT_ITERATOR
+                expr_iter_next_fn = "blink_FlatMapIterator_{carrier}_next"
+                expr_list_elem_type = CT_INT
+                return
+            }
             let tag = c_type_tag(elem_type)
             ensure_flat_map_iter(elem_type)
             let adapter_var = fresh_temp("__flatmap_")
@@ -4027,7 +4144,14 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             cg_indent = cg_indent - 1
             emit_line("}")
             if carrier != "" {
-                copy_list_compound_elem(obj_str, result_list)
+                // z9gkt3: a direct List source has full element metadata to copy; a
+                // var-iterator source (a chained lazy adapter — filter().collect())
+                // carries only the carrier tag on its sname, so re-stamp from the tag.
+                if obj_type == CT_LIST {
+                    copy_list_compound_elem(obj_str, result_list)
+                } else {
+                    set_list_elem_compound_from_tag(result_list, carrier)
+                }
                 expr_result_str = result_list
                 expr_result_type = CT_LIST
                 expr_list_elem_type = compound_tag_ct(carrier)
