@@ -3161,6 +3161,23 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
         let rhs_deep = get_var_option_inner_tp(val_str)
         if rhs_deep >= 0 {
             set_var_option_inner_tp(name, rhs_deep)
+        } else if type_ann != -1 && node_name(type_ann) == "Option" {
+            // 7s0wjh: a CONSTRUCTED `let x: Option[Option[List[Int]]] =
+            // Some(Some(inner))` has no RHS var to source the deep tp from — the
+            // Some(Some(..)) temp carries none — so the flat set_var_option_struct
+            // above collapses x to Option[Option[Int]]. When the annotation itself
+            // spells the full depth AND the inner is a container (matching
+            // get_var_option_inner_tp's own guard), rebuild the deep inner tp
+            // losslessly from the annotation via deep_tp_from_ann.
+            let ann_elems = node_elements(type_ann)
+            if ann_elems != -1 && sublist_length(ann_elems) >= 1 {
+                let inner_ann = sublist_get(ann_elems, 0)
+                let inner_deep = deep_tp_from_ann(inner_ann)
+                let inner_k = tp_get_kind(inner_deep)
+                if inner_k == CT_MAP || inner_k == CT_LIST || inner_k == CT_RESULT || inner_k == CT_OPTION || inner_k == CT_SET {
+                    set_var_option_inner_tp(name, inner_deep)
+                }
+            }
         }
     }
     if val_type == CT_RESULT {
@@ -3237,33 +3254,47 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
             set_var_channel(name, CT_INT)
         }
     }
-    if node_kind(val_node) == NodeKind.StructLit {
-        let expr_struct = get_var_struct(val_str)
-        if expr_struct != "" {
-            set_var_struct(name, expr_struct)
-        } else {
-            let sname = node_type_name(val_node)
-            if is_struct_type(sname) != 0 {
-                set_var_struct(name, sname)
+    // 7s0wjh: the generic struct-fallback propagates the RHS var's `sname` onto a
+    // struct-typed binding via get_var_struct -> set_var_struct, which rebuilds
+    // tp_id through the lossy 2-level sv_tp bridge. For an Option whose inner is
+    // itself a CONTAINER, that RHS sname is a CARRIER TAG (`Option_list`) and the
+    // rebuild re-collapses the deep tp (`Option[Option[List[Int]]]` ->
+    // `Option[Option[Int]]`) that the CT_OPTION block above just restored, losing
+    // the inner List's element. Skip the fallback ONLY in that narrow case
+    // (get_var_option_inner_tp(name) >= 0 iff the restored inner is a container);
+    // a compound over a real struct/enum inner (`Option[Status]`) has no deep
+    // container tp, so the fallback still runs and legitimately stamps the inner's
+    // struct name — no regression.
+    let skip_struct_fallback = (val_type == CT_OPTION && get_var_option_inner_tp(name) >= 0)
+    if skip_struct_fallback == 0 {
+        if node_kind(val_node) == NodeKind.StructLit {
+            let expr_struct = get_var_struct(val_str)
+            if expr_struct != "" {
+                set_var_struct(name, expr_struct)
+            } else {
+                let sname = node_type_name(val_node)
+                if is_struct_type(sname) != 0 {
+                    set_var_struct(name, sname)
+                }
             }
-        }
-    } else if type_ann != -1 {
-        let ann_name = node_name(type_ann)
-        if is_struct_type(ann_name) != 0 {
-            set_var_struct(name, ann_name)
-        } else if ann_name == "Tuple" {
-            let tup_name = resolve_tuple_ann(type_ann, -1, "", []).unwrap()
-            set_var_struct(name, tup_name)
+        } else if type_ann != -1 {
+            let ann_name = node_name(type_ann)
+            if is_struct_type(ann_name) != 0 {
+                set_var_struct(name, ann_name)
+            } else if ann_name == "Tuple" {
+                let tup_name = resolve_tuple_ann(type_ann, -1, "", []).unwrap()
+                set_var_struct(name, tup_name)
+            } else {
+                let expr_struct = get_var_struct(val_str)
+                if expr_struct != "" {
+                    set_var_struct(name, expr_struct)
+                }
+            }
         } else {
             let expr_struct = get_var_struct(val_str)
             if expr_struct != "" {
                 set_var_struct(name, expr_struct)
             }
-        }
-    } else {
-        let expr_struct = get_var_struct(val_str)
-        if expr_struct != "" {
-            set_var_struct(name, expr_struct)
         }
     }
     if val_type == CT_LIST && type_ann != -1 {

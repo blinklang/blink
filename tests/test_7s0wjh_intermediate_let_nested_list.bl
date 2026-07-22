@@ -1,0 +1,74 @@
+// 7s0wjh: a doubly-nested compound element (`List[Option[List[Int]]]`) routed
+// through an INTERMEDIATE let lost the inner List's element type. The chained
+// idiom `pairs.get(0).unwrap()` works (an Ident read restores the deep tp from
+// the scope-var), but `let x = pairs.get(0)` then `x.unwrap()` re-collapsed the
+// deep tp_id: the generic struct-fallback in the let-binding (codegen_stmt.bl)
+// ran get_var_struct -> set_var_struct on the CT_OPTION var, and set_var_struct
+// rebuilds tp_id through the lossy 2-level sv_tp bridge, flattening
+// Option[Option[List[Int]]] to Option[Option[Int]]. x.unwrap() then read the
+// collapsed Int and bound `li` as int64_t, so `.len()` failed LOUDLY with
+// UnresolvedMethod '.len' on Int. Fix: skip the struct-fallback for compound
+// carriers (CT_OPTION/CT_RESULT) — their dedicated blocks already set all
+// metadata, and their var sname is a carrier tag, not a struct name.
+
+// RED before fix: intermediate-let double-unwrap over List[Option[List[Int]]].
+test "intermediate-let double-unwrap List[Option[List[Int]]]" {
+    let pairs: List[Option[List[Int]]] = [Some([1, 2]), None]
+    let x = pairs.get(0)
+    match x.unwrap() {
+        Some(li) => {
+            assert_eq(li.len(), 2)
+            assert_eq(li.get(0).unwrap(), 1)
+            assert_eq(li.get(1).unwrap(), 2)
+        }
+        None => assert(false)
+    }
+}
+
+// RED before fix: Some(Some([..])) construction bound to a let, then unwrap.
+// Also routes through the let-binding struct-fallback.
+test "Some(Some(list)) construction + unwrap" {
+    let inner: List[Int] = [10, 20, 30]
+    let x: Option[Option[List[Int]]] = Some(Some(inner))
+    match x.unwrap() {
+        Some(li) => assert_eq(li.len(), 3)
+        None => assert(false)
+    }
+}
+
+// CONTROL (green already): the match-based double-unwrap binds inner_opt via a
+// match-arm binding, not the let-binding fallback — guards no regression.
+test "match-based double-unwrap Some(Some(li))" {
+    let inner: List[Int] = [3, 4, 5, 6]
+    let x: Option[Option[List[Int]]] = Some(Some(inner))
+    match x {
+        Some(inner_opt) => {
+            match inner_opt {
+                Some(li) => assert_eq(li.len(), 4)
+                None => assert(false)
+            }
+        }
+        None => assert(false)
+    }
+}
+
+// CONTROL (green already): the Map inner rides a lossless carrier tag
+// (Option_Map_int_str), so the intermediate-let path already worked. Proves the
+// fix leaves the Map path untouched (no regression).
+test "intermediate-let control List[Option[Map[Int,Str]]]" {
+    let mut m: Map[Int, Str] = Map()
+    m.insert(1, "a")
+    m.insert(2, "b")
+    let pairs: List[Option[Map[Int, Str]]] = [Some(m), None]
+    let x = pairs.get(0)
+    match x.unwrap() {
+        Some(mm) => {
+            assert_eq(mm.len(), 2)
+            match mm.get(1) {
+                Some(s) => assert_eq(s, "a")
+                None => assert(false)
+            }
+        }
+        None => assert(false)
+    }
+}
