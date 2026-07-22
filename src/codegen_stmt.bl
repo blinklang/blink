@@ -60,21 +60,23 @@ import codegen_types.{
     resolve_import_alias, resolve_option_inner_from_ann, resolve_ret_type_from_ann,
     resolve_self_type, resolve_tuple_ann, resolve_variant, result_c_type,
     result_c_type_mixed, tuple_struct_arity, set_list_elem_struct, set_list_elem_type,
-    set_list_nested_elem_struct, set_list_nested_elem_type, set_list_elem_map_types, set_list_elem_option, set_list_elem_result, get_list_elem_option_inner, get_list_elem_option_inner_struct, get_list_elem_result_ok, get_list_elem_result_err, get_list_elem_result_ok_struct, get_list_elem_result_err_struct, set_map_types, set_map_key_struct, key_struct_sname_from_ann, set_map_value_list_elem, set_map_value_struct, copy_map_value_meta, set_set_elem_type, set_set_elem_struct,
+    set_list_nested_elem_struct, set_list_nested_elem_type, set_list_elem_map_types, set_list_elem_option, set_list_elem_result, get_list_elem_option_inner, get_list_elem_option_inner_struct, get_list_elem_result_ok, get_list_elem_result_err, get_list_elem_result_ok_struct, get_list_elem_result_err_struct, get_list_elem_option_inner_tp, get_list_elem_result_ok_tp, get_list_elem_result_err_tp, tp_carrier_tag, set_var_option_inner_tp, set_map_types, set_map_key_struct, key_struct_sname_from_ann, set_map_value_list_elem, set_map_value_struct, copy_map_value_meta, set_set_elem_type, set_set_elem_struct,
     find_type_def_node, set_var_ffi_ptr_struct, set_var_ffi_ptr_array, set_var_ffi_ptr_extra,
     ffi_alloc_n_pending, ffi_offset_pending_struct,
     set_var, set_var_alias, set_var_channel, set_var_closure, set_var_handle,
     set_var_handler,
     set_var_handle_full, set_var_iterator, set_var_option,
-    set_var_option_inner2, set_var_option_inner2_struct,
+    set_var_option_inner2, set_var_option_inner2_struct, get_var_option_inner_tp,
     set_var_option_struct, set_var_option_from_struct_tag,
     set_var_result, set_var_result_ok_elem,
     set_var_result_struct, set_var_result_from_struct_tag,
     set_var_struct, sf_closure_sigs, sf_entries,
     struct_field_defaults, struct_invariants, struct_option_c_type,
     struct_reg_names, struct_reg_set, struct_result_c_type, sv_tp, tp_from_ann,
+    type_int, type_string, type_struct, type_list, type_option, type_result, type_map, type_set, type_iterator,
+    set_list_elem_option_tp, set_list_elem_result_tp,
     split_result_compound, CompoundSplit, map_struct_scalar_kv, MapKvCt, typedef_tag_or_empty, tp_child1_kind, tp_child1_sname, tp_child2_kind, tp_child2_sname,
-    tp_get_kind, tp_get_sname, type_from_name, type_from_name_tag,
+    tp_get_kind, tp_get_child1, tp_get_child2, tp_get_sname, type_from_name, type_from_name_tag,
     type_name_from_ct, type_where_preds, cg_where_self_var, is_compound_tag, var_enums,
     CaptureEntry, ClosureCapInfo,
     closure_captures, closure_cap_infos, lookup_closure_lit_cap_idx,
@@ -84,7 +86,7 @@ import codegen_expr.{
     emit_expr, expr_closure_sig, expr_list_elem_struct, expr_list_elem_type,
     expr_map_key_type, expr_map_val_type, expr_map_val_struct, expr_map_key_struct, expr_option_inner,
     expr_option_inner_list_elem, expr_option_inner_list_struct,
-    expr_option_inner_map_val_struct, expr_option_inner_map_val_list_elem,
+    expr_option_inner_map_val_struct, expr_option_inner_map_val_list_elem, expr_option_inner_tp,
     expr_option_inner_struct, expr_option_is_none, expr_result_err_struct, expr_result_err_type,
     expr_result_ok_struct, expr_result_ok_type, expr_result_str,
     expr_result_type, panic_file_for, segs_from_arg_tids
@@ -152,40 +154,68 @@ fn set_list_elem_map_ann(var_name: Str, elem_ann: Int) {
     }
 }
 
-// gemr3z: stamp a List[Option[T]] / List[Result[T,E]] element's INNER type(s)
-// from the element annotation onto the list var (the compound-element twin of
-// set_list_elem_map_ann). Without this, the plain set_list_elem_type(CT_OPTION)
-// at each annotation site defaults the Option inner to Int and get()/for-in emit
-// the undefined `blink_Option_option`. Resolves each inner name through the mono
-// resolver (so a mono param's typevar inner is substituted) and records the
-// nested type via set_list_elem_option / set_list_elem_result. A struct/enum inner
-// stamps its name so the carrier is named by struct tag; scalars pass "".
+// whg65a: build a fully-recursive tp node from a type annotation, substituting
+// mono typevars via the current cg_mono_* context. The tparam-resolving twin of
+// tp_from_ann (codegen_types.bl) — that one runs BELOW the mono resolver in the
+// module DAG so it can't call resolve_tparam_via_tid; this one lives alongside
+// the resolver and is the deep builder for a List's compound element inner, so
+// `List[Option[Map[K,V]]]` records list→option→map→{k,v} instead of collapsing
+// the Map's K/V to the sv_tp default (Str/Int). Handles the container ctypes it
+// can descend into; anything else lowers to the resolved scalar/struct.
+fn deep_tp_from_ann(ann: Int) -> Int {
+    let resolved = resolve_tparam_via_tid(node_name(ann), cg_mono_tparams_sl, cg_mono_concrete_args, cg_mono_arg_tids)
+    let ct = type_from_name(resolved)
+    let elems = node_elements(ann)
+    let n = if elems != -1 { sublist_length(elems) } else { 0 }
+    if ct == CT_OPTION && n >= 1 {
+        return type_option(deep_tp_from_ann(sublist_get(elems, 0)))
+    }
+    if ct == CT_RESULT && n >= 2 {
+        return type_result(deep_tp_from_ann(sublist_get(elems, 0)), deep_tp_from_ann(sublist_get(elems, 1)))
+    }
+    if ct == CT_MAP && n >= 2 {
+        return type_map(deep_tp_from_ann(sublist_get(elems, 0)), deep_tp_from_ann(sublist_get(elems, 1)))
+    }
+    if ct == CT_LIST && n >= 1 {
+        return type_list(deep_tp_from_ann(sublist_get(elems, 0)))
+    }
+    if ct == CT_SET && n >= 1 {
+        return type_set(deep_tp_from_ann(sublist_get(elems, 0)))
+    }
+    if ct == CT_ITERATOR && n >= 1 {
+        return type_iterator(deep_tp_from_ann(sublist_get(elems, 0)))
+    }
+    if is_struct_or_enum_type(resolved) != 0 {
+        return type_struct(resolved)
+    }
+    sv_tp(ct, -1, -1, "")
+}
+
+// gemr3z + whg65a: stamp a List[Option[T]] / List[Result[T,E]] element's INNER
+// type(s) from the element annotation onto the list var (the compound-element
+// twin of set_list_elem_map_ann). Without this, the plain
+// set_list_elem_type(CT_OPTION) at each annotation site defaults the Option inner
+// to Int and get()/for-in emit the undefined `blink_Option_option`. Builds the
+// element's inner as a FULLY-RECURSIVE tp (deep_tp_from_ann) so a container
+// nested inside the compound — `List[Option[Map[K,V]]]`, `List[Result[Map,..]]`,
+// `List[Option[List[T]]]` — keeps its own type params (whg65a). Records via the
+// deep set_list_elem_option_tp / set_list_elem_result_tp.
 // Returns 1 when it handled the element (Option/Result), 0 otherwise so the caller
 // keeps its existing dispatch for non-compound elements.
 fn set_list_elem_compound_ann(var_name: Str, elem_ann: Int, elem_ct: Int) -> Int {
     if elem_ct == CT_OPTION {
         let inner_sl = node_elements(elem_ann)
         if inner_sl != -1 && sublist_length(inner_sl) >= 1 {
-            let inner_ann = sublist_get(inner_sl, 0)
-            let inner_name = resolve_tparam_via_tid(node_name(inner_ann), cg_mono_tparams_sl, cg_mono_concrete_args, cg_mono_arg_tids)
-            let inner_ct = type_from_name(inner_name)
-            let inner_struct = if is_struct_or_enum_type(inner_name) != 0 { inner_name } else { "" }
-            set_list_elem_option(var_name, inner_ct, inner_struct)
+            set_list_elem_option_tp(var_name, deep_tp_from_ann(sublist_get(inner_sl, 0)))
         }
         return 1
     }
     if elem_ct == CT_RESULT {
         let inner_sl = node_elements(elem_ann)
         if inner_sl != -1 && sublist_length(inner_sl) >= 2 {
-            let ok_ann = sublist_get(inner_sl, 0)
-            let err_ann = sublist_get(inner_sl, 1)
-            let ok_name = resolve_tparam_via_tid(node_name(ok_ann), cg_mono_tparams_sl, cg_mono_concrete_args, cg_mono_arg_tids)
-            let err_name = resolve_tparam_via_tid(node_name(err_ann), cg_mono_tparams_sl, cg_mono_concrete_args, cg_mono_arg_tids)
-            let ok_ct = type_from_name(ok_name)
-            let err_ct = type_from_name(err_name)
-            let ok_struct = if is_struct_or_enum_type(ok_name) != 0 { ok_name } else { "" }
-            let err_struct = if is_struct_or_enum_type(err_name) != 0 { err_name } else { "" }
-            set_list_elem_result(var_name, ok_ct, ok_struct, err_ct, err_struct)
+            let ok_tp = deep_tp_from_ann(sublist_get(inner_sl, 0))
+            let err_tp = deep_tp_from_ann(sublist_get(inner_sl, 1))
+            set_list_elem_result_tp(var_name, ok_tp, err_tp)
         }
         return 1
     }
@@ -923,6 +953,11 @@ pub fn emit_match_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scop
     let saved_option_inner_struct = expr_option_inner_struct
     let saved_option_inner_map_val_struct = expr_option_inner_map_val_struct
     let saved_option_inner_map_val_list_elem = expr_option_inner_map_val_list_elem
+    // whg65a: preserve the scrutinee Option's deep inner tp (a nested Map/List)
+    // across each arm so the Some(mm)/Ok(mm) binding recovers the container's own
+    // K/V — the arm loop below clobbers the transient global while inferring arm
+    // types, exactly like the map_val channels above.
+    let saved_option_inner_tp = expr_option_inner_tp
     let saved_list_elem_type = expr_list_elem_type
     let saved_list_elem_struct = expr_list_elem_struct
 
@@ -961,6 +996,7 @@ pub fn emit_match_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scop
         expr_option_inner_struct = saved_option_inner_struct
         expr_option_inner_map_val_struct = saved_option_inner_map_val_struct
         expr_option_inner_map_val_list_elem = saved_option_inner_map_val_list_elem
+        expr_option_inner_tp = saved_option_inner_tp
         expr_list_elem_type = saved_list_elem_type
         expr_list_elem_struct = saved_list_elem_struct
         let pp_arm = sublist_get(arms_sl, ppi)
@@ -1104,6 +1140,7 @@ pub fn emit_match_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scop
         expr_option_inner_struct = saved_option_inner_struct
         expr_option_inner_map_val_struct = saved_option_inner_map_val_struct
         expr_option_inner_map_val_list_elem = saved_option_inner_map_val_list_elem
+        expr_option_inner_tp = saved_option_inner_tp
         expr_list_elem_type = saved_list_elem_type
         expr_list_elem_struct = saved_list_elem_struct
         let arm = sublist_get(arms_sl, i)
@@ -1766,6 +1803,19 @@ fn bind_pattern_vars(pat: Int, scrut_off: Int, scrut_len: Int) ! Codegen.Emit, C
                     } else if inner_struct != "" && inner_ct == CT_MAP {
                         emit_line("blink_map* {c_bind} = {scrut}.{field};")
                         set_var(bind_name, CT_MAP, 0)
+                        // whg65a: a Map unwrapped from a `List[Option[Map[K,V]]]`
+                        // element (`match item { Some(mm) => mm.get(k) }`) needs its
+                        // scalar K/V so `mm.get(k)` decodes V — the single-slot
+                        // expr_option_inner_map_val_* channels only carry a struct/list
+                        // value, never a scalar V (Str), which is what erased to Int.
+                        // The carrier tag (`Map_int_str`) encodes both scalar sides;
+                        // recover them from the tag itself (stateless — unlike the
+                        // transient expr_option_inner_tp, which a nested scope can
+                        // revert). Fire only when a scalar V hasn't already been set.
+                        let mkv = map_struct_scalar_kv(inner_struct)
+                        if mkv.first >= 0 && expr_option_inner_map_val_struct == "" && expr_option_inner_map_val_list_elem < 0 {
+                            set_map_types(bind_name, mkv.first, mkv.second, "")
+                        }
                         if expr_option_inner_map_val_struct != "" {
                             set_map_value_struct(bind_name, expr_option_inner_map_val_struct)
                         }
@@ -1775,7 +1825,16 @@ fn bind_pattern_vars(pat: Int, scrut_off: Int, scrut_len: Int) ! Codegen.Emit, C
                     } else if inner_struct != "" && inner_ct == CT_LIST {
                         emit_line("blink_list* {c_bind} = {scrut}.{field};")
                         set_var(bind_name, CT_LIST, 0)
-                        if expr_option_inner_list_elem >= 0 {
+                        // whg65a: a List unwrapped from a `List[Option[List[T]]]`
+                        // element carries its element type in expr_option_inner_tp
+                        // (the inner List tp node). Prefer it so `li.get(i)` decodes T.
+                        if expr_option_inner_tp >= 0 && tp_get_kind(expr_option_inner_tp) == CT_LIST {
+                            set_list_elem_type(bind_name, tp_child1_kind(expr_option_inner_tp))
+                            let les = tp_child1_sname(expr_option_inner_tp)
+                            if les != "" {
+                                set_list_elem_struct(bind_name, les)
+                            }
+                        } else if expr_option_inner_list_elem >= 0 {
                             set_list_elem_type(bind_name, expr_option_inner_list_elem)
                         } else if expr_list_elem_type >= 0 {
                             set_list_elem_type(bind_name, expr_list_elem_type)
@@ -1800,7 +1859,18 @@ fn bind_pattern_vars(pat: Int, scrut_off: Int, scrut_len: Int) ! Codegen.Emit, C
                         emit_line("{c_type_str(inner_ct)} {c_bind} = {scrut}.{field};")
                         set_var(bind_name, inner_ct, 0)
                         if inner_ct == CT_LIST {
-                            if expr_option_inner_list_elem >= 0 {
+                            // whg65a: a plain `Option[List[T]]` (no struct name)
+                            // unwrapped from a List[compound] element carries T on
+                            // expr_option_inner_tp (the inner List tp). Prefer it so
+                            // `li.get(i)` decodes T — the list-elem globals below are
+                            // stale here (they described the outer list).
+                            if expr_option_inner_tp >= 0 && tp_get_kind(expr_option_inner_tp) == CT_LIST {
+                                set_list_elem_type(bind_name, tp_child1_kind(expr_option_inner_tp))
+                                let les = tp_child1_sname(expr_option_inner_tp)
+                                if les != "" {
+                                    set_list_elem_struct(bind_name, les)
+                                }
+                            } else if expr_option_inner_list_elem >= 0 {
                                 set_list_elem_type(bind_name, expr_option_inner_list_elem)
                             } else if expr_list_elem_type >= 0 {
                                 set_list_elem_type(bind_name, expr_list_elem_type)
@@ -3073,6 +3143,25 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
                 expr_option_inner_map_val_struct = ""
             }
         }
+        // whg65a: preserve a DIRECT Option[container]'s deep inner tp across the
+        // let-binding (the flat set_var_option_struct rebind above drops a Map's V /
+        // a List's element). Only for a Map/List inner — an Option[Option[..]] or
+        // Option[Result[..]] keeps its carrier-tag flat storage, which the later
+        // unwrap round-trips losslessly (`Option_Map_int_str`); re-stamping those
+        // through a bare inner tp would erase the inner carrier's struct name.
+        //
+        // Source the deep tp ONLY from the RHS var's own stored tp_id
+        // (get_var_option_inner_tp) — never the transient expr_option_inner_tp
+        // global, which producers that aren't a List[compound] readback leave stale
+        // and would corrupt an unrelated `let o = f()` (whg65a review Finding 2). The
+        // RHS temp reliably carries its deep tp: .get()/.pop() stamp
+        // `Option[Option[container]]` and .unwrap() re-stamps the peeled result. Copy
+        // ANY container inner (Map/List/Result/Option/Set) so a doubly-nested
+        // `let x = pairs.get(0)` (Option[Option[List]]) also round-trips (Finding 1).
+        let rhs_deep = get_var_option_inner_tp(val_str)
+        if rhs_deep >= 0 {
+            set_var_option_inner_tp(name, rhs_deep)
+        }
     }
     if val_type == CT_RESULT {
         let mut rok_t = expr_result_ok_type
@@ -3456,18 +3545,25 @@ fn emit_for_in(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.
             // `else` below keys the iterator on c_type_tag(CT_OPTION)="option" and
             // emits the undefined blink_Option_option / blink_ListIterator_option_next.
             if elem_type == CT_OPTION || elem_type == CT_RESULT {
+                // whg65a: the element's inner tp(s) drive the carrier tag
+                // (tp_carrier_tag) so a nested container — `for m in
+                // (List[Option[Map[K,V]]])` — spells `Option_Map_int_str`, not the
+                // lossy `Option_map`. The Option inner tp is also stamped onto the
+                // loop var so a body `match item { Some(mm) => mm.get(k) }` decodes V.
+                let oi_tp = get_list_elem_option_inner_tp(iter_str)
+                let rok_tp = get_list_elem_result_ok_tp(iter_str)
+                let rerr_tp = get_list_elem_result_err_tp(iter_str)
                 let carrier = if elem_type == CT_OPTION {
                     let oi_ct = get_list_elem_option_inner(iter_str)
                     let oi_struct = get_list_elem_option_inner_struct(iter_str)
-                    let inner_tag = if oi_struct != "" { c_type_tag_for_struct(oi_struct) } else if oi_ct >= 0 { c_type_tag(oi_ct) } else { "int" }
-                    "Option_{inner_tag}"
+                    if oi_tp >= 0 { "Option_{tp_carrier_tag(oi_tp)}" } else if oi_struct != "" { "Option_{c_type_tag_for_struct(oi_struct)}" } else if oi_ct >= 0 { "Option_{c_type_tag(oi_ct)}" } else { "Option_int" }
                 } else {
                     let rok_ct = get_list_elem_result_ok(iter_str)
                     let rerr_ct = get_list_elem_result_err(iter_str)
                     let rok_struct = get_list_elem_result_ok_struct(iter_str)
                     let rerr_struct = get_list_elem_result_err_struct(iter_str)
-                    let ok_tag = if rok_struct != "" { c_type_tag_for_struct(rok_struct) } else if rok_ct >= 0 { c_type_tag(rok_ct) } else { "int" }
-                    let err_tag = if rerr_struct != "" { c_type_tag_for_struct(rerr_struct) } else if rerr_ct >= 0 { c_type_tag(rerr_ct) } else { "str" }
+                    let ok_tag = if rok_tp >= 0 { tp_carrier_tag(rok_tp) } else if rok_struct != "" { c_type_tag_for_struct(rok_struct) } else if rok_ct >= 0 { c_type_tag(rok_ct) } else { "int" }
+                    let err_tag = if rerr_tp >= 0 { tp_carrier_tag(rerr_tp) } else if rerr_struct != "" { c_type_tag_for_struct(rerr_struct) } else if rerr_ct >= 0 { c_type_tag(rerr_ct) } else { "str" }
                     "Result_{ok_tag}_{err_tag}"
                 }
                 ensure_carrier_from_tag(carrier)
@@ -3488,7 +3584,15 @@ fn emit_for_in(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.
                     let oi_ct = get_list_elem_option_inner(iter_str)
                     let oi_struct = get_list_elem_option_inner_struct(iter_str)
                     set_var(var_name, CT_OPTION, 0)
-                    if oi_struct != "" {
+                    // whg65a: a nested container inner (Map/List) binds the loop var
+                    // through the full carrier tag (`Option_Map_int_str`) so a body
+                    // `match item { Some(mm) => mm.get(k) }` reads the Map struct tag
+                    // and recovers K/V. The flat set_var_option(CT_MAP) path would
+                    // leave the var as the lossy `Option_map` and re-erase V to Int.
+                    if oi_tp >= 0 && (tp_get_kind(oi_tp) == CT_MAP || tp_get_kind(oi_tp) == CT_LIST) {
+                        set_var_option_from_struct_tag(var_name, carrier)
+                        set_var_option_inner_tp(var_name, oi_tp)
+                    } else if oi_struct != "" {
                         set_var_option_struct(var_name, CT_INT, oi_struct)
                     } else {
                         set_var_option(var_name, if oi_ct >= 0 { oi_ct } else { CT_INT })
@@ -3499,9 +3603,19 @@ fn emit_for_in(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.
                     let rerr_ct = get_list_elem_result_err(iter_str)
                     let rok_struct = get_list_elem_result_ok_struct(iter_str)
                     let rerr_struct = get_list_elem_result_err_struct(iter_str)
-                    set_var_result(var_name, if rok_ct >= 0 { rok_ct } else { CT_INT }, if rerr_ct >= 0 { rerr_ct } else { CT_STRING })
-                    if rok_struct != "" || rerr_struct != "" {
+                    // whg65a: a nested container on either side binds the loop var
+                    // through the full Result carrier tag (`Result_Map_int_str_str`)
+                    // so a body `match item { Ok(mm) => mm.get(k) }` reads the correct
+                    // side carrier. The flat set_var_result(CT_MAP,..) path leaves the
+                    // var as the lossy `Result_map_str`.
+                    let ok_is_container = rok_tp >= 0 && (tp_get_kind(rok_tp) == CT_MAP || tp_get_kind(rok_tp) == CT_LIST)
+                    let err_is_container = rerr_tp >= 0 && (tp_get_kind(rerr_tp) == CT_MAP || tp_get_kind(rerr_tp) == CT_LIST)
+                    if ok_is_container || err_is_container {
+                        set_var_result_from_struct_tag(var_name, carrier)
+                    } else if rok_struct != "" || rerr_struct != "" {
                         set_var_result_struct(var_name, if rok_ct >= 0 { rok_ct } else { CT_INT }, if rerr_ct >= 0 { rerr_ct } else { CT_STRING }, rok_struct, rerr_struct)
+                    } else {
+                        set_var_result(var_name, if rok_ct >= 0 { rok_ct } else { CT_INT }, if rerr_ct >= 0 { rerr_ct } else { CT_STRING })
                     }
                 }
                 emit_block(node_body(node))

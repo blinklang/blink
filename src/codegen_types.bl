@@ -91,7 +91,7 @@ fn tp_alloc(kind: Int, c1: Int, c2: Int, sname: Str) -> Int {
     id
 }
 
-fn type_int() -> Int {
+pub fn type_int() -> Int {
     tp_alloc(CT_INT, -1, -1, "")
 }
 
@@ -103,7 +103,7 @@ fn type_bool() -> Int {
     tp_alloc(CT_BOOL, -1, -1, "")
 }
 
-fn type_string() -> Int {
+pub fn type_string() -> Int {
     tp_alloc(CT_STRING, -1, -1, "")
 }
 
@@ -123,27 +123,27 @@ fn type_duration() -> Int {
     tp_alloc(CT_DURATION, -1, -1, "")
 }
 
-fn type_list(elem: Int) -> Int {
+pub fn type_list(elem: Int) -> Int {
     tp_alloc(CT_LIST, elem, -1, "")
 }
 
-fn type_option(inner: Int) -> Int {
+pub fn type_option(inner: Int) -> Int {
     tp_alloc(CT_OPTION, inner, -1, "")
 }
 
-fn type_result(ok: Int, err: Int) -> Int {
+pub fn type_result(ok: Int, err: Int) -> Int {
     tp_alloc(CT_RESULT, ok, err, "")
 }
 
-fn type_map(key: Int, value: Int) -> Int {
+pub fn type_map(key: Int, value: Int) -> Int {
     tp_alloc(CT_MAP, key, value, "")
 }
 
-fn type_set(elem: Int) -> Int {
+pub fn type_set(elem: Int) -> Int {
     tp_alloc(CT_SET, elem, -1, "")
 }
 
-fn type_iterator(inner: Int) -> Int {
+pub fn type_iterator(inner: Int) -> Int {
     tp_alloc(CT_ITERATOR, inner, -1, "")
 }
 
@@ -159,7 +159,7 @@ fn type_closure(sig: Str) -> Int {
     tp_alloc(CT_CLOSURE, -1, -1, sig)
 }
 
-fn type_struct(name: Str) -> Int {
+pub fn type_struct(name: Str) -> Int {
     tp_alloc(CT_STRUCT, -1, -1, name)
 }
 
@@ -3009,39 +3009,55 @@ pub fn set_list_elem_map_types(name: Str, key_ct: Int, val_ct: Int, val_name: St
 // Building the tp_id directly preserves the concrete inner (Str / a struct) so
 // List[Option[T]].get()/for-in carry the right inner type. `inner_struct` names a
 // struct/enum inner (routed through sv_tp's CT_STRUCT case); scalars pass "".
-pub fn set_list_elem_option(name: Str, inner_ct: Int, inner_struct: Str) {
-    let opt_tp = sv_tp(CT_OPTION, inner_ct, -1, inner_struct)
-    let list_tp = type_list(opt_tp)
+// whg65a: core write-side that stamps a pre-built list tp (`type_list(<inner>)`)
+// onto the var. `inner_marker` is the element's own CT (CT_OPTION/CT_RESULT) kept
+// in the flat inner1 slot for the legacy callers that still read it. The inner tp
+// is arbitrarily deep — this is how `List[Option[Map[Int,Str]]]` stores its full
+// list→option→map→{k,v} shape (the flat sv_tp path collapses the Map's K/V).
+fn set_list_elem_compound_tp(name: Str, list_tp: Int, inner_marker: Int) {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
         if sv.name == name && tp_get_kind(sv.tp_id) == CT_LIST {
-            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: CT_OPTION, inner2: sv.inner2, sname: sv.sname, sname2: sv.sname2, extra: sv.extra, tp_id: list_tp })
+            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: inner_marker, inner2: sv.inner2, sname: sv.sname, sname2: sv.sname2, extra: sv.extra, tp_id: list_tp })
             return
         }
         i = i - 1
     }
-    push_scope_var(ScopeVar { name: name, ctype: CT_LIST, is_mut: 0, inner1: CT_OPTION, inner2: -1, sname: "", sname2: "", extra: "", tp_id: list_tp })
+    push_scope_var(ScopeVar { name: name, ctype: CT_LIST, is_mut: 0, inner1: inner_marker, inner2: -1, sname: "", sname2: "", extra: "", tp_id: list_tp })
+}
+
+// whg65a: record a List's element-OPTION from a pre-built inner tp
+// (`type_option(<deep inner tp>)`). The deep-tp caller
+// (set_list_elem_compound_ann) passes the fully-recursive inner so a nested
+// container inside the Option — `List[Option[Map[K,V]]]`,
+// `List[Option[List[T]]]` — keeps its own type params.
+pub fn set_list_elem_option_tp(name: Str, inner_tp: Int) {
+    set_list_elem_compound_tp(name, type_list(type_option(inner_tp)), CT_OPTION)
+}
+
+// gemr3z: record a List's element-OPTION inner as a full nested type
+// (`type_list(type_option(inner))`). The scalar/bare-struct convenience twin of
+// set_list_elem_option_tp — `inner_struct` names a struct/enum inner ("" for
+// scalars), routed through sv_tp's CT_STRUCT case. Passes the Option's INNER tp
+// (`sv_tp(inner_ct, …)`) — set_list_elem_option_tp adds the single Option wrap; a
+// double sv_tp(CT_OPTION, …) here would nest the element as Option[Option[T]].
+pub fn set_list_elem_option(name: Str, inner_ct: Int, inner_struct: Str) {
+    set_list_elem_option_tp(name, sv_tp(inner_ct, -1, -1, inner_struct))
+}
+
+// whg65a: the Result twin of set_list_elem_option_tp — record
+// `type_list(type_result(ok_tp, err_tp))` from pre-built ok/err inner tps so a
+// nested container inside either side (`List[Result[Map[K,V], E]]`) survives.
+pub fn set_list_elem_result_tp(name: Str, ok_tp: Int, err_tp: Int) {
+    set_list_elem_compound_tp(name, type_list(type_result(ok_tp, err_tp)), CT_RESULT)
 }
 
 // gemr3z: the Result twin of set_list_elem_option — record
 // `type_list(type_result(ok, err))` so List[Result[T,E]].get()/for-in carry both
 // concrete inners. ok_struct/err_struct name a struct/enum inner ("" for scalars).
 pub fn set_list_elem_result(name: Str, ok_ct: Int, ok_struct: Str, err_ct: Int, err_struct: Str) {
-    let ok_tp = sv_tp(ok_ct, -1, -1, ok_struct)
-    let err_tp = sv_tp(err_ct, -1, -1, err_struct)
-    let res_tp = type_result(ok_tp, err_tp)
-    let list_tp = type_list(res_tp)
-    let mut i = scope_vars.len() - 1
-    while i >= 0 {
-        let sv = scope_vars.get(i).unwrap()
-        if sv.name == name && tp_get_kind(sv.tp_id) == CT_LIST {
-            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: CT_RESULT, inner2: sv.inner2, sname: sv.sname, sname2: sv.sname2, extra: sv.extra, tp_id: list_tp })
-            return
-        }
-        i = i - 1
-    }
-    push_scope_var(ScopeVar { name: name, ctype: CT_LIST, is_mut: 0, inner1: CT_RESULT, inner2: -1, sname: "", sname2: "", extra: "", tp_id: list_tp })
+    set_list_elem_result_tp(name, sv_tp(ok_ct, -1, -1, ok_struct), sv_tp(err_ct, -1, -1, err_struct))
 }
 
 // The element Option's inner CT (List[Option[Int]] → CT_INT). -1 when the list is
@@ -3055,6 +3071,61 @@ pub fn get_list_elem_option_inner(name: Str) -> Int {
             let c1 = tp_get_child1(sv.tp_id)
             if c1 >= 0 && tp_get_kind(c1) == CT_OPTION {
                 return tp_child1_kind(c1)
+            }
+            return -1
+        }
+        i = i - 1
+    }
+    -1
+}
+
+// whg65a: the element Option's INNER tp NODE (List[Option[Map[Int,Str]]] → the
+// `Map[Int,Str]` tp), or -1. Unlike get_list_elem_option_inner (which flattens to
+// a single CT), this returns the whole subtree so a nested container inner keeps
+// its K/V — the readback walks it via tp_carrier_tag + the map/list-elem getters.
+pub fn get_list_elem_option_inner_tp(name: Str) -> Int {
+    let mut i = scope_vars.len() - 1
+    while i >= 0 {
+        let sv = scope_vars.get(i).unwrap()
+        if sv.name == name && tp_get_kind(sv.tp_id) == CT_LIST {
+            let c1 = tp_get_child1(sv.tp_id)
+            if c1 >= 0 && tp_get_kind(c1) == CT_OPTION {
+                return tp_get_child1(c1)
+            }
+            return -1
+        }
+        i = i - 1
+    }
+    -1
+}
+
+// whg65a: the element Result's OK / ERR inner tp NODE
+// (List[Result[Map[Int,Str],Str]] → the `Map[Int,Str]` tp for ok, `Str` for err),
+// or -1. The Result twin of get_list_elem_option_inner_tp.
+pub fn get_list_elem_result_ok_tp(name: Str) -> Int {
+    let mut i = scope_vars.len() - 1
+    while i >= 0 {
+        let sv = scope_vars.get(i).unwrap()
+        if sv.name == name && tp_get_kind(sv.tp_id) == CT_LIST {
+            let c1 = tp_get_child1(sv.tp_id)
+            if c1 >= 0 && tp_get_kind(c1) == CT_RESULT {
+                return tp_get_child1(c1)
+            }
+            return -1
+        }
+        i = i - 1
+    }
+    -1
+}
+
+pub fn get_list_elem_result_err_tp(name: Str) -> Int {
+    let mut i = scope_vars.len() - 1
+    while i >= 0 {
+        let sv = scope_vars.get(i).unwrap()
+        if sv.name == name && tp_get_kind(sv.tp_id) == CT_LIST {
+            let c1 = tp_get_child1(sv.tp_id)
+            if c1 >= 0 && tp_get_kind(c1) == CT_RESULT {
+                return tp_get_child2(c1)
             }
             return -1
         }
@@ -5442,6 +5513,39 @@ pub fn is_compound_ct(ct: Int) -> Int {
     }
 }
 
+// whg65a: the carrier tag for a tp node, recursing into nested containers so a
+// deep element type spells its full layout — `Option[Map[Int,Str]]` →
+// `Option_Map_int_str`, `Result[Map[Int,Str],Str]` → `Result_Map_int_str_str`,
+// `Option[List[Int]]` → `Option_list`. The tp_pool twin of typecheck's
+// tc_tid_inner_tag (which walks the ty_pool). This is the single source of the
+// carrier name for `List[compound]` get()/pop()/for-in and the HOF iterator path,
+// replacing the lossy one-level `c_type_tag(inner_ct)` spellings (which erase a
+// Map's K/V to the bare `map` tag). A struct/enum node uses its C struct tag; a
+// bare scalar its c_type_tag.
+pub fn tp_carrier_tag(id: Int) -> Str {
+    if id < 0 { return "void" }
+    let kind = tp_get_kind(id)
+    let sname = tp_get_sname(id)
+    if kind == CT_STRUCT || kind == CT_ENUM {
+        if sname != "" { return c_type_tag_for_struct(sname) }
+        return "void"
+    }
+    if kind == CT_OPTION {
+        return "Option_{tp_carrier_tag(tp_get_child1(id))}"
+    }
+    if kind == CT_RESULT {
+        return "Result_{tp_carrier_tag(tp_get_child1(id))}_{tp_carrier_tag(tp_get_child2(id))}"
+    }
+    if kind == CT_MAP {
+        return "Map_{tp_carrier_tag(tp_get_child1(id))}_{tp_carrier_tag(tp_get_child2(id))}"
+    }
+    // List/Set/Iterator and all scalars are pointer-boxed / by-value under a
+    // single flat tag — the inner element travels via the var's map/list-elem
+    // metadata channels, not the carrier tag (mirrors the existing `Option_list`
+    // spelling for List[Option[List[T]]]).
+    c_type_tag(kind)
+}
+
 // Canonical tuple tag (e.g. `Tuple2_int_bytes`) for a tuple annotation, or ""
 // if `ann` isn't a tuple. type_from_name("Tuple") is CT_VOID, so the compound
 // resolvers can't recognize tuples by CT — they dispatch on the annotation
@@ -5786,6 +5890,47 @@ pub fn set_var_option_inner2_struct(name: Str, struct_name: Str) {
     }
 }
 
+// whg65a: stamp a deep inner tp onto an Option var by rebuilding its tp_id as
+// `type_option(<inner_tp>)`. Lets `Option[Map[K,V]]` / `Option[List[T]]` keep the
+// inner container's full type params on the var itself, so a later Ident-read can
+// restore expr_option_inner_tp and the match arm decodes the Map's V / List's T.
+// The flat set_var_option/_struct path can only store one inner CT/struct.
+pub fn set_var_option_inner_tp(name: Str, inner_tp: Int) {
+    if inner_tp < 0 { return }
+    let mut i = scope_vars.len() - 1
+    while i >= 0 {
+        let sv = scope_vars.get(i).unwrap()
+        if sv.name == name && tp_get_kind(sv.tp_id) == CT_OPTION {
+            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: sv.inner2, sname: sv.sname, sname2: sv.sname2, extra: sv.extra, tp_id: type_option(inner_tp) })
+            return
+        }
+        i = i - 1
+    }
+}
+
+// whg65a: the deep inner tp NODE of an Option var (child1 of its option tp_id),
+// but ONLY when that inner is itself a container (Map/List/Result) — a plain
+// scalar/struct inner is already carried by the flat inner1/extra channels, so
+// return -1 there to avoid disturbing the existing paths.
+pub fn get_var_option_inner_tp(name: Str) -> Int {
+    let mut i = scope_vars.len() - 1
+    while i >= 0 {
+        let sv = scope_vars.get(i).unwrap()
+        if sv.name == name && tp_get_kind(sv.tp_id) == CT_OPTION {
+            let c1 = tp_get_child1(sv.tp_id)
+            if c1 >= 0 {
+                let k = tp_get_kind(c1)
+                if k == CT_MAP || k == CT_LIST || k == CT_RESULT || k == CT_OPTION || k == CT_SET {
+                    return c1
+                }
+            }
+            return -1
+        }
+        i = i - 1
+    }
+    -1
+}
+
 pub fn get_var_option_inner2_struct(name: Str) -> Str {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
@@ -5860,11 +6005,32 @@ pub fn set_var_result_struct(name: Str, ok_t: Int, err_t: Int, ok_s: Str, err_s:
 pub fn set_var_option_from_struct_tag(name: Str, fs: Str) {
     let inner_tag = fs.slice(7, fs.len())
     let inner_ct = type_from_name_tag(inner_tag)
+    // whg65a: a `Map_<k>_<v>` inner carries its scalar K/V in the tag itself.
+    // Rebuild the var's tp as `option(map(k,v))` so the unwrapped Option keeps the
+    // Map's value type (a later `mm.get(k)` decodes V) — set_var_option_struct's
+    // flat sv_tp path would default V to Int. Only fires for scalar-recoverable
+    // K/V; struct/nested values keep the existing struct-tag path.
+    if inner_ct == CT_MAP && inner_tag.starts_with("Map_") {
+        let kv = map_struct_scalar_kv(inner_tag)
+        if kv.first >= 0 {
+            set_var_option_struct(name, CT_MAP, inner_tag)
+            set_var_option_inner_tp(name, type_map(type_from_tag_node(kv.first), type_from_tag_node(kv.second)))
+            return
+        }
+    }
     if is_named_typedef_tag(inner_tag) != 0 {
         set_var_option_struct(name, inner_ct, inner_tag)
     } else {
         set_var_option(name, inner_ct)
     }
+}
+
+// whg65a: a scalar CT to its leaf tp node (Int→type_int, Str→type_string, else a
+// bare sv_tp of that CT). Used to rebuild a Map inner tp from recovered K/V CTs.
+fn type_from_tag_node(ct: Int) -> Int {
+    if ct == CT_INT { return type_int() }
+    if ct == CT_STRING { return type_string() }
+    sv_tp(ct, -1, -1, "")
 }
 
 // Precondition: fs.starts_with("Result_"). Malformed tags (no second segment)

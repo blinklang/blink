@@ -32,6 +32,9 @@ import codegen_types.{
     get_fn_ret_handler, get_fn_ret_struct_inner, get_fn_ret_type,
     get_generic_fn_node,
     get_impl_method_ret, has_derive_method, impl_method_reg_name, impl_trait_for_method, impl_type_implements_trait_method, lookup_impl_method, mangle_impl_method_q, get_list_elem_struct, get_list_elem_type,
+    get_list_elem_option_inner, get_list_elem_option_inner_struct, get_list_elem_option_inner_tp,
+    get_list_elem_result_ok, get_list_elem_result_err, get_list_elem_result_ok_struct, get_list_elem_result_err_struct,
+    get_list_elem_result_ok_tp, get_list_elem_result_err_tp, tp_carrier_tag, c_type_tag_for_struct,
     get_map_key_type, get_map_key_struct,
     get_map_value_list_elem, get_map_value_struct, get_map_value_type,
     get_struct_field_closure_sig,
@@ -40,7 +43,7 @@ import codegen_types.{
     get_var_alias, get_var_closure_sig, get_var_enum,
     get_var_handle_inner, get_var_handle_inner2, get_var_handle_sname,
     get_var_iter_next_fn, get_var_iterator_inner,
-    get_var_option_inner, get_var_option_inner2,
+    get_var_option_inner, get_var_option_inner2, get_var_option_inner_tp,
     get_var_option_inner2_struct, get_var_option_inner_struct,
     get_var_result_err, get_var_result_err_struct,
     get_var_result_ok, get_var_result_ok_struct,
@@ -117,6 +120,13 @@ pub let mut expr_option_inner_list_elem: Int = -1
 pub let mut expr_option_inner_list_struct: Str = ""
 pub let mut expr_option_inner_map_val_struct: Str = ""
 pub let mut expr_option_inner_map_val_list_elem: Int = -1
+// whg65a: the full inner tp NODE of a compound List element read back by
+// List[Option[C]].get()/pop() (the `Map[Int,Str]` / `List[Int]` tp inside the
+// element Option/Result). Carries a NESTED container's own type params — which
+// the single-slot inner2 channels can't — so the match arm that unwraps to `mm`
+// stamps the Map's K/V (or the List's element) onto `mm` via set_map_types /
+// set_list_elem_*. -1 when the element inner is a plain scalar/struct.
+pub let mut expr_option_inner_tp: Int = -1
 pub let mut expr_iter_next_fn: Str = ""
 
 let mut embed_byte_lut: List[Str] = []
@@ -135,14 +145,68 @@ pub let mut ifs_iter_var: Str = ""
 pub let mut ifs_next_fn: Str = ""
 pub let mut ifs_elem_type: Int = 0
 pub let mut ifs_opt_type: Str = ""
+// j0cdey: when the list element is a pointer-boxed COMPOUND (Option/Result), the
+// iterator is keyed on CT_INT (the value is an intptr_t to the carrier) and this
+// holds the concrete carrier tag (`Option_int`, `Result_int_str`,
+// `Option_Map_int_str`). Consumers deref `*(blink_<tag>*)(intptr_t)next.value`
+// before handing the element to a closure/adapter. Empty for a scalar element.
+pub let mut ifs_carrier_tag: Str = ""
+
+// j0cdey: the carrier tag for a List's COMPOUND element (Option/Result), or "" if
+// the element isn't a compound. Mirrors the .get()/for-in carrier derivation:
+// the element's full inner tp drives the tag (tp_carrier_tag) so a nested
+// container inner — `List[Option[Map[Int,Str]]]` → `Option_Map_int_str` — keeps
+// its type params and composes with whg65a.
+fn list_compound_carrier_tag(obj_str: Str, elem_type: Int) -> Str {
+    if elem_type == CT_OPTION {
+        let oi_tp = get_list_elem_option_inner_tp(obj_str)
+        let oi_struct = get_list_elem_option_inner_struct(obj_str)
+        let oi_ct = get_list_elem_option_inner(obj_str)
+        if oi_tp >= 0 { return "Option_{tp_carrier_tag(oi_tp)}" }
+        if oi_struct != "" { return "Option_{c_type_tag_for_struct(oi_struct)}" }
+        if oi_ct >= 0 { return "Option_{c_type_tag(oi_ct)}" }
+        return "Option_int"
+    }
+    if elem_type == CT_RESULT {
+        let rok_tp = get_list_elem_result_ok_tp(obj_str)
+        let rerr_tp = get_list_elem_result_err_tp(obj_str)
+        let rok_struct = get_list_elem_result_ok_struct(obj_str)
+        let rerr_struct = get_list_elem_result_err_struct(obj_str)
+        let rok_ct = get_list_elem_result_ok(obj_str)
+        let rerr_ct = get_list_elem_result_err(obj_str)
+        let ok_tag = if rok_tp >= 0 { tp_carrier_tag(rok_tp) } else if rok_struct != "" { c_type_tag_for_struct(rok_struct) } else if rok_ct >= 0 { c_type_tag(rok_ct) } else { "int" }
+        let err_tag = if rerr_tp >= 0 { tp_carrier_tag(rerr_tp) } else if rerr_struct != "" { c_type_tag_for_struct(rerr_struct) } else if rerr_ct >= 0 { c_type_tag(rerr_ct) } else { "str" }
+        return "Result_{ok_tag}_{err_tag}"
+    }
+    ""
+}
 
 // Convert a CT_LIST or CT_ITERATOR source into a uniform iterator representation.
 // Sets ifs_iter_var (C var name of the iterator struct on the stack),
 // ifs_next_fn (C function name to call next), ifs_elem_type, ifs_opt_type.
+// j0cdey: for a COMPOUND element, keys the iterator on CT_INT (the pointer
+// iterator) and sets ifs_carrier_tag so consumers deref the boxed carrier.
 pub fn iter_from_source(obj_str: Str, obj_type: Int) ! Codegen.Emit {
+    ifs_carrier_tag = ""
     if obj_type == CT_LIST {
         let mut elem_type = get_list_elem_type(obj_str)
         if elem_type == -1 { elem_type = CT_INT }
+        let carrier = list_compound_carrier_tag(obj_str, elem_type)
+        if carrier != "" {
+            // Pointer-boxed compound element: iterate via the generic pointer
+            // iterator (values = intptr_t) and expose the carrier tag for the deref.
+            ensure_carrier_from_tag(carrier)
+            ensure_iter_type(CT_INT)
+            let li_type = list_iter_c_type(CT_INT)
+            let iter_var = fresh_temp("__src_iter_")
+            emit_line("{li_type} {iter_var} = blink_list_into_iter_int({obj_str});")
+            ifs_iter_var = iter_var
+            ifs_next_fn = "{li_type}_next"
+            ifs_elem_type = CT_INT
+            ifs_opt_type = option_c_type(CT_INT)
+            ifs_carrier_tag = carrier
+            return
+        }
         ensure_iter_type(elem_type)
         let tag = c_type_tag(elem_type)
         let li_type = list_iter_c_type(elem_type)
@@ -549,6 +613,11 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
         if expr_result_type == CT_OPTION {
             expr_option_inner = get_var_option_inner(name)
             expr_option_inner_struct = get_var_option_inner_struct(name)
+            // whg65a: restore the deep inner tp so a match on this Option var (an
+            // `Option[Map[K,V]]` / `Option[List[T]]` unwrapped from a
+            // List[compound] element) recovers the nested container's own type
+            // params. -1 for a scalar/struct inner — resets any stale value.
+            expr_option_inner_tp = get_var_option_inner_tp(name)
             if expr_option_inner == CT_LIST {
                 expr_option_inner_list_elem = get_var_option_inner2(name)
                 expr_option_inner_list_struct = get_var_option_inner2_struct(name)

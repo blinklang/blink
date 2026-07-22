@@ -9,11 +9,13 @@ import parser.{
     sublist_length, sublist_get,
 }
 import codegen_types.{
-    Codegen, CT_INT, CT_FLOAT, CT_BOOL, CT_VOID, CT_STRUCT, CT_CLOSURE, CT_OPTION,
+    Codegen, CT_INT, CT_FLOAT, CT_BOOL, CT_VOID, CT_STRUCT, CT_CLOSURE, CT_OPTION, CT_RESULT,
     CaptureEntry, ClosureCapInfo, VarEnumEntry,
     emit_line, c_safe_name, c_type_str, c_type_c_name, type_from_name,
+    compound_name_from_ann, ensure_carrier_from_tag,
     tp_get_kind, tp_get_sname,
     scope_vars, push_scope, pop_scope, set_var, set_var_closure, set_var_struct, get_var_tp, is_scope_var,
+    set_var_option_from_struct_tag, set_var_result_from_struct_tag,
     fn_regs, fn_regs_idx, var_enums, mut_captured_vars,
     closure_captures, closure_cap_infos, closure_lit_cap_idx, closure_param_names,
     is_emitted_fn, is_enum_type, is_struct_type, list_contains_str, resolve_variant,
@@ -838,6 +840,15 @@ pub fn emit_closure(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
                 params_c = params_c.concat("{c_type_c_name(ptype)} {pname}")
             } else if ptype == "Tuple" {
                 params_c = params_c.concat("{tuple_c_name_from_ann(node_type_ann(p), \"void\")} {pname}")
+            } else if type_from_name(ptype) == CT_OPTION || type_from_name(ptype) == CT_RESULT {
+                // j0cdey: a closure param typed `Option[T]` / `Result[T,E]` (a HOF
+                // over List[Option[T]]) must lower to the parameterized carrier
+                // (blink_Option_int, …), not the bare `void` that c_type_str(CT_OPTION)
+                // yields with no inner. compound_name_from_ann builds the carrier tag
+                // from the annotation (nested inners kept — composes with whg65a).
+                let carrier = compound_name_from_ann(node_type_ann(p))
+                ensure_carrier_from_tag(carrier)
+                params_c = params_c.concat("{c_type_c_name(carrier)} {pname}")
             } else {
                 let ct = type_from_name(ptype)
                 params_c = params_c.concat("{c_type_str(ct)} {pname}")
@@ -883,6 +894,16 @@ pub fn emit_closure(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
                 }
             } else if ptype == "" && saved_param_hint >= 0 && saved_param_hint != CT_VOID {
                 set_var(pname, saved_param_hint, 1)
+            } else if type_from_name(ptype) == CT_OPTION {
+                // j0cdey: a closure param `x: Option[T]` binds as an Option carrying
+                // its inner from the annotation, so a body `match x { Some(v) => ... }`
+                // decodes v. set_var_option_from_struct_tag also recovers a nested
+                // Map value (whg65a), so `List[Option[Map]].for_each` composes.
+                set_var(pname, CT_OPTION, 1)
+                set_var_option_from_struct_tag(pname, compound_name_from_ann(node_type_ann(p)))
+            } else if type_from_name(ptype) == CT_RESULT {
+                set_var(pname, CT_RESULT, 1)
+                set_var_result_from_struct_tag(pname, compound_name_from_ann(node_type_ann(p)))
             } else {
                 let param_ct = if is_enum_type(ptype) != 0 { CT_INT } else { type_from_name(ptype) }
                 set_var(pname, param_ct, 1)
@@ -1016,6 +1037,12 @@ pub fn emit_closure(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
                 sig_params = sig_params.concat(c_type_c_name(sptype))
             } else if sptype == "Tuple" {
                 sig_params = sig_params.concat(tuple_c_name_from_ann(node_type_ann(sp), "void"))
+            } else if type_from_name(sptype) == CT_OPTION || type_from_name(sptype) == CT_RESULT {
+                // j0cdey: the call-site fn-ptr cast must match the closure body's
+                // parameterized carrier param (blink_Option_int, …) — see the param
+                // list above. Without this the cast keeps `void` and gcc rejects the
+                // 2-arg call.
+                sig_params = sig_params.concat(c_type_c_name(compound_name_from_ann(node_type_ann(sp))))
             } else {
                 sig_params = sig_params.concat(c_type_str(type_from_name(sptype)))
             }
