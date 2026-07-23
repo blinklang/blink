@@ -18,7 +18,7 @@ import codegen_types.{
     ensure_map_iter_c, ensure_take_iter_c, ensure_skip_iter_c,
     set_var_iter_carrier, set_list_elem_compound_from_tag,
     ensure_result_type, ensure_skip_iter, ensure_struct_option_type,
-    ensure_struct_result_type, ensure_take_iter,
+    ensure_struct_result_type, ensure_take_iter, ensure_tuple_type,
     find_from_impl, find_impl_method_node, impl_method_self_name, find_tryfrom_impl, fresh_temp,
     get_fn_ret, get_fn_ret_struct, get_fn_ret_struct_inner, get_fn_ret_type,
     get_impl_method_ret, get_list_elem_map_key_type, get_list_elem_map_val_type, get_list_elem_map_val_struct, set_list_elem_map_types, is_map_scalar_ct,
@@ -964,6 +964,46 @@ fn hof_elem_value(next_var: Str) -> Str {
         return "(*({carrier_c}*)(intptr_t){next_var}.value)"
     }
     "{next_var}.value"
+}
+
+// 44xww4: one slot of an enumerate/zip pair, described for the Tuple2 struct that
+// materializes the pair. `carrier` is the pointer-boxed compound tag (Option_int,
+// Result_int_str) or "" for a scalar; `next_var`.value holds the carrier's value.
+// tag: tuple-name / elem_structs token (Option_int, or "int" for a scalar).
+// ct: elem_types CSV entry — CT_VOID for a compound, the scalar CT otherwise.
+// struct_tag: elem_structs token — the carrier tag for a compound, "" for a scalar.
+// value: C expression for the slot value, BY VALUE.
+type EnumZipSlot { tag: Str, ct: Int, struct_tag: Str, value: Str }
+
+// 44xww4: describe an enumerate/zip pair slot fed by a `.value`-carrying iterator
+// `next` result. A compound source (carrier != "") boxes the carrier behind an
+// intptr_t, so deref it back BY VALUE for a plain struct-field assignment — the
+// s663bm multi-eightbyte RETURN concern does NOT apply to a field store. A scalar
+// slot keys on its CT directly.
+fn enum_zip_slot(next_var: Str, elem_type: Int, carrier: Str) -> EnumZipSlot {
+    if carrier != "" {
+        let carrier_c = c_type_from_tag(carrier)
+        return EnumZipSlot { tag: carrier, ct: CT_VOID, struct_tag: carrier, value: "(*({carrier_c}*)(intptr_t){next_var}.value)" }
+    }
+    EnumZipSlot { tag: c_type_tag(elem_type), ct: elem_type, struct_tag: "", value: "{next_var}.value" }
+}
+
+// The slot's elem_structs CSV token for ensure_tuple_type: the carrier tag for a
+// compound, or the "-" no-struct sentinel for a scalar.
+fn enum_zip_slot_struct_csv(slot: EnumZipSlot) -> Str {
+    if slot.struct_tag != "" { slot.struct_tag } else { "-" }
+}
+
+// 44xww4: stamp `result_list` as a List of `tuple_tag` structs (mirrors
+// emit_list_lit's struct-element path) and set the expr_* result channels so the
+// caller's `.get()` returns Option[tuple_tag] and `for (i,x)` destructures it.
+fn finish_enum_zip_result(result_list: Str, tuple_tag: Str) {
+    set_list_elem_type(result_list, CT_VOID)
+    set_list_elem_struct(result_list, tuple_tag)
+    expr_result_str = result_list
+    expr_result_type = CT_LIST
+    expr_list_elem_type = CT_VOID
+    expr_list_elem_struct = tuple_tag
 }
 
 // j0cdey: copy a source List's COMPOUND element type onto a destination list
@@ -3787,20 +3827,31 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
         // --- Adapter methods: return CT_ITERATOR ---
 
         // z9gkt3: the lazy ADAPTER HOFs .map/.filter/.take/.skip/.chain/.flat_map
-        // over a List[compound] now route through per-carrier adapter iterators
+        // over a List[compound] route through per-carrier adapter iterators
         // (blink_MapIterator_Option_int, …) that deref the pointer-boxed carrier.
-        // .enumerate/.zip remain deferred (44xww4): they are EAGER inline
-        // materializers that build an inner pair list, and threading the compound
-        // element's metadata onto that inner pair channel (so a `for (i,x)`
-        // destructuring re-decodes it) is a separate piece. They still take the
-        // CT_INT branch and would push the boxed carrier's pointer bits without
-        // re-stamping the result element — fail LOUDLY (cf. PolyImplUnsupported)
-        // instead of emitting a silently wrong pair list.
-        if obj_type == CT_LIST && (method == "enumerate" || method == "zip") && is_compound_ct(get_list_elem_type(obj_str)) != 0 {
-            diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "'.{method}' over a List of Option/Result elements is not yet supported (br 44xww4)", node, "collect into a concrete list first, or use an eager HOF (for_each/fold/filter-via-loop)")
-            expr_result_str = "0"
-            expr_result_type = CT_VOID
-            return
+        // 44xww4: .enumerate/.zip over a List[compound] now flow through the same
+        // Tuple2-struct materialization as directly-constructed tuples — the pair's
+        // compound slot rides the struct field's stype (Option_int), so .0/.1 access
+        // and for (i,x) destructuring re-decode it with no extra plumbing.
+
+        // msm1k3: iter_from_source has NO struct/enum-name channel — it lowers a
+        // struct-element list to blink_list_into_iter_void / blink_Option_void, so
+        // c_type_tag(elem_type) spells the pair slot "void" and the Tuple2 field
+        // erases (a silent cc miscompile). This is a pre-existing iter_from_source
+        // limitation shared by EVERY HOF (map/collect/take/… over List[Struct] fail
+        // identically), not specific to enumerate/zip. Until msm1k3 gives
+        // iter_from_source a struct channel, fail LOUDLY here rather than emit a
+        // confusing C error. Fires only for a DIRECT List whose element is a real
+        // struct/enum (a compound carrier tag like Option_int is not a struct type,
+        // so the compound path above is unaffected).
+        if obj_type == CT_LIST && (method == "enumerate" || method == "zip") {
+            let es = get_list_elem_struct(obj_str)
+            if es != "" && (is_struct_type(es) != 0 || is_enum_type(es) != 0) {
+                diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "'.{method}' over a List of struct/enum elements is not yet supported (br msm1k3)", node, "collect into a concrete list first, or destructure via an explicit for-loop")
+                expr_result_str = "0"
+                expr_result_type = CT_VOID
+                return
+            }
         }
 
         if method == "map" {
@@ -4043,9 +4094,18 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             let src_next = ifs_next_fn
             let elem_type = ifs_elem_type
             let opt_t = ifs_opt_type
+            // 44xww4: enumerate() yields genuine (Int, T) tuples (spec §3.8/§3c).
+            // The pair materializes as a Tuple2_int_<T> struct so per-slot compound
+            // metadata (.1 = Option/Result), .0/.1 field access, and for (i,x)
+            // destructuring all flow through the tuple-struct infra — the compound
+            // case needs no extra plumbing (a scalar slot keys on its CT).
             let result_list = fresh_temp("__enum_")
             let next_var = fresh_temp("__enum_next_")
             let i_var = fresh_temp("__enum_i_")
+            let slot1 = enum_zip_slot(next_var, elem_type, ifs_carrier_tag)
+            let tuple_tag = "Tuple2_int_{slot1.tag}"
+            ensure_tuple_type(tuple_tag, 2, "{CT_INT},{slot1.ct}", "-,{enum_zip_slot_struct_csv(slot1)}")
+            let tuple_c = c_type_c_name(tuple_tag)
             emit_line("blink_list* {result_list} = blink_list_new();")
             emit_line("int64_t {i_var} = 0;")
             emit_line("while (1) \{")
@@ -4053,21 +4113,12 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             emit_line("{opt_t} {next_var} = (({opt_t} (*)(void*)){src_next})(&{src_var});")
             emit_line("if ({next_var}.tag == 0) break;")
             let pair_var = fresh_temp("__enum_pair_")
-            emit_line("blink_list* {pair_var} = blink_list_new();")
-            emit_line("blink_list_push({pair_var}, (void*)(intptr_t){i_var});")
-            if elem_type == CT_INT {
-                emit_line("blink_list_push({pair_var}, (void*)(intptr_t){next_var}.value);")
-            } else {
-                emit_line("blink_list_push({pair_var}, (void*){next_var}.value);")
-            }
-            emit_line("blink_list_push({result_list}, (void*){pair_var});")
+            emit_line("{tuple_c} {pair_var} = \{ ._0 = {i_var}, ._1 = {slot1.value} };")
+            emit_boxed_container_store("blink_list_push({result_list}, ", pair_var, CT_VOID, tuple_tag, "")
             emit_line("{i_var}++;")
             cg_indent = cg_indent - 1
             emit_line("}")
-            set_list_elem_type(result_list, CT_LIST)
-            expr_result_str = result_list
-            expr_result_type = CT_LIST
-            expr_list_elem_type = CT_LIST
+            finish_enum_zip_result(result_list, tuple_tag)
             return
         }
         if method == "zip" {
@@ -4080,14 +4131,25 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             let next_a = ifs_next_fn
             let elem_type_a = ifs_elem_type
             let opt_a = ifs_opt_type
+            // Capture side A's carrier before the second iter_from_source clobbers
+            // ifs_carrier_tag (mirrors the next_a/opt_a capture above).
+            let carrier_a = ifs_carrier_tag
             iter_from_source(other_str, other_type)
             let src_b_var = ifs_iter_var
             let next_b = ifs_next_fn
             let elem_type_b = ifs_elem_type
             let opt_b = ifs_opt_type
+            let carrier_b = ifs_carrier_tag
+            // 44xww4: zip() yields genuine (T, U) tuples (spec §3.8/§3c) — same
+            // Tuple2 materialization as enumerate, one value slot per side.
             let result_list = fresh_temp("__zip_")
             let next_a_var = fresh_temp("__zip_na_")
             let next_b_var = fresh_temp("__zip_nb_")
+            let slot_a = enum_zip_slot(next_a_var, elem_type_a, carrier_a)
+            let slot_b = enum_zip_slot(next_b_var, elem_type_b, carrier_b)
+            let tuple_tag = "Tuple2_{slot_a.tag}_{slot_b.tag}"
+            ensure_tuple_type(tuple_tag, 2, "{slot_a.ct},{slot_b.ct}", "{enum_zip_slot_struct_csv(slot_a)},{enum_zip_slot_struct_csv(slot_b)}")
+            let tuple_c = c_type_c_name(tuple_tag)
             emit_line("blink_list* {result_list} = blink_list_new();")
             emit_line("while (1) \{")
             cg_indent = cg_indent + 1
@@ -4096,24 +4158,11 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             emit_line("{opt_b} {next_b_var} = (({opt_b} (*)(void*)){next_b})(&{src_b_var});")
             emit_line("if ({next_b_var}.tag == 0) break;")
             let pair_var = fresh_temp("__zip_pair_")
-            emit_line("blink_list* {pair_var} = blink_list_new();")
-            if elem_type_a == CT_INT {
-                emit_line("blink_list_push({pair_var}, (void*)(intptr_t){next_a_var}.value);")
-            } else {
-                emit_line("blink_list_push({pair_var}, (void*){next_a_var}.value);")
-            }
-            if elem_type_b == CT_INT {
-                emit_line("blink_list_push({pair_var}, (void*)(intptr_t){next_b_var}.value);")
-            } else {
-                emit_line("blink_list_push({pair_var}, (void*){next_b_var}.value);")
-            }
-            emit_line("blink_list_push({result_list}, (void*){pair_var});")
+            emit_line("{tuple_c} {pair_var} = \{ ._0 = {slot_a.value}, ._1 = {slot_b.value} };")
+            emit_boxed_container_store("blink_list_push({result_list}, ", pair_var, CT_VOID, tuple_tag, "")
             cg_indent = cg_indent - 1
             emit_line("}")
-            set_list_elem_type(result_list, CT_LIST)
-            expr_result_str = result_list
-            expr_result_type = CT_LIST
-            expr_list_elem_type = CT_LIST
+            finish_enum_zip_result(result_list, tuple_tag)
             return
         }
 
