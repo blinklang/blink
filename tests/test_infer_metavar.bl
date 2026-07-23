@@ -1,0 +1,64 @@
+// Stage 2 (gqg3rk c9hv7g): metavariable constraint threading.
+//
+// An unannotated empty container mints a fresh metavar α for its element/inner
+// type. A later constraining use (push/insert/assignment) must PIN α to the
+// concrete type via unification — NOT discard the constraint the way the old
+// `check_arg_value` TYPE_UNKNOWN early-return did. This file is the spec:
+//   (a) push-then-use infers the right element type (compiles + runs correctly)
+//   (b) a mistyped use of a now-pinned element is REJECTED (the latent-erasure
+//       fix: `let s: Str = intList.get(0).unwrap()` used to type-check green).
+//
+// Decision: decisions/under-determined-types.md (6-0). Spec: sections/03_types.md §3.3.
+
+import compile_test_helpers
+
+// ── (a) push-then-use pins the element; program is correct ──────────────────
+
+test "unannotated list pinned by push infers Int element" {
+    let src = "fn main() ! IO \{\n    let mut xs = []\n    xs.push(1)\n    xs.push(2)\n    let n: Int = xs.get(0).unwrap()\n    assert_eq(n, 1)\n}\n"
+    compile_test_helpers.expect_no_error(src, "mv_list_push_int", "E0301")
+}
+
+test "unannotated list pinned by push infers Str element" {
+    let src = "fn main() ! IO \{\n    let mut xs = []\n    xs.push(\"a\")\n    let s: Str = xs.get(0).unwrap()\n    assert_eq(s, \"a\")\n}\n"
+    compile_test_helpers.expect_no_error(src, "mv_list_push_str", "E0301")
+}
+
+test "unannotated Set pinned by insert survives (no E0301)" {
+    let src = "fn main() ! IO \{\n    let mut s = Set()\n    s.insert(\"Alice\")\n    assert_eq(s.contains(\"Alice\"), 1)\n}\n"
+    compile_test_helpers.expect_no_error(src, "mv_set_insert", "E0301")
+}
+
+test "unannotated Map pinned by insert survives (no E0301)" {
+    let src = "fn main() ! IO \{\n    let mut m = Map()\n    m.insert(\"k\", 1)\n    let v: Int = m.get(\"k\").unwrap()\n    assert_eq(v, 1)\n}\n"
+    compile_test_helpers.expect_no_error(src, "mv_map_insert", "E0301")
+}
+
+// ── (b) latent-erasure fix: a pinned element rejects a mistyped use ─────────
+
+test "Str binding from a pinned Int-list element is rejected" {
+    // xs is pinned List[Int] by push(1); assigning its element to a Str MUST error.
+    // Before metavars this type-checked green (element erased to TYPE_UNKNOWN,
+    // which types_compatible treats as compatible with everything).
+    let src = "fn main() ! IO \{\n    let mut xs = []\n    xs.push(1)\n    let s: Str = xs.get(0).unwrap()\n    assert_eq(s.len(), 0)\n}\n"
+    compile_test_helpers.expect_compile_error(src, "mv_list_mistyped", "declared type")
+}
+
+test "mistyped push after a pinning push is rejected" {
+    // First push pins α=Int; the second push of a Str must be an arg-type error.
+    let src = "fn main() ! IO \{\n    let mut xs = []\n    xs.push(1)\n    xs.push(\"a\")\n}\n"
+    compile_test_helpers.expect_compile_error(src, "mv_list_push_conflict", "expects")
+}
+
+// ── (c) a typed-param function call is a constraining use (check_arg_shapes) ─
+
+test "passing empty list to a typed-param fn pins the element" {
+    let src = "fn takes_ints(xs: List[Int]) -> Int \{ xs.len() }\nfn main() ! IO \{\n    let xs = []\n    let n = takes_ints(xs)\n    assert_eq(n, 0)\n}\n"
+    compile_test_helpers.expect_no_error(src, "mv_fnarg_pin", "E0301")
+}
+
+test "passing empty list to a mismatched typed-param fn is rejected" {
+    // xs pinned List[Str] by the first call; second call wants List[Int] -> error.
+    let src = "fn takes_strs(xs: List[Str]) -> Int \{ xs.len() }\nfn takes_ints(xs: List[Int]) -> Int \{ xs.len() }\nfn main() ! IO \{\n    let xs = []\n    let a = takes_strs(xs)\n    let b = takes_ints(xs)\n    assert_eq(a + b, 0)\n}\n"
+    compile_test_helpers.expect_compile_error(src, "mv_fnarg_conflict", "expects")
+}

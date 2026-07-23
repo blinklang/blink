@@ -15,9 +15,9 @@ import parser.{
     sublist_get, sublist_length,
 }
 import diagnostics.{
-    Diag, diag_clear_allows, diag_error_at, diag_error_no_loc,
+    Diag, diag_clear_allows, diag_error_at, diag_error_at_notes, diag_error_no_loc,
     diag_push_allows, diag_warn_at,
-    TYPE_ERROR, CAPABILITY_BUDGET, QM_INVALID_OPERAND, UNDEFINED_FUNCTION,
+    TYPE_ERROR, CANNOT_INFER_TYPE, CAPABILITY_BUDGET, QM_INVALID_OPERAND, UNDEFINED_FUNCTION,
     UNRESOLVED_METHOD, AMBIGUOUS_METHOD_CALL, MISSING_DISPLAY_IMPL,
     UNDEFINED_VARIABLE, UNKNOWN_TYPE, QM_RESULT_IN_NON_RESULT,
     QM_OPTION_IN_NON_OPTION, QM_ERROR_MISMATCH,
@@ -626,6 +626,291 @@ fn make_set_type(elem_type: Int) -> Int {
     t
 }
 
+// ── Metavariables (Hindley-Milner inference discipline) ─────────────
+//
+// A metavariable is a *fresh* TK_UNKNOWN pool entry (minted per binding via
+// make_metavar), distinct from the single shared TYPE_UNKNOWN sentinel so each
+// unannotated `[]` / `None` / `Map()` / `Set()` gets its OWN α that can be pinned
+// independently by a later constraining use. This is textbook HM: an α starts
+// unbound and is bound in place when unification meets it against a concrete type
+// (`xs.push(1)` pins List's element α to Int). Under-determined types (an α still
+// unbound at the region boundary) become error[CannotInferType] (E0301) rather
+// than the pre-decision silent Void-erasure. Decision: decisions/under-determined-types.md.
+//
+// Representation rides the existing functional pool (no new store):
+//   unbound α : kind == TK_UNKNOWN, inner1 == -1   (new_type's default)
+//   bound   α : kind == TK_UNKNOWN, inner1 == <solution tid>  (>= 0, set via ty_pool.set)
+// The shared TYPE_UNKNOWN singleton keeps inner1 == -1 forever (never a per-binding
+// α, never bound), so resolve() is the identity on it — Stage-1-safe.
+
+fn make_metavar() -> Int {
+    // A fresh, independently-bindable α. NOT the shared TYPE_UNKNOWN singleton.
+    new_type(TK_UNKNOWN, "?")
+}
+
+fn tc_is_unbound_metavar(tid: Int) -> Int {
+    if tid < 0 || tid >= ty_pool.len() { return 0 }
+    if tid == TYPE_UNKNOWN { return 0 }
+    let e = ty_pool.get(tid).unwrap()
+    if e.kind == TK_UNKNOWN && e.inner1 < 0 { return 1 }
+    0
+}
+
+// Follow a bound metavar to its solution. Identity on concrete types, typevars,
+// the shared TYPE_UNKNOWN singleton, and unbound metavars. The step cap is a
+// defensive backstop; the occurs-guard in bind_metavar prevents cycles at bind
+// time, so in practice the chain is short (path compression optional).
+// Named tc_resolve (not bare `resolve`) to avoid a flat-symbol clash with
+// pkg.resolver.resolve in the archive-linked build.
+fn tc_resolve(tid0: Int) -> Int {
+    let mut tid = tid0
+    let mut steps = 0
+    while steps < 10000 {
+        if tid < 0 || tid >= ty_pool.len() { return tid }
+        let e = ty_pool.get(tid).unwrap()
+        if e.kind == TK_UNKNOWN && e.inner1 >= 0 {
+            tid = e.inner1
+            steps = steps + 1
+        } else {
+            return tid
+        }
+    }
+    tid
+}
+
+// Does `needle` (an unbound α) occur inside `hay` after resolution? Guards
+// bind_metavar against building an infinitely-recursive type (α := List[α]).
+fn tc_occurs_in(needle: Int, hay0: Int) -> Int {
+    let hay = tc_resolve(hay0)
+    if hay < 0 || hay >= ty_pool.len() { return 0 }
+    if hay == needle { return 1 }
+    let e = ty_pool.get(hay).unwrap()
+    let k = e.kind
+    if k == TK_LIST || k == TK_OPTION || k == TK_SET {
+        return tc_occurs_in(needle, e.inner1)
+    }
+    if k == TK_RESULT || k == TK_MAP {
+        if tc_occurs_in(needle, e.inner1) != 0 { return 1 }
+        return tc_occurs_in(needle, e.inner2)
+    }
+    if k == TK_TUPLE || k == TK_STRUCT || k == TK_ENUM {
+        let mut i = 0
+        while i < e.params_count {
+            let c = ty_param_list.get(e.params_start + i).unwrap()
+            if tc_occurs_in(needle, c) != 0 { return 1 }
+            i = i + 1
+        }
+        return 0
+    }
+    0
+}
+
+// Bind an unbound metavar α to a concrete solution by mutating its slot in place
+// (the ty_pool.set idiom every make_*_type uses). Returns 1 on success. Refuses a
+// self-bind (α := α) and a cyclic bind (α occurs in the solution) — both leave α
+// unbound so the region-boundary check can report E0301.
+fn bind_metavar(a0: Int, sol0: Int) -> Int {
+    let a = tc_resolve(a0)
+    let sol = tc_resolve(sol0)
+    if tc_is_unbound_metavar(a) == 0 { return 0 }
+    if a == sol { return 0 }
+    if tc_occurs_in(a, sol) != 0 { return 0 }
+    let e = ty_pool.get(a).unwrap()
+    ty_pool.set(a, TypePoolEntry { inner1: sol, ..e })
+    1
+}
+
+// Does `tid` carry an unbound metavariable anywhere in its structure (after
+// resolution)? True for a bare unbound α and for any compound that transitively
+// contains one (List[α], Map[Str,α], Box[α], (Int, α), …). This is the shared
+// under-determined predicate: check_arg_value uses it to decide whether to take
+// the unify path, and the Stage-3 region-boundary check uses it to fire E0301.
+// NOTE: does NOT reuse tc_tid_encodable — that predicate does not descend
+// TK_LIST/TK_SET (verified) and would miss an under-determined list element.
+fn tc_tid_has_unbound_metavar(tid0: Int) -> Int {
+    let tid = tc_resolve(tid0)
+    if tid < 0 || tid >= ty_pool.len() { return 0 }
+    if tc_is_unbound_metavar(tid) != 0 { return 1 }
+    let e = ty_pool.get(tid).unwrap()
+    let k = e.kind
+    if k == TK_LIST || k == TK_OPTION || k == TK_SET {
+        return tc_tid_has_unbound_metavar(e.inner1)
+    }
+    if k == TK_RESULT || k == TK_MAP {
+        if tc_tid_has_unbound_metavar(e.inner1) != 0 { return 1 }
+        return tc_tid_has_unbound_metavar(e.inner2)
+    }
+    if k == TK_TUPLE || k == TK_STRUCT || k == TK_ENUM {
+        let mut i = 0
+        while i < e.params_count {
+            let c = ty_param_list.get(e.params_start + i).unwrap()
+            if tc_tid_has_unbound_metavar(c) != 0 { return 1 }
+            i = i + 1
+        }
+        return 0
+    }
+    0
+}
+
+// The machine-applicable annotation shape that would fix an under-determined
+// binding, chosen from the empty-ctor's known outer shape (gqg3rk report-at-
+// binding, dual-span). `: List[T]` / `: T?` / `: Map[K, V]` / `: Set[T]`; a
+// generic construction names its open params. Falls back to ": T" for a bare α.
+fn tc_infer_annotation_hint(tid0: Int) -> Str {
+    let tid = tc_resolve(tid0)
+    if tid < 0 || tid >= ty_pool.len() { return ": T" }
+    let e = ty_pool.get(tid).unwrap()
+    let k = e.kind
+    if k == TK_LIST { return ": List[T]" }
+    if k == TK_OPTION { return ": T?" }
+    if k == TK_SET { return ": Set[T]" }
+    if k == TK_MAP { return ": Map[K, V]" }
+    if k == TK_STRUCT || k == TK_ENUM {
+        return ": {strip_module_qualifier(e.name)}[...]"
+    }
+    ": T"
+}
+
+// Pin a sealed Ops-trait receiver's element metavar(s) from the call's payload
+// args (gqg3rk). These static calls (MapOps.insert(m,k,v) …) put the receiver at
+// args[0]; the element-bearing args follow. Mirrors the method-call pin so the
+// trait-qualified spelling is an equally-good constraining use. No-op unless the
+// receiver container actually carries an unbound metavar.
+fn tc_pin_ops_trait_receiver(trait_name: Str, method: Str, args_sl: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    if args_sl == -1 || sublist_length(args_sl) < 2 { return }
+    let recv = tc_resolve(infer_type(sublist_get(args_sl, 0)))
+    if tc_tid_has_unbound_metavar(recv) == 0 { return }
+    let rk = ty_pool.get(recv).unwrap().kind
+    // Only pin from a method whose pinned-position argument GENUINELY carries the
+    // element/key/value. A blind "arg1"/"last-arg" heuristic mis-pins the many
+    // methods whose args are indices or whole containers (ListOps.get(l, idx),
+    // ListOps.concat(l, other), SetOps.union(s, other)) — that would infer the
+    // element from an Int index or a nested container. Gate per method explicitly.
+    if trait_name == "MapOps" {
+        // insert(m,k,v): arg1→key, arg2→value. get/contains_key/remove(m,k): arg1→key.
+        // (len/keys/values are 1-arg → early-returned above.) Every 2+-arg MapOps
+        // method takes the key at arg1, so arg1→key is always right here.
+        if rk != TK_MAP { return }
+        let key_a = ty_pool.get(recv).unwrap().inner1
+        let val_a = ty_pool.get(recv).unwrap().inner2
+        if method == "insert" || method == "get" || method == "contains_key" || method == "remove" {
+            if tc_tid_has_unbound_metavar(key_a) != 0 {
+                let _ = tc_unify(key_a, infer_type(sublist_get(args_sl, 1)))
+            }
+        }
+        if method == "insert" && sublist_length(args_sl) >= 3 && tc_tid_has_unbound_metavar(val_a) != 0 {
+            let _ = tc_unify(val_a, infer_type(sublist_get(args_sl, 2)))
+        }
+        return
+    }
+    if trait_name == "SetOps" {
+        // insert/contains/remove(s,e): arg1→elem. union(s, other) takes a Set, NOT
+        // an element — must NOT pin from it (would infer Set[Set[T]]).
+        if rk != TK_SET { return }
+        if method != "insert" && method != "contains" && method != "remove" { return }
+        let elem_a = ty_pool.get(recv).unwrap().inner1
+        if tc_tid_has_unbound_metavar(elem_a) != 0 {
+            let _ = tc_unify(elem_a, infer_type(sublist_get(args_sl, 1)))
+        }
+        return
+    }
+    if trait_name == "ListOps" {
+        // Only push(l,x) and set(l,i,x) carry the element at the LAST arg. get(l,i),
+        // pop(l), concat(l,other), slice(l,s,e) do NOT — their last arg is an Int
+        // index/bound or another List, so pinning from it mis-infers the element.
+        if rk != TK_LIST { return }
+        if method != "push" && method != "set" { return }
+        let elem_a = ty_pool.get(recv).unwrap().inner1
+        if tc_tid_has_unbound_metavar(elem_a) != 0 {
+            let last = sublist_get(args_sl, sublist_length(args_sl) - 1)
+            let _ = tc_unify(elem_a, infer_type(last))
+        }
+        return
+    }
+}
+
+// Report a binding whose type is under-determined — HM finished the region with a
+// metavar still unbound (an empty `[]`/`None`/`Map()`/`Set()` never pinned by a
+// constraining use). error[CannotInferType] (E0301), sole repair is annotation
+// (decision 8vcj2c, 6-0). Report-at-binding, dual-span: primary caret at the
+// `let`, a secondary note at the empty ctor (the RHS value). The `help` text shows
+// the annotation SHAPE with placeholder type-params (T/K/V) — deliberately NOT a
+// machine-applicable `fix`, because the element type is precisely what the error
+// says is unknowable: an auto-applied `: List[T]` would insert an undefined `T`.
+fn tc_report_under_determined(vname: Str, tid: Int, decl_node: Int) ! Diag.Report {
+    if decl_node == -1 { return }
+    let hint = tc_infer_annotation_hint(tid)
+    let mut notes: List[Str] = []
+    let val = node_value(decl_node)
+    if val != -1 {
+        notes.push("the empty construction here has no element type to infer at line {node_line(val)}")
+    }
+    diag_error_at_notes("CannotInferType", CANNOT_INFER_TYPE, "cannot infer a type for '{vname}': it is never given one by an annotation or a later use", decl_node, "add a type annotation, e.g. `let {vname}{hint} = ...` (replace the placeholder with the intended element type)", notes)
+}
+
+// Structural unification. On meeting an unbound α on either side, bind it to the
+// other side (the crux fix — the constraint is *recorded*, not discarded the way
+// check_arg_value's TYPE_UNKNOWN early-return does today). Returns 1 if the two
+// types can be made equal, 0 on a hard structural mismatch. Same-kind compound
+// types unify element-wise; unequal concrete kinds fail. This is intentionally
+// permissive toward the legacy TYPE_UNKNOWN singleton and bare TK_TYPEVAR (both
+// treated as "unifies with anything, no bind") so Stage 1 is behavior-neutral —
+// only fresh per-binding metavars from make_metavar ever get pinned.
+fn tc_unify(a0: Int, b0: Int) -> Int {
+    let a = tc_resolve(a0)
+    let b = tc_resolve(b0)
+    if a == b { return 1 }
+    if a < 0 || b < 0 { return 1 }
+    if a >= ty_pool.len() || b >= ty_pool.len() { return 1 }
+    // Legacy singleton / bare typevar: unify vacuously, never bind (Stage-1 neutral).
+    if a == TYPE_UNKNOWN || b == TYPE_UNKNOWN { return 1 }
+    let ka0 = ty_pool.get(a).unwrap().kind
+    let kb0 = ty_pool.get(b).unwrap().kind
+    if ka0 == TK_TYPEVAR || kb0 == TK_TYPEVAR { return 1 }
+    // Unbound metavar on either side: pin it to the other side.
+    if tc_is_unbound_metavar(a) != 0 { return bind_metavar(a, b) }
+    if tc_is_unbound_metavar(b) != 0 { return bind_metavar(b, a) }
+    let ta = ty_pool.get(a).unwrap()
+    let tb = ty_pool.get(b).unwrap()
+    let ka = ta.kind
+    let kb = tb.kind
+    if ka != kb { return 0 }
+    if ka == TK_LIST || ka == TK_OPTION || ka == TK_SET {
+        return tc_unify(ta.inner1, tb.inner1)
+    }
+    if ka == TK_RESULT || ka == TK_MAP {
+        if tc_unify(ta.inner1, tb.inner1) == 0 { return 0 }
+        return tc_unify(ta.inner2, tb.inner2)
+    }
+    if ka == TK_TUPLE {
+        if ta.params_count != tb.params_count { return 0 }
+        let mut i = 0
+        while i < ta.params_count {
+            let ea = ty_param_list.get(ta.params_start + i).unwrap()
+            let eb = ty_param_list.get(tb.params_start + i).unwrap()
+            if tc_unify(ea, eb) == 0 { return 0 }
+            i = i + 1
+        }
+        return 1
+    }
+    if ka == TK_STRUCT || ka == TK_ENUM {
+        if strip_module_qualifier(ta.name) != strip_module_qualifier(tb.name) { return 0 }
+        if ta.params_count > 0 && tb.params_count > 0 {
+            if ta.params_count != tb.params_count { return 0 }
+            let mut i = 0
+            while i < ta.params_count {
+                let ea = ty_param_list.get(ta.params_start + i).unwrap()
+                let eb = ty_param_list.get(tb.params_start + i).unwrap()
+                if tc_unify(ea, eb) == 0 { return 0 }
+                i = i + 1
+            }
+        }
+        return 1
+    }
+    // Same concrete scalar kind (Int/Str/Bool/…): already equal by kind.
+    1
+}
+
 // ── Type lookup ─────────────────────────────────────────────────────
 
 fn lookup_named_type(name: Str) -> Int {
@@ -947,6 +1232,38 @@ fn instantiate_return_type(sig: Int, args_sl: Int) -> Int ! TypeCheck.Resolve, T
     substitute_typevar_tid(ret, binds)
 }
 
+// Pin a generic call's metavar-carrying arguments from the resolved typevar binds
+// (gqg3rk). For `fill[K,V](m: Map[K,V], …)` called `fill(Map(), 256, "x")`, the
+// binds recovered from the sibling args are K→Int, V→Str; substituting them into
+// the param type `Map[K,V]` gives `Map[Int,Str]`, and unifying that against the
+// `Map()` arg's `Map[α_k,α_v]` pins α_k=Int, α_v=Str — so codegen emits the right
+// kops instead of the erased str default (the escape miscompile the reviewer
+// found). If a typevar is genuinely unbound (no arg supplies it), substitution
+// leaves it a typevar, unify leaves the arg's α unbound, and E0301 fires at the
+// arg's own binding boundary. Runs only for metavar-carrying args — concrete args
+// and the no-generic path are untouched.
+fn tc_pin_generic_args_from_binds(sig: Int, args_sl: Int, self_offset: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    if args_sl == -1 { return }
+    let fs = fnsig_pool.get(sig).unwrap()
+    let param_start = fs.params_start
+    let param_count = fs.params_count
+    let binds = build_typevar_binds(sig, args_sl)
+    let n = sublist_length(args_sl)
+    let mut i = 0
+    while i < n {
+        let pidx = i + self_offset
+        if pidx < param_count {
+            let arg_t = infer_type(sublist_get(args_sl, i))
+            if tc_tid_has_unbound_metavar(arg_t) != 0 {
+                let ptid = fnsig_param_list.get(param_start + pidx).unwrap()
+                let concrete_ptid = substitute_typevar_tid(ptid, binds)
+                let _ = tc_unify(concrete_ptid, arg_t)
+            }
+        }
+        i = i + 1
+    }
+}
+
 // Parse an all-digits field name ("0", "12") to its Int index, or -1 for any
 // non-numeric name (so struct field accesses never match the tuple path).
 fn str_to_tuple_index(name: Str) -> Int {
@@ -995,12 +1312,24 @@ fn check_arg_shapes(fn_name: Str, sig: Int, args_sl: Int, self_offset: Int) ! Ty
                 tc_construct_hint = resolve_alias_tid(ptid)
                 let arg_t = infer_type(arg_node)
                 tc_construct_hint = saved_hint
-                let mut lit_to_int = 0
-                if is_int_literal_node(arg_node) != 0 && is_integer_type(resolve_alias_tid(ptid)) != 0 {
-                    lit_to_int = 1
-                }
-                if lit_to_int == 0 && types_compatible(arg_t, ptid) == 0 {
-                    tc_error_at("argument {i + 1} of '{fn_name}' expects {type_to_str(ptid)}, got {type_to_str(arg_t)}", arg_node)
+                // Metavar path (gqg3rk): passing an as-yet-unpinned empty container
+                // to a concretely-typed param is a constraining use — UNIFY so the
+                // param type PINS the argument's α (`let xs = []; takes_ints(xs)`
+                // infers List[Int]). tc_unify returns 0 on a hard mismatch (real
+                // arg-type error). Only when a metavar is actually present, so the
+                // fully-concrete path keeps its existing types_compatible semantics.
+                if tc_tid_has_unbound_metavar(arg_t) != 0 {
+                    if tc_unify(ptid, arg_t) == 0 {
+                        tc_error_at("argument {i + 1} of '{fn_name}' expects {type_to_str(ptid)}, got {type_to_str(arg_t)}", arg_node)
+                    }
+                } else {
+                    let mut lit_to_int = 0
+                    if is_int_literal_node(arg_node) != 0 && is_integer_type(resolve_alias_tid(ptid)) != 0 {
+                        lit_to_int = 1
+                    }
+                    if lit_to_int == 0 && types_compatible(arg_t, ptid) == 0 {
+                        tc_error_at("argument {i + 1} of '{fn_name}' expects {type_to_str(ptid)}, got {type_to_str(arg_t)}", arg_node)
+                    }
                 }
             }
         }
@@ -1021,6 +1350,24 @@ fn check_arg_value(label: Str, arg_idx: Int, expected_t: Int, value_node: Int) !
     tc_construct_hint = resolve_alias_tid(expected_t)
     let arg_t = infer_type(value_node)
     tc_construct_hint = saved_hint
+    // Metavariable path (gqg3rk): when the expected type carries an unbound α
+    // (e.g. `elem` of an as-yet-unpinned List/Set/Map — an unannotated `[]`),
+    // UNIFY it with the argument type so the constraining use PINS α, instead of
+    // discarding the constraint. tc_unify binds α in place and returns 1 on a
+    // structural match, 0 on a hard mismatch (a real type error — a conflicting
+    // second push, `xs.push(1); xs.push("a")`). Int-literals still coerce to a
+    // pinned sized-int target. Runs only when a metavar is actually present so
+    // the fully-concrete path stays on the existing types_compatible semantics.
+    if tc_tid_has_unbound_metavar(expected_t) != 0 {
+        let mut lit_ok = 0
+        if is_int_literal_node(value_node) != 0 && is_integer_type(tc_resolve(expected_t)) != 0 {
+            lit_ok = 1
+        }
+        if lit_ok == 0 && tc_unify(expected_t, arg_t) == 0 {
+            tc_error_at("argument {arg_idx + 1} of '{label}' expects {type_to_str(expected_t)}, got {type_to_str(arg_t)}", value_node)
+        }
+        return
+    }
     let mut lit_to_int = 0
     if is_int_literal_node(value_node) != 0 && is_integer_type(resolve_alias_tid(expected_t)) != 0 {
         lit_to_int = 1
@@ -1493,13 +1840,23 @@ fn tc_struct_lit_instance_tid(stid: Int, sname: Str, node: Int) -> Int ! TypeChe
     // MIXED instance (one arg concrete, one unknown) still mints — the arg-list
     // builder keeps the unknown arg, and the field-access consumer skips it.
     let mut has_concrete = 0
+    // gqg3rk: also mint the instance when a param bound to an UNBOUND metavar
+    // (an inner empty `Map()`/`Set()`/`[]`/`None`). Pre-decision this returned the
+    // bare stid and the erased inner rode codegen's default-recovery; post-decision
+    // an under-determined construction must be REPORTED (E0301), so the instance
+    // must carry the α — the region-boundary check then blames the binding and
+    // names the open params. A raw resolved metavar (kind TK_UNKNOWN after
+    // tc_resolve) is the trigger; a bare TK_TYPEVAR (legitimate generic-fn body
+    // context) is NOT — that still returns the bare stid untouched.
+    let mut has_open_metavar = 0
     let mut ci = 0
     while ci < sublist_length(tparams_sl) {
         let bound = binds.get(node_name(sublist_get(tparams_sl, ci))) ?? -1
         if bound != -1 && type_kind(bound) != TK_TYPEVAR && type_kind(bound) != TK_UNKNOWN { has_concrete = 1 }
+        if bound != -1 && tc_tid_has_unbound_metavar(bound) != 0 { has_open_metavar = 1 }
         ci = ci + 1
     }
-    if has_concrete == 0 { return stid }
+    if has_concrete == 0 && has_open_metavar == 0 { return stid }
     let mut arg_tids: List[Int] = []
     let mut ti = 0
     while ti < sublist_length(tparams_sl) {
@@ -3325,6 +3682,7 @@ fn init_types() ! TypeCheck.Register {
     tc_current_fn_ret = -1
     tc_current_fn_name = ""
     tc_suppress_ann_validation = 0
+    tc_boundary_check_active = 0
     tc_errors.clear()
     tc_warnings.clear()
     depr_fn_nodes.clear()
@@ -4002,6 +4360,13 @@ let mut nr_loop_depth: Int = 0
 let mut nr_in_closure_depth: Int = 0
 let mut nr_with_ptr_depth: Int = 0
 let mut nr_warn_unused: Int = 0
+// gqg3rk: the E0301 region-boundary check must run ONLY in the type-inference
+// pass (tc_check_fn/tc_check_body), where annotations are honored (final_tid =
+// declared_tid) and constraining uses have pinned their metavars. The earlier
+// name-resolution pass (nr_check_fn/nr_check_node) shares nr_pop_scope but stores
+// the raw *inferred* RHS type ignoring annotations — so `let m: Map[Str,Int] =
+// Map()` carries an unpinned α there and would false-positive. Gate on this flag.
+let mut tc_boundary_check_active: Int = 0
 
 // Push a new entry into the parallel scope arrays and update nr_name_top.
 // All nr_define* functions must route through here to keep the shadow chain
@@ -4053,6 +4418,19 @@ fn nr_pop_scope() ! Diag.Report {
                         diag_warn_at("UnusedVariable", UNUSED_VARIABLE, "variable '{nm}' is never read", nd, "prefix with '_' to suppress this warning")
                     }
                 }
+            }
+        }
+        // Region boundary (gqg3rk): the scope is closing in the INFERENCE pass and
+        // every constraining use in it has already run (tc_check_body is a single
+        // interleaved walk), so a binding still carrying an unbound metavar is
+        // genuinely under-determined → error[CannotInferType] (E0301). Gated on
+        // tc_boundary_check_active so the earlier annotation-blind name-resolution
+        // pass never fires it. The shared singleton TYPE_UNKNOWN never trips this
+        // (tc_is_unbound_metavar excludes it), so only unpinned empty-ctor bindings
+        // are reported.
+        if tc_boundary_check_active != 0 {
+            if tc_tid_has_unbound_metavar(nr_scope_types.get(idx).unwrap()) != 0 {
+                tc_report_under_determined(nm, nr_scope_types.get(idx).unwrap(), nr_scope_nodes.get(idx).unwrap())
             }
         }
         let prev = nr_scope_prev.get(idx).unwrap()
@@ -4141,6 +4519,13 @@ fn nr_define_mut_at(name: Str, is_mut: Int, node: Int) ! Diag.Report {
 
 fn nr_define_typed(name: Str, is_mut: Int, tid: Int) {
     nr_scope_push_entry(name, is_mut, tid, -1)
+}
+
+// Like nr_define_typed but records the binding's decl node (gqg3rk): the E0301
+// region-boundary check needs a span to point the diagnostic at. Used by the
+// inference-pass LetBinding, whose `node` is the `let` itself.
+fn nr_define_typed_at(name: Str, is_mut: Int, tid: Int, node: Int) {
+    nr_scope_push_entry(name, is_mut, tid, node)
 }
 
 // match-with-return per arm (instead of `let x = match { ... }` as an
@@ -4552,8 +4937,8 @@ fn get_builtin_fn_ret(name: Str) -> Int {
     if name == "process_pid_send_signal" { return TYPE_INT }
     if name == "process_install_signal_forwarding" { return TYPE_VOID }
     if name == "Bytes" { return new_type(TK_BYTES, "Bytes") }
-    if name == "Map" { return make_map_type(TYPE_UNKNOWN, TYPE_UNKNOWN) }
-    if name == "Set" { return make_set_type(TYPE_UNKNOWN) }
+    if name == "Map" { return make_map_type(make_metavar(), make_metavar()) }
+    if name == "Set" { return make_set_type(make_metavar()) }
     TYPE_UNKNOWN
 }
 
@@ -6217,8 +6602,14 @@ fn resolve_alias_tid(tid: Int) -> Int {
 }
 
 fn types_compatible(a0: Int, b0: Int) -> Int {
-    let a = resolve_alias_tid(a0)
-    let b = resolve_alias_tid(b0)
+    // Follow bound metavars to their solution FIRST (gqg3rk): a pinned α reads as
+    // its concrete type, so `let s: Str = intList.get(0).unwrap()` is now rejected
+    // (α=Int vs Str) instead of silently accepted. An *unbound* α (or the shared
+    // TYPE_UNKNOWN singleton) still resolves to a TK_UNKNOWN entry and takes the
+    // permissive branch below — the region-boundary check reports it as E0301, so
+    // we do not double-report it here as a spurious mismatch.
+    let a = tc_resolve(resolve_alias_tid(a0))
+    let b = tc_resolve(resolve_alias_tid(b0))
     if a == b { return 1 }
     if a == TYPE_UNKNOWN || b == TYPE_UNKNOWN { return 1 }
     if a < 0 || b < 0 { return 1 }
@@ -6227,6 +6618,9 @@ fn types_compatible(a0: Int, b0: Int) -> Int {
     let tb = ty_pool.get(b).unwrap()
     let ka = ta.kind
     let kb = tb.kind
+    // An unbound metavar that survived resolution (kind TK_UNKNOWN, not the
+    // singleton) is still "compatible with anything" pending the boundary check.
+    if ka == TK_UNKNOWN || kb == TK_UNKNOWN { return 1 }
     if ka == TK_TYPEVAR || kb == TK_TYPEVAR { return 1 }
     // Int and Bool are interchangeable in Blink (C-style truthiness)
     if (ka == TK_INT || ka == TK_BOOL) && (kb == TK_INT || kb == TK_BOOL) { return 1 }
@@ -6309,12 +6703,27 @@ fn assignment_types_compatible(target_t: Int, val_t: Int, val_node: Int) -> Int 
 // Result[?, Bool] yields Result[Int, Bool] instead of dropping the
 // concrete payload from one side. Caller must have already validated
 // `types_compatible(a, b)`.
-fn type_merge(a: Int, b: Int) -> Int {
+fn type_merge(a0: Int, b0: Int) -> Int {
+    // Branch unification is a constraining use (gqg3rk): `if c { None } else {
+    // Some(x) }` must PIN the None's element α from the Some branch, so the merged
+    // binding is Option[T] and never trips E0301. Resolve bound metavars first,
+    // then unify an unbound α on either side against the other (tc_unify binds it
+    // in place) and return the now-concrete side.
+    let a = tc_resolve(a0)
+    let b = tc_resolve(b0)
     if a == TYPE_UNKNOWN { return b }
     if b == TYPE_UNKNOWN { return a }
     if a == b { return a }
     if a < 0 || b < 0 { return a }
     if a >= ty_pool.len() || b >= ty_pool.len() { return a }
+    if tc_is_unbound_metavar(a) != 0 {
+        let _ = tc_unify(a, b)
+        return tc_resolve(a)
+    }
+    if tc_is_unbound_metavar(b) != 0 {
+        let _ = tc_unify(b, a)
+        return tc_resolve(b)
+    }
     let ta = ty_pool.get(a).unwrap()
     let tb = ty_pool.get(b).unwrap()
     if ta.kind != tb.kind { return a }
@@ -6363,7 +6772,9 @@ fn infer_arm_body(arm: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.R
     infer_type(b)
 }
 
-fn type_kind(tid: Int) -> Int {
+fn type_kind(tid0: Int) -> Int {
+    // Resolve bound metavars so a pinned α reports its solution's kind (gqg3rk).
+    let tid = tc_resolve(tid0)
     if tid < 0 || tid >= ty_pool.len() { return TK_UNKNOWN }
     ty_pool.get(tid).unwrap().kind
 }
@@ -6611,7 +7022,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
     if kind == NodeKind.Ident {
         let name = node_name(node)
         if name == "true" || name == "false" { return TYPE_BOOL }
-        if name == "None" { return make_option_type(TYPE_UNKNOWN) }
+        if name == "None" { return make_option_type(make_metavar()) }
         let vt = nr_get_type(name)
         if vt != TYPE_UNKNOWN { return vt }
         if is_variant_name(name) != 0 {
@@ -6724,7 +7135,15 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             if left_k != TK_OPTION && left_k != TK_UNKNOWN {
                 tc_error_at("'??' operator requires Option value, got {type_to_str(lt)}", node)
             }
-            if left_k == TK_OPTION { return ty_pool.get(lt).unwrap().inner1 }
+            if left_k == TK_OPTION {
+                // `y ?? default` is a constraining use (gqg3rk): the default's type
+                // pins the Option's element α (`None ?? 99` infers y : Int?). Unify
+                // the (possibly-metavar) inner with the default type.
+                let opt = tc_resolve(lt)
+                let inner = ty_pool.get(opt).unwrap().inner1
+                if tc_tid_has_unbound_metavar(inner) != 0 { let _ = tc_unify(inner, rt) }
+                return tc_resolve(inner)
+            }
             return rt
         }
         if lt != TYPE_UNKNOWN { return lt }
@@ -6942,6 +7361,13 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                     }
                     check_arg_shapes(fn_name, sig, args_sl, 0)
                     if fs.type_params_count > 0 {
+                        // gqg3rk: pin any metavar-carrying arg from the call's resolved
+                        // typevar binds, so `fill(Map(), 256, "x")` (K→Int, V→Str from
+                        // the sibling args) codegens the Map() with the right kops
+                        // instead of the erased str default (a silent miscompile). If a
+                        // typevar is genuinely unbound (no arg pins it), the arg's α
+                        // stays unbound and E0301 fires at its own binding/boundary.
+                        tc_pin_generic_args_from_binds(sig, args_sl, 0)
                         return instantiate_return_type(sig, args_sl)
                     }
                     return fs.ret
@@ -7392,6 +7818,14 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
 
         if obj_node != -1 && node_kind(obj_node) == NodeKind.Ident {
             let obj_name = node_name(obj_node)
+            // gqg3rk: a sealed Ops-trait mutator (MapOps.insert(m,k,v),
+            // SetOps.insert(s,e), ListOps.push(l,x)) is a constraining use spelled
+            // statically with the receiver at args[0]. Pin the receiver container's
+            // element metavar(s) from the payload args so `let m = Map();
+            // MapOps.insert(m,"k",42)` infers Map[Str,Int] rather than E0301.
+            if is_sealed_builtin_trait(obj_name) != 0 {
+                tc_pin_ops_trait_receiver(obj_name, method, node_args(node))
+            }
             if obj_name == "Char" {
                 if method == "from_code_point" {
                     return make_result_type(TYPE_CHAR, lookup_named_type("ConversionError"))
@@ -7535,6 +7969,16 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                                 let ak = type_kind(arg_tid)
                                 if ak != TK_TYPEVAR && ak != TK_UNKNOWN {
                                     binds.insert(tpname, arg_tid)
+                                } else if tc_is_unbound_metavar(arg_tid) != 0 {
+                                    // gqg3rk: the instance param is an as-yet-unpinned
+                                    // metavar α (`let b = GBox { s: Set() }`). Bind the
+                                    // field's typevar to THAT SAME α so the field-access
+                                    // type shares it — then a later constraining use
+                                    // (`b.s.insert(3)`) pins α through the field and the
+                                    // whole instance resolves. Without this the field
+                                    // type is a fresh disconnected Set[T] and the pin is
+                                    // lost (→ spurious E0301 on the vbhc4x recovery idiom).
+                                    binds.insert(tpname, arg_tid)
                                 }
                                 i = i + 1
                             }
@@ -7573,7 +8017,10 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             let first_t = infer_type(sublist_get(elems_sl, 0))
             return make_list_type(first_t)
         }
-        return make_list_type(TYPE_UNKNOWN)
+        // Empty `[]`: mint a fresh element metavar α (gqg3rk) so a later
+        // constraining use (xs.push(1)) can pin it. If nothing pins α, the
+        // region-boundary check reports E0301.
+        return make_list_type(make_metavar())
     }
 
     if kind == NodeKind.StructLit {
@@ -7790,6 +8237,8 @@ fn resolve_param_type(p: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
 // outside that pattern, which the analyzer correctly flags.
 @allow(UnrestoredMutation, IncompleteStateRestore)
 fn tc_check_fn(fn_node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let prev_boundary = tc_boundary_check_active
+    tc_boundary_check_active = 1
     nr_push_scope()
     let fn_name = node_name(fn_node)
     let prev_fn_name = tc_current_fn_name
@@ -7851,6 +8300,7 @@ fn tc_check_fn(fn_node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report 
     tc_current_fn_name = prev_fn_name
     tc_current_fn_ret = prev_fn_ret
     nr_pop_scope()
+    tc_boundary_check_active = prev_boundary
 }
 
 // Block branch genuinely save/restores scope via nr_push_scope/nr_pop_scope;
@@ -7920,7 +8370,10 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         if final_tid == TYPE_UNKNOWN {
             final_tid = inferred_tid
         }
-        nr_define_typed(vname, is_mut, final_tid)
+        // Record the decl node (gqg3rk) so the E0301 region-boundary check has a
+        // span. Node is used only for that diagnostic in this pass — unused-var
+        // warnings are off during inference (nr_warn_unused == 0).
+        nr_define_typed_at(vname, is_mut, final_tid, node)
         if type_ann == -1 && type_str == "" && final_tid != TYPE_UNKNOWN {
             tc_hints.push(HintEntry { line: node_line(node), col: node_col(node), name: vname, type_str: type_to_str(final_tid), module: nr_current_module })
         }
@@ -8561,9 +9014,12 @@ fn tc_check_test_block(tb: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repo
         tc_current_fn_ret = TYPE_VOID
     }
 
+    let prev_boundary = tc_boundary_check_active
+    tc_boundary_check_active = 1
     nr_push_scope()
     tc_check_body(tbody)
     nr_pop_scope()
+    tc_boundary_check_active = prev_boundary
 
     tc_current_fn_name = prev_fn_name
     tc_current_fn_ret = prev_fn_ret
@@ -8688,7 +9144,10 @@ fn tc_infer_program(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Re
 
 // ── Debug / introspection ───────────────────────────────────────────
 
-fn type_to_str(tid: Int) -> Str {
+fn type_to_str(tid0: Int) -> Str {
+    // A bound metavar renders as its solution (gqg3rk); an unbound α still
+    // renders as the internal "?" placeholder (never a surface type name).
+    let tid = tc_resolve(tid0)
     if tid < 0 || tid >= ty_pool.len() {
         return "<?>"
     }
@@ -8819,7 +9278,8 @@ fn tc_tid_scalar_tag(tid: Int) -> Str {
 // nested compound → recurse (Option[Result[..]]), else lowercase scalar tag.
 // Mirrors codegen_types.resolve_ann_tag's inner behavior but reads the tid
 // structurally instead of guessing from a flattened string.
-pub fn tc_tid_inner_tag(tid: Int) -> Str {
+pub fn tc_tid_inner_tag(tid0: Int) -> Str {
+    let tid = tc_resolve(tid0)
     if tid < 0 || tid >= ty_pool.len() { return "void" }
     let t = ty_pool.get(tid).unwrap()
     let k = t.kind
@@ -9400,7 +9860,11 @@ pub fn tc_tid_result_err_tid(tid: Int) -> Int {
 // tuple's registered typedef name). tc_tid_encodable gates OUT tuples whose
 // elements are structs/enums, where the tid path's strip_module_qualifier would
 // diverge from c_type_tag_for_struct's module-prefixed spelling.
-pub fn tc_tid_to_c_tag(tid: Int) -> Str {
+pub fn tc_tid_to_c_tag(tid0: Int) -> Str {
+    // Resolve bound metavars (gqg3rk): a pinned α (List[α→Int]) must encode as
+    // its solution (Int), not the erased carrier. Inner recursion resolves too
+    // via the same tc_tid_inner_tag/self recursion, each of which resolves.
+    let tid = tc_resolve(tid0)
     if tid < 0 || tid >= ty_pool.len() { return "Void" }
     let t = ty_pool.get(tid).unwrap()
     let k = t.kind
@@ -9444,6 +9908,13 @@ pub fn tc_tid_to_c_tag(tid: Int) -> Str {
     if k == TK_U32 { return "U32" }
     if k == TK_U64 { return "U64" }
     if k == TK_CHAR { return "Char" }
+    // I0001 (gqg3rk): an unbound metavar (TK_UNKNOWN) reaching C-tag emission means
+    // an under-determined binding escaped the E0301 boundary check — a compiler
+    // invariant violation. Fail CLOSED with an invalid-C-identifier sentinel (the
+    // established BLINK_n idiom) so the C compiler errors loudly, NEVER silently
+    // fall through to "Void" (the pre-decision erased-default miscompile). Keys on
+    // KIND, so a genuine TK_VOID (real Void) is unaffected — it never reaches here.
+    if k == TK_UNKNOWN { return "BLINK_I0001_unsolved_typevar_at_codegen" }
     "Void"
 }
 
@@ -9461,7 +9932,11 @@ pub fn tc_tid_to_c_tag(tid: Int) -> Str {
 // string path's c_type_tag_for_struct KEEPS the module prefix, so a tuple that
 // transitively contains a struct/enum would mangle to a different symbol. Those
 // still defer to the string path.
-fn tc_tid_encodable(tid: Int) -> Bool {
+fn tc_tid_encodable(tid0: Int) -> Bool {
+    // Resolve bound metavars (gqg3rk): a pinned α is encodable iff its solution
+    // is; an unbound α resolves to itself (kind TK_UNKNOWN) → false (defer to the
+    // string path / boundary check reports E0301).
+    let tid = tc_resolve(tid0)
     if tid < 0 || tid >= ty_pool.len() { return false }
     let t = ty_pool.get(tid).unwrap()
     let k = t.kind

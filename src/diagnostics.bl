@@ -18,6 +18,7 @@ effect Diag {
 
 // E0300+ — type errors
 pub const TYPE_ERROR              = "E0300"
+pub const CANNOT_INFER_TYPE       = "E0301"
 pub const TEMPLATE_MISMATCH       = "E0310"
 
 // E0500+ — effects, capabilities, ?-propagation
@@ -183,6 +184,16 @@ pub const BITWISE_PRECEDENCE      = "W0702"
 pub const UNAUDITED_FFI           = "W0800"
 pub const MISSING_CANONICAL_HEADER = "W0812"
 pub const DEPRECATED_USAGE        = "W2000"
+
+// I0000+ — internal compiler errors (ICE). Unsuppressable (bypass lint
+// overrides in diag_emit_range_notes). An ICE means a compiler invariant was
+// violated — it should be unreachable from valid user input; if one fires, it
+// is a compiler bug, never the user's fault.
+// I0001: an unsolved metavariable / typevar reached a codegen chokepoint that
+// must have a concrete type. The type-inference boundary check (E0301) is meant
+// to catch every under-determined binding first, so this firing means a metavar
+// escaped that net. Fails closed (never silently emits "Void").
+pub const UNSOLVED_TYPEVAR_AT_CODEGEN = "I0001"
 
 // ── Diagnostic struct ────────────────────────────────────────────────
 
@@ -420,6 +431,19 @@ pub fn diag_warn_at_notes(name: Str, code: Str, message: Str, node_id: Int, help
     diag_source_file = saved_file
 }
 
+// Error with secondary blame span(s) carried in `notes` (gqg3rk dual-span): the
+// primary caret sits at `node_id` (the binding), and each note points the reader
+// at a contributing sub-expression (e.g. the empty `Map()` whose element is open).
+@allow(UnrestoredMutation, IncompleteStateRestore)
+pub fn diag_error_at_notes(name: Str, code: Str, message: Str, node_id: Int, help: Str, notes: List[Str]) ! Diag.Report {
+    let line = node_line(node_id)
+    let col = node_col(node_id)
+    let saved_file = diag_source_file
+    diag_source_file = diag_file_for_node(node_id)
+    diag_emit_range_notes("error", name, code, message, line, col, 0, 0, help, notes)
+    diag_source_file = saved_file
+}
+
 pub fn diag_ice(name: Str, code: Str, message: Str, line: Int, col: Int, help: Str) ! Diag.Report {
     diag_emit("ice", name, code, message, line, col, help)
 }
@@ -648,6 +672,9 @@ pub fn diag_reset() {
 pub fn diag_explain(code: Str) -> Str {
     if code == TYPE_ERROR {
         return "E0300 -- TypeError\n\nA type mismatch was detected during type checking.\n\nCommon causes:\n  - Passing a value of the wrong type to a function\n  - Using '?' in a function that does not return Result\n  - Assigning a value to a variable of incompatible type\n\nFix: check the expected and actual types in the error message and\nadjust your code to match.\n\n  fn add(a: Int, b: Int) -> Int \{ a + b \}\n  add(1, \"two\")  // E0300: expected Int, got Str"
+    }
+    if code == CANNOT_INFER_TYPE {
+        return "E0301 -- CannotInferType\n\nEvery binding must resolve to a concrete type. This one is\nunder-determined: an empty container or bare None was never given\nan element type -- not by an annotation, and not by a later use\nthat would constrain it. There is no default type; the compiler\nreports it instead of guessing.\n\nA constraining use DOES fix it: pushing/inserting an element, or\npassing the value where a concrete type is expected.\n\n  let mut xs = []\n  xs.push(1)              // OK -- later use infers List[Int]\n\n  let x = []\n  let n = x.len()         // E0301 -- len() does not constrain the element\n\nFix: add a type annotation.\n\n  let x: List[Int] = []   // OK\n  let m: Map[Str, Int] = Map()\n  let o: Int? = None"
     }
     if code == UNDECLARED_EFFECT {
         return "E0500 -- UndeclaredEffect\n\nA function calls another function that requires an effect, but the\ncaller does not declare that effect in its signature.\n\nFix: add '! EffectName' to the calling function's signature.\n\n  fn greet() ! IO \{\n      io.println(\"hello\")  // IO effect declared\n  \}\n\n  fn bad() \{\n      io.println(\"hello\")  // E0500: requires IO but bad() has none\n  \}"
