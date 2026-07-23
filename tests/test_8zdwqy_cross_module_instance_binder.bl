@@ -1,0 +1,79 @@
+import test_cross_module_generic_fn_helper
+
+// Bug 8zdwqy (codegen-structured-tids, project nqq29j). A generic-struct
+// INSTANCE (`CmgBox[Int]`) flowing through a generic function as a bare
+// type-param `T` mangled the C SYMBOL correctly (`..._CmgBox_Int`) but emitted
+// the wrong C TYPE spelling — the never-typedef'd bare head
+// `blink_..._CmgBox` (dropping `_Int`) — so `cc` failed with
+// "unknown type name 'blink_..._CmgBox'". This is a codegen correctness bug:
+// the emitted type must match the symbol the value was mangled as.
+//
+// TWO distinct failure modes (the ticket's stated def-side root cause was
+// wrong; the def side already emits correctly — these two sites were broken):
+//
+//   Bug A — bare struct-instance LET ANNOTATION (free-fn path):
+//     `let b: <helper>.CmgBox[Int] = <helper>.cmg_make_box(7)` emitted
+//     `const blink_..._CmgBox b = ...` — the `_Int` stem dropped on the
+//     DECLARATION. emit_let_binding's struct-fallback annotation branch stored
+//     the bare head (node_name(type_ann)) via set_var_struct, dropping [Int].
+//     Fix: store the mono stem via mono_name_from_ann when the annotation is a
+//     generic instance. Must use the explicit annotation on a fn-call RHS — the
+//     StructLit RHS form (see test_nss31w) already worked and would not be red.
+//
+//   Bug B — poly-impl method CALL SITE bare `-> T` returning the instance:
+//     `boxes.echo_one(b)` over `CmgBox[Int]` emitted `const void r = ...`, the
+//     return collapsed to `void`, cascading to `cmg_unbox` monomorphizing as
+//     `_Void` (undeclared `..._CmgBox_Void`). emit_poly_impl_call's
+//     struct-return-temp gate only accepted is_struct_type||is_enum_type (both
+//     false for a mono stem registered only in mono_rev_idx). Fix: widen the
+//     gate with is_mono_struct_instance.
+//
+// Both bugs ALSO reproduce SAME-MODULE (local `SbBox[T]`) — the cross-module
+// framing is incidental; the fix is module-agnostic. All four cases committed
+// (both bugs × cross-module + same-module) so a same-module case guards a
+// future same-module-only regression. Assert-on-value proves the C compiles
+// AND the value round-trips.
+//
+// DELIBERATELY EXCLUDED (separate pre-existing bugs / already-correct paths):
+//   - concrete-receiver method return of a struct instance (ns7qdm) —
+//     emit_user_impl_call:565, already correct via tc_tid_struct_mono_name.
+//   - poly-impl over a MONOMORPHIC struct (dwhm4v) — orthogonal binder shape.
+//   - struct instance through Option/Result/Map/Tuple CARRIERS (q4etvt/637sy9)
+//     — carrier speller, not a bare-`T` binder.
+//   - the ticket's original (wrong) def-side fix direction — the def side
+//     already emits the correct `..._CmgBox_Int` type.
+
+type SbBox8zdwqy[T] { value: T }
+fn sb_make_8zdwqy[T](v: T) -> SbBox8zdwqy[T] { SbBox8zdwqy { value: v } }
+fn sb_unbox_8zdwqy[T](b: SbBox8zdwqy[T]) -> T { b.value }
+
+fn echo_it_8zdwqy[T](x: T) -> T { x }
+
+trait Echoer8zdwqy[T] { fn echo_one_8zdwqy(self, x: T) -> T }
+impl[T] Echoer8zdwqy[T] for List[T] { fn echo_one_8zdwqy(_self, x: T) -> T { x } }
+
+test "Bug A cross-module: struct-instance let annotation on a fn-call RHS" {
+    let b: test_cross_module_generic_fn_helper.CmgBox[Int] = test_cross_module_generic_fn_helper.cmg_make_box(7)
+    let r = echo_it_8zdwqy(b)
+    assert_eq(test_cross_module_generic_fn_helper.cmg_unbox(r), 7)
+}
+
+test "Bug A same-module: local struct-instance let annotation on a fn-call RHS" {
+    let b: SbBox8zdwqy[Int] = sb_make_8zdwqy(9)
+    let r = echo_it_8zdwqy(b)
+    assert_eq(sb_unbox_8zdwqy(r), 9)
+}
+
+test "Bug B cross-module: poly-impl bare -> T returns struct instance" {
+    let b = test_cross_module_generic_fn_helper.cmg_make_box(7)
+    let boxes = [b]
+    let r = boxes.echo_one_8zdwqy(b)
+    assert_eq(test_cross_module_generic_fn_helper.cmg_unbox(r), 7)
+}
+
+test "Bug B same-module: poly-impl bare -> T returns local struct instance" {
+    let b = sb_make_8zdwqy(9)
+    let boxes = [b]
+    let r = boxes.echo_one_8zdwqy(b)
+    assert_eq(sb_unbox_8zdwqy(r), 9)
+}
