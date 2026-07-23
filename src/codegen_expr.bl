@@ -5498,14 +5498,27 @@ fn emit_struct_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
     let saved_mono_tparams = cg_mono_tparams_sl
     let saved_mono_args = cg_mono_concrete_args
     // Struct-lit field emission derives its mono context from the string target
-    // args, not a tid list — clear cg_mono_arg_tids so the group-A compound-inner
-    // sites reached during field emission fall back to the string path instead of
-    // reading a stale tid list from an enclosing generic-fn body.
+    // args — the ENCLOSING fn's cg_mono_arg_tids (a stale tid list keyed on the
+    // enclosing generic's tparams) must not leak into a ctor/compound-inner site
+    // reached during the field loop, so we never keep it. When the target names
+    // this struct's concrete tparams (target_args != ""), recover THIS instance's
+    // own slot tids off the memoized annotation tid and install them alongside the
+    // struct's tparams, so a container-field ctor (`Set[T]` where T→Int) resolves
+    // its element via the structured tid (resolve_tparam_via_tid) instead of the
+    // legacy string CSV (resolve_tparam) — the 365fqj/hnyqe4 SetField/MapField/GKV
+    // capture gap (br 9myrp2). Gated by arg_tids_match_mono_args exactly like the
+    // Class-A recovery below: a mismatched / absent tid yields [] and the field loop
+    // falls back to the string path, byte-identical to the prior unconditional clear.
     let saved_mono_arg_tids = cg_mono_arg_tids
     cg_mono_arg_tids = []
     if target_args != "" && td_tparams != -1 && sublist_length(td_tparams) > 0 {
         cg_mono_tparams_sl = td_tparams
         cg_mono_concrete_args = target_args
+        let inst_tid = tid_native_struct_inst_tid(node, sname)
+        let recovered = mono_instance_arg_tids_from_tid(inst_tid, sname, tc_tid_struct_arg_count(inst_tid))
+        if arg_tids_match_mono_args(recovered, target_args) {
+            cg_mono_arg_tids = recovered
+        }
     }
     let mut inits = ""
     let mut field_types: List[Int] = []
