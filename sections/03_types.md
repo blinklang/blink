@@ -1129,6 +1129,70 @@ let pair = Pair { first: "hello", second: 42 }  // Pair[Str, Int]
 let tree = Branch(Leaf(1), Leaf(2))              // Tree[Int]
 ```
 
+#### Under-Determined Types
+
+Inference at a binding is a two-state judgment: either every type variable is resolved to a concrete type, or the ones that cannot be resolved are **reported**. There is no third state — Blink never *defaults* an unresolved type variable to a concrete type, and there is no user-facing "unknown" or "any" type that inference can fall into.
+
+When Hindley-Milner inference finishes a binding with a type variable still unbound — not fixed by an annotation and not fixed by any later use — that binding is `error[CannotInferType]`. The single repair is a type annotation.
+
+```blink
+fn f() {
+    let x = []          // error[CannotInferType]: element type of `x` is undetermined
+    let n = None        // error[CannotInferType]: the inner type of `n` is undetermined
+    let m = Map()       // error[CannotInferType]: key/value types of `m` are undetermined
+}
+```
+
+The fix in every case is to annotate the binding:
+
+```blink
+fn f() {
+    let x: List[Int] = []
+    let n: Int? = None
+    let m: Map[Str, Int] = Map()
+}
+```
+
+This is one rule applied uniformly: an empty `[]`, a bare `None`, an empty `Map()`/`Set()`, and an under-constrained generic construction are not four cases — they are one case, "inference left a type variable unbound," reported by one diagnostic.
+
+**Later use still determines the type — there is no error when it does.** The error fires only when inference *terminates* with the variable unbound, so a binding constrained by a subsequent use is inferred normally with no annotation:
+
+```blink
+fn g() {
+    let mut xs = List.new()   // element type inferred from the push below
+    xs.push(1)                // xs : List[Int] — no annotation, no error
+}
+```
+
+A use that does *not* constrain the type parameter does not rescue the binding. `.len()`, `.is_empty()`, and `.is_none()` observe the container, not its element, so a binding used only through them stays under-determined and is an error:
+
+```blink
+fn h() {
+    let x = []      // error[CannotInferType]: element type is undetermined
+    x.len()         // observes the list, not the element type — does not constrain `x`
+}
+```
+
+There is no exception for a value that is "never used in a way that would expose the missing type." Whether the under-determined value is later observed is a whole-function property; making the binding's legality depend on it would break locality of reasoning (§1) — you could no longer tell whether `let x = []` is valid without reading the rest of the body, and a later edit adding `x.push(y)` could retroactively change the binding's status. The binding is judged at the binding, once.
+
+**Under-determination flows through construction.** An under-constrained generic construction is the same error, reported at the binding, with the enclosing constructor's parameters named:
+
+```blink
+type GKV[K, V] {
+    m: Map[K, V]
+}
+
+fn f() {
+    let b = GKV { m: Map() }   // error[CannotInferType]: type parameters K, V of `GKV`
+                               //   are undetermined — no use constrains them
+    // fix: let b: GKV[Int, Str] = GKV { m: Map() }
+}
+```
+
+The diagnostic points at the binding — where the annotation fix applies — and carries a secondary span at the empty constructor (`Map()` / `[]`) explaining why the parameter is open (see §5 for `error[CannotInferType]`, E0301). This mirrors the `AmbiguousConstruction` rule (§3.3): no path ever silently picks a winner. It is also the Hindley-Milner discipline Blink's ancestry (§1.3) shares with OCaml, SML, Haskell, and Rust — an unconstrained type variable is resolved by unification or reported, never assigned a type the program did not ask for.
+
+> There is no surface `unknown` / `any` / `?` type in Blink. The concept "a type not yet known" exists only inside the compiler as a transient inference state; it is never a type a program can name, hold, or produce. A value's type is always fully determined or the program does not type-check.
+
 #### Recursive Types
 
 Types can reference themselves. The compiler handles the indirection:

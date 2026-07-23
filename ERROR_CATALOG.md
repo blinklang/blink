@@ -57,7 +57,8 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 
 | Name | Code | One-line |
 |------|------|----------|
-| *(reserved for future use)* | I0001+ | Internal compiler errors will be cataloged as they are defined |
+| UnsolvedTypeVarAtCodegen | I0001 | An unsolved type variable reached monomorphization — the front end should have reported `CannotInferType` (E0301) first |
+| *(reserved for future use)* | I0002+ | Internal compiler errors will be cataloged as they are defined |
 
 ---
 
@@ -66,6 +67,7 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | Name | Code | One-line | Category | Spec ref |
 |------|------|----------|----------|----------|
 | TypeError | E0300 | Type mismatch detected during type checking | Type checking | §3 |
+| CannotInferType | E0301 | Inference left a binding's type variable unbound; annotate the binding | Type checking | §3.3 |
 | TemplateMismatch | E0310 | String template parameter type does not match argument | Type checking | §3 |
 | UndeclaredEffect | E0500 | Callee requires effect not declared by caller | Effects | §4.5 |
 | CapabilityBudgetExceeded | E0501 | Function effect exceeds module `@capabilities` budget | Effects | §4.8 |
