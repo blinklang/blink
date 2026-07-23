@@ -819,6 +819,26 @@ fn substitute_typevar_tid(t: Int, binds: Map[Str, Int]) -> Int {
         if changed == 0 { return t }
         return make_struct_instance_type(e.name, elems)
     }
+    if k == TK_ENUM {
+        // The enum twin of the TK_STRUCT arm: a monomorphized enum instance (`Box[T]`,
+        // params_count>=1) may embed a typevar in a type-arg; substitute each and rebuild
+        // via make_enum_instance_type. Same aliasing guard — read all originals into
+        // `elems` BEFORE the constructor appends to ty_param_list. A bare generic enum
+        // (params_count 0) has no type-args → empty loop → changed==0 → returns `t`
+        // unchanged (br 82ajft).
+        let mut elems: List[Int] = []
+        let mut changed = 0
+        let mut i = 0
+        while i < e.params_count {
+            let orig = ty_param_list.get(e.params_start + i).unwrap()
+            let sub = substitute_typevar_tid(orig, binds)
+            if sub != orig { changed = 1 }
+            elems.push(sub)
+            i = i + 1
+        }
+        if changed == 0 { return t }
+        return make_enum_instance_type(e.name, elems)
+    }
     // TK_FN and every scalar/nominal kind: no embedded typevar to rewrite.
     t
 }
@@ -7715,7 +7735,23 @@ fn tc_check_fn(fn_node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report 
             let p = sublist_get(params_sl, i)
             let pname = node_name(p)
             let ptid = resolve_param_type(p)
-            nr_define_typed(pname, 0, ptid)
+            // Mirror the fnsig path (tc_fnsig_param_instance_tid): a generic-struct/enum
+            // param binds into scope as a STRUCTURAL instance carrying its type-arg slots,
+            // not the erased bare base. Without this the mono-calls-mono forwarding chain
+            // (take_box→is_full, forward_box→take_box, recursion) sees a bare enum head
+            // that substitute_typevar_tid can't rewrite and the instance-arm guard rejects,
+            // falling the element resolution to the legacy CSV path (br 82ajft). Guard on
+            // `ann != -1` exactly like the fnsig caller — an un-annotated param resolves to
+            // TYPE_UNKNOWN today so the callee's bk-guard already returns -1, but keeping
+            // the guard makes this an exact structural mirror and never hands a -1 node to
+            // node_elements (which node_or_die-crashes on -1).
+            let ann = node_type_ann(p)
+            let mut ptid_final = ptid
+            if ann != -1 {
+                let inst = tc_fnsig_param_instance_tid(ann, ptid)
+                if inst != -1 { ptid_final = inst }
+            }
+            nr_define_typed(pname, 0, ptid_final)
             i = i + 1
         }
     }
