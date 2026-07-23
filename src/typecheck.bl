@@ -197,6 +197,16 @@ let mut tc_method_trait_names_idx: Map[Str, Str] = Map()
 // reads this for the E0910 arg-arity check; deriving it from tc_tmsig_pool
 // (per-method sigs) missed methodless traits, which have no sig entry.
 let mut tc_trait_tparam_count_idx: Map[Str, Int] = Map()
+// 9myrp2: binder-recovery index for the canonical monomorphized poly impl
+// `impl[T] Trait[T] for List[T]`, keyed "List_{trait}_{method}" -> impl node.
+// The MethodCall arm reads it to substitute the impl's `-> T` return type with
+// the receiver's List element tid, so the method-call node memoizes a concrete
+// tid instead of TYPE_UNKNOWN (which forced the downstream free-fn call to
+// resolve its type-param via the legacy string CSV). Only the canonical shape
+// (single binder == receiver's sole type arg, matching validate_trait_impls'
+// poly_supported gate) ever registers; every other shape stays absent so the
+// arm falls through to today's TYPE_UNKNOWN behavior unchanged.
+let mut tc_poly_list_impl_node: Map[Str, Int] = Map()
 
 fn tc_method_traits_key(tname: Str, method: Str) -> Str {
     "{tname}\t{method}"
@@ -3307,6 +3317,7 @@ fn init_types() ! TypeCheck.Register {
     tc_display_impl_types.clear()
     tc_method_trait_count_idx.clear()
     tc_method_trait_names_idx.clear()
+    tc_poly_list_impl_node.clear()
     tc_tmsig_pool.clear()
     tc_tmsig_param_names.clear()
     tc_trait_tparam_names.clear()
@@ -3533,6 +3544,33 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
             let im = sublist_get(impls_sl, i)
             let impl_type = node_name(im)
             let trait_name = node_trait_name(im)
+            // 9myrp2: register the canonical monomorphized poly impl
+            // `impl[T] Trait[T] for List[T]` for binder recovery in the
+            // MethodCall arm. Same shape gate as validate_trait_impls'
+            // poly_supported (typecheck.bl ~3122): List receiver, exactly one
+            // impl binder, exactly one receiver type arg, and that arg IS the
+            // binder. Any other shape never registers, so the arm falls through.
+            if impl_type == "List" {
+                let pl_binders = node_impl_binders(im)
+                let pl_recv_args = node_recv_type_args(im)
+                if pl_binders != -1 && pl_recv_args != -1 {
+                    if sublist_length(pl_binders) == 1 && sublist_length(pl_recv_args) == 1 {
+                        let pl_binder_name = node_name(sublist_get(pl_binders, 0))
+                        let pl_recv_arg_name = node_name(sublist_get(pl_recv_args, 0))
+                        if pl_binder_name != "" && pl_recv_arg_name == pl_binder_name {
+                            let pl_methods = node_methods(im)
+                            if pl_methods != -1 {
+                                let mut pmi = 0
+                                while pmi < sublist_length(pl_methods) {
+                                    let pl_mname = node_name(sublist_get(pl_methods, pmi))
+                                    tc_poly_list_impl_node.insert("List_{trait_name}_{pl_mname}", im)
+                                    pmi = pmi + 1
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             // 4q2etk: replaced by mwxtyj — record Display impls so infer_type
             // can resolve the synthesized display() to Str.
             if trait_name == "Display" {
@@ -7076,6 +7114,43 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                     return infer_type(sublist_get(args_sl, 0))
                 }
                 return TYPE_UNKNOWN
+            }
+        }
+
+        // 9myrp2: a user poly-impl method on a List receiver — the canonical
+        // `impl[T] Trait[T] for List[T]` form. Placed AFTER the builtin List
+        // block so every builtin method has already returned (builtins win,
+        // untouched). Resolve the sole owning trait's fnsig and return its
+        // `-> T` return type with the impl binder substituted by the receiver's
+        // element tid, so the method-call node memoizes a concrete tid instead
+        // of TYPE_UNKNOWN. Only the canonical single-binder shape registered in
+        // tc_poly_list_impl_node; any other shape leaves `im == -1` and this
+        // block does nothing, falling through to today's arg-inference loop and
+        // TYPE_UNKNOWN — no path regresses.
+        if obj_k == TK_LIST {
+            let sole_trait = tc_method_trait_names("List", method)
+            if sole_trait != "" && tc_method_trait_count("List", method) == 1 {
+                let sig_name = "List_{sole_trait}_{method}"
+                let sig = lookup_fnsig(sig_name)
+                if sig != -1 {
+                    let im = tc_poly_list_impl_node.get(sig_name) ?? -1
+                    // The registry only ever holds nodes that passed the
+                    // canonical single-binder gate at registration, so binders
+                    // is a length-1 sublist here. Re-check defensively so a
+                    // future gate relaxation that forgets this reader degrades
+                    // to the fall-through TYPE_UNKNOWN path instead of crashing
+                    // sublist_get on a -1 / empty binder list.
+                    let im_binders = if im != -1 { node_impl_binders(im) } else { -1 }
+                    if im != -1 && im_binders != -1 && sublist_length(im_binders) == 1 {
+                        let elem = ty_pool.get(obj_t).unwrap().inner1
+                        check_arg_shapes("List.{method}", sig, node_args(node), 1)
+                        let binder = node_name(sublist_get(im_binders, 0))
+                        let mut binds: Map[Str, Int] = Map()
+                        binds.insert(binder, elem)
+                        let raw_ret = fnsig_pool.get(sig).unwrap().ret
+                        return substitute_typevar_tid(raw_ret, binds)
+                    }
+                }
             }
         }
 
