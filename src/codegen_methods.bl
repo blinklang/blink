@@ -44,7 +44,7 @@ import codegen_types.{
     builtin_receiver_type_name,
     is_sized_int_ct, lookup_builtin_trait_impl, lookup_impl_method, impl_method_reg_name, impl_trait_for_method, impl_type_implements_trait_method, mangle_generic_name, mangle_impl_method_q, mangle_from_method, synthesized_display_call, render_result_arm_value, wrapping_unsigned_c_type,
     option_c_type, option_inner_ct_from_tag, option_inner_struct_from_tag, reg_fn, reg_fn_ret_type, reg_fn_ret_struct_inner, reg_fn_with_effects, register_mono_fn, register_mono_instance,
-    resolve_tparam, poly_impl_method_node, poly_impl_block_node, is_poly_impl_base,
+    poly_impl_method_node, poly_impl_block_node, is_poly_impl_base,
     resolve_import_alias, resolve_ptr_inner_c, resolve_struct_from_c_name, get_var_ffi_ptr_struct, is_ffi_ptr_array_var,
     ffi_alloc_n_pending, ffi_offset_pending_struct,
     result_c_type, result_c_type_mixed,
@@ -161,39 +161,6 @@ fn poly_impl_concrete_args(im: Int, obj_str: Str, recv_node: Int) -> Str {
     build_binder_csv(binders_sl, elem_name)
 }
 
-// The RESOLVABLE twin of poly_impl_concrete_args: the element spelled as its
-// original struct name (dotted/qualified for cross-module, e.g.
-// `helper.CmgPoint`) rather than the canonical C tag. resolve_tparam +
-// type_from_name / is_struct_type strip the qualifier by SPLITTING ON `.`, so a
-// bare-T return only resolves to CT_STRUCT off the dotted name — the dot-free
-// physical tag (helper_CmgPoint) has no `.` to strip and collapses to CT_VOID
-// (br dwhm4v). Used solely for return-type substitution; the mangled symbol
-// still comes from poly_impl_concrete_args.
-fn poly_impl_resolution_args(im: Int, obj_str: Str, recv_node: Int) -> Str {
-    let binders_sl = node_impl_binders(im)
-    let elem_ct = get_list_elem_type(obj_str)
-    let elem_struct = get_list_elem_struct(obj_str)
-    // br 4c3gts: a poly-slot-encodable COMPOUND element resolves to its carrier tag
-    // (Option_int) via the tid, matching the mangling twin. This is the string
-    // FALLBACK for return-type substitution; the primary path is the ret_tids tid
-    // path in emit_poly_impl_call, which already spells the same segment. Keeping
-    // the two twins aligned means the fallback never re-introduces the "Void"
-    // erasure if the tid path ever misses. Bare struct elements keep the DOTTED
-    // spelling (elem_struct) so resolve_tparam's type_from_name can split on `.`
-    // (br dwhm4v); only compounds route through the tid seg.
-    let elem_tid = tc_tid_list_elem(tc_lookup_node_tid(recv_node))
-    let elem_is_compound = elem_ct == CT_OPTION || elem_ct == CT_RESULT || elem_ct == CT_MAP
-    let compound_seg = if tc_poly_elem_slot_encodable(elem_tid) && elem_struct == "" && elem_is_compound { tc_seg_from_tid(elem_tid) } else { None }
-    let elem_name = if compound_seg.is_some() {
-        compound_seg.unwrap()
-    } else if elem_struct != "" {
-        elem_struct
-    } else {
-        type_name_from_ct(elem_ct)
-    }
-    build_binder_csv(binders_sl, elem_name)
-}
-
 fn build_binder_csv(binders_sl: Int, elem_name: Str) -> Str {
     let mut csv = ""
     let mut bi = 0
@@ -296,7 +263,7 @@ pub fn listop_slot_tid(tid: Int, csv_seg: Str) -> Int {
 // the established convention (bare for a plain struct, matching descriptor_mangle /
 // the free-fn carrier producers). concrete_args stays as the fallback tail, a strict
 // superset: an unencodable slot still resolves via the old dotted string path.
-pub fn resolve_tparam_via_tid(param_name: Str, tparams_sl: Int, concrete_args: Str, arg_tids: List[Int]) -> Str {
+pub fn resolve_tparam_via_tid(param_name: Str, tparams_sl: Int, arg_tids: List[Int]) -> Str {
     if tparams_sl != -1 {
         let mut pi = 0
         while pi < sublist_length(tparams_sl) {
@@ -340,8 +307,7 @@ fn emit_poly_impl_call(node: Int, composed_base: Str, obj_str: Str) ! Codegen.Em
     // and produced the invalid promote symbol `blink_promote_helper.CmgPoint` for a
     // with-arena tail (latent bug fixed here).
     let ret_str_raw = node_return_type(m_def)
-    let resolution_args = poly_impl_resolution_args(im, obj_str, node_obj(node))
-    let ret_str = resolve_tparam_via_tid(ret_str_raw, tparams_sl, resolution_args, ret_tids)
+    let ret_str = resolve_tparam_via_tid(ret_str_raw, tparams_sl, ret_tids)
     // A bare-binder return (`-> T`) instantiated at a COMPOUND element
     // (`List[Option[Int]]`) resolves ret_str to the inner-carrying carrier tag
     // (`Option_int` / `Result_int_str` / `Map_int_str`) via the tid RETURN path
@@ -419,7 +385,7 @@ fn emit_poly_impl_call(node: Int, composed_base: Str, obj_str: Str) ! Codegen.Em
             reg_fn_ret_type(mangled, CT_OPTION, inner_ct, -1)
         } else if ann_elems != -1 && sublist_length(ann_elems) >= 1 {
             let inner_ann = sublist_get(ann_elems, 0)
-            let inner_name = resolve_tparam_via_tid(node_name(inner_ann), tparams_sl, resolution_args, ret_tids)
+            let inner_name = resolve_tparam_via_tid(node_name(inner_ann), tparams_sl, ret_tids)
             let inner_ct = type_from_name(inner_name)
             expr_option_inner = inner_ct
             expr_option_inner_struct = ""
@@ -457,8 +423,8 @@ fn emit_poly_impl_call(node: Int, composed_base: Str, obj_str: Str) ! Codegen.Em
         } else if ann_elems != -1 && sublist_length(ann_elems) >= 2 {
             let ok_ann = sublist_get(ann_elems, 0)
             let err_ann = sublist_get(ann_elems, 1)
-            let ok_name = resolve_tparam_via_tid(node_name(ok_ann), tparams_sl, resolution_args, ret_tids)
-            let err_name = resolve_tparam_via_tid(node_name(err_ann), tparams_sl, resolution_args, ret_tids)
+            let ok_name = resolve_tparam_via_tid(node_name(ok_ann), tparams_sl, ret_tids)
+            let err_name = resolve_tparam_via_tid(node_name(err_ann), tparams_sl, ret_tids)
             let ok_ct = type_from_name(ok_name)
             let err_ct = type_from_name(err_name)
             expr_result_ok_type = ok_ct
