@@ -1146,16 +1146,46 @@ fn substitute_typevar_tid(t: Int, binds: Map[Str, Int]) -> Int {
 // typevar buried inside `List[T]` / `Option[T]` / `Set[T]` / `Result[T,E]` /
 // `Map[K,V]` / `(A, B)` is still inferred. Pure bind collection — allocates NO
 // pool entries (no make_* calls), so it never touches ty_param_list and is free
-// of the tuple aliasing hazard substitute_typevar_tid guards against. A first
-// binding wins; kind mismatches (arg not shaped like the param) bind nothing.
+// of the tuple aliasing hazard substitute_typevar_tid guards against. The first
+// CONCRETE binding wins; a later concrete arg overwrites only a placeholder bind
+// (a non-concrete metavar/typevar) left by an earlier metavar-carrying sibling
+// arg (see the TK_TYPEVAR branch below); kind mismatches (arg not shaped like the
+// param) bind nothing.
+// A bind target is CONCRETE when, after following bound metavars, it is neither
+// an unbound metavar nor a bare typevar — i.e. it names a real type a downstream
+// substitution/pin can commit to. Used by unify_typevar_binds so a concrete arg
+// can overwrite a placeholder bind left by a metavar-carrying sibling arg.
+fn bind_target_is_concrete(tid: Int) -> Int {
+    let r = tc_resolve(tid)
+    if r < 0 || r >= ty_pool.len() { return 0 }
+    if tc_is_unbound_metavar(r) != 0 { return 0 }
+    if ty_pool.get(r).unwrap().kind == TK_TYPEVAR { return 0 }
+    1
+}
+
 fn unify_typevar_binds(ptid: Int, atid: Int, binds: Map[Str, Int]) {
     if ptid < 0 || ptid >= ty_pool.len() { return }
     if atid < 0 || atid >= ty_pool.len() { return }
     let pe = ty_pool.get(ptid).unwrap()
     let pk = pe.kind
     if pk == TK_TYPEVAR {
-        if !binds.contains_key(pe.name) {
-            binds.insert(pe.name, atid)
+        // "First binding wins" is only correct among CONCRETE args. A
+        // metavar-carrying arg — a bare `Map()`/`Set()` whose element is a fresh
+        // unbound α — unifies its typevar against that α; recording it would poison
+        // the bind and block a later concrete sibling arg from supplying the real
+        // type (m1wspm: `fill(Map(), 256, "x")` bound K to Map()'s α before the
+        // `256` arg could bind K:=Int). So: record a bind only when it is absent, or
+        // when the existing bind is itself non-concrete (a placeholder α/typevar) and
+        // the new atid IS concrete. Never let a non-concrete atid overwrite or claim.
+        match binds.get(pe.name) {
+            Some(prev) => {
+                if bind_target_is_concrete(atid) != 0 && bind_target_is_concrete(prev) == 0 {
+                    binds.insert(pe.name, atid)
+                }
+            }
+            None => {
+                binds.insert(pe.name, atid)
+            }
         }
         return
     }
@@ -7367,8 +7397,16 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                         // instead of the erased str default (a silent miscompile). If a
                         // typevar is genuinely unbound (no arg pins it), the arg's α
                         // stays unbound and E0301 fires at its own binding/boundary.
+                        // instantiate_return_type re-infers every arg via
+                        // build_typevar_binds, which re-mints a fresh (unbound)
+                        // Map[α,α]/Set[α] for a bare ctor arg and CLOBBERS the
+                        // node's memoized tid. So compute the return type FIRST,
+                        // then pin LAST — the pin's own final infer_type per arg
+                        // leaves the bound metavars in the node memo for codegen
+                        // to read (m1wspm).
+                        let ret_t = instantiate_return_type(sig, args_sl)
                         tc_pin_generic_args_from_binds(sig, args_sl, 0)
-                        return instantiate_return_type(sig, args_sl)
+                        return ret_t
                     }
                     return fs.ret
                 }
@@ -9422,6 +9460,43 @@ pub fn tc_tid_map_val_struct(tid: Int) -> Str {
     let t = ty_pool.get(tid).unwrap()
     if t.kind != TK_MAP { return "" }
     tid_inner_struct(t.inner2)
+}
+
+// Resolving twins of the Set/Map element accessors above (m1wspm). The plain
+// accessors read ty_pool.get(inner) WITHOUT tc_resolve, so a metavar that
+// tc_pin_generic_args_from_binds bound IN PLACE (kind stays TK_UNKNOWN, solution
+// stashed in inner1) reads back as TK_UNKNOWN -> CT_VOID -> -1/"". These wrap the
+// inner in tc_resolve so a bound a_k := Int surfaces its real ct/sname. Only the
+// key(Map)/elem(Set) are needed — kops_table_name keys the vtable on the key ct
+// and sname alone; the Map value type doesn't affect it. Kept separate from the
+// non-resolving accessors: other callers depend on the bound-but-typevar inner
+// reading as -1/"" (dbzy4r deferral et al.).
+pub fn tc_tid_map_key_ct_resolved(tid: Int) -> Int {
+    if tid < 0 || tid >= ty_pool.len() { return -1 }
+    let t = ty_pool.get(tid).unwrap()
+    if t.kind != TK_MAP { return -1 }
+    tid_inner_ct(tc_resolve(t.inner1))
+}
+
+pub fn tc_tid_map_key_struct_resolved(tid: Int) -> Str {
+    if tid < 0 || tid >= ty_pool.len() { return "" }
+    let t = ty_pool.get(tid).unwrap()
+    if t.kind != TK_MAP { return "" }
+    tid_inner_struct(tc_resolve(t.inner1))
+}
+
+pub fn tc_tid_set_elem_ct_resolved(tid: Int) -> Int {
+    if tid < 0 || tid >= ty_pool.len() { return -1 }
+    let t = ty_pool.get(tid).unwrap()
+    if t.kind != TK_SET { return -1 }
+    tid_inner_ct(tc_resolve(t.inner1))
+}
+
+pub fn tc_tid_set_elem_struct_resolved(tid: Int) -> Str {
+    if tid < 0 || tid >= ty_pool.len() { return "" }
+    let t = ty_pool.get(tid).unwrap()
+    if t.kind != TK_SET { return "" }
+    tid_inner_struct(tc_resolve(t.inner1))
 }
 
 // The raw value-slot tid for a Map tid — twin of tc_tid_map_val_struct but

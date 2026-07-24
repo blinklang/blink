@@ -67,7 +67,7 @@ import codegen_types.{
     nth_type_arg, resolve_tparam, resolve_variant, struct_concrete_args_from_target,
     result_c_type, result_c_type_mixed,
     scope_vars, set_list_elem_struct, set_list_elem_type,
-    kops_table_name, kops_elem_is_concrete, key_struct_sname_from_ann, ensure_tuple_kops_key,
+    kops_table_name, kops_elem_is_concrete, kops_is_struct_key, key_struct_sname_from_ann, ensure_tuple_kops_key,
     set_map_types, set_map_key_struct, set_set_elem_type, set_set_elem_struct,
     set_var, set_var_closure, set_var_option, set_var_struct,
     strip_blink_prefix, strip_generic_args, strip_module_qualifier,
@@ -92,7 +92,7 @@ import diagnostics.{
 }
 import std.path.{path_dirname}
 import formatter.{format_expr}
-import typecheck.{tc_mono_csv, tc_mono_tids_subst, tc_seg_from_tid, is_import_module_name, tc_lookup_node_tid, tc_tid_set_elem_ct, tc_tid_set_elem_struct, tc_tid_map_key_ct, tc_tid_map_key_struct, tc_tid_map_val_ct, tc_tid_map_val_struct, tc_tid_map_val_tid, tc_tid_map_key_tid, tc_tid_struct_slot_seg, tc_tid_ct, tc_tid_option_inner_ct, tc_tid_option_inner_struct, tc_tid_result_ok_ct, tc_tid_result_ok_struct, tc_tid_result_err_ct, tc_tid_result_err_struct, tc_tid_to_c_tag, tc_tid_struct, tc_tid_struct_mono_name, tc_tid_is_enum, tc_tid_struct_arg_count, tc_tid_struct_arg_tid, tc_tid_compound_slot_faithful, tc_struct_slot_encodable, tc_tid_inner_tag, tc_tid_option_inner_tid, tc_tid_result_ok_tid, tc_tid_result_err_tid, tc_tid_tuple_elem_encodable}
+import typecheck.{tc_mono_csv, tc_mono_tids_subst, tc_seg_from_tid, is_import_module_name, tc_lookup_node_tid, tc_tid_set_elem_ct, tc_tid_set_elem_struct, tc_tid_set_elem_ct_resolved, tc_tid_set_elem_struct_resolved, tc_tid_map_key_ct, tc_tid_map_key_struct, tc_tid_map_key_ct_resolved, tc_tid_map_key_struct_resolved, tc_tid_map_val_ct, tc_tid_map_val_struct, tc_tid_map_val_tid, tc_tid_map_key_tid, tc_tid_struct_slot_seg, tc_tid_ct, tc_tid_option_inner_ct, tc_tid_option_inner_struct, tc_tid_result_ok_ct, tc_tid_result_ok_struct, tc_tid_result_err_ct, tc_tid_result_err_struct, tc_tid_to_c_tag, tc_tid_struct, tc_tid_struct_mono_name, tc_tid_is_enum, tc_tid_struct_arg_count, tc_tid_struct_arg_tid, tc_tid_compound_slot_faithful, tc_struct_slot_encodable, tc_tid_inner_tag, tc_tid_option_inner_tid, tc_tid_result_ok_tid, tc_tid_result_err_tid, tc_tid_tuple_elem_encodable}
 
 // codegen_expr.bl — Expression codegen, closures, capture analysis
 
@@ -2587,6 +2587,29 @@ fn upgrade_compound_carrier(c: CarrierInfo, ann_node: Int) -> CarrierInfo {
     CarrierInfo { type_const: ct, struct_name: compound_name_from_ann(ann_node) }
 }
 
+// Select the kops element carrier from the ctor NODE's memoized tid, which
+// typecheck already pinned (m1wspm): a bare Map()/Set() passed directly to a
+// generic param has its metavar key/elem bound in place by
+// tc_pin_generic_args_from_binds, so the resolving accessors surface the real
+// concrete type. Mirrors recover_elem_ct_from_arg (the insert-site sibling):
+// a named @derive(Hash,Eq) struct key -> {CT_STRUCT-carrier, sname} but only
+// when kops_is_struct_key confirms it registered; else a resolved scalar CT;
+// else {CT_VOID, ""} meaning "no claim — fall through to the annotation path".
+// Tuple keys decline here (tid_inner_struct returns "" for TK_TUPLE, tid_inner_ct
+// returns -1) so resolve_ctor_kops_elem's tuple branch registers them.
+fn ctor_kops_elem_from_node_tid(node: Int, container: Str) -> CarrierInfo {
+    let tid = tc_lookup_node_tid(node)
+    let sname = if container == "Map" { tc_tid_map_key_struct_resolved(tid) } else { tc_tid_set_elem_struct_resolved(tid) }
+    if kops_is_struct_key(sname) {
+        return CarrierInfo { type_const: type_from_name(sname), struct_name: sname }
+    }
+    let ct = if container == "Map" { tc_tid_map_key_ct_resolved(tid) } else { tc_tid_set_elem_ct_resolved(tid) }
+    if ct >= 0 {
+        return CarrierInfo { type_const: ct, struct_name: "" }
+    }
+    CarrierInfo { type_const: CT_VOID, struct_name: "" }
+}
+
 // Select the kops element carrier (ct + sname) for a Set()/Map() constructor from
 // its declared container annotation. `container` is "Set" or "Map". A struct-field
 // initializer or call-arg supplies the type via cg_expect_arg_ann, not
@@ -4116,14 +4139,16 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
             }
         }
         if fn_name == "Map" {
-            let ec = resolve_ctor_kops_elem("Map")
+            let nt = ctor_kops_elem_from_node_tid(node, "Map")
+            let ec = if nt.type_const != CT_VOID || nt.struct_name != "" { nt } else { resolve_ctor_kops_elem("Map") }
             let kops = kops_table_name(ec.type_const, ec.struct_name)
             expr_result_str = "blink_map_new(&{kops})"
             expr_result_type = CT_MAP
             return
         }
         if fn_name == "Set" {
-            let ec = resolve_ctor_kops_elem("Set")
+            let nt = ctor_kops_elem_from_node_tid(node, "Set")
+            let ec = if nt.type_const != CT_VOID || nt.struct_name != "" { nt } else { resolve_ctor_kops_elem("Set") }
             let kops = kops_table_name(ec.type_const, ec.struct_name)
             expr_result_str = "blink_set_new(&{kops})"
             expr_result_type = CT_SET
