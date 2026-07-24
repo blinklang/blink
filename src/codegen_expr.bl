@@ -82,8 +82,8 @@ import codegen_derive.{ct_to_descriptor, descriptor_mangle, queue_promote_type}
 import codegen_methods.{emit_boxed_container_store, emit_method_call, listop_slot_tid, resolve_push_struct, resolve_tparam_via_tid}
 import codegen_closures.{analyze_captures, emit_closure, emit_fn_value_shim_if_needed}
 import diagnostics.{
-    diag_error, diag_error_at, diag_warn_at, diag_set_last_fix,
-    diag_file_for_node, diag_source_file,
+    diag_error, diag_error_at, diag_warn_at, diag_set_last_fix, diag_ice_at,
+    diag_file_for_node, diag_source_file, UNSOLVED_TYPEVAR_AT_CODEGEN,
     COALESCE_REQUIRES_OPT, QM_INVALID_OPERAND, UNDEFINED_FUNCTION,
     QM_RESULT_IN_NON_RESULT, QM_OPTION_IN_NON_OPTION,
     MISSING_KEYWORD_ARG, INVALID_KEYWORD_ARG,
@@ -5031,7 +5031,15 @@ fn infer_struct_type_args(type_name: Str, field_types: List[Int], field_structs:
     let mut pi = 0
     while pi < num_params {
         let param_name = node_name(sublist_get(tparams_sl, pi))
-        let mut resolved = "Void"
+        // "" not "Void" (nqq29j): an unmatched param must be a DETECTABLE no-answer,
+        // not a plausible-looking type name. The old initializer made every gap in the
+        // arm coverage below (no CT_MAP/CT_SET case, so a Map[K,V]-typed field falls
+        // straight through) silently mint blink_GKV_Void_Void — a valid C identifier
+        // that compiles, links, and collides sibling instances under one typedef guard.
+        // The caller treats "" as "no mono args", and the struct-lit chokepoint raises
+        // I0001 rather than emitting an erased name. This converts the whole function's
+        // failure mode without having to enumerate every missing CT arm.
+        let mut resolved = ""
         let mut fi = 0
         while fi < sublist_length(td_flds_sl) && fi < field_types.len() {
             let f = sublist_get(td_flds_sl, fi)
@@ -5074,6 +5082,12 @@ fn infer_struct_type_args(type_name: Str, field_types: List[Int], field_structs:
                 }
             }
             fi = fi + 1
+        }
+        // A single unresolved param poisons the whole CSV: a partial answer
+        // ("Int,") would still register a mono instance under a half-spelled name.
+        // None routes the caller to the I0001 chokepoint instead.
+        if resolved == "" {
+            return None
         }
         if pi > 0 {
             args = args.concat(",")
@@ -5278,6 +5292,25 @@ fn tid_slot_is_plain_scalar(slot: Int) -> Bool {
     let ct = tc_tid_ct_resolved(slot)
     if ct == CT_INT || ct == CT_FLOAT || ct == CT_BOOL || ct == CT_STRING || ct == CT_CHAR { return true }
     is_sized_int_ct(ct) != 0
+}
+
+// Whether any per-tparam segment of a mono-args CSV is exactly "Void" — the erased
+// spelling every string producer falls back to when it cannot name a slot. Checked
+// per DECLARED tparam (via nth_type_arg, the same naive comma split the rest of the
+// mono machinery uses) rather than as a substring, so a user type whose name merely
+// contains "Void" and a legitimately Void-valued NON-tparam position can't trip it.
+// Returns false when the struct declares no tparams — a monomorphic struct's
+// mono_args is not a type-param CSV at all.
+fn mono_args_has_void_seg(mono_args: Str, tparams_sl: Int) -> Bool {
+    if tparams_sl == -1 { return false }
+    let count = sublist_length(tparams_sl)
+    if count < 1 { return false }
+    let mut i = 0
+    while i < count {
+        if nth_type_arg(mono_args, i) == "Void" { return true }
+        i = i + 1
+    }
+    false
 }
 
 // A slot tid that resolves to a BARE (params_count 0) struct/enum — `Set[Point]`'s
@@ -5770,6 +5803,25 @@ fn emit_struct_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
     }
     let mut struct_key = sname
     if mono_args != "" {
+        // I0001 chokepoint (nqq29j). Every generic-struct literal's mono name funnels
+        // through here, so this is where an unsolved type param becomes observable —
+        // and the one place that already carries Diag.Report, so raising the ICE needs
+        // no effect threading through the 85+ resolve_tparam_via_tid callers.
+        //
+        // A "Void" segment is never a legitimate answer for a declared type param: it
+        // means some producer erased a slot it could not spell, and the resulting name
+        // (blink_GKV_Void_Void) is a VALID C identifier that compiles and links while
+        // silently collapsing sibling instances onto one typedef. Fail loudly instead:
+        // "ice" severity bypasses @allow and blinkc exits 101 before writing any C.
+        // The front end should have reported CannotInferType (E0301) first if the
+        // program were genuinely under-determined; reaching here means it did not, so
+        // this is a compiler bug, not a user error.
+        if mono_args_has_void_seg(mono_args, td_tparams) {
+            diag_ice_at("UnsolvedTypeVarAtCodegen", UNSOLVED_TYPEVAR_AT_CODEGEN,
+                "type parameter of '{sname}' reached monomorphization unsolved (mono args '{mono_args}')",
+                node,
+                "this is a compiler bug — the type should have been inferred, or reported as error[CannotInferType]")
+        }
         let mono_name = register_mono_instance(sname, mono_args, mono_arg_tids)
         c_type = c_type_c_name(mono_name)
         struct_key = mono_name
