@@ -130,9 +130,9 @@ fn emit_panic_tag_check_render(tmp: Str, tag_val: Int, msg_prefix: Str, rendered
 // cross-module element yields a valid C identifier, br dwhm4v); scalars use the
 // CT-derived name. This CSV feeds mangle_generic_name and the mono-registry
 // (the PHYSICAL symbol), so it must be the dot-free physical spelling. For the
-// RESOLVABLE element name (return-type substitution) use
-// poly_impl_resolution_args instead. CSV order follows binder order
-// (mangle_generic_name / resolve_tparam both index positionally by binder).
+// CSV order follows binder order (mangle_generic_name indexes positionally by
+// binder). Return-type substitution does NOT read this CSV — it lowers the element
+// name from the interned tids via poly_impl_ret_arg_tids + resolve_tparam_via_tid.
 fn poly_impl_concrete_args(im: Int, obj_str: Str, recv_node: Int) -> Str {
     let binders_sl = node_impl_binders(im)
     let elem_ct = get_list_elem_type(obj_str)
@@ -210,7 +210,8 @@ fn poly_impl_concrete_arg_tids(im: Int, recv_node: Int) -> List[Int] {
 // substitution sites in emit_poly_impl_call recover the concrete element name for a
 // bare-T / compound-over-T return; this carries the concrete element tid per binder
 // so resolve_tparam_via_tid can lower that name from the interned type_id pool
-// (tc_seg_from_tid) instead of the dotted string CSV (poly_impl_resolution_args).
+// (tc_seg_from_tid). This is the only path now — the dotted string CSV it replaced
+// (poly_impl_resolution_args) is deleted.
 //
 // Unlike poly_impl_concrete_arg_tids, this does NOT apply the strict
 // tc_poly_elem_slot_encodable gate: that gate exists to keep the MANGLING CSV twin
@@ -240,8 +241,10 @@ fn poly_impl_return_elem_tids(im: Int, recv_node: Int) -> List[Int] {
 // the CSV segment (`csv_seg`) that mangling actually used, byte-for-byte. Any
 // divergence — an element the CT-tag path spelled "Void", an unencodable tid, a -1
 // from an unresolvable receiver, or an infer-CSV slot the tid can't reach — stores
-// -1, forcing the def-side resolver back onto the string seg (identical to the
-// pre-tid behavior). The Gen1==Gen2 fixed-point gate proves the equality.
+// -1, which the def-side resolver reports by passing the binder name through
+// unchanged. With the string tail gone that would spell a bare binder into a C
+// symbol, so a -1 here has to stay unreachable in practice; the _Void grep in
+// CLAUDE.md is the guard. The Gen1==Gen2 fixed-point gate proves the equality.
 pub fn listop_slot_tid(tid: Int, csv_seg: Str) -> Int {
     let seg = tc_seg_from_tid(tid)
     if seg.is_some() && seg.unwrap() == csv_seg {
@@ -250,19 +253,23 @@ pub fn listop_slot_tid(tid: Int, csv_seg: Str) -> Int {
     -1
 }
 
-// 6mhzya: the canonical tid-preferring twin of resolve_tparam, home to all three
-// codegen layers (stmt/expr/methods) after the three byte-identical twins collapsed
-// here. codegen_methods is the only safe home: it already imports typecheck for
-// tc_seg_from_tid and resolve_tparam (codegen_types), and it sits below both
-// codegen_expr (imports methods) and codegen_stmt (imports expr, plus a shortcut
-// import of methods for this name) in the DAG — so no import cycle. When `param_name`
-// is a binder and arg_tids captured a concrete tid for its position, lower the segment
-// from the structured tid via tc_seg_from_tid; otherwise fall back to resolve_tparam
-// over the string CSV. tc_seg_from_tid returns Some only when the tid is encodable,
-// and it spells a bare struct BARE / a struct instance as its physical mono stem —
-// the established convention (bare for a plain struct, matching descriptor_mangle /
-// the free-fn carrier producers). concrete_args stays as the fallback tail, a strict
-// superset: an unencodable slot still resolves via the old dotted string path.
+// 6mhzya: the canonical type-param resolver, home to all three codegen layers
+// (stmt/expr/methods) after the three byte-identical twins collapsed here.
+// codegen_methods is the only safe home: it already imports typecheck for
+// tc_seg_from_tid, and it sits below both codegen_expr (imports methods) and
+// codegen_stmt (imports expr, plus a shortcut import of methods for this name) in the
+// DAG — so no import cycle. When `param_name` is a binder and arg_tids captured a
+// concrete tid for its position, lower the segment from the structured tid via
+// tc_seg_from_tid, which returns Some only when the tid is encodable and spells a bare
+// struct BARE / a struct instance as its physical mono stem — the established
+// convention (bare for a plain struct, matching descriptor_mangle / the free-fn
+// carrier producers).
+//
+// Otherwise the name passes through unchanged. That covers the two non-binder roles
+// the deleted string resolver also served (no tparams at all; a name that is already a
+// concrete type) AND, now that there is no CSV tail, the binder-with-no-usable-tid
+// case: that one would spell a bare binder into a C symbol, so it must stay
+// unreachable. The guard is the _Void grep in CLAUDE.md, which is 0 repo-wide.
 pub fn resolve_tparam_via_tid(param_name: Str, tparams_sl: Int, arg_tids: List[Int]) -> Str {
     if tparams_sl != -1 {
         let mut pi = 0
@@ -300,12 +307,11 @@ fn emit_poly_impl_call(node: Int, composed_base: Str, obj_str: Str) ! Codegen.Em
     // (resolve_tparam_via_tid over ret_tids): tc_seg_from_tid spells a bare
     // cross-module struct BARE (CmgPoint) — which type_from_name / is_struct_type
     // recover directly from struct_reg_set without a `.` to split — and a struct
-    // instance as its physical mono stem. The dotted string CSV
-    // (poly_impl_resolution_args) stays as the fallback tail for unencodable slots;
-    // it is what the head relied on before pktmea (br dwhm4v). Bare is not just
-    // equivalent but MORE correct: the dotted spelling flowed into descriptor_mangle
-    // and produced the invalid promote symbol `blink_promote_helper.CmgPoint` for a
-    // with-arena tail (latent bug fixed here).
+    // instance as its physical mono stem. The dotted string CSV this replaced
+    // (poly_impl_resolution_args) is what the head relied on before pktmea (br dwhm4v);
+    // it is now deleted. Bare is not just equivalent but MORE correct: the dotted
+    // spelling flowed into descriptor_mangle and produced the invalid promote symbol
+    // `blink_promote_helper.CmgPoint` for a with-arena tail (latent bug fixed here).
     let ret_str_raw = node_return_type(m_def)
     let ret_str = resolve_tparam_via_tid(ret_str_raw, tparams_sl, ret_tids)
     // A bare-binder return (`-> T`) instantiated at a COMPOUND element

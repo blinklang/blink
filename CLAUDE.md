@@ -44,19 +44,21 @@ After modifying compiler sources: `task regen` then `task ci` to verify.
 
 Inspect generated C: `build/blink build --emit c <file.bl>` — output goes to `build/<name>.c`.
 Trace compiler phases: `build/blink run --blink-trace codegen <file.bl>` (also: lex, parse, typecheck, all).
-Fine-grained internal trace: `BLINK_TRACE_CHANNELS=<ch>[,<ch>...|all] build/blink build --emit c <file.bl>` — env-gated `dbg_trace(channel, msg)` taps (defined in ast.bl, the DAG root, so any module can emit). Emits `[dbg:<channel>] ...` to stderr; zero cost when unset. Prefer adding a permanent tap over a throwaway printf+recompile. Current channels: `csvresolve` (mono type-param resolved via the legacy string CSV — a tid-path miss), `monotid` (the tid twin's per-slot arg_tid at resolution).
+Fine-grained internal trace: `BLINK_TRACE_CHANNELS=<ch>[,<ch>...|all] build/blink build --emit c <file.bl>` — env-gated `dbg_trace(channel, msg)` taps (defined in ast.bl, the DAG root, so any module can emit). Emits `[dbg:<channel>] ...` to stderr; zero cost when unset. Prefer adding a permanent tap over a throwaway printf+recompile. Current channels: `monotid` (the tid twin's per-slot arg_tid at resolution). (`csvresolve` is retired — the legacy string-CSV type-param resolver it tapped no longer exists.)
 Runtime trace: `build/blink run --trace all <file.bl>` (NDJSON to stderr, filter: `fn:name`, `module:mod`, `depth:N`).
 Debug build: `build/blink run --debug <file.bl>` — enables debug_assert, compiles with `-g -O0`.
 When debugging codegen bugs, inspect the emitted C first (`--emit c`), then use `--blink-trace codegen`.
 
 Measuring type-erasure in emitted C: grep the emitted C for `_Void`, and filter out `blink_test_*`
-symbols (a test whose NAME contains "Void" mangles into one). A `_Void` in a monomorphized name
-(`blink_GKV_Void_Void`) means a type param was erased — and because the erased name is a valid C
-identifier under an `#ifndef BLINK_TD_` typedef guard, it compiles and links silently while
-collapsing distinct instantiations onto one C type. Do NOT use the `csvresolve` channel as the
-exit criterion: it is only a LOWER BOUND. `blink_GSet_Void`/`blink_GBoxSet_Void` were emitted with
-zero csvresolve hits, because a producer's `"Void"` initializer never routes through the tapped
-return. Grep `_Void`; keep the channel as a secondary signal.
+symbols (a test whose NAME contains "Void" mangles into one) — and note that a test asserting
+ABOUT erasure can carry the pattern in a plain string literal, so read the matched lines before
+calling one a hit. A `_Void` in a monomorphized name (`blink_GKV_Void_Void`) means a type param was
+erased — and because the erased name is a valid C identifier under an `#ifndef BLINK_TD_` typedef
+guard, it compiles and links silently while collapsing distinct instantiations onto one C type.
+This grep is the SOUND erasure metric and the only exit criterion. The retired `csvresolve` channel
+was never a substitute: it was only a LOWER BOUND, and `blink_GSet_Void`/`blink_GBoxSet_Void` were
+emitted with zero hits on it, because a producer's `"Void"` initializer never routed through the
+tapped return.
 
 ## Self-Hosting Bootstrap Protocol
 
