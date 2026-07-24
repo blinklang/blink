@@ -1,0 +1,91 @@
+// internal compiler error[UnsolvedTypeVarAtCodegen] (I0001) — the codegen-side
+// backstop for the two-state inference decision (8vcj2c). E0301 is the FRONT-END
+// half: a genuinely under-determined binding is reported to the user. I0001 is the
+// invariant half: if a declared type param nevertheless reaches monomorphization
+// without a concrete spelling, the compiler must STOP rather than mint an erased
+// name like blink_GKV_Void_Void — a valid C identifier that compiles and links
+// while collapsing distinct instantiations onto one #ifndef BLINK_TD_ typedef.
+//
+// The chokepoint is emit_struct_lit: every generic-struct literal's mono name
+// funnels through it, so a "Void" segment in the mono-args CSV is caught there.
+//
+// Catalog: ERROR_CATALOG.md I0001. Metric note: CLAUDE.md "Measuring type-erasure".
+
+import compile_test_helpers
+
+// ── the chokepoint fires ────────────────────────────────────────────────────
+// A PHANTOM type param: no field of W mentions T, so no field-value inference arm
+// can ever match it, and there is nothing under-determined for E0301 to latch onto
+// either. Before the I0001 chokepoint this silently registered blink_W_Void, an
+// erased name that compiled and linked. It must be a diagnosed I0001 instead.
+//
+// This shape reaches the chokepoint via tid_native_struct_mono_args (which returns
+// "Void" for it), NOT via infer_struct_type_args — verified by probe. The test is a
+// guard on the OUTCOME, so it holds whichever producer supplies the Void segment.
+
+test "phantom type param raises I0001 rather than erasing or emitting bare C" {
+    let src = "type W[T] \{ n: Int }\nfn main() ! IO \{\n    let w = W \{ n: 5 }\n    assert_eq(w.n, 5)\n}\n"
+    compile_test_helpers.expect_compile_error(src, "i0001_phantom_tparam", "I0001")
+}
+
+// A param that IS matched by a field but whose CT the string speller cannot name:
+// field `a: T` binds T to Option[Int], and type_name_from_ct has no CT_OPTION arm,
+// so the segment erases to "Void". The sibling `Inner_Int` slot (a struct INSTANCE)
+// keeps the tid-native path deferring, so the string CSV stays authoritative here.
+test "unspellable matched param raises I0001" {
+    let src = "type Inner[X] \{ q: X }\ntype W[T, U] \{ a: T, b: U }\nfn main() ! IO \{\n    let w = W \{ a: Some(1), b: Inner \{ q: 5 } }\n    assert_eq(w.b.q, 5)\n}\n"
+    compile_test_helpers.expect_compile_error(src, "i0001_unspellable_matched", "I0001")
+}
+
+// ── no false positives on the shapes that DO lower ──────────────────────────
+// Each of these spells every tparam concretely, so I0001 must stay silent. These
+// are also the type-IDENTITY guards: the emitted C must contain no erased _Void
+// segment, and the annotated/inferred twins must agree on ONE mono name.
+
+test "annotated phantom type param lowers without I0001" {
+    let src = "type W[T] \{ n: Int }\nfn main() ! IO \{\n    let w: W[Int] = W \{ n: 5 }\n    assert_eq(w.n, 5)\n}\n"
+    compile_test_helpers.expect_no_error(src, "i0001_phantom_annotated", "I0001")
+}
+
+test "bound metavar slot lowers concretely without I0001" {
+    let src = "type P[K, V] \{ m: Map[K, V], n: Int }\nfn main() ! IO \{\n    let mut p = P \{ m: Map(), n: 1 }\n    p.m.insert(\"a\", 256)\n    assert_eq(p.m.get(\"a\").unwrap(), 256)\n}\n"
+    compile_test_helpers.expect_no_error(src, "i0001_bound_metavar", "I0001")
+}
+
+test "compound slot beside a bare-struct slot lowers concretely without I0001" {
+    let src = "type Pt \{ x: Int }\ntype W[T, U] \{ a: T, b: U }\nfn main() ! IO \{\n    let w = W \{ a: Some(1), b: Pt \{ x: 4 } }\n    assert_eq(w.b.x, 4)\n}\n"
+    compile_test_helpers.expect_no_error(src, "i0001_compound_and_bare_struct", "I0001")
+}
+
+// ── the emitted C carries no erased segment (the SOUND erasure metric) ───────
+// Grep the emitted C for _Void, per CLAUDE.md: the csvresolve trace channel is only
+// a LOWER bound (an erased GSet_Void can be emitted with ZERO csvresolve hits,
+// because a producer's "Void" initializer never routes through the tapped return).
+
+test "inferred and annotated twins share one non-erased mono name" {
+    let src = "type P[K, V] \{ m: Map[K, V], n: Int }\nfn main() ! IO \{\n    let mut p = P \{ m: Map(), n: 1 }\n    p.m.insert(\"a\", 256)\n    let q: P[Str, Int] = P \{ m: Map(), n: 2 }\n    assert_eq(p.m.get(\"a\").unwrap(), 256)\n    assert_eq(q.n, 2)\n}\n"
+    let c_src = compile_test_helpers.compile_and_emit_c(src, "i0001_twin_mono_name")
+    compile_test_helpers.expect_contains(c_src, "blink_P_Str_Int", "twins spell P_Str_Int")
+    if c_src.contains("_Void") {
+        io.println("FAIL: emitted C contains an erased _Void segment")
+    } else {
+        io.println("PASS: emitted C has no erased _Void segment")
+    }
+}
+
+test "bare-struct slot spells the struct name, not Void" {
+    let src = "type Pt \{ x: Int }\ntype W[T, U] \{ a: T, b: U }\nfn main() ! IO \{\n    let w = W \{ a: Some(1), b: Pt \{ x: 4 } }\n    assert_eq(w.b.x, 4)\n}\n"
+    let c_src = compile_test_helpers.compile_and_emit_c(src, "i0001_bare_struct_seg")
+    compile_test_helpers.expect_contains(c_src, "blink_W_Option_int_Pt", "bare struct slot spells Pt")
+    if c_src.contains("_Void") {
+        io.println("FAIL: emitted C contains an erased _Void segment")
+    } else {
+        io.println("PASS: emitted C has no erased _Void segment")
+    }
+}
+
+// ── the code is in the catalog and `blink explain I0001` works ──────────────
+
+test "blink explain I0001 returns the catalog entry" {
+    compile_test_helpers.verify_catalog_entry("I0001", "UnsolvedTypeVarAtCodegen")
+}

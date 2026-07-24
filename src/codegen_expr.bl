@@ -5036,9 +5036,8 @@ fn infer_struct_type_args(type_name: Str, field_types: List[Int], field_structs:
         // arm coverage below (no CT_MAP/CT_SET case, so a Map[K,V]-typed field falls
         // straight through) silently mint blink_GKV_Void_Void — a valid C identifier
         // that compiles, links, and collides sibling instances under one typedef guard.
-        // The caller treats "" as "no mono args", and the struct-lit chokepoint raises
-        // I0001 rather than emitting an erased name. This converts the whole function's
-        // failure mode without having to enumerate every missing CT arm.
+        // Normalized to "Void" before returning so the struct-lit chokepoint raises
+        // I0001 on it, rather than enumerating every missing CT arm here.
         let mut resolved = ""
         let mut fi = 0
         while fi < sublist_length(td_flds_sl) && fi < field_types.len() {
@@ -5083,11 +5082,20 @@ fn infer_struct_type_args(type_name: Str, field_types: List[Int], field_structs:
             }
             fi = fi + 1
         }
-        // A single unresolved param poisons the whole CSV: a partial answer
-        // ("Int,") would still register a mono instance under a half-spelled name.
-        // None routes the caller to the I0001 chokepoint instead.
+        // An unmatched param still occupies its CSV slot, so the segment count stays
+        // equal to num_params and mono_args_has_void_seg can see it — I0001 at the
+        // literal, never a half-spelled mono name. Returning None here instead would
+        // leave mono_args "" and fall through to the bare `blink_W`, a typedef never
+        // declared for a generic struct (a location-less C `unknown type name`).
+        //
+        // DEFENSIVE, not load-bearing on any known input: for every phantom/unspellable
+        // shape probed (`type W[T] { n: Int }`, a scalar-only twin, and a matched-but-
+        // unspellable `a: T` bound to Option[Int]), tid_native_struct_mono_args already
+        // returns "Void" and this function is never consulted — I0001 fires identically
+        // with or without this normalization. Kept because the None path is not provably
+        // unreachable and its failure mode is an undiagnosed C error.
         if resolved == "" {
-            return None
+            resolved = "Void"
         }
         if pi > 0 {
             args = args.concat(",")
@@ -5153,6 +5161,16 @@ fn tid_native_struct_mono_args(node: Int, sname: Str) -> Str {
     // BOTH accessors. It admits the instance to the tid path alongside
     // has_compound, so the has_compound gate keeps confining every OTHER shape to
     // its exact current string output (byte-identity preserved).
+    //
+    // NOTE on the resolving/non-resolving asymmetry: this gate reads the slot
+    // RESOLVED, but the parallel arg_tids recovery (mono_instance_arg_tids_from_tid
+    // → tc_struct_slot_encodable) reads it RAW, where a bound metavar is still
+    // TK_UNKNOWN and so unencodable. A bound-metavar slot therefore mangles
+    // concretely in mono_args while its arg_tids entry is -1. That is harmless
+    // today — the def side falls back to the string seg, which is the same text,
+    // and arg_tids_match_mono_args skips "" segs — but the two halves of one
+    // decision look at the slot through different lenses, so tightening the parity
+    // guard must resolve on BOTH sides or it will start rejecting these instances.
     let mut has_bound_metavar = 0
     let mut i = 0
     while i < count {
