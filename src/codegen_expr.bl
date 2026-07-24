@@ -92,7 +92,7 @@ import diagnostics.{
 }
 import std.path.{path_dirname}
 import formatter.{format_expr}
-import typecheck.{tc_mono_csv, tc_mono_tids_subst, tc_seg_from_tid, is_import_module_name, tc_lookup_node_tid, tc_tid_set_elem_ct, tc_tid_set_elem_struct, tc_tid_set_elem_ct_resolved, tc_tid_set_elem_struct_resolved, tc_tid_map_key_ct, tc_tid_map_key_struct, tc_tid_map_key_ct_resolved, tc_tid_map_key_struct_resolved, tc_tid_map_val_ct, tc_tid_map_val_struct, tc_tid_map_val_tid, tc_tid_map_key_tid, tc_tid_struct_slot_seg, tc_tid_ct, tc_tid_option_inner_ct, tc_tid_option_inner_struct, tc_tid_result_ok_ct, tc_tid_result_ok_struct, tc_tid_result_err_ct, tc_tid_result_err_struct, tc_tid_to_c_tag, tc_tid_struct, tc_tid_struct_mono_name, tc_tid_is_enum, tc_tid_struct_arg_count, tc_tid_struct_arg_tid, tc_tid_compound_slot_faithful, tc_struct_slot_encodable, tc_tid_inner_tag, tc_tid_option_inner_tid, tc_tid_result_ok_tid, tc_tid_result_err_tid, tc_tid_tuple_elem_encodable}
+import typecheck.{tc_mono_csv, tc_mono_tids_subst, tc_seg_from_tid, is_import_module_name, tc_lookup_node_tid, tc_tid_set_elem_ct, tc_tid_set_elem_struct, tc_tid_set_elem_ct_resolved, tc_tid_set_elem_struct_resolved, tc_tid_map_key_ct, tc_tid_map_key_struct, tc_tid_map_key_ct_resolved, tc_tid_map_key_struct_resolved, tc_tid_map_val_ct, tc_tid_map_val_struct, tc_tid_map_val_tid, tc_tid_map_key_tid, tc_tid_struct_slot_seg, tc_tid_ct, tc_tid_ct_resolved, tc_tid_option_inner_ct, tc_tid_option_inner_struct, tc_tid_result_ok_ct, tc_tid_result_ok_struct, tc_tid_result_err_ct, tc_tid_result_err_struct, tc_tid_to_c_tag, tc_tid_struct, tc_tid_struct_mono_name, tc_tid_is_enum, tc_tid_struct_arg_count, tc_tid_struct_arg_tid, tc_tid_compound_slot_faithful, tc_struct_slot_encodable, tc_tid_inner_tag, tc_tid_option_inner_tid, tc_tid_result_ok_tid, tc_tid_result_err_tid, tc_tid_tuple_elem_encodable}
 
 // codegen_expr.bl — Expression codegen, closures, capture analysis
 
@@ -5131,9 +5131,21 @@ fn tid_native_struct_mono_args(node: Int, sname: Str) -> Str {
     let count = tc_tid_struct_arg_count(inst_tid)
     if count < 1 { return "" }
     let mut has_compound = 0
+    // A slot holding a metavar that tc_pin_generic_args_from_binds bound IN PLACE:
+    // the non-resolving read says "no concrete storage" while the resolving read
+    // names a real scalar. That pair is exactly the inferred-generic-ctor shape
+    // (`let b = GKV { m: Map() }` + a later constraining use) and provably not any
+    // shape that lowers correctly today — a working shape reads concretely under
+    // BOTH accessors. It admits the instance to the tid path alongside
+    // has_compound, so the has_compound gate keeps confining every OTHER shape to
+    // its exact current string output (byte-identity preserved).
+    let mut has_bound_metavar = 0
     let mut i = 0
     while i < count {
         let slot = tc_tid_struct_arg_tid(inst_tid, i)
+        if tc_tid_ct(slot) == -1 && tc_tid_ct_resolved(slot) != -1 {
+            has_bound_metavar = 1
+        }
         if tc_tid_compound_slot_faithful(slot) {
             has_compound = 1
         } else if !tid_slot_is_plain_scalar(slot) {
@@ -5144,7 +5156,7 @@ fn tid_native_struct_mono_args(node: Int, sname: Str) -> Str {
         }
         i = i + 1
     }
-    if has_compound == 0 { return "" }
+    if has_compound == 0 && has_bound_metavar == 0 { return "" }
     let mut args = ""
     let mut j = 0
     while j < count {
@@ -5258,7 +5270,12 @@ pub fn register_mono_enum_from_node(node: Int, expected_base: Str) -> Str ! Code
 // bailing on anything structural.
 fn tid_slot_is_plain_scalar(slot: Int) -> Bool {
     if slot < 0 { return false }
-    let ct = tc_tid_ct(slot)
+    // tc_tid_ct_resolved, not tc_tid_ct: a slot holding a metavar bound in place by
+    // tc_pin_generic_args_from_binds (inferred `GKV { m: Map() }` + a constraining
+    // `.insert(256,"x")`) keeps kind TK_UNKNOWN, so the non-resolving read yields -1
+    // and the slot looks structural — bailing the whole instance to the string path,
+    // which erases it to GKV_Void_Void.
+    let ct = tc_tid_ct_resolved(slot)
     if ct == CT_INT || ct == CT_FLOAT || ct == CT_BOOL || ct == CT_STRING || ct == CT_CHAR { return true }
     is_sized_int_ct(ct) != 0
 }
