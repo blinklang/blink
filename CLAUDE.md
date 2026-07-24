@@ -49,6 +49,15 @@ Runtime trace: `build/blink run --trace all <file.bl>` (NDJSON to stderr, filter
 Debug build: `build/blink run --debug <file.bl>` — enables debug_assert, compiles with `-g -O0`.
 When debugging codegen bugs, inspect the emitted C first (`--emit c`), then use `--blink-trace codegen`.
 
+Measuring type-erasure in emitted C: grep the emitted C for `_Void`, and filter out `blink_test_*`
+symbols (a test whose NAME contains "Void" mangles into one). A `_Void` in a monomorphized name
+(`blink_GKV_Void_Void`) means a type param was erased — and because the erased name is a valid C
+identifier under an `#ifndef BLINK_TD_` typedef guard, it compiles and links silently while
+collapsing distinct instantiations onto one C type. Do NOT use the `csvresolve` channel as the
+exit criterion: it is only a LOWER BOUND. `blink_GSet_Void`/`blink_GBoxSet_Void` were emitted with
+zero csvresolve hits, because a producer's `"Void"` initializer never routes through the tapped
+return. Grep `_Void`; keep the channel as a secondary signal.
+
 ## Self-Hosting Bootstrap Protocol
 
 The compiler compiles itself. `task regen` verifies by compiling the compiler twice (Gen1 + Gen2)
