@@ -1,0 +1,84 @@
+// br 0n07he: a generic call in TAIL position of a fn with a non-void declared
+// return type must still monomorphize off a real instance tid. Before the fix the
+// caller-side arg tid came back UNKNOWN, so the mono registry recorded arg_tids=[-1]
+// and the def side fell back to the legacy string-CSV tparam resolver.
+//
+// The chain (all in src/typecheck.bl):
+//   1. tc_check_body walks the body and correctly memoizes Box[Int] onto the ident
+//      arg node of `box_get(b)`.
+//   2. tc_check_fn then runs a post-hoc declared-return check — `infer_type(body)` —
+//      AFTER tc_check_body has already pushed AND POPPED the body scope.
+//   3. infer_type_uncached's Block arm jumps straight to the LAST statement, skipping
+//      `let b = box_make(7)`. With the body scope gone, `b` is unbound -> TYPE_UNKNOWN.
+//   4. infer_type's memo write was unconditional, so that UNKNOWN CLOBBERED the good
+//      Box[Int] tid the body walk had established.
+//   5. tc_resolve_tparam_tid's struct arm saw a non-TK_STRUCT arg tid and returned -1.
+// Fix: infer_type refuses to downgrade an already-known memo to TYPE_UNKNOWN.
+//
+// `main()` was immune because declared_ret == TYPE_VOID skips the check entirely, and
+// annotating the `let` did not help either — the Block shortcut never visits the `let`.
+//
+// FLOOR PROBE (0n07he): this fixture is a type-IDENTITY guard, not a runtime one — it
+// passed at runtime before the fix too, because the string-CSV fallback happened to
+// produce the CORRECT segment ("Int") at these six sites. So pre-fix there is no _Void
+// and no failing assertion; the only pre-fix red signal was the trace counter:
+//   BLINK_TRACE_CHANNELS=csvresolve blink build --emit c \
+//     tests/test_0n07he_tail_position_generic_arg_tid.bl 2>&1 >/dev/null | grep -c csvresolve
+// which was 6 and must be 0. That channel is retired along with the string resolver
+// itself, at which point this file becomes a genuinely EXECUTABLE guard: without the
+// typecheck fix the def side has no string to fall back to, so this exact shape spells
+// the bare `blink_Box_T` head and fails to compile. The durable criterion is the _Void
+// grep (see CLAUDE.md "Measuring type-erasure in emitted C"), which must also be 0.
+
+type Box[T] { value: T }
+
+fn box_make[T](v: T) -> Box[T] {
+    Box { value: v }
+}
+
+fn box_get[T](b: Box[T]) -> T {
+    b.value
+}
+
+// The clobbered shape: intermediate `let`, then a generic call in tail position of a
+// fn whose declared return type is non-void.
+fn boxed_seven() -> Int {
+    let b = box_make(7)
+    box_get(b)
+}
+
+// Same shape with an explicit `return` — the Block arm takes the Return branch, which
+// reaches the same unconditional memo write.
+fn boxed_eight() -> Int {
+    let b = box_make(8)
+    return box_get(b)
+}
+
+// Same shape reached through string interpolation in tail position.
+fn boxed_label() -> Str {
+    let b = box_make("ok")
+    "label={box_get(b)}"
+}
+
+// Annotating the let does not change the Block shortcut, so it must hold here too.
+fn boxed_annotated() -> Int {
+    let b: Box[Int] = box_make(9)
+    box_get(b)
+}
+
+test "generic call in tail position of a non-void fn monomorphizes concretely" {
+    assert_eq(boxed_seven(), 7)
+    assert_eq(boxed_eight(), 8)
+    assert_eq(boxed_annotated(), 9)
+}
+
+test "tail-position generic call through interpolation" {
+    assert_eq(boxed_label(), "label=ok")
+}
+
+test "the same generic fns still instantiate from a void fn body" {
+    let bi = box_make(99)
+    assert_eq(box_get(bi), 99)
+    let bs = box_make("str")
+    assert_eq(box_get(bs), "str")
+}
