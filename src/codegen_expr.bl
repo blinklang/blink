@@ -80,7 +80,7 @@ import codegen_types.{
     var_enums
 }
 import codegen_derive.{ct_to_descriptor, descriptor_mangle, queue_promote_type}
-import codegen_methods.{emit_boxed_container_store, emit_method_call, listop_slot_tid, resolve_push_struct, resolve_tparam_via_tid}
+import codegen_methods.{emit_boxed_container_store, emit_method_call, listop_slot_tid, resolve_push_struct, resolve_tparam_via_tid, tparam_tid_via_mono}
 import codegen_closures.{analyze_captures, emit_closure, emit_fn_value_shim_if_needed}
 import diagnostics.{
     diag_error, diag_error_at, diag_warn_at, diag_set_last_fix, diag_ice_at,
@@ -93,7 +93,7 @@ import diagnostics.{
 }
 import std.path.{path_dirname}
 import formatter.{format_expr}
-import typecheck.{tc_mono_csv, tc_mono_tids_subst, tc_seg_from_tid, is_import_module_name, tc_lookup_node_tid, tc_tid_set_elem_ct, tc_tid_set_elem_struct, tc_tid_set_elem_ct_resolved, tc_tid_set_elem_struct_resolved, tc_tid_map_key_ct, tc_tid_map_key_struct, tc_tid_map_key_ct_resolved, tc_tid_map_key_struct_resolved, tc_tid_map_val_ct, tc_tid_map_val_struct, tc_tid_map_val_tid, tc_tid_map_key_tid, tc_tid_struct_slot_seg, tc_tid_ct, tc_tid_ct_resolved, tc_tid_resolved, tc_tid_option_inner_ct, tc_tid_option_inner_struct, tc_tid_result_ok_ct, tc_tid_result_ok_struct, tc_tid_result_err_ct, tc_tid_result_err_struct, tc_tid_to_c_tag, tc_tid_struct, tc_tid_struct_mono_name, tc_tid_is_enum, tc_tid_struct_arg_count, tc_tid_struct_arg_tid, tc_tid_compound_slot_faithful, tc_struct_slot_encodable, tc_tid_inner_tag, tc_tid_option_inner_tid, tc_tid_result_ok_tid, tc_tid_result_err_tid, tc_tid_tuple_elem_encodable}
+import typecheck.{tc_mono_csv, tc_mono_tids_subst, tc_seg_from_tid, is_import_module_name, tc_lookup_node_tid, tc_tid_set_elem_ct, tc_tid_set_elem_struct, tc_tid_set_elem_ct_resolved, tc_tid_set_elem_struct_resolved, tc_tid_map_key_ct, tc_tid_map_key_struct, tc_tid_map_key_ct_resolved, tc_tid_map_key_struct_resolved, tc_tid_map_val_ct, tc_tid_map_val_struct, tc_tid_map_val_tid, tc_tid_map_key_tid, tc_tid_struct_slot_seg, tc_tid_ct, tc_tid_ct_resolved, tc_tid_resolved, tc_tid_option_inner_ct, tc_tid_option_inner_struct, tc_tid_result_ok_ct, tc_tid_result_ok_struct, tc_tid_result_err_ct, tc_tid_result_err_struct, tc_tid_to_c_tag, tc_tid_struct, tc_tid_struct_mono_name, tc_tid_is_enum, tc_tid_struct_arg_count, tc_tid_struct_arg_tid, tc_tid_compound_slot_faithful, tc_struct_slot_encodable, tc_tid_inner_tag, tc_tid_option_inner_tid, tc_tid_result_ok_tid, tc_tid_result_err_tid, tc_tid_tuple_elem_encodable, tc_tid_tuple_sname, tc_tid_tuple_arity, tc_tid_tuple_elem_tid}
 
 // codegen_expr.bl — Expression codegen, closures, capture analysis
 
@@ -2611,6 +2611,126 @@ fn ctor_kops_elem_from_node_tid(node: Int, container: Str) -> CarrierInfo {
     CarrierInfo { type_const: CT_VOID, struct_name: "" }
 }
 
+// One tuple element's registration encoding: the CT stored in the TupleEntry's
+// elem_types slot, the by-value carrier tag stored in its elem_structs slot ("" for a
+// scalar, which encodes as "-"), and whether this element is encodable from a tid at
+// all. `ok: false` means "decline the whole tuple" — see ensure_tuple_carrier_from_tid.
+type TidTupleElem { ct: Int, struct_tag: Str, ok: Bool }
+
+// Register the tuple CARRIER a tid names — the TupleEntry plus its Hash/Eq derive —
+// from the TID rather than from an annotation, returning the registered C tag ("" when
+// the tid is not a tuple, or an element is not encodable here).
+//
+// The annotation twin is key_struct_sname_from_ann -> resolve_tuple_ann, which the
+// DIRECT `let s: Set[(Int, Int)] = Set()` ctor uses. A tuple that reaches the ctor
+// THROUGH a type param has no annotation to read: `GT[(Int, Int)] { s: Set() }` spells
+// the field's `Set[T]` element by resolving T off the instance tid (br fqthkv), and a
+// generic-fn mono over a tuple key does the same (br 0sh55p). Unregistered,
+// find_tuple_entry misses, ensure_tuple_kops_key returns 0, and the ctor keeps
+// blink_kops_str — an Int-keyed tuple hashed as a C string, the br hnyqe4 collision
+// wearing a fully correct mono name. Registering at the ctor is the symmetric fix: it is
+// exactly where the annotation path registers too.
+//
+// The NAME comes from tc_tid_tuple_sname (== tc_tid_tuple_tag), the same speller
+// tc_tid_to_c_tag used for the enclosing mono args, so the carrier registered here is by
+// construction the one the caller goes on to name.
+//
+// The per-element encoding mirrors resolve_tuple_ann arm for arm — verified against the
+// direct `Set[..] = Set()` C for all six matrix shapes: Int -> (CT_INT, "-"),
+// List[Str] -> (CT_LIST, "-"), (Int,Int) -> (CT_VOID, "Tuple2_int_int"),
+// Option[Str] -> (CT_OPTION, "Option_str"), Map[Str,Int] -> (CT_MAP, "Map_str_int"),
+// Pt -> (CT_VOID, "Pt"). That parity is load-bearing: ensure_tuple_type is name-keyed and
+// idempotent, so when a later tuple LITERAL of the same shape re-registers, whichever ran
+// first defines the C field types for both.
+//
+// Declining ("") is for shapes NEITHER path can spell. It is not a safe fallback for a
+// shape the mono namer already spelled: this fn's caller then names the carrier anyway
+// and kops_table_name emits its BLINK_COMPILER_BUG sentinel, which reaches cc as an
+// undeclared identifier with no source span. Keep the admission set here in step with
+// tc_tid_tuple_elem_encodable, the gate that decides which slots get here at all.
+fn ensure_tuple_carrier_from_tid(tid: Int) -> Str {
+    let c_name = tc_tid_tuple_sname(tid)
+    if c_name == "" { return "" }
+    if find_tuple_entry(c_name) >= 0 {
+        ensure_tuple_kops_key(c_name)
+        return c_name
+    }
+    let arity = tc_tid_tuple_arity(tid)
+    let mut elem_types = ""
+    let mut elem_structs = ""
+    let mut i = 0
+    while i < arity {
+        let enc = tid_tuple_elem_enc(tc_tid_tuple_elem_tid(tid, i))
+        if !enc.ok { return "" }
+        if i > 0 {
+            elem_types = elem_types.concat(",")
+            elem_structs = elem_structs.concat(",")
+        }
+        elem_types = elem_types.concat("{enc.ct}")
+        elem_structs = elem_structs.concat(if enc.struct_tag != "" { enc.struct_tag } else { "-" })
+        i = i + 1
+    }
+    ensure_tuple_type(c_name, arity, elem_types, elem_structs)
+    ensure_tuple_kops_key(c_name)
+    c_name
+}
+
+fn tid_tuple_elem_enc(tid0: Int) -> TidTupleElem {
+    // Resolve bound metavars up front, as tc_tid_to_c_tag / tc_tid_inner_tag do: the
+    // kind reads below (tc_tid_tuple_sname, tc_tid_struct, tc_tid_ct) are all
+    // NON-resolving, so a pinned α would read TK_UNKNOWN and decline the whole tuple.
+    let tid = tc_tid_resolved(tid0)
+    // A nested tuple element is embedded BY VALUE, so its own carrier must be
+    // registered first — emit_tuple_typedef's dep loop then emits the inner typedef
+    // ahead of the outer one. Recurse before anything else: tc_tid_ct has no TK_TUPLE
+    // arm (it would read -1 and decline).
+    if tc_tid_tuple_sname(tid) != "" {
+        let inner = ensure_tuple_carrier_from_tid(tid)
+        if inner == "" { return TidTupleElem { ct: CT_VOID, struct_tag: "", ok: false } }
+        return TidTupleElem { ct: CT_VOID, struct_tag: inner, ok: true }
+    }
+    // Struct or enum (tc_tid_struct covers both kinds): embedded by value under
+    // tc_tid_inner_tag's tag, which is c_type_tag_for_struct / the mono stem — the same
+    // spelling resolve_tuple_ann's struct/enum arm produces.
+    if tc_tid_struct(tid) != "" {
+        let tag = tc_tid_inner_tag(tid)
+        if tag == "" { return TidTupleElem { ct: CT_VOID, struct_tag: "", ok: false } }
+        return TidTupleElem { ct: CT_VOID, struct_tag: tag, ok: true }
+    }
+    let ct = tc_tid_ct(tid)
+    if ct == CT_OPTION || ct == CT_RESULT {
+        let tag = tc_tid_inner_tag(tid)
+        // Decline on an unspellable inner, symmetrically with the struct arm above. An
+        // empty tag would encode as "-" (the scalar spelling) while ct still said
+        // CT_OPTION, so emit_tuple_typedef would emit a carrier-typed field with no
+        // carrier registered for it.
+        if tag == "" { return TidTupleElem { ct: CT_VOID, struct_tag: "", ok: false } }
+        ensure_carrier_from_tag(tag)
+        return TidTupleElem { ct: ct, struct_tag: tag, ok: true }
+    }
+    // A Map element carries its structured tag (Map_str_int) beside CT_MAP, exactly as
+    // resolve_tuple_ann's is_compound_ct arm does (compound_name_from_ann → "Map_k_v").
+    // No ensure_* call is its twin's counterpart: ensure_compound_type_from_ann has only
+    // OPTION/RESULT arms, because a Map field is the uniform blink_map* pointer and needs
+    // no carrier typedef. Admitted rather than declined because the GATE that let this
+    // slot reach us — tc_tid_tuple_elem_encodable — admits a scalar-keyed Map element, so
+    // declining here would leave the carrier unregistered for a mono name we DID spell,
+    // and kops_table_name's BLINK_COMPILER_BUG sentinel would reach cc as an undeclared
+    // identifier with no span. (Whether a tuple containing a Map may be a kops key at all
+    // is an E1400 typecheck question; the annotation twin accepts it today, and this path
+    // must not answer it differently.)
+    if ct == CT_MAP {
+        let tag = tc_tid_inner_tag(tid)
+        if tag == "" { return TidTupleElem { ct: CT_VOID, struct_tag: "", ok: false } }
+        return TidTupleElem { ct: ct, struct_tag: tag, ok: true }
+    }
+    // Scalars, and the containers whose tuple field is a uniform pointer
+    // (List/Set/Bytes/Iterator): tc_tid_scalar_tag and c_type_tag agree on the tag, and
+    // the field type comes from the CT alone.
+    if ct < 0 { return TidTupleElem { ct: CT_VOID, struct_tag: "", ok: false } }
+    TidTupleElem { ct: ct, struct_tag: "", ok: true }
+}
+
 // Select the kops element carrier (ct + sname) for a Set()/Map() constructor from
 // its declared container annotation. `container` is "Set" or "Map". A struct-field
 // initializer or call-arg supplies the type via cg_expect_arg_ann, not
@@ -2626,17 +2746,51 @@ fn resolve_ctor_kops_elem(container: Str) -> CarrierInfo ! Codegen.Emit {
     let ta_elems = node_elements(ann)
     if ta_elems == -1 || sublist_length(ta_elems) < 1 { return CarrierInfo { type_const: CT_STRING, struct_name: "" } }
     let e_ann = sublist_get(ta_elems, 0)
-    let e_name = resolve_tparam_via_tid(node_name(e_ann), cg_mono_tparams_sl, cg_mono_arg_tids)
+    let e_raw = node_name(e_ann)
+    let e_name = resolve_tparam_via_tid(e_raw, cg_mono_tparams_sl, cg_mono_arg_tids)
+    // Resolved, so the tid's tuple tag is the one tc_tid_to_c_tag (and therefore e_name)
+    // spelled — tc_tid_to_c_tag resolves bound metavars, tc_tid_tuple_sname does not.
+    let e_tid = tc_tid_resolved(tparam_tid_via_mono(e_raw, cg_mono_tparams_sl, cg_mono_arg_tids))
+    let e_tuple = tc_tid_tuple_sname(e_tid)
+    // Gated on dbg_channel_on, per ast.bl's note: the message is interpolated EAGERLY, and
+    // this runs at every Set()/Map() ctor in every compiled program (the compiler's own
+    // bootstrap included), so an ungated tap is not the "zero cost when unset" CLAUDE.md
+    // documents.
+    if dbg_channel_on("kopsctor") != 0 {
+        dbg_trace("kopsctor", "container={container} raw={e_raw} e_name={e_name} tid={e_tid} tuple={e_tuple}")
+    }
     if e_name == "Tuple" {
         return CarrierInfo { type_const: CT_VOID, struct_name: key_struct_sname_from_ann(e_ann) }
     }
+    // The element reached us THROUGH a type param, already spelled as a tuple carrier
+    // ("Tuple2_int_int"), so the literal-"Tuple" branch above never sees it. Two ways in:
+    // a generic-fn mono over a tuple key (br 0sh55p), and a generic STRUCT whose type arg
+    // is a tuple — `GT[(Int, Int)] { s: Set() }` (br fqthkv), where the field loop's mono
+    // context resolves T off the instance tid.
+    //
+    // This must precede kops_elem_is_concrete, which says FALSE for a tuple carrier name
+    // (neither a primitive nor an is_named_type) and so would fall through to the
+    // CT_STRING default — an Int-keyed tuple hashed as a C string, the br hnyqe4
+    // collision under a fully correct mono name.
+    //
+    // Decided on the TID's kind, not on the name's shape: a name test would be a
+    // "Tuple"-prefix guess that a user type could satisfy, and the tid is what
+    // ensure_tuple_carrier_from_tid needs anyway. Claiming the carrier UNCONDITIONALLY
+    // once the tid says tuple is deliberate — if registration declined, kops_table_name
+    // emits its BLINK_COMPILER_BUG sentinel and the C compiler stops, which is the right
+    // failure for a shape we cannot hash. Falling through to CT_STRING here would be
+    // silent corruption instead.
+    // Name the carrier that was actually REGISTERED rather than assuming the two
+    // spellers agree: e_name comes from tc_seg_from_tid and the registration from
+    // tc_tid_tuple_sname, and a silent divergence between two tid spellers is a
+    // documented hazard (br bwyfy1). kops_table_name is keyed on this name, so it must
+    // be the registered one. On a decline ("") keep e_name, which resolves to the
+    // BLINK_COMPILER_BUG sentinel — "" would read as a scalar void instead.
+    if e_tuple != "" {
+        let reg = ensure_tuple_carrier_from_tid(e_tid)
+        return CarrierInfo { type_const: CT_VOID, struct_name: if reg != "" { reg } else { e_name } }
+    }
     if kops_elem_is_concrete(e_name) {
-        // A generic-fn mono over a tuple key reaches here with e_name already the
-        // tuple C-name ("Tuple2_int_int") rather than the literal "Tuple", so the
-        // branch above (which registers the tuple into the hash/eq derive lists)
-        // is skipped. Register it here so kops_table_name resolves to a real
-        // adapter instead of the BLINK_COMPILER_BUG sentinel (0sh55p).
-        ensure_tuple_kops_key(e_name)
         return CarrierInfo { type_const: type_from_name(e_name), struct_name: e_name }
     }
     CarrierInfo { type_const: CT_STRING, struct_name: "" }
@@ -5199,10 +5353,26 @@ fn tid_native_struct_mono_args(node: Int, sname: Str) -> Str {
         }
         if tc_tid_compound_slot_faithful(slot) {
             has_compound = 1
+        } else if tc_tid_ct(slot) == -1 && tc_tid_compound_slot_faithful(tc_tid_resolved(slot)) {
+            // A metavar bound IN PLACE to a TUPLE — the one kind the has_bound_metavar
+            // probe above structurally cannot see, because tk_to_ct maps TK_TUPLE to
+            // CT_VOID and so tc_tid_ct_resolved reads -1 for it exactly as the raw read
+            // does. Without this arm the slot classifies as neither compound nor scalar
+            // and bails the whole instance to the string path, which has nothing to spell
+            // for a tuple type arg (br y1n3ck's `fn f() -> GT[(Int, Int)]` composition
+            // row, reachable only once tc_pin_tail_ret_generic creates such a slot).
+            //
+            // Guarded by the RAW read being -1 so this only ever admits a metavar: every
+            // slot whose raw kind already has a ct — and every raw TK_TUPLE, which the
+            // faithfulness gate admits directly in the arm above — takes an unchanged
+            // path. tc_tid_to_c_tag resolves, so the spelling is already correct.
+            has_compound = 1
         } else if !tid_slot_is_plain_scalar(slot) && !tid_slot_is_bare_struct(slot) {
-            // A struct-instance / compound-of-struct / list / tuple slot — the
-            // string path (which reuses the field's registered mono name) stays
-            // authoritative. Bail so a mixed instance is never half-lowered.
+            // A struct-instance / compound-of-struct / list slot — the string path
+            // (which reuses the field's registered mono name) stays authoritative.
+            // Bail so a mixed instance is never half-lowered. (A TUPLE slot no longer
+            // lands here: tc_tid_compound_slot_faithful admits it since br fqthkv,
+            // because the string path had nothing to spell for one — it ICEd.)
             return ""
         }
         i = i + 1
@@ -5653,6 +5823,11 @@ fn emit_struct_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
     // at the ctor and the right kops vtable is selected. (No-op when the target
     // isn't annotated; the field-value inference below still runs as fallback.)
     let target_args = struct_concrete_args_from_target(sname, segs_from_arg_tids(cg_mono_arg_tids))
+    // Hoisted above the field loop because the field-loop mono context below needs it
+    // too (br fqthkv). Reads only the memoized instance tid plus cg_expect_arg_ann /
+    // cg_let_target_ann, and the field loop save/restores cg_expect_arg_ann per field,
+    // so evaluating it here is identical to evaluating it at the mono_args selector.
+    let tid_native_args = tid_native_struct_mono_args(node, sname)
     let td_tparams = if td != -1 { node_type_params(td) } else { -1 }
     let saved_mono_tparams = cg_mono_tparams_sl
     // Struct-lit field emission derives its mono context from the string target
@@ -5668,11 +5843,23 @@ fn emit_struct_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
     // absent tid yields [], byte-identical to the prior unconditional clear.
     let saved_mono_arg_tids = cg_mono_arg_tids
     cg_mono_arg_tids = []
-    if target_args != "" && td_tparams != -1 && sublist_length(td_tparams) > 0 {
+    // Which spelling of this instance's args the field loop resolves against. The
+    // string target args when they exist; otherwise the tid-native namer (br fqthkv).
+    // struct_concrete_args_from_target bails on EVERY compound annotation arg by
+    // design (node_name flattens `(Int, Int)` to the bare head "Tuple"), so a tuple
+    // type arg reached the field loop with no mono context at all: the `s: Set()`
+    // ctor saw T unresolved and fell to blink_kops_str for a tuple key. That is the
+    // hnyqe4 silent-hash miscompile wearing a CORRECT mono name — the mono-name half
+    // of fqthkv (tc_tid_compound_slot_faithful's TK_TUPLE arm) does not fix it,
+    // which is why the fqthkv test asserts the runtime round-trip and not just the
+    // name. Both arms stay gated by arg_tids_match_mono_args below, so a tid that
+    // does not spell the chosen args is still discarded to [].
+    let field_ctx_args = if target_args != "" { target_args } else { tid_native_args }
+    if field_ctx_args != "" && td_tparams != -1 && sublist_length(td_tparams) > 0 {
         cg_mono_tparams_sl = td_tparams
         let inst_tid = tid_native_struct_inst_tid(node, sname)
         let recovered = mono_instance_arg_tids_from_tid(inst_tid, sname, tc_tid_struct_arg_count(inst_tid))
-        if arg_tids_match_mono_args(recovered, target_args) {
+        if arg_tids_match_mono_args(recovered, field_ctx_args) {
             cg_mono_arg_tids = recovered
         }
     }
@@ -5807,7 +5994,7 @@ fn emit_struct_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
         // "Void"). Recover it from the instance tid typecheck memoized on this literal
         // (br zrybya). Returns "" for every shape the string path already handles, so
         // the fallback below stays authoritative for scalar / struct-instance fields.
-        mono_args = tid_native_struct_mono_args(node, sname)
+        mono_args = tid_native_args
         if mono_args == "" {
             let type_args = infer_struct_type_args(sname, field_types, field_structs)
             if type_args.is_some() { mono_args = type_args.unwrap() }

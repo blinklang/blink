@@ -1,0 +1,217 @@
+// br fqthkv: a generic struct instantiated at a TUPLE type argument must
+// monomorphize. `let e: GT[(Int, Int)] = GT { s: Set() }` hard-failed with
+// error[I0001] UnsolvedTypeVarAtCodegen "mono args 'Void'" — the tid-native mono
+// namer (tid_native_struct_mono_args, codegen_expr.bl:5170) bailed to the string
+// path for every tuple slot, and the string path had nothing to spell.
+//
+// The seam is a FAITHFULNESS GATE, not the speller: tc_tid_compound_slot_faithful
+// (typecheck.bl) admitted only Option/Result/Map slots, so a TK_TUPLE slot left
+// has_compound at 0 and hit the `return ""` bail. Both spellers already handle
+// tuples (tc_tid_to_c_tag -> tc_tid_tuple_tag), and the sibling gate
+// tc_struct_slot_encodable already admits tuples via tc_tid_tuple_encodable — the
+// literal-side gate was the lone laggard.
+//
+// Tuple type arguments are legal and pervasive: sections/03_types.md:3104 (arity
+// 0-6), :3198 (tuples as Map keys), plus List[(Str, T)] / Iterator[(Int, T)]
+// throughout the spec.
+//
+// WHY compile_and_run AND NOT ONLY THE MONO NAME: per CLAUDE.md the `_Void` grep
+// is a LOWER BOUND, and a *correct* mono name can still carry a *wrong* kops — the
+// br hnyqe4 shape. 256 and 512 are the canonical corruption signature (both end in
+// a 0x00 byte, so they collide as the empty string under blink_kops_str). Only the
+// runtime round-trip catches that.
+//
+// THREE erasure needles, not one (CLAUDE.md): `_Void` (the string producers'
+// spelling), a bare-binder passthrough `GT_T` (br pt4hsy — the tid producers erase
+// by passing the binder through unchanged, so NO `_Void` appears anywhere), and an
+// erased carrier FIELD under a correct mono name (br w4c0py — `blink_Option_void`,
+// which the name-level grep cannot see at all).
+
+import compile_test_helpers
+import std.io
+
+// `blink_GT_T` is a strict PREFIX of the correct `blink_GT_Tuple2_int_int`, so a
+// plain contains() check false-positives on every passing case. Count instead: the
+// only legitimate `<head>_T` occurrences are the `<head>_Tuple` ones, so the two
+// counts must be equal. Any excess is a real bare-binder passthrough (br pt4hsy).
+fn count_occurrences(hay: Str, needle: Str) -> Int {
+    let mut n = 0
+    let mut rest = hay
+    let mut idx = rest.index_of(needle)
+    while idx >= 0 {
+        n = n + 1
+        rest = rest.substr(idx + needle.len(), rest.len())
+        idx = rest.index_of(needle)
+    }
+    n
+}
+
+fn assert_has(c: Str, needle: Str, label: Str) {
+    if !c.contains(needle) { io.println("FAIL: {label} — missing '{needle}'") }
+    assert(c.contains(needle))
+}
+
+fn assert_lacks(c: Str, needle: Str, label: Str) {
+    if c.contains(needle) { io.println("FAIL: {label} — forbidden '{needle}' present") }
+    assert(!c.contains(needle))
+}
+
+fn assert_no_bare_binder(c: Str, label: Str) {
+    let bare = count_occurrences(c, "blink_GT_T")
+    let tup = count_occurrences(c, "blink_GT_Tuple")
+    if bare != tup { io.println("FAIL: {label} — bare-binder blink_GT_T passthrough present") }
+    assert_eq(bare, tup)
+}
+
+// All three needle families in one place so every matrix row checks all of them.
+fn assert_no_erasure(c: Str, label: Str) {
+    assert_lacks(c, "_Void", "{label} / string-producer erasure")
+    assert_no_bare_binder(c, label)
+    assert_lacks(c, "blink_Option_void", "{label} / erased Option carrier field")
+    assert_lacks(c, "blink_set_void", "{label} / erased Set carrier field")
+}
+
+// `type GT[T] { s: Set[T] }` at type arg `shape`, inserting two shape-appropriate
+// tuples and reading both back. `a` deliberately carries a 0x00 low byte.
+fn gt_src(shape: Str, a: Str, b: Str) -> Str {
+    let mut s = "@derive(Hash, Eq)\n"
+    s = s.concat("type Pt \{ x: Int, y: Int }\n")
+    s = s.concat("type GT[T] \{ s: Set[T] }\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let e: GT[{shape}] = GT \{ s: Set() }\n")
+    s = s.concat("    e.s.insert({a})\n")
+    s = s.concat("    e.s.insert({b})\n")
+    s = s.concat("    assert_eq(e.s.len(), 2)\n")
+    s = s.concat("    assert(e.s.contains({a}))\n")
+    s = s.concat("    assert(e.s.contains({b}))\n")
+    s = s.concat("}\n")
+    s
+}
+
+// ── the ticket MVCE ─────────────────────────────────────────────────────────
+
+test "generic struct at a tuple type arg does not ICE (MVCE)" {
+    let src = "import std.io\ntype GT[T] \{ s: Set[T] }\nfn main() \{\n    let e: GT[(Int, Int)] = GT \{ s: Set() }\n    io.println(\"\{e.s.len()}\")\n}\n"
+    compile_test_helpers.expect_no_error(src, "fqthkv_mvce", "I0001")
+}
+
+// The ticket's second exhibit: pre-filling the field from an ALREADY-CONCRETE Set
+// did not help either, which is what proved this is the struct mono namer and not
+// container element inference.
+test "generic struct at a tuple type arg from a concrete field value does not ICE" {
+    let src = "import std.io\ntype GT[T] \{ s: Set[T] }\nfn main() \{\n    let s: Set[(Int, Int)] = Set()\n    let e: GT[(Int, Int)] = GT \{ s: s }\n    io.println(\"\{e.s.len()}\")\n}\n"
+    compile_test_helpers.expect_no_error(src, "fqthkv_concrete_field", "I0001")
+}
+
+// ── element-shape matrix: exit 0 AND the single expected spelling ────────────
+// Each row asserts BOTH halves. Name-only would pass with a wrong kops; runtime-only
+// would pass with two distinct instantiations collapsed onto one erased C type.
+
+test "GT[(Int, Int)] monomorphizes to Tuple2_int_int and round-trips" {
+    let src = gt_src("(Int, Int)", "(256, 512)", "(1, 2)")
+    let c = compile_test_helpers.compile_and_emit_c(src, "fqthkv_m_intint_c")
+    assert_has(c, "blink_GT_Tuple2_int_int", "GT[(Int,Int)] mono name")
+    assert_no_erasure(c, "GT[(Int,Int)]")
+    let r = compile_test_helpers.compile_and_run(src, "fqthkv_m_intint_run")
+    assert_eq(r.exit_code, 0)
+}
+
+test "GT[(Int, List[Str])] monomorphizes to Tuple2_int_list and round-trips" {
+    let src = gt_src("(Int, List[Str])", "(256, [\"a\"])", "(1, [\"b\"])")
+    let c = compile_test_helpers.compile_and_emit_c(src, "fqthkv_m_intlist_c")
+    assert_has(c, "blink_GT_Tuple2_int_list", "GT[(Int,List[Str])] mono name")
+    assert_no_erasure(c, "GT[(Int,List[Str])]")
+    let r = compile_test_helpers.compile_and_run(src, "fqthkv_m_intlist_run")
+    assert_eq(r.exit_code, 0)
+}
+
+test "GT[((Int, Int), Str)] monomorphizes to Tuple2_Tuple2_int_int_str and round-trips" {
+    let src = gt_src("((Int, Int), Str)", "((256, 512), \"k\")", "((1, 2), \"j\")")
+    let c = compile_test_helpers.compile_and_emit_c(src, "fqthkv_m_nested_c")
+    assert_has(c, "blink_GT_Tuple2_Tuple2_int_int_str", "GT[((Int,Int),Str)] mono name")
+    assert_no_erasure(c, "GT[((Int,Int),Str)]")
+    let r = compile_test_helpers.compile_and_run(src, "fqthkv_m_nested_run")
+    assert_eq(r.exit_code, 0)
+}
+
+// THE DIVERGENCE ROW. An Option tuple element is the one shape that can spell
+// differently between the tid path (tc_tid_inner_tag -> "Option_str") and the
+// annotation path (resolve_tuple_ann -> compound_name_from_ann). Do not widen the
+// faithfulness gate without this row: if it diverges, narrow the gate from THIS
+// evidence rather than a priori.
+test "GT[(Int, Option[Str])] monomorphizes to Tuple2_int_Option_str and round-trips" {
+    let src = gt_src("(Int, Option[Str])", "(256, Some(\"a\"))", "(1, Some(\"b\"))")
+    let c = compile_test_helpers.compile_and_emit_c(src, "fqthkv_m_intopt_c")
+    assert_has(c, "blink_GT_Tuple2_int_Option_str", "GT[(Int,Option[Str])] mono name")
+    assert_no_erasure(c, "GT[(Int,Option[Str])]")
+    let r = compile_test_helpers.compile_and_run(src, "fqthkv_m_intopt_run")
+    assert_eq(r.exit_code, 0)
+}
+
+// The GATE (tc_tid_tuple_elem_encodable) admits a scalar-keyed Map element, so the
+// mono namer spells this instance — which means the ctor's carrier registration must
+// spell it too. Declining there instead leaves the carrier unregistered and
+// kops_table_name emits BLINK_COMPILER_BUG_kops_unsupported_K_ct5_Tuple2_int_Map_str_int,
+// a raw cc error with no span for a type whose annotation-spelled twin
+// (`let s: Set[(Int, Map[Str,Int])] = Set()`) compiles today. Gate, mono namer and
+// carrier registration are one seam: whatever one admits, all three must.
+// Not gt_src: a BARE `Map()` as a tuple-element literal erases to
+// Tuple2_int_Map_void_void at the VALUE path (emit_tuple_lit) on the annotation path
+// too — `let s: Set[(Int, Map[Str,Int])] = Set(); s.insert((1, Map()))` fails cc
+// identically, so it is a separate value-path gap and not this seam's. Bind the element
+// to an annotated Map first so the value path can spell it, keeping this row on the
+// carrier-registration question it exists to answer.
+test "GT[(Int, Map[Str, Int])] monomorphizes to Tuple2_int_Map_str_int and round-trips" {
+    let mut src = "type GT[T] \{ s: Set[T] }\n"
+    src = src.concat("fn main() \{\n")
+    src = src.concat("    let e: GT[(Int, Map[Str, Int])] = GT \{ s: Set() }\n")
+    src = src.concat("    let m1: Map[Str, Int] = Map()\n")
+    src = src.concat("    let m2: Map[Str, Int] = Map()\n")
+    src = src.concat("    e.s.insert((256, m1))\n")
+    src = src.concat("    e.s.insert((1, m2))\n")
+    src = src.concat("    assert_eq(e.s.len(), 2)\n")
+    src = src.concat("    assert(e.s.contains((256, m1)))\n")
+    src = src.concat("    assert(e.s.contains((1, m2)))\n")
+    src = src.concat("}\n")
+    let c = compile_test_helpers.compile_and_emit_c(src, "fqthkv_m_intmap_c")
+    assert_has(c, "blink_GT_Tuple2_int_Map_str_int", "GT[(Int,Map[Str,Int])] mono name")
+    assert_lacks(c, "BLINK_COMPILER_BUG_kops_unsupported", "GT[(Int,Map)] kops sentinel")
+    assert_no_erasure(c, "GT[(Int,Map[Str,Int])]")
+    let r = compile_test_helpers.compile_and_run(src, "fqthkv_m_intmap_run")
+    assert_eq(r.exit_code, 0)
+}
+
+test "GT[(Pt, Int)] monomorphizes to Tuple2_Pt_int and round-trips" {
+    let src = gt_src("(Pt, Int)", "(Pt \{ x: 256, y: 512 }, 7)", "(Pt \{ x: 1, y: 2 }, 8)")
+    let c = compile_test_helpers.compile_and_emit_c(src, "fqthkv_m_ptint_c")
+    assert_has(c, "blink_GT_Tuple2_Pt_int", "GT[(Pt,Int)] mono name")
+    assert_no_erasure(c, "GT[(Pt,Int)]")
+    let r = compile_test_helpers.compile_and_run(src, "fqthkv_m_ptint_run")
+    assert_eq(r.exit_code, 0)
+}
+
+// ── type IDENTITY guard ─────────────────────────────────────────────────────
+// Two sibling instantiations at DIFFERENT tuple type args must each get their own
+// mono type. Collapsing both onto one erased name compiles and links silently
+// (the `#ifndef BLINK_TD_` typedef guard makes the duplicate a no-op), so the only
+// way to see it is to demand both spellings.
+
+test "sibling GT instantiations at different tuple type args stay distinct" {
+    let mut src = "type GT[T] \{ s: Set[T] }\n"
+    src = src.concat("fn main() \{\n")
+    src = src.concat("    let a: GT[(Int, Int)] = GT \{ s: Set() }\n")
+    src = src.concat("    let b: GT[(Str, Int)] = GT \{ s: Set() }\n")
+    src = src.concat("    a.s.insert((256, 512))\n")
+    src = src.concat("    b.s.insert((\"k\", 512))\n")
+    src = src.concat("    assert(a.s.contains((256, 512)))\n")
+    src = src.concat("    assert(b.s.contains((\"k\", 512)))\n")
+    src = src.concat("    assert_eq(a.s.len(), 1)\n")
+    src = src.concat("    assert_eq(b.s.len(), 1)\n")
+    src = src.concat("}\n")
+    let c = compile_test_helpers.compile_and_emit_c(src, "fqthkv_siblings_c")
+    assert_has(c, "blink_GT_Tuple2_int_int", "sibling GT[(Int,Int)]")
+    assert_has(c, "blink_GT_Tuple2_str_int", "sibling GT[(Str,Int)]")
+    assert_no_erasure(c, "sibling tuple instantiations")
+    let r = compile_test_helpers.compile_and_run(src, "fqthkv_siblings_run")
+    assert_eq(r.exit_code, 0)
+}

@@ -44,7 +44,9 @@ After modifying compiler sources: `task regen` then `task ci` to verify.
 
 Inspect generated C: `build/blink build --emit c <file.bl>` — output goes to `build/<name>.c`.
 Trace compiler phases: `build/blink run --blink-trace codegen <file.bl>` (also: lex, parse, typecheck, all).
-Fine-grained internal trace: `BLINK_TRACE_CHANNELS=<ch>[,<ch>...|all] build/blink build --emit c <file.bl>` — env-gated `dbg_trace(channel, msg)` taps (defined in ast.bl, the DAG root, so any module can emit). Emits `[dbg:<channel>] ...` to stderr; zero cost when unset. Prefer adding a permanent tap over a throwaway printf+recompile. Current channels: `monotid` (the tid twin's per-slot arg_tid at resolution). (`csvresolve` is retired — the legacy string-CSV type-param resolver it tapped no longer exists.)
+Fine-grained internal trace: `BLINK_TRACE_CHANNELS=<ch>[,<ch>...|all] build/blink build --emit c <file.bl>` — env-gated `dbg_trace(channel, msg)` taps (defined in ast.bl, the DAG root, so any module can emit). Emits `[dbg:<channel>] ...` to stderr; zero cost when unset. Prefer adding a permanent tap over a throwaway printf+recompile. Current channels: `monotid` (the tid twin's per-slot arg_tid at resolution); `kopsctor` (the
+Set()/Map() ctor's element resolution — raw annotation name, name resolved through the mono
+context, its tid, and the tid's tuple tag; this is where a wrong kops table gets baked). (`csvresolve` is retired — the legacy string-CSV type-param resolver it tapped no longer exists.)
 Runtime trace: `build/blink run --trace all <file.bl>` (NDJSON to stderr, filter: `fn:name`, `module:mod`, `depth:N`).
 Debug build: `build/blink run --debug <file.bl>` — enables debug_assert, compiles with `-g -O0`.
 When debugging codegen bugs, inspect the emitted C first (`--emit c`), then use `--blink-trace codegen`.

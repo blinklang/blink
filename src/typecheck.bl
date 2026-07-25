@@ -394,6 +394,12 @@ let mut tc_trait_tparam_names: List[Str] = []
 
 let mut tc_current_fn_ret: Int = -1
 let mut tc_current_fn_name: Str = ""
+// Depth of closure bodies the type-inference pass is currently inside. tc_current_fn_ret
+// is saved/restored by tc_check_fn (and the test-body elaborator) only, so within a
+// closure body it still names the ENCLOSING fn's declared return — the closure's own is
+// never installed. Read-only diagnostics tolerate that; an in-place ty_pool MUTATION
+// keyed on it does not (see tc_pin_tail_ret_generic's call site in the Return arm).
+let mut tc_in_closure_depth: Int = 0
 
 let mut tc_errors: List[Str] = []
 let mut tc_warnings: List[Str] = []
@@ -1295,6 +1301,43 @@ fn tc_pin_generic_args_from_binds(sig: Int, args_sl: Int, self_offset: Int) ! Ty
     }
 }
 
+// A function's declared return type is an expected-type source
+// (sections/03_types.md:1031), so a generic-struct/enum literal in return position
+// must monomorphize against it. `fn a() -> GKV[Int, Str] { GKV { m: Map() } }` got
+// no such constraint: tc_struct_lit_instance_tid mints `GKV[?a, ?b]` from the
+// `Map()` field's own unbound metavars, nobody unified it against the declared
+// `GKV[Int, Str]`, and codegen reached the struct-lit mono chokepoint with two
+// unsolved params — I0001 (br y1n3ck).
+//
+// The pin is an IN-PLACE tc_unify, not a hint seed. That distinction is the whole
+// fix: the metavar integers in the instance's arg list are the SAME integers the
+// field's `Map[?a, ?b]` holds, so binding a:=Int solves the mono NAME and the
+// ctor's kops vtable from one constraint. Seeding tc_construct_hint instead would
+// fix only the name and leave resolve_ctor_kops_elem on its CT_STRING default —
+// blink_kops_str for an Int key, trading a loud ICE for the silent br hnyqe4 hash
+// collision.
+//
+// Each of the three gates is load-bearing:
+//   TK_STRUCT/TK_ENUM  — excludes Option/Result/List/Map/Set/tuple/Handler returns,
+//                        which is what keeps every existing tail-`None` / tail-`[]`
+//                        / tail-tuple return byte-identical.
+//   params_count > 0   — a monomorphic struct has nothing to pin.
+//   unbound metavar    — excludes a bare TK_TYPEVAR, so a generic fn's `-> Box[T]`
+//                        keeps its existing per-T monomorphization untouched.
+//
+// The unify result is deliberately discarded: callers invoke this only where
+// types_compatible ALREADY agreed, so there is no new mismatch to report, and a
+// partial unify degrades to exactly today's I0001 rather than to a wrong type.
+fn tc_pin_tail_ret_generic(declared_ret: Int, inferred_ret: Int) {
+    let d = resolve_alias_tid(declared_ret)
+    if d < 0 || d >= ty_pool.len() { return }
+    let dt = ty_pool.get(d).unwrap()
+    if dt.kind != TK_STRUCT && dt.kind != TK_ENUM { return }
+    if dt.params_count == 0 { return }
+    if tc_tid_has_unbound_metavar(inferred_ret) == 0 { return }
+    let _ = tc_unify(d, inferred_ret)
+}
+
 // Parse an all-digits field name ("0", "12") to its Int index, or -1 for any
 // non-numeric name (so struct field accesses never match the tuple path).
 fn str_to_tuple_index(name: Str) -> Int {
@@ -1470,7 +1513,9 @@ fn is_elem_closure_hof(method: Str) -> Int {
 // typecheck to the C compiler. When a param IS explicitly annotated we bind the
 // declared type instead — this preserves Part A's annotation validation and never
 // contradicts it. Walks the body exactly once via tc_check_body, mirroring its own
-// Closure handler's scope dance.
+// Closure handler's scope dance — INCLUDING the tc_in_closure_depth bump: this is the
+// second entry into a closure body (the HOF path) and does not pass through that
+// handler, so anything keyed on "am I in a closure" must be maintained in both.
 fn check_closure_body(cls: Int, p0_t: Int, p1_t: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     if cls == -1 || node_kind(cls) != NodeKind.Closure { return }
     nr_push_scope()
@@ -1490,7 +1535,9 @@ fn check_closure_body(cls: Int, p0_t: Int, p1_t: Int) ! TypeCheck.Resolve, TypeC
             nr_define_typed(node_name(p1), 0, bind1)
         }
     }
+    tc_in_closure_depth = tc_in_closure_depth + 1
     tc_check_body(node_body(cls))
+    tc_in_closure_depth = tc_in_closure_depth - 1
     nr_pop_scope()
 }
 
@@ -3712,6 +3759,7 @@ fn init_types() ! TypeCheck.Register {
     tc_trait_tparam_count_idx.clear()
     tc_current_fn_ret = -1
     tc_current_fn_name = ""
+    tc_in_closure_depth = 0
     tc_suppress_ann_validation = 0
     tc_boundary_check_active = 0
     tc_errors.clear()
@@ -8339,6 +8387,14 @@ fn tc_check_fn(fn_node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report 
                 if inferred_ret != TYPE_UNKNOWN {
                     if types_compatible(declared_ret, inferred_ret) == 0 {
                         tc_error_at("function '{fn_name}' declared return type {type_to_str(declared_ret)} but body returns {type_to_str(inferred_ret)}", fn_node)
+                    } else {
+                        // An implicit-tail generic construction (br y1n3ck). Only in the
+                        // compatible branch: types_compatible is permissive toward an
+                        // unbound metavar (it defers to the E0301 boundary check), so this
+                        // IS the branch the under-determined tail takes — and placing the
+                        // pin here means it can never turn a reported mismatch into a
+                        // silent success.
+                        tc_pin_tail_ret_generic(declared_ret, inferred_ret)
                     }
                 }
             }
@@ -8615,7 +8671,9 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                 i = i + 1
             }
         }
+        tc_in_closure_depth = tc_in_closure_depth + 1
         tc_check_body(node_body(node))
+        tc_in_closure_depth = tc_in_closure_depth - 1
         nr_pop_scope()
         return
     }
@@ -8659,6 +8717,25 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             if tc_current_fn_ret != TYPE_VOID && tc_current_fn_ret != TYPE_UNKNOWN && val_t != TYPE_UNKNOWN {
                 if types_compatible(tc_current_fn_ret, val_t) == 0 {
                     tc_error_at("return value type {type_to_str(val_t)} does not match function '{tc_current_fn_name}' return type {type_to_str(tc_current_fn_ret)}", node)
+                } else {
+                    // An explicit `return` of a generic construction (br y1n3ck). Needed in
+                    // addition to the tc_check_fn tail site: infer_type(body) only visits a
+                    // block's LAST statement, so an EARLY return inside an `if` is never
+                    // seen there. The construct-hint push above fixes the field carriers
+                    // but not the instance's own type args — those are metavars in the
+                    // instance tid, and only unification reaches them.
+                    //
+                    // NOT inside a closure body: a `return` there returns from the CLOSURE,
+                    // but tc_current_fn_ret still names the enclosing fn's declared return
+                    // (only tc_check_fn installs it). The compare above merely reports on
+                    // that mismatch; this pin MUTATES ty_pool, so it would bind the
+                    // closure's metavars to the enclosing instance's args — `GKV[Str, Str]`
+                    // emitted as blink_GKV_Int_Str with blink_kops_i64 for a Str key, the
+                    // br hnyqe4 silent hash under a wrong-but-plausible mono name. Leaving
+                    // the closure's return under-determined keeps it a loud stop instead.
+                    if tc_in_closure_depth == 0 {
+                        tc_pin_tail_ret_generic(tc_current_fn_ret, val_t)
+                    }
                 }
             }
         } else {
@@ -9715,6 +9792,22 @@ pub fn tc_tid_struct_slot_seg(slot: Int) -> Str {
 //     (`Option[Box[Int]]`, `Option[Option[Int]]`): can diverge in the field-value
 //     registration path; defer (orthogonal follow-up).
 //   - a bare scalar slot: handled by the existing string path unchanged.
+//
+// A TUPLE slot is ADMITTED (br fqthkv), gated on tc_tid_tuple_encodable — the SAME
+// predicate the sibling gate tc_struct_slot_encodable already uses for its own
+// TK_TUPLE arm, whose comment records that tc_tid_to_c_tag's tuple spelling
+// (tc_tid_tuple_tag -> Tuple2_int_int) byte-matches the struct-lit string path's
+// registered tuple carrier segment. Before this arm a tuple type arg left
+// has_compound at 0 in tid_native_struct_mono_args, so `GT[(Int, Int)]` hit the
+// bail and reached codegen with no mono args at all — error[I0001] "mono args 'Void'".
+//
+// Permissive (tc_tid_tuple_encodable) rather than scalar-elements-only, because both
+// of the other halves of this seam are ALREADY permissive: the def side
+// (tc_tid_struct_slot_seg -> tc_tid_encodable) and the parallel arg_tids recovery
+// (mono_instance_arg_tids_from_tid -> tc_struct_slot_encodable). An asymmetric
+// literal-side gate would recreate the same bail for shapes the compiler can spell
+// on both other sides — and tc_tid_scalar_tag already erases TK_LIST/TK_SET/TK_BYTES
+// identically for all three, so `(Int, List[Str])` byte-matches everywhere.
 pub fn tc_tid_compound_slot_faithful(tid: Int) -> Bool {
     if tid < 0 || tid >= ty_pool.len() { return false }
     let t = ty_pool.get(tid).unwrap()
@@ -9722,6 +9815,7 @@ pub fn tc_tid_compound_slot_faithful(tid: Int) -> Bool {
     if k == TK_OPTION { return tc_tid_scalar_only(t.inner1) }
     if k == TK_RESULT { return tc_tid_scalar_only(t.inner1) && tc_tid_scalar_only(t.inner2) }
     if k == TK_MAP { return tc_tid_scalar_only(t.inner1) && tc_tid_scalar_only(t.inner2) }
+    if k == TK_TUPLE { return tc_tid_tuple_encodable(t) }
     false
 }
 

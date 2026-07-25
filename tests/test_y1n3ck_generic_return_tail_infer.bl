@@ -1,0 +1,261 @@
+// br y1n3ck: a generic-struct literal in RETURN position must take the declared
+// return type as its monomorphization target. `fn a() -> GKV[Int, Str] { GKV { m:
+// Map() } }` hard-failed with error[I0001] UnsolvedTypeVarAtCodegen "mono args
+// 'Void,Void'".
+//
+// RESHAPED ROOT CAUSE (the ticket's own diagnosis named the wrong seam). It is NOT
+// struct_concrete_args_from_target — that is the retired STRING type-universe, and
+// adding a return-annotation tier there would patch the tier nqq29j just removed
+// while leaving typecheck's node tid metavar-bearing. The seam is TYPECHECK
+// UNIFICATION: tc_struct_lit_instance_tid mints `GKV[?a, ?b]` from the `Map()`
+// field's own unbound metavars, and nothing ever unifies that against the declared
+// return type. The fix pins the two IN PLACE (tc_pin_tail_ret_generic -> tc_unify),
+// so the SAME metavar integers the field holds become Int/Str — which solves the
+// mono NAME and the field's kops vtable together, from one constraint.
+//
+// Spec: sections/03_types.md:896 (HM inference), :923 (bidirectional checking),
+// :1031 (a function's declared return type IS an expected-type source), :1134-1136
+// (an under-determined type is reported, never defaulted to Void).
+//
+// WHY THE kops ASSERTION IS THE LOAD-BEARING ONE. The rejected alternative fix —
+// seeding tc_construct_hint from the return type — makes the mono NAME correct
+// while leaving the `Map()` field's metavars unbound, so resolve_ctor_kops_elem
+// falls to its CT_STRING default and emits blink_kops_str for an Int key. That
+// passes every name-level assertion and silently miscompiles: 256 and 512 both end
+// in a 0x00 byte, so under the string hasher they collide as the empty string (the
+// br hnyqe4 corruption signature). Asserting `blink_kops_i64` present AND
+// `blink_kops_str` absent is what separates the correct fix from that one, and the
+// 256/512 runtime round-trip is the independent witness.
+
+import compile_test_helpers
+import std.io
+
+fn assert_has(c: Str, needle: Str, label: Str) {
+    if !c.contains(needle) { io.println("FAIL: {label} — missing '{needle}'") }
+    assert(c.contains(needle))
+}
+
+fn assert_lacks(c: Str, needle: Str, label: Str) {
+    if c.contains(needle) { io.println("FAIL: {label} — forbidden '{needle}' present") }
+    assert(!c.contains(needle))
+}
+
+// Per CLAUDE.md the `_Void` grep is a LOWER BOUND: the tid producers erase by
+// passing the binder through unchanged (blink_GKV_K / _V, br pt4hsy) and a def-side
+// field can erase under a fully correct mono name (blink_map_void, br w4c0py).
+// Check all three families on every row.
+fn assert_no_erasure(c: Str, label: Str) {
+    assert_lacks(c, "_Void", "{label} / string-producer erasure")
+    assert_lacks(c, "blink_GKV_K", "{label} / bare-binder K passthrough")
+    assert_lacks(c, "blink_GKV_V", "{label} / bare-binder V passthrough")
+    assert_lacks(c, "blink_map_void", "{label} / erased Map carrier field")
+}
+
+// The Int key is what the kops choice decides, so both keys carry a 0x00 low byte.
+fn gkv_body() -> Str {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let g = a()\n")
+    s = s.concat("    g.m.insert(256, \"lo\")\n")
+    s = s.concat("    g.m.insert(512, \"hi\")\n")
+    s = s.concat("    assert_eq(g.m.len(), 2)\n")
+    s = s.concat("    assert(g.m.get(256).unwrap() == \"lo\")\n")
+    s = s.concat("    assert(g.m.get(512).unwrap() == \"hi\")\n")
+    s = s.concat("}\n")
+    s
+}
+
+// `body` is the whole `fn a() -> GKV[Int, Str] { .. }` declaration, so each row can
+// vary only the return form.
+fn gkv_src(decl: Str) -> Str {
+    "type GKV[K, V] \{ m: Map[K, V] }\n{decl}{gkv_body()}"
+}
+
+fn src_tail() -> Str {
+    gkv_src("fn a() -> GKV[Int, Str] \{ GKV \{ m: Map() } }\n")
+}
+
+fn src_return() -> Str {
+    gkv_src("fn a() -> GKV[Int, Str] \{ return GKV \{ m: Map() } }\n")
+}
+
+// The early return is NOT the block's last statement, so infer_type(body) never
+// visits it — this row is red if only tc_check_fn's tail compare is patched and the
+// NodeKind.Return arm is skipped. The tail here is deliberately the already-working
+// annotated-let form, so the row isolates the early return.
+fn src_early() -> Str {
+    let mut d = "fn a() -> GKV[Int, Str] \{\n"
+    d = d.concat("    if 1 == 1 \{ return GKV \{ m: Map() } }\n")
+    d = d.concat("    let g: GKV[Int, Str] = GKV \{ m: Map() }\n")
+    d = d.concat("    g\n")
+    d = d.concat("}\n")
+    gkv_src(d)
+}
+
+// ── the three return forms must not ICE ──────────────────────────────────────
+
+test "generic-struct literal in implicit tail position does not ICE (MVCE)" {
+    compile_test_helpers.expect_no_error(src_tail(), "y1n3ck_tail", "I0001")
+}
+
+test "generic-struct literal in explicit return position does not ICE" {
+    compile_test_helpers.expect_no_error(src_return(), "y1n3ck_return", "I0001")
+}
+
+test "generic-struct literal in an early return does not ICE" {
+    compile_test_helpers.expect_no_error(src_early(), "y1n3ck_early", "I0001")
+}
+
+// ── mono name + kops + runtime, per return form ──────────────────────────────
+
+test "implicit tail monomorphizes to GKV_Int_Str with the i64 kops" {
+    let c = compile_test_helpers.compile_and_emit_c(src_tail(), "y1n3ck_tail_c")
+    assert_has(c, "blink_GKV_Int_Str", "tail mono name")
+    assert_has(c, "blink_map_new(&blink_kops_i64)", "tail Int-key kops")
+    assert_lacks(c, "blink_kops_str", "tail must not hash an Int key as a string")
+    assert_no_erasure(c, "implicit tail")
+}
+
+test "implicit tail round-trips 256 and 512 at runtime" {
+    let r = compile_test_helpers.compile_and_run(src_tail(), "y1n3ck_tail_run")
+    assert_eq(r.exit_code, 0)
+}
+
+test "explicit return monomorphizes to GKV_Int_Str with the i64 kops" {
+    let c = compile_test_helpers.compile_and_emit_c(src_return(), "y1n3ck_return_c")
+    assert_has(c, "blink_GKV_Int_Str", "return mono name")
+    assert_has(c, "blink_map_new(&blink_kops_i64)", "return Int-key kops")
+    assert_lacks(c, "blink_kops_str", "return must not hash an Int key as a string")
+    assert_no_erasure(c, "explicit return")
+}
+
+test "explicit return round-trips 256 and 512 at runtime" {
+    let r = compile_test_helpers.compile_and_run(src_return(), "y1n3ck_return_run")
+    assert_eq(r.exit_code, 0)
+}
+
+test "early return monomorphizes to GKV_Int_Str with the i64 kops" {
+    let c = compile_test_helpers.compile_and_emit_c(src_early(), "y1n3ck_early_c")
+    assert_has(c, "blink_GKV_Int_Str", "early-return mono name")
+    assert_has(c, "blink_map_new(&blink_kops_i64)", "early-return Int-key kops")
+    assert_lacks(c, "blink_kops_str", "early return must not hash an Int key as a string")
+    assert_no_erasure(c, "early return")
+}
+
+test "early return round-trips 256 and 512 at runtime" {
+    let r = compile_test_helpers.compile_and_run(src_early(), "y1n3ck_early_run")
+    assert_eq(r.exit_code, 0)
+}
+
+// ── composition: needs BOTH the tuple faithfulness gate (fqthkv) and the pin ──
+// The pin leaves T holding a metavar bound IN PLACE to Tuple2_int_int. That slot is
+// invisible to tid_native_struct_mono_args' bound-metavar probe (tk_to_ct maps
+// TK_TUPLE to CT_VOID, so tc_tid_ct_resolved reads -1 for it — the one kind the
+// probe cannot see), and the faithfulness gate reads the slot unresolved, so it
+// classifies as neither compound nor scalar and bails the whole instance. Both
+// halves must be in place for this row.
+
+test "tuple-arg generic struct in tail position monomorphizes and round-trips" {
+    let mut src = "type GT[T] \{ s: Set[T] }\n"
+    src = src.concat("fn f() -> GT[(Int, Int)] \{ GT \{ s: Set() } }\n")
+    src = src.concat("fn main() \{\n")
+    src = src.concat("    let e = f()\n")
+    src = src.concat("    e.s.insert((256, 512))\n")
+    src = src.concat("    e.s.insert((1, 2))\n")
+    src = src.concat("    assert_eq(e.s.len(), 2)\n")
+    src = src.concat("    assert(e.s.contains((256, 512)))\n")
+    src = src.concat("    assert(e.s.contains((1, 2)))\n")
+    src = src.concat("}\n")
+    let c = compile_test_helpers.compile_and_emit_c(src, "y1n3ck_tuple_c")
+    assert_has(c, "blink_GT_Tuple2_int_int", "tuple-arg tail mono name")
+    assert_lacks(c, "blink_kops_str", "tuple key must not be hashed as a string")
+    assert_lacks(c, "_Void", "tuple-arg tail / string-producer erasure")
+    let r = compile_test_helpers.compile_and_run(src, "y1n3ck_tuple_run")
+    assert_eq(r.exit_code, 0)
+}
+
+// ── green guards: shapes the pin must NOT touch ──────────────────────────────
+
+// The pin runs only where types_compatible ALREADY agreed, so a real mismatch keeps
+// its diagnostic. This is the shape that reaches the compare with two concrete
+// instances (the field value is an annotated let, so K/V bind concretely).
+test "a declared/body generic-arg mismatch is still diagnosed" {
+    let mut src = "type GKV[K, V] \{ m: Map[K, V] }\n"
+    src = src.concat("fn a() -> GKV[Int, Str] \{\n")
+    src = src.concat("    let m: Map[Str, Int] = Map()\n")
+    src = src.concat("    return GKV \{ m: m }\n")
+    src = src.concat("}\n")
+    src = src.concat("fn main() \{ let _x = a() }\n")
+    compile_test_helpers.expect_compile_error(src, "y1n3ck_guard_mismatch", "E0300")
+}
+
+// A generic fn's `-> Box[T]` return is a struct INSTANCE (TK_STRUCT, params_count 1),
+// so it clears the first two gates; the third excludes it. Its slot holds a bare
+// TK_TYPEVAR, and tc_is_unbound_metavar counts only TK_UNKNOWN-with-no-solution, so
+// tc_tid_has_unbound_metavar reads 0 and this stays on its existing per-T
+// monomorphization path. Do not drop that gate as redundant with the other two.
+test "a generic fn returning Box[T] is untouched" {
+    let mut src = "type Box[T] \{ v: T }\n"
+    src = src.concat("fn mk[T](x: T) -> Box[T] \{ Box \{ v: x } }\n")
+    src = src.concat("fn main() \{\n")
+    src = src.concat("    let b = mk(5)\n")
+    src = src.concat("    let s = mk(\"x\")\n")
+    src = src.concat("    assert_eq(b.v, 5)\n")
+    src = src.concat("    assert(s.v == \"x\")\n")
+    src = src.concat("}\n")
+    let c = compile_test_helpers.compile_and_emit_c(src, "y1n3ck_guard_boxt")
+    assert_has(c, "blink_Box_Int", "Box[Int] mono still emitted")
+    assert_has(c, "blink_Box_Str", "Box[Str] mono still emitted")
+    assert_lacks(c, "_Void", "Box[T] guard / erasure")
+    let r = compile_test_helpers.compile_and_run(src, "y1n3ck_guard_boxt_run")
+    assert_eq(r.exit_code, 0)
+}
+
+// The TK_STRUCT/TK_ENUM gate is what keeps every tail-`None` / tail-`[]` / tail-tuple
+// return outside the pin. A tuple return carrying a bare `None` is the densest such
+// shape: metavar-bearing AND compound, and still must not be pinned.
+test "a tuple return carrying a bare None is untouched" {
+    let mut src = "fn a() -> (Int, Option[Int]) \{ (1, None) }\n"
+    src = src.concat("fn main() \{\n")
+    src = src.concat("    let t = a()\n")
+    src = src.concat("    assert_eq(t.0, 1)\n")
+    src = src.concat("    assert(t.1.is_none())\n")
+    src = src.concat("}\n")
+    let r = compile_test_helpers.compile_and_run(src, "y1n3ck_guard_tupopt")
+    assert_eq(r.exit_code, 0)
+}
+
+// tc_current_fn_ret is saved/restored by tc_check_fn only — the tc_check_body Closure
+// arm does not touch it — so inside a closure body it still names the ENCLOSING fn's
+// declared return. The pin is an IN-PLACE ty_pool mutation, so firing it there would
+// bind the closure's own metavars to the enclosing instance's args: `GKV[Str, Str]`
+// monomorphized as blink_GKV_Int_Str, with blink_kops_i64 baked for a Str key. That is
+// the br hnyqe4 shape again, so the pin must not fire in a closure body at all. The
+// closure's return then stays genuinely under-determined and the existing backstop
+// reports it — a loud stop, never a wrong instance.
+test "the pin does not reach into a closure body's own return" {
+    let mut src = "type GKV[K, V] \{ m: Map[K, V] }\n"
+    src = src.concat("fn a() -> GKV[Int, Str] \{\n")
+    src = src.concat("    let f = fn() -> GKV[Str, Str] \{ return GKV \{ m: Map() } }\n")
+    src = src.concat("    let _z = f()\n")
+    src = src.concat("    GKV \{ m: Map() }\n")
+    src = src.concat("}\n")
+    src = src.concat("fn main() \{ let _g = a() }\n")
+    compile_test_helpers.expect_compile_error(src, "y1n3ck_guard_closure", "I0001")
+}
+
+// ── pinned CURRENT behavior (documented gap, tracked separately) ─────────────
+// An INTERMEDIATE let defeats the pin: tc_check_body pops the block scope and the
+// E0301 region-boundary check fires on `x` before tc_check_fn ever reaches the tail.
+// Per sections/03_types.md:1158 a later constraining use should determine the type,
+// and returning `x` arguably is one — so this is a diagnostic-ordering gap, filed as
+// its own bug. Asserted here so whoever fixes it trips this test and updates it
+// deliberately rather than by accident.
+test "an intermediate let before the tail still reports E0301 (current behavior)" {
+    let mut src = "type GKV[K, V] \{ m: Map[K, V] }\n"
+    src = src.concat("fn a() -> GKV[Int, Str] \{\n")
+    src = src.concat("    let x = GKV \{ m: Map() }\n")
+    src = src.concat("    x\n")
+    src = src.concat("}\n")
+    src = src.concat("fn main() \{ let _g = a() }\n")
+    compile_test_helpers.expect_compile_error(src, "y1n3ck_pinned_e0301", "E0301")
+}
