@@ -1230,6 +1230,14 @@ type MonoInstance {
     args: Str
     c_name: Str
     arg_tids: List[Int]
+    // The type ANNOTATION node this instance was registered from, or -1. Only
+    // register_carrier_inner_mono_instance sets it, because that producer runs in
+    // codegen_types — BELOW typecheck in the module DAG — and so cannot read the
+    // instance tid it needs for arg_tids. The tid does exist:
+    // tc_produce_struct_instance_tid / _enum_ memoized the full instance onto this
+    // very node. Carrying the node id (a plain Int, no typecheck surface required)
+    // lets the def-side typedef emitter, which runs ABOVE typecheck, recover it.
+    ann: Int
 }
 
 // The PHYSICAL C-symbol stem for a mono base. For a generic STRUCT/ENUM base
@@ -1342,11 +1350,11 @@ pub let mut cg_expect_arg_ann: Int = -1
 // Monomorphization context: set while emitting a generic fn body so deeply
 // nested codegen sites (like Map() literals) can substitute tparams.
 pub let mut cg_mono_tparams_sl: Int = -1
-pub let mut cg_mono_concrete_args: Str = ""
-// Tid parallel of cg_mono_concrete_args: the concrete arg type-ids for the
-// generic instance currently being emitted, so compound-inner sites can resolve
-// a typevar via its structured tid (resolve_tparam_via_tid) instead of the
-// string tag. Empty ([]) at any site → graceful fallback to the string path.
+// The concrete arg type-ids for the generic instance currently being emitted, so
+// compound-inner sites can resolve a typevar via its structured tid
+// (resolve_tparam_via_tid). Empty ([]) at any site → the name passes through
+// unchanged. (The string CSV twin this used to shadow, cg_mono_concrete_args, went
+// with the string resolver: after that deletion nothing ever read it back.)
 pub let mut cg_mono_arg_tids: List[Int] = []
 
 pub let mut ffi_alloc_n_pending: Int = 0
@@ -4352,8 +4360,28 @@ pub fn mangle_from_method(source: Str, target: Str, mname: Str) -> Str {
 }
 
 pub fn register_mono_instance(base: Str, args: Str, arg_tids: List[Int]) -> Str ! Codegen.Register {
+    register_mono_instance_ann(base, args, arg_tids, -1)
+}
+
+// register_mono_instance plus the source annotation node, for the one producer that
+// cannot compute arg_tids itself (see MonoInstance.ann). On a dedup hit an incoming
+// annotation is ATTACHED to the existing entry when that entry has none: registration
+// order is not controlled, so the tid-bearing annotation may well arrive second, and
+// dropping it would leave the def side with the same all- -1 slots this exists to fix.
+pub fn register_mono_instance_ann(base: Str, args: Str, arg_tids: List[Int], ann: Int) -> Str ! Codegen.Register {
     let existing = lookup_mono_instance(base, args)
     if existing != "" {
+        if ann != -1 {
+            match mono_rev_idx.get(existing) {
+                Some(idx) => {
+                    let m = mono_instances.get(idx).unwrap()
+                    if m.ann == -1 {
+                        mono_instances.set(idx, MonoInstance { base: m.base, args: m.args, c_name: m.c_name, arg_tids: m.arg_tids, ann: ann })
+                    }
+                }
+                None => {}
+            }
+        }
         return existing
     }
     // The C symbol is built off the PHYSICAL base (module-prefixed for a
@@ -4366,7 +4394,7 @@ pub fn register_mono_instance(base: Str, args: Str, arg_tids: List[Int]) -> Str 
     let c_name = mangle_generic_name(phys_base, args)
     mono_idx.insert(phys_base.concat("\t").concat(args), mono_instances.len())
     mono_rev_idx.insert(c_name, mono_instances.len())
-    mono_instances.push(MonoInstance { base: base, args: args, c_name: c_name, arg_tids: arg_tids })
+    mono_instances.push(MonoInstance { base: base, args: args, c_name: c_name, arg_tids: arg_tids, ann: ann })
     c_name
 }
 
@@ -4461,6 +4489,12 @@ pub fn mono_name_from_ann(base_name: Str, ann_node: Int, tparams_sl: Int, segs: 
 // inner-first (its typedef must precede the outer that names it). Returns the mono
 // stem (`QBox_Int`) or "" when inner_name isn't a generic instance (bare struct /
 // typevar) — the caller then keeps its existing bare-head spelling.
+//
+// Because no tid is reachable here, this registers the SOURCE ANNOTATION alongside
+// the all- -1 arg_tids (MonoInstance.ann) and the def-side typedef emitter recovers
+// the real slots from it above typecheck. Do not "fix" the -1s by parsing the
+// concrete_args string: that resolver was deleted (0n07he) and reinstating it is
+// exactly what decisions/compiler-type-representation.md step 4 forbids.
 pub fn register_carrier_inner_mono_instance(inner_name: Str, inner_ann: Int) -> Str ! Codegen.Register {
     let base = strip_module_qualifier(inner_name)
     let td = find_type_def_node(base)
@@ -4485,12 +4519,16 @@ pub fn register_carrier_inner_mono_instance(inner_name: Str, inner_ann: Int) -> 
         }
         if ai > 0 { args = args.concat(",") }
         args = args.concat(arg_seg)
-        // Scalar/string-resolvable args carry no tid; the def-side typedef emitter
-        // (emit_mono_struct_typedef) resolves them from the concrete_args string.
+        // No tid is computable HERE: codegen_types sits below typecheck in the module
+        // DAG, so the tid accessors are out of reach. Registering the source annotation
+        // (below) hands the def-side emitter the node whose memoized instance tid it can
+        // read for itself — see MonoInstance.ann. This used to say the def side would
+        // recover the slot from the concrete_args STRING; that resolver is gone (0n07he),
+        // and the premise outliving it is what erased these fields to `void` (br w4c0py).
         arg_tids.push(-1)
         ai = ai + 1
     }
-    register_mono_instance(base, args, arg_tids)
+    register_mono_instance_ann(base, args, arg_tids, inner_ann)
 }
 
 // Concrete type-args CSV for a struct instance whose enclosing value context

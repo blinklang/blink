@@ -18,7 +18,7 @@ import codegen_types.{
     cg_handler_is_user_effect,
     cg_handler_vtable_field, cg_handler_vtable_type,
     cg_in_handler_body, cg_in_ffi_scope_resource, cg_indent, cg_test_mode, cg_in_assert_panics, cg_assert_panics_counter, cg_let_target_ann, cg_expect_arg_ann,
-    cg_mono_tparams_sl, cg_mono_concrete_args, cg_mono_arg_tids,
+    cg_mono_tparams_sl, cg_mono_arg_tids,
     cg_let_target_name, cg_let_target_type, cg_assign_target_name, cg_lines, cg_program_node,
     cg_temp_counter, cg_trace_codegen, cg_ensures_result_var, cg_old_snapshot_vars,
     compound_name_from_ann, resolve_result_inner_tag,
@@ -50,7 +50,7 @@ import codegen_types.{
     is_compound_ct, is_data_enum, is_enum_type, is_mono_struct_instance, is_transparent_newtype,
     is_intrinsic_method, is_named_type, is_runtime_header_fn, is_stdlib_source_module, is_struct_or_enum_type, is_struct_type, is_trait_type, list_contains_str, list_iter_c_type, skip_private_in_module_header,
     lookup_assoc_type, lookup_impl_type_for_trait, lookup_mono_base, mangle_generic_name, mangle_impl_method, mangle_impl_method_q, match_scrut_enum,
-    match_scruts, mono_fns, mono_instances, mono_name_from_ann, mono_phys_base, mut_captured_vars, option_c_type, register_mono_instance,
+    match_scruts, mono_fns, mono_instances, mono_name_from_ann, mono_phys_base, mut_captured_vars, nth_type_arg, option_c_type, register_mono_instance,
     register_carrier_inner_mono_instance,
     strip_generic_args, strip_module_qualifier,
     poly_impl_method_node, poly_impl_block_node, is_poly_impl_base,
@@ -89,7 +89,7 @@ import codegen_expr.{
     expr_option_inner_map_val_struct, expr_option_inner_map_val_list_elem, expr_option_inner_tp,
     expr_option_inner_struct, expr_option_is_none, expr_result_err_struct, expr_result_err_type,
     expr_result_ok_struct, expr_result_ok_type, expr_result_str,
-    expr_result_type, panic_file_for, segs_from_arg_tids
+    expr_result_type, mono_instance_arg_tids_from_tid, panic_file_for, segs_from_arg_tids
 }
 import codegen_methods.{resolve_tparam_via_tid}
 import codegen_derive.{ct_to_descriptor, desc_primary_ct, descriptor_c_type, descriptor_mangle, emit_promote_elem_into, inner_desc_of, queue_promote_type}
@@ -6364,7 +6364,46 @@ fn register_carrier_leaf_or_instance(leaf: Int) ! Codegen.Register {
     }
 }
 
-fn emit_mono_struct_typedef(base_name: Str, concrete_args: Str, arg_tids: List[Int]) ! Codegen.Emit {
+// br w4c0py: fill the -1 slots register_carrier_inner_mono_instance had to leave.
+//
+// That producer registers the inner of a carrier annotation (`-> Option[QBox[Int]]`)
+// from codegen_types, BELOW typecheck in the import DAG, so it cannot reach a single tid
+// accessor and pushes -1 for every slot. It records the source annotation node instead
+// (MonoInstance.ann), and here — above typecheck — the real instance tid is one lookup
+// away: tc_produce_struct_instance_tid / _enum_ already memoized `QBox[Int]` onto that
+// node. So the slot is recovered as a TID, not re-parsed out of the concrete_args string;
+// the string resolver is gone (0n07he) and stays gone.
+//
+// Without this a bare-typevar field emits `void v;` (a hard C error) and, worse, a
+// compound one emits `blink_Option_void v;` inside a correctly-named blink_QBox_Int:
+// a SILENT erasure the `_Void` grep does not see, because only the field type erases
+// while the mono name stays concrete.
+//
+// A slot that already carries a tid wins — this only ever fills holes. A missing,
+// mismatched, or still-generic annotation tid leaves the list exactly as it was, so a
+// genuinely generic instance is untouched.
+fn mono_arg_tids_with_ann(arg_tids: List[Int], ann: Int, base_name: Str, count: Int) -> List[Int] {
+    if ann == -1 { return arg_tids }
+    let mut hole = 0
+    let mut i = 0
+    while i < arg_tids.len() {
+        if arg_tids.get(i).unwrap() == -1 { hole = 1 }
+        i = i + 1
+    }
+    if hole == 0 { return arg_tids }
+    let recovered = mono_instance_arg_tids_from_tid(tc_lookup_node_tid(ann), strip_module_qualifier(base_name), count)
+    if recovered.len() != arg_tids.len() { return arg_tids }
+    let mut out: List[Int] = []
+    let mut j = 0
+    while j < arg_tids.len() {
+        let have = arg_tids.get(j).unwrap()
+        out.push(if have != -1 { have } else { recovered.get(j).unwrap() })
+        j = j + 1
+    }
+    out
+}
+
+fn emit_mono_struct_typedef(base_name: Str, concrete_args: Str, arg_tids0: List[Int], ann: Int) ! Codegen.Emit {
     let td = find_type_def(base_name)
     if td == -1 {
         return
@@ -6373,6 +6412,7 @@ fn emit_mono_struct_typedef(base_name: Str, concrete_args: Str, arg_tids: List[I
     if tparams_sl == -1 {
         return
     }
+    let arg_tids = mono_arg_tids_with_ann(arg_tids0, ann, base_name, sublist_length(tparams_sl))
     // c_name uses the PHYSICAL base so the typedef name byte-matches the c_name
     // register_mono_instance minted (blink_<mod>_Box_Int for a cross-module
     // instance); find_type_def above keeps using the LOGICAL base_name. For a
@@ -6505,11 +6545,12 @@ fn emit_mono_struct_typedef(base_name: Str, concrete_args: Str, arg_tids: List[I
 // tparams_sl / arg_tids. Also registers the mono name in enum_reg_set so is_data_enum
 // / c_type_from_tag recognize the instance, and emits the per-variant `_TAG` macros
 // keyed on the mono C name.
-fn emit_mono_enum_typedef(base_name: Str, concrete_args: Str, arg_tids: List[Int]) ! Codegen.Emit {
+fn emit_mono_enum_typedef(base_name: Str, concrete_args: Str, arg_tids0: List[Int], ann: Int) ! Codegen.Emit {
     let td = find_type_def(base_name)
     if td == -1 { return }
     let tparams_sl = node_type_params(td)
     if tparams_sl == -1 { return }
+    let arg_tids = mono_arg_tids_with_ann(arg_tids0, ann, base_name, sublist_length(tparams_sl))
     let flds_sl = node_fields(td)
     if flds_sl == -1 { return }
     let c_name = mangle_generic_name(mono_phys_base(base_name), concrete_args)
@@ -6627,9 +6668,9 @@ pub fn emit_all_mono_typedefs() ! Codegen.Emit {
             let flds_sl = node_fields(td)
             if flds_sl != -1 && sublist_length(flds_sl) > 0 {
                 if node_kind(sublist_get(flds_sl, 0)) != NodeKind.TypeVariant {
-                    emit_mono_struct_typedef(mi.base, mi.args, mi.arg_tids)
+                    emit_mono_struct_typedef(mi.base, mi.args, mi.arg_tids, mi.ann)
                 } else {
-                    emit_mono_enum_typedef(mi.base, mi.args, mi.arg_tids)
+                    emit_mono_enum_typedef(mi.base, mi.args, mi.arg_tids, mi.ann)
                 }
             }
         }
@@ -7091,14 +7132,11 @@ fn emit_mono_fn_def(fn_node: Int, concrete_args: Str, arg_tids: List[Int]) ! Cod
         body_ret = CT_INT
     }
     let saved_mono_tparams = cg_mono_tparams_sl
-    let saved_mono_args = cg_mono_concrete_args
     let saved_mono_arg_tids = cg_mono_arg_tids
     cg_mono_tparams_sl = tparams_sl
-    cg_mono_concrete_args = concrete_args
     cg_mono_arg_tids = arg_tids
     emit_fn_body(node_body(fn_node), body_ret)
     cg_mono_tparams_sl = saved_mono_tparams
-    cg_mono_concrete_args = saved_mono_args
     cg_mono_arg_tids = saved_mono_arg_tids
     if ret_type == CT_VOID && body_ret == CT_VOID {
         emit_trace_exit_void()
@@ -7403,14 +7441,11 @@ fn emit_poly_impl_method_def(im: Int, method_node: Int, concrete_args: Str, arg_
         body_ret = CT_INT
     }
     let saved_mono_tparams = cg_mono_tparams_sl
-    let saved_mono_args = cg_mono_concrete_args
     let saved_mono_arg_tids = cg_mono_arg_tids
     cg_mono_tparams_sl = tparams_sl
-    cg_mono_concrete_args = concrete_args
     cg_mono_arg_tids = arg_tids
     emit_fn_body(node_body(method_node), body_ret)
     cg_mono_tparams_sl = saved_mono_tparams
-    cg_mono_concrete_args = saved_mono_args
     cg_mono_arg_tids = saved_mono_arg_tids
     if ret_type == CT_VOID && body_ret == CT_VOID {
         emit_trace_exit_void()
@@ -7464,9 +7499,9 @@ pub fn emit_mono_typedefs_from(start: Int) ! Codegen.Emit {
             let flds_sl = node_fields(td)
             if flds_sl != -1 && sublist_length(flds_sl) > 0 {
                 if node_kind(sublist_get(flds_sl, 0)) != NodeKind.TypeVariant {
-                    emit_mono_struct_typedef(mi.base, mi.args, mi.arg_tids)
+                    emit_mono_struct_typedef(mi.base, mi.args, mi.arg_tids, mi.ann)
                 } else {
-                    emit_mono_enum_typedef(mi.base, mi.args, mi.arg_tids)
+                    emit_mono_enum_typedef(mi.base, mi.args, mi.arg_tids, mi.ann)
                 }
             }
         }

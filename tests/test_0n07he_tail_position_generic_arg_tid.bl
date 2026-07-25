@@ -22,14 +22,17 @@
 // one — it passed at runtime before the fix too, because the string-CSV fallback
 // happened to produce the CORRECT segment ("Int") at these 14 sites. So pre-fix there
 // was no _Void and no failing assertion; the only red signal was the csvresolve trace
-// counter. That channel is now retired along with the string resolver itself, which
-// makes this file a genuinely EXECUTABLE guard: with no string left to fall back to,
-// regressing the typecheck fix makes this exact shape spell the bare `blink_Box_T` head
-// and fail to compile. The durable criterion is the _Void grep (see CLAUDE.md
-// "Measuring type-erasure in emitted C"):
-//   blink build --emit c tests/test_0n07he_tail_position_generic_arg_tid.bl -o .tmp/f
-//   grep -c '_Void' .tmp/f.c
-// must be 0.
+// counter, and that channel is now retired along with the string resolver itself.
+//
+// The scalar-return shapes below (`-> T`) are therefore still WEAK guards: the memo
+// clobber they were written for does not, on its own, make them fail. The executable
+// guard is `rewrapped()` (br pt4hsy), whose declared return is the generic STRUCT —
+// that one spells the bare `blink_Box_T` head and fails to compile when the fix is
+// regressed. Do not delete it as a duplicate of the scalar cases.
+//
+// Note also that `_Void` does NOT cover this: a bare binder mangles to `blink_Box_T`,
+// which contains no "Void". See the corrected paragraph in CLAUDE.md, "Measuring
+// type-erasure in emitted C".
 
 type Box[T] { value: T }
 
@@ -39,6 +42,10 @@ fn box_make[T](v: T) -> Box[T] {
 
 fn box_get[T](b: Box[T]) -> T {
     b.value
+}
+
+fn box_rewrap[T](b: Box[T]) -> Box[T] {
+    Box { value: b.value }
 }
 
 // The clobbered shape: intermediate `let`, then a generic call in tail position of a
@@ -65,6 +72,24 @@ fn boxed_label() -> Str {
 fn boxed_annotated() -> Int {
     let b: Box[Int] = box_make(9)
     box_get(b)
+}
+
+// br pt4hsy: the declared return is the GENERIC STRUCT itself (`-> Box[T]`), not a
+// scalar `-> T`. That routes through a different site than box_get above — the
+// CT_VOID/struct-return arm of emit_generic_call, which rebuilds mono_args from the
+// return ANNOTATION's elements. When the tail-position memo clobber leaves the return
+// tid unresolved, that arm spells the element as the bare binder "T" and registers
+// `Box` / "T", emitting `typedef struct { void value; } blink_Box_T;`. Its sibling
+// site (register_map_elem_struct_mono) already refuses to register a binder-named
+// instance; this one must too, after first trying the enclosing call's own mono segs.
+fn rewrapped() -> Box[Int] {
+    let b = box_make(7)
+    box_rewrap(b)
+}
+
+test "tail-position generic call whose declared return is the generic struct" {
+    assert_eq(box_get(rewrapped()), 7)
+    assert_eq(rewrapped().value, 7)
 }
 
 test "generic call in tail position of a non-void fn monomorphizes concretely" {

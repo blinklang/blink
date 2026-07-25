@@ -10,7 +10,7 @@ import codegen_types.{
     cg_closure_cap_count, cg_closure_cap_start, cg_closure_defs,
     cg_current_fn_has_ev, cg_current_fn_name, cg_current_fn_node, cg_current_fn_option_inner, cg_current_fn_option_inner_struct, cg_current_fn_ret, cg_in_test_body, cg_test_mode, cg_in_assert_panics,
     cg_let_target_ann, cg_expect_arg_ann, cg_assign_target_name,
-    cg_mono_tparams_sl, cg_mono_concrete_args, cg_mono_arg_tids,
+    cg_mono_tparams_sl, cg_mono_arg_tids,
     cg_debug_mode, cg_handler_body_field, cg_handler_body_idx,
     cg_handler_body_is_ue, cg_handler_body_vtable_type,
     cg_handler_caps, HandlerCapture,
@@ -64,6 +64,7 @@ import codegen_types.{
     register_mono_fn, register_mono_instance,
     resolve_import_alias, resolve_option_inner_from_ann,
     resolve_ptr_inner_c, resolve_result_inner_tag, resolve_ret_type_from_ann, resolve_struct_from_c_name,
+    resolve_tparam_seg,
     nth_type_arg, resolve_variant, struct_concrete_args_from_target,
     result_c_type, result_c_type_mixed,
     scope_vars, set_list_elem_struct, set_list_elem_type,
@@ -3125,19 +3126,37 @@ pub fn emit_generic_fn_call_tail(node: Int, fn_name: Str, args_str: Str, ca: Gen
             if ret_elems != -1 && sublist_length(ret_elems) > 0 {
                 let ret_arg_tids = mono_instance_arg_tids_from_tid(ret_tid, resolved_ret, sublist_length(ret_elems))
                 let mut mono_args = ""
+                let mut binder_seg = 0
                 let mut ai = 0
                 while ai < sublist_length(ret_elems) {
                     let elem = sublist_get(ret_elems, ai)
                     let raw_name = node_name(elem)
-                    let resolved_arg = resolve_arg_seg_via_slot_tid(ai, raw_name, ret_arg_tids)
+                    let mut resolved_arg = resolve_arg_seg_via_slot_tid(ai, raw_name, ret_arg_tids)
+                    // br pt4hsy: the return tid can come back unresolved for this exact
+                    // shape (a generic call in TAIL position — tc_check_fn re-infers the
+                    // body after its scope is popped), leaving the element spelled as the
+                    // bare binder. `segs` holds THIS call's own concrete args, aligned to
+                    // the callee's tparams, so a binder still resolves there.
+                    if resolved_arg == raw_name {
+                        resolved_arg = resolve_tparam_seg(raw_name, tparams_sl, segs)
+                    }
+                    if tparams_sl_contains(tparams_sl, resolved_arg) != 0 {
+                        binder_seg = 1
+                    }
                     if ai > 0 {
                         mono_args = mono_args.concat(",")
                     }
                     mono_args = mono_args.concat(resolved_arg)
                     ai = ai + 1
                 }
-                ret_struct_name = register_mono_instance(resolved_ret, mono_args, ret_arg_tids)
-                set_var_struct("{c_fn_name(mangled)}({call_args})", ret_struct_name)
+                // Still a declared type-param after both resolvers means the caller is
+                // itself generic with no concrete binding here; registering would mint a
+                // typevar-named instance (`blink_Box_T` with a `void` field). Defer to the
+                // bare path below, matching register_map_elem_struct_mono's guard.
+                if binder_seg == 0 {
+                    ret_struct_name = register_mono_instance(resolved_ret, mono_args, ret_arg_tids)
+                    set_var_struct("{c_fn_name(mangled)}({call_args})", ret_struct_name)
+                }
             }
         }
         // Plain T → user struct/enum: emit a temp + struct binding so the
@@ -5163,15 +5182,14 @@ fn tid_native_struct_mono_args(node: Int, sname: Str) -> Str {
     // has_compound, so the has_compound gate keeps confining every OTHER shape to
     // its exact current string output (byte-identity preserved).
     //
-    // NOTE on the resolving/non-resolving asymmetry: this gate reads the slot
-    // RESOLVED, but the parallel arg_tids recovery (mono_instance_arg_tids_from_tid
-    // → tc_struct_slot_encodable) reads it RAW, where a bound metavar is still
-    // TK_UNKNOWN and so unencodable. A bound-metavar slot therefore mangles
-    // concretely in mono_args while its arg_tids entry is -1. That is harmless
-    // today — the def side falls back to the string seg, which is the same text,
-    // and arg_tids_match_mono_args skips "" segs — but the two halves of one
-    // decision look at the slot through different lenses, so tightening the parity
-    // guard must resolve on BOTH sides or it will start rejecting these instances.
+    // Both halves of this decision now read the slot RESOLVED: the parallel arg_tids
+    // recovery (mono_instance_arg_tids_from_tid) applies tc_tid_resolved before
+    // tc_struct_slot_encodable for exactly this reason. A bound metavar keeps kind
+    // TK_UNKNOWN, so a RAW read would call the slot unencodable and store -1 while
+    // the mono_args half spelled it concretely — and there is no longer a string
+    // resolver to paper over that gap on the def side. Keep the two lenses matched:
+    // if either side stops resolving, bound-metavar instances silently lose their
+    // tids again.
     let mut has_bound_metavar = 0
     let mut i = 0
     while i < count {
@@ -5203,12 +5221,17 @@ fn tid_native_struct_mono_args(node: Int, sname: Str) -> Str {
 // Recover the per-slot arg tids for a struct-INSTANCE tid, gated on
 // tc_struct_slot_encodable exactly like register_struct_instance_from_tid
 // (codegen.bl:315-319): an encodable scalar / bare struct slot carries its real
-// tid, an unencodable slot (struct-instance, module-qualified, typevar) stores
-// -1 so the def-side emitter falls back to the string seg. Returns [] unless the
-// tid names `expected_base` with exactly `expected_count` args — so a mismatched
-// or absent memoized tid degrades to the string path (byte-identical), never
-// half-lowers a mismatched instance (br dhrpxw / the -1-hole regression guards).
-fn mono_instance_arg_tids_from_tid(inst_tid: Int, expected_base: Str, expected_count: Int) -> List[Int] {
+// tid, an unencodable slot (struct-instance, module-qualified, typevar) stores -1.
+// Returns [] unless the tid names `expected_base` with exactly `expected_count`
+// args, so a mismatched or absent memoized tid yields nothing rather than
+// half-lowering a mismatched instance (br dhrpxw / the -1-hole regression guards).
+//
+// A -1 slot used to mean "the def side will read the string CSV instead"; that
+// resolver is gone (0n07he), so a -1 now genuinely means UNKNOWN and the def side
+// spells the binder through — a hard `cc` error, not a silent erasure. The one
+// producer that cannot compute tids at all routes around this via MonoInstance.ann
+// (see mono_arg_tids_with_ann in codegen_stmt), which calls back into this fn.
+pub fn mono_instance_arg_tids_from_tid(inst_tid: Int, expected_base: Str, expected_count: Int) -> List[Int] {
     let mut out: List[Int] = []
     if inst_tid < 0 { return out }
     if tc_tid_struct(inst_tid) != expected_base { return out }
@@ -5235,8 +5258,11 @@ fn mono_instance_arg_tids_from_tid(inst_tid: Int, expected_base: Str, expected_c
 
 // Whether a recovered arg_tids list is parallel to the already-chosen `mono_args`
 // CSV: every encodable slot (seg != "") must spell exactly the segment mono_args
-// holds for that index. A -1 / unencodable slot ("") is a don't-care — the def-side
-// emitter falls back to the string seg there, so it can never diverge. Used by the
+// holds for that index. A -1 / unencodable slot ("") is a don't-care: this guard only
+// rejects a POSITIVE contradiction, and a slot with no tid cannot contradict. (It is
+// not "safe" in the old sense — the def side no longer has a string resolver to fall
+// back to — but recovering that slot is register-time work, not this guard's job.)
+// Used by the
 // phybxe Class-A recovery to reject a tid recovered off a MISMATCHED outer annotation
 // (bare-name matched but a different nesting level), which would otherwise mis-lower a
 // nested inner instance's field type. Returns true for an empty list (nothing to
@@ -5319,12 +5345,23 @@ fn tid_slot_is_plain_scalar(slot: Int) -> Bool {
     is_sized_int_ct(ct) != 0
 }
 
-// Whether any per-tparam segment of a mono-args CSV is exactly "Void" — the erased
-// spelling every string producer falls back to when it cannot name a slot. Checked
-// per DECLARED tparam (via nth_type_arg, the same naive comma split the rest of the
-// mono machinery uses) rather than as a substring, so a user type whose name merely
-// contains "Void" and a legitimately Void-valued NON-tparam position can't trip it.
-// Returns false when the struct declares no tparams — a monomorphic struct's
+// Whether any per-tparam segment of a mono-args CSV names an ERASED slot. Two
+// spellings qualify, and both are equally fatal:
+//
+//   "Void"  — what every string producer fell back to when it could not name a slot.
+//   a BINDER of this very struct ("T") — what the tid producers leave behind when
+//           tc_seg_from_tid declines a slot and the name passes through unchanged.
+//           `blink_Box_T` is just as valid a C identifier as `blink_Box_Void`, and
+//           collapses sibling instantiations exactly the same way. It also emits a
+//           `void` field, so it usually surfaces as an inscrutable C error rather
+//           than a compiler diagnostic — worse than the ICE (br pt4hsy).
+//
+// Checked per DECLARED tparam (via nth_type_arg, the same naive comma split the rest
+// of the mono machinery uses) rather than as a substring, so a user type whose name
+// merely contains "Void" and a legitimately Void-valued NON-tparam position can't trip
+// it. A user type that genuinely SHARES a name with a binder (`type Box[T]` alongside
+// `type T {..}`, so `Box[T]` is concrete) is excluded by the is_struct_or_enum_type
+// check. Returns false when the struct declares no tparams — a monomorphic struct's
 // mono_args is not a type-param CSV at all.
 fn mono_args_has_void_seg(mono_args: Str, tparams_sl: Int) -> Bool {
     if tparams_sl == -1 { return false }
@@ -5332,7 +5369,11 @@ fn mono_args_has_void_seg(mono_args: Str, tparams_sl: Int) -> Bool {
     if count < 1 { return false }
     let mut i = 0
     while i < count {
-        if nth_type_arg(mono_args, i) == "Void" { return true }
+        let seg = nth_type_arg(mono_args, i)
+        if seg == "Void" { return true }
+        if tparams_sl_contains(tparams_sl, seg) != 0 && is_struct_or_enum_type(seg) == 0 {
+            return true
+        }
         i = i + 1
     }
     false
@@ -5614,7 +5655,6 @@ fn emit_struct_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
     let target_args = struct_concrete_args_from_target(sname, segs_from_arg_tids(cg_mono_arg_tids))
     let td_tparams = if td != -1 { node_type_params(td) } else { -1 }
     let saved_mono_tparams = cg_mono_tparams_sl
-    let saved_mono_args = cg_mono_concrete_args
     // Struct-lit field emission derives its mono context from the string target
     // args — the ENCLOSING fn's cg_mono_arg_tids (a stale tid list keyed on the
     // enclosing generic's tparams) must not leak into a ctor/compound-inner site
@@ -5630,7 +5670,6 @@ fn emit_struct_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
     cg_mono_arg_tids = []
     if target_args != "" && td_tparams != -1 && sublist_length(td_tparams) > 0 {
         cg_mono_tparams_sl = td_tparams
-        cg_mono_concrete_args = target_args
         let inst_tid = tid_native_struct_inst_tid(node, sname)
         let recovered = mono_instance_arg_tids_from_tid(inst_tid, sname, tc_tid_struct_arg_count(inst_tid))
         if arg_tids_match_mono_args(recovered, target_args) {
@@ -5746,7 +5785,6 @@ fn emit_struct_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
         di = di + 1
     }
     cg_mono_tparams_sl = saved_mono_tparams
-    cg_mono_concrete_args = saved_mono_args
     cg_mono_arg_tids = saved_mono_arg_tids
     // The declared let-target args are authoritative when present (they name the
     // instantiation directly); field-VALUE inference is the fallback for an

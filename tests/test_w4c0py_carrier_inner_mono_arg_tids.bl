@@ -1,0 +1,78 @@
+// br w4c0py: a generic struct reached ONLY through a carrier ANNOTATION
+// (`Option[QBox[Int]]`) registers its mono instance via
+// register_carrier_inner_mono_instance (src/codegen_types.bl). That producer sits
+// BELOW typecheck in the import DAG, so it cannot mint interned tids and pushes -1
+// for every slot. It relied — explicitly, in its own comment — on the def-side
+// typedef emitter resolving each field from the concrete_args CSV instead.
+//
+// With the legacy string-CSV resolver gone, a -1 slot left the field spelled as the
+// binder itself:
+//   `v: T`         -> `void v;`               (hard C error)
+//   `v: Option[T]` -> `blink_Option_void v;`  (SILENT: the typedef carries the right
+//                                              NAME, blink_QBox_Int, and only the
+//                                              FIELD type erases)
+//
+// The silent variant is why the `_Void` grep does not guard this shape: it is 0 for
+// both programs below. The registered mono NAME is already correct, so nothing ever
+// spells `_Void`. Fix: resolve_mono_field_type (src/codegen_stmt.bl) falls back to the
+// concrete_args CSV — the very key the instance was registered under, and the string
+// mangle_generic_name already spells the typedef name from.
+//
+// SHAPE NOTE: the guarding shape is the fn SIGNATURE one (`-> Option[QBox[Int]]`),
+// NOT the local `let` — a local annotation reaches the instance through a producer
+// that does carry tids, so it stays green even with the fallback removed. Keep the
+// signature fns.
+//
+// Reaching them at all also required br tsqxsc: the Option arm of reg_fn_ret_from_ann
+// registers its inner instance DURING the reg_fn pass, so a watermarked pre-decl flush
+// skipped it and the carrier typedef named blink_QBox_Int before it was declared. Both
+// flushes now run from 0.
+
+type QBox[T] { v: T }
+
+// Reached ONLY through the carrier annotation on this signature.
+fn none_box() -> Option[QBox[Int]] {
+    let x: Option[QBox[Int]] = None
+    x
+}
+
+fn some_box(n: Int) -> Option[QBox[Int]] {
+    Some(QBox { v: n })
+}
+
+type WBox[T] { v: Option[T], n: Int }
+
+fn none_wbox() -> Option[WBox[Int]] {
+    let x: Option[WBox[Int]] = None
+    x
+}
+
+fn some_wbox(n: Int) -> Option[WBox[Int]] {
+    Some(WBox { v: Some(n), n: n })
+}
+
+test "carrier-inner generic struct with a bare typevar field" {
+    let none_q: Option[QBox[Int]] = None
+    assert_eq(none_q.is_none(), true)
+
+    let some_q: Option[QBox[Int]] = Some(QBox { v: 7 })
+    assert_eq(some_q.unwrap().v, 7)
+
+    assert_eq(none_box().is_none(), true)
+    assert_eq(some_box(9).unwrap().v, 9)
+}
+
+test "carrier-inner generic struct with a compound typevar field" {
+    let none_w: Option[WBox[Int]] = None
+    assert_eq(none_w.is_none(), true)
+
+    let some_w: Option[WBox[Int]] = Some(WBox { v: Some(5), n: 5 })
+    let w = some_w.unwrap()
+    assert_eq(w.v.unwrap(), 5)
+    assert_eq(w.n, 5)
+
+    assert_eq(none_wbox().is_none(), true)
+    let w2 = some_wbox(11).unwrap()
+    assert_eq(w2.v.unwrap(), 11)
+    assert_eq(w2.n, 11)
+}

@@ -55,10 +55,17 @@ ABOUT erasure can carry the pattern in a plain string literal, so read the match
 calling one a hit. A `_Void` in a monomorphized name (`blink_GKV_Void_Void`) means a type param was
 erased — and because the erased name is a valid C identifier under an `#ifndef BLINK_TD_` typedef
 guard, it compiles and links silently while collapsing distinct instantiations onto one C type.
-This grep is the SOUND erasure metric and the only exit criterion. The retired `csvresolve` channel
-was never a substitute: it was only a LOWER BOUND, and `blink_GSet_Void`/`blink_GBoxSet_Void` were
-emitted with zero hits on it, because a producer's `"Void"` initializer never routed through the
-tapped return.
+This grep is a LOWER BOUND, not a sound metric, and never an exit criterion on its own. It finds
+only the STRING producers' erasure spelling. The tid producers erase differently: a slot they
+cannot name passes the binder through unchanged, so the symbol is `blink_Box_T` — no `_Void`
+anywhere. Worse, a def-side field can erase while the mono NAME stays correct
+(`blink_QBox_Int { blink_Option_void v; }`), which the grep cannot see at all. Both shapes are
+real and both were found with the grep reading 0 (br pt4hsy, br w4c0py).
+Check for BOTH spellings, and treat a clean C compile as necessary, not sufficient — a `void`
+field errors loudly but an erased carrier field does not.
+The retired `csvresolve` channel was a lower bound for the same reason:
+`blink_GSet_Void`/`blink_GBoxSet_Void` were emitted with zero hits on it, because a producer's
+`"Void"` initializer never routed through the tapped return.
 
 ## Self-Hosting Bootstrap Protocol
 

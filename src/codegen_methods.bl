@@ -129,8 +129,8 @@ fn emit_panic_tag_check_render(tmp: Str, tag_val: Int, msg_prefix: Str, rendered
 // CANONICAL C tag (c_type_tag_for_struct — dot-free, module-qualified so a
 // cross-module element yields a valid C identifier, br dwhm4v); scalars use the
 // CT-derived name. This CSV feeds mangle_generic_name and the mono-registry
-// (the PHYSICAL symbol), so it must be the dot-free physical spelling. For the
-// CSV order follows binder order (mangle_generic_name indexes positionally by
+// (the PHYSICAL symbol), so it must be the dot-free physical spelling. The CSV
+// order follows binder order (mangle_generic_name indexes positionally by
 // binder). Return-type substitution does NOT read this CSV — it lowers the element
 // name from the interned tids via poly_impl_ret_arg_tids + resolve_tparam_via_tid.
 fn poly_impl_concrete_args(im: Int, obj_str: Str, recv_node: Int) -> Str {
@@ -182,12 +182,18 @@ fn build_binder_csv(binders_sl: Int, elem_name: Str) -> Str {
 // unqualified struct/enum, where tc_tid_to_c_tag round-trips to the same segment
 // the CSV twin spells via type_name_from_ct / get_list_elem_struct. Store -1 for
 // every other element (a struct-INSTANCE like Box[Int], or a compound like
-// Option[Int]): the CSV twin spells those as the bare carrier / "Void", so the
+// Option[Int]): the mangling twin spells those as the bare carrier / "Void", so the
 // tid path's inner-carrying tag (tc_tid_to_c_tag -> "Box" / tc_seg_from_tid ->
-// "Option_int") would DIVERGE from the mangled symbol. -1 forces the def-side
-// emitter back onto the string seg, matching the CSV exactly (br ec5qgb; mirrors
-// the register_struct_instance_from_tid gate). Also -1 when the receiver tid is
-// not a resolvable List (tc_tid_list_elem = -1), so both cases stay byte-safe.
+// "Option_int") would DIVERGE from the mangled symbol. -1 keeps the def side off the
+// tid path for that slot, matching the mangled name exactly (br ec5qgb; mirrors the
+// register_struct_instance_from_tid gate). Also -1 when the receiver tid is not a
+// resolvable List (tc_tid_list_elem = -1), so both cases stay byte-safe.
+//
+// NOTE: -1 is no longer a free "defer to the string resolver" — that resolver is gone.
+// Only the two mono TYPEDEF emitters still recover a -1 slot, from the concrete_args
+// CSV via resolve_mono_field_type (br w4c0py). Everywhere else a -1 slot leaves the
+// name passing through unchanged, so a slot that is a BINDER must not reach a C
+// symbol; the emit_struct_lit I0001 chokepoint is what catches it.
 fn poly_impl_concrete_arg_tids(im: Int, recv_node: Int) -> List[Int] {
     let mut tids: List[Int] = []
     let binders_sl = node_impl_binders(im)
@@ -221,7 +227,8 @@ fn poly_impl_concrete_arg_tids(im: Int, recv_node: Int) -> List[Int] {
 // resolve_tparam_via_tid's tc_seg_from_tid admission decide: an encodable tid
 // (scalar / bare struct / struct instance) yields its bare-or-physical segment; an
 // unencodable tid (or -1 when the receiver is not a resolvable List) returns None and
-// the twin falls back to the string path. tc_seg_from_tid guards tid<0 internally.
+// the name passes through unchanged — there is no string path left to fall back to.
+// tc_seg_from_tid guards tid<0 internally.
 fn poly_impl_return_elem_tids(im: Int, recv_node: Int) -> List[Int] {
     let mut tids: List[Int] = []
     let binders_sl = node_impl_binders(im)
@@ -268,8 +275,18 @@ pub fn listop_slot_tid(tid: Int, csv_seg: Str) -> Int {
 // Otherwise the name passes through unchanged. That covers the two non-binder roles
 // the deleted string resolver also served (no tparams at all; a name that is already a
 // concrete type) AND, now that there is no CSV tail, the binder-with-no-usable-tid
-// case: that one would spell a bare binder into a C symbol, so it must stay
-// unreachable. The guard is the _Void grep in CLAUDE.md, which is 0 repo-wide.
+// case: that one would spell a bare binder into a C symbol.
+//
+// That last case is NOT hypothetical and the `_Void` grep does NOT guard it — a bare
+// binder mangles to `blink_Box_T`, which contains no "Void" (br pt4hsy, br w4c0py).
+// The real guards are, in order:
+//   - the callers: register_map_elem_struct_mono and the CT_VOID struct-return arm of
+//     emit_generic_call both refuse to register an instance whose args CSV still holds
+//     a binder (tparams_sl_contains);
+//   - resolve_mono_field_type (codegen_stmt), which recovers a def-side typedef field
+//     from the concrete_args CSV when the producer could not supply a tid;
+//   - emit_struct_lit's I0001 chokepoint, which now treats a binder segment as erased
+//     exactly like "Void".
 pub fn resolve_tparam_via_tid(param_name: Str, tparams_sl: Int, arg_tids: List[Int]) -> Str {
     if tparams_sl != -1 {
         let mut pi = 0
