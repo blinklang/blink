@@ -1,0 +1,48 @@
+// 59bnez: the `blink_map_ensure_kops`/`blink_set_ensure_kops` runtime rebind is
+// retired. It was a pre-metavar escape hatch: a generic-struct field
+// `Map[K,V]`/`Set[T]` whose key was an unresolved typevar got constructed with
+// the `blink_kops_str` default, and codegen patched the vtable at the first
+// `insert` once backward inference pinned the real key type. The gqg3rk metavar
+// work (HM inference + error[CannotInferType] E0301 + the I0001 ICE backstop)
+// moved that decision to construction time, so the ctor now pins the exact
+// vtable the rebind used to target.
+//
+// This must be an emitted-C test, not run-and-assert: the rebind is a no-op at
+// this point, so behaviour is identical either way. The observable difference is
+// the absence of the patch call. Keeping it absent also keeps ctor-pinning
+// regressions LOUD — the rescue only ever worked in single-TU builds and masked
+// construction-site miscompiles under --link-archive separate compilation
+// (see test_m1wspm_ctor_kops_generic_param.bl).
+//
+// The narrow-stride cases (Char, Bool) are the ones that matter most: a wrong
+// ctor choice there leaves a keys-buffer stride mismatch that only the rebind's
+// realloc used to repair.
+import compile_test_helpers { compile_and_emit_c }
+
+test "inferred Set[T] field pins i64 kops at ctor with no runtime rebind" {
+    let src = "import std.io\ntype GBox[T] \{ s: Set[T] \}\nfn main() ! IO \{\n    let c = GBox \{ s: Set() \}\n    c.s.insert(512)\n    io.println(\"\{c.s.contains(512)\}\")\n\}\n"
+    let c = compile_and_emit_c(src, "59bnez_set_int")
+    assert(c.contains("blink_set_new(&blink_kops_i64)"))
+    assert(!c.contains("ensure_kops"))
+}
+
+test "inferred Map[K,V] field pins i64 kops at ctor with no runtime rebind" {
+    let src = "import std.io\ntype GKV[K, V] \{ m: Map[K, V] \}\nfn main() ! IO \{\n    let b = GKV \{ m: Map() \}\n    b.m.insert(256, \"x\")\n    io.println(\"\{b.m.get(256).unwrap()\}\")\n\}\n"
+    let c = compile_and_emit_c(src, "59bnez_map_int")
+    assert(c.contains("blink_map_new(&blink_kops_i64)"))
+    assert(!c.contains("ensure_kops"))
+}
+
+test "struct-keyed Set[T] field pins derived kops at ctor with no runtime rebind" {
+    let src = "import std.io\n@derive(Hash, Eq)\ntype Pt \{ x: Int, y: Int \}\ntype GP[T] \{ s: Set[T] \}\nfn main() ! IO \{\n    let d = GP \{ s: Set() \}\n    d.s.insert(Pt \{ x: 1, y: 2 \})\n    io.println(\"\{d.s.contains(Pt \{ x: 1, y: 2 \})\}\")\n\}\n"
+    let c = compile_and_emit_c(src, "59bnez_set_struct")
+    assert(c.contains("blink_set_new(&kops_blink_Pt)"))
+    assert(!c.contains("ensure_kops"))
+}
+
+test "narrow-stride Char elem pins char kops at ctor with no runtime rebind" {
+    let src = "import std.io\ntype GS[T] \{ s: Set[T] \}\nfn main() ! IO \{\n    let a = GS \{ s: Set() \}\n    a.s.insert('z')\n    io.println(\"\{a.s.contains('z')\}\")\n\}\n"
+    let c = compile_and_emit_c(src, "59bnez_set_char")
+    assert(c.contains("blink_set_new(&blink_kops_char)"))
+    assert(!c.contains("ensure_kops"))
+}

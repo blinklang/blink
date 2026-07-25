@@ -4,6 +4,12 @@
 
 **Spec gap:** br `8vcj2c` — *First-class "unknown" type: uniform treatment of under-determined types across all inference sites.*
 
+**Status: implemented.** The 6-0 vote below stands and the normative spec (`sections/03_types.md`
+§3.3) is unchanged. One detail of the *rationale* is now historical: the `blink_map_ensure_kops` /
+`blink_set_ensure_kops` runtime patch described throughout as the "current accident" was retired
+(br `59bnez`) once E0301 + the I0001 ICE backstop moved the vtable decision to construction time.
+Every reference to it below describes the pre-metavar state of the compiler, not current behaviour.
+
 ### Panel Deliberation
 
 Six panelists (systems, web/scripting, PLT, DevOps/tooling, AI/ML, minimalism) deliberated
