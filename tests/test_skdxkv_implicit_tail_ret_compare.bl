@@ -1,0 +1,199 @@
+// br skdxkv: the implicit-tail declared-return compare ran AFTER the block scope was
+// popped, so a generic-arg mismatch went undiagnosed.
+//
+//     type GKV[K, V] { m: Map[K, V] }
+//     fn a() -> GKV[Int, Str] {
+//         let g: GKV[Str, Int] = GKV { m: Map() }
+//         g                                        // reported NOTHING
+//     }
+//
+// The emitted C returned a blink_GKV_Str_Int from a function declared
+// blink_GKV_Int_Str, and only gcc caught it. The explicit-`return` spelling of the
+// same program WAS diagnosed — same divergence as r9krgr, same root cause, opposite
+// symptom: r9krgr is the false positive, skdxkv the false negative.
+//
+// MECHANISM. tc_check_fn re-inferred the body AFTER tc_check_body had already popped
+// the body scope, so the compare read a degraded type:
+//   • a tail Ident read TYPE_UNKNOWN (out of scope) and the compare was skipped;
+//   • a tail struct literal fell to tc_struct_lit_instance_tid's bare-stid return,
+//     which is not TYPE_UNKNOWN, so it OVERWROTE the good memo — and
+//     types_compatible's bare-generic escape (params_count 0 matches any
+//     specialization) then made the mismatch vacuously compatible.
+// Moving the compare ahead of nr_pop_scope makes both cases read the real type.
+//
+// This file also pins the DOUBLE-REPORT cleanup. Before the fix an explicit
+// `return` of a wrong-typed value produced TWO E0300s: the Return arm's, plus
+// tc_check_fn's post-pop compare on the same statement. The Block-arm tail check
+// excludes NodeKind.Return precisely because the Return arm already handled it.
+
+import compile_test_helpers
+import std.io
+
+// There is no Str.count; splitting on the needle yields (occurrences + 1) pieces.
+fn count_of(hay: Str, needle: Str) -> Int {
+    hay.split(needle).len() - 1
+}
+
+fn assert_count(hay: Str, needle: Str, want: Int, label: Str) {
+    let got = count_of(hay, needle)
+    if got != want { io.println("FAIL: {label} — expected {want} occurrence(s) of '{needle}', got {got}") }
+    assert_eq(got, want)
+}
+
+// compile_test_helpers.expect_contains only PRINTS its verdict, so a row built on
+// it can never go red. The message-parity row asserts instead.
+fn assert_has(hay: Str, needle: Str, label: Str) {
+    if !hay.contains(needle) { io.println("FAIL: {label} — missing '{needle}'") }
+    assert(hay.contains(needle))
+}
+
+// MVCE 1: the mismatch is carried by an annotated local, and the tail is a bare
+// Ident. Before the fix this reached gcc as `incompatible types when returning`.
+fn src_case1() -> Str {
+    let mut src = "type GKV[K, V] \{ m: Map[K, V] }\n"
+    src = src.concat("fn a() -> GKV[Int, Str] \{\n")
+    src = src.concat("    let g: GKV[Str, Int] = GKV \{ m: Map() }\n")
+    src = src.concat("    g\n")
+    src = src.concat("}\n")
+    src = src.concat("fn main() \{ let _x = a() }\n")
+    src
+}
+
+// MVCE 2: the mismatch is carried by the tail struct literal's own field. Before
+// the fix this ICEd (I0001 'Void,Void') instead of reporting the type error.
+fn src_case2() -> Str {
+    let mut src = "type GKV[K, V] \{ m: Map[K, V] }\n"
+    src = src.concat("fn a() -> GKV[Int, Str] \{\n")
+    src = src.concat("    let m: Map[Str, Int] = Map()\n")
+    src = src.concat("    GKV \{ m: m }\n")
+    src = src.concat("}\n")
+    src = src.concat("fn main() \{ let _x = a() }\n")
+    src
+}
+
+// The explicit-return twin of case 2 — already correctly diagnosed before the fix.
+// Kept so a regression in the Return arm shows up next to its tail counterpart.
+fn src_case2_return() -> Str {
+    let mut src = "type GKV[K, V] \{ m: Map[K, V] }\n"
+    src = src.concat("fn a() -> GKV[Int, Str] \{\n")
+    src = src.concat("    let m: Map[Str, Int] = Map()\n")
+    src = src.concat("    return GKV \{ m: m }\n")
+    src = src.concat("}\n")
+    src = src.concat("fn main() \{ let _x = a() }\n")
+    src
+}
+
+// ── both mismatch shapes are now diagnosed ───────────────────────────────────
+
+test "a bare tail Ident with a mismatched generic arg is reported (MVCE 1)" {
+    compile_test_helpers.expect_compile_error(src_case1(), "skdxkv_case1", "E0300")
+}
+
+test "a tail struct literal with a mismatched field is reported (MVCE 2)" {
+    compile_test_helpers.expect_compile_error(src_case2(), "skdxkv_case2", "E0300")
+}
+
+// The mismatch must be a TYPE ERROR, not a compiler bug. Before the fix case 2's
+// only signal was the ICE.
+test "the tail struct-literal mismatch no longer ICEs" {
+    compile_test_helpers.expect_no_error(src_case2(), "skdxkv_case2_ice", "I0001")
+}
+
+test "the explicit-return twin is still reported" {
+    compile_test_helpers.expect_compile_error(src_case2_return(), "skdxkv_case2_ret", "E0300")
+}
+
+// ── message parity: the tail speaks with the Return arm's voice ──────────────
+// The tail check is the Return arm's logic hoisted into a shared helper, so both
+// spellings of one program must produce the same sentence. A divergence here means
+// the two sites have drifted apart again — which IS this bug.
+
+test "the tail and the explicit return produce the same message" {
+    let tail_out = compile_test_helpers.compile_and_capture(src_case2(), "skdxkv_msg_tail")
+    let ret_out = compile_test_helpers.compile_and_capture(src_case2_return(), "skdxkv_msg_ret")
+    assert_has(tail_out, "does not match function 'a' return type", "tail message shape")
+    assert_has(ret_out, "does not match function 'a' return type", "return message shape")
+    assert_has(tail_out, "return value type", "tail message prefix")
+    assert_has(ret_out, "return value type", "return message prefix")
+}
+
+// ── double-report cleanup ────────────────────────────────────────────────────
+// `fn give_int() -> Int { return "hello" }` emitted TWO E0300s before the fix: the
+// Return arm's "return value type Str does not match ...", then tc_check_fn's
+// post-pop "declared return type Int but body returns Str" on the very same
+// statement. Excluding NodeKind.Return from the Block-arm tail check leaves exactly
+// one. The "but body returns" wording survives only for the missing-tail-value
+// case (see test_r9krgr_intermediate_let_tail_ret.bl), so its absence here is the
+// precise assertion.
+test "a mismatched explicit return is reported exactly once" {
+    let mut src = "fn give_int() -> Int \{ return \"hello\" }\n"
+    src = src.concat("fn main() \{ let _x = give_int() }\n")
+    let out = compile_test_helpers.compile_and_capture(src, "skdxkv_double_report")
+    assert_count(out, "E0300", 1, "single E0300 for a mismatched return")
+    if out.contains("but body returns") { io.println("FAIL: the post-pop duplicate is still emitted") }
+    assert(!out.contains("but body returns"))
+}
+
+// The same cleanup for a mismatched bare TAIL: one report, and it comes from the
+// tail check rather than a post-pop re-infer.
+test "a mismatched bare tail value is reported exactly once" {
+    let mut src = "fn give_int() -> Int \{ \"hello\" }\n"
+    src = src.concat("fn main() \{ let _x = give_int() }\n")
+    let out = compile_test_helpers.compile_and_capture(src, "skdxkv_tail_once")
+    assert_count(out, "E0300", 1, "single E0300 for a mismatched tail")
+}
+
+// ── DOCUMENTED GAP: impl methods (br ya8qyf) ─────────────────────────────────
+// The fix reaches free functions only. For an impl method the declared-return
+// check — the Return arm's compare included — has NEVER run, because the fnsig
+// register site keys on tc_mangle_impl_fnsig ("Holder_Maker_make") while
+// tc_check_fn's caller re-derives "{impl_type}_{orig_name}" ("Holder_make").
+// lookup_fnsig misses, so sig == -1, tc_current_fn_ret is never installed, and
+// every guard keyed on it is vacuous.
+//
+// Verified pre-existing: blinkc.bak (pre-fix) and blinkc (post-fix) emit
+// byte-identical diagnostics on both rows below. These rows pin the CURRENT wrong
+// behavior so ya8qyf's fix has a red test waiting and so nobody "improves" the
+// key derivation without noticing what it turns on.
+
+fn impl_preamble() -> Str {
+    let mut s = "type GKV[K, V] \{ m: Map[K, V] }\n"
+    s = s.concat("type Holder \{ n: Int }\n")
+    s = s.concat("trait Maker \{ fn make(self) -> GKV[Int, Str] }\n")
+    s
+}
+
+// The skdxkv symptom, for a method: gcc reports
+// "incompatible types when returning type blink_GKV_Str_Int" and Blink says nothing.
+test "GAP: an impl method's mismatched tail is not diagnosed (ya8qyf)" {
+    let mut src = impl_preamble()
+    src = src.concat("impl Maker for Holder \{\n")
+    src = src.concat("    fn make(self) -> GKV[Int, Str] \{\n")
+    src = src.concat("        let g: GKV[Str, Int] = GKV \{ m: Map() }\n")
+    src = src.concat("        g\n")
+    src = src.concat("    }\n")
+    src = src.concat("}\n")
+    src = src.concat("fn main() \{\n")
+    src = src.concat("    let h = Holder \{ n: 1 }\n")
+    src = src.concat("    let _x = h.make()\n")
+    src = src.concat("}\n")
+    compile_test_helpers.expect_no_error(src, "skdxkv_gap_impl_mismatch", "E0300")
+}
+
+// The r9krgr symptom, for a method: the declared return determines the instance,
+// but the pin never runs, so E0301 still fires. The free-fn spelling of the same
+// program compiles (see test_r9krgr_intermediate_let_tail_ret.bl's MVCE).
+test "GAP: an impl method's intermediate let still reports E0301 (ya8qyf)" {
+    let mut src = impl_preamble()
+    src = src.concat("impl Maker for Holder \{\n")
+    src = src.concat("    fn make(self) -> GKV[Int, Str] \{\n")
+    src = src.concat("        let x = GKV \{ m: Map() }\n")
+    src = src.concat("        x\n")
+    src = src.concat("    }\n")
+    src = src.concat("}\n")
+    src = src.concat("fn main() \{\n")
+    src = src.concat("    let h = Holder \{ n: 1 }\n")
+    src = src.concat("    let _x = h.make()\n")
+    src = src.concat("}\n")
+    compile_test_helpers.expect_compile_error(src, "skdxkv_gap_impl_e0301", "E0301")
+}

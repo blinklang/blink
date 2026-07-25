@@ -401,6 +401,20 @@ let mut tc_current_fn_name: Str = ""
 // keyed on it does not (see tc_pin_tail_ret_generic's call site in the Return arm).
 let mut tc_in_closure_depth: Int = 0
 
+// Consume-once marker (br r9krgr): tc_check_fn sets it immediately before calling
+// tc_check_body on the fn's own body, and tc_check_body's Block arm reads-then-zeroes
+// it as its first act. That is what lets the implicit-tail declared-return check run
+// for exactly the fn body and for no nested block — if/else, `with`, match arm, loop
+// body, closure body all read 0 for free, with no depth arithmetic.
+//
+// NOT nr_scope_depth. tc_check_test_block does nr_push_scope / tc_check_body /
+// nr_pop_scope at the SAME depth as a fn body while installing tc_current_fn_ret =
+// Result[Void, TestError], so a depth discriminator would compare every test body's
+// Void tail against that and emit spurious E0300 repo-wide.
+// NOT a tc_check_body parameter either: it is called from every nested-block
+// position in the checker (22 sites today) and the bit is true at exactly one.
+let mut tc_fn_body_block: Int = 0
+
 let mut tc_errors: List[Str] = []
 let mut tc_warnings: List[Str] = []
 
@@ -1336,6 +1350,51 @@ fn tc_pin_tail_ret_generic(declared_ret: Int, inferred_ret: Int) {
     if dt.params_count == 0 { return }
     if tc_tid_has_unbound_metavar(inferred_ret) == 0 { return }
     let _ = tc_unify(d, inferred_ret)
+}
+
+// The declared-return check for one returned value, shared by NodeKind.Return and by
+// the implicit tail of a fn body (br skdxkv). Two spellings of one program must give
+// one answer, and the only way to guarantee that is one implementation.
+//
+// Every guard here is byte-identical to the Return arm's, deliberately:
+//   • the tc_current_fn_ret Void/Unknown skip — a fn with no declared return has
+//     nothing to compare against, and when tc_check_fn's `lookup_fnsig` misses it
+//     never installs one at all, leaving tc_current_fn_ret at -1 (tc_check_fn is
+//     called only from two non-reentrant top-level loops, so prev_fn_ret is always
+//     -1 at entry). -1 stays vacuous through types_compatible's `a < 0` escape,
+//     exactly as today. Do not "tighten" this with a >= 0 test: the Return arm has
+//     always called through with -1 and must keep doing so. (The tail call site
+//     does add >= 0, for an unrelated reason — see it.)
+//     That miss is not hypothetical: EVERY impl method takes it, because the
+//     register site keys the sig through tc_mangle_impl_fnsig while the check site
+//     re-derives a different key. So neither this compare nor the pin has ever run
+//     for a method — tracked as its own defect (br ya8qyf) with pinned rows in
+//     tests/test_skdxkv_implicit_tail_ret_compare.bl. Fixing the key turns both on
+//     for methods at once; expect new diagnostics, not none.
+//   • the val_t Unknown skip — an unbound metavar defers to the E0301 region
+//     boundary check rather than double-reporting as a mismatch here.
+//   • the pin only in the compatible branch — types_compatible is permissive toward
+//     an unbound metavar, so this IS the branch an under-determined tail takes, and
+//     placing the pin here means it can never turn a reported mismatch into a silent
+//     success.
+//   • tc_in_closure_depth == 0 — tc_current_fn_ret is installed by tc_check_fn (and
+//     the test-body elaborator) only, so inside a closure body it still names the
+//     ENCLOSING fn's declared return. The compare above merely misreports on that;
+//     this pin MUTATES ty_pool, so it would bind the closure's own metavars to the
+//     enclosing instance's args — `GKV[Str, Str]` emitted as blink_GKV_Int_Str with
+//     blink_kops_i64 baked for a Str key, the br hnyqe4 silent-hash shape under a
+//     wrong-but-plausible mono name. Leaving the closure's return under-determined
+//     keeps it a loud stop instead.
+fn tc_check_returned_value(val_t: Int, at_node: Int) ! TypeCheck.Report, Diag.Report {
+    if tc_current_fn_ret == TYPE_VOID || tc_current_fn_ret == TYPE_UNKNOWN { return }
+    if val_t == TYPE_UNKNOWN { return }
+    if types_compatible(tc_current_fn_ret, val_t) == 0 {
+        tc_error_at("return value type {type_to_str(val_t)} does not match function '{tc_current_fn_name}' return type {type_to_str(tc_current_fn_ret)}", at_node)
+    } else {
+        if tc_in_closure_depth == 0 {
+            tc_pin_tail_ret_generic(tc_current_fn_ret, val_t)
+        }
+    }
 }
 
 // Parse an all-digits field name ("0", "12") to its Int index, or -1 for any
@@ -3760,6 +3819,7 @@ fn init_types() ! TypeCheck.Register {
     tc_current_fn_ret = -1
     tc_current_fn_name = ""
     tc_in_closure_depth = 0
+    tc_fn_body_block = 0
     tc_suppress_ann_validation = 0
     tc_boundary_check_active = 0
     tc_errors.clear()
@@ -4507,6 +4567,13 @@ fn nr_pop_scope() ! Diag.Report {
         // pass never fires it. The shared singleton TYPE_UNKNOWN never trips this
         // (tc_is_unbound_metavar excludes it), so only unpinned empty-ctor bindings
         // are reported.
+        //
+        // "Every constraining use has already run" only became true for a fn body's
+        // IMPLICIT TAIL in br r9krgr. The declared return type is a constraining use
+        // (sections/03_types.md:1031) and it used to be applied by tc_check_fn AFTER
+        // this pop, so this check reported E0301 on bindings the declared return would
+        // have solved. tc_check_body's Block arm now pins ahead of the pop. Any future
+        // constraint source for a fn body must land on that same side of this line.
         if tc_boundary_check_active != 0 {
             if tc_tid_has_unbound_metavar(nr_scope_types.get(idx).unwrap()) != 0 {
                 tc_report_under_determined(nm, nr_scope_types.get(idx).unwrap(), nr_scope_nodes.get(idx).unwrap())
@@ -7050,13 +7117,18 @@ fn infer_carrier_arg(arg_node: Int, carrier: Str) -> Int ! TypeCheck.Resolve, Ty
 fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let tid = infer_type_uncached(node)
     if node != -1 && node < tc_node_tid.len() {
-        // Never downgrade a known memo to UNKNOWN. tc_check_fn re-infers the body for
-        // its declared-return check AFTER tc_check_body popped the body scope, and the
-        // Block arm jumps to the last statement — so a tail-position generic call's
-        // ident args read UNKNOWN there. That must not erase the concrete tid
-        // tc_check_body already established. -1 is the unset sentinel (TYPE_INT is 0),
-        // so a never-inferred node still takes the write. known->known overwrites are
-        // preserved: mono-calls-mono re-instantiates one AST node under several T.
+        // Never downgrade a known memo to UNKNOWN. -1 is the unset sentinel (TYPE_INT
+        // is 0), so a never-inferred node still takes the write, and known->known
+        // overwrites are preserved: mono-calls-mono re-instantiates one AST node under
+        // several T.
+        //
+        // The producer this guard was written for is GONE (br r9krgr): tc_check_fn used
+        // to re-infer the body for its declared-return check AFTER tc_check_body popped
+        // the body scope, so a tail-position generic call's ident args read UNKNOWN
+        // there and clobbered the concrete tid. That compare now runs inside the Block
+        // arm, in scope, and never re-infers. The guard is kept because it is not known
+        // to be the only out-of-scope re-infer — proving that and retiring it is br
+        // kdskwh. Do not treat this comment as evidence that a live producer remains.
         if tid != TYPE_UNKNOWN || tc_node_tid.get(node).unwrap() == -1 {
             tc_node_tid.set(node, tid)
         }
@@ -8220,21 +8292,9 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
     }
 
     if kind == NodeKind.Block {
-        let stmts_sl = node_stmts(node)
-        if stmts_sl != -1 && sublist_length(stmts_sl) > 0 {
-            let last = sublist_get(stmts_sl, sublist_length(stmts_sl) - 1)
-            let last_k = node_kind(last)
-            if last_k == NodeKind.ExprStmt {
-                return infer_type(node_value(last))
-            }
-            if last_k == NodeKind.Return {
-                return infer_type(node_value(last))
-            }
-            if last_k == NodeKind.IfExpr || last_k == NodeKind.MatchExpr || last_k == NodeKind.Call || last_k == NodeKind.MethodCall || last_k == NodeKind.Ident || last_k == NodeKind.IntLit || last_k == NodeKind.FloatLit || last_k == NodeKind.BoolLit || last_k == NodeKind.InterpString || last_k == NodeKind.BinOp || last_k == NodeKind.UnaryOp || last_k == NodeKind.WhileLoop || last_k == NodeKind.ForIn || last_k == NodeKind.LoopExpr || last_k == NodeKind.WithBlock {
-                return infer_type(last)
-            }
-        }
-        return TYPE_VOID
+        let tail = tc_block_tail_stmt(node)
+        if tail == -1 { return TYPE_VOID }
+        return infer_type(tc_block_tail_value(tail))
     }
 
     if kind == NodeKind.WhileLoop || kind == NodeKind.ForIn || kind == NodeKind.LoopExpr {
@@ -8328,6 +8388,34 @@ fn resolve_param_type(p: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
     TYPE_UNKNOWN
 }
 
+// The statement that carries a block's value, or -1 when the block has none.
+//
+// This accepted-kind list has TWO consumers — infer_type's Block arm and
+// tc_check_body's implicit-tail declared-return check — and their divergence IS
+// br skdxkv. Keep it here, in one place, so they cannot drift apart again.
+fn tc_block_tail_stmt(block: Int) -> Int {
+    let stmts_sl = node_stmts(block)
+    if stmts_sl == -1 { return -1 }
+    if sublist_length(stmts_sl) == 0 { return -1 }
+    let last = sublist_get(stmts_sl, sublist_length(stmts_sl) - 1)
+    let last_k = node_kind(last)
+    if last_k == NodeKind.ExprStmt { return last }
+    if last_k == NodeKind.Return { return last }
+    if last_k == NodeKind.IfExpr || last_k == NodeKind.MatchExpr || last_k == NodeKind.Call || last_k == NodeKind.MethodCall || last_k == NodeKind.Ident || last_k == NodeKind.IntLit || last_k == NodeKind.FloatLit || last_k == NodeKind.BoolLit || last_k == NodeKind.InterpString || last_k == NodeKind.BinOp || last_k == NodeKind.UnaryOp || last_k == NodeKind.WhileLoop || last_k == NodeKind.ForIn || last_k == NodeKind.LoopExpr || last_k == NodeKind.WithBlock {
+        return last
+    }
+    -1
+}
+
+// The value node inside a tail statement. ExprStmt and Return wrap theirs; every
+// other accepted kind IS its own value. A bare `return` yields -1, which infer_type
+// maps to TYPE_UNKNOWN — the same answer the inlined list gave before.
+fn tc_block_tail_value(stmt: Int) -> Int {
+    let k = node_kind(stmt)
+    if k == NodeKind.ExprStmt || k == NodeKind.Return { return node_value(stmt) }
+    stmt
+}
+
 // Genuine scope save/restore: nr_push_scope on entry, nr_pop_scope on exit.
 // The sibling diag_push_allows/diag_clear_allows and nr_* scope writes fall
 // outside that pattern, which the analyzer correctly flags.
@@ -8378,24 +8466,26 @@ fn tc_check_fn(fn_node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report 
 
     let body = node_body(fn_node)
     if body != -1 && is_ffi == 0 {
+        // The implicit-tail declared-return check itself now runs INSIDE tc_check_body,
+        // ahead of the body scope's nr_pop_scope (br r9krgr / skdxkv). Re-inferring the
+        // body here, after the pop, read a degraded type: a tail Ident resolved to
+        // TYPE_UNKNOWN and a tail struct literal fell to the bare-stid return, which
+        // then overwrote the good memo and compared vacuously.
+        if node_kind(body) == NodeKind.Block { tc_fn_body_block = 1 }
         tc_check_body(body)
+        tc_fn_body_block = 0
 
-        if sig != -1 {
+        // The one branch that CANNOT move: a body with no tail value at all reports
+        // against the whole function, not against a statement that does not exist. The
+        // old post-pop compare was its only producer (infer_type(Block) answers
+        // TYPE_VOID — not UNKNOWN — for a valueless body), so `fn f() -> Int { let x =
+        // 1 }` and `fn f() -> Int { }` both depend on keeping it here, verbatim, with
+        // fn_node as the report site.
+        if sig != -1 && node_kind(body) == NodeKind.Block {
             let declared_ret = fnsig_pool.get(sig).unwrap().ret
             if declared_ret != TYPE_VOID && declared_ret != TYPE_UNKNOWN {
-                let inferred_ret = infer_type(body)
-                if inferred_ret != TYPE_UNKNOWN {
-                    if types_compatible(declared_ret, inferred_ret) == 0 {
-                        tc_error_at("function '{fn_name}' declared return type {type_to_str(declared_ret)} but body returns {type_to_str(inferred_ret)}", fn_node)
-                    } else {
-                        // An implicit-tail generic construction (br y1n3ck). Only in the
-                        // compatible branch: types_compatible is permissive toward an
-                        // unbound metavar (it defers to the E0301 boundary check), so this
-                        // IS the branch the under-determined tail takes — and placing the
-                        // pin here means it can never turn a reported mismatch into a
-                        // silent success.
-                        tc_pin_tail_ret_generic(declared_ret, inferred_ret)
-                    }
+                if tc_block_tail_stmt(body) == -1 {
+                    tc_error_at("function '{fn_name}' declared return type {type_to_str(declared_ret)} but body returns {type_to_str(TYPE_VOID)}", fn_node)
                 }
             }
         }
@@ -8416,6 +8506,9 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let kind = node_kind(node)
 
     if kind == NodeKind.Block {
+        // Read-then-zero: only the block tc_check_fn set the marker for is a fn body.
+        let is_fn_body = tc_fn_body_block
+        tc_fn_body_block = 0
         nr_push_scope()
         let stmts_sl = node_stmts(node)
         if stmts_sl != -1 {
@@ -8432,6 +8525,36 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                     _found_terminal = 1
                 }
                 i = i + 1
+            }
+        }
+        // ORDERING CONTRACT (br r9krgr): this must run BEFORE nr_pop_scope. The pin
+        // inside tc_check_returned_value binds metavars in place — bind_metavar mutates
+        // the α slot itself, and the tail's instance tid and the scope entry for a local
+        // hold the very same α integers — so nr_pop_scope's E0301 region-boundary check
+        // then reads them already solved, with no scope-entry rewrite. Pop first and the
+        // boundary check wins the race, which is the bug.
+        //
+        // NodeKind.Return is excluded because its own arm already ran this check on the
+        // same value during the statement walk above; including it is the double-report.
+        //
+        // The declared-return gate is hoisted OUT of tc_check_returned_value and
+        // repeated here, and that placement is load-bearing: infer_type REPORTS as a
+        // side effect (its IfExpr arm emits "if branches have incompatible types"), so
+        // inferring a tail the old code never inferred invents diagnostics. The old
+        // post-pop site was gated on `sig != -1 && declared_ret not Void/Unknown` and so
+        // never ran on a Void-returning fn — `fn f() { if c { a() } else { b() } }` with
+        // arms of different types was, and stays, silent. `tc_current_fn_ret >= 0` is
+        // the `sig != -1` half: tc_check_fn installs a return type only when
+        // lookup_fnsig hits, and it is called from two non-reentrant top-level loops,
+        // so a miss leaves the -1 that init_types/the prior restore put there. (Which
+        // is why this check does not reach impl methods — see tc_check_returned_value.)
+        if is_fn_body != 0 && tc_current_fn_ret >= 0 && tc_current_fn_ret != TYPE_VOID && tc_current_fn_ret != TYPE_UNKNOWN {
+            let tail = tc_block_tail_stmt(node)
+            if tail != -1 && node_kind(tail) != NodeKind.Return {
+                let tail_val = tc_block_tail_value(tail)
+                if tail_val != -1 {
+                    tc_check_returned_value(infer_type(tail_val), tail_val)
+                }
             }
         }
         nr_pop_scope()
@@ -8714,30 +8837,11 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             if tc_current_fn_ret != TYPE_VOID && tc_current_fn_ret != TYPE_UNKNOWN { tc_construct_hint = resolve_alias_tid(tc_current_fn_ret) }
             let val_t = infer_type(val)
             tc_construct_hint = saved_hint
-            if tc_current_fn_ret != TYPE_VOID && tc_current_fn_ret != TYPE_UNKNOWN && val_t != TYPE_UNKNOWN {
-                if types_compatible(tc_current_fn_ret, val_t) == 0 {
-                    tc_error_at("return value type {type_to_str(val_t)} does not match function '{tc_current_fn_name}' return type {type_to_str(tc_current_fn_ret)}", node)
-                } else {
-                    // An explicit `return` of a generic construction (br y1n3ck). Needed in
-                    // addition to the tc_check_fn tail site: infer_type(body) only visits a
-                    // block's LAST statement, so an EARLY return inside an `if` is never
-                    // seen there. The construct-hint push above fixes the field carriers
-                    // but not the instance's own type args — those are metavars in the
-                    // instance tid, and only unification reaches them.
-                    //
-                    // NOT inside a closure body: a `return` there returns from the CLOSURE,
-                    // but tc_current_fn_ret still names the enclosing fn's declared return
-                    // (only tc_check_fn installs it). The compare above merely reports on
-                    // that mismatch; this pin MUTATES ty_pool, so it would bind the
-                    // closure's metavars to the enclosing instance's args — `GKV[Str, Str]`
-                    // emitted as blink_GKV_Int_Str with blink_kops_i64 for a Str key, the
-                    // br hnyqe4 silent hash under a wrong-but-plausible mono name. Leaving
-                    // the closure's return under-determined keeps it a loud stop instead.
-                    if tc_in_closure_depth == 0 {
-                        tc_pin_tail_ret_generic(tc_current_fn_ret, val_t)
-                    }
-                }
-            }
+            // Shared with the implicit tail (br skdxkv) — see tc_check_returned_value for
+            // why each guard is load-bearing. This arm stays necessary alongside the tail
+            // site: an EARLY return inside an `if` is not the block's last statement, so
+            // the tail check never visits it.
+            tc_check_returned_value(val_t, node)
         } else {
             if tc_current_fn_ret != TYPE_VOID && tc_current_fn_ret != TYPE_UNKNOWN {
                 tc_error_at("function '{tc_current_fn_name}' returns {type_to_str(tc_current_fn_ret)} but bare 'return' has no value", node)

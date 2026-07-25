@@ -1,0 +1,252 @@
+// br r9krgr: E0301 fires on an intermediate `let` before the declared return type
+// is ever consulted as a constraint.
+//
+//     type GKV[K, V] { m: Map[K, V] }
+//     fn a() -> GKV[Int, Str] {
+//         let x = GKV { m: Map() }
+//         x
+//     }
+//
+// => error[CannotInferType] E0301, while the SAME program spelled `return x`
+// compiles and monomorphizes correctly. That divergence is the whole ticket: two
+// spellings of one program, two results. Per sections/03_types.md:1158 a later
+// constraining use must determine the type, and :1031 makes the declared return
+// type an expected-type source — so returning `x` IS the constraint.
+//
+// MECHANISM. tc_check_body's Block arm pushes and POPS the body scope, and the
+// E0301 region-boundary check is inlined in nr_pop_scope. tc_check_fn only reached
+// the declared-return compare afterwards, so the boundary check always won the
+// race. The fix moves the compare + pin INTO the Block arm, ahead of nr_pop_scope,
+// mirroring the NodeKind.Return arm exactly. Ordering is the contract: the pin
+// mutates ty_pool in place, and nr_pop_scope then reads nr_scope_types and sees the
+// now-bound metavars — no scope-entry rewrite is needed, because bind_metavar
+// mutates the α pool slot that the scope entry's instance tid already points at.
+//
+// WHY THE kops ASSERTION IS LOAD-BEARING (inherited from y1n3ck). A fix that makes
+// only the mono NAME correct leaves the `Map()` field's metavars unbound, so the
+// ctor falls to its CT_STRING default and bakes blink_kops_str for an Int key. 256
+// and 512 both end in a 0x00 byte, so under the string hasher they collide as the
+// empty string (the br hnyqe4 corruption signature). `blink_kops_i64` present AND
+// `blink_kops_str` absent separates the real fix from that one; the 256/512 runtime
+// round-trip is the independent witness.
+
+import compile_test_helpers
+import std.io
+
+fn assert_has(c: Str, needle: Str, label: Str) {
+    if !c.contains(needle) { io.println("FAIL: {label} — missing '{needle}'") }
+    assert(c.contains(needle))
+}
+
+fn assert_lacks(c: Str, needle: Str, label: Str) {
+    if c.contains(needle) { io.println("FAIL: {label} — forbidden '{needle}' present") }
+    assert(!c.contains(needle))
+}
+
+// compile_test_helpers.expect_contains/expect_error only PRINT their verdict, so a
+// row built on them can never go red. Diagnostic-text rows use assert_has instead.
+
+// Per CLAUDE.md the `_Void` grep is a LOWER BOUND: the tid producers erase by
+// passing the binder through unchanged (blink_GKV_K / _V, br pt4hsy) and a def-side
+// field can erase under a fully correct mono name (blink_map_void, br w4c0py).
+// Check all three families on every C-emitting row.
+fn assert_no_erasure(c: Str, label: Str) {
+    assert_lacks(c, "_Void", "{label} / string-producer erasure")
+    assert_lacks(c, "blink_GKV_K", "{label} / bare-binder K passthrough")
+    assert_lacks(c, "blink_GKV_V", "{label} / bare-binder V passthrough")
+    assert_lacks(c, "blink_map_void", "{label} / erased Map carrier field")
+}
+
+// The Int key is what the kops choice decides, so both keys carry a 0x00 low byte.
+fn gkv_body() -> Str {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let g = a()\n")
+    s = s.concat("    g.m.insert(256, \"lo\")\n")
+    s = s.concat("    g.m.insert(512, \"hi\")\n")
+    s = s.concat("    assert_eq(g.m.len(), 2)\n")
+    s = s.concat("    assert(g.m.get(256).unwrap() == \"lo\")\n")
+    s = s.concat("    assert(g.m.get(512).unwrap() == \"hi\")\n")
+    s = s.concat("}\n")
+    s
+}
+
+fn gkv_src(decl: Str) -> Str {
+    "type GKV[K, V] \{ m: Map[K, V] }\n{decl}{gkv_body()}"
+}
+
+// The MVCE: an intermediate let, then a bare tail Ident.
+fn src_mvce() -> Str {
+    let mut d = "fn a() -> GKV[Int, Str] \{\n"
+    d = d.concat("    let x = GKV \{ m: Map() }\n")
+    d = d.concat("    x\n")
+    d = d.concat("}\n")
+    gkv_src(d)
+}
+
+// The parity twin. This ALREADY compiled before the fix — it is the evidence that
+// r9krgr is a defect and not a spec question, and it must keep compiling.
+fn src_return_twin() -> Str {
+    let mut d = "fn a() -> GKV[Int, Str] \{\n"
+    d = d.concat("    let x = GKV \{ m: Map() }\n")
+    d = d.concat("    return x\n")
+    d = d.concat("}\n")
+    gkv_src(d)
+}
+
+// The intermediate let holds the FIELD, not the struct: the tail struct literal
+// mints its instance slots from `m2`'s own metavars, so pinning the tail against
+// the declared return reaches back through the literal and solves `m2` too. Red
+// before the fix for exactly the same reason as the MVCE.
+fn src_intermediate_field() -> Str {
+    let mut d = "fn a() -> GKV[Int, Str] \{\n"
+    d = d.concat("    let m2 = Map()\n")
+    d = d.concat("    GKV \{ m: m2 }\n")
+    d = d.concat("}\n")
+    gkv_src(d)
+}
+
+// ── the MVCE: no E0301, no I0001, correct instance, correct kops ─────────────
+
+test "an intermediate let before a bare tail no longer reports E0301 (MVCE)" {
+    compile_test_helpers.expect_no_error(src_mvce(), "r9krgr_mvce_e0301", "E0301")
+}
+
+test "an intermediate let before a bare tail does not ICE" {
+    compile_test_helpers.expect_no_error(src_mvce(), "r9krgr_mvce_i0001", "I0001")
+}
+
+test "the intermediate-let tail monomorphizes to GKV_Int_Str with the i64 kops" {
+    let c = compile_test_helpers.compile_and_emit_c(src_mvce(), "r9krgr_mvce_c")
+    assert_has(c, "blink_GKV_Int_Str", "intermediate-let mono name")
+    assert_has(c, "blink_map_new(&blink_kops_i64)", "intermediate-let Int-key kops")
+    assert_lacks(c, "blink_kops_str", "must not hash an Int key as a string")
+    assert_no_erasure(c, "intermediate let")
+}
+
+test "the intermediate-let tail round-trips 256 and 512 at runtime" {
+    let r = compile_test_helpers.compile_and_run(src_mvce(), "r9krgr_mvce_run")
+    assert_eq(r.exit_code, 0)
+}
+
+// ── parity: `return x` and the bare tail `x` must agree ──────────────────────
+
+test "the explicit-return twin still monomorphizes identically" {
+    let c = compile_test_helpers.compile_and_emit_c(src_return_twin(), "r9krgr_twin_c")
+    assert_has(c, "blink_GKV_Int_Str", "return-twin mono name")
+    assert_has(c, "blink_map_new(&blink_kops_i64)", "return-twin Int-key kops")
+    assert_lacks(c, "blink_kops_str", "return twin must not hash an Int key as a string")
+    assert_no_erasure(c, "return twin")
+}
+
+test "the explicit-return twin round-trips 256 and 512 at runtime" {
+    let r = compile_test_helpers.compile_and_run(src_return_twin(), "r9krgr_twin_run")
+    assert_eq(r.exit_code, 0)
+}
+
+// ── the intermediate let holding the field value ─────────────────────────────
+
+test "an intermediate let holding the field value is solved by the tail" {
+    compile_test_helpers.expect_no_error(src_intermediate_field(), "r9krgr_field_e0301", "E0301")
+    let c = compile_test_helpers.compile_and_emit_c(src_intermediate_field(), "r9krgr_field_c")
+    assert_has(c, "blink_GKV_Int_Str", "intermediate-field mono name")
+    assert_has(c, "blink_map_new(&blink_kops_i64)", "intermediate-field Int-key kops")
+    assert_lacks(c, "blink_kops_str", "intermediate field must not hash an Int key as a string")
+    assert_no_erasure(c, "intermediate field")
+}
+
+test "the intermediate-field form round-trips 256 and 512 at runtime" {
+    let r = compile_test_helpers.compile_and_run(src_intermediate_field(), "r9krgr_field_run")
+    assert_eq(r.exit_code, 0)
+}
+
+// ── FLOOR: shapes that are green today and must stay green ───────────────────
+
+// A fn with no declared return type has nothing to pin with, so a genuinely
+// under-determined binding must still be reported. If this row ever goes quiet the
+// tail check has started firing where tc_current_fn_ret is Void — which would
+// silently Void-default every unpinnable construction, the exact outcome decision
+// 8vcj2c forbids. (The binding is named `_x`: an unused non-underscore binding gets
+// an UnusedVariable warning at the same node, and the per-node diagnostic dedup
+// then swallows the E0301.)
+test "FLOOR: a Void-returning fn still reports E0301 for an unpinnable let" {
+    let mut src = "type GKV[K, V] \{ m: Map[K, V] }\n"
+    src = src.concat("fn a() \{\n")
+    src = src.concat("    let _x = GKV \{ m: Map() }\n")
+    src = src.concat("}\n")
+    src = src.concat("fn main() \{ a() }\n")
+    compile_test_helpers.expect_compile_error(src, "r9krgr_floor_void", "E0301")
+}
+
+// tc_pin_tail_ret_generic gates on TK_STRUCT/TK_ENUM, so a declared `Map`/`Set`
+// return does NOT pin its tail — the documented non-struct gap. It must stay E0301
+// (a loud stop) rather than becoming a wrong-kops silent miscompile: that gate is
+// what keeps every existing tail-`None` / tail-`[]` / tail-tuple return untouched.
+// Tracked separately as its own bug.
+test "FLOOR: a declared Map return still does not pin its tail (documented gap)" {
+    let mut src = "fn a() -> Map[Str, Int] \{\n"
+    src = src.concat("    let m = Map()\n")
+    src = src.concat("    m\n")
+    src = src.concat("}\n")
+    src = src.concat("fn main() \{ let _x = a() }\n")
+    compile_test_helpers.expect_compile_error(src, "r9krgr_floor_map", "E0301")
+}
+
+// The missing-return-value diagnostic. infer_type(Block) returns TYPE_VOID (not
+// UNKNOWN) for a valueless body, and tc_check_fn's now-deleted post-pop block was
+// its ONLY producer — so the tail-check rewrite has to keep this branch alive
+// verbatim. This is the trap in "just delete the post-pop compare".
+test "FLOOR: a body with no tail value still reports the missing return" {
+    let mut src = "fn f() -> Int \{ let x = 1 }\n"
+    src = src.concat("fn main() \{ let _y = f() }\n")
+    let out = compile_test_helpers.compile_and_capture(src, "r9krgr_floor_novalue")
+    assert_has(out, "E0300", "missing tail value")
+    assert_has(out, "declared return type Int but body returns Void", "missing tail value message")
+}
+
+test "FLOOR: an empty body still reports the missing return" {
+    let mut src = "fn f() -> Int \{ }\n"
+    src = src.concat("fn main() \{ let _y = f() }\n")
+    let out = compile_test_helpers.compile_and_capture(src, "r9krgr_floor_empty")
+    assert_has(out, "E0300", "empty body")
+    assert_has(out, "declared return type Int but body returns Void", "empty body message")
+}
+
+// ── which producer speaks, for a tail that EXISTS but is Void ────────────────
+// A tail statement that is present but evaluates to Void (a void call, a `while`,
+// a `for`) used to be reported by the post-pop compare, against the whole function:
+//   "function 'i' declared return type Int but body returns Void"   at the fn
+// It is now reported by the tail check, against the offending statement:
+//   "return value type Void does not match function 'i' return type Int"  at the tail
+// Same E0300, strictly better location. These rows exist because the two wordings are
+// now split across two producers by whether a tail EXISTS — the rows above own the
+// no-tail wording, these own the has-tail wording. Asserting only one of the pair is
+// how a future refactor drops the other silently.
+
+fn assert_tail_void_reported(src: Str, name: Str, label: Str) {
+    let out = compile_test_helpers.compile_and_capture(src, name)
+    assert_has(out, "E0300", label)
+    assert_has(out, "return value type Void does not match function 'i' return type Int", label)
+    if out.contains("but body returns") {
+        io.println("FAIL: {label} — the no-tail wording leaked onto a tail that exists")
+    }
+    assert(!out.contains("but body returns"))
+}
+
+test "a Void-valued void call in tail position is reported at the statement" {
+    let mut src = "fn g() \{ }\n"
+    src = src.concat("fn i() -> Int \{ g() }\n")
+    src = src.concat("fn main() \{ let _x = i() }\n")
+    assert_tail_void_reported(src, "r9krgr_tail_voidcall", "void call tail")
+}
+
+test "a while loop in tail position is reported at the statement" {
+    let mut src = "fn i() -> Int \{ while false \{ } }\n"
+    src = src.concat("fn main() \{ let _x = i() }\n")
+    assert_tail_void_reported(src, "r9krgr_tail_while", "while tail")
+}
+
+test "a for loop in tail position is reported at the statement" {
+    let mut src = "fn i() -> Int \{ for _c in [1] \{ } }\n"
+    src = src.concat("fn main() \{ let _x = i() }\n")
+    assert_tail_void_reported(src, "r9krgr_tail_forin", "for-in tail")
+}
