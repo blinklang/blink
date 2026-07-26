@@ -2986,6 +2986,134 @@ pub fn segs_from_arg_tids(arg_tids: List[Int]) -> List[Str] {
     segs
 }
 
+// Is `node` the value of the enclosing fn's tail statement? The def-side return-
+// annotation tier below is gated on it, and the gate is the whole safety argument:
+// a return annotation is in scope for a fn's ENTIRE body, unlike cg_expect_arg_ann /
+// cg_let_target_ann which are set and restored per value context. Ungated, every
+// same-named literal anywhere in the body would silently adopt the return type's
+// args — `fn f() -> RGT[Int] { let y = RGT { s: Set() }; ...}` would stamp `Int`
+// onto `y` on no evidence at all. A wrong guess replacing a loud ICE is strictly
+// worse than the ICE.
+fn struct_lit_is_fn_tail_value(node: Int) -> Int {
+    if cg_current_fn_node == -1 { return 0 }
+    let body = node_body(cg_current_fn_node)
+    if body == -1 || node_kind(body) != NodeKind.Block { return 0 }
+    let stmts_sl = node_stmts(body)
+    if stmts_sl == -1 || sublist_length(stmts_sl) == 0 { return 0 }
+    let last = sublist_get(stmts_sl, sublist_length(stmts_sl) - 1)
+    let k = node_kind(last)
+    let val = if k == NodeKind.ExprStmt || k == NodeKind.Return { node_value(last) } else { last }
+    if val == node { return 1 }
+    0
+}
+
+// The DEF-side twin of struct_concrete_args_from_target (br 3dpshm). Both answer
+// "which concrete type args does this struct literal instantiate?"; they differ only
+// in which annotation is the oracle. The target version reads the enclosing VALUE
+// context; this one reads the enclosing fn's RETURN annotation, resolved through the
+// mono context the enclosing generic fn was instantiated with.
+//
+// It exists because the call-site mint solves only half of `fn mk[T]() -> RGT[T] {
+// RGT { s: Set() } }`. With `let e: RGT[Int] = mk()` the call site now knows T:=Int
+// and mangles blink_mk_Int correctly — but inside mk's monomorphized body the literal
+// has no value context whatsoever (no let target, no call-arg annotation, and `Set()`
+// has no element VALUE to infer from), so it reached the mono chokepoint with T
+// unsolved. The return annotation is the only channel that carries T there, and by
+// then cg_mono_tparams_sl/cg_mono_arg_tids already hold T:=Int for this instantiation.
+// Precedent for reading node_type_ann(cg_current_fn_node) as a codegen tier:
+// emit_tuple_lit does exactly this (br 295z9x).
+//
+// Every bail is load-bearing. Bare-name and arity mismatch mean the annotation is
+// about a different type. A compound arg flattens lossily through node_name — the
+// same reason struct_concrete_args_from_target bails on one.
+//
+// ONE LENS, DELIBERATELY. It returns TIDS and the caller spells the CSV from them via
+// segs_from_arg_tids, so the name it registers and the arg_tids it installs can never
+// disagree — the bwyfy1 two-speller hazard, which bites hardest exactly here because
+// the CSV drives the mono NAME while the tids drive the field ctor's kops vtable. A
+// name/vtable split is the br hnyqe4 signature: a correctly-named struct whose Int-keyed
+// Set is hashed as a string, silent under gcc and a SIGSEGV at runtime (br farq9f).
+//
+// Every annotation arg must be a BINDER of the enclosing mono context. A non-binder arg
+// (`fn f[T]() -> Pair[T, Int]`) is not this tier's business: an already-concrete slot
+// means the return instance tid is nameable, which is the tid-native path's job, and
+// answering it a second way here would be the second lens this function exists to avoid.
+// An unresolvable binder likewise bails — a "" / "Void" / bare-binder segment is precisely
+// the erasure this ticket closes, and emitting one trades a loud I0001 for a miscompile.
+fn struct_ret_ann_arg_tids(sname: Str, node: Int) -> List[Int] {
+    let none: List[Int] = []
+    // Gated on dbg_channel_on, per ast.bl's note and the kopsctor tap above: dbg_trace's
+    // message argument is interpolated EAGERLY, and this function runs for every struct
+    // literal in the program.
+    let tracing = dbg_channel_on("retann")
+    if struct_lit_is_fn_tail_value(node) == 0 {
+        if tracing != 0 { dbg_trace("retann", "{sname}: not the enclosing fn's tail value") }
+        return none
+    }
+    let td = find_type_def_node(sname)
+    if td == -1 { return none }
+    let td_tparams = node_type_params(td)
+    if td_tparams == -1 { return none }
+    let nparams = sublist_length(td_tparams)
+    if nparams == 0 { return none }
+    let ann = node_type_ann(cg_current_fn_node)
+    if ann == -1 {
+        if tracing != 0 { dbg_trace("retann", "{sname}: enclosing fn has no return annotation") }
+        return none
+    }
+    if strip_module_qualifier(node_name(ann)) != sname {
+        if tracing != 0 { dbg_trace("retann", "{sname}: return annotation names {node_name(ann)}") }
+        return none
+    }
+    let elems = node_elements(ann)
+    if elems == -1 || sublist_length(elems) != nparams {
+        if tracing != 0 { dbg_trace("retann", "{sname}: return annotation has the wrong arity for {nparams} type params") }
+        return none
+    }
+    let mut tids: List[Int] = []
+    let mut ai = 0
+    while ai < sublist_length(elems) {
+        let elem = sublist_get(elems, ai)
+        let sub = node_elements(elem)
+        if sub != -1 && sublist_length(sub) > 0 {
+            if tracing != 0 { dbg_trace("retann", "{sname} slot {ai}: compound annotation arg") }
+            return none
+        }
+        let tid = tparam_tid_via_mono(node_name(elem), cg_mono_tparams_sl, cg_mono_arg_tids)
+        if tid < 0 {
+            if tracing != 0 { dbg_trace("retann", "{sname} slot {ai}: '{node_name(elem)}' is not a binder of the enclosing mono context") }
+            return none
+        }
+        let seg = tc_seg_from_tid(tid)
+        if seg.is_none() {
+            if tracing != 0 { dbg_trace("retann", "{sname} slot {ai}: tid {tid} is unencodable") }
+            return none
+        }
+        if seg.unwrap() == "" || seg.unwrap() == "Void" {
+            if tracing != 0 { dbg_trace("retann", "{sname} slot {ai}: erased segment '{seg.unwrap()}'") }
+            return none
+        }
+        tids.push(tid)
+        ai = ai + 1
+    }
+    if tracing != 0 { dbg_trace("retann", "{sname}: return annotation resolves to '{struct_mono_from_fn_ret_ann(tids)}'") }
+    tids
+}
+
+// The CSV spelling of struct_ret_ann_arg_tids, through the SAME lens the tids carry.
+fn struct_mono_from_fn_ret_ann(tids: List[Int]) -> Str {
+    if tids.len() == 0 { return "" }
+    let segs = segs_from_arg_tids(tids)
+    let mut args = ""
+    let mut i = 0
+    while i < segs.len() {
+        if i > 0 { args = args.concat(",") }
+        args = args.concat(segs.get(i).unwrap())
+        i = i + 1
+    }
+    args
+}
+
 // Returns 0 if type-arg inference yields None so the caller can fall through
 // to non-generic handling; on success registers the monomorphization, writes
 // expr_result_str / expr_result_type plus container inner-type globals, and
@@ -5940,6 +6068,9 @@ fn emit_struct_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
     // cg_let_target_ann, and the field loop save/restores cg_expect_arg_ann per field,
     // so evaluating it here is identical to evaluating it at the mono_args selector.
     let tid_native_args = tid_native_struct_mono_args(node, sname)
+    // Computed HERE, before cg_mono_arg_tids is cleared below: it reads the ENCLOSING
+    // fn's mono context, not this literal's.
+    let ret_ann_tids = struct_ret_ann_arg_tids(sname, node)
     let td_tparams = if td != -1 { node_type_params(td) } else { -1 }
     let saved_mono_tparams = cg_mono_tparams_sl
     // Struct-lit field emission derives its mono context from the string target
@@ -5974,6 +6105,25 @@ fn emit_struct_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
         if arg_tids_match_mono_args(recovered, field_ctx_args) {
             cg_mono_arg_tids = recovered
         }
+    } else if ret_ann_tids.len() > 0 {
+        // Last tier: the enclosing fn's return annotation (br 3dpshm). Only reached when
+        // neither the value context nor the memoized instance tid could name this literal
+        // — i.e. exactly the def-side body of a monomorphized generic fn, whose alternative
+        // is the I0001 at the mono chokepoint below.
+        //
+        // Installed DIRECTLY, not re-derived through mono_instance_arg_tids_from_tid: that
+        // recovery reads the literal's own memoized instance tid, which in this body still
+        // holds the unsolved binder — the very reason we are in this branch. The tids here
+        // came from the enclosing mono context, which is already concrete, and the CSV the
+        // selector spells below comes from these same tids, so name and vtable cannot split.
+        //
+        // field_ctx_args is deliberately NOT updated: its only consumer is the
+        // arg_tids_match_mono_args parity guard in the sibling branch, which exists to
+        // discard a recovered tid that disagrees with a CSV some other producer chose.
+        // Here the tids ARE the source and the CSV is derived from them, so there is no
+        // second opinion to check against.
+        cg_mono_tparams_sl = td_tparams
+        cg_mono_arg_tids = ret_ann_tids
     }
     let mut inits = ""
     let mut field_types: List[Int] = []
@@ -6110,6 +6260,17 @@ fn emit_struct_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
         if mono_args == "" {
             let type_args = infer_struct_type_args(sname, field_types, field_structs)
             if type_args.is_some() { mono_args = type_args.unwrap() }
+            // LAST, and only after field-value inference declined or erased (br 3dpshm).
+            // Ordered here so this tier can never displace an answer another producer
+            // reached — the alternative it replaces is the I0001 below, never a name.
+            // mono_args_has_void_seg is the same predicate the chokepoint uses, so
+            // "inference erased a slot" is decided by one rule, not two.
+            if ret_ann_tids.len() > 0 {
+                if mono_args == "" || mono_args_has_void_seg(mono_args, td_tparams) {
+                    mono_args = struct_mono_from_fn_ret_ann(ret_ann_tids)
+                    mono_arg_tids = ret_ann_tids
+                }
+            }
         } else {
             // Tid-native path won: recover the parallel slot tids off the SAME
             // instance tid it resolved, so the def-side typedef emitter can lower

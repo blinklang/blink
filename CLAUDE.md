@@ -51,8 +51,10 @@ context, its tid, and the tid's tuple tag; this is where a wrong kops table gets
 that path WOULD have answered — the several declines are indistinguishable from outside, all
 producing the same I0001 spelling the string path's answer, and telling "the memo holds only the
 bare base" apart from "concrete but no admission reason fired" is the difference between a
-typecheck memo bug and a missing codegen tier). (`csvresolve` is retired — the legacy string-CSV
-type-param resolver it tapped no longer exists.)
+typecheck memo bug and a missing codegen tier); `retann` (the def-side return-annotation tier —
+which gate declined a struct literal in a monomorphized generic fn's tail, or the CSV it resolved
+to; the tier is last-resort, so silence here means an earlier producer answered). (`csvresolve` is
+retired — the legacy string-CSV type-param resolver it tapped no longer exists.)
 NOTE: `build/blinkc` IGNORES `BLINK_TRACE_CHANNELS` — `dbg_channels` is assigned only in
 `src/cli.bl`, so a probe binary for tracing must be built from `src/cli.bl`, not
 `src/blinkc_main.bl`, and (because the stdlib registry root is argv[0]-derived) must live in

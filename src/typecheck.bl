@@ -107,6 +107,24 @@ let mut ty_param_list: List[Int] = []
 // init_types alongside ty_pool so a tid can never outlive its pool.
 let mut tc_node_tid: List[Int] = []
 
+// Call node → the metavars minted for that call's RETURN-ONLY type params (3dpshm).
+// Presized to node_count() with -1 in init_types, exactly like tc_node_tid, so a
+// stale index can never survive a pool reset.
+//
+// TWO LISTS, NOT A MAP, and MEMOIZED PER CALL NODE. infer_type calls
+// infer_type_uncached unconditionally, so one call site's return type is
+// instantiated many times; without the memo each visit would mint a DIFFERENT α and
+// only the last one would ever be constrained — the node's memoized tid would carry
+// a bound α while the mono lowering read a fresh unbound one. Sharing α across call
+// sites is the opposite failure: `let a: RGT[Int] = mk(); let b: RGT[Str] = mk()`
+// would bind whichever ran first and collapse both onto one C type.
+//
+// tc_ret_mint_start holds the offset of this call's group in tc_ret_mint_tids;
+// each group is FULL ARITY, with -1 in the slots that were not minted, so a reader
+// can index it positionally against the fn's type-param list with no second table.
+let mut tc_ret_mint_start: List[Int] = []
+let mut tc_ret_mint_tids: List[Int] = []
+
 // ── Builtin type indices (populated by init_types) ──────────────────
 let mut TYPE_INT: Int = -1
 let mut TYPE_FLOAT: Int = -1
@@ -174,6 +192,16 @@ type FnSigEntry {
 let mut fnsig_pool: List[FnSigEntry] = []
 let mut fnsig_param_list: List[Int] = []
 let mut fnsig_type_param_names: List[Str] = []
+// Flat side-table PARALLEL to fnsig_type_param_names (same index, same length):
+// 1 iff that type param is RETURN-ONLY — named by the fn's return annotation and by
+// no parameter annotation. Only those slots get a call-site metavar (3dpshm); every
+// other slot keeps inferring from arguments exactly as before.
+//
+// It is a side-table rather than an FnSigEntry field because FnSigEntry is by-value
+// and already carries the (start, count) pair that indexes the names, so a parallel
+// list needs no new bookkeeping and no struct-shape change to a type the whole file
+// destructures.
+let mut fnsig_tparam_ret_only: List[Int] = []
 let mut fnsig_effect_names: List[Str] = []
 
 let mut tc_trait_names: List[Str] = []
@@ -1275,11 +1303,155 @@ fn build_typevar_binds(sig: Int, args_sl: Int) -> Map[Str, Int] ! TypeCheck.Reso
     binds
 }
 
-fn instantiate_return_type(sig: Int, args_sl: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+// The metavars minted for `call_node`'s return-only type params, as a full-arity
+// group (-1 where nothing was minted), minting them on first visit and returning the
+// SAME ones on every later visit. See tc_ret_mint_start's declaration for why the
+// per-node memo is required rather than merely nice.
+//
+// Each returned tid is passed through tc_resolve, so a caller reads the SOLUTION once
+// something has bound α rather than the raw α slot. That matters concretely:
+// tc_struct_slot_encodable does not resolve, and would judge a bound α unencodable and
+// silently drop the slot back to the erasing string path.
+// Group layout in tc_ret_mint_tids: [arity, slot_0, …, slot_{arity-1}], so the group
+// is SELF-DESCRIBING and a reader that disagrees about the fn's arity refuses instead
+// of indexing into the next call's group. That is not hypothetical: this memo is
+// written from the sig (fs.type_params_count) and read back by tc_mono_csv /
+// tc_mono_tids_core from the AST (sublist_length(node_type_params(fn_node))), and
+// lookup_fnsig keys on a name — two fns of the same name with different arities would
+// otherwise silently share a slot and mint one fn's α into the other's mono name.
+fn tc_ret_only_metavars(sig: Int, call_node: Int) -> List[Int] {
+    let fs = fnsig_pool.get(sig).unwrap()
+    let n = fs.type_params_count
+    let mut out: List[Int] = []
+    if n == 0 { return out }
+    if call_node < 0 || call_node >= tc_ret_mint_start.len() { return out }
+
+    let existing = tc_ret_mint_start.get(call_node).unwrap()
+    if existing >= 0 {
+        let mut i = 0
+        while i < n {
+            out.push(tc_resolve(tc_ret_mint_at(call_node, n, i)))
+            i = i + 1
+        }
+        return out
+    }
+
+    let start = tc_ret_mint_tids.len()
+    tc_ret_mint_tids.push(n)
+    let mut minted = 0
+    let mut pi = 0
+    while pi < n {
+        let ro_idx = fs.type_params_start + pi
+        let mut tid = -1
+        if ro_idx < fnsig_tparam_ret_only.len() {
+            if fnsig_tparam_ret_only.get(ro_idx).unwrap() != 0 {
+                tid = make_metavar()
+                minted = minted + 1
+            }
+        }
+        tc_ret_mint_tids.push(tid)
+        out.push(tid)
+        pi = pi + 1
+    }
+    // Record the group only when it holds at least one α. Every non-return-only
+    // generic call would otherwise burn an all -1 group per call node for nothing, and
+    // leaving the start at -1 keeps that overwhelmingly common path a single list read.
+    if minted == 0 {
+        let mut trim = 0
+        while trim <= n {
+            let _ = tc_ret_mint_tids.pop()
+            trim = trim + 1
+        }
+        return out
+    }
+    tc_ret_mint_start.set(call_node, start)
+    out
+}
+
+// The metavar minted for slot `pi` of `call_node`'s return-only group, RESOLVED, or -1
+// when this call minted nothing, minted nothing for that slot, or the caller's arity
+// disagrees with the recorded group. The mono-lowering consumers read through here so
+// each one is a single guarded lookup with no arithmetic of its own.
+pub fn tc_ret_mint_at(call_node: Int, arity: Int, pi: Int) -> Int {
+    if call_node < 0 || call_node >= tc_ret_mint_start.len() { return -1 }
+    let start = tc_ret_mint_start.get(call_node).unwrap()
+    if start < 0 || start >= tc_ret_mint_tids.len() { return -1 }
+    if tc_ret_mint_tids.get(start).unwrap() != arity { return -1 }
+    if pi < 0 || pi >= arity { return -1 }
+    let slot = start + 1 + pi
+    if slot >= tc_ret_mint_tids.len() { return -1 }
+    let tid = tc_ret_mint_tids.get(slot).unwrap()
+    if tid < 0 { return -1 }
+    tc_resolve(tid)
+}
+
+// Did THIS node mint return-only metavars? The let-target pin is gated on it, so that
+// caller reaches exactly the under-determination this ticket introduced and nothing else.
+//
+// Without the gate the pin also fires on an annotated let whose initializer is a struct
+// LITERAL carrying field metavars — `let x: Box[Map[Float,Int]] = Box { value: Map() }`.
+// That is a different mechanism with a different owner, and pinning it changes emitted C
+// two ways at once: it fixes a latent br hnyqe4 kops miscompile (an Int-keyed Set hashed
+// as a string) and it drives a Float key all the way to resolve_ctor_kops_elem, which has
+// no vtable for one and emits a BLINK_COMPILER_BUG_ sentinel — an invalid C identifier.
+// Both are real findings about the struct-literal path, both are filed, and neither is
+// this ticket's to decide. A declared `Map[Float,_]` is rejected outright by
+// validate_map_key; the same type reached through a struct type-arg is not (see
+// tc_suppress_ann_validation), and until that enforcement gap closes there is no honest
+// answer for the pinned form.
+fn tc_node_has_ret_mint(n: Int) -> Int {
+    if n < 0 || n >= tc_ret_mint_start.len() { return 0 }
+    if tc_ret_mint_start.get(n).unwrap() < 0 { return 0 }
+    1
+}
+
+// A generic call's return type, with its type params substituted from the call's
+// arguments — and, for a RETURN-ONLY type param, from a freshly minted metavariable
+// (3dpshm).
+//
+// The mint is the whole point. build_typevar_binds infers exclusively from ARGUMENT
+// types, so `fn mk[T]() -> RGT[T]` called as `mk()` gets empty binds,
+// substitute_typevar_tid's TK_TYPEVAR arm returns `T` unchanged, and the return type
+// carries a BARE TYPEVAR. A bare typevar is invisible to every part of the metavar
+// machinery — tc_is_unbound_metavar counts only TK_UNKNOWN with inner1 < 0, and
+// tc_unify's typevar arm returns 1 without binding — so typecheck passes clean, no
+// E0301 fires, and codegen erases the slot to "Void" at the emit_struct_lit
+// chokepoint (a loud I0001) or to a wrong mono name. Substituting α instead puts the
+// slot into the ONE representation the existing constraint machinery can already
+// solve: the let-target pin (tc_pin_tail_ret_generic), the argument-position unify
+// (check_arg_value), and the declared-return compare (tc_check_returned_value) each
+// bind α with no new inference code, and a genuinely unconstrained α is reported as
+// E0301 at its binding boundary instead of reaching codegen.
+//
+// Minting HERE and not in build_typevar_binds: that function runs twice per call site
+// (once for the return type, once for tc_pin_generic_args_from_binds), so it would
+// produce two unrelated α for one slot and only one of them could ever be bound.
+// substitute_typevar_tid stays byte-identical — inserting α into `binds` is the whole
+// mechanism, which is what keeps every `-> Box[T]` whose T comes from an argument on
+// exactly its current path.
+fn instantiate_return_type(sig: Int, args_sl: Int, call_node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let fs = fnsig_pool.get(sig).unwrap()
     let ret = fs.ret
     if ret < 0 || ret >= ty_pool.len() { return ret }
-    let binds = build_typevar_binds(sig, args_sl)
+    let mut binds = build_typevar_binds(sig, args_sl)
+    let mints = tc_ret_only_metavars(sig, call_node)
+    let mut pi = 0
+    while pi < mints.len() {
+        let a = mints.get(pi).unwrap()
+        if a >= 0 {
+            let nidx = fs.type_params_start + pi
+            if nidx < fnsig_type_param_names.len() {
+                let tpn = fnsig_type_param_names.get(nidx).unwrap()
+                // An argument bind wins: a param annotation naming the tparam means it
+                // is not return-only and no α was minted for it, so this can only be a
+                // belt-and-braces guard against a future producer inserting both.
+                if binds.contains_key(tpn) == 0 {
+                    binds.insert(tpn, a)
+                }
+            }
+        }
+        pi = pi + 1
+    }
     substitute_typevar_tid(ret, binds)
 }
 
@@ -1342,6 +1514,14 @@ fn tc_pin_generic_args_from_binds(sig: Int, args_sl: Int, self_offset: Int) ! Ty
 // The unify result is deliberately discarded: callers invoke this only where
 // types_compatible ALREADY agreed, so there is no new mismatch to report, and a
 // partial unify degrades to exactly today's I0001 rather than to a wrong type.
+//
+// Two callers, both a declared type meeting an under-determined value: the returned
+// value of a fn (tc_check_returned_value, for both `return x` and an implicit tail)
+// and an annotated let's initializer (the LetBinding arm, br 3dpshm). The name says
+// "tail ret" for its first caller; it is really "pin a declared generic type onto a
+// metavar-carrying value", and every gate above reads the same either way. Not
+// renamed on purpose — a rename of a compiler-internal helper costs a 3-step
+// bootstrap and buys nothing a comment cannot say.
 fn tc_pin_tail_ret_generic(declared_ret: Int, inferred_ret: Int) {
     let d = resolve_alias_tid(declared_ret)
     if d < 0 || d >= ty_pool.len() { return }
@@ -2564,6 +2744,37 @@ fn tc_check_name_collisions() ! TypeCheck.Register, Diag.Report {
     }
 }
 
+// Is `tp_name` return-only: named by the fn's RETURN annotation and by no parameter
+// annotation? Computed once at registration, where `ret_ann` and `params_sl` are both
+// in scope and the type-param push order is guaranteed to match the side-table's.
+//
+// BOTH halves of the conjunction are required, and the return half is the tighter of
+// the two. Requiring only "no parameter mentions it" would also admit a PHANTOM type
+// param (`fn f[T]() -> Int`), which today mangles `blink_f_Void` with no diagnostic
+// (br psrvff) — minting for it would change that shape's behavior from a live known
+// bug into a different one, out of scope here. Requiring the return annotation to
+// name it keeps the mint at exactly the shape whose type argument is knowable from
+// the call's context, which is what "return-only" means.
+fn tc_tparam_is_ret_only(tp_name: Str, ret_ann: Int, params_sl: Int) -> Int {
+    if ret_ann == -1 { return 0 }
+    if !tc_ann_names_tparam(ret_ann, tp_name) { return 0 }
+    if params_sl != -1 {
+        let mut i = 0
+        while i < sublist_length(params_sl) {
+            let p = sublist_get(params_sl, i)
+            // node_type_name as well as the walk: parse_param sets both from the same
+            // annotation, but register_fn_sig itself falls back to the flat type_name
+            // when a param carries no ann node (:2617), so a synthesized param must
+            // not be able to hide a mention. Costs nothing and can only ever make
+            // FEWER params look return-only — the safe direction.
+            if node_type_name(p) == tp_name { return 0 }
+            if tc_ann_names_tparam(node_type_ann(p), tp_name) { return 0 }
+            i = i + 1
+        }
+    }
+    1
+}
+
 fn register_fn_sig(fn_node: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Report {
     let name = node_name(fn_node)
     let ret_str = node_return_type(fn_node)
@@ -2633,7 +2844,9 @@ fn register_fn_sig(fn_node: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.R
         let mut ti = 0
         while ti < sublist_length(tparams_sl) {
             let tp = sublist_get(tparams_sl, ti)
-            fnsig_type_param_names.push(node_name(tp))
+            let tp_name = node_name(tp)
+            fnsig_type_param_names.push(tp_name)
+            fnsig_tparam_ret_only.push(tc_tparam_is_ret_only(tp_name, ret_ann, params_sl))
             tp_count = tp_count + 1
             ti = ti + 1
         }
@@ -3784,11 +3997,14 @@ fn init_types() ! TypeCheck.Register {
     ty_pool.clear()
     ty_param_list.clear()
     tc_node_tid.clear()
+    tc_ret_mint_start.clear()
     let mut nti = 0
     while nti < node_count() {
         tc_node_tid.push(-1)
+        tc_ret_mint_start.push(-1)
         nti = nti + 1
     }
+    tc_ret_mint_tids.clear()
     named_type_names.clear()
     named_type_ids.clear()
     named_type_map.clear()
@@ -3804,6 +4020,7 @@ fn init_types() ! TypeCheck.Register {
     fnsig_map.clear()
     fnsig_param_list.clear()
     fnsig_type_param_names.clear()
+    fnsig_tparam_ret_only.clear()
     fnsig_effect_names.clear()
     tc_trait_names.clear()
     tc_trait_method_names.clear()
@@ -7534,7 +7751,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                         // then pin LAST — the pin's own final infer_type per arg
                         // leaves the bound metavars in the node memo for codegen
                         // to read (m1wspm).
-                        let ret_t = instantiate_return_type(sig, args_sl)
+                        let ret_t = instantiate_return_type(sig, args_sl, node)
                         tc_pin_generic_args_from_binds(sig, args_sl, 0)
                         return ret_t
                     }
@@ -8034,7 +8251,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                     // node→tid memo the tid-driven mono lowering (tc_mono_csv) reads.
                     let mq_fs = fnsig_pool.get(sig).unwrap()
                     if mq_fs.type_params_count > 0 {
-                        return instantiate_return_type(sig, mq_gen_args)
+                        return instantiate_return_type(sig, mq_gen_args, node)
                     }
                     // Non-generic module-qualified call: no substitution, but still
                     // infer the args so their node→tid memo is populated (the
@@ -8590,6 +8807,26 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         if declared_tid != TYPE_UNKNOWN && inferred_tid != TYPE_UNKNOWN {
             if assignment_types_compatible(declared_tid, inferred_tid, val) == 0 {
                 tc_error_at("variable '{vname}': declared type {type_to_str(declared_tid)} but got {type_to_str(inferred_tid)}", node)
+            } else {
+                // A declared let type is an expected-type source for the value's
+                // metavars, not only something to compare against. This arm otherwise
+                // only compares and then discards `inferred_tid` for `final_tid =
+                // declared_tid`, so `let e: RGT[Int] = mk()` left the α that
+                // instantiate_return_type minted for mk's return-only T unbound — the
+                // declared instantiation was right there and never written down
+                // (3dpshm).
+                //
+                // In the COMPATIBLE branch only, and via the same in-place unify the
+                // tail-return site uses: the α integers in the value's instance arg
+                // list are the same integers its fields hold, so one bind solves the
+                // mono name and the field ctor's kops vtable together. Placing it here
+                // rather than before the compare means it can never turn a reported
+                // mismatch into a silent success.
+                //
+                // Restricted to initializers that minted here — see tc_node_has_ret_mint.
+                if tc_node_has_ret_mint(val) != 0 {
+                    tc_pin_tail_ret_generic(declared_tid, inferred_tid)
+                }
             }
         }
 
@@ -10822,6 +11059,37 @@ fn tc_ann_mentions_param(ann: Int, param_name: Str) -> Bool {
     false
 }
 
+// COMPLETE walk of a type annotation for a type-param name — elements AND the
+// nested `type_ann` slot. Deliberately NOT tc_ann_mentions_param, which walks only
+// node_elements: parser.bl builds an `Fn` annotation with its PARAMS in `elements`
+// and its RETURN in `type_ann`, so the elements-only walk cannot see the `U` in
+// `f: fn(T) -> U`. `Fn` is the only TypeAnn kind that stores a nested annotation
+// outside `elements`, which is what makes this walk complete rather than merely
+// deeper.
+//
+// The distinction is load-bearing and asymmetric: the two existing users of
+// tc_ann_mentions_param ask "does this position mention the param, so should I
+// DEFER?", where under-reporting costs only a fallback to the string path. This
+// asks "is this param unconstrained by every parameter, so should I MINT?", where
+// under-reporting mints an α nothing can ever bind — E0301 at every call of
+// lib/std/list.bl's list_map and lib/std/map.bl's map_map_values, the only two
+// functions in the repo whose type param is named solely inside an `Fn`. A row in
+// tests/test_3dpshm_generic_fn_ret_only_tparam.bl fails loudly if the two are
+// confused; do not merge them.
+fn tc_ann_names_tparam(ann: Int, param_name: Str) -> Bool {
+    if ann == -1 { return false }
+    if node_name(ann) == param_name { return true }
+    if tc_ann_names_tparam(node_type_ann(ann), param_name) { return true }
+    let elems_sl = node_elements(ann)
+    if elems_sl == -1 { return false }
+    let mut i = 0
+    while i < sublist_length(elems_sl) {
+        if tc_ann_names_tparam(sublist_get(elems_sl, i), param_name) { return true }
+        i = i + 1
+    }
+    false
+}
+
 // tid-driven twin of infer_fn_type_args_from_types: build the per-type-param
 // CSV that mangle_generic_name consumes, resolving each segment from the call
 // argument's memoized tid instead of the codegen CT capture. Returns None when
@@ -10846,7 +11114,22 @@ pub fn tc_mono_csv(call_node: Int, fn_node: Int) -> Option[Str] {
         let param_name = node_name(sublist_get(tparams_sl, pi))
         let seg_opt = tc_resolve_tparam_seg(param_name, fn_params_sl, args_sl)
         if seg_opt.is_none() { return None }
-        let seg = seg_opt.unwrap()
+        let mut seg = seg_opt.unwrap()
+        // A RETURN-ONLY type param has no argument position to resolve from, so
+        // tc_resolve_tparam_seg reaches its "no position mentions it" end and returns
+        // Some("") — the exact fall-through that used to spell "Void" here and hand
+        // codegen an erased mono name. If the call site's minted α got solved (by the
+        // let target, an argument position, or the declared return), spell the
+        // SOLUTION; otherwise fall through to today's behavior unchanged (3dpshm).
+        //
+        // Narrowly gated on seg == "" and Some: every None still defers to the string
+        // path, and any slot the argument path DID resolve keeps its own segment. The
+        // encodable gate is what keeps the tid segment byte-identical to the string
+        // path's — an unbound or unencodable α is not spelled at all.
+        if seg == "" {
+            let m = tc_ret_mint_at(call_node, num_params, pi)
+            if m >= 0 && tc_tid_encodable(m) { seg = tc_tid_to_c_tag(m) }
+        }
         csv = csv.concat(if seg != "" { seg } else { "Void" })
         pi = pi + 1
     }
@@ -11074,7 +11357,18 @@ fn tc_mono_tids_core(call_node: Int, fn_node: Int, binds: Map[Str, Int]) -> List
     let mut pi = 0
     while pi < num_params {
         let param_name = node_name(sublist_get(tparams_sl, pi))
-        tids.push(tc_resolve_tparam_tid(param_name, fn_params_sl, args_sl, binds))
+        let mut tid = tc_resolve_tparam_tid(param_name, fn_params_sl, args_sl, binds)
+        // -1 is this function's "no argument position could supply it" — the tid twin
+        // of tc_mono_csv's Some("") fall-through, and the same seam a return-only type
+        // param falls through (3dpshm). Substitute the call site's solved α so the
+        // registered mono instance carries the concrete inner tid every def-side
+        // arg_tids consumer reads, rather than -1 (which drops the slot to the erasing
+        // string path). Only where the argument path already gave up.
+        if tid < 0 {
+            let m = tc_ret_mint_at(call_node, num_params, pi)
+            if m >= 0 && tc_tid_encodable(m) { tid = m }
+        }
+        tids.push(tid)
         pi = pi + 1
     }
     tids

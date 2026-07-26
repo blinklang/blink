@@ -1,0 +1,367 @@
+// br 3dpshm, defect 1: a generic function's type parameter that appears ONLY in its
+// return type has no channel to the call site, so it reaches monomorphization unsolved.
+//
+//     type RGT[T] { s: Set[T] }
+//     fn mk[T]() -> RGT[T] { RGT { s: Set() } }
+//     let e: RGT[Int] = mk()
+//   => internal compiler error[UnsolvedTypeVarAtCodegen] (I0001):
+//      type parameter of 'RGT' reached monomorphization unsolved (mono args 'Void')
+//
+// WHY NOTHING CATCHES IT EARLIER. build_typevar_binds infers exclusively from ARGUMENT
+// types, so a zero-argument generic call gets empty binds; substitute_typevar_tid's
+// TK_TYPEVAR arm then returns `T` unchanged and the return type carries a BARE TYPEVAR.
+// A bare typevar is invisible to the whole metavar machinery: tc_is_unbound_metavar
+// counts only TK_UNKNOWN with inner1 < 0, and tc_unify's typevar arm returns 1 without
+// binding anything. So typecheck passes clean, no E0301 fires, and codegen erases the
+// slot to "Void" at the emit_struct_lit chokepoint. The declared `RGT[Int]` on the let
+// was knowable the whole time — there was simply no representation to write it into.
+//
+// THE FIX MINTS A METAVARIABLE. A return-only type param becomes a fresh α at the call
+// site, which is precisely the representation the existing machinery already knows how
+// to constrain: the let-target pin, the arg-position unify, and the declared-return
+// compare all bind α without any new inference code. That is also why the E0301 row
+// below matters — under-determination becomes a proper diagnostic instead of an ICE,
+// discharging the 6-0 decision in decisions/under-determined-types.md.
+//
+// THE GATE IS THE DANGEROUS PART, AND IT IS WHY ROW `rmap` EXISTS. "Return-only" means
+// no PARAMETER annotation names the type param. tc_ann_mentions_param walks only
+// node_elements, but parser.bl:1439 stores an `Fn` annotation's RETURN in `type_ann` —
+// so reusing it classifies `U` in `rmap[T, U](xs: List[T], f: fn(T) -> U)` as
+// return-only, mints an unconstrainable α, and fires E0301 on every stdlib HOF call
+// (list_map, map_map_values). The walk must recurse type_ann as well. `Fn` is the only
+// TypeAnn kind that stores a nested annotation outside `elements`, so that walk is
+// provably complete — and the rmap row fails loudly if the incomplete one is reused.
+//
+// FOUR SEAMS, ONE MINT. Once α exists, four separate call contexts constrain it through
+// code that already exists: an annotated let (tc_pin_tail_ret_generic), a later
+// field/method use (the field-access metavar branch + check_arg_value), a concretely
+// typed parameter position, and an implicit tail return. Each has its own row, because
+// each reaches α through a different unify site and could regress independently.
+//
+// PINNED AS STILL-LOUD (out of scope, adjacent mechanisms): a call in an `if`-arm tail
+// (tail-position propagation through If/Match/With is a separate gap) and a
+// mono-calls-mono site whose enclosing type param is still abstract. Both must stay a
+// loud I0001 rather than degrade to a wrong mono name — pinned here so this file
+// records the boundary rather than leaving it to be discovered.
+
+import compile_test_helpers
+import std.io
+
+fn assert_has(c: Str, needle: Str, label: Str) {
+    if !c.contains(needle) { io.println("FAIL: {label} — missing '{needle}'") }
+    assert(c.contains(needle))
+}
+
+fn assert_lacks(c: Str, needle: Str, label: Str) {
+    if c.contains(needle) { io.println("FAIL: {label} — forbidden '{needle}' present") }
+    assert(!c.contains(needle))
+}
+
+// Per CLAUDE.md the `_Void` grep is a LOWER BOUND, so every C-emitting row checks the
+// bare-binder family too — and this ticket's shape is exactly the one the grep cannot
+// see: an unresolved slot that passes its binder through unchanged mangles to
+// `blink_RGT_T`, which contains no "Void" at all (br pt4hsy, br w4c0py). The needles are
+// TERMINATED (`;` for a typedef, a trailing space for a declaration) so they cannot
+// match inside a legitimate `blink_RGT_Int`-style name.
+fn assert_no_erasure(c: Str, label: Str) {
+    assert_lacks(c, "_Void", "{label} / string-producer erasure")
+    assert_lacks(c, "blink_RGT_T;", "{label} / bare-binder RGT typedef")
+    assert_lacks(c, "blink_RGT_T ", "{label} / bare-binder RGT declaration")
+    assert_lacks(c, "blink_RGS_T;", "{label} / bare-binder RGS typedef")
+    assert_lacks(c, "blink_RGS_T ", "{label} / bare-binder RGS declaration")
+}
+
+// compile_and_emit_c read_file-aborts the whole harness when the compile produced no
+// output, which is exactly what an I0001 does — so a row that emits first would take
+// every later row down with it and report one failure for ten. This makes the failure
+// attributable to the row that caused it.
+fn emit_c_checked(src: Str, tag: Str, label: Str) -> Str {
+    let out = compile_test_helpers.compile_and_capture(src, "{tag}_diag")
+    assert_lacks(out, "I0001", "{label} / compiles before emitting")
+    compile_test_helpers.compile_and_emit_c(src, tag)
+}
+
+// The third erasure family for this shape. A `Set[T]` field lowers to the type-ERASED
+// `blink_set*` in C, so there is no `blink_set_void` spelling to grep for: the erasure
+// surfaces in the element VTABLE the ctor bakes. blink_kops_str for an Int element is
+// the br hnyqe4 silent-hash miscompile — 256 and 512 both end in 0x00, so the string
+// hasher reads two empty strings and they collide — and per br farq9f it now SIGSEGVs.
+// A correct mono NAME over a wrong vtable is the exact failure this pair catches, which
+// is why the name assertions alone are not sufficient coverage for any of these rows.
+fn assert_int_kops(c: Str, label: Str) {
+    assert_has(c, "blink_set_new(&blink_kops_i64)", "{label} / int element vtable")
+    assert_lacks(c, "blink_kops_str", "{label} / string vtable for an Int element")
+}
+
+fn rgt_decl() -> Str {
+    let mut s = "type RGT[T] \{ s: Set[T] }\n"
+    s = s.concat("fn mk[T]() -> RGT[T] \{ RGT \{ s: Set() } }\n")
+    s
+}
+
+// Exhibit (b) from the ticket: the declared let type names the instantiation directly.
+fn src_annotated_let() -> Str {
+    let mut s = rgt_decl()
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let e: RGT[Int] = mk()\n")
+    s = s.concat("    e.s.insert(256)\n")
+    s = s.concat("    e.s.insert(512)\n")
+    s = s.concat("    assert(e.s.len() == 2)\n")
+    s = s.concat("    assert(e.s.contains(256))\n")
+    s = s.concat("    assert(!e.s.contains(257))\n")
+    s = s.concat("}\n")
+    s
+}
+
+// Exhibit (a): nothing annotates the binding — α is pinned BACKWARD from a later use.
+// Uses its own struct (RGS) so a failure here cannot be confused with the RGT rows.
+fn src_backward_use() -> Str {
+    let mut s = "type RGS[T] \{ s: Set[T] }\n"
+    s = s.concat("fn mks[T]() -> RGS[T] \{ RGS \{ s: Set() } }\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let b = mks()\n")
+    s = s.concat("    b.s.insert(256)\n")
+    s = s.concat("    b.s.insert(512)\n")
+    s = s.concat("    assert(b.s.contains(512))\n")
+    s = s.concat("    assert(b.s.len() == 2)\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "E0301 and I0001 are both in the error catalog" {
+    compile_test_helpers.verify_catalog_entry("E0301", "CannotInferType")
+    compile_test_helpers.verify_catalog_entry("I0001", "UnsolvedTypeVarAtCodegen")
+}
+
+// ── seam 1: an annotated let target ───────────────────────────────────────────
+
+test "a return-only type param resolves from the annotated let target" {
+    let out = compile_test_helpers.compile_and_capture(src_annotated_let(), "3dpshm_let_diag")
+    assert_lacks(out, "I0001", "annotated let / no ICE")
+    assert_lacks(out, "E0301", "annotated let / no under-determined error")
+}
+
+test "the annotated let emits the concrete fn and struct monos" {
+    let c = emit_c_checked(src_annotated_let(), "3dpshm_let_c", "annotated let")
+    assert_has(c, "blink_mk_Int", "annotated let / fn mono")
+    assert_has(c, "} blink_RGT_Int;", "annotated let / struct mono typedef")
+    assert_int_kops(c, "annotated let")
+    assert_no_erasure(c, "annotated let")
+}
+
+test "the annotated let round-trips its Set elements at runtime" {
+    let r = compile_test_helpers.compile_and_run(src_annotated_let(), "3dpshm_let_run")
+    if r.exit_code != 0 { io.println("FAIL: annotated let — exit {r.exit_code}: {r.err_out}") }
+    assert_eq(r.exit_code, 0)
+}
+
+// ── seam 2: backward inference from a later use ───────────────────────────────
+
+test "a return-only type param resolves backward from a later method call" {
+    let out = compile_test_helpers.compile_and_capture(src_backward_use(), "3dpshm_back_diag")
+    assert_lacks(out, "I0001", "backward use / no ICE")
+    assert_lacks(out, "E0301", "backward use / no under-determined error")
+    // Before the mint this shape ALSO reported the receiver as unresolvable, because
+    // `b.s` typed as Set[T] with T a bare typevar — no Set method resolves on it.
+    assert_lacks(out, "E0505", "backward use / method resolves")
+}
+
+test "backward inference emits the concrete monos and the int vtable" {
+    let c = emit_c_checked(src_backward_use(), "3dpshm_back_c", "backward use")
+    assert_has(c, "blink_mks_Int", "backward use / fn mono")
+    assert_has(c, "} blink_RGS_Int;", "backward use / struct mono typedef")
+    assert_int_kops(c, "backward use")
+    assert_no_erasure(c, "backward use")
+}
+
+test "backward inference round-trips at runtime" {
+    let r = compile_test_helpers.compile_and_run(src_backward_use(), "3dpshm_back_run")
+    if r.exit_code != 0 { io.println("FAIL: backward use — exit {r.exit_code}: {r.err_out}") }
+    assert_eq(r.exit_code, 0)
+}
+
+// ── seam 3: a concretely typed parameter position ─────────────────────────────
+// check_arg_value already unifies a metavar-carrying argument against its declared
+// param type; the mint is what gives it something to unify.
+
+test "a return-only type param resolves from a concretely typed param position" {
+    let mut s = rgt_decl()
+    s = s.concat("fn take(g: RGT[Int]) -> Int \{ g.s.len() }\n")
+    s = s.concat("fn main() \{ assert(take(mk()) == 0) }\n")
+    let r = compile_test_helpers.compile_and_run(s, "3dpshm_argpos_run")
+    if r.exit_code != 0 { io.println("FAIL: arg position — exit {r.exit_code}: {r.err_out}") }
+    assert_eq(r.exit_code, 0)
+    let c = compile_test_helpers.compile_and_emit_c(s, "3dpshm_argpos_c")
+    assert_has(c, "blink_mk_Int", "arg position / fn mono")
+    assert_no_erasure(c, "arg position")
+}
+
+// ── seam 4: an implicit tail return ───────────────────────────────────────────
+// Routes through tc_check_returned_value's pin, the same one br skdxkv moved into the
+// Block arm — so this row also guards that the tail check still runs before the scope
+// pops.
+
+test "a return-only type param resolves from an implicit tail return" {
+    let mut s = rgt_decl()
+    s = s.concat("fn make_int() -> RGT[Int] \{ mk() }\n")
+    s = s.concat("fn main() \{ assert(make_int().s.len() == 0) }\n")
+    let r = compile_test_helpers.compile_and_run(s, "3dpshm_tail_run")
+    if r.exit_code != 0 { io.println("FAIL: tail return — exit {r.exit_code}: {r.err_out}") }
+    assert_eq(r.exit_code, 0)
+    let c = compile_test_helpers.compile_and_emit_c(s, "3dpshm_tail_c")
+    assert_has(c, "blink_mk_Int", "tail return / fn mono")
+    assert_no_erasure(c, "tail return")
+}
+
+// ── the freshness guard ───────────────────────────────────────────────────────
+// Two call sites of ONE generic fn under DIFFERENT annotations must mint DIFFERENT α.
+// A shared α would be bound by whichever site ran first, and the second would either
+// collapse onto that instantiation (one C typedef for two Blink types, the silent
+// failure) or fail to unify. Both kops appear here by design, so this row deliberately
+// does not assert blink_kops_str absent.
+
+test "two call sites under different annotations monomorphize separately" {
+    let mut s = rgt_decl()
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let a: RGT[Int] = mk()\n")
+    s = s.concat("    let b: RGT[Str] = mk()\n")
+    s = s.concat("    a.s.insert(256)\n")
+    s = s.concat("    b.s.insert(\"x\")\n")
+    s = s.concat("    assert(a.s.len() == 1)\n")
+    s = s.concat("    assert(b.s.len() == 1)\n")
+    s = s.concat("    assert(a.s.contains(256))\n")
+    s = s.concat("    assert(b.s.contains(\"x\"))\n")
+    s = s.concat("}\n")
+    let c = emit_c_checked(s, "3dpshm_fresh_c", "freshness")
+    assert_has(c, "} blink_RGT_Int;", "freshness / Int typedef")
+    assert_has(c, "} blink_RGT_Str;", "freshness / Str typedef")
+    assert_has(c, "blink_mk_Int", "freshness / Int fn mono")
+    assert_has(c, "blink_mk_Str", "freshness / Str fn mono")
+    assert_has(c, "blink_kops_i64", "freshness / int vtable for the Int set")
+    assert_has(c, "blink_kops_str", "freshness / str vtable for the Str set")
+    assert_no_erasure(c, "freshness")
+    let r = compile_test_helpers.compile_and_run(s, "3dpshm_fresh_run")
+    if r.exit_code != 0 { io.println("FAIL: freshness — exit {r.exit_code}: {r.err_out}") }
+    assert_eq(r.exit_code, 0)
+}
+
+// ── the positional-alignment guard ────────────────────────────────────────────
+// A mixed signature: A binds from the argument, B is return-only. The minted α must
+// land in slot B. Landing it in slot A would spell RP_Int_Str for an RP[Str, Int] —
+// a valid C identifier, a wrong type, and no diagnostic.
+
+test "a mixed signature mints only the return-only slot, in position" {
+    let mut s = "type RP[A, B] \{ k: A, s: Set[B] }\n"
+    s = s.concat("fn mkp[A, B](k: A) -> RP[A, B] \{ RP \{ k: k, s: Set() } }\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let p: RP[Str, Int] = mkp(\"k\")\n")
+    s = s.concat("    p.s.insert(256)\n")
+    s = s.concat("    assert(p.s.len() == 1)\n")
+    s = s.concat("    assert(p.k == \"k\")\n")
+    s = s.concat("    assert(p.s.contains(256))\n")
+    s = s.concat("}\n")
+    let c = emit_c_checked(s, "3dpshm_mixed_c", "mixed")
+    assert_has(c, "} blink_RP_Str_Int;", "mixed / typedef in declared order")
+    assert_lacks(c, "blink_RP_Int_Str", "mixed / transposed slots")
+    assert_has(c, "blink_mkp_Str_Int", "mixed / fn mono")
+    assert_int_kops(c, "mixed")
+    assert_lacks(c, "_Void", "mixed / string-producer erasure")
+    let r = compile_test_helpers.compile_and_run(s, "3dpshm_mixed_run")
+    if r.exit_code != 0 { io.println("FAIL: mixed — exit {r.exit_code}: {r.err_out}") }
+    assert_eq(r.exit_code, 0)
+}
+
+// ── the genuinely under-determined case becomes a real diagnostic ─────────────
+// Nothing anywhere constrains T. Today this is an I0001 compiler bug; the decision in
+// decisions/under-determined-types.md says it must be error[CannotInferType] instead.
+// This row is the discharge of that decision for the return-only shape.
+
+test "a call whose return-only type param nothing constrains reports E0301" {
+    let mut s = rgt_decl()
+    s = s.concat("fn main() \{ let _e = mk() }\n")
+    let out = compile_test_helpers.compile_and_capture(s, "3dpshm_undet")
+    assert_has(out, "E0301", "under-determined / CannotInferType")
+    assert_lacks(out, "I0001", "under-determined / not an ICE")
+}
+
+// ── pinned boundaries: adjacent shapes that must stay LOUD ────────────────────
+// Neither of these is fixed here. What matters is that they keep failing loudly: a
+// half-resolved slot that silently adopted some other instantiation would be strictly
+// worse than the ICE, because it compiles and links.
+
+test "a call in an if-arm tail still reaches a loud I0001" {
+    let mut s = rgt_decl()
+    s = s.concat("fn pick(c: Bool) -> RGT[Int] \{ if c \{ mk() } else \{ mk() } }\n")
+    s = s.concat("fn main() \{ assert(pick(true).s.len() == 0) }\n")
+    let out = compile_test_helpers.compile_and_capture(s, "3dpshm_ifarm")
+    assert_has(out, "I0001", "if-arm tail / still loud")
+}
+
+test "a mono-calls-mono site with an abstract enclosing type param stays loud" {
+    let mut s = rgt_decl()
+    s = s.concat("fn outer[T](x: T) -> RGT[T] \{ mk() }\n")
+    s = s.concat("fn main() \{ assert(outer(1).s.len() == 0) }\n")
+    let out = compile_test_helpers.compile_and_capture(s, "3dpshm_monomono")
+    assert_has(out, "I0001", "mono-calls-mono / still loud")
+}
+
+// ── the Fn-return regression guard ────────────────────────────────────────────
+// The whole file's most important row for the REST of the repo. `U` appears only in
+// `f: fn(T) -> U` and in the return type — and an `Fn` annotation stores its return in
+// `type_ann`, not in `elements`. A return-only gate built on the elements-only walk
+// classifies U as return-only, mints an α nothing can bind, and E0301s here and at
+// every list_map / map_map_values call in the stdlib. Local twin of lib/std/list.bl's
+// list_map so the failure is attributable to the gate and not to stdlib plumbing.
+
+test "a type param named only inside an Fn param annotation is not return-only" {
+    let mut s = "fn rmap[T, U](xs: List[T], f: fn(T) -> U) -> List[U] \{\n"
+    s = s.concat("    let mut out: List[U] = []\n")
+    s = s.concat("    let mut i = 0\n")
+    s = s.concat("    while i < xs.len() \{\n")
+    s = s.concat("        out.push(f(xs.get(i).unwrap()))\n")
+    s = s.concat("        i = i + 1\n")
+    s = s.concat("    }\n")
+    s = s.concat("    out\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let ys = rmap([1, 2], fn(n: Int) -> Str \{ \"\{n}\" })\n")
+    s = s.concat("    assert(ys.len() == 2)\n")
+    s = s.concat("    assert(ys.get(0).unwrap() == \"1\")\n")
+    s = s.concat("}\n")
+    let out = compile_test_helpers.compile_and_capture(s, "3dpshm_fnret")
+    assert_lacks(out, "E0301", "Fn-return guard / no spurious under-determined error")
+    assert_lacks(out, "I0001", "Fn-return guard / no ICE")
+    let r = compile_test_helpers.compile_and_run(s, "3dpshm_fnret_run")
+    if r.exit_code != 0 { io.println("FAIL: Fn-return guard — exit {r.exit_code}: {r.err_out}") }
+    assert_eq(r.exit_code, 0)
+}
+
+// The stdlib's own HOFs are the live surface the guard above protects — they are the two
+// functions in the whole repo whose U is named only inside an `Fn` annotation, so a gate
+// regression takes them out and this row says so in one line instead of leaving it to a
+// suite-wide bisect.
+//
+// list_map carries the value assertion; map_map_values deliberately asserts only len().
+// Its result Map's VALUE type is not substituted at the call site — `m2.get(k)` lowers to
+// Option_int for a U of Str, so `.unwrap() == "a1"` compares an int64_t against a char*
+// (br ymw81c, and a SIGSEGV when combined with a preceding list_map call). Asserting on
+// that value would make this row's verdict depend on an unrelated live bug; len() is
+// exactly the part that answers the question this row asks.
+test "the stdlib HOFs whose U is Fn-return-only still compile" {
+    let mut s = "import std.list.\{list_map}\n"
+    s = s.concat("import std.map.\{map_map_values}\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let ys = list_map([1, 2], fn(n: Int) -> Str \{ \"\{n}\" })\n")
+    s = s.concat("    assert(ys.len() == 2)\n")
+    s = s.concat("    assert(ys.get(0).unwrap() == \"1\")\n")
+    s = s.concat("    let m: Map[Str, Int] = Map()\n")
+    s = s.concat("    m.insert(\"a\", 1)\n")
+    s = s.concat("    let m2 = map_map_values(m, fn(k: Str, v: Int) -> Str \{ \"\{k}\{v}\" })\n")
+    s = s.concat("    assert(m2.len() == 1)\n")
+    s = s.concat("}\n")
+    let out = compile_test_helpers.compile_and_capture(s, "3dpshm_stdhof")
+    assert_lacks(out, "E0301", "stdlib HOFs / no spurious under-determined error")
+    let r = compile_test_helpers.compile_and_run(s, "3dpshm_stdhof_run")
+    if r.exit_code != 0 { io.println("FAIL: stdlib HOFs — exit {r.exit_code}: {r.err_out}") }
+    assert_eq(r.exit_code, 0)
+}
