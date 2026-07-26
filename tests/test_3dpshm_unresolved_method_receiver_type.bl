@@ -1,0 +1,133 @@
+// br 3dpshm, defect 2 (INDEPENDENT of defect 1): the E0505 UnresolvedMethod diagnostic
+// must not spell an internal unknown as `Void`.
+//
+//     let x: Int? = Some(1)
+//     x.no_such()
+//   => error[UnresolvedMethod]: unresolved method '.no_such' on type Void in 'main'
+//
+// The receiver is an Option. `Void` is a real surface type in Blink, so this does not
+// read as "the compiler does not know" — it reads as a confident, wrong claim about the
+// receiver. That violates the 6-0 decision recorded in decisions/under-determined-types.md
+// (:256) and sections/03_types.md (:1194): the internal unknown must never reach
+// user-facing diagnostic text.
+//
+// WHERE IT COMES FROM. codegen_methods' generic fallback spells the receiver with
+// type_name_from_ct, whose final arm is `else { "Void" }` (codegen_types.bl:4285-4310) —
+// a total function over CTs it knows, and CT_OPTION / CT_RESULT are not among them.
+// So this is not a missing case in a diagnostic; it is a lossy lens being asked a
+// question it cannot answer, and answering anyway.
+//
+// THE FIX ROUTES THROUGH THE TID. typecheck already computed the receiver's real type
+// and memoized it on the node; type_to_str already distinguishes TK_VOID from TK_UNKNOWN
+// and renders instance type-args. Precedent: the ma6n41/tr5gcn CT_VOID reroute at
+// codegen_expr.bl:3055, which recovers a return type off the memoized tid for exactly
+// the same reason (a string tag whose type_from_name is CT_VOID).
+//
+// WHY THIS IS INDEPENDENTLY VERIFIABLE, and why it needs to be. Defect 1 (the return-only
+// type-param mint) makes the ticket's own exhibit COMPILE, which would take its
+// diagnostic with it and leave this half untested. These rows use a receiver that is
+// unambiguously typed and stays unresolvable no matter what inference does:
+// typecheck.bl:7758-7760 handles only unwrap/is_some/is_none for TK_OPTION and falls
+// through silently, and type_name_from_ct has no CT_OPTION arm at all.
+//
+// THE CONTROL IS THE LOAD-BEARING ROW. `Void` here is not a wrong string to be replaced
+// with a better one — it is the wrong SOURCE being consulted. A fix that reads the tid
+// must not change what the already-correct receivers print, or it has traded one lossy
+// lens for another. The List row pins that.
+
+import compile_test_helpers
+import std.io
+
+fn assert_says(out: Str, needle: Str, label: Str) {
+    if !out.contains(needle) { io.println("FAIL: {label} — missing '{needle}'\n{out}") }
+    assert(out.contains(needle))
+}
+
+fn assert_not_void_typed(out: Str, label: Str) {
+    if out.contains("on type Void") {
+        io.println("FAIL: {label} — diagnostic spells the internal unknown as 'Void'\n{out}")
+    }
+    assert(!out.contains("on type Void"))
+}
+
+fn src_recv(decl: Str) -> Str {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    {decl}\n")
+    s = s.concat("    v.no_such()\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "E0505 is in the error catalog" {
+    compile_test_helpers.verify_catalog_entry("E0505", "UnresolvedMethod")
+}
+
+test "an unresolved method on an Option receiver names the Option, not Void" {
+    let out = compile_test_helpers.compile_and_capture(src_recv("let v: Int? = Some(1)"), "3dpshm_opt")
+    assert_says(out, "UnresolvedMethod", "Option receiver / diagnostic fires")
+    assert_not_void_typed(out, "Option receiver")
+    assert_says(out, "Option[Int]", "Option receiver / renders the instance")
+}
+
+test "an unresolved method on a Result receiver names the Result, not Void" {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let v: Result[Int, Str] = Ok(1)\n")
+    s = s.concat("    v.no_such()\n")
+    s = s.concat("}\n")
+    let out = compile_test_helpers.compile_and_capture(s, "3dpshm_res")
+    assert_says(out, "UnresolvedMethod", "Result receiver / diagnostic fires")
+    assert_not_void_typed(out, "Result receiver")
+    assert_says(out, "Result[Int, Str]", "Result receiver / renders the instance")
+}
+
+// ── controls: what already reads correctly must not move ──────────────────────
+// A Map receiver is a control, not a repro: CT_MAP has an arm, so it reads "Map" today.
+// It is here because it is the nearest neighbour of the two rows above — same
+// compound-carrier family, opposite outcome — which is what makes "the CT lens is lossy,
+// not wrong" the accurate description of the defect.
+test "a Map receiver keeps naming the Map" {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let v: Map[Int, Str] = Map()\n")
+    s = s.concat("    v.no_such()\n")
+    s = s.concat("}\n")
+    let out = compile_test_helpers.compile_and_capture(s, "3dpshm_map")
+    assert_says(out, "UnresolvedMethod", "Map receiver / diagnostic fires")
+    assert_not_void_typed(out, "Map receiver")
+}
+
+test "a List receiver still reads List" {
+    let out = compile_test_helpers.compile_and_capture(src_recv("let v = [1]"), "3dpshm_ctrl_list")
+    assert_says(out, "UnresolvedMethod", "List control / diagnostic fires")
+    assert_says(out, "on type List", "List control / unchanged spelling")
+}
+
+test "a Str receiver still reads Str" {
+    let out = compile_test_helpers.compile_and_capture(src_recv("let v = \"s\""), "3dpshm_ctrl_str")
+    assert_says(out, "UnresolvedMethod", "Str control / diagnostic fires")
+    assert_says(out, "on type Str", "Str control / unchanged spelling")
+}
+
+test "a struct receiver still names the struct" {
+    let mut s = "type Pt \{ x: Int }\n"
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let v = Pt \{ x: 1 }\n")
+    s = s.concat("    v.no_such()\n")
+    s = s.concat("}\n")
+    let out = compile_test_helpers.compile_and_capture(s, "3dpshm_ctrl_struct")
+    assert_says(out, "UnresolvedMethod", "struct control / diagnostic fires")
+    assert_says(out, "Pt", "struct control / names the struct")
+    assert_not_void_typed(out, "struct control")
+}
+
+// A receiver that genuinely IS Void must still say Void — it is a real surface type, and
+// the rule this fixes is about the INTERNAL unknown, not about the word.
+test "a genuinely Void receiver still reads Void" {
+    let mut s = "fn nothing() \{ }\n"
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let v = nothing()\n")
+    s = s.concat("    v.no_such()\n")
+    s = s.concat("}\n")
+    let out = compile_test_helpers.compile_and_capture(s, "3dpshm_ctrl_void")
+    assert_says(out, "UnresolvedMethod", "Void control / diagnostic fires")
+    assert_says(out, "on type Void", "Void control / a real Void still reads Void")
+}

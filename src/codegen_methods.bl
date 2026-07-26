@@ -69,7 +69,7 @@ import diagnostics.{
     WITH_PTR_BODY_TOO_COMPLEX, FFI_SCOPE_NOT_WITH_RESOURCE,
 }
 import ast.{NodeKind, is_block_bearing}
-import typecheck.{tc_lookup_node_tid, tc_tid_ct, tc_tid_struct, tc_tid_struct_mono_name, tc_tid_tuple_sname, tc_tid_list_elem, tc_struct_slot_encodable, tc_poly_elem_slot_encodable, tc_seg_from_tid, is_import_module_name, tc_qualifier_to_module_or_self, suggest_module_member}
+import typecheck.{tc_lookup_node_tid, tc_tid_ct, tc_tid_struct, tc_tid_struct_mono_name, tc_tid_tuple_sname, tc_tid_list_elem, tc_struct_slot_encodable, tc_poly_elem_slot_encodable, tc_seg_from_tid, tc_type_str, is_import_module_name, tc_qualifier_to_module_or_self, suggest_module_member}
 
 // Arg offset for trait-qualified builtin calls: MapOps.contains_key(m, k) has receiver at args[0]
 let mut btc_arg_offset: Int = 0
@@ -2207,6 +2207,29 @@ fn emit_io_output(node: Int, trace_op: Str, direct_prefix: Str, newline: Int, vt
 }
 
 @allow(UnrestoredMutation, IncompleteStateRestore)
+// Receiver type as USER-FACING TEXT for the unresolved-method diagnostic. Read the
+// memoized tid first, not the CT: type_name_from_ct is a total function over the CTs it
+// enumerates and answers "Void" for the rest, so an Option or Result receiver — CTs it has
+// no arm for — was reported as `on type Void`. Void is a real surface type in Blink, so
+// that is a confident wrong claim about the receiver rather than a visible unknown, which
+// is what decisions/under-determined-types.md forbids (br 3dpshm). typecheck already
+// computed the receiver's real type; tc_type_str also renders instance type-args
+// (Option[Int], Result[Int, Str]) and distinguishes a genuine TK_VOID from TK_UNKNOWN.
+//
+// Same reroute-off-the-tid shape as the ma6n41/tr5gcn CT_VOID recovery at
+// codegen_expr.bl:3055, and the CT stays the FALLBACK for the same reason: it is what
+// every already-correct receiver (List, Str, a struct) reads today, and "<?>" means the
+// node carries no usable tid — not that the type is unknown. Diagnostic text only; do not
+// route dispatch decisions through this.
+fn receiver_type_name_for_diag(obj_node: Int, obj_type: Int) -> Str {
+    let tid = tc_lookup_node_tid(obj_node)
+    if tid >= 0 {
+        let rendered = tc_type_str(tid)
+        if rendered != "<?>" { return rendered }
+    }
+    type_name_from_ct(obj_type)
+}
+
 pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
     let obj_node = node_obj(node)
     let method = node_method(node)
@@ -5126,7 +5149,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
     }
 
     // Generic fallback — emit diagnostic and produce safe placeholder
-    let recv_type_name = type_name_from_ct(obj_type)
+    let recv_type_name = receiver_type_name_for_diag(obj_node, obj_type)
     // br j2xxyd: `.display()` on a struct/enum with no `impl Display` lands
     // here. Suggest the impl (per the 4q2etk Display design) instead of an
     // empty help string; every other unresolved method keeps the bare help.
