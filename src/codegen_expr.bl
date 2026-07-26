@@ -5329,11 +5329,78 @@ fn tid_native_struct_inst_tid(node: Int, sname: Str) -> Int {
     inst_tid
 }
 
+// The mono-args CSV for a struct-INSTANCE tid, spelled through tc_tid_to_c_tag.
+// Extracted so there is exactly ONE speller: a caller that compares two instances
+// (or a trace that reports what this path WOULD have answered) cannot read a
+// different lens than the path that returns the name.
+fn tid_instance_mono_args_csv(inst_tid: Int, count: Int) -> Str {
+    let mut args = ""
+    let mut j = 0
+    while j < count {
+        if j > 0 { args = args.concat(",") }
+        args = args.concat(tc_tid_to_c_tag(tc_tid_struct_arg_tid(inst_tid, j)))
+        j = j + 1
+    }
+    args
+}
+
+// The struct-INSTANCE tid named by the ENCLOSING FN's RETURN annotation, when that
+// annotation names `sname` with exactly `count` type args.
+//
+// THIS IS A CONFIRMATION ORACLE, NEVER AN INSTANCE SOURCE. Unlike
+// cg_expect_arg_ann / cg_let_target_ann — set and restored per value context, so
+// their presence proves the literal being emitted sits in that context — the return
+// annotation is in scope for the WHOLE body. Adding a return tier to
+// tid_native_struct_inst_tid would therefore mis-name every unrelated literal of the
+// same base: `let y = Box { v: "s" }` inside `fn f() -> Box[Int]` would become
+// blink_Box_Int, because that function's only net is `tc_tid_struct(inst) != sname`
+// and both spell "Box". The single legitimate use is to CHECK that an instance
+// derived from somewhere else spells the same args, which is why the caller compares
+// two CSVs rather than reading this one.
+fn tid_ret_target_inst_tid(sname: Str, count: Int) -> Int {
+    if cg_current_fn_node == -1 { return -1 }
+    let ann = node_type_ann(cg_current_fn_node)
+    if ann == -1 { return -1 }
+    if strip_module_qualifier(node_name(ann)) != sname { return -1 }
+    let tid = tc_lookup_node_tid(ann)
+    if tid < 0 { return -1 }
+    if tc_tid_struct(tid) != sname { return -1 }
+    if tc_tid_struct_arg_count(tid) != count { return -1 }
+    tid
+}
+
+// Whether a STRING-path target annotation naming this struct is in scope — i.e.
+// whether struct_concrete_args_from_target (codegen_types.bl:4553) would select an
+// annotation for it. Mirrors that function's annotation-selection condition exactly,
+// and deliberately NOT its return value: it bails to "" on a compound arg or an
+// arity mismatch, and those sites must still count as string-owned. A site the
+// string tier owns keeps its exact current output, which is what makes the
+// has_ret_target admission below byte-identity-preserving rather than merely
+// probably-equal.
+fn struct_string_target_in_scope(sname: Str) -> Bool {
+    if cg_expect_arg_ann != -1 && strip_module_qualifier(node_name(cg_expect_arg_ann)) == sname { return true }
+    if cg_let_target_ann != -1 && strip_module_qualifier(node_name(cg_let_target_ann)) == sname { return true }
+    false
+}
+
 fn tid_native_struct_mono_args(node: Int, sname: Str) -> Str {
     let inst_tid = tid_native_struct_inst_tid(node, sname)
-    if inst_tid < 0 { return "" }
+    // Which of this function's several declines a caller actually hit. The two that
+    // look alike from outside — "no instance tid names this struct" (inst_tid < 0 /
+    // count < 1, i.e. the memo holds only the BARE base) versus "the instance is
+    // concrete but no admission reason fired" (the has_compound/has_bound_metavar
+    // gate below) — produce the identical observable, an I0001 spelling the string
+    // path's answer. Distinguishing them is the difference between a typecheck memo
+    // bug and a missing codegen tier, and it is not inferable from the ICE text.
+    if inst_tid < 0 {
+        dbg_trace("retmono", "sname={sname} decline=no_inst_tid")
+        return ""
+    }
     let count = tc_tid_struct_arg_count(inst_tid)
-    if count < 1 { return "" }
+    if count < 1 {
+        dbg_trace("retmono", "sname={sname} inst_tid={inst_tid} decline=bare_base count={count}")
+        return ""
+    }
     let mut has_compound = 0
     // A slot holding a metavar that tc_pin_generic_args_from_binds bound IN PLACE:
     // the non-resolving read says "no concrete storage" while the resolving read
@@ -5353,9 +5420,18 @@ fn tid_native_struct_mono_args(node: Int, sname: Str) -> Str {
     // if either side stops resolving, bound-metavar instances silently lose their
     // tids again.
     let mut has_bound_metavar = 0
+    // Every slot a plain scalar — the precondition for the has_ret_target admission
+    // below, and the reason that admission cannot inherit the bwyfy1 two-lens
+    // divergence: that divergence lives only in tc_tid_to_c_tag's TK_STRUCT/TK_ENUM
+    // arm, which this flag excludes. Bare-struct slots are restricted out too even
+    // though the loop tolerates them (their string side reads get_var_struct, which
+    // may keep a module qualifier the tid side strips — unprovable without auditing
+    // every writer; br f6ytg4).
+    let mut all_plain_scalar = 1
     let mut i = 0
     while i < count {
         let slot = tc_tid_struct_arg_tid(inst_tid, i)
+        if !tid_slot_is_plain_scalar(slot) { all_plain_scalar = 0 }
         if tc_tid_ct(slot) == -1 && tc_tid_ct_resolved(slot) != -1 {
             has_bound_metavar = 1
         }
@@ -5385,15 +5461,43 @@ fn tid_native_struct_mono_args(node: Int, sname: Str) -> Str {
         }
         i = i + 1
     }
-    if has_compound == 0 && has_bound_metavar == 0 { return "" }
-    let mut args = ""
-    let mut j = 0
-    while j < count {
-        if j > 0 { args = args.concat(",") }
-        args = args.concat(tc_tid_to_c_tag(tc_tid_struct_arg_tid(inst_tid, j)))
-        j = j + 1
+    if has_compound == 0 && has_bound_metavar == 0 {
+        // Third admission reason: has_ret_target. A fully-concrete all-scalar instance
+        // that no string-path target names — `fn a() -> GKV[Int, Str] { GKV { m: mkmap() } }`
+        // — is knowable here and nowhere else: typecheck bound K:=Int, V:=Str as real
+        // concrete tids on the literal (tc_struct_lit_instance_tid), while the string
+        // path has no return tier at all by design (nqq29j) and infer_struct_type_args
+        // has no CT_MAP/CT_SET arm, so both halves declined and the site ICEd I0001
+        // with 'Void,Void' (br 5htahp).
+        //
+        // The enclosing fn's return annotation confirms, and only confirms: the two
+        // CSVs must be BYTE-IDENTICAL. That equality is what makes this structural
+        // defence rather than trust —
+        //   * a nested inner literal declines: `-> Box[Box[Int]]`'s inner spells "Int"
+        //     while the return target spells "Box_Int" (br ns7qdm's shape),
+        //   * a declared/body mismatch declines, so a program returning GKV[Str,Int]
+        //     from a GKV[Int,Str] fn still reaches a loud I0001 even if the E0300 that
+        //     now catches it upstream (br skdxkv) ever regresses. A wrong guess here
+        //     would be a silent miscompile that only gcc could catch — decline instead.
+        // The no-string-target gate keeps every site the string tier already answers on
+        // its exact current output: the working annotated twin
+        // (`let g: GKV[Int, Str] = ...`) declines here with this same CSV and is
+        // answered by the let-target tier, so byte-identity is preserved by
+        // construction, not by the two lenses happening to agree.
+        if all_plain_scalar != 0 && !struct_string_target_in_scope(sname) {
+            let csv = tid_instance_mono_args_csv(inst_tid, count)
+            let ret_tid = tid_ret_target_inst_tid(sname, count)
+            if ret_tid >= 0 && tid_instance_mono_args_csv(ret_tid, count) == csv {
+                dbg_trace("retmono", "sname={sname} inst_tid={inst_tid} count={count} admit=has_ret_target csv={csv}")
+                return csv
+            }
+            dbg_trace("retmono", "sname={sname} inst_tid={inst_tid} count={count} decline=ret_target_mismatch csv={csv} ret_tid={ret_tid}")
+            return ""
+        }
+        dbg_trace("retmono", "sname={sname} inst_tid={inst_tid} count={count} decline=no_admission_reason csv={tid_instance_mono_args_csv(inst_tid, count)}")
+        return ""
     }
-    args
+    tid_instance_mono_args_csv(inst_tid, count)
 }
 
 // Recover the per-slot arg tids for a struct-INSTANCE tid, gated on

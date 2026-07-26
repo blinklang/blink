@@ -1,0 +1,527 @@
+// br 5htahp: a generic-struct literal in return position whose type arguments are
+// ALREADY concrete in typecheck's memoized instance tid must be allowed to spell its
+// own mono name. Both of the ticket's MVCEs ICEd:
+//
+//     type GKV[K, V] { m: Map[K, V] }
+//     fn a() -> GKV[Int, Str] { GKV { m: mkmap() } }          // MVCE 1
+//     fn a() -> GKV[Int, Str] { let m: Map[Int, Str] = Map(); return GKV { m: m } }
+//                                                              // MVCE 2
+//   internal compiler error[I0001]: type parameter of 'GKV' reached monomorphization
+//   unsolved (mono args 'Void,Void')
+//
+// TYPECHECK IS CORRECT AND ALWAYS WAS. Measured with the `retmono` dbg_trace channel
+// on the pre-fix tree, both MVCEs reach codegen with a fully concrete instance:
+//     [dbg:retmono] sname=GKV inst_tid=441 count=2 decline=no_admission_reason csv=Int,Str
+// The tid path already computes "Int,Str". It threw the answer away at the admission
+// gate (`has_compound == 0 && has_bound_metavar == 0`), and the string path has no
+// return tier by design (nqq29j) — struct_concrete_args_from_target reads only
+// cg_expect_arg_ann / cg_let_target_ann, and infer_struct_type_args has no
+// CT_MAP/CT_SET arm. Both halves declined a question they could both answer.
+//
+// THE FIX IS ADMISSION, NOT SPELLING: a third admission reason, has_ret_target,
+// gated on (a) every slot a plain scalar, (b) NO string-target tier in scope, and
+// (c) the enclosing fn's return-annotation instance tid spelling a BYTE-IDENTICAL
+// mono-args CSV.
+//
+// WHY (b) IS LOAD-BEARING. The working annotated-target twin declines at the SAME
+// gate with the SAME csv=Int,Str:
+//     let g: GKV[Int, Str] = GKV { m: Map() }
+//     [dbg:retmono] sname=GKV inst_tid=430 count=2 decline=no_admission_reason csv=Int,Str
+// It compiles today only because the string let-target tier answers instead. Every
+// currently-working shape reaches this decline, so admitting them to the tid path
+// would move them off the string path and forfeit byte-identity. Condition (b) is
+// what keeps them where they are.
+//
+// WHY (c) IS DEFENCE, NOT TRUST. The return annotation is in scope for the WHOLE
+// body, unlike cg_expect_arg_ann / cg_let_target_ann which are set and restored per
+// value context. A return TIER on tid_native_struct_inst_tid would therefore misname
+// `let y = Box { v: "s" }` inside `fn f() -> Box[Int]` as blink_Box_Int — its only
+// net is `tc_tid_struct(inst) != sname`, and both are "Box". CSV equality makes that
+// sibling decline, makes ns7qdm's nested inner literal decline ("Int" != "Box_Int"),
+// and makes a declared/body mismatch decline — so a mismatched program still reaches
+// a loud I0001 even if skdxkv's E0300 ever regresses. The return annotation is a
+// CONFIRMATION ORACLE, never an instance source.
+//
+// WHY THE kops ASSERTION IS THE LOAD-BEARING ONE (same reasoning as y1n3ck). A fix
+// that gets the mono NAME right while leaving the Map field's element type unresolved
+// emits blink_kops_str for an Int key. 256 and 512 both end in a 0x00 byte, so under
+// the string hasher they collide as the empty string — the br hnyqe4 corruption
+// signature. `blink_kops_i64` present AND `blink_kops_str` absent separates the
+// correct fix from that one, and the 256/512 round-trip is the independent witness.
+
+import compile_test_helpers
+import std.io
+
+fn assert_has(c: Str, needle: Str, label: Str) {
+    if !c.contains(needle) { io.println("FAIL: {label} — missing '{needle}'") }
+    assert(c.contains(needle))
+}
+
+fn assert_lacks(c: Str, needle: Str, label: Str) {
+    if c.contains(needle) { io.println("FAIL: {label} — forbidden '{needle}' present") }
+    assert(!c.contains(needle))
+}
+
+// Per CLAUDE.md the `_Void` grep is a LOWER BOUND: the tid producers erase by passing
+// the binder through unchanged (blink_GKV_K / _V, br pt4hsy) and a def-side field can
+// erase under a fully correct mono name (blink_map_void, br w4c0py). All three
+// families on every C-emitting row.
+fn assert_no_erasure(c: Str, label: Str) {
+    assert_lacks(c, "_Void", "{label} / string-producer erasure")
+    assert_lacks(c, "blink_GKV_K", "{label} / bare-binder K passthrough")
+    assert_lacks(c, "blink_GKV_V", "{label} / bare-binder V passthrough")
+    assert_lacks(c, "blink_map_void", "{label} / erased Map carrier field")
+}
+
+// The Box[T] rows' twin. Same three families, spelled for this shape: Box's field is a
+// plain scalar `v: T`, so there is no carrier to erase and the third family collapses
+// onto the bare binder — which is the family the `_Void` grep structurally cannot see,
+// and the only one that would catch a Box row erasing.
+fn assert_no_box_erasure(c: Str, label: Str) {
+    assert_lacks(c, "_Void", "{label} / string-producer erasure")
+    assert_lacks(c, "blink_Box_T", "{label} / bare-binder T passthrough")
+}
+
+// ANNOTATED-HELPER form. The ticket's own spelling is `fn mkmap() -> Map[Int, Str] {
+// Map() }`, which is br farq9f: a declared Map/Set return does not pin an empty
+// ctor's element type, so it emits blink_map_new(&blink_kops_str) for an Int key and
+// SEGFAULTS at the first insert (the string hasher dereferences 256 as a char*). That
+// is an independent P0 defect, not this one. Every row that runs or inspects kops uses
+// the annotated-LOCAL helper below; the literal form gets its own compile-only row so
+// this file records the difference instead of tripping over it.
+fn mkmap_annotated() -> Str {
+    let mut s = "fn mkmap() -> Map[Int, Str] \{\n"
+    s = s.concat("    let m: Map[Int, Str] = Map()\n")
+    s = s.concat("    m\n")
+    s = s.concat("}\n")
+    s
+}
+
+// Both keys carry a 0x00 low byte, which is what makes the kops choice observable.
+fn gkv_body() -> Str {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let g = a()\n")
+    s = s.concat("    g.m.insert(256, \"lo\")\n")
+    s = s.concat("    g.m.insert(512, \"hi\")\n")
+    s = s.concat("    assert_eq(g.m.len(), 2)\n")
+    s = s.concat("    assert(g.m.get(256).unwrap() == \"lo\")\n")
+    s = s.concat("    assert(g.m.get(512).unwrap() == \"hi\")\n")
+    s = s.concat("}\n")
+    s
+}
+
+fn gkv_decl() -> Str {
+    "type GKV[K, V] \{ m: Map[K, V] }\n"
+}
+
+// MVCE 1: the field value is a CALL whose declared return names the concrete Map.
+fn src_mvce1() -> Str {
+    let mut s = gkv_decl()
+    s = s.concat(mkmap_annotated())
+    s = s.concat("fn a() -> GKV[Int, Str] \{ GKV \{ m: mkmap() } }\n")
+    s.concat(gkv_body())
+}
+
+// MVCE 2: the field value is an annotated local, returned explicitly.
+fn src_mvce2() -> Str {
+    let mut s = gkv_decl()
+    s = s.concat("fn a() -> GKV[Int, Str] \{\n")
+    s = s.concat("    let m: Map[Int, Str] = Map()\n")
+    s = s.concat("    return GKV \{ m: m }\n")
+    s = s.concat("}\n")
+    s.concat(gkv_body())
+}
+
+// MVCE 2's implicit-tail twin. r9krgr/skdxkv made the two spellings agree in
+// typecheck; this asserts they also agree in codegen.
+fn src_mvce2_tail() -> Str {
+    let mut s = gkv_decl()
+    s = s.concat("fn a() -> GKV[Int, Str] \{\n")
+    s = s.concat("    let m: Map[Int, Str] = Map()\n")
+    s = s.concat("    GKV \{ m: m }\n")
+    s = s.concat("}\n")
+    s.concat(gkv_body())
+}
+
+// ── the ICE is gone and the mono name is right ───────────────────────────────
+
+test "MVCE 1: a concrete call-valued field in return position no longer ICEs" {
+    compile_test_helpers.expect_no_error(src_mvce1(), "5htahp_mvce1_ice", "I0001")
+}
+
+test "MVCE 2: a concrete annotated-local field in return position no longer ICEs" {
+    compile_test_helpers.expect_no_error(src_mvce2(), "5htahp_mvce2_ice", "I0001")
+}
+
+test "MVCE 2's implicit-tail twin no longer ICEs" {
+    compile_test_helpers.expect_no_error(src_mvce2_tail(), "5htahp_mvce2_tail_ice", "I0001")
+}
+
+test "MVCE 1 spells blink_GKV_Int_Str with no erasure" {
+    let c = compile_test_helpers.compile_and_emit_c(src_mvce1(), "5htahp_mvce1_c")
+    assert_has(c, "blink_GKV_Int_Str", "MVCE 1 mono name")
+    assert_no_erasure(c, "MVCE 1")
+}
+
+test "MVCE 2 spells blink_GKV_Int_Str with no erasure" {
+    let c = compile_test_helpers.compile_and_emit_c(src_mvce2(), "5htahp_mvce2_c")
+    assert_has(c, "blink_GKV_Int_Str", "MVCE 2 mono name")
+    assert_no_erasure(c, "MVCE 2")
+}
+
+// ── the kops vtable, and the runtime witness that it is the right one ────────
+
+test "MVCE 1 selects the int kops vtable, not the string one" {
+    let c = compile_test_helpers.compile_and_emit_c(src_mvce1(), "5htahp_mvce1_kops")
+    assert_has(c, "blink_kops_i64", "MVCE 1 int kops present")
+    assert_lacks(c, "blink_kops_str", "MVCE 1 string kops absent")
+}
+
+test "MVCE 2 selects the int kops vtable, not the string one" {
+    let c = compile_test_helpers.compile_and_emit_c(src_mvce2(), "5htahp_mvce2_kops")
+    assert_has(c, "blink_kops_i64", "MVCE 2 int kops present")
+    assert_lacks(c, "blink_kops_str", "MVCE 2 string kops absent")
+}
+
+// The independent witness: under blink_kops_str, 256 and 512 collide as the empty
+// string and this reports len 1 with one clobbered value.
+test "MVCE 1 round-trips 256 and 512 at runtime" {
+    let r = compile_test_helpers.compile_and_run(src_mvce1(), "5htahp_mvce1_run")
+    if r.exit_code != 0 { io.println("FAIL: MVCE 1 runtime — exit {r.exit_code}: {r.err_out}") }
+    assert_eq(r.exit_code, 0)
+}
+
+test "MVCE 2 round-trips 256 and 512 at runtime" {
+    let r = compile_test_helpers.compile_and_run(src_mvce2(), "5htahp_mvce2_run")
+    if r.exit_code != 0 { io.println("FAIL: MVCE 2 runtime — exit {r.exit_code}: {r.err_out}") }
+    assert_eq(r.exit_code, 0)
+}
+
+// ── the mismatch must STILL be rejected ──────────────────────────────────────
+// CSV equality is what makes this decline. Without it, a return tier would name the
+// literal after the declared return and silently emit a GKV[Str,Int] value into a
+// blink_GKV_Int_Str slot. skdxkv's E0300 catches these today; these rows assert the
+// codegen gate independently, so a regression in the typecheck compare cannot turn
+// this shape into a silent miscompile.
+
+test "a mismatched generic arg is still rejected (annotated local)" {
+    let mut s = gkv_decl()
+    s = s.concat("fn a() -> GKV[Int, Str] \{\n")
+    s = s.concat("    let m: Map[Str, Int] = Map()\n")
+    s = s.concat("    return GKV \{ m: m }\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{ let _g = a() }\n")
+    let out = compile_test_helpers.compile_and_capture(s, "5htahp_mismatch_local")
+    if !out.contains("E0300") && !out.contains("I0001") {
+        io.println("FAIL: a declared/body generic-arg mismatch produced neither E0300 nor I0001")
+    }
+    assert(out.contains("E0300") || out.contains("I0001"))
+}
+
+test "a mismatched generic arg is still rejected (call-valued field)" {
+    let mut s = gkv_decl()
+    s = s.concat("fn mkmap() -> Map[Str, Int] \{\n")
+    s = s.concat("    let m: Map[Str, Int] = Map()\n")
+    s = s.concat("    m\n")
+    s = s.concat("}\n")
+    s = s.concat("fn a() -> GKV[Int, Str] \{ GKV \{ m: mkmap() } }\n")
+    s = s.concat("fn main() \{ let _g = a() }\n")
+    let out = compile_test_helpers.compile_and_capture(s, "5htahp_mismatch_call")
+    if !out.contains("E0300") && !out.contains("I0001") {
+        io.println("FAIL: a mismatched call-valued field produced neither E0300 nor I0001")
+    }
+    assert(out.contains("E0300") || out.contains("I0001"))
+}
+
+// ── sibling distinctness ─────────────────────────────────────────────────────
+// Two instantiations in ONE program must land on two C types. Deliberately does NOT
+// assert blink_kops_str absent: GKV[Str, Int] has a Str key, so the string vtable is
+// CORRECT here and asserting its absence would be asserting a miscompile.
+
+test "sibling instances get distinct mono names in one program" {
+    let mut s = gkv_decl()
+    s = s.concat(mkmap_annotated())
+    s = s.concat("fn mkmap2() -> Map[Str, Int] \{\n")
+    s = s.concat("    let m: Map[Str, Int] = Map()\n")
+    s = s.concat("    m\n")
+    s = s.concat("}\n")
+    s = s.concat("fn a() -> GKV[Int, Str] \{ GKV \{ m: mkmap() } }\n")
+    s = s.concat("fn b() -> GKV[Str, Int] \{ GKV \{ m: mkmap2() } }\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let g = a()\n")
+    s = s.concat("    let h = b()\n")
+    s = s.concat("    g.m.insert(256, \"lo\")\n")
+    s = s.concat("    h.m.insert(\"k\", 7)\n")
+    s = s.concat("    assert_eq(g.m.len(), 1)\n")
+    s = s.concat("    assert_eq(h.m.len(), 1)\n")
+    s = s.concat("}\n")
+    let c = compile_test_helpers.compile_and_emit_c(s, "5htahp_siblings")
+    assert_has(c, "blink_GKV_Int_Str", "sibling Int,Str")
+    assert_has(c, "blink_GKV_Str_Int", "sibling Str,Int")
+    assert_no_erasure(c, "siblings")
+}
+
+test "sibling instances round-trip independently at runtime" {
+    let mut s = gkv_decl()
+    s = s.concat(mkmap_annotated())
+    s = s.concat("fn mkmap2() -> Map[Str, Int] \{\n")
+    s = s.concat("    let m: Map[Str, Int] = Map()\n")
+    s = s.concat("    m\n")
+    s = s.concat("}\n")
+    s = s.concat("fn a() -> GKV[Int, Str] \{ GKV \{ m: mkmap() } }\n")
+    s = s.concat("fn b() -> GKV[Str, Int] \{ GKV \{ m: mkmap2() } }\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let g = a()\n")
+    s = s.concat("    let h = b()\n")
+    s = s.concat("    g.m.insert(256, \"lo\")\n")
+    s = s.concat("    g.m.insert(512, \"hi\")\n")
+    s = s.concat("    h.m.insert(\"k\", 7)\n")
+    s = s.concat("    assert_eq(g.m.len(), 2)\n")
+    s = s.concat("    assert(g.m.get(256).unwrap() == \"lo\")\n")
+    s = s.concat("    assert(g.m.get(512).unwrap() == \"hi\")\n")
+    s = s.concat("    assert_eq(h.m.get(\"k\").unwrap(), 7)\n")
+    s = s.concat("}\n")
+    let r = compile_test_helpers.compile_and_run(s, "5htahp_siblings_run")
+    if r.exit_code != 0 { io.println("FAIL: siblings runtime — exit {r.exit_code}: {r.err_out}") }
+    assert_eq(r.exit_code, 0)
+}
+
+// ── the same-named-sibling decline: the reason (c) exists ────────────────────
+// A NON-return literal of the same base inside a fn whose return names that base.
+// The return annotation is in scope for the whole body, so a naive return tier would
+// name `Box { v: "s" }` blink_Box_Int — its only net would be
+// `tc_tid_struct(inst) != sname`, and both are "Box".
+//
+// The local is deliberately UNANNOTATED, which is what makes this row exercise gate
+// (c) and not gate (b): an annotated `let y: Box[Str]` would put a string target in
+// scope and decline one gate earlier, leaving CSV equality untested. Measured with
+// BLINK_TRACE_CHANNELS=retmono on this exact program — two admission decisions in one
+// function body, discriminated on nothing but the CSV:
+//     [dbg:retmono] sname=Box inst_tid=430 count=1 decline=ret_target_mismatch csv=Str
+//     [dbg:retmono] sname=Box inst_tid=432 count=1 admit=has_ret_target csv=Int
+
+test "a same-named non-return sibling is not renamed by the return annotation" {
+    let mut s = "type Box[T] \{ v: T }\n"
+    s = s.concat("fn f() -> Box[Int] \{\n")
+    s = s.concat("    let y = Box \{ v: \"s\" }\n")
+    s = s.concat("    assert(y.v == \"s\")\n")
+    s = s.concat("    return Box \{ v: 1 }\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let b = f()\n")
+    s = s.concat("    assert_eq(b.v, 1)\n")
+    s = s.concat("}\n")
+    let c = compile_test_helpers.compile_and_emit_c(s, "5htahp_same_named")
+    assert_has(c, "blink_Box_Int", "return instance")
+    assert_has(c, "blink_Box_Str", "non-return sibling keeps its own instance")
+    assert_no_box_erasure(c, "same-named siblings")
+    let r = compile_test_helpers.compile_and_run(s, "5htahp_same_named_run")
+    if r.exit_code != 0 { io.println("FAIL: same-named siblings runtime — exit {r.exit_code}: {r.err_out}") }
+    assert_eq(r.exit_code, 0)
+}
+
+// The gate-(b) twin of the row above: the same sibling WITH a let annotation, which is
+// the shape the string target tier already owns. It must keep its own instance for a
+// different reason — struct_string_target_in_scope declines before the CSV is ever
+// compared — and that is precisely the decline that preserves byte-identity for every
+// currently-working annotated shape in the repo. Both gates pinned separately, so
+// narrowing or widening either one has a row that notices.
+
+test "an annotated same-named sibling stays on the string target tier" {
+    let mut s = "type Box[T] \{ v: T }\n"
+    s = s.concat("fn f() -> Box[Int] \{\n")
+    s = s.concat("    let y: Box[Str] = Box \{ v: \"s\" }\n")
+    s = s.concat("    assert(y.v == \"s\")\n")
+    s = s.concat("    return Box \{ v: 1 }\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let b = f()\n")
+    s = s.concat("    assert_eq(b.v, 1)\n")
+    s = s.concat("}\n")
+    let c = compile_test_helpers.compile_and_emit_c(s, "5htahp_same_named_ann")
+    assert_has(c, "blink_Box_Int", "return instance")
+    assert_has(c, "blink_Box_Str", "annotated sibling keeps its own instance")
+    assert_no_box_erasure(c, "annotated same-named siblings")
+    let r = compile_test_helpers.compile_and_run(s, "5htahp_same_named_ann_run")
+    if r.exit_code != 0 { io.println("FAIL: annotated same-named siblings runtime — exit {r.exit_code}: {r.err_out}") }
+    assert_eq(r.exit_code, 0)
+}
+
+// ── the nested-inner decline (ns7qdm's shape) ───────────────────────────────
+// Under `-> Box[Box[Int]]` the INNER literal's own CSV is "Int" while the return
+// annotation's is "Box_Int". CSV equality declines the inner, so the outer's existing
+// handling stays authoritative and the inner is not misnamed after the outer.
+//
+// Inner written INLINE rather than via an annotated local, for the same reason as the
+// row above: an annotated local would decline at gate (b) and never reach the CSV
+// compare. Measured on this program:
+//     [dbg:retmono] sname=Box inst_tid=434 count=1 decline=ret_target_mismatch csv=Int ret_tid=199
+// The outer literal never reaches this gate at all — its slot is a struct instance, so
+// the slot loop bails to the string path before any admission reason is considered.
+
+test "a nested inner literal is not named after the outer return annotation" {
+    let mut s = "type Box[T] \{ v: T }\n"
+    s = s.concat("fn f() -> Box[Box[Int]] \{ Box \{ v: Box \{ v: 3 } } }\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let b = f()\n")
+    s = s.concat("    assert_eq(b.v.v, 3)\n")
+    s = s.concat("}\n")
+    let c = compile_test_helpers.compile_and_emit_c(s, "5htahp_nested")
+    assert_has(c, "blink_Box_Box_Int", "outer instance")
+    assert_has(c, "blink_Box_Int", "inner instance")
+    assert_no_box_erasure(c, "nested")
+    let r = compile_test_helpers.compile_and_run(s, "5htahp_nested_run")
+    if r.exit_code != 0 { io.println("FAIL: nested runtime — exit {r.exit_code}: {r.err_out}") }
+    assert_eq(r.exit_code, 0)
+}
+
+// The annotated-local nested twin, kept because it was the ns7qdm spelling and because
+// it is the gate-(b) half of the same shape.
+
+test "a nested inner literal via an annotated local keeps its own instance" {
+    let mut s = "type Box[T] \{ v: T }\n"
+    s = s.concat("fn f() -> Box[Box[Int]] \{\n")
+    s = s.concat("    let inner: Box[Int] = Box \{ v: 3 }\n")
+    s = s.concat("    return Box \{ v: inner }\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let b = f()\n")
+    s = s.concat("    assert_eq(b.v.v, 3)\n")
+    s = s.concat("}\n")
+    let c = compile_test_helpers.compile_and_emit_c(s, "5htahp_nested_ann")
+    assert_has(c, "blink_Box_Box_Int", "outer instance")
+    assert_has(c, "blink_Box_Int", "inner instance")
+    assert_no_box_erasure(c, "nested annotated")
+    let r = compile_test_helpers.compile_and_run(s, "5htahp_nested_ann_run")
+    if r.exit_code != 0 { io.println("FAIL: nested annotated runtime — exit {r.exit_code}: {r.err_out}") }
+    assert_eq(r.exit_code, 0)
+}
+
+// ── an impl method's return ──────────────────────────────────────────────────
+// cg_current_fn_node is set and restored by every fn emitter, methods included, so
+// the return-annotation read must work here too. (Note: the declared-return TYPECHECK
+// compare does not reach methods at all — br ya8qyf — so this row exercises the
+// codegen tier on its own, which is exactly why it is worth having.)
+
+test "an impl method's concrete return instance monomorphizes" {
+    let mut s = gkv_decl()
+    s = s.concat(mkmap_annotated())
+    s = s.concat("type Holder \{ n: Int }\n")
+    s = s.concat("trait Maker \{ fn make(self) -> GKV[Int, Str] }\n")
+    s = s.concat("impl Maker for Holder \{\n")
+    s = s.concat("    fn make(self) -> GKV[Int, Str] \{ GKV \{ m: mkmap() } }\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let h = Holder \{ n: 1 }\n")
+    s = s.concat("    let g = h.make()\n")
+    s = s.concat("    g.m.insert(256, \"lo\")\n")
+    s = s.concat("    g.m.insert(512, \"hi\")\n")
+    s = s.concat("    assert_eq(g.m.len(), 2)\n")
+    s = s.concat("    assert(g.m.get(256).unwrap() == \"lo\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_no_error(s, "5htahp_impl_ice", "I0001")
+    let c = compile_test_helpers.compile_and_emit_c(s, "5htahp_impl_c")
+    assert_has(c, "blink_GKV_Int_Str", "impl-method mono name")
+    assert_has(c, "blink_kops_i64", "impl-method int kops")
+    assert_lacks(c, "blink_kops_str", "impl-method string kops absent")
+    assert_no_erasure(c, "impl method")
+    let r = compile_test_helpers.compile_and_run(s, "5htahp_impl_run")
+    if r.exit_code != 0 { io.println("FAIL: impl-method runtime — exit {r.exit_code}: {r.err_out}") }
+    assert_eq(r.exit_code, 0)
+}
+
+// ── shapes that must STAY loud ───────────────────────────────────────────────
+
+// A PHANTOM type param: no field mentions T, so nothing can ever determine it and the
+// return annotation must not be mistaken for a determination. Note the annotation
+// SAYS W[Int] — this row is precisely the case where believing it would be wrong,
+// because there is no instance to confirm.
+test "a phantom generic type param still ICEs" {
+    let mut s = "type W[T] \{ n: Int }\n"
+    s = s.concat("fn f() -> W[Int] \{ W \{ n: 1 } }\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let w = f()\n")
+    s = s.concat("    assert_eq(w.n, 1)\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_compile_error(s, "5htahp_phantom", "I0001")
+}
+
+// A CLOSURE's own return annotation is not a mono target yet, and the reason is on the
+// typecheck side, not here: tc_check_body's Closure arm resolves param types but never
+// reads node_type_ann(closure), so no instance tid is memoized on the annotation and
+// tid_ret_target_inst_tid reads -1 (br n8mmry, which also covers the larger half of the
+// same hole — a closure's declared return is never compared against its body at all).
+// The confirmation oracle failing can only ever DECLINE, so this is a loud ICE and
+// never a miscompile. Pinned as a tripwire: when n8mmry lands this goes red, and the
+// fix is to flip it to the MVCE-1 assertions (no I0001, blink_GKV_Int_Str, kops_i64,
+// assert_no_erasure) — the admission logic needs no change for that to work.
+test "a closure's own return annotation does not yet supply a mono target (loud ICE)" {
+    let mut s = gkv_decl()
+    s = s.concat(mkmap_annotated())
+    s = s.concat("fn a() -> GKV[Int, Str] \{\n")
+    s = s.concat("    let c = fn() -> GKV[Int, Str] \{ GKV \{ m: mkmap() } }\n")
+    s = s.concat("    c()\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let g = a()\n")
+    s = s.concat("    g.m.insert(256, \"lo\")\n")
+    s = s.concat("    assert(g.m.get(256).unwrap() == \"lo\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_compile_error(s, "5htahp_closure_ret", "I0001")
+}
+
+// ── a type alias as a type argument: pinned as UNREACHABLE, not as admitted ──
+// This row was written as a probe — does an alias reach the mono name as "Int", or
+// leak the alias spelling into a second, divergent C type? The answer is neither: a
+// `type MyInt = Int` key never reaches codegen at all. validate_map_key reads the
+// annotation NAME, finds "MyInt" in named_type_map, and rejects it as a user type
+// with no @derive(Hash) — a separate defect (br 0kvdef), a separate mechanism, so
+// 5htahp does not own it and must not be blocked on it.
+//
+// Pinned rather than dropped, so the row itself is the tripwire: when 0kvdef lands
+// this test goes red, and the fix is to restore the probe's real assertions — the
+// alias must resolve to "Int" on BOTH sides of the CSV comparison, since a
+// one-sided alias spelling would decline an admissible shape or, worse, admit one
+// whose two lenses disagree. Those assertions are kept below, commented, so the
+// answer this row is really asking for is not lost.
+test "a type-aliased Map key is rejected before it can reach the mono name" {
+    let mut s = "type MyInt = Int\n"
+    s = s.concat(gkv_decl())
+    s = s.concat("fn mkmap() -> Map[MyInt, Str] \{\n")
+    s = s.concat("    let m: Map[MyInt, Str] = Map()\n")
+    s = s.concat("    m\n")
+    s = s.concat("}\n")
+    s = s.concat("fn a() -> GKV[MyInt, Str] \{ GKV \{ m: mkmap() } }\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let g = a()\n")
+    s = s.concat("    g.m.insert(256, \"lo\")\n")
+    s = s.concat("    assert_eq(g.m.len(), 1)\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_compile_error(s, "5htahp_alias", "E1400")
+    // When 0kvdef lands, replace the line above with:
+    //   let c = compile_test_helpers.compile_and_emit_c(s, "5htahp_alias")
+    //   assert_lacks(c, "blink_GKV_MyInt_Str", "alias must not leak into the mono name")
+    //   assert_lacks(c, "_Void", "alias / string-producer erasure")
+    //   assert_lacks(c, "blink_map_void", "alias / erased Map carrier field")
+    //   assert_has(c, "blink_GKV_Int_Str", "alias resolves to the underlying Int")
+}
+
+// ── the farq9f boundary, recorded not tripped over ──────────────────────────
+// The ticket's own helper spelling. A declared Map return does not pin an empty
+// ctor's element type (br farq9f, P0), so this emits blink_map_new(&blink_kops_str)
+// for an Int key and SEGFAULTS at the first insert. That is a DIFFERENT defect, so
+// this row asserts only what 5htahp owns — the struct's mono name — and does not run
+// the program or assert its kops. When farq9f lands, fold this into the rows above.
+test "the literal-ctor helper form still monomorphizes the struct correctly" {
+    let mut s = gkv_decl()
+    s = s.concat("fn mkmap() -> Map[Int, Str] \{ Map() }\n")
+    s = s.concat("fn a() -> GKV[Int, Str] \{ GKV \{ m: mkmap() } }\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let g = a()\n")
+    s = s.concat("    assert_eq(g.m.len(), 0)\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_no_error(s, "5htahp_farq9f_ice", "I0001")
+    let c = compile_test_helpers.compile_and_emit_c(s, "5htahp_farq9f_c")
+    assert_has(c, "blink_GKV_Int_Str", "literal-ctor helper mono name")
+    assert_lacks(c, "_Void", "literal-ctor helper / string-producer erasure")
+}
