@@ -4449,15 +4449,32 @@ pub fn mono_name_from_ann(base_name: Str, ann_node: Int, tparams_sl: Int, segs: 
         let elem = sublist_get(elems, ai)
         let raw_name = node_name(elem)
         let resolved_arg = resolve_tparam_seg(raw_name, tparams_sl, segs)
-        // A NESTED generic-struct-instance arg (`Box[Box[Int]]` → outer arg
-        // `Box[Int]`) must spell its own full recursive stem (Box_Int), matching the
-        // tid-native tc_tid_struct_mono_name / register_struct_instance_from_tid the
-        // construction+typedef side use — a flat resolved_arg (`Box`) is one level
-        // short and would name a type that is never typedef'd (br 637sy9). Recurse
-        // when the arg annotation itself carries type-args over a generic struct;
-        // resolved_arg (bare head / substituted concrete) stays the fallback.
+        // An arg annotation that itself carries structure must spell its own full stem,
+        // not the flat head resolve_tparam_seg yields: the head names a C type that is
+        // never typedef'd. Two such args, and both diverge from the tid-native
+        // tc_tid_struct_mono_name / register_struct_instance_from_tid that the
+        // construction+typedef side uses. resolved_arg (bare head / substituted
+        // concrete) stays the fallback for both.
         let mut arg_seg = resolved_arg
-        if (is_struct_type(resolved_arg) != 0 || is_enum_type(resolved_arg) != 0) {
+        // A TUPLE arg (`GT[(Int, Int)]`) flattens to "Tuple", and neither arm below can
+        // pick it up: type_from_name("Tuple") is CT_VOID and is_struct_type("Tuple") is
+        // 0, because only the mangled Tuple2_int_int is ever registered
+        // (ensure_tuple_type). resolve_tuple_ann spells it and registers that typedef as
+        // an idempotent side effect — the same delegation resolve_ann_tag (:5609) makes,
+        // except that this call passes the mono context, as the struct recursion below
+        // does: resolve_tuple_tag's context-free -1/[] would decline a tuple whose
+        // elements are typevars instead of resolving them. Keyed on the RAW name,
+        // matching resolve_tuple_ann:2465 — a typevar already substituted to a tuple
+        // arrives as the mangled tag and needs no recursion. Left flat, the name diverges
+        // from the tid path's GT_Tuple2_int_int, and as a carrier payload the field
+        // ERASES to `void ok` (br 23tfxg, the w4c0py spelling).
+        if raw_name == "Tuple" {
+            let tup = resolve_tuple_ann(elem, tparams_sl, segs)
+            if tup.is_some() { arg_seg = tup.unwrap() }
+        } else if (is_struct_type(resolved_arg) != 0 || is_enum_type(resolved_arg) != 0) {
+            // A NESTED generic-struct-instance arg (`Box[Box[Int]]` → outer arg
+            // `Box[Int]`) recurses for its own stem (Box_Int); a flat `Box` is one level
+            // short and names a type that is never typedef'd (br 637sy9).
             let nested = mono_name_from_ann(strip_module_qualifier(resolved_arg), elem, tparams_sl, segs)
             if nested != "" { arg_seg = nested }
         }
@@ -4509,11 +4526,23 @@ pub fn register_carrier_inner_mono_instance(inner_name: Str, inner_ann: Int) -> 
     let mut ai = 0
     while ai < sublist_length(elems) {
         let elem = sublist_get(elems, ai)
-        let resolved = resolve_tparam_seg(node_name(elem), -1, [])
+        let raw_name = node_name(elem)
+        let resolved = resolve_tparam_seg(raw_name, -1, [])
         let mut arg_seg = resolved
-        // A nested generic-instance arg (`QBox[QBox[Int]]`) registers inner-first and
-        // reuses its own full mono stem, matching mono_name_from_ann's recursion.
-        if is_struct_type(resolved) != 0 || is_enum_type(resolved) != 0 {
+        // A tuple arg spells its mangled stem, exactly as mono_name_from_ann's arm does
+        // and for the same reason (br 23tfxg): the bare head "Tuple" is neither a
+        // compound CT nor a registered struct, so leaving it flat REGISTERS a second
+        // divergent instance (`GT_Tuple`) alongside the tid path's GT_Tuple2_int_int —
+        // one Blink type, two C typedefs, exit 0. resolve_tuple_tag is resolve_tuple_ann
+        // with no mono context, which is all this loop has: its resolve_tparam_seg call
+        // above passes -1/[] for the same reason (no tid or mono state is reachable from
+        // codegen_types — see this function's header).
+        if raw_name == "Tuple" {
+            let tup = resolve_tuple_tag(elem)
+            if tup != "" { arg_seg = tup }
+        } else if is_struct_type(resolved) != 0 || is_enum_type(resolved) != 0 {
+            // A nested generic-instance arg (`QBox[QBox[Int]]`) registers inner-first and
+            // reuses its own full mono stem, matching mono_name_from_ann's recursion.
             let nested = register_carrier_inner_mono_instance(resolved, elem)
             if nested != "" { arg_seg = nested }
         }

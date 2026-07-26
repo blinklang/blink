@@ -1,0 +1,292 @@
+// br 23tfxg: an annotation-driven mono-name speller must not flatten a TUPLE type
+// argument to its bare head. `mono_name_from_ann` did `node_name(elem)`, which yields
+// "Tuple" for `(Int, Int)`, and because `is_struct_type("Tuple")` is 0 (only the
+// mangled `Tuple2_int_int` is ever registered, by ensure_tuple_type) the nested
+// recursion that would spell the element types never ran. Result: `GT_Tuple` where the
+// tid path spells `GT_Tuple2_int_int`. Same defect, line for line, in
+// register_carrier_inner_mono_instance.
+//
+// TWO REPRODUCTIONS, and only one of them is loud.
+//
+// LOUD — the Result carrier is named from the annotation, so it became
+// `blink_Result_GT_Tuple_str`, and since `blink_GT_Tuple` is not a registered struct at
+// that point the payload field ERASED:
+//     typedef struct { int tag; union { void ok; const char* err; }; } blink_Result_GT_Tuple_str;
+//     const blink_Result_GT_Tuple_str r = (blink_Result_GT_Tuple_str){.tag = 0, .ok = e};
+//   => error: incompatible types when initializing type 'int' using type 'blink_GT_Tuple2_int_int'
+// That is the br w4c0py erasure spelling (erased carrier FIELD), caught only because
+// gcc happens to reject `void ok`. Nothing in the compiler noticed.
+//
+// SILENT — the Option carrier's NAME comes from the tid path, so it was already
+// `blink_Option_GT_Tuple2_int_int`; only the annotation-driven REGISTRATION diverged,
+// minting a second typedef for one Blink type and exiting 0:
+//     typedef struct { blink_set* s; } blink_GT_Tuple2_int_int;
+//     typedef struct { blink_set* s; } blink_GT_Tuple;        // <- one type, two C types
+//
+// WHY NO EXISTING TEST CATCHES THIS. test_fqthkv's assert_no_bare_binder is
+// COUNT-based: a spurious `blink_GT_Tuple` typedef increments both of its counters, so
+// it structurally cannot see the silent repro. The assertion here must therefore be
+// TYPEDEF DISTINCTNESS, not a count — and the needle must be the typedef terminator
+// `} blink_GT_Tuple;` (or the `#define BLINK_TD_...` guard line), never the bare
+// substring `blink_GT_Tuple`, which is a prefix of the CORRECT name.
+//
+// FIX SHAPE: a `"Tuple"` head arm before the struct/enum arm in both loops, routing
+// through resolve_tuple_ann — the exact ordering resolve_ann_tag already uses, and
+// which registers the tuple typedef as an idempotent side effect (ensure_tuple_type).
+// resolve_tuple_ann can return None, so `resolved_arg` stays the fallback.
+//
+// ADJACENT AND OUT OF SCOPE (pinned below as still-loud, filed separately): a tuple
+// type arg whose ELEMENTS are typevars (`GT[(T, Int)]` inside `fn wrap[T]`), and a
+// generic-struct-INSTANCE type arg in a container-element position (`GT[QB[Int]]`),
+// both still reach a loud I0001. Different mechanism — struct_concrete_args_from_target
+// deliberately bails on any compound arg (codegen_types.bl:4573-4579) and the tid path
+// cannot resolve those slots either. Pinned so this file records the boundary.
+
+import compile_test_helpers
+import std.io
+
+fn assert_has(c: Str, needle: Str, label: Str) {
+    if !c.contains(needle) { io.println("FAIL: {label} — missing '{needle}'") }
+    assert(c.contains(needle))
+}
+
+fn assert_lacks(c: Str, needle: Str, label: Str) {
+    if c.contains(needle) { io.println("FAIL: {label} — forbidden '{needle}' present") }
+    assert(!c.contains(needle))
+}
+
+// Per CLAUDE.md the `_Void` grep is a LOWER BOUND. All three families on every
+// C-emitting row:
+//   1. the string-producer spelling (`_Void`);
+//   2. the bare-binder passthrough — and the needle MUST be terminated, because
+//      `blink_GT_T` is a PREFIX of the correct `blink_GT_Tuple2_int_int`. `;` catches
+//      the typedef terminator, a trailing space catches a C declaration. This is the
+//      family the `_Void` grep structurally cannot see (br pt4hsy);
+//   3. the erased carrier field (br w4c0py). For this shape the field that erases is
+//      the CARRIER payload, not the Set (a Set field is always the type-erased
+//      `blink_set*`), so the needle is the `void ok;` / `void value;` member the loud
+//      repro actually emitted — the very thing gcc happened to reject.
+fn assert_no_erasure(c: Str, label: Str) {
+    assert_lacks(c, "_Void", "{label} / string-producer erasure")
+    assert_lacks(c, "blink_GT_T;", "{label} / bare-binder T typedef")
+    assert_lacks(c, "blink_GT_T ", "{label} / bare-binder T declaration")
+    assert_lacks(c, "void ok;", "{label} / erased Result payload")
+    assert_lacks(c, "void value;", "{label} / erased Option payload")
+}
+
+// The bug's own signature: a SECOND C typedef for one Blink type. `} blink_GT_Tuple;`
+// is the typedef terminator, so it cannot match inside `} blink_GT_Tuple2_int_int;`.
+fn assert_one_gt_typedef(c: Str, mono: Str, label: Str) {
+    assert_has(c, "} blink_{mono};", "{label} / correct mono typedef")
+    assert_lacks(c, "} blink_GT_Tuple;", "{label} / bare-head typedef")
+    assert_lacks(c, "#define BLINK_TD_blink_GT_Tuple\n", "{label} / bare-head typedef guard")
+}
+
+fn gt_decl() -> Str {
+    "type GT[T] \{ s: Set[T] }\n"
+}
+
+// MVCE 1 (loud): the Result carrier's ok payload is the generic instance.
+fn src_loud() -> Str {
+    let mut s = gt_decl()
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let e: GT[(Int, Int)] = GT \{ s: Set() }\n")
+    s = s.concat("    let r: Result[GT[(Int, Int)], Str] = Ok(e)\n")
+    s = s.concat("    assert(r.is_ok())\n")
+    s = s.concat("}\n")
+    s
+}
+
+// MVCE 2 (silent): the Option carrier. Compiles and exits 0 today — the divergence is
+// visible only in the typedef set.
+fn src_silent() -> Str {
+    let mut s = gt_decl()
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let e: GT[(Int, Int)] = GT \{ s: Set() }\n")
+    s = s.concat("    let o: Option[GT[(Int, Int)]] = Some(e)\n")
+    s = s.concat("    assert(o.is_some())\n")
+    s = s.concat("}\n")
+    s
+}
+
+// ── the loud repro: the carrier payload must not erase ────────────────────────
+
+test "a tuple type arg in a Result carrier's payload compiles and runs" {
+    let r = compile_test_helpers.compile_and_run(src_loud(), "23tfxg_loud_run")
+    if r.exit_code != 0 { io.println("FAIL: loud repro — exit {r.exit_code}: {r.err_out}") }
+    assert_eq(r.exit_code, 0)
+}
+
+test "the Result carrier names its payload with the tuple's mono stem" {
+    let c = compile_test_helpers.compile_and_emit_c(src_loud(), "23tfxg_loud_c")
+    assert_one_gt_typedef(c, "GT_Tuple2_int_int", "loud repro")
+    // The specific wrong carrier the bare head produced.
+    assert_lacks(c, "blink_Result_GT_Tuple_str", "loud repro / bare-head carrier")
+    assert_no_erasure(c, "loud repro")
+}
+
+// ── the silent repro: one Blink type, one C type ──────────────────────────────
+
+test "a tuple type arg in an Option carrier emits exactly one GT typedef" {
+    let c = compile_test_helpers.compile_and_emit_c(src_silent(), "23tfxg_silent_c")
+    assert_one_gt_typedef(c, "GT_Tuple2_int_int", "silent repro")
+    assert_has(c, "blink_Option_GT_Tuple2_int_int", "silent repro / carrier name")
+    assert_no_erasure(c, "silent repro")
+}
+
+test "the silent repro still runs" {
+    let r = compile_test_helpers.compile_and_run(src_silent(), "23tfxg_silent_run")
+    if r.exit_code != 0 { io.println("FAIL: silent repro — exit {r.exit_code}: {r.err_out}") }
+    assert_eq(r.exit_code, 0)
+}
+
+// ── the runtime witness: the tuple field actually works ───────────────────────
+// A correct mono name over a Set whose element kops were selected for the wrong type
+// would still compile. This round-trips two distinct tuples through the field and
+// checks a near-miss is absent, so a wrong element vtable is observable.
+
+test "tuple elements round-trip through the generic struct's Set field" {
+    let mut s = gt_decl()
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let mut e: GT[(Int, Int)] = GT \{ s: Set() }\n")
+    s = s.concat("    e.s.insert((1, 2))\n")
+    s = s.concat("    e.s.insert((3, 4))\n")
+    s = s.concat("    let o: Option[GT[(Int, Int)]] = Some(e)\n")
+    s = s.concat("    let g = o.unwrap()\n")
+    s = s.concat("    assert_eq(g.s.len(), 2)\n")
+    s = s.concat("    assert(g.s.contains((1, 2)))\n")
+    s = s.concat("    assert(g.s.contains((3, 4)))\n")
+    s = s.concat("    assert(!g.s.contains((1, 3)))\n")
+    s = s.concat("}\n")
+    let r = compile_test_helpers.compile_and_run(s, "23tfxg_rt")
+    if r.exit_code != 0 { io.println("FAIL: tuple round-trip — exit {r.exit_code}: {r.err_out}") }
+    assert_eq(r.exit_code, 0)
+}
+
+// ── the recursion must go all the way down ────────────────────────────────────
+// A NESTED tuple element exercises resolve_tuple_ann's own recursion (:2465) reached
+// through the new arm. `GT_Tuple` flattens both levels identically, so without the
+// distinctness needle this shape is indistinguishable from the one above.
+
+test "a nested tuple type arg spells both levels" {
+    let mut s = gt_decl()
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let e: GT[((Int, Int), Str)] = GT \{ s: Set() }\n")
+    s = s.concat("    let o: Option[GT[((Int, Int), Str)]] = Some(e)\n")
+    s = s.concat("    assert(o.is_some())\n")
+    s = s.concat("}\n")
+    let c = compile_test_helpers.compile_and_emit_c(s, "23tfxg_nested_c")
+    assert_one_gt_typedef(c, "GT_Tuple2_Tuple2_int_int_str", "nested tuple")
+    assert_no_erasure(c, "nested tuple")
+}
+
+// A tuple in the SECOND slot of a two-param struct: the arm must not disturb
+// positional alignment, and the non-tuple sibling slot must still spell normally.
+
+test "a tuple type arg in the second slot keeps positional alignment" {
+    let mut s = "type GP[A, B] \{ a: A, b: List[B] }\n"
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let e: GP[Str, (Int, Int)] = GP \{ a: \"x\", b: [] }\n")
+    s = s.concat("    let o: Option[GP[Str, (Int, Int)]] = Some(e)\n")
+    s = s.concat("    assert(o.is_some())\n")
+    s = s.concat("    assert(o.unwrap().a == \"x\")\n")
+    s = s.concat("}\n")
+    let c = compile_test_helpers.compile_and_emit_c(s, "23tfxg_twoparam_c")
+    assert_has(c, "} blink_GP_Str_Tuple2_int_int;", "two-param / correct mono typedef")
+    assert_lacks(c, "} blink_GP_Str_Tuple;", "two-param / bare-head typedef")
+    let r = compile_test_helpers.compile_and_run(s, "23tfxg_twoparam_run")
+    if r.exit_code != 0 { io.println("FAIL: two-param — exit {r.exit_code}: {r.err_out}") }
+    assert_eq(r.exit_code, 0)
+}
+
+// ── controls: the arm this one is inserted BEFORE must keep working ───────────
+// The struct/enum recursion (br 637sy9 / bee854) is now reached through an `else if`.
+// A nested generic-struct type arg must still spell its own full stem.
+
+test "a nested generic-struct type arg still recurses (bee854 control)" {
+    let mut s = "type QB[T] \{ v: T }\n"
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let inner: QB[Int] = QB \{ v: 7 }\n")
+    s = s.concat("    let e: QB[QB[Int]] = QB \{ v: inner }\n")
+    s = s.concat("    let o: Option[QB[QB[Int]]] = Some(e)\n")
+    s = s.concat("    assert_eq(o.unwrap().v.v, 7)\n")
+    s = s.concat("    let r: Result[QB[QB[Int]], Str] = Ok(e)\n")
+    s = s.concat("    assert(r.is_ok())\n")
+    s = s.concat("}\n")
+    let c = compile_test_helpers.compile_and_emit_c(s, "23tfxg_ctrl_c")
+    assert_has(c, "} blink_QB_QB_Int;", "bee854 control / nested stem")
+    assert_lacks(c, "} blink_QB;", "bee854 control / bare-head typedef")
+    let r = compile_test_helpers.compile_and_run(s, "23tfxg_ctrl_run")
+    if r.exit_code != 0 { io.println("FAIL: bee854 control — exit {r.exit_code}: {r.err_out}") }
+    assert_eq(r.exit_code, 0)
+}
+
+test "a plain scalar type arg is unaffected" {
+    let mut s = gt_decl()
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let e: GT[Int] = GT \{ s: Set() }\n")
+    s = s.concat("    let o: Option[GT[Int]] = Some(e)\n")
+    s = s.concat("    assert(o.is_some())\n")
+    s = s.concat("}\n")
+    let c = compile_test_helpers.compile_and_emit_c(s, "23tfxg_scalar_c")
+    assert_has(c, "} blink_GT_Int;", "scalar arg / mono typedef")
+    assert_no_erasure(c, "scalar arg")
+}
+
+// ── the boundary: adjacent shapes that must stay LOUD ─────────────────────────
+// Both are pre-existing and mechanically distinct (see the header). They are pinned
+// here so that if a later fix makes either compile, it must do so deliberately —
+// a silent transition from ICE to wrong C is exactly what this ticket was.
+
+test "a tuple arg over a typevar element still ICEs loudly" {
+    let mut s = gt_decl()
+    s = s.concat("fn wrap[T](x: T) -> Option[GT[(T, Int)]] \{\n")
+    s = s.concat("    let e: GT[(T, Int)] = GT \{ s: Set() }\n")
+    s = s.concat("    let _u = x\n")
+    s = s.concat("    Some(e)\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{ assert(wrap(7).is_some()) }\n")
+    let out = compile_test_helpers.compile_and_capture(s, "23tfxg_typevar_elem")
+    compile_test_helpers.expect_contains(out, "I0001", "typevar tuple element stays loud")
+    assert(out.contains("I0001"))
+}
+
+// A BY-VALUE tuple field (`v: T` rather than `s: Set[T]`) is the one shape where getting
+// the mono name right is not sufficient: the mono struct typedef embeds the tuple by
+// value but is emitted BEFORE it, so cc reports `unknown type name blink_Tuple2_int_int`.
+// PRE-EXISTING, not a regression — the pre-23tfxg compiler, rebuilt from the stashed
+// source, emits the SAME error plus the two this fix removed (error count 6 -> 4). Filed
+// as br 7jm54r; only reachable once the name is right, which is why this fix surfaced it.
+// This row asserts the part 23tfxg owns and pins the part it does not, so the residue
+// cannot be mistaken for either a regression here or a clean pass there.
+test "a by-value tuple field gets the right mono name but still hits the typedef-order gap" {
+    let mut s = "type QB[T] \{ v: T }\n"
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let e: QB[(Int, Int)] = QB \{ v: (1, 2) }\n")
+    s = s.concat("    let o: Option[QB[(Int, Int)]] = Some(e)\n")
+    s = s.concat("    assert_eq(o.unwrap().v._0, 1)\n")
+    s = s.concat("}\n")
+    let c = compile_test_helpers.compile_and_emit_c(s, "23tfxg_byval_c")
+    // What this fix owns: the name, and the absence of the bare-head twin.
+    assert_has(c, "} blink_QB_Tuple2_int_int;", "by-value field / correct mono typedef")
+    assert_lacks(c, "} blink_QB_Tuple;", "by-value field / bare-head typedef")
+    assert_has(c, "blink_Tuple2_int_int v;", "by-value field / member type")
+    // What br 7jm54r owns: the tuple typedef must precede the struct embedding it.
+    let r = compile_test_helpers.compile_and_run(s, "23tfxg_byval_run")
+    if r.exit_code == 0 {
+        io.println("br 7jm54r appears FIXED — flip this row to assert_eq(r.exit_code, 0)")
+    }
+    assert(r.exit_code != 0)
+}
+
+test "a generic-struct-instance type arg in a Set element still ICEs loudly" {
+    let mut s = gt_decl()
+    s = s.concat("type QB[T] \{ v: T }\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let e: GT[QB[Int]] = GT \{ s: Set() }\n")
+    s = s.concat("    assert(e.s.len() == 0)\n")
+    s = s.concat("}\n")
+    let out = compile_test_helpers.compile_and_capture(s, "23tfxg_struct_elem")
+    compile_test_helpers.expect_contains(out, "I0001", "struct Set element stays loud")
+    assert(out.contains("I0001"))
+}
