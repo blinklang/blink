@@ -93,7 +93,7 @@ import diagnostics.{
 }
 import std.path.{path_dirname}
 import formatter.{format_expr}
-import typecheck.{tc_mono_csv, tc_mono_tids_subst, tc_seg_from_tid, is_import_module_name, tc_lookup_node_tid, tc_tid_set_elem_ct, tc_tid_set_elem_struct, tc_tid_set_elem_ct_resolved, tc_tid_set_elem_struct_resolved, tc_tid_map_key_ct, tc_tid_map_key_struct, tc_tid_map_key_ct_resolved, tc_tid_map_key_struct_resolved, tc_tid_map_val_ct, tc_tid_map_val_struct, tc_tid_map_val_tid, tc_tid_map_key_tid, tc_tid_struct_slot_seg, tc_tid_ct, tc_tid_ct_resolved, tc_tid_resolved, tc_tid_option_inner_ct, tc_tid_option_inner_struct, tc_tid_result_ok_ct, tc_tid_result_ok_struct, tc_tid_result_err_ct, tc_tid_result_err_struct, tc_tid_to_c_tag, tc_tid_struct, tc_tid_struct_mono_name, tc_tid_is_enum, tc_tid_struct_arg_count, tc_tid_struct_arg_tid, tc_tid_compound_slot_faithful, tc_struct_slot_encodable, tc_tid_inner_tag, tc_tid_option_inner_tid, tc_tid_result_ok_tid, tc_tid_result_err_tid, tc_tid_tuple_elem_encodable, tc_tid_tuple_sname, tc_tid_tuple_arity, tc_tid_tuple_elem_tid}
+import typecheck.{tc_mono_csv, tc_mono_tids_subst, tc_seg_from_tid, is_import_module_name, tc_lookup_node_tid, tc_tid_set_elem_ct, tc_tid_set_elem_struct, tc_tid_set_elem_ct_resolved, tc_tid_set_elem_struct_resolved, tc_tid_map_key_ct, tc_tid_map_key_struct, tc_tid_map_key_ct_resolved, tc_tid_map_key_struct_resolved, tc_tid_map_val_ct, tc_tid_map_val_struct, tc_tid_map_val_tid, tc_tid_map_key_tid, tc_tid_struct_slot_seg, tc_tid_ct, tc_tid_ct_resolved, tc_tid_resolved, tc_tid_option_inner_ct, tc_tid_option_inner_struct, tc_tid_result_ok_ct, tc_tid_result_ok_struct, tc_tid_result_err_ct, tc_tid_result_err_struct, tc_tid_to_c_tag, tc_tid_struct, tc_tid_struct_mono_name, tc_tid_is_enum, tc_tid_struct_arg_count, tc_tid_struct_arg_tid, tc_tid_compound_slot_faithful, tc_struct_slot_encodable, tc_tid_inner_tag, tc_tid_option_inner_tid, tc_tid_result_ok_tid, tc_tid_result_err_tid, tc_tid_tuple_elem_encodable, tc_tid_tuple_sname, tc_tid_tuple_arity, tc_tid_tuple_elem_tid, tc_tid_kops_slot_unsolved}
 
 // codegen_expr.bl — Expression codegen, closures, capture analysis
 
@@ -2731,20 +2731,58 @@ fn tid_tuple_elem_enc(tid0: Int) -> TidTupleElem {
     TidTupleElem { ct: ct, struct_tag: "", ok: true }
 }
 
-// Select the kops element carrier (ct + sname) for a Set()/Map() constructor from
-// its declared container annotation. `container` is "Set" or "Map". A struct-field
-// initializer or call-arg supplies the type via cg_expect_arg_ann, not
-// cg_let_target_ann (br 6ph073); prefer it, but only when it actually names the
-// container — a let-RHS block-expr inside a call arg leaves cg_expect_arg_ann on the
-// OUTER param (e.g. Int), which must not shadow the block-local `let s: Set[..] =`'s
-// target. The string default (CT_STRING/"") is kept for an unresolved typevar
-// (generic-struct field Set[T]/Map[K,_], which typecheck never monomorphizes);
-// recover_elem_ct_from_arg corrects the kops downstream (br 6ph073/vbhc4x).
-fn resolve_ctor_kops_elem(container: Str) -> CarrierInfo ! Codegen.Emit {
-    let ann = if cg_expect_arg_ann != -1 && node_name(cg_expect_arg_ann) == container { cg_expect_arg_ann } else { cg_let_target_ann }
-    if ann == -1 || node_name(ann) != container { return CarrierInfo { type_const: CT_STRING, struct_name: "" } }
+// Fail-closed backstop (br farq9f Stage 3). Reached only when every earlier
+// tier — the tid-native answer, the def-side return annotation, and the
+// value-context annotation — has declined and tier 2 (resolve_ctor_kops_elem)
+// fell all the way through to its CT_STRING/"" default. That default is
+// legitimate at the countless non-tail sites where an unresolved typevar's kops
+// choice is corrected downstream by recover_elem_ct_from_arg (br 6ph073/vbhc4x)
+// — this tier must not disturb any of them, so it fires only when BOTH:
+//   (1) this ctor is the enclosing fn's tail value (struct_lit_is_fn_tail_value)
+//       — the one position with no downstream call-arg/insert-site correction to
+//       catch a wrong guess,
+//   (2) `fallback` IS tier 2's decline default ({CT_STRING, ""}) and not a real
+//       answer — tier C (ctor_ret_ann_kops_elem) resolves impl methods, closures
+//       and generic-fn-mono instances by reading the def-side annotation
+//       directly, entirely bypassing typecheck's own tid pin, so a real answer
+//       from tier C must win here even though the tid below still reads
+//       unsolved; skipping this check was an over-fire bug caught by the impl-
+//       method/closure/generic-fn test rows, and
+//   (3) the ctor's own memoized tid PROVES the kops-deciding slot is still an
+//       unbound metavar (tc_tid_kops_slot_unsolved) — not merely "no tier
+//       answered", which would also slander a real TK_TYPEVAR or the shared
+//       TYPE_UNKNOWN singleton.
+// Mirrors emit_struct_lit's own I0001 chokepoint (nqq29j): diag_ice_at then
+// CONTINUE — "ice" severity already exits blinkc with 101 before any C is
+// written, so the fallback this returns only keeps the rest of emit_call's
+// control flow well-typed, not because the fallback ever reaches a linker.
+// Verified inert on the whole compiler + stdlib + test corpus: zero bare tail
+// `Map()`/`Set()` sites exist today (`rg '^\s*(Map|Set)\(\)\s*$' src/ lib/ tests/`).
+fn ctor_kops_fail_closed(container: Str, node: Int, fallback: CarrierInfo) -> CarrierInfo ! Diag.Report {
+    if struct_lit_is_fn_tail_value(node) == 0 { return fallback }
+    if fallback.type_const != CT_STRING || fallback.struct_name != "" { return fallback }
+    let tid = tc_lookup_node_tid(node)
+    if tc_tid_kops_slot_unsolved(tid, container) == 0 { return fallback }
+    diag_ice_at("UnsolvedTypeVarAtCodegen", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "{container}()'s key/element type reached construction unsolved",
+        node,
+        "this is a compiler bug — the type should have been inferred, or reported as error[CannotInferType]")
+    fallback
+}
+
+// Shared decoder behind resolve_ctor_kops_elem and the def-side twin
+// ctor_ret_ann_kops_elem: given an annotation node already known to be the right
+// container ("Set"/"Map"), decode its element arg into the kops carrier. Declining
+// (no evidence at all) is spelled {CT_VOID, ""} — the same sentinel
+// ctor_kops_elem_from_node_tid uses at its own decline — so a caller can tell "this
+// tier has nothing to say" apart from a real answer and fall through to the next
+// tier. The two tuple branches below return {CT_VOID, non-empty}, and the concrete
+// branch can return {CT_STRING, "Str"} for a genuine Str key — both distinguishable
+// from the decline sentinel by the (kind, name) pair together, never by kind alone.
+fn kops_elem_from_container_ann(ann: Int, container: Str) -> CarrierInfo ! Codegen.Emit {
+    if ann == -1 || node_name(ann) != container { return CarrierInfo { type_const: CT_VOID, struct_name: "" } }
     let ta_elems = node_elements(ann)
-    if ta_elems == -1 || sublist_length(ta_elems) < 1 { return CarrierInfo { type_const: CT_STRING, struct_name: "" } }
+    if ta_elems == -1 || sublist_length(ta_elems) < 1 { return CarrierInfo { type_const: CT_VOID, struct_name: "" } }
     let e_ann = sublist_get(ta_elems, 0)
     let e_raw = node_name(e_ann)
     let e_name = resolve_tparam_via_tid(e_raw, cg_mono_tparams_sl, cg_mono_arg_tids)
@@ -2770,7 +2808,7 @@ fn resolve_ctor_kops_elem(container: Str) -> CarrierInfo ! Codegen.Emit {
     //
     // This must precede kops_elem_is_concrete, which says FALSE for a tuple carrier name
     // (neither a primitive nor an is_named_type) and so would fall through to the
-    // CT_STRING default — an Int-keyed tuple hashed as a C string, the br hnyqe4
+    // decline default — an Int-keyed tuple hashed as a C string, the br hnyqe4
     // collision under a fully correct mono name.
     //
     // Decided on the TID's kind, not on the name's shape: a name test would be a
@@ -2778,8 +2816,8 @@ fn resolve_ctor_kops_elem(container: Str) -> CarrierInfo ! Codegen.Emit {
     // ensure_tuple_carrier_from_tid needs anyway. Claiming the carrier UNCONDITIONALLY
     // once the tid says tuple is deliberate — if registration declined, kops_table_name
     // emits its BLINK_COMPILER_BUG sentinel and the C compiler stops, which is the right
-    // failure for a shape we cannot hash. Falling through to CT_STRING here would be
-    // silent corruption instead.
+    // failure for a shape we cannot hash. Falling through to the decline default here
+    // would be silent corruption instead.
     // Name the carrier that was actually REGISTERED rather than assuming the two
     // spellers agree: e_name comes from tc_seg_from_tid and the registration from
     // tc_tid_tuple_sname, and a silent divergence between two tid spellers is a
@@ -2793,7 +2831,74 @@ fn resolve_ctor_kops_elem(container: Str) -> CarrierInfo ! Codegen.Emit {
     if kops_elem_is_concrete(e_name) {
         return CarrierInfo { type_const: type_from_name(e_name), struct_name: e_name }
     }
-    CarrierInfo { type_const: CT_STRING, struct_name: "" }
+    CarrierInfo { type_const: CT_VOID, struct_name: "" }
+}
+
+// Def-side return-annotation tier for a Map()/Set() ctor's kops element — the
+// container-shaped twin of struct_ret_ann_arg_tids, both answering "what does the
+// enclosing fn's OWN return annotation say" rather than a per-value-context oracle.
+// Covers the def-side gap tier 1 (ctor_kops_elem_from_node_tid) and tier 2
+// (resolve_ctor_kops_elem) both miss: an impl method's declared return never
+// reaches lookup_fnsig (br ya8qyf), an annotated closure's own declared return
+// (br n8mmry), a tuple key on a generic-fn mono instance (br 0sh55p), and any
+// generic-fn return whose type param the enclosing mono context has bound.
+//
+// Gated on struct_lit_is_fn_tail_value exactly as struct_ret_ann_arg_tids is — a
+// return annotation is in scope for the WHOLE fn body, so ungated this would stamp
+// the return type onto an unrelated same-shaped Map()/Set() anywhere in the body.
+//
+// Unlike struct_ret_ann_arg_tids, a non-binder concrete annotation arg (a plain
+// `-> Map[Int, Str]`, no type param at all) is exactly the case this tier exists
+// for — do not bail on it. kops_elem_from_container_ann already resolves a
+// concrete name straight through (kops_elem_is_concrete), and resolves a binder
+// via resolve_tparam_via_tid/tparam_tid_via_mono when the fn IS generic.
+fn ctor_ret_ann_kops_elem(container: Str, node: Int) -> CarrierInfo ! Codegen.Emit {
+    let tracing = dbg_channel_on("retann")
+    if struct_lit_is_fn_tail_value(node) == 0 {
+        if tracing != 0 { dbg_trace("retann", "{container} ctor: not the enclosing fn's tail value") }
+        return CarrierInfo { type_const: CT_VOID, struct_name: "" }
+    }
+    // No separate cg_current_fn_node == -1 check needed: struct_lit_is_fn_tail_value
+    // already returns 0 in that case (it's the first thing it checks), so reaching
+    // here guarantees cg_current_fn_node is a valid node.
+    let ann = node_type_ann(cg_current_fn_node)
+    if ann == -1 {
+        if tracing != 0 { dbg_trace("retann", "{container} ctor: enclosing fn has no return annotation") }
+        return CarrierInfo { type_const: CT_VOID, struct_name: "" }
+    }
+    if node_name(ann) != container {
+        if tracing != 0 { dbg_trace("retann", "{container} ctor: return annotation names {node_name(ann)}") }
+        return CarrierInfo { type_const: CT_VOID, struct_name: "" }
+    }
+    kops_elem_from_container_ann(ann, container)
+}
+
+// Select the kops element carrier (ct + sname) for a Set()/Map() constructor from
+// its declared container annotation. `container` is "Set" or "Map". A struct-field
+// initializer or call-arg supplies the type via cg_expect_arg_ann, not
+// cg_let_target_ann (br 6ph073); prefer it, but only when it actually names the
+// container — a let-RHS block-expr inside a call arg leaves cg_expect_arg_ann on the
+// OUTER param (e.g. Int), which must not shadow the block-local `let s: Set[..] =`'s
+// target. The string default (CT_STRING/"") is kept for an unresolved typevar
+// (generic-struct field Set[T]/Map[K,_], which typecheck never monomorphizes);
+// recover_elem_ct_from_arg corrects the kops downstream (br 6ph073/vbhc4x).
+fn resolve_ctor_kops_elem(container: Str) -> CarrierInfo ! Codegen.Emit {
+    let ann = if cg_expect_arg_ann != -1 && node_name(cg_expect_arg_ann) == container { cg_expect_arg_ann } else { cg_let_target_ann }
+    let dec = kops_elem_from_container_ann(ann, container)
+    if dec.type_const == CT_VOID && dec.struct_name == "" { return CarrierInfo { type_const: CT_STRING, struct_name: "" } }
+    dec
+}
+
+// The full four-tier kops-carrier resolution for a Map()/Set() ctor, shared by
+// emit_call's "Map" and "Set" arms (which previously duplicated this exact chain
+// verbatim per container): the ctor's own memoized tid, the enclosing fn's own
+// return annotation, the value-context annotation, and — only once every earlier
+// tier has declined — the fail-closed I0001 backstop.
+fn resolve_kops_carrier(container: Str, node: Int) -> CarrierInfo ! Codegen.Emit, Diag.Report {
+    let nt = ctor_kops_elem_from_node_tid(node, container)
+    let rt = if nt.type_const != CT_VOID || nt.struct_name != "" { nt } else { ctor_ret_ann_kops_elem(container, node) }
+    let ec0 = if rt.type_const != CT_VOID || rt.struct_name != "" { rt } else { resolve_ctor_kops_elem(container) }
+    ctor_kops_fail_closed(container, node, ec0)
 }
 
 // Carrier for a just-emitted argument expression. Used when the carrier's
@@ -3032,7 +3137,9 @@ fn struct_lit_is_fn_tail_value(node: Int) -> Int {
 // disagree — the bwyfy1 two-speller hazard, which bites hardest exactly here because
 // the CSV drives the mono NAME while the tids drive the field ctor's kops vtable. A
 // name/vtable split is the br hnyqe4 signature: a correctly-named struct whose Int-keyed
-// Set is hashed as a string, silent under gcc and a SIGSEGV at runtime (br farq9f).
+// Set is hashed as a string — silent collision/data-loss under plain gcc, and (for keys
+// with no zero byte) an ASAN-only stack-buffer-overflow read, not a guaranteed SIGSEGV
+// (br farq9f; farq9f's own Stage A/C/B now closes this for the direct tail-ctor case).
 //
 // Every annotation arg must be a BINDER of the enclosing mono context. A non-binder arg
 // (`fn f[T]() -> Pair[T, Int]`) is not this tier's business: an already-concrete slot
@@ -4449,16 +4556,14 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
             }
         }
         if fn_name == "Map" {
-            let nt = ctor_kops_elem_from_node_tid(node, "Map")
-            let ec = if nt.type_const != CT_VOID || nt.struct_name != "" { nt } else { resolve_ctor_kops_elem("Map") }
+            let ec = resolve_kops_carrier("Map", node)
             let kops = kops_table_name(ec.type_const, ec.struct_name)
             expr_result_str = "blink_map_new(&{kops})"
             expr_result_type = CT_MAP
             return
         }
         if fn_name == "Set" {
-            let nt = ctor_kops_elem_from_node_tid(node, "Set")
-            let ec = if nt.type_const != CT_VOID || nt.struct_name != "" { nt } else { resolve_ctor_kops_elem("Set") }
+            let ec = resolve_kops_carrier("Set", node)
             let kops = kops_table_name(ec.type_const, ec.struct_name)
             expr_result_str = "blink_set_new(&{kops})"
             expr_result_type = CT_SET

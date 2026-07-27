@@ -1,0 +1,577 @@
+// br farq9f: a declared Map/Set return type does not pin its tail ctor's element
+// type. `fn mkmap() -> Map[Int, Str] { Map() }` emits `blink_map_new(&blink_kops_str)`
+// — the STRING key-ops vtable for an Int key — because tc_pin_tail_ret_generic
+// (src/typecheck.bl) gates on TK_STRUCT/TK_ENUM and excludes TK_MAP/TK_SET, and
+// codegen's resolve_ctor_kops_elem has no return-annotation tier, so a tail ctor with
+// no let-target/call-arg annotation falls to its CT_STRING default.
+//
+// THREE REAL SYMPTOMS (the ticket's own "crashes, exit 139" does not reproduce):
+//   1. Silent wrong answer, exit 0 — insert(256)/insert(512) collide under the
+//      string hasher (both keys carry a 0x00 low byte, hashing as "").
+//   2. Genuine memory unsafety, ASAN-only — blink_kops_eq_str reads past the 8-byte
+//      key slot for a key with no zero byte (e.g. -1). Silent under plain gcc.
+//   3. Lost key — insert(-1) then get(-1) panics `unwrap called on None` while len()
+//      still reads 2.
+//
+// THE FIX, staged (three regens):
+//   (A) src/typecheck.bl — tc_pin_admits_declared admits TK_MAP/TK_SET to the pin
+//       gate, so tc_pin_tail_ret_generic's tc_unify solves the ctor's own metavars.
+//   (C) src/codegen_expr.bl — a def-side return-annotation decoder tier
+//       (ctor_ret_ann_kops_elem) answers the cases the pin cannot reach: impl
+//       methods, annotated closures, and mono generic-fn instances.
+//   (B) src/typecheck.bl + src/codegen_expr.bl — a tail-gated fail-closed I0001 when
+//       every tier declines AND the tid's kops-deciding slot is still unsolved,
+//       closing the silent CT_STRING default for good.
+//
+// Spec: sections/03_types.md:1031 (a fn's declared return type is an expected-type
+// source), :1134/:1192/:1624 (hash coherence), :1973 (one vtable per Map/Set),
+// DECISIONS.md:342 (never Void-default). Structured on
+// tests/test_y1n3ck_generic_return_tail_infer.bl (its assert_has/assert_lacks and the
+// three-family assert_no_erasure, which is a documented LOWER BOUND per CLAUDE.md).
+//
+// NEVER use compile_test_helpers.expect_contains/expect_error — they only io.println
+// their verdict and can never go red (br zzpeg8).
+
+import compile_test_helpers
+import std.io
+
+fn assert_has(c: Str, needle: Str, label: Str) {
+    if !c.contains(needle) { io.println("FAIL: {label} — missing '{needle}'") }
+    assert(c.contains(needle))
+}
+
+fn assert_lacks(c: Str, needle: Str, label: Str) {
+    if c.contains(needle) { io.println("FAIL: {label} — forbidden '{needle}' present") }
+    assert(!c.contains(needle))
+}
+
+// Per CLAUDE.md the `_Void` grep is a LOWER BOUND — check all three erasure families.
+fn assert_no_erasure(c: Str, label: Str) {
+    assert_lacks(c, "_Void", "{label} / string-producer erasure")
+    assert_lacks(c, "blink_map_void", "{label} / erased Map carrier field")
+    assert_lacks(c, "blink_set_void", "{label} / erased Set carrier field")
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// Stage 1 — (A) admits Map/Set to the pin gate
+// ══════════════════════════════════════════════════════════════════════════
+
+// ── implicit tail, Map and Set, the MVCE ─────────────────────────────────────
+
+fn src_map_tail() -> Str {
+    let mut s = "fn mkmap() -> Map[Int, Str] \{ Map() }\n"
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let m = mkmap()\n")
+    s = s.concat("    m.insert(256, \"lo\")\n")
+    s = s.concat("    m.insert(512, \"hi\")\n")
+    s = s.concat("    assert_eq(m.len(), 2)\n")
+    s = s.concat("    assert(m.get(256).unwrap() == \"lo\")\n")
+    s = s.concat("    assert(m.get(512).unwrap() == \"hi\")\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "MVCE: implicit-tail Map[Int,Str] does not ICE" {
+    compile_test_helpers.expect_no_error(src_map_tail(), "farq9f_map_tail_ice", "I0001")
+}
+
+test "MVCE: implicit-tail Map[Int,Str] selects the i64 kops, not the string one" {
+    let c = compile_test_helpers.compile_and_emit_c(src_map_tail(), "farq9f_map_tail_c")
+    assert_has(c, "blink_map_new(&blink_kops_i64)", "Int-key kops")
+    assert_lacks(c, "blink_map_new(&blink_kops_str)", "must not hash an Int key as a string")
+    assert_no_erasure(c, "implicit-tail Map")
+}
+
+test "MVCE: implicit-tail Map[Int,Str] round-trips 256 and 512 at runtime" {
+    let r = compile_test_helpers.compile_and_run(src_map_tail(), "farq9f_map_tail_run")
+    if r.exit_code != 0 { io.println("FAIL: implicit-tail Map runtime — exit {r.exit_code}: {r.err_out}") }
+    assert_eq(r.exit_code, 0)
+}
+
+fn src_set_tail() -> Str {
+    let mut s = "fn mkset() -> Set[Int] \{ Set() }\n"
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let s = mkset()\n")
+    s = s.concat("    s.insert(256)\n")
+    s = s.concat("    s.insert(512)\n")
+    s = s.concat("    assert_eq(s.len(), 2)\n")
+    s = s.concat("    assert(s.contains(256))\n")
+    s = s.concat("    assert(s.contains(512))\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "MVCE: implicit-tail Set[Int] does not ICE" {
+    compile_test_helpers.expect_no_error(src_set_tail(), "farq9f_set_tail_ice", "I0001")
+}
+
+test "MVCE: implicit-tail Set[Int] selects the i64 kops, not the string one" {
+    let c = compile_test_helpers.compile_and_emit_c(src_set_tail(), "farq9f_set_tail_c")
+    assert_has(c, "blink_set_new(&blink_kops_i64)", "Int-elem kops")
+    assert_lacks(c, "blink_set_new(&blink_kops_str)", "must not hash an Int elem as a string")
+    assert_no_erasure(c, "implicit-tail Set")
+}
+
+test "MVCE: implicit-tail Set[Int] round-trips 256 and 512 at runtime" {
+    let r = compile_test_helpers.compile_and_run(src_set_tail(), "farq9f_set_tail_run")
+    if r.exit_code != 0 { io.println("FAIL: implicit-tail Set runtime — exit {r.exit_code}: {r.err_out}") }
+    assert_eq(r.exit_code, 0)
+}
+
+// ── the no-zero-byte keys: the ASAN read + the lost-key symptom ─────────────
+// -1/-2 carry no 0x00 byte at all, so under the string hasher this is not merely a
+// collision — it's an out-of-bounds read (ASAN-only) and, per the ticket's third
+// symptom, a lost key: insert(-1) then get(-1) panics `unwrap called on None` while
+// len() still reads 2. Plain gcc masks the read, so the panic is the witness here;
+// the ASAN run is a separate verification step (not part of `task ci`).
+
+test "negative keys with no shared zero byte round-trip at runtime" {
+    let mut s = "fn mkmap() -> Map[Int, Str] \{ Map() }\n"
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let m = mkmap()\n")
+    s = s.concat("    m.insert(-1, \"a\")\n")
+    s = s.concat("    m.insert(-2, \"b\")\n")
+    s = s.concat("    assert_eq(m.len(), 2)\n")
+    s = s.concat("    assert(m.get(-1).unwrap() == \"a\")\n")
+    s = s.concat("    assert(m.get(-2).unwrap() == \"b\")\n")
+    s = s.concat("}\n")
+    let r = compile_test_helpers.compile_and_run(s, "farq9f_negkeys_run")
+    if r.exit_code != 0 { io.println("FAIL: negative-key runtime — exit {r.exit_code}: {r.err_out}") }
+    assert_eq(r.exit_code, 0)
+}
+
+test "Set negative elements with no shared zero byte round-trip at runtime" {
+    let mut s = "fn mkset() -> Set[Int] \{ Set() }\n"
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let s = mkset()\n")
+    s = s.concat("    s.insert(-1)\n")
+    s = s.concat("    s.insert(-2)\n")
+    s = s.concat("    assert_eq(s.len(), 2)\n")
+    s = s.concat("    assert(s.contains(-1))\n")
+    s = s.concat("    assert(s.contains(-2))\n")
+    s = s.concat("}\n")
+    let r = compile_test_helpers.compile_and_run(s, "farq9f_negelems_run")
+    if r.exit_code != 0 { io.println("FAIL: negative-elem runtime — exit {r.exit_code}: {r.err_out}") }
+    assert_eq(r.exit_code, 0)
+}
+
+// ── explicit return, and the intermediate-let form ───────────────────────────
+
+test "explicit `return Map()` pins identically to the implicit tail" {
+    let mut s = "fn mkmap() -> Map[Int, Str] \{ return Map() }\n"
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let m = mkmap()\n")
+    s = s.concat("    m.insert(256, \"lo\")\n")
+    s = s.concat("    m.insert(512, \"hi\")\n")
+    s = s.concat("    assert_eq(m.len(), 2)\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_no_error(s, "farq9f_explicit_return_ice", "I0001")
+    let c = compile_test_helpers.compile_and_emit_c(s, "farq9f_explicit_return_c")
+    assert_has(c, "blink_map_new(&blink_kops_i64)", "explicit-return Int-key kops")
+    assert_lacks(c, "blink_map_new(&blink_kops_str)", "explicit-return must not hash Int as string")
+    let r = compile_test_helpers.compile_and_run(s, "farq9f_explicit_return_run")
+    assert_eq(r.exit_code, 0)
+}
+
+test "an intermediate let before the tail still pins" {
+    let mut s = "fn mkmap() -> Map[Int, Str] \{\n"
+    s = s.concat("    let m = Map()\n")
+    s = s.concat("    m\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let m = mkmap()\n")
+    s = s.concat("    m.insert(256, \"lo\")\n")
+    s = s.concat("    m.insert(512, \"hi\")\n")
+    s = s.concat("    assert_eq(m.len(), 2)\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_no_error(s, "farq9f_interlet_ice", "I0001")
+    let c = compile_test_helpers.compile_and_emit_c(s, "farq9f_interlet_c")
+    assert_has(c, "blink_map_new(&blink_kops_i64)", "intermediate-let Int-key kops")
+    assert_lacks(c, "blink_map_new(&blink_kops_str)", "intermediate-let must not hash Int as string")
+    let r = compile_test_helpers.compile_and_run(s, "farq9f_interlet_run")
+    assert_eq(r.exit_code, 0)
+}
+
+// ── Str-keyed controls: kops choice unchanged (kops_str is CORRECT here) ─────
+
+test "control: a declared Str-keyed Map return keeps the string kops" {
+    let mut s = "fn mkmap() -> Map[Str, Int] \{ Map() }\n"
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let m = mkmap()\n")
+    s = s.concat("    m.insert(\"a\", 1)\n")
+    s = s.concat("    assert_eq(m.get(\"a\").unwrap(), 1)\n")
+    s = s.concat("}\n")
+    let c = compile_test_helpers.compile_and_emit_c(s, "farq9f_str_control_c")
+    assert_has(c, "blink_map_new(&blink_kops_str)", "Str key correctly keeps string kops")
+    let r = compile_test_helpers.compile_and_run(s, "farq9f_str_control_run")
+    assert_eq(r.exit_code, 0)
+}
+
+test "control: a declared Str-elem Set return keeps the string kops" {
+    let mut s = "fn mkset() -> Set[Str] \{ Set() }\n"
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let s = mkset()\n")
+    s = s.concat("    s.insert(\"a\")\n")
+    s = s.concat("    assert(s.contains(\"a\"))\n")
+    s = s.concat("}\n")
+    let c = compile_test_helpers.compile_and_emit_c(s, "farq9f_str_set_control_c")
+    assert_has(c, "blink_set_new(&blink_kops_str)", "Str elem correctly keeps string kops")
+    let r = compile_test_helpers.compile_and_run(s, "farq9f_str_set_control_run")
+    assert_eq(r.exit_code, 0)
+}
+
+// ── non-container tails must NOT be touched by the widened gate ─────────────
+// tc_pin_admits_declared admits only MAP/SET/STRUCT/ENUM by construction — these
+// exercise OPTION/LIST/TUPLE explicitly, since a metavar-bearing tail is exactly
+// where a too-wide gate would show up first.
+
+test "a declared Option[Int] tail carrying None is untouched" {
+    let mut s = "fn f() -> Option[Int] \{ None }\n"
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let o = f()\n")
+    s = s.concat("    assert(o.is_none())\n")
+    s = s.concat("}\n")
+    let r = compile_test_helpers.compile_and_run(s, "farq9f_guard_option")
+    assert_eq(r.exit_code, 0)
+}
+
+test "a declared List[Int] tail carrying an empty literal is untouched" {
+    let mut s = "fn f() -> List[Int] \{ [] }\n"
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let l = f()\n")
+    s = s.concat("    assert_eq(l.len(), 0)\n")
+    s = s.concat("}\n")
+    let r = compile_test_helpers.compile_and_run(s, "farq9f_guard_list")
+    assert_eq(r.exit_code, 0)
+}
+
+test "a declared tuple tail carrying a bare None is untouched" {
+    let mut s = "fn f() -> (Int, Option[Int]) \{ (1, None) }\n"
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let t = f()\n")
+    s = s.concat("    assert_eq(t.0, 1)\n")
+    s = s.concat("    assert(t.1.is_none())\n")
+    s = s.concat("}\n")
+    let r = compile_test_helpers.compile_and_run(s, "farq9f_guard_tuple")
+    assert_eq(r.exit_code, 0)
+}
+
+// ── non-Int scalar keys: Bool / Char / I32 ───────────────────────────────────
+
+test "a declared Bool-keyed Map return pins the bool kops" {
+    let mut s = "fn mkmap() -> Map[Bool, Str] \{ Map() }\n"
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let m = mkmap()\n")
+    s = s.concat("    m.insert(true, \"yes\")\n")
+    s = s.concat("    assert(m.get(true).unwrap() == \"yes\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_no_error(s, "farq9f_bool_ice", "I0001")
+    let c = compile_test_helpers.compile_and_emit_c(s, "farq9f_bool_c")
+    assert_has(c, "blink_map_new(&blink_kops_bool)", "bool kops")
+    let r = compile_test_helpers.compile_and_run(s, "farq9f_bool_run")
+    assert_eq(r.exit_code, 0)
+}
+
+test "a declared Char-keyed Map return pins the char kops" {
+    let mut s = "fn mkmap() -> Map[Char, Str] \{ Map() }\n"
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let m = mkmap()\n")
+    s = s.concat("    m.insert('x', \"ex\")\n")
+    s = s.concat("    assert(m.get('x').unwrap() == \"ex\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_no_error(s, "farq9f_char_ice", "I0001")
+    let c = compile_test_helpers.compile_and_emit_c(s, "farq9f_char_c")
+    assert_has(c, "blink_map_new(&blink_kops_char)", "char kops")
+    let r = compile_test_helpers.compile_and_run(s, "farq9f_char_run")
+    assert_eq(r.exit_code, 0)
+}
+
+test "a declared I32-keyed Map return pins the i32 kops" {
+    let mut s = "fn mkmap() -> Map[I32, Str] \{ Map() }\n"
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let m = mkmap()\n")
+    s = s.concat("    m.insert(256, \"lo\")\n")
+    s = s.concat("    m.insert(512, \"hi\")\n")
+    s = s.concat("    assert_eq(m.len(), 2)\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_no_error(s, "farq9f_i32_ice", "I0001")
+    let c = compile_test_helpers.compile_and_emit_c(s, "farq9f_i32_c")
+    assert_has(c, "blink_map_new(&blink_kops_i32)", "i32 kops")
+    let r = compile_test_helpers.compile_and_run(s, "farq9f_i32_run")
+    assert_eq(r.exit_code, 0)
+}
+
+// ── @derive(Hash, Eq) struct key ──────────────────────────────────────────────
+// The pin itself (tc_unify against the declared TK_MAP) reaches the constructor
+// for a struct key exactly like a scalar key — confirmed here at the C-emission
+// level. Compiling THIS SNIPPET further (linking + running) hits an unrelated,
+// pre-existing gap: a struct-keyed Map returned from a plain (non-generic) fn
+// boxes the key as `void` at the .insert()/.get() call sites, because
+// reg_fn_ret_from_ann's Map branch never records the key/value struct name and
+// the plain-call CT_MAP arm (codegen_expr.bl:~4746) never reads it back — filed
+// as br 97d605, independent of farq9f. This row stops at compile_and_emit_c so
+// it verifies only what farq9f actually fixes.
+
+test "a declared @derive(Hash,Eq) struct-keyed Map return pins the struct kops" {
+    let mut s = "@derive(Hash, Eq)\ntype Point \{ x: Int, y: Int }\n"
+    s = s.concat("fn mkmap() -> Map[Point, Str] \{ Map() }\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let m = mkmap()\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_no_error(s, "farq9f_structkey_ice", "I0001")
+    let c = compile_test_helpers.compile_and_emit_c(s, "farq9f_structkey_c")
+    assert_has(c, "kops_blink_Point", "struct-key kops (or the mangled equivalent)")
+    assert_lacks(c, "blink_map_new(&blink_kops_str)", "struct key must not fall back to string kops")
+}
+
+// ── alias return: capture Stage-0 behavior, then require the pin to reach through ──
+// tc_pin_tail_ret_generic already calls resolve_alias_tid(declared_ret) before
+// reading `.kind`, so an aliased declared return is not a new gate — it rides the
+// same TK_MAP check as a spelled-out Map[Int,Str]. Verified at the C-emission
+// level: the constructor correctly picks blink_kops_i64 through the alias.
+// Compiling THIS SNIPPET further (linking + running) hits an unrelated,
+// pre-existing gap: c_type_for_alias (codegen_types.bl:7656) has no case for a
+// container base name, so `type IntMap = Map[Int, Str]` emits an invalid
+// `typedef blink_Map blink_IntMap;` regardless of return position — filed as
+// br sncncd, independent of farq9f. This row stops at compile_and_emit_c.
+
+test "a type-aliased Map return still pins through the alias" {
+    let mut s = "type IntMap = Map[Int, Str]\n"
+    s = s.concat("fn mkmap() -> IntMap \{ Map() }\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let m = mkmap()\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_no_error(s, "farq9f_alias_ice", "I0001")
+    let c = compile_test_helpers.compile_and_emit_c(s, "farq9f_alias_c")
+    assert_has(c, "blink_map_new(&blink_kops_i64)", "aliased Int-key kops")
+    assert_lacks(c, "blink_map_new(&blink_kops_str)", "aliased Int key must not hash as a string")
+}
+
+// ── a genuine mismatch must still be diagnosed ───────────────────────────────
+// The pin runs only where types_compatible ALREADY agreed (:1576-1578); a real
+// mismatch keeps its diagnostic untouched.
+
+test "a declared/body Map key mismatch is still diagnosed" {
+    let mut s = "fn mkmap() -> Map[Int, Str] \{\n"
+    s = s.concat("    let m: Map[Str, Int] = Map()\n")
+    s = s.concat("    m\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{ let _m = mkmap() }\n")
+    compile_test_helpers.expect_compile_error(s, "farq9f_mismatch", "E0300")
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// Stage 2 — (C) def-side return-annotation tier
+// ══════════════════════════════════════════════════════════════════════════
+// The typecheck pin never reaches an impl method (br ya8qyf — lookup_fnsig misses
+// for every method) or a closure (tc_in_closure_depth gate, by design). Both need
+// codegen's OWN return-annotation reader.
+
+test "an impl method's declared Map return pins the i64 kops" {
+    let mut s = "type Holder \{ n: Int }\n"
+    s = s.concat("trait Maker \{ fn make(self) -> Map[Int, Str] }\n")
+    s = s.concat("impl Maker for Holder \{\n")
+    s = s.concat("    fn make(self) -> Map[Int, Str] \{ Map() }\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let h = Holder \{ n: 1 }\n")
+    s = s.concat("    let m = h.make()\n")
+    s = s.concat("    m.insert(256, \"lo\")\n")
+    s = s.concat("    m.insert(512, \"hi\")\n")
+    s = s.concat("    assert_eq(m.len(), 2)\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_no_error(s, "farq9f_impl_ice", "I0001")
+    let c = compile_test_helpers.compile_and_emit_c(s, "farq9f_impl_c")
+    assert_has(c, "blink_map_new(&blink_kops_i64)", "impl-method Int-key kops")
+    assert_lacks(c, "blink_map_new(&blink_kops_str)", "impl-method must not hash Int as string")
+    let r = compile_test_helpers.compile_and_run(s, "farq9f_impl_run")
+    assert_eq(r.exit_code, 0)
+}
+
+test "an annotated closure's own declared Map return pins the i64 kops" {
+    let mut s = "fn a() -> Map[Int, Str] \{\n"
+    s = s.concat("    let c = fn() -> Map[Int, Str] \{ Map() }\n")
+    s = s.concat("    c()\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let m = a()\n")
+    s = s.concat("    m.insert(256, \"lo\")\n")
+    s = s.concat("    m.insert(512, \"hi\")\n")
+    s = s.concat("    assert_eq(m.len(), 2)\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_no_error(s, "farq9f_closure_ann_ice", "I0001")
+    let c = compile_test_helpers.compile_and_emit_c(s, "farq9f_closure_ann_c")
+    assert_has(c, "blink_map_new(&blink_kops_i64)", "annotated-closure Int-key kops")
+    assert_lacks(c, "blink_map_new(&blink_kops_str)", "annotated closure must not hash Int as string")
+    let r = compile_test_helpers.compile_and_run(s, "farq9f_closure_ann_run")
+    assert_eq(r.exit_code, 0)
+}
+
+// ── tuple key through a declared return ──────────────────────────────────────
+// The ctor itself (ctor_ret_ann_kops_elem reading the return annotation) correctly
+// picks blink_kops_blink_Tuple2_int_int — confirmed here at the C-emission level.
+// Compiling THIS SNIPPET further (linking + running) hits the same unrelated,
+// pre-existing gap as the struct-keyed row above: a compound-keyed Map returned
+// from a plain (non-generic) fn boxes the key as `void` at the .insert()/.get()
+// call sites, because reg_fn_ret_from_ann's Map branch never records the
+// key/value carrier name and the plain-call CT_MAP arm never reads it back — now
+// confirmed to also fire for a tuple key, not just a struct key (br 97d605, noted
+// there). This row stops at compile_and_emit_c so it verifies only what farq9f's
+// Stage 2 actually fixes: the ctor's kops selection.
+test "a declared tuple-keyed Map return pins the tuple carrier, not the string default" {
+    let mut s = "fn mkmap() -> Map[(Int, Int), Str] \{ Map() }\n"
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let m = mkmap()\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_no_error(s, "farq9f_tuplekey_ice", "I0001")
+    let c = compile_test_helpers.compile_and_emit_c(s, "farq9f_tuplekey_c")
+    assert_lacks(c, "blink_map_new(&blink_kops_str)", "tuple key must not fall back to string kops")
+    assert_lacks(c, "BLINK_COMPILER_BUG", "tuple key must register a real kops table")
+    assert_has(c, "kops_blink_Tuple2_int_int", "tuple carrier kops registered")
+}
+
+// ── generic-fn return, monomorphized at a concrete K ─────────────────────────
+
+test "a generic fn's declared Map[K,Str] return pins per-instantiation" {
+    let mut s = "fn mk[K]() -> Map[K, Str] \{ Map() }\n"
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let m: Map[Int, Str] = mk()\n")
+    s = s.concat("    m.insert(256, \"lo\")\n")
+    s = s.concat("    m.insert(512, \"hi\")\n")
+    s = s.concat("    assert_eq(m.len(), 2)\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_no_error(s, "farq9f_genericfn_ice", "I0001")
+    let c = compile_test_helpers.compile_and_emit_c(s, "farq9f_genericfn_c")
+    assert_has(c, "blink_map_new(&blink_kops_i64)", "generic-fn mono Int-key kops")
+    assert_lacks(c, "blink_map_new(&blink_kops_str)", "generic-fn mono must not hash Int as string")
+    let r = compile_test_helpers.compile_and_run(s, "farq9f_genericfn_run")
+    assert_eq(r.exit_code, 0)
+}
+
+// ── control: a generic fn with a Map[T,Str] return that is NEVER monomorphized
+// concretely must not ICE — codegen only visits monomorphized instances, so a
+// purely generic, never-called body has nothing to fail closed on. ──
+
+test "an un-monomorphized generic Map-returning fn does not ICE" {
+    let mut s = "fn mk[T]() -> Map[T, Str] \{ Map() }\n"
+    s = s.concat("fn main() \{ assert_eq(1, 1) }\n")
+    compile_test_helpers.expect_no_error(s, "farq9f_generic_unused_ice", "I0001")
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// Stage 3 — (B) fail-closed on a provably-unsolved kops slot
+// ══════════════════════════════════════════════════════════════════════════
+// Both rows below are genuinely under-determined AND slip past the front-end E0301
+// region-boundary check (it is scope-pop-triggered; a bare tail ctor with no
+// intervening let has no scope-pop to fire it, and a bare generic typevar target
+// makes types_compatible permissive rather than a mismatch). This is precisely the
+// gap (B) exists to close: a loud I0001 instead of the old silent kops_str default.
+
+test "a bare generic-typevar return whose body is Map() fails closed with I0001" {
+    let mut s = "fn mk[T]() -> T \{ Map() }\n"
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let m: Map[Int, Str] = mk()\n")
+    s = s.concat("    let _n = m.len()\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_compile_error(s, "farq9f_bare_typevar_ice", "I0001")
+}
+
+test "an un-annotated closure's own Map() tail fails closed with I0001" {
+    let mut s = "fn a() -> Map[Int, Str] \{\n"
+    s = s.concat("    let c = fn() \{ Map() }\n")
+    s = s.concat("    c()\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{ let _m = a() }\n")
+    compile_test_helpers.expect_compile_error(s, "farq9f_unannotated_closure_ice", "I0001")
+}
+
+// ── over-fire guards: every shape below must compile AND run clean ──────────
+// These are the most important rows in the file. (B) is gated tail-only, so none of
+// these — none of them a bare tail Map()/Set() against a declared MAP/SET/STRUCT/ENUM
+// return — may reach the fail-closed chokepoint.
+
+test "over-fire guard: the annotated-let workaround stays clean" {
+    let mut s = "fn mkmap() -> Map[Int, Str] \{\n"
+    s = s.concat("    let m: Map[Int, Str] = Map()\n")
+    s = s.concat("    m\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let m = mkmap()\n")
+    s = s.concat("    m.insert(256, \"lo\")\n")
+    s = s.concat("    assert_eq(m.len(), 1)\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_no_error(s, "farq9f_guard_annotated_let", "I0001")
+    let r = compile_test_helpers.compile_and_run(s, "farq9f_guard_annotated_let_run")
+    assert_eq(r.exit_code, 0)
+}
+
+// The src/escape.bl:208 shape: Map() as a call ARG (not a tail value) inside a
+// Void-returning fn. Neither the declared-return type (Void) nor tail position
+// admits this to the pin or to (B) — this is the `task regen` canary.
+test "over-fire guard: List[Map[Str,Str]] push(Map()) (the escape.bl:208 shape)" {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let mut fs: List[Map[Str, Str]] = []\n")
+    s = s.concat("    fs.push(Map())\n")
+    s = s.concat("    assert_eq(fs.len(), 1)\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_no_error(s, "farq9f_guard_list_push", "I0001")
+    let r = compile_test_helpers.compile_and_run(s, "farq9f_guard_list_push_run")
+    assert_eq(r.exit_code, 0)
+}
+
+// A non-tail struct-literal field Map() inside a fn returning a DIFFERENT container
+// (so `struct_lit_is_fn_tail_value`-style gates must see this as NOT the tail value).
+test "over-fire guard: a non-tail struct field Map() inside a differently-typed return" {
+    let mut s = "type Holder \{ m: Map[Str, Int] }\n"
+    s = s.concat("fn f() -> List[Int] \{\n")
+    s = s.concat("    let h = Holder \{ m: Map() }\n")
+    s = s.concat("    h.m.insert(\"a\", 1)\n")
+    s = s.concat("    [h.m.get(\"a\").unwrap()]\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let l = f()\n")
+    s = s.concat("    assert_eq(l.get(0).unwrap(), 1)\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_no_error(s, "farq9f_guard_nontail_field", "I0001")
+    let r = compile_test_helpers.compile_and_run(s, "farq9f_guard_nontail_field_run")
+    assert_eq(r.exit_code, 0)
+}
+
+// A map_filter-shaped HOF: Map() constructed inside a helper whose OWN declared
+// return is the same concrete Map type, mirroring lib/std/map.bl's map_filter.
+test "over-fire guard: a map_filter-shaped HOF stays clean" {
+    let mut s = "fn keep_gt(m: Map[Int, Str], threshold: Int) -> Map[Int, Str] \{\n"
+    s = s.concat("    let mut out = Map()\n")
+    s = s.concat("    for k in m.keys() \{\n")
+    s = s.concat("        if k > threshold \{ out.insert(k, m.get(k).unwrap()) }\n")
+    s = s.concat("    }\n")
+    s = s.concat("    out\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let mut m: Map[Int, Str] = Map()\n")
+    s = s.concat("    m.insert(256, \"a\")\n")
+    s = s.concat("    m.insert(1, \"b\")\n")
+    s = s.concat("    let out = keep_gt(m, 10)\n")
+    s = s.concat("    assert_eq(out.len(), 1)\n")
+    s = s.concat("    assert(out.get(256).unwrap() == \"a\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_no_error(s, "farq9f_guard_hof", "I0001")
+    let r = compile_test_helpers.compile_and_run(s, "farq9f_guard_hof_run")
+    assert_eq(r.exit_code, 0)
+}
+
+// A generic-struct field Map() with NO declared return in scope at all must stay
+// E0301 (a loud front-end stop), never silently promoted to I0001 by (B) — (B) only
+// answers "no tier could name this AND it is still under-determined," and here the
+// front end already has the definitive answer.
+test "over-fire guard: an unpinnable generic-struct field stays E0301, not I0001" {
+    let mut s = "type GKV[K, V] \{ m: Map[K, V] }\n"
+    s = s.concat("fn f() \{ let _x = GKV \{ m: Map() } }\n")
+    s = s.concat("fn main() \{ f() }\n")
+    compile_test_helpers.expect_compile_error(s, "farq9f_guard_e0301", "E0301")
+    compile_test_helpers.expect_no_error(s, "farq9f_guard_e0301_not_ice", "I0001")
+}
+
+test "blink explain I0001 still returns the catalog entry" {
+    compile_test_helpers.verify_catalog_entry("I0001", "UnsolvedTypeVarAtCodegen")
+}

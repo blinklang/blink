@@ -185,18 +185,28 @@ test "FLOOR: a Void-returning fn still reports E0301 for an unpinnable let" {
     compile_test_helpers.expect_compile_error(src, "r9krgr_floor_void", "E0301")
 }
 
-// tc_pin_tail_ret_generic gates on TK_STRUCT/TK_ENUM, so a declared `Map`/`Set`
-// return does NOT pin its tail — the documented non-struct gap. It must stay E0301
-// (a loud stop) rather than becoming a wrong-kops silent miscompile: that gate is
-// what keeps every existing tail-`None` / tail-`[]` / tail-tuple return untouched.
-// Tracked separately as its own bug.
-test "FLOOR: a declared Map return still does not pin its tail (documented gap)" {
-    let mut src = "fn a() -> Map[Str, Int] \{\n"
+// br farq9f: tc_pin_admits_declared now also admits TK_MAP/TK_SET (not just
+// TK_STRUCT/TK_ENUM), so a declared `Map`/`Set` return pins its tail exactly like
+// the GKV-wrapped case above — an intermediate `let` no longer shields the ctor
+// from the declared return type. Was E0301 (a documented gap); now pins to the
+// declared key's kops, same load-bearing assertion as the GKV rows above.
+test "an intermediate let before a bare Map tail pins the declared key kops" {
+    let mut src = "fn a() -> Map[Int, Str] \{\n"
     src = src.concat("    let m = Map()\n")
     src = src.concat("    m\n")
     src = src.concat("}\n")
-    src = src.concat("fn main() \{ let _x = a() }\n")
-    compile_test_helpers.expect_compile_error(src, "r9krgr_floor_map", "E0301")
+    src = src.concat("fn main() \{\n")
+    src = src.concat("    let m = a()\n")
+    src = src.concat("    m.insert(256, \"lo\")\n")
+    src = src.concat("    m.insert(512, \"hi\")\n")
+    src = src.concat("    assert_eq(m.len(), 2)\n")
+    src = src.concat("}\n")
+    compile_test_helpers.expect_no_error(src, "r9krgr_map_ice", "I0001")
+    let c = compile_test_helpers.compile_and_emit_c(src, "r9krgr_map_c")
+    assert_has(c, "blink_map_new(&blink_kops_i64)", "bare-Map intermediate-let Int-key kops")
+    assert_lacks(c, "blink_map_new(&blink_kops_str)", "bare-Map intermediate-let must not hash an Int key as a string")
+    let r = compile_test_helpers.compile_and_run(src, "r9krgr_map_run")
+    assert_eq(r.exit_code, 0)
 }
 
 // The missing-return-value diagnostic. infer_type(Block) returns TYPE_VOID (not

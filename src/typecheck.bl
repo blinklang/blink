@@ -1490,12 +1490,16 @@ fn tc_pin_generic_args_from_binds(sig: Int, args_sl: Int, self_offset: Int) ! Ty
 }
 
 // A function's declared return type is an expected-type source
-// (sections/03_types.md:1031), so a generic-struct/enum literal in return position
-// must monomorphize against it. `fn a() -> GKV[Int, Str] { GKV { m: Map() } }` got
-// no such constraint: tc_struct_lit_instance_tid mints `GKV[?a, ?b]` from the
-// `Map()` field's own unbound metavars, nobody unified it against the declared
-// `GKV[Int, Str]`, and codegen reached the struct-lit mono chokepoint with two
-// unsolved params — I0001 (br y1n3ck).
+// (sections/03_types.md:1031), so a generic-struct/enum literal — or a Map/Set
+// construction — in return position must monomorphize against it.
+// `fn a() -> GKV[Int, Str] { GKV { m: Map() } }` got no such constraint:
+// tc_struct_lit_instance_tid mints `GKV[?a, ?b]` from the `Map()` field's own
+// unbound metavars, nobody unified it against the declared `GKV[Int, Str]`, and
+// codegen reached the struct-lit mono chokepoint with two unsolved params — I0001
+// (br y1n3ck). `fn mkmap() -> Map[Int, Str] { Map() }` has the identical shape one
+// level up: the bare `Map()` ctor mints `Map[?a, ?b]` and nothing pins it either —
+// but there is no struct-lit mono chokepoint to catch it, so it silently reaches
+// codegen's CT_STRING kops default instead of an ICE (br farq9f).
 //
 // The pin is an IN-PLACE tc_unify, not a hint seed. That distinction is the whole
 // fix: the metavar integers in the instance's arg list are the SAME integers the
@@ -1505,13 +1509,18 @@ fn tc_pin_generic_args_from_binds(sig: Int, args_sl: Int, self_offset: Int) ! Ty
 // blink_kops_str for an Int key, trading a loud ICE for the silent br hnyqe4 hash
 // collision.
 //
-// Each of the three gates is load-bearing:
-//   TK_STRUCT/TK_ENUM  — excludes Option/Result/List/Map/Set/tuple/Handler returns,
-//                        which is what keeps every existing tail-`None` / tail-`[]`
-//                        / tail-tuple return byte-identical.
+// tc_pin_admits_declared is the gate; each branch is load-bearing:
+//   TK_MAP/TK_SET      — the only kind whose params_count is never set (br farq9f;
+//                        make_map_type/make_set_type store inner1/inner2, not a
+//                        ty_param_list), so it must admit unconditionally rather
+//                        than fall into the params_count check below.
+//   TK_STRUCT/TK_ENUM  — excludes Option/Result/List/tuple/Handler returns, which
+//                        is what keeps every existing tail-`None` / tail-`[]` /
+//                        tail-tuple return byte-identical.
 //   params_count > 0   — a monomorphic struct has nothing to pin.
-//   unbound metavar    — excludes a bare TK_TYPEVAR, so a generic fn's `-> Box[T]`
-//                        keeps its existing per-T monomorphization untouched.
+// The caller additionally requires an unbound metavar in the inferred value, which
+// excludes a bare TK_TYPEVAR, so a generic fn's `-> Box[T]` keeps its existing
+// per-T monomorphization untouched.
 //
 // The unify result is deliberately discarded: callers invoke this only where
 // types_compatible ALREADY agreed, so there is no new mismatch to report, and a
@@ -1524,12 +1533,18 @@ fn tc_pin_generic_args_from_binds(sig: Int, args_sl: Int, self_offset: Int) ! Ty
 // metavar-carrying value", and every gate above reads the same either way. Not
 // renamed on purpose — a rename of a compiler-internal helper costs a 3-step
 // bootstrap and buys nothing a comment cannot say.
+fn tc_pin_admits_declared(d: Int) -> Int {
+    if d < 0 || d >= ty_pool.len() { return 0 }
+    let dt = ty_pool.get(d).unwrap()
+    if dt.kind == TK_MAP || dt.kind == TK_SET { return 1 }
+    if dt.kind != TK_STRUCT && dt.kind != TK_ENUM { return 0 }
+    if dt.params_count == 0 { return 0 }
+    1
+}
+
 fn tc_pin_tail_ret_generic(declared_ret: Int, inferred_ret: Int) {
     let d = resolve_alias_tid(declared_ret)
-    if d < 0 || d >= ty_pool.len() { return }
-    let dt = ty_pool.get(d).unwrap()
-    if dt.kind != TK_STRUCT && dt.kind != TK_ENUM { return }
-    if dt.params_count == 0 { return }
+    if tc_pin_admits_declared(d) == 0 { return }
     if tc_tid_has_unbound_metavar(inferred_ret) == 0 { return }
     let _ = tc_unify(d, inferred_ret)
 }
@@ -9937,6 +9952,25 @@ pub fn tc_tid_set_elem_struct_resolved(tid: Int) -> Str {
     let t = ty_pool.get(tid).unwrap()
     if t.kind != TK_SET { return "" }
     tid_inner_struct(tc_resolve(t.inner1))
+}
+
+// Is a Map/Set tid's KOPS-DECIDING slot (the key for Map, the element for Set —
+// inner1 either way) still a genuinely unbound metavar? The fail-closed backstop
+// (br farq9f Stage 3) uses this, not tc_tid_has_unbound_metavar, because that
+// predicate also descends the Map VALUE slot (inner2) — `Map[Int, ?v]` is a
+// reachable, CORRECT state (the value type doesn't affect kops_table_name) and
+// must not be misreported as unsolved. tc_is_unbound_metavar (not a bare kind
+// check) is deliberate too: it excludes both a real TK_TYPEVAR and the shared
+// TYPE_UNKNOWN singleton, so neither is slandered as "unsolved" by this gate.
+// Returns 0 — "no evidence", not "proof of a solved slot" — for a non-Map/Set
+// tid, an out-of-range tid, or a container mismatch: absence of an unsolved
+// metavar is not the same claim as absence of an answer.
+pub fn tc_tid_kops_slot_unsolved(tid: Int, container: Str) -> Int {
+    if tid < 0 || tid >= ty_pool.len() { return 0 }
+    let t = ty_pool.get(tid).unwrap()
+    let want_kind = if container == "Map" { TK_MAP } else { TK_SET }
+    if t.kind != want_kind { return 0 }
+    tc_is_unbound_metavar(tc_resolve(t.inner1))
 }
 
 // The raw value-slot tid for a Map tid — twin of tc_tid_map_val_struct but
