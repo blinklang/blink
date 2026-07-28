@@ -1,0 +1,238 @@
+// br e2kjqy (seam 2 of 2): a struct literal's DECLARED FIELD TYPE is a declared-type
+// source for a return-only type param, exactly as a let annotation and an assignment
+// target are.
+//
+//     type W { s: Set[Int] }
+//     fn mkset[T]() -> Set[T] { Set() }
+//     let w = W { s: mkset() }        // <- I0001 "Set()'s key/element type reached
+//                                     //    construction unsolved"
+//
+// THE TICKET NAMES THE WRONG SEAM. It points at the binds loop in
+// tc_struct_lit_instance_tid, which cannot run for its own repro: that function
+// returns early when the struct declares no type params, and `Wrapper` is
+// monomorphic. Verifying that turned up the larger fact — there is NO struct-literal
+// field-value type check anywhere in the compiler. The binds loop is the only place a
+// declared field type meets its value's type, and its consumer unify_typevar_binds is
+// a pure bind COLLECTOR that never mutates a metavar. So the pin is a new,
+// deliberately-scoped walk, placed as the first statement of
+// tc_struct_lit_instance_tid: one live caller, so it covers generic AND monomorphic
+// outer structs with no call-site edit, and running BEFORE the binds loop means a
+// generic outer struct sees the solved α when building its own instance args.
+//
+// TWO GATES, IN THIS ORDER. tc_call_mints_ret_only is purely syntactic — is the field
+// value a direct Call to a bare Ident whose sig declares a return-only tparam? — and
+// tc_node_has_ret_mint then confirms a mint actually exists. On first visit the value
+// has never been inferred, so the mint does not exist yet and the existence check
+// alone reads 0; the syntactic check answers "CAN this mint" without paying for an
+// infer. Dropping the syntactic one would re-infer every field of every struct
+// literal in the program (infer_type does not memoize its diagnostics), and would
+// also un-exclude the hazard the tripwire row below pins.
+//
+// WHY THE kops ASSERTIONS ARE THE LOAD-BEARING ONES. The pin binds the metavar IN
+// PLACE, so the same integer the mono name reads is the one the ctor's kops vtable
+// reads. A fix that solved only the name would leave resolve_ctor_kops_elem on its
+// CT_STRING default: blink_kops_str for an Int element. 256 and 512 both carry a 0x00
+// low byte, so under the string hasher they collide as the empty string — the br
+// hnyqe4 corruption signature. Asserting kops_i64 present AND kops_str absent, plus
+// the runtime round-trip, is what separates the two.
+
+import compile_test_helpers
+import std.io
+
+fn assert_has(c: Str, needle: Str, label: Str) {
+    if !c.contains(needle) { io.println("FAIL: {label} — missing '{needle}'") }
+    assert(c.contains(needle))
+}
+
+fn assert_lacks(c: Str, needle: Str, label: Str) {
+    if c.contains(needle) { io.println("FAIL: {label} — forbidden '{needle}' present") }
+    assert(!c.contains(needle))
+}
+
+// ── the seam, fully observable: a declared Set/Map field ─────────────────────
+// These spellings keep the whole row inside working codegen. A field declared as a
+// generic-struct INSTANCE (the ticket's own `inner: RGT[Int]`) additionally trips br
+// 50cmqc — see that row's comment — so it can only assert names.
+
+fn src_set_field() -> Str {
+    let mut s = "type W \{ s: Set[Int] }\n"
+    s = s.concat("fn mkset[T]() -> Set[T] \{ Set() }\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let w = W \{ s: mkset() }\n")
+    s = s.concat("    w.s.insert(256)\n")
+    s = s.concat("    w.s.insert(512)\n")
+    s = s.concat("    assert_eq(w.s.len(), 2)\n")
+    s = s.concat("    assert(w.s.contains(256))\n")
+    s = s.concat("    assert(w.s.contains(512))\n")
+    s = s.concat("    assert(!w.s.contains(257))\n")
+    s = s.concat("}\n")
+    s
+}
+
+fn src_map_field() -> Str {
+    let mut s = "type WM \{ m: Map[Int, Str] }\n"
+    s = s.concat("fn mkmap[K, V]() -> Map[K, V] \{ Map() }\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let w = WM \{ m: mkmap() }\n")
+    s = s.concat("    w.m.insert(256, \"lo\")\n")
+    s = s.concat("    w.m.insert(512, \"hi\")\n")
+    s = s.concat("    assert_eq(w.m.len(), 2)\n")
+    s = s.concat("    assert(w.m.get(256).unwrap() == \"lo\")\n")
+    s = s.concat("    assert(w.m.get(512).unwrap() == \"hi\")\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "a declared Set field pins a return-only tparam (no ICE)" {
+    let out = compile_test_helpers.compile_and_capture(src_set_field(), "e2kjqy_setfld_diag")
+    assert_lacks(out, "I0001", "Set field / no unsolved-typevar ICE")
+    assert_lacks(out, "E0301", "Set field / the declared field type determines the slot")
+    assert_lacks(out, "E0505", "Set field / methods resolve on the field")
+}
+
+test "a declared Set field gets the i64 kops, not the erased str default" {
+    let c = compile_test_helpers.compile_and_emit_c(src_set_field(), "e2kjqy_setfld_c")
+    assert_has(c, "blink_set_new(&blink_kops_i64)", "Set field / Int-element kops")
+    assert_lacks(c, "blink_kops_str", "Set field / must not hash an Int element as a string")
+    assert_lacks(c, "_Void", "Set field / string-producer erasure")
+    let r = compile_test_helpers.compile_and_run(src_set_field(), "e2kjqy_setfld_run")
+    assert_eq(r.exit_code, 0)
+}
+
+test "a declared two-tparam Map field pins both slots positionally" {
+    let out = compile_test_helpers.compile_and_capture(src_map_field(), "e2kjqy_mapfld_diag")
+    assert_lacks(out, "I0001", "Map field / no unsolved-typevar ICE")
+    assert_lacks(out, "E0301", "Map field / the declared field type determines both slots")
+    let c = compile_test_helpers.compile_and_emit_c(src_map_field(), "e2kjqy_mapfld_c")
+    assert_has(c, "blink_map_new(&blink_kops_i64)", "Map field / Int-key kops")
+    assert_lacks(c, "blink_kops_str", "Map field / must not hash an Int key as a string")
+    assert_lacks(c, "_Void", "Map field / string-producer erasure")
+    let r = compile_test_helpers.compile_and_run(src_map_field(), "e2kjqy_mapfld_run")
+    assert_eq(r.exit_code, 0)
+}
+
+// ── the ticket's own repro: a generic-struct INSTANCE field ─────────────────
+// NAME-LEVEL ONLY, and not by choice: br 50cmqc. A struct field DECLARED as a
+// generic-struct instance (`inner: RGT[Int]`) lowers to the bare base name —
+// `blink_Wrapper` gets a `blink_RGT inner;` member, which is never typedef'd — so the
+// emitted C does not compile and reading the field back reports a spurious E0505 on
+// its own Set. That defect is fully concrete: it reproduces with no generic fn, no
+// assignment and no under-determination anywhere, so it is not this pin's to fix and
+// its E0505 is NOT evidence the pin failed. What the pin alone decides — mk's mono
+// name, RGT's mono typedef, and the Set ctor's kops — is asserted here. Add the
+// round-trip and the E0505 row when 50cmqc lands.
+fn src_instance_field() -> Str {
+    let mut s = "type RGT[T] \{ s: Set[T] }\n"
+    s = s.concat("type Wrapper \{ inner: RGT[Int] }\n")
+    s = s.concat("fn mk[T]() -> RGT[T] \{ RGT \{ s: Set() } }\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let w = Wrapper \{ inner: mk() }\n")
+    s = s.concat("    assert(1 == 1)\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "a generic-struct-instance field pins the ticket MVCE" {
+    let out = compile_test_helpers.compile_and_capture(src_instance_field(), "e2kjqy_instfld_diag")
+    assert_lacks(out, "I0001", "instance field / no unsolved-typevar ICE")
+    assert_lacks(out, "E0301", "instance field / the declared field type determines the slot")
+    let c = compile_test_helpers.compile_and_emit_c(src_instance_field(), "e2kjqy_instfld_c")
+    assert_has(c, "} blink_RGT_Int;", "instance field / struct mono typedef")
+    assert_has(c, "blink_mk_Int", "instance field / fn mono name")
+    assert_has(c, "blink_set_new(&blink_kops_i64)", "instance field / Int-element kops")
+    assert_lacks(c, "blink_kops_str", "instance field / must not hash an Int element as a string")
+    assert_lacks(c, "_Void", "instance field / string-producer erasure")
+}
+
+// ── the pin runs BEFORE the binds loop and must not disturb it ──────────────
+// GWrap's own instance arg comes from the `tag` field's concrete bind. The pinned
+// `inner` field is a Set, which the binds loop deliberately treats as carrying no
+// concrete information for X — so if the early pin had corrupted the loop's
+// concrete/open-metavar decision, GWrap would either lose its `_Int` instance or mint
+// a spurious open one.
+
+test "a generic outer struct still mints its own instance around a pinned field" {
+    let mut src = "type GWrap[X] \{ tag: X, inner: Set[Int] }\n"
+    src = src.concat("fn mkset[T]() -> Set[T] \{ Set() }\n")
+    src = src.concat("fn main() \{\n")
+    src = src.concat("    let g = GWrap \{ tag: 7, inner: mkset() }\n")
+    src = src.concat("    g.inner.insert(256)\n")
+    src = src.concat("    g.inner.insert(512)\n")
+    src = src.concat("    assert_eq(g.tag, 7)\n")
+    src = src.concat("    assert_eq(g.inner.len(), 2)\n")
+    src = src.concat("    assert(g.inner.contains(512))\n")
+    src = src.concat("}\n")
+    let out = compile_test_helpers.compile_and_capture(src, "e2kjqy_gwrap_diag")
+    assert_lacks(out, "I0001", "generic outer / no unsolved-typevar ICE")
+    assert_lacks(out, "E0301", "generic outer / both the tag bind and the pin resolve")
+    let c = compile_test_helpers.compile_and_emit_c(src, "e2kjqy_gwrap_c")
+    assert_has(c, "} blink_GWrap_Int;", "generic outer / own instance typedef survives the early pin")
+    assert_has(c, "blink_set_new(&blink_kops_i64)", "generic outer / pinned field's Int kops")
+    assert_lacks(c, "blink_kops_str", "generic outer / must not hash an Int element as a string")
+    assert_lacks(c, "_Void", "generic outer / string-producer erasure")
+    let r = compile_test_helpers.compile_and_run(src, "e2kjqy_gwrap_run")
+    assert_eq(r.exit_code, 0)
+}
+
+// ── tripwire: the hazard the syntactic gate structurally excludes ────────────
+// The doc on tc_node_has_ret_mint warns that an UNGATED pin also fires on a struct
+// literal carrying a bare-ctor field, driving a Float key into resolve_ctor_kops_elem,
+// which has no vtable for one and emits a BLINK_COMPILER_BUG_ sentinel — an invalid C
+// identifier. tc_call_mints_ret_only excludes it structurally: Map()/Set() are
+// builtins handled long before lookup_fnsig, so the lookup misses and the walk never
+// infers the field at all.
+//
+// This row pins "e2kjqy did not leak". It does NOT bless the latent kops behavior for
+// a Float key reached through a type arg — that enforcement gap (validate_map_key
+// rejects a declared Map[Float,_] but not one reached through a struct type arg) is
+// filed separately.
+
+test "a bare-ctor field under a Float-keyed annotation is untouched by the pin" {
+    let mut src = "type Box[T] \{ value: T }\n"
+    src = src.concat("fn main() \{\n")
+    src = src.concat("    let x: Box[Map[Float, Int]] = Box \{ value: Map() }\n")
+    src = src.concat("    assert(1 == 1)\n")
+    src = src.concat("}\n")
+    let out = compile_test_helpers.compile_and_capture(src, "e2kjqy_tripwire_diag")
+    assert_lacks(out, "I0001", "tripwire / the pin must not turn this into an ICE")
+    let c = compile_test_helpers.compile_and_emit_c(src, "e2kjqy_tripwire_c")
+    assert_lacks(c, "BLINK_COMPILER_BUG_", "tripwire / the pin must not drive a Float key to the kops sentinel")
+}
+
+// ── pinned loud: the two boundaries this commit deliberately does NOT cross ──
+
+// Not a direct Call, so tc_call_mints_ret_only reads 0 and the value is never
+// inferred by the walk. Reaching it needs a transitive successor predicate that is
+// only half-solvable from one arm's type; half-solved is the "compiles under a
+// wrong-but-plausible mono name" failure a loud I0001 exists to prevent. Filed
+// separately.
+test "a return-only mint behind an if-arm field value is still loud" {
+    let mut src = "type W \{ s: Set[Int] }\n"
+    src = src.concat("fn mkset[T]() -> Set[T] \{ Set() }\n")
+    src = src.concat("fn main() \{\n")
+    src = src.concat("    let w = W \{ s: if 1 == 1 \{ mkset() } else \{ mkset() } }\n")
+    src = src.concat("    assert_eq(w.s.len(), 0)\n")
+    src = src.concat("}\n")
+    let out = compile_test_helpers.compile_and_capture(src, "e2kjqy_ifarm_field_loud")
+    assert_has(out, "I0001", "if-arm field value stays a loud stop")
+}
+
+// tc_pin_admits_declared admits Map, Set, and generic struct/enum instances — not
+// TK_OPTION, not TK_RESULT, and not a variant payload. `Some(mk())` therefore has no
+// declared type the pin will accept, and the carrier seam is genuinely unpinned.
+// Filed separately; pinned here so the boundary is recorded, not assumed.
+test "a return-only mint inside an Option carrier is still loud" {
+    let mut src = "type RGT[T] \{ s: Set[T] }\n"
+    src = src.concat("fn mk[T]() -> RGT[T] \{ RGT \{ s: Set() } }\n")
+    src = src.concat("fn main() \{\n")
+    src = src.concat("    let o: Option[RGT[Int]] = Some(mk())\n")
+    src = src.concat("    assert(o.is_some())\n")
+    src = src.concat("}\n")
+    let out = compile_test_helpers.compile_and_capture(src, "e2kjqy_option_loud")
+    assert_has(out, "I0001", "Option-carried mint stays a loud stop")
+}
+
+test "E0301 and I0001 are both in the error catalog" {
+    compile_test_helpers.verify_catalog_entry("E0301", "CannotInferType")
+    compile_test_helpers.verify_catalog_entry("I0001", "UnsolvedTypeVarAtCodegen")
+}

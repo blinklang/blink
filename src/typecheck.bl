@@ -2152,7 +2152,95 @@ fn tc_evfield_instance_tid(ann_node: Int, bare_tid: Int) -> Int ! TypeCheck.Reso
 // A missing decl node (should not happen for a resolved struct) or a non-generic
 // struct (no type params) short-circuits to bare — no instance is minted for a
 // monomorphic struct, keeping the pool free of redundant entries.
+// Purely SYNTACTIC pre-check: is `v` a direct call to a bare Ident whose signature
+// declares at least one RETURN-ONLY type param — i.e. could this node have minted a
+// metavar that a declared type is entitled to pin?
+//
+// This is the load-bearing narrowing for tc_pin_struct_lit_field_ret_mints, on two
+// counts, and neither is an optimization detail:
+//
+//   • COST. infer_type does not memoize its diagnostics, so an unconditional infer
+//     per struct-literal field would re-run every field value's checking for every
+//     struct literal in the program. Answering "can this mint" without inferring
+//     keeps the walk free for the overwhelming majority of literals.
+//
+//   • SCOPE. It STRUCTURALLY excludes the hazard the pin doc at tc_node_has_ret_mint
+//     warns about — `let x: Box[Map[Float,Int]] = Box { value: Map() }`, which drives
+//     a Float key into resolve_ctor_kops_elem and out the BLINK_COMPILER_BUG_ escape.
+//     `Map()`/`Set()`/`[]`/`None` are builtins handled long before lookup_fnsig, so
+//     the lookup misses and this returns 0. The field pin therefore cannot reach a
+//     bare ctor field value at all; that shape stays exactly where it is today.
+//
+// A local binding of the same name shadows the global sig (a closure-valued
+// variable), so it is excluded the same way the Call arm of infer_type excludes it.
+fn tc_call_mints_ret_only(v: Int) -> Int {
+    if v == -1 { return 0 }
+    if node_kind(v) != NodeKind.Call { return 0 }
+    let callee = node_left(v)
+    if callee == -1 { return 0 }
+    if node_kind(callee) != NodeKind.Ident { return 0 }
+    let mut fn_name = node_name(callee)
+    fn_name = tc_alias_to_original.get(fn_name) ?? fn_name
+    if nr_get_type(fn_name) != TYPE_UNKNOWN { return 0 }
+    let sig = lookup_fnsig(fn_name)
+    if sig == -1 { return 0 }
+    let fs = fnsig_pool.get(sig).unwrap()
+    let mut pi = 0
+    while pi < fs.type_params_count {
+        let ro_idx = fs.type_params_start + pi
+        if ro_idx < fnsig_tparam_ret_only.len() {
+            if fnsig_tparam_ret_only.get(ro_idx).unwrap() != 0 { return 1 }
+        }
+        pi = pi + 1
+    }
+    0
+}
+
+// A struct literal's DECLARED FIELD TYPE is an expected-type source for that field's
+// value, exactly as a let annotation and an assignment target are (e2kjqy). Without
+// this, `Wrapper { inner: mk() }` for `fn mk[T]() -> RGT[T]` left the α minted for
+// mk's return-only T unbound and it reached the emit_struct_lit chokepoint erased.
+//
+// THERE IS NO OTHER PLACE THIS COULD LIVE. The compiler has no struct-literal
+// field-value type CHECK anywhere; the binds loop in tc_struct_lit_instance_tid below
+// is the only spot where a declared field type meets its value's type, and its
+// consumer unify_typevar_binds is a pure bind COLLECTOR that never mutates a metavar.
+// So this is a new, deliberately-scoped walk rather than an extra line in that loop —
+// and it must run BEFORE the loop, so a generic outer struct sees the solved α when it
+// builds its own instance args.
+//
+// TWO GATES, IN THIS ORDER, both required. On first visit the value has never been
+// inferred, so no mint exists yet and tc_node_has_ret_mint reads 0: the syntactic
+// check answers "CAN this mint" without inferring, and the existence check then
+// confirms "DID it". Reversing them makes the walk a no-op on every first visit;
+// dropping the syntactic one re-infers every field of every struct literal.
+//
+// Deliberately NOT transitive. A value that merely CONTAINS a minting call (an if or
+// match arm tail) is out of scope: reaching it needs a successor predicate that is
+// only half-solvable from one arm's type, and half-solved is the "compiles under a
+// wrong-but-plausible mono name" failure a loud I0001 exists to prevent.
+fn tc_pin_struct_lit_field_ret_mints(stid: Int, node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let flds_sl = node_fields(node)
+    if flds_sl == -1 { return }
+    let mut fi = 0
+    while fi < sublist_length(flds_sl) {
+        let f = sublist_get(flds_sl, fi)
+        let v = node_value(f)
+        if tc_call_mints_ret_only(v) != 0 {
+            let declared = get_struct_field_tid(stid, node_name(f))
+            if declared != -1 {
+                let inferred = infer_type(v)
+                if tc_node_has_ret_mint(v) != 0 {
+                    tc_pin_tail_ret_generic(declared, inferred)
+                }
+            }
+        }
+        fi = fi + 1
+    }
+}
+
 fn tc_struct_lit_instance_tid(stid: Int, sname: Str, node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    tc_pin_struct_lit_field_ret_mints(stid, node)
     let bare = strip_module_qualifier(sname)
     let decl = tc_struct_decl_nodes.get(bare) ?? -1
     if decl == -1 { return stid }
