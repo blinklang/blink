@@ -1,0 +1,173 @@
+// br jq85k8: a TWO-type-param generic fn returning its own generic-struct instance
+// (`fn mk[K, V]() -> GKV[K, V] { GKV { m: Map() } }`) called under an annotated let.
+//
+// THE TICKET'S PREMISE IS STALE. It was filed against a real I0001 ("mono args
+// 'Void,Void'") and blamed tc_pin_tail_ret_generic: `tc_unify(declared_ret,
+// inferred_ret)` where declared_ret is `GKV[K, V]` whose slots are bare TK_TYPEVARs,
+// and tc_unify DOES return 1 vacuously on a TK_TYPEVAR without binding
+// (src/typecheck.bl, the TK_TYPEVAR arm). That diagnosis is accurate about the
+// DEF-side pin — and irrelevant to this shape, because the def-side pin is not what
+// solves it. The CALL-site pin operates on the call-site-minted `GKV[a_K, a_V]`,
+// whose slots are metavars, not typevars, and those bind fine.
+//
+// Fixed in the interim by two commits, neither of which pinned this shape:
+//   77d328e (br y1n3ck) — the LetBinding pin, and
+//   85f4fa5 (br 3dpshm) — minting a call-site instance for a return-only tparam.
+// test_y1n3ck_generic_return_tail_infer.bl covers the CONCRETE
+// `fn a() -> GKV[Int, Str]` only, and test_3dpshm covers the ONE-tparam `Set` case
+// only. Nothing pins the two-tparam generic-fn shape, so this file is a pure
+// regression pin: no source change accompanies it.
+//
+// WHY TWO TPARAMS IS ITS OWN ROW AND NOT A DUPLICATE OF y1n3ck. A one-tparam shape
+// cannot distinguish "the slots were solved" from "the slots were transposed": there
+// is only one slot. `GKV[Int, Str]` and `GKV[Str, Int]` in one program is the
+// smallest witness that the pin binds K and V POSITIONALLY, and that the two
+// instantiations get two distinct C typedefs rather than collapsing.
+//
+// WHY THE kops ASSERTION IS THE LOAD-BEARING ONE (same reasoning as y1n3ck). A fix
+// that gets the mono NAME right while leaving the `Map()` field's metavars unbound
+// falls to resolve_ctor_kops_elem's CT_STRING default and emits blink_kops_str for
+// an Int key. 256 and 512 both carry a 0x00 low byte, so under the string hasher
+// they collide as the empty string — the br hnyqe4 corruption signature. Asserting
+// blink_kops_i64 present AND blink_kops_str absent separates a correct fix from that
+// one; the 256/512 runtime round-trip is the independent witness.
+
+import compile_test_helpers
+import std.io
+
+fn assert_has(c: Str, needle: Str, label: Str) {
+    if !c.contains(needle) { io.println("FAIL: {label} — missing '{needle}'") }
+    assert(c.contains(needle))
+}
+
+fn assert_lacks(c: Str, needle: Str, label: Str) {
+    if c.contains(needle) { io.println("FAIL: {label} — forbidden '{needle}' present") }
+    assert(!c.contains(needle))
+}
+
+// Per CLAUDE.md the `_Void` grep is a LOWER BOUND: the tid producers erase by passing
+// the binder through unchanged (blink_GKV_K / _V, br pt4hsy) and a def-side field can
+// erase under a fully correct mono name (blink_map_void, br w4c0py). Check all three
+// families on every C-emitting row.
+fn assert_no_erasure(c: Str, label: Str) {
+    assert_lacks(c, "_Void", "{label} / string-producer erasure")
+    assert_lacks(c, "blink_GKV_K", "{label} / bare-binder K passthrough")
+    assert_lacks(c, "blink_GKV_V", "{label} / bare-binder V passthrough")
+    assert_lacks(c, "blink_map_void", "{label} / erased Map carrier field")
+}
+
+fn gkv_decls() -> Str {
+    let mut s = "type GKV[K, V] \{ m: Map[K, V] }\n"
+    s = s.concat("fn mk[K, V]() -> GKV[K, V] \{ GKV \{ m: Map() } }\n")
+    s
+}
+
+// Both keys carry a 0x00 low byte, so a kops_str regression collides them.
+fn round_trip_body(bind: Str) -> Str {
+    let mut s = "fn main() \{\n"
+    s = s.concat(bind)
+    s = s.concat("    g.m.insert(256, \"lo\")\n")
+    s = s.concat("    g.m.insert(512, \"hi\")\n")
+    s = s.concat("    assert_eq(g.m.len(), 2)\n")
+    s = s.concat("    assert(g.m.get(256).unwrap() == \"lo\")\n")
+    s = s.concat("    assert(g.m.get(512).unwrap() == \"hi\")\n")
+    s = s.concat("}\n")
+    s
+}
+
+// The ticket's own MVCE binding: the annotation names both slots.
+fn src_annotated() -> Str {
+    gkv_decls().concat(round_trip_body("    let g: GKV[Int, Str] = mk()\n"))
+}
+
+// Nothing annotates the binding — both slots are pinned BACKWARD from the later use.
+// test_3dpshm covers this for ONE tparam (a Set element); two slots is the row that
+// can see a transposition.
+fn src_backward() -> Str {
+    gkv_decls().concat(round_trip_body("    let g = mk()\n"))
+}
+
+// ── the MVCE must not ICE, and must not have been "fixed" into a diagnostic ──
+
+test "the two-tparam generic-fn return does not ICE under an annotated let" {
+    let out = compile_test_helpers.compile_and_capture(src_annotated(), "jq85k8_annotated_diag")
+    assert_lacks(out, "I0001", "annotated let / no unsolved-typevar ICE")
+    assert_lacks(out, "E0301", "annotated let / the annotation determines both slots")
+    assert_lacks(out, "E0505", "annotated let / .len() resolves on the Map field")
+}
+
+test "two-tparam annotated let monomorphizes to GKV_Int_Str with the i64 kops" {
+    let c = compile_test_helpers.compile_and_emit_c(src_annotated(), "jq85k8_annotated_c")
+    assert_has(c, "blink_GKV_Int_Str", "annotated let / struct mono name")
+    assert_has(c, "blink_mk_Int_Str", "annotated let / fn mono name")
+    assert_has(c, "blink_map_new(&blink_kops_i64)", "annotated let / Int-key kops")
+    assert_lacks(c, "blink_kops_str", "annotated let / must not hash an Int key as a string")
+    assert_no_erasure(c, "annotated let")
+}
+
+test "two-tparam annotated let round-trips 256 and 512 at runtime" {
+    let r = compile_test_helpers.compile_and_run(src_annotated(), "jq85k8_annotated_run")
+    assert_eq(r.exit_code, 0)
+}
+
+// ── backward inference: both slots come from a later use, not an annotation ──
+
+test "an unannotated two-tparam binding infers both slots from a later use" {
+    let out = compile_test_helpers.compile_and_capture(src_backward(), "jq85k8_backward_diag")
+    assert_lacks(out, "I0001", "backward infer / no unsolved-typevar ICE")
+    assert_lacks(out, "E0301", "backward infer / the later use determines both slots")
+}
+
+test "backward-inferred two-tparam binding monomorphizes and round-trips" {
+    let c = compile_test_helpers.compile_and_emit_c(src_backward(), "jq85k8_backward_c")
+    assert_has(c, "blink_GKV_Int_Str", "backward infer / struct mono name")
+    assert_has(c, "blink_mk_Int_Str", "backward infer / fn mono name")
+    assert_has(c, "blink_map_new(&blink_kops_i64)", "backward infer / Int-key kops")
+    assert_lacks(c, "blink_kops_str", "backward infer / must not hash an Int key as a string")
+    assert_no_erasure(c, "backward infer")
+    let r = compile_test_helpers.compile_and_run(src_backward(), "jq85k8_backward_run")
+    assert_eq(r.exit_code, 0)
+}
+
+// ── slot order: the two tparams must bind POSITIONALLY, not as a set ─────────
+// A transposition, or a collapse of the two instantiations onto one C type, is
+// invisible to every row above. The needles are typedef TERMINATORS: the bare
+// substring `blink_GKV_Int_Str` would also match inside a longer mangled name.
+
+test "GKV[Int,Str] and GKV[Str,Int] mint two distinct positional typedefs" {
+    let mut src = gkv_decls()
+    src = src.concat("fn main() \{\n")
+    src = src.concat("    let a: GKV[Int, Str] = mk()\n")
+    src = src.concat("    let b: GKV[Str, Int] = mk()\n")
+    src = src.concat("    a.m.insert(256, \"lo\")\n")
+    src = src.concat("    b.m.insert(\"lo\", 256)\n")
+    src = src.concat("    assert_eq(a.m.len(), 1)\n")
+    src = src.concat("    assert_eq(b.m.len(), 1)\n")
+    src = src.concat("    assert(a.m.get(256).unwrap() == \"lo\")\n")
+    src = src.concat("    assert_eq(b.m.get(\"lo\").unwrap(), 256)\n")
+    src = src.concat("}\n")
+    let c = compile_test_helpers.compile_and_emit_c(src, "jq85k8_slotorder_c")
+    assert_has(c, "} blink_GKV_Int_Str;", "slot order / Int,Str typedef")
+    assert_has(c, "} blink_GKV_Str_Int;", "slot order / Str,Int typedef")
+    assert_has(c, "blink_mk_Int_Str", "slot order / Int,Str fn mono")
+    assert_has(c, "blink_mk_Str_Int", "slot order / Str,Int fn mono")
+    assert_no_erasure(c, "slot order")
+    let r = compile_test_helpers.compile_and_run(src, "jq85k8_slotorder_run")
+    assert_eq(r.exit_code, 0)
+}
+
+// ── the under-determined boundary stays a real diagnostic, never an ICE ─────
+// br 8vcj2c decided this class is error[CannotInferType] E0301 and NEVER a Void
+// default; I0001 is the codegen backstop that must not be what the user sees.
+
+test "an under-determined two-tparam call is E0301, not I0001" {
+    let src = gkv_decls().concat("fn main() \{ let _g = mk() }\n")
+    let out = compile_test_helpers.compile_and_capture(src, "jq85k8_underdet")
+    assert_has(out, "E0301", "under-determined / reported as CannotInferType")
+    assert_lacks(out, "I0001", "under-determined / must not reach the codegen backstop")
+}
+
+test "E0301 and I0001 are both in the error catalog" {
+    compile_test_helpers.verify_catalog_entry("E0301", "CannotInferType")
+    compile_test_helpers.verify_catalog_entry("I0001", "UnsolvedTypeVarAtCodegen")
+}
