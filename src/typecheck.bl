@@ -1546,6 +1546,14 @@ fn tc_pin_tail_ret_generic(declared_ret: Int, inferred_ret: Int) {
     let d = resolve_alias_tid(declared_ret)
     if tc_pin_admits_declared(d) == 0 { return }
     if tc_tid_has_unbound_metavar(inferred_ret) == 0 { return }
+    // Every pin mutates ty_pool IN PLACE, so adding a caller can change emitted C for
+    // programs that have nothing to do with the new seam. `retpin` makes that blast
+    // radius auditable without a printf+recompile: one line per pin that actually
+    // fired, past all four gates. Gated on dbg_channel_on so the interpolation is not
+    // built when tracing is off.
+    if dbg_channel_on("retpin") != 0 {
+        dbg_trace("retpin", "pin declared={type_to_str(d)} inferred={type_to_str(inferred_ret)}")
+    }
     let _ = tc_unify(d, inferred_ret)
 }
 
@@ -8882,6 +8890,35 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             if target_t != TYPE_UNKNOWN && val_t != TYPE_UNKNOWN {
                 if assignment_types_compatible(target_t, val_t, val) == 0 {
                     tc_error_at("assignment: cannot assign {type_to_str(val_t)} to {type_to_str(target_t)}", node)
+                } else {
+                    // An assignment TARGET is a declared-type source for the value's
+                    // metavars, not only something to compare against — the same
+                    // reasoning as the LetBinding arm above, and the same in-place
+                    // unify, so one bind solves the mono name and the field ctor's
+                    // kops vtable together (e2kjqy). Without it `e = mk()` left the α
+                    // that instantiate_return_type minted for mk's return-only T
+                    // unbound and it reached emit_struct_lit erased.
+                    //
+                    // target_t already carries the right expected type for both
+                    // spellings: an Ident target resolves through scope, a FieldAccess
+                    // target through the field arm, which substitutes the enclosing
+                    // instance's concrete args.
+                    //
+                    // No tc_in_closure_depth guard, unlike tc_check_returned_value:
+                    // that guard exists because tc_current_fn_ret is AMBIENT state
+                    // that goes stale inside a closure body. target_t is read from
+                    // the target expression itself, so a closure assigning to a
+                    // captured binding pins that binding's own declared type.
+                    //
+                    // Assignment only, never CompoundAssign: no compound operator is
+                    // defined over any kind tc_pin_admits_declared admits (Map, Set,
+                    // generic struct/enum), so the branch would be dead. Excluded on
+                    // purpose rather than by accident.
+                    //
+                    // Restricted to values that minted here — see tc_node_has_ret_mint.
+                    if kind == NodeKind.Assignment && tc_node_has_ret_mint(val) != 0 {
+                        tc_pin_tail_ret_generic(target_t, val_t)
+                    }
                 }
             }
         }

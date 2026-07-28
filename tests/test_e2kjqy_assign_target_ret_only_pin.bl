@@ -1,0 +1,268 @@
+// br e2kjqy (seam 1 of 2): an ASSIGNMENT target is a declared-type source for a
+// return-only type param, exactly as an annotated let target is.
+//
+//     type RGT[T] { s: Set[T] }
+//     fn mk[T]() -> RGT[T] { RGT { s: Set() } }
+//     let mut e: RGT[Int] = RGT { s: Set() }
+//     e = mk()          // <- I0001 "mono args 'Void'"
+//
+// tc_pin_tail_ret_generic had two callers — tc_check_returned_value (both `return x`
+// and an implicit tail) and the LetBinding arm. The Assignment arm compared
+// target_t against val_t and then threw the comparison away, so the α that
+// instantiate_return_type minted for mk's return-only T stayed unbound and reached
+// the emit_struct_lit chokepoint erased.
+//
+// WHY NO tc_in_closure_depth GUARD HERE, unlike the return seam. That guard exists
+// because tc_current_fn_ret is AMBIENT state installed by tc_check_fn, so inside a
+// closure it still names the enclosing fn's declared return and pinning it would
+// bind the closure's metavars to the wrong instance. `target_t` is read from the
+// target expression itself — from scope for an Ident, from the field arm's
+// concrete-instance substitution for a FieldAccess — so there is no ambient context
+// to go stale. A closure that assigns to a captured binding pins that binding's own
+// declared type, which is the right answer.
+//
+// WHY Assignment ONLY, not CompoundAssign. tc_pin_admits_declared admits Map, Set,
+// and generic struct/enum instances. No compound operator is defined over any of
+// those, so a CompoundAssign that reached the pin would already have failed the
+// compatibility compare. The branch would be dead; excluding it says so out loud
+// rather than leaving a future reader to assume it was considered.
+//
+// WHY THE kops ASSERTION IS THE LOAD-BEARING ONE. A fix that gets the mono NAME
+// right while leaving the Set's element metavar unbound falls to
+// resolve_ctor_kops_elem's CT_STRING default and emits blink_kops_str for an Int
+// element. 256 and 512 both carry a 0x00 low byte, so under the string hasher they
+// collide as the empty string — the br hnyqe4 corruption signature. Asserting
+// blink_kops_i64 present AND blink_kops_str absent separates a correct fix from
+// that one; the runtime round-trip THROUGH THE ASSIGNED VALUE is the independent
+// witness.
+
+import compile_test_helpers
+import std.io
+
+fn assert_has(c: Str, needle: Str, label: Str) {
+    if !c.contains(needle) { io.println("FAIL: {label} — missing '{needle}'") }
+    assert(c.contains(needle))
+}
+
+fn assert_lacks(c: Str, needle: Str, label: Str) {
+    if c.contains(needle) { io.println("FAIL: {label} — forbidden '{needle}' present") }
+    assert(!c.contains(needle))
+}
+
+// Per CLAUDE.md the `_Void` grep is a LOWER BOUND: the tid producers erase by
+// passing the binder through unchanged (blink_RGT_T, br pt4hsy) and a def-side field
+// can erase under a fully correct mono name (br w4c0py). The bare-binder needles are
+// TERMINATED because `blink_RGT_T` is a prefix of nothing here today but would be of
+// any future `RGT_Tuple…` spelling.
+fn assert_no_erasure(c: Str, label: Str) {
+    assert_lacks(c, "_Void", "{label} / string-producer erasure")
+    assert_lacks(c, "} blink_RGT_T;", "{label} / bare-binder T typedef")
+    assert_lacks(c, "blink_RGT_T ", "{label} / bare-binder T declaration")
+}
+
+fn rgt_decls() -> Str {
+    let mut s = "type RGT[T] \{ s: Set[T] }\n"
+    s = s.concat("fn mk[T]() -> RGT[T] \{ RGT \{ s: Set() } }\n")
+    s
+}
+
+// Both elements carry a 0x00 low byte, so a kops_str regression collides them.
+fn round_trip(recv: Str) -> Str {
+    let mut s = "    {recv}.s.insert(256)\n"
+    s = s.concat("    {recv}.s.insert(512)\n")
+    s = s.concat("    assert_eq({recv}.s.len(), 2)\n")
+    s = s.concat("    assert({recv}.s.contains(256))\n")
+    s = s.concat("    assert({recv}.s.contains(512))\n")
+    s = s.concat("    assert(!{recv}.s.contains(257))\n")
+    s
+}
+
+// The ticket's own MVCE: the annotation is on the let, the under-determined value
+// arrives through a later assignment.
+fn src_ticket() -> Str {
+    let mut s = rgt_decls()
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let mut e: RGT[Int] = RGT \{ s: Set() }\n")
+    s = s.concat("    e = mk()\n")
+    s = s.concat(round_trip("e"))
+    s = s.concat("}\n")
+    s
+}
+
+// ISOLATED SEAM. The ticket's repro has TWO under-determinable struct literals: the
+// annotated let's own `RGT { s: Set() }` and mk's tail. If the let's literal were
+// the one failing, the ticket row could pass for the wrong reason. Here the binding
+// is initialized from a CONCRETE fn, so the only thing left to determine in the whole
+// program is the assignment's right-hand side.
+fn src_isolated() -> Str {
+    let mut s = rgt_decls()
+    s = s.concat("fn mkint() -> RGT[Int] \{ RGT \{ s: Set() } }\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let mut e = mkint()\n")
+    s = s.concat("    e = mk()\n")
+    s = s.concat(round_trip("e"))
+    s = s.concat("}\n")
+    s
+}
+
+// A FieldAccess target. infer_type routes this through the field arm, which
+// substitutes the enclosing instance's concrete args, so the pin gets `RGT[Int]`
+// with no extra call-site work.
+//
+// NAME-LEVEL ONLY, and not by choice: br 50cmqc. A struct field DECLARED as a
+// generic-struct instance (`g: RGT[Int]`) lowers to the bare base name — `blink_H`
+// gets a `blink_RGT g;` member, which is never typedef'd — so the emitted C does not
+// compile and reading the field back reports a spurious E0505 on its own Set. That
+// defect is fully concrete (it reproduces with no generic fn and no assignment
+// anywhere) and is therefore not this pin's to fix. This row asserts what the pin
+// alone decides: the value's mono name and kops. Add the round-trip when 50cmqc lands.
+fn src_field_target() -> Str {
+    let mut s = rgt_decls()
+    s = s.concat("type H \{ g: RGT[Int] }\n")
+    s = s.concat("fn mkint() -> RGT[Int] \{ RGT \{ s: Set() } }\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let mut h = H \{ g: mkint() }\n")
+    s = s.concat("    h.g = mk()\n")
+    s = s.concat("    assert(1 == 1)\n")
+    s = s.concat("}\n")
+    s
+}
+
+// ── the two repros must not ICE ──────────────────────────────────────────────
+
+test "an assignment target pins a return-only tparam (ticket MVCE)" {
+    let out = compile_test_helpers.compile_and_capture(src_ticket(), "e2kjqy_assign_diag")
+    assert_lacks(out, "I0001", "assign target / no unsolved-typevar ICE")
+    assert_lacks(out, "E0301", "assign target / the target type determines the slot")
+    assert_lacks(out, "E0505", "assign target / .len() resolves on the Set field")
+}
+
+test "an assignment is the ONLY under-determination and still pins" {
+    let out = compile_test_helpers.compile_and_capture(src_isolated(), "e2kjqy_isolated_diag")
+    assert_lacks(out, "I0001", "isolated seam / no unsolved-typevar ICE")
+    assert_lacks(out, "E0301", "isolated seam / the target type determines the slot")
+}
+
+// ── mono name + kops + runtime ───────────────────────────────────────────────
+
+test "the assigned value monomorphizes to RGT_Int with the i64 kops" {
+    let c = compile_test_helpers.compile_and_emit_c(src_isolated(), "e2kjqy_isolated_c")
+    assert_has(c, "blink_mk_Int", "isolated seam / fn mono name")
+    assert_has(c, "} blink_RGT_Int;", "isolated seam / struct mono typedef")
+    assert_has(c, "blink_kops_i64", "isolated seam / Int-element kops")
+    assert_lacks(c, "blink_kops_str", "isolated seam / must not hash an Int element as a string")
+    assert_no_erasure(c, "isolated seam")
+}
+
+test "the assigned value round-trips 256 and 512 at runtime" {
+    let r = compile_test_helpers.compile_and_run(src_isolated(), "e2kjqy_isolated_run")
+    assert_eq(r.exit_code, 0)
+}
+
+test "the ticket MVCE round-trips through the assigned value" {
+    let r = compile_test_helpers.compile_and_run(src_ticket(), "e2kjqy_ticket_run")
+    assert_eq(r.exit_code, 0)
+}
+
+// ── a FieldAccess target, not just an Ident ──────────────────────────────────
+
+test "a field-access assignment target pins the same way" {
+    let out = compile_test_helpers.compile_and_capture(src_field_target(), "e2kjqy_field_diag")
+    assert_lacks(out, "I0001", "field target / no unsolved-typevar ICE")
+    assert_lacks(out, "E0301", "field target / the field type determines the slot")
+    let c = compile_test_helpers.compile_and_emit_c(src_field_target(), "e2kjqy_field_c")
+    assert_has(c, "} blink_RGT_Int;", "field target / struct mono typedef")
+    assert_has(c, "blink_mk_Int", "field target / fn mono name")
+    assert_has(c, "blink_kops_i64", "field target / Int-element kops")
+    assert_lacks(c, "blink_kops_str", "field target / must not hash an Int element as a string")
+    assert_no_erasure(c, "field target")
+}
+
+// ── two type params, so a transposition is visible ───────────────────────────
+
+test "a two-tparam generic-struct assignment pins both slots positionally" {
+    let mut src = "type GKV[K, V] \{ m: Map[K, V] }\n"
+    src = src.concat("fn mkkv[K, V]() -> GKV[K, V] \{ GKV \{ m: Map() } }\n")
+    src = src.concat("fn mkis() -> GKV[Int, Str] \{ GKV \{ m: Map() } }\n")
+    src = src.concat("fn main() \{\n")
+    src = src.concat("    let mut g = mkis()\n")
+    src = src.concat("    g = mkkv()\n")
+    src = src.concat("    g.m.insert(256, \"lo\")\n")
+    src = src.concat("    g.m.insert(512, \"hi\")\n")
+    src = src.concat("    assert_eq(g.m.len(), 2)\n")
+    src = src.concat("    assert(g.m.get(256).unwrap() == \"lo\")\n")
+    src = src.concat("    assert(g.m.get(512).unwrap() == \"hi\")\n")
+    src = src.concat("}\n")
+    let c = compile_test_helpers.compile_and_emit_c(src, "e2kjqy_kv_c")
+    assert_lacks(c, "I0001", "two-tparam assign / no ICE in output")
+    assert_has(c, "} blink_GKV_Int_Str;", "two-tparam assign / positional mono typedef")
+    assert_has(c, "blink_map_new(&blink_kops_i64)", "two-tparam assign / Int-key kops")
+    assert_lacks(c, "blink_kops_str", "two-tparam assign / must not hash an Int key as a string")
+    assert_lacks(c, "_Void", "two-tparam assign / string-producer erasure")
+    let r = compile_test_helpers.compile_and_run(src, "e2kjqy_kv_run")
+    assert_eq(r.exit_code, 0)
+}
+
+// ── freshness: two assignment sites must not share or transpose a solution ───
+// The pin binds metavars IN PLACE. If the two `mk()` call sites reused one mint, the
+// second bind would either fail against an already-bound α or overwrite the first.
+// Both typedefs must exist, and the program must behave.
+
+test "two assignment sites under different target types stay independent" {
+    let mut src = rgt_decls()
+    src = src.concat("fn mkint() -> RGT[Int] \{ RGT \{ s: Set() } }\n")
+    src = src.concat("fn mkstr() -> RGT[Str] \{ RGT \{ s: Set() } }\n")
+    src = src.concat("fn main() \{\n")
+    src = src.concat("    let mut a = mkint()\n")
+    src = src.concat("    let mut b = mkstr()\n")
+    src = src.concat("    a = mk()\n")
+    src = src.concat("    b = mk()\n")
+    src = src.concat("    a.s.insert(256)\n")
+    src = src.concat("    b.s.insert(\"lo\")\n")
+    src = src.concat("    assert(a.s.contains(256))\n")
+    src = src.concat("    assert(b.s.contains(\"lo\"))\n")
+    src = src.concat("    assert_eq(a.s.len(), 1)\n")
+    src = src.concat("    assert_eq(b.s.len(), 1)\n")
+    src = src.concat("}\n")
+    let c = compile_test_helpers.compile_and_emit_c(src, "e2kjqy_fresh_c")
+    assert_has(c, "} blink_RGT_Int;", "freshness / Int typedef")
+    assert_has(c, "} blink_RGT_Str;", "freshness / Str typedef")
+    assert_has(c, "blink_mk_Int", "freshness / Int fn mono")
+    assert_has(c, "blink_mk_Str", "freshness / Str fn mono")
+    assert_no_erasure(c, "freshness")
+    let r = compile_test_helpers.compile_and_run(src, "e2kjqy_fresh_run")
+    assert_eq(r.exit_code, 0)
+}
+
+// ── green guard: the pin runs only where the compare ALREADY agreed ──────────
+
+test "a real assignment type mismatch is still diagnosed" {
+    let mut src = rgt_decls()
+    src = src.concat("fn mkint() -> RGT[Int] \{ RGT \{ s: Set() } }\n")
+    src = src.concat("fn mkstr() -> RGT[Str] \{ RGT \{ s: Set() } }\n")
+    src = src.concat("fn main() \{\n")
+    src = src.concat("    let mut a = mkint()\n")
+    src = src.concat("    a = mkstr()\n")
+    src = src.concat("    assert_eq(a.s.len(), 0)\n")
+    src = src.concat("}\n")
+    compile_test_helpers.expect_compile_error(src, "e2kjqy_guard_mismatch", "E0300")
+}
+
+// ── pinned loud: the boundary this commit deliberately does NOT cross ────────
+// An if/match-arm tail is not a direct Call, so the value node minted nothing and
+// tc_node_has_ret_mint reads 0. Reaching it needs a transitive successor predicate
+// that is only HALF solvable from one arm's type — and half-solved is the
+// "compiles under a wrong-but-plausible mono name" failure the gate exists to
+// prevent. Filed separately; pinned here so the boundary is recorded, not assumed.
+
+test "a return-only mint behind an if-arm tail is still loud" {
+    let mut src = rgt_decls()
+    src = src.concat("fn mkint() -> RGT[Int] \{ RGT \{ s: Set() } }\n")
+    src = src.concat("fn main() \{\n")
+    src = src.concat("    let mut e = mkint()\n")
+    src = src.concat("    e = if 1 == 1 \{ mk() } else \{ mk() }\n")
+    src = src.concat("    assert_eq(e.s.len(), 0)\n")
+    src = src.concat("}\n")
+    let out = compile_test_helpers.compile_and_capture(src, "e2kjqy_ifarm_loud")
+    assert_has(out, "I0001", "if-arm assignment RHS stays a loud stop")
+}

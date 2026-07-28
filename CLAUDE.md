@@ -53,7 +53,11 @@ producing the same I0001 spelling the string path's answer, and telling "the mem
 bare base" apart from "concrete but no admission reason fired" is the difference between a
 typecheck memo bug and a missing codegen tier); `retann` (the def-side return-annotation tier —
 which gate declined a struct literal in a monomorphized generic fn's tail, or the CSV it resolved
-to; the tier is last-resort, so silence here means an earlier producer answered). (`csvresolve` is
+to; the tier is last-resort, so silence here means an earlier producer answered); `retpin` (every
+`tc_pin_tail_ret_generic` that made it past all four gates, with the declared and inferred types
+it unified). Every pin mutates `ty_pool` IN PLACE, so adding a pin caller can change emitted C for
+programs unrelated to the new seam — `retpin` is how you audit that blast radius without a
+printf+recompile; silence on a program means no pin fired for it. (`csvresolve` is
 retired — the legacy string-CSV type-param resolver it tapped no longer exists.)
 NOTE: `build/blinkc` IGNORES `BLINK_TRACE_CHANNELS` — `dbg_channels` is assigned only in
 `src/cli.bl`, so a probe binary for tracing must be built from `src/cli.bl`, not
