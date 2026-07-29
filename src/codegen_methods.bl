@@ -190,10 +190,23 @@ fn build_binder_csv(binders_sl: Int, elem_name: Str) -> Str {
 // resolvable List (tc_tid_list_elem = -1), so both cases stay byte-safe.
 //
 // NOTE: -1 is no longer a free "defer to the string resolver" — that resolver is gone.
-// Only the two mono TYPEDEF emitters still recover a -1 slot, from the concrete_args
-// CSV via resolve_mono_field_type (br w4c0py). Everywhere else a -1 slot leaves the
-// name passing through unchanged, so a slot that is a BINDER must not reach a C
-// symbol; the emit_struct_lit I0001 chokepoint is what catches it.
+//
+// The one thing that still recovers a -1 slot is `mono_arg_tids_with_ann`
+// (src/codegen_stmt.bl), reached from the two mono TYPEDEF emitters. It does NOT read
+// the concrete_args CSV — an earlier version of this comment named a
+// `resolve_mono_field_type` that NEVER EXISTED (br fes70z: `git log -S` finds it only as
+// added comment text, never as a definition), and the CSV mechanism it advertised is what
+// decisions/compiler-type-representation.md:104 forbids and br 0n07he deleted. What the net
+// actually does is recover the slot from a tid MEMOIZED ON THE SOURCE ANNOTATION NODE
+// (MonoInstance.ann), so no string is parsed for a type param.
+//
+// It BAILS, returning the list untouched, in four cases: `ann == -1`; no -1 hole to fill; an
+// EMPTY arg_tids (no hole to find — which is why merge_arg_tids treats arity as information,
+// br p7014w); and an arity mismatch against what the annotation tid recovers.
+//
+// ON A BAIL THERE IS NO FALLBACK LEFT — the name passes through unchanged, which is an
+// ERASURE and not a downgrade. So a slot that is a BINDER must not reach a C symbol; the
+// emit_struct_lit I0001 chokepoint is what catches it.
 fn poly_impl_concrete_arg_tids(im: Int, recv_node: Int) -> List[Int] {
     let mut tids: List[Int] = []
     let binders_sl = node_impl_binders(im)
@@ -250,8 +263,16 @@ fn poly_impl_return_elem_tids(im: Int, recv_node: Int) -> List[Int] {
 // from an unresolvable receiver, or an infer-CSV slot the tid can't reach — stores
 // -1, which the def-side resolver reports by passing the binder name through
 // unchanged. With the string tail gone that would spell a bare binder into a C
-// symbol, so a -1 here has to stay unreachable in practice; the _Void grep in
-// CLAUDE.md is the guard. The Gen1==Gen2 fixed-point gate proves the equality.
+// symbol, so a -1 here has to stay unreachable in practice.
+//
+// This comment used to name the `_Void` grep as THE guard for that. It is not one: CLAUDE.md
+// documents that grep as a LOWER BOUND, and the bare-binder spelling it would have to catch
+// (`blink_List_T`) contains no "Void" at all, so the grep reads 0 on exactly the shape in
+// question (br pt4hsy, br w4c0py). The Gen1==Gen2 fixed-point gate proves byte-equality of
+// the compiler's own output and nothing about user programs (see
+// project_self_host_doesnt_catch_user_codegen_bugs). The honest statement is that a -1 here is
+// unguarded by any sound check, and stays correct only because no producer is known to reach
+// it; the `monofield` dbg_trace channel is the standing detector.
 pub fn listop_slot_tid(tid: Int, csv_seg: Str) -> Int {
     let seg = tc_seg_from_tid(tid)
     if seg.is_some() && seg.unwrap() == csv_seg {
@@ -283,10 +304,24 @@ pub fn listop_slot_tid(tid: Int, csv_seg: Str) -> Int {
 //   - the callers: register_map_elem_struct_mono and the CT_VOID struct-return arm of
 //     emit_generic_call both refuse to register an instance whose args CSV still holds
 //     a binder (tparams_sl_contains);
-//   - resolve_mono_field_type (codegen_stmt), which recovers a def-side typedef field
-//     from the concrete_args CSV when the producer could not supply a tid;
+//   - `mono_arg_tids_with_ann` (src/codegen_stmt.bl), which recovers a def-side typedef
+//     field from a tid MEMOIZED ON THE SOURCE ANNOTATION NODE. This tier previously read
+//     "resolve_mono_field_type (codegen_stmt), which recovers ... from the concrete_args CSV",
+//     and BOTH HALVES OF THAT WERE WRONG (br fes70z): no such function has ever existed, and
+//     the CSV mechanism it named is the one br 0n07he deleted per
+//     decisions/compiler-type-representation.md:104. Treat this tier as PARTIAL, not a
+//     backstop: it bails on `ann == -1`, on no -1 hole, on an EMPTY arg_tids (no hole to
+//     find), and on an arity mismatch — and a bail erases, because there is no CSV tail to
+//     fall back to;
 //   - emit_struct_lit's I0001 chokepoint, which now treats a binder segment as erased
 //     exactly like "Void".
+//
+// NOT COVERED BY ANY OF THE THREE, and not a binder at all — br 3aa3je: a struct instance
+// nested inside a TUPLE type arg (`Box[(Box[Int], Int)]`) reaches here with `resolved` a
+// TUPLE STEM, so every binder-keyed predicate above (including tparams_sl_contains and the
+// R3 guard) is BLIND to it. build/nest_tuple.c:123 still emits
+// `typedef struct { void v; } blink_Box_Tuple2_Box_Int_int;`. Do not read the guards as
+// covering that class; see tests/test_6cvvh8_struct_mono_target_seams.bl:48-56.
 pub fn resolve_tparam_via_tid(param_name: Str, tparams_sl: Int, arg_tids: List[Int]) -> Str {
     let tid = tparam_tid_via_mono(param_name, tparams_sl, arg_tids)
     if tid >= 0 {

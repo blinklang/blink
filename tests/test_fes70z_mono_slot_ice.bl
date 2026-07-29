@@ -1,0 +1,177 @@
+// br fes70z, increment R3: the def-side mono slot resolver fails CLOSED.
+//
+// WHAT IS BEING GUARDED. `resolve_tparam_via_tid` returns a bare `Str` at all 65 of its call
+// sites, so every one of them silently discards whether the tid answered or the declared BINDER
+// NAME passed through unchanged. Since br 0n07he deleted the legacy string-CSV type-param
+// resolver there is no CSV tail left to catch the second case, so a passed-through binder is an
+// ERASURE, not a downgrade. It lands as one of two shapes, NEITHER of which the `_Void` grep in
+// CLAUDE.md can see:
+//
+//   `v: T`         -> `void v;`               (hard cc error, loud)
+//   `v: Option[T]` -> `blink_Option_void v;`  (valid C, SILENT miscompile — the typedef NAME is
+//                                              still correct, `blink_QBox_Int`; only the field
+//                                              type erases. br w4c0py)
+//
+// `resolve_mono_slot` (src/codegen_stmt.bl) is the one def-side resolver that keeps the
+// resolved-vs-unchanged distinction and raises I0001 UNSOLVED_TYPEVAR_AT_CODEGEN on the second.
+//
+// THE PREDICATE IS KEYED ON THE KIND, NEVER ON THE RESULTING "Void" STRING, per
+// decisions/under-determined-types.md Q5 (6-0 ADOPT) and sections/03_types.md:1136-1192. Both
+// halves are load-bearing and each has a row below:
+//   tparams_sl_contains(tparams_sl, resolved) != 0   — the answer is still a declared binder OF
+//                                                      THIS type, so nothing was resolved
+//   is_struct_or_enum_type(resolved) == 0            — ... and it names no concrete type, because
+//                                                      a type param may LEGITIMATELY be shadowed
+//                                                      by a same-named struct or enum, in which
+//                                                      case the identical string IS the answer
+//
+// WHY UNIT ROWS AND NOT A FIXTURE. There is no Blink program in the 700-fixture corpus that
+// reaches this guard. That is a measured fact, not an assumption: the `monofield` channel reads
+// zero `binder-survived` lines across all 700 fixtures, all 22 examples, and both compiler entry
+// points (src/cli.bl, src/blinkc_main.bl) — which is precisely the arming gate the guard was
+// allowed to ship behind, since a false positive while the compiler compiles itself would kill
+// `task regen` at Gen2. The w4c0py shape, which is the closest thing to a natural trigger, no
+// longer degrades at all: merge_arg_tids (br p7014w) joins the carrier producer's all- -1 list
+// with the tid-bearing registration at registration time, so the hole is filled before any
+// def-side resolver sees it.
+//
+// So the corpus and `task regen` are this guard's negative test at scale, and these rows are its
+// positive test: they drive `resolve_mono_slot` directly with a degraded slot, which is the only
+// way to prove the arm actually fires rather than merely being unreachable-and-untested.
+//
+// WHAT THESE ROWS DO NOT CLAIM. Not that every def-side erasure is now caught. The predicate is
+// binder-keyed, so when the unresolvable slot is a TUPLE STEM rather than a binder it is blind by
+// construction — `Box[(Box[Int], Int)]` still emits `typedef struct { void v; }
+// blink_Box_Tuple2_Box_Int_int;` (br 3aa3je, open, out of scope here). Do not read a silent
+// `monofield` sweep or a green run of this file as covering that class.
+//
+// SETUP HAZARDS, both real and both handled below:
+//  1. `resolve_mono_slot` resolves globals out of the MERGED program rather than its own imports
+//     (typecheck and compiler sit above codegen_stmt in the import DAG), so a compiler-internal
+//     test needs a bare `import codegen_expr` to close the back-references. Without it the test
+//     fails to compile with `undefined variable 'trace_mode'` / `undefined function 'trace'`, or
+//     links with `expr_result_ok_struct` undeclared. Same reason
+//     tests/test_panic_line_str_synth.bl:1 imports it.
+//  2. `diag_seen` dedups on (severity|code|file|line|col|message), so two ICEs whose message and
+//     node coincide count ONCE. Every row below uses a distinct owner string, which the message
+//     interpolates, so the counts are independent.
+//  3. `effect Parse` is declared non-`pub` (src/parser.bl:14), so the sublist setup CANNOT be
+//     factored into a helper `fn` — that would need its own `! Parse.Build` row. It stays inline
+//     in each body, where check_effect_propagation short-circuits on the `__test_` fn-name prefix
+//     (src/codegen_types.bl:2678). The repetition is the constraint, not an oversight.
+//
+// `diag_ice_at` COUNTS, it does not abort (src/diagnostics.bl:456 -> diag_emit_range_notes:489)
+// — the driver exits 101 without writing C. That is what makes `diag_ice_count` the assertable
+// signal here, and why these rows are silent: nothing is printed until a flush that never runs.
+
+import codegen_stmt.{resolve_mono_slot}
+import codegen_types.{struct_reg_set}
+import diagnostics.{diag_ice_count}
+import parser.{nodes, new_sublist, sublist_push, finalize_sublist}
+import ast.{AstNode}
+import std.io
+import codegen_expr
+
+fn assert_eq_int(label: Str, got: Int, want: Int) {
+    if got != want {
+        io.println("FAIL: {label}: got {got} want {want}")
+    }
+    assert_eq(got, want)
+}
+
+fn assert_eq_str(label: Str, got: Str, want: Str) {
+    if got != want {
+        io.println("FAIL: {label}: got '{got}' want '{want}'")
+    }
+    assert_eq(got, want)
+}
+
+test "a binder that survives resolution raises I0001 and is still returned" {
+    // A one-binder type-param sublist plus a node to hang the diagnostic on. `nodes` is empty in
+    // a bare test binary, so the node must exist before diag_ice_at reads node_line/node_col off
+    // it; AstNode.line defaults are not relied on, it is set explicitly.
+    let bn = nodes.len()
+    nodes.push(AstNode { name: "T", line: 0 })
+    let sl = new_sublist()
+    sublist_push(sl, bn)
+    finalize_sublist(sl)
+    let n = nodes.len()
+    nodes.push(AstNode { line: 0 })
+    let before = diag_ice_count
+
+    // arg_tids = [-1]: the slot the tid path could not spell. Nothing fills it, so
+    // resolve_tparam_via_tid hands back the binder name it was given.
+    let resolved = resolve_mono_slot("T", sl, [-1], "unit_fires", "fes70z_r1.v", n)
+
+    assert_eq_str("degraded slot still returns the binder", resolved, "T")
+    assert_eq_int("degraded slot raises exactly one ICE", diag_ice_count - before, 1)
+}
+
+test "an empty arg_tids is degraded too, not exempt" {
+    let bn = nodes.len()
+    nodes.push(AstNode { name: "T", line: 0 })
+    let sl = new_sublist()
+    sublist_push(sl, bn)
+    finalize_sublist(sl)
+    let n = nodes.len()
+    nodes.push(AstNode { line: 0 })
+    let before = diag_ice_count
+
+    // [] is strictly WORSE than all- -1 (br p7014w: arity is information — there is no hole for
+    // mono_arg_tids_with_ann to find), so it must not slip past the guard on a length check.
+    let resolved = resolve_mono_slot("T", sl, [], "unit_empty", "fes70z_r2.v", n)
+
+    assert_eq_str("empty arg_tids still returns the binder", resolved, "T")
+    assert_eq_int("empty arg_tids raises exactly one ICE", diag_ice_count - before, 1)
+}
+
+test "a name that is not a binder of this type is not a degraded slot" {
+    let bn = nodes.len()
+    nodes.push(AstNode { name: "T", line: 0 })
+    let sl = new_sublist()
+    sublist_push(sl, bn)
+    finalize_sublist(sl)
+    let n = nodes.len()
+    nodes.push(AstNode { line: 0 })
+    let before = diag_ice_count
+
+    // A concrete field type resolves to itself. tparams_sl_contains is false, so the first half
+    // of the predicate rejects it before the ICE — this is the overwhelmingly common case and
+    // the reason the guard is silent across the whole corpus.
+    let resolved = resolve_mono_slot("Int", sl, [-1], "unit_concrete", "fes70z_r3.v", n)
+
+    assert_eq_str("a concrete type resolves to itself", resolved, "Int")
+    assert_eq_int("a concrete type raises no ICE", diag_ice_count - before, 0)
+}
+
+test "no tparams at all is not a degraded slot" {
+    let n = nodes.len()
+    nodes.push(AstNode { line: 0 })
+    let before = diag_ice_count
+
+    let resolved = resolve_mono_slot("T", -1, [-1], "unit_no_tparams", "fes70z_r4.v", n)
+
+    assert_eq_str("tparams_sl -1 resolves to itself", resolved, "T")
+    assert_eq_int("tparams_sl -1 raises no ICE", diag_ice_count - before, 0)
+}
+
+test "a binder shadowed by a concrete struct of the same name is a legitimate answer" {
+    let bn = nodes.len()
+    nodes.push(AstNode { name: "Fes70zShadow", line: 0 })
+    let sl = new_sublist()
+    sublist_push(sl, bn)
+    finalize_sublist(sl)
+    let n = nodes.len()
+    nodes.push(AstNode { line: 0 })
+
+    // The second half of the predicate. With a struct of the same name registered, the identical
+    // string IS the resolved answer, so ICE-ing on it would be a false positive — exactly the
+    // class that would have killed `task regen` had the arming sweep not been run first.
+    struct_reg_set.insert("Fes70zShadow", 1)
+    let before = diag_ice_count
+
+    let resolved = resolve_mono_slot("Fes70zShadow", sl, [-1], "unit_shadow", "fes70z_r5.v", n)
+
+    assert_eq_str("shadowed binder resolves to itself", resolved, "Fes70zShadow")
+    assert_eq_int("shadowed binder raises no ICE", diag_ice_count - before, 0)
+}

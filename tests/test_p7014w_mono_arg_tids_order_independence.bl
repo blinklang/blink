@@ -1,0 +1,225 @@
+// br p7014w: register_mono_fn and register_mono_instance_ann dedup on (base, args) and
+// return early on a hit, DISCARDING the incoming arg_tids. First registration wins
+// permanently, so EMISSION ORDER — not tid quality — decides what the def side gets.
+//
+// WHY AN ORDER-INDEPENDENT JOIN AND NOT A COMPARISON. The ticket words the fix as
+// "upgrade when the incoming arg_tids is strictly more concrete", which is a
+// comparison-and-replace and is itself ORDER-DEPENDENT: stored [t1,-1] against incoming
+// [-1,t2] has no winner under any total order, so first-arrival wins and the two
+// registration orders disagree — exactly the case that matters most. merge_arg_tids is
+// therefore an element-wise LATTICE JOIN, and ROW 3 BELOW IS THE ANTI-REGRESSION FOR THAT:
+// a comparison-and-replace fix passes rows 1-2 and fails row 3.
+//
+// THE LATTICE. Per slot: bottom = -1, every concrete tid >= 0 an incomparable atom; two
+// DIFFERENT concrete tids in one slot is a CONTRADICTION, not a degradation (row 5), so it
+// is counted and traced and resolved by a deterministic representative (min) purely to keep
+// the join commutative + associative. Per list: bottom = [], and every populated list is
+// strictly above it INCLUDING AN ALL- -1 LIST, because ARITY IS INFORMATION (row 4): [] is
+// the one shape mono_arg_tids_with_ann (src/codegen_stmt.bl) cannot repair, since it
+// bails when it finds no -1 hole and an empty list has none. So [] means "unrecoverable
+// even with a good annotation tid in hand", while [-1] means "recoverable".
+//
+// Spec basis for a join rather than an assertion: decisions/compiler-type-representation.md:47
+// (Q3, 5-0) — "Interning map key construction must be canonical. Compound types constructed
+// in different orders must produce the same key." An order-dependent PAYLOAD behind a
+// canonical KEY violates that canonicity.
+//
+// WHY THIS MATTERS MORE SINCE 0n07he. There is NO def-side CSV fallback left ANYWHERE:
+// emit_mono_struct_typedef / emit_mono_enum_typedef / mono_fn_signature use concrete_args
+// ONLY to build the c_name, and resolve every field and param through
+// resolve_tparam_via_tid, which returns the binder name UNCHANGED on a -1 slot. So a
+// degraded arg_tids erases with no compensation, in one of two shapes NEITHER of which the
+// `_Void` grep can see (CLAUDE.md): a bare binder in a C symbol (blink_Box_T — either a hard
+// cc failure or, under the #ifndef BLINK_TD_ typedef guard, a SILENT collapse of distinct
+// instantiations onto one type), or an erased FIELD inside a correctly-named typedef
+// (blink_QBox_Int { blink_Option_void v; } — valid C, silent miscompile, br w4c0py).
+//
+// WHY UNIT ROWS AGAINST THE REGISTRIES AND NOT A FIXTURE. The natural trigger shape (two
+// call sites for one mono key, the degraded one first) is GREEN at HEAD end-to-end, because
+// the def side recovers the binder through cg_mono_arg_tids threaded from the outer
+// instance — the stored -1 is latent, not load-bearing, on today's paths. A fixture would
+// therefore assert nothing, and would silently STOP asserting the property the day an
+// unrelated recovery tier changes. These rows test the invariant itself.
+//
+// WHAT THESE ROWS DO *NOT* CLAIM. The registry becomes a function of the registration SET,
+// but EMISSION IS STILL A SINGLE FORWARD PASS (flush_mono_fns_with_typedefs, src/codegen.bl:349
+// bodies then :378 prototypes) — an upgrade that arrives AFTER its entry is already emitted
+// has no effect on the C. Full output-level order independence would need
+// all-registration-before-all-emission, or re-emission; neither is in scope here. Do not
+// read these rows as the stronger claim.
+//
+// SETUP HAZARDS, both load-bearing:
+//   * register_mono_instance* panics in a bare test binary — lookup_mono_instance ->
+//     mono_phys_base -> find_type_def_node -> node_fields(cg_program_node) -> node_or_die on
+//     an empty `nodes` pool. Row 6 pushes a node first; AstNode.fields defaults to -1, so
+//     find_type_def_node returns -1 and mono_phys_base is the identity.
+//   * These registries are PROCESS GLOBALS shared by every test in this file (`blink test
+//     --parallel` forks per FILE, not per test), so EVERY ROW USES ITS OWN (base, args) KEY.
+//
+// Reading MonoFnInstance.arg_tids from another module is fine despite the type being
+// private: E1003 fires only where the type NAME is referenced (src/typecheck.bl:4838, :6226,
+// :6544), and src/codegen_stmt.bl:7487 already does this exact field read cross-module.
+
+import codegen_types.{
+    mono_fns, cg_program_node, mono_arg_tid_conflicts, merge_arg_tids,
+    register_mono_fn, register_mono_instance, register_mono_instance_ann, lookup_mono_base
+}
+import parser.{nodes}
+import ast.{AstNode}
+import std.io
+// Bare, and load-bearing: codegen_types resolves several globals it cannot import
+// (tc_alias_to_original at :821, and lexer/parser's trace_mode/trace) out of the MERGED
+// program rather than its own import list, because those modules sit ABOVE it in the DAG.
+// Importing codegen_types alone leaves them undefined; codegen_expr is the smallest root
+// whose transitive closure (typecheck, compiler, the codegen_* peers) closes every one of
+// those back-references. Same reason tests/test_panic_line_str_synth.bl imports it.
+// Nothing is selected from it, so check_unused_imports has nothing to flag.
+import codegen_expr
+
+fn tids_str(t: List[Int]) -> Str {
+    let mut s = "["
+    let mut i = 0
+    while i < t.len() {
+        if i > 0 { s = s.concat(",") }
+        s = s.concat("{t.get(i).unwrap()}")
+        i = i + 1
+    }
+    s.concat("]")
+}
+
+fn assert_tids(got: List[Int], want: List[Int], label: Str) {
+    let g = tids_str(got)
+    let w = tids_str(want)
+    if g != w { io.println("FAIL: {label} — got {g}, want {w}") }
+    assert(g == w)
+}
+
+fn assert_eq_int(got: Int, want: Int, label: Str) {
+    if got != want { io.println("FAIL: {label} — got {got}, want {want}") }
+    assert(got == want)
+}
+
+// The stored arg_tids for a mono FN key. Mirrors register_mono_fn's own (base, args)
+// dedup scan rather than adding a pub accessor to the compiler for a test's benefit.
+fn fn_tids(base: Str, args: Str) -> List[Int] {
+    let mut i = 0
+    while i < mono_fns.len() {
+        let mf = mono_fns.get(i).unwrap()
+        if mf.base == base && mf.args == args { return mf.arg_tids }
+        i = i + 1
+    }
+    []
+}
+
+// find_type_def_node reads node_fields(cg_program_node); with the default 0 against an
+// empty pool that is a panic, so point it at a fields-less node before touching the
+// instance registry.
+fn arm_instance_registry() {
+    cg_program_node = nodes.len()
+    nodes.push(AstNode { line: 0 })
+}
+
+// ---- the join in isolation -------------------------------------------------------
+
+test "merge_arg_tids joins element-wise and is commutative" {
+    assert_tids(merge_arg_tids([], [7], "u1", "Int"), [7], "unit/empty-lhs")
+    assert_tids(merge_arg_tids([7], [], "u2", "Int"), [7], "unit/empty-rhs")
+    assert_tids(merge_arg_tids([-1], [7], "u3", "Int"), [7], "unit/hole-lhs")
+    assert_tids(merge_arg_tids([7], [-1], "u4", "Int"), [7], "unit/hole-rhs")
+    assert_tids(merge_arg_tids([7, -1], [-1, 9], "u5", "Int,Str"), [7, 9], "unit/incomparable")
+    assert_tids(merge_arg_tids([-1, 9], [7, -1], "u6", "Int,Str"), [7, 9], "unit/incomparable-rev")
+    assert_tids(merge_arg_tids([], [-1], "u7", "Int"), [-1], "unit/arity-is-information")
+    assert_tids(merge_arg_tids([-1], [], "u8", "Int"), [-1], "unit/arity-is-information-rev")
+    assert_tids(merge_arg_tids([7, 9], [7, 9], "u9", "Int,Str"), [7, 9], "unit/idempotent")
+}
+
+// ---- row 1: a tid-bearing registration arriving SECOND must upgrade ---------------
+
+test "row1 mono_fn: concrete arg_tids arriving second upgrades an empty stored list" {
+    register_mono_fn("p7014w_r1", "Int", [])
+    register_mono_fn("p7014w_r1", "Int", [7])
+    assert_tids(fn_tids("p7014w_r1", "Int"), [7], "row1/upgrade-on-dedup-hit")
+}
+
+// ---- row 2: both orders agree, and the concrete tid is the survivor ---------------
+
+test "row2 mono_fn: registration order does not decide the stored arg_tids" {
+    register_mono_fn("p7014w_r2a", "Int", [])
+    register_mono_fn("p7014w_r2a", "Int", [7])
+    register_mono_fn("p7014w_r2b", "Int", [7])
+    register_mono_fn("p7014w_r2b", "Int", [])
+    assert_tids(fn_tids("p7014w_r2a", "Int"), [7], "row2/degraded-then-concrete")
+    assert_tids(fn_tids("p7014w_r2b", "Int"), [7], "row2/concrete-then-degraded")
+    assert_tids(fn_tids("p7014w_r2a", "Int"), fn_tids("p7014w_r2b", "Int"), "row2/orders-agree")
+}
+
+// ---- row 3: INCOMPARABLE partials — the anti-regression for compare-and-replace ----
+
+test "row3 mono_fn: incomparable partial lists join in both directions" {
+    register_mono_fn("p7014w_r3a", "Int,Str", [7, -1])
+    register_mono_fn("p7014w_r3a", "Int,Str", [-1, 9])
+    register_mono_fn("p7014w_r3b", "Int,Str", [-1, 9])
+    register_mono_fn("p7014w_r3b", "Int,Str", [7, -1])
+    assert_tids(fn_tids("p7014w_r3a", "Int,Str"), [7, 9], "row3/first-slot-then-second")
+    assert_tids(fn_tids("p7014w_r3b", "Int,Str"), [7, 9], "row3/second-slot-then-first")
+    assert_tids(fn_tids("p7014w_r3a", "Int,Str"), fn_tids("p7014w_r3b", "Int,Str"), "row3/orders-agree")
+}
+
+// ---- row 4: arity is information — [] join [-1] is [-1], never [] -----------------
+
+test "row4 mono_fn: an all-hole list outranks an empty one in both orders" {
+    register_mono_fn("p7014w_r4a", "Int", [])
+    register_mono_fn("p7014w_r4a", "Int", [-1])
+    register_mono_fn("p7014w_r4b", "Int", [-1])
+    register_mono_fn("p7014w_r4b", "Int", [])
+    assert_tids(fn_tids("p7014w_r4a", "Int"), [-1], "row4/empty-then-hole")
+    assert_tids(fn_tids("p7014w_r4b", "Int"), [-1], "row4/hole-then-empty")
+}
+
+// ---- row 5: a slot contradiction is order-independent AND counted -----------------
+
+test "row5 mono_fn: conflicting concrete tids resolve deterministically and are counted" {
+    let before = mono_arg_tid_conflicts
+    register_mono_fn("p7014w_r5a", "Int", [7])
+    register_mono_fn("p7014w_r5a", "Int", [9])
+    register_mono_fn("p7014w_r5b", "Int", [9])
+    register_mono_fn("p7014w_r5b", "Int", [7])
+    assert_tids(fn_tids("p7014w_r5a", "Int"), fn_tids("p7014w_r5b", "Int"), "row5/orders-agree")
+    assert_tids(fn_tids("p7014w_r5a", "Int"), [7], "row5/deterministic-representative")
+    assert_eq_int(mono_arg_tid_conflicts - before, 2, "row5/conflicts-counted")
+}
+
+// ---- row 6: the instance registry, including []-then-carrier-ann ------------------
+
+test "row6 mono_instance: arg_tids upgrade on a dedup hit independently of ann" {
+    arm_instance_registry()
+
+    // The plain upgrade. Both calls carry ann == -1, which is the case the guard on the
+    // existing `ann` upgrade block used to exclude: EVERY tid-bearing producer reaches
+    // here through register_mono_instance with ann == -1, so gating the arg_tids join on
+    // `ann != -1` would skip exactly the registrations that must be able to upgrade.
+    let c6a = register_mono_instance("p7014w_r6a", "Int", [])
+    register_mono_instance("p7014w_r6a", "Int", [7])
+    assert_tids(lookup_mono_base(c6a).arg_tids, [7], "row6/plain-upgrade-ann-absent")
+
+    let c6b = register_mono_instance("p7014w_r6b", "Int", [7])
+    register_mono_instance("p7014w_r6b", "Int", [])
+    assert_tids(lookup_mono_base(c6b).arg_tids, [7], "row6/plain-upgrade-reverse")
+
+    // THE WORST-CASE SHAPE, and the reason arity is modelled as information. A string
+    // producer registers [] first; register_carrier_inner_mono_instance then arrives with
+    // all- -1 plus the annotation node that DOES carry the tid (it runs in codegen_types,
+    // below typecheck in the DAG, so it cannot read the tid itself). Today the ann
+    // attaches and is USELESS, because mono_arg_tids_with_ann needs a -1 HOLE to fill and
+    // an empty list has none. After the join [] ⊔ [-1] = [-1]: the arity is restored, the
+    // hole exists, and the EXISTING net recovers the real tid. The fix repairs this shape
+    // THROUGH that mechanism instead of adding a second one.
+    let c6c = register_mono_instance("p7014w_r6c", "Int", [])
+    register_mono_instance_ann("p7014w_r6c", "Int", [-1], cg_program_node)
+    assert_tids(lookup_mono_base(c6c).arg_tids, [-1], "row6/empty-then-carrier-restores-arity")
+
+    // Incomparable partials on the instance registry too.
+    let c6d = register_mono_instance("p7014w_r6d", "Int,Str", [7, -1])
+    register_mono_instance("p7014w_r6d", "Int,Str", [-1, 9])
+    assert_tids(lookup_mono_base(c6d).arg_tids, [7, 9], "row6/incomparable")
+}

@@ -1,0 +1,159 @@
+// br fes70z, R3's false-positive net. The companion to tests/test_fes70z_mono_slot_ice.bl:
+// that file proves the I0001 guard in resolve_mono_slot FIRES on a degraded slot, this one
+// proves it stays SILENT on legitimate programs that provably reach it.
+//
+// WHY THIS FILE EXISTS AS A FIXTURE AND NOT AS UNIT ROWS. The guard's risk profile is
+// lopsided. A missed erasure is a bug in one program; a FALSE POSITIVE is a compiler that
+// refuses to build correct code — and because resolve_mono_slot runs while the compiler
+// compiles itself, a false positive kills `task regen` at Gen2. The arming evidence was a
+// zero-hit sweep over the existing corpus, but "no existing program triggers it" is a weaker
+// claim than "programs of this shape do not trigger it": the corpus is only the programs that
+// happen to exist. These rows are constructed adversarially for that gap.
+//
+// EVERY SHAPE BELOW PROVABLY REACHES THE GUARD — that is what stops this file from being
+// vacuous. Measured on the emitted C, each of blink_QBox_Int, blink_QBox_Str, blink_WBox_Int
+// and blink_Tree_Int is emitted as a monomorphized typedef, which means
+// emit_mono_struct_typedef / emit_mono_enum_typedef ran and resolved every field through
+// resolve_mono_slot. A row that merely compiled without reaching the resolver would assert
+// nothing at all. The enum call site (enum_typedef_payload) is reached by the annotation-only
+// Tree row: blink_Tree_Int is emitted even though no Tree is ever constructed.
+//
+// The shapes target the producers that historically could NOT mint tids, because those are
+// where a -1 slot comes from in the first place:
+//   - a generic struct reached ONLY through a carrier ANNOTATION, which routes through
+//     register_carrier_inner_mono_instance — that producer sits below typecheck in the import
+//     DAG and pushes -1 for every slot unconditionally, by design (br w4c0py);
+//   - the same, nested one level deeper, so the outer carrier's own registration cannot be the
+//     thing that supplies the tid;
+//   - a compound field (`v: Option[T]`), the shape whose erasure is invisible to the `_Void`
+//     grep because only the FIELD type erases while the mono NAME stays correct;
+//   - the enum analogue, which is a different emitter and a different guard call site.
+//
+// HOW A REGRESSION SHOWS UP HERE. diag_ice_at does not abort — it counts, and the driver exits
+// 101 without writing C (src/diagnostics.bl). So a false positive on any row below is not a
+// failed assertion, it is a BUILD ERROR for this file, which `task test` reports as such. The
+// assertions exist to pin the runtime behaviour too, so the rows stay honest if the guard is
+// ever removed and the erasure comes back silently. All three erasure families were also
+// measured 0 on this file's emitted C when it was written — `_Void`, the terminated bare binder
+// (`blink_QBox_T;` / `blink_QBox_T `), and the field-only shapes `void v;` / `blink_Option_void`
+// that no name-grep can see. Those cannot be asserted from inside the fixture (it does not
+// compile itself); re-grep the emitted C by hand if this file is ever extended.
+//
+// ═══ WHAT THIS FILE DOES NOT COVER, AND WHY ═══
+//
+// Each family below was found by CONSTRUCTING programs for it — none of these shapes has any
+// coverage in the 700-fixture corpus, which is exactly why the R3 arming sweep read zero on
+// them. Every one is PRE-EXISTING, none is caused by the fes70z guard, and the evidence is not
+// an argument but a measurement: each was compiled by a compiler built from HEAD (5374595) and
+// by this one, both in the same monolithic `blinkc` + `cc` mode, and the cc error counts are
+// IDENTICAL on both sides. Rows are deliberately absent so this file stays green — there is no
+// xfail mechanism (br 1c2zr6 is spec-only). Each is filed with its own MVCE.
+//
+//   1. THE TUPLE STEM, br 3aa3je: `type Box[T] { v: T }` + `fn f() -> Box[(Box[Int], Int)]`
+//      emits `typedef struct { void v; } blink_Box_Tuple2_Box_Int_int;` and then fails at cc
+//      with "field has incomplete type" — a LOUD broken build, not a silent miscompile. The
+//      binder-keyed predicate is blind to it by construction, because `resolved` there is a
+//      tuple stem rather than a declared binder of the type. Do not read a silent `monofield`
+//      sweep or a green run of this file as covering that class.
+//
+//   2. A GENERIC STRUCT/ENUM INSTANCE USED AS A FIELD, ELEMENT OR PAYLOAD TYPE emits the
+//      UNMANGLED BASE NAME, failing at cc with `unknown type name 'blink_Inner'` /
+//      `'blink_QBox'` / `'blink_Tree'`. Three surfaces, one apparent root cause:
+//        - as a field:   `type Outer { i: Inner[Int] }`  (non-generic outer, so it never reaches
+//                        a mono emitter at all — emit_struct_typedef handles it, and that
+//                        function appears NOWHERE in the fes70z diff, which is the attribution
+//                        proof by inspection as well as by measurement)
+//        - as a List element: a `List[QBox[Int]]` literal
+//        - as an enum payload: constructing `Tree.Leaf(v: 9)` reached through a carrier
+//      The generic-outer variant `type Outer[T] { i: Inner[T] }` constructed as
+//      `Outer { i: Inner { v: n } }` degrades differently — it DOES reach mono and raises I0001
+//      with mono args 'T' and 'Void'.
+//
+//   3. OPTION NESTING OVER A GENERIC STRUCT: `Some(Some(QBox { v: n }))` collapses. This is why
+//      the two carrier rows below construct only ONE level deep while their None counterparts
+//      stay two deep — the two-deep None path is the shape that exercises the carrier producer,
+//      and the one-deep Some path is as far as construction currently survives.
+//
+// One thing NOT claimed: that any of the above was fixed here. R1 (running
+// mono_arg_tids_with_ann at register_mono_field_types) was measured byte-neutral across the
+// corpus and fixes none of these families — an earlier hunch that it repaired the compound-field
+// carrier came from comparing archive-linked `blink run` against monolithic `blinkc`, and in the
+// same mode that shape fails identically before and after.
+
+type QBox[T] { v: T }
+type WBox[T] { v: Option[T] }
+type Tree[T] { Leaf(v: T), Nil }
+
+// Carrier-annotation-only reach, nested two deep: the inner QBox[Int] instance is never
+// constructed on any path the tid-bearing producers see.
+fn nested_none() -> Option[Option[QBox[Int]]] {
+    None
+}
+
+fn carrier_some(n: Int) -> Option[QBox[Int]] {
+    Some(QBox { v: n })
+}
+
+// The invisible-erasure shape: a COMPOUND field reached through a carrier.
+fn compound_none() -> Option[Option[WBox[Int]]] {
+    None
+}
+
+fn compound_some(n: Int) -> Option[WBox[Int]] {
+    Some(WBox { v: Some(n) })
+}
+
+// Two distinct instantiations of one generic struct in the two slots of one carrier — the
+// registry keys them separately, so a slot mixed up between them would surface here.
+fn result_carrier(ok: Int) -> Result[QBox[Int], QBox[Str]] {
+    if ok != 0 {
+        return Ok(QBox { v: ok })
+    }
+    Err(QBox { v: "bad" })
+}
+
+// Container-inside-carrier: the annotation names List/Map, and the generic struct is one level
+// further in, so the slot cannot be recovered from the carrier's own head.
+fn list_carrier() -> Option[List[QBox[Int]]] {
+    None
+}
+
+fn map_carrier() -> Option[Map[Str, QBox[Int]]] {
+    None
+}
+
+// The enum emitter is a separate guard call site (enum_typedef_payload).
+fn tree_carrier() -> Option[Tree[Int]] {
+    None
+}
+
+test "carrier-only generic struct does not false-ICE" {
+    assert_eq(nested_none().is_none(), true)
+    assert_eq(carrier_some(7).unwrap().v, 7)
+}
+
+test "carrier-only compound field does not false-ICE" {
+    assert_eq(compound_none().is_none(), true)
+    assert_eq(compound_some(5).unwrap().v.unwrap(), 5)
+}
+
+test "two instantiations in one Result carrier do not false-ICE" {
+    let ok = result_carrier(3)
+    assert_eq(ok.is_ok(), true)
+    assert_eq(ok.unwrap().v, 3)
+
+    let bad = result_carrier(0)
+    assert_eq(bad.is_err(), true)
+}
+
+test "generic struct inside a container inside a carrier does not false-ICE" {
+    assert_eq(list_carrier().is_none(), true)
+    assert_eq(map_carrier().is_none(), true)
+}
+
+test "carrier-only generic ENUM does not false-ICE" {
+    // Annotation-only, and that is enough: blink_Tree_Int is emitted through
+    // emit_mono_enum_typedef, so the enum guard call site is reached. CONSTRUCTING a Tree[Int]
+    // through the carrier is family 2 above, absent here.
+    assert_eq(tree_carrier().is_none(), true)
+}

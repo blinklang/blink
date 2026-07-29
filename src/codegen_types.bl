@@ -3,7 +3,7 @@ import parser.{
     node_source_module, node_trait_name, node_type_ann, node_type_name, node_type_params,
     sublist_get, sublist_length
 }
-import ast.{dbg_trace}
+import ast.{dbg_channel_on, dbg_trace}
 import diagnostics.{
     Diag, diag_error_no_loc, diag_set_last_fix,
     UNDECLARED_EFFECT,
@@ -1214,9 +1214,21 @@ pub type GenericCallArgs {
 // Mono function instances to emit: (base_fn_name, concrete_args)
 // arg_tids: the per-tparam concrete type-ids that produced `args`, positionally
 // aligned with the CSV segments (codegen-structured-tids D1b, br ec5qgb). Empty
-// when the registering call site had no tid in scope (string-derived paths); the
-// def-side emitters gate on tc_tid_encodable and fall back to the `args` string
-// for those slots, so an empty list is always safe.
+// when the registering call site had no tid in scope (string-derived paths).
+//
+// "AN EMPTY LIST IS ALWAYS SAFE" USED TO BE CLAIMED HERE AND IS FALSE. It rested on a
+// def-side fall back to the `args` string that NO LONGER EXISTS: since br 0n07he deleted the
+// string-CSV type-param resolver, emit_mono_struct_typedef / emit_mono_enum_typedef /
+// mono_fn_signature use concrete_args ONLY to build the c_name and resolve every field and
+// param through resolve_tparam_via_tid, which returns the BINDER NAME UNCHANGED on a -1 or
+// absent slot. A degraded arg_tids therefore erases with no compensation whatsoever, in one
+// of two shapes neither of which the `_Void` grep can see (CLAUDE.md): a bare binder in a C
+// symbol (blink_Box_T), or an erased field under a correct mono name
+// (blink_QBox_Int { blink_Option_void v; }, br w4c0py).
+//
+// Worse, [] is strictly less recoverable than an all- -1 list of the right arity, because the
+// recovery net mono_arg_tids_with_ann (codegen_stmt.bl) fills -1 HOLES and an empty list
+// has none. merge_arg_tids treats arity as information for exactly that reason (br p7014w).
 type MonoFnInstance {
     base: Str
     args: Str
@@ -3994,11 +4006,152 @@ pub fn get_callee_params_sl(fn_name: Str) -> Int {
     -1
 }
 
+// Slot contradictions seen by merge_arg_tids: two DIFFERENT concrete tids offered for one
+// slot of one (base, args) key. NOT unreachable — MEASURED at 31 hits across 14 fixtures on
+// the 700-fixture corpus, and every one of them is the same mechanism: THE `args` CSV KEY IS
+// NON-INJECTIVE. The clearest exhibit is tests/test_jkdywb_tuple_inline_container.bl, whose
+// `fn wrap[T](x: T) -> (T, Int)` is instantiated at Set[Int], Set[Str] and Set[Point] — all
+// three of which spell the bare segment "Set", so all three share the one mono key
+// "wrap"/"Set" while carrying three distinct tids. That collapse predates this counter and
+// has nothing to do with the join; the join merely made it OBSERVABLE. (The fixture passes
+// because the def side keeps those instantiations apart through the tid memo threaded at the
+// tuple boundary, not through this registry's arg_tids.)
+//
+// So read a nonzero count as "the CSV segment lost information", NOT as "a non-canonical tid
+// escaped ty_pool" — that second mechanism (two tids for one FULLY spelled segment) would be
+// the q4etvt class and is a genuine bug, but it is not what the corpus shows. The two are
+// told apart by whether the traced `args` segment names its own type arguments.
+//
+// The tie-break is arbitrary and provably so: rebuilding the whole corpus with `max` instead
+// of `min` emits byte-identical C for all 709 files, so no conflicting slot is load-bearing
+// today. That is a statement about today's corpus, not a guarantee — see the ticket note, and
+// br qnpb2d in particular, where making the tid path AUTHORITATIVE over the string path would
+// turn one of these collapsed keys into a real miscompile.
+pub let mut mono_arg_tid_conflicts: Int = 0
+// Arity disagreements between two populated lists for one key. MEASURED at zero across the
+// corpus and both compiler entry points, as expected: arg_tids are positionally aligned with
+// the `args` CSV segments and `args` is half the dedup key, so one key cannot disagree on
+// arity even when it is non-injective about segment CONTENT.
+pub let mut mono_arg_tid_arity_conflicts: Int = 0
+
+// The LATTICE JOIN of two arg_tids lists for the same (base, args) key (br p7014w).
+//
+// Both register fns dedup on (base, args); before this, the loser's arg_tids was simply
+// discarded, so EMISSION ORDER — not tid quality — decided what the def side got. A join
+// makes the stored payload a function of the SET of registrations instead of their order,
+// which is what decisions/compiler-type-representation.md:47 (Q3, 5-0) requires of anything
+// behind a canonical key: "Compound types constructed in different orders must produce the
+// same key."
+//
+// It must be a JOIN and not a compare-and-replace. "Take whichever list is more concrete"
+// has no answer for stored [t1,-1] against incoming [-1,t2] — the two are INCOMPARABLE, so
+// first-arrival wins and the orders disagree on exactly the case that matters most.
+// Element-wise join has an answer: [t1,t2].
+//
+// Per slot: bottom = -1, every concrete tid >= 0 an incomparable atom.
+// Per list: bottom = [], and EVERY populated list is strictly above it INCLUDING AN
+// ALL- -1 LIST, because arity is information. Widening [] to all- -1 is a no-op for every
+// consumer EXCEPT the hole-filler: resolve_tparam_seg (:2419-2424) treats an out-of-range
+// slot and a "" seg identically, tparam_tid_via_mono (codegen_methods.bl:317-318) returns
+// -1 for both, and segs_from_arg_tids (codegen_expr.bl:3079-3092) maps -1 to "". The sole
+// behavioural delta is that mono_arg_tids_with_ann (codegen_stmt.bl) starts working:
+// it needs a -1 HOLE to fill and an empty list has none, so [] is unrecoverable even with a
+// tid-bearing annotation in hand while [-1] is recoverable.
+//
+// PURITY IS A REQUIREMENT, NOT AN ACCIDENT. This is Int/List[Int]/Str arithmetic only, so it
+// reaches no tid accessor and respects codegen_types' position BELOW typecheck in the DAG.
+// The predicate may only ever ask "is this slot -1?", never "is this tid encodable?".
+pub fn merge_arg_tids(stored: List[Int], incoming: List[Int], base: Str, args: Str) -> List[Int] {
+    if incoming.len() == 0 { return stored }
+    if stored.len() == 0 {
+        dbg_trace("monodedup", "upgrade base={base} args={args} stored=[] incoming=len{incoming.len()} merged=incoming")
+        return incoming
+    }
+    let mut width = stored.len()
+    if stored.len() != incoming.len() {
+        mono_arg_tid_arity_conflicts = mono_arg_tid_arity_conflicts + 1
+        dbg_trace("monodedup", "arity-conflict base={base} args={args} stored=len{stored.len()} incoming=len{incoming.len()}")
+        // Resolve by LENGTH, never by arrival order — otherwise the tie-break reintroduces
+        // the order dependence this whole function exists to remove. But take only the
+        // ARITY from the longer list, not its contents: the longer list can hold a -1
+        // where the shorter holds a concrete tid, and returning it whole would DEGRADE
+        // that slot. The overlap is joined element-wise below, with a missing slot read
+        // as the per-slot bottom (-1), which is what makes this branch a join too.
+        if incoming.len() > width { width = incoming.len() }
+    }
+    let mut out: List[Int] = []
+    let mut upgraded = 0
+    let mut i = 0
+    while i < width {
+        let s = arg_tid_slot(stored, i)
+        let n = arg_tid_slot(incoming, i)
+        if s == n {
+            out.push(s)
+        } else if s < 0 {
+            upgraded = 1
+            out.push(n)
+        } else if n < 0 {
+            out.push(s)
+        } else {
+            // Both concrete and different. Not a degradation — either the CSV segment is
+            // non-injective (what the corpus actually shows) or a non-canonical tid escaped
+            // ty_pool. See mono_arg_tid_conflicts for how to tell those apart; the fix for
+            // either is at the TID SOURCE or the KEY, never here.
+            mono_arg_tid_conflicts = mono_arg_tid_conflicts + 1
+            dbg_trace("monodedup", "slot-conflict base={base} args={args} slot={i} stored={s} incoming={n}")
+            // `min` purely so the join stays commutative and associative; a join is what
+            // makes the result a function of the registration SET. DO NOT TUNE THIS — the
+            // choice is measured to be C-neutral, so tuning it can only ever look like it
+            // fixed something.
+            out.push(if s < n { s } else { n })
+        }
+        i = i + 1
+    }
+    if upgraded != 0 {
+        if dbg_channel_on("monodedup") != 0 {
+            dbg_trace("monodedup", "upgrade base={base} args={args} stored={arg_tids_dbg(stored)} incoming={arg_tids_dbg(incoming)} merged={arg_tids_dbg(out)}")
+        }
+    }
+    out
+}
+
+// A slot of an arg_tids list, with an out-of-range index reading as the per-slot bottom.
+// Only merge_arg_tids' arity-conflict branch can index past a list's end, and treating the
+// missing slot as -1 is what keeps that branch a join rather than a replacement.
+fn arg_tid_slot(t: List[Int], i: Int) -> Int {
+    if i < t.len() { return t.get(i).unwrap() }
+    -1
+}
+
+fn arg_tids_differ(a: List[Int], b: List[Int]) -> Bool {
+    if a.len() != b.len() { return true }
+    let mut i = 0
+    while i < a.len() {
+        if a.get(i).unwrap() != b.get(i).unwrap() { return true }
+        i = i + 1
+    }
+    false
+}
+
+fn arg_tids_dbg(t: List[Int]) -> Str {
+    let mut s = "["
+    let mut i = 0
+    while i < t.len() {
+        if i > 0 { s = s.concat(",") }
+        s = s.concat("{t.get(i).unwrap()}")
+        i = i + 1
+    }
+    s.concat("]")
+}
+
 pub fn register_mono_fn(base: Str, args: Str, arg_tids: List[Int]) ! Codegen.Register {
     let mut i = 0
     while i < mono_fns.len() {
         let mf = mono_fns.get(i).unwrap()
         if mf.base == base && mf.args == args {
+            // Not a bare `return` — the incoming arg_tids used to be discarded here, making
+            // registration order decide what the def side got (br p7014w). Join instead.
+            mono_fns.set(i, MonoFnInstance { base: mf.base, args: mf.args, arg_tids: merge_arg_tids(mf.arg_tids, arg_tids, base, args) })
             return
         }
         i = i + 1
@@ -4368,19 +4521,30 @@ pub fn register_mono_instance(base: Str, args: Str, arg_tids: List[Int]) -> Str 
 // annotation is ATTACHED to the existing entry when that entry has none: registration
 // order is not controlled, so the tid-bearing annotation may well arrive second, and
 // dropping it would leave the def side with the same all- -1 slots this exists to fix.
+//
+// The incoming arg_tids is JOINED into the existing entry in that SAME lookup (br p7014w) —
+// it used to be dropped outright, so registration order decided the def side's slots. Note
+// this deliberately does NOT sit under an `ann != -1` guard: every tid-BEARING producer
+// arrives through register_mono_instance with ann == -1, and it is precisely those that must
+// be able to upgrade a degraded entry. `ann` keeps its own fill-a-hole rule, which is sound
+// for a single node id because two annotations naming one instance memoize the same interned
+// tid (that residual "first non- -1 wins" is recorded on the ticket as benign).
 pub fn register_mono_instance_ann(base: Str, args: Str, arg_tids: List[Int], ann: Int) -> Str ! Codegen.Register {
     let existing = lookup_mono_instance(base, args)
     if existing != "" {
-        if ann != -1 {
-            match mono_rev_idx.get(existing) {
-                Some(idx) => {
-                    let m = mono_instances.get(idx).unwrap()
-                    if m.ann == -1 {
-                        mono_instances.set(idx, MonoInstance { base: m.base, args: m.args, c_name: m.c_name, arg_tids: m.arg_tids, ann: ann })
-                    }
+        match mono_rev_idx.get(existing) {
+            Some(idx) => {
+                let m = mono_instances.get(idx).unwrap()
+                let merged = merge_arg_tids(m.arg_tids, arg_tids, base, args)
+                let keep_ann = if m.ann == -1 { ann } else { m.ann }
+                // The overwhelmingly common dedup hit is a second identical registration
+                // (ann == -1, same arg_tids), where the join is the identity — skip the
+                // rewrite so a repeated struct literal does not rebuild the entry.
+                if keep_ann != m.ann || arg_tids_differ(merged, m.arg_tids) {
+                    mono_instances.set(idx, MonoInstance { base: m.base, args: m.args, c_name: m.c_name, arg_tids: merged, ann: keep_ann })
                 }
-                None => {}
             }
+            None => {}
         }
         return existing
     }

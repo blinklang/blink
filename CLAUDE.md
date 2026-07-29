@@ -60,7 +60,27 @@ to; the tier is last-resort, so silence here means an earlier producer answered)
 `tc_pin_tail_ret_generic` that made it past all four gates, with the declared and inferred types
 it unified). Every pin mutates `ty_pool` IN PLACE, so adding a pin caller can change emitted C for
 programs unrelated to the new seam — `retpin` is how you audit that blast radius without a
-printf+recompile; silence on a program means no pin fired for it. (`csvresolve` is
+printf+recompile; silence on a program means no pin fired for it. `monodedup` (every
+`merge_arg_tids` join on a mono-registry `(base, args)` dedup hit — `upgrade` when a degraded
+stored `arg_tids` gained a slot, `slot-conflict` when two DIFFERENT concrete tids were offered
+for one slot, `arity-conflict` on a length disagreement. `upgrade` is the blast-radius audit
+for br p7014w: zero upgrade lines on a program guarantees its emitted C is unchanged by the
+join a priori, which is a cheaper and stronger argument than a byte-diff. `slot-conflict` is
+NOT a bug in the join — it means the `args` CSV key is non-injective at that segment, e.g.
+`wrap[T]` instantiated at `Set[Int]`/`Set[Str]`/`Set[Point]` all keying as `wrap`/`Set`
+(measured: 31 hits over 14 fixtures, all this shape, all C-neutral). Two tids for a FULLY
+spelled segment would instead be the q4etvt non-canonical-interning class, a real bug — tell
+them apart by whether the traced `args` segment names its own type arguments.); `monofield` (the
+def-side mono SLOT resolvers — `bail=no_ann`/`bail=empty_arg_tids`/`bail=arity` are the recovery
+net `mono_arg_tids_with_ann` giving up, and `binder-survived` is a slot that reached emission still
+spelled as its own type-param binder, i.e. an erasure to `void v;` or `blink_Option_void v;`.
+`binder-survived` now also raises I0001 (which carries the same owner in its message and site in its
+help), so on a normal build that arm is already fatal and loud — the channel's real value is the
+three BAILS, which are otherwise completely silent. Two
+things it CANNOT see: a slot whose unresolvable answer is a TUPLE STEM rather than a binder (br
+3aa3je — `blink_Box_Tuple2_Box_Int_int` still gets `void v;` with this channel silent), and any
+erasure outside these four resolvers. Measured floor is 0 across 700 fixtures, 22 examples and both
+compiler entry points — a nonzero reading is a regression, not noise.) (`csvresolve` is
 retired — the legacy string-CSV type-param resolver it tapped no longer exists.)
 NOTE: `build/blinkc` IGNORES `BLINK_TRACE_CHANNELS` — `dbg_channels` is assigned only in
 `src/cli.bl`, so a probe binary for tracing must be built from `src/cli.bl`, not
