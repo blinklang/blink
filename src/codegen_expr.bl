@@ -3244,6 +3244,34 @@ pub fn emit_generic_fn_call_tail(node: Int, fn_name: Str, args_str: Str, ca: Gen
         return 0
     }
     let ta_str = type_args.unwrap()
+    let tparams_sl = node_type_params(gfn_node)
+    // I0001 chokepoint for the generic-FN path (br psrvff), the twin of emit_struct_lit's
+    // below. Every generic-fn call's mono name funnels through here, and this is the last
+    // point before register_mono_fn/register_mono_instance — so a rejected name is never
+    // registered, and no C is written.
+    //
+    // The struct half of this invariant has been loud for a while; the fn half was
+    // SILENT. `fn f[T]() -> Int { 1 }` called as `f()` mangled `blink_f_Void` and exited
+    // 0 with zero diagnostics, because an erased mono name is a perfectly valid C
+    // identifier — so it compiled, linked, and collapsed `f[Int]` and `f[Str]` onto one
+    // symbol. Silent wrong C is strictly worse than an ICE.
+    //
+    // Same predicate as the struct chokepoint on purpose: mono_args_has_void_seg is
+    // generic over (csv, tparams_sublist), not struct-specific, and it rejects the
+    // bare-binder passthrough (`blink_f_T`) as well as the literal "Void" — the spelling
+    // the `_Void` grep structurally cannot see.
+    //
+    // Not E0301: that rule is binding-scoped (reported from nr_pop_scope via
+    // tc_report_under_determined), and for the shape above `_x : Int` is fully concrete,
+    // so there is no under-determined binding and no metavar to latch onto. A real
+    // declaration-site diagnostic is the right long-term answer, with this demoted to a
+    // backstop; until then a phantom tparam surfaces as the compiler bug it is.
+    if mono_args_has_void_seg(ta_str, tparams_sl) {
+        diag_ice_at("UnsolvedTypeVarAtCodegen", UNSOLVED_TYPEVAR_AT_CODEGEN,
+            "type parameter of fn '{fn_name}' reached monomorphization unsolved (mono args '{ta_str}')",
+            node,
+            "this is a compiler bug — the type should have been inferred, or reported as error[CannotInferType]")
+    }
     let mangled = mangle_generic_name(fn_name, ta_str)
     // 0n07he Step 2b: carry the per-tparam concrete tids on EVERY slot the tid can
     // faithfully spell, whether the CSV came from the tid path (tc_mono_csv) or the
@@ -3277,7 +3305,6 @@ pub fn emit_generic_fn_call_tail(node: Int, fn_name: Str, args_str: Str, ca: Gen
     register_mono_instance(fn_name, ta_str, arg_tids)
     let segs = segs_from_arg_tids(arg_tids)
     let ret_str = node_return_type(gfn_node)
-    let tparams_sl = node_type_params(gfn_node)
     let resolved_ret = resolve_tparam_via_tid(ret_str, tparams_sl, arg_tids)
     // A bare-typevar return (`-> T`/`-> U`) bound to a compound resolves through
     // the string tag to a carrier name (Option_int / Result_int_str / Map_..)

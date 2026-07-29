@@ -1,0 +1,213 @@
+// br psrvff: a generic FN's type param that no call site can determine reached the
+// mangler erased and mangled `blink_f_Void` — silently, exit 0, zero diagnostics:
+//
+//     fn f[T]() -> Int { 1 }
+//     fn main() { let _x = f() }
+//   => int64_t blink_f_Void(void);   // compiles, links, runs
+//
+// This is the WORST erasure spelling. `blink_f_Void` is a valid C identifier under an
+// `#ifndef BLINK_TD_` regime, so nothing rejects it, and two distinct instantiations of
+// the same generic fn — `f[Int]` and `f[Str]` — collapse onto one C symbol. A wrong
+// answer that compiles beats no answer only if you never run it.
+//
+// The struct half of this invariant has been a hard stop for a while: emit_struct_lit
+// funnels every generic-struct literal's mono name through one chokepoint and raises
+// I0001 on a Void segment (tests/test_i0001_unsolved_typevar_at_codegen.bl). The generic
+// FN path had no equivalent. This file pins it.
+//
+// WHY I0001 AND NOT E0301. E0301 CannotInferType is BINDING-scoped: it reports an
+// under-determined *binding* out of nr_pop_scope via tc_report_under_determined
+// (sections/03_types.md:1136-1192). Here `_x : Int` is fully concrete — there is no
+// under-determined binding to report. tc_tparam_is_ret_only never even mints a metavar
+// for `-> Int`, so there is no α to latch onto either. The unsolved thing is a type param
+// that literally cannot be named: Blink has no turbofish, so nothing the user can write
+// supplies T.
+//
+// THAT IS ALSO WHY THIS IS NOT THE END STATE. I0001 says "compiler bug, please report
+// it" about a declaration the compiler accepted, which is the wrong thing to show a user
+// even though it is the right thing to DO. The real answer is a declaration-site
+// diagnostic with I0001 demoted to a backstop — filed as its own spec ticket (8w0yj9).
+// Failing closed first is the prerequisite: you cannot diagnose at the declaration while
+// the call site is still quietly succeeding.
+//
+// THE GATE reuses mono_args_has_void_seg, the same predicate the struct chokepoint uses.
+// It is generic over (csv, tparams_sublist), not struct-specific, and it rejects the
+// BARE-BINDER passthrough as well as the literal "Void" — the spelling CLAUDE.md's
+// `_Void` grep structurally cannot see (`blink_f_T`, no `_Void` anywhere).
+//
+// Catalog: ERROR_CATALOG.md I0001. The row and the `blink explain` text are already
+// kind-agnostic, so no catalog change was needed for the fn path.
+
+import compile_test_helpers
+import std.io
+
+fn assert_has(out: Str, needle: Str, label: Str) {
+    if !out.contains(needle) { io.println("FAIL: {label} — missing '{needle}'") }
+    assert(out.contains(needle))
+}
+
+fn assert_lacks(out: Str, needle: Str, label: Str) {
+    if out.contains(needle) { io.println("FAIL: {label} — forbidden '{needle}' present") }
+    assert(!out.contains(needle))
+}
+
+fn phantom_src() -> Str {
+    let mut s = "fn f[T]() -> Int \{ 1 }\n"
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let _x = f()\n")
+    s = s.concat("    assert(_x == 1)\n")
+    s = s.concat("}\n")
+    s
+}
+
+// ── the chokepoint fires ──────────────────────────────────────────────────────
+
+test "a phantom generic-fn type param raises I0001 instead of mangling Void" {
+    compile_test_helpers.expect_compile_error(phantom_src(), "psrvff_phantom", "I0001")
+}
+
+// The BELT to the row above's braces. `expect_compile_error` only proves a diagnostic was
+// PRINTED; the failure this ticket is about was invisible precisely because it also
+// produced valid, linkable output, so a diagnostic alongside an emitted `blink_f_Void`
+// would satisfy the row above while leaving the miscompile in place.
+//
+// Asserting NO C FILE EXISTS is the strongest available form of that check, and stronger
+// than grepping emitted C for the erased name: `ice` severity makes blinkc exit before
+// writing any output at all, so the erased symbol cannot appear under EITHER spelling —
+// including the bare-binder `blink_f_T`, which the `_Void` grep structurally cannot see.
+// Driving blinkc directly rather than through compile_and_emit_c because that helper
+// read_file's the .c unconditionally and panics when the compile correctly fails.
+test "a rejected mono name produces no C output at all" {
+    let bl_path = ".tmp/psrvff_belt.bl"
+    let c_path = ".tmp/psrvff_belt.c"
+    write_file(bl_path, phantom_src())
+    let r = process_run("build/blinkc", [bl_path, c_path])
+    assert(r.exit_code != 0)
+    // The human renderer spells the NAME, not the code (the code is what the JSON
+    // format the row above goes through carries), so match on the name here.
+    assert(r.err_out.contains("UnsolvedTypeVarAtCodegen"))
+    let names: List[Str] = fs.list_dir(".tmp")
+    assert(!names.contains("psrvff_belt.c"))
+    fs.remove(bl_path)
+}
+
+test "I0001 is in the error catalog under the fn path's name too" {
+    compile_test_helpers.verify_catalog_entry("I0001", "UnsolvedTypeVarAtCodegen")
+}
+
+// ── false-positive guards, one per inference arm ──────────────────────────────
+// The gate is a hard stop on a path every generic-fn call takes, so a false positive is a
+// worse outcome than the bug it fixes: it would reject working programs. Each row below
+// hits a DIFFERENT arm of infer_fn_type_args_from_types, because the arms decode the
+// binding by different means and a gate that reads the CSV cannot tell which one produced
+// it. `compile_and_run` rather than `compile_and_capture` alone, so a row cannot pass by
+// emitting a diagnostic-free wrong answer.
+
+fn assert_green(src: Str, tag: Str, label: Str) {
+    let out = compile_test_helpers.compile_and_capture(src, tag)
+    assert_lacks(out, "I0001", "{label} / no ICE")
+    let r = compile_test_helpers.compile_and_run(src, "{tag}_run")
+    if r.exit_code != 0 { io.println("FAIL: {label} — exit {r.exit_code}: {r.err_out}") }
+    assert_eq(r.exit_code, 0)
+}
+
+test "a tparam bound by a plain param is unaffected" {
+    let mut s = "fn id[T](x: T) -> T \{ x }\n"
+    s = s.concat("fn main() \{ assert(id(7) == 7) }\n")
+    assert_green(s, "psrvff_bound", "bound tparam")
+}
+
+// The e2kjqy pin sites' own output. A return-only tparam is solved by a metavar pinned
+// from the declared type, so the CSV arrives concrete by a route that never touches a
+// param type — the gate must not mistake "no param named it" for "nothing named it".
+test "a return-only tparam solved by the declared type is unaffected" {
+    let mut s = "type RGT[T] \{ s: Set[T] }\n"
+    s = s.concat("fn mk[T]() -> RGT[T] \{ RGT \{ s: Set() } }\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let e: RGT[Int] = mk()\n")
+    s = s.concat("    assert(e.s.len() == 0)\n")
+    s = s.concat("}\n")
+    assert_green(s, "psrvff_retonly", "return-only tparam")
+}
+
+// HIGHEST RISK of the green rows. type_name_from_ct returns "Void" for CT_TUPLE —
+// it has no arm for it, unlike struct/enum/Option/Result which are special-cased
+// upstream. A tuple-bound tparam is therefore the shape most likely to reach the gate
+// with a literal "Void" segment despite being perfectly determined. If this row ever goes
+// red, the fix is the missing type_name_from_ct arm, NOT relaxing the gate.
+test "a tuple-bound tparam is unaffected" {
+    let mut s = "fn id[T](x: T) -> T \{ x }\n"
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let t = id((1, 2))\n")
+    s = s.concat("    assert(t._0 == 1)\n")
+    s = s.concat("    assert(t._1 == 2)\n")
+    s = s.concat("}\n")
+    assert_green(s, "psrvff_tuple", "tuple-bound tparam")
+}
+
+// Option/Result ARE special-cased upstream (compound_tag_from_ca), so this row and the
+// tuple row above exercise two different decoders for the same question.
+test "an Option-bound tparam is unaffected" {
+    let mut s = "fn unwrap_or[T](o: Option[T], d: T) -> T \{\n"
+    s = s.concat("    match o \{\n")
+    s = s.concat("        Some(v) => return v\n")
+    s = s.concat("        None => return d\n")
+    s = s.concat("    }\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    assert(unwrap_or(Some(3), 0) == 3)\n")
+    s = s.concat("    assert(unwrap_or(None, 9) == 9)\n")
+    s = s.concat("}\n")
+    assert_green(s, "psrvff_option", "Option-bound tparam")
+}
+
+test "a tparam bound through a generic user struct param is unaffected" {
+    let mut s = "type Box[T] \{ v: T }\n"
+    s = s.concat("fn peek[T](b: Box[T]) -> T \{ b.v }\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let b: Box[Int] = Box \{ v: 5 }\n")
+    s = s.concat("    assert(peek(b) == 5)\n")
+    s = s.concat("}\n")
+    assert_green(s, "psrvff_structparam", "generic user-struct param")
+}
+
+// Reused verbatim from tests/test_3dpshm_generic_fn_ret_only_tparam.bl's Fn-return rows,
+// because the `Fn`-annotation arm decodes a param's type from a C SIGNATURE STRING and can
+// legitimately yield CT_VOID for a slot — the one arm where a "Void" in flight is not
+// evidence of erasure. list_map and map_map_values are the only two functions in the repo
+// whose U is named solely inside an `Fn` annotation, so they are the live surface a
+// too-eager gate takes out.
+//
+// map_map_values asserts only len(): its result Map's VALUE type is not substituted at the
+// call site (br ymw81c), so asserting on the value would make this row's verdict depend on
+// an unrelated live bug.
+test "the stdlib HOFs whose U is Fn-return-only still compile" {
+    let mut s = "import std.list.\{list_map}\n"
+    s = s.concat("import std.map.\{map_map_values}\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let ys = list_map([1, 2], fn(n: Int) -> Str \{ \"\{n}\" })\n")
+    s = s.concat("    assert(ys.len() == 2)\n")
+    s = s.concat("    assert(ys.get(0).unwrap() == \"1\")\n")
+    s = s.concat("    let m: Map[Str, Int] = Map()\n")
+    s = s.concat("    m.insert(\"a\", 1)\n")
+    s = s.concat("    let m2 = map_map_values(m, fn(k: Str, v: Int) -> Str \{ \"\{k}\{v}\" })\n")
+    s = s.concat("    assert(m2.len() == 1)\n")
+    s = s.concat("}\n")
+    assert_green(s, "psrvff_stdhof", "stdlib Fn-return-only HOFs")
+}
+
+// A generic fn whose tparam is bound at TWO call sites with different types: the shape the
+// erased symbol actually corrupted, since blink_f_Void would have collapsed both onto one
+// C function. Distinct mono symbols are the positive statement of what the gate protects.
+test "two instantiations of one generic fn keep distinct mono symbols" {
+    let mut s = "fn id[T](x: T) -> T \{ x }\n"
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    assert(id(7) == 7)\n")
+    s = s.concat("    assert(id(\"a\") == \"a\")\n")
+    s = s.concat("}\n")
+    let c = compile_test_helpers.compile_and_emit_c(s, "psrvff_twins_c")
+    assert_has(c, "blink_id_Int", "twins / Int instantiation")
+    assert_has(c, "blink_id_Str", "twins / Str instantiation")
+    assert_lacks(c, "_Void", "twins / string-producer erasure")
+    assert_green(s, "psrvff_twins", "two instantiations")
+}
