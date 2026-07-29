@@ -28,13 +28,30 @@ test "phantom type param raises I0001 rather than erasing or emitting bare C" {
     compile_test_helpers.expect_compile_error(src, "i0001_phantom_tparam", "I0001")
 }
 
-// A param that IS matched by a field but whose CT the string speller cannot name:
-// field `a: T` binds T to Option[Int], and type_name_from_ct has no CT_OPTION arm,
-// so the segment erases to "Void". The sibling `Inner_Int` slot (a struct INSTANCE)
-// keeps the tid-native path deferring, so the string CSV stays authoritative here.
-test "unspellable matched param raises I0001" {
-    let src = "type Inner[X] \{ q: X }\ntype W[T, U] \{ a: T, b: U }\nfn main() ! IO \{\n    let w = W \{ a: Some(1), b: Inner \{ q: 5 } }\n    assert_eq(w.b.q, 5)\n}\n"
-    compile_test_helpers.expect_compile_error(src, "i0001_unspellable_matched", "I0001")
+// FLIPPED by br 6cvvh8 — this row used to pin an I0001. Field `a: T` binds T to
+// Option[Int], which the STRING speller cannot name (type_name_from_ct has no CT_OPTION
+// arm, so the segment erased to "Void"), and the row's premise was that the sibling
+// `Inner_Int` slot — a struct INSTANCE — kept the tid-native path deferring, leaving the
+// erased string CSV authoritative. 6cvvh8 admitted struct-instance slots to the tid tier,
+// so the tid path now answers first and spells BOTH slots.
+//
+// This is the chokepoint working as designed rather than being weakened: it stops an
+// erased name, and the correct response to it firing is to teach a producer to spell the
+// slot, never to relax the gate. What replaced the ICE is the whole name, not a partial
+// one — so the row asserts the full spelling of both segments and the absence of any
+// erased segment, which is what would regress if a producer lost either slot.
+test "a struct-instance sibling slot lets the tid tier spell an Option-bound param" {
+    let mut s = "type Inner[X] \{ q: X }\n"
+    s = s.concat("type W[T, U] \{ a: T, b: U }\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let w = W \{ a: Some(1), b: Inner \{ q: 5 } }\n")
+    s = s.concat("    assert_eq(w.b.q, 5)\n")
+    s = s.concat("}\n")
+    let c = compile_test_helpers.compile_and_emit_c(s, "i0001_unspellable_matched")
+    assert(c.contains("} blink_W_Option_int_Inner_Int;"))
+    assert(!c.contains("_Void"))
+    let r = compile_test_helpers.compile_and_run(s, "i0001_unspellable_matched_run")
+    assert_eq(r.exit_code, 0)
 }
 
 // ── the SECOND chokepoint: ctor_kops_fail_closed (br farq9f Stage B) ────────

@@ -35,12 +35,21 @@
 // which registers the tuple typedef as an idempotent side effect (ensure_tuple_type).
 // resolve_tuple_ann can return None, so `resolved_arg` stays the fallback.
 //
-// ADJACENT AND OUT OF SCOPE (pinned below as still-loud, filed separately): a tuple
-// type arg whose ELEMENTS are typevars (`GT[(T, Int)]` inside `fn wrap[T]`), and a
-// generic-struct-INSTANCE type arg in a container-element position (`GT[QB[Int]]`),
-// both still reach a loud I0001. Different mechanism — struct_concrete_args_from_target
-// deliberately bails on any compound arg (codegen_types.bl:4573-4579) and the tid path
-// cannot resolve those slots either. Pinned so this file records the boundary.
+// TWO ROWS BELOW WERE FLIPPED BY br 6cvvh8, which taught the TID tier to classify a
+// tuple-over-typevar slot (by substituting the mono context) and a struct-INSTANCE slot.
+// They used to pin `GT[(T, Int)]` inside `fn wrap[T]` and `GT[QB[Int]]` as loud I0001;
+// they now assert correct monomorphization. struct_concrete_args_from_target still bails
+// on every compound arg and deliberately was NOT taught otherwise — see
+// tests/test_6cvvh8_struct_mono_target_seams.bl for why a string-tier fix would have
+// produced a correct NAME over a wrong kops VTABLE.
+//
+// WHAT REMAINS OUT OF SCOPE, still pinned here as the boundary:
+//   - inserting a struct INSTANCE into a Set/Map: derive_hash_types holds only BASE
+//     names, so `Set[QB[Int]]` has no kops table on any path. `GT[QB[Int]]` may be
+//     NAMED, never keyed.
+//   - ENUM-instance type args: tc_tid_compound_slot_faithful still excludes TK_ENUM
+//     (br dbzy4r), so a generic-enum instance as a type arg is not admitted.
+//   - the by-value tuple field's typedef ordering (br 7jm54r), pinned in its own row.
 
 import compile_test_helpers
 import std.io
@@ -233,12 +242,16 @@ test "a plain scalar type arg is unaffected" {
     assert_no_erasure(c, "scalar arg")
 }
 
-// ── the boundary: adjacent shapes that must stay LOUD ─────────────────────────
-// Both are pre-existing and mechanically distinct (see the header). They are pinned
-// here so that if a later fix makes either compile, it must do so deliberately —
-// a silent transition from ICE to wrong C is exactly what this ticket was.
+// ── the boundary: adjacent shapes, flipped or still LOUD ──────────────────────
+// The two flipped rows keep their assertions HERE as well as in the 6cvvh8 file, because
+// this is the file that recorded them as loud: a future regression that re-erases them
+// must fail in the place that once accepted the ICE, not only in the newer file.
 
-test "a tuple arg over a typevar element still ICEs loudly" {
+// FLIPPED by br 6cvvh8. The tid tier now substitutes the enclosing mono context, so the
+// raw `(T, Int)` slot becomes `(Int, Int)` and the existing fqthkv tuple arm admits it.
+// The kops needle is the load-bearing half: a name-only fix leaves the `s: Set()` ctor on
+// blink_kops_str, hashing tuple keys by string pointer under a correct-looking name.
+test "a tuple arg over a typevar element monomorphizes by its substituted elements" {
     let mut s = gt_decl()
     s = s.concat("fn wrap[T](x: T) -> Option[GT[(T, Int)]] \{\n")
     s = s.concat("    let e: GT[(T, Int)] = GT \{ s: Set() }\n")
@@ -246,9 +259,12 @@ test "a tuple arg over a typevar element still ICEs loudly" {
     s = s.concat("    Some(e)\n")
     s = s.concat("}\n")
     s = s.concat("fn main() \{ assert(wrap(7).is_some()) }\n")
-    let out = compile_test_helpers.compile_and_capture(s, "23tfxg_typevar_elem")
-    compile_test_helpers.expect_contains(out, "I0001", "typevar tuple element stays loud")
-    assert(out.contains("I0001"))
+    let c = compile_test_helpers.compile_and_emit_c(s, "23tfxg_typevar_elem")
+    assert_has(c, "} blink_GT_Tuple2_int_int;", "typevar tuple element / mono typedef")
+    assert_lacks(c, "} blink_GT_Tuple;", "typevar tuple element / bare-head typedef")
+    assert_has(c, "blink_set_new(&kops_blink_Tuple2_int_int)", "typevar tuple element / tuple kops")
+    assert_lacks(c, "blink_kops_str", "typevar tuple element / string kops fallback")
+    assert_no_erasure(c, "typevar tuple element")
 }
 
 // A BY-VALUE tuple field (`v: T` rather than `s: Set[T]`) is the one shape where getting
@@ -279,14 +295,26 @@ test "a by-value tuple field gets the right mono name but still hits the typedef
     assert(r.exit_code != 0)
 }
 
-test "a generic-struct-instance type arg in a Set element still ICEs loudly" {
+// FLIPPED by br 6cvvh8, which added a TK_STRUCT admission to the tid tier's slot loop.
+// The instance is NAMED and never keyed: GT's field is `Set[T]`, which lowers to the
+// erased `blink_set*`, so nothing in blink_GT_QB_Int's typedef mentions QB_Int. The
+// sentinel needle pins that naming the type arg did not also register QB[Int] as a mono
+// instance — that would flip kops_elem_is_concrete("QB_Int") true and drive
+// kops_table_name down its fail-closed branch, since derive_hash_types holds only base
+// names. Inserting a struct instance into a Set remains out of scope entirely.
+test "a generic-struct-instance type arg in a Set element monomorphizes to its nested segment" {
     let mut s = gt_decl()
     s = s.concat("type QB[T] \{ v: T }\n")
     s = s.concat("fn main() \{\n")
     s = s.concat("    let e: GT[QB[Int]] = GT \{ s: Set() }\n")
     s = s.concat("    assert(e.s.len() == 0)\n")
     s = s.concat("}\n")
-    let out = compile_test_helpers.compile_and_capture(s, "23tfxg_struct_elem")
-    compile_test_helpers.expect_contains(out, "I0001", "struct Set element stays loud")
-    assert(out.contains("I0001"))
+    let c = compile_test_helpers.compile_and_emit_c(s, "23tfxg_struct_elem")
+    assert_has(c, "} blink_GT_QB_Int;", "struct Set element / mono typedef")
+    assert_lacks(c, "} blink_GT_QB;", "struct Set element / bare-head nested typedef")
+    assert_lacks(c, "BLINK_COMPILER_BUG_kops", "struct Set element / kops sentinel")
+    assert_no_erasure(c, "struct Set element")
+    let r = compile_test_helpers.compile_and_run(s, "23tfxg_struct_elem_run")
+    if r.exit_code != 0 { io.println("FAIL: struct Set element — exit {r.exit_code}: {r.err_out}") }
+    assert_eq(r.exit_code, 0)
 }

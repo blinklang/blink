@@ -93,7 +93,7 @@ import diagnostics.{
 }
 import std.path.{path_dirname}
 import formatter.{format_expr}
-import typecheck.{tc_mono_csv, tc_mono_tids_subst, tc_seg_from_tid, is_import_module_name, tc_lookup_node_tid, tc_tid_set_elem_ct, tc_tid_set_elem_struct, tc_tid_set_elem_ct_resolved, tc_tid_set_elem_struct_resolved, tc_tid_map_key_ct, tc_tid_map_key_struct, tc_tid_map_key_ct_resolved, tc_tid_map_key_struct_resolved, tc_tid_map_val_ct, tc_tid_map_val_struct, tc_tid_map_val_tid, tc_tid_map_key_tid, tc_tid_struct_slot_seg, tc_tid_ct, tc_tid_ct_resolved, tc_tid_resolved, tc_tid_option_inner_ct, tc_tid_option_inner_struct, tc_tid_result_ok_ct, tc_tid_result_ok_struct, tc_tid_result_err_ct, tc_tid_result_err_struct, tc_tid_to_c_tag, tc_tid_struct, tc_tid_struct_mono_name, tc_tid_is_enum, tc_tid_struct_arg_count, tc_tid_struct_arg_tid, tc_tid_compound_slot_faithful, tc_struct_slot_encodable, tc_tid_inner_tag, tc_tid_option_inner_tid, tc_tid_result_ok_tid, tc_tid_result_err_tid, tc_tid_tuple_elem_encodable, tc_tid_tuple_sname, tc_tid_tuple_arity, tc_tid_tuple_elem_tid, tc_tid_kops_slot_unsolved}
+import typecheck.{tc_mono_csv, tc_mono_tids_subst, tc_tid_subst_mono, tc_seg_from_tid, is_import_module_name, tc_lookup_node_tid, tc_tid_set_elem_ct, tc_tid_set_elem_struct, tc_tid_set_elem_ct_resolved, tc_tid_set_elem_struct_resolved, tc_tid_map_key_ct, tc_tid_map_key_struct, tc_tid_map_key_ct_resolved, tc_tid_map_key_struct_resolved, tc_tid_map_val_ct, tc_tid_map_val_struct, tc_tid_map_val_tid, tc_tid_map_key_tid, tc_tid_struct_slot_seg, tc_tid_ct, tc_tid_ct_resolved, tc_tid_resolved, tc_tid_option_inner_ct, tc_tid_option_inner_struct, tc_tid_result_ok_ct, tc_tid_result_ok_struct, tc_tid_result_err_ct, tc_tid_result_err_struct, tc_tid_to_c_tag, tc_tid_struct, tc_tid_struct_mono_name, tc_tid_is_enum, tc_tid_struct_arg_count, tc_tid_struct_arg_tid, tc_tid_compound_slot_faithful, tc_struct_slot_encodable, tc_tid_inner_tag, tc_tid_option_inner_tid, tc_tid_result_ok_tid, tc_tid_result_err_tid, tc_tid_tuple_elem_encodable, tc_tid_tuple_sname, tc_tid_tuple_arity, tc_tid_tuple_elem_tid, tc_tid_kops_slot_unsolved}
 
 // codegen_expr.bl — Expression codegen, closures, capture analysis
 
@@ -5616,26 +5616,16 @@ fn struct_string_target_in_scope(sname: Str) -> Bool {
     false
 }
 
-fn tid_native_struct_mono_args(node: Int, sname: Str) -> Str {
-    let inst_tid = tid_native_struct_inst_tid(node, sname)
-    // Gated on dbg_channel_on, per ast.bl's note and the kopsctor tap above: the
-    // message is interpolated EAGERLY, and this function runs at every struct literal
-    // in every compiled program (the compiler's own bootstrap included). The
-    // no_admission_reason tap below is the one that makes this load-bearing rather
-    // than cosmetic — it calls tid_instance_mono_args_csv purely to interpolate, an
-    // O(count) loop through tc_tid_to_c_tag that nothing else on that path needs.
-    let tracing = dbg_channel_on("retmono")
-    // Which of this function's several declines a caller actually hit. The two that
-    // look alike from outside — "no instance tid names this struct" (inst_tid < 0 /
-    // count < 1, i.e. the memo holds only the BARE base) versus "the instance is
-    // concrete but no admission reason fired" (the has_compound/has_bound_metavar
-    // gate below) — produce the identical observable, an I0001 spelling the string
-    // path's answer. Distinguishing them is the difference between a typecheck memo
-    // bug and a missing codegen tier, and it is not inferable from the ICE text.
-    if inst_tid < 0 {
-        if tracing != 0 { dbg_trace("retmono", "sname={sname} decline=no_inst_tid") }
-        return ""
-    }
+// The two outputs of the tid-native monomorphization tier, returned together so a
+// caller cannot read the CSV from the substituted instance while recovering slot tids
+// from the raw one (br 6cvvh8). `inst_tid` is the RAW instance tid unless the
+// substituted retry is what produced a non-empty `csv`.
+type TidNativeMono {
+    csv: Str,
+    inst_tid: Int
+}
+
+fn tid_native_struct_mono_slots(inst_tid: Int, sname: Str, node: Int, tracing: Int) -> Str {
     let count = tc_tid_struct_arg_count(inst_tid)
     if count < 1 {
         if tracing != 0 { dbg_trace("retmono", "sname={sname} inst_tid={inst_tid} decline=bare_base count={count}") }
@@ -5668,6 +5658,13 @@ fn tid_native_struct_mono_args(node: Int, sname: Str) -> Str {
     // may keep a module qualifier the tid side strips — unprovable without auditing
     // every writer; br f6ytg4).
     let mut all_plain_scalar = 1
+    // Whether any slot rode in on tc_tid_compound_slot_faithful's STRUCT-INSTANCE arm
+    // (br 6cvvh8). Tracked separately from has_compound because that arm is the only
+    // one that needs the nesting guard below: tid_native_struct_inst_tid matches an
+    // annotation by BARE struct name, so a nested inner literal can adopt the OUTER
+    // instance's tid, and a struct-instance slot is exactly the shape where the two
+    // nesting levels are both admissible and differently spelled.
+    let mut has_struct_inst = 0
     let mut i = 0
     while i < count {
         let slot = tc_tid_struct_arg_tid(inst_tid, i)
@@ -5677,6 +5674,7 @@ fn tid_native_struct_mono_args(node: Int, sname: Str) -> Str {
         }
         if tc_tid_compound_slot_faithful(slot) {
             has_compound = 1
+            if tc_tid_struct_arg_count(slot) >= 1 && !tc_tid_is_enum(slot) { has_struct_inst = 1 }
         } else if tc_tid_ct(slot) == -1 && tc_tid_compound_slot_faithful(tc_tid_resolved(slot)) {
             // A metavar bound IN PLACE to a TUPLE — the one kind the has_bound_metavar
             // probe above structurally cannot see, because tk_to_ct maps TK_TUPLE to
@@ -5692,11 +5690,17 @@ fn tid_native_struct_mono_args(node: Int, sname: Str) -> Str {
             // path. tc_tid_to_c_tag resolves, so the spelling is already correct.
             has_compound = 1
         } else if !tid_slot_is_plain_scalar(slot) && !tid_slot_is_bare_struct(slot) {
-            // A struct-instance / compound-of-struct / list slot — the string path
-            // (which reuses the field's registered mono name) stays authoritative.
-            // Bail so a mixed instance is never half-lowered. (A TUPLE slot no longer
-            // lands here: tc_tid_compound_slot_faithful admits it since br fqthkv,
-            // because the string path had nothing to spell for one — it ICEd.)
+            // A compound-of-struct / list / still-unsubstituted-typevar slot — the
+            // string path (which reuses the field's registered mono name) stays
+            // authoritative. Bail so a mixed instance is never half-lowered. (A TUPLE
+            // slot no longer lands here: tc_tid_compound_slot_faithful admits it since
+            // br fqthkv. Nor does a struct INSTANCE whose mono name spells — br 6cvvh8.)
+            //
+            // This bail was the one decline with no tap, which is why tracing both
+            // br 6cvvh8 exhibits printed NOTHING and read as "the tier is never
+            // reached" when in fact it was reached and bailed here. The slot's own
+            // kind is the whole diagnosis, so report it.
+            if tracing != 0 { dbg_trace("retmono", "sname={sname} inst_tid={inst_tid} slot={slot} idx={i} decline=slot_unclassifiable ct={tc_tid_ct(slot)}") }
             return ""
         }
         i = i + 1
@@ -5737,7 +5741,77 @@ fn tid_native_struct_mono_args(node: Int, sname: Str) -> Str {
         if tracing != 0 { dbg_trace("retmono", "sname={sname} inst_tid={inst_tid} count={count} decline=no_admission_reason csv={tid_instance_mono_args_csv(inst_tid, count)}") }
         return ""
     }
-    tid_instance_mono_args_csv(inst_tid, count)
+    let csv = tid_instance_mono_args_csv(inst_tid, count)
+    // NESTING GUARD for the struct-instance admission (br 6cvvh8). cg_let_target_ann /
+    // cg_expect_arg_ann are matched by BARE struct name and are NOT cleared while the
+    // field loop emits nested values, so for
+    //     let b: Box[Box[Int]] = Box { v: Box { v: 7 } }
+    // the INNER literal also sees the outer annotation's tid and would name itself
+    // blink_Box_Box_Int, lowering its own `v` field to `blink_Box_Int` — self-
+    // referential and undeclared. Before this arm the inner literal was saved by the
+    // bail above (a struct-instance slot was unclassifiable); now it is admissible, so
+    // the level must be checked explicitly.
+    //
+    // The check is the literal's OWN memoized instance tid, compared through the same
+    // arg_tids_match_mono_args parity used by the Class-A recovery: the inner literal's
+    // own tid spells "Int", which POSITIVELY contradicts "Box_Int" → decline. Exhibit
+    // B's literal has no encodable own slot, so it spells "" — a don't-care, admitted.
+    // Only ever a decline, so the tid path can lose a site to the string tier but never
+    // claim one it cannot spell.
+    if has_struct_inst != 0 {
+        let own_tid = tc_lookup_node_tid(node)
+        if own_tid != inst_tid {
+            let own = mono_instance_arg_tids_from_tid(own_tid, sname, tc_tid_struct_arg_count(own_tid))
+            if !arg_tids_match_mono_args(own, csv) {
+                if tracing != 0 { dbg_trace("retmono", "sname={sname} inst_tid={inst_tid} own_tid={own_tid} decline=nesting_level_mismatch csv={csv}") }
+                return ""
+            }
+        }
+    }
+    csv
+}
+
+// The tid-native tier. Classifies the instance tid the literal's value context names;
+// on a decline, RETRIES against that tid with the enclosing monomorphized generic's
+// binders substituted away (br 6cvvh8), which is what lets `GT[(T, Int)]` inside
+// `fn wrap[T]` be spelled as GT_Tuple2_int_int.
+//
+// Ordered retry-after-decline, not substitute-first, so every shape a tier already
+// answers keeps its exact current output: tc_tid_subst_mono is a no-op outside a mono
+// body and on any tid with no typevar, so the retry only runs where the raw pass had
+// already given up.
+fn tid_native_struct_mono(node: Int, sname: Str) -> TidNativeMono {
+    let raw = tid_native_struct_inst_tid(node, sname)
+    // Gated on dbg_channel_on, per ast.bl's note and the kopsctor tap above: the
+    // message is interpolated EAGERLY, and this runs at every struct literal in every
+    // compiled program (the compiler's own bootstrap included). The
+    // no_admission_reason tap is the one that makes this load-bearing rather than
+    // cosmetic — it calls tid_instance_mono_args_csv purely to interpolate, an
+    // O(count) loop through tc_tid_to_c_tag that nothing else on that path needs.
+    let tracing = dbg_channel_on("retmono")
+    // Which of this tier's several declines a caller actually hit. The two that look
+    // alike from outside — "no instance tid names this struct" (raw < 0 / count < 1,
+    // i.e. the memo holds only the BARE base) versus "the instance is concrete but no
+    // admission reason fired" — produce the identical observable, an I0001 spelling the
+    // string path's answer. Distinguishing them is the difference between a typecheck
+    // memo bug and a missing codegen tier, and it is not inferable from the ICE text.
+    if raw < 0 {
+        if tracing != 0 { dbg_trace("retmono", "sname={sname} decline=no_inst_tid") }
+        return TidNativeMono { csv: "", inst_tid: raw }
+    }
+    let csv = tid_native_struct_mono_slots(raw, sname, node, tracing)
+    if csv != "" { return TidNativeMono { csv: csv, inst_tid: raw } }
+    let sub = tc_tid_subst_mono(raw, cg_mono_tparams_sl, cg_mono_arg_tids)
+    if sub != raw && sub >= 0 {
+        if tracing != 0 { dbg_trace("retmono", "sname={sname} raw={raw} sub={sub} retry=mono_subst") }
+        let sub_csv = tid_native_struct_mono_slots(sub, sname, node, tracing)
+        if sub_csv != "" { return TidNativeMono { csv: sub_csv, inst_tid: sub } }
+    }
+    TidNativeMono { csv: "", inst_tid: raw }
+}
+
+fn tid_native_struct_mono_args(node: Int, sname: Str) -> Str {
+    tid_native_struct_mono(node, sname).csv
 }
 
 // Recover the per-slot arg tids for a struct-INSTANCE tid, gated on
@@ -6179,7 +6253,12 @@ fn emit_struct_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
     // too (br fqthkv). Reads only the memoized instance tid plus cg_expect_arg_ann /
     // cg_let_target_ann, and the field loop save/restores cg_expect_arg_ann per field,
     // so evaluating it here is identical to evaluating it at the mono_args selector.
-    let tid_native_args = tid_native_struct_mono_args(node, sname)
+    // Both outputs of the tid-native tier together: when the mono-context substitution
+    // retry is what answered, the CSV is spelled from the SUBSTITUTED instance tid, and
+    // every slot-tid recovery below must read that same tid or the instance gets the
+    // right name over a wrong kops vtable — this ticket's own miscompile class (6cvvh8).
+    let tid_native = tid_native_struct_mono(node, sname)
+    let tid_native_args = tid_native.csv
     // Computed HERE, before cg_mono_arg_tids is cleared below: it reads the ENCLOSING
     // fn's mono context, not this literal's.
     let ret_ann_tids = struct_ret_ann_arg_tids(sname, node)
@@ -6212,7 +6291,14 @@ fn emit_struct_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
     let field_ctx_args = if target_args != "" { target_args } else { tid_native_args }
     if field_ctx_args != "" && td_tparams != -1 && sublist_length(td_tparams) > 0 {
         cg_mono_tparams_sl = td_tparams
-        let inst_tid = tid_native_struct_inst_tid(node, sname)
+        // Read the tid the tid-native tier actually spelled from, but ONLY when that
+        // tier is what supplied field_ctx_args. When the string target answered
+        // (target_args != "") this must stay the raw tid: a substituted tid there would
+        // start carrying real slot tids where the recovery previously stored -1, which
+        // changes emitted C for shapes that already work. tid_native.inst_tid IS the raw
+        // tid whenever the substitution retry did not win, so this is byte-identical
+        // outside the newly-answered shapes.
+        let inst_tid = if target_args == "" { tid_native.inst_tid } else { tid_native_struct_inst_tid(node, sname) }
         let recovered = mono_instance_arg_tids_from_tid(inst_tid, sname, tc_tid_struct_arg_count(inst_tid))
         if arg_tids_match_mono_args(recovered, field_ctx_args) {
             cg_mono_arg_tids = recovered
@@ -6387,8 +6473,9 @@ fn emit_struct_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
             // Tid-native path won: recover the parallel slot tids off the SAME
             // instance tid it resolved, so the def-side typedef emitter can lower
             // off tids for the encodable slots (byte-identical to the string seg).
-            let inst_tid = tid_native_struct_inst_tid(node, sname)
-            mono_arg_tids = mono_instance_arg_tids_from_tid(inst_tid, sname, tc_tid_struct_arg_count(inst_tid))
+            // tid_native.inst_tid is that tid — the raw one unless the mono-context
+            // substitution retry is what produced this CSV (br 6cvvh8).
+            mono_arg_tids = mono_instance_arg_tids_from_tid(tid_native.inst_tid, sname, tc_tid_struct_arg_count(tid_native.inst_tid))
         }
     }
     // Class-A recovery (br phybxe): the string branches (target_args and

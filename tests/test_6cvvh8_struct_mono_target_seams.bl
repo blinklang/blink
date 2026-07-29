@@ -1,0 +1,252 @@
+// br 6cvvh8: a generic struct's type argument is named unambiguously by the enclosing
+// `let` annotation, but neither monomorphization tier at emit_struct_lit can classify
+// the slot, so the literal reaches the I0001 chokepoint with 'Void'.
+//
+// TWO EXHIBITS, one mechanism per tier:
+//
+//   A. a TUPLE type arg whose elements include a typevar, inside a generic fn:
+//        fn wrap[T](x: T) -> Option[GT[(T, Int)]] { let e: GT[(T, Int)] = GT { s: Set() } .. }
+//      Tier 1 (struct_concrete_args_from_target) bails on EVERY compound annotation
+//      arg by design — node_name flattens `(T, Int)` to the bare head "Tuple". Tier 2
+//      (tid_native_struct_mono_args) sees a raw TK_TUPLE slot holding a TK_TYPEVAR
+//      element, which tc_tid_tuple_elem_encodable rejects, so the slot classifies as
+//      neither compound nor plain scalar and bails the whole instance.
+//
+//   B. a generic-struct INSTANCE as the type arg:
+//        let e: GT[QB[Int]] = GT { s: Set() }
+//      Tier 1 bails the same way. Tier 2's slot loop had no TK_STRUCT admission, so a
+//      struct-INSTANCE slot fell to the same bail.
+//
+// FIX SHAPE — extend TIER 2, never tier 1. Tier 1 is the string/annotation lens and
+// teaching it to synthesize compound names re-grows the CSV resolver deleted under
+// 0n07he (decisions/compiler-type-representation.md:99-105 step 4, restated verbatim in
+// register_carrier_inner_mono_instance). More concretely: the CSV is only ONE of
+// emit_struct_lit's two outputs — the other is the field-loop mono context that the
+// `s: Set()` ctor reads to pick its kops vtable. A tier-1 fix would produce the correct
+// NAME over a wrong VTABLE: `blink_GT_Tuple2_int_int` whose Set hashes tuple keys with
+// blink_kops_str. That is the hnyqe4 silent-hash miscompile wearing a correct-looking
+// name — strictly worse than the loud ICE it replaced.
+//
+// THE ANTI-REGRESSION FOR THE WHOLE TICKET is therefore the exhibit-A kops row below,
+// not the name row: a name-only fix passes every name assertion and fails that one.
+//
+// STILL OUT OF SCOPE — br vc40w6: Set/Map key boxing inside a monomorphized fn body reads
+// the def-side (typevar-bearing) element annotation instead of the mono context's
+// substituted type, so inserting a key from within `fn wrap[T]` mislowers even once the
+// instance is named and hashed correctly. That seam has nothing to do with either tier here
+// (it reproduces with a bare `Set[(T, Int)]` local and no struct literal at all), so exhibit
+// A's insert row below is pinned failing on it rather than fixed here.
+//
+// ALSO STILL OUT OF SCOPE (deliberately, see the pinned rows in
+// tests/test_23tfxg_tuple_arg_mono_name.bl): inserting a struct INSTANCE into a
+// Set/Map — derive_hash_types holds only BASE names, so `Set[QB[Int]]` has no kops
+// table on any path. Exhibit B therefore names its type arg and never inserts, and
+// asserts the fail-closed BLINK_COMPILER_BUG_kops sentinel is absent — naming
+// QB_Int must not register it as a mono instance, which would flip
+// kops_elem_is_concrete("QB_Int") true and drive kops_table_name down the sentinel
+// branch.
+
+import compile_test_helpers
+import std.io
+
+fn assert_has(c: Str, needle: Str, label: Str) {
+    if !c.contains(needle) { io.println("FAIL: {label} — missing '{needle}'") }
+    assert(c.contains(needle))
+}
+
+fn assert_lacks(c: Str, needle: Str, label: Str) {
+    if c.contains(needle) { io.println("FAIL: {label} — forbidden '{needle}' present") }
+    assert(!c.contains(needle))
+}
+
+fn count_occurrences(hay: Str, needle: Str) -> Int {
+    let mut n = 0
+    let mut rest = hay
+    let mut idx = rest.index_of(needle)
+    while idx >= 0 {
+        n = n + 1
+        rest = rest.substr(idx + needle.len(), rest.len())
+        idx = rest.index_of(needle)
+    }
+    n
+}
+
+// Per CLAUDE.md the `_Void` grep is a LOWER BOUND — it sees only the string
+// producers' spelling. Two more families must be checked on every C-emitting row:
+// the bare-binder passthrough (br pt4hsy — `blink_GT_T`, no `_Void` anywhere), whose
+// needle MUST be terminated because `blink_GT_T` is a strict PREFIX of the correct
+// `blink_GT_Tuple2_int_int`; and the erased carrier FIELD under a correct mono name
+// (br w4c0py — `void value;` in the Option carrier this shape returns through).
+fn assert_no_erasure(c: Str, label: Str) {
+    assert_lacks(c, "_Void", "{label} / string-producer erasure")
+    assert_lacks(c, "blink_GT_T;", "{label} / bare-binder T typedef")
+    assert_lacks(c, "blink_GT_T ", "{label} / bare-binder T declaration")
+    assert_lacks(c, "void value;", "{label} / erased Option payload")
+    assert_lacks(c, "void ok;", "{label} / erased Result payload")
+}
+
+fn gt_decl() -> Str {
+    "type GT[T] \{ s: Set[T] }\n"
+}
+
+// Exhibit A verbatim from the ticket: the only under-determination is the tuple type
+// arg's typevar element. `let _u = x` keeps the param live without constraining T
+// through any other path.
+fn src_a() -> Str {
+    let mut s = gt_decl()
+    s = s.concat("fn wrap[T](x: T) -> Option[GT[(T, Int)]] \{\n")
+    s = s.concat("    let e: GT[(T, Int)] = GT \{ s: Set() }\n")
+    s = s.concat("    let _u = x\n")
+    s = s.concat("    Some(e)\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{ assert(wrap(7).is_some()) }\n")
+    s
+}
+
+// Exhibit A carried across the mono boundary at runtime: the monomorphized body builds the
+// instance and `main` reads its field back, so the typedef must really be emitted and the
+// struct really usable — not merely spelled. It deliberately does NOT insert a key; see
+// src_a_insert below.
+fn src_a_run() -> Str {
+    let mut s = gt_decl()
+    s = s.concat("fn wrap[T](x: T) -> GT[(T, Int)] \{\n")
+    s = s.concat("    let e: GT[(T, Int)] = GT \{ s: Set() }\n")
+    s = s.concat("    let _u = x\n")
+    s = s.concat("    e\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let g = wrap(1)\n")
+    s = s.concat("    assert(g.s.len() == 0)\n")
+    s = s.concat("}\n")
+    s
+}
+
+// The same exhibit with a live insert through the tuple-keyed Set. PINNED FAILING on
+// br vc40w6, which is a different seam: Set/Map key boxing inside a monomorphized fn body
+// reads the def-side (typevar-bearing) element annotation instead of the mono context's
+// substituted type, so the `const void* item` boxing temp the runtime ABI requires is
+// skipped and the tuple is passed by value. 6cvvh8 is what made this shape reachable — it
+// is not what broke it: vc40w6 reproduces with a bare `Set[(T, Int)]` local and no struct
+// literal anywhere, and with a bare typevar element that tier 1 has always answered.
+// Flip this row to a green round-trip when vc40w6 lands.
+fn src_a_insert() -> Str {
+    let mut s = gt_decl()
+    s = s.concat("fn wrap[T](x: T) -> GT[(T, Int)] \{\n")
+    s = s.concat("    let mut e: GT[(T, Int)] = GT \{ s: Set() }\n")
+    s = s.concat("    e.s.insert((x, 2))\n")
+    s = s.concat("    e\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let g = wrap(1)\n")
+    s = s.concat("    assert(g.s.contains((1, 2)))\n")
+    s = s.concat("}\n")
+    s
+}
+
+// Exhibit B verbatim from the ticket. Kept in `main`, not inside a monomorphized body:
+// emit_all_mono_typedefs runs AFTER fn bodies (src/codegen.bl), so the same shape in a
+// mono body can see is_struct_type true for the type arg and surface the kops sentinel
+// that this row asserts absent.
+fn src_b() -> Str {
+    let mut s = gt_decl()
+    s = s.concat("type QB[T] \{ v: T }\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let e: GT[QB[Int]] = GT \{ s: Set() }\n")
+    s = s.concat("    assert(e.s.len() == 0)\n")
+    s = s.concat("}\n")
+    s
+}
+
+// ── exhibit A: tuple type arg over a typevar element ──────────────────────────
+
+test "a tuple type arg over a typevar element monomorphizes by its substituted elements" {
+    let c = compile_test_helpers.compile_and_emit_c(src_a(), "6cvvh8_a_c")
+    assert_has(c, "} blink_GT_Tuple2_int_int;", "exhibit A / mono typedef")
+    assert_lacks(c, "} blink_GT_Tuple;", "exhibit A / bare-head typedef")
+}
+
+// THE ANTI-REGRESSION FOR THE WHOLE TICKET. A tier-1-only fix names the instance
+// correctly and still binds blink_kops_str at the `s: Set()` ctor, because the tuple
+// kops table is minted from a TID (ensure_tuple_carrier_from_tid), never from a name.
+// This row is what makes that fix fail instead of silently passing.
+test "the tuple-keyed Set ctor in the mono body binds the tuple kops table" {
+    let c = compile_test_helpers.compile_and_emit_c(src_a(), "6cvvh8_a_kops")
+    assert_has(c, "blink_set_new(&kops_blink_Tuple2_int_int)", "exhibit A / tuple kops at ctor")
+    assert_lacks(c, "blink_kops_str", "exhibit A / string kops fallback")
+}
+
+test "exhibit A emits no erasure in any of the three families" {
+    let c = compile_test_helpers.compile_and_emit_c(src_a(), "6cvvh8_a_erase")
+    assert_no_erasure(c, "exhibit A")
+}
+
+test "the tuple-arg mono instance crosses the mono boundary at runtime" {
+    let r = compile_test_helpers.compile_and_run(src_a_run(), "6cvvh8_a_run")
+    if r.exit_code != 0 { io.println("FAIL: exhibit A runtime — exit {r.exit_code}: {r.err_out}") }
+    assert_eq(r.exit_code, 0)
+}
+
+// PINNED FAILING on br vc40w6 — see src_a_insert. Asserted on the specific C-level symptom
+// rather than on `exit_code != 0` alone, so that a *different* future breakage of this shape
+// makes the row fail instead of quietly satisfying it.
+test "inserting a tuple key from inside the monomorphized body still mislowers" {
+    let r = compile_test_helpers.compile_and_run(src_a_insert(), "6cvvh8_a_insert")
+    assert(r.exit_code != 0)
+    assert(r.err_out.contains("blink_set_insert"))
+}
+
+// ── exhibit B: generic-struct instance as the type arg ────────────────────────
+
+test "a generic-struct-instance type arg monomorphizes to its nested mono segment" {
+    let c = compile_test_helpers.compile_and_emit_c(src_b(), "6cvvh8_b_c")
+    assert_has(c, "} blink_GT_QB_Int;", "exhibit B / mono typedef")
+    assert_lacks(c, "_Void", "exhibit B / string-producer erasure")
+    assert_lacks(c, "blink_GT_QB;", "exhibit B / bare-head nested typedef")
+}
+
+// Naming the type arg must NOT register QB[Int] as a mono instance: that would insert
+// QB_Int into struct_reg_set, flip kops_elem_is_concrete("QB_Int") true, and drive
+// kops_table_name down its fail-closed branch — derive_hash_types only ever holds BASE
+// names, so there is no table to emit. The sentinel is the compiler telling the truth;
+// this row pins that we never make it reachable.
+test "naming a struct-instance type arg does not emit the kops sentinel" {
+    let c = compile_test_helpers.compile_and_emit_c(src_b(), "6cvvh8_b_kops")
+    assert_lacks(c, "BLINK_COMPILER_BUG_kops", "exhibit B / kops sentinel")
+}
+
+test "exhibit B compiles and runs" {
+    let r = compile_test_helpers.compile_and_run(src_b(), "6cvvh8_b_run")
+    if r.exit_code != 0 { io.println("FAIL: exhibit B runtime — exit {r.exit_code}: {r.err_out}") }
+    assert_eq(r.exit_code, 0)
+}
+
+// ── the nesting guard on the new struct-instance admission ────────────────────
+// tid_native_struct_inst_tid matches an annotation by BARE struct name and is not
+// cleared during the field loop, so admitting struct-INSTANCE slots lets a NESTED
+// inner literal adopt the OUTER instance's tid: the inner `Box { v: 7 }` would name
+// itself blink_Box_Box_Int and lower its own field to `blink_Box_Int v` —
+// self-referential, undeclared. The guard compares the recovered slot against the
+// literal's OWN memoized tid: the inner spells "Int", the outer "Box_Int".
+
+test "a nested generic-struct literal keeps its own mono name, one typedef each" {
+    let mut s = "type Box[T] \{ v: T }\n"
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let b: Box[Box[Int]] = Box \{ v: Box \{ v: 7 } }\n")
+    s = s.concat("    assert(b.v.v == 7)\n")
+    s = s.concat("}\n")
+    let c = compile_test_helpers.compile_and_emit_c(s, "6cvvh8_nest_c")
+    assert_eq(count_occurrences(c, "} blink_Box_Int;"), 1)
+    assert_eq(count_occurrences(c, "} blink_Box_Box_Int;"), 1)
+    assert_lacks(c, "_Void", "nesting guard / string-producer erasure")
+}
+
+test "the nested generic-struct literal round-trips at runtime" {
+    let mut s = "type Box[T] \{ v: T }\n"
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let b: Box[Box[Int]] = Box \{ v: Box \{ v: 7 } }\n")
+    s = s.concat("    assert(b.v.v == 7)\n")
+    s = s.concat("}\n")
+    let r = compile_test_helpers.compile_and_run(s, "6cvvh8_nest_run")
+    if r.exit_code != 0 { io.println("FAIL: nesting guard runtime — exit {r.exit_code}: {r.err_out}") }
+    assert_eq(r.exit_code, 0)
+}

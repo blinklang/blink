@@ -1189,6 +1189,49 @@ fn substitute_typevar_tid(t: Int, binds: Map[Str, Int]) -> Int {
     t
 }
 
+// The tparam-name → concrete-tid map for a codegen MONO CONTEXT: the enclosing
+// monomorphized generic's tparam sublist zipped against its per-slot arg tids.
+// Factored out of tc_mono_tids_subst so there is exactly ONE construction site for
+// this pairing — a caller that skips the `tid >= 0` filter would bind a tparam to
+// -1, which substitute_typevar_tid would then splice into a rebuilt instance as a
+// pool index that is not a type.
+fn tc_mono_binds_map(mono_tparams_sl: Int, mono_arg_tids: List[Int]) -> Map[Str, Int] {
+    let mut binds: Map[Str, Int] = Map()
+    if mono_tparams_sl == -1 { return binds }
+    let mut mi = 0
+    while mi < sublist_length(mono_tparams_sl) && mi < mono_arg_tids.len() {
+        let tid = mono_arg_tids.get(mi).unwrap()
+        if tid >= 0 {
+            binds.insert(node_name(sublist_get(mono_tparams_sl, mi)), tid)
+        }
+        mi = mi + 1
+    }
+    binds
+}
+
+// Rewrite every typevar in `tid` through a codegen MONO CONTEXT, returning the
+// interned tid of the substituted type (or `tid` itself when nothing changed).
+//
+// This is what lets a struct-instance tid written in terms of the ENCLOSING generic's
+// binders — `GT[(T, Int)]` inside `fn wrap[T]` — be classified and spelled at the
+// literal, where the only alternative was the I0001 chokepoint (br 6cvvh8). The
+// substitution happens HERE rather than by relaxing an encodability predicate on
+// purpose: a typevar has no C spelling, so admitting TK_TYPEVAR into
+// tc_tid_tuple_elem_encodable would let a genuinely-unsolved `T` produce a segment.
+// Eliminate the typevar; keep the predicates conservative.
+//
+// Interning at codegen time is not a new hazard: substitute_typevar_tid is already
+// reached from codegen via tc_resolve_tparam_tid, so the pool already grows during
+// emission and every reader is index-based.
+//
+// No-op by construction when `tid < 0` or the mono context is empty, so a caller can
+// apply it unconditionally and still be byte-identical outside a mono body.
+pub fn tc_tid_subst_mono(tid: Int, mono_tparams_sl: Int, mono_arg_tids: List[Int]) -> Int {
+    if tid < 0 || tid >= ty_pool.len() { return tid }
+    if mono_tparams_sl == -1 || mono_arg_tids.len() == 0 { return tid }
+    substitute_typevar_tid(tid, tc_mono_binds_map(mono_tparams_sl, mono_arg_tids))
+}
+
 // Structurally unify a param tid against a concrete arg tid, recording every
 // typevar→concrete binding into `binds`. The reverse of substitute_typevar_tid:
 // where that walks one tid rewriting typevars via `binds`, this walks the param
@@ -10295,11 +10338,7 @@ pub fn tc_tid_struct_slot_seg(slot: Int) -> Str {
 // compound (Option/Result/Map) whose inners are all scalars, because
 // tc_tid_to_c_tag then produces exactly the blink_Option_int / blink_Result_int_str
 // carrier the field value registers. We REJECT:
-//   - a struct/enum INSTANCE slot (`Box[Box[Int]]`): the 3xvjcy string path (which
-//     reuses the field's registered mono name) stays authoritative. (tc_tid_to_c_tag
-//     no longer erases the inner — since 1452w4 it recurses via tc_tid_struct_mono_name
-//     — but this compound-field seam still defers to keep the zrybya string path
-//     authoritative; not re-verified against the tid path here.)
+//   - an ENUM INSTANCE slot: still deferred, waiting on dbzy4r/82ajft.
 //   - a compound whose inner is itself a struct/enum or another compound
 //     (`Option[Box[Int]]`, `Option[Option[Int]]`): can diverge in the field-value
 //     registration path; defer (orthogonal follow-up).
@@ -10320,6 +10359,19 @@ pub fn tc_tid_struct_slot_seg(slot: Int) -> Str {
 // literal-side gate would recreate the same bail for shapes the compiler can spell
 // on both other sides — and tc_tid_scalar_tag already erases TK_LIST/TK_SET/TK_BYTES
 // identically for all three, so `(Int, List[Str])` byte-matches everywhere.
+//
+// A STRUCT-INSTANCE slot is ADMITTED (br 6cvvh8) iff tc_tid_struct_mono_name spells it
+// — the very predicate the def-side slot speller (tc_tid_struct_slot_seg) and the mono
+// registrar already consult first, so admitting on it cannot split the name from the
+// typedef. Before this arm `let e: GT[QB[Int]] = GT { s: Set() }` had no producer at
+// all: the string tier bails on every compound annotation arg, so the literal reached
+// codegen with 'Void'. The BARE generic base (params_count 0) is unaffected — its mono
+// name is "" — and so is every already-working shape, because the string tier is
+// consulted before this one at the mono_args selector.
+//
+// TK_ENUM stays excluded: a generic-enum instance's mono lowering is still landing
+// (br dbzy4r), and admitting one here would name an instance the def side cannot yet
+// emit a typedef for.
 pub fn tc_tid_compound_slot_faithful(tid: Int) -> Bool {
     if tid < 0 || tid >= ty_pool.len() { return false }
     let t = ty_pool.get(tid).unwrap()
@@ -10328,6 +10380,7 @@ pub fn tc_tid_compound_slot_faithful(tid: Int) -> Bool {
     if k == TK_RESULT { return tc_tid_scalar_only(t.inner1) && tc_tid_scalar_only(t.inner2) }
     if k == TK_MAP { return tc_tid_scalar_only(t.inner1) && tc_tid_scalar_only(t.inner2) }
     if k == TK_TUPLE { return tc_tid_tuple_encodable(t) }
+    if k == TK_STRUCT { return tc_tid_struct_mono_name(tid) != "" }
     false
 }
 
@@ -11491,18 +11544,7 @@ fn tc_resolve_tparam_tid(param_name: Str, fn_params_sl: Int, args_sl: Int, binds
 // simply not inserted, so an un-captured enclosing slot leaves that typevar
 // abstract and the nested slot stays on the string path (never a wrong bind).
 pub fn tc_mono_tids_subst(call_node: Int, fn_node: Int, mono_tparams_sl: Int, mono_arg_tids: List[Int]) -> List[Int] {
-    let mut binds: Map[Str, Int] = Map()
-    if mono_tparams_sl != -1 {
-        let mut mi = 0
-        while mi < sublist_length(mono_tparams_sl) && mi < mono_arg_tids.len() {
-            let tid = mono_arg_tids.get(mi).unwrap()
-            if tid >= 0 {
-                binds.insert(node_name(sublist_get(mono_tparams_sl, mi)), tid)
-            }
-            mi = mi + 1
-        }
-    }
-    tc_mono_tids_core(call_node, fn_node, binds)
+    tc_mono_tids_core(call_node, fn_node, tc_mono_binds_map(mono_tparams_sl, mono_arg_tids))
 }
 
 fn tc_mono_tids_core(call_node: Int, fn_node: Int, binds: Map[Str, Int]) -> List[Int] {
