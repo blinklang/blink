@@ -47,11 +47,14 @@ Trace compiler phases: `build/blink run --blink-trace codegen <file.bl>` (also: 
 Fine-grained internal trace: `BLINK_TRACE_CHANNELS=<ch>[,<ch>...|all] build/blink build --emit c <file.bl>` — env-gated `dbg_trace(channel, msg)` taps (defined in ast.bl, the DAG root, so any module can emit). Emits `[dbg:<channel>] ...` to stderr; zero cost when unset. Prefer adding a permanent tap over a throwaway printf+recompile. Current channels: `monotid` (the tid twin's per-slot arg_tid at resolution); `kopsctor` (the
 Set()/Map() ctor's element resolution — raw annotation name, name resolved through the mono
 context, its tid, and the tid's tuple tag; this is where a wrong kops table gets baked);
-`retmono` (which of `tid_native_struct_mono_args`' declines a struct literal hit, with the CSV
+`retmono` (which of the tid-native struct-mono tier's declines a struct literal hit, with the CSV
 that path WOULD have answered — the several declines are indistinguishable from outside, all
 producing the same I0001 spelling the string path's answer, and telling "the memo holds only the
 bare base" apart from "concrete but no admission reason fired" is the difference between a
-typecheck memo bug and a missing codegen tier); `retann` (the def-side return-annotation tier —
+typecheck memo bug and a missing codegen tier. Also reports `decline=slot_unclassifiable` with
+the offending slot/idx/ct, `decline=nesting_level_mismatch` when the nesting guard stops an inner
+literal from adopting an outer annotation's slot, and `retry=mono_subst` when substituting the
+enclosing mono context is what let the tier answer); `retann` (the def-side return-annotation tier —
 which gate declined a struct literal in a monomorphized generic fn's tail, or the CSV it resolved
 to; the tier is last-resort, so silence here means an earlier producer answered); `retpin` (every
 `tc_pin_tail_ret_generic` that made it past all four gates, with the declared and inferred types
