@@ -54,6 +54,7 @@
 import typecheck.{
     tc_tid_to_c_tag, tc_seg_from_tid, tc_type_str, tc_lookup_node_tid,
     make_fn_type, check_types,
+    tc_tid_tuple_elem_encodable, tc_struct_slot_encodable, tc_poly_elem_slot_encodable,
 }
 import codegen_stmt.{resolve_mono_slot}
 import diagnostics.{
@@ -102,10 +103,18 @@ fn assert_false(label: Str, got: Bool) {
 // by widening two more fns to `pub`: these tids must be the ones real inference produces, or
 // the rows would only prove that hand-built pool entries behave.
 fn probe_src() -> Str {
+    // Every annotation here exists to be HARVESTED by rendered-type-string key, so each one
+    // is load-bearing for some row below and none may be removed as unused. `i: Int` is the
+    // concrete control R9 compares against; it must come from a real annotation in this
+    // source rather than from a tid some earlier row happened to leave in the global `nodes`
+    // — relying on that accumulation makes a row pass standalone and fail under `task ci`,
+    // where the rows do not run in this file's textual order.
     #"fn main() {
     let u: Void = ()
     let r: Result[Void, Str] = Ok(())
+    let i: Int = 7
     assert(r.is_ok())
+    assert(i == 7)
 }
 "#
 }
@@ -274,4 +283,46 @@ test "mono_args_has_void_seg ignores a genuine Void and catches the erasure sent
     // silently absorb everything the "Void" half used to catch.
     assert_true("a surviving binder is still fatal", codegen_expr.mono_args_has_void_seg("T", sl))
     assert_false("a concrete segment is still legitimate", codegen_expr.mono_args_has_void_seg("Int", sl))
+}
+
+// R9 — the three sibling encodability gates do NOT all admit a genuine Void, and the split is
+// deliberate rather than leftover. Each of the four gates is an allow-list that ends in
+// `false`, so before br hsgsbp every one of them refused Void BY ACCIDENT — no arm, no
+// comment. Stage D gave each an explicit arm, and two of the four still answer `false`. That
+// is the part a future session is most likely to "finish", so this row states the reason.
+//
+// The dividing line is NOT the type — it is whether the C EMITTER downstream of the gate can
+// spell a Void leaf. `c_field_type_str` (src/codegen_types.bl) can, because it receives the
+// resolved type NAME and lowers the literal name "Void" to an int64_t placeholder. The tuple
+// and poly-carrier emitters do not receive a name: emit_tuple_typedef spells a scalar element
+// through `c_type_str`, whose CT_VOID answer is the illegal C field `void v;`, and TupleEntry
+// carries only CTs plus struct names. Keying THOSE on CT_VOID instead of the name is not an
+// option — `type_from_name` collapses "" and every unknown name onto CT_VOID as well, so a
+// CT-keyed lowering would silently swallow an ERASED slot into a well-typed int64_t field and
+// disarm the loud `void v;` tripwire this ticket depends on.
+//
+// So an admission here would trade a LOCATED I0001 for an opaque `cc` error, which is
+// strictly worse. Admitting is correct only once the emitters take a name; until then these
+// two refuse on purpose. Flipping either `assert_false` below without first fixing its
+// emitter is the regression this row exists to catch.
+test "the sibling encodability gates admit a genuine Void only where the emitter can spell it" {
+    let m = harvest_type_tids()
+    let void_tid = expect_tid(m, "Void")
+
+    // The admitting half — this is the gate that delivers the ticket's headline program. A
+    // `false` here is the I0001 false positive on `Box[Void]` coming back.
+    assert_true("a struct slot admits a genuine Void", tc_struct_slot_encodable(void_tid))
+
+    // A BARE Void element of a poly-impl carrier is admitted for the same reason; the
+    // compound arms of this gate route through tc_poly_inner_encodable, which refuses.
+    assert_true("a bare poly element slot admits a genuine Void", tc_poly_elem_slot_encodable(void_tid))
+
+    // The refusing half. `Box[(Void, Int)]` therefore raises a located I0001 naming
+    // 'Box_Tuple2_void_int.v' rather than emitting a tuple typedef with an illegal field.
+    assert_false("a tuple element refuses a genuine Void", tc_tid_tuple_elem_encodable(void_tid))
+
+    // The refusal is scoped to Void, not to the gate: a concrete element still passes, so a
+    // future fix cannot claim this row forced the whole gate closed.
+    let int_tid = expect_tid(m, "Int")
+    assert_true("a tuple element still admits a concrete type", tc_tid_tuple_elem_encodable(int_tid))
 }

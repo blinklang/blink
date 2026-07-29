@@ -2626,14 +2626,24 @@ fn tc_is_container_name(n: Str) -> Int {
     0
 }
 
-// Parser pseudo-types that reach the Debug field check as a leaf `name` but are
-// NOT Debug-renderable in v1 and can never be made so by adding a derive:
+// Leaf type names that reach the Debug field check but are NOT Debug-renderable in v1 and
+// can never be made so by adding a derive:
 //   fn(...) -> T  → "Fn" (parser.bl:1437); (A, B) → "Tuple" (parser.bl:1408;
 //   tuples auto-derive Eq/Ord/Hash/Display/Clone but NOT Debug, spec §3.6);
 //   handler[E] → "Handler" (parser.bl:1453). Rejected E0520 like Set/Result
 //   (0xr7fq); else they slip past tc_debug_field_ok and emit BLINK_COMPILER_BUG.
+//
+// "Void" is the one entry that is NOT a parser pseudo-type — it is an ordinary inhabited
+// type (decisions/under-determined-types.md:39) — but it belongs here for the same reason
+// "Tuple" does: `()` IS the 0-tuple, so rejecting the n-tuple and rendering the 0-tuple
+// would be incoherent, and Void's single value carries no information to render. It reaches
+// this check as a leaf name only after br hsgsbp made a declared Void field lower to an
+// int64_t placeholder; while `v: Void` still emitted an illegal `void v;`, cc stopped every
+// such build and the gap was invisible. Without this arm the type builds and RUNS, printing
+// `<?>` for the field with a BLINK_COMPILER_BUG marker compiled into the binary — the
+// silent-wrong-answer class this ticket exists to remove, not merely a missing diagnostic.
 fn tc_is_non_debug_pseudo_type(n: Str) -> Int {
-    if n == "Fn" || n == "Tuple" || n == "Handler" { return 1 }
+    if n == "Fn" || n == "Tuple" || n == "Handler" || n == "Void" { return 1 }
     0
 }
 
@@ -11074,16 +11084,25 @@ pub fn tc_tid_tuple_elem_encodable(tid: Int) -> Bool {
     // (Tree_Int) that resolve_tuple_ann's element arm recovers via mono_name_from_ann
     // — the enum twin of the struct-instance case above.
     if k == TK_STRUCT || k == TK_ENUM { return true }
-    // A GENUINE Void slot is ADMITTED (br hsgsbp). Void is "an ordinary INHABITED,
-    // encodable type" (decisions/under-determined-types.md:39, 6-0), and both paths spell
-    // it the same: tc_tid_to_c_tag has an explicit TK_VOID arm returning "Void" and the
-    // string path's type_arg_name_from_ct answers "Void" for CT_VOID, so carrying the real
-    // tid is byte-neutral by construction. Before this arm the refusal was ACCIDENTAL —
-    // TK_VOID simply had no arm and fell to the closing `false` — which dropped the slot to
-    // a -1 hole, so the def-side resolver passed the BINDER through and a hand-written
-    // `Box[Void]` raised I0001 at every def-side seam. Explicit, and admitting, in all four
-    // of these gates plus tc_tid_encodable; do not let it revert to a fall-through.
-    if k == TK_VOID { return true }
+    // A genuine Void TUPLE ELEMENT is REFUSED, and unlike the pre-hsgsbp state that refusal
+    // is now DELIBERATE — this is the one of the four sibling gates that does not admit it.
+    //
+    // Admitting it here is correct in principle (Void is "an ordinary INHABITED, encodable
+    // type", decisions/under-determined-types.md:39, 6-0) and hsgsbp did admit it at first.
+    // But the emitter behind this gate is not ready: emit_tuple_typedef
+    // (codegen_types.bl:5749) spells a scalar element with c_type_str, which lowers CT_VOID
+    // to `void`, so `Box[(Void, Int)]` emitted `typedef struct { void _0; ... }` — a hard cc
+    // error with no source location, REPLACING the located I0001 the refusal produces. That
+    // is a strictly worse diagnostic for the same broken program.
+    //
+    // It cannot be fixed the way a named field was (c_field_type_str, keyed on the resolved
+    // NAME so an erased slot keeps failing loudly): TupleEntry carries only CTs and struct
+    // names (codegen_types.bl:1331-1336), and type_from_name collapses every unknown name
+    // onto CT_VOID, so a CT-keyed lowering here would silently turn an ERASED element into a
+    // well-typed int64_t field. The name the tuple's own c_name encodes cannot disambiguate
+    // either, because the lowercase "void" speller (tc_tid_scalar_tag) still carries all
+    // three meanings and is deliberately unarmed. Arming that twin is the prerequisite.
+    // Until then: refuse, and keep the located I0001.
     false
 }
 
@@ -11297,9 +11316,11 @@ pub fn tc_poly_elem_slot_encodable(tid: Int) -> Bool {
     if k == TK_OPTION { return tc_poly_inner_encodable(t.inner1) }
     if k == TK_RESULT { return tc_poly_inner_encodable(t.inner1) && tc_poly_inner_encodable(t.inner2) }
     if k == TK_MAP { return tc_poly_inner_encodable(t.inner1) && tc_poly_inner_encodable(t.inner2) }
-    // A genuine Void slot is ADMITTED — same reasoning as tc_tid_tuple_elem_encodable's
-    // TK_VOID arm above (br hsgsbp): both paths spell it "Void", so this is byte-neutral,
-    // and the accidental fall-through to `false` was what erased a real `Box[Void]`.
+    // A genuine Void slot is ADMITTED — same reasoning as tc_struct_slot_encodable's TK_VOID
+    // arm (br hsgsbp): both paths spell it "Void", so this is byte-neutral, and the accidental
+    // fall-through to `false` was what erased a real `Box[Void]`. Note this admits only a BARE
+    // Void element; a Void reached through the compound arms above goes to
+    // tc_poly_inner_encodable, which refuses it — see the comment there for why.
     if k == TK_VOID { return true }
     false
 }
@@ -11324,10 +11345,22 @@ fn tc_poly_inner_encodable(tid: Int) -> Bool {
     if k == TK_OPTION { return tc_poly_inner_encodable(t.inner1) }
     if k == TK_RESULT { return tc_poly_inner_encodable(t.inner1) && tc_poly_inner_encodable(t.inner2) }
     if k == TK_MAP { return tc_poly_inner_encodable(t.inner1) && tc_poly_inner_encodable(t.inner2) }
-    // A genuine Void slot is ADMITTED — same reasoning as tc_tid_tuple_elem_encodable's
-    // TK_VOID arm above (br hsgsbp): both paths spell it "Void", so this is byte-neutral,
-    // and the accidental fall-through to `false` was what erased a real `Box[Void]`.
-    if k == TK_VOID { return true }
+    // A genuine Void CARRIER INNER is REFUSED, deliberately — the second of the two gates
+    // hsgsbp leaves refusing, for the same reason as tc_tid_tuple_elem_encodable: the emitter
+    // is not ready, so admitting it trades a located I0001 for an opaque cc error.
+    //
+    // Specifically, emit_option_typedef (codegen_types.bl:6703) emits NOTHING for a CT_VOID
+    // inner (three early returns, :6704/:6706/:6711) while option_c_type still NAMES the type
+    // blink_Option_void — so `type QBox[T] { v: Option[T] }` at Void referenced a typedef that
+    // was never defined. emit_result_typedef's int64_t leaf (:6728-6729) is NOT a template to
+    // copy here: it keys on CT_VOID alone, and because type_from_name collapses every unknown
+    // name onto CT_VOID, a CT-keyed rule in a carrier position would swallow an ERASED inner
+    // into a well-typed field instead of failing the C compile.
+    //
+    // There is a SECOND defect behind this gate that the typedef is not even the whole of: the
+    // struct literal spelled `None` at T=Void as blink_Option_int, a mistyped carrier from a
+    // different speller. Carrier-position Void is its own mechanism and its own ticket; it is
+    // not the tail of this one.
     false
 }
 
