@@ -110,12 +110,14 @@ COUNTERFACTUAL tap in `tc_tid_encodable`: every row is a site where rejecting `T
 hsgsbp originally asked for, and what `DECISIONS.md:342` forbids — would have flipped the answer and
 routed a genuine Void onto the string path. It also shows the propagation: the `TK_RESULT` arm means
 rejecting the kind would make `Result[Void, Str]` unencodable, a type `lib/std/` depends on and one
-the compiler synthesizes for every `?`-bearing `test` block. Measured floor is 0 in ALL FOUR buckets
-across 712 fixtures, the 8 examples that still build, the `with_deps` package and both compiler entry
-points — but that zero is an UNEXERCISED TAP, not coverage: no corpus fixture instantiates a generic
-at Void. The tap is proven live only by hand-built shapes (a generic fn called at bare `Void` →
-`genuine_void`; called at `Result[Void, Str]` → `probe=encodable_void`), so construct the shape
-before reading a 0 as evidence of anything.
+the compiler synthesizes for every `?`-bearing `test` block. Measured over 737 files (all `tests/`,
+all `examples/`, the `with_deps` package and both compiler entry points): the two ARMED buckets read
+**0** — that is the arming premise, re-measure before trusting it — while `genuine_void` reads **20**
+and `probe=encodable_void` **18**, all 38 in `tests/test_hsgsbp_box_void.bl`, the only fixture that
+instantiates anything at Void. Those two counts are the live-tap proof: before that fixture existed
+all four buckets read 0 and it was an UNEXERCISED TAP, not coverage, provable only by hand-built
+shapes. If `genuine_void` ever drops back to 0, the fixture stopped reaching the tap — check that
+before concluding anything from the armed buckets' 0.
 NOTE the lowercase twin `tc_tid_scalar_tag`/`tc_tid_inner_tag` still carries all three meanings in
 `"void"` and is deliberately NOT armed — its fall-through is load-bearing for `Result_void_str`. See
 the comment on `tc_tid_scalar_tag` before "finishing the job" there.) (`csvresolve` is
@@ -142,6 +144,11 @@ anywhere. Worse, a def-side field can erase while the mono NAME stays correct
 real and both were found with the grep reading 0 (br pt4hsy, br w4c0py).
 Check for BOTH spellings, and treat a clean C compile as necessary, not sufficient — a `void`
 field errors loudly but an erased carrier field does not.
+That `void <name>;` loudness is a LOAD-BEARING tripwire, and `c_field_type_str`
+(`src/codegen_types.bl`) is built to preserve it: it lowers a Void field to an `int64_t`
+placeholder only when the resolved type NAME is literally `"Void"`, never on `CT_VOID` alone —
+`type_from_name` collapses `""` and every unknown name onto `CT_VOID` too, so a CT-keyed predicate
+would silently swallow an erased slot into a well-typed field. Do not "simplify" it to one argument.
 The retired `csvresolve` channel was a lower bound for the same reason:
 `blink_GSet_Void`/`blink_GBoxSet_Void` were emitted with zero hits on it, because a producer's
 `"Void"` initializer never routed through the tapped return.

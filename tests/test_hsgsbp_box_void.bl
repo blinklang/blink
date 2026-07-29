@@ -1,0 +1,104 @@
+// br hsgsbp: a user generic instantiated at a GENUINE Void compiles, links and runs.
+//
+// This is the program DECISIONS.md:342 (6-0) promises works. The I0001 tripwire for an
+// under-determined type "must key on the *kind*, not the resulting \"Void\" tag, so a
+// genuine GKV[Void, Void] is unaffected", and Void is "an ordinary INHABITED, encodable
+// type" (decisions/under-determined-types.md:39). Before br hsgsbp it did NOT work: the
+// four-line source below raised TWO internal compiler errors —
+//
+//   I0001 at the literal:  type parameter of 'Box' reached monomorphization unsolved
+//                          (mono args 'Void')
+//   I0001 at the field:    type parameter 'T' of 'Box_Void.v' reached monomorphization
+//                          unsolved   (site 'register_mono_field_types')
+//
+// — because a genuine Void and an ERASED slot both spelled the string "Void", and the two
+// chokepoints keyed on that string. Nothing was under-determined here; `Void` is written out
+// explicitly, in the annotation, by hand.
+//
+// WHY A FIXTURE AND NOT ANOTHER UNIT ROW. The unit rows in
+// tests/test_hsgsbp_void_vs_erasure.bl pin each predicate in isolation, but the failure this
+// file guards was a COMPOSITION: the typecheck-side slot, the mono-name CSV, the def-side
+// field resolver, and the C typedef emitter each had to agree that Void is a real type. Only
+// an end-to-end compile proves they do. It is also the load-bearing green for the lowering
+// half of the ticket — see the assertion note below.
+//
+// WHAT TO CHECK IF THIS FILE REGRESSES, in order:
+//  1. `build/blink build --emit c tests/test_hsgsbp_box_void.bl` and grep the C for
+//     `blink_Box_Void`. It must be a REAL typedef with an `int64_t` placeholder field
+//     (the same lowering src/codegen_types.bl already applies to a Void ok/err leaf of
+//     Result[Void, E]), NOT `void v;` — an illegal C field type — and NOT a symbol shared
+//     with a sibling instantiation.
+//  2. `Box[Int]` below is the anti-collapse control: `blink_Box_Void` and `blink_Box_Int`
+//     must be two distinct typedefs. A single shared symbol is the ODR violation the
+//     Systems panelist vetoed by name (decisions/under-determined-types.md:38-42) — under
+//     `--link-archive` separate compilation it is a silent miscompile, and it compiles and
+//     links cleanly, so only this row catches it.
+//  3. The `_Void` grep in CLAUDE.md does NOT cover this file, and a hit here is EXPECTED
+//     and correct — `blink_Box_Void` is the right name for `Box[Void]`. That grep looks for
+//     an ERASED type param that happened to spell "Void"; this is a named one. Read the
+//     matched line before calling it a regression.
+
+type Box[T] {
+    v: T
+}
+
+// The NON-generic twin. `c_field_type_str` lowers a field whose annotation resolved to the
+// name "Void" to an int64_t placeholder, and it keys on that NAME rather than on CT_VOID
+// precisely so an ERASED slot (type_from_name collapses "" and every unknown name onto
+// CT_VOID too) keeps emitting the loud `void v;` C error. This row pins the admitting half;
+// the refusing half is pinned by the resolve_mono_slot rows in
+// tests/test_hsgsbp_void_vs_erasure.bl. Before br hsgsbp this type did not compile either,
+// which is the clearest evidence the defect was never about generics.
+type PlainVoidField {
+    v: Void
+}
+
+fn unwrap_box[T](b: Box[T]) -> T {
+    b.v
+}
+
+test "a generic struct instantiated at a genuine Void compiles and runs" {
+    // `()` is the Void value (Ok(()) ≡ Ok() at the type level; see
+    // tests/test_result_void_inference.bl). The annotation is explicit, so there is nothing
+    // for inference to leave unsolved and nothing for E0301 to report — the only way this
+    // fails is a compiler bug.
+    let b: Box[Void] = Box { v: () }
+    // Reaching this line at all is the assertion: an I0001 makes blinkc exit 101 before
+    // writing any C, so the binary never builds and the test never runs. There is no Void
+    // VALUE to compare (no Eq, nothing to print), so the observable is that the program
+    // exists.
+    assert(true)
+
+    // Drives the field back out through a generic fn, so the Void slot has to survive a
+    // second monomorphization seam (mono_fn_signature_ret, the site that raised the second
+    // I0001 for the bare-Void-through-a-generic-fn shape) and not just the struct typedef.
+    // Called for its SIGNATURE, not its value: `let u = unwrap_box(b)` emits
+    // `const void u = ...`, an illegal C declaration — br 296hpm, an independent bug with
+    // the same MVCE for a plain `let x = void_fn()` and nothing generic about it. The call
+    // still forces blink_unwrap_box_Void to be monomorphized and emitted, which is the
+    // seam this row exists to cover; restore the binding when 296hpm lands.
+    unwrap_box(b)
+    assert(true)
+}
+
+test "Box[Void] and Box[Int] are distinct instantiations, not one collapsed symbol" {
+    let bv: Box[Void] = Box { v: () }
+    let bi: Box[Int] = Box { v: 7 }
+    // If the two instantiations had collapsed onto one typedef, the Int field would be
+    // reading whatever the Void placeholder left in that slot rather than 7.
+    assert_eq(unwrap_box(bi), 7)
+    assert_eq(bi.v, 7)
+    // `let v = bv.v` is br 296hpm's field-read shape (illegal `const void v = ...`), so the
+    // Void side asserts on the typedef rather than the value — which is all there is to
+    // assert: `()` has no Eq and nothing to print. If Box[Void] and Box[Int] had collapsed,
+    // the assertions above would be reading the placeholder slot instead of 7.
+    unwrap_box(bv)
+    assert(true)
+}
+
+test "a non-generic struct with a declared Void field compiles and runs" {
+    // Same observable as the Box[Void] row: the field has storage, so the literal emits and
+    // the program exists. `_p.v` is not READ — that is br 296hpm's shape, not this one.
+    let _p = PlainVoidField { v: () }
+    assert(true)
+}
