@@ -1,0 +1,65 @@
+// br wc7nxy: a generic-struct mono INSTANCE first registered while a MONOMORPHIZED FN
+// BODY is emitted never gets its C typedef, so the body references an undeclared type.
+//
+//     type GT[T] { s: Set[T] }
+//     fn wrap[T](x: T) -> Int { let e: GT[Int] = GT { s: Set() } ... }
+//
+// => error: unknown type name 'blink_GT_Int'
+//
+// The name is RIGHT — every producer spelled GT_Int correctly and the body uses it. Only
+// the typedef is missing, which makes this a pure EMISSION-ORDER defect and not an
+// inference one: the type arg is fully concrete, so no metavar, pin or mono-context
+// substitution is involved.
+//
+// ORDER: emit_all_mono_typedefs() runs at src/codegen.bl:1959, and
+// flush_mono_fns_with_typedefs(0) — which emits the monomorphized fn BODIES — runs
+// after it. An instance discovered inside one of those bodies is therefore registered
+// after the only pass that would have emitted it. The flush already re-flushes every
+// OTHER kind of type it can discover (tuple carriers, Option/Result carriers, derive fn
+// defs, kops adapters); mono struct/enum typedefs were the one omission. The parallel
+// test-block flush (src/codegen.bl:2111) has always had the corresponding
+// emit_mono_typedefs_from call, which is why the same shape inside a `test` block works.
+//
+// STRUCT ONLY. emit_mono_typedefs_from dispatches on the type def's first field being a
+// TypeVariant, so an enum row would be the natural companion — but generic enums cannot
+// reach this defect today: the two spellings that would express it are broken upstream and
+// in plain `fn main()`, with no monomorphized body involved. A qualified struct-style
+// variant literal registers no mono instance at all (bare `blink_Choice`, br 9s93fa), and
+// the bare spelling registers correctly but erases the arm binding to `void value`
+// (br qap9s7). Positional payloads — the only generic-enum shape that works, and what
+// tests/test_jjhnf3_generic_enum_mono.bl covers — construct through a variant ctor, not a
+// struct literal, so they never take the path this test exercises. Add the enum row here
+// once 9s93fa and qap9s7 land.
+
+import compile_test_helpers
+import std.io
+
+fn assert_has(c: Str, needle: Str, label: Str) {
+    if !c.contains(needle) { io.println("FAIL: {label} — missing '{needle}'") }
+    assert(c.contains(needle))
+}
+
+// A container field, so the instance is registered by the struct literal in the mono
+// body and the field itself lowers to the erased blink_set* — keeping this test about
+// the typedef's EXISTENCE rather than its member types.
+fn src_struct() -> Str {
+    let mut s = "type GT[T] \{ s: Set[T] }\n"
+    s = s.concat("fn wrap[T](x: T) -> Int \{\n")
+    s = s.concat("    let e: GT[Int] = GT \{ s: Set() }\n")
+    s = s.concat("    let _u = x\n")
+    s = s.concat("    e.s.len()\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{ assert(wrap(\"a\") == 0) }\n")
+    s
+}
+
+test "a mono-body-registered generic-struct instance gets its typedef emitted" {
+    let c = compile_test_helpers.compile_and_emit_c(src_struct(), "wc7nxy_struct_c")
+    assert_has(c, "} blink_GT_Int;", "mono body struct / typedef")
+}
+
+test "the mono-body-registered generic-struct instance compiles and runs" {
+    let r = compile_test_helpers.compile_and_run(src_struct(), "wc7nxy_struct_run")
+    if r.exit_code != 0 { io.println("FAIL: mono body struct — exit {r.exit_code}: {r.err_out}") }
+    assert_eq(r.exit_code, 0)
+}
