@@ -97,7 +97,28 @@ three BAILS, which are otherwise completely silent. Two
 things it CANNOT see: a slot whose unresolvable answer is a TUPLE STEM rather than a binder (br
 3aa3je — `blink_Box_Tuple2_Box_Int_int` still gets `void v;` with this channel silent), and any
 erasure outside these four resolvers. Measured floor is 0 across 700 fixtures, 22 examples and both
-compiler entry points — a nonzero reading is a regression, not noise.) (`csvresolve` is
+compiler entry points — a nonzero reading is a regression, not noise.) `ctagvoid` (the four
+things `tc_tid_to_c_tag` used to spell with the ONE string `"Void"`, now separated — br hsgsbp.
+`producer=genuine_void` is a real `TK_VOID` type argument, which is LEGAL and expected: Void is "an
+ordinary INHABITED, encodable type" (`decisions/under-determined-types.md:38-42`, 6-0), so this
+bucket is informational and never an error. `producer=unhandled_kind` (with `k=`/`name=`) is a kind
+with no arm — `TK_FN`, `TK_CLOSURE`, anything added later; `producer=out_of_range` is a negative or
+out-of-pool tid. Those two are ARMED to `BLINK_I0001_*` sentinels, so a nonzero reading is a real
+bug in the CALLER, and the arming premise is exactly "both read 0" — re-measure before adding a
+`tc_tid_to_c_tag` caller that does not gate `tid < 0`. `probe=encodable_void` is a permanent
+COUNTERFACTUAL tap in `tc_tid_encodable`: every row is a site where rejecting `TK_VOID` — what br
+hsgsbp originally asked for, and what `DECISIONS.md:342` forbids — would have flipped the answer and
+routed a genuine Void onto the string path. It also shows the propagation: the `TK_RESULT` arm means
+rejecting the kind would make `Result[Void, Str]` unencodable, a type `lib/std/` depends on and one
+the compiler synthesizes for every `?`-bearing `test` block. Measured floor is 0 in ALL FOUR buckets
+across 712 fixtures, the 8 examples that still build, the `with_deps` package and both compiler entry
+points — but that zero is an UNEXERCISED TAP, not coverage: no corpus fixture instantiates a generic
+at Void. The tap is proven live only by hand-built shapes (a generic fn called at bare `Void` →
+`genuine_void`; called at `Result[Void, Str]` → `probe=encodable_void`), so construct the shape
+before reading a 0 as evidence of anything.
+NOTE the lowercase twin `tc_tid_scalar_tag`/`tc_tid_inner_tag` still carries all three meanings in
+`"void"` and is deliberately NOT armed — its fall-through is load-bearing for `Result_void_str`. See
+the comment on `tc_tid_scalar_tag` before "finishing the job" there.) (`csvresolve` is
 retired — the legacy string-CSV type-param resolver it tapped no longer exists.)
 NOTE: `build/blinkc` IGNORES `BLINK_TRACE_CHANNELS` — `dbg_channels` is assigned only in
 `src/cli.bl`, so a probe binary for tracing must be built from `src/cli.bl`, not

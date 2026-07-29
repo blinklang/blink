@@ -17,6 +17,8 @@ import parser.{
 import diagnostics.{
     Diag, diag_clear_allows, diag_error_at, diag_error_at_notes, diag_error_no_loc,
     diag_push_allows, diag_warn_at,
+    ICE_SEG_UNSOLVED_TYPEVAR, ICE_SEG_UNHANDLED_KIND, ICE_SEG_TID_OUT_OF_RANGE,
+    ICE_SEG_ERASED_SLOT,
     TYPE_ERROR, CANNOT_INFER_TYPE, CAPABILITY_BUDGET, QM_INVALID_OPERAND, UNDEFINED_FUNCTION,
     UNRESOLVED_METHOD, AMBIGUOUS_METHOD_CALL, MISSING_DISPLAY_IMPL,
     UNDEFINED_VARIABLE, UNKNOWN_TYPE, QM_RESULT_IN_NON_RESULT,
@@ -9945,6 +9947,30 @@ fn tc_tid_scalar_tag(tid: Int) -> Str {
     if k == TK_U32 { return "u32" }
     if k == TK_U64 { return "u64" }
     if k == TK_CHAR { return "char" }
+    // A GENUINE Void, answered deliberately (the twin of tc_tid_to_c_tag's TK_VOID arm).
+    if k == TK_VOID { return "void" }
+    //
+    // THIS FALL-THROUGH IS LOAD-BEARING AND MUST NOT BE ARMED (br hsgsbp).
+    //
+    // The lowercase "void" carries exactly the same triple meaning its uppercase twin
+    // tc_tid_to_c_tag did before br hsgsbp — genuine Void, an unhandled kind, and an
+    // out-of-range tid all land here. Stage C of br hsgsbp split those apart UP THERE by
+    // returning a BLINK_I0001_* sentinel. Doing the same HERE would be a miscompile, not a
+    // fix, because unlike the uppercase path this string is CONSUMED as a real C type tag:
+    //
+    //   tc_tid_to_c_tag's TK_RESULT arm spells Result[Void, Str] as
+    //   "Result_{tc_tid_inner_tag(inner1)}_{...}" = Result_void_str, and
+    //   src/codegen_types.bl's result-typedef emitter MATCHES the literal tag "void" there
+    //   (`if ok_tag == "void" || ok_tag == "Void"`) to lower the Void leaf to an int64_t
+    //   placeholder field. A sentinel would miss that match and emit an undeclared type.
+    //
+    // Result[Void, E] is not a corner case: lib/std/ depends on it (bytes.bl, db_sqlite.bl,
+    // traits.bl) and the compiler synthesizes it for EVERY `?`-bearing `test` block.
+    //
+    // So the inner twin needs a DIFFERENT remedy than the outer one — separate ticket. If
+    // you arrived here intending to "finish the job" that br hsgsbp started on the
+    // uppercase path: this is the arm that looks identical and is not. Measure
+    // Result_void_str first.
     "void"
 }
 
@@ -10651,7 +10677,10 @@ pub fn tc_tid_to_c_tag(tid0: Int) -> Str {
     // its solution (Int), not the erased carrier. Inner recursion resolves too
     // via the same tc_tid_inner_tag/self recursion, each of which resolves.
     let tid = tc_resolve(tid0)
-    if tid < 0 || tid >= ty_pool.len() { return "Void" }
+    if tid < 0 || tid >= ty_pool.len() {
+        dbg_trace("ctagvoid", "producer=out_of_range tid0={tid0} tid={tid} pool_len={ty_pool.len()}")
+        return "Void"
+    }
     let t = ty_pool.get(tid).unwrap()
     let k = t.kind
 
@@ -10696,11 +10725,35 @@ pub fn tc_tid_to_c_tag(tid0: Int) -> Str {
     if k == TK_CHAR { return "Char" }
     // I0001 (gqg3rk): an unbound metavar (TK_UNKNOWN) reaching C-tag emission means
     // an under-determined binding escaped the E0301 boundary check — a compiler
-    // invariant violation. Fail CLOSED with an invalid-C-identifier sentinel (the
-    // established BLINK_n idiom) so the C compiler errors loudly, NEVER silently
-    // fall through to "Void" (the pre-decision erased-default miscompile). Keys on
-    // KIND, so a genuine TK_VOID (real Void) is unaffected — it never reaches here.
-    if k == TK_UNKNOWN { return "BLINK_I0001_unsolved_typevar_at_codegen" }
+    // invariant violation. Fail CLOSED with an invalid-C-identifier sentinel so the C
+    // compiler errors loudly, NEVER silently fall through to "Void" (the pre-decision
+    // erased-default miscompile). Keys on KIND, per DECISIONS.md:342.
+    //
+    // The old text here claimed a genuine TK_VOID "never reaches here". That was FALSE as
+    // naturally read (br hsgsbp measured it: a generic fn instantiated at bare Void reaches
+    // this tail), and two comments already contradicted it —
+    // tc_tid_seg_injective below ("'Void' is also tc_tid_to_c_tag's fallthrough for every
+    // kind it has no arm for") and resolve_mono_slot (src/codegen_stmt.bl, "'Void' —
+    // reachable HERE ... because tc_tid_encodable ADMITS TK_VOID").
+    if k == TK_UNKNOWN { return ICE_SEG_UNSOLVED_TYPEVAR }
+    // A GENUINE Void, answered deliberately rather than by fall-through. Void is "an
+    // ordinary INHABITED, encodable type" (decisions/under-determined-types.md:38-42, 6-0)
+    // and is genuinely distinct from an unsolved metavariable α (:51-54 — substituting one
+    // for the other "is licensed by no typing rule"). The I0001 tripwire keys on the KIND
+    // "so a genuine GKV[Void, Void] is unaffected" (:263-266, DECISIONS.md:342), which is
+    // only true if this arm exists: without it, Void shares its spelling with the two
+    // failure buckets below and every consumer that rejects one rejects all three.
+    // Byte-identical to the string path, which also spells a Void type arg "Void".
+    if k == TK_VOID {
+        dbg_trace("ctagvoid", "producer=genuine_void tid={tid} name={t.name}")
+        return "Void"
+    }
+    // A kind with no arm above (TK_FN, TK_CLOSURE, any kind added later). Still spells
+    // "Void", i.e. still indistinguishable from the genuine Void directly above — arming
+    // this to ICE_SEG_UNHANDLED_KIND is Stage C of br hsgsbp, and must land WITH the
+    // chokepoint switch to diag_is_ice_seg: arming it first would downgrade a located
+    // I0001 into an opaque `cc` error with no source span.
+    dbg_trace("ctagvoid", "producer=unhandled_kind tid={tid} k={k} name={t.name}")
     "Void"
 }
 
@@ -10754,6 +10807,17 @@ fn tc_tid_encodable(tid0: Int) -> Bool {
     // path's registered mono name — exactly the struct-instance beachhead above. A
     // slot that is itself inexpressible still bottoms out at tc_tid_struct_slot_seg ""
     // (deferred there), so nothing that was on the string path starts diverging.
+    //
+    // COUNTERFACTUAL MEASUREMENT, br hsgsbp. This tap ships permanently: every row is a
+    // site where adding TK_VOID to the rejection set above — what br hsgsbp originally
+    // asked for — would have flipped this answer to false and routed a genuine Void slot
+    // onto the -1/string path. Void is an ordinary INHABITED, encodable type
+    // (decisions/under-determined-types.md:38-42, 6-0), so the rejection is forbidden;
+    // the number here is what makes that a measurement instead of an argument. Re-measure
+    // before reopening the question.
+    if k == TK_VOID {
+        dbg_trace("ctagvoid", "probe=encodable_void tid={tid} name={t.name}")
+    }
     true
 }
 
