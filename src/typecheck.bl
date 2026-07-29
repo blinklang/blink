@@ -592,7 +592,14 @@ fn make_result_type(ok_type: Int, err_type: Int) -> Int {
     t
 }
 
-fn make_fn_type(ret_type: Int, param_types: List[Int]) -> Int {
+// `pub` FOR THE TEST ONLY — zero non-test callers, same precedent as resolve_mono_slot
+// (src/codegen_stmt.bl). TK_FN is the one kind tc_tid_to_c_tag has no arm for, so this is
+// the only way to CONSTRUCT the input that proves its ICE_SEG_UNHANDLED_KIND tail actually
+// fires. Without it that arm would be armed-but-never-proven-to-fire, which is exactly the
+// gap tests/test_fes70z_mono_slot_ice.bl exists to close. `fn(...)` ANNOTATIONS do not
+// reach here — they lower to TK_TYPEVAR("Fn") — so there is no surface syntax that
+// produces a TK_FN tid, hence no fixture alternative (br hsgsbp).
+pub fn make_fn_type(ret_type: Int, param_types: List[Int]) -> Int {
     let t = new_type(TK_FN, "Fn")
     let start = ty_param_list.len()
     let mut i = 0
@@ -10677,9 +10684,13 @@ pub fn tc_tid_to_c_tag(tid0: Int) -> Str {
     // its solution (Int), not the erased carrier. Inner recursion resolves too
     // via the same tc_tid_inner_tag/self recursion, each of which resolves.
     let tid = tc_resolve(tid0)
+    // A tid outside the pool names no type at all, so it fails CLOSED rather than
+    // answering "Void" — a plausible-looking type name for what is a bad index. All five
+    // callers already gate `tid < 0` themselves, and the measured floor is 0 across the
+    // corpus and both compiler entry points (ctagvoid), so this is a tripwire, not a path.
     if tid < 0 || tid >= ty_pool.len() {
         dbg_trace("ctagvoid", "producer=out_of_range tid0={tid0} tid={tid} pool_len={ty_pool.len()}")
-        return "Void"
+        return ICE_SEG_TID_OUT_OF_RANGE
     }
     let t = ty_pool.get(tid).unwrap()
     let k = t.kind
@@ -10748,13 +10759,16 @@ pub fn tc_tid_to_c_tag(tid0: Int) -> Str {
         dbg_trace("ctagvoid", "producer=genuine_void tid={tid} name={t.name}")
         return "Void"
     }
-    // A kind with no arm above (TK_FN, TK_CLOSURE, any kind added later). Still spells
-    // "Void", i.e. still indistinguishable from the genuine Void directly above — arming
-    // this to ICE_SEG_UNHANDLED_KIND is Stage C of br hsgsbp, and must land WITH the
-    // chokepoint switch to diag_is_ice_seg: arming it first would downgrade a located
-    // I0001 into an opaque `cc` error with no source span.
+    // A kind with no arm above (TK_FN, TK_CLOSURE, any kind added later). Fails CLOSED
+    // rather than sharing the genuine Void's spelling directly above: this is not a type
+    // name, it is "this encoder does not know how to spell this kind", and letting it
+    // read as "Void" is what made the two indistinguishable. The floor is measured at 0
+    // across the corpus and both compiler entry points (ctagvoid, CLAUDE.md), so arming
+    // it cannot regress a working program — it can only make a future kind loud instead
+    // of silent. The chokepoints turn this into a LOCATED I0001; ship them together or a
+    // hit here degrades to an opaque `cc` error with no source span.
     dbg_trace("ctagvoid", "producer=unhandled_kind tid={tid} k={k} name={t.name}")
-    "Void"
+    ICE_SEG_UNHANDLED_KIND
 }
 
 // Whether tc_tid_to_c_tag can faithfully encode this tid into a CSV segment that
@@ -11629,7 +11643,11 @@ pub fn tc_mono_csv(call_node: Int, fn_node: Int) -> Option[Str] {
             let m = tc_ret_mint_at(call_node, num_params, pi)
             if m >= 0 && tc_tid_encodable(m) { seg = tc_tid_to_c_tag(m) }
         }
-        csv = csv.concat(if seg != "" { seg } else { "Void" })
+        // Still "" after the mint attempt means nothing resolved this slot — an ERASURE,
+        // which br hsgsbp gave its own sentinel so it stops sharing a spelling with a
+        // genuine Void type argument. The slot keeps its CSV position either way, so the
+        // segment count stays equal to num_params and the chokepoints can still see it.
+        csv = csv.concat(if seg != "" { seg } else { ICE_SEG_ERASED_SLOT })
         pi = pi + 1
     }
     Some(csv)

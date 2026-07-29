@@ -6,7 +6,7 @@ import parser.{
 import ast.{dbg_channel_on, dbg_trace}
 import diagnostics.{
     Diag, diag_error_no_loc, diag_set_last_fix,
-    UNDECLARED_EFFECT,
+    UNDECLARED_EFFECT, ICE_SEG_ERASED_SLOT,
 }
 
 effect Codegen {
@@ -4243,7 +4243,11 @@ pub fn infer_fn_type_args_from_types(fn_node: Int, ca: GenericCallArgs) -> Optio
     let mut pi = 0
     while pi < num_params {
         let param_name = node_name(sublist_get(tparams_sl, pi))
-        let mut resolved = "Void"
+        // Starts ERASED, not Void. If no arm below claims this tparam, the slot was never
+        // resolved — that is an erasure, and br hsgsbp separated it from a genuine Void so
+        // the downstream chokepoints can tell them apart. Before the split both spelled
+        // "Void" and a hand-written `Box[Void]` was refused as if it were unsolved.
+        let mut resolved = ICE_SEG_ERASED_SLOT
         let mut fi = 0
         while fi < sublist_length(fn_params_sl) && fi < ca.types.len() {
             let p = sublist_get(fn_params_sl, fi)
@@ -4255,7 +4259,8 @@ pub fn infer_fn_type_args_from_types(fn_node: Int, ca: GenericCallArgs) -> Optio
                     resolved = arg_sn
                 } else if arg_ct == CT_OPTION || arg_ct == CT_RESULT {
                     // Whole Option/Result bound to a bare-typevar param `x: T`.
-                    // type_name_from_ct returns "Void" for these; instead thread
+                    // Neither speller can name these (type_name_from_ct answers "Void",
+                    // type_arg_name_from_ct the erasure sentinel); instead thread
                     // the canonical inner-carrying tag (Option_str, Result_int_str)
                     // built from the inner types the call site captured in `ca`.
                     // This keeps mono keys distinct per inner (no wrap_Option
@@ -4265,7 +4270,7 @@ pub fn infer_fn_type_args_from_types(fn_node: Int, ca: GenericCallArgs) -> Optio
                 } else {
                     // Map/List/Set etc. erase to a single uniform C carrier, so
                     // the bare name (type_name_from_ct) is sufficient.
-                    resolved = type_name_from_ct(arg_ct)
+                    resolved = type_arg_name_from_ct(arg_ct)
                 }
             } else if ptype == "List" {
                 let ta = node_type_ann(p)
@@ -4277,7 +4282,7 @@ pub fn infer_fn_type_args_from_types(fn_node: Int, ca: GenericCallArgs) -> Optio
                         if elem_name == param_name {
                             let elt = ca.elem_types.get(fi).unwrap()
                             if elt >= 0 {
-                                resolved = type_name_from_ct(elt)
+                                resolved = type_arg_name_from_ct(elt)
                             }
                         } else if elem_name == "Tuple" && fi < ca.struct_names.len() {
                             let arg_tuple_cname = ca.struct_names.get(fi).unwrap()
@@ -4296,7 +4301,7 @@ pub fn infer_fn_type_args_from_types(fn_node: Int, ca: GenericCallArgs) -> Optio
                                             resolved = es
                                         } else {
                                             let et = get_tuple_entry_elem_type(entry.elem_types, ti)
-                                            resolved = type_name_from_ct(et)
+                                            resolved = type_arg_name_from_ct(et)
                                         }
                                         found = true
                                     }
@@ -4320,7 +4325,7 @@ pub fn infer_fn_type_args_from_types(fn_node: Int, ca: GenericCallArgs) -> Optio
                             } else {
                                 let akt = ca.map_key_types.get(fi).unwrap()
                                 if akt >= 0 && akt != CT_VOID {
-                                    resolved = type_name_from_ct(akt)
+                                    resolved = type_arg_name_from_ct(akt)
                                 }
                             }
                         }
@@ -4331,7 +4336,7 @@ pub fn infer_fn_type_args_from_types(fn_node: Int, ca: GenericCallArgs) -> Optio
                             } else {
                                 let avt = ca.map_val_types.get(fi).unwrap()
                                 if avt >= 0 && avt != CT_VOID {
-                                    resolved = type_name_from_ct(avt)
+                                    resolved = type_arg_name_from_ct(avt)
                                 }
                             }
                         }
@@ -4357,7 +4362,7 @@ pub fn infer_fn_type_args_from_types(fn_node: Int, ca: GenericCallArgs) -> Optio
                             } else {
                                 let elt = ca.elem_types.get(fi).unwrap()
                                 if elt >= 0 && elt != CT_VOID {
-                                    resolved = type_name_from_ct(elt)
+                                    resolved = type_arg_name_from_ct(elt)
                                 }
                             }
                         }
@@ -4370,7 +4375,7 @@ pub fn infer_fn_type_args_from_types(fn_node: Int, ca: GenericCallArgs) -> Optio
                                 } else {
                                     let eet = ca.err_elem_types.get(fi).unwrap()
                                     if eet >= 0 && eet != CT_VOID {
-                                        resolved = type_name_from_ct(eet)
+                                        resolved = type_arg_name_from_ct(eet)
                                     }
                                 }
                             }
@@ -4422,7 +4427,7 @@ pub fn infer_fn_type_args_from_types(fn_node: Int, ca: GenericCallArgs) -> Optio
                                 let csig = ca.closure_sigs.get(fi).unwrap()
                                 let inner_ct = infer_closure_param_type(csig, fpi)
                                 if inner_ct != CT_VOID {
-                                    resolved = type_name_from_ct(inner_ct)
+                                    resolved = type_arg_name_from_ct(inner_ct)
                                 }
                             }
                             fpi = fpi + 1
@@ -4433,7 +4438,7 @@ pub fn infer_fn_type_args_from_types(fn_node: Int, ca: GenericCallArgs) -> Optio
                         let csig = ca.closure_sigs.get(fi).unwrap()
                         let ret_ct = infer_closure_ret_type(csig)
                         if ret_ct != CT_VOID {
-                            resolved = type_name_from_ct(ret_ct)
+                            resolved = type_arg_name_from_ct(ret_ct)
                         }
                     }
                 }
@@ -4507,7 +4512,55 @@ pub fn type_name_from_ct(ct: Int) -> Str {
     else if ct == CT_U32 { "U32" }
     else if ct == CT_U64 { "U64" }
     else if ct == CT_CHAR { "Char" }
+    // Ten CTs reach this bare else — CT_VOID, CT_OPTION, CT_RESULT, CT_TAGGED_ENUM,
+    // CT_INSTANT, CT_DURATION, CT_FFI_SCOPE, CT_TEMPLATE, CT_STRUCT and CT_ENUM — and
+    // "Void" is NOT an erasure sentinel for them, because several CONSUMERS depend on this
+    // exact string as a load-bearing dispatch signal, not as a type name:
+    //   codegen_methods.bl's list-HOF guard (`if elem_name != "Void"`) uses it to exclude a
+    //     struct/enum element from the stdlib path — and says so in its own comment.
+    //   codegen_closures.bl / codegen_methods.bl / codegen_expr.bl compare a closure or
+    //     method return name against "Void" to decide void-return lowering.
+    // br hsgsbp deliberately did NOT change this arm. Erasure in a type-arg CSV is a
+    // DIFFERENT question from "what do I call this CT", and it is answered by
+    // type_arg_name_from_ct below. Changing this else would silently disarm ~16 guards
+    // across four modules that have nothing to do with monomorphization.
     else { "Void" }
+}
+
+// The TYPE-ARGUMENT spelling of a CT, for the mono-CSV producers only
+// (infer_fn_type_args_from_types, infer_struct_type_args). Same answers as
+// type_name_from_ct for every CT that HAS a name; the difference is what it says when
+// there is none.
+//
+// br hsgsbp: type_name_from_ct answers "Void" both for a genuine CT_VOID and for nine CTs
+// it simply cannot name. In a type-arg CSV those two are opposites — the first is a real
+// type argument that must lower, the second is an ERASURE that must fail closed — and
+// collapsing them is what made a genuine `Box[Void]` raise I0001 while
+// `blink_GKV_Void_Void` compiled and linked silently. Splitting them HERE rather than in
+// type_name_from_ct keeps the blast radius inside the mono machinery, which is the only
+// audience that reads these strings as type arguments.
+//
+// Structured as "delegate, then disambiguate the one ambiguous answer" on purpose: every
+// real arm is inherited automatically, so a CT that gains a name in type_name_from_ct
+// gains it here too, and this function cannot drift out of sync with it.
+pub fn type_arg_name_from_ct(ct: Int) -> Str {
+    let name = type_name_from_ct(ct)
+    if name != "Void" {
+        return name
+    }
+    // A GENUINE Void type argument. Void is "an ordinary INHABITED, encodable type"
+    // (decisions/under-determined-types.md:39, 6-0), so it is spelled, not refused — this
+    // is the arm that makes `Box[Void]` compile, and the string path's answer here
+    // byte-matches the tid path's tc_tid_to_c_tag TK_VOID arm.
+    if ct == CT_VOID {
+        return "Void"
+    }
+    // Genuinely unnameable: no arm exists and none is inherited. Fail CLOSED with a
+    // sentinel that is not a valid C identifier, so it cannot silently become part of a
+    // mono symbol the way "Void" did. The LOCATED I0001 is raised downstream by the
+    // chokepoints that have a node (mono_args_has_void_seg, resolve_mono_slot), both of
+    // which detect it via diag_is_ice_seg.
+    ICE_SEG_ERASED_SLOT
 }
 
 pub fn mangle_generic_name(base: Str, args: Str) -> Str {

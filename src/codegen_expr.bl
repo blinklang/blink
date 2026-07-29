@@ -76,7 +76,7 @@ import codegen_types.{
     coerce_to_c_str, render_result_arm_value,
     tp_child1_kind, tp_child1_sname, tp_child2_kind, tp_child2_sname, tp_get_child1, tp_get_child2, tp_get_kind, tp_get_sname,
     resolve_effect_field, resolve_effect_is_ue, resolve_effect_vtable,
-    resolve_tuple_ann, split_result_compound, tuple_c_type_name, type_from_name, type_from_name_tag, type_name_from_ct, ue_effects, c_type_from_tag, is_sized_int_ct,
+    resolve_tuple_ann, split_result_compound, tuple_c_type_name, type_from_name, type_from_name_tag, type_name_from_ct, type_arg_name_from_ct, ue_effects, c_type_from_tag, is_sized_int_ct,
     var_enums
 }
 import codegen_derive.{ct_to_descriptor, descriptor_mangle, queue_promote_type}
@@ -89,7 +89,7 @@ import diagnostics.{
     QM_RESULT_IN_NON_RESULT, QM_OPTION_IN_NON_OPTION,
     MISSING_KEYWORD_ARG, INVALID_KEYWORD_ARG,
     CLOSEABLE_ESCAPES_SCOPE, FILE_NOT_FOUND, RAW_BYPASSES_PARAM,
-    BARE_GENERIC_FN_AS_VALUE,
+    BARE_GENERIC_FN_AS_VALUE, ICE_SEG_ERASED_SLOT, diag_is_ice_seg,
 }
 import std.path.{path_dirname}
 import formatter.{format_expr}
@@ -3196,7 +3196,11 @@ fn struct_ret_ann_arg_tids(sname: Str, node: Int) -> List[Int] {
             if tracing != 0 { dbg_trace("retann", "{sname} slot {ai}: tid {tid} is unencodable") }
             return none
         }
-        if seg.unwrap() == "" || seg.unwrap() == "Void" {
+        // "Void" is NOT declined here (br hsgsbp): a genuine Void type argument is an
+        // ordinary encodable answer (decisions/under-determined-types.md:39, 6-0), and
+        // declining it routed `Box[Void]` off this tier onto a producer that then erased
+        // the slot. Only an EMPTY segment or a BLINK_I0001_* sentinel is an erasure.
+        if seg.unwrap() == "" || diag_is_ice_seg(seg.unwrap()) {
             if tracing != 0 { dbg_trace("retann", "{sname} slot {ai}: erased segment '{seg.unwrap()}'") }
             return none
         }
@@ -5503,7 +5507,7 @@ fn infer_struct_type_args(type_name: Str, field_types: List[Int], field_structs:
                     if (fct == CT_STRUCT || fct == CT_ENUM) && fstruct != "" {
                         resolved = fstruct
                     } else {
-                        resolved = type_name_from_ct(fct)
+                        resolved = type_arg_name_from_ct(fct)
                     }
                 } else {
                     let sub_elems = node_elements(type_ann_node)
@@ -5514,12 +5518,12 @@ fn infer_struct_type_args(type_name: Str, field_types: List[Int], field_structs:
                             if node_name(sub_ann) == param_name {
                                 let ft = field_types.get(fi).unwrap()
                                 if ft == CT_OPTION {
-                                    resolved = type_name_from_ct(expr_option_inner)
+                                    resolved = type_arg_name_from_ct(expr_option_inner)
                                 } else if ft == CT_RESULT {
                                     if si == 0 {
-                                        resolved = type_name_from_ct(expr_result_ok_type)
+                                        resolved = type_arg_name_from_ct(expr_result_ok_type)
                                     } else {
-                                        resolved = type_name_from_ct(expr_result_err_type)
+                                        resolved = type_arg_name_from_ct(expr_result_err_type)
                                     }
                                 }
                             }
@@ -5542,8 +5546,12 @@ fn infer_struct_type_args(type_name: Str, field_types: List[Int], field_structs:
         // returns "Void" and this function is never consulted — I0001 fires identically
         // with or without this normalization. Kept because the None path is not provably
         // unreachable and its failure mode is an undiagnosed C error.
+        //
+        // Normalizes to the erasure SENTINEL, not to "Void" (br hsgsbp): the two used to
+        // be the same string, which is why a hand-written `Box[Void]` was refused as if
+        // its slot had never been resolved.
         if resolved == "" {
-            resolved = "Void"
+            resolved = ICE_SEG_ERASED_SLOT
         }
         if pi > 0 {
             args = args.concat(",")
@@ -5977,7 +5985,14 @@ fn tid_slot_is_plain_scalar(slot: Int) -> Bool {
 // Whether any per-tparam segment of a mono-args CSV names an ERASED slot. Two
 // spellings qualify, and both are equally fatal:
 //
-//   "Void"  — what every string producer fell back to when it could not name a slot.
+//   a BLINK_I0001_* SENTINEL — what every producer that could not name a slot now
+//           writes. Before br hsgsbp this was the string "Void", which the ratified
+//           6-0 decision forbids: the tripwire "must key on the *kind*, not the
+//           resulting \"Void\" tag, so a genuine GKV[Void, Void] is unaffected"
+//           (DECISIONS.md:342). Void is "an ordinary INHABITED, encodable type"
+//           (decisions/under-determined-types.md:39), so a segment reading "Void" is
+//           now a legitimate answer and this predicate must say false to it — see the
+//           two polarity rows in tests/test_hsgsbp_void_vs_erasure.bl.
 //   a BINDER of this very struct ("T") — what the tid producers leave behind when
 //           tc_seg_from_tid declines a slot and the name passes through unchanged.
 //           `blink_Box_T` is just as valid a C identifier as `blink_Box_Void`, and
@@ -5986,20 +6001,28 @@ fn tid_slot_is_plain_scalar(slot: Int) -> Bool {
 //           than a compiler diagnostic — worse than the ICE (br pt4hsy).
 //
 // Checked per DECLARED tparam (via nth_type_arg, the same naive comma split the rest
-// of the mono machinery uses) rather than as a substring, so a user type whose name
-// merely contains "Void" and a legitimately Void-valued NON-tparam position can't trip
-// it. A user type that genuinely SHARES a name with a binder (`type Box[T]` alongside
+// of the mono machinery uses) rather than as a substring, so a sentinel appearing inside
+// some non-tparam position can't trip it. A user type that genuinely SHARES a name with a binder (`type Box[T]` alongside
 // `type T {..}`, so `Box[T]` is concrete) is excluded by the is_struct_or_enum_type
 // check. Returns false when the struct declares no tparams — a monomorphic struct's
 // mono_args is not a type-param CSV at all.
-fn mono_args_has_void_seg(mono_args: Str, tparams_sl: Int) -> Bool {
+// `pub` FOR THE TEST ONLY — its single non-test caller is emit_struct_lit's chokepoint just
+// below. Same precedent as resolve_mono_slot (src/codegen_stmt.bl): the predicate's two
+// polarities (a sentinel is fatal, a genuine "Void" is NOT) are the whole point of br
+// hsgsbp, and no Blink program in the corpus reaches the fatal one, so a unit row driving it
+// directly is the only positive test available.
+pub fn mono_args_has_void_seg(mono_args: Str, tparams_sl: Int) -> Bool {
     if tparams_sl == -1 { return false }
     let count = sublist_length(tparams_sl)
     if count < 1 { return false }
     let mut i = 0
     while i < count {
         let seg = nth_type_arg(mono_args, i)
-        if seg == "Void" { return true }
+        // A string test inside a change whose whole point is to stop keying on a type
+        // NAME. That is deliberate and is not a precedent: BLINK_I0001_ is a
+        // mangler-internal prefix no user type can spell, so this tests for a marker the
+        // compiler itself wrote, not for a type the user named.
+        if diag_is_ice_seg(seg) { return true }
         if tparams_sl_contains(tparams_sl, seg) != 0 && is_struct_or_enum_type(seg) == 0 {
             return true
         }
@@ -6562,10 +6585,14 @@ fn emit_struct_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
         // and the one place that already carries Diag.Report, so raising the ICE needs
         // no effect threading through the 85+ resolve_tparam_via_tid callers.
         //
-        // A "Void" segment is never a legitimate answer for a declared type param: it
-        // means some producer erased a slot it could not spell, and the resulting name
-        // (blink_GKV_Void_Void) is a VALID C identifier that compiles and links while
-        // silently collapsing sibling instances onto one typedef. Fail loudly instead:
+        // A BLINK_I0001_* segment is never a legitimate answer for a declared type param:
+        // it means some producer erased a slot it could not spell. Until br hsgsbp the
+        // erasure spelled itself "Void", and the resulting name (blink_GKV_Void_Void) was
+        // a VALID C identifier that compiled and linked while silently collapsing sibling
+        // instances onto one typedef. That is what the sentinel exists to prevent — and
+        // splitting the two spellings is also what makes a GENUINE `Box[Void]` compile,
+        // per DECISIONS.md:342 (6-0): the tripwire keys on the KIND, so a real
+        // GKV[Void, Void] is unaffected. Fail loudly on the sentinel instead:
         // "ice" severity bypasses @allow and blinkc exits 101 before writing any C.
         // The front end should have reported CannotInferType (E0301) first if the
         // program were genuinely under-determined; reaching here means it did not, so

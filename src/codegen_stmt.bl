@@ -97,7 +97,7 @@ import codegen_derive.{ct_to_descriptor, desc_primary_ct, descriptor_c_type, des
 import diagnostics.{
     Diag, diag_error_at, diag_ice_at, diag_warn_at, diag_file_for_node,
     ARENA_CLOSURE_TAIL_NONLITERAL, ARENA_CLOSURE_UNSUPPORTED_CAP,
-    MISSING_CANONICAL_HEADER, UNSOLVED_TYPEVAR_AT_CODEGEN,
+    MISSING_CANONICAL_HEADER, UNSOLVED_TYPEVAR_AT_CODEGEN, diag_is_ice_seg,
 }
 import pkg.manifest.{manifest_header_is_declared, manifest_name}
 import compiler.{trace}
@@ -6464,13 +6464,21 @@ fn mono_arg_tids_with_ann(arg_tids: List[Int], ann: Int, base_name: Str, count: 
 //     is_struct_or_enum_type half matters because a type param may legitimately be shadowed by
 //     a same-named concrete type (decisions/under-determined-types.md Q5, 6-0 ADOPT;
 //     sections/03_types.md:1136-1192).
-//   "Void" — reachable HERE and not only on the CSV, because tc_tid_encodable ADMITS TK_VOID:
-//     a slot carrying TYPE_VOID resolves to the string "Void" rather than passing the binder
-//     through, so the binder half alone is blind to it. And merge_arg_tids (codegen_types.bl)
-//     ranks any tid >= 0 above a -1 hole, TYPE_VOID included, so a Void-degraded slot tid now
-//     WINS a dedup join against the hole that this guard would otherwise have caught. Checking
-//     the string here is not "keying the diagnostic on Void" in the Q5 sense — the CSV
-//     chokepoint checks the identical string for the identical reason.
+//   a BLINK_I0001_* SENTINEL — reachable HERE and not only on the CSV, because tc_tid_to_c_tag
+//     answers with one for an out-of-range tid and for a kind it has no arm for, and
+//     tc_seg_from_tid threads that answer straight through. The binder half is blind to it (a
+//     sentinel is not a declared tparam name), so without this arm arming those two producers
+//     would DOWNGRADE a located I0001 into an opaque `cc` error with no source span — which is
+//     why br hsgsbp landed this check in the same commit as the arming.
+//
+//     Unlike the binder half, this one is NOT gated on tparams_sl_contains(param_name). A binder
+//     name can legitimately appear in a non-generic position, so that half needs the gate; a
+//     sentinel is a marker the compiler wrote about its own failure and is never legitimate in
+//     ANY position. This is also where the predicate used to test `resolved == "Void"`, which
+//     DECISIONS.md:342 (6-0) forbids — Void is "an ordinary INHABITED, encodable type"
+//     (decisions/under-determined-types.md:39), so a slot resolving to "Void" is now a correct
+//     answer and falls through clean. That is the fix for the genuine `Box[Void]` false
+//     positive; tests/test_hsgsbp_box_void.bl is the end-to-end green.
 //
 // DELIBERATELY NOT NAMED resolve_mono_field_type. That identifier has never denoted anything
 // in this codebase — it entered as comment prose only (1409140) and misdescribed both the name
@@ -6488,11 +6496,9 @@ fn mono_arg_tids_with_ann(arg_tids: List[Int], ann: Int, base_name: Str, count: 
 pub fn resolve_mono_slot(param_name: Str, tparams_sl: Int, arg_tids: List[Int], site: Str, owner: Str, node: Int) -> Str ! Diag.Report {
     let resolved = resolve_tparam_via_tid(param_name, tparams_sl, arg_tids)
     let binder_survived = tparams_sl_contains(tparams_sl, resolved) != 0 && is_struct_or_enum_type(resolved) == 0
-    // Only for a DECLARED tparam position: a non-generic slot that legitimately names nothing
-    // (`resolved == param_name` for a concrete annotation) must not be read as an erasure just
-    // because the string happens to be "Void".
-    let void_survived = resolved == "Void" && tparams_sl_contains(tparams_sl, param_name) != 0
-    if binder_survived || void_survived {
+    // No tparams_sl_contains gate, deliberately — see the SENTINEL paragraph above.
+    let ice_seg_survived = diag_is_ice_seg(resolved)
+    if binder_survived || ice_seg_survived {
         dbg_trace("monofield", "binder-survived site={site} owner={owner} param={param_name} resolved={resolved} arg_tids=len{arg_tids.len()}")
         // `owner` is in the MESSAGE and `site` only in the help, deliberately: diag_seen dedups on
         // (severity|code|file|line|col|message), so the two def-side resolvers that describe the
@@ -6501,7 +6507,7 @@ pub fn resolve_mono_slot(param_name: Str, tparams_sl: Int, arg_tids: List[Int], 
         diag_ice_at("UnsolvedTypeVarAtCodegen", UNSOLVED_TYPEVAR_AT_CODEGEN,
             "type parameter '{param_name}' of '{owner}' reached monomorphization unsolved",
             node,
-            "this is a compiler bug — the type should have been inferred, or reported as error[CannotInferType]; the def-side slot resolved to the binder name itself (codegen site '{site}'), which would erase to a void or _Void field")
+            "this is a compiler bug — the type should have been inferred, or reported as error[CannotInferType]; the def-side slot resolved to '{resolved}' (codegen site '{site}'), which would erase to a void or _Void field")
     }
     resolved
 }

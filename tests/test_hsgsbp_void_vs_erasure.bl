@@ -1,0 +1,277 @@
+// br hsgsbp: the spelling "Void" means GENUINE Void and nothing else.
+//
+// WHAT WAS WRONG. tc_tid_to_c_tag (src/typecheck.bl) spelled the single string "Void" for
+// four unrelated conditions, and four sibling string producers spelled it for a fifth:
+//
+//   a genuine TK_VOID              — a real, inhabited type the user wrote
+//   a kind with no arm             — TK_FN, TK_CLOSURE, any kind added later
+//   a negative / out-of-pool tid   — a caller that skipped its own `tid < 0` gate
+//   an ERASED type-arg slot        — type_name_from_ct's bare else, tc_mono_csv,
+//                                    infer_struct_type_args, infer_fn_type_args_from_types
+//
+// The two I0001 chokepoints then keyed on that string. DECISIONS.md:342 (6-0) forbids
+// exactly this: the tripwire "must key on the *kind*, not the resulting \"Void\" tag, so a
+// genuine GKV[Void, Void] is unaffected". It was NOT unaffected — a genuine `Box[Void]`
+// raised two I0001s (measured, br hsgsbp Stage A). Void is "an ordinary INHABITED,
+// encodable type" (decisions/under-determined-types.md:38-42) and is genuinely distinct
+// from an unsolved metavariable α (:51-54 — substituting one for the other "is licensed by
+// no typing rule"), so refusing it is a bug, not a safety net.
+//
+// The fix gives ERASURE its own fail-closed sentinel (diagnostics.ICE_SEG_*, detected via
+// diag_is_ice_seg) and leaves "Void" meaning only genuine Void. These rows pin BOTH
+// polarities, because only having both makes the change a fix rather than a relabeling:
+// a sentinel must still be fatal, and a genuine Void must now be fine.
+//
+// WHAT THE TICKET ASKED FOR, AND WHY R2 FORBIDS IT. br hsgsbp was filed asking to add
+// TK_VOID to tc_tid_encodable's REJECTION set. That is the opposite of the decision above,
+// and it does not stop at bare Void: tc_tid_encodable's TK_RESULT arm recurses, so
+// rejecting the kind makes `Result[Void, Str]` unencodable — a type lib/std depends on
+// (bytes.bl, db_sqlite.bl, traits.bl) and one the compiler synthesizes for EVERY
+// `?`-bearing `test` block. R2 asserts encodability AND the exact spelling, so that patch
+// cannot be reapplied without turning this row red.
+//
+// WHY UNIT ROWS. Same reason as tests/test_fes70z_mono_slot_ice.bl: no Blink program in the
+// corpus reaches these arms. That is measured, not assumed — the `ctagvoid` channel reads 0
+// in all four buckets across the whole corpus and both compiler entry points, and that zero
+// is the arming gate the two sentinels shipped behind. It is also why a corpus sweep proves
+// nothing here on its own, so these rows drive the predicates directly. The companion
+// FIXTURE tests/test_hsgsbp_box_void.bl covers the end-to-end program.
+//
+// SETUP HAZARDS, inherited from the two files this is patterned on:
+//  1. Bare `import codegen_expr` closes the whole-program-merge back-references —
+//     resolve_mono_slot resolves globals out of the MERGED program, not its own imports
+//     (typecheck/compiler sit above codegen_stmt in the import DAG). Without it this fails
+//     to compile with `undefined variable 'trace_mode'`. Same reason
+//     tests/test_fes70z_mono_slot_ice.bl and test_panic_line_str_synth.bl import it.
+//  2. diag_seen dedups on (severity|code|file|line|col|message), so every ICE-raising row
+//     below passes a DISTINCT owner string (the message interpolates it) — otherwise two
+//     rows would coalesce and the delta assertions would silently read 0.
+//  3. `effect Parse` is non-`pub` (src/parser.bl:14), so the sublist setup cannot be
+//     factored into a helper fn. It stays inline per body; the repetition is a constraint.
+//  4. diag_ice_at COUNTS without aborting, so `diag_ice_count` deltas are the assertable
+//     signal and these rows print nothing.
+
+import typecheck.{
+    tc_tid_to_c_tag, tc_seg_from_tid, tc_type_str, tc_lookup_node_tid,
+    make_fn_type, check_types,
+}
+import codegen_stmt.{resolve_mono_slot}
+import diagnostics.{
+    diag_ice_count, diag_is_ice_seg,
+    ICE_SEG_UNSOLVED_TYPEVAR, ICE_SEG_UNHANDLED_KIND, ICE_SEG_TID_OUT_OF_RANGE,
+    ICE_SEG_ERASED_SLOT,
+}
+import parser.{nodes, new_sublist, sublist_push, finalize_sublist}
+import compiler.{compile_to_program}
+import ast.{AstNode}
+import std.io
+import codegen_expr
+
+fn assert_eq_int(label: Str, got: Int, want: Int) {
+    if got != want {
+        io.println("FAIL: {label}: got {got} want {want}")
+    }
+    assert_eq(got, want)
+}
+
+fn assert_eq_str(label: Str, got: Str, want: Str) {
+    if got != want {
+        io.println("FAIL: {label}: got '{got}' want '{want}'")
+    }
+    assert_eq(got, want)
+}
+
+fn assert_true(label: Str, got: Bool) {
+    if !got {
+        io.println("FAIL: {label}: got false want true")
+    }
+    assert(got)
+}
+
+fn assert_false(label: Str, got: Bool) {
+    if got {
+        io.println("FAIL: {label}: got true want false")
+    }
+    assert(!got)
+}
+
+// A genuine Void tid and a genuine Result[Void, Str] tid cannot be built from the outside:
+// TYPE_VOID is a non-`pub` `let mut` and make_result_type is non-`pub`. So harvest them the
+// way tests/test_xskbvh_seg_injective.bl does — compile a probe source, typecheck it, and
+// index every memoized node tid by its RENDERED type string (tc_type_str). Deliberately NOT
+// by widening two more fns to `pub`: these tids must be the ones real inference produces, or
+// the rows would only prove that hand-built pool entries behave.
+fn probe_src() -> Str {
+    #"fn main() {
+    let u: Void = ()
+    let r: Result[Void, Str] = Ok(())
+    assert(r.is_ok())
+}
+"#
+}
+
+fn harvest_type_tids() -> Map[Str, Int] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let path = "build/hsgsbp_probe_src.bl"
+    write_file(path, probe_src())
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    // Removed BEFORE any row assertion below, so a failing assertion can never leak the
+    // probe file. A stale build/hsgsbp_probe_src.bl on disk means the front end ICE'd on the
+    // probe itself and aborted the binary — a signal the probe broke, not that a row
+    // disagreed. (Same contract as test_xskbvh_seg_injective.bl.)
+    fs.remove(path)
+    let mut m: Map[Str, Int] = Map()
+    let mut idx = 0
+    let n = nodes.len()
+    while idx < n {
+        let tid = tc_lookup_node_tid(idx)
+        if tid >= 0 {
+            m.insert(tc_type_str(tid), tid)
+        }
+        idx = idx + 1
+    }
+    m
+}
+
+fn expect_tid(m: Map[Str, Int], key: Str) -> Int {
+    let tid = m.get(key) ?? -1
+    if tid == -1 {
+        io.println("FAIL: harvested map has no tid for rendered type string '{key}'")
+    }
+    assert(tid != -1)
+    tid
+}
+
+// R1 + R2 — the POSITIVE polarity: a genuine Void is spellable, and stays spellable.
+test "a genuine Void tid spells Void, and Result[Void, Str] stays encodable" {
+    let m = harvest_type_tids()
+
+    // R1. Pins the explicit TK_VOID arm. Before br hsgsbp this same string came out of the
+    // fall-through TAIL, i.e. by accident and indistinguishably from a kind with no arm; the
+    // answer is unchanged and the point is that it is now DELIBERATE. A future session that
+    // "cleans up" the arm as redundant turns the tail's sentinel into Void's spelling and
+    // silently reverts the whole ticket.
+    let void_tid = expect_tid(m, "Void")
+    assert_eq_str("genuine Void spells Void", tc_tid_to_c_tag(void_tid), "Void")
+    assert_false("genuine Void is not an ICE sentinel", diag_is_ice_seg(tc_tid_to_c_tag(void_tid)))
+
+    // R2. The counterfactual guard on the ticket's literal ask, asserting encodability AND
+    // spelling together. `Some(...)` proves tc_tid_encodable admitted it (a rejection yields
+    // None), and "Result_void_str" is the exact tag src/codegen_types.bl matches to lower the
+    // Void ok-leaf to an int64_t placeholder field — so this row also pins the load-bearing
+    // lowercase fall-through in tc_tid_scalar_tag that must NOT be armed.
+    let rv_tid = expect_tid(m, "Result[Void, Str]")
+    let seg = tc_seg_from_tid(rv_tid)
+    assert_true("Result[Void, Str] is encodable", seg.is_some())
+    assert_eq_str("Result[Void, Str] spells Result_void_str", seg.unwrap(), "Result_void_str")
+}
+
+// R3 — an out-of-range tid is its own sentinel, no longer Void's spelling.
+test "an out-of-range tid spells the out-of-range sentinel, not Void" {
+    // Both directions of out-of-range. -1 is what every one of tc_tid_to_c_tag's five
+    // callers gates on today; the huge tid is the other half of the same guard and the one a
+    // future caller is likelier to get wrong. tc_resolve passes both through unchanged.
+    assert_eq_str("negative tid", tc_tid_to_c_tag(-1), ICE_SEG_TID_OUT_OF_RANGE)
+    assert_eq_str("out-of-pool tid", tc_tid_to_c_tag(1000000000), ICE_SEG_TID_OUT_OF_RANGE)
+    assert_true("out-of-range is an ICE sentinel", diag_is_ice_seg(tc_tid_to_c_tag(-1)))
+    // The whole point: it is no longer confusable with a real type's real name.
+    assert_false("out-of-range no longer spells Void", tc_tid_to_c_tag(-1) == "Void")
+}
+
+// R4 — a kind with no arm is its own sentinel. TK_FN is the only such kind that can be
+// constructed, and only via make_fn_type, which is `pub` for this row alone.
+test "a kind with no arm spells the unhandled-kind sentinel, not Void" {
+    let fn_tid = make_fn_type(-1, [])
+    assert_eq_str("TK_FN has no arm", tc_tid_to_c_tag(fn_tid), ICE_SEG_UNHANDLED_KIND)
+    assert_true("unhandled kind is an ICE sentinel", diag_is_ice_seg(tc_tid_to_c_tag(fn_tid)))
+    assert_false("unhandled kind no longer spells Void", tc_tid_to_c_tag(fn_tid) == "Void")
+
+    // Distinct sentinels, not one shared "something went wrong" string. The three buckets
+    // have three different remedies — fix the caller's gate, add an arm, fix inference — so
+    // collapsing them would re-create the ambiguity this ticket removed, one level down.
+    assert_false("unhandled kind != out of range", ICE_SEG_UNHANDLED_KIND == ICE_SEG_TID_OUT_OF_RANGE)
+    assert_false("unhandled kind != erased slot", ICE_SEG_UNHANDLED_KIND == ICE_SEG_ERASED_SLOT)
+    assert_false("erased slot != unsolved typevar", ICE_SEG_ERASED_SLOT == ICE_SEG_UNSOLVED_TYPEVAR)
+}
+
+// R5 — diag_is_ice_seg polarity. The detector is total over the sentinels and inert over
+// every real type name, which is the property that lets the chokepoints stop string-keying
+// on "Void".
+test "diag_is_ice_seg is true for every sentinel and false for every real name" {
+    assert_true("unsolved typevar", diag_is_ice_seg(ICE_SEG_UNSOLVED_TYPEVAR))
+    assert_true("unhandled kind", diag_is_ice_seg(ICE_SEG_UNHANDLED_KIND))
+    assert_true("tid out of range", diag_is_ice_seg(ICE_SEG_TID_OUT_OF_RANGE))
+    assert_true("erased slot", diag_is_ice_seg(ICE_SEG_ERASED_SLOT))
+
+    // "Void" is the row that matters — it is the whole ticket. A type param's binder name,
+    // a scalar, and the empty CSV segment cover the other strings that legitimately flow
+    // through the chokepoints.
+    assert_false("Void is a real type", diag_is_ice_seg("Void"))
+    assert_false("Int is a real type", diag_is_ice_seg("Int"))
+    assert_false("T is a binder name", diag_is_ice_seg("T"))
+    assert_false("empty segment", diag_is_ice_seg(""))
+}
+
+// R6 — the located diagnostic SURVIVES the sentinel swap. This is why C4/C5 could not ship
+// without C3: arming the spellers while the chokepoint still compared against "Void" would
+// have DOWNGRADED a diagnostic with a source span into an opaque `cc` error.
+test "a sentinel-resolving def-side slot still raises exactly one located I0001" {
+    let bn = nodes.len()
+    nodes.push(AstNode { name: "T", line: 0 })
+    let sl = new_sublist()
+    sublist_push(sl, bn)
+    finalize_sublist(sl)
+    let n = nodes.len()
+    nodes.push(AstNode { line: 0 })
+    let before = diag_ice_count
+
+    // A TK_FN slot tid: resolvable enough to be spelled, but spellable only as a sentinel.
+    // Unlike the all- -1 case in test_fes70z_mono_slot_ice.bl this exercises the
+    // ice_seg_survived half rather than the binder half — and note it is UNGATED by
+    // tparams_sl_contains, because unlike "Void" a sentinel is never legitimate in ANY
+    // position, so it must not inherit the gate that exists to protect a concrete `v: Void`.
+    let resolved = resolve_mono_slot("T", sl, [make_fn_type(-1, [])], "unit_ice_seg", "hsgsbp_r6.v", n)
+
+    assert_true("a sentinel-resolving slot is detected", diag_is_ice_seg(resolved))
+    assert_eq_int("sentinel slot raises exactly one ICE", diag_ice_count - before, 1)
+}
+
+// R7 — negative control. The guard must not have WIDENED while being rewritten; a concrete
+// slot that the tid path declined is the overwhelmingly common case and stays silent.
+test "a concrete slot with a declined tid still raises no ICE" {
+    let bn = nodes.len()
+    nodes.push(AstNode { name: "T", line: 0 })
+    let sl = new_sublist()
+    sublist_push(sl, bn)
+    finalize_sublist(sl)
+    let n = nodes.len()
+    nodes.push(AstNode { line: 0 })
+    let before = diag_ice_count
+
+    let resolved = resolve_mono_slot("Int", sl, [-1], "unit_negative", "hsgsbp_r7.v", n)
+
+    assert_eq_str("a concrete type resolves to itself", resolved, "Int")
+    assert_eq_int("a concrete slot raises no ICE", diag_ice_count - before, 0)
+}
+
+// R8 — the CSV chokepoint's polarity flip, stated as directly as it can be: the string that
+// used to trip it must no longer trip it, and the sentinel that replaced it must.
+test "mono_args_has_void_seg ignores a genuine Void and catches the erasure sentinel" {
+    let bn = nodes.len()
+    nodes.push(AstNode { name: "T", line: 0 })
+    let sl = new_sublist()
+    sublist_push(sl, bn)
+    finalize_sublist(sl)
+
+    // THE regression row for br hsgsbp. `Box[Void]` produces exactly this CSV, and a `true`
+    // here is the I0001 false positive on the precise program DECISIONS.md:342 promises is
+    // unaffected.
+    assert_false("a genuine Void segment is legitimate", codegen_expr.mono_args_has_void_seg("Void", sl))
+    assert_true("an erasure sentinel segment is fatal", codegen_expr.mono_args_has_void_seg(ICE_SEG_ERASED_SLOT, sl))
+
+    // The binder half is untouched by this ticket and must stay armed — it is the tid
+    // producers' erasure spelling (`blink_Box_T`), and it is the half that would otherwise
+    // silently absorb everything the "Void" half used to catch.
+    assert_true("a surviving binder is still fatal", codegen_expr.mono_args_has_void_seg("T", sl))
+    assert_false("a concrete segment is still legitimate", codegen_expr.mono_args_has_void_seg("Int", sl))
+}
