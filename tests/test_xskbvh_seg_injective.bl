@@ -1,0 +1,200 @@
+// br xskbvh: unit rows for tc_tid_seg_injective(tid) -> Bool (src/typecheck.bl, next to
+// its two helpers tc_tid_struct_seg_injective / tc_tid_inner_seg_injective).
+//
+// WHY THIS PREDICATE EXISTS. The mono registries (mono_fns / mono_instances,
+// codegen_types.bl) dedup generic instantiations on a key `(base, args)`, where `args` is
+// a CSV of per-type-param segments spelled by tc_tid_to_c_tag. That speller ERASES a
+// container's type arguments at the top level: `Set[Int]`, `Set[Str]` and `Set[Point]`
+// all spell the bare segment "Set". This collapse is CORRECT for NAMING — all three are
+// `blink_set*`, one C symbol, and the registry SHOULD share one entry so only one function
+// is emitted — but it means the single stored `arg_tids` behind that shared key cannot
+// answer "which instantiation is this" for any but the first one registered. A caller that
+// forgets this and reads the registry's tid back as per-instantiation IDENTITY (e.g. to
+// decide which concrete element type a mono-ed generic fn was called with) would silently
+// get the WRONG instantiation's tid for every collision after the first.
+// tc_tid_seg_injective(tid) is the boundary: it answers whether the segment
+// tc_tid_to_c_tag spells for `tid` names its own type arguments (true = safe to read back
+// as identity) or only serves as a shared representation tag (false = a Set is a Set, the
+// tid still lowers correctly, but the registry entry it keys is shared and must not be
+// trusted for identity). This is the gate br qnpb2d consumes before making the tid path
+// authoritative at the struct-literal mono seam — a wrong answer here would let that seam
+// pick the wrong stored tid for a colliding key.
+//
+// POSITION-AWARE, not a fixed kind set. tc_tid_to_c_tag (top level) and tc_tid_inner_tag
+// (nested inside Option/Result/Tuple) erase DIFFERENTLY: a Map at the top level erases to
+// bare "Map", but as the INNER of an Option/Result/Tuple it is spelled "Map_<k>_<v>" and IS
+// injective there. Rows below exercise both positions for Map, which is the one kind whose
+// answer flips.
+//
+// WHY THE HARNESS RESOLVES TIDS BY RENDERED TYPE STRING. There is no public tid
+// constructor and ty_pool is private to typecheck, so real tids can only be obtained by
+// running the front end and reading back tc_lookup_node_tid/tc_type_str for the nodes it
+// memoized. This is deliberately indirect — it does not depend on AST node kinds, node
+// ordering, or internal struct-field names, only on the type string the checker itself
+// renders, so the test does not need to track those internals to keep working.
+//
+// SETUP HAZARD carried over from tests/test_p7014w_mono_arg_tids_order_independence.bl:
+// codegen_types.bl reads several globals (expr_option_inner, expr_result_ok_type,
+// expr_list_elem_type, ...) it does not import, relying on them being defined elsewhere in
+// the whole-program merge (they live in codegen_expr.bl). Reaching codegen_types.bl
+// through compiler/typecheck without also importing codegen_expr leaves those globals
+// UNDECLARED in the emitted C — a hard `cc` failure, not a Blink-level error. Importing
+// codegen_expr closes that gap. test_p7014w does it with a BARE import, which W0602
+// (UnusedImport) flags; here the import is selective on segs_from_arg_tids, which the last
+// rows genuinely call, so the same gap is closed without an accepted warning.
+
+import compiler.{compile_to_program}
+import typecheck.{check_types, tc_lookup_node_tid, tc_type_str, tc_tid_seg_injective}
+import parser.{nodes}
+import std.io
+// Load-bearing beyond the symbol selected: see the header note above. codegen_expr's
+// transitive closure is the smallest root that defines every global codegen_types.bl
+// free-loads on, so dropping this import breaks the emitted C even though only one fn is
+// named here.
+import codegen_expr.{segs_from_arg_tids}
+
+fn assert_eq_bool(got: Bool, want: Bool, label: Str) {
+    if got != want { io.println("FAIL: {label} — got {got}, want {want}") }
+    assert(got == want)
+}
+
+// Every type this file needs to assert about, mentioned in a position that gets inferred
+// (a `let` with an explicit annotation plus a constructing expression — every expression
+// node is memoized during inference, so the constructing expr's node ends up carrying the
+// annotated tid). `Box[T]` supplies both a fully-faithful struct instance (`Box[Int]`) and
+// one whose single slot itself erases (`Box[Set[Int]]`, segment `Box_Set`).
+fn probe_src() -> Str {
+    #"type Box[T] {
+    v: T
+}
+
+fn main() {
+    let a: Set[Int] = Set()
+    let b: Set[Str] = Set()
+    let c: Map[Str, Int] = Map()
+    let d: List[Int] = []
+    let e: Box[Set[Int]] = Box { v: Set() }
+    let f: Int = 1
+    let g: Str = "x"
+    let h: Bytes = Bytes.new()
+    let i: Box[Int] = Box { v: 1 }
+    let j: Option[Box[Int]] = Some(Box { v: 1 })
+    let k: (Int, Int) = (1, 2)
+    let l: Option[Map[Str, Int]] = Some(Map())
+    assert(a.len() == 0)
+    assert(b.len() == 0)
+    assert(c.len() == 0)
+    assert(d.len() == 0)
+    assert(e.v.len() == 0)
+    assert(f == 1)
+    assert(g == "x")
+    assert(h.len() == 0)
+    assert(i.v == 1)
+    assert(j.is_some())
+    assert(k.0 == 1)
+    assert(l.is_some())
+}
+"#
+}
+
+// Compile the probe, typecheck it, then harvest every memoized node tid keyed by its
+// RENDERED TYPE STRING (tc_type_str). A later node overwriting an earlier one for the same
+// string is fine — the probe never needs two different tids for one rendered spelling.
+//
+// `write_file`/`fs.remove` are genuine compiler BUILTINS, not the whole-program-merge
+// free-load this file's header warns about for codegen_types.bl's globals: `write_file` is
+// listed as a builtin fn name in typecheck.bl (is_builtin_fn / builtin return-type table,
+// e.g. src/typecheck.bl:5176-5178, :5429-5431) and registered in codegen.bl:576-578, while
+// `fs` is one of the namespace names typecheck.bl explicitly exempts from import
+// resolution (src/typecheck.bl:6535) with its methods dispatched as intrinsics in
+// codegen_methods.bl (e.g. :2817 for `fs.remove`). Neither needs an import here, by design
+// — unlike expr_option_inner et al., these do not depend on which OTHER modules happen to
+// be in this file's transitive closure.
+//
+// `fs.remove` runs immediately after `check_types`, BEFORE any row assertion in the `test`
+// block below — so an assertion failure on any of the 12 rows can never leak the probe
+// file; it is already gone by the time those assertions run. The one way
+// build/xskbvh_probe_src.bl could survive a run is if compile_to_program/check_types
+// itself panics on the probe (an ICE, not an ordinary diagnostic) before reaching the
+// `fs.remove` line below — that would abort the test binary outright. If you ever find a
+// stale build/xskbvh_probe_src.bl on disk, that is what happened; it is safe to delete by
+// hand and is a signal the probe itself broke the front end, not that a row disagreed.
+fn harvest_type_tids() -> Map[Str, Int] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let path = "build/xskbvh_probe_src.bl"
+    write_file(path, probe_src())
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    fs.remove(path)
+    let mut m: Map[Str, Int] = Map()
+    let mut idx = 0
+    let n = nodes.len()
+    while idx < n {
+        let tid = tc_lookup_node_tid(idx)
+        if tid >= 0 {
+            m.insert(tc_type_str(tid), tid)
+        }
+        idx = idx + 1
+    }
+    m
+}
+
+fn expect_tid(m: Map[Str, Int], key: Str) -> Int {
+    let tid = m.get(key) ?? -1
+    if tid == -1 {
+        io.println("FAIL: harvested map has no tid for rendered type string '{key}'")
+    }
+    assert(tid != -1)
+    tid
+}
+
+test "tc_tid_seg_injective: non-injective and injective rows, both polarities" {
+    let m = harvest_type_tids()
+
+    // ── non-injective: the segment collapses distinct instantiations onto one key ──
+
+    // Set[Int] / Set[Str] both spell the bare "Set" segment — the textbook collision the
+    // predicate exists to flag.
+    assert_eq_bool(tc_tid_seg_injective(expect_tid(m, "Set[Int]")), false, "Set[Int] top-level")
+    assert_eq_bool(tc_tid_seg_injective(expect_tid(m, "Set[Str]")), false, "Set[Str] top-level")
+    // Map at the TOP level erases to bare "Map" (contrast with the Option[Map[...]] row
+    // below, where the SAME kind is injective because it is nested).
+    assert_eq_bool(tc_tid_seg_injective(expect_tid(m, "Map[Str, Int]")), false, "Map[Str, Int] top-level")
+    assert_eq_bool(tc_tid_seg_injective(expect_tid(m, "List[Int]")), false, "List[Int] top-level")
+    // A struct instance whose SLOT itself erases: Box[T] instantiated at Set[Int] spells
+    // the mono segment "Box_Set" — faithful about the outer Box, faithless about the Set
+    // slot inside it, so the whole struct segment is non-injective.
+    assert_eq_bool(tc_tid_seg_injective(expect_tid(m, "Box[Set[Int]]")), false, "Box[Set[Int]] (erasing slot)")
+
+    // ── injective: the segment names its own type arguments ──
+
+    assert_eq_bool(tc_tid_seg_injective(expect_tid(m, "Int")), true, "Int scalar")
+    assert_eq_bool(tc_tid_seg_injective(expect_tid(m, "Str")), true, "Str scalar")
+    // Bytes has no type arguments at all, so its bare "Bytes" is fully faithful — it is
+    // NOT part of the erasing List/Set/Map/Iterator/Handle/Channel family even though it
+    // shares their bare-carrier spelling shape.
+    assert_eq_bool(tc_tid_seg_injective(expect_tid(m, "Bytes")), true, "Bytes")
+    // A struct instance whose slots are all faithful.
+    assert_eq_bool(tc_tid_seg_injective(expect_tid(m, "Box[Int]")), true, "Box[Int] (faithful slot)")
+    assert_eq_bool(tc_tid_seg_injective(expect_tid(m, "Option[Box[Int]]")), true, "Option[Box[Int]]")
+    assert_eq_bool(tc_tid_seg_injective(expect_tid(m, "(Int, Int)")), true, "(Int, Int) tuple")
+    // THE POSITION-AWARE CASE: Map as the INNER of an Option is spelled Map_<k>_<v> (unlike
+    // the bare-"Map" top-level row above), so it IS injective here even though the same
+    // Map[Str, Int] kind was non-injective at the top level.
+    assert_eq_bool(tc_tid_seg_injective(expect_tid(m, "Option[Map[Str, Int]]")), true, "Option[Map[Str, Int]] (inner position)")
+
+    // ── the collapse itself, at the seam that produces it ──
+    //
+    // The rows above assert what the PREDICATE says; these assert the fact it describes, so
+    // the two cannot drift apart. segs_from_arg_tids is what lowers an arg_tids list into
+    // the per-tparam CSV segments the mono key is built from, so it IS the collapse: feed
+    // it two DIFFERENT types and get two IDENTICAL segments. That is why a shared
+    // (base, args) entry cannot be read as per-instantiation identity, and it is exactly
+    // the pair pinned at runtime in tests/test_jkdywb_tuple_inline_container.bl.
+    let collapsed = segs_from_arg_tids([expect_tid(m, "Set[Int]"), expect_tid(m, "Set[Str]")])
+    assert_eq(collapsed.get(0).unwrap(), "Set")
+    assert_eq(collapsed.get(1).unwrap(), "Set")
+    // Control: two types the predicate calls injective get DISTINCT segments, so the
+    // collapse above is a property of the erasing kinds and not of segs_from_arg_tids.
+    let distinct = segs_from_arg_tids([expect_tid(m, "Box[Int]"), expect_tid(m, "Option[Box[Int]]")])
+    assert(distinct.get(0).unwrap() != distinct.get(1).unwrap())
+}

@@ -1,6 +1,6 @@
 import ast.{NodeKind, node_kind_name, is_block_bearing, dbg_trace, dbg_channel_on}
 import std.str.{str_to_lower}
-import codegen_types.{is_intrinsic_method, strip_module_qualifier, c_type_tag_for_struct, CT_INT, CT_FLOAT, CT_BOOL, CT_STRING, CT_LIST, CT_VOID, CT_OPTION, CT_RESULT, CT_ITERATOR, CT_HANDLE, CT_CHANNEL, CT_MAP, CT_BYTES, CT_SET, CT_STRUCT, CT_ENUM, CT_I8, CT_I16, CT_I32, CT_U8, CT_U16, CT_U32, CT_U64, CT_CHAR}
+import codegen_types.{is_intrinsic_method, strip_module_qualifier, c_type_tag_for_struct, mono_slot_conflicts, mono_slot_conflicts_same_type, mono_slot_conflicts_diff_type, CT_INT, CT_FLOAT, CT_BOOL, CT_STRING, CT_LIST, CT_VOID, CT_OPTION, CT_RESULT, CT_ITERATOR, CT_HANDLE, CT_CHANNEL, CT_MAP, CT_BYTES, CT_SET, CT_STRUCT, CT_ENUM, CT_I8, CT_I16, CT_I32, CT_U8, CT_U16, CT_U32, CT_U64, CT_CHAR}
 import parser.{
     get_annotation, has_annotation, is_literal_string_part,
     node_args, node_assoc_types, node_arms, node_body, node_captures, node_col, node_condition,
@@ -627,10 +627,17 @@ fn make_tuple_type(elem_types: List[Int]) -> Int {
 // `type Box[T] { .. }` keeps params_count=0; an instance carries params_count>=1.
 // This is the tid-pool representation decisions/compiler-type-representation.md
 // Q2 (5-0) mandates to close the "concrete inner lives only in codegen's string
-// mono registry" split. Foundation-only (br kvn6w8 spike): produced OFF-PATH
-// (memoized onto the annotation node's tc_node_tid slot) and read solely by the
-// tc_tid_struct_arg_* accessors — no emit reader consumes it yet, so it does not
-// intern (mirrors make_tuple_type: fresh entry per call) and stays byte-identical.
+// mono registry" split.
+//
+// It does NOT intern — fresh entry per call, mirroring make_tuple_type. That was
+// once justified by "no emit reader consumes it yet" (br kvn6w8, when this was a
+// foundation-only spike read solely by the tc_tid_struct_arg_* accessors); the
+// premise has since EXPIRED — br wzv72h made the tid path primary at every
+// generic-fn seam and br qnpb2d makes it authoritative at the struct-literal mono
+// seam. So the non-interning is now a measured cost, not a free deferral: 25 of the
+// 43 mono-registry slot-conflicts on the corpus are two tids for ONE type minted
+// here and at the sibling make_*_type fns (br v76b0b). Until that lands, no
+// consumer may treat tid equality as type equality — compare with tc_tid_same_type.
 fn make_struct_instance_type(base_name: Str, arg_types: List[Int]) -> Int {
     let t = new_type(TK_STRUCT, base_name)
     let start = ty_param_list.len()
@@ -10750,6 +10757,134 @@ fn tc_tid_encodable(tid0: Int) -> Bool {
     true
 }
 
+// Whether the mono-CSV segment tc_tid_to_c_tag spells for `tid` NAMES ITS OWN TYPE
+// ARGUMENTS — i.e. whether that segment may be read back as per-instantiation IDENTITY, or
+// only as a REPRESENTATION tag (br xskbvh).
+//
+// The mono registries dedup on (base, args) with `args` a CSV of these segments, so a
+// non-injective segment COLLAPSES distinct instantiations onto one entry: `fn wrap[T]`
+// called at Set[Int], Set[Str] and Set[Point] spells the bare segment "Set" three times
+// and shares one key, hence one stored arg_tids. That collapse is CORRECT for naming —
+// all three are blink_set*, so one C function serves all three and they MUST share the
+// symbol — and it is exactly why the single stored tid cannot be per-instantiation type
+// info for the others. This predicate is where that boundary is stated: false means "this
+// slot's tid still lowers correctly (a Set is a Set), but the registry entry it keys is
+// shared, so do not read identity out of it".
+//
+// KEYED ON THE KIND, never on the resulting string. Pattern-matching a spelling would be
+// the erased-default guessing decisions/under-determined-types.md:264-266 forbids (a user
+// struct legitimately named `Set` must not answer for the builtin), and a segment cannot
+// be inverted anyway — losing the element is the whole point.
+//
+// It is the tid-side counterpart to the STRING-side erasure detector
+// mono_args_has_void_seg (codegen_expr.bl), and answers a DIFFERENT question. That one
+// asks "was this slot un-nameable" (a "Void" or bare-binder segment → I0001); this one
+// asks "is the name FAITHFUL". Do not fold them together: a faithless name is valid C that
+// compiles and links, which is why nothing else catches it.
+//
+// It must NOT be used to degrade a slot to -1. Since br 0n07he a -1 arg_tid means
+// genuinely UNKNOWN, and the def side spells the binder through to a hard cc error
+// (codegen_methods.bl resolve_mono_slot). The tid stays — it correctly spells blink_set*
+// whatever the element is — only its use as IDENTITY is refused.
+pub fn tc_tid_seg_injective(tid0: Int) -> Bool {
+    let tid = tc_resolve(tid0)
+    if tid < 0 || tid >= ty_pool.len() { return false }
+    let t = ty_pool.get(tid).unwrap()
+    let k = t.kind
+    // The six kinds tc_tid_to_c_tag spells as a BARE carrier tag, dropping every type
+    // argument: "List", "Set", "Map", "Iterator", "Handle", "Channel". Note TK_MAP is
+    // non-injective HERE but injective as an INNER (tc_tid_inner_tag spells Map_k_v) —
+    // that is why this predicate is position-aware rather than one kind set.
+    if k == TK_LIST || k == TK_SET || k == TK_MAP { return false }
+    if k == TK_ITERATOR || k == TK_HANDLE || k == TK_CHANNEL { return false }
+    // TK_BYTES has no type arguments at all, so its bare "Bytes" is fully faithful — it is
+    // NOT part of the erasing set even though it shares their bare spelling.
+    if k == TK_BYTES { return true }
+    if k == TK_OPTION { return tc_tid_inner_seg_injective(t.inner1) }
+    if k == TK_RESULT { return tc_tid_inner_seg_injective(t.inner1) && tc_tid_inner_seg_injective(t.inner2) }
+    if k == TK_TUPLE { return tc_tid_tuple_seg_injective(t) }
+    if k == TK_STRUCT || k == TK_ENUM { return tc_tid_struct_seg_injective(t) }
+    // No name to be faithful TO: a typevar spells "<tv>" and an unbound metavar spells the
+    // I0001 sentinel. Neither identifies a type, so neither may be read as identity. This
+    // overlaps mono_args_has_void_seg's population by design — that detector reports it
+    // (as a compiler bug), this one merely refuses to trust it.
+    if k == TK_TYPEVAR || k == TK_UNKNOWN { return false }
+    // Void is refused for a different reason: "Void" is also tc_tid_to_c_tag's fallthrough
+    // for every kind it has no arm for, so the segment does not distinguish the real Void
+    // from an unspellable type. Never identity.
+    if k == TK_VOID { return false }
+    // Scalars (Int/Float/Bool/Str/Char/sized ints) each spell a unique fixed tag.
+    if k == TK_INT || k == TK_FLOAT || k == TK_BOOL || k == TK_STR || k == TK_CHAR { return true }
+    if k == TK_I8 || k == TK_I16 || k == TK_I32 { return true }
+    if k == TK_U8 || k == TK_U16 || k == TK_U32 || k == TK_U64 { return true }
+    // Anything else (TK_FN, any future kind) has no tc_tid_to_c_tag arm and falls through
+    // to "Void" there. Fail closed: an unhandled kind is not identity.
+    false
+}
+
+// The struct/enum arm, shared by both positions because both spell an instance through
+// tc_tid_struct_mono_name: head tag + `_`-joined per-slot segs, where each slot seg comes
+// from tc_tid_struct_slot_seg → tc_tid_to_c_tag, i.e. the TOP-LEVEL rules. So
+// `Box[Set[Int]]` spells Box_Set and is non-injective through its slot.
+fn tc_tid_struct_seg_injective(t: TypePoolEntry) -> Bool {
+    if t.params_count == 0 {
+        // A bare head. For a monomorphic type the name IS the identity. For a GENERIC base
+        // reaching here with zero recorded args the same spelling drops every argument —
+        // the nss31w erased-bare-head shape — so refuse it, but only on POSITIVE proof
+        // from the decl: ty_pool cannot tell the two apart on its own, and a decl the
+        // checker never registered (a miss) must not silently condemn every plain struct
+        // arg. This is the one branch whose answer is registry-dependent rather than
+        // kind-dependent; the erased-bare-head class is separately visible as
+        // tc_tid_struct_mono_name returning "" (which every mono tier already treats as
+        // "defer to the string path").
+        let decl = tc_struct_decl_nodes.get(strip_module_qualifier(t.name)) ?? -1
+        if decl == -1 { return true }
+        let tparams_sl = node_type_params(decl)
+        if tparams_sl == -1 { return true }
+        return sublist_length(tparams_sl) == 0
+    }
+    let mut i = 0
+    while i < t.params_count {
+        if !tc_tid_seg_injective(ty_param_list.get(t.params_start + i).unwrap()) { return false }
+        i = i + 1
+    }
+    true
+}
+
+fn tc_tid_tuple_seg_injective(t: TypePoolEntry) -> Bool {
+    let mut i = 0
+    while i < t.params_count {
+        if !tc_tid_inner_seg_injective(ty_param_list.get(t.params_start + i).unwrap()) { return false }
+        i = i + 1
+    }
+    true
+}
+
+// The INNER-position twin, mirroring tc_tid_inner_tag rather than tc_tid_to_c_tag. The two
+// spellers erase DIFFERENTLY and the difference is not cosmetic: a Map spells its key and
+// value here (Option[Map[Str,Int]] → Option_Map_str_int, injective) but erases to a bare
+// "Map" at the top level. List/Set/Iterator/Handle/Channel erase in BOTH positions
+// (tc_tid_inner_tag falls through to tc_tid_scalar_tag → "list"/"set"/…).
+fn tc_tid_inner_seg_injective(tid0: Int) -> Bool {
+    let tid = tc_resolve(tid0)
+    if tid < 0 || tid >= ty_pool.len() { return false }
+    let t = ty_pool.get(tid).unwrap()
+    let k = t.kind
+    if k == TK_STRUCT || k == TK_ENUM { return tc_tid_struct_seg_injective(t) }
+    if k == TK_OPTION { return tc_tid_inner_seg_injective(t.inner1) }
+    if k == TK_RESULT { return tc_tid_inner_seg_injective(t.inner1) && tc_tid_inner_seg_injective(t.inner2) }
+    if k == TK_MAP { return tc_tid_inner_seg_injective(t.inner1) && tc_tid_inner_seg_injective(t.inner2) }
+    if k == TK_TUPLE { return tc_tid_tuple_seg_injective(t) }
+    if k == TK_LIST || k == TK_SET { return false }
+    if k == TK_ITERATOR || k == TK_HANDLE || k == TK_CHANNEL { return false }
+    if k == TK_BYTES { return true }
+    if k == TK_TYPEVAR || k == TK_UNKNOWN || k == TK_VOID { return false }
+    if k == TK_INT || k == TK_FLOAT || k == TK_BOOL || k == TK_STR || k == TK_CHAR { return true }
+    if k == TK_I8 || k == TK_I16 || k == TK_I32 { return true }
+    if k == TK_U8 || k == TK_U16 || k == TK_U32 || k == TK_U64 { return true }
+    false
+}
+
 // A tuple is encodable iff every element's tc_tid_inner_tag is byte-identical to
 // the string path's per-element tag. This slice deliberately allows only the
 // element shapes PROVEN identical, deferring the rest:
@@ -10871,6 +11006,86 @@ pub fn tc_tid_tuple_elem_encodable(tid: Int) -> Bool {
 pub fn tc_seg_from_tid(tid: Int) -> Option[Str] {
     if !tc_tid_encodable(tid) { return None }
     Some(tc_tid_to_c_tag(tid))
+}
+
+// STRUCTURAL type equality over two tids: same kind, same nominal name where the name is
+// load-bearing, same inners, same type-args element-wise.
+//
+// tid INEQUALITY IS NOT TYPE INEQUALITY. new_type appends unconditionally and no
+// make_*_type interns, so constructing Option[Box[Int]] twice mints two tids for one type
+// (decisions/compiler-type-representation.md:39-47 mandates interning; it is not
+// implemented). Anything that wants to know whether two tids denote the same type must ask
+// STRUCTURALLY — never `a == b`, and never by comparing the erasing mono-CSV spellings
+// (tc_tid_to_c_tag drops a container's element, so Set[Int] and Set[Str] both spell "Set").
+//
+// Deliberately conservative on the two axes where a wrong answer misleads:
+//   - the nominal name is compared only for TK_STRUCT / TK_ENUM / TK_TYPEVAR, the kinds
+//     where it distinguishes types. Every other kind's head is fixed by the kind itself,
+//     and make_*_type's `name` for those is decorative — comparing it would report a
+//     spurious difference for two spellings of one type.
+//   - a metavar is resolved first (a pinned α is its solution), and an out-of-range tid
+//     answers false: unknown provenance is never reported as sameness.
+pub fn tc_tid_same_type(a0: Int, b0: Int) -> Bool {
+    let a = tc_resolve(a0)
+    let b = tc_resolve(b0)
+    if a == b { return a >= 0 && a < ty_pool.len() }
+    if a < 0 || a >= ty_pool.len() { return false }
+    if b < 0 || b >= ty_pool.len() { return false }
+    let ta = ty_pool.get(a).unwrap()
+    let tb = ty_pool.get(b).unwrap()
+    if ta.kind != tb.kind { return false }
+    let k = ta.kind
+    if k == TK_STRUCT || k == TK_ENUM || k == TK_TYPEVAR {
+        if ta.name != tb.name { return false }
+    }
+    if (ta.inner1 < 0) != (tb.inner1 < 0) { return false }
+    if (ta.inner2 < 0) != (tb.inner2 < 0) { return false }
+    if ta.inner1 >= 0 && !tc_tid_same_type(ta.inner1, tb.inner1) { return false }
+    if ta.inner2 >= 0 && !tc_tid_same_type(ta.inner2, tb.inner2) { return false }
+    if ta.params_count != tb.params_count { return false }
+    let mut i = 0
+    while i < ta.params_count {
+        let pa = ty_param_list.get(ta.params_start + i).unwrap()
+        let pb = ty_param_list.get(tb.params_start + i).unwrap()
+        if !tc_tid_same_type(pa, pb) { return false }
+        i = i + 1
+    }
+    true
+}
+
+// Triage the slot contradictions merge_arg_tids recorded (br xskbvh). Drained once at the
+// end of generate(), which is why the buffer exists at all: the detector lives in
+// codegen_types, BELOW typecheck in the DAG, and must stay pure — it can see that two
+// concrete tids disagree but not whether they MEAN different things.
+//
+// The split is the whole point. `same_type` is the ty_pool non-interning artefact: two
+// handles on one type, so whichever the join keeps lowers identically — measured as the
+// MAJORITY of the corpus population, and harmless even once the tid is authoritative.
+// `diff_type` is one (base, args) key that genuinely collapsed two different types; a
+// single stored tid cannot be per-instantiation identity for all of them, which is exactly
+// what br qnpb2d must not assume it can read.
+//
+// Spelling is read HERE, after all emission, not at conflict time. Deliberate: pins mutate
+// ty_pool in place and only ever make a type MORE resolved, so classifying late can only
+// turn a "both render as ?" false SAMEness into the real difference — the direction that
+// loses no findings.
+pub fn tc_classify_mono_conflicts() {
+    let mut i = 0
+    while i < mono_slot_conflicts.len() {
+        let c = mono_slot_conflicts.get(i).unwrap()
+        let same = tc_tid_same_type(c.stored, c.incoming)
+        if same {
+            mono_slot_conflicts_same_type = mono_slot_conflicts_same_type + 1
+        } else {
+            mono_slot_conflicts_diff_type = mono_slot_conflicts_diff_type + 1
+        }
+        if dbg_channel_on("monodedup") != 0 {
+            let verdict = if same { "same-type" } else { "DIFF-TYPE" }
+            dbg_trace("monodedup", "slot-conflict-class base={c.base} args={c.args} slot={c.slot} verdict={verdict} stored={c.stored}:{tc_type_str(c.stored)} incoming={c.incoming}:{tc_type_str(c.incoming)}")
+        }
+        i = i + 1
+    }
+    mono_slot_conflicts = []
 }
 
 // Whether a struct type-arg SLOT tid spells byte-identically to the string path's

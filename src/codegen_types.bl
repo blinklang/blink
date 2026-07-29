@@ -4006,21 +4006,32 @@ pub fn get_callee_params_sl(fn_name: Str) -> Int {
     -1
 }
 
-// Slot contradictions seen by merge_arg_tids: two DIFFERENT concrete tids offered for one
-// slot of one (base, args) key. NOT unreachable — MEASURED at 31 hits across 14 fixtures on
-// the 700-fixture corpus, and every one of them is the same mechanism: THE `args` CSV KEY IS
-// NON-INJECTIVE. The clearest exhibit is tests/test_jkdywb_tuple_inline_container.bl, whose
-// `fn wrap[T](x: T) -> (T, Int)` is instantiated at Set[Int], Set[Str] and Set[Point] — all
-// three of which spell the bare segment "Set", so all three share the one mono key
-// "wrap"/"Set" while carrying three distinct tids. That collapse predates this counter and
-// has nothing to do with the join; the join merely made it OBSERVABLE. (The fixture passes
-// because the def side keeps those instantiations apart through the tid memo threaded at the
-// tuple boundary, not through this registry's arg_tids.)
+// Slot contradictions seen by merge_arg_tids: two DIFFERENT tid NUMBERS offered for one slot
+// of one (base, args) key. NOT unreachable — MEASURED at 43 hits across 13 fixtures on the
+// 700-fixture corpus. A count alone cannot be triaged, because two unrelated mechanisms land
+// on it, and they are told apart by comparing the two tids STRUCTURALLY (tc_tid_same_type),
+// never by their numbers and never by the `args` spelling. Measured split, 25 / 18:
 //
-// So read a nonzero count as "the CSV segment lost information", NOT as "a non-canonical tid
-// escaped ty_pool" — that second mechanism (two tids for one FULLY spelled segment) would be
-// the q4etvt class and is a genuine bug, but it is not what the corpus shows. The two are
-// told apart by whether the traced `args` segment names its own type arguments.
+//   25 SAME-TYPE (19 of them over 12 fixtures: Box_Int, Result_Box_Int_str, LocBox_Int,
+//   Option_Box_Int, Option_int, Option_Cmd, Tuple2_Option_int_int, …) — ty_pool does not
+//   intern compound types, so a second Option[Box[Int]] mints a second tid for the same
+//   type. Harmless: either tid lowers identically. (br v76b0b)
+//
+//   18 DIFF-TYPE (all in tests/test_jkdywb_tuple_inline_container.bl) — THE `args` CSV KEY IS
+//   NON-INJECTIVE. Its `fn wrap[T](x: T) -> (T, Int)` is instantiated at Set[Int], Set[Str]
+//   and Set[Point], all of which spell the bare segment "Set", so all three share the one
+//   mono key "wrap"/"Set" while carrying three distinct tids (same for the three Map
+//   instantiations). That collapse predates this counter and has nothing to do with the join;
+//   the join merely made it OBSERVABLE. (The fixture passes because the def side keeps those
+//   instantiations apart through the tid memo threaded at the tuple boundary, not through
+//   this registry's arg_tids.)
+//
+// A DIFF-TYPE hit is NOT automatically a bug: sharing one entry is CORRECT when the segment
+// is representation-keyed, since Set[Int] and Set[Str] are both blink_set* and share one C
+// symbol. What must not happen is a consumer reading per-instantiation IDENTITY off such a
+// slot — tc_tid_seg_injective is the predicate for that, and br qnpb2d is the consumer it
+// gates. A DIFF-TYPE hit on a segment that DOES name its own type arguments would instead be
+// the q4etvt non-canonical-interning class, a genuine bug; the corpus shows none.
 //
 // The tie-break is arbitrary and provably so: rebuilding the whole corpus with `max` instead
 // of `min` emits byte-identical C for all 709 files, so no conflicting slot is load-bearing
@@ -4033,6 +4044,40 @@ pub let mut mono_arg_tid_conflicts: Int = 0
 // the `args` CSV segments and `args` is half the dedup key, so one key cannot disagree on
 // arity even when it is non-injective about segment CONTENT.
 pub let mut mono_arg_tid_arity_conflicts: Int = 0
+
+// One recorded slot contradiction, awaiting CLASSIFICATION by a reader that can spell
+// tids (tc_classify_mono_conflicts, in typecheck.bl).
+//
+// The counter above says only HOW MANY contradictions there were, and that number cannot
+// be triaged: "two handles on the SAME type" (harmless — ty_pool never interns compound
+// types, so a second Option[Box[Int]] mints a second tid) and "two DIFFERENT types
+// sharing one non-injective CSV segment" (a latent miscompile the moment the tid becomes
+// authoritative) both land on it. Telling them apart requires comparing the two tids
+// STRUCTURALLY, which merge_arg_tids may not do: it sits BELOW typecheck in the DAG and
+// its purity is a requirement (see the note on merge_arg_tids). So it records the raw
+// pair here — Int/Str data only, no tid accessor reached — and typecheck classifies.
+pub type MonoSlotConflict {
+    base: Str
+    args: Str
+    slot: Int
+    stored: Int
+    incoming: Int
+}
+// Drained by tc_classify_mono_conflicts at the end of generate(). Bounded by the number
+// of contradictions, which is 31 across the whole 700-fixture corpus.
+pub let mut mono_slot_conflicts: List[MonoSlotConflict] = []
+// Classification results, filled by tc_classify_mono_conflicts.
+//
+// `same_type` is the interning artefact: harmless today and harmless under br qnpb2d,
+// because the two tids denote the same type, so either one lowers identically.
+// `diff_type` is the load-bearing one: one (base, args) key genuinely collapsed two
+// DIFFERENT types, so a single stored tid cannot be per-instantiation identity for both.
+// A nonzero `diff_type` is not automatically a bug — the collapse is CORRECT when the key
+// is representation-keyed (Set[Int] and Set[Str] are both blink_set*, share one C symbol,
+// and must therefore share one registry entry; tc_tid_seg_injective is the predicate for
+// that) — but it is exactly the population br qnpb2d must not read identity out of.
+pub let mut mono_slot_conflicts_same_type: Int = 0
+pub let mut mono_slot_conflicts_diff_type: Int = 0
 
 // The LATTICE JOIN of two arg_tids lists for the same (base, args) key (br p7014w).
 //
@@ -4093,11 +4138,14 @@ pub fn merge_arg_tids(stored: List[Int], incoming: List[Int], base: Str, args: S
         } else if n < 0 {
             out.push(s)
         } else {
-            // Both concrete and different. Not a degradation — either the CSV segment is
-            // non-injective (what the corpus actually shows) or a non-canonical tid escaped
-            // ty_pool. See mono_arg_tid_conflicts for how to tell those apart; the fix for
-            // either is at the TID SOURCE or the KEY, never here.
+            // Both concrete and different. Not a degradation — either the two tids are two
+            // handles on the SAME type (ty_pool does not intern compounds) or the CSV
+            // segment collapsed two DIFFERENT types. Which one cannot be decided here: it
+            // takes a structural comparison of the two tids, and this fn may not spell a
+            // tid. Record the pair for tc_classify_mono_conflicts and keep going; the fix
+            // for either is at the TID SOURCE or the KEY, never here.
             mono_arg_tid_conflicts = mono_arg_tid_conflicts + 1
+            mono_slot_conflicts.push(MonoSlotConflict { base: base, args: args, slot: i, stored: s, incoming: n })
             dbg_trace("monodedup", "slot-conflict base={base} args={args} slot={i} stored={s} incoming={n}")
             // `min` purely so the join stays commutative and associative; a join is what
             // makes the result a function of the registration SET. DO NOT TUNE THIS — the

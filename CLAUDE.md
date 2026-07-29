@@ -66,11 +66,28 @@ stored `arg_tids` gained a slot, `slot-conflict` when two DIFFERENT concrete tid
 for one slot, `arity-conflict` on a length disagreement. `upgrade` is the blast-radius audit
 for br p7014w: zero upgrade lines on a program guarantees its emitted C is unchanged by the
 join a priori, which is a cheaper and stronger argument than a byte-diff. `slot-conflict` is
-NOT a bug in the join — it means the `args` CSV key is non-injective at that segment, e.g.
-`wrap[T]` instantiated at `Set[Int]`/`Set[Str]`/`Set[Point]` all keying as `wrap`/`Set`
-(measured: 31 hits over 14 fixtures, all this shape, all C-neutral). Two tids for a FULLY
-spelled segment would instead be the q4etvt non-canonical-interning class, a real bug — tell
-them apart by whether the traced `args` segment names its own type arguments.); `monofield` (the
+NOT a bug in the join — it means the `(base, args)` key collapsed two tids onto one slot, and
+the join has no way to tell WHY. `slot-conflict-class` is the row that can: emitted once per
+recorded conflict by `tc_classify_mono_conflicts` at the end of `generate()`, with
+`verdict=same-type` or `verdict=DIFF-TYPE` and both tids rendered via `tc_type_str`.
+NEVER discriminate on the tid NUMBERS: `new_type` (`src/typecheck.bl:566`) appends
+unconditionally and `ty_pool` does not intern compound types, so two tids for one type is the
+NORMAL state — the comparison must be structural (`tc_tid_same_type`).
+`verdict=same-type` is that interning artefact and is harmless under br qnpb2d (either tid
+lowers identically). `verdict=DIFF-TYPE` means one key genuinely holds two different types;
+that is CORRECT when the segment is representation-keyed (`Set[Int]` and `Set[Str]` are both
+`blink_set*`, share one C symbol, so they MUST share one registry entry) and the predicate for
+"may this slot be read as per-instantiation identity" is `tc_tid_seg_injective`, not the `args`
+spelling. Measured on the 700-fixture corpus: 43 raw `slot-conflict` rows over 13 fixtures →
+25 same-type and 18 DIFF-TYPE, `arity-conflict` 0. 19 of the same-type rows are spread over 12
+fixtures (`Box_Int`, `Result_Box_Int_str`, `LocBox_Int`, `Option_Box_Int`, `Option_int`,
+`Option_Cmd`, `Tuple2_Option_int_int`, `Tuple2_Result_str_int_int`); the other 24 rows (6
+same-type + ALL 18 DIFF-TYPE) are in `tests/test_jkdywb_tuple_inline_container.bl` alone, and
+every DIFF-TYPE one is container-class (`Set[Int]` vs `Set[Str]`/`Set[Point]`, `Map[Int,Str]`
+vs `Map[Int,NineBox]`/`Map[Point,Int]`). A DIFF-TYPE row
+whose segment DOES name its own type arguments would be a real bug (the q4etvt class) — and
+note rows come in pairs at the generic-fn seam, since `register_mono_fn` and
+`register_mono_instance` both join the same key.); `monofield` (the
 def-side mono SLOT resolvers — `bail=no_ann`/`bail=empty_arg_tids`/`bail=arity` are the recovery
 net `mono_arg_tids_with_ann` giving up, and `binder-survived` is a slot that reached emission still
 spelled as its own type-param binder, i.e. an erasure to `void v;` or `blink_Option_void v;`.
