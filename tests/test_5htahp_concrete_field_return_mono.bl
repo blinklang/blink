@@ -448,16 +448,27 @@ test "a phantom generic type param still ICEs" {
     compile_test_helpers.expect_compile_error(s, "5htahp_phantom", "I0001")
 }
 
-// A CLOSURE's own return annotation is not a mono target yet, and the reason is on the
-// typecheck side, not here: tc_check_body's Closure arm resolves param types but never
-// reads node_type_ann(closure), so no instance tid is memoized on the annotation and
-// tid_ret_target_inst_tid reads -1 (br n8mmry, which also covers the larger half of the
-// same hole — a closure's declared return is never compared against its body at all).
-// The confirmation oracle failing can only ever DECLINE, so this is a loud ICE and
-// never a miscompile. Pinned as a tripwire: when n8mmry lands this goes red, and the
-// fix is to flip it to the MVCE-1 assertions (no I0001, blink_GKV_Int_Str, kops_i64,
-// assert_no_erasure) — the admission logic needs no change for that to work.
-test "a closure's own return annotation does not yet supply a mono target (loud ICE)" {
+// This row used to pin a loud I0001 for the closure form, with the note that when the
+// gap closed the fix was "to flip it to the MVCE-1 assertions (no I0001,
+// blink_GKV_Int_Str, kops_i64, assert_no_erasure) — the admission logic needs no change
+// for that to work." That is exactly what happened, in two independent halves:
+//
+//   * br qnpb2d made the tid authoritative at the struct-literal mono seam, which
+//     resolves the literal's slots and removes the I0001. The prediction held: the
+//     admission logic needed no closure-specific case.
+//   * that unmasked br vmf1k0 — the closure's own RETURN TYPE was still spelled with
+//     the bare head (`static blink_GKV __closure_0`), so the C stopped compiling. Fixed
+//     in src/codegen_closures.bl by expanding the return annotation to its mono stem.
+//
+// br n8mmry is still open and is still the reason the codegen fix reads the annotation
+// sublist rather than a memoized tid — typecheck's Closure arm never looks at
+// node_type_ann(closure), so a closure's declared return is compared against its body
+// nowhere. This row does NOT cover that; it is the codegen half only.
+//
+// Kept as a positive pin rather than dropped: it is the only row in this file whose
+// mono target is reached through a closure, so it is what would catch the closure path
+// regressing back to the bare head independently of tests/test_vmf1k0_*.
+test "a closure's own return annotation reaches the mono target" {
     let mut s = gkv_decl()
     s = s.concat(mkmap_annotated())
     s = s.concat("fn a() -> GKV[Int, Str] \{\n")
@@ -467,9 +478,26 @@ test "a closure's own return annotation does not yet supply a mono target (loud 
     s = s.concat("fn main() \{\n")
     s = s.concat("    let g = a()\n")
     s = s.concat("    g.m.insert(256, \"lo\")\n")
+    s = s.concat("    g.m.insert(512, \"hi\")\n")
     s = s.concat("    assert(g.m.get(256).unwrap() == \"lo\")\n")
+    s = s.concat("    assert(g.m.get(512).unwrap() == \"hi\")\n")
     s = s.concat("}\n")
-    compile_test_helpers.expect_compile_error(s, "5htahp_closure_ret", "I0001")
+    compile_test_helpers.expect_no_error(s, "5htahp_closure_ret_ice", "I0001")
+    let c = compile_test_helpers.compile_and_emit_c(s, "5htahp_closure_ret_c")
+    assert_has(c, "blink_GKV_Int_Str", "closure return mono name")
+    assert_lacks(c, "static blink_GKV __closure_", "closure return bare head")
+    assert_no_erasure(c, "closure return")
+    // The wrong-kops class compiles cleanly, so the kops pair plus the 256/512
+    // round-trip below are the only detectors — same reasoning as every other GKV row.
+    // KEY path only: the `== "lo"` value side compares POINTERS today and passes on
+    // literal interning (br sqbb99, pre-existing — `let g = a()` loses the Map value
+    // type where the annotated twin does not). Swapping in a computed string segfaults
+    // on the baseline too, so leave it literal until sqbb99 lands.
+    assert_has(c, "blink_kops_i64", "closure return int kops present")
+    assert_lacks(c, "blink_kops_str", "closure return string kops absent")
+    let r = compile_test_helpers.compile_and_run(s, "5htahp_closure_ret_run")
+    if r.exit_code != 0 { io.println("FAIL: closure return runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
 }
 
 // ── a type alias as a type argument: pinned as UNREACHABLE, not as admitted ──

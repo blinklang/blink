@@ -21,6 +21,7 @@ import codegen_types.{
     is_emitted_fn, is_enum_type, is_struct_type, list_contains_str, resolve_variant,
     reg_fn_struct_ret, reg_fn_ret_from_ann,
     resolve_ret_type_from_ann, resolve_option_inner_from_ann, build_closure_sig_from_type_ann,
+    mono_name_from_ann, strip_module_qualifier,
     resolve_tuple_ann, tuple_c_name_from_ann,
     append_ev_arg, fn_node_has_effects,
     cg_closure_counter, cg_closure_defs, cg_closure_promoter_defs, cg_closure_param_type_hint,
@@ -941,8 +942,44 @@ pub fn emit_closure(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
     let mut closure_ret_struct = ""
     if ret_type == CT_VOID && ret_str != "Void" && ret_str != "" {
         if is_struct_type(ret_str) != 0 {
-            ret_c_str = c_type_c_name(ret_str)
-            closure_ret_struct = ret_str
+            // br vmf1k0 — the closure twin of ns7qdm (src/codegen.bl:1378). ret_str is
+            // node_return_type, i.e. the BARE head: for `fn() -> GKV[Int, Str]` the
+            // arguments live in the annotation's element sublist, never in the name. So
+            // this binding spelled `blink_GKV`, and because it feeds BOTH the definition
+            // line below and — via closure_ret_struct → :1052 → expr_closure_sig — the
+            // call-site cast, one bare name produced two C errors on a type whose
+            // blink_GKV_Int_Str typedef was already emitted right above it.
+            //
+            // NOT the tid route the plain-fn path uses. `node_type_ann(node)` IS the
+            // return annotation (parser.bl attaches it as `type_ann: ret_ann`), but the
+            // typechecker memoizes instance tids onto fn-DECL return annotations only —
+            // tc_lookup_node_tid on a closure's comes back -1, so
+            // tc_tid_struct_mono_name(...) returns "" and the bare head survives. That
+            // gap is br n8mmry (tc_check_body's Closure arm resolves param types but
+            // never reads node_type_ann(closure)). Read the annotation's own element
+            // sublist instead, exactly as the Option-inner case does
+            // (src/codegen_types.bl:2350). When n8mmry lands, this should move onto the
+            // tid — that is the better end state, but it is a typecheck change, not a
+            // codegen one, so it is not folded in here.
+            //
+            // An empty stem keeps ret_str, which is the correct answer for a NON-generic
+            // struct (`-> Plain` must stay blink_Plain, not gain an empty suffix) and for
+            // a bare/typevar head.
+            //
+            // A CROSS-MODULE generic return is NOT that case and must not be read as one.
+            // strip_module_qualifier is what every other mono_name_from_ann caller passes
+            // (20 sites), and the stem comes back UNQUALIFIED — `GKV_Int_Str`. The module
+            // prefix is then reapplied by c_type_c_name, which resolves through
+            // mod_type_prefix, so the emitted type is blink_gmod_GKV_Int_Str at the
+            // definition, the cast and the `_sr` temp alike. Verified on a two-module
+            // program; the pre-qnpb2d compiler ICEd (I0001) on that same shape.
+            let ret_stem = mono_name_from_ann(strip_module_qualifier(ret_str), node_type_ann(node), -1, [])
+            let stem = if ret_stem != "" { ret_stem } else { ret_str }
+            ret_c_str = c_type_c_name(stem)
+            // The mono stem, not the declared name: reg_fn_struct_ret's contract is the
+            // mono CARRIER (see the ns7qdm comment at its plain-fn caller), so the
+            // call-site `_sr` temp names the typedef'd type.
+            closure_ret_struct = stem
         } else if is_enum_type(ret_str) != 0 {
             ret_c_str = c_type_c_name(ret_str)
         }

@@ -47,14 +47,21 @@ Trace compiler phases: `build/blink run --blink-trace codegen <file.bl>` (also: 
 Fine-grained internal trace: `BLINK_TRACE_CHANNELS=<ch>[,<ch>...|all] build/blink build --emit c <file.bl>` — env-gated `dbg_trace(channel, msg)` taps (defined in ast.bl, the DAG root, so any module can emit). Emits `[dbg:<channel>] ...` to stderr; zero cost when unset. Prefer adding a permanent tap over a throwaway printf+recompile. Current channels: `monotid` (the tid twin's per-slot arg_tid at resolution); `kopsctor` (the
 Set()/Map() ctor's element resolution — raw annotation name, name resolved through the mono
 context, its tid, and the tid's tuple tag; this is where a wrong kops table gets baked);
-`retmono` (which of the tid-native struct-mono tier's declines a struct literal hit, with the CSV
-that path WOULD have answered — the several declines are indistinguishable from outside, all
-producing the same I0001 spelling the string path's answer, and telling "the memo holds only the
-bare base" apart from "concrete but no admission reason fired" is the difference between a
-typecheck memo bug and a missing codegen tier. Also reports `decline=slot_unclassifiable` with
-the offending slot/idx/ct, `decline=nesting_level_mismatch` when the nesting guard stops an inner
-literal from adopting an outer annotation's slot, and `retry=mono_subst` when substituting the
-enclosing mono context is what let the tier answer); `retann` (the def-side return-annotation tier —
+`retmono` (the tid-native struct-mono tier's verdict at every struct literal. Since br qnpb2d that
+tier is the PRIMARY producer at this seam, so a decline is consequential — it hands the site back to
+the string-CSV tier rather than merely losing a tie. Admission is now ONE predicate per slot:
+`admit=slot_encodable` carries the CSV the tier answered with, `decline=slot_unencodable` the
+offending slot/idx/ct. The latter is a genuinely unspellable slot (typevar, unknown, List, fn), NOT a
+policy veto — a slot appearing there is a `tc_struct_slot_encodable` gap to close in the PRODUCER,
+never a reason to re-prefer the string. The three structural declines stay distinct because they mean
+different things: `decline=bare_base` is a memo holding only the bare base (a typecheck memo bug),
+`decline=no_inst_tid` is no per-node instance tid at all, and `decline=nesting_level_mismatch` is the
+guard stopping an inner literal from adopting an outer annotation's slot — now UNCONDITIONAL, because
+`cg_let_target_ann`/`cg_expect_arg_ann` are still not cleared while the field loop emits nested values
+(br 3aa3je). `retry=mono_subst` means substituting the enclosing mono context is what let the tier
+answer. The pre-qnpb2d spellings `decline=slot_unclassifiable`, `decline=ret_target_mismatch`,
+`decline=no_admission_reason` and the `admit=string_target_tid`/`admit=has_ret_target` split are GONE
+— they named the four-lens triad the single predicate replaced); `retann` (the def-side return-annotation tier —
 which gate declined a struct literal in a monomorphized generic fn's tail, or the CSV it resolved
 to; the tier is last-resort, so silence here means an earlier producer answered); `retpin` (every
 `tc_pin_tail_ret_generic` that made it past all four gates, with the declared and inferred types

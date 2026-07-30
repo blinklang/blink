@@ -1,0 +1,303 @@
+// br qnpb2d: make the tid authoritative at the struct-literal monomorphization seam.
+//
+// decisions/compiler-type-representation.md:99-105 stages the type-representation
+// migration; step 4 ("remove writes to old fields; type_id is authoritative") was never
+// done at emit_struct_lit, where a STRING CSV producer outranked the TID producer
+// whenever both could answer.
+//
+// Measured at Stage 0 (734-file corpus): they never both answer. The two tiers PARTITION
+// the population — struct_concrete_args_from_target bails on every compound annotation
+// arg (so a compound-slot instance is tid-only), and an all-scalar instance reaches the
+// tid tier's ret_target block where struct_string_target_in_scope VETOES it (so it is
+// string-only). The tier's abstention IS the polarity, implemented a second time inside
+// the tid path. That is why the selector flip and the veto drop are ONE decision and land
+// together, and why a pure selector flip would have been a provable no-op.
+//
+// THE OBSERVABLE is Box[I64]. resolve_type_name maps I64 -> TYPE_INT
+// (src/typecheck.bl:1013), so the slot tid is TK_INT and spells "Int", while the string
+// tier spells the mono name "Box_I64" off the annotation's bare node name. The two
+// disagree, arg_tids_match_mono_args rejects the parity, arg_tids degrades, and the
+// binder survives to emission:
+//
+//     internal compiler error[UnsolvedTypeVarAtCodegen]:
+//     type parameter 'T' of 'Box_I64.value' reached monomorphization unsolved
+//
+// So Box[I64] is not merely spelled twice today — it is UNUSABLE. Under tid authority it
+// lowers to blink_Box_Int and works.
+//
+// THIS IS DE-DUPLICATION, NOT ERASURE. DECISIONS.md:343 / sections/03_types.md:1153 (6-0)
+// forbid collapsing DISTINCT instantiations onto one C symbol. Box[I64] and Box[Int] are
+// not distinct instantiations: they are ONE type (TYPE_INT) reached by two spellings, so
+// they resolve to one tid and one symbol is the CORRECT answer. The no-erasure floor rows
+// below are what keep that claim honest — genuinely distinct instantiations must still get
+// genuinely distinct symbols. Measured for contrast: I8/I16/I32/U8/U16/U32/U64 each have
+// their own TYPE_* and keep their own distinct symbol; I64 is the sole scalar alias.
+//
+// STAGE SPLIT (why the two I64 rows differ). Both shapes decline identically at baseline
+// (decline=no_admission_reason) and the decline is the VETO, so:
+//   * the fn-return-annotated shape goes green at Stage 2 — dropping the veto lets the
+//     has_ret_target admission fire, since the enclosing fn's return annotation names Box
+//     with a byte-identical CSV;
+//   * the PLAIN LET shape has no enclosing return annotation to confirm against, so
+//     has_ret_target cannot fire for it at all. It goes green only at Stage 3b, when the
+//     admission triad collapses to the single per-slot tc_struct_slot_encodable predicate.
+// Keeping them as separate rows is what makes each stage's regen independently meaningful.
+
+import compile_test_helpers
+import std.io
+
+fn assert_has(c: Str, needle: Str, label: Str) {
+    if !c.contains(needle) { io.println("FAIL: {label} — missing '{needle}'") }
+    assert(c.contains(needle))
+}
+
+fn assert_lacks(c: Str, needle: Str, label: Str) {
+    if c.contains(needle) { io.println("FAIL: {label} — forbidden '{needle}' present") }
+    assert(!c.contains(needle))
+}
+
+fn box_decl() -> Str {
+    "type Box[T] \{ value: T }\n"
+}
+
+// The Stage 2 shape: an enclosing fn RETURN annotation names Box with the same args as
+// the let target, so the has_ret_target admission has something to confirm against once
+// the string-target veto is gone.
+fn src_i64_retann() -> Str {
+    let mut s = box_decl()
+    s = s.concat("fn mk_i64() -> Box[I64] \{\n")
+    s = s.concat("    let a: Box[I64] = Box \{ value: 3 }\n")
+    s = s.concat("    a\n")
+    s = s.concat("}\n")
+    s = s.concat("fn mk_int() -> Box[Int] \{\n")
+    s = s.concat("    let b: Box[Int] = Box \{ value: 4 }\n")
+    s = s.concat("    b\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    assert(mk_i64().value == 3)\n")
+    s = s.concat("    assert(mk_int().value == 4)\n")
+    s = s.concat("}\n")
+    s
+}
+
+// GREEN CONTROL. Str is not an alias of anything, so the tid and the string spell it
+// identically and this row must read blink_Box_Str before AND after the transfer. It is
+// what distinguishes "the tid became authoritative" from "the tid started erasing".
+fn src_str_control() -> Str {
+    let mut s = box_decl()
+    s = s.concat("fn mk() -> Box[Str] \{\n")
+    s = s.concat("    let a: Box[Str] = Box \{ value: \"s\" }\n")
+    s = s.concat("    a\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{ assert(mk().value == \"s\") }\n")
+    s
+}
+
+// GREEN NO-ERASURE FLOOR (DECISIONS.md:343, 6-0). Three genuinely distinct
+// instantiations over two distinct generic bases must yield three distinct C symbols.
+// This is the row that fails if the authority transfer starts collapsing instantiations
+// rather than de-duplicating spellings.
+fn src_no_erasure_floor() -> Str {
+    let mut s = box_decl()
+    s = s.concat("type Pair[A, B] \{ first: A, second: B }\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let a: Box[Int] = Box \{ value: 1 }\n")
+    s = s.concat("    let b: Box[Str] = Box \{ value: \"s\" }\n")
+    s = s.concat("    let c: Pair[Int, Str] = Pair \{ first: 2, second: \"t\" }\n")
+    s = s.concat("    assert(a.value == 1)\n")
+    s = s.concat("    assert(b.value == \"s\")\n")
+    s = s.concat("    assert(c.first == 2)\n")
+    s = s.concat("    assert(c.second == \"t\")\n")
+    s = s.concat("}\n")
+    s
+}
+
+// ── Stage 2: the tid outranks the string target, and the veto is gone ──────────
+
+test "Box[I64] under a matching return annotation lowers through the tid as blink_Box_Int" {
+    let c = compile_test_helpers.compile_and_emit_c(src_i64_retann(), "qnpb2d_i64_ret_c")
+    assert_has(c, "blink_Box_Int", "I64 ret-ann / tid-sourced symbol")
+    assert_lacks(c, "blink_Box_I64", "I64 ret-ann / string-sourced symbol")
+    // The ICE this replaces. Asserting its absence explicitly, because the failure mode
+    // at baseline is a diagnostic rather than a wrong symbol.
+    assert_lacks(c, "UnsolvedTypeVarAtCodegen", "I64 ret-ann / mono binder survived")
+    assert_lacks(c, "_Void", "I64 ret-ann / string-producer erasure")
+    assert_lacks(c, "blink_Box_T ", "I64 ret-ann / bare-binder passthrough")
+}
+
+test "Box[I64] and Box[Int] are one type, so both values round-trip through one symbol" {
+    let r = compile_test_helpers.compile_and_run(src_i64_retann(), "qnpb2d_i64_ret_run")
+    if r.exit_code != 0 { io.println("FAIL: I64 ret-ann runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+}
+
+test "a non-aliased scalar type arg keeps its own spelling" {
+    let c = compile_test_helpers.compile_and_emit_c(src_str_control(), "qnpb2d_str_ctl_c")
+    assert_has(c, "blink_Box_Str", "Str control / symbol")
+    assert_lacks(c, "_Void", "Str control / erasure")
+    let r = compile_test_helpers.compile_and_run(src_str_control(), "qnpb2d_str_ctl_run")
+    if r.exit_code != 0 { io.println("FAIL: Str control runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+}
+
+// ── Stage 3b: one per-slot predicate replaces the admission triad ──────────────
+//
+// The triad (has_compound / has_bound_metavar / has_ret_target, gated on
+// all_plain_scalar) collapses to tc_struct_slot_encodable(tc_tid_resolved(slot)).
+//
+// MEASURED BEFORE WRITING THESE ROWS, so the reds are honestly red and the greens are
+// honestly no-regression. Only ONE of these shapes changes its emitted C:
+//   Box[I64] plain let  decline=ret_target_mismatch -> ICE, no .c   <-- the RED
+//   Box[Void]           decline=slot_unclassifiable, string path spells blink_Box_Void
+//   Box[Point]          decline=no_admission_reason, string path spells blink_Box_Point
+//   Box[Box[Int]]       decline=nesting_level_mismatch (inner), output already correct
+//   Box[Set[..]]        decline=slot_unclassifiable, one shared blink_Box_Set
+// The last four are TIER-ATTRIBUTION changes: the tid tier starts answering where the
+// string tier answered before, and the required outcome is that the C does not move. They
+// are pinned here precisely because "the answer came from a different producer" is
+// invisible in the output — which is the whole hazard this project keeps running into.
+
+// THE STAGE 3b RED. Same Box[I64] type as the Stage 2 row, but a PLAIN LET with no
+// enclosing return annotation, so has_ret_target had nothing to confirm against and the
+// site ICEd even after the veto came off. Under the single predicate the slot resolves to
+// TK_INT, is encodable, and spells "Int" with no confirmation oracle needed.
+fn src_i64_plain_let() -> Str {
+    let mut s = box_decl()
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let b: Box[I64] = Box \{ value: 7 }\n")
+    s = s.concat("    assert(b.value == 7)\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "Box[I64] as a plain let lowers through the tid without a return annotation" {
+    let c = compile_test_helpers.compile_and_emit_c(src_i64_plain_let(), "qnpb2d_i64_let_c")
+    assert_has(c, "blink_Box_Int", "I64 plain let / tid-sourced symbol")
+    assert_lacks(c, "blink_Box_I64", "I64 plain let / string-sourced symbol")
+    assert_lacks(c, "UnsolvedTypeVarAtCodegen", "I64 plain let / mono binder survived")
+    let r = compile_test_helpers.compile_and_run(src_i64_plain_let(), "qnpb2d_i64_let_run")
+    if r.exit_code != 0 { io.println("FAIL: I64 plain let runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+}
+
+// Void is an ordinary INHABITED, encodable type (DECISIONS.md:342,
+// decisions/under-determined-types.md:38-42, 6-0). tc_struct_slot_encodable admits TK_VOID
+// (src/typecheck.bl:11295), so the tid tier now answers here — and must spell exactly what
+// the string tier spelled.
+//
+// TRAP, recorded because it is the mistake this project already made once (br hsgsbp
+// reverted a subtask for it): the fix that makes this row pass is NOT adding CT_VOID to
+// tid_slot_is_plain_scalar. CT_VOID is also tk_to_ct's fall-through for
+// TK_TYPEVAR/TK_UNKNOWN/TK_FN, so keying on the CT would admit unsolved metavars as if
+// they were Void. The predicate keys on the KIND, which is what makes it safe.
+fn src_box_void() -> Str {
+    let mut s = box_decl()
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let b: Box[Void] = Box \{ value: () }\n")
+    s = s.concat("    assert(true)\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "a genuine Void type argument still spells Box_Void once the tid tier owns the slot" {
+    let c = compile_test_helpers.compile_and_emit_c(src_box_void(), "qnpb2d_void_c")
+    assert_has(c, "blink_Box_Void", "Box[Void] / symbol unchanged across the tier handover")
+    assert_lacks(c, "blink_Box_T ", "Box[Void] / bare-binder passthrough")
+    let r = compile_test_helpers.compile_and_run(src_box_void(), "qnpb2d_void_run")
+    if r.exit_code != 0 { io.println("FAIL: Box[Void] runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+}
+
+// The br f6ytg4 bare-struct exclusion: all_plain_scalar deliberately restricted bare-struct
+// slots out of the has_ret_target admission because their string side reads get_var_struct,
+// which may keep a module qualifier the tid side strips. tc_struct_slot_encodable admits
+// TK_STRUCT (br q4etvt made both paths spell a cross-module slot the same), so the slot is
+// now carried — and this SAME-MODULE row pins that the ordinary case does not move.
+fn src_box_point() -> Str {
+    let mut s = "type Point \{ x: Int, y: Int }\n"
+    s = s.concat(box_decl())
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let b: Box[Point] = Box \{ value: Point \{ x: 1, y: 2 } }\n")
+    s = s.concat("    assert(b.value.x == 1)\n")
+    s = s.concat("    assert(b.value.y == 2)\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "a bare-struct type argument keeps its spelling once the tid tier owns the slot" {
+    let c = compile_test_helpers.compile_and_emit_c(src_box_point(), "qnpb2d_point_c")
+    assert_has(c, "blink_Box_Point", "Box[Point] / symbol unchanged across the tier handover")
+    assert_lacks(c, "_Void", "Box[Point] / erasure")
+    let r = compile_test_helpers.compile_and_run(src_box_point(), "qnpb2d_point_run")
+    if r.exit_code != 0 { io.println("FAIL: Box[Point] runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+}
+
+// THE ANTI-REGRESSION FOR MAKING THE NESTING GUARD UNCONDITIONAL. cg_let_target_ann /
+// cg_expect_arg_ann are matched by BARE struct name and are NOT cleared while the field
+// loop emits nested values (br 3aa3je), so the INNER literal here also sees the outer
+// annotation's tid and would name itself blink_Box_Box_Int, lowering its own field to
+// blink_Box_Int — self-referential and undeclared. The guard used to run only when
+// has_struct_inst was set; with the triad gone there is no such flag, so it must run
+// always. If it is ever made conditional again, this row breaks.
+fn src_box_box_int() -> Str {
+    let mut s = box_decl()
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let b: Box[Box[Int]] = Box \{ value: Box \{ value: 7 } }\n")
+    s = s.concat("    assert(b.value.value == 7)\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "a nested struct-instance slot still declines at the inner level" {
+    let c = compile_test_helpers.compile_and_emit_c(src_box_box_int(), "qnpb2d_nest_c")
+    assert_has(c, "blink_Box_Box_Int", "Box[Box[Int]] / outer symbol")
+    assert_has(c, "blink_Box_Int", "Box[Box[Int]] / inner symbol kept distinct")
+    // The field must be the INNER mono type, not a self-reference to the outer.
+    assert_has(c, "blink_Box_Int value;", "Box[Box[Int]] / field lowers to the inner mono")
+    assert_lacks(c, "blink_Box_Box_Int value;", "Box[Box[Int]] / self-referential typedef")
+    let r = compile_test_helpers.compile_and_run(src_box_box_int(), "qnpb2d_nest_run")
+    if r.exit_code != 0 { io.println("FAIL: Box[Box[Int]] runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+}
+
+// A SHARED symbol that is CORRECT, and therefore the row that keeps the no-erasure floor
+// above from being read as "never share a symbol". Set[Int] and Set[Str] are both
+// blink_set*, so Box[Set[Int]] and Box[Set[Str]] genuinely are one C type and one
+// blink_Box_Set must serve both. tc_tid_seg_injective is false for these slots, which is
+// why Stage 3a's tripwire stays silent here while firing on Box[Int]/Box[Str]. Both
+// values are kept alive simultaneously so a wrong-kops collapse fails at RUNTIME — a
+// clean cc proves nothing for this shape (the hnyqe4 class).
+fn src_box_set_shared() -> Str {
+    let mut s = box_decl()
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let a: Box[Set[Int]] = Box \{ value: Set() }\n")
+    s = s.concat("    let b: Box[Set[Str]] = Box \{ value: Set() }\n")
+    s = s.concat("    assert(a.value.insert(1))\n")
+    s = s.concat("    assert(b.value.insert(\"s\"))\n")
+    s = s.concat("    assert(a.value.len() == 1)\n")
+    s = s.concat("    assert(b.value.len() == 1)\n")
+    s = s.concat("    assert(a.value.contains(1))\n")
+    s = s.concat("    assert(b.value.contains(\"s\"))\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "a representation-keyed slot correctly shares one symbol" {
+    let c = compile_test_helpers.compile_and_emit_c(src_box_set_shared(), "qnpb2d_set_c")
+    assert_has(c, "blink_Box_Set", "Box[Set[..]] / one shared symbol")
+    let r = compile_test_helpers.compile_and_run(src_box_set_shared(), "qnpb2d_set_run")
+    if r.exit_code != 0 { io.println("FAIL: Box[Set[..]] runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+}
+
+test "distinct instantiations keep distinct C symbols" {
+    let c = compile_test_helpers.compile_and_emit_c(src_no_erasure_floor(), "qnpb2d_floor_c")
+    assert_has(c, "blink_Box_Int", "no-erasure floor / Box[Int]")
+    assert_has(c, "blink_Box_Str", "no-erasure floor / Box[Str]")
+    assert_has(c, "blink_Pair_Int_Str", "no-erasure floor / Pair[Int,Str]")
+    assert_lacks(c, "_Void", "no-erasure floor / erasure")
+    let r = compile_test_helpers.compile_and_run(src_no_erasure_floor(), "qnpb2d_floor_run")
+    if r.exit_code != 0 { io.println("FAIL: no-erasure floor runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+}

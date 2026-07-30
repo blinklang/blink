@@ -1,0 +1,170 @@
+// br qnpb2d Stage 3a: pre-arm the no-erasure tripwire before the admission widens.
+//
+// DECISIONS.md:343 / sections/03_types.md:1153 (6-0) forbid collapsing DISTINCT
+// instantiations onto one C symbol. The existing mono_slot_conflicts_diff_type counter
+// cannot enforce that, because a DIFF-TYPE row is not automatically a violation: when the
+// (base, args) key is REPRESENTATION-KEYED, the collapse is CORRECT and required. Set[Int]
+// and Set[Str] are both blink_set*, share one C symbol, and must therefore share one
+// registry entry. All 18 DIFF-TYPE rows in the corpus today are of exactly that excusable
+// container class (tests/test_jkdywb_tuple_inline_container.bl).
+//
+// So `diff_type` has a nonzero floor and cannot be asserted == 0. This file adds the
+// counter that CAN be: mono_slot_conflicts_diff_type_injective, which counts only the
+// conflicts where BOTH tids' segments name their own type arguments
+// (tc_tid_seg_injective) — i.e. two genuinely distinct instantiations that the key
+// nevertheless collapsed. That population must be empty, and its zero is the arming
+// premise for Stage 3b (CLAUDE.md:117-124: state the premise, re-measure before trusting).
+//
+// tc_tid_seg_injective is used here strictly as an ADJUDICATOR — it classifies a conflict
+// that already happened. Its header (src/typecheck.bl:10874-10880) forbids using it as a
+// GATE to degrade a slot to -1, and nothing here does that.
+//
+// BOTH POLARITIES ARE ASSERTED, which is the point of the file: a counter that only ever
+// reads 0 is indistinguishable from a counter that is never incremented (see
+// CLAUDE.md's note that a zero-hit sweep is an unexercised tap, not coverage). Row 2
+// constructs a real violation by hand and requires the tripwire to fire on it.
+//
+// LIMIT, stated deliberately: this only sees conflicts registered within ONE compilation
+// unit. Cross-TU collapse is invisible to it and is filed as its own successor.
+
+import compiler.{compile_to_program}
+import typecheck.{
+    check_types, tc_lookup_node_tid, tc_type_str, tc_tid_seg_injective,
+    tc_classify_mono_conflicts
+}
+import codegen_types.{
+    register_mono_fn, mono_slot_conflicts_diff_type,
+    mono_slot_conflicts_same_type, mono_slot_conflicts_diff_type_injective
+}
+import parser.{nodes}
+import std.io
+// Bare, and load-bearing for the same reason as tests/test_p7014w_*: codegen_types
+// resolves several globals it cannot import out of the MERGED program, and codegen_expr is
+// the smallest root whose transitive closure closes every one of those back-references.
+// Verified by removing it: the link then fails on `expr_list_elem_struct undeclared`.
+// It DOES draw a W[UnusedImport] — nothing is selected from it — which is expected noise
+// here, not a sign the import is removable.
+import codegen_expr
+
+fn assert_eq_int(got: Int, want: Int, label: Str) {
+    if got != want { io.println("FAIL: {label} — got {got}, want {want}") }
+    assert(got == want)
+}
+
+fn assert_eq_bool(got: Bool, want: Bool, label: Str) {
+    if got != want { io.println("FAIL: {label} — got {got}, want {want}") }
+    assert(got == want)
+}
+
+// Two instantiations of an ERASING carrier (Set — one blink_set* serves every element
+// type) and two of a FAITHFUL one (Box[T] spells its slot). That contrast is the whole
+// classification.
+fn probe_src() -> Str {
+    #"type Box[T] {
+    v: T
+}
+
+fn main() {
+    let a: Set[Int] = Set()
+    let b: Set[Str] = Set()
+    let c: Box[Int] = Box { v: 1 }
+    let d: Box[Str] = Box { v: "x" }
+    assert(a.len() == 0)
+    assert(b.len() == 0)
+    assert(c.v == 1)
+    assert(d.v == "x")
+}
+"#
+}
+
+fn harvest_type_tids() -> Map[Str, Int] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let path = "build/qnpb2d_3a_probe_src.bl"
+    write_file(path, probe_src())
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    fs.remove(path)
+    let mut m: Map[Str, Int] = Map()
+    let mut idx = 0
+    let n = nodes.len()
+    while idx < n {
+        let tid = tc_lookup_node_tid(idx)
+        if tid >= 0 {
+            m.insert(tc_type_str(tid), tid)
+        }
+        idx = idx + 1
+    }
+    m
+}
+
+fn expect_tid(m: Map[Str, Int], key: Str) -> Int {
+    let tid = m.get(key) ?? -1
+    if tid == -1 { io.println("FAIL: harvested map has no tid for '{key}'") }
+    assert(tid != -1)
+    tid
+}
+
+test "the injective-conflict tripwire distinguishes an excusable collapse from a violation" {
+    let m = harvest_type_tids()
+
+    let set_int = expect_tid(m, "Set[Int]")
+    let set_str = expect_tid(m, "Set[Str]")
+    let box_int = expect_tid(m, "Box[Int]")
+    let box_str = expect_tid(m, "Box[Str]")
+
+    // The classification premise, asserted rather than assumed — if tc_tid_seg_injective
+    // ever changed its answer for these shapes, both rows below would still "pass" while
+    // measuring nothing.
+    assert_eq_bool(tc_tid_seg_injective(set_int), false, "premise/Set[Int] non-injective")
+    assert_eq_bool(tc_tid_seg_injective(set_str), false, "premise/Set[Str] non-injective")
+    assert_eq_bool(tc_tid_seg_injective(box_int), true, "premise/Box[Int] injective")
+    assert_eq_bool(tc_tid_seg_injective(box_str), true, "premise/Box[Str] injective")
+
+    // Drain anything the harvest left pending so the deltas below are attributable.
+    tc_classify_mono_conflicts()
+
+    // ── row 1: EXCUSABLE. One (base, args) key holding Set[Int] and Set[Str] is a
+    // DIFF-TYPE conflict, but both segments erase to a bare "Set", so one registry entry
+    // genuinely serves both and the tripwire must NOT fire.
+    let d0 = mono_slot_conflicts_diff_type
+    let i0 = mono_slot_conflicts_diff_type_injective
+    let s0 = mono_slot_conflicts_same_type
+    register_mono_fn("qnpb2d_3a_set", "Set", [set_int])
+    register_mono_fn("qnpb2d_3a_set", "Set", [set_str])
+    tc_classify_mono_conflicts()
+    assert_eq_int(mono_slot_conflicts_diff_type - d0, 1, "row1/diff_type counted")
+    assert_eq_int(mono_slot_conflicts_diff_type_injective - i0, 0, "row1/tripwire silent (excusable)")
+    assert_eq_int(mono_slot_conflicts_same_type - s0, 0, "row1/not misfiled as same-type")
+
+    // ── row 2: VIOLATION. Box[Int] and Box[Str] each name their own type argument, so
+    // blink_Box_Int and blink_Box_Str are distinct C symbols and one key cannot serve
+    // both. This is the shape DECISIONS.md:343 forbids, and the tripwire must fire.
+    let d1 = mono_slot_conflicts_diff_type
+    let i1 = mono_slot_conflicts_diff_type_injective
+    register_mono_fn("qnpb2d_3a_box", "Box", [box_int])
+    register_mono_fn("qnpb2d_3a_box", "Box", [box_str])
+    tc_classify_mono_conflicts()
+    assert_eq_int(mono_slot_conflicts_diff_type - d1, 1, "row2/diff_type counted")
+    assert_eq_int(mono_slot_conflicts_diff_type_injective - i1, 1, "row2/tripwire FIRES (violation)")
+}
+
+// A same-type conflict must reach neither diff counter. This is the guard against
+// "arm the tripwire by counting every conflict", which would pass row 2 while making the
+// corpus floor unreachable — 25 same-type rows exist today.
+test "a same-type conflict trips neither diff counter" {
+    let m = harvest_type_tids()
+    let box_int = expect_tid(m, "Box[Int]")
+    tc_classify_mono_conflicts()
+
+    let d0 = mono_slot_conflicts_diff_type
+    let i0 = mono_slot_conflicts_diff_type_injective
+    let s0 = mono_slot_conflicts_same_type
+    // Distinct tid HANDLES are the normal state — new_type appends unconditionally and
+    // ty_pool does not intern compound types — so this is only a conflict at the numeric
+    // level. tc_tid_same_type must see through it.
+    register_mono_fn("qnpb2d_3a_same", "Box", [box_int])
+    register_mono_fn("qnpb2d_3a_same", "Box", [box_int])
+    tc_classify_mono_conflicts()
+    assert_eq_int(mono_slot_conflicts_diff_type - d0, 0, "row3/no diff_type")
+    assert_eq_int(mono_slot_conflicts_diff_type_injective - i0, 0, "row3/tripwire silent")
+    assert_eq_int(mono_slot_conflicts_same_type - s0, 0, "row3/identical tids are not a conflict at all")
+}
