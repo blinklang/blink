@@ -18,29 +18,38 @@
 // cg_expect_arg_ann / cg_let_target_ann, and infer_struct_type_args has no
 // CT_MAP/CT_SET arm. Both halves declined a question they could both answer.
 //
-// THE FIX IS ADMISSION, NOT SPELLING: a third admission reason, has_ret_target,
-// gated on (a) every slot a plain scalar, (b) NO string-target tier in scope, and
-// (c) the enclosing fn's return-annotation instance tid spelling a BYTE-IDENTICAL
-// mono-args CSV.
+// THE FIX 5htahp SHIPPED WAS ADMISSION, NOT SPELLING — and it has since been REPLACED.
+// That fix added a third admission reason, has_ret_target, gated on (a) every slot a
+// plain scalar, (b) NO string-target tier in scope, and (c) the enclosing fn's
+// return-annotation instance tid spelling a BYTE-IDENTICAL mono-args CSV. Br qnpb2d
+// collapsed all three into the single per-slot predicate
+// tc_struct_slot_encodable(tc_tid_resolved(slot)) in tid_native_struct_mono_slots.
+// Read (a)-(c) and the two "WHY" paragraphs below as HISTORY: the trace tags they quote
+// (decline=no_admission_reason, admit=has_ret_target) are no longer emitted by any tap.
+// What survives is the HAZARD each condition defended against, and both are re-pinned by
+// live rows further down.
 //
-// WHY (b) IS LOAD-BEARING. The working annotated-target twin declines at the SAME
-// gate with the SAME csv=Int,Str:
+// WHY (b) WAS LOAD-BEARING. The working annotated-target twin declined at the SAME gate
+// with the SAME csv=Int,Str:
 //     let g: GKV[Int, Str] = GKV { m: Map() }
 //     [dbg:retmono] sname=GKV inst_tid=430 count=2 decline=no_admission_reason csv=Int,Str
-// It compiles today only because the string let-target tier answers instead. Every
-// currently-working shape reaches this decline, so admitting them to the tid path
-// would move them off the string path and forfeit byte-identity. Condition (b) is
-// what keeps them where they are.
+// It compiled then only because the string let-target tier answered instead. Every shape
+// working at the time reached this decline, so admitting them to the tid path would have
+// moved them off the string path and forfeited byte-identity. Condition (b) is what kept
+// them where they were — a parity concern, not a correctness one, which is why qnpb2d
+// could drop it and make the tid tier deliberately AUTHORITATIVE at this seam.
 //
-// WHY (c) IS DEFENCE, NOT TRUST. The return annotation is in scope for the WHOLE
-// body, unlike cg_expect_arg_ann / cg_let_target_ann which are set and restored per
-// value context. A return TIER on tid_native_struct_inst_tid would therefore misname
-// `let y = Box { v: "s" }` inside `fn f() -> Box[Int]` as blink_Box_Int — its only
-// net is `tc_tid_struct(inst) != sname`, and both are "Box". CSV equality makes that
-// sibling decline, makes ns7qdm's nested inner literal decline ("Int" != "Box_Int"),
-// and makes a declared/body mismatch decline — so a mismatched program still reaches
-// a loud I0001 even if skdxkv's E0300 ever regresses. The return annotation is a
-// CONFIRMATION ORACLE, never an instance source.
+// WHY (c) WAS DEFENCE, NOT TRUST. The return annotation is in scope for the WHOLE body,
+// unlike cg_expect_arg_ann / cg_let_target_ann which are set and restored per value
+// context. A return TIER on tid_native_struct_inst_tid would therefore misname
+// `let y = Box { v: "s" }` inside `fn f() -> Box[Int]` as blink_Box_Int — its only net is
+// `tc_tid_struct(inst) != sname`, and both are "Box". CSV equality made that sibling
+// decline, made ns7qdm's nested inner literal decline ("Int" != "Box_Int"), and made a
+// declared/body mismatch decline. THAT HAZARD IS STILL REAL; what guards it now is the
+// unconditional nesting guard in tid_native_struct_mono_slots, which compares the
+// literal's OWN memoized tid against the CSV it is about to be named with rather than
+// trusting a whole-body proxy, plus skdxkv's upstream E0300 for the declared/body
+// mismatch.
 //
 // WHY THE kops ASSERTION IS THE LOAD-BEARING ONE (same reasoning as y1n3ck). A fix
 // that gets the mono NAME right while leaving the Map field's element type unresolved
@@ -288,19 +297,22 @@ test "sibling instances round-trip independently at runtime" {
     assert_eq(r.exit_code, 0)
 }
 
-// ── the same-named-sibling decline: the reason (c) exists ────────────────────
+// ── the same-named sibling: an unannotated local keeps its own instance ──────
 // A NON-return literal of the same base inside a fn whose return names that base.
 // The return annotation is in scope for the whole body, so a naive return tier would
 // name `Box { v: "s" }` blink_Box_Int — its only net would be
 // `tc_tid_struct(inst) != sname`, and both are "Box".
 //
-// The local is deliberately UNANNOTATED, which is what makes this row exercise gate
-// (c) and not gate (b): an annotated `let y: Box[Str]` would put a string target in
-// scope and decline one gate earlier, leaving CSV equality untested. Measured with
-// BLINK_TRACE_CHANNELS=retmono on this exact program — two admission decisions in one
-// function body, discriminated on nothing but the CSV:
-//     [dbg:retmono] sname=Box inst_tid=430 count=1 decline=ret_target_mismatch csv=Str
-//     [dbg:retmono] sname=Box inst_tid=432 count=1 admit=has_ret_target csv=Int
+// The local is deliberately UNANNOTATED, so nothing puts a string let-target in scope and
+// the tid tier is the only producer in play. Measured with BLINK_TRACE_CHANNELS=retmono on
+// this exact program — two admission decisions in one function body:
+//     [dbg:retmono] sname=Box inst_tid=430 count=1 admit=slot_encodable csv=Str
+//     [dbg:retmono] sname=Box inst_tid=431 count=1 admit=slot_encodable csv=Int
+// BOTH are admitted, each named from its OWN memoized instance tid — which is what the row
+// pins: the enclosing return annotation does not leak its args into the sibling. When this
+// row was written the discrimination was a CSV compare against that annotation (gate (c)
+// in the header above); qnpb2d replaced it with per-slot encodability plus the nesting
+// guard, and the outcome is unchanged.
 
 test "a same-named non-return sibling is not renamed by the return annotation" {
     let mut s = "type Box[T] \{ v: T }\n"
@@ -322,14 +334,24 @@ test "a same-named non-return sibling is not renamed by the return annotation" {
     assert_eq(r.exit_code, 0)
 }
 
-// The gate-(b) twin of the row above: the same sibling WITH a let annotation, which is
-// the shape the string target tier already owns. It must keep its own instance for a
-// different reason — struct_string_target_in_scope declines before the CSV is ever
-// compared — and that is precisely the decline that preserves byte-identity for every
-// currently-working annotated shape in the repo. Both gates pinned separately, so
-// narrowing or widening either one has a row that notices.
+// The twin of the row above: the same sibling WITH a let annotation. When this row was
+// written the annotation made the string target tier the owner, because the tid tier
+// vetoed its own admission whenever a string target annotation was in scope. Br qnpb2d
+// deleted that veto and made the tid authoritative, so BOTH siblings are now named by the
+// tid tier. Measured on the current tree:
+//
+//     [dbg:retmono] sname=Box inst_tid=430 count=1 admit=slot_encodable csv=Str
+//     [dbg:retmono] sname=Box inst_tid=432 count=1 admit=slot_encodable csv=Int
+//
+// The annotated sibling keeps its own instance because the tid tier spells the ANNOTATED
+// instance's slot (csv=Str) and wins outright — `tid_wins` is taken before
+// `string_target_wins` in the tier-order branch at src/codegen_expr.bl:6408-6415 (the two
+// booleans themselves are set at :6219 / :6222) — not because anything declines. The row
+// still earns its keep: it pins that the annotation does not leak the enclosing return
+// instance's args into the sibling, which is the failure the veto used to prevent
+// structurally.
 
-test "an annotated same-named sibling stays on the string target tier" {
+test "an annotated same-named sibling gets its own instance from the tid tier" {
     let mut s = "type Box[T] \{ v: T }\n"
     s = s.concat("fn f() -> Box[Int] \{\n")
     s = s.concat("    let y: Box[Str] = Box \{ v: \"s\" }\n")
@@ -349,17 +371,20 @@ test "an annotated same-named sibling stays on the string target tier" {
     assert_eq(r.exit_code, 0)
 }
 
-// ── the nested-inner decline (ns7qdm's shape) ───────────────────────────────
+// ── the nested-inner literal (ns7qdm's shape) ───────────────────────────────
 // Under `-> Box[Box[Int]]` the INNER literal's own CSV is "Int" while the return
-// annotation's is "Box_Int". CSV equality declines the inner, so the outer's existing
-// handling stays authoritative and the inner is not misnamed after the outer.
+// annotation's is "Box_Int". The inner must not be named after the outer.
 //
-// Inner written INLINE rather than via an annotated local, for the same reason as the
-// row above: an annotated local would decline at gate (b) and never reach the CSV
-// compare. Measured on this program:
-//     [dbg:retmono] sname=Box inst_tid=434 count=1 decline=ret_target_mismatch csv=Int ret_tid=199
-// The outer literal never reaches this gate at all — its slot is a struct instance, so
-// the slot loop bails to the string path before any admission reason is considered.
+// Inner written INLINE rather than via an annotated local, for the same reason as the row
+// above: no string let-target tier in scope, so the tid tier owns both literals. Measured
+// on this program:
+//     [dbg:retmono] sname=Box inst_tid=435 count=1 admit=slot_encodable csv=Box_Int
+//     [dbg:retmono] sname=Box inst_tid=434 count=1 admit=slot_encodable csv=Int
+// BOTH are admitted now — including the OUTER, whose slot is a struct INSTANCE. When this
+// row was written the slot loop bailed on instance slots and the outer never reached the
+// gate at all; br 6cvvh8 admitted them. The inner still spells "Int" because the NESTING
+// GUARD compares the literal's own memoized tid against the CSV it is about to be named
+// with, not because a CSV-equality admission declines it.
 
 test "a nested inner literal is not named after the outer return annotation" {
     let mut s = "type Box[T] \{ v: T }\n"

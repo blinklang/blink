@@ -10234,25 +10234,27 @@ pub fn tc_tid_map_key_tid(tid: Int) -> Int {
 // Same -1 / "" sentinel contract as the inner accessors: tc_tid_ct returns -1
 // for a tid tk_to_ct can't map to concrete storage (typevar/tuple/fn/unknown),
 // and tc_tid_struct returns "" unless the tid is itself a struct/enum.
+//
+// THIS FUNCTION IS DELIBERATELY NON-RESOLVING, and that is load-bearing. It reads
+// ty_pool.get(tid).kind directly, so a metavar that tc_pin_generic_args_from_binds
+// bound IN PLACE (kind stays TK_UNKNOWN, solution stashed in inner1) reads back
+// TK_UNKNOWN -> CT_VOID -> -1. Callers here depend on that -1: a bound-but-typevar
+// tid must not masquerade as concrete storage. A caller that instead wants the real
+// ct of a bound `a_k := Int` composes tc_tid_resolved with this, or uses one of the
+// surviving resolving twins in the m1wspm family — tc_tid_set_elem_ct_resolved /
+// tc_tid_map_key_ct_resolved (live at src/codegen_expr.bl:2607, the kops ctor).
+// A direct resolving twin of THIS function existed and was deleted with its last caller;
+// re-adding one is fine, folding resolution INTO this function is not.
+//
+// TRAP, and the reason this warning lives here rather than only at the seam: do NOT
+// key a struct-slot admission gate on a CT at all. tk_to_ct maps TK_VOID, TK_TYPEVAR,
+// TK_UNKNOWN and TK_FN all onto CT_VOID, so a CT-keyed slot gate admits unsolved
+// metavars as if they were a genuine Void — the inversion br hsgsbp had to reverse
+// once already. Slot gates key on the KIND (tc_struct_slot_encodable); the same trap
+// is restated at the seam itself, src/codegen_expr.bl:5663-5666.
 pub fn tc_tid_ct(tid: Int) -> Int {
     if tid < 0 || tid >= ty_pool.len() { return -1 }
     let ct = tk_to_ct(ty_pool.get(tid).unwrap().kind)
-    if ct == CT_VOID { return -1 }
-    ct
-}
-
-// Resolving twin of tc_tid_ct, in the same family as the Map/Set accessor twins
-// above (m1wspm). tc_tid_ct reads ty_pool.get(tid).kind directly, so a metavar
-// that tc_pin_generic_args_from_binds bound IN PLACE (kind stays TK_UNKNOWN,
-// solution stashed in inner1) reads back TK_UNKNOWN -> CT_VOID -> -1. Wrapping in
-// tc_resolve surfaces the real ct of a bound a_k := Int. Deliberately NOT folded
-// into tc_tid_ct: callers there depend on a bound-but-typevar tid reading as -1
-// (see the note at the Map/Set twins).
-pub fn tc_tid_ct_resolved(tid: Int) -> Int {
-    if tid < 0 || tid >= ty_pool.len() { return -1 }
-    let r = tc_resolve(tid)
-    if r < 0 || r >= ty_pool.len() { return -1 }
-    let ct = tk_to_ct(ty_pool.get(r).unwrap().kind)
     if ct == CT_VOID { return -1 }
     ct
 }
@@ -10412,7 +10414,8 @@ pub fn tc_tid_struct_slot_seg(slot: Int) -> Str {
 // TK_TUPLE arm, whose comment records that tc_tid_to_c_tag's tuple spelling
 // (tc_tid_tuple_tag -> Tuple2_int_int) byte-matches the struct-lit string path's
 // registered tuple carrier segment. Before this arm a tuple type arg left
-// has_compound at 0 in tid_native_struct_mono_args, so `GT[(Int, Int)]` hit the
+// has_compound at 0 in the tid tier's then-triad admission (now the single
+// tc_struct_slot_encodable in tid_native_struct_mono_slots), so `GT[(Int, Int)]` hit the
 // bail and reached codegen with no mono args at all — error[I0001] "mono args 'Void'".
 //
 // Permissive (tc_tid_tuple_encodable) rather than scalar-elements-only, because both
@@ -11233,8 +11236,8 @@ pub fn tc_classify_mono_conflicts() {
 //     branch's own comment below.
 //   - Option/Result over encodable inners, Tuple (tc_tid_tuple_encodable), Map over
 //     encodable inners, and Set are now ADMITTED (br kffj8d): the string path spells a
-//     compound slot via the SAME tc_tid_to_c_tag (tid_native_struct_mono_args' compound
-//     branch → "Option_int" / "Result_int_str" / "Tuple2_int_int" / bare "Map"/"Set"),
+//     compound slot via the SAME tc_tid_to_c_tag (tid_instance_mono_args_csv, the tid
+//     tier's one speller → "Option_int" / "Result_int_str" / "Tuple2_int_int" / bare "Map"/"Set"),
 //     and the def-side reader round-trips it byte-identically. Each shape's inner gate
 //     mirrors the general tc_tid_encodable's own arm, so admitting it here never widens
 //     past what the string path already spelled. See the per-shape arms below.
@@ -11264,8 +11267,8 @@ pub fn tc_struct_slot_encodable(tid: Int) -> Bool {
     }
     // Compound slots (br kffj8d): a struct type-arg SLOT that is itself an
     // Option/Result over encodable inners is now ADMITTED. The string path spells the
-    // slot via the SAME tc_tid_to_c_tag (tid_native_struct_mono_args' compound branch
-    // → "Option_int" / "Result_int_str"), and the def-side reader (resolve_tparam_via_tid
+    // slot via the SAME tc_tid_to_c_tag (tid_instance_mono_args_csv, the tid tier's one
+    // speller → "Option_int" / "Result_int_str"), and the def-side reader (resolve_tparam_via_tid
     // → tc_seg_from_tid → tc_tid_to_c_tag) round-trips it byte-identically, so carrying
     // the real tid keys the mono dedup without changing emitted C. Gated on the general
     // tc_tid_encodable for the inner, exactly like tc_tid_to_c_tag's own recursion — a
