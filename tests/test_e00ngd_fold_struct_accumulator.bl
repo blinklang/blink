@@ -1,0 +1,57 @@
+// br e00ngd: `list.fold` with a STRUCT-typed accumulator erased the init type to "Void",
+// collapsing two distinct instantiations onto one C symbol.
+//
+// The list-HOF seam in emit_method_call built its mono CSV as
+// `"{elem_name},{init_name}"` where both names came from type_name_from_ct. That helper
+// has no CT_STRUCT arm, so a struct accumulator fell through to "Void" — and the seam's
+// only erasure guard, `elem_name != "Void"`, screens the ELEMENT and never the INIT.
+//
+// So both folds below mangled the SAME symbol, blink_list_fold_Int_Void. `--emit c`
+// exited 0 with no diagnostic; the C compile then failed with
+//     error: request for member 'n' in something not a structure or union
+// which is the "silent wrong C" class the mono chokepoints exist to prevent — the symbol
+// said Void while the def-side field types came from arg_tids and said AccA/AccB.
+//
+// This is a REACHABILITY guard, not merely a runtime one: with the two accumulators
+// collapsed the program does not compile at all. The assertions below pin the values so a
+// future collapse that happens to still compile is caught too.
+//
+// The fix is at the PRODUCER (qnpb2d I5): the seam renders its CSV from its own arg_tids
+// via mono_csv_from_arg_tids, and init_tid — already in hand at that line — spells AccA
+// and AccB correctly. Do not re-guard by widening type_name_from_ct; the string CSV
+// producer is gone.
+
+type AccA {
+    n: Int = 0
+}
+
+type AccB {
+    s: Str = ""
+}
+
+test "fold with two distinct struct accumulators keeps distinct C symbols" {
+    let nums: List[Int] = [1, 2, 3]
+
+    let a = nums.fold(AccA { n: 0 }, fn(acc: AccA, x: Int) -> AccA { AccA { n: acc.n + x } })
+    assert_eq(a.n, 6)
+
+    let b = nums.fold(AccB { s: "" }, fn(acc: AccB, x: Int) -> AccB { AccB { s: acc.s.concat("{x}") } })
+    assert_eq(b.s, "123")
+}
+
+// A single struct accumulator alone is enough to erase the init segment; the two-fold
+// shape above is what turns the erasure into a COLLISION. Keep both rows: if only the
+// collision is tested, a fix that spells "Void" consistently for every struct would pass.
+test "fold with one struct accumulator does not erase its init segment" {
+    let nums: List[Int] = [10, 20]
+    let a = nums.fold(AccA { n: 5 }, fn(acc: AccA, x: Int) -> AccA { AccA { n: acc.n + x } })
+    assert_eq(a.n, 35)
+}
+
+// Control: the scalar accumulator that always worked must keep working, and must keep
+// its own symbol (blink_list_fold_Int_Int) distinct from the struct ones.
+test "fold with a scalar accumulator is unaffected" {
+    let nums: List[Int] = [1, 2, 3, 4]
+    let s = nums.fold(0, fn(acc: Int, x: Int) -> Int { acc + x })
+    assert_eq(s, 10)
+}

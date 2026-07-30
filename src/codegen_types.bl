@@ -1192,25 +1192,6 @@ pub let mut generic_fns: List[GenericFnEntry] = []
 // get_generic_fn_node lookups. Kept in lockstep with generic_fns.
 pub let mut generic_fns_by_name: Map[Str, Int] = Map()
 
-// Bundled per-argument metadata for a generic-fn call, threaded into
-// infer_fn_type_args_from_types / emit_generic_fn_call_tail. Each list is
-// indexed by argument position (parallel to the callee's params).
-// For Result/Option carriers the ok/inner slot is (elem_types, struct_names);
-// the err slot is (err_elem_types, err_struct_names). Option leaves the err
-// slot empty (no err position).
-pub type GenericCallArgs {
-    types: List[Int]
-    elem_types: List[Int]
-    err_elem_types: List[Int]
-    closure_sigs: List[Str]
-    struct_names: List[Str]
-    err_struct_names: List[Str]
-    map_key_types: List[Int]
-    map_key_structs: List[Str]
-    map_val_types: List[Int]
-    map_val_structs: List[Str]
-}
-
 // Mono function instances to emit: (base_fn_name, concrete_args)
 // arg_tids: the per-tparam concrete type-ids that produced `args`, positionally
 // aligned with the CSV segments (codegen-structured-tids D1b, br ec5qgb). Empty
@@ -4224,253 +4205,6 @@ pub fn register_mono_fn(base: Str, args: Str, arg_tids: List[Int]) ! Codegen.Reg
     mono_fns.push(MonoFnInstance { base: base, args: args, arg_tids: arg_tids })
 }
 
-// Canonical inner-carrying tag (Option_<inner>, Result_<ok>_<err>) for a whole
-// Option/Result argument at position `fi`, built from the inner types the call
-// site captured in GenericCallArgs. Uses the struct/enum name when present, else
-// the scalar tag — matching compound_option_inner_name / compound_name_from_ann
-// so downstream decoders (c_type_c_name, canonical_struct_tag) round-trip it to
-// blink_Option_<inner>. Keeps generic mono keys distinct per inner type.
-fn compound_tag_from_ca(ca: GenericCallArgs, fi: Int, arg_ct: Int) -> Str {
-    let ok_sn = ca.struct_names.get(fi).unwrap()
-    let ok_ct = ca.elem_types.get(fi).unwrap()
-    let ok_tag = if ok_sn != "" { ok_sn } else { c_type_tag(ok_ct) }
-    if arg_ct == CT_OPTION {
-        return "Option_{ok_tag}"
-    }
-    let err_sn = ca.err_struct_names.get(fi).unwrap()
-    let err_ct = ca.err_elem_types.get(fi).unwrap()
-    let err_tag = if err_sn != "" { err_sn } else { c_type_tag(err_ct) }
-    "Result_{ok_tag}_{err_tag}"
-}
-
-pub fn infer_fn_type_args_from_types(fn_node: Int, ca: GenericCallArgs) -> Option[Str] {
-    let tparams_sl = node_type_params(fn_node)
-    if tparams_sl == -1 {
-        return None
-    }
-    let num_params = sublist_length(tparams_sl)
-    if num_params == 0 {
-        return None
-    }
-    let fn_params_sl = node_params(fn_node)
-    if fn_params_sl == -1 {
-        return None
-    }
-    let mut args = ""
-    let mut pi = 0
-    while pi < num_params {
-        let param_name = node_name(sublist_get(tparams_sl, pi))
-        // Starts ERASED, not Void. If no arm below claims this tparam, the slot was never
-        // resolved — that is an erasure, and br hsgsbp separated it from a genuine Void so
-        // the downstream chokepoints can tell them apart. Before the split both spelled
-        // "Void" and a hand-written `Box[Void]` was refused as if it were unsolved.
-        let mut resolved = ICE_SEG_ERASED_SLOT
-        let mut fi = 0
-        while fi < sublist_length(fn_params_sl) && fi < ca.types.len() {
-            let p = sublist_get(fn_params_sl, fi)
-            let ptype = node_type_name(p)
-            if ptype == param_name {
-                let arg_ct = ca.types.get(fi).unwrap()
-                let arg_sn = ca.struct_names.get(fi).unwrap()
-                if (arg_ct == CT_STRUCT || arg_ct == CT_ENUM) && arg_sn != "" {
-                    resolved = arg_sn
-                } else if arg_ct == CT_OPTION || arg_ct == CT_RESULT {
-                    // Whole Option/Result bound to a bare-typevar param `x: T`.
-                    // Neither speller can name these (type_name_from_ct answers "Void",
-                    // type_arg_name_from_ct the erasure sentinel); instead thread
-                    // the canonical inner-carrying tag (Option_str, Result_int_str)
-                    // built from the inner types the call site captured in `ca`.
-                    // This keeps mono keys distinct per inner (no wrap_Option
-                    // collision) and lets the param/return/tuple carriers resolve
-                    // to blink_Option_<inner> instead of blink_void (qm01e7).
-                    resolved = compound_tag_from_ca(ca, fi, arg_ct)
-                } else {
-                    // Map/List/Set etc. erase to a single uniform C carrier, so
-                    // the bare name (type_name_from_ct) is sufficient.
-                    resolved = type_arg_name_from_ct(arg_ct)
-                }
-            } else if ptype == "List" {
-                let ta = node_type_ann(p)
-                if ta != -1 {
-                    let elems_sl = node_elements(ta)
-                    if elems_sl != -1 && sublist_length(elems_sl) > 0 {
-                        let elem_ann = sublist_get(elems_sl, 0)
-                        let elem_name = node_name(elem_ann)
-                        if elem_name == param_name {
-                            let elt = ca.elem_types.get(fi).unwrap()
-                            if elt >= 0 {
-                                resolved = type_arg_name_from_ct(elt)
-                            }
-                        } else if elem_name == "Tuple" && fi < ca.struct_names.len() {
-                            let arg_tuple_cname = ca.struct_names.get(fi).unwrap()
-                            let tup_elems_sl = if arg_tuple_cname != "" { node_elements(elem_ann) } else { -1 }
-                            let entry_idx = if tup_elems_sl != -1 { find_tuple_entry(arg_tuple_cname) } else { -1 }
-                            if entry_idx >= 0 {
-                                let entry = emitted_tuple_entries.get(entry_idx).unwrap()
-                                let arity = sublist_length(tup_elems_sl)
-                                let mut ti = 0
-                                let mut found = false
-                                while ti < arity && !found {
-                                    let tslot_ann = sublist_get(tup_elems_sl, ti)
-                                    if node_name(tslot_ann) == param_name {
-                                        let es = get_tuple_entry_elem_struct(entry.elem_structs, ti)
-                                        if es != "" {
-                                            resolved = es
-                                        } else {
-                                            let et = get_tuple_entry_elem_type(entry.elem_types, ti)
-                                            resolved = type_arg_name_from_ct(et)
-                                        }
-                                        found = true
-                                    }
-                                    ti = ti + 1
-                                }
-                            }
-                        }
-                    }
-                }
-            } else if ptype == "Map" {
-                let ta = node_type_ann(p)
-                if ta != -1 {
-                    let elems_sl = node_elements(ta)
-                    if elems_sl != -1 && sublist_length(elems_sl) >= 2 {
-                        let key_ann = sublist_get(elems_sl, 0)
-                        let val_ann = sublist_get(elems_sl, 1)
-                        if node_name(key_ann) == param_name && fi < ca.map_key_types.len() {
-                            let aks = ca.map_key_structs.get(fi).unwrap()
-                            if aks != "" {
-                                resolved = aks
-                            } else {
-                                let akt = ca.map_key_types.get(fi).unwrap()
-                                if akt >= 0 && akt != CT_VOID {
-                                    resolved = type_arg_name_from_ct(akt)
-                                }
-                            }
-                        }
-                        if node_name(val_ann) == param_name && fi < ca.map_val_types.len() {
-                            let avs = ca.map_val_structs.get(fi).unwrap()
-                            if avs != "" {
-                                resolved = avs
-                            } else {
-                                let avt = ca.map_val_types.get(fi).unwrap()
-                                if avt >= 0 && avt != CT_VOID {
-                                    resolved = type_arg_name_from_ct(avt)
-                                }
-                            }
-                        }
-                    }
-                }
-            } else if ptype == "Result" || ptype == "Option" {
-                // Generic Result[T,E] / Option[T] param: infer from the
-                // payload of the Ok(...)/Some(...)/Err(...) call argument.
-                // Both positions thread now: the ok/inner side via
-                // struct_names[fi] / elem_types[fi] and the err side via
-                // err_struct_names[fi] / err_elem_types[fi] (all set at the
-                // call site by arg_struct_name_for / arg_elem_type_for and
-                // their arg_err_* counterparts).
-                let ta = node_type_ann(p)
-                if ta != -1 {
-                    let elems_sl = node_elements(ta)
-                    if elems_sl != -1 && sublist_length(elems_sl) >= 1 {
-                        let ok_ann = sublist_get(elems_sl, 0)
-                        if node_name(ok_ann) == param_name {
-                            let arg_sn = ca.struct_names.get(fi).unwrap()
-                            if arg_sn != "" {
-                                resolved = arg_sn
-                            } else {
-                                let elt = ca.elem_types.get(fi).unwrap()
-                                if elt >= 0 && elt != CT_VOID {
-                                    resolved = type_arg_name_from_ct(elt)
-                                }
-                            }
-                        }
-                        if ptype == "Result" && sublist_length(elems_sl) >= 2 {
-                            let err_ann = sublist_get(elems_sl, 1)
-                            if node_name(err_ann) == param_name {
-                                let err_sn = ca.err_struct_names.get(fi).unwrap()
-                                if err_sn != "" {
-                                    resolved = err_sn
-                                } else {
-                                    let eet = ca.err_elem_types.get(fi).unwrap()
-                                    if eet >= 0 && eet != CT_VOID {
-                                        resolved = type_arg_name_from_ct(eet)
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            } else if is_struct_type(ptype) != 0 || is_enum_type(ptype) != 0 {
-                // Generic user struct/enum param (Box[T] / Tree[T]) — extract the
-                // concrete type-args from the actual argument's mono name. The arm is
-                // kind-agnostic: lookup_mono_base recovers (base, args CSV) for both a
-                // struct instance (Box_Int) and an enum instance (Tree_Int, br 82ajft),
-                // and the annotation slot naming param_name selects the arg. This is the
-                // codegen fallback the tid mono-CSV defers to for a recursive/forwarding
-                // self-call inside a generic body (`count(l)` where l's slot tid is still
-                // abstract) — without it the arg falls through with T unresolved (_Void).
-                let ta = node_type_ann(p)
-                if ta != -1 && fi < ca.struct_names.len() {
-                    let arg_sname = ca.struct_names.get(fi).unwrap()
-                    if arg_sname != "" {
-                        let mi = lookup_mono_base(arg_sname)
-                        if mi.base == ptype && mi.args != "" {
-                            let elems_sl = node_elements(ta)
-                            if elems_sl != -1 {
-                                let mut ei = 0
-                                while ei < sublist_length(elems_sl) {
-                                    let elem_ann = sublist_get(elems_sl, ei)
-                                    if node_name(elem_ann) == param_name {
-                                        let extracted = nth_type_arg(mi.args, ei)
-                                        if extracted != "" {
-                                            resolved = extracted
-                                        }
-                                    }
-                                    ei = ei + 1
-                                }
-                            }
-                        }
-                    }
-                }
-            } else if ptype == "Fn" {
-                let ta = node_type_ann(p)
-                if ta != -1 {
-                    let fn_elems_sl = node_elements(ta)
-                    if fn_elems_sl != -1 {
-                        let mut fpi = 0
-                        while fpi < sublist_length(fn_elems_sl) {
-                            let fp_ann = sublist_get(fn_elems_sl, fpi)
-                            let fp_name = node_name(fp_ann)
-                            if fp_name == param_name {
-                                let csig = ca.closure_sigs.get(fi).unwrap()
-                                let inner_ct = infer_closure_param_type(csig, fpi)
-                                if inner_ct != CT_VOID {
-                                    resolved = type_arg_name_from_ct(inner_ct)
-                                }
-                            }
-                            fpi = fpi + 1
-                        }
-                    }
-                    let fn_ret = node_return_type(ta)
-                    if fn_ret == param_name {
-                        let csig = ca.closure_sigs.get(fi).unwrap()
-                        let ret_ct = infer_closure_ret_type(csig)
-                        if ret_ct != CT_VOID {
-                            resolved = type_arg_name_from_ct(ret_ct)
-                        }
-                    }
-                }
-            }
-            fi = fi + 1
-        }
-        if pi > 0 {
-            args = args.concat(",")
-        }
-        args = args.concat(resolved)
-        pi = pi + 1
-    }
-    Some(args)
-}
-
 fn infer_closure_param_type(sig: Str, param_idx: Int) -> Int {
     if sig == "" { return CT_VOID }
     let star_pos = sig.index_of("*)")
@@ -4544,8 +4278,9 @@ pub fn type_name_from_ct(ct: Int) -> Str {
     else { "Void" }
 }
 
-// The TYPE-ARGUMENT spelling of a CT, for the mono-CSV producers only
-// (infer_fn_type_args_from_types, infer_struct_type_args). Same answers as
+// The TYPE-ARGUMENT spelling of a CT, for the mono-CSV producers only — which since
+// br 3fc3pn means infer_struct_type_args alone, the fn-call twin having been deleted
+// with the rest of the string CSV. Same answers as
 // type_name_from_ct for every CT that HAS a name; the difference is what it says when
 // there is none.
 //
@@ -6719,6 +6454,26 @@ pub fn push_td_guard_close() {
     cg_lines.push("#endif")
 }
 
+// KNOWN GAP, carrier-position Void (br dq15j7 / vbcw1e). This fn emits NOTHING for a
+// CT_VOID inner — the three early returns immediately below — while option_c_type still
+// NAMES the type blink_Option_void. So `type QBox[T] { v: Option[T] }` instantiated at
+// Void references a typedef that was never defined. Until that is closed, the encodability
+// gates REFUSE a genuine Void carrier inner on purpose: admitting it trades a located
+// I0001 for an opaque cc error.
+//
+// emit_result_typedef's int64_t leaf (:6481-6482) is NOT a template to copy here. It keys
+// on CT_VOID alone, and because type_from_name collapses every unknown name onto CT_VOID,
+// a CT-keyed rule in a CARRIER position would swallow an ERASED inner into a well-typed
+// field instead of failing the C compile — losing the `void <name>;` tripwire CLAUDE.md
+// describes as load-bearing.
+//
+// There is a SECOND defect behind the same gate that this typedef is not the whole of: the
+// struct literal spelled `None` at T=Void as blink_Option_int, a mistyped carrier from a
+// different speller. Carrier-position Void is its own mechanism and its own ticket.
+//
+// (This note used to live on tc_poly_inner_encodable in typecheck.bl. That gate existed
+// only to keep the tid CSV byte-matching the string CSV twin and died with it in br
+// 3fc3pn, so the rationale was moved to the emitter it actually describes.)
 pub fn emit_option_typedef(inner: Int) ! Codegen.Emit {
     if inner == CT_VOID { return }
     let tag = c_type_tag(inner)

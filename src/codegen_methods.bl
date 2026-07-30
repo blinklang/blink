@@ -3,7 +3,6 @@ import codegen_types.{
     CT_CHAR, CT_FLOAT, CT_HANDLE, CT_HANDLER, CT_I8, CT_I16, CT_I32, CT_U8, CT_U16, CT_U32, CT_U64, CT_INSTANT, CT_INT, CT_ITERATOR, CT_LIST, CT_MAP,
     CT_OPTION, CT_PTR, CT_RESULT, CT_SET, CT_STRING, CT_STRINGBUILDER,
     CT_ENUM, CT_STRUCT, CT_TEMPLATE, CT_VOID,
-    GenericCallArgs,
     append_ev_arg, c_fn_name, c_type_c_name, c_type_c_name_in, c_type_from_tag, c_type_str, c_type_tag, c_type_tag_for_struct, canonical_struct_tag, derive_method_cname,
     cg_async_scope_stack, cg_async_wrapper_counter, cg_closure_defs,
     cg_closure_param_type_hint, cg_current_fn_name, cg_handler_body_idx,
@@ -43,7 +42,7 @@ import codegen_types.{
     cg_expect_fn_value_sig, cg_expect_arg_ann, arg_type_ann_at, get_callee_params_sl,
     builtin_receiver_type_name,
     is_sized_int_ct, lookup_builtin_trait_impl, lookup_impl_method, impl_method_reg_name, impl_trait_for_method, impl_type_implements_trait_method, mangle_generic_name, mangle_impl_method_q, mangle_from_method, synthesized_display_call, render_result_arm_value, wrapping_unsigned_c_type,
-    option_c_type, option_inner_ct_from_tag, option_inner_struct_from_tag, reg_fn, reg_fn_ret_type, reg_fn_ret_struct_inner, reg_fn_with_effects, register_mono_fn, register_mono_instance,
+    option_c_type, option_inner_ct_from_tag, option_inner_struct_from_tag, reg_fn, reg_fn_ret_type, reg_fn_ret_struct_inner, reg_fn_struct_ret, reg_fn_with_effects, register_mono_fn, register_mono_instance,
     poly_impl_method_node, poly_impl_block_node, is_poly_impl_base,
     resolve_import_alias, resolve_ptr_inner_c, resolve_struct_from_c_name, get_var_ffi_ptr_struct, is_ffi_ptr_array_var,
     ffi_alloc_n_pending, ffi_offset_pending_struct,
@@ -67,9 +66,10 @@ import diagnostics.{
     TEMPLATE_MISMATCH, UNRESOLVED_METHOD,
     FFI_OFFSET_ON_SINGLETON, FFI_OFFSET_UNKNOWN_STRIDE,
     WITH_PTR_BODY_TOO_COMPLEX, FFI_SCOPE_NOT_WITH_RESOURCE,
+    ICE_SEG_ERASED_SLOT,
 }
 import ast.{NodeKind, is_block_bearing}
-import typecheck.{tc_lookup_node_tid, tc_tid_ct, tc_tid_struct, tc_tid_struct_mono_name, tc_tid_tuple_sname, tc_tid_list_elem, tc_struct_slot_encodable, tc_poly_elem_slot_encodable, tc_seg_from_tid, tc_type_str, is_import_module_name, tc_qualifier_to_module_or_self, suggest_module_member}
+import typecheck.{tc_lookup_node_tid, tc_tid_ct, tc_tid_struct, tc_tid_struct_mono_name, tc_tid_tuple_sname, tc_tid_list_elem, tc_struct_slot_encodable, tc_seg_from_tid, tc_type_str, is_import_module_name, tc_qualifier_to_module_or_self, suggest_module_member}
 
 // Arg offset for trait-qualified builtin calls: MapOps.contains_key(m, k) has receiver at args[0]
 let mut btc_arg_offset: Int = 0
@@ -122,83 +122,42 @@ fn emit_panic_tag_check_render(tmp: Str, tag_val: Int, msg_prefix: Str, rendered
     emit_line("if ({tmp}.tag == {tag_val}) \{ {emit_panic_site(\"panic: {msg_prefix}: %s at {file}:{loc}\", \", {rendered_expr}\")} }")
 }
 
-// ms4ctb: build the concrete type-args CSV for a poly-impl call on a builtin
-// List receiver. The canonical form `impl[T] Trait[T] for List[T]` has each
-// impl binder appear as the List's element type, so every binder resolves to
-// the receiver list's concrete element type. Struct/enum elements use their
-// CANONICAL C tag (c_type_tag_for_struct — dot-free, module-qualified so a
-// cross-module element yields a valid C identifier, br dwhm4v); scalars use the
-// CT-derived name. This CSV feeds mangle_generic_name and the mono-registry
-// (the PHYSICAL symbol), so it must be the dot-free physical spelling. The CSV
-// order follows binder order (mangle_generic_name indexes positionally by
-// binder). Return-type substitution does NOT read this CSV — it lowers the element
-// name from the interned tids via poly_impl_ret_arg_tids + resolve_tparam_via_tid.
-fn poly_impl_concrete_args(im: Int, obj_str: Str, recv_node: Int) -> Str {
-    let binders_sl = node_impl_binders(im)
-    let elem_ct = get_list_elem_type(obj_str)
-    let elem_struct = get_list_elem_struct(obj_str)
-    // br 4c3gts: a COMPOUND element (`List[Option[Int]]`) has no struct name and
-    // its CT (CT_OPTION/CT_RESULT/CT_MAP) has no type_name_from_ct arm, so the
-    // string path below spells it "Void" — collapsing every compound instance to
-    // the single symbol `..._Void` (a C-level collision + Void-return miscompile).
-    // When the element tid is poly-slot-encodable (a same-module compound over
-    // bare inners), spell it via the tid path (tc_seg_from_tid → "Option_int"),
-    // which is the SAME segment poly_impl_concrete_arg_tids carries and the
-    // def-side resolve_tparam_via_tid resolves — byte-identical by construction.
-    // A cross-module compound stays unencodable and keeps the string spelling
-    // (defers to the tk8qbv path). tc_tid_to_c_tag already erases a scalar / bare
-    // struct element to the same tag the string path spells, so an encodable
-    // scalar/struct element is also safe here (no behavior change for those).
-    let elem_tid = tc_tid_list_elem(tc_lookup_node_tid(recv_node))
-    let tid_seg = if tc_poly_elem_slot_encodable(elem_tid) { tc_seg_from_tid(elem_tid) } else { None }
-    let elem_name = if tid_seg.is_some() {
-        tid_seg.unwrap()
-    } else if elem_struct != "" {
-        c_type_tag_for_struct(elem_struct)
-    } else {
-        type_name_from_ct(elem_ct)
-    }
-    build_binder_csv(binders_sl, elem_name)
-}
-
-fn build_binder_csv(binders_sl: Int, elem_name: Str) -> Str {
-    let mut csv = ""
-    let mut bi = 0
-    while bi < sublist_length(binders_sl) {
-        if bi > 0 { csv = csv.concat(",") }
-        csv = csv.concat(elem_name)
-        bi = bi + 1
-    }
-    csv
-}
-
-// tid twin of poly_impl_concrete_args: the concrete element tid per binder. The
-// canonical `impl[T] Trait[T] for List[T]` binds every binder to the receiver
-// list's element type, so each binder's tid is inner1 of the receiver List tid
-// (memoized on the call's object node). Positionally aligned with
-// poly_impl_concrete_args' CSV.
+// The concrete element tid per binder, and the SOLE producer of the poly-impl mono
+// CSV (br 3fc3pn) — emit_poly_impl_call renders that CSV from this list via
+// mono_csv_from_arg_tids, so the symbol and the def-side slot types come from one
+// value and cannot disagree. The canonical `impl[T] Trait[T] for List[T]` binds every
+// binder to the receiver list's element type, so each binder's tid is inner1 of the
+// receiver List tid (memoized on the call's object node).
 //
-// Only carry the element tid when it is slot-encodable — a scalar or a bare
-// unqualified struct/enum, where tc_tid_to_c_tag round-trips to the same segment
-// the CSV twin spells via type_name_from_ct / get_list_elem_struct. Store -1 for
-// every other element (a struct-INSTANCE like Box[Int], or a compound like
-// Option[Int]): the mangling twin spells those as the bare carrier / "Void", so the
-// tid path's inner-carrying tag (tc_tid_to_c_tag -> "Box" / tc_seg_from_tid ->
-// "Option_int") would DIVERGE from the mangled symbol. -1 keeps the def side off the
-// tid path for that slot, matching the mangled name exactly (br ec5qgb; mirrors the
-// register_struct_instance_from_tid gate). Also -1 when the receiver tid is not a
-// resolvable List (tc_tid_list_elem = -1), so both cases stay byte-safe.
+// The element tid is carried UNGATED. It used to pass tc_poly_elem_slot_encodable and
+// store -1 otherwise, purely so the tid could not out-spell the string CSV twin
+// (poly_impl_concrete_args, deleted): that twin spelled a struct element via the raw
+// QUALIFIED get_list_elem_struct through c_type_tag_for_struct, which emits only the
+// struct HEAD. With the twin gone the gate protects nothing and actively caused br
+// gdq426 — a qualified GENERIC element (`multifile_helper.HelperBox[Int]`) was declined,
+// fell to the twin, and mangled to the type-argument-free `multifile_helper_HelperBox`,
+// colliding every instantiation onto one C symbol with an erased `void` param.
 //
-// NOTE: -1 is no longer a free "defer to the string resolver" — that resolver is gone.
+// Measured before removing the gate (temporary `polycsv` tap, 13 hand-built element
+// shapes — scalars, bare containers, tuples, compounds, same-module struct instances,
+// qualified bare structs and enums — plus the 726-file corpus): the ungated tid spelling
+// AGREED with whichever branch the string took in every shape but that one, where the
+// tid was the correct speller. A qualified BARE struct is not affected (it already took
+// the tid branch), so the axis is the qualified reference to a GENERIC struct, not
+// cross-module-ness.
+//
+// -1 remains only for an unresolvable receiver (tc_tid_list_elem = -1). It is NOT a
+// "defer to the string resolver" — that resolver is gone — so it renders as
+// ICE_SEG_ERASED_SLOT and is caught at the mono_args_has_void_seg I0001 chokepoint.
 //
 // The one thing that still recovers a -1 slot is `mono_arg_tids_with_ann`
 // (src/codegen_stmt.bl), reached from the two mono TYPEDEF emitters. It does NOT read
-// the concrete_args CSV — an earlier version of this comment named a
-// `resolve_mono_field_type` that NEVER EXISTED (br fes70z: `git log -S` finds it only as
-// added comment text, never as a definition), and the CSV mechanism it advertised is what
-// decisions/compiler-type-representation.md:104 forbids and br 0n07he deleted. What the net
-// actually does is recover the slot from a tid MEMOIZED ON THE SOURCE ANNOTATION NODE
-// (MonoInstance.ann), so no string is parsed for a type param.
+// the CSV — an earlier version of this comment named a `resolve_mono_field_type` that
+// NEVER EXISTED (br fes70z: `git log -S` finds it only as added comment text, never as a
+// definition), and the CSV mechanism it advertised is what
+// decisions/compiler-type-representation.md:104 forbids and br 0n07he deleted. What the
+// net actually does is recover the slot from a tid MEMOIZED ON THE SOURCE ANNOTATION
+// NODE (MonoInstance.ann), so no string is parsed for a type param.
 //
 // It BAILS, returning the list untouched, in four cases: `ann == -1`; no -1 hole to fill; an
 // EMPTY arg_tids (no hole to find — which is why merge_arg_tids treats arity as information,
@@ -211,15 +170,9 @@ fn poly_impl_concrete_arg_tids(im: Int, recv_node: Int) -> List[Int] {
     let mut tids: List[Int] = []
     let binders_sl = node_impl_binders(im)
     let elem_tid = tc_tid_list_elem(tc_lookup_node_tid(recv_node))
-    // tc_POLY_elem_slot_encodable, not the general tc_struct_slot_encodable: the
-    // poly-impl CSV twin (poly_impl_concrete_args) spells a cross-module element via
-    // the raw QUALIFIED get_list_elem_struct (br dwhm4v), which does not round-trip
-    // through tc_seg_from_tid — so a module-qualified element must store -1 here even
-    // though q4etvt relaxed the general slot gate to admit it (br q4etvt).
-    let carried = if tc_poly_elem_slot_encodable(elem_tid) { elem_tid } else { -1 }
     let mut bi = 0
     while bi < sublist_length(binders_sl) {
-        tids.push(carried)
+        tids.push(elem_tid)
         bi = bi + 1
     }
     tids
@@ -232,11 +185,13 @@ fn poly_impl_concrete_arg_tids(im: Int, recv_node: Int) -> List[Int] {
 // (tc_seg_from_tid). This is the only path now — the dotted string CSV it replaced
 // (poly_impl_resolution_args) is deleted.
 //
-// Unlike poly_impl_concrete_arg_tids, this does NOT apply the strict
-// tc_poly_elem_slot_encodable gate: that gate exists to keep the MANGLING CSV twin
-// byte-identical to the physical symbol, whereas the RETURN path only needs a valid
-// downstream name and BARE is the established convention (matching the 7 other
-// bare-storing RETURN-path producers). So carry the raw element tid and let
+// This carries the raw element tid with no encodability gate — and since br 3fc3pn so does
+// poly_impl_concrete_arg_tids, so the two paths now agree. They used to differ: the arg-tid
+// path applied a strict tc_poly_elem_slot_encodable gate whose only job was keeping the
+// MANGLING CSV byte-identical to the string twin's physical symbol. Both the twin and the
+// gate are deleted, so nothing distinguishes the two paths any more. BARE remains the
+// RETURN-path convention (matching the 7 other bare-storing RETURN-path producers). Carry
+// the raw element tid and let
 // resolve_tparam_via_tid's tc_seg_from_tid admission decide: an encodable tid
 // (scalar / bare struct / struct instance) yields its bare-or-physical segment; an
 // unencodable tid (or -1 when the receiver is not a resolvable List) returns None and
@@ -254,27 +209,29 @@ fn poly_impl_return_elem_tids(im: Int, recv_node: Int) -> List[Int] {
     tids
 }
 
-// ENCODABILITY gate for the mono-registration sites that carry per-slot tids alongside a
-// string CSV (the stdlib list-ops list_fold/for_each/any/all here, and
-// emit_generic_fn_call_tail's free-fn path in codegen_expr). A slot keeps its concrete tid
-// when tc_seg_from_tid can spell it at all, and stores -1 when it cannot — an unencodable
-// tid, or a -1 from an unresolvable receiver.
+// ENCODABILITY gate for the mono-registration sites that carry per-slot tids (the stdlib
+// list-ops list_fold/for_each/any/all here, and emit_generic_fn_call_tail's free-fn path in
+// codegen_expr). A slot keeps its concrete tid when tc_seg_from_tid can spell it at all, and
+// stores -1 when it cannot — an unencodable tid, or a -1 from an unresolvable receiver.
 //
 // What this used to ALSO do, and no longer does (br fsa9gf): compare the spelled segment
-// against the CSV segment mangling actually used, and veto the slot on any byte
-// divergence. The two CSVs can genuinely come from different walkers — `ta_str`
-// (codegen_expr.bl:3245-3250) is tc_mono_csv (tid-derived) OR
-// infer_fn_type_args_from_types (string inference), and tc_mono_csv is all-or-nothing, so
-// a 2-tparam call with one unspellable slot routes the WHOLE CSV to the string walker
-// while tc_mono_tids_core still holds a good tid for the other slot. The comparison
-// therefore vetoed slots that were fine, and its removal is what br fsa9gf asked for.
+// against the CSV segment mangling actually used, and veto the slot on any byte divergence.
+// That comparison guarded a hazard that br 3fc3pn then removed at its root. The hazard was
+// TWO WALKERS: `ta_str` came from tc_mono_csv (tid-derived, all-or-nothing) OR
+// infer_fn_type_args_from_types (string inference), so a 2-tparam call with one unspellable
+// slot routed the WHOLE CSV to the string walker while tc_mono_tids_core still held a good
+// tid for the other slot — and the comparison then vetoed slots that were fine.
 //
-// Stated plainly, because the removal costs something: on a genuine tid-vs-CSV
-// divergence the surviving tid is now kept, and the symbol still comes from `ta_str`
-// while the param/field types come from the tid. That is the br 6cvvh8 miscompile
-// class — clean `cc`, wrong at runtime. The comparison was a loud tripwire for it. The
-// remaining detectors are the `monofield` channel (binder-survived + the three bails) and
-// emit_struct_lit's I0001 chokepoint; neither is sound, and NEITHER sees a slot whose
+// Both of those producers are gone. Every caller now renders `ta_str` from THIS list via
+// mono_csv_from_arg_tids, so the symbol and the per-slot tids are the same value in two
+// forms and cannot disagree. The br 6cvvh8 miscompile class the comparison was a tripwire
+// for (clean `cc`, wrong at runtime) is therefore unreachable through this seam by
+// construction, not merely undetected.
+//
+// That is NOT a claim that erasure is impossible here — an unspellable slot still becomes
+// -1 and renders as ICE_SEG_ERASED_SLOT. It is caught at the I0001 chokepoints, and the
+// remaining soft detectors are the `monofield` channel (binder-survived + the three bails)
+// and emit_struct_lit's chokepoint; neither is sound, and NEITHER sees a slot whose
 // unspellable answer is a tuple stem (br 3aa3je).
 //
 // The `is_some()` gate is NOT part of what was deleted, and must stay: tc_mono_tids_core
@@ -301,6 +258,40 @@ fn poly_impl_return_elem_tids(im: Int, recv_node: Int) -> List[Int] {
 pub fn listop_slot_tid(tid: Int) -> Int {
     if tc_seg_from_tid(tid).is_some() { return tid }
     -1
+}
+
+// Render a mono CSV directly from an arg_tids list — the TOTAL replacement for
+// tc_mono_csv, and since br 3fc3pn the SOLE producer of a monomorphization CSV.
+//
+// tc_mono_csv was all-or-nothing: one unresolvable slot returned None and the whole
+// call deferred to the string producer (infer_fn_type_args_from_types /
+// poly_impl_concrete_args). Those are gone, so there is nothing to defer TO — this
+// always answers, and an unspellable slot keeps its CSV POSITION filled with
+// ICE_SEG_ERASED_SLOT.
+//
+// Filling rather than dropping is the whole safety property. The segment count stays
+// equal to the tparam count, so mono_args_has_void_seg still sees the slot and the
+// chokepoint raises I0001. Dropping it would shorten the CSV and mangle a name that is
+// perfectly valid C and perfectly wrong — silently collapsing sibling instantiations,
+// which is the failure class the chokepoints exist to prevent.
+//
+// Callers pass tids already through listop_slot_tid, so an unspellable slot arrives as
+// -1; tc_seg_from_tid guards tid < 0 internally and declines it. Both routes reach the
+// same sentinel, so a caller that has NOT pre-filtered is still safe.
+//
+// Lives here rather than in codegen_expr for the same import-graph reason as
+// listop_slot_tid above: codegen_methods already imports typecheck for tc_seg_from_tid,
+// and codegen_expr imports methods, not the reverse.
+pub fn mono_csv_from_arg_tids(arg_tids: List[Int]) -> Str {
+    let mut csv = ""
+    let mut i = 0
+    while i < arg_tids.len() {
+        if i > 0 { csv = csv.concat(",") }
+        let seg = tc_seg_from_tid(arg_tids.get(i).unwrap())
+        csv = csv.concat(if seg.is_some() { seg.unwrap() } else { ICE_SEG_ERASED_SLOT })
+        i = i + 1
+    }
+    csv
 }
 
 // 6mhzya: the canonical type-param resolver, home to all three codegen layers
@@ -384,8 +375,8 @@ fn emit_poly_impl_call(node: Int, composed_base: Str, obj_str: Str) ! Codegen.Em
     let im = poly_impl_block_node.get(composed_base).unwrap()
     let m_def = poly_impl_method_node.get(composed_base).unwrap()
     let tparams_sl = node_impl_binders(im)
-    let concrete_args = poly_impl_concrete_args(im, obj_str, node_obj(node))
     let arg_tids = poly_impl_concrete_arg_tids(im, node_obj(node))
+    let concrete_args = mono_csv_from_arg_tids(arg_tids)
     let ret_tids = poly_impl_return_elem_tids(im, node_obj(node))
     let mangled = mangle_generic_name(composed_base, concrete_args)
     register_mono_fn(composed_base, concrete_args, arg_tids)
@@ -3270,16 +3261,6 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             if is_fn_registered(mq_fn_name) != 0 || mq_is_generic != 0 {
                 let args_sl = node_args(node)
                 let mut mq_args_str = ""
-                let mut mq_arg_types: List[Int] = []
-                let mut mq_arg_elem_types: List[Int] = []
-                let mut mq_arg_err_elem_types: List[Int] = []
-                let mut mq_arg_closure_sigs: List[Str] = []
-                let mut mq_arg_struct_names: List[Str] = []
-                let mut mq_arg_err_struct_names: List[Str] = []
-                let mut mq_arg_map_key_types: List[Int] = []
-                let mut mq_arg_map_key_structs: List[Str] = []
-                let mut mq_arg_map_val_types: List[Int] = []
-                let mut mq_arg_map_val_structs: List[Str] = []
                 let mq_callee_params_sl = get_callee_params_sl(mq_fn_name)
                 if args_sl != -1 {
                     let mut mqi = 0
@@ -3296,37 +3277,12 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                         cg_expect_arg_ann = mq_saved_arg_ann
                         cg_expect_fn_value_sig = mq_saved_hint
                         mq_args_str = mq_args_str.concat(expr_result_str)
-                        if mq_is_generic != 0 {
-                            mq_arg_types.push(expr_result_type)
-                            mq_arg_elem_types.push(arg_elem_type_for(expr_result_type, expr_list_elem_type))
-                            mq_arg_err_elem_types.push(arg_err_elem_type_for(expr_result_type))
-                            mq_arg_closure_sigs.push(expr_closure_sig)
-                            mq_arg_struct_names.push(arg_struct_name_for(expr_result_type, expr_result_str, expr_list_elem_struct))
-                            mq_arg_err_struct_names.push(arg_err_struct_name_for(expr_result_type))
-                            let mq_map_info = arg_map_info_for(mq_arg_node, expr_result_type)
-                            mq_arg_map_key_types.push(mq_map_info.kt)
-                            mq_arg_map_key_structs.push(mq_map_info.ks)
-                            mq_arg_map_val_types.push(mq_map_info.vt)
-                            mq_arg_map_val_structs.push(mq_map_info.vs)
-                        }
                         mqi = mqi + 1
                     }
                 }
                 mq_args_str = append_ev_arg(mq_fn_name, mq_args_str)
                 if mq_is_generic != 0 {
-                    let mq_ca = GenericCallArgs {
-                        types: mq_arg_types,
-                        elem_types: mq_arg_elem_types,
-                        err_elem_types: mq_arg_err_elem_types,
-                        closure_sigs: mq_arg_closure_sigs,
-                        struct_names: mq_arg_struct_names,
-                        err_struct_names: mq_arg_err_struct_names,
-                        map_key_types: mq_arg_map_key_types,
-                        map_key_structs: mq_arg_map_key_structs,
-                        map_val_types: mq_arg_map_val_types,
-                        map_val_structs: mq_arg_map_val_structs,
-                    }
-                    let mq_handled = emit_generic_fn_call_tail(node, mq_fn_name, mq_args_str, mq_ca)
+                    let mq_handled = emit_generic_fn_call_tail(node, mq_fn_name, mq_args_str)
                     if mq_handled != 0 {
                         return
                     }
@@ -4317,25 +4273,60 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                     emit_expr(sublist_get(args_sl, 0))
                     let init_str = expr_result_str
                     let init_type = expr_result_type
-                    let init_name = type_name_from_ct(init_type)
                     let init_tid = tc_lookup_node_tid(sublist_get(args_sl, 0))
                     emit_expr(sublist_get(args_sl, 1))
                     let fn_str = expr_result_str
-                    let ta_str = "{elem_name},{init_name}"
                     let arg_tids = [listop_slot_tid(elem_tid), listop_slot_tid(init_tid)]
+                    // br e00ngd / br 3fc3pn: render from arg_tids, not from
+                    // "{elem_name},{init_name}". The init half was the live miscompile —
+                    // type_name_from_ct has no CT_STRUCT arm, so a struct accumulator
+                    // spelled "Void", and the seam's only erasure guard
+                    // (`elem_name != "Void"` above) screens the ELEMENT and never the
+                    // INIT. Two folds with different struct accumulators therefore both
+                    // mangled blink_list_fold_Int_Void: `--emit c` exited 0 with no
+                    // diagnostic and the C compile then failed on the collapsed symbol.
+                    // init_tid was already in hand here and spells the accumulator
+                    // correctly.
+                    let ta_str = mono_csv_from_arg_tids(arg_tids)
                     let mangled = mangle_generic_name(stdlib_name, ta_str)
                     register_mono_fn(stdlib_name, ta_str, arg_tids)
                     register_mono_instance(stdlib_name, ta_str, arg_tids)
-                    reg_fn(mangled, init_type)
+                    // br e00ngd, second defect at the same seam: the RESULT LOCAL's C type.
+                    // c_type_str has no CT_STRUCT arm (codegen_types.bl:5241-5270), so a
+                    // struct accumulator declared `void __fold_N` — a hard C error, and the
+                    // reason the fixture stayed red after the symbol was fixed. Spell it from
+                    // the SAME init segment the symbol was mangled from, so the local and the
+                    // callee's return type cannot disagree by construction. `init_sname` is
+                    // exactly `arg_tids`' slot-1 segment; a divergence here would be a
+                    // divergence inside one expression.
+                    let init_seg = tc_seg_from_tid(listop_slot_tid(init_tid))
+                    let init_sname = if init_seg.is_some() { init_seg.unwrap() } else { "" }
+                    let init_named = init_sname != "" && (is_struct_type(init_sname) != 0 || is_enum_type(init_sname) != 0 || is_mono_struct_instance(init_sname) != 0)
                     let result_var = fresh_temp("__fold_")
-                    emit_line("{c_type_str(init_type)} {result_var} = {c_fn_name(mangled)}({obj_str}, {init_str}, {fn_str});")
-                    expr_result_str = result_var
-                    expr_result_type = init_type
+                    if init_named {
+                        reg_fn(mangled, CT_STRUCT)
+                        reg_fn_struct_ret(mangled, init_sname)
+                        emit_line("{c_type_c_name(init_sname)} {result_var} = {c_fn_name(mangled)}({obj_str}, {init_str}, {fn_str});")
+                        set_var(result_var, CT_STRUCT, 0)
+                        set_var_struct(result_var, init_sname)
+                        expr_result_str = result_var
+                        expr_result_type = CT_STRUCT
+                    } else {
+                        reg_fn(mangled, init_type)
+                        emit_line("{c_type_str(init_type)} {result_var} = {c_fn_name(mangled)}({obj_str}, {init_str}, {fn_str});")
+                        expr_result_str = result_var
+                        expr_result_type = init_type
+                    }
                 } else {
                     emit_expr(sublist_get(args_sl, 0))
                     let fn_str = expr_result_str
-                    let ta_str = elem_name
                     let arg_tids = [listop_slot_tid(elem_tid)]
+                    // Same single-producer rule as the fold arm above. This arm
+                    // (for_each / any / all) has only the element slot, and the
+                    // `elem_name != "Void"` guard has already excluded the struct/enum
+                    // elements type_name_from_ct cannot spell — so the reachable set is
+                    // scalars and bare containers, which the tid spells identically.
+                    let ta_str = mono_csv_from_arg_tids(arg_tids)
                     let mangled = mangle_generic_name(stdlib_name, ta_str)
                     register_mono_fn(stdlib_name, ta_str, arg_tids)
                     register_mono_instance(stdlib_name, ta_str, arg_tids)

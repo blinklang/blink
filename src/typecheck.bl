@@ -1376,7 +1376,7 @@ fn build_typevar_binds(sig: Int, args_sl: Int) -> Map[Str, Int] ! TypeCheck.Reso
 // Group layout in tc_ret_mint_tids: [arity, slot_0, …, slot_{arity-1}], so the group
 // is SELF-DESCRIBING and a reader that disagrees about the fn's arity refuses instead
 // of indexing into the next call's group. That is not hypothetical: this memo is
-// written from the sig (fs.type_params_count) and read back by tc_mono_csv /
+// written from the sig (fs.type_params_count) and read back by
 // tc_mono_tids_core from the AST (sublist_length(node_type_params(fn_node))), and
 // lookup_fnsig keys on a name — two fns of the same name with different arities would
 // otherwise silently share a slot and mint one fn's α into the other's mono name.
@@ -8443,7 +8443,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                     // additionally fixes the generic-struct-instance return.
                     // instantiate_return_type infers each arg (build_typevar_binds)
                     // as a side effect, so the generic path also populates the
-                    // node→tid memo the tid-driven mono lowering (tc_mono_csv) reads.
+                    // node→tid memo the tid-driven mono lowering (tc_mono_tids_core) reads.
                     let mq_fs = fnsig_pool.get(sig).unwrap()
                     if mq_fs.type_params_count > 0 {
                         return instantiate_return_type(sig, mq_gen_args, node)
@@ -10680,8 +10680,11 @@ pub fn tc_tid_result_err_tid(tid: Int) -> Int {
 
 // TOP-LEVEL CSV-segment form for a tid: the string that, concatenated onto a
 // generic base by mangle_generic_name, reproduces the current monomorphized C
-// symbol. This is the tid-driven twin of infer_fn_type_args_from_types' per-
-// segment resolution:
+// symbol. Since br 3fc3pn this is the SOLE per-segment resolution, not a twin of
+// one: the string producer it was written to byte-match is gone, so the answers
+// below DEFINE the symbol rather than having to agree with something else. The
+// parenthesised branch names are the deleted string arms each rule descends from,
+// kept only to explain why a rule looks the way it does:
 //   - struct/enum      → stripped name        (arg_sn branch)
 //   - Option/Result    → Option_/Result_ tag  (compound_tag_from_ca branch)
 //   - List/Set/Map/... → Pascal name          (type_name_from_ct erasure)
@@ -11253,8 +11256,10 @@ pub fn tc_struct_slot_encodable(tid: Int) -> Bool {
     // An ENUM INSTANCE (TK_ENUM, params_count>=1) is now ADMITTED (br 82ajft / dbzy4r):
     // tc_tid_struct_mono_name was widened for TK_ENUM in jjhnf3, so the encoder spells
     // its full mono stem (Tree_Int) rather than erasing to the bare head — the enum
-    // twin of the struct-instance slot admitted below. (The poly-impl wrapper
-    // tc_poly_elem_slot_encodable still further restricts to BARE unqualified names.)
+    // twin of the struct-instance slot admitted below. (A poly-impl wrapper,
+    // tc_poly_elem_slot_encodable, used to further restrict this to BARE unqualified
+    // names for the poly-impl element path; br 3fc3pn deleted it along with the string
+    // CSV twin it existed to byte-match, so that path now shares this rule.)
     // A struct/enum slot is admitted regardless of module qualifier (br q4etvt): the
     // mono-registry physical-base split makes both paths spell a cross-module slot
     // the SAME — a bare cross-module struct's segment is bare on both (tc_tid_to_c_tag
@@ -11299,90 +11304,6 @@ pub fn tc_struct_slot_encodable(tid: Int) -> Bool {
     false
 }
 
-// STRICTER slot-encodability for the poly-impl List-element arg-tid path
-// (poly_impl_concrete_arg_tids). tc_struct_slot_encodable was relaxed by q4etvt to
-// admit MODULE-QUALIFIED struct/enum slots, and by kffj8d to admit compound
-// (Option/Result) slots, because the struct-lit / fn-arg CSV twin it must byte-match
-// now spells them physically / structurally. The poly-impl CSV twin does NOT:
-// poly_impl_concrete_args spells a cross-module element via the raw QUALIFIED
-// get_list_elem_struct (dotted; br dwhm4v), which does not round-trip through
-// tc_seg_from_tid's strip_module_qualifier. So the poly-impl path keeps the
-// pre-q4etvt contract — carry a tid ONLY for a scalar or a BARE UNQUALIFIED
-// struct/enum, and defer (-1 → string seg) everything else, including any
-// module-qualified struct/enum AND the compound slots kffj8d newly admitted for the
-// struct-lit path. This gate is now SELF-CONTAINED (it no longer delegates to the
-// relaxed tc_struct_slot_encodable) so the compound relaxation cannot leak into the
-// poly tail — its admission set is exactly the pre-kffj8d one.
-pub fn tc_poly_elem_slot_encodable(tid: Int) -> Bool {
-    if tid < 0 || tid >= ty_pool.len() { return false }
-    let t = ty_pool.get(tid).unwrap()
-    let k = t.kind
-    if k == TK_INT || k == TK_FLOAT || k == TK_BOOL || k == TK_STR || k == TK_CHAR { return true }
-    if k == TK_I8 || k == TK_I16 || k == TK_I32 { return true }
-    if k == TK_U8 || k == TK_U16 || k == TK_U32 || k == TK_U64 { return true }
-    if k == TK_STRUCT || k == TK_ENUM {
-        return strip_module_qualifier(t.name) == t.name
-    }
-    // br 4c3gts: a COMPOUND element (`List[Option[Int]]`) is now ADMITTED when
-    // every inner is itself poly-encodable — scalar or a BARE UNQUALIFIED
-    // struct/enum. Since poly_impl_concrete_args now spells an admitted compound
-    // via the SAME tc_seg_from_tid the def-side resolver uses, the mangling symbol
-    // and the resolved segment are byte-identical by construction (both go through
-    // tc_tid_to_c_tag). A MODULE-QUALIFIED struct inner still DEFERS: tc_tid_inner_tag
-    // strips the qualifier while a from-string carrier would keep it, so the two
-    // spellings would diverge (tk8qbv territory) — so recurse with the same
-    // bare-only inner rule this gate enforces at the top level.
-    if k == TK_OPTION { return tc_poly_inner_encodable(t.inner1) }
-    if k == TK_RESULT { return tc_poly_inner_encodable(t.inner1) && tc_poly_inner_encodable(t.inner2) }
-    if k == TK_MAP { return tc_poly_inner_encodable(t.inner1) && tc_poly_inner_encodable(t.inner2) }
-    // A genuine Void slot is ADMITTED — same reasoning as tc_struct_slot_encodable's TK_VOID
-    // arm (br hsgsbp): both paths spell it "Void", so this is byte-neutral, and the accidental
-    // fall-through to `false` was what erased a real `Box[Void]`. Note this admits only a BARE
-    // Void element; a Void reached through the compound arms above goes to
-    // tc_poly_inner_encodable, which refuses it — see the comment there for why.
-    if k == TK_VOID { return true }
-    false
-}
-
-// The recursive inner-admission rule for a poly-impl COMPOUND element
-// (tc_poly_elem_slot_encodable). An inner is carried ONLY when tc_tid_inner_tag
-// spells it identically on the tid path and any string path — scalars (lowercase
-// scalar tag), a BARE UNQUALIFIED struct/enum (c_type_tag_for_struct is a no-op on
-// an unqualified name), or a nested compound whose own inners recurse to the same
-// rule. A module-qualified struct/enum, a typevar, or any other kind DEFERS
-// (false) so the whole element falls back to the -1 / string path (br 4c3gts).
-fn tc_poly_inner_encodable(tid: Int) -> Bool {
-    if tid < 0 || tid >= ty_pool.len() { return false }
-    let t = ty_pool.get(tid).unwrap()
-    let k = t.kind
-    if k == TK_INT || k == TK_FLOAT || k == TK_BOOL || k == TK_STR || k == TK_CHAR { return true }
-    if k == TK_I8 || k == TK_I16 || k == TK_I32 { return true }
-    if k == TK_U8 || k == TK_U16 || k == TK_U32 || k == TK_U64 { return true }
-    if k == TK_STRUCT || k == TK_ENUM {
-        return strip_module_qualifier(t.name) == t.name
-    }
-    if k == TK_OPTION { return tc_poly_inner_encodable(t.inner1) }
-    if k == TK_RESULT { return tc_poly_inner_encodable(t.inner1) && tc_poly_inner_encodable(t.inner2) }
-    if k == TK_MAP { return tc_poly_inner_encodable(t.inner1) && tc_poly_inner_encodable(t.inner2) }
-    // A genuine Void CARRIER INNER is REFUSED, deliberately — the second of the two gates
-    // hsgsbp leaves refusing, for the same reason as tc_tid_tuple_elem_encodable: the emitter
-    // is not ready, so admitting it trades a located I0001 for an opaque cc error.
-    //
-    // Specifically, emit_option_typedef (codegen_types.bl:6703) emits NOTHING for a CT_VOID
-    // inner (three early returns, :6704/:6706/:6711) while option_c_type still NAMES the type
-    // blink_Option_void — so `type QBox[T] { v: Option[T] }` at Void referenced a typedef that
-    // was never defined. emit_result_typedef's int64_t leaf (:6728-6729) is NOT a template to
-    // copy here: it keys on CT_VOID alone, and because type_from_name collapses every unknown
-    // name onto CT_VOID, a CT-keyed rule in a carrier position would swallow an ERASED inner
-    // into a well-typed field instead of failing the C compile.
-    //
-    // There is a SECOND defect behind this gate that the typedef is not even the whole of: the
-    // struct literal spelled `None` at T=Void as blink_Option_int, a mistyped carrier from a
-    // different speller. Carrier-position Void is its own mechanism and its own ticket; it is
-    // not the tail of this one.
-    false
-}
-
 // Resolve the CSV segment for type-arg slot `idx` of a struct-INSTANCE tid
 // (`Box[Int]`, `Pair[Int,Str]` built by make_struct_instance_type). Reads the raw
 // slot tid from ty_param_list — the same slot the dormant tc_tid_struct_arg_ct /
@@ -11402,130 +11323,6 @@ fn tc_struct_seg_from_arg(tid: Int, idx: Int) -> Option[Str] {
     Some(tc_tid_to_c_tag(slot_tid))
 }
 
-// Resolve one generic type-param `param_name` to its CSV segment from the call's
-// argument tids, mirroring the positional param/arg matching in
-// infer_fn_type_args_from_types. Three-state result:
-//   None       - a param position mentions the type-param but the tid can't
-//                express its binding: generic user-struct Box[T] and nested
-//                List[Tuple[..T..]] (typecheck does not monomorphize struct
-//                instances, so `Int` for `Box[Int]` lives only in the codegen
-//                mono registry); an unsubstituted-typevar or unknown binding
-//                (mono-calls-mono, closure-literal args carry no TK_FN tid).
-//                tc_mono_csv turns this into an overall None so the call falls
-//                back to the string-tag path that reads the mono registry.
-//   Some("")   - no param position mentions the type-param (old code leaves the
-//                segment "Void"; the caller substitutes that).
-//   Some(tag)  - resolved to a concrete CSV segment.
-fn tc_resolve_tparam_seg(param_name: Str, fn_params_sl: Int, args_sl: Int) -> Option[Str] {
-    let np = sublist_length(fn_params_sl)
-    let na = sublist_length(args_sl)
-    let mut fi = 0
-    while fi < np && fi < na {
-        let p = sublist_get(fn_params_sl, fi)
-        let ptype = node_type_name(p)
-        let arg_tid = tc_lookup_node_tid(sublist_get(args_sl, fi))
-        if ptype == param_name {
-            return tc_seg_from_tid(arg_tid)
-        } else if ptype == "List" {
-            // `xs: List[T]` - the segment is the element type. Read inner1 of
-            // the arg's List tid so a List[Foo] arg yields the element tag.
-            if arg_tid >= 0 && arg_tid < ty_pool.len() {
-                let arg_ty = ty_pool.get(arg_tid).unwrap()
-                if arg_ty.kind == TK_LIST && tc_list_param_elem_is(p, param_name) {
-                    return tc_seg_from_tid(arg_ty.inner1)
-                }
-                // List[Tuple[..T..]] or other nested shape mentioning the param:
-                // structurally beyond the flat inner1 read - defer to old path.
-                if arg_ty.kind == TK_LIST && tc_ann_mentions_param(node_type_ann(p), param_name) {
-                    return None
-                }
-            }
-        } else if ptype == "Map" {
-            if arg_tid >= 0 && arg_tid < ty_pool.len() {
-                let arg_ty = ty_pool.get(arg_tid).unwrap()
-                if arg_ty.kind == TK_MAP {
-                    let which = tc_map_param_binds(p, param_name)
-                    if which == 1 { return tc_seg_from_tid(arg_ty.inner1) }
-                    if which == 2 { return tc_seg_from_tid(arg_ty.inner2) }
-                }
-            }
-        } else if ptype == "Result" || ptype == "Option" {
-            // `r: Result[T, E]` / `o: Option[T]` - the arg tid is the concrete
-            // Result/Option; read inner1 (ok/some) or inner2 (err) per which
-            // annotation slot names the type-param.
-            if arg_tid >= 0 && arg_tid < ty_pool.len() {
-                let arg_ty = ty_pool.get(arg_tid).unwrap()
-                if arg_ty.kind == TK_RESULT || arg_ty.kind == TK_OPTION {
-                    let which = tc_compound_param_binds(p, param_name)
-                    if which == 1 { return tc_seg_from_tid(arg_ty.inner1) }
-                    if which == 2 { return tc_seg_from_tid(arg_ty.inner2) }
-                }
-            }
-        } else if ptype == "Fn" {
-            // `f: Fn(T) -> U` names a type-param in a closure position. Closure-
-            // literal args carry no structured TK_FN tid (infer_type returns
-            // TYPE_UNKNOWN for a Closure), so the binding can't be read from the
-            // tid — defer to the string-tag path (which infers it from the
-            // closure's C signature).
-            if tc_fn_param_binds(p, param_name) != -1 {
-                return None
-            }
-        } else if tc_type_is_struct(ptype) != 0 {
-            // Generic user-struct param (`Box[T]`, `Pair[A, B]`). Increments B/C
-            // (kvn6w8) give a concrete arg (`let b: Box[Int]`) a struct INSTANCE
-            // tid (TK_STRUCT, params_count>=1) carrying the type-args, so read the
-            // annotation slot that names this param, then the same slot of the arg
-            // instance tid, and resolve it through the shared tc_seg_from_tid gate.
-            // A bare generic base (count 0), an arity mismatch, or a param mentioned
-            // but inexpressible in a slot (nested compound, module-qualified struct)
-            // falls through to the existing tc_ann_mentions_param → None defer, so
-            // nothing that was on the string path starts emitting a divergent symbol.
-            if arg_tid >= 0 && arg_tid < ty_pool.len() {
-                let arg_ty = ty_pool.get(arg_tid).unwrap()
-                // Gate on the arg instance being the SAME struct base as the
-                // annotation (strip_module_qualifier(arg_ty.name) == ptype),
-                // mirroring the string path's `mi.base == ptype` guard
-                // (codegen_types.bl:3837). Without it, an arg tid that is a
-                // different struct instance (e.g. Pair[Int,Str] reaching a Box[T]
-                // param) would read the wrong slot and emit a divergent symbol.
-                if arg_ty.kind == TK_STRUCT && tc_tid_struct_arg_count(arg_tid) >= 1 && strip_module_qualifier(arg_ty.name) == ptype {
-                    let slot = tc_struct_param_binds(p, param_name)
-                    if slot >= 0 {
-                        let seg = tc_struct_seg_from_arg(arg_tid, slot)
-                        if seg.is_some() { return seg }
-                    }
-                }
-            }
-            if tc_ann_mentions_param(node_type_ann(p), param_name) {
-                return None
-            }
-        } else if tc_type_is_enum(ptype) != 0 {
-            // br 82ajft: generic user-ENUM param (`t: Tree[T]`). Exact twin of the
-            // struct arm above — a concrete arg (`let t: Tree[Int]`) has an enum
-            // INSTANCE tid (TK_ENUM, params_count>=1) carrying the type-args, and the
-            // slot readers (tc_struct_param_binds / tc_struct_seg_from_arg /
-            // tc_tid_struct_arg_count) are kind-agnostic, so read the annotation slot
-            // that names this param and the same slot of the arg instance tid. Without
-            // this the "" segment falls through to the literal "Void" fill below and
-            // the caller mangles blink_count_Void instead of blink_count_Int.
-            if arg_tid >= 0 && arg_tid < ty_pool.len() {
-                let arg_ty = ty_pool.get(arg_tid).unwrap()
-                if arg_ty.kind == TK_ENUM && tc_tid_struct_arg_count(arg_tid) >= 1 && strip_module_qualifier(arg_ty.name) == ptype {
-                    let slot = tc_struct_param_binds(p, param_name)
-                    if slot >= 0 {
-                        let seg = tc_struct_seg_from_arg(arg_tid, slot)
-                        if seg.is_some() { return seg }
-                    }
-                }
-            }
-            if tc_ann_mentions_param(node_type_ann(p), param_name) {
-                return None
-            }
-        }
-        fi = fi + 1
-    }
-    Some("")
-}
 
 // True when `tname` names a user-declared ENUM (first field is a TypeVariant) —
 // the complement of tc_type_is_struct, used to route a generic-enum param
@@ -11585,9 +11382,10 @@ fn tc_map_param_binds(p: Int, param_name: Str) -> Int {
 // The 0-based type-arg slot in generic-struct param `p`'s annotation
 // (`Box[T]` → 0, `Pair[A, B]` → A=0 / B=1) that names `param_name`, or -1.
 // A struct can mention the param in any slot; when several do, return the LAST
-// match — mirrors the while-loop last-wins in infer_fn_type_args_from_types'
-// string-path struct branch (codegen_types.bl:3841-3850), where a later matching
-// slot overwrites `resolved`.
+// match. That rule was inherited from the while-loop last-wins in the deleted
+// infer_fn_type_args_from_types' string struct branch, where a later matching slot
+// overwrote `resolved`. Since br 3fc3pn there is nothing left to mirror, so last-wins
+// is now this function's OWN choice — changing it changes emitted symbols directly.
 fn tc_struct_param_binds(p: Int, param_name: Str) -> Int {
     let ta = node_type_ann(p)
     if ta == -1 { return -1 }
@@ -11677,55 +11475,6 @@ fn tc_ann_names_tparam(ann: Int, param_name: Str) -> Bool {
     false
 }
 
-// tid-driven twin of infer_fn_type_args_from_types: build the per-type-param
-// CSV that mangle_generic_name consumes, resolving each segment from the call
-// argument's memoized tid instead of the codegen CT capture. Returns None when
-// any type-param can't be derived from tids (generic user-struct param, nested
-// List[Tuple], etc.) so the call falls back to the string-tag path - which is
-// also the non-generic fallthrough contract. Where it returns Some, the CSV is
-// byte-identical to the old path (enforced by the B.3 parity assert).
-pub fn tc_mono_csv(call_node: Int, fn_node: Int) -> Option[Str] {
-    let tparams_sl = node_type_params(fn_node)
-    if tparams_sl == -1 { return None }
-    let num_params = sublist_length(tparams_sl)
-    if num_params == 0 { return None }
-    let fn_params_sl = node_params(fn_node)
-    if fn_params_sl == -1 { return None }
-    let args_sl = node_args(call_node)
-    if args_sl == -1 { return None }
-
-    let mut csv = ""
-    let mut pi = 0
-    while pi < num_params {
-        if pi > 0 { csv = csv.concat(",") }
-        let param_name = node_name(sublist_get(tparams_sl, pi))
-        let seg_opt = tc_resolve_tparam_seg(param_name, fn_params_sl, args_sl)
-        if seg_opt.is_none() { return None }
-        let mut seg = seg_opt.unwrap()
-        // A RETURN-ONLY type param has no argument position to resolve from, so
-        // tc_resolve_tparam_seg reaches its "no position mentions it" end and returns
-        // Some("") — the exact fall-through that used to spell "Void" here and hand
-        // codegen an erased mono name. If the call site's minted α got solved (by the
-        // let target, an argument position, or the declared return), spell the
-        // SOLUTION; otherwise fall through to today's behavior unchanged (3dpshm).
-        //
-        // Narrowly gated on seg == "" and Some: every None still defers to the string
-        // path, and any slot the argument path DID resolve keeps its own segment. The
-        // encodable gate is what keeps the tid segment byte-identical to the string
-        // path's — an unbound or unencodable α is not spelled at all.
-        if seg == "" {
-            let m = tc_ret_mint_at(call_node, num_params, pi)
-            if m >= 0 && tc_tid_encodable(m) { seg = tc_tid_to_c_tag(m) }
-        }
-        // Still "" after the mint attempt means nothing resolved this slot — an ERASURE,
-        // which br hsgsbp gave its own sentinel so it stops sharing a spelling with a
-        // genuine Void type argument. The slot keeps its CSV position either way, so the
-        // segment count stays equal to num_params and the chokepoints can still see it.
-        csv = csv.concat(if seg != "" { seg } else { ICE_SEG_ERASED_SLOT })
-        pi = pi + 1
-    }
-    Some(csv)
-}
 
 // Closure-signature scalar type NAME → its canonical tid, or -1 for anything else.
 // Pure (effect-free) so the Fn arm of tc_resolve_tparam_tid can lower a closure
@@ -11755,14 +11504,18 @@ fn tc_scalar_tid_from_name(name: Str) -> Int {
     -1
 }
 
-// The tid twin of tc_resolve_tparam_seg: return the concrete arg tid that the
-// segment path resolved this type-param to, or -1 when the segment path either
-// found no param position (Some("")) or deferred (None). Positionally aligned
-// with tc_resolve_tparam_seg so a stored tid, run back through tc_seg_from_tid,
-// reproduces that segment byte-for-byte (the D1b invariant the def-side emitters
-// rely on: tid path == string path for every encodable slot). Mirrors the same
-// param-matching ladder; every arm returns the SAME tid tc_resolve_tparam_seg
-// fed to tc_seg_from_tid / tc_struct_seg_from_arg.
+// Return the concrete arg tid this type-param resolves to, or -1 when no argument
+// position can supply it. Since br 3fc3pn this is the SOLE resolver: the whole mono CSV
+// is rendered from the tids it produces, so "the segment" is by definition
+// tc_seg_from_tid of what this returns and cannot disagree with it.
+//
+// It was previously the tid TWIN of a segment-producing resolver, tc_resolve_tparam_seg,
+// and had to stay positionally aligned with it so a stored tid run back through
+// tc_seg_from_tid reproduced that segment byte-for-byte (the D1b invariant). That twin is
+// deleted — it was a strictly weaker duplicate of this ladder, never receiving
+// mono-calls-mono substitution, the List[Tuple[..T..]] arm, or closure-annotation
+// reading. Nothing needs alignment with it any more; the D1b framing survives here only
+// as history.
 //
 // `binds` (typevar-name → concrete tid) resolves the mono-calls-mono case: inside a
 // monomorphized body the nested generic call's arg carries its ORIGINAL memoized tid,
@@ -11819,10 +11572,11 @@ fn tc_resolve_tparam_tid(param_name: Str, fn_params_sl: Int, args_sl: Int, binds
                 }
                 // A `List[<nested>]` whose element mentions the param but is not the
                 // bare element (`List[(Str, T)]`, `List[Box[T]]`) can't be read from
-                // the flat inner1 slot. The seg twin returns None here — correct there,
-                // because a None aborts the ALL-OR-NOTHING tc_mono_csv and the whole
-                // call falls to infer_fn_type_args_from_types' last-wins scan. This tid
-                // twin is PER-SLOT, so a hard -1 would freeze the binding at this param
+                // the flat inner1 slot. The deleted seg twin returned None here, which
+                // was correct THERE only because a None aborted the all-or-nothing
+                // tc_mono_csv and handed the whole call to the string walker. No such
+                // walker exists now. This resolver is PER-SLOT, so a hard -1 would
+                // freeze the binding at this param
                 // even though a LATER param (`body: fn(T) -> Void`, the std.testing
                 // for_each shape) can bind it. Fall through instead — keep scanning; if
                 // no later param binds it the loop still returns -1 at the tail.
@@ -11851,15 +11605,28 @@ fn tc_resolve_tparam_tid(param_name: Str, fn_params_sl: Int, args_sl: Int, binds
             // so the binding is read off the literal's own annotations instead: the
             // return_type string when the param names the Fn return (tc_fn_param_binds
             // == -2), otherwise the naming Fn-param slot's declared type name. This is
-            // the tid twin of infer_fn_type_args_from_types' Fn arm (codegen_types.bl
-            // 4434-4462), which derives U/T from the closure's C signature via
-            // infer_closure_ret_type / infer_closure_param_type. tc_scalar_tid_from_name
-            // admits only the four scalars that C-signature path can recover (Int/Float/
-            // Bool/Str), so the tid seg stays byte-identical to the string seg; any
-            // richer param/return returns -1 here and defers to the string path. Since br
-            // fsa9gf that -1-here-and-defer discipline is the ONLY alignment guarantee at
-            // this seam — the register site's listop_slot_tid no longer compares the two
-            // spellings, so a divergence introduced here would be mangled, not screened.
+            // the tid twin of the deleted infer_fn_type_args_from_types' Fn arm, which
+            // derived U/T from the closure's C signature via infer_closure_ret_type /
+            // infer_closure_param_type. tc_scalar_tid_from_name admits only the four
+            // scalars that C-signature path could recover (Int/Float/Bool/Str), which is
+            // why the narrowness is here at all — it kept the tid seg byte-identical to
+            // the string seg.
+            //
+            // THE CONSEQUENCE OF A -1 HERE IS NOW I0001, NOT A FALLBACK. This block used
+            // to say a richer param/return "defers to the string path". That was already
+            // untrue before br 3fc3pn deleted the string producer — measured on the HEAD
+            // binary, `fn apply[T](f: fn(Int) -> Box[T], x: Int) -> Box[T]` called with a
+            // `fn(n: Int) -> Box[Int]` literal raises the SAME two ICEs before and after
+            // the deletion. The tid path has been sole authority at this seam since br
+            // wzv72h; nothing was consulting the string here to defer TO.
+            //
+            // So the narrowness is a live gap, not a safe conservatism: br 3ejrqa. Its
+            // root is the same missing memo as br n8mmry symptom 2 — the closure LITERAL's
+            // return annotation carries no instance tid, so this arm is reduced to reading
+            // the annotation's NAME as a string. Once n8mmry memoizes one, this arm reads
+            // the tid and the scalar restriction goes away. Widening tc_scalar_tid_from_name
+            // instead would spell a name with no tid behind it, which is the erasure this
+            // whole seam exists to prevent.
             let fslot = tc_fn_param_binds(p, param_name)
             if fslot != -1 {
                 if arg_node != -1 && node_kind(arg_node) == NodeKind.Closure {
@@ -11911,10 +11678,14 @@ fn tc_resolve_tparam_tid(param_name: Str, fn_params_sl: Int, args_sl: Int, binds
     -1
 }
 
-// Per-type-param concrete tids parallel to tc_mono_csv's CSV segments. Only
-// meaningful when tc_mono_csv returned Some for the same (call_node, fn_node);
-// each entry is the tid whose tc_seg_from_tid reproduces the CSV segment, or -1
-// where the segment came from a no-param "Void" fill or a deferred slot. Stored
+// The per-type-param concrete tids, and since br 3fc3pn the ORIGIN of the mono CSV
+// rather than something parallel to it: codegen renders the CSV from this list via
+// mono_csv_from_arg_tids, so each entry's tc_seg_from_tid IS the segment. An entry is -1
+// where no argument position could supply the param, which renders as
+// ICE_SEG_ERASED_SLOT and is caught at the I0001 chokepoints. (It formerly ran parallel
+// to tc_mono_csv's independently-walked segments and was meaningful only when that
+// returned Some; both that function and the string walker it chose between are gone.)
+// Stored
 // on the mono registry (arg_tids) so the def-side emitters can re-derive that
 // slot from the structured tid instead of re-parsing the CSV string.
 //
@@ -11944,9 +11715,9 @@ fn tc_mono_tids_core(call_node: Int, fn_node: Int, binds: Map[Str, Int]) -> List
     while pi < num_params {
         let param_name = node_name(sublist_get(tparams_sl, pi))
         let mut tid = tc_resolve_tparam_tid(param_name, fn_params_sl, args_sl, binds)
-        // -1 is this function's "no argument position could supply it" — the tid twin
-        // of tc_mono_csv's Some("") fall-through, and the same seam a return-only type
-        // param falls through (3dpshm). Substitute the call site's solved α so the
+        // -1 is this function's "no argument position could supply it" — what the deleted
+        // tc_mono_csv spelled as a Some("") fall-through, and the same seam a return-only
+        // type param falls through (3dpshm). Substitute the call site's solved α so the
         // registered mono instance carries the concrete inner tid every def-side
         // arg_tids consumer reads, rather than -1 (which drops the slot to the erasing
         // string path). Only where the argument path already gave up.

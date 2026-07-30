@@ -2,7 +2,7 @@ import codegen_types.{
     CT_BOOL, CT_BYTES, CT_CHANNEL, CT_CLOSURE, CT_FFI_SCOPE, CT_FLOAT, CT_INSTANT, CT_DURATION,
     CT_HANDLER, CT_I8, CT_I16, CT_I32, CT_U8, CT_U16, CT_U32, CT_U64, CT_INT, CT_ITERATOR, CT_LIST, CT_MAP, CT_OPTION, CT_PTR,
     CT_CHAR, CT_ENUM, CT_RESULT, CT_SET, CT_STRING, CT_STRINGBUILDER, CT_STRUCT, CT_TEMPLATE, CT_VOID,
-    CarrierInfo, CaptureEntry, ClosureCapInfo, GenericCallArgs, VarEnumEntry,
+    CarrierInfo, CaptureEntry, ClosureCapInfo, VarEnumEntry,
     c_blink_name, c_fn_name, c_safe_name, c_type_c_name, c_type_str, c_type_tag, canonical_struct_tag, ct_bit_width, derive_method_cname,
     append_ev_arg, capture_cast_expr,
     cg_arena_expr_prev_stack, cg_arena_expr_tmp_stack,
@@ -51,7 +51,7 @@ import codegen_types.{
     get_variant_field_count, get_variant_field_name,
     get_variant_field_type_str, get_variant_index, get_variant_tag,
     get_callee_params_sl,
-    infer_fn_type_args_from_types, is_compound_ct, is_compound_tag, is_data_enum, is_named_typedef_tag, is_mono_struct_instance, is_transparent_newtype, typedef_tag_or_empty,
+    is_compound_ct, is_compound_tag, is_data_enum, is_named_typedef_tag, is_mono_struct_instance, is_transparent_newtype, typedef_tag_or_empty,
     is_emitted_let, is_enum_type, is_fn_registered, is_generic_fn,
     is_scope_var,
     is_struct_or_enum_type, is_struct_type, is_trait_type,
@@ -80,7 +80,7 @@ import codegen_types.{
     var_enums
 }
 import codegen_derive.{ct_to_descriptor, descriptor_mangle, queue_promote_type}
-import codegen_methods.{emit_boxed_container_store, emit_method_call, listop_slot_tid, resolve_push_struct, resolve_tparam_via_tid, tparam_tid_via_mono}
+import codegen_methods.{emit_boxed_container_store, emit_method_call, listop_slot_tid, mono_csv_from_arg_tids, resolve_push_struct, resolve_tparam_via_tid, tparam_tid_via_mono}
 import codegen_closures.{analyze_captures, emit_closure, emit_fn_value_shim_if_needed}
 import diagnostics.{
     diag_error, diag_error_at, diag_warn_at, diag_set_last_fix, diag_ice_at,
@@ -93,7 +93,7 @@ import diagnostics.{
 }
 import std.path.{path_dirname}
 import formatter.{format_expr}
-import typecheck.{tc_mono_csv, tc_mono_tids_subst, tc_tid_subst_mono, tc_seg_from_tid, is_import_module_name, tc_lookup_node_tid, tc_tid_set_elem_ct, tc_tid_set_elem_struct, tc_tid_set_elem_ct_resolved, tc_tid_set_elem_struct_resolved, tc_tid_map_key_ct, tc_tid_map_key_struct, tc_tid_map_key_ct_resolved, tc_tid_map_key_struct_resolved, tc_tid_map_val_ct, tc_tid_map_val_struct, tc_tid_map_val_tid, tc_tid_map_key_tid, tc_tid_struct_slot_seg, tc_tid_ct, tc_tid_resolved, tc_tid_option_inner_ct, tc_tid_option_inner_struct, tc_tid_result_ok_ct, tc_tid_result_ok_struct, tc_tid_result_err_ct, tc_tid_result_err_struct, tc_tid_to_c_tag, tc_tid_struct, tc_tid_struct_mono_name, tc_tid_is_enum, tc_tid_struct_arg_count, tc_tid_struct_arg_tid, tc_tid_compound_slot_faithful, tc_struct_slot_encodable, tc_tid_inner_tag, tc_tid_option_inner_tid, tc_tid_result_ok_tid, tc_tid_result_err_tid, tc_tid_tuple_elem_encodable, tc_tid_tuple_sname, tc_tid_tuple_arity, tc_tid_tuple_elem_tid, tc_tid_kops_slot_unsolved}
+import typecheck.{tc_mono_tids_subst, tc_tid_subst_mono, tc_seg_from_tid, is_import_module_name, tc_lookup_node_tid, tc_tid_set_elem_ct, tc_tid_set_elem_struct, tc_tid_set_elem_ct_resolved, tc_tid_set_elem_struct_resolved, tc_tid_map_key_ct, tc_tid_map_key_struct, tc_tid_map_key_ct_resolved, tc_tid_map_key_struct_resolved, tc_tid_map_val_ct, tc_tid_map_val_struct, tc_tid_map_val_tid, tc_tid_map_key_tid, tc_tid_struct_slot_seg, tc_tid_ct, tc_tid_resolved, tc_tid_option_inner_ct, tc_tid_option_inner_struct, tc_tid_result_ok_ct, tc_tid_result_ok_struct, tc_tid_result_err_ct, tc_tid_result_err_struct, tc_tid_to_c_tag, tc_tid_struct, tc_tid_struct_mono_name, tc_tid_is_enum, tc_tid_struct_arg_count, tc_tid_struct_arg_tid, tc_tid_compound_slot_faithful, tc_struct_slot_encodable, tc_tid_inner_tag, tc_tid_option_inner_tid, tc_tid_result_ok_tid, tc_tid_result_err_tid, tc_tid_tuple_elem_encodable, tc_tid_tuple_sname, tc_tid_tuple_arity, tc_tid_tuple_elem_tid, tc_tid_kops_slot_unsolved}
 
 // codegen_expr.bl — Expression codegen, closures, capture analysis
 
@@ -2493,56 +2493,6 @@ fn pa_ct_renderable(ct: Int) -> Int {
     0
 }
 
-pub fn arg_struct_name_for(rt: Int, rs: Str, list_elem_struct: Str) -> Str {
-    if rt == CT_STRUCT { return get_var_struct(rs) }
-    // br 82ajft: a generic-enum-INSTANCE arg (`t: Tree[Int]`) forwarded into another
-    // generic fn (`indirect[T](t: Tree[T]) { take_tree(t) }`) must carry its mono name
-    // (Tree_Int) so infer_fn_type_args_from_types' enum arm can extract T — the twin of
-    // the CT_STRUCT case. A data-enum var reports CT_INT here (its value repr is int-tagged),
-    // yet set_var_struct tracks the mono stem on the param binding, and get_var_enum names
-    // the data enum; recover the mono stem from get_var_struct when the var is a data enum.
-    if rt == CT_INT && get_var_enum(rs) != "" && is_data_enum(get_var_enum(rs)) != 0 {
-        let s = get_var_struct(rs)
-        if s != "" { return s }
-    }
-    if rt == CT_ENUM { return get_var_struct(rs) }
-    if rt == CT_LIST { return list_elem_struct }
-    if rt == CT_RESULT { return expr_result_ok_struct }
-    if rt == CT_OPTION { return expr_option_inner_struct }
-    ""
-}
-
-// Carrier element-type for a generic call argument: the inner type-kind to
-// thread into infer_fn_type_args_from_types via arg_elem_types[fi]. For a
-// List it's the element kind (carried by emit_expr in expr_list_elem_type);
-// for a Result/Option carrier it's the ok/inner payload kind. Lets a generic
-// `Result[T,E]`/`Option[T]` param infer T from an `Ok(7)`/`Some(7)` scalar arg.
-pub fn arg_elem_type_for(rt: Int, list_elem: Int) -> Int {
-    if rt == CT_RESULT { return expr_result_ok_type }
-    if rt == CT_OPTION { return expr_option_inner }
-    list_elem
-}
-
-// Err-side carrier for a Result call argument: the struct name / payload kind
-// in the Err(...) position, threaded via GenericCallArgs.err_struct_names /
-// err_elem_types so a generic `Result[T,E]` param can infer E. Option has no
-// err position, so it contributes nothing.
-pub fn arg_err_struct_name_for(rt: Int) -> Str {
-    if rt == CT_RESULT { return expr_result_err_struct }
-    ""
-}
-pub fn arg_err_elem_type_for(rt: Int) -> Int {
-    if rt == CT_RESULT { return expr_result_err_type }
-    CT_VOID
-}
-
-type ArgMapInfo {
-    kt: Int
-    ks: Str
-    vt: Int
-    vs: Str
-}
-
 // Carrier type for one side of a Result/Option from a type-annotation element
 // name: a struct/enum name carries as CT_INT with struct_name set; everything
 // else carries as `fallback` with no struct.
@@ -2919,14 +2869,6 @@ fn carrier_from_emitted(expr_str: Str, ct: Int) -> CarrierInfo {
     CarrierInfo { type_const: ct, struct_name: "" }
 }
 
-pub fn arg_map_info_for(arg_node: Int, rt: Int) -> ArgMapInfo {
-    if rt != CT_MAP || node_kind(arg_node) != NodeKind.Ident {
-        return ArgMapInfo { kt: -1, ks: "", vt: -1, vs: "" }
-    }
-    let nm = node_name(arg_node)
-    ArgMapInfo { kt: get_map_key_type(nm), ks: get_map_key_struct(nm), vt: get_map_value_type(nm), vs: get_map_value_struct(nm) }
-}
-
 // Resolves the inner struct/enum name from the expected call-argument annotation
 // (cg_expect_arg_ann) when it is `Option[Struct]`/`Result[Struct, _]`. Lets bare
 // carrier constructors at a call site pick the parameter's expected carrier.
@@ -3230,25 +3172,52 @@ fn struct_mono_from_fn_ret_ann(tids: List[Int]) -> Str {
 // expr_result_str / expr_result_type plus container inner-type globals, and
 // returns 1.
 @allow(UnrestoredMutation, IncompleteStateRestore)
-pub fn emit_generic_fn_call_tail(node: Int, fn_name: Str, args_str: Str, ca: GenericCallArgs) -> Int ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
+pub fn emit_generic_fn_call_tail(node: Int, fn_name: Str, args_str: Str) -> Int ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
     let gfn_node = get_generic_fn_node(fn_name)
-    // Subtask C (7pfhc9): derive the monomorphization CSV from the structured
-    // tids (tc_mono_csv) whenever they can express the binding; fall back to the
-    // string-tag inference (infer_fn_type_args_from_types) only for the shapes
-    // tids can't reach (generic user-struct param, closure-bound typevar, mono-
-    // calls-mono, tuple arg). tc_mono_csv returns Some only when it is
-    // byte-identical to the old path — tc_tid_encodable gates out every shape
-    // that would diverge — so this switch keeps Gen1==Gen2 while making the tid
-    // path the primary source: the qm01e7/295z9x/j9v92x compound-carrier cases
-    // now flow through it structurally instead of the canonical_struct_tag
-    // `_`-guess heuristic.
-    let tid_csv = tc_mono_csv(node, gfn_node)
-    let type_args = if tid_csv.is_some() { tid_csv } else { infer_fn_type_args_from_types(gfn_node, ca) }
-    if type_args.is_none() {
+    let tparams_sl = node_type_params(gfn_node)
+    // A callee with no type params is not a monomorphization at all — return 0 so the
+    // caller falls through to non-generic handling. This replaces the old
+    // `type_args.is_none()` bail: tc_mono_csv returned None here, and the string
+    // fallback returned None too, so the two agreed. Now that the CSV is TOTAL the
+    // condition has to be tested directly rather than inferred from a None.
+    let num_tparams = if tparams_sl == -1 { 0 } else { sublist_length(tparams_sl) }
+    if num_tparams == 0 {
         return 0
     }
-    let ta_str = type_args.unwrap()
-    let tparams_sl = node_type_params(gfn_node)
+    // br 3fc3pn: the tid is the SOLE producer of the mono CSV. The string twin
+    // (infer_fn_type_args_from_types) is gone, so there is no longer a second walker to
+    // defer to and no parity constraint to satisfy — tc_mono_csv's all-or-nothing
+    // Option, whose only purpose was choosing between the two, is gone with it.
+    //
+    // Measured before the inversion (Stage 0, 286 generic-fn call sites over the 726-file
+    // corpus that reaches codegen): the CSV rendered from arg_tids is byte-identical to
+    // the one actually used at 286/286 sites, INCLUDING all 20 where the string answered,
+    // with zero unspellable slots. The 20 string answers were not tid gaps — they were
+    // tc_mono_csv walking tc_resolve_tparam_seg, a weaker duplicate of
+    // tc_resolve_tparam_tid that never received mono-calls-mono substitution, the
+    // List[Tuple[..T..]] slot arm, or closure-annotation reading. The tid walker below
+    // has all three.
+    //
+    // This block moved ABOVE the CSV (it used to sit after the mangle). Safe: it calls
+    // only tc_mono_tids_subst and listop_slot_tid, neither of which emits.
+    let raw_tids = tc_mono_tids_subst(node, gfn_node, cg_mono_tparams_sl, cg_mono_arg_tids)
+    let mut arg_tids: List[Int] = []
+    let mut ti = 0
+    while ti < raw_tids.len() {
+        arg_tids.push(listop_slot_tid(raw_tids.get(ti).unwrap()))
+        ti = ti + 1
+    }
+    // tc_mono_tids_core returns an EMPTY list — not a short one — for its structural
+    // early-outs (no params sublist, no args sublist). `fn f[T]() -> Int` called as `f()`
+    // is the reachable one, and the string used to mangle it `blink_f_Void`: a valid C
+    // identifier that silently collapsed f[Int] and f[Str] onto one symbol. Padding the
+    // missing slots keeps the segment count equal to the tparam count so the chokepoint
+    // below sees them and raises I0001 instead. That is the outcome the chokepoint's own
+    // comment asks for, not a new refusal.
+    while arg_tids.len() < num_tparams {
+        arg_tids.push(-1)
+    }
+    let ta_str = mono_csv_from_arg_tids(arg_tids)
     // I0001 chokepoint for the generic-FN path (br psrvff), the twin of emit_struct_lit's
     // below. Every generic-fn call's mono name funnels through here, at the point where
     // that name is finalized and before it is mangled and registered.
@@ -3283,40 +3252,13 @@ pub fn emit_generic_fn_call_tail(node: Int, fn_name: Str, args_str: Str, ca: Gen
             "this is a compiler bug — the type should have been inferred, or reported as error[CannotInferType]")
     }
     let mangled = mangle_generic_name(fn_name, ta_str)
-    // 0n07he Step 2b: carry the per-tparam concrete tids on EVERY slot the tid can
-    // faithfully spell, whether the CSV came from the tid path (tc_mono_csv) or the
-    // string-inference fallback (infer_fn_type_args_from_types). tc_mono_tids is
-    // per-slot (a real tid for an encodable slot, -1 for a deferred one), unlike the
-    // all-or-nothing tc_mono_csv — so it can upgrade the encodable slots of a CSV
-    // that string-inference produced.
-    //
-    // The alignment hazard is real and is now UNGUARDED here (br fsa9gf):
-    // tc_mono_tids_core aligns to tc_resolve_tparam_seg's slot order, but the infer CSV is
-    // built by a DIFFERENT walker, so the two can disagree on slot content/order.
-    // listop_slot_tid used to veto a slot whose tid did not reproduce THIS ta_str's
-    // segment byte-for-byte; it is an encodability-only gate now, so a divergent tid is
-    // KEPT. The symbol still comes from ta_str while the param/field types come from the
-    // tid, which is the br 6cvvh8 miscompile class: clean `cc`, wrong at runtime. It does
-    // NOT fail the Gen1==Gen2 gate — that gate only covers the compiler's own sources
-    // (project_self_host_doesnt_catch_user_codegen_bugs). A divergence reaching here is a
-    // bug in the PRODUCER (tc_mono_tids_core or the infer walker), and per qnpb2d's I5 rule
-    // it is fixed there, never by re-preferring the string.
-    // tc_mono_tids_subst upgrades the mono-calls-mono slots: when THIS call sits
-    // inside a monomorphized body (cg_mono_tparams_sl != -1), the nested arg's
-    // memoized tid still embeds the enclosing fn's typevar; passing the enclosing
-    // (tparams, arg_tids) lets the resolver substitute it to the concrete tid before
-    // deriving (szh3cy M→Model, ma6n41 T→Int inside Result[T,Str]). Outside a mono
-    // body the context is empty and this is byte-identical to tc_mono_tids. Every slot
-    // still passes through listop_slot_tid below, but that only screens out the
-    // UNSPELLABLE ones now — a substitution that diverges from ta_str's segment is kept,
-    // per the hazard above.
-    let raw_tids = tc_mono_tids_subst(node, gfn_node, cg_mono_tparams_sl, cg_mono_arg_tids)
-    let mut arg_tids: List[Int] = []
-    let mut ti = 0
-    while ti < raw_tids.len() {
-        arg_tids.push(listop_slot_tid(raw_tids.get(ti).unwrap()))
-        ti = ti + 1
-    }
+    // arg_tids and ta_str are now produced TOGETHER, above — the same list, rendered.
+    // The br fsa9gf alignment hazard that used to live here is GONE BY CONSTRUCTION
+    // rather than merely unguarded: it existed because ta_str could come from the string
+    // walker while arg_tids came from the tid walker, so the symbol and the def-side
+    // param/field types could disagree (the br 6cvvh8 miscompile class — clean `cc`,
+    // wrong at runtime). With one producer there is no second walker to disagree with,
+    // and no slot ordering to reconcile.
     register_mono_fn(fn_name, ta_str, arg_tids)
     register_mono_instance(fn_name, ta_str, arg_tids)
     let segs = segs_from_arg_tids(arg_tids)
@@ -4713,16 +4655,6 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
         }
         let args_sl = node_args(node)
         let mut args_str = ""
-        let mut arg_types: List[Int] = []
-        let mut arg_elem_types: List[Int] = []
-        let mut arg_err_elem_types: List[Int] = []
-        let mut arg_closure_sigs: List[Str] = []
-        let mut arg_struct_names: List[Str] = []
-        let mut arg_err_struct_names: List[Str] = []
-        let mut arg_map_key_types: List[Int] = []
-        let mut arg_map_key_structs: List[Str] = []
-        let mut arg_map_val_types: List[Int] = []
-        let mut arg_map_val_structs: List[Str] = []
         let is_generic = is_generic_fn(fn_name)
         let callee_params_sl = get_callee_params_sl(fn_name)
         reorder_named_args(fn_name, args_sl, node)
@@ -4745,19 +4677,6 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                 cg_expect_arg_ann = saved_arg_ann
                 cg_expect_fn_value_sig = saved_hint
                 args_str = args_str.concat(expr_result_str)
-                if is_generic != 0 {
-                    arg_types.push(expr_result_type)
-                    arg_elem_types.push(arg_elem_type_for(expr_result_type, expr_list_elem_type))
-                    arg_err_elem_types.push(arg_err_elem_type_for(expr_result_type))
-                    arg_closure_sigs.push(expr_closure_sig)
-                    arg_struct_names.push(arg_struct_name_for(expr_result_type, expr_result_str, expr_list_elem_struct))
-                    arg_err_struct_names.push(arg_err_struct_name_for(expr_result_type))
-                    let map_info = arg_map_info_for(actual, expr_result_type)
-                    arg_map_key_types.push(map_info.kt)
-                    arg_map_key_structs.push(map_info.ks)
-                    arg_map_val_types.push(map_info.vt)
-                    arg_map_val_structs.push(map_info.vs)
-                }
                 i = i + 1
             }
         } else if args_sl != -1 {
@@ -4775,37 +4694,12 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
                 cg_expect_arg_ann = saved_arg_ann
                 cg_expect_fn_value_sig = saved_hint
                 args_str = args_str.concat(expr_result_str)
-                if is_generic != 0 {
-                    arg_types.push(expr_result_type)
-                    arg_elem_types.push(arg_elem_type_for(expr_result_type, expr_list_elem_type))
-                    arg_err_elem_types.push(arg_err_elem_type_for(expr_result_type))
-                    arg_closure_sigs.push(expr_closure_sig)
-                    arg_struct_names.push(arg_struct_name_for(expr_result_type, expr_result_str, expr_list_elem_struct))
-                    arg_err_struct_names.push(arg_err_struct_name_for(expr_result_type))
-                    let map_info = arg_map_info_for(arg_node_i, expr_result_type)
-                    arg_map_key_types.push(map_info.kt)
-                    arg_map_key_structs.push(map_info.ks)
-                    arg_map_val_types.push(map_info.vt)
-                    arg_map_val_structs.push(map_info.vs)
-                }
                 i = i + 1
             }
         }
         args_str = append_ev_arg(fn_name, args_str)
         if is_generic != 0 {
-            let ca = GenericCallArgs {
-                types: arg_types,
-                elem_types: arg_elem_types,
-                err_elem_types: arg_err_elem_types,
-                closure_sigs: arg_closure_sigs,
-                struct_names: arg_struct_names,
-                err_struct_names: arg_err_struct_names,
-                map_key_types: arg_map_key_types,
-                map_key_structs: arg_map_key_structs,
-                map_val_types: arg_map_val_types,
-                map_val_structs: arg_map_val_structs,
-            }
-            let handled = emit_generic_fn_call_tail(node, fn_name, args_str, ca)
+            let handled = emit_generic_fn_call_tail(node, fn_name, args_str)
             if handled != 0 {
                 return
             }

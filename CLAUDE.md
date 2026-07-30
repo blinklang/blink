@@ -104,7 +104,7 @@ three BAILS, which are otherwise completely silent. Two
 things it CANNOT see: a slot whose unresolvable answer is a TUPLE STEM rather than a binder (br
 3aa3je — `blink_Box_Tuple2_Box_Int_int` still gets `void v;` with this channel silent), and any
 erasure outside these four resolvers. Measured floor is 0 — `binder-survived` and every `bail=*` —
-across the same 726 codegen-reaching files described under `ctagvoid` below, in the same sweep. A
+across the same 728 codegen-reaching files described under `ctagvoid` below, in the same sweep. A
 nonzero reading is a regression, not noise.) `ctagvoid` (the four
 things `tc_tid_to_c_tag` used to spell with the ONE string `"Void"`, now separated — br hsgsbp.
 `producer=genuine_void` is a real `TK_VOID` type argument, which is LEGAL and expected: Void is "an
@@ -118,17 +118,21 @@ COUNTERFACTUAL tap in `tc_tid_encodable`: every row is a site where rejecting `T
 hsgsbp originally asked for, and what `DECISIONS.md:342` forbids — would have flipped the answer and
 routed a genuine Void onto the string path. It also shows the propagation: the `TK_RESULT` arm means
 rejecting the kind would make `Result[Void, Str]` unencodable, a type `lib/std/` depends on and one
-the compiler synthesizes for every `?`-bearing `test` block. Measured (2026-07-30) over the 741-file
+the compiler synthesizes for every `?`-bearing `test` block. Measured (2026-07-30) over the 743-file
 corpus `tests/*.bl` + `examples/*.bl` + `examples/with_deps/{app,mathlib}/src/*.bl` + `src/cli.bl` +
-`src/blinkc_main.bl`, of which **726 actually reach codegen** — 15 die in an earlier phase and so
+`src/blinkc_main.bl`, of which **728 actually reach codegen** — 15 die in an earlier phase and so
 cannot reach any of these taps (`tests/xtest_question_mark_errors.bl` by design, plus 13 stale
 `examples/*.bl` and `with_deps`' app compiled standalone without its package context; note
 `task ci` does not compile `examples/` at all, so those are unguarded). Do NOT write the sweep as
 `examples/with_deps/app/*.bl` — that glob matches nothing, and a sweep using it silently reports the
 package as covered while contributing zero files. On that corpus the two ARMED buckets read
 **0** — that is the arming premise, re-measure before trusting it — while `genuine_void` reads **22**
-and `probe=encodable_void` **18**, all 40 in `tests/test_hsgsbp_box_void.bl`, the only fixture that
-instantiates anything at Void. Those two counts are the live-tap proof: before that fixture existed
+and `probe=encodable_void` **20**, all 42 in `tests/test_hsgsbp_box_void.bl`, the only fixture that
+instantiates anything at Void. (`probe=encodable_void` was 18 until the string-CSV producer was
+retired; the tid seams that replaced it call `tc_tid_encodable` twice more on genuinely-Void tids.
+The fixture's emitted C is byte-identical across that change, so the +2 is extra TAP TRAFFIC, not a
+behavior change — do not read a moved count here as a regression without diffing the C.)
+Those two counts are the live-tap proof: before that fixture existed
 all four buckets read 0 and it was an UNEXERCISED TAP, not coverage, provable only by hand-built
 shapes. If `genuine_void` ever drops back to 0, the fixture stopped reaching the tap — check that
 before concluding anything from the armed buckets' 0.
