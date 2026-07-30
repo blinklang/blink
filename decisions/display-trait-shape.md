@@ -9,7 +9,7 @@ Six panelists (systems, web/scripting, PLT, DevOps/tooling, AI/ML, minimalism) d
 The `Display` trait already existed (decided 5-0 to require strict impl for interpolation, see `display-format-protocol.md`), but its **shape** — single pull-style method `display() -> Str` — created two latent problems:
 
 1. **Quadratic allocation under composition.** Recursive `display` impls (trees, ASTs, nested structs) allocate a fresh `Str` at every level, then concatenate and discard. O(n·depth) allocator pressure under Blink's manual-memory model.
-2. **Hardcoded type dispatch in `sb.write`.** `src/codegen_methods.bl:754-798` switches on `CT_INT` / `CT_FLOAT` / `CT_BOOL` / `CT_STR` and falls back to `blink_sb_write` for everything else — meaning user types could never participate in the same surface. The spec gap explicitly cited this.
+2. **Hardcoded type dispatch in `sb.write`.** `src/codegen_methods.bl:770-820` switches on `CT_INT` / `CT_FLOAT` / `CT_BOOL` / `CT_STR` and falls back to `blink_sb_write` for everything else — meaning user types could never participate in the same surface. The spec gap explicitly cited this.
 
 Four sub-questions resolved:
 

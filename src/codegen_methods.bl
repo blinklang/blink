@@ -254,30 +254,52 @@ fn poly_impl_return_elem_tids(im: Int, recv_node: Int) -> List[Int] {
     tids
 }
 
-// 0n07he: byte-exact slot-tid admission guard shared by every mono-registration
-// site that carries per-slot tids alongside a string CSV (the stdlib list-ops
-// list_fold/for_each/any/all here, and emit_generic_fn_call_tail's free-fn path in
-// codegen_expr). A slot keeps its concrete tid ONLY when tc_seg_from_tid reproduces
-// the CSV segment (`csv_seg`) that mangling actually used, byte-for-byte. Any
-// divergence — an element the CT-tag path spelled "Void", an unencodable tid, a -1
-// from an unresolvable receiver, or an infer-CSV slot the tid can't reach — stores
-// -1, which the def-side resolver reports by passing the binder name through
-// unchanged. With the string tail gone that would spell a bare binder into a C
-// symbol, so a -1 here has to stay unreachable in practice.
+// ENCODABILITY gate for the mono-registration sites that carry per-slot tids alongside a
+// string CSV (the stdlib list-ops list_fold/for_each/any/all here, and
+// emit_generic_fn_call_tail's free-fn path in codegen_expr). A slot keeps its concrete tid
+// when tc_seg_from_tid can spell it at all, and stores -1 when it cannot — an unencodable
+// tid, or a -1 from an unresolvable receiver.
 //
-// This comment used to name the `_Void` grep as THE guard for that. It is not one: CLAUDE.md
-// documents that grep as a LOWER BOUND, and the bare-binder spelling it would have to catch
-// (`blink_List_T`) contains no "Void" at all, so the grep reads 0 on exactly the shape in
-// question (br pt4hsy, br w4c0py). The Gen1==Gen2 fixed-point gate proves byte-equality of
-// the compiler's own output and nothing about user programs (see
-// project_self_host_doesnt_catch_user_codegen_bugs). The honest statement is that a -1 here is
-// unguarded by any sound check, and stays correct only because no producer is known to reach
-// it; the `monofield` dbg_trace channel is the standing detector.
-pub fn listop_slot_tid(tid: Int, csv_seg: Str) -> Int {
-    let seg = tc_seg_from_tid(tid)
-    if seg.is_some() && seg.unwrap() == csv_seg {
-        return tid
-    }
+// What this used to ALSO do, and no longer does (br fsa9gf): compare the spelled segment
+// against the CSV segment mangling actually used, and veto the slot on any byte
+// divergence. The two CSVs can genuinely come from different walkers — `ta_str`
+// (codegen_expr.bl:3245-3250) is tc_mono_csv (tid-derived) OR
+// infer_fn_type_args_from_types (string inference), and tc_mono_csv is all-or-nothing, so
+// a 2-tparam call with one unspellable slot routes the WHOLE CSV to the string walker
+// while tc_mono_tids_core still holds a good tid for the other slot. The comparison
+// therefore vetoed slots that were fine, and its removal is what br fsa9gf asked for.
+//
+// Stated plainly, because the removal costs something: on a genuine tid-vs-CSV
+// divergence the surviving tid is now kept, and the symbol still comes from `ta_str`
+// while the param/field types come from the tid. That is the br 6cvvh8 miscompile
+// class — clean `cc`, wrong at runtime. The comparison was a loud tripwire for it. The
+// remaining detectors are the `monofield` channel (binder-survived + the three bails) and
+// emit_struct_lit's I0001 chokepoint; neither is sound, and NEITHER sees a slot whose
+// unspellable answer is a tuple stem (br 3aa3je).
+//
+// The `is_some()` gate is NOT part of what was deleted, and must stay: tc_mono_tids_core
+// does not gate on encodability before returning (it pushes tc_resolve_tparam_tid's raw
+// result, so a TK_TYPEVAR-bearing tid arrives non-negative). Storing those would flow `""`
+// segments out of segs_from_arg_tids into mono_name_from_ann / resolve_tuple_ann /
+// resolve_tparam_seg — i.e. into NAMES, mangling `blink_f_` — and the empty-segment
+// chokepoint is deliberately unarmed (codegen_expr.bl:5923-5927). Dropping it would be a
+// plain correctness regression, not a tripwire removal.
+//
+// NOTE on the name: several older comments here and in codegen_expr say "tc_mono_tids",
+// which is not a function — the pair is tc_mono_tids_subst (public entry) and
+// tc_mono_tids_core (the walker that actually builds the list). New text should spell the
+// real one.
+//
+// A -1 here is not a string fallback: the def-side resolver (resolve_tparam_via_tid,
+// :347-354) passes the binder name through UNCHANGED, which is I0001 on a return slot and
+// erased C on a param slot. Do not restore the claim that it degrades gracefully.
+// Do not name the `_Void` grep as the guard either: CLAUDE.md documents it as a LOWER
+// BOUND, and the bare-binder spelling it would have to catch (`blink_List_T`) contains no
+// "Void" at all, so it reads 0 on exactly the shape in question (br pt4hsy, br w4c0py).
+// Gen1==Gen2 proves byte-equality of the compiler's own output and nothing about user
+// programs (see project_self_host_doesnt_catch_user_codegen_bugs).
+pub fn listop_slot_tid(tid: Int) -> Int {
+    if tc_seg_from_tid(tid).is_some() { return tid }
     -1
 }
 
@@ -4278,15 +4300,18 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                 let args_sl = node_args(node)
                 // 0n07he Step 2a: recover the element binder's concrete tid from the
                 // receiver list (tc_tid_list_elem over the object node's memoized tid),
-                // carried through listop_slot_tid so it is fed as arg_tids ONLY when it
-                // byte-matches the type_name_from_ct CSV segment (else -1 → string seg,
-                // exactly as before). The reachable elements are scalars OR bare
-                // containers (List/Map/Set/Bytes) — the `elem_name != "Void"` guard above
-                // only excludes struct/enum (type_name_from_ct has no CT_STRUCT/CT_ENUM
-                // case → "Void"). For both admitted kinds tc_tid_to_c_tag spells a bare
-                // tag matching type_name_from_ct, so the byte-match holds; do NOT assume
-                // a scalar-only shape here (a List[List[Int]].fold carries elem_name
-                // "List"). The guard is what keeps every slot safe, not the element kind.
+                // carried through listop_slot_tid so an unencodable slot stores -1 rather
+                // than a tid nothing can spell. A -1 is NOT a string fallback — the
+                // def-side resolver passes the binder through unchanged (:347-354), which
+                // is I0001 on a return slot and erased C on a param slot. The reachable
+                // elements are scalars OR bare containers (List/Map/Set/Bytes) — the
+                // `elem_name != "Void"` guard above only excludes struct/enum
+                // (type_name_from_ct has no CT_STRUCT/CT_ENUM case → "Void"). Both
+                // admitted kinds are encodable, so the gate passes them; do NOT assume a
+                // scalar-only shape here (a List[List[Int]].fold carries elem_name
+                // "List"). Since br fsa9gf the gate no longer checks that the tid's
+                // spelling MATCHES type_name_from_ct's, so nothing here reports a
+                // divergence between the two.
                 let elem_tid = tc_tid_list_elem(tc_lookup_node_tid(node_obj(node)))
                 if method == "fold" {
                     emit_expr(sublist_get(args_sl, 0))
@@ -4297,7 +4322,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                     emit_expr(sublist_get(args_sl, 1))
                     let fn_str = expr_result_str
                     let ta_str = "{elem_name},{init_name}"
-                    let arg_tids = [listop_slot_tid(elem_tid, elem_name), listop_slot_tid(init_tid, init_name)]
+                    let arg_tids = [listop_slot_tid(elem_tid), listop_slot_tid(init_tid)]
                     let mangled = mangle_generic_name(stdlib_name, ta_str)
                     register_mono_fn(stdlib_name, ta_str, arg_tids)
                     register_mono_instance(stdlib_name, ta_str, arg_tids)
@@ -4310,7 +4335,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                     emit_expr(sublist_get(args_sl, 0))
                     let fn_str = expr_result_str
                     let ta_str = elem_name
-                    let arg_tids = [listop_slot_tid(elem_tid, elem_name)]
+                    let arg_tids = [listop_slot_tid(elem_tid)]
                     let mangled = mangle_generic_name(stdlib_name, ta_str)
                     register_mono_fn(stdlib_name, ta_str, arg_tids)
                     register_mono_instance(stdlib_name, ta_str, arg_tids)
