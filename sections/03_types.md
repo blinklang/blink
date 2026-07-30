@@ -16,6 +16,16 @@ The foundation is Hindley-Milner type inference extended with algebraic data typ
 
 4. **Inference is a token budget.** Every type annotation an AI writes costs tokens. Every annotation a human writes costs keystrokes. The inference engine should eliminate redundant annotations everywhere it can -- but never at function boundaries, where types serve as API documentation.
 
+#### Diagnostic Discipline (normative)
+
+Three rules govern every diagnostic the type system emits. They constrain diagnostics not yet written, and each is checkable one diagnostic at a time.
+
+1. **Never emit a diagnostic whose prescribed repair does not exist.** If a rule rejects a program, some edit the diagnostic names must make the program legal. A `help:` that cannot be followed is worse than silence, because both a human and a tool will follow it — and a machine-applicable fix that compiles while deleting the construct the user needed is the worst outcome of all.
+
+2. **Every typing rule must be visible to `blink check`.** No rule is enforced only at codegen. A rule the front end cannot see is a rule no editor, no formatter, no fixer, and no agent in a loop can act on, and it turns a user error into an internal compiler error. The `UnsolvedTypeVarAtCodegen` backstop (I0001) exists to catch violations of *this* rule, not to serve as one.
+
+3. **Diagnostics at one program point must converge.** When more than one diagnostic fires at the same point, at least one prescribed repair, applied, must discharge all of them — and it must be the repair the diagnostic names *first*. Two diagnostics that each demand the opposite of the other leave the user with no terminating edit; a converging repair that is offered second is a guarantee a mechanical fixer never reaches.
+
 ---
 
 ### 3.2 Built-in Types
@@ -1129,11 +1139,94 @@ let pair = Pair { first: "hello", second: 42 }  // Pair[Str, Int]
 let tree = Branch(Leaf(1), Leaf(2))              // Tree[Int]
 ```
 
+#### Explicit Type Application
+
+A generic function's type parameters may also be supplied **explicitly**, in square brackets written directly after the callee:
+
+```blink
+let forecast = json.decode[Forecast](body)?
+let buf = alloc_ptr[U8]()
+```
+
+Explicit type application is a third supply mechanism alongside inference at a construction site and a type annotation on the binding. All three name the same type parameters and differ only in where the program writes them. Brackets in this position can never be confused with indexing or comparison — Blink has no index operator, and element access is `.get()` (§2.6).
+
+**No erasure.** Every type parameter a declaration binds belongs to that declaration's monomorphization key, whether or not a parameter type or the return type mentions it. `probe[Int]()` and `probe[Str]()` are distinct instantiations and compile to distinct functions. A type parameter is never dropped from the key, never defaulted, and never collapsed onto another instantiation's — the guarantee §3.4 *Under-Determined Types* makes at a binding, applied to a declaration.
+
+**When brackets are mandatory.** A type parameter is **supplied by the signature** when it occurs in a parameter type or in the return type: inference solves it from the call's arguments, or from the annotation on the binding the call feeds. A type parameter the signature does not supply has no other source, so every call must write it:
+
+```blink
+fn probe[T]() -> Int { 1 }       // T occurs in no parameter type and not in the return type
+
+fn main() {
+    let n = probe[Int]()         // OK -- the call supplies T
+    let m = probe()              // error[CannotInferType]: type parameter `T` of `probe` has
+                                 //   no source -- it is bound by the declaration but supplied
+                                 //   by neither a parameter nor the return type
+}
+```
+
+Whether a type parameter is supplied by the signature is decidable from the signature alone — no call site, and no function body, is consulted.
+
+**Where the error is reported.** `error[CannotInferType]` (E0301) is reported **where its repair attaches**. For an under-determined *binding* that is the `let` (§3.4 *Under-Determined Types*). For a type parameter with no source it is the call's type-argument position, because that is where the brackets go — including when the call stands alone as a statement and there is no binding to annotate:
+
+```blink
+fn main() {
+    probe()                      // error[CannotInferType] reported at the call, not at a binding
+}
+```
+
+**Two repairs, in a fixed order.** When a call is under-determined *and* the declaration binds a type parameter nothing supplies, two repairs exist: write the type argument at this call, or delete the binder from the declaration. The order in which a diagnostic offers them is **normative, not presentational** — a tool, or a reader, applies the first `help:` and stops.
+
+**Deleting the binder is offered first** whenever the lint below reports it as removable. Both repairs make the program compile, but only the deletion discharges both diagnostics at once, and it discharges them for every other call of that declaration rather than for this one. Offering the type argument first would make the path of least resistance "write `[Int]` and leave a meaningless binder in place" — one keystroke in an editor, applied unread, at every call site of a declaration whose signature is the actual defect. Where the binder is *not* removable, the type argument is the only repair and is offered alone.
+
+**All type-argument lists obey one discipline.** Wherever a program may write a type expression, it may write its type arguments explicitly, and the rules are the same in every position — a callee, a parameter type, a return type, a field type, a nested type argument, or a struct-literal head:
+
+```blink
+let r = Registry[User] { entries: [] }      // OK -- brackets on a struct-literal head
+```
+
+- **All or none.** A type-argument list supplies every one of the declaration's type parameters or none of them. There is no partial application and no placeholder for "infer this one."
+- **Arity is exact.** Supplying the wrong count is an error, not a prompt to infer the remainder.
+- **Bounds are checked against the arguments as written.** An explicit type argument satisfies the binder's bounds or the call is rejected; explicitness never bypasses a bound.
+
+**A redundant type-argument list is permitted and carries no diagnostic.** When inference would have reached the same answer, writing the arguments anyway is neither an error nor a warning nor a lint — exactly as `let x: Int = 1` is permitted where `let x = 1` would do. A diagnostic here would be non-monotonic: adding an annotation elsewhere in the program could make an untouched line retroactively noisy.
+
+**Phantom type parameters are legal in user code.** Because no binder is erased, a type parameter mentioned by no field is supplied by the type annotation and keeps its instantiations distinct:
+
+```blink
+type Template[C] {
+    source: Str
+}
+
+let db: Template[DB] = Template { source: "SELECT 1" }
+let sh: Template[Shell] = Template { source: "ls" }     // a distinct type from Template[DB]
+```
+
+`Template[DB]` and `Template[Shell]` are different types, and neither is assignable to the other. This pattern is not reserved to compiler-known types — it is the same mechanism `Template[C]` uses (§3b.5), available to user code on the same terms.
+
+**Lint: a type parameter that occurs nowhere.** `W0604 UnusedTypeParamBinder` fires when **the type parameter occurs nowhere in the declaration or its body.** That is the whole gate, and it is decided by inspection of one declaration:
+
+```blink
+fn tag[T]() -> Int { 1 }                       // W0604 -- T occurs nowhere; the binder is removable
+
+fn assert_serializable[T: Serialize]() { }     // no warning -- T occurs in its own bound
+fn probe[T]() -> Int { let xs: List[T] = [] xs.len() }  // no warning -- T occurs in the body
+fn cell[T]() -> Ptr[T] { alloc_ptr[T]() }      // no warning -- T occurs in the return type
+```
+
+A **bound is an occurrence.** `T: Serialize` partitions the instantiations into well-typed and ill-typed, so the binder decides which programs exist: `assert_serializable[NotSerializable]()` is rejected and `assert_serializable[User]()` is accepted. Deleting that binder would accept both. A declaration whose only mention of `T` is its bound is a compile-time assertion, and warning that `T` is unused would assert something untrue about the code.
+
+*Rationale (normative).* The gate is drawn where it is because **W0604 fires exactly when deleting the binder is a safe edit** — when the declaration still compiles afterwards and means the same thing, so the fix the lint prescribes cannot break working code. Occurrence is what makes that property checkable: any mention of `T` anywhere in the declaration or its body is a way the declaration could depend on `T`, and a mention in a body form the language has not been given yet is still a mention. Stated as a predicate the counterfactual needs machinery the gate does not — the comparison is between programs modulo the mechanical erasure of type-argument lists at call sites, since deleting any binder turns `tag[Int]()` into an arity error on its own. The occurrence clause is the rule; safety of the prescribed edit is the reason the rule is drawn there. If a future type position lets a body depend on `T` without naming it, this rationale is the criterion for amending the clause.
+
+W0604 is a warning and not an error: a binder nothing supplies is still callable, because the brackets reach it. Nothing about such a declaration is unsound — it is merely a declaration whose every call must carry a type argument that changes nothing, and the lint is what keeps those out of a codebase.
+
 #### Under-Determined Types
 
 Inference at a binding is a two-state judgment: either every type variable is resolved to a concrete type, or the ones that cannot be resolved are **reported**. There is no third state — Blink never *defaults* an unresolved type variable to a concrete type, and there is no user-facing "unknown" or "any" type that inference can fall into.
 
-When Hindley-Milner inference finishes a binding with a type variable still unbound — not fixed by an annotation and not fixed by any later use — that binding is `error[CannotInferType]`. The single repair is a type annotation.
+When Hindley-Milner inference finishes a binding with a type variable still unbound — not fixed by an annotation and not fixed by any later use — that binding is `error[CannotInferType]`. The repair for a binding is a type annotation.
+
+> **The repair is whatever reaches the open type variable, and E0301 is reported where that repair attaches.** For the bindings below, an annotation on the `let` reaches it, so the diagnostic points at the `let`. For a type parameter that the callee's signature does not supply, the annotation cannot reach it and the repair is an explicit type-argument list at the call — so the diagnostic points there instead, including when the call is a bare statement with no binding at all (§3.4 *Explicit Type Application*). One rule, one diagnostic, reported at the edit that fixes it.
 
 ```blink
 fn f() {
@@ -1189,7 +1282,9 @@ fn f() {
 }
 ```
 
-The diagnostic points at the binding — where the annotation fix applies — and carries a secondary span at the empty constructor (`Map()` / `[]`) explaining why the parameter is open (see §5 for `error[CannotInferType]`, E0301). This mirrors the `AmbiguousConstruction` rule (§3.3): no path ever silently picks a winner. It is also the Hindley-Milner discipline Blink's ancestry (§1.3) shares with OCaml, SML, Haskell, and Rust — an unconstrained type variable is resolved by unification or reported, never assigned a type the program did not ask for.
+The diagnostic points at the binding — where the annotation fix applies — and carries a secondary span at the empty constructor (`Map()` / `[]`) explaining why the parameter is open (`error[CannotInferType]`, E0301 — see [ERROR_CATALOG.md](../ERROR_CATALOG.md)). This mirrors the `AmbiguousConstruction` rule (§3.4): no path ever silently picks a winner.
+
+**A type parameter named by no field is reported too.** The rule is the same one: every type parameter the declaration binds must be determined, and a phantom parameter is determined only by an annotation on the binding or by a type-argument list on the literal head. So `let w = W { n: 1 }` for `type W[T] { n: Int }` is `error[CannotInferType]` on `T` — repaired by `let w: W[Int] = W { n: 1 }` or by `let w = W[Int] { n: 1 }`. This follows from *no erasure* (§3.4 *Explicit Type Application*): a phantom parameter is part of the type's identity, so leaving it open leaves the type open. It is also the Hindley-Milner discipline Blink's ancestry (§1.3) shares with OCaml, SML, Haskell, and Rust — an unconstrained type variable is resolved by unification or reported, never assigned a type the program did not ask for.
 
 > There is no surface `unknown` / `any` / `?` type in Blink. The concept "a type not yet known" exists only inside the compiler as a transient inference state; it is never a type a program can name, hold, or produce. A value's type is always fully determined or the program does not type-check.
 
@@ -2126,6 +2221,18 @@ impl[T] Display for List[T] where T: Display {
 ```
 
 The `[T]` after `impl` introduces the type parameter; the `where` clause states the bounds it must satisfy.
+
+**An impl binder must occur in the impl header's type positions.** A type parameter declared after `impl` must appear in the trait's type arguments, in the receiver's type arguments, or both. A binder appearing in neither is rejected at the declaration with `error[ImplBinderUnused]` (E0909):
+
+```blink
+impl[T] Show for IntBox { ... }          // E0909 -- T appears in neither the trait nor the receiver
+impl[T] Convert[T] for IntBox { ... }    // OK -- T binds the trait's type argument
+impl[T] Show for Box[T] { ... }          // OK -- T binds the receiver's type argument
+```
+
+**A `where`-clause bound does not rescue an impl binder.** `impl[T] Show for IntBox where T: Display` is still E0909. A bound *constrains* a type parameter; it does not *determine* one. An impl is selected by matching the trait and the receiver, so the header's type positions are the only places a selection could ever fix what `T` stands for — a binder absent from both is unfillable no matter how it is bounded.
+
+This is the mirror image of the W0604 gate (§3.4 *Explicit Type Application*), and the two are consistent rather than contradictory. There, a bound *is* an occurrence, because a generic function's binder can be supplied by an explicit type argument and the bound decides which arguments are accepted. Here there is no supply site at all: impl selection admits no type-argument list, so no use site could ever repair the declaration. That distinction — between *constraining* a type parameter and *determining* it — is what makes a declaration-site **error** the right severity for an impl binder and a **warning** the right severity for a function binder. A declaration is rejected outright only when no use site could ever repair it; where a use site can, the diagnostic goes to the use site and the declaration gets a lint.
 
 **Compilation model: monomorphization.** Each distinct instantiation referenced in the program (`List[Int]`, `List[Str]`, `List[User]`, etc.) compiles to a separate function. The compiler substitutes the concrete type for `T` before codegen, so each instantiation has type-appropriate storage and method dispatch baked in. The linker's dead-code stripping (`--gc-sections`) removes instantiations the final binary does not call. Stdlib monomorphizations live in the stdlib archive's `monolith.o`; user-code monomorphizations live as `static inline` in each `.o` that instantiates them. See [generic-mono-ownership-per-module](../decisions/generic-mono-ownership-per-module.md) for the storage rules.
 

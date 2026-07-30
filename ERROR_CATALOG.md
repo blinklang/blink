@@ -26,6 +26,7 @@ error[NonExhaustiveMatch]: non-exhaustive match
 - **Codes** are secondary comblink identifiers (E/W + 4 digits). Codes are never reused after retirement.
 - **Suppression** uses names: `@allow(NonExhaustiveMatch)`.
 - **`blink explain <name>`** prints a detailed explanation (future — not yet implemented).
+- **Every entry in this catalog is bound by the three rules in §3.1 *Diagnostic Discipline*:** a diagnostic never prescribes a repair that does not exist, no rule is enforced only at codegen, and diagnostics firing at one program point must converge on a repair the first `help:` names.
 
 ---
 
@@ -67,7 +68,7 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | Name | Code | One-line | Category | Spec ref |
 |------|------|----------|----------|----------|
 | TypeError | E0300 | Type mismatch detected during type checking | Type checking | §3 |
-| CannotInferType | E0301 | Inference left a binding's type variable unbound; annotate the binding | Type checking | §3.3 |
+| CannotInferType | E0301 | Inference left a type variable unbound — annotate the binding, or supply the type argument at the call when the callee's signature does not supply it. Reported where the repair attaches | Type checking | §3.4 |
 | TemplateMismatch | E0310 | String template parameter type does not match argument | Type checking | §3 |
 | UndeclaredEffect | E0500 | Callee requires effect not declared by caller | Effects | §4.5 |
 | CapabilityBudgetExceeded | E0501 | Function effect exceeds module `@capabilities` budget | Effects | §4.8 |
@@ -173,6 +174,7 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | SetButNotRead | W0601 | Variable assigned but value never read | Linting | §6 |
 | UnusedImport | W0602 | Module imported but no symbols referenced | Linting | §6 |
 | ShadowedVariable | W0603 | Variable shadows another with the same name in an outer scope | Linting | §6 |
+| UnusedTypeParamBinder | W0604 | Type parameter occurs nowhere in the declaration or its body; the binder is removable | Linting | §3.4 |
 | UnreachableCode | W0700 | Code follows an unconditional return/break/continue | Linting | §6 |
 | ArenaEffectRedundant | W0701 | `! Arena` on a function where every Arena call is already inside `with arena { }` | Arena | §5.2 |
 | BitwisePrecedence | W0702 | Bitwise `&`/`|` mixed with comparison without parentheses | Linting | §6 |

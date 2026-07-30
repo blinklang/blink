@@ -4,12 +4,36 @@
 
 **Spec gap:** br `8vcj2c` — *First-class "unknown" type: uniform treatment of under-determined types across all inference sites.*
 
-**Status: implemented.** The 6-0 vote below stands and the normative spec (`sections/03_types.md`
-§3.3) is unchanged. One detail of the *rationale* is now historical: the `blink_map_ensure_kops` /
+**Status: implemented.** The 6-0 vote below stands. The normative spec lives at
+`sections/03_types.md` **§3.4** *Under-Determined Types* — this rationale originally cited §3.3,
+which is *Type Inference*; the heading has always been a `####` inside §3.4. The rule itself is
+unchanged except for the report site, amended below. One detail of the *rationale* is now
+historical: the `blink_map_ensure_kops` /
 `blink_set_ensure_kops` runtime patch described throughout as the "current accident" was retired
 in commit `ac31647` once E0301 + the I0001 ICE backstop moved the vtable decision to construction
 time — the constructor now pins the vtable directly, making the runtime rebind a no-op.
 Every reference to it below describes the pre-metavar state of the compiler, not current behaviour.
+
+**Amended 2026-07-29 by br `8w0yj9` (V1-c, 6-0) — the report site.** Q4 below decided
+*report-at-binding* 6-0, and the spec stated the universal *"The single repair is a type
+annotation."* Both are now **narrowed to bindings**. This deliberation was scoped to
+inference-site under-determination, where the open type variable is always reachable from a
+`let`; it did not consider a type parameter that the callee's signature never supplies. For
+`fn tag[T]() -> Int { 1 }`, the binding `let n = tag()` has type `Int`, fully concrete, and **no
+annotation on it can reach `T`** — so the prescribed repair does not exist, and in statement
+position (`tag()`) there is no binding to report at, which fell through to the I0001 ICE where a
+plain user error belongs. The amended rule:
+
+> **E0301 is reported where its repair attaches.** For an under-determined *binding* that is the
+> `let`, with the dual-span blame at the empty constructor exactly as decided below. For a type
+> parameter the signature does not supply, it is the call's **type-argument position** — including
+> when the call stands alone as a statement.
+
+One rule and one diagnostic, as Q1 intended; the report site is derived from the repair rather
+than fixed at the binding. The reason this could not be folded silently into §3 is that Q4's
+tally was cast on the binding formulation, so the generalization is a recorded amendment and not
+a re-reading. See [Explicit Type Application](explicit-type-application.md) for the deliberation,
+which also corrected this rationale's and the catalog's `§3.3` spec-ref.
 
 ### Panel Deliberation
 
