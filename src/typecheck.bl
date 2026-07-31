@@ -8718,6 +8718,21 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         let elems_sl = node_elements(node)
         if elems_sl != -1 && sublist_length(elems_sl) > 0 {
             let first_t = infer_type(sublist_get(elems_sl, 0))
+            // Every element beyond the first must still be visited: infer_type is
+            // what memoizes a per-node tid (tc_node_tid), and a CALL-style
+            // generic-enum/struct constructor's mono-name recovery
+            // (register_mono_enum_from_node / register_struct_instance_from_tid)
+            // reads that memo via tc_lookup_node_tid. Before this loop, elements
+            // 1..N were never inferred at all, so a 2nd+ `Tree.Leaf(n)` in one
+            // list literal fell back to the erased bare head at construction —
+            // not a codegen list-elem-channel gap, a typecheck one (br tydqe6).
+            // The List's own element type still comes from element 0 only,
+            // matching pre-existing homogeneity assumptions and diagnostics.
+            let mut ei = 1
+            while ei < sublist_length(elems_sl) {
+                infer_type(sublist_get(elems_sl, ei))
+                ei = ei + 1
+            }
             return make_list_type(first_t)
         }
         // Empty `[]`: mint a fresh element metavar α (gqg3rk) so a later
@@ -10214,16 +10229,14 @@ fn tid_inner_struct(inner: Int) -> Str {
         // the top-level branch; "" from tc_tid_struct_mono_name (bare base, typevar,
         // module-qual) keeps the bare fallback.
         //
-        // An ENUM INSTANCE inner keeps DEFERRING to its bare head here: jjhnf3 widened
-        // tc_tid_struct_mono_name to spell enum instances, but this Set/Map-element
-        // accessor feeds the kops element/decoder path whose encodability gates
-        // (tc_struct_slot_encodable et al.) still defer enum instances (dbzy4r). Surfacing
-        // Tree_Int here while those gates defer would reference an unemitted kops carrier;
-        // keep the bare fallback until dbzy4r relaxes the gates holistically.
-        if it.kind != TK_ENUM {
-            let stem = tc_tid_struct_mono_name(inner)
-            if stem != "" { return stem }
-        }
+        // An ENUM INSTANCE inner now shares this path with struct instances (br
+        // tydqe6): tc_struct_slot_encodable / tc_tid_encodable already admit an enum
+        // instance via this same tc_tid_struct_mono_name (br 82ajft item 1), so the
+        // "defer until the gates widen" premise here was stale — the gates had
+        // already widened. `stem != ""` still falls through to the bare fallback for
+        // a bare base, typevar, or module-qualified name, exactly as the struct arm.
+        let stem = tc_tid_struct_mono_name(inner)
+        if stem != "" { return stem }
         return strip_module_qualifier(it.name)
     }
     ""
@@ -10543,7 +10556,6 @@ pub fn tc_tid_struct_slot_seg(slot: Int) -> Str {
 // compound (Option/Result/Map) whose inners are all scalars, because
 // tc_tid_to_c_tag then produces exactly the blink_Option_int / blink_Result_int_str
 // carrier the field value registers. We REJECT:
-//   - an ENUM INSTANCE slot: still deferred, waiting on dbzy4r/82ajft.
 //   - a compound whose inner is itself a struct/enum or another compound
 //     (`Option[Box[Int]]`, `Option[Option[Int]]`): can diverge in the field-value
 //     registration path; defer (orthogonal follow-up).
@@ -10566,18 +10578,27 @@ pub fn tc_tid_struct_slot_seg(slot: Int) -> Str {
 // on both other sides — and tc_tid_scalar_tag already erases TK_LIST/TK_SET/TK_BYTES
 // identically for all three, so `(Int, List[Str])` byte-matches everywhere.
 //
-// A STRUCT-INSTANCE slot is ADMITTED (br 6cvvh8) iff tc_tid_struct_mono_name spells it
-// — the very predicate the def-side slot speller (tc_tid_struct_slot_seg) and the mono
-// registrar already consult first, so admitting on it cannot split the name from the
-// typedef. Before this arm `let e: GT[QB[Int]] = GT { s: Set() }` had no producer at
-// all: the string tier bails on every compound annotation arg, so the literal reached
-// codegen with 'Void'. The BARE generic base (params_count 0) is unaffected — its mono
-// name is "" — and so is every already-working shape, because the string tier is
-// consulted before this one at the mono_args selector.
+// A STRUCT-OR-ENUM-INSTANCE slot is ADMITTED (br 6cvvh8; TK_ENUM joined under br
+// tydqe6) iff tc_tid_struct_mono_name spells it — the very predicate the def-side
+// slot speller (tc_tid_struct_slot_seg) and the mono registrar already consult
+// first, so admitting on it cannot split the name from the typedef. Before br
+// 6cvvh8 this arm `let e: GT[QB[Int]] = GT { s: Set() }` had no producer at all: the
+// string tier bails on every compound annotation arg, so the literal reached
+// codegen with 'Void'. The BARE generic base (params_count 0) is unaffected — its
+// mono name is "" — and so is every already-working shape, because the string tier
+// is consulted before this one at the mono_args selector. TK_ENUM was excluded
+// until tydqe6 on the premise that the encodable gates still deferred it (br
+// dbzy4r) — but tc_tid_encodable (:10980-10986) and tc_struct_slot_encodable
+// (:11396-11402) already admit an enum instance via this same predicate (br 82ajft
+// item 1), so the carve-out here was stale.
 //
-// TK_ENUM stays excluded: a generic-enum instance's mono lowering is still landing
-// (br dbzy4r), and admitting one here would name an instance the def side cannot yet
-// emit a typedef for.
+// NOTE: this predicate currently has no callers anywhere in the repo (confirmed by
+// grep, br tydqe6) — it is exported and imported into codegen_expr.bl's namespace
+// but never invoked there. Widening its TK_ENUM arm above is therefore a no-op today;
+// R2 of tests/test_tydqe6_generic_enum_instance_mono.bl passes via the
+// emit_mono_struct_typedef admission (src/codegen_stmt.bl), not via this function.
+// Keep the widening (it documents the intended admission for whenever a caller is
+// wired up) but don't rely on it as the cause of any observed behavior change.
 pub fn tc_tid_compound_slot_faithful(tid: Int) -> Bool {
     if tid < 0 || tid >= ty_pool.len() { return false }
     let t = ty_pool.get(tid).unwrap()
@@ -10586,7 +10607,7 @@ pub fn tc_tid_compound_slot_faithful(tid: Int) -> Bool {
     if k == TK_RESULT { return tc_tid_scalar_only(t.inner1) && tc_tid_scalar_only(t.inner2) }
     if k == TK_MAP { return tc_tid_scalar_only(t.inner1) && tc_tid_scalar_only(t.inner2) }
     if k == TK_TUPLE { return tc_tid_tuple_encodable(t) }
-    if k == TK_STRUCT { return tc_tid_struct_mono_name(tid) != "" }
+    if k == TK_STRUCT || k == TK_ENUM { return tc_tid_struct_mono_name(tid) != "" }
     false
 }
 
@@ -10615,12 +10636,11 @@ pub fn tc_tid_compound_slot_faithful(tid: Int) -> Bool {
 //     speller the tid path uses), so the value carrier and the mono param are byte-identical by
 //     construction — the 637sy9 equivalence for a DIRECT bare-struct tuple element, reused for
 //     the wrapped leaf. A Map/Option/Result inner CONTAINING a bare struct/enum leaf rides too.
+//   - a struct/enum INSTANCE leaf (params_count != 0, e.g. QBox[Int]/Tree[Int]): admitted
+//     (br bee854 for struct, br tydqe6 for enum) — see the two comments beside the
+//     `params_count != 0` arm below.
 // DEFERS (the string path stays authoritative — a too-loose gate breaks the Gen1==Gen2
 // fixed point OR emits divergent carriers):
-//   - a struct/enum INSTANCE leaf (params_count != 0): the Option/Result carrier typedef for an
-//     instance inner erases its value member to void*/bare-blink_QBox and mints a divergent bare
-//     carrier alongside the mono one — a carrier-member-emission gap deeper than this gate.
-//     Follow-up ticket. (An enum instance additionally waits on dbzy4r/82ajft.)
 //   - tuple, typevar, iterator/handle/channel, unknown.
 pub fn tc_tid_inner_tag_faithful(tid: Int) -> Bool {
     if tid < 0 || tid >= ty_pool.len() { return false }
@@ -10668,13 +10688,13 @@ pub fn tc_tid_inner_tag_faithful(tid: Int) -> Bool {
     // thread the mono stem + register the instance (register_carrier_inner_mono_instance), so
     // both paths converge on the single blink_Option_QBox_Int (blink_QBox_Int* value).
     //
-    // A generic-enum INSTANCE (TK_ENUM, params_count != 0) STILL DEFERS: its mono
-    // (blink_Tree_Int) rides only once generic-fn-over-enum + the encodable gates land
-    // (br 82ajft / dbzy4r). Admitting it here before those would mint an un-typedef'd enum
-    // mono member. Mirrors tc_tid_tuple_elem_encodable's enum-instance carve-out (:9425) and
-    // tc_struct_slot_encodable (:9474) — all three widen together with 82ajft item 1.
+    // A generic-enum INSTANCE (TK_ENUM, params_count != 0) is now admitted alongside
+    // TK_STRUCT (br tydqe6): the encodable gates (tc_tid_encodable, tc_struct_slot_
+    // encodable) already spell it via tc_tid_struct_mono_name (Tree_Int), so it rides
+    // the tid path exactly like a struct instance — the "still defers" carve-out that
+    // used to live here was stale once those gates widened under br 82ajft item 1.
     if t.params_count != 0 {
-        if k == TK_STRUCT { return true }
+        if k == TK_STRUCT || k == TK_ENUM { return true }
         return false
     }
     if k == TK_STRUCT || k == TK_ENUM { return true }

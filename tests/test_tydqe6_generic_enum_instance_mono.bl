@@ -1,0 +1,219 @@
+// br tydqe6: generic-enum-instance monomorphization outside the bare-local seam.
+//
+// br dbzy4r closed 2026-07-20 with "No residual", promising to relax the generic-enum
+// deferral HOLISTICALLY once the encodability gates admitted enum instances (82ajft item
+// 1). They did — tc_tid_encodable (typecheck.bl:10980-10986) and tc_struct_slot_encodable
+// (typecheck.bl:11396-11402) both already admit TK_ENUM via tc_tid_struct_mono_name. But
+// three sites still deferred on a stale "dbzy4r hasn't landed yet" premise:
+//   1. tid_inner_struct (typecheck.bl:10206-10230) — the Set/Map/List *element* recovery
+//      accessor kept a `if it.kind != TK_ENUM` bare-head carve-out.
+//   2. tc_tid_compound_slot_faithful (typecheck.bl:10581-10591) — TK_STRUCT admitted via
+//      tc_tid_struct_mono_name, TK_ENUM excluded outright.
+//   3. tc_tid_inner_tag_faithful (typecheck.bl:10625-10682) — same asymmetry, plus stale
+//      cross-references to line numbers that no longer name the gates they claimed to.
+// Fourth, a codegen-side gap: the list-element metadata channel
+// (set_list_elem_struct / codegen_types.bl:3228) only ever received the BARE base
+// ("Tree"), never the mono stem, because nothing fed it one — so even once the
+// typecheck gates widen, a List[Tree[Int]] element still names an unemitted symbol.
+//
+// ── LEDGER: every row's state, measured directly against build/blink at git rev
+//    819fc8b (pre-fix), via the shape `type Tree[T] \{ Leaf(value: T) Branch(left:
+//    Tree[T], right: Tree[T]) }` unless noted ──
+//
+//   R1  `let xs: List[Tree[Int]] = [...]`, plain local, element matched   RED —
+//         cc failure: `_scrut_N` undeclared / `variable or field 'v' declared void` /
+//         `blink_Tree _l` (bare, undeclared type) — the list-element channel stores the
+//         bare base "Tree", not the mono stem "Tree_Int".
+//   R2  `let a: Box[Tree[Int]] = Box \{ v: Tree.Leaf(1) }`, a.v matched   RED — cc
+//         failure: `void v;` field declaration (tid_inner_struct/faithful gates erase
+//         the direct struct-instance SLOT to Void), `invalid initializer`,
+//         `incompatible types when initializing type 'int'`.
+//   R3  `let a: Box[List[Tree[Int]]] = ...`, element matched              RED —
+//         identical cc failure shape to R1 (same list-element channel gap, reached
+//         through an extra Box indirection).
+//   R4  `Tree[Int]` and `Tree[Str]` bare locals, BOTH matched, live together   GREEN
+//         already — measured emitted C carries two DISTINCT typedefs
+//         (`blink_Tree_Int`, `blink_Tree_Str`), not one shared representation. A
+//         generic ENUM instance is a NAMED mono position (unlike List/Set/Map, which
+//         are non-injective per tc_tid_seg_injective) — this is the injectivity
+//         witness the ticket's holistic fix must not regress.
+//   R5  GREEN CONTROL: `let t: Tree[Int] = Tree.Leaf(1)` bare local, matched   GREEN
+//         already — exit 0. Guards the bare-base variant-lookup path
+//         (codegen_stmt.bl:3008-3015) that the fix must leave untouched.
+//   R6  GREEN CONTROL: `Box[List[Box[Int]]]` (jw1pmb R7's struct-instance shape)   GREEN
+//         already — exit 0. Proves the pre-existing STRUCT branch of tid_inner_struct
+//         and the list-element channel are undisturbed by widening the ENUM branch.
+//
+// ── WHAT TO CHECK IF THIS FILE REGRESSES ──
+//  1. `build/blink build --emit c tests/test_tydqe6_generic_enum_instance_mono.bl` and
+//     read the cc error if there is one — R1-R3's failure shape is always
+//     `void`-declared field / undeclared bare `blink_Tree` type, never a typecheck
+//     diagnostic (the gates fail SILENT-open into codegen, not loud at typecheck).
+//  2. If R2 regressed: tc_tid_compound_slot_faithful / tc_tid_inner_tag_faithful
+//     (typecheck.bl, beside their TK_STRUCT arms) — the TK_ENUM admission via
+//     tc_tid_struct_mono_name(tid) != "" may have been reverted or narrowed.
+//  3. If R1 or R3 regressed but R2 passes: tid_inner_struct's `it.kind != TK_ENUM`
+//     guard (typecheck.bl, beside tc_tid_set_elem_ct) came back, OR the codegen-side
+//     enum_mono stem thread into set_list_elem_struct (codegen_types.bl / the
+//     recover_list_elem_from_tid call sites in codegen_expr.bl) regressed — check
+//     whether register_enum_instance_from_tid actually ran before the element type
+//     was spelled.
+//  4. If R4 regressed (two instantiations collapsed onto one C symbol, or one
+//     overwrote the other's payload at runtime): a generic-enum instance's mono name
+//     stopped being TYPE-ARGUMENT-KEYED. This is the single most consequential
+//     regression this file guards against — re-read tc_tid_struct_mono_name before
+//     touching anything upstream of it.
+//  5. If R5 regressed: something started routing the plain bare-enum-instance local
+//     through the (newly widened) struct/enum-instance machinery instead of its
+//     existing direct path — check codegen_stmt.bl:3008-3015's bare-base variant
+//     lookup is still reached first.
+//  6. If R6 regressed: the TK_ENUM widening in tid_inner_struct / the two faithful
+//     gates leaked into the TK_STRUCT arm's behavior — they must stay two separate
+//     conditions (structurally identical predicate, but each kind admitted on its
+//     own arm), not merged into a single kind-agnostic branch that changed evaluation
+//     order.
+
+import compile_test_helpers
+import std.io
+
+fn assert_has(c: Str, needle: Str, label: Str) {
+    if !c.contains(needle) { io.println("FAIL: {label} — missing '{needle}'") }
+    assert(c.contains(needle))
+}
+
+fn assert_lacks(c: Str, needle: Str, label: Str) {
+    if c.contains(needle) { io.println("FAIL: {label} — forbidden '{needle}' present") }
+    assert(!c.contains(needle))
+}
+
+fn tree_decl() -> Str {
+    "type Tree[T] \{\n    Leaf(value: T)\n    Branch(left: Tree[T], right: Tree[T])\n}\n"
+}
+
+fn src_r1() -> Str {
+    let mut s = tree_decl()
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let xs: List[Tree[Int]] = [Tree.Leaf(1), Tree.Leaf(2)]\n")
+    s = s.concat("    let t = xs.get(0).unwrap()\n")
+    s = s.concat("    match t \{\n")
+    s = s.concat("        Leaf(v) => assert(v == 1)\n")
+    s = s.concat("        Branch(_l, _r) => assert(false)\n")
+    s = s.concat("    }\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "R1: List[Tree[Int]] plain local recovers the mono stem, not the bare unemitted head" {
+    let c = compile_test_helpers.compile_and_emit_c(src_r1(), "tydqe6_r1_c")
+    assert_has(c, "blink_Tree_Int", "R1 / mono stem present")
+    assert_lacks(c, "blink_Tree left", "R1 / no bare-head field declaration")
+    let r = compile_test_helpers.compile_and_run(src_r1(), "tydqe6_r1_run")
+    if r.exit_code != 0 { io.println("FAIL: R1 runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+}
+
+fn src_r2() -> Str {
+    let mut s = tree_decl()
+    s = s.concat("type Box[T] \{ v: T }\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let a: Box[Tree[Int]] = Box \{ v: Tree.Leaf(1) }\n")
+    s = s.concat("    match a.v \{\n")
+    s = s.concat("        Leaf(v) => assert(v == 1)\n")
+    s = s.concat("        Branch(_l, _r) => assert(false)\n")
+    s = s.concat("    }\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "R2: Box[Tree[Int]] direct slot recovers the mono stem, field is not erased to void" {
+    let c = compile_test_helpers.compile_and_emit_c(src_r2(), "tydqe6_r2_c")
+    assert_has(c, "blink_Tree_Int", "R2 / mono stem present")
+    assert_lacks(c, "void v;", "R2 / field not erased to void")
+    let r = compile_test_helpers.compile_and_run(src_r2(), "tydqe6_r2_run")
+    if r.exit_code != 0 { io.println("FAIL: R2 runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+}
+
+fn src_r3() -> Str {
+    let mut s = tree_decl()
+    s = s.concat("type Box[T] \{ v: T }\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let a: Box[List[Tree[Int]]] = Box \{ v: [Tree.Leaf(1), Tree.Leaf(2)] }\n")
+    s = s.concat("    let t = a.v.get(0).unwrap()\n")
+    s = s.concat("    match t \{\n")
+    s = s.concat("        Leaf(v) => assert(v == 1)\n")
+    s = s.concat("        Branch(_l, _r) => assert(false)\n")
+    s = s.concat("    }\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "R3: Box[List[Tree[Int]]] element recovers the mono stem through the Box indirection" {
+    let c = compile_test_helpers.compile_and_emit_c(src_r3(), "tydqe6_r3_c")
+    assert_has(c, "blink_Tree_Int", "R3 / mono stem present")
+    let r = compile_test_helpers.compile_and_run(src_r3(), "tydqe6_r3_run")
+    if r.exit_code != 0 { io.println("FAIL: R3 runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+}
+
+fn src_r4() -> Str {
+    let mut s = tree_decl()
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let a: Tree[Int] = Tree.Leaf(1)\n")
+    s = s.concat("    let b: Tree[Str] = Tree.Leaf(\"x\")\n")
+    s = s.concat("    match a \{\n")
+    s = s.concat("        Leaf(v) => assert(v == 1)\n")
+    s = s.concat("        Branch(_l, _r) => assert(false)\n")
+    s = s.concat("    }\n")
+    s = s.concat("    match b \{\n")
+    s = s.concat("        Leaf(v) => assert(v == \"x\")\n")
+    s = s.concat("        Branch(_l, _r) => assert(false)\n")
+    s = s.concat("    }\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "R4: Tree[Int] and Tree[Str] get DISTINCT C symbols — the injectivity witness" {
+    let c = compile_test_helpers.compile_and_emit_c(src_r4(), "tydqe6_r4_c")
+    assert_has(c, "blink_Tree_Int", "R4 / Int instantiation symbol")
+    assert_has(c, "blink_Tree_Str", "R4 / Str instantiation symbol")
+    let r = compile_test_helpers.compile_and_run(src_r4(), "tydqe6_r4_run")
+    if r.exit_code != 0 { io.println("FAIL: R4 runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+}
+
+fn src_r5() -> Str {
+    let mut s = tree_decl()
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let t: Tree[Int] = Tree.Leaf(1)\n")
+    s = s.concat("    match t \{\n")
+    s = s.concat("        Leaf(v) => assert(v == 1)\n")
+    s = s.concat("        Branch(_l, _r) => assert(false)\n")
+    s = s.concat("    }\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "R5 GREEN CONTROL: Tree[Int] bare local, the pre-existing working path" {
+    let r = compile_test_helpers.compile_and_run(src_r5(), "tydqe6_r5_run")
+    if r.exit_code != 0 { io.println("FAIL: R5 runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+}
+
+fn src_r6() -> Str {
+    let mut s = "type Box[T] \{ v: T }\n"
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let a: Box[List[Box[Int]]] = Box \{ v: [Box \{ v: 9 }] }\n")
+    s = s.concat("    let inner = a.v.get(0).unwrap()\n")
+    s = s.concat("    assert(inner.v == 9)\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "R6 GREEN CONTROL: Box[List[Box[Int]]] struct-instance element (jw1pmb R7) undisturbed" {
+    let c = compile_test_helpers.compile_and_emit_c(src_r6(), "tydqe6_r6_c")
+    assert_has(c, "blink_Box_Int", "R6 / struct-instance element mono stem")
+    let r = compile_test_helpers.compile_and_run(src_r6(), "tydqe6_r6_run")
+    if r.exit_code != 0 { io.println("FAIL: R6 runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+}
