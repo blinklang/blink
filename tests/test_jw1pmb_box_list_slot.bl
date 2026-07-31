@@ -1,0 +1,314 @@
+// br jw1pmb: admit a List[T] slot at the struct-literal monomorphization seam.
+//
+// tc_struct_slot_encodable (src/typecheck.bl:11372) is the sole per-slot admission
+// predicate at that seam. Before this fix it admitted scalars, TK_STRUCT/TK_ENUM,
+// TK_OPTION/TK_RESULT, TK_TUPLE, TK_MAP, TK_SET (unconditionally) and TK_VOID, but fell
+// through to `false` for TK_LIST — even though tc_tid_to_c_tag already spells it
+// (:10868, bare "List") and tc_tid_encodable already admits it (:10934, by fall-through).
+//
+// Before br 3fc3pn a decline here merely deferred to the string-CSV producer. That
+// producer is gone, so a decline is now FATAL: the slot's arg_tid stays -1, the binder
+// `T` survives resolve_mono_slot, and every row below died with the SAME internal
+// compiler error (measured, see LEDGER) — not merely a spelling mismatch.
+//
+// The fix is TWO PARTS, and the ticket's own triage found that widening the gate ALONE
+// is a SILENT MISCOMPILE, not a safe subset of the real fix:
+//   Part A — widen tc_struct_slot_encodable to admit TK_LIST.
+//   Part B — recover_list_elem_from_tid, a per-USE element recovery (the List twin of
+//     recover_set_elem_from_tid), because the def-side sf_entry for a monomorphized
+//     `Box[T]`'s `v: T` field stores sv_tp(CT_LIST, -1, -1, "") regardless of the actual
+//     element (codegen_stmt.bl reg_sf_entry / codegen_types.bl sv_tp), which
+//     type_list(type_int()) turns into a tp_id INDISTINGUISHABLE from a genuine
+//     `List[Int]`. Without Part B, Box[List[Int]] goes green BY ACCIDENT (the erased
+//     default happens to be Int) while Box[List[Str]]/[Float]/[Point] compile and link
+//     cleanly but read every element back as if it were an Int — trading a loud I0001 for
+//     a silent wrong value.
+//
+// CORRECTED ACCEPTANCE CRITERION (the ticket's original text demanded Box[List[Int]] and
+// Box[List[Str]] keep DISTINCT C symbols — that contradicts shipped code).
+// tc_tid_to_c_tag spells TK_LIST as the bare "List" with NO type arguments, exactly like
+// TK_SET/TK_MAP, and tc_tid_seg_injective (:11022) already groups all three as
+// non-injective; tc_classify_mono_conflicts (:11320-11323) already names List among the
+// EXCUSABLE erasing positions. tests/test_qnpb2d_tid_outranks_target.bl:285-291 already
+// ships the identical argument for Box[Set[Int]]/Box[Set[Str]] sharing one blink_Box_Set.
+// So the real criterion is: exactly ONE blink_Box_List C symbol serves every element type,
+// plus an element-sensitive RUNTIME witness with multiple instantiations live at once — a
+// clean `cc` proves nothing for a representation-shared symbol (the hnyqe4 class).
+//
+// ── LEDGER: every row's red-before state, measured directly against build/blinkc on the
+//    pre-fix binary (git rev 3994d48) via the shape `type Box[T] \{ v: T }` +
+//    `let a: Box[List[<X>]] = Box \{ v: ... }` + a per-element access ──
+//
+//   R1  Box[List[Int]],   .len()+.get(0).unwrap()   RED — I0001 UnsolvedTypeVarAtCodegen,
+//         "type parameter 'T' of 'Box_List.v' reached monomorphization unsolved", plus
+//         cascading UnresolvedMethod errors on .len/.get/.unwrap (the field's type never
+//         resolved past `T`, so no method lookup on List[Int] can succeed either).
+//   R2  Box[List[Str]],   .get(0).unwrap() == "a"    RED — identical I0001 at Box_List.v.
+//   R2b for-loop over Box[List[Str]].v, io.println   RED — identical I0001 at Box_List.v
+//         (the loop body never emits — this is the GLOBAL expr_list_elem_type channel,
+//         read by the for-loop lowering at codegen_stmt.bl:3570 before any scope var).
+//   R3  Box[List[Float]]                             RED — identical I0001 at Box_List.v.
+//   R4  Box[List[Point]], p.x == 3                    RED — identical I0001 at Box_List.v.
+//   R5  Box[List[Int]] AND Box[List[Str]] live together   RED — identical I0001.
+//   R6  Box[List[List[Int]]] (nested)                 RED — identical I0001.
+//   R7  Box[List[Box[Int]]] (struct-instance element)  RED — identical I0001.
+//   R8  GREEN CONTROL: non-generic `type Holder \{ xs: List[Str] }`  GREEN already —
+//         exit 0. This shape never reaches tc_struct_slot_encodable at all (no generic
+//         struct instance involved), so it is unaffected by Part A/B either way; it exists
+//         to prove the declared-tp_from_ann precedence path (codegen_expr.bl:915-925's
+//         gate, part B3) does not regress it.
+//   R9  GREEN CONTROL: Box[Set[Int]] + Box[Int] (neighbouring slots)   GREEN already —
+//         exit 0. Proves Part A/B do not disturb the pre-existing Set/scalar admission.
+//   R10 fn unwrap_box[T](b: Box[T]) -> T called at T=List[Str], .get(0).unwrap() == "a"
+//         RED — TWO I0001s: the same Box_List.v field error, PLUS "type parameter of fn
+//         'unwrap_box' reached monomorphization unsolved (mono args
+//         'BLINK_I0001_erased_slot')" at the call site — the shape the ticket's own
+//         context section cites. Measured to go GREEN under Part A alone (no Part B
+//         involvement): the fn-arg resolver at src/typecheck.bl:11773 (the tc_type_is_
+//         struct arm binding T off Box's own slot) already calls the SAME
+//         tc_struct_slot_encodable this ticket widens, so it is not a separate gap.
+//
+// ── WHAT TO CHECK IF THIS FILE REGRESSES ──
+//  1. `build/blink build --emit c tests/test_jw1pmb_box_list_slot.bl` and read the I0001
+//     if there is one — it will name the exact struct/field that failed to resolve.
+//  2. If it is R1-R7/R10 that regressed: check tc_struct_slot_encodable
+//     (src/typecheck.bl, beside the TK_SET arm) — the `if k == TK_LIST { return true }`
+//     arm (Part A) may have been reverted or narrowed.
+//  3. If R1/R8/R9 pass but R2/R3/R4 fail at RUNTIME (wrong value, not a compile error):
+//     Part B's recover_list_elem_from_tid (src/codegen_expr.bl, beside
+//     recover_set_elem_from_tid) regressed — the erased sf_entry is defaulting every
+//     element to Int again. Check the call site's gate at codegen_expr.bl (immediately
+//     after the CT_LIST/CT_OPTION/CT_RESULT/CT_MAP block, before the CT_SET recovery).
+//  4. If R2b fails but R2 passes: the GLOBAL expr_list_elem_type/expr_list_elem_struct
+//     write in recover_list_elem_from_tid regressed (it must write the global, not just
+//     the scope var — the Set twin has no such global, this is List's own divergence).
+//  5. If R4 fails at runtime with a bogus `p.x`: the struct-element convention regressed —
+//     List elements must recover as (CT_VOID, sname), NOT (CT_STRUCT, sname) (the Set
+//     twin's convention). Check cg_closure_param_type_hint's `!= CT_VOID` comparisons
+//     (src/codegen_closures.bl:835/896/1069) still hold.
+//  6. If R5 fails on the assert_lacks rows: two per-element C symbols were emitted where
+//     one shared blink_Box_List should serve both — re-read the "CORRECTED ACCEPTANCE
+//     CRITERION" paragraph above before treating a NEW distinct symbol as progress.
+//  7. If R6 fails: the ONE-level nested recursion into set_list_nested_elem_type/_struct
+//     regressed (List[List[T]] needs a second recovery step off the element's own tid,
+//     via the already-existing tc_tid_list_elem accessor).
+//  8. If R8 or R9 regressed: Part B's call-site gate widened past the erasure shape (it
+//     must fire ONLY when the field's tp_id looks like the erased `type_list(type_int())`
+//     placeholder, never on a genuinely-declared List[T] field — see codegen_expr.bl B3's
+//     gate on `tp_child1_sname(le_tp) == "" && tp_child1_kind(le_tp) == CT_INT`).
+
+import compile_test_helpers
+import std.io
+
+fn assert_has(c: Str, needle: Str, label: Str) {
+    if !c.contains(needle) { io.println("FAIL: {label} — missing '{needle}'") }
+    assert(c.contains(needle))
+}
+
+fn assert_lacks(c: Str, needle: Str, label: Str) {
+    if c.contains(needle) { io.println("FAIL: {label} — forbidden '{needle}' present") }
+    assert(!c.contains(needle))
+}
+
+fn box_decl() -> Str {
+    "type Box[T] \{ v: T }\n"
+}
+
+fn src_r1() -> Str {
+    let mut s = box_decl()
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let a: Box[List[Int]] = Box \{ v: [1, 2, 3] }\n")
+    s = s.concat("    assert(a.v.len() == 3)\n")
+    s = s.concat("    assert(a.v.get(0).unwrap() == 1)\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "R1: Box[List[Int]] admits the slot and reads Int elements back correctly" {
+    let c = compile_test_helpers.compile_and_emit_c(src_r1(), "jw1pmb_r1_c")
+    assert_has(c, "blink_Box_List", "R1 / one shared List symbol")
+    let r = compile_test_helpers.compile_and_run(src_r1(), "jw1pmb_r1_run")
+    if r.exit_code != 0 { io.println("FAIL: R1 runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+}
+
+fn src_r2() -> Str {
+    let mut s = box_decl()
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let a: Box[List[Str]] = Box \{ v: [\"a\", \"b\"] }\n")
+    s = s.concat("    assert(a.v.get(0).unwrap() == \"a\")\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "R2: Box[List[Str]] reads Str elements back correctly, not as a mis-cast Int" {
+    let r = compile_test_helpers.compile_and_run(src_r2(), "jw1pmb_r2_run")
+    if r.exit_code != 0 { io.println("FAIL: R2 runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+}
+
+fn src_r2b() -> Str {
+    let mut s = box_decl()
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let a: Box[List[Str]] = Box \{ v: [\"x\", \"y\"] }\n")
+    s = s.concat("    for e in a.v \{\n")
+    s = s.concat("        io.println(e)\n")
+    s = s.concat("    }\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "R2b: a for-loop over a.v reads Str elements through the GLOBAL elem-type channel" {
+    let r = compile_test_helpers.compile_and_run(src_r2b(), "jw1pmb_r2b_run")
+    if r.exit_code != 0 { io.println("FAIL: R2b runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+    assert(r.out.contains("x"))
+    assert(r.out.contains("y"))
+}
+
+fn src_r3() -> Str {
+    let mut s = box_decl()
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let a: Box[List[Float]] = Box \{ v: [1.5, 2.5] }\n")
+    s = s.concat("    assert(a.v.get(0).unwrap() == 1.5)\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "R3: Box[List[Float]] — the sharpest witness (a boxed Float misread as Int reads a pointer)" {
+    let r = compile_test_helpers.compile_and_run(src_r3(), "jw1pmb_r3_run")
+    if r.exit_code != 0 { io.println("FAIL: R3 runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+}
+
+fn src_r4() -> Str {
+    let mut s = "type Point \{ x: Int, y: Int }\n"
+    s = s.concat(box_decl())
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let a: Box[List[Point]] = Box \{ v: [Point \{ x: 3, y: 4 }] }\n")
+    s = s.concat("    let p = a.v.get(0).unwrap()\n")
+    s = s.concat("    assert(p.x == 3)\n")
+    s = s.concat("    assert(p.y == 4)\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "R4: Box[List[Point]] recovers a struct element as (CT_VOID, sname), the List convention" {
+    let r = compile_test_helpers.compile_and_run(src_r4(), "jw1pmb_r4_run")
+    if r.exit_code != 0 { io.println("FAIL: R4 runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+}
+
+fn src_r5() -> Str {
+    let mut s = box_decl()
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let a: Box[List[Int]] = Box \{ v: [1, 2, 3] }\n")
+    s = s.concat("    let b: Box[List[Str]] = Box \{ v: [\"a\", \"b\"] }\n")
+    s = s.concat("    assert(a.v.get(0).unwrap() == 1)\n")
+    s = s.concat("    assert(b.v.get(0).unwrap() == \"a\")\n")
+    s = s.concat("    assert(a.v.len() == 3)\n")
+    s = s.concat("    assert(b.v.len() == 2)\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "R5: Box[List[Int]] and Box[List[Str]] correctly SHARE one C symbol (corrected criterion)" {
+    let c = compile_test_helpers.compile_and_emit_c(src_r5(), "jw1pmb_r5_c")
+    assert_has(c, "blink_Box_List", "R5 / the one shared symbol")
+    // The old (wrong) criterion demanded distinct per-element symbols. No such symbols
+    // should exist — List is a non-injective mono-CSV position (tc_tid_seg_injective),
+    // the same representation-sharing already shipped for Box[Set[..]].
+    assert_lacks(c, "blink_Box_List_Int", "R5 / no per-element List symbol (Int)")
+    assert_lacks(c, "blink_Box_List_Str", "R5 / no per-element List symbol (Str)")
+    // Both instantiations alive simultaneously — the runtime witness a clean cc cannot
+    // provide for a representation-shared symbol.
+    let r = compile_test_helpers.compile_and_run(src_r5(), "jw1pmb_r5_run")
+    if r.exit_code != 0 { io.println("FAIL: R5 runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+}
+
+fn src_r6() -> Str {
+    let mut s = box_decl()
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let a: Box[List[List[Int]]] = Box \{ v: [[1, 2], [3, 4]] }\n")
+    s = s.concat("    let inner = a.v.get(0).unwrap()\n")
+    s = s.concat("    assert(inner.get(1).unwrap() == 2)\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "R6: Box[List[List[Int]]] recovers the nested element one level deep" {
+    let r = compile_test_helpers.compile_and_run(src_r6(), "jw1pmb_r6_run")
+    if r.exit_code != 0 { io.println("FAIL: R6 runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+}
+
+fn src_r7() -> Str {
+    let mut s = box_decl()
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let a: Box[List[Box[Int]]] = Box \{ v: [Box \{ v: 9 }] }\n")
+    s = s.concat("    let inner = a.v.get(0).unwrap()\n")
+    s = s.concat("    assert(inner.v == 9)\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "R7: Box[List[Box[Int]]] recovers a struct-INSTANCE element as its full mono stem" {
+    let c = compile_test_helpers.compile_and_emit_c(src_r7(), "jw1pmb_r7_c")
+    assert_has(c, "blink_Box_Int", "R7 / element mono stem, not the erased bare head")
+    let r = compile_test_helpers.compile_and_run(src_r7(), "jw1pmb_r7_run")
+    if r.exit_code != 0 { io.println("FAIL: R7 runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+}
+
+fn src_r8() -> Str {
+    let mut s = "type Holder \{ xs: List[Str] }\n"
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let h = Holder \{ xs: [\"a\", \"b\"] }\n")
+    s = s.concat("    assert(h.xs.get(0).unwrap() == \"a\")\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "R8 GREEN CONTROL: a non-generic declared List[Str] field is unaffected" {
+    let r = compile_test_helpers.compile_and_run(src_r8(), "jw1pmb_r8_run")
+    if r.exit_code != 0 { io.println("FAIL: R8 runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+}
+
+fn src_r9() -> Str {
+    let mut s = box_decl()
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let a: Box[Set[Int]] = Box \{ v: Set() }\n")
+    s = s.concat("    let b: Box[Int] = Box \{ v: 7 }\n")
+    s = s.concat("    assert(a.v.insert(1))\n")
+    s = s.concat("    assert(a.v.contains(1))\n")
+    s = s.concat("    assert(b.v == 7)\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "R9 GREEN CONTROL: neighbouring Box[Set[..]]/Box[Int] slots are undisturbed" {
+    let r = compile_test_helpers.compile_and_run(src_r9(), "jw1pmb_r9_run")
+    if r.exit_code != 0 { io.println("FAIL: R9 runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+}
+
+fn src_r10() -> Str {
+    let mut s = box_decl()
+    s = s.concat("fn unwrap_box[T](b: Box[T]) -> T \{\n")
+    s = s.concat("    b.v\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let a: Box[List[Str]] = Box \{ v: [\"a\"] }\n")
+    s = s.concat("    let xs = unwrap_box(a)\n")
+    s = s.concat("    assert(xs.get(0).unwrap() == \"a\")\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "R10: a generic fn's List[T]-bound type param resolves through the same predicate" {
+    let r = compile_test_helpers.compile_and_run(src_r10(), "jw1pmb_r10_run")
+    if r.exit_code != 0 { io.println("FAIL: R10 runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+}

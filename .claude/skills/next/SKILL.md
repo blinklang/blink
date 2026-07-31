@@ -148,7 +148,7 @@ For each bug:
 3. Write a failing test that reproduces the bug (test_*.bl)
 4. Fix the bug
 5. `task regen` then `task ci`
-6. run `/code-review --fix`
+6. run `/cr`
 7. `br close <id>`
 
 When working multiple bugs: use parallel agents with worktrees. Each agent gets one bug.
@@ -169,7 +169,7 @@ For each friction item:
 RESHAPE, and build to what the spec says rather than the ticket's asserted approach.)
 1. Present all selected features with brief proposed approaches
 2. Wait for user approval of the batch
-3. Each feature: plan → implement → `task regen` → `task ci` → `/code-review --fix` → `br close <id>`
+3. Each feature: plan → implement → `task regen` → `task ci` → `/cr` → `br close <id>`
 
 When working multiple features: use parallel agents with worktrees. Each agent gets one feature.
 
@@ -201,7 +201,7 @@ For each chore item:
 1. `br start <id>`
 2. Read the task, find relevant info
 3. Do the task
-4. `/code-review --fix`
+4. `/cr`
 5. `br close <id>`
 
 ## Step 4: Ship it

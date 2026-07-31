@@ -1,6 +1,6 @@
 import codegen_types.{
     CT_BOOL, CT_BYTES, CT_CHANNEL, CT_CLOSURE, CT_FFI_SCOPE, CT_FLOAT, CT_INSTANT, CT_DURATION,
-    CT_HANDLER, CT_I8, CT_I16, CT_I32, CT_U8, CT_U16, CT_U32, CT_U64, CT_INT, CT_ITERATOR, CT_LIST, CT_MAP, CT_OPTION, CT_PTR,
+    CT_HANDLE, CT_HANDLER, CT_I8, CT_I16, CT_I32, CT_U8, CT_U16, CT_U32, CT_U64, CT_INT, CT_ITERATOR, CT_LIST, CT_MAP, CT_OPTION, CT_PTR,
     CT_CHAR, CT_ENUM, CT_RESULT, CT_SET, CT_STRING, CT_STRINGBUILDER, CT_STRUCT, CT_TEMPLATE, CT_VOID,
     CarrierInfo, CaptureEntry, ClosureCapInfo, VarEnumEntry,
     c_blink_name, c_fn_name, c_safe_name, c_type_c_name, c_type_str, c_type_tag, canonical_struct_tag, ct_bit_width, derive_method_cname,
@@ -67,7 +67,7 @@ import codegen_types.{
     resolve_tparam_seg,
     nth_type_arg, resolve_variant, struct_concrete_args_from_target,
     result_c_type, result_c_type_mixed,
-    scope_vars, set_list_elem_struct, set_list_elem_type,
+    scope_vars, set_list_elem_struct, set_list_elem_type, set_list_nested_elem_type, set_list_nested_elem_struct,
     kops_table_name, kops_elem_is_concrete, kops_is_struct_key, key_struct_sname_from_ann, ensure_tuple_kops_key,
     set_map_types, set_map_key_struct, set_set_elem_type, set_set_elem_struct,
     set_var, set_var_closure, set_var_option, set_var_struct,
@@ -93,7 +93,7 @@ import diagnostics.{
 }
 import std.path.{path_dirname}
 import formatter.{format_expr}
-import typecheck.{tc_mono_tids_subst, tc_tid_subst_mono, tc_seg_from_tid, is_import_module_name, tc_lookup_node_tid, tc_tid_set_elem_ct, tc_tid_set_elem_struct, tc_tid_set_elem_ct_resolved, tc_tid_set_elem_struct_resolved, tc_tid_map_key_ct, tc_tid_map_key_struct, tc_tid_map_key_ct_resolved, tc_tid_map_key_struct_resolved, tc_tid_map_val_ct, tc_tid_map_val_struct, tc_tid_map_val_tid, tc_tid_map_key_tid, tc_tid_struct_slot_seg, tc_tid_ct, tc_tid_resolved, tc_tid_option_inner_ct, tc_tid_option_inner_struct, tc_tid_result_ok_ct, tc_tid_result_ok_struct, tc_tid_result_err_ct, tc_tid_result_err_struct, tc_tid_to_c_tag, tc_tid_struct, tc_tid_struct_mono_name, tc_tid_is_enum, tc_tid_struct_arg_count, tc_tid_struct_arg_tid, tc_tid_compound_slot_faithful, tc_struct_slot_encodable, tc_tid_inner_tag, tc_tid_option_inner_tid, tc_tid_result_ok_tid, tc_tid_result_err_tid, tc_tid_tuple_elem_encodable, tc_tid_tuple_sname, tc_tid_tuple_arity, tc_tid_tuple_elem_tid, tc_tid_kops_slot_unsolved}
+import typecheck.{tc_mono_tids_subst, tc_tid_subst_mono, tc_seg_from_tid, is_import_module_name, tc_lookup_node_tid, tc_tid_set_elem_ct, tc_tid_set_elem_struct, tc_tid_set_elem_ct_resolved, tc_tid_set_elem_struct_resolved, tc_tid_list_elem_ct, tc_tid_list_elem_struct, tc_tid_list_elem, tc_tid_map_key_ct, tc_tid_map_key_struct, tc_tid_map_key_ct_resolved, tc_tid_map_key_struct_resolved, tc_tid_map_val_ct, tc_tid_map_val_struct, tc_tid_map_val_tid, tc_tid_map_key_tid, tc_tid_struct_slot_seg, tc_tid_ct, tc_tid_resolved, tc_tid_option_inner_ct, tc_tid_option_inner_struct, tc_tid_result_ok_ct, tc_tid_result_ok_struct, tc_tid_result_err_ct, tc_tid_result_err_struct, tc_tid_to_c_tag, tc_tid_struct, tc_tid_struct_mono_name, tc_tid_is_enum, tc_tid_struct_arg_count, tc_tid_struct_arg_tid, tc_tid_compound_slot_faithful, tc_struct_slot_encodable, tc_tid_inner_tag, tc_tid_option_inner_tid, tc_tid_result_ok_tid, tc_tid_result_err_tid, tc_tid_tuple_elem_encodable, tc_tid_tuple_sname, tc_tid_tuple_arity, tc_tid_tuple_elem_tid, tc_tid_kops_slot_unsolved}
 
 // codegen_expr.bl — Expression codegen, closures, capture analysis
 
@@ -395,6 +395,67 @@ fn recover_set_elem_from_tid(node: Int, var_name: Str) ! Codegen.Register, Codeg
         let es = tc_tid_set_elem_struct(etid)
         if es != "" { set_set_elem_struct(var_name, es) }
     }
+}
+
+// br jw1pmb: the List twin of recover_set_elem_from_tid above, for the same
+// reason — a generic struct's List[T] field erases identically for every T
+// (one sf_entry per (struct,field): reg_sf_entry is keyed on name, not
+// instantiation), so the element must be recovered per-USE from the
+// per-node tid memo rather than per-def. Three divergences from the Set
+// twin, each load-bearing:
+//   - it ALSO writes the global expr_list_elem_type/expr_list_elem_struct
+//     channel. The Set twin has no such global; List does, and the
+//     for-loop lowering (codegen_stmt.bl:3570) reads the global BEFORE the
+//     scope var.
+//   - a struct/enum element writes (CT_VOID, sname), not the Set twin's
+//     bare CT_STRUCT/CT_ENUM — the List house convention (emit_list_lit's
+//     tail; the declared-List[T] LetBinding path at codegen_stmt.bl:3312
+//     uses the identical (CT_VOID, sname) shape for a struct elem, and
+//     :3327 for a nested one).
+//   - CT_OPTION/CT_RESULT/CT_MAP/CT_SET/CT_ITERATOR/CT_HANDLE/CT_CHANNEL/
+//     CT_BYTES elements stay erased: a flat set_list_elem_type(CT_OPTION)
+//     would re-erase THAT element's own inner to Int, and no deep
+//     tp_from_tid builder exists yet to fill it in faithfully (successor
+//     ticket). Staying erased is the honest answer, not a wrong-but-quiet
+//     one.
+// A nested List[List[T]] recurses exactly one level into
+// set_list_nested_elem_type/_struct, mirroring the declared-path shape at
+// codegen_stmt.bl:3320-3330; a second nested List level, or a typevar/
+// tuple/fn element, is a safe no-op (the -1/"" sentinel already stands).
+fn recover_list_elem_from_tid(node: Int, var_name: Str) ! Codegen.Register, Codegen.Scope {
+    let etid = tc_lookup_node_tid(node)
+    let ect = tc_tid_list_elem_ct(etid)
+    if ect < 0 { return }
+    if ect == CT_OPTION || ect == CT_RESULT || ect == CT_MAP || ect == CT_SET || ect == CT_ITERATOR || ect == CT_HANDLE || ect == CT_CHANNEL || ect == CT_BYTES {
+        return
+    }
+    if ect == CT_STRUCT || ect == CT_ENUM {
+        let es = tc_tid_list_elem_struct(etid)
+        if es == "" { return }
+        expr_list_elem_type = CT_VOID
+        expr_list_elem_struct = es
+        set_list_elem_type(var_name, CT_VOID)
+        set_list_elem_struct(var_name, es)
+        return
+    }
+    expr_list_elem_type = ect
+    expr_list_elem_struct = ""
+    set_list_elem_type(var_name, ect)
+    if ect != CT_LIST { return }
+    let inner_tid = tc_tid_list_elem(etid)
+    let nect = tc_tid_list_elem_ct(inner_tid)
+    if nect < 0 || nect == CT_OPTION || nect == CT_RESULT || nect == CT_MAP || nect == CT_SET || nect == CT_ITERATOR || nect == CT_HANDLE || nect == CT_CHANNEL || nect == CT_BYTES || nect == CT_LIST {
+        return
+    }
+    if nect == CT_STRUCT || nect == CT_ENUM {
+        let nes = tc_tid_list_elem_struct(inner_tid)
+        if nes != "" {
+            set_list_nested_elem_type(var_name, CT_VOID)
+            set_list_nested_elem_struct(var_name, nes)
+        }
+        return
+    }
+    set_list_nested_elem_type(var_name, nect)
 }
 
 @allow(UnrestoredMutation, IncompleteStateRestore)
@@ -912,6 +973,21 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
                         // downgrading it on this re-emit.
                         set_map_types(expr_result_str, mk_type, mv_type, mv_struct)
                     }
+                }
+            }
+            // Struct-field List[T] on a MONOMORPHIZED generic struct: reg_sf_entry
+            // stores one shared sv_tp(CT_LIST, -1, -1, "") per (struct,field), so
+            // fa_tp above answers CT_INT for every instantiation (the sv_tp default
+            // at codegen_types.bl:1469) — indistinguishable from a genuinely
+            // declared List[Int] field. Gate on that exact erasure shape (no tp_id,
+            // or a tp_id whose child1 is bare CT_INT with no struct name) before
+            // recovering the real element from the per-node tid memo; a declared
+            // field's deep tp_from_tid answer (R8) or an already-resolved non-Int
+            // child (a genuine List[Int]) must NOT be overwritten. br jw1pmb.
+            if fa_type == CT_LIST {
+                let le_tp = get_struct_field_tp_id(struct_type, c_field)
+                if le_tp < 0 || (tp_child1_sname(le_tp) == "" && tp_child1_kind(le_tp) == CT_INT) {
+                    recover_list_elem_from_tid(node, expr_result_str)
                 }
             }
             // Struct-field Set[T]: the monomorphized-generic struct field tp_id
@@ -5682,9 +5758,10 @@ fn tid_native_struct_mono_slots(inst_tid: Int, sname: Str, node: Int, tracing: I
     // parity-safe: scalars, sized ints, struct/enum (bare OR instance OR module-qualified,
     // br q4etvt), Option/Result/Tuple/Map/Set over encodable inners, and TK_VOID — a
     // genuine Void being an ordinary inhabited encodable type (DECISIONS.md:342,
-    // decisions/under-determined-types.md:38-42, 6-0). The residual decline is exactly
-    // !tc_struct_slot_encodable = typevar / unknown / list / iterator / handle / channel /
-    // fn, i.e. genuinely unspellable.
+    // decisions/under-determined-types.md:38-42, 6-0), and — since br jw1pmb — List
+    // (bare carrier, same top-level erasure as Set/Map). The residual decline is exactly
+    // !tc_struct_slot_encodable = typevar / unknown / iterator / handle / channel / fn,
+    // i.e. genuinely unspellable.
     //
     // TRAP for anyone widening this further: do NOT reach for the slot's CT. tk_to_ct maps
     // TK_VOID, TK_TYPEVAR, TK_UNKNOWN and TK_FN all onto CT_VOID, so a CT-keyed gate would
@@ -5696,7 +5773,7 @@ fn tid_native_struct_mono_slots(inst_tid: Int, sname: Str, node: Int, tracing: I
         if !tc_struct_slot_encodable(tc_tid_resolved(slot)) {
             // The single decline. Report the slot's own kind-ish view, because the slot is
             // the whole diagnosis: an unencodable slot is a still-unsubstituted typevar, an
-            // unsolved metavar, or a List/iterator/handle/channel/fn the encoder has no
+            // unsolved metavar, or an iterator/handle/channel/fn the encoder has no
             // faithful segment for.
             if tracing != 0 { dbg_trace("retmono", "sname={sname} inst_tid={inst_tid} slot={slot} idx={i} decline=slot_unencodable ct={tc_tid_ct(slot)}") }
             return ""
