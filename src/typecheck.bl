@@ -1456,10 +1456,15 @@ pub fn tc_ret_mint_at(call_node: Int, arity: Int, pi: Int) -> Int {
 // as a string) and it drives a Float key all the way to resolve_ctor_kops_elem, which has
 // no vtable for one and emits a BLINK_COMPILER_BUG_ sentinel — an invalid C identifier.
 // Both are real findings about the struct-literal path, both are filed, and neither is
-// this ticket's to decide. A declared `Map[Float,_]` is rejected outright by
-// validate_map_key; the same type reached through a struct type-arg is not (see
-// tc_suppress_ann_validation), and until that enforcement gap closes there is no honest
-// answer for the pinned form.
+// this ticket's to decide.
+//
+// The half of that which was a BLOCKER is now gone: the enforcement gap it named — a
+// declared `Map[Float,_]` rejected by validate_map_key while the same type reached
+// through a struct type-arg was not — is closed by tc_validate_type_arg_hashability, so
+// the Float MVCE above no longer reaches codegen at all and the sentinel arm is
+// unreachable from it. What remains is the kops half, which is a genuine question about
+// the struct-literal path and still not this gate's to answer. Widening the gate is now
+// a decision, not a wait.
 fn tc_node_has_ret_mint(n: Int) -> Int {
     if n < 0 || n >= tc_ret_mint_start.len() { return 0 }
     if tc_ret_mint_start.get(n).unwrap() < 0 { return 0 }
@@ -2037,6 +2042,13 @@ fn resolve_type_ann(ann_node: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
         // is still memoized onto the annotation node's tc_node_tid slot for the
         // tc_tid_struct_arg_* accessors. Falls back to the bare tid when no concrete
         // arg is present (all-typevar `Box[T]`).
+        // The struct/enum branches are the only ones that never visited their own args on the
+        // live path, so a Map key or Set element reached through one escaped validation
+        // entirely (br f8t5wb). Gated on the same flag as the Map/Set branches above so the
+        // off-path re-resolution below still cannot double-report.
+        if tc_suppress_ann_validation == 0 && (type_kind(resolved) == TK_STRUCT || type_kind(resolved) == TK_ENUM) {
+            tc_validate_type_arg_hashability(elems_sl)
+        }
         if type_kind(resolved) == TK_STRUCT && elems_sl != -1 && sublist_length(elems_sl) >= 1 {
             let inst = tc_produce_struct_instance_tid(ann_node, name, elems_sl)
             if inst != -1 { return inst }
@@ -2388,10 +2400,62 @@ fn is_builtin_hashable(name: Str) -> Int {
 // must carry @derive(Hash); tuples are OK iff every element is hashable;
 // Float/Double are explicitly rejected. Generic type parameters are accepted
 // since we can't see through them at this point.
+// A type alias / refinement (`type Port = Int`, `type Port = Int @where(self > 0)`) constrains
+// the VALUES that inhabit its base type; it is not a new representation. sections/03b_contracts.md
+// is explicit — "@where constrains the set of values that inhabit the type" — and
+// sections/03_types.md:757 draws the contrast from the other side, calling sized ints "first-class
+// nominal types -- not refinements of Int, not aliases, not newtypes".
+//
+// Hashability is a property of representation plus equality, so an alias is hashable exactly when
+// its base is. @derive(Hash, Eq) exists for structs and enums, which have no intrinsic hash; asking
+// it of a refinement over Int is a category error, and the E1400 help text ("add @derive(Hash, Eq)
+// to the 'Port' type definition") is advice the user should never need — it is written for a struct.
+//
+// Resolving the name makes both answers fall out of the ordinary rules below rather than needing a
+// carve-out: `type Port = Int` reaches is_builtin_hashable and is accepted, while
+// `type Temp = Float` reaches the Float arm and is rejected for the NaN hazard it actually has.
+// Skipping aliases instead would accept a Float-keyed Map, which the spec forbids outright.
+//
+// Resolution is deliberately partial. A NAME cannot carry type arguments, so `type Pair =
+// (Float, Float)` resolves to a bare tuple name with no element nodes to recurse into, and any
+// verdict read off that name would be a guess — accepting it would punch a Float-keyed hole
+// straight through the arm above. So a hop is taken only when the underlying name is one these
+// rules can decide NOMINALLY: a hashable builtin, a Float width, or a declared struct/enum
+// (which also keeps alias chains walking, since an intermediate alias is itself a named type).
+// Anything else leaves the declared name in place and the caller's behavior unchanged.
+fn alias_name_decidable(name: Str) -> Int {
+    if is_builtin_hashable(name) != 0 { return 1 }
+    if name == "Float" || name == "F32" || name == "F64" { return 1 }
+    let bare = strip_module_qualifier(name)
+    if named_type_map.contains_key(name) || named_type_map.contains_key(bare) { return 1 }
+    0
+}
+
+fn resolve_alias_type_name(name0: Str) -> Str {
+    if tc_alias_underlying.len() == 0 { return name0 }
+    let mut name = name0
+    let mut hops = 0
+    while hops < 8 {
+        let bare = strip_module_qualifier(name)
+        let mut u = tc_alias_underlying.get(name) ?? -1
+        if u == -1 { u = tc_alias_underlying.get(bare) ?? -1 }
+        if u == -1 { return name }
+        let next = tc_type_name(u)
+        if next == "" || next == name { return name }
+        if alias_name_decidable(next) == 0 { return name }
+        name = next
+        hops = hops + 1
+    }
+    name
+}
+
 fn validate_map_key(key_ann: Int) ! Diag.Report {
-    let key_name = node_name(key_ann)
+    // Decisions read the base type; every message names what the USER wrote, so a rejected
+    // `type Temp = Float` says "Map key type 'Temp'" and explains the Float hazard behind it.
+    let decl_name = node_name(key_ann)
+    let key_name = resolve_alias_type_name(decl_name)
     if key_name == "Float" || key_name == "F32" || key_name == "F64" {
-        diag_error_at("MapKeyNotHashable", MAP_KEY_NOT_HASHABLE, "Map key type '{key_name}' is not hashable — Float/Double values cannot serve as Map keys (NaN-inequality and bit-equality hazards)", key_ann, "round the key to an Int (or another integer width) before inserting")
+        diag_error_at("MapKeyNotHashable", MAP_KEY_NOT_HASHABLE, "Map key type '{decl_name}' is not hashable — Float/Double values cannot serve as Map keys (NaN-inequality and bit-equality hazards)", key_ann, "round the key to an Int (or another integer width) before inserting")
         return
     }
     if key_name == "Tuple" {
@@ -2413,8 +2477,11 @@ fn validate_map_key(key_ann: Int) ! Diag.Report {
     // Generic type params and unknown names — let later phases handle them.
     // Only reject when we KNOW this is a user-defined struct/enum without
     // @derive(Hash), to avoid spurious errors on generics.
+    // The message names what the user wrote; the help names the type that actually has to carry the
+    // derive. For `type MyKey = Point` those differ, and pointing the fix at Point is the useful
+    // half — @derive on the alias would be the category error described above.
     if named_type_map.contains_key(key_name) || named_type_map.contains_key(bare) {
-        diag_error_at("MapKeyNotHashable", MAP_KEY_NOT_HASHABLE, "Map key type '{key_name}' does not implement Hash — user types used as Map keys must carry the @derive(Hash, Eq) annotation", key_ann, "add @derive(Hash, Eq) to the '{key_name}' type definition")
+        diag_error_at("MapKeyNotHashable", MAP_KEY_NOT_HASHABLE, "Map key type '{decl_name}' does not implement Hash — user types used as Map keys must carry the @derive(Hash, Eq) annotation", key_ann, "add @derive(Hash, Eq) to the '{key_name}' type definition")
     }
 }
 
@@ -2423,11 +2490,14 @@ fn validate_map_key(key_ann: Int) ! Diag.Report {
 // Emits MAP_KEY_NOT_HASHABLE (E1400) with Set-worded messages. Same rules as
 // validate_map_key: built-in scalars OK; user structs/enums need @derive(Hash);
 // tuples OK iff every element is hashable; Float/Double rejected; generic type
-// params accepted (opaque at this point).
+// params accepted (opaque at this point); aliases decided by their base type.
 fn validate_set_elem(elem_ann: Int) ! Diag.Report {
-    let elem_name = node_name(elem_ann)
+    // Same decl/base split as validate_map_key: verdicts read the base type, messages name what
+    // the user wrote.
+    let decl_name = node_name(elem_ann)
+    let elem_name = resolve_alias_type_name(decl_name)
     if elem_name == "Float" || elem_name == "F32" || elem_name == "F64" {
-        diag_error_at("MapKeyNotHashable", MAP_KEY_NOT_HASHABLE, "Set element type '{elem_name}' is not hashable — Float/Double values cannot serve as Set elements (NaN-inequality and bit-equality hazards)", elem_ann, "round the value to an Int (or another integer width) before inserting")
+        diag_error_at("MapKeyNotHashable", MAP_KEY_NOT_HASHABLE, "Set element type '{decl_name}' is not hashable — Float/Double values cannot serve as Set elements (NaN-inequality and bit-equality hazards)", elem_ann, "round the value to an Int (or another integer width) before inserting")
         return
     }
     if elem_name == "Tuple" {
@@ -2447,7 +2517,60 @@ fn validate_set_elem(elem_ann: Int) ! Diag.Report {
         return
     }
     if named_type_map.contains_key(elem_name) || named_type_map.contains_key(bare) {
-        diag_error_at("MapKeyNotHashable", MAP_KEY_NOT_HASHABLE, "Set element type '{elem_name}' does not implement Hash — user types used as Set elements must carry the @derive(Hash, Eq) annotation", elem_ann, "add @derive(Hash, Eq) to the '{elem_name}' type definition")
+        diag_error_at("MapKeyNotHashable", MAP_KEY_NOT_HASHABLE, "Set element type '{decl_name}' does not implement Hash — user types used as Set elements must carry the @derive(Hash, Eq) annotation", elem_ann, "add @derive(Hash, Eq) to the '{elem_name}' type definition")
+    }
+}
+
+// Hashability validation for a STRUCT or ENUM annotation's type arguments (br f8t5wb).
+//
+// resolve_type_ann's Map and Set branches validate their own key/element, and the builtin
+// carrier branches (Option/Result/Tuple) reach a nested Map/Set because they resolve their
+// inners through resolve_type_ann. The struct and enum branches did neither: they hand the
+// annotation straight to tc_produce_struct_instance_tid / tc_produce_enum_instance_tid and
+// return the instance tid, and those producers re-resolve the args with
+// tc_suppress_ann_validation raised. So nothing on the LIVE path had ever visited a struct
+// type-arg, and `Box[Map[Float,Int]]` was accepted while the bare `Map[Float,Int]` was
+// rejected outright.
+//
+// That was never merely a missing diagnostic. Codegen has no kops vtable for a Float key, so
+// once any tier pinned the slot, kops_table_name fell through to
+// BLINK_COMPILER_BUG_kops_unsupported_K_ct1_Float — an invalid C identifier, a gcc-level
+// failure with no Blink diagnostic, wearing a spelling that accuses the compiler for what is a
+// user program naming an illegal key. Before the slot got pinned the erased default emitted
+// blink_kops_str instead: a Float hashed through the STRING vtable, the br hnyqe4 silent-hash
+// shape. Which of the two you got depended only on whether some unrelated tier happened to
+// bind the slot.
+//
+// Deliberately NOT a resolve_type_ann recursion. This walks the annotation tree and calls only
+// the two validators, so it interns nothing and appends nothing to ty_pool — which is what
+// keeps every legal program byte-identical, the concern that made the off-path producer
+// suppress in the first place. Validating HERE rather than un-suppressing THERE is also what
+// makes the diagnostic fire once per SITE: the live path visits each annotation exactly once,
+// while the off-path producer can visit one node repeatedly.
+//
+// The recursion descends through intervening carriers and struct levels alike, so
+// `Box[Box[Map[Float,Int]]]` and `Box[Option[Set[Float]]]` are both reached. A typevar or
+// unknown arg name matches neither "Map" nor "Set" and has no elements, so it costs one
+// comparison and terminates — the deferral validate_map_key documents for type params stays
+// intact (br 0kvdef is the sibling bug where being over-eager here is itself the defect).
+fn tc_validate_type_arg_hashability(elems_sl: Int) ! Diag.Report {
+    if elems_sl == -1 { return }
+    let mut i = 0
+    while i < sublist_length(elems_sl) {
+        let arg = sublist_get(elems_sl, i)
+        let arg_name = node_name(arg)
+        let arg_elems = node_elements(arg)
+        if arg_name == "Map" {
+            if arg_elems != -1 && sublist_length(arg_elems) >= 1 {
+                validate_map_key(sublist_get(arg_elems, 0))
+            }
+        } else if arg_name == "Set" {
+            if arg_elems != -1 && sublist_length(arg_elems) >= 1 {
+                validate_set_elem(sublist_get(arg_elems, 0))
+            }
+        }
+        tc_validate_type_arg_hashability(arg_elems)
+        i = i + 1
     }
 }
 

@@ -2906,6 +2906,131 @@ fn struct_field_type_ann(td_flds: Int, fname: Str) -> Int {
     -1
 }
 
+// The field's declared type annotation RESOLVED AT THIS INSTANTIATION — the annotation the
+// htxpmh retarget hands to a nested emission.
+//
+// A field declared with a bare type-param binder (`value: T`) has an annotation node that
+// carries no type information at all, so retargeting to it literally would hand the nested
+// value a blank context. Descend ONE LEVEL instead: take the value-context annotation that
+// names THIS struct and read its matching type argument. For
+//     let x: Box[Box[Option[Str]]] = Box { value: Box { value: None } }
+// the outer literal's `value: T` resolves to `Box[Option[Str]]`, so the inner literal sees
+// the annotation describing ITSELF rather than its parent — which is what makes the retarget
+// LEVEL-CORRECT rather than merely level-shifted. Without the descent the inner literal has
+// neither an annotation nor a usable own tid (a bare `None` reverse-infers Option[metavar],
+// an unencodable slot) and the instantiation reaches monomorphization as
+// BLINK_I0001_erased_slot.
+//
+// Channel precedence mirrors tid_native_struct_inst_tid and struct_concrete_args_from_target
+// exactly — cg_expect_arg_ann first, then cg_let_target_ann, both matched by bare struct
+// name — so the annotation descended through is the SAME one those consumers would have read
+// for this literal. Only a BARE binder is descended: an annotation carrying type arguments of
+// its own (`next: Option[Node[T]]`) already describes the field, and a non-binder name is
+// already concrete.
+//
+// Every failure to descend faithfully falls back to the declared annotation — no
+// value-context annotation names this struct, an arity disagreement, a name that is not a
+// binder here. That fallback can still SPELL a type-param binder, which is why the
+// cg_let_target_ann half of the retarget is gated on value_ctx_ann_spellable below.
+fn field_ann_at_instance(td_flds: Int, td_tparams: Int, sname: Str, fname: Str) -> Int {
+    let f_ann = struct_field_type_ann(td_flds, fname)
+    if f_ann == -1 { return -1 }
+    if td_tparams == -1 { return f_ann }
+    let nparams = sublist_length(td_tparams)
+    if nparams == 0 { return f_ann }
+    let own_elems = node_elements(f_ann)
+    if own_elems != -1 && sublist_length(own_elems) > 0 { return f_ann }
+    let mut slot = -1
+    let mut pi = 0
+    while pi < nparams {
+        if node_name(sublist_get(td_tparams, pi)) == node_name(f_ann) {
+            slot = pi
+            break
+        }
+        pi = pi + 1
+    }
+    if slot < 0 { return f_ann }
+    let mut ann = -1
+    if cg_expect_arg_ann != -1 && strip_module_qualifier(node_name(cg_expect_arg_ann)) == sname {
+        ann = cg_expect_arg_ann
+    } else if cg_let_target_ann != -1 && strip_module_qualifier(node_name(cg_let_target_ann)) == sname {
+        ann = cg_let_target_ann
+    }
+    if ann == -1 { return f_ann }
+    let elems = node_elements(ann)
+    if elems == -1 || sublist_length(elems) != nparams { return f_ann }
+    let descended = sublist_get(elems, slot)
+    // The descended element is spelled in the ENCLOSING scope's type-param vocabulary, but both
+    // channels are read while cg_mono_tparams_sl holds THIS struct's tparams. A binder surviving
+    // in it is therefore not merely uninformative — it is resolved by NAME against the wrong list
+    // and silently answers with another slot's type. See the vocabulary note on
+    // value_ctx_ann_spellable.
+    if value_ctx_ann_spellable(descended) == 0 { return f_ann }
+    descended
+}
+
+// Whether `ann` names a concrete type end to end — every name in the tree resolves to a
+// struct, an enum, a builtin, Void, or a tuple. An unknown bare identifier is a type-param
+// BINDER, and a binder makes the whole annotation unspellable.
+//
+// This is the gate on the cg_let_target_ann half of the htxpmh retarget, and it exists
+// because that channel's consumers treat a binder as NO INFORMATION and fall back to a
+// hardcoded default rather than to the annotation they would otherwise have read. Two
+// measured cases where writing a binder into the channel is strictly worse than leaving the
+// enclosing annotation in place:
+//
+//   resolve_ctor_kops_elem falls through to cg_let_target_ann for a Set()/Map() ctor in a
+//   struct-literal field. Under `let s: Set[Int] = (Box { value: Set() }).value` nothing
+//   names Box, so field_ann_at_instance answers with the bare `T`; the channel had held
+//   `Set[Int]` and answered kops_i64, and `T` drops it to kops_str — int keys hashed through
+//   the STRING vtable, silent at cc time (the hnyqe4 class).
+//
+//   resolve_ptr_inner_c reads cg_let_target_ann with no name gate and no arity check. For
+//   `type GW[T] { p: Ptr[T] }` the declared annotation already carries an element, so
+//   field_ann_at_instance returns it undescended and the element is still `T`;
+//   ptr_inner_c_type falls through to "void" and `calloc(1, sizeof(void))` allocates ONE byte
+//   for an 8-byte Pollfd.
+//
+// So the rule is asymmetric on purpose: cg_expect_arg_ann is retargeted unconditionally,
+// because every one of its consumers gates on a head name that a binder cannot match, so a
+// binder there is inert. cg_let_target_ann is retargeted only when this returns nonzero.
+// A stale-but-concrete annotation carries more information than a binder does.
+//
+// That "a binder is inert in cg_expect_arg_ann" argument holds only for a BARE binder, and it is
+// why field_ann_at_instance ALSO gates its descent result on this predicate. A descended element
+// can be CONCRETE-HEADED and still carry a binder as an element (`Set[K]`): the head matches a
+// consumer's name gate, so the annotation is not inert at all, and the element is then resolved by
+// name against cg_mono_tparams_sl — which holds the STRUCT's tparams, while `K` was spelled in the
+// enclosing FN's vocabulary. Measured: `type P[K, V] { m: V, spare: K }` returned from
+// `fn mk[K](_k: K) -> P[Int, Set[K]]` resolved `K` against P's `K` (= Int) and put a `Set[Str]` on
+// the int64 by-value vtable, so `contains` matched on the first 8 bytes of key data. Renaming the
+// fn's binder to `U` changed the emitted vtable, and to `T` produced an undeclared
+// BLINK_COMPILER_BUG_kops_unsupported sentinel — a cc-time build break keyed on a cosmetic
+// identifier choice. Both are silent-to-cc or compiler-accusing, and neither shape existed before
+// the htxpmh retarget: the vocabulary boundary is what the descent crosses and the mono-context
+// globals do not cross with it.
+//
+// CT_VOID is not sufficient as the unspellable test on its own: type_from_name maps "" and
+// every unknown name onto it as well, so genuine Void has to be admitted by name — the same
+// distinction c_field_type_str keeps for exactly the same reason.
+fn value_ctx_ann_spellable(ann: Int) -> Int {
+    if ann == -1 { return 0 }
+    let name = strip_module_qualifier(node_name(ann))
+    if name == "" { return 0 }
+    if name != "Void" && name != "Tuple" && is_struct_or_enum_type(name) == 0 && type_from_name(name) == CT_VOID {
+        return 0
+    }
+    let elems = node_elements(ann)
+    if elems == -1 { return 1 }
+    let n = sublist_length(elems)
+    let mut i = 0
+    while i < n {
+        if value_ctx_ann_spellable(sublist_get(elems, i)) == 0 { return 0 }
+        i = i + 1
+    }
+    1
+}
+
 // When cg_expect_arg_ann is `Option[Prim]` with a primitive (non-struct,
 // non-enum, non-compound) inner, returns that inner's C-type kind. Returns
 // CT_VOID otherwise — including when the inner is a struct/enum (handled by
@@ -3036,7 +3161,8 @@ pub fn segs_from_arg_tids(arg_tids: List[Int]) -> List[Str] {
 // Is `node` the value of the enclosing fn's tail statement? The def-side return-
 // annotation tier below is gated on it, and the gate is the whole safety argument:
 // a return annotation is in scope for a fn's ENTIRE body, unlike cg_expect_arg_ann /
-// cg_let_target_ann which are set and restored per value context. Ungated, every
+// cg_let_target_ann which are set and restored per value context — aspirational when this
+// was written, and actually true at the struct-field seam since br htxpmh. Ungated, every
 // same-named literal anywhere in the body would silently adopt the return type's
 // args — `fn f() -> RGT[Int] { let y = RGT { s: Set() }; ...}` would stamp `Int`
 // onto `y` on no evidence at all. A wrong guess replacing a loud ICE is strictly
@@ -5578,13 +5704,29 @@ fn tid_native_struct_mono_slots(inst_tid: Int, sname: Str, node: Int, tracing: I
         i = i + 1
     }
     let csv = tid_instance_mono_args_csv(inst_tid, count)
-    // NESTING GUARD (br 6cvvh8), now UNCONDITIONAL. cg_let_target_ann / cg_expect_arg_ann
-    // are matched by BARE struct name and are NOT cleared while the field loop emits nested
-    // values (br 3aa3je), so for
+    // NESTING GUARD (br 6cvvh8) — unconditional, and as of br htxpmh a TRIPWIRE that must
+    // never fire. It exists because cg_let_target_ann / cg_expect_arg_ann are matched by
+    // BARE struct name, so when the field loop left them pointing at the ENCLOSING
+    // annotation while emitting a nested value, for
     //     let b: Box[Box[Int]] = Box { v: Box { v: 7 } }
-    // the INNER literal also sees the outer annotation's tid and would name itself
+    // the INNER literal also saw the outer annotation's tid and would name itself
     // blink_Box_Box_Int, lowering its own `v` field to `blink_Box_Int` — self-referential
-    // and undeclared.
+    // and undeclared. The tuple-wrapped shape of the same mechanism is br 3aa3je.
+    //
+    // htxpmh removed the cause: emit_struct_lit's field loop, its defaults loop and the
+    // enum-variant ctor loop now retarget both channels to the field's own annotation
+    // (descending through the instantiation when the field is declared as a bare binder), so
+    // a nested literal is handed the annotation describing ITSELF and can no longer adopt its
+    // parent's. Measured over the pinned 745-file corpus (730 reaching codegen), this decline
+    // went from 4 rows in 3 fixtures to 0.
+    //
+    // So a `decline=nesting_level_mismatch` row now means a NEW nested-emission site was
+    // added without the retarget — fix the site, do not widen the guard, and above all do not
+    // read the decline as a reason to prefer the string tier (CLAUDE.md). It stays a
+    // diagnostic decline rather than an I0001 on purpose: br jefm9w owns deleting it along
+    // with its three sibling sites, and an ICE here would make that deletion a behavior
+    // change instead of a cleanup. own_tid and csv are computed unconditionally either way,
+    // so keeping it costs nothing.
     //
     // It used to run only `if has_struct_inst != 0`, which was always too narrow —
     // has_struct_inst inspected only the immediate slot, so it could not see a deeper
@@ -6014,6 +6156,7 @@ fn emit_struct_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
             // struct_field_type_ann consumes (typecheck.bl:742-752).
             let enum_td = find_type_def_node(variant_enum)
             let mut variant_flds = -1
+            let enum_tparams = if enum_td != -1 { node_type_params(enum_td) } else { -1 }
             if enum_td != -1 {
                 let variants_sl = node_fields(enum_td)
                 if variants_sl != -1 {
@@ -6038,10 +6181,23 @@ fn emit_struct_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
                     }
                     let sf = sublist_get(flds_sl_sv, fi)
                     let field_name = node_name(sf)
+                    // Retarget the value-context channels to the variant field's
+                    // annotation (br htxpmh), under the same spellability asymmetry as the
+                    // sibling struct-field loop below; leaving one of two sibling loops
+                    // unretargeted is the "partial lens" pattern the qnpb2d comments above
+                    // exist to stop.
+                    // The binder descent keys on the ENUM (variant_enum + the enum's own
+                    // tparams), not on the variant: a value-context annotation for a
+                    // struct-style variant literal spells `Choice[Int,Str]`, i.e. it names
+                    // the enum, and the binders a variant field can mention are the enum's.
+                    let vf_ann = field_ann_at_instance(variant_flds, enum_tparams, variant_enum, field_name)
                     let saved_arg_ann = cg_expect_arg_ann
-                    cg_expect_arg_ann = struct_field_type_ann(variant_flds, field_name)
+                    let saved_let_ann = cg_let_target_ann
+                    cg_expect_arg_ann = vf_ann
+                    if value_ctx_ann_spellable(vf_ann) != 0 { cg_let_target_ann = vf_ann }
                     emit_expr(node_value(sf))
                     cg_expect_arg_ann = saved_arg_ann
+                    cg_let_target_ann = saved_let_ann
                     let arg_str = expr_result_str
                     let field_type = get_variant_field_type_str(vidx, fi)
                     // strip_generic_args so a self-referential generic-enum variant
@@ -6086,8 +6242,9 @@ fn emit_struct_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
     let target_args = struct_concrete_args_from_target(sname, segs_from_arg_tids(cg_mono_arg_tids))
     // Hoisted above the field loop because the field-loop mono context below needs it
     // too (br fqthkv). Reads only the memoized instance tid plus cg_expect_arg_ann /
-    // cg_let_target_ann, and the field loop save/restores cg_expect_arg_ann per field,
-    // so evaluating it here is identical to evaluating it at the mono_args selector.
+    // cg_let_target_ann, and the field loop save/restores BOTH channels per field
+    // (br htxpmh; before it, only cg_expect_arg_ann), so evaluating it here is identical
+    // to evaluating it at the mono_args selector.
     // Both outputs of the tid-native tier together: when the mono-context substitution
     // retry is what answered, the CSV is spelled from the SUBSTITUTED instance tid, and
     // every slot-tid recovery below must read that same tid or the instance gets the
@@ -6191,6 +6348,13 @@ fn emit_struct_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
         while i < sublist_length(flds_sl) {
             let sf = sublist_get(flds_sl, i)
             if node_kind(sf) == NodeKind.SpreadExpr {
+                // NOT retargeted, and deliberately not cleared either (br htxpmh). A spread
+                // source is a WHOLE-STRUCT value of THIS struct's type, so an enclosing
+                // annotation naming this struct is the annotation that correctly describes
+                // it — the one case where the adoption the retarget exists to stop is not an
+                // adoption at all. Clearing to -1 would throw that away and buy nothing:
+                // every corpus spread source is an Ident, which reads no annotation channel.
+                // tests/test_htxpmh_field_loop_value_ctx.bl row 9 pins the Ident case.
                 emit_expr(node_value(sf))
                 spread_tmp = expr_result_str
                 i = i + 1
@@ -6198,10 +6362,34 @@ fn emit_struct_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
             }
             let fname = node_name(sf)
             provided_fields.push(fname)
+            // THE htxpmh RETARGET. Both value-context channels move to the field's own
+            // annotation for the nested emission, because the consumers read them under
+            // DIFFERENT rules and cg_expect_arg_ann alone cannot shadow cg_let_target_ann:
+            // tid_native_struct_inst_tid matches either channel by BARE STRUCT NAME (so a
+            // nested literal of the same struct adopted the outer instance's type args),
+            // resolve_ptr_inner_c reads cg_let_target_ann with NO name gate at all, and
+            // emit_tuple_lit's parent_tuple_ann / the Some-carrier consult gate on the head
+            // name plus arity, which a sibling instantiation satisfies. emit_tuple_lit
+            // already retargets both per slot; this brings the struct-field loop to parity.
+            //
+            // Via field_ann_at_instance, so a field declared as a bare binder (`value: T`)
+            // retargets to the type argument THIS instantiation gives it rather than to the
+            // information-free binder node — the descent is what makes the retarget
+            // level-correct instead of merely level-shifted. See that function.
+            //
+            // The two channels are gated ASYMMETRICALLY: cg_let_target_ann moves only when
+            // the resolved annotation is spellable end to end, because its consumers read a
+            // binder as no-information and fall back to a default instead of to the
+            // annotation they would have read. See value_ctx_ann_spellable for the two
+            // measured shapes where writing a binder here is worse than writing nothing.
+            let f_ann = field_ann_at_instance(td_flds, td_tparams, sname, fname)
             let saved_arg_ann = cg_expect_arg_ann
-            cg_expect_arg_ann = struct_field_type_ann(td_flds, fname)
+            let saved_let_ann = cg_let_target_ann
+            cg_expect_arg_ann = f_ann
+            if value_ctx_ann_spellable(f_ann) != 0 { cg_let_target_ann = f_ann }
             emit_expr(node_value(sf))
             cg_expect_arg_ann = saved_arg_ann
+            cg_let_target_ann = saved_let_ann
             let val_str = expr_result_str
             field_types.push(expr_result_type)
             // Capture the struct-instance's already-registered mono name (e.g.
@@ -6268,10 +6456,19 @@ fn emit_struct_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
                 pi = pi + 1
             }
             if found == 0 {
+                // Retarget (br htxpmh). This is the strongest of the sites:
+                // dfl.default_node belongs to the TYPE DEFINITION, not to any use site, so
+                // ANY enclosing value-context annotation is categorically wrong here. Same
+                // spellability asymmetry as the field loop — an unspellable answer leaves
+                // cg_let_target_ann alone rather than replacing it with a binder.
+                let dfl_ann = field_ann_at_instance(td_flds, td_tparams, sname, dfl.field_name)
                 let saved_dfl_arg_ann = cg_expect_arg_ann
-                cg_expect_arg_ann = struct_field_type_ann(td_flds, dfl.field_name)
+                let saved_dfl_let_ann = cg_let_target_ann
+                cg_expect_arg_ann = dfl_ann
+                if value_ctx_ann_spellable(dfl_ann) != 0 { cg_let_target_ann = dfl_ann }
                 emit_expr(dfl.default_node)
                 cg_expect_arg_ann = saved_dfl_arg_ann
+                cg_let_target_ann = saved_dfl_let_ann
                 let dval = expr_result_str
                 field_types.push(expr_result_type)
                 if expr_result_type == CT_STRUCT {
@@ -6355,6 +6552,25 @@ fn emit_struct_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
         // segment `mono_args` already chose for that slot; on any divergence the tid
         // belongs to a different instance, so discard to [] (byte-identical to the
         // pre-phybxe empty-list fallback).
+        //
+        // AUDITED at br htxpmh, KEPT. The hazard above is stated as a live one, and at
+        // the FIELD-LOOP seam it no longer is: emit_struct_lit now saves and restores
+        // both cg_let_target_ann and cg_expect_arg_ann per field and retargets them to
+        // the FIELD's annotation, so the inner literal never sees the outer
+        // `Box[Box[Int]]` to match against by bare name. Neither this guard nor the
+        // second source below was measured firing after that, and both stay anyway,
+        // for two different reasons.
+        //
+        // This guard stays because it is a TRIPWIRE on the same class as the one in
+        // tid_native_struct_mono_slots (jefm9w owns retiring all four together), and
+        // because tid_native_struct_inst_tid is reachable from callers other than the
+        // field loop — the retarget narrows what a nested VALUE sees, not what every
+        // caller of the bare-name match can be handed.
+        //
+        // The second-source fallback below stays for an independent reason: it also
+        // serves the Void-DEGRADED node-tid case (br msd9xq), which is not a nesting
+        // problem at all and which the retarget does not touch. Do not read "the
+        // nesting hazard is now unreachable" as a licence to delete it.
         if arg_tids_match_mono_args(recovered, mono_args) {
             mono_arg_tids = recovered
         } else {

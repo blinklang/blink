@@ -19,6 +19,8 @@
 // and the Str path is undisturbed. Green now (works via the string path); stays
 // green as readers move to the structured tid.
 
+import compile_test_helpers
+
 type Box[T] {
     value: T
 }
@@ -62,20 +64,73 @@ test "Pair[Str, Int] with swapped args keeps distinct field types" {
     io.println(p.first)
 }
 
-// Regression guard (code-review finding): the off-path instance-tid producer
-// re-resolves a struct's type-args, and resolve_type_ann's Map/Set branches emit
-// non-deduped hashability diagnostics. A struct type-arg that transitively holds a
-// non-hashable Map key / Set element (Float) must NOT be rejected — the live
-// struct path never validated those args, so re-resolving them off-path must stay
-// silent (tc_suppress_ann_validation). This compiles iff the suppression holds; a
-// spurious MapKeyNotHashable would fail the build. The Map is never populated with
-// a Float key, so there is no real hashability hazard at runtime.
-test "struct type-arg holding Map[Float,_] is not spuriously rejected" {
-    let x: Box[Map[Float, Int]] = Box { value: Map() }
-    assert_eq(x.value.len(), 0)
+// ── INVERTED by br f8t5wb ──────────────────────────────────────────────────
+//
+// AUDIT TRAIL — what these two rows used to assert, verbatim, and why it was wrong:
+//
+//   "Regression guard (code-review finding): the off-path instance-tid producer
+//    re-resolves a struct's type-args, and resolve_type_ann's Map/Set branches emit
+//    non-deduped hashability diagnostics. A struct type-arg that transitively holds a
+//    non-hashable Map key / Set element (Float) must NOT be rejected — the live
+//    struct path never validated those args, so re-resolving them off-path must stay
+//    silent (tc_suppress_ann_validation). This compiles iff the suppression holds; a
+//    spurious MapKeyNotHashable would fail the build. The Map is never populated with
+//    a Float key, so there is no real hashability hazard at runtime."
+//
+// The first half of that is still exactly right and is still what these rows guard: the
+// off-path re-resolution must not emit a diagnostic of its own, and it still doesn't —
+// tc_suppress_ann_validation is untouched. What was wrong is the conclusion drawn from
+// "the live struct path never validated those args": that was an enforcement GAP, not a
+// decision. `let m: Map[Float, Int] = Map()` is rejected outright by validate_map_key, so
+// the same illegal key reached through a struct type-arg being accepted made
+// MapKeyNotHashable depend on how the type was spelled. br f8t5wb closes it by validating
+// on the LIVE path (each annotation visited exactly once), which is why these rows can
+// invert without un-suppressing the off-path pass.
+//
+// "No real hashability hazard at runtime" was also only true by luck. Codegen has no kops
+// vtable for a Float key: once any tier pinned the slot, kops_table_name fell through to
+// BLINK_COMPILER_BUG_kops_unsupported_K_ct1_Float — an invalid C identifier — and before it
+// got pinned the erased default emitted blink_kops_str, a Float hashed through the STRING
+// vtable (the br hnyqe4 shape). These rows only ever passed because they never populate the
+// container, which is precisely what made the hazard invisible here.
+//
+// Now capture-based rather than constructed: the programs no longer compile, which IS the
+// assertion. The exhaustive row set (nested, multi-param, enum, typevar controls, and the
+// once-per-site counts) lives in tests/test_f8t5wb_struct_typearg_hashability.bl; these two
+// stay here because this is the fixture whose off-path producer created the question.
+
+fn src_box_map_float() -> Str {
+    let mut s = "type Box[T] \{ value: T }\n"
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let x: Box[Map[Float, Int]] = Box \{ value: Map() }\n")
+    s = s.concat("    assert(x.value.len() == 0)\n")
+    s = s.concat("}\n")
+    s
 }
 
-test "struct type-arg holding Set[Float] is not spuriously rejected" {
-    let y: Box[Set[Float]] = Box { value: Set() }
-    assert_eq(y.value.len(), 0)
+fn src_box_set_float() -> Str {
+    let mut s = "type Box[T] \{ value: T }\n"
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let y: Box[Set[Float]] = Box \{ value: Set() }\n")
+    s = s.concat("    assert(y.value.len() == 0)\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "struct type-arg holding Map[Float,_] is rejected, like the bare Map[Float,_]" {
+    let out = compile_test_helpers.compile_and_capture(src_box_map_float(), "kvn6w8_mapfloat")
+    assert(out.contains("MapKeyNotHashable"))
+    // The off-path producer must still stay silent: one site, one diagnostic. Note this
+    // checks the DIAGNOSTIC only — compile_and_capture discards the emitted C — so it is a
+    // sentinel-leak tripwire, not emitted-C coverage. The program no longer reaches codegen,
+    // so there is no emitted C to assert on and none is needed.
+    assert(!out.contains("BLINK_COMPILER_BUG_kops_unsupported"))
+}
+
+test "struct type-arg holding Set[Float] is rejected, like the bare Set[Float]" {
+    let out = compile_test_helpers.compile_and_capture(src_box_set_float(), "kvn6w8_setfloat")
+    assert(out.contains("MapKeyNotHashable"))
+    assert(out.contains("Set element type"))
+    // Diagnostic-only, as above.
+    assert(!out.contains("BLINK_COMPILER_BUG_kops_unsupported"))
 }

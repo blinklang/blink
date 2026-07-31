@@ -51,14 +51,18 @@
 //
 // ALSO OUT OF SCOPE, and NOT deliberately so when this file was written — br 3aa3je: a
 // struct instance of the SAME name nested inside a TUPLE type arg
-// (`let b: Box[(Box[Int], Int)] = Box { v: (Box { v: 7 }, 5) }`) still collides, lowering
-// the struct's own field to `void` and emitting invalid C. The nesting guard below was
-// built for exactly that collision class but its has_struct_inst detection inspects only
-// the IMMEDIATE slot, so a tuple-wrapped instance rides in on the pre-existing TK_TUPLE
-// arm and the guard never runs. Confirmed byte-identical to a compiler built at 9f7fb86
-// (before this whole series), so it is pre-existing rather than caused by this tier — but
-// the nesting-guard row below covers only the DIRECT `Box[Box[Int]]` spelling, and reading
-// it as coverage of the whole class is the mistake 3aa3je exists to prevent.
+// (`let b: Box[(Box[Int], Int)] = Box { v: (Box { v: 7 }, 5) }`) still fails to compile.
+//
+// RE-MEASURED at br htxpmh, and the recorded symptom above is now STALE. The field no
+// longer lowers to `void`: the typedefs are correct (`blink_Tuple2_Box_Int_int v;`), and
+// the emitted C is byte-identical before and after the htxpmh retarget, so htxpmh neither
+// fixed nor caused it. What remains is a TUPLE ACCESS defect — `b.v.0.v` is emitted where
+// `b.v._0.v` is meant, and cc rejects that. The ticket is updated; treat the `void`
+// spelling here as history.
+//
+// The scope warning still stands and is the reason this paragraph survives: the
+// nesting-guard row below covers only the DIRECT `Box[Box[Int]]` spelling, and reading it
+// as coverage of the whole tuple-wrapped class is the mistake 3aa3je exists to prevent.
 
 import compile_test_helpers
 import std.io
@@ -234,13 +238,22 @@ test "exhibit B compiles and runs" {
     assert_eq(r.exit_code, 0)
 }
 
-// ── the nesting guard on the new struct-instance admission ────────────────────
-// tid_native_struct_inst_tid matches an annotation by BARE struct name and is not
-// cleared during the field loop, so admitting struct-INSTANCE slots lets a NESTED
-// inner literal adopt the OUTER instance's tid: the inner `Box { v: 7 }` would name
-// itself blink_Box_Box_Int and lower its own field to `blink_Box_Int v` —
-// self-referential, undeclared. The guard compares the recovered slot against the
-// literal's OWN memoized tid: the inner spells "Int", the outer "Box_Int".
+// ── the nested-literal anti-regression row ────────────────────────────────────
+// tid_native_struct_inst_tid matches an annotation by BARE struct name, so admitting
+// struct-INSTANCE slots let a NESTED inner literal adopt the OUTER instance's tid: the
+// inner `Box { v: 7 }` would name itself blink_Box_Box_Int and lower its own field to
+// `blink_Box_Int v` — self-referential, undeclared.
+//
+// The premise "and is not cleared during the field loop" was TRUE when this row was
+// written and is FALSE since br htxpmh: emit_struct_lit now saves and restores both
+// cg_let_target_ann and cg_expect_arg_ann per field and points them at the FIELD's own
+// annotation, so no outer instance is visible to the inner literal in the first place.
+// What answers this row now is the retarget. The nesting guard behind it still compares
+// the recovered slot against the literal's OWN memoized tid, but it is unreachable by
+// construction — corpus `decline=nesting_level_mismatch` went 4 -> 0 — and survives only
+// as a tripwire for a new nested-emission site added without the retarget (br jefm9w
+// deletes it). Every assertion below stays exactly as valid; only the mechanism named
+// above it changed.
 
 test "a nested generic-struct literal keeps its own mono name, one typedef each" {
     let mut s = "type Box[T] \{ v: T }\n"

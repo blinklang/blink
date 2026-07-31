@@ -56,9 +56,29 @@ policy veto — a slot appearing there is a `tc_struct_slot_encodable` gap to cl
 never a reason to re-prefer the string. The three structural declines stay distinct because they mean
 different things: `decline=bare_base` is a memo holding only the bare base (a typecheck memo bug),
 `decline=no_inst_tid` is no per-node instance tid at all, and `decline=nesting_level_mismatch` is the
-guard stopping an inner literal from adopting an outer annotation's slot — now UNCONDITIONAL, because
-`cg_let_target_ann`/`cg_expect_arg_ann` are still not cleared while the field loop emits nested values
-(br 3aa3je). `retry=mono_subst` means substituting the enclosing mono context is what let the tier
+guard stopping an inner literal from adopting an outer annotation's slot. It is UNCONDITIONAL and, since
+br htxpmh, UNREACHABLE BY CONSTRUCTION: emit_struct_lit's field loop, defaults loop and enum-variant ctor
+loop now retarget both `cg_let_target_ann` and `cg_expect_arg_ann` to the field's own annotation
+(descending through the instantiation when the field is declared as a bare binder), so a nested literal
+is handed the annotation describing itself and cannot adopt its parent's. Measured 4 rows over 3 fixtures
+before, **0** after, on the pinned corpus. A row here now means a NEW nested-emission site was added
+without the retarget — fix the site. The retarget is gated on `value_ctx_ann_spellable`, applied to
+`field_ann_at_instance`'s DESCENT RESULT so it covers BOTH channels: an annotation that still spells a
+type-param binder leaves them alone rather than overwriting them. Two independent reasons, and both were
+measured, so do not narrow the gate to one channel. (1) The consumers of `cg_let_target_ann`
+(`resolve_ctor_kops_elem`, `resolve_ptr_inner_c`) read a binder as no-information and fall back to a
+default — an int-keyed Set dropping to `blink_kops_str`, a `Ptr[T]` field allocating `sizeof(void)`.
+(2) The VOCABULARY BOUNDARY, which is why gating only that channel was itself a regression: the descent
+result is spelled in the ENCLOSING scope's type-param vocabulary, but both channels are then read while
+`cg_mono_tparams_sl` holds THIS struct's tparams, so a surviving binder is resolved BY NAME against the
+wrong list. The tempting argument that a binder is inert in `cg_expect_arg_ann` because it cannot match a
+head-name gate holds only for a BARE binder; `Set[K]` has a concrete head that matches and a foreign
+binder inside. Measured on `type P[K, V] { m: V, spare: K }` + `fn mk[K](_k: K) -> P[Int, Set[K]]`: an
+ungated `cg_expect_arg_ann` gave a `Set[Str]` the `blink_kops_i64` vtable and `contains("prefixedBBBB")`
+returned **true** (keys compared as the first 8 bytes of char data — silent, clean cc), and renaming the
+fn's type param `U`→`T` flipped a correct `blink_kops_str` into an undeclared
+`BLINK_COMPILER_BUG_kops_unsupported_K_ct20_Set`, a cc-time break on a legal program keyed on a cosmetic
+identifier. The tuple-wrapped shape of the same underlying mechanism is br 3aa3je. `retry=mono_subst` means substituting the enclosing mono context is what let the tier
 answer. The pre-qnpb2d spellings `decline=slot_unclassifiable`, `decline=ret_target_mismatch`,
 `decline=no_admission_reason` and the `admit=string_target_tid`/`admit=has_ret_target` split are GONE
 — they named the four-lens triad the single predicate replaced); `retann` (the def-side return-annotation tier —
@@ -101,9 +121,14 @@ spelled as its own type-param binder, i.e. an erasure to `void v;` or `blink_Opt
 `binder-survived` now also raises I0001 (which carries the same owner in its message and site in its
 help), so on a normal build that arm is already fatal and loud — the channel's real value is the
 three BAILS, which are otherwise completely silent. Two
-things it CANNOT see: a slot whose unresolvable answer is a TUPLE STEM rather than a binder (br
-3aa3je — `blink_Box_Tuple2_Box_Int_int` still gets `void v;` with this channel silent), and any
-erasure outside these four resolvers. Measured floor is 0 — `binder-survived` and every `bail=*` —
+things it CANNOT see: a slot whose unresolvable answer is a TUPLE STEM rather than a binder, and
+any erasure outside these four resolvers. The 3aa3je citation for the first of those is now
+HISTORY, not a live example — re-measured at br htxpmh, `let b: Box[(Box[Int], Int)] = Box { v:
+(Box { v: 7 }, 5) }` emits the correct `blink_Tuple2_Box_Int_int v;`, byte-identically before and
+after the retarget; what remains of 3aa3je is a tuple ACCESS defect (`b.v.0.v` for `b.v._0.v`).
+The blind spot itself is structural and unchanged — a tuple-stem slot would still be silent here
+— but there is currently no fixture exhibiting it, so treat it as an UNEXERCISED gap rather than
+a known-reachable one. Measured floor is 0 — `binder-survived` and every `bail=*` —
 across the same 728 codegen-reaching files described under `ctagvoid` below, in the same sweep. A
 nonzero reading is a regression, not noise.) `ctagvoid` (the four
 things `tc_tid_to_c_tag` used to spell with the ONE string `"Void"`, now separated — br hsgsbp.
@@ -120,7 +145,7 @@ routed a genuine Void onto the string path. It also shows the propagation: the `
 rejecting the kind would make `Result[Void, Str]` unencodable, a type `lib/std/` depends on and one
 the compiler synthesizes for every `?`-bearing `test` block. Measured (2026-07-30) over the 743-file
 corpus `tests/*.bl` + `examples/*.bl` + `examples/with_deps/{app,mathlib}/src/*.bl` + `src/cli.bl` +
-`src/blinkc_main.bl`, of which **728 actually reach codegen** — 15 die in an earlier phase and so
+`src/blinkc_main.bl`, of which **730 actually reach codegen** — 15 die in an earlier phase and so
 cannot reach any of these taps (`tests/xtest_question_mark_errors.bl` by design, plus 13 stale
 `examples/*.bl` and `with_deps`' app compiled standalone without its package context; note
 `task ci` does not compile `examples/` at all, so those are unguarded). Do NOT write the sweep as

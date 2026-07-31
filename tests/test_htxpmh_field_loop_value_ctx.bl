@@ -1,0 +1,866 @@
+// br htxpmh: retarget the VALUE-CONTEXT annotation across emit_struct_lit's field loop.
+//
+// emit_struct_lit (src/codegen_expr.bl) saves/restores `cg_expect_arg_ann` per field,
+// setting it to the field's declared annotation. It never touched `cg_let_target_ann`, so
+// the ENCLOSING let annotation stayed live for the whole field loop and every nested
+// `emit_expr` beneath it. Consumers read the two channels with different rules, and three
+// of them read `cg_let_target_ann` in a way `cg_expect_arg_ann` cannot shadow:
+//
+//   * tid_native_struct_inst_tid (:5492) matches BOTH channels by BARE STRUCT NAME, so a
+//     nested literal of the same struct adopts the OUTER annotation's type arguments.
+//   * resolve_ptr_inner_c (src/codegen_types.bl:5198) reads cg_let_target_ann with NO name
+//     gate at all — whatever annotation happens to be live supplies Ptr's inner C type.
+//   * emit_tuple_lit's parent_tuple_ann (:6445) and the Some-carrier consult (:4141) gate on
+//     the head name only ("Tuple" / "Option"), which a sibling instantiation satisfies.
+//
+// emit_tuple_lit (:6490-6515) already retargets BOTH channels per slot. emit_struct_lit was
+// the one nested-value emitter that retargeted only one. This fixture pins the retarget at
+// all four of its emission sites.
+//
+// ── LEDGER: every row's behavior MEASURED at 4afa18a BEFORE the retarget ───────────────
+//
+// The reds are honestly red and the greens are honestly no-regression:
+//
+//   ROW 1a  Box[Box[Option[Str]]] = Box{value: Box{value: None}}
+//             RED  — internal compiler error[UnsolvedTypeVarAtCodegen]:
+//                    "type parameter 'T' of 'Box_Box_Box_Option_str.value' reached
+//                    monomorphization unsolved". ONE NESTING LEVEL TOO DEEP: the inner
+//                    literal adopted the outer annotation's Box[Option[Str]] arg.
+//   ROW 1b  the Some("z") twin
+//             RED  — same ICE, mono args 'BLINK_I0001_erased_slot', so the instance is
+//                    named 'Box_BLINK_I0001_erased_slot'.
+//   ROW 2a  let s: Set[Int] = unbox(Box { value: Set() })
+//             GREEN, blink_kops_i64 — but green BY LEAK. The Box field's annotation is the
+//             bare binder `T`, which does not name "Set", so resolve_ctor_kops_elem fell
+//             through to the still-live outer cg_let_target_ann = Set[Int]. The retarget
+//             takes that leak away, so this row is the REGRESSION CONTROL for the whole
+//             change: the kops table must now come from an earlier tier (the ctor's own
+//             memoized tid / the field-loop mono context), not from a stale annotation.
+//   ROW 2b  the Map[Int,Str] twin — same, blink_kops_i64.
+//   ROW 3   type H { o: Option[Map[Str,Int]] }, H { o: Some(m) } under an outer Option[Int]
+//             GREEN — field decl and literal cast both blink_Option_Map_str_int.
+//   ROW 4   enum-variant twin, E.V { o: Option[Str], xs: List[Option[Str]] }
+//             RED  — pins site :6040, the sibling loop. The `o` half is green (its carrier
+//                    cast was already right); the `xs` half boxes its None element as
+//                    blink_Option_int*, adopting the outer List[Option[Int]]. 1 box at HEAD,
+//                    0 after.
+//   ROW 5   type H { xs: List[Option[Str]] }, H { xs: [None, Some("abcd")] } under List[Option[Int]]
+//             RED  — the None element is boxed as blink_Option_int*. 1 box at HEAD, 0 after.
+//                    This is the shape rows 4 and 8 were rewritten around: the first draft of
+//                    all three asserted on TYPEDEF-derived strings, which the type-definition
+//                    walker emits from the field declaration and no value-context channel can
+//                    reach, so they passed with their own hunks reverted.
+//   ROW 6   type H { t: (Int, Option[Str]) }, H { t: (1, None) } under an outer (Int, Option[Int])
+//             RED  — cc: "incompatible types when initializing type 'long int' using type
+//                    'blink_Tuple2_int_Option_int'". The tuple was built from the OUTER
+//                    annotation's slots, not the field's.
+//   ROW 7a  @ffi.struct Pollfd + type W { p: Ptr[Pollfd] }, plain `let w: W = W { p: ... }`
+//             RED  — `calloc(1, sizeof(void))`. cg_let_target_ann was `W`, which has no
+//                    type arguments, so resolve_ptr_inner_c returned "void": ONE byte
+//                    allocated for an eight-byte struct. Heap corruption, clean cc.
+//   ROW 7b  the same W under an outer Option[Int]
+//             RED  — `calloc(1, sizeof(int64_t))`, the outer annotation's inner adopted
+//                    wholesale. Right size only by coincidence.
+//             Rows 7a/7b are the WHOLE JUSTIFICATION for retargeting to the field
+//             annotation rather than clearing to -1: clearing fixes 7b and leaves 7a.
+//             Zero corpus coverage for this shape.
+//   ROW 8   field DEFAULTS (Option[Str] = None, Map[Str,Int] = Map(),
+//           List[Option[Str]] = [None]) under an outer Option[Int] / List[Option[Int]]
+//             RED  — the Option and Map defaults were already right; the list default boxes
+//                    its None element as blink_Option_int*, once per H literal. 3 boxes at
+//                    HEAD, 0 after. Site :6270 is the strongest argument of the four:
+//                    `dfl.default_node` belongs to the TYPE DEFINITION, so ANY enclosing
+//                    value-context annotation is categorically wrong there.
+//   ROW 9   spread, H { x: 5, ..base } — plain and under an outer Option[Int]
+//             GREEN, and stays untouched. Site :6208 has no field annotation to retarget to,
+//             and a spread source is a WHOLE-STRUCT value of this struct's type, so an
+//             enclosing annotation naming the struct is the one that correctly describes it.
+//             Clearing to -1 would discard that and buy nothing: corpus spread sources are
+//             Idents, which read no annotation channel. Byte-identity control.
+//   ROW 10  let b: Box[U8] = Box { value: 7 }
+//             TYPECHECK-REJECTED, error[TypeError] "declared type Box[U8] but got Box[Int]".
+//             Pinned as the rejected row it is because a claim in circulation held that
+//             this shape gave the nesting guard a SECOND, legitimate role
+//             (annotation-as-oracle for a sized-int coercion). It does not — the program
+//             never reaches codegen, so the guard has no such role, and that is why
+//             htxpmh could retarget instead of having to preserve the leak.
+//   ROWS 11a-11d  the retarget must never be WORSE than the leak it replaces
+//             GREEN at HEAD and green now, by construction: these are the shapes where the
+//             retarget's own answer is UNSPELLABLE and it must therefore stand aside rather
+//             than overwrite a working annotation. See the block comment above them.
+//   ROW 12a GE[T] with a BARE-BINDER struct-style variant field, V { o: T }
+//             RED  — 2x blink_kops_str at HEAD: both instantiations take whichever annotation
+//                    was live, so the Set[Int] hashes integers through the STRING vtable.
+//                    kops_i64 + kops_str after.
+//   ROW 12b P[A, B] at SLOT 1 — P[Map[Str,Int], Set[Int]]
+//             RED  — 2x blink_kops_str at HEAD: slot 1's Set[Int] took slot 0's Map key type.
+//                    Every other generic type in this fixture has ONE type parameter, so a
+//                    resolver that silently answered slot 0 for every slot would have passed
+//                    the whole file. Exits 0 at HEAD as well as here — a wrong kops table is
+//                    silent until it isn't (hnyqe4), which is why the C assertion carries it.
+//
+// ── WHAT THE NESTING GUARD DID AND DID NOT CONTAIN ────────────────────────────────────
+//
+// The unconditional nesting guard (src/codegen_expr.bl:5581-5613) caught ROW 1's shape only
+// when the inner literal's own tid POSITIVELY CONTRADICTED the adopted CSV.
+// arg_tids_match_mono_args treats a -1 slot as a DON'T-CARE, not a contradiction (its
+// contract, documented at the guard), so when the inner field value is a bare carrier whose
+// slot reverse-infers unencodable the guard stays SILENT and the adoption lands. That is
+// exactly rows 1a/1b. Box[Box[Int]] escaped only by luck of tiers: the tid tier declined,
+// struct_concrete_args_from_target bailed on the compound arg, and infer_struct_type_args
+// read the field VALUE and got Int.
+//
+// After the retarget the guard is UNREACHABLE by construction and stays only as a
+// diagnostic tripwire (br jefm9w deletes it along with its three siblings). The
+// Box[Box[Int]] anti-regression row lives in tests/test_qnpb2d_tid_outranks_target.bl and
+// now proves the retarget rather than the guard.
+
+import compile_test_helpers
+import std.io
+
+fn assert_has(c: Str, needle: Str, label: Str) {
+    if !c.contains(needle) { io.println("FAIL: {label} — missing '{needle}'") }
+    assert(c.contains(needle))
+}
+
+fn assert_lacks(c: Str, needle: Str, label: Str) {
+    if c.contains(needle) { io.println("FAIL: {label} — forbidden '{needle}' present") }
+    assert(!c.contains(needle))
+}
+
+fn box_decl() -> Str {
+    "type Box[T] \{ value: T }\n"
+}
+
+// ── ROWS 1a/1b: the headline RED ──────────────────────────────────────────────────────
+//
+// The nesting guard could not see this. `Box { value: None }` reverse-infers its slot as
+// unencodable, which the guard reads as a DON'T-CARE rather than a contradiction, so the
+// inner literal kept the outer annotation's Box[Option[Str]] arg and mangled itself one
+// level too deep.
+
+fn src_nested_opt(payload: Str) -> Str {
+    let mut s = box_decl()
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let x: Box[Box[Option[Str]]] = Box \{ value: Box \{ value: {payload} } }\n")
+    s = s.concat("    assert(true)\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "a nested Box over a bare None carrier does not adopt the outer annotation's arg" {
+    let c = compile_test_helpers.compile_and_emit_c(src_nested_opt("None"), "htxpmh_r1none_c")
+    assert_lacks(c, "BLINK_I0001_", "row 1a / I0001 sentinel in emitted C")
+    assert_lacks(c, "Box_Box_Box_Option_str", "row 1a / mono name one nesting level too deep")
+    assert_has(c, "blink_Box_Box_Option_str", "row 1a / outer instance")
+    assert_has(c, "blink_Box_Option_str", "row 1a / inner instance kept distinct")
+    let r = compile_test_helpers.compile_and_run(src_nested_opt("None"), "htxpmh_r1none_run")
+    if r.exit_code != 0 { io.println("FAIL: row 1a runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+}
+
+test "a nested Box over a Some carrier does not erase its slot" {
+    let c = compile_test_helpers.compile_and_emit_c(src_nested_opt("Some(\"z\")"), "htxpmh_r1some_c")
+    assert_lacks(c, "BLINK_I0001_", "row 1b / I0001 sentinel in emitted C")
+    assert_lacks(c, "erased_slot", "row 1b / erased mono slot")
+    assert_has(c, "blink_Box_Box_Option_str", "row 1b / outer instance")
+    assert_has(c, "blink_Box_Option_str", "row 1b / inner instance kept distinct")
+    let r = compile_test_helpers.compile_and_run(src_nested_opt("Some(\"z\")"), "htxpmh_r1some_run")
+    if r.exit_code != 0 { io.println("FAIL: row 1b runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+}
+
+// ── ROWS 2a/2b: the kops regression control ───────────────────────────────────────────
+//
+// A RUNTIME WITNESS IS MANDATORY HERE. A Set()/Map() in a struct-literal FIELD is never the
+// fn tail value, so ctor_kops_fail_closed (src/codegen_expr.bl:2711-2721) does NOT fail
+// closed for it and a wrong kops table is completely silent at cc time — the hnyqe4
+// collision class. 256 and 512 are chosen because they collide under the string hash when
+// int keys are hashed as strings.
+
+fn src_set_field() -> Str {
+    let mut s = box_decl()
+    s = s.concat("fn unbox(b: Box[Set[Int]]) -> Set[Int] \{ b.value }\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let mut s: Set[Int] = unbox(Box \{ value: Set() })\n")
+    s = s.concat("    s.insert(256)\n")
+    s = s.concat("    s.insert(512)\n")
+    s = s.concat("    assert(s.contains(256))\n")
+    s = s.concat("    assert(s.contains(512))\n")
+    s = s.concat("    assert(!s.contains(7))\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "a Set() in a bare-binder struct field keeps its int kops after the retarget" {
+    let c = compile_test_helpers.compile_and_emit_c(src_set_field(), "htxpmh_r2set_c")
+    assert_has(c, "blink_kops_i64", "row 2a / int kops vtable")
+    assert_lacks(c, "blink_kops_str", "row 2a / string kops vtable")
+    let r = compile_test_helpers.compile_and_run(src_set_field(), "htxpmh_r2set_run")
+    if r.exit_code != 0 { io.println("FAIL: row 2a runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+}
+
+fn src_map_field() -> Str {
+    let mut s = box_decl()
+    s = s.concat("fn unbox(b: Box[Map[Int, Str]]) -> Map[Int, Str] \{ b.value }\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let mut m: Map[Int, Str] = unbox(Box \{ value: Map() })\n")
+    s = s.concat("    m.insert(256, \"a\")\n")
+    s = s.concat("    m.insert(512, \"b\")\n")
+    s = s.concat("    assert(m.get(256).unwrap() == \"a\")\n")
+    s = s.concat("    assert(m.get(512).unwrap() == \"b\")\n")
+    s = s.concat("    assert(m.get(7).is_none())\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "a Map() in a bare-binder struct field keeps its int kops after the retarget" {
+    let c = compile_test_helpers.compile_and_emit_c(src_map_field(), "htxpmh_r2map_c")
+    assert_has(c, "blink_kops_i64", "row 2b / int kops vtable")
+    assert_lacks(c, "blink_kops_str", "row 2b / string kops vtable")
+    let r = compile_test_helpers.compile_and_run(src_map_field(), "htxpmh_r2map_run")
+    if r.exit_code != 0 { io.println("FAIL: row 2b runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+}
+
+// ── ROW 3: compound carrier field under a colliding outer annotation ──────────────────
+//
+// The outer `let n: Option[Int]` names "Option", which is all the Some-carrier consult at
+// :4141 gates on, so the field's Option[Map[Str,Int]] and the outer Option[Int] are
+// indistinguishable to it by head name. The declared carrier is blink_Option_Map_str_int
+// (verified before writing this assertion — determine which carrier the field decl actually
+// mints, do not guess).
+
+fn src_compound_carrier() -> Str {
+    let mut s = "type H \{ o: Option[Map[Str, Int]] }\n"
+    s = s.concat("fn take(h: H) -> Option[Int] \{ Some(1) }\n")
+    s = s.concat("fn seed() -> Map[Str, Int] \{\n")
+    s = s.concat("    let mut m: Map[Str, Int] = Map()\n")
+    s = s.concat("    m.insert(\"a\", 7)\n")
+    s = s.concat("    m\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let n: Option[Int] = take(H \{ o: Some(seed()) })\n")
+    s = s.concat("    assert(n.unwrap() == 1)\n")
+    s = s.concat("    let h: H = H \{ o: Some(seed()) }\n")
+    s = s.concat("    assert(h.o.is_some())\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "a compound carrier field keeps its declared carrier under a colliding outer let" {
+    let c = compile_test_helpers.compile_and_emit_c(src_compound_carrier(), "htxpmh_r3_c")
+    assert_has(c, "blink_Option_Map_str_int o;", "row 3 / field lowers to the declared carrier")
+    assert_has(c, "(blink_Option_Map_str_int)\{.tag = 1", "row 3 / literal casts to the same carrier")
+    assert_lacks(c, "blink_Option_int o;", "row 3 / outer Option[Int] adopted into the field")
+    let r = compile_test_helpers.compile_and_run(src_compound_carrier(), "htxpmh_r3_run")
+    if r.exit_code != 0 { io.println("FAIL: row 3 runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+}
+
+// ── ROW 4: the enum-variant ctor loop, site :6040 ─────────────────────────────────────
+//
+// The sibling loop. Leaving one of two sibling loops unretargeted is the "partial lens"
+// pattern the qnpb2d comments (src/codegen_expr.bl:5537-5548) exist to stop. The incumbent
+// guard for this site is tests/test_264p4n_none_enum_variant_field_carrier.bl; this row adds
+// the colliding OUTER annotation that fixture has no reason to carry.
+//
+// A `blink_Option_str o;` needle here would be unfalsifiable, and the first draft of this row
+// used one: that string is emitted by the TYPE DEFINITION walker into
+// `typedef struct { ... } blink_E` from the declared field annotation, which no value-context
+// channel can reach. Revert the whole enum-variant hunk and it stays byte-identical, so it says
+// nothing about this site. Needles have to name what the hunk actually emits — the casts and
+// boxes the field VALUES are built with.
+//
+// The variant therefore carries TWO fields, one for each half of the proof:
+//
+//   o: Option[Str]           — the runtime half. `take` matches the variant and reads `o` back
+//                              out through the colliding `Option[Int]` return, so the witness
+//                              exercises the value instead of only proving the program links.
+//   xs: List[Option[Str]]    — the falsifiable half, and a measured RED. At HEAD the `[None]`
+//                              element under the outer `List[Option[Int]]` is boxed as
+//                              `blink_Option_int*`; with the retarget it is `blink_Option_str*`.
+//                              `empties` returns an EMPTY list precisely so it mints no
+//                              Option[Int] box of its own — that makes "zero `blink_Option_int*`
+//                              anywhere in the program" an exact statement of the fix rather
+//                              than a count that has to be maintained.
+
+fn src_enum_variant() -> Str {
+    let mut s = "type E \{\n    V \{ o: Option[Str], xs: List[Option[Str]] }\n    Nil\n}\n"
+    s = s.concat("fn take(e: E) -> Option[Int] \{\n")
+    s = s.concat("    match e \{\n")
+    s = s.concat("        E.V \{ o, xs } => \{\n")
+    s = s.concat("            if o.is_none() \{ return Some(xs.len()) }\n")
+    s = s.concat("            return Some(o.unwrap().len())\n")
+    s = s.concat("        }\n")
+    s = s.concat("        E.Nil => \{ return None }\n")
+    s = s.concat("    }\n")
+    s = s.concat("    None\n")
+    s = s.concat("}\n")
+    s = s.concat("fn empties(_e: E) -> List[Option[Int]] \{ [] }\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let n: Option[Int] = take(E.V \{ o: Some(\"abc\"), xs: [] })\n")
+    s = s.concat("    assert(n.unwrap() == 3)\n")
+    s = s.concat("    let n2: Option[Int] = take(E.V \{ o: None, xs: [] })\n")
+    s = s.concat("    assert(n2.unwrap() == 0)\n")
+    s = s.concat("    let n3: Option[Int] = take(E.Nil)\n")
+    s = s.concat("    assert(n3.is_none())\n")
+    s = s.concat("    let ys: List[Option[Int]] = empties(E.V \{ o: None, xs: [None] })\n")
+    s = s.concat("    assert(ys.len() == 0)\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "an enum-variant field keeps its declared carrier under a colliding outer let" {
+    let c = compile_test_helpers.compile_and_emit_c(src_enum_variant(), "htxpmh_r4_c")
+    assert_has(c, ".o = (blink_Option_str)\{.tag = 1, .value = \"abc\"}",
+        "row 4 / the Some payload is cast to the declared carrier")
+    assert_has(c, ".o = (blink_Option_str)\{.tag = 0}",
+        "row 4 / the None payload is cast to the declared carrier")
+    assert_lacks(c, "blink_Option_int*",
+        "row 4 / outer List[Option[Int]] adopted for the variant's list element (1 box at HEAD)")
+    let r = compile_test_helpers.compile_and_run(src_enum_variant(), "htxpmh_r4_run")
+    if r.exit_code != 0 { io.println("FAIL: row 4 runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+}
+
+// ── ROW 5: List field ─────────────────────────────────────────────────────────────────
+//
+// list_lit_elem_ann (src/codegen_expr.bl:2960) reads cg_let_target_ann and gates on the head
+// name "List" only, so the outer List[Option[Int]] is indistinguishable from the field's
+// List[Option[Str]] to it.
+//
+// A measured RED, and the row that found the shape the other two site rows now use. A bare
+// `blink_Option_str` needle would be unfalsifiable — the typedef block emits it from the field
+// DECLARATION either way. The discriminating needles are the elements' own boxes: at HEAD the
+// `None` element is `blink_Option_int*` (adopting the outer annotation), with the retarget it
+// is `blink_Option_str*`. `first` returns an EMPTY list so it mints no Option[Int] box of its
+// own, which lets the assertion be the exact "zero anywhere in the program".
+//
+// NO RUNTIME WITNESS, and not for lack of trying: reading an element back out of a
+// List[Option[Str]] STRUCT FIELD lowers the read as blink_Option_int and cc rejects it, both
+// via `.get(i).unwrap()` and via `for o in h.xs`. That is br 95zr3e — identical at HEAD
+// (4afa18a), present with no colliding annotation anywhere in the program, and absent when the
+// same list is a bare local, so it is a field-READ defect independent of this seam. The row
+// asserts on emitted C only until 95zr3e lands; add the witness then.
+
+fn src_list_field() -> Str {
+    let mut s = "type H \{ xs: List[Option[Str]] }\n"
+    s = s.concat("fn first(_h: H) -> List[Option[Int]] \{ [] }\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let ys: List[Option[Int]] = first(H \{ xs: [None, Some(\"abcd\")] })\n")
+    s = s.concat("    assert(ys.len() == 0)\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "a List field's element carrier comes from the field annotation" {
+    let c = compile_test_helpers.compile_and_emit_c(src_list_field(), "htxpmh_r5_c")
+    assert_has(c, "(blink_Option_str)\{.tag = 1, .value = \"abcd\"}",
+        "row 5 / the Some element is boxed as the field's declared carrier")
+    assert_lacks(c, "blink_Option_int*",
+        "row 5 / outer List[Option[Int]] adopted for an element (1 box at HEAD)")
+    let r = compile_test_helpers.compile_and_run(src_list_field(), "htxpmh_r5_run")
+    if r.exit_code != 0 { io.println("FAIL: row 5 runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+}
+
+// ── ROW 6: tuple field — the second RED ───────────────────────────────────────────────
+//
+// emit_tuple_lit's parent_tuple_ann (:6445) reads cg_let_target_ann and gates on the head
+// name "Tuple" plus ARITY. The outer (Int, Option[Int]) and the field's (Int, Option[Str])
+// coincide on both, so the tuple slots were built from the outer annotation:
+//
+//   blink_H _s0 = { .t = _tup1 };   // _tup1 is blink_Tuple2_int_Option_int
+//   cc: incompatible types when initializing type 'long int'
+//
+// Note the field itself lowered to a BARE int64_t under the wrong tuple type — a nested
+// tuple field is only well-typed when the slot annotation the literal is built from is the
+// field's own.
+
+fn src_tuple_field() -> Str {
+    let mut s = "type H \{ t: (Int, Option[Str]) }\n"
+    s = s.concat("fn wrap(h: H) -> (Int, Option[Int]) \{ (h.t._0, None) }\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let u: (Int, Option[Int]) = wrap(H \{ t: (1, None) })\n")
+    s = s.concat("    assert(u._0 == 1)\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "a tuple field is built from the field annotation, not a same-arity outer let" {
+    let c = compile_test_helpers.compile_and_emit_c(src_tuple_field(), "htxpmh_r6_c")
+    assert_has(c, "blink_Tuple2_int_Option_str", "row 6 / field's own tuple type")
+    assert_has(c, "blink_Tuple2_int_Option_str t;", "row 6 / field lowers to its own tuple type")
+    let r = compile_test_helpers.compile_and_run(src_tuple_field(), "htxpmh_r6_run")
+    if r.exit_code != 0 { io.println("FAIL: row 6 runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+}
+
+// ── ROWS 7a/7b: Ptr field — the third RED, and the reason to RETARGET not CLEAR ────────
+//
+// resolve_ptr_inner_c (src/codegen_types.bl:5198) reads cg_let_target_ann with NO name gate:
+// it takes whatever annotation is live and uses its FIRST type argument as Ptr's inner C
+// type. So the field `p: Ptr[Pollfd]` sized its allocation from whatever `let` enclosed the
+// literal:
+//
+//   let w: W = W { p: scope.alloc() }        ->  calloc(1, sizeof(void))     // 1 byte!
+//   let n: Option[Int] = count(W { p: ... }) ->  calloc(1, sizeof(int64_t))  // by luck
+//
+// Pollfd is {I32, I16, I16} = 8 bytes. sizeof(void) is 1 under GCC, so 7a genuinely
+// under-allocates and the write scribbles past the block: silent heap corruption behind a
+// perfectly clean cc.
+//
+// 7a is what makes the operator decision "retarget to the field annotation" and not "clear
+// to -1": clearing fixes 7b (nothing live to adopt) and leaves 7a EXACTLY as broken, because
+// `W` already had no type arguments to read. Only the field annotation Ptr[Pollfd] carries
+// the answer. This shape has ZERO corpus coverage.
+
+fn ptr_decls() -> Str {
+    let mut s = "@ffi.struct(header: \"poll.h\", name: \"pollfd\")\n"
+    s = s.concat("pub type Pollfd \{ fd: I32, events: I16, revents: I16 }\n")
+    s = s.concat("type W \{ p: Ptr[Pollfd] }\n")
+    s
+}
+
+fn src_ptr_plain() -> Str {
+    let mut s = ptr_decls()
+    s = s.concat("@trusted(audit: \"htxpmh-ptr-field\")\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    with ffi.scope() as scope \{\n")
+    s = s.concat("        let w: W = W \{ p: scope.alloc() }\n")
+    s = s.concat("        assert(w.p.is_null() == false)\n")
+    s = s.concat("    }\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "a Ptr field sizes its allocation from the field annotation, not the outer let" {
+    let c = compile_test_helpers.compile_and_emit_c(src_ptr_plain(), "htxpmh_r7a_c")
+    assert_has(c, "sizeof(blink_Pollfd)", "row 7a / allocation sized from the field annotation")
+    assert_lacks(c, "calloc(1, sizeof(void))", "row 7a / one-byte under-allocation")
+    let r = compile_test_helpers.compile_and_run(src_ptr_plain(), "htxpmh_r7a_run")
+    if r.exit_code != 0 { io.println("FAIL: row 7a runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+}
+
+fn src_ptr_collide() -> Str {
+    let mut s = ptr_decls()
+    s = s.concat("fn count(_w: W) -> Option[Int] \{ Some(1) }\n")
+    s = s.concat("@trusted(audit: \"htxpmh-ptr-field\")\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    with ffi.scope() as scope \{\n")
+    s = s.concat("        let n: Option[Int] = count(W \{ p: scope.alloc() })\n")
+    s = s.concat("        assert(n.unwrap() == 1)\n")
+    s = s.concat("    }\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "a Ptr field does not adopt a colliding outer annotation's inner type" {
+    let c = compile_test_helpers.compile_and_emit_c(src_ptr_collide(), "htxpmh_r7b_c")
+    assert_has(c, "sizeof(blink_Pollfd)", "row 7b / allocation sized from the field annotation")
+    assert_lacks(c, "calloc(1, sizeof(int64_t))", "row 7b / outer Option[Int] inner adopted")
+    let r = compile_test_helpers.compile_and_run(src_ptr_collide(), "htxpmh_r7b_run")
+    if r.exit_code != 0 { io.println("FAIL: row 7b runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+}
+
+// ── ROW 8: the field-DEFAULT site, :6270 ──────────────────────────────────────────────
+//
+// The strongest argument of the four sites: `dfl.default_node` belongs to the TYPE
+// DEFINITION, not to any use site, so ANY enclosing value-context annotation is
+// categorically wrong for it. Green at HEAD, and the point of the row is that it stays green
+// while the site starts answering from the field annotation instead of by accident.
+//
+// `blink_Option_str o;` is again typedef-derived and dropped. The needles are the DEFAULT
+// VALUES the site emits into the struct initializer, and the three fields split the work:
+//
+//   o: Option[Str] = None            — `.o = (blink_Option_str){.tag = 0}`.
+//   m: Map[Str, Int] = Map()         — `.m = blink_map_new(&blink_kops_str)`, plus the runtime
+//                                      witness below.
+//   xs: List[Option[Str]] = [None]   — the measured RED: 3 `blink_Option_int*` boxes at HEAD
+//                                      (one per H literal), 0 with the retarget. `empties`
+//                                      returns an empty list so it mints none of its own.
+//
+// The Map field is where a defect would be SILENT. A Map() in a struct-field default is never
+// the fn tail value, so ctor_kops_fail_closed (src/codegen_expr.bl:2711-2721) does not fail
+// closed: the program still compiles and links while hashing Str keys through the wrong vtable
+// (the hnyqe4 collision). So the runtime witness inserts under one COMPUTED key and reads back
+// under a differently-computed equal one — literal-identical keys would pass under a
+// pointer-comparing vtable too, and prove nothing.
+
+fn src_field_default() -> Str {
+    let mut s = "type H \{ x: Int, o: Option[Str] = None, m: Map[Str, Int] = Map(), xs: List[Option[Str]] = [None] }\n"
+    s = s.concat("fn take(_h: H) -> Option[Int] \{ Some(1) }\n")
+    s = s.concat("fn empties(_h: H) -> List[Option[Int]] \{ [] }\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let n: Option[Int] = take(H \{ x: 1 })\n")
+    s = s.concat("    assert(n.unwrap() == 1)\n")
+    s = s.concat("    let ys: List[Option[Int]] = empties(H \{ x: 3 })\n")
+    s = s.concat("    assert(ys.len() == 0)\n")
+    s = s.concat("    let mut h: H = H \{ x: 2 }\n")
+    s = s.concat("    assert(h.o.is_none())\n")
+    s = s.concat("    assert(h.m.len() == 0)\n")
+    s = s.concat("    assert(h.xs.len() == 1)\n")
+    s = s.concat("    let k1 = \"k\".concat(\"ey\")\n")
+    s = s.concat("    let k2 = \"ke\".concat(\"y\")\n")
+    s = s.concat("    h.m.insert(k1, 7)\n")
+    s = s.concat("    assert(h.m.len() == 1)\n")
+    s = s.concat("    assert(h.m.get(k2).unwrap() == 7)\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "field defaults resolve against the field annotation, not the enclosing let" {
+    let c = compile_test_helpers.compile_and_emit_c(src_field_default(), "htxpmh_r8_c")
+    assert_has(c, ".o = (blink_Option_str)\{.tag = 0}", "row 8 / the default None casts to the field's carrier")
+    assert_has(c, ".m = blink_map_new(&blink_kops_str)", "row 8 / Str-keyed default Map keeps string kops")
+    assert_lacks(c, "blink_kops_i64", "row 8 / a non-Str kops table anywhere in the program")
+    assert_lacks(c, "blink_Option_int*",
+        "row 8 / outer List[Option[Int]] adopted for the default list element (3 boxes at HEAD)")
+    let r = compile_test_helpers.compile_and_run(src_field_default(), "htxpmh_r8_run")
+    if r.exit_code != 0 { io.println("FAIL: row 8 runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+}
+
+// ── ROW 9: the spread site, :6208 ─────────────────────────────────────────────────────
+//
+// The one site the retarget deliberately does NOT touch. A spread source is a WHOLE-STRUCT
+// value of THIS struct's type, so there is no field annotation to retarget to — and an
+// enclosing annotation naming this struct is the annotation that correctly describes it. This
+// is the single case where the adoption the retarget exists to stop is not an adoption at all,
+// so clearing to -1 would throw away a correct answer and buy nothing: every corpus spread
+// source is an Ident, which reads no annotation channel. The site is therefore left exactly as
+// HEAD had it, and this row is the byte-identity control proving that: green at HEAD, green
+// now, and it pins the Ident case so a future change to the arm has to face it.
+
+fn src_spread() -> Str {
+    let mut s = "type H \{ x: Int, o: Option[Str] }\n"
+    s = s.concat("fn take(h: H) -> Option[Int] \{ Some(h.x) }\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let base: H = H \{ x: 1, o: Some(\"a\") }\n")
+    s = s.concat("    let h2: H = H \{ x: 5, ..base }\n")
+    s = s.concat("    assert(h2.x == 5)\n")
+    s = s.concat("    assert(h2.o.is_some())\n")
+    s = s.concat("    let n: Option[Int] = take(H \{ x: 9, ..base })\n")
+    s = s.concat("    assert(n.unwrap() == 9)\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "leaving the spread site alone keeps the ordinary Ident case byte-identical" {
+    let c = compile_test_helpers.compile_and_emit_c(src_spread(), "htxpmh_r9_c")
+    assert_has(c, "blink_Option_str o;", "row 9 / spread-copied field carrier")
+    assert_lacks(c, "BLINK_I0001_", "row 9 / I0001 sentinel")
+    let r = compile_test_helpers.compile_and_run(src_spread(), "htxpmh_r9_run")
+    if r.exit_code != 0 { io.println("FAIL: row 9 runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+}
+
+// ── ROW 10: the refuted "second role" ─────────────────────────────────────────────────
+//
+// Pinned as the TYPECHECK-REJECTED row it is. A claim in circulation held that
+// `let b: Box[U8] = Box { value: 7 }` gave the outer annotation a second, LEGITIMATE role at
+// the field loop — an oracle telling the `7` literal to become a U8 — and that the retarget
+// would therefore have to preserve the leak. Measurement refutes it: typecheck rejects the
+// program before codegen ever runs, so no annotation reaches the field loop and there is no
+// second role to preserve. This row keeps that refutation from having to be re-derived.
+
+fn src_box_u8() -> Str {
+    let mut s = box_decl()
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let b: Box[U8] = Box \{ value: 7 }\n")
+    s = s.concat("    assert(b.value == 7)\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "Box[U8] over an Int literal is rejected by typecheck, so the field loop never sees it" {
+    let out = compile_test_helpers.compile_and_capture(src_box_u8(), "htxpmh_r10")
+    assert_has(out, "TypeError", "row 10 / rejected at typecheck")
+    assert_has(out, "Box[U8]", "row 10 / the declared type is named")
+}
+
+// ── ROWS 11a-11d: the retarget must never be WORSE than the leak it replaces ──────────
+//
+// Rows 2a/2b and 7a/7b all give the descent something to land on: 2a's `unbox` is
+// MONOMORPHIC (`b: Box[Set[Int]]`), so the field's bare `T` resolves to `Set[Int]`, and 7a's
+// `W` is NON-GENERIC, so `p: Ptr[Pollfd]` is concrete as declared. Neither can reach the
+// case where field_ann_at_instance answers with an annotation that still contains a
+// type-param BINDER — and that case is where an unconditional retarget of cg_let_target_ann
+// is strictly worse than leaving it alone, because the channel's consumers read a binder as
+// "no information" and fall back to a default rather than to the outer annotation the leak
+// used to supply.
+//
+// Two distinct ways to get a binder-bearing answer, both with zero corpus coverage:
+//
+//   11a/11b — the descent FAILS. In 11a no value-context annotation names `Box` at all (the
+//   literal is the receiver of a field access); in 11b `unbox[T]` is generic, so the descent
+//   succeeds but lands on the FN's binder. Either way f_ann is the bare `T`.
+//   resolve_ctor_kops_elem falls through to cg_let_target_ann, which at HEAD still held the
+//   outer `Set[Int]` and answered kops_i64 correctly. Overwriting it with `T`
+//   drops the ctor to blink_kops_str — int keys hashed through the STRING vtable, the hnyqe4
+//   silent-hash class, invisible at cc time. 256/512 collide under that hash.
+//
+//   11c/11d — the field annotation carries type arguments of its OWN (`p: Ptr[T]`), so
+//   field_ann_at_instance returns it undescended and it still spells the binder in its
+//   element. resolve_ptr_inner_c reads cg_let_target_ann with NO name gate and no arity
+//   check, so at HEAD it read the outer `W[Pollfd]`'s first element and got Pollfd by
+//   coincidence; retargeting hands it `Ptr[T]` whose element is `T`, and ptr_inner_c_type
+//   falls through to "void". Pollfd is 8 bytes and sizeof(void) is 1 under GCC, so this is a
+//   silent 7-byte heap overflow behind a clean cc — strictly worse than the leak.
+//
+// The rule these four pin: retarget cg_let_target_ann only when the resolved field
+// annotation is SPELLABLE end to end. When it is not, leave the channel exactly as the
+// enclosing context set it, because a stale-but-concrete annotation still carries more
+// information than a binder. cg_expect_arg_ann is retargeted unconditionally — its consumers
+// all gate on a head name that a binder cannot match, so a binder there is inert.
+
+fn src_kops_no_naming_ann() -> Str {
+    let mut s = box_decl()
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let mut s: Set[Int] = (Box \{ value: Set() }).value\n")
+    s = s.concat("    s.insert(256)\n")
+    s = s.concat("    s.insert(512)\n")
+    s = s.concat("    assert(s.contains(256))\n")
+    s = s.concat("    assert(s.contains(512))\n")
+    s = s.concat("    assert(!s.contains(7))\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "a Set() field with no annotation naming the struct keeps its int kops" {
+    let c = compile_test_helpers.compile_and_emit_c(src_kops_no_naming_ann(), "htxpmh_r11a_c")
+    assert_has(c, "blink_kops_i64", "row 11a / int kops vtable")
+    assert_lacks(c, "blink_kops_str", "row 11a / string kops vtable")
+    let r = compile_test_helpers.compile_and_run(src_kops_no_naming_ann(), "htxpmh_r11a_run")
+    if r.exit_code != 0 { io.println("FAIL: row 11a runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+}
+
+// Set, not Map, in BOTH 11a and 11b. The Map twins of these two shapes
+// (`let m: Map[Int,Str] = (Box { value: Map() }).value` and the generic-unbox spelling) are
+// already broken at HEAD with I0001 UnsolvedTypeVarAtCodegen — pre-existing, independent of
+// this retarget, and filed separately. Using them here would make the rows red for a reason
+// that is not the one they exist to pin.
+
+fn src_kops_generic_unbox() -> Str {
+    let mut s = box_decl()
+    s = s.concat("fn unbox[T](b: Box[T]) -> T \{ b.value }\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let mut s2: Set[Int] = unbox(Box \{ value: Set() })\n")
+    s = s.concat("    s2.insert(256)\n")
+    s = s.concat("    s2.insert(512)\n")
+    s = s.concat("    assert(s2.contains(256))\n")
+    s = s.concat("    assert(s2.contains(512))\n")
+    s = s.concat("    assert(!s2.contains(7))\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "a Set() field reached through a GENERIC unbox keeps its int kops" {
+    let c = compile_test_helpers.compile_and_emit_c(src_kops_generic_unbox(), "htxpmh_r11b_c")
+    assert_has(c, "blink_kops_i64", "row 11b / int kops vtable")
+    assert_lacks(c, "blink_kops_str", "row 11b / string kops vtable")
+    let r = compile_test_helpers.compile_and_run(src_kops_generic_unbox(), "htxpmh_r11b_run")
+    if r.exit_code != 0 { io.println("FAIL: row 11b runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+}
+
+fn src_ptr_generic_struct() -> Str {
+    let mut s = "@ffi.struct(header: \"poll.h\", name: \"pollfd\")\n"
+    s = s.concat("pub type Pollfd \{ fd: I32, events: I16, revents: I16 }\n")
+    s = s.concat("type GW[T] \{ p: Ptr[T] }\n")
+    s = s.concat("@trusted(audit: \"htxpmh-ptr-field\")\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    with ffi.scope() as scope \{\n")
+    s = s.concat("        let w: GW[Pollfd] = GW \{ p: scope.alloc() }\n")
+    s = s.concat("        assert(w.p.is_null() == false)\n")
+    s = s.concat("    }\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "a GENERIC struct's Ptr[T] field still sizes its allocation from Pollfd" {
+    let c = compile_test_helpers.compile_and_emit_c(src_ptr_generic_struct(), "htxpmh_r11c_c")
+    assert_has(c, "sizeof(blink_Pollfd)", "row 11c / allocation sized from the instantiation")
+    assert_lacks(c, "calloc(1, sizeof(void))", "row 11c / one-byte under-allocation")
+    let r = compile_test_helpers.compile_and_run(src_ptr_generic_struct(), "htxpmh_r11c_run")
+    if r.exit_code != 0 { io.println("FAIL: row 11c runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+}
+
+fn src_ptr_generic_enum() -> Str {
+    let mut s = "@ffi.struct(header: \"poll.h\", name: \"pollfd\")\n"
+    s = s.concat("pub type Pollfd \{ fd: I32, events: I16, revents: I16 }\n")
+    s = s.concat("type GE[T] \{ V \{ p: Ptr[T] } Nil }\n")
+    s = s.concat("@trusted(audit: \"htxpmh-ptr-field\")\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    with ffi.scope() as scope \{\n")
+    s = s.concat("        let e: GE[Pollfd] = GE.V \{ p: scope.alloc() }\n")
+    s = s.concat("        assert(true)\n")
+    s = s.concat("    }\n")
+    s = s.concat("}\n")
+    s
+}
+
+// 11d asserts on emitted C only, with NO runtime witness, and that is a limitation of the
+// shape rather than a weaker standard. A struct-style variant on a generic enum emits an
+// UNSUFFIXED `blink_GE` typedef that is never declared, so cc rejects the program — at HEAD
+// too, byte for byte, which is what makes it pre-existing and independent of this retarget
+// (it is the same missing-monomorphization class as the self-recursive `type Node[T]`
+// neighbour, and is filed on its own). Until that is fixed there is no binary to run. The C
+// assertion is still the one that matters here: sizeof is what the regression moved.
+test "a GENERIC enum variant's Ptr[T] field still sizes its allocation from Pollfd" {
+    let c = compile_test_helpers.compile_and_emit_c(src_ptr_generic_enum(), "htxpmh_r11d_c")
+    assert_has(c, "sizeof(blink_Pollfd)", "row 11d / allocation sized from the instantiation")
+    assert_lacks(c, "calloc(1, sizeof(void))", "row 11d / one-byte under-allocation")
+}
+
+// ── ROWS 12a/12b: the two shapes the first pass never exercised ───────────────────────
+//
+// Both came out of a coverage audit of this fixture, and both turned out to be REDS rather
+// than the mere gaps the audit expected.
+//
+// 12a — a generic ENUM whose variant field is a BARE TYPE-PARAM BINDER (`V { o: T }`). Every
+// other enum row here declares its variant field with a concrete annotation, so the binder
+// path through the enum-variant ctor loop was untested. At HEAD both instantiations resolve
+// their ctor kops from whichever annotation happened to be live: 2x blink_kops_str, so the
+// Set[Int] hashes its integers through the STRING vtable. With the retarget it is one
+// blink_kops_i64 and one blink_kops_str, one per instantiation.
+//
+// No runtime witness, for the same reason as row 11d: a struct-style variant on a generic enum
+// emits an UNSUFFIXED `blink_GE` typedef that is never declared (`unknown type name
+// 'blink_GE'`), so cc rejects the program — at HEAD too, so it is pre-existing and independent
+// of this retarget. That is br 9vcnan; add the witness when it lands. Two further read-side
+// limitations were hit while trying: destructuring binds `o` at the BINDER type `T`, not at
+// the instantiation, so `o.insert(...)` is E-UnresolvedMethod; and routing through a generic
+// `fn seen[T](e: GE[T])` only adds the same missing typedef under a mangled name
+// (`blink_GE_Set`). None of the three is this seam.
+//
+// 12b — SLOT 1 of a multi-param generic. Every other generic type in this fixture has exactly
+// one type parameter, so a slot index above 0 was never exercised at all, and a resolver that
+// silently answered slot 0 for every slot would have passed the whole file. It is a red:
+// at HEAD `P[Map[Str, Int], Set[Int]]` emits 2x blink_kops_str and the Set[Int] in slot 1
+// takes slot 0's Map key type. The two slots are deliberately given DIFFERENT kops tables so
+// the assertion cannot pass by both being right for the same reason.
+//
+// 12b's program exits 0 at HEAD as well as here, which is the point of the emitted-C
+// assertion: integers hashed through the string vtable did not crash and did not give a wrong
+// answer for these particular keys. A wrong kops table is silent until it isn't (hnyqe4).
+
+fn src_generic_enum_binder_field() -> Str {
+    let mut s = "type GE[T] \{\n    V \{ o: T }\n    Nil\n}\n"
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let _e: GE[Set[Int]] = GE.V \{ o: Set() }\n")
+    s = s.concat("    let _e2: GE[Map[Str, Int]] = GE.V \{ o: Map() }\n")
+    s = s.concat("    assert(true)\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "a generic enum's BARE-BINDER variant field resolves kops per instantiation" {
+    let c = compile_test_helpers.compile_and_emit_c(src_generic_enum_binder_field(), "htxpmh_r12a_c")
+    assert_has(c, "blink_kops_i64", "row 12a / the Set[Int] instantiation gets the int vtable (kops_str at HEAD)")
+    assert_has(c, "blink_kops_str", "row 12a / the Map[Str,Int] instantiation gets the string vtable")
+}
+
+fn src_multi_param_slot1() -> Str {
+    let mut s = "type P[A, B] \{ first: A, second: B }\n"
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let mut p: P[Map[Str, Int], Set[Int]] = P \{ first: Map(), second: Set() }\n")
+    s = s.concat("    let k1 = \"k\".concat(\"ey\")\n")
+    s = s.concat("    let k2 = \"ke\".concat(\"y\")\n")
+    s = s.concat("    p.first.insert(k1, 9)\n")
+    s = s.concat("    assert(p.first.get(k2).unwrap() == 9)\n")
+    s = s.concat("    p.second.insert(256)\n")
+    s = s.concat("    p.second.insert(512)\n")
+    s = s.concat("    assert(p.second.contains(256))\n")
+    s = s.concat("    assert(p.second.contains(512))\n")
+    s = s.concat("    assert(p.second.contains(7) == false)\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "slot 1 of a multi-param generic struct resolves from its own type argument" {
+    let c = compile_test_helpers.compile_and_emit_c(src_multi_param_slot1(), "htxpmh_r12b_c")
+    assert_has(c, "blink_kops_str", "row 12b / slot 0's Map[Str,Int] keeps the string vtable")
+    assert_has(c, "blink_kops_i64", "row 12b / slot 1's Set[Int] gets its own int vtable (kops_str at HEAD)")
+    let r = compile_test_helpers.compile_and_run(src_multi_param_slot1(), "htxpmh_r12b_run")
+    if r.exit_code != 0 { io.println("FAIL: row 12b runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+}
+
+// ROW 13 — the descent's TYPE-PARAMETER VOCABULARY BOUNDARY.
+//
+// field_ann_at_instance descends the value-context annotation and returns one of its elements.
+// That element is spelled in the ENCLOSING scope's vocabulary, but both channels are read while
+// cg_mono_tparams_sl holds THIS STRUCT's tparams. A binder that survives the descent is therefore
+// resolved by NAME against the wrong list and silently answers with another slot's type.
+//
+// value_ctx_ann_spellable gates the cg_let_target_ann half of the retarget, but cg_expect_arg_ann
+// is retargeted unconditionally on the argument that a binder cannot match a consumer's head-name
+// gate. That argument holds for a BARE binder and fails for `Set[K]` — concrete head, foreign
+// binder inside — which is why the descent RESULT is gated too.
+//
+// Both rows emit correctly at HEAD and were broken by the first draft of the retarget, so they are
+// anti-regression rows for htxpmh's own fix, not for HEAD.
+fn src_vocab_boundary() -> Str {
+    let mut s = "type P[K, V] \{ m: V, spare: K }\n"
+    s = s.concat("fn mk[K](_k: K) -> P[Int, Set[K]] \{\n")
+    s = s.concat("    let p: P[Int, Set[K]] = P \{ m: Set(), spare: 0 }\n")
+    s = s.concat("    p\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let mut bad: Set[Str] = mk(\"seed\").m\n")
+    s = s.concat("    bad.insert(\"prefixedAAAA\")\n")
+    s = s.concat("    assert(bad.len() == 1)\n")
+    s = s.concat("    assert(bad.contains(\"prefixedAAAA\"))\n")
+    s = s.concat("    assert(bad.contains(\"prefixedBBBB\") == false)\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "a descended element carrying a foreign binder does not cross the mono vocabulary" {
+    let c = compile_test_helpers.compile_and_emit_c(src_vocab_boundary(), "htxpmh_r13a_c")
+    assert_has(c, "blink_kops_str", "row 13a / Set[Str] keeps the string vtable")
+    assert_lacks(c, "blink_kops_i64", "row 13a / resolving K against P's K gave Int and the int64 by-value vtable")
+    // The miscompile is silent at cc: keys are compared as the first 8 bytes of char data, so
+    // contains() matched a different 12-char string sharing a prefix. Only a runtime row sees it.
+    let r = compile_test_helpers.compile_and_run(src_vocab_boundary(), "htxpmh_r13a_run")
+    if r.exit_code != 0 { io.println("FAIL: row 13a runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+}
+
+// ROW 13b — the same seam's LOUD twin: which vtable is emitted must not depend on the SPELLING of
+// a type parameter. These two programs differ only in the fn's binder letter.
+fn src_binder_rename(letter: Str) -> Str {
+    let mut s = "type Box[T] \{ value: T }\n"
+    s = s.concat("fn wrap[{letter}](_x: {letter}) -> Box[Set[{letter}]] \{\n")
+    s = s.concat("    let b: Box[Set[{letter}]] = Box \{ value: Set() }\n")
+    s = s.concat("    b\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let mut s: Set[Str] = wrap(\"a\").value\n")
+    s = s.concat("    s.insert(\"q\")\n")
+    s = s.concat("    assert(s.len() == 1)\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "the emitted kops vtable does not depend on a type parameter's spelling" {
+    let ct = compile_test_helpers.compile_and_emit_c(src_binder_rename("T"), "htxpmh_r13b_T")
+    let cu = compile_test_helpers.compile_and_emit_c(src_binder_rename("U"), "htxpmh_r13b_U")
+    // At the first draft the T spelling collided with Box's own binder and emitted an undeclared
+    // BLINK_COMPILER_BUG_kops_unsupported_K_ct20_Set — a cc-time build break, on a legal program,
+    // keyed on a cosmetic identifier choice. The U spelling built and ran.
+    assert_lacks(ct, "BLINK_COMPILER_BUG", "row 13b / T spelling must not emit a compiler-bug sentinel")
+    assert_lacks(cu, "BLINK_COMPILER_BUG", "row 13b / U spelling must not emit a compiler-bug sentinel")
+    assert_has(ct, "blink_kops_str", "row 13b / T spelling gets Set[Str]'s string vtable")
+    assert_has(cu, "blink_kops_str", "row 13b / U spelling gets the same vtable")
+    let r = compile_test_helpers.compile_and_run(src_binder_rename("T"), "htxpmh_r13b_run")
+    if r.exit_code != 0 { io.println("FAIL: row 13b runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+}

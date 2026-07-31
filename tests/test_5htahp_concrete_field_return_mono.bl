@@ -45,11 +45,23 @@
 // `let y = Box { v: "s" }` inside `fn f() -> Box[Int]` as blink_Box_Int — its only net is
 // `tc_tid_struct(inst) != sname`, and both are "Box". CSV equality made that sibling
 // decline, made ns7qdm's nested inner literal decline ("Int" != "Box_Int"), and made a
-// declared/body mismatch decline. THAT HAZARD IS STILL REAL; what guards it now is the
-// unconditional nesting guard in tid_native_struct_mono_slots, which compares the
-// literal's OWN memoized tid against the CSV it is about to be named with rather than
-// trusting a whole-body proxy, plus skdxkv's upstream E0300 for the declared/body
-// mismatch.
+// declared/body mismatch decline. THAT HAZARD IS STILL REAL, and since br htxpmh three
+// separate things guard it, in this order:
+//
+//   1. The RETARGET. emit_struct_lit now saves and restores BOTH value-context channels
+//      per field and points them at the FIELD's annotation, so the sibling-adoption path
+//      the guard was catching no longer forms. This is the real fix; the other two are
+//      the net under it.
+//   2. skdxkv's upstream E0300 for the declared/body mismatch, which rejects that shape
+//      before codegen sees it at all.
+//   3. The nesting guard in tid_native_struct_mono_slots, comparing the literal's OWN
+//      memoized tid against the CSV it is about to be named with. It is now unreachable
+//      by construction and kept only as a TRIPWIRE — a row from it means a new nested
+//      emission site was added without the retarget. br jefm9w deletes it.
+//
+// Note what does NOT guard it: the return annotation itself is still in scope for the
+// whole body, so the "whole-body proxy" objection above is untouched. The retarget
+// narrows what a value context can see; it does not narrow the return annotation.
 //
 // WHY THE kops ASSERTION IS THE LOAD-BEARING ONE (same reasoning as y1n3ck). A fix
 // that gets the mono NAME right while leaving the Map field's element type unresolved
@@ -525,21 +537,26 @@ test "a closure's own return annotation reaches the mono target" {
     assert(r.exit_code == 0)
 }
 
-// ── a type alias as a type argument: pinned as UNREACHABLE, not as admitted ──
+// ── a type alias as a type argument: the probe now has its answer ──
 // This row was written as a probe — does an alias reach the mono name as "Int", or
-// leak the alias spelling into a second, divergent C type? The answer is neither: a
-// `type MyInt = Int` key never reaches codegen at all. validate_map_key reads the
-// annotation NAME, finds "MyInt" in named_type_map, and rejects it as a user type
-// with no @derive(Hash) — a separate defect (br 0kvdef), a separate mechanism, so
-// 5htahp does not own it and must not be blocked on it.
+// leak the alias spelling into a second, divergent C type? It could not answer,
+// because a `type MyInt = Int` key never reached codegen: validate_map_key read the
+// annotation NAME, found "MyInt" in named_type_map, and rejected it as a user type
+// with no @derive(Hash). That was br 0kvdef, and it has since landed (f8t5wb) —
+// validate_map_key resolves the alias to Int and accepts it.
 //
-// Pinned rather than dropped, so the row itself is the tripwire: when 0kvdef lands
-// this test goes red, and the fix is to restore the probe's real assertions — the
-// alias must resolve to "Int" on BOTH sides of the CSV comparison, since a
-// one-sided alias spelling would decline an admissible shape or, worse, admit one
-// whose two lenses disagree. Those assertions are kept below, commented, so the
-// answer this row is really asking for is not lost.
-test "a type-aliased Map key is rejected before it can reach the mono name" {
+// So the probe fired, and the answer is the SECOND horn: the alias leaks. The mono
+// name is `blink_GKV_MyInt_Str`, a C type structurally identical to and
+// incompatible with `blink_GKV_Int_Str`; mixing the two spellings in one program is
+// a gcc failure with no Blink diagnostic. That is br awynaj, and it is NOT 5htahp's
+// mechanism and NOT caused by 0kvdef landing — measured byte-identical at HEAD on
+// the Map-free shape `Box[MyInt]` vs `Box[Int]`, which was always reachable. 0kvdef
+// only stopped hiding one instance of it.
+//
+// The row therefore PINS the divergence rather than asserting the fix, so it goes
+// red exactly once — when awynaj lands. The assertions to restore then are kept
+// below, commented, since they are the answer this row is really asking for.
+test "a type-aliased Map key leaks the alias into the mono name" {
     let mut s = "type MyInt = Int\n"
     s = s.concat(gkv_decl())
     s = s.concat("fn mkmap() -> Map[MyInt, Str] \{\n")
@@ -552,13 +569,19 @@ test "a type-aliased Map key is rejected before it can reach the mono name" {
     s = s.concat("    g.m.insert(256, \"lo\")\n")
     s = s.concat("    assert_eq(g.m.len(), 1)\n")
     s = s.concat("}\n")
-    compile_test_helpers.expect_compile_error(s, "5htahp_alias", "E1400")
-    // When 0kvdef lands, replace the line above with:
-    //   let c = compile_test_helpers.compile_and_emit_c(s, "5htahp_alias")
+    compile_test_helpers.expect_no_error(s, "5htahp_alias_e1400", "E1400")
+    let c = compile_test_helpers.compile_and_emit_c(s, "5htahp_alias")
+    // 5htahp's OWN claims, and they hold: the alias is a refinement of Int, so the key
+    // must hash through the integer vtable, and the carrier must not erase.
+    assert_has(c, "blink_kops_i64", "alias key hashes as its base type")
+    assert_lacks(c, "blink_kops_str", "alias key must not fall to the string vtable")
+    assert_no_erasure(c, "type-aliased Map key")
+    // br awynaj, PINNED as the current wrong answer, not asserted as right. Flip these
+    // two lines when it lands:
     //   assert_lacks(c, "blink_GKV_MyInt_Str", "alias must not leak into the mono name")
-    //   assert_lacks(c, "_Void", "alias / string-producer erasure")
-    //   assert_lacks(c, "blink_map_void", "alias / erased Map carrier field")
     //   assert_has(c, "blink_GKV_Int_Str", "alias resolves to the underlying Int")
+    assert_has(c, "blink_GKV_MyInt_Str", "awynaj / the alias spelling still leaks into the mono name")
+    assert_lacks(c, "blink_GKV_Int_Str", "awynaj / and no Int-spelled twin is minted alongside it")
 }
 
 // ── the farq9f boundary, now folded in ──────────────────────────────────────

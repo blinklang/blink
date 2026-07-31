@@ -1,0 +1,497 @@
+// br f8t5wb: a struct/enum type-arg bypasses Map-key / Set-elem hashability validation.
+//
+// `let m: Map[Float, Int] = Map()` is rejected outright — error[MapKeyNotHashable] E1400,
+// "Float/Double values cannot serve as Map keys (NaN-inequality and bit-equality hazards)".
+// The SAME illegal key reached through a struct type-arg was accepted:
+//
+//     type Box[T] { value: T }
+//     let x: Box[Map[Float, Int]] = Box { value: Map() }   // no diagnostic at all
+//
+// CAUSE. resolve_type_ann's STRUCT and ENUM branches (src/typecheck.bl) hand the annotation
+// straight to tc_produce_struct_instance_tid / tc_produce_enum_instance_tid and return the
+// instance tid. Those producers DO re-resolve the args, but they raise
+// tc_suppress_ann_validation over the pass — deliberately, because they are off-path and can
+// visit one annotation node more than once, so an unsuppressed validate_map_key there would
+// emit non-deduped duplicate diagnostics. Net effect: nothing on the LIVE path ever visited a
+// struct type-arg, so validate_map_key / validate_set_elem never ran on one.
+//
+// WHY IT IS MORE THAN A MISSING DIAGNOSTIC. Codegen has no kops vtable for a Float key. Any
+// path that actually pins the slot reaches kops_table_name's fall-through
+// (src/codegen_types.bl) and emits `BLINK_COMPILER_BUG_kops_unsupported_K_ct1_Float` — an
+// invalid C identifier, i.e. a gcc-level failure with NO Blink diagnostic, wearing a spelling
+// that accuses the compiler for what is a user program naming an illegal key type. Before the
+// slot got pinned the erased default emitted `blink_kops_str` instead: a Float key hashed
+// through the STRING vtable, the br hnyqe4 silent-hash shape. Neither is an honest answer, and
+// which one you got depended only on whether some other tier happened to bind the slot.
+//
+// THE FIX. Validate on the LIVE struct/enum path, where each annotation is visited exactly
+// once and the non-dedup concern that motivated the suppression does not apply — rather than
+// un-suppressing the off-path re-resolution. Rows 10/11 are the guard on that reasoning: they
+// count diagnostics, because a fix that emits the right error three times is not a fix.
+//
+// ── LEDGER: every row MEASURED before the fix ──────────────────────────────────────────
+//
+//   ROW 1   Box[Map[Float,Int]]           RED    0 diagnostics; cc fails, undeclared
+//                                                BLINK_COMPILER_BUG_kops_unsupported_K_ct1_Float
+//   ROW 2   Box[Set[Float]]               RED    same
+//   ROW 3   Box[Box[Map[Float,Int]]]      RED    same — two struct levels deep
+//   ROW 4   Pair[Map[Float,Int], Int]     RED    same — arg 0 of 2, so the walk is positional
+//   ROW 5   Box[Map[Str,Int]]             GREEN  control: a hashable key stays accepted
+//   ROW 6   Box[Set[Int]]                 GREEN  control: ditto for Set
+//   ROW 7   decl-only Wrap[K] holding
+//           Box[Map[K,Int]]               GREEN  control: a TYPEVAR key must NOT be rejected —
+//                                                validate_map_key defers unknown names to later
+//                                                phases on purpose. The type-alias sibling of that
+//                                                over-eager rejection was br 0kvdef; rows 12-17
+//                                                below close it.
+//   ROW 8   Tree[Map[Float,Int]] (ENUM)   RED    the enum branch has the identical hole
+//   ROW 9   Option[Map[Float,Int]]        GREEN  already correct — the builtin-carrier branches
+//                                                resolve their inner through resolve_type_ann, so
+//                                                the Map branch validates. Pins that ONLY the
+//                                                struct/enum branch was the hole, which is what
+//                                                makes the fix's scope defensible.
+//   ROW 10  two lets, same illegal ann    RED    must become EXACTLY 2 — one per site, not per visit
+//   ROW 11  one let, illegal ann          RED    must become EXACTLY 1 — the dedup guard proper
+//
+// Rows 1-4, 8, 10, 11 are the reds. Rows 5-7 and 9 are no-regression controls.
+//
+// SCOPE NOTE. Rows 1-16 assert on DIAGNOSTICS only, never on emitted C. Row 17 is the single
+// deliberate exception, for the reason recorded in its ledger entry: it is the only row whose
+// subject is a program the fix newly ACCEPTS, and an acceptance with no codegen witness would
+// just trade a false rejection for an unmeasured kops table. The kops vtable
+// actually selected for a struct-field container is br htxpmh's subject (its value-context
+// retarget is what pins the slot in the first place, and it carries the runtime witness rows).
+// Keeping the two apart is deliberate: a fixture that asserted both would go red when either
+// mechanism moved.
+
+import compile_test_helpers
+import std.io
+
+fn assert_has(out: Str, needle: Str, label: Str) {
+    if !out.contains(needle) { io.println("FAIL: {label} — missing '{needle}'") }
+    assert(out.contains(needle))
+}
+
+// A NOTE ON THE SENTINEL ASSERTIONS BELOW. compile_and_capture returns the compiler's
+// DIAGNOSTIC output only — the emitted C goes to /dev/null (see its doc comment). So
+// `assert_lacks(out, "BLINK_COMPILER_BUG_kops_unsupported")` is not emitted-C coverage and
+// must not be read as any: it checks only that the sentinel never leaks into a DIAGNOSTIC
+// message, which is a real but much narrower guarantee. It is kept because that leak is
+// cheap to check and would be confusing to debug, not because it proves anything about
+// codegen.
+//
+// There is no stronger assertion available for these rows, and that is the point: the
+// programs are now rejected before codegen, so there is no emitted C to inspect. Making the
+// kops-sentinel state UNREACHABLE is what replaced the coverage, and the rejection
+// assertions on the same rows are what prove it.
+fn assert_lacks(out: Str, needle: Str, label: Str) {
+    if out.contains(needle) { io.println("FAIL: {label} — forbidden '{needle}' present") }
+    assert(!out.contains(needle))
+}
+
+// Counts non-overlapping occurrences of `needle`. Rows 10/11 need the COUNT, not just
+// presence: the suppression this fix removes was installed precisely because the off-path
+// producer can validate one annotation node repeatedly, so "the error fires" and "the error
+// fires once" are different claims and only the second one means the fix is right.
+fn count_of(out: Str, needle: Str) -> Int {
+    let mut n = 0
+    let mut rest = out
+    let mut idx = rest.index_of(needle)
+    while idx >= 0 {
+        n = n + 1
+        rest = rest.substr(idx + needle.len(), rest.len())
+        idx = rest.index_of(needle)
+    }
+    n
+}
+
+fn assert_count(out: Str, needle: Str, want: Int, label: Str) {
+    let got = count_of(out, needle)
+    if got != want { io.println("FAIL: {label} — '{needle}' x{got}, wanted x{want}") }
+    assert(got == want)
+}
+
+fn box_decl() -> Str {
+    "type Box[T] \{ value: T }\n"
+}
+
+// ── ROW 1: Map[Float,Int] through a struct type-arg ────────────────────────────────────
+
+fn src_box_map_float() -> Str {
+    let mut s = box_decl()
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let x: Box[Map[Float, Int]] = Box \{ value: Map() }\n")
+    s = s.concat("    assert(x.value.len() == 0)\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "Box[Map[Float,Int]] is rejected like a bare Map[Float,Int]" {
+    let out = compile_test_helpers.compile_and_capture(src_box_map_float(), "f8t5wb_r1")
+    assert_has(out, "MapKeyNotHashable", "row 1 / the hashability diagnostic fires")
+    assert_has(out, "Float", "row 1 / the offending key type is named")
+    // The whole point: a Blink diagnostic INSTEAD OF the C-level sentinel, not alongside it.
+    assert_lacks(out, "BLINK_COMPILER_BUG_kops_unsupported", "row 1 / kops sentinel absent from the DIAGNOSTIC (not an emitted-C claim)")
+}
+
+// ── ROW 2: Set[Float] through a struct type-arg ────────────────────────────────────────
+
+fn src_box_set_float() -> Str {
+    let mut s = box_decl()
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let y: Box[Set[Float]] = Box \{ value: Set() }\n")
+    s = s.concat("    assert(y.value.len() == 0)\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "Box[Set[Float]] is rejected like a bare Set[Float]" {
+    let out = compile_test_helpers.compile_and_capture(src_box_set_float(), "f8t5wb_r2")
+    assert_has(out, "MapKeyNotHashable", "row 2 / the hashability diagnostic fires")
+    assert_has(out, "Set element type", "row 2 / the Set wording, not the Map wording")
+    assert_lacks(out, "BLINK_COMPILER_BUG_kops_unsupported", "row 2 / kops sentinel absent from the DIAGNOSTIC (not an emitted-C claim)")
+}
+
+// ── ROW 3: two struct levels deep ─────────────────────────────────────────────────────
+
+fn src_nested_box_map_float() -> Str {
+    let mut s = box_decl()
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let z: Box[Box[Map[Float, Int]]] = Box \{ value: Box \{ value: Map() } }\n")
+    s = s.concat("    assert(z.value.value.len() == 0)\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "Box[Box[Map[Float,Int]]] is rejected two struct levels down" {
+    let out = compile_test_helpers.compile_and_capture(src_nested_box_map_float(), "f8t5wb_r3")
+    assert_has(out, "MapKeyNotHashable", "row 3 / the walk recurses through struct args")
+    assert_lacks(out, "BLINK_COMPILER_BUG_kops_unsupported", "row 3 / kops sentinel absent from the DIAGNOSTIC (not an emitted-C claim)")
+}
+
+// ── ROW 4: arg 0 of a two-param struct ────────────────────────────────────────────────
+
+fn src_pair_map_float() -> Str {
+    let mut s = "type Pair[A, B] \{ first: A, second: B }\n"
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let p: Pair[Map[Float, Int], Int] = Pair \{ first: Map(), second: 1 }\n")
+    s = s.concat("    assert(p.second == 1)\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "Pair[Map[Float,Int], Int] is rejected at arg position 0" {
+    let out = compile_test_helpers.compile_and_capture(src_pair_map_float(), "f8t5wb_r4")
+    assert_has(out, "MapKeyNotHashable", "row 4 / every arg position is walked, not just the last")
+    assert_lacks(out, "BLINK_COMPILER_BUG_kops_unsupported", "row 4 / kops sentinel absent from the DIAGNOSTIC (not an emitted-C claim)")
+}
+
+// ── ROWS 5-6: hashable keys stay accepted ─────────────────────────────────────────────
+
+test "Box[Map[Str,Int]] with a hashable key is still accepted" {
+    let x: Box5[Map[Str, Int]] = Box5 { value: Map() }
+    assert_eq(x.value.len(), 0)
+}
+
+test "Box[Set[Int]] with a hashable element is still accepted" {
+    let x: Box5[Set[Int]] = Box5 { value: Set() }
+    assert_eq(x.value.len(), 0)
+}
+
+type Box5[T] {
+    value: T
+}
+
+// ── ROW 7: a TYPEVAR key must not be falsely rejected ─────────────────────────────────
+//
+// Declared, never instantiated: the field annotation is still resolved when the type decl is
+// registered, which is exactly the code path the fix touches. validate_map_key defers unknown
+// and type-param names to later phases on purpose — br 0kvdef is the sibling bug where being
+// over-eager here (rejecting a type ALIAS to a hashable scalar) is itself the defect. This row
+// is the fence on the fix's blast radius, so it must stay silent, not merely compile.
+
+fn src_typevar_map_key() -> Str {
+    let mut s = box_decl()
+    s = s.concat("type Wrap[K] \{ b: Box[Map[K, Int]], n: Int }\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    assert(true)\n")
+    s = s.concat("}\n")
+    s
+}
+
+// The "nothing else fires either" half is stated as EMPTY OUTPUT, not as a needle. Two reasons.
+// compile_and_capture runs the compiler with --format json, so the human-readable `error[`
+// prefix this row used to look for does not exist in the output under any circumstance — it was
+// vacuous. And this program in fact emits NOTHING AT ALL: not the diagnostic, not a warning, not
+// a note. Asserting emptiness is both the strongest available statement of "must stay silent"
+// and the only one that cannot rot into another unfalsifiable needle. If a future diagnostic
+// legitimately belongs here, tighten to `"\"severity\":\"error\""` rather than deleting the check.
+test "a type-param Map key inside a struct type-arg is not falsely rejected" {
+    let out = compile_test_helpers.compile_and_capture(src_typevar_map_key(), "f8t5wb_r7")
+    assert_lacks(out, "MapKeyNotHashable", "row 7 / a typevar key defers to later phases")
+    if out != "" { io.println("FAIL: row 7 / expected silence, got: {out}") }
+    assert(out == "")
+}
+
+// ── ROW 8: the generic-ENUM branch has the same hole ──────────────────────────────────
+
+fn src_enum_map_float() -> Str {
+    let mut s = "type Tree[T] \{ Leaf, Node \{ v: T } }\n"
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let t: Tree[Map[Float, Int]] = Tree.Leaf\n")
+    s = s.concat("    assert(true)\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "Tree[Map[Float,Int]] is rejected — the enum branch is fixed alongside the struct one" {
+    let out = compile_test_helpers.compile_and_capture(src_enum_map_float(), "f8t5wb_r8")
+    assert_has(out, "MapKeyNotHashable", "row 8 / generic-enum type-args are walked too")
+    assert_lacks(out, "BLINK_COMPILER_BUG_kops_unsupported", "row 8 / kops sentinel absent from the DIAGNOSTIC (not an emitted-C claim)")
+}
+
+// ── ROW 9: the builtin-carrier branches were ALREADY correct ──────────────────────────
+
+fn src_option_map_float() -> Str {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let o: Option[Map[Float, Int]] = None\n")
+    s = s.concat("    assert(o.is_none())\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "Option[Map[Float,Int]] was already rejected — only struct/enum args were the hole" {
+    let out = compile_test_helpers.compile_and_capture(src_option_map_float(), "f8t5wb_r9")
+    assert_has(out, "MapKeyNotHashable", "row 9 / Option's inner resolves through resolve_type_ann")
+    assert_count(out, "MapKeyNotHashable", 1, "row 9 / and reports it exactly once")
+}
+
+// ── ROWS 10-11: the diagnostic fires ONCE PER SITE ────────────────────────────────────
+//
+// These are the guard on the fix's shape. The suppression being worked around exists because
+// the off-path instance-tid producer can visit one annotation node repeatedly; a fix that
+// un-suppressed it there would report the same illegal key several times. Validating on the
+// live path, where each annotation is visited once, is what makes these counts exact.
+
+fn src_one_site() -> Str {
+    let mut s = box_decl()
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let a: Box[Map[Float, Int]] = Box \{ value: Map() }\n")
+    s = s.concat("    assert(a.value.len() == 0)\n")
+    s = s.concat("}\n")
+    s
+}
+
+fn src_two_sites() -> Str {
+    let mut s = box_decl()
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let a: Box[Map[Float, Int]] = Box \{ value: Map() }\n")
+    s = s.concat("    let b: Box[Map[Float, Int]] = Box \{ value: Map() }\n")
+    s = s.concat("    assert(a.value.len() == b.value.len())\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "one illegal struct type-arg reports exactly one diagnostic" {
+    let out = compile_test_helpers.compile_and_capture(src_one_site(), "f8t5wb_r11")
+    assert_count(out, "MapKeyNotHashable", 1, "row 11 / once, not once per off-path visit")
+}
+
+test "two illegal struct type-args report exactly two diagnostics" {
+    let out = compile_test_helpers.compile_and_capture(src_two_sites(), "f8t5wb_r10")
+    assert_count(out, "MapKeyNotHashable", 2, "row 10 / one per site")
+}
+
+// ── ROWS 12-17: type aliases are decided by their BASE type ───────────────────────────
+//
+// Rows 1-11 walk the struct/enum type-arg into validate_map_key. That walk immediately made
+// a second question load-bearing: what does validate_map_key DO with a `type Port = Int`?
+// Measured at HEAD, the answer was wrong in both directions at once.
+//
+// `type X = Y` is a refinement, not a nominal newtype. sections/03b_contracts.md is explicit —
+// "@where constrains the set of values that inhabit the type" — and sections/03_types.md:757
+// draws the contrast from the other side, calling sized ints "first-class nominal types -- not
+// refinements of Int, not aliases, not newtypes". Hashability is representation plus equality,
+// so an alias is hashable exactly when its base is. @derive(Hash, Eq) is for structs and enums,
+// which have no intrinsic hash; asking it of a refinement over Int is a category error, and
+// HEAD's help text ("add @derive(Hash, Eq) to the 'Port' type definition") was advice written
+// for a struct. Worse, that annotation IS accepted on an alias and DOES silence the error, so
+// the compiler was telling users to write something meaningless to unblock legal code.
+//
+// ── LEDGER: MEASURED at HEAD (4afa18a), before this fix ────────────────────────────────
+//
+//   ROW 12  Map[Port,Int], Port = Int         RED    HEAD REJECTS it — E1400 "does not implement
+//                                                    Hash". This is br 0kvdef, closed here as a
+//                                                    by-product: resolving the alias is the
+//                                                    minimum correct implementation of the gate,
+//                                                    not scope creep.
+//   ROW 13  Box[Map[Temp,Int]], Temp = Float  RED    HEAD ACCEPTS it — a Float-keyed Map, which
+//                                                    the spec forbids outright. The opposite
+//                                                    error from row 12, from the same missing
+//                                                    resolution. This row is why "just skip
+//                                                    aliases" is not an option: skipping accepts
+//                                                    row 13 and only resolving rejects it while
+//                                                    still accepting row 12.
+//   ROW 14  Set[Temp] / Box[Set[Port]]        RED    the Set twin of 12 and 13
+//   ROW 15  MyKey = Point (no @derive)        RED    HEAD's help said "add @derive to 'MyKey'",
+//                                                    pointing the fix at the alias. The message
+//                                                    must name what the user WROTE (MyKey), the
+//                                                    help the type that has to carry the derive
+//                                                    (Point) — @derive on the alias is the
+//                                                    category error described above.
+//   ROW 16  Pair = (Float, Float)             GREEN  control: resolution is PARTIAL on purpose.
+//                                                    A name cannot carry type arguments, so a
+//                                                    tuple alias has no element nodes to recurse
+//                                                    into and any verdict read off the resolved
+//                                                    name would be a guess. alias_name_decidable
+//                                                    refuses the hop, HEAD's conservative
+//                                                    rejection stands, and no Float hole opens.
+//   ROW 17  runtime witness for row 12        RED    codegen coverage for an accepted alias key
+//                                                    did not exist at HEAD, because HEAD rejected
+//                                                    every one of them. Accepting without this
+//                                                    row would be trading a false rejection for
+//                                                    an unmeasured kops table — the hnyqe4 shape.
+//                                                    Amends this fixture's diagnostics-only scope
+//                                                    note deliberately: it is the ONE row here
+//                                                    that must reach codegen, because acceptance
+//                                                    is the new behavior.
+
+fn src_alias_int_key() -> Str {
+    let mut s = "type Port = Int\n"
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let mut m: Map[Port, Int] = Map()\n")
+    s = s.concat("    m.insert(80, 1)\n")
+    s = s.concat("    assert(m.len() == 1)\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "an Int-based alias is a legal Map key (br 0kvdef)" {
+    let out = compile_test_helpers.compile_and_capture(src_alias_int_key(), "f8t5wb_r12")
+    assert_lacks(out, "MapKeyNotHashable", "row 12 / Port resolves to Int and Int is hashable")
+}
+
+fn src_alias_int_key_boxed() -> Str {
+    let mut s = "type Port = Int\n"
+    s = s.concat(box_decl())
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let x: Box[Map[Port, Int]] = Box \{ value: Map() }\n")
+    s = s.concat("    assert(x.value.len() == 0)\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "an Int-based alias stays legal through a struct type-arg" {
+    let out = compile_test_helpers.compile_and_capture(src_alias_int_key_boxed(), "f8t5wb_r12b")
+    assert_lacks(out, "MapKeyNotHashable", "row 12b / the new walk must not reject what the bare form accepts")
+}
+
+fn src_alias_float_key() -> Str {
+    let mut s = "type Temp = Float\n"
+    s = s.concat(box_decl())
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let x: Box[Map[Temp, Int]] = Box \{ value: Map() }\n")
+    s = s.concat("    assert(x.value.len() == 0)\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "a Float-based alias is rejected for the hazard its base actually has" {
+    let out = compile_test_helpers.compile_and_capture(src_alias_float_key(), "f8t5wb_r13")
+    assert_has(out, "MapKeyNotHashable", "row 13 / Temp resolves to Float")
+    assert_has(out, "'Temp'", "row 13 / the message names what the user wrote")
+    assert_has(out, "NaN-inequality", "row 13 / and gives the Float reason, not the derive advice")
+    assert_count(out, "MapKeyNotHashable", 1, "row 13 / exactly once")
+}
+
+fn src_alias_set_float() -> Str {
+    let mut s = "type Temp = Float\n"
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let s: Set[Temp] = Set()\n")
+    s = s.concat("    assert(s.len() == 0)\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "the Set twin rejects a Float-based alias element" {
+    let out = compile_test_helpers.compile_and_capture(src_alias_set_float(), "f8t5wb_r14")
+    assert_has(out, "MapKeyNotHashable", "row 14 / validate_set_elem resolves aliases too")
+    assert_has(out, "Set element type 'Temp'", "row 14 / Set-worded and names the alias")
+}
+
+fn src_alias_set_int() -> Str {
+    let mut s = "type Port = Int\n"
+    s = s.concat(box_decl())
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let x: Box[Set[Port]] = Box \{ value: Set() }\n")
+    s = s.concat("    assert(x.value.len() == 0)\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "the Set twin accepts an Int-based alias element" {
+    let out = compile_test_helpers.compile_and_capture(src_alias_set_int(), "f8t5wb_r14b")
+    assert_lacks(out, "MapKeyNotHashable", "row 14b / Port resolves to Int")
+}
+
+fn src_alias_to_underived_struct() -> Str {
+    let mut s = "type Point \{ x: Int, y: Int }\n"
+    s = s.concat("type MyKey = Point\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let m: Map[MyKey, Int] = Map()\n")
+    s = s.concat("    assert(m.len() == 0)\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "an alias to an underived struct names the alias but blames the struct" {
+    let out = compile_test_helpers.compile_and_capture(src_alias_to_underived_struct(), "f8t5wb_r15")
+    assert_has(out, "Map key type 'MyKey'", "row 15 / the message names what the user wrote")
+    assert_has(out, "to the 'Point' type definition", "row 15 / the help names the type that must carry the derive")
+}
+
+fn src_tuple_alias_key() -> Str {
+    let mut s = "type Pair = (Float, Float)\n"
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let m: Map[Pair, Int] = Map()\n")
+    s = s.concat("    assert(m.len() == 0)\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "a tuple alias is not resolved, so no Float hole opens behind it" {
+    let out = compile_test_helpers.compile_and_capture(src_tuple_alias_key(), "f8t5wb_r16")
+    assert_has(out, "MapKeyNotHashable", "row 16 / partial resolution keeps HEAD's conservative rejection")
+}
+
+fn src_alias_key_runtime() -> Str {
+    let mut s = "import std.io\n"
+    s = s.concat("type Port = Int\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let mut m: Map[Port, Int] = Map()\n")
+    s = s.concat("    m.insert(80, 1)\n")
+    s = s.concat("    m.insert(443, 2)\n")
+    s = s.concat("    assert(m.len() == 2)\n")
+    s = s.concat("    assert((m.get(443) ?? -1) == 2)\n")
+    s = s.concat("    let mut s: Set[Port] = Set()\n")
+    s = s.concat("    s.insert(80)\n")
+    s = s.concat("    s.insert(80)\n")
+    s = s.concat("    assert(s.len() == 1)\n")
+    s = s.concat("    assert(s.contains(80))\n")
+    s = s.concat("    assert(s.contains(81) == false)\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "an accepted alias key hashes through its base type's vtable" {
+    // The acceptance in row 12 is only honest if codegen has a vtable for the base. A wrong
+    // one here is SILENT — ctor_kops_fail_closed only fires for fn tail values — so this row
+    // pins the table by name AND round-trips it at runtime.
+    let c = compile_test_helpers.compile_and_emit_c(src_alias_key_runtime(), "f8t5wb_r17_c")
+    assert_has(c, "blink_kops_i64", "row 17 / an Int-based alias key uses the integer vtable")
+    assert_lacks(c, "blink_kops_str", "row 17 / not the string vtable (the hnyqe4 silent-hash shape)")
+    assert_lacks(c, "BLINK_COMPILER_BUG_kops_unsupported", "row 17 / and not the unsupported-key sentinel")
+    let r = compile_test_helpers.compile_and_run(src_alias_key_runtime(), "f8t5wb_r17_run")
+    if r.exit_code != 0 { io.println("FAIL: row 17 runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+}
