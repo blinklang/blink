@@ -5754,7 +5754,7 @@ type TidNativeMono {
     inst_tid: Int
 }
 
-fn tid_native_struct_mono_slots(inst_tid: Int, sname: Str, node: Int, tracing: Int) -> Str {
+fn tid_native_struct_mono_slots(inst_tid: Int, sname: Str, tracing: Int) -> Str {
     let count = tc_tid_struct_arg_count(inst_tid)
     if count < 1 {
         if tracing != 0 { dbg_trace("retmono", "sname={sname} inst_tid={inst_tid} decline=bare_base count={count}") }
@@ -5805,55 +5805,38 @@ fn tid_native_struct_mono_slots(inst_tid: Int, sname: Str, node: Int, tracing: I
         i = i + 1
     }
     let csv = tid_instance_mono_args_csv(inst_tid, count)
-    // NESTING GUARD (br 6cvvh8) — unconditional, and as of br htxpmh a TRIPWIRE that must
-    // never fire. It exists because cg_let_target_ann / cg_expect_arg_ann are matched by
-    // BARE struct name, so when the field loop left them pointing at the ENCLOSING
-    // annotation while emitting a nested value, for
+    // NESTING GUARD (br 6cvvh8) retired at br jefm9w. It existed because
+    // cg_let_target_ann / cg_expect_arg_ann are matched by BARE struct name, so when the
+    // field loop left them pointing at the ENCLOSING annotation while emitting a nested
+    // value, for
     //     let b: Box[Box[Int]] = Box { v: Box { v: 7 } }
     // the INNER literal also saw the outer annotation's tid and would name itself
     // blink_Box_Box_Int, lowering its own `v` field to `blink_Box_Int` — self-referential
     // and undeclared. The tuple-wrapped shape of the same mechanism is br 3aa3je.
     //
-    // htxpmh removed the cause: emit_struct_lit's field loop, its defaults loop and the
-    // enum-variant ctor loop now retarget both channels to the field's own annotation
-    // (descending through the instantiation when the field is declared as a bare binder), so
-    // a nested literal is handed the annotation describing ITSELF and can no longer adopt its
-    // parent's. Measured over the pinned 745-file corpus (730 reaching codegen), this decline
-    // went from 4 rows in 3 fixtures to 0.
+    // br htxpmh removed that cause AT THE FIELD-VALUE SEAM: emit_struct_lit's field loop, its
+    // defaults loop and the enum-variant ctor loop retarget both channels to the field's own
+    // annotation (descending through the instantiation when the field is declared as a bare
+    // binder), so a nested literal is handed the annotation describing ITSELF and can no
+    // longer adopt its parent's. Measured over the pinned 745-file corpus (730 reaching
+    // codegen), decline=nesting_level_mismatch went from 4 rows in 3 fixtures to 0 — but that
+    // 0 did not cover every producer: a struct literal in FIELD-ACCESS RECEIVER position
+    // (`Box { v: Box { v: Set() } } .value` annotated Box[Set[Int]]) is typed as the RESULT of
+    // the access rather than as itself, which the field-loop retarget does not touch, and this
+    // guard was the only thing catching the resulting one-level-too-high adoption. br qah9tx
+    // fixed that seam directly (591d4a1) — the receiver is retargeted to its own annotation the
+    // same way the field loop already is — which closed the guard's last live producer.
     //
-    // So a `decline=nesting_level_mismatch` row now means a NEW nested-emission site was
-    // added without the retarget — fix the site, do not widen the guard, and above all do not
-    // read the decline as a reason to prefer the string tier (CLAUDE.md). It stays a
-    // diagnostic decline rather than an I0001 on purpose: br jefm9w owns deleting it along
-    // with its three sibling sites, and an ICE here would make that deletion a behavior
-    // change instead of a cleanup. own_tid and csv are computed unconditionally either way,
-    // so keeping it costs nothing.
-    //
-    // It used to run only `if has_struct_inst != 0`, which was always too narrow —
-    // has_struct_inst inspected only the immediate slot, so it could not see a deeper
-    // adoption (br 3aa3je). With the triad gone there is no flag to gate on, and gating was
-    // never what made it correct: the guard is a pure DECLINE, so running it everywhere can
-    // only lose a site to the string tier, never claim one the tid cannot spell.
-    //
-    // The check is the literal's OWN memoized instance tid, compared through
-    // arg_tids_match_mono_args' POSITIVE-CONTRADICTION semantics: the inner literal's own
-    // tid spells "Int", which positively contradicts "Box_Int" → decline. A -1 slot stays a
-    // DON'T-CARE, not a contradiction — flipping that would regress zrybya's
-    // Box[Option[Int]].
-    //
-    // This also absorbs what the deleted has_ret_target CONFIRMATION was protecting. That
-    // block required the enclosing fn's return annotation to spell a byte-identical CSV,
-    // which caught two things: a nested inner literal (this guard, more directly — it
-    // compares the literal's own tid rather than a proxy) and a declared/body mismatch
-    // (now an upstream E0300, br skdxkv, and still a contradiction here if it ever isn't).
-    let own_tid = tc_lookup_node_tid(node)
-    if own_tid != inst_tid {
-        let own = mono_instance_arg_tids_from_tid(own_tid, sname, tc_tid_struct_arg_count(own_tid))
-        if !arg_tids_match_mono_args(own, csv) {
-            if tracing != 0 { dbg_trace("retmono", "sname={sname} inst_tid={inst_tid} own_tid={own_tid} decline=nesting_level_mismatch csv={csv}") }
-            return ""
-        }
-    }
+    // With that fixed, every remaining `decline=nesting_level_mismatch` this guard could still
+    // raise was br qnpb2d's aliased-spelling false positive: `type Alias = Int` mints its own
+    // tid, so a slot spelled "Alias" in the annotation and "Int" on the literal's own memoized
+    // tid read as a POSITIVE CONTRADICTION under this guard's segment comparison, though the
+    // two spellings name one type (`P[Alias, I64] = P { a: 1, b: 2 }` died at I0001 on exactly
+    // this). qnpb2d already settled that the tid outranks the string CSV when they disagree —
+    // this guard was the last place at the struct-lit seam still arbitrating between them, so
+    // once its one genuine producer was fixed upstream, deleting it is the only remaining
+    // question, not a tradeoff. own_tid and csv used to be computed unconditionally either
+    // way; csv is still the return value below.
     if tracing != 0 { dbg_trace("retmono", "sname={sname} inst_tid={inst_tid} count={count} admit=slot_encodable csv={csv}") }
     csv
 }
@@ -5892,12 +5875,12 @@ fn tid_native_struct_mono(node: Int, sname: Str) -> TidNativeMono {
         if tracing != 0 { dbg_trace("retmono", "sname={sname} decline=no_inst_tid") }
         return TidNativeMono { csv: "", inst_tid: raw }
     }
-    let csv = tid_native_struct_mono_slots(raw, sname, node, tracing)
+    let csv = tid_native_struct_mono_slots(raw, sname, tracing)
     if csv != "" { return TidNativeMono { csv: csv, inst_tid: raw } }
     let sub = tc_tid_subst_mono(raw, cg_mono_tparams_sl, cg_mono_arg_tids)
     if sub != raw && sub >= 0 {
         if tracing != 0 { dbg_trace("retmono", "sname={sname} raw={raw} sub={sub} retry=mono_subst") }
-        let sub_csv = tid_native_struct_mono_slots(sub, sname, node, tracing)
+        let sub_csv = tid_native_struct_mono_slots(sub, sname, tracing)
         if sub_csv != "" { return TidNativeMono { csv: sub_csv, inst_tid: sub } }
     }
     TidNativeMono { csv: "", inst_tid: raw }
@@ -5939,38 +5922,6 @@ pub fn mono_instance_arg_tids_from_tid(inst_tid: Int, expected_base: Str, expect
         i = i + 1
     }
     out
-}
-
-// Whether a recovered arg_tids list is parallel to the already-chosen `mono_args`
-// CSV: every encodable slot (seg != "") must spell exactly the segment mono_args
-// holds for that index. A -1 / unencodable slot ("") is a don't-care: this guard only
-// rejects a POSITIVE contradiction, and a slot with no tid cannot contradict. (It is
-// not "safe" in the old sense — the def side no longer has a string resolver to fall
-// back to — but recovering that slot is register-time work, not this guard's job.)
-// Used by the
-// phybxe Class-A recovery to reject a tid recovered off a MISMATCHED outer annotation
-// (bare-name matched but a different nesting level), which would otherwise mis-lower a
-// nested inner instance's field type. Returns true for an empty list (nothing to
-// contradict → the empty-list fallback stays authoritative).
-//
-// Per-slot alignment is sound because nth_type_arg splits mono_args naively on ',',
-// and every slot segment (whether from tc_tid_to_c_tag on the tid side or the string
-// producers on the CSV side) spells compound/nested types with UNDERSCORES
-// (Result_int_str, Box_Int), never commas — so one slot never injects a comma that
-// would desync the split. segs and the CSV are parallel: recovered's length is the
-// instance's params_count (or 0), and the string mono_args in this branch has exactly
-// one comma-segment per declared tparam.
-fn arg_tids_match_mono_args(arg_tids: List[Int], mono_args: Str) -> Bool {
-    let segs = segs_from_arg_tids(arg_tids)
-    let mut i = 0
-    while i < segs.len() {
-        let seg = segs.get(i).unwrap()
-        if seg != "" && seg != nth_type_arg(mono_args, i) {
-            return false
-        }
-        i = i + 1
-    }
-    true
 }
 
 // Register the mono instance for a generic-enum construction (`Branch(Leaf(1),…)`)
@@ -6146,16 +6097,15 @@ fn register_map_elem_struct_mono(base: Str, ann: Int, tparams_sl: Int, slot_tid:
         mono_args = mono_args.concat(resolved_arg)
         ai = ai + 1
     }
-    // Per-slot parity is enforced INLINE, not by a trailing arg_tids_match_mono_args
-    // check: resolve_arg_seg_via_slot_tid (above) spells each slot from
-    // tc_seg_from_tid(arg_tids[ai]) when the recovered tid is encodable, and passes the
-    // element name through otherwise. Since tc_seg_from_tid reproduces the CSV segment
-    // mangling used for every encodable slot (the regen-enforced
-    // invariant), mono_args equals the pre-msd9xq CSV string byte-for-byte and every
-    // stored tid already agrees with the segment it produced. A trailing
-    // arg_tids_match_mono_args guard would be circular here (mono_args is DERIVED from
-    // arg_tids, so it can never contradict them) — unlike the struct-lit Class-A path,
-    // where mono_args is computed independently and the guard genuinely cross-checks.
+    // Per-slot parity is enforced INLINE: resolve_arg_seg_via_slot_tid (above) spells each
+    // slot from tc_seg_from_tid(arg_tids[ai]) when the recovered tid is encodable, and
+    // passes the element name through otherwise. Since tc_seg_from_tid reproduces the CSV
+    // segment mangling used for every encodable slot (the regen-enforced invariant),
+    // mono_args equals the pre-msd9xq CSV string byte-for-byte and every stored tid already
+    // agrees with the segment it produced. mono_args is DERIVED from arg_tids here, so
+    // there was never an independent CSV for a trailing arg_tids_match_mono_args-style
+    // cross-check to read (br jefm9w retired that check entirely, including at the
+    // struct-lit Class-A path where mono_args WAS computed independently).
     register_mono_instance(base, mono_args, arg_tids)
 }
 
@@ -6393,9 +6343,10 @@ fn emit_struct_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
     // own slot tids off the memoized annotation tid and install them alongside the
     // struct's tparams, so a container-field ctor (`Set[T]` where T→Int) resolves
     // its element via the structured tid (resolve_tparam_via_tid) — the
-    // 365fqj/hnyqe4 SetField/MapField/GKV capture gap (br 9myrp2). Gated by
-    // arg_tids_match_mono_args exactly like the Class-A recovery below: a mismatched /
-    // absent tid yields [], byte-identical to the prior unconditional clear.
+    // 365fqj/hnyqe4 SetField/MapField/GKV capture gap (br 9myrp2). An absent /
+    // base-mismatched / arity-mismatched tid still yields [] (that is
+    // mono_instance_arg_tids_from_tid's own contract), which is the pre-9myrp2
+    // unconditional clear.
     let saved_mono_arg_tids = cg_mono_arg_tids
     cg_mono_arg_tids = []
     // Which spelling of this instance's args the field loop resolves against. The
@@ -6407,8 +6358,7 @@ fn emit_struct_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
     // hnyqe4 silent-hash miscompile wearing a CORRECT mono name — the mono-name half
     // of fqthkv (tc_tid_compound_slot_faithful's TK_TUPLE arm) does not fix it,
     // which is why the fqthkv test asserts the runtime round-trip and not just the
-    // name. Both arms stay gated by arg_tids_match_mono_args below, so a tid that
-    // does not spell the chosen args is still discarded to [].
+    // name.
     let field_ctx_args = if tid_wins { tid_native_args } else { target_args }
     if field_ctx_args != "" && td_tparams != -1 && sublist_length(td_tparams) > 0 {
         cg_mono_tparams_sl = td_tparams
@@ -6419,11 +6369,16 @@ fn emit_struct_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
         // changes emitted C for shapes that already work. tid_native.inst_tid IS the raw
         // tid whenever the substitution retry did not win, so this is byte-identical
         // outside the newly-answered shapes.
+        //
+        // Installed UNCONDITIONALLY (br jefm9w). A parity veto against field_ctx_args used
+        // to sit here. On the tid_wins arm it was CIRCULAR — field_ctx_args is
+        // tid_native_args, spelled from this same inst_tid through the same
+        // tc_tid_to_c_tag, so the two could never disagree — and on the string arm it
+        // contradicted br qnpb2d: when the recovered tid and a string-chosen CSV
+        // disagree the tid is authoritative, so a divergence there was an aliased
+        // spelling to accept, not a second opinion to reject.
         let inst_tid = if tid_wins { tid_native.inst_tid } else { tid_native_struct_inst_tid(node, sname) }
-        let recovered = mono_instance_arg_tids_from_tid(inst_tid, sname, tc_tid_struct_arg_count(inst_tid))
-        if arg_tids_match_mono_args(recovered, field_ctx_args) {
-            cg_mono_arg_tids = recovered
-        }
+        cg_mono_arg_tids = mono_instance_arg_tids_from_tid(inst_tid, sname, tc_tid_struct_arg_count(inst_tid))
     } else if ret_ann_tids.len() > 0 {
         // Last tier: the enclosing fn's return annotation (br 3dpshm). Only reached when
         // neither the value context nor the memoized instance tid could name this literal
@@ -6436,11 +6391,9 @@ fn emit_struct_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
         // came from the enclosing mono context, which is already concrete, and the CSV the
         // selector spells below comes from these same tids, so name and vtable cannot split.
         //
-        // field_ctx_args is deliberately NOT updated: its only consumer is the
-        // arg_tids_match_mono_args parity guard in the sibling branch, which exists to
-        // discard a recovered tid that disagrees with a CSV some other producer chose.
-        // Here the tids ARE the source and the CSV is derived from them, so there is no
-        // second opinion to check against.
+        // field_ctx_args is deliberately NOT updated: this branch is only reached when it
+        // is "", and the sibling branch's only use for it was the parity veto br jefm9w
+        // retired. Here the tids ARE the source and the CSV is derived from them.
         cg_mono_tparams_sl = td_tparams
         cg_mono_arg_tids = ret_ann_tids
     }
@@ -6666,56 +6619,35 @@ fn emit_struct_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
     // carrying real tids so arg_tids can key the def-side tid lowering.
     if mono_args != "" && mono_arg_tids.len() == 0 {
         let inst_tid = tid_native_struct_inst_tid(node, sname)
-        let recovered = mono_instance_arg_tids_from_tid(inst_tid, sname, tc_tid_struct_arg_count(inst_tid))
-        // tid_native_struct_inst_tid matches an outer let/arg annotation by BARE
+        // Installed UNCONDITIONALLY (br jefm9w). This was the last of the four
+        // arg_tids_match_mono_args sites and the one that genuinely cross-checked: here
+        // mono_args came from struct_concrete_args_from_target / infer_struct_type_args /
+        // struct_mono_from_fn_ret_ann, none of which read the recovered tid — unlike site
+        // 2's tid_wins arm, a divergence here was not circular. It was deleted anyway,
+        // because br qnpb2d settled that a tid/CSV disagreement is not a contradiction to
+        // arbitrate: the tid is authoritative and the CSV is the stale or aliased
+        // spelling. tid_native_struct_inst_tid matches an outer let/arg annotation by BARE
         // struct name, so a NESTED inner literal (`Box{value:42}` inside a
-        // `let b: Box[Box[Int]]`) can recover the OUTER instance's tid — whose slot
-        // is `Box[Int]`, not the inner literal's `Int`. That would lower the inner
-        // `Box_Int` typedef's field to `blink_Box_Int value` (self-referential →
-        // undeclared type). Guard: every encodable recovered slot MUST spell the
-        // segment `mono_args` already chose for that slot; on any divergence the tid
-        // belongs to a different instance, so discard to [] (byte-identical to the
-        // pre-phybxe empty-list fallback).
+        // `let b: Box[Box[Int]]`) used to be able to recover the OUTER instance's tid here
+        // — the hazard this site's veto existed to catch. br htxpmh closed that at the
+        // FIELD-LOOP seam (emit_struct_lit saves and restores both cg_let_target_ann and
+        // cg_expect_arg_ann per field, retargeted to the FIELD's own annotation, so the
+        // inner literal never sees the outer `Box[Box[Int]]` to match against by bare
+        // name), which is why this recovery measured 0 divergences on the pinned corpus
+        // before the veto was ever deleted.
         //
-        // AUDITED at br htxpmh, KEPT. The hazard above is stated as a live one, and at
-        // the FIELD-LOOP seam it no longer is: emit_struct_lit now saves and restores
-        // both cg_let_target_ann and cg_expect_arg_ann per field and retargets them to
-        // the FIELD's annotation, so the inner literal never sees the outer
-        // `Box[Box[Int]]` to match against by bare name. Neither this guard nor the
-        // second source below was measured firing after that, and both stay anyway,
-        // for two different reasons.
-        //
-        // This guard stays because it is a TRIPWIRE on the same class as the one in
-        // tid_native_struct_mono_slots (jefm9w owns retiring all four together), and
-        // because tid_native_struct_inst_tid is reachable from callers other than the
-        // field loop — the retarget narrows what a nested VALUE sees, not what every
-        // caller of the bare-name match can be handed.
-        //
-        // The second-source fallback below stays for an independent reason: it also
-        // serves the Void-DEGRADED node-tid case (br msd9xq), which is not a nesting
-        // problem at all and which the retarget does not touch. Do not read "the
-        // nesting hazard is now unreachable" as a licence to delete it.
-        if arg_tids_match_mono_args(recovered, mono_args) {
-            mono_arg_tids = recovered
-        } else {
-            // The annotation-matched tid belonged to a DIFFERENT nesting level (the
-            // guard above rejected it). For a nested inner literal typecheck also
-            // memoizes the correct own-instance tid directly on the construction node
-            // (tc_struct_lit_instance_tid) — try THAT as a second source, still gated
-            // by the same segment-parity guard so a Void-degraded or mismatched node
-            // tid (e.g. `Box{value:None}` whose slot reverse-infers to Void) is
-            // discarded to [] and the def-side stays on the string seg (br msd9xq).
-            // Confined to this recovery site so the shared mono_args string selector
-            // (tid_native_struct_mono) is untouched — the zrybya compound-field
-            // path keeps choosing the faithful annotation slot.
-            let node_tid = tc_lookup_node_tid(node)
-            if node_tid != inst_tid {
-                let node_recovered = mono_instance_arg_tids_from_tid(node_tid, sname, tc_tid_struct_arg_count(node_tid))
-                if node_recovered.len() > 0 && arg_tids_match_mono_args(node_recovered, mono_args) {
-                    mono_arg_tids = node_recovered
-                }
-            }
-        }
+        // The node-tid second-source fallback that used to sit in the rejection branch
+        // (try tc_lookup_node_tid(node) when the annotation-matched tid diverged) went
+        // with the veto (br jefm9w) rather than being re-triggered on an empty recovery:
+        // it existed to give a DIVERGENT recovery another chance to pass the same check
+        // (br msd9xq's nested-inner case), and had no role once there was no check to
+        // fail in the first place. It was already measuring 0 calls on the pinned corpus
+        // before this deletion — htxpmh's field-loop retarget left it unreached the same
+        // way it left the rejection branch above unreached. zrybya's None-at-annotation
+        // shape (`Box{value:None}` at `Box[Option[Int]]`) never depended on it: the
+        // annotation-matched recovery there agrees with mono_args (both read the same
+        // faithful annotation), so it always took the accept branch, never the fallback.
+        mono_arg_tids = mono_instance_arg_tids_from_tid(inst_tid, sname, tc_tid_struct_arg_count(inst_tid))
     }
     let mut struct_key = sname
     if mono_args != "" {

@@ -1,81 +1,63 @@
 // br jefm9w: arg_tids_match_mono_args, the struct-literal seam's tid-vs-CSV parity veto, is
-// LIVE. This file pins the programs that prove it, because the corpus does not.
+// RETIRED — deleted at all four call sites and as a `fn`. This file used to pin the programs
+// that proved it live; it now pins the same programs as anti-regressions for the producer
+// fixes that made the veto's only genuine job (site 3, br phybxe) obsolete, plus the false
+// positive its removal fixes.
 //
-// The veto compares a recovered arg_tids list against an already-chosen mono_args CSV segment
-// by segment and discards the WHOLE list on any positive contradiction. jefm9w proposed
-// deleting it at all four call sites in src/codegen_expr.bl, on the strength of br qnpb2d's
-// rule that THE TID IS AUTHORITATIVE — when the tid and the string CSV disagree the tid is
-// correct and the string is a stale or aliased spelling, so there is nothing to arbitrate.
+// The veto used to compare a recovered arg_tids list against an already-chosen mono_args CSV
+// segment by segment and discard the WHOLE list on any positive contradiction. br qnpb2d's
+// rule is THE TID IS AUTHORITATIVE — when the tid and the string CSV disagree the tid is
+// correct and the string is a stale or aliased spelling — so once nothing upstream hands the
+// tier a tid belonging to the WRONG instance, there is nothing left to arbitrate.
 //
-// The deletion was implemented and measured. It is byte-identical on the whole pinned corpus
-// (tests/*.bl + examples/*.bl + examples/with_deps/{app,mathlib}/src/*.bl + src/cli.bl +
-// src/blinkc_main.bl — 747 files, 732 reaching codegen), `task regen` is green and all 582
-// tests pass. It is still wrong: one of the three genuine veto sites is load-bearing for
-// shapes the corpus happens not to contain. Row B is such a program, found by hand after the
-// sweep read zero. A zero-hit sweep is an unexercised tap, not coverage.
+// ── THE FIRST ATTEMPT, WHY IT REVERTED ─────────────────────────────────────────────────────
 //
-// Measured by applying the deletion to a clean worktree at 1a0f961 and running a FULL
-// `task regen` before comparing — a partially-rebuilt tree reports stale C and produced two
-// false readings on the first attempt (see project_codegen_change_needs_cli_rebuild):
+// A prior session deleted the veto at all four sites and measured a byte-identical pinned
+// corpus (747 files, 732 reaching codegen) with `task regen` and all tests green — then found
+// by hand, off-corpus, that it regressed two programs the sweep never touched:
 //
 //   Box[Set[Int]]  via a field-access receiver     HEAD green -> POST cc ERROR   (row B)
 //   Box[List[Int]] via a field-access receiver     HEAD green -> POST cc ERROR   (row B2)
-//   P[Alias, Box[Int]] into a P[Int, Box[Int]]     HEAD green -> POST green      (row A)
-//   P[Alias, I64]                                  HEAD I0001 -> POST green      (see below)
 //
-// ── WHAT THE SWEEP SAID, AND WHY IT WAS WORTHLESS ─────────────────────────────────────────
+// Both are the SAME defect: a struct literal in FIELD-ACCESS RECEIVER position (`Box { value:
+// Box { value: Set() } }.value`) was typed as the RESULT of the access rather than as itself,
+// so the OUTER literal (really Box[Box[Set[Int]]]) matched the enclosing let's annotation
+// (Box[Set[Int]]) by bare struct name and adopted `Set` one nesting level too high. Site 3's
+// veto happened to decline that adoption and kept the instances distinct; deleting the veto
+// let the outer collapse onto the inner and `cc` failed. That was a producer bug wearing the
+// veto as an accidental partial mask, not a reason to keep the veto: it was filed as br
+// qah9tx and fixed upstream in 591d4a1 — the receiver-seam gets its own annotation, retargeted
+// to itself the same way htxpmh's field-loop retarget already covers field-value position.
 //
-//   site 1  nesting guard          0 declines
-//   site 2  tid_wins arm         127 calls, 0 divergences   (CIRCULAR: the CSV and the
-//                                                            recovered list are spelled from
-//                                                            the SAME inst_tid, so this site
-//                                                            genuinely cannot diverge)
-//   site 2  string arm             0 calls
-//   site 3  Class-A recovery      19 calls, 0 divergences   (GENUINE cross-check: mono_args
-//                                                            comes from
-//                                                            struct_concrete_args_from_target
-//                                                            / infer_struct_type_args,
-//                                                            independent of the recovered tid)
-//   site 3b node-tid second source 0 calls
+// ── RE-MEASURED POST-FIX, AT 1b96cec ───────────────────────────────────────────────────────
 //
-// Site 2's tid_wins arm is provably vacuous — it compares a value against itself. Site 3 is
-// the one proven load-bearing off-corpus (rows B and B2). Site 1's nesting guard DOES fire
-// off-corpus (row B traces one `decline=nesting_level_mismatch` against the corpus's zero),
-// but no program has yet been found that regresses from deleting site 1 alone, so treat it as
-// unproven-either-way rather than safe.
+// With qah9tx's fix in the binary, row B's shape no longer reaches site 3 at all: the tid
+// tier admits Box[Set[Int]] directly (0 `decline=nesting_level_mismatch`, `tid_wins` true), so
+// the Class-A recovery this file used to pin as load-bearing never runs. Rows B and B2 are
+// anti-regressions for qah9tx now, not veto liveness proofs — they still assert the same C
+// shapes, because those shapes are what "typed as itself" looks like, but the mechanism
+// answering them moved from the veto to the fixed producer before the veto was ever deleted.
+//
+// The false positive the veto DID own outright is still live at HEAD and is what its deletion
+// actually fixes — see ROW G below.
 //
 // ── ROW LEDGER ────────────────────────────────────────────────────────────────────────────
 //
 //   ROW A   P[Alias, Box[Int]] into a P[Int, Box[Int]] param   green, control (unchanged)
-//   ROW B   Box[Set[Int]] via a field-access receiver          green now, cc ERROR if deleted
-//   ROW B2  Box[List[Int]] via a field-access receiver         green now, cc ERROR if deleted
+//   ROW B   Box[Set[Int]] via a field-access receiver          green, qah9tx anti-regression
+//   ROW B2  Box[List[Int]] via a field-access receiver         green, qah9tx anti-regression
 //   ROW C   Box[Box[Int]]                                      green, htxpmh anti-regression
 //   ROW D   Box[Box[Option[Str]]] over a bare None             green, htxpmh anti-regression
 //   ROW E   the Some("z") twin                                 green, htxpmh anti-regression
-//   ROW F   Box[Alias] — guard fires, nothing diverges         green, control
+//   ROW F   Box[Alias] — used to trip the guard, ran anyway    green, control
+//   ROW G   P[Alias, I64] — the veto's own false positive      HEAD I0001 -> green (jefm9w)
 //
-// ── THE RECEIVER SEAM IS ALREADY BROKEN, WHICH IS THE REAL POINT ──────────────────────────
+// ── ROW G: THE FALSE POSITIVE THE VETO CAUSED, AND WHY DELETING IT IS THE RIGHT FIX ────────
 //
-// Rows B and B2 survive at HEAD by ACCIDENT. The same shape with a scalar payload, and the
-// two-level chain, are red at HEAD already — the veto does not rescue them:
-//
-//   let n: Box[Str] = Box { value: Box { value: "z" } }.value
-//     error: incompatible types when initializing type 'const char *' using 'blink_Box_Str'
-//   let n: Box[Int] = Box { value: Box { value: Box { value: 3 } } }.value.value
-//     error: incompatible types when initializing type 'long int' using 'blink_Box_Box_Int'
-//
-// One defect, four shapes: a struct literal in FIELD-ACCESS RECEIVER position is typed as the
-// RESULT of the access rather than as itself. Two shapes the veto happens to catch, two it
-// does not. So the veto is not a backstop worth keeping on its merits — it is an accidental
-// partial mask over a producer bug, and the fix is to make the receiver seam type its own
-// literal, after which all four are green and site 3 has nothing left to do.
-//
-// ── THE KNOWN FALSE POSITIVE, WHICH IS NOT A REASON TO DELETE THE GUARD ───────────────────
-//
-// The veto cannot tell a wrong nesting level from a second spelling of one type, so it also
-// rejects legitimate aliased slots, and its rejection is not a graceful degrade: the recovered
-// list is discarded, the binder survives to emission, and the program dies on
-// I0001 UnsolvedTypeVarAtCodegen. Measured at 1a0f961:
+// The veto could not tell a wrong nesting level from a second spelling of one type, so it also
+// rejected legitimate aliased slots, and its rejection was not a graceful degrade: the
+// recovered list was discarded, the binder survived to emission, and the program died on
+// I0001 UnsolvedTypeVarAtCodegen. Measured at 1a0f961, while the veto was still live:
 //
 //   type Alias = Int
 //   type P[A, B] { a: A, b: B }
@@ -87,23 +69,18 @@
 //
 // Two spellings, one type, on both slots: `type Alias = Int` mints its OWN tid, and
 // resolve_type_name folds I64 onto TYPE_INT (src/typecheck.bl:1013) so the tid spells "Int"
-// where the annotation's bare node name spells "I64". Deleting the veto does fix this program.
-// It is nonetheless the WRONG fix — the defect is that the seam compares SPELLINGS where it
-// means to compare TYPES, and the repair belongs at the speller (canonicalize alias tids), not
-// at the one consumer that noticed. Tracked as the q38hbk alias-canonicalization family. There
-// is no test for it here because it is red today and this file must stay green.
+// where the annotation's bare node name spells "I64". This was never a nesting problem — there
+// is no nested literal here at all — so the veto's own contract (catch a tid recovered off a
+// MISMATCHED nesting level) never applied; it fired anyway because it cannot distinguish an
+// aliased spelling from a genuine contradiction. Canonicalizing alias tids at the seg speller
+// (the q38hbk family) would also fix this row, but with the veto gone there is no consumer
+// left to canonicalize FOR — deleting the arbitration is the smaller, sufficient fix, and
+// q38hbk is not needed to close this row.
 //
-// Arming the comparator to an ICE instead of deleting it was also refused, and rows A and B
-// are why that was the right call twice over: an ICE would turn these two working programs
-// into hard compiler errors.
-//
-// ── THE ORDER OF OPERATIONS FOR A FUTURE ATTEMPT ──────────────────────────────────────────
-//
-// Retiring the veto needs the PRODUCERS fixed first, never the string tier re-preferred
-// (qnpb2d's I5 rule):
-//   1. extend htxpmh's field-loop retarget to the field-access-receiver seam (row B), and
-//   2. canonicalize type-alias tids at the seg speller (row A, q38hbk).
-// Then these rows stay green on their own merits and the veto is genuinely vacuous.
+// Arming the comparator to an ICE instead of deleting it was refused twice, and rows A, B and
+// B2 are why: an ICE would have turned three working programs into hard compiler errors for a
+// veto whose only genuine catch (site 3) was itself a mask over a producer bug now fixed at
+// its source.
 
 import compile_test_helpers
 import std.io
@@ -156,31 +133,28 @@ test "an aliased slot beside a compound slot canonicalizes to the param's spelli
     assert(r.exit_code == 0)
 }
 
-// ── ROW B: the site-3 recovery veto, load-bearing ─────────────────────────────────────────
+// ── ROW B: the qah9tx receiver-seam fix, anti-regression ──────────────────────────────────
 //
-// The literal sits in FIELD-ACCESS RECEIVER position, which htxpmh's retarget does not cover:
-// the enclosing `let` annotates the RESULT of `.value`, not the receiver. The outer literal is
-// really Box[Box[Set[Int]]] while cg_let_target_ann still says Box[Set[Int]], and because
-// tid_native_struct_inst_tid matches value-context annotations by BARE STRUCT NAME, the outer
-// literal sees `Box` and adopts `Set` one nesting level too high.
+// The literal sits in FIELD-ACCESS RECEIVER position, which htxpmh's field-loop retarget does
+// not cover: the enclosing `let` annotates the RESULT of `.value`, not the receiver. Before
+// br qah9tx the outer literal — really Box[Box[Set[Int]]] — saw cg_let_target_ann still
+// spelling Box[Set[Int]] and, because tid_native_struct_inst_tid matches value-context
+// annotations by BARE STRUCT NAME, adopted `Set` one nesting level too high. The veto (site 3's
+// Class-A recovery) used to decline that adoption and kept both instances distinct — an
+// accidental partial mask, not a fix, since the same defect broke the scalar-payload and
+// two-level-chain twins of this shape that the veto could not catch at all (pinned green in
+// tests/test_qah9tx_fieldaccess_receiver.bl).
 //
-// Today the veto declines that adoption and both instances stay distinct:
+// br qah9tx fixed the receiver seam itself: the literal is now typed as ITSELF rather than as
+// the access result, so the outer instance is correctly Box[Box[Set[Int]]] from the start and
+// the tid tier admits it directly — 0 `decline=nesting_level_mismatch`, site 3 never runs.
+// With the veto now deleted entirely, this row pins that the producer fix alone carries it:
 //
 //   typedef struct { blink_set*    value; } blink_Box_Set;
 //   typedef struct { blink_Box_Set value; } blink_Box_Box_Set;
 //
-// Delete it and site 3's recovery becomes unconditional, which installs the INNER field tids
-// under the OUTER symbol. The name still comes from the string tier, so exactly one line of C
-// moves — `blink_Box_Set value;` becomes `blink_set* value;` — and the outer struct collapses
-// onto the inner:
-//
-//   error: invalid initializer
-//     blink_Box_Set n = _s0.value;
-//
-// That one-line move is the whole tell. `retmono` output is byte-identical with and without
-// the deletion, so no trace channel sees this; only the emitted C does. The runtime assertion
-// guards the other half: the Set must keep the int kops vtable rather than degrading to
-// blink_kops_str, which is the silent hnyqe4 collision class.
+// The runtime assertion guards the other half: the Set must keep the int kops vtable rather
+// than degrading to blink_kops_str, which is the silent hnyqe4 collision class.
 fn src_receiver_nested_set() -> Str {
     let mut s = box_decl()
     s = s.concat("fn main() \{\n")
@@ -210,7 +184,7 @@ test "a struct literal in field-access-receiver position keeps its own nesting l
 // ── ROW B2: the same seam with a different carrier ────────────────────────────────────────
 //
 // List instead of Set, to pin that row B is about the RECEIVER POSITION and not about Set's
-// kops resolution. Same HEAD-green / post-deletion-cc-error result, same one-line cause.
+// kops resolution. Same qah9tx fix, same producer, same anti-regression role.
 fn src_receiver_nested_list() -> Str {
     let mut s = box_decl()
     s = s.concat("fn main() \{\n")
@@ -297,19 +271,23 @@ test "a nested Some carrier stays at its own nesting level" {
     assert(r.exit_code == 0)
 }
 
-// ── ROW F: the guard fires, nothing diverges ──────────────────────────────────────────────
+// ── ROW F: the control that separates row A's two mechanisms ─────────────────────────────
 //
-// The control that separates row A's two mechanisms. `Box[Alias]` trips the site-1 guard for
-// exactly the same reason — the annotation's slot spells "Alias" while the literal's own
-// reverse-inferred slot spells "Int" — and hands the literal to the string tier. But with one
-// scalar slot and no compound beside it there is nothing left to diverge downstream, and the
-// program is green either way. Measured at 1a0f961:
+// `Box[Alias]` used to trip the site-1 guard for the same reason row G does — the
+// annotation's slot spells "Alias" while the literal's own reverse-inferred slot spells
+// "Int" — but with one scalar slot and no compound beside it there was nothing left to
+// diverge downstream, so the guard's decline handed the literal to a string tier that named
+// it identically and the program stayed green either way. Measured at 1a0f961, while the
+// guard was still live:
 //
 //   [retmono] sname=Box decline=nesting_level_mismatch csv=Alias
 //   [site3 classA]  verdict=match segs=[Alias] csv=[Alias]
 //
-// So a nesting_level_mismatch decline is NOT on its own evidence of a bug, and this row is
-// what stops a future reader from concluding that it is.
+// So a nesting_level_mismatch decline was NEVER on its own evidence of a bug — it fired here
+// exactly as often as on row G below, and only the presence of a SECOND slot (row G's `B`)
+// turned the same aliased spelling into an I0001. With the guard deleted this row is admitted
+// directly by the tid tier with no arbitration at all; it stays as the one-scalar-slot control
+// against row G's two-slot break.
 fn src_box_alias() -> Str {
     let mut s = "type Alias = Int\n"
     s = s.concat(box_decl())
@@ -320,11 +298,48 @@ fn src_box_alias() -> Str {
     s
 }
 
-test "a lone aliased slot compiles and runs though the guard declines it" {
+test "a lone aliased slot compiles and runs" {
     let c = compile_test_helpers.compile_and_emit_c(src_box_alias(), "jefm9w_rf_c")
     assert_lacks(c, "BLINK_I0001_", "row F / I0001 sentinel")
     assert_lacks(c, "_Void", "row F / erasure")
     let r = compile_test_helpers.compile_and_run(src_box_alias(), "jefm9w_rf_run")
     if r.exit_code != 0 { io.println("FAIL: row F runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+}
+
+// ── ROW G: the veto's own false positive, now fixed ───────────────────────────────────────
+//
+// `P[Alias, I64]` puts an aliased slot BESIDE a second slot, unlike row F's lone alias. Both
+// slots disagree with the annotation's spelling — `Alias`/`Int` and `I64`/`Int` — which used
+// to be exactly two positive contradictions for the veto to catch, and it discarded the whole
+// recovered list rather than degrading one slot at a time. With no slot recovered, the def-side
+// substitution never landed and the program died at the I0001 chokepoint (measured at 1a0f961,
+// while the veto was still live):
+//
+//   [retmono] sname=P decline=nesting_level_mismatch csv=Alias,Int
+//   [site3 classA]  verdict=DIVERGE segs=[Alias,Int] csv=[Alias,I64]
+//   internal compiler error[UnsolvedTypeVarAtCodegen]: the def-side slot resolved to 'B'
+//
+// This was never a nesting-level bug — there is no nested literal in this program at all — so
+// the veto's contract never covered it; it fired only because it could not tell an aliased
+// spelling from a genuine contradiction. Deleting the veto is the fix: the tid, not the string
+// CSV, is what the def side lowers from, and br qnpb2d already settled that the tid is
+// authoritative. This is the row the deletion is FOR.
+fn src_alias_two_slot() -> Str {
+    let mut s = "type Alias = Int\n"
+    s = s.concat("type P[A, B] \{ a: A, b: B }\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let p: P[Alias, I64] = P \{ a: 1, b: 2 }\n")
+    s = s.concat("    assert(p.a == 1)\n")
+    s = s.concat("    assert(p.b == 2)\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "an aliased slot beside a second slot no longer dies at I0001" {
+    let c = compile_test_helpers.compile_and_emit_c(src_alias_two_slot(), "jefm9w_rg_c")
+    assert_lacks(c, "BLINK_I0001_", "row G / I0001 sentinel")
+    let r = compile_test_helpers.compile_and_run(src_alias_two_slot(), "jefm9w_rg_run")
+    if r.exit_code != 0 { io.println("FAIL: row G runtime — {r.err_out}") }
     assert(r.exit_code == 0)
 }

@@ -7282,6 +7282,50 @@ fn resolve_alias_tid(tid: Int) -> Int {
     tc_alias_underlying.get(name) ?? tid
 }
 
+// Walks a transparent `type Alias = X` chain from a bare (params_count 0) struct/enum
+// NAME to the tid that actually determines its C spelling / injectivity — the single
+// shared resolver for the three consumers that must agree on this (tc_tid_to_c_tag,
+// tc_tid_inner_tag, tc_tid_struct_seg_injective), rather than each re-deriving it (br
+// bwyfy1's "two-speller, opposite rules" shape, repeated a third time if left alone).
+// Bounded like resolve_alias_type_name's hop cap: a long alias-of-alias chain must
+// terminate, not recurse unboundedly. Refuses to follow into a forward-declared alias
+// whose RHS hadn't been registered yet — register_struct_type inserts the alias's own
+// name into named_type_map before resolving its RHS, so a reference to a not-yet-declared
+// type mints an orphaned TK_TYPEVAR (resolve_type_ann's make_typevar fallback) instead of
+// the real tid. Chasing that phantom would hand back tc_tid_to_c_tag's own "<tv>" poison
+// sentinel as if it were a genuine resolution, baking it into a real C identifier instead
+// of refusing to treat the alias as resolved. Returns -1 when `name` names no alias, or
+// when the chain would return anything other than a genuine, encodable target.
+fn tc_resolve_transparent_alias_name(name: Str) -> Int {
+    if tc_alias_underlying.len() == 0 { return -1 }
+    let mut cur_name = name
+    let mut result = -1
+    let mut hops = 0
+    while hops < 8 {
+        let next = tc_alias_underlying.get(cur_name) ?? -1
+        if next == -1 { return result }
+        let nr = tc_resolve(next)
+        if nr < 0 || nr >= ty_pool.len() { return result }
+        let ne = ty_pool.get(nr).unwrap()
+        if ne.kind == TK_TYPEVAR || ne.kind == TK_UNKNOWN { return result }
+        // Direct self-alias (`type A = A`) resolves to a real, already-registered tid
+        // for itself rather than a TK_TYPEVAR placeholder, so the poison check above
+        // does not catch it. A genuine multi-name cycle always has some direction that
+        // forward-references a not-yet-declared name and mints an orphan TK_TYPEVAR
+        // there (register_struct_type inserts before resolving), which the check above
+        // already terminates within a few hops — only the degenerate zero-indirection
+        // self-loop has no such gap to be caught by. Without this, cur_name would never
+        // change and the caller's self-recursion on an unchanged tid would spin forever.
+        if ne.name == cur_name { return result }
+        result = next
+        if ne.kind != TK_STRUCT && ne.kind != TK_ENUM { return result }
+        if ne.params_count != 0 { return result }
+        cur_name = ne.name
+        hops = hops + 1
+    }
+    result
+}
+
 fn types_compatible(a0: Int, b0: Int) -> Int {
     // Follow bound metavars to their solution FIRST (gqg3rk): a pinned α reads as
     // its concrete type, so `let s: Str = intList.get(0).unwrap()` is now rejected
@@ -10148,6 +10192,12 @@ pub fn tc_tid_inner_tag(tid0: Int) -> Str {
     if k == TK_STRUCT || k == TK_ENUM {
         let stem = tc_tid_struct_mono_name(tid)
         if stem != "" { return stem }
+        // Twin of tc_tid_to_c_tag's alias hop (bwyfy1: these two spellers must agree
+        // on every bare struct/enum, aliases included, or Option[MyInt]/List[MyInt]/
+        // Map[K,MyInt]/Result[MyInt,_] keep leaking the alias spelling even after the
+        // top-level slot is fixed).
+        let underlying = tc_resolve_transparent_alias_name(t.name)
+        if underlying != -1 { return tc_tid_inner_tag(underlying) }
         return c_type_tag_for_struct(t.name)
     }
     if k == TK_OPTION { return "Option_{tc_tid_inner_tag(t.inner1)}" }
@@ -10891,6 +10941,17 @@ pub fn tc_tid_to_c_tag(tid0: Int) -> Str {
     if k == TK_STRUCT || k == TK_ENUM {
         let stem = tc_tid_struct_mono_name(tid)
         if stem != "" { return stem }
+        // A bare (params_count 0) struct-kinded tid is also the shape a transparent
+        // `type Alias = Int` alias takes (register_struct_type mints it as a genuine
+        // 0-field TK_STRUCT and records the underlying tid separately in
+        // tc_alias_underlying, never consulted above). Left unresolved, a slot
+        // spelled "Alias" here diverges from a sibling spelled "Int" for the same
+        // underlying type — the jefm9w Row A regression, where P[Alias, Box[Int]]
+        // and P[Int, Box[Int]] must byte-match. Hop through the alias (bounded,
+        // poison-safe — see tc_resolve_transparent_alias_name) before falling back
+        // to the bare name; a non-alias struct/enum finds no entry and is unaffected.
+        let underlying = tc_resolve_transparent_alias_name(t.name)
+        if underlying != -1 { return tc_tid_to_c_tag(underlying) }
         return strip_module_qualifier(t.name)
     }
     if k == TK_OPTION { return "Option_{tc_tid_inner_tag(t.inner1)}" }
@@ -11102,7 +11163,18 @@ fn tc_tid_struct_seg_injective(t: TypePoolEntry) -> Bool {
         if decl == -1 { return true }
         let tparams_sl = node_type_params(decl)
         if tparams_sl == -1 { return true }
-        return sublist_length(tparams_sl) == 0
+        if sublist_length(tparams_sl) != 0 { return false }
+        // A bare, non-generic head normally IS the identity — but a transparent
+        // `type Alias = X` alias also takes this shape, and tc_tid_to_c_tag now spells
+        // it through to X's own tag (tc_resolve_transparent_alias_name) rather than the
+        // alias's bare name. If X itself erases its arguments (List/Set/Map/...), this
+        // predicate must say so too, or `type IntList = List[Int]` reads as injective
+        // while the tid path spells it down to the bare, non-injective "List" — the
+        // exact class DECISIONS.md:343 / br qnpb2d's diff-type-injective floor exists
+        // to catch, reintroduced through the one branch that didn't ask the alias table.
+        let underlying = tc_resolve_transparent_alias_name(t.name)
+        if underlying != -1 { return tc_tid_seg_injective(underlying) }
+        return true
     }
     let mut i = 0
     while i < t.params_count {
