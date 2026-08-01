@@ -57,12 +57,46 @@ never a reason to re-prefer the string. The three structural declines stay disti
 different things: `decline=bare_base` is a memo holding only the bare base (a typecheck memo bug),
 `decline=no_inst_tid` is no per-node instance tid at all, and `decline=nesting_level_mismatch` is the
 guard stopping an inner literal from adopting an outer annotation's slot. It is UNCONDITIONAL and, since
-br htxpmh, UNREACHABLE BY CONSTRUCTION: emit_struct_lit's field loop, defaults loop and enum-variant ctor
+br htxpmh, reads **0** on the pinned corpus (4 rows over 3 fixtures before): emit_struct_lit's field loop,
+defaults loop and enum-variant ctor
 loop now retarget both `cg_let_target_ann` and `cg_expect_arg_ann` to the field's own annotation
 (descending through the instantiation when the field is declared as a bare binder), so a nested literal
-is handed the annotation describing itself and cannot adopt its parent's. Measured 4 rows over 3 fixtures
-before, **0** after, on the pinned corpus. A row here now means a NEW nested-emission site was added
-without the retarget — fix the site. The retarget is gated on `value_ctx_ann_spellable`, applied to
+is handed the annotation describing itself and cannot adopt its parent's.
+That 0 is an UNEXERCISED TAP, NOT COVERAGE, and br jefm9w established the difference by trying to delete
+the guard on the strength of it — which is how the FIELD-ACCESS RECEIVER gap below was found. The
+retarget covers struct-field values, defaults and enum-variant ctor args; it never touched a literal in
+receiver position, where the enclosing `let`/arg annotation describes the RESULT of the access and not
+the receiver: in `let n: Box[Set[Int]] = Box { value: Box { value: Set() } }.value` the outer literal is
+really `Box[Box[Set[Int]]]`, but `cg_let_target_ann` names `Box[Set[Int]]` and the bare-name match
+adopted `Set` one level too high. That was br qah9tx (CLOSED). The `Set`/`List` carriers stayed green
+only because the jefm9w veto downstream declined the bad adoption; the shapes it does not catch —
+`let n: Box[Str] = Box { value: Box { value: "z" } }.value` and the three-level
+`Box { value: Box { value: Box { value: 3 } } }.value.value` — were hard cc errors at HEAD
+(`incompatible types when initializing`), pinned red in `tests/test_qah9tx_fieldaccess_receiver.bl`
+before the fix. Fixed with a scoped context flag, `cg_fa_receiver_ctx` (`codegen_types.bl`): the
+FieldAccess handler in `emit_expr` sets it true only around the receiver's own `emit_expr(fa_obj)` call;
+`tid_native_struct_inst_tid` skips its ann-based bare-name-match branch entirely while the flag is true,
+falling through to the literal's own memoized tid instead. Clearing the ann channels outright (tried
+first) was too blunt and REGRESSED kops resolution — `field_ann_at_instance`'s descent, used by the
+htxpmh retarget, reads those same two channels to resolve a NESTED field's bare-binder type argument, and
+the "leaked" receiver-result annotation is exactly the correct descent target one level down for whatever
+is nested inside the receiver (a `Set()`/`Map()` ctor, an `Option` carrier). So `emit_struct_lit`
+explicitly suspends `cg_fa_receiver_ctx` back to false around all four of its nested recursive emissions
+(enum-variant ctor field, spread, field value, defaults) — the flag narrows ONLY the receiver literal's
+own top-level identity resolution, never anything nested inside it. All four shapes (the two hard
+cc-errors plus the two previously-masked `Set`/`List` rows) go green together under this fix, confirmed
+via `tests/test_qah9tx_fieldaccess_receiver.bl`, `tests/test_jefm9w_parity_veto_live.bl` rows B/B2, and
+`tests/test_htxpmh_field_loop_value_ctx.bl`, all green on a fully regenerated tree.
+A `decline=nesting_level_mismatch` row now means one of two things: a nested-emission site the
+retarget does not reach, or an ALIASED slot, because the guard cannot tell a wrong nesting level from a
+second spelling of one type — `type Alias = Int` mints its own tid, so
+`let p: P[Alias, I64] = P { a: 1, b: 2 }` reads as a contradiction, loses the literal to the string tier
+and ICEs (I0001, measured at 1a0f961). That false positive is real and belongs to the
+alias-canonicalization family (br q38hbk); it is a reason to fix the speller, not to drop the guard.
+Above all do not read a decline as a reason to prefer the string tier in general (see below).
+Measure any claim here against a FULLY REGENERATED tree: a partially-rebuilt one reports stale C and
+produced two false liveness readings on jefm9w's first attempt.
+The retarget is gated on `value_ctx_ann_spellable`, applied to
 `field_ann_at_instance`'s DESCENT RESULT so it covers BOTH channels: an annotation that still spells a
 type-param binder leaves them alone rather than overwriting them. Two independent reasons, and both were
 measured, so do not narrow the gate to one channel. (1) The consumers of `cg_let_target_ann`

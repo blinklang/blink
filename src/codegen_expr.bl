@@ -9,7 +9,7 @@ import codegen_types.{
     cg_async_scope_counter, cg_async_scope_stack,
     cg_closure_cap_count, cg_closure_cap_start, cg_closure_defs,
     cg_current_fn_has_ev, cg_current_fn_name, cg_current_fn_node, cg_current_fn_option_inner, cg_current_fn_option_inner_struct, cg_current_fn_ret, cg_in_test_body, cg_test_mode, cg_in_assert_panics,
-    cg_let_target_ann, cg_expect_arg_ann, cg_assign_target_name,
+    cg_let_target_ann, cg_expect_arg_ann, cg_assign_target_name, cg_fa_receiver_ctx,
     cg_mono_tparams_sl, cg_mono_arg_tids,
     cg_debug_mode, cg_handler_body_field, cg_handler_body_idx,
     cg_handler_body_is_ue, cg_handler_body_vtable_type,
@@ -809,7 +809,23 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
                 return
             }
         }
+        // br qah9tx: the enclosing value-context annotation describes the RESULT of this
+        // access, not the receiver — one nesting level too high for a struct literal sitting
+        // in fa_obj. tid_native_struct_inst_tid matches cg_let_target_ann / cg_expect_arg_ann
+        // by BARE STRUCT NAME with no nesting check, so a receiver of the same struct name
+        // adopts the annotation one level too high. Clearing the channels outright (tried
+        // first) is too blunt: it also blinds field_ann_at_instance's descent for whatever
+        // is nested INSIDE the receiver (a bare Set()/Map() ctor, an Option carrier), which
+        // still needs the leaked annotation to resolve correctly — that is what rows 2a/2b
+        // of htxpmh and rows B/B2 of jefm9w depend on. cg_fa_receiver_ctx instead disables
+        // ONLY the ann-name match for fa_obj's OWN identity resolution; emit_struct_lit
+        // resumes normal (ann-eligible) behavior around every nested recursive emission
+        // (field values, defaults, spread), so a struct literal nested inside the receiver
+        // is unaffected.
+        let saved_fa_receiver_ctx = cg_fa_receiver_ctx
+        cg_fa_receiver_ctx = true
         emit_expr(fa_obj)
+        cg_fa_receiver_ctx = saved_fa_receiver_ctx
         let obj_str = expr_result_str
         let obj_type_for_fa = expr_result_type
         let mut c_field = fa_field
@@ -5691,12 +5707,20 @@ fn infer_struct_type_args(type_name: Str, field_types: List[Int], field_structs:
 // cg_expect_arg_ann wins when it names this struct (a call-arg position);
 // otherwise cg_let_target_ann. Falls back to the literal node's own tid.
 // Returns -1 when no memoized tid names this struct.
+// br qah9tx: cg_fa_receiver_ctx suppresses the ann-based branch entirely while
+// resolving a literal's OWN identity in FieldAccess receiver position — there,
+// both channels describe the RESULT of the access (one nesting level too high)
+// and a same-named bare match would wrongly adopt it. emit_struct_lit suspends
+// the flag around every nested recursive emission, so this only ever narrows
+// the receiver literal's own top-level resolution, never anything nested inside it.
 fn tid_native_struct_inst_tid(node: Int, sname: Str) -> Int {
     let mut inst_tid = -1
-    if cg_expect_arg_ann != -1 && strip_module_qualifier(node_name(cg_expect_arg_ann)) == sname {
-        inst_tid = tc_lookup_node_tid(cg_expect_arg_ann)
-    } else if cg_let_target_ann != -1 && strip_module_qualifier(node_name(cg_let_target_ann)) == sname {
-        inst_tid = tc_lookup_node_tid(cg_let_target_ann)
+    if !cg_fa_receiver_ctx {
+        if cg_expect_arg_ann != -1 && strip_module_qualifier(node_name(cg_expect_arg_ann)) == sname {
+            inst_tid = tc_lookup_node_tid(cg_expect_arg_ann)
+        } else if cg_let_target_ann != -1 && strip_module_qualifier(node_name(cg_let_target_ann)) == sname {
+            inst_tid = tc_lookup_node_tid(cg_let_target_ann)
+        }
     }
     if inst_tid < 0 || tc_tid_struct(inst_tid) != sname {
         inst_tid = tc_lookup_node_tid(node)
@@ -6272,7 +6296,13 @@ fn emit_struct_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
                     let saved_let_ann = cg_let_target_ann
                     cg_expect_arg_ann = vf_ann
                     if value_ctx_ann_spellable(vf_ann) != 0 { cg_let_target_ann = vf_ann }
+                    // br qah9tx: this nested emission is not the receiver's own identity
+                    // resolution, so it must see normal ann-eligible semantics even when
+                    // the enclosing enum-variant literal itself sits in receiver position.
+                    let saved_fa_ctx_vf = cg_fa_receiver_ctx
+                    cg_fa_receiver_ctx = false
                     emit_expr(node_value(sf))
+                    cg_fa_receiver_ctx = saved_fa_ctx_vf
                     cg_expect_arg_ann = saved_arg_ann
                     cg_let_target_ann = saved_let_ann
                     let arg_str = expr_result_str
@@ -6432,7 +6462,13 @@ fn emit_struct_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
                 // adoption at all. Clearing to -1 would throw that away and buy nothing:
                 // every corpus spread source is an Ident, which reads no annotation channel.
                 // tests/test_htxpmh_field_loop_value_ctx.bl row 9 pins the Ident case.
+                // br qah9tx: suspended for the same reason as the field-value and
+                // defaults sites below — this is a nested emission, not this literal's
+                // own receiver-position identity resolution.
+                let saved_fa_ctx_spread = cg_fa_receiver_ctx
+                cg_fa_receiver_ctx = false
                 emit_expr(node_value(sf))
+                cg_fa_receiver_ctx = saved_fa_ctx_spread
                 spread_tmp = expr_result_str
                 i = i + 1
                 continue
@@ -6464,7 +6500,13 @@ fn emit_struct_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
             let saved_let_ann = cg_let_target_ann
             cg_expect_arg_ann = f_ann
             if value_ctx_ann_spellable(f_ann) != 0 { cg_let_target_ann = f_ann }
+            // br qah9tx: a field VALUE nested inside a receiver-position literal is not
+            // that literal's own identity resolution — suspend so it gets normal
+            // ann-eligible semantics (needed e.g. for a nested Set()/Map() ctor's kops).
+            let saved_fa_ctx_fv = cg_fa_receiver_ctx
+            cg_fa_receiver_ctx = false
             emit_expr(node_value(sf))
+            cg_fa_receiver_ctx = saved_fa_ctx_fv
             cg_expect_arg_ann = saved_arg_ann
             cg_let_target_ann = saved_let_ann
             let val_str = expr_result_str
@@ -6543,7 +6585,12 @@ fn emit_struct_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
                 let saved_dfl_let_ann = cg_let_target_ann
                 cg_expect_arg_ann = dfl_ann
                 if value_ctx_ann_spellable(dfl_ann) != 0 { cg_let_target_ann = dfl_ann }
+                // br qah9tx: same suspension as the field-value site — a default value
+                // belongs to the type definition, not to this literal's own identity.
+                let saved_fa_ctx_dfl = cg_fa_receiver_ctx
+                cg_fa_receiver_ctx = false
                 emit_expr(dfl.default_node)
+                cg_fa_receiver_ctx = saved_fa_ctx_dfl
                 cg_expect_arg_ann = saved_dfl_arg_ann
                 cg_let_target_ann = saved_dfl_let_ann
                 let dval = expr_result_str
