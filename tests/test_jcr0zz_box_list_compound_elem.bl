@@ -1,0 +1,379 @@
+// br jcr0zz: deep tp_from_tid recovery for a monomorphized-generic-struct's List[T]
+// field when the element itself is compound (Option/Result/Map).
+//
+// recover_list_elem_from_tid (src/codegen_expr.bl, beside deep_tp_from_tid) is
+// jw1pmb's per-use element recovery for the shape `type Box[T] { v: T }` +
+// `Box[List[<X>]]`: one sf_entry per (struct, field) erases every instantiation to
+// the same sv_tp(CT_LIST, -1, -1, ""), so the real element must be recovered per
+// call site from typecheck's tid memo. Before this fix it recovered scalar/struct
+// elements correctly (jw1pmb) but BAILED (left the element erased to Int) whenever
+// the element was itself Option/Result/Map — the declared form (`let g:
+// List[Option[Str]] = […]`) already worked, so this was a pure parity gap.
+//
+// deep_tp_from_tid is the tid-side twin of the declared path's deep_tp_from_ann
+// (codegen_stmt.bl) — both build a fully-recursive tp_id (codegen's ScopeVar.tp_id
+// tree), the ONLY channel deep enough to carry a nested container's own type
+// params; the flat inner1/inner2 ScopeVar slots hold one level only.
+//
+// A second, independently-discovered bug was fixed alongside this ticket's own
+// scope: the unannotated `let g = <list-expr>` re-bind in emit_let_binding /
+// emit_top_level_let (codegen_stmt.bl) copied a compound element's flat CT marker
+// (expr_list_elem_type) from the RHS temp var onto the new LHS var, but never
+// copied the DEEP tp_id — so `let g = b.v` recovered the right element shape onto
+// the field-access temp, then silently dropped it the moment `g` was bound, and
+// `.get()` fell back to the boxed-int64 default (garbage reads, not a diagnostic).
+// Fixed by calling copy_list_compound_elem (src/codegen_methods.bl, previously only
+// used by one HOF/collect call site) from both re-bind sites, and by extending that
+// helper with a CT_MAP arm (it only handled Option/Result before).
+//
+// ── LEDGER: red-before state, measured against build/blink pre-fix (git rev
+//    48ce08b) via `type Box[T] { v: T }` + `let b: Box[List[<X>]] = …` + a
+//    per-element access ──
+//
+//   C1  Box[List[Option[Str]]], .get(0).unwrap().unwrap()=="hello", .get(1) none
+//         RED — error[UnresolvedMethod]: unresolved method '.unwrap' on type
+//         Option[Str] in 'main' (the bail left the element erased to Int, so the
+//         SECOND .unwrap() has no Option to call into).
+//   C2  same shape, assert_has(c,"blink_Option_str")/assert_lacks(c,"blink_Option_int")
+//         RED — same UnresolvedMethod as C1 (never reaches codegen emission).
+//   C3  Box[List[Result[Int,Str]]], .get(0).unwrap().unwrap()==7, .get(1) is_err
+//         RED — identical UnresolvedMethod shape on Result.
+//   C4  Box[List[Map[Str,Int]]], .get(0).unwrap().get("k").unwrap()==5
+//         RED — identical UnresolvedMethod shape on Map.
+//   C5  Box[List[Option[Point]]], .get(0).unwrap().unwrap().x==3
+//         RED — identical UnresolvedMethod shape (struct leaf inside Option).
+//   C6  Box[List[Option[QBox[Int]]]], .unwrap().unwrap().v==9,
+//         assert_has(c,"blink_QBox_Int")/assert_lacks(c,"blink_Option_QBox;")
+//         RED — identical UnresolvedMethod; would ALSO have been red on the stem
+//         (bare "blink_QBox") had the bail merely been removed without the mono-stem
+//         fix in deep_tp_from_tid (tc_tid_struct_mono_name).
+//   C6b DECLARED `let xs: List[Option[QBox[Int]]] = [Some(QBox{v:9})]`, same asserts
+//         RED — error: unknown type name 'blink_QBox' (the §3 fold-in target: the
+//         declared path's deep_tp_from_ann spelled the bare generic head, not the
+//         mono stem, for a struct/enum leaf nested inside a compound).
+//   C7  Box[List[Option[Map[Str,Int]]]], assert_has(c,"Option_Map_str_int"),
+//         assert_lacks(c,"blink_Option_map"), runtime read-back
+//         RED — identical UnresolvedMethod; the depth witness (a one-level-only
+//         builder would pass C1-C5 and fail only here).
+//   C8  Box[List[Option[Str]]] + `for item in b.v { … }`
+//         RED — identical UnresolvedMethod (the GLOBAL expr_list_elem_type channel
+//         the for-loop lowering reads before the scope var).
+//   C9  Box[List[Result[Int,Str]]], .pop().unwrap().unwrap()==7
+//         RED — identical UnresolvedMethod via the second reader family (pop, not get).
+//   C10 all four (Option/Result/Map + nested Option[Map]) live in one main
+//         RED — identical UnresolvedMethod; ONE shared blink_Box_List symbol serves
+//         every element (jw1pmb's corrected criterion — a clean cc alone proves
+//         nothing for a representation-shared symbol).
+//   C11 NEGATIVE Box[List[Set[Str]]], .get(0).unwrap().len()
+//         Measured GREEN-as-error both before and after this fix — error
+//         [UnresolvedMethod]: unresolved method '.len' on type Set[Str] in 'main'.
+//         Set has NO emit_list_method `get` arm (codegen_methods.bl's dispatch
+//         falls to int64 boxing for anything not VOID/STRUCT/ENUM/STRING/FLOAT/
+//         LIST/MAP/OPTION/RESULT) — there is no parity target, so jcr0zz
+//         deliberately leaves this bailing. See the successor ticket for the gap.
+//   C12 NEGATIVE TWIN, DECLARED `let d: List[Set[Str]] = [Set()]`, same call
+//         same error[UnresolvedMethod] on Set[Str] — proves C11 is PARITY, not a
+//         jcr0zz regression. If C12 ever goes green (Set[T] gets a real `get` arm),
+//         C11 must be revisited — it would then be an actual bug, not a shared gap.
+//   C13 GREEN CONTROL non-generic `type Holder { xs: List[Option[Str]] }`
+//         GREEN already — this shape never reaches recover_list_elem_from_tid at
+//         all (no monomorphized generic struct involved); proves the erased-Int
+//         gate (recover_list_elem_from_tid's call-site check) did not widen past
+//         its intended shape.
+//   C14 GREEN CONTROL Box[List[List[Str]]] + Box[List[Point]] in one main
+//         GREEN already — proves the nested-List `extra` channel (untouched by
+//         this ticket, §4e) and the plain-struct-element (CT_VOID, sname)
+//         convention (jw1pmb) both survived.
+//
+// ── WHAT TO CHECK IF THIS FILE REGRESSES ──
+//  1. `build/blink build --emit c tests/test_jcr0zz_box_list_compound_elem.bl` and
+//     read the error — UnresolvedMethod on Option/Result/Map means the bail block
+//     in recover_list_elem_from_tid (src/codegen_expr.bl) regressed to the old
+//     single `return`.
+//  2. If C1-C5/C8-C10 pass but produce a GARBAGE VALUE at runtime (not a compile
+//     error): the re-bind copy in emit_let_binding/emit_top_level_let
+//     (src/codegen_stmt.bl, the `type_ann == -1` CT_LIST branch) lost its call to
+//     copy_list_compound_elem — the deep tp_id died with the RHS temp var.
+//  3. If C6/C6b fail with an "unknown type name" C compile error: the mono-stem fix
+//     regressed — deep_tp_from_tid (tid side) or deep_tp_from_ann (ann side,
+//     codegen_stmt.bl) reverted to spelling the bare generic head instead of the
+//     mono stem via mono_name_from_ann/register_carrier_inner_mono_instance.
+//  4. If C7 fails specifically (C1-C5 still pass): the builder stopped recursing
+//     past one level — check deep_tp_from_tid's CT_MAP/CT_OPTION arms call
+//     themselves recursively rather than defaulting the inner.
+//  5. If C11/C12 diverge (one errors, the other doesn't): Set gained or lost parity
+//     somewhere outside this ticket's scope — re-triage before touching this file.
+
+import compile_test_helpers
+import std.io
+
+fn assert_has(c: Str, needle: Str, label: Str) {
+    if !c.contains(needle) { io.println("FAIL: {label} — missing '{needle}'") }
+    assert(c.contains(needle))
+}
+
+fn assert_lacks(c: Str, needle: Str, label: Str) {
+    if c.contains(needle) { io.println("FAIL: {label} — forbidden '{needle}' present") }
+    assert(!c.contains(needle))
+}
+
+fn box_decl() -> Str {
+    "type Box[T] \{ v: T }\n"
+}
+
+fn src_c1() -> Str {
+    let mut s = box_decl()
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let b: Box[List[Option[Str]]] = Box \{ v: [Some(\"hello\"), None] }\n")
+    s = s.concat("    let g = b.v\n")
+    s = s.concat("    assert(g.get(0).unwrap().unwrap() == \"hello\")\n")
+    s = s.concat("    assert(g.get(1).unwrap().is_none())\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "C1: Box[List[Option[Str]]] recovers the Option element through an unannotated re-bind" {
+    let r = compile_test_helpers.compile_and_run(src_c1(), "jcr0zz_c1_run")
+    if r.exit_code != 0 { io.println("FAIL: C1 runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+}
+
+test "C2: Box[List[Option[Str]]] carrier is Option_str, not re-erased to Option_int" {
+    let c = compile_test_helpers.compile_and_emit_c(src_c1(), "jcr0zz_c2_c")
+    // blink_Option_int is emitted as baseline stdlib-prelude scaffolding in nearly
+    // every program (verified: present even in `fn main() { let x = 5 }`), so its
+    // presence alone proves nothing here — the precise witness is the wrapping
+    // carrier .get() actually emits for `g`: blink_Option_Option_str (the correct
+    // Str inner) vs. blink_Option_Option_int (what a re-erased-to-Int element would
+    // produce).
+    assert_has(c, "blink_Option_str", "C2 / Str inner carrier present")
+    assert_has(c, "blink_Option_Option_str", "C2 / g.get() wraps the Str carrier, not Int")
+    assert_lacks(c, "blink_Option_Option_int", "C2 / g.get() not re-erased to an Int wrap")
+}
+
+fn src_c3() -> Str {
+    let mut s = box_decl()
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let b: Box[List[Result[Int, Str]]] = Box \{ v: [Ok(7), Err(\"bad\")] }\n")
+    s = s.concat("    let g = b.v\n")
+    s = s.concat("    assert(g.get(0).unwrap().unwrap() == 7)\n")
+    s = s.concat("    assert(g.get(1).unwrap().is_err())\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "C3: Box[List[Result[Int,Str]]] recovers the Result element through an unannotated re-bind" {
+    let r = compile_test_helpers.compile_and_run(src_c3(), "jcr0zz_c3_run")
+    if r.exit_code != 0 { io.println("FAIL: C3 runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+}
+
+fn src_c4() -> Str {
+    let mut s = box_decl()
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let m: Map[Str, Int] = Map()\n")
+    s = s.concat("    m.insert(\"k\", 5)\n")
+    s = s.concat("    let b: Box[List[Map[Str, Int]]] = Box \{ v: [m] }\n")
+    s = s.concat("    let g = b.v\n")
+    s = s.concat("    assert(g.get(0).unwrap().get(\"k\").unwrap() == 5)\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "C4: Box[List[Map[Str,Int]]] recovers the Map element through an unannotated re-bind" {
+    let r = compile_test_helpers.compile_and_run(src_c4(), "jcr0zz_c4_run")
+    if r.exit_code != 0 { io.println("FAIL: C4 runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+}
+
+fn src_c5() -> Str {
+    let mut s = "type Point \{ x: Int, y: Int }\n"
+    s = s.concat(box_decl())
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let b: Box[List[Option[Point]]] = Box \{ v: [Some(Point \{ x: 3, y: 4 })] }\n")
+    s = s.concat("    let g = b.v\n")
+    s = s.concat("    let p = g.get(0).unwrap().unwrap()\n")
+    s = s.concat("    assert(p.x == 3)\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "C5: Box[List[Option[Point]]] recovers a struct leaf nested inside Option" {
+    let r = compile_test_helpers.compile_and_run(src_c5(), "jcr0zz_c5_run")
+    if r.exit_code != 0 { io.println("FAIL: C5 runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+}
+
+fn src_c6() -> Str {
+    let mut s = "type QBox[T] \{ v: T }\n"
+    s = s.concat(box_decl())
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let b: Box[List[Option[QBox[Int]]]] = Box \{ v: [Some(QBox \{ v: 9 })] }\n")
+    s = s.concat("    let g = b.v\n")
+    s = s.concat("    assert(g.get(0).unwrap().unwrap().v == 9)\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "C6: Box[List[Option[QBox[Int]]]] spells the mono STEM, not the bare generic head" {
+    let c = compile_test_helpers.compile_and_emit_c(src_c6(), "jcr0zz_c6_c")
+    assert_has(c, "blink_QBox_Int", "C6 / mono stem present")
+    assert_lacks(c, "blink_Option_QBox;", "C6 / not the bare-head Option carrier")
+    let r = compile_test_helpers.compile_and_run(src_c6(), "jcr0zz_c6_run")
+    if r.exit_code != 0 { io.println("FAIL: C6 runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+}
+
+fn src_c6b() -> Str {
+    let mut s = "type QBox[T] \{ v: T }\n"
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let xs: List[Option[QBox[Int]]] = [Some(QBox \{ v: 9 })]\n")
+    s = s.concat("    assert(xs.get(0).unwrap().unwrap().v == 9)\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "C6b: DECLARED List[Option[QBox[Int]]] also spells the mono stem (the §3 fold-in)" {
+    let c = compile_test_helpers.compile_and_emit_c(src_c6b(), "jcr0zz_c6b_c")
+    assert_has(c, "blink_QBox_Int", "C6b / mono stem present")
+    let r = compile_test_helpers.compile_and_run(src_c6b(), "jcr0zz_c6b_run")
+    if r.exit_code != 0 { io.println("FAIL: C6b runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+}
+
+fn src_c7() -> Str {
+    let mut s = box_decl()
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let m: Map[Str, Int] = Map()\n")
+    s = s.concat("    m.insert(\"k\", 5)\n")
+    s = s.concat("    let b: Box[List[Option[Map[Str, Int]]]] = Box \{ v: [Some(m)] }\n")
+    s = s.concat("    let g = b.v\n")
+    s = s.concat("    assert(g.get(0).unwrap().unwrap().get(\"k\").unwrap() == 5)\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "C7: Box[List[Option[Map[Str,Int]]]] recurses two levels deep (the depth witness)" {
+    let c = compile_test_helpers.compile_and_emit_c(src_c7(), "jcr0zz_c7_c")
+    assert_has(c, "Option_Map_str_int", "C7 / two-level carrier tag present")
+    assert_lacks(c, "blink_Option_map", "C7 / not collapsed to a flat map default")
+    let r = compile_test_helpers.compile_and_run(src_c7(), "jcr0zz_c7_run")
+    if r.exit_code != 0 { io.println("FAIL: C7 runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+}
+
+fn src_c8() -> Str {
+    let mut s = box_decl()
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let b: Box[List[Option[Str]]] = Box \{ v: [Some(\"x\"), None] }\n")
+    s = s.concat("    for item in b.v \{\n")
+    s = s.concat("        if item.is_some() \{ io.println(\"got \{item.unwrap()}\") } else \{ io.println(\"none\") }\n")
+    s = s.concat("    }\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "C8: for-in over b.v reads the Option element through the GLOBAL elem-type channel" {
+    let r = compile_test_helpers.compile_and_run(src_c8(), "jcr0zz_c8_run")
+    if r.exit_code != 0 { io.println("FAIL: C8 runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+    assert(r.out.contains("got x"))
+    assert(r.out.contains("none"))
+}
+
+fn src_c9() -> Str {
+    let mut s = box_decl()
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let b: Box[List[Result[Int, Str]]] = Box \{ v: [Ok(7)] }\n")
+    s = s.concat("    let g = b.v\n")
+    s = s.concat("    assert(g.pop().unwrap().unwrap() == 7)\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "C9: .pop() reads the Result element (the second reader family, independent of .get)" {
+    let r = compile_test_helpers.compile_and_run(src_c9(), "jcr0zz_c9_run")
+    if r.exit_code != 0 { io.println("FAIL: C9 runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+}
+
+fn src_c10() -> Str {
+    let mut s = box_decl()
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let bo: Box[List[Option[Str]]] = Box \{ v: [Some(\"a\")] }\n")
+    s = s.concat("    let br: Box[List[Result[Int, Str]]] = Box \{ v: [Ok(1)] }\n")
+    s = s.concat("    let bm: Box[List[Map[Str, Int]]] = Box \{ v: [Map()] }\n")
+    s = s.concat("    let m: Map[Str, Int] = Map()\n")
+    s = s.concat("    m.insert(\"k\", 9)\n")
+    s = s.concat("    let bom: Box[List[Option[Map[Str, Int]]]] = Box \{ v: [Some(m)] }\n")
+    s = s.concat("    let go = bo.v\n")
+    s = s.concat("    let gr = br.v\n")
+    s = s.concat("    let gm = bm.v\n")
+    s = s.concat("    let gom = bom.v\n")
+    s = s.concat("    assert(go.get(0).unwrap().unwrap() == \"a\")\n")
+    s = s.concat("    assert(gr.get(0).unwrap().unwrap() == 1)\n")
+    s = s.concat("    assert(gm.get(0).unwrap().len() == 0)\n")
+    s = s.concat("    assert(gom.get(0).unwrap().unwrap().get(\"k\").unwrap() == 9)\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "C10: Option/Result/Map/nested-Option-Map slots all live in one main, sharing one symbol" {
+    let c = compile_test_helpers.compile_and_emit_c(src_c10(), "jcr0zz_c10_c")
+    assert_has(c, "blink_Box_List", "C10 / one shared List symbol")
+    assert_lacks(c, "blink_Box_List_Option", "C10 / no per-element List symbol")
+    let r = compile_test_helpers.compile_and_run(src_c10(), "jcr0zz_c10_run")
+    if r.exit_code != 0 { io.println("FAIL: C10 runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+}
+
+fn src_c11() -> Str {
+    let mut s = box_decl()
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let b: Box[List[Set[Str]]] = Box \{ v: [Set()] }\n")
+    s = s.concat("    let g = b.v\n")
+    s = s.concat("    let _n = g.get(0).unwrap().len()\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "C11 NEGATIVE: Box[List[Set[Str]]] stays honestly erased — no parity target" {
+    compile_test_helpers.expect_compile_error(src_c11(), "jcr0zz_c11", "UnresolvedMethod")
+}
+
+fn src_c12() -> Str {
+    "fn main() \{\n    let d: List[Set[Str]] = [Set()]\n    let _n = d.get(0).unwrap().len()\n}\n"
+}
+
+test "C12 NEGATIVE TWIN: DECLARED List[Set[Str]] fails identically — C11 is parity, not a regression" {
+    compile_test_helpers.expect_compile_error(src_c12(), "jcr0zz_c12", "UnresolvedMethod")
+}
+
+fn src_c13() -> Str {
+    "type Holder \{ xs: List[Option[Str]] }\nfn main() \{\n    let h = Holder \{ xs: [Some(\"a\"), None] }\n    assert(h.xs.get(0).unwrap().unwrap() == \"a\")\n}\n"
+}
+
+test "C13 GREEN CONTROL: a non-generic declared List[Option[Str]] field is unaffected" {
+    let r = compile_test_helpers.compile_and_run(src_c13(), "jcr0zz_c13_run")
+    if r.exit_code != 0 { io.println("FAIL: C13 runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+}
+
+fn src_c14() -> Str {
+    let mut s = "type Point \{ x: Int, y: Int }\n"
+    s = s.concat(box_decl())
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let a: Box[List[List[Str]]] = Box \{ v: [[\"a\", \"b\"]] }\n")
+    s = s.concat("    let inner = a.v.get(0).unwrap()\n")
+    s = s.concat("    assert(inner.get(1).unwrap() == \"b\")\n")
+    s = s.concat("    let p: Box[List[Point]] = Box \{ v: [Point \{ x: 3, y: 4 }] }\n")
+    s = s.concat("    assert(p.v.get(0).unwrap().x == 3)\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "C14 GREEN CONTROL: nested List and plain-struct elements are unaffected (§4e untouched)" {
+    let r = compile_test_helpers.compile_and_run(src_c14(), "jcr0zz_c14_run")
+    if r.exit_code != 0 { io.println("FAIL: C14 runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+}

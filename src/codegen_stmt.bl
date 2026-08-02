@@ -92,7 +92,7 @@ import codegen_expr.{
     expr_result_type, mono_instance_arg_tids_from_tid, panic_file_for, segs_from_arg_tids,
     tparams_sl_contains
 }
-import codegen_methods.{resolve_tparam_via_tid}
+import codegen_methods.{resolve_tparam_via_tid, copy_list_compound_elem}
 import codegen_derive.{ct_to_descriptor, desc_primary_ct, descriptor_c_type, descriptor_mangle, emit_promote_elem_into, inner_desc_of, queue_promote_type}
 import diagnostics.{
     Diag, diag_error_at, diag_ice_at, diag_warn_at, diag_file_for_node,
@@ -163,7 +163,7 @@ fn set_list_elem_map_ann(var_name: Str, elem_ann: Int) {
 // `List[Option[Map[K,V]]]` records list→option→map→{k,v} instead of collapsing
 // the Map's K/V to the sv_tp default (Str/Int). Handles the container ctypes it
 // can descend into; anything else lowers to the resolved scalar/struct.
-fn deep_tp_from_ann(ann: Int) -> Int {
+fn deep_tp_from_ann(ann: Int) -> Int ! Codegen.Register {
     let resolved = resolve_tparam_via_tid(node_name(ann), cg_mono_tparams_sl, cg_mono_arg_tids)
     let ct = type_from_name(resolved)
     let elems = node_elements(ann)
@@ -187,7 +187,15 @@ fn deep_tp_from_ann(ann: Int) -> Int {
         return type_iterator(deep_tp_from_ann(sublist_get(elems, 0)))
     }
     if is_struct_or_enum_type(resolved) != 0 {
-        return type_struct(resolved)
+        // br jcr0zz (folded-in fix, §3): a bare generic head (`resolved` alone,
+        // e.g. `QBox`) is never typedef'd on its own — only mono instances are
+        // (br tydqe6) — so a nested struct/enum leaf must spell the mono STEM
+        // (`QBox_Int`), mirroring the declared List[T] element branch below
+        // (:3319-3321). register_carrier_inner_mono_instance emits that
+        // instance's typedef so the stem this returns actually exists in C.
+        let stem = mono_name_from_ann(strip_module_qualifier(resolved), ann, -1, [])
+        let _reg = register_carrier_inner_mono_instance(resolved, ann)
+        return type_struct(if stem != "" { stem } else { resolved })
     }
     sv_tp(ct, -1, -1, "")
 }
@@ -203,7 +211,7 @@ fn deep_tp_from_ann(ann: Int) -> Int {
 // deep set_list_elem_option_tp / set_list_elem_result_tp.
 // Returns 1 when it handled the element (Option/Result), 0 otherwise so the caller
 // keeps its existing dispatch for non-compound elements.
-fn set_list_elem_compound_ann(var_name: Str, elem_ann: Int, elem_ct: Int) -> Int {
+fn set_list_elem_compound_ann(var_name: Str, elem_ann: Int, elem_ct: Int) -> Int ! Codegen.Register {
     if elem_ct == CT_OPTION {
         let inner_sl = node_elements(elem_ann)
         if inner_sl != -1 && sublist_length(inner_sl) >= 1 {
@@ -3426,6 +3434,13 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
     }
     if val_type == CT_LIST && expr_list_elem_type >= 0 && type_ann == -1 {
         set_list_elem_type(name, expr_list_elem_type)
+        // jcr0zz: a compound element (Option/Result/Map) recovered onto val_str by
+        // recover_list_elem_from_tid (a field-access temp) carries its deep tp_id —
+        // the flat set_list_elem_type above only stamps the shallow CT marker, so
+        // without this the deep inner dies with val_str when `name` re-binds it.
+        if expr_list_elem_type == CT_OPTION || expr_list_elem_type == CT_RESULT || expr_list_elem_type == CT_MAP {
+            copy_list_compound_elem(val_str, name)
+        }
         expr_list_elem_type = -1
         let src_struct = get_list_elem_struct(val_str)
         if src_struct != "" {
@@ -8286,6 +8301,13 @@ pub fn emit_top_level_let(node: Int, extern_only: Int) ! Codegen.Emit, Codegen.R
     }
     if val_type == CT_LIST && expr_list_elem_type >= 0 && type_ann == -1 {
         set_list_elem_type(name, expr_list_elem_type)
+        // jcr0zz: a compound element (Option/Result/Map) recovered onto val_str by
+        // recover_list_elem_from_tid (a field-access temp) carries its deep tp_id —
+        // the flat set_list_elem_type above only stamps the shallow CT marker, so
+        // without this the deep inner dies with val_str when `name` re-binds it.
+        if expr_list_elem_type == CT_OPTION || expr_list_elem_type == CT_RESULT || expr_list_elem_type == CT_MAP {
+            copy_list_compound_elem(val_str, name)
+        }
         expr_list_elem_type = -1
         let src_struct = get_list_elem_struct(val_str)
         if src_struct != "" {
