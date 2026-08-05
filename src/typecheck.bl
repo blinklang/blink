@@ -2423,9 +2423,16 @@ fn is_builtin_hashable(name: Str) -> Int {
 // rules can decide NOMINALLY: a hashable builtin, a Float width, or a declared struct/enum
 // (which also keeps alias chains walking, since an intermediate alias is itself a named type).
 // Anything else leaves the declared name in place and the caller's behavior unchanged.
+// "Tuple" is deliberately excluded even though is_primitive_type recognizes it: a NAME
+// carries no type arguments, so a tuple alias (`type Pair = (Float, Float)`) resolves to
+// the bare name "Tuple" with no element nodes to recurse into, and Tuple's hashability
+// depends entirely on its elements. Every OTHER primitive name is decided by the name
+// alone regardless of its own type arguments — a container (List/Map/Set/Option/Result)
+// is never Hash no matter what it holds, same for Bytes/StringBuilder/Fn/etc — so hopping
+// to one of those and rejecting immediately is sound without seeing inside it.
 fn alias_name_decidable(name: Str) -> Int {
-    if is_builtin_hashable(name) != 0 { return 1 }
-    if name == "Float" || name == "F32" || name == "F64" { return 1 }
+    if name == "Tuple" { return 0 }
+    if is_primitive_type(name) != 0 { return 1 }
     let bare = strip_module_qualifier(name)
     if named_type_map.contains_key(name) || named_type_map.contains_key(bare) { return 1 }
     0
@@ -2482,6 +2489,16 @@ fn validate_map_key(key_ann: Int) ! Diag.Report {
     // half — @derive on the alias would be the category error described above.
     if named_type_map.contains_key(key_name) || named_type_map.contains_key(bare) {
         diag_error_at("MapKeyNotHashable", MAP_KEY_NOT_HASHABLE, "Map key type '{decl_name}' does not implement Hash — user types used as Map keys must carry the @derive(Hash, Eq) annotation", key_ann, "add @derive(Hash, Eq) to the '{key_name}' type definition")
+        return
+    }
+    // Deny-by-default: is_primitive_type enumerates every concrete builtin name the
+    // compiler knows (List/Map/Set/Option/Result, Bytes, StringBuilder, Fn, ...). None of
+    // them implement Hash, and none of them can gain one via @derive, so any name it
+    // recognizes here is a known rejection rather than a missing diagnostic. A name it
+    // does NOT recognize, and that is also not a registered user type, is a generic type
+    // parameter opaque at this point — deferred to later phases, same as always.
+    if is_primitive_type(key_name) != 0 {
+        diag_error_at("MapKeyNotHashable", MAP_KEY_NOT_HASHABLE, "Map key type '{decl_name}' does not implement Hash — {key_name} has no Hash/Eq implementation in v1 (containers, Bytes, StringBuilder, and fn types cannot be Map keys)", key_ann, "use a hashable scalar (Int/sized-int/Bool/Char/Str), a tuple of hashable types, or a @derive(Hash, Eq) struct/enum as the key instead")
     }
 }
 
@@ -2518,6 +2535,13 @@ fn validate_set_elem(elem_ann: Int) ! Diag.Report {
     }
     if named_type_map.contains_key(elem_name) || named_type_map.contains_key(bare) {
         diag_error_at("MapKeyNotHashable", MAP_KEY_NOT_HASHABLE, "Set element type '{decl_name}' does not implement Hash — user types used as Set elements must carry the @derive(Hash, Eq) annotation", elem_ann, "add @derive(Hash, Eq) to the '{elem_name}' type definition")
+        return
+    }
+    // Deny-by-default — see validate_map_key's twin comment. A name is_primitive_type
+    // recognizes is a known-concrete builtin with no Hash impl; anything else unresolved
+    // is a generic type parameter and stays deferred.
+    if is_primitive_type(elem_name) != 0 {
+        diag_error_at("MapKeyNotHashable", MAP_KEY_NOT_HASHABLE, "Set element type '{decl_name}' does not implement Hash — {elem_name} has no Hash/Eq implementation in v1 (containers, Bytes, StringBuilder, and fn types cannot be Set elements)", elem_ann, "use a hashable scalar (Int/sized-int/Bool/Char/Str), a tuple of hashable types, or a @derive(Hash, Eq) struct/enum as the element instead")
     }
 }
 
@@ -5936,7 +5960,7 @@ fn is_trait_name(name: Str) -> Int {
 }
 
 fn is_primitive_type(name: Str) -> Int {
-    if name == "Int" || name == "Float" || name == "Bool" || name == "Str" { return 1 }
+    if name == "Int" || name == "Float" || name == "F32" || name == "F64" || name == "Bool" || name == "Str" { return 1 }
     if name == "Void" || name == "List" || name == "Option" || name == "Result" { return 1 }
     if name == "Iterator" || name == "Handle" || name == "Channel" || name == "Map" || name == "Set" { return 1 }
     if name == "Bytes" || name == "Instant" || name == "Duration" || name == "Char" || name == "StringBuilder" { return 1 }

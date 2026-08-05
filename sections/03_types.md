@@ -1734,6 +1734,8 @@ A function whose result depends on unsorted `Map`/`Set` iteration order is **not
 
 **Float keys.** `F32`/`F64` do not implement `Hash`, and a `Float` (or any type transitively containing one) used as a `Map`/`Set` key is rejected at type-check as `E1400 MapKeyNotHashable`. This is a permanent contract, not a missing impl: float equality cannot satisfy the `Eq`/`Hash` coherence law — `-0.0 == 0.0` holds while the two have distinct bit patterns, so a bitwise hash would map equal values to different buckets. Round to an integer key instead.
 
+**Non-hashable keys and elements in general.** Only builtin scalars (`Int`, sized ints, `Bool`, `Char`, `Str`), a tuple whose elements are all hashable, and a user `struct`/`enum` carrying `@derive(Hash, Eq)` implement `Hash`. Every other type — every container (`List`, `Map`, `Set`, `Option`, `Result`), `Bytes`, `StringBuilder`, and any `fn`/closure type — has no `Hash` impl and cannot gain one via `@derive`, so using one as a `Map` key or `Set` element is rejected at type-check as `E1400 MapKeyNotHashable`, the same code as the Float case above. A tuple is hashable **if and only if** every one of its elements is; `(Int, Option[Int])` is rejected because its second element is not, even though `(Int, Str)` is accepted.
+
 For pinning the seed (golden-file tests, fixture-driven runners, self-hosting diff stability) and for the `--deterministic` flag and `BLINK_MAP_SEED` environment variable, see §8.10.
 
 #### The `final` Modifier

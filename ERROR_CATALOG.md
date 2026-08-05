@@ -45,6 +45,7 @@ error[NonExhaustiveMatch]: non-exhaustive match
 | E09xx | Module capabilities / trait contracts |
 | E10xx | Module resolution / imports |
 | E13xx | Refinement contracts (predicate sublanguage) |
+| E14xx | Generic collections / Hash + Eq bounds |
 | I00xx | Internal compiler errors (ICE) |
 
 ---
@@ -159,6 +160,8 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | AssignmentInPredicate | E1306 | Predicate contains an assignment | Refinement contracts | §3b |
 | ImpureBodyForPureAnnotation | E1307 | `@pure` function body contains a non-pure construct | Refinement contracts | §3b |
 | ModifiesArgNotSimplePath | E1308 | `@modifies` argument is not a simple path | Refinement contracts | §3b |
+| MapKeyNotHashable | E1400 | `Map` key / `Set` element type does not implement `Hash` (Float, container, `Bytes`/`StringBuilder`, `fn`, or non-derived user type) | Generic collections | §3.6 |
+| NonDerivableTrait | E1401 | A `@derive(Hash/Eq/Ord)` field's type does not implement the derived trait | Generic collections | §3.6 |
 
 ---
 
