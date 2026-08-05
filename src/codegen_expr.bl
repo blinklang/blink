@@ -2806,7 +2806,10 @@ type TidTupleElem { ct: Int, struct_tag: Str, ok: Bool }
 // tc_tid_tuple_elem_encodable, the gate that decides which slots get here at all.
 fn ensure_tuple_carrier_from_tid(tid: Int) -> Str {
     let c_name = tc_tid_tuple_sname(tid)
-    if c_name == "" { return "" }
+    // "" and a bare ICE_SEG_* sentinel (br vbcw1e Stage 2: tc_tid_tuple_sname can now
+    // answer one for a tuple with a non-genuine element) both mean "cannot register a
+    // real carrier under this name" — decline rather than typedef'ing the sentinel.
+    if c_name == "" || diag_is_ice_seg(c_name) { return "" }
     if find_tuple_entry(c_name) >= 0 {
         ensure_tuple_kops_key(c_name)
         return c_name
@@ -2840,9 +2843,14 @@ fn tid_tuple_elem_enc(tid0: Int) -> TidTupleElem {
     // registered first — emit_tuple_typedef's dep loop then emits the inner typedef
     // ahead of the outer one. Recurse before anything else: tc_tid_ct has no TK_TUPLE
     // arm (it would read -1 and decline).
-    if tc_tid_tuple_sname(tid) != "" {
+    let tuple_sname = tc_tid_tuple_sname(tid)
+    // Non-"" no longer means "a real tuple carrier" on its own (br vbcw1e Stage 2):
+    // tc_tid_tuple_sname now recurses tc_tid_inner_tag, which can answer a bare
+    // ICE_SEG_* sentinel for a non-genuine element — decline rather than register a
+    // typedef under that name.
+    if tuple_sname != "" && !diag_is_ice_seg(tuple_sname) {
         let inner = ensure_tuple_carrier_from_tid(tid)
-        if inner == "" { return TidTupleElem { ct: CT_VOID, struct_tag: "", ok: false } }
+        if inner == "" || diag_is_ice_seg(inner) { return TidTupleElem { ct: CT_VOID, struct_tag: "", ok: false } }
         return TidTupleElem { ct: CT_VOID, struct_tag: inner, ok: true }
     }
     // Struct or enum (tc_tid_struct covers both kinds): embedded by value under
@@ -2850,7 +2858,10 @@ fn tid_tuple_elem_enc(tid0: Int) -> TidTupleElem {
     // spelling resolve_tuple_ann's struct/enum arm produces.
     if tc_tid_struct(tid) != "" {
         let tag = tc_tid_inner_tag(tid)
-        if tag == "" { return TidTupleElem { ct: CT_VOID, struct_tag: "", ok: false } }
+        // Decline on "" (unreachable today — kept for symmetry) or on a bare ICE_SEG_*
+        // sentinel (br vbcw1e Stage 2: tc_tid_inner_tag can now answer one instead of
+        // erasing to "void") — either way this element isn't a real spellable carrier.
+        if tag == "" || diag_is_ice_seg(tag) { return TidTupleElem { ct: CT_VOID, struct_tag: "", ok: false } }
         return TidTupleElem { ct: CT_VOID, struct_tag: tag, ok: true }
     }
     let ct = tc_tid_ct(tid)
@@ -2859,8 +2870,9 @@ fn tid_tuple_elem_enc(tid0: Int) -> TidTupleElem {
         // Decline on an unspellable inner, symmetrically with the struct arm above. An
         // empty tag would encode as "-" (the scalar spelling) while ct still said
         // CT_OPTION, so emit_tuple_typedef would emit a carrier-typed field with no
-        // carrier registered for it.
-        if tag == "" { return TidTupleElem { ct: CT_VOID, struct_tag: "", ok: false } }
+        // carrier registered for it. A bare ICE_SEG_* sentinel (br vbcw1e Stage 2) is the
+        // same class of non-spellable inner and declines the same way.
+        if tag == "" || diag_is_ice_seg(tag) { return TidTupleElem { ct: CT_VOID, struct_tag: "", ok: false } }
         ensure_carrier_from_tag(tag)
         return TidTupleElem { ct: ct, struct_tag: tag, ok: true }
     }
@@ -2877,7 +2889,8 @@ fn tid_tuple_elem_enc(tid0: Int) -> TidTupleElem {
     // must not answer it differently.)
     if ct == CT_MAP {
         let tag = tc_tid_inner_tag(tid)
-        if tag == "" { return TidTupleElem { ct: CT_VOID, struct_tag: "", ok: false } }
+        // Same ICE_SEG_* decline as the arms above (br vbcw1e Stage 2).
+        if tag == "" || diag_is_ice_seg(tag) { return TidTupleElem { ct: CT_VOID, struct_tag: "", ok: false } }
         return TidTupleElem { ct: ct, struct_tag: tag, ok: true }
     }
     // Scalars, and the containers whose tuple field is a uniform pointer
@@ -6940,14 +6953,23 @@ fn emit_tuple_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Di
         if sn == "" && is_compound_ct(expr_result_type) != 0 {
             if expr_result_type == CT_OPTION {
                 if elem_rides_tid && tc_tid_ct(elem_tid) == CT_OPTION {
-                    ctag = "Option_{tc_tid_inner_tag(tc_tid_option_inner_tid(elem_tid))}"
+                    // Collapse, never interpolate (br vbcw1e Stage 2): tc_tid_inner_tag can
+                    // now answer a bare ICE_SEG_* sentinel; embedding it in "Option_{...}"
+                    // would hide it from diag_is_ice_seg's prefix test at the mono-CSV
+                    // chokepoints downstream.
+                    let inner = tc_tid_inner_tag(tc_tid_option_inner_tid(elem_tid))
+                    ctag = if diag_is_ice_seg(inner) { inner } else { "Option_{inner}" }
                 } else {
                     let inner_tag = if expr_option_inner_struct != "" { canonical_struct_tag(expr_option_inner_struct) } else { c_type_tag(expr_option_inner) }
                     ctag = "Option_{inner_tag}"
                 }
             } else if expr_result_type == CT_RESULT {
                 if elem_rides_tid && tc_tid_ct(elem_tid) == CT_RESULT {
-                    ctag = "Result_{tc_tid_inner_tag(tc_tid_result_ok_tid(elem_tid))}_{tc_tid_inner_tag(tc_tid_result_err_tid(elem_tid))}"
+                    // Collapse, never interpolate (br vbcw1e Stage 2) — same rule as the
+                    // Option arm above.
+                    let ok = tc_tid_inner_tag(tc_tid_result_ok_tid(elem_tid))
+                    let err = tc_tid_inner_tag(tc_tid_result_err_tid(elem_tid))
+                    ctag = if diag_is_ice_seg(ok) { ok } else if diag_is_ice_seg(err) { err } else { "Result_{ok}_{err}" }
                 } else {
                     let ok_tag = if expr_result_ok_struct != "" { canonical_struct_tag(expr_result_ok_struct) } else { c_type_tag(expr_result_ok_type) }
                     let err_tag = if expr_result_err_struct != "" { canonical_struct_tag(expr_result_err_struct) } else { c_type_tag(expr_result_err_type) }

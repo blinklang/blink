@@ -18,7 +18,7 @@ import diagnostics.{
     Diag, diag_clear_allows, diag_error_at, diag_error_at_notes, diag_error_no_loc,
     diag_push_allows, diag_warn_at,
     ICE_SEG_UNSOLVED_TYPEVAR, ICE_SEG_UNHANDLED_KIND, ICE_SEG_TID_OUT_OF_RANGE,
-    ICE_SEG_ERASED_SLOT,
+    ICE_SEG_ERASED_SLOT, diag_is_ice_seg,
     TYPE_ERROR, CANNOT_INFER_TYPE, CAPABILITY_BUDGET, QM_INVALID_OPERAND, UNDEFINED_FUNCTION,
     UNRESOLVED_METHOD, AMBIGUOUS_METHOD_CALL, MISSING_DISPLAY_IMPL,
     UNDEFINED_VARIABLE, UNKNOWN_TYPE, QM_RESULT_IN_NON_RESULT,
@@ -578,14 +578,19 @@ fn make_list_type(inner: Int) -> Int {
     t
 }
 
-fn make_option_type(inner: Int) -> Int {
+// `pub` FOR THE TEST ONLY — same precedent as make_fn_type below: proving the
+// collapse-not-interpolate arms in tc_tid_inner_tag/tc_tid_to_c_tag (br vbcw1e Stage 2)
+// requires constructing an Option/Result/Map wrapping an unbound metavar directly, which
+// no surface program can do (an unbound metavar never survives to a fully-typechecked
+// program — it either binds or raises E0301 at the boundary).
+pub fn make_option_type(inner: Int) -> Int {
     let t = new_type(TK_OPTION, "Option")
     let e = ty_pool.get(t).unwrap()
     ty_pool.set(t, TypePoolEntry { inner1: inner, ..e })
     t
 }
 
-fn make_result_type(ok_type: Int, err_type: Int) -> Int {
+pub fn make_result_type(ok_type: Int, err_type: Int) -> Int {
     let t = new_type(TK_RESULT, "Result")
     let e = ty_pool.get(t).unwrap()
     ty_pool.set(t, TypePoolEntry { inner1: ok_type, inner2: err_type, ..e })
@@ -616,7 +621,8 @@ fn make_typevar(name: Str) -> Int {
     new_type(TK_TYPEVAR, name)
 }
 
-fn make_tuple_type(elem_types: List[Int]) -> Int {
+// `pub` FOR THE TEST ONLY — see make_option_type above.
+pub fn make_tuple_type(elem_types: List[Int]) -> Int {
     let t = new_type(TK_TUPLE, "Tuple")
     let start = ty_param_list.len()
     let mut i = 0
@@ -679,7 +685,8 @@ fn make_enum_instance_type(base_name: Str, arg_types: List[Int]) -> Int {
 }
 
 
-fn make_map_type(key_type: Int, value_type: Int) -> Int {
+// `pub` FOR THE TEST ONLY — see make_option_type above.
+pub fn make_map_type(key_type: Int, value_type: Int) -> Int {
     let t = new_type(TK_MAP, "Map")
     let e = ty_pool.get(t).unwrap()
     ty_pool.set(t, TypePoolEntry { inner1: key_type, inner2: value_type, ..e })
@@ -710,7 +717,12 @@ fn make_set_type(elem_type: Int) -> Int {
 // The shared TYPE_UNKNOWN singleton keeps inner1 == -1 forever (never a per-binding
 // α, never bound), so resolve() is the identity on it — Stage-1-safe.
 
-fn make_metavar() -> Int {
+// `pub` FOR THE TEST ONLY — same precedent as make_fn_type. Constructing an unbound
+// metavar directly is the only way to prove tc_tid_scalar_tag/tc_tid_inner_tag's
+// TK_UNKNOWN arm (br vbcw1e Stage 2) actually fires: no fully-typechecked surface
+// program can produce one, since check_types resolves or E0301's every metavar at
+// the region boundary (8vcj2c) before codegen ever sees it.
+pub fn make_metavar() -> Int {
     // A fresh, independently-bindable α. NOT the shared TYPE_UNKNOWN singleton.
     new_type(TK_UNKNOWN, "?")
 }
@@ -10154,7 +10166,15 @@ fn type_to_str(tid0: Int) -> Str {
 // Option_Str). Struct/enum inners carry their stripped name, matching
 // compound_tag_from_ca's `if sn != "" { sn } else { c_type_tag(ct) }`.
 fn tc_tid_scalar_tag(tid: Int) -> Str {
-    if tid < 0 || tid >= ty_pool.len() { return "void" }
+    // br vbcw1e Stage 2: armed. Structurally dead through this function's ONLY caller
+    // (tc_tid_inner_tag's tail), which has already range-checked `tid` before delegating
+    // here — so this bucket measured 0 over the full corpus (Stage 1). Kept (not deleted)
+    // so a future direct caller fails the same way tc_tid_inner_tag's own guard does,
+    // rather than indexing ty_pool out of bounds or silently spelling a bad index "void".
+    if tid < 0 || tid >= ty_pool.len() {
+        if dbg_channel_on("voidtwin") != 0 { dbg_trace("voidtwin", "producer=scalar_out_of_range tid={tid} pool_len={ty_pool.len()}") }
+        return ICE_SEG_TID_OUT_OF_RANGE
+    }
     let k = ty_pool.get(tid).unwrap().kind
     if k == TK_INT { return "int" }
     if k == TK_FLOAT { return "double" }
@@ -10178,39 +10198,75 @@ fn tc_tid_scalar_tag(tid: Int) -> Str {
     if k == TK_U64 { return "u64" }
     if k == TK_CHAR { return "char" }
     // A GENUINE Void, answered deliberately (the twin of tc_tid_to_c_tag's TK_VOID arm).
-    if k == TK_VOID { return "void" }
     //
-    // THIS FALL-THROUGH IS LOAD-BEARING AND MUST NOT BE ARMED (br hsgsbp).
+    // THIS ARM IS LOAD-BEARING AND MUST NOT BE DELETED (br hsgsbp / br vbcw1e).
     //
-    // The lowercase "void" carries exactly the same triple meaning its uppercase twin
-    // tc_tid_to_c_tag did before br hsgsbp — genuine Void, an unhandled kind, and an
-    // out-of-range tid all land here. Stage C of br hsgsbp split those apart UP THERE by
-    // returning a BLINK_I0001_* sentinel. Doing the same HERE would be a miscompile, not a
-    // fix, because unlike the uppercase path this string is CONSUMED as a real C type tag:
+    // An earlier version of this comment attached that constraint to the fall-through
+    // at the bottom of this function instead of here — wrong, and worth recording why:
+    // tc_tid_to_c_tag's TK_RESULT arm spells Result[Void, Str] as
+    // "Result_{tc_tid_inner_tag(inner1)}_{...}", and tc_tid_inner_tag(void_tid) delegates
+    // to tc_tid_scalar_tag(void_tid), which matches THIS arm before it ever reaches the
+    // fall-through below — so Result_void_str's "void" comes from here, full stop.
+    // src/codegen_types.bl's result-typedef emitter MATCHES that literal tag
+    // (`if ok_tag == "void" || ok_tag == "Void"`) to lower the Void leaf to an int64_t
+    // placeholder field; deleting this arm (or changing what it returns) would miss that
+    // match and emit an undeclared type. Result[Void, E] is not a corner case: lib/std/
+    // depends on it (bytes.bl, db_sqlite.bl, traits.bl) and the compiler synthesizes it
+    // for EVERY `?`-bearing `test` block. The fall-through below is a SEPARATE bucket
+    // (kinds with no arm at all — TK_FN, TK_CLOSURE) that a genuine Void never reaches,
+    // and arming IT (br vbcw1e Stage 2) does not touch this one.
     //
-    //   tc_tid_to_c_tag's TK_RESULT arm spells Result[Void, Str] as
-    //   "Result_{tc_tid_inner_tag(inner1)}_{...}" = Result_void_str, and
-    //   src/codegen_types.bl's result-typedef emitter MATCHES the literal tag "void" there
-    //   (`if ok_tag == "void" || ok_tag == "Void"`) to lower the Void leaf to an int64_t
-    //   placeholder field. A sentinel would miss that match and emit an undeclared type.
-    //
-    // Result[Void, E] is not a corner case: lib/std/ depends on it (bytes.bl, db_sqlite.bl,
-    // traits.bl) and the compiler synthesizes it for EVERY `?`-bearing `test` block.
-    //
-    // So the inner twin needs a DIFFERENT remedy than the outer one — separate ticket. If
-    // you arrived here intending to "finish the job" that br hsgsbp started on the
-    // uppercase path: this is the arm that looks identical and is not. Measure
-    // Result_void_str first.
-    "void"
+    // VERIFIED, not just traced: the 728-file corpus sweep for this arm's `voidtwin` tap
+    // reads 0 — that is a coverage gap, not a safety fact (feedback_corpus_sweep_is_not_
+    // coverage: no corpus file happens to instantiate a generic fn/struct over a
+    // Result[Void,_]/Option[Void] argument, which is what actually drives a call here).
+    // Constructing that shape by hand (a generic `identity[T]` called with a
+    // `Result[Void, Str]` argument) reaches this exact arm via the real, ungated caller
+    // chain — tid_instance_mono_args_csv / tc_seg_from_tid → tc_tid_to_c_tag →
+    // tc_tid_inner_tag → here — firing 12 times in one tiny file. That MVCE is the actual
+    // load-bearing witness for this arm, not the corpus.
+    if k == TK_VOID {
+        // Gated explicitly (not just relying on dbg_trace's own internal gate): this arm is a
+        // hot path — Result[Void, E] is synthesized for every `?`-bearing test block — so the
+        // message must not be built when the channel is off (see kops_elem_from_container_ann's
+        // kopsctor tap for the same "not zero-cost when unset" concern).
+        if dbg_channel_on("voidtwin") != 0 { dbg_trace("voidtwin", "producer=scalar_genuine_void tid={tid}") }
+        return "void"
+    }
+    // An unbound metavariable: this is the erased-default bucket DECISIONS.md:342 forbids —
+    // an unsolved α reaching codegen must ICE, never silently spell "void" (which the same
+    // kind DOES answer correctly at top level, via tc_tid_to_c_tag's own TK_UNKNOWN arm,
+    // gqg3rk). Stage 1 measured this bucket's floor at 0 over the full corpus; it is
+    // reachable in principle only if some future caller stops routing an unbound metavar
+    // away via tc_tid_encodable/tc_tid_inner_tag_faithful (the gates this ticket's parent,
+    // qerbc7, retires) and lets it ride the tid path instead — exactly the failure this arm
+    // now forecloses at the source, rather than depending on every caller's gate agreeing.
+    if k == TK_UNKNOWN {
+        if dbg_channel_on("voidtwin") != 0 { dbg_trace("voidtwin", "producer=scalar_unsolved_typevar tid={tid}") }
+        return ICE_SEG_UNSOLVED_TYPEVAR
+    }
+    // Every kind with a real arm above is exhausted, and TK_VOID/TK_UNKNOWN are both
+    // intercepted above too, so this is reached only by a kind this speller never learned
+    // (TK_FN, TK_CLOSURE — the only two reachable through this function's sole caller,
+    // tc_tid_inner_tag's tail, which itself handles STRUCT/ENUM/OPTION/RESULT/MAP/TUPLE/
+    // TYPEVAR before delegating here). Stage 1 measured this bucket's floor at 0 over the
+    // full corpus. Safe to arm because, per the TK_VOID arm's comment above, a genuine Void
+    // can never reach this line — only a kind this speller genuinely never learned does.
+    if dbg_channel_on("voidtwin") != 0 { dbg_trace("voidtwin", "producer=scalar_unhandled_kind tid={tid} k={k}") }
+    ICE_SEG_UNHANDLED_KIND
 }
 
+// Companion to tc_tid_scalar_tag, answering the question that function is forbidden to
 // Codegen tag for the INNER of a compound carrier. Struct/enum → stripped name,
 // nested compound → recurse (Option[Result[..]]), else lowercase scalar tag.
 // Mirrors codegen_types.resolve_ann_tag's inner behavior but reads the tid
 // structurally instead of guessing from a flattened string.
 pub fn tc_tid_inner_tag(tid0: Int) -> Str {
     let tid = tc_resolve(tid0)
-    if tid < 0 || tid >= ty_pool.len() { return "void" }
+    if tid < 0 || tid >= ty_pool.len() {
+        if dbg_channel_on("voidtwin") != 0 { dbg_trace("voidtwin", "producer=inner_out_of_range tid0={tid0} tid={tid} pool_len={ty_pool.len()}") }
+        return ICE_SEG_TID_OUT_OF_RANGE
+    }
     let t = ty_pool.get(tid).unwrap()
     let k = t.kind
     if k == TK_STRUCT || k == TK_ENUM {
@@ -10224,11 +10280,39 @@ pub fn tc_tid_inner_tag(tid0: Int) -> Str {
         if underlying != -1 { return tc_tid_inner_tag(underlying) }
         return c_type_tag_for_struct(t.name)
     }
-    if k == TK_OPTION { return "Option_{tc_tid_inner_tag(t.inner1)}" }
-    if k == TK_RESULT { return "Result_{tc_tid_inner_tag(t.inner1)}_{tc_tid_inner_tag(t.inner2)}" }
-    if k == TK_MAP { return "Map_{tc_tid_inner_tag(t.inner1)}_{tc_tid_inner_tag(t.inner2)}" }
+    // Collapse, never interpolate (br vbcw1e Stage 2): a recursive tc_tid_inner_tag call can
+    // now itself return a bare ICE_SEG_* sentinel (out-of-range / unsolved metavar /
+    // unhandled kind). Interpolating that into "Option_{inner}" would yield
+    // "Option_BLINK_I0001_..." — a legal C identifier diag_is_ice_seg's prefix test would
+    // never recognize, silently degrading a compiler-invariant violation into an opaque `cc`
+    // error (the exact hazard this ticket's parent, qerbc7, exists to close). So check each
+    // inner BEFORE interpolating and, if it is non-genuine, propagate it whole instead.
+    if k == TK_OPTION {
+        let inner = tc_tid_inner_tag(t.inner1)
+        if diag_is_ice_seg(inner) { return inner }
+        return "Option_{inner}"
+    }
+    if k == TK_RESULT {
+        let ok = tc_tid_inner_tag(t.inner1)
+        if diag_is_ice_seg(ok) { return ok }
+        let err = tc_tid_inner_tag(t.inner2)
+        if diag_is_ice_seg(err) { return err }
+        return "Result_{ok}_{err}"
+    }
+    if k == TK_MAP {
+        let key = tc_tid_inner_tag(t.inner1)
+        if diag_is_ice_seg(key) { return key }
+        let val = tc_tid_inner_tag(t.inner2)
+        if diag_is_ice_seg(val) { return val }
+        return "Map_{key}_{val}"
+    }
     if k == TK_TUPLE { return tc_tid_tuple_tag(t) }
-    if k == TK_TYPEVAR { return "<tv>" }
+    if k == TK_TYPEVAR {
+        // Gated explicitly: an unresolved generic type param is a common inner in
+        // generic-heavy code, so this must not build the message when the channel is off.
+        if dbg_channel_on("voidtwin") != 0 { dbg_trace("voidtwin", "producer=inner_typevar tid={tid}") }
+        return "<tv>"
+    }
     tc_tid_scalar_tag(tid)
 }
 
@@ -10238,10 +10322,37 @@ fn tc_tid_tuple_tag(t: TypePoolEntry) -> Str {
     let mut tag = "Tuple{count}"
     let mut i = 0
     while i < count {
-        tag = tag.concat("_").concat(tc_tid_inner_tag(ty_param_list.get(start + i).unwrap()))
+        // Collapse, never interpolate (br vbcw1e Stage 2) — same rule as the OPTION/RESULT/
+        // MAP arms above: an ICE_SEG_* element must replace the whole tag, not get
+        // concatenated into it.
+        let elem = tc_tid_inner_tag(ty_param_list.get(start + i).unwrap())
+        if diag_is_ice_seg(elem) { return elem }
+        tag = tag.concat("_").concat(elem)
         i = i + 1
     }
     tag
+}
+
+// Prints the qerbc7 counterfactual for a single gate rejection (br vbcw1e): what the now-
+// armed tc_tid_inner_tag answers for `tid` when a caller's gate (tc_tid_encodable /
+// tc_tid_inner_tag_faithful) has just declined to route it onto the tid path. Since Stage 2,
+// tc_tid_inner_tag IS the ICE-or-genuine answer — no separate shadow predicate to keep in
+// lockstep — so this only needs to call it and check diag_is_ice_seg on the result. Gated on
+// the channel first so a cold run skips the extra structural walk on every rejection — every
+// caller site is on a generic call's hot path pre-monomorphization.
+//
+// Callers narrow `tid` to a scalar/typevar/unknown leaf before its own gate check, with one
+// exception: tc_tid_inner_tag_faithful's params_count!=0 branch also reaches a non-STRUCT/ENUM
+// compound tid here (e.g. a TK_TUPLE with arity>0, via its "faithful_reject_paramcount" call) —
+// harmless, since tc_tid_inner_tag's own TK_TUPLE arm spells it structurally rather than falling
+// through to tc_tid_scalar_tag, so diag_is_ice_seg never fires for a genuine compound. A
+// struct/enum tid can also legitimately answer a non-ICE erased name here (the STRUCT/ENUM arm's
+// own give-up path, a separate undischarged concern, not this probe's job to flag).
+fn voidtwin_probe(gate: Str, tid: Int) {
+    if dbg_channel_on("voidtwin") == 0 { return }
+    let spelled = tc_tid_inner_tag(tid)
+    if !diag_is_ice_seg(spelled) { return }
+    dbg_trace("voidtwin", "probe=gate_reject gate={gate} tid={tid} k={type_kind(tid)} would_ice={spelled}")
 }
 
 // TK_* → CT_* translation. The two numberings are NOT the same (e.g. TK_MAP=18
@@ -10602,6 +10713,12 @@ pub fn tc_tid_struct_mono_name(tid: Int) -> Str {
         let slot = ty_param_list.get(t.params_start + i).unwrap()
         let seg = tc_tid_struct_slot_seg(slot)
         if seg == "" { return "" }
+        // Collapse, never interpolate (br vbcw1e): tc_tid_struct_slot_seg can answer a bare
+        // ICE_SEG_* sentinel (e.g. a TK_FN/TK_CLOSURE slot via tc_tid_to_c_tag's unhandled-kind
+        // arm). Concatenating it here would bury it mid-identifier (Box_int_BLINK_I0001_...),
+        // past where diag_is_ice_seg's prefix test at the downstream chokepoints can see it —
+        // the same hazard this ticket closes for Option/Result/Map/Tuple, one struct level down.
+        if diag_is_ice_seg(seg) { return seg }
         result = result.concat("_").concat(seg)
         i = i + 1
     }
@@ -10769,9 +10886,17 @@ pub fn tc_tid_inner_tag_faithful(tid: Int) -> Bool {
     // used to live here was stale once those gates widened under br 82ajft item 1.
     if t.params_count != 0 {
         if k == TK_STRUCT || k == TK_ENUM { return true }
+        // Counterfactual measurement (br vbcw1e): every DECLINE here is a slot that stays
+        // on the string CSV path today. If a future caller routed it onto the tid path
+        // instead (qerbc7's "consumers stop routing on the gate" flip), this records
+        // whether tc_tid_inner_tag would have silently spelled it "void" (a give-up) rather
+        // than a real name — the erasure this gate currently prevents by declining, not by
+        // detecting. Never changes the `false` returned above.
+        voidtwin_probe("faithful_reject_paramcount", tid)
         return false
     }
     if k == TK_STRUCT || k == TK_ENUM { return true }
+    voidtwin_probe("faithful_reject", tid)
     false
 }
 
@@ -10978,8 +11103,22 @@ pub fn tc_tid_to_c_tag(tid0: Int) -> Str {
         if underlying != -1 { return tc_tid_to_c_tag(underlying) }
         return strip_module_qualifier(t.name)
     }
-    if k == TK_OPTION { return "Option_{tc_tid_inner_tag(t.inner1)}" }
-    if k == TK_RESULT { return "Result_{tc_tid_inner_tag(t.inner1)}_{tc_tid_inner_tag(t.inner2)}" }
+    // Collapse, never interpolate (br vbcw1e Stage 2) — same rule as tc_tid_inner_tag's own
+    // OPTION/RESULT arms: tc_tid_inner_tag can now itself answer a bare ICE_SEG_* sentinel,
+    // and interpolating it into "Option_{inner}"/"Result_{ok}_{err}" would bury it where
+    // diag_is_ice_seg's prefix test can no longer see it.
+    if k == TK_OPTION {
+        let inner = tc_tid_inner_tag(t.inner1)
+        if diag_is_ice_seg(inner) { return inner }
+        return "Option_{inner}"
+    }
+    if k == TK_RESULT {
+        let ok = tc_tid_inner_tag(t.inner1)
+        if diag_is_ice_seg(ok) { return ok }
+        let err = tc_tid_inner_tag(t.inner2)
+        if diag_is_ice_seg(err) { return err }
+        return "Result_{ok}_{err}"
+    }
     if k == TK_TUPLE { return tc_tid_tuple_tag(t) }
     if k == TK_TYPEVAR { return "<tv>" }
 
@@ -11061,6 +11200,13 @@ fn tc_tid_encodable(tid0: Int) -> Bool {
     if tid < 0 || tid >= ty_pool.len() { return false }
     let t = ty_pool.get(tid).unwrap()
     let k = t.kind
+    // Counterfactual measurement (br vbcw1e): TK_UNKNOWN declining here is exactly the
+    // routing this gate provides today in INNER position — the reason the lowercase twin's
+    // TK_UNKNOWN fall-through (tc_tid_scalar_tag) is unreachable from any gated caller. Taps
+    // the would-be-erasure without changing the `false` returned below.
+    if k == TK_UNKNOWN {
+        voidtwin_probe("encodable", tid)
+    }
     if k == TK_TYPEVAR || k == TK_UNKNOWN { return false }
     if k == TK_TUPLE { return tc_tid_tuple_encodable(t) }
     if k == TK_OPTION { return tc_tid_encodable(t.inner1) }
@@ -11369,9 +11515,11 @@ pub fn tc_tid_tuple_elem_encodable(tid: Int) -> Bool {
     // names (codegen_types.bl:1331-1336), and type_from_name collapses every unknown name
     // onto CT_VOID, so a CT-keyed lowering here would silently turn an ERASED element into a
     // well-typed int64_t field. The name the tuple's own c_name encodes cannot disambiguate
-    // either, because the lowercase "void" speller (tc_tid_scalar_tag) still carries all
-    // three meanings and is deliberately unarmed. Arming that twin is the prerequisite.
-    // Until then: refuse, and keep the located I0001.
+    // this either, regardless of the lowercase twin's state: br vbcw1e has since armed
+    // tc_tid_scalar_tag, but arming it was necessary for the OUTER speller chokepoints, not
+    // sufficient here — the emit_tuple_typedef gap above is untouched.
+    // Until it's fixed: refuse, and keep the located I0001.
+    voidtwin_probe("tuple_elem", tid)
     false
 }
 
@@ -11581,6 +11729,7 @@ pub fn tc_struct_slot_encodable(tid: Int) -> Bool {
     // TK_VOID arm above (br hsgsbp): both paths spell it "Void", so this is byte-neutral,
     // and the accidental fall-through to `false` was what erased a real `Box[Void]`.
     if k == TK_VOID { return true }
+    voidtwin_probe("struct_slot", tid)
     false
 }
 

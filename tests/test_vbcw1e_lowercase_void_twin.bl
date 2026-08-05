@@ -1,0 +1,262 @@
+// br vbcw1e: arm the LOWERCASE void twin (tc_tid_scalar_tag / tc_tid_inner_tag /
+// tc_tid_tuple_tag), the INNER-position counterpart to the UPPERCASE speller br hsgsbp
+// already split (tc_tid_to_c_tag). Same finding, one level down: before this ticket,
+// tc_tid_scalar_tag answered the single string "void" for THREE unrelated conditions —
+// out-of-range (src/typecheck.bl:10162, pre-fix), genuine TK_VOID (:10216), and the
+// unhandled-kind fall-through (:10240) — and had NO TK_UNKNOWN arm at all, so an unbound
+// metavariable in INNER position (Option[α], Map[α, Int], a tuple element) fell through
+// to "void" too, spelling e.g. Option_void instead of raising DECISIONS.md:342's I0001.
+// That is exactly the erased-default miscompile the decision forbids, alive one level
+// below where br hsgsbp closed it.
+//
+// The fix mirrors hsgsbp exactly: each give-up arm now returns its own diagnostics.ICE_SEG_*
+// sentinel (detected via diag_is_ice_seg) instead of sharing "void" with genuine Void. The
+// recursive composing arms (tc_tid_inner_tag's OPTION/RESULT/MAP, tc_tid_tuple_tag) collapse
+// a non-genuine inner into the BARE sentinel rather than interpolating it into a larger tag
+// (e.g. "Option_{inner}") — interpolating would bury the sentinel where diag_is_ice_seg's
+// `starts_with("BLINK_I0001_")` prefix test can no longer see it, silently degrading a
+// compiler-invariant violation into a legal-looking C identifier that compiles and links
+// (src/diagnostics.bl:207-214, the exact blink_GKV_Void_Void failure class).
+//
+// R2's counterfactual is restated for the twin below because it is the one constraint that
+// makes this a fix rather than a relabeling: Result[Void, Str] must still spell
+// Result_void_str THROUGH tc_tid_inner_tag (tc_tid_to_c_tag's TK_RESULT arm delegates to it),
+// because src/codegen_types.bl:6780 matches that literal tag to lower the Void leaf to an
+// int64_t placeholder field. Arming the twin's give-up arms must not touch the one arm
+// (TK_VOID, :10216) that is deliberately unchanged.
+//
+// SETUP HAZARDS, inherited from tests/test_hsgsbp_void_vs_erasure.bl (same reasons):
+//  1. Importing typecheck/compiler/parser pulls in the whole-program merge, which is what
+//     lets write_file/fs.remove resolve below without their own explicit import.
+//  2. make_metavar/make_option_type/make_result_type/make_map_type/make_tuple_type are `pub`
+//     FOR THIS TEST ONLY (same precedent as make_fn_type in test_hsgsbp_void_vs_erasure.bl):
+//     an unbound metavariable never survives a fully-typechecked program (it either binds or
+//     raises E0301 at the boundary, decisions/under-determined-types.md), so there is no
+//     surface syntax that produces one — direct pool construction is the only way to build
+//     the input these rows need.
+
+import typecheck.{
+    tc_tid_inner_tag, tc_tid_to_c_tag, tc_type_str, tc_lookup_node_tid,
+    make_fn_type, make_metavar, make_option_type, make_result_type, make_map_type,
+    make_tuple_type, check_types,
+}
+import diagnostics.{
+    diag_is_ice_seg, ICE_SEG_UNSOLVED_TYPEVAR, ICE_SEG_UNHANDLED_KIND, ICE_SEG_TID_OUT_OF_RANGE,
+}
+import parser.{nodes}
+import compiler.{compile_to_program}
+import std.io
+import compile_test_helpers
+import codegen_expr
+
+fn assert_eq_str(label: Str, got: Str, want: Str) {
+    if got != want {
+        io.println("FAIL: {label}: got '{got}' want '{want}'")
+    }
+    assert_eq(got, want)
+}
+
+fn assert_true(label: Str, got: Bool) {
+    if !got {
+        io.println("FAIL: {label}: got false want true")
+    }
+    assert(got)
+}
+
+fn assert_false(label: Str, got: Bool) {
+    if got {
+        io.println("FAIL: {label}: got true want false")
+    }
+    assert(!got)
+}
+
+// A genuine Void tid and a genuine Result[Void, Str] tid cannot be built from the outside
+// (TYPE_VOID is a non-`pub` `let mut` and make_result_type's genuine callers are internal),
+// so harvest them from a real typechecked program by rendered-type-string key, exactly as
+// test_hsgsbp_void_vs_erasure.bl's harvest_type_tids does. Relying on the real inference
+// path (rather than hand-building these two specific tids) is deliberate: these are the
+// ones a real program actually produces.
+fn probe_src() -> Str {
+    #"fn main() {
+    let u: Void = ()
+    let r: Result[Void, Str] = Ok(())
+    assert(r.is_ok())
+}
+"#
+}
+
+fn harvest_type_tids() -> Map[Str, Int] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let path = "build/vbcw1e_probe_src.bl"
+    write_file(path, probe_src())
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    // Removed BEFORE any row assertion below, so a failing assertion never leaks the probe
+    // file (same contract as test_hsgsbp_void_vs_erasure.bl / test_xskbvh_seg_injective.bl).
+    fs.remove(path)
+    let mut m: Map[Str, Int] = Map()
+    let mut idx = 0
+    let n = nodes.len()
+    while idx < n {
+        let tid = tc_lookup_node_tid(idx)
+        if tid >= 0 {
+            m.insert(tc_type_str(tid), tid)
+        }
+        idx = idx + 1
+    }
+    m
+}
+
+fn expect_tid(m: Map[Str, Int], key: Str) -> Int {
+    let tid = m.get(key) ?? -1
+    if tid == -1 {
+        io.println("FAIL: harvested map has no tid for rendered type string '{key}'")
+    }
+    assert(tid != -1)
+    tid
+}
+
+// R1 + R2 — the twin's positive polarity, restated from test_hsgsbp_void_vs_erasure.bl: a
+// genuine Void inner still spells "void", and Result[Void, Str] still spells the exact tag
+// codegen_types.bl:6780 matches.
+test "a genuine Void inner spells void, and Result[Void, Str] stays Result_void_str" {
+    let m = harvest_type_tids()
+
+    // R1. Pins tc_tid_scalar_tag's TK_VOID arm (reached through tc_tid_inner_tag's tail,
+    // since Void is neither STRUCT/ENUM/OPTION/RESULT/MAP/TUPLE/TYPEVAR). This is the arm
+    // the comment at src/typecheck.bl:10188 forbids ever deleting.
+    let void_tid = expect_tid(m, "Void")
+    assert_eq_str("genuine Void inner spells void", tc_tid_inner_tag(void_tid), "void")
+    assert_false("genuine Void is not an ICE sentinel", diag_is_ice_seg(tc_tid_inner_tag(void_tid)))
+
+    // R2's twin. tc_tid_inner_tag's TK_RESULT arm recurses through the lowercase scalar
+    // spellers for both slots, so this pins the exact composition codegen_types.bl:6780
+    // depends on: "Result_" + tc_tid_inner_tag(Void) + "_" + tc_tid_inner_tag(Str).
+    let rv_tid = expect_tid(m, "Result[Void, Str]")
+    assert_eq_str("Result[Void, Str] spells Result_void_str", tc_tid_inner_tag(rv_tid), "Result_void_str")
+    assert_false("Result_void_str is not an ICE sentinel", diag_is_ice_seg(tc_tid_inner_tag(rv_tid)))
+}
+
+// R3 — out-of-range is its own sentinel at BOTH the scalar and inner entry points, no longer
+// confusable with Void's spelling.
+test "an out-of-range tid spells the out-of-range sentinel, not void" {
+    assert_eq_str("negative tid", tc_tid_inner_tag(-1), ICE_SEG_TID_OUT_OF_RANGE)
+    assert_eq_str("out-of-pool tid", tc_tid_inner_tag(1000000000), ICE_SEG_TID_OUT_OF_RANGE)
+    assert_true("out-of-range is an ICE sentinel", diag_is_ice_seg(tc_tid_inner_tag(-1)))
+    assert_false("out-of-range no longer spells void", tc_tid_inner_tag(-1) == "void")
+}
+
+// R4 — a kind with no arm (TK_FN, the only constructible one) spells the unhandled-kind
+// sentinel through the INNER entry point, not "void". Byte-neutrality check: this is the
+// same string tc_tid_scalar_tag returned for this bucket BEFORE arming (Stage 1 measured its
+// floor at 0), so arming it could not have changed any real program's output.
+test "a kind with no arm spells the unhandled-kind sentinel through tc_tid_inner_tag" {
+    let fn_tid = make_fn_type(-1, [])
+    assert_eq_str("TK_FN has no arm", tc_tid_inner_tag(fn_tid), ICE_SEG_UNHANDLED_KIND)
+    assert_true("unhandled kind is an ICE sentinel", diag_is_ice_seg(tc_tid_inner_tag(fn_tid)))
+    assert_false("unhandled kind no longer spells void", tc_tid_inner_tag(fn_tid) == "void")
+}
+
+// R5 — THE finding that opened this ticket: an unbound metavariable in INNER position must
+// ICE, not fall through to "void". Before Stage 2, tc_tid_scalar_tag had no TK_UNKNOWN arm at
+// all, so this exact call answered "void" — indistinguishable from a genuine Void, and the
+// erased-default bucket DECISIONS.md:342 forbids, alive in inner position.
+test "an unbound metavar at inner position ICEs instead of falling through to void" {
+    let mv = make_metavar()
+    assert_eq_str("unbound metavar spells the unsolved-typevar sentinel", tc_tid_inner_tag(mv), ICE_SEG_UNSOLVED_TYPEVAR)
+    assert_true("unbound metavar is an ICE sentinel", diag_is_ice_seg(tc_tid_inner_tag(mv)))
+    assert_false("unbound metavar no longer spells void", tc_tid_inner_tag(mv) == "void")
+}
+
+// R6 — collapse, never interpolate: Option[α] must answer the BARE sentinel, not
+// "Option_BLINK_I0001_...". This is the row that would have stayed red one line further than
+// R5 alone proves: R5 shows the leaf ICEs, this shows the composing arm doesn't smuggle that
+// ICE into the middle of a larger, deceptively-legal-looking C identifier. Checked at both
+// entry points that recurse through the OPTION arm — tc_tid_inner_tag (its own recursive
+// arm) and tc_tid_to_c_tag (the top-level twin, which delegates the same way).
+test "Option[unbound metavar] collapses to the bare sentinel, never interpolates it" {
+    let mv = make_metavar()
+    let opt = make_option_type(mv)
+    assert_eq_str("tc_tid_inner_tag collapses Option[α]", tc_tid_inner_tag(opt), ICE_SEG_UNSOLVED_TYPEVAR)
+    assert_eq_str("tc_tid_to_c_tag collapses Option[α]", tc_tid_to_c_tag(opt), ICE_SEG_UNSOLVED_TYPEVAR)
+    assert_false("never buried inside Option_", tc_tid_inner_tag(opt).contains("Option_"))
+}
+
+// R7 — same collapse proof for TK_RESULT, both slot positions independently (ok fails first
+// and must not mask a healthy err, and vice versa when ok is genuine).
+test "Result[.., unbound metavar] collapses to the bare sentinel regardless of which slot" {
+    let m = harvest_type_tids()
+    let void_tid = expect_tid(m, "Void")
+    let mv_ok = make_metavar()
+    let mv_err = make_metavar()
+
+    // ok slot is the metavar: must collapse before ever looking at err.
+    let r_ok_bad = make_result_type(mv_ok, void_tid)
+    assert_eq_str("bad ok slot collapses", tc_tid_inner_tag(r_ok_bad), ICE_SEG_UNSOLVED_TYPEVAR)
+
+    // ok slot is genuine Void (spells fine), err slot is the metavar: must still collapse,
+    // proving the err check isn't skipped once ok passes.
+    let r_err_bad = make_result_type(void_tid, mv_err)
+    assert_eq_str("bad err slot collapses", tc_tid_inner_tag(r_err_bad), ICE_SEG_UNSOLVED_TYPEVAR)
+    assert_false("never buried inside Result_void_", tc_tid_inner_tag(r_err_bad).contains("Result_void_"))
+}
+
+// R8 — same collapse proof for TK_MAP.
+test "Map[unbound metavar, ..] collapses to the bare sentinel, never interpolates it" {
+    let m = harvest_type_tids()
+    let void_tid = expect_tid(m, "Void")
+    let mv = make_metavar()
+    let map_tid = make_map_type(mv, void_tid)
+    assert_eq_str("Map key collapses", tc_tid_inner_tag(map_tid), ICE_SEG_UNSOLVED_TYPEVAR)
+    assert_false("never buried inside Map_", tc_tid_inner_tag(map_tid).contains("Map_"))
+}
+
+// R9 — same collapse proof for tc_tid_tuple_tag: a genuine element earlier in the tuple must
+// not let a later non-genuine element leak through as a suffix ("Tuple2_void_BLINK_I0001_...").
+test "a tuple with one unbound-metavar element collapses the whole tag, not just that slot" {
+    let m = harvest_type_tids()
+    let void_tid = expect_tid(m, "Void")
+    let mv = make_metavar()
+    let tup_tid = make_tuple_type([void_tid, mv])
+    let tag = tc_tid_inner_tag(tup_tid)
+    assert_eq_str("tuple with a bad element collapses", tag, ICE_SEG_UNSOLVED_TYPEVAR)
+    assert_false("never partially spelled as Tuple2_void_", tag.contains("Tuple2_void"))
+}
+
+// R10 — permanent regression witness for the TK_VOID arm's load-bearing claim (comment at
+// src/typecheck.bl:10211): a user generic fn instantiated over Result[Void, Str] reaches
+// tc_tid_scalar_tag's TK_VOID arm through the real, ungated caller chain
+// (tid_instance_mono_args_csv / tc_seg_from_tid -> tc_tid_to_c_tag -> tc_tid_inner_tag ->
+// tc_tid_scalar_tag), not through a hand-built pool entry. This MVCE previously existed only
+// as a throwaway .tmp/ file (wiped by task ci) — promoted here so the corpus keeps exercising
+// it. It also closes the loop on codegen_types.bl:6780: the emitted C must carry the
+// int64_t-placeholder Result typedef, not an illegal `void ok;` field.
+//
+// The call result feeds `.is_ok()` directly instead of landing in an intermediate `let`, as a
+// workaround for br b22wpe (pre-existing, confirmed unrelated to this ticket via a
+// clean-checkout repro, and NOT fixed by annotating the let-target's type): a
+// `let r = identity(v)` or even an explicitly-annotated `let r: Result[Void, Str] =
+// identity(v)` here both infer the local's C type as blink_Result_int_str instead of
+// blink_Result_void_str, an unrelated let-target-inference bug for generic-fn-call RHS
+// values. Restore the more natural `let r = identity(v); assert(r.is_ok())` form once
+// b22wpe is fixed.
+test "a generic fn instantiated over Result[Void, Str] compiles, links, and lowers the Void leaf" {
+    let src = "fn identity[T](x: T) -> T \{ x \}\nfn main() \{\n    let v: Result[Void, Str] = Ok(())\n    assert(identity(v).is_ok())\n}\n"
+    let c_src = compile_test_helpers.compile_and_emit_c(src, "vbcw1e_result_void_mvce")
+    compile_test_helpers.expect_contains(c_src, "blink_Result_void_str", "Result[Void, Str] mono name is spelled")
+    compile_test_helpers.expect_contains(c_src, "int64_t ok;", "the Void ok-leaf lowers to the int64_t placeholder")
+    let r = compile_test_helpers.compile_and_run(src, "vbcw1e_result_void_mvce_run")
+    assert_eq(r.exit_code, 0)
+}
+
+// R11 — diag_is_ice_seg polarity, restated for the strings this file's rows actually produce.
+// Same property test_hsgsbp_void_vs_erasure.bl's R5 pins for the uppercase twin: the detector
+// must be total over the sentinels and inert over every real lowercase name these rows emit.
+test "diag_is_ice_seg is true for every sentinel this file uses and false for real lowercase tags" {
+    assert_true("unsolved typevar", diag_is_ice_seg(ICE_SEG_UNSOLVED_TYPEVAR))
+    assert_true("unhandled kind", diag_is_ice_seg(ICE_SEG_UNHANDLED_KIND))
+    assert_true("tid out of range", diag_is_ice_seg(ICE_SEG_TID_OUT_OF_RANGE))
+
+    assert_false("void is a real scalar tag", diag_is_ice_seg("void"))
+    assert_false("int is a real scalar tag", diag_is_ice_seg("int"))
+    assert_false("Result_void_str is a real composed tag", diag_is_ice_seg("Result_void_str"))
+}
