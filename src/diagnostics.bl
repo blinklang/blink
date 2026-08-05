@@ -19,6 +19,7 @@ effect Diag {
 // E0300+ — type errors
 pub const TYPE_ERROR              = "E0300"
 pub const CANNOT_INFER_TYPE       = "E0301"
+pub const NOT_ITERABLE            = "E0302"
 pub const TEMPLATE_MISMATCH       = "E0310"
 
 // E0500+ — effects, capabilities, ?-propagation
@@ -194,6 +195,12 @@ pub const DEPRECATED_USAGE        = "W2000"
 // to catch every under-determined binding first, so this firing means a metavar
 // escaped that net. Fails closed (never silently emits "Void").
 pub const UNSOLVED_TYPEVAR_AT_CODEGEN = "I0001"
+// I0002: a for-in target's runtime CT reached emit_for_in with no arm to handle it.
+// The ForIn typecheck seam (NodeKind.ForIn, tc_check_node) rejects every non-iterable
+// type before codegen runs, so this firing means the iterable IS one of the spec's
+// built-in IntoIterator kinds (or the Channel receive extension) but codegen has not
+// been armed for it yet — a missing-implementation bug, never the user's fault.
+pub const UNHANDLED_ITERABLE_AT_CODEGEN = "I0002"
 
 // ── I0001 mangler sentinels (br hsgsbp) ──────────────────────────────
 //
@@ -744,8 +751,14 @@ pub fn diag_explain(code: Str) -> Str {
     if code == CANNOT_INFER_TYPE {
         return "E0301 -- CannotInferType\n\nEvery binding must resolve to a concrete type. This one is\nunder-determined: an empty container or bare None was never given\nan element type -- not by an annotation, and not by a later use\nthat would constrain it. There is no default type; the compiler\nreports it instead of guessing.\n\nA constraining use DOES fix it: pushing/inserting an element, or\npassing the value where a concrete type is expected.\n\n  let mut xs = []\n  xs.push(1)              // OK -- later use infers List[Int]\n\n  let x = []\n  let n = x.len()         // E0301 -- len() does not constrain the element\n\nFix: add a type annotation.\n\n  let x: List[Int] = []   // OK\n  let m: Map[Str, Int] = Map()\n  let o: Int? = None"
     }
+    if code == NOT_ITERABLE {
+        return "E0302 -- NotIterable\n\nA `for` loop's iterable is not one of Blink's built-in iterable\ntypes. Only these implement IntoIterator:\n\n  List[T]    -- yields T, in order\n  Set[T]     -- yields T, unspecified order\n  Map[K, V]  -- yields (K, V), unspecified order\n  Range[T]   -- yields T, lazy\n  Str        -- yields Char\n  Bytes      -- yields U8\n  Channel[T] -- yields T (receive)\n  Iterator[T] -- yields T (identity)\n\nFix: iterate one of the types above, or call `.into_iter()` /\n`.iter()` on a type that provides one.\n\n  for x in 5 \{ }              // E0302 -- Int is not iterable\n  for x in (List[Int]) \{ }    // OK"
+    }
     if code == UNSOLVED_TYPEVAR_AT_CODEGEN {
         return "I0001 -- UnsolvedTypeVarAtCodegen\n\nAn INTERNAL COMPILER ERROR. A generic type's parameter was still\nunsolved when code generation tried to monomorphize it, so the\ncompiler had no concrete type to emit for that slot.\n\nThis is a bug in the compiler, not in your program. One of two\nthings should have happened first and did not:\n\n  - the type should have been inferred from a use, or\n  - the front end should have reported error[CannotInferType]\n    (E0301) for a genuinely under-determined binding.\n\nThe compiler stops here rather than emitting a type-erased name,\nwhich would silently collapse distinct instantiations onto one C\ntype and miscompile.\n\nFix: please report this, ideally with the smallest program that\nreproduces it. As a workaround, adding an explicit type annotation\nat the reported location usually avoids the unsolved slot.\n\n  let b: GKV[Int, Str] = GKV \{ m: Map() \}   // annotated -- avoids it"
+    }
+    if code == UNHANDLED_ITERABLE_AT_CODEGEN {
+        return "I0002 -- UnhandledIterableAtCodegen\n\nAn INTERNAL COMPILER ERROR. A `for` loop's iterable passed the\nfront-end's iterable check (error[NotIterable], E0302) but code\ngeneration has no loop emitter for its runtime type.\n\nThis is a bug in the compiler, not in your program: the type is\ngenuinely one of the built-in IntoIterator kinds (List/Set/Map/\nRange/Str/Iterator) or the Channel receive extension, but the\ncorresponding codegen arm has not been implemented yet. The\ncompiler stops here rather than silently emitting a loop that runs\nzero iterations.\n\nFix: please report this, ideally with the smallest program that\nreproduces it."
     }
     if code == UNDECLARED_EFFECT {
         return "E0500 -- UndeclaredEffect\n\nA function calls another function that requires an effect, but the\ncaller does not declare that effect in its signature.\n\nFix: add '! EffectName' to the calling function's signature.\n\n  fn greet() ! IO \{\n      io.println(\"hello\")  // IO effect declared\n  \}\n\n  fn bad() \{\n      io.println(\"hello\")  // E0500: requires IO but bad() has none\n  \}"

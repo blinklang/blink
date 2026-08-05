@@ -35,7 +35,8 @@ import codegen_types.{
     get_fn_ret, get_fn_ret_struct, get_fn_ret_struct_inner, get_fn_ret_type,
     get_generic_fn_node, get_list_elem_struct, get_list_elem_type,
     get_list_nested_elem_struct, get_list_nested_elem_type,
-    get_map_key_type, get_map_key_type_raw, get_map_value_struct, get_map_value_type, is_map_scalar_ct, get_set_elem_type, get_set_elem_struct,
+    get_map_key_type, get_map_key_type_raw, get_map_key_struct, get_map_value_struct, get_map_value_type, get_map_value_list_elem, is_map_scalar_ct, get_set_elem_type, get_set_elem_struct,
+    ensure_tuple_type,
     get_struct_field_stype, get_struct_field_type, get_var_channel_inner,
     get_var_enum, get_var_handle_inner, get_var_handle_inner2,
     get_var_handler_is_ue, get_var_handler_vtable_field,
@@ -92,12 +93,13 @@ import codegen_expr.{
     expr_result_type, mono_instance_arg_tids_from_tid, panic_file_for, segs_from_arg_tids,
     tparams_sl_contains
 }
-import codegen_methods.{resolve_tparam_via_tid, copy_list_compound_elem}
-import codegen_derive.{ct_to_descriptor, desc_primary_ct, descriptor_c_type, descriptor_mangle, emit_promote_elem_into, inner_desc_of, queue_promote_type}
+import codegen_methods.{resolve_tparam_via_tid, copy_list_compound_elem, emit_boxed_container_store, finish_enum_zip_result}
+import codegen_derive.{ct_to_descriptor, desc_primary_ct, descriptor_c_type, descriptor_mangle, emit_promote_elem_into, inner_desc_of, queue_promote_type, map_pair_key_read_expr}
 import diagnostics.{
     Diag, diag_error_at, diag_ice_at, diag_warn_at, diag_file_for_node,
     ARENA_CLOSURE_TAIL_NONLITERAL, ARENA_CLOSURE_UNSUPPORTED_CAP,
     MISSING_CANONICAL_HEADER, UNSOLVED_TYPEVAR_AT_CODEGEN, diag_is_ice_seg,
+    UNHANDLED_ITERABLE_AT_CODEGEN,
 }
 import pkg.manifest.{manifest_header_is_declared, manifest_name}
 import compiler.{trace}
@@ -3345,6 +3347,19 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
                         }
                     }
                 }
+                if elem_ct == CT_SET {
+                    let nested_sl = node_elements(elem_ann)
+                    if nested_sl != -1 && sublist_length(nested_sl) > 0 {
+                        let nested_ann = sublist_get(nested_sl, 0)
+                        let nested_name = node_name(nested_ann)
+                        let nested_ct = type_from_name(nested_name)
+                        set_list_nested_elem_type(name, nested_ct)
+                        let nested_struct = key_struct_sname_from_ann(nested_ann)
+                        if nested_struct != "" {
+                            set_list_nested_elem_struct(name, nested_struct)
+                        }
+                    }
+                }
                 if elem_ct == CT_MAP {
                     set_list_elem_map_ann(name, elem_ann)
                 }
@@ -3553,6 +3568,24 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
     }
 }
 
+// The BY-VALUE C expression for a Map value read from `m->values[i]` (a bare
+// void*), for embedding into a Tuple2 `._1` field (7b1t5a: `for (k, v) in
+// map`). Mirrors emit_map_method's "get" dispatch (:1671-1767) exactly, so a
+// Map value materializes here the same way it already does through `.get()` —
+// no new value-representation support, just the same boxing convention read
+// back inline instead of behind an Option.
+fn map_pair_value_read_expr(value_expr: Str, val_ct: Int, val_struct: Str) -> Str {
+    if val_struct != "" {
+        return "*({c_type_c_name(val_struct)}*){value_expr}"
+    }
+    if val_ct == CT_STRING { return "(const char*){value_expr}" }
+    if val_ct == CT_LIST { return "(blink_list*){value_expr}" }
+    if val_ct == CT_MAP { return "(blink_map*){value_expr}" }
+    if val_ct == CT_SET { return "(blink_set*){value_expr}" }
+    if val_ct == CT_FLOAT { return "*(double*){value_expr}" }
+    "(int64_t)(intptr_t){value_expr}"
+}
+
 @allow(UnrestoredMutation, IncompleteStateRestore)
 fn emit_for_in(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
     let var_name = node_var_name(node)
@@ -3587,8 +3620,105 @@ fn emit_for_in(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.
         emit_line("}")
     } else {
         emit_expr(iter_node)
-        let iter_str = expr_result_str
-        let iter_type = expr_result_type
+        let mut iter_str = expr_result_str
+        let mut iter_type = expr_result_type
+        // Container metadata (get_set_elem_type/get_map_key_type/etc.) is keyed in
+        // scope_vars by the RAW Blink identifier a container was declared under, but
+        // expr_result_str for a mut-captured Ident can diverge from that name (e.g.
+        // "(*name_cell)" -- codegen_expr.bl's mut_captured_vars rewrite). Mirror
+        // emit_map_method's defensive override (codegen_methods.bl ~1621) so a lookup
+        // against the raw AST name is used instead of the possibly-rewritten C
+        // expression string; a miss here silently falls back to a wrong element/key/
+        // value CT with no diagnostic.
+        let mut lookup_name = iter_str
+        if node_kind(iter_node) == NodeKind.Ident {
+            lookup_name = node_name(iter_node)
+        }
+        // Set only when the CT_MAP normalizer below finds a List/Set-valued Map (e.g.
+        // `Map[K, List[V]]`) with tracked nested-element info, so `for (k, v) in map`
+        // can propagate it onto the destructured `v` -- otherwise a later `for x in v`
+        // would fall back to get_list_elem_type/get_set_elem_type's CT_STRING default.
+        let mut map_val_ct = -1
+        let mut map_val_nested_ct = -1
+        if iter_type == CT_SET {
+            // blink_set_to_list normalizes the set into a blink_list* up front so
+            // the loop below reuses the CT_LIST arm verbatim, rather than a second
+            // loop emitter. Do NOT route this through iter_from_source
+            // (codegen_expr.bl:192-232) instead: its only two branches are CT_LIST
+            // and an else that treats everything else as CT_ITERATOR, so a bare
+            // CT_SET would fall into the else and call
+            // get_var_iter_next_fn(<set var>) — an empty/garbage function name —
+            // producing a silently wrong or uncompilable call.
+            let set_elem_ct = get_set_elem_type(lookup_name)
+            let set_elem_struct = get_set_elem_struct(lookup_name)
+            let lst = fresh_temp("_setl_")
+            emit_line("blink_list* {lst} = blink_set_to_list({iter_str});")
+            set_var(lst, CT_LIST, 0)
+            set_list_elem_type(lst, set_elem_ct)
+            if set_elem_struct != "" {
+                set_list_elem_struct(lst, set_elem_struct)
+            }
+            expr_list_elem_type = set_elem_ct
+            expr_list_elem_struct = set_elem_struct
+            iter_str = lst
+            iter_type = CT_LIST
+        }
+        if iter_type == CT_MAP {
+            // Same normalize-then-reuse-CT_LIST shape as the CT_SET block above,
+            // but a Map has no runtime-fn analogue of blink_set_to_list — the
+            // (K, V) pair must materialize as an emitted Tuple2_<k>_<v> struct
+            // (there is no generic pair type in the runtime), so this walks the
+            // map's buckets directly (mirrors emit_debug_map_fn,
+            // codegen_derive.bl:941-968) and builds the pair list in emitted C.
+            // finish_enum_zip_result then stamps elem_struct=tuple_tag, so the
+            // CT_LIST arm's existing elem_struct sub-arm gives `for (k, v) in m`
+            // tuple destructuring for free (emit_tuple_destructure), the same way
+            // enumerate()'s (i, x) pairs already do.
+            let key_ct = get_map_key_type(lookup_name)
+            let key_struct = get_map_key_struct(lookup_name)
+            let val_ct = get_map_value_type(lookup_name)
+            let val_struct = get_map_value_struct(lookup_name)
+            if val_ct == CT_LIST || val_ct == CT_SET {
+                map_val_ct = val_ct
+                map_val_nested_ct = get_map_value_list_elem(lookup_name)
+            }
+            let key_tag = if key_struct != "" { key_struct } else { c_type_tag(key_ct) }
+            let val_tag = if val_struct != "" { val_struct } else { c_type_tag(val_ct) }
+            let tuple_tag = "Tuple2_{key_tag}_{val_tag}"
+            let key_type_csv = if key_struct != "" { "{CT_VOID}" } else { "{key_ct}" }
+            let val_type_csv = if val_struct != "" { "{CT_VOID}" } else { "{val_ct}" }
+            let key_struct_csv = if key_struct != "" { key_struct } else { "-" }
+            let val_struct_csv = if val_struct != "" { val_struct } else { "-" }
+            ensure_tuple_type(tuple_tag, 2, "{key_type_csv},{val_type_csv}", "{key_struct_csv},{val_struct_csv}")
+            let tuple_c = c_type_c_name(tuple_tag)
+            let lst = fresh_temp("_mapl_")
+            let stride_var = fresh_temp("_mstride_")
+            let i_var = fresh_temp("_mi_")
+            let map_var = fresh_temp("_mapv_")
+            // `iter_str` may be a non-trivial expression (a call, a method chain) --
+            // it is referenced 5x below (kops, cap, states, key slot, values), so it
+            // must be evaluated into a temp exactly once rather than re-spliced
+            // verbatim, or a side-effecting/allocating iterable (e.g. `for (k, v) in
+            // make_map()`) would re-run once per reference and each reference could
+            // observe a different underlying map.
+            emit_line("blink_map* {map_var} = {iter_str};")
+            emit_line("blink_list* {lst} = blink_list_new();")
+            emit_line("size_t {stride_var} = blink_kops_stride({map_var}->kops);")
+            emit_line("for (int64_t {i_var} = 0; {i_var} < {map_var}->cap; {i_var}++) \{")
+            cg_indent = cg_indent + 1
+            emit_line("if ({map_var}->states[{i_var}] != 1) continue;")
+            let slot_expr = "blink_map_key_slot({map_var}, {i_var}, {stride_var})"
+            let key_read = map_pair_key_read_expr(slot_expr, key_ct, key_struct)
+            let val_read = map_pair_value_read_expr("{map_var}->values[{i_var}]", val_ct, val_struct)
+            let pair_var = fresh_temp("_mpair_")
+            emit_line("{tuple_c} {pair_var} = \{ ._0 = {key_read}, ._1 = {val_read} };")
+            emit_boxed_container_store("blink_list_push({lst}, ", pair_var, CT_VOID, tuple_tag, "")
+            cg_indent = cg_indent - 1
+            emit_line("}")
+            finish_enum_zip_result(lst, tuple_tag)
+            iter_str = lst
+            iter_type = CT_LIST
+        }
         if iter_type == CT_LIST {
             let mut elem_type = expr_list_elem_type
             if elem_type == -1 { elem_type = get_list_elem_type(iter_str) }
@@ -3738,6 +3868,22 @@ fn emit_for_in(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.
                 let for_pat_sl = node_elements(node)
                 if for_pat_sl != -1 {
                     emit_tuple_destructure(for_pat_sl, c_var_name, elem_struct, 0)
+                    // `for (k, v) in <Map[K, List[V]] or Map[K, Set[V]]>`: emit_tuple_destructure
+                    // binds `v` as a bare CT_LIST/CT_SET with no nested-element channel of its
+                    // own, so propagate the Map's own tracked nested type here -- otherwise a
+                    // body `for x in v` would fall back to get_list_elem_type/get_set_elem_type's
+                    // weak default instead of the Map's real value element type.
+                    if map_val_nested_ct >= 0 && sublist_length(for_pat_sl) > 1 {
+                        let val_pat = sublist_get(for_pat_sl, 1)
+                        if node_kind(val_pat) != NodeKind.WildcardPattern {
+                            let val_name = node_name(val_pat)
+                            if map_val_ct == CT_LIST {
+                                set_list_elem_type(val_name, map_val_nested_ct)
+                            } else if map_val_ct == CT_SET {
+                                set_set_elem_type(val_name, map_val_nested_ct)
+                            }
+                        }
+                    }
                 }
                 emit_block(node_body(node))
                 pop_scope()
@@ -3767,6 +3913,20 @@ fn emit_for_in(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.
                     let nested_es = get_list_nested_elem_struct(iter_str)
                     if nested_es != "" {
                         set_list_elem_struct(var_name, nested_es)
+                    }
+                } else if elem_type == CT_SET {
+                    // A List[Set[T]] for-in materializes each element as a Set: carry
+                    // the inner Set's own element type/struct (stamped at declare time,
+                    // see the elem_ct == CT_SET branch below) so a nested `for x in
+                    // inner_set` doesn't fall back to get_set_elem_type's CT_STRING
+                    // default.
+                    let nested_et = get_list_nested_elem_type(iter_str)
+                    if nested_et != -1 {
+                        set_set_elem_type(var_name, nested_et)
+                    }
+                    let nested_es = get_list_nested_elem_struct(iter_str)
+                    if nested_es != "" {
+                        set_set_elem_struct(var_name, nested_es)
                     }
                 }
                 emit_block(node_body(node))
@@ -3829,7 +3989,10 @@ fn emit_for_in(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.
             cg_indent = cg_indent - 1
             emit_line("}")
         } else {
-            emit_line("/* unsupported iterable */")
+            diag_ice_at("UnhandledIterableAtCodegen", UNHANDLED_ITERABLE_AT_CODEGEN,
+                "for-in over '{type_name_from_ct(iter_type)}' passed the front-end iterable check but has no codegen loop emitter",
+                iter_node,
+                "this is a compiler bug — please report it with the smallest reproducing program")
         }
     }
 }
@@ -8209,6 +8372,19 @@ pub fn emit_top_level_let(node: Int, extern_only: Int) ! Codegen.Emit, Codegen.R
                         set_list_nested_elem_type(name, nested_ct)
                         if nested_ct == CT_VOID && (is_named_type(nested_name) != 0) {
                             set_list_nested_elem_struct(name, nested_name)
+                        }
+                    }
+                }
+                if elem_ct == CT_SET {
+                    let nested_sl = node_elements(elem_ann)
+                    if nested_sl != -1 && sublist_length(nested_sl) > 0 {
+                        let nested_ann = sublist_get(nested_sl, 0)
+                        let nested_name = node_name(nested_ann)
+                        let nested_ct = type_from_name(nested_name)
+                        set_list_nested_elem_type(name, nested_ct)
+                        let nested_struct = key_struct_sname_from_ann(nested_ann)
+                        if nested_struct != "" {
+                            set_list_nested_elem_struct(name, nested_struct)
                         }
                     }
                 }
