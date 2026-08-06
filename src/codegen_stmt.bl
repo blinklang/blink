@@ -3009,14 +3009,27 @@ fn apply_map_binding_meta(name: Str) {
 // miss falls back to `name`'s own value if it's scalar, else the CT_INT
 // floor every unstamped map already reads (br ymw81c). Shared by
 // emit_let_binding and emit_top_level_let, which had byte-identical copies.
-fn carry_map_binding_meta(val_str: Str, name: Str, type_ann: Int) {
+// AL1-sibling (A1): a closure-captured Map alias (`let alias = m` where `m` is
+// captured) lowers val_str to a capture-read C expression that matches
+// neither scope_vars nor closure_captures by name, so the raw lookups below
+// always miss and use_val falls to the CT_INT floor. val_orig_name is the
+// RHS's own Blink-level identifier (empty when the RHS isn't a bare Ident) —
+// closure_captures is keyed on that original name, so it recovers what
+// val_str's lowered text cannot.
+fn carry_map_binding_meta(val_str: Str, val_orig_name: Str, name: Str, type_ann: Int) {
     copy_map_value_meta(val_str, name)
     if type_ann == -1 {
-        let src_val_raw = get_map_value_type_raw(val_str)
-        let own_val_raw = get_map_value_type_raw(name)
-        let use_val = if src_val_raw >= 0 { src_val_raw } else if is_map_scalar_ct(own_val_raw) != 0 { own_val_raw } else { CT_INT }
+        let mut src_val_raw = get_map_value_type_raw(val_str)
+        if src_val_raw < 0 && val_orig_name != "" { src_val_raw = get_map_value_type_raw(val_orig_name) }
+        let use_val = if src_val_raw >= 0 {
+            src_val_raw
+        } else {
+            let own_val_raw = get_map_value_type_raw(name)
+            if is_map_scalar_ct(own_val_raw) != 0 { own_val_raw } else { CT_INT }
+        }
         if is_map_scalar_ct(use_val) != 0 {
-            let src_key_raw = get_map_key_type_raw(val_str)
+            let mut src_key_raw = get_map_key_type_raw(val_str)
+            if src_key_raw < 0 && val_orig_name != "" { src_key_raw = get_map_key_type_raw(val_orig_name) }
             let use_key = if src_key_raw >= 0 { src_key_raw } else { get_map_key_type(name) }
             set_map_types(name, use_key, use_val, "")
         }
@@ -3512,7 +3525,8 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
         apply_map_binding_meta(name)
     }
     if val_type == CT_MAP {
-        carry_map_binding_meta(val_str, name, type_ann)
+        let val_orig_name = if node_kind(val_node) == NodeKind.Ident { node_name(val_node) } else { "" }
+        carry_map_binding_meta(val_str, val_orig_name, name, type_ann)
     }
     if val_type == CT_LIST && expr_list_elem_type >= 0 && type_ann == -1 {
         set_list_elem_type(name, expr_list_elem_type)
@@ -8683,7 +8697,7 @@ pub fn emit_top_level_let(node: Int, extern_only: Int) ! Codegen.Emit, Codegen.R
         } else {
             // mv45y5: no annotation, no alias source, no adapter carry -- the
             // last resort is typecheck's own tid for the RHS (see the twin
-            // comment on the local-let path, ~line 3479).
+            // comment on the local-let path, ~line 3514).
             recover_set_elem_from_tid(node_value(node), name)
         }
         expr_list_elem_type = -1
@@ -8693,7 +8707,8 @@ pub fn emit_top_level_let(node: Int, extern_only: Int) ! Codegen.Emit, Codegen.R
         apply_map_binding_meta(name)
     }
     if val_type == CT_MAP {
-        carry_map_binding_meta(val_str, name, type_ann)
+        let val_orig_name = if node_kind(node_value(node)) == NodeKind.Ident { node_name(node_value(node)) } else { "" }
+        carry_map_binding_meta(val_str, val_orig_name, name, type_ann)
     }
     if val_type == CT_LIST && expr_list_elem_type >= 0 && type_ann == -1 {
         set_list_elem_type(name, expr_list_elem_type)

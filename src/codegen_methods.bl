@@ -1675,13 +1675,24 @@ fn map_key_expr_lookup(key_str: Str, key_ct: Int, key_sname: Str) -> Str ! Codeg
 }
 
 @allow(UnrestoredMutation, IncompleteStateRestore)
-fn emit_map_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
+fn emit_map_method(node: Int, obj_str: Str, obj_node: Int, method: Str, fb_key_ct: Int, fb_val_ct: Int, fb_val_struct: Str, fb_key_struct: Str) -> Int ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
     let mut map_var_name = obj_str
-    if node_kind(obj_node) == NodeKind.Ident {
+    let is_named_map_var = node_kind(obj_node) == NodeKind.Ident
+    if is_named_map_var {
         map_var_name = node_name(obj_node)
     }
-    let base_key_ct = get_map_key_type(map_var_name)
-    let base_key_sname = if base_key_ct == CT_VOID || base_key_ct == CT_STRUCT { get_map_key_struct(map_var_name) } else { "" }
+    // AL1: obj_str is never a registered ScopeVar when the receiver isn't a
+    // bare Ident (a chained call like `foo().get(k)`), so the lookups below
+    // always miss. Fall back to the caller-captured carrier metadata instead
+    // of silently keeping the CT_INT/CT_STRING default.
+    let base_key_ct0 = get_map_key_type(map_var_name)
+    let base_key_ct = if !is_named_map_var && fb_key_ct >= 0 { fb_key_ct } else { base_key_ct0 }
+    let base_key_sname0 = if base_key_ct0 == CT_VOID || base_key_ct0 == CT_STRUCT { get_map_key_struct(map_var_name) } else { "" }
+    let base_key_sname = if !is_named_map_var && fb_key_struct != "" { fb_key_struct } else { base_key_sname0 }
+    let base_val_ct0 = get_map_value_type(map_var_name)
+    let base_val_ct = if !is_named_map_var && fb_val_ct >= 0 { fb_val_ct } else { base_val_ct0 }
+    let base_val_sname0 = get_map_value_struct(map_var_name)
+    let base_val_sname = if !is_named_map_var && fb_val_struct != "" { fb_val_struct } else { base_val_sname0 }
     // vbhc4x: a generic-struct field Map[K,V] erases its key. The erased key CT
     // is CT_VOID when the field's key is a typevar (tp_child1_kind yields the
     // typevar's void kind) or CT_STRING when the key CT is entirely unset — both
@@ -1731,8 +1742,8 @@ fn emit_map_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int !
         emit_expr(sublist_get(args_sl, btc_arg_offset))
         let key_str = expr_result_str
         let key_expr = map_key_expr_lookup(key_str, key_ct, key_sname)
-        let vtype = get_map_value_type(map_var_name)
-        let vstruct = get_map_value_struct(map_var_name)
+        let vtype = base_val_ct
+        let vstruct = base_val_sname
         let res = fresh_temp("_mgetopt_")
         if vstruct != "" {
             ensure_struct_option_type(vstruct)
@@ -1865,7 +1876,7 @@ fn emit_map_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int !
         return 1
     }
     if method == "values" {
-        let vtype = get_map_value_type(map_var_name)
+        let vtype = base_val_ct
         expr_result_str = "blink_map_values({obj_str})"
         expr_result_type = CT_LIST
         expr_list_elem_type = vtype
@@ -2253,7 +2264,7 @@ fn emit_bytes_method(node: Int, obj_str: Str, _obj_node: Int, method: Str) -> In
     0
 }
 
-fn emit_builtin_trait_method(node: Int, obj_str: Str, obj_type: Int, obj_node: Int, method: Str) -> Int ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
+fn emit_builtin_trait_method(node: Int, obj_str: Str, obj_type: Int, obj_node: Int, method: Str, fb_key_ct: Int, fb_val_ct: Int, fb_val_struct: Str, fb_key_struct: Str) -> Int ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
     if lookup_builtin_trait_impl("StrOps", obj_type) != 0 {
         if emit_str_method(node, obj_str, obj_node, method) != 0 { return 1 }
     }
@@ -2261,7 +2272,7 @@ fn emit_builtin_trait_method(node: Int, obj_str: Str, obj_type: Int, obj_node: I
         if emit_list_method(node, obj_str, obj_node, method) != 0 { return 1 }
     }
     if lookup_builtin_trait_impl("MapOps", obj_type) != 0 {
-        if emit_map_method(node, obj_str, obj_node, method) != 0 { return 1 }
+        if emit_map_method(node, obj_str, obj_node, method, fb_key_ct, fb_val_ct, fb_val_struct, fb_key_struct) != 0 { return 1 }
     }
     if lookup_builtin_trait_impl("SetOps", obj_type) != 0 {
         if emit_set_method(node, obj_str, obj_node, method) != 0 { return 1 }
@@ -3222,7 +3233,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                 // below never claims a builtin (sb3125 regression).
                 if lookup_builtin_trait_impl(trait_name, first_type) != 0 {
                     btc_arg_offset = 1
-                    let bt_handled = emit_builtin_trait_method(node, first_str, first_type, obj_node, method)
+                    let bt_handled = emit_builtin_trait_method(node, first_str, first_type, obj_node, method, -1, -1, "", "")
                     btc_arg_offset = 0
                     if bt_handled != 0 { return }
                 }
@@ -3252,7 +3263,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                 }
                 if is_map_builtin_intercept(first_type, method) {
                     btc_arg_offset = 1
-                    let mh = emit_map_method(node, first_str, obj_node, method)
+                    let mh = emit_map_method(node, first_str, obj_node, method, -1, -1, "", "")
                     btc_arg_offset = 0
                     if mh != 0 { return }
                 }
@@ -3602,6 +3613,15 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
     emit_expr(obj_node)
     let obj_str = expr_result_str
     let obj_type = expr_result_type
+    // AL1: a chained-call receiver (`foo().get(k)`) is never a ScopeVar, so
+    // emit_map_method's name-keyed lookups always miss. Capture the map carrier
+    // metadata obj_node's own emit_expr just published (the same globals
+    // carry_map_binding_meta reads for a let-binding RHS) so emit_map_method can
+    // fall back to it instead of the CT_INT/CT_STRING defaults.
+    let recv_map_key_ct = if obj_type == CT_MAP { expr_map_key_type } else { -1 }
+    let recv_map_val_ct = if obj_type == CT_MAP { expr_map_val_type } else { -1 }
+    let recv_map_val_struct = if obj_type == CT_MAP { expr_map_val_struct } else { "" }
+    let recv_map_key_struct = if obj_type == CT_MAP { expr_map_key_struct } else { "" }
 
     if obj_type == CT_BYTES && method == "with_ptr" {
         let args_sl = node_args(node)
@@ -3668,7 +3688,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
     }
 
     if is_map_builtin_intercept(obj_type, method) {
-        if emit_map_method(node, obj_str, obj_node, method) != 0 { return }
+        if emit_map_method(node, obj_str, obj_node, method, recv_map_key_ct, recv_map_val_ct, recv_map_val_struct, recv_map_key_struct) != 0 { return }
     }
 
     if is_set_builtin_intercept(obj_type, method) {
@@ -3915,7 +3935,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
     }
 
     // Trait-based builtin method dispatch
-    if emit_builtin_trait_method(node, obj_str, obj_type, obj_node, method) != 0 {
+    if emit_builtin_trait_method(node, obj_str, obj_type, obj_node, method, recv_map_key_ct, recv_map_val_ct, recv_map_val_struct, recv_map_key_struct) != 0 {
         return
     }
 
