@@ -1,0 +1,117 @@
+// ymw81c: an unannotated `let` binding a generic-fn call that returns a
+// Map[K,V] clobbers the value type to CT_INT. src/codegen_stmt.bl's
+// unannotated-CT_MAP arm (:3500-3507, twin :8689-8702) read
+// get_map_value_type(val_str) -- which defaults CT_INT on a miss -- instead
+// of the `_raw` twin that already exists for the KEY (get_map_key_type_raw,
+// wx184m). `val_str` for a generic-fn call is the raw call-expression text,
+// never a ScopeVar, so the getter always misses and the clobber always
+// fires. Any V other than Int (Float, Str, ...) then reads back through the
+// wrong C type.
+//
+// Discriminator: Map[Str,Float] -> Map[Str,Str] (V != Int, U != V) proves the
+// fabricated default is a hard-coded CT_INT, not "inherited from V" -- the
+// ticket's own repro (source V = Int) can't distinguish the two theories,
+// since CT_INT matches that V by coincidence.
+//
+// Spec: sections/03_types.md (Map value type authority).
+
+import std.map.{map_map_values, map_filter, map_merge}
+import std.list.{list_map}
+import compile_test_helpers
+
+fn pick[K, V](m: Map[K, V]) -> Map[K, V] { m }
+
+test "pick[K,V] over Map[Int,Float] carries the real value type (no HOF, no closure, no U)" {
+    let m: Map[Int, Float] = Map()
+    m.insert(1, 2.5)
+    let m2 = pick(m)
+    assert_eq(m2.get(1).unwrap(), 2.5)
+}
+
+test "map_map_values V=Float U=Str: result value type is Str, not the CT_INT default" {
+    let m: Map[Str, Float] = Map()
+    m.insert("a", 2.5)
+    let m2 = map_map_values(m, fn(_k: Str, v: Float) -> Str { "{v}" })
+    assert_eq(m2.get("a").unwrap(), "2.5")
+}
+
+test "map_map_values: ticket's own MVCE, Map[Str,Int] -> U=Str" {
+    let m: Map[Str, Int] = Map()
+    m.insert("a", 1)
+    let m2 = map_map_values(m, fn(k: Str, v: Int) -> Str { "{k}{v}" })
+    assert_eq(m2.get("a").unwrap(), "a1")
+}
+
+test "map_map_values: Map[Str,Int] -> U=Float (source V=Int, confounded but still red)" {
+    let m: Map[Str, Int] = Map()
+    m.insert("a", 3)
+    let m2 = map_map_values(m, fn(_k: Str, v: Int) -> Float { v.to_float() * 2.0 })
+    assert_eq(m2.get("a").unwrap(), 6.0)
+}
+
+test "map_filter over Map[Str,Float] carries the real value type (U-free, no third type param)" {
+    let m: Map[Str, Float] = Map()
+    m.insert("a", 1.5)
+    m.insert("b", 2.5)
+    let filtered = map_filter(m, fn(_k: Str, v: Float) -> Bool { v > 2.0 })
+    assert_eq(filtered.len(), 1)
+    assert_eq(filtered.get("b").unwrap(), 2.5)
+}
+
+test "map_merge over Map[Str,Float] carries the real value type (U-free, no third type param)" {
+    let a: Map[Str, Float] = Map()
+    a.insert("x", 1.5)
+    let b: Map[Str, Float] = Map()
+    b.insert("y", 2.5)
+    let merged = map_merge(a, b)
+    assert_eq(merged.len(), 2)
+    assert_eq(merged.get("x").unwrap(), 1.5)
+    assert_eq(merged.get("y").unwrap(), 2.5)
+}
+
+test "ticket's list_map-then-map_map_values combination, isolated in a subprocess" {
+    let mut s = "import std.list.\{list_map}\n"
+    s = s.concat("import std.map.\{map_map_values}\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let ys = list_map([1, 2], fn(n: Int) -> Str \{ \"\{n}\" })\n")
+    s = s.concat("    let m: Map[Str, Float] = Map()\n")
+    s = s.concat("    m.insert(\"a\", 2.5)\n")
+    s = s.concat("    let m2 = map_map_values(m, fn(k: Str, v: Float) -> Str \{ \"\{v}\" })\n")
+    s = s.concat("    assert(ys.len() == 2)\n")
+    s = s.concat("    io.println(m2.get(\"a\").unwrap())\n")
+    s = s.concat("}\n")
+    let r = compile_test_helpers.compile_and_run(s, "ymw81c_combo")
+    if r.exit_code != 0 { io.println("FAIL: exit {r.exit_code} out={r.out} err={r.err_out}") }
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out.trim(), "2.5")
+}
+
+// Green guard: an unannotated `let` alias whose RHS is a genuinely-recovered
+// ScopeVar (raw >= 0), not a bare call expression, must keep adopting the
+// carried value exactly as it does today (wx184m). Mirrors
+// tests/test_list_map_unwrap_value_type.bl's shape with a Float value
+// (V != Int) instead of Str, since that's this ticket's focus.
+test "local alias of an annotated Map keeps its own value type (green guard)" {
+    let mut frames: List[Map[Str, Float]] = []
+    let mut m: Map[Str, Float] = Map()
+    m.insert("k", 4.5)
+    frames.push(m)
+    let alias = frames.get(0).unwrap()
+    assert_eq(alias.get("k").unwrap(), 4.5)
+}
+
+// Green guard: the module-level twin (emit_top_level_let, codegen_stmt.bl
+// :8689-8702). A module-level `let` cannot call a function today (B3), so a
+// bare-variable alias is the only constructible top-level carry -- mirrors
+// tests/test_list_map_reassign_value_type.bl's module-level shape.
+let mut ymw81c_top_m: Map[Str, Float] = Map()
+let ymw81c_top_alias = ymw81c_top_m
+
+fn ymw81c_top_seed() {
+    ymw81c_top_m.insert("k", 8.5)
+}
+
+test "module-level alias of an annotated Map keeps its own value type (green guard, :8689 twin)" {
+    ymw81c_top_seed()
+    assert_eq(ymw81c_top_alias.get("k").unwrap(), 8.5)
+}
