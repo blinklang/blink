@@ -1663,14 +1663,17 @@ fn tc_pin_tail_ret_generic(declared_ret: Int, inferred_ret: Int) {
 //     an unbound metavar, so this IS the branch an under-determined tail takes, and
 //     placing the pin here means it can never turn a reported mismatch into a silent
 //     success.
-//   • tc_in_closure_depth == 0 — tc_current_fn_ret is installed by tc_check_fn (and
-//     the test-body elaborator) only, so inside a closure body it still names the
-//     ENCLOSING fn's declared return. The compare above merely misreports on that;
-//     this pin MUTATES ty_pool, so it would bind the closure's own metavars to the
-//     enclosing instance's args — `GKV[Str, Str]` emitted as blink_GKV_Int_Str with
-//     blink_kops_i64 baked for a Str key, the br hnyqe4 silent-hash shape under a
-//     wrong-but-plausible mono name. Leaving the closure's return under-determined
-//     keeps it a loud stop instead.
+//   • tc_in_closure_depth == 0 — since n8mmry, tc_current_fn_ret DOES name the
+//     closure's own declared return inside a closure body (installed by
+//     tc_check_closure_body_against_own_ret, never the enclosing fn's), so the
+//     compare above is no longer misreporting there. The gate stays anyway:
+//     tc_pin_tail_ret_generic MUTATES ty_pool in place, and its own comment warns
+//     that adding a caller can change emitted C for unrelated programs. Nothing
+//     forces widening it — an under-determined closure tail declines into a loud
+//     stop, never a silent miscompile — and doing so would newly touch live rows
+//     in tests/test_y1n3ck_generic_return_tail_infer.bl and
+//     tests/test_e00ngd_fold_struct_accumulator.bl that no test asks for. Tracked
+//     as its own follow-up (br S6) rather than folded into this fix.
 fn tc_check_returned_value(val_t: Int, at_node: Int) ! TypeCheck.Report, Diag.Report {
     if tc_current_fn_ret == TYPE_VOID || tc_current_fn_ret == TYPE_UNKNOWN { return }
     if val_t == TYPE_UNKNOWN { return }
@@ -1846,10 +1849,61 @@ fn check_closure_ret(closure_node: Int, expected_ret: Int, method: Str, containe
     }
 }
 
+// A closure's OWN written return annotation, resolved to a tid. Mirrors
+// register_fn_sig's ret-resolution (:3132-3156): resolve_type_ann, then
+// re-intern a generic user-struct/enum return as a structural instance carrying
+// its type-arg slots via tc_fnsig_param_instance_tid, so the codegen mono seams
+// read the instance tid instead of the erased bare base. TYPE_VOID when
+// unannotated, matching register_fn_sig's no-`-> T` default (Principle 2: a
+// closure and a named fn share one obligation). No node_return_type string
+// fallback needed: parser.bl's sole Closure producer sets return_type/type_ann
+// from the same node, so ret_ann == -1 iff ret_str == "".
+fn tc_closure_declared_ret(cls: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
+    let ret_ann = node_type_ann(cls)
+    if ret_ann == -1 { return TYPE_VOID }
+    let mut ret_tid = resolve_type_ann(ret_ann)
+    let ret_inst = tc_fnsig_param_instance_tid(ret_ann, ret_tid)
+    if ret_inst != -1 { ret_tid = ret_inst }
+    ret_tid
+}
+
 // List HOFs whose closure takes a single element-typed param. `fold` is handled
 // separately (its closure takes accumulator + element).
 fn is_elem_closure_hof(method: Str) -> Int {
     method == "map" || method == "filter" || method == "for_each" || method == "any" || method == "all" || method == "find"
+}
+
+// The single install point for a closure's own fn-identity: installs
+// tc_current_fn_name/tc_current_fn_ret to the closure's OWN declared return
+// (never the enclosing fn's, which is what every other read of these globals
+// gets for free once this runs), walks the body once, and checks the implicit
+// tail against that same declared return. Mirrors emit_closure's codegen
+// treatment of a closure as its own fn context (src/codegen_closures.bl:868-874,
+// 1028-1043, 1046-1052) — codegen already does this; typecheck never did, which
+// is the root of all seven n8mmry symptoms. Shared by the two positions a
+// closure body is walked from (tc_check_body's Closure arm and
+// check_closure_body's HOF path below), so the tc_in_closure_depth bump and the
+// tc_fn_body_block one-shot marker live here exactly once instead of duplicated
+// at both call sites.
+// tc_current_fn_name/tc_current_fn_ret are genuinely saved and restored here;
+// the tc_check_body call mutates plenty of other global state (tc_errors,
+// ty_pool, ...) that this function does not save/restore around that one call,
+// which the analyzer correctly flags (mirrors tc_check_fn:9052).
+@allow(UnrestoredMutation, IncompleteStateRestore)
+fn tc_check_closure_body_against_own_ret(cls: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let prev_fn_name = tc_current_fn_name
+    let prev_fn_ret = tc_current_fn_ret
+    tc_current_fn_name = "closure"
+    tc_current_fn_ret = tc_closure_declared_ret(cls)
+    let body = node_body(cls)
+    if node_kind(body) == NodeKind.Block { tc_fn_body_block = 1 }
+    tc_in_closure_depth = tc_in_closure_depth + 1
+    tc_check_body(body)
+    tc_in_closure_depth = tc_in_closure_depth - 1
+    tc_fn_body_block = 0
+    tc_check_missing_tail_value(body, tc_current_fn_ret, "closure", cls)
+    tc_current_fn_name = prev_fn_name
+    tc_current_fn_ret = prev_fn_ret
 }
 
 // gkr3fs Part B — type-check the BODY of a closure with params bound to the types
@@ -1857,10 +1911,10 @@ fn is_elem_closure_hof(method: Str) -> Int {
 // bind to TYPE_UNKNOWN, so a wrong body (e.g. `Str` param used as `Int`) leaks past
 // typecheck to the C compiler. When a param IS explicitly annotated we bind the
 // declared type instead — this preserves Part A's annotation validation and never
-// contradicts it. Walks the body exactly once via tc_check_body, mirroring its own
-// Closure handler's scope dance — INCLUDING the tc_in_closure_depth bump: this is the
-// second entry into a closure body (the HOF path) and does not pass through that
-// handler, so anything keyed on "am I in a closure" must be maintained in both.
+// contradicts it. The body walk itself — including installing the closure's own
+// declared return and the tc_in_closure_depth bump — is shared with tc_check_body's
+// Closure arm via tc_check_closure_body_against_own_ret (br n8mmry): this is the
+// second of the two entry points into a closure body (the HOF path).
 fn check_closure_body(cls: Int, p0_t: Int, p1_t: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     if cls == -1 || node_kind(cls) != NodeKind.Closure { return }
     nr_push_scope()
@@ -1880,9 +1934,7 @@ fn check_closure_body(cls: Int, p0_t: Int, p1_t: Int) ! TypeCheck.Resolve, TypeC
             nr_define_typed(node_name(p1), 0, bind1)
         }
     }
-    tc_in_closure_depth = tc_in_closure_depth + 1
-    tc_check_body(node_body(cls))
-    tc_in_closure_depth = tc_in_closure_depth - 1
+    tc_check_closure_body_against_own_ret(cls)
     nr_pop_scope()
 }
 
@@ -9046,6 +9098,23 @@ fn tc_block_tail_value(stmt: Int) -> Int {
     stmt
 }
 
+// A Block body with a non-Void declared return but NO tail value at all (ends in
+// a `let`, an empty body, etc.) — the one branch that cannot be folded into the
+// per-statement walk, since it reports against the whole fn/closure, not a
+// statement that doesn't exist. infer_type(Block) answers TYPE_VOID (not
+// TYPE_UNKNOWN) for a valueless body, so `-> Int { let x = 1 }` depends on this
+// running here, verbatim, with `at_node` as the report site. Extracted from
+// tc_check_fn (br n8mmry) so a closure's own declared return gets the same check
+// a named fn's does — "Two spellings of one program must give one answer, and
+// the only way to guarantee that is one implementation" (tc_check_returned_value).
+fn tc_check_missing_tail_value(body: Int, declared_ret: Int, owner_name: Str, at_node: Int) ! TypeCheck.Report, Diag.Report {
+    if node_kind(body) != NodeKind.Block { return }
+    if declared_ret == TYPE_VOID || declared_ret == TYPE_UNKNOWN { return }
+    if tc_block_tail_stmt(body) == -1 {
+        tc_error_at("function '{owner_name}' declared return type {type_to_str(declared_ret)} but body returns {type_to_str(TYPE_VOID)}", at_node)
+    }
+}
+
 // Genuine scope save/restore: nr_push_scope on entry, nr_pop_scope on exit.
 // The sibling diag_push_allows/diag_clear_allows and nr_* scope writes fall
 // outside that pattern, which the analyzer correctly flags.
@@ -9110,14 +9179,12 @@ fn tc_check_fn(fn_node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report 
         // old post-pop compare was its only producer (infer_type(Block) answers
         // TYPE_VOID — not UNKNOWN — for a valueless body), so `fn f() -> Int { let x =
         // 1 }` and `fn f() -> Int { }` both depend on keeping it here, verbatim, with
-        // fn_node as the report site.
-        if sig != -1 && node_kind(body) == NodeKind.Block {
+        // fn_node as the report site. `sig != -1` is kept here, not inside the shared
+        // helper: it is what leaves this check un-run for every impl method (br ya8qyf),
+        // and that miss must stay verbatim.
+        if sig != -1 {
             let declared_ret = fnsig_pool.get(sig).unwrap().ret
-            if declared_ret != TYPE_VOID && declared_ret != TYPE_UNKNOWN {
-                if tc_block_tail_stmt(body) == -1 {
-                    tc_error_at("function '{fn_name}' declared return type {type_to_str(declared_ret)} but body returns {type_to_str(TYPE_VOID)}", fn_node)
-                }
-            }
+            tc_check_missing_tail_value(body, declared_ret, fn_name, fn_node)
         }
     }
     diag_clear_allows()
@@ -9488,9 +9555,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                 i = i + 1
             }
         }
-        tc_in_closure_depth = tc_in_closure_depth + 1
-        tc_check_body(node_body(node))
-        tc_in_closure_depth = tc_in_closure_depth - 1
+        tc_check_closure_body_against_own_ret(node)
         nr_pop_scope()
         return
     }

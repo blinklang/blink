@@ -1,0 +1,315 @@
+// br n8mmry: typecheck's Closure arm never validated a closure body against its OWN
+// written return-type annotation. tc_current_fn_name/tc_current_fn_ret are installed
+// only by tc_check_fn (named functions) and were never updated on entering a closure
+// body, so every diagnostic keyed on that ambient state — inside a closure — actually
+// read the ENCLOSING function's identity and declared return. codegen already treats a
+// closure as its own fn context (src/codegen_closures.bl:868-874, 1028-1043,
+// 1046-1052); typecheck did not. That asymmetry is the root of all seven confirmed
+// symptoms below.
+//
+// Spec authority: sections/02_syntax.md:1264 (a let-bound closure "has already been
+// type-checked against its own written return type"), sections/03c_protocols.md:439
+// (HOF closures obey Rules 2/3 "against their own return types"),
+// sections/02_syntax.md:1234-1235 (the closure's own return type governs whether `?`
+// is valid), sections/02_syntax.md:313-328 (closures share `fn`/`-> T` form with named
+// fns — Principle 2: same obligation).
+//
+// FALSE NEGATIVES (invalid code silently accepted, one a live miscompile):
+//   1. `let c = fn() -> Int { "hello" }` typechecks clean.
+//   2. `let c = fn() -> Int { return "hello" }` typechecks clean.
+//   6. `?` in an unannotated closure inside a Result fn is silent at typecheck (only
+//      codegen's C-level twin catches it — `build/blink check` must also catch it).
+//   8. `fn() -> Int { let x = 1 }` compiles, links, and returns uninitialized memory.
+//  10. A HOF closure argument's own tail mismatch is never checked.
+//  11. A HOF closure that mismatches BOTH the HOF's expectation and its own declared
+//      return under-reports (only the HOF-expectation mismatch fires).
+//  13. `fn() -> Map[Float, Int] { Map() }` never validates key hashability (E1400).
+//
+// FALSE POSITIVES (valid code rejected, because the compare read the wrong context):
+//   3. `return 42` inside a closure declaring `-> Int`, nested in `fn outer() -> Str`,
+//      reports "does not match function 'outer' return type Str".
+//   4. A bare `return` inside an unannotated (Void) closure, nested in a non-Void fn,
+//      is rejected as if the ENCLOSING fn's non-Void return applied.
+//   5. `?` inside a closure explicitly annotated `-> Result[...]`, nested in a Void
+//      fn, is rejected with a spurious E0508.
+//  12. A closure nested inside another closure is validated against a STALE ancestor
+//      context instead of its own immediately-enclosing closure's declared return.
+//
+// GREEN GUARDS (must never regress):
+//   7. An unannotated closure with an ordinary Int tail stays inferred — no spurious
+//      "declared Void but tail is Int" (tc_check_returned_value's Void/Unknown guard
+//      at :1678 short-circuits before any compare, so this is safe by construction).
+//   9. The ticket's own GKV symptom-2 program (already pinned as green in
+//      tests/test_5htahp_concrete_field_return_mono.bl) — repeated here as the
+//      ticket's own record.
+
+import compile_test_helpers
+import std.io
+
+fn assert_has(hay: Str, needle: Str, label: Str) {
+    if !hay.contains(needle) { io.println("FAIL: {label} — missing '{needle}'") }
+    assert(hay.contains(needle))
+}
+
+fn assert_lacks(hay: Str, needle: Str, label: Str) {
+    if hay.contains(needle) { io.println("FAIL: {label} — forbidden '{needle}' present") }
+    assert(!hay.contains(needle))
+}
+
+// There is no Str.count; splitting on the needle yields (occurrences + 1) pieces.
+fn count_of(hay: Str, needle: Str) -> Int {
+    hay.split(needle).len() - 1
+}
+
+fn assert_count(hay: Str, needle: Str, want: Int, label: Str) {
+    let got = count_of(hay, needle)
+    if got != want { io.println("FAIL: {label} — expected {want} occurrence(s) of '{needle}', got {got}") }
+    assert_eq(got, want)
+}
+
+// ── 1. implicit-tail mismatch, unannotated enclosing context ─────────────────────
+// The ticket's own MVCE. Never reaches the Block-arm's tail check pre-fix because
+// tc_fn_body_block is never set for a closure body.
+
+test "a closure's implicit tail mismatching its OWN return is reported (E0300)" {
+    let mut src = "fn main() \{\n"
+    src = src.concat("    let c = fn() -> Int \{ \"hello\" }\n")
+    src = src.concat("}\n")
+    compile_test_helpers.expect_compile_error(src, "n8mmry_row1", "E0300")
+}
+
+// ── 2. explicit-return mismatch, unannotated enclosing context ───────────────────
+// Pre-fix tc_current_fn_ret is `main`'s TYPE_VOID, so tc_check_returned_value's
+// Void/Unknown guard (:1678) skips the compare entirely — silent.
+
+test "a closure's explicit return mismatching its OWN return is reported (E0300)" {
+    let mut src = "fn main() \{\n"
+    src = src.concat("    let c = fn() -> Int \{ return \"hello\" }\n")
+    src = src.concat("}\n")
+    compile_test_helpers.expect_compile_error(src, "n8mmry_row2", "E0300")
+}
+
+// ── 3. wrong-context misreport: valid code, rejected pre-fix ─────────────────────
+// The closure's own declared return (Int) matches its own tail (42). Pre-fix the
+// compare ran against the ENCLOSING fn's declared return (Str) instead, and reported
+// the mismatch as belonging to 'outer'.
+
+test "a closure matching its OWN return is accepted even when the enclosing fn's differs" {
+    let mut src = "fn outer() -> Str \{\n"
+    src = src.concat("    let c = fn() -> Int \{ return 42 }\n")
+    src = src.concat("    \"done\"\n")
+    src = src.concat("}\n")
+    src = src.concat("fn main() \{ let _x = outer() }\n")
+    let out = compile_test_helpers.compile_and_capture(src, "n8mmry_row3")
+    if out.contains("E0300") { io.println("FAIL: spurious mismatch against the enclosing fn") }
+    assert(!out.contains("E0300"))
+    assert_lacks(out, "function 'outer'", "row3 misattribution to the enclosing fn")
+}
+
+// ── 4. bare `return` in an unannotated (Void) closure ────────────────────────────
+// Pre-fix tc_current_fn_ret was the ENCLOSING fn's Int, so a bare `return` (legal in
+// a Void closure) was rejected as if it belonged to a non-Void function.
+
+test "a bare 'return' in an unannotated closure is accepted inside a non-Void fn" {
+    let mut src = "fn outer() -> Int \{\n"
+    src = src.concat("    let c = fn() \{ return }\n")
+    src = src.concat("    5\n")
+    src = src.concat("}\n")
+    src = src.concat("fn main() \{ let _x = outer() }\n")
+    compile_test_helpers.expect_no_error(src, "n8mmry_row4", "E0300")
+}
+
+// ── 5. `?` in an annotated `-> Result` closure inside a Void fn ──────────────────
+// Pre-fix the `?` legality check (E0508) read the ENCLOSING Void fn's return kind and
+// rejected `?` even though the closure's OWN declared return is Result.
+
+fn helper_result() -> Result[Int, Str] { Ok(1) }
+
+test "'?' is accepted in a closure explicitly annotated -> Result, inside a Void fn" {
+    let mut src = "fn helper_result() -> Result[Int, Str] \{ Ok(1) }\n"
+    src = src.concat("fn side_effect() \{\n")
+    src = src.concat("    let c = fn() -> Result[Int, Str] \{\n")
+    src = src.concat("        let v = helper_result()?\n")
+    src = src.concat("        Ok(v)\n")
+    src = src.concat("    }\n")
+    src = src.concat("}\n")
+    src = src.concat("fn main() \{ side_effect() }\n")
+    compile_test_helpers.expect_no_error(src, "n8mmry_row5", "E0508")
+}
+
+// ── 6. `?` in an UNANNOTATED closure inside a Result fn ───────────────────────────
+// The closure's own declared return defaults to TYPE_VOID (unannotated), so `?` is
+// illegal there regardless of what the enclosing fn returns. Pre-fix tc_current_fn_ret
+// read the ENCLOSING fn's Result kind and let it through silently. Checked via
+// `build/blink check`, not just raw `blinkc`, per sections/03c_protocols.md §3c.2
+// ("Why type checking, not codegen").
+
+test "'?' in an unannotated closure inside a Result fn is rejected by 'blink check' (E0508)" {
+    let mut src = "fn helper_result() -> Result[Int, Str] \{ Ok(1) }\n"
+    src = src.concat("fn main() -> Result[Int, Str] \{\n")
+    src = src.concat("    let c = fn() \{\n")
+    src = src.concat("        let v = helper_result()?\n")
+    src = src.concat("    }\n")
+    src = src.concat("    Ok(1)\n")
+    src = src.concat("}\n")
+    let out = compile_test_helpers.check_via_cli(src, "n8mmry_row6")
+    assert_has(out, "E0508", "row6 'blink check' catches the unannotated-closure '?' misuse")
+}
+
+// ── 7. GREEN GUARD: an ordinary unannotated closure stays inferred ───────────────
+// declared_ret == TYPE_VOID for an unannotated closure, and tc_check_returned_value's
+// Void/Unknown guard (:1678) short-circuits before any compare — so the ubiquitous
+// `.map(fn(x) { x * 2 })` shape must never spuriously error just because the closure
+// now installs its own (Void) declared return.
+
+test "GUARD: an unannotated closure with an ordinary tail is never rejected" {
+    let mut src = "fn main() \{\n"
+    src = src.concat("    let c = fn() \{ 5 }\n")
+    src = src.concat("    let _x = c()\n")
+    src = src.concat("}\n")
+    compile_test_helpers.expect_no_error(src, "n8mmry_row7", "E0300")
+}
+
+// ── 8. empty tail: the live miscompile ────────────────────────────────────────────
+// `fn() -> Int { let x = 1 }` has NO tail value at all. infer_type(Block) answers
+// TYPE_VOID for a valueless body (not TYPE_UNKNOWN), so this is the one branch that
+// cannot be folded into the per-statement walk. Pre-fix this compiled, linked, and
+// returned uninitialized memory as an Int.
+
+test "a closure with no tail value at all is reported (E0300, 'but body returns Void')" {
+    let mut src = "fn main() \{\n"
+    src = src.concat("    let c = fn() -> Int \{ let x = 1 }\n")
+    src = src.concat("    let _y = 0\n")
+    src = src.concat("}\n")
+    let out = compile_test_helpers.compile_and_capture(src, "n8mmry_row8")
+    assert_has(out, "E0300", "row8 empty closure tail reported")
+    assert_has(out, "function 'closure'", "row8 identity names the closure, not the enclosing fn")
+    assert_has(out, "but body returns Void", "row8 exact missing-tail wording")
+}
+
+// ── 9. the ticket's own GKV symptom-2 program ────────────────────────────────────
+// Already pinned green in tests/test_5htahp_concrete_field_return_mono.bl (the
+// closure's own -> GKV[Int, Str] annotation reaches the mono target). Repeated here,
+// self-contained, as this ticket's own record: no I0001, the mono name is present,
+// the bare closure head is absent, no erasure, the int kops pair is present (not the
+// string one), and the value round-trips at runtime.
+
+fn gkv_decl() -> Str {
+    "type GKV[K, V] \{ m: Map[K, V] }\n"
+}
+
+fn mkmap_annotated() -> Str {
+    let mut s = "fn mkmap() -> Map[Int, Str] \{\n"
+    s = s.concat("    let m: Map[Int, Str] = Map()\n")
+    s = s.concat("    m\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "GUARD: a closure's own generic-struct return reaches the mono target (5htahp/n8mmry)" {
+    let mut s = gkv_decl()
+    s = s.concat(mkmap_annotated())
+    s = s.concat("fn a() -> GKV[Int, Str] \{\n")
+    s = s.concat("    let c = fn() -> GKV[Int, Str] \{ GKV \{ m: mkmap() } }\n")
+    s = s.concat("    c()\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let g = a()\n")
+    s = s.concat("    g.m.insert(256, \"lo\")\n")
+    s = s.concat("    g.m.insert(512, \"hi\")\n")
+    s = s.concat("    assert(g.m.get(256).unwrap() == \"lo\")\n")
+    s = s.concat("    assert(g.m.get(512).unwrap() == \"hi\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_no_error(s, "n8mmry_row9_ice", "I0001")
+    let c = compile_test_helpers.compile_and_emit_c(s, "n8mmry_row9_c")
+    assert_has(c, "blink_GKV_Int_Str", "row9 closure return mono name")
+    assert_lacks(c, "static blink_GKV __closure_", "row9 closure return bare head")
+    assert_lacks(c, "_Void", "row9 no erasure")
+    assert_has(c, "blink_kops_i64", "row9 int kops present")
+    assert_lacks(c, "blink_kops_str", "row9 string kops absent")
+    let r = compile_test_helpers.compile_and_run(s, "n8mmry_row9_run")
+    if r.exit_code != 0 { io.println("FAIL: row9 runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+}
+
+// ── 10. HOF entry path via `.map` ─────────────────────────────────────────────────
+// check_closure_body (the List-HOF walk) had the identical omission as the
+// let-bound path. Pre-fix a `.map` closure's own tail mismatch was never checked.
+
+test "a '.map' closure's own tail mismatch is reported (E0300)" {
+    let mut src = "fn main() \{\n"
+    src = src.concat("    let xs: List[Int] = [1, 2, 3]\n")
+    src = src.concat("    let ys = xs.map(fn(x: Int) -> Int \{ \"bad\" })\n")
+    src = src.concat("    let _z = ys.len()\n")
+    src = src.concat("}\n")
+    compile_test_helpers.expect_compile_error(src, "n8mmry_row10", "E0300")
+}
+
+// ── 11. HOF own-ret mismatch AND HOF-expectation mismatch fire independently ─────
+// check_closure_ret (pre-existing) validates the closure's annotation against what
+// `.filter` requires (Bool); it answers a DIFFERENT question than this fix's own-body
+// check and the two compose without duplication. Note Int/Bool are compatible in
+// Blink (types_compatible: C-style truthiness), so the mismatched HOF type must be
+// Str, not Int, to actually trigger check_closure_ret. `.filter`'s closure here
+// declares -> Str (mismatching Bool) AND its own tail is Int (mismatching its own
+// Str) — two independent defects. Pre-fix only check_closure_ret's report fired
+// (1x E0300); post-fix both fire (2x E0300).
+
+test "a '.filter' closure mismatching BOTH its HOF and its own return reports both (2x E0300)" {
+    let mut src = "fn main() \{\n"
+    src = src.concat("    let xs: List[Int] = [1, 2, 3]\n")
+    src = src.concat("    let ys = xs.filter(fn(x: Int) -> Str \{ 42 })\n")
+    src = src.concat("}\n")
+    let out = compile_test_helpers.compile_and_capture(src, "n8mmry_row11")
+    assert_count(out, "E0300", 2, "row11 HOF-expectation mismatch AND own-return mismatch both reported")
+}
+
+// ── 12. nested closures ───────────────────────────────────────────────────────────
+// The install/save/restore must nest correctly: each closure body is validated
+// against its OWN immediately-enclosing declared return, not a stale ancestor's.
+
+test "GUARD: the enclosing fn's context is restored once its nested closures return" {
+    let mut src = "fn outer() -> Int \{\n"
+    src = src.concat("    let make_str = fn() -> Str \{\n")
+    src = src.concat("        let inner = fn() -> Int \{ return 1 }\n")
+    src = src.concat("        inner()\n")
+    src = src.concat("        \"ok\"\n")
+    src = src.concat("    }\n")
+    src = src.concat("    let _s = make_str()\n")
+    src = src.concat("    return 5\n")
+    src = src.concat("}\n")
+    src = src.concat("fn main() \{ let _x = outer() }\n")
+    compile_test_helpers.expect_no_error(src, "n8mmry_row12_main", "E0300")
+}
+
+// The nested-flip: pre-fix, `return "hi"` inside `inner` compared against a STALE
+// ancestor context (outer's Int, since neither closure ever installed its own) and
+// was rejected — a false positive, since `inner`'s OWN declared return is Str and
+// "hi" matches it.
+
+test "a nested closure is validated against its OWN declared return, not a stale ancestor's" {
+    let mut src = "fn outer() -> Int \{\n"
+    src = src.concat("    let make_str = fn() -> Str \{\n")
+    src = src.concat("        let inner = fn() -> Str \{ return \"hi\" }\n")
+    src = src.concat("        inner()\n")
+    src = src.concat("    }\n")
+    src = src.concat("    let _s = make_str()\n")
+    src = src.concat("    return 5\n")
+    src = src.concat("}\n")
+    src = src.concat("fn main() \{ let _x = outer() }\n")
+    compile_test_helpers.expect_no_error(src, "n8mmry_row12_flip", "E0300")
+}
+
+// ── 13. Map[BadKey, Int] hashability reaches a closure's return annotation ───────
+// A NEW diagnostic class this fix produces for free: tc_closure_declared_ret routes
+// the annotation through resolve_type_ann, the same function that validates a named
+// fn's Map-return key hashability (E1400). Pre-fix a closure's Map-valued return was
+// NEVER hashability-checked at all — check_closure_ret validates against the HOF's
+// expected type, not key hashability, and is only reached for HOF closures anyway.
+
+test "a closure's own Map[Float, Int] return is rejected for a non-hashable key (E1400)" {
+    let mut src = "fn main() \{\n"
+    src = src.concat("    let c = fn() -> Map[Float, Int] \{ Map() }\n")
+    src = src.concat("}\n")
+    compile_test_helpers.expect_compile_error(src, "n8mmry_row13", "E1400")
+}
