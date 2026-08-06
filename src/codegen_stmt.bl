@@ -3789,7 +3789,12 @@ fn emit_for_in(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.
             let val_type_csv = if val_struct != "" { "{CT_VOID}" } else { "{val_ct}" }
             let key_struct_csv = if key_struct != "" { key_struct } else { "-" }
             let val_struct_csv = if val_struct != "" { val_struct } else { "-" }
-            ensure_tuple_type(tuple_tag, 2, "{key_type_csv},{val_type_csv}", "{key_struct_csv},{val_struct_csv}")
+            // The erased-recovery-failure defaults are CT_STRING (key) / CT_INT
+            // (value) — never CT_VOID — so a scalar CT_VOID reading here can only
+            // be a genuinely Void key/value type, safe to name (br dq15j7).
+            let key_name_csv = if key_struct == "" && key_ct == CT_VOID { "Void" } else { "" }
+            let val_name_csv = if val_struct == "" && val_ct == CT_VOID { "Void" } else { "" }
+            ensure_tuple_type(tuple_tag, 2, "{key_type_csv},{val_type_csv}", "{key_struct_csv},{val_struct_csv}", "{key_name_csv},{val_name_csv}")
             let tuple_c = c_type_c_name(tuple_tag)
             let lst = fresh_temp("_mapl_")
             let stride_var = fresh_temp("_mstride_")
@@ -6889,6 +6894,54 @@ fn emit_mono_struct_typedef(base_name: Str, concrete_args: Str, arg_tids0: List[
     }
     struct_reg_names.push(c_name)
     struct_reg_set.insert(c_name, 1)
+    // A tuple-stem field (e.g. `v: T` resolving to "Tuple2_int_int") must have its
+    // own typedef forced BEFORE this struct's own `typedef struct {` opens below —
+    // emit_tuple_typedef_for_tag emits directly via emit_line, so calling it from
+    // inside the field loop (after the outer typedef is already open) would nest
+    // one `typedef struct {...}` textually inside another, illegal C. Mirrors
+    // emit_struct_option_typedef (:6640), which forces the same dependency before
+    // opening ITS OWN typedef, at the same (outer) nesting level (br g812z0).
+    let mut j = 0
+    while j < sublist_length(flds_sl) {
+        let f0 = sublist_get(flds_sl, j)
+        let type_ann_node0 = node_value(f0)
+        if type_ann_node0 != -1 {
+            let resolved0 = resolve_mono_slot(node_name(type_ann_node0), tparams_sl, arg_tids, "struct_typedef_field", "{c_name}.{node_name(f0)}", type_ann_node0)
+            if is_struct_type(resolved0) != 0 || is_enum_type(resolved0) != 0 || is_mono_struct_instance(resolved0) != 0 {
+                emit_tuple_typedef_for_tag(resolved0)
+            } else if resolved0 == "Option" {
+                // The field's own resolved type isn't a tuple, but it may WRAP one
+                // (`v: Option[(Int,Int)]`) — the Option carrier the main loop below
+                // registers for this field embeds the tuple BY VALUE, so the tuple's
+                // typedef must precede the carrier's, and the carrier's typedef is
+                // flushed later, outside this function. Force it here too, same
+                // reasoning as the direct-tuple-field case above (br dq15j7).
+                let inner_elems0 = node_elements(type_ann_node0)
+                if inner_elems0 != -1 && sublist_length(inner_elems0) >= 1 {
+                    let inner_ann0 = sublist_get(inner_elems0, 0)
+                    let inner_resolved0 = resolve_mono_slot(node_name(inner_ann0), tparams_sl, arg_tids, "struct_typedef_field_inner", "{c_name}.{node_name(f0)}", inner_ann0)
+                    if is_struct_type(inner_resolved0) != 0 || is_mono_struct_instance(inner_resolved0) != 0 {
+                        emit_tuple_typedef_for_tag(inner_resolved0)
+                    }
+                }
+            } else if resolved0 == "Result" {
+                let inner_elems0 = node_elements(type_ann_node0)
+                if inner_elems0 != -1 && sublist_length(inner_elems0) >= 2 {
+                    let ok_ann0 = sublist_get(inner_elems0, 0)
+                    let err_ann0 = sublist_get(inner_elems0, 1)
+                    let ok_resolved0 = resolve_mono_slot(node_name(ok_ann0), tparams_sl, arg_tids, "struct_typedef_field_inner", "{c_name}.{node_name(f0)}", ok_ann0)
+                    let err_resolved0 = resolve_mono_slot(node_name(err_ann0), tparams_sl, arg_tids, "struct_typedef_field_inner", "{c_name}.{node_name(f0)}", err_ann0)
+                    if is_struct_type(ok_resolved0) != 0 || is_mono_struct_instance(ok_resolved0) != 0 {
+                        emit_tuple_typedef_for_tag(ok_resolved0)
+                    }
+                    if is_struct_type(err_resolved0) != 0 || is_mono_struct_instance(err_resolved0) != 0 {
+                        emit_tuple_typedef_for_tag(err_resolved0)
+                    }
+                }
+            }
+        }
+        j = j + 1
+    }
     emit_td_guard_open(c_type_c_name(c_name))
     emit_line("typedef struct \{")
     cg_indent = cg_indent + 1

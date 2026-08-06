@@ -96,7 +96,7 @@ import diagnostics.{
 }
 import std.path.{path_dirname}
 import formatter.{format_expr}
-import typecheck.{tc_mono_tids_subst, tc_tid_subst_mono, tc_seg_from_tid, is_import_module_name, tc_lookup_node_tid, tc_tid_set_elem_ct, tc_tid_set_elem_struct, tc_tid_set_elem_ct_resolved, tc_tid_set_elem_struct_resolved, tc_tid_list_elem_ct, tc_tid_list_elem_struct, tc_tid_list_elem, tc_tid_map_key_ct, tc_tid_map_key_struct, tc_tid_map_key_ct_resolved, tc_tid_map_key_struct_resolved, tc_tid_map_val_ct, tc_tid_map_val_struct, tc_tid_map_val_tid, tc_tid_map_key_tid, tc_tid_struct_slot_seg, tc_tid_ct, tc_tid_resolved, tc_tid_option_inner_ct, tc_tid_option_inner_struct, tc_tid_result_ok_ct, tc_tid_result_ok_struct, tc_tid_result_err_ct, tc_tid_result_err_struct, tc_tid_to_c_tag, tc_tid_struct, tc_tid_struct_mono_name, tc_tid_is_enum, tc_tid_struct_arg_count, tc_tid_struct_arg_tid, tc_tid_compound_slot_faithful, tc_struct_slot_encodable, tc_tid_inner_tag, tc_tid_option_inner_tid, tc_tid_result_ok_tid, tc_tid_result_err_tid, tc_tid_tuple_elem_encodable, tc_tid_tuple_sname, tc_tid_tuple_arity, tc_tid_tuple_elem_tid, tc_tid_kops_slot_unsolved}
+import typecheck.{tc_mono_tids_subst, tc_tid_subst_mono, tc_seg_from_tid, is_import_module_name, tc_lookup_node_tid, tc_tid_set_elem_ct, tc_tid_set_elem_struct, tc_tid_set_elem_ct_resolved, tc_tid_set_elem_struct_resolved, tc_tid_list_elem_ct, tc_tid_list_elem_struct, tc_tid_list_elem, tc_tid_map_key_ct, tc_tid_map_key_struct, tc_tid_map_key_ct_resolved, tc_tid_map_key_struct_resolved, tc_tid_map_val_ct, tc_tid_map_val_struct, tc_tid_map_val_ct_resolved, tc_tid_map_val_struct_resolved, tc_tid_map_val_tid, tc_tid_map_key_tid, tc_tid_struct_slot_seg, tc_tid_ct, tc_tid_resolved, tc_tid_option_inner_ct, tc_tid_option_inner_struct, tc_tid_result_ok_ct, tc_tid_result_ok_struct, tc_tid_result_err_ct, tc_tid_result_err_struct, tc_tid_to_c_tag, tc_tid_struct, tc_tid_struct_mono_name, tc_tid_is_enum, tc_tid_struct_arg_count, tc_tid_struct_arg_tid, tc_tid_compound_slot_faithful, tc_struct_slot_encodable, tc_tid_inner_tag, tc_tid_option_inner_tid, tc_tid_result_ok_tid, tc_tid_result_err_tid, tc_tid_tuple_elem_encodable, tc_tid_tuple_sname, tc_tid_tuple_arity, tc_tid_tuple_elem_tid, tc_tid_kops_slot_unsolved}
 
 // codegen_expr.bl — Expression codegen, closures, capture analysis
 
@@ -454,9 +454,9 @@ pub fn recover_option_set_elem_from_tid(node: Int, var_name: Str) ! Codegen.Regi
 fn recover_map_kv_from_tid(node: Int, var_name: Str) ! Codegen.Register, Codegen.Scope {
     let mtid = tc_tid_subst_mono(tc_lookup_node_tid(node), cg_mono_tparams_sl, cg_mono_arg_tids)
     let kct = tc_tid_map_key_ct_resolved(mtid)
-    let vct = tc_tid_map_val_ct(mtid)
+    let vct = tc_tid_map_val_ct_resolved(mtid)
     if kct < 0 || vct < 0 { return }
-    set_map_types(var_name, kct, vct, tc_tid_map_val_struct(mtid))
+    set_map_types(var_name, kct, vct, tc_tid_map_val_struct_resolved(mtid))
     let ks = tc_tid_map_key_struct_resolved(mtid)
     if ks != "" { set_map_key_struct(var_name, ks) }
 }
@@ -1095,13 +1095,7 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
             if fa_type == CT_SET {
                 recover_set_elem_from_tid(node, expr_result_str)
             } else if fa_type == CT_MAP {
-                let mtid = tc_lookup_node_tid(node)
-                let kct = tc_tid_map_key_ct(mtid)
-                if kct >= 0 {
-                    set_map_types(expr_result_str, kct, tc_tid_map_val_ct(mtid), tc_tid_map_val_struct(mtid))
-                    let ks = tc_tid_map_key_struct(mtid)
-                    if ks != "" { set_map_key_struct(expr_result_str, ks) }
-                }
+                recover_map_kv_from_tid(node, expr_result_str)
             }
             expr_result_type = fa_type
             return
@@ -2956,9 +2950,12 @@ fn ctor_kops_elem_from_node_tid(node: Int, container: Str) -> CarrierInfo {
 
 // One tuple element's registration encoding: the CT stored in the TupleEntry's
 // elem_types slot, the by-value carrier tag stored in its elem_structs slot ("" for a
-// scalar, which encodes as "-"), and whether this element is encodable from a tid at
-// all. `ok: false` means "decline the whole tuple" — see ensure_tuple_carrier_from_tid.
-type TidTupleElem { ct: Int, struct_tag: Str, ok: Bool }
+// scalar, which encodes as "-"), whether this element is encodable from a tid at
+// all, and the resolved NAME stored in the TupleEntry's elem_names slot ("" for
+// every element except a genuine Void, which is "Void" — br dq15j7, mirrors
+// resolve_tuple_ann's elem_names_enc). `ok: false` means "decline the whole tuple" —
+// see ensure_tuple_carrier_from_tid.
+type TidTupleElem { ct: Int, struct_tag: Str, ok: Bool, name: Str }
 
 // Register the tuple CARRIER a tid names — the TupleEntry plus its Hash/Eq derive —
 // from the TID rather than from an annotation, returning the registered C tag ("" when
@@ -3004,6 +3001,7 @@ fn ensure_tuple_carrier_from_tid(tid: Int) -> Str {
     let arity = tc_tid_tuple_arity(tid)
     let mut elem_types = ""
     let mut elem_structs = ""
+    let mut elem_names = ""
     let mut i = 0
     while i < arity {
         let enc = tid_tuple_elem_enc(tc_tid_tuple_elem_tid(tid, i))
@@ -3011,12 +3009,14 @@ fn ensure_tuple_carrier_from_tid(tid: Int) -> Str {
         if i > 0 {
             elem_types = elem_types.concat(",")
             elem_structs = elem_structs.concat(",")
+            elem_names = elem_names.concat(",")
         }
         elem_types = elem_types.concat("{enc.ct}")
         elem_structs = elem_structs.concat(if enc.struct_tag != "" { enc.struct_tag } else { "-" })
+        elem_names = elem_names.concat(enc.name)
         i = i + 1
     }
-    ensure_tuple_type(c_name, arity, elem_types, elem_structs)
+    ensure_tuple_type(c_name, arity, elem_types, elem_structs, elem_names)
     ensure_tuple_kops_key(c_name)
     c_name
 }
@@ -3037,8 +3037,8 @@ fn tid_tuple_elem_enc(tid0: Int) -> TidTupleElem {
     // typedef under that name.
     if tuple_sname != "" && !diag_is_ice_seg(tuple_sname) {
         let inner = ensure_tuple_carrier_from_tid(tid)
-        if inner == "" || diag_is_ice_seg(inner) { return TidTupleElem { ct: CT_VOID, struct_tag: "", ok: false } }
-        return TidTupleElem { ct: CT_VOID, struct_tag: inner, ok: true }
+        if inner == "" || diag_is_ice_seg(inner) { return TidTupleElem { ct: CT_VOID, struct_tag: "", ok: false, name: "" } }
+        return TidTupleElem { ct: CT_VOID, struct_tag: inner, ok: true, name: "" }
     }
     // Struct or enum (tc_tid_struct covers both kinds): embedded by value under
     // tc_tid_inner_tag's tag, which is c_type_tag_for_struct / the mono stem — the same
@@ -3048,8 +3048,8 @@ fn tid_tuple_elem_enc(tid0: Int) -> TidTupleElem {
         // Decline on "" (unreachable today — kept for symmetry) or on a bare ICE_SEG_*
         // sentinel (br vbcw1e Stage 2: tc_tid_inner_tag can now answer one instead of
         // erasing to "void") — either way this element isn't a real spellable carrier.
-        if tag == "" || diag_is_ice_seg(tag) { return TidTupleElem { ct: CT_VOID, struct_tag: "", ok: false } }
-        return TidTupleElem { ct: CT_VOID, struct_tag: tag, ok: true }
+        if tag == "" || diag_is_ice_seg(tag) { return TidTupleElem { ct: CT_VOID, struct_tag: "", ok: false, name: "" } }
+        return TidTupleElem { ct: CT_VOID, struct_tag: tag, ok: true, name: "" }
     }
     let ct = tc_tid_ct(tid)
     if ct == CT_OPTION || ct == CT_RESULT {
@@ -3059,9 +3059,9 @@ fn tid_tuple_elem_enc(tid0: Int) -> TidTupleElem {
         // CT_OPTION, so emit_tuple_typedef would emit a carrier-typed field with no
         // carrier registered for it. A bare ICE_SEG_* sentinel (br vbcw1e Stage 2) is the
         // same class of non-spellable inner and declines the same way.
-        if tag == "" || diag_is_ice_seg(tag) { return TidTupleElem { ct: CT_VOID, struct_tag: "", ok: false } }
+        if tag == "" || diag_is_ice_seg(tag) { return TidTupleElem { ct: CT_VOID, struct_tag: "", ok: false, name: "" } }
         ensure_carrier_from_tag(tag)
-        return TidTupleElem { ct: ct, struct_tag: tag, ok: true }
+        return TidTupleElem { ct: ct, struct_tag: tag, ok: true, name: "" }
     }
     // A Map element carries its structured tag (Map_str_int) beside CT_MAP, exactly as
     // resolve_tuple_ann's is_compound_ct arm does (compound_name_from_ann → "Map_k_v").
@@ -3077,14 +3077,25 @@ fn tid_tuple_elem_enc(tid0: Int) -> TidTupleElem {
     if ct == CT_MAP {
         let tag = tc_tid_inner_tag(tid)
         // Same ICE_SEG_* decline as the arms above (br vbcw1e Stage 2).
-        if tag == "" || diag_is_ice_seg(tag) { return TidTupleElem { ct: CT_VOID, struct_tag: "", ok: false } }
-        return TidTupleElem { ct: ct, struct_tag: tag, ok: true }
+        if tag == "" || diag_is_ice_seg(tag) { return TidTupleElem { ct: CT_VOID, struct_tag: "", ok: false, name: "" } }
+        return TidTupleElem { ct: ct, struct_tag: tag, ok: true, name: "" }
     }
     // Scalars, and the containers whose tuple field is a uniform pointer
     // (List/Set/Bytes/Iterator): tc_tid_scalar_tag and c_type_tag agree on the tag, and
-    // the field type comes from the CT alone.
-    if ct < 0 { return TidTupleElem { ct: CT_VOID, struct_tag: "", ok: false } }
-    TidTupleElem { ct: ct, struct_tag: "", ok: true }
+    // the field type comes from the CT alone. tc_tid_ct maps TK_VOID onto CT_VOID and
+    // then to -1 (tc_tid_ct cannot distinguish a genuine Void from an unsolved
+    // metavar by CT alone — typecheck.bl:10677), so a genuine Void is admitted here by
+    // KIND via tc_tid_inner_tag, which answers the literal string "void" only for
+    // TK_VOID (br dq15j7, the tid twin of resolve_tuple_ann's elem_name == "Void"
+    // check). An unsolved metavar is foreclosed before codegen by E0301, so it never
+    // reaches this arm.
+    if ct < 0 {
+        if tc_tid_inner_tag(tid) == "void" {
+            return TidTupleElem { ct: CT_VOID, struct_tag: "", ok: true, name: "Void" }
+        }
+        return TidTupleElem { ct: CT_VOID, struct_tag: "", ok: false, name: "" }
+    }
+    TidTupleElem { ct: ct, struct_tag: "", ok: true, name: "" }
 }
 
 // Fail-closed backstop (br farq9f Stage 3). Reached only when every earlier
@@ -7221,6 +7232,7 @@ fn emit_tuple_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Di
     let mut tags = ""
     let mut elem_types_enc = ""
     let mut elem_structs_enc = ""
+    let mut elem_names_enc = ""
     let mut inits = ""
     i = 0
     while i < arity {
@@ -7228,10 +7240,12 @@ fn emit_tuple_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Di
             tags = tags.concat("_")
             elem_types_enc = elem_types_enc.concat(",")
             elem_structs_enc = elem_structs_enc.concat(",")
+            elem_names_enc = elem_names_enc.concat(",")
             inits = inits.concat(", ")
         }
         let vs = val_structs.get(i).unwrap()
         let ctag = val_compound_tags.get(i).unwrap()
+        let vt = val_types.get(i).unwrap()
         if vs != "" {
             tags = tags.concat(vs)
             elem_structs_enc = elem_structs_enc.concat(vs)
@@ -7239,10 +7253,17 @@ fn emit_tuple_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Di
             tags = tags.concat(ctag)
             elem_structs_enc = elem_structs_enc.concat(ctag)
         } else {
-            tags = tags.concat(c_type_tag(val_types.get(i).unwrap()))
+            tags = tags.concat(c_type_tag(vt))
             elem_structs_enc = elem_structs_enc.concat("-")
+            // Unlike a mono struct field's erased T, this element is a fresh,
+            // directly-typechecked sub-expression of the literal itself — CT_VOID
+            // here can only mean a genuinely Void value, never an erased unknown,
+            // so it's always safe to name it (br dq15j7).
+            if vt == CT_VOID {
+                elem_names_enc = elem_names_enc.concat("Void")
+            }
         }
-        elem_types_enc = elem_types_enc.concat("{val_types.get(i).unwrap()}")
+        elem_types_enc = elem_types_enc.concat("{vt}")
         inits = inits.concat("._{i} = {val_strs.get(i).unwrap()}")
         i = i + 1
     }
@@ -7260,7 +7281,7 @@ fn emit_tuple_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Di
     }
     if tup_name == "" {
         tup_name = tuple_c_type_name(tags, arity)
-        ensure_tuple_type(tup_name, arity, elem_types_enc, elem_structs_enc)
+        ensure_tuple_type(tup_name, arity, elem_types_enc, elem_structs_enc, elem_names_enc)
     }
     let tmp = fresh_temp("_tup")
     emit_line("{c_type_c_name(tup_name)} {tmp} = \{ {inits} };")

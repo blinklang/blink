@@ -10579,11 +10579,17 @@ pub fn tc_tid_map_val_struct(tid: Int) -> Str {
 // accessors read ty_pool.get(inner) WITHOUT tc_resolve, so a metavar that
 // tc_pin_generic_args_from_binds bound IN PLACE (kind stays TK_UNKNOWN, solution
 // stashed in inner1) reads back as TK_UNKNOWN -> CT_VOID -> -1/"". These wrap the
-// inner in tc_resolve so a bound a_k := Int surfaces its real ct/sname. Only the
-// key(Map)/elem(Set) are needed — kops_table_name keys the vtable on the key ct
-// and sname alone; the Map value type doesn't affect it. Kept separate from the
-// non-resolving accessors: other callers depend on the bound-but-typevar inner
-// reading as -1/"" (dbzy4r deferral et al.).
+// inner in tc_resolve so a bound a_k := Int surfaces its real ct/sname. Originally
+// only the key(Map)/elem(Set) twins existed — kops_table_name keys the vtable on
+// the key ct and sname alone; the Map value type doesn't affect it. The val
+// twins below were added for recover_map_kv_from_tid (codegen_expr.bl), which
+// DOES need the value's concrete ct/sname (to pick the right box/unbox shape at
+// the read site) — using the plain, non-resolving val accessor there let an
+// in-place-bound value metavar read back as -1, bail the whole recovery, and
+// leave the field at its erased CT_INT default while the map actually stored a
+// boxed value of a different ct, a real box/unbox mismatch (segfault, not just
+// a wrong value). Kept separate from the plain accessors: other callers still
+// depend on the bound-but-typevar inner reading as -1/"" (dbzy4r deferral et al.).
 pub fn tc_tid_map_key_ct_resolved(tid: Int) -> Int {
     if tid < 0 || tid >= ty_pool.len() { return -1 }
     let t = ty_pool.get(tid).unwrap()
@@ -10596,6 +10602,20 @@ pub fn tc_tid_map_key_struct_resolved(tid: Int) -> Str {
     let t = ty_pool.get(tid).unwrap()
     if t.kind != TK_MAP { return "" }
     tid_inner_struct(tc_resolve(t.inner1))
+}
+
+pub fn tc_tid_map_val_ct_resolved(tid: Int) -> Int {
+    if tid < 0 || tid >= ty_pool.len() { return -1 }
+    let t = ty_pool.get(tid).unwrap()
+    if t.kind != TK_MAP { return -1 }
+    tid_inner_ct(tc_resolve(t.inner2))
+}
+
+pub fn tc_tid_map_val_struct_resolved(tid: Int) -> Str {
+    if tid < 0 || tid >= ty_pool.len() { return "" }
+    let t = ty_pool.get(tid).unwrap()
+    if t.kind != TK_MAP { return "" }
+    tid_inner_struct(tc_resolve(t.inner2))
 }
 
 pub fn tc_tid_set_elem_ct_resolved(tid: Int) -> Int {
@@ -11593,26 +11613,27 @@ pub fn tc_tid_tuple_elem_encodable(tid: Int) -> Bool {
     // (Tree_Int) that resolve_tuple_ann's element arm recovers via mono_name_from_ann
     // — the enum twin of the struct-instance case above.
     if k == TK_STRUCT || k == TK_ENUM { return true }
-    // A genuine Void TUPLE ELEMENT is REFUSED, and unlike the pre-hsgsbp state that refusal
-    // is now DELIBERATE — this is the one of the four sibling gates that does not admit it.
+    // A genuine Void TUPLE ELEMENT is now ADMITTED (br dq15j7) — the last of the four
+    // sibling gates to do so, and the emitter gap that forced the deliberate refusal below
+    // for so long is fixed: emit_tuple_typedef (codegen_types.bl:5622) now spells a scalar
+    // element through c_field_type_str(et, name) instead of the bare c_type_str(et), keyed
+    // on a resolved NAME threaded through TupleEntry's new elem_names field
+    // (codegen_types.bl:1312-1317) from all three registration sites (ensure_tuple_type,
+    // resolve_tuple_ann, tid_tuple_elem_enc/ensure_tuple_carrier_from_tid) — the same
+    // NAME-keyed mechanism a named struct/enum Void field already used
+    // (c_field_type_str is keyed on the literal name "Void", not on CT_VOID, precisely so
+    // an ERASED element — type_from_name collapses "" and every unknown name onto CT_VOID
+    // too — keeps failing loudly instead of silently becoming a well-typed int64_t field).
     //
-    // Admitting it here is correct in principle (Void is "an ordinary INHABITED, encodable
-    // type", decisions/under-determined-types.md:39, 6-0) and hsgsbp did admit it at first.
-    // But the emitter behind this gate is not ready: emit_tuple_typedef
-    // (codegen_types.bl:5749) spells a scalar element with c_type_str, which lowers CT_VOID
-    // to `void`, so `Box[(Void, Int)]` emitted `typedef struct { void _0; ... }` — a hard cc
-    // error with no source location, REPLACING the located I0001 the refusal produces. That
-    // is a strictly worse diagnostic for the same broken program.
-    //
-    // It cannot be fixed the way a named field was (c_field_type_str, keyed on the resolved
-    // NAME so an erased slot keeps failing loudly): TupleEntry carries only CTs and struct
-    // names (codegen_types.bl:1331-1336), and type_from_name collapses every unknown name
-    // onto CT_VOID, so a CT-keyed lowering here would silently turn an ERASED element into a
-    // well-typed int64_t field. The name the tuple's own c_name encodes cannot disambiguate
-    // this either, regardless of the lowercase twin's state: br vbcw1e has since armed
-    // tc_tid_scalar_tag, but arming it was necessary for the OUTER speller chokepoints, not
-    // sufficient here — the emit_tuple_typedef gap above is untouched.
-    // Until it's fixed: refuse, and keep the located I0001.
+    // Admitting it here is correct in principle regardless of the emitter state: Void is
+    // "an ordinary INHABITED, encodable type" (decisions/under-determined-types.md:39, 6-0).
+    // tc_tid_ct maps TK_VOID onto CT_VOID and then to -1 (:10677) — CT alone cannot
+    // distinguish a genuine Void from an unsolved metavariable — so this checks the KIND
+    // directly, mirroring tc_struct_slot_encodable's TK_VOID arm above (:11831).
+    if k == TK_VOID { return true }
+    // A kind with no arm above (TK_TYPEVAR, TK_UNKNOWN, TK_FN): E0301 forecloses an
+    // unsolved metavar before codegen reaches this gate, so this refusal exists for
+    // defense in depth and for kinds with genuinely no tuple-element spelling.
     voidtwin_probe("tuple_elem", tid)
     false
 }

@@ -1314,6 +1314,11 @@ type TupleEntry {
     arity: Int
     elem_types: Str
     elem_structs: Str
+    // Per-element resolved NAME, CSV-encoded like elem_types/elem_structs, empty per
+    // position except where a resolved annotation/tid literally names "Void" (br dq15j7).
+    // c_field_type_str keys on this exact string to lower a genuine Void element's field
+    // to an int64_t placeholder — see emit_tuple_typedef's scalar branch.
+    elem_names: Str
 }
 pub let mut emitted_tuple_set: Map[Str, Int] = Map()
 pub let mut emitted_tuple_entries: List[TupleEntry] = []
@@ -2453,6 +2458,7 @@ pub fn resolve_tuple_ann(ta: Int, tparams_sl: Int, segs: List[Str]) -> Option[St
     let mut tags = ""
     let mut elem_types_enc = ""
     let mut elem_structs_enc = ""
+    let mut elem_names_enc = ""
     let mut i = 0
     while i < arity {
         let elem_ann = sublist_get(elems_sl, i)
@@ -2472,13 +2478,19 @@ pub fn resolve_tuple_ann(ta: Int, tparams_sl: Int, segs: List[Str]) -> Option[St
         // inner typedef is registered first; the BLINK_TD_ guard keeps emit order safe.
         let nested_tuple = if carrier_tag == "" && elem_name_raw == "Tuple" { resolve_tuple_ann(elem_ann, tparams_sl, segs) } else { None }
         let elem_t = if carrier_tag != "" { compound_tag_ct(carrier_tag) } else { type_from_name(elem_name) }
-        if carrier_tag == "" && nested_tuple.is_none() && elem_t == CT_VOID && is_struct_type(elem_name) == 0 && is_enum_type(elem_name) == 0 {
+        // A genuine Void element (elem_name literally "Void", the same discriminant
+        // c_field_type_str keys on) is admitted rather than declined — br dq15j7. Every
+        // other unresolved/unknown name still declines: type_from_name collapses "" and
+        // any unrecognized name onto CT_VOID too, and only the exact name "Void" has a
+        // placeholder lowering downstream.
+        if carrier_tag == "" && nested_tuple.is_none() && elem_t == CT_VOID && elem_name != "Void" && is_struct_type(elem_name) == 0 && is_enum_type(elem_name) == 0 {
             return None
         }
         if i > 0 {
             tags = tags.concat("_")
             elem_types_enc = elem_types_enc.concat(",")
             elem_structs_enc = elem_structs_enc.concat(",")
+            elem_names_enc = elem_names_enc.concat(",")
         }
         if nested_tuple.is_some() {
             let inner_c_name = nested_tuple.unwrap()
@@ -2519,10 +2531,11 @@ pub fn resolve_tuple_ann(ta: Int, tparams_sl: Int, segs: List[Str]) -> Option[St
             elem_structs_enc = elem_structs_enc.concat("-")
         }
         elem_types_enc = elem_types_enc.concat("{elem_t}")
+        elem_names_enc = elem_names_enc.concat(if elem_name == "Void" { "Void" } else { "" })
         i = i + 1
     }
     let tup_name = tuple_c_type_name(tags, arity)
-    ensure_tuple_type(tup_name, arity, elem_types_enc, elem_structs_enc)
+    ensure_tuple_type(tup_name, arity, elem_types_enc, elem_structs_enc, elem_names_enc)
     Some(tup_name)
 }
 
@@ -5118,12 +5131,14 @@ pub fn c_type_str(ct: Int) -> Str {
 // spot is detectable only because of it. So: exactly the name "Void" lowers; anything else
 // that lands on CT_VOID keeps failing the C compile.
 //
-// Only the five emitters that declare a NAMED field route through here. A tuple element
-// (emit_tuple_typedef) deliberately does not — it has no resolved name to key on, so it
-// keeps c_type_str and stays loud; a Void tuple element is out of scope for br hsgsbp.
-// Every other c_type_str caller is a return type, a parameter, or a local, where `void` is
-// either correct (a void-returning fn) or a separate bug (`let x = void_fn()` emits
-// `const void x = ...`, broken independently of anything generic — br 296hpm).
+// The five emitters that declare a NAMED struct/enum field route through here, and so does
+// emit_tuple_typedef's scalar branch (br dq15j7): TupleEntry now carries a per-element
+// resolved name (elem_names) threaded from every registration site, "" for an ordinary
+// element and "Void" for a genuine Void one, so a tuple element gets the identical
+// name-keyed lowering a named field always did. Every other c_type_str caller is a return
+// type, a parameter, or a local, where `void` is either correct (a void-returning fn) or a
+// separate bug (`let x = void_fn()` emits `const void x = ...`, broken independently of
+// anything generic — br 296hpm).
 pub fn c_field_type_str(ct: Int, tname: Str) -> Str {
     if ct == CT_VOID && tname == "Void" { return "int64_t" }
     c_type_str(ct)
@@ -5507,12 +5522,43 @@ pub fn tuple_elem_struct(c_name: Str, idx: Int) -> Str {
     get_tuple_entry_elem_struct(emitted_tuple_entries.get(e).unwrap().elem_structs, idx)
 }
 
-pub fn ensure_tuple_type(c_name: Str, arity: Int, elem_types: Str, elem_structs: Str) {
-    if emitted_tuple_set.contains_key(c_name) != 0 {
-        return
+// Per-position merge for repeat ensure_tuple_type calls on the SAME c_name
+// (dq15j7): elem_types/elem_structs are safe as pure first-writer-wins because
+// c_name is derived from them (two callers registering the same c_name always
+// agree on shape), but elem_names is not — several call sites (bare tuple
+// literals, enum-zip/map-iteration synthetic tuples) mint "" per position
+// because they have no resolved annotation/tid in hand at that call, while a
+// later, better-informed caller for the SAME stem may know a position is
+// genuinely Void. Without this merge, whichever caller registers first wins
+// outright, and an uninformed "" can permanently shadow the correct "Void" —
+// silently reintroducing the illegal `void _0;` field this ticket exists to
+// prevent, now as an unlocated, call-order-dependent `cc` failure.
+fn merge_tuple_elem_names(old_names: Str, new_names: Str, arity: Int) -> Str {
+    let mut out = ""
+    let mut i = 0
+    while i < arity {
+        let on = get_tuple_entry_elem_name(old_names, i)
+        let picked = if on != "" { on } else { get_tuple_entry_elem_name(new_names, i) }
+        out = if i == 0 { picked } else { "{out},{picked}" }
+        i = i + 1
+    }
+    out
+}
+
+pub fn ensure_tuple_type(c_name: Str, arity: Int, elem_types: Str, elem_structs: Str, elem_names: Str) {
+    match emitted_tuple_set.get(c_name) {
+        Some(idx) => {
+            let existing = emitted_tuple_entries.get(idx).unwrap()
+            let merged = merge_tuple_elem_names(existing.elem_names, elem_names, arity)
+            if merged != existing.elem_names {
+                emitted_tuple_entries.set(idx, TupleEntry { c_name: existing.c_name, arity: existing.arity, elem_types: existing.elem_types, elem_structs: existing.elem_structs, elem_names: merged })
+            }
+            return
+        }
+        None => {}
     }
     emitted_tuple_set.insert(c_name, emitted_tuple_entries.len())
-    emitted_tuple_entries.push(TupleEntry { c_name: c_name, arity: arity, elem_types: elem_types, elem_structs: elem_structs })
+    emitted_tuple_entries.push(TupleEntry { c_name: c_name, arity: arity, elem_types: elem_types, elem_structs: elem_structs, elem_names: elem_names })
     struct_reg_names.push(c_name)
     struct_reg_set.insert(c_name, 1)
     let mut i = 0
@@ -5626,7 +5672,12 @@ fn emit_tuple_typedef(entry: TupleEntry) ! Codegen.Emit {
         if es != "" {
             emit_line("{c_type_c_name(es)} {fname};")
         } else {
-            emit_line("{c_type_str(et)} {fname};")
+            // c_field_type_str lowers a genuine Void element (name "Void") to an int64_t
+            // placeholder, exactly as a named struct field already did; every other
+            // position's name is "" and this is byte-identical to the old c_type_str(et)
+            // call (br dq15j7).
+            let nm = get_tuple_entry_elem_name(entry.elem_names, i)
+            emit_line("{c_field_type_str(et, nm)} {fname};")
         }
         i = i + 1
     }
@@ -5672,6 +5723,13 @@ fn get_tuple_entry_elem_type(encoded: Str, idx: Int) -> Int {
         return part.to_int()
     }
     CT_VOID
+}
+
+// The name decode is byte-identical to elem_structs' (a bare "-" would decode to "", but a
+// name position is only ever "" or "Void" and never "-"), so this delegates rather than
+// duplicating the split loop a third time.
+fn get_tuple_entry_elem_name(encoded: Str, idx: Int) -> Str {
+    get_tuple_entry_elem_struct(encoded, idx)
 }
 
 fn get_tuple_entry_elem_struct(encoded: Str, idx: Int) -> Str {
