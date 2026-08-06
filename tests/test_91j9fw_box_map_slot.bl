@@ -1,0 +1,196 @@
+// br 91j9fw: admit a Map[K,V] slot at the struct-literal monomorphization seam —
+// the Map twin of br jw1pmb (List), one carrier over.
+//
+// tc_struct_slot_encodable (src/typecheck.bl) is the sole per-slot admission predicate
+// at that seam. Before this fix it delegated Map to tc_tid_encodable's own TK_MAP arm,
+// which recursed into both inners and declined whenever either was itself declined —
+// even though tc_tid_to_c_tag already spells Map as the bare "Map" (no inner spelling,
+// exactly like Set/List) and tc_tid_seg_injective already groups TK_MAP alongside
+// TK_SET/TK_LIST as non-injective. That inner recursion was a refusal with NO REFERENT:
+// there is nothing it could protect that a leaking unencodable inner would threaten,
+// since the top-level spelling never names the inner in the first place.
+//
+// MVCE (both spellings ICE'd before this fix):
+//   type Box[T] { value: T }
+//   fn main() {
+//       let mut m: Map[Int, Str] = (Box { value: Map() }).value
+//       ...
+//   }
+// and
+//   fn unbox[T](b: Box[T]) -> T { b.value }
+//   let mut m: Map[Int, Str] = unbox(Box { value: Map() })
+//
+// The fix is TWO PARTS, same shape as jw1pmb's:
+//   Part A — widen tc_struct_slot_encodable / tc_tid_encodable to admit TK_MAP
+//     unconditionally (both call sites; struct_slot delegates to the general gate).
+//   Part B — recover_map_kv_from_tid, a per-USE key+value recovery (the Map twin of
+//     recover_set_elem_from_tid / recover_list_elem_from_tid), because the def-side
+//     sf_entry for a monomorphized Box[T]'s value:T field stores sv_tp(CT_MAP,-1,-1,"")
+//     regardless of the actual K,V (codegen_types.bl sv_tp's CT_MAP arm defaults an
+//     unset key to CT_STRING and an unset value to CT_INT). Without Part B,
+//     Box[Map[Str,Int]] would go green BY ACCIDENT (the erased default happens to match)
+//     while Box[Map[Str,Float]]/[Str,Point]/[Point,Int] compile and link cleanly but read
+//     every key/value back as if it were Str/Int — trading a loud I0001 for a silent
+//     wrong value.
+//
+// ACCEPTANCE CRITERION (mirrors jw1pmb's corrected criterion, NOT per-instantiation
+// symbols): tc_tid_to_c_tag spells TK_MAP as the bare "Map" with no type arguments,
+// exactly like TK_SET/TK_LIST, so exactly ONE blink_Box_Map C symbol must serve every
+// key/value pair — representation-sharing, not per-instantiation symbols. A clean `cc`
+// proves nothing for a representation-shared symbol, so every row needing a runtime
+// witness asserts on an actually-executed binary, and R5 keeps two instantiations alive
+// simultaneously in one process.
+
+import compile_test_helpers
+import std.io
+
+fn assert_has(c: Str, needle: Str, label: Str) {
+    if !c.contains(needle) { io.println("FAIL: {label} — missing '{needle}'") }
+    assert(c.contains(needle))
+}
+
+fn assert_lacks(c: Str, needle: Str, label: Str) {
+    if c.contains(needle) { io.println("FAIL: {label} — forbidden '{needle}' present") }
+    assert(!c.contains(needle))
+}
+
+fn box_decl() -> Str {
+    "type Box[T] \{ value: T }\n"
+}
+
+fn src_r1() -> Str {
+    let mut s = box_decl()
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let mut m: Map[Int, Str] = (Box \{ value: Map() }).value\n")
+    s = s.concat("    m.insert(256, \"a\")\n")
+    s = s.concat("    assert(m.get(256).unwrap() == \"a\")\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "R1: Box[Map[Int,Str]] field access admits the slot and round-trips Int/Str" {
+    let c = compile_test_helpers.compile_and_emit_c(src_r1(), "n91j9fw_r1_c")
+    assert_has(c, "blink_Box_Map", "R1 / one shared Map symbol")
+    let r = compile_test_helpers.compile_and_run(src_r1(), "n91j9fw_r1_run")
+    if r.exit_code != 0 { io.println("FAIL: R1 runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+}
+
+fn src_r2() -> Str {
+    let mut s = box_decl()
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let mut m: Map[Str, Float] = (Box \{ value: Map() }).value\n")
+    s = s.concat("    m.insert(\"pi\", 3.5)\n")
+    s = s.concat("    assert(m.get(\"pi\").unwrap() == 3.5)\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "R2: Box[Map[Str,Float]] — the sharpest witness (a boxed Float misread as Int reads a pointer)" {
+    let r = compile_test_helpers.compile_and_run(src_r2(), "n91j9fw_r2_run")
+    if r.exit_code != 0 { io.println("FAIL: R2 runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+}
+
+fn src_r3() -> Str {
+    let mut s = "@derive(Hash, Eq)\ntype Point \{ x: Int, y: Int }\n"
+    s = s.concat(box_decl())
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let mut m: Map[Str, Point] = (Box \{ value: Map() }).value\n")
+    s = s.concat("    m.insert(\"origin\", Point \{ x: 3, y: 4 })\n")
+    s = s.concat("    let p = m.get(\"origin\").unwrap()\n")
+    s = s.concat("    assert(p.x == 3)\n")
+    s = s.concat("    assert(p.y == 4)\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "R3: Box[Map[Str,Point]] recovers a struct VALUE via tc_tid_map_val_struct" {
+    let r = compile_test_helpers.compile_and_run(src_r3(), "n91j9fw_r3_run")
+    if r.exit_code != 0 { io.println("FAIL: R3 runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+}
+
+fn src_r4() -> Str {
+    let mut s = box_decl()
+    s = s.concat("fn unbox[T](b: Box[T]) -> T \{\n")
+    s = s.concat("    b.value\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let mut m: Map[Int, Str] = unbox(Box \{ value: Map() })\n")
+    s = s.concat("    m.insert(256, \"a\")\n")
+    s = s.concat("    assert(m.get(256).unwrap() == \"a\")\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "R4: unbox[T] generic-fn route — the ticket's second MVCE spelling" {
+    let r = compile_test_helpers.compile_and_run(src_r4(), "n91j9fw_r4_run")
+    if r.exit_code != 0 { io.println("FAIL: R4 runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+}
+
+fn src_r5() -> Str {
+    let mut s = box_decl()
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let mut a: Map[Int, Str] = (Box \{ value: Map() }).value\n")
+    s = s.concat("    let mut b: Map[Str, Float] = (Box \{ value: Map() }).value\n")
+    s = s.concat("    a.insert(1, \"a\")\n")
+    s = s.concat("    b.insert(\"x\", 1.5)\n")
+    s = s.concat("    assert(a.get(1).unwrap() == \"a\")\n")
+    s = s.concat("    assert(b.get(\"x\").unwrap() == 1.5)\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "R5: Box[Map[Int,Str]] and Box[Map[Str,Float]] correctly SHARE one C symbol" {
+    let c = compile_test_helpers.compile_and_emit_c(src_r5(), "n91j9fw_r5_c")
+    assert_has(c, "blink_Box_Map", "R5 / the one shared symbol")
+    // No per-instantiation symbols — Map is a non-injective mono-CSV position
+    // (tc_tid_seg_injective), the same representation-sharing already shipped for
+    // Box[List[..]] (br jw1pmb) and Box[Set[..]].
+    assert_lacks(c, "blink_Box_Map_Int_Str", "R5 / no per-instantiation Map symbol (Int,Str)")
+    assert_lacks(c, "blink_Box_Map_Str_Float", "R5 / no per-instantiation Map symbol (Str,Float)")
+    // Both instantiations alive simultaneously — the runtime witness a clean cc cannot
+    // provide for a representation-shared symbol.
+    let r = compile_test_helpers.compile_and_run(src_r5(), "n91j9fw_r5_run")
+    if r.exit_code != 0 { io.println("FAIL: R5 runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+}
+
+fn src_r6() -> Str {
+    let mut s = "@derive(Hash, Eq)\ntype Point \{ x: Int, y: Int }\n"
+    s = s.concat(box_decl())
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let mut m: Map[Point, Int] = (Box \{ value: Map() }).value\n")
+    s = s.concat("    m.insert(Point \{ x: 1, y: 2 }, 200)\n")
+    s = s.concat("    assert(m.contains_key(Point \{ x: 1, y: 2 }))\n")
+    s = s.concat("    assert(m.get(Point \{ x: 1, y: 2 }).unwrap() == 200)\n")
+    s = s.concat("    assert(!m.contains_key(Point \{ x: 9, y: 9 }))\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "R6: Box[Map[Point,Int]] recovers a struct KEY, exercising kops" {
+    let r = compile_test_helpers.compile_and_run(src_r6(), "n91j9fw_r6_run")
+    if r.exit_code != 0 { io.println("FAIL: R6 runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+}
+
+fn src_r7() -> Str {
+    let mut s = box_decl()
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let a: Box[Set[Int]] = Box \{ value: Set() }\n")
+    s = s.concat("    let b: Box[Int] = Box \{ value: 7 }\n")
+    s = s.concat("    assert(a.value.insert(1))\n")
+    s = s.concat("    assert(a.value.contains(1))\n")
+    s = s.concat("    assert(b.value == 7)\n")
+    s = s.concat("}\n")
+    s
+}
+
+test "R7 GREEN CONTROL: neighbouring Box[Set[..]]/Box[Int] slots are undisturbed" {
+    let r = compile_test_helpers.compile_and_run(src_r7(), "n91j9fw_r7_run")
+    if r.exit_code != 0 { io.println("FAIL: R7 runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+}

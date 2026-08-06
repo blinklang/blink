@@ -428,6 +428,39 @@ pub fn recover_option_set_elem_from_tid(node: Int, var_name: Str) ! Codegen.Regi
     }
 }
 
+// br 91j9fw: the Map twin of recover_set_elem_from_tid above, for the same
+// reason — a generic struct's Map[K,V] field erases identically for every K,V
+// (one sf_entry per (struct,field), sv_tp's CT_MAP arm defaulting an unset key
+// to CT_STRING and an unset value to CT_INT), so both key and value must be
+// recovered per-USE from the per-node tid memo rather than per-def.
+//
+// Key uses the _resolved twin (mv45y5/m1wspm): the key is the kops-deciding
+// slot, and a bare `Map()`'s key can be a fresh metavar bound in place by a
+// later `.insert()`, which the plain accessor cannot see through. Value uses
+// the plain (non-resolved) accessor, mirroring tc_tid_map_val_ct's own
+// rationale — kops_table_name never looks at the value, so a value that is
+// still a genuinely unbound metavar is safe to defer rather than force here.
+//
+// Gated on BOTH key and value resolving concretely: a Map's tp_id carries one
+// combined (key_type, value_type) pair (set_map_types), so a half-known
+// answer cannot be committed without either fabricating the other half (the
+// exact wrong-but-quiet default this ticket exists to avoid) or clobbering an
+// already-correct half. Leaving it erased is the honest answer.
+//
+// tc_tid_subst_mono mirrors recover_list_elem_from_tid: inside a generic
+// FUNCTION body (e.g. `fn unbox[T](b: Box[T]) -> T { b.value }` at T=Map[K,V]),
+// the field access's own tid memo still reads back with T a bare typevar
+// unless rewritten through this call's binder.
+fn recover_map_kv_from_tid(node: Int, var_name: Str) ! Codegen.Register, Codegen.Scope {
+    let mtid = tc_tid_subst_mono(tc_lookup_node_tid(node), cg_mono_tparams_sl, cg_mono_arg_tids)
+    let kct = tc_tid_map_key_ct_resolved(mtid)
+    let vct = tc_tid_map_val_ct(mtid)
+    if kct < 0 || vct < 0 { return }
+    set_map_types(var_name, kct, vct, tc_tid_map_val_struct(mtid))
+    let ks = tc_tid_map_key_struct_resolved(mtid)
+    if ks != "" { set_map_key_struct(var_name, ks) }
+}
+
 // jcr0zz: build a fully-recursive tp node from a tid (typecheck's ty_pool tree),
 // the tid-side twin of deep_tp_from_ann (codegen_stmt.bl:166). That one walks an
 // annotation AST and resolves mono typevars via cg_mono_*; this one walks a tid
@@ -1225,6 +1258,22 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
                 // hits mv45y5's SetElementTypeUnknownAtCodegen ICE on `s`.
                 if le_tp < 0 || (tp_child1_sname(le_tp) == "" && tp_child1_kind(le_tp) == CT_INT) || tp_child1_kind(le_tp) == CT_SET {
                     recover_list_elem_from_tid(node, expr_result_str)
+                }
+            }
+            // Struct-field Map[K,V] on a MONOMORPHIZED generic struct: reg_sf_entry
+            // stores one shared sv_tp(CT_MAP, -1, -1, "") per (struct,field) — sv_tp's
+            // CT_MAP arm (codegen_types.bl) defaults an unset key to CT_STRING and an
+            // unset value to CT_INT, so fa_tp above answers (Str, Int) for every
+            // instantiation regardless of the real K,V, indistinguishable from a
+            // genuinely declared Map[Str,Int] field. Gate on that exact erasure shape
+            // before recovering the real key/value from the per-node tid memo; the
+            // ambiguity with a genuine Map[Str,Int] field is safe (idempotent
+            // re-recovery), the same tolerance List's CT_INT ambiguity above accepts.
+            // br 91j9fw.
+            if fa_type == CT_MAP {
+                let mp_tp = get_struct_field_tp_id(struct_type, c_field)
+                if mp_tp < 0 || (tp_child1_kind(mp_tp) == CT_STRING && tp_child2_kind(mp_tp) == CT_INT && tp_child2_sname(mp_tp) == "") {
+                    recover_map_kv_from_tid(node, expr_result_str)
                 }
             }
             // Struct-field Set[T]: the monomorphized-generic struct field tp_id
