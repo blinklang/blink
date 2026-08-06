@@ -64,15 +64,18 @@
 //         RED — identical UnresolvedMethod; ONE shared blink_Box_List symbol serves
 //         every element (jw1pmb's corrected criterion — a clean cc alone proves
 //         nothing for a representation-shared symbol).
-//   C11 NEGATIVE Box[List[Set[Str]]], .get(0).unwrap().len()
-//         Measured GREEN-as-error both before and after this fix — error
-//         [UnresolvedMethod]: unresolved method '.len' on type Set[Str] in 'main'.
-//         Set has NO emit_list_method `get` arm (codegen_methods.bl's dispatch
-//         falls to int64 boxing for anything not VOID/STRUCT/ENUM/STRING/FLOAT/
-//         LIST/MAP/OPTION/RESULT) — there is no parity target, so jcr0zz
-//         deliberately leaves this bailing. See the successor ticket for the gap.
-//   C12 NEGATIVE TWIN, DECLARED `let d: List[Set[Str]] = [Set()]`, same call
-//         same error[UnresolvedMethod] on Set[Str] — proves C11 is PARITY, not a
+//   C11 FLIPPED to POSITIVE by nprhy8: Box[List[Set[Str]]], .get(0).unwrap()
+//         recovers the Set's own Str element via recover_list_elem_from_tid's new
+//         CT_SET arm — insert/contains element-sensitively prove it, not just
+//         `.len()` (which can't distinguish a real Str element from a fabricated
+//         one). Was GREEN-as-error before nprhy8 — error[UnresolvedMethod]:
+//         unresolved method '.len' on type Set[Str] in 'main' — because
+//         emit_list_method had no `get`/`pop` CT_SET arm at all (dispatch fell to
+//         int64 boxing for anything not VOID/STRUCT/ENUM/STRING/FLOAT/LIST/MAP/
+//         OPTION/RESULT). nprhy8 gave Set real parity; see that ticket for the
+//         CT_SET arms + five Option->Set binding seams.
+//   C12 FLIPPED TWIN, DECLARED `let d: List[Set[Str]] = [Set()]`, same call —
+//         C11 and C12 must flip together (rule 5, below) — proves the DECLARED and
 //         jcr0zz regression. If C12 ever goes green (Set[T] gets a real `get` arm),
 //         C11 must be revisited — it would then be an actual bug, not a shared gap.
 //   C13 GREEN CONTROL non-generic `type Holder { xs: List[Option[Str]] }`
@@ -101,8 +104,12 @@
 //  4. If C7 fails specifically (C1-C5 still pass): the builder stopped recursing
 //     past one level — check deep_tp_from_tid's CT_MAP/CT_OPTION arms call
 //     themselves recursively rather than defaulting the inner.
-//  5. If C11/C12 diverge (one errors, the other doesn't): Set gained or lost parity
-//     somewhere outside this ticket's scope — re-triage before touching this file.
+//  5. If C11/C12 diverge (one passes, the other errors): the DECLARED half
+//     (codegen_stmt.bl's `elem_ct == CT_SET` arm) and the RECOVERED half
+//     (recover_list_elem_from_tid's CT_SET arm, src/codegen_expr.bl) have
+//     drifted — they must agree, since C11's `Box[T]` field re-bind and C12's
+//     bare declared List are supposed to be the same element-recovery answer
+//     reached by two different producers.
 
 import compile_test_helpers
 import std.io
@@ -332,21 +339,28 @@ fn src_c11() -> Str {
     s = s.concat("fn main() \{\n")
     s = s.concat("    let b: Box[List[Set[Str]]] = Box \{ v: [Set()] }\n")
     s = s.concat("    let g = b.v\n")
-    s = s.concat("    let _n = g.get(0).unwrap().len()\n")
+    s = s.concat("    let mut st = g.get(0).unwrap()\n")
+    s = s.concat("    st.insert(\"x\")\n")
+    s = s.concat("    assert(st.contains(\"x\"))\n")
+    s = s.concat("    assert(!st.contains(\"y\"))\n")
     s = s.concat("}\n")
     s
 }
 
-test "C11 NEGATIVE: Box[List[Set[Str]]] stays honestly erased — no parity target" {
-    compile_test_helpers.expect_compile_error(src_c11(), "jcr0zz_c11", "UnresolvedMethod")
+test "C11 POSITIVE: Box[List[Set[Str]]] recovers the Set's own Str element through an unannotated re-bind" {
+    let r = compile_test_helpers.compile_and_run(src_c11(), "jcr0zz_c11_run")
+    if r.exit_code != 0 { io.println("FAIL: C11 runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
 }
 
 fn src_c12() -> Str {
-    "fn main() \{\n    let d: List[Set[Str]] = [Set()]\n    let _n = d.get(0).unwrap().len()\n}\n"
+    "fn main() \{\n    let d: List[Set[Str]] = [Set()]\n    let mut st = d.get(0).unwrap()\n    st.insert(\"x\")\n    assert(st.contains(\"x\"))\n    assert(!st.contains(\"y\"))\n}\n"
 }
 
-test "C12 NEGATIVE TWIN: DECLARED List[Set[Str]] fails identically — C11 is parity, not a regression" {
-    compile_test_helpers.expect_compile_error(src_c12(), "jcr0zz_c12", "UnresolvedMethod")
+test "C12 POSITIVE TWIN: DECLARED List[Set[Str]] recovers identically — the two producers agree" {
+    let r = compile_test_helpers.compile_and_run(src_c12(), "jcr0zz_c12_run")
+    if r.exit_code != 0 { io.println("FAIL: C12 runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
 }
 
 fn src_c13() -> Str {

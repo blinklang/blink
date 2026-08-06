@@ -1,0 +1,455 @@
+// nprhy8: List[Set[T]] element codegen — every seam that binds a Set out of a
+// List (or a List of Sets) must carry the Set's OWN element type, not fabricate
+// one and not misread the outer CT_SET as its own element.
+//
+// Root cause (see the full triage in the nprhy8 plan): get_set_elem_type used to
+// fabricate CT_STRING for "element unknown" (src/codegen_types.bl's sv_tp CT_SET
+// arm), and emit_list_method had NO get/pop CT_SET arm at all — codegen_methods.bl's
+// dispatch fell through to plain int64 boxing for any CT not in the
+// VOID/STRUCT/ENUM/STRING/FLOAT/LIST/MAP/OPTION/RESULT list. So
+// `for x in d.get(0).unwrap()` on a `List[Set[Int]]` either ICE'd (loud) or,
+// worse, silently boxed a `blink_set*` pointer where an `Int` element was
+// expected (silent miscompile — no diagnostic).
+//
+// Fix landed in three stages:
+//   Stage A — typecheck already resolves every Set's element via HM metavar
+//     inference; codegen now reads that tid instead of guessing. Unknown-element
+//     consumers (for-in's CT_SET normalizer) fail loud (I0002 ICE), never fabricate.
+//   Stage B.6/7 — real `get`/`pop` CT_SET arms in emit_list_method, keyed off
+//     get_var_option_inner2/_struct (NOT the global expr_option_inner_list_elem
+//     channel — that's CT_LIST-only, and contaminating it would leak a Set's
+//     element onto an unrelated later List binding).
+//   Stage B.9 — all five Option->Set binding seams (.unwrap(), `let o = d.get(0)`,
+//     `match Some(s)`, re-reading the Option var, `??`) carry the element forward.
+//   Stage B.10 — recover_list_elem_from_tid (the monomorphized-struct-field path,
+//     shared with br jcr0zz) gained a real CT_SET arm.
+//   Stage B.11 — both inferred-shape producers (`d.push(s)` and the list literal
+//     `[s]`) stamp the Set's element onto the LIST var so later reads have
+//     something to recover.
+//
+// Rows are deliberately element-sensitive on an Int-element Set — `.len()` and
+// `Set[Str]` alone can't distinguish a real element from a fabricated default
+// (that's exactly why the pre-nprhy8 test suite missed this hole); every row here
+// either sums/reads back a concrete Int (or, for the struct-element row, a field)
+// through the seam under test.
+
+import compile_test_helpers
+import std.io
+
+fn assert_has(c: Str, needle: Str, label: Str) {
+    if !c.contains(needle) { io.println("FAIL: {label} — missing '{needle}'") }
+    assert(c.contains(needle))
+}
+
+// Row 1: `.get(0).unwrap()` + for-in sum — the .unwrap() seam (Stage B.9), also
+// acw3q3's construct (for-in over an Option-unwrapped Set).
+fn src_row1() -> Str {
+    "fn main() ! IO \{\n"
+        .concat("    let mut s = Set()\n")
+        .concat("    s.insert(3)\n")
+        .concat("    s.insert(4)\n")
+        .concat("    s.insert(5)\n")
+        .concat("    let mut d = []\n")
+        .concat("    d.push(s)\n")
+        .concat("    let mut total = 0\n")
+        .concat("    for x in d.get(0).unwrap() \{ total = total + x }\n")
+        .concat("    io.println(\"total=\{total}\")\n")
+        .concat("}\n")
+}
+
+test "row 1: for x in d.get(0).unwrap() sums the Set's real Int element" {
+    let r = compile_test_helpers.compile_and_run(src_row1(), "nprhy8_row1")
+    if r.exit_code != 0 { io.println("FAIL: row1 runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+    assert(r.out.contains("total=12"))
+}
+
+// Row 2: .contains() element-sensitive — proves the recovered element is
+// genuinely Int (a Str-fabricated default would either mistype or accept the
+// wrong value).
+// Annotated (not inferred) per sq16v7: an unannotated `let mut s = Set()` /
+// `let mut d = []` here binds s/d's element as an HM metavar, and
+// got.contains(N)'s arg-check reads that metavar's OWN (unresolved) tid
+// instead of resolving it first (missing tc_resolve at typecheck.bl:8232) --
+// it misreads the bound metavar's solution pointer (the whole Set[Int]) as
+// the element (Int), producing a false TypeError on a correct program. Not
+// this ticket's concern -- sq16v7 tracks the fix, 7dcwvz tracks removing
+// this annotation once it lands. Explicit annotations sidestep the bug
+// (annotated types are concrete tids from the start, never metavars), so
+// this row still exercises the codegen seam (Stage B.9's `.unwrap()` seam)
+// nprhy8 actually owns.
+fn src_row2() -> Str {
+    "fn main() ! IO \{\n"
+        .concat("    let mut s: Set[Int] = Set()\n")
+        .concat("    s.insert(1)\n")
+        .concat("    let mut d: List[Set[Int]] = []\n")
+        .concat("    d.push(s)\n")
+        .concat("    let got = d.get(0).unwrap()\n")
+        .concat("    io.println(\"has1=\{got.contains(1)} has9=\{got.contains(9)}\")\n")
+        .concat("}\n")
+}
+
+test "row 2: .get(0).unwrap().contains(1)/!contains(9) proves the element is Int" {
+    let r = compile_test_helpers.compile_and_run(src_row2(), "nprhy8_row2")
+    if r.exit_code != 0 { io.println("FAIL: row2 runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+    assert(r.out.contains("has1=true has9=false"))
+}
+
+// Row 3: `.pop()` — the second reader family, independent of `.get`.
+fn src_row3() -> Str {
+    "fn main() ! IO \{\n"
+        .concat("    let mut s = Set()\n")
+        .concat("    s.insert(6)\n")
+        .concat("    s.insert(7)\n")
+        .concat("    let mut d = []\n")
+        .concat("    d.push(s)\n")
+        .concat("    let popped = d.pop().unwrap()\n")
+        .concat("    let mut total = 0\n")
+        .concat("    for x in popped \{ total = total + x }\n")
+        .concat("    io.println(\"total=\{total}\")\n")
+        .concat("}\n")
+}
+
+test "row 3: .pop().unwrap() carries the Set's Int element" {
+    let r = compile_test_helpers.compile_and_run(src_row3(), "nprhy8_row3")
+    if r.exit_code != 0 { io.println("FAIL: row3 runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+    assert(r.out.contains("total=13"))
+}
+
+// Row 4: `for inner in d` — 7b1t5a's control construct (direct List[Set[Int]]
+// iteration, no Option unwrap in the path at all).
+fn src_row4() -> Str {
+    "fn main() ! IO \{\n"
+        .concat("    let mut s = Set()\n")
+        .concat("    s.insert(2)\n")
+        .concat("    s.insert(9)\n")
+        .concat("    let mut d = []\n")
+        .concat("    d.push(s)\n")
+        .concat("    let mut total = 0\n")
+        .concat("    for inner in d \{\n")
+        .concat("        for x in inner \{ total = total + x }\n")
+        .concat("    }\n")
+        .concat("    io.println(\"total=\{total}\")\n")
+        .concat("}\n")
+}
+
+test "row 4: for inner in d (List[Set[Int]]) iterates without an Option seam" {
+    let r = compile_test_helpers.compile_and_run(src_row4(), "nprhy8_row4")
+    if r.exit_code != 0 { io.println("FAIL: row4 runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+    assert(r.out.contains("total=11"))
+}
+
+// Row 5: inferred list literal `[s]` producer (Stage B.11's list-literal half).
+fn src_row5() -> Str {
+    "fn main() ! IO \{\n"
+        .concat("    let mut s = Set()\n")
+        .concat("    s.insert(3)\n")
+        .concat("    s.insert(4)\n")
+        .concat("    s.insert(5)\n")
+        .concat("    let d = [s]\n")
+        .concat("    let mut total = 0\n")
+        .concat("    for x in d.get(0).unwrap() \{ total = total + x }\n")
+        .concat("    io.println(\"total=\{total}\")\n")
+        .concat("}\n")
+}
+
+test "row 5: let d = [s] (list literal) carries the Set's element" {
+    let r = compile_test_helpers.compile_and_run(src_row5(), "nprhy8_row5")
+    if r.exit_code != 0 { io.println("FAIL: row5 runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+    assert(r.out.contains("total=12"))
+}
+
+// Row 6: inferred `let d = []; d.push(s)` producer (Stage B.11's push half).
+fn src_row6() -> Str {
+    "fn main() ! IO \{\n"
+        .concat("    let mut s = Set()\n")
+        .concat("    s.insert(3)\n")
+        .concat("    s.insert(4)\n")
+        .concat("    s.insert(5)\n")
+        .concat("    let mut d = []\n")
+        .concat("    d.push(s)\n")
+        .concat("    let mut total = 0\n")
+        .concat("    for x in d.get(0).unwrap() \{ total = total + x }\n")
+        .concat("    io.println(\"total=\{total}\")\n")
+        .concat("}\n")
+}
+
+test "row 6: let d = []; d.push(s) carries the Set's element" {
+    let r = compile_test_helpers.compile_and_run(src_row6(), "nprhy8_row6")
+    if r.exit_code != 0 { io.println("FAIL: row6 runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+    assert(r.out.contains("total=12"))
+}
+
+// Row 7: fn param `List[Set[Int]]` — the declared-annotation seam.
+fn src_row7() -> Str {
+    "fn sum_first(xs: List[Set[Int]]) -> Int \{\n"
+        .concat("    let mut total = 0\n")
+        .concat("    for x in xs.get(0).unwrap() \{ total = total + x }\n")
+        .concat("    total\n")
+        .concat("}\n")
+        .concat("fn main() ! IO \{\n")
+        .concat("    let mut s = Set()\n")
+        .concat("    s.insert(1)\n")
+        .concat("    s.insert(2)\n")
+        .concat("    let mut d = []\n")
+        .concat("    d.push(s)\n")
+        .concat("    io.println(\"total=\{sum_first(d)}\")\n")
+        .concat("}\n")
+}
+
+test "row 7: fn f(xs: List[Set[Int]]) param carries the Set's element" {
+    let r = compile_test_helpers.compile_and_run(src_row7(), "nprhy8_row7")
+    if r.exit_code != 0 { io.println("FAIL: row7 runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+    assert(r.out.contains("total=3"))
+}
+
+// Row 8: `let o = d.get(0)` (no immediate .unwrap()) — a second, independent
+// binding of the Option[Set] before it's consumed.
+fn src_row8() -> Str {
+    "fn main() ! IO \{\n"
+        .concat("    let mut s = Set()\n")
+        .concat("    s.insert(4)\n")
+        .concat("    s.insert(5)\n")
+        .concat("    let mut d = []\n")
+        .concat("    d.push(s)\n")
+        .concat("    let o = d.get(0)\n")
+        .concat("    let mut total = 0\n")
+        .concat("    for x in o.unwrap() \{ total = total + x }\n")
+        .concat("    io.println(\"total=\{total}\")\n")
+        .concat("}\n")
+}
+
+test "row 8: let o = d.get(0) carries the element through a separate binding" {
+    let r = compile_test_helpers.compile_and_run(src_row8(), "nprhy8_row8")
+    if r.exit_code != 0 { io.println("FAIL: row8 runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+    assert(r.out.contains("total=9"))
+}
+
+// Row 9: `match d.get(0) { Some(s) => ... }` — the match-scrutinee seam.
+fn src_row9() -> Str {
+    "fn main() ! IO \{\n"
+        .concat("    let mut s = Set()\n")
+        .concat("    s.insert(3)\n")
+        .concat("    s.insert(4)\n")
+        .concat("    s.insert(5)\n")
+        .concat("    let mut d = []\n")
+        .concat("    d.push(s)\n")
+        .concat("    match d.get(0) \{\n")
+        .concat("        Some(inner) => \{\n")
+        .concat("            let mut total = 0\n")
+        .concat("            for x in inner \{ total = total + x }\n")
+        .concat("            io.println(\"total=\{total}\")\n")
+        .concat("        }\n")
+        .concat("        None => \{ io.println(\"none\") }\n")
+        .concat("    }\n")
+        .concat("}\n")
+}
+
+test "row 9: match d.get(0) \{ Some(inner) => ... } carries the element" {
+    let r = compile_test_helpers.compile_and_run(src_row9(), "nprhy8_row9")
+    if r.exit_code != 0 { io.println("FAIL: row9 runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+    assert(r.out.contains("total=12"))
+}
+
+// Row 10: `??` coalesce — falls back to an explicitly-typed empty Set when the
+// list has been emptied, then proves the FALLBACK's own element (not a stale
+// one) is what gets iterated.
+fn src_row10() -> Str {
+    "fn main() ! IO \{\n"
+        .concat("    let mut d = []\n")
+        .concat("    let mut seed = Set()\n")
+        .concat("    seed.insert(1)\n")
+        .concat("    d.push(seed)\n")
+        .concat("    d.pop()\n")
+        .concat("    let fallback: Set[Int] = Set()\n")
+        .concat("    let mut picked = d.get(0) ?? fallback\n")
+        .concat("    picked.insert(9)\n")
+        .concat("    let mut total = 0\n")
+        .concat("    for x in picked \{ total = total + x }\n")
+        .concat("    io.println(\"total=\{total}\")\n")
+        .concat("}\n")
+}
+
+test "row 10: d.get(0) ?? fallback carries the fallback Set's element" {
+    let r = compile_test_helpers.compile_and_run(src_row10(), "nprhy8_row10")
+    if r.exit_code != 0 { io.println("FAIL: row10 runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+    assert(r.out.contains("total=9"))
+}
+
+// Row 10b: `??` coalesce, Some branch — d is NOT emptied, so the LEFT operand's
+// own Set (not the fallback's) is what gets iterated. Row 10 alone always takes
+// the fallback branch (d.pop() empties it first), so it can't prove the left
+// operand's element carries through too; this row closes that gap. Fallback is
+// seeded with a distinct value (99) so a wrong-branch or stale-metadata bug
+// would show up as the wrong sum, not an accidental match.
+fn src_row10b() -> Str {
+    "fn main() ! IO \{\n"
+        .concat("    let mut d = []\n")
+        .concat("    let mut seed = Set()\n")
+        .concat("    seed.insert(1)\n")
+        .concat("    seed.insert(2)\n")
+        .concat("    d.push(seed)\n")
+        .concat("    let mut fallback: Set[Int] = Set()\n")
+        .concat("    fallback.insert(99)\n")
+        .concat("    let picked = d.get(0) ?? fallback\n")
+        .concat("    let mut total = 0\n")
+        .concat("    for x in picked \{ total = total + x }\n")
+        .concat("    io.println(\"total=\{total}\")\n")
+        .concat("}\n")
+}
+
+test "row 10b: d.get(0) ?? fallback carries the LEFT operand's element when Some" {
+    let r = compile_test_helpers.compile_and_run(src_row10b(), "nprhy8_row10b")
+    if r.exit_code != 0 { io.println("FAIL: row10b runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+    assert(r.out.contains("total=3"))
+}
+
+// Row 10c: `??` coalesce consumed INLINE, with no intervening `let` — rows 10/10b
+// both bind `?? `'s result to a var first, and that let-binding has its own,
+// independent tid-recovery fallback (recover_list_elem_from_tid) that can carry
+// the element even if emit_binop's CT_SET arm itself regresses. Feeding the `for`
+// loop straight off the `??` expression is the only shape that actually exercises
+// that arm (src/codegen_expr.bl's `??` CT_SET arm) in isolation.
+fn src_row10c() -> Str {
+    "fn main() ! IO \{\n"
+        .concat("    let mut d = []\n")
+        .concat("    let mut seed = Set()\n")
+        .concat("    seed.insert(4)\n")
+        .concat("    seed.insert(5)\n")
+        .concat("    d.push(seed)\n")
+        .concat("    let mut fallback: Set[Int] = Set()\n")
+        .concat("    fallback.insert(77)\n")
+        .concat("    let mut total = 0\n")
+        .concat("    for x in (d.get(0) ?? fallback) \{ total = total + x }\n")
+        .concat("    io.println(\"total=\{total}\")\n")
+        .concat("}\n")
+}
+
+test "row 10c: d.get(0) ?? fallback carries the element with no intervening let" {
+    let r = compile_test_helpers.compile_and_run(src_row10c(), "nprhy8_row10c")
+    if r.exit_code != 0 { io.println("FAIL: row10c runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+    assert(r.out.contains("total=9"))
+}
+
+// Row 11: module-scope `let` (top-level twin of the local-let binding path).
+// Annotated on purpose: an UNANNOTATED top-level `let mut s = Set()` whose
+// element is only pinned by a later in-function `.insert()` hits a distinct,
+// pre-existing gap (z4srag — tc_infer_program's top-level-let loop never
+// calls infer_type on a Call-node RHS, so the global's element metavar never
+// exists for that later unification to reach; List/Map mask it with a safe
+// Int/erased default, Set's honest no-fabrication design does not). Not this
+// ticket's concern — z4srag tracks the workaround's removal. This row stays
+// annotated so it exercises the codegen seam (src/codegen_stmt.bl's top-level
+// LET CT_SET/CT_LIST-nested arms, :8471-8489) nprhy8 actually owns.
+fn src_row11() -> Str {
+    "let mut s: Set[Int] = Set()\n"
+        .concat("let d: List[Set[Int]] = [s]\n")
+        .concat("fn main() ! IO \{\n")
+        .concat("    s.insert(7)\n")
+        .concat("    s.insert(8)\n")
+        .concat("    let mut total = 0\n")
+        .concat("    for x in d.get(0).unwrap() \{ total = total + x }\n")
+        .concat("    io.println(\"total=\{total}\")\n")
+        .concat("}\n")
+}
+
+test "row 11: module-scope let d = [s] carries the element" {
+    let r = compile_test_helpers.compile_and_run(src_row11(), "nprhy8_row11")
+    if r.exit_code != 0 { io.println("FAIL: row11 runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+    assert(r.out.contains("total=15"))
+}
+
+// Row 12: the recovered Set passed into a closure-literal param typed
+// `Set[Int]` — a third consumption style beyond `for` and `.contains`, and
+// the exact shape closure-param registration (src/codegen_closures.bl's
+// param-registration loop, no CT_SET arm before this ticket) was missing.
+// (Set has no `.for_each` method — an earlier draft of this row assumed one
+// and hit UnresolvedMethod; this row exercises the same closure-param seam
+// via an explicit higher-order function instead.)
+fn src_row12() -> Str {
+    "fn apply_to_set(s: Set[Int], f: fn(Set[Int]) -> Void) \{\n"
+        .concat("    f(s)\n")
+        .concat("}\n")
+        .concat("fn main() ! IO \{\n")
+        .concat("    let mut s = Set()\n")
+        .concat("    s.insert(10)\n")
+        .concat("    s.insert(20)\n")
+        .concat("    let mut d = []\n")
+        .concat("    d.push(s)\n")
+        .concat("    let inner = d.get(0).unwrap()\n")
+        .concat("    let mut total = 0\n")
+        .concat("    apply_to_set(inner, fn(x: Set[Int]) \{\n")
+        .concat("        for v in x \{ total = total + v }\n")
+        .concat("    })\n")
+        .concat("    io.println(\"total=\{total}\")\n")
+        .concat("}\n")
+}
+
+test "row 12: recovered Set passed into a closure-literal param carries its element" {
+    let r = compile_test_helpers.compile_and_run(src_row12(), "nprhy8_row12")
+    if r.exit_code != 0 { io.println("FAIL: row12 runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+    assert(r.out.contains("total=30"))
+}
+
+// Row 13: a @derive(Hash,Eq) struct element — proves the seam is not
+// Int-special-cased.
+// Annotated per sq16v7, same reason as row 2 — see that row's comment.
+fn src_row13() -> Str {
+    "@derive(Hash, Eq)\n"
+        .concat("type Pt \{ x: Int, y: Int }\n")
+        .concat("fn main() ! IO \{\n")
+        .concat("    let mut s: Set[Pt] = Set()\n")
+        .concat("    s.insert(Pt \{ x: 3, y: 4 })\n")
+        .concat("    let mut d: List[Set[Pt]] = []\n")
+        .concat("    d.push(s)\n")
+        .concat("    let inner = d.get(0).unwrap()\n")
+        .concat("    io.println(\"has=\{inner.contains(Pt \{ x: 3, y: 4 })}\")\n")
+        .concat("}\n")
+}
+
+test "row 13: List[Set[Pt]] with a @derive(Hash,Eq) struct element" {
+    let r = compile_test_helpers.compile_and_run(src_row13(), "nprhy8_row13")
+    if r.exit_code != 0 { io.println("FAIL: row13 runtime — {r.err_out}") }
+    assert(r.exit_code == 0)
+    assert(r.out.contains("has=true"))
+}
+
+// Emitted-C witness: the `get` arm must actually wrap the element in a real
+// blink_Option_set carrier and cast the raw list slot back to blink_set*, not
+// silently box it as an int64.
+fn src_c_witness() -> Str {
+    "fn main() ! IO \{\n"
+        .concat("    let mut s = Set()\n")
+        .concat("    s.insert(1)\n")
+        .concat("    let mut d = []\n")
+        .concat("    d.push(s)\n")
+        .concat("    let _o = d.get(0)\n")
+        .concat("}\n")
+}
+
+test "C witness: .get() on List[Set[Int]] emits blink_Option_set + the blink_set* cast" {
+    let c = compile_test_helpers.compile_and_emit_c(src_c_witness(), "nprhy8_c_witness")
+    assert_has(c, "blink_Option_set", "witness / Option_set carrier present")
+    assert_has(c, "(blink_set*)blink_list_get", "witness / list slot cast back to blink_set*")
+}
+
+// Depth stays loud in TYPECHECK (E1400), never reaches codegen — Set can't
+// nest a container element at all, so List[Set[List[Int]]] must be rejected
+// long before any of the seams above are exercised.
+test "depth control: List[Set[List[Int]]] is rejected in typecheck (E1400), not codegen" {
+    let src = "fn main() \{\n    let d: List[Set[List[Int]]] = []\n}\n"
+    compile_test_helpers.expect_compile_error(src, "nprhy8_depth", "MapKeyNotHashable")
+}

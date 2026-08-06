@@ -28,6 +28,7 @@ import codegen_types.{
     get_list_elem_struct, get_list_elem_type,
     get_list_nested_elem_struct, get_list_nested_elem_type,
     get_map_key_type, get_map_key_type_raw, get_map_key_struct, get_map_value_list_elem, get_map_value_struct, get_map_value_type, get_map_value_type_raw, get_set_elem_type, get_set_elem_struct,
+    set_set_elem_type, set_set_elem_struct,
     kops_is_inline_key, kops_is_struct_key,
     get_struct_field_closure_sig, get_struct_field_type,
     get_var_channel_inner, get_var_enum, get_var_iterator_inner,
@@ -48,7 +49,7 @@ import codegen_types.{
     resolve_import_alias, resolve_ptr_inner_c, resolve_struct_from_c_name, get_var_ffi_ptr_struct, is_ffi_ptr_array_var,
     ffi_alloc_n_pending, ffi_offset_pending_struct,
     result_c_type, result_c_type_mixed,
-    set_list_elem_struct, set_list_elem_type, set_list_nested_elem_type,
+    set_list_elem_struct, set_list_elem_type, set_list_nested_elem_type, set_list_nested_elem_struct,
     set_list_elem_option, set_list_elem_result, set_list_elem_option_tp, set_list_elem_result_tp,
     push_scope, pop_scope,
     set_map_types, set_map_value_list_elem, set_map_value_struct, map_struct_scalar_kv, set_var, set_var_handle,
@@ -78,13 +79,15 @@ let mut btc_arg_offset: Int = 0
 // vbhc4x: recover a Set element / Map key CT from the method-argument node's
 // memoized tid, for the case where the container is a generic-struct field
 // (Box[T] { s: Set[T] }). typecheck does NOT monomorphize struct instances, so
-// the FieldAccess tid for `b.s` is Set[<typevar>] and get_set_elem_type returns
-// the erased default (CT_STRING). The concrete element type lives only on the
-// argument node (`insert(3)` → 3 infers TYPE_INT). Fire ONLY when the element is
-// still that erased default (cur_ct == CT_STRING && cur_sname == "" for a Set,
-// or CT_VOID && "" for a Map key) — never override an already-resolved element
-// (protects Set[Str], concrete Set[Int] via node-tid, struct elements). Returns
-// the recovered (ct, sname); (-1, "") means "no recovery, keep the caller's".
+// the FieldAccess tid for `b.s` is Set[<typevar>] and get_set_elem_type/
+// get_map_key_type have nothing recorded (mv45y5: -1, not a fabricated
+// default). The concrete element type lives only on the argument node
+// (`insert(3)` → 3 infers TYPE_INT). Fire ONLY when the caller's element is
+// still unrecorded (elem_ct < 0 || elem_ct == CT_VOID, with sname == "" — see
+// each call site's `*_erased_default` predicate) — never override an
+// already-resolved element (protects Set[Str], concrete Set[Int] via
+// node-tid, struct elements). Returns the recovered (ct, sname); (-1, "")
+// means "no recovery, keep the caller's".
 type ElemRecovery { ct: Int, sname: Str }
 fn recover_elem_ct_from_arg(node: Int, arg_pos: Int, is_erased_default: Bool) -> ElemRecovery ! Codegen.Register {
     if !is_erased_default { return ElemRecovery { ct: -1, sname: "" } }
@@ -1142,6 +1145,21 @@ fn emit_list_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int 
                 set_list_elem_map_types(obj_str, pre_list_map_k, pre_list_map_v, pre_list_map_vs)
             }
         }
+        // nprhy8: pushing a Set carries only its OWN kind (CT_SET) via the plain
+        // set_list_elem_type above — the pushed set's element (Int/struct) has
+        // nowhere to land without this, so a later `d.get(0).unwrap()` for-in
+        // has no nested element and either ICEs (Stage A.4) or misreads the
+        // outer CT_SET as its own element. Mirrors the CT_MAP carry above.
+        if val_type == CT_SET {
+            let pushed_elem = get_set_elem_type(val_str)
+            if pushed_elem >= 0 {
+                set_list_nested_elem_type(obj_str, pushed_elem)
+            }
+            let pushed_elem_s = get_set_elem_struct(val_str)
+            if pushed_elem_s != "" {
+                set_list_nested_elem_struct(obj_str, pushed_elem_s)
+            }
+        }
         let val_struct = resolve_push_struct(val_str, obj_str)
         emit_boxed_container_store("blink_list_push({obj_str}, ", val_str, val_type, val_struct, obj_str)
         if push_var_name != "" {
@@ -1295,6 +1313,26 @@ fn emit_list_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int 
             expr_result_type = CT_OPTION
             expr_option_inner = CT_RESULT
             expr_option_inner_struct = res_carrier
+        } else if elem_type == CT_SET {
+            ensure_option_type(CT_SET)
+            let opt_type = option_c_type(CT_SET)
+            emit_line("{opt_type} {res};")
+            emit_line("if (blink_list_len({obj_str}) > 0) \{")
+            emit_line("    {res}.tag = 1; {res}.value = (blink_set*)blink_list_pop({obj_str});")
+            emit_line("} else \{ {res}.tag = 0; }")
+            set_var_option(res, CT_SET)
+            let pop_nested = get_list_nested_elem_type(obj_str)
+            if pop_nested != -1 {
+                set_var_option_inner2(res, pop_nested)
+            }
+            let pop_nested_s = get_list_nested_elem_struct(obj_str)
+            if pop_nested_s != "" {
+                set_var_option_inner2_struct(res, pop_nested_s)
+            }
+            expr_result_str = res
+            expr_result_type = CT_OPTION
+            expr_option_inner = CT_SET
+            expr_option_inner_struct = ""
         } else {
             ensure_option_type(CT_INT)
             let opt_type = option_c_type(CT_INT)
@@ -1508,6 +1546,26 @@ fn emit_list_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int 
             expr_result_type = CT_OPTION
             expr_option_inner = CT_RESULT
             expr_option_inner_struct = res_carrier
+        } else if elem_type == CT_SET {
+            ensure_option_type(CT_SET)
+            let opt_type = option_c_type(CT_SET)
+            emit_line("{opt_type} {res};")
+            emit_line("if (blink_list_in_bounds({obj_str}, {idx_tmp})) \{")
+            emit_line("    {res}.tag = 1; {res}.value = (blink_set*)blink_list_get({obj_str}, {idx_tmp});")
+            emit_line("} else \{ {res}.tag = 0; }")
+            set_var_option(res, CT_SET)
+            let nested_et = get_list_nested_elem_type(obj_str)
+            if nested_et != -1 {
+                set_var_option_inner2(res, nested_et)
+            }
+            let nested_es = get_list_nested_elem_struct(obj_str)
+            if nested_es != "" {
+                set_var_option_inner2_struct(res, nested_es)
+            }
+            expr_result_str = res
+            expr_result_type = CT_OPTION
+            expr_option_inner = CT_SET
+            expr_option_inner_struct = ""
         } else {
             ensure_option_type(CT_INT)
             let opt_type = option_c_type(CT_INT)
@@ -1827,16 +1885,26 @@ fn emit_set_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int !
         set_var_name = node_name(obj_node)
     }
     let elem_ct = get_set_elem_type(set_var_name)
-    let elem_sname = if elem_ct == CT_VOID || elem_ct == CT_STRUCT { get_set_elem_struct(set_var_name) } else { "" }
+    let elem_sname = if elem_ct == CT_VOID || elem_ct == CT_STRUCT || elem_ct < 0 { get_set_elem_struct(set_var_name) } else { "" }
 
     // vbhc4x: a generic-struct field Set[T] erases its element. Like the Map key
-    // (emit_map_method), the erased element CT is CT_STRING (unknown field
-    // default) or CT_VOID (typevar element kind) — both mean "no concrete
-    // element". Recover from the insert/contains/remove argument's memoized tid,
-    // ONLY at that erased default with no struct name (so Set[Str] and a resolved
-    // Set[Int]/Set[Struct] are untouched). Scoped to these three element-taking
-    // methods — union/len/is_empty do not box an element.
-    let set_erased_default = (elem_ct == CT_STRING || elem_ct == CT_VOID) && elem_sname == ""
+    // (emit_map_method), the erased element CT is -1 (mv45y5: get_set_elem_type's
+    // truthful "no element recorded" sentinel) or CT_VOID (typevar element kind)
+    // — both mean "no concrete element". Recover from the insert/contains/remove
+    // argument's memoized tid, ONLY at that erased default with no struct name
+    // (so Set[Str] and a resolved Set[Int]/Set[Struct] are untouched). Scoped to
+    // these three element-taking methods — union/len/is_empty do not box an
+    // element.
+    //
+    // mv45y5 Stage A.5: NOT dead code. Stage A stamped every Set *binding* site
+    // (unannotated let, fn params) from typecheck's tid, but a generic-struct
+    // FIELD's Set[T] (this fn's own motivating case, `GT[T] { s: Set[T] }`) has
+    // no scope var of its own to stamp ahead of time — typecheck does not
+    // monomorphize struct instances, so `e.s`'s tid stays Set[<typevar>] no
+    // matter how many binding sites get fixed. Confirmed still live via
+    // tests/test_6cvvh8_struct_mono_target_seams.bl's tuple-key insert row,
+    // whose failure symptom changed shape under this very Stage A landing.
+    let set_erased_default = (elem_ct < 0 || elem_ct == CT_VOID) && elem_sname == ""
     if method == "insert" {
         let args_sl = node_args(node)
         let rec = recover_elem_ct_from_arg(node, btc_arg_offset, set_erased_default)
@@ -1887,7 +1955,20 @@ fn emit_set_method(node: Int, obj_str: Str, obj_node: Int, method: Str) -> Int !
         let args_sl = node_args(node)
         emit_expr(sublist_get(args_sl, btc_arg_offset))
         let other_str = expr_result_str
-        expr_result_str = "blink_set_union({obj_str}, {other_str})"
+        // nprhy8: mint a real scope var for the union result (not a bare call
+        // expression string) so `for x in a.union(b)` used inline, with no
+        // intervening `let`, has something to read the element metadata off
+        // of — a bare expr_result_str has no scope-var entry at all.
+        let tmp = fresh_temp("__union")
+        emit_line("blink_set* {tmp} = blink_set_union({obj_str}, {other_str});")
+        set_var(tmp, CT_SET, 0)
+        if elem_ct >= 0 {
+            set_set_elem_type(tmp, elem_ct)
+        }
+        if elem_sname != "" {
+            set_set_elem_struct(tmp, elem_sname)
+        }
+        expr_result_str = tmp
         expr_result_type = CT_SET
         expr_list_elem_type = elem_ct
         // Carry the struct/tuple element tag onto the union result so an
@@ -4920,12 +5001,26 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                 // falls to the scalar else and erases to CT_INT, so `.contains`/`.len`
                 // on the unwrapped set report unresolved-method (br 7s0vaj, mirror of
                 // the emit_result_unwrap_inner CT_SET seam).
+                ensure_option_type(CT_SET)
                 let opt_c = option_c_type(CT_SET)
                 emit_line("{opt_c} {tmp} = {obj_str};")
                 emit_panic_tag_check(tmp, 0, "unwrap called on None", node)
                 let val_tmp = fresh_temp("_ounv_")
                 emit_line("blink_set* {val_tmp} = {tmp}.value;")
                 set_var(val_tmp, CT_SET, 0)
+                // nprhy8: the flat inner2 / inner2_struct channels carry the Set's OWN
+                // element (stamped by the CT_SET .get()/.pop() arms) — without threading
+                // them onto val_tmp here, a later for-in over the unwrapped set has no
+                // element recorded and either ICEs (Stage A.4) or, worse, misreads the
+                // stale outer-level metadata as its own element.
+                let nested = get_var_option_inner2(obj_str)
+                if nested != -1 {
+                    set_set_elem_type(val_tmp, nested)
+                }
+                let nested_s = get_var_option_inner2_struct(obj_str)
+                if nested_s != "" {
+                    set_set_elem_struct(val_tmp, nested_s)
+                }
                 expr_result_str = val_tmp
                 expr_result_type = CT_SET
             } else {

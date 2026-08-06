@@ -1495,7 +1495,13 @@ pub fn sv_tp(ctype: Int, inner1: Int, inner2: Int, sname: Str) -> Int {
         return type_map(k, v)
     }
     if ctype == CT_SET {
-        let elem = if inner1 >= 0 { sv_tp(inner1, -1, -1, sname) } else { type_string() }
+        // mv45y5: unlike the sibling container arms above, an unknown Set
+        // element must NOT fabricate a concrete type — typecheck already
+        // resolves every Set's element via HM metavar inference, so codegen
+        // has no business guessing Str. Pass -1 through as the element tp so
+        // tp_child1_kind (get_set_elem_type's reader) faithfully reports
+        // "unknown" instead of a confident wrong answer.
+        let elem = if inner1 >= 0 { sv_tp(inner1, -1, -1, sname) } else { -1 }
         return type_set(elem)
     }
     if ctype == CT_ITERATOR {
@@ -3319,6 +3325,12 @@ pub fn get_list_elem_struct(name: Str) -> Str {
     ""
 }
 
+// Unlike set_var_option_inner2/_struct (mutate-only -- silently a no-op if
+// `name` isn't already a registered CT_OPTION var), this pushes a fresh
+// ScopeVar when no CT_SET entry exists yet. Callers that only ever expect to
+// annotate an already-live Set var still get a write; callers relying on this
+// push as their FIRST registration of `name` must not assume any other kind
+// (e.g. CT_OPTION) also gets stamped by the same call.
 pub fn set_set_elem_type(name: Str, elem_type: Int) {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
@@ -3332,14 +3344,16 @@ pub fn set_set_elem_type(name: Str, elem_type: Int) {
     push_scope_var(ScopeVar { name: name, ctype: CT_SET, is_mut: 0, inner1: elem_type, inner2: -1, sname: "", sname2: "", extra: "", tp_id: sv_tp(CT_SET, elem_type, -1, "") })
 }
 
+// mv45y5: -1 means "no element recorded" -- callers must treat that as
+// unknown (loud diagnostic downstream), never assume CT_STRING. A struct/
+// tuple element legitimately reads -1 here too; check get_set_elem_struct
+// before concluding "truly unknown".
 pub fn get_set_elem_type(name: Str) -> Int {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()
         if sv.name == name && tp_get_kind(sv.tp_id) == CT_SET {
-            let c1k = tp_child1_kind(sv.tp_id)
-            if c1k >= 0 { return c1k }
-            return CT_STRING
+            return tp_child1_kind(sv.tp_id)
         }
         i = i - 1
     }
@@ -3348,14 +3362,12 @@ pub fn get_set_elem_type(name: Str) -> Int {
         while ci < cg_closure_cap_count {
             let cap = closure_captures.get(cg_closure_cap_start + ci).unwrap()
             if cap.name == name && tp_get_kind(cap.tp_id) == CT_SET {
-                let c1k = tp_child1_kind(cap.tp_id)
-                if c1k >= 0 { return c1k }
-                return CT_STRING
+                return tp_child1_kind(cap.tp_id)
             }
             ci = ci + 1
         }
     }
-    CT_STRING
+    -1
 }
 
 // Struct/tuple element tag of a Set scope var (parallels get_map_key_struct),

@@ -71,8 +71,9 @@ import codegen_types.{
     set_list_elem_option_tp, set_list_elem_result_tp, set_list_elem_map_tp,
     type_option, type_result, type_map, type_list, type_struct, sv_tp,
     kops_table_name, kops_elem_is_concrete, kops_is_struct_key, key_struct_sname_from_ann, ensure_tuple_kops_key,
-    set_map_types, set_map_key_struct, set_set_elem_type, set_set_elem_struct,
+    set_map_types, set_map_key_struct, set_set_elem_type, set_set_elem_struct, get_set_elem_type, get_set_elem_struct,
     set_var, set_var_closure, set_var_option, set_var_struct,
+    set_var_option_inner2, set_var_option_inner2_struct,
     strip_blink_prefix, strip_generic_args, strip_module_qualifier,
     sf_entries, struct_field_defaults, struct_invariants, struct_option_c_type, synthesized_display_call,
     coerce_to_c_str, render_result_arm_value,
@@ -387,15 +388,43 @@ fn reseat_after_q_on_result(tmp: Str, rok: Int, rok_s: Str) {
 // monomorphizations, and the struct-field tp_id is reg-side-erased to -1. Both
 // the tuple-access and struct-field paths recover it identically from
 // typecheck's per-node tid memo, so they share this helper. A -1 elem CT
-// (unresolvable inner: typevar/tuple/fn) is a no-op — the caller's default
-// element type stands. jkdywb.
-fn recover_set_elem_from_tid(node: Int, var_name: Str) ! Codegen.Register, Codegen.Scope {
+// (unresolvable inner: typevar/tuple/fn) is a no-op — mv45y5 removed the
+// fabricated CT_STRING default every caller used to fall back to, so a no-op
+// here now leaves the element genuinely unset (not a safe default); callers
+// without their own downstream diagnostic must treat that as "still unknown",
+// not "some default is fine". jkdywb.
+//
+// mv45y5: uses the _resolved twins, not the plain tc_tid_set_elem_ct/_struct.
+// An unannotated `Set()`'s element is a fresh metavar (make_metavar,
+// TK_UNKNOWN with the solution stashed in inner1, never in .kind) that a later
+// `insert(x)` binds IN PLACE -- the plain accessors read inner1's raw .kind
+// without following that bind, so a perfectly-solved element still reads back
+// as -1. Every caller of this helper wants the concrete backing type for
+// codegen bookkeeping, so resolving is always correct here (the dbzy4r
+// deferral the plain accessors exist for is a concern for other callers, not
+// this one).
+pub fn recover_set_elem_from_tid(node: Int, var_name: Str) ! Codegen.Register, Codegen.Scope {
     let etid = tc_lookup_node_tid(node)
-    let ect = tc_tid_set_elem_ct(etid)
+    let ect = tc_tid_set_elem_ct_resolved(etid)
     if ect >= 0 {
         set_set_elem_type(var_name, ect)
-        let es = tc_tid_set_elem_struct(etid)
+        let es = tc_tid_set_elem_struct_resolved(etid)
         if es != "" { set_set_elem_struct(var_name, es) }
+    }
+}
+
+// The Option-wrapped twin of recover_set_elem_from_tid: `var_name` is an
+// already-registered CT_OPTION var whose inner is a Set, so the Set's own
+// element rides the option's flat inner2 slot (get_var_option_inner2) rather
+// than the var's own elem_type/elem_struct channel. `node` is the Set[T]
+// annotation node itself (the Option's inner_ann), not the Option annotation.
+pub fn recover_option_set_elem_from_tid(node: Int, var_name: Str) ! Codegen.Register, Codegen.Scope {
+    let etid = tc_lookup_node_tid(node)
+    let ect = tc_tid_set_elem_ct_resolved(etid)
+    if ect >= 0 {
+        set_var_option_inner2(var_name, ect)
+        let es = tc_tid_set_elem_struct_resolved(etid)
+        if es != "" { set_var_option_inner2_struct(var_name, es) }
     }
 }
 
@@ -473,18 +502,27 @@ fn deep_tp_from_tid(tid: Int) -> Int {
 //   - br jcr0zz: CT_OPTION/CT_RESULT/CT_MAP elements recover their own inner
 //     via deep_tp_from_tid (below) instead of re-erasing to Int — a flat
 //     set_list_elem_type(CT_OPTION) would lose that inner, which is exactly
-//     what deep_tp_from_tid's tp_id tree exists to preserve. CT_SET/
-//     CT_ITERATOR/CT_HANDLE/CT_CHANNEL/CT_BYTES have no parity target
-//     (emit_list_method's `get` has no arm for them even on the DECLARED
-//     path — jcr0zz §2) and stay erased on purpose; a flat write there
-//     would trade a loud `.get()` error for a link error in for-in instead.
-//     Staying erased is the honest answer, not a wrong-but-quiet one.
+//     what deep_tp_from_tid's tp_id tree exists to preserve. nprhy8: CT_SET
+//     now has a parity target too (emit_list_method's `get`/`pop` CT_SET
+//     arms) — its element is flat (E1400 forbids a container Set element),
+//     so it recovers via tc_tid_set_elem_ct/_struct straight onto
+//     set_list_nested_elem_type/_struct, no deep_tp_from_tid needed.
+//     CT_ITERATOR/CT_HANDLE/CT_CHANNEL/CT_BYTES still have no parity target
+//     and stay erased on purpose; a flat write there would trade a loud
+//     `.get()` error for a link error in for-in instead. Staying erased is
+//     the honest answer, not a wrong-but-quiet one.
 // A nested List[List[T]] recurses exactly one level into
 // set_list_nested_elem_type/_struct, mirroring the declared-path shape at
 // codegen_stmt.bl:3320-3330; a second nested List level, or a typevar/
 // tuple/fn element, is a safe no-op (the -1/"" sentinel already stands).
 fn recover_list_elem_from_tid(node: Int, var_name: Str) ! Codegen.Register, Codegen.Scope {
-    let etid = tc_lookup_node_tid(node)
+    // A generic FUNCTION body's own tid memo is written once at typecheck with
+    // its tparams abstract (typecheck never re-runs per instantiation) -- inside
+    // a mono instance's body, `List[Set[T]]` still reads back with T a bare
+    // typevar unless it is rewritten through THIS call's binder, exactly what
+    // tc_tid_subst_mono exists for (mirrors the raw/sub retry at :6160). No-op
+    // outside a mono body or when node's tid is already concrete.
+    let etid = tc_tid_subst_mono(tc_lookup_node_tid(node), cg_mono_tparams_sl, cg_mono_arg_tids)
     let ect = tc_tid_list_elem_ct(etid)
     if ect < 0 { return }
     let tracing = dbg_channel_on("listelem")
@@ -532,14 +570,39 @@ fn recover_list_elem_from_tid(node: Int, var_name: Str) ! Codegen.Register, Code
         set_list_elem_map_tp(var_name, key_tp, val_tp)
         return
     }
-    // br jcr0zz §2: Set/Iterator/Handle/Channel/Bytes elements have no parity
+    // nprhy8: Set element is always a flat hashable scalar/struct/tuple
+    // (E1400 forecloses a container element), so no deep_tp_from_tid tree is
+    // needed — tc_tid_set_elem_ct/_struct read straight off the Set's own
+    // tid. Gate on the element being nameable so a genuinely-unresolved
+    // typevar keeps bailing loudly instead of committing to a partial
+    // (elem-type-known, nested-elem-unknown) answer.
+    if ect == CT_SET {
+        let elem_tid = tc_tid_list_elem(etid)
+        let set_ct = tc_tid_set_elem_ct(elem_tid)
+        let set_struct = tc_tid_set_elem_struct(elem_tid)
+        if set_ct < 0 && set_struct == "" {
+            if tracing != 0 { dbg_trace("listelem", "recover ect={ect} var={var_name} arm=set_bail_unfaithful") }
+            return
+        }
+        if tracing != 0 { dbg_trace("listelem", "recover ect={ect} var={var_name} arm=set set_ct={set_ct} set_struct={set_struct}") }
+        expr_list_elem_type = ect
+        expr_list_elem_struct = ""
+        set_list_elem_type(var_name, ect)
+        if set_ct >= 0 {
+            set_list_nested_elem_type(var_name, set_ct)
+        }
+        if set_struct != "" {
+            set_list_nested_elem_struct(var_name, set_struct)
+        }
+        return
+    }
+    // br jcr0zz §2: Iterator/Handle/Channel/Bytes elements have no parity
     // target — emit_list_method's `get` branch has no arm for these kinds
     // (codegen_methods.bl's else falls to int64_t boxing), and the DECLARED
     // path erases identically. Flipping expr_list_elem_type to one of these
-    // would redirect for-in to a never-emitted iterator type
-    // (blink_ListIterator_set etc.), trading a loud `.get()` error for a link
-    // error in a different construct. Stay erased — the honest answer.
-    if ect == CT_SET || ect == CT_ITERATOR || ect == CT_HANDLE || ect == CT_CHANNEL || ect == CT_BYTES {
+    // would redirect for-in to a never-emitted iterator type, trading a loud
+    // `.get()` error for a link error in a different construct. Stay erased.
+    if ect == CT_ITERATOR || ect == CT_HANDLE || ect == CT_CHANNEL || ect == CT_BYTES {
         if tracing != 0 { dbg_trace("listelem", "recover ect={ect} var={var_name} arm=no_parity_target") }
         return
     }
@@ -558,7 +621,13 @@ fn recover_list_elem_from_tid(node: Int, var_name: Str) ! Codegen.Register, Code
     if ect != CT_LIST { return }
     let inner_tid = tc_tid_list_elem(etid)
     let nect = tc_tid_list_elem_ct(inner_tid)
-    if nect < 0 || nect == CT_OPTION || nect == CT_RESULT || nect == CT_MAP || nect == CT_SET || nect == CT_ITERATOR || nect == CT_HANDLE || nect == CT_CHANNEL || nect == CT_BYTES || nect == CT_LIST {
+    // nprhy8: CT_SET dropped from this exclusion — List[List[Set[T]]]'s outer
+    // var can now record that its nested (2-deep) element is itself a Set via
+    // the same flat set_list_nested_elem_type fallback below as any other
+    // scalar kind. This carries only the KIND at 2 levels deep, not the Set's
+    // OWN element at 3 levels deep (no deep-carrier family exists for that,
+    // per plan) — a for-in 2 levels down still needs its own recovery.
+    if nect < 0 || nect == CT_OPTION || nect == CT_RESULT || nect == CT_MAP || nect == CT_ITERATOR || nect == CT_HANDLE || nect == CT_CHANNEL || nect == CT_BYTES || nect == CT_LIST {
         return
     }
     if nect == CT_STRUCT || nect == CT_ENUM {
@@ -1037,6 +1106,18 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
                                                 } else if is_compound_ct(inner_ct) != 0 {
                                                     expr_option_inner_struct = compound_name_from_ann(inner_ann)
                                                 }
+                                                // A monomorphized generic field Option[Set[T]]: register
+                                                // expr_result_str as a real CT_OPTION var so `.unwrap()`'s
+                                                // get_var_option_inner2 has an entry to read the Set's OWN
+                                                // element off of (there is no flat-global twin of
+                                                // expr_option_inner_list_elem for Set, by design — see the
+                                                // plan's Stage B.8 guardrail). recover_option_set_elem_from_tid
+                                                // resolves T via inner_ann's per-node tid, same as the fn-param
+                                                // call sites.
+                                                if inner_ct == CT_SET {
+                                                    set_var_option(expr_result_str, CT_SET)
+                                                    recover_option_set_elem_from_tid(inner_ann, expr_result_str)
+                                                }
                                             }
                                         } else if resolved == "Result" {
                                             fa_type = CT_RESULT
@@ -1090,6 +1171,24 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
                         expr_option_inner = tp_child1_kind(fa_tp)
                         let fa_opt_sname = tp_child1_sname(fa_tp)
                         expr_option_inner_struct = if fa_opt_sname != "" { fa_opt_sname } else { "" }
+                        // A plain (non-generic) struct field Option[Set[T]]: unlike the
+                        // CT_LIST arm above, fa_tp's own child1 (the Set) has no
+                        // recover_set_elem_from_tid fallback anywhere in this branch, so
+                        // register expr_result_str as a real CT_OPTION var and stamp the
+                        // Set's own element via the node's tid — the same mechanism the
+                        // mono-substitution arm above and the fn-param call sites use.
+                        if expr_option_inner == CT_SET {
+                            set_var_option(expr_result_str, CT_SET)
+                            let set_tid = tc_tid_option_inner_tid(tc_lookup_node_tid(node))
+                            if set_tid >= 0 {
+                                let set_ect = tc_tid_set_elem_ct_resolved(set_tid)
+                                if set_ect >= 0 {
+                                    set_var_option_inner2(expr_result_str, set_ect)
+                                    let set_es = tc_tid_set_elem_struct_resolved(set_tid)
+                                    if set_es != "" { set_var_option_inner2_struct(expr_result_str, set_es) }
+                                }
+                            }
+                        }
                     } else if fa_type == CT_RESULT {
                         expr_result_ok_type = tp_child1_kind(fa_tp)
                         expr_result_err_type = tp_child2_kind(fa_tp)
@@ -1116,7 +1215,15 @@ pub fn emit_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
             // child (a genuine List[Int]) must NOT be overwritten. br jw1pmb.
             if fa_type == CT_LIST {
                 let le_tp = get_struct_field_tp_id(struct_type, c_field)
-                if le_tp < 0 || (tp_child1_sname(le_tp) == "" && tp_child1_kind(le_tp) == CT_INT) {
+                // A List[Set[T]] field's own element (Set) is knowable straight off
+                // reg_sf_entry's shallow one-level tp (sv_tp has no slot for a 2nd
+                // level), but the Set's OWN nested element never is -- recover_list_
+                // elem_from_tid's CT_SET arm is the only path that stamps
+                // set_list_nested_elem_type/_struct, so it must still run even when
+                // the outer "List's element is a Set" fact is already correctly
+                // known, or a generic fn body's `for s in b.xs { for x in s {...} }`
+                // hits mv45y5's SetElementTypeUnknownAtCodegen ICE on `s`.
+                if le_tp < 0 || (tp_child1_sname(le_tp) == "" && tp_child1_kind(le_tp) == CT_INT) || tp_child1_kind(le_tp) == CT_SET {
                     recover_list_elem_from_tid(node, expr_result_str)
                 }
             }
@@ -1963,6 +2070,37 @@ fn emit_binop(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.R
             }
             expr_result_str = val_tmp
             expr_result_type = CT_LIST
+        } else if opt_inner == CT_SET {
+            // nprhy8: the generic opt_inner>=0 fallback below mints no temp
+            // var — it returns a bare ternary expression string — so there is
+            // nothing to attach the Set's own element metadata to. Mirror the
+            // CT_LIST arm above: mint val_tmp and carry the element off
+            // left_str's flat inner2 channel (stamped by the .get()/.pop()
+            // CT_SET arms), not a transient global.
+            ensure_option_type(CT_SET)
+            let opt_c = option_c_type(CT_SET)
+            emit_line("{opt_c} {tmp} = {left_str};")
+            let val_tmp = fresh_temp("__optv")
+            emit_line("blink_set* {val_tmp} = {tmp}.tag == 1 ? {tmp}.value : {right_str};")
+            set_var(val_tmp, CT_SET, 0)
+            let nested = get_var_option_inner2(left_str)
+            let nested_s = get_var_option_inner2_struct(left_str)
+            if nested != -1 {
+                set_set_elem_type(val_tmp, nested)
+            }
+            if nested_s != "" {
+                set_set_elem_struct(val_tmp, nested_s)
+            }
+            if nested == -1 && nested_s == "" {
+                // nprhy8: left_str's inner2 channel is only populated for a
+                // registered Option scope var (a `let`-bound or param name) --
+                // a struct-field left operand (`b.inner ?? fallback`) has no
+                // such registration, so fall back to the ?? node's own tid,
+                // same last resort the unannotated let-binding path uses.
+                recover_set_elem_from_tid(node, val_tmp)
+            }
+            expr_result_str = val_tmp
+            expr_result_type = CT_SET
         } else if opt_inner >= 0 {
             let opt_c = option_c_type(opt_inner)
             emit_line("{opt_c} {tmp} = {left_str};")
@@ -5636,6 +5774,7 @@ fn emit_list_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
     let elems_sl = node_elements(node)
     let mut first_elem_type = -1
     let mut first_elem_struct = ""
+    let mut first_elem_str = ""
     if elems_sl != -1 {
         let mut i = 0
         while i < sublist_length(elems_sl) {
@@ -5665,6 +5804,7 @@ fn emit_list_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
                 if i == 0 {
                     first_elem_type = e_type
                     first_elem_struct = resolve_push_struct(e_str, tmp)
+                    first_elem_str = e_str
                 }
                 let e_struct = resolve_push_struct(e_str, tmp)
                 // For a struct literal element whose type isn't recorded on a
@@ -5690,6 +5830,25 @@ fn emit_list_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Dia
         expr_list_elem_struct = first_elem_struct
     } else {
         expr_list_elem_struct = ""
+    }
+    // nprhy8: a Set first element carries only its own kind (CT_SET) via the
+    // expr_list_elem_type global above — the LET-BINDING consumer
+    // (codegen_stmt.bl) recovers the Set's OWN element by reading
+    // get_list_nested_elem_type(tmp), which requires tmp to already be a
+    // registered CT_LIST scope var (set_list_nested_elem_type has no push
+    // fallback, unlike set_list_elem_type). Register tmp and carry the
+    // element off the first element's own var, mirroring the push() fix in
+    // emit_list_method.
+    if first_elem_type == CT_SET {
+        set_list_elem_type(tmp, CT_SET)
+        let nested = get_set_elem_type(first_elem_str)
+        if nested >= 0 {
+            set_list_nested_elem_type(tmp, nested)
+        }
+        let nested_s = get_set_elem_struct(first_elem_str)
+        if nested_s != "" {
+            set_list_nested_elem_struct(tmp, nested_s)
+        }
     }
     expr_result_str = tmp
     expr_result_type = CT_LIST

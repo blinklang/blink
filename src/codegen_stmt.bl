@@ -68,6 +68,7 @@ import codegen_types.{
     set_var_handler,
     set_var_handle_full, set_var_iterator, set_var_option,
     set_var_option_inner2, set_var_option_inner2_struct, get_var_option_inner_tp,
+    get_var_option_inner2, get_var_option_inner2_struct,
     set_var_option_struct, set_var_option_from_struct_tag,
     set_var_result, set_var_result_ok_elem,
     set_var_result_struct, set_var_result_from_struct_tag,
@@ -91,7 +92,7 @@ import codegen_expr.{
     expr_option_inner_struct, expr_option_is_none, expr_result_err_struct, expr_result_err_type,
     expr_result_ok_struct, expr_result_ok_type, expr_result_str,
     expr_result_type, mono_instance_arg_tids_from_tid, panic_file_for, segs_from_arg_tids,
-    tparams_sl_contains
+    tparams_sl_contains, recover_set_elem_from_tid, recover_option_set_elem_from_tid
 }
 import codegen_methods.{resolve_tparam_via_tid, copy_list_compound_elem, emit_boxed_container_store, finish_enum_zip_result}
 import codegen_derive.{ct_to_descriptor, desc_primary_ct, descriptor_c_type, descriptor_mangle, emit_promote_elem_into, inner_desc_of, queue_promote_type, map_pair_key_read_expr}
@@ -873,6 +874,28 @@ pub fn emit_match_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scop
                 } else {
                     let opt_c = option_c_type(oi)
                     emit_line("{opt_c} {scrut_tmp} = {expr_result_str};")
+                }
+                // nprhy8: the materialized scrut_tmp is a bare C copy with no scope-var
+                // metadata of its own — unwrap_carrier reads the still-live transient
+                // globals for inner_ct/inner_struct, but a CT_SET inner's OWN element
+                // rides the source var's flat inner2 channel, which the copy above
+                // does not carry. Copy it explicitly (mirrors the CT_LIST branch's
+                // get_list_elem_type(src_name) carry) before expr_result_str moves on,
+                // so bind_pattern_vars's Some(x) arm can read it off scrut_tmp.
+                if oi == CT_SET {
+                    // set_var_option_inner2 only mutates an EXISTING CT_OPTION
+                    // scope_vars entry (no push fallback, unlike set_var_option) —
+                    // scrut_tmp has no entry at all on this branch, so register it
+                    // first or the inner2 write below is a silent no-op.
+                    set_var_option(scrut_tmp, oi)
+                    let set_nested = get_var_option_inner2(expr_result_str)
+                    if set_nested != -1 {
+                        set_var_option_inner2(scrut_tmp, set_nested)
+                    }
+                    let set_nested_s = get_var_option_inner2_struct(expr_result_str)
+                    if set_nested_s != "" {
+                        set_var_option_inner2_struct(scrut_tmp, set_nested_s)
+                    }
                 }
             }
             match_scruts.push(MatchScrutEntry { str_val: scrut_tmp, scrut_type: expr_result_type })
@@ -1890,6 +1913,20 @@ fn bind_pattern_vars(pat: Int, scrut_off: Int, scrut_len: Int) ! Codegen.Emit, C
                                 set_list_elem_struct(bind_name, expr_option_inner_list_struct)
                             } else if expr_list_elem_struct != "" {
                                 set_list_elem_struct(bind_name, expr_list_elem_struct)
+                            }
+                        } else if inner_ct == CT_SET {
+                            // nprhy8: match d.get(0) { Some(inner) => ... } — mirror the
+                            // CT_LIST branch above. The Set's own element rides the
+                            // scrutinee's flat inner2 channel (stamped by the .get()/.pop()
+                            // CT_SET arms), never a transient global (avoids the CT_LIST
+                            // contamination the plan calls out at :3139/:1884-equivalent).
+                            let set_nested = get_var_option_inner2(scrut)
+                            if set_nested != -1 {
+                                set_set_elem_type(bind_name, set_nested)
+                            }
+                            let set_nested_s = get_var_option_inner2_struct(scrut)
+                            if set_nested_s != "" {
+                                set_set_elem_struct(bind_name, set_nested_s)
                             }
                         }
                     }
@@ -3154,6 +3191,21 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
                 expr_option_inner_map_val_struct = ""
             }
         }
+        // nprhy8: a CT_SET inner carries its own element on the RHS temp's flat
+        // inner2 channel (stamped directly by the .get()/.pop() CT_SET arms, never
+        // through the CT_LIST-only expr_option_inner_list_elem global — see the
+        // contamination note above :3139). Copy it straight off val_str rather than
+        // adding a parallel global, so `let o = d.get(0)` doesn't lose the element.
+        if expr_option_inner == CT_SET {
+            let set_nested = get_var_option_inner2(val_str)
+            if set_nested != -1 {
+                set_var_option_inner2(name, set_nested)
+            }
+            let set_nested_s = get_var_option_inner2_struct(val_str)
+            if set_nested_s != "" {
+                set_var_option_inner2_struct(name, set_nested_s)
+            }
+        }
         // whg65a: preserve a DIRECT Option[container]'s deep inner tp across the
         // let-binding (the flat set_var_option_struct rebind above drops a Map's V /
         // a List's element). Only for a Map/List inner — an Option[Option[..]] or
@@ -3412,7 +3464,7 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
         // set expr_list_elem_type (union results). Always clear the global so a
         // stale value from a prior expression can't leak into a later binding.
         let src_elem = get_set_elem_type(val_str)
-        if src_elem != CT_STRING || get_set_elem_struct(val_str) != "" {
+        if src_elem >= 0 || get_set_elem_struct(val_str) != "" {
             set_set_elem_type(name, src_elem)
             let src_struct = get_set_elem_struct(val_str)
             if src_struct != "" {
@@ -3423,6 +3475,13 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
             if expr_list_elem_struct != "" {
                 set_set_elem_struct(name, expr_list_elem_struct)
             }
+        } else {
+            // mv45y5: no annotation, no alias source, no adapter carry -- the
+            // last resort is typecheck's own tid for the RHS (Set() mints a
+            // metavar that HM inference has already pinned by this point for
+            // any well-typed program; genuinely unconstrained is E0301 well
+            // before codegen).
+            recover_set_elem_from_tid(val_node, name)
         }
         expr_list_elem_type = -1
         expr_list_elem_struct = ""
@@ -3637,7 +3696,9 @@ fn emit_for_in(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.
         // Set only when the CT_MAP normalizer below finds a List/Set-valued Map (e.g.
         // `Map[K, List[V]]`) with tracked nested-element info, so `for (k, v) in map`
         // can propagate it onto the destructured `v` -- otherwise a later `for x in v`
-        // would fall back to get_list_elem_type/get_set_elem_type's CT_STRING default.
+        // would find nothing recorded on `v` and (List) silently read -1 or (Set, per
+        // mv45y5 below) fail loud, neither of which fabricates a CT_STRING default
+        // anymore.
         let mut map_val_ct = -1
         let mut map_val_nested_ct = -1
         if iter_type == CT_SET {
@@ -3651,6 +3712,23 @@ fn emit_for_in(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.
             // producing a silently wrong or uncompilable call.
             let set_elem_ct = get_set_elem_type(lookup_name)
             let set_elem_struct = get_set_elem_struct(lookup_name)
+            if set_elem_ct < 0 && set_elem_struct == "" {
+                // mv45y5: get_set_elem_type now reports -1 truthfully instead of
+                // fabricating CT_STRING. Every Set binding site is stamped from
+                // typecheck's HM-resolved element (Stage A) and E0301 rejects a
+                // genuinely unconstrained Set() before codegen runs, so reaching
+                // this point with no element recorded is a compiler bug, not the
+                // user's fault -- fail loud rather than guess.
+                diag_ice_at("SetElementTypeUnknownAtCodegen", UNHANDLED_ITERABLE_AT_CODEGEN,
+                    "for-in over Set variable '{lookup_name}' has no element type recorded at codegen",
+                    iter_node,
+                    "this is a compiler bug — please report it with the smallest reproducing program")
+                // diag_ice_at only records the diagnostic; it does not abort. Bail
+                // out now rather than falling through to the CT_LIST conversion
+                // below and its `elem_type == -1 -> CT_INT` fallback (~line 3798),
+                // which would silently box a Str/struct element as int64.
+                return
+            }
             let lst = fresh_temp("_setl_")
             emit_line("blink_list* {lst} = blink_set_to_list({iter_str});")
             set_var(lst, CT_LIST, 0)
@@ -3918,8 +3996,8 @@ fn emit_for_in(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.
                     // A List[Set[T]] for-in materializes each element as a Set: carry
                     // the inner Set's own element type/struct (stamped at declare time,
                     // see the elem_ct == CT_SET branch below) so a nested `for x in
-                    // inner_set` doesn't fall back to get_set_elem_type's CT_STRING
-                    // default.
+                    // inner_set` finds the real element instead of hitting mv45y5's
+                    // loud SetElementTypeUnknownAtCodegen ICE.
                     let nested_et = get_list_nested_elem_type(iter_str)
                     if nested_et != -1 {
                         set_set_elem_type(var_name, nested_et)
@@ -5423,6 +5501,19 @@ pub fn emit_impl_method_def(fn_node: Int, impl_type: Str, im_node: Int) ! Codege
                                         }
                                     }
                                 }
+                                if elem_ct == CT_SET {
+                                    let nested_sl = node_elements(elem_ann)
+                                    if nested_sl != -1 && sublist_length(nested_sl) > 0 {
+                                        let nested_ann = sublist_get(nested_sl, 0)
+                                        let nested_name = node_name(nested_ann)
+                                        let nested_ct = type_from_name(nested_name)
+                                        set_list_nested_elem_type(pname, nested_ct)
+                                        let nested_struct = key_struct_sname_from_ann(nested_ann)
+                                        if nested_struct != "" {
+                                            set_list_nested_elem_struct(pname, nested_struct)
+                                        }
+                                    }
+                                }
                                 if elem_ct == CT_MAP {
                                     set_list_elem_map_ann(pname, elem_ann)
                                 }
@@ -5452,7 +5543,16 @@ pub fn emit_impl_method_def(fn_node: Int, impl_type: Str, im_node: Int) ! Codege
                                 let elem_ann = sublist_get(elems_sl, 0)
                                 let elem_name = node_name(elem_ann)
                                 let elem_ct = type_from_name(elem_name)
-                                set_set_elem_type(pname, elem_ct)
+                                if elem_ct >= 0 && elem_ct != CT_VOID {
+                                    set_set_elem_type(pname, elem_ct)
+                                } else {
+                                    // mv45y5: a raw type-parameter letter (e.g. "T") or a
+                                    // struct-element name both read CT_VOID from
+                                    // type_from_name -- recover the mono-substituted
+                                    // element (scalar or struct) from the annotation's
+                                    // own tid instead of leaving it unstamped.
+                                    recover_set_elem_from_tid(ta, pname)
+                                }
                             }
                         }
                     }
@@ -6073,6 +6173,19 @@ pub fn emit_fn_def(fn_node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope
                                     }
                                 }
                             }
+                            if elem_ct == CT_SET {
+                                let nested_sl = node_elements(elem_ann)
+                                if nested_sl != -1 && sublist_length(nested_sl) > 0 {
+                                    let nested_ann = sublist_get(nested_sl, 0)
+                                    let nested_name = node_name(nested_ann)
+                                    let nested_ct = type_from_name(nested_name)
+                                    set_list_nested_elem_type(pname, nested_ct)
+                                    let nested_struct = key_struct_sname_from_ann(nested_ann)
+                                    if nested_struct != "" {
+                                        set_list_nested_elem_struct(pname, nested_struct)
+                                    }
+                                }
+                            }
                             if elem_ct == CT_MAP {
                                 set_list_elem_map_ann(pname, elem_ann)
                             }
@@ -6097,6 +6210,25 @@ pub fn emit_fn_def(fn_node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope
                                     let inner_name = node_name(inner_ann)
                                     set_map_value_list_elem(pname, type_from_name(inner_name))
                                 }
+                            }
+                        }
+                    }
+                }
+                if ptype == "Set" {
+                    let ta = node_type_ann(p)
+                    if ta != -1 {
+                        let elems_sl = node_elements(ta)
+                        if elems_sl != -1 && sublist_length(elems_sl) > 0 {
+                            let elem_ann = sublist_get(elems_sl, 0)
+                            let elem_name = node_name(elem_ann)
+                            let elem_ct = type_from_name(elem_name)
+                            if elem_ct >= 0 && elem_ct != CT_VOID {
+                                set_set_elem_type(pname, elem_ct)
+                            } else {
+                                // mv45y5: see the twin block in emit_impl_method_def --
+                                // recover the mono-substituted element from the
+                                // annotation's tid rather than leaving it unstamped.
+                                recover_set_elem_from_tid(ta, pname)
                             }
                         }
                     }
@@ -6184,6 +6316,22 @@ pub fn emit_fn_def(fn_node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope
                                 set_var_option_struct(pname, inner_t, inner_s)
                             } else if is_compound_ct(inner_t) != 0 || inner_name == "Tuple" {
                                 set_var_option_struct(pname, inner_t, compound_name_from_ann(inner_ann))
+                            } else if inner_name == "Set" {
+                                // nprhy8: CT_SET is deliberately not in is_compound_ct, so
+                                // the arm above never fires -- the Set's OWN element rides
+                                // the option's flat inner2 slot instead (get_var_option_inner2),
+                                // mirroring the bare `Set[T]` param arm below.
+                                set_var_option(pname, inner_t)
+                                let set_elems_sl = node_elements(inner_ann)
+                                if set_elems_sl != -1 && sublist_length(set_elems_sl) > 0 {
+                                    let set_elem_ann = sublist_get(set_elems_sl, 0)
+                                    let set_elem_ct = type_from_name(node_name(set_elem_ann))
+                                    if set_elem_ct >= 0 && set_elem_ct != CT_VOID {
+                                        set_var_option_inner2(pname, set_elem_ct)
+                                    } else {
+                                        recover_option_set_elem_from_tid(inner_ann, pname)
+                                    }
+                                }
                             } else {
                                 set_var_option(pname, inner_t)
                             }
@@ -7326,6 +7474,25 @@ fn emit_mono_fn_def(fn_node: Int, concrete_args: Str, arg_tids: List[Int]) ! Cod
                                     }
                                 }
                             }
+                            if elem_ct == CT_SET {
+                                let nested_sl = node_elements(elem_ann)
+                                if nested_sl != -1 && sublist_length(nested_sl) > 0 {
+                                    let nested_ann = sublist_get(nested_sl, 0)
+                                    let nested_name_raw = node_name(nested_ann)
+                                    let nested_name = resolve_tparam_via_tid(nested_name_raw, tparams_sl, arg_tids)
+                                    let nested_ct = type_from_name(nested_name)
+                                    set_list_nested_elem_type(pname, nested_ct)
+                                    // key_struct_sname_from_ann re-reads node_name(nested_ann)
+                                    // internally, which is the RAW (unsubstituted) typevar
+                                    // letter for a mono param -- check the already-resolved
+                                    // nested_name first so a `List[Set[T]]` monomorphized with
+                                    // T bound to a struct/data-enum doesn't lose the name.
+                                    let nested_struct = if is_named_type(nested_name) != 0 { nested_name } else { key_struct_sname_from_ann(nested_ann) }
+                                    if nested_struct != "" {
+                                        set_list_nested_elem_struct(pname, nested_struct)
+                                    }
+                                }
+                            }
                             if elem_ct == CT_MAP {
                                 set_list_elem_map_ann(pname, elem_ann)
                             }
@@ -7374,10 +7541,27 @@ fn emit_mono_fn_def(fn_node: Int, concrete_args: Str, arg_tids: List[Int]) ! Cod
                     if ta != -1 {
                         let elems_sl = node_elements(ta)
                         if elems_sl != -1 && sublist_length(elems_sl) >= 1 {
-                            let inner_name = resolve_tparam_via_tid(node_name(sublist_get(elems_sl, 0)), tparams_sl, arg_tids)
+                            let inner_ann = sublist_get(elems_sl, 0)
+                            let inner_name = resolve_tparam_via_tid(node_name(inner_ann), tparams_sl, arg_tids)
                             let inner_ct = type_from_name(inner_name)
                             if is_struct_type(inner_name) != 0 || is_enum_type(inner_name) != 0 {
                                 set_var_option_struct(pname, CT_INT, inner_name)
+                            } else if inner_name == "Set" {
+                                // nprhy8: see the twin block in emit_fn_def -- the Set's
+                                // own element rides the option's inner2 slot, not
+                                // is_compound_ct (CT_SET is deliberately excluded there).
+                                set_var_option(pname, inner_ct)
+                                let set_elems_sl = node_elements(inner_ann)
+                                if set_elems_sl != -1 && sublist_length(set_elems_sl) > 0 {
+                                    let set_elem_ann = sublist_get(set_elems_sl, 0)
+                                    let set_elem_name = resolve_tparam_via_tid(node_name(set_elem_ann), tparams_sl, arg_tids)
+                                    let set_elem_ct = type_from_name(set_elem_name)
+                                    if set_elem_ct >= 0 && set_elem_ct != CT_VOID {
+                                        set_var_option_inner2(pname, set_elem_ct)
+                                    } else {
+                                        recover_option_set_elem_from_tid(inner_ann, pname)
+                                    }
+                                }
                             } else {
                                 set_var_option(pname, inner_ct)
                             }
@@ -7399,6 +7583,26 @@ fn emit_mono_fn_def(fn_node: Int, concrete_args: Str, arg_tids: List[Int]) ! Cod
                                 set_var_result_struct(pname, ok_ct, err_ct, ok_s, err_s)
                             } else {
                                 set_var_result(pname, ok_ct, err_ct)
+                            }
+                        }
+                    }
+                }
+                if resolved_ptype == "Set" {
+                    let ta = node_type_ann(p)
+                    if ta != -1 {
+                        let elems_sl = node_elements(ta)
+                        if elems_sl != -1 && sublist_length(elems_sl) > 0 {
+                            let elem_ann = sublist_get(elems_sl, 0)
+                            let elem_name_raw = node_name(elem_ann)
+                            let elem_name = resolve_tparam_via_tid(elem_name_raw, tparams_sl, arg_tids)
+                            let elem_ct = type_from_name(elem_name)
+                            if elem_ct >= 0 && elem_ct != CT_VOID {
+                                set_set_elem_type(pname, elem_ct)
+                            } else {
+                                // mv45y5: see the twin block in emit_impl_method_def --
+                                // recover the mono-substituted element from the
+                                // annotation's tid rather than leaving it unstamped.
+                                recover_set_elem_from_tid(ta, pname)
                             }
                         }
                     }
@@ -7683,10 +7887,27 @@ fn emit_poly_impl_method_def(im: Int, method_node: Int, concrete_args: Str, arg_
                     if ta != -1 {
                         let elems_sl = node_elements(ta)
                         if elems_sl != -1 && sublist_length(elems_sl) >= 1 {
-                            let inner_name = resolve_tparam_via_tid(node_name(sublist_get(elems_sl, 0)), tparams_sl, arg_tids)
+                            let inner_ann = sublist_get(elems_sl, 0)
+                            let inner_name = resolve_tparam_via_tid(node_name(inner_ann), tparams_sl, arg_tids)
                             let inner_ct = type_from_name(inner_name)
                             if is_struct_type(inner_name) != 0 || is_enum_type(inner_name) != 0 {
                                 set_var_option_struct(pname, CT_INT, inner_name)
+                            } else if inner_name == "Set" {
+                                // nprhy8: see the twin block in emit_fn_def -- the Set's
+                                // own element rides the option's inner2 slot, not
+                                // is_compound_ct (CT_SET is deliberately excluded there).
+                                set_var_option(pname, inner_ct)
+                                let set_elems_sl = node_elements(inner_ann)
+                                if set_elems_sl != -1 && sublist_length(set_elems_sl) > 0 {
+                                    let set_elem_ann = sublist_get(set_elems_sl, 0)
+                                    let set_elem_name = resolve_tparam_via_tid(node_name(set_elem_ann), tparams_sl, arg_tids)
+                                    let set_elem_ct = type_from_name(set_elem_name)
+                                    if set_elem_ct >= 0 && set_elem_ct != CT_VOID {
+                                        set_var_option_inner2(pname, set_elem_ct)
+                                    } else {
+                                        recover_option_set_elem_from_tid(inner_ann, pname)
+                                    }
+                                }
                             } else {
                                 set_var_option(pname, inner_ct)
                             }
@@ -8440,7 +8661,7 @@ pub fn emit_top_level_let(node: Int, extern_only: Int) ! Codegen.Emit, Codegen.R
         // set expr_list_elem_type (union results). Always clear the global so a
         // stale value from a prior expression can't leak into a later binding.
         let src_elem = get_set_elem_type(val_str)
-        if src_elem != CT_STRING || get_set_elem_struct(val_str) != "" {
+        if src_elem >= 0 || get_set_elem_struct(val_str) != "" {
             set_set_elem_type(name, src_elem)
             let src_struct = get_set_elem_struct(val_str)
             if src_struct != "" {
@@ -8451,6 +8672,11 @@ pub fn emit_top_level_let(node: Int, extern_only: Int) ! Codegen.Emit, Codegen.R
             if expr_list_elem_struct != "" {
                 set_set_elem_struct(name, expr_list_elem_struct)
             }
+        } else {
+            // mv45y5: no annotation, no alias source, no adapter carry -- the
+            // last resort is typecheck's own tid for the RHS (see the twin
+            // comment on the local-let path, ~line 3479).
+            recover_set_elem_from_tid(node_value(node), name)
         }
         expr_list_elem_type = -1
         expr_list_elem_struct = ""
