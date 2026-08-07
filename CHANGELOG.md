@@ -4,6 +4,7 @@ Single source of truth for release history. `blink llms` and `blink llms --full`
 
 ## Fixes (v0.53.1)
 
+- **`--test-json` per-test status is now `"passed"`, not `"pass"`.** The per-test record's `status` value disagreed with both the summary object's `passed` count key and §8.10's documented wire format. Any external consumer matching the literal string `"pass"` needs updating to `"passed"`; the in-repo test suite has been updated to match.
 - **`blink test` no longer loses per-test output when a test file crashes at the C level.** The runner captures each compiled test binary's stdout through a pipe, which made glibc fully block-buffer it; a hardware-signal crash (stack overflow, out-of-bounds, null deref) skipped the atexit flush and discarded every buffered `test NAME ... ok/FAIL` line, so a run that had partly succeeded read as a total wipeout. Test stdout is now line-buffered, so each completed per-test line survives the crash — you see which tests ran before the file went down (the case summary still won't print on a mid-run crash, because the run didn't finish).
 
 ## What's New (v0.53.0)

@@ -1363,7 +1363,7 @@ test "unwrap on empty list panics with the expected message" {
 - **E0831** `AssertPanicsBodyReturned` — the body returned normally without panicking. A `?`-propagated `Err` that exits the body without panicking is *also* a body-returned failure, not the expected panic.
 - **E0832** `AssertPanicsMessageMismatch` — the body panicked, but the panic message did not contain the `matching:` substring. The failure output renders the expected substring, the **full actual panic message**, and the source location where the panic fired, so the author can correct either the pattern or the message.
 
-**Pass semantics.** A passing `assert_panics` *consumes* the expected panic: the test's status is `"pass"`, **not** `"panicked"`. The top-level `"panicked"` status is reserved for an *unexpected* panic that escapes a test body. See §8.10 for runner output.
+**Pass semantics.** A passing `assert_panics` *consumes* the expected panic: the test's status is `"passed"`, **not** `"panicked"`. The top-level `"panicked"` status is reserved for an *unexpected* panic that escapes a test body. See §8.10 for runner output.
 
 **Resource cleanup on the expected panic.** A panic caught by `assert_panics` is a **catchable unwind** in the sense of §4.6.3: in-scope `with`/`Closeable` resources opened *inside* the block run `BlockHandler.exit(false)` / `Closeable.close()` during the unwind, before the runner records the pass.
 

@@ -551,7 +551,7 @@ BLINK_UNUSED static void blink_test_run(const blink_test_entry* tests, int count
             pass++;
             if (json_output) {
                 if (total > 1) printf(",");
-                printf("{\"name\":\"%s\",\"status\":\"pass\"", tests[i].name);
+                printf("{\"name\":\"%s\",\"status\":\"passed\"", tests[i].name);
                 printf(",\"duration_ms\":%g", dur_ms);
                 __blink_test_print_tags_json(&tests[i]);
                 __blink_test_print_cleanup_warnings_json();

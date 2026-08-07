@@ -639,7 +639,7 @@ blink test --json
   "results": [
     {
       "name": "login succeeds with valid credentials",
-      "status": "pass",
+      "status": "passed",
       "duration_ms": 12
     },
     {
@@ -820,7 +820,7 @@ test "unwrap on empty list panics" {
 }
 ```
 
-The body is a `{ ... }` block (not a closure), the optional `matching:` argument is a literal **substring** test on the panic message, and the construct is test-only and valueless. On failure the runner renders structured output: a body that returns without panicking is **E0831** (`expected the block to panic, but it returned normally`); a panic whose message lacks the `matching:` substring is **E0832**, which prints the expected substring, the **full actual panic message**, and the source location where the panic fired. A passing `assert_panics` consumes the panic — the test status is `"pass"`, not `"panicked"`. In-scope `with`/`Closeable` resources opened inside the block are released on the expected panic (§4.6.3, *armed* catchable unwind). See §2.20 for the full semantics, the test-only (E0833) and no-nesting (E0834) rules, and the R3-fence amendment.
+The body is a `{ ... }` block (not a closure), the optional `matching:` argument is a literal **substring** test on the panic message, and the construct is test-only and valueless. On failure the runner renders structured output: a body that returns without panicking is **E0831** (`expected the block to panic, but it returned normally`); a panic whose message lacks the `matching:` substring is **E0832**, which prints the expected substring, the **full actual panic message**, and the source location where the panic fired. A passing `assert_panics` consumes the panic — the test status is `"passed"`, not `"panicked"`. In-scope `with`/`Closeable` resources opened inside the block are released on the expected panic (§4.6.3, *armed* catchable unwind). See §2.20 for the full semantics, the test-only (E0833) and no-nesting (E0834) rules, and the R3-fence amendment.
 
 For testing that a *separate binary* exits via panic (e.g. the compiler's own end-to-end suite), continue to isolate the call in a subprocess via `process_run` and inspect `exit_code`/`err_out` (the approach used by `tests/compile_test_helpers.bl`); `assert_panics` is for in-process expressions within the test itself.
 

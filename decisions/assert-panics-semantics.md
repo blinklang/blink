@@ -103,7 +103,7 @@ Locked design points:
 - Optional `matching: Str` is a **literal substring** test on the panic message — not a pattern/regex language, and it will not grow metacharacters.
 - **Test-only** (E0833 outside a test) and **non-nestable** (E0834), enforced at parse/typecheck. Like `skip()`.
 - Runtime failures: **E0831** (body returned without panicking — includes a `?`-propagated `Err` that exits without panicking) and **E0832** (message lacks the substring; renders expected substring + full actual message + panic-origin location).
-- A passing `assert_panics` **consumes** the panic: test status `"pass"`, not `"panicked"`. Top-level `"panicked"` is reserved for unexpected escapes.
+- A passing `assert_panics` **consumes** the panic: test status `"passed"`, not `"panicked"`. Top-level `"panicked"` is reserved for unexpected escapes.
 - The expected panic is a **catchable unwind** (§4.6.3): in-scope `with`/`Closeable` resources opened inside the block run `exit(false)`/`close()` before the runner records the pass. This is the only place a `panic` unwind runs cleanup; an unexpected (unarmed) panic still terminates and bypasses cleanup.
 - **R3-fence (honest framing):** `assert_panics` *extends* the catchable-unwind set with a compiler-managed, test-only, no-user-nameable-symbol boundary. It does NOT extend the *user-reachable* set (still empty); `panic: Never` is preserved because the construct is `()` and the body is not reified. Armed state is **per-test (thread-local)** — normative.
 - E0831–E0834 are wired (not deleted); the catalog was minted for exactly this shape.
