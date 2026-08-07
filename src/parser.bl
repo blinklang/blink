@@ -267,6 +267,8 @@ pub fn node_assoc_types(id: Int) -> Int { node_or_die(id, "node_assoc_types").as
 pub fn node_impl_binders(id: Int) -> Int { node_or_die(id, "node_impl_binders").impl_binders }
 pub fn node_recv_type_args(id: Int) -> Int { node_or_die(id, "node_recv_type_args").recv_type_args }
 pub fn node_impl_where_bounds(id: Int) -> Int { node_or_die(id, "node_impl_where_bounds").impl_where_bounds }
+pub fn node_xfail_reason(id: Int) -> Str { node_or_die(id, "node_xfail_reason").xfail_reason }
+pub fn node_xfail_ticket(id: Int) -> Str { node_or_die(id, "node_xfail_ticket").xfail_ticket }
 
 // ── Node setter functions ───────────────────────────────────────────
 // Retained for post-parse mutations performed by comment_attach, typecheck,
@@ -934,10 +936,32 @@ pub fn parse_program() -> Int ! Parse, Diag.Report {
             effect_decl_nodes.push(ed)
         } else if at(TokenKind.Test) {
             advance()
-            let tb = parse_test_block()
-            attach_pending_annotations(tb)
-            maybe_desugar_expect_panic(tb)
-            test_nodes.push(tb)
+            if at(TokenKind.Dot) {
+                advance()
+                if at(TokenKind.Ident) && peek_value() == "failing" {
+                    advance()
+                    let tb = parse_test_failing_block()
+                    // Deliberately NOT desugared via maybe_desugar_expect_panic:
+                    // that wraps the body in assert_panics, which turns a matching
+                    // panic into an ordinary pass for the enclosing test. That
+                    // inverts test.failing's own semantics (body fails -> passed,
+                    // body passes -> unexpected-pass failure) — the two mechanisms
+                    // are incompatible, not just unwired. @expect_panic on
+                    // test.failing is a no-op annotation for now.
+                    attach_pending_annotations(tb)
+                    test_nodes.push(tb)
+                } else {
+                    diag_error_range("UnexpectedToken", UNEXPECTED_TOKEN,
+                        "expected 'failing' after 'test.'",
+                        peek_line(), peek_col(), peek_end_col(), "")
+                    advance()
+                }
+            } else {
+                let tb = parse_test_block()
+                attach_pending_annotations(tb)
+                maybe_desugar_expect_panic(tb)
+                test_nodes.push(tb)
+            }
         } else if at(TokenKind.Fn) {
             let f = parse_fn_def()
             attach_pending_annotations(f)
@@ -1719,6 +1743,109 @@ fn parse_test_block() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         str_val: test_name, name: test_name, body: body,
         line: test_start_line, col: test_start_col,
         end_line: tb_end_l, end_col: tb_end_c,
+    })
+    nd
+}
+
+// test.failing("name", reason: "...", ticket: "...") { ... } (§8.10.6).
+// 'test' and '.failing' already consumed. Named-arg keyword form, hand-rolled
+// like assert_panics(matching:) — reason/ticket order is fixed, not
+// order-independent, matching the spec's own example layout.
+// Consumes a required Comma, but WITHOUT expect()'s auto-advance-on-mismatch —
+// that behavior is exactly what causes a single missing comma to cascade into
+// two diagnostics here: expect(Comma) would eat the very token (`reason`/
+// `ticket`) the next check looks for, so the next check's failure fires a
+// second, misleading diagnostic. Diagnose the missing comma without moving
+// the cursor if the token positioned there is plausibly the next keyword.
+fn expect_field_comma() -> Int ! Parse.Advance, Diag.Report {
+    if at(TokenKind.Comma) {
+        advance()
+        return 1
+    }
+    diag_error_range("UnexpectedToken", UNEXPECTED_TOKEN,
+        "expected ',' in test.failing(...)",
+        peek_line(), peek_col(), peek_end_col(), "")
+    0
+}
+
+// Extracts the literal text of a parse_interp_string() result, rejecting
+// `{...}` splices (test.failing metadata must be static — a ticket id or
+// reason that varies at runtime can't be checked by the closed-ticket lint).
+fn literal_interp_string_or_error(node: Int, field_label: Str) -> Str ! Diag.Report {
+    let parts_sl = node_elements(node)
+    if parts_sl == -1 || sublist_length(parts_sl) == 0 { return "" }
+    if sublist_length(parts_sl) > 1 {
+        diag_error_range("UnexpectedToken", UNEXPECTED_TOKEN,
+            "test.failing {field_label} must be a plain string literal, not an interpolated string",
+            node_line(node), node_col(node), node_end_col(node), "")
+    }
+    node_str_val(sublist_get(parts_sl, 0))
+}
+
+fn parse_test_failing_block() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
+    let tf_start_line = peek_line()
+    let tf_start_col = peek_col()
+    expect(TokenKind.LParen)
+    skip_newlines_and_comments()
+    let name_node = parse_interp_string()
+    let test_name = literal_interp_string_or_error(name_node, "name")
+    skip_newlines_and_comments()
+    expect_field_comma()
+    skip_newlines_and_comments()
+    let mut reason = ""
+    if at(TokenKind.Ident) && peek_value() == "reason" {
+        advance()
+        expect(TokenKind.Colon)
+        skip_newlines_and_comments()
+        let reason_node = parse_interp_string()
+        reason = literal_interp_string_or_error(reason_node, "reason")
+    } else {
+        diag_error_range("UnexpectedToken", UNEXPECTED_TOKEN,
+            "expected 'reason:' in test.failing(...)",
+            peek_line(), peek_col(), peek_end_col(), "")
+        // Resync: consume the unexpected token so the next check doesn't
+        // re-diagnose the same stuck cursor (mirrors assert_panics' drain).
+        if !at(TokenKind.RParen) && !at(TokenKind.EOF) { advance() }
+    }
+    skip_newlines_and_comments()
+    expect_field_comma()
+    skip_newlines_and_comments()
+    let mut ticket = ""
+    if at(TokenKind.Ident) && peek_value() == "ticket" {
+        advance()
+        expect(TokenKind.Colon)
+        skip_newlines_and_comments()
+        let ticket_node = parse_interp_string()
+        ticket = literal_interp_string_or_error(ticket_node, "ticket")
+    } else {
+        diag_error_range("UnexpectedToken", UNEXPECTED_TOKEN,
+            "expected 'ticket:' in test.failing(...)",
+            peek_line(), peek_col(), peek_end_col(), "")
+        if !at(TokenKind.RParen) && !at(TokenKind.EOF) { advance() }
+    }
+    skip_newlines_and_comments()
+    // Optional trailing comma (spec example at §8.10.6 has one).
+    if at(TokenKind.Comma) {
+        advance()
+        skip_newlines_and_comments()
+    }
+    expect(TokenKind.RParen)
+    skip_newlines_and_comments()
+    let body = parse_block()
+    let mut tf_end_l = -1
+    let mut tf_end_c = -1
+    let el = node_end_line(body)
+    if el != -1 {
+        tf_end_l = el
+        tf_end_c = node_end_col(body)
+    }
+    let nd = node_count()
+    nodes.push(AstNode {
+        kind: NodeKind.TestBlock,
+        str_val: test_name, name: test_name, body: body,
+        xfail_reason: reason, xfail_ticket: ticket, int_val: 1,
+        line: tf_start_line, col: tf_start_col,
+        end_line: tf_end_l, end_col: tf_end_c,
     })
     nd
 }

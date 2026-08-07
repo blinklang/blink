@@ -12,6 +12,8 @@ typedef struct {
     int skip;
     const char** tags;
     int tag_count;
+    int expected_fail;
+    const char* xfail_reason;
 } blink_test_entry;
 
 BLINK_UNUSED static jmp_buf __blink_test_jmp;
@@ -442,6 +444,26 @@ BLINK_UNUSED static void blink_test_run(const blink_test_entry* tests, int count
         double dur_ms = (double)(__t1.tv_sec - __t0.tv_sec) * 1000.0
                       + (double)(__t1.tv_nsec - __t0.tv_nsec) / 1000000.0;
         total_ms += dur_ms;
+        /* xf9a63 (test.failing, §8.10.6): invert observed outcome exactly once
+         * for xfail tests. An unexpected pass is synthesized as an assertion
+         * failure so it still counts against the suite. */
+        int __blink_test_observed_failed = __blink_test_failed;
+        if (tests[i].expected_fail && !__blink_test_skipped) {
+            if (!__blink_test_observed_failed) {
+                __blink_test_failed = 1;
+                __blink_test_fail_cause = "assertion";
+                __blink_test_fail_msg[0] = '\0';
+                __blink_test_fail_assertion[0] = '\0';
+                __blink_test_fail_expected[0] = '\0';
+                __blink_test_fail_actual[0] = '\0';
+                __blink_test_fail_intro[0] = '\0';
+                __blink_test_fail_user_msg[0] = '\0';
+                snprintf(__blink_test_fail_assertion, sizeof(__blink_test_fail_assertion),
+                         "expected failure, got pass");
+            } else {
+                __blink_test_failed = 0;
+            }
+        }
         if (__blink_test_skipped) {
             skip++;
             if (json_output) {
@@ -512,6 +534,12 @@ BLINK_UNUSED static void blink_test_run(const blink_test_entry* tests, int count
                     blink_record_case(__blink_test_case_label, 1);
                 }
                 __blink_test_print_case_records_json();
+                if (tests[i].expected_fail) {
+                    printf(",\"expected_fail\":true");
+                    if (tests[i].xfail_reason) {
+                        printf(",\"xfail_reason\":\"%s\"", __blink_test_json_escape(tests[i].xfail_reason));
+                    }
+                }
                 printf("}");
             } else {
                 if (__blink_test_case_label[0]) {
@@ -556,6 +584,12 @@ BLINK_UNUSED static void blink_test_run(const blink_test_entry* tests, int count
                 __blink_test_print_tags_json(&tests[i]);
                 __blink_test_print_cleanup_warnings_json();
                 __blink_test_print_case_records_json();
+                if (tests[i].expected_fail) {
+                    printf(",\"expected_fail\":true");
+                    if (tests[i].xfail_reason) {
+                        printf(",\"xfail_reason\":\"%s\"", __blink_test_json_escape(tests[i].xfail_reason));
+                    }
+                }
                 printf("}");
             } else {
                 printf("test %s ... \033[32mok\033[0m\n", tests[i].name);

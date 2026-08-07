@@ -1,0 +1,107 @@
+// xf9a63 (spec 1c2zr6, §8.10.6): test.failing(name, reason:, ticket:) { body }
+// registers an expected-red test. status:"passed" when the body fails as
+// expected; status:"failed" (assertion "expected failure, got pass") when it
+// unexpectedly passes; E0835 when reason/ticket is empty.
+
+import compile_test_helpers.{compile_and_run_test_json, expect_compile_error, expect_no_error, compile_and_capture}
+
+// ── Expected case: body fails as expected -> suite-level status "passed" ───
+
+test "test.failing with a failing body reports status passed with xfail fields" {
+    let src = "test.failing(\n  \"t\",\n  reason: \"not implemented yet\",\n  ticket: \"abc123\",\n) \{\n    assert(1 == 2)\n}\n"
+    let r = compile_and_run_test_json(src, "_xfail_expected_red")
+    assert(r.out.contains("\"status\":\"passed\""))
+    assert(r.out.contains("\"expected_fail\":true"))
+    assert(r.out.contains("\"xfail_reason\":\"br:abc123 — not implemented yet\""))
+    assert(r.out.contains("\"passed\":1"))
+    assert(r.out.contains("\"failed\":0"))
+}
+
+// ── Unexpected pass: body succeeds -> suite-level status "failed" ──────────
+
+test "test.failing with a passing body reports status failed as unexpected pass" {
+    let src = "test.failing(\n  \"t\",\n  reason: \"not implemented yet\",\n  ticket: \"abc123\",\n) \{\n    assert(1 == 1)\n}\n"
+    let r = compile_and_run_test_json(src, "_xfail_unexpected_pass")
+    assert(r.out.contains("\"status\":\"failed\""))
+    assert(r.out.contains("\"cause\":\"assertion\""))
+    assert(r.out.contains("\"assertion\":\"expected failure, got pass\""))
+    assert(r.out.contains("\"expected_fail\":true"))
+    assert(r.out.contains("\"xfail_reason\":\"br:abc123 — not implemented yet\""))
+    assert(r.out.contains("\"passed\":0"))
+    assert(r.out.contains("\"failed\":1"))
+}
+
+// ── Panicking xfail body: panic sets __blink_test_failed, counts as expected ─
+
+test "test.failing with a panicking body still reports status passed" {
+    let src = "test.failing(\n  \"t\",\n  reason: \"not implemented yet\",\n  ticket: \"abc123\",\n) \{\n    let xs: [Int] = []\n    let _ = xs.get(0).unwrap()\n}\n"
+    let r = compile_and_run_test_json(src, "_xfail_panic_body")
+    assert(r.out.contains("\"status\":\"passed\""))
+    assert(r.out.contains("\"expected_fail\":true"))
+}
+
+// ── Plain test blocks are unaffected: no xfail fields on the wire at all ───
+
+test "plain test block emits no expected_fail or xfail_reason fields" {
+    let src = "test \"t\" \{\n    assert(1 == 1)\n}\n"
+    let r = compile_and_run_test_json(src, "_xfail_plain_unaffected")
+    assert(r.out.contains("\"status\":\"passed\""))
+    assert(!r.out.contains("expected_fail"))
+    assert(!r.out.contains("xfail_reason"))
+}
+
+// ── E0835: empty reason / empty ticket ──────────────────────────────────────
+
+test "test.failing with empty reason -> E0835" {
+    let src = "test.failing(\n  \"t\",\n  reason: \"\",\n  ticket: \"abc123\",\n) \{\n    assert(1 == 2)\n}\n"
+    expect_compile_error(src, "_xfail_empty_reason", "E0835")
+}
+
+test "test.failing with empty ticket -> E0835" {
+    let src = "test.failing(\n  \"t\",\n  reason: \"not implemented yet\",\n  ticket: \"\",\n) \{\n    assert(1 == 2)\n}\n"
+    expect_compile_error(src, "_xfail_empty_ticket", "E0835")
+}
+
+// ── Interpolated reason:/ticket: are rejected — metadata must be static ────
+
+test "test.failing with interpolated reason is rejected" {
+    let src = "let x = 1\ntest.failing(\n  \"t\",\n  reason: \"blocked by \{x}\",\n  ticket: \"abc123\",\n) \{\n    assert(1 == 2)\n}\n"
+    expect_compile_error(src, "_xfail_interp_reason", "UnexpectedToken")
+}
+
+test "test.failing with interpolated ticket is rejected" {
+    let src = "let x = 1\ntest.failing(\n  \"t\",\n  reason: \"not implemented yet\",\n  ticket: \"abc-\{x}\",\n) \{\n    assert(1 == 2)\n}\n"
+    expect_compile_error(src, "_xfail_interp_ticket", "UnexpectedToken")
+}
+
+// ── Missing comma before reason:/ticket: reports exactly one diagnostic ────
+// (regression: expect()'s self-advance plus a non-resyncing else-branch used
+// to make one missing comma cascade into two misleading diagnostics)
+
+test "test.failing missing comma before reason does not cascade" {
+    let src = "test.failing(\n  \"t\"\n  reason: \"not implemented yet\",\n  ticket: \"abc123\",\n) \{\n    assert(1 == 2)\n}\n"
+    let output = compile_and_capture(src, "_xfail_missing_comma")
+    let lines = output.split("\n")
+    let mut error_lines = 0
+    let mut i = 0
+    while i < lines.len() {
+        if lines.get(i).unwrap().contains("\"severity\":\"error\"") {
+            error_lines = error_lines + 1
+        }
+        i = i + 1
+    }
+    assert(error_lines == 1)
+}
+
+// ── @expect_panic is a deliberate no-op on test.failing ────────────────────
+// (assert_panics desugar would turn an expected panic into an ordinary pass,
+// which inverts test.failing's own fail<->passed semantics; the annotation is
+// inert rather than wired in, and the panicking body just reports "passed"
+// via test.failing's own invert logic, same as without the annotation).
+
+test "test.failing with @expect_panic annotation is inert, not double-inverted" {
+    let src = "@expect_panic(\"None\")\ntest.failing(\n  \"t\",\n  reason: \"not implemented yet\",\n  ticket: \"abc123\",\n) \{\n    let xs: [Int] = []\n    let _ = xs.get(0).unwrap()\n}\n"
+    let r = compile_and_run_test_json(src, "_xfail_expect_panic")
+    assert(r.out.contains("\"status\":\"passed\""))
+    assert(r.out.contains("\"expected_fail\":true"))
+}
