@@ -719,8 +719,8 @@ fn make_set_type(elem_type: Int) -> Int {
 // α, never bound), so resolve() is the identity on it — Stage-1-safe.
 
 // `pub` FOR THE TEST ONLY — same precedent as make_fn_type. Constructing an unbound
-// metavar directly is the only way to prove tc_tid_scalar_tag/tc_tid_inner_tag's
-// TK_UNKNOWN arm (br vbcw1e Stage 2) actually fires: no fully-typechecked surface
+// metavar directly is the only way to prove tc_tid_tag_at's TK_UNKNOWN arm (br vbcw1e
+// Stage 2) actually fires at either tag position: no fully-typechecked surface
 // program can produce one, since check_types resolves or E0301's every metavar at
 // the region boundary (8vcj2c) before codegen ever sees it.
 pub fn make_metavar() -> Int {
@@ -1246,7 +1246,7 @@ fn tc_mono_binds_map(mono_tparams_sl: Int, mono_arg_tids: List[Int]) -> Map[Str,
 // literal, where the only alternative was the I0001 chokepoint (br 6cvvh8). The
 // substitution happens HERE rather than by relaxing an encodability predicate on
 // purpose: a typevar has no C spelling, so admitting TK_TYPEVAR into
-// tc_tid_tuple_elem_encodable would let a genuinely-unsolved `T` produce a segment.
+// tc_tid_tuple_elem_faithful would let a genuinely-unsolved `T` produce a segment.
 // Eliminate the typevar; keep the predicates conservative.
 //
 // Interning at codegen time is not a new hazard: substitute_typevar_tid is already
@@ -10273,22 +10273,131 @@ fn type_to_str(tid0: Int) -> Str {
     name
 }
 
-// Lowercase scalar tag for a tid, mirroring codegen_types.c_type_tag. Used for
-// the INNER positions of a compound tag (Option_<inner>, Result_<ok>_<err>,
-// Map_<k>_<v>), where the codegen encoding is lowercase (Option_str, not
-// Option_Str). Struct/enum inners carry their stripped name, matching
-// compound_tag_from_ca's `if sn != "" { sn } else { c_type_tag(ct) }`.
-fn tc_tid_scalar_tag(tid: Int) -> Str {
-    // br vbcw1e Stage 2: armed. Structurally dead through this function's ONLY caller
-    // (tc_tid_inner_tag's tail), which has already range-checked `tid` before delegating
-    // here — so this bucket measured 0 over the full corpus (Stage 1). Kept (not deleted)
-    // so a future direct caller fails the same way tc_tid_inner_tag's own guard does,
-    // rather than indexing ty_pool out of bounds or silently spelling a bad index "void".
+// Tag position: TOP is tc_tid_to_c_tag's own call (Pascal scalars, module-qualifier
+// stripped, List/Set/Map/Bytes erased to their bare carrier). INNER is every recursion
+// into a compound's element (Option_<inner>, Result_<ok>_<err>, Map_<k>_<v>,
+// Tuple<n>_<...>): lowercase scalars, module prefix KEPT via c_type_tag_for_struct, Map
+// spelled structurally. This asymmetry is a property of the emitted C names, not
+// accidental duplication (br bwyfy1: collapsing it to one RULE broke 296 fixtures and
+// was reverted) — so it is a position PARAMETER on one encoder, never a shared rule.
+let TAGPOS_TOP = 0
+let TAGPOS_INNER = 1
+
+// One encoder for both tid-to-C-tag positions (br qerbc7). tc_tid_to_c_tag and
+// tc_tid_inner_tag are thin `tagpos`-fixed wrappers below, so no call site moves and every
+// existing byte-for-byte contract (scalar casing, struct/enum module-qualifier handling,
+// compound erasure vs structural spelling, the three ICE_SEG_* sentinels) is preserved
+// exactly, not re-derived.
+fn tc_tid_tag_at(tid0: Int, tagpos: Int) -> Str {
+    let tid = tc_resolve(tid0)
     if tid < 0 || tid >= ty_pool.len() {
-        if dbg_channel_on("voidtwin") != 0 { dbg_trace("voidtwin", "producer=scalar_out_of_range tid={tid} pool_len={ty_pool.len()}") }
+        if tagpos == TAGPOS_TOP {
+            dbg_trace("ctagvoid", "producer=out_of_range tid0={tid0} tid={tid} pool_len={ty_pool.len()}")
+        } else {
+            if dbg_channel_on("voidtwin") != 0 { dbg_trace("voidtwin", "producer=inner_out_of_range tid0={tid0} tid={tid} pool_len={ty_pool.len()}") }
+        }
         return ICE_SEG_TID_OUT_OF_RANGE
     }
-    let k = ty_pool.get(tid).unwrap().kind
+    let t = ty_pool.get(tid).unwrap()
+    let k = t.kind
+    if k == TK_STRUCT || k == TK_ENUM {
+        let stem = tc_tid_struct_mono_name(tid)
+        if stem != "" { return stem }
+        // Twin alias hop for both positions (bwyfy1: the two spellers must agree on
+        // every bare struct/enum, aliases included, or Option[MyInt]/List[MyInt]/
+        // Map[K,MyInt]/Result[MyInt,_] keep leaking the alias spelling even after the
+        // top-level slot is fixed).
+        let underlying = tc_resolve_transparent_alias_name(t.name)
+        if underlying != -1 { return tc_tid_tag_at(underlying, tagpos) }
+        if tagpos == TAGPOS_TOP { return strip_module_qualifier(t.name) }
+        return c_type_tag_for_struct(t.name)
+    }
+    // Collapse, never interpolate (br vbcw1e Stage 2): a recursive call can itself answer
+    // a bare ICE_SEG_* sentinel (out-of-range / unsolved metavar / unhandled kind).
+    // Interpolating that into "Option_{inner}" would bury it where diag_is_ice_seg's
+    // prefix test can no longer see it — the exact hazard qerbc7 exists to close. Inner
+    // recursion is always TAGPOS_INNER regardless of this call's own position (both
+    // original callers already did this; it is why sharing tc_tid_tuple_tag is safe).
+    if k == TK_OPTION {
+        let inner = tc_tid_tag_at(t.inner1, TAGPOS_INNER)
+        if diag_is_ice_seg(inner) { return inner }
+        return "Option_{inner}"
+    }
+    if k == TK_RESULT {
+        let ok = tc_tid_tag_at(t.inner1, TAGPOS_INNER)
+        if diag_is_ice_seg(ok) { return ok }
+        let err = tc_tid_tag_at(t.inner2, TAGPOS_INNER)
+        if diag_is_ice_seg(err) { return err }
+        return "Result_{ok}_{err}"
+    }
+    if k == TK_TUPLE { return tc_tid_tuple_tag(t) }
+    if k == TK_TYPEVAR {
+        if tagpos == TAGPOS_INNER {
+            // Gated explicitly: an unresolved generic type param is a common inner in
+            // generic-heavy code, so this must not build the message when the channel is off.
+            if dbg_channel_on("voidtwin") != 0 { dbg_trace("voidtwin", "producer=inner_typevar tid={tid}") }
+        }
+        return "<tv>"
+    }
+    // TOP erases Map to its bare Pascal carrier ("Map"); INNER spells it structurally,
+    // lowercase, byte-matching the string path's own Map_<key>_<val> segment.
+    if k == TK_MAP {
+        if tagpos == TAGPOS_TOP { return "Map" }
+        let key = tc_tid_tag_at(t.inner1, TAGPOS_INNER)
+        if diag_is_ice_seg(key) { return key }
+        let val = tc_tid_tag_at(t.inner2, TAGPOS_INNER)
+        if diag_is_ice_seg(val) { return val }
+        return "Map_{key}_{val}"
+    }
+    if tagpos == TAGPOS_TOP {
+        if k == TK_INT { return "Int" }
+        if k == TK_FLOAT { return "Float" }
+        if k == TK_BOOL { return "Bool" }
+        if k == TK_STR { return "Str" }
+        if k == TK_LIST { return "List" }
+        if k == TK_ITERATOR { return "Iterator" }
+        if k == TK_HANDLE { return "Handle" }
+        if k == TK_CHANNEL { return "Channel" }
+        if k == TK_SET { return "Set" }
+        if k == TK_BYTES { return "Bytes" }
+        if k == TK_I8 { return "I8" }
+        if k == TK_I16 { return "I16" }
+        if k == TK_I32 { return "I32" }
+        if k == TK_U8 { return "U8" }
+        if k == TK_U16 { return "U16" }
+        if k == TK_U32 { return "U32" }
+        if k == TK_U64 { return "U64" }
+        if k == TK_CHAR { return "Char" }
+        // I0001 (gqg3rk): an unbound metavar (TK_UNKNOWN) reaching C-tag emission means
+        // an under-determined binding escaped the E0301 boundary check — a compiler
+        // invariant violation. Fail CLOSED with an invalid-C-identifier sentinel so the C
+        // compiler errors loudly, NEVER silently fall through to "Void" (the pre-decision
+        // erased-default miscompile). Keys on KIND, per DECISIONS.md:342.
+        if k == TK_UNKNOWN { return ICE_SEG_UNSOLVED_TYPEVAR }
+        // A GENUINE Void, answered deliberately rather than by fall-through. Void is "an
+        // ordinary INHABITED, encodable type" (decisions/under-determined-types.md:38-42,
+        // 6-0) and is genuinely distinct from an unsolved metavariable α (:51-54 —
+        // substituting one for the other "is licensed by no typing rule"). The I0001
+        // tripwire keys on the KIND "so a genuine GKV[Void, Void] is unaffected"
+        // (:263-266, DECISIONS.md:342), which is only true if this arm exists: without
+        // it, Void shares its spelling with the two failure buckets below and every
+        // consumer that rejects one rejects all three. Byte-identical to the string
+        // path, which also spells a Void type arg "Void".
+        if k == TK_VOID {
+            dbg_trace("ctagvoid", "producer=genuine_void tid={tid} name={t.name}")
+            return "Void"
+        }
+        // A kind with no arm above (TK_FN, TK_CLOSURE, any kind added later). Fails
+        // CLOSED rather than sharing the genuine Void's spelling directly above: this is
+        // not a type name, it is "this encoder does not know how to spell this kind", and
+        // letting it read as "Void" is what made the two indistinguishable. The floor is
+        // measured at 0 across the corpus and both compiler entry points (ctagvoid,
+        // CLAUDE.md), so arming it cannot regress a working program — it can only make a
+        // future kind loud instead of silent.
+        dbg_trace("ctagvoid", "producer=unhandled_kind tid={tid} k={k} name={t.name}")
+        return ICE_SEG_UNHANDLED_KIND
+    }
+    // INNER: lowercase scalars, mirroring codegen_types.c_type_tag.
     if k == TK_INT { return "int" }
     if k == TK_FLOAT { return "double" }
     if k == TK_BOOL { return "bool" }
@@ -10297,7 +10406,6 @@ fn tc_tid_scalar_tag(tid: Int) -> Str {
     if k == TK_ITERATOR { return "iter" }
     if k == TK_HANDLE { return "handle" }
     if k == TK_CHANNEL { return "channel" }
-    if k == TK_MAP { return "map" }
     if k == TK_SET { return "set" }
     if k == TK_BYTES { return "bytes" }
     if k == TK_OPTION { return "option" }
@@ -10310,24 +10418,22 @@ fn tc_tid_scalar_tag(tid: Int) -> Str {
     if k == TK_U32 { return "u32" }
     if k == TK_U64 { return "u64" }
     if k == TK_CHAR { return "char" }
-    // A GENUINE Void, answered deliberately (the twin of tc_tid_to_c_tag's TK_VOID arm).
+    // A GENUINE Void, answered deliberately (the twin of the TOP arm's TK_VOID case).
     //
     // THIS ARM IS LOAD-BEARING AND MUST NOT BE DELETED (br hsgsbp / br vbcw1e).
     //
-    // An earlier version of this comment attached that constraint to the fall-through
-    // at the bottom of this function instead of here — wrong, and worth recording why:
-    // tc_tid_to_c_tag's TK_RESULT arm spells Result[Void, Str] as
-    // "Result_{tc_tid_inner_tag(inner1)}_{...}", and tc_tid_inner_tag(void_tid) delegates
-    // to tc_tid_scalar_tag(void_tid), which matches THIS arm before it ever reaches the
-    // fall-through below — so Result_void_str's "void" comes from here, full stop.
-    // src/codegen_types.bl's result-typedef emitter MATCHES that literal tag
-    // (`if ok_tag == "void" || ok_tag == "Void"`) to lower the Void leaf to an int64_t
-    // placeholder field; deleting this arm (or changing what it returns) would miss that
-    // match and emit an undeclared type. Result[Void, E] is not a corner case: lib/std/
-    // depends on it (bytes.bl, db_sqlite.bl, traits.bl) and the compiler synthesizes it
-    // for EVERY `?`-bearing `test` block. The fall-through below is a SEPARATE bucket
-    // (kinds with no arm at all — TK_FN, TK_CLOSURE) that a genuine Void never reaches,
-    // and arming IT (br vbcw1e Stage 2) does not touch this one.
+    // tc_tid_tag_at's TOP-position TK_RESULT arm spells Result[Void, Str] as
+    // "Result_{tc_tid_tag_at(inner1, INNER)}_{...}", and the INNER recursion on a Void
+    // inner reaches THIS arm before it ever reaches the fall-through below — so
+    // Result_void_str's "void" comes from here, full stop. src/codegen_types.bl's
+    // result-typedef emitter MATCHES that literal tag (`if ok_tag == "void" || ok_tag ==
+    // "Void"`) to lower the Void leaf to an int64_t placeholder field; deleting this arm
+    // (or changing what it returns) would miss that match and emit an undeclared type.
+    // Result[Void, E] is not a corner case: lib/std/ depends on it (bytes.bl,
+    // db_sqlite.bl, traits.bl) and the compiler synthesizes it for EVERY `?`-bearing
+    // `test` block. The fall-through below is a SEPARATE bucket (kinds with no arm at
+    // all — TK_FN, TK_CLOSURE) that a genuine Void never reaches, and arming IT (br
+    // vbcw1e Stage 2) does not touch this one.
     //
     // VERIFIED, not just traced: the 728-file corpus sweep for this arm's `voidtwin` tap
     // reads 0 — that is a coverage gap, not a safety fact (feedback_corpus_sweep_is_not_
@@ -10336,97 +10442,42 @@ fn tc_tid_scalar_tag(tid: Int) -> Str {
     // Constructing that shape by hand (a generic `identity[T]` called with a
     // `Result[Void, Str]` argument) reaches this exact arm via the real, ungated caller
     // chain — tid_instance_mono_args_csv / tc_seg_from_tid → tc_tid_to_c_tag →
-    // tc_tid_inner_tag → here — firing 12 times in one tiny file. That MVCE is the actual
-    // load-bearing witness for this arm, not the corpus.
+    // tc_tid_tag_at(_, INNER) → here — firing 12 times in one tiny file. That MVCE is the
+    // actual load-bearing witness for this arm, not the corpus.
     if k == TK_VOID {
-        // Gated explicitly (not just relying on dbg_trace's own internal gate): this arm is a
-        // hot path — Result[Void, E] is synthesized for every `?`-bearing test block — so the
-        // message must not be built when the channel is off (see kops_elem_from_container_ann's
-        // kopsctor tap for the same "not zero-cost when unset" concern).
+        // Gated explicitly (not just relying on dbg_trace's own internal gate): this arm is
+        // a hot path — Result[Void, E] is synthesized for every `?`-bearing test block —
+        // so the message must not be built when the channel is off.
         if dbg_channel_on("voidtwin") != 0 { dbg_trace("voidtwin", "producer=scalar_genuine_void tid={tid}") }
         return "void"
     }
     // An unbound metavariable: this is the erased-default bucket DECISIONS.md:342 forbids —
     // an unsolved α reaching codegen must ICE, never silently spell "void" (which the same
-    // kind DOES answer correctly at top level, via tc_tid_to_c_tag's own TK_UNKNOWN arm,
-    // gqg3rk). Stage 1 measured this bucket's floor at 0 over the full corpus; it is
-    // reachable in principle only if some future caller stops routing an unbound metavar
-    // away via tc_tid_encodable/tc_tid_inner_tag_faithful (the gates this ticket's parent,
-    // qerbc7, retires) and lets it ride the tid path instead — exactly the failure this arm
-    // now forecloses at the source, rather than depending on every caller's gate agreeing.
+    // kind DOES answer correctly at TOP position, gqg3rk). Stage 1 measured this bucket's
+    // floor at 0 over the full corpus; it is reachable in principle only if some future
+    // caller stops routing an unbound metavar away via tc_tid_encodable/
+    // tc_tid_tuple_elem_faithful (the gates qerbc7 retires) and lets it ride the tid path
+    // instead — exactly the failure this arm now forecloses at the source.
     if k == TK_UNKNOWN {
         if dbg_channel_on("voidtwin") != 0 { dbg_trace("voidtwin", "producer=scalar_unsolved_typevar tid={tid}") }
         return ICE_SEG_UNSOLVED_TYPEVAR
     }
     // Every kind with a real arm above is exhausted, and TK_VOID/TK_UNKNOWN are both
     // intercepted above too, so this is reached only by a kind this speller never learned
-    // (TK_FN, TK_CLOSURE — the only two reachable through this function's sole caller,
-    // tc_tid_inner_tag's tail, which itself handles STRUCT/ENUM/OPTION/RESULT/MAP/TUPLE/
-    // TYPEVAR before delegating here). Stage 1 measured this bucket's floor at 0 over the
-    // full corpus. Safe to arm because, per the TK_VOID arm's comment above, a genuine Void
-    // can never reach this line — only a kind this speller genuinely never learned does.
+    // (TK_FN, TK_CLOSURE). Stage 1 measured this bucket's floor at 0 over the full corpus.
+    // Safe to arm because, per the TK_VOID arm's comment above, a genuine Void can never
+    // reach this line — only a kind this speller genuinely never learned does.
     if dbg_channel_on("voidtwin") != 0 { dbg_trace("voidtwin", "producer=scalar_unhandled_kind tid={tid} k={k}") }
     ICE_SEG_UNHANDLED_KIND
 }
 
-// Companion to tc_tid_scalar_tag, answering the question that function is forbidden to
-// Codegen tag for the INNER of a compound carrier. Struct/enum → stripped name,
-// nested compound → recurse (Option[Result[..]]), else lowercase scalar tag.
-// Mirrors codegen_types.resolve_ann_tag's inner behavior but reads the tid
-// structurally instead of guessing from a flattened string.
-pub fn tc_tid_inner_tag(tid0: Int) -> Str {
-    let tid = tc_resolve(tid0)
-    if tid < 0 || tid >= ty_pool.len() {
-        if dbg_channel_on("voidtwin") != 0 { dbg_trace("voidtwin", "producer=inner_out_of_range tid0={tid0} tid={tid} pool_len={ty_pool.len()}") }
-        return ICE_SEG_TID_OUT_OF_RANGE
-    }
-    let t = ty_pool.get(tid).unwrap()
-    let k = t.kind
-    if k == TK_STRUCT || k == TK_ENUM {
-        let stem = tc_tid_struct_mono_name(tid)
-        if stem != "" { return stem }
-        // Twin of tc_tid_to_c_tag's alias hop (bwyfy1: these two spellers must agree
-        // on every bare struct/enum, aliases included, or Option[MyInt]/List[MyInt]/
-        // Map[K,MyInt]/Result[MyInt,_] keep leaking the alias spelling even after the
-        // top-level slot is fixed).
-        let underlying = tc_resolve_transparent_alias_name(t.name)
-        if underlying != -1 { return tc_tid_inner_tag(underlying) }
-        return c_type_tag_for_struct(t.name)
-    }
-    // Collapse, never interpolate (br vbcw1e Stage 2): a recursive tc_tid_inner_tag call can
-    // now itself return a bare ICE_SEG_* sentinel (out-of-range / unsolved metavar /
-    // unhandled kind). Interpolating that into "Option_{inner}" would yield
-    // "Option_BLINK_I0001_..." — a legal C identifier diag_is_ice_seg's prefix test would
-    // never recognize, silently degrading a compiler-invariant violation into an opaque `cc`
-    // error (the exact hazard this ticket's parent, qerbc7, exists to close). So check each
-    // inner BEFORE interpolating and, if it is non-genuine, propagate it whole instead.
-    if k == TK_OPTION {
-        let inner = tc_tid_inner_tag(t.inner1)
-        if diag_is_ice_seg(inner) { return inner }
-        return "Option_{inner}"
-    }
-    if k == TK_RESULT {
-        let ok = tc_tid_inner_tag(t.inner1)
-        if diag_is_ice_seg(ok) { return ok }
-        let err = tc_tid_inner_tag(t.inner2)
-        if diag_is_ice_seg(err) { return err }
-        return "Result_{ok}_{err}"
-    }
-    if k == TK_MAP {
-        let key = tc_tid_inner_tag(t.inner1)
-        if diag_is_ice_seg(key) { return key }
-        let val = tc_tid_inner_tag(t.inner2)
-        if diag_is_ice_seg(val) { return val }
-        return "Map_{key}_{val}"
-    }
-    if k == TK_TUPLE { return tc_tid_tuple_tag(t) }
-    if k == TK_TYPEVAR {
-        // Gated explicitly: an unresolved generic type param is a common inner in
-        // generic-heavy code, so this must not build the message when the channel is off.
-        if dbg_channel_on("voidtwin") != 0 { dbg_trace("voidtwin", "producer=inner_typevar tid={tid}") }
-        return "<tv>"
-    }
-    tc_tid_scalar_tag(tid)
+// Codegen tag for the INNER of a compound carrier. Struct/enum → stripped name (module
+// prefix KEPT), nested compound → recurse, else lowercase scalar tag. Mirrors
+// codegen_types.resolve_ann_tag's inner behavior but reads the tid structurally instead
+// of guessing from a flattened string. Thin wrapper over tc_tid_tag_at (br qerbc7) — no
+// caller moves, no behavior changes.
+pub fn tc_tid_inner_tag(tid: Int) -> Str {
+    tc_tid_tag_at(tid, TAGPOS_INNER)
 }
 
 fn tc_tid_tuple_tag(t: TypePoolEntry) -> Str {
@@ -10437,8 +10488,9 @@ fn tc_tid_tuple_tag(t: TypePoolEntry) -> Str {
     while i < count {
         // Collapse, never interpolate (br vbcw1e Stage 2) — same rule as the OPTION/RESULT/
         // MAP arms above: an ICE_SEG_* element must replace the whole tag, not get
-        // concatenated into it.
-        let elem = tc_tid_inner_tag(ty_param_list.get(start + i).unwrap())
+        // concatenated into it. Elements are always TAGPOS_INNER regardless of the
+        // tuple's own position (both callers already did this before qerbc7).
+        let elem = tc_tid_tag_at(ty_param_list.get(start + i).unwrap(), TAGPOS_INNER)
         if diag_is_ice_seg(elem) { return elem }
         tag = tag.concat("_").concat(elem)
         i = i + 1
@@ -10457,8 +10509,8 @@ fn tc_tid_tuple_tag(t: TypePoolEntry) -> Str {
 // Callers narrow `tid` to a scalar/typevar/unknown leaf before its own gate check, with one
 // exception: tc_tid_inner_tag_faithful's params_count!=0 branch also reaches a non-STRUCT/ENUM
 // compound tid here (e.g. a TK_TUPLE with arity>0, via its "faithful_reject_paramcount" call) —
-// harmless, since tc_tid_inner_tag's own TK_TUPLE arm spells it structurally rather than falling
-// through to tc_tid_scalar_tag, so diag_is_ice_seg never fires for a genuine compound. A
+// harmless, since tc_tid_tag_at's TK_TUPLE arm spells it structurally rather than falling
+// through to its TAGPOS_INNER scalar fallback, so diag_is_ice_seg never fires for a genuine compound. A
 // struct/enum tid can also legitimately answer a non-ICE erased name here (the STRUCT/ENUM arm's
 // own give-up path, a separate undischarged concern, not this probe's job to flag).
 fn voidtwin_probe(gate: Str, tid: Int) {
@@ -10835,10 +10887,10 @@ pub fn tc_tid_struct_mono_name(tid: Int) -> Str {
     // mono stem as a struct instance — c_type_tag_for_struct(base) + `_`-joined slot
     // segs — since both the head tag and tc_tid_struct_slot_seg are kind-agnostic. This
     // is what lets tc_tid_to_c_tag's shared TK_STRUCT|TK_ENUM branch produce `Tree_Int`.
-    // NOTE: the 3 encodable carve-outs (tc_tid_encodable / the tuple-element sibling /
-    // tc_struct_slot_encodable) still DEFER an enum instance by their own explicit
-    // `k == TK_ENUM && params_count != 0 → false` guards — widening this fn does not
-    // flip their result (dbzy4r owns relaxing those).
+    // The 3 sibling gates (tc_tid_encodable / tc_tid_tuple_elem_faithful /
+    // tc_struct_slot_encodable) now ADMIT an enum instance too (br 82ajft / dbzy4r
+    // flipped their `k == TK_ENUM && params_count != 0` arms), so widening this fn
+    // and widening them landed together — neither is stale relative to the other.
     if (t.kind != TK_STRUCT && t.kind != TK_ENUM) || t.params_count == 0 { return "" }
     let mut result = c_type_tag_for_struct(t.name)
     let mut i = 0
@@ -10885,7 +10937,7 @@ pub fn tc_tid_struct_slot_seg(slot: Int) -> Str {
 //     registration path; defer (orthogonal follow-up).
 //   - a bare scalar slot: handled by the existing string path unchanged.
 //
-// A TUPLE slot is ADMITTED (br fqthkv), gated on tc_tid_tuple_encodable — the SAME
+// A TUPLE slot is ADMITTED (br fqthkv), gated on tc_tid_tuple_elem_faithful — the SAME
 // predicate the sibling gate tc_struct_slot_encodable already uses for its own
 // TK_TUPLE arm, whose comment records that tc_tid_to_c_tag's tuple spelling
 // (tc_tid_tuple_tag -> Tuple2_int_int) byte-matches the struct-lit string path's
@@ -10894,13 +10946,14 @@ pub fn tc_tid_struct_slot_seg(slot: Int) -> Str {
 // tc_struct_slot_encodable in tid_native_struct_mono_slots), so `GT[(Int, Int)]` hit the
 // bail and reached codegen with no mono args at all — error[I0001] "mono args 'Void'".
 //
-// Permissive (tc_tid_tuple_encodable) rather than scalar-elements-only, because both
+// Permissive (tc_tid_tuple_elem_faithful) rather than scalar-elements-only, because both
 // of the other halves of this seam are ALREADY permissive: the def side
 // (tc_tid_struct_slot_seg -> tc_tid_encodable) and the parallel arg_tids recovery
 // (mono_instance_arg_tids_from_tid -> tc_struct_slot_encodable). An asymmetric
 // literal-side gate would recreate the same bail for shapes the compiler can spell
-// on both other sides — and tc_tid_scalar_tag already erases TK_LIST/TK_SET/TK_BYTES
-// identically for all three, so `(Int, List[Str])` byte-matches everywhere.
+// on both other sides — and tc_tid_tag_at's TAGPOS_INNER arm already erases
+// TK_LIST/TK_SET/TK_BYTES identically for all three, so `(Int, List[Str])` byte-matches
+// everywhere.
 //
 // A STRUCT-OR-ENUM-INSTANCE slot is ADMITTED (br 6cvvh8; TK_ENUM joined under br
 // tydqe6) iff tc_tid_struct_mono_name spells it — the very predicate the def-side
@@ -10930,7 +10983,7 @@ pub fn tc_tid_compound_slot_faithful(tid: Int) -> Bool {
     if k == TK_OPTION { return tc_tid_scalar_only(t.inner1) }
     if k == TK_RESULT { return tc_tid_scalar_only(t.inner1) && tc_tid_scalar_only(t.inner2) }
     if k == TK_MAP { return tc_tid_scalar_only(t.inner1) && tc_tid_scalar_only(t.inner2) }
-    if k == TK_TUPLE { return tc_tid_tuple_encodable(t) }
+    if k == TK_TUPLE { return tc_tid_tuple_elem_faithful(tid) }
     if k == TK_STRUCT || k == TK_ENUM { return tc_tid_struct_mono_name(tid) != "" }
     false
 }
@@ -10947,7 +11000,7 @@ pub fn tc_tid_compound_slot_faithful(tid: Int) -> Bool {
 // tc_tid_inner_tag the tid path uses, so the value path recurses in lockstep. This
 // predicate therefore admits every inner whose STRUCTURED recursion bottoms out at
 // faithful leaves:
-//   - scalar (int/float/bool/str/char/sized-int): tc_tid_scalar_tag on all three.
+//   - scalar (int/float/bool/str/char/sized-int): tc_tid_tag_at's TAGPOS_INNER arm on all three.
 //   - List / Set / Bytes: element dropped to bare "list"/"set"/"bytes" identically.
 //   - Map / nested Option / nested Result whose OWN leaves are each faithful: the value
 //     path recurses via tc_tid_inner_tag (br yavhwc), so Option[Map[Str,Int]] spells
@@ -11051,8 +11104,8 @@ fn tc_tid_scalar_only(tid: Int) -> Bool {
 // (or Map tuple key) reached through a tuple/struct-field boundary erases to
 // CT_STRING (recover_elem_ct_from_arg's erased default); codegen recovers the
 // concrete tuple element from the argument node's memoized tid. For SCALAR tuple
-// elements the tag equals resolve_tuple_ann's tuple_c_type_name (tc_tid_scalar_tag
-// ≡ c_type_tag), so the recovered sname aliases the kops-struct carrier the Set's
+// elements the tag equals resolve_tuple_ann's tuple_c_type_name (tc_tid_tag_at's
+// TAGPOS_INNER arm ≡ c_type_tag), so the recovered sname aliases the kops-struct carrier the Set's
 // construction registered in derive_hash_types. Tuple elements that are
 // themselves module-qualified structs/enums can diverge from resolve_tuple_ann's
 // c_type_tag_for_struct spelling; recover_elem_ct_from_arg's kops_is_struct_key
@@ -11174,141 +11227,14 @@ pub fn tc_tid_result_err_tid(tid: Int) -> Int {
 // generic base by mangle_generic_name, reproduces the current monomorphized C
 // symbol. Since br 3fc3pn this is the SOLE per-segment resolution, not a twin of
 // one: the string producer it was written to byte-match is gone, so the answers
-// below DEFINE the symbol rather than having to agree with something else. The
-// parenthesised branch names are the deleted string arms each rule descends from,
-// kept only to explain why a rule looks the way it does:
-//   - struct/enum      → stripped name        (arg_sn branch)
-//   - Option/Result    → Option_/Result_ tag  (compound_tag_from_ca branch)
-//   - List/Set/Map/... → Pascal name          (type_name_from_ct erasure)
-//   - scalars          → Pascal name
-//   - typevar          → "<tv>" poison sentinel — a concrete call must never
-//                        carry an unsubstituted typevar; callers gate on
-//                        tc_tid_encodable (which rejects typevars) so this is
-//                        never reached via the mono path, but it stays as a
-//                        loud tell if some future caller skips the gate.
+// DEFINE the symbol rather than having to agree with something else.
 // Note the asymmetry vs tc_tid_inner_tag: a top-level Map segment erases to the
 // bare carrier "Map", while a Map *inside* a compound keeps its Map_<k>_<v> tag.
-// A top-level TK_TUPLE routes through tc_tid_tuple_tag — the same Tuple{n}_...
-// encoder the inner path uses — so a `x: T` param bound to a whole tuple mangles
-// to the identical carrier the string path builds from ca.struct_names (the
-// tuple's registered typedef name). tc_tid_encodable gates OUT tuples whose
-// elements are structs/enums, where the tid path's strip_module_qualifier would
-// diverge from c_type_tag_for_struct's module-prefixed spelling.
-pub fn tc_tid_to_c_tag(tid0: Int) -> Str {
-    // Resolve bound metavars (gqg3rk): a pinned α (List[α→Int]) must encode as
-    // its solution (Int), not the erased carrier. Inner recursion resolves too
-    // via the same tc_tid_inner_tag/self recursion, each of which resolves.
-    let tid = tc_resolve(tid0)
-    // A tid outside the pool names no type at all, so it fails CLOSED rather than
-    // answering "Void" — a plausible-looking type name for what is a bad index. All five
-    // callers already gate `tid < 0` themselves, and the measured floor is 0 across the
-    // corpus and both compiler entry points (ctagvoid), so this is a tripwire, not a path.
-    if tid < 0 || tid >= ty_pool.len() {
-        dbg_trace("ctagvoid", "producer=out_of_range tid0={tid0} tid={tid} pool_len={ty_pool.len()}")
-        return ICE_SEG_TID_OUT_OF_RANGE
-    }
-    let t = ty_pool.get(tid).unwrap()
-    let k = t.kind
-
-    // A struct/enum INSTANCE (params_count>=1, e.g. Box[Int]) recurses its args
-    // to the full mono stem (Box_Int / Box_Box_Int) via tc_tid_struct_mono_name —
-    // the same recursion the def-side registrar uses — so the mono-CSV segment
-    // byte-matches the string path's registered mono name (blink_identity_Box_Int),
-    // not the erased bare head (blink_identity_Box, the nss31w bug). A bare generic
-    // base (params_count 0) or monomorphic struct keeps the bare short name, which
-    // the generic-fn mono suffix spells bare (matches get_var_struct); the module
-    // qualifier is stripped here because THIS consumer (tc_seg_from_tid → mono CSV)
-    // is module-scoped by its own fn symbol — the physical-prefix carrier speller
-    // is the separate tc_tid_inner_tag path (br bwyfy1: two-speller finding).
-    if k == TK_STRUCT || k == TK_ENUM {
-        let stem = tc_tid_struct_mono_name(tid)
-        if stem != "" { return stem }
-        // A bare (params_count 0) struct-kinded tid is also the shape a transparent
-        // `type Alias = Int` alias takes (register_struct_type mints it as a genuine
-        // 0-field TK_STRUCT and records the underlying tid separately in
-        // tc_alias_underlying, never consulted above). Left unresolved, a slot
-        // spelled "Alias" here diverges from a sibling spelled "Int" for the same
-        // underlying type — the jefm9w Row A regression, where P[Alias, Box[Int]]
-        // and P[Int, Box[Int]] must byte-match. Hop through the alias (bounded,
-        // poison-safe — see tc_resolve_transparent_alias_name) before falling back
-        // to the bare name; a non-alias struct/enum finds no entry and is unaffected.
-        let underlying = tc_resolve_transparent_alias_name(t.name)
-        if underlying != -1 { return tc_tid_to_c_tag(underlying) }
-        return strip_module_qualifier(t.name)
-    }
-    // Collapse, never interpolate (br vbcw1e Stage 2) — same rule as tc_tid_inner_tag's own
-    // OPTION/RESULT arms: tc_tid_inner_tag can now itself answer a bare ICE_SEG_* sentinel,
-    // and interpolating it into "Option_{inner}"/"Result_{ok}_{err}" would bury it where
-    // diag_is_ice_seg's prefix test can no longer see it.
-    if k == TK_OPTION {
-        let inner = tc_tid_inner_tag(t.inner1)
-        if diag_is_ice_seg(inner) { return inner }
-        return "Option_{inner}"
-    }
-    if k == TK_RESULT {
-        let ok = tc_tid_inner_tag(t.inner1)
-        if diag_is_ice_seg(ok) { return ok }
-        let err = tc_tid_inner_tag(t.inner2)
-        if diag_is_ice_seg(err) { return err }
-        return "Result_{ok}_{err}"
-    }
-    if k == TK_TUPLE { return tc_tid_tuple_tag(t) }
-    if k == TK_TYPEVAR { return "<tv>" }
-
-    if k == TK_INT { return "Int" }
-    if k == TK_FLOAT { return "Float" }
-    if k == TK_BOOL { return "Bool" }
-    if k == TK_STR { return "Str" }
-    if k == TK_LIST { return "List" }
-    if k == TK_ITERATOR { return "Iterator" }
-    if k == TK_HANDLE { return "Handle" }
-    if k == TK_CHANNEL { return "Channel" }
-    if k == TK_MAP { return "Map" }
-    if k == TK_SET { return "Set" }
-    if k == TK_BYTES { return "Bytes" }
-    if k == TK_I8 { return "I8" }
-    if k == TK_I16 { return "I16" }
-    if k == TK_I32 { return "I32" }
-    if k == TK_U8 { return "U8" }
-    if k == TK_U16 { return "U16" }
-    if k == TK_U32 { return "U32" }
-    if k == TK_U64 { return "U64" }
-    if k == TK_CHAR { return "Char" }
-    // I0001 (gqg3rk): an unbound metavar (TK_UNKNOWN) reaching C-tag emission means
-    // an under-determined binding escaped the E0301 boundary check — a compiler
-    // invariant violation. Fail CLOSED with an invalid-C-identifier sentinel so the C
-    // compiler errors loudly, NEVER silently fall through to "Void" (the pre-decision
-    // erased-default miscompile). Keys on KIND, per DECISIONS.md:342.
-    //
-    // The old text here claimed a genuine TK_VOID "never reaches here". That was FALSE as
-    // naturally read (br hsgsbp measured it: a generic fn instantiated at bare Void reaches
-    // this tail), and two comments already contradicted it —
-    // tc_tid_seg_injective below ("'Void' is also tc_tid_to_c_tag's fallthrough for every
-    // kind it has no arm for") and resolve_mono_slot (src/codegen_stmt.bl, "'Void' —
-    // reachable HERE ... because tc_tid_encodable ADMITS TK_VOID").
-    if k == TK_UNKNOWN { return ICE_SEG_UNSOLVED_TYPEVAR }
-    // A GENUINE Void, answered deliberately rather than by fall-through. Void is "an
-    // ordinary INHABITED, encodable type" (decisions/under-determined-types.md:38-42, 6-0)
-    // and is genuinely distinct from an unsolved metavariable α (:51-54 — substituting one
-    // for the other "is licensed by no typing rule"). The I0001 tripwire keys on the KIND
-    // "so a genuine GKV[Void, Void] is unaffected" (:263-266, DECISIONS.md:342), which is
-    // only true if this arm exists: without it, Void shares its spelling with the two
-    // failure buckets below and every consumer that rejects one rejects all three.
-    // Byte-identical to the string path, which also spells a Void type arg "Void".
-    if k == TK_VOID {
-        dbg_trace("ctagvoid", "producer=genuine_void tid={tid} name={t.name}")
-        return "Void"
-    }
-    // A kind with no arm above (TK_FN, TK_CLOSURE, any kind added later). Fails CLOSED
-    // rather than sharing the genuine Void's spelling directly above: this is not a type
-    // name, it is "this encoder does not know how to spell this kind", and letting it
-    // read as "Void" is what made the two indistinguishable. The floor is measured at 0
-    // across the corpus and both compiler entry points (ctagvoid, CLAUDE.md), so arming
-    // it cannot regress a working program — it can only make a future kind loud instead
-    // of silent. The chokepoints turn this into a LOCATED I0001; ship them together or a
-    // hit here degrades to an opaque `cc` error with no source span.
-    dbg_trace("ctagvoid", "producer=unhandled_kind tid={tid} k={k} name={t.name}")
-    ICE_SEG_UNHANDLED_KIND
+// Both positions are one encoder with a `tagpos` parameter (br qerbc7,
+// tc_tid_tag_at) — see that function for the full per-kind rationale. Thin
+// wrapper: no caller moves, no behavior changes.
+pub fn tc_tid_to_c_tag(tid: Int) -> Str {
+    tc_tid_tag_at(tid, TAGPOS_TOP)
 }
 
 // Whether tc_tid_to_c_tag can faithfully encode this tid into a CSV segment that
@@ -11320,7 +11246,7 @@ pub fn tc_tid_to_c_tag(tid0: Int) -> Str {
 // the top level (list/set/map erase to their bare carrier).
 //
 // A top-level tuple is encodable only when every element is tuple-element-safe
-// (tc_tid_tuple_encodable): the tid path spells a struct/enum element with the
+// (tc_tid_tuple_elem_faithful): the tid path spells a struct/enum element with the
 // module qualifier STRIPPED (tc_tid_inner_tag → strip_module_qualifier) while the
 // string path's c_type_tag_for_struct KEEPS the module prefix, so a tuple that
 // transitively contains a struct/enum would mangle to a different symbol. Those
@@ -11334,14 +11260,14 @@ fn tc_tid_encodable(tid0: Int) -> Bool {
     let t = ty_pool.get(tid).unwrap()
     let k = t.kind
     // Counterfactual measurement (br vbcw1e): TK_UNKNOWN declining here is exactly the
-    // routing this gate provides today in INNER position — the reason the lowercase twin's
-    // TK_UNKNOWN fall-through (tc_tid_scalar_tag) is unreachable from any gated caller. Taps
+    // routing this gate provides today in INNER position — the reason tc_tid_tag_at's
+    // TAGPOS_INNER TK_UNKNOWN fall-through is unreachable from any gated caller. Taps
     // the would-be-erasure without changing the `false` returned below.
     if k == TK_UNKNOWN {
         voidtwin_probe("encodable", tid)
     }
     if k == TK_TYPEVAR || k == TK_UNKNOWN { return false }
-    if k == TK_TUPLE { return tc_tid_tuple_encodable(t) }
+    if k == TK_TUPLE { return tc_tid_tuple_elem_faithful(tid) }
     if k == TK_OPTION { return tc_tid_encodable(t.inner1) }
     if k == TK_RESULT { return tc_tid_encodable(t.inner1) && tc_tid_encodable(t.inner2) }
     // A MAP slot (br 91j9fw, the List twin of br jw1pmb one carrier over):
@@ -11505,7 +11431,7 @@ fn tc_tid_tuple_seg_injective(t: TypePoolEntry) -> Bool {
 // spellers erase DIFFERENTLY and the difference is not cosmetic: a Map spells its key and
 // value here (Option[Map[Str,Int]] → Option_Map_str_int, injective) but erases to a bare
 // "Map" at the top level. List/Set/Iterator/Handle/Channel erase in BOTH positions
-// (tc_tid_inner_tag falls through to tc_tid_scalar_tag → "list"/"set"/…).
+// (tc_tid_inner_tag falls through to tc_tid_tag_at's shared scalar fallback → "list"/"set"/…).
 fn tc_tid_inner_seg_injective(tid0: Int) -> Bool {
     let tid = tc_resolve(tid0)
     if tid < 0 || tid >= ty_pool.len() { return false }
@@ -11564,29 +11490,27 @@ fn tc_tid_inner_seg_injective(tid0: Int) -> Bool {
 // Deferred (string path stays authoritative — the two tags DIVERGE):
 //   - enum INSTANCE: tc_tid_struct_mono_name is STRUCT-only, so the encoder would
 //                   erase the args to the bare head (latent — generic enums aren't
-//                   constructible today; mirrors the tc_tid_tuple_elem_encodable arm).
+//                   constructible today; mirrors the tc_tid_tuple_elem_faithful arm).
 //   - Option/Result with a List/Map/struct/nested-compound inner: tc_tid_inner_tag
 //                   has no List/Set/Bytes arm (erases to bare list/set/bytes) and
 //                   spells Map/struct/nested inners differently from the
 //                   value-constructed string path (Option[List[Int]] tid → bare
 //                   "list" vs string path's kept element).
 //   - typevar/unknown: no concrete binding yet.
-fn tc_tid_tuple_encodable(t: TypePoolEntry) -> Bool {
-    let start = t.params_start
-    let count = t.params_count
-    let mut i = 0
-    while i < count {
-        if !tc_tid_tuple_elem_encodable(ty_param_list.get(start + i).unwrap()) { return false }
-        i = i + 1
-    }
-    true
-}
-
-pub fn tc_tid_tuple_elem_encodable(tid: Int) -> Bool {
+pub fn tc_tid_tuple_elem_faithful(tid: Int) -> Bool {
     if tid < 0 || tid >= ty_pool.len() { return false }
     let t = ty_pool.get(tid).unwrap()
     let k = t.kind
-    if k == TK_TUPLE { return tc_tid_tuple_encodable(t) }
+    if k == TK_TUPLE {
+        let start = t.params_start
+        let count = t.params_count
+        let mut i = 0
+        while i < count {
+            if !tc_tid_tuple_elem_faithful(ty_param_list.get(start + i).unwrap()) { return false }
+            i = i + 1
+        }
+        return true
+    }
     if k == TK_LIST || k == TK_SET || k == TK_BYTES { return true }
     if k == TK_INT || k == TK_FLOAT || k == TK_BOOL || k == TK_STR || k == TK_CHAR { return true }
     if k == TK_I8 || k == TK_I16 || k == TK_I32 { return true }
@@ -11609,8 +11533,9 @@ pub fn tc_tid_tuple_elem_encodable(tid: Int) -> Bool {
     // the nested case (via the predicate's TK_RESULT branch) ride.
     // Still DEFERS: a struct/enum leaf anywhere in the inner (tc_tid_inner_tag routes
     // through c_type_tag_for_struct / tc_tid_struct_mono_name vs the annotation path's
-    // mono_name_from_ann — not proven byte-equal at this seam; the 295z9x follow-up
-    // reconciles it), as does a tuple inner.
+    // mono_name_from_ann — not proven byte-equal at THIS seam specifically; 295z9x
+    // reconciled the sibling value-path bugs it was filed for, but didn't reconcile
+    // this one, which stays open as its own follow-up), as does a tuple inner.
     if k == TK_OPTION { return tc_tid_inner_tag_faithful(t.inner1) }
     if k == TK_RESULT {
         return tc_tid_inner_tag_faithful(t.inner1) && tc_tid_inner_tag_faithful(t.inner2)
@@ -11653,7 +11578,7 @@ pub fn tc_tid_tuple_elem_encodable(tid: Int) -> Bool {
     // "an ordinary INHABITED, encodable type" (decisions/under-determined-types.md:39, 6-0).
     // tc_tid_ct maps TK_VOID onto CT_VOID and then to -1 (:10677) — CT alone cannot
     // distinguish a genuine Void from an unsolved metavariable — so this checks the KIND
-    // directly, mirroring tc_struct_slot_encodable's TK_VOID arm above (:11831).
+    // directly, mirroring tc_struct_slot_encodable's TK_VOID arm above (:11797).
     if k == TK_VOID { return true }
     // A kind with no arm above (TK_TYPEVAR, TK_UNKNOWN, TK_FN): E0301 forecloses an
     // unsolved metavar before codegen reaches this gate, so this refusal exists for
@@ -11760,34 +11685,34 @@ pub fn tc_classify_mono_conflicts() {
     mono_slot_conflicts = []
 }
 
-// Whether a struct type-arg SLOT tid spells byte-identically to the string path's
-// stored mono segment (`nth_type_arg(mi.args, ei)`). This is STRICTER than the
-// general tc_tid_encodable: the string path stores a slot's segment as the arg
-// struct's registered mono name (`Box[Box[Int]]` → slot 0 = "Box_Int", the full
-// inner mono name), whereas tc_tid_to_c_tag erases a struct/enum instance to its
-// bare base ("Box"), and spells a top-level Option/Result/Map/List/Tuple slot with
-// its own carrier tag whose casing/erasure need not match what the arg registered.
-// So only the shapes PROVEN identical resolve here:
-//   - scalars (int/float/str/bool/sized-ints/char) → same Pascal tag both paths.
-//   - a BARE (params_count 0), UNQUALIFIED struct/enum → the string path stores
-//     the bare name; tc_tid_to_c_tag returns strip_module_qualifier(name) (a no-op
-//     when unqualified). This is the `Box[Inner]` case.
-//   - a same-module STRUCT INSTANCE slot (params_count>=1, `Box[Box[Int]]`) is now
-//     ADMITTED (br bwyfy1 B4): tc_tid_to_c_tag recurses its args to the full mono
-//     stem (Box_Int) via tc_tid_struct_mono_name, so the def-side reader round-trips
-//     it byte-identically to the recursively-registered mono name — closing the -1
+// Whether a struct type-arg SLOT tid is one tc_tid_to_c_tag can spell at all — the
+// slot-tid analogue of tc_tid_encodable, kept SEPARATE rather than folded into it
+// (br qerbc7 triage) because the two predicates deliberately diverge on two axes:
+// this one does NOT tc_resolve a bound-but-unsolved metavar (so a raw slot reads
+// back TK_UNKNOWN and is refused even when its resolution is concrete — 9 of its
+// 10 call sites rely on that), and it admits TK_MAP/TK_SET/TK_LIST unconditionally
+// where tc_tid_encodable recurses. Before br 3fc3pn deleted the string mono-CSV
+// producer, this predicate's contract was framed as byte-matching that producer's
+// stored segment (`nth_type_arg(mi.args, ei)`); since then the tid path is sole
+// authority, so each arm below is a decision about what the mono registry may key
+// on, not a parity check against a twin that no longer exists.
+//   - scalars (int/float/str/bool/sized-ints/char) admit unconditionally.
+//   - a BARE (params_count 0) struct/enum admits regardless of module qualifier
+//     (br q4etvt): tc_tid_to_c_tag spells it via strip_module_qualifier, and the
+//     mono registrar's physical c_name agrees.
+//   - a STRUCT INSTANCE slot (params_count>=1, `Box[Box[Int]]`) admits (br bwyfy1
+//     B4): tc_tid_to_c_tag recurses via tc_tid_struct_mono_name to the full mono
+//     stem (Box_Int), the same name register_mono_instance mints — closing the -1
 //     hole so arg_tids can key the mono dedup (br 16z0s1).
-//   - a module-qualified struct/enum is ADMITTED (br q4etvt) and an ENUM INSTANCE
-//     (params_count>=1) is ADMITTED (br 82ajft/dbzy4r) — see the TK_STRUCT|TK_ENUM
-//     branch's own comment below.
-//   - Option/Result over encodable inners, Tuple (tc_tid_tuple_encodable), Map over
-//     encodable inners, and Set are now ADMITTED (br kffj8d): the string path spells a
-//     compound slot via the SAME tc_tid_to_c_tag (tid_instance_mono_args_csv, the tid
-//     tier's one speller → "Option_int" / "Result_int_str" / "Tuple2_int_int" / bare "Map"/"Set"),
-//     and the def-side reader round-trips it byte-identically. Each shape's inner gate
-//     mirrors the general tc_tid_encodable's own arm, so admitting it here never widens
-//     past what the string path already spelled. See the per-shape arms below.
-// Everything else DEFERS to the string path (return false):
+//   - an ENUM INSTANCE (params_count>=1) admits too (br 82ajft/dbzy4r) — see the
+//     TK_STRUCT|TK_ENUM branch's own comment below.
+//   - Option/Result over encodable inners, Tuple (tc_tid_tuple_elem_faithful), Map,
+//     and Set all admit (br kffj8d): tc_tid_to_c_tag spells each via the tid tier's
+//     one speller ("Option_int" / "Result_int_str" / "Tuple2_int_int" / bare
+//     "Map"/"Set"), so carrying the real tid keys the mono dedup without changing
+//     emitted C. Each shape's inner gate mirrors tc_tid_encodable's own arm. See
+//     the per-shape arms below.
+// Everything else refuses (return false):
 //   - typevar/unknown — no concrete binding.
 pub fn tc_struct_slot_encodable(tid: Int) -> Bool {
     if tid < 0 || tid >= ty_pool.len() { return false }
@@ -11825,11 +11750,11 @@ pub fn tc_struct_slot_encodable(tid: Int) -> Bool {
     if k == TK_OPTION { return tc_tid_encodable(t.inner1) }
     if k == TK_RESULT { return tc_tid_encodable(t.inner1) && tc_tid_encodable(t.inner2) }
     // A TUPLE slot (br kffj8d, test_0sh55p T=Tuple2_int_int): admitted when every
-    // element is tuple-element-safe (tc_tid_tuple_encodable), the same gate the general
+    // element is tuple-element-safe (tc_tid_tuple_elem_faithful), the same gate the general
     // tc_tid_encodable uses. tc_tid_to_c_tag spells it via tc_tid_tuple_tag
     // (Tuple2_int_int), byte-matching the struct-lit string path's registered tuple
     // carrier segment.
-    if k == TK_TUPLE { return tc_tid_tuple_encodable(t) }
+    if k == TK_TUPLE { return tc_tid_tuple_elem_faithful(tid) }
     // A MAP slot (br 91j9fw, the List twin of br jw1pmb one carrier over): tc_tid_to_c_tag
     // erases Map to the bare carrier tag "Map" (no inner spelling), matching the string
     // path's bare "Map" segment — the same top-level spelling as Set/List below, admitted
@@ -11858,7 +11783,7 @@ pub fn tc_struct_slot_encodable(tid: Int) -> Bool {
     // names no type argument, no inner element can ever leak into the symbol, so an
     // inner gate here would be a refusal with NO REFERENT — there is nothing it could
     // protect that Option/Map/Tuple's inner gates protect (a leaking unencodable inner
-    // spelling). tc_tid_seg_injective is already false for TK_LIST (:11022), so the
+    // spelling). tc_tid_seg_injective is already false for TK_LIST (:11344), so the
     // mono-conflict tripwire (tc_classify_mono_conflicts) already classifies the
     // resulting cross-element sharing as `excusable`, not a violation. And refusing here
     // does not make the program safe: a decline just pushes the same under-determination
@@ -11870,7 +11795,7 @@ pub fn tc_struct_slot_encodable(tid: Int) -> Bool {
     // recover_list_elem_from_tid, codegen_expr.bl — is required alongside this to avoid
     // silently mis-reading a List[Str]/[Float]/[struct] field as a List[Int].)
     if k == TK_LIST { return true }
-    // A genuine Void slot is ADMITTED — same reasoning as tc_tid_tuple_elem_encodable's
+    // A genuine Void slot is ADMITTED — same reasoning as tc_tid_tuple_elem_faithful's
     // TK_VOID arm above (br hsgsbp): both paths spell it "Void", so this is byte-neutral,
     // and the accidental fall-through to `false` was what erased a real `Box[Void]`.
     if k == TK_VOID { return true }

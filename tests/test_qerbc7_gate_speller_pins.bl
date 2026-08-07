@@ -1,0 +1,162 @@
+// br qerbc7: pins for the three properties the gate/speller collapse must not disturb.
+//
+// The ticket asked to fold the 4 remaining encodability gates (tc_poly_elem_slot_encodable
+// and tc_poly_inner_encodable were already deleted by br 3fc3pn) into one, armed to ICE,
+// and to merge the 5 tid spellers into one rule. Neither survives contact with the code:
+//
+//   - tc_struct_slot_encodable deliberately does NOT tc_resolve (typecheck.bl:1387) while
+//     tc_tid_encodable does. Folding them changes behavior on a bound-but-unresolved
+//     metavar. R1 pins the asymmetry so a fold that resolves cannot land silently.
+//   - tc_tid_to_c_tag (top-level) and tc_tid_inner_tag (inner) spell the SAME tid two
+//     different ways on purpose (br bwyfy1: collapsing them to one rule broke 296
+//     fixtures and was reverted). R2 pins both positions on the same tids so the
+//     one-encoder-two-positions merge stays a refactor, not a behavior change.
+//   - tc_tid_tuple_elem_faithful's TK_MAP arm is a live behavioral guard, not an
+//     invariant: codegen_expr.bl:7196 selects between the tid speller and a still-live
+//     string speller on its `false`, exactly the br jefm9w shape ("do not arm a guard a
+//     working program depends on"). R3 pins the refusal so the predicate cannot be armed
+//     or dropped now that it has been renamed to tc_tid_tuple_elem_faithful.
+//
+// SETUP HAZARDS, inherited from tests/test_hsgsbp_void_vs_erasure.bl (same pattern):
+//  1. Bare `import codegen_expr` closes the whole-program-merge back-references.
+//  2. The harvest reads real inferred tids from a compiled probe program rather than
+//     hand-building pool entries, because tc_resolve/bind_metavar/TYPE_VOID are not `pub`.
+
+import typecheck.{
+    tc_tid_to_c_tag, tc_tid_inner_tag, tc_lookup_node_tid, tc_type_str,
+    tc_tid_map_key_tid, tc_tid_resolved, tc_struct_slot_encodable,
+    tc_tid_tuple_elem_faithful, check_types, make_map_type,
+}
+import parser.{nodes}
+import compiler.{compile_to_program}
+import std.io
+import codegen_expr
+
+fn assert_eq_str(label: Str, got: Str, want: Str) {
+    if got != want {
+        io.println("FAIL: {label}: got '{got}' want '{want}'")
+    }
+    assert_eq(got, want)
+}
+
+fn assert_true(label: Str, got: Bool) {
+    if !got {
+        io.println("FAIL: {label}: got false want true")
+    }
+    assert(got)
+}
+
+fn assert_false(label: Str, got: Bool) {
+    if got {
+        io.println("FAIL: {label}: got true want false")
+    }
+    assert(!got)
+}
+
+// The fill/Map() shape is the documented m1wspm producer of a bound-but-raw metavar:
+// tc_pin_generic_args_from_binds unifies Map[Int, Str] against Map[a_k, a_v] and binds
+// a_k := Int IN PLACE (kind stays TK_UNKNOWN, solution stashed in inner1) rather than
+// rewriting the node's memoized tid through tc_resolve.
+fn probe_src() -> Str {
+    #"fn fill[K, V](m: Map[K, V], k: K, v: V) {
+    m.insert(k, v)
+}
+fn main() ! IO {
+    fill(Map(), 256, "x")
+}
+"#
+}
+
+fn harvest_type_tids() -> Map[Str, Int] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let path = "build/qerbc7_probe_src.bl"
+    write_file(path, probe_src())
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    // Removed before any row assertion, so a failing row never leaks the probe file.
+    fs.remove(path)
+    let mut m: Map[Str, Int] = Map()
+    let mut idx = 0
+    let n = nodes.len()
+    while idx < n {
+        let tid = tc_lookup_node_tid(idx)
+        if tid >= 0 {
+            m.insert(tc_type_str(tid), tid)
+        }
+        idx = idx + 1
+    }
+    m
+}
+
+fn expect_tid(m: Map[Str, Int], key: Str) -> Int {
+    let tid = m.get(key) ?? -1
+    if tid == -1 {
+        io.println("FAIL: harvested map has no tid for rendered type string '{key}'")
+    }
+    assert(tid != -1)
+    tid
+}
+
+// R1 — resolve-asymmetry pin. tc_struct_slot_encodable reads ty_pool.get(tid).kind
+// directly (typecheck.bl:1387), so a metavar bound IN PLACE still reads back TK_UNKNOWN
+// and is refused — while the SAME tid stepped through tc_resolve reads its concrete
+// solution and is admitted. A fold that makes this gate resolve (or that folds it into
+// the resolving tc_tid_encodable) flips this row and silently changes 9 of its 10 call
+// sites' behavior on every bound-but-unresolved slot in the compiler.
+test "tc_struct_slot_encodable refuses a raw bound metavar but admits its resolution" {
+    let m = harvest_type_tids()
+    let map_tid = expect_tid(m, "Map[Int, Str]")
+    let raw_key_tid = tc_tid_map_key_tid(map_tid)
+    let resolved_key_tid = tc_tid_resolved(raw_key_tid)
+
+    assert_false("raw bound metavar reads back TK_UNKNOWN and is refused",
+        tc_struct_slot_encodable(raw_key_tid))
+    assert_true("the same slot's resolution is a concrete Int and is admitted",
+        tc_struct_slot_encodable(resolved_key_tid))
+}
+
+// R2 — position-asymmetry pin (br bwyfy1). tc_tid_to_c_tag (top-level) erases a Map to
+// its bare Pascal carrier; tc_tid_inner_tag (inner) spells it structurally with lowercase
+// scalars. Collapsing the two into one RULE instead of one encoder with a position
+// parameter was tried once and broke 296 fixtures. These rows pin both spellings of the
+// SAME tid so the merge stays byte-identical by construction.
+test "tc_tid_to_c_tag and tc_tid_inner_tag spell the same Map tid two different ways" {
+    let m = harvest_type_tids()
+    let map_tid = expect_tid(m, "Map[Int, Str]")
+
+    assert_eq_str("top-level position erases Map to its bare carrier",
+        tc_tid_to_c_tag(map_tid), "Map")
+    assert_eq_str("inner position spells Map structurally, lowercase",
+        tc_tid_inner_tag(map_tid), "Map_int_str")
+}
+
+// R3 — path-selector pin (br jefm9w shape). codegen_expr.bl:7196 reads
+// tc_tid_tuple_elem_faithful's `false` on a Map tuple element with a non-scalar
+// key/value to fall back onto a still-live string speller — a working program depends
+// on that fallback firing. This is a live behavioral guard, not an invariant assertion,
+// and must not be armed or silently dropped now that the predicate has been renamed
+// from tc_tid_tuple_elem_encodable.
+test "tc_tid_tuple_elem_faithful still refuses a Map tuple element with a non-scalar value" {
+    let m = harvest_type_tids()
+    // The harvested Map[Int, Str] carries its key/value slots as RAW bound metavars
+    // (fill's K/V are bound in place by tc_pin_generic_args_from_binds, same shape as
+    // R1) — resolve them first so this row probes the gate's MAP arm on genuinely
+    // concrete scalar tids, not on the resolve-asymmetry R1 already pins separately.
+    let map_tid = expect_tid(m, "Map[Int, Str]")
+    let scalar_key_tid = tc_tid_resolved(tc_tid_map_key_tid(map_tid))
+    let scalar_val_tid = tc_tid_resolved(m.get("Str") ?? -1)
+
+    // A fresh Map built from two RESOLVED scalar tids — negative control so this row
+    // cannot pass by the gate being universally false.
+    let scalar_map_tid = make_map_type(scalar_key_tid, scalar_val_tid)
+    assert_true("a scalar-key/scalar-value Map tuple element is still admitted",
+        tc_tid_tuple_elem_faithful(scalar_map_tid))
+
+    // A Map whose VALUE is itself compound (Map[Int, Map[Int,Str]]) is the shape the
+    // gate's own comment names as refused: "Scalar inners only — a struct/compound
+    // inner would spell via tc_tid_struct_mono_name here vs canonical_struct_tag on the
+    // value/annotation side and could diverge." codegen_expr.bl:7196 depends on this
+    // `false` to fall back to the string speller for exactly this shape.
+    let nested_map_tid = make_map_type(scalar_key_tid, scalar_map_tid)
+    assert_false("a Map tuple element with a compound value is still refused",
+        tc_tid_tuple_elem_faithful(nested_map_tid))
+}
