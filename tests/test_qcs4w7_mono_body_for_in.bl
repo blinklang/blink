@@ -1,0 +1,92 @@
+// br qcs4w7: flush_mono_fns_with_typedefs (src/codegen.bl:320) drains every OTHER
+// registry a mono body can discover (mono typedefs, tuples, Option/Result, derive/kops,
+// closures) but NEVER drains the iterator registries. A `for x in xs` (or `for i in
+// 0..n`) loop inside a monomorphized generic fn's body is the first thing to register
+// into those registries — ensure_iter_type/ensure_range_iter/ensure_str_iter all run
+// AFTER emit_all_iter_types() (codegen.bl:1985), which is the only top-level pass that
+// would have emitted them. The mangled element tag is correct; only the typedef/`_next`
+// function is missing.
+//
+//     fn sum_list[T](xs: List[T]) -> Int { let mut t = 0; for x in xs { t = t + 1 }; t }
+//
+// => error: unknown type name 'blink_ListIterator_int' / implicit decl of
+//    blink_ListIterator_int_next / blink_list_into_iter_int
+//
+// Isomorphic to wc7nxy (test_wc7nxy_mono_body_struct_typedef.bl), which hit the same
+// omission for mono struct/enum typedefs. The parallel test-block flush at
+// codegen.bl:2131 has always drained iterators via emit_iter_types_from; the bare-fn
+// mono flush never did.
+//
+// Widened beyond the ticket as filed: `for i in 0..n` inside a mono body hits the same
+// gap via the RANGE iterator flag (emitted_range_iter), not the list registry — verified
+// to fail identically. A from-0 flag test (`pre == 0`) would be wrong for a SECOND mono
+// fn in the same compile unit reusing the range iterator; a delta test (`pre == 0 && now
+// != 0`) is required, matching the test-block flush's own shape at codegen.bl:2135-2138.
+
+import compile_test_helpers
+import std.io
+
+fn assert_has(c: Str, needle: Str, label: Str) {
+    if !c.contains(needle) { io.println("FAIL: {label} — missing '{needle}'") }
+    assert(c.contains(needle))
+}
+
+fn src_list_for() -> Str {
+    let mut s = "fn sum_list[T](xs: List[T]) -> Int \{\n"
+    s = s.concat("    let mut t = 0\n")
+    s = s.concat("    for x in xs \{ t = t + 1 }\n")
+    s = s.concat("    t\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{ assert(sum_list([1, 2, 3]) == 3) }\n")
+    s
+}
+
+fn src_range_for() -> Str {
+    let mut s = "fn sum_range[T](x: T) -> Int \{\n"
+    s = s.concat("    let mut t = 0\n")
+    s = s.concat("    for i in 0..3 \{ t = t + i }\n")
+    s = s.concat("    let _u = x\n")
+    s = s.concat("    t\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{ assert(sum_range(\"a\") == 3) }\n")
+    s
+}
+
+// Two mono levels: outer[U] calls inner[T] which contains the `for` loop, so the
+// iterator registration happens transitively during the flush's own body-emission
+// pass (mono_fns.len() growing while emit_mono_fns_from iterates) — not merely once
+// at the top of the flush. Mirrors the transitive shape in test_0sh55p.
+fn inner_for[T](xs: List[T]) -> Int {
+    let mut t = 0
+    for _x in xs { t = t + 1 }
+    t
+}
+fn outer_for[U](ys: List[U]) -> Int { inner_for(ys) }
+
+test "a mono-body for-in over List[T] gets its iterator typedef emitted" {
+    let c = compile_test_helpers.compile_and_emit_c(src_list_for(), "qcs4w7_list_c")
+    assert_has(c, "blink_ListIterator_int_next", "mono body list-iter / typedef")
+}
+
+test "the mono-body for-in over List[T] compiles and runs" {
+    let r = compile_test_helpers.compile_and_run(src_list_for(), "qcs4w7_list_run")
+    if r.exit_code != 0 { io.println("FAIL: mono body list for-in — exit {r.exit_code}: {r.err_out}") }
+    assert_eq(r.exit_code, 0)
+}
+
+test "a mono-body for-in over a range gets its RangeIterator typedef emitted" {
+    let c = compile_test_helpers.compile_and_emit_c(src_range_for(), "qcs4w7_range_c")
+    assert_has(c, "blink_RangeIterator_next", "mono body range-iter / typedef")
+}
+
+test "the mono-body for-in over a range compiles and runs" {
+    let r = compile_test_helpers.compile_and_run(src_range_for(), "qcs4w7_range_run")
+    if r.exit_code != 0 { io.println("FAIL: mono body range for-in — exit {r.exit_code}: {r.err_out}") }
+    assert_eq(r.exit_code, 0)
+}
+
+test "a transitively-mono-body for-in over List[T] links + runs" {
+    let r = compile_test_helpers.compile_and_run("fn inner_for[T](xs: List[T]) -> Int \{\n    let mut t = 0\n    for _x in xs \{ t = t + 1 }\n    t\n}\nfn outer_for[U](ys: List[U]) -> Int \{ inner_for(ys) }\nfn main() \{ assert(outer_for([1,2,3,4]) == 4) }\n", "qcs4w7_transitive_run")
+    if r.exit_code != 0 { io.println("FAIL: transitive mono for-in — exit {r.exit_code}: {r.err_out}") }
+    assert_eq(r.exit_code, 0)
+}

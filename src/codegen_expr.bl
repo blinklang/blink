@@ -5088,6 +5088,18 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
             let kops = kops_table_name(ec.type_const, ec.struct_name)
             expr_result_str = "blink_map_new(&{kops})"
             expr_result_type = CT_MAP
+            // A bare `Map()` literal carries no key/value type of its own -- the
+            // binding's annotation branch (emit_let_binding's CT_MAP arm) derives
+            // and stamps the real types separately. Without resetting these here,
+            // a stale expr_map_key_type/expr_map_val_type left over from an
+            // unrelated earlier CT_MAP-producing expression (e.g. a prior
+            // statement's generic-fn call returning Map[K,V]) reads as "fresh" to
+            // apply_map_binding_meta's `>= 0` guard and clobbers the just-stamped
+            // types with garbage.
+            expr_map_key_type = -1
+            expr_map_val_type = -1
+            expr_map_key_struct = ""
+            expr_map_val_struct = ""
             return
         }
         if fn_name == "Set" {
@@ -5332,6 +5344,21 @@ fn emit_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
         if expr_result_type == CT_MAP {
             expr_map_key_type = tp_child1_kind(rt.tp_id)
             expr_map_val_type = tp_child2_kind(rt.tp_id)
+            // A plain (non-generic) fn returning Map[K, Box[Int]] carries the value
+            // struct on the return tid's value-child sname; without this a struct-
+            // instance Map value erases to the bare generic head at the call site,
+            // same defect class as h4kqsg/ya0739 (td9n5k widened). Mirrors the
+            // CT_LIST/CT_OPTION struct recovery three lines above.
+            let map_val_child = tp_get_child2(rt.tp_id)
+            if map_val_child >= 0 {
+                let mvs = tp_get_sname(map_val_child)
+                if mvs != "" { expr_map_val_struct = mvs }
+            }
+            let map_key_child = tp_get_child1(rt.tp_id)
+            if map_key_child >= 0 {
+                let mks = tp_get_sname(map_key_child)
+                if mks != "" { expr_map_key_struct = mks }
+            }
         }
         if expr_result_type == CT_SET {
             expr_list_elem_type = tp_child1_kind(rt.tp_id)
@@ -6485,7 +6512,7 @@ fn map_elem_tparam_tid(elem_name: Str, tparams_sl: Int, fn_arg_tids: List[Int]) 
 // codegen.bl, above this module in the import graph, so it can't be shared without a
 // cycle (dedup follow-up filed). A non-instance slot (scalar value, bare generic
 // base, absent tid) has arg_count 0 → no-op.
-fn register_map_elem_struct_mono_from_tid(slot_tid: Int) ! Codegen.Register {
+pub fn register_map_elem_struct_mono_from_tid(slot_tid: Int) ! Codegen.Register {
     let _name = register_map_elem_struct_mono_from_tid_named(slot_tid)
 }
 

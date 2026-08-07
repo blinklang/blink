@@ -2215,7 +2215,7 @@ pub fn reg_fn_ret_type_tp(name: Str, kind: Int, inner1: Int, inner2: Int, tp_id:
     fn_ret_types.push(RetType { name: name, kind: kind, inner1: inner1, inner2: inner2, tp_id: tp_id })
 }
 
-pub fn tp_from_ann(ann: Int) -> Int {
+pub fn tp_from_ann(ann: Int) -> Int ! Codegen.Register {
     let name = node_name(ann)
     let ct = type_from_name(name)
     if ct == CT_LIST {
@@ -2289,7 +2289,22 @@ pub fn tp_from_ann(ann: Int) -> Int {
         if type_alias_base.contains_key(name) {
             resolved_name = type_alias_base.get(name).unwrap()
         }
-        return sv_tp(CT_VOID, -1, -1, if resolved_name == "Void" || resolved_name == "" { "" } else { name })
+        if resolved_name == "Void" || resolved_name == "" {
+            return sv_tp(CT_VOID, -1, -1, "")
+        }
+        // A generic-struct/enum INSTANCE annotation (`Box[Int]`) must carry its
+        // mono stem (Box_Int), not the bare head `name` -- the bare head is never
+        // typedef'd (br td9n5k/ya0739: a Map-return's value child read back via
+        // tp_get_sname otherwise erases to an undeclared `blink_Box`). Registers
+        // the instance too, so its typedef gets emitted. "" (bare struct/enum,
+        // typevar, or non-generic) keeps the existing bare-head spelling.
+        if is_struct_type(name) != 0 || is_enum_type(name) != 0 {
+            let inst_stem = register_carrier_inner_mono_instance(name, ann)
+            if inst_stem != "" {
+                return sv_tp(CT_VOID, -1, -1, inst_stem)
+            }
+        }
+        return sv_tp(CT_VOID, -1, -1, name)
     }
     sv_tp(ct, -1, -1, "")
 }
@@ -2640,9 +2655,22 @@ pub fn reg_fn_ret_from_ann(name: Str, fn_node: Int) ! Codegen.Register {
         if elems_sl != -1 && sublist_length(elems_sl) >= 2 {
             let key_ann = sublist_get(elems_sl, 0)
             let val_ann = sublist_get(elems_sl, 1)
-            let key_t = type_from_name(node_name(key_ann))
-            let val_t = type_from_name(node_name(val_ann))
+            let key_name = node_name(key_ann)
+            let val_name = node_name(val_ann)
+            let key_t = type_from_name(key_name)
+            let val_t = type_from_name(val_name)
             reg_fn_ret_type_tp(name, CT_MAP, key_t, val_t, tp_from_ann(ta))
+            // Mirror the Option branch above (bee854): a struct/enum-instance Map
+            // value (Box[Int]) needs its mono INSTANCE registered here too, or its
+            // typedef never gets emitted when nothing else in the compile unit
+            // directly constructs one -- same defect class as h0n5qe/qcs4w7, just at
+            // the declaration-time registration point instead of a call/assign site.
+            if is_struct_type(val_name) != 0 || is_enum_type(val_name) != 0 {
+                register_carrier_inner_mono_instance(val_name, val_ann)
+            }
+            if is_struct_type(key_name) != 0 || is_enum_type(key_name) != 0 {
+                register_carrier_inner_mono_instance(key_name, key_ann)
+            }
         }
     }
     if ret_str == "Tuple" && ta != -1 {

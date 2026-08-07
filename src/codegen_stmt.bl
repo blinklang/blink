@@ -92,7 +92,8 @@ import codegen_expr.{
     expr_option_inner_struct, expr_option_is_none, expr_result_err_struct, expr_result_err_type,
     expr_result_ok_struct, expr_result_ok_type, expr_result_str,
     expr_result_type, mono_instance_arg_tids_from_tid, panic_file_for, segs_from_arg_tids,
-    tparams_sl_contains, recover_set_elem_from_tid, recover_option_set_elem_from_tid
+    tparams_sl_contains, recover_set_elem_from_tid, recover_option_set_elem_from_tid,
+    register_map_elem_struct_mono_from_tid
 }
 import codegen_methods.{resolve_tparam_via_tid, copy_list_compound_elem, emit_boxed_container_store, finish_enum_zip_result}
 import codegen_derive.{ct_to_descriptor, desc_primary_ct, descriptor_c_type, descriptor_mangle, emit_promote_elem_into, inner_desc_of, queue_promote_type, map_pair_key_read_expr}
@@ -2750,6 +2751,20 @@ fn emit_stmt(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
         }
         if node_kind(assign_target_node) == NodeKind.Ident {
             let var_name = node_name(assign_target_node)
+            // Assignment twin of emit_let_binding's Ident-target map-meta stamp
+            // (codegen_stmt.bl:3583-3589) -- an Assignment's target has no type
+            // annotation node (node_target is the LHS ident, not an ann), so this
+            // always takes carry_map_binding_meta's no-annotation branch and
+            // carries the RHS map's value struct across (td9n5k). Without this the
+            // target keeps whatever meta it had before the reassignment (or the
+            // CT_INT floor if never stamped), erasing a struct-instance Map value.
+            if val_type == CT_MAP && expr_map_key_type >= 0 {
+                apply_map_binding_meta(var_name)
+            }
+            if val_type == CT_MAP {
+                let assign_val_orig_name = if node_kind(rhs_node) == NodeKind.Ident { node_name(rhs_node) } else { "" }
+                carry_map_binding_meta(val_str, assign_val_orig_name, var_name, -1)
+            }
             emit_trace_state(var_name, "assign", target_str, val_type)
         }
         return
@@ -5676,9 +5691,20 @@ pub fn emit_impl_method_def(fn_node: Int, impl_type: Str, im_node: Int) ! Codege
                             if elems_sl != -1 && sublist_length(elems_sl) >= 2 {
                                 let key_ann = sublist_get(elems_sl, 0)
                                 let val_ann = sublist_get(elems_sl, 1)
-                                let val_name = node_name(val_ann)
-                                let val_ct = type_from_name(val_name)
+                                let val_head = node_name(val_ann)
+                                let val_ct = type_from_name(val_head)
+                                // Mirror emit_fn_def's Map param fix (h4kqsg): a
+                                // generic-struct-INSTANCE value ("Box[Int]") must
+                                // resolve to its mono stem, not the bare head.
+                                let val_inst_stem = tc_tid_struct_mono_name(tc_lookup_node_tid(val_ann))
+                                let val_name = if val_inst_stem != "" { val_inst_stem } else { val_head }
                                 set_map_types(pname, type_from_name(node_name(key_ann)), val_ct, val_name)
+                                if val_inst_stem != "" {
+                                    // See emit_fn_def's Map param fix (h4kqsg) for why this
+                                    // must be unconditional: struct_reg_set race at bind time.
+                                    set_map_value_struct(pname, val_inst_stem)
+                                    register_map_elem_struct_mono_from_tid(tc_lookup_node_tid(val_ann))
+                                }
                                 propagate_map_list_elem(pname, val_ct, val_ann)
                             }
                         }
@@ -6348,9 +6374,30 @@ pub fn emit_fn_def(fn_node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope
                         if elems_sl != -1 && sublist_length(elems_sl) >= 2 {
                             let key_ann = sublist_get(elems_sl, 0)
                             let val_ann = sublist_get(elems_sl, 1)
-                            let val_name = node_name(val_ann)
-                            let val_ct = type_from_name(val_name)
+                            let val_head = node_name(val_ann)
+                            let val_ct = type_from_name(val_head)
+                            // Match the struct-param fix three branches up (br wme0hh):
+                            // the bare head ("Box") is never declared in C when the
+                            // value is a generic-struct INSTANCE ("Box[Int]" ->
+                            // "Box_Int") -- h4kqsg.
+                            let val_inst_stem = tc_tid_struct_mono_name(tc_lookup_node_tid(val_ann))
+                            let val_name = if val_inst_stem != "" { val_inst_stem } else { val_head }
                             set_map_types(pname, type_from_name(node_name(key_ann)), val_ct, val_name)
+                            if val_inst_stem != "" {
+                                // set_map_types's own struct-name gate requires
+                                // is_named_type(value_name), which is_struct_type-backed
+                                // and false for a mono INSTANCE stem not yet in
+                                // struct_reg_set at param-binding time (its typedef
+                                // flushes later) -- codegen_stmt.bl:6678 hits the same
+                                // race. tc_tid_struct_mono_name already proved this is a
+                                // genuine resolved instance, so stamp it unconditionally.
+                                set_map_value_struct(pname, val_inst_stem)
+                                // Nothing else in this fn necessarily constructs/consumes
+                                // a Box_Int directly, so without registering the mono
+                                // instance here its typedef never gets emitted even
+                                // though every read site now correctly names it.
+                                register_map_elem_struct_mono_from_tid(tc_lookup_node_tid(val_ann))
+                            }
                             if val_ct == CT_LIST {
                                 let val_elems = node_elements(val_ann)
                                 if val_elems != -1 && sublist_length(val_elems) > 0 {
@@ -7726,9 +7773,21 @@ fn emit_mono_fn_def(fn_node: Int, concrete_args: Str, arg_tids: List[Int]) ! Cod
                             let key_name = resolve_tparam_via_tid(key_name_raw, tparams_sl, arg_tids)
                             let key_ct = type_from_name(key_name)
                             let val_name_raw = node_name(val_ann)
-                            let val_name = resolve_tparam_via_tid(val_name_raw, tparams_sl, arg_tids)
+                            // resolve_tparam_via_tid only substitutes a BARE binder
+                            // ("V" -> "Box"); a nested generic-struct instance written
+                            // literally in the annotation ("Box[T]") still needs its
+                            // own type-arg substituted via the annotation's own tid
+                            // (h4kqsg) before falling back to the bare-binder path.
+                            let val_inst_stem = tc_tid_struct_mono_name(tc_lookup_node_tid(val_ann))
+                            let val_name = if val_inst_stem != "" { val_inst_stem } else { resolve_tparam_via_tid(val_name_raw, tparams_sl, arg_tids) }
                             let val_ct = type_from_name(val_name)
                             set_map_types(pname, key_ct, val_ct, val_name)
+                            if val_inst_stem != "" {
+                                // See emit_fn_def's Map param fix (h4kqsg) for why this
+                                // must be unconditional: struct_reg_set race at bind time.
+                                set_map_value_struct(pname, val_inst_stem)
+                                register_map_elem_struct_mono_from_tid(tc_lookup_node_tid(val_ann))
+                            }
                             if key_ct == CT_VOID && is_named_type(key_name) != 0 {
                                 set_map_key_struct(pname, key_name)
                             }
@@ -8329,7 +8388,7 @@ fn typedef_c_name(td_node: Int, name: Str) -> Str {
     c_type_c_name_in(name, mod_ctx)
 }
 
-pub fn emit_struct_typedef(td_node: Int) ! Codegen.Emit, Diag.Report {
+pub fn emit_struct_typedef(td_node: Int) ! Codegen.Emit, Codegen.Register, Diag.Report {
     let name = node_name(td_node)
     // Resolve the C name against the TYPE'S OWN defining module (not the ambient
     // cg_current_module) and use it for the dedup key, the `#ifndef` guard, and
