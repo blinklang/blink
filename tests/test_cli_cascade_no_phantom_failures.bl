@@ -1,0 +1,47 @@
+// Regression (br vv51bm): `blink test <dir>` over N files where exactly one
+// file fails to LINK (typechecks fine, but `cc`/`ld` rejects it — an
+// undefined @ffi symbol reference) must report exactly 1 build error, not
+// N-1 phantom failures. The pre-flight typecheck loop in cmd_test
+// (src/cli.bl:2085-2104) single-threads and exits before workers spawn on
+// any Blink-diagnostic-level failure, so a failure that reaches the
+// parallel build phase is necessarily a cc/ld failure — and the old
+// cancel-wire mapped every never-dispatched worker's pre-seeded exit_codes
+// entry of -1 to "BUILD FAILED" too, inflating the count.
+//
+// Fixture basenames must be unique per worker (see test_for_each_case_records.bl):
+// `blink test` writes the compiled child binary to build/<basename>.
+
+test "one link-failing file among many does not cascade into phantom build errors" {
+    let scratch = ".tmp/_test_cascade_{getpid()}"
+    shell_exec("rm -rf {scratch}")
+    shell_exec("mkdir -p {scratch}")
+
+    let bad_src = "@ffi(\"totally_nonexistent_c_symbol_xyz_{getpid()}\")\n"
+        .concat("@trusted\n")
+        .concat("fn c_missing(n: Int) -> Int ! FFI \{ }\n\n")
+        .concat("test \"bad\" \{\n")
+        .concat("    let _ = c_missing(42)\n")
+        .concat("}\n")
+    write_file("{scratch}/cascade_bad_{getpid()}.bl", bad_src)
+
+    // 10 good files empirically reproduces the old race reliably under the
+    // default num_workers=4 pool (5 was not enough to keep the semaphore
+    // saturated long enough for other workers to observe cancel_ch before
+    // the bad file's worker set it).
+    let mut good_count = 10
+    let mut gi = 0
+    while gi < good_count {
+        let good_src = "test \"good_{gi}\" \{\n    assert(1 + 1 == 2)\n}\n"
+        write_file("{scratch}/cascade_good_{gi}_{getpid()}.bl", good_src)
+        gi = gi + 1
+    }
+
+    let result = process_run("build/blink", ["test", "--json", scratch])
+    let output = result.out.concat(result.err_out)
+    let diag = "exit_code={result.exit_code}; captured:\n{output}"
+
+    assert(output.contains("\"build_errors\":1"), "expected exactly 1 build error; {diag}")
+    assert(output.contains("\"files_passed\":{good_count}"), "expected all {good_count} good files to report passed; {diag}")
+
+    shell_exec("rm -rf {scratch}")
+}
