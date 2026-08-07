@@ -5,8 +5,8 @@ import parser.{
 }
 import ast.{dbg_channel_on, dbg_trace}
 import diagnostics.{
-    Diag, diag_error_no_loc, diag_set_last_fix,
-    UNDECLARED_EFFECT, ICE_SEG_ERASED_SLOT,
+    Diag, diag_error_no_loc, diag_ice_no_loc, diag_set_last_fix,
+    UNDECLARED_EFFECT, ICE_SEG_ERASED_SLOT, MAP_TAG_REACHED_CARRIER_SCOPE,
 }
 
 effect Codegen {
@@ -2271,7 +2271,25 @@ pub fn tp_from_ann(ann: Int) -> Int {
         }
     }
     if ct == CT_VOID {
-        return sv_tp(CT_VOID, -1, -1, name)
+        // br 296hpm: sv_tp's CT_VOID arm routes a non-empty sname through
+        // type_struct(sname), which hardcodes kind=CT_STRUCT — correct for the
+        // common case here (an unresolved head name IS a real struct/enum, and
+        // callers want CT_STRUCT+sname back). A field/element literally
+        // annotated `Void` hits this same branch and loses its CT_VOID kind to
+        // that collapse, so a later get_struct_field_type/get_struct_elem_type
+        // read reports CT_STRUCT for a genuinely Void slot (mirrors
+        // resolve_type_name's own `name == "Void" || name == ""` check,
+        // typecheck.bl:1021). Every other name keeps the existing behavior.
+        // /cr 296hpm follow-up: resolve a single-level type alias (`type Unit =
+        // Void`) before the name check, mirroring type_from_name's own
+        // type_alias_base lookup (:5368) -- otherwise an aliased Void name
+        // reaches sv_tp with the alias spelling, not "Void", and rides the
+        // type_struct(sname) collapse this branch exists to avoid.
+        let mut resolved_name = name
+        if type_alias_base.contains_key(name) {
+            resolved_name = type_alias_base.get(name).unwrap()
+        }
+        return sv_tp(CT_VOID, -1, -1, if resolved_name == "Void" || resolved_name == "" { "" } else { name })
     }
     sv_tp(ct, -1, -1, "")
 }
@@ -5522,6 +5540,17 @@ pub fn tuple_elem_struct(c_name: Str, idx: Int) -> Str {
     get_tuple_entry_elem_struct(emitted_tuple_entries.get(e).unwrap().elem_structs, idx)
 }
 
+// Element resolved name of tuple tag `c_name` at position `idx` -- "Void" for a
+// genuine Void element, "" otherwise (or when the tag is unknown). /cr 296hpm
+// follow-up: lets emit_tuple_destructure route a scalar element through
+// c_field_type_str exactly as emit_tuple_typedef already does (:5697),
+// without importing TupleEntry internals -- mirrors tuple_elem_struct's shape.
+pub fn tuple_elem_name(c_name: Str, idx: Int) -> Str {
+    let e = find_tuple_entry(c_name)
+    if e < 0 { return "" }
+    get_tuple_entry_elem_name(emitted_tuple_entries.get(e).unwrap().elem_names, idx)
+}
+
 // Per-position merge for repeat ensure_tuple_type calls on the SAME c_name
 // (dq15j7): elem_types/elem_structs are safe as pure first-writer-wins because
 // c_name is derived from them (two callers registering the same c_name always
@@ -6384,6 +6413,55 @@ pub fn register_var_compound_inner_from_str(name: Str, type_str: Str) {
         set_var_option_from_struct_tag(name, tag)
     } else if ct == CT_RESULT && tag.starts_with("Result_") {
         set_var_result_from_struct_tag(name, tag)
+    }
+}
+
+// Register a variable bound to a whole compound CARRIER TAG (`Option_int`,
+// `Result_int_str`) — the tag-form twin of register_var_compound_inner_from_str
+// above (which takes an annotation STRING, not a resolved tag). Precedents:
+// register_mono_field_types (FIELD slot, br zrybya) and register_poly_list_elem
+// (LIST ELEMENT slot, br 4c3gts) do the same tag-to-CT decode for their own
+// slots; this is the missing twin for a PARAM's own local scope binding
+// (br p24dfj — a bare-typevar param `x: T` bound to a compound resolves to
+// the carrier tag, not a head name, so type_from_name alone answers CT_VOID).
+//
+// set_var must run BEFORE the set_var_*_from_struct_tag decoders: both decoders
+// PUSH their own fully-populated ScopeVar when they don't find an existing one
+// to attach to, and find_scope_var returns the topmost push — so decoding first
+// and running set_var second would shadow the decoders' correctly-typed push
+// under a bare CT_OPTION/CT_RESULT var with no inner metadata, not leave it
+// dangling with "nothing to attach to".
+//
+// ensure_carrier_from_tag runs on the RAW tag, not `canon` — mirroring the
+// signature-builder precedents exactly. Its own Result branch re-canonicalizes
+// internally, and that internal splitter is not the same algorithm as
+// canonical_struct_tag; feeding it an already-canonical tag double-applies a
+// non-idempotent transform and can name/register a different typedef than the
+// signature side emitted for the identical source tag.
+//
+// No Map arm: unreachable in practice (tc_tid_to_c_tag spells TK_MAP as the
+// bare string "Map", never "Map_k_v", so a Map-bound-typevar param never
+// resolves to a tag here) and not safe to add speculatively — every Map
+// lowers to the single runtime `blink_map*`, and set_map_types would need
+// map_struct_scalar_kv's K/V, which the tag alone can't always supply. Calling
+// it with that helper's -1 sentinel would swap a loud `void` for a silently
+// wrong `.get()`/`.insert()` — the exact trade the R9 doctrine (Void erasure
+// must stay loud) forbids. The CT_MAP arm below is a self-defending backstop
+// for that invariant, not a speculative Map implementation: if it ever fires,
+// the tc_tid_to_c_tag invariant this comment describes has broken elsewhere.
+pub fn register_var_compound_from_tag(name: Str, tag: Str, is_mut: Int) ! Codegen.Scope, Diag.Report {
+    ensure_carrier_from_tag(tag)
+    let canon = canonical_struct_tag(tag)
+    let ct = compound_tag_ct(canon)
+    set_var(name, ct, is_mut)
+    if ct == CT_OPTION {
+        set_var_option_from_struct_tag(name, canon)
+    } else if ct == CT_RESULT {
+        set_var_result_from_struct_tag(name, canon)
+    } else if ct == CT_MAP {
+        diag_ice_no_loc("MapTagReachedCarrierScope", MAP_TAG_REACHED_CARRIER_SCOPE,
+            "Map-shaped compound tag '{tag}' reached register_var_compound_from_tag's scope registration",
+            "tc_tid_to_c_tag should never spell TK_MAP structurally — this invariant broke")
     }
 }
 

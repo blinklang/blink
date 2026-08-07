@@ -1,0 +1,150 @@
+// br p24dfj: poly-impl twin of test_p24dfj_mono_param_compound_local_binding.bl.
+// emit_poly_impl_method_def's scope-registration loop (codegen_stmt.bl,
+// the `else` block after the `ptype == "List"` arm at :7938-7950) has the
+// identical gap as the free-fn emit_mono_fn_def: a non-self bare-binder
+// param (`x: T`) bound to a compound element erases its LOCAL BINDING to
+// CT_VOID, even though the receiver's own List[T] element (registered via
+// register_poly_list_elem, br 4c3gts) and the method's SIGNATURE
+// (poly_impl_method_signature's compound-param arm, :7855, br 4c3gts) are
+// both already correct.
+//
+// Shape: `impl[T] KeepOne[T] for List[T]` instantiated at a compound T
+// (List[Option[Int]], ...) -- test_xgm7jv_poly_impl_instance_compound_return.bl's
+// `Wrap[T]`/`wrap_one` shape (bare-binder non-self param) instantiated at
+// test_4c3gts_poly_impl_compound_element.bl's List[Option[Int]] compound
+// element.
+//
+// See test_p24dfj_mono_param_compound_local_binding.bl for the two scope
+// corrections (Map off-axis; tuple passes by struct_reg_set accident) and
+// the nested-carrier exclusion -- both apply identically here.
+
+type Thing { n: Int }
+
+trait KeepOne[T] {
+    fn keep_one(self, x: T) -> T
+    fn tally_one(self, x: T) -> Int
+}
+
+impl[T] KeepOne[T] for List[T] {
+    fn keep_one(self, x: T) -> T {
+        let y = x
+        y
+    }
+    fn tally_one(self, x: T) -> Int {
+        let _y = x
+        1
+    }
+}
+
+// ---- RED: local binding must carry the resolved carrier, not CT_VOID ------
+
+test "p24dfj poly-impl tally_one over Option[Int] compiles (discarded local is the carrier, not void)" {
+    let xs: List[Option[Int]] = [Some(1)]
+    assert_eq(xs.tally_one(Some(3)), 1)
+}
+
+test "p24dfj poly-impl keep_one over Option[Int] returns the carrier through the local" {
+    let xs: List[Option[Int]] = [Some(1)]
+    let w = xs.keep_one(Some(5))
+    assert_eq(w.unwrap(), 5)
+}
+
+test "p24dfj poly-impl keep_one over Option[Str] returns the carrier through the local" {
+    let xs: List[Option[Str]] = [Some("a")]
+    let w = xs.keep_one(Some("hi"))
+    assert_eq(w.unwrap(), "hi")
+}
+
+test "p24dfj poly-impl keep_one over Option[(Int,Int)] returns the carrier through the local" {
+    let xs: List[Option[(Int, Int)]] = [Some((1, 1))]
+    let w = xs.keep_one(Some((3, 4)))
+    let pair = w.unwrap()
+    assert_eq(pair.0, 3)
+    assert_eq(pair.1, 4)
+}
+
+test "p24dfj poly-impl keep_one over Option[Struct] returns the carrier through the local" {
+    let xs: List[Option[Thing]] = [Some(Thing { n: 1 })]
+    let w = xs.keep_one(Some(Thing { n: 9 }))
+    assert_eq(w.unwrap().n, 9)
+}
+
+test "p24dfj poly-impl keep_one over Result[Int,Str] Ok arm returns the carrier through the local" {
+    let xs: List[Result[Int, Str]] = [Ok(1)]
+    let w = xs.keep_one(Ok(7))
+    match w {
+        Ok(v) => { assert_eq(v, 7) }
+        Err(_e) => { assert(false) }
+    }
+}
+
+test "p24dfj poly-impl keep_one over Result[Int,Str] Err arm returns the carrier through the local" {
+    let xs: List[Result[Int, Str]] = [Ok(1)]
+    let w = xs.keep_one(Err("boom"))
+    match w {
+        Ok(_v) => { assert(false) }
+        Err(e) => { assert_eq(e, "boom") }
+    }
+}
+
+// ---- GREEN controls: neighbouring param paths must stay undisturbed ------
+
+test "control poly-impl keep_one over scalar Int stays undisturbed" {
+    let xs: List[Int] = [1]
+    let w = xs.keep_one(5)
+    assert_eq(w, 5)
+}
+
+test "control poly-impl keep_one over a bare Tuple stays undisturbed (struct_reg_set accident)" {
+    let xs: List[(Int, Int)] = [(1, 1)]
+    let w = xs.keep_one((3, 4))
+    assert_eq(w.0, 3)
+    assert_eq(w.1, 4)
+}
+
+test "control poly-impl keep_one over a plain struct stays undisturbed" {
+    let xs: List[Thing] = [Thing { n: 1 }]
+    let w = xs.keep_one(Thing { n: 11 })
+    assert_eq(w.n, 11)
+}
+
+test "control poly-impl keep_one over Map[Int,Str] stays undisturbed (Map is off this axis)" {
+    let mut m0: Map[Int, Str] = Map()
+    m0.insert(1, "one")
+    let xs: List[Map[Int, Str]] = [m0]
+    let mut m: Map[Int, Str] = Map()
+    m.insert(3, "three")
+    let w = xs.keep_one(m)
+    assert_eq(w.get(3).unwrap(), "three")
+}
+
+// ---- C fence: pin the exact spelling ---------------------------------------
+
+fn emit_c(tag: Str, src: Str) -> Str {
+    let bl_path = ".tmp/_test_{tag}.bl"
+    write_file(bl_path, src)
+    let _ = process_run("build/blink", ["build", bl_path, "--emit", "c"])
+    let c_src = read_file("build/_test_{tag}.c")
+    shell_exec("rm -f {bl_path} build/_test_{tag}.c")
+    c_src
+}
+
+test "p24dfj poly-impl C fence: the local binding is the carrier, not void" {
+    let src = #"trait KeepOne2[T] {
+    fn keep_one(self, x: T) -> T
+}
+impl[T] KeepOne2[T] for List[T] {
+    fn keep_one(self, x: T) -> T {
+        let y = x
+        y
+    }
+}
+fn main() {
+    let xs: List[Option[Int]] = [Some(1)]
+    let _w = xs.keep_one(Some(3))
+}
+"#
+    let c = emit_c("p24dfj_poly_fence", src)
+    assert(c.contains("blink_Option_int y"))
+    assert(!c.contains("void y"))
+}

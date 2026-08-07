@@ -1,0 +1,48 @@
+// br 296hpm: `let x = <void-valued expr>` emits `const void x = ...;` — illegal C —
+// because emit_let_binding's fall-through (codegen_stmt.bl:3627) lowers CT_VOID
+// through c_type_str unconditionally, and c_type_str(CT_VOID) is the bare "void".
+//
+// This is a genuine Void, not an erased slot (that family is p24dfj, an
+// independent producer fixed separately) — `()` is the 0-tuple, "a type with
+// exactly one value" (sections/03_types.md:3187), the implicit return type of a
+// function producing no value. DECISIONS.md:342 (6-0) says Void is "an ordinary
+// inhabited, encodable type", so nothing forbids binding it; the fix is a
+// codegen-only lowering, name-keyed on the literal "Void" recovered from the
+// RHS node's tid via tc_tid_to_c_tag (not CT-keyed — CT_VOID also means "erased",
+// and keying on the CT would silently swallow that case into a well-typed
+// int64_t, disarming the loud `void v;` tripwire R9 depends on).
+//
+// Three sub-shapes, all discovered at the SAME producer:
+//   - a Void-returning fn call (`nothing()`)             — RHS is void-valued in C
+//   - a Void-typed field read on a plain (non-mono) struct — already an int64_t
+//     lvalue, but the placeholder rule is harmless there too
+//   - a mut-captured Void let (the closure-cell twin at :3638-3641)
+
+fn nothing() { }
+
+type Holder { v: Void }
+
+fn main() {
+    // ---- RED: the call-return shape -----------------------------------
+    let x = nothing()
+    assert(true)
+
+    // ---- RED: the field-read shape -------------------------------------
+    let h = Holder { v: () }
+    let v = h.v
+    assert(true)
+
+    // ---- RED: the mut-captured cell shape ------------------------------
+    let mut m = nothing()
+    let bump = fn() { m = nothing() }
+    bump()
+    assert(true)
+
+    // ---- RED: bare reassignment, no closure capture --------------------
+    // Same NodeKind.Assignment discriminator as the cell shape above, but
+    // reached without ever going through mut_captured_vars -- pins the
+    // arm's own guard independent of the cell twin.
+    m = nothing()
+    m += nothing()
+    assert(true)
+}

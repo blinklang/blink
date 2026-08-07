@@ -57,10 +57,10 @@ import codegen_types.{
     poly_impl_method_node, poly_impl_block_node, is_poly_impl_base,
     compound_tag_ct, option_inner_ct_from_tag, option_inner_struct_from_tag,
     option_c_type_mixed, pop_scope, ptr_inner_c_type, push_scope,
-    reg_sf_entry, register_var_compound_inner_from_str, resolve_effect_field, resolve_effect_is_ue, resolve_effect_vtable,
+    reg_sf_entry, register_var_compound_from_tag, register_var_compound_inner_from_str, resolve_effect_field, resolve_effect_is_ue, resolve_effect_vtable,
     resolve_import_alias, resolve_option_inner_from_ann, resolve_ret_type_from_ann,
     resolve_self_type, resolve_tuple_ann, resolve_variant, result_c_type,
-    result_c_type_mixed, tuple_struct_arity, set_list_elem_struct, set_list_elem_type,
+    result_c_type_mixed, tuple_struct_arity, tuple_elem_name, set_list_elem_struct, set_list_elem_type,
     set_list_nested_elem_struct, set_list_nested_elem_type, set_list_elem_map_types, set_list_elem_option, set_list_elem_result, get_list_elem_option_inner, get_list_elem_option_inner_struct, get_list_elem_result_ok, get_list_elem_result_err, get_list_elem_result_ok_struct, get_list_elem_result_err_struct, get_list_elem_option_inner_tp, get_list_elem_result_ok_tp, get_list_elem_result_err_tp, tp_carrier_tag, set_var_option_inner_tp, set_map_types, set_map_key_struct, key_struct_sname_from_ann, set_map_value_list_elem, set_map_value_struct, copy_map_value_meta, set_set_elem_type, set_set_elem_struct,
     find_type_def_node, set_var_ffi_ptr_struct, set_var_ffi_ptr_array, set_var_ffi_ptr_extra,
     ffi_alloc_n_pending, ffi_offset_pending_struct,
@@ -105,7 +105,7 @@ import diagnostics.{
 import pkg.manifest.{manifest_header_is_declared, manifest_name}
 import compiler.{trace}
 import stdlib_native_deps.{stdlib_native_dep_name_by_ffi_symbol}
-import typecheck.{is_import_module_name, tc_lookup_node_tid, tc_tid_struct_mono_name, tc_tid_struct, tc_tid_is_enum, tc_tid_struct_arg_count, tc_tid_struct_arg_tid, tc_tid_struct_slot_seg, tc_struct_slot_encodable, tc_tid_result_ok_tid, tc_tid_result_err_tid, tc_tid_option_inner_tid, tc_tid_tuple_arity, tc_tid_tuple_elem_tid}
+import typecheck.{is_import_module_name, tc_lookup_node_tid, tc_tid_struct_mono_name, tc_tid_struct, tc_tid_is_enum, tc_tid_struct_arg_count, tc_tid_struct_arg_tid, tc_tid_struct_slot_seg, tc_struct_slot_encodable, tc_tid_result_ok_tid, tc_tid_result_err_tid, tc_tid_option_inner_tid, tc_tid_tuple_arity, tc_tid_tuple_elem_tid, tc_tid_to_c_tag}
 
 fn strip_outer_parens(s: Str) -> Str {
     if s.starts_with("(") && s.ends_with(")") {
@@ -754,6 +754,17 @@ fn match_arms_need_struct(arms_sl: Int) -> Int {
     0
 }
 
+// /cr 296hpm follow-up: the two-signal genuine-Void discriminator (br 296hpm's
+// emit_let_binding comment, ~:3650, has the full rationale) hand-copied at
+// every call site that needs it. Extracted here so a future call site reuses
+// it instead of re-deriving it inline (this review found 4 more sites missing
+// it precisely because there was no named predicate to reach for).
+fn rhs_is_genuine_void(val_type: Int, val_node: Int) -> Int {
+    if val_type != CT_VOID { return 0 }
+    if tc_tid_to_c_tag(tc_lookup_node_tid(val_node)) == "Void" { return 1 }
+    0
+}
+
 @allow(UnrestoredMutation, IncompleteStateRestore)
 pub fn emit_match_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
     let scrut = node_scrutinee(node)
@@ -767,7 +778,8 @@ pub fn emit_match_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scop
         if elems_sl != -1 {
             let mut ei = 0
             while ei < sublist_length(elems_sl) {
-                emit_expr(sublist_get(elems_sl, ei))
+                let match_tuple_elem_node = sublist_get(elems_sl, ei)
+                emit_expr(match_tuple_elem_node)
                 let tmp = fresh_temp("_tup_")
                 let elem_sname = if expr_result_type == CT_STRUCT { get_var_struct(expr_result_str) } else { "" }
                 if elem_sname != "" {
@@ -805,7 +817,20 @@ pub fn emit_match_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scop
                     if rok_s != "" || rerr_s != "" { set_var_result_struct(tmp, rok, rerr, rok_s, rerr_s) }
                     match_scruts.push(MatchScrutEntry { str_val: tmp, scrut_type: expr_result_type, scrut_sname: res_tag })
                 } else {
-                    emit_line("{c_type_str(expr_result_type)} {tmp} = {expr_result_str};")
+                    // /cr 296hpm follow-up: mirror the single-scrutinee sibling's
+                    // CT_VOID exclusion (:929) -- a genuinely Void tuple element
+                    // (e.g. `match (nothing(), 1) { ... }`) must not materialize
+                    // as `void _tup_0 = ...;`, same two-signal guard as
+                    // emit_let_binding (:3622).
+                    let mte_is_void = rhs_is_genuine_void(expr_result_type, match_tuple_elem_node) != 0
+                    if mte_is_void {
+                        if expr_result_str != "" && expr_result_str != "0" {
+                            emit_line("(void){expr_result_str};")
+                        }
+                        emit_line("int64_t {tmp} = 0;")
+                    } else {
+                        emit_line("{c_type_str(expr_result_type)} {tmp} = {expr_result_str};")
+                    }
                     set_var(tmp, expr_result_type, 1)
                     match_scruts.push(MatchScrutEntry { str_val: tmp, scrut_type: expr_result_type })
                 }
@@ -2702,11 +2727,27 @@ fn emit_stmt(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
         if node_kind(assign_target_node) == NodeKind.Ident {
             cg_assign_target_name = node_name(assign_target_node)
         }
-        emit_expr(node_value(node))
+        let rhs_node = node_value(node)
+        emit_expr(rhs_node)
         cg_assign_target_name = saved_assign_target
         let val_str = expr_result_str
         let val_type = expr_result_type
-        emit_line("{target_str} = {val_str};")
+        // br 296hpm: the plain-assignment twin of emit_let_binding's Void
+        // placeholder rule (:3611) -- `m = nothing()` reassigning a genuine
+        // Void-typed var has a `void`-valued RHS in C. The target already holds
+        // the int64_t placeholder from its own `let`, and Void has exactly one
+        // value, so there is nothing to write back; only the RHS's side effect
+        // (the call itself) needs to survive. Same two-signal guard as :3611.
+        if rhs_is_genuine_void(val_type, rhs_node) != 0 {
+            // /cr 296hpm follow-up: same empty-val_str guard as emit_let_binding's
+            // twin branch (:3622) -- a Void-returning builtin already emitted its
+            // own statement(s) and left val_str=="".
+            if val_str != "" && val_str != "0" {
+                emit_line("(void){val_str};")
+            }
+        } else {
+            emit_line("{target_str} = {val_str};")
+        }
         if node_kind(assign_target_node) == NodeKind.Ident {
             let var_name = node_name(assign_target_node)
             emit_trace_state(var_name, "assign", target_str, val_type)
@@ -2719,10 +2760,21 @@ fn emit_stmt(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Re
         emit_expr(assign_target_node)
         let target_str = expr_result_str
         let target_type = expr_result_type
-        emit_expr(node_value(node))
+        let ca_rhs_node = node_value(node)
+        emit_expr(ca_rhs_node)
         let val_str = expr_result_str
+        let val_type = expr_result_type
         let op = node_op(node)
-        emit_line("{target_str} {op}= {val_str};")
+        // /cr 296hpm follow-up: same two-signal guard as the Assignment arm
+        // (:2716) -- `m += nothing()` has a `void`-valued RHS in C; there is
+        // nothing to compound-assign, only the RHS's side effect survives.
+        if rhs_is_genuine_void(val_type, ca_rhs_node) != 0 {
+            if val_str != "" && val_str != "0" {
+                emit_line("(void){val_str};")
+            }
+        } else {
+            emit_line("{target_str} {op}= {val_str};")
+        }
         if node_kind(assign_target_node) == NodeKind.Ident {
             emit_trace_state(node_name(assign_target_node), "assign", target_str, target_type)
         }
@@ -2978,7 +3030,14 @@ fn emit_tuple_destructure(pat_node: Int, source_var: Str, struct_name: Str, is_m
                 set_var_struct(c_elem, fs)
             }
         } else {
-            emit_line("{c_type_str(ft)} {c_elem} = {source_var}.{field_name};")
+            // /cr 296hpm follow-up: mirror emit_tuple_typedef's own scalar
+            // branch (codegen_types.bl:5697) -- a genuine Void tuple element
+            // read (`let (_, v) = t` where v: Void) must lower through
+            // c_field_type_str, not bare c_type_str, or this emits `void v =
+            // t._1;`. Reachable from both `let (a,b) = tup` and `for (a,b) in
+            // list_of_tuples` (both route through this fn).
+            let elem_nm = tuple_elem_name(struct_name, di)
+            emit_line("{c_field_type_str(ft, elem_nm)} {c_elem} = {source_var}.{field_name};")
             set_var(elem_name, ft, is_mut)
         }
         di = di + 1
@@ -3568,7 +3627,61 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
     }
     let struct_type = get_var_struct(name)
     let cname = c_safe_name(name)
-    if val_type == CT_OPTION {
+    // br 296hpm: a genuine Void RHS (`let x = nothing()`, a Void-typed field
+    // read, a generic fn returning its Void type argument) must not decay to
+    // `const void x = ...;` -- illegal C, since `()` is DECISIONS.md:342's
+    // "ordinary inhabited, encodable type", not a construct ban like `while`/
+    // `loop` (sections/02_syntax.md:597/:1353). Checked FIRST, ahead of every
+    // other branch below (including struct_type != "", which a pre-existing
+    // sname-tagging quirk in tp_from_ann/get_struct_field_stype can leave set
+    // to the literal string "Void" for a genuinely Void field -- see
+    // tp_from_ann's `ct == CT_VOID -> sv_tp(CT_VOID, -1, -1, name)` catch-all,
+    // which stamps sname=name even when name IS "Void", not just when it's an
+    // unrecognized/erased name; that sname then rides get_var_struct into this
+    // function's own `struct_type` local via the no-annotation fallback at
+    // :3394-3397).
+    //
+    // TWO independent signals must both agree, not one:
+    //  - tc_tid_to_c_tag(tid) == "Void" recovers the literal name from the RHS
+    //    node's typecheck-side tid. This alone is not enough: `.pop()`/
+    //    `.clear()` on a List are typecheck-side special-cased to TYPE_VOID
+    //    (:8317) even though codegen's OWN method-call handler computes their
+    //    real type as CT_OPTION (the Option[T] pop() actually returns) --
+    //    typecheck and codegen disagree about this one node's type, and
+    //    trusting the tid alone silently discarded a real `.pop()` result
+    //    (regen's gen1/gen2 bootstrap diff on tc_ret_only_metavars's `let _ =
+    //    tc_ret_mint_tids.pop()` caught exactly this).
+    //  - val_type == CT_VOID is codegen's OWN computed type for this RHS
+    //    (expr_result_type), already correct for `.pop()` (CT_OPTION, so this
+    //    guard alone already excludes it) but NOT enough on its own either:
+    //    an ERASED carrier slot also collapses to CT_VOID at codegen
+    //    (type_from_name collapses "" and every unknown name onto it too), so
+    //    a CT-only check would silently swallow an erased carrier into a
+    //    well-typed int64_t and disarm the loud `void x;` tripwire R9 depends
+    //    on -- an erased slot's tid still resolves to its true carrier tag
+    //    (e.g. "Option_int"), never to "Void", so requiring the tid to ALSO
+    //    say "Void" keeps that case falling through to the loud failure below.
+    //
+    // Only where BOTH agree is the RHS discarded for effect (its C type is
+    // genuinely `void` for a Void-returning call -- there is no value to read
+    // it into) and the local a constant int64_t placeholder, mirroring the
+    // field lowering c_field_type_str already applies to a Void struct field
+    // / Result leaf.
+    if rhs_is_genuine_void(val_type, val_node) != 0 {
+        // /cr 296hpm follow-up: a Void-returning builtin (assert/debug_assert/
+        // skip) already emitted its own full C statement(s) as a side effect
+        // inside emit_expr and signals "nothing left to emit" via val_str=="",
+        // mirroring emit_stmt's ExprStmt arm (:2681) -- wrapping an empty
+        // val_str here would emit the illegal bare `(void);`.
+        if val_str != "" && val_str != "0" {
+            emit_line("(void){val_str};")
+        }
+        if is_mut != 0 {
+            emit_line("int64_t {cname} = 0;")
+        } else {
+            emit_line("const int64_t {cname} = 0;")
+        }
+    } else if val_type == CT_OPTION {
         let opt_inner = get_var_option_inner(name)
         let opt_inner_s = get_var_option_inner_struct(name)
         let opt_c_inner = opt_inner
@@ -3636,7 +3749,15 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
         emit_line("(void){cname};")
     }
     if list_contains_str(mut_captured_vars, name) != 0 {
-        let cell_type = c_type_str(val_type)
+        // br 296hpm: the closure-cell twin of the placeholder rule above --
+        // `{cell_type}` must agree with the int64_t placeholder just emitted
+        // for `{cname}` above, or this reduces to `void* x_cell =
+        // (void*)blink_alloc(sizeof(void));` (a zero-sized alloc) followed by
+        // `*x_cell = x;`, an illegal void-lvalue assignment.
+        // /cr 296hpm follow-up: reuse c_field_type_str (the canonical
+        // CT_VOID+"Void"->int64_t storage-position lowering) instead of
+        // re-deriving the same rule inline with a second ad hoc ternary.
+        let cell_type = c_field_type_str(val_type, if rhs_is_genuine_void(val_type, val_node) != 0 { "Void" } else { "" })
         emit_line("{cell_type}* {cname}_cell = ({cell_type}*)blink_alloc(sizeof({cell_type}));")
         emit_line("*{cname}_cell = {cname};")
     }
@@ -7493,6 +7614,25 @@ fn emit_mono_fn_def(fn_node: Int, concrete_args: Str, arg_tids: List[Int]) ! Cod
                     let sig_str = build_closure_sig_resolved_mono(ta, tparams_sl, arg_tids)
                     set_var_closure(pname, sig_str)
                 }
+            } else if type_from_name(resolved_ptype) == CT_VOID && is_compound_tag(resolved_ptype) != 0 && is_struct_type(resolved_ptype) == 0 && is_enum_type(resolved_ptype) == 0 {
+                // br p24dfj: a bare-typevar param (`x: T`) bound to a whole
+                // Option/Result resolves to the carrier tag (Option_int, ...),
+                // reaching the same outcome as mono_fn_signature's own
+                // compound-param arm above (:7421, br qm01e7) so the local's
+                // scope CT agrees with the signature's C type by construction
+                // — though that arm excludes struct/enum by ARM ORDERING, not
+                // by an explicit clause the way this one does. The
+                // `type_from_name(...) == CT_VOID` guard (absent from :7421
+                // itself, a pre-existing gap shared with it) keeps a type
+                // ALIAS literally spelled like a carrier tag (`type Result_x
+                // = Int`) on its normal scalar/struct path instead of being
+                // misrouted into the carrier decoder.
+                //
+                // RAW, not canonicalized -- mirrors mono_fn_signature (:7426)
+                // exactly, which also calls ensure_carrier_from_tag on the raw
+                // tag. The poly-impl twin below canonicalizes first because its
+                // own signature builder does; see the comment there.
+                register_var_compound_from_tag(pname, resolved_ptype, 1)
             } else {
                 let param_ct = if is_enum_type(resolved_ptype) != 0 { CT_INT } else { type_from_name(resolved_ptype) }
                 set_var(pname, param_ct, 1)
@@ -7948,6 +8088,34 @@ fn emit_poly_impl_method_def(im: Int, method_node: Int, concrete_args: Str, arg_
                         register_poly_list_elem(pname, elem_name)
                     }
                 }
+            } else if type_from_name(ptype) == CT_VOID && is_compound_tag(ptype) != 0 && is_struct_type(ptype) == 0 && is_enum_type(ptype) == 0 {
+                // br p24dfj: poly-impl twin of the emit_mono_fn_def arm above --
+                // a non-self bare-binder param (`x: T`) bound to a whole
+                // Option/Result resolves to the carrier tag, reaching the same
+                // outcome as poly_impl_method_signature's own compound-param
+                // arm (:7869-7877, br 4c3gts) so the local's scope CT agrees with
+                // the signature's C type by construction — though that arm
+                // excludes struct/enum by ARM ORDERING, not by an explicit
+                // clause the way this one does. The `type_from_name(...) ==
+                // CT_VOID` guard (absent from :7869 itself, a pre-existing gap
+                // shared with it) keeps a type ALIAS literally spelled like a
+                // carrier tag (`type Result_x = Int`) on its normal
+                // scalar/struct path instead of being misrouted into the
+                // carrier decoder.
+                //
+                // Canonicalize BEFORE handing off, unlike the mono call site
+                // below: the two signature builders disagree with each other on
+                // this axis -- mono_fn_signature (:7426) calls
+                // ensure_carrier_from_tag on the RAW tag, but
+                // poly_impl_method_signature (:7875-7876) canonicalizes first.
+                // register_var_compound_from_tag's own `ensure_carrier_from_tag`
+                // call must receive the SAME string its paired signature builder
+                // fed it, or the two can independently split a Result tag's
+                // ok/err segment differently (canonical_struct_tag's backward
+                // scan vs ensure_carrier_from_tag's internal forward splitter
+                // are not the same algorithm) and register a scope decode for a
+                // typedef the signature never emitted.
+                register_var_compound_from_tag(pname, canonical_struct_tag(ptype), 1)
             } else {
                 let param_ct = if is_enum_type(ptype) != 0 { CT_INT } else { type_from_name(ptype) }
                 set_var(pname, param_ct, 1)

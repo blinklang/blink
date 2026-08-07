@@ -1,0 +1,171 @@
+// br p24dfj: a generic fn parameter bound to a bare typevar (`x: T`) that
+// resolves at a call site to a COMPOUND carrier (Option/Result) erased its
+// LOCAL BINDING to CT_VOID -- `const void _y = x;`, illegal C -- while the
+// param's own C type in the SIGNATURE was already correct
+// (`blink_Option_int x`). mono_fn_signature's compound-param arm
+// (codegen_stmt.bl:7421, br qm01e7) has no twin in emit_mono_fn_def's
+// scope-registration loop: resolve_tparam_via_tid answers the carrier TAG
+// ("Option_int"), and type_from_name keys on bracket-stripped HEAD names, so
+// a tag with no `[` falls to CT_VOID. The poly-impl twin
+// emit_poly_impl_method_def has the identical gap for non-self bare-binder
+// params (see test_p24dfj_poly_impl_param_compound_local_binding.bl).
+//
+// Two scope corrections pinned by the GREEN controls below:
+//   - Map is OFF this axis: tc_tid_to_c_tag spells TK_MAP as the bare string
+//     "Map" (never "Map_k_v"), so type_from_name already answers CT_MAP for
+//     a Map-bound-typevar param -- it never reaches the new arm at all.
+//   - Tuples pass only by ACCIDENT today: ensure_tuple_type registers its C
+//     name into struct_reg_set, so is_struct_type("Tuple2_int_int") is 1 and
+//     the pre-existing struct arm rescues it. The bare-tuple control pins
+//     that accident so a future refactor of ensure_tuple_type can't
+//     silently regress it.
+//
+// Scope note (mirrors test_ma6n41_generic_typevar_compound_return.bl:76-82):
+// NESTED carriers (Option[Option[Int]]) and struct-INSTANCE carrier inners
+// (Option[Box[Int]]) are excluded here -- those depend on
+// ensure_carrier_from_tag's own nested/instance-inner-naming behavior, which
+// is probed separately and, if broken, is an independently ticketed bug,
+// not this local-binding fix.
+
+type Thing { n: Int }
+
+fn sink[T](x: T) -> Int {
+    let _y = x
+    1
+}
+
+fn keep[T](x: T) -> T {
+    let y = x
+    y
+}
+
+fn tally2[A, B](a: A, b: B) -> Int {
+    let _x = a
+    let _y = b
+    1
+}
+
+// ---- RED: local binding must carry the resolved carrier, not CT_VOID ------
+
+test "p24dfj sink over Option[Int] compiles (discarded local is the carrier, not void)" {
+    assert(sink(Some(3)) == 1)
+}
+
+test "p24dfj keep over Option[Int] returns the carrier through the local" {
+    let o: Option[Int] = Some(5)
+    let w = keep(o)
+    assert_eq(w.unwrap(), 5)
+}
+
+test "p24dfj keep over Option[Str] returns the carrier through the local" {
+    let o: Option[Str] = Some("hi")
+    let w = keep(o)
+    assert_eq(w.unwrap(), "hi")
+}
+
+test "p24dfj keep over Option[(Int,Int)] returns the carrier through the local" {
+    let o: Option[(Int, Int)] = Some((3, 4))
+    let w = keep(o)
+    let pair = w.unwrap()
+    assert_eq(pair.0, 3)
+    assert_eq(pair.1, 4)
+}
+
+test "p24dfj keep over Option[Struct] returns the carrier through the local" {
+    let o: Option[Thing] = Some(Thing { n: 9 })
+    let w = keep(o)
+    assert_eq(w.unwrap().n, 9)
+}
+
+test "p24dfj keep over Result[Int,Str] Ok arm returns the carrier through the local" {
+    let r: Result[Int, Str] = Ok(7)
+    let w = keep(r)
+    match w {
+        Ok(v) => { assert_eq(v, 7) }
+        Err(_e) => { assert(false) }
+    }
+}
+
+test "p24dfj keep over Result[Int,Str] Err arm returns the carrier through the local" {
+    let r: Result[Int, Str] = Err("boom")
+    let w = keep(r)
+    match w {
+        Ok(_v) => { assert(false) }
+        Err(e) => { assert_eq(e, "boom") }
+    }
+}
+
+test "p24dfj keep over Result[Int,Struct] Err arm returns the carrier through the local" {
+    // Regression fence for the register_var_compound_from_tag double-
+    // canonicalization bug caught in review: canonical_struct_tag's
+    // backward scan and ensure_carrier_from_tag's own internal Result
+    // splitter disagree once the err segment is itself struct/enum-named
+    // rather than scalar. This same-module Thing doesn't reproduce the
+    // module-qualified divergence directly, but it pins the struct-err
+    // shape so any regression that reintroduces canonicalizing twice
+    // before ensure_carrier_from_tag has a fence to trip.
+    let r: Result[Int, Thing] = Err(Thing { n: 13 })
+    let w = keep(r)
+    match w {
+        Ok(_v) => { assert(false) }
+        Err(e) => { assert_eq(e.n, 13) }
+    }
+}
+
+test "p24dfj tally2 with the carrier in slot 1 (positional resolution)" {
+    assert_eq(tally2(Some(1), 2), 1)
+}
+
+test "p24dfj tally2 with the carrier in slot 2 (positional resolution)" {
+    assert_eq(tally2(1, Some(2)), 1)
+}
+
+// ---- GREEN controls: neighbouring param paths must stay undisturbed ------
+
+test "control keep over scalar Int stays undisturbed" {
+    let w = keep(5)
+    assert_eq(w, 5)
+}
+
+test "control keep over a bare Tuple stays undisturbed (struct_reg_set accident)" {
+    let w = keep((3, 4))
+    assert_eq(w.0, 3)
+    assert_eq(w.1, 4)
+}
+
+test "control keep over a plain struct stays undisturbed" {
+    let w = keep(Thing { n: 11 })
+    assert_eq(w.n, 11)
+}
+
+test "control keep over Map[Int,Str] stays undisturbed (Map is off this axis)" {
+    let mut m: Map[Int, Str] = Map()
+    m.insert(3, "three")
+    let w = keep(m)
+    assert_eq(w.get(3).unwrap(), "three")
+}
+
+// ---- C fence: pin the exact spelling ---------------------------------------
+
+fn emit_c(tag: Str, src: Str) -> Str {
+    let bl_path = ".tmp/_test_{tag}.bl"
+    write_file(bl_path, src)
+    let _ = process_run("build/blink", ["build", bl_path, "--emit", "c"])
+    let c_src = read_file("build/_test_{tag}.c")
+    shell_exec("rm -f {bl_path} build/_test_{tag}.c")
+    c_src
+}
+
+test "p24dfj C fence: the local binding is the carrier, not void" {
+    let src = #"fn sink[T](x: T) -> Int {
+    let _y = x
+    1
+}
+fn main() {
+    let _r = sink(Some(3))
+}
+"#
+    let c = emit_c("p24dfj_fence", src)
+    assert(c.contains("blink_Option_int _y"))
+    assert(!c.contains("void _y"))
+}
