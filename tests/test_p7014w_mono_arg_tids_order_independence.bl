@@ -223,3 +223,45 @@ test "row6 mono_instance: arg_tids upgrade on a dedup hit independently of ann" 
     register_mono_instance("p7014w_r6d", "Int,Str", [-1, 9])
     assert_tids(lookup_mono_base(c6d).arg_tids, [7, 9], "row6/incomparable")
 }
+
+// ---- row 7 (br cr4gqk): mangle_generic_name collision — two DISTINCT (base, args) keys
+// must never share a c_name, and each must resolve back to its OWN base/arg_tids ----------
+//
+// register_mono_instance_ann's dedup hit re-derives its target index by looking the freshly
+// minted c_name UP through mono_rev_idx (c_name -> Map[Str,Int] -> mono_idx position),
+// throwing away the injective mono_idx position it already computed. mono_rev_idx is keyed
+// on c_name = mangle_generic_name(...), which — before the cr4gqk fix — is NOT injective:
+// ("cr4gqk_r7_Box", "Inner_Int") and ("cr4gqk_r7_Box_Inner", "Int") both mangle to
+// "cr4gqk_r7_Box_Inner_Int". At HEAD the second registration's insert into mono_rev_idx
+// silently clobbers the first's reverse entry, so lookup_mono_base on EITHER c_name resolves
+// to the SECOND entry only — the first becomes unreachable through the reverse map (though it
+// is still present and intact in mono_instances itself, keyed correctly under mono_idx).
+test "row7 mono_instance: colliding c_names still resolve to their own (base, arg_tids)" {
+    let c7a = register_mono_instance("cr4gqk_r7_Box", "Inner_Int", [7])
+    let c7b = register_mono_instance("cr4gqk_r7_Box_Inner", "Int", [9])
+    assert(c7a != c7b)
+    let l7a = lookup_mono_base(c7a)
+    let l7b = lookup_mono_base(c7b)
+    assert_eq(l7a.base, "cr4gqk_r7_Box")
+    assert_eq(l7a.args, "Inner_Int")
+    assert_tids(l7a.arg_tids, [7], "row7/first-entry-own-tids")
+    assert_eq(l7b.base, "cr4gqk_r7_Box_Inner")
+    assert_eq(l7b.args, "Int")
+    assert_tids(l7b.arg_tids, [9], "row7/second-entry-own-tids")
+}
+
+// ---- row 7b: the merge cross-write. A genuine mono_idx dedup hit on entry #1 must not
+// write its incoming arg_tids into entry #2, even when entry #2's c_name happens to collide
+// with entry #1's under mangle_generic_name. At HEAD, register_mono_instance_ann's dedup
+// path resolves `existing` (entry #1's own c_name, from the injective mono_idx lookup) back
+// through mono_rev_idx — which, after entry #2 registered and clobbered that c_name's
+// reverse slot, points at entry #2. The merge and the `mono_instances.set` both land on
+// entry #2 instead of entry #1. ----------------------------------------------------------
+test "row7b mono_instance: a genuine dedup hit does not cross-write another entry's arg_tids" {
+    let c7ba = register_mono_instance("cr4gqk_r7b_Box", "Inner_Int", [])
+    let c7bb = register_mono_instance("cr4gqk_r7b_Box_Inner", "Int", [7])
+    // Third call: same (base, args) as c7ba, a genuine mono_idx dedup hit on entry #1.
+    register_mono_instance("cr4gqk_r7b_Box", "Inner_Int", [9])
+    assert_tids(lookup_mono_base(c7ba).arg_tids, [9], "row7b/entry1-gets-its-own-upgrade")
+    assert_tids(lookup_mono_base(c7bb).arg_tids, [7], "row7b/entry2-untouched")
+}

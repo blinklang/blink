@@ -143,8 +143,8 @@ test "a return-only type param resolves from the annotated let target" {
 
 test "the annotated let emits the concrete fn and struct monos" {
     let c = emit_c_checked(src_annotated_let(), "3dpshm_let_c", "annotated let")
-    assert_has(c, "blink_mk_Int", "annotated let / fn mono")
-    assert_has(c, "} blink_RGT_Int;", "annotated let / struct mono typedef")
+    assert(compile_test_helpers.has_mono_fn_instance(c, "mk") == 1)
+    assert(compile_test_helpers.has_mono_instance(c, "RGT") == 1)
     assert_int_kops(c, "annotated let")
     assert_no_erasure(c, "annotated let")
 }
@@ -168,8 +168,8 @@ test "a return-only type param resolves backward from a later method call" {
 
 test "backward inference emits the concrete monos and the int vtable" {
     let c = emit_c_checked(src_backward_use(), "3dpshm_back_c", "backward use")
-    assert_has(c, "blink_mks_Int", "backward use / fn mono")
-    assert_has(c, "} blink_RGS_Int;", "backward use / struct mono typedef")
+    assert(compile_test_helpers.has_mono_fn_instance(c, "mks") == 1)
+    assert(compile_test_helpers.has_mono_instance(c, "RGS") == 1)
     assert_int_kops(c, "backward use")
     assert_no_erasure(c, "backward use")
 }
@@ -192,7 +192,7 @@ test "a return-only type param resolves from a concretely typed param position" 
     if r.exit_code != 0 { io.println("FAIL: arg position — exit {r.exit_code}: {r.err_out}") }
     assert_eq(r.exit_code, 0)
     let c = compile_test_helpers.compile_and_emit_c(s, "3dpshm_argpos_c")
-    assert_has(c, "blink_mk_Int", "arg position / fn mono")
+    assert(compile_test_helpers.has_mono_fn_instance(c, "mk") == 1)
     assert_no_erasure(c, "arg position")
 }
 
@@ -209,7 +209,7 @@ test "a return-only type param resolves from an implicit tail return" {
     if r.exit_code != 0 { io.println("FAIL: tail return — exit {r.exit_code}: {r.err_out}") }
     assert_eq(r.exit_code, 0)
     let c = compile_test_helpers.compile_and_emit_c(s, "3dpshm_tail_c")
-    assert_has(c, "blink_mk_Int", "tail return / fn mono")
+    assert(compile_test_helpers.has_mono_fn_instance(c, "mk") == 1)
     assert_no_erasure(c, "tail return")
 }
 
@@ -233,10 +233,17 @@ test "two call sites under different annotations monomorphize separately" {
     s = s.concat("    assert(b.s.contains(\"x\"))\n")
     s = s.concat("}\n")
     let c = emit_c_checked(s, "3dpshm_fresh_c", "freshness")
-    assert_has(c, "} blink_RGT_Int;", "freshness / Int typedef")
-    assert_has(c, "} blink_RGT_Str;", "freshness / Str typedef")
-    assert_has(c, "blink_mk_Int", "freshness / Int fn mono")
-    assert_has(c, "blink_mk_Str", "freshness / Str fn mono")
+    // The freshness claim is DISTINCTNESS: two call sites must produce two instances,
+    // not one shared one — a relational property, so read it relationally rather than
+    // by pinning either instance's mangled spelling.
+    let names = compile_test_helpers.mono_typedef_names(c, "RGT")
+    if names.len() != 2 { io.println("FAIL: freshness — want 2 RGT typedefs, got {names.len()}") }
+    assert(names.len() == 2)
+    assert(names.get(0).unwrap() != names.get(1).unwrap())
+    let fns = compile_test_helpers.mono_fn_names(c, "mk")
+    if fns.len() != 2 { io.println("FAIL: freshness — want 2 mk fn monos, got {fns.len()}") }
+    assert(fns.len() == 2)
+    assert(fns.get(0).unwrap() != fns.get(1).unwrap())
     assert_has(c, "blink_kops_i64", "freshness / int vtable for the Int set")
     assert_has(c, "blink_kops_str", "freshness / str vtable for the Str set")
     assert_no_erasure(c, "freshness")
@@ -261,9 +268,18 @@ test "a mixed signature mints only the return-only slot, in position" {
     s = s.concat("    assert(p.s.contains(256))\n")
     s = s.concat("}\n")
     let c = emit_c_checked(s, "3dpshm_mixed_c", "mixed")
-    assert_has(c, "} blink_RP_Str_Int;", "mixed / typedef in declared order")
-    assert_lacks(c, "blink_RP_Int_Str", "mixed / transposed slots")
-    assert_has(c, "blink_mkp_Str_Int", "mixed / fn mono")
+    // Positional alignment: the one RP instance must mention Str BEFORE Int — that is
+    // the whole claim, and it holds regardless of what separator the mangler uses.
+    let names = compile_test_helpers.mono_typedef_names(c, "RP")
+    if names.len() != 1 { io.println("FAIL: mixed — want exactly 1 RP typedef, got {names.len()}") }
+    assert(names.len() == 1)
+    let rp = names.get(0).unwrap()
+    let str_at = rp.index_of("Str")
+    let int_at = rp.index_of("Int")
+    if str_at < 0 || int_at < str_at { io.println("FAIL: mixed / transposed slots — '{rp}'") }
+    assert(str_at >= 0)
+    assert(int_at > str_at)
+    assert(compile_test_helpers.has_mono_fn_instance(c, "mkp") == 1)
     assert_int_kops(c, "mixed")
     assert_lacks(c, "_Void", "mixed / string-producer erasure")
     let r = compile_test_helpers.compile_and_run(s, "3dpshm_mixed_run")

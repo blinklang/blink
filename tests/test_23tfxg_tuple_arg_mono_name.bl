@@ -86,12 +86,27 @@ fn assert_no_erasure(c: Str, label: Str) {
     assert_lacks(c, "void value;", "{label} / erased Option payload")
 }
 
-// The bug's own signature: a SECOND C typedef for one Blink type. `} blink_GT_Tuple;`
-// is the typedef terminator, so it cannot match inside `} blink_GT_Tuple2_int_int;`.
-fn assert_one_gt_typedef(c: Str, mono: Str, label: Str) {
-    assert_has(c, "} blink_{mono};", "{label} / correct mono typedef")
-    assert_lacks(c, "} blink_GT_Tuple;", "{label} / bare-head typedef")
-    assert_lacks(c, "#define BLINK_TD_blink_GT_Tuple\n", "{label} / bare-head typedef guard")
+// The bug's own signature: a SECOND C typedef for one Blink type. Read STRUCTURALLY
+// via mono_typedef_names rather than by pinning a literal mangled spelling — the bug
+// is "two typedefs where one belongs", which is a COUNT plus a content check on the
+// single survivor, neither of which needs to know where the mangler puts separators.
+// `segs` names the mono segments the one surviving typedef must mention, in order,
+// with no claim about what sits between them.
+fn assert_one_gt_typedef(c: Str, segs: List[Str], label: Str) {
+    let names = compile_test_helpers.mono_typedef_names(c, "GT")
+    if names.len() != 1 { io.println("FAIL: {label} — want exactly 1 GT typedef, got {names.len()}") }
+    assert(names.len() == 1)
+    let name = names.get(0).unwrap()
+    let mut i = 0
+    let mut rest = name
+    while i < segs.len() {
+        let seg = segs.get(i).unwrap()
+        let at = rest.index_of(seg)
+        if at < 0 { io.println("FAIL: {label} — mono typedef '{name}' missing segment '{seg}'") }
+        assert(at >= 0)
+        rest = rest.substr(at + seg.len(), rest.len())
+        i = i + 1
+    }
 }
 
 fn gt_decl() -> Str {
@@ -131,7 +146,7 @@ test "a tuple type arg in a Result carrier's payload compiles and runs" {
 
 test "the Result carrier names its payload with the tuple's mono stem" {
     let c = compile_test_helpers.compile_and_emit_c(src_loud(), "23tfxg_loud_c")
-    assert_one_gt_typedef(c, "GT_Tuple2_int_int", "loud repro")
+    assert_one_gt_typedef(c, ["Tuple2", "int", "int"], "loud repro")
     // The specific wrong carrier the bare head produced.
     assert_lacks(c, "blink_Result_GT_Tuple_str", "loud repro / bare-head carrier")
     assert_no_erasure(c, "loud repro")
@@ -141,8 +156,12 @@ test "the Result carrier names its payload with the tuple's mono stem" {
 
 test "a tuple type arg in an Option carrier emits exactly one GT typedef" {
     let c = compile_test_helpers.compile_and_emit_c(src_silent(), "23tfxg_silent_c")
-    assert_one_gt_typedef(c, "GT_Tuple2_int_int", "silent repro")
-    assert_has(c, "blink_Option_GT_Tuple2_int_int", "silent repro / carrier name")
+    assert_one_gt_typedef(c, ["Tuple2", "int", "int"], "silent repro")
+    // The carrier must be named after the GT instance actually emitted, whatever that
+    // instance's mangled spelling is — derived from the recovered typedef name rather
+    // than pinned literally.
+    let gt = compile_test_helpers.mono_typedef_names(c, "GT")
+    assert_has(c, "blink_Option_{gt.get(0).unwrap().substr(6, 1000)}", "silent repro / carrier name")
     assert_no_erasure(c, "silent repro")
 }
 
@@ -188,7 +207,7 @@ test "a nested tuple type arg spells both levels" {
     s = s.concat("    assert(o.is_some())\n")
     s = s.concat("}\n")
     let c = compile_test_helpers.compile_and_emit_c(s, "23tfxg_nested_c")
-    assert_one_gt_typedef(c, "GT_Tuple2_Tuple2_int_int_str", "nested tuple")
+    assert_one_gt_typedef(c, ["Tuple2", "Tuple2", "int", "int", "str"], "nested tuple")
     assert_no_erasure(c, "nested tuple")
 }
 
@@ -204,8 +223,16 @@ test "a tuple type arg in the second slot keeps positional alignment" {
     s = s.concat("    assert(o.unwrap().a == \"x\")\n")
     s = s.concat("}\n")
     let c = compile_test_helpers.compile_and_emit_c(s, "23tfxg_twoparam_c")
-    assert_has(c, "} blink_GP_Str_Tuple2_int_int;", "two-param / correct mono typedef")
-    assert_lacks(c, "} blink_GP_Str_Tuple;", "two-param / bare-head typedef")
+    let gp = compile_test_helpers.mono_typedef_names(c, "GP")
+    if gp.len() != 1 { io.println("FAIL: two-param — want exactly 1 GP typedef, got {gp.len()}") }
+    assert(gp.len() == 1)
+    // Positional alignment: Str precedes the tuple's own elements in the one name.
+    let gpn = gp.get(0).unwrap()
+    let str_at = gpn.index_of("Str")
+    let tup_at = gpn.index_of("Tuple2")
+    assert(str_at >= 0)
+    assert(tup_at > str_at)
+    assert(gpn.index_of("int") > tup_at)
     let r = compile_test_helpers.compile_and_run(s, "23tfxg_twoparam_run")
     if r.exit_code != 0 { io.println("FAIL: two-param — exit {r.exit_code}: {r.err_out}") }
     assert_eq(r.exit_code, 0)
@@ -226,7 +253,12 @@ test "a nested generic-struct type arg still recurses (bee854 control)" {
     s = s.concat("    assert(r.is_ok())\n")
     s = s.concat("}\n")
     let c = compile_test_helpers.compile_and_emit_c(s, "23tfxg_ctrl_c")
-    assert_has(c, "} blink_QB_QB_Int;", "bee854 control / nested stem")
+    // The nested stem: QB[QB[Int]] and its inner QB[Int] are two distinct instances,
+    // neither of them the bare head.
+    let qb = compile_test_helpers.mono_typedef_names(c, "QB")
+    if qb.len() != 2 { io.println("FAIL: bee854 control — want 2 QB typedefs, got {qb.len()}") }
+    assert(qb.len() == 2)
+    assert(qb.get(0).unwrap() != qb.get(1).unwrap())
     assert_lacks(c, "} blink_QB;", "bee854 control / bare-head typedef")
     let r = compile_test_helpers.compile_and_run(s, "23tfxg_ctrl_run")
     if r.exit_code != 0 { io.println("FAIL: bee854 control — exit {r.exit_code}: {r.err_out}") }
@@ -241,7 +273,7 @@ test "a plain scalar type arg is unaffected" {
     s = s.concat("    assert(o.is_some())\n")
     s = s.concat("}\n")
     let c = compile_test_helpers.compile_and_emit_c(s, "23tfxg_scalar_c")
-    assert_has(c, "} blink_GT_Int;", "scalar arg / mono typedef")
+    assert_one_gt_typedef(c, ["Int"], "scalar arg")
     assert_no_erasure(c, "scalar arg")
 }
 
@@ -263,8 +295,7 @@ test "a tuple arg over a typevar element monomorphizes by its substituted elemen
     s = s.concat("}\n")
     s = s.concat("fn main() \{ assert(wrap(7).is_some()) }\n")
     let c = compile_test_helpers.compile_and_emit_c(s, "23tfxg_typevar_elem")
-    assert_has(c, "} blink_GT_Tuple2_int_int;", "typevar tuple element / mono typedef")
-    assert_lacks(c, "} blink_GT_Tuple;", "typevar tuple element / bare-head typedef")
+    assert_one_gt_typedef(c, ["Tuple2", "int", "int"], "typevar tuple element")
     assert_has(c, "blink_set_new(&kops_blink_Tuple2_int_int)", "typevar tuple element / tuple kops")
     assert_lacks(c, "blink_kops_str", "typevar tuple element / string kops fallback")
     assert_no_erasure(c, "typevar tuple element")
@@ -288,12 +319,16 @@ test "a by-value tuple field gets the right mono name and the typedef order is c
     s = s.concat("}\n")
     let c = compile_test_helpers.compile_and_emit_c(s, "23tfxg_byval_c")
     // What this fix owns: the name, and the absence of the bare-head twin.
-    assert_has(c, "} blink_QB_Tuple2_int_int;", "by-value field / correct mono typedef")
-    assert_lacks(c, "} blink_QB_Tuple;", "by-value field / bare-head typedef")
+    let qb = compile_test_helpers.mono_typedef_names(c, "QB")
+    if qb.len() != 1 { io.println("FAIL: by-value field — want exactly 1 QB typedef, got {qb.len()}") }
+    assert(qb.len() == 1)
+    let qbn = qb.get(0).unwrap()
+    assert(qbn.index_of("Tuple2") >= 0)
+    assert(qbn.index_of("int") > qbn.index_of("Tuple2"))
     assert_has(c, "blink_Tuple2_int_int v;", "by-value field / member type")
     // What br 7jm54r owned: the tuple typedef must precede the struct embedding it.
     let tuple_td_idx = c.index_of("} blink_Tuple2_int_int;")
-    let struct_td_idx = c.index_of("} blink_QB_Tuple2_int_int;")
+    let struct_td_idx = c.index_of("\} {qbn};")
     assert(tuple_td_idx >= 0)
     assert(struct_td_idx >= 0)
     assert(tuple_td_idx < struct_td_idx)
@@ -316,7 +351,7 @@ test "a generic-struct-instance type arg in a Set element monomorphizes to its n
     s = s.concat("    assert(e.s.len() == 0)\n")
     s = s.concat("}\n")
     let c = compile_test_helpers.compile_and_emit_c(s, "23tfxg_struct_elem")
-    assert_has(c, "} blink_GT_QB_Int;", "struct Set element / mono typedef")
+    assert_one_gt_typedef(c, ["QB", "Int"], "struct Set element")
     assert_lacks(c, "} blink_GT_QB;", "struct Set element / bare-head nested typedef")
     assert_lacks(c, "BLINK_COMPILER_BUG_kops", "struct Set element / kops sentinel")
     assert_no_erasure(c, "struct Set element")

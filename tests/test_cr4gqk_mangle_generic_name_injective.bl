@@ -1,0 +1,152 @@
+// br cr4gqk: unit rows for mangle_generic_name(base, args) -> Str (src/codegen_types.bl:4476).
+//
+// WHY THIS PREDICATE MUST BE INJECTIVE. mangle_generic_name builds the C symbol for a
+// generic mono instance by joining base + each comma-separated arg segment. Plain
+// concatenation with "_" collapses distinct (base, args) pairs the moment either side
+// already contains an underscore: ("A","B,C,D"), ("A_B","C,D"), ("A","B_C,D") and
+// ("A","B,C_D") all joined to "A_B_C_D". Two DIFFERENT generic instantiations then share
+// one C symbol, and the second typedef/fn body emitted under that name is silently
+// discarded by the `#ifndef BLINK_TD_`/include-guard pattern (a real, reproduced bug: see
+// tests/test_cr4gqk_mono_name_collision_struct.bl and the _fn/_cross_kind siblings).
+//
+// THE FIX (escape_mono_seg): escape a literal "_" to the two-char sequence "_1", and join
+// segments with the two-char separator "_0" instead of a bare "_". A single "_" byte in the
+// output is now always immediately followed by "0" (separator) or "1" (one escaped literal
+// underscore) — decoding never needs run-length/parity reasoning, unlike a doubling scheme.
+//
+// WHY NOT DOUBLING (the first thing tried here, and DISPROVEN by the boundary-adjacent row
+// below): doubling "_" to "__" and joining with a bare "_" looks injective per comma-split
+// segment, but is NOT injective ACROSS a segment boundary — mangle("Box_","Int") and
+// mangle("Box","_Int") both produced "Box___Int" under doubling, because a trailing escaped
+// underscore from one segment, the separator, and a leading escaped underscore from the
+// next segment all collapse into one ambiguous 3-underscore run with no marker for which
+// underscore in the run is the separator. _0/_1 has no such run at all: escape and separator
+// are different characters, so there is nothing to disambiguate.
+//
+// SCOPE BOUNDARY (do not conflate with tc_tid_seg_injective, tests/test_xskbvh_seg_injective.bl):
+// this predicate is about the BASE/SEGMENT BOUNDARY in the string mangle_generic_name is
+// handed. It says nothing about SEGMENT CONTENT collapse — Set[Int] and Set[Str] both
+// legitimately arrive as the bare segment "Set" (one C symbol correctly serves both), and
+// mangle_generic_name is not the seam that could fix or should fix that; tc_tid_seg_injective
+// governs whether a segment names its own type arguments before it ever reaches this join.
+//
+// mangle_generic_name itself is pure Str arithmetic with no registry/global reads, but
+// codegen_types.bl as a WHOLE MODULE still free-loads globals it does not import
+// (tc_alias_to_original, lexer/parser's trace_mode/trace) out of the merged program rather
+// than its own import list — the same hazard test_p7014w and test_xskbvh document. Reaching
+// codegen_types through anything short of codegen_expr's transitive closure leaves those
+// undefined in the emitted C. Bare import, same as test_p7014w — no symbol of codegen_expr's
+// own is needed here, so the selective form would just move the W0602 onto an unused named
+// import instead of the module; accepting the same warning test_p7014w already accepts.
+
+import codegen_types.{mangle_generic_name}
+import codegen_expr
+import std.io
+
+fn assert_eq_str(got: Str, want: Str, label: Str) {
+    if got != want { io.println("FAIL: {label} — got '{got}', want '{want}'") }
+    assert(got == want)
+}
+
+// ---- underscore-free shapes: unchanged base/segments, but the separator is now "_0" -----
+//
+// Unlike a doubling scheme, _0/_1 does NOT leave underscore-free names byte-identical to
+// the pre-fix spelling (that property could not be salvaged once the boundary-adjacent
+// collision below was found) — but it does leave them a pure, predictable function of the
+// inputs with no escaping applied to any character. This row is the guard for THAT: no
+// segment here contains "_", so no "_1" ever appears, only the "_0" join.
+
+test "mangle_generic_name: underscore-free shapes get the plain _0 join, no escaping" {
+    assert_eq_str(mangle_generic_name("Box", "Int"), "Box_0Int", "Box/Int")
+    assert_eq_str(mangle_generic_name("Pair", "Int,Str"), "Pair_0Int_0Str", "Pair/Int,Str")
+    assert_eq_str(mangle_generic_name("A", "B,C,D"), "A_0B_0C_0D", "A/B,C,D")
+    assert_eq_str(mangle_generic_name("Box", ""), "Box_0", "Box/empty-args")
+    assert_eq_str(mangle_generic_name("Option", "Int"), "Option_0Int", "Option/Int")
+}
+
+// ---- the new spelling for underscore-bearing shapes, pinning high-traffic carriers ----
+
+test "mangle_generic_name: underscore-bearing shapes escape to _1, separator stays _0" {
+    assert_eq_str(mangle_generic_name("Box", "Inner_Int"), "Box_0Inner_1Int", "Box/Inner_Int")
+    assert_eq_str(mangle_generic_name("Box_Inner", "Int"), "Box_1Inner_0Int", "Box_Inner/Int")
+    assert_eq_str(mangle_generic_name("list_map", "Int"), "list_1map_0Int", "list_map/Int")
+    assert_eq_str(mangle_generic_name("Box", "Tuple2_int_int"), "Box_0Tuple2_1int_1int", "Box/Tuple2_int_int")
+    // High-traffic compound carriers, explicitly pinned so a future mangler change cannot
+    // silently rename the C symbols half the stdlib's typedefs rely on.
+    assert_eq_str(mangle_generic_name("Option", "Int"), "Option_0Int", "carrier/Option_Int")
+    assert_eq_str(mangle_generic_name("Tuple2", "int,int"), "Tuple2_0int_0int", "carrier/Tuple2_int_int")
+    assert_eq_str(mangle_generic_name("Map", "str,int"), "Map_0str_0int", "carrier/Map_str_int")
+}
+
+// ---- pairwise != over the four-way A_B_C_D collapse (the ORIGINAL motivating example) ----
+
+test "mangle_generic_name: the four A_B_C_D-colliding inputs are pairwise distinct" {
+    let s1 = mangle_generic_name("A", "B,C,D")
+    let s2 = mangle_generic_name("A_B", "C,D")
+    let s3 = mangle_generic_name("A", "B_C,D")
+    let s4 = mangle_generic_name("A", "B,C_D")
+    assert(s1 != s2)
+    assert(s1 != s3)
+    assert(s1 != s4)
+    assert(s2 != s3)
+    assert(s2 != s4)
+    assert(s3 != s4)
+}
+
+// ---- the BOUNDARY-ADJACENT collision that disproved doubling ----------------------------
+//
+// mangle("Box_", "Int") and mangle("Box", "_Int") each involve exactly one underscore, on
+// opposite sides of the base/args boundary. Under doubling they both produced "Box___Int".
+// Under _0/_1 the escape marker and separator marker are different characters, so the two
+// stay distinct: "Box_1_0Int" (trailing base underscore, THEN the separator) vs.
+// "Box_0_1Int" (the separator, THEN a leading arg underscore).
+
+test "mangle_generic_name: boundary-adjacent underscores do not collide" {
+    let boundary_a = mangle_generic_name("Box_", "Int")
+    let boundary_b = mangle_generic_name("Box", "_Int")
+    assert_eq_str(boundary_a, "Box_1_0Int", "boundary/trailing-base-underscore")
+    assert_eq_str(boundary_b, "Box_0_1Int", "boundary/leading-arg-underscore")
+    assert(boundary_a != boundary_b)
+}
+
+// ---- O(n^2) injectivity sweep: the row that catches a future "clever" mangler change ----
+
+fn injectivity_sweep_bases() -> List[Str] {
+    [
+        "Box", "Box", "Box", "Box_Inner", "Box", "Box_", "Box", "_Box", "Box",
+        "Box__Inner", "Box", "A", "A_B", "A", "A", "A_B_C", "list_map", "list", "A_", "A",
+    ]
+}
+
+fn injectivity_sweep_args() -> List[Str] {
+    [
+        "Int", "", "Int,Str", "Int", "Inner_Int", "Int", "_Int", "Int", "Int_",
+        "Int", "Inner__Int", "B,C,D", "C,D", "B_C,D", "B,C_D", "D", "Int", "map_Int", "_B", "__B",
+    ]
+}
+
+test "mangle_generic_name: O(n^2) injectivity sweep over ~20 (base,args) pairs" {
+    let bases = injectivity_sweep_bases()
+    let args = injectivity_sweep_args()
+    let n = bases.len()
+    let mut outputs: List[Str] = []
+    let mut i = 0
+    while i < n {
+        outputs.push(mangle_generic_name(bases.get(i).unwrap(), args.get(i).unwrap()))
+        i = i + 1
+    }
+    i = 0
+    while i < n {
+        let mut j = i + 1
+        while j < n {
+            let oi = outputs.get(i).unwrap()
+            let oj = outputs.get(j).unwrap()
+            if oi == oj {
+                io.println("FAIL: collision between ({bases.get(i).unwrap()},{args.get(i).unwrap()}) and ({bases.get(j).unwrap()},{args.get(j).unwrap()}) both -> {oi}")
+            }
+            assert(oi != oj)
+            j = j + 1
+        }
+        i = i + 1
+    }
+}

@@ -135,6 +135,42 @@ fn box_decl() -> Str {
     "type Box[T] \{ value: T }\n"
 }
 
+fn count_occurrences(s: Str, needle: Str) -> Int {
+    let mut n = 0
+    let mut i = 0
+    while i + needle.len() <= s.len() {
+        if s.substring(i, needle.len()) == needle { n = n + 1 }
+        i = i + 1
+    }
+    n
+}
+
+// Rows 1a/1b pin that the OUTER `Box[Box[Option[Str]]]` and the INNER `Box[Option[Str]]`
+// stay two distinct mono instances. Both are read structurally out of the emitted C and
+// told apart by how deep each one nests `Box` — never by the mangler's literal spelling,
+// which is what the too-deep failure mode would corrupt anyway.
+fn assert_nested_box_instances(c: Str, label: Str) {
+    let names = compile_test_helpers.mono_typedef_names(c, "Box")
+    if names.len() != 2 { io.println("FAIL: {label} — want 2 Box instances, got {names.len()}") }
+    assert(names.len() == 2)
+    let mut outer = 0
+    let mut inner = 0
+    let mut i = 0
+    while i < names.len() {
+        let n = names.get(i).unwrap()
+        // Every instance's arg is an Option[Str] carrier at some depth.
+        assert(n.contains("Option") && n.contains("str"))
+        let depth = count_occurrences(n, "Box")
+        if depth == 2 { outer = outer + 1 }
+        if depth == 1 { inner = inner + 1 }
+        i = i + 1
+    }
+    if outer != 1 { io.println("FAIL: {label} / outer instance — want 1 doubly-nested Box, got {outer}") }
+    assert(outer == 1)
+    if inner != 1 { io.println("FAIL: {label} / inner instance kept distinct — want 1 flat Box, got {inner}") }
+    assert(inner == 1)
+}
+
 // ── ROWS 1a/1b: the headline RED ──────────────────────────────────────────────────────
 //
 // The nesting guard could not see this. `Box { value: None }` reverse-infers its slot as
@@ -154,9 +190,9 @@ fn src_nested_opt(payload: Str) -> Str {
 test "a nested Box over a bare None carrier does not adopt the outer annotation's arg" {
     let c = compile_test_helpers.compile_and_emit_c(src_nested_opt("None"), "htxpmh_r1none_c")
     assert_lacks(c, "BLINK_I0001_", "row 1a / I0001 sentinel in emitted C")
-    assert_lacks(c, "Box_Box_Box_Option_str", "row 1a / mono name one nesting level too deep")
-    assert_has(c, "blink_Box_Box_Option_str", "row 1a / outer instance")
-    assert_has(c, "blink_Box_Option_str", "row 1a / inner instance kept distinct")
+    // The "one nesting level too deep" failure is caught by the depth census itself:
+    // a triply-nested inner would leave zero flat instances.
+    assert_nested_box_instances(c, "row 1a")
     let r = compile_test_helpers.compile_and_run(src_nested_opt("None"), "htxpmh_r1none_run")
     if r.exit_code != 0 { io.println("FAIL: row 1a runtime — {r.err_out}") }
     assert(r.exit_code == 0)
@@ -166,8 +202,7 @@ test "a nested Box over a Some carrier does not erase its slot" {
     let c = compile_test_helpers.compile_and_emit_c(src_nested_opt("Some(\"z\")"), "htxpmh_r1some_c")
     assert_lacks(c, "BLINK_I0001_", "row 1b / I0001 sentinel in emitted C")
     assert_lacks(c, "erased_slot", "row 1b / erased mono slot")
-    assert_has(c, "blink_Box_Box_Option_str", "row 1b / outer instance")
-    assert_has(c, "blink_Box_Option_str", "row 1b / inner instance kept distinct")
+    assert_nested_box_instances(c, "row 1b")
     let r = compile_test_helpers.compile_and_run(src_nested_opt("Some(\"z\")"), "htxpmh_r1some_run")
     if r.exit_code != 0 { io.println("FAIL: row 1b runtime — {r.err_out}") }
     assert(r.exit_code == 0)

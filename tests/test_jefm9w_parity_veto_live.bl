@@ -95,6 +95,26 @@ fn assert_lacks(c: Str, needle: Str, label: Str) {
     assert(!c.contains(needle))
 }
 
+// Counts non-overlapping occurrences of `needle` in `s` — used to tell a Box-nested-in-Box
+// typedef name (needle "Box" appears twice) apart from a single-level one (appears once),
+// without depending on the mangling scheme's exact separator/escape spelling.
+fn count_occurrences(s: Str, needle: Str) -> Int {
+    let mut count = 0
+    let mut start = 0
+    let mut going = true
+    while going {
+        let rest = s.substring(start, s.len() - start)
+        let idx = rest.index_of(needle)
+        if idx < 0 {
+            going = false
+        } else {
+            count = count + 1
+            start = start + idx + needle.len()
+        }
+    }
+    count
+}
+
 fn box_decl() -> Str {
     "type Box[T] \{ value: T }\n"
 }
@@ -125,8 +145,16 @@ fn src_alias_compound_param() -> Str {
 
 test "an aliased slot beside a compound slot canonicalizes to the param's spelling" {
     let c = compile_test_helpers.compile_and_emit_c(src_alias_compound_param(), "jefm9w_ra_c")
-    assert_has(c, "blink_P_Int_Box_Int", "row A / instance matches the param type")
-    assert_lacks(c, "blink_P_Alias_Box_Int", "row A / nominally distinct alias-spelled twin")
+    // Exactly ONE P instance: the alias must canonicalize to Int rather than minting a
+    // second, nominally-distinct alias-spelled twin beside it. The surviving name must
+    // spell the canonical slot (Int) and the compound slot (Box), never "Alias".
+    let names = compile_test_helpers.mono_typedef_names(c, "P")
+    if names.len() != 1 { io.println("FAIL: row A / want exactly 1 P instance, got {names.len()}") }
+    assert(names.len() == 1)
+    let pname = names.get(0).unwrap()
+    assert_has(pname, "Int", "row A / canonical Int slot")
+    assert_has(pname, "Box", "row A / compound Box slot")
+    assert_lacks(pname, "Alias", "row A / alias spelling leaked into the mono name")
     assert_lacks(c, "BLINK_I0001_", "row A / I0001 sentinel")
     let r = compile_test_helpers.compile_and_run(src_alias_compound_param(), "jefm9w_ra_run")
     if r.exit_code != 0 { io.println("FAIL: row A runtime — {r.err_out}") }
@@ -170,9 +198,30 @@ fn src_receiver_nested_set() -> Str {
 
 test "a struct literal in field-access-receiver position keeps its own nesting level" {
     let c = compile_test_helpers.compile_and_emit_c(src_receiver_nested_set(), "jefm9w_rb_c")
-    assert_has(c, "blink_Box_Box_Set", "row B / outer instance exists")
-    assert_has(c, "blink_Box_Set value;", "row B / outer field lowers to the inner mono")
-    assert_lacks(c, "blink_set* value;\n} blink_Box_Box_Set", "row B / outer collapsed onto inner")
+    // Two DISTINCT Box instances: the inner Box[Set[Int]] and the outer Box[Box[Set[Int]]].
+    // The outer is identified by "Box" appearing twice in its own name — a nesting-DEPTH
+    // reading, agnostic to how the mangler spells the separator. A collapse of the outer
+    // onto the inner would leave only one.
+    let names = compile_test_helpers.mono_typedef_names(c, "Box")
+    if names.len() != 2 { io.println("FAIL: row B / want 2 Box instances (inner+outer), got {names.len()}") }
+    assert(names.len() == 2)
+    assert(names.get(0).unwrap() != names.get(1).unwrap())
+    let mut found_outer = false
+    let mut inner_name = ""
+    let mut i = 0
+    while i < names.len() {
+        let n = names.get(i).unwrap()
+        if count_occurrences(n, "Box") >= 2 && n.contains("Set") {
+            found_outer = true
+        } else {
+            inner_name = n
+        }
+        i = i + 1
+    }
+    if !found_outer { io.println("FAIL: row B / no Box-of-Box-of-Set instance — outer collapsed onto inner") }
+    assert(found_outer)
+    // The outer's `value` field must lower to the INNER mono type, not to a raw set pointer.
+    assert_has(c, "{inner_name} value;", "row B / outer field lowers to the inner mono")
     assert_has(c, "blink_kops_i64", "row B / int-keyed Set gets the int vtable")
     assert_lacks(c, "blink_kops_str", "row B / int keys hashed through the string vtable")
     assert_lacks(c, "BLINK_I0001_", "row B / I0001 sentinel")
@@ -197,8 +246,25 @@ fn src_receiver_nested_list() -> Str {
 
 test "a List-carrying literal in field-access-receiver position keeps its own nesting level" {
     let c = compile_test_helpers.compile_and_emit_c(src_receiver_nested_list(), "jefm9w_rb2_c")
-    assert_has(c, "blink_Box_Box_List", "row B2 / outer instance exists")
-    assert_has(c, "blink_Box_List value;", "row B2 / outer field lowers to the inner mono")
+    let names = compile_test_helpers.mono_typedef_names(c, "Box")
+    if names.len() != 2 { io.println("FAIL: row B2 / want 2 Box instances (inner+outer), got {names.len()}") }
+    assert(names.len() == 2)
+    assert(names.get(0).unwrap() != names.get(1).unwrap())
+    let mut found_outer = false
+    let mut inner_name = ""
+    let mut i = 0
+    while i < names.len() {
+        let n = names.get(i).unwrap()
+        if count_occurrences(n, "Box") >= 2 && n.contains("List") {
+            found_outer = true
+        } else {
+            inner_name = n
+        }
+        i = i + 1
+    }
+    if !found_outer { io.println("FAIL: row B2 / no Box-of-Box-of-List instance — outer collapsed onto inner") }
+    assert(found_outer)
+    assert_has(c, "{inner_name} value;", "row B2 / outer field lowers to the inner mono")
     assert_lacks(c, "BLINK_I0001_", "row B2 / I0001 sentinel")
     let r = compile_test_helpers.compile_and_run(src_receiver_nested_list(), "jefm9w_rb2_run")
     if r.exit_code != 0 { io.println("FAIL: row B2 runtime — {r.err_out}") }
@@ -224,9 +290,23 @@ fn src_box_box_int() -> Str {
 
 test "a nested struct-instance literal in field-value position is correctly named" {
     let c = compile_test_helpers.compile_and_emit_c(src_box_box_int(), "jefm9w_rc_c")
-    assert_has(c, "blink_Box_Box_Int", "row C / outer symbol")
-    assert_has(c, "blink_Box_Int value;", "row C / field lowers to the inner mono")
-    assert_lacks(c, "blink_Box_Box_Int value;", "row C / self-referential typedef")
+    let names = compile_test_helpers.mono_typedef_names(c, "Box")
+    if names.len() != 2 { io.println("FAIL: row C / want 2 Box instances (inner+outer), got {names.len()}") }
+    assert(names.len() == 2)
+    assert(names.get(0).unwrap() != names.get(1).unwrap())
+    let mut outer_name = ""
+    let mut inner_name = ""
+    let mut i = 0
+    while i < names.len() {
+        let n = names.get(i).unwrap()
+        if count_occurrences(n, "Box") >= 2 { outer_name = n } else { inner_name = n }
+        i = i + 1
+    }
+    if outer_name == "" { io.println("FAIL: row C / no Box-of-Box outer symbol") }
+    assert(outer_name != "")
+    assert(inner_name != "")
+    assert_has(c, "{inner_name} value;", "row C / field lowers to the inner mono")
+    assert_lacks(c, "{outer_name} value;", "row C / self-referential typedef")
     assert_lacks(c, "BLINK_I0001_", "row C / I0001 sentinel")
     let r = compile_test_helpers.compile_and_run(src_box_box_int(), "jefm9w_rc_run")
     if r.exit_code != 0 { io.println("FAIL: row C runtime — {r.err_out}") }
@@ -249,12 +329,37 @@ fn src_nested_opt(payload: Str) -> Str {
     s
 }
 
+// Exactly two Box instances — the inner Box[Option[Str]] (one "Box") and the outer
+// Box[Box[Option[Str]]] (two "Box"es) — and nothing at THREE levels, which is what an
+// adoption one nesting level too deep would produce. Read as nesting DEPTH so no
+// mangling separator is spelled out.
+fn assert_nested_opt_levels(c: Str, label: Str) {
+    let names = compile_test_helpers.mono_typedef_names(c, "Box")
+    if names.len() != 2 { io.println("FAIL: {label} / want 2 Box instances (inner+outer), got {names.len()}") }
+    assert(names.len() == 2)
+    assert(names.get(0).unwrap() != names.get(1).unwrap())
+    let mut found_inner = false
+    let mut found_outer = false
+    let mut i = 0
+    while i < names.len() {
+        let n = names.get(i).unwrap()
+        let depth = count_occurrences(n, "Box")
+        if depth > 2 { io.println("FAIL: {label} / '{n}' is one nesting level too deep") }
+        assert(depth <= 2)
+        if depth == 1 && n.contains("Option") { found_inner = true }
+        if depth == 2 && n.contains("Option") { found_outer = true }
+        i = i + 1
+    }
+    if !found_outer { io.println("FAIL: {label} / no Box-of-Box-of-Option outer instance") }
+    assert(found_outer)
+    if !found_inner { io.println("FAIL: {label} / inner Box-of-Option instance not kept distinct") }
+    assert(found_inner)
+}
+
 test "a nested bare-None carrier stays at its own nesting level" {
     let c = compile_test_helpers.compile_and_emit_c(src_nested_opt("None"), "jefm9w_rd_c")
     assert_lacks(c, "BLINK_I0001_", "row D / I0001 sentinel")
-    assert_lacks(c, "Box_Box_Box_Option_str", "row D / mono name one nesting level too deep")
-    assert_has(c, "blink_Box_Box_Option_str", "row D / outer instance")
-    assert_has(c, "blink_Box_Option_str", "row D / inner instance kept distinct")
+    assert_nested_opt_levels(c, "row D")
     let r = compile_test_helpers.compile_and_run(src_nested_opt("None"), "jefm9w_rd_run")
     if r.exit_code != 0 { io.println("FAIL: row D runtime — {r.err_out}") }
     assert(r.exit_code == 0)
@@ -264,8 +369,7 @@ test "a nested Some carrier stays at its own nesting level" {
     let c = compile_test_helpers.compile_and_emit_c(src_nested_opt("Some(\"z\")"), "jefm9w_re_c")
     assert_lacks(c, "BLINK_I0001_", "row E / I0001 sentinel")
     assert_lacks(c, "erased_slot", "row E / erased mono slot")
-    assert_has(c, "blink_Box_Box_Option_str", "row E / outer instance")
-    assert_has(c, "blink_Box_Option_str", "row E / inner instance kept distinct")
+    assert_nested_opt_levels(c, "row E")
     let r = compile_test_helpers.compile_and_run(src_nested_opt("Some(\"z\")"), "jefm9w_re_run")
     if r.exit_code != 0 { io.println("FAIL: row E runtime — {r.err_out}") }
     assert(r.exit_code == 0)

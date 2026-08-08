@@ -1249,7 +1249,13 @@ pub fn mono_phys_base(base: Str) -> Str {
 }
 pub let mut mono_instances: List[MonoInstance] = []
 pub let mut mono_idx: Map[Str, Int] = Map()
-pub let mut mono_rev_idx: Map[Str, Int] = Map()
+// br cr4gqk: count of newly minted c_names that collided with an EXISTING different
+// (base, args) entry's c_name — a mangle_generic_name collision slipping past the escape
+// fix. Must be 0 corpus-wide; see register_mono_instance_ann and dbg_trace channel
+// "monodedup". The reverse index this used to be silently swallowed by (mono_rev_idx) is
+// retired: it answered c_name -> entry non-injectively, which is the root cause this
+// tripwire now catches instead of hiding.
+pub let mut mono_cname_collisions: Int = 0
 
 // ms4ctb: polymorphic-impl template registry. Keyed on the trait-qualified
 // composed base `mangle_impl_method_q(recv, trait, method)` (e.g.
@@ -4473,14 +4479,72 @@ pub fn type_arg_name_from_ct(ct: Int) -> Str {
     ICE_SEG_ERASED_SLOT
 }
 
+// br cr4gqk: escapes a single mangle_generic_name segment (the base, or one comma-split
+// `args` segment) so that joining segments is INJECTIVE. Without this, plain concatenation
+// with "_" collapses distinct (base, args) pairs the moment either side already contains an
+// underscore: ("A","B,C,D"), ("A_B","C,D"), ("A","B_C,D") and ("A","B,C_D") all join to
+// "A_B_C_D".
+//
+// THE SCHEME: escape a literal "_" to the two-char sequence "_1", and join segments with
+// the two-char separator "_0" (not a bare "_"). A single "_" byte in the OUTPUT is now
+// always immediately followed by either "0" (it is a separator) or "1" (it is one escaped
+// literal underscore) — decoding never needs to reason about run lengths or parity, because
+// the escape marker and the separator marker are different characters.
+//
+// WHY NOT DOUBLE "_" AND JOIN WITH A BARE "_" (the first thing tried, and wrong): doubling
+// makes a run of k consecutive underscores decode as k/2 literals plus one separator iff k
+// is odd, which sounds injective per-run but is NOT injective across a SEGMENT BOUNDARY:
+// mangle("Box_", "Int") and mangle("Box", "_Int") both produce "Box___Int" (three
+// underscores either way), because the run straddles where a trailing escaped underscore
+// from one segment meets the separator meets a leading escaped underscore from the next —
+// two different splits of the same 3-run. Doubling has no way to mark WHICH underscore in
+// a boundary-adjacent run is the separator; _0/_1 sidesteps the question entirely by never
+// producing an ambiguous bare run in the first place.
+//
+// Cost of the fix: unlike doubling, this changes the spelling of EVERY joined name,
+// including the underscore-free majority (mangle_generic_name("Box","Int") is now
+// "Box_0Int", not "Box_Int") — doubling's one attractive property (leaving underscore-free
+// names byte-identical) could not be salvaged once the boundary case was found. See
+// tests/test_cr4gqk_mangle_generic_name_injective.bl for the injectivity sweep, including
+// the boundary-adjacent regression row.
+//
+// Rejected alternative: length-prefixing segments is also injective and has the same
+// "changes every name" cost as _0/_1, with no offsetting advantage — _0/_1 keeps the
+// changed names closer to the original spelling (same length class) and needs no length
+// arithmetic to decode. Rejected alternative: renaming only the segment that is detected to
+// collide is not a pure function of (base, args) alone (it depends on what else happened to
+// be registered first), which breaks decisions/generic-mono-ownership-per-module.md:74-79 —
+// two modules instantiating the same generic type must mangle it identically so the linker
+// merges the two TUs' copies into one symbol; a collision-dependent rename cannot promise
+// that.
+//
+// Pure Str arithmetic only — this sits below typecheck in the DAG, the same constraint
+// merge_arg_tids documents above (:4259).
+pub fn escape_mono_seg(s: Str) -> Str {
+    if s.index_of("_") < 0 {
+        return s
+    }
+    let mut result = ""
+    let mut i = 0
+    while i < s.len() {
+        if s.byte_at(i) == 95 { // '_'
+            result = result.concat("_1")
+        } else {
+            result = result.concat(s.substr(i, 1))
+        }
+        i = i + 1
+    }
+    result
+}
+
 pub fn mangle_generic_name(base: Str, args: Str) -> Str {
-    let mut result = base
+    let mut result = escape_mono_seg(base)
     let mut i = 0
     let mut _seg_start = 0
     while i <= args.len() {
         if i == args.len() || args.byte_at(i) == 44 { // ','
             let seg = args.substr(_seg_start, i - _seg_start)
-            result = result.concat("_").concat(seg)
+            result = result.concat("_0").concat(escape_mono_seg(seg))
             _seg_start = i + 1
         }
         i = i + 1
@@ -4541,23 +4605,23 @@ pub fn register_mono_instance(base: Str, args: Str, arg_tids: List[Int]) -> Str 
 // for a single node id because two annotations naming one instance memoize the same interned
 // tid (that residual "first non- -1 wins" is recorded on the ticket as benign).
 pub fn register_mono_instance_ann(base: Str, args: Str, arg_tids: List[Int], ann: Int) -> Str ! Codegen.Register {
-    let existing = lookup_mono_instance(base, args)
-    if existing != "" {
-        match mono_rev_idx.get(existing) {
-            Some(idx) => {
-                let m = mono_instances.get(idx).unwrap()
-                let merged = merge_arg_tids(m.arg_tids, arg_tids, base, args)
-                let keep_ann = if m.ann == -1 { ann } else { m.ann }
-                // The overwhelmingly common dedup hit is a second identical registration
-                // (ann == -1, same arg_tids), where the join is the identity — skip the
-                // rewrite so a repeated struct literal does not rebuild the entry.
-                if keep_ann != m.ann || arg_tids_differ(merged, m.arg_tids) {
-                    mono_instances.set(idx, MonoInstance { base: m.base, args: m.args, c_name: m.c_name, arg_tids: merged, ann: keep_ann })
-                }
-            }
-            None => {}
+    let idx = lookup_mono_instance_idx(base, args)
+    if idx != -1 {
+        // br cr4gqk: update the entry the injective mono_idx lookup ALREADY found, rather
+        // than re-deriving it through mangle_generic_name's c_name (the old mono_rev_idx
+        // detour). c_name is not guaranteed injective before the escape fix in
+        // mangle_generic_name, and even after it, re-deriving an index through a second
+        // map is a needless indirection this dedup hit has no reason to take.
+        let m = mono_instances.get(idx).unwrap()
+        let merged = merge_arg_tids(m.arg_tids, arg_tids, base, args)
+        let keep_ann = if m.ann == -1 { ann } else { m.ann }
+        // The overwhelmingly common dedup hit is a second identical registration
+        // (ann == -1, same arg_tids), where the join is the identity — skip the
+        // rewrite so a repeated struct literal does not rebuild the entry.
+        if keep_ann != m.ann || arg_tids_differ(merged, m.arg_tids) {
+            mono_instances.set(idx, MonoInstance { base: m.base, args: m.args, c_name: m.c_name, arg_tids: merged, ann: keep_ann })
         }
-        return existing
+        return m.c_name
     }
     // The C symbol is built off the PHYSICAL base (module-prefixed for a
     // cross-module generic struct), and so is the dedup key — else two modules'
@@ -4567,8 +4631,17 @@ pub fn register_mono_instance_ann(base: Str, args: Str, arg_tids: List[Int], ann
     // byte-identical to before.
     let phys_base = mono_phys_base(base)
     let c_name = mangle_generic_name(phys_base, args)
+    // br cr4gqk tripwire: a newly minted c_name that already names a DIFFERENT
+    // (base, args) entry would be a mangle_generic_name collision slipping through the
+    // escape fix. Checked via the same linear scan lookup_mono_base uses, since the
+    // reverse index that used to answer this cheaply (mono_rev_idx) is retired precisely
+    // because it could not answer it CORRECTLY. Post-fix this must read 0 corpus-wide.
+    let prior = lookup_mono_base(c_name)
+    if prior.base != "" {
+        mono_cname_collisions = mono_cname_collisions + 1
+        dbg_trace("monodedup", "cname-collision c_name={c_name} new_base={base} new_args={args} existing_base={prior.base} existing_args={prior.args}")
+    }
     mono_idx.insert(phys_base.concat("\t").concat(args), mono_instances.len())
-    mono_rev_idx.insert(c_name, mono_instances.len())
     mono_instances.push(MonoInstance { base: base, args: args, c_name: c_name, arg_tids: arg_tids, ann: ann })
     c_name
 }
@@ -4579,13 +4652,23 @@ pub type MonoLookup {
     arg_tids: List[Int]
 }
 
+// br cr4gqk: linear scan on c_name, first match wins. Was a mono_rev_idx (Map[Str,Int])
+// lookup; that map was keyed on mangle_generic_name's output, which is not guaranteed
+// injective independent of the escape fix in mangle_generic_name (two different (base,
+// args) registrations could always in principle mangle to the same c_name — the escape
+// fix makes that far rarer but a linear scan is the only form that CANNOT itself introduce
+// a second non-injective index on top of the fix). Mirrors register_mono_fn's existing
+// linear-scan precedent (:4349) instead of adding a second, differently-shaped registry
+// design. Measured cost: see task ci-profile; is_mono_struct_instance is the warm-ish
+// caller.
 pub fn lookup_mono_base(c_name: Str) -> MonoLookup {
-    match mono_rev_idx.get(c_name) {
-        Some(idx) => {
-            let m = mono_instances.get(idx).unwrap()
+    let mut i = 0
+    while i < mono_instances.len() {
+        let m = mono_instances.get(i).unwrap()
+        if m.c_name == c_name {
             return MonoLookup { base: m.base, args: m.args, arg_tids: m.arg_tids }
         }
-        None => {}
+        i = i + 1
     }
     MonoLookup { base: "", args: "", arg_tids: [] }
 }
@@ -4797,15 +4880,26 @@ pub fn struct_concrete_args_from_target(sname: Str, segs: List[Str]) -> Str {
     args
 }
 
-pub fn lookup_mono_instance(base: Str, args: Str) -> Str {
+// br cr4gqk: the injective mono_idx lookup, as a raw index rather than a c_name — the
+// index register_mono_instance_ann needs to update an existing entry directly, without
+// re-deriving it through the non-injective c_name (mono_rev_idx used to be that re-derive
+// step, and re-deriving through a non-injective key is exactly how one instance's
+// arg_tids got written into another's, br cr4gqk). Returns -1 on a miss.
+pub fn lookup_mono_instance_idx(base: Str, args: Str) -> Int {
     // Key on the PHYSICAL base to match register_mono_instance's keying (q4etvt);
     // phys_base == base for fns and same-module structs, so unchanged for them.
     let key = mono_phys_base(base).concat("\t").concat(args)
     match mono_idx.get(key) {
-        Some(idx) => return mono_instances.get(idx).unwrap().c_name
+        Some(idx) => return idx
         None => {}
     }
-    ""
+    -1
+}
+
+pub fn lookup_mono_instance(base: Str, args: Str) -> Str {
+    let idx = lookup_mono_instance_idx(base, args)
+    if idx == -1 { return "" }
+    mono_instances.get(idx).unwrap().c_name
 }
 
 pub fn is_trait_type(name: Str) -> Int {
@@ -6826,8 +6920,9 @@ pub fn compound_tag_ct(tag: Str) -> Int {
 
 // True when `tag` names a registered monomorphized struct/enum INSTANCE (e.g.
 // `Box_Int`) — one whose mono base resolves to a struct/enum type. The mono
-// registry (mono_rev_idx) is populated at registration time, EARLIER than the
-// mono struct typedef is physically emitted into struct_reg_set. A consumer that
+// registry (mono_instances, scanned by lookup_mono_base) is populated at
+// registration time, EARLIER than the mono struct typedef is physically emitted into
+// struct_reg_set. A consumer that
 // runs during statement emission before the typedef flush (a match arm binding a
 // carrier-of-struct-instance payload, br gw4cyh) therefore can't rely on
 // is_struct_type — but the instance is already in the registry, so this recovers

@@ -56,6 +56,41 @@ fn assert_no_erasure(c: Str, label: Str) {
     assert_lacks(c, "blink_map_void", "{label} / erased Map carrier field")
 }
 
+// The single GKV instance in a one-instantiation program must be the Int,Str one — and
+// POSITIONALLY so: "Int" must occur before "Str" in the name. Reading the ORDER rather
+// than the exact spelling is what makes this a transposition detector without pinning
+// where the mangler puts its separators.
+fn assert_gkv_int_str(c: Str, label: Str) {
+    let names = compile_test_helpers.mono_typedef_names(c, "GKV")
+    if names.len() != 1 { io.println("FAIL: {label} / want exactly 1 GKV instance, got {names.len()}") }
+    assert(names.len() == 1)
+    let n = names.get(0).unwrap()
+    let at_int = n.index_of("Int")
+    let at_str = n.index_of("Str")
+    if at_int < 0 || at_str < 0 || at_int > at_str {
+        io.println("FAIL: {label} / GKV instance '{n}' does not spell Int then Str positionally")
+    }
+    assert(at_int >= 0)
+    assert(at_str >= 0)
+    assert(at_int < at_str)
+}
+
+// The fn-symbol twin of the above, over mono_fn_names.
+fn assert_mk_int_str(c: Str, label: Str) {
+    let names = compile_test_helpers.mono_fn_names(c, "mk")
+    if names.len() != 1 { io.println("FAIL: {label} / want exactly 1 mk mono, got {names.len()}") }
+    assert(names.len() == 1)
+    let n = names.get(0).unwrap()
+    let at_int = n.index_of("Int")
+    let at_str = n.index_of("Str")
+    if at_int < 0 || at_str < 0 || at_int > at_str {
+        io.println("FAIL: {label} / mk mono '{n}' does not spell Int then Str positionally")
+    }
+    assert(at_int >= 0)
+    assert(at_str >= 0)
+    assert(at_int < at_str)
+}
+
 fn gkv_decls() -> Str {
     let mut s = "type GKV[K, V] \{ m: Map[K, V] }\n"
     s = s.concat("fn mk[K, V]() -> GKV[K, V] \{ GKV \{ m: Map() } }\n")
@@ -98,8 +133,8 @@ test "the two-tparam generic-fn return does not ICE under an annotated let" {
 
 test "two-tparam annotated let monomorphizes to GKV_Int_Str with the i64 kops" {
     let c = compile_test_helpers.compile_and_emit_c(src_annotated(), "jq85k8_annotated_c")
-    assert_has(c, "blink_GKV_Int_Str", "annotated let / struct mono name")
-    assert_has(c, "blink_mk_Int_Str", "annotated let / fn mono name")
+    assert_gkv_int_str(c, "annotated let")
+    assert_mk_int_str(c, "annotated let")
     assert_has(c, "blink_map_new(&blink_kops_i64)", "annotated let / Int-key kops")
     assert_lacks(c, "blink_kops_str", "annotated let / must not hash an Int key as a string")
     assert_no_erasure(c, "annotated let")
@@ -120,8 +155,8 @@ test "an unannotated two-tparam binding infers both slots from a later use" {
 
 test "backward-inferred two-tparam binding monomorphizes and round-trips" {
     let c = compile_test_helpers.compile_and_emit_c(src_backward(), "jq85k8_backward_c")
-    assert_has(c, "blink_GKV_Int_Str", "backward infer / struct mono name")
-    assert_has(c, "blink_mk_Int_Str", "backward infer / fn mono name")
+    assert_gkv_int_str(c, "backward infer")
+    assert_mk_int_str(c, "backward infer")
     assert_has(c, "blink_map_new(&blink_kops_i64)", "backward infer / Int-key kops")
     assert_lacks(c, "blink_kops_str", "backward infer / must not hash an Int key as a string")
     assert_no_erasure(c, "backward infer")
@@ -131,8 +166,17 @@ test "backward-inferred two-tparam binding monomorphizes and round-trips" {
 
 // ── slot order: the two tparams must bind POSITIONALLY, not as a set ─────────
 // A transposition, or a collapse of the two instantiations onto one C type, is
-// invisible to every row above. The needles are typedef TERMINATORS: the bare
-// substring `blink_GKV_Int_Str` would also match inside a longer mangled name.
+// invisible to every row above. Read as: TWO distinct typedef names, one spelling
+// Int-before-Str and one spelling Str-before-Int. A collapse leaves one name; a
+// transposition leaves two names on the same side of the order test.
+
+// True iff `first` occurs before `second` in `n`, with both present.
+fn spells_in_order(n: Str, first: Str, second: Str) -> Bool {
+    let a = n.index_of(first)
+    let b = n.index_of(second)
+    if a < 0 || b < 0 { return false }
+    a < b
+}
 
 test "GKV[Int,Str] and GKV[Str,Int] mint two distinct positional typedefs" {
     let mut src = gkv_decls()
@@ -147,10 +191,40 @@ test "GKV[Int,Str] and GKV[Str,Int] mint two distinct positional typedefs" {
     src = src.concat("    assert_eq(b.m.get(\"lo\").unwrap(), 256)\n")
     src = src.concat("}\n")
     let c = compile_test_helpers.compile_and_emit_c(src, "jq85k8_slotorder_c")
-    assert_has(c, "} blink_GKV_Int_Str;", "slot order / Int,Str typedef")
-    assert_has(c, "} blink_GKV_Str_Int;", "slot order / Str,Int typedef")
-    assert_has(c, "blink_mk_Int_Str", "slot order / Int,Str fn mono")
-    assert_has(c, "blink_mk_Str_Int", "slot order / Str,Int fn mono")
+    let tnames = compile_test_helpers.mono_typedef_names(c, "GKV")
+    if tnames.len() != 2 { io.println("FAIL: slot order / want 2 GKV typedefs, got {tnames.len()}") }
+    assert(tnames.len() == 2)
+    assert(tnames.get(0).unwrap() != tnames.get(1).unwrap())
+    let mut t_is = false
+    let mut t_si = false
+    let mut i = 0
+    while i < tnames.len() {
+        let n = tnames.get(i).unwrap()
+        if spells_in_order(n, "Int", "Str") { t_is = true }
+        if spells_in_order(n, "Str", "Int") { t_si = true }
+        i = i + 1
+    }
+    if !t_is { io.println("FAIL: slot order / no Int-then-Str GKV typedef") }
+    if !t_si { io.println("FAIL: slot order / no Str-then-Int GKV typedef") }
+    assert(t_is)
+    assert(t_si)
+    let fnames = compile_test_helpers.mono_fn_names(c, "mk")
+    if fnames.len() != 2 { io.println("FAIL: slot order / want 2 mk monos, got {fnames.len()}") }
+    assert(fnames.len() == 2)
+    assert(fnames.get(0).unwrap() != fnames.get(1).unwrap())
+    let mut f_is = false
+    let mut f_si = false
+    let mut j = 0
+    while j < fnames.len() {
+        let n = fnames.get(j).unwrap()
+        if spells_in_order(n, "Int", "Str") { f_is = true }
+        if spells_in_order(n, "Str", "Int") { f_si = true }
+        j = j + 1
+    }
+    if !f_is { io.println("FAIL: slot order / no Int-then-Str mk mono") }
+    if !f_si { io.println("FAIL: slot order / no Str-then-Int mk mono") }
+    assert(f_is)
+    assert(f_si)
     assert_no_erasure(c, "slot order")
     let r = compile_test_helpers.compile_and_run(src, "jq85k8_slotorder_run")
     assert_eq(r.exit_code, 0)

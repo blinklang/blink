@@ -1,0 +1,172 @@
+// br cr4gqk: unit rows for compile_test_helpers.mono_typedef_names/has_mono_instance.
+//
+// WHY THIS HELPER EXISTS. The mangle_generic_name fix (escape_mono_seg, _0/_1 scheme)
+// changes the C spelling of every multi-segment mono name (Box_Int -> Box_0Int), which
+// broke ~25 existing test files that pinned the OLD literal spelling as a witness that
+// "this instantiation was actually monomorphized, not erased/collapsed." Re-pinning the
+// NEW literal spelling would just move the same brittleness onto a different string —
+// any future mangling-scheme change breaks the same tests again for no semantic reason.
+//
+// mono_typedef_names(c, base) reads the STRUCTURE of a typedef's closing line
+// (`} blink_<name>;`) rather than a specific mangling scheme's spelling: it finds every
+// distinct typedef whose name is exactly `blink_{base}` or starts with `blink_{base}_`,
+// with no assumption about how the tail after that is mangled. Callers use it for
+// presence ("at least one instance exists": has_mono_instance) and distinctness ("two
+// different instantiations produced two different C types": compare the returned names).
+//
+// mono_fn_names is the function-symbol twin, scheme-agnostic via underscore-stripping.
+// poly_impl_fn_names is a THIRD, narrower helper for poly-impl-on-builtin bases whose name
+// already contains '_' before mangling (e.g. "List_Echoable_echo") — underscore-stripping
+// can't disambiguate escaped digits from real characters for that shape, so it is the one
+// helper here that knowingly couples to today's _0/_1 escape scheme. See its doc comment.
+
+import compile_test_helpers
+import std.io
+
+fn assert_true(cond: Bool, label: Str) {
+    if !cond { io.println("FAIL: {label}") }
+    assert(cond)
+}
+
+test "mono_typedef_names: finds a single bare struct typedef" {
+    let c = compile_test_helpers.compile_and_emit_c(
+        "type Box[T] \{ v: T }\nfn main() \{ let b = Box \{ v: 3 }\n assert_eq(b.v, 3) }\n",
+        "cr4gqk_helper_bare"
+    )
+    let names = compile_test_helpers.mono_typedef_names(c, "Box")
+    assert_true(names.len() == 1, "exactly one Box instance found")
+    assert_true(names.get(0).unwrap().starts_with("blink_Box"), "found name starts with blink_Box")
+}
+
+test "mono_typedef_names: two sibling instantiations produce two distinct names" {
+    let mut s = "type GKV[K, V] \{ m: Map[K, V] }\n"
+    s = s.concat("fn a() -> GKV[Int, Str] \{\n")
+    s = s.concat("    let m: Map[Int, Str] = Map()\n")
+    s = s.concat("    GKV \{ m: m }\n")
+    s = s.concat("}\n")
+    s = s.concat("fn b() -> GKV[Str, Int] \{\n")
+    s = s.concat("    let m: Map[Str, Int] = Map()\n")
+    s = s.concat("    GKV \{ m: m }\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{ let g = a()\n let h = b() }\n")
+    let c = compile_test_helpers.compile_and_emit_c(s, "cr4gqk_helper_siblings")
+    let names = compile_test_helpers.mono_typedef_names(c, "GKV")
+    assert_true(names.len() == 2, "exactly two GKV instances found")
+    let n0 = names.get(0).unwrap()
+    let n1 = names.get(1).unwrap()
+    assert_true(n0 != n1, "the two GKV instances have distinct C names")
+}
+
+test "mono_typedef_names: a base with no emitted instance returns empty" {
+    let c = compile_test_helpers.compile_and_emit_c(
+        "fn main() \{ assert(1 == 1) }\n",
+        "cr4gqk_helper_absent"
+    )
+    let names = compile_test_helpers.mono_typedef_names(c, "NeverUsed")
+    assert_true(names.len() == 0, "no instance found for an unused base")
+}
+
+test "mono_typedef_names: a base name that is a PREFIX of another base's name is not confused" {
+    // Box and BoxOfBoxes both exist; Box's own line must not be matched by a
+    // scan for "BoxOfBoxes", and a scan for "Box" must not accidentally match
+    // "BoxOfBoxes"'s typedef too (that would require the char right after the
+    // base to be '_' or end-of-name, which BoxOfBoxes's 'O' fails).
+    let mut s = "type Box[T] \{ v: T }\n"
+    s = s.concat("type BoxOfBoxes[T] \{ v: T }\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let a = Box \{ v: 3 }\n")
+    s = s.concat("    let b = BoxOfBoxes \{ v: 4 }\n")
+    s = s.concat("    assert_eq(a.v, 3)\n")
+    s = s.concat("    assert_eq(b.v, 4)\n")
+    s = s.concat("}\n")
+    let c = compile_test_helpers.compile_and_emit_c(s, "cr4gqk_helper_prefix")
+    let box_names = compile_test_helpers.mono_typedef_names(c, "Box")
+    assert_true(box_names.len() == 1, "Box scan finds exactly its own instance, not BoxOfBoxes's")
+    assert_true(box_names.get(0).unwrap().starts_with("blink_Box_"), "Box's own instance name")
+}
+
+test "has_mono_instance: true when present, false when absent" {
+    let c = compile_test_helpers.compile_and_emit_c(
+        "type Box[T] \{ v: T }\nfn main() \{ let b = Box \{ v: 3 }\n assert_eq(b.v, 3) }\n",
+        "cr4gqk_helper_has"
+    )
+    assert_true(compile_test_helpers.has_mono_instance(c, "Box") == 1, "Box is present")
+    assert_true(compile_test_helpers.has_mono_instance(c, "NeverUsed") == 0, "NeverUsed is absent")
+}
+
+test "mono_fn_names: a monomorphized struct return type does not shadow the fn name" {
+    // fn mk[T]() -> RGT[T] emits e.g. `blink_RGT_0Int blink_mk_0Int(void) {` — the
+    // RETURN TYPE also spells "blink_" and comes first on the line. mono_fn_names must
+    // find the function's own "blink_mk_..." name, not misidentify the return type's
+    // "blink_RGT_..." as the function name and then miss "mk" entirely.
+    let mut s = "type RGT[T] \{ v: T }\n"
+    s = s.concat("fn mk[T](x: T) -> RGT[T] \{ RGT \{ v: x } }\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let a = mk(3)\n")
+    s = s.concat("    let b = mk(\"s\")\n")
+    s = s.concat("    assert_eq(a.v, 3)\n")
+    s = s.concat("    assert(b.v == \"s\")\n")
+    s = s.concat("}\n")
+    let c = compile_test_helpers.compile_and_emit_c(s, "cr4gqk_helper_fn_struct_ret")
+    let names = compile_test_helpers.mono_fn_names(c, "mk")
+    assert_true(names.len() == 2, "exactly two mk instances found despite the struct-return-type shadow")
+    assert_true(names.get(0).unwrap() != names.get(1).unwrap(), "the two mk instances have distinct C names")
+}
+
+test "mono_fn_names: a plain generic fn gets one entry per concrete instantiation" {
+    let mut s = "fn id[T](x: T) -> T \{ x }\n"
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let a = id(3)\n")
+    s = s.concat("    let b = id(\"s\")\n")
+    s = s.concat("    assert_eq(a, 3)\n")
+    s = s.concat("    assert(b == \"s\")\n")
+    s = s.concat("}\n")
+    let c = compile_test_helpers.compile_and_emit_c(s, "cr4gqk_helper_fn")
+    let names = compile_test_helpers.mono_fn_names(c, "id")
+    assert_true(names.len() == 2, "exactly two id instances found")
+    assert_true(names.get(0).unwrap() != names.get(1).unwrap(), "the two id instances have distinct C names")
+}
+
+test "poly_impl_fn_names: a monomorphized struct return type does not shadow the fn name" {
+    // Same shadow hazard as mono_fn_names above, but for a poly-impl-on-builtin base: the
+    // impl's own return type can be a mono struct that also spells the escaped "blink_"
+    // prefix and precedes the fn name on the definition line.
+    let mut s = "type RGT[T] \{ v: T }\n"
+    s = s.concat("trait Wrapper[T] \{\n")
+    s = s.concat("    fn wrap(self, x: T) -> RGT[T]\n")
+    s = s.concat("}\n")
+    s = s.concat("impl[T] Wrapper[T] for List[T] \{\n")
+    s = s.concat("    fn wrap(self, x: T) -> RGT[T] \{ RGT \{ v: x } }\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let ints: List[Int] = [1, 2, 3]\n")
+    s = s.concat("    let a = ints.wrap(7)\n")
+    s = s.concat("    let strs: List[Str] = [\"a\", \"b\"]\n")
+    s = s.concat("    let b = strs.wrap(\"z\")\n")
+    s = s.concat("    assert_eq(a.v, 7)\n")
+    s = s.concat("    assert(b.v == \"z\")\n")
+    s = s.concat("}\n")
+    let c = compile_test_helpers.compile_and_emit_c(s, "cr4gqk_helper_poly_impl_fn_struct_ret")
+    let names = compile_test_helpers.poly_impl_fn_names(c, "List_Wrapper_wrap")
+    assert_true(names.len() == 2, "exactly two List_Wrapper_wrap instances found despite the struct-return-type shadow")
+    assert_true(names.get(0).unwrap() != names.get(1).unwrap(), "the two instances have distinct C names")
+}
+
+test "poly_impl_fn_names: a base containing underscores (poly-impl-on-builtin shape) is found" {
+    let mut s = "trait Echoable[T] \{\n"
+    s = s.concat("    fn echo(self, x: T) -> T\n")
+    s = s.concat("}\n")
+    s = s.concat("impl[T] Echoable[T] for List[T] \{\n")
+    s = s.concat("    fn echo(self, x: T) -> T \{ x }\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let ints: List[Int] = [1, 2, 3]\n")
+    s = s.concat("    let _i = ints.echo(7)\n")
+    s = s.concat("    let strs: List[Str] = [\"a\", \"b\"]\n")
+    s = s.concat("    let _s = strs.echo(\"z\")\n")
+    s = s.concat("}\n")
+    let c = compile_test_helpers.compile_and_emit_c(s, "cr4gqk_helper_fn_underscore_base")
+    let names = compile_test_helpers.poly_impl_fn_names(c, "List_Echoable_echo")
+    assert_true(names.len() == 2, "exactly two List_Echoable_echo instances found")
+    assert_true(names.get(0).unwrap() != names.get(1).unwrap(), "the two instances have distinct C names")
+}
