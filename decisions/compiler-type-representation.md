@@ -46,6 +46,24 @@ All 5 experts independently converged on the same fundamental design: **interned
 
 **Shared concern:** Interning map key construction must be canonical. Compound types constructed in different orders must produce the same key. Inference variables should not be interned — only fully-resolved types.
 
+**Implementation status (br v76b0b):** Q3 is implemented for `ty_pool` compound types
+(`List`, `Option`, `Result`, `Map`, `Set`, `Tuple`, struct/enum instances, `Fn`, and typevars).
+Each `make_*_type` constructor delegates to a shared `ty_intern` (`Map[Str,Int]`) keyed on the
+raw child tids as stored — never `tc_resolve`'d, never over recursive structure. `new_type`
+itself remains un-interned, so `make_metavar` (fresh inference variables) can never be swept
+into interning, per the "inference variables should not be interned" concern above. Corpus-wide
+same-type mono-registry slot-conflicts went from 25 to 0.
+
+**Known incompleteness, accepted for v1:** a compound minted wrapping an unbound metavar (e.g.
+`Option[α]` from a bare `None`) is correctly left un-interned at construction time. If that
+metavar is later bound to a concrete type, the existing compound tid still carries the old,
+metavar-keyed identity — a later canonical construction of the same now-resolved type mints a
+second tid. Closing this needs rehash-on-bind plus a tid-forwarding/union-find layer (no
+existing holder of the old tid gets rewritten). Tracked as follow-up `98nsfa`. Until it lands,
+`tc_tid_same_type` (structural comparison) remains the sanctioned way to compare tids that may
+predate a metavar bind site — `a == b` is not a safe universal replacement, only a fast path
+for canonically-constructed compounds.
+
 ---
 
 ### AI-First Review

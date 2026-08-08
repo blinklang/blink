@@ -572,11 +572,100 @@ fn new_type(kind: Int, name: Str) -> Int {
     idx
 }
 
-fn make_list_type(inner: Int) -> Int {
-    let t = new_type(TK_LIST, "List")
+// ── Compound-type interning (br v76b0b) ──────────────────────────────
+//
+// decisions/compiler-type-representation.md:39-47 (Q3, 5-0) mandates full interning:
+// "type equality is integer comparison." Mirrors tp_intern/tp_alloc
+// (codegen_types.bl:78-92), extended with the variadic ty_param_list slice ty_pool
+// additionally carries.
+//
+// THE CENTRAL INVARIANT: the key is built over the RAW CHILD TIDS AS STORED — never
+// tc_resolve'd, never over a child's recursive structure, and ABOVE ALL never with an
+// unbound metavar normalized to a common token. make_metavar mints a FRESH, never-interned
+// TK_UNKNOWN entry for every unannotated `Map()` / `Set()` / `None` / `[]`, and that
+// freshness is exactly what lets each one bind independently later (textbook HM). If the
+// key ever collapsed two different unbound metavars onto one string, `let a: Option[Int] =
+// None; let b: Option[Str] = None` would share one alpha — binding it via `a` would
+// silently retype `b`. new_type/make_metavar are deliberately left OUT of the intern path
+// so this can never happen by construction; do not "improve" this by normalizing unbound
+// tids in the key. tests/test_v76b0b_ty_pool_interns_compounds.bl Half B is the permanent
+// tripwire for this invariant and must never be deleted.
+//
+// Safe to share a hit across callers because: (1) a compound ty_pool entry is NEVER
+// mutated post-construction except bind_metavar, which is gated to TK_UNKNOWN entries only
+// and therefore never touches a compound; (2) ty_param_list is append-only (push/clear,
+// no set/pop), so a compound's params slice is frozen at construction.
+//
+// The key is deliberately FINER than tc_tid_same_type on two axes (finer only ever merges
+// less, never wrongly collapses): `name` is part of the key for EVERY kind (not just
+// TK_STRUCT/TK_ENUM/TK_TYPEVAR), and `name` is RAW, never strip_module_qualifier'd —
+// stripping would collapse `helper.Box[Int]` with `Box[Int]` across modules, the exact
+// cross-module collision mono_phys_base (codegen_types.bl:1246) exists to prevent (br
+// q4etvt). Coarser-than-tc_tid_same_type is the one direction that would be unsound.
+//
+// Sound but INCOMPLETE, accepted for v1: interning `Option[alpha]` then later binding
+// alpha := Int does not re-key that entry, so a subsequent make_option_type(TYPE_INT)
+// mints a second tid. Closing this needs a rehash-on-bind plus tid-forwarding, which does
+// not exist yet (follow-up filed, br v76b0b Stage 4). This does not weaken the measured
+// goal: the corpus's same-type conflicts are annotation-shaped, with no metavar involved,
+// and bottom-up interning fixes those outright.
+let mut ty_intern: Map[Str, Int] = Map()
+
+fn ty_intern_args_key(args: List[Int]) -> Str {
+    let mut s = ""
+    let mut i = 0
+    while i < args.len() {
+        s = "{s},{args.get(i).unwrap()}"
+        i = i + 1
+    }
+    s
+}
+
+fn ty_intern_key(kind: Int, name: Str, inner1: Int, inner2: Int, args: List[Int]) -> Str {
+    "{kind}|{name}|{inner1}|{inner2}|{ty_intern_args_key(args)}"
+}
+
+// Interning ctor for the fixed-arity shapes (List/Option/Result/Map/Set): at most two
+// scalar inner slots, no ty_param_list involvement.
+fn ty_intern_simple(kind: Int, name: Str, inner1: Int, inner2: Int) -> Int {
+    let key = ty_intern_key(kind, name, inner1, inner2, [])
+    match ty_intern.get(key) {
+        Some(v) => return v
+        None => {}
+    }
+    let t = new_type(kind, name)
     let e = ty_pool.get(t).unwrap()
-    ty_pool.set(t, TypePoolEntry { inner1: inner, ..e })
+    ty_pool.set(t, TypePoolEntry { inner1: inner1, inner2: inner2, ..e })
+    ty_intern.insert(key, t)
     t
+}
+
+// Interning ctor for the variadic shapes (Tuple/Fn/struct-instance/enum-instance): the
+// key is computed from the caller's already-materialized `args` BEFORE any push, so a
+// HIT touches ty_param_list not at all — there is no rollback path to get wrong, because
+// there is nothing to roll back. A MISS pushes exactly once, in the original order,
+// reproducing the pre-interning body byte-for-byte.
+fn ty_intern_variadic(kind: Int, name: Str, inner1: Int, args: List[Int]) -> Int {
+    let key = ty_intern_key(kind, name, inner1, -1, args)
+    match ty_intern.get(key) {
+        Some(v) => return v
+        None => {}
+    }
+    let t = new_type(kind, name)
+    let start = ty_param_list.len()
+    let mut i = 0
+    while i < args.len() {
+        ty_param_list.push(args.get(i).unwrap())
+        i = i + 1
+    }
+    let e = ty_pool.get(t).unwrap()
+    ty_pool.set(t, TypePoolEntry { inner1: inner1, params_start: start, params_count: args.len(), ..e })
+    ty_intern.insert(key, t)
+    t
+}
+
+fn make_list_type(inner: Int) -> Int {
+    ty_intern_simple(TK_LIST, "List", inner, -1)
 }
 
 // `pub` FOR THE TEST ONLY — same precedent as make_fn_type below: proving the
@@ -585,17 +674,11 @@ fn make_list_type(inner: Int) -> Int {
 // no surface program can do (an unbound metavar never survives to a fully-typechecked
 // program — it either binds or raises E0301 at the boundary).
 pub fn make_option_type(inner: Int) -> Int {
-    let t = new_type(TK_OPTION, "Option")
-    let e = ty_pool.get(t).unwrap()
-    ty_pool.set(t, TypePoolEntry { inner1: inner, ..e })
-    t
+    ty_intern_simple(TK_OPTION, "Option", inner, -1)
 }
 
 pub fn make_result_type(ok_type: Int, err_type: Int) -> Int {
-    let t = new_type(TK_RESULT, "Result")
-    let e = ty_pool.get(t).unwrap()
-    ty_pool.set(t, TypePoolEntry { inner1: ok_type, inner2: err_type, ..e })
-    t
+    ty_intern_simple(TK_RESULT, "Result", ok_type, err_type)
 }
 
 // `pub` FOR THE TEST ONLY — zero non-test callers, same precedent as resolve_mono_slot
@@ -606,34 +689,23 @@ pub fn make_result_type(ok_type: Int, err_type: Int) -> Int {
 // reach here — they lower to TK_TYPEVAR("Fn") — so there is no surface syntax that
 // produces a TK_FN tid, hence no fixture alternative (br hsgsbp).
 pub fn make_fn_type(ret_type: Int, param_types: List[Int]) -> Int {
-    let t = new_type(TK_FN, "Fn")
-    let start = ty_param_list.len()
-    let mut i = 0
-    while i < param_types.len() {
-        ty_param_list.push(param_types.get(i).unwrap())
-        i = i + 1
-    }
-    let e = ty_pool.get(t).unwrap()
-    ty_pool.set(t, TypePoolEntry { inner1: ret_type, params_start: start, params_count: param_types.len(), ..e })
-    t
+    ty_intern_variadic(TK_FN, "Fn", ret_type, param_types)
 }
 
+// INTERNS (br v76b0b Stage 3) — safe because tc_tid_same_type compares TK_TYPEVAR by
+// name alone (:11672-11673 above), so name-keying IS its equality, and a TK_TYPEVAR entry
+// is never mutated post-construction (same invariant as every other ty_intern_* ctor).
+// Isolated as its own stage/commit: changes tid identity for generic BASE shapes, a wider
+// blast radius than compound instances — revert this stage alone if the monodedup
+// counters move the wrong way or task ci reddens; Stages 1-2 already deliver the ticket's
+// measured goal independent of this one.
 fn make_typevar(name: Str) -> Int {
-    new_type(TK_TYPEVAR, name)
+    ty_intern_simple(TK_TYPEVAR, name, -1, -1)
 }
 
 // `pub` FOR THE TEST ONLY — see make_option_type above.
 pub fn make_tuple_type(elem_types: List[Int]) -> Int {
-    let t = new_type(TK_TUPLE, "Tuple")
-    let start = ty_param_list.len()
-    let mut i = 0
-    while i < elem_types.len() {
-        ty_param_list.push(elem_types.get(i).unwrap())
-        i = i + 1
-    }
-    let e = ty_pool.get(t).unwrap()
-    ty_pool.set(t, TypePoolEntry { params_start: start, params_count: elem_types.len(), ..e })
-    t
+    ty_intern_variadic(TK_TUPLE, "Tuple", -1, elem_types)
 }
 
 // A monomorphized struct instance (`Box[Int]`): a fresh TK_STRUCT entry named
@@ -645,60 +717,42 @@ pub fn make_tuple_type(elem_types: List[Int]) -> Int {
 // Q2 (5-0) mandates to close the "concrete inner lives only in codegen's string
 // mono registry" split.
 //
-// It does NOT intern — fresh entry per call, mirroring make_tuple_type. That was
-// once justified by "no emit reader consumes it yet" (br kvn6w8, when this was a
-// foundation-only spike read solely by the tc_tid_struct_arg_* accessors); the
-// premise has since EXPIRED — br wzv72h made the tid path primary at every
-// generic-fn seam and br qnpb2d makes it authoritative at the struct-literal mono
-// seam. So the non-interning is now a measured cost, not a free deferral: 25 of the
-// 43 mono-registry slot-conflicts on the corpus are two tids for ONE type minted
-// here and at the sibling make_*_type fns (br v76b0b). Until that lands, no
-// consumer may treat tid equality as type equality — compare with tc_tid_same_type.
-fn make_struct_instance_type(base_name: Str, arg_types: List[Int]) -> Int {
-    let t = new_type(TK_STRUCT, base_name)
-    let start = ty_param_list.len()
-    let mut i = 0
-    while i < arg_types.len() {
-        ty_param_list.push(arg_types.get(i).unwrap())
-        i = i + 1
-    }
-    let e = ty_pool.get(t).unwrap()
-    ty_pool.set(t, TypePoolEntry { params_start: start, params_count: arg_types.len(), ..e })
-    t
+// INTERNS (br v76b0b) — two calls with the same (base_name, arg_types) share one tid.
+// Was "fresh entry per call" once justified by "no emit reader consumes it yet" (br
+// kvn6w8, when this was a foundation-only spike read solely by the tc_tid_struct_arg_*
+// accessors); that premise EXPIRED — br wzv72h made the tid path primary at every
+// generic-fn seam and br qnpb2d makes it authoritative at the struct-literal mono seam.
+// See the ty_intern_* helpers above `new_type` for the interning invariant.
+// tc_tid_same_type remains the sanctioned STRUCTURAL comparison for the residual case
+// interning does not close (a compound built over a since-bound metavar) — do not
+// deprecate it here.
+//
+// `pub` FOR THE TEST ONLY — same precedent as make_option_type above:
+// tests/test_v76b0b_ty_pool_interns_compounds.bl constructs struct-instance tids directly
+// to prove the interning invariant at the ctor boundary, not just end-to-end through a
+// compiled program.
+pub fn make_struct_instance_type(base_name: Str, arg_types: List[Int]) -> Int {
+    ty_intern_variadic(TK_STRUCT, base_name, -1, arg_types)
 }
 
 // A generic-enum INSTANCE tid (`Tree[Int]`), the enum analogue of
 // make_struct_instance_type (jjhnf3). Records the concrete type-args variadically
 // in ty_param_list[params_start..] so tc_tid_struct_arg_* / tc_tid_struct_mono_name
 // (all kind-agnostic once widened to TK_ENUM) can recover them at codegen, minting
-// the mono typedef `blink_Tree_Int` instead of the erased bare `blink_Tree`.
+// the mono typedef `blink_Tree_Int` instead of the erased bare `blink_Tree`. INTERNS
+// (br v76b0b) — see make_struct_instance_type above.
 fn make_enum_instance_type(base_name: Str, arg_types: List[Int]) -> Int {
-    let t = new_type(TK_ENUM, base_name)
-    let start = ty_param_list.len()
-    let mut i = 0
-    while i < arg_types.len() {
-        ty_param_list.push(arg_types.get(i).unwrap())
-        i = i + 1
-    }
-    let e = ty_pool.get(t).unwrap()
-    ty_pool.set(t, TypePoolEntry { params_start: start, params_count: arg_types.len(), ..e })
-    t
+    ty_intern_variadic(TK_ENUM, base_name, -1, arg_types)
 }
 
 
 // `pub` FOR THE TEST ONLY — see make_option_type above.
 pub fn make_map_type(key_type: Int, value_type: Int) -> Int {
-    let t = new_type(TK_MAP, "Map")
-    let e = ty_pool.get(t).unwrap()
-    ty_pool.set(t, TypePoolEntry { inner1: key_type, inner2: value_type, ..e })
-    t
+    ty_intern_simple(TK_MAP, "Map", key_type, value_type)
 }
 
 fn make_set_type(elem_type: Int) -> Int {
-    let t = new_type(TK_SET, "Set")
-    let e = ty_pool.get(t).unwrap()
-    ty_pool.set(t, TypePoolEntry { inner1: elem_type, ..e })
-    t
+    ty_intern_simple(TK_SET, "Set", elem_type, -1)
 }
 
 // ── Metavariables (Hindley-Milner inference discipline) ─────────────
@@ -4420,6 +4474,12 @@ fn validate_trait_impls(program: Int) ! TypeCheck.Register, Diag.Report {
 fn init_types() ! TypeCheck.Register {
     ty_pool.clear()
     ty_param_list.clear()
+    // Load-bearing for the daemon/LSP (long-lived processes, daemon.bl / lsp.bl): a
+    // surviving intern map would hand out tids keyed against the PREVIOUS, since-cleared
+    // pool on the next check_types() call — out-of-bounds unwrap panic or a silently
+    // wrong shared type. tests/test_v76b0b_ty_pool_interns_compounds.bl Half D is the
+    // only test shape that can catch a dropped clear here (task test forks per file).
+    ty_intern.clear()
     tc_node_tid.clear()
     tc_ret_mint_start.clear()
     let mut nti = 0
@@ -11599,12 +11659,17 @@ pub fn tc_seg_from_tid(tid: Int) -> Option[Str] {
 // STRUCTURAL type equality over two tids: same kind, same nominal name where the name is
 // load-bearing, same inners, same type-args element-wise.
 //
-// tid INEQUALITY IS NOT TYPE INEQUALITY. new_type appends unconditionally and no
-// make_*_type interns, so constructing Option[Box[Int]] twice mints two tids for one type
-// (decisions/compiler-type-representation.md:39-47 mandates interning; it is not
-// implemented). Anything that wants to know whether two tids denote the same type must ask
-// STRUCTURALLY — never `a == b`, and never by comparing the erasing mono-CSV spellings
-// (tc_tid_to_c_tag drops a container's element, so Set[Int] and Set[Str] both spell "Set").
+// tid INEQUALITY IS NOT ALWAYS TYPE INEQUALITY, even after ty_pool interning (br v76b0b):
+// make_*_type now interns canonically-constructed compounds behind ty_intern (see the
+// comment above `new_type`), so two calls with the same (kind, name, inners, args) share
+// one tid — closing the corpus's measured same-type conflict population. What interning
+// does NOT close: a compound built over a metavar that is later BOUND is not re-keyed, so
+// `Option[alpha]` interned before `alpha := Int` binds remains a separate tid from a
+// fresh `make_option_type(TYPE_INT)` call (needs tid-forwarding, not yet built — br
+// v76b0b Stage 4 follow-up). So `a == b` is still a sound but INCOMPLETE test of type
+// equality. Anything that wants a complete answer must still ask STRUCTURALLY — never by
+// comparing the erasing mono-CSV spellings (tc_tid_to_c_tag drops a container's element,
+// so Set[Int] and Set[Str] both spell "Set").
 //
 // Deliberately conservative on the two axes where a wrong answer misleads:
 //   - the nominal name is compared only for TK_STRUCT / TK_ENUM / TK_TYPEVAR, the kinds
@@ -11646,9 +11711,13 @@ pub fn tc_tid_same_type(a0: Int, b0: Int) -> Bool {
 // codegen_types, BELOW typecheck in the DAG, and must stay pure — it can see that two
 // concrete tids disagree but not whether they MEAN different things.
 //
-// The split is the whole point. `same_type` is the ty_pool non-interning artefact: two
-// handles on one type, so whichever the join keeps lowers identically — measured as the
-// MAJORITY of the corpus population, and harmless even once the tid is authoritative.
+// The split is the whole point. `same_type` was, before br v76b0b, the ty_pool
+// non-interning artefact and the MAJORITY of the corpus population; ty_pool now interns
+// canonically-constructed compounds (see the ty_intern_* helpers above `new_type`), so
+// that population is driven toward 0. The residual `same_type` hits are the accepted
+// incompleteness: a compound built over a metavar that later binds is not re-keyed, so
+// two handles can still denote one type. Either handle still lowers identically, so this
+// remains harmless even once the tid is authoritative.
 // `diff_type` is one (base, args) key that genuinely collapsed two different types; a
 // single stored tid cannot be per-instantiation identity for all of them, which is exactly
 // what br qnpb2d must not assume it can read.

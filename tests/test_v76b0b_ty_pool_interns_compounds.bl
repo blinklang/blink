@@ -1,0 +1,283 @@
+// br v76b0b: ty_pool must intern compound types so tid EQUALITY implies type equality
+// for canonically-constructed compounds. Today it does not: new_type (typecheck.bl:569)
+// appends unconditionally and no make_*_type interns, so constructing Option[Box[Int]]
+// twice mints two different tids for one type. Measured: 21 of 31 mono-registry
+// slot-conflicts on the corpus are exactly this — two tid NUMBERS for one (base, args)
+// slot denoting the SAME type. DECISIONS.md:284 (Q3, 5-0) and
+// decisions/compiler-type-representation.md:39-47 mandate full interning; this closes
+// that gap for ty_pool compounds.
+//
+// THE CENTRAL INVARIANT THIS FILE GUARDS: the intern key is over RAW CHILD TIDS AS
+// STORED — never tc_resolve'd, never recursive, and ABOVE ALL never with an unbound
+// metavar normalized to a common token. Four sites mint a compound wrapping a FRESH
+// metavar (Map(), Set(), None, []); if the key ever collapsed two different unbound
+// metavars, `let a: Option[Int] = None; let b: Option[Str] = None` would share one alpha
+// and silently retype `b` the moment either binds. Half B below is the permanent
+// tripwire for that and must never be deleted, per the ticket.
+//
+// Harness pattern mirrors test_qnpb2d_diff_type_injective_tripwire.bl. NOTE the trap
+// that harness's own comment calls out: harvesting node tids into a Map[Str,Int] keyed
+// by type string OVERWRITES on collision, so it would misreport 1 distinct tid even at
+// HEAD where two are actually minted. Half A therefore counts DISTINCT tids directly by
+// scanning a plain List, never via a map that dedups as a side effect of insertion.
+
+import compiler.{compile_to_program}
+import typecheck.{
+    check_types, tc_lookup_node_tid, tc_type_str, tc_classify_mono_conflicts,
+    make_struct_instance_type, make_option_type, make_metavar
+}
+import codegen.{generate}
+import codegen_types.{mono_slot_conflicts_same_type}
+import parser.{nodes}
+import std.io
+// Bare, load-bearing for the same reason as in test_qnpb2d_diff_type_injective_tripwire.bl:
+// codegen_types resolves several globals it cannot import out of the MERGED program, and
+// codegen_expr is the smallest root whose transitive closure closes those back-references.
+import codegen_expr
+
+fn assert_eq_int(got: Int, want: Int, label: Str) {
+    if got != want { io.println("FAIL: {label} — got {got}, want {want}") }
+    assert(got == want)
+}
+
+fn assert_true(got: Bool, label: Str) {
+    if !got { io.println("FAIL: {label} — expected true") }
+    assert(got)
+}
+
+// Harvest the FIRST node tid whose type-string matches `want`, from whatever program is
+// currently the live check_types() result. -1 if not observed.
+fn find_tid_by_str(want: Str) -> Int {
+    let mut idx = 0
+    let n = nodes.len()
+    while idx < n {
+        let tid = tc_lookup_node_tid(idx)
+        if tid >= 0 && tc_type_str(tid) == want {
+            return tid
+        }
+        idx = idx + 1
+    }
+    -1
+}
+
+// Count DISTINCT tid values among every node whose type-string matches `want`. Deliberately
+// a linear scan over a plain List, not a Map insert — a Map keyed by type-string would
+// dedup identical strings on its own and could never observe the bug this file exists to
+// catch (see file header).
+fn count_distinct_tids_by_str(want: Str) -> Int {
+    let mut distinct: List[Int] = []
+    let mut idx = 0
+    let n = nodes.len()
+    while idx < n {
+        let tid = tc_lookup_node_tid(idx)
+        if tid >= 0 && tc_type_str(tid) == want {
+            let mut found = false
+            let mut j = 0
+            while j < distinct.len() {
+                if distinct.get(j).unwrap() == tid { found = true }
+                j = j + 1
+            }
+            if !found { distinct.push(tid) }
+        }
+        idx = idx + 1
+    }
+    distinct.len()
+}
+
+fn int_tid_probe_src() -> Str {
+    #"fn main() {
+    let x: Int = 1
+    assert(x == 1)
+}
+"#
+}
+
+// A concrete TYPE_INT tid, harvested rather than hardcoded — TYPE_INT is a runtime global
+// populated by init_types(), not a compile-time constant this test module can import.
+fn harvest_type_int_tid() -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let path = "build/v76b0b_inttid_probe.bl"
+    write_file(path, int_tid_probe_src())
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    fs.remove(path)
+    let tid = find_tid_by_str("Int")
+    assert_true(tid >= 0, "harvest_type_int_tid: observed an Int tid")
+    tid
+}
+
+// ── Half A — positive claim: two structurally identical compounds share one tid ─────
+
+test "Half A direct-ctor: two Box[Int] and two Option[Box[Int]] each share one tid" {
+    let int_tid = harvest_type_int_tid()
+
+    let box_int_1 = make_struct_instance_type("Box", [int_tid])
+    let box_int_2 = make_struct_instance_type("Box", [int_tid])
+    assert_eq_int(box_int_2, box_int_1, "halfA/direct-ctor: two Box[Int] share one tid")
+
+    let opt_box_1 = make_option_type(box_int_1)
+    let opt_box_2 = make_option_type(box_int_2)
+    assert_eq_int(opt_box_2, opt_box_1, "halfA/direct-ctor: two Option[Box[Int]] share one tid")
+}
+
+fn e2e_probe_src() -> Str {
+    #"type Box[T] {
+    v: T
+}
+
+fn make_a() -> Option[Box[Int]] {
+    Some(Box { v: 1 })
+}
+
+fn make_b() -> Option[Box[Int]] {
+    Some(Box { v: 2 })
+}
+
+fn main() {
+    let a = make_a()
+    let b = make_b()
+    assert(a.is_some())
+    assert(b.is_some())
+}
+"#
+}
+
+test "Half A end-to-end: Option[Box[Int]] minted at two independent call sites shares one tid" {
+    let path = "build/v76b0b_e2e_probe.bl"
+    write_file(path, e2e_probe_src())
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    fs.remove(path)
+
+    let distinct = count_distinct_tids_by_str("Option[Box[Int]]")
+    assert_true(distinct >= 1, "halfA/e2e: at least one Option[Box[Int]] tid observed")
+    assert_eq_int(distinct, 1, "halfA/e2e: all Option[Box[Int]] occurrences share one tid")
+}
+
+// ── Half B — negative claim: compounds over FRESH metavars must NOT share a tid ─────
+// PERMANENT TRIPWIRE for R1 (see file header). Do not delete this test.
+
+test "Half B direct: Option wrapping two independently-minted fresh metavars must differ" {
+    let opt_1 = make_option_type(make_metavar())
+    let opt_2 = make_option_type(make_metavar())
+    assert_true(opt_1 != opt_2, "halfB/direct: Option[fresh alpha] must NOT share a tid across two mints")
+}
+
+fn surface_metavar_probe_src() -> Str {
+    #"fn main() {
+    let a: Option[Int] = None
+    let b: Option[Str] = None
+    assert(a.is_none())
+    assert(b.is_none())
+}
+"#
+}
+
+test "Half B surface syntax: distinct None annotations must not share an alpha" {
+    let path = "build/v76b0b_metavar_probe.bl"
+    write_file(path, surface_metavar_probe_src())
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    fs.remove(path)
+
+    let a_tid = find_tid_by_str("Option[Int]")
+    let b_tid = find_tid_by_str("Option[Str]")
+    assert_true(a_tid != -1, "halfB/surface: Option[Int] tid observed for `a`")
+    assert_true(b_tid != -1, "halfB/surface: Option[Str] tid observed for `b`")
+    assert_true(a_tid != b_tid, "halfB/surface: `a` and `b` must NOT share a tid — sharing would mean one alpha got bound by both annotations")
+}
+
+// ── Half C — counter delta: mono_slot_conflicts_same_type driven toward 0 ──────────
+//
+// Reuses the exact shape of tests/test_1452w4_option_struct_instance_carrier.bl, the
+// fixture the ticket's own trace example is measured against: an annotation-only
+// `Option[Box[Int]] = Some(...)` mints one tid, and passing that value through a generic
+// fn (`ident(o)`) mints a SECOND, independent tid for the identical type at the call's
+// mono-registration seam — that pair is what merge_arg_tids records as a same-type
+// slot-conflict. A toy program with no generic-fn call site never reaches
+// merge_arg_tids at all, so it would read 0 even at HEAD and prove nothing.
+
+fn half_c_probe_src() -> Str {
+    #"type Box[T] {
+    value: T
+}
+
+fn ident[T](v: T) -> T {
+    v
+}
+
+fn use_a() -> Int {
+    let o: Option[Box[Int]] = Some(Box { value: 9 })
+    let o2 = ident(o)
+    o2.unwrap().value
+}
+
+fn use_b() -> Int {
+    let o: Option[Box[Int]] = None
+    let o2 = ident(o)
+    if o2.is_none() { 0 } else { o2.unwrap().value }
+}
+
+fn main() {
+    assert(use_a() == 9)
+    assert(use_b() == 0)
+}
+"#
+}
+
+test "Half C: same-type mono-conflict counter delta is zero" {
+    // Drain anything an earlier test in this binary left pending, so the delta below is
+    // attributable solely to this probe's own compile (same discipline as
+    // test_qnpb2d_diff_type_injective_tripwire.bl's "Drain anything the harvest left
+    // pending" comment).
+    tc_classify_mono_conflicts()
+    let s0 = mono_slot_conflicts_same_type
+
+    let path = "build/v76b0b_halfc_probe.bl"
+    write_file(path, half_c_probe_src())
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    // merge_arg_tids (the mechanism mono_slot_conflicts_same_type counts) only runs
+    // during codegen's register_mono_fn, not during check_types — must actually generate.
+    generate(program)
+    fs.remove(path)
+
+    tc_classify_mono_conflicts()
+    assert_eq_int(mono_slot_conflicts_same_type - s0, 0, "halfC/no same-type conflicts once ty_pool interns")
+}
+
+// ── Half D — reset proof: run the direct-ctor harness twice in one process ─────────
+// Without ty_intern.clear() in init_types, a surviving intern map (daemon/LSP long-lived
+// process shape) hands out tids minted against a PREVIOUS, since-cleared pool.
+
+fn dummy_compile_probe_src() -> Str {
+    #"type Box[T] {
+    v: T
+}
+
+fn main() {
+    let b = Box { v: 1 }
+    assert(b.v == 1)
+}
+"#
+}
+
+fn compile_fresh(path: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    write_file(path, dummy_compile_probe_src())
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    fs.remove(path)
+}
+
+test "Half D: interning survives a second check_types() run in the same process" {
+    compile_fresh("build/v76b0b_d1.bl")
+    let int_tid_1 = harvest_type_int_tid()
+    let box1a = make_struct_instance_type("Box", [int_tid_1])
+    let box1b = make_struct_instance_type("Box", [int_tid_1])
+    assert_eq_int(box1b, box1a, "halfD/run1: interns")
+
+    compile_fresh("build/v76b0b_d2.bl")
+    let int_tid_2 = harvest_type_int_tid()
+    let box2a = make_struct_instance_type("Box", [int_tid_2])
+    let box2b = make_struct_instance_type("Box", [int_tid_2])
+    assert_eq_int(box2b, box2a, "halfD/run2: interns")
+}
