@@ -197,6 +197,10 @@ verbatim — **never fired at all**. Per `feedback_corpus_sweep_is_not_coverage`
 sweep is an unexercised tap and proves nothing: the shapes must be constructed by hand
 before the three missing arms can be called live or theoretical.
 
+**Resolved — see `twq9kz` in the progress log.** The shapes were constructed. The three arms are
+**dead by caller gating**, and the exercise turned up a blocker for Stage 3's planned replacement
+of this very function.
+
 ## Build-mode attribution
 
 The plan requires attributing sweeps in both build modes. The honest split achieved:
@@ -667,7 +671,7 @@ One line contradicting itself — it names Channel as iterable while refusing a 
 `type_to_str` had no arm either and rendered the typevar's bare name.
 
 **Why it gates Stage 3.** Measured on the `tydiv` channel, these four are the cells where the
-**flat universe is strictly more informative than the tid**:
+flat universe *appears* strictly more informative than the tid:
 
 ```
 var=cl tid=? flat=Fn(int64_t(*)(const blink_closure*, int64_t))
@@ -680,6 +684,19 @@ Stage 3 flips authority onto the tid and Stage 4 deletes the flat fields. At the
 would be **nothing to read**, so the divergence counter could never reach 0. Hence direction
 (a), construct — not direction (b), delete the variants and let codegen keep a private universe,
 which would make "the tid is the single authority" false by construction.
+
+**"Appears", because that `Int` is a fabrication — found while starting `e0wmt6`, and it
+strengthens the case rather than weakening it.** `src/codegen_stmt.bl:3508` reads
+`get_var_channel_inner(val_str)` and, on `-1`, falls back to `set_var_channel(name, CT_INT)`;
+`set_var_handle(name, CT_INT)` sits directly above it. So `flat=Channel[Int]` is not information
+recovered from the program, it is the `sv_tp` erasure factory guessing — and the guess is right
+across the whole corpus only because every Channel in `tests/` happens to carry `Int`. It is
+also a live silent miscompile (br `hgd2az`): `let ch: Channel[Str] = Channel(4)` +
+`for v in ch` prints `got 94225742992982`, because the receive seam emits
+`int64_t v = (int64_t)(intptr_t)__chrecv_0` whatever the element is, and a `Channel[Float]`
+fails in the C compiler rather than with a Blink diagnostic. Post-vag3wc the *tid* for the
+annotated form is correct while the flat field is a fabricated `Int`, which is the collapse's
+thesis stated as a bug: 429 divergence cells and a green 624-file suite all agreed with a lie.
 
 The four did not land the same way, and that is the substance of the ticket:
 
@@ -777,6 +794,223 @@ new-root-is-a-new-root bookkeeping recorded under sskpk8 above.
 Also filed: the four-`tid=?` measurement in this section is why `e0wmt6` (`infer_type` has no
 arm for `ChannelNew` / `AsyncSpawn` / `AwaitExpr` / `AsyncScope`) depended on this ticket — it
 had nothing to construct until now.
+
+### e0wmt6 — a statement-position `async.scope` body was never typechecked (CLOSED)
+
+Opened as the four `bucket=missing` cells in this map — `tid=- flat=-`, the only bucket with no
+fallback once Stage 4 deletes the flat fields. Reproducing it turned up something strictly worse
+in the same code path, and the ticket split into two defects.
+
+**Defect 1 — the walk gap. `async.scope { ... }` in STATEMENT position was not typechecked at
+all.** Not "typed as Unknown": not visited.
+
+```
+fn main() {
+    async.scope {
+        let bad: Int = "not an int"
+        io.println("{bad}")
+    }
+}
+$ build/blink check hole.bl
+ok: hole.bl                 <- no error
+$ build/blink run hole.bl
+not an int                  <- a Str lives in an Int-declared variable, and prints
+```
+
+The same body in INITIALIZER position (`let v = async.scope { ... }`) reported `TypeError`
+correctly, so **position alone decided whether code was checked** — which is what makes this a
+bug rather than a known limitation. The blast radius is every per-statement check in the
+language, not just types.
+
+Root cause, and the safeguard that was supposed to prevent it: a statement-position
+`async.scope` arrives ExprStmt-wrapped and lands in `tc_check_body`'s ExprStmt arm
+(`src/typecheck.bl:10131`), which re-dispatches into a body only for kinds the predicate claims:
+
+```blink
+if is_block_bearing(vk) || vk == NodeKind.MethodCall { tc_check_body(val) }
+```
+
+`infer_type` had no `AsyncScope` arm, so it returned Unknown without visiting the body, and
+`is_block_bearing` (`src/ast.bl:187`) listed IfExpr / MatchExpr / WhileLoop / LoopExpr / ForIn /
+WithBlock — **not AsyncScope**. That arm's own comment already says the predicate is "the single
+source of truth for THIS re-dispatch so a future block-bearing kind cannot silently lose
+statement-walking coverage here." The mechanism was right; `async.scope` was never registered in
+it. The fix is one line plus the reason: a kind that bears a block answers 1.
+
+**Defect 2 — publication.** Three `infer_type_uncached` arms: `AsyncScope` -> its block's tail
+type; `AwaitExpr` -> the operand's `Handle` inner (reading the operand from `obj`, not `value` —
+br `1b7ggq`); and `async.spawn` -> `make_handle_type(...)`. The spawn arm goes in the
+**MethodCall** arm, because `NodeKind.AsyncSpawn` **has no producer anywhere in `src/` or
+`lib/`** — `async.spawn(f)` parses as an ordinary `MethodCall{method: "spawn", obj: Ident
+"async"}`. That is the same dead-variant shape as `TyKind.Closure` in vag3wc, and it cost real
+time: four handled call sites read as coverage for a node kind that never exists (br `q6ytta` to
+delete it). The arm is also gated on `nr_get_type("async") == TYPE_UNKNOWN` so a user variable
+named `async` cannot be hijacked. `tc_closure_declared_ret` (`:2100`) answers `TYPE_VOID` for an
+un-annotated closure, so the corpus form `async.spawn(fn() { compute(100) })` must infer the
+body tail instead — annotation first, body second.
+
+**This ticket needed vag3wc.** Until `TyKind.Handle` was constructible there was nothing to
+answer `.await` or `spawn` with; `make_handle_type` did not exist.
+
+| | pre (post-vag3wc) | post | delta |
+|---|---|---|---|
+| shape cells | 429 | 423 | **−6** |
+| diverge occurrences | 4888 | 4799 | **−89** |
+| agree occurrences | 344457 | 344688 | +231 |
+| missing | 40 | **14** | **−26** |
+
+Monolithic, both sides on the same 872-file basis (both new test roots excluded from both).
+`missing` fell by 26, not the 4 the ticket was opened for: the walk gap was suppressing a tid for
+*every* `let` in a statement-position scope, so fixing the walk published far more than the four
+named cells. Eight `tid=?` cells were eliminated — the whole `Handle[...]` family
+(`Handle[Int]`, `Handle[Str]`, `Handle[Bool]`, `Handle[Float]`, `Handle[List[Int]]`,
+`Handle[Option[Int]]`, `Handle[Result[Int, Str]]`, `Handle[]`).
+
+**The sskpk8 trap, reproduced exactly, and why the +231 is not noise.** Of the 18 files whose
+counters moved beyond it, **26 files moved by precisely `+4 agree, 0 diverge, 0 missing`** — the
+26 compiler-importing roots × the 4 new `let` statements this fix adds to `src/typecheck.bl`, all
+four of which agree. 26 × 4 = 104 of the +231; the remaining +127 is real conversion in the 18
+async-touching files. Per-file deltas are exactly uniform, as they were for sskpk8. New
+*compiler* source adds new *sites* to every root.
+
+**Two cells appeared, and both are the flat universe's errors becoming visible** — the reverse of
+a regression:
+
+```
+tid=Handle[Point] flat=Handle[]      tests/test_async_spawn_types.bl  var=h
+tid=Handle[Void]  flat=Handle[Int]   tests/test_async_codegen.bl      var=_h
+```
+
+The first: the flat pair cannot hold a struct element at all, so it spells the inner as *empty*.
+The second: `let _h = async.spawn(fn() { do_nothing() })` in a test titled **"void spawn"**, where
+`do_nothing()` is `fn do_nothing() { let _ = 1 }` — the tid's `Void` is correct and the flat's
+`Int` is the fabricated default at `codegen_stmt.bl:3508`, the same fabrication documented under
+vag3wc. These two cells are Stage 3 work with the answer already known.
+
+`tests/test_e0wmt6_async_let_tids.bl`: 9 rows, **red 4/9 before, green 9/9 after**. Half A pins
+the walk gap by diagnostic *count* (statement position reports 1, the initializer-position
+control reports 1, a correct body reports 0 — the last row is what proves the widened walk does
+not invent errors). Half B pins the four tids with three *different* result types (Str, Bool,
+Int) so a spawn arm that ignored the closure and answered a fixed inner cannot pass. Half C runs
+a real fork-join (sums to 42) and an `async.scope { 7 }`. `task regen` green; `task ci` green —
+**625 test files, 625 passed, 0 failed, 0 build errors**.
+
+**All 14 residual `missing` cells are now attributed**, and 13 of them are one newly-found bug:
+
+- **br `pgc3d9` (filed, 13 cells)** — closure and handler bodies passed as **call arguments** are
+  never typechecked, and it is **not async-specific**. `take(fn() { let bad: Int = "not an int" })`
+  passes `check` *and* `run`, and prints `not an int`. Position does not rescue it here (unlike
+  this ticket, initializer position is equally unchecked), and a `let`-bound closure *is* checked
+  — so the body is walkable, it is only unwalked as an argument. It also exposes a **check/run
+  divergence**: a `.map` closure body is re-walked by a later mono pass, so `run` reports the
+  `TypeError` that `check` misses, i.e. `blink check` is unsound relative to `blink run`. Cells:
+  `err_text` ×2 (`src/cli.bl:2189`, `src/build_stdlib.bl` — our own source), `i` ×1
+  (`test_async_channels.bl`), `x` ×10 (`tests/fmt/*_handler_*`, the `handler MyEff { ... }`
+  argument form).
+- **br `twq9kz` (1 cell)** — `copy_list_compound_elem.src` in `test_yvq32w`, unrelated and
+  already tracked.
+
+**ChannelNew deliberately excluded → br `w3v2e6`** (blocked on `hgd2az`). It reads `tid=?`
+(diverge), not `missing`, so it was never one of this ticket's cells. `Channel(4)` names no
+element anywhere in the expression: `Channel[Unknown]` would launder an unknown into a structured
+type, and the correct `Channel[α]` makes every `let ch = Channel(4)` an `E0301` under the gqg3rk
+boundary check until the element is bound from `.send`/`.recv`/`for-in`. It is an inference task,
+not a publication one — and its codegen half (`hgd2az`, `Channel[T]` is int64-only) would turn a
+newly-published element tid into a wider set of silent miscompiles.
+
+### twq9kz — the three missing arms are dead by caller gating (CLOSED), and Stage 3's one-liner does not work as written
+
+The last Stage 3 prerequisite. `copy_list_compound_elem` (`src/codegen_methods.bl:1083`) is this
+plan's named archetype — 26 lines of hand case analysis to copy one variable's type to another,
+with no `CT_SET` / `CT_LIST` / `CT_STRUCT` arm, three open 03p551 cells verbatim. The question was
+whether those absences are a live hole or a theoretical one.
+
+**They are unreachable, and not because the shapes do not occur — because every caller gates on
+exactly the arms that exist.**
+
+```
+src/codegen_stmt.bl:3699     if expr_list_elem_type == CT_OPTION || CT_RESULT || CT_MAP
+src/codegen_stmt.bl:9156     identical gate (the second copy of this block)
+src/codegen_methods.bl:4354  if carrier != "" — and carrier comes from list_compound_carrier_tag
+                             (src/codegen_expr.bl:165), which returns non-empty ONLY for
+                             CT_OPTION and CT_RESULT
+```
+
+`compound_tag_ct` (`codegen_types.bl:7079`) likewise knows only `Option_` / `Result_` / `Map_`.
+So no constructible source can reach the `else if` — "add three arms" would have been a **no-op
+fix** on three tickets.
+
+Constructed by hand rather than inferred from corpus silence, per
+`feedback_corpus_sweep_is_not_coverage`: a `List[Set[Int]]` and a `List[List[Int]]` rebind emit
+**no `copy_list_compound_elem` row at all**, while the `List[Option[Int]]` control emits one. The
+tap is not broken; the function is not entered.
+
+**The Stage 3 blocker.** All three reaching call sites report `bucket=missing`, and the `var=`
+field says why:
+
+```
+bucket=missing site=copy_list_compound_elem.src var=blink_u_mk_opt() tid=- flat=-
+bucket=missing site=copy_list_compound_elem.src var=blink_u_mk_res() tid=- flat=-
+bucket=missing site=copy_list_compound_elem.src var=blink_u_mk_map() tid=- flat=-
+```
+
+`src` is not a Blink variable — it is `expr_result_str`, the **emitted C expression text** for the
+producing call. `get_var_ty("blink_u_mk_opt()")` is `< 0` because nothing ever stamped a tid on a
+key like that. So the plan's stated replacement —
+
+```blink
+set_var_ty(dst, get_var_ty(src))    // Stage 3, as written
+```
+
+— would copy `-1` and lose everything these three arms carry today. **Stage 3 must source the tid
+from the producing call NODE's memoized tid, not from a var keyed on the emitted expression
+string.** That is a real change to the sub-step, found before it was written rather than after it
+broke the corpus.
+
+One thing this does *not* prove, and the instrument is the reason to be careful: in the `missing`
+branch `ty_div_trace` is called with a hardcoded `-1` for the flat argument
+(`src/typecheck.bl:11330`), so the `flat=-` in a `missing` row is **not a measurement** and says
+nothing about whether a backing `ScopeVar` exists. Only the `tid=-` half is real. Whether the
+three live arms currently do useful work or are already no-ops at these sites is therefore still
+open — but it does not change the Stage 3 conclusion, which rests on the missing tid alone.
+
+`tests/test_twq9kz_list_compound_elem_rebind.bl`: **6 rows, green from the start** — a regression
+net for a function about to be rewritten, not a bug fix, and recorded as such. Rows 1-3 pin the
+three live arms through the unannotated `let g = mk_*()` rebind that reaches them (leaving them
+unannotated is load-bearing: an annotation re-stamps the element independently and bypasses the
+copy), and each pins *both* variants — `None` as well as `Some`, `Err` payload as well as `Ok` —
+since an element erased to a boxed int64 still reads correctly on the happy arm. Rows 4-5 pin the
+two gate-excluded shapes that work anyway, so Stage 3's unconditional copy must not regress them.
+Row 6 pins the one tuple form that works. Verified against the instrument: rows 1-3 fire `.src`,
+rows 4-6 fire nothing, `.no_arm` stays silent.
+
+`task ci` green — **626 test files, 626 passed, 0 failed**; fmt 1472 passed.
+
+**Bug found while constructing, filed not fixed: br `6g6g7t`.** A `List[(Int, Str)]` returned from
+a function loses its tuple element, **silently**:
+
+```
+fn make_tups() -> List[(Int, Str)] { let l: List[(Int, Str)] = []; l.push((7, "seven")); l }
+let first = make_tups().get(0).unwrap()
+io.println("n={first.0} s={first.1}")     ->  n=<value> s=<value>
+```
+
+Emitted C degrades the element to the boxed-int64 default and the interpolation falls back to a
+literal placeholder: `const int64_t first = _ounw_2.value;` then
+`blink_str_format("n=%s s=%s", "<value>", "<value>")`. A typed use instead escapes as a **raw C
+error** — `const void n = first._0;` → *request for member '_0' in something not a structure or
+union*. Two controls locate it: a **local** list is fine, and an **annotated** rebind is fine
+(row 6), so the receiver temp of a `List[(..)]`-returning call is where the tuple dies.
+
+Its Set/List siblings fail **loudly** instead — `unresolved method '.len' on type Set[Int]`,
+`... on type List[Int]` — codegen naming the receiver correctly and having nothing to dispatch,
+i.e. family C / `tavvwj`. The tuple case is the same mechanism with a silent outcome, because a
+tuple degrades to a scalar that `Display` will print as `<value>` rather than refuse. Expected to
+be subsumed by Stage 3 — the diagnostics *spell* `Set[Int]` and `List[Int]` correctly, which is
+direct evidence typecheck holds the right type at those nodes and only the flat pair cannot carry
+it to the consumer.
+
+**Stage 3's prerequisite list is now empty.**
 
 ## Appendix — all 428 shape cells
 

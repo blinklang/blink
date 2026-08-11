@@ -8526,6 +8526,35 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         let obj_node = node_obj(node)
         let method = node_method(node)
 
+        // br e0wmt6: `async.spawn(f)` is Handle[T] for f's return type T. It parses as an
+        // ordinary MethodCall on the `async` module — NodeKind.AsyncSpawn has no producer
+        // anywhere in src/ or lib/ and is a dead variant — so the answer belongs here rather
+        // than in an AsyncSpawn arm. The nr_get_type guard mirrors codegen's mc_obj_is_local
+        // check: a local named `async` must not be mistaken for the module.
+        if obj_node != -1 && node_kind(obj_node) == NodeKind.Ident && node_name(obj_node) == "async" && method == "spawn" {
+            if nr_get_type("async") == TYPE_UNKNOWN {
+                let sp_args = node_args(node)
+                if sp_args != -1 && sublist_length(sp_args) >= 1 {
+                    let sp_cls = sublist_get(sp_args, 0)
+                    if node_kind(sp_cls) == NodeKind.Closure {
+                        // A DECLARED return wins; otherwise infer the body's tail, because
+                        // tc_closure_declared_ret answers TYPE_VOID for an un-annotated
+                        // closure and the corpus form is `async.spawn(fn() { compute(100) })`
+                        // — taking Void there would make every `.await` on it Void. The body
+                        // is only inferred for a zero-param closure (spawn's shape), so no
+                        // param binding is needed for the walk to be sound.
+                        if node_type_ann(sp_cls) != -1 {
+                            return make_handle_type(tc_closure_declared_ret(sp_cls))
+                        }
+                        let sp_params = node_params(sp_cls)
+                        if sp_params == -1 || sublist_length(sp_params) == 0 {
+                            return make_handle_type(infer_type(node_body(sp_cls)))
+                        }
+                    }
+                }
+            }
+        }
+
         // 8v0cpr: a variant name (e.g. `Key`) can shadow an enum type name when
         // `Key` is also a variant of another enum (`Event.Key`). For qualified
         // construction `Enum.Variant(...)`, resolve the obj as a TYPE first when
@@ -9362,6 +9391,26 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
 
     if kind == NodeKind.RangeLit {
         return make_list_type(TYPE_INT)
+    }
+
+    // br e0wmt6. `async.scope { ... }` evaluates to its block's tail, exactly like the bare
+    // block it wraps, so the Block arm already computes the answer. Without this arm a
+    // statement-position scope returned Unknown here AND its body went unwalked, because
+    // tc_check_body's ExprStmt re-dispatch keys on is_block_bearing (now fixed in src/ast.bl).
+    if kind == NodeKind.AsyncScope {
+        return infer_type(node_body(node))
+    }
+
+    // br e0wmt6. `.await` unwraps Handle[T]. The operand is in `obj`, NOT `value`
+    // (br 1b7ggq). This became expressible only once TyKind.Handle was constructible
+    // (br vag3wc) — before that the operand's own tid was a bare typevar named "Handle" and
+    // there was no inner to read, which is why this ticket depended on that one.
+    if kind == NodeKind.AwaitExpr {
+        let awaited = infer_type(node_obj(node))
+        if tc_tid_kind(awaited) == TyKind.Handle && tc_tid_child_count(awaited) >= 1 {
+            return tc_tid_child(awaited, 0)
+        }
+        return TYPE_UNKNOWN
     }
 
     if kind == NodeKind.Closure {

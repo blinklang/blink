@@ -1,0 +1,280 @@
+// br e0wmt6: a `let` inside an `async.scope` in STATEMENT position is never walked by
+// typecheck, and a `let` bound to `async.spawn` / `.await` / `async.scope` carries no usable
+// type.
+//
+// The ticket was opened as a tid-publication gap — the 4 `bucket=missing` cells in the Stage 2
+// divergence map (`tid=- flat=-`, the only bucket with no fallback once Stage 4 deletes the flat
+// fields). Reproducing it turned up something strictly worse in the same code path: the body of
+// a statement-position `async.scope` is not typechecked AT ALL.
+//
+//     fn main() {
+//         async.scope {
+//             let bad: Int = "not an int"
+//             io.println("{bad}")
+//         }
+//     }
+//     $ build/blink check hole.bl
+//     ok: hole.bl                 <- no error
+//     $ build/blink run hole.bl
+//     not an int                  <- the annotation was ignored, not enforced
+//
+// Move the same `async.scope` into INITIALIZER position (`let v = async.scope { ... }`) and the
+// identical body reports `TypeError` correctly. So this is a WALK gap, not a missing arm, and
+// its blast radius is every per-statement check in the language — not just types.
+//
+// ROOT CAUSE, and the safeguard that was supposed to prevent it. A statement-position
+// `async.scope` arrives ExprStmt-wrapped, so it lands in tc_check_body's ExprStmt arm
+// (src/typecheck.bl:10131), which calls `infer_type(val)` and then re-dispatches into the body
+// only for block-bearing kinds:
+//
+//     if is_block_bearing(vk) || vk == NodeKind.MethodCall { tc_check_body(val) }
+//
+// `infer_type` has no AsyncScope arm, so it returns Unknown without visiting the body, and
+// `is_block_bearing` (src/ast.bl:187) lists IfExpr / MatchExpr / WhileLoop / LoopExpr / ForIn /
+// WithBlock — but NOT AsyncScope. The ExprStmt arm's own comment says that predicate is "the
+// single source of truth for THIS re-dispatch so a future block-bearing kind cannot silently
+// lose statement-walking coverage here." The mechanism was right; `async.scope` was simply never
+// registered in it. That is the fix: a kind that bears a block answers 1.
+//
+// WHY THE TIDS ARE NOW CONSTRUCTIBLE. `async.spawn(f)` parses as an ordinary
+// MethodCall{method: "spawn", obj: Ident "async"} (NodeKind.AsyncSpawn has NO producer anywhere
+// in src/ or lib/ — it is a dead variant, the same shape as TyKind.Closure in br vag3wc), and
+// until br vag3wc there was no TyKind.Handle to answer with: `make_handle_type` did not exist.
+// So this ticket depended on that one for a reason. `.await` reads its operand from `obj`, not
+// `value` (br 1b7ggq).
+//
+// SCOPE. ChannelNew is deliberately NOT in this ticket. It reads `tid=?` (diverge), not
+// `missing`, so it is not one of the cells this was opened for; minting `Channel[a]` without
+// binding the element from `.send`/`.recv`/`for-in` would turn today's `let ch = Channel(4)`
+// into E0301 under the gqg3rk boundary check; and its codegen half is a separate live
+// miscompile (br hgd2az — `Channel[Str]` prints a pointer as an integer). Tracked separately.
+
+import compiler.{compile_to_program}
+import typecheck.{
+    check_types, tc_lookup_node_tid, tc_type_str, TyKind,
+    tc_tid_kind, tc_tid_child_count, tc_tid_child,
+}
+import parser.{nodes, node_kind, node_name}
+import ast.{NodeKind}
+import diagnostics.{diag_entries, diag_entry_count, diag_truncate}
+import std.io
+// Bare and LOAD-BEARING despite `warning[UnusedImport]` (br xrhq1c): codegen_types resolves
+// several globals it cannot import out of the MERGED program, and codegen_expr is the smallest
+// root whose transitive closure closes those back-references.
+import codegen_expr
+
+fn assert_eq_str(got: Str, want: Str, label: Str) {
+    if got != want { io.println("FAIL: {label} — got '{got}', want '{want}'") }
+    assert(got == want)
+}
+
+fn assert_eq_int(got: Int, want: Int, label: Str) {
+    if got != want { io.println("FAIL: {label} — got {got}, want {want}") }
+    assert(got == want)
+}
+
+fn assert_true(got: Bool, label: Str) {
+    if !got { io.println("FAIL: {label} — expected true") }
+    assert(got)
+}
+
+fn let_tid(vname: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.LetBinding && node_name(i) == vname {
+            return tc_lookup_node_tid(i)
+        }
+        i = i + 1
+    }
+    -1
+}
+
+fn tid_str_of(tid: Int) -> Str {
+    if tid < 0 { return "NONE" }
+    tc_type_str(tid)
+}
+
+// A second, local spelling of the kind — deliberately NOT typecheck's `type_kind_name`. A test
+// that renders the kind through the function it is checking passes even when both sides are
+// wrong about the same variant.
+fn kind_str(k: TyKind) -> Str {
+    match k {
+        TyKind.Int => "Int"
+        TyKind.Float => "Float"
+        TyKind.Bool => "Bool"
+        TyKind.Str => "Str"
+        TyKind.Void => "Void"
+        TyKind.List => "List"
+        TyKind.Option => "Option"
+        TyKind.Result => "Result"
+        TyKind.Fn => "Fn"
+        TyKind.Struct => "Struct"
+        TyKind.Enum => "Enum"
+        TyKind.Typevar => "Typevar"
+        TyKind.Unknown => "Unknown"
+        TyKind.StringBuilder => "StringBuilder"
+        TyKind.Iterator => "Iterator"
+        TyKind.Handle => "Handle"
+        TyKind.Channel => "Channel"
+        TyKind.Tuple => "Tuple"
+        TyKind.Map => "Map"
+        TyKind.Bytes => "Bytes"
+        TyKind.Set => "Set"
+        TyKind.I8 => "I8"
+        TyKind.I16 => "I16"
+        TyKind.I32 => "I32"
+        TyKind.U8 => "U8"
+        TyKind.U16 => "U16"
+        TyKind.U32 => "U32"
+        TyKind.U64 => "U64"
+        TyKind.Char => "Char"
+    }
+}
+
+fn typecheck_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    write_file(path, src)
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    fs.remove(path)
+}
+
+// Diagnostics this probe adds with the given name. The shared global diag buffer is truncated
+// back to where it was found: an unflushed entry would read as a failure of whichever test in
+// this binary flushes next.
+fn count_diag(path: Str, src: Str, want_name: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    write_file(path, src)
+    let program = compile_to_program(path, 1)
+    let before = diag_entry_count()
+    check_types(program)
+    fs.remove(path)
+
+    let mut hits = 0
+    let mut i = before
+    while i < diag_entries.len() {
+        let d = diag_entries.get(i).unwrap()
+        if d.severity == "error" && d.name == want_name { hits = hits + 1 }
+        i = i + 1
+    }
+    diag_truncate(before)
+    hits
+}
+
+// ── Half A — the walk gap: a statement-position async.scope body IS typechecked ──
+
+fn stmt_pos_bad_src() -> Str {
+    #"fn main() {
+    async.scope {
+        let bad: Int = "not an int"
+        io.println("{bad}")
+    }
+}
+"#
+}
+
+test "a type error inside a statement-position async.scope is reported" {
+    let hits = count_diag("build/e0wmt6_stmt_bad.bl", stmt_pos_bad_src(), "TypeError")
+    assert_eq_int(hits, 1, "TypeError for `let bad: Int = \"not an int\"` in a bare async.scope")
+}
+
+fn init_pos_bad_src() -> Str {
+    #"fn main() {
+    let v = async.scope {
+        let bad: Int = "not an int"
+        1
+    }
+    io.println("{v}")
+}
+"#
+}
+
+// The control that makes the row above a bug report rather than a preference: the SAME body in
+// INITIALIZER position was always checked, so position was the only difference.
+test "the initializer-position async.scope body was always checked" {
+    let hits = count_diag("build/e0wmt6_init_bad.bl", init_pos_bad_src(), "TypeError")
+    assert_eq_int(hits, 1, "TypeError for the same body in initializer position")
+}
+
+// Walking a body that was previously skipped must not INVENT errors in the async programs that
+// already compile — the widened walk is worthless if it makes correct code fail.
+fn stmt_pos_good_src() -> Str {
+    #"fn main() {
+    async.scope {
+        let h = async.spawn(fn() -> Int { 21 })
+        let r = h.await
+        io.println("{r}")
+    }
+}
+"#
+}
+
+test "a correct statement-position async.scope body stays error-free" {
+    let hits = count_diag("build/e0wmt6_stmt_ok.bl", stmt_pos_good_src(), "TypeError")
+    assert_eq_int(hits, 0, "TypeError count for a correct bare async.scope body")
+}
+
+// ── Half B — publication: the four kinds of let carry a usable tid ──────────────
+
+fn tids_src() -> Str {
+    #"fn main() {
+    async.scope {
+        let sh = async.spawn(fn() -> Str { "s" })
+        let stmt_await = sh.await
+        io.println("{stmt_await}")
+    }
+    let scoped = async.scope { 5 }
+    let bh = async.spawn(fn() -> Bool { true })
+    let init_await = bh.await
+    io.println("{scoped} {init_await}")
+}
+"#
+}
+
+// The `missing` bucket this ticket was opened for: tid=- with flat=- and, once Stage 4 deletes
+// the flat fields, nothing at all to fall back to.
+test "a let inside a statement-position async.scope carries a tid" {
+    typecheck_probe("build/e0wmt6_tids_a.bl", tids_src())
+    let tid = let_tid("stmt_await")
+    assert_true(tid >= 0, "stmt_await has a tid at all (was -1, bucket=missing)")
+    assert_eq_str(tid_str_of(tid), "Str", "stmt_await is the handle's result type")
+}
+
+// Three DIFFERENT result types across the rows (Str, Bool, Int) on purpose: a spawn arm that
+// ignored the closure and answered a fixed inner would pass a single-type test.
+test "async.spawn is Handle[T] for the closure's return type" {
+    typecheck_probe("build/e0wmt6_tids_b.bl", tids_src())
+    let tid = let_tid("bh")
+    assert_true(tid >= 0, "the spawn let carries a tid")
+    assert_eq_str(kind_str(tc_tid_kind(tid)), "Handle", "spawn produces TyKind.Handle")
+    assert_eq_int(tc_tid_child_count(tid), 1, "Handle child_count")
+    assert_eq_str(tid_str_of(tc_tid_child(tid, 0)), "Bool", "Handle inner is the closure return")
+    assert_eq_str(tid_str_of(tid), "Handle[Bool]", "spawn renders with its result type")
+}
+
+test "await is the Handle's inner, not Unknown" {
+    typecheck_probe("build/e0wmt6_tids_c.bl", tids_src())
+    assert_eq_str(tid_str_of(let_tid("init_await")), "Bool", "await unwraps Handle[Bool]")
+}
+
+test "async.scope is its block's tail type" {
+    typecheck_probe("build/e0wmt6_tids_d.bl", tids_src())
+    assert_eq_str(tid_str_of(let_tid("scoped")), "Int", "async.scope { 5 } is Int")
+}
+
+// ── Half C — runtime: the async programs still run and still produce right answers ──
+
+test "runtime: fork-join through a statement-position scope" {
+    let mut total = 0
+    async.scope {
+        let ha = async.spawn(fn() -> Int { 40 })
+        let hb = async.spawn(fn() -> Int { 2 })
+        total = ha.await + hb.await
+    }
+    assert_eq_int(total, 42, "fork-join sum")
+}
+
+test "runtime: a scope's value and a Str handle" {
+    let scoped = async.scope { 7 }
+    assert_eq_int(scoped, 7, "async.scope value")
+    let sh = async.spawn(fn() -> Str { "hi" })
+    assert_eq_str(sh.await, "hi", "await on a Handle[Str]")
+}

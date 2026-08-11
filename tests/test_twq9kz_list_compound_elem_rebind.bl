@@ -1,0 +1,163 @@
+// br twq9kz: `copy_list_compound_elem` (src/codegen_methods.bl:1083) is the tid-collapse plan's
+// named archetype — 26 lines of hand case analysis to copy one variable's type to another, one
+// arm per (position x nested shape) cell, which is exactly what a flat `(CT_*, sname)` pair
+// forces. Stage 3 replaces the whole body with `set_var_ty(dst, get_var_ty(src))`.
+//
+// This file is the regression net for that rewrite. Every row here passes TODAY; the point is
+// that they must still pass after the function is replaced. Nothing here is red — recording it
+// as a green pin rather than pretending otherwise.
+//
+// WHY THE FUNCTION'S THREE "MISSING ARMS" ARE DEAD. It has no CT_SET / CT_LIST / CT_STRUCT arm,
+// and those absences are three open 03p551 cells verbatim. They are unreachable, and not because
+// the shapes do not occur — because every caller gates on exactly the arms that exist:
+//
+//   src/codegen_stmt.bl:3699   if expr_list_elem_type == CT_OPTION || CT_RESULT || CT_MAP
+//   src/codegen_stmt.bl:9156   (identical gate, the second copy of this block)
+//   src/codegen_methods.bl:4354  if carrier != "", where carrier comes from
+//                                list_compound_carrier_tag (src/codegen_expr.bl:165), which
+//                                returns non-empty ONLY for CT_OPTION and CT_RESULT
+//
+// So the Stage 2 `.no_arm` tap could never fire no matter what source is constructed — confirmed
+// by hand: a List[Set[Int]] and a List[List[Int]] rebind emit no `copy_list_compound_elem` row at
+// all, while the List[Option[Int]] control emits one. Per feedback_corpus_sweep_is_not_coverage a
+// zero-hit sweep proves nothing on its own; these were constructed, not inferred from corpus hits.
+//
+// The hole is therefore in the CALLER GATES and in upstream element recovery, not in this
+// function — which matters, because "add three arms" would have been a no-op fix.
+//
+// Rows 1-3 route THROUGH the function (its three live arms). Rows 4-5 deliberately do NOT — they
+// pin that the shapes the gate excludes work anyway, so Stage 3's unconditional
+// `set_var_ty(dst, get_var_ty(src))` must not regress them. Row 6 pins the one tuple form that
+// works today.
+//
+// Bugs found while constructing these, filed rather than fixed here:
+//   6g6g7t  List[(Int,Str)] from a fn return loses the tuple element — SILENTLY prints `<value>`,
+//           or emits `const void n` and fails the C compile. Only an annotated rebind survives
+//           (row 6 is that survivor).
+//   tavvwj  the Set/List analogues fail LOUDLY instead — `unresolved method '.len' on type
+//           Set[Int]`, i.e. codegen names the receiver correctly and cannot dispatch on it.
+
+fn assert_eq_int(got: Int, want: Int, label: Str) {
+    if got != want { io.println("FAIL: {label} — got {got}, want {want}") }
+    assert(got == want)
+}
+
+fn assert_eq_str(got: Str, want: Str, label: Str) {
+    if got != want { io.println("FAIL: {label} — got '{got}', want '{want}'") }
+    assert(got == want)
+}
+
+fn assert_true(got: Bool, label: Str) {
+    if !got { io.println("FAIL: {label} — expected true") }
+    assert(got)
+}
+
+// ── Rows 1-3: the three arms copy_list_compound_elem actually has ───────────────
+//
+// The unannotated `let g = mk_*()` rebind is the shape that reaches it: codegen_stmt's
+// `val_type == CT_LIST && expr_list_elem_type >= 0 && type_ann == -1` branch. An annotation
+// would re-stamp the element independently and bypass the copy, so leaving these unannotated is
+// load-bearing — annotate them and the test stops covering the function.
+
+fn mk_opt() -> List[Option[Int]] {
+    let l: List[Option[Int]] = []
+    l.push(Some(7))
+    l.push(None)
+    l
+}
+
+test "unannotated rebind of List[Option[T]] keeps the element's inner type" {
+    let g = mk_opt()
+    assert_eq_int(g.len(), 2, "list length survives the rebind")
+    assert_eq_int(g.get(0).unwrap().unwrap(), 7, "Some(7) inner survives")
+    // The None arm matters separately: an element erased to a boxed int64 would still read 7
+    // above while losing the tag here.
+    let second = g.get(1).unwrap()
+    assert_true(second.is_none(), "the None element is still a None, not a zero")
+}
+
+fn mk_res() -> List[Result[Int, Str]] {
+    let l: List[Result[Int, Str]] = []
+    l.push(Ok(3))
+    l.push(Err("bad"))
+    l
+}
+
+test "unannotated rebind of List[Result[T, E]] keeps ok and err" {
+    let g = mk_res()
+    assert_eq_int(g.get(0).unwrap().unwrap(), 3, "Ok(3) inner survives")
+    // Both sides: the Result arm copies ok and err through separate slots, so an arm that
+    // dropped only `err` would still pass the Ok row.
+    let e = g.get(1).unwrap()
+    assert_true(e.is_err(), "the Err element is still an Err")
+    assert_eq_str(e.unwrap_err(), "bad", "Err payload survives")
+}
+
+fn mk_map() -> List[Map[Str, Int]] {
+    let m: Map[Str, Int] = Map()
+    m.insert("a", 1)
+    m.insert("b", 2)
+    let l: List[Map[Str, Int]] = []
+    l.push(m)
+    l
+}
+
+test "unannotated rebind of List[Map[K, V]] keeps key and value types" {
+    let g = mk_map()
+    let m0 = g.get(0).unwrap()
+    assert_eq_int(m0.len(), 2, "map element survives with both entries")
+    assert_eq_int(m0.get("a").unwrap(), 1, "Str key and Int value both survive")
+    assert_eq_int(m0.get("b").unwrap(), 2, "second entry too")
+}
+
+// ── Rows 4-5: the shapes the caller gate EXCLUDES ───────────────────────────────
+//
+// These never reach copy_list_compound_elem — that is the twq9kz finding. They work through a
+// different path, and Stage 3's unconditional copy must leave them working.
+
+fn mk_sets() -> List[Set[Int]] {
+    let s: Set[Int] = Set()
+    s.insert(1)
+    s.insert(2)
+    let l: List[Set[Int]] = []
+    l.push(s)
+    l
+}
+
+test "List[Set[T]] rebind works despite reaching no copy arm" {
+    let g = mk_sets()
+    let first = g.get(0).unwrap()
+    assert_eq_int(first.len(), 2, "set element survives")
+    assert_true(first.contains(1), "set membership survives, so the element is a real Set")
+}
+
+fn mk_lists() -> List[List[Int]] {
+    let l: List[List[Int]] = []
+    l.push([1, 2, 3])
+    l
+}
+
+test "List[List[T]] rebind works despite reaching no copy arm" {
+    let g = mk_lists()
+    let first = g.get(0).unwrap()
+    assert_eq_int(first.len(), 3, "inner list survives")
+    assert_eq_int(first.get(2).unwrap(), 3, "inner list is indexable, not a boxed scalar")
+}
+
+// ── Row 6: the tuple form that survives ────────────────────────────────────────
+
+fn mk_tups() -> List[(Int, Str)] {
+    let l: List[(Int, Str)] = []
+    l.push((7, "seven"))
+    l
+}
+
+// The ANNOTATION is what makes this row pass. Drop it and both fields print `<value>` — br
+// 6g6g7t. Pinned here so a Stage 3 change that regresses the annotated path is caught even
+// while the unannotated path is still broken.
+test "annotated rebind of List[(Int, Str)] keeps both tuple fields" {
+    let g: List[(Int, Str)] = mk_tups()
+    let first = g.get(0).unwrap()
+    assert_eq_int(first.0, 7, "tuple field 0 survives the annotated rebind")
+    assert_eq_str(first.1, "seven", "tuple field 1 survives the annotated rebind")
+}
