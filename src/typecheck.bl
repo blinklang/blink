@@ -9533,9 +9533,9 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
     }
 
     // br nz7drz. A closure literal's type is its signature. Returning TYPE_UNKNOWN here was
-    // the single largest tid-collapse divergence root cause — 62 of the 82 family-A cells,
-    // where the FLAT universe holds the whole signature (`flat=Fn(int64_t(*)(const
-    // blink_closure*, int64_t))`) and the tid holds nothing.
+    // the single largest tid-collapse divergence root cause — 16 of the 82 family-A shape
+    // cells and 88 of the 1339 rows, where the FLAT universe holds the whole signature
+    // (`flat=Fn(int64_t(*)(const blink_closure*, int64_t))`) and the tid holds nothing.
     //
     // Both halves come from the declaration, never from the body: params through
     // resolve_param_type (TYPE_UNKNOWN for an un-annotated param, which is honest — nothing
@@ -9655,6 +9655,41 @@ fn tc_block_tail_value(stmt: Int) -> Int {
     let k = node_kind(stmt)
     if k == NodeKind.ExprStmt || k == NodeKind.Return { return node_value(stmt) }
     stmt
+}
+
+// The tid the IN-SCOPE walk recorded for a block-bearing expression's tail value, or -1.
+//
+// br bfq7nf. infer_type's Block arm cannot answer for a tail that names a binding of that
+// same block: tc_check_body's LetBinding arm infers the initializer BEFORE walking it, so at
+// that moment nr has no frame for the block and nr_get_type misses. The walk that follows
+// does have the frame, and its ExprStmt arm memoizes the tail with the right answer — so the
+// tid exists, it is merely written one step late. This reads it instead of re-deriving it,
+// which is the whole direction of the tid collapse (decisions/compiler-type-representation.md
+// Q2) and also the only version that adds no diagnostics: infer_type REPORTS as a side effect
+// (its IfExpr arm emits "if branches have incompatible types"), so re-inferring the block to
+// recover the tail would double-report every such tail.
+//
+// WithBlock and AsyncScope forward to their body for the same reason infer_type's arms do —
+// both evaluate to the block they wrap. The depth bound is a belt: these nest only as deep as
+// the source does, and 8 is far past any real spelling.
+fn tc_block_tail_memo(node: Int) -> Int {
+    let mut n = node
+    let mut depth = 0
+    while depth < 8 {
+        if n == -1 { return -1 }
+        let k = node_kind(n)
+        if k == NodeKind.WithBlock || k == NodeKind.AsyncScope {
+            n = node_body(n)
+        } else if k == NodeKind.Block {
+            let tail = tc_block_tail_stmt(n)
+            if tail == -1 { return -1 }
+            return tc_lookup_node_tid(tc_block_tail_value(tail))
+        } else {
+            return -1
+        }
+        depth = depth + 1
+    }
+    -1
 }
 
 // A Block body with a non-Void declared return but NO tail value at all (ends in
@@ -9999,6 +10034,20 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             inferred_tid = infer_type(val)
             tc_construct_hint = saved_hint
             tc_check_body(val)
+            // br bfq7nf. `let x = { let h = 5  h }` — the tail names a binding of the block
+            // itself, which the infer_type above could not see because tc_check_body had not
+            // pushed the block's frame yet. It has now, and it memoized the tail in scope, so
+            // the answer is available one line later. Placed BEFORE the declared/inferred
+            // compare below, which is the point: TYPE_UNKNOWN unifies with anything, so
+            // `let x: Str = { let h = 5  h }` typechecked clean, and a closure reached this way
+            // lost the arity check br nz7drz had just made possible.
+            //
+            // Recovery only — it can never overwrite an answer infer_type already gave, so no
+            // shape that resolved before now takes a different tid.
+            if inferred_tid == TYPE_UNKNOWN {
+                let memo = tc_block_tail_memo(val)
+                if memo >= 0 && memo != TYPE_UNKNOWN { inferred_tid = memo }
+            }
         }
 
         if declared_tid != TYPE_UNKNOWN && inferred_tid != TYPE_UNKNOWN {

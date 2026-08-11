@@ -187,6 +187,7 @@ not Stage 3 work:
 | `twq9kz` | P2 | `copy_list_compound_elem` never reached across the corpus — prove its 3 missing arms are live |
 | `pgc3d9` | P1 | *(filed later, from re-measuring `missing` for the Stage 3 kickoff)* closure and `handler` bodies in argument position never typechecked — 13 of the 14 residual `missing` cells |
 | `nz7drz` | P2 | *(the first Stage 3 root cause worked)* a closure literal had no type at all, and an `fn(..)` annotation lowered to a bare typevar — 16 family-A cells, plus 5 more retired as knock-on |
+| `bfq7nf` | P2 | *(the 2 cells `nz7drz` left)* a block whose tail is a bare Ident bound inside that block infers nothing — not arena- or closure-specific |
 
 `k9agr8` gates the *measurement*, not the code: without it Stage 3 can only demonstrate 0
 in archive-linked mode.
@@ -1156,20 +1157,40 @@ not cells:
 | family A rows | 1339 | 1243 | −96 |
 | `Fn`-flat `tid=?` cells | 16 | 2 | −14 |
 | `Fn`-flat `tid=?` rows | 88 | 5 | −83 |
-| agree | 372979 | 382138 | +9426 |
+| total cells | 424 | 424 | 0 |
+| agree | 372712 | 372974 | +262 |
+| diverge rows | 5118 | 5113 | −5 |
 | missing | 5 | 5 | 0 |
+
+*(The `agree` and `total cells` rows are corrected. They were first published as
+`372979 → 382138` and `421 → 424`, computed with the new test root excluded from only one side
+of the comparison — which reads the 15 fresh `test_nz7drz` compiles as `agree` growth and as new
+cells. Excluding the new roots from BOTH sides is the honest basis and is what every other row
+here already used. The corrected total, `424 → 424`, strengthens rather than softens the point
+made below: the counter did not move at all.)*
 
 21 family-A cells retired, not 14: the Call arm's `TyKind.Fn` branch (`typecheck.bl:8552`) was
 dead code until a closure had a structured tid, and making it live means `let y = c(...)` gets
 the closure's *return* tid too — which retired the residual `tid=? flat=Float` and five
 `tid=? flat=Tuple2_*` cells as knock-on.
 
-The **2 residual `Fn` cells are not this ticket**: both are `let g = with arena { fn(..) {..} }`.
-`infer_type` does not propagate a `WithBlock` tail's type — the separate `with arena` root cause
-(12 cells) already on the Stage 3 list. The closure fix is complete everywhere it is not
-composed with that.
+The **2 residual `Fn` cells are not this ticket** — they are `bfq7nf`, a separate and more general
+hole: a block whose tail is a bare **Ident bound inside that block** infers nothing. The corpus
+spelling is `let g = with arena { let h = fn(..) {..}  h }`
+(`test_with_arena_closure_tail.bl:50`, `test_arena_promote_nested.bl:179/195/210/225`), which is
+what first made this look like a `with arena` cause. It is not. Two probes settle it:
 
-**Why the counter did not drop (421 → 424 cells), stated honestly.** The 14 retired cells did not
+| probe | result |
+|---|---|
+| `let g = with arena { fn(x: Int) -> Int { x*2 } }` — literal tail | `tid=Fn(Int) -> Int` ✓ |
+| `let g = { let h = 5  h }` — Ident tail, no arena, not a closure | `tid=? flat=Int` ✗ |
+
+`infer_type` already has a `WithBlock` arm (`src/typecheck.bl:9507`), so nothing is missing there;
+the tail type propagates for every shape except a bare Ident. The Ident arm resolves through
+`nr_get_type(name)`, and the block's name-resolution scope is not live when the enclosing `let`'s
+initializer is inferred. The closure fix is complete everywhere it is not composed with `bfq7nf`.
+
+**Why the counter did not drop (424 → 424 cells), stated honestly.** The 14 retired cells did not
 become `agree`; they changed *spelling* from `tid=?` to `tid=Fn(Int) -> Int` and stayed in
 `diverge`, because `ty_tp_same_shape` rejects `TyKind.Fn` up front — `tk_to_ct` maps it to
 `CT_VOID` and the `ct == CT_VOID && k != TyKind.Void` guard is deliberate (a kind the flat
@@ -1215,6 +1236,79 @@ carries the *instance* return, measured on its own MVCE as `Fn(Int) -> Box[Int]`
 
 Test: `tests/test_nz7drz_closure_fn_tid.bl`, 15 rows — 7 D1 rows red before (4 more D2 rows were
 outright build errors), all green after. `task ci` green.
+
+### bfq7nf — a block's tail could not name a binding of that block (CLOSED)
+
+**The first Stage 3 root cause to move the counter itself.** `let x = { let h = 5  h }` gave the
+binding no tid at all, for any type, in any block. The two cells `nz7drz` left were this, and so
+were twelve more it had nothing to do with.
+
+**Cause, and it is an ORDERING one, not a missing arm.** `tc_check_body`'s `LetBinding` arm infers
+the initializer at `typecheck.bl:9999` and only *then* walks it at `:10001`. `infer_type`'s Block
+arm resolves the tail, the tail is an `Ident`, and the `Ident` arm resolves through
+`nr_get_type` — but the block's own nr frame is pushed by the walk that has not run yet. So the
+name misses, the tail is `TYPE_UNKNOWN`, and `TYPE_UNKNOWN` unifies with anything. Two checks went
+silent as a result:
+
+| shape | before | after |
+|---|---|---|
+| `let x: Str = { let h = 5  h }` | accepted | `error[TypeError]` |
+| `let g = { let h = fn(a: Int) -> Int {..}  h }` then `g(1,2,3)` | accepted | `error[TypeError]` |
+
+An `Ident` tail naming an **outer** binding always worked — that frame is live — which is what
+localizes the defect to block-*local* names and rules out "blocks don't propagate their tail".
+`infer_type` already has `WithBlock` and `AsyncScope` arms; nothing was missing there.
+
+**Fix: read the tid, do not re-derive it.** The walk at `:10001` *does* have the frame, and its
+`ExprStmt` arm memoizes the tail with the right answer — the tid existed, it was merely written one
+step late. `tc_block_tail_memo` reads it, and the `LetBinding` arm consults it right after the walk
+and before the declared/inferred compare. Recovery only: it can never overwrite an answer
+`infer_type` already gave, so no shape that resolved before takes a different tid.
+
+Re-inferring the block instead would have been one line shorter and wrong — `infer_type` REPORTS as
+a side effect (its `IfExpr` arm emits "if branches have incompatible types", the hazard
+`typecheck.bl:9955` already names), so recovering the tail that way double-reports every such
+tail. Duplicating nr's scope machinery inside `infer_type` was the other candidate and is worse
+still: `nr_pop_scope` carries the E0301 region-boundary check, so a speculative frame either
+fires it twice or needs `tc_boundary_check_active` suppressed around it.
+
+**Measurement** (tydiv, monolithic, all three sweeps re-tallied on ONE exclusion basis — both new
+test roots excluded from every column, which is also the correction applied to the `nz7drz` table
+above):
+
+| | before `nz7drz` | after `nz7drz` | after `bfq7nf` |
+|---|---:|---:|---:|
+| **total cells** | 424 | 424 | **412** |
+| family A (`tid=?`) cells | 82 | 61 | **47** |
+| family A rows | 1339 | 1243 | **1209** |
+| `Fn`-flat `tid=?` cells | 16 | 2 | **0** |
+| agree | 372712 | 372974 | **373161** |
+| diverge rows | 5118 | 5113 | **5086** |
+| missing | 5 | 5 | 5 |
+
+14 family-A cells retired for a fix aimed at 2, because the recovery is keyed on the *initializer
+being block-bearing*, not on the tail being a closure: `flat=CmgPoint`, `flat=Pair`,
+`flat=List[Char]`, `flat=List[I32]`, and seven `flat=Map[..]` cells went with them.
+
+**Two NEW `diverge` cells, and the flat side is the wrong one.** Both from
+`tests/test_arena_promote_nested.bl`:
+
+```
+site=emit_let_binding.decl var=m tid=Map[Bool, Int] flat=Map[Int, Int]
+site=emit_let_binding.decl var=m tid=Map[Int, I32]  flat=Map[Int, Int]
+```
+
+The source declares `let mut m: Map[Bool, Int]` (`:56`) and `let mut m: Map[Int, I32]` (`:140`).
+The tid spells both exactly; the flat universe widened the `Bool` key and the `I32` value to `Int`.
+These were `tid=?` cells before, so nothing regressed — giving the tid an answer **revealed** two
+more instances of the flat universe's width erasure, which is the instrument working. Note the
+asymmetry it exposes: an `I32`/`I8`/`U8`/`Char` **key** survives the flat encoding (those cells now
+agree) while an `I32` **value** does not. Stage 3's authority flip closes both for free.
+
+Test: `tests/test_bfq7nf_block_ident_tail_tid.bl`, 14 rows — 6 red before, all green after, with
+the 8 controls (literal tail, outer-scope tail, and the runtime answers through the arena promote
+path) green throughout to pin that the fix adds a tid without moving one byte of behavior.
+`task regen` + `task ci` green.
 
 ## Appendix — all 428 shape cells
 

@@ -1,0 +1,175 @@
+// br bfq7nf — a block whose tail is a bare Ident bound INSIDE that block infers no type.
+//
+// `infer_type`'s Block arm resolves the tail through tc_block_tail_stmt/tc_block_tail_value,
+// and the Ident arm resolves a name through nr_get_type. tc_check_body's LetBinding arm calls
+// `infer_type(val)` BEFORE `tc_check_body(val)` (src/typecheck.bl:9999 vs :10001), so at the
+// moment the enclosing initializer is inferred the block's own scope has not been pushed and
+// none of its `let`s are visible. The tail resolved to TYPE_UNKNOWN, and TYPE_UNKNOWN unifies
+// with anything — so the declared-type compare and the closure arity check both went silent.
+//
+// This is the last family-A cause the tid collapse left for closure-typed lets (br nz7drz
+// closed the other 14 of 16 cells); the divergence it shows is
+//
+//     [dbg:tydiv] bucket=diverge site=emit_let_binding.decl var=g tid=? flat=Int
+//
+// Two axes it is NOT, both mistaken for it first and both disproved by the control rows
+// below: it is not `with arena`-specific, and it is not closure-specific. Any block, any type.
+//
+// The programs still COMPILED AND RAN correctly throughout, because codegen's flat universe
+// carried the type the tid did not. That is exactly the asymmetry
+// decisions/compiler-type-representation.md Q2 voted to remove, so the run rows here are as
+// load-bearing as the diagnostic rows: the fix must add the missing tid without changing one
+// runtime answer.
+
+import compile_test_helpers
+
+// ── the declared type must be compared against a block-local Ident tail ─────
+
+test "a block-local Ident tail is compared against the declared type" {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let x: Str = \{ let h = 5  h }\n")
+    s = s.concat("    io.println(\"\{x}\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_compile_error(s, "bfq7nf_decl_plain", "TypeError")
+}
+
+// The corpus spelling, and the reason this looked like an arena bug: with arena behaves
+// identically, because the WithBlock arm just forwards to the Block arm (typecheck.bl:9507).
+test "a with-arena block-local Ident tail is compared against the declared type" {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let x: Str = with arena \{ let h = 5  h }\n")
+    s = s.concat("    io.println(\"\{x}\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_compile_error(s, "bfq7nf_decl_arena", "TypeError")
+}
+
+// Two hops inside one block. A fix that resolves only the tail name and not the chain it
+// depends on passes the row above and fails this one.
+test "a two-hop block-local alias chain is compared against the declared type" {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let x: Str = \{ let h = 5  let j = h  j }\n")
+    s = s.concat("    io.println(\"\{x}\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_compile_error(s, "bfq7nf_decl_two_hop", "TypeError")
+}
+
+// Not the last statement's type — the TAIL's. A sibling `let` of a different type after the
+// one the tail names must not be what answers.
+test "a block-local Ident tail names its own binding, not the last let" {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let x: Int = \{ let h = \"a\"  let _n = 5  h }\n")
+    s = s.concat("    io.println(\"\{x}\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_compile_error(s, "bfq7nf_decl_sibling", "TypeError")
+}
+
+// ── a closure reached through a block-local Ident tail stays arity-checked ──
+// br nz7drz gave a closure literal a real TyKind.Fn tid, which is what makes an arity check
+// on a closure-typed let possible at all. Losing the tid to a block tail loses the check.
+
+test "a closure bound to a block-local Ident tail is arity-checked" {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let g = \{ let h = fn(a: Int) -> Int \{ a * 2 }  h }\n")
+    s = s.concat("    let r = g(1, 2, 3)\n")
+    s = s.concat("    io.println(\"\{r}\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_compile_error(s, "bfq7nf_arity_plain", "TypeError")
+}
+
+test "a closure bound to a with-arena block-local Ident tail is arity-checked" {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let g = with arena \{ let h = fn(a: Int) -> Int \{ a * 2 }  h }\n")
+    s = s.concat("    let r = g(1, 2, 3)\n")
+    s = s.concat("    io.println(\"\{r}\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_compile_error(s, "bfq7nf_arity_arena", "TypeError")
+}
+
+// ── controls: the shapes that ALREADY resolved must keep resolving ──────────
+// These pin the boundary of the defect. Each one was green before the fix, so a fix that
+// works by widening TYPE_UNKNOWN tolerance anywhere would show up here as a regression.
+
+test "a literal block tail is compared against the declared type" {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let x: Str = \{ 5 }\n")
+    s = s.concat("    io.println(\"\{x}\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_compile_error(s, "bfq7nf_ctl_literal", "TypeError")
+}
+
+// An Ident tail naming an OUTER binding always worked — that scope is still live. This is the
+// row that localizes the defect to block-LOCAL names.
+test "an outer-scope Ident tail is compared against the declared type" {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let h = 5\n")
+    s = s.concat("    let x: Str = \{ h }\n")
+    s = s.concat("    io.println(\"\{x}\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_compile_error(s, "bfq7nf_ctl_outer", "TypeError")
+}
+
+test "a closure literal block tail is arity-checked" {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let g = \{ fn(a: Int) -> Int \{ a * 2 } }\n")
+    s = s.concat("    let r = g(1, 2, 3)\n")
+    s = s.concat("    io.println(\"\{r}\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_compile_error(s, "bfq7nf_ctl_lit_arity", "TypeError")
+}
+
+// ── no false positives, and the runtime answer is unchanged ─────────────────
+// A tid where there was none must not invent a diagnostic on a correct program, and must not
+// move one byte of behavior. The arena rows also cross the promote path (br 2aw8mt/nc0yrr):
+// a block-local closure capturing an arena value, returned as a bare tail.
+
+test "a matching declared type over a block-local Ident tail stays clean" {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let x: Int = \{ let h = 5  h }\n")
+    s = s.concat("    io.println(\"\{x}\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_no_error(s, "bfq7nf_clean_decl", "TypeError")
+    let r = compile_test_helpers.compile_and_run(s, "bfq7nf_clean_decl_run")
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out.trim(), "5")
+}
+
+test "an inferred block-local Ident tail still runs" {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let g = \{ let h = 5  h }\n")
+    s = s.concat("    io.println(\"\{g + 1}\")\n")
+    s = s.concat("}\n")
+    let r = compile_test_helpers.compile_and_run(s, "bfq7nf_run_plain")
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out.trim(), "6")
+}
+
+test "a two-hop block-local alias chain still runs" {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let g = \{ let h = 5  let j = h  j }\n")
+    s = s.concat("    io.println(\"\{g + 1}\")\n")
+    s = s.concat("}\n")
+    let r = compile_test_helpers.compile_and_run(s, "bfq7nf_run_two_hop")
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out.trim(), "6")
+}
+
+test "a closure through a with-arena block-local Ident tail still runs" {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let g = with arena \{ let h = fn(a: Int) -> Int \{ a * 2 }  h }\n")
+    s = s.concat("    io.println(\"\{g(21)}\")\n")
+    s = s.concat("}\n")
+    let r = compile_test_helpers.compile_and_run(s, "bfq7nf_run_arena_closure")
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out.trim(), "42")
+}
+
+test "a correct-arity call through a block-local Ident tail stays clean and runs" {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let g = \{ let h = fn(a: Int) -> Int \{ a * 2 }  h }\n")
+    s = s.concat("    io.println(\"\{g(21)}\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_no_error(s, "bfq7nf_clean_arity", "TypeError")
+    let r = compile_test_helpers.compile_and_run(s, "bfq7nf_clean_arity_run")
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out.trim(), "42")
+}
