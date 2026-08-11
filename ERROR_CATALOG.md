@@ -68,6 +68,7 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 
 | Name | Code | One-line | Category | Spec ref |
 |------|------|----------|----------|----------|
+| NonExhaustiveMatch | E0004 | A `match` leaves an enum variant unhandled. Guarded arms do not contribute to coverage; a `_` or plain-binding arm makes the match exhaustive | Pattern matching | §3.9 |
 | TypeError | E0300 | Type mismatch detected during type checking | Type checking | §3 |
 | CannotInferType | E0301 | Inference left a type variable unbound — annotate the binding, or supply the type argument at the call when the callee's signature does not supply it. Reported where the repair attaches | Type checking | §3.4 |
 | TemplateMismatch | E0310 | String template parameter type does not match argument | Type checking | §3 |
@@ -195,6 +196,7 @@ The self-hosting compiler (`src/codegen_types.bl`, `src/codegen_expr.bl`) curren
 
 | Code | Name | Implementation |
 |------|------|---------------|
+| E0004 | NonExhaustiveMatch | `typecheck.bl` — `tc_check_match_exhaustive`, on a match whose scrutinee resolves to a declared enum. Under-approximating: Int/Str/Char ranges, tuple/struct patterns and nested refutable sub-patterns contribute nothing rather than risk a false positive |
 | E0500 | UndeclaredEffect | `codegen_types.bl` — effect propagation check |
 | E0501 | CapabilityBudgetExceeded | `typecheck.bl` — `@capabilities` budget check |
 | E0502 | QuestionMarkInvalidOperand | `codegen_expr.bl` — `?` operator type check (to move to typecheck phase) |

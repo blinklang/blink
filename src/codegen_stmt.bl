@@ -65,7 +65,7 @@ import codegen_types.{
     set_list_nested_elem_struct, set_list_nested_elem_type, set_list_elem_map_types, set_list_elem_option, set_list_elem_result, get_list_elem_option_inner, get_list_elem_option_inner_struct, get_list_elem_result_ok, get_list_elem_result_err, get_list_elem_result_ok_struct, get_list_elem_result_err_struct, get_list_elem_option_inner_tp, get_list_elem_result_ok_tp, get_list_elem_result_err_tp, tp_carrier_tag, set_var_option_inner_tp, set_map_types, set_map_key_struct, key_struct_sname_from_ann, set_map_value_list_elem, set_map_value_struct, copy_map_value_meta, set_set_elem_type, set_set_elem_struct,
     find_type_def_node, set_var_ffi_ptr_struct, set_var_ffi_ptr_array, set_var_ffi_ptr_extra,
     ffi_alloc_n_pending, ffi_offset_pending_struct,
-    set_var, set_var_alias, set_var_channel, set_var_closure, set_var_handle,
+    set_var, set_var_ty, set_var_alias, set_var_channel, set_var_closure, set_var_handle,
     set_var_handler,
     set_var_handle_full, set_var_iterator, set_var_option,
     set_var_option_inner2, set_var_option_inner2_struct, get_var_option_inner_tp,
@@ -92,7 +92,8 @@ import codegen_expr.{
     expr_option_inner_map_val_struct, expr_option_inner_map_val_list_elem, expr_option_inner_tp,
     expr_option_inner_struct, expr_option_is_none, expr_result_err_struct, expr_result_err_type,
     expr_result_ok_struct, expr_result_ok_type, expr_result_str,
-    expr_result_type, mono_instance_arg_tids_from_tid, panic_file_for, segs_from_arg_tids,
+    expr_result_type, mono_instance_arg_tids_from_tid, panic_file_for, panic_file_for_fmt,
+    panic_line_str, emit_panic_site, segs_from_arg_tids,
     tparams_sl_contains, recover_set_elem_from_tid, recover_option_set_elem_from_tid,
     register_map_elem_struct_mono_from_tid
 }
@@ -107,7 +108,7 @@ import diagnostics.{
 import pkg.manifest.{manifest_header_is_declared, manifest_name}
 import compiler.{trace}
 import stdlib_native_deps.{stdlib_native_dep_name_by_ffi_symbol}
-import typecheck.{is_import_module_name, tc_lookup_node_tid, tc_tid_struct_mono_name, tc_tid_struct, tc_tid_is_enum, tc_tid_struct_arg_count, tc_tid_struct_arg_tid, tc_tid_struct_slot_seg, tc_struct_slot_encodable, tc_tid_result_ok_tid, tc_tid_result_err_tid, tc_tid_option_inner_tid, tc_tid_tuple_arity, tc_tid_tuple_elem_tid, tc_tid_to_c_tag}
+import typecheck.{sv_ty_or_flat, is_builtin_fn, is_import_module_name, tc_lookup_node_tid, tc_tid_struct_mono_name, tc_tid_struct, tc_tid_is_enum, tc_tid_struct_arg_count, tc_tid_struct_arg_tid, tc_tid_struct_slot_seg, tc_struct_slot_encodable, tc_tid_result_ok_tid, tc_tid_result_err_tid, tc_tid_option_inner_tid, tc_tid_tuple_arity, tc_tid_tuple_elem_tid, tc_tid_to_c_tag}
 
 fn strip_outer_parens(s: Str) -> Str {
     if s.starts_with("(") && s.ends_with(")") {
@@ -1190,6 +1191,11 @@ pub fn emit_match_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scop
         cg_current_fn_option_inner_struct = mcarrier.option_inner_struct
     }
 
+    // Tracks whether any arm absorbs every remaining scrutinee unconditionally
+    // (`_` or a plain binding, no guard). Its absence is what makes the
+    // fail-closed tail below necessary — see the backstop comment at the chain
+    // close.
+    let mut saw_catch_all = 0
     let mut _first = 1
     let mut i = 0
     while i < sublist_length(arms_sl) {
@@ -1213,6 +1219,7 @@ pub fn emit_match_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scop
 
         if has_guards {
             if pat_cond == "" {
+                if guard_node == -1 { saw_catch_all = 1 }
                 if _first {
                     emit_line("if (!_mg_) \{")
                 } else {
@@ -1251,6 +1258,7 @@ pub fn emit_match_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scop
             cg_indent = cg_indent - 1
         } else {
             if is_wildcard {
+                saw_catch_all = 1
                 if _first {
                     emit_line("\{")
                 } else {
@@ -1282,7 +1290,38 @@ pub fn emit_match_expr(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scop
         _first = 0
         i = i + 1
     }
+
+    // Fail-closed backstop (br 51fhf5). A value-producing match declares
+    // `result_var` uninitialized; if no arm runs, every reader of it is UB —
+    // pre-backstop this printed a stack address. E0004 rejects the one shape
+    // typecheck can PROVE non-exhaustive (a declared-enum scrutinee) and
+    // deliberately stays silent on the rest (Int/Str ranges, Option/Result arm
+    // sets, refutable sub-patterns); that under-approximation is only sound
+    // because the unmatched path traps here instead of reading garbage.
+    //
+    // A STATEMENT-position match is untouched: falling through without running
+    // an arm produces no value to be read, so trapping would be a behaviour
+    // change rather than a safety fix.
+    //
+    // Emitted as `else` on the plain if/else-if chain and as an `if (!_mg_)`
+    // tail on the guarded form, since guarded arms are sibling blocks rather
+    // than a chain.
+    let produces_value = result_type != CT_VOID || match_struct_name != ""
+    let needs_backstop = produces_value && saw_catch_all == 0 && _first == 0
+    if needs_backstop && has_guards == 0 {
+        emit_line("} else \{")
+        cg_indent = cg_indent + 1
+        emit_line(emit_panic_site("panic: non-exhaustive match at {panic_file_for_fmt(node)}:{panic_line_str(node)}", ""))
+        cg_indent = cg_indent - 1
+    }
     emit_line("}")
+    if needs_backstop && has_guards != 0 {
+        emit_line("if (!_mg_) \{")
+        cg_indent = cg_indent + 1
+        emit_line(emit_panic_site("panic: non-exhaustive match at {panic_file_for_fmt(node)}:{panic_line_str(node)}", ""))
+        cg_indent = cg_indent - 1
+        emit_line("}")
+    }
     cg_current_fn_option_inner = saved_loop_option_inner
     cg_current_fn_option_inner_struct = saved_loop_option_inner_struct
     if match_struct_name != "" {
@@ -2981,9 +3020,17 @@ fn infer_enum_from_node(val_node: Int) -> Str {
         let func = node_left(val_node)
         if node_kind(func) == NodeKind.Ident {
             let fn_name = node_name(func)
-            let resolved = resolve_variant(fn_name)
-            if resolved != "" {
-                return resolved
+            // A CALL resolves to a builtin before a variant, matching typecheck's
+            // order in infer_type (br t1apwa). Without this, a module declaring a
+            // payload-less variant named `Map` typed every `Map()` local as that
+            // enum, which made an empty Map unconstructible there — `Map()` is the
+            // only way to build one. The bare-Ident arm above stays unguarded: with
+            // no parens, `Map` genuinely is the variant.
+            if is_builtin_fn(fn_name) == 0 {
+                let resolved = resolve_variant(fn_name)
+                if resolved != "" {
+                    return resolved
+                }
             }
         }
     }
@@ -3111,6 +3158,28 @@ fn carry_map_binding_meta(val_str: Str, val_orig_name: Str, name: Str, type_ann:
     }
 }
 
+// The tid for a `let`. The LET NODE is the authority: typecheck publishes its own
+// `final_tid` there (declared annotation, else inferred initializer — see its LetBinding
+// arm), so codegen reads one answer instead of re-deriving the choice.
+//
+// The two fallbacks are measurement scaffolding, not a second opinion. They exist so a let
+// that typecheck left UNKNOWN still reports a comparable shape rather than a blanket
+// Missing, which would make the Stage 2 cell map read as "codegen never stamped anything"
+// where the truth is "typecheck had no answer either". Note the initializer is the WEAKEST
+// of the three: `let m: Map[Str, List[Int]] = Map()` infers `Map[α, β]` with both metavars
+// unbound, because the declared type is compared against the initializer and never unified
+// into it. Stage 3 must not read it in preference to the let node.
+fn let_binding_tid(node: Int, type_ann: Int, val_node: Int) -> Int {
+    let own = tc_lookup_node_tid(node)
+    if own >= 0 { return own }
+    if type_ann != -1 {
+        let ann_tid = tc_lookup_node_tid(type_ann)
+        if ann_tid >= 0 { return ann_tid }
+    }
+    if val_node != -1 { return tc_lookup_node_tid(val_node) }
+    -1
+}
+
 @allow(UnrestoredMutation, IncompleteStateRestore)
 fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
     let val_node = node_value(node)
@@ -3192,6 +3261,12 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
     }
     let is_mut = node_is_mut(node)
     set_var(name, val_type, is_mut)
+    // Stage 2: stamp typecheck's tid at the earliest possible point, immediately after the
+    // binding exists and BEFORE the ~40 set_var_* refinements below. Any later and the
+    // refinements would be measured against an unstamped var, so every read would report
+    // Missing and the instrument would measure its own late arrival. The refinements carry
+    // `ty` across untouched by design (src/codegen_types.bl ScopeVar.ty).
+    set_var_ty(name, let_binding_tid(node, type_ann, val_node))
     if enum_type != "" {
         var_enums.push(VarEnumEntry { name: name, enum_type: enum_type })
     }
@@ -3643,6 +3718,11 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
     }
     let struct_type = get_var_struct(name)
     let cname = c_safe_name(name)
+    // Stage 2 measurement, immediately ahead of the declaration chain below — the single
+    // decision that turns a variable's type into C. The answer is DISCARDED: the flat
+    // `val_type` still governs every branch, which is what keeps the emitted C byte-identical
+    // while the counter enumerates the cells Stage 3 has to lower from the tid instead.
+    sv_ty_or_flat(name, "emit_let_binding.decl")
     // br 296hpm: a genuine Void RHS (`let x = nothing()`, a Void-typed field
     // read, a generic fn returning its Void type argument) must not decay to
     // `const void x = ...;` -- illegal C, since `()` is DECISIONS.md:342's
@@ -6831,7 +6911,7 @@ pub fn register_struct_instance_from_tid(tid: Int) -> Str ! Codegen.Register {
 // The enum analogue of register_struct_instance_from_tid (jjhnf3): register the mono
 // instance for a generic-enum INSTANCE tid (`Tree[Int]`) so its tagged-union typedef
 // (blink_Tree_Int) is emitted and c_type_from_tag / is_mono_struct_instance recognize
-// it. tc_tid_struct is kind-agnostic (returns the base for TK_ENUM too), as are the
+// it. tc_tid_struct is kind-agnostic (returns the base for TyKind.Enum too), as are the
 // now-widened tc_tid_struct_arg_* accessors and tc_tid_struct_slot_seg — so this is a
 // near-verbatim copy. Returns the mono c_name (`blink_Tree_Int`) or "" when the tid is
 // not a concretely-encodable enum instance.

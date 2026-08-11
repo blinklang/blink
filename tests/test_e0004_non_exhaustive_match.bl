@@ -1,0 +1,177 @@
+// Stage -1 of the codegen-type-collapse project: error[NonExhaustiveMatch] (E0004).
+//
+// Spec: sections/03_types.md "Exhaustiveness" — "Every `match` must cover all
+// possible values. The compiler performs exhaustiveness analysis and rejects
+// incomplete matches." Catalog: ERROR_CATALOG.md E0004 (the catalog's own worked
+// example, and the reserved E00xx "Pattern matching / exhaustiveness" range).
+//
+// Before this landed there was NO exhaustiveness analysis: only a wildcard-presence
+// heuristic (typecheck.bl) that never enumerated variants, reporting through tc_warn
+// into tc_warnings — a list that was pushed to, cleared, and never read. A match
+// missing an arm therefore compiled, and in EXPRESSION position emitted C that read
+// an uninitialized local (br 51fhf5):
+//
+//     static int64_t blink_u_spell(blink_TKind k) {
+//         int64_t _match_0;                                  // uninitialized
+//         if (k == blink_TKind_Alpha) { _match_0 = 111; }
+//         else if (k == blink_TKind_Beta) { _match_0 = 222; }
+//         const int64_t s = _match_0;                        // UB
+//         return s;
+//     }
+//
+// SCOPE. This covers a match whose scrutinee is a user-declared enum. The checker
+// UNDER-approximates by design: it reports only what it can prove non-exhaustive, so
+// a shape it cannot yet reason about stays silent rather than raising a false
+// positive. Option/Result scrutinees, integer/char ranges and nested patterns are
+// tracked separately — the soundness direction that matters is no false positives.
+
+import compile_test_helpers
+
+// ── the core case: a missing variant is an error ─────────────────────────────
+
+test "enum match missing a variant errors E0004 in statement position" {
+    let src = "type Color \{ Red, Green, Blue }\nfn name(c: Color) -> Str \{\n    match c \{\n        Color.Red => return \"r\"\n        Color.Green => return \"g\"\n    }\n    return \"?\"\n}\nfn main() ! IO \{\n    let _s = name(Color.Blue)\n}\n"
+    compile_test_helpers.expect_compile_error(src, "e0004_stmt_missing_variant", "E0004")
+}
+
+// The UB exhibit (br 51fhf5). A non-exhaustive match in expression position used to
+// compile to a read of an uninitialized local; it must be rejected in the front end.
+test "enum match missing a variant errors E0004 in expression position" {
+    let src = "type Color \{ Red, Green, Blue }\nfn code(c: Color) -> Int \{\n    let n = match c \{\n        Color.Red => 1\n        Color.Green => 2\n    }\n    return n\n}\nfn main() ! IO \{\n    let _n = code(Color.Blue)\n}\n"
+    compile_test_helpers.expect_compile_error(src, "e0004_expr_missing_variant", "E0004")
+}
+
+test "enum match missing several variants errors E0004" {
+    let src = "type Color \{ Red, Green, Blue }\nfn name(c: Color) -> Str \{\n    match c \{\n        Color.Red => return \"r\"\n    }\n    return \"?\"\n}\nfn main() ! IO \{\n    let _s = name(Color.Blue)\n}\n"
+    compile_test_helpers.expect_compile_error(src, "e0004_two_missing", "E0004")
+}
+
+// ── the repairs (each must NOT error) ────────────────────────────────────────
+
+test "enum match covering every variant does not error" {
+    let src = "type Color \{ Red, Green, Blue }\nfn name(c: Color) -> Str \{\n    match c \{\n        Color.Red => return \"r\"\n        Color.Green => return \"g\"\n        Color.Blue => return \"b\"\n    }\n    return \"?\"\n}\nfn main() ! IO \{\n    assert_eq(name(Color.Blue), \"b\")\n}\n"
+    compile_test_helpers.expect_no_error(src, "e0004_all_variants", "E0004")
+}
+
+test "enum match with a wildcard arm does not error" {
+    let src = "type Color \{ Red, Green, Blue }\nfn name(c: Color) -> Str \{\n    match c \{\n        Color.Red => return \"r\"\n        _ => return \"other\"\n    }\n    return \"?\"\n}\nfn main() ! IO \{\n    assert_eq(name(Color.Blue), \"other\")\n}\n"
+    compile_test_helpers.expect_no_error(src, "e0004_wildcard", "E0004")
+}
+
+test "enum match with a catch-all binding arm does not error" {
+    let src = "type Color \{ Red, Green, Blue }\nfn name(c: Color) -> Str \{\n    match c \{\n        Color.Red => return \"r\"\n        other => return \"other\"\n    }\n    return \"?\"\n}\nfn main() ! IO \{\n    assert_eq(name(Color.Blue), \"other\")\n}\n"
+    compile_test_helpers.expect_no_error(src, "e0004_binding_catchall", "E0004")
+}
+
+// An OR-pattern contributes the UNION of its alternatives (spec: "OR-patterns —
+// union of covered patterns per alternative"), so this is exhaustive.
+test "enum match with an OR-pattern covering the rest does not error" {
+    let src = "type Color \{ Red, Green, Blue }\nfn name(c: Color) -> Str \{\n    match c \{\n        Color.Red => return \"r\"\n        Color.Green | Color.Blue => return \"gb\"\n    }\n    return \"?\"\n}\nfn main() ! IO \{\n    assert_eq(name(Color.Blue), \"gb\")\n}\n"
+    compile_test_helpers.expect_no_error(src, "e0004_or_pattern", "E0004")
+}
+
+// Bare variant spellings (no `Color.` qualifier) resolve via resolve_arm_enum and
+// must count toward coverage exactly as the qualified form does.
+test "enum match using bare variant names does not error" {
+    let src = "type Color \{ Red, Green, Blue }\nfn name(c: Color) -> Str \{\n    match c \{\n        Red => return \"r\"\n        Green => return \"g\"\n        Blue => return \"b\"\n    }\n    return \"?\"\n}\nfn main() ! IO \{\n    assert_eq(name(Color.Blue), \"b\")\n}\n"
+    compile_test_helpers.expect_no_error(src, "e0004_bare_variants", "E0004")
+}
+
+// ── bare struct-style variant patterns count as coverage ────────────────────
+//
+// A struct-style variant written BARE (`NotFound { msg }`, no `QueryError.` prefix)
+// parses as NodeKind.StructPattern with the variant in `type_name` — NOT as an
+// EnumPattern. The first cut of this checker ignored StructPattern and so reported
+// three exhaustive matches in the existing corpus (test_struct_enum_variant_match,
+// test_enum_struct_variants, test_jbhzvt_bare_variant_name_collision) as missing
+// variants. These lock the repair; the corpus files are the wider regression.
+
+test "bare struct-style variant patterns are exhaustive coverage" {
+    let src = "type Q \{ NotFound \{ msg: Str }, Timeout \{ seconds: Int } }\nfn d(e: Q) -> Str \{\n    match e \{\n        NotFound \{ msg } => return \"n:\{msg}\"\n        Timeout \{ seconds } => return \"t:\{seconds}\"\n    }\n    return \"?\"\n}\nfn main() ! IO \{\n    assert_eq(d(Q.Timeout \{ seconds: 3 }), \"t:3\")\n}\n"
+    compile_test_helpers.expect_no_error(src, "e0004_bare_struct_variant", "E0004")
+}
+
+test "mixed bare tuple, bare struct-style and bare unit variants are coverage" {
+    let src = "type DbError \{ ConnectionError(msg: Str), QueryError \{ sqlstate: Str }, Closed }\nfn d(e: DbError) -> Str \{\n    match e \{\n        ConnectionError(m) => return \"c:\{m}\"\n        QueryError \{ sqlstate } => return \"q:\{sqlstate}\"\n        Closed => return \"closed\"\n    }\n    return \"?\"\n}\nfn main() ! IO \{\n    assert_eq(d(DbError.Closed), \"closed\")\n}\n"
+    compile_test_helpers.expect_no_error(src, "e0004_mixed_bare_variants", "E0004")
+}
+
+// The repair must not go so far that it silences a genuine gap: a struct-style enum
+// with one variant covered and one missing is still an error.
+test "bare struct-style variant still errors when a variant is missing" {
+    let src = "type Q \{ NotFound \{ msg: Str }, Timeout \{ seconds: Int } }\nfn d(e: Q) -> Str \{\n    match e \{\n        NotFound \{ msg } => return \"n:\{msg}\"\n    }\n    return \"?\"\n}\nfn main() ! IO \{\n    let _s = d(Q.Timeout \{ seconds: 3 })\n}\n"
+    compile_test_helpers.expect_compile_error(src, "e0004_bare_struct_missing", "E0004")
+}
+
+// `..` rest in a struct-style variant pattern still covers the whole variant.
+test "struct-style variant pattern with rest is coverage" {
+    let src = "type Q \{ NotFound \{ msg: Str, code: Int }, Timeout \{ seconds: Int } }\nfn d(e: Q) -> Str \{\n    match e \{\n        NotFound \{ msg, .. } => return \"n:\{msg}\"\n        Timeout \{ seconds } => return \"t:\{seconds}\"\n    }\n    return \"?\"\n}\nfn main() ! IO \{\n    assert_eq(d(Q.Timeout \{ seconds: 3 }), \"t:3\")\n}\n"
+    compile_test_helpers.expect_no_error(src, "e0004_struct_variant_rest", "E0004")
+}
+
+// ── guards are opaque ───────────────────────────────────────────────────────
+//
+// Spec: "Guards — treated as opaque (may be false), so guarded arms do not
+// contribute to exhaustiveness." A guarded arm for the only missing variant
+// therefore leaves the match non-exhaustive.
+
+test "guarded arm does not contribute to exhaustiveness" {
+    let src = "type Color \{ Red, Green, Blue }\nfn name(c: Color, f: Bool) -> Str \{\n    match c \{\n        Color.Red => return \"r\"\n        Color.Green => return \"g\"\n        Color.Blue if f => return \"b\"\n    }\n    return \"?\"\n}\nfn main() ! IO \{\n    let _s = name(Color.Blue, true)\n}\n"
+    compile_test_helpers.expect_compile_error(src, "e0004_guarded_arm", "E0004")
+}
+
+// ── no false positives on the shapes the checker does not yet model ──────────
+//
+// These are the under-approximation guarantees. Each is a match the checker must
+// stay silent about, so that landing E0004 cannot break working programs.
+
+test "match on an Int scrutinee with a wildcard does not error" {
+    let src = "fn classify(n: Int) -> Str \{\n    match n \{\n        0 => return \"zero\"\n        _ => return \"other\"\n    }\n    return \"?\"\n}\nfn main() ! IO \{\n    assert_eq(classify(0), \"zero\")\n}\n"
+    compile_test_helpers.expect_no_error(src, "e0004_int_wildcard", "E0004")
+}
+
+test "match on a Str scrutinee with a wildcard does not error" {
+    let src = "fn classify(s: Str) -> Str \{\n    match s \{\n        \"a\" => return \"first\"\n        _ => return \"other\"\n    }\n    return \"?\"\n}\nfn main() ! IO \{\n    assert_eq(classify(\"a\"), \"first\")\n}\n"
+    compile_test_helpers.expect_no_error(src, "e0004_str_wildcard", "E0004")
+}
+
+test "exhaustive Option match does not error" {
+    let src = "fn main() ! IO \{\n    let x: Int? = None\n    match x \{\n        Some(v) => \{}\n        None => \{}\n    }\n}\n"
+    compile_test_helpers.expect_no_error(src, "e0004_option_full", "E0004")
+}
+
+test "exhaustive Result match does not error" {
+    let src = "fn get() -> Result[Int, Str] \{ Ok(1) }\nfn main() ! IO \{\n    match get() \{\n        Ok(v) => \{}\n        Err(e) => \{}\n    }\n}\n"
+    compile_test_helpers.expect_no_error(src, "e0004_result_full", "E0004")
+}
+
+// A payload-carrying enum is still exhaustiveness-checked on its variant set; the
+// payload bindings are irrelevant to coverage.
+test "payload-carrying enum match missing a variant errors E0004" {
+    let src = "type Shape \{ Circle(r: Int), Square(s: Int), Empty }\nfn area(sh: Shape) -> Int \{\n    match sh \{\n        Shape.Circle(r) => return r\n        Shape.Square(s) => return s\n    }\n    return 0\n}\nfn main() ! IO \{\n    let _a = area(Shape.Empty)\n}\n"
+    compile_test_helpers.expect_compile_error(src, "e0004_payload_missing", "E0004")
+}
+
+test "payload-carrying enum match covering every variant does not error" {
+    let src = "type Shape \{ Circle(r: Int), Square(s: Int), Empty }\nfn area(sh: Shape) -> Int \{\n    match sh \{\n        Shape.Circle(r) => return r\n        Shape.Square(s) => return s\n        Shape.Empty => return 0\n    }\n    return 0\n}\nfn main() ! IO \{\n    assert_eq(area(Shape.Empty), 0)\n}\n"
+    compile_test_helpers.expect_no_error(src, "e0004_payload_full", "E0004")
+}
+
+// ── the diagnostic names the missing variant ─────────────────────────────────
+//
+// Diagnostic Discipline (§3.1): the message must name what is missing so the
+// generate-compile-fix loop can act on it mechanically, per the spec's own example
+// ("missing pattern: `Triangle`").
+
+test "E0004 message names the missing variant" {
+    let src = "type Color \{ Red, Green, Blue }\nfn name(c: Color) -> Str \{\n    match c \{\n        Color.Red => return \"r\"\n        Color.Green => return \"g\"\n    }\n    return \"?\"\n}\nfn main() ! IO \{\n    let _s = name(Color.Blue)\n}\n"
+    let output = compile_test_helpers.compile_and_capture(src, "e0004_names_variant")
+    assert(output.contains("E0004"))
+    assert(output.contains("Blue"))
+}
+
+// ── catalog wiring ──────────────────────────────────────────────────────────
+
+test "blink explain E0004 returns the catalog entry" {
+    compile_test_helpers.verify_catalog_entry("E0004", "NonExhaustiveMatch")
+}

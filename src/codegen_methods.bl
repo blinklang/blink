@@ -71,7 +71,7 @@ import diagnostics.{
     ICE_SEG_ERASED_SLOT,
 }
 import ast.{NodeKind, is_block_bearing}
-import typecheck.{tc_lookup_node_tid, tc_tid_ct, tc_tid_struct, tc_tid_struct_mono_name, tc_tid_tuple_sname, tc_tid_list_elem, tc_seg_from_tid, tc_type_str, is_import_module_name, tc_qualifier_to_module_or_self, suggest_module_member}
+import typecheck.{sv_ty_or_flat, tc_lookup_node_tid, tc_tid_ct, tc_tid_struct, tc_tid_struct_mono_name, tc_tid_tuple_sname, tc_tid_list_elem, tc_seg_from_tid, tc_type_str, is_import_module_name, tc_qualifier_to_module_or_self, suggest_module_member}
 
 // Arg offset for trait-qualified builtin calls: MapOps.contains_key(m, k) has receiver at args[0]
 let mut btc_arg_offset: Int = 0
@@ -95,7 +95,7 @@ fn recover_elem_ct_from_arg(node: Int, arg_pos: Int, is_erased_default: Bool) ->
     if args_sl == -1 || arg_pos >= sublist_length(args_sl) { return ElemRecovery { ct: -1, sname: "" } }
     let atid = tc_lookup_node_tid(sublist_get(args_sl, arg_pos))
     // mmegcb: a tuple element (Set[(Int,Str)] through a tuple boundary) has no
-    // scalar CT — tc_tid_ct returns -1 for TK_TUPLE. Recover its mangled carrier
+    // scalar CT — tc_tid_ct returns -1 for TyKind.Tuple. Recover its mangled carrier
     // and route through the kops-struct box path (CT_STRUCT + sname), the same
     // path the direct Set[(Int,Str)] uses. Guard on kops_is_struct_key so we
     // only claim it when the tuple carrier is actually a registered kops key
@@ -240,7 +240,7 @@ fn poly_impl_return_elem_tids(im: Int, recv_node: Int) -> List[Int] {
 //
 // The `is_some()` gate is NOT part of what was deleted, and must stay: tc_mono_tids_core
 // does not gate on encodability before returning (it pushes tc_resolve_tparam_tid's raw
-// result, so a TK_TYPEVAR-bearing tid arrives non-negative). Storing those would flow `""`
+// result, so a TyKind.Typevar-bearing tid arrives non-negative). Storing those would flow `""`
 // segments out of segs_from_arg_tids into mono_name_from_ann / resolve_tuple_ann /
 // resolve_tparam_seg — i.e. into NAMES, mangling `blink_f_` — and the empty-segment
 // chokepoint is deliberately unarmed (codegen_expr.bl:5923-5927). Dropping it would be a
@@ -1081,6 +1081,12 @@ pub fn finish_enum_zip_result(result_list: Str, tuple_tag: Str) {
 // route, or the deep tp_id dies with the temp and later readers (emit_list_method's
 // `get`) fall back to a boxed-int64 default.
 pub fn copy_list_compound_elem(src: Str, dst: Str) {
+    // Stage 2 measurement. This function is the plan's archetype: 26 lines of hand case
+    // analysis to copy one variable's type to another, one arm per (position x nested shape)
+    // cell, which is exactly what a flat pair (CT_*, sname) forces. Stage 3 replaces the whole
+    // body with set_var_ty(dst, get_var_ty(src)) — so what has to be measured first is whether
+    // the source even carries a tid to copy.
+    sv_ty_or_flat(src, "copy_list_compound_elem.src")
     let elem_ct = get_list_elem_type(src)
     if elem_ct == CT_OPTION {
         let oi_tp = get_list_elem_option_inner_tp(src)
@@ -1105,6 +1111,14 @@ pub fn copy_list_compound_elem(src: Str, dst: Str) {
         } else {
             set_list_elem_map_types(dst, get_list_elem_map_key_type(src), get_list_elem_map_val_type(src), get_list_elem_map_val_struct(src))
         }
+    } else if elem_ct == CT_SET || elem_ct == CT_LIST || elem_ct == CT_STRUCT {
+        // THE MISSING ARMS — three of the open 03p551 cells, verbatim. A List[Set[..]],
+        // List[List[..]] or List[(..)] element type is silently NOT copied here, so the deep
+        // element dies with the source variable. Counting the reaches (behaviour unchanged:
+        // this arm copies nothing, exactly as the absent arms copied nothing) is the point of
+        // Stage 2 — it says whether this is a live hole or a theoretical one before Stage 3
+        // deletes the case analysis entirely.
+        sv_ty_or_flat(src, "copy_list_compound_elem.no_arm")
     }
 }
 
@@ -2376,7 +2390,7 @@ fn emit_io_output(node: Int, trace_op: Str, direct_prefix: Str, newline: Int, vt
 // that is a confident wrong claim about the receiver rather than a visible unknown, which
 // is what decisions/under-determined-types.md forbids (br 3dpshm). typecheck already
 // computed the receiver's real type; tc_type_str also renders instance type-args
-// (Option[Int], Result[Int, Str]) and distinguishes a genuine TK_VOID from TK_UNKNOWN.
+// (Option[Int], Result[Int, Str]) and distinguishes a genuine TyKind.Void from TyKind.Unknown.
 //
 // Same reroute-off-the-tid shape as the ma6n41/tr5gcn CT_VOID recovery at
 // codegen_expr.bl:3055, and the CT stays the FALLBACK for the same reason: it is what

@@ -1,0 +1,120 @@
+// br t1apwa — a payload-less enum variant named like a builtin type must not
+// shadow that builtin's CONSTRUCTOR.
+//
+// typecheck gets this right: infer_type's Call handler tests is_builtin_fn(fn_name)
+// BEFORE is_variant_name(fn_name), so `Map()` is the builtin Map constructor even in
+// a module declaring a variant named `Map`. codegen's twin, infer_enum_from_node in
+// codegen_stmt.bl, called resolve_variant on the callee with no builtin guard and so
+// typed the local as the user enum:
+//
+//     static blink_map* blink_u_build(void) {
+//         blink_Kind9 m = blink_map_new(&blink_kops_str);   // wrong C type
+//         blink_map_set(m, "a", (void*)(intptr_t)1);        // int passed as blink_map*
+//         return m;
+//     }
+//
+// Two phases, two resolution orders — that divergence is the defect, so the fix
+// shares typecheck's is_builtin_fn list rather than restating it.
+//
+// Not a corner case: `Map()` is the ONLY way to build an empty map (a bare `{}` is
+// error[EmptyBraceExpr]), so before this fix an empty Map was UNCONSTRUCTIBLE inside
+// such a module, with no workaround.
+//
+// The dual must keep working: a BARE variant name with no parens is genuinely the
+// variant, and the fix must not touch it. Both directions are locked below.
+
+// Every variant here collides with a builtin constructor name.
+pub type Kind9 { Alpha, Map, Set, List, Bytes, Beta }
+
+// ── the builtin constructor wins over the variant ────────────────────────────
+
+fn build_map() -> Map[Str, Int] {
+    let mut m: Map[Str, Int] = Map()
+    m.insert("a", 1)
+    m.insert("b", 2)
+    m
+}
+
+test "Map() in a module declaring a variant named Map builds a real map" {
+    let m = build_map()
+    assert_eq(m.len(), 2)
+    assert_eq(m.get("a").unwrap(), 1)
+    assert_eq(m.get("b").unwrap(), 2)
+}
+
+fn build_set() -> Set[Int] {
+    let mut s: Set[Int] = Set()
+    s.insert(7)
+    s.insert(7)
+    s.insert(9)
+    s
+}
+
+test "Set() is the builtin constructor, not the variant named Set" {
+    let s = build_set()
+    assert_eq(s.len(), 2)
+    assert(s.contains(7))
+    assert(s.contains(9))
+}
+
+fn build_bytes() -> Bytes {
+    let b = Bytes()
+    b
+}
+
+test "Bytes() is the builtin constructor, not the variant named Bytes" {
+    assert_eq(build_bytes().len(), 0)
+}
+
+// An un-annotated let takes its type from the initializer alone — the path that
+// mistyped the local, with no annotation available to contradict it.
+test "an un-annotated Map() local is still a map" {
+    let mut m = Map()
+    m.insert("k", 42)
+    assert_eq(m.len(), 1)
+    assert_eq(m.get("k").unwrap(), 42)
+}
+
+// ── the dual: a BARE variant name is still the variant ───────────────────────
+
+fn name_of(k: Kind9) -> Str {
+    match k {
+        Kind9.Alpha => "alpha"
+        Kind9.Map => "map"
+        Kind9.Set => "set"
+        Kind9.List => "list"
+        Kind9.Bytes => "bytes"
+        Kind9.Beta => "beta"
+    }
+}
+
+test "qualified variants that collide with builtin names still resolve" {
+    assert_eq(name_of(Kind9.Map), "map")
+    assert_eq(name_of(Kind9.Set), "set")
+    assert_eq(name_of(Kind9.List), "list")
+    assert_eq(name_of(Kind9.Bytes), "bytes")
+    assert_eq(name_of(Kind9.Alpha), "alpha")
+}
+
+test "a variant colliding with a builtin name round-trips through a let" {
+    let k: Kind9 = Kind9.Map
+    assert_eq(name_of(k), "map")
+}
+
+// A bare (unqualified, no-parens) variant name is the variant, not the builtin
+// type — the case the fix must NOT regress, since it is the reason
+// resolve_variant cannot simply refuse every builtin name.
+test "a bare variant name that collides with a builtin still resolves" {
+    let k: Kind9 = Map
+    assert_eq(name_of(k), "map")
+}
+
+// ── both in one function, so neither resolution can be sticky ────────────────
+
+test "the builtin ctor and the same-named variant coexist in one scope" {
+    let mut m: Map[Str, Int] = Map()
+    let k: Kind9 = Kind9.Map
+    m.insert(name_of(k), 1)
+    assert_eq(m.len(), 1)
+    assert_eq(m.get("map").unwrap(), 1)
+}

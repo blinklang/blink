@@ -1,0 +1,477 @@
+// Stage 1 of the tid collapse (decisions/compiler-type-representation.md Q2, 5-0):
+// four structural accessors that subsume the 51-accessor cartesian product.
+//
+// THE PRODUCT BEING REPLACED. typecheck exports
+//   {list_elem, set_elem, map_key, map_val, option_inner, result_ok, result_err,
+//    struct_arg, tuple_elem} x {_ct, _struct, _tid} x {plain, _resolved}
+// and the `_ct`/`_struct` split exists for ONE reason: codegen could not hold a tid, so
+// every child had to be pre-flattened into a (CT_* code, struct name) pair at the
+// typecheck boundary. A pair represents depth 1. Everything at depth >= 2 needed a
+// bespoke channel, which is what generated 100+ tickets across nqq29j / ng2qd3 / 03p551.
+// `tc_tid_child` returns a *tid*, so it composes with itself and depth stops mattering.
+//
+// WHAT EACH HALF PROVES:
+//   Half A — the shape contract: child_count is KIND-determined, child(i) returns a tid,
+//            and out-of-range answers -1 rather than fabricating a type.
+//   Half B — EQUIVALENCE with the accessors Stage 4 deletes. This is the load-bearing
+//            half: the deletion is only licensed if the new accessor answers what each
+//            old one answered, on the same inputs. A claim in a commit message is not
+//            evidence; these rows are.
+//   Half C — depth >= 2, the property the flat (CT_*, sname) pair provably cannot hold.
+//   Half D — the raw/resolved contract, pinned deliberately because the ASYMMETRY between
+//            raw and resolved readers is a documented past cause of capture holes. All
+//            four accessors are RAW: they read the pool slot as stored. A caller that
+//            wants a bound metavar followed composes tc_tid_resolved FIRST. Mixing the
+//            two (resolving the kind but not the children) is the exact trap this pins
+//            shut — it would report kind Map while answering -1 for both children.
+//
+// NOT an anti-`sv_tp` claim by assertion: Half A's out-of-range rows are the concrete
+// difference. sv_tp (codegen_types.bl) answers a missing slot by *inventing*
+// `type_list(type_int())`; tc_tid_child answers -1. Every "erases the element to Int" /
+// "fabricated as CT_STRING default" ticket is that invention. -1 is what lets a caller
+// tell "no child" from "a child I could not name".
+//
+// SETUP HAZARDS (inherited from test_vbcw1e_lowercase_void_twin.bl / test_hsgsbp_void_vs_erasure.bl):
+//  1. Importing typecheck/compiler/parser pulls in the whole-program merge, which is what
+//     lets write_file/fs.remove resolve below without their own explicit import.
+//  2. The make_* ctors used here are `pub` FOR TESTS ONLY. Base scalars cannot be
+//     constructed that way (TYPE_INT et al are private globals seeded during
+//     check_types), so they are harvested from a probe program instead.
+//  3. Bare `import codegen_expr` is load-bearing even though `blink check` reports it
+//     UNUSED: compile_to_program drags in codegen_types, which resolves several globals
+//     (expr_result_ok_type, expr_option_inner, expr_list_elem_struct, ...) out of the
+//     MERGED program rather than importing them, and codegen_expr is the smallest root
+//     whose transitive closure closes those back-references. Dropping it on the warning's
+//     advice fails at C compile, not at check.
+
+import typecheck.{
+    TyKind, tc_tid_kind, tc_tid_child_count, tc_tid_child, tc_tid_name,
+    tc_tid_resolved, tc_type_str, tc_lookup_node_tid, check_types,
+    make_list_type, make_set_type, make_option_type, make_result_type, make_map_type,
+    make_tuple_type, make_struct_instance_type, make_fn_type, make_metavar,
+    // The accessors Half B proves equivalent — imported so the retirement claim is
+    // checked against the real functions, not a restatement of them.
+    tc_tid_option_inner_tid, tc_tid_result_ok_tid, tc_tid_result_err_tid,
+    tc_tid_map_key_tid, tc_tid_map_val_tid, tc_tid_list_elem,
+    tc_tid_struct_arg_count, tc_tid_struct_arg_tid,
+    tc_tid_tuple_arity, tc_tid_tuple_elem_tid,
+}
+import parser.{nodes}
+import compiler.{compile_to_program}
+import std.io
+import codegen_expr
+
+// A match, not @derive(Display): this is a second, independent enumeration of the kind
+// set, so a kind added to TyKind without a spelling fails to compile HERE too — the test
+// carries its own exhaustiveness net rather than trusting the one in typecheck.bl.
+fn kind_name(k: TyKind) -> Str {
+    match k {
+        TyKind.Int => "Int"
+        TyKind.Float => "Float"
+        TyKind.Bool => "Bool"
+        TyKind.Str => "Str"
+        TyKind.Void => "Void"
+        TyKind.List => "List"
+        TyKind.Option => "Option"
+        TyKind.Result => "Result"
+        TyKind.Fn => "Fn"
+        TyKind.Struct => "Struct"
+        TyKind.Enum => "Enum"
+        TyKind.Typevar => "Typevar"
+        TyKind.Unknown => "Unknown"
+        TyKind.Closure => "Closure"
+        TyKind.Iterator => "Iterator"
+        TyKind.Handle => "Handle"
+        TyKind.Channel => "Channel"
+        TyKind.Tuple => "Tuple"
+        TyKind.Map => "Map"
+        TyKind.Bytes => "Bytes"
+        TyKind.Set => "Set"
+        TyKind.I8 => "I8"
+        TyKind.I16 => "I16"
+        TyKind.I32 => "I32"
+        TyKind.U8 => "U8"
+        TyKind.U16 => "U16"
+        TyKind.U32 => "U32"
+        TyKind.U64 => "U64"
+        TyKind.Char => "Char"
+    }
+}
+
+fn assert_eq_int(label: Str, got: Int, want: Int) {
+    if got != want { io.println("FAIL: {label} — got {got}, want {want}") }
+    assert_eq(got, want)
+}
+
+fn assert_eq_str(label: Str, got: Str, want: Str) {
+    if got != want { io.println("FAIL: {label} — got '{got}', want '{want}'") }
+    assert_eq(got, want)
+}
+
+fn assert_kind(label: Str, got: TyKind, want: TyKind) {
+    if got != want {
+        io.println("FAIL: {label} — got {kind_name(got)}, want {kind_name(want)}")
+    }
+    assert(got == want)
+}
+
+fn probe_src() -> Str {
+    "fn probe() -> Int \{\n    let a = 1\n    let b = \"s\"\n    let c = true\n    a\n}\n"
+}
+
+// Base scalars are seeded into ty_pool during check_types and their tids are private
+// globals, so a probe program is the only route to them. Keyed by rendered type string.
+fn harvest_scalars() -> Map[Str, Int] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let path = "build/tc_tid_structural_probe.bl"
+    write_file(path, probe_src())
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    // Removed BEFORE any row assertion, so a failing assertion never leaks the probe
+    // file (same contract as test_vbcw1e_lowercase_void_twin.bl).
+    fs.remove(path)
+    let mut m: Map[Str, Int] = Map()
+    let mut idx = 0
+    let n = nodes.len()
+    while idx < n {
+        let tid = tc_lookup_node_tid(idx)
+        if tid >= 0 {
+            m.insert(tc_type_str(tid), tid)
+        }
+        idx = idx + 1
+    }
+    m
+}
+
+fn expect_tid(m: Map[Str, Int], key: Str) -> Int {
+    let tid = m.get(key) ?? -1
+    if tid == -1 {
+        io.println("FAIL: harvested map has no tid for rendered type string '{key}'")
+    }
+    assert(tid != -1)
+    tid
+}
+
+// ════ Half A — the shape contract ════════════════════════════════════════════
+
+// child_count is determined by the KIND, not by whether the slot happens to hold a real
+// tid. That distinction is the whole point: a List whose element is unknown still HAS one
+// child (answered as -1), which is how a caller tells "no element exists" from "the
+// element is erased". Collapsing those two is the Void-vs-erasure conflation that
+// tests/test_hsgsbp_void_vs_erasure.bl exists to guard.
+test "child_count is kind-determined for the one-child containers" {
+    let m = harvest_scalars()
+    let int_tid = expect_tid(m, "Int")
+    assert_eq_int("List", tc_tid_child_count(make_list_type(int_tid)), 1)
+    assert_eq_int("Set", tc_tid_child_count(make_set_type(int_tid)), 1)
+    assert_eq_int("Option", tc_tid_child_count(make_option_type(int_tid)), 1)
+}
+
+test "child_count is 2 for the two-child containers" {
+    let m = harvest_scalars()
+    let int_tid = expect_tid(m, "Int")
+    let str_tid = expect_tid(m, "Str")
+    assert_eq_int("Result", tc_tid_child_count(make_result_type(int_tid, str_tid)), 2)
+    assert_eq_int("Map", tc_tid_child_count(make_map_type(str_tid, int_tid)), 2)
+}
+
+test "child_count is 0 for scalar leaves" {
+    let m = harvest_scalars()
+    assert_eq_int("Int", tc_tid_child_count(expect_tid(m, "Int")), 0)
+    assert_eq_int("Str", tc_tid_child_count(expect_tid(m, "Str")), 0)
+    assert_eq_int("Bool", tc_tid_child_count(expect_tid(m, "Bool")), 0)
+}
+
+// Tuple/Struct arity comes from params_count, so it is genuinely variadic rather than a
+// fixed slot count.
+test "child_count tracks arity for the variadic kinds" {
+    let m = harvest_scalars()
+    let int_tid = expect_tid(m, "Int")
+    let str_tid = expect_tid(m, "Str")
+    assert_eq_int("Tuple2", tc_tid_child_count(make_tuple_type([int_tid, str_tid])), 2)
+    assert_eq_int("Tuple3", tc_tid_child_count(make_tuple_type([int_tid, str_tid, int_tid])), 3)
+    assert_eq_int("Box[Int]", tc_tid_child_count(make_struct_instance_type("Box", [int_tid])), 1)
+    assert_eq_int("Pair[Int,Str]", tc_tid_child_count(make_struct_instance_type("Pair", [int_tid, str_tid])), 2)
+    // A generic BASE (no args) keeps params_count 0 — distinct from an instance.
+    assert_eq_int("bare Box", tc_tid_child_count(make_struct_instance_type("Box", [])), 0)
+}
+
+// Fn is the one kind whose children span both storage forms at once: inner1 holds the
+// return type and the params live in the ty_param_list slice. The uniform child order is
+// return-first, then params — pinned here because nothing else in the tree has this shape
+// and a silent reordering would be invisible until Stage 3 spelled a signature backwards.
+test "Fn exposes its return type as child 0 and params after it" {
+    let m = harvest_scalars()
+    let int_tid = expect_tid(m, "Int")
+    let str_tid = expect_tid(m, "Str")
+    let f = make_fn_type(int_tid, [str_tid, int_tid])
+    assert_eq_int("child_count = 1 + params", tc_tid_child_count(f), 3)
+    assert_eq_int("child 0 is the return type", tc_tid_child(f, 0), int_tid)
+    assert_eq_int("child 1 is param 0", tc_tid_child(f, 1), str_tid)
+    assert_eq_int("child 2 is param 1", tc_tid_child(f, 2), int_tid)
+}
+
+// The anti-sv_tp row. sv_tp answers a missing slot by inventing type_list(type_int());
+// this answers -1. Out-of-range must NOT fabricate, must not panic, and must not clamp
+// to the last real child (a clamp would silently duplicate a type into a slot that has
+// none, which reads as success).
+test "an out-of-range child index answers -1 instead of fabricating a type" {
+    let m = harvest_scalars()
+    let int_tid = expect_tid(m, "Int")
+    let str_tid = expect_tid(m, "Str")
+    let lst = make_list_type(int_tid)
+    assert_eq_int("List child 1", tc_tid_child(lst, 1), -1)
+    assert_eq_int("List child 99", tc_tid_child(lst, 99), -1)
+    assert_eq_int("List child -1", tc_tid_child(lst, -1), -1)
+    // A scalar has no children at all.
+    assert_eq_int("Int child 0", tc_tid_child(int_tid, 0), -1)
+    // Past the end of a variadic kind, where a clamp would have returned str_tid.
+    let tup = make_tuple_type([int_tid, str_tid])
+    assert_eq_int("Tuple2 child 2", tc_tid_child(tup, 2), -1)
+}
+
+test "a garbage tid answers -1 and Unknown rather than panicking" {
+    assert_eq_int("child_count(-1)", tc_tid_child_count(-1), 0)
+    assert_eq_int("child(-1, 0)", tc_tid_child(-1, 0), -1)
+    assert_eq_int("child_count(huge)", tc_tid_child_count(999999999), 0)
+    assert_eq_int("child(huge, 0)", tc_tid_child(999999999, 0), -1)
+    assert_kind("kind(-1)", tc_tid_kind(-1), TyKind.Unknown)
+    assert_kind("kind(huge)", tc_tid_kind(999999999), TyKind.Unknown)
+    assert_eq_str("name(-1)", tc_tid_name(-1), "")
+}
+
+test "tc_tid_kind reports the pool kind for each constructed shape" {
+    let m = harvest_scalars()
+    let int_tid = expect_tid(m, "Int")
+    let str_tid = expect_tid(m, "Str")
+    assert_kind("Int", tc_tid_kind(int_tid), TyKind.Int)
+    assert_kind("Str", tc_tid_kind(str_tid), TyKind.Str)
+    assert_kind("List", tc_tid_kind(make_list_type(int_tid)), TyKind.List)
+    assert_kind("Set", tc_tid_kind(make_set_type(int_tid)), TyKind.Set)
+    assert_kind("Option", tc_tid_kind(make_option_type(int_tid)), TyKind.Option)
+    assert_kind("Result", tc_tid_kind(make_result_type(int_tid, str_tid)), TyKind.Result)
+    assert_kind("Map", tc_tid_kind(make_map_type(str_tid, int_tid)), TyKind.Map)
+    assert_kind("Tuple", tc_tid_kind(make_tuple_type([int_tid, str_tid])), TyKind.Tuple)
+    assert_kind("Struct", tc_tid_kind(make_struct_instance_type("Box", [int_tid])), TyKind.Struct)
+    assert_kind("Fn", tc_tid_kind(make_fn_type(int_tid, [])), TyKind.Fn)
+}
+
+// tc_tid_name is the RAW declared name — the mono-name spellers are a separate concern
+// and must not leak into it. A struct instance answers its generic base, unadorned.
+test "tc_tid_name gives the raw declared name, not a mono spelling" {
+    let m = harvest_scalars()
+    let int_tid = expect_tid(m, "Int")
+    assert_eq_str("Box[Int]", tc_tid_name(make_struct_instance_type("Box", [int_tid])), "Box")
+    assert_eq_str("Pair", tc_tid_name(make_struct_instance_type("Pair", [int_tid, int_tid])), "Pair")
+    // Containers carry their kind's own name; nothing here should be "" by accident.
+    assert_eq_str("List", tc_tid_name(make_list_type(int_tid)), "List")
+    assert_eq_str("Map", tc_tid_name(make_map_type(int_tid, int_tid)), "Map")
+}
+
+// ════ Half B — equivalence with the accessors Stage 4 deletes ════════════════
+//
+// Each row pairs tc_tid_child against the specific old accessor it retires. If a row
+// here ever fails, the deletion in Stage 4 is NOT licensed — fix the accessor, do not
+// weaken the row.
+
+test "child 0 equals tc_tid_option_inner_tid for Option" {
+    let m = harvest_scalars()
+    let int_tid = expect_tid(m, "Int")
+    let o = make_option_type(int_tid)
+    assert_eq_int("Option inner", tc_tid_child(o, 0), tc_tid_option_inner_tid(o))
+    assert_eq_int("and it is Int", tc_tid_child(o, 0), int_tid)
+}
+
+test "children 0 and 1 equal tc_tid_result_ok_tid / tc_tid_result_err_tid" {
+    let m = harvest_scalars()
+    let int_tid = expect_tid(m, "Int")
+    let str_tid = expect_tid(m, "Str")
+    let r = make_result_type(int_tid, str_tid)
+    assert_eq_int("Result ok", tc_tid_child(r, 0), tc_tid_result_ok_tid(r))
+    assert_eq_int("Result err", tc_tid_child(r, 1), tc_tid_result_err_tid(r))
+    // Order is pinned: ok before err. Swapping them would still satisfy a set-equality
+    // check, so assert the slots individually against distinct types.
+    assert_eq_int("ok is Int", tc_tid_child(r, 0), int_tid)
+    assert_eq_int("err is Str", tc_tid_child(r, 1), str_tid)
+}
+
+test "children 0 and 1 equal tc_tid_map_key_tid / tc_tid_map_val_tid" {
+    let m = harvest_scalars()
+    let int_tid = expect_tid(m, "Int")
+    let str_tid = expect_tid(m, "Str")
+    let mp = make_map_type(str_tid, int_tid)
+    assert_eq_int("Map key", tc_tid_child(mp, 0), tc_tid_map_key_tid(mp))
+    assert_eq_int("Map val", tc_tid_child(mp, 1), tc_tid_map_val_tid(mp))
+    assert_eq_int("key is Str", tc_tid_child(mp, 0), str_tid)
+    assert_eq_int("val is Int", tc_tid_child(mp, 1), int_tid)
+}
+
+test "child 0 equals tc_tid_list_elem for List" {
+    let m = harvest_scalars()
+    let str_tid = expect_tid(m, "Str")
+    let l = make_list_type(str_tid)
+    assert_eq_int("List elem", tc_tid_child(l, 0), tc_tid_list_elem(l))
+    assert_eq_int("and it is Str", tc_tid_child(l, 0), str_tid)
+}
+
+// Set is the gap in the old product: it has _ct and _struct variants but NO
+// tc_tid_set_elem_tid at all, so the element tid was simply unreachable. The uniform
+// accessor closes that without a new name.
+test "Set's element tid is reachable through child 0, which the old product never exposed" {
+    let m = harvest_scalars()
+    let int_tid = expect_tid(m, "Int")
+    let s = make_set_type(int_tid)
+    assert_eq_int("Set elem", tc_tid_child(s, 0), int_tid)
+}
+
+test "child i equals tc_tid_struct_arg_tid and child_count equals tc_tid_struct_arg_count" {
+    let m = harvest_scalars()
+    let int_tid = expect_tid(m, "Int")
+    let str_tid = expect_tid(m, "Str")
+    let sb = make_struct_instance_type("Pair", [int_tid, str_tid])
+    assert_eq_int("arg count", tc_tid_child_count(sb), tc_tid_struct_arg_count(sb))
+    assert_eq_int("arg 0", tc_tid_child(sb, 0), tc_tid_struct_arg_tid(sb, 0))
+    assert_eq_int("arg 1", tc_tid_child(sb, 1), tc_tid_struct_arg_tid(sb, 1))
+    assert_eq_int("arg 0 is Int", tc_tid_child(sb, 0), int_tid)
+    assert_eq_int("arg 1 is Str", tc_tid_child(sb, 1), str_tid)
+}
+
+test "child i equals tc_tid_tuple_elem_tid and child_count equals tc_tid_tuple_arity" {
+    let m = harvest_scalars()
+    let int_tid = expect_tid(m, "Int")
+    let str_tid = expect_tid(m, "Str")
+    let t = make_tuple_type([str_tid, int_tid, str_tid])
+    assert_eq_int("arity", tc_tid_child_count(t), tc_tid_tuple_arity(t))
+    assert_eq_int("elem 0", tc_tid_child(t, 0), tc_tid_tuple_elem_tid(t, 0))
+    assert_eq_int("elem 1", tc_tid_child(t, 1), tc_tid_tuple_elem_tid(t, 1))
+    assert_eq_int("elem 2", tc_tid_child(t, 2), tc_tid_tuple_elem_tid(t, 2))
+}
+
+// A kind mismatch must answer -1, matching the old accessors' contract exactly rather
+// than reading whichever slot happens to be populated. Without this, child(list, 0) and
+// tc_tid_option_inner_tid(list) would disagree the moment a caller passed the wrong kind
+// — and it is precisely the wrong-kind path that the old accessors were guarding.
+test "the old accessors and child agree on kind mismatch by both answering -1" {
+    let m = harvest_scalars()
+    let int_tid = expect_tid(m, "Int")
+    let l = make_list_type(int_tid)
+    assert_eq_int("option_inner on a List", tc_tid_option_inner_tid(l), -1)
+    assert_eq_int("result_ok on a List", tc_tid_result_ok_tid(l), -1)
+    assert_eq_int("map_key on a List", tc_tid_map_key_tid(l), -1)
+    // child() is kind-driven, so on a List it reads the List's own child — it does not
+    // pretend to be an Option. Its arity, not a kind check, is what bounds it.
+    assert_eq_int("List has exactly one child", tc_tid_child_count(l), 1)
+    assert_eq_int("list_elem on an Option", tc_tid_list_elem(make_option_type(int_tid)), -1)
+}
+
+// ════ Half C — depth >= 2, which the flat pair cannot represent ══════════════
+//
+// This is the root-cause claim of the whole collapse, stated as a test. A (CT_*, sname)
+// pair can say "a List of struct Foo". It cannot say "a List of Map of Str to List of
+// Int" — there is nowhere to put the third level. Each row below walks to a leaf that
+// the flat representation has no slot for.
+
+test "Option[Map[Str, List[Int]]] walks to its Int leaf at depth 3" {
+    let m = harvest_scalars()
+    let int_tid = expect_tid(m, "Int")
+    let str_tid = expect_tid(m, "Str")
+    let deep = make_option_type(make_map_type(str_tid, make_list_type(int_tid)))
+
+    assert_kind("d0 Option", tc_tid_kind(deep), TyKind.Option)
+    let d1 = tc_tid_child(deep, 0)
+    assert_kind("d1 Map", tc_tid_kind(d1), TyKind.Map)
+    assert_kind("d2 key Str", tc_tid_kind(tc_tid_child(d1, 0)), TyKind.Str)
+    let d2 = tc_tid_child(d1, 1)
+    assert_kind("d2 val List", tc_tid_kind(d2), TyKind.List)
+    let d3 = tc_tid_child(d2, 0)
+    assert_kind("d3 Int", tc_tid_kind(d3), TyKind.Int)
+    assert_eq_int("d3 is the harvested Int tid", d3, int_tid)
+}
+
+test "a struct instance nested inside two containers keeps its name and args" {
+    let m = harvest_scalars()
+    let int_tid = expect_tid(m, "Int")
+    let str_tid = expect_tid(m, "Str")
+    // List[Result[Pair[Int,Str], Str]] — the struct instance sits at depth 2 with its
+    // own two type-args at depth 3, four levels the flat pair has two slots for.
+    let pair = make_struct_instance_type("Pair", [int_tid, str_tid])
+    let deep = make_list_type(make_result_type(pair, str_tid))
+
+    let res = tc_tid_child(deep, 0)
+    assert_kind("Result at depth 1", tc_tid_kind(res), TyKind.Result)
+    let leaf = tc_tid_child(res, 0)
+    assert_kind("Struct at depth 2", tc_tid_kind(leaf), TyKind.Struct)
+    assert_eq_str("name survives the nesting", tc_tid_name(leaf), "Pair")
+    assert_eq_int("both type-args survive", tc_tid_child_count(leaf), 2)
+    assert_kind("arg 0 Int", tc_tid_kind(tc_tid_child(leaf, 0)), TyKind.Int)
+    assert_kind("arg 1 Str", tc_tid_kind(tc_tid_child(leaf, 1)), TyKind.Str)
+    assert_kind("err slot Str", tc_tid_kind(tc_tid_child(res, 1)), TyKind.Str)
+}
+
+// A generic recursive walk, written once, terminating. If child_count ever over-reported
+// (or child returned a tid outside the pool), this either miscounts or fails to
+// terminate — which is the property Stage 3's recursive c_type_from_tid depends on.
+fn count_leaves(tid: Int) -> Int {
+    let n = tc_tid_child_count(tid)
+    if n == 0 { return 1 }
+    let mut total = 0
+    let mut i = 0
+    while i < n {
+        let c = tc_tid_child(tid, i)
+        if c >= 0 { total = total + count_leaves(c) }
+        i = i + 1
+    }
+    total
+}
+
+test "one generic recursive walk handles every shape, with no per-shape case analysis" {
+    let m = harvest_scalars()
+    let int_tid = expect_tid(m, "Int")
+    let str_tid = expect_tid(m, "Str")
+    assert_eq_int("scalar", count_leaves(int_tid), 1)
+    assert_eq_int("List[Int]", count_leaves(make_list_type(int_tid)), 1)
+    assert_eq_int("Map[Str,Int]", count_leaves(make_map_type(str_tid, int_tid)), 2)
+    // Option[Map[Str, List[Int]]] — leaves are Str and Int.
+    assert_eq_int("depth 3", count_leaves(make_option_type(make_map_type(str_tid, make_list_type(int_tid)))), 2)
+    // Tuple[Int, Map[Str,Int], List[Str]] — leaves Int, Str, Int, Str.
+    assert_eq_int("mixed variadic", count_leaves(make_tuple_type([int_tid, make_map_type(str_tid, int_tid), make_list_type(str_tid)])), 4)
+}
+
+// ════ Half D — the raw/resolved contract ═════════════════════════════════════
+//
+// Pinned deliberately: a raw/resolved asymmetry between two readers of the same tid is a
+// documented past cause of capture holes in this codebase. All four accessors are RAW.
+
+test "all four accessors read the slot as stored, so an unbound metavar stays Unknown" {
+    let mv = make_metavar()
+    assert_kind("unbound metavar", tc_tid_kind(mv), TyKind.Unknown)
+    assert_eq_int("no children", tc_tid_child_count(mv), 0)
+    assert_eq_int("child answers -1", tc_tid_child(mv, 0), -1)
+}
+
+// A container over an unbound metavar keeps ONE child that is a real tid pointing at the
+// metavar — not -1, and not silently replaced by a default element type. This is the
+// difference between "the element is an unsolved α" (recoverable, diagnosable as E0301)
+// and "the element is Int" (sv_tp's invention, a silent miscompile).
+test "a container over an unbound metavar reports the metavar, not a fabricated default" {
+    let mv = make_metavar()
+    let l = make_list_type(mv)
+    assert_kind("List kind unaffected", tc_tid_kind(l), TyKind.List)
+    assert_eq_int("still exactly one child", tc_tid_child_count(l), 1)
+    assert_eq_int("child IS the metavar", tc_tid_child(l, 0), mv)
+    assert_kind("whose kind is Unknown", tc_tid_kind(tc_tid_child(l, 0)), TyKind.Unknown)
+}
+
+// The composition contract: resolution is the CALLER's step, via tc_tid_resolved. This
+// row is what makes it safe for the accessors to stay raw — it shows the follow-through
+// is available and works, so no `_resolved` twin of any of the four is needed.
+test "tc_tid_resolved composes with the raw accessors instead of twinning them" {
+    let m = harvest_scalars()
+    let int_tid = expect_tid(m, "Int")
+    // A tid that needs no resolution is unchanged by it — the identity case, which must
+    // hold or every composed call site would shift.
+    assert_eq_int("resolved(Int) is Int", tc_tid_resolved(int_tid), int_tid)
+    let l = make_list_type(int_tid)
+    assert_eq_int("resolved(List) is List", tc_tid_resolved(l), l)
+    assert_kind("kind after resolve", tc_tid_kind(tc_tid_resolved(l)), TyKind.List)
+    assert_eq_int("child after resolve", tc_tid_child(tc_tid_resolved(l), 0), int_tid)
+}

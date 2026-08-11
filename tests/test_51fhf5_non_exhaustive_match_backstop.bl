@@ -1,0 +1,136 @@
+// br 51fhf5 — fail-closed codegen backstop for a non-exhaustive value match.
+//
+// E0004 (tests/test_e0004_non_exhaustive_match.bl) rejects the case the front end
+// can PROVE non-exhaustive: a match over a declared enum. It deliberately
+// under-approximates everything else — Int/Str/Char scrutinees and their ranges,
+// Option/Result arm sets, nested refutable sub-patterns — so that landing it could
+// not raise a false positive on working code.
+//
+// That under-approximation is only safe if the shapes it stays silent about FAIL
+// CLOSED at runtime instead of reading uninitialized memory. Before this backstop,
+// a value match with no arm taken emitted:
+//
+//     int64_t _match_0;                        // uninitialized, no else
+//     if (n == 0) { _match_0 = 111; }
+//     else if (n == 1) { _match_0 = 222; }
+//     const int64_t s = _match_0;              // UB — printed a stack address
+//
+// Observed garbage: 94478538681784 (Int scrutinee), 140121353210652 (Option missing
+// None). Now the unmatched path panics.
+//
+// A match in STATEMENT position (no value produced) is untouched: falling through
+// without running an arm is a defined no-op there, and trapping would be a
+// behaviour change rather than a safety fix.
+
+// ── Int scrutinee: no wildcard, value position ───────────────────────────────
+
+fn pick_int(n: Int) -> Int {
+    let s = match n {
+        0 => 111
+        1 => 222
+    }
+    return s
+}
+
+test "non-exhaustive Int match in value position panics instead of returning garbage" {
+    assert_panics(matching: "non-exhaustive match") {
+        let _v = pick_int(99)
+    }
+}
+
+test "a covered arm of the same match still returns its value" {
+    assert_eq(pick_int(0), 111)
+    assert_eq(pick_int(1), 222)
+}
+
+// ── Str scrutinee ───────────────────────────────────────────────────────────
+
+fn pick_str(s: Str) -> Int {
+    let n = match s {
+        "a" => 1
+        "b" => 2
+    }
+    return n
+}
+
+test "non-exhaustive Str match in value position panics" {
+    assert_panics(matching: "non-exhaustive match") {
+        let _v = pick_str("zzz")
+    }
+}
+
+test "covered Str arms still return their values" {
+    assert_eq(pick_str("a"), 1)
+    assert_eq(pick_str("b"), 2)
+}
+
+// ── Option scrutinee missing None ───────────────────────────────────────────
+
+fn pick_opt(o: Int?) -> Int {
+    let s = match o {
+        Some(v) => v
+    }
+    return s
+}
+
+test "Option match missing None panics in value position" {
+    assert_panics(matching: "non-exhaustive match") {
+        let _v = pick_opt(None)
+    }
+}
+
+test "Option match Some arm still returns its payload" {
+    assert_eq(pick_opt(Some(7)), 7)
+}
+
+// ── a wildcard arm means no backstop is emitted and nothing traps ────────────
+
+fn pick_with_default(n: Int) -> Int {
+    let s = match n {
+        0 => 111
+        _ => 999
+    }
+    return s
+}
+
+test "wildcard arm absorbs the unmatched case with no panic" {
+    assert_eq(pick_with_default(0), 111)
+    assert_eq(pick_with_default(12345), 999)
+}
+
+// ── guarded arms: the _mg_ path must trap too ────────────────────────────────
+//
+// A guarded match compiles to the `_mg_` matched-flag form rather than a plain
+// if/else-if chain, so it needs its own fail-closed tail. Every arm here is
+// guarded, so a scrutinee failing all guards takes no arm at all.
+
+fn pick_guarded(n: Int) -> Int {
+    let s = match n {
+        v if v > 100 => 1
+        v if v < 0 => 2
+    }
+    return s
+}
+
+test "all-guards-false match panics in value position" {
+    assert_panics(matching: "non-exhaustive match") {
+        let _v = pick_guarded(50)
+    }
+}
+
+test "a satisfied guard still returns its value" {
+    assert_eq(pick_guarded(500), 1)
+    assert_eq(pick_guarded(-5), 2)
+}
+
+// ── statement position is deliberately NOT trapped ──────────────────────────
+
+test "non-exhaustive match in statement position remains a no-op" {
+    let mut hits = 0
+    let n = 99
+    match n {
+        0 => { hits = hits + 1 }
+        1 => { hits = hits + 1 }
+    }
+    assert_eq(hits, 0)
+}

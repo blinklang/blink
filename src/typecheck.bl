@@ -1,6 +1,6 @@
 import ast.{NodeKind, node_kind_name, is_block_bearing, dbg_trace, dbg_channel_on}
 import std.str.{str_to_lower}
-import codegen_types.{is_intrinsic_method, strip_module_qualifier, c_type_tag_for_struct, escape_mono_seg, mono_slot_conflicts, mono_slot_conflicts_same_type, mono_slot_conflicts_diff_type, mono_slot_conflicts_diff_type_injective, CT_INT, CT_FLOAT, CT_BOOL, CT_STRING, CT_LIST, CT_VOID, CT_OPTION, CT_RESULT, CT_ITERATOR, CT_HANDLE, CT_CHANNEL, CT_MAP, CT_BYTES, CT_SET, CT_STRUCT, CT_ENUM, CT_I8, CT_I16, CT_I32, CT_U8, CT_U16, CT_U32, CT_U64, CT_CHAR}
+import codegen_types.{is_intrinsic_method, strip_module_qualifier, c_type_tag_for_struct, escape_mono_seg, mono_slot_conflicts, mono_slot_conflicts_same_type, mono_slot_conflicts_diff_type, mono_slot_conflicts_diff_type_injective, get_var_ty, get_var_tp, tp_get_kind, tp_get_child1, tp_get_child2, tp_get_sname, tp_display, CT_INT, CT_FLOAT, CT_BOOL, CT_STRING, CT_LIST, CT_VOID, CT_OPTION, CT_RESULT, CT_ITERATOR, CT_HANDLE, CT_CHANNEL, CT_MAP, CT_BYTES, CT_SET, CT_STRUCT, CT_ENUM, CT_I8, CT_I16, CT_I32, CT_U8, CT_U16, CT_U32, CT_U64, CT_CHAR}
 import parser.{
     get_annotation, has_annotation, is_literal_string_part,
     node_args, node_assoc_types, node_arms, node_body, node_captures, node_col, node_condition,
@@ -20,6 +20,7 @@ import diagnostics.{
     diag_push_allows, diag_warn_at,
     ICE_SEG_UNSOLVED_TYPEVAR, ICE_SEG_UNHANDLED_KIND, ICE_SEG_TID_OUT_OF_RANGE,
     ICE_SEG_ERASED_SLOT, diag_is_ice_seg,
+    NON_EXHAUSTIVE_MATCH,
     TYPE_ERROR, CANNOT_INFER_TYPE, NOT_ITERABLE, CAPABILITY_BUDGET, QM_INVALID_OPERAND, UNDEFINED_FUNCTION,
     UNRESOLVED_METHOD, AMBIGUOUS_METHOD_CALL, MISSING_DISPLAY_IMPL,
     UNDEFINED_VARIABLE, UNKNOWN_TYPE, QM_RESULT_IN_NON_RESULT,
@@ -62,40 +63,61 @@ effect TypeCheck {
 //
 // The pipeline: lex → parse → typecheck → codegen
 
-// ── Type kind constants ─────────────────────────────────────────────
-let TK_INT = 0
-let TK_FLOAT = 1
-let TK_BOOL = 2
-let TK_STR = 3
-let TK_VOID = 4
-let TK_LIST = 5
-let TK_OPTION = 6
-let TK_RESULT = 7
-let TK_FN = 8
-let TK_STRUCT = 9
-let TK_ENUM = 10
-let TK_TYPEVAR = 11
-let TK_UNKNOWN = 12
-let TK_CLOSURE = 13
-let TK_ITERATOR = 14
-let TK_HANDLE = 15
-let TK_CHANNEL = 16
-let TK_TUPLE = 17
-let TK_MAP = 18
-let TK_BYTES = 19
-let TK_SET = 20
-let TK_I8 = 21
-let TK_I16 = 22
-let TK_I32 = 23
-let TK_U8 = 24
-let TK_U16 = 25
-let TK_U32 = 26
-let TK_U64 = 27
-let TK_CHAR = 28
+// ── Type kinds ──────────────────────────────────────────────────────
+// The discriminant of an interned type. A real enum, not a `let` Int: a kind
+// reached by an `if k == ...` chain falls through silently to whatever default
+// the chain ends in, which is how a speller comes to answer a plausible-wrong
+// tag for TyKind.Fn or TyKind.Closure. Typed as TyKind end to end — never
+// stored back into an Int (see ast.bl's node_kind_name(kind: Int) for the trap:
+// widening an enum to Int throws exhaustiveness away).
+pub type TyKind {
+    Int, Float, Bool, Str, Void,
+    List, Option, Result, Fn, Struct, Enum,
+    Typevar, Unknown, Closure, Iterator, Handle, Channel,
+    Tuple, Map, Bytes, Set,
+    I8, I16, I32, U8, U16, U32, U64, Char
+}
+
+// Stable spelling of a kind, for the ty_intern key. A match, not Display: it is
+// the one place the whole kind set must be enumerated, so a kind added without
+// a spelling fails to compile here rather than colliding in the intern map.
+fn tk_name(k: TyKind) -> Str {
+    match k {
+        TyKind.Int => "Int"
+        TyKind.Float => "Float"
+        TyKind.Bool => "Bool"
+        TyKind.Str => "Str"
+        TyKind.Void => "Void"
+        TyKind.List => "List"
+        TyKind.Option => "Option"
+        TyKind.Result => "Result"
+        TyKind.Fn => "Fn"
+        TyKind.Struct => "Struct"
+        TyKind.Enum => "Enum"
+        TyKind.Typevar => "Typevar"
+        TyKind.Unknown => "Unknown"
+        TyKind.Closure => "Closure"
+        TyKind.Iterator => "Iterator"
+        TyKind.Handle => "Handle"
+        TyKind.Channel => "Channel"
+        TyKind.Tuple => "Tuple"
+        TyKind.Map => "Map"
+        TyKind.Bytes => "Bytes"
+        TyKind.Set => "Set"
+        TyKind.I8 => "I8"
+        TyKind.I16 => "I16"
+        TyKind.I32 => "I32"
+        TyKind.U8 => "U8"
+        TyKind.U16 => "U16"
+        TyKind.U32 => "U32"
+        TyKind.U64 => "U64"
+        TyKind.Char => "Char"
+    }
+}
 
 // ── Type pool ───────────────────────────────────────────────────────
 pub type TypePoolEntry {
-    kind: Int
+    kind: TyKind
     name: Str
     inner1: Int
     inner2: Int
@@ -321,7 +343,7 @@ fn tc_type_has_display_impl(tname: Str) -> Int {
 // (the codegen E0505 backstop catches genuine misses). Returning 0 emits a hard
 // typecheck error, so over-strictness would reject valid programs — including
 // the compiler typechecking itself during `task regen`. When unsure: return 1.
-fn tc_method_resolvable_on_type(obj_k: Int, tname: Str, method: Str) -> Int {
+fn tc_method_resolvable_on_type(obj_k: TyKind, tname: Str, method: Str) -> Int {
     // (a) user method + ALL trait-impl methods. Trait-impl methods register
     //     under the trait-qualified key `{T}_{trait}_{m}` (sb3125), so consult
     //     the method→traits index; a bare inherent fnsig `{T}_{m}` still counts.
@@ -345,11 +367,11 @@ fn tc_method_resolvable_on_type(obj_k: Int, tname: Str, method: Str) -> Int {
     }
     // (c') str-backed enum intrinsics (to_str/from_str) are synthesized in
     //      codegen (codegen_stmt.bl:5983) and not modeled here → fail-open.
-    if obj_k == TK_ENUM && (method == "to_str" || method == "from_str") { return 1 }
+    if obj_k == TyKind.Enum && (method == "to_str" || method == "from_str") { return 1 }
     // (d) closure-typed struct field invoked like a method. Closure fields lower
-    //     to TK_TYPEVAR("Fn"), not a closure kind, so reuse the callable-field
+    //     to TyKind.Typevar("Fn"), not a closure kind, so reuse the callable-field
     //     name registry (the same signal that suppresses W0501).
-    if obj_k == TK_STRUCT && is_callable_field_name(method) != 0 { return 1 }
+    if obj_k == TyKind.Struct && is_callable_field_name(method) != 0 { return 1 }
     // (e) trait/stdlib methods whose receiver-type resolution is not modeled at
     //     typecheck: `.into()` (From-trait auto-conversion), stdlib-type methods
     //     like `Instant.to_rfc3339()`, channel ops, etc. This is the SAME name
@@ -370,26 +392,26 @@ fn tc_method_resolvable_on_type(obj_k: Int, tname: Str, method: Str) -> Int {
 
 // E0514 helper (5q5jwz/wbf74w): does a type id have a usable Display impl?
 // Returns 1 for builtin-scalar Display (Int/Float/Bool/Char/Str) or a user
-// type with `impl Display`. Returns 0 for TK_UNKNOWN / TK_TYPEVAR so callers
+// type with `impl Display`. Returns 0 for TyKind.Unknown / TyKind.Typevar so callers
 // SKIP the check (Display is unknowable for unresolved/generic types).
 fn tc_type_id_has_display(tid: Int) -> Int {
     let k = type_kind(tid)
-    if k == TK_UNKNOWN || k == TK_TYPEVAR { return 0 }
-    if k == TK_INT || k == TK_FLOAT || k == TK_BOOL || k == TK_CHAR || k == TK_STR { return 1 }
+    if k == TyKind.Unknown || k == TyKind.Typevar { return 0 }
+    if k == TyKind.Int || k == TyKind.Float || k == TyKind.Bool || k == TyKind.Char || k == TyKind.Str { return 1 }
     // Sized integers are Display-able scalars — interpolation lowers them to
     // %lld/%llu just like Int (codegen_expr emit_interp_string CT_I8..CT_U64).
     if is_sized_int(k) != 0 { return 1 }
     // Tuples derive Display structurally when every element is Display (spec
     // §3.6); codegen renders them "(e0, e1, ...)". An empty tuple has nothing
     // non-Display, so it is trivially Display.
-    if k == TK_TUPLE {
+    if k == TyKind.Tuple {
         let te = ty_pool.get(tid).unwrap()
         let mut i = 0
         while i < te.params_count {
             let et = ty_param_list.get(te.params_start + i).unwrap()
             let ek = type_kind(et)
             // Fail-open on unresolved/generic elements — unknowable, not absent.
-            if ek != TK_UNKNOWN && ek != TK_TYPEVAR && tc_type_id_has_display(et) == 0 {
+            if ek != TyKind.Unknown && ek != TyKind.Typevar && tc_type_id_has_display(et) == 0 {
                 return 0
             }
             i = i + 1
@@ -403,7 +425,7 @@ fn tc_type_id_has_display(tid: Int) -> Int {
     // now carries an instance tid (br qw7v90 regression). strip_module_qualifier
     // mirrors the bare key form; for non-struct/enum kinds type_to_str already
     // returns the plain scalar name, so fall back to it.
-    if k == TK_STRUCT || k == TK_ENUM {
+    if k == TyKind.Struct || k == TyKind.Enum {
         return tc_type_has_display_impl(strip_module_qualifier(ty_pool.get(tid).unwrap().name))
     }
     tc_type_has_display_impl(type_to_str(tid))
@@ -449,7 +471,6 @@ let mut tc_in_closure_depth: Int = 0
 let mut tc_fn_body_block: Int = 0
 
 let mut tc_errors: List[Str] = []
-let mut tc_warnings: List[Str] = []
 
 // ── Deprecation tracking ───────────────────────────────────────────
 let mut depr_fn_nodes: Map[Str, Int] = Map()
@@ -579,7 +600,7 @@ pub let mut tc_structural_nested_instances: Int = 0
 
 // ── Type creation ───────────────────────────────────────────────────
 
-fn new_type(kind: Int, name: Str) -> Int {
+fn new_type(kind: TyKind, name: Str) -> Int {
     let idx = ty_pool.len()
     ty_pool.push(TypePoolEntry { kind: kind, name: name, inner1: -1, inner2: -1, params_start: -1, params_count: 0 })
     idx
@@ -595,7 +616,7 @@ fn new_type(kind: Int, name: Str) -> Int {
 // THE CENTRAL INVARIANT: the key is built over the RAW CHILD TIDS AS STORED — never
 // tc_resolve'd, never over a child's recursive structure, and ABOVE ALL never with an
 // unbound metavar normalized to a common token. make_metavar mints a FRESH, never-interned
-// TK_UNKNOWN entry for every unannotated `Map()` / `Set()` / `None` / `[]`, and that
+// TyKind.Unknown entry for every unannotated `Map()` / `Set()` / `None` / `[]`, and that
 // freshness is exactly what lets each one bind independently later (textbook HM). If the
 // key ever collapsed two different unbound metavars onto one string, `let a: Option[Int] =
 // None; let b: Option[Str] = None` would share one alpha — binding it via `a` would
@@ -605,13 +626,13 @@ fn new_type(kind: Int, name: Str) -> Int {
 // tripwire for this invariant and must never be deleted.
 //
 // Safe to share a hit across callers because: (1) a compound ty_pool entry is NEVER
-// mutated post-construction except bind_metavar, which is gated to TK_UNKNOWN entries only
+// mutated post-construction except bind_metavar, which is gated to TyKind.Unknown entries only
 // and therefore never touches a compound; (2) ty_param_list is append-only (push/clear,
 // no set/pop), so a compound's params slice is frozen at construction.
 //
 // The key is deliberately FINER than tc_tid_same_type on two axes (finer only ever merges
 // less, never wrongly collapses): `name` is part of the key for EVERY kind (not just
-// TK_STRUCT/TK_ENUM/TK_TYPEVAR), and `name` is RAW, never strip_module_qualifier'd —
+// TyKind.Struct/TyKind.Enum/TyKind.Typevar), and `name` is RAW, never strip_module_qualifier'd —
 // stripping would collapse `helper.Box[Int]` with `Box[Int]` across modules, the exact
 // cross-module collision mono_phys_base (codegen_types.bl:1246) exists to prevent (br
 // q4etvt). Coarser-than-tc_tid_same_type is the one direction that would be unsound.
@@ -634,13 +655,13 @@ fn ty_intern_args_key(args: List[Int]) -> Str {
     s
 }
 
-fn ty_intern_key(kind: Int, name: Str, inner1: Int, inner2: Int, args: List[Int]) -> Str {
-    "{kind}|{name}|{inner1}|{inner2}|{ty_intern_args_key(args)}"
+fn ty_intern_key(kind: TyKind, name: Str, inner1: Int, inner2: Int, args: List[Int]) -> Str {
+    "{tk_name(kind)}|{name}|{inner1}|{inner2}|{ty_intern_args_key(args)}"
 }
 
 // Interning ctor for the fixed-arity shapes (List/Option/Result/Map/Set): at most two
 // scalar inner slots, no ty_param_list involvement.
-fn ty_intern_simple(kind: Int, name: Str, inner1: Int, inner2: Int) -> Int {
+fn ty_intern_simple(kind: TyKind, name: Str, inner1: Int, inner2: Int) -> Int {
     let key = ty_intern_key(kind, name, inner1, inner2, [])
     match ty_intern.get(key) {
         Some(v) => return v
@@ -658,7 +679,7 @@ fn ty_intern_simple(kind: Int, name: Str, inner1: Int, inner2: Int) -> Int {
 // HIT touches ty_param_list not at all — there is no rollback path to get wrong, because
 // there is nothing to roll back. A MISS pushes exactly once, in the original order,
 // reproducing the pre-interning body byte-for-byte.
-fn ty_intern_variadic(kind: Int, name: Str, inner1: Int, args: List[Int]) -> Int {
+fn ty_intern_variadic(kind: TyKind, name: Str, inner1: Int, args: List[Int]) -> Int {
     let key = ty_intern_key(kind, name, inner1, -1, args)
     match ty_intern.get(key) {
         Some(v) => return v
@@ -677,8 +698,12 @@ fn ty_intern_variadic(kind: Int, name: Str, inner1: Int, args: List[Int]) -> Int
     t
 }
 
-fn make_list_type(inner: Int) -> Int {
-    ty_intern_simple(TK_LIST, "List", inner, -1)
+// `pub` FOR THE TEST ONLY — see make_option_type below. List and Set are the two
+// containers whose structural child access the collapse leans on hardest, so
+// tests/test_tc_tid_structural_accessors.bl builds them directly rather than hoping a
+// probe program happens to mint the nesting depth a row needs.
+pub fn make_list_type(inner: Int) -> Int {
+    ty_intern_simple(TyKind.List, "List", inner, -1)
 }
 
 // `pub` FOR THE TEST ONLY — same precedent as make_fn_type below: proving the
@@ -687,41 +712,41 @@ fn make_list_type(inner: Int) -> Int {
 // no surface program can do (an unbound metavar never survives to a fully-typechecked
 // program — it either binds or raises E0301 at the boundary).
 pub fn make_option_type(inner: Int) -> Int {
-    ty_intern_simple(TK_OPTION, "Option", inner, -1)
+    ty_intern_simple(TyKind.Option, "Option", inner, -1)
 }
 
 pub fn make_result_type(ok_type: Int, err_type: Int) -> Int {
-    ty_intern_simple(TK_RESULT, "Result", ok_type, err_type)
+    ty_intern_simple(TyKind.Result, "Result", ok_type, err_type)
 }
 
 // `pub` FOR THE TEST ONLY — zero non-test callers, same precedent as resolve_mono_slot
-// (src/codegen_stmt.bl). TK_FN is the one kind tc_tid_to_c_tag has no arm for, so this is
+// (src/codegen_stmt.bl). TyKind.Fn is the one kind tc_tid_to_c_tag has no arm for, so this is
 // the only way to CONSTRUCT the input that proves its ICE_SEG_UNHANDLED_KIND tail actually
 // fires. Without it that arm would be armed-but-never-proven-to-fire, which is exactly the
 // gap tests/test_fes70z_mono_slot_ice.bl exists to close. `fn(...)` ANNOTATIONS do not
-// reach here — they lower to TK_TYPEVAR("Fn") — so there is no surface syntax that
-// produces a TK_FN tid, hence no fixture alternative (br hsgsbp).
+// reach here — they lower to TyKind.Typevar("Fn") — so there is no surface syntax that
+// produces a TyKind.Fn tid, hence no fixture alternative (br hsgsbp).
 pub fn make_fn_type(ret_type: Int, param_types: List[Int]) -> Int {
-    ty_intern_variadic(TK_FN, "Fn", ret_type, param_types)
+    ty_intern_variadic(TyKind.Fn, "Fn", ret_type, param_types)
 }
 
-// INTERNS (br v76b0b Stage 3) — safe because tc_tid_same_type compares TK_TYPEVAR by
-// name alone (:11672-11673 above), so name-keying IS its equality, and a TK_TYPEVAR entry
+// INTERNS (br v76b0b Stage 3) — safe because tc_tid_same_type compares TyKind.Typevar by
+// name alone (:11672-11673 above), so name-keying IS its equality, and a TyKind.Typevar entry
 // is never mutated post-construction (same invariant as every other ty_intern_* ctor).
 // Isolated as its own stage/commit: changes tid identity for generic BASE shapes, a wider
 // blast radius than compound instances — revert this stage alone if the monodedup
 // counters move the wrong way or task ci reddens; Stages 1-2 already deliver the ticket's
 // measured goal independent of this one.
 fn make_typevar(name: Str) -> Int {
-    ty_intern_simple(TK_TYPEVAR, name, -1, -1)
+    ty_intern_simple(TyKind.Typevar, name, -1, -1)
 }
 
 // `pub` FOR THE TEST ONLY — see make_option_type above.
 pub fn make_tuple_type(elem_types: List[Int]) -> Int {
-    ty_intern_variadic(TK_TUPLE, "Tuple", -1, elem_types)
+    ty_intern_variadic(TyKind.Tuple, "Tuple", -1, elem_types)
 }
 
-// A monomorphized struct instance (`Box[Int]`): a fresh TK_STRUCT entry named
+// A monomorphized struct instance (`Box[Int]`): a fresh TyKind.Struct entry named
 // after the generic base, with its concrete type-args stored variadically in
 // ty_param_list[params_start .. +params_count] — exactly how make_tuple_type /
 // make_fn_type store their element/param tids. The generic base declared by a
@@ -745,32 +770,33 @@ pub fn make_tuple_type(elem_types: List[Int]) -> Int {
 // to prove the interning invariant at the ctor boundary, not just end-to-end through a
 // compiled program.
 pub fn make_struct_instance_type(base_name: Str, arg_types: List[Int]) -> Int {
-    ty_intern_variadic(TK_STRUCT, base_name, -1, arg_types)
+    ty_intern_variadic(TyKind.Struct, base_name, -1, arg_types)
 }
 
 // A generic-enum INSTANCE tid (`Tree[Int]`), the enum analogue of
 // make_struct_instance_type (jjhnf3). Records the concrete type-args variadically
 // in ty_param_list[params_start..] so tc_tid_struct_arg_* / tc_tid_struct_mono_name
-// (all kind-agnostic once widened to TK_ENUM) can recover them at codegen, minting
+// (all kind-agnostic once widened to TyKind.Enum) can recover them at codegen, minting
 // the mono typedef `blink_Tree_Int` instead of the erased bare `blink_Tree`. INTERNS
 // (br v76b0b) — see make_struct_instance_type above.
 fn make_enum_instance_type(base_name: Str, arg_types: List[Int]) -> Int {
-    ty_intern_variadic(TK_ENUM, base_name, -1, arg_types)
+    ty_intern_variadic(TyKind.Enum, base_name, -1, arg_types)
 }
 
 
 // `pub` FOR THE TEST ONLY — see make_option_type above.
 pub fn make_map_type(key_type: Int, value_type: Int) -> Int {
-    ty_intern_simple(TK_MAP, "Map", key_type, value_type)
+    ty_intern_simple(TyKind.Map, "Map", key_type, value_type)
 }
 
-fn make_set_type(elem_type: Int) -> Int {
-    ty_intern_simple(TK_SET, "Set", elem_type, -1)
+// `pub` FOR THE TEST ONLY — see make_list_type above.
+pub fn make_set_type(elem_type: Int) -> Int {
+    ty_intern_simple(TyKind.Set, "Set", elem_type, -1)
 }
 
 // ── Metavariables (Hindley-Milner inference discipline) ─────────────
 //
-// A metavariable is a *fresh* TK_UNKNOWN pool entry (minted per binding via
+// A metavariable is a *fresh* TyKind.Unknown pool entry (minted per binding via
 // make_metavar), distinct from the single shared TYPE_UNKNOWN sentinel so each
 // unannotated `[]` / `None` / `Map()` / `Set()` gets its OWN α that can be pinned
 // independently by a later constraining use. This is textbook HM: an α starts
@@ -780,26 +806,26 @@ fn make_set_type(elem_type: Int) -> Int {
 // than the pre-decision silent Void-erasure. Decision: decisions/under-determined-types.md.
 //
 // Representation rides the existing functional pool (no new store):
-//   unbound α : kind == TK_UNKNOWN, inner1 == -1   (new_type's default)
-//   bound   α : kind == TK_UNKNOWN, inner1 == <solution tid>  (>= 0, set via ty_pool.set)
+//   unbound α : kind == TyKind.Unknown, inner1 == -1   (new_type's default)
+//   bound   α : kind == TyKind.Unknown, inner1 == <solution tid>  (>= 0, set via ty_pool.set)
 // The shared TYPE_UNKNOWN singleton keeps inner1 == -1 forever (never a per-binding
 // α, never bound), so resolve() is the identity on it — Stage-1-safe.
 
 // `pub` FOR THE TEST ONLY — same precedent as make_fn_type. Constructing an unbound
-// metavar directly is the only way to prove tc_tid_tag_at's TK_UNKNOWN arm (br vbcw1e
+// metavar directly is the only way to prove tc_tid_tag_at's TyKind.Unknown arm (br vbcw1e
 // Stage 2) actually fires at either tag position: no fully-typechecked surface
 // program can produce one, since check_types resolves or E0301's every metavar at
 // the region boundary (8vcj2c) before codegen ever sees it.
 pub fn make_metavar() -> Int {
     // A fresh, independently-bindable α. NOT the shared TYPE_UNKNOWN singleton.
-    new_type(TK_UNKNOWN, "?")
+    new_type(TyKind.Unknown, "?")
 }
 
 fn tc_is_unbound_metavar(tid: Int) -> Int {
     if tid < 0 || tid >= ty_pool.len() { return 0 }
     if tid == TYPE_UNKNOWN { return 0 }
     let e = ty_pool.get(tid).unwrap()
-    if e.kind == TK_UNKNOWN && e.inner1 < 0 { return 1 }
+    if e.kind == TyKind.Unknown && e.inner1 < 0 { return 1 }
     0
 }
 
@@ -815,7 +841,7 @@ fn tc_resolve(tid0: Int) -> Int {
     while steps < 10000 {
         if tid < 0 || tid >= ty_pool.len() { return tid }
         let e = ty_pool.get(tid).unwrap()
-        if e.kind == TK_UNKNOWN && e.inner1 >= 0 {
+        if e.kind == TyKind.Unknown && e.inner1 >= 0 {
             tid = e.inner1
             steps = steps + 1
         } else {
@@ -833,14 +859,14 @@ fn tc_occurs_in(needle: Int, hay0: Int) -> Int {
     if hay == needle { return 1 }
     let e = ty_pool.get(hay).unwrap()
     let k = e.kind
-    if k == TK_LIST || k == TK_OPTION || k == TK_SET {
+    if k == TyKind.List || k == TyKind.Option || k == TyKind.Set {
         return tc_occurs_in(needle, e.inner1)
     }
-    if k == TK_RESULT || k == TK_MAP {
+    if k == TyKind.Result || k == TyKind.Map {
         if tc_occurs_in(needle, e.inner1) != 0 { return 1 }
         return tc_occurs_in(needle, e.inner2)
     }
-    if k == TK_TUPLE || k == TK_STRUCT || k == TK_ENUM {
+    if k == TyKind.Tuple || k == TyKind.Struct || k == TyKind.Enum {
         let mut i = 0
         while i < e.params_count {
             let c = ty_param_list.get(e.params_start + i).unwrap()
@@ -873,21 +899,21 @@ fn bind_metavar(a0: Int, sol0: Int) -> Int {
 // under-determined predicate: check_arg_value uses it to decide whether to take
 // the unify path, and the Stage-3 region-boundary check uses it to fire E0301.
 // NOTE: does NOT reuse tc_tid_encodable — that predicate does not descend
-// TK_LIST/TK_SET (verified) and would miss an under-determined list element.
+// TyKind.List/TyKind.Set (verified) and would miss an under-determined list element.
 fn tc_tid_has_unbound_metavar(tid0: Int) -> Int {
     let tid = tc_resolve(tid0)
     if tid < 0 || tid >= ty_pool.len() { return 0 }
     if tc_is_unbound_metavar(tid) != 0 { return 1 }
     let e = ty_pool.get(tid).unwrap()
     let k = e.kind
-    if k == TK_LIST || k == TK_OPTION || k == TK_SET {
+    if k == TyKind.List || k == TyKind.Option || k == TyKind.Set {
         return tc_tid_has_unbound_metavar(e.inner1)
     }
-    if k == TK_RESULT || k == TK_MAP {
+    if k == TyKind.Result || k == TyKind.Map {
         if tc_tid_has_unbound_metavar(e.inner1) != 0 { return 1 }
         return tc_tid_has_unbound_metavar(e.inner2)
     }
-    if k == TK_TUPLE || k == TK_STRUCT || k == TK_ENUM {
+    if k == TyKind.Tuple || k == TyKind.Struct || k == TyKind.Enum {
         let mut i = 0
         while i < e.params_count {
             let c = ty_param_list.get(e.params_start + i).unwrap()
@@ -908,11 +934,11 @@ fn tc_infer_annotation_hint(tid0: Int) -> Str {
     if tid < 0 || tid >= ty_pool.len() { return ": T" }
     let e = ty_pool.get(tid).unwrap()
     let k = e.kind
-    if k == TK_LIST { return ": List[T]" }
-    if k == TK_OPTION { return ": T?" }
-    if k == TK_SET { return ": Set[T]" }
-    if k == TK_MAP { return ": Map[K, V]" }
-    if k == TK_STRUCT || k == TK_ENUM {
+    if k == TyKind.List { return ": List[T]" }
+    if k == TyKind.Option { return ": T?" }
+    if k == TyKind.Set { return ": Set[T]" }
+    if k == TyKind.Map { return ": Map[K, V]" }
+    if k == TyKind.Struct || k == TyKind.Enum {
         return ": {strip_module_qualifier(e.name)}[...]"
     }
     ": T"
@@ -937,7 +963,7 @@ fn tc_pin_ops_trait_receiver(trait_name: Str, method: Str, args_sl: Int) ! TypeC
         // insert(m,k,v): arg1→key, arg2→value. get/contains_key/remove(m,k): arg1→key.
         // (len/keys/values are 1-arg → early-returned above.) Every 2+-arg MapOps
         // method takes the key at arg1, so arg1→key is always right here.
-        if rk != TK_MAP { return }
+        if rk != TyKind.Map { return }
         let key_a = ty_pool.get(recv).unwrap().inner1
         let val_a = ty_pool.get(recv).unwrap().inner2
         if method == "insert" || method == "get" || method == "contains_key" || method == "remove" {
@@ -953,7 +979,7 @@ fn tc_pin_ops_trait_receiver(trait_name: Str, method: Str, args_sl: Int) ! TypeC
     if trait_name == "SetOps" {
         // insert/contains/remove(s,e): arg1→elem. union(s, other) takes a Set, NOT
         // an element — must NOT pin from it (would infer Set[Set[T]]).
-        if rk != TK_SET { return }
+        if rk != TyKind.Set { return }
         if method != "insert" && method != "contains" && method != "remove" { return }
         let elem_a = ty_pool.get(recv).unwrap().inner1
         if tc_tid_has_unbound_metavar(elem_a) != 0 {
@@ -965,7 +991,7 @@ fn tc_pin_ops_trait_receiver(trait_name: Str, method: Str, args_sl: Int) ! TypeC
         // Only push(l,x) and set(l,i,x) carry the element at the LAST arg. get(l,i),
         // pop(l), concat(l,other), slice(l,s,e) do NOT — their last arg is an Int
         // index/bound or another List, so pinning from it mis-infers the element.
-        if rk != TK_LIST { return }
+        if rk != TyKind.List { return }
         if method != "push" && method != "set" { return }
         let elem_a = ty_pool.get(recv).unwrap().inner1
         if tc_tid_has_unbound_metavar(elem_a) != 0 {
@@ -1000,7 +1026,7 @@ fn tc_report_under_determined(vname: Str, tid: Int, decl_node: Int) ! Diag.Repor
 // check_arg_value's TYPE_UNKNOWN early-return does today). Returns 1 if the two
 // types can be made equal, 0 on a hard structural mismatch. Same-kind compound
 // types unify element-wise; unequal concrete kinds fail. This is intentionally
-// permissive toward the legacy TYPE_UNKNOWN singleton and bare TK_TYPEVAR (both
+// permissive toward the legacy TYPE_UNKNOWN singleton and bare TyKind.Typevar (both
 // treated as "unifies with anything, no bind") so Stage 1 is behavior-neutral —
 // only fresh per-binding metavars from make_metavar ever get pinned.
 fn tc_unify(a0: Int, b0: Int) -> Int {
@@ -1013,7 +1039,7 @@ fn tc_unify(a0: Int, b0: Int) -> Int {
     if a == TYPE_UNKNOWN || b == TYPE_UNKNOWN { return 1 }
     let ka0 = ty_pool.get(a).unwrap().kind
     let kb0 = ty_pool.get(b).unwrap().kind
-    if ka0 == TK_TYPEVAR || kb0 == TK_TYPEVAR { return 1 }
+    if ka0 == TyKind.Typevar || kb0 == TyKind.Typevar { return 1 }
     // Unbound metavar on either side: pin it to the other side.
     if tc_is_unbound_metavar(a) != 0 { return bind_metavar(a, b) }
     if tc_is_unbound_metavar(b) != 0 { return bind_metavar(b, a) }
@@ -1022,14 +1048,14 @@ fn tc_unify(a0: Int, b0: Int) -> Int {
     let ka = ta.kind
     let kb = tb.kind
     if ka != kb { return 0 }
-    if ka == TK_LIST || ka == TK_OPTION || ka == TK_SET {
+    if ka == TyKind.List || ka == TyKind.Option || ka == TyKind.Set {
         return tc_unify(ta.inner1, tb.inner1)
     }
-    if ka == TK_RESULT || ka == TK_MAP {
+    if ka == TyKind.Result || ka == TyKind.Map {
         if tc_unify(ta.inner1, tb.inner1) == 0 { return 0 }
         return tc_unify(ta.inner2, tb.inner2)
     }
-    if ka == TK_TUPLE {
+    if ka == TyKind.Tuple {
         if ta.params_count != tb.params_count { return 0 }
         let mut i = 0
         while i < ta.params_count {
@@ -1040,7 +1066,7 @@ fn tc_unify(a0: Int, b0: Int) -> Int {
         }
         return 1
     }
-    if ka == TK_STRUCT || ka == TK_ENUM {
+    if ka == TyKind.Struct || ka == TyKind.Enum {
         if strip_module_qualifier(ta.name) != strip_module_qualifier(tb.name) { return 0 }
         if ta.params_count > 0 && tb.params_count > 0 {
             if ta.params_count != tb.params_count { return 0 }
@@ -1125,7 +1151,7 @@ fn get_struct_field_tid(struct_tid: Int, fname: Str) -> Int {
 fn tc_struct_base_tid(tid: Int) -> Int {
     if tid < 0 || tid >= ty_pool.len() { return tid }
     let t = ty_pool.get(tid).unwrap()
-    if t.kind != TK_STRUCT { return tid }
+    if t.kind != TyKind.Struct { return tid }
     if t.params_count == 0 { return tid }
     let base = lookup_named_type(strip_module_qualifier(t.name))
     if base == -1 { return tid }
@@ -1191,40 +1217,40 @@ fn substitute_typevar_tid(t: Int, binds: Map[Str, Int]) -> Int {
     if t < 0 || t >= ty_pool.len() { return t }
     let e = ty_pool.get(t).unwrap()
     let k = e.kind
-    if k == TK_TYPEVAR {
+    if k == TyKind.Typevar {
         match binds.get(e.name) {
             Some(tid) => return tid
             None => return t
         }
     }
-    if k == TK_LIST {
+    if k == TyKind.List {
         let inner = substitute_typevar_tid(e.inner1, binds)
         if inner == e.inner1 { return t }
         return make_list_type(inner)
     }
-    if k == TK_OPTION {
+    if k == TyKind.Option {
         let inner = substitute_typevar_tid(e.inner1, binds)
         if inner == e.inner1 { return t }
         return make_option_type(inner)
     }
-    if k == TK_SET {
+    if k == TyKind.Set {
         let inner = substitute_typevar_tid(e.inner1, binds)
         if inner == e.inner1 { return t }
         return make_set_type(inner)
     }
-    if k == TK_RESULT {
+    if k == TyKind.Result {
         let ok = substitute_typevar_tid(e.inner1, binds)
         let er = substitute_typevar_tid(e.inner2, binds)
         if ok == e.inner1 && er == e.inner2 { return t }
         return make_result_type(ok, er)
     }
-    if k == TK_MAP {
+    if k == TyKind.Map {
         let kk = substitute_typevar_tid(e.inner1, binds)
         let vv = substitute_typevar_tid(e.inner2, binds)
         if kk == e.inner1 && vv == e.inner2 { return t }
         return make_map_type(kk, vv)
     }
-    if k == TK_TUPLE {
+    if k == TyKind.Tuple {
         // Read every original element into `elems` BEFORE calling make_tuple_type:
         // the constructor appends to ty_param_list, the same array we read
         // e.params_start.. from, so finishing the read first avoids aliasing.
@@ -1241,10 +1267,10 @@ fn substitute_typevar_tid(t: Int, binds: Map[Str, Int]) -> Int {
         if changed == 0 { return t }
         return make_tuple_type(elems)
     }
-    if k == TK_STRUCT {
+    if k == TyKind.Struct {
         // A monomorphized struct instance (`Box[T]`, params_count>=1) may embed a
         // typevar in a type-arg; substitute each and rebuild via make_struct_
-        // instance_type. Same aliasing guard as TK_TUPLE: make_struct_instance_type
+        // instance_type. Same aliasing guard as TyKind.Tuple: make_struct_instance_type
         // appends to ty_param_list (the array we read e.params_start.. from), so
         // finish the read into `elems` FIRST. The bare generic base (params_count 0)
         // has no type-args — the loop is empty, changed stays 0, `t` returns as-is.
@@ -1261,8 +1287,8 @@ fn substitute_typevar_tid(t: Int, binds: Map[Str, Int]) -> Int {
         if changed == 0 { return t }
         return make_struct_instance_type(e.name, elems)
     }
-    if k == TK_ENUM {
-        // The enum twin of the TK_STRUCT arm: a monomorphized enum instance (`Box[T]`,
+    if k == TyKind.Enum {
+        // The enum twin of the TyKind.Struct arm: a monomorphized enum instance (`Box[T]`,
         // params_count>=1) may embed a typevar in a type-arg; substitute each and rebuild
         // via make_enum_instance_type. Same aliasing guard — read all originals into
         // `elems` BEFORE the constructor appends to ty_param_list. A bare generic enum
@@ -1281,7 +1307,7 @@ fn substitute_typevar_tid(t: Int, binds: Map[Str, Int]) -> Int {
         if changed == 0 { return t }
         return make_enum_instance_type(e.name, elems)
     }
-    // TK_FN and every scalar/nominal kind: no embedded typevar to rewrite.
+    // TyKind.Fn and every scalar/nominal kind: no embedded typevar to rewrite.
     t
 }
 
@@ -1312,7 +1338,7 @@ fn tc_mono_binds_map(mono_tparams_sl: Int, mono_arg_tids: List[Int]) -> Map[Str,
 // binders — `GT[(T, Int)]` inside `fn wrap[T]` — be classified and spelled at the
 // literal, where the only alternative was the I0001 chokepoint (br 6cvvh8). The
 // substitution happens HERE rather than by relaxing an encodability predicate on
-// purpose: a typevar has no C spelling, so admitting TK_TYPEVAR into
+// purpose: a typevar has no C spelling, so admitting TyKind.Typevar into
 // tc_tid_tuple_elem_faithful would let a genuinely-unsolved `T` produce a segment.
 // Eliminate the typevar; keep the predicates conservative.
 //
@@ -1339,7 +1365,7 @@ pub fn tc_tid_subst_mono(tid: Int, mono_tparams_sl: Int, mono_arg_tids: List[Int
 // of the tuple aliasing hazard substitute_typevar_tid guards against. The first
 // CONCRETE binding wins; a later concrete arg overwrites only a placeholder bind
 // (a non-concrete metavar/typevar) left by an earlier metavar-carrying sibling
-// arg (see the TK_TYPEVAR branch below); kind mismatches (arg not shaped like the
+// arg (see the TyKind.Typevar branch below); kind mismatches (arg not shaped like the
 // param) bind nothing.
 // A bind target is CONCRETE when, after following bound metavars, it is neither
 // an unbound metavar nor a bare typevar — i.e. it names a real type a downstream
@@ -1349,7 +1375,7 @@ fn bind_target_is_concrete(tid: Int) -> Int {
     let r = tc_resolve(tid)
     if r < 0 || r >= ty_pool.len() { return 0 }
     if tc_is_unbound_metavar(r) != 0 { return 0 }
-    if ty_pool.get(r).unwrap().kind == TK_TYPEVAR { return 0 }
+    if ty_pool.get(r).unwrap().kind == TyKind.Typevar { return 0 }
     1
 }
 
@@ -1358,7 +1384,7 @@ fn unify_typevar_binds(ptid: Int, atid: Int, binds: Map[Str, Int]) {
     if atid < 0 || atid >= ty_pool.len() { return }
     let pe = ty_pool.get(ptid).unwrap()
     let pk = pe.kind
-    if pk == TK_TYPEVAR {
+    if pk == TyKind.Typevar {
         // "First binding wins" is only correct among CONCRETE args. A
         // metavar-carrying arg — a bare `Map()`/`Set()` whose element is a fresh
         // unbound α — unifies its typevar against that α; recording it would poison
@@ -1381,16 +1407,16 @@ fn unify_typevar_binds(ptid: Int, atid: Int, binds: Map[Str, Int]) {
     }
     let ae = ty_pool.get(atid).unwrap()
     if ae.kind != pk { return }
-    if pk == TK_LIST || pk == TK_OPTION || pk == TK_SET {
+    if pk == TyKind.List || pk == TyKind.Option || pk == TyKind.Set {
         unify_typevar_binds(pe.inner1, ae.inner1, binds)
         return
     }
-    if pk == TK_RESULT || pk == TK_MAP {
+    if pk == TyKind.Result || pk == TyKind.Map {
         unify_typevar_binds(pe.inner1, ae.inner1, binds)
         unify_typevar_binds(pe.inner2, ae.inner2, binds)
         return
     }
-    if pk == TK_TUPLE {
+    if pk == TyKind.Tuple {
         if pe.params_count != ae.params_count { return }
         let mut i = 0
         while i < pe.params_count {
@@ -1401,13 +1427,13 @@ fn unify_typevar_binds(ptid: Int, atid: Int, binds: Map[Str, Int]) {
         }
         return
     }
-    if pk == TK_STRUCT || pk == TK_ENUM {
+    if pk == TyKind.Struct || pk == TyKind.Enum {
         // A generic struct/enum param (`b: Box[T]`, `n: Tree[T]`) binds its typevars
         // from an instance arg (`Box[Int]`, `Tree[Int]`). Both are nominal — the base
         // names must match (module-qualifier-stripped) as well as the arity, unlike
         // the structural tuple case above. Walk the type-args in lockstep. A bare
         // generic base (no args, params_count 0) has nothing to bind and the loop is
-        // empty. The TK_ENUM case covers a recursive generic-enum field (jjhnf3:
+        // empty. The TyKind.Enum case covers a recursive generic-enum field (jjhnf3:
         // `Branch(left: Tree[T], …)` unified against a `Tree[Int]` arg).
         if strip_module_qualifier(pe.name) != strip_module_qualifier(ae.name) { return }
         if pe.params_count != ae.params_count { return }
@@ -1557,9 +1583,9 @@ fn tc_node_has_ret_mint(n: Int) -> Int {
 //
 // The mint is the whole point. build_typevar_binds infers exclusively from ARGUMENT
 // types, so `fn mk[T]() -> RGT[T]` called as `mk()` gets empty binds,
-// substitute_typevar_tid's TK_TYPEVAR arm returns `T` unchanged, and the return type
+// substitute_typevar_tid's TyKind.Typevar arm returns `T` unchanged, and the return type
 // carries a BARE TYPEVAR. A bare typevar is invisible to every part of the metavar
-// machinery — tc_is_unbound_metavar counts only TK_UNKNOWN with inner1 < 0, and
+// machinery — tc_is_unbound_metavar counts only TyKind.Unknown with inner1 < 0, and
 // tc_unify's typevar arm returns 1 without binding — so typecheck passes clean, no
 // E0301 fires, and codegen erases the slot to "Void" at the emit_struct_lit
 // chokepoint (a loud I0001) or to a wrong mono name. Substituting α instead puts the
@@ -1654,16 +1680,16 @@ fn tc_pin_generic_args_from_binds(sig: Int, args_sl: Int, self_offset: Int) ! Ty
 // collision.
 //
 // tc_pin_admits_declared is the gate; each branch is load-bearing:
-//   TK_MAP/TK_SET      — the only kind whose params_count is never set (br farq9f;
+//   TyKind.Map/TyKind.Set      — the only kind whose params_count is never set (br farq9f;
 //                        make_map_type/make_set_type store inner1/inner2, not a
 //                        ty_param_list), so it must admit unconditionally rather
 //                        than fall into the params_count check below.
-//   TK_STRUCT/TK_ENUM  — excludes Option/Result/List/tuple/Handler returns, which
+//   TyKind.Struct/TyKind.Enum  — excludes Option/Result/List/tuple/Handler returns, which
 //                        is what keeps every existing tail-`None` / tail-`[]` /
 //                        tail-tuple return byte-identical.
 //   params_count > 0   — a monomorphic struct has nothing to pin.
 // The caller additionally requires an unbound metavar in the inferred value, which
-// excludes a bare TK_TYPEVAR, so a generic fn's `-> Box[T]` keeps its existing
+// excludes a bare TyKind.Typevar, so a generic fn's `-> Box[T]` keeps its existing
 // per-T monomorphization untouched.
 //
 // The unify result is deliberately discarded: callers invoke this only where
@@ -1684,8 +1710,8 @@ fn tc_pin_generic_args_from_binds(sig: Int, args_sl: Int, self_offset: Int) ! Ty
 fn tc_pin_admits_declared(d: Int) -> Int {
     if d < 0 || d >= ty_pool.len() { return 0 }
     let dt = ty_pool.get(d).unwrap()
-    if dt.kind == TK_MAP || dt.kind == TK_SET { return 1 }
-    if dt.kind != TK_STRUCT && dt.kind != TK_ENUM { return 0 }
+    if dt.kind == TyKind.Map || dt.kind == TyKind.Set { return 1 }
+    if dt.kind != TyKind.Struct && dt.kind != TyKind.Enum { return 0 }
     if dt.params_count == 0 { return 0 }
     1
 }
@@ -2024,9 +2050,6 @@ fn tc_error_at(msg: Str, node_id: Int) ! TypeCheck.Report, Diag.Report {
     diag_error_at("TypeError", TYPE_ERROR, msg, node_id, "")
 }
 
-fn tc_warn(msg: Str) ! TypeCheck.Report {
-    tc_warnings.push(msg)
-}
 
 // ── Incremental filter API ──────────────────────────────────────────
 
@@ -2075,12 +2098,12 @@ fn tc_memo_carrier_over_instance(ann_node: Int, carrier_tid: Int) {
 fn tc_carrier_has_instance_leaf(tid: Int) -> Int {
     if tid < 0 || tid >= ty_pool.len() { return 0 }
     let t = ty_pool.get(tid).unwrap()
-    if t.kind == TK_OPTION { return tc_leaf_is_instance_or_carrier(t.inner1) }
-    if t.kind == TK_RESULT {
+    if t.kind == TyKind.Option { return tc_leaf_is_instance_or_carrier(t.inner1) }
+    if t.kind == TyKind.Result {
         if tc_leaf_is_instance_or_carrier(t.inner1) != 0 { return 1 }
         return tc_leaf_is_instance_or_carrier(t.inner2)
     }
-    if t.kind == TK_TUPLE {
+    if t.kind == TyKind.Tuple {
         let mut i = 0
         while i < t.params_count {
             let et = ty_param_list.get(t.params_start + i).unwrap()
@@ -2094,8 +2117,8 @@ fn tc_carrier_has_instance_leaf(tid: Int) -> Int {
 fn tc_leaf_is_instance_or_carrier(tid: Int) -> Int {
     if tid < 0 || tid >= ty_pool.len() { return 0 }
     let t = ty_pool.get(tid).unwrap()
-    if t.kind == TK_STRUCT && t.params_count >= 1 { return 1 }
-    if t.kind == TK_OPTION || t.kind == TK_RESULT || t.kind == TK_TUPLE { return tc_carrier_has_instance_leaf(tid) }
+    if t.kind == TyKind.Struct && t.params_count >= 1 { return 1 }
+    if t.kind == TyKind.Option || t.kind == TyKind.Result || t.kind == TyKind.Tuple { return tc_carrier_has_instance_leaf(tid) }
     0
 }
 
@@ -2165,7 +2188,7 @@ fn resolve_type_ann(ann_node: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
         }
     }
     if name == "Bytes" {
-        return new_type(TK_BYTES, "Bytes")
+        return new_type(TyKind.Bytes, "Bytes")
     }
 
     let resolved = resolve_type_name(name)
@@ -2184,10 +2207,10 @@ fn resolve_type_ann(ann_node: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
         // live path, so a Map key or Set element reached through one escaped validation
         // entirely (br f8t5wb). Gated on the same flag as the Map/Set branches above so the
         // off-path re-resolution below still cannot double-report.
-        if tc_suppress_ann_validation == 0 && (type_kind(resolved) == TK_STRUCT || type_kind(resolved) == TK_ENUM) {
+        if tc_suppress_ann_validation == 0 && (type_kind(resolved) == TyKind.Struct || type_kind(resolved) == TyKind.Enum) {
             tc_validate_type_arg_hashability(elems_sl)
         }
-        if type_kind(resolved) == TK_STRUCT && elems_sl != -1 && sublist_length(elems_sl) >= 1 {
+        if type_kind(resolved) == TyKind.Struct && elems_sl != -1 && sublist_length(elems_sl) >= 1 {
             let inst = tc_produce_struct_instance_tid(ann_node, name, elems_sl)
             if inst != -1 { return inst }
         }
@@ -2195,7 +2218,7 @@ fn resolve_type_ann(ann_node: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
         // structured instance tid onto the annotation node so codegen's param_c_type
         // can lower it to the mono carrier (blink_Tree_Int), not the erased bare enum
         // (jjhnf3). Same all-typevar skip as the struct producer.
-        if type_kind(resolved) == TK_ENUM && elems_sl != -1 && sublist_length(elems_sl) >= 1 {
+        if type_kind(resolved) == TyKind.Enum && elems_sl != -1 && sublist_length(elems_sl) >= 1 {
             let inst = tc_produce_enum_instance_tid(ann_node, name, elems_sl)
             if inst != -1 { return inst }
         }
@@ -2233,7 +2256,7 @@ fn tc_produce_struct_instance_tid(ann_node: Int, name: Str, elems_sl: Int) -> In
     let mut ai = 0
     while ai < sublist_length(elems_sl) {
         let arg_t = resolve_type_ann(sublist_get(elems_sl, ai))
-        if type_kind(arg_t) != TK_TYPEVAR { has_concrete = 1 }
+        if type_kind(arg_t) != TyKind.Typevar { has_concrete = 1 }
         arg_tids.push(arg_t)
         ai = ai + 1
     }
@@ -2261,7 +2284,7 @@ fn tc_produce_enum_instance_tid(ann_node: Int, name: Str, elems_sl: Int) -> Int 
     let mut ai = 0
     while ai < sublist_length(elems_sl) {
         let arg_t = resolve_type_ann(sublist_get(elems_sl, ai))
-        if type_kind(arg_t) != TK_TYPEVAR { has_concrete = 1 }
+        if type_kind(arg_t) != TyKind.Typevar { has_concrete = 1 }
         arg_tids.push(arg_t)
         ai = ai + 1
     }
@@ -2278,7 +2301,7 @@ fn tc_produce_enum_instance_tid(ann_node: Int, name: Str, elems_sl: Int) -> Int 
 
 // A generic FN PARAM annotation (`b: Box[T]`) must intern as a STRUCTURAL instance
 // tid carrying its type-arg slots — even when every slot is a typevar — so
-// unify_typevar_binds' TK_STRUCT arm (which walks param/arg slots in lockstep) can
+// unify_typevar_binds' TyKind.Struct arm (which walks param/arg slots in lockstep) can
 // discover T from a `Box[Box[Int]]` argument (br 8wyq1k). This is the deliberate
 // EXCEPTION to tc_produce_struct_instance_tid's all-typevar skip: that skip guards
 // the annotation/inference HOT path (an all-typevar instance there carries no more
@@ -2290,7 +2313,7 @@ fn tc_produce_enum_instance_tid(ann_node: Int, name: Str, elems_sl: Int) -> Int 
 // codegen types the result `void`.
 //
 // Safe for check_arg_shapes: types_compatible treats a typevar slot as compatible
-// with anything (TK_TYPEVAR short-circuit + the element-wise struct-slot compare),
+// with anything (TyKind.Typevar short-circuit + the element-wise struct-slot compare),
 // so `Box[Box[Int]]` still matches the `Box[T]` param. Returns -1 (caller keeps the
 // bare tid) unless the annotation is a generic user-struct with type-args.
 //
@@ -2306,7 +2329,7 @@ fn tc_fnsig_param_instance_tid(ann_node: Int, bare_tid: Int) -> Int ! TypeCheck.
     // instance tid (tc_lookup_node_tid → tc_tid_struct_mono_name → blink_Tree_Int)
     // instead of the erased bare base. Without it a `-> Tree[Int]` return kept the
     // bare Tree tid and lowered to the never-typedef'd blink_Tree.
-    if bk != TK_STRUCT && bk != TK_ENUM { return -1 }
+    if bk != TyKind.Struct && bk != TyKind.Enum { return -1 }
     let elems_sl = node_elements(ann_node)
     if elems_sl == -1 || sublist_length(elems_sl) < 1 { return -1 }
     let saved_suppress = tc_suppress_ann_validation
@@ -2319,7 +2342,7 @@ fn tc_fnsig_param_instance_tid(ann_node: Int, bare_tid: Int) -> Int ! TypeCheck.
     }
     tc_suppress_ann_validation = saved_suppress
     let base = strip_module_qualifier(node_name(ann_node))
-    if bk == TK_ENUM {
+    if bk == TyKind.Enum {
         return make_enum_instance_type(base, arg_tids)
     }
     make_struct_instance_type(base, arg_tids)
@@ -2327,7 +2350,7 @@ fn tc_fnsig_param_instance_tid(ann_node: Int, bare_tid: Int) -> Int ! TypeCheck.
 
 // A generic-enum VARIANT-FIELD annotation (`Branch(left: Tree[T], …)`) must intern
 // as a STRUCTURAL enum instance carrying its type-arg slots — even all-typevar ones
-// — so unify_typevar_binds' TK_ENUM arm can walk the recursive-field param against a
+// — so unify_typevar_binds' TyKind.Enum arm can walk the recursive-field param against a
 // concrete `Tree[Int]` construction arg and bind T (jjhnf3). The enum analogue of
 // tc_fnsig_param_instance_tid; same deliberate exception to the all-typevar skip
 // (a field decl is resolved once at register_enum_type, not on the hot path).
@@ -2335,7 +2358,7 @@ fn tc_fnsig_param_instance_tid(ann_node: Int, bare_tid: Int) -> Int ! TypeCheck.
 // generic user-enum with type-args.
 @allow(UnrestoredMutation)
 fn tc_evfield_instance_tid(ann_node: Int, bare_tid: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
-    if type_kind(bare_tid) != TK_ENUM { return -1 }
+    if type_kind(bare_tid) != TyKind.Enum { return -1 }
     let elems_sl = node_elements(ann_node)
     if elems_sl == -1 || sublist_length(elems_sl) < 1 { return -1 }
     let saved_suppress = tc_suppress_ann_validation
@@ -2440,7 +2463,7 @@ fn tc_pin_struct_lit_field_ret_mints(stid: Int, node: Int) ! TypeCheck.Resolve, 
 // LIVE reverse-inference of a struct literal's concrete instance tid (br qw7v90,
 // increment B of the codegen-structured-tids epic). Given the bare generic tid
 // (`Box`) and the StructLit node, unify each declared generic field type (which
-// holds TK_TYPEVAR for a generic field, e.g. Box.value: T) against the inferred
+// holds TyKind.Typevar for a generic field, e.g. Box.value: T) against the inferred
 // type of the corresponding literal field VALUE, collecting typevar→concrete
 // binds. If at least one type-param binds to a concrete (non-typevar) type, build
 // the structured instance tid (make_struct_instance_type, args in the decl's
@@ -2492,11 +2515,11 @@ fn tc_struct_lit_instance_tid(stid: Int, sname: Str, node: Int) -> Int ! TypeChe
     // bare stid and the erased inner rode codegen's default-recovery; post-decision
     // an under-determined construction must be REPORTED (E0301), so the instance
     // must carry the α — the region-boundary check then blames the binding and
-    // names the open params. A raw resolved metavar (kind TK_UNKNOWN after
-    // tc_resolve) is the trigger; a bare TK_TYPEVAR (legitimate generic-fn body
+    // names the open params. A raw resolved metavar (kind TyKind.Unknown after
+    // tc_resolve) is the trigger; a bare TyKind.Typevar (legitimate generic-fn body
     // context) is NOT — that still returns the bare stid untouched.
     let mut has_open_metavar = 0
-    // gq131c: also mint when a param binds to a bare TK_TYPEVAR from the
+    // gq131c: also mint when a param binds to a bare TyKind.Typevar from the
     // ENCLOSING generic fn's own scope (`Box { value: inner }` where `inner: T`
     // inside `fn wrap_and_build[T](...)`). A bare-head instance has no param slot
     // for wrap_and_build's OWN monomorphization (T:=Int) to substitute into, so
@@ -2509,9 +2532,9 @@ fn tc_struct_lit_instance_tid(stid: Int, sname: Str, node: Int) -> Int ! TypeChe
     let mut ci = 0
     while ci < sublist_length(tparams_sl) {
         let bound = binds.get(node_name(sublist_get(tparams_sl, ci))) ?? -1
-        if bound != -1 && type_kind(bound) != TK_TYPEVAR && type_kind(bound) != TK_UNKNOWN { has_concrete = 1 }
+        if bound != -1 && type_kind(bound) != TyKind.Typevar && type_kind(bound) != TyKind.Unknown { has_concrete = 1 }
         if bound != -1 && tc_tid_has_unbound_metavar(bound) != 0 { has_open_metavar = 1 }
-        if bound != -1 && type_kind(bound) == TK_TYPEVAR { has_bare_typevar = 1 }
+        if bound != -1 && type_kind(bound) == TyKind.Typevar { has_bare_typevar = 1 }
         ci = ci + 1
     }
     if has_concrete == 0 && has_open_metavar == 0 && has_bare_typevar == 0 { return stid }
@@ -2798,7 +2821,7 @@ fn reject_reserved_type_name(td: Int) ! Diag.Report {
 fn register_struct_type(td: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Report {
     reject_reserved_type_name(td)
     let name = node_name(td)
-    let tid = new_type(TK_STRUCT, name)
+    let tid = new_type(TyKind.Struct, name)
     named_type_names.push(name)
     named_type_ids.push(tid)
     named_type_map.insert(name, tid)
@@ -2852,7 +2875,7 @@ fn register_struct_type(td: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.R
 fn register_enum_type(td: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Report {
     reject_reserved_type_name(td)
     let name = node_name(td)
-    let tid = new_type(TK_ENUM, name)
+    let tid = new_type(TyKind.Enum, name)
     named_type_names.push(name)
     named_type_ids.push(tid)
     named_type_map.insert(name, tid)
@@ -3210,14 +3233,14 @@ fn tc_check_derive_hash_eq_ord() ! Diag.Report {
 // Kind A collision: a struct type whose name equals an enum variant name. This is the
 // NARROW invariant — two enums sharing a variant name (e.g. `Pending` in JobState and
 // NetState) stays legal and is resolved by the hint, so we only fire when the colliding
-// name is registered as a TK_STRUCT in named_type_map. Whole-program: both tables are
+// name is registered as a TyKind.Struct in named_type_map. Whole-program: both tables are
 // merged across all modules at registration, so cross-module collisions are caught.
 fn tc_check_name_collisions() ! TypeCheck.Register, Diag.Report {
     let mut i = 0
     while i < evar_pool.len() {
         let vname = evar_pool.get(i).unwrap().name
         let stid = named_type_map.get(vname) ?? -1
-        if tc_collision_reported.contains_key(vname) == 0 && stid != -1 && type_kind(stid) == TK_STRUCT {
+        if tc_collision_reported.contains_key(vname) == 0 && stid != -1 && type_kind(stid) == TyKind.Struct {
             tc_collision_reported.insert(vname, 1)
             let struct_node = tc_struct_decl_nodes.get(vname) ?? -1
             let enum_node = tc_variant_enum_decl_nodes.get(vname) ?? -1
@@ -4541,7 +4564,6 @@ fn init_types() ! TypeCheck.Register {
     tc_structural_nested_instances = 0
     tc_boundary_check_active = 0
     tc_errors.clear()
-    tc_warnings.clear()
     depr_fn_nodes.clear()
     depr_type_nodes.clear()
     tc_struct_decl_nodes.clear()
@@ -4557,20 +4579,20 @@ fn init_types() ! TypeCheck.Register {
     pv_in_old_depth = 0
     tc_build_import_map()
 
-    TYPE_INT = new_type(TK_INT, "Int")
-    TYPE_FLOAT = new_type(TK_FLOAT, "Float")
-    TYPE_BOOL = new_type(TK_BOOL, "Bool")
-    TYPE_STR = new_type(TK_STR, "Str")
-    TYPE_VOID = new_type(TK_VOID, "Void")
-    TYPE_UNKNOWN = new_type(TK_UNKNOWN, "?")
-    TYPE_I8 = new_type(TK_I8, "I8")
-    TYPE_I16 = new_type(TK_I16, "I16")
-    TYPE_I32 = new_type(TK_I32, "I32")
-    TYPE_U8 = new_type(TK_U8, "U8")
-    TYPE_U16 = new_type(TK_U16, "U16")
-    TYPE_U32 = new_type(TK_U32, "U32")
-    TYPE_U64 = new_type(TK_U64, "U64")
-    TYPE_CHAR = new_type(TK_CHAR, "Char")
+    TYPE_INT = new_type(TyKind.Int, "Int")
+    TYPE_FLOAT = new_type(TyKind.Float, "Float")
+    TYPE_BOOL = new_type(TyKind.Bool, "Bool")
+    TYPE_STR = new_type(TyKind.Str, "Str")
+    TYPE_VOID = new_type(TyKind.Void, "Void")
+    TYPE_UNKNOWN = new_type(TyKind.Unknown, "?")
+    TYPE_I8 = new_type(TyKind.I8, "I8")
+    TYPE_I16 = new_type(TyKind.I16, "I16")
+    TYPE_I32 = new_type(TyKind.I32, "I32")
+    TYPE_U8 = new_type(TyKind.U8, "U8")
+    TYPE_U16 = new_type(TyKind.U16, "U16")
+    TYPE_U32 = new_type(TyKind.U32, "U32")
+    TYPE_U64 = new_type(TyKind.U64, "U64")
+    TYPE_CHAR = new_type(TyKind.Char, "Char")
 }
 
 pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
@@ -5502,7 +5524,11 @@ fn tc_fence_test_only_symbol(name: Str, code: Str, short_name: Str, node: Int) !
     }
 }
 
-fn is_builtin_fn(name: Str) -> Int {
+// pub so codegen resolves a CALL callee in the same order this file does: builtin
+// first, user variant second. A payload-less variant named `Map` must not shadow the
+// `Map()` constructor, and the only way that ordering cannot drift between the two
+// phases is for both to read this one list (br t1apwa).
+pub fn is_builtin_fn(name: Str) -> Int {
     if name == "arg_count" { return 1 }
     if name == "get_arg" { return 1 }
     if name == "read_file" { return 1 }
@@ -5800,7 +5826,7 @@ fn get_builtin_fn_ret(name: Str) -> Int {
     if name == "process_pid_kill" { return TYPE_INT }
     if name == "process_pid_send_signal" { return TYPE_INT }
     if name == "process_install_signal_forwarding" { return TYPE_VOID }
-    if name == "Bytes" { return new_type(TK_BYTES, "Bytes") }
+    if name == "Bytes" { return new_type(TyKind.Bytes, "Bytes") }
     if name == "Map" { return make_map_type(make_metavar(), make_metavar()) }
     if name == "Set" { return make_set_type(make_metavar()) }
     TYPE_UNKNOWN
@@ -5871,7 +5897,7 @@ fn tc_enum_ctor_instance_tid(enum_tid: Int, decl: Int, vname: Str, args_sl: Int)
     let mut ci = 0
     while ci < sublist_length(tparams_sl) {
         let bound = binds.get(node_name(sublist_get(tparams_sl, ci))) ?? -1
-        if bound != -1 && type_kind(bound) != TK_TYPEVAR && type_kind(bound) != TK_UNKNOWN { has_concrete = 1 }
+        if bound != -1 && type_kind(bound) != TyKind.Typevar && type_kind(bound) != TyKind.Unknown { has_concrete = 1 }
         ci = ci + 1
     }
     if has_concrete == 0 { return enum_tid }
@@ -5920,7 +5946,7 @@ fn tc_enum_structlit_instance_tid(enum_tid: Int, decl: Int, vname: Str, flds_sl:
     let mut ci = 0
     while ci < sublist_length(tparams_sl) {
         let bound = binds.get(node_name(sublist_get(tparams_sl, ci))) ?? -1
-        if bound != -1 && type_kind(bound) != TK_TYPEVAR && type_kind(bound) != TK_UNKNOWN { has_concrete = 1 }
+        if bound != -1 && type_kind(bound) != TyKind.Typevar && type_kind(bound) != TyKind.Unknown { has_concrete = 1 }
         ci = ci + 1
     }
     if has_concrete == 0 { return enum_tid }
@@ -5946,7 +5972,7 @@ fn tc_enum_structlit_instance_tid(enum_tid: Int, decl: Int, vname: Str, flds_sl:
 // When a generic-enum ctor slot is unbound after arg-unification (a subset variant
 // like `Left(L)` leaves R untouched), the enclosing annotation (tc_construct_hint)
 // may pin it. Return the hint's concrete slot tid at `ti`, or -1 unless the hint is
-// a TK_ENUM matching THIS enum by strip_module_qualifier(base name) AND arity. Hint
+// a TyKind.Enum matching THIS enum by strip_module_qualifier(base name) AND arity. Hint
 // fills gaps only; unify wins where it has evidence. An unrelated hint (Option[..],
 // a different-named enum) is rejected (br 7q3aj0).
 fn tc_hint_enum_slot(enum_tid: Int, tparams_sl: Int, ti: Int) -> Int {
@@ -7038,7 +7064,7 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         if is_with_ptr_call != 0 { nr_with_ptr_depth = nr_with_ptr_depth - 1 }
         if method_name == "as_ptr" && nr_with_ptr_depth == 0 && obj_is_ident != 0 {
             let recv_t = infer_type(obj)
-            if type_kind(recv_t) == TK_BYTES {
+            if type_kind(recv_t) == TyKind.Bytes {
                 diag_error_at("BytesPtrCastForbidden", BYTES_PTR_CAST_FORBIDDEN, "cannot take a raw Ptr[U8] from Bytes outside a with_ptr closure — Bytes is GC-managed and may be relocated", node, "use Bytes.with_ptr(fn(p) \{ ... }) to pin the buffer for the FFI call")
             }
         }
@@ -7474,7 +7500,7 @@ fn resolve_alias_tid(tid: Int) -> Int {
 // terminate, not recurse unboundedly. Refuses to follow into a forward-declared alias
 // whose RHS hadn't been registered yet — register_struct_type inserts the alias's own
 // name into named_type_map before resolving its RHS, so a reference to a not-yet-declared
-// type mints an orphaned TK_TYPEVAR (resolve_type_ann's make_typevar fallback) instead of
+// type mints an orphaned TyKind.Typevar (resolve_type_ann's make_typevar fallback) instead of
 // the real tid. Chasing that phantom would hand back tc_tid_to_c_tag's own "<tv>" poison
 // sentinel as if it were a genuine resolution, baking it into a real C identifier instead
 // of refusing to treat the alias as resolved. Returns -1 when `name` names no alias, or
@@ -7490,18 +7516,18 @@ fn tc_resolve_transparent_alias_name(name: Str) -> Int {
         let nr = tc_resolve(next)
         if nr < 0 || nr >= ty_pool.len() { return result }
         let ne = ty_pool.get(nr).unwrap()
-        if ne.kind == TK_TYPEVAR || ne.kind == TK_UNKNOWN { return result }
+        if ne.kind == TyKind.Typevar || ne.kind == TyKind.Unknown { return result }
         // Direct self-alias (`type A = A`) resolves to a real, already-registered tid
-        // for itself rather than a TK_TYPEVAR placeholder, so the poison check above
+        // for itself rather than a TyKind.Typevar placeholder, so the poison check above
         // does not catch it. A genuine multi-name cycle always has some direction that
-        // forward-references a not-yet-declared name and mints an orphan TK_TYPEVAR
+        // forward-references a not-yet-declared name and mints an orphan TyKind.Typevar
         // there (register_struct_type inserts before resolving), which the check above
         // already terminates within a few hops — only the degenerate zero-indirection
         // self-loop has no such gap to be caught by. Without this, cur_name would never
         // change and the caller's self-recursion on an unchanged tid would spin forever.
         if ne.name == cur_name { return result }
         result = next
-        if ne.kind != TK_STRUCT && ne.kind != TK_ENUM { return result }
+        if ne.kind != TyKind.Struct && ne.kind != TyKind.Enum { return result }
         if ne.params_count != 0 { return result }
         cur_name = ne.name
         hops = hops + 1
@@ -7513,7 +7539,7 @@ fn types_compatible(a0: Int, b0: Int) -> Int {
     // Follow bound metavars to their solution FIRST (gqg3rk): a pinned α reads as
     // its concrete type, so `let s: Str = intList.get(0).unwrap()` is now rejected
     // (α=Int vs Str) instead of silently accepted. An *unbound* α (or the shared
-    // TYPE_UNKNOWN singleton) still resolves to a TK_UNKNOWN entry and takes the
+    // TYPE_UNKNOWN singleton) still resolves to a TyKind.Unknown entry and takes the
     // permissive branch below — the region-boundary check reports it as E0301, so
     // we do not double-report it here as a spurious mismatch.
     let a = tc_resolve(resolve_alias_tid(a0))
@@ -7526,12 +7552,12 @@ fn types_compatible(a0: Int, b0: Int) -> Int {
     let tb = ty_pool.get(b).unwrap()
     let ka = ta.kind
     let kb = tb.kind
-    // An unbound metavar that survived resolution (kind TK_UNKNOWN, not the
+    // An unbound metavar that survived resolution (kind TyKind.Unknown, not the
     // singleton) is still "compatible with anything" pending the boundary check.
-    if ka == TK_UNKNOWN || kb == TK_UNKNOWN { return 1 }
-    if ka == TK_TYPEVAR || kb == TK_TYPEVAR { return 1 }
+    if ka == TyKind.Unknown || kb == TyKind.Unknown { return 1 }
+    if ka == TyKind.Typevar || kb == TyKind.Typevar { return 1 }
     // Int and Bool are interchangeable in Blink (C-style truthiness)
-    if (ka == TK_INT || ka == TK_BOOL) && (kb == TK_INT || kb == TK_BOOL) { return 1 }
+    if (ka == TyKind.Int || ka == TyKind.Bool) && (kb == TyKind.Int || kb == TyKind.Bool) { return 1 }
     // Sized integer kinds are compatible only with themselves (no implicit promotion)
     let is_sized_a = is_sized_int(ka)
     let is_sized_b = is_sized_int(kb)
@@ -7543,18 +7569,18 @@ fn types_compatible(a0: Int, b0: Int) -> Int {
     // types_compatible, so an enum tag stays comparable to an Int. Convert explicitly
     // via Enum.to_int() / Enum.from_int(n) -> Option[Enum].
     if ka == kb {
-        if ka == TK_LIST || ka == TK_OPTION || ka == TK_ITERATOR || ka == TK_SET {
+        if ka == TyKind.List || ka == TyKind.Option || ka == TyKind.Iterator || ka == TyKind.Set {
             return types_compatible(ta.inner1, tb.inner1)
         }
-        if ka == TK_MAP {
+        if ka == TyKind.Map {
             if types_compatible(ta.inner1, tb.inner1) == 0 { return 0 }
             return types_compatible(ta.inner2, tb.inner2)
         }
-        if ka == TK_RESULT {
+        if ka == TyKind.Result {
             if types_compatible(ta.inner1, tb.inner1) == 0 { return 0 }
             return types_compatible(ta.inner2, tb.inner2)
         }
-        if ka == TK_TUPLE {
+        if ka == TyKind.Tuple {
             if ta.params_count != tb.params_count { return 0 }
             let mut i = 0
             while i < ta.params_count {
@@ -7565,8 +7591,8 @@ fn types_compatible(a0: Int, b0: Int) -> Int {
             }
             return 1
         }
-        if ka == TK_STRUCT || ka == TK_ENUM {
-            // Nominal equality by base name first (mirrors the TK_TUPLE branch
+        if ka == TyKind.Struct || ka == TyKind.Enum {
+            // Nominal equality by base name first (mirrors the TyKind.Tuple branch
             // above). Two struct/enum tids are compatible iff they name the same
             // declaration; the module qualifier is stripped on both sides so a
             // qualified and bare reference to the same type still match (precedent:
@@ -7635,32 +7661,32 @@ fn type_merge(a0: Int, b0: Int) -> Int {
     let ta = ty_pool.get(a).unwrap()
     let tb = ty_pool.get(b).unwrap()
     if ta.kind != tb.kind { return a }
-    if ta.kind == TK_LIST {
+    if ta.kind == TyKind.List {
         let inner = type_merge(ta.inner1, tb.inner1)
         if inner == ta.inner1 { return a }
         if inner == tb.inner1 { return b }
         return make_list_type(inner)
     }
-    if ta.kind == TK_OPTION {
+    if ta.kind == TyKind.Option {
         let inner = type_merge(ta.inner1, tb.inner1)
         if inner == ta.inner1 { return a }
         if inner == tb.inner1 { return b }
         return make_option_type(inner)
     }
-    if ta.kind == TK_SET {
+    if ta.kind == TyKind.Set {
         let inner = type_merge(ta.inner1, tb.inner1)
         if inner == ta.inner1 { return a }
         if inner == tb.inner1 { return b }
         return make_set_type(inner)
     }
-    if ta.kind == TK_RESULT {
+    if ta.kind == TyKind.Result {
         let i1 = type_merge(ta.inner1, tb.inner1)
         let i2 = type_merge(ta.inner2, tb.inner2)
         if i1 == ta.inner1 && i2 == ta.inner2 { return a }
         if i1 == tb.inner1 && i2 == tb.inner2 { return b }
         return make_result_type(i1, i2)
     }
-    if ta.kind == TK_MAP {
+    if ta.kind == TyKind.Map {
         let k = type_merge(ta.inner1, tb.inner1)
         let v = type_merge(ta.inner2, tb.inner2)
         if k == ta.inner1 && v == ta.inner2 { return a }
@@ -7680,10 +7706,10 @@ fn infer_arm_body(arm: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.R
     infer_type(b)
 }
 
-fn type_kind(tid0: Int) -> Int {
+fn type_kind(tid0: Int) -> TyKind {
     // Resolve bound metavars so a pinned α reports its solution's kind (gqg3rk).
     let tid = tc_resolve(tid0)
-    if tid < 0 || tid >= ty_pool.len() { return TK_UNKNOWN }
+    if tid < 0 || tid >= ty_pool.len() { return TyKind.Unknown }
     ty_pool.get(tid).unwrap().kind
 }
 
@@ -7693,28 +7719,28 @@ fn is_bool_compat(tid: Int) -> Int {
     if tid == TYPE_BOOL { return 1 }
     if tid == TYPE_INT { return 1 }
     let k = type_kind(tid)
-    if k == TK_BOOL || k == TK_INT { return 1 }
+    if k == TyKind.Bool || k == TyKind.Int { return 1 }
     0
 }
 
-pub fn is_sized_int(k: Int) -> Int {
-    if k == TK_I8 || k == TK_I16 || k == TK_I32 { return 1 }
-    if k == TK_U8 || k == TK_U16 || k == TK_U32 || k == TK_U64 { return 1 }
+pub fn is_sized_int(k: TyKind) -> Int {
+    if k == TyKind.I8 || k == TyKind.I16 || k == TyKind.I32 { return 1 }
+    if k == TyKind.U8 || k == TyKind.U16 || k == TyKind.U32 || k == TyKind.U64 { return 1 }
     0
 }
 
 fn is_integer_type(tid: Int) -> Int {
     if tid == TYPE_UNKNOWN { return 0 }
     let k = type_kind(tid)
-    if k == TK_INT { return 1 }
+    if k == TyKind.Int { return 1 }
     is_sized_int(k)
 }
 
 fn is_shift_amount_type(tid: Int, rhs_node: Int) -> Int {
     if tid == TYPE_UNKNOWN { return 1 }
     let k = type_kind(tid)
-    if k == TK_U32 { return 1 }
-    if k == TK_INT && rhs_node != -1 && node_kind(rhs_node) == NodeKind.IntLit { return 1 }
+    if k == TyKind.U32 { return 1 }
+    if k == TyKind.Int && rhs_node != -1 && node_kind(rhs_node) == NodeKind.IntLit { return 1 }
     0
 }
 
@@ -7730,21 +7756,21 @@ fn tc_type_name(tid: Int) -> Str {
 fn cmp_is_enum_int_pair(lt: Int, rt: Int) -> Int {
     let lk = type_kind(lt)
     let rk = type_kind(rt)
-    // Int side may be plain Int OR a sized int; the enum side is TK_ENUM.
-    let l_int = lk == TK_INT || is_sized_int(lk) != 0
-    let r_int = rk == TK_INT || is_sized_int(rk) != 0
-    if lk == TK_ENUM && r_int != 0 { return 1 }
-    if rk == TK_ENUM && l_int != 0 { return 1 }
+    // Int side may be plain Int OR a sized int; the enum side is TyKind.Enum.
+    let l_int = lk == TyKind.Int || is_sized_int(lk) != 0
+    let r_int = rk == TyKind.Int || is_sized_int(rk) != 0
+    if lk == TyKind.Enum && r_int != 0 { return 1 }
+    if rk == TyKind.Enum && l_int != 0 { return 1 }
     0
 }
 
 // vfgp72: builtin types that implement Eq+Ord per spec §3.6 (03_types.md:1822)
 // but are represented as plain structs/kinds in the type pool (no @derive, no
-// user impl). Instant/Duration are `{ nanos: Int }` structs; Bytes is TK_BYTES.
+// user impl). Instant/Duration are `{ nanos: Int }` structs; Bytes is TyKind.Bytes.
 fn is_builtin_eq_ord_type(tid: Int) -> Int {
     let k = type_kind(tid)
-    if k == TK_BYTES { return 1 }
-    if k == TK_STRUCT {
+    if k == TyKind.Bytes { return 1 }
+    if k == TyKind.Struct {
         let n = tc_type_name(tid)
         if n == "Instant" || n == "Duration" { return 1 }
     }
@@ -7761,41 +7787,41 @@ fn cmp_operands_ok(lt: Int, rt: Int, relational: Int) -> Int {
     let kb = type_kind(b)
 
     // Fail-open on types we cannot model here, mirroring types_compatible:
-    //   - TK_TYPEVAR: generic `T <op> T` resolves at monomorphization (the
+    //   - TyKind.Typevar: generic `T <op> T` resolves at monomorphization (the
     //     concrete type's Eq/Ord is checked there).
-    //   - TK_VOID: an under-inferred value (e.g. an un-annotated closure return
+    //   - TyKind.Void: an under-inferred value (e.g. an un-annotated closure return
     //     flowing through Bytes.with_ptr) types as Void; rejecting it would
     //     break programs that compiled before operand checking landed.
-    if ka == TK_TYPEVAR || kb == TK_TYPEVAR { return 1 }
-    if ka == TK_VOID || kb == TK_VOID { return 1 }
+    if ka == TyKind.Typevar || kb == TyKind.Typevar { return 1 }
+    if ka == TyKind.Void || kb == TyKind.Void { return 1 }
 
     // Int and Bool are interchangeable (C-style truthiness, mirroring
     // types_compatible:5132). `flag == 0`, `set.contains(x) != 0`, and
     // `true == false` are all pervasive Blink idioms. Bool participates only in
     // equality — it has Eq but not Ord (spec §3.6) — so relational against a Bool
     // operand falls through to the reject path below.
-    let a_intbool = ka == TK_INT || ka == TK_BOOL
-    let b_intbool = kb == TK_INT || kb == TK_BOOL
+    let a_intbool = ka == TyKind.Int || ka == TyKind.Bool
+    let b_intbool = kb == TyKind.Int || kb == TyKind.Bool
     if a_intbool != 0 && b_intbool != 0 {
-        if relational != 0 && (ka == TK_BOOL || kb == TK_BOOL) { return 0 }
+        if relational != 0 && (ka == TyKind.Bool || kb == TyKind.Bool) { return 0 }
         return 1
     }
 
     // Scalars: same kind only (no implicit promotion), mirroring types_compatible.
     // Int<->sized-int literal coercion is handled by the caller. Float/Char and
     // sized ints compare within their own kind.
-    let a_scalar = is_sized_int(ka) != 0 || ka == TK_FLOAT || ka == TK_CHAR
-    let b_scalar = is_sized_int(kb) != 0 || kb == TK_FLOAT || kb == TK_CHAR
+    let a_scalar = is_sized_int(ka) != 0 || ka == TyKind.Float || ka == TyKind.Char
+    let b_scalar = is_sized_int(kb) != 0 || kb == TyKind.Float || kb == TyKind.Char
     if a_scalar != 0 && b_scalar != 0 {
         if ka == kb { return 1 }
         return 0
     }
 
     // Str: full Eq + Ord.
-    if ka == TK_STR && kb == TK_STR { return 1 }
+    if ka == TyKind.Str && kb == TyKind.Str { return 1 }
 
     // Option[T]: codegen only lowers ==/!= on matching inner; relational is rejected.
-    if ka == TK_OPTION && kb == TK_OPTION {
+    if ka == TyKind.Option && kb == TyKind.Option {
         if relational != 0 { return 0 }
         return types_compatible(a, b)
     }
@@ -7805,7 +7831,7 @@ fn cmp_operands_ok(lt: Int, rt: Int, relational: Int) -> Int {
     // always been legal in Blink (no @derive required) and is what the bulk of
     // the compiler's own enum comparisons rely on. @derive(Eq/Ord) on an enum
     // only customizes semantics; it is not a precondition for comparing.
-    if ka == TK_ENUM && kb == TK_ENUM {
+    if ka == TyKind.Enum && kb == TyKind.Enum {
         let an = tc_type_name(a)
         let bn = tc_type_name(b)
         if an == "" || an != bn { return 0 }
@@ -7814,14 +7840,14 @@ fn cmp_operands_ok(lt: Int, rt: Int, relational: Int) -> Int {
 
     // Builtin Eq+Ord types (Instant/Duration/Bytes): same type, any comparison.
     if is_builtin_eq_ord_type(a) != 0 && ka == kb {
-        if ka == TK_STRUCT && tc_type_name(a) != tc_type_name(b) { return 0 }
+        if ka == TyKind.Struct && tc_type_name(a) != tc_type_name(b) { return 0 }
         return 1
     }
 
     // User struct: must be the SAME nominal type and carry the right impl
     // (equality needs Eq, relational needs Ord) — structs have no intrinsic
     // comparison, so a bare struct compare is the genuine error case.
-    if ka == TK_STRUCT && kb == TK_STRUCT {
+    if ka == TyKind.Struct && kb == TyKind.Struct {
         let an = tc_type_name(a)
         let bn = tc_type_name(b)
         if an != bn || an == "" { return 0 }
@@ -7836,9 +7862,9 @@ fn cmp_operands_ok(lt: Int, rt: Int, relational: Int) -> Int {
 
 fn type_bit_width(tid: Int) -> Int {
     let k = type_kind(tid)
-    if k == TK_I8 || k == TK_U8 { return 8 }
-    if k == TK_I16 || k == TK_U16 { return 16 }
-    if k == TK_I32 || k == TK_U32 { return 32 }
+    if k == TyKind.I8 || k == TyKind.U8 { return 8 }
+    if k == TyKind.I16 || k == TyKind.U16 { return 16 }
+    if k == TyKind.I32 || k == TyKind.U32 { return 32 }
     64
 }
 
@@ -7867,8 +7893,8 @@ fn infer_carrier_arg(arg_node: Int, carrier: Str) -> Int ! TypeCheck.Resolve, Ty
     let saved_hint = tc_construct_hint
     let k = type_kind(tc_construct_hint)
     if carrier == "Err" {
-        if tc_construct_hint >= 0 && k == TK_RESULT { tc_construct_hint = ty_pool.get(tc_construct_hint).unwrap().inner2 }
-    } else if (carrier == "Some" && k == TK_OPTION) || (carrier == "Ok" && k == TK_RESULT) {
+        if tc_construct_hint >= 0 && k == TyKind.Result { tc_construct_hint = ty_pool.get(tc_construct_hint).unwrap().inner2 }
+    } else if (carrier == "Some" && k == TyKind.Option) || (carrier == "Ok" && k == TyKind.Result) {
         if tc_construct_hint >= 0 { tc_construct_hint = ty_pool.get(tc_construct_hint).unwrap().inner1 }
     }
     let inner = infer_type(arg_node)
@@ -7929,7 +7955,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                     // Display is unknowable — erroring would false-reject and
                     // brick `task regen`).
                     let pk = type_kind(ptid)
-                    if pk != TK_UNKNOWN && pk != TK_TYPEVAR && tc_type_id_has_display(ptid) == 0 {
+                    if pk != TyKind.Unknown && pk != TyKind.Typevar && tc_type_id_has_display(ptid) == 0 {
                         tc_errors.push("interpolated value of type '{type_to_str(ptid)}' does not implement Display")
                         diag_error_at("MissingDisplayImpl", MISSING_DISPLAY_IMPL, "type '{type_to_str(ptid)}' does not implement Display", part, "add '@derive(Display)' or implement Display manually; use '.debug()' for structural form")
                     }
@@ -7986,7 +8012,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             }
             return TYPE_BOOL
         }
-        if op == "+" && (type_kind(lt) == TK_STR || type_kind(rt) == TK_STR) {
+        if op == "+" && (type_kind(lt) == TyKind.Str || type_kind(rt) == TyKind.Str) {
             if lt != TYPE_UNKNOWN && rt != TYPE_UNKNOWN {
                 diag_error_at("StrPlusUnsupported", STR_PLUS_UNSUPPORTED,
                     "'+' does not work on Str", node,
@@ -8054,10 +8080,10 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         }
         if op == "??" {
             let left_k = type_kind(lt)
-            if left_k != TK_OPTION && left_k != TK_UNKNOWN {
+            if left_k != TyKind.Option && left_k != TyKind.Unknown {
                 tc_error_at("'??' operator requires Option value, got {type_to_str(lt)}", node)
             }
-            if left_k == TK_OPTION {
+            if left_k == TyKind.Option {
                 // `y ?? default` is a constraining use (gqg3rk): the default's type
                 // pins the Option's element α (`None ?? 99` infers y : Int?). Unify
                 // the (possibly-metavar) inner with the default type.
@@ -8085,7 +8111,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         }
         if op == "?" {
             let ok = type_kind(operand)
-            if ok == TK_RESULT {
+            if ok == TyKind.Result {
                 let operand_err = ty_pool.get(operand).unwrap().inner2
                 if tc_in_test_body == 1 {
                     // Spec §2.20 / §3c.2: inside a test body E is rendered via
@@ -8093,16 +8119,16 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                     // E0512/E0508 gates; require Display[E] (E0514). Skip when E
                     // is unresolved/generic (helper returns 0 there).
                     let k = type_kind(operand_err)
-                    if k != TK_UNKNOWN && k != TK_TYPEVAR && tc_type_id_has_display(operand_err) == 0 {
+                    if k != TyKind.Unknown && k != TyKind.Typevar && tc_type_id_has_display(operand_err) == 0 {
                         tc_errors.push("'?' on Result in test body requires error type '{type_to_str(operand_err)}' to implement Display")
                         diag_error_at("QuestionMarkTestDisplayRequired", QM_TEST_DISPLAY_REQUIRED, "'?' in a test body requires the error type '{type_to_str(operand_err)}' to implement Display", node, "implement 'impl Display for {type_to_str(operand_err)}' or '.unwrap()' the Result explicitly")
                     }
                 } else if tc_current_fn_ret >= 0 && tc_current_fn_ret < ty_pool.len() {
                     let ret_kind = ty_pool.get(tc_current_fn_ret).unwrap().kind
-                    if ret_kind != TK_RESULT && ret_kind != TK_UNKNOWN {
+                    if ret_kind != TyKind.Result && ret_kind != TyKind.Unknown {
                         tc_errors.push("'?' on Result in function '{tc_current_fn_name}' which does not return Result")
                         diag_error_at("QuestionMarkResultInNonResult", QM_RESULT_IN_NON_RESULT, "'?' on Result in function '{tc_current_fn_name}' which does not return Result", node, "change the return type to Result[T, E]")
-                    } else if ret_kind == TK_RESULT {
+                    } else if ret_kind == TyKind.Result {
                         let ret_err = ty_pool.get(tc_current_fn_ret).unwrap().inner2
                         if types_compatible(operand_err, ret_err) == 0 {
                             tc_errors.push("'?' error type mismatch in function '{tc_current_fn_name}'")
@@ -8112,21 +8138,21 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 }
                 return ty_pool.get(operand).unwrap().inner1
             }
-            if ok == TK_OPTION {
+            if ok == TyKind.Option {
                 // Spec §2.20: in a test body `?` on Option is permitted —
                 // None propagates as a fixed-message TestError. The
                 // elaborated return is Result[Void, TestError] (not Option),
                 // so suppress the QM-Option-in-non-Option gate here.
                 if tc_in_test_body == 0 && tc_current_fn_ret >= 0 && tc_current_fn_ret < ty_pool.len() {
                     let ret_kind = ty_pool.get(tc_current_fn_ret).unwrap().kind
-                    if ret_kind != TK_OPTION && ret_kind != TK_UNKNOWN {
+                    if ret_kind != TyKind.Option && ret_kind != TyKind.Unknown {
                         tc_errors.push("'?' on Option in function '{tc_current_fn_name}' which does not return Option")
                         diag_error_at("QuestionMarkOptionInNonOption", QM_OPTION_IN_NON_OPTION, "'?' on Option in function '{tc_current_fn_name}' which does not return Option", node, "change the return type to Option[T]")
                     }
                 }
                 return ty_pool.get(operand).unwrap().inner1
             }
-            if ok != TK_UNKNOWN {
+            if ok != TyKind.Unknown {
                 tc_errors.push("'?' requires Result or Option value")
                 diag_error_at("QuestionMarkInvalidOperand", QM_INVALID_OPERAND, "'?' requires a Result or Option value", node, "")
             }
@@ -8233,12 +8259,12 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 // is bound in local scope, it wins: infer the args (so nested
                 // expressions are still type-checked) and, if the local binding is
                 // a structured fn type, arity/type-check against THAT; otherwise
-                // (closure params currently carry a bare typevar tid, not TK_FN)
+                // (closure params currently carry a bare typevar tid, not TyKind.Fn)
                 // return its type without consulting the global fnsig.
                 let local_tid = nr_get_type(fn_name)
                 if local_tid != TYPE_UNKNOWN {
                     let call_args_sl = node_args(node)
-                    if type_kind(local_tid) == TK_FN {
+                    if type_kind(local_tid) == TyKind.Fn {
                         let fn_ty = ty_pool.get(local_tid).unwrap()
                         let expected = fn_ty.params_count
                         let got = if call_args_sl != -1 { sublist_length(call_args_sl) } else { 0 }
@@ -8338,7 +8364,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             let cname = node_name(obj_node)
             if nr_get_type(cname) == TYPE_UNKNOWN {
                 let ctor_tid = lookup_named_type(cname)
-                if ctor_tid != -1 && type_kind(ctor_tid) == TK_ENUM {
+                if ctor_tid != -1 && type_kind(ctor_tid) == TyKind.Enum {
                     let cvar_idx = get_variant_by_name(ctor_tid, method)
                     if cvar_idx != -1 {
                         let cargs_sl = node_args(node)
@@ -8381,12 +8407,12 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
 
         // 4q2etk: replaced by mwxtyj — builtin scalar Display:
         // display() -> Str and fmt(sb) on Int/Float/Bool/Str/Char.
-        if obj_k == TK_INT || obj_k == TK_FLOAT || obj_k == TK_BOOL || obj_k == TK_STR || obj_k == TK_CHAR {
+        if obj_k == TyKind.Int || obj_k == TyKind.Float || obj_k == TyKind.Bool || obj_k == TyKind.Str || obj_k == TyKind.Char {
             if method == "display" { return TYPE_STR }
             if method == "fmt" { return TYPE_VOID }
         }
 
-        if obj_k == TK_LIST {
+        if obj_k == TyKind.List {
             let args_sl = node_args(node)
             let elem = ty_pool.get(obj_t).unwrap().inner1
             if method == "len" || method == "count" { return TYPE_INT }
@@ -8483,7 +8509,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         // tc_poly_list_impl_node; any other shape leaves `im == -1` and this
         // block does nothing, falling through to today's arg-inference loop and
         // TYPE_UNKNOWN — no path regresses.
-        if obj_k == TK_LIST {
+        if obj_k == TyKind.List {
             let sole_trait = tc_method_trait_names("List", method)
             if sole_trait != "" && tc_method_trait_count("List", method) == 1 {
                 let sig_name = "List_{sole_trait}_{method}"
@@ -8510,7 +8536,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             }
         }
 
-        if obj_k == TK_STR {
+        if obj_k == TyKind.Str {
             let args_sl = node_args(node)
             if method == "len" { return TYPE_INT }
             if method == "contains" || method == "starts_with" || method == "ends_with" {
@@ -8557,7 +8583,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             if method == "is_empty" { return TYPE_BOOL }
         }
 
-        if obj_k == TK_INT {
+        if obj_k == TyKind.Int {
             if method == "to_str" { return TYPE_STR }
             if method == "abs" || method == "min" || method == "max" { return TYPE_INT }
             if method == "to_i8" { return TYPE_I8 }
@@ -8584,23 +8610,23 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             }
         }
 
-        if obj_k == TK_CHAR {
+        if obj_k == TyKind.Char {
             if method == "to_int" { return TYPE_INT }
             if method == "to_str" { return TYPE_STR }
         }
 
-        if obj_k == TK_OPTION {
+        if obj_k == TyKind.Option {
             if method == "unwrap" { return ty_pool.get(obj_t).unwrap().inner1 }
             if method == "is_some" || method == "is_none" { return TYPE_BOOL }
         }
 
-        if obj_k == TK_RESULT {
+        if obj_k == TyKind.Result {
             if method == "unwrap" { return ty_pool.get(obj_t).unwrap().inner1 }
             if method == "unwrap_err" { return ty_pool.get(obj_t).unwrap().inner2 }
             if method == "is_ok" || method == "is_err" { return TYPE_BOOL }
         }
 
-        if obj_k == TK_MAP {
+        if obj_k == TyKind.Map {
             let args_sl = node_args(node)
             let key_t = ty_pool.get(obj_t).unwrap().inner1
             let val_t = ty_pool.get(obj_t).unwrap().inner2
@@ -8623,7 +8649,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             if method == "values" { return make_list_type(val_t) }
         }
 
-        if obj_k == TK_SET {
+        if obj_k == TyKind.Set {
             let args_sl = node_args(node)
             let elem = ty_pool.get(obj_t).unwrap().inner1
             if method == "len" { return TYPE_INT }
@@ -8638,7 +8664,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             }
         }
 
-        if obj_k == TK_BYTES {
+        if obj_k == TyKind.Bytes {
             let args_sl = node_args(node)
             if method == "len" { return TYPE_INT }
             if method == "get" {
@@ -8694,7 +8720,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             }
         }
 
-        if obj_k == TK_STRUCT || obj_k == TK_ENUM {
+        if obj_k == TyKind.Struct || obj_k == TyKind.Enum {
             let tname = ty_pool.get(obj_t).unwrap().name
             // sb3125 §3c rule-3: an unqualified call to a method defined by two
             // or more traits this type implements is ambiguous. Reject before
@@ -8858,13 +8884,13 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         if node_kind(obj_node) == NodeKind.Ident {
             let obj_name = node_name(obj_node)
             let tid = lookup_named_type(obj_name)
-            if tid != -1 && type_kind(tid) == TK_ENUM {
+            if tid != -1 && type_kind(tid) == TyKind.Enum {
                 return tid
             }
         }
 
         let obj_t = infer_type(obj_node)
-        if type_kind(obj_t) == TK_STRUCT {
+        if type_kind(obj_t) == TyKind.Struct {
             let ft = get_struct_field_tid(obj_t, fname)
             if ft != -1 {
                 // A generic field on a struct INSTANCE (`b: Box[Int]`) carries the
@@ -8897,7 +8923,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                                 let tpname = node_name(sublist_get(tparams_sl, i))
                                 let arg_tid = ty_param_list.get(inst.params_start + i).unwrap()
                                 let ak = type_kind(arg_tid)
-                                if ak != TK_TYPEVAR && ak != TK_UNKNOWN {
+                                if ak != TyKind.Typevar && ak != TyKind.Unknown {
                                     binds.insert(tpname, arg_tid)
                                 } else if tc_is_unbound_metavar(arg_tid) != 0 {
                                     // gqg3rk: the instance param is an as-yet-unpinned
@@ -8923,7 +8949,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         // numeric index into the tuple's element tids. Without this, a tuple
         // element type is TYPE_UNKNOWN and method calls on it (e.g. `t.0.unwrap()`
         // when element 0 is Option) fail to resolve (qm01e7).
-        if type_kind(obj_t) == TK_TUPLE {
+        if type_kind(obj_t) == TyKind.Tuple {
             let te = ty_pool.get(obj_t).unwrap()
             let idx = str_to_tuple_index(fname)
             if idx >= 0 && idx < te.params_count {
@@ -8935,7 +8961,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
 
     if kind == NodeKind.IndexExpr {
         let obj_t = infer_type(node_obj(node))
-        if type_kind(obj_t) == TK_LIST {
+        if type_kind(obj_t) == TyKind.List {
             return ty_pool.get(obj_t).unwrap().inner1
         }
         return TYPE_UNKNOWN
@@ -8983,7 +9009,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             } else {
                 // 1) hint FIRST (monotonicity: a distant enum decl must never retroactively
                 //    rebind a locally-determined site).
-                if tc_construct_hint >= 0 && type_kind(tc_construct_hint) == TK_ENUM && get_variant_by_name(tc_construct_hint, sname) != -1 {
+                if tc_construct_hint >= 0 && type_kind(tc_construct_hint) == TyKind.Enum && get_variant_by_name(tc_construct_hint, sname) != -1 {
                     return tc_construct_hint
                 }
                 // 2) struct (Kind A guarantees a name is never both a struct AND a variant).
@@ -9289,6 +9315,164 @@ fn tc_check_fn(fn_node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report 
     tc_boundary_check_active = prev_boundary
 }
 
+// ── Match exhaustiveness (E0004) ─────────────────────────────────────
+//
+// Spec: sections/03_types.md "Exhaustiveness". Catalog: E0004 NonExhaustiveMatch.
+//
+// UNDER-APPROXIMATING BY DESIGN. This reports only what it can PROVE is
+// non-exhaustive: a match whose scrutinee resolves to a declared enum, where some
+// variant of that enum is named by no arm and no arm is a catch-all. Every shape it
+// cannot reason about (Int/Str/Char scrutinees and their ranges, tuple and struct
+// patterns, nested refutable sub-patterns) contributes nothing and stays silent.
+//
+// The asymmetry is deliberate and is the whole safety argument for turning this on
+// in a self-hosting compiler: a FALSE NEGATIVE is a match that keeps its old
+// behaviour, while a FALSE POSITIVE breaks a working program. So when in doubt this
+// code counts a variant as COVERED. That is also why a variant with refutable
+// sub-patterns (`Shape.Circle(0)`) counts as fully covering `Circle` — narrowing it
+// would need range/nested analysis, which is not implemented, and guessing would
+// reject valid code.
+
+// Normalize a possibly-monomorphized enum instance tid (`Tree[Int]`) to its base
+// declaration tid (`Tree`), the key evar_pool.enum_id is stored under. The enum twin
+// of tc_struct_base_tid; a non-enum, bare, or unresolvable tid returns unchanged.
+fn tc_enum_base_tid(tid: Int) -> Int {
+    if tid < 0 || tid >= ty_pool.len() { return tid }
+    let t = ty_pool.get(tid).unwrap()
+    if t.kind != TyKind.Enum { return tid }
+    if t.params_count == 0 { return tid }
+    let base = lookup_named_type(strip_module_qualifier(t.name))
+    if base == -1 { return tid }
+    base
+}
+
+// Collect the variant names a single pattern covers into `covered`, and return 1 if
+// the pattern is a CATCH-ALL (irrefutable) — in which case the match is exhaustive
+// regardless of what else is present.
+fn tc_exh_collect_pattern(pat: Int, covered: List[Str]) -> Int {
+    if pat == -1 { return 0 }
+    let pk = node_kind(pat)
+    if pk == NodeKind.WildcardPattern { return 1 }
+    if pk == NodeKind.IdentPattern {
+        // A bare identifier is either a variant spelling (`Red`) or a binding that
+        // matches anything (`other`). is_variant_name is the same discriminator the
+        // pre-existing heuristic used, so this inherits its resolution rules.
+        let nm = node_name(pat)
+        if is_variant_name(nm) != 0 {
+            covered.push(nm)
+            return 0
+        }
+        return 1
+    }
+    if pk == NodeKind.EnumPattern {
+        // Qualified `Color.Red` puts the type in `name` and the variant in
+        // `type_name`; unqualified `Red(x)` puts the variant in `name`.
+        let vname = node_name(pat)
+        let tname = node_type_name(pat)
+        if tname != "" {
+            covered.push(tname)
+        } else {
+            covered.push(vname)
+        }
+        return 0
+    }
+    if pk == NodeKind.OrPattern {
+        // Union of the alternatives (spec: "OR-patterns — union of covered patterns
+        // per alternative"). A catch-all in any alternative makes the whole arm one.
+        let alts = node_elements(pat)
+        if alts == -1 { return 0 }
+        let mut any_catch_all = 0
+        let mut i = 0
+        while i < sublist_length(alts) {
+            if tc_exh_collect_pattern(sublist_get(alts, i), covered) != 0 { any_catch_all = 1 }
+            i = i + 1
+        }
+        return any_catch_all
+    }
+    if pk == NodeKind.StructPattern {
+        // A struct-STYLE variant written bare (`NotFound { msg }`, `Shared { only }`)
+        // parses here, not as an EnumPattern — the parser only builds an EnumPattern
+        // for the qualified `Type.Variant { .. }` form. Its `type_name` holds the bare
+        // name. Missing this arm reported three exhaustive corpus matches as missing
+        // variants, so it is load-bearing, not defensive.
+        //
+        // A genuine struct destructuring (`Point { x, y }`) also lands here; its name
+        // is not a variant name, so it contributes nothing. A name that collides across
+        // enums is safe too: coverage is compared against the SCRUTINEE enum's declared
+        // variant list, which scopes the match.
+        let sname = node_type_name(pat)
+        if is_variant_name(sname) != 0 {
+            covered.push(sname)
+        }
+        return 0
+    }
+    if pk == NodeKind.AsPattern {
+        // `p as name` binds in addition to matching; coverage is the inner pattern's.
+        return tc_exh_collect_pattern(node_pattern(pat), covered)
+    }
+    // Int/Str/Range/Tuple/List patterns cover no enum variant and are not catch-alls.
+    // Contribute nothing.
+    0
+}
+
+fn tc_check_match_exhaustive(node: Int, scrut_tid: Int, arms_sl: Int) ! TypeCheck.Report, Diag.Report {
+    if arms_sl == -1 { return }
+    let base = tc_enum_base_tid(tc_resolve(scrut_tid))
+    if base < 0 || base >= ty_pool.len() { return }
+    if ty_pool.get(base).unwrap().kind != TyKind.Enum { return }
+
+    // The declared variant set. An enum the registry knows nothing about (0 variants)
+    // is unanalyzable, not vacuously non-exhaustive.
+    let mut declared: List[Str] = []
+    let mut i = 0
+    while i < evar_pool.len() {
+        let ev = evar_pool.get(i).unwrap()
+        if ev.enum_id == base { declared.push(ev.name) }
+        i = i + 1
+    }
+    if declared.len() == 0 { return }
+
+    let mut covered: List[Str] = []
+    let mut ai = 0
+    while ai < sublist_length(arms_sl) {
+        let arm = sublist_get(arms_sl, ai)
+        // Guards are opaque (spec): a guarded arm may not fire, so it contributes
+        // NOTHING — not its variants, and not its catch-all-ness.
+        if node_guard(arm) == -1 {
+            if tc_exh_collect_pattern(node_pattern(arm), covered) != 0 { return }
+        }
+        ai = ai + 1
+    }
+
+    let mut missing: List[Str] = []
+    let mut di = 0
+    while di < declared.len() {
+        let want = declared.get(di).unwrap()
+        let mut seen = 0
+        let mut ci = 0
+        while ci < covered.len() {
+            if covered.get(ci).unwrap() == want { seen = 1 }
+            ci = ci + 1
+        }
+        if seen == 0 { missing.push(want) }
+        di = di + 1
+    }
+    if missing.len() == 0 { return }
+
+    let ename = strip_module_qualifier(ty_pool.get(base).unwrap().name)
+    let mut list_str = ""
+    let mut mi = 0
+    while mi < missing.len() {
+        if mi > 0 { list_str = "{list_str}, " }
+        list_str = "{list_str}`{missing.get(mi).unwrap()}`"
+        mi = mi + 1
+    }
+    let noun = if missing.len() == 1 { "pattern" } else { "patterns" }
+    diag_error_at("NonExhaustiveMatch", NON_EXHAUSTIVE_MATCH,
+        "non-exhaustive match: missing {noun} {list_str}", node,
+        "add an arm for {list_str}, or a `_ => ...` catch-all arm to absorb the rest of {ename}")
+}
+
 // Block branch genuinely save/restores scope via nr_push_scope/nr_pop_scope;
 // the recursive tc_check_body and other nr_* writes fall outside that pattern,
 // which the analyzer correctly flags.
@@ -9409,6 +9593,20 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         if final_tid == TYPE_UNKNOWN {
             final_tid = inferred_tid
         }
+        // Publish the BINDING's type on the let node itself. infer_type memoizes expression
+        // nodes only, so a `let` statement carried no tid at all and codegen had to guess
+        // between the annotation node and the initializer — and guessing the initializer is
+        // WRONG for `let m: Map[Str, List[Int]] = Map()`: the declared type is compared
+        // against the initializer, never unified into it, so the ctor's tid is still
+        // `Map[α, β]` with both metavars unbound. final_tid is typecheck's own answer to
+        // "what type is this variable", by the same rule three lines up, so publishing it is
+        // what lets codegen READ the type rather than re-derive it (Stage 2 of the tid
+        // collapse, decisions/compiler-type-representation.md Q2).
+        //
+        // Additive: this slot was the -1 unset sentinel for every let node before now.
+        if node < tc_node_tid.len() && final_tid != TYPE_UNKNOWN {
+            tc_node_tid.set(node, final_tid)
+        }
         // Record the decl node (gqg3rk) so the E0301 region-boundary check has a
         // span. Node is used only for that diagnostic in this pass — unused-var
         // warnings are off during inference (nr_warn_unused == 0).
@@ -9502,10 +9700,10 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         let iter_t = tc_resolve(infer_type(node_iterable(node)))
         let iter_tk = type_kind(iter_t)
         let mut elem_t = TYPE_UNKNOWN
-        if iter_tk == TK_LIST || iter_tk == TK_SET {
+        if iter_tk == TyKind.List || iter_tk == TyKind.Set {
             elem_t = ty_pool.get(iter_t).unwrap().inner1
         } else {
-            // TK_UNKNOWN here means iter_t is still an unbound metavar (e.g. a lazy-adapter
+            // TyKind.Unknown here means iter_t is still an unbound metavar (e.g. a lazy-adapter
             // chain like `.enumerate()`/`.zip()` not yet pinned at this point in checking) --
             // under-determined, not known to be non-iterable. Leave it to E0301's
             // region-boundary check rather than misdiagnosing it here. Set/Map/Str/Bytes/
@@ -9514,7 +9712,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             // plus the Channel receive extension) so they pass through even where codegen's
             // emit_for_in has no arm yet -- that gap is I0002, an internal compiler error,
             // never a user-facing NotIterable.
-            let is_deferred_iterable = iter_tk == TK_UNKNOWN || iter_tk == TK_MAP || iter_tk == TK_STR || iter_tk == TK_BYTES || iter_tk == TK_ITERATOR || iter_tk == TK_CHANNEL
+            let is_deferred_iterable = iter_tk == TyKind.Unknown || iter_tk == TyKind.Map || iter_tk == TyKind.Str || iter_tk == TyKind.Bytes || iter_tk == TyKind.Iterator || iter_tk == TyKind.Channel
             if is_deferred_iterable == 0 {
                 diag_error_at("NotIterable", NOT_ITERABLE, "cannot iterate over type '{type_to_str(iter_t)}' with a `for` loop -- only List, Set, Map, Range, Str, Bytes, Channel, and Iterator implement iteration", node_iterable(node), "iterate a List, Set, Map, Range, Str, Bytes, Channel, or Iterator instead")
             }
@@ -9546,25 +9744,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                 i = i + 1
             }
 
-            let mut has_wildcard = 0
-            let mut ai = 0
-            while ai < sublist_length(arms_sl) {
-                let arm = sublist_get(arms_sl, ai)
-                let pat = node_pattern(arm)
-                if pat != -1 {
-                    let pk = node_kind(pat)
-                    if pk == NodeKind.WildcardPattern {
-                        has_wildcard = 1
-                    }
-                    if pk == NodeKind.IdentPattern && is_variant_name(node_name(pat)) == 0 {
-                        has_wildcard = 1
-                    }
-                }
-                ai = ai + 1
-            }
-            if has_wildcard == 0 {
-                tc_warn("match expression may not be exhaustive (no wildcard or catch-all arm)")
-            }
+            tc_check_match_exhaustive(node, scrut_tid, arms_sl)
         }
         return
     }
@@ -9713,7 +9893,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         // the Part B body walk: bind unannotated closure params to the elem/acc
         // type and type-check the body once. Only List has closure-taking HOFs.
         let obj_t = infer_type(node_obj(node))
-        if type_kind(obj_t) == TK_LIST {
+        if type_kind(obj_t) == TyKind.List {
             let method = node_method(node)
             let args_sl = node_args(node)
             let elem = ty_pool.get(obj_t).unwrap().inner1
@@ -9772,11 +9952,11 @@ fn tc_check_pattern_types(node: Int) ! TypeCheck.Resolve {
             short_name = tname
             variant_enum_tid = named_type_map.get(vname) ?? -1
         }
-        if vname == "Some" && tc_pattern_binding_type >= 0 && type_kind(tc_pattern_binding_type) == TK_OPTION {
+        if vname == "Some" && tc_pattern_binding_type >= 0 && type_kind(tc_pattern_binding_type) == TyKind.Option {
             tc_pattern_binding_type = ty_pool.get(tc_pattern_binding_type).unwrap().inner1
-        } else if vname == "Ok" && tc_pattern_binding_type >= 0 && type_kind(tc_pattern_binding_type) == TK_RESULT {
+        } else if vname == "Ok" && tc_pattern_binding_type >= 0 && type_kind(tc_pattern_binding_type) == TyKind.Result {
             tc_pattern_binding_type = ty_pool.get(tc_pattern_binding_type).unwrap().inner1
-        } else if vname == "Err" && tc_pattern_binding_type >= 0 && type_kind(tc_pattern_binding_type) == TK_RESULT {
+        } else if vname == "Err" && tc_pattern_binding_type >= 0 && type_kind(tc_pattern_binding_type) == TyKind.Result {
             tc_pattern_binding_type = ty_pool.get(tc_pattern_binding_type).unwrap().inner2
         } else {
             tc_pattern_binding_type = -1
@@ -9785,7 +9965,7 @@ fn tc_check_pattern_types(node: Int) ! TypeCheck.Resolve {
         if variant_enum_tid >= 0 {
             var_idx = get_variant_by_name(variant_enum_tid, short_name)
         }
-        if var_idx == -1 && saved_binding >= 0 && type_kind(saved_binding) == TK_ENUM {
+        if var_idx == -1 && saved_binding >= 0 && type_kind(saved_binding) == TyKind.Enum {
             var_idx = get_variant_by_name(saved_binding, short_name)
         }
         if var_idx == -1 {
@@ -9851,7 +10031,7 @@ fn tc_check_pattern_types(node: Int) ! TypeCheck.Resolve {
             // nested match on it fails typecheck.
             let mut tup_start = -1
             let mut tup_count = 0
-            if saved_binding >= 0 && type_kind(saved_binding) == TK_TUPLE {
+            if saved_binding >= 0 && type_kind(saved_binding) == TyKind.Tuple {
                 let te = ty_pool.get(saved_binding).unwrap()
                 tup_start = te.params_start
                 tup_count = te.params_count
@@ -9877,7 +10057,7 @@ fn tc_check_pattern_types(node: Int) ! TypeCheck.Resolve {
         // typed as List[T] and any consumer that reads the binding's type
         // (e.g. the Display interpolation gate) sees the wrong type.
         let mut elem_t = -1
-        if saved_binding >= 0 && type_kind(saved_binding) == TK_LIST {
+        if saved_binding >= 0 && type_kind(saved_binding) == TyKind.List {
             elem_t = ty_pool.get(saved_binding).unwrap().inner1
         }
         let elems_sl = node_elements(node)
@@ -10263,21 +10443,45 @@ fn type_to_str(tid0: Int) -> Str {
     let k = t.kind
     let name = t.name
 
-    if k == TK_INT { return "Int" }
-    if k == TK_FLOAT { return "Float" }
-    if k == TK_BOOL { return "Bool" }
-    if k == TK_STR { return "Str" }
-    if k == TK_VOID { return "Void" }
-    if k == TK_I8 { return "I8" }
-    if k == TK_I16 { return "I16" }
-    if k == TK_I32 { return "I32" }
-    if k == TK_U8 { return "U8" }
-    if k == TK_U16 { return "U16" }
-    if k == TK_U32 { return "U32" }
-    if k == TK_U64 { return "U64" }
-    if k == TK_UNKNOWN { return "?" }
-    if k == TK_TYPEVAR { return name }
-    if k == TK_STRUCT {
+    // Dispatch is a match, not an if-chain, so the surface rendering of a kind can
+    // never be decided by fall-through. The five arms that answer `name` do so
+    // deliberately; four of them (Closure/Iterator/Handle/Channel) are also
+    // UNCONSTRUCTIBLE — new_type is never called with them (br vag3wc) — so they
+    // are named here to record that, not because the rendering was chosen.
+    match k {
+        TyKind.Int => return "Int"
+        TyKind.Float => return "Float"
+        TyKind.Bool => return "Bool"
+        TyKind.Str => return "Str"
+        TyKind.Void => return "Void"
+        TyKind.Char => return name
+        TyKind.I8 => return "I8"
+        TyKind.I16 => return "I16"
+        TyKind.I32 => return "I32"
+        TyKind.U8 => return "U8"
+        TyKind.U16 => return "U16"
+        TyKind.U32 => return "U32"
+        TyKind.U64 => return "U64"
+        TyKind.Bytes => return "Bytes"
+        TyKind.Unknown => return "?"
+        TyKind.Typevar => return name
+        TyKind.Enum => return name
+        // Unconstructible (br vag3wc): kept on the pre-match fall-through rendering.
+        TyKind.Closure => return name
+        TyKind.Iterator => return name
+        TyKind.Handle => return name
+        TyKind.Channel => return name
+        TyKind.List => return "List[{type_to_str(t.inner1)}]"
+        TyKind.Option => return "Option[{type_to_str(t.inner1)}]"
+        TyKind.Result => return "Result[{type_to_str(t.inner1)}, {type_to_str(t.inner2)}]"
+        TyKind.Map => return "Map[{type_to_str(t.inner1)}, {type_to_str(t.inner2)}]"
+        TyKind.Set => return "Set[{type_to_str(t.inner1)}]"
+        TyKind.Struct => {}
+        TyKind.Fn => {}
+        TyKind.Tuple => {}
+    }
+
+    if k == TyKind.Struct {
         // Monomorphized struct instance (Box[Int]): render its concrete type-args so
         // diagnostics read "expects Box[Int], got Box[Str]" instead of an ambiguous
         // bare "Box" on both sides (br qw7v90). A bare generic struct (params_count
@@ -10298,27 +10502,7 @@ fn type_to_str(tid0: Int) -> Str {
         }
         return name
     }
-    if k == TK_ENUM { return name }
-
-    if k == TK_LIST {
-        return "List[{type_to_str(t.inner1)}]"
-    }
-    if k == TK_OPTION {
-        return "Option[{type_to_str(t.inner1)}]"
-    }
-    if k == TK_RESULT {
-        return "Result[{type_to_str(t.inner1)}, {type_to_str(t.inner2)}]"
-    }
-    if k == TK_MAP {
-        return "Map[{type_to_str(t.inner1)}, {type_to_str(t.inner2)}]"
-    }
-    if k == TK_SET {
-        return "Set[{type_to_str(t.inner1)}]"
-    }
-    if k == TK_BYTES {
-        return "Bytes"
-    }
-    if k == TK_FN {
+    if k == TyKind.Fn {
         let start = t.params_start
         let count = t.params_count
         let mut params = ""
@@ -10332,7 +10516,7 @@ fn type_to_str(tid0: Int) -> Str {
         }
         return "Fn({params}) -> {type_to_str(t.inner1)}"
     }
-    if k == TK_TUPLE {
+    if k == TyKind.Tuple {
         let start = t.params_start
         let count = t.params_count
         let mut elems = ""
@@ -10377,7 +10561,7 @@ fn tc_tid_tag_at(tid0: Int, tagpos: Int) -> Str {
     }
     let t = ty_pool.get(tid).unwrap()
     let k = t.kind
-    if k == TK_STRUCT || k == TK_ENUM {
+    if k == TyKind.Struct || k == TyKind.Enum {
         let stem = tc_tid_struct_mono_name(tid)
         if stem != "" { return stem }
         // Twin alias hop for both positions (bwyfy1: the two spellers must agree on
@@ -10395,20 +10579,20 @@ fn tc_tid_tag_at(tid0: Int, tagpos: Int) -> Str {
     // prefix test can no longer see it — the exact hazard qerbc7 exists to close. Inner
     // recursion is always TAGPOS_INNER regardless of this call's own position (both
     // original callers already did this; it is why sharing tc_tid_tuple_tag is safe).
-    if k == TK_OPTION {
+    if k == TyKind.Option {
         let inner = tc_tid_tag_at(t.inner1, TAGPOS_INNER)
         if diag_is_ice_seg(inner) { return inner }
         return "Option_{inner}"
     }
-    if k == TK_RESULT {
+    if k == TyKind.Result {
         let ok = tc_tid_tag_at(t.inner1, TAGPOS_INNER)
         if diag_is_ice_seg(ok) { return ok }
         let err = tc_tid_tag_at(t.inner2, TAGPOS_INNER)
         if diag_is_ice_seg(err) { return err }
         return "Result_{ok}_{err}"
     }
-    if k == TK_TUPLE { return tc_tid_tuple_tag(t) }
-    if k == TK_TYPEVAR {
+    if k == TyKind.Tuple { return tc_tid_tuple_tag(t) }
+    if k == TyKind.Typevar {
         if tagpos == TAGPOS_INNER {
             // Gated explicitly: an unresolved generic type param is a common inner in
             // generic-heavy code, so this must not build the message when the channel is off.
@@ -10418,7 +10602,7 @@ fn tc_tid_tag_at(tid0: Int, tagpos: Int) -> Str {
     }
     // TOP erases Map to its bare Pascal carrier ("Map"); INNER spells it structurally,
     // lowercase, byte-matching the string path's own Map_<key>_<val> segment.
-    if k == TK_MAP {
+    if k == TyKind.Map {
         if tagpos == TAGPOS_TOP { return "Map" }
         let key = tc_tid_tag_at(t.inner1, TAGPOS_INNER)
         if diag_is_ice_seg(key) { return key }
@@ -10427,30 +10611,30 @@ fn tc_tid_tag_at(tid0: Int, tagpos: Int) -> Str {
         return "Map_{key}_{val}"
     }
     if tagpos == TAGPOS_TOP {
-        if k == TK_INT { return "Int" }
-        if k == TK_FLOAT { return "Float" }
-        if k == TK_BOOL { return "Bool" }
-        if k == TK_STR { return "Str" }
-        if k == TK_LIST { return "List" }
-        if k == TK_ITERATOR { return "Iterator" }
-        if k == TK_HANDLE { return "Handle" }
-        if k == TK_CHANNEL { return "Channel" }
-        if k == TK_SET { return "Set" }
-        if k == TK_BYTES { return "Bytes" }
-        if k == TK_I8 { return "I8" }
-        if k == TK_I16 { return "I16" }
-        if k == TK_I32 { return "I32" }
-        if k == TK_U8 { return "U8" }
-        if k == TK_U16 { return "U16" }
-        if k == TK_U32 { return "U32" }
-        if k == TK_U64 { return "U64" }
-        if k == TK_CHAR { return "Char" }
-        // I0001 (gqg3rk): an unbound metavar (TK_UNKNOWN) reaching C-tag emission means
+        if k == TyKind.Int { return "Int" }
+        if k == TyKind.Float { return "Float" }
+        if k == TyKind.Bool { return "Bool" }
+        if k == TyKind.Str { return "Str" }
+        if k == TyKind.List { return "List" }
+        if k == TyKind.Iterator { return "Iterator" }
+        if k == TyKind.Handle { return "Handle" }
+        if k == TyKind.Channel { return "Channel" }
+        if k == TyKind.Set { return "Set" }
+        if k == TyKind.Bytes { return "Bytes" }
+        if k == TyKind.I8 { return "I8" }
+        if k == TyKind.I16 { return "I16" }
+        if k == TyKind.I32 { return "I32" }
+        if k == TyKind.U8 { return "U8" }
+        if k == TyKind.U16 { return "U16" }
+        if k == TyKind.U32 { return "U32" }
+        if k == TyKind.U64 { return "U64" }
+        if k == TyKind.Char { return "Char" }
+        // I0001 (gqg3rk): an unbound metavar (TyKind.Unknown) reaching C-tag emission means
         // an under-determined binding escaped the E0301 boundary check — a compiler
         // invariant violation. Fail CLOSED with an invalid-C-identifier sentinel so the C
         // compiler errors loudly, NEVER silently fall through to "Void" (the pre-decision
         // erased-default miscompile). Keys on KIND, per DECISIONS.md:342.
-        if k == TK_UNKNOWN { return ICE_SEG_UNSOLVED_TYPEVAR }
+        if k == TyKind.Unknown { return ICE_SEG_UNSOLVED_TYPEVAR }
         // A GENUINE Void, answered deliberately rather than by fall-through. Void is "an
         // ordinary INHABITED, encodable type" (decisions/under-determined-types.md:38-42,
         // 6-0) and is genuinely distinct from an unsolved metavariable α (:51-54 —
@@ -10460,46 +10644,46 @@ fn tc_tid_tag_at(tid0: Int, tagpos: Int) -> Str {
         // it, Void shares its spelling with the two failure buckets below and every
         // consumer that rejects one rejects all three. Byte-identical to the string
         // path, which also spells a Void type arg "Void".
-        if k == TK_VOID {
+        if k == TyKind.Void {
             dbg_trace("ctagvoid", "producer=genuine_void tid={tid} name={t.name}")
             return "Void"
         }
-        // A kind with no arm above (TK_FN, TK_CLOSURE, any kind added later). Fails
+        // A kind with no arm above (TyKind.Fn, TyKind.Closure, any kind added later). Fails
         // CLOSED rather than sharing the genuine Void's spelling directly above: this is
         // not a type name, it is "this encoder does not know how to spell this kind", and
         // letting it read as "Void" is what made the two indistinguishable. The floor is
         // measured at 0 across the corpus and both compiler entry points (ctagvoid,
         // CLAUDE.md), so arming it cannot regress a working program — it can only make a
         // future kind loud instead of silent.
-        dbg_trace("ctagvoid", "producer=unhandled_kind tid={tid} k={k} name={t.name}")
+        dbg_trace("ctagvoid", "producer=unhandled_kind tid={tid} k={tk_name(k)} name={t.name}")
         return ICE_SEG_UNHANDLED_KIND
     }
     // INNER: lowercase scalars, mirroring codegen_types.c_type_tag.
-    if k == TK_INT { return "int" }
-    if k == TK_FLOAT { return "double" }
-    if k == TK_BOOL { return "bool" }
-    if k == TK_STR { return "str" }
-    if k == TK_LIST { return "list" }
-    if k == TK_ITERATOR { return "iter" }
-    if k == TK_HANDLE { return "handle" }
-    if k == TK_CHANNEL { return "channel" }
-    if k == TK_SET { return "set" }
-    if k == TK_BYTES { return "bytes" }
-    if k == TK_OPTION { return "option" }
-    if k == TK_RESULT { return "result" }
-    if k == TK_I8 { return "i8" }
-    if k == TK_I16 { return "i16" }
-    if k == TK_I32 { return "i32" }
-    if k == TK_U8 { return "u8" }
-    if k == TK_U16 { return "u16" }
-    if k == TK_U32 { return "u32" }
-    if k == TK_U64 { return "u64" }
-    if k == TK_CHAR { return "char" }
-    // A GENUINE Void, answered deliberately (the twin of the TOP arm's TK_VOID case).
+    if k == TyKind.Int { return "int" }
+    if k == TyKind.Float { return "double" }
+    if k == TyKind.Bool { return "bool" }
+    if k == TyKind.Str { return "str" }
+    if k == TyKind.List { return "list" }
+    if k == TyKind.Iterator { return "iter" }
+    if k == TyKind.Handle { return "handle" }
+    if k == TyKind.Channel { return "channel" }
+    if k == TyKind.Set { return "set" }
+    if k == TyKind.Bytes { return "bytes" }
+    if k == TyKind.Option { return "option" }
+    if k == TyKind.Result { return "result" }
+    if k == TyKind.I8 { return "i8" }
+    if k == TyKind.I16 { return "i16" }
+    if k == TyKind.I32 { return "i32" }
+    if k == TyKind.U8 { return "u8" }
+    if k == TyKind.U16 { return "u16" }
+    if k == TyKind.U32 { return "u32" }
+    if k == TyKind.U64 { return "u64" }
+    if k == TyKind.Char { return "char" }
+    // A GENUINE Void, answered deliberately (the twin of the TOP arm's TyKind.Void case).
     //
     // THIS ARM IS LOAD-BEARING AND MUST NOT BE DELETED (br hsgsbp / br vbcw1e).
     //
-    // tc_tid_tag_at's TOP-position TK_RESULT arm spells Result[Void, Str] as
+    // tc_tid_tag_at's TOP-position TyKind.Result arm spells Result[Void, Str] as
     // "Result_{tc_tid_tag_at(inner1, INNER)}_{...}", and the INNER recursion on a Void
     // inner reaches THIS arm before it ever reaches the fall-through below — so
     // Result_void_str's "void" comes from here, full stop. src/codegen_types.bl's
@@ -10509,7 +10693,7 @@ fn tc_tid_tag_at(tid0: Int, tagpos: Int) -> Str {
     // Result[Void, E] is not a corner case: lib/std/ depends on it (bytes.bl,
     // db_sqlite.bl, traits.bl) and the compiler synthesizes it for EVERY `?`-bearing
     // `test` block. The fall-through below is a SEPARATE bucket (kinds with no arm at
-    // all — TK_FN, TK_CLOSURE) that a genuine Void never reaches, and arming IT (br
+    // all — TyKind.Fn, TyKind.Closure) that a genuine Void never reaches, and arming IT (br
     // vbcw1e Stage 2) does not touch this one.
     //
     // VERIFIED, not just traced: the 728-file corpus sweep for this arm's `voidtwin` tap
@@ -10521,7 +10705,7 @@ fn tc_tid_tag_at(tid0: Int, tagpos: Int) -> Str {
     // chain — tid_instance_mono_args_csv / tc_seg_from_tid → tc_tid_to_c_tag →
     // tc_tid_tag_at(_, INNER) → here — firing 12 times in one tiny file. That MVCE is the
     // actual load-bearing witness for this arm, not the corpus.
-    if k == TK_VOID {
+    if k == TyKind.Void {
         // Gated explicitly (not just relying on dbg_trace's own internal gate): this arm is
         // a hot path — Result[Void, E] is synthesized for every `?`-bearing test block —
         // so the message must not be built when the channel is off.
@@ -10535,16 +10719,16 @@ fn tc_tid_tag_at(tid0: Int, tagpos: Int) -> Str {
     // caller stops routing an unbound metavar away via tc_tid_encodable/
     // tc_tid_tuple_elem_faithful (the gates qerbc7 retires) and lets it ride the tid path
     // instead — exactly the failure this arm now forecloses at the source.
-    if k == TK_UNKNOWN {
+    if k == TyKind.Unknown {
         if dbg_channel_on("voidtwin") != 0 { dbg_trace("voidtwin", "producer=scalar_unsolved_typevar tid={tid}") }
         return ICE_SEG_UNSOLVED_TYPEVAR
     }
-    // Every kind with a real arm above is exhausted, and TK_VOID/TK_UNKNOWN are both
+    // Every kind with a real arm above is exhausted, and TyKind.Void/TyKind.Unknown are both
     // intercepted above too, so this is reached only by a kind this speller never learned
-    // (TK_FN, TK_CLOSURE). Stage 1 measured this bucket's floor at 0 over the full corpus.
-    // Safe to arm because, per the TK_VOID arm's comment above, a genuine Void can never
+    // (TyKind.Fn, TyKind.Closure). Stage 1 measured this bucket's floor at 0 over the full corpus.
+    // Safe to arm because, per the TyKind.Void arm's comment above, a genuine Void can never
     // reach this line — only a kind this speller genuinely never learned does.
-    if dbg_channel_on("voidtwin") != 0 { dbg_trace("voidtwin", "producer=scalar_unhandled_kind tid={tid} k={k}") }
+    if dbg_channel_on("voidtwin") != 0 { dbg_trace("voidtwin", "producer=scalar_unhandled_kind tid={tid} k={tk_name(k)}") }
     ICE_SEG_UNHANDLED_KIND
 }
 
@@ -10585,8 +10769,8 @@ fn tc_tid_tuple_tag(t: TypePoolEntry) -> Str {
 //
 // Callers narrow `tid` to a scalar/typevar/unknown leaf before its own gate check, with one
 // exception: tc_tid_inner_tag_faithful's params_count!=0 branch also reaches a non-STRUCT/ENUM
-// compound tid here (e.g. a TK_TUPLE with arity>0, via its "faithful_reject_paramcount" call) —
-// harmless, since tc_tid_tag_at's TK_TUPLE arm spells it structurally rather than falling
+// compound tid here (e.g. a TyKind.Tuple with arity>0, via its "faithful_reject_paramcount" call) —
+// harmless, since tc_tid_tag_at's TyKind.Tuple arm spells it structurally rather than falling
 // through to its TAGPOS_INNER scalar fallback, so diag_is_ice_seg never fires for a genuine compound. A
 // struct/enum tid can also legitimately answer a non-ICE erased name here (the STRUCT/ENUM arm's
 // own give-up path, a separate undischarged concern, not this probe's job to flag).
@@ -10594,37 +10778,241 @@ fn voidtwin_probe(gate: Str, tid: Int) {
     if dbg_channel_on("voidtwin") == 0 { return }
     let spelled = tc_tid_inner_tag(tid)
     if !diag_is_ice_seg(spelled) { return }
-    dbg_trace("voidtwin", "probe=gate_reject gate={gate} tid={tid} k={type_kind(tid)} would_ice={spelled}")
+    dbg_trace("voidtwin", "probe=gate_reject gate={gate} tid={tid} k={tk_name(type_kind(tid))} would_ice={spelled}")
 }
 
-// TK_* → CT_* translation. The two numberings are NOT the same (e.g. TK_MAP=18
-// vs CT_MAP=13, TK_STRUCT=9 vs CT_STRUCT=23), so a cast would silently corrupt.
+// TK_* → CT_* translation. The two numberings are NOT the same (e.g. TyKind.Map=18
+// vs CT_MAP=13, TyKind.Struct=9 vs CT_STRUCT=23), so a cast would silently corrupt.
 // Explicit switch; unknown kinds map to CT_VOID.
-fn tk_to_ct(kind: Int) -> Int {
-    if kind == TK_INT { return CT_INT }
-    if kind == TK_FLOAT { return CT_FLOAT }
-    if kind == TK_BOOL { return CT_BOOL }
-    if kind == TK_STR { return CT_STRING }
-    if kind == TK_LIST { return CT_LIST }
-    if kind == TK_OPTION { return CT_OPTION }
-    if kind == TK_RESULT { return CT_RESULT }
-    if kind == TK_STRUCT { return CT_STRUCT }
-    if kind == TK_ENUM { return CT_ENUM }
-    if kind == TK_ITERATOR { return CT_ITERATOR }
-    if kind == TK_HANDLE { return CT_HANDLE }
-    if kind == TK_CHANNEL { return CT_CHANNEL }
-    if kind == TK_MAP { return CT_MAP }
-    if kind == TK_BYTES { return CT_BYTES }
-    if kind == TK_SET { return CT_SET }
-    if kind == TK_I8 { return CT_I8 }
-    if kind == TK_I16 { return CT_I16 }
-    if kind == TK_I32 { return CT_I32 }
-    if kind == TK_U8 { return CT_U8 }
-    if kind == TK_U16 { return CT_U16 }
-    if kind == TK_U32 { return CT_U32 }
-    if kind == TK_U64 { return CT_U64 }
-    if kind == TK_CHAR { return CT_CHAR }
-    CT_VOID
+// Q2's translation layer between the two type universes, and slated for deletion
+// once codegen reads the tid directly. Exhaustive by construction: six kinds have
+// no CT at all and collapse onto CT_VOID, which is a LOSSY answer, not a correct
+// one — CT_VOID here means "codegen's flat universe cannot say this", and callers
+// that must not force a value to void re-read it as -1 (see tid_inner_ct below).
+// Naming those six keeps the collapse legible instead of implicit in a
+// fall-through, and makes a newly added kind a compile error here.
+fn tk_to_ct(kind: TyKind) -> Int {
+    match kind {
+        TyKind.Int => CT_INT
+        TyKind.Float => CT_FLOAT
+        TyKind.Bool => CT_BOOL
+        TyKind.Str => CT_STRING
+        TyKind.List => CT_LIST
+        TyKind.Option => CT_OPTION
+        TyKind.Result => CT_RESULT
+        TyKind.Struct => CT_STRUCT
+        TyKind.Enum => CT_ENUM
+        TyKind.Iterator => CT_ITERATOR
+        TyKind.Handle => CT_HANDLE
+        TyKind.Channel => CT_CHANNEL
+        TyKind.Map => CT_MAP
+        TyKind.Bytes => CT_BYTES
+        TyKind.Set => CT_SET
+        TyKind.I8 => CT_I8
+        TyKind.I16 => CT_I16
+        TyKind.I32 => CT_I32
+        TyKind.U8 => CT_U8
+        TyKind.U16 => CT_U16
+        TyKind.U32 => CT_U32
+        TyKind.U64 => CT_U64
+        TyKind.Char => CT_CHAR
+        // No CT exists for these. CT_VOID is the erasure, not a type.
+        TyKind.Void => CT_VOID
+        TyKind.Fn => CT_VOID
+        TyKind.Closure => CT_VOID
+        TyKind.Tuple => CT_VOID
+        TyKind.Typevar => CT_VOID
+        TyKind.Unknown => CT_VOID
+    }
+}
+
+// ── Stage 2 divergence instrument ───────────────────────────────────
+//
+// WHY THIS LIVES IN typecheck.bl. The measurement needs to read BOTH type universes at
+// once: ty_pool (this file) and codegen's flat-derived tp_pool. typecheck imports
+// codegen_types, not the reverse, so this file is the only one below codegen_expr /
+// codegen_stmt / codegen_methods that can see both — and it already owns tk_to_ct, the
+// translation layer the comparison runs through. All three codegen modules import
+// typecheck, so a call site anywhere in codegen can reach sv_ty_or_flat. It leaves with
+// tk_to_ct in Stage 4.
+//
+// WHAT IT MEASURES. Per call site: how often codegen has no stamped tid at all (Missing),
+// how often it has one that the flat fields contradict (Diverge), and how often the two
+// agree. Missing is remaining Stage 2 instrumentation; Diverge is remaining Stage 3
+// lowering work. Pooling them into one number would conflate the two, so they are separate
+// buckets, and both are keyed by site because Stage 3's exit criterion — the counter at 0 —
+// has to be worked through site by site.
+pub type TyDiv { Agree, Diverge, Missing }
+
+type TyDivRow {
+    site: Str
+    agree: Int
+    diverge: Int
+    missing: Int
+}
+// Deliberately NOT reset by reset_scope_state: that runs per function, and a per-function
+// counter cannot answer a whole-corpus sweep. Reset is explicit only.
+let mut ty_div_rows: List[TyDivRow] = []
+
+pub fn reset_ty_divergence() {
+    ty_div_rows = []
+}
+
+fn ty_div_find(site: Str) -> Int {
+    let mut i = 0
+    while i < ty_div_rows.len() {
+        if ty_div_rows.get(i).unwrap().site == site { return i }
+        i = i + 1
+    }
+    -1
+}
+
+fn ty_div_bump(site: Str, b: TyDiv) {
+    let idx = ty_div_find(site)
+    if idx < 0 {
+        ty_div_rows.push(TyDivRow { site: site, agree: 0, diverge: 0, missing: 0 })
+        ty_div_bump(site, b)
+        return
+    }
+    let r = ty_div_rows.get(idx).unwrap()
+    match b {
+        TyDiv.Agree => { ty_div_rows.set(idx, TyDivRow { agree: r.agree + 1, ..r }) }
+        TyDiv.Diverge => { ty_div_rows.set(idx, TyDivRow { diverge: r.diverge + 1, ..r }) }
+        TyDiv.Missing => { ty_div_rows.set(idx, TyDivRow { missing: r.missing + 1, ..r }) }
+    }
+}
+
+// A query must never create a row: a sweep's zero has to mean "reached and clean", not
+// "never reached" (the unexercised-tap failure mode).
+pub fn ty_divergence_count(site: Str, b: TyDiv) -> Int {
+    let idx = ty_div_find(site)
+    if idx < 0 { return 0 }
+    let r = ty_div_rows.get(idx).unwrap()
+    match b {
+        TyDiv.Agree => return r.agree
+        TyDiv.Diverge => return r.diverge
+        TyDiv.Missing => return r.missing
+    }
+}
+
+pub fn ty_divergence_total(b: TyDiv) -> Int {
+    let mut total = 0
+    let mut i = 0
+    while i < ty_div_rows.len() {
+        total = total + ty_divergence_count(ty_div_rows.get(i).unwrap().site, b)
+        i = i + 1
+    }
+    total
+}
+
+pub fn ty_divergence_rows() -> List[Str] {
+    let mut out: List[Str] = []
+    let mut i = 0
+    while i < ty_div_rows.len() {
+        let r = ty_div_rows.get(i).unwrap()
+        out.push("{r.site} agree={r.agree} diverge={r.diverge} missing={r.missing}")
+        i = i + 1
+    }
+    out
+}
+
+fn tp_cmp_child(tp: Int, i: Int) -> Int {
+    if i == 0 { return tp_get_child1(tp) }
+    if i == 1 { return tp_get_child2(tp) }
+    -1
+}
+
+// Structural, NOT string equality. The two universes render types with different
+// vocabularies (tp_display spells a closure `Fn(sig)`, tc_type_str spells a struct instance
+// with its mono stem), so comparing renderings would manufacture cells for pure spelling
+// differences and bury the real ones. Kinds are compared through tk_to_ct, the translation
+// that already exists.
+//
+// Returns 1 for "same shape". Every 0 is a real cell, by construction of three rules:
+//   * tp < 0 is an ERASED flat slot. Against a tid that named the type, that is a
+//     divergence, not a match — mv45y5's -1-instead-of-fabricate patch made the erasure
+//     honest, it did not make it correct.
+//   * a kind with no CT at all (Tuple / Fn / Closure / Typevar / Unknown) collapses onto
+//     CT_VOID in tk_to_ct. Accepting that as equal to a CT_VOID tp would report AGREE for
+//     a tuple-typed variable the flat universe provably cannot describe, so the six are
+//     rejected up front and only a genuine Void matches CT_VOID.
+//   * Struct / Enum do not recurse. The flat universe has no slot for type arguments; what
+//     it has is the mono STEM baked into sname (`Box_Int`), so the args are compared there
+//     or nowhere. Recursing would report a cell for every non-generic struct.
+fn ty_tp_same_shape(tid0: Int, tp: Int, depth: Int) -> Int {
+    // A cycle cannot occur in an interned acyclic pool; the cap is against a corrupted
+    // slot, and it answers "same" so a defensive stop can never invent a cell.
+    if depth > 12 { return 1 }
+    if tp < 0 { return 0 }
+    let tid = tc_resolve(tid0)
+    if tid < 0 || tid >= ty_pool.len() { return 0 }
+    let t = ty_pool.get(tid).unwrap()
+    let k = t.kind
+    let ct = tk_to_ct(k)
+    if ct == CT_VOID && k != TyKind.Void { return 0 }
+    if ct != tp_get_kind(tp) { return 0 }
+    if k == TyKind.Struct || k == TyKind.Enum {
+        let sn = tp_get_sname(tp)
+        if sn == t.name { return 1 }
+        let stem = tc_tid_struct_mono_name(tid)
+        if stem != "" && sn == stem { return 1 }
+        return 0
+    }
+    let n = tc_tid_child_count(tid)
+    let mut i = 0
+    while i < n {
+        if ty_tp_same_shape(tc_tid_child(tid, i), tp_cmp_child(tp, i), depth + 1) == 0 { return 0 }
+        i = i + 1
+    }
+    1
+}
+
+// The Stage 2 seam, and the one Stage 3 flips. Answers the authoritative tid for `name`, or
+// -1 when codegen never stamped one; a caller keeps its legacy flat path for -1 and reads
+// the tid otherwise. In Stage 2 no emit decision calls it, so the flat fields still govern
+// everything and the emitted C is unchanged — the instrument observes without perturbing.
+//
+// `site` is a stable label for the call site, not a message. It is the key the whole cell
+// map is grouped by.
+pub fn sv_ty_or_flat(name: Str, site: Str) -> Int {
+    let tid = get_var_ty(name)
+    if tid < 0 {
+        ty_div_bump(site, TyDiv.Missing)
+        ty_div_trace(site, "missing", name, -1, -1)
+        return -1
+    }
+    let tp = get_var_tp(name)
+    if ty_tp_same_shape(tid, tp, 0) == 1 {
+        ty_div_bump(site, TyDiv.Agree)
+        return tid
+    }
+    ty_div_bump(site, TyDiv.Diverge)
+    ty_div_trace(site, "diverge", name, tid, tp)
+    tid
+}
+
+// The sweep's readout: one NDJSON-ish line per occurrence, carrying both renderings so the
+// cell map says WHAT diverged and not merely where. Off by default, so the instrument costs
+// a channel check per call when nobody is measuring.
+// The sweep's per-site summary, emitted once at the end of a codegen run. Silent when the
+// channel is off, and silent when no site was ever reached — an empty dump means "the
+// instrument was not exercised", which is a different claim from "zero divergences", and
+// keeping the two distinguishable is the whole reason a sweep can be trusted.
+pub fn ty_divergence_dump() {
+    if dbg_channel_on("tydiv") == 0 { return }
+    let rows = ty_divergence_rows()
+    let mut i = 0
+    while i < rows.len() {
+        dbg_trace("tydiv", "summary {rows.get(i).unwrap()}")
+        i = i + 1
+    }
+}
+
+fn ty_div_trace(site: Str, bucket: Str, name: Str, tid: Int, tp: Int) {
+    if dbg_channel_on("tydiv") == 0 { return }
+    let spelled_tid = if tid >= 0 { tc_type_str(tid) } else { "-" }
+    let spelled_tp = if tp >= 0 { tp_display(tp) } else { "-" }
+    dbg_trace("tydiv", "bucket={bucket} site={site} var={name} tid={spelled_tid} flat={spelled_tp}")
 }
 
 // Inner-type accessors over a tid for the codegen read-site fix (jkdywb). A
@@ -10648,7 +11036,7 @@ fn tid_inner_ct(inner: Int) -> Int {
 fn tid_inner_struct(inner: Int) -> Str {
     if inner < 0 || inner >= ty_pool.len() { return "" }
     let it = ty_pool.get(inner).unwrap()
-    if it.kind == TK_STRUCT || it.kind == TK_ENUM {
+    if it.kind == TyKind.Struct || it.kind == TyKind.Enum {
         // A generic struct INSTANCE inner (Box[Int]) must carry its recursive mono
         // stem (Box_Int), not the erased bare head (Box) — this feeds the generic-fn
         // bare-typevar-return recovery (emit_generic_fn_call_tail) that types the
@@ -10672,14 +11060,14 @@ fn tid_inner_struct(inner: Int) -> Str {
 pub fn tc_tid_set_elem_ct(tid: Int) -> Int {
     if tid < 0 || tid >= ty_pool.len() { return -1 }
     let t = ty_pool.get(tid).unwrap()
-    if t.kind != TK_SET { return -1 }
+    if t.kind != TyKind.Set { return -1 }
     tid_inner_ct(t.inner1)
 }
 
 pub fn tc_tid_set_elem_struct(tid: Int) -> Str {
     if tid < 0 || tid >= ty_pool.len() { return "" }
     let t = ty_pool.get(tid).unwrap()
-    if t.kind != TK_SET { return "" }
+    if t.kind != TyKind.Set { return "" }
     tid_inner_struct(t.inner1)
 }
 
@@ -10689,49 +11077,49 @@ pub fn tc_tid_set_elem_struct(tid: Int) -> Str {
 pub fn tc_tid_list_elem_ct(tid: Int) -> Int {
     if tid < 0 || tid >= ty_pool.len() { return -1 }
     let t = ty_pool.get(tid).unwrap()
-    if t.kind != TK_LIST { return -1 }
+    if t.kind != TyKind.List { return -1 }
     tid_inner_ct(t.inner1)
 }
 
 pub fn tc_tid_list_elem_struct(tid: Int) -> Str {
     if tid < 0 || tid >= ty_pool.len() { return "" }
     let t = ty_pool.get(tid).unwrap()
-    if t.kind != TK_LIST { return "" }
+    if t.kind != TyKind.List { return "" }
     tid_inner_struct(t.inner1)
 }
 
 pub fn tc_tid_map_key_ct(tid: Int) -> Int {
     if tid < 0 || tid >= ty_pool.len() { return -1 }
     let t = ty_pool.get(tid).unwrap()
-    if t.kind != TK_MAP { return -1 }
+    if t.kind != TyKind.Map { return -1 }
     tid_inner_ct(t.inner1)
 }
 
 pub fn tc_tid_map_key_struct(tid: Int) -> Str {
     if tid < 0 || tid >= ty_pool.len() { return "" }
     let t = ty_pool.get(tid).unwrap()
-    if t.kind != TK_MAP { return "" }
+    if t.kind != TyKind.Map { return "" }
     tid_inner_struct(t.inner1)
 }
 
 pub fn tc_tid_map_val_ct(tid: Int) -> Int {
     if tid < 0 || tid >= ty_pool.len() { return -1 }
     let t = ty_pool.get(tid).unwrap()
-    if t.kind != TK_MAP { return -1 }
+    if t.kind != TyKind.Map { return -1 }
     tid_inner_ct(t.inner2)
 }
 
 pub fn tc_tid_map_val_struct(tid: Int) -> Str {
     if tid < 0 || tid >= ty_pool.len() { return "" }
     let t = ty_pool.get(tid).unwrap()
-    if t.kind != TK_MAP { return "" }
+    if t.kind != TyKind.Map { return "" }
     tid_inner_struct(t.inner2)
 }
 
 // Resolving twins of the Set/Map element accessors above (m1wspm). The plain
 // accessors read ty_pool.get(inner) WITHOUT tc_resolve, so a metavar that
-// tc_pin_generic_args_from_binds bound IN PLACE (kind stays TK_UNKNOWN, solution
-// stashed in inner1) reads back as TK_UNKNOWN -> CT_VOID -> -1/"". These wrap the
+// tc_pin_generic_args_from_binds bound IN PLACE (kind stays TyKind.Unknown, solution
+// stashed in inner1) reads back as TyKind.Unknown -> CT_VOID -> -1/"". These wrap the
 // inner in tc_resolve so a bound a_k := Int surfaces its real ct/sname. Originally
 // only the key(Map)/elem(Set) twins existed — kops_table_name keys the vtable on
 // the key ct and sname alone; the Map value type doesn't affect it. The val
@@ -10746,42 +11134,42 @@ pub fn tc_tid_map_val_struct(tid: Int) -> Str {
 pub fn tc_tid_map_key_ct_resolved(tid: Int) -> Int {
     if tid < 0 || tid >= ty_pool.len() { return -1 }
     let t = ty_pool.get(tid).unwrap()
-    if t.kind != TK_MAP { return -1 }
+    if t.kind != TyKind.Map { return -1 }
     tid_inner_ct(tc_resolve(t.inner1))
 }
 
 pub fn tc_tid_map_key_struct_resolved(tid: Int) -> Str {
     if tid < 0 || tid >= ty_pool.len() { return "" }
     let t = ty_pool.get(tid).unwrap()
-    if t.kind != TK_MAP { return "" }
+    if t.kind != TyKind.Map { return "" }
     tid_inner_struct(tc_resolve(t.inner1))
 }
 
 pub fn tc_tid_map_val_ct_resolved(tid: Int) -> Int {
     if tid < 0 || tid >= ty_pool.len() { return -1 }
     let t = ty_pool.get(tid).unwrap()
-    if t.kind != TK_MAP { return -1 }
+    if t.kind != TyKind.Map { return -1 }
     tid_inner_ct(tc_resolve(t.inner2))
 }
 
 pub fn tc_tid_map_val_struct_resolved(tid: Int) -> Str {
     if tid < 0 || tid >= ty_pool.len() { return "" }
     let t = ty_pool.get(tid).unwrap()
-    if t.kind != TK_MAP { return "" }
+    if t.kind != TyKind.Map { return "" }
     tid_inner_struct(tc_resolve(t.inner2))
 }
 
 pub fn tc_tid_set_elem_ct_resolved(tid: Int) -> Int {
     if tid < 0 || tid >= ty_pool.len() { return -1 }
     let t = ty_pool.get(tid).unwrap()
-    if t.kind != TK_SET { return -1 }
+    if t.kind != TyKind.Set { return -1 }
     tid_inner_ct(tc_resolve(t.inner1))
 }
 
 pub fn tc_tid_set_elem_struct_resolved(tid: Int) -> Str {
     if tid < 0 || tid >= ty_pool.len() { return "" }
     let t = ty_pool.get(tid).unwrap()
-    if t.kind != TK_SET { return "" }
+    if t.kind != TyKind.Set { return "" }
     tid_inner_struct(tc_resolve(t.inner1))
 }
 
@@ -10791,7 +11179,7 @@ pub fn tc_tid_set_elem_struct_resolved(tid: Int) -> Str {
 // predicate also descends the Map VALUE slot (inner2) — `Map[Int, ?v]` is a
 // reachable, CORRECT state (the value type doesn't affect kops_table_name) and
 // must not be misreported as unsolved. tc_is_unbound_metavar (not a bare kind
-// check) is deliberate too: it excludes both a real TK_TYPEVAR and the shared
+// check) is deliberate too: it excludes both a real TyKind.Typevar and the shared
 // TYPE_UNKNOWN singleton, so neither is slandered as "unsolved" by this gate.
 // Returns 0 — "no evidence", not "proof of a solved slot" — for a non-Map/Set
 // tid, an out-of-range tid, or a container mismatch: absence of an unsolved
@@ -10799,7 +11187,7 @@ pub fn tc_tid_set_elem_struct_resolved(tid: Int) -> Str {
 pub fn tc_tid_kops_slot_unsolved(tid: Int, container: Str) -> Int {
     if tid < 0 || tid >= ty_pool.len() { return 0 }
     let t = ty_pool.get(tid).unwrap()
-    let want_kind = if container == "Map" { TK_MAP } else { TK_SET }
+    let want_kind = if container == "Map" { TyKind.Map } else { TyKind.Set }
     if t.kind != want_kind { return 0 }
     tc_is_unbound_metavar(tc_resolve(t.inner1))
 }
@@ -10813,7 +11201,7 @@ pub fn tc_tid_kops_slot_unsolved(tid: Int, container: Str) -> Int {
 pub fn tc_tid_map_val_tid(tid: Int) -> Int {
     if tid < 0 || tid >= ty_pool.len() { return -1 }
     let t = ty_pool.get(tid).unwrap()
-    if t.kind != TK_MAP { return -1 }
+    if t.kind != TyKind.Map { return -1 }
     t.inner2
 }
 
@@ -10822,7 +11210,7 @@ pub fn tc_tid_map_val_tid(tid: Int) -> Int {
 pub fn tc_tid_map_key_tid(tid: Int) -> Int {
     if tid < 0 || tid >= ty_pool.len() { return -1 }
     let t = ty_pool.get(tid).unwrap()
-    if t.kind != TK_MAP { return -1 }
+    if t.kind != TyKind.Map { return -1 }
     t.inner1
 }
 
@@ -10837,8 +11225,8 @@ pub fn tc_tid_map_key_tid(tid: Int) -> Int {
 //
 // THIS FUNCTION IS DELIBERATELY NON-RESOLVING, and that is load-bearing. It reads
 // ty_pool.get(tid).kind directly, so a metavar that tc_pin_generic_args_from_binds
-// bound IN PLACE (kind stays TK_UNKNOWN, solution stashed in inner1) reads back
-// TK_UNKNOWN -> CT_VOID -> -1. Callers here depend on that -1: a bound-but-typevar
+// bound IN PLACE (kind stays TyKind.Unknown, solution stashed in inner1) reads back
+// TyKind.Unknown -> CT_VOID -> -1. Callers here depend on that -1: a bound-but-typevar
 // tid must not masquerade as concrete storage. A caller that instead wants the real
 // ct of a bound `a_k := Int` composes tc_tid_resolved with this, or uses one of the
 // surviving resolving twins in the m1wspm family — tc_tid_set_elem_ct_resolved /
@@ -10847,8 +11235,8 @@ pub fn tc_tid_map_key_tid(tid: Int) -> Int {
 // re-adding one is fine, folding resolution INTO this function is not.
 //
 // TRAP, and the reason this warning lives here rather than only at the seam: do NOT
-// key a struct-slot admission gate on a CT at all. tk_to_ct maps TK_VOID, TK_TYPEVAR,
-// TK_UNKNOWN and TK_FN all onto CT_VOID, so a CT-keyed slot gate admits unsolved
+// key a struct-slot admission gate on a CT at all. tk_to_ct maps TyKind.Void, TyKind.Typevar,
+// TyKind.Unknown and TyKind.Fn all onto CT_VOID, so a CT-keyed slot gate admits unsolved
 // metavars as if they were a genuine Void — the inversion br hsgsbp had to reverse
 // once already. Slot gates key on the KIND (tc_struct_slot_encodable); the same trap
 // is restated at the seam itself, src/codegen_expr.bl:5669-5672.
@@ -10871,19 +11259,167 @@ pub fn tc_tid_resolved(tid: Int) -> Int {
     tc_resolve(tid)
 }
 
+// ── Structural accessors ────────────────────────────────────────────────────
+//
+// The four functions that subsume the 51-accessor cartesian product below
+// ({list_elem, set_elem, map_key, map_val, option_inner, result_ok, result_err,
+// struct_arg, tuple_elem} x {_ct, _struct, _tid} x {plain, _resolved}). That product
+// exists for ONE reason: codegen could not hold a tid, so each child had to be
+// pre-flattened into a (CT_* code, struct name) pair at this boundary. A pair spans
+// depth 1, which is why every nesting deeper than that needed its own bespoke channel.
+// tc_tid_child answers a *tid*, so it composes with itself and depth stops mattering.
+//
+// RAW, all four: they read the pool slot as stored. A caller that wants a bound metavar
+// followed composes tc_tid_resolved FIRST. This is deliberate and not an oversight — a
+// raw/resolved asymmetry between two readers of one tid is a documented cause of past
+// capture holes, and resolving the kind while reading children raw would report
+// TyKind.Map while answering -1 for both children. Note the resulting split with
+// type_kind above, which DOES resolve: type_kind is typecheck's semantic question ("what
+// is this type"), tc_tid_kind is the structural one ("what is in this slot").
+//
+// Equivalence with each accessor these replace is pinned in
+// tests/test_tc_tid_structural_accessors.bl. Stage 4's deletion is licensed by those
+// rows and nothing else.
+pub fn tc_tid_kind(tid: Int) -> TyKind {
+    if tid < 0 || tid >= ty_pool.len() { return TyKind.Unknown }
+    ty_pool.get(tid).unwrap().kind
+}
+
+// Arity is KIND-determined, never slot-determined. A List whose element slot holds -1
+// still has ONE child, answered as -1 — that is what lets a caller tell "this kind has
+// no child" from "this child is erased". Collapsing those two is exactly the
+// Void-vs-erasure conflation tests/test_hsgsbp_void_vs_erasure.bl guards, and deriving
+// the count from `inner1 != -1` would reintroduce it here.
+pub fn tc_tid_child_count(tid: Int) -> Int {
+    if tid < 0 || tid >= ty_pool.len() { return 0 }
+    let t = ty_pool.get(tid).unwrap()
+    match t.kind {
+        TyKind.List => 1
+        TyKind.Option => 1
+        TyKind.Set => 1
+        TyKind.Result => 2
+        TyKind.Map => 2
+        // inner1 is the return type and the params follow it, so 1 + params_count.
+        TyKind.Fn => 1 + t.params_count
+        // Variadic: arity IS params_count, so a generic base (Box) reports 0 and an
+        // instance (Box[Int]) reports 1 — a distinction callers depend on.
+        TyKind.Tuple => t.params_count
+        TyKind.Struct => t.params_count
+        TyKind.Enum => t.params_count
+        // Leaves. Named individually rather than defaulted so that adding a kind with
+        // children fails to compile here instead of silently reporting 0 — which would
+        // present as "the type has no element" at every call site at once.
+        TyKind.Int => 0
+        TyKind.Float => 0
+        TyKind.Bool => 0
+        TyKind.Str => 0
+        TyKind.Void => 0
+        TyKind.Bytes => 0
+        TyKind.Typevar => 0
+        TyKind.Unknown => 0
+        TyKind.Closure => 0
+        TyKind.Iterator => 0
+        TyKind.Handle => 0
+        TyKind.Channel => 0
+        TyKind.I8 => 0
+        TyKind.I16 => 0
+        TyKind.I32 => 0
+        TyKind.U8 => 0
+        TyKind.U16 => 0
+        TyKind.U32 => 0
+        TyKind.U64 => 0
+        TyKind.Char => 0
+    }
+}
+
+// Child `i` as a TID, uniformly across all three storage forms (inner1, inner2, and the
+// ty_param_list slice). -1 for out of range, and -1 is also the honest answer for a slot
+// whose child is genuinely absent.
+//
+// Answering -1 rather than a plausible default is the entire point. sv_tp
+// (codegen_types.bl) responds to a missing slot by INVENTING one —
+// `return type_list(type_int())` — and every "erases the element to Int" / "fabricated as
+// CT_STRING default" ticket in the backlog is that invention observed downstream. Do not
+// add a fallback here, and do not clamp `i` to the last real child: a clamp duplicates a
+// type into a slot that has none and reads as success.
+pub fn tc_tid_child(tid: Int, i: Int) -> Int {
+    if i < 0 { return -1 }
+    if i >= tc_tid_child_count(tid) { return -1 }
+    let t = ty_pool.get(tid).unwrap()
+    match t.kind {
+        TyKind.List => t.inner1
+        TyKind.Option => t.inner1
+        TyKind.Set => t.inner1
+        TyKind.Result => if i == 0 { t.inner1 } else { t.inner2 }
+        TyKind.Map => if i == 0 { t.inner1 } else { t.inner2 }
+        // Return-first, then params. Pinned by test rather than convention: nothing else
+        // in the tree mixes a scalar slot with the variadic slice, so a silent reordering
+        // would stay invisible until a signature came out backwards.
+        TyKind.Fn => if i == 0 { t.inner1 } else { ty_param_at(t, i - 1) }
+        TyKind.Tuple => ty_param_at(t, i)
+        TyKind.Struct => ty_param_at(t, i)
+        TyKind.Enum => ty_param_at(t, i)
+        // Unreachable: child_count answered 0 for every kind below, so the bound check
+        // above already returned. Enumerated anyway so this match stays total and a kind
+        // that GAINS children cannot slip through with a silent -1.
+        TyKind.Int => -1
+        TyKind.Float => -1
+        TyKind.Bool => -1
+        TyKind.Str => -1
+        TyKind.Void => -1
+        TyKind.Bytes => -1
+        TyKind.Typevar => -1
+        TyKind.Unknown => -1
+        TyKind.Closure => -1
+        TyKind.Iterator => -1
+        TyKind.Handle => -1
+        TyKind.Channel => -1
+        TyKind.I8 => -1
+        TyKind.I16 => -1
+        TyKind.I32 => -1
+        TyKind.U8 => -1
+        TyKind.U16 => -1
+        TyKind.U32 => -1
+        TyKind.U64 => -1
+        TyKind.Char => -1
+    }
+}
+
+// Bounds-checked read of the variadic slice. A params_start/params_count pair pointing
+// outside ty_param_list is a pool-invariant violation; answer -1 rather than panicking,
+// consistent with every other sentinel on this boundary.
+fn ty_param_at(t: TypePoolEntry, i: Int) -> Int {
+    if t.params_start < 0 { return -1 }
+    if i < 0 || i >= t.params_count { return -1 }
+    let idx = t.params_start + i
+    if idx >= ty_param_list.len() { return -1 }
+    ty_param_list.get(idx) ?? -1
+}
+
+// The RAW declared name: a struct/enum instance answers its generic base unadorned
+// (`Box`, not `Box_Int`) and a container answers its kind's own name. Mono spelling is a
+// separate concern and must not leak in here — tc_tid_struct_mono_name owns that.
+// Unlike tc_tid_struct below, this does not strip the module qualifier and does not
+// restrict to Struct/Enum, because a caller walking a tree needs a name for whatever it
+// lands on.
+pub fn tc_tid_name(tid: Int) -> Str {
+    if tid < 0 || tid >= ty_pool.len() { return "" }
+    ty_pool.get(tid).unwrap().name
+}
+
 pub fn tc_tid_struct(tid: Int) -> Str {
     if tid < 0 || tid >= ty_pool.len() { return "" }
     let t = ty_pool.get(tid).unwrap()
-    if t.kind == TK_STRUCT || t.kind == TK_ENUM { return strip_module_qualifier(t.name) }
+    if t.kind == TyKind.Struct || t.kind == TyKind.Enum { return strip_module_qualifier(t.name) }
     ""
 }
 
-// Whether `tid` is a TK_ENUM (bare or instance). Lets codegen distinguish a
+// Whether `tid` is a TyKind.Enum (bare or instance). Lets codegen distinguish a
 // generic-enum instance slot from a struct instance slot when both funnel through
 // the kind-agnostic tc_tid_struct/tc_tid_struct_arg_* accessors (jjhnf3).
 pub fn tc_tid_is_enum(tid: Int) -> Int {
     if tid < 0 || tid >= ty_pool.len() { return 0 }
-    if ty_pool.get(tid).unwrap().kind == TK_ENUM { return 1 }
+    if ty_pool.get(tid).unwrap().kind == TyKind.Enum { return 1 }
     0
 }
 
@@ -10898,16 +11434,16 @@ pub fn tc_tid_is_enum(tid: Int) -> Int {
 pub fn tc_tid_struct_arg_count(tid: Int) -> Int {
     if tid < 0 || tid >= ty_pool.len() { return 0 }
     let t = ty_pool.get(tid).unwrap()
-    // TK_ENUM admitted so a generic-enum INSTANCE (`Tree[Int]`) surfaces its arg
+    // TyKind.Enum admitted so a generic-enum INSTANCE (`Tree[Int]`) surfaces its arg
     // count to the codegen mono-name path, mirroring struct instances (jjhnf3).
-    if t.kind != TK_STRUCT && t.kind != TK_ENUM { return 0 }
+    if t.kind != TyKind.Struct && t.kind != TyKind.Enum { return 0 }
     t.params_count
 }
 
 pub fn tc_tid_struct_arg_ct(tid: Int, idx: Int) -> Int {
     if tid < 0 || tid >= ty_pool.len() { return -1 }
     let t = ty_pool.get(tid).unwrap()
-    if t.kind != TK_STRUCT { return -1 }
+    if t.kind != TyKind.Struct { return -1 }
     if idx < 0 || idx >= t.params_count { return -1 }
     tid_inner_ct(ty_param_list.get(t.params_start + idx).unwrap())
 }
@@ -10915,7 +11451,7 @@ pub fn tc_tid_struct_arg_ct(tid: Int, idx: Int) -> Int {
 pub fn tc_tid_struct_arg_struct(tid: Int, idx: Int) -> Str {
     if tid < 0 || tid >= ty_pool.len() { return "" }
     let t = ty_pool.get(tid).unwrap()
-    if t.kind != TK_STRUCT { return "" }
+    if t.kind != TyKind.Struct { return "" }
     if idx < 0 || idx >= t.params_count { return "" }
     tid_inner_struct(ty_param_list.get(t.params_start + idx).unwrap())
 }
@@ -10929,9 +11465,9 @@ pub fn tc_tid_struct_arg_struct(tid: Int, idx: Int) -> Str {
 pub fn tc_tid_struct_arg_tid(tid: Int, idx: Int) -> Int {
     if tid < 0 || tid >= ty_pool.len() { return -1 }
     let t = ty_pool.get(tid).unwrap()
-    // TK_ENUM admitted so a generic-enum INSTANCE (`Tree[Int]`) surfaces its per-slot
+    // TyKind.Enum admitted so a generic-enum INSTANCE (`Tree[Int]`) surfaces its per-slot
     // arg tids to the codegen mono-name / instance-registration path (jjhnf3).
-    if t.kind != TK_STRUCT && t.kind != TK_ENUM { return -1 }
+    if t.kind != TyKind.Struct && t.kind != TyKind.Enum { return -1 }
     if idx < 0 || idx >= t.params_count { return -1 }
     ty_param_list.get(t.params_start + idx).unwrap()
 }
@@ -10960,15 +11496,15 @@ pub fn tc_tid_struct_arg_tid(tid: Int, idx: Int) -> Int {
 pub fn tc_tid_struct_mono_name(tid: Int) -> Str {
     if tid < 0 || tid >= ty_pool.len() { return "" }
     let t = ty_pool.get(tid).unwrap()
-    // TK_ENUM admitted (jjhnf3): a generic-enum INSTANCE (`Tree[Int]`) spells the same
+    // TyKind.Enum admitted (jjhnf3): a generic-enum INSTANCE (`Tree[Int]`) spells the same
     // mono stem as a struct instance — c_type_tag_for_struct(base) + `_`-joined slot
     // segs — since both the head tag and tc_tid_struct_slot_seg are kind-agnostic. This
-    // is what lets tc_tid_to_c_tag's shared TK_STRUCT|TK_ENUM branch produce `Tree_Int`.
+    // is what lets tc_tid_to_c_tag's shared TyKind.Struct|TyKind.Enum branch produce `Tree_Int`.
     // The 3 sibling gates (tc_tid_encodable / tc_tid_tuple_elem_faithful /
     // tc_struct_slot_encodable) now ADMIT an enum instance too (br 82ajft / dbzy4r
-    // flipped their `k == TK_ENUM && params_count != 0` arms), so widening this fn
+    // flipped their `k == TyKind.Enum && params_count != 0` arms), so widening this fn
     // and widening them landed together — neither is stale relative to the other.
-    if (t.kind != TK_STRUCT && t.kind != TK_ENUM) || t.params_count == 0 { return "" }
+    if (t.kind != TyKind.Struct && t.kind != TyKind.Enum) || t.params_count == 0 { return "" }
     // br cr4gqk: escape_mono_seg on the base and every slot segment, and join with "_0"
     // rather than a bare "_", so this stem is byte-identical to what mangle_generic_name
     // (codegen_types.bl) produces for the same (base, args) — this fn is a NINTH,
@@ -10986,7 +11522,7 @@ pub fn tc_tid_struct_mono_name(tid: Int) -> Str {
         let seg = tc_tid_struct_slot_seg(slot)
         if seg == "" { return "" }
         // Collapse, never interpolate (br vbcw1e): tc_tid_struct_slot_seg can answer a bare
-        // ICE_SEG_* sentinel (e.g. a TK_FN/TK_CLOSURE slot via tc_tid_to_c_tag's unhandled-kind
+        // ICE_SEG_* sentinel (e.g. a TyKind.Fn/TyKind.Closure slot via tc_tid_to_c_tag's unhandled-kind
         // arm). Concatenating it here would bury it mid-identifier (Box_int_BLINK_I0001_...),
         // past where diag_is_ice_seg's prefix test at the downstream chokepoints can see it —
         // the same hazard this ticket closes for Option/Result/Map/Tuple, one struct level down.
@@ -11026,7 +11562,7 @@ pub fn tc_tid_struct_slot_seg(slot: Int) -> Str {
 //
 // A TUPLE slot is ADMITTED (br fqthkv), gated on tc_tid_tuple_elem_faithful — the SAME
 // predicate the sibling gate tc_struct_slot_encodable already uses for its own
-// TK_TUPLE arm, whose comment records that tc_tid_to_c_tag's tuple spelling
+// TyKind.Tuple arm, whose comment records that tc_tid_to_c_tag's tuple spelling
 // (tc_tid_tuple_tag -> Tuple2_int_int) byte-matches the struct-lit string path's
 // registered tuple carrier segment. Before this arm a tuple type arg left
 // has_compound at 0 in the tid tier's then-triad admission (now the single
@@ -11039,10 +11575,10 @@ pub fn tc_tid_struct_slot_seg(slot: Int) -> Str {
 // (mono_instance_arg_tids_from_tid -> tc_struct_slot_encodable). An asymmetric
 // literal-side gate would recreate the same bail for shapes the compiler can spell
 // on both other sides — and tc_tid_tag_at's TAGPOS_INNER arm already erases
-// TK_LIST/TK_SET/TK_BYTES identically for all three, so `(Int, List[Str])` byte-matches
+// TyKind.List/TyKind.Set/TyKind.Bytes identically for all three, so `(Int, List[Str])` byte-matches
 // everywhere.
 //
-// A STRUCT-OR-ENUM-INSTANCE slot is ADMITTED (br 6cvvh8; TK_ENUM joined under br
+// A STRUCT-OR-ENUM-INSTANCE slot is ADMITTED (br 6cvvh8; TyKind.Enum joined under br
 // tydqe6) iff tc_tid_struct_mono_name spells it — the very predicate the def-side
 // slot speller (tc_tid_struct_slot_seg) and the mono registrar already consult
 // first, so admitting on it cannot split the name from the typedef. Before br
@@ -11050,7 +11586,7 @@ pub fn tc_tid_struct_slot_seg(slot: Int) -> Str {
 // string tier bails on every compound annotation arg, so the literal reached
 // codegen with 'Void'. The BARE generic base (params_count 0) is unaffected — its
 // mono name is "" — and so is every already-working shape, because the string tier
-// is consulted before this one at the mono_args selector. TK_ENUM was excluded
+// is consulted before this one at the mono_args selector. TyKind.Enum was excluded
 // until tydqe6 on the premise that the encodable gates still deferred it (br
 // dbzy4r) — but tc_tid_encodable (:10980-10986) and tc_struct_slot_encodable
 // (:11396-11402) already admit an enum instance via this same predicate (br 82ajft
@@ -11058,7 +11594,7 @@ pub fn tc_tid_struct_slot_seg(slot: Int) -> Str {
 //
 // NOTE: this predicate currently has no callers anywhere in the repo (confirmed by
 // grep, br tydqe6) — it is exported and imported into codegen_expr.bl's namespace
-// but never invoked there. Widening its TK_ENUM arm above is therefore a no-op today;
+// but never invoked there. Widening its TyKind.Enum arm above is therefore a no-op today;
 // R2 of tests/test_tydqe6_generic_enum_instance_mono.bl passes via the
 // emit_mono_struct_typedef admission (src/codegen_stmt.bl), not via this function.
 // Keep the widening (it documents the intended admission for whenever a caller is
@@ -11067,11 +11603,11 @@ pub fn tc_tid_compound_slot_faithful(tid: Int) -> Bool {
     if tid < 0 || tid >= ty_pool.len() { return false }
     let t = ty_pool.get(tid).unwrap()
     let k = t.kind
-    if k == TK_OPTION { return tc_tid_scalar_only(t.inner1) }
-    if k == TK_RESULT { return tc_tid_scalar_only(t.inner1) && tc_tid_scalar_only(t.inner2) }
-    if k == TK_MAP { return tc_tid_scalar_only(t.inner1) && tc_tid_scalar_only(t.inner2) }
-    if k == TK_TUPLE { return tc_tid_tuple_elem_faithful(tid) }
-    if k == TK_STRUCT || k == TK_ENUM { return tc_tid_struct_mono_name(tid) != "" }
+    if k == TyKind.Option { return tc_tid_scalar_only(t.inner1) }
+    if k == TyKind.Result { return tc_tid_scalar_only(t.inner1) && tc_tid_scalar_only(t.inner2) }
+    if k == TyKind.Map { return tc_tid_scalar_only(t.inner1) && tc_tid_scalar_only(t.inner2) }
+    if k == TyKind.Tuple { return tc_tid_tuple_elem_faithful(tid) }
+    if k == TyKind.Struct || k == TyKind.Enum { return tc_tid_struct_mono_name(tid) != "" }
     false
 }
 
@@ -11113,16 +11649,16 @@ pub fn tc_tid_inner_tag_faithful(tid: Int) -> Bool {
     if tc_tid_scalar_only(tid) { return true }
     let t = ty_pool.get(tid).unwrap()
     let k = t.kind
-    if k == TK_LIST || k == TK_SET || k == TK_BYTES { return true }
+    if k == TyKind.List || k == TyKind.Set || k == TyKind.Bytes { return true }
     // br yavhwc: the value path now recurses (emit_tuple_lit reads the element tid and
     // spells the inner via the SAME tc_tid_inner_tag the tid path uses), so a Map inner
     // or a nested Option/Result inner is faithful WHENEVER its own leaves are faithful.
     // Recurse structurally — a Map key/val or an Option/Result sub-inner must each be
     // faithful, so the recursion bottoms out at scalar/List/Set/Bytes leaves and rejects
     // any struct/enum/tuple/typevar leaf (still spelled divergently, still deferred).
-    if k == TK_MAP { return tc_tid_inner_tag_faithful(t.inner1) && tc_tid_inner_tag_faithful(t.inner2) }
-    if k == TK_OPTION { return tc_tid_inner_tag_faithful(t.inner1) }
-    if k == TK_RESULT {
+    if k == TyKind.Map { return tc_tid_inner_tag_faithful(t.inner1) && tc_tid_inner_tag_faithful(t.inner2) }
+    if k == TyKind.Option { return tc_tid_inner_tag_faithful(t.inner1) }
+    if k == TyKind.Result {
         // br e3js70: a Result carrier with a DIRECT Map ok/err side is now faithful. The
         // Result-Map value carrier used to be spelled BARE ("map") by upgrade_compound_carrier
         // for uniform-blink_map* assignment compat, diverging from the tid path's structured
@@ -11152,13 +11688,13 @@ pub fn tc_tid_inner_tag_faithful(tid: Int) -> Bool {
     // thread the mono stem + register the instance (register_carrier_inner_mono_instance), so
     // both paths converge on the single blink_Option_QBox_Int (blink_QBox_Int* value).
     //
-    // A generic-enum INSTANCE (TK_ENUM, params_count != 0) is now admitted alongside
-    // TK_STRUCT (br tydqe6): the encodable gates (tc_tid_encodable, tc_struct_slot_
+    // A generic-enum INSTANCE (TyKind.Enum, params_count != 0) is now admitted alongside
+    // TyKind.Struct (br tydqe6): the encodable gates (tc_tid_encodable, tc_struct_slot_
     // encodable) already spell it via tc_tid_struct_mono_name (Tree_Int), so it rides
     // the tid path exactly like a struct instance — the "still defers" carve-out that
     // used to live here was stale once those gates widened under br 82ajft item 1.
     if t.params_count != 0 {
-        if k == TK_STRUCT || k == TK_ENUM { return true }
+        if k == TyKind.Struct || k == TyKind.Enum { return true }
         // Counterfactual measurement (br vbcw1e): every DECLINE here is a slot that stays
         // on the string CSV path today. If a future caller routed it onto the tid path
         // instead (qerbc7's "consumers stop routing on the gate" flip), this records
@@ -11168,7 +11704,7 @@ pub fn tc_tid_inner_tag_faithful(tid: Int) -> Bool {
         voidtwin_probe("faithful_reject_paramcount", tid)
         return false
     }
-    if k == TK_STRUCT || k == TK_ENUM { return true }
+    if k == TyKind.Struct || k == TyKind.Enum { return true }
     voidtwin_probe("faithful_reject", tid)
     false
 }
@@ -11180,13 +11716,13 @@ pub fn tc_tid_inner_tag_faithful(tid: Int) -> Bool {
 fn tc_tid_scalar_only(tid: Int) -> Bool {
     if tid < 0 || tid >= ty_pool.len() { return false }
     let k = ty_pool.get(tid).unwrap().kind
-    if k == TK_INT || k == TK_FLOAT || k == TK_BOOL || k == TK_STR || k == TK_CHAR { return true }
-    if k == TK_I8 || k == TK_I16 || k == TK_I32 { return true }
-    if k == TK_U8 || k == TK_U16 || k == TK_U32 || k == TK_U64 { return true }
+    if k == TyKind.Int || k == TyKind.Float || k == TyKind.Bool || k == TyKind.Str || k == TyKind.Char { return true }
+    if k == TyKind.I8 || k == TyKind.I16 || k == TyKind.I32 { return true }
+    if k == TyKind.U8 || k == TyKind.U16 || k == TyKind.U32 || k == TyKind.U64 { return true }
     false
 }
 
-// mmegcb: the mangled tuple carrier name (Tuple2_int_str) for a TK_TUPLE tid,
+// mmegcb: the mangled tuple carrier name (Tuple2_int_str) for a TyKind.Tuple tid,
 // else "" (same sentinel contract as tc_tid_struct). A Set[(Int,Str)] element
 // (or Map tuple key) reached through a tuple/struct-field boundary erases to
 // CT_STRING (recover_elem_ct_from_arg's erased default); codegen recovers the
@@ -11200,7 +11736,7 @@ fn tc_tid_scalar_only(tid: Int) -> Bool {
 pub fn tc_tid_tuple_sname(tid: Int) -> Str {
     if tid < 0 || tid >= ty_pool.len() { return "" }
     let t = ty_pool.get(tid).unwrap()
-    if t.kind != TK_TUPLE { return "" }
+    if t.kind != TyKind.Tuple { return "" }
     tc_tid_tuple_tag(t)
 }
 
@@ -11212,14 +11748,14 @@ pub fn tc_tid_tuple_sname(tid: Int) -> Str {
 pub fn tc_tid_tuple_arity(tid: Int) -> Int {
     if tid < 0 || tid >= ty_pool.len() { return 0 }
     let t = ty_pool.get(tid).unwrap()
-    if t.kind != TK_TUPLE { return 0 }
+    if t.kind != TyKind.Tuple { return 0 }
     t.params_count
 }
 
 pub fn tc_tid_tuple_elem_tid(tid: Int, idx: Int) -> Int {
     if tid < 0 || tid >= ty_pool.len() { return -1 }
     let t = ty_pool.get(tid).unwrap()
-    if t.kind != TK_TUPLE { return -1 }
+    if t.kind != TyKind.Tuple { return -1 }
     if idx < 0 || idx >= t.params_count { return -1 }
     ty_param_list.get(t.params_start + idx).unwrap()
 }
@@ -11232,7 +11768,7 @@ pub fn tc_tid_tuple_elem_tid(tid: Int, idx: Int) -> Int {
 pub fn tc_tid_option_inner_ct(tid: Int) -> Int {
     if tid < 0 || tid >= ty_pool.len() { return -1 }
     let t = ty_pool.get(tid).unwrap()
-    if t.kind != TK_OPTION { return -1 }
+    if t.kind != TyKind.Option { return -1 }
     tid_inner_ct(t.inner1)
 }
 
@@ -11242,42 +11778,42 @@ pub fn tc_tid_option_inner_ct(tid: Int) -> Int {
 pub fn tc_tid_list_elem(tid: Int) -> Int {
     if tid < 0 || tid >= ty_pool.len() { return -1 }
     let t = ty_pool.get(tid).unwrap()
-    if t.kind != TK_LIST { return -1 }
+    if t.kind != TyKind.List { return -1 }
     t.inner1
 }
 
 pub fn tc_tid_option_inner_struct(tid: Int) -> Str {
     if tid < 0 || tid >= ty_pool.len() { return "" }
     let t = ty_pool.get(tid).unwrap()
-    if t.kind != TK_OPTION { return "" }
+    if t.kind != TyKind.Option { return "" }
     tid_inner_struct(t.inner1)
 }
 
 pub fn tc_tid_result_ok_ct(tid: Int) -> Int {
     if tid < 0 || tid >= ty_pool.len() { return -1 }
     let t = ty_pool.get(tid).unwrap()
-    if t.kind != TK_RESULT { return -1 }
+    if t.kind != TyKind.Result { return -1 }
     tid_inner_ct(t.inner1)
 }
 
 pub fn tc_tid_result_ok_struct(tid: Int) -> Str {
     if tid < 0 || tid >= ty_pool.len() { return "" }
     let t = ty_pool.get(tid).unwrap()
-    if t.kind != TK_RESULT { return "" }
+    if t.kind != TyKind.Result { return "" }
     tid_inner_struct(t.inner1)
 }
 
 pub fn tc_tid_result_err_ct(tid: Int) -> Int {
     if tid < 0 || tid >= ty_pool.len() { return -1 }
     let t = ty_pool.get(tid).unwrap()
-    if t.kind != TK_RESULT { return -1 }
+    if t.kind != TyKind.Result { return -1 }
     tid_inner_ct(t.inner2)
 }
 
 pub fn tc_tid_result_err_struct(tid: Int) -> Str {
     if tid < 0 || tid >= ty_pool.len() { return "" }
     let t = ty_pool.get(tid).unwrap()
-    if t.kind != TK_RESULT { return "" }
+    if t.kind != TyKind.Result { return "" }
     tid_inner_struct(t.inner2)
 }
 
@@ -11292,21 +11828,21 @@ pub fn tc_tid_result_err_struct(tid: Int) -> Str {
 pub fn tc_tid_option_inner_tid(tid: Int) -> Int {
     if tid < 0 || tid >= ty_pool.len() { return -1 }
     let t = ty_pool.get(tid).unwrap()
-    if t.kind != TK_OPTION { return -1 }
+    if t.kind != TyKind.Option { return -1 }
     t.inner1
 }
 
 pub fn tc_tid_result_ok_tid(tid: Int) -> Int {
     if tid < 0 || tid >= ty_pool.len() { return -1 }
     let t = ty_pool.get(tid).unwrap()
-    if t.kind != TK_RESULT { return -1 }
+    if t.kind != TyKind.Result { return -1 }
     t.inner1
 }
 
 pub fn tc_tid_result_err_tid(tid: Int) -> Int {
     if tid < 0 || tid >= ty_pool.len() { return -1 }
     let t = ty_pool.get(tid).unwrap()
-    if t.kind != TK_RESULT { return -1 }
+    if t.kind != TyKind.Result { return -1 }
     t.inner2
 }
 
@@ -11340,37 +11876,37 @@ pub fn tc_tid_to_c_tag(tid: Int) -> Str {
 // still defer to the string path.
 fn tc_tid_encodable(tid0: Int) -> Bool {
     // Resolve bound metavars (gqg3rk): a pinned α is encodable iff its solution
-    // is; an unbound α resolves to itself (kind TK_UNKNOWN) → false (defer to the
+    // is; an unbound α resolves to itself (kind TyKind.Unknown) → false (defer to the
     // string path / boundary check reports E0301).
     let tid = tc_resolve(tid0)
     if tid < 0 || tid >= ty_pool.len() { return false }
     let t = ty_pool.get(tid).unwrap()
     let k = t.kind
-    // Counterfactual measurement (br vbcw1e): TK_UNKNOWN declining here is exactly the
+    // Counterfactual measurement (br vbcw1e): TyKind.Unknown declining here is exactly the
     // routing this gate provides today in INNER position — the reason tc_tid_tag_at's
-    // TAGPOS_INNER TK_UNKNOWN fall-through is unreachable from any gated caller. Taps
+    // TAGPOS_INNER TyKind.Unknown fall-through is unreachable from any gated caller. Taps
     // the would-be-erasure without changing the `false` returned below.
-    if k == TK_UNKNOWN {
+    if k == TyKind.Unknown {
         voidtwin_probe("encodable", tid)
     }
-    if k == TK_TYPEVAR || k == TK_UNKNOWN { return false }
-    if k == TK_TUPLE { return tc_tid_tuple_elem_faithful(tid) }
-    if k == TK_OPTION { return tc_tid_encodable(t.inner1) }
-    if k == TK_RESULT { return tc_tid_encodable(t.inner1) && tc_tid_encodable(t.inner2) }
+    if k == TyKind.Typevar || k == TyKind.Unknown { return false }
+    if k == TyKind.Tuple { return tc_tid_tuple_elem_faithful(tid) }
+    if k == TyKind.Option { return tc_tid_encodable(t.inner1) }
+    if k == TyKind.Result { return tc_tid_encodable(t.inner1) && tc_tid_encodable(t.inner2) }
     // A struct/enum INSTANCE (params_count>=1) is admitted only when
     // tc_tid_struct_mono_name can actually spell its full recursive stem — the exact
     // guard tc_struct_slot_encodable uses (br wzm47q depth-3: a still-generic nested
     // instance like Box[T], one level inside an outer Box[Box[T]] LITERAL, used to fall
     // through to the unconditional `true` below on the strength of the comment two
     // paragraphs down, which is true only when tc_tid_struct_mono_name's recursion
-    // SUCCEEDS. When it declines (mono_name == ""), tc_tid_to_c_tag's TK_STRUCT|TK_ENUM
+    // SUCCEEDS. When it declines (mono_name == ""), tc_tid_to_c_tag's TyKind.Struct|TyKind.Enum
     // arm falls back to the BARE head name instead of declining, so this predicate was
     // admitting a slot that spells as a plain, wrong "Box" — which tc_tid_struct_slot_seg
     // (this function's own caller, one struct level up) then folds into ITS OWN parent's
     // mono name as a plausible-but-unsubstituted segment, short-circuiting
     // tid_native_struct_mono's substitution retry before it gets a chance to run).
     // A BARE struct/enum (params_count 0) still admits unconditionally (br q4etvt).
-    if k == TK_STRUCT || k == TK_ENUM {
+    if k == TyKind.Struct || k == TyKind.Enum {
         if t.params_count == 0 { return true }
         let name = tc_tid_struct_mono_name(tid)
         return name != "" && !diag_is_ice_seg(name)
@@ -11378,9 +11914,9 @@ fn tc_tid_encodable(tid0: Int) -> Bool {
     // A MAP slot (br 91j9fw, the List twin of br jw1pmb one carrier over):
     // tc_tid_to_c_tag erases Map to the bare carrier tag "Map" with no inner
     // spelling, exactly like Set/List, and tc_tid_seg_injective already groups
-    // TK_MAP alongside TK_SET/TK_LIST as non-injective — so an inner gate here
+    // TyKind.Map alongside TyKind.Set/TyKind.List as non-injective — so an inner gate here
     // is a refusal with no referent, the identical parity argument jw1pmb made
-    // for List. Falls through to TK_SET/TK_LIST at the tail `true` below.
+    // for List. Falls through to TyKind.Set/TyKind.List at the tail `true` below.
     // A struct/enum INSTANCE (type-args present, params_count>=1, e.g. Box[Int]) is
     // ADMITTED (br bwyfy1 B1) above once tc_tid_struct_mono_name can spell it: the
     // mono-CSV consumer (tc_seg_from_tid →
@@ -11398,22 +11934,22 @@ fn tc_tid_encodable(tid0: Int) -> Bool {
     // mono-CSV segment byte-matches the string path, so the module-qualifier no longer
     // forces a defer.
     //
-    // An ENUM INSTANCE (TK_ENUM, params_count>=1) is now ADMITTED (br 82ajft / dbzy4r):
-    // tc_tid_struct_mono_name was widened for TK_ENUM in jjhnf3 (c_type_tag_for_struct
+    // An ENUM INSTANCE (TyKind.Enum, params_count>=1) is now ADMITTED (br 82ajft / dbzy4r):
+    // tc_tid_struct_mono_name was widened for TyKind.Enum in jjhnf3 (c_type_tag_for_struct
     // base + kind-agnostic slot segs → Tree_Int), so tc_tid_to_c_tag's shared
-    // TK_STRUCT|TK_ENUM branch spells the full mono stem, byte-matching the string
+    // TyKind.Struct|TyKind.Enum branch spells the full mono stem, byte-matching the string
     // path's registered mono name — exactly the struct-instance beachhead above. A
     // slot that is itself inexpressible still bottoms out at tc_tid_struct_slot_seg ""
     // (deferred there), so nothing that was on the string path starts diverging.
     //
     // COUNTERFACTUAL MEASUREMENT, br hsgsbp. This tap ships permanently: every row is a
-    // site where adding TK_VOID to the rejection set above — what br hsgsbp originally
+    // site where adding TyKind.Void to the rejection set above — what br hsgsbp originally
     // asked for — would have flipped this answer to false and routed a genuine Void slot
     // onto the -1/string path. Void is an ordinary INHABITED, encodable type
     // (decisions/under-determined-types.md:38-42, 6-0), so the rejection is forbidden;
     // the number here is what makes that a measurement instead of an argument. Re-measure
     // before reopening the question.
-    if k == TK_VOID {
+    if k == TyKind.Void {
         dbg_trace("ctagvoid", "probe=encodable_void tid={tid} name={t.name}")
     }
     true
@@ -11454,32 +11990,32 @@ pub fn tc_tid_seg_injective(tid0: Int) -> Bool {
     let t = ty_pool.get(tid).unwrap()
     let k = t.kind
     // The six kinds tc_tid_to_c_tag spells as a BARE carrier tag, dropping every type
-    // argument: "List", "Set", "Map", "Iterator", "Handle", "Channel". Note TK_MAP is
+    // argument: "List", "Set", "Map", "Iterator", "Handle", "Channel". Note TyKind.Map is
     // non-injective HERE but injective as an INNER (tc_tid_inner_tag spells Map_k_v) —
     // that is why this predicate is position-aware rather than one kind set.
-    if k == TK_LIST || k == TK_SET || k == TK_MAP { return false }
-    if k == TK_ITERATOR || k == TK_HANDLE || k == TK_CHANNEL { return false }
-    // TK_BYTES has no type arguments at all, so its bare "Bytes" is fully faithful — it is
+    if k == TyKind.List || k == TyKind.Set || k == TyKind.Map { return false }
+    if k == TyKind.Iterator || k == TyKind.Handle || k == TyKind.Channel { return false }
+    // TyKind.Bytes has no type arguments at all, so its bare "Bytes" is fully faithful — it is
     // NOT part of the erasing set even though it shares their bare spelling.
-    if k == TK_BYTES { return true }
-    if k == TK_OPTION { return tc_tid_inner_seg_injective(t.inner1) }
-    if k == TK_RESULT { return tc_tid_inner_seg_injective(t.inner1) && tc_tid_inner_seg_injective(t.inner2) }
-    if k == TK_TUPLE { return tc_tid_tuple_seg_injective(t) }
-    if k == TK_STRUCT || k == TK_ENUM { return tc_tid_struct_seg_injective(t) }
+    if k == TyKind.Bytes { return true }
+    if k == TyKind.Option { return tc_tid_inner_seg_injective(t.inner1) }
+    if k == TyKind.Result { return tc_tid_inner_seg_injective(t.inner1) && tc_tid_inner_seg_injective(t.inner2) }
+    if k == TyKind.Tuple { return tc_tid_tuple_seg_injective(t) }
+    if k == TyKind.Struct || k == TyKind.Enum { return tc_tid_struct_seg_injective(t) }
     // No name to be faithful TO: a typevar spells "<tv>" and an unbound metavar spells the
     // I0001 sentinel. Neither identifies a type, so neither may be read as identity. This
     // overlaps mono_args_has_void_seg's population by design — that detector reports it
     // (as a compiler bug), this one merely refuses to trust it.
-    if k == TK_TYPEVAR || k == TK_UNKNOWN { return false }
+    if k == TyKind.Typevar || k == TyKind.Unknown { return false }
     // Void is refused for a different reason: "Void" is also tc_tid_to_c_tag's fallthrough
     // for every kind it has no arm for, so the segment does not distinguish the real Void
     // from an unspellable type. Never identity.
-    if k == TK_VOID { return false }
+    if k == TyKind.Void { return false }
     // Scalars (Int/Float/Bool/Str/Char/sized ints) each spell a unique fixed tag.
-    if k == TK_INT || k == TK_FLOAT || k == TK_BOOL || k == TK_STR || k == TK_CHAR { return true }
-    if k == TK_I8 || k == TK_I16 || k == TK_I32 { return true }
-    if k == TK_U8 || k == TK_U16 || k == TK_U32 || k == TK_U64 { return true }
-    // Anything else (TK_FN, any future kind) has no tc_tid_to_c_tag arm and falls through
+    if k == TyKind.Int || k == TyKind.Float || k == TyKind.Bool || k == TyKind.Str || k == TyKind.Char { return true }
+    if k == TyKind.I8 || k == TyKind.I16 || k == TyKind.I32 { return true }
+    if k == TyKind.U8 || k == TyKind.U16 || k == TyKind.U32 || k == TyKind.U64 { return true }
+    // Anything else (TyKind.Fn, any future kind) has no tc_tid_to_c_tag arm and falls through
     // to "Void" there. Fail closed: an unhandled kind is not identity.
     false
 }
@@ -11543,18 +12079,18 @@ fn tc_tid_inner_seg_injective(tid0: Int) -> Bool {
     if tid < 0 || tid >= ty_pool.len() { return false }
     let t = ty_pool.get(tid).unwrap()
     let k = t.kind
-    if k == TK_STRUCT || k == TK_ENUM { return tc_tid_struct_seg_injective(t) }
-    if k == TK_OPTION { return tc_tid_inner_seg_injective(t.inner1) }
-    if k == TK_RESULT { return tc_tid_inner_seg_injective(t.inner1) && tc_tid_inner_seg_injective(t.inner2) }
-    if k == TK_MAP { return tc_tid_inner_seg_injective(t.inner1) && tc_tid_inner_seg_injective(t.inner2) }
-    if k == TK_TUPLE { return tc_tid_tuple_seg_injective(t) }
-    if k == TK_LIST || k == TK_SET { return false }
-    if k == TK_ITERATOR || k == TK_HANDLE || k == TK_CHANNEL { return false }
-    if k == TK_BYTES { return true }
-    if k == TK_TYPEVAR || k == TK_UNKNOWN || k == TK_VOID { return false }
-    if k == TK_INT || k == TK_FLOAT || k == TK_BOOL || k == TK_STR || k == TK_CHAR { return true }
-    if k == TK_I8 || k == TK_I16 || k == TK_I32 { return true }
-    if k == TK_U8 || k == TK_U16 || k == TK_U32 || k == TK_U64 { return true }
+    if k == TyKind.Struct || k == TyKind.Enum { return tc_tid_struct_seg_injective(t) }
+    if k == TyKind.Option { return tc_tid_inner_seg_injective(t.inner1) }
+    if k == TyKind.Result { return tc_tid_inner_seg_injective(t.inner1) && tc_tid_inner_seg_injective(t.inner2) }
+    if k == TyKind.Map { return tc_tid_inner_seg_injective(t.inner1) && tc_tid_inner_seg_injective(t.inner2) }
+    if k == TyKind.Tuple { return tc_tid_tuple_seg_injective(t) }
+    if k == TyKind.List || k == TyKind.Set { return false }
+    if k == TyKind.Iterator || k == TyKind.Handle || k == TyKind.Channel { return false }
+    if k == TyKind.Bytes { return true }
+    if k == TyKind.Typevar || k == TyKind.Unknown || k == TyKind.Void { return false }
+    if k == TyKind.Int || k == TyKind.Float || k == TyKind.Bool || k == TyKind.Str || k == TyKind.Char { return true }
+    if k == TyKind.I8 || k == TyKind.I16 || k == TyKind.I32 { return true }
+    if k == TyKind.U8 || k == TyKind.U16 || k == TyKind.U32 || k == TyKind.U64 { return true }
     false
 }
 
@@ -11607,7 +12143,7 @@ pub fn tc_tid_tuple_elem_faithful(tid: Int) -> Bool {
     if tid < 0 || tid >= ty_pool.len() { return false }
     let t = ty_pool.get(tid).unwrap()
     let k = t.kind
-    if k == TK_TUPLE {
+    if k == TyKind.Tuple {
         let start = t.params_start
         let count = t.params_count
         let mut i = 0
@@ -11617,10 +12153,10 @@ pub fn tc_tid_tuple_elem_faithful(tid: Int) -> Bool {
         }
         return true
     }
-    if k == TK_LIST || k == TK_SET || k == TK_BYTES { return true }
-    if k == TK_INT || k == TK_FLOAT || k == TK_BOOL || k == TK_STR || k == TK_CHAR { return true }
-    if k == TK_I8 || k == TK_I16 || k == TK_I32 { return true }
-    if k == TK_U8 || k == TK_U16 || k == TK_U32 || k == TK_U64 { return true }
+    if k == TyKind.List || k == TyKind.Set || k == TyKind.Bytes { return true }
+    if k == TyKind.Int || k == TyKind.Float || k == TyKind.Bool || k == TyKind.Str || k == TyKind.Char { return true }
+    if k == TyKind.I8 || k == TyKind.I16 || k == TyKind.I32 { return true }
+    if k == TyKind.U8 || k == TyKind.U16 || k == TyKind.U32 || k == TyKind.U64 { return true }
     // Option/Result tuple element (br anaqc3 admitted SCALAR inners; br 9myrp2 widened
     // to List/Set/Bytes inners; br yavhwc widened to Map + nested Option/Result inners):
     // tc_tid_inner_tag spells Option_<inner> / Result_<i1>_<i2>, byte-identical to the
@@ -11636,14 +12172,14 @@ pub fn tc_tid_tuple_elem_faithful(tid: Int) -> Bool {
     // (Result_Map_str_int_int) by the construction/param/reassignment speller — identical
     // C layout to the bare "map" it replaced (uniform blink_map* member), so assignment
     // stays legal AND it matches the tid path — so both the top-level Result arm here and
-    // the nested case (via the predicate's TK_RESULT branch) ride.
+    // the nested case (via the predicate's TyKind.Result branch) ride.
     // Still DEFERS: a struct/enum leaf anywhere in the inner (tc_tid_inner_tag routes
     // through c_type_tag_for_struct / tc_tid_struct_mono_name vs the annotation path's
     // mono_name_from_ann — not proven byte-equal at THIS seam specifically; 295z9x
     // reconciled the sibling value-path bugs it was filed for, but didn't reconcile
     // this one, which stays open as its own follow-up), as does a tuple inner.
-    if k == TK_OPTION { return tc_tid_inner_tag_faithful(t.inner1) }
-    if k == TK_RESULT {
+    if k == TyKind.Option { return tc_tid_inner_tag_faithful(t.inner1) }
+    if k == TyKind.Result {
         return tc_tid_inner_tag_faithful(t.inner1) && tc_tid_inner_tag_faithful(t.inner2)
     }
     // Top-level Map tuple element with SCALAR key AND value (br 6kqgnp): tc_tid_inner_tag
@@ -11652,7 +12188,7 @@ pub fn tc_tid_tuple_elem_faithful(tid: Int) -> Bool {
     // Scalar inners only — a struct/compound inner would spell via tc_tid_struct_mono_name
     // here vs canonical_struct_tag on the value/annotation side and could diverge (mirrors
     // tc_tid_compound_slot_faithful's Map arm and the Option/Result scalar/compound gate above).
-    if k == TK_MAP { return tc_tid_scalar_only(t.inner1) && tc_tid_scalar_only(t.inner2) }
+    if k == TyKind.Map { return tc_tid_scalar_only(t.inner1) && tc_tid_scalar_only(t.inner2) }
     // A BARE (monomorphic) struct/enum tuple element: tc_tid_inner_tag spells it via
     // c_type_tag_for_struct (physical prefix), byte-identical to resolve_tuple_ann's
     // struct-element tag for BOTH same-module and cross-module names (br bwyfy1 B3;
@@ -11662,12 +12198,12 @@ pub fn tc_tid_tuple_elem_faithful(tid: Int) -> Bool {
     // resolve_tuple_ann's element arm recovers the same mono stem via
     // mono_name_from_ann (br 637sy9, CLOSED) instead of erasing to the bare head — the
     // wzv72h fixed-point gate proves it (test_637sy9_*). An ENUM INSTANCE
-    // (TK_ENUM, params_count>=1) is now ADMITTED too (br 82ajft / dbzy4r):
-    // tc_tid_struct_mono_name was widened for TK_ENUM in jjhnf3 (c_type_tag_for_struct
+    // (TyKind.Enum, params_count>=1) is now ADMITTED too (br 82ajft / dbzy4r):
+    // tc_tid_struct_mono_name was widened for TyKind.Enum in jjhnf3 (c_type_tag_for_struct
     // base + kind-agnostic slot segs), so it spells the same full mono stem
     // (Tree_Int) that resolve_tuple_ann's element arm recovers via mono_name_from_ann
     // — the enum twin of the struct-instance case above.
-    if k == TK_STRUCT || k == TK_ENUM { return true }
+    if k == TyKind.Struct || k == TyKind.Enum { return true }
     // A genuine Void TUPLE ELEMENT is now ADMITTED (br dq15j7) — the last of the four
     // sibling gates to do so, and the emitter gap that forced the deliberate refusal below
     // for so long is fixed: emit_tuple_typedef (codegen_types.bl:5622) now spells a scalar
@@ -11682,11 +12218,11 @@ pub fn tc_tid_tuple_elem_faithful(tid: Int) -> Bool {
     //
     // Admitting it here is correct in principle regardless of the emitter state: Void is
     // "an ordinary INHABITED, encodable type" (decisions/under-determined-types.md:39, 6-0).
-    // tc_tid_ct maps TK_VOID onto CT_VOID and then to -1 (:10677) — CT alone cannot
+    // tc_tid_ct maps TyKind.Void onto CT_VOID and then to -1 (:10677) — CT alone cannot
     // distinguish a genuine Void from an unsolved metavariable — so this checks the KIND
-    // directly, mirroring tc_struct_slot_encodable's TK_VOID arm above (:11797).
-    if k == TK_VOID { return true }
-    // A kind with no arm above (TK_TYPEVAR, TK_UNKNOWN, TK_FN): E0301 forecloses an
+    // directly, mirroring tc_struct_slot_encodable's TyKind.Void arm above (:11797).
+    if k == TyKind.Void { return true }
+    // A kind with no arm above (TyKind.Typevar, TyKind.Unknown, TyKind.Fn): E0301 forecloses an
     // unsolved metavar before codegen reaches this gate, so this refusal exists for
     // defense in depth and for kinds with genuinely no tuple-element spelling.
     voidtwin_probe("tuple_elem", tid)
@@ -11718,7 +12254,7 @@ pub fn tc_seg_from_tid(tid: Int) -> Option[Str] {
 // so Set[Int] and Set[Str] both spell "Set").
 //
 // Deliberately conservative on the two axes where a wrong answer misleads:
-//   - the nominal name is compared only for TK_STRUCT / TK_ENUM / TK_TYPEVAR, the kinds
+//   - the nominal name is compared only for TyKind.Struct / TyKind.Enum / TyKind.Typevar, the kinds
 //     where it distinguishes types. Every other kind's head is fixed by the kind itself,
 //     and make_*_type's `name` for those is decorative — comparing it would report a
 //     spurious difference for two spellings of one type.
@@ -11734,7 +12270,7 @@ pub fn tc_tid_same_type(a0: Int, b0: Int) -> Bool {
     let tb = ty_pool.get(b).unwrap()
     if ta.kind != tb.kind { return false }
     let k = ta.kind
-    if k == TK_STRUCT || k == TK_ENUM || k == TK_TYPEVAR {
+    if k == TyKind.Struct || k == TyKind.Enum || k == TyKind.Typevar {
         if ta.name != tb.name { return false }
     }
     if (ta.inner1 < 0) != (tb.inner1 < 0) { return false }
@@ -11804,8 +12340,8 @@ pub fn tc_classify_mono_conflicts() {
 // slot-tid analogue of tc_tid_encodable, kept SEPARATE rather than folded into it
 // (br qerbc7 triage) because the two predicates deliberately diverge on two axes:
 // this one does NOT tc_resolve a bound-but-unsolved metavar (so a raw slot reads
-// back TK_UNKNOWN and is refused even when its resolution is concrete — 9 of its
-// 10 call sites rely on that), and it admits TK_MAP/TK_SET/TK_LIST unconditionally
+// back TyKind.Unknown and is refused even when its resolution is concrete — 9 of its
+// 10 call sites rely on that), and it admits TyKind.Map/TyKind.Set/TyKind.List unconditionally
 // where tc_tid_encodable recurses. Before br 3fc3pn deleted the string mono-CSV
 // producer, this predicate's contract was framed as byte-matching that producer's
 // stored segment (`nth_type_arg(mi.args, ei)`); since then the tid path is sole
@@ -11820,7 +12356,7 @@ pub fn tc_classify_mono_conflicts() {
 //     stem (Box_Int), the same name register_mono_instance mints — closing the -1
 //     hole so arg_tids can key the mono dedup (br 16z0s1).
 //   - an ENUM INSTANCE (params_count>=1) admits too (br 82ajft/dbzy4r) — see the
-//     TK_STRUCT|TK_ENUM branch's own comment below.
+//     TyKind.Struct|TyKind.Enum branch's own comment below.
 //   - Option/Result over encodable inners, Tuple (tc_tid_tuple_elem_faithful), Map,
 //     and Set all admit (br kffj8d): tc_tid_to_c_tag spells each via the tid tier's
 //     one speller ("Option_int" / "Result_int_str" / "Tuple2_int_int" / bare
@@ -11833,11 +12369,11 @@ pub fn tc_struct_slot_encodable(tid: Int) -> Bool {
     if tid < 0 || tid >= ty_pool.len() { return false }
     let t = ty_pool.get(tid).unwrap()
     let k = t.kind
-    if k == TK_INT || k == TK_FLOAT || k == TK_BOOL || k == TK_STR || k == TK_CHAR { return true }
-    if k == TK_I8 || k == TK_I16 || k == TK_I32 { return true }
-    if k == TK_U8 || k == TK_U16 || k == TK_U32 || k == TK_U64 { return true }
-    // An ENUM INSTANCE (TK_ENUM, params_count>=1) is now ADMITTED (br 82ajft / dbzy4r):
-    // tc_tid_struct_mono_name was widened for TK_ENUM in jjhnf3, so the encoder spells
+    if k == TyKind.Int || k == TyKind.Float || k == TyKind.Bool || k == TyKind.Str || k == TyKind.Char { return true }
+    if k == TyKind.I8 || k == TyKind.I16 || k == TyKind.I32 { return true }
+    if k == TyKind.U8 || k == TyKind.U16 || k == TyKind.U32 || k == TyKind.U64 { return true }
+    // An ENUM INSTANCE (TyKind.Enum, params_count>=1) is now ADMITTED (br 82ajft / dbzy4r):
+    // tc_tid_struct_mono_name was widened for TyKind.Enum in jjhnf3, so the encoder spells
     // its full mono stem (Tree_Int) rather than erasing to the bare head — the enum
     // twin of the struct-instance slot admitted below. (A poly-impl wrapper,
     // tc_poly_elem_slot_encodable, used to further restrict this to BARE unqualified
@@ -11857,13 +12393,13 @@ pub fn tc_struct_slot_encodable(tid: Int) -> Bool {
     // inside an outer Box[Box[T]] struct LITERAL) was admitted unconditionally on
     // the strength of the comment above ("tc_tid_to_c_tag recurses ... to the full
     // mono stem") — true only when that recursion SUCCEEDS. When it declines
-    // (mono_name == ""), tc_tid_tag_at's own TK_STRUCT|TK_ENUM arm falls back to the
+    // (mono_name == ""), tc_tid_tag_at's own TyKind.Struct|TyKind.Enum arm falls back to the
     // BARE head name for every stem=="" cause, conflating "genuinely bare base" with
     // "instance failed to resolve" — so this gate would wave through a slot that
     // spells as a plain, wrong "Box" instead of declining so tid_native_struct_mono's
     // substitution retry (tc_tid_subst_mono) gets a chance to run. Also reject a bare
     // ICE_SEG_* sentinel spelling (diag_is_ice_seg) — non-"" but not a real name.
-    if k == TK_STRUCT || k == TK_ENUM {
+    if k == TyKind.Struct || k == TyKind.Enum {
         if t.params_count == 0 { return true }
         let name = tc_tid_struct_mono_name(tid)
         return name != "" && !diag_is_ice_seg(name)
@@ -11877,30 +12413,30 @@ pub fn tc_struct_slot_encodable(tid: Int) -> Bool {
     // tc_tid_encodable for the inner, exactly like tc_tid_to_c_tag's own recursion — a
     // nested typevar/unknown inner still defers. The Gen1==Gen2 fixed point is the
     // byte-equality proof; a shape that breaks it is a genuine divergence and reverts.
-    if k == TK_OPTION { return tc_tid_encodable(t.inner1) }
-    if k == TK_RESULT { return tc_tid_encodable(t.inner1) && tc_tid_encodable(t.inner2) }
+    if k == TyKind.Option { return tc_tid_encodable(t.inner1) }
+    if k == TyKind.Result { return tc_tid_encodable(t.inner1) && tc_tid_encodable(t.inner2) }
     // A TUPLE slot (br kffj8d, test_0sh55p T=Tuple2_int_int): admitted when every
     // element is tuple-element-safe (tc_tid_tuple_elem_faithful), the same gate the general
     // tc_tid_encodable uses. tc_tid_to_c_tag spells it via tc_tid_tuple_tag
     // (Tuple2_int_int), byte-matching the struct-lit string path's registered tuple
     // carrier segment.
-    if k == TK_TUPLE { return tc_tid_tuple_elem_faithful(tid) }
+    if k == TyKind.Tuple { return tc_tid_tuple_elem_faithful(tid) }
     // A MAP slot (br 91j9fw, the List twin of br jw1pmb one carrier over): tc_tid_to_c_tag
     // erases Map to the bare carrier tag "Map" (no inner spelling), matching the string
     // path's bare "Map" segment — the same top-level spelling as Set/List below, admitted
     // unconditionally for the identical parity reason (a refusal here has no referent:
-    // tc_tid_seg_injective already groups TK_MAP with TK_SET/TK_LIST as non-injective, so
+    // tc_tid_seg_injective already groups TyKind.Map with TyKind.Set/TyKind.List as non-injective, so
     // no inner element can ever leak into the erased "Map" symbol). Admitting the slot
     // alone is NOT the whole fix: the def-side field storage erases every Map[K,V] field
     // identically regardless of K,V, so a per-USE key/value recovery —
     // recover_map_kv_from_tid, codegen_expr.bl — is required alongside this to avoid
     // silently mis-reading a Map[Str,Point] field as the erased-default Map[Str,Int].
-    if k == TK_MAP { return true }
+    if k == TyKind.Map { return true }
     // A SET slot (br kffj8d, test_kvn6w8 / test_qw7v90 T=Set): tc_tid_to_c_tag erases
     // Set to the bare carrier tag "Set", matching the string path's bare "Set" segment
-    // — the twin of the Map arm above. tc_tid_encodable admits TK_SET unconditionally
+    // — the twin of the Map arm above. tc_tid_encodable admits TyKind.Set unconditionally
     // (it erases to the bare carrier), so no inner gate is needed here.
-    if k == TK_SET { return true }
+    if k == TyKind.Set { return true }
     // A LIST slot (br jw1pmb): tc_tid_to_c_tag erases List to the bare carrier tag
     // "List", dropping every type argument — the same top-level spelling as Set/Map
     // above, admitted unconditionally for the identical reason. This needs a PARITY
@@ -11913,7 +12449,7 @@ pub fn tc_struct_slot_encodable(tid: Int) -> Bool {
     // names no type argument, no inner element can ever leak into the symbol, so an
     // inner gate here would be a refusal with NO REFERENT — there is nothing it could
     // protect that Option/Map/Tuple's inner gates protect (a leaking unencodable inner
-    // spelling). tc_tid_seg_injective is already false for TK_LIST (:11344), so the
+    // spelling). tc_tid_seg_injective is already false for TyKind.List (:11344), so the
     // mono-conflict tripwire (tc_classify_mono_conflicts) already classifies the
     // resulting cross-element sharing as `excusable`, not a violation. And refusing here
     // does not make the program safe: a decline just pushes the same under-determination
@@ -11924,11 +12460,11 @@ pub fn tc_struct_slot_encodable(tid: Int) -> Bool {
     // every List[T] field identically regardless of T, so a per-USE element recovery —
     // recover_list_elem_from_tid, codegen_expr.bl — is required alongside this to avoid
     // silently mis-reading a List[Str]/[Float]/[struct] field as a List[Int].)
-    if k == TK_LIST { return true }
+    if k == TyKind.List { return true }
     // A genuine Void slot is ADMITTED — same reasoning as tc_tid_tuple_elem_faithful's
-    // TK_VOID arm above (br hsgsbp): both paths spell it "Void", so this is byte-neutral,
+    // TyKind.Void arm above (br hsgsbp): both paths spell it "Void", so this is byte-neutral,
     // and the accidental fall-through to `false` was what erased a real `Box[Void]`.
-    if k == TK_VOID { return true }
+    if k == TyKind.Void { return true }
     voidtwin_probe("struct_slot", tid)
     false
 }
@@ -12150,7 +12686,7 @@ fn tc_scalar_tid_from_name(name: Str) -> Int {
 // monomorphized body the nested generic call's arg carries its ORIGINAL memoized tid,
 // which still embeds the enclosing fn's abstract typevar (`run[M]`'s body calls
 // `step(initial)` with initial:M; `outer_result[T]` calls `identity(r)` with
-// r:Result[T,Str]). tc_lookup_node_tid then returns a TK_TYPEVAR / typevar-embedding
+// r:Result[T,Str]). tc_lookup_node_tid then returns a TyKind.Typevar / typevar-embedding
 // tid that tc_tid_encodable rejects, leaving the slot unresolvable. Substituting the arg tid
 // through the enclosing instantiation's binding (built at the codegen call site, the
 // only place the M→Model / T→Int map is known) concretizes it BEFORE the arm ladder
@@ -12180,7 +12716,7 @@ fn tc_resolve_tparam_tid(param_name: Str, fn_params_sl: Int, args_sl: Int, binds
         } else if ptype == "List" {
             if arg_tid >= 0 && arg_tid < ty_pool.len() {
                 let arg_ty = ty_pool.get(arg_tid).unwrap()
-                if arg_ty.kind == TK_LIST && tc_list_param_elem_is(p, param_name) {
+                if arg_ty.kind == TyKind.List && tc_list_param_elem_is(p, param_name) {
                     return arg_ty.inner1
                 }
                 // `List[(.., T, ..)]` — the element is a TUPLE naming the param at a
@@ -12192,9 +12728,9 @@ fn tc_resolve_tparam_tid(param_name: Str, fn_params_sl: Int, args_sl: Int, binds
                 // is actually a tuple of the annotation's arity; anything else falls
                 // through to keep scanning (the closure param, etc.).
                 let lslot = tc_list_tuple_elem_slot(p, param_name)
-                if lslot >= 0 && arg_ty.kind == TK_LIST && arg_ty.inner1 >= 0 && arg_ty.inner1 < ty_pool.len() {
+                if lslot >= 0 && arg_ty.kind == TyKind.List && arg_ty.inner1 >= 0 && arg_ty.inner1 < ty_pool.len() {
                     let elem_ty = ty_pool.get(arg_ty.inner1).unwrap()
-                    if elem_ty.kind == TK_TUPLE && lslot < elem_ty.params_count {
+                    if elem_ty.kind == TyKind.Tuple && lslot < elem_ty.params_count {
                         let slot_tid = ty_param_list.get(elem_ty.params_start + lslot).unwrap()
                         if tc_struct_slot_encodable(slot_tid) { return slot_tid }
                     }
@@ -12213,7 +12749,7 @@ fn tc_resolve_tparam_tid(param_name: Str, fn_params_sl: Int, args_sl: Int, binds
         } else if ptype == "Map" {
             if arg_tid >= 0 && arg_tid < ty_pool.len() {
                 let arg_ty = ty_pool.get(arg_tid).unwrap()
-                if arg_ty.kind == TK_MAP {
+                if arg_ty.kind == TyKind.Map {
                     let which = tc_map_param_binds(p, param_name)
                     if which == 1 { return arg_ty.inner1 }
                     if which == 2 { return arg_ty.inner2 }
@@ -12222,7 +12758,7 @@ fn tc_resolve_tparam_tid(param_name: Str, fn_params_sl: Int, args_sl: Int, binds
         } else if ptype == "Result" || ptype == "Option" {
             if arg_tid >= 0 && arg_tid < ty_pool.len() {
                 let arg_ty = ty_pool.get(arg_tid).unwrap()
-                if arg_ty.kind == TK_RESULT || arg_ty.kind == TK_OPTION {
+                if arg_ty.kind == TyKind.Result || arg_ty.kind == TyKind.Option {
                     let which = tc_compound_param_binds(p, param_name)
                     if which == 1 { return arg_ty.inner1 }
                     if which == 2 { return arg_ty.inner2 }
@@ -12230,7 +12766,7 @@ fn tc_resolve_tparam_tid(param_name: Str, fn_params_sl: Int, args_sl: Int, binds
             }
         } else if ptype == "Fn" {
             // `f: Fn(T) -> U` names a type-param in a closure position. A closure-
-            // LITERAL arg carries no structured TK_FN tid (infer_type → TYPE_UNKNOWN),
+            // LITERAL arg carries no structured TyKind.Fn tid (infer_type → TYPE_UNKNOWN),
             // so the binding is read off the literal's own annotations instead: the
             // return_type string when the param names the Fn return (tc_fn_param_binds
             // == -2), otherwise the naming Fn-param slot's declared type name. This is
@@ -12272,7 +12808,7 @@ fn tc_resolve_tparam_tid(param_name: Str, fn_params_sl: Int, args_sl: Int, binds
         } else if tc_type_is_struct(ptype) != 0 {
             if arg_tid >= 0 && arg_tid < ty_pool.len() {
                 let arg_ty = ty_pool.get(arg_tid).unwrap()
-                if arg_ty.kind == TK_STRUCT && tc_tid_struct_arg_count(arg_tid) >= 1 && strip_module_qualifier(arg_ty.name) == ptype {
+                if arg_ty.kind == TyKind.Struct && tc_tid_struct_arg_count(arg_tid) >= 1 && strip_module_qualifier(arg_ty.name) == ptype {
                     let slot = tc_struct_param_binds(p, param_name)
                     if slot >= 0 && slot < tc_tid_struct_arg_count(arg_tid) {
                         let slot_tid = ty_param_list.get(ty_pool.get(arg_tid).unwrap().params_start + slot).unwrap()
@@ -12285,12 +12821,12 @@ fn tc_resolve_tparam_tid(param_name: Str, fn_params_sl: Int, args_sl: Int, binds
             }
         } else if tc_type_is_enum(ptype) != 0 {
             // br 82ajft: generic-enum param tid twin of the struct arm — read the
-            // named slot's concrete tid off the arg's enum INSTANCE tid (TK_ENUM), so
+            // named slot's concrete tid off the arg's enum INSTANCE tid (TyKind.Enum), so
             // the def-side mono emitter re-derives blink_Tree_Int from the structured
             // tid rather than the "Void"-filled CSV.
             if arg_tid >= 0 && arg_tid < ty_pool.len() {
                 let arg_ty = ty_pool.get(arg_tid).unwrap()
-                if arg_ty.kind == TK_ENUM && tc_tid_struct_arg_count(arg_tid) >= 1 && strip_module_qualifier(arg_ty.name) == ptype {
+                if arg_ty.kind == TyKind.Enum && tc_tid_struct_arg_count(arg_tid) >= 1 && strip_module_qualifier(arg_ty.name) == ptype {
                     let slot = tc_struct_param_binds(p, param_name)
                     if slot >= 0 && slot < tc_tid_struct_arg_count(arg_tid) {
                         let slot_tid = ty_param_list.get(ty_pool.get(arg_tid).unwrap().params_start + slot).unwrap()
