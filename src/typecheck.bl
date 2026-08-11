@@ -9238,10 +9238,10 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 return get_builtin_fn_ret(obj_name)
             }
             // Static method on a builtin/named type: Type.from(x), Type.try_from(x), etc.
-            // Trait-impl methods register under `{Type}_{trait}_{method}` (sb3125);
-            // From/TryFrom and inherent sigs keep the bare `{Type}_{method}` key — which is
-            // how the stdlib spells a static constructor at all, since Blink has no inherent
-            // methods (sections/03c_protocols.md:758): `pub fn Duration_seconds(s: Int)`
+            // Trait-impl methods register under `{Type}_{trait}_{method}` (sb3125); an
+            // inherent sig keeps the bare `{Type}_{method}` key — which is how the stdlib
+            // spells a static constructor at all, since Blink has no inherent methods
+            // (sections/03c_protocols.md:758): `pub fn Duration_seconds(s: Int)`
             // (lib/std/time.bl:3) IS `Duration.seconds(2)`.
             if obj_is_value == 0 {
                 let static_trait = tc_method_trait_names(obj_name, method)
@@ -9255,6 +9255,36 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 let static_sig = lookup_fnsig(static_sig_name)
                 if static_sig != -1 {
                     return fnsig_pool.get(static_sig).unwrap().ret
+                }
+                // br zs7khh. From/TryFrom are the one scheme neither key above can name:
+                // tc_mangle_impl_fnsig keys them SOURCE-TYPED, `{Type}_{method}_{Src}`,
+                // because one target can carry several source impls — lib/std/int_conv.bl
+                // declares try_from on I8 from Int, from I32 and from I16, all three named
+                // `try_from` on `I8`. So the source has to come from the argument, exactly
+                // as codegen already does it (codegen_methods.bl's static From/TryFrom
+                // dispatch spells `src` from the argument's own type, then goes through
+                // find_from_impl/find_tryfrom_impl + mangle_from_method).
+                //
+                // Gated on the method NAME rather than on static_trait, to mirror codegen
+                // and to stay independent of the count == 1 guard above: a target with
+                // several distinct traits owning `try_from` still has exactly one
+                // source-typed key per argument type.
+                //
+                // A miss returns Unknown here instead of falling through, because the
+                // shared fall-through below re-infers every argument and infer_type REPORTS
+                // as a side effect (see the note at the IfExpr arm) — falling through would
+                // double-report a bad argument. Nothing past this point could answer for a
+                // static call anyway.
+                if method == "from" || method == "try_from" {
+                    let ff_args = node_args(node)
+                    if ff_args != -1 && sublist_length(ff_args) == 1 {
+                        let src_t = infer_type(sublist_get(ff_args, 0))
+                        let src_sig = lookup_fnsig("{obj_name}_{method}_{tc_type_str(src_t)}")
+                        if src_sig != -1 {
+                            return fnsig_pool.get(src_sig).unwrap().ret
+                        }
+                        return TYPE_UNKNOWN
+                    }
                 }
             }
         }

@@ -190,6 +190,8 @@ not Stage 3 work:
 | `bfq7nf` | P2 | *(the 2 cells `nz7drz` left)* a block whose tail is a bare Ident bound inside that block infers nothing — not arena- or closure-specific |
 | `3c4g71` | P2 | *(`bfq7nf` one NodeKind over, found by `at=` attribution)* a match arm body naming its own pattern binding infers nothing; a diverging sibling arm cannot cover for it — 17 declaration sites, 4 in the compiler's own source |
 | `8wk3xg` | P2 | *(by-product of adding `at=`)* a local `let at = ..` resolves to `parser.bl`'s PRIVATE `fn at` and reports `ImportNotSelected`; blocks renaming `ty_div_trace`'s `at_str` back |
+| `zs7khh` | P2 | *(first sub-mechanism of the ranked top cause)* static `Type.from` / `Type.try_from` resolved no return type — the fnsig key is source-typed `{T}_{m}_{Src}`, and neither key the call site tried can name it — 10 family-A cells |
+| `3xhh59` | P2 | *(exposed by `zs7khh`)* an impl method spelling `-> Self` registers the literal `Self` typevar as its fnsig return; a typevar is as permissive as `TYPE_UNKNOWN`, so the compare stays disabled |
 
 `k9agr8` gates the *measurement*, not the code: without it Stage 3 can only demonstrate 0
 in archive-linked mode.
@@ -1399,15 +1401,15 @@ these four sweeps, tallied on the **intersection of their file sets** (874 files
 do not appear in all four are listed under the `nz7drz` correction note). `scratchpad/cells.sh`
 takes that allow-list as a required argument.
 
-| | before `nz7drz` | after `nz7drz` | after `bfq7nf` | after `3c4g71` |
-|---|---:|---:|---:|---:|
-| **total cells** | 423 | 421 | 409 | **407** |
-| family A (`tid=?`) cells | 84 | 61 | 47 | **45** |
-| family A rows | 1323 | 1224 | 1190 | **1050** |
-| `Fn`-flat `tid=?` cells | 16 | 2 | 0 | **0** |
-| agree | 362979 | 363711 | 363924 | **364187** |
-| diverge rows | 5008 | 5003 | 4976 | **4837** |
-| missing | 14 | 1 | 1 | **1** |
+| | before `nz7drz` | after `nz7drz` | after `bfq7nf` | after `3c4g71` | after `zs7khh` |
+|---|---:|---:|---:|---:|---:|
+| **total cells** | 423 | 421 | 409 | 407 | **405** |
+| family A (`tid=?`) cells | 84 | 61 | 47 | 45 | **35** |
+| family A rows | 1323 | 1224 | 1190 | 1050 | **1015** |
+| `Fn`-flat `tid=?` cells | 16 | 2 | 0 | 0 | **0** |
+| agree | 362979 | 363711 | 363924 | 364187 | **364289** |
+| diverge rows | 5008 | 5003 | 4976 | 4837 | **4828** |
+| missing | 14 | 1 | 1 | 1 | **1** |
 
 **Cells move by 2 while rows move by 140, and that is the honest reading.** A cell is a
 `(site, tid, flat)` shape triple, so the 17 retired *declaration sites* mostly shared their flat
@@ -1424,16 +1426,63 @@ need no scope because `nz7drz` reads the *signature* and never the body) and the
 were green throughout, pinning that the fix adds a tid without moving one runtime answer.
 `task regen` + `task ci` green.
 
-### Remaining family-A causes, ranked (45 cells / 1050 rows / 347 declaration sites)
+### `zs7khh` — a static `Type.from` / `Type.try_from` resolved no return type (CLOSED)
+
+The first sub-mechanism out of the ranked list's top entry. `tc_mangle_impl_fnsig`
+(`src/typecheck.bl:295`) keys From/TryFrom **source-typed**, `{Type}_{method}_{Src}`, because one
+target can carry several source impls — `lib/std/int_conv.bl` declares `try_from` on `I8` from
+`Int`, from `I32` and from `I16`, all three named `try_from` on `I8`. The static-call site tried
+only the trait-qualified key (`I8_TryFrom_try_from`) and the bare key (`I8_try_from`). Neither can
+name `I8_try_from_Int`, so every static From/TryFrom call fell through to `TYPE_UNKNOWN`. The
+comment above that block asserted the opposite — *"From/TryFrom … keep the bare `{Type}_{method}`
+key"* — which is the false premise that kept the hole open; it is corrected in place.
+
+Codegen never had the hole. `codegen_methods.bl`'s static From/TryFrom dispatch spells `src` from
+the **argument's** type, then goes through `find_from_impl` / `find_tryfrom_impl` +
+`mangle_from_method`. The fix mirrors it: infer the single argument, spell it with `tc_type_str`,
+look up the third key. A miss returns `TYPE_UNKNOWN` rather than falling through, because the
+shared fall-through re-infers every argument and `infer_type` reports as a side effect.
+
+Diagnostic consequence, now fixed: `let x: Str = I8.try_from(5)` compiled clean, because
+`TYPE_UNKNOWN` unifies with anything.
+
+**Two follow-on causes the fix exposed.** Both were hidden behind `tid=?`, so this is visibility
+gained, not ground lost — and it is why 10 family-A cells retired while total cells moved only 2:
+
+- Seven new cells `tid=Result[X, ConversionError]` vs `flat=Result[X, ]`. The flat side holds the
+  Err *CT* but not the enum *name*. Family D, retired structurally by Stage 3's
+  `c_type_from_tid` — deliberately **not** filed as a cell ticket, per the plan's non-goal.
+- One new cell `tid=Self flat=ConfigError`. An impl method spelling `-> Self` registers the literal
+  `Self` typevar as its fnsig return (`typecheck.bl:5103`). A typevar is as permissive as
+  `TYPE_UNKNOWN`, so the declared-type compare stays disabled — the defect class did not change,
+  only its spelling. Filed as **`3xhh59`**.
+
+Test: `tests/test_zs7khh_static_from_tryfrom_ret_tid.bl`, 14 rows — 6 red before, all green after.
+The source-selecting row (`I8.try_from(i32val)`) is the one that fails a fix picking "the first
+`try_from` for `I8`". Controls green throughout: the bare-key `Duration.seconds(2)`, the builtin
+`Bytes.new()`, and the `mjsbwm` shadowing gate (`let I8 = 42`). `task regen` + `task ci` green.
+
+### Remaining family-A causes, ranked (35 cells / 1015 rows)
 
 Now attributable, from `at=`. Grouped by the **innermost producer** — the outermost call is
-usually a symptom (`.unwrap()` heads 72 sites, but its receiver is already unknown):
+usually a symptom (`.unwrap()` heads 72 sites, but its receiver is already unknown). Site counts
+are as of the `3c4g71` sweep, before `zs7khh` landed.
+
+What the ranking called one top cause — *"`X.try_from` / `X.from_str` on a user enum or
+narrow-width type, ~46 sites"* — turned out to be **three** sub-mechanisms, and only the first is
+closed. Read this as a warning about the ranking itself: a shared *spelling* is not a shared
+*cause*, and the remaining rows below may split the same way.
+
+| sub-mechanism | sites | status |
+|---|---:|---|
+| `X.from(v)` / `X.try_from(v)` — real stdlib/user trait impls, source-typed fnsig key | ~25 | **CLOSED (`zs7khh`)** |
+| `Bytes.zeroed` / `Bytes.from_str` — pure codegen intrinsics (`codegen_methods.bl:2545`), no stdlib fn and no fnsig at all | 27 | open |
+| `Status.from_str` — the compiler-synthesized static on a str-backed enum, returning `Option[Enum]`; also no fnsig | 4 | open |
 
 | cause | sites | note |
 |---|---:|---|
-| `X.try_from(..)` / `X.from_str(..)` on a user enum or narrow-width type | ~46 | `Char`/`I8`/`U8`/`Percent`/`Rating`/`Status`; static method returns unresolved |
 | `db.query` / `db.query_one` / `db.execute` / `stmt.step` / `stmt.column_text` | ~40 | `std.db_sqlite`; heads most of the `.unwrap()` chains |
-| `Bytes.zeroed` / `Bytes.from_str` | ~27 | static `Bytes` intrinsics |
+| `Bytes.zeroed` / `Bytes.from_str` | ~27 | static `Bytes` intrinsics — see the split above |
 | `Channel(n)` | 19 | **likely genuinely under-determined** — the arg is a capacity, not an element type, so this may be `decisions/under-determined-types.md` / E0301, not a missing rule |
 | `fs.read` / `fs.list_dir` / `io.read_line` / `io.read_bytes` / `net.*` / `scope.cstr` / `p.deref` / `p.offset` | ~30 | intrinsic namespace methods |
 | `ch.recv` / `dot_ch.recv` | ~16 | `Channel[T]` element |

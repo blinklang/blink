@@ -1,0 +1,199 @@
+// br zs7khh — a static `Type.from(v)` / `Type.try_from(v)` call resolves no return type.
+//
+// register_impl_signatures keys an impl method's fnsig through tc_mangle_impl_fnsig
+// (src/typecheck.bl:295), and From/TryFrom get a SOURCE-TYPED key `{Type}_{method}_{Src}`
+// because one target can have several source impls — lib/std/int_conv.bl declares
+// `impl TryFrom[Int] for I8`, `impl TryFrom[I32] for I8` and `impl TryFrom[I16] for I8`, all
+// three named `try_from` on `I8`. The static-method resolution block only ever tried the
+// trait-qualified key (`I8_TryFrom_try_from`) and the bare key (`I8_try_from`). Neither can
+// name `I8_try_from_Int`, so every static From/TryFrom call fell through to TYPE_UNKNOWN.
+//
+// TYPE_UNKNOWN unifies with anything, so a declared type was accepted no matter what it
+// said. That is the observable half and what the diagnostic rows below pin.
+//
+// Codegen never had the hole: it resolves the same call through
+// find_from_impl/find_tryfrom_impl + mangle_from_method (codegen_methods.bl:3326-3372),
+// spelling the source from the ARGUMENT's type. So these programs always COMPILED AND RAN
+// correctly — the flat universe carried the type the tid did not. That asymmetry is what
+// decisions/compiler-type-representation.md Q2 voted to remove, which makes the run rows
+// here as load-bearing as the diagnostic rows: the fix must add the missing tid without
+// moving one runtime answer.
+
+import compile_test_helpers
+
+// ── the declared type must be compared against a static TryFrom return ──────
+// Three targets, because they exercise three different sources of the impl: a stdlib
+// narrow-width int, a stdlib Char, and a user struct. All three key on `_Int`.
+
+test "a declared type is compared against I8.try_from" {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let x: Str = I8.try_from(5)\n")
+    s = s.concat("    io.println(\"\{x.is_ok()}\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_compile_error(s, "zs7khh_decl_i8", "TypeError")
+}
+
+test "a declared type is compared against Char.try_from" {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let x: Str = Char.try_from(65)\n")
+    s = s.concat("    io.println(\"\{x.is_ok()}\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_compile_error(s, "zs7khh_decl_char", "TypeError")
+}
+
+test "a declared type is compared against a user impl TryFrom" {
+    let mut s = "type Percent \{ value: Int }\n"
+    s = s.concat("impl TryFrom[Int] for Percent \{\n")
+    s = s.concat("    fn try_from(value: Int) -> Result[Percent, Str] \{\n")
+    s = s.concat("        if value < 0 \{ Err(\"negative\") } else \{ Ok(Percent \{ value: value }) }\n")
+    s = s.concat("    }\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let x: Str = Percent.try_from(42)\n")
+    s = s.concat("    io.println(\"\{x.is_ok()}\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_compile_error(s, "zs7khh_decl_user_tryfrom", "TypeError")
+}
+
+// ── the From half ───────────────────────────────────────────────────────────
+// `from` and `try_from` share the source-typed key scheme, so a fix that only teaches
+// try_from passes every row above and fails here.
+
+test "a declared type is compared against a user impl From" {
+    let mut s = "type Celsius \{ deg: Int }\n"
+    s = s.concat("impl From[Int] for Celsius \{\n")
+    s = s.concat("    fn from(value: Int) -> Celsius \{ Celsius \{ deg: value } }\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let x: Str = Celsius.from(20)\n")
+    s = s.concat("    io.println(\"\{x.deg}\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_compile_error(s, "zs7khh_decl_user_from", "TypeError")
+}
+
+test "a declared type is compared against a stdlib widening From" {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let n = I8.try_from(5).unwrap()\n")
+    s = s.concat("    let x: Str = I32.from(n)\n")
+    s = s.concat("    io.println(\"\{x}\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_compile_error(s, "zs7khh_decl_widen", "TypeError")
+}
+
+// ── the SOURCE selects the impl, not just the target ────────────────────────
+// I8 has three try_from impls. A fix that finds "the first try_from for I8" instead of the
+// one matching the argument's type resolves this row to the wrong return type — and since
+// all three return Result[I8, ConversionError] the return type cannot tell them apart, so
+// the row asserts on the declared-type compare of the SOURCE-distinguishing call.
+
+test "a narrowing I32 source selects its own impl" {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let big = I32.try_from(300).unwrap()\n")
+    s = s.concat("    let x: Str = I8.try_from(big)\n")
+    s = s.concat("    io.println(\"\{x.is_ok()}\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_compile_error(s, "zs7khh_decl_narrow_src", "TypeError")
+}
+
+// ── controls: static resolution that already worked must keep working ───────
+// The bare `{Type}_{method}` key is how the stdlib spells every other static constructor
+// (Blink has no inherent methods — sections/03c_protocols.md:758), and `Type.new()` goes
+// through get_builtin_fn_ret. A fix that reorders or shadows those lookups shows up here.
+
+test "a bare-key static constructor still resolves its return type" {
+    let mut s = "import std.time.\{Duration}\n"
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let x: Str = Duration.seconds(2)\n")
+    s = s.concat("    io.println(\"\{x.to_ms()}\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_compile_error(s, "zs7khh_ctl_bare_key", "TypeError")
+}
+
+// The other static-resolution path in the same block: `Type.new()` on a sealed builtin
+// answers from get_builtin_fn_ret, before any fnsig lookup runs at all.
+test "a builtin Type.new still resolves its return type" {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let x: Str = Bytes.new()\n")
+    s = s.concat("    io.println(\"\{x.len()}\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_compile_error(s, "zs7khh_ctl_builtin_new", "TypeError")
+}
+
+// mjsbwm: a name with a binding in scope is a VALUE, and `value.method()` is an instance
+// call however the type spells it. The source-typed lookup must stay behind that gate.
+test "a local binding shadowing a type name is not a static From call" {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let I8 = 42\n")
+    s = s.concat("    io.println(\"\{I8}\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_no_error(s, "zs7khh_ctl_shadow", "TypeError")
+    let r = compile_test_helpers.compile_and_run(s, "zs7khh_ctl_shadow_run")
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out.trim(), "42")
+}
+
+// ── no false positives, and every runtime answer is unchanged ───────────────
+
+test "a matching declared type over I8.try_from stays clean and runs" {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let x: Result[I8, ConversionError] = I8.try_from(5)\n")
+    s = s.concat("    io.println(\"\{x.is_ok()}\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_no_error(s, "zs7khh_clean_i8", "TypeError")
+    let r = compile_test_helpers.compile_and_run(s, "zs7khh_clean_i8_run")
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out.trim(), "true")
+}
+
+test "an inferred I8.try_from still runs" {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let r = I8.try_from(5)\n")
+    s = s.concat("    io.println(\"\{r.unwrap()}\")\n")
+    s = s.concat("}\n")
+    let r = compile_test_helpers.compile_and_run(s, "zs7khh_run_i8")
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out.trim(), "5")
+}
+
+test "an out-of-range narrowing try_from still reports Err at runtime" {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let big = I32.try_from(300).unwrap()\n")
+    s = s.concat("    let r = I8.try_from(big)\n")
+    s = s.concat("    io.println(\"\{r.is_ok()}\")\n")
+    s = s.concat("}\n")
+    let r = compile_test_helpers.compile_and_run(s, "zs7khh_run_narrow")
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out.trim(), "false")
+}
+
+test "a user impl TryFrom still runs" {
+    let mut s = "type Percent \{ value: Int }\n"
+    s = s.concat("impl TryFrom[Int] for Percent \{\n")
+    s = s.concat("    fn try_from(value: Int) -> Result[Percent, Str] \{\n")
+    s = s.concat("        if value < 0 \{ Err(\"negative\") } else \{ Ok(Percent \{ value: value }) }\n")
+    s = s.concat("    }\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let p = Percent.try_from(42)\n")
+    s = s.concat("    io.println(\"\{p.unwrap().value}\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_no_error(s, "zs7khh_clean_user", "TypeError")
+    let r = compile_test_helpers.compile_and_run(s, "zs7khh_run_user")
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out.trim(), "42")
+}
+
+test "a user impl From still runs" {
+    let mut s = "type Celsius \{ deg: Int }\n"
+    s = s.concat("impl From[Int] for Celsius \{\n")
+    s = s.concat("    fn from(value: Int) -> Celsius \{ Celsius \{ deg: value } }\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let c = Celsius.from(20)\n")
+    s = s.concat("    io.println(\"\{c.deg}\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_no_error(s, "zs7khh_clean_from", "TypeError")
+    let r = compile_test_helpers.compile_and_run(s, "zs7khh_run_from")
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out.trim(), "20")
+}
