@@ -192,6 +192,9 @@ not Stage 3 work:
 | `8wk3xg` | P2 | *(by-product of adding `at=`)* a local `let at = ..` resolves to `parser.bl`'s PRIVATE `fn at` and reports `ImportNotSelected`; blocks renaming `ty_div_trace`'s `at_str` back |
 | `zs7khh` | P2 | *(first sub-mechanism of the ranked top cause)* static `Type.from` / `Type.try_from` resolved no return type — the fnsig key is source-typed `{T}_{m}_{Src}`, and neither key the call site tried can name it — 10 family-A cells |
 | `3xhh59` | P2 | *(exposed by `zs7khh`)* an impl method spelling `-> Self` registers the literal `Self` typevar as its fnsig return; a typevar is as permissive as `TYPE_UNKNOWN`, so the compare stays disabled |
+| `2r96m9` | P2 | *(second sub-mechanism of the ranked top cause)* `Bytes.zeroed` / `Bytes.from_str` produced no type — `get_builtin_fn_ret` is keyed on the type name alone, so a mirror gated on `method == "new"` could not name them — **−354 family-A rows, the largest reduction so far**, and it was masking a real miscompile |
+| `w13xgb` | P1 | *(the new #1, from the post-`2r96m9` re-rank)* `Ptr[T]` intrinsics `offset` / `deref` / `is_null` resolve no return type — 165 rows |
+| `rbd0a4` | P2 | *(#2, same audit)* `Str` intrinsic aliases `substr` / `charAt` and `Int.to_string()` resolve no return type — 147 rows |
 
 `k9agr8` gates the *measurement*, not the code: without it Stage 3 can only demonstrate 0
 in archive-linked mode.
@@ -1401,15 +1404,15 @@ these four sweeps, tallied on the **intersection of their file sets** (874 files
 do not appear in all four are listed under the `nz7drz` correction note). `scratchpad/cells.sh`
 takes that allow-list as a required argument.
 
-| | before `nz7drz` | after `nz7drz` | after `bfq7nf` | after `3c4g71` | after `zs7khh` |
-|---|---:|---:|---:|---:|---:|
-| **total cells** | 423 | 421 | 409 | 407 | **405** |
-| family A (`tid=?`) cells | 84 | 61 | 47 | 45 | **35** |
-| family A rows | 1323 | 1224 | 1190 | 1050 | **1015** |
-| `Fn`-flat `tid=?` cells | 16 | 2 | 0 | 0 | **0** |
-| agree | 362979 | 363711 | 363924 | 364187 | **364289** |
-| diverge rows | 5008 | 5003 | 4976 | 4837 | **4828** |
-| missing | 14 | 1 | 1 | 1 | **1** |
+| | before `nz7drz` | after `nz7drz` | after `bfq7nf` | after `3c4g71` | after `zs7khh` | after `2r96m9` |
+|---|---:|---:|---:|---:|---:|---:|
+| **total cells** | 423 | 421 | 409 | 407 | 405 | **404** |
+| family A (`tid=?`) cells | 84 | 61 | 47 | 45 | 35 | **34** |
+| family A rows | 1323 | 1224 | 1190 | 1050 | 1015 | **661** |
+| `Fn`-flat `tid=?` cells | 16 | 2 | 0 | 0 | 0 | **0** |
+| agree | 362979 | 363711 | 363924 | 364187 | 364289 | **364674** |
+| diverge rows | 5008 | 5003 | 4976 | 4837 | 4828 | **4474** |
+| missing | 14 | 1 | 1 | 1 | 1 | **1** |
 
 **Cells move by 2 while rows move by 140, and that is the honest reading.** A cell is a
 `(site, tid, flat)` shape triple, so the 17 retired *declaration sites* mostly shared their flat
@@ -1462,33 +1465,116 @@ The source-selecting row (`I8.try_from(i32val)`) is the one that fails a fix pic
 `try_from` for `I8`". Controls green throughout: the bare-key `Duration.seconds(2)`, the builtin
 `Bytes.new()`, and the `mjsbwm` shadowing gate (`let I8 = 42`). `task regen` + `task ci` green.
 
-### Remaining family-A causes, ranked (35 cells / 1015 rows)
+### `2r96m9` — two of three `Bytes` static intrinsics produced no type (CLOSED)
 
-Now attributable, from `at=`. Grouped by the **innermost producer** — the outermost call is
-usually a symptom (`.unwrap()` heads 72 sites, but its receiver is already unknown). Site counts
-are as of the `3c4g71` sweep, before `zs7khh` landed.
+The second sub-mechanism out of the ranked list's top entry, and **the largest single row
+reduction of the campaign so far: family-A rows 1015 → 661, −354 (−35%)**.
 
-What the ranking called one top cause — *"`X.try_from` / `X.from_str` on a user enum or
-narrow-width type, ~46 sites"* — turned out to be **three** sub-mechanisms, and only the first is
-closed. Read this as a warning about the ranking itself: a shared *spelling* is not a shared
-*cause*, and the remaining rows below may split the same way.
+Codegen's `Bytes` static block (`codegen_methods.bl:2545`) dispatches three intrinsics — `new`,
+`from_str`, `zeroed` — and **none is backed by a `.bl` function**, so no fnsig can answer for any
+of them. The typecheck static branch mirrored exactly one, gated on the literal method name:
 
-| sub-mechanism | sites | status |
-|---|---:|---|
-| `X.from(v)` / `X.try_from(v)` — real stdlib/user trait impls, source-typed fnsig key | ~25 | **CLOSED (`zs7khh`)** |
-| `Bytes.zeroed` / `Bytes.from_str` — pure codegen intrinsics (`codegen_methods.bl:2545`), no stdlib fn and no fnsig at all | 27 | open |
-| `Status.from_str` — the compiler-synthesized static on a str-backed enum, returning `Option[Enum]`; also no fnsig | 4 | open |
+```blink
+if method == "new" && is_builtin_fn(obj_name) != 0 && obj_is_value == 0 {
+    return get_builtin_fn_ret(obj_name)
+}
+```
 
-| cause | sites | note |
-|---|---:|---|
-| `db.query` / `db.query_one` / `db.execute` / `stmt.step` / `stmt.column_text` | ~40 | `std.db_sqlite`; heads most of the `.unwrap()` chains |
-| `Bytes.zeroed` / `Bytes.from_str` | ~27 | static `Bytes` intrinsics — see the split above |
-| `Channel(n)` | 19 | **likely genuinely under-determined** — the arg is a capacity, not an element type, so this may be `decisions/under-determined-types.md` / E0301, not a missing rule |
-| `fs.read` / `fs.list_dir` / `io.read_line` / `io.read_bytes` / `net.*` / `scope.cstr` / `p.deref` / `p.offset` | ~30 | intrinsic namespace methods |
-| `ch.recv` / `dot_ch.recv` | ~16 | `Channel[T]` element |
-| calling a closure-typed **field** (`route.callback`, `logger.log_msg`) | ~11 | |
-| `buf.with_ptr(fn(p) -> I64 { .. })` | ~6 | return type is the closure's return type |
-| `Iterator` adapters (`.chain`, `.zip`, `.collect`, `.enumerate`) | ~25 | **deferred to `qzdz2e`** (panel decision, user-visible) |
+`get_builtin_fn_ret` is keyed on the **type name alone** and so cannot tell two constructors of one
+type apart, which is exactly why `Bytes.new` was fine while `from_str` and `zeroed` fell through
+every lookup to `TYPE_UNKNOWN`. Third instance of `project_is_intrinsic_method_must_match_handlers`
+in this campaign: a typecheck mirror of a codegen intrinsic list, gated on a *name* rather than
+enumerated against the list, silently omits whatever the list grows.
+
+The fix is `tc_builtin_static_ret(tname, method)`, keyed on the type **and** the method. It is
+strictly more permissive at the fall-through than the gate it replaces, which returned
+`get_builtin_fn_ret`'s answer for `new` even when that answer was Unknown, ending resolution there.
+Deliberately absent, each for its own reason: `Duration.*`, `Instant.from_epoch_secs` and
+`Char.from_code_point` are real stdlib functions already answered by the bare `{Type}_{method}` key,
+and `StringBuilder` keeps its own earlier block, which has to run *before* the receiver is inferred
+so a same-spelled enum variant cannot shadow it into E0505. Probing every builtin static block
+confirmed the hole is exactly these two methods.
+
+| | after `zs7khh` | after `2r96m9` | delta |
+|---|---:|---:|---:|
+| family A rows | 1015 | **661** | **−354 (−35%)** |
+| `tid=? flat=Bytes` rows | 201 | 12 | −189 |
+| diverge rows | 4828 | 4474 | −354 |
+| total cells | 405 | 404 | −1 |
+| family A cells | 35 | 34 | −1 |
+
+**Why one cell for 354 rows.** A cell is a `(site, tid, flat)` triple, and other producers still
+leave `tid=? flat=Bytes` at `emit_let_binding.decl` (`std_net_tcp:128`, `lsp:50`). The 354 rows are
+the three `Bytes.zeroed` sites in `lib/std/libc.bl` — `:143` (read), `:161` (recv), `:207`
+(getentropy) — times the 55 roots that link libc, **plus their knock-on**: each buffer is fed
+straight into `buf.with_ptr(fn(p) -> .. { .. })`, whose result was unknown only because its
+receiver was (`libc:144`, `:162` as `Int`; `:208` as `I32`). So this retires most of the separate
+ranked cause *"`buf.with_ptr`, ~6 sites"* as a by-product, and the one cell that cleared is
+`tid=? flat=I32` at `libc:208` — the last site holding that spelling.
+
+**The hole was masking a miscompile, not merely a missing type.** Found while writing the test:
+`Bytes.to_str()` returns `Result[Str, Str]`, which has no `Display` impl, so interpolating it
+unwrapped is an error. With the receiver untyped that check could not run, and the program compiled
+and **printed the literal `<value>`** — a wrong answer reaching the user. Now
+`error[MissingDisplayImpl]`, pinned by its own row. This is the second family-A cause shown to be
+hiding a user-visible defect rather than only a divergence, and it is the strongest argument yet
+that the family-A prerequisites are worth doing on their own terms.
+
+Test: `tests/test_2r96m9_bytes_static_intrinsic_tid.bl`, 13 rows — 3 red before (the 2 intended
+plus the miscompile), 13 green after. Argument type/arity checking for the `Bytes` statics was
+deliberately **not** added: that is a new diagnostic surface and a separate decision. `task regen` +
+`task ci` green.
+
+### Remaining family-A causes, ranked (34 cells / 661 rows)
+
+Re-ranked from the post-`2r96m9` sweep, by **rows on the 874-file common basis**, grouped by the
+innermost producer (the outermost call is usually a symptom — `.unwrap()` heads many chains, but its
+receiver is already unknown). Rows, not sites: the earlier site-count ranking is what let one entry
+hide three unrelated mechanisms.
+
+**The organizing principle, found by auditing the whole allow-list rather than one cause at a time.**
+`is_builtin_method` (`src/typecheck.bl:5867-6074`) is a flat **172-name** list whose only job is to
+suppress the `UnknownMethod` warning. Return types live in a **separate**, per-receiver-type dispatch
+inside `infer_type_uncached`. The two lists are not coupled, so a name in the first with no arm in
+the second resolves to `TYPE_UNKNOWN` — silently, because the warning that would have named it is
+exactly what the first list suppressed. **73 of the 172 names have no `method == "<name>"`
+comparison anywhere in `typecheck.bl`.** Many are legitimately answered elsewhere (`Duration.to_ms`
+and friends are real stdlib functions reached through the bare `{Type}_{method}` fnsig key), but
+every one that is a pure codegen intrinsic is a family-A cause by construction. This is the same
+defect class as `mjsbwm`, `7cq6w2` and `2r96m9` — `project_is_intrinsic_method_must_match_handlers`,
+now measured rather than met one instance at a time.
+
+| cause | rows | ticket | note |
+|---|---:|---|---|
+| `Ptr[T]` intrinsics — `buf.offset(i)`, `p.deref()`, `p.is_null()` | 165 | **`w13xgb`** (P1) | `lib/std/libc.bl:52`, `:68`. Answers need the receiver's element tid, not a fixed type |
+| `Str` intrinsic aliases — `s.substr(a,b)`, `s.charAt(i)`, `n.to_string()` | 147 | **`rbd0a4`** | `substr`/`charAt` are aliases codegen dispatches (`codegen_methods.bl:922`) and the return block (`typecheck.bl:8939`) never learned; answers are fixed per name |
+| `net.*` — `net.connect` / `listen` / `accept` / `read_bytes` / `write_bytes` | 40 | — | `lib/std/net_tcp.bl:68,83,92,128,137`; intrinsic namespace methods |
+| `db.query` / `query_one` / `execute` / `stmt.step` / `row.get` / `tpl.type_tag` | ~35 | — | **effect operations**, mechanism diagnosed below — no typecheck-side signature source at all |
+| a cross-module `pub let` container element — `symbol_index.si_file_path.get(i)` | 12 | — | `src/incremental.bl:44,75`, `src/file_watcher.bl:40,73` |
+| `Channel(n)` / `ch.recv` | ~24 | — | **likely genuinely under-determined** — the arg is a capacity, not an element type, so this may be `decisions/under-determined-types.md` / E0301, not a missing rule |
+| calling a closure-typed **field** (`route.callback`, `logger.log_msg`) | ~11 | — | |
+| `Status.from_str` — the compiler-synthesized static on a str-backed enum, returning `Option[Enum]` | 4 | — | third sub-mechanism of the old top entry; also no fnsig |
+| `Iterator` adapters (`.chain`, `.zip`, `.collect`, `.enumerate`) | — | `qzdz2e` | **deferred** (panel decision, user-visible) |
+
+Two entries from the previous ranking are gone: `Bytes.zeroed`/`Bytes.from_str` closed as `2r96m9`,
+and `buf.with_ptr` closed with it as knock-on. What that ranking called one top cause —
+*"`X.try_from` / `X.from_str`, ~46 sites"* — was **three** sub-mechanisms: real trait impls with
+source-typed fnsig keys (closed, `zs7khh`), the `Bytes` intrinsics (closed, `2r96m9`), and
+`Status.from_str` (still open). A shared *spelling* is not a shared *cause*.
+
+**The `db.*` mechanism, diagnosed (read-only).** These are **effect operations**, declared in
+`lib/std/db.bl` as `pub effect DB { effect Read { fn query(..) -> Result[List[Row], DBError] } .. }`.
+Typecheck registers only the lowercased effect **name** — `register_ue_handle(str_to_lower(eff_name))`
+at `src/typecheck.bl:5126` — and reads it back at `:7358` for one purpose only: suppressing the
+`UnknownMethod` warning. It holds **no operation signatures whatsoever**, so `db.query(..)` cannot
+resolve. Codegen holds them in the `UeMethod` registry (`src/codegen_types.bl:1817`, populated at
+`src/codegen.bl:751-901`) with **eight flat return fields** — `ret`, `ret_ct`, `ret_inner_ct`,
+`ret_inner_struct`, `ret_inner_ct2`, `ret_inner_struct2`, `ret_ok_elem_ct`, `ret_ok_elem_struct` —
+where the last pair exists solely because `Result[Option[Row], DBError]` is depth 2 and the flat
+`(CT_*, sname)` pair stops at depth 1. That is this plan's thesis in one struct. The fix has a clean
+source: the op's `node_type_ann` through `resolve_type_ann` (`typecheck.bl:2357`), keyed by
+`{handle}.{op}`, walking `node_elements(effect_decl)` → `node_methods(sub_effect)` exactly as
+codegen does.
 
 ## Appendix — all 428 shape cells
 

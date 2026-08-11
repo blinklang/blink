@@ -6113,6 +6113,39 @@ fn get_builtin_fn_ret(name: Str) -> Int {
     TYPE_UNKNOWN
 }
 
+// br 2r96m9. The typecheck mirror of codegen's builtin static-constructor blocks
+// (codegen_methods.bl:2525 onward). Every constructor reached here is a codegen INTRINSIC
+// with no .bl function behind it, so no fnsig can answer for it and this is the only source
+// of its type. It therefore has to enumerate the same methods codegen dispatches
+// (project_is_intrinsic_method_must_match_handlers): the call site used to gate on the
+// method name `new` alone and hand the whole answer to get_builtin_fn_ret, which is keyed on
+// the TYPE name and so cannot tell two constructors of one type apart — which is exactly why
+// Bytes.from_str and Bytes.zeroed were untyped while Bytes.new was fine.
+//
+// Deliberately ABSENT, and each for its own reason:
+//   • Duration.nanos/ms/seconds/minutes/hours and Instant.from_epoch_secs — lib/std/time.bl
+//     declares them as real functions, so the bare `{Type}_{method}` fnsig key already
+//     answers. A second answer here could only drift from the declaration.
+//   • Char.from_code_point — likewise answered already, as Result[Char, ConversionError].
+//   • StringBuilder — answered by its own block earlier in infer_type, which has to run
+//     BEFORE the receiver is inferred so a same-spelled enum variant cannot shadow it into
+//     E0505. Keeping it there is why StringBuilder is named below only as a comment.
+//
+// Returns TYPE_UNKNOWN for anything it does not own, and the caller falls through to the
+// fnsig lookups rather than treating that as the final answer.
+fn tc_builtin_static_ret(tname: Str, method: Str) -> Int {
+    if tname == "Bytes" {
+        if method == "new" || method == "from_str" || method == "zeroed" {
+            return get_builtin_fn_ret("Bytes")
+        }
+        return TYPE_UNKNOWN
+    }
+    // Map.new() / Set.new(): the element types are metavars, minted per call by
+    // get_builtin_fn_ret. No other static constructor exists on either.
+    if method == "new" { return get_builtin_fn_ret(tname) }
+    TYPE_UNKNOWN
+}
+
 fn is_builtin_variant_name(name: Str) -> Int {
     if name == "None" { return 1 }
     if name == "Some" { return 1 }
@@ -9232,10 +9265,16 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             // tc_method_resolvable_on_type, and a scalar one falls through to Unknown and
             // the codegen E0505 backstop. The wrong ANSWER is what this removes.
             let obj_is_value = nr_has_binding(obj_name)
-            // Static constructor on a sealed builtin type: Bytes.new(), Map.new(),
-            // Set.new() mirror the bare-call forms in get_builtin_fn_ret.
-            if method == "new" && is_builtin_fn(obj_name) != 0 && obj_is_value == 0 {
-                return get_builtin_fn_ret(obj_name)
+            // Static constructor on a sealed builtin type: Bytes.new/from_str/zeroed,
+            // Map.new(), Set.new() mirror the bare-call forms in get_builtin_fn_ret. Keyed on
+            // the type AND the method — see tc_builtin_static_ret for why the method half
+            // matters. A type/method pair it does not own answers TYPE_UNKNOWN and falls
+            // through to the fnsig lookups below, which is strictly more than the old gate
+            // did: it returned get_builtin_fn_ret's answer for `new` even when that was
+            // Unknown, ending resolution there.
+            if is_builtin_fn(obj_name) != 0 && obj_is_value == 0 {
+                let bs_ret = tc_builtin_static_ret(obj_name, method)
+                if bs_ret != TYPE_UNKNOWN { return bs_ret }
             }
             // Static method on a builtin/named type: Type.from(x), Type.try_from(x), etc.
             // Trait-impl methods register under `{Type}_{trait}_{method}` (sb3125); an

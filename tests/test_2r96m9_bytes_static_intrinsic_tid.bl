@@ -1,0 +1,168 @@
+// br 2r96m9 — `Bytes.from_str(s)` and `Bytes.zeroed(n)` produce no type in typecheck.
+//
+// Codegen's static-constructor block for Bytes (src/codegen_methods.bl:2525) carries THREE
+// methods — `new`, `from_str`, `zeroed` — and none of them is backed by a .bl function, so no
+// fnsig exists for any of them. The typecheck static-method branch mirrored exactly one, gated
+// on the literal method name:
+//
+//     if method == "new" && is_builtin_fn(obj_name) != 0 && obj_is_value == 0 { .. }
+//
+// so the other two fell through every fnsig lookup to TYPE_UNKNOWN. Same defect class as
+// project_is_intrinsic_method_must_match_handlers: a typecheck-side mirror of a codegen
+// intrinsic list must enumerate the SAME methods, and a name-gated mirror silently omits
+// whatever that list grows.
+//
+// TYPE_UNKNOWN unifies with anything, so the declared type was accepted no matter what it
+// said — that is the observable half these rows pin. The programs always COMPILED AND RAN
+// correctly, because codegen's flat universe carried the CT_BYTES the tid did not, so the
+// run rows are as load-bearing as the diagnostic ones.
+
+import compile_test_helpers
+
+// ── the declared type must be compared against each Bytes static ────────────
+
+test "a declared type is compared against Bytes.zeroed" {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let a: Str = Bytes.zeroed(8)\n")
+    s = s.concat("    io.println(\"\{a.len()}\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_compile_error(s, "2r96m9_decl_zeroed", "TypeError")
+}
+
+test "a declared type is compared against Bytes.from_str" {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let b: Str = Bytes.from_str(\"hi\")\n")
+    s = s.concat("    io.println(\"\{b.len()}\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_compile_error(s, "2r96m9_decl_from_str", "TypeError")
+}
+
+// ── controls: the statics that ALREADY resolved must keep resolving ──────────
+// These three bound the hole. Each was green before the fix, so a mirror that replaces the
+// `new` gate rather than widening it shows up here as a regression.
+
+test "Bytes.new still resolves its return type" {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let x: Str = Bytes.new()\n")
+    s = s.concat("    io.println(\"\{x.len()}\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_compile_error(s, "2r96m9_ctl_bytes_new", "TypeError")
+}
+
+// br 7cq6w2 made StringBuilder a first-class TyKind, including this non-`new` static — so
+// the mirror already had to hold one method beyond `new`, via its own fnsig.
+test "StringBuilder.with_capacity still resolves its return type" {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let x: Str = StringBuilder.with_capacity(16)\n")
+    s = s.concat("    io.println(\"\{x.len()}\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_compile_error(s, "2r96m9_ctl_sb_cap", "TypeError")
+}
+
+test "Char.from_code_point still resolves its Result return type" {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let x: Str = Char.from_code_point(65)\n")
+    s = s.concat("    io.println(\"\{x.is_ok()}\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_compile_error(s, "2r96m9_ctl_char_cp", "TypeError")
+}
+
+// mjsbwm: a name with a binding in scope is a VALUE, and the mirror must stay behind that
+// gate — `let Bytes = 42` is an Int, not a type whose statics can be reached.
+test "a local binding shadowing Bytes is not a static call" {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let Bytes = 42\n")
+    s = s.concat("    io.println(\"\{Bytes}\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_no_error(s, "2r96m9_ctl_shadow", "TypeError")
+    let r = compile_test_helpers.compile_and_run(s, "2r96m9_ctl_shadow_run")
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out.trim(), "42")
+}
+
+// ── no false positives, and every runtime answer is unchanged ───────────────
+
+test "a matching declared Bytes over zeroed stays clean and runs" {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let a: Bytes = Bytes.zeroed(4)\n")
+    s = s.concat("    io.println(\"\{a.len()}\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_no_error(s, "2r96m9_clean_zeroed", "TypeError")
+    let r = compile_test_helpers.compile_and_run(s, "2r96m9_clean_zeroed_run")
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out.trim(), "4")
+}
+
+test "a matching declared Bytes over from_str stays clean and runs" {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let b: Bytes = Bytes.from_str(\"hello\")\n")
+    s = s.concat("    io.println(\"\{b.len()}\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_no_error(s, "2r96m9_clean_from_str", "TypeError")
+    let r = compile_test_helpers.compile_and_run(s, "2r96m9_clean_from_str_run")
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out.trim(), "5")
+}
+
+// Two Bytes tids must compare equal. get_builtin_fn_ret mints Bytes through the deliberately
+// UN-interned new_type (typecheck.bl:1243), so every mention gets a fresh tid — this row is
+// what catches a fix that hands two `Bytes` bindings tids that are not integer-equal.
+test "two Bytes statics produce mutually assignable values" {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let a = Bytes.zeroed(2)\n")
+    s = s.concat("    let b = Bytes.from_str(\"xy\")\n")
+    s = s.concat("    let mut c: Bytes = a\n")
+    s = s.concat("    c = b\n")
+    s = s.concat("    io.println(\"\{c.len()}\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_no_error(s, "2r96m9_clean_two_tids", "TypeError")
+    let r = compile_test_helpers.compile_and_run(s, "2r96m9_run_two_tids")
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out.trim(), "2")
+}
+
+test "an inferred Bytes.zeroed still runs its method surface" {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let a = Bytes.zeroed(3)\n")
+    s = s.concat("    io.println(\"\{a.len()}\")\n")
+    s = s.concat("}\n")
+    let r = compile_test_helpers.compile_and_run(s, "2r96m9_run_zeroed")
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out.trim(), "3")
+}
+
+test "an inferred Bytes.from_str round-trips to a Str" {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let b = Bytes.from_str(\"hey\")\n")
+    s = s.concat("    io.println(\"\{b.to_str().unwrap()}\")\n")
+    s = s.concat("}\n")
+    let r = compile_test_helpers.compile_and_run(s, "2r96m9_run_from_str")
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out.trim(), "hey")
+}
+
+// The row that shows this cause was NOT merely a missing tid: it was masking a miscompile.
+// `Bytes.to_str()` returns Result[Str, Str] (Bytes Methods), which does not implement
+// Display, so interpolating it unwrapped is an error. With the receiver untyped that check
+// could not run, and the program compiled and PRINTED the literal `<value>` — a wrong answer
+// reaching the user. It is now error[MissingDisplayImpl].
+test "interpolating an un-unwrapped Bytes.to_str is a diagnostic, not the string <value>" {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let b = Bytes.from_str(\"hey\")\n")
+    s = s.concat("    io.println(\"\{b.to_str()}\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_compile_error(s, "2r96m9_decl_display", "MissingDisplayImpl")
+}
+
+// A Bytes static passed straight into a Bytes parameter: the tid has to reach the call-arg
+// check, not just the let binding.
+test "a Bytes static passed as a Bytes argument stays clean and runs" {
+    let mut s = "fn take(b: Bytes) -> Int \{ b.len() }\n"
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    io.println(\"\{take(Bytes.zeroed(6))}\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_no_error(s, "2r96m9_clean_arg", "TypeError")
+    let r = compile_test_helpers.compile_and_run(s, "2r96m9_run_arg")
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out.trim(), "6")
+}
