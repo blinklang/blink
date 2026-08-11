@@ -1,6 +1,6 @@
 import ast.{NodeKind, node_kind_name, is_block_bearing, dbg_trace, dbg_channel_on}
 import std.str.{str_to_lower}
-import codegen_types.{is_intrinsic_method, strip_module_qualifier, c_type_tag_for_struct, escape_mono_seg, mono_slot_conflicts, mono_slot_conflicts_same_type, mono_slot_conflicts_diff_type, mono_slot_conflicts_diff_type_injective, get_var_ty, get_var_tp, tp_get_kind, tp_get_child1, tp_get_child2, tp_get_sname, tp_display, CT_INT, CT_FLOAT, CT_BOOL, CT_STRING, CT_LIST, CT_VOID, CT_OPTION, CT_RESULT, CT_ITERATOR, CT_HANDLE, CT_CHANNEL, CT_MAP, CT_BYTES, CT_SET, CT_STRUCT, CT_ENUM, CT_I8, CT_I16, CT_I32, CT_U8, CT_U16, CT_U32, CT_U64, CT_CHAR}
+import codegen_types.{is_intrinsic_method, strip_module_qualifier, c_type_tag_for_struct, escape_mono_seg, mono_slot_conflicts, mono_slot_conflicts_same_type, mono_slot_conflicts_diff_type, mono_slot_conflicts_diff_type_injective, get_var_ty, get_var_tp, tp_get_kind, tp_get_child1, tp_get_child2, tp_get_sname, tp_display, CT_INT, CT_FLOAT, CT_BOOL, CT_STRING, CT_LIST, CT_VOID, CT_OPTION, CT_RESULT, CT_ITERATOR, CT_HANDLE, CT_CHANNEL, CT_MAP, CT_BYTES, CT_SET, CT_STRINGBUILDER, CT_STRUCT, CT_ENUM, CT_I8, CT_I16, CT_I32, CT_U8, CT_U16, CT_U32, CT_U64, CT_CHAR}
 import parser.{
     get_annotation, has_annotation, is_literal_string_part,
     node_args, node_assoc_types, node_arms, node_body, node_captures, node_col, node_condition,
@@ -67,14 +67,14 @@ effect TypeCheck {
 // The discriminant of an interned type. A real enum, not a `let` Int: a kind
 // reached by an `if k == ...` chain falls through silently to whatever default
 // the chain ends in, which is how a speller comes to answer a plausible-wrong
-// tag for TyKind.Fn or TyKind.Closure. Typed as TyKind end to end — never
+// tag for TyKind.Fn. Typed as TyKind end to end — never
 // stored back into an Int (see ast.bl's node_kind_name(kind: Int) for the trap:
 // widening an enum to Int throws exhaustiveness away).
 pub type TyKind {
     Int, Float, Bool, Str, Void,
     List, Option, Result, Fn, Struct, Enum,
-    Typevar, Unknown, Closure, Iterator, Handle, Channel,
-    Tuple, Map, Bytes, Set,
+    Typevar, Unknown, Iterator, Handle, Channel,
+    Tuple, Map, Bytes, Set, StringBuilder,
     I8, I16, I32, U8, U16, U32, U64, Char
 }
 
@@ -96,7 +96,6 @@ fn tk_name(k: TyKind) -> Str {
         TyKind.Enum => "Enum"
         TyKind.Typevar => "Typevar"
         TyKind.Unknown => "Unknown"
-        TyKind.Closure => "Closure"
         TyKind.Iterator => "Iterator"
         TyKind.Handle => "Handle"
         TyKind.Channel => "Channel"
@@ -104,6 +103,7 @@ fn tk_name(k: TyKind) -> Str {
         TyKind.Map => "Map"
         TyKind.Bytes => "Bytes"
         TyKind.Set => "Set"
+        TyKind.StringBuilder => "StringBuilder"
         TyKind.I8 => "I8"
         TyKind.I16 => "I16"
         TyKind.I32 => "I32"
@@ -794,6 +794,32 @@ pub fn make_set_type(elem_type: Int) -> Int {
     ty_intern_simple(TyKind.Set, "Set", elem_type, -1)
 }
 
+// The two one-inner runtime carriers (br vag3wc). Until these existed, `new_type` was never
+// called with TyKind.Handle or TyKind.Channel, so an annotation naming one fell through
+// resolve_type_ann to `make_typevar(name)` — a bare typevar wearing the type's name. Codegen
+// meanwhile had CT_HANDLE / CT_CHANNEL and carried the element in its flat fields, which made
+// the flat universe STRICTLY more informative than the tid for these and would have left the
+// Stage 3 divergence counter permanently nonzero at those sites with nothing to read. It also
+// broke a real program: `iter_tk == TyKind.Channel` is how tc_check_body recognises a channel
+// as iterable, and a typevar is not that kind, so ANNOTATING a channel made it un-iterable.
+//
+// Shaped exactly like make_set_type: one inner, name = the type's own name, so tc_tid_child /
+// tc_tid_child_count / the spellers / tk_to_ct all reach them through the arms they already
+// had.
+//
+// The other two unconstructible kinds resolve differently. TyKind.Closure is DELETED, not
+// constructed: TyKind.Fn is already constructed (make_fn_type), covers the same surface (a
+// closure's declared type is spelled `Fn(..) -> T`), and tk_to_ct collapsed both to CT_VOID
+// anyway. TyKind.Iterator is DEFERRED to br qzdz2e on a spec question — see the note on its
+// tc_tid_child_count arm.
+pub fn make_handle_type(result_type: Int) -> Int {
+    ty_intern_simple(TyKind.Handle, "Handle", result_type, -1)
+}
+
+pub fn make_channel_type(elem_type: Int) -> Int {
+    ty_intern_simple(TyKind.Channel, "Channel", elem_type, -1)
+}
+
 // ── Metavariables (Hindley-Milner inference discipline) ─────────────
 //
 // A metavariable is a *fresh* TyKind.Unknown pool entry (minted per binding via
@@ -918,6 +944,76 @@ fn tc_tid_has_unbound_metavar(tid0: Int) -> Int {
         while i < e.params_count {
             let c = ty_param_list.get(e.params_start + i).unwrap()
             if tc_tid_has_unbound_metavar(c) != 0 { return 1 }
+            i = i + 1
+        }
+        return 0
+    }
+    0
+}
+
+// Does `tid` carry a BARE TYPEVAR anywhere in its structure? The structural twin of
+// tc_tid_has_unbound_metavar above, and deliberately a separate predicate: α and T are both
+// "not concrete yet" but they are not interchangeable, and only one of them is solvable.
+//
+// A metavar can still be bound — by a later use, an argument-position unify, or
+// monomorphization. A bare typevar cannot: as instantiate_return_type's doc spells out,
+// tc_is_unbound_metavar counts only TyKind.Unknown with inner1 < 0 and tc_unify's typevar arm
+// returns 1 WITHOUT binding, so a bare typevar is invisible to the whole metavar machinery.
+// That makes `α := T` a strictly lossy pin — it converts a solvable hole into an unsolvable
+// one — which is why the pin caller below refuses a declared type containing one (sskpk8).
+pub fn tc_tid_has_bare_typevar(tid0: Int) -> Int {
+    let tid = tc_resolve(tid0)
+    if tid < 0 || tid >= ty_pool.len() { return 0 }
+    let e = ty_pool.get(tid).unwrap()
+    let k = e.kind
+    if k == TyKind.Typevar { return 1 }
+    if k == TyKind.List || k == TyKind.Option || k == TyKind.Set {
+        return tc_tid_has_bare_typevar(e.inner1)
+    }
+    if k == TyKind.Result || k == TyKind.Map {
+        if tc_tid_has_bare_typevar(e.inner1) != 0 { return 1 }
+        return tc_tid_has_bare_typevar(e.inner2)
+    }
+    if k == TyKind.Tuple || k == TyKind.Struct || k == TyKind.Enum {
+        let mut i = 0
+        while i < e.params_count {
+            let c = ty_param_list.get(e.params_start + i).unwrap()
+            if tc_tid_has_bare_typevar(c) != 0 { return 1 }
+            i = i + 1
+        }
+        return 0
+    }
+    0
+}
+
+// Does `tid` name a transparent `type Alias = X` anywhere in its structure? The tid tree
+// stores the alias's OWN name, and resolve_alias_tid only ever peels the outermost one, so
+// `Map[Port, Int]` keeps `Port` in its key slot while the parallel annotation-NODE path
+// (type_from_name) lowers it to Int. Two spellings of one type, and the pin caller below
+// refuses rather than committing the un-canonical one (sskpk8; the structural resolver is
+// tracked as its own prerequisite, br bvh7qt).
+pub fn tc_tid_has_alias(tid0: Int) -> Int {
+    if tc_alias_underlying.len() == 0 { return 0 }
+    let tid = tc_resolve(tid0)
+    if tid < 0 || tid >= ty_pool.len() { return 0 }
+    let e = ty_pool.get(tid).unwrap()
+    if e.name != "" {
+        let under = tc_alias_underlying.get(e.name) ?? -1
+        if under != -1 { return 1 }
+    }
+    let k = e.kind
+    if k == TyKind.List || k == TyKind.Option || k == TyKind.Set {
+        return tc_tid_has_alias(e.inner1)
+    }
+    if k == TyKind.Result || k == TyKind.Map {
+        if tc_tid_has_alias(e.inner1) != 0 { return 1 }
+        return tc_tid_has_alias(e.inner2)
+    }
+    if k == TyKind.Tuple || k == TyKind.Struct || k == TyKind.Enum {
+        let mut i = 0
+        while i < e.params_count {
+            let c = ty_param_list.get(e.params_start + i).unwrap()
+            if tc_tid_has_alias(c) != 0 { return 1 }
             i = i + 1
         }
         return 0
@@ -1107,6 +1203,50 @@ fn lookup_named_type(name: Str) -> Int {
     -1
 }
 
+// b907wt: mint a declaration for a RUNTIME-BACKED compiler-known type on demand.
+//
+// ProcessResult's C struct lives in bootstrap/runtime_process.h and codegen names it with
+// no Blink declaration at all (src/codegen.bl:634 reg_fn_struct_ret, :650-652 the fields).
+// So `let r = process_pid_wait(pid)` compiles and RUNS correctly in a file that never
+// writes `import std.process` — src/cli.bl:2187 is exactly that. Typecheck used to answer
+// TYPE_VOID there: a fail-OPEN erasure that also swallowed every downstream `r.out`.
+//
+// The type is known, so typecheck says so. Minting is idempotent and always defers to a
+// real declaration, because lookup runs first: if lib/std/process.bl is in the program its
+// register_struct_type has already inserted the name (registration precedes inference), and
+// this returns that tid. Fields are registered here too — a fieldless mint would turn a
+// silent erasure into a spurious "no field" error, which is worse.
+fn ensure_runtime_struct_type(name: Str, fnames: List[Str], ftids: List[Int]) -> Int {
+    let existing = lookup_named_type(name)
+    if existing != -1 { return existing }
+    let tid = new_type(TyKind.Struct, name)
+    named_type_names.push(name)
+    named_type_ids.push(tid)
+    named_type_map.insert(name, tid)
+    let mut i = 0
+    while i < fnames.len() {
+        sfield_pool.push(TcStructField { struct_id: tid, name: fnames.get(i).unwrap(), type_id: ftids.get(i).unwrap() })
+        i = i + 1
+    }
+    tid
+}
+
+fn runtime_process_result_tid() -> Int {
+    ensure_runtime_struct_type("ProcessResult", ["out", "err_out", "exit_code"], [TYPE_STR, TYPE_STR, TYPE_INT])
+}
+
+// 7cq6w2: THE StringBuilder tid — one entry per program, so `sb_a` and `sb_b` compare
+// equal by integer comparison per decisions/compiler-type-representation.md Q3.
+//
+// Goes through ty_intern_simple rather than new_type, unlike the TyKind.Bytes sites it
+// otherwise mirrors (:2236, :5875). new_type is deliberately un-interned to keep every
+// metavar FRESH, and a childless nominal leaf gets no benefit from that freshness — it
+// just gets a fresh tid per mention. (Bytes therefore has as many tids as it has
+// mentions; that is pre-existing and separate.)
+fn type_stringbuilder() -> Int {
+    ty_intern_simple(TyKind.StringBuilder, "StringBuilder", -1, -1)
+}
+
 fn resolve_type_name(name: Str) -> Int ! TypeCheck.Resolve {
     if name == "Int" { return TYPE_INT }
     if name == "Float" { return TYPE_FLOAT }
@@ -1122,6 +1262,11 @@ fn resolve_type_name(name: Str) -> Int ! TypeCheck.Resolve {
     if name == "U32" { return TYPE_U32 }
     if name == "U64" { return TYPE_U64 }
     if name == "Char" { return TYPE_CHAR }
+    // A builtin with no Blink declaration anywhere: `StringBuilder` names codegen's
+    // CT_STRINGBUILDER / `blink_sb*` and is listed by is_primitive_type, but lib/std/sb.bl
+    // only declares FUNCTIONS over it. Without this arm every `sb: StringBuilder` param
+    // and `-> StringBuilder` return resolved to -1 and inference fell back to Unknown.
+    if name == "StringBuilder" { return type_stringbuilder() }
     lookup_named_type(name)
 }
 
@@ -2189,6 +2334,24 @@ fn resolve_type_ann(ann_node: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
     }
     if name == "Bytes" {
         return new_type(TyKind.Bytes, "Bytes")
+    }
+    // The three one-inner runtime carriers (br vag3wc). Ahead of resolve_type_name for the
+    // same reason List/Map/Set are: is_primitive_type already claims these names, so a user
+    // type could not have taken them, and falling through to `make_typevar(name)` is what made
+    // an ANNOTATED channel un-iterable — tc_check_body's deferred-iterable test asks
+    // `iter_tk == TyKind.Channel`, which a typevar is not, so `let ch: Channel[Int] = Channel(4)`
+    // followed by `for v in ch` drew E0302 while the unannotated program compiled.
+    if name == "Handle" {
+        if elems_sl != -1 && sublist_length(elems_sl) >= 1 {
+            return make_handle_type(resolve_type_ann(sublist_get(elems_sl, 0)))
+        }
+        return make_handle_type(TYPE_UNKNOWN)
+    }
+    if name == "Channel" {
+        if elems_sl != -1 && sublist_length(elems_sl) >= 1 {
+            return make_channel_type(resolve_type_ann(sublist_get(elems_sl, 0)))
+        }
+        return make_channel_type(TYPE_UNKNOWN)
     }
 
     let resolved = resolve_type_name(name)
@@ -5444,6 +5607,17 @@ fn nr_is_defined(name: Str) -> Int {
     0
 }
 
+// mjsbwm: does `name` have ANY binding in scope right now? nr_is_defined's answer without
+// its side effects — that one marks nr_scope_reads (and nr_scope_captured inside a closure),
+// which is how W0310/W0601 decide a variable was used. An inference-time question like "is
+// this method receiver a value rather than a type name?" must not count as a read, or asking
+// it would silence the unused-variable warnings for every name it asks about. Same
+// pure-inspection contract as nr_top_binding_is_global below.
+fn nr_has_binding(name: Str) -> Int {
+    if nr_name_top.contains_key(name) { return 1 }
+    0
+}
+
 // Whether `name`'s current top binding lives in the global frame (depth 1).
 // A cross-module private-access violation can only legitimately apply to a
 // real top-level free-fn/let reference (global frame); when a name resolves to
@@ -5764,6 +5938,10 @@ fn is_builtin_method(name: Str) -> Int {
     if name == "clear" { return 1 }
     if name == "write_char" { return 1 }
     if name == "capacity" { return 1 }
+    // 7cq6w2: emit_sb_method's sibling constructor (codegen_methods.bl:2590) — omitted
+    // here, so `StringBuilder.with_capacity(8)` drew a W0501 for a method the compiler
+    // has always been able to emit.
+    if name == "with_capacity" { return 1 }
     // Bytes/Instant static constructors
     if name == "new" { return 1 }
     if name == "zeroed" { return 1 }
@@ -5806,27 +5984,16 @@ fn get_builtin_fn_ret(name: Str) -> Int {
     if name == "socket_write" { return TYPE_VOID }
     if name == "file_mtime" { return TYPE_INT }
     if name == "getpid" { return TYPE_INT }
-    if name == "process_run" {
-        let pr = lookup_named_type("ProcessResult")
-        if pr != -1 { return pr }
-        return TYPE_VOID
-    }
-    if name == "process_run_with_stdin" {
-        let pr = lookup_named_type("ProcessResult")
-        if pr != -1 { return pr }
-        return TYPE_VOID
-    }
+    if name == "process_run" { return runtime_process_result_tid() }
+    if name == "process_run_with_stdin" { return runtime_process_result_tid() }
     if name == "process_exec" { return TYPE_VOID }
     if name == "process_spawn" { return TYPE_INT }
-    if name == "process_pid_wait" {
-        let pr = lookup_named_type("ProcessResult")
-        if pr != -1 { return pr }
-        return TYPE_VOID
-    }
+    if name == "process_pid_wait" { return runtime_process_result_tid() }
     if name == "process_pid_kill" { return TYPE_INT }
     if name == "process_pid_send_signal" { return TYPE_INT }
     if name == "process_install_signal_forwarding" { return TYPE_VOID }
     if name == "Bytes" { return new_type(TyKind.Bytes, "Bytes") }
+    if name == "StringBuilder" { return type_stringbuilder() }
     if name == "Map" { return make_map_type(make_metavar(), make_metavar()) }
     if name == "Set" { return make_set_type(make_metavar()) }
     TYPE_UNKNOWN
@@ -7366,7 +7533,11 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     }
 
     if kind == NodeKind.AwaitExpr {
-        nr_check_node(node_value(node))
+        // 1b7ggq: the operand lives in `obj` (src/parser.bl:2865), not `value`. Reading
+        // `value` gave -1, so the whole operand subtree went unvisited — `h1.await` did not
+        // count as a read of `h1`, and an undefined name in that position reached the C
+        // compiler with `check` reporting ok.
+        nr_check_node(node_obj(node))
         return
     }
 
@@ -8402,6 +8573,33 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             }
         }
 
+        // 7cq6w2: StringBuilder's two static constructors, resolved from the receiver's
+        // NAME before the receiver is inferred as a value.
+        //
+        // The ordering is load-bearing. `StringBuilder` is a builtin type with no Blink
+        // declaration, so a bare Ident spelling it has nothing to resolve to — except that
+        // an enum in scope may own a variant of the same name, and bare-variant resolution
+        // then infers the Ident as THAT ENUM. typecheck's own TyKind has exactly such a
+        // variant (and a `Char` one, the same hazard for `Char.from_code_point`), so any
+        // file importing TyKind and calling `StringBuilder.new()` — tests/, and any future
+        // compiler module — would reach the Struct/Enum branch below and be rejected with
+        // E0505 "unresolved method '.new' on type TyKind". Deciding on the name first
+        // cannot be shadowed that way.
+        //
+        // A local genuinely named `StringBuilder` still wins: it is a value, and a value
+        // receiver is not a static call.
+        if obj_node != -1 && node_kind(obj_node) == NodeKind.Ident {
+            if node_name(obj_node) == "StringBuilder" && nr_is_defined("StringBuilder") == 0 {
+                if method == "new" { return type_stringbuilder() }
+                // Kept beside `new` rather than folded into get_builtin_fn_ret, which is
+                // keyed on the type name alone and so cannot tell two constructors apart.
+                if method == "with_capacity" {
+                    check_builtin_arg(method, 0, TYPE_INT, node_args(node), "StringBuilder")
+                    return type_stringbuilder()
+                }
+            }
+        }
+
         let obj_t = infer_type(obj_node)
         let obj_k = type_kind(obj_t)
 
@@ -8429,7 +8627,12 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 check_builtin_arg(method, 1, elem, args_sl, "List")
                 return TYPE_VOID
             }
-            if method == "pop" || method == "clear" { return TYPE_VOID }
+            // dvzt90: `pop` was sharing `clear`'s arm. It removes AND RETURNS the last
+            // element (`sections/03_types.md:390`, `lib/std/traits.bl:56`
+            // `fn pop(self) -> Option[T]`), and codegen has built that Option since gemr3z
+            // (src/codegen_methods.bl:1285) — typecheck was the only phase saying Void.
+            if method == "pop" { return make_option_type(elem) }
+            if method == "clear" { return TYPE_VOID }
             if method == "for_each" {
                 check_closure_param(closure_arg_at(args_sl, 0), 0, elem, method, "List")
                 return TYPE_VOID
@@ -8720,6 +8923,32 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             }
         }
 
+        // 7cq6w2: the StringBuilder surface, mirroring emit_sb_method
+        // (src/codegen_methods.bl:2017) method-for-method — that function IS the
+        // definition of what a StringBuilder can do, and a method typed here that it
+        // cannot emit would trade a missing type for a link error.
+        //
+        // `write` deliberately takes ANY argument: codegen dispatches on the arg's ct
+        // (blink_sb_write / _write_int / _write_float / _write_bool) and interpolates an
+        // InterpString part-by-part, so constraining it to Str here would reject
+        // `buf.write("{n}")` and `buf.write(count)`, both of which lower correctly today.
+        if obj_k == TyKind.StringBuilder {
+            let args_sl = node_args(node)
+            if method == "write" || method == "write_char" {
+                // Not checked, but still INFERRED: the shared fall-through at the end of
+                // this arm is what surfaces E0522 for a nested call in an argument, and
+                // returning early here would skip it.
+                if args_sl != -1 && sublist_length(args_sl) > 0 {
+                    infer_type(sublist_get(args_sl, 0))
+                }
+                return TYPE_VOID
+            }
+            if method == "clear" { return TYPE_VOID }
+            if method == "to_str" { return TYPE_STR }
+            if method == "len" || method == "capacity" { return TYPE_INT }
+            if method == "is_empty" { return TYPE_BOOL }
+        }
+
         if obj_k == TyKind.Struct || obj_k == TyKind.Enum {
             let tname = ty_pool.get(obj_t).unwrap().name
             // sb3125 §3c rule-3: an unqualified call to a method defined by two
@@ -8794,8 +9023,11 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             // original ticket bug.
             if is_import_module_name(obj_name) != 0 && nr_is_defined(obj_name) == 0 && is_intrinsic_method(obj_name, method) != 0 {
                 if obj_name == "time" && method == "read" {
-                    let it = lookup_named_type("Instant")
-                    if it != -1 { return it }
+                    // b907wt: std.time is a prelude module (compiler.bl:1357), so the
+                    // declaration is normally present — but a silent fall-through when it
+                    // is not is the same fail-open erasure as the process builtins had.
+                    // Mint it, so the type is right whether or not std.time is in scope.
+                    return ensure_runtime_struct_type("Instant", ["nanos"], [TYPE_INT])
                 }
                 if obj_name == "time" && method == "sleep" { return TYPE_VOID }
             }
@@ -8838,25 +9070,44 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                     return mq_fs.ret
                 }
             }
+            // mjsbwm: every path below reads the receiver Ident as a TYPE NAME. A name with
+            // a binding in scope is a value, and `value.method()` is an instance call no
+            // matter what a same-spelled type could have offered — name resolution follows
+            // scope. Without this gate `let foo = 42; foo.bar()` silently adopted the return
+            // type of a free fn named `foo_bar`, and `let Widget = 7; Widget.make(3)` typed
+            // as Widget while emitting a call that ignored the binding. Deliberately mirrors
+            // the `nr_is_defined(obj_name) == 0` gate the module-qualified paths above
+            // already carry — but via the pure probe, so asking does not mark a read.
+            //
+            // Failing to resolve here is not the end of checking: the receiver was inferred
+            // above, so a struct/enum receiver has already been through
+            // tc_method_resolvable_on_type, and a scalar one falls through to Unknown and
+            // the codegen E0505 backstop. The wrong ANSWER is what this removes.
+            let obj_is_value = nr_has_binding(obj_name)
             // Static constructor on a sealed builtin type: Bytes.new(), Map.new(),
             // Set.new() mirror the bare-call forms in get_builtin_fn_ret.
-            if method == "new" && is_builtin_fn(obj_name) != 0 {
+            if method == "new" && is_builtin_fn(obj_name) != 0 && obj_is_value == 0 {
                 return get_builtin_fn_ret(obj_name)
             }
             // Static method on a builtin/named type: Type.from(x), Type.try_from(x), etc.
             // Trait-impl methods register under `{Type}_{trait}_{method}` (sb3125);
-            // From/TryFrom and inherent sigs keep the bare `{Type}_{method}` key.
-            let static_trait = tc_method_trait_names(obj_name, method)
-            if static_trait != "" && tc_method_trait_count(obj_name, method) == 1 {
-                let q_sig = lookup_fnsig("{obj_name}_{static_trait}_{method}")
-                if q_sig != -1 {
-                    return fnsig_pool.get(q_sig).unwrap().ret
+            // From/TryFrom and inherent sigs keep the bare `{Type}_{method}` key — which is
+            // how the stdlib spells a static constructor at all, since Blink has no inherent
+            // methods (sections/03c_protocols.md:758): `pub fn Duration_seconds(s: Int)`
+            // (lib/std/time.bl:3) IS `Duration.seconds(2)`.
+            if obj_is_value == 0 {
+                let static_trait = tc_method_trait_names(obj_name, method)
+                if static_trait != "" && tc_method_trait_count(obj_name, method) == 1 {
+                    let q_sig = lookup_fnsig("{obj_name}_{static_trait}_{method}")
+                    if q_sig != -1 {
+                        return fnsig_pool.get(q_sig).unwrap().ret
+                    }
                 }
-            }
-            let static_sig_name = "{obj_name}_{method}"
-            let static_sig = lookup_fnsig(static_sig_name)
-            if static_sig != -1 {
-                return fnsig_pool.get(static_sig).unwrap().ret
+                let static_sig_name = "{obj_name}_{method}"
+                let static_sig = lookup_fnsig(static_sig_name)
+                if static_sig != -1 {
+                    return fnsig_pool.get(static_sig).unwrap().ret
+                }
             }
         }
 
@@ -9582,8 +9833,47 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                 // rather than before the compare means it can never turn a reported
                 // mismatch into a silent success.
                 //
-                // Restricted to initializers that minted here — see tc_node_has_ret_mint.
-                if tc_node_has_ret_mint(val) != 0 {
+                // The mint gate is no longer the ONLY way in (sskpk8). It asks "did
+                // instantiate_return_type register a return-only metavar group for this call
+                // node", which only a GENERIC FN CALL ever does, so a builtin container ctor
+                // never qualified: `let m: Map[Str, List[Int]] = Map()` left the ctor node at
+                // `Map[α, β]` with both metavars unbound while the declared instantiation sat
+                // right there — the same defect 3dpshm was, one node kind over.
+                //
+                // The second way in is deliberately narrow, and each clause paid for itself by
+                // breaking a pinned test when it was absent:
+                //
+                //   • Map/Set HEAD only. The struct/enum heads tc_pin_admits_declared also
+                //     admits stay mint-gated. `let e: GT[QB[Int]] = GT { s: Set() }` binds a
+                //     FIELD's α, not the binding's, and making `Set[QB[Int]]` concrete drives
+                //     kops_table_name down its fail-closed branch — QB carries no Hash derive,
+                //     so there is genuinely no table and the compiler emits
+                //     BLINK_COMPILER_BUG_kops. That program's hazard is real and pre-existing
+                //     (the annotation-only hashability validators, br xcx9wc); revealing it is
+                //     not this ticket's job, and doing it here would report it as a C
+                //     compile error instead of a diagnostic.
+                //   • No bare typevar. `let m: Map[K, V] = Map()` inside `fn f[K, V]()` must
+                //     not be pinned: `α := K` trades a hole monomorphization can still fill
+                //     for one nothing can (tc_tid_has_bare_typevar), and it emitted
+                //     BLINK_COMPILER_BUG_kops_unsupported_K_ct23_ — the kops selector had been
+                //     recovering the concrete key from the instantiation.
+                //   • No alias. `let m: Map[Port, Int] = Map()` over `type Port = Int` keeps
+                //     `Port` in the tid's key slot while the annotation path lowers it to Int,
+                //     so pinning commits the un-canonical spelling and the i64 vtable is never
+                //     selected (tc_tid_has_alias, br bvh7qt).
+                //
+                // Two gates then remain inside tc_pin_tail_ret_generic and they are the shared
+                // ones: an admitted declared head, and an actually-unbound metavar in the value.
+                let mut pin_ok = tc_node_has_ret_mint(val) != 0
+                if pin_ok == false {
+                    let dk = type_kind(resolve_alias_tid(declared_tid))
+                    if dk == TyKind.Map || dk == TyKind.Set {
+                        if tc_tid_has_bare_typevar(declared_tid) == 0 && tc_tid_has_alias(declared_tid) == 0 {
+                            pin_ok = true
+                        }
+                    }
+                }
+                if pin_ok {
                     tc_pin_tail_ret_generic(declared_tid, inferred_tid)
                 }
             }
@@ -10463,14 +10753,18 @@ fn type_to_str(tid0: Int) -> Str {
         TyKind.U32 => return "U32"
         TyKind.U64 => return "U64"
         TyKind.Bytes => return "Bytes"
+        TyKind.StringBuilder => return "StringBuilder"
         TyKind.Unknown => return "?"
         TyKind.Typevar => return name
         TyKind.Enum => return name
-        // Unconstructible (br vag3wc): kept on the pre-match fall-through rendering.
-        TyKind.Closure => return name
+        // Channel/Handle are constructed since br vag3wc, so they render their inner rather
+        // than the bare name. The bare name is what made NotIterable read "cannot iterate over
+        // type 'Channel' -- only ... Channel ... implement iteration": one line contradicting
+        // itself. TyKind.Iterator stays UNCONSTRUCTED and keeps the bare-name rendering — see
+        // the note on tc_tid_child_count below (br qzdz2e).
         TyKind.Iterator => return name
-        TyKind.Handle => return name
-        TyKind.Channel => return name
+        TyKind.Handle => return "Handle[{type_to_str(t.inner1)}]"
+        TyKind.Channel => return "Channel[{type_to_str(t.inner1)}]"
         TyKind.List => return "List[{type_to_str(t.inner1)}]"
         TyKind.Option => return "Option[{type_to_str(t.inner1)}]"
         TyKind.Result => return "Result[{type_to_str(t.inner1)}, {type_to_str(t.inner2)}]"
@@ -10621,6 +10915,11 @@ fn tc_tid_tag_at(tid0: Int, tagpos: Int) -> Str {
         if k == TyKind.Channel { return "Channel" }
         if k == TyKind.Set { return "Set" }
         if k == TyKind.Bytes { return "Bytes" }
+        // Mirrors codegen's own two spellings for CT_STRINGBUILDER — Pascal at the
+        // carrier position (type_name_from_ct, codegen_types.bl:4517) and lowercase
+        // inside a segment (c_type_tag, :6094). Spelled on both sides so the tid path
+        // byte-matches the string path for a StringBuilder type arg (br 7cq6w2).
+        if k == TyKind.StringBuilder { return "StringBuilder" }
         if k == TyKind.I8 { return "I8" }
         if k == TyKind.I16 { return "I16" }
         if k == TyKind.I32 { return "I32" }
@@ -10648,7 +10947,7 @@ fn tc_tid_tag_at(tid0: Int, tagpos: Int) -> Str {
             dbg_trace("ctagvoid", "producer=genuine_void tid={tid} name={t.name}")
             return "Void"
         }
-        // A kind with no arm above (TyKind.Fn, TyKind.Closure, any kind added later). Fails
+        // A kind with no arm above (TyKind.Fn, any kind added later). Fails
         // CLOSED rather than sharing the genuine Void's spelling directly above: this is
         // not a type name, it is "this encoder does not know how to spell this kind", and
         // letting it read as "Void" is what made the two indistinguishable. The floor is
@@ -10669,6 +10968,7 @@ fn tc_tid_tag_at(tid0: Int, tagpos: Int) -> Str {
     if k == TyKind.Channel { return "channel" }
     if k == TyKind.Set { return "set" }
     if k == TyKind.Bytes { return "bytes" }
+    if k == TyKind.StringBuilder { return "stringbuilder" }
     if k == TyKind.Option { return "option" }
     if k == TyKind.Result { return "result" }
     if k == TyKind.I8 { return "i8" }
@@ -10693,7 +10993,7 @@ fn tc_tid_tag_at(tid0: Int, tagpos: Int) -> Str {
     // Result[Void, E] is not a corner case: lib/std/ depends on it (bytes.bl,
     // db_sqlite.bl, traits.bl) and the compiler synthesizes it for EVERY `?`-bearing
     // `test` block. The fall-through below is a SEPARATE bucket (kinds with no arm at
-    // all — TyKind.Fn, TyKind.Closure) that a genuine Void never reaches, and arming IT (br
+    // all — TyKind.Fn) that a genuine Void never reaches, and arming IT (br
     // vbcw1e Stage 2) does not touch this one.
     //
     // VERIFIED, not just traced: the 728-file corpus sweep for this arm's `voidtwin` tap
@@ -10725,7 +11025,7 @@ fn tc_tid_tag_at(tid0: Int, tagpos: Int) -> Str {
     }
     // Every kind with a real arm above is exhausted, and TyKind.Void/TyKind.Unknown are both
     // intercepted above too, so this is reached only by a kind this speller never learned
-    // (TyKind.Fn, TyKind.Closure). Stage 1 measured this bucket's floor at 0 over the full corpus.
+    // (TyKind.Fn). Stage 1 measured this bucket's floor at 0 over the full corpus.
     // Safe to arm because, per the TyKind.Void arm's comment above, a genuine Void can never
     // reach this line — only a kind this speller genuinely never learned does.
     if dbg_channel_on("voidtwin") != 0 { dbg_trace("voidtwin", "producer=scalar_unhandled_kind tid={tid} k={tk_name(k)}") }
@@ -10808,6 +11108,7 @@ fn tk_to_ct(kind: TyKind) -> Int {
         TyKind.Map => CT_MAP
         TyKind.Bytes => CT_BYTES
         TyKind.Set => CT_SET
+        TyKind.StringBuilder => CT_STRINGBUILDER
         TyKind.I8 => CT_I8
         TyKind.I16 => CT_I16
         TyKind.I32 => CT_I32
@@ -10819,7 +11120,6 @@ fn tk_to_ct(kind: TyKind) -> Int {
         // No CT exists for these. CT_VOID is the erasure, not a type.
         TyKind.Void => CT_VOID
         TyKind.Fn => CT_VOID
-        TyKind.Closure => CT_VOID
         TyKind.Tuple => CT_VOID
         TyKind.Typevar => CT_VOID
         TyKind.Unknown => CT_VOID
@@ -11315,12 +11615,19 @@ pub fn tc_tid_child_count(tid: Int) -> Int {
         TyKind.Str => 0
         TyKind.Void => 0
         TyKind.Bytes => 0
+        TyKind.StringBuilder => 0
         TyKind.Typevar => 0
         TyKind.Unknown => 0
-        TyKind.Closure => 0
+        // Channel/Handle carry one inner each since br vag3wc constructed them (element /
+        // result). TyKind.Iterator is still never produced: `Iterator[T]` is a TRAIT in
+        // sections/03c_protocols.md as well as a concrete return type in the List-methods
+        // table, and typecheck's own adapter table answers List[T] for .take/.skip — so
+        // constructing it would reject the spec-legal `let it: Iterator[Int] = a.take(2)`
+        // that is accepted today. Deciding which reading wins, and aligning the adapter
+        // return types with it, is br qzdz2e; this arm stays 0 until then.
         TyKind.Iterator => 0
-        TyKind.Handle => 0
-        TyKind.Channel => 0
+        TyKind.Handle => 1
+        TyKind.Channel => 1
         TyKind.I8 => 0
         TyKind.I16 => 0
         TyKind.I32 => 0
@@ -11368,12 +11675,13 @@ pub fn tc_tid_child(tid: Int, i: Int) -> Int {
         TyKind.Str => -1
         TyKind.Void => -1
         TyKind.Bytes => -1
+        TyKind.StringBuilder => -1
         TyKind.Typevar => -1
         TyKind.Unknown => -1
-        TyKind.Closure => -1
+        // Unconstructed — see tc_tid_child_count above (br qzdz2e).
         TyKind.Iterator => -1
-        TyKind.Handle => -1
-        TyKind.Channel => -1
+        TyKind.Handle => if i == 0 { t.inner1 } else { -1 }
+        TyKind.Channel => if i == 0 { t.inner1 } else { -1 }
         TyKind.I8 => -1
         TyKind.I16 => -1
         TyKind.I32 => -1
@@ -11522,7 +11830,7 @@ pub fn tc_tid_struct_mono_name(tid: Int) -> Str {
         let seg = tc_tid_struct_slot_seg(slot)
         if seg == "" { return "" }
         // Collapse, never interpolate (br vbcw1e): tc_tid_struct_slot_seg can answer a bare
-        // ICE_SEG_* sentinel (e.g. a TyKind.Fn/TyKind.Closure slot via tc_tid_to_c_tag's unhandled-kind
+        // ICE_SEG_* sentinel (e.g. a TyKind.Fn slot via tc_tid_to_c_tag's unhandled-kind
         // arm). Concatenating it here would bury it mid-identifier (Box_int_BLINK_I0001_...),
         // past where diag_is_ice_seg's prefix test at the downstream chokepoints can see it —
         // the same hazard this ticket closes for Option/Result/Map/Tuple, one struct level down.

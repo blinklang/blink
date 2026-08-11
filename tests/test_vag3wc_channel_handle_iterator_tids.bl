@@ -1,0 +1,330 @@
+// br vag3wc: `TyKind.Handle`, `TyKind.Channel`, `TyKind.Iterator` and `TyKind.Closure` are
+// never constructed, so an annotation naming one of them falls through to `make_typevar(name)`
+// — a BARE TYPEVAR wearing the type's name.
+//
+// `resolve_type_ann` (src/typecheck.bl) has arms for List / Option / Result / Map / Set /
+// Tuple / Bytes, then `resolve_type_name(name)`, then:
+//
+//     make_typevar(name)
+//
+// `is_primitive_type` already answers 1 for "Iterator" / "Handle" / "Channel", and
+// `new_type` is the SOLE writer of `TypePoolEntry.kind` — it is never called with those
+// three kinds (nor with `TyKind.Closure`), which is what Stage 0 of the tid collapse exposed
+// by making TyKind a real enum. So the kinds exist in the enum, `tk_to_ct` maps them to
+// CT_ITERATOR / CT_HANDLE / CT_CHANNEL, `tc_tid_tag_at` spells them — and every one of those
+// arms is unreachable. Four of 29 variants read as coverage while representing nothing.
+//
+// THE USER-VISIBLE CONSEQUENCE, and it is not cosmetic. `tc_check_body`'s deferred-iterable
+// test asks `iter_tk == TyKind.Channel`. A bare typevar is not that kind, so ANNOTATING a
+// channel breaks iterating it, while the same program without the annotation works:
+//
+//     let ch: Channel[Int] = Channel(4)
+//     for v in ch { }
+//     error[NotIterable]: cannot iterate over type 'Channel' with a `for` loop --
+//       only List, Set, Map, Range, Str, Bytes, Channel, and Iterator implement iteration
+//
+// The diagnostic contradicts itself in one line — it names Channel as iterable while
+// refusing a Channel — because `type_to_str` has no arm for the four kinds either and
+// renders the typevar as its bare name.
+//
+// WHY THIS GATES STAGE 3 of the tid collapse (03p551 / decisions Q2). Measured at Stage 2,
+// the four flat spellings are STRICTLY MORE INFORMATIVE than the tid:
+//
+//     var=cl tid=? flat=Fn(int64_t(*)(const blink_closure*, int64_t))
+//     var=ch tid=? flat=Channel[Int]
+//     var=h  tid=? flat=Handle[Int]
+//     var=it tid=? flat=Void
+//
+// Stage 3 flips authority onto the tid and Stage 4 deletes the flat fields. For these types
+// there would be nothing to read, so the divergence counter could never reach 0. Hence the
+// default this ticket records: CONSTRUCT them (direction (a)), do not delete the variants and
+// accept a private codegen universe (direction (b)), because (b) makes "the tid is the single
+// authority" false by construction.
+//
+// The four variants do NOT all land the same way, and the two exceptions are the interesting
+// part of the ticket:
+//
+//   `TyKind.Closure` is DELETED. `TyKind.Fn` is already constructed (`make_fn_type`), a
+//   closure's declared type is spelled `Fn(..) -> T`, and `tk_to_ct` collapsed both to
+//   CT_VOID — the variant represented nothing that Fn does not. A deletion is unobservable
+//   from a test, so the evidence is the second, independent TyKind enumeration in
+//   tests/test_tc_tid_structural_accessors.bl, which fails to COMPILE if a variant appears or
+//   disappears without that file being updated.
+//
+//   `TyKind.Iterator` is DEFERRED to br qzdz2e, and stays unconstructed. `Iterator[T]` is
+//   registered both as a builtin TRAIT (`tc_trait_names`, arity 1; `trait Iterator[T]` in
+//   sections/03c_protocols.md, with `impl IntoIterator[T] for List[T]`) and as a concrete
+//   builtin return type (`is_primitive_type`, CT_ITERATOR, and the `List[T] Methods` table
+//   documenting `.take/.skip/.chain/.flat_map -> Iterator[T]`). Typecheck's adapter table
+//   agrees with neither: `.take`/`.skip` infer `List[Int]`, `.chain` infers Unknown. Since
+//   `types_compatible`'s container family requires `ka == kb`, constructing the kind makes an
+//   `Iterator[T]` annotation reject every initializer that exists today — it would turn
+//   doc-conformant code into a hard error. That is a spec decision, not a representation one.
+//   The last row of this file is the regression guard for it.
+//
+// SCOPE. This ticket is the REPRESENTATION: the constructors, the annotation-path arms, and
+// the `type_to_str` rendering. The INFERENCE path — `Channel(4)`, `async.spawn(...)`, `.await`,
+// and the lazy adapter results, none of which `infer_type` has an arm for at all — is
+// br e0wmt6, which depends on this ticket precisely because it had nothing to construct.
+
+import compiler.{compile_to_program}
+import typecheck.{
+    check_types, tc_lookup_node_tid, tc_type_str, TyKind,
+    tc_tid_kind, tc_tid_child_count, tc_tid_child, tc_tid_name,
+}
+import parser.{nodes, node_kind, node_name}
+import ast.{NodeKind}
+import diagnostics.{diag_entries, diag_entry_count, diag_truncate}
+import std.io
+// Bare and LOAD-BEARING despite `warning[UnusedImport]` (br xrhq1c): codegen_types resolves
+// several globals it cannot import out of the MERGED program, and codegen_expr is the
+// smallest root whose transitive closure closes those back-references. Removing it fails the
+// C compile with `'expr_option_inner' undeclared` and friends.
+import codegen_expr
+
+fn assert_eq_str(got: Str, want: Str, label: Str) {
+    if got != want { io.println("FAIL: {label} — got '{got}', want '{want}'") }
+    assert(got == want)
+}
+
+fn assert_eq_int(got: Int, want: Int, label: Str) {
+    if got != want { io.println("FAIL: {label} — got {got}, want {want}") }
+    assert(got == want)
+}
+
+fn assert_true(got: Bool, label: Str) {
+    if !got { io.println("FAIL: {label} — expected true") }
+    assert(got)
+}
+
+// The tid on the LET NODE is the DECLARED type: typecheck publishes `final_tid` there and it
+// takes the annotation when one is present. That makes it the cheapest window onto
+// `resolve_type_ann`'s answer without exporting the resolver itself.
+fn let_tid(vname: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.LetBinding && node_name(i) == vname {
+            return tc_lookup_node_tid(i)
+        }
+        i = i + 1
+    }
+    -1
+}
+
+fn tid_str_of(tid: Int) -> Str {
+    if tid < 0 { return "NONE" }
+    tc_type_str(tid)
+}
+
+// A second, local spelling of the kind — deliberately NOT `type_kind_name` from typecheck.
+// A test that renders the kind through the same function it is checking would pass even if
+// both sides were wrong about the same variant.
+fn kind_str(k: TyKind) -> Str {
+    match k {
+        TyKind.Int => "Int"
+        TyKind.Float => "Float"
+        TyKind.Bool => "Bool"
+        TyKind.Str => "Str"
+        TyKind.Void => "Void"
+        TyKind.List => "List"
+        TyKind.Option => "Option"
+        TyKind.Result => "Result"
+        TyKind.Fn => "Fn"
+        TyKind.Struct => "Struct"
+        TyKind.Enum => "Enum"
+        TyKind.Typevar => "Typevar"
+        TyKind.Unknown => "Unknown"
+        TyKind.StringBuilder => "StringBuilder"
+        TyKind.Iterator => "Iterator"
+        TyKind.Handle => "Handle"
+        TyKind.Channel => "Channel"
+        TyKind.Tuple => "Tuple"
+        TyKind.Map => "Map"
+        TyKind.Bytes => "Bytes"
+        TyKind.Set => "Set"
+        TyKind.I8 => "I8"
+        TyKind.I16 => "I16"
+        TyKind.I32 => "I32"
+        TyKind.U8 => "U8"
+        TyKind.U16 => "U16"
+        TyKind.U32 => "U32"
+        TyKind.U64 => "U64"
+        TyKind.Char => "Char"
+    }
+}
+
+fn typecheck_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    write_file(path, src)
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    fs.remove(path)
+}
+
+// Diagnostics this probe adds with the given name. The shared global diag buffer is truncated
+// back to where it was found: an unflushed entry would read as a failure of whichever test in
+// this binary happens to flush next.
+fn count_diag(path: Str, src: Str, want_name: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    write_file(path, src)
+    let program = compile_to_program(path, 1)
+    let before = diag_entry_count()
+    check_types(program)
+    fs.remove(path)
+
+    let mut hits = 0
+    let mut i = before
+    while i < diag_entries.len() {
+        let d = diag_entries.get(i).unwrap()
+        if d.severity == "error" && d.name == want_name { hits = hits + 1 }
+        i = i + 1
+    }
+    diag_truncate(before)
+    hits
+}
+
+// Three DIFFERENT inner types on purpose: a shared `Int` would let a constructor that ignores
+// its argument and returns a cached entry pass every row below.
+fn three_annotations_src() -> Str {
+    #"fn probe() -> Int {
+    let mut a: List[Int] = []
+    a.push(1)
+    let it: Iterator[Int] = a.take(1)
+    let ch: Channel[Str] = Channel(2)
+    let h: Handle[Bool] = async.spawn(fn() { true })
+    0
+}
+"#
+}
+
+// ── Half A — the representation: the annotation produces the kind it names ──────
+
+test "Channel[Str] annotation is TyKind.Channel, not a typevar wearing the name" {
+    typecheck_probe("build/vag3wc_repr_ch.bl", three_annotations_src())
+    let tid = let_tid("ch")
+    assert_true(tid >= 0, "the annotated let carries a tid at all")
+    assert_eq_str(kind_str(tc_tid_kind(tid)), "Channel", "Channel[Str] annotation kind")
+    assert_eq_str(tc_tid_name(tid), "Channel", "Channel tid name")
+    assert_eq_int(tc_tid_child_count(tid), 1, "Channel child_count")
+    assert_eq_str(tid_str_of(tc_tid_child(tid, 0)), "Str", "Channel element")
+}
+
+test "Handle[Bool] annotation is TyKind.Handle" {
+    typecheck_probe("build/vag3wc_repr_h.bl", three_annotations_src())
+    let tid = let_tid("h")
+    assert_true(tid >= 0, "the annotated let carries a tid at all")
+    assert_eq_str(kind_str(tc_tid_kind(tid)), "Handle", "Handle[Bool] annotation kind")
+    assert_eq_int(tc_tid_child_count(tid), 1, "Handle child_count")
+    assert_eq_str(tid_str_of(tc_tid_child(tid, 0)), "Bool", "Handle result type")
+}
+
+// PINS THE DEFERRAL, and is expected to be REWRITTEN by br qzdz2e rather than to keep
+// passing: `Iterator[Int]` still resolves to a bare typevar named "Iterator", carrying no
+// element. This is a live Stage 3 divergence site — `tid=? flat=Iterator[Int]` — recorded
+// here so it is a named debt with an owner instead of a silent hole. When qzdz2e decides
+// whether `Iterator[T]` is a trait or a concrete carrier and aligns the adapter return
+// types, these three assertions become Iterator / 1 / "Int", exactly like Channel above.
+test "Iterator[Int] annotation is NOT yet TyKind.Iterator (br qzdz2e)" {
+    typecheck_probe("build/vag3wc_repr_it.bl", three_annotations_src())
+    let tid = let_tid("it")
+    assert_true(tid >= 0, "the annotated let carries a tid at all")
+    assert_eq_str(kind_str(tc_tid_kind(tid)), "Typevar", "Iterator[Int] annotation kind")
+    assert_eq_int(tc_tid_child_count(tid), 0, "Iterator carries no element yet")
+}
+
+// The rendering is not decoration: the NotIterable diagnostic below contradicted itself
+// because `type_to_str` fell through to the typevar's bare name, so "Channel" was what the
+// user was told about a value the compiler was refusing to treat as a Channel.
+test "the constructed two render with their element, not as a bare name" {
+    typecheck_probe("build/vag3wc_render.bl", three_annotations_src())
+    assert_eq_str(tid_str_of(let_tid("ch")), "Channel[Str]", "Channel renders its element")
+    assert_eq_str(tid_str_of(let_tid("h")), "Handle[Bool]", "Handle renders its result")
+    // Still the bare name, because still a typevar — see the pin above (br qzdz2e).
+    assert_eq_str(tid_str_of(let_tid("it")), "Iterator", "Iterator renders its bare name")
+}
+
+// ── Half B — the consequence: an annotated channel is iterable ─────────────────
+
+fn annotated_channel_for_src() -> Str {
+    #"fn main() {
+    let ch: Channel[Int] = Channel(4)
+    ch.send(5)
+    ch.close()
+    let mut t = 0
+    for v in ch { t = t + v }
+}
+"#
+}
+
+test "annotating a channel does not make it un-iterable" {
+    let hits = count_diag("build/vag3wc_for_ann.bl", annotated_channel_for_src(), "NotIterable")
+    assert_eq_int(hits, 0, "NotIterable errors for an annotated Channel[Int] for-loop")
+}
+
+fn unannotated_channel_for_src() -> Str {
+    #"fn main() {
+    let ch = Channel(4)
+    ch.send(5)
+    ch.close()
+    let mut t = 0
+    for v in ch { t = t + v }
+}
+"#
+}
+
+// The control that makes the row above a bug report rather than a preference: the SAME
+// program without the annotation always typechecked, so the annotation was the difference.
+test "the unannotated channel for-loop was never broken" {
+    let hits = count_diag("build/vag3wc_for_unann.bl", unannotated_channel_for_src(), "NotIterable")
+    assert_eq_int(hits, 0, "NotIterable errors for an unannotated channel for-loop")
+}
+
+// NotIterable must still fire where it belongs. Constructing the two kinds widens what
+// `is_deferred_iterable` accepts by KIND, and a widened accept that swallowed a real error
+// would be a worse outcome than the bug being fixed.
+fn for_over_int_src() -> Str {
+    #"fn main() {
+    let mut acc = 0
+    let n = 5
+    for x in n { acc = acc + x }
+}
+"#
+}
+
+test "for-in over an Int is still NotIterable" {
+    let hits = count_diag("build/vag3wc_for_int.bl", for_over_int_src(), "NotIterable")
+    assert_eq_int(hits, 1, "NotIterable errors for `for x in 5`")
+}
+
+// ── Half C — runtime: the programs the representation is for actually run ───────
+
+test "runtime: an annotated channel iterates" {
+    let ch: Channel[Int] = Channel(8)
+    ch.send(3)
+    ch.send(4)
+    ch.close()
+    let mut total = 0
+    for v in ch { total = total + v }
+    assert_eq_int(total, 7, "sum over an annotated Channel[Int]")
+}
+
+test "runtime: an annotated handle awaits" {
+    let h: Handle[Int] = async.spawn(fn() { 41 + 1 })
+    let got = h.await
+    assert_eq_int(got, 42, "await on an annotated Handle[Int]")
+}
+
+// THE REGRESSION GUARD for br qzdz2e. This program follows the documented `List[T] Methods`
+// table (`.take(n) -> Iterator[T]`) and compiles and runs today — but only because the
+// annotation degrades to a typevar that unifies with the `List[Int]` typecheck actually
+// infers for `.take`. Constructing `TyKind.Iterator` breaks it. Whichever way qzdz2e lands,
+// this row makes that program's status a deliberate choice: either it keeps working, or the
+// decision is to reject it and this row changes with a recorded reason.
+test "runtime: a documented Iterator[Int] annotation still compiles and runs" {
+    let mut a: List[Int] = []
+    a.push(1)
+    a.push(2)
+    a.push(3)
+    let it: Iterator[Int] = a.take(2)
+    let got = it.collect()
+    assert_eq_int(got.len(), 2, "collect length from an annotated Iterator[Int]")
+    assert_eq_int(got.get(0).unwrap(), 1, "collect element from an annotated Iterator[Int]")
+}

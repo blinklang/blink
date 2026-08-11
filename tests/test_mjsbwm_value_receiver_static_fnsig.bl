@@ -1,0 +1,207 @@
+// br mjsbwm: a method call on a VALUE receiver must not resolve to the free function
+// whose name happens to be `{receiver_name}_{method}`.
+//
+// src/typecheck.bl:8955 (the Ident-receiver block of the MethodCall inference arm) builds
+// a fnsig key by string concatenation:
+//
+//     let static_sig_name = "{obj_name}_{method}"
+//     let static_sig = lookup_fnsig(static_sig_name)
+//     if static_sig != -1 { return fnsig_pool.get(static_sig).unwrap().ret }
+//
+// That path exists for the stdlib's pseudo-static constructors, which are written as free
+// functions with a type-prefixed name — `pub fn Duration_seconds(s: Int) -> Duration`
+// (lib/std/time.bl:3) is what makes `Duration.seconds(2)` work, since Blink has no
+// inherent methods at all (sections/03c_protocols.md:758). It is right for a receiver that
+// NAMES A TYPE and wrong for anything else: unlike the module-qualified paths a few lines
+// above it, which are gated on `is_import_module_name(obj_name) != 0 && nr_is_defined(obj_name) == 0`,
+// these two static paths check nothing. So an ordinary local silently adopts an unrelated
+// function's return type, in pure user code, with only a warning:
+//
+//     fn foo_bar(x: Int) -> Str { "hi" }
+//     fn main() {
+//         let foo = 42
+//         let s: Int = foo.bar()      // typed Str, from foo_bar
+//     }
+//
+// -> warning[UnknownMethod] plus error[TypeError]: variable 's': declared type Int but got Str
+//
+// The second diagnostic is the damage: it blames the user's own correct annotation for
+// disagreeing with a type typecheck invented. Without the annotation `blink check` reports
+// `ok` outright and only `blink build` catches it, via the codegen E0505 backstop.
+//
+// Found while fixing 7cq6w2 (StringBuilder was not a representable type): with the receiver
+// Unknown, the compiler's own `sb.to_str()` was landing on lib/std/sb.bl:31's `sb_to_str`
+// through exactly this path — typing correctly for the wrong reason, and only for receivers
+// spelled `sb`. 7cq6w2 removed that dependency, which is what makes this fixable.
+
+import compiler.{compile_to_program}
+import typecheck.{check_types, tc_lookup_node_tid, tc_type_str}
+import parser.{nodes, node_kind, node_method}
+import ast.{NodeKind}
+import diagnostics.{diag_entries, diag_entry_count, diag_truncate}
+import std.io
+// Bare: codegen_types resolves several globals it cannot import out of the MERGED program,
+// and codegen_expr is the smallest root whose closure closes those back-references.
+import codegen_expr
+
+fn assert_eq_str(got: Str, want: Str, label: Str) {
+    if got != want { io.println("FAIL: {label} — got '{got}', want '{want}'") }
+    assert(got == want)
+}
+
+fn assert_ne_str(got: Str, forbidden: Str, label: Str) {
+    if got == forbidden { io.println("FAIL: {label} — got the forbidden '{got}'") }
+    assert(got != forbidden)
+}
+
+fn assert_true(got: Bool, label: Str) {
+    if !got { io.println("FAIL: {label} — expected true") }
+    assert(got)
+}
+
+// The type-string of the first `.{method}()` call node, or "NONE" when that node carries
+// no tid at all. Keyed on the method name so each assertion names the call it is about.
+fn method_call_ty(method: Str) -> Str {
+    let mut idx = 0
+    let n = nodes.len()
+    while idx < n {
+        if node_kind(idx) == NodeKind.MethodCall && node_method(idx) == method {
+            let tid = tc_lookup_node_tid(idx)
+            if tid < 0 { return "NONE" }
+            return tc_type_str(tid)
+        }
+        idx = idx + 1
+    }
+    "NONE"
+}
+
+fn type_of_first_call(path: Str, src: Str, method: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    write_file(path, src)
+    let program = compile_to_program(path, 1)
+    let before = diag_entry_count()
+    check_types(program)
+    fs.remove(path)
+    // These probes deliberately contain unresolvable calls; leave the shared global diag
+    // buffer as it was found so an error here cannot read as a failure of whichever test
+    // happens to flush next.
+    diag_truncate(before)
+    method_call_ty(method)
+}
+
+// ── Half A — the defect: a value receiver adopts `{name}_{method}` ────────────
+
+fn value_receiver_src() -> Str {
+    #"fn foo_bar(x: Int) -> Str {
+    "hi:{x}"
+}
+
+fn main() {
+    let foo = 42
+    let s = foo.bar()
+    assert(s.len() >= 0)
+}
+"#
+}
+
+test "an Int local does not adopt the return type of a free fn named {var}_{method}" {
+    let ty = type_of_first_call("build/mjsbwm_value_receiver.bl", value_receiver_src(), "bar")
+    // `foo` is an Int and Int has no `.bar()`. Whatever typecheck answers, it must not be
+    // `foo_bar`'s Str: that is an unrelated free function the user never called.
+    assert_ne_str(ty, "Str", "foo.bar() with `let foo = 42` must not take foo_bar's return type")
+}
+
+// ── Half B — the invented type must not become a diagnostic about the user ────
+
+fn annotated_src() -> Str {
+    #"fn foo_bar(x: Int) -> Str {
+    "hi"
+}
+
+fn main() {
+    let foo = 42
+    let s: Int = foo.bar()
+    assert(s == 0)
+}
+"#
+}
+
+test "the annotation is not blamed for disagreeing with an invented type" {
+    let path = "build/mjsbwm_annotated.bl"
+    write_file(path, annotated_src())
+    let program = compile_to_program(path, 1)
+    let before = diag_entry_count()
+    check_types(program)
+    fs.remove(path)
+
+    let mut blamed_annotation = false
+    let mut i = before
+    while i < diag_entries.len() {
+        let d = diag_entries.get(i).unwrap()
+        if d.name == "TypeError" && d.message.contains("got Str") {
+            blamed_annotation = true
+        }
+        i = i + 1
+    }
+    diag_truncate(before)
+    // The user wrote `let s: Int` and a call that resolves to nothing. Telling them their
+    // Int "got Str" points at the one line in the program that is not the problem.
+    assert_true(!blamed_annotation, "no TypeError may claim the Int annotation 'got Str' — Str is typecheck's own invention here")
+}
+
+// ── Half C — the path this must NOT break: a real pseudo-static ───────────────
+//
+// Blink has no inherent methods, so `Type.method(args)` on a free fn named
+// `Type_method` is the ONLY way the stdlib spells a static constructor
+// (`Duration.seconds`, `Instant.from_epoch_secs`). Declared locally rather than
+// imported from lib/std: this binary's `std.*` resolution is argv[0]-relative and the
+// harness builds test binaries into a directory with no `lib/std` beside them (exb557),
+// so a prelude-dependent probe would assert a mode-dependent answer.
+
+fn pseudo_static_src() -> Str {
+    #"type Widget {
+    v: Int
+}
+
+fn Widget_make(x: Int) -> Widget {
+    Widget { v: x }
+}
+
+fn main() {
+    let w = Widget.make(3)
+    assert(w.v == 3)
+}
+"#
+}
+
+test "a pseudo-static on a bare type name still resolves" {
+    let ty = type_of_first_call("build/mjsbwm_pseudo_static.bl", pseudo_static_src(), "make")
+    assert_eq_str(ty, "Widget", "Widget.make(3) resolves through the free fn Widget_make — the legitimate use of this path")
+}
+
+// ── Half D — scope wins: a value binding shadowing the type name ──────────────
+
+fn shadowed_type_src() -> Str {
+    #"type Widget {
+    v: Int
+}
+
+fn Widget_make(x: Int) -> Widget {
+    Widget { v: x }
+}
+
+fn main() {
+    let Widget = 7
+    let w = Widget.make(3)
+    assert(w.v == 3)
+}
+"#
+}
+
+test "a local binding shadowing a type name beats the pseudo-static" {
+    let ty = type_of_first_call("build/mjsbwm_shadowed_type.bl", shadowed_type_src(), "make")
+    // `Widget` here resolves to an Int local. Name resolution follows scope, so this is
+    // `.make()` on an Int — unresolvable, not a static constructor call. (Today it types
+    // as Widget and emits a call that ignores the binding entirely: the same probe run
+    // through `blink run` prints `<value>` for `w.v`.)
+    assert_ne_str(ty, "Widget", "with `let Widget = 7` in scope, Widget.make(3) is a method call on an Int, not a static")
+}

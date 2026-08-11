@@ -1,0 +1,198 @@
+// br dvzt90: `List.pop()` returns `Option[T]`, and typecheck must SAY so.
+//
+// The spec is unambiguous — `sections/03_types.md:390` shows `let last = items.pop()`
+// commented `// Some(9)`, and `lib/std/traits.bl:56` declares `fn pop(self) -> Option[T]`
+// in the trait that names the operation. Codegen has always agreed: the `.pop()` arms in
+// src/codegen_methods.bl:1285/1316 exist specifically to build `Option[Option[T]]` and
+// `Option[Result[T,E]]`. Typecheck alone disagreed, at src/typecheck.bl:8513:
+//
+//     if method == "pop" || method == "clear" { return TYPE_VOID }
+//
+// `clear` is genuinely Void; `pop` was sharing its arm. Nothing observable broke because
+// codegen's flat fields still govern emission, so the wrong answer was invisible from the
+// outside — it showed up only as four cells in the Stage 2 tid-divergence map
+// (`tid=Void flat=Option[...]`, family B2). That is exactly the kind of hole the collapse
+// cannot survive: Stage 3 makes the tid authoritative, at which point `Void` stops being a
+// cosmetic mislabel and starts erasing the value.
+//
+// Half B is the load-bearing half. A type typecheck computes but never CHECKS is not fixed,
+// just relabelled — so the declared-type mismatch must actually be reported.
+
+import compiler.{compile_to_program}
+import typecheck.{check_types, tc_lookup_node_tid, tc_type_str}
+import parser.{nodes, node_kind, node_method}
+import ast.{NodeKind}
+import diagnostics.{diag_entries, diag_entry_count, diag_truncate}
+import std.io
+// Bare and LOAD-BEARING, for the same reason as in test_7cq6w2_stringbuilder_type.bl:
+// codegen_types resolves several globals it cannot import out of the MERGED program, and
+// codegen_expr is the smallest root whose transitive closure closes those back-references.
+// `warning[UnusedImport]` fires on it and is wrong — removing it fails the C compile with
+// `'expr_option_inner' undeclared` and friends.
+import codegen_expr
+
+fn assert_eq_str(got: Str, want: Str, label: Str) {
+    if got != want { io.println("FAIL: {label} — got '{got}', want '{want}'") }
+    assert(got == want)
+}
+
+fn assert_true(got: Bool, label: Str) {
+    if !got { io.println("FAIL: {label} — expected true") }
+    assert(got)
+}
+
+// The type-string of the n-th (0-based) `.{method}()` call node, or "NONE" when that node
+// carries no tid. Indexed rather than first-match so one probe can hold several receivers.
+fn nth_method_call_ty(method: Str, n: Int) -> Str {
+    let mut seen = 0
+    let mut idx = 0
+    let ncount = nodes.len()
+    while idx < ncount {
+        if node_kind(idx) == NodeKind.MethodCall && node_method(idx) == method {
+            if seen == n {
+                let tid = tc_lookup_node_tid(idx)
+                if tid < 0 { return "NONE" }
+                return tc_type_str(tid)
+            }
+            seen = seen + 1
+        }
+        idx = idx + 1
+    }
+    "NONE"
+}
+
+fn typecheck_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    write_file(path, src)
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    fs.remove(path)
+}
+
+// ── Half A — the return type, at three element shapes ─────────────────────────
+//
+// Scalar, compound, and struct elements: the ticket reproduces with a scalar inside the
+// Option, which is what rules out the compound-element/CSV family as the cause. All three
+// belong here so a fix that only threads compound elements is not mistaken for a fix.
+
+fn pop_shapes_src() -> Str {
+    #"type Item {
+    v: Int
+}
+
+fn main() {
+    let mut a: List[Int] = []
+    a.push(1)
+    let pa = a.pop()
+
+    let mut b: List[Option[Int]] = []
+    b.push(Some(1))
+    let pb = b.pop()
+
+    let mut c: List[Item] = []
+    c.push(Item { v: 2 })
+    let pc = c.pop()
+
+    let mut d: List[List[Str]] = []
+    d.push(["x"])
+    let pd = d.pop()
+
+    a.clear()
+    assert(pa.is_some())
+    assert(pb.is_some())
+    assert(pc.is_some())
+    assert(pd.is_some())
+}
+"#
+}
+
+test "List.pop() types as Option[T] for a scalar element" {
+    typecheck_probe("build/dvzt90_shapes.bl", pop_shapes_src())
+    assert_eq_str(nth_method_call_ty("pop", 0), "Option[Int]", "List[Int].pop() is Option[Int], not Void")
+}
+
+test "List.pop() nests the Option for a compound element" {
+    typecheck_probe("build/dvzt90_shapes2.bl", pop_shapes_src())
+    // Codegen has built this shape by hand since gemr3z (codegen_methods.bl:1285); the
+    // wrapper must not collapse `Option[Option[Int]]` down to one level.
+    assert_eq_str(nth_method_call_ty("pop", 1), "Option[Option[Int]]", "List[Option[Int]].pop() is Option[Option[Int]]")
+}
+
+test "List.pop() keeps a struct and a nested-container element intact" {
+    typecheck_probe("build/dvzt90_shapes3.bl", pop_shapes_src())
+    assert_eq_str(nth_method_call_ty("pop", 2), "Option[Item]", "List[Item].pop() is Option[Item]")
+    assert_eq_str(nth_method_call_ty("pop", 3), "Option[List[Str]]", "List[List[Str]].pop() is Option[List[Str]]")
+}
+
+test "clear() is still Void — it was only sharing pop's arm" {
+    typecheck_probe("build/dvzt90_clear.bl", pop_shapes_src())
+    assert_eq_str(nth_method_call_ty("clear", 0), "Void", "clear() genuinely returns nothing")
+}
+
+// ── Half B — the computed type must participate in checking ───────────────────
+
+fn mismatch_src() -> Str {
+    #"fn main() {
+    let mut xs: List[Int] = []
+    xs.push(1)
+    let n: Int = xs.pop()
+    assert(n == 1)
+}
+"#
+}
+
+test "a popped value is checked against its declared type" {
+    let path = "build/dvzt90_mismatch.bl"
+    write_file(path, mismatch_src())
+    let program = compile_to_program(path, 1)
+    let before = diag_entry_count()
+    check_types(program)
+    fs.remove(path)
+
+    let mut saw_type_error = false
+    let mut i = before
+    while i < diag_entries.len() {
+        let d = diag_entries.get(i).unwrap()
+        if d.severity == "error" && d.name == "TypeError" { saw_type_error = true }
+        i = i + 1
+    }
+    // Leave the shared global diag buffer as it was found: an unflushed error here would
+    // read as a failure of whichever test in this binary happens to flush next.
+    diag_truncate(before)
+    // `let n: Int = xs.pop()` is wrong — the user owes an `.unwrap()`. With pop typed Void
+    // this was accepted silently, which is the whole reason the mislabel was survivable.
+    assert_true(saw_type_error, "declaring `let n: Int = xs.pop()` is a TypeError once pop() is known to return Option[Int]")
+}
+
+// ── Half C — the runtime half, which was always right and must stay right ─────
+
+test "pop still behaves at runtime" {
+    let mut xs: List[Int] = []
+    xs.push(3)
+    xs.push(4)
+    let last = xs.pop()
+    assert_true(last.is_some(), "runtime: pop on a non-empty list is Some")
+    assert(last.unwrap() == 4)
+    assert(xs.len() == 1)
+    let only = xs.pop()
+    assert(only.unwrap() == 3)
+    let empty = xs.pop()
+    // Codegen guards the empty case rather than trapping (see test_ajnk77's note).
+    assert_true(!empty.is_some(), "runtime: pop on an empty list is None")
+}
+
+test "pop of a nested-Option element produces a present outer Option at runtime" {
+    let mut ys: List[Option[Int]] = []
+    ys.push(Some(7))
+    let outer = ys.pop()
+    assert_true(outer.is_some(), "runtime: the outer Option is present")
+    // Reading THROUGH to the element stops here on purpose. `outer.unwrap().is_some()` and
+    // the equivalent nested `match` both fail today — the first with
+    // `error[UnresolvedMethod]: unresolved method '.is_some' on type Option[Int]` from the
+    // codegen backstop, the second with invalid C — because a let bound to a List reader
+    // records only the outer Option in codegen's flat ScopeVar (br tavvwj, family C). That
+    // is independent of this ticket: `.get()` has returned `Option[T]` since long before
+    // `.pop()` did, and it breaks identically, while the same shape written as an annotated
+    // literal (`let outer: Option[Option[Int]] = Some(Some(7))`) works for both readers.
+    // Asserting the nesting is still worthwhile, so Half A does it against typecheck's tid,
+    // which is where dvzt90 actually lives.
+}

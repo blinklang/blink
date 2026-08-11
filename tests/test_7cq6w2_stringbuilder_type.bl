@@ -1,0 +1,232 @@
+// br 7cq6w2: StringBuilder must be a type typecheck can REPRESENT.
+//
+// Codegen has had a first-class StringBuilder since forever — CT_STRINGBUILDER
+// (src/codegen_types.bl:49), lowering to `blink_sb*` (:5348), with a complete
+// method surface in emit_sb_method (src/codegen_methods.bl:2017). Typecheck had
+// no corresponding kind at all: `TyKind` (src/typecheck.bl:74) listed 29 variants
+// and none of them was StringBuilder, so `StringBuilder.new()` inferred Unknown
+// and every value derived from it — `sb.to_str()`, then `.len()` on that — was
+// Unknown too. That single hole is the second-largest cell in the Stage 2
+// divergence map (715 occurrences of `tid=? flat=StringBuilder`) and the head of
+// the Str/Int cascade families.
+//
+// It also produced a genuinely wrong ANSWER, not merely a missing one: with the
+// receiver Unknown, inference fell through to the static-call path at
+// src/typecheck.bl:8878, which builds a fnsig key by concatenation —
+// `"{obj_name}_{method}"`. For a receiver that happened to be spelled `sb` that
+// key is `sb_to_str`, lib/std/sb.bl:31's FFI free fn, so `sb.to_str()` typed as
+// Str for the WRONG reason while the identical call on a receiver named `zz`
+// stayed Unknown. (That collision is filed separately as mjsbwm; this file is
+// what removes the compiler's reliance on it — hence the deliberately
+// non-`sb` receiver names in the probes below.)
+//
+// Asserts typecheck's own tids, not runtime behaviour: the runtime was always
+// correct because codegen's flat path had the type. The final test in this file
+// is the runtime guard for that half.
+
+import compiler.{compile_to_program}
+import typecheck.{check_types, tc_lookup_node_tid, tc_type_str, tc_tid_kind, TyKind}
+import parser.{nodes, node_kind, node_method}
+import ast.{NodeKind}
+import diagnostics.{diag_entries, diag_entry_count, diag_truncate}
+import std.io
+// Bare, load-bearing for the same reason as in test_b907wt_runtime_backed_type_fail_open.bl:
+// codegen_types resolves several globals it cannot import out of the MERGED program, and
+// codegen_expr is the smallest root whose transitive closure closes those back-references.
+import codegen_expr
+
+fn assert_eq_int(got: Int, want: Int, label: Str) {
+    if got != want { io.println("FAIL: {label} — got {got}, want {want}") }
+    assert(got == want)
+}
+
+fn assert_eq_str(got: Str, want: Str, label: Str) {
+    if got != want { io.println("FAIL: {label} — got '{got}', want '{want}'") }
+    assert(got == want)
+}
+
+fn assert_true(got: Bool, label: Str) {
+    if !got { io.println("FAIL: {label} — expected true") }
+    assert(got)
+}
+
+fn find_tid_by_str(want: Str) -> Int {
+    let mut idx = 0
+    let n = nodes.len()
+    while idx < n {
+        let tid = tc_lookup_node_tid(idx)
+        if tid >= 0 && tc_type_str(tid) == want {
+            return tid
+        }
+        idx = idx + 1
+    }
+    -1
+}
+
+// DISTINCT tid values among nodes typed `want`. A linear scan, not a Map keyed by
+// the type-string: a Map would dedup on its own and could never observe two pool
+// entries that merely SPELL the same.
+fn count_distinct_tids_by_str(want: Str) -> Int {
+    let mut distinct: List[Int] = []
+    let mut idx = 0
+    let n = nodes.len()
+    while idx < n {
+        let tid = tc_lookup_node_tid(idx)
+        if tid >= 0 && tc_type_str(tid) == want {
+            let mut found = false
+            let mut j = 0
+            while j < distinct.len() {
+                if distinct.get(j).unwrap() == tid { found = true }
+                j = j + 1
+            }
+            if !found { distinct.push(tid) }
+        }
+        idx = idx + 1
+    }
+    distinct.len()
+}
+
+fn count_nodes_by_str(want: Str) -> Int {
+    let mut n_hit = 0
+    let mut idx = 0
+    let n = nodes.len()
+    while idx < n {
+        let tid = tc_lookup_node_tid(idx)
+        if tid >= 0 && tc_type_str(tid) == want {
+            n_hit = n_hit + 1
+        }
+        idx = idx + 1
+    }
+    n_hit
+}
+
+// The type-string of the first `.{method}()` call node, or "NONE" when the node
+// carries no tid. Keyed on the method NAME so each assertion below names the
+// call it is about instead of a node index that shifts when the probe changes.
+fn method_call_ty(method: Str) -> Str {
+    let mut idx = 0
+    let n = nodes.len()
+    while idx < n {
+        if node_kind(idx) == NodeKind.MethodCall && node_method(idx) == method {
+            let tid = tc_lookup_node_tid(idx)
+            if tid < 0 { return "NONE" }
+            return tc_type_str(tid)
+        }
+        idx = idx + 1
+    }
+    "NONE"
+}
+
+// ── Half A — the constructor, the annotation, and the derived chain ──────────
+//
+// Receivers are named `buf`/`cap`, never `sb`: a receiver spelled `sb` resolves
+// through the `sb_to_str` free-fn collision (mjsbwm) and would pass this test
+// with StringBuilder still unrepresentable.
+
+fn sb_probe_src() -> Str {
+    #"fn take_sb(buf: StringBuilder) -> Int {
+    buf.len()
+}
+
+fn main() {
+    let buf = StringBuilder.new()
+    buf.write("x")
+    buf.write_char("y")
+    let s = buf.to_str()
+    let n = take_sb(buf)
+    let cap = StringBuilder.with_capacity(8)
+    let is_e = cap.is_empty()
+    let c = cap.capacity()
+    cap.clear()
+    assert(s.len() == n)
+    assert(is_e)
+    assert(c >= 0)
+}
+"#
+}
+
+test "StringBuilder is a representable type with one interned tid" {
+    let path = "build/7cq6w2_sb_probe.bl"
+    write_file(path, sb_probe_src())
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    fs.remove(path)
+
+    let tid = find_tid_by_str("StringBuilder")
+    assert_true(tid >= 0, "a StringBuilder tid is observed — typecheck must be able to name the type codegen emits as blink_sb*")
+    assert_true(tc_tid_kind(tid) == TyKind.StringBuilder, "the StringBuilder tid is its own kind, not a struct or a handle")
+    assert_eq_int(count_distinct_tids_by_str("StringBuilder"), 1, "the constructor, with_capacity, the param annotation and every binding share ONE interned tid")
+    // new() + its let, with_capacity() + its let, the param annotation, and the
+    // three receiver Idents (`buf.to_str()`, `take_sb(buf)`, `cap.is_empty()`).
+    assert_true(count_nodes_by_str("StringBuilder") >= 5, "the constructor call AND its let binding carry the type — a fix that types only the call leaves the chain erased")
+}
+
+test "methods on a StringBuilder receiver type their returns" {
+    let path = "build/7cq6w2_sb_methods_probe.bl"
+    write_file(path, sb_probe_src())
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    fs.remove(path)
+
+    assert_eq_str(method_call_ty("to_str"), "Str", "buf.to_str() is Str")
+    assert_eq_str(method_call_ty("len"), "Int", "buf.len() is Int")
+    assert_eq_str(method_call_ty("is_empty"), "Bool", "cap.is_empty() is Bool")
+    assert_eq_str(method_call_ty("capacity"), "Int", "cap.capacity() is Int")
+    assert_eq_str(method_call_ty("write"), "Void", "buf.write(x) is Void")
+    assert_eq_str(method_call_ty("write_char"), "Void", "buf.write_char(c) is Void")
+    assert_eq_str(method_call_ty("clear"), "Void", "cap.clear() is Void")
+}
+
+// ── Half B — the declared type must not be a silent mismatch ─────────────────
+//
+// The chain being typed is only useful if the type participates in checking:
+// with StringBuilder Unknown, `let s: Int = buf.to_str()` was accepted.
+
+fn mismatch_probe_src() -> Str {
+    #"fn main() {
+    let buf = StringBuilder.new()
+    let s: Int = buf.to_str()
+    assert(s == 0)
+}
+"#
+}
+
+test "a StringBuilder-derived value is checked against its declared type" {
+    let path = "build/7cq6w2_sb_mismatch_probe.bl"
+    write_file(path, mismatch_probe_src())
+    let program = compile_to_program(path, 1)
+    let before = diag_entry_count()
+    check_types(program)
+    fs.remove(path)
+
+    let mut saw_type_error = false
+    let mut i = before
+    while i < diag_entries.len() {
+        let d = diag_entries.get(i).unwrap()
+        if d.severity == "error" && d.name == "TypeError" { saw_type_error = true }
+        i = i + 1
+    }
+    // Leave the buffer as it was found: this binary shares the compiler's global
+    // diag state with every other test in the file, and an unflushed error here
+    // would read as a failure of whichever test happens to flush.
+    diag_truncate(before)
+    assert_true(saw_type_error, "declaring `let s: Int = buf.to_str()` is a TypeError once to_str() is known to return Str")
+}
+
+// ── Half C — the runtime half, which was always right and must stay right ────
+
+test "StringBuilder still behaves at runtime" {
+    let buf = StringBuilder.new()
+    buf.write("ab")
+    buf.write("{3}")
+    assert_eq_str(buf.to_str(), "ab3", "runtime: write + to_str")
+    assert_eq_int(buf.len(), 3, "runtime: len")
+    assert_true(!buf.is_empty(), "runtime: is_empty on a written builder")
+    buf.clear()
+    assert_true(buf.is_empty(), "runtime: is_empty after clear")
+
+    let cap = StringBuilder.with_capacity(16)
+    assert_true(cap.capacity() >= 16, "runtime: with_capacity")
+    cap.write_char("z")
+    assert_eq_str(cap.to_str(), "z", "runtime: write_char")
+}

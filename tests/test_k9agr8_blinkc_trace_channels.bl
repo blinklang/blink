@@ -1,0 +1,95 @@
+// br k9agr8: `build/blinkc` must honour BLINK_TRACE_CHANNELS.
+//
+// dbg_trace's sink (src/ast.bl:230) gates on the mutable global `dbg_channels`, and only
+// ONE binary ever set it: src/cli.bl:3520 reads the env var at the top of `main`. The
+// compiler binary src/blinkc_main.bl never did, so every `dbg_trace` channel was
+// permanently dark there — the trace call sites are compiled in, the env var is set, and
+// nothing is emitted.
+//
+// That matters beyond convenience. `build/blinkc` is the only MONOLITHIC emitter: `blink
+// build` has no monolith flag (`--emit binary|c|per-module-dir`), so an archive-linked
+// sweep is the only one the tid-collapse divergence counter (the `tydiv` channel) could
+// be measured in. The two build modes take different codegen paths and a sweep in one is
+// not coverage of the other (feedback_corpus_sweep_is_not_coverage), so Stage 3's exit
+// criterion — the counter at 0 in BOTH modes — was unmeasurable in half of them.
+//
+// Asserts through a real child process rather than by calling dbg_channel_on directly:
+// the defect was never in the sink, it was in one binary's startup, and only spawning
+// that binary can observe its startup.
+
+import std.process.{ProcessResult}
+
+let PROBE_SRC: Str = #"fn main() {
+    let xs: List[Int] = [1, 2, 3]
+    let m: Map[Str, Int] = Map()
+    m.insert("a", xs.len())
+    io.println("{m.len()}")
+}
+"#
+
+fn probe_path() -> Str { "build/k9agr8_probe.bl" }
+
+// blinkc, with the environment stated explicitly in both directions: `env VAR=...` for the
+// on case, `env -u VAR` for the off case. Inheriting the harness's own environment would
+// make the control pass or fail depending on how the suite was invoked.
+fn run_blinkc(env_prefix: Str) -> ProcessResult {
+    process_run("sh", ["-c", "{env_prefix} build/blinkc {probe_path()} build/k9agr8_probe.c 2>&1"])
+}
+
+fn have_blinkc() -> Bool {
+    file_exists("build/blinkc") == 1
+}
+
+test "blinkc emits dbg_trace rows when BLINK_TRACE_CHANNELS names a channel" {
+    if !have_blinkc() {
+        skip("build/blinkc is not present in this working tree")
+        return
+    }
+    write_file(probe_path(), PROBE_SRC)
+    let r = run_blinkc("env BLINK_TRACE_CHANNELS=tydiv")
+    fs.remove(probe_path())
+    // 2>&1 above: the sink writes to stderr, and folding it into stdout keeps this
+    // assertion independent of which stream a future dbg_trace picks.
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("[dbg:tydiv]"))
+}
+
+test "blinkc stays silent when the env var is unset" {
+    if !have_blinkc() {
+        skip("build/blinkc is not present in this working tree")
+        return
+    }
+    write_file(probe_path(), PROBE_SRC)
+    let r = run_blinkc("env -u BLINK_TRACE_CHANNELS")
+    fs.remove(probe_path())
+    // Empty channel list must cost nothing and print nothing — the trace surface is a
+    // debugging tap, not output.
+    assert_eq(r.exit_code, 0)
+    assert(!r.out.contains("[dbg:"))
+}
+
+test "an unrelated channel name does not turn tydiv on" {
+    if !have_blinkc() {
+        skip("build/blinkc is not present in this working tree")
+        return
+    }
+    write_file(probe_path(), PROBE_SRC)
+    let r = run_blinkc("env BLINK_TRACE_CHANNELS=nosuchchannel")
+    fs.remove(probe_path())
+    // dbg_channel_on matches whole comma-delimited segments; wiring the var up must not
+    // degrade into "any non-empty value means all".
+    assert_eq(r.exit_code, 0)
+    assert(!r.out.contains("[dbg:tydiv]"))
+}
+
+test "the wildcard turns tydiv on" {
+    if !have_blinkc() {
+        skip("build/blinkc is not present in this working tree")
+        return
+    }
+    write_file(probe_path(), PROBE_SRC)
+    let r = run_blinkc("env BLINK_TRACE_CHANNELS=all")
+    fs.remove(probe_path())
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("[dbg:tydiv]"))
+}

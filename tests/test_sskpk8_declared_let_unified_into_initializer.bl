@@ -1,0 +1,337 @@
+// br sskpk8: an annotated `let`'s declared type must be UNIFIED INTO the initializer, not
+// only compared against it.
+//
+// The LetBinding arm (src/typecheck.bl) already holds both halves of the answer:
+//
+//     if assignment_types_compatible(declared_tid, inferred_tid, val) == 0 { ...error... }
+//     else {
+//         if tc_node_has_ret_mint(val) != 0 { tc_pin_tail_ret_generic(declared_tid, inferred_tid) }
+//     }
+//
+// `tc_pin_tail_ret_generic` IS the unify (`tc_unify(d, inferred_ret)`), and
+// `tc_pin_admits_declared` admits `Map`/`Set` unconditionally. The only thing keeping
+// `let m: Map[Str, List[Int]] = Map()` unpinned was the caller-side `tc_node_has_ret_mint`
+// pre-check: that registry is populated by `instantiate_return_type`, i.e. only for a
+// GENERIC FN CALL with a return-only type param (3dpshm). A builtin container ctor mints no
+// such group, so the pin never ran and the ctor node kept `Map[α, β]` with both metavars
+// unbound:
+//
+//     let m: Map[Str, List[Int]] = Map()
+//        let m: node=6  kind=LetBinding tid=Map[Str, List[Int]]      <- right
+//          init m: node=5 kind=Call     tid=Map[?, ?]                 <- wrong
+//
+// The BINDING was never wrong — `final_tid` takes the declared type. The initializer node
+// was, and that is what makes this a Stage-3 prerequisite rather than cosmetics: codegen's
+// `let_binding_tid` documents the initializer as the weakest of its three tid sources
+// precisely because of this bug, and Stage 3 removes the other two. Measured at Stage 2 as
+// `tid=Map[?, ?] flat=Map[Str, List[Int]]` — the flat universe being MORE precise than
+// typecheck is the tell.
+//
+// Half B is the load-bearing half. Unification runs only in the branch where
+// `assignment_types_compatible` ALREADY agreed, so it must be impossible for the pin to turn
+// a reported mismatch into a silent success, and a genuinely under-determined initializer
+// must still reach the E0301 boundary (decisions 8vcj2c: an under-determined type is an
+// error, never a silent unbound metavar).
+
+import compiler.{compile_to_program}
+import typecheck.{check_types, tc_lookup_node_tid, tc_type_str}
+import parser.{nodes, node_kind, node_name, node_value}
+import ast.{NodeKind}
+import diagnostics.{diag_entries, diag_entry_count, diag_truncate}
+import std.io
+// Bare and LOAD-BEARING despite `warning[UnusedImport]` (br xrhq1c): codegen_types resolves
+// several globals it cannot import out of the MERGED program, and codegen_expr is the
+// smallest root whose transitive closure closes those back-references. Removing it fails the
+// C compile with `'expr_option_inner' undeclared` and friends.
+import codegen_expr
+
+type Port = Int
+
+fn assert_eq_str(got: Str, want: Str, label: Str) {
+    if got != want { io.println("FAIL: {label} — got '{got}', want '{want}'") }
+    assert(got == want)
+}
+
+fn assert_true(got: Bool, label: Str) {
+    if !got { io.println("FAIL: {label} — expected true") }
+    assert(got)
+}
+
+fn tid_str(n: Int) -> Str {
+    if n < 0 { return "NONE" }
+    let tid = tc_lookup_node_tid(n)
+    if tid < 0 { return "NONE" }
+    tc_type_str(tid)
+}
+
+// The type-string of the INITIALIZER of the `let` named `vname`, which is the node this
+// ticket is about. `let_ty` is its sibling for the binding itself, kept so the tests can
+// show that the two answers used to disagree.
+fn init_ty(vname: Str) -> Str {
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.LetBinding && node_name(i) == vname {
+            return tid_str(node_value(i))
+        }
+        i = i + 1
+    }
+    "NO-LET"
+}
+
+fn let_ty(vname: Str) -> Str {
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.LetBinding && node_name(i) == vname {
+            return tid_str(i)
+        }
+        i = i + 1
+    }
+    "NO-LET"
+}
+
+fn typecheck_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    write_file(path, src)
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    fs.remove(path)
+}
+
+// Diagnostics this probe adds with the given name+severity. The shared global diag buffer is
+// truncated back to where it was found: an unflushed entry would read as a failure of
+// whichever test in this binary happens to flush next.
+fn count_diag(path: Str, src: Str, want_name: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    write_file(path, src)
+    let program = compile_to_program(path, 1)
+    let before = diag_entry_count()
+    check_types(program)
+    fs.remove(path)
+
+    let mut hits = 0
+    let mut i = before
+    while i < diag_entries.len() {
+        let d = diag_entries.get(i).unwrap()
+        if d.severity == "error" && d.name == want_name { hits = hits + 1 }
+        i = i + 1
+    }
+    diag_truncate(before)
+    hits
+}
+
+// ── Half A — the declared type reaches the initializer node ────────────────────
+//
+// Scalar params, a nested container param, and Set as well as Map: the ticket reproduces
+// with the flat `Map[Int, Str]`, which rules out the compound-value/CSV family as the cause,
+// so a fix that only threads compound values must not be mistaken for a fix.
+
+fn ctor_shapes_src() -> Str {
+    #"fn main() {
+    let m: Map[Str, List[Int]] = Map()
+    let g: Map[Int, Str] = Map()
+    let s: Set[Str] = Set()
+    let n: Map[Str, Map[Int, Bool]] = Map()
+    m.insert("k", [1])
+    g.insert(1, "v")
+    s.insert("x")
+    n.insert("k", Map())
+    assert(m.len() == 1)
+    assert(g.len() == 1)
+    assert(s.len() == 1)
+    assert(n.len() == 1)
+}
+"#
+}
+
+test "an annotated let pins its Map() initializer with a compound value type" {
+    typecheck_probe("build/sskpk8_a1.bl", ctor_shapes_src())
+    // Was `Map[?, ?]`. The binding was always right, which is why nothing observable broke.
+    assert_eq_str(let_ty("m"), "Map[Str, List[Int]]", "the binding was never the problem")
+    assert_eq_str(init_ty("m"), "Map[Str, List[Int]]", "the Map() ctor node carries the declared type")
+}
+
+test "the same pin happens for all-scalar params" {
+    typecheck_probe("build/sskpk8_a2.bl", ctor_shapes_src())
+    // Both params scalar — no compound element anywhere, so this cannot be explained by the
+    // nested-element/CSV family.
+    assert_eq_str(init_ty("g"), "Map[Int, Str]", "Map[Int, Str] = Map() pins both scalar params")
+}
+
+test "Set() is pinned identically to Map()" {
+    typecheck_probe("build/sskpk8_a3.bl", ctor_shapes_src())
+    // tc_pin_admits_declared admits Map and Set on the same line; the test holds it to that.
+    assert_eq_str(init_ty("s"), "Set[Str]", "Set[Str] = Set() pins its element")
+}
+
+test "a nested container value type is pinned to full depth" {
+    typecheck_probe("build/sskpk8_a4.bl", ctor_shapes_src())
+    // Depth >= 2 is the whole reason the collapse exists: the flat universe cannot express
+    // this, so the tid is the only source that ever could.
+    assert_eq_str(init_ty("n"), "Map[Str, Map[Int, Bool]]", "Map[Str, Map[Int, Bool]] pins to full depth")
+}
+
+// ── Half B — the pin cannot launder a mismatch, and cannot hide E0301 ──────────
+
+fn mismatch_src() -> Str {
+    #"fn main() {
+    let m: Map[Str, Int] = Set()
+    assert(m.len() == 0)
+}
+"#
+}
+
+test "a declared/initializer mismatch is still reported" {
+    let hits = count_diag("build/sskpk8_b1.bl", mismatch_src(), "TypeError")
+    // The pin lives in the COMPATIBLE branch only. If it ever moves ahead of the compare,
+    // unifying `Map[Str, Int]` into `Set[?]` could bind the Set's metavar and make this
+    // silent — the exact failure mode that placement prevents.
+    assert_true(hits > 0, "declared Map[Str, Int] with a Set() initializer is a TypeError")
+}
+
+fn undetermined_src() -> Str {
+    #"fn main() {
+    let m = Map()
+    assert(m.len() == 0)
+}
+"#
+}
+
+test "an unannotated empty ctor is still error[CannotInferType]" {
+    let hits = count_diag("build/sskpk8_b2.bl", undetermined_src(), "CannotInferType")
+    // decisions 8vcj2c: under-determined is an ERROR, never a silently unbound metavar.
+    // With no annotation there is nothing to pin, so E0301 must still be what fires.
+    assert_true(hits > 0, "no annotation and no later use is E0301, not a silent Map[?, ?]")
+}
+
+// ── Half C — the pin does not disturb what already worked, and still runs ──────
+
+fn generic_ctor_src() -> Str {
+    #"type Box[T] {
+    v: T
+}
+
+fn mk[T]() -> Box[T] {
+    Box { v: default_of() }
+}
+
+fn default_of[T]() -> T {
+    panic("unused")
+}
+
+fn main() {
+    let b: Box[Int] = mk()
+    io.println("{b.v}")
+}
+"#
+}
+
+test "the generic-fn return mint path still pins (3dpshm control)" {
+    typecheck_probe("build/sskpk8_c1.bl", generic_ctor_src())
+    // This one went through the tc_node_has_ret_mint gate before the fix. It must keep
+    // working after the gate is broadened, or the fix traded one hole for another.
+    assert_eq_str(init_ty("b"), "Box[Int]", "an annotated let still pins a generic fn's return-only T")
+}
+
+fn typevar_declared_src() -> Str {
+    #"fn mk[K, V](k: K, v: V) -> Int {
+    let m: Map[K, V] = Map()
+    m.insert(k, v)
+    m.len()
+}
+
+fn main() {
+    io.println("{mk(256, "a")}")
+}
+"#
+}
+
+test "a typevar-parameterized declared type is NOT pinned" {
+    typecheck_probe("build/sskpk8_c3.bl", typevar_declared_src())
+    // α and K are both "not concrete yet" and are NOT interchangeable. α can still be bound —
+    // by a later use, an argument unify, or monomorphization; a bare typevar cannot be bound
+    // at all (tc_unify's typevar arm returns 1 without binding), so `α := K` trades a solvable
+    // hole for an unsolvable one. Left unpinned, the tid says `Map[?, ?]` and the kops selector
+    // keeps recovering the concrete key from the instantiation. Pinning it emitted
+    // `BLINK_COMPILER_BUG_kops_unsupported_K_ct23_` into the C — this row is that regression.
+    assert_eq_str(init_ty("m"), "Map[?, ?]", "Map[K, V] = Map() inside fn mk[K, V] stays unpinned")
+}
+
+test "the typevar-declared generic fn still selects the int kops at runtime" {
+    // The C-level guard for the row above: a 0x00-leading int key round-trips only if the
+    // integer vtable was selected. The string vtable strcmp-dedups 256 and 512 to one entry.
+    let mut m: Map[Int, Str] = Map()
+    m.insert(256, "a")
+    m.insert(512, "b")
+    assert(m.len() == 2)
+    assert_eq_str(m.get(256).unwrap(), "a", "256 and 512 are distinct keys — integer kops")
+}
+
+fn alias_declared_src() -> Str {
+    #"type Port = Int
+
+fn main() {
+    let mut m: Map[Port, Int] = Map()
+    m.insert(80, 1)
+    m.insert(443, 2)
+    assert(m.len() == 2)
+}
+"#
+}
+
+test "a declared type containing an alias is NOT pinned (bvh7qt workaround)" {
+    typecheck_probe("build/sskpk8_c4.bl", alias_declared_src())
+    // Pinned as a WORKAROUND, not as intended behaviour. resolve_alias_tid peels only the
+    // outermost alias, so the tid's key slot keeps `Port` while the annotation path lowers it
+    // to Int — two spellings of one type, and committing the un-canonical one to the ctor node
+    // loses the i64 vtable (test_f8t5wb row 17). Refusing to pin leaves the shape on the
+    // pre-existing annotation path, which is right. When bvh7qt lands a structural alias
+    // resolver, this row should flip to `Map[Int, Int]` and tc_tid_has_alias should come out.
+    assert_eq_str(init_ty("m"), "Map[?, ?]", "an aliased key defers to the annotation path for now")
+}
+
+test "an aliased Map key still hashes as its base type at runtime" {
+    // The C-level guard for the row above: 80 and 443 stay distinct keys only under the
+    // integer vtable, so this is what would break if the un-canonical pin were committed.
+    let mut m: Map[Port, Int] = Map()
+    m.insert(80, 1)
+    m.insert(443, 2)
+    assert(m.len() == 2)
+    assert(m.get(443).unwrap() == 2)
+}
+
+test "a monomorphic initializer is untouched" {
+    typecheck_probe("build/sskpk8_c2.bl", #"fn main() {
+    let xs: List[Int] = []
+    let i: Int = 3
+    assert(xs.len() == 0)
+    assert(i == 3)
+}
+"#)
+    // tc_pin_admits_declared rejects List and every scalar, so these must read exactly as
+    // they did — the pin is not allowed to become "unify every annotated let".
+    assert_eq_str(let_ty("i"), "Int", "a scalar binding is unaffected")
+    assert_eq_str(let_ty("xs"), "List[Int]", "a List binding is unaffected")
+}
+
+test "the pinned containers still work at runtime" {
+    let m: Map[Str, List[Int]] = Map()
+    m.insert("a", [1, 2])
+    assert(m.len() == 1)
+    assert(m.get("a").unwrap().len() == 2)
+
+    let s: Set[Str] = Set()
+    s.insert("x")
+    assert_true(s.contains("x"), "runtime: the pinned Set holds its element")
+
+    let n: Map[Str, Map[Int, Bool]] = Map()
+    let inner: Map[Int, Bool] = Map()
+    inner.insert(1, true)
+    n.insert("k", inner)
+    assert(n.len() == 1)
+    assert_true(n.contains_key("k"), "runtime: the depth-2 map holds its key")
+    // Reading THROUGH to the inner map stops here on purpose. `n.get("k").unwrap().get(1)`
+    // fails to compile with `unresolved method '.get' on type Map[Int, Bool]` — codegen
+    // NAMES the receiver correctly and still has no dispatchable method for it, because a
+    // value recovered from a container reader keeps only the outer level in codegen's flat
+    // `ScopeVar` (br tavvwj, family C). Independent of this ticket and unaffected by it: the
+    // failure is on the read side, while sskpk8 is about the ctor node's tid, which Half A
+    // asserts directly. Expected to be subsumed by Stage 3.
+}

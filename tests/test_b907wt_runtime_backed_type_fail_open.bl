@@ -1,0 +1,220 @@
+// br b907wt: typecheck must not fail OPEN to Void for runtime-backed compiler-known types.
+//
+// `ProcessResult` and `Instant` are compiler-known types whose C struct lives in the
+// runtime (bootstrap/runtime_process.h:10, and CT_INSTANT in codegen_types.bl:246), and
+// codegen names them without any Blink declaration: src/codegen.bl:634 wires
+// reg_fn_struct_ret("process_pid_wait", "ProcessResult") and :650-652 registers the three
+// fields. So `let r = process_pid_wait(pid)` compiles and runs correctly even in a file
+// that never writes `import std.process` — src/cli.bl:2187 is exactly that shape.
+//
+// Typecheck, however, only knew these types if a declaration happened to be registered,
+// i.e. only if lib/std/process.bl (or lib/std/time.bl) was in the program. On a miss it
+// returned TYPE_VOID (src/typecheck.bl:5810/5815/5822 and the Instant fall-through at
+// :8797) — a fail-OPEN erasure, not an error. That is the single largest divergence cell
+// in the Stage 2 tid-collapse map: 3124 occurrences of `tid=Void flat=ProcessResult`,
+// plus the whole downstream cascade (`let err_text = br.out` gets no tid at all).
+//
+// The type is KNOWN, so typecheck must say so. This file asserts typecheck's own tid,
+// not runtime behaviour: the wrong answer is invisible at runtime precisely because
+// codegen's flat path still has the type right. Harness mirrors
+// tests/test_v76b0b_ty_pool_interns_compounds.bl.
+
+import compiler.{compile_to_program}
+import typecheck.{check_types, tc_lookup_node_tid, tc_type_str, tc_tid_kind, TyKind}
+import parser.{nodes}
+import std.io
+// Bare, load-bearing for the same reason as in test_v76b0b_ty_pool_interns_compounds.bl:
+// codegen_types resolves several globals it cannot import out of the MERGED program, and
+// codegen_expr is the smallest root whose transitive closure closes those back-references.
+import codegen_expr
+
+fn assert_eq_int(got: Int, want: Int, label: Str) {
+    if got != want { io.println("FAIL: {label} — got {got}, want {want}") }
+    assert(got == want)
+}
+
+fn assert_true(got: Bool, label: Str) {
+    if !got { io.println("FAIL: {label} — expected true") }
+    assert(got)
+}
+
+fn find_tid_by_str(want: Str) -> Int {
+    let mut idx = 0
+    let n = nodes.len()
+    while idx < n {
+        let tid = tc_lookup_node_tid(idx)
+        if tid >= 0 && tc_type_str(tid) == want {
+            return tid
+        }
+        idx = idx + 1
+    }
+    -1
+}
+
+// Count DISTINCT tid values among every node whose type-string matches `want`. A plain
+// linear scan, not a Map insert — a Map keyed by type-string would dedup on its own and
+// could never observe a mint-vs-declaration collision (Half B).
+fn count_distinct_tids_by_str(want: Str) -> Int {
+    let mut distinct: List[Int] = []
+    let mut idx = 0
+    let n = nodes.len()
+    while idx < n {
+        let tid = tc_lookup_node_tid(idx)
+        if tid >= 0 && tc_type_str(tid) == want {
+            let mut found = false
+            let mut j = 0
+            while j < distinct.len() {
+                if distinct.get(j).unwrap() == tid { found = true }
+                j = j + 1
+            }
+            if !found { distinct.push(tid) }
+        }
+        idx = idx + 1
+    }
+    distinct.len()
+}
+
+fn count_nodes_by_str(want: Str) -> Int {
+    let mut n_hit = 0
+    let mut idx = 0
+    let n = nodes.len()
+    while idx < n {
+        let tid = tc_lookup_node_tid(idx)
+        if tid >= 0 && tc_type_str(tid) == want {
+            n_hit = n_hit + 1
+        }
+        idx = idx + 1
+    }
+    n_hit
+}
+
+// Whether THIS test binary can load stdlib modules at all. It often cannot: std.* is
+// resolved relative to `path_dirname(get_arg(0))` (compiler.bl:634), and `blink test <dir>`
+// builds each test binary into `build/<dir>/`, where no `lib/std` sits beside it — while
+// `blink test <file>` builds into `build/`, which does have one. So the same test file sees
+// a program WITH prelude in one harness mode and WITHOUT it in the other, with only an
+// unflushed ModuleNotFound to show for it. Filed separately; the halves below that need a
+// real declaration skip rather than assert a mode-dependent answer.
+fn stdlib_loadable() -> Bool ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let path = "build/b907wt_stdlib_probe.bl"
+    write_file(path, "import std.time\n\nfn main() \{\n    assert(true)\n}\n")
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    fs.remove(path)
+    // Duration is declared ONLY in lib/std/time.bl — observing its tid proves the module
+    // was actually loaded and registered, not merely named in an import.
+    find_tid_by_str("Duration") >= 0
+}
+
+// ── Half A — the three process builtins, with NO `import std.process` ───────────────
+//
+// The field reads are load-bearing, not decoration: they are how this test asserts the
+// fields are registered too. A ProcessResult tid whose sfield_pool entries are missing
+// makes `r.out` a field access on a fieldless struct, and check_types() raises instead
+// of returning — so a fields-less "fix" fails here rather than passing quietly.
+
+fn process_probe_src() -> Str {
+    #"fn main() {
+    let pid = process_spawn("echo", ["hi"])
+    let waited = process_pid_wait(pid)
+    let w_out: Str = waited.out
+    let w_code: Int = waited.exit_code
+    let ran = process_run("echo", ["hi"])
+    let r_err: Str = ran.err_out
+    let piped = process_run_with_stdin("cat", [], "hi")
+    let p_out: Str = piped.out
+    assert(w_out.len() >= 0)
+    assert(w_code >= 0)
+    assert(r_err.len() >= 0)
+    assert(p_out.len() >= 0)
+}
+"#
+}
+
+test "process builtins type as ProcessResult without import std.process" {
+    let path = "build/b907wt_process_probe.bl"
+    write_file(path, process_probe_src())
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    fs.remove(path)
+
+    let tid = find_tid_by_str("ProcessResult")
+    assert_true(tid >= 0, "process: a ProcessResult tid is observed — typecheck must not erase a runtime-backed type to Void")
+    assert_true(tc_tid_kind(tid) == TyKind.Struct, "process: the ProcessResult tid is a Struct kind")
+    assert_eq_int(count_distinct_tids_by_str("ProcessResult"), 1, "process: all three builtins share ONE ProcessResult tid")
+    // Six nodes must carry it: the three calls and the three lets bound to them. A fix that
+    // typed only the call expression and left the let erased would satisfy the checks above.
+    assert_true(count_nodes_by_str("ProcessResult") >= 6, "process: both the call and its let binding carry the type, for all three builtins")
+}
+
+// ── Half B — a real declaration must win, with no second mint ───────────────────────
+//
+// Minting on demand must not race the declaration: when lib/std/process.bl IS in the
+// program there must still be exactly ONE ProcessResult tid. Two would mean an intrinsic
+// call minted its own before/after registration, and nominal type identity would then
+// depend on which tid a given node happened to memoize.
+
+fn declared_probe_src() -> Str {
+    #"import std.process
+
+fn main() {
+    let ran = process_run("echo", ["hi"])
+    let out: Str = ran.out
+    let p = process.spawn("echo", ["hi"])
+    let waited = p.wait()
+    let w: Str = waited.out
+    assert(out.len() >= 0)
+    assert(w.len() >= 0)
+}
+"#
+}
+
+test "a declared ProcessResult and the builtin return type are ONE tid" {
+    if !stdlib_loadable() {
+        skip("harness cannot load std.* from this binary's directory — the declaration half needs a real lib/std/process.bl")
+    }
+    let path = "build/b907wt_declared_probe.bl"
+    write_file(path, declared_probe_src())
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    fs.remove(path)
+
+    let tid = find_tid_by_str("ProcessResult")
+    assert_true(tid >= 0, "declared: a ProcessResult tid is observed")
+    assert_eq_int(count_distinct_tids_by_str("ProcessResult"), 1, "declared: the declaration and the intrinsic return share ONE tid — no duplicate mint")
+}
+
+// ── Half C — the Instant twin, with NO `import std.time` ────────────────────────────
+//
+// Same shape at src/typecheck.bl:8797. vfgp72's comment there already states the intent
+// ("typing read() as Instant lets the comparison check catch `time.read() > 0`"). std.time
+// is a PRELUDE module (compiler.bl:1357), so the declaration is normally present and this
+// half exercises the lookup-hit path — it is a tripwire against std.time leaving the
+// prelude, plus a guard that the site never answers Void. It cannot exercise the mint:
+// the enclosing branch also requires `is_import_module_name("time")`, so with no std.time
+// in the program at all the call types as Unknown before reaching the lookup.
+
+fn time_probe_src() -> Str {
+    #"fn main() {
+    let t = time.read()
+    let n: Int = t.nanos
+    assert(n >= 0)
+}
+"#
+}
+
+test "time.read() types as Instant without import std.time" {
+    if !stdlib_loadable() {
+        skip("harness cannot load std.* from this binary's directory — see stdlib_loadable()")
+    }
+    let path = "build/b907wt_time_probe.bl"
+    write_file(path, time_probe_src())
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    fs.remove(path)
+
+    let tid = find_tid_by_str("Instant")
+    assert_true(tid >= 0, "time: an Instant tid is observed — typecheck must not erase a runtime-backed type")
+    assert_true(tc_tid_kind(tid) == TyKind.Struct, "time: the Instant tid is a Struct kind")
+    assert_eq_int(count_distinct_tids_by_str("Instant"), 1, "time: one Instant tid")
+}

@@ -1,0 +1,121 @@
+// br 1b7ggq: the operand of `.await` must be name-resolved.
+//
+// The parser stores the awaited operand in `obj` (src/parser.bl:2865,
+// `AstNode { kind: NodeKind.AwaitExpr, obj: node, ... }`). name resolution read `value`:
+//
+//     if kind == NodeKind.AwaitExpr {
+//         nr_check_node(node_value(node))     // -1 here — should be node_obj(node)
+//         return
+//     }
+//
+// `node_value` is -1 for that node kind, so the recursion terminated immediately and the whole
+// operand subtree was never visited. Two consequences, and the second is the serious one:
+//
+//   1. `h1.await` did not count as a READ of `h1`, so correct code drew
+//      `warning[UnusedVariable]: variable 'h1' is never read` and the suggested fix
+//      (rename to `_h1`) would make a load-bearing binding look deliberately discarded.
+//
+//   2. An UNDEFINED identifier in that position was never reported. `build/blink check`
+//      printed `ok` and the name reached the C compiler as
+//      `'totally_undefined_name' undeclared`. Same check-vs-build fail-open class as vctk7f.
+//
+// Asserted against the diagnostic stream rather than through behaviour: both halves ARE
+// diagnostics, and the emitted program was correct all along in the well-formed case.
+
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_entry_count, diag_truncate}
+import std.io
+// Bare and LOAD-BEARING despite `warning[UnusedImport]` (br xrhq1c): codegen_types resolves
+// several globals it cannot import out of the MERGED program, and codegen_expr is the smallest
+// root whose transitive closure closes those back-references. Removing it fails the C compile
+// with `'expr_option_inner' undeclared` and friends.
+import codegen_expr
+
+fn assert_true(got: Bool, label: Str) {
+    if !got { io.println("FAIL: {label} — expected true") }
+    assert(got)
+}
+
+// Diagnostics this probe adds, as (severity, name) pairs the callers can search. The shared
+// global buffer is truncated back to where it was found: an unflushed entry would read as a
+// failure of whichever test in this binary happens to flush next.
+fn count_diag(path: Str, src: Str, want_name: Str, want_sev: Str, must_mention: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    write_file(path, src)
+    let program = compile_to_program(path, 1)
+    let before = diag_entry_count()
+    check_types(program)
+    fs.remove(path)
+
+    let mut hits = 0
+    let mut i = before
+    while i < diag_entries.len() {
+        let d = diag_entries.get(i).unwrap()
+        if d.name == want_name && d.severity == want_sev {
+            if must_mention == "" || d.message.contains(must_mention) { hits = hits + 1 }
+        }
+        i = i + 1
+    }
+    diag_truncate(before)
+    hits
+}
+
+// ── Half A — `.await` is a read ───────────────────────────────────────────────
+
+fn awaited_handle_src() -> Str {
+    #"fn main() {
+    async.scope {
+        let h1 = async.spawn(fn() {
+            42
+        })
+        let r1 = h1.await
+        io.println("{r1}")
+    }
+}
+"#
+}
+
+test "awaiting a handle counts as reading it" {
+    let hits = count_diag("build/1b7ggq_await_read.bl", awaited_handle_src(), "UnusedVariable", "warning", "'h1'")
+    // The next line awaits it and the program depends on the result. Suggesting `_h1` here
+    // trains the reader to mark a load-bearing binding as discarded.
+    assert_true(hits == 0, "no UnusedVariable for 'h1' — `h1.await` on the following line reads it")
+}
+
+// ── Half B — the operand subtree is resolved at all ───────────────────────────
+
+fn undefined_operand_src() -> Str {
+    #"fn main() {
+    async.scope {
+        let h1 = async.spawn(fn() {
+            1
+        })
+        let r1 = totally_undefined_name.await
+        io.println("{r1}{h1}")
+    }
+}
+"#
+}
+
+test "an undefined name in the await operand is reported" {
+    let hits = count_diag("build/1b7ggq_await_undef.bl", undefined_operand_src(), "UndefinedVariable", "error", "totally_undefined_name")
+    // A bare undefined name anywhere else is error[UndefinedVariable]. In this one position
+    // `check` used to print `ok` and let it reach the C compiler.
+    assert_true(hits > 0, "error[UndefinedVariable] for an undefined await operand — `check` must not defer this to cc")
+}
+
+// ── Half C — the well-formed program still compiles and runs ──────────────────
+//
+// The fix only ADDS a traversal, so the guard is that it adds no diagnostic to a correct
+// program and does not disturb the emitted code.
+
+test "awaiting a spawned handle still works end to end" {
+    let mut got = 0
+    async.scope {
+        let h = async.spawn(fn() {
+            21 + 21
+        })
+        got = h.await
+    }
+    assert(got == 42)
+}
