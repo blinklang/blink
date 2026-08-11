@@ -10,7 +10,7 @@ import codegen_types.{
     cg_closure_cap_count, cg_closure_cap_start, cg_closure_defs,
     cg_current_fn_has_ev, cg_current_fn_name, cg_current_fn_node, cg_current_fn_option_inner, cg_current_fn_option_inner_struct, cg_current_fn_ret, cg_in_test_body, cg_test_mode, cg_in_assert_panics,
     cg_let_target_ann, cg_expect_arg_ann, cg_assign_target_name, cg_fa_receiver_ctx,
-    cg_mono_tparams_sl, cg_mono_arg_tids,
+    cg_mono_tparams_sl, cg_mono_arg_tids, cg_fn_mono_tparams_sl, cg_fn_mono_arg_tids,
     cg_debug_mode, cg_handler_body_field, cg_handler_body_idx,
     cg_handler_body_is_ue, cg_handler_body_vtable_type,
     cg_handler_caps, HandlerCapture,
@@ -55,7 +55,7 @@ import codegen_types.{
     is_emitted_let, is_enum_type, is_fn_registered, is_generic_fn,
     is_scope_var,
     is_struct_or_enum_type, is_struct_type, is_trait_type,
-    list_contains_str, list_iter_c_type, lookup_mono_base, mangle_generic_name,
+    list_contains_str, list_iter_c_type, lookup_mono_base, mangle_generic_name, mono_phys_base,
     mono_name_from_ann,
     mut_captured_vars,
     option_c_type, pop_scope, push_scope,
@@ -71,6 +71,7 @@ import codegen_types.{
     set_list_elem_option_tp, set_list_elem_result_tp, set_list_elem_map_tp,
     type_option, type_result, type_map, type_list, type_struct, sv_tp,
     kops_table_name, kops_elem_is_concrete, kops_is_struct_key, key_struct_sname_from_ann, ensure_tuple_kops_key,
+    ensure_struct_derive_kops_key, ensure_struct_derive_kops_key_for_base,
     set_map_types, set_map_key_struct, set_set_elem_type, set_set_elem_struct, get_set_elem_type, get_set_elem_struct,
     set_var, set_var_closure, set_var_option, set_var_struct,
     set_var_option_inner2, set_var_option_inner2_struct,
@@ -2935,9 +2936,21 @@ fn upgrade_compound_carrier(c: CarrierInfo, ann_node: Int) -> CarrierInfo {
 // else {CT_VOID, ""} meaning "no claim — fall through to the annotation path".
 // Tuple keys decline here (tid_inner_struct returns "" for TK_TUPLE, tid_inner_ct
 // returns -1) so resolve_ctor_kops_elem's tuple branch registers them.
-fn ctor_kops_elem_from_node_tid(node: Int, container: Str) -> CarrierInfo {
-    let tid = tc_lookup_node_tid(node)
+fn ctor_kops_elem_from_node_tid(node: Int, container: Str) -> CarrierInfo ! Codegen.Emit {
+    // A bare Map()/Set() ctor LOCAL to a generic fn's own body (e.g. `fn mk_key[T](v: T)
+    // { let mut m: Map[HBox[HBox[T]], Int] = Map() ... }`) has its K/V typechecked
+    // ONCE, polymorphically — the node's own memoized tid still carries the fn's
+    // bare typevar T, not this instantiation's concrete arg. tc_tid_subst_mono
+    // rewrites it through the ACTIVE mono context, mirroring recover_map_kv_from_tid's
+    // identical rationale a few hundred lines up (br wzm47q RED2); a no-op outside a
+    // mono body or when nothing needs rewriting.
+    let raw_tid = tc_lookup_node_tid(node)
+    let tid = tc_tid_subst_mono(raw_tid, cg_mono_tparams_sl, cg_mono_arg_tids)
     let sname = if container == "Map" { tc_tid_map_key_struct_resolved(tid) } else { tc_tid_set_elem_struct_resolved(tid) }
+    // A generic-struct instance key (e.g. "HBox_0Int") joins derive_hash_types/
+    // derive_eq_types here, on first use, when its declared base derives Hash/Eq
+    // (br wzm47q RED2) — mirrors ensure_tuple_carrier_from_tid's tuple-key twin.
+    ensure_struct_derive_kops_key(sname)
     if kops_is_struct_key(sname) {
         return CarrierInfo { type_const: type_from_name(sname), struct_name: sname }
     }
@@ -3166,7 +3179,7 @@ fn kops_elem_from_container_ann(ann: Int, container: Str) -> CarrierInfo ! Codeg
         dbg_trace("kopsctor", "container={container} raw={e_raw} e_name={e_name} tid={e_tid} tuple={e_tuple}")
     }
     if e_name == "Tuple" {
-        return CarrierInfo { type_const: CT_VOID, struct_name: key_struct_sname_from_ann(e_ann) }
+        return CarrierInfo { type_const: CT_VOID, struct_name: key_struct_sname_from_ann(e_ann, cg_mono_tparams_sl, segs_from_arg_tids(cg_mono_arg_tids)) }
     }
     // The element reached us THROUGH a type param, already spelled as a tuple carrier
     // ("Tuple2_int_int"), so the literal-"Tuple" branch above never sees it. Two ways in:
@@ -3196,7 +3209,28 @@ fn kops_elem_from_container_ann(ann: Int, container: Str) -> CarrierInfo ! Codeg
         let reg = ensure_tuple_carrier_from_tid(e_tid)
         return CarrierInfo { type_const: CT_VOID, struct_name: if reg != "" { reg } else { e_name } }
     }
+    // e_name reached us as a bare DECLARED generic struct/enum head ("HBox"), not a
+    // literal tparam binder or an already-resolved instance — resolve_tparam_via_tid
+    // only matches a name that IS a tparam, never a struct's own name that merely
+    // NESTS one in its type args (`HBox[HBox[T]]`). mono_name_from_ann is the
+    // existing recursive annotation walker (used at the def-side return/param
+    // signature seam) that spells the full mangled instance through the ACTIVE mono
+    // context; it declines ("") for a non-generic struct, so this falls through to
+    // the concrete branch unchanged for every shape that already worked (br wzm47q
+    // RED2). Must precede kops_elem_is_concrete, which would otherwise treat the
+    // bare unmangled head as if it were the final key name and register nothing
+    // useful for it (lookup_mono_base("HBox") finds no instance).
+    if is_struct_type(e_name) != 0 || is_enum_type(e_name) != 0 {
+        let mono_name = mono_name_from_ann(strip_module_qualifier(e_name), e_ann, cg_mono_tparams_sl, segs_from_arg_tids(cg_mono_arg_tids))
+        if mono_name != "" {
+            ensure_struct_derive_kops_key_for_base(mono_name, e_name)
+            return CarrierInfo { type_const: CT_VOID, struct_name: mono_name }
+        }
+    }
     if kops_elem_is_concrete(e_name) {
+        // A no-op for anything that isn't a derived-generic-struct instance name
+        // (lookup_mono_base declines); see ctor_kops_elem_from_node_tid's twin call.
+        ensure_struct_derive_kops_key(e_name)
         return CarrierInfo { type_const: type_from_name(e_name), struct_name: e_name }
     }
     CarrierInfo { type_const: CT_VOID, struct_name: "" }
@@ -3970,20 +4004,16 @@ pub fn emit_generic_fn_call_tail(node: Int, fn_name: Str, args_str: Str) -> Int 
             // Recover the recursive value/key stems from the annotation's mono, in
             // the fn's mono context (tparams_sl/ta_str resolves the T binding).
             if is_struct_type(v_name) != 0 || is_enum_type(v_name) != 0 {
-                map_ret_val_struct = mono_name_from_ann(strip_module_qualifier(v_name), v_ann, tparams_sl, segs)
-                if map_ret_val_struct == "" { map_ret_val_struct = strip_module_qualifier(v_name) }
-                // mono_name_from_ann yields only the mangled NAME; the value
-                // struct's mono instance was never registered, so its typedef was
-                // never emitted and emit_struct_option_typedef fell through to
-                // `void* value` (br h0n5qe). Register it here — rebuild mono_args
-                // from the annotation elements (the CT_VOID-return precedent below)
-                // and pass real arg tids off the return's value slot.
-                register_map_elem_struct_mono(strip_module_qualifier(v_name), v_ann, tparams_sl, tc_tid_map_val_tid(ret_tid), arg_tids)
+                // Tid-first selector (br wzm47q Stage 2b): the tid tier's dry-walk
+                // wins when it can spell the slot (a nested instance like
+                // Box[Box[T]]), falling back to mono_name_from_ann's annotation
+                // walk + register_map_elem_struct_mono's registration only when
+                // the tid tier declines. Either tier's typedef was previously
+                // missing here (br h0n5qe), so the selector always registers.
+                map_ret_val_struct = map_elem_mono_selector(tc_tid_map_val_tid(ret_tid), strip_module_qualifier(v_name), v_ann, tparams_sl, arg_tids, segs)
             }
             if is_struct_type(k_name) != 0 || is_enum_type(k_name) != 0 {
-                map_ret_key_struct = mono_name_from_ann(strip_module_qualifier(k_name), k_ann, tparams_sl, segs)
-                if map_ret_key_struct == "" { map_ret_key_struct = strip_module_qualifier(k_name) }
-                register_map_elem_struct_mono(strip_module_qualifier(k_name), k_ann, tparams_sl, tc_tid_map_key_tid(ret_tid), arg_tids)
+                map_ret_key_struct = map_elem_mono_selector(tc_tid_map_key_tid(ret_tid), strip_module_qualifier(k_name), k_ann, tparams_sl, arg_tids, segs)
             }
         } else if tid_ct == CT_MAP {
             // Bare-typevar return `-> T` bound to Map[K,V]: recover key/value
@@ -4003,16 +4033,13 @@ pub fn emit_generic_fn_call_tail(node: Int, fn_name: Str, args_str: Str) -> Int 
             // returns Option_int and reads the pointer payload as a by-value struct
             // (1452w4). Register the recovered val/key structs on the map result
             // string; the let-binding's copy_map_value_meta carries them onto the var.
-            map_ret_val_struct = tc_tid_map_val_struct(ret_tid)
-            map_ret_key_struct = tc_tid_map_key_struct(ret_tid)
-            // Like the annotated branch: the value/key struct mono instance was
-            // never registered (the tc_tid_map_val_struct name is not enough), so
-            // its typedef never emitted and the carrier erased to void*/bare-head
-            // (br h0n5qe). Register off the memoized return tid's value/key slots —
-            // this covers nested value structs (Box[Box[Int]]) because the slot
-            // tid carries the full instance shape.
-            register_map_elem_struct_mono_from_tid(tc_tid_map_val_tid(ret_tid))
-            register_map_elem_struct_mono_from_tid(tc_tid_map_key_tid(ret_tid))
+            // Tid-first selector (br wzm47q Stage 2c): tc_tid_map_val_struct/
+            // tc_tid_map_key_struct is the D2 "liar" — it can answer a plausible
+            // bare-head name without an instance ever being registered for it, so
+            // the published name and the registered instance could disagree. The
+            // selector's own tier-1 walk is the registrar, so they can't.
+            map_ret_val_struct = map_elem_mono_selector(tc_tid_map_val_tid(ret_tid), "", -1, tparams_sl, arg_tids, segs)
+            map_ret_key_struct = map_elem_mono_selector(tc_tid_map_key_tid(ret_tid), "", -1, tparams_sl, arg_tids, segs)
         }
     } else if ret_type == CT_STRUCT && rerouted {
         // Bare-typevar return `-> T` bound to a struct INSTANCE (unbox(outer) :
@@ -6251,7 +6278,16 @@ fn tid_native_struct_mono(node: Int, sname: Str) -> TidNativeMono {
     }
     let csv = tid_native_struct_mono_slots(raw, sname, tracing)
     if csv != "" { return TidNativeMono { csv: csv, inst_tid: raw } }
-    let sub = tc_tid_subst_mono(raw, cg_mono_tparams_sl, cg_mono_arg_tids)
+    // cg_fn_mono_tparams_sl/cg_fn_mono_arg_tids, NOT cg_mono_tparams_sl/cg_mono_arg_tids:
+    // this retry recovers the binders of the ENCLOSING GENERIC FUNCTION currently being
+    // emitted. The latter pair gets transiently swapped by this same function's OWN
+    // field-loop below (and by any enclosing struct literal's field loop we are nested
+    // inside) to the CONTAINING STRUCT's tparams, for resolving bare-binder field ctors.
+    // When a struct's own declared tparam shares a name with the enclosing fn's tparam
+    // (`type Box[T]` built inside `fn mk[T]`), substituting against the swapped pair
+    // resolves "T" against Box's bind instead of mk's, and a nested Box-in-Box literal
+    // silently inherits the outer instance's tid (br wzm47q).
+    let sub = tc_tid_subst_mono(raw, cg_fn_mono_tparams_sl, cg_fn_mono_arg_tids)
     if sub != raw && sub >= 0 {
         if tracing != 0 { dbg_trace("retmono", "sname={sname} raw={raw} sub={sub} retry=mono_subst") }
         let sub_csv = tid_native_struct_mono_slots(sub, sname, tracing)
@@ -6517,15 +6553,54 @@ pub fn register_map_elem_struct_mono_from_tid(slot_tid: Int) ! Codegen.Register 
     let _name = register_map_elem_struct_mono_from_tid_named(slot_tid)
 }
 
-// Registers a struct-instance slot (and its nested instances, inner-first) and
-// RETURNS its mono name — the CSV segment a parent embeds. A nested instance slot
+// Shared tier selector for a generic Map return's key/value struct name+registration
+// (br wzm47q Stage 2b/2c), used by BOTH the annotated arm and the bare-typevar arm of
+// emit_generic_fn_call_tail's CT_MAP branch, for both the value and the key slot.
+//
+// Tier order: tid (dry-walk, then register) -> annotation -> bare-head fallback.
+// Tier 1's name is map_elem_struct_mono_walk's OWN return, never
+// tc_tid_map_val_struct/tc_tid_map_key_struct — those fall back to a bare-head name
+// that LOOKS like a full stem when the tid can't actually spell one (the D2 "liar"
+// wzm47q's triage identified), which is exactly the name/registration split this
+// selector exists to close.
+//
+// `ann`/`ann_base` are -1/"" from the bare-typevar arm (no annotation to fall back
+// to there); the annotated arm passes its resolved element name and node.
+fn map_elem_mono_selector(slot_tid: Int, ann_base: Str, ann: Int, tparams_sl: Int, fn_arg_tids: List[Int], segs: List[Str]) -> Str ! Codegen.Register {
+    let tid_name = map_elem_struct_mono_walk(slot_tid, 0)
+    if tid_name != "" {
+        let _reg = map_elem_struct_mono_walk(slot_tid, 1)
+        return tid_name
+    }
+    if ann != -1 && ann_base != "" {
+        let ann_name = mono_name_from_ann(ann_base, ann, tparams_sl, segs)
+        if ann_name != "" {
+            register_map_elem_struct_mono(ann_base, ann, tparams_sl, slot_tid, fn_arg_tids)
+            return ann_name
+        }
+    }
+    if ann_base != "" { return ann_base }
+    tc_tid_struct(slot_tid)
+}
+
+// Walks a struct-instance slot (and its nested instances, inner-first) and RETURNS
+// its mono name — the CSV segment a parent embeds. A nested instance slot
 // (Box[Box[Int]]) recurses so the inner typedef precedes the outer that embeds it,
 // mirroring register_struct_instance_from_tid (codegen.bl); that superset lives
 // above this module in the import graph, so it can't be shared without a cycle
 // (dedup follow-up filed). Returns "" for an unencodable/non-instance slot (scalar,
 // bare generic base, typevar, module-qualified) so the parent bails identically to
 // the def-side string path.
-fn register_map_elem_struct_mono_from_tid_named(slot_tid: Int) -> Str ! Codegen.Register {
+//
+// `do_register` toggles whether a REAL instance is registered on the way back up
+// (1) or the name is only computed (0). The recursion registers inner instances
+// before the caller's own `seg == ""` check can decline (br wzm47q Stage 2a), so a
+// second, independently-written pure predicate would be two lenses on one question
+// — the exact failure mode tid_native_struct_mono_slots' own comment (above,
+// :6137-6148) warns against. A dry run (do_register=0) answers "would this tier
+// spell it" through the SAME walk that registers, so the published name and the
+// registered instance can never disagree.
+fn map_elem_struct_mono_walk(slot_tid: Int, do_register: Int) -> Str ! Codegen.Register {
     if slot_tid < 0 { return "" }
     let base = tc_tid_struct(slot_tid)
     if base == "" { return "" }
@@ -6536,17 +6611,28 @@ fn register_map_elem_struct_mono_from_tid_named(slot_tid: Int) -> Str ! Codegen.
     while i < count {
         let slot = tc_tid_struct_arg_tid(slot_tid, i)
         let seg = if tc_tid_struct_arg_count(slot) >= 1 {
-            register_map_elem_struct_mono_from_tid_named(slot)
+            map_elem_struct_mono_walk(slot, do_register)
         } else {
             tc_tid_struct_slot_seg(slot)
         }
         if seg == "" { return "" }
+        // A bare ICE_SEG_* sentinel must not be concatenated mid-identifier, which
+        // would bury it past diag_is_ice_seg's prefix test. Decline to the next
+        // tier instead — an existing I0001 chokepoint elsewhere is the reporter.
+        if diag_is_ice_seg(seg) { return "" }
         if i > 0 { mono_args = mono_args.concat(",") }
         mono_args = mono_args.concat(seg)
         i = i + 1
     }
-    let arg_tids = mono_instance_arg_tids_from_tid(slot_tid, base, count)
-    register_mono_instance(base, mono_args, arg_tids)
+    if do_register != 0 {
+        let arg_tids = mono_instance_arg_tids_from_tid(slot_tid, base, count)
+        return register_mono_instance(base, mono_args, arg_tids)
+    }
+    mangle_generic_name(mono_phys_base(base), mono_args)
+}
+
+fn register_map_elem_struct_mono_from_tid_named(slot_tid: Int) -> Str ! Codegen.Register {
+    map_elem_struct_mono_walk(slot_tid, 1)
 }
 
 @allow(UnrestoredMutation, IncompleteStateRestore)
@@ -6988,7 +7074,29 @@ fn emit_struct_lit(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, D
         // seams (struct_concrete_args_from_target bails on a compound annotation arg;
         // infer_struct_type_args' bare-typevar-field branch has no compound case →
         // "Void"), which is why the tid tier above outranks them both (br zrybya).
+        // br 4ak9ff counterfactual probe (ctagvoid-shaped, kept as permanent
+        // instrumentation): tid_wins and string_target_wins are both known false in
+        // this branch, so every call recorded here is a case both higher tiers already
+        // declined. Measured corpus-wide (tests/lib/examples/samples/benchmarks/src,
+        // 952 files): 11745 calls, 11742 return None (this tier is a near-total no-op
+        // in practice), and the 3 that return Some all go through the pre-existing
+        // CT_STRUCT/fstruct or scalar type_arg_name_from_ct arms
+        // (test_gdq426_poly_impl_xmod_generic_elem.bl) — never through CT_MAP/CT_SET/
+        // CT_LIST, the specific arms 4ak9ff asked to add. That gap is confirmed
+        // unreached at 0/11745: the ticket's "falls through to Void" premise is stale
+        // (type_arg_name_from_ct already normalizes to ICE_SEG_ERASED_SLOT, which the
+        // I0001 chokepoint below reports correctly), and adding those arms would only
+        // add string-tier authority at a mono site for zero measured benefit — the
+        // opposite of this project's goal. Ticket closed as reshaped/moot rather than
+        // implemented; the function itself stays (real, if rare, callers above prove
+        // it is not dead code, so the plan's "0 hits -> delete the tier" branch does
+        // not apply — only the narrower CT_MAP/CT_SET/CT_LIST sub-claim read 0).
         let type_args = infer_struct_type_args(sname, field_types, field_structs)
+        if type_args.is_some() {
+            dbg_trace("sta4ak9ff", "sname={sname} some=1 val={type_args.unwrap()}")
+        } else {
+            dbg_trace("sta4ak9ff", "sname={sname} some=0 val=<none>")
+        }
         if type_args.is_some() { mono_args = type_args.unwrap() }
         // LAST, and only after field-value inference declined or erased (br 3dpshm).
         // Ordered here so this tier can never displace an answer another producer

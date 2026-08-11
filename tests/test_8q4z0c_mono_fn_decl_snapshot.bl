@@ -1,0 +1,218 @@
+// br 8q4z0c: a mono fn's C is emitted at TWO independent sites — the definition, during
+// emit_mono_fns_from's forward pass over mono_fns, and the declaration, during
+// emit_mono_fn_decls_range's later pass over the SAME index range. Both used to derive
+// their signature from `mono_fns[i].arg_tids` read LIVE. A registration landing strictly
+// between one entry's body-emission and its own decl-emission can merge_arg_tids-upgrade
+// that stored arg_tids in place (br p7014w's join, not a bug on its own), so the decl pass
+// could see a DIFFERENT value than the def already committed to — a `cc: conflicting
+// types` failure if the upgrade also changes the RENDERED CSV segment, not just the raw
+// tid.
+//
+// WHY THIS IS PROVABLY UNREACHABLE TODAY, NOT MERELY LATENT. Every register_mono_fn call
+// site (codegen_expr.bl:3763/3806, codegen_methods.bl:381/386/4414/4416/4452/4455) derives
+// `args` from mono_csv_from_arg_tids(arg_tids) — the (base, args) KEY is a total function
+// of the tids. So two registrations that land on the same key by construction render the
+// same CSV segment; there is no live compiler pathway that first registers with one
+// segment and later, mid-flush, upgrades the SAME key to a different one. Nothing in the
+// real pipeline interleaves a body-emission with a later, segment-changing registration on
+// its own key — registration is one phase, emission is the next.
+//
+// WHY NO `cc`-RED FIXTURE IS CONSTRUCTIBLE AT HEAD. A `.bl` source fixture can only reach
+// register_mono_fn through call sites that all uphold the invariant above. Forcing a
+// mid-window upgrade therefore requires calling register_mono_fn a second time, by hand,
+// with a DIFFERENT tid for the SAME (base, args) key than any real call site would ever
+// produce for that key — the white-box unit rows below are not a weaker substitute for a
+// fixture, they are the only way to exercise this arm at all. If a future change makes a
+// segment-changing same-key upgrade reachable from source, `mono_fn_decl_seg_drift` is the
+// tripwire that will catch it, corpus-wide, before it reaches `cc`.
+//
+// THE FIX: close the class by construction. emit_mono_fns_from now snapshots each entry's
+// arg_tids (mono_fn_body_tids, src/codegen_stmt.bl) at the moment its body is emitted;
+// emit_mono_fn_decls_range sources the decl from that snapshot instead of the live
+// mono_fns[i].arg_tids. mono_fn_decl_tid_drift is informational (any raw-tid disagreement,
+// including a benign hole-filling upgrade); mono_fn_decl_seg_drift is the assertable
+// violation counter and must read 0 corpus-wide (verified separately by a
+// BLINK_TRACE_CHANNELS=monodedup sweep over tests/*.bl, per the project plan).
+//
+// SETUP HAZARDS, both load-bearing (same as tests/test_p7014w_mono_arg_tids_order_independence.bl):
+//   * mono_fns is a PROCESS GLOBAL shared by every test in this file (`blink test
+//     --parallel` forks per FILE, not per test) — every row captures its own window via
+//     `mono_fns.len()` immediately before registering, so growth from earlier tests in
+//     this file never shifts a later row's window.
+//   * register_mono_fn alone does not need arm_instance_registry() (only
+//     register_mono_instance* does — p7014w:59-61); nor do emit_mono_fns_from /
+//     emit_mono_fn_decls_range for a FABRICATED base name: is_poly_impl_base returns 0 and
+//     get_generic_fn_node returns -1 for a name absent from generic_fns_by_name, so both
+//     no-op on real C emission while still running the new snapshot/drift-counting code
+//     that sits ahead of that branch.
+//
+// WHY ROWS A/B HARVEST REAL TIDS INSTEAD OF FABRICATING THEM. mono_csv_from_arg_tids calls
+// tc_seg_from_tid -> tc_tid_encodable, which indexes the real ty_pool — a fabricated raw
+// int is only safe to feed arg_tids_differ (plain List[Int] equality, row C), never
+// mono_csv_from_arg_tids. Rows A and B only reach mono_csv_from_arg_tids when
+// arg_tids_differ is already true, so they harvest two REAL, DISTINCT tids from an
+// in-process partial compile — Set[Int]/Set[Str] (tc_tid_to_c_tag collapses both to the
+// bare "Set" segment: seg-PRESERVING drift) and Box[Int]/Box[Str] (each names its own type
+// argument: seg-CHANGING drift, the violation). Same technique and same probe shapes as
+// tests/test_qnpb2d_diff_type_injective_tripwire.bl, whose header documents the
+// Set/non-injective vs Box/injective contrast in full.
+//
+// merge_arg_tids resolves two DIFFERENT concrete tids in one slot to their numeric min
+// (codegen_types.bl, "DO NOT TUNE THIS"). Rows A/B register the LARGER of the pair first
+// (so the snapshot the body pass takes is the larger tid) and the SMALLER second (so the
+// post-merge live value is the smaller tid) — this guarantees snapshot != live regardless
+// of which of the two harvested tids happens to come out numerically larger.
+
+import compiler.{compile_to_program}
+import typecheck.{check_types, tc_lookup_node_tid, tc_type_str, tc_tid_seg_injective}
+import codegen_types.{
+    register_mono_fn, mono_fns, mono_arg_tid_conflicts, mono_fn_decl_tid_drift,
+    mono_fn_decl_seg_drift, arg_tids_differ
+}
+import codegen_methods.{mono_csv_from_arg_tids}
+import codegen_stmt.{emit_mono_fns_from, emit_mono_fn_decls_range}
+import parser.{nodes}
+import std.io
+// Bare, and load-bearing for the same reason as tests/test_p7014w_*: codegen_types
+// resolves several globals it cannot import out of the MERGED program, and codegen_expr is
+// the smallest root whose transitive closure closes every one of those back-references.
+import codegen_expr
+
+fn assert_eq_int(got: Int, want: Int, label: Str) {
+    if got != want { io.println("FAIL: {label} — got {got}, want {want}") }
+    assert(got == want)
+}
+
+fn assert_eq_bool(got: Bool, want: Bool, label: Str) {
+    if got != want { io.println("FAIL: {label} — got {got}, want {want}") }
+    assert(got == want)
+}
+
+// Same probe shape as test_qnpb2d_diff_type_injective_tripwire.bl: two instantiations of
+// an ERASING carrier (Set) and two of a FAITHFUL one (Box).
+fn probe_src() -> Str {
+    #"type Box[T] {
+    v: T
+}
+
+fn main() {
+    let a: Set[Int] = Set()
+    let b: Set[Str] = Set()
+    let c: Box[Int] = Box { v: 1 }
+    let d: Box[Str] = Box { v: "x" }
+    assert(a.len() == 0)
+    assert(b.len() == 0)
+    assert(c.v == 1)
+    assert(d.v == "x")
+}
+"#
+}
+
+fn harvest_type_tids() -> Map[Str, Int] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let path = "build/8q4z0c_probe_src.bl"
+    write_file(path, probe_src())
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    fs.remove(path)
+    let mut m: Map[Str, Int] = Map()
+    let mut idx = 0
+    let n = nodes.len()
+    while idx < n {
+        let tid = tc_lookup_node_tid(idx)
+        if tid >= 0 {
+            m.insert(tc_type_str(tid), tid)
+        }
+        idx = idx + 1
+    }
+    m
+}
+
+fn expect_tid(m: Map[Str, Int], key: Str) -> Int {
+    let tid = m.get(key) ?? -1
+    if tid == -1 { io.println("FAIL: harvested map has no tid for '{key}'") }
+    assert(tid != -1)
+    tid
+}
+
+// Larger-first, smaller-second, so the post-merge live value is always the SMALLER of the
+// pair regardless of which harvested tid numbers out larger.
+fn ordered_desc(a: Int, b: Int) -> List[Int] {
+    if a > b { return [a, b] }
+    [b, a]
+}
+
+test "row A: a seg-preserving upgrade between body and decl emission drifts the tid but not the segment" {
+    let m = harvest_type_tids()
+    let set_int = expect_tid(m, "Set[Int]")
+    let set_str = expect_tid(m, "Set[Str]")
+
+    // Premise, asserted rather than assumed (CLAUDE.md:117-124): Set erases its element,
+    // so these two real, distinct tids must render the identical CSV segment.
+    assert_eq_bool(tc_tid_seg_injective(set_int), false, "premise/Set[Int] non-injective")
+    assert_eq_bool(tc_tid_seg_injective(set_str), false, "premise/Set[Str] non-injective")
+    assert_eq(mono_csv_from_arg_tids([set_int]), mono_csv_from_arg_tids([set_str]))
+
+    let pair = ordered_desc(set_int, set_str)
+    let first = pair.get(0).unwrap()
+    let second = pair.get(1).unwrap()
+
+    let td0 = mono_fn_decl_tid_drift
+    let sd0 = mono_fn_decl_seg_drift
+    let c0 = mono_arg_tid_conflicts
+
+    let start = mono_fns.len()
+    register_mono_fn("z8q4z0c_rowA", "Set", [first])
+    emit_mono_fns_from(start)
+    // Lands strictly between rowA's body-emission and its own decl-emission.
+    register_mono_fn("z8q4z0c_rowA", "Set", [second])
+    emit_mono_fn_decls_range(start, start + 1)
+
+    assert_eq_int(mono_arg_tid_conflicts - c0, 1, "rowA/slot-conflict counted (two different concrete tids)")
+    assert_eq_int(mono_fn_decl_tid_drift - td0, 1, "rowA/tid drift measured")
+    assert_eq_int(mono_fn_decl_seg_drift - sd0, 0, "rowA/segment-preserving — NOT a violation")
+}
+
+test "row B: a seg-changing upgrade between body and decl emission is the violation" {
+    let m = harvest_type_tids()
+    let box_int = expect_tid(m, "Box[Int]")
+    let box_str = expect_tid(m, "Box[Str]")
+
+    assert_eq_bool(tc_tid_seg_injective(box_int), true, "premise/Box[Int] injective")
+    assert_eq_bool(tc_tid_seg_injective(box_str), true, "premise/Box[Str] injective")
+    assert(mono_csv_from_arg_tids([box_int]) != mono_csv_from_arg_tids([box_str]))
+
+    let pair = ordered_desc(box_int, box_str)
+    let first = pair.get(0).unwrap()
+    let second = pair.get(1).unwrap()
+
+    let td0 = mono_fn_decl_tid_drift
+    let sd0 = mono_fn_decl_seg_drift
+    let c0 = mono_arg_tid_conflicts
+
+    let start = mono_fns.len()
+    register_mono_fn("z8q4z0c_rowB", "Box", [first])
+    emit_mono_fns_from(start)
+    register_mono_fn("z8q4z0c_rowB", "Box", [second])
+    emit_mono_fn_decls_range(start, start + 1)
+
+    assert_eq_int(mono_arg_tid_conflicts - c0, 1, "rowB/slot-conflict counted (two different concrete tids)")
+    assert_eq_int(mono_fn_decl_tid_drift - td0, 1, "rowB/tid drift measured")
+    assert_eq_int(mono_fn_decl_seg_drift - sd0, 1, "rowB/segment-changing — THE VIOLATION, must fire")
+}
+
+// Identity control: no registration lands between body- and decl-emission, so the decl
+// pass's snapshot and the live value never diverge — both counters stay silent. Uses a
+// fabricated tid deliberately: arg_tids_differ never reports a difference here, so
+// mono_csv_from_arg_tids (which would need a real ty_pool index) is never reached.
+test "row C: no intervening registration means neither counter moves" {
+    let td0 = mono_fn_decl_tid_drift
+    let sd0 = mono_fn_decl_seg_drift
+
+    let start = mono_fns.len()
+    register_mono_fn("z8q4z0c_rowC", "Int", [4242])
+    emit_mono_fns_from(start)
+    emit_mono_fn_decls_range(start, start + 1)
+
+    assert_eq_int(mono_fn_decl_tid_drift - td0, 0, "rowC/no tid drift")
+    assert_eq_int(mono_fn_decl_seg_drift - sd0, 0, "rowC/no seg drift")
+}

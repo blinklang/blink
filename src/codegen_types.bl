@@ -1108,6 +1108,14 @@ pub let mut derive_clone_types: List[Str] = []
 pub let mut derive_hash_types: List[Str] = []
 pub let mut derive_debug_types: List[Str] = []
 
+// br wzm47q RED2: a GENERIC type's bare declared name (e.g. "HBox") has no C
+// representation, so register_derive_annotations routes its Hash/Eq derives here
+// instead of into derive_hash_types/derive_eq_types at parse time. Each mono
+// instance (e.g. "HBox_0Int") joins the real lists on demand, at the ctor site
+// that actually needs its kops table — see ensure_struct_derive_kops_key.
+pub let mut derive_hash_generic_bases: List[Str] = []
+pub let mut derive_eq_generic_bases: List[Str] = []
+
 // 4q2etk: replaced by mwxtyj — types with an `impl Display`; the compiler
 // synthesizes a sealed `{T}_display` fn (fmt rendered through a fresh
 // StringBuilder) for each.
@@ -1128,6 +1136,24 @@ pub fn has_derive_method(type_name: Str, method: Str) -> Int {
             return 1
         }
         i = i + 1
+    }
+    // A generic mono instance (e.g. "HBox_0Int") has no entry of its own —
+    // register_derive_annotations only knows the bare declared name at parse
+    // time, since no instance exists yet to name (br wzm47q RED2). Fall back to
+    // the instance's declared base once the direct match misses, so a derived
+    // generic struct nested inside another instance's field still recurses into
+    // a real {stype}_hash/{stype}_eq call instead of the BLINK_COMPILER_BUG
+    // sentinel this predicate's callers fall back to on a false miss.
+    let base = lookup_mono_base(type_name).base
+    if base != "" && base != type_name {
+        let mut j = 0
+        while j < derive_method_entries.len() {
+            let e = derive_method_entries.get(j).unwrap()
+            if e.type_name == base && e.method_name == method {
+                return 1
+            }
+            j = j + 1
+        }
     }
     0
 }
@@ -1369,6 +1395,23 @@ pub let mut cg_mono_tparams_sl: Int = -1
 // unchanged. (The string CSV twin this used to shadow, cg_mono_concrete_args, went
 // with the string resolver: after that deletion nothing ever read it back.)
 pub let mut cg_mono_arg_tids: List[Int] = []
+
+// Stable twin of the pair above: set ONCE per monomorphized-fn-body emission
+// (codegen_stmt.bl, both the generic-fn and poly-impl entry points) and never
+// touched again until that body finishes. cg_mono_tparams_sl/cg_mono_arg_tids
+// get transiently swapped by emit_struct_lit for the duration of a struct
+// literal's OWN field loop (so a field declared as a bare binder resolves
+// against THIS INSTANCE's args). When a struct literal appears as another
+// struct literal's field value, its own tid_native_struct_mono substitution
+// retry runs INSIDE that swapped window — and if the nested struct's own
+// declared type-param happens to share a NAME with the enclosing generic
+// function's type-param (`type Box[T]` nested inside `fn mk[T]`), the retry
+// resolves "T" against Box's swapped bind instead of mk's, silently reusing
+// the outer instance's tid for the inner literal. tid_native_struct_mono's
+// retry needs the enclosing FUNCTION's own binds, which this pair holds
+// steady through any number of nested struct-literal field-loop swaps.
+pub let mut cg_fn_mono_tparams_sl: Int = -1
+pub let mut cg_fn_mono_arg_tids: List[Int] = []
 
 pub let mut ffi_alloc_n_pending: Int = 0
 pub let mut ffi_offset_pending_struct: Str = ""
@@ -4238,6 +4281,21 @@ pub let mut mono_slot_conflicts_diff_type: Int = 0
 // collapse does not reach this counter.
 pub let mut mono_slot_conflicts_diff_type_injective: Int = 0
 
+// Decl/def signature drift at a mono-fn's TWO independent C emission sites (declaration
+// vs definition body) — br 8q4z0c. Both derive `args` from the same `arg_tids` snapshot
+// key, but the snapshot itself can be TAKEN at two different times: the body pass runs
+// during the main flush and the decl pass runs later, after further registrations may
+// have upgraded (merge_arg_tids) the stored arg_tids for that same key. A later upgrade
+// changing a -1 slot to a concrete tid is expected and harmless AS LONG AS the rendered
+// CSV segment is unchanged (an upgrade that only fills a hole `tc_seg_from_tid` already
+// read as "" for both tids). `mono_fn_decl_tid_drift` counts every such benign case.
+pub let mut mono_fn_decl_tid_drift: Int = 0
+// The violation: the upgrade changed the RENDERED CSV segment between the two sites, so
+// the emitted declaration and definition disagree on a parameter's mangled type — the
+// `cc: conflicting types` failure 8q4z0c describes. Must read 0 corpus-wide; see the
+// snapshot machinery in codegen_stmt.bl (mono_fn_body_tids) for how it is measured.
+pub let mut mono_fn_decl_seg_drift: Int = 0
+
 // The LATTICE JOIN of two arg_tids lists for the same (base, args) key (br p7014w).
 //
 // Both register fns dedup on (base, args); before this, the loser's arg_tids was simply
@@ -4331,7 +4389,7 @@ fn arg_tid_slot(t: List[Int], i: Int) -> Int {
     -1
 }
 
-fn arg_tids_differ(a: List[Int], b: List[Int]) -> Bool {
+pub fn arg_tids_differ(a: List[Int], b: List[Int]) -> Bool {
     if a.len() != b.len() { return true }
     let mut i = 0
     while i < a.len() {
@@ -5341,7 +5399,14 @@ pub fn kops_elem_is_concrete(name: Str) -> Bool {
 /// the kops_<mangled> adapter table is emitted. Per spec §3.8: tuple Hash/Eq
 /// are auto-derived structurally when all element types are themselves
 /// Hash + Eq, with no user annotation required.
-pub fn key_struct_sname_from_ann(k_ann: Int) -> Str ! Codegen.Emit {
+// tparams_sl/segs are the same pre-lowered mono-context pair mono_name_from_ann
+// takes (see resolve_tparam_seg's note above: codegen_types sits BELOW typecheck
+// in the import graph and cannot lower arg_tids to segs itself, so every caller
+// passes segs_from_arg_tids(cg_mono_arg_tids)/cg_mono_tparams_sl already computed).
+// Outside a generic-fn mono body, callers pass -1/[] (mono_name_from_ann's own
+// no-context contract), so this is a no-op there — every existing call site keeps
+// its current behavior.
+pub fn key_struct_sname_from_ann(k_ann: Int, tparams_sl: Int, segs: List[Str]) -> Str ! Codegen.Emit {
     if k_ann == -1 { return "" }
     let kname = node_name(k_ann)
     if kname == "Tuple" {
@@ -5361,6 +5426,20 @@ pub fn key_struct_sname_from_ann(k_ann: Int) -> Str ! Codegen.Emit {
             derive_eq_types.push(c_name)
         }
         return c_name
+    }
+    // A bare DECLARED generic struct/enum head ("HBox" from `HBox[HBox[T]]`) needs
+    // its type args resolved through the mono context before it names a real C
+    // type — is_named_type("HBox") is already true (a plain declared type), so
+    // without this branch the caller below would return the ungmangled head and
+    // the kops adapter lookup for it would never match a registered instance
+    // (br wzm47q RED2). mono_name_from_ann declines ("") for a non-generic
+    // struct/enum, so this is a no-op for every shape that already worked.
+    if is_struct_type(kname) != 0 || is_enum_type(kname) != 0 {
+        let mono_name = mono_name_from_ann(strip_module_qualifier(kname), k_ann, tparams_sl, segs)
+        if mono_name != "" {
+            ensure_struct_derive_kops_key_for_base(mono_name, kname)
+            return mono_name
+        }
     }
     if is_named_type(kname) != 0 {
         return kname
@@ -5393,6 +5472,49 @@ pub fn ensure_tuple_kops_key(c_name: Str) -> Int {
         derive_eq_types.push(c_name)
     }
     1
+}
+
+// The struct-instance twin of ensure_tuple_kops_key (br wzm47q RED2): a resolved
+// mono struct instance name (e.g. "HBox_0HBox_10Int") used as a Map/Set key/elem
+// joins derive_hash_types/derive_eq_types only here, on demand, when its declared
+// base is in derive_hash_generic_bases/derive_eq_generic_bases. register_derive_
+// annotations cannot register the instance itself — at parse time no mono
+// instance exists yet, only the generic declaration. Mirrors the tuple path's
+// inline extern decl for the case where emit_derive_forward_decls already
+// flushed by the time this instance mints (mid fn-body emission); the definition
+// itself comes later from emit_kops_adapters_late's "_from" flush.
+// Returns 1 when the base wants Hash and/or Eq (registered or already present),
+// 0 for an ordinary (non-derived) struct instance.
+pub fn ensure_struct_derive_kops_key(c_name: Str) -> Int ! Codegen.Emit {
+    ensure_struct_derive_kops_key_for_base(c_name, lookup_mono_base(c_name).base)
+}
+
+// The explicit-base twin of ensure_struct_derive_kops_key, for a caller that
+// already knows the instance's declared base from walking the ANNOTATION
+// (e.g. kops_elem_from_container_ann resolving a Map key's `HBox[HBox[T]]`
+// annotation via mono_name_from_ann) rather than from a REGISTERED instance's
+// reverse lookup. lookup_mono_base can't be used at that call site: a Map/Set
+// ctor statement routinely runs BEFORE the first struct literal of its own key
+// type does (you need an empty container before you can insert into it), so
+// mono_instances has no row yet — lookup_mono_base(c_name).base would read ""
+// and silently decline a key that does derive Hash/Eq (br wzm47q RED2).
+pub fn ensure_struct_derive_kops_key_for_base(c_name: Str, base: Str) -> Int ! Codegen.Emit {
+    if base == "" { return 0 }
+    let mut did = 0
+    if list_contains_str(derive_hash_generic_bases, base) != 0 {
+        if list_contains_str(derive_hash_types, c_name) == 0 {
+            derive_hash_types.push(c_name)
+            emit_line("extern const blink_kops kops_{c_type_c_name(c_name)};")
+        }
+        did = 1
+    }
+    if list_contains_str(derive_eq_generic_bases, base) != 0 {
+        if list_contains_str(derive_eq_types, c_name) == 0 {
+            derive_eq_types.push(c_name)
+        }
+        did = 1
+    }
+    did
 }
 
 /// 1 if the kops table stores keys inline (key copied into slot, e.g. integers);

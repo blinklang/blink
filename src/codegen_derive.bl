@@ -19,13 +19,14 @@ import codegen_types.{
     get_variant_field_name, get_variant_field_type_str,
     derive_serialize_types, derive_deserialize_types,
     derive_eq_types, derive_ord_types, derive_clone_types, derive_hash_types, derive_debug_types,
+    derive_hash_generic_bases, derive_eq_generic_bases,
     derive_method_entries, display_impl_types, lookup_impl_method, mangle_impl_method_q,
     DeriveMethodEntry,
     list_contains_str,
     sf_entries,
     enum_regs, enum_variants,
 }
-import parser.{node_args, node_handlers, node_name, sublist_get, sublist_length}
+import parser.{node_args, node_handlers, node_name, node_type_params, sublist_get, sublist_length}
 import diagnostics.{diag_error_at, UNKNOWN_DERIVE_NAME, Diag}
 
 fn is_known_derive(name: Str) -> Bool {
@@ -37,6 +38,8 @@ pub fn register_derive_annotations(types_sl: Int) ! Diag.Report {
     let mut i = 0
     while i < sublist_length(types_sl) {
         let td = sublist_get(types_sl, i)
+        let td_tparams = node_type_params(td)
+        let is_generic = td_tparams != -1 && sublist_length(td_tparams) > 0
         let td_anns = node_handlers(td)
         if td_anns != -1 {
             let mut ai = 0
@@ -67,9 +70,19 @@ pub fn register_derive_annotations(types_sl: Int) ! Diag.Report {
                                 })
                                 ensure_struct_result_type(tname, "str")
                             }
+                            // A GENERIC type's bare declared name (e.g. "HBox") has no C
+                            // representation, so its Hash/Eq derive routes to the
+                            // generic-bases side lists instead of the real emission
+                            // lists — ensure_struct_derive_kops_key joins each mono
+                            // instance in on demand, at the ctor site that names it
+                            // (br wzm47q RED2). derive_method_entries still keys on the
+                            // bare name regardless: typecheck resolves `.eq()`/`.hash()`
+                            // on the DECLARED type, not a not-yet-existing instance.
+                            let eq_target = if is_generic { derive_eq_generic_bases } else { derive_eq_types }
+                            let hash_target = if is_generic { derive_hash_generic_bases } else { derive_hash_types }
                             if dname == "Eq" {
-                                if list_contains_str(derive_eq_types, tname) == 0 {
-                                    derive_eq_types.push(tname)
+                                if list_contains_str(eq_target, tname) == 0 {
+                                    eq_target.push(tname)
                                     derive_method_entries.push(DeriveMethodEntry {
                                         type_name: tname,
                                         method_name: "eq",
@@ -91,8 +104,8 @@ pub fn register_derive_annotations(types_sl: Int) ! Diag.Report {
                                         ret_type: CT_VOID
                                     })
                                 }
-                                if list_contains_str(derive_eq_types, tname) == 0 {
-                                    derive_eq_types.push(tname)
+                                if list_contains_str(eq_target, tname) == 0 {
+                                    eq_target.push(tname)
                                     derive_method_entries.push(DeriveMethodEntry {
                                         type_name: tname,
                                         method_name: "eq",
@@ -109,7 +122,7 @@ pub fn register_derive_annotations(types_sl: Int) ! Diag.Report {
                                 })
                             }
                             if dname == "Hash" {
-                                derive_hash_types.push(tname)
+                                hash_target.push(tname)
                                 derive_method_entries.push(DeriveMethodEntry {
                                     type_name: tname,
                                     method_name: "hash",

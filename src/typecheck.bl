@@ -564,6 +564,19 @@ let mut tc_inc_filter: Map[Str, Int] = Map()
 // still reports as before.
 let mut tc_suppress_ann_validation: Int = 0
 
+// Raised around tc_produce_struct_instance_tid's own arg-resolution loop (br
+// wzm47q): while resolving Box[Box[T]]'s outer arg list, the inner Box[T] element
+// is itself re-resolved through resolve_type_ann's struct branch, which recurses
+// back into tc_produce_struct_instance_tid for "Box[T]". That inner call's own
+// all-typevar skip would otherwise erase T and return -1, collapsing the slot to
+// the bare Box tid — the outer instance then carries no way to substitute T later.
+// This flag tells an inner call "you were reached while your caller was itself
+// producing a struct instance", so it mints the all-typevar instance anyway. It
+// does NOT widen the skip's exemption to the general hot path (a plain `Box[T]`
+// resolved directly off a Map/List/... branch still returns -1, unchanged) —
+// only a struct instance nested inside another struct instance's arg list opts in.
+pub let mut tc_structural_nested_instances: Int = 0
+
 // ── Type creation ───────────────────────────────────────────────────
 
 fn new_type(kind: Int, name: Str) -> Int {
@@ -2213,6 +2226,8 @@ fn resolve_type_ann(ann_node: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
 fn tc_produce_struct_instance_tid(ann_node: Int, name: Str, elems_sl: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
     let saved_suppress = tc_suppress_ann_validation
     tc_suppress_ann_validation = 1
+    let saved_nested = tc_structural_nested_instances
+    tc_structural_nested_instances = 1
     let mut arg_tids: List[Int] = []
     let mut has_concrete = 0
     let mut ai = 0
@@ -2223,7 +2238,8 @@ fn tc_produce_struct_instance_tid(ann_node: Int, name: Str, elems_sl: Int) -> In
         ai = ai + 1
     }
     tc_suppress_ann_validation = saved_suppress
-    if has_concrete != 0 {
+    tc_structural_nested_instances = saved_nested
+    if has_concrete != 0 || saved_nested != 0 {
         let inst = make_struct_instance_type(name, arg_tids)
         if ann_node < tc_node_tid.len() {
             tc_node_tid.set(ann_node, inst)
@@ -4522,6 +4538,7 @@ fn init_types() ! TypeCheck.Register {
     tc_in_closure_depth = 0
     tc_fn_body_block = 0
     tc_suppress_ann_validation = 0
+    tc_structural_nested_instances = 0
     tc_boundary_check_active = 0
     tc_errors.clear()
     tc_warnings.clear()
@@ -11340,6 +11357,24 @@ fn tc_tid_encodable(tid0: Int) -> Bool {
     if k == TK_TUPLE { return tc_tid_tuple_elem_faithful(tid) }
     if k == TK_OPTION { return tc_tid_encodable(t.inner1) }
     if k == TK_RESULT { return tc_tid_encodable(t.inner1) && tc_tid_encodable(t.inner2) }
+    // A struct/enum INSTANCE (params_count>=1) is admitted only when
+    // tc_tid_struct_mono_name can actually spell its full recursive stem — the exact
+    // guard tc_struct_slot_encodable uses (br wzm47q depth-3: a still-generic nested
+    // instance like Box[T], one level inside an outer Box[Box[T]] LITERAL, used to fall
+    // through to the unconditional `true` below on the strength of the comment two
+    // paragraphs down, which is true only when tc_tid_struct_mono_name's recursion
+    // SUCCEEDS. When it declines (mono_name == ""), tc_tid_to_c_tag's TK_STRUCT|TK_ENUM
+    // arm falls back to the BARE head name instead of declining, so this predicate was
+    // admitting a slot that spells as a plain, wrong "Box" — which tc_tid_struct_slot_seg
+    // (this function's own caller, one struct level up) then folds into ITS OWN parent's
+    // mono name as a plausible-but-unsubstituted segment, short-circuiting
+    // tid_native_struct_mono's substitution retry before it gets a chance to run).
+    // A BARE struct/enum (params_count 0) still admits unconditionally (br q4etvt).
+    if k == TK_STRUCT || k == TK_ENUM {
+        if t.params_count == 0 { return true }
+        let name = tc_tid_struct_mono_name(tid)
+        return name != "" && !diag_is_ice_seg(name)
+    }
     // A MAP slot (br 91j9fw, the List twin of br jw1pmb one carrier over):
     // tc_tid_to_c_tag erases Map to the bare carrier tag "Map" with no inner
     // spelling, exactly like Set/List, and tc_tid_seg_injective already groups
@@ -11347,7 +11382,8 @@ fn tc_tid_encodable(tid0: Int) -> Bool {
     // is a refusal with no referent, the identical parity argument jw1pmb made
     // for List. Falls through to TK_SET/TK_LIST at the tail `true` below.
     // A struct/enum INSTANCE (type-args present, params_count>=1, e.g. Box[Int]) is
-    // ADMITTED (br bwyfy1 B1): the mono-CSV consumer (tc_seg_from_tid →
+    // ADMITTED (br bwyfy1 B1) above once tc_tid_struct_mono_name can spell it: the
+    // mono-CSV consumer (tc_seg_from_tid →
     // tc_tid_to_c_tag) recurses its args to the full mono stem (Box_Int) via
     // tc_tid_struct_mono_name, byte-matching the string path's registered mono name
     // (blink_identity_Box_Int) instead of the erased bare head (blink_identity_Box,
@@ -11814,8 +11850,23 @@ pub fn tc_struct_slot_encodable(tid: Int) -> Bool {
     // cross-module struct INSTANCE's segment is PHYSICAL on both (tc_tid_struct_mono_name
     // == register_mono_instance's physical c_name). This is what lets a cross-module
     // instance SLOT carry a real tid so arg_tids can key the mono dedup (br 16z0s1).
+    // A BARE struct/enum (params_count 0) admits unconditionally (br q4etvt, above).
+    // An INSTANCE (params_count>=1) admits only when tc_tid_struct_mono_name can
+    // actually spell its full recursive stem. Without this check, a still-generic
+    // nested instance (Box[T] where T is this fn's own unbound typevar, one level
+    // inside an outer Box[Box[T]] struct LITERAL) was admitted unconditionally on
+    // the strength of the comment above ("tc_tid_to_c_tag recurses ... to the full
+    // mono stem") — true only when that recursion SUCCEEDS. When it declines
+    // (mono_name == ""), tc_tid_tag_at's own TK_STRUCT|TK_ENUM arm falls back to the
+    // BARE head name for every stem=="" cause, conflating "genuinely bare base" with
+    // "instance failed to resolve" — so this gate would wave through a slot that
+    // spells as a plain, wrong "Box" instead of declining so tid_native_struct_mono's
+    // substitution retry (tc_tid_subst_mono) gets a chance to run. Also reject a bare
+    // ICE_SEG_* sentinel spelling (diag_is_ice_seg) — non-"" but not a real name.
     if k == TK_STRUCT || k == TK_ENUM {
-        return true
+        if t.params_count == 0 { return true }
+        let name = tc_tid_struct_mono_name(tid)
+        return name != "" && !diag_is_ice_seg(name)
     }
     // Compound slots (br kffj8d): a struct type-arg SLOT that is itself an
     // Option/Result over encodable inners is now ADMITTED. The string path spells the

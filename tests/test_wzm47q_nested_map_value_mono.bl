@@ -1,0 +1,128 @@
+// br wzm47q (codegen-structured-tids, csv-authority-retirement 03p551). A generic
+// fn returning `Map[Str, Box[Box[T]]]` (a nested generic-struct VALUE, two levels
+// deep) monomorphized the outer instance's name (`Box_0Box_10Int`) but the inner
+// literal's own C temp was ALSO emitted with that same outer name — `cc:
+// 'blink_Box_0Box_10Int' undeclared` / unknown type name 'blink_Box' — because two
+// separate defects stacked:
+//
+//   D2 (typecheck) — tc_produce_struct_instance_tid skipped minting an instance tid
+//   for `Box[Box[T]]` whenever every arg was still a bare typevar, collapsing the
+//   inner `Box[T]` to a nameless `Box` with nothing left for substitute_typevar_tid
+//   to rewrite at the call site. Fixed: mint unconditionally while resolving a
+//   nested structural arg (tc_structural_nested_instances), mirroring the sanctioned
+//   exception already used by tc_fnsig_param_instance_tid / tc_evfield_instance_tid.
+//
+//   D3 (typecheck) — tc_struct_slot_encodable admitted ANY struct/enum slot
+//   unconditionally, including an unresolved nested instance that could not spell
+//   its own recursive stem. Fixed: an instance (params_count >= 1) is encodable
+//   only if tc_tid_struct_mono_name(tid) is non-empty and not an ICE_SEG sentinel.
+//
+//   Mono-context name collision (codegen) — Box[T]'s OWN declared type parameter is
+//   named "T", colliding by STRING NAME with the enclosing generic fn `mk[T]`'s type
+//   parameter. emit_struct_lit transiently swaps cg_mono_tparams_sl/cg_mono_arg_tids
+//   to the CONTAINING STRUCT's own tparams for the duration of its field-value loop
+//   (so a bare-binder field type resolves against THIS instance's args). When a
+//   field value is itself another struct literal of the SAME struct type (the inner
+//   `Box{value: v}` nested inside the outer `Box{value: Box{value: v}}`), that inner
+//   literal's OWN tid_native_struct_mono substitution retry ran DURING the outer's
+//   swapped window and — because tc_mono_binds_map keys purely by type-param NAME
+//   STRING, not by declaring scope — resolved "T" against Box's swapped bind instead
+//   of mk's, silently reusing the OUTER instance's tid for the INNER literal. Fixed:
+//   a stable cg_fn_mono_tparams_sl/cg_fn_mono_arg_tids pair, set once per
+//   monomorphized-fn-body emission and never touched by the struct-literal swap,
+//   backs the retry instead.
+//
+// Model: test_zrybya_compound_field (header style), test_h0n5qe_map_box_value_mono_registration
+// (GREEN B/C shapes), test_0sh55p_mono_kops_tuple_struct_key (@derive(Hash, Eq) key usage).
+
+type Box[T] {
+    value: T
+}
+
+@derive(Hash, Eq)
+type HBox[T] {
+    value: T
+}
+
+// RED 1 — the MVCE verbatim (value slot, depth 2).
+fn mk[T](v: T) -> Map[Str, Box[Box[T]]] {
+    let mut m: Map[Str, Box[Box[T]]] = Map()
+    m.insert("k", Box { value: Box { value: v } })
+    m
+}
+
+test "RED 1: nested Box[Box[T]] Map VALUE round-trips" {
+    let m = mk(99)
+    assert_eq(m.get("k").unwrap().value.value, 99)
+}
+
+// RED 2 — key twin: nested struct KEY, not just value. A name/instance split here
+// is a silent wrong-vtable hash, not a link error, so this must round-trip at
+// runtime, not merely compile.
+fn mk_key[T](v: T) -> Map[HBox[HBox[T]], Int] {
+    let mut m: Map[HBox[HBox[T]], Int] = Map()
+    m.insert(HBox { value: HBox { value: v } }, 7)
+    m
+}
+
+test "RED 2: nested HBox[HBox[T]] Map KEY round-trips" {
+    let m = mk_key(42)
+    assert_eq(m.get(HBox { value: HBox { value: 42 } }).unwrap(), 7)
+    assert_eq(m.get(HBox { value: HBox { value: 41 } }).is_some(), false)
+}
+
+// RED 3 — depth 3, pinning the recursion rather than one special case.
+fn mk3[T](v: T) -> Map[Str, Box[Box[Box[T]]]] {
+    let mut m: Map[Str, Box[Box[Box[T]]]] = Map()
+    m.insert("k", Box { value: Box { value: Box { value: v } } })
+    m
+}
+
+test "RED 3: depth-3 Box[Box[Box[T]]] Map VALUE round-trips" {
+    let m = mk3(7)
+    assert_eq(m.get("k").unwrap().value.value.value, 7)
+}
+
+// GREEN A — the passing control (one level), must stay green.
+fn mk_one[T](v: T) -> Map[Str, Box[T]] {
+    let mut m: Map[Str, Box[T]] = Map()
+    m.insert("k", Box { value: v })
+    m
+}
+
+test "GREEN A: one-level -> Map[Str, Box[T]] with a scalar arg still round-trips" {
+    let m = mk_one(99)
+    assert_eq(m.get("k").unwrap().value, 99)
+}
+
+// GREEN B — one-level generic fn instantiated with a struct-valued T, not a scalar.
+test "GREEN B: one-level -> Map[Str, Box[T]] with a struct-valued T still round-trips" {
+    let m = mk_one(Box { value: 55 })
+    assert_eq(m.get("k").unwrap().value.value, 55)
+}
+
+// GREEN C — passthru over an already-concrete Map[Str, Box[Int]]; the bare-typevar
+// -> T branch, not the annotated -> Map[K,V] branch, must stay unaffected.
+fn passthru[T](m: T) -> T {
+    m
+}
+
+test "GREEN C: passthru over a concrete Map[Str, Box[Int]] still round-trips" {
+    let mut src: Map[Str, Box[Int]] = Map()
+    src.insert("k", Box { value: 7 })
+    let m2 = passthru(src)
+    assert_eq(m2.get("k").unwrap().value, 7)
+}
+
+// GREEN D — scalar-valued generic Map return, proving the CT computation (not just
+// the struct-mono naming) was untouched by this fix.
+fn mk_scalar[T](v: T) -> Map[Str, T] {
+    let mut m: Map[Str, T] = Map()
+    m.insert("k", v)
+    m
+}
+
+test "GREEN D: scalar-valued -> Map[Str, T] still round-trips" {
+    let m = mk_scalar(123)
+    assert_eq(m.get("k").unwrap(), 123)
+}
