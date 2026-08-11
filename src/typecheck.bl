@@ -719,13 +719,15 @@ pub fn make_result_type(ok_type: Int, err_type: Int) -> Int {
     ty_intern_simple(TyKind.Result, "Result", ok_type, err_type)
 }
 
-// `pub` FOR THE TEST ONLY — zero non-test callers, same precedent as resolve_mono_slot
-// (src/codegen_stmt.bl). TyKind.Fn is the one kind tc_tid_to_c_tag has no arm for, so this is
-// the only way to CONSTRUCT the input that proves its ICE_SEG_UNHANDLED_KIND tail actually
-// fires. Without it that arm would be armed-but-never-proven-to-fire, which is exactly the
-// gap tests/test_fes70z_mono_slot_ice.bl exists to close. `fn(...)` ANNOTATIONS do not
-// reach here — they lower to TyKind.Typevar("Fn") — so there is no surface syntax that
-// produces a TyKind.Fn tid, hence no fixture alternative (br hsgsbp).
+// TyKind.Fn is the one kind tc_tid_to_c_tag has no arm for, so this is also the way to
+// CONSTRUCT the input that proves its ICE_SEG_UNHANDLED_KIND tail actually fires — the gap
+// tests/test_fes70z_mono_slot_ice.bl exists to close (br hsgsbp).
+//
+// `pub` was once FOR THAT TEST ONLY, because no surface syntax reached here: a closure
+// literal inferred as TYPE_UNKNOWN and an `fn(...)` annotation lowered to
+// TyKind.Typevar("Fn"). Both are now real callers (br nz7drz, infer_type's Closure arm and
+// resolve_type_ann's Fn arm), so a Fn tid is ordinary and the fixture is no longer the only
+// producer.
 pub fn make_fn_type(ret_type: Int, param_types: List[Int]) -> Int {
     ty_intern_variadic(TyKind.Fn, "Fn", ret_type, param_types)
 }
@@ -2437,6 +2439,30 @@ fn resolve_type_ann(ann_node: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
             return make_channel_type(resolve_type_ann(sublist_get(elems_sl, 0)))
         }
         return make_channel_type(TYPE_UNKNOWN)
+    }
+    // `fn(A, B) -> R` (br nz7drz). Placed here for the same reason as the three carriers
+    // above: "Fn" is a reserved type name (is_primitive_type claims it), so no user type
+    // could have taken it, and falling through to `make_typevar("Fn")` is what made an
+    // ANNOTATED closure both structureless and unsound — a bare typevar unifies with
+    // anything, so `let bad: fn(Int) -> Int = 5` typechecked clean.
+    //
+    // parser.bl:1447 puts the param annotations in `elements` and the return annotation in
+    // `type_ann`, leaving type_ann == -1 (with return_type "Void") when the arrow is absent.
+    // TYPE_VOID for that case, not TYPE_UNKNOWN: it matches tc_closure_declared_ret and the
+    // named-fn default, and Void is an ordinary inhabited type, not an unsolved one
+    // (decisions/under-determined-types.md).
+    if name == "Fn" {
+        let ret_ann = node_type_ann(ann_node)
+        let ret_t = if ret_ann == -1 { TYPE_VOID } else { resolve_type_ann(ret_ann) }
+        let mut param_types: List[Int] = []
+        if elems_sl != -1 {
+            let mut i = 0
+            while i < sublist_length(elems_sl) {
+                param_types.push(resolve_type_ann(sublist_get(elems_sl, i)))
+                i = i + 1
+            }
+        }
+        return make_fn_type(ret_t, param_types)
     }
 
     let resolved = resolve_type_name(name)
@@ -8518,8 +8544,13 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 // is bound in local scope, it wins: infer the args (so nested
                 // expressions are still type-checked) and, if the local binding is
                 // a structured fn type, arity/type-check against THAT; otherwise
-                // (closure params currently carry a bare typevar tid, not TyKind.Fn)
                 // return its type without consulting the global fnsig.
+                //
+                // The TyKind.Fn branch below was dead until br nz7drz — closure
+                // literals inferred TYPE_UNKNOWN and `fn(..)` annotations lowered to
+                // TyKind.Typevar("Fn"), so a locally-bound callable never had a
+                // structured tid to check against. It is the live path now, and it is
+                // what makes `let g = c` followed by `g(21)` arity-checked.
                 let local_tid = nr_get_type(fn_name)
                 if local_tid != TYPE_UNKNOWN {
                     let call_args_sl = node_args(node)
@@ -9501,8 +9532,27 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         return TYPE_UNKNOWN
     }
 
+    // br nz7drz. A closure literal's type is its signature. Returning TYPE_UNKNOWN here was
+    // the single largest tid-collapse divergence root cause — 62 of the 82 family-A cells,
+    // where the FLAT universe holds the whole signature (`flat=Fn(int64_t(*)(const
+    // blink_closure*, int64_t))`) and the tid holds nothing.
+    //
+    // Both halves come from the declaration, never from the body: params through
+    // resolve_param_type (TYPE_UNKNOWN for an un-annotated param, which is honest — nothing
+    // infers those yet), the return through tc_closure_declared_ret (TYPE_VOID when the
+    // arrow is omitted, matching the named-fn default).
     if kind == NodeKind.Closure {
-        return TYPE_UNKNOWN
+        let ret_t = tc_closure_declared_ret(node)
+        let mut param_types: List[Int] = []
+        let params_sl = node_params(node)
+        if params_sl != -1 {
+            let mut i = 0
+            while i < sublist_length(params_sl) {
+                param_types.push(resolve_param_type(sublist_get(params_sl, i)))
+                i = i + 1
+            }
+        }
+        return make_fn_type(ret_t, param_types)
     }
 
     TYPE_UNKNOWN
@@ -13279,8 +13329,10 @@ fn tc_resolve_tparam_tid(param_name: Str, fn_params_sl: Int, args_sl: Int, binds
             }
         } else if ptype == "Fn" {
             // `f: Fn(T) -> U` names a type-param in a closure position. A closure-
-            // LITERAL arg carries no structured TyKind.Fn tid (infer_type → TYPE_UNKNOWN),
-            // so the binding is read off the literal's own annotations instead: the
+            // LITERAL arg carried no structured TyKind.Fn tid when this was written
+            // (infer_type → TYPE_UNKNOWN — no longer true, see the br 3ejrqa note at the
+            // tail of this comment), so the binding is read off the literal's own
+            // annotations instead: the
             // return_type string when the param names the Fn return (tc_fn_param_binds
             // == -2), otherwise the naming Fn-param slot's declared type name. This is
             // the tid twin of the deleted infer_fn_type_args_from_types' Fn arm, which
@@ -13299,12 +13351,18 @@ fn tc_resolve_tparam_tid(param_name: Str, fn_params_sl: Int, args_sl: Int, binds
             // wzv72h; nothing was consulting the string here to defer TO.
             //
             // So the narrowness is a live gap, not a safe conservatism: br 3ejrqa. Its
-            // root is the same missing memo as br n8mmry symptom 2 — the closure LITERAL's
-            // return annotation carries no instance tid, so this arm is reduced to reading
-            // the annotation's NAME as a string. Once n8mmry memoizes one, this arm reads
-            // the tid and the scalar restriction goes away. Widening tc_scalar_tid_from_name
-            // instead would spell a name with no tid behind it, which is the erasure this
-            // whole seam exists to prevent.
+            // root was the same missing memo as br n8mmry symptom 2 — the closure LITERAL's
+            // return annotation carried no instance tid, so this arm was reduced to reading
+            // the annotation's NAME as a string. Widening tc_scalar_tid_from_name instead
+            // would spell a name with no tid behind it, which is the erasure this whole seam
+            // exists to prevent.
+            //
+            // 3ejrqa'S PRECONDITION IS NOW MET (br nz7drz). The closure literal's own node
+            // tid is a real TyKind.Fn, and its return child is the INSTANCE tid, not a name:
+            // measured on the 3ejrqa MVCE, the Closure arg node memoizes
+            // `Fn(Int) -> Box[Int]`. So this arm can read tc_lookup_node_tid(arg_node) and
+            // walk tc_tid_child, and the four-scalar restriction goes away. Left as its own
+            // ticket because it needs 3ejrqa's own four-case fixture first.
             let fslot = tc_fn_param_binds(p, param_name)
             if fslot != -1 {
                 if arg_node != -1 && node_kind(arg_node) == NodeKind.Closure {

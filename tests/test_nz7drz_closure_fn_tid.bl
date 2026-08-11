@@ -1,0 +1,383 @@
+// br nz7drz: `infer_type`'s Closure arm is
+//
+//     if kind == NodeKind.Closure {
+//         return TYPE_UNKNOWN
+//     }
+//
+// so a closure literal has no type. `resolve_type_ann` has no `Fn` arm either, so the
+// ANNOTATION `fn(Int) -> Int` falls through to `make_typevar("Fn")` — a bare typevar wearing
+// the name. Both halves of the same hole, and exactly the shape br vag3wc found for
+// Channel/Handle: the representation is already built and nothing constructs it.
+//
+// `make_fn_type(ret, params)` exists (src/typecheck.bl) and interns a real `TyKind.Fn` entry
+// with the return in inner1 and the params in the variadic slice. `tc_tid_child_count` /
+// `tc_tid_child` already have Fn arms — return first, then params. Until this ticket the sole
+// caller was a test: make_fn_type's own comment recorded that `fn(...)` annotations "do not
+// reach here — they lower to TyKind.Typevar('Fn') — so there is no surface syntax that
+// produces a TyKind.Fn tid".
+//
+// THE USER-VISIBLE CONSEQUENCE. A closure is a first-class value — `sections/02_syntax.md:1382`
+// says so in as many words ("a user could bind it (`let g = ...`) and hold a value whose
+// invocation is panic-catchable") and :1264 again ("a closure bound to a `let` and then passed
+// in is a first-class value"). Binding one and calling it does not work, and the two phases
+// disagree about whether the program is valid:
+//
+//     fn main() {
+//         let c = fn(x: Int) -> Int { x * 2 }
+//         let g = c
+//         let v = g(21)
+//         io.println("{v}")
+//     }
+//     $ build/blink check n1.bl   ->  ok: n1.bl
+//     $ build/blink run n1.bl     ->  error[UndefinedFunction]: undefined function 'g'
+//                                     called in 'main'
+//
+// A REAL check/run divergence, unlike the one br pgc3d9's description claimed. `check` clears
+// the program and codegen then refuses it, so the error surfaces at build time from the wrong
+// phase with no type information behind it. Annotating does not rescue it — `let g: fn(Int) ->
+// Int = c` fails identically — which is what makes this two defects and not one:
+//
+//   D1  TYPECHECK constructs no Fn type, on either path (inference or annotation). This is the
+//       half Stage 3 of the tid collapse needs: measured on the `tydiv` channel, a closure-typed
+//       `let` is the single largest remaining `tid=?` root cause in the corpus — 62 of 82
+//       family-A divergence cells, where the FLAT universe holds a full signature
+//       (`flat=Fn(int64_t(*)(const blink_closure*, int64_t))`) and the tid holds nothing. Stage 3
+//       flips authority onto the tid and Stage 4 deletes the flat fields, so at those cells there
+//       would be nothing left to read.
+//
+//   D2  CODEGEN loses the closure signature across a rebind. `set_var_closure(name,
+//       expr_closure_sig)` (src/codegen_stmt.bl) stamps a closure variable from the RHS's
+//       emitted signature, and an Ident RHS never propagates it: emit_expr resets
+//       expr_closure_sig to "" and only ever sets it from `cg_expect_fn_value_sig` (an
+//       argument-position hint). So `get_var_closure_sig("g")` answers "", the call site cannot
+//       spell a function-pointer cast, and it falls through to the UndefinedFunction backstop.
+//
+// The two are independent: D1 alone leaves the program still failing at codegen, D2 alone
+// leaves the tid empty. Both are fixed here, in that order, one regen each.
+//
+// WHAT IS NOT IN SCOPE. `TyKind.Iterator` stays unconstructed (br qzdz2e — `Iterator[T]` is
+// both a builtin trait and a concrete return type in the docs, and constructing it would
+// reject `let it: Iterator[Int] = a.take(2)`, which compiles today). A closure with no declared
+// return type still emits C `void` and discards its tail (br svsag8), so every row here that
+// runs a closure declares its return.
+
+import compiler.{compile_to_program}
+import typecheck.{
+    check_types, tc_lookup_node_tid, tc_type_str, TyKind,
+    tc_tid_kind, tc_tid_child_count, tc_tid_child,
+}
+import parser.{nodes, node_kind, node_name}
+import ast.{NodeKind}
+import diagnostics.{diag_entries, diag_entry_count, diag_truncate}
+import std.io
+// Bare and LOAD-BEARING despite `warning[UnusedImport]` (br xrhq1c): codegen_types resolves
+// several globals it cannot import out of the MERGED program, and codegen_expr is the smallest
+// root whose transitive closure closes those back-references.
+import codegen_expr
+
+fn assert_eq_str(got: Str, want: Str, label: Str) {
+    if got != want { io.println("FAIL: {label} — got '{got}', want '{want}'") }
+    assert(got == want)
+}
+
+fn assert_eq_int(got: Int, want: Int, label: Str) {
+    if got != want { io.println("FAIL: {label} — got {got}, want {want}") }
+    assert(got == want)
+}
+
+fn typecheck_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    write_file(path, src)
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    fs.remove(path)
+}
+
+fn count_diag(path: Str, src: Str, want_name: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    write_file(path, src)
+    let program = compile_to_program(path, 1)
+    let before = diag_entry_count()
+    check_types(program)
+    fs.remove(path)
+
+    let mut hits = 0
+    let mut i = before
+    while i < diag_entries.len() {
+        let d = diag_entries.get(i).unwrap()
+        if d.severity == "error" && d.name == want_name { hits = hits + 1 }
+        i = i + 1
+    }
+    diag_truncate(before)
+    hits
+}
+
+// The tid on the LET NODE is the DECLARED type: typecheck publishes `final_tid` there, and it
+// takes the annotation when one is present. That makes it one window onto both halves — the
+// unannotated form reads infer_type's answer, the annotated form reads resolve_type_ann's.
+fn let_tid(vname: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.LetBinding && node_name(i) == vname {
+            return tc_lookup_node_tid(i)
+        }
+        i = i + 1
+    }
+    -1
+}
+
+// A second, local spelling of the kind — deliberately NOT typecheck's `type_kind_name`. A test
+// that renders the kind through the function it is checking passes even when both sides are
+// wrong about the same variant.
+fn kind_str(k: TyKind) -> Str {
+    match k {
+        TyKind.Int => "Int"
+        TyKind.Float => "Float"
+        TyKind.Bool => "Bool"
+        TyKind.Str => "Str"
+        TyKind.Void => "Void"
+        TyKind.List => "List"
+        TyKind.Option => "Option"
+        TyKind.Result => "Result"
+        TyKind.Fn => "Fn"
+        TyKind.Struct => "Struct"
+        TyKind.Enum => "Enum"
+        TyKind.Typevar => "Typevar"
+        TyKind.Unknown => "Unknown"
+        TyKind.StringBuilder => "StringBuilder"
+        TyKind.Iterator => "Iterator"
+        TyKind.Handle => "Handle"
+        TyKind.Channel => "Channel"
+        TyKind.Map => "Map"
+        TyKind.Tuple => "Tuple"
+        TyKind.Bytes => "Bytes"
+        TyKind.Set => "Set"
+        TyKind.I8 => "I8"
+        TyKind.I16 => "I16"
+        TyKind.I32 => "I32"
+        TyKind.U8 => "U8"
+        TyKind.U16 => "U16"
+        TyKind.U32 => "U32"
+        TyKind.U64 => "U64"
+        TyKind.Char => "Char"
+    }
+}
+
+fn kind_of_let(vname: Str) -> Str {
+    let t = let_tid(vname)
+    if t < 0 { return "NONE" }
+    kind_str(tc_tid_kind(t))
+}
+
+// Child 0 is the RETURN and children 1.. are the params — the order tc_tid_child's Fn arm
+// documents. Spelled here as a helper so a silent reordering shows up as a swapped pair of
+// row failures rather than as one confusing one.
+fn ret_kind_of_let(vname: Str) -> Str {
+    let t = let_tid(vname)
+    if t < 0 { return "NONE" }
+    if tc_tid_child_count(t) < 1 { return "NO-CHILD" }
+    kind_str(tc_tid_kind(tc_tid_child(t, 0)))
+}
+
+fn param_kind_of_let(vname: Str, i: Int) -> Str {
+    let t = let_tid(vname)
+    if t < 0 { return "NONE" }
+    if tc_tid_child_count(t) < i + 2 { return "NO-CHILD" }
+    kind_str(tc_tid_kind(tc_tid_child(t, i + 1)))
+}
+
+// ── D1 Part A — infer_type builds a real Fn tid for a closure literal ───────────
+//
+// Every row below uses a DIFFERENT signature on purpose. A constructor that ignored its
+// arguments and returned one cached entry would satisfy a suite where every closure is
+// `fn(Int) -> Int`.
+
+fn two_closures_src() -> Str {
+    #"fn main() {
+    let ci = fn(x: Int) -> Int { x * 2 }
+    let cs = fn(s: Str) -> Bool { s.len() > 0 }
+    io.println("{ci(1)} {cs("a")}")
+}
+"#
+}
+
+test "an unannotated closure literal gets a TyKind.Fn tid, not Unknown" {
+    typecheck_probe("build/nz7drz_infer.bl", two_closures_src())
+    assert_eq_str(kind_of_let("ci"), "Fn", "let ci = fn(x: Int) -> Int literal")
+    assert_eq_str(kind_of_let("cs"), "Fn", "let cs = fn(s: Str) -> Bool literal")
+}
+
+test "the Fn tid carries the closure's own return and param types" {
+    typecheck_probe("build/nz7drz_shape.bl", two_closures_src())
+    // Distinct on BOTH axes across the two rows, so a constructor that hard-wired either
+    // slot — or swapped them — fails at least one assertion.
+    assert_eq_str(ret_kind_of_let("ci"), "Int", "ci's return is Int")
+    assert_eq_str(param_kind_of_let("ci", 0), "Int", "ci's param 0 is Int")
+    assert_eq_str(ret_kind_of_let("cs"), "Bool", "cs's return is Bool")
+    assert_eq_str(param_kind_of_let("cs", 0), "Str", "cs's param 0 is Str")
+}
+
+fn arity_src() -> Str {
+    #"fn main() {
+    let c0 = fn() -> Int { 1 }
+    let c2 = fn(a: Int, b: Str) -> Float { 1.5 }
+    io.println("{c0()} {c2(1, "x")}")
+}
+"#
+}
+
+test "Fn child_count is 1 + arity, and arity 0 is not the same as absent" {
+    typecheck_probe("build/nz7drz_arity.bl", arity_src())
+    let t0 = let_tid("c0")
+    let t2 = let_tid("c2")
+    // A zero-param closure still has one child (the return). Reporting 0 here would make
+    // "no params" and "no type at all" indistinguishable to every consumer at once.
+    assert_eq_int(tc_tid_child_count(t0), 1, "fn() -> Int has 1 child (the return)")
+    assert_eq_int(tc_tid_child_count(t2), 3, "fn(Int, Str) -> Float has 3 children")
+    assert_eq_str(ret_kind_of_let("c2"), "Float", "c2's return is Float")
+    assert_eq_str(param_kind_of_let("c2", 0), "Int", "c2's param 0 is Int")
+    assert_eq_str(param_kind_of_let("c2", 1), "Str", "c2's param 1 is Str")
+}
+
+fn no_ret_src() -> Str {
+    #"fn main() {
+    let cv = fn(x: Int) { io.println("{x}") }
+    cv(1)
+}
+"#
+}
+
+// An omitted `-> T` is Void, matching register_fn_sig's default for a named fn and
+// tc_closure_declared_ret's own TYPE_VOID — a closure and a named fn share one obligation.
+// NOT Unknown: Void is an ordinary inhabited type (decisions/under-determined-types.md, 6-0),
+// so answering Unknown here would put a real Stage 3 divergence cell back.
+test "a closure with no declared return type has a Void return, not Unknown" {
+    typecheck_probe("build/nz7drz_noret.bl", no_ret_src())
+    assert_eq_str(kind_of_let("cv"), "Fn", "an unannotated-return closure is still Fn")
+    assert_eq_str(ret_kind_of_let("cv"), "Void", "omitted -> T is Void")
+    assert_eq_str(param_kind_of_let("cv", 0), "Int", "the param survives")
+}
+
+// ── D1 Part B — resolve_type_ann builds an Fn tid for an `fn(..) -> T` annotation ─
+
+fn annotated_src() -> Str {
+    #"fn main() {
+    let ga: fn(Int) -> Str = fn(x: Int) -> Str { "{x}" }
+    io.println("{ga(1)}")
+}
+"#
+}
+
+test "an `fn(..) -> T` annotation resolves to Fn, not a typevar named Fn" {
+    typecheck_probe("build/nz7drz_ann.bl", annotated_src())
+    assert_eq_str(kind_of_let("ga"), "Fn", "let ga: fn(Int) -> Str")
+    // Distinct from the return on purpose: a resolver that read the annotation's `elements`
+    // for both slots would answer Int twice and pass a same-type row.
+    assert_eq_str(ret_kind_of_let("ga"), "Str", "the annotation's return is Str")
+    assert_eq_str(param_kind_of_let("ga", 0), "Int", "the annotation's param 0 is Int")
+}
+
+fn ann_nested_src() -> Str {
+    #"fn main() {
+    let gn: fn(List[Int]) -> Option[Str] = fn(l: List[Int]) -> Option[Str] { None }
+    io.println("{gn([1]).is_none()}")
+}
+"#
+}
+
+// The recursion is the point. A one-level resolver that called type_from_name on each element
+// would flatten these to bare heads, which is the exact depth-1 limit the tid collapse exists
+// to remove.
+test "an annotated fn type resolves its params and return recursively" {
+    typecheck_probe("build/nz7drz_annnest.bl", ann_nested_src())
+    assert_eq_str(kind_of_let("gn"), "Fn", "let gn: fn(List[Int]) -> Option[Str]")
+    assert_eq_str(ret_kind_of_let("gn"), "Option", "the return is an Option, not a bare head")
+    assert_eq_str(param_kind_of_let("gn", 0), "List", "the param is a List, not a bare head")
+    let t = let_tid("gn")
+    // One level deeper on both sides, so a resolver that stopped at the container passes
+    // neither.
+    assert_eq_str(kind_str(tc_tid_kind(tc_tid_child(tc_tid_child(t, 0), 0))), "Str",
+        "Option[Str]'s inner survives")
+    assert_eq_str(kind_str(tc_tid_kind(tc_tid_child(tc_tid_child(t, 1), 0))), "Int",
+        "List[Int]'s element survives")
+}
+
+// Constructing the kind must not start rejecting programs that compile today. `types_compatible`
+// requires matching kinds for a container family, so an annotation that becomes a real kind can
+// reject an initializer a typevar used to unify with.
+test "constructing Fn invents no errors in programs that compile today" {
+    assert_eq_int(count_diag("build/nz7drz_clean.bl", annotated_src(), "TypeError"), 0,
+        "annotated closure let is clean")
+    assert_eq_int(count_diag("build/nz7drz_clean2.bl", ann_nested_src(), "TypeError"), 0,
+        "annotated nested closure let is clean")
+    assert_eq_int(count_diag("build/nz7drz_clean3.bl", arity_src(), "TypeError"), 0,
+        "arity-0 and arity-2 closure lets are clean")
+}
+
+// A genuine mismatch must still be caught. Without this row the ticket could be "satisfied" by
+// a resolver that produced Fn and then compared nothing.
+fn ann_mismatch_src() -> Str {
+    #"fn main() {
+    let bad: fn(Int) -> Int = 5
+    io.println("{bad(1)}")
+}
+"#
+}
+
+test "a non-closure initializer for an fn-typed let is still a TypeError" {
+    assert_eq_int(count_diag("build/nz7drz_bad.bl", ann_mismatch_src(), "TypeError"), 1,
+        "let bad: fn(Int) -> Int = 5")
+}
+
+// ── D2 — a closure survives a rebind, at runtime ────────────────────────────────
+//
+// These are the rows that fail as a BUILD error while red, because the file they live in is
+// the program: `let g = c` followed by `g(21)` is what codegen refuses.
+
+fn double(x: Int) -> Int { x * 2 }
+
+test "a closure bound to a second let is still callable" {
+    let c = fn(x: Int) -> Int { x * 2 }
+    let g = c
+    assert_eq_int(g(21), 42, "let g = c; g(21)")
+}
+
+test "an annotated rebind of a closure is callable" {
+    let c = fn(x: Int) -> Int { x * 2 }
+    let g: fn(Int) -> Int = c
+    assert_eq_int(g(21), 42, "let g: fn(Int) -> Int = c; g(21)")
+}
+
+// Two hops, and the signature must survive both. One hop could be rescued by a special case
+// that reads the immediately-preceding let.
+test "a closure survives two rebinds" {
+    let c = fn(x: Int) -> Int { x + 1 }
+    let g = c
+    let h = g
+    assert_eq_int(h(41), 42, "let g = c; let h = g; h(41)")
+}
+
+// A non-Int signature, so a fix that hard-wired int64_t into the emitted cast fails here
+// rather than passing on a coincidence.
+test "a rebound closure keeps a non-Int signature" {
+    let c = fn(s: Str) -> Str { s.concat("!") }
+    let g = c
+    assert_eq_str(g("hi"), "hi!", "a Str -> Str closure survives the rebind")
+}
+
+// The controls: both forms already worked before this ticket, and must keep working.
+test "calling a closure directly still works" {
+    let c = fn(x: Int) -> Int { x * 2 }
+    assert_eq_int(c(21), 42, "direct call, no rebind")
+}
+
+test "passing a closure through an fn-typed param still works" {
+    let c = fn(x: Int) -> Int { x * 2 }
+    assert_eq_int(apply(c, 21), 42, "apply(c, 21)")
+}
+
+fn apply(f: fn(Int) -> Int, x: Int) -> Int { f(x) }
+
+// A bare named fn passed by name is a different codegen path (a shim, not a closure cell);
+// pinned so the D2 fix does not disturb it.
+test "a bare named fn as a value still works" {
+    assert_eq_int(apply(double, 21), 42, "apply(double, 21)")
+}

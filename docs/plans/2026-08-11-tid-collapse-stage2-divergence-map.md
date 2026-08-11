@@ -186,6 +186,7 @@ not Stage 3 work:
 | `sskpk8` | P2 | declared `let` type compared against the initializer, never unified into it, leaving ctor metavars unbound |
 | `twq9kz` | P2 | `copy_list_compound_elem` never reached across the corpus — prove its 3 missing arms are live |
 | `pgc3d9` | P1 | *(filed later, from re-measuring `missing` for the Stage 3 kickoff)* closure and `handler` bodies in argument position never typechecked — 13 of the 14 residual `missing` cells |
+| `nz7drz` | P2 | *(the first Stage 3 root cause worked)* a closure literal had no type at all, and an `fn(..)` annotation lowered to a bare typevar — 16 family-A cells, plus 5 more retired as knock-on |
 
 `k9agr8` gates the *measurement*, not the code: without it Stage 3 can only demonstrate 0
 in archive-linked mode.
@@ -1114,6 +1115,106 @@ all three defects in every position, both dedup guards, an all-correct program a
 invented errors, the `skip`-in-closure / `skip`-in-helper pair, a *"`?` still gates against the
 closure's own return"* row that fails if the flag were merely un-reset instead of split, two
 tid-publication rows (the property Stage 3 needs), and two runtime rows.
+
+### nz7drz — a closure literal had no type at all (CLOSED)
+
+The largest single family-A root cause, and two defects rather than one. The ticket named the
+first; the second is what actually produced its reported symptom.
+
+**D1 — typecheck constructed no `Fn` type on either path.** `infer_type`'s Closure arm was a
+literal `return TYPE_UNKNOWN`, and `resolve_type_ann` had no `Fn` arm, so an *annotated*
+`fn(Int) -> Str` fell through to `make_typevar("Fn")`. This is the `vag3wc` shape exactly:
+`make_fn_type` and the `TyKind.Fn` arms in `tc_tid_child_count` / `tc_tid_child` already
+existed and nothing constructed them. A bare typevar unifies with anything, so the annotation
+path was also unsound — `let bad: fn(Int) -> Int = 5` typechecked clean, and is a `TypeError`
+now. An omitted `-> T` resolves to `TYPE_VOID`, not `TYPE_UNKNOWN`, matching
+`tc_closure_declared_ret` and the named-fn default.
+
+**D2 — codegen lost a closure's signature across a rebind.** `let g = c` then `g(21)`:
+
+```
+$ build/blink check   ok
+$ build/blink run     error[UndefinedFunction]: undefined function 'g' called in 'main'
+```
+
+A real check-passes/run-fails divergence (the one the ticket description claimed was not).
+`emit_expr` clears `expr_closure_sig` on entry and only ever *set* it from
+`cg_expect_fn_value_sig`, an argument-position hint — so an Ident RHS propagated nothing,
+`set_var_closure` stamped `""`, and the call fell past the closure-variable path into the
+`UndefinedFunction` backstop. One restore-on-read block in the Ident arm, the same shape
+`CT_ITERATOR` already had beside it. Annotating did not rescue it; direct calls and passing
+through an `fn`-typed param already worked, so the spec question was settled
+(`sections/02_syntax.md:1382`, `:1264`) and the fix was to make it work, not to reject it.
+
+**Measurement** (tydiv, monolithic, shared exclusion basis). The Stage 3 kickoff figure "62 of
+82" mixed units — 62 counted distinct `tid=?` *(var, file) pairs* grouped by initializer callee,
+not cells:
+
+| | before | after | |
+|---|---:|---:|---:|
+| family A (`tid=?`) cells | 82 | 61 | −21 |
+| family A rows | 1339 | 1243 | −96 |
+| `Fn`-flat `tid=?` cells | 16 | 2 | −14 |
+| `Fn`-flat `tid=?` rows | 88 | 5 | −83 |
+| agree | 372979 | 382138 | +9426 |
+| missing | 5 | 5 | 0 |
+
+21 family-A cells retired, not 14: the Call arm's `TyKind.Fn` branch (`typecheck.bl:8552`) was
+dead code until a closure had a structured tid, and making it live means `let y = c(...)` gets
+the closure's *return* tid too — which retired the residual `tid=? flat=Float` and five
+`tid=? flat=Tuple2_*` cells as knock-on.
+
+The **2 residual `Fn` cells are not this ticket**: both are `let g = with arena { fn(..) {..} }`.
+`infer_type` does not propagate a `WithBlock` tail's type — the separate `with arena` root cause
+(12 cells) already on the Stage 3 list. The closure fix is complete everywhere it is not
+composed with that.
+
+**Why the counter did not drop (421 → 424 cells), stated honestly.** The 14 retired cells did not
+become `agree`; they changed *spelling* from `tid=?` to `tid=Fn(Int) -> Int` and stayed in
+`diverge`, because `ty_tp_same_shape` rejects `TyKind.Fn` up front — `tk_to_ct` maps it to
+`CT_VOID` and the `ct == CT_VOID && k != TyKind.Void` guard is deliberate (a kind the flat
+universe provably cannot describe must not report agreement). A `Fn` ↔ `CT_CLOSURE` bridge needs
+a tid → C-signature speller, because the flat side holds nothing structural to compare against —
+only a rendered C signature string. That speller is Stage 3's `c_type_from_tid`; writing a second
+one into typecheck to move a counter would be the drift this plan exists to undo. **Deferred to
+Stage 3, where the same speller closes the cells and the comparator together.**
+
+The 17 `Fn` rows are verified correct by hand against the flat C spelling beside them, which is
+the evidence the comparator cannot yet give:
+
+```
+tid=Fn(Int, Int) -> Int              flat=Fn(int64_t(*)(const blink_closure*, int64_t, int64_t))
+tid=Fn(Str, Int) -> Result[Int, Str] flat=Fn(blink_Result_int_str(*)(…, const char*, int64_t))
+tid=Fn(Request, Str) -> Response     flat=Fn(blink_std_http_types_Response(*)(…, Request, const char*))
+tid=Fn(Int) -> Bool                  flat=Fn(int(*)(const blink_closure*, int64_t))
+```
+
+The last row is the Bool-is-C-`int` case, which also rules out an `int64_t`-shaped guess.
+
+**Two existing rows updated, not deleted.** `an un-annotated closure's own Map() tail fails
+closed with I0001` (duplicated in `test_i0001_unsolved_typevar_at_codegen.bl` and
+`test_farq9f_declared_container_ret_pins_ctor.bl`) no longer reaches codegen: an omitted `-> T`
+is a Void return now, so typecheck rejects `c()` in a `Map`-returning tail with the ordinary
+`error[TypeError]: return value type Void does not match function 'a' return type Map[Int, Str]`
+— byte-identical to what `fn c() { Map() }` has always produced. An ICE backstop replaced by the
+correct upstream diagnostic is the outcome I0001 exists to enable. Both rows moved to the closure
+shape that still gets past the front end (`fn a[K,V]() { let c = fn() -> Map[K,V] { Map() } }`,
+verified to still raise I0001), and the retired spelling is pinned as a *TypeError-not-ICE* row
+so it can never regress into an ICE or a silent `kops_str` guess.
+
+**Spun out.** `r398vj` — a closure *call*'s `List`/`Map`/`Set` return is lost, because
+`codegen_expr.bl:5232` recovers the return type by re-parsing the emitted C signature string;
+`Int`/`Str`/`Option` survive only because `closure_ret_tag_is_recognized` happens to decode their
+C spelling. Pre-existing and independent: `receiver_type_name_for_diag` already read the tid, so
+this change only improved the diagnostic's type *name*. It is a Stage 3 cell of the purest kind —
+the call node's own memoized tid already holds the answer.
+
+`3ejrqa`'s stated precondition is now met, and noted on that ticket: a closure literal's node tid
+carries the *instance* return, measured on its own MVCE as `Fn(Int) -> Box[Int]`, so
+`tc_resolve_tparam_tid`'s `Fn` arm can read `tc_tid_child` instead of parsing an annotation name.
+
+Test: `tests/test_nz7drz_closure_fn_tid.bl`, 15 rows — 7 D1 rows red before (4 more D2 rows were
+outright build errors), all green after. `task ci` green.
 
 ## Appendix — all 428 shape cells
 
