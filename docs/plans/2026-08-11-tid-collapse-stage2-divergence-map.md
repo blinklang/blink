@@ -188,6 +188,8 @@ not Stage 3 work:
 | `pgc3d9` | P1 | *(filed later, from re-measuring `missing` for the Stage 3 kickoff)* closure and `handler` bodies in argument position never typechecked — 13 of the 14 residual `missing` cells |
 | `nz7drz` | P2 | *(the first Stage 3 root cause worked)* a closure literal had no type at all, and an `fn(..)` annotation lowered to a bare typevar — 16 family-A cells, plus 5 more retired as knock-on |
 | `bfq7nf` | P2 | *(the 2 cells `nz7drz` left)* a block whose tail is a bare Ident bound inside that block infers nothing — not arena- or closure-specific |
+| `3c4g71` | P2 | *(`bfq7nf` one NodeKind over, found by `at=` attribution)* a match arm body naming its own pattern binding infers nothing; a diverging sibling arm cannot cover for it — 17 declaration sites, 4 in the compiler's own source |
+| `8wk3xg` | P2 | *(by-product of adding `at=`)* a local `let at = ..` resolves to `parser.bl`'s PRIVATE `fn at` and reports `ImportNotSelected`; blocks renaming `ty_div_trace`'s `at_str` back |
 
 `k9agr8` gates the *measurement*, not the code: without it Stage 3 can only demonstrate 0
 in archive-linked mode.
@@ -1153,21 +1155,26 @@ not cells:
 
 | | before | after | |
 |---|---:|---:|---:|
-| family A (`tid=?`) cells | 82 | 61 | −21 |
-| family A rows | 1339 | 1243 | −96 |
+| family A (`tid=?`) cells | 84 | 61 | −23 |
+| family A rows | 1323 | 1224 | −99 |
 | `Fn`-flat `tid=?` cells | 16 | 2 | −14 |
 | `Fn`-flat `tid=?` rows | 88 | 5 | −83 |
-| total cells | 424 | 424 | 0 |
-| agree | 372712 | 372974 | +262 |
-| diverge rows | 5118 | 5113 | −5 |
-| missing | 5 | 5 | 0 |
+| total cells | 423 | 421 | −2 |
+| agree | 362979 | 363711 | +732 |
+| diverge rows | 5008 | 5003 | −5 |
+| missing | 14 | 1 | −13 |
 
-*(The `agree` and `total cells` rows are corrected. They were first published as
-`372979 → 382138` and `421 → 424`, computed with the new test root excluded from only one side
-of the comparison — which reads the 15 fresh `test_nz7drz` compiles as `agree` growth and as new
-cells. Excluding the new roots from BOTH sides is the honest basis and is what every other row
-here already used. The corrected total, `424 → 424`, strengthens rather than softens the point
-made below: the counter did not move at all.)*
+*(**Basis: the intersection of the two sweeps' file sets** — see the master table under
+`3c4g71` below, which is where every figure in this section now comes from. These numbers were
+published twice before and wrong both times, from the same mistake made two ways: first
+`372979 → 382138` / `421 → 424` with the new test root excluded from only ONE side, then
+`372712 → 372974` / `424 → 424` with it excluded from both sides but nothing else. Excluding
+"the new test roots" is not enough. Sweeps taken weeks apart differ by **every** file added in
+between, and any one of those that links the compiler contributes ~9000 `agree` rows by itself
+— which is the entire ~9700 gap between the second attempt's `before` and the real one.
+Intersecting the file sets is the only basis that cannot drift, and `scratchpad/cells.sh` now
+takes that allow-list as a required argument so the shortcut is no longer reachable. The
+conclusion below is unaffected in direction and slightly stronger in size: 2 cells, not 0.)*
 
 21 family-A cells retired, not 14: the Call arm's `TyKind.Fn` branch (`typecheck.bl:8552`) was
 dead code until a closure had a structured tid, and making it live means `let y = c(...)` gets
@@ -1272,19 +1279,9 @@ tail. Duplicating nr's scope machinery inside `infer_type` was the other candida
 still: `nr_pop_scope` carries the E0301 region-boundary check, so a speculative frame either
 fires it twice or needs `tc_boundary_check_active` suppressed around it.
 
-**Measurement** (tydiv, monolithic, all three sweeps re-tallied on ONE exclusion basis — both new
-test roots excluded from every column, which is also the correction applied to the `nz7drz` table
-above):
-
-| | before `nz7drz` | after `nz7drz` | after `bfq7nf` |
-|---|---:|---:|---:|
-| **total cells** | 424 | 424 | **412** |
-| family A (`tid=?`) cells | 82 | 61 | **47** |
-| family A rows | 1339 | 1243 | **1209** |
-| `Fn`-flat `tid=?` cells | 16 | 2 | **0** |
-| agree | 372712 | 372974 | **373161** |
-| diverge rows | 5118 | 5113 | **5086** |
-| missing | 5 | 5 | 5 |
+**Measurement** — see the master table under `3c4g71` below; the `after bfq7nf` column is this
+ticket. Headline: **423 → 409 cells**, family A **84 → 47**, and the last `Fn`-flat `tid=?` cell
+gone (2 → 0), which is what closes out `nz7drz`'s deferred residual.
 
 14 family-A cells retired for a fix aimed at 2, because the recovery is keyed on the *initializer
 being block-bearing*, not on the tail being a closure: `flat=CmgPoint`, `flat=Pair`,
@@ -1309,6 +1306,140 @@ Test: `tests/test_bfq7nf_block_ident_tail_tid.bl`, 14 rows — 6 red before, all
 the 8 controls (literal tail, outer-scope tail, and the runtime answers through the arena promote
 path) green throughout to pin that the fix adds a tid without moving one byte of behavior.
 `task regen` + `task ci` green.
+
+### The instrument now names its own site (`at=module:line`)
+
+Between `bfq7nf` and `3c4g71` the trace gained a field, because grep-based attribution had run
+out of resolution and was **producing wrong answers, not just vague ones**.
+
+A sweep row carried `var=` and the `file=` the harness appended — and `file=` is the **entry**
+file, not the declaring one. Every test compile re-emits the whole stdlib, so one
+`lib/std/libc.bl` binding is blamed on ~90 different entry files at once. Ranking causes by
+grepping `let <var> =` out of the blamed file therefore mis-attributed most of the corpus: **501
+of 767 `(var, flat, file)` triples had no such line in that file at all**, and many that did
+matched a same-named variable in an unrelated module — short names (`r`, `p`, `v`, `b`, `inner`)
+collide freely across 90 modules.
+
+`sv_ty_or_flat` now delegates to `sv_ty_or_flat_at(name, site, node)`, and `codegen_stmt.bl`'s
+`emit_let_binding.decl` tap threads the `let` node so `ty_div_trace` can append
+`at={node_source_module(node)}:{node_line(node)}`. The field is **last on the line** on purpose:
+a flat spelling can contain spaces (`Fn(int64_t(*)(const blink_closure*, int64_t))`), so every
+sweep script strips fixed trailing tokens to reach the cell, and both `at=` and the harness's
+`file=` are suffixes — `sed 's| at=[^ ]* file=[^ ]*$||'` stays sufficient.
+`copy_list_compound_elem`'s two taps keep the node-less wrapper; that function is handed only
+`Str src, Str dst` and has no node to thread.
+
+Two by-products, neither part of this work:
+
+- **`8wk3xg` (filed).** A local `let at = ...` in `ty_div_trace` does not resolve to itself —
+  name resolution reaches `src/parser.bl:585`'s **private** `fn at(kind: TokenKind)` and reports
+  `error[ImportNotSelected]: 'at' is not in scope — add it to the import list`, i.e. it suggests
+  importing a private item to fix a local binding. Shadowing runs the wrong way. Not
+  interpolation-specific (a plain `at.concat("")` fails identically). Worked around by naming the
+  local `at_str`; the comment there says to rename it back when `8wk3xg` closes.
+- Recorded in `8wk3xg`'s description as explicitly separate: a `@module helper` line in a
+  same-package module file makes the **entry** file fail to parse with
+  `error[UnexpectedToken]: unexpected token at top level: IDENT`, pointed at the entry's own
+  `import` line — wrong file, wrong span.
+
+`at=` is what turned the remaining family-A backlog from 364 unattributable rows into a ranked
+list of causes, which is how `3c4g71` was found.
+
+### 3c4g71 — a match arm body could not name its own pattern binding (CLOSED)
+
+`bfq7nf` one `NodeKind` over, and the same root cause: `tc_check_body`'s `LetBinding` arm infers
+the initializer before walking it, so a value that names a binding **the construct itself
+introduces** is inferred with that frame unpushed. For `bfq7nf` the construct was a block and the
+binding a `let`; here it is a `match` arm and the binding comes from the arm's **pattern**.
+
+What made it look like a different bug is the merge in `infer_type`'s `MatchExpr` arm:
+
+```blink
+if merged == TYPE_UNKNOWN { merged = arm_t }
+```
+
+so the match keeps its type whenever **some** sibling arm dodges the defect. Only a match where
+no arm dodges loses it — which is why every compiler-source instance is spelled with a diverging
+arm. A `None => return 0` body is `TYPE_UNKNOWN` too (`infer_type_uncached` has no
+`NodeKind.Return` arm and falls through), so it cannot cover for the pattern-bound arm beside it.
+Two probes separate the axes:
+
+| probe | result |
+|---|---|
+| `match sh { Circle(a) => a  Square(a) => a }` — every arm pattern-bound | `tid=? flat=Int` ✗ |
+| `match sh { Circle(a) => a  Square(_) => 0 }` — one literal arm covers | `tid=Int` ✓ |
+| `match o { Some(v) => v  None => return 0 }` — diverging arm cannot cover | `tid=? flat=Int` ✗ |
+
+**The diagnostic hole, and the `if` asymmetry that proves it is a bug.** `TYPE_UNKNOWN` unifies
+with anything, so the declared-type compare went silent — while the `if` analogue was rejected
+correctly all along, because its arm carries an explicit
+`if then_t == TYPE_UNKNOWN { return else_t }` pair:
+
+```blink
+let a: Str = match o { Some(v) => v  None => return 0 }   // accepted, no error
+let b: Str = if c { 5 } else { return 0 }                 // error[TypeError], correct
+```
+
+**Fix.** `tc_block_tail_memo` became `tc_scoped_value_memo(node, depth)` — recursive rather than a
+loop, because a match fans out — and gained a `MatchExpr` case that merges the arm bodies' memos
+through `type_merge`. Same principle as `bfq7nf`: the in-scope walk (`tc_check_body`'s `MatchExpr`
+arm pushes the arm scope, binds the pattern, then walks the body) already memoized every arm body
+with the right answer, so the tid exists and is merely written one step late. Read it; do not
+re-derive it. Re-inferring is still not an option — `infer_type` REPORTS as a side effect.
+
+A **diverging** arm body contributes nothing, skipped by kind (`Return`/`Break`/`Continue`) in the
+new `tc_arm_body_value`. That is the bottom-type rule, not an omission, and it has to be explicit:
+leaning on the `Return` node's memo happening to be `TYPE_UNKNOWN` would break silently the day
+something memoizes it, and folding the `return`'s own operand in would type
+`fn f(o: Option[Str]) -> Int { match o { Some(v) => v  None => return 0 } }` as the merge of `Str`
+and `Int`.
+
+**Measurement — the master table.** Every figure in this document's progress log now derives from
+these four sweeps, tallied on the **intersection of their file sets** (874 files; the 5 files that
+do not appear in all four are listed under the `nz7drz` correction note). `scratchpad/cells.sh`
+takes that allow-list as a required argument.
+
+| | before `nz7drz` | after `nz7drz` | after `bfq7nf` | after `3c4g71` |
+|---|---:|---:|---:|---:|
+| **total cells** | 423 | 421 | 409 | **407** |
+| family A (`tid=?`) cells | 84 | 61 | 47 | **45** |
+| family A rows | 1323 | 1224 | 1190 | **1050** |
+| `Fn`-flat `tid=?` cells | 16 | 2 | 0 | **0** |
+| agree | 362979 | 363711 | 363924 | **364187** |
+| diverge rows | 5008 | 5003 | 4976 | **4837** |
+| missing | 14 | 1 | 1 | **1** |
+
+**Cells move by 2 while rows move by 140, and that is the honest reading.** A cell is a
+`(site, tid, flat)` shape triple, so the 17 retired *declaration sites* mostly shared their flat
+spelling (`Int`, `Str`, `Person`, `Color`) with other still-open causes; the cell only clears when
+the last site holding that spelling clears. Rows are the better progress signal for a
+cause-by-cause phase, cells for Stage 3's exit gate. All 17 match-initialized family-A sites are
+gone and **zero remain** — including the four in the compiler's own source
+(`src/typecheck.bl:5362`, `:5415`, `:5456`, `src/symbol_index.bl:621`, every one the
+`match m.get(k) { Some(v) => v  None => return ... }` shape).
+
+Test: `tests/test_3c4g71_match_arm_pattern_binding_tid.bl`, 14 rows — 6 red before, all green
+after. The 3 controls (the literal-arm cover, the `if` analogue, and closure-literal arms, which
+need no scope because `nz7drz` reads the *signature* and never the body) and the 5 clean/run rows
+were green throughout, pinning that the fix adds a tid without moving one runtime answer.
+`task regen` + `task ci` green.
+
+### Remaining family-A causes, ranked (45 cells / 1050 rows / 347 declaration sites)
+
+Now attributable, from `at=`. Grouped by the **innermost producer** — the outermost call is
+usually a symptom (`.unwrap()` heads 72 sites, but its receiver is already unknown):
+
+| cause | sites | note |
+|---|---:|---|
+| `X.try_from(..)` / `X.from_str(..)` on a user enum or narrow-width type | ~46 | `Char`/`I8`/`U8`/`Percent`/`Rating`/`Status`; static method returns unresolved |
+| `db.query` / `db.query_one` / `db.execute` / `stmt.step` / `stmt.column_text` | ~40 | `std.db_sqlite`; heads most of the `.unwrap()` chains |
+| `Bytes.zeroed` / `Bytes.from_str` | ~27 | static `Bytes` intrinsics |
+| `Channel(n)` | 19 | **likely genuinely under-determined** — the arg is a capacity, not an element type, so this may be `decisions/under-determined-types.md` / E0301, not a missing rule |
+| `fs.read` / `fs.list_dir` / `io.read_line` / `io.read_bytes` / `net.*` / `scope.cstr` / `p.deref` / `p.offset` | ~30 | intrinsic namespace methods |
+| `ch.recv` / `dot_ch.recv` | ~16 | `Channel[T]` element |
+| calling a closure-typed **field** (`route.callback`, `logger.log_msg`) | ~11 | |
+| `buf.with_ptr(fn(p) -> I64 { .. })` | ~6 | return type is the closure's return type |
+| `Iterator` adapters (`.chain`, `.zip`, `.collect`, `.enumerate`) | ~25 | **deferred to `qzdz2e`** (panel decision, user-visible) |
 
 ## Appendix — all 428 shape cells
 

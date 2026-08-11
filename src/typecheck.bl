@@ -10,7 +10,7 @@ import parser.{
     node_op, node_params, node_pattern, node_return_type, node_right, node_scrutinee,
     node_start, node_stmts, node_str_val, node_target, node_then_body, node_trait_name,
     node_type_ann, node_type_name, node_type_params, node_value, node_var_name,
-    node_impl_binders, node_recv_type_args,
+    node_impl_binders, node_recv_type_args, node_source_module,
     node_set_module, node_set_name,
     node_xfail_reason, node_xfail_ticket,
     sublist_get, sublist_length,
@@ -9657,39 +9657,76 @@ fn tc_block_tail_value(stmt: Int) -> Int {
     stmt
 }
 
-// The tid the IN-SCOPE walk recorded for a block-bearing expression's tail value, or -1.
+// The tid the IN-SCOPE walk recorded for a value produced inside a scope the speculative
+// infer could not see, or -1.
 //
-// br bfq7nf. infer_type's Block arm cannot answer for a tail that names a binding of that
-// same block: tc_check_body's LetBinding arm infers the initializer BEFORE walking it, so at
-// that moment nr has no frame for the block and nr_get_type misses. The walk that follows
-// does have the frame, and its ExprStmt arm memoizes the tail with the right answer — so the
-// tid exists, it is merely written one step late. This reads it instead of re-deriving it,
-// which is the whole direction of the tid collapse (decisions/compiler-type-representation.md
-// Q2) and also the only version that adds no diagnostics: infer_type REPORTS as a side effect
-// (its IfExpr arm emits "if branches have incompatible types"), so re-inferring the block to
-// recover the tail would double-report every such tail.
+// br bfq7nf. infer_type cannot answer for a value that names a binding introduced by the very
+// construct being inferred: tc_check_body's LetBinding arm infers the initializer BEFORE
+// walking it, so at that moment nr has no frame for the construct and nr_get_type misses. The
+// walk that follows does have the frame, and its ExprStmt arm memoizes the value with the
+// right answer — so the tid exists, it is merely written one step late. This reads it instead
+// of re-deriving it, which is the whole direction of the tid collapse
+// (decisions/compiler-type-representation.md Q2) and also the only version that adds no
+// diagnostics: infer_type REPORTS as a side effect (its IfExpr arm emits "if branches have
+// incompatible types"), so re-inferring to recover the value would double-report every one.
 //
-// WithBlock and AsyncScope forward to their body for the same reason infer_type's arms do —
-// both evaluate to the block they wrap. The depth bound is a belt: these nest only as deep as
-// the source does, and 8 is far past any real spelling.
-fn tc_block_tail_memo(node: Int) -> Int {
-    let mut n = node
-    let mut depth = 0
-    while depth < 8 {
-        if n == -1 { return -1 }
-        let k = node_kind(n)
-        if k == NodeKind.WithBlock || k == NodeKind.AsyncScope {
-            n = node_body(n)
-        } else if k == NodeKind.Block {
-            let tail = tc_block_tail_stmt(n)
-            if tail == -1 { return -1 }
-            return tc_lookup_node_tid(tc_block_tail_value(tail))
-        } else {
-            return -1
-        }
-        depth = depth + 1
+// Two scope-introducing constructs reach here, for the same reason:
+//
+//   Block (and WithBlock/AsyncScope, which forward to the block they wrap, exactly as
+//   infer_type's own arms do) — the tail names a `let` of that block.
+//
+//   MatchExpr (br 3c4g71) — an arm body names a binding of that arm's PATTERN. The merge in
+//   infer_type's MatchExpr arm hides this whenever some sibling arm dodges it
+//   (`if merged == TYPE_UNKNOWN { merged = arm_t }`), so only a match where NO arm dodges
+//   loses its type. That is why the corpus rows all look like a diverging-arm bug: a
+//   `None => return 0` body is TYPE_UNKNOWN too, and so cannot cover for the arm beside it.
+//
+// A DIVERGING arm body contributes nothing, which is the bottom-type rule and not an
+// omission: `match o { Some(v) => v  None => return 0 }` in a `-> Int` fn has the type of
+// `v`, and folding the `return`'s own operand in would type an `Option[Str]` match as the
+// merge of Str and Int. Skipped by kind rather than by leaning on the Return node's memo
+// being TYPE_UNKNOWN, so a later change to what Return memoizes cannot quietly break it.
+//
+// Recursive rather than a loop because a match fans out. The depth bound is a belt: these
+// nest only as deep as the source does, and 8 is far past any real spelling.
+fn tc_scoped_value_memo(node: Int, depth: Int) -> Int {
+    if node == -1 { return -1 }
+    if depth >= 8 { return -1 }
+    let k = node_kind(node)
+    if k == NodeKind.WithBlock || k == NodeKind.AsyncScope {
+        return tc_scoped_value_memo(node_body(node), depth + 1)
     }
-    -1
+    if k == NodeKind.Block {
+        let tail = tc_block_tail_stmt(node)
+        if tail == -1 { return -1 }
+        return tc_scoped_value_memo(tc_block_tail_value(tail), depth + 1)
+    }
+    if k == NodeKind.MatchExpr {
+        let arms_sl = node_arms(node)
+        if arms_sl == -1 { return -1 }
+        let mut merged = -1
+        let mut i = 0
+        while i < sublist_length(arms_sl) {
+            let arm_t = tc_scoped_value_memo(tc_arm_body_value(sublist_get(arms_sl, i)), depth + 1)
+            if arm_t >= 0 && arm_t != TYPE_UNKNOWN {
+                if merged < 0 { merged = arm_t } else { merged = type_merge(merged, arm_t) }
+            }
+            i = i + 1
+        }
+        return merged
+    }
+    tc_lookup_node_tid(node)
+}
+
+// The value node of a match arm body, or -1 when the body diverges and therefore contributes
+// no type. Mirrors infer_arm_body's ExprStmt unwrap — that is the node the walk memoizes.
+fn tc_arm_body_value(arm: Int) -> Int {
+    let b = node_body(arm)
+    if b == -1 { return -1 }
+    let k = node_kind(b)
+    if k == NodeKind.Return || k == NodeKind.Break || k == NodeKind.Continue { return -1 }
+    if k == NodeKind.ExprStmt { return node_value(b) }
+    b
 }
 
 // A Block body with a non-Void declared return but NO tail value at all (ends in
@@ -10034,18 +10071,19 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             inferred_tid = infer_type(val)
             tc_construct_hint = saved_hint
             tc_check_body(val)
-            // br bfq7nf. `let x = { let h = 5  h }` — the tail names a binding of the block
-            // itself, which the infer_type above could not see because tc_check_body had not
-            // pushed the block's frame yet. It has now, and it memoized the tail in scope, so
-            // the answer is available one line later. Placed BEFORE the declared/inferred
-            // compare below, which is the point: TYPE_UNKNOWN unifies with anything, so
-            // `let x: Str = { let h = 5  h }` typechecked clean, and a closure reached this way
-            // lost the arity check br nz7drz had just made possible.
+            // br bfq7nf / br 3c4g71. `let x = { let h = 5  h }` and
+            // `let x = match sh { Circle(a) => a  Square(a) => a }` — the value names a binding
+            // the construct itself introduces, which the infer_type above could not see because
+            // tc_check_body had not pushed that frame yet. It has now, and it memoized the value
+            // in scope, so the answer is available one line later. Placed BEFORE the
+            // declared/inferred compare below, which is the point: TYPE_UNKNOWN unifies with
+            // anything, so `let x: Str = { let h = 5  h }` typechecked clean, and a closure
+            // reached this way lost the arity check br nz7drz had just made possible.
             //
             // Recovery only — it can never overwrite an answer infer_type already gave, so no
             // shape that resolved before now takes a different tid.
             if inferred_tid == TYPE_UNKNOWN {
-                let memo = tc_block_tail_memo(val)
+                let memo = tc_scoped_value_memo(val, 0)
                 if memo >= 0 && memo != TYPE_UNKNOWN { inferred_tid = memo }
             }
         }
@@ -11579,10 +11617,24 @@ fn ty_tp_same_shape(tid0: Int, tp: Int, depth: Int) -> Int {
 // `site` is a stable label for the call site, not a message. It is the key the whole cell
 // map is grouped by.
 pub fn sv_ty_or_flat(name: Str, site: Str) -> Int {
+    sv_ty_or_flat_at(name, site, -1)
+}
+
+// Same seam, plus the AST node whose type is being decided, so the trace can name the
+// declaration instead of only the variable.
+//
+// Attribution, not decoration. A sweep row carries `var=` and the ENTRY file it was compiled
+// from, and neither identifies the `let`: every test compile re-emits the whole stdlib, so one
+// stdlib `let buf = ...` is blamed on ~90 different entry files, and short names (`r`, `p`,
+// `v`, `inner`) collide across modules besides. Ranking cells by grepping `let <var> =` out of
+// the entry file therefore mis-attributes most of the corpus — 501 of 767 (var, flat, file)
+// triples had no such line at all, and the ones that did were frequently a same-named variable
+// in an unrelated module. `at=` makes every remaining cell attributable from the sweep alone.
+pub fn sv_ty_or_flat_at(name: Str, site: Str, node: Int) -> Int {
     let tid = get_var_ty(name)
     if tid < 0 {
         ty_div_bump(site, TyDiv.Missing)
-        ty_div_trace(site, "missing", name, -1, -1)
+        ty_div_trace(site, "missing", name, -1, -1, node)
         return -1
     }
     let tp = get_var_tp(name)
@@ -11591,7 +11643,7 @@ pub fn sv_ty_or_flat(name: Str, site: Str) -> Int {
         return tid
     }
     ty_div_bump(site, TyDiv.Diverge)
-    ty_div_trace(site, "diverge", name, tid, tp)
+    ty_div_trace(site, "diverge", name, tid, tp, node)
     tid
 }
 
@@ -11612,11 +11664,21 @@ pub fn ty_divergence_dump() {
     }
 }
 
-fn ty_div_trace(site: Str, bucket: Str, name: Str, tid: Int, tp: Int) {
+// `at=` is LAST on the line on purpose: a flat spelling can contain spaces
+// (`Fn(int64_t(*)(const blink_closure*, int64_t))`), so every sweep script strips a fixed
+// trailing token to get at the cell. Two trailing tokens now — the harness appends ` file=`
+// after this — and both are suffixes, which keeps `sed 's| at=[^ ]* file=[^ ]*$||'` sufficient.
+// `-` when no node was threaded, so the field is always present and never has to be optional.
+fn ty_div_trace(site: Str, bucket: Str, name: Str, tid: Int, tp: Int, node: Int) {
     if dbg_channel_on("tydiv") == 0 { return }
     let spelled_tid = if tid >= 0 { tc_type_str(tid) } else { "-" }
     let spelled_tp = if tp >= 0 { tp_display(tp) } else { "-" }
-    dbg_trace("tydiv", "bucket={bucket} site={site} var={name} tid={spelled_tid} flat={spelled_tp}")
+    // Named `at_str`, not `at`, as a WORKAROUND for br 8wk3xg: a local `let at` is not found
+    // at all — resolution reaches parser.bl:585's PRIVATE `fn at` and reports
+    // error[ImportNotSelected], suggesting you import a private item. Shadowing runs the wrong
+    // way. Rename this back to `at` when 8wk3xg is fixed.
+    let at_str = if node >= 0 { "{node_source_module(node)}:{node_line(node)}" } else { "-" }
+    dbg_trace("tydiv", "bucket={bucket} site={site} var={name} tid={spelled_tid} flat={spelled_tp} at={at_str}")
 }
 
 // Inner-type accessors over a tid for the codegen read-site fix (jkdywb). A

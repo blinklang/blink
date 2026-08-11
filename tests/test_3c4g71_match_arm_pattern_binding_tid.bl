@@ -1,0 +1,215 @@
+// br 3c4g71 — a match arm body that names its own pattern binding infers no type.
+//
+// The same ordering defect as br bfq7nf, one NodeKind over. `infer_type`'s MatchExpr arm
+// (src/typecheck.bl:9477) merges the arm bodies through infer_arm_body -> infer_type, and
+// tc_check_body's LetBinding arm infers the initializer BEFORE walking it — so at the moment
+// an arm body is inferred, that arm's PATTERN SCOPE has not been pushed and the binding the
+// body names is invisible. The arm yields TYPE_UNKNOWN.
+//
+// What makes this one worth its own test file is the merge loop's cover behaviour:
+//
+//     if merged == TYPE_UNKNOWN { merged = arm_t }
+//
+// so the match keeps its type whenever SOME arm dodges the defect. Only a match where NO arm
+// dodges loses it. That is why the corpus rows all look like a "diverging arm" bug — a
+// `None => return 0` arm is TYPE_UNKNOWN too (infer_type_uncached has no NodeKind.Return arm
+// and falls through), so it cannot cover for the pattern-bound arm next to it. Both spellings
+// are here, and so is the cover row that proves the boundary.
+//
+// The divergence it shows is
+//
+//     [dbg:tydiv] bucket=diverge site=emit_let_binding.decl var=a tid=? flat=Int
+//
+// 17 of the 364 family-A declaration sites in the tydiv sweep, four of them in the compiler's
+// own source (src/typecheck.bl:5362, :5415, :5456, src/symbol_index.bl:621 — every one the
+// `match m.get(k) { Some(v) => v  None => return ... }` shape, which is row 4 below).
+//
+// TYPE_UNKNOWN unifies with anything, so the declared-type compare went silent. The `if`
+// analogue is rejected correctly today, which is the asymmetry the control rows pin.
+//
+// The programs COMPILED AND RAN correctly throughout — codegen's flat universe carried the
+// type the tid did not (`flat=Int`). That is the asymmetry
+// decisions/compiler-type-representation.md Q2 voted to remove, so the run rows are as
+// load-bearing as the diagnostic ones: the fix must add the missing tid without moving one
+// runtime answer.
+
+import compile_test_helpers
+
+// ── the declared type must be compared against a pattern-bound arm body ─────
+
+test "an all-arms-pattern-bound enum match is compared against the declared type" {
+    let mut s = "type Shape \{ Circle(r: Int), Square(s: Int) }\n"
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let sh = Circle(5)\n")
+    s = s.concat("    let x: Str = match sh \{ Circle(a) => a  Square(a) => a }\n")
+    s = s.concat("    io.println(\"\{x}\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_compile_error(s, "3c4g71_decl_enum", "TypeError")
+}
+
+// One arm pattern-bound, one arm DIVERGING. Nothing covers, because a `return` body is
+// TYPE_UNKNOWN as well. This is the spelling every compiler-source site uses.
+test "a diverging sibling arm cannot cover for a pattern-bound arm" {
+    let mut s = "fn f(o: Option[Int]) -> Int \{\n"
+    s = s.concat("    let x: Str = match o \{ Some(v) => v  None => return 0 }\n")
+    s = s.concat("    io.println(\"\{x}\")\n")
+    s = s.concat("    0\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{ io.println(\"\{f(Some(3))}\") }\n")
+    compile_test_helpers.expect_compile_error(s, "3c4g71_decl_diverge", "TypeError")
+}
+
+// Both Result arms bind, so both are blind. Not enum-specific, not Option-specific.
+test "a both-arms-pattern-bound Result match is compared against the declared type" {
+    let mut s = "fn f(r: Result[Int, Int]) -> Int \{\n"
+    s = s.concat("    let x: Str = match r \{ Ok(v) => v  Err(e) => e }\n")
+    s = s.concat("    io.println(\"\{x}\")\n")
+    s = s.concat("    0\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{ io.println(\"\{f(Ok(3))}\") }\n")
+    compile_test_helpers.expect_compile_error(s, "3c4g71_decl_result", "TypeError")
+}
+
+// The compiler's own shape, verbatim (src/typecheck.bl:5362 and three siblings): unwrap a
+// map lookup, bail on absence. A fix that misses this row misses every in-tree site.
+test "a map-lookup match with a diverging None arm is compared against the declared type" {
+    let mut s = "let mut m: Map[Str, Int] = Map()\n"
+    s = s.concat("fn f(name: Str) -> Int \{\n")
+    s = s.concat("    let x: Str = match m.get(name) \{ Some(v) => v  None => return 0 }\n")
+    s = s.concat("    io.println(\"\{x}\")\n")
+    s = s.concat("    0\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{ m.insert(\"k\", 1)  io.println(\"\{f(\\\"k\\\")}\") }\n")
+    compile_test_helpers.expect_compile_error(s, "3c4g71_decl_map_get", "TypeError")
+}
+
+// A match whose arm body is ITSELF an all-pattern-bound match. A fix that resolves only the
+// outermost arm bodies passes the rows above and fails this one.
+test "a nested all-pattern-bound match is compared against the declared type" {
+    let mut s = "type Shape \{ Circle(r: Int), Square(s: Int) }\n"
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let sh = Circle(5)\n")
+    s = s.concat("    let x: Str = match sh \{ Circle(_a) => match sh \{ Circle(b) => b  Square(b) => b }  Square(c) => c }\n")
+    s = s.concat("    io.println(\"\{x}\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_compile_error(s, "3c4g71_decl_nested", "TypeError")
+}
+
+// ── controls: the shapes that ALREADY resolved must keep resolving ──────────
+// Each was green before the fix. They pin the boundary, so a fix that works by widening
+// TYPE_UNKNOWN tolerance anywhere shows up here as a regression.
+
+// The cover row. One literal arm is enough for the merge to recover the whole match, which is
+// exactly why this defect only surfaces on some spellings.
+test "a literal sibling arm covers for a pattern-bound arm" {
+    let mut s = "type Shape \{ Circle(r: Int), Square(s: Int) }\n"
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let sh = Circle(5)\n")
+    s = s.concat("    let x: Str = match sh \{ Circle(a) => a  Square(_) => 0 }\n")
+    s = s.concat("    io.println(\"\{x}\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_compile_error(s, "3c4g71_ctl_cover", "TypeError")
+}
+
+// The `if` analogue, which has always been right: its arm carries an explicit
+// `if then_t == TYPE_UNKNOWN { return else_t }` pair, so a diverging else falls back cleanly.
+test "an if with a diverging else is compared against the declared type" {
+    let mut s = "fn f(c: Bool) -> Int \{\n"
+    s = s.concat("    let x: Str = if c \{ 5 } else \{ return 0 }\n")
+    s = s.concat("    io.println(\"\{x}\")\n")
+    s = s.concat("    0\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{ io.println(\"\{f(true)}\") }\n")
+    compile_test_helpers.expect_compile_error(s, "3c4g71_ctl_if", "TypeError")
+}
+
+// Closure-literal arms need no scope to infer (br nz7drz reads the SIGNATURE, never the body),
+// so a match of two of them keeps its TyKind.Fn tid and stays arity-checked.
+test "closure-literal match arms stay arity-checked" {
+    let mut s = "type Shape \{ Circle(r: Int), Square(s: Int) }\n"
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let sh = Circle(5)\n")
+    s = s.concat("    let g = match sh \{ Circle(_) => fn(a: Int) -> Int \{ a * 2 }  Square(_) => fn(a: Int) -> Int \{ a * 3 } }\n")
+    s = s.concat("    io.println(\"\{g(1, 2, 3)}\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_compile_error(s, "3c4g71_ctl_closure_arity", "TypeError")
+}
+
+// ── no false positives, and the runtime answer is unchanged ─────────────────
+
+test "a matching declared type over a pattern-bound arm body stays clean and runs" {
+    let mut s = "type Shape \{ Circle(r: Int), Square(s: Int) }\n"
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let sh = Square(7)\n")
+    s = s.concat("    let x: Int = match sh \{ Circle(a) => a  Square(a) => a }\n")
+    s = s.concat("    io.println(\"\{x}\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_no_error(s, "3c4g71_clean_enum", "TypeError")
+    let r = compile_test_helpers.compile_and_run(s, "3c4g71_clean_enum_run")
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out.trim(), "7")
+}
+
+test "an inferred all-pattern-bound match still runs" {
+    let mut s = "type Shape \{ Circle(r: Int), Square(s: Int) }\n"
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let sh = Circle(5)\n")
+    s = s.concat("    let a = match sh \{ Circle(x) => x  Square(x) => x }\n")
+    s = s.concat("    io.println(\"\{a + 1}\")\n")
+    s = s.concat("}\n")
+    let r = compile_test_helpers.compile_and_run(s, "3c4g71_run_enum")
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out.trim(), "6")
+}
+
+// Both control-flow paths of the diverging spelling: the arm that yields, and the arm that
+// returns. A recovery keyed on the wrong arm would show up as one of these two.
+test "a diverging-arm match still runs down both paths" {
+    let mut s = "fn f(o: Option[Int]) -> Int \{\n"
+    s = s.concat("    let v = match o \{ Some(n) => n  None => return 99 }\n")
+    s = s.concat("    v * 2\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    io.println(\"\{f(Some(4))}\")\n")
+    s = s.concat("    io.println(\"\{f(None)}\")\n")
+    s = s.concat("}\n")
+    let r = compile_test_helpers.compile_and_run(s, "3c4g71_run_diverge")
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out.trim(), "8\n99")
+}
+
+test "a both-arms-pattern-bound Result match still runs" {
+    let mut s = "fn f(r: Result[Int, Int]) -> Int \{\n"
+    s = s.concat("    let v = match r \{ Ok(n) => n  Err(e) => e }\n")
+    s = s.concat("    v + 1\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{ io.println(\"\{f(Ok(3))}\")  io.println(\"\{f(Err(10))}\") }\n")
+    let r = compile_test_helpers.compile_and_run(s, "3c4g71_run_result")
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out.trim(), "4\n11")
+}
+
+test "a nested all-pattern-bound match still runs" {
+    let mut s = "type Shape \{ Circle(r: Int), Square(s: Int) }\n"
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let sh = Square(7)\n")
+    s = s.concat("    let a = match sh \{ Circle(_x) => match sh \{ Circle(b) => b  Square(b) => b }  Square(c) => c * 10 }\n")
+    s = s.concat("    io.println(\"\{a}\")\n")
+    s = s.concat("}\n")
+    let r = compile_test_helpers.compile_and_run(s, "3c4g71_run_nested")
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out.trim(), "70")
+}
+
+// A struct-typed arm body, so the recovered tid has to be a nominal type and not just a
+// scalar. `flat=Person`-class rows exist in the corpus (tests/test_match_result_struct.bl).
+test "a struct-typed pattern-bound arm body is compared against the declared type" {
+    let mut s = "type Person \{ name: Str }\n"
+    s = s.concat("fn f(r: Result[Person, Person]) -> Int \{\n")
+    s = s.concat("    let x: Str = match r \{ Ok(p) => p  Err(p) => p }\n")
+    s = s.concat("    io.println(\"\{x.name}\")\n")
+    s = s.concat("    0\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{ io.println(\"\{f(Ok(Person \{ name: \\\"a\\\" }))}\") }\n")
+    compile_test_helpers.expect_compile_error(s, "3c4g71_decl_struct", "TypeError")
+}
