@@ -185,6 +185,7 @@ not Stage 3 work:
 | `k9agr8` | P2 | `build/blinkc` ignores `BLINK_TRACE_CHANNELS`, so the counter cannot be measured monolithically |
 | `sskpk8` | P2 | declared `let` type compared against the initializer, never unified into it, leaving ctor metavars unbound |
 | `twq9kz` | P2 | `copy_list_compound_elem` never reached across the corpus — prove its 3 missing arms are live |
+| `pgc3d9` | P1 | *(filed later, from re-measuring `missing` for the Stage 3 kickoff)* closure and `handler` bodies in argument position never typechecked — 13 of the 14 residual `missing` cells |
 
 `k9agr8` gates the *measurement*, not the code: without it Stage 3 can only demonstrate 0
 in archive-linked mode.
@@ -1010,7 +1011,109 @@ be subsumed by Stage 3 — the diagnostics *spell* `Set[Int]` and `List[Int]` co
 direct evidence typecheck holds the right type at those nodes and only the flat pair cannot carry
 it to the consumer.
 
-**Stage 3's prerequisite list is now empty.**
+**Stage 3's prerequisite list was empty at this point** — and then re-measuring the `missing`
+bucket for the Stage 3 kickoff showed 14 cells still there, 13 of them one bug. See `pgc3d9`.
+
+### pgc3d9 — closure and handler bodies in argument position were never typechecked (CLOSED)
+
+The `missing` bucket is the one with no fallback once Stage 4 deletes the flat fields, so it is
+the bucket that decides whether Stage 3 can exit. After `e0wmt6` it still held **14** cells.
+**Thirteen were a single typecheck walk bug** with the same shape as `e0wmt6`: a body that is
+never visited, so nothing publishes a tid for anything inside it.
+
+Doing it before Stage 3 rather than during was deliberate. Stage 3 flips the tid to authoritative;
+if a walk-widening rides along with the flip, a new `missing` cell cannot be attributed to either
+change. Fixed on the green tree first, against a known baseline.
+
+**Three defects, one missing dispatch each, all in `tc_check_body`.**
+
+| | shape | why it was unwalked |
+|---|---|---|
+| D1 | closure argument to a plain `Call` — `take(fn() { ... })` | no `Call` arm at all (silent `let _skip = 0` fallthrough), *and* the ExprStmt arm re-dispatched only for `is_block_bearing(vk) \|\| vk == MethodCall` — dropped twice over, in both statement and initializer position |
+| D2 | closure argument to a **non-List** `MethodCall` — `async.spawn(fn() { ... })` | the arm `return`ed after its List branch, under the comment *"Only List has closure-taking HOFs"* |
+| D3 | `handler` method bodies, in **every** position | no `HandlerExpr` arm at all |
+
+D2's comment is the instructive one. It is true of the **stdlib** and false of the **language**:
+any `fn`-typed param takes a closure, and `async.spawn` is a MethodCall on a receiver that is not
+a List — the shape in our own `src/cli.bl`.
+
+D3 is wider than the ticket recorded. It was filed as argument-position; in fact a handler as a
+call argument, written inline in a `with`, and bound to a `let` were all equally unchecked.
+`tc_check_body`'s WithBlock arm *already routed* an inline handler in — the route existed and
+landed on the fallthrough. **The arm was missing, not the route.** Worth stating because "add the
+route" would have been a no-op fix, the same trap as `twq9kz`'s "add three arms".
+
+**Fix.** Two new functions in `src/typecheck.bl`:
+
+- `tc_check_handler_method(m)` — the third entry point into a body that is its own fn context.
+  A handler method is an ordinary `parse_fn_def()` FnDef living in a HandlerExpr's `methods`
+  sublist rather than the program's, so the top-level `tc_check_fn` walk never reaches it and
+  `lookup_fnsig` has no entry under its bare name. Mirrors `tc_check_fn` with the fnsig lookup
+  replaced by `tc_closure_declared_ret(m)`, which reads only `node_type_ann` — set by the same
+  `parse_type_annotation()` a closure's is — so it resolves the return with no closure-specific
+  behavior, including the generic-instance re-intern a hand-rolled `resolve_type_ann` would drop.
+- `tc_check_callable_arg_bodies(args_sl, skip_idx)` — walks `Closure` / `HandlerExpr` arguments,
+  descending through `NamedArg` so a labelled closure argument is not mistaken for a non-closure.
+
+Wired at four points: a new `HandlerExpr` arm, a new `Call` arm, the `MethodCall` arm after its
+List branch, and `NodeKind.Call` added to the ExprStmt re-dispatch.
+
+`skip_idx` is load-bearing, not defensive. The List-HOF path already walks arg 0 (arg 1 for
+`fold`) with the element/accumulator type bound, which is strictly better than the generic walk
+can do for an *unannotated* param; without the skip every `.map` / `.filter` / `.fold` closure in
+the corpus grows a duplicate diagnostic. Two test rows assert the count is exactly **1**.
+
+**One correction to the ticket.** Its MVCE 3 claimed `blink check` misses a `.map` closure's
+TypeError that `blink run` catches — i.e. that `check` is *unsound relative to* `run`. It is not.
+`check` reports it for both `.map` and `.filter`; the original reading came from output piped
+through `| head -6`, which truncated exactly above the error line. List HOFs were never part of
+this bug. MVCEs 1, 2 and 4 reproduce verbatim and stand.
+
+**Second bug, pre-existing, exposed by the widened walk.** Walking closure arguments broke
+`tests/test_for_each_skip_stops.bl` with `error[SkipOutsideTest]`. `tc_in_test_body` was answering
+two questions that want **opposite** answers inside a closure:
+
+| flag | question | inside a closure |
+|---|---|---|
+| `tc_in_test_body` | does `?` elaborate against the test block's implicit `Result[Void, TestError]`? | **no** — a closure gates `?` against its own declared return (spec §3c.2), which is why the closure walkers reset it |
+| `tc_in_test_lexical` | is this code lexically inside a `test { }` block? | **yes** — and the test-only symbol fences (E0827 `skip`, E0833 `assert_panics`) are the readers that mean this |
+
+Both fences read the elaboration flag. Split; the fences now read the lexical half, which
+`tc_check_test_block` sets and the closure/handler walkers never reset. **Not introduced by
+pgc3d9** — `skip()` inside a *List-HOF* closure in a test was already wrongly fenced, on a path
+this ticket never touched, verified directly. Two places already documented the intended behavior
+against the code: `tc_fence_test_only_symbol`'s comment (*"and inside closures lexically within
+it — testing.for_each's case body relies on this"*) and the header of
+`tests/test_e0833_assert_panics_outside_test.bl` (*"because tc_in_test_body stays set through such
+closures"*). It did not stay set; the split is what makes both statements true.
+`tc_in_test_lexical` joins its sibling in `tests/test_reset_staleness.bl`'s allowlist.
+
+**Measured.** Monolithic sweep, `tests/ examples/ src/`, on a strictly shared 873-root basis with
+both post-baseline test roots excluded:
+
+| | before | after |
+|---|---|---|
+| `missing` | 14 | **1** |
+| `diverge` | 5008 | 5008 |
+| `agree` | 362979 | 363457 |
+| shape cells | 423 | 421 |
+
+All 13 pgc3d9 cells gone — 10 handler `x` in `tests/fmt/*_handler_*`, 1 `i` in
+`tests/test_async_channels.bl`, 2 `err_text` in `src/cli.bl` + `src/build_stdlib.bl`. Diverge
+unchanged, so no new disagreements were introduced; `agree` up 478 because the newly-walked
+bodies now publish tids.
+
+The single surviving `missing` row is `copy_list_compound_elem.src` — `twq9kz`, which Stage 3
+replaces outright. **So the counter's no-fallback bucket is no longer blocked by a typecheck walk
+bug, and Stage 3's exit criterion is reachable.**
+
+`task regen` passed on the first attempt after the walk widened: the compiler's own
+previously-unwalked bodies, `src/cli.bl`'s `async.spawn` closure included, held no latent type
+errors. Test: `tests/test_pgc3d9_closure_arg_body_walk.bl`, 18 rows, red 9/15 before the fix —
+all three defects in every position, both dedup guards, an all-correct program asserting 0
+invented errors, the `skip`-in-closure / `skip`-in-helper pair, a *"`?` still gates against the
+closure's own return"* row that fails if the flag were merely un-reset instead of split, two
+tid-publication rows (the property Stage 3 needs), and two runtime rows.
 
 ## Appendix — all 428 shape cells
 

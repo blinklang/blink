@@ -1,0 +1,538 @@
+// br pgc3d9: a closure passed as a CALL ARGUMENT, and a `handler` method body in ANY position,
+// are never typechecked. `build/blink check` reports ok and `build/blink run` runs the program
+// with a Str living in an Int-declared variable.
+//
+//     fn take(f: fn() -> Void) { f() }
+//     fn main() {
+//         take(fn() {
+//             let bad: Int = "not an int"
+//             io.println("{bad}")
+//         })
+//     }
+//     $ build/blink check cls.bl   ->  ok: cls.bl
+//     $ build/blink run cls.bl     ->  not an int
+//
+// This is the sibling of br e0wmt6 (statement-position `async.scope` bodies), found while
+// fixing it, and it is BROADER: not async-specific, and position does not rescue it — the same
+// closure argument in initializer position is equally unchecked, unlike e0wmt6 where the
+// initializer form was always fine.
+//
+// THREE DEFECTS, ONE FAMILY. All three are the same missing re-dispatch in tc_check_body:
+//
+//   D1  a Closure argument to a Call. tc_check_body has NO Call arm at all — the function ends
+//       in a silent `let _skip = 0` fallthrough — and its ExprStmt arm re-dispatches only for
+//       `is_block_bearing(vk) || vk == MethodCall`, so a statement-position `take(fn() {...})`
+//       is dropped twice over.
+//
+//   D2  a Closure argument to a non-List MethodCall. The MethodCall arm walks closure bodies
+//       only when the receiver is a List (`is_elem_closure_hof` + `fold`) and returns
+//       immediately after, so `async.spawn(fn() { ... })` — the shape in our own src/cli.bl —
+//       is never walked. Its own comment says "Only List has closure-taking HOFs", which is
+//       true of the STDLIB and false of the language: any fn-typed param takes a closure.
+//
+//   D3  a `handler` method body, in EVERY position. tc_check_body has no HandlerExpr arm, so
+//       `handler MyEff { fn doit() -> Int { ... } }` is unwalked whether it is a call argument,
+//       inline in a `with`, or bound to a `let`. This is wider than the ticket first recorded:
+//       argument position is not the distinguishing factor here, the missing arm is.
+//       tc_check_body's WithBlock arm already ROUTES a handler item to tc_check_body — the
+//       route exists and lands on the fallthrough. Handler methods are ordinary parse_fn_def()
+//       FnDef nodes carrying `type_ann` (src/parser.bl:2116), so nothing about them is exotic.
+//
+// WHY THESE ARE BUGS AND NOT A DESIGN CHOICE. A closure bound to a `let` IS checked (row 7),
+// via tc_check_body's Closure arm -> tc_check_closure_body_against_own_ret -> a full
+// tc_check_body walk. So the body is walkable and the walker is correct; it is simply never
+// reached from these three positions. Two spellings of one program must give one answer.
+//
+// NOT A CHECK/RUN DIVERGENCE. The ticket originally claimed a fourth MVCE — that
+// `l.map(fn(x: Int) -> Int { let bad: Int = "not an int"; x })` is caught by `run` and missed
+// by `check`. That was a misreading of `check` output truncated by `| head -6` past the error
+// line. List HOFs are caught by BOTH, exactly as the MethodCall arm above says. Row 8 pins it,
+// and pins it as EXACTLY ONE diagnostic: the List-HOF path already walks arg 0, so a fix that
+// adds a generic closure-argument walk on top of it double-reports every `.map` in the corpus.
+// That row is the dedup guard, and it is the one row here most likely to catch a bad fix.
+//
+// TID PUBLICATION (why this blocks project 03p551 Stage 3). An unwalked body memoizes no tid,
+// so every `let` inside one reads `bucket=missing` in the Stage 2 tid-divergence sweep
+// (BLINK_TRACE_CHANNELS=tydiv) — the only bucket with NO flat fallback once Stage 4 deletes
+// ScopeVar's flat fields. 13 of the 14 residual missing cells in that sweep are this bug:
+// 2 `err_text` (src/cli.bl, src/build_stdlib.bl — our own source), 1 `i`
+// (tests/test_async_channels.bl), 10 `x` (tests/fmt/*_handler_*). Rows 11-12 assert the tid
+// directly, so the fix is pinned at the property Stage 3 actually needs, not just at the
+// diagnostic.
+
+import compiler.{compile_to_program}
+import typecheck.{check_types, tc_lookup_node_tid, tc_type_str}
+import parser.{nodes, node_kind, node_name}
+import ast.{NodeKind}
+import diagnostics.{diag_entries, diag_entry_count, diag_truncate}
+import std.io
+// Bare and LOAD-BEARING despite `warning[UnusedImport]` (br xrhq1c): codegen_types resolves
+// several globals it cannot import out of the MERGED program, and codegen_expr is the smallest
+// root whose transitive closure closes those back-references.
+import codegen_expr
+
+fn assert_eq_int(got: Int, want: Int, label: Str) {
+    if got != want { io.println("FAIL: {label} — got {got}, want {want}") }
+    assert(got == want)
+}
+
+fn assert_eq_str(got: Str, want: Str, label: Str) {
+    if got != want { io.println("FAIL: {label} — got '{got}', want '{want}'") }
+    assert(got == want)
+}
+
+fn assert_true(got: Bool, label: Str) {
+    if !got { io.println("FAIL: {label} — expected true") }
+    assert(got)
+}
+
+// Diagnostics this probe adds with the given name. The shared global diag buffer is truncated
+// back to where it was found: an unflushed entry would read as a failure of whichever test in
+// this binary flushes next.
+fn count_diag(path: Str, src: Str, want_name: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    write_file(path, src)
+    let program = compile_to_program(path, 1)
+    let before = diag_entry_count()
+    check_types(program)
+    fs.remove(path)
+
+    let mut hits = 0
+    let mut i = before
+    while i < diag_entries.len() {
+        let d = diag_entries.get(i).unwrap()
+        if d.severity == "error" && d.name == want_name { hits = hits + 1 }
+        i = i + 1
+    }
+    diag_truncate(before)
+    hits
+}
+
+fn typecheck_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    write_file(path, src)
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    fs.remove(path)
+}
+
+fn let_tid(vname: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.LetBinding && node_name(i) == vname {
+            return tc_lookup_node_tid(i)
+        }
+        i = i + 1
+    }
+    -1
+}
+
+fn tid_str_of(tid: Int) -> Str {
+    if tid < 0 { return "NONE" }
+    tc_type_str(tid)
+}
+
+// ── D1 — a Closure argument to a Call ───────────────────────────────────────────
+
+fn call_arg_stmt_src() -> Str {
+    #"fn take(f: fn() -> Int) -> Int { f() }
+fn main() {
+    take(fn() -> Int {
+        let bad: Int = "not an int"
+        7
+    })
+}
+"#
+}
+
+test "a type error in a closure argument to a call is reported (statement position)" {
+    let hits = count_diag("build/pgc3d9_call_stmt.bl", call_arg_stmt_src(), "TypeError")
+    assert_eq_int(hits, 1, "TypeError inside a closure passed to take()")
+}
+
+fn call_arg_init_src() -> Str {
+    #"fn take(f: fn() -> Int) -> Int { f() }
+fn main() {
+    let v = take(fn() -> Int {
+        let bad: Int = "not an int"
+        7
+    })
+    io.println("{v}")
+}
+"#
+}
+
+// Unlike br e0wmt6, INITIALIZER position does not rescue this one — both spellings were
+// unchecked, so both need pinning. If a fix only reaches one, this row and the one above
+// disagree and name which.
+test "a type error in a closure argument is reported in initializer position too" {
+    let hits = count_diag("build/pgc3d9_call_init.bl", call_arg_init_src(), "TypeError")
+    assert_eq_int(hits, 1, "TypeError inside a closure passed to take() in a let initializer")
+}
+
+// An UNANNOTATED closure argument (`fn() { ... }`, no `-> T`) is the original MVCE and takes a
+// different path to its declared return (tc_closure_declared_ret answers Void for it). A fix
+// keyed on the annotation being present would pass the two rows above and fail here.
+fn call_arg_unannotated_src() -> Str {
+    #"fn take(f: fn() -> Void) { f() }
+fn main() {
+    take(fn() {
+        let bad: Int = "not an int"
+        io.println("{bad}")
+    })
+}
+"#
+}
+
+test "a type error in an UNANNOTATED closure argument is reported" {
+    let hits = count_diag("build/pgc3d9_call_unann.bl", call_arg_unannotated_src(), "TypeError")
+    assert_eq_int(hits, 1, "TypeError inside an unannotated closure argument")
+}
+
+// ── D2 — a Closure argument to a non-List MethodCall ────────────────────────────
+
+fn spawn_arg_src() -> Str {
+    #"fn main() {
+    async.scope {
+        async.spawn(fn() {
+            let bad: Int = "not an int"
+            io.println("{bad}")
+        })
+    }
+}
+"#
+}
+
+test "a type error inside an async.spawn closure body is reported" {
+    let hits = count_diag("build/pgc3d9_spawn.bl", spawn_arg_src(), "TypeError")
+    assert_eq_int(hits, 1, "TypeError inside async.spawn's closure — the src/cli.bl shape")
+}
+
+// ── D3 — a handler method body, in all three positions ──────────────────────────
+//
+// The effect declaration is shared; only where the `handler` sits changes. Three rows because
+// the ticket recorded this as argument-only and it is not: the missing HandlerExpr arm makes
+// every position equally unwalked, and a fix that only widens call arguments leaves two of
+// these three red.
+
+// Spelled out in full three times rather than assembled by concat: `{` inside a "..." string
+// starts interpolation, so a source template that contains a brace has to be a raw #"..."#
+// string anyway, and three whole raw strings read better than three spliced ones.
+
+fn handler_as_arg_src() -> Str {
+    #"effect MyEff {
+    effect Op {
+        fn doit() -> Int
+    }
+}
+
+fn caller(h: Handler[MyEff]) -> Int {
+    with h { myeff.doit() }
+}
+
+fn main() {
+    let v = caller(handler MyEff {
+        fn doit() -> Int {
+            let bad: Int = "not an int"
+            2
+        }
+    })
+    io.println("{v}")
+}
+"#
+}
+
+test "a type error in a handler method body is reported (handler as a call argument)" {
+    let hits = count_diag("build/pgc3d9_h_arg.bl", handler_as_arg_src(), "TypeError")
+    assert_eq_int(hits, 1, "TypeError in a handler passed to caller()")
+}
+
+fn handler_inline_with_src() -> Str {
+    #"effect MyEff {
+    effect Op {
+        fn doit() -> Int
+    }
+}
+
+fn main() {
+    let v = with handler MyEff {
+        fn doit() -> Int {
+            let bad: Int = "not an int"
+            2
+        }
+    } { myeff.doit() }
+    io.println("{v}")
+}
+"#
+}
+
+test "a type error in a handler method body is reported (handler inline in a with)" {
+    let hits = count_diag("build/pgc3d9_h_with.bl", handler_inline_with_src(), "TypeError")
+    assert_eq_int(hits, 1, "TypeError in a handler written inline in a with block")
+}
+
+fn handler_let_bound_src() -> Str {
+    #"effect MyEff {
+    effect Op {
+        fn doit() -> Int
+    }
+}
+
+fn main() {
+    let h = handler MyEff {
+        fn doit() -> Int {
+            let bad: Int = "not an int"
+            2
+        }
+    }
+    let v = with h { myeff.doit() }
+    io.println("{v}")
+}
+"#
+}
+
+// The WithBlock arm already routes the inline form to tc_check_body — it lands on the
+// fallthrough. So these rows distinguish "the route is missing" from "the arm is missing"; it
+// is the latter.
+test "a type error in a handler method body is reported (handler bound to a let)" {
+    let hits = count_diag("build/pgc3d9_h_let.bl", handler_let_bound_src(), "TypeError")
+    assert_eq_int(hits, 1, "TypeError in a let-bound handler")
+}
+
+// ── Controls: what already worked must keep working, exactly once ────────────────
+
+fn let_closure_src() -> Str {
+    #"fn main() {
+    let f = fn() {
+        let bad: Int = "not an int"
+        io.println("{bad}")
+    }
+    f()
+}
+"#
+}
+
+// The control that makes every row above a bug report: this spelling was ALWAYS checked.
+test "a let-bound closure body stays checked" {
+    let hits = count_diag("build/pgc3d9_letcls.bl", let_closure_src(), "TypeError")
+    assert_eq_int(hits, 1, "TypeError in a let-bound closure (the working control)")
+}
+
+fn list_hof_src() -> Str {
+    #"fn main() {
+    let l = [1, 2, 3]
+    let m = l.map(fn(x: Int) -> Int {
+        let bad: Int = "not an int"
+        x + 1
+    })
+    io.println("{m.len()}")
+}
+"#
+}
+
+// THE DEDUP GUARD. The List-HOF path in tc_check_body's MethodCall arm already walks argument 0
+// via check_closure_body. A fix that adds a generic closure-argument walk without excluding the
+// arg the HOF path already took reports this twice — `want 1, got 2` — and every `.map` /
+// `.filter` / `.fold` in the corpus grows a duplicate error. Asserting the COUNT, not
+// `hits > 0`, is the whole point of this row.
+test "a List HOF closure body reports exactly one error, not two" {
+    let hits = count_diag("build/pgc3d9_hof.bl", list_hof_src(), "TypeError")
+    assert_eq_int(hits, 1, "exactly one TypeError for a List.map closure body — no double-report")
+}
+
+fn fold_src() -> Str {
+    #"fn main() {
+    let l = [1, 2, 3]
+    let s = l.fold(0, fn(acc: Int, x: Int) -> Int {
+        let bad: Int = "not an int"
+        acc + x
+    })
+    io.println("{s}")
+}
+"#
+}
+
+// `fold`'s closure is argument 1, not 0 — a dedup keyed on "skip index 0" passes the row above
+// and double-reports here.
+test "a List fold closure body reports exactly one error, not two" {
+    let hits = count_diag("build/pgc3d9_fold.bl", fold_src(), "TypeError")
+    assert_eq_int(hits, 1, "exactly one TypeError for a List.fold closure body")
+}
+
+// Widening a walk is worthless if it invents errors in code that already compiles. This is the
+// same program shape as every row above with the type error removed.
+fn all_good_src() -> Str {
+    #"effect MyEff {
+    effect Op {
+        fn doit() -> Int
+    }
+}
+
+fn caller(h: Handler[MyEff]) -> Int {
+    with h { myeff.doit() }
+}
+
+fn take(f: fn() -> Int) -> Int { f() }
+
+fn main() {
+    let a = take(fn() -> Int {
+        let ok: Int = 1
+        ok + 6
+    })
+    let b = caller(handler MyEff {
+        fn doit() -> Int {
+            let ok: Int = 2
+            ok
+        }
+    })
+    let l = [1, 2, 3]
+    let m = l.map(fn(x: Int) -> Int { x + 1 })
+    async.scope {
+        async.spawn(fn() {
+            let ok: Int = 3
+            io.println("{ok}")
+        })
+    }
+    io.println("{a} {b} {m.len()}")
+}
+"#
+}
+
+test "correct closure and handler bodies stay error-free" {
+    let hits = count_diag("build/pgc3d9_good.bl", all_good_src(), "TypeError")
+    assert_eq_int(hits, 0, "no TypeError invented in correct closure/handler/spawn bodies")
+}
+
+// ── The flag the widened walk exposed: lexical test-ness vs `?` elaboration ──────
+//
+// Walking closure arguments made tests/test_for_each_skip_stops.bl fail to compile with
+// `error[SkipOutsideTest]`, because tc_in_test_body was answering two questions at once and
+// the closure walkers reset it for the `?`-elaboration one (spec §3c.2). The fences for
+// test-only symbols ask a purely LEXICAL question and want the opposite answer. Split into
+// tc_in_test_body + tc_in_test_lexical.
+//
+// This was NOT introduced by the widened walk — `skip()` inside a List-HOF closure
+// (`l.for_each(fn(x) { skip(...) })`) was already wrongly fenced on a path pgc3d9 never
+// touched. The widened walk only made it reachable from `testing.for_each`.
+
+fn skip_in_closure_src() -> Str {
+    #"import std.testing.{skip}
+
+test "skip inside a closure lexically within the test" {
+    let l = [1, 2, 3]
+    l.for_each(fn(x: Int) {
+        if x == 2 { skip("stop") }
+    })
+}
+"#
+}
+
+test "skip() inside a closure lexically within a test is accepted" {
+    let hits = count_diag("build/pgc3d9_skip_ok.bl", skip_in_closure_src(), "SkipOutsideTest")
+    assert_eq_int(hits, 0, "no E0827 for skip() in a closure inside a test body")
+}
+
+fn skip_in_helper_src() -> Str {
+    #"import std.testing.{skip}
+
+fn helper() {
+    skip("nope")
+}
+
+test "t" {
+    helper()
+}
+"#
+}
+
+// The fence must still FENCE. A fix that simply stopped resetting the flag, or read a constant
+// 1, would pass the row above and lose E0827 entirely — this row is what makes the pair
+// meaningful.
+test "skip() in a plain helper fn is still fenced" {
+    let hits = count_diag("build/pgc3d9_skip_bad.bl", skip_in_helper_src(), "SkipOutsideTest")
+    assert_eq_int(hits, 1, "E0827 still fires for skip() outside any test body")
+}
+
+fn qm_in_closure_src() -> Str {
+    #"test "t" {
+    let f = fn() -> Int {
+        let r: Result[Int, Str] = Ok(1)
+        let v = r?
+        v
+    }
+    io.println("{f()}")
+}
+"#
+}
+
+// THE SPLIT GUARD. `?` inside a closure must keep gating against the CLOSURE's declared return
+// (`-> Int`, not a Result) and not the test block's implicit Result[Void, TestError] — spec
+// §3c.2, and the whole reason tc_in_test_body is reset by the closure walkers. If the fix had
+// removed that reset instead of splitting the flag, this `?` would take the test-body branch
+// and E0512 would vanish. So this row and the two skip rows above can only pass together if the
+// two questions really are asked of two different flags.
+test "`?` inside a closure still gates against the closure's own return type" {
+    let hits = count_diag("build/pgc3d9_qm.bl", qm_in_closure_src(), "QuestionMarkResultInNonResult")
+    assert_eq_int(hits, 1, "`?` in a non-Result closure inside a test body is still an error")
+}
+
+// ── Tid publication — the property project 03p551 Stage 3 needs ──────────────────
+
+fn tid_src() -> Str {
+    #"fn take(f: fn() -> Int) -> Int { f() }
+fn main() {
+    let v = take(fn() -> Int {
+        let inner_s = "text"
+        let inner_n = 41
+        inner_n + inner_s.len()
+    })
+    io.println("{v}")
+}
+"#
+}
+
+// `bucket=missing` in the tydiv sweep is exactly this: an unwalked body memoizes no tid, and
+// after Stage 4 deletes ScopeVar's flat fields there is nothing to fall back to. Two DIFFERENT
+// types on purpose — a walk that published one fabricated tid for everything would pass a
+// single-type row.
+test "a let inside a closure argument carries a tid" {
+    typecheck_probe("build/pgc3d9_tid.bl", tid_src())
+    let ts = let_tid("inner_s")
+    assert_true(ts >= 0, "inner_s has a tid at all (was -1, bucket=missing)")
+    assert_eq_str(tid_str_of(ts), "Str", "inner_s is Str")
+}
+
+test "a second let inside a closure argument carries its own distinct tid" {
+    typecheck_probe("build/pgc3d9_tid2.bl", tid_src())
+    assert_eq_str(tid_str_of(let_tid("inner_n")), "Int", "inner_n is Int, not inner_s's type")
+}
+
+// ── Runtime: the programs still run, and still produce the right answers ─────────
+
+fn hrun() -> Handler[MyEff2] {
+    handler MyEff2 {
+        fn twice(n: Int) -> Int {
+            let doubled = n + n
+            doubled
+        }
+    }
+}
+
+effect MyEff2 {
+    effect Op {
+        fn twice(n: Int) -> Int
+    }
+}
+
+fn apply(f: fn(Int) -> Int, n: Int) -> Int { f(n) }
+
+test "runtime: a closure argument still runs and returns the right value" {
+    let got = apply(fn(x: Int) -> Int {
+        let step = 20
+        x + step
+    }, 22)
+    assert_eq_int(got, 42, "closure argument through a fn-typed param")
+}
+
+test "runtime: a handler method body still runs and returns the right value" {
+    let got = with hrun() { myeff2.twice(21) }
+    assert_eq_int(got, 42, "handler method through a with block")
+}

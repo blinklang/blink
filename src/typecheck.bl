@@ -2183,6 +2183,91 @@ fn check_closure_body(cls: Int, p0_t: Int, p1_t: Int) ! TypeCheck.Resolve, TypeC
     nr_pop_scope()
 }
 
+// br pgc3d9 — the third entry point into a body that is its own fn context. A handler method
+// is an ordinary parse_fn_def() FnDef node (src/parser.bl:2116) that lives in a HandlerExpr's
+// `methods` sublist rather than the program's, so check_types' top-level tc_check_fn walk never
+// reaches it and lookup_fnsig has no entry under its bare name. Nothing else about it is
+// special: it has params to bind and its own declared return to check the body and the implicit
+// tail against. Mirrors tc_check_fn with the fnsig lookup replaced by the node's own
+// annotation, so `handler MyEff { fn doit() -> Int { let bad: Int = "not an int"; 2 } }` reports
+// the same error the identical named fn would.
+//
+// tc_closure_declared_ret reads only node_type_ann, which parse_fn_def sets from the same
+// parse_type_annotation() the sole Closure producer uses, so it resolves a handler method's
+// return with no closure-specific behavior — including the generic-instance re-intern a
+// hand-rolled resolve_type_ann here would drop.
+//
+// tc_current_fn_name/tc_current_fn_ret are genuinely saved and restored; the tc_check_body call
+// mutates plenty of other global state (tc_errors, ty_pool, nr_* scope) that this does not save
+// around it, which the analyzer correctly flags (mirrors tc_check_fn and
+// tc_check_closure_body_against_own_ret).
+@allow(UnrestoredMutation, IncompleteStateRestore)
+fn tc_check_handler_method(m: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    if m == -1 || node_kind(m) != NodeKind.FnDef { return }
+    let body = node_body(m)
+    if body == -1 { return }
+    let mname = node_name(m)
+    let prev_fn_name = tc_current_fn_name
+    let prev_fn_ret = tc_current_fn_ret
+    tc_current_fn_name = mname
+    tc_current_fn_ret = tc_closure_declared_ret(m)
+
+    nr_push_scope()
+    let params_sl = node_params(m)
+    if params_sl != -1 {
+        let mut i = 0
+        while i < sublist_length(params_sl) {
+            let p = sublist_get(params_sl, i)
+            nr_define_typed(node_name(p), 0, resolve_param_type(p))
+            i = i + 1
+        }
+    }
+    if node_kind(body) == NodeKind.Block { tc_fn_body_block = 1 }
+    // Same reason as the closure walker: a handler method body is its own fn context, so `?`
+    // inside it gates against this method's return type and not an enclosing test block's
+    // implicit Result[Void, TestError] (spec §3c.2).
+    let saved_in_test = tc_in_test_body
+    tc_in_test_body = 0
+    tc_check_body(body)
+    tc_in_test_body = saved_in_test
+    tc_check_missing_tail_value(body, tc_current_fn_ret, mname, m)
+    nr_pop_scope()
+
+    tc_current_fn_name = prev_fn_name
+    tc_current_fn_ret = prev_fn_ret
+}
+
+// br pgc3d9 — walk the BODY of every Closure / HandlerExpr argument at a call site. Before this,
+// tc_check_body had no way in: infer_type validates a closure argument's declared annotation
+// against the param type (Part A, check_closure_ret) but never visits its statements, so
+// `take(fn() { let bad: Int = "not an int" })` typechecked clean and RAN, printing a Str out of
+// an Int-declared variable. A closure bound to a `let` was always checked, so position alone
+// decided whether code was checked — the same shape of hole as br e0wmt6.
+//
+// `skip_idx` is the argument the caller already walked itself. The List-HOF path in the
+// MethodCall arm binds arg 0 (arg 1 for `fold`) to the element/accumulator type via
+// check_closure_body, which is strictly better than what this function can do for an
+// unannotated param, and walking it a second time would report every diagnostic inside every
+// `.map`/`.filter`/`.fold` closure in the corpus twice. -1 means nothing to skip.
+//
+// A NamedArg wraps its value, so descend through it rather than treating a labelled closure
+// argument as a non-closure.
+fn tc_check_callable_arg_bodies(args_sl: Int, skip_idx: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    if args_sl == -1 { return }
+    let mut i = 0
+    while i < sublist_length(args_sl) {
+        if i != skip_idx {
+            let mut a = sublist_get(args_sl, i)
+            if a != -1 && node_kind(a) == NodeKind.NamedArg { a = node_value(a) }
+            if a != -1 {
+                let ak = node_kind(a)
+                if ak == NodeKind.Closure || ak == NodeKind.HandlerExpr { tc_check_body(a) }
+            }
+        }
+        i = i + 1
+    }
+}
+
 // ── Error reporting ─────────────────────────────────────────────────
 
 fn tc_error(msg: Str) ! TypeCheck.Report, Diag.Report {
@@ -5686,12 +5771,15 @@ fn is_test_only_symbol(name: Str) -> Int {
 
 // Shared fence for §2.20 test-only symbols. `code`/`short_name` are
 // parameterized so a future symbol (assert_panics) can fence with E0833.
-// tc_in_test_body is 1 inside the test block (and inside closures lexically
-// within it — testing.for_each's case body relies on this); it is 0 in a
+// tc_in_test_lexical is 1 inside the test block AND inside closures lexically
+// within it — testing.for_each's case body relies on this; it is 0 in a
 // regular fn, so calling a test-only symbol from a helper fn is fenced even
-// when that helper is reachable from a test.
+// when that helper is reachable from a test. This asks a purely LEXICAL
+// question, which is why it is not tc_in_test_body: that flag is reset by the
+// closure walkers for `?` elaboration (spec §3c.2) and would fence every
+// test-only symbol inside a walked closure body (br pgc3d9).
 fn tc_fence_test_only_symbol(name: Str, code: Str, short_name: Str, node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
-    if is_test_only_symbol(name) != 0 && tc_in_test_body == 0 {
+    if is_test_only_symbol(name) != 0 && tc_in_test_lexical == 0 {
         diag_error_at(short_name, code,
             "{name}() can only be called inside a test body",
             node, "move the call into a 'test \{ ... }' block")
@@ -10121,8 +10209,25 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         return
     }
 
+    // br pgc3d9: without this arm a handler's method bodies were unwalked in EVERY position —
+    // as a call argument, written inline in a `with`, or bound to a `let`. The WithBlock arm
+    // above already ROUTES an inline handler here; it landed on this function's silent
+    // `let _skip = 0` fallthrough. So the route was never the missing piece, the arm was.
+    if kind == NodeKind.HandlerExpr {
+        let hm_sl = node_methods(node)
+        if hm_sl != -1 {
+            let mut hi = 0
+            while hi < sublist_length(hm_sl) {
+                tc_check_handler_method(sublist_get(hm_sl, hi))
+                hi = hi + 1
+            }
+        }
+        return
+    }
+
     if kind == NodeKind.AssertPanics {
-        if tc_in_test_body == 0 {
+        // Lexical, like the E0827 skip fence — see tc_in_test_lexical's declaration.
+        if tc_in_test_lexical == 0 {
             diag_error_at("AssertPanicsOutsideTest", ASSERT_PANICS_OUTSIDE_TEST,
                 "assert_panics can only be used inside a test body",
                 node, "move it into a 'test \{ ... }' block")
@@ -10198,8 +10303,12 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             // MatchExpr branch above, not here. is_block_bearing is the single source
             // of truth for THIS re-dispatch so a future block-bearing kind cannot
             // silently lose statement-walking coverage here.
+            // br pgc3d9: NodeKind.Call joins MethodCall here for the same reason MethodCall was
+            // already listed — a statement-position call can carry a closure argument whose
+            // body needs walking (`take(fn() { ... })`). Both arms are narrow by construction:
+            // they walk callable arguments only, never arbitrary statement values.
             let vk = node_kind(val)
-            if is_block_bearing(vk) || vk == NodeKind.MethodCall {
+            if is_block_bearing(vk) || vk == NodeKind.MethodCall || vk == NodeKind.Call {
                 tc_check_body(val)
             }
         }
@@ -10230,21 +10339,42 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         // infer_type already validated explicit closure annotations (Part A) and
         // ran arg/method checks during the binding/ExprStmt inference. Here we add
         // the Part B body walk: bind unannotated closure params to the elem/acc
-        // type and type-check the body once. Only List has closure-taking HOFs.
+        // type and type-check the body once.
         let obj_t = infer_type(node_obj(node))
+        let args_sl = node_args(node)
+        // The argument the List-HOF path walks itself, so the generic walk below does not
+        // report its contents a second time.
+        let mut hof_arg = -1
         if type_kind(obj_t) == TyKind.List {
             let method = node_method(node)
-            let args_sl = node_args(node)
             let elem = ty_pool.get(obj_t).unwrap().inner1
             if is_elem_closure_hof(method) != 0 {
                 check_closure_body(closure_arg_at(args_sl, 0), elem, -1)
+                hof_arg = 0
             } else if method == "fold" {
                 if args_sl != -1 && sublist_length(args_sl) >= 2 {
                     let acc_t = infer_type(sublist_get(args_sl, 0))
                     check_closure_body(sublist_get(args_sl, 1), acc_t, elem)
+                    hof_arg = 1
                 }
             }
         }
+        // br pgc3d9: the branch above used to be the whole arm, under the comment "Only List
+        // has closure-taking HOFs". That is true of the STDLIB and false of the LANGUAGE — any
+        // fn-typed param takes a closure, and `async.spawn(fn() { ... })` (the shape in our own
+        // src/cli.bl) is a MethodCall on a receiver that is not a List. Those bodies were never
+        // walked at all.
+        tc_check_callable_arg_bodies(args_sl, hof_arg)
+        return
+    }
+
+    // br pgc3d9: a plain call had NO arm here, so `take(fn() { ... })` fell through to the
+    // silent tail below and its closure argument's body was never typechecked in either
+    // position. Only the callable arguments need walking: infer_type has already visited every
+    // argument expression, and recursing unconditionally would surface the spurious errors the
+    // ExprStmt arm's comment describes.
+    if kind == NodeKind.Call {
+        tc_check_callable_arg_bodies(node_args(node), -1)
         return
     }
 
@@ -10568,7 +10698,30 @@ fn tc_node_contains_question_op(node: Int) -> Int {
     0
 }
 
+// Two DIFFERENT questions used to share tc_in_test_body, and they want opposite answers inside
+// a closure (br pgc3d9):
+//
+//   tc_in_test_body     "does `?` here elaborate against the test block's implicit
+//                        Result[Void, TestError]?"  Inside a closure the answer is NO — a
+//                        closure body gates `?` against its OWN declared return (spec §3c.2),
+//                        so the closure walkers reset this to 0.
+//
+//   tc_in_test_lexical  "is this code lexically inside a `test { ... }` block?"  Inside a
+//                        closure the answer is YES, and the test-only symbol fences (E0827
+//                        skip, E0833 assert_panics) are the readers that mean this one. The
+//                        closure walkers must NOT reset it.
+//
+// Both fence sites were reading the elaboration flag, so a `skip()` in a closure lexically
+// inside a test was rejected the moment anything walked that closure body — reachable via the
+// List-HOF path (`l.for_each(fn(x) { skip(...) })`) long before pgc3d9 widened the walk to
+// `testing.for_each`. Two places already documented the intended behavior against the code:
+// tc_fence_test_only_symbol's comment ("and inside closures lexically within it —
+// testing.for_each's case body relies on this") and the header of
+// tests/test_e0833_assert_panics_outside_test.bl ("it IS allowed inside a closure that is
+// lexically within a test body ... because tc_in_test_body stays set through such closures").
+// It did not stay set; splitting the flag is what makes both statements true.
 let mut tc_in_test_body: Int = 0
+let mut tc_in_test_lexical: Int = 0
 let mut tc_in_assert_panics: Int = 0
 
 pub fn sanitize_test_name(name: Str) -> Str {
@@ -10618,8 +10771,10 @@ fn tc_check_test_block(tb: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repo
     let prev_fn_name = tc_current_fn_name
     let prev_fn_ret = tc_current_fn_ret
     let prev_in_test = tc_in_test_body
+    let prev_in_test_lex = tc_in_test_lexical
     tc_current_fn_name = "__test_{sanitized}"
     tc_in_test_body = 1
+    tc_in_test_lexical = 1
 
     if tc_node_contains_question_op(tbody) != 0 {
         // Elaborate to Result[Void, TestError]. TestError must be visible
@@ -10641,6 +10796,7 @@ fn tc_check_test_block(tb: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repo
     tc_current_fn_name = prev_fn_name
     tc_current_fn_ret = prev_fn_ret
     tc_in_test_body = prev_in_test
+    tc_in_test_lexical = prev_in_test_lex
 }
 
 
