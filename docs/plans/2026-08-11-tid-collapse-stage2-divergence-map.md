@@ -193,8 +193,9 @@ not Stage 3 work:
 | `zs7khh` | P2 | *(first sub-mechanism of the ranked top cause)* static `Type.from` / `Type.try_from` resolved no return type — the fnsig key is source-typed `{T}_{m}_{Src}`, and neither key the call site tried can name it — 10 family-A cells |
 | `3xhh59` | P2 | *(exposed by `zs7khh`)* an impl method spelling `-> Self` registers the literal `Self` typevar as its fnsig return; a typevar is as permissive as `TYPE_UNKNOWN`, so the compare stays disabled |
 | `2r96m9` | P2 | *(second sub-mechanism of the ranked top cause)* `Bytes.zeroed` / `Bytes.from_str` produced no type — `get_builtin_fn_ret` is keyed on the type name alone, so a mirror gated on `method == "new"` could not name them — **−354 family-A rows, the largest reduction so far**, and it was masking a real miscompile |
-| `w13xgb` | P1 | *(the new #1, from the post-`2r96m9` re-rank)* `Ptr[T]` intrinsics `offset` / `deref` / `is_null` resolve no return type — 165 rows |
-| `rbd0a4` | P2 | *(#2, same audit)* `Str` intrinsic aliases `substr` / `charAt` and `Int.to_string()` resolve no return type — 147 rows |
+| `w13xgb` | P1 | *(the outright #1 after `rbd0a4`)* `Ptr[T]` intrinsics `offset` / `deref` / `is_null` resolve no return type — 176 rows, 165 of them in `lib/std/libc.bl`, **35% of all family-A rows left**. Needs a `TyKind.Ptr` variant first, as its own regen |
+| `rbd0a4` | P2 | *(#2, same audit)* `Str` intrinsic aliases `substr` / `charAt` and `Int.to_string()` resolve no return type — **−157 rows**; the ticket's four names split three ways, and `charAt` turned out to name a method that does not exist at all |
+| `xfrd4j` | P2 | *(exposed while scoping `rbd0a4`)* typecheck's allow-list affirms `Int.to_str()`, `Str.to_float()` and `to_string()` on a `Bool` or sized int, which codegen does not implement — the error lands at codegen, so `blink check` is untrustworthy for them |
 
 `k9agr8` gates the *measurement*, not the code: without it Stage 3 can only demonstrate 0
 in archive-linked mode.
@@ -1404,15 +1405,15 @@ these four sweeps, tallied on the **intersection of their file sets** (874 files
 do not appear in all four are listed under the `nz7drz` correction note). `scratchpad/cells.sh`
 takes that allow-list as a required argument.
 
-| | before `nz7drz` | after `nz7drz` | after `bfq7nf` | after `3c4g71` | after `zs7khh` | after `2r96m9` |
-|---|---:|---:|---:|---:|---:|---:|
-| **total cells** | 423 | 421 | 409 | 407 | 405 | **404** |
-| family A (`tid=?`) cells | 84 | 61 | 47 | 45 | 35 | **34** |
-| family A rows | 1323 | 1224 | 1190 | 1050 | 1015 | **661** |
-| `Fn`-flat `tid=?` cells | 16 | 2 | 0 | 0 | 0 | **0** |
-| agree | 362979 | 363711 | 363924 | 364187 | 364289 | **364674** |
-| diverge rows | 5008 | 5003 | 4976 | 4837 | 4828 | **4474** |
-| missing | 14 | 1 | 1 | 1 | 1 | **1** |
+| | before `nz7drz` | after `nz7drz` | after `bfq7nf` | after `3c4g71` | after `zs7khh` | after `2r96m9` | after `rbd0a4` |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| **total cells** | 423 | 421 | 409 | 407 | 405 | 404 | **404** |
+| family A (`tid=?`) cells | 84 | 61 | 47 | 45 | 35 | 34 | **34** |
+| family A rows | 1323 | 1224 | 1190 | 1050 | 1015 | 661 | **504** |
+| `Fn`-flat `tid=?` cells | 16 | 2 | 0 | 0 | 0 | 0 | **0** |
+| agree | 362979 | 363711 | 363924 | 364187 | 364289 | 364674 | **364831** |
+| diverge rows | 5008 | 5003 | 4976 | 4837 | 4828 | 4474 | **4317** |
+| missing | 14 | 1 | 1 | 1 | 1 | 1 | **1** |
 
 **Cells move by 2 while rows move by 140, and that is the honest reading.** A cell is a
 `(site, tid, flat)` shape triple, so the 17 retired *declaration sites* mostly shared their flat
@@ -1525,7 +1526,65 @@ plus the miscompile), 13 green after. Argument type/arity checking for the `Byte
 deliberately **not** added: that is a new diagnostic surface and a separate decision. `task regen` +
 `task ci` green.
 
-### Remaining family-A causes, ranked (34 cells / 661 rows)
+### `rbd0a4` — `Str` and numeric intrinsics with no arm in the return dispatch (CLOSED)
+
+The first cause taken from the 172-name audit below, and the first one whose **scope the ticket got
+wrong**. The ticket named four methods as one hole. Probing split them three ways, and only the
+first group was a missing return type:
+
+1. **Real, working, and unnamed in typecheck** — the fix. `substr` on a `Str`; `to_string` on an
+   `Int` and on a `Float` (`codegen_methods.bl:3879`, `:3884`); `to_float` on an `Int` (`:3777`);
+   `to_int` on a `Float` (`:3782`). A **`Float` receiver had no block at all** in the dispatch —
+   `to_int` was answered only inside the `Str` block — so `1.7.to_int()` resolved nothing although
+   codegen had implemented it all along. `substr` shares the `substring` arm rather than getting a
+   copy of it, because codegen dispatches both from **one** arm (`codegen_methods.bl:922` spells
+   `"substring" || "substr"`) and two arms could drift.
+2. **Does not exist at all** — `charAt`. It was the *only* mention of that spelling in the whole
+   compiler: no codegen arm, no stdlib function, zero uses across `src/ lib/ tests/ examples/`. Its
+   only effect was to suppress the one `UnknownMethod` warning a user would get before the hard
+   `UnresolvedMethod` at codegen. The fix is to **remove it from the allow-list**, not to give it a
+   return type — that list asserts a method *exists* (it also gates the resolution check at
+   `typecheck.bl:388`), so a name with nothing behind it belongs out of it.
+3. **Deferred** — `as_cstr` returns `CT_PTR` (`codegen_methods.bl:857`) and typecheck has no
+   `TyKind.Ptr` variant at all. That is `w13xgb`, which has to add the variant first.
+
+Deliberately **not** widened: `to_string` on a `Bool` or a sized int, and `to_float` on a `Str`.
+Codegen implements none of the three, so answering them here would invent surface. Together with
+`Int.to_str()` — which the allow-list affirms and codegen lacks — they are the inverse defect and
+are filed separately as **`xfrd4j`**: the error lands at codegen, so `blink check` is untrustworthy
+for them.
+
+| | after `2r96m9` | after `rbd0a4` | delta |
+|---|---:|---:|---:|
+| family A rows | 661 | **504** | **−157 (−23.8%)** |
+| `tid=? flat=Str` rows | 217 | 61 | −156 |
+| `tid=? flat=Int` rows | 86 | 85 | −1 |
+| diverge rows | 4474 | 4317 | −157 |
+| total cells | 404 | 404 | **0** |
+| family A cells | 34 | 34 | **0** |
+
+The retired rows attribute to exactly nine source lines times the roots that link them: **147** are
+the five `.substr()` let-bindings in the compiler's own source (`codegen_types:4647`, `:6663`,
+`typecheck:7553`, `codegen_stmt:1804`, `:2116`), **6** are `lib/std/http_server.bl:229,230`
+(`resp.status.to_string()` and `resp.body.len().to_string()`), and 4 are two small pairs in test
+roots.
+
+**Zero cells retired** — the first fix in the campaign to move rows without moving a single cell.
+`tid=? flat=Str` at `emit_let_binding.decl` still has other producers, 61 rows of them, and what
+remains there is now a **scattered tail rather than one cause**: a cross-module `List[Str]` element
+(`symbol_index.si_file_path.get(i).unwrap()`), `List.join`, and `io.read_line()`. Each is already a
+separate entry in the ranking below. This is the clearest case yet that rows are the honest progress
+signal during the cause-by-cause phase and cells are Stage 3's exit gate, not a per-fix scorecard.
+
+Test: `tests/test_rbd0a4_str_num_intrinsic_ret_tid.bl`, 16 rows — 6 red before, all green after. The
+`charAt` row cannot use `compile_test_helpers.expect_warning`: that helper (like `expect_error`,
+`expect_contains` and `expect_clean`) only **prints** a PASS/FAIL line and asserts nothing, so a row
+built on it passes green either way. It uses `compile_and_capture` + `assert`. Controls green
+throughout: `substring`, `char_at` (→ `Option[Char]`), `Str.to_int`, `parse_float`, `Int.to_i32` —
+these catch a fix that reorders the receiver blocks or puts the new `Float` block ahead of the `Str`
+one. `task regen` + `task ci` green.
+
+### Remaining family-A causes, ranked (34 cells / 504 rows)
 
 Re-ranked from the post-`2r96m9` sweep, by **rows on the 874-file common basis**, grouped by the
 innermost producer (the outermost call is usually a symptom — `.unwrap()` heads many chains, but its
@@ -1546,21 +1605,43 @@ now measured rather than met one instance at a time.
 
 | cause | rows | ticket | note |
 |---|---:|---|---|
-| `Ptr[T]` intrinsics — `buf.offset(i)`, `p.deref()`, `p.is_null()` | 165 | **`w13xgb`** (P1) | `lib/std/libc.bl:52`, `:68`. Answers need the receiver's element tid, not a fixed type |
-| `Str` intrinsic aliases — `s.substr(a,b)`, `s.charAt(i)`, `n.to_string()` | 147 | **`rbd0a4`** | `substr`/`charAt` are aliases codegen dispatches (`codegen_methods.bl:922`) and the return block (`typecheck.bl:8939`) never learned; answers are fixed per name |
-| `net.*` — `net.connect` / `listen` / `accept` / `read_bytes` / `write_bytes` | 40 | — | `lib/std/net_tcp.bl:68,83,92,128,137`; intrinsic namespace methods |
+| `Ptr[T]` intrinsics — `buf.offset(i)`, `p.deref()`, `p.is_null()` | 176 | **`w13xgb`** (P1) | `lib/std/libc.bl:52`, `:68`. Now the outright #1, and **35% of all remaining family-A rows**. Answers need the receiver's element tid, not a fixed type, and typecheck has **no `TyKind.Ptr` at all** — the variant is its own additive step and must not share a regen with a cause fix. (The 165 quoted for it earlier is the same cause attributed by *source module*, `at=std_libc`; counted by flat spelling, `tid=? flat=Ptr[Int]`, it is 176 — the 11 extra are direct `Ptr` uses in test roots.) |
+| ~~`Str` intrinsic aliases — `s.substr(a,b)`, `s.charAt(i)`, `n.to_string()`~~ | ~~147~~ | **`rbd0a4`** | **CLOSED** — −157 rows, section above. `charAt` was not a missing return type; the method does not exist |
+| `net.*` / `io.*` — `net.connect` / `listen` / `accept` / `read_bytes` / `write_bytes`, `io.read_line` | 40 + | — | `lib/std/net_tcp.bl:68,83,92,128,137`, `src/lsp.bl:32`. The seam is `is_intrinsic_method(namespace, method)` — `pub` in **`src/codegen_types.bl:8084`** and called from `typecheck.bl:9227`, where the *only* two answers are `time.read` (→ `Instant`) and `time.sleep` (→ Void). Typecheck asks codegen's intrinsic list whether the method exists and then has no table of return types behind it |
 | `db.query` / `query_one` / `execute` / `stmt.step` / `row.get` / `tpl.type_tag` | ~35 | — | **effect operations**, mechanism diagnosed below — no typecheck-side signature source at all |
-| a cross-module `pub let` container element — `symbol_index.si_file_path.get(i)` | 12 | — | `src/incremental.bl:44,75`, `src/file_watcher.bl:40,73` |
-| `Channel(n)` / `ch.recv` | ~24 | — | **likely genuinely under-determined** — the arg is a capacity, not an element type, so this may be `decisions/under-determined-types.md` / E0301, not a missing rule |
+| `Channel(n)` / `ch.recv` | 24 | — | **likely genuinely under-determined** — the arg is a capacity, not an element type, so this may be `decisions/under-determined-types.md` / E0301, not a missing rule |
+| a cross-module `pub let` container element — `symbol_index.si_file_path.get(i)` | 12 | — | `src/incremental.bl:44,75`, `src/file_watcher.bl:40,73`. Part of the `flat=Str` tail `rbd0a4` uncovered |
 | calling a closure-typed **field** (`route.callback`, `logger.log_msg`) | ~11 | — | |
+| `List.join` on a `List[Str]` | ~4 | — | `src/cli.bl:935`, `:3561`, `:3563`. Also from the `rbd0a4` tail; same allow-list-vs-dispatch shape |
 | `Status.from_str` — the compiler-synthesized static on a str-backed enum, returning `Option[Enum]` | 4 | — | third sub-mechanism of the old top entry; also no fnsig |
 | `Iterator` adapters (`.chain`, `.zip`, `.collect`, `.enumerate`) | — | `qzdz2e` | **deferred** (panel decision, user-visible) |
 
-Two entries from the previous ranking are gone: `Bytes.zeroed`/`Bytes.from_str` closed as `2r96m9`,
-and `buf.with_ptr` closed with it as knock-on. What that ranking called one top cause —
+Three entries from the previous ranking are gone: `Bytes.zeroed`/`Bytes.from_str` closed as `2r96m9`,
+`buf.with_ptr` closed with it as knock-on, and the `Str` aliases closed as `rbd0a4`. What that ranking
+called one top cause —
 *"`X.try_from` / `X.from_str`, ~46 sites"* — was **three** sub-mechanisms: real trait impls with
 source-typed fnsig keys (closed, `zs7khh`), the `Bytes` intrinsics (closed, `2r96m9`), and
 `Status.from_str` (still open). A shared *spelling* is not a shared *cause*.
+
+**Cross-check by source module** (`at=` on the post-`rbd0a4` sweep), because the flat spelling and the
+producing module answer different questions and disagreeing on which is "the" count is how the Ptr
+entry acquired two figures:
+
+| module | family-A rows |
+|---|---:|
+| `__main__` (the root being compiled) | 237 |
+| `std_libc` | 165 |
+| `std_net_tcp` | 40 |
+| `std_db_row` | 12 |
+| `cli` | 11 |
+| `std_db_sqlite` | 9 |
+| `lsp` / `incremental` / `file_watcher` | 6 each |
+| `std_testing` / `std_http_server` / `pkg_resolver` / `build_stdlib` | 3 each |
+
+Two readings worth keeping. **`std_libc` alone is a third of what is left**, and it is one cause. And
+the 237 in `__main__` are not a 238th cause: `__main__` is whatever root is under compilation, so
+that bucket is the *corpus* redistributing the same handful of mechanisms across roots — which is
+why the ranking is organized by producer and not by this table.
 
 **The `db.*` mechanism, diagnosed (read-only).** These are **effect operations**, declared in
 `lib/std/db.bl` as `pub effect DB { effect Read { fn query(..) -> Result[List[Row], DBError] } .. }`.

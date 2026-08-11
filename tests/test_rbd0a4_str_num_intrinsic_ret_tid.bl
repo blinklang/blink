@@ -1,0 +1,206 @@
+// br rbd0a4 — `Str` and numeric intrinsics that resolve no return type in typecheck.
+//
+// `is_builtin_method` (src/typecheck.bl:5867-6074) is a flat 172-name allow-list whose only job is
+// to suppress the `UnknownMethod` warning. The return types live in a SEPARATE, per-receiver-kind
+// dispatch inside `infer_type_uncached`. Nothing couples the two lists, so a name in the first
+// with no arm in the second resolves to `TYPE_UNKNOWN` — silently, because the warning that would
+// have named it is exactly what the first list suppressed. An audit of the two found 73 of the 172
+// names with no `method == "<name>"` comparison anywhere in typecheck.bl.
+//
+// `TYPE_UNKNOWN` unifies with anything, so a declared type over such a call is accepted no matter
+// what it says. That is the observable half these rows pin. The programs always COMPILED AND RAN
+// correctly — codegen's flat universe carried the type the tid did not — so the run rows are as
+// load-bearing as the diagnostic ones.
+//
+// Fourth instance of project_is_intrinsic_method_must_match_handlers in this campaign, after
+// mjsbwm, 7cq6w2 and 2r96m9.
+//
+// Two names in the ticket are deliberately NOT here:
+//   • `as_cstr` returns `CT_PTR` (codegen_methods.bl:857), and typecheck has no `TyKind.Ptr` at
+//     all — that is br w13xgb, which has to add the variant first.
+//   • `to_float` on a `Str`, `to_string` on a `Bool` or a sized int, and `to_str` on an `Int` are
+//     methods typecheck and codegen disagree about the EXISTENCE of, not the type of. Answering
+//     them here would invent surface. Probed and left alone.
+
+import compile_test_helpers
+
+// ── Str: `substr` is an alias whose arm was never written ────────────────────
+// `is_builtin_method:5885` accepts `substr` and codegen_methods.bl:922 dispatches
+// `"substring" || "substr"`, but the return block (typecheck.bl:8939) lists only `substring` and
+// `slice`. 147 of the 661 remaining family-A divergence rows are this one name, every one of them
+// a `let <x> = <s>.substr(a, b)` in the compiler's own source.
+
+test "a declared type is compared against Str.substr" {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let x: Int = \"hello\".substr(0, 2)\n")
+    s = s.concat("    io.println(\"\{x}\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_compile_error(s, "rbd0a4_decl_substr", "TypeError")
+}
+
+// ── numeric receivers: to_string, and the Int/Float conversion pair ──────────
+
+test "a declared type is compared against Int.to_string" {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let n = 42\n")
+    s = s.concat("    let x: Int = n.to_string()\n")
+    s = s.concat("    io.println(\"\{x}\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_compile_error(s, "rbd0a4_decl_int_tostring", "TypeError")
+}
+
+test "a declared type is compared against Float.to_string" {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let n = 1.5\n")
+    s = s.concat("    let x: Int = n.to_string()\n")
+    s = s.concat("    io.println(\"\{x}\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_compile_error(s, "rbd0a4_decl_flt_tostring", "TypeError")
+}
+
+test "a declared type is compared against Int.to_float" {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let n = 42\n")
+    s = s.concat("    let x: Int = n.to_float()\n")
+    s = s.concat("    io.println(\"\{x}\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_compile_error(s, "rbd0a4_decl_int_tofloat", "TypeError")
+}
+
+// `Float` had no receiver block in the dispatch at all — `to_int` is answered only for a `Str`
+// receiver, which is why this row and the one above fail for different reasons.
+test "a declared type is compared against Float.to_int" {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let n = 1.7\n")
+    s = s.concat("    let x: Str = n.to_int()\n")
+    s = s.concat("    io.println(\"\{x}\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_compile_error(s, "rbd0a4_decl_flt_toint", "TypeError")
+}
+
+// ── charAt: the allow-list names a method that does not exist ────────────────
+// `charAt` is in `is_builtin_method` (:5882) and NOWHERE else in the compiler — no codegen arm,
+// no stdlib fn, zero uses across src/ lib/ tests/ examples/. Its only effect is to suppress the
+// one warning a user would get before the hard `UnresolvedMethod` at codegen. The right answer is
+// not a return type; it is to stop claiming the method exists.
+test "charAt is reported as an unknown method, not silently accepted" {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let x = \"hi\".charAt(0)\n")
+    s = s.concat("    io.println(\"\{x}\")\n")
+    s = s.concat("}\n")
+    // Not compile_test_helpers.expect_warning: that helper PRINTS a verdict instead of
+    // asserting one, so a row built on it passes green either way.
+    let out = compile_test_helpers.compile_and_capture(s, "rbd0a4_charat")
+    assert(out.contains("UnknownMethod"))
+}
+
+// ── controls: the canonical spellings and the neighbouring arms ──────────────
+// Each was green before the fix. A fix that reorders the receiver blocks, or that adds a `Float`
+// block ahead of the `Str` one, shows up here.
+
+test "Str.substring still resolves its return type" {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let x: Int = \"hello\".substring(0, 2)\n")
+    s = s.concat("    io.println(\"\{x}\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_compile_error(s, "rbd0a4_ctl_substring", "TypeError")
+}
+
+test "Str.char_at still resolves its Option[Char] return type" {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let x: Int = \"hi\".char_at(0)\n")
+    s = s.concat("    io.println(\"\{x}\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_compile_error(s, "rbd0a4_ctl_char_at", "TypeError")
+}
+
+test "Str.to_int still resolves its return type" {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let x: Str = \"5\".to_int()\n")
+    s = s.concat("    io.println(\"\{x}\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_compile_error(s, "rbd0a4_ctl_str_toint", "TypeError")
+}
+
+test "Str.parse_float still resolves its return type" {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let x: Int = \"1.5\".parse_float()\n")
+    s = s.concat("    io.println(\"\{x}\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_compile_error(s, "rbd0a4_ctl_parse_float", "TypeError")
+}
+
+test "Int.to_i32 still resolves its sized return type" {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let n = 42\n")
+    s = s.concat("    let x: Str = n.to_i32()\n")
+    s = s.concat("    io.println(\"\{x}\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_compile_error(s, "rbd0a4_ctl_to_i32", "TypeError")
+}
+
+// ── no false positives, and every runtime answer is unchanged ───────────────
+
+test "a matching declared type over substr stays clean and runs" {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let x: Str = \"hello\".substr(1, 3)\n")
+    s = s.concat("    io.println(\"\{x}\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_no_error(s, "rbd0a4_clean_substr", "TypeError")
+    let r = compile_test_helpers.compile_and_run(s, "rbd0a4_run_substr")
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out.trim(), "ell")
+}
+
+test "matching declared types over to_string stay clean and run" {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let n = 42\n")
+    s = s.concat("    let f = 1.5\n")
+    s = s.concat("    let a: Str = n.to_string()\n")
+    s = s.concat("    let b: Str = f.to_string()\n")
+    s = s.concat("    io.println(\"\{a}|\{b}\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_no_error(s, "rbd0a4_clean_tostring", "TypeError")
+    let r = compile_test_helpers.compile_and_run(s, "rbd0a4_run_tostring")
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out.trim(), "42|1.5")
+}
+
+test "matching declared types over the Int/Float conversion pair stay clean and run" {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let n = 3\n")
+    s = s.concat("    let f = 1.7\n")
+    s = s.concat("    let a: Float = n.to_float()\n")
+    s = s.concat("    let b: Int = f.to_int()\n")
+    s = s.concat("    io.println(\"\{a}|\{b}\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_no_error(s, "rbd0a4_clean_conv", "TypeError")
+    let r = compile_test_helpers.compile_and_run(s, "rbd0a4_run_conv")
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out.trim(), "3|1")
+}
+
+// The tid has to reach the call-arg check, not just the let binding.
+test "substr and to_string pass as arguments and run" {
+    let mut s = "fn takes(a: Str, b: Str) -> Int \{ a.len() + b.len() }\n"
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let n = 42\n")
+    s = s.concat("    io.println(\"\{takes(\"hello\".substr(0, 2), n.to_string())}\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_no_error(s, "rbd0a4_clean_arg", "TypeError")
+    let r = compile_test_helpers.compile_and_run(s, "rbd0a4_run_arg")
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out.trim(), "4")
+}
+
+// substr's result must be a Str all the way through, not merely at the binding: chaining a Str
+// method onto it is what fails if the arm returns something looser.
+test "a substr result chains further Str methods" {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let x = \"hello world\".substr(0, 5).to_upper()\n")
+    s = s.concat("    io.println(\"\{x}\")\n")
+    s = s.concat("}\n")
+    let r = compile_test_helpers.compile_and_run(s, "rbd0a4_run_chain")
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out.trim(), "HELLO")
+}
