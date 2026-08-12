@@ -1,0 +1,191 @@
+import compile_test_helpers.{compile_and_run}
+
+// br hgd2az — Channel[T] was int64-only at every consumption seam.
+//
+// THE CAUSE, in one line: the three seams that consume a channel element asked
+// `get_var_channel_inner(...)` — a lookup into codegen's FLAT ScopeVar fields — instead of
+// asking the element's tid, and the flat field is a FABRICATION. src/codegen_stmt.bl:3508:
+//
+//     if val_type == CT_CHANNEL {
+//         let ch_inner = get_var_channel_inner(val_str)
+//         if ch_inner >= 0 { set_var_channel(name, ch_inner) }
+//         else { set_var_channel(name, CT_INT) }      // <- hard-coded default
+//     }
+//
+// `val_str` is the EMITTED C EXPRESSION for the initializer (`blink_channel_new(4)`), never a
+// variable name, so the lookup always missed and every channel in every program landed on
+// `CT_INT`. The tydiv instrument named it exactly:
+//
+//     let ch: Channel[Str] = Channel(4)
+//     [dbg:tydiv] site=emit_let_binding.decl var=ch tid=Channel[Str] flat=Channel[Int]
+//
+// The tid was RIGHT (br vag3wc made TyKind.Channel constructible and the annotation path
+// publishes it) and codegen read the fabrication one line away. That is the whole thesis of
+// the tid-collapse plan in one binding, which is why this test asserts RUNTIME OUTPUT and not
+// emitted C: the flat field agreeing with the tid is not the property that matters, the
+// program printing the value that was sent is.
+//
+// Consequence: the `CT_STRING` arms in the recv method (codegen_methods.bl) and in the for-in
+// lowering (codegen_stmt.bl) were DEAD BY KEYING — they existed, read as coverage, and could
+// not be reached, because nothing could ever put anything but CT_INT in that field. Same shape
+// as br twq9kz (dead by caller gating) and br pvhaew (emitted but unnameable).
+//
+// SPEC. sections/04_effects.md:1751 is the only channel text and it spells the constructor
+// `channel.new[Int](buffer: 10)` — the element type is written down at the construction site —
+// and drains with `for value in ch`. Both of those are exercised below. The bare `Channel(n)`
+// spelling used by the rest of the corpus appears in no spec section and in no `blink llms`
+// topic; it names no element type at all, which is br w3v2e6 (inference) and NOT this ticket.
+//
+// FAIL-OPEN MODES, every one reproduced by RUNNING a program:
+//
+//   1. Str element, `.recv()` — printed `94463530825302`, a pointer as an integer. Exit 0.
+//   2. Str element, `for v in ch` — same garbage. The spec's own drain idiom.
+//   3. Str element via the spec's own constructor, `channel.new[Str](buffer: 4)` — same
+//      garbage. The element type was written down explicitly and discarded anyway.
+//   4. Bool element — printed `1`, not `true`.
+//   5. Float element — `cc` escape: `error: cannot convert to a pointer type` on
+//      `blink_channel_send(cf, (void*)1.5)`.
+//   6. Struct element — same `cc` escape on `(void*)_s0`.
+//   7. DATA LOSS, and the worst of the seven: `ch.send(0)` encodes as `(void*)(intptr_t)0`,
+//      which IS NULL, and NULL is the end-of-stream sentinel. So `for v in ch` on a channel
+//      whose first value is 0 printed NOTHING — the 0 and every value behind it were dropped,
+//      silently, exit 0. Row 6 below is that program.
+//
+// THE FIX, and why it is one rule rather than six arms: every element is BOXED. `send`
+// GC-allocates a cell of the element's C type, stores the value, and passes the cell pointer;
+// `recv` and `for-in` dereference it with the same C type. That is one seam per direction for
+// all element types — and because a box pointer is never NULL, mode 7 dies with it: NULL now
+// means exactly "closed and empty" and nothing else. Per-type casts are what produced modes
+// 4-6 and the dead CT_STRING arms; the boxed representation has no per-type arm to be short of.
+//
+// DO NOT "fix" the following, all of them deliberate:
+//
+//   - The unannotated `let ch = Channel(4)` still falls back to the flat CT_INT. It has no tid
+//     to read (`infer_type` has no arm for the bare form and the element is knowable only from
+//     a later use), so this is br w3v2e6, an INFERENCE task. Row 8 pins that the fallback keeps
+//     working; do not make it an error here — that decision is spec 8vcj2c's E0301 boundary and
+//     turning every corpus channel into a hard error is not this ticket's call.
+//   - `ch.send(x)` is still not CHECKED against the element type — `Channel[Int]` accepts a
+//     `Str`. That is br eg0p6y, the typecheck half. This ticket makes the type FLOW; it does
+//     not add the check, and a row asserting rejection here would be asserting eg0p6y.
+//   - `ch.recv()` on a CLOSED, EMPTY channel still yields the element's zero value. That is
+//     today's behaviour preserved on purpose: what it SHOULD do (Option[T]? panic?) is br
+//     yzan52, a `type:spec` question about a documented concurrency primitive, and not
+//     answerable by a codegen fix.
+//   - `channel.new[T](buffer: n)` does not name-resolve its capacity argument (br crxrh3), so
+//     an undefined name there reaches `cc`. Row 7 uses a literal capacity for that reason.
+
+type Pt { x: Int, y: Int }
+
+// ── The same shapes written DIRECTLY, not through compile_and_run ────────────────────────
+//
+// Two different things are being pinned. The compile_and_run rows below assert what the
+// compiler EMITS, by compiling a source string with it. These rows put the shape in the
+// corpus itself: this file is compiled by the ordinary build, so a wrong box or a wrong
+// unbox is a build failure here, and — the reason they exist — the `tydiv` divergence
+// instrument can finally SEE an annotated channel.
+//
+// It could not before. The whole corpus spells `Channel(n)`, so the sweep that ranks the
+// remaining tid-vs-flat divergence measured zero rows for this ticket's entire territory
+// while every one of the seven fail-open modes was live. A counter reads the corpus, not the
+// language (feedback_corpus_sweep_is_not_coverage); the shape has to be written down before
+// it can be counted.
+test "an annotated Str channel round-trips in the corpus, where the sweep can see it" {
+    let ch: Channel[Str] = Channel(4)
+    ch.send("direct")
+    assert_eq(ch.recv(), "direct")
+}
+
+test "an annotated struct channel drains by value in the corpus" {
+    let ch: Channel[Pt] = Channel(4)
+    ch.send(Pt { x: 3, y: 4 })
+    ch.close()
+    let mut total = 0
+    for p in ch {
+        total = total + p.x + p.y
+    }
+    assert_eq(total, 7)
+}
+
+test "channel.new[T] round-trips in the corpus" {
+    let ch = channel.new[Str](2)
+    ch.send("spec")
+    assert_eq(ch.recv(), "spec")
+}
+
+test "a Str element survives .recv()" {
+    let src = "fn main() \{\n    let ch: Channel[Str] = Channel(4)\n    ch.send(\"hello\")\n    let got = ch.recv()\n    io.println(\"recv \{got}\")\n}\n"
+    let r = compile_and_run(src, "hgd2az_recv_str")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("recv hello"))
+}
+
+test "a Str element survives the spec's for-in drain" {
+    let src = "fn main() \{\n    let ch: Channel[Str] = Channel(4)\n    ch.send(\"hello\")\n    ch.send(\"world\")\n    ch.close()\n    for v in ch \{\n        io.println(\"got \{v}\")\n    }\n}\n"
+    let r = compile_and_run(src, "hgd2az_forin_str")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("got hello"))
+    assert(r.out.contains("got world"))
+}
+
+test "a Float element compiles and round-trips" {
+    let src = "fn main() \{\n    let ch: Channel[Float] = Channel(2)\n    ch.send(1.5)\n    let f = ch.recv()\n    io.println(\"f=\{f}\")\n}\n"
+    let r = compile_and_run(src, "hgd2az_float")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("f=1.5"))
+}
+
+test "a struct element compiles and round-trips by value" {
+    let src = "type Pt \{ x: Int, y: Int }\n\nfn main() \{\n    let ch: Channel[Pt] = Channel(2)\n    ch.send(Pt \{ x: 1, y: 2 })\n    let p = ch.recv()\n    io.println(\"p=\{p.x},\{p.y}\")\n}\n"
+    let r = compile_and_run(src, "hgd2az_struct")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("p=1,2"))
+}
+
+test "a Bool element prints as a Bool, not as its integer encoding" {
+    let src = "fn main() \{\n    let ch: Channel[Bool] = Channel(2)\n    ch.send(true)\n    let b = ch.recv()\n    io.println(\"b=\{b}\")\n}\n"
+    let r = compile_and_run(src, "hgd2az_bool")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("b=true"))
+}
+
+// Mode 7 — the data-loss row. A sent 0 must not read as end-of-stream, and the values BEHIND
+// it must not be dropped either. Before the fix this program printed only `done`.
+test "sending 0 does not truncate a for-in drain" {
+    let src = "fn main() \{\n    let ch: Channel[Int] = Channel(4)\n    ch.send(0)\n    ch.send(1)\n    ch.send(2)\n    ch.close()\n    for v in ch \{\n        io.println(\"v=\{v}\")\n    }\n    io.println(\"done\")\n}\n"
+    let r = compile_and_run(src, "hgd2az_zero_sentinel")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("v=0"))
+    assert(r.out.contains("v=1"))
+    assert(r.out.contains("v=2"))
+    assert(r.out.contains("done"))
+}
+
+// The spec's own constructor spelling (04_effects.md:1751), where the element type is written
+// at the construction site and needs no annotation and no inference. Capacity is a literal
+// because br crxrh3 leaves that argument unresolved.
+test "channel.new[T] carries its explicit type argument to the seams" {
+    let src = "fn main() \{\n    let ch = channel.new[Str](buffer: 4)\n    ch.send(\"hello\")\n    let got = ch.recv()\n    io.println(\"new \{got}\")\n}\n"
+    let r = compile_and_run(src, "hgd2az_channel_new_str")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("new hello"))
+}
+
+// Regression guard for the fallback br w3v2e6 owns: the bare, unannotated spelling has no tid
+// to read and must keep working exactly as it does today.
+test "the unannotated Int channel keeps working" {
+    let src = "fn main() \{\n    let ch = Channel(4)\n    ch.send(7)\n    ch.send(8)\n    io.println(\"a=\{ch.recv()} b=\{ch.recv()}\")\n}\n"
+    let r = compile_and_run(src, "hgd2az_bare_int")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("a=7 b=8"))
+}
+
+// A channel crossing a function boundary as a parameter: the element type has to reach the
+// seams through the PARAMETER's tid, not through the initializer's, and those are different
+// ScopeVar construction sites.
+test "a Str channel passed as a parameter keeps its element type" {
+    let src = "fn feed(ch: Channel[Str]) \{\n    ch.send(\"via param\")\n}\n\nfn main() \{\n    let ch: Channel[Str] = Channel(2)\n    feed(ch)\n    io.println(\"p \{ch.recv()}\")\n}\n"
+    let r = compile_and_run(src, "hgd2az_param_str")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("p via param"))
+}

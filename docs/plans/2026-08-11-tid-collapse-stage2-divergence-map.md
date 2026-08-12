@@ -218,6 +218,7 @@ not Stage 3 work:
 | `nxnnxe` | P2 | *(the ranked #1 after `x3x0qj`, and the allow-list-with-nothing-behind-it shape a **fourth** time)* every method `@derive` synthesizes had its **name** affirmed by `tc_method_resolvable_on_type` and **no signature anywhere** — so `to_json` / `from_json` / `clone` / `debug` / `eq` / `cmp` and the str-backed-enum statics all resolved to `TYPE_UNKNOWN`. Both halves failed open: `let bad: Int = u.to_json()` compiled, linked and **ran**, and `User.from_json(42)` escaped to `cc`. Fixed the `qjfwc6` way — **a table, not arms**. **−19 rows, exactly as predicted, and every one of the seven named files went to zero.** Three byproducts filed: `pvhaew`, `bf0jnj`, `169kjt` |
 | `cjtxxr` | P2 | *(the largest actionable entry left, and the allow-list shape a **tenth** time)* calling a **closure-typed struct field** — `route.callback(req)`, `srv.error_handler.on_error(req, msg)`, the `handler: fn(Request) -> Response` the spec puts inside `type Route` — was the **last unchecked callable shape in the language**: return type, arity and every argument type failed open together. The closure *variable*, the IIFE, a fn-typed *parameter* and even the same field **hoisted through a `let`** were all already checked, which proved the field's tid was a real `TyKind.Fn` and only the dispatch was missing. `tc_method_resolvable_on_type` clause (d) fail-opened on `is_callable_field_name`, a **global** name list, on the strength of a comment that `nz7drz` had falsified. **Three silent miscompiles** (one propagating into the returned struct's own field access) plus five `cc` escapes. **−12 rows against 11 predicted**, the twelfth being a downstream `let` two lines below a cured producer |
 | `9md3r1` | P2 | *(the six flat-tail enum spellings that were one cause)* a **qualified** struct-style variant literal — `Enum.Variant { field: v }`, the spelling `error[AmbiguousConstruction]` itself tells the user to write — resolved to `TYPE_UNKNOWN`, because `lookup_named_type` strips a dotted name to its **suffix** and the suffix of `Enum.Variant` is the variant, never a type. **Both phases had a mirror-image half**: codegen preferred a **global** variant-name→enum map over the explicit prefix, so `Right.Item { v: 2 }` emitted a `blink_Left` even after typecheck was fixed. **Seven fail-open modes**, including three silent miscompiles (one passing a wrong-nominal-type value to a typed parameter) and one **false positive** — correct code *rejected* with `expects Left, got Item` when an unrelated enum happened to be named like the variant. **−12 rows, exactly as predicted, all `__main__`**; all 12 landed in class B, and root-causing that landing found the Stage-3 hazard below (`tk_to_ct`'s Enum arm targets a dead `CT_ENUM`). Three byproducts filed: `x056sx`, `krwywm`, `5fn53v` |
+| `hgd2az` | P2 | *(the spec's own concurrency primitive, and the fix the divergence counter could not see)* every seam that consumes a `Channel[T]` element — `send`, `recv`, the `for v in ch` drain — read the **flat** `get_var_channel_inner`, and that field was stamped by looking the initializer's emitted **C expression** up as a variable name, which never hits, so **every channel in every program** was `CT_INT`. The `CT_STRING` arms in both consumers were **dead by keying**. **Seven fail-open modes**, including two `cc` escapes, a `Bool` printing as `1`, and **silent data loss**: `(void*)(intptr_t)0` *is* `NULL`, `NULL` is the end-of-stream sentinel, so a drain over a channel whose first value is `0` printed nothing and dropped every value behind it. Fixed by **boxing** — one rule, no per-type cast — with the element type read from the node's tid: codegen's **first consumer of the Stage-1 structural accessors**. Only **−3 rows** (the corpus's three `channel.new[T]` sites), because the corpus had **zero** class-B Channel rows *before* the fix while all seven modes were live — see the caveat below |
 
 `k9agr8` gates the *measurement*, not the code: without it Stage 3 can only demonstrate 0
 in archive-linked mode.
@@ -3135,7 +3136,138 @@ qualified variant in the unit and tuple spellings silently builds **another enum
 — a generic enum's struct-style variant **pattern** erases its payload binding to `void`, found by
 probing the bare control of the generic row and therefore not caused by this fix.
 
-### Remaining family-A causes, ranked (12 cells / 119 rows)
+### hgd2az — seven fail-open modes at a counter reading zero (CLOSED, −3 rows)
+
+The rows are the least interesting thing about this one. Read it for the caveat it puts on Stage 3's
+exit gate.
+
+**The cause, one line.** The three seams that consume a channel element — `send` and `recv`
+(`codegen_methods.bl`) and the `for v in ch` drain (`codegen_stmt.bl`) — each asked
+`get_var_channel_inner`, a read of codegen's **flat** `ScopeVar` field. That field is stamped at
+`codegen_stmt.bl:3509` from `get_var_channel_inner(val_str)`, and `val_str` is the **emitted C
+expression** for the initializer (`blink_channel_new(4)`), never a variable name. The lookup
+therefore missed for every constructed channel and the `CT_INT` default one line below became the
+element type of **every channel in every program**.
+
+**Consequence, and it is the `twq9kz` / `pvhaew` shape a sixth time.** Both consumers already had a
+`CT_STRING` arm. Both were **dead by keying**: nothing could put anything but `CT_INT` in that field,
+so the arm existed, read as coverage, and could not be reached. Arms that cannot be reached are not
+arms.
+
+**The spec was checked first and it moved the ticket.** `sections/04_effects.md:1751` is the only
+channel text in the spec and it spells the constructor `channel.new[Int](buffer: 10)` — **the element
+type is written down at the construction site** — and drains with `for value in ch`. The plan doc's
+own note guessed Channel was "likely genuinely under-determined … the arg is a capacity, not an
+element type". That premise was wrong for the spec's spelling, and `parser.bl:2885` already kept the
+type argument in `type_params`. So there was no inference problem to solve for `channel.new[T]`: there
+was a type that had been written down explicitly and then discarded. Only the **bare** `Channel(n)` —
+which appears in no spec section and in no `blink llms` topic, and which is what the whole corpus
+uses — names no element at all, and that is `w3v2e6`.
+
+**Seven fail-open modes, every one reproduced by *running* a program:**
+
+| | shape | observed |
+|---|---|---|
+| 1 | `Channel[Str]` + `.recv()` | printed `94463530825302` — a pointer as an integer. Exit 0 |
+| 2 | `Channel[Str]` + `for v in ch` | same garbage, from the spec's own drain idiom |
+| 3 | `channel.new[Str](buffer: 4)` | same garbage — the element type was **explicit** and discarded anyway |
+| 4 | `Channel[Bool]` | printed `1`, not `true` |
+| 5 | `Channel[Float]` | `cc` escape: *cannot convert to a pointer type* on `(void*)1.5` |
+| 6 | `Channel[Pt]` | same `cc` escape on `(void*)_s0` |
+| 7 | `ch.send(0)`, any channel | **silent data loss.** `(void*)(intptr_t)0` *is* `NULL`, and `NULL` is `blink_channel_recv`'s end-of-stream sentinel, so a drain over a channel whose first value is `0` printed **nothing** — the `0` and every value behind it dropped, exit 0 |
+
+Mode 7 is the one to remember. It needs no annotation, no generics and no unusual spelling: three
+lines of ordinary Blink using the corpus's own idiom, and the program silently produces nothing.
+
+**The fix is one rule, not six arms.** Every element is **boxed**: `send` GC-allocates a cell of the
+element's own C type, stores the value and sends the cell's address; `recv` and the drain dereference
+with the same C type. The per-type casts *are* modes 4–6, and a boxed representation has no per-type
+arm to be short of. It also retires mode 7 for free and with **no runtime-header change**, because a
+box address is never `NULL`: `NULL` now means exactly "closed and empty" and nothing else.
+
+**This is codegen's first consumer of the Stage-1 structural accessors.** The element type comes from
+`tc_lookup_node_tid` on the receiver/iterable node, through new `tc_channel_elem_ct` /
+`tc_channel_elem_struct` in `typecheck.bl` built on `tc_tid_kind` / `tc_tid_child_count` /
+`tc_tid_child` / `tc_tid_struct`. Two properties of that helper are worth copying at every later
+Stage-3 seam:
+
+- **The gate and the answer are the same function.** `tc_channel_elem_ct` returns a `CT_*` only for an
+  element it can actually spell, and `-1` otherwise — and `-1` means the caller keeps its existing
+  flat emission, byte for byte. A separate "is this supported" predicate would be a second list to
+  drift out of sync with the arms, which is the allow-list defect this campaign has now seen **ten**
+  times. One function cannot disagree with itself.
+- **The exclusions are deliberate and named.** `List` / `Map` / `Set` / `Option` / `Result` / `Tuple` /
+  `Ptr` / `Fn` / `Handle` / `Channel` / `Iterator` all answer `-1`. A container element round-trips
+  through the box perfectly; what does not round-trip is **its own** element/key/value metadata, which
+  lives in flat side fields a `recv()` result has no way to carry. Claiming them would move the wrong
+  element type **one level down** — the exact defect being fixed. A generic struct instance is
+  excluded for the same reason in a different currency: its C name is the monomorphised spelling, and
+  emitting `blink_Box` for a `Box[Int]` element names a type that was never emitted. The `match` over
+  `TyKind` is exhaustive, so Stage 0's net names any kind added later instead of letting it fall
+  through to a plausible `CT_*`.
+
+**The caveat, and the reason to read this entry at all: the instrument could not see any of it.**
+Before the fix, the corpus contained **zero** class-B Channel rows. Not few — zero. The decisive
+evidence for this ticket, `var=ch tid=Channel[Str] flat=Channel[Int]`, came from a hand-built MVCE,
+because the entire corpus spells `Channel(n)` and **nothing in `tests/`, `examples/` or `src/`
+annotated a channel or used the spec's own constructor with a non-`Int` element**. Seven live
+fail-open modes, two of them `cc` escapes and one of them silent data loss, at a counter reading zero.
+
+That is `feedback_corpus_sweep_is_not_coverage` at full strength, and it is a **caveat on this plan's
+Stage-3 exit gate**: *the counter at 0 means the corpus stopped disagreeing, not that the tid is
+authoritative.* The gate stays — it is still the only finite instrument this campaign has — but it
+bounds divergence over shapes that are **written down somewhere**, and a shape absent from the corpus
+is invisible to it no matter how broken it is. Two consequences adopted here:
+
+- Rows 10–12 of the test write the annotated shapes **directly** rather than only through
+  `compile_and_run`, so the corpus now contains an annotated `Channel[Str]`, an annotated
+  `Channel[Pt]` drained by value, and a `channel.new[Str]`. Verified the tap now fires. A shape has to
+  be written down before it can be counted.
+- For each remaining ranked cause, ask what shapes the corpus does **not** contain before reading its
+  row count as the size of the problem.
+
+**Attribution, and all movement accounted for.** Family-A rows 119 → 116 on the 874-file common basis.
+The three are precisely the corpus's only three `channel.new[T]` sites
+(`tests/test_async_parse.bl:13`, `tests/fmt/{expected,input}_channel_new_wrap.bl:2`), which the new
+`infer_type` arm now types. All three in `__main__`, making it eight consecutive `__main__`-only
+deltas. Every remaining `flat=Channel[Int]` family-A row (21 of them) is a bare `Channel(n)` and
+belongs to `w3v2e6`.
+
+Total `sv_ty_or_flat_at` calls moved +491 — `agree` +463, `diverge` +28 — and the whole of it is the
+compiler's own new `let`s, per the per-file-multiplier rule:
+
+- +31 `diverge` from **one** new `TyKind`-typed `let` (`typecheck.bl:12961`, `let k = tc_tid_kind(e)`)
+  × the 31 roots that compile `typecheck.bl`.
+- +460 `agree` from the other 16 new `let`s: 4 × 31 in `typecheck.bl`, 7 × 28 in `codegen_methods.bl`,
+  5 × 28 in `codegen_stmt.bl`.
+- +3 `agree` / −3 `diverge` from the rows that flipped. 460 + 3 = 463 ✓, 31 − 3 = 28 ✓.
+
+The +31 is the **already-documented `CT_ENUM` hazard**, not a regression: `tk_to_ct` maps
+`TyKind.Enum => CT_ENUM`, `type_enum` is `CT_ENUM`'s only producer and has **zero callers**, so a data
+enum's flat is always `CT_STRUCT` and **every enum-typed variable is class B by construction**. Every
+`TyKind`-typed local added between now and Stage 3 adds one row per root. Do not chase them; Stage 3's
+`c_type_from_tid` must lower `TyKind.Enum` to the struct C form and they go together.
+
+**One residual row, stated honestly.** An annotated `Channel[Pt]` still reads `tid=Channel[Pt]
+flat=Channel[]` at `emit_let_binding.decl`. `set_var_channel(name, CT_STRUCT)` has nowhere to put the
+element's struct **name** — there is no `set_var_channel_full` — so the flat pair spans depth 1 and
+stops, which is this plan's thesis showing up as a leftover. Behavior is correct because the seams
+read the tid; only the flat shadow is short. Adding a flat field is what the non-goals forbid, and
+Stage 3's `sv.ty` authority flip is what closes the row.
+
+`task regen` + `task ci` green (650 test files, 0 failed; fmt 1520 passed, 0 failed). Test:
+`tests/test_hgd2az_channel_element_type.bl`, 12 rows, 8 red of 9 → 12 green.
+
+**Three byproducts filed, none fixed inline.** `crxrh3` — `channel.new[T](buffer: n)`'s arguments are
+never name-resolved, so an undefined name there reaches `cc` with `blink check` reporting ok (the
+`1b7ggq` shape). `eg0p6y` — `ch.send(x)` is never checked against the element type, so a
+`Channel[Int]` accepts a `Str` (the allow-list shape). `yzan52` — `type:spec`: what should `.recv()`
+answer on a **closed, empty** channel? Today it is the element's zero value, indistinguishable from a
+sent zero value; four candidate answers are enumerated on the ticket. A documented concurrency
+primitive's end-of-stream contract is not a codegen decision, so the boxing fix deliberately preserved
+today's behavior.
+
+### Remaining family-A causes, ranked (12 cells / 116 rows)
 
 Re-ranked from the post-`qjfwc6` sweep, by **rows on the 874-file common basis**, grouped by the
 innermost producer (the outermost call is usually a symptom — `.unwrap()` heads many chains, but its
@@ -3228,24 +3360,24 @@ it the pattern also matches inside `flat=`), because the flat spelling and the p
 different questions and disagreeing on which is "the" count is how the Ptr entry once acquired two
 figures:
 
-| module | family-A rows | | after `cjtxxr` | after `rb5wvb` | after `jvy35h` | after `n84s1p` | after `cttrag` | after `nxnnxe` | after `x3x0qj` | after `w089a0` | after `qjfwc6` | after `h3q81d` | after `jzvxav` | after `w13xgb` | after `rbd0a4` |
-|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| `__main__` (the root being compiled) | **96** | | **108** | **120** | 122 | 125 | 129 | 129 | 148 | 158 | 171 | 174 | 223 | 225 | 237 |
-| `std_libc` | **0** | | **0** | **0** | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 165 |
-| `std_net_tcp` | **0** | | **0** | **0** | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 40 | 40 | 40 | 40 |
-| `std_db_row` | **0** | | **0** | **0** | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 12 | 12 |
-| `cli` | **8** | | **8** | **8** | 8 | 11 | 11 | 11 | 11 | 11 | 11 | 11 | 11 | 11 | 11 |
-| `std_db_sqlite` | 9 | | 9 | 9 | 9 | 9 | 9 | 9 | 9 | 9 | 9 | 9 | 9 | 9 | 9 |
-| `incremental` / `file_watcher` | **0 each** | | **0 each** | **0 each** | 0 each | 0 each | 0 each | 6 each | 6 each | 6 each | 6 each | 6 each | 6 each | 6 each | 6 each |
-| `lsp` | **0** | | **0** | **0** | 0 | 0 | 4 | 4 | 4 | 4 | 4 | 6 | 6 | 6 | 6 |
-| `std_testing` | **0** | | **0** | **0** | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 3 | 3 |
-| `std_http_server` / `build_stdlib` | 3 each | | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each |
-| `pkg_resolver` | **0** | | **0** | **0** | 3 | 3 | 3 | 3 | 3 | 3 | 3 | 3 | 3 | 3 | 3 |
+| module | family-A rows | | after `9md3r1` | after `cjtxxr` | after `rb5wvb` | after `jvy35h` | after `n84s1p` | after `cttrag` | after `nxnnxe` | after `x3x0qj` | after `w089a0` | after `qjfwc6` | after `h3q81d` | after `jzvxav` | after `w13xgb` | after `rbd0a4` |
+|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `__main__` (the root being compiled) | **93** | | **96** | **108** | **120** | 122 | 125 | 129 | 129 | 148 | 158 | 171 | 174 | 223 | 225 | 237 |
+| `std_libc` | **0** | | **0** | **0** | **0** | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 165 |
+| `std_net_tcp` | **0** | | **0** | **0** | **0** | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 40 | 40 | 40 | 40 |
+| `std_db_row` | **0** | | **0** | **0** | **0** | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 12 | 12 |
+| `cli` | **8** | | **8** | **8** | **8** | 8 | 11 | 11 | 11 | 11 | 11 | 11 | 11 | 11 | 11 | 11 |
+| `std_db_sqlite` | 9 | | 9 | 9 | 9 | 9 | 9 | 9 | 9 | 9 | 9 | 9 | 9 | 9 | 9 | 9 |
+| `incremental` / `file_watcher` | **0 each** | | **0 each** | **0 each** | **0 each** | 0 each | 0 each | 0 each | 6 each | 6 each | 6 each | 6 each | 6 each | 6 each | 6 each | 6 each |
+| `lsp` | **0** | | **0** | **0** | **0** | 0 | 0 | 4 | 4 | 4 | 4 | 4 | 6 | 6 | 6 | 6 |
+| `std_testing` | **0** | | **0** | **0** | **0** | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 3 | 3 |
+| `std_http_server` / `build_stdlib` | 3 each | | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each |
+| `pkg_resolver` | **0** | | **0** | **0** | **0** | 3 | 3 | 3 | 3 | 3 | 3 | 3 | 3 | 3 | 3 | 3 |
 
-**Seven consecutive fixes have now landed their whole delta in `__main__` and nowhere else** —
+**Eight consecutive fixes have now landed their whole delta in `__main__` and nowhere else** —
 `w089a0`'s −13 (171 → 158), `x3x0qj`'s −10 (158 → 148), `nxnnxe`'s −19 (148 → 129), `jvy35h`'s −3
 (125 → 122), `rb5wvb`'s −2 (122 → 120, its other 3 rows being `pkg_resolver`'s), `cjtxxr`'s −12
-(120 → 108) and `9md3r1`'s −12 (108 → 96). That is the expected shape for a fix to a **declaration site** or to a **syntactic
+(120 → 108), `9md3r1`'s −12 (108 → 96) and `hgd2az`'s −3 (96 → 93). That is the expected shape for a fix to a **declaration site** or to a **syntactic
 form**: a `with ... as` clause, an `fn(..) { .. }()` call, an `@derive`d type and a
 `route.callback(req)` field invocation are all written in the root under compilation, so unlike the
 stdlib causes there is no shared module for the rows to concentrate in. It is also why those

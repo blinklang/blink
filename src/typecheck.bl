@@ -8706,6 +8706,26 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
     }
     if kind == NodeKind.EmbedExpr { return TYPE_STR }
 
+    // br hgd2az. `channel.new[Str](buffer: 4)` is the spec's own constructor
+    // (sections/04_effects.md:1751) and it writes the element type down at the construction
+    // site; the parser already keeps it (parser.bl:2885 stores `type_params`). With no arm
+    // here the node inferred TYPE_UNKNOWN, so the type that was spelled out explicitly was
+    // discarded and the consumption seams fell back to the fabricated CT_INT element.
+    //
+    // The type argument is read by NAME, not through resolve_type_ann: parse_type_params
+    // builds a NodeKind.TypeParam whose `elements` are trait BOUNDS (parser.bl:1104-1113),
+    // not type arguments, and handing those to resolve_type_parts as type args would read
+    // `[T: Ord]`'s bound as an element. That also means a nested argument
+    // (`channel.new[List[Int]]`) is a parse limitation upstream, not a hole here.
+    if kind == NodeKind.ChannelNew {
+        let cn_tps = node_type_params(node)
+        if cn_tps != -1 && sublist_length(cn_tps) >= 1 {
+            let cn_tp = sublist_get(cn_tps, 0)
+            return make_channel_type(resolve_type_parts(node_name(cn_tp), -1, cn_tp))
+        }
+        return make_channel_type(TYPE_UNKNOWN)
+    }
+
     if kind == NodeKind.Ident {
         let name = node_name(node)
         if name == "true" || name == "false" { return TYPE_BOOL }
@@ -12908,6 +12928,99 @@ pub fn tc_tid_is_enum(tid: Int) -> Int {
     if tid < 0 || tid >= ty_pool.len() { return 0 }
     if ty_pool.get(tid).unwrap().kind == TyKind.Enum { return 1 }
     0
+}
+
+// ── Channel element type, for codegen's three consumption seams (br hgd2az) ──────────
+//
+// `send`, `recv` and the `for v in ch` drain all asked get_var_channel_inner — a read of
+// codegen's FLAT ScopeVar field — and that field was a fabrication: the let-binding stamped
+// it by looking the INITIALIZER's emitted C expression up as a variable name
+// (codegen_stmt.bl:3509), which never hits, so every channel in every program landed on the
+// CT_INT default. The element type was in the tid the whole time. These two answer it.
+//
+// The pair (ct, struct name) rather than a tid is codegen's own language at this boundary;
+// see the note on tc_tid_child above for why that pair is the thing being retired. Once
+// Stage 3's recursive c_type_from_tid lands, both of these collapse into it.
+fn tc_channel_elem_tid(chan_tid: Int) -> Int {
+    let t = tc_tid_resolved(chan_tid)
+    if t < 0 { return -1 }
+    if tc_tid_kind(t) != TyKind.Channel { return -1 }
+    if tc_tid_child_count(t) < 1 { return -1 }
+    tc_tid_resolved(tc_tid_child(t, 0))
+}
+
+// The element's CT when the element is representable BY VALUE in codegen's flat universe,
+// and -1 when it is not — in which case the caller must keep its existing flat behaviour
+// rather than trade one wrong answer for another. The gate and the answer are the same
+// function on purpose: a kind that this cannot spell cannot be claimed as supported
+// somewhere else. The match is exhaustive so a kind added later fails to compile here
+// instead of falling through to a plausible CT.
+pub fn tc_channel_elem_ct(chan_tid: Int) -> Int {
+    let e = tc_channel_elem_tid(chan_tid)
+    if e < 0 { return -1 }
+    let k = tc_tid_kind(e)
+    // A struct or a data enum travels as its typedef, by value. A GENERIC instance is
+    // excluded: its C name is the monomorphised spelling that only the mono registry can
+    // produce, and emitting `blink_Box` for a `Box[Int]` element would name a type that was
+    // never emitted. tc_tid_child_count reports 0 for a non-generic struct/enum and the arg
+    // count for an instance, so the test is exact.
+    if k == TyKind.Struct || k == TyKind.Enum {
+        if tc_tid_child_count(e) != 0 { return -1 }
+        if tc_tid_struct(e) == "" { return -1 }
+        return CT_STRUCT
+    }
+    match k {
+        TyKind.Int => CT_INT
+        TyKind.Float => CT_FLOAT
+        TyKind.Bool => CT_BOOL
+        TyKind.Str => CT_STRING
+        TyKind.Char => CT_CHAR
+        TyKind.I8 => CT_I8
+        TyKind.I16 => CT_I16
+        TyKind.I32 => CT_I32
+        TyKind.U8 => CT_U8
+        TyKind.U16 => CT_U16
+        TyKind.U32 => CT_U32
+        TyKind.U64 => CT_U64
+        // Two runtime handles with no element of their own, so nothing is lost by carrying
+        // them: the box holds the handle and the unboxed value is complete.
+        TyKind.Bytes => CT_BYTES
+        TyKind.StringBuilder => CT_STRINGBUILDER
+        // A CONTAINER element round-trips through the box perfectly well; what does not
+        // round-trip is its own element/key/value metadata, which lives in flat side fields
+        // that a `recv()` result has no way to carry. Claiming these would turn a wrong
+        // element type into a wrong element type ONE LEVEL DOWN — the exact defect this
+        // ticket is fixing — so they stay with the fallback until c_type_from_tid makes the
+        // whole tree spellable.
+        TyKind.List => -1
+        TyKind.Map => -1
+        TyKind.Set => -1
+        TyKind.Option => -1
+        TyKind.Result => -1
+        TyKind.Tuple => -1
+        TyKind.Ptr => -1
+        TyKind.Fn => -1
+        TyKind.Handle => -1
+        TyKind.Channel => -1
+        TyKind.Iterator => -1
+        // No element type at all. `Channel[Void]` is not a thing, an unresolved metavar or a
+        // typevar means the element is not known YET, and a bare `Channel(n)` reaches here
+        // through TyKind.Unknown — that spelling names no element and is br w3v2e6's
+        // inference task, not a hole in this function.
+        TyKind.Void => -1
+        TyKind.Typevar => -1
+        TyKind.Unknown => -1
+        // Handled above, ahead of the match, because both need the arity test.
+        TyKind.Struct => -1
+        TyKind.Enum => -1
+    }
+}
+
+// The bare struct/enum name behind a CT_STRUCT element; "" for every other element. Paired
+// with tc_channel_elem_ct — a caller that reads CT_STRUCT must read this too, or it has a
+// nameless struct.
+pub fn tc_channel_elem_struct(chan_tid: Int) -> Str {
+    tc_tid_struct(tc_channel_elem_tid(chan_tid))
 }
 
 // Monomorphized-struct-instance accessors (br kvn6w8 spike). Read the concrete

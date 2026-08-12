@@ -17,6 +17,7 @@ import codegen_types.{
     ensure_map_iter_c, ensure_take_iter_c, ensure_skip_iter_c,
     set_var_iter_carrier, set_list_elem_compound_from_tag,
     ensure_result_type, ensure_skip_iter, ensure_struct_option_type,
+    chan_elem_c_type,
     ensure_struct_result_type, ensure_take_iter, ensure_tuple_type,
     find_from_impl, find_impl_method_node, impl_method_self_name, find_tryfrom_impl, fresh_temp,
     get_fn_ret, get_fn_ret_struct, get_fn_ret_struct_inner, get_fn_ret_type,
@@ -71,7 +72,7 @@ import diagnostics.{
     ICE_SEG_ERASED_SLOT,
 }
 import ast.{NodeKind, is_block_bearing}
-import typecheck.{sv_ty_or_flat, tc_lookup_node_tid, tc_tid_ct, tc_tid_struct, tc_tid_struct_mono_name, tc_tid_tuple_sname, tc_tid_list_elem, tc_seg_from_tid, tc_type_str, is_import_module_name, tc_qualifier_to_module_or_self, suggest_module_member}
+import typecheck.{sv_ty_or_flat, tc_channel_elem_ct, tc_channel_elem_struct, tc_lookup_node_tid, tc_tid_ct, tc_tid_struct, tc_tid_struct_mono_name, tc_tid_tuple_sname, tc_tid_list_elem, tc_seg_from_tid, tc_type_str, is_import_module_name, tc_qualifier_to_module_or_self, suggest_module_member}
 
 // Arg offset for trait-qualified builtin calls: MapOps.contains_key(m, k) has receiver at args[0]
 let mut btc_arg_offset: Int = 0
@@ -4655,12 +4656,34 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
 
     // Channel methods
     if obj_type == CT_CHANNEL {
+        // br hgd2az: the element type comes from the RECEIVER's tid, not from
+        // get_var_channel_inner — that flat field is stamped by looking an emitted C
+        // expression up as a variable name and so reads CT_INT for every channel that was
+        // constructed rather than passed in. A -1 here means the element is not spellable
+        // (an un-annotated `Channel(4)`, whose element nothing knows — br w3v2e6), and the
+        // pre-existing int64/pointer reinterpretation below stays in charge for those.
+        let ch_tid = tc_lookup_node_tid(node_obj(node))
+        let elem_ct = tc_channel_elem_ct(ch_tid)
+        let elem_sname = tc_channel_elem_struct(ch_tid)
+        let elem_c = chan_elem_c_type(elem_ct, elem_sname)
         if method == "send" {
             let args_sl = node_args(node)
             emit_expr(sublist_get(args_sl, 0))
             let val_str = expr_result_str
             let val_type = expr_result_type
-            if val_type == CT_INT {
+            if elem_ct >= 0 {
+                // BOXED, uniformly for every element type: a GC cell of the element's own C
+                // type, sent as the cell's address. One rule instead of a cast per type —
+                // the per-type casts are what made a Float or a struct element a hard `cc`
+                // error and a Bool element print as `1`. It also retires the worst mode:
+                // `(void*)(intptr_t)0` IS NULL, which blink_channel_recv returns for
+                // end-of-stream, so a sent 0 silently truncated a for-in drain. A box
+                // address is never NULL.
+                let box_tmp = fresh_temp("__chbox_")
+                emit_line("{elem_c}* {box_tmp} = ({elem_c}*)blink_alloc(sizeof({elem_c}));")
+                emit_line("*{box_tmp} = {val_str};")
+                emit_line("blink_channel_send({obj_str}, (void*){box_tmp});")
+            } else if val_type == CT_INT {
                 emit_line("blink_channel_send({obj_str}, (void*)(intptr_t){val_str});")
             } else {
                 emit_line("blink_channel_send({obj_str}, (void*){val_str});")
@@ -4671,8 +4694,25 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
         }
         if method == "recv" {
             let recv_tmp = fresh_temp("__recv_")
-            let ch_inner = get_var_channel_inner(obj_str)
             emit_line("void* {recv_tmp} = blink_channel_recv({obj_str});")
+            if elem_ct >= 0 {
+                // The NULL case is a closed, empty channel, and it keeps today's answer —
+                // the element's zero value. What it SHOULD answer (an Option? a panic?) is
+                // br yzan52, a spec question about a documented concurrency primitive, and
+                // not something a codegen fix gets to decide.
+                let val_tmp = fresh_temp("__recvv_")
+                let zero = if elem_ct == CT_STRUCT { "\{0}" } else { "0" }
+                emit_line("{elem_c} {val_tmp} = {zero};")
+                emit_line("if ({recv_tmp} != NULL) {val_tmp} = *({elem_c}*){recv_tmp};")
+                set_var(val_tmp, elem_ct, 0)
+                if elem_ct == CT_STRUCT {
+                    set_var_struct(val_tmp, elem_sname)
+                }
+                expr_result_str = val_tmp
+                expr_result_type = elem_ct
+                return
+            }
+            let ch_inner = get_var_channel_inner(obj_str)
             if ch_inner == CT_STRING {
                 expr_result_str = "(const char*){recv_tmp}"
                 expr_result_type = CT_STRING

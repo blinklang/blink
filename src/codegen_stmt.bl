@@ -37,6 +37,7 @@ import codegen_types.{
     get_list_nested_elem_struct, get_list_nested_elem_type,
     get_map_key_type, get_map_key_type_raw, get_map_key_struct, get_map_value_struct, get_map_value_type, get_map_value_type_raw, get_map_value_list_elem, is_map_scalar_ct, get_set_elem_type, get_set_elem_struct,
     ensure_tuple_type,
+    chan_elem_c_type, get_var_ty,
     get_struct_field_stype, get_struct_field_type, get_var_channel_inner,
     get_var_enum, get_var_handle_inner, get_var_handle_inner2,
     get_var_handler_is_ue, get_var_handler_vtable_field,
@@ -108,7 +109,7 @@ import diagnostics.{
 import pkg.manifest.{manifest_header_is_declared, manifest_name}
 import compiler.{trace}
 import stdlib_native_deps.{stdlib_native_dep_name_by_ffi_symbol}
-import typecheck.{sv_ty_or_flat_at, is_builtin_fn, is_import_module_name, tc_lookup_node_tid, tc_tid_struct_mono_name, tc_tid_struct, tc_tid_is_enum, tc_tid_struct_arg_count, tc_tid_struct_arg_tid, tc_tid_struct_slot_seg, tc_struct_slot_encodable, tc_tid_result_ok_tid, tc_tid_result_err_tid, tc_tid_option_inner_tid, tc_tid_tuple_arity, tc_tid_tuple_elem_tid, tc_tid_to_c_tag}
+import typecheck.{sv_ty_or_flat_at, is_builtin_fn, is_import_module_name, tc_channel_elem_ct, tc_channel_elem_struct, tc_lookup_node_tid, tc_tid_struct_mono_name, tc_tid_struct, tc_tid_is_enum, tc_tid_struct_arg_count, tc_tid_struct_arg_tid, tc_tid_struct_slot_seg, tc_struct_slot_encodable, tc_tid_result_ok_tid, tc_tid_result_err_tid, tc_tid_option_inner_tid, tc_tid_tuple_arity, tc_tid_tuple_elem_tid, tc_tid_to_c_tag}
 
 fn strip_outer_parens(s: Str) -> Str {
     if s.starts_with("(") && s.ends_with(")") {
@@ -3506,8 +3507,18 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
         }
     }
     if val_type == CT_CHANNEL {
+        // br hgd2az: `val_str` is the emitted C expression for the initializer
+        // (`blink_channel_new(4)`), NOT a variable name, so for every CONSTRUCTED channel
+        // this lookup misses and the CT_INT default below became the element type of every
+        // channel in every program — the tydiv instrument reads
+        // `var=ch tid=Channel[Str] flat=Channel[Int]` on exactly this line. The binding's own
+        // tid knows the element, so ask it first; the flat lookup and its default stay for a
+        // channel with no tid to read (br w3v2e6).
         let ch_inner = get_var_channel_inner(val_str)
-        if ch_inner >= 0 {
+        let tid_inner = tc_channel_elem_ct(get_var_ty(name))
+        if tid_inner >= 0 {
+            set_var_channel(name, tid_inner)
+        } else if ch_inner >= 0 {
             set_var_channel(name, ch_inner)
         } else {
             set_var_channel(name, CT_INT)
@@ -4290,12 +4301,28 @@ fn emit_for_in(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.
             emit_line("}")
         } else if iter_type == CT_CHANNEL {
             let ch_inner = get_var_channel_inner(iter_str)
+            // br hgd2az: the element type from the ITERABLE's tid, with the flat field kept
+            // as the fallback for a channel whose element nothing knows (br w3v2e6). The
+            // NULL test above is the end-of-stream signal and is only sound because `send`
+            // now boxes — a raw `(void*)(intptr_t)0` element was indistinguishable from it,
+            // which dropped a sent 0 and every value behind it.
+            let ch_tid = tc_lookup_node_tid(iter_node)
+            let elem_ct = tc_channel_elem_ct(ch_tid)
             let recv_tmp = fresh_temp("__chrecv_")
             emit_line("while (1) \{")
             cg_indent = cg_indent + 1
             emit_line("void* {recv_tmp} = blink_channel_recv({iter_str});")
             emit_line("if ({recv_tmp} == NULL) break;")
-            if ch_inner == CT_STRING {
+            if elem_ct >= 0 {
+                let elem_sname = tc_channel_elem_struct(ch_tid)
+                let elem_c = chan_elem_c_type(elem_ct, elem_sname)
+                emit_line("{elem_c} {c_var_name} = *({elem_c}*){recv_tmp};")
+                push_scope()
+                set_var(var_name, elem_ct, 0)
+                if elem_ct == CT_STRUCT {
+                    set_var_struct(var_name, elem_sname)
+                }
+            } else if ch_inner == CT_STRING {
                 emit_line("const char* {c_var_name} = (const char*){recv_tmp};")
                 push_scope()
                 set_var(var_name, CT_STRING, 0)
