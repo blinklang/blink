@@ -212,6 +212,7 @@ not Stage 3 work:
 | `jr4xf7` | P2 `type:spec` | *(`qjfwc6`'s held group)* what does `fs.read` return? The spec spells `fs.read(path)?` as a `Result` and names the lister `fs.list`; codegen emits a bare `const char*` from `blink_read_file` and calls it `list_dir`. 4 rows, and typecheck cannot sign `fs.*` until it is answered |
 | `n84s1p` | P3 | *(`qjfwc6`'s other residual)* `is_intrinsic_method` disagrees with the codegen arms **in both directions** — `io.debug` listed with no arm, `io.read_bytes` / `env.var` with arms and unlisted, so they resolve through `lookup_fnsig` on the **bare** method name. 9 rows |
 | `x3x0qj` | P2 | *(found by probing the un-triaged `@derive`/`Result` line, which turned out to be three causes)* an **immediately-invoked closure** was entirely unchecked: `infer_type`'s `Call` arm had branches for an `Ident` and a `FieldAccess` callee only, so a closure **literal** callee fell through to `TYPE_UNKNOWN` with its arguments un-inferred. Result type, arity **and** the callee body all unchecked at once — a **silent miscompile** (`let bad: Str = fn() -> Int { 7 }()` ran and printed `7`) plus two `cc` escapes. **−10 rows**, and the first fix whose rows moved family A → **class B** instead of leaving `diverge`. Callee position is the third position of `1hg8b6`'s family |
+| `bf0jnj` | P2 | *(`nxnnxe`'s byproduct, and the `expr_result_*`-vs-`ScopeVar` split that Stage 4 deletes)* the `from_str` emitter stamped the Option's inner type on the temp **variable** and not on the **expression** channel, so a direct `match Status.from_str(..)` scrutinee was spelled `blink_Option_void` while an intermediate `let` worked. The `try_from`/`from_json` arm **one line above** writes its channel — a two-line asymmetry inside one function. **Divergence-neutral, measured** (every figure of the after-`nxnnxe` sweep reproduced exactly). Byproduct: `qne9k3` |
 | `nxnnxe` | P2 | *(the ranked #1 after `x3x0qj`, and the allow-list-with-nothing-behind-it shape a **fourth** time)* every method `@derive` synthesizes had its **name** affirmed by `tc_method_resolvable_on_type` and **no signature anywhere** — so `to_json` / `from_json` / `clone` / `debug` / `eq` / `cmp` and the str-backed-enum statics all resolved to `TYPE_UNKNOWN`. Both halves failed open: `let bad: Int = u.to_json()` compiled, linked and **ran**, and `User.from_json(42)` escaped to `cc`. Fixed the `qjfwc6` way — **a table, not arms**. **−19 rows, exactly as predicted, and every one of the seven named files went to zero.** Three byproducts filed: `pvhaew`, `bf0jnj`, `169kjt` |
 
 `k9agr8` gates the *measurement*, not the code: without it Stage 3 can only demonstrate 0
@@ -2331,6 +2332,76 @@ benign only by luck: `method_names` ends up the *longer* list, so `nr_has_impl_m
 iterating `type_names.len()` never indexes out of range, and derived names stay invisible to it
 while still suppressing the name-only W0501 scan at `:7594`. **Do not add the missing push without
 checking both readers** — it would change what `nr_has_impl_method` answers.
+
+### bf0jnj — one type, two channels, and only one written (CLOSED, divergence-neutral)
+
+**Mechanism.** `match Status.from_str("done") { .. }` failed to compile:
+
+```
+build/c3.c:167:5: error: unknown type name 'blink_Option_void'
+  167 |     blink_Option_void _scrut_5 = _fromstr_4;
+build/c3.c:167:34: error: incompatible types when initializing type 'int' using type 'blink_Option_Status'
+```
+
+The emitted **call** was always right — `blink_Option_Status _fromstr_4 = ...` — and only the
+scrutinee temp copied out of it was wrong. Binding through an intermediate `let` worked, which is
+why nothing in the corpus ever saw it: `tests/test_str_backed_enum.bl:18` writes
+`let s = Status.from_str(..)` and then matches `s`.
+
+The `from_str` static emitter (`codegen_methods.bl:2444`) stamped the Option's inner type on the
+**temp variable** (`set_var_option_struct(tmp, CT_VOID, static_type_name)`) and left the
+**expression side-channel** alone. The match-scrutinee branch (`codegen_stmt.bl:896-905`) reads the
+expression channel — `expr_option_inner` / `expr_option_inner_struct` — found an empty struct name,
+and spelled `Option_void`; anything that bound the call to a name first read the `ScopeVar` and got
+`Status`. **The `try_from` / `from_json` arm one line above (`:2438`) writes its channel.** So the
+fix is two lines, and the asymmetry between two adjacent arms in the same function is the whole
+defect.
+
+**This is the `expr_result_*`-vs-`ScopeVar` split, which is exactly what Stage 4 deletes.** One
+type, two places to write it down, and a producer that wrote one. Until the side-channel is gone,
+both have to be written together — there is no rule enforcing it, which is why this class keeps
+recurring (`bf0jnj` is the same shape as the `1452w4` note at `codegen_expr.bl:4137`).
+
+**`nxnnxe` is what exposed it.** Before typecheck knew `from_str`'s signature it rejected these
+programs with `on type ?`, so the codegen bug behind them was unreachable. That is the second time
+a signature fix has uncovered a codegen bug the missing type was hiding, after `2r96m9`.
+
+**Divergence-neutral, by the same reasoning as `ya8qyf`, and measured rather than asserted.** A `cc`
+escape produces no row: the instrument compares typecheck's tid against codegen's flat pair at a
+*declaration site*, and this bug lives in an expression consumer with no binding at all. The sweep
+after the fix reproduces **every figure** of the after-`nxnnxe` column exactly — 406 total cells, 23
+family-A cells, 174 family-A rows, 4185 diverge, 366051 agree, 1 missing — so no column is added to
+the master table for it. `ya8qyf` was recorded as neutral *by inference* because it shared a sweep;
+this one has its own.
+
+A note on the instrument while sweeping it: `scratchpad/sweep_mono.sh` takes the output path as a
+**required argument** and, called without one, writes nothing and reports every count as zero. It
+read as a clean corpus. Per `feedback_corpus_sweep_is_not_coverage`, an all-zero sweep is a broken
+tap until proven otherwise — here it was the harness, not the compiler.
+
+Test: `tests/test_bf0jnj_from_str_direct_match.bl`, 10 rows — 5 red before, all green after. The
+direct match on both the `Some` and `None` paths; a nested variant match inside the `Some` arm; the
+`Option_void` spelling asserted **absent from `compile_and_run`'s `err_out`**, because
+`compile_and_capture` stops after `blinkc` and never invokes `cc`, so asserting on its output would
+have been a permanent false green (it was, on the first draft, and the row read green while the bug
+was live); `is_some` / `is_none` read directly; and four controls — the intermediate-`let` form that
+always worked, the `from_json` sibling arm that is the reference implementation, a user fn returning
+`Option[Color]` matched directly (which is what proved the bug was **emitter**-specific and not a
+property of `Option`-of-enum), and `to_str`, which never touched the Option channel.
+
+**Byproduct — `qne9k3` filed (P2): `Option[Enum].unwrap()` gives a receiver with no enum channel.**
+`Status.from_str("open").unwrap().to_str()` still fails with
+`unresolved method '.to_str' on type Status`, and it is **not** this emitter: a plain
+`fn pick() -> Option[Status]` unwrapped fails identically, with no `from_str` and no `@derive`
+anywhere. The unwrapped value is a correct `Status` in every other respect — it compares equal to a
+variant, passes as a `Status` argument, and matches its own variant tags — so the value, its C type
+and its tags are all right and only **method dispatch** fails. Codegen dispatches every enum method
+on `get_var_enum(obj_str)` (`codegen_methods.bl:5232`, gating `to_json`, `debug`, `to_str`, `eq`,
+`cmp`, `clone`), the unwrap temp carries the enum on the **struct** channel only, so `get_var_enum`
+reads `""` and control falls to the E0505 backstop at `:5390` — which still prints the right type
+name, because that reads a third channel. **This is the enum-vs-struct confusion of the D+E bucket,
+in the variable channels rather than in `sv_tp`** — the same thing the `tid=Shape flat=Shape` row
+records from the other side. Typecheck passes the program; the error is codegen-only.
 
 ### Remaining family-A causes, ranked (23 cells / 174 rows)
 

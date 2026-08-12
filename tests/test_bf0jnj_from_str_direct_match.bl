@@ -1,0 +1,173 @@
+// br bf0jnj — a str-backed enum's `from_str` matched DIRECTLY erased the Option's inner type.
+//
+// The emitted CALL was always right (`blink_Option_Status _fromstr_4 = ...`). Only the scrutinee
+// temp copied out of it was wrong: `blink_Option_void _scrut_5 = _fromstr_4;`, an unknown C type
+// name plus an incompatible initialization.
+//
+// CAUSE. One type, two places to write it down, and only one written. The from_str static emitter
+// (src/codegen_methods.bl:2444) stamped the Option's inner type on the temp VARIABLE
+// (set_var_option_struct) and left the EXPRESSION side-channel alone. The match-scrutinee branch
+// (src/codegen_stmt.bl:896-905) reads the expression channel — expr_option_inner /
+// expr_option_inner_struct — so it found an empty struct name and spelled Option_void, while
+// anything that bound the call to a name first read the ScopeVar and got Status. The `try_from` /
+// `from_json` arm ONE LINE ABOVE sets its channel (codegen_methods.bl:2438), which is what makes
+// this a one-line asymmetry rather than a design question.
+//
+// This is the `expr_result_*` side-channel vs ScopeVar split that Stage 4 of the tid collapse
+// deletes outright. Until then the two must be written together.
+//
+// Found by br nxnnxe: before typecheck knew from_str's signature it rejected these programs with
+// `on type ?`, so the codegen bug behind them was unreachable.
+
+import compile_test_helpers
+
+fn status_program(body: Str) -> Str {
+    let mut s = "type Status \{\n    Open = \"open\"\n    Done = \"done\"\n}\n\n"
+    s = s.concat("fn main() \{\n")
+    s = s.concat(body)
+    s = s.concat("}\n")
+    s
+}
+
+// ── the bug itself: from_str as a direct match scrutinee ──
+
+test "from_str matched directly compiles and runs" {
+    let mut b = "    match Status.from_str(\"done\") \{\n"
+    b = b.concat("        Some(v) => io.println(\"some=\{v.to_str()}\")\n")
+    b = b.concat("        None => io.println(\"none\")\n")
+    b = b.concat("    }\n")
+    let r = compile_test_helpers.compile_and_run(status_program(b), "bf0jnj_direct_some")
+    assert(r.exit_code == 0)
+    assert(r.out.contains("some=done"))
+}
+
+test "from_str matched directly takes the None arm for an unknown string" {
+    let mut b = "    match Status.from_str(\"nope\") \{\n"
+    b = b.concat("        Some(v) => io.println(\"some=\{v.to_str()}\")\n")
+    b = b.concat("        None => io.println(\"none\")\n")
+    b = b.concat("    }\n")
+    let r = compile_test_helpers.compile_and_run(status_program(b), "bf0jnj_direct_none")
+    assert(r.exit_code == 0)
+    assert(r.out.contains("none"))
+}
+
+// The failure was a C compilation failure, not a diagnostic — assert on the C type name itself so
+// a regression cannot hide behind a different error. It must be read off compile_and_run's
+// err_out: compile_and_capture stops after blinkc and never invokes cc, so it cannot see this
+// failure at all and asserting on its output would be a permanent false green.
+test "the direct form never spells Option_void" {
+    let mut b = "    match Status.from_str(\"open\") \{\n"
+    b = b.concat("        Some(v) => io.println(v.to_str())\n")
+    b = b.concat("        None => io.println(\"none\")\n")
+    b = b.concat("    }\n")
+    let r = compile_test_helpers.compile_and_run(status_program(b), "bf0jnj_no_void")
+    assert(!r.err_out.contains("Option_void"))
+    assert(r.exit_code == 0)
+    assert(r.out.contains("open"))
+}
+
+// ── the same expression channel in the other consumers that read it ──
+
+// A direct `.unwrap()` on the call reads the expression channel too, one consumer over from the
+// match scrutinee. It never appeared in the ticket because nothing in the corpus writes it.
+//
+// What is asserted here is the OPTION INNER TYPE surviving the unwrap, which is bf0jnj's half:
+// the unwrapped value compares equal to a variant, passes as a `Status` argument, and matches its
+// own variant tags. Calling a METHOD on it is a different bug — br qne9k3, the enum-vs-struct
+// split in the VARIABLE channels: codegen dispatches enum methods on get_var_enum
+// (codegen_methods.bl:5232) and the unwrap temp carries the enum on the struct channel only.
+// qne9k3 reproduces with a plain user fn returning Option[Status] and no from_str at all, so it
+// is not this emitter's to fix. Add `.unwrap().to_str()` here once qne9k3 closes.
+test "from_str unwrapped directly carries the enum" {
+    let mut b = "    let v = Status.from_str(\"done\").unwrap()\n"
+    b = b.concat("    io.println(\"\{v == Status.Done}\")\n")
+    b = b.concat("    match v \{\n")
+    b = b.concat("        Status.Open => io.println(\"is-open\")\n")
+    b = b.concat("        Status.Done => io.println(\"is-done\")\n")
+    b = b.concat("    }\n")
+    let r = compile_test_helpers.compile_and_run(status_program(b), "bf0jnj_unwrap")
+    assert(r.exit_code == 0)
+    assert(r.out.contains("true"))
+    assert(r.out.contains("is-done"))
+}
+
+test "from_str is_some/is_none read directly" {
+    let mut b = "    io.println(\"\{Status.from_str(\"open\").is_some()}\")\n"
+    b = b.concat("    io.println(\"\{Status.from_str(\"zzz\").is_none()}\")\n")
+    let r = compile_test_helpers.compile_and_run(status_program(b), "bf0jnj_is_some")
+    assert(r.exit_code == 0)
+    assert(r.out.contains("true"))
+}
+
+// A nested variant match inside the Some arm was the second shape in the ticket's probe.
+test "a nested match inside the Some arm compiles" {
+    let mut b = "    match Status.from_str(\"done\") \{\n"
+    b = b.concat("        Some(v) => match v \{\n")
+    b = b.concat("            Status.Open => io.println(\"is-open\")\n")
+    b = b.concat("            Status.Done => io.println(\"is-done\")\n")
+    b = b.concat("        }\n")
+    b = b.concat("        None => io.println(\"none\")\n")
+    b = b.concat("    }\n")
+    let r = compile_test_helpers.compile_and_run(status_program(b), "bf0jnj_nested")
+    assert(r.exit_code == 0)
+    assert(r.out.contains("is-done"))
+}
+
+// ── controls ──
+
+// The form that always worked, and the reason this went unnoticed: tests/test_str_backed_enum.bl
+// binds through an intermediate let. It must keep working — the fix writes the expression channel
+// in ADDITION to the variable, not instead of it.
+test "the intermediate-let form still works" {
+    let mut b = "    let found = Status.from_str(\"done\")\n"
+    b = b.concat("    match found \{\n")
+    b = b.concat("        Some(v) => io.println(\"some=\{v.to_str()}\")\n")
+    b = b.concat("        None => io.println(\"none\")\n")
+    b = b.concat("    }\n")
+    let r = compile_test_helpers.compile_and_run(status_program(b), "bf0jnj_via_let")
+    assert(r.exit_code == 0)
+    assert(r.out.contains("some=done"))
+}
+
+// The sibling arm one line up in the same emitter, which already wrote its channel. It is the
+// reference implementation for the fix, so it is asserted here to catch a fix that breaks it.
+test "from_json matched directly still works" {
+    let mut s = "import std.json\n\n"
+    s = s.concat("@derive(Serialize, Deserialize)\ntype Point \{ x: Int, y: Int }\n\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let p = Point \{ x: 3, y: 4 }\n")
+    s = s.concat("    match Point.from_json(p.to_json()) \{\n")
+    s = s.concat("        Ok(v) => io.println(\"ok=\{v.x + v.y}\")\n")
+    s = s.concat("        Err(e) => io.println(\"err=\{e}\")\n")
+    s = s.concat("    }\n}\n")
+    let r = compile_test_helpers.compile_and_run(s, "bf0jnj_from_json")
+    assert(r.exit_code == 0)
+    assert(r.out.contains("ok=7"))
+}
+
+// A user fn returning Option[Enum], matched directly. This already worked, which is what proved
+// the bug was specific to the from_str EMITTER and not to Option-of-enum as a shape.
+test "a user fn returning Option of an enum matched directly still works" {
+    let mut s = "type Color \{ Red, Green }\n\n"
+    s = s.concat("fn pick(n: Int) -> Option[Color] \{\n")
+    s = s.concat("    if n == 0 \{ Some(Color.Red) } else \{ None }\n}\n\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    match pick(0) \{\n")
+    s = s.concat("        Some(c) => match c \{\n")
+    s = s.concat("            Color.Red => io.println(\"red\")\n")
+    s = s.concat("            Color.Green => io.println(\"green\")\n")
+    s = s.concat("        }\n")
+    s = s.concat("        None => io.println(\"none\")\n")
+    s = s.concat("    }\n}\n")
+    let r = compile_test_helpers.compile_and_run(s, "bf0jnj_user_fn")
+    assert(r.exit_code == 0)
+    assert(r.out.contains("red"))
+}
+
+// to_str on the same enum is unaffected — it returns Str, so it never touched the Option channel.
+test "to_str direct is unaffected" {
+    let b = "    io.println(Status.Open.to_str())\n"
+    let r = compile_test_helpers.compile_and_run(status_program(b), "bf0jnj_to_str")
+    assert(r.exit_code == 0)
+    assert(r.out.contains("open"))
+}
