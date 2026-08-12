@@ -3376,7 +3376,110 @@ program that imports `std.db` makes `db_sqlite.bl` itself fail to compile. Its d
 tid-vs-flat divergence witness — the message names the receiver from the **tid**, correctly, while
 dispatch reads the **flat** ctype — so it is a likely Stage-3 structural fix.
 
-### Remaining family-A causes, ranked (12 cells / ~~116~~ 107 rows)
+### ps5br9 — the last untyped receiver, and a signature the spec writes and the parser throws away (CLOSED, −5 rows)
+
+**The cause, one line.** Codegen has carried `CT_FFI_SCOPE` (`codegen_types.bl:48`) and a
+four-method emitter block — `alloc`, `alloc_n`, `cstr`, `take` (`codegen_methods.bl:4886`) — since the
+FFI surface landed, while typecheck had **no `TyKind` for the scope object at all**
+(`rg 'ffi_scope|CT_FFI_SCOPE' src/typecheck.bl` found nothing). So `with ffi.scope() as scope` bound
+the binder at `TYPE_UNKNOWN` and the **receiver** was permissive before any method arm could run: the
+declared type of a result was never compared and no argument was ever checked.
+
+**The premise held, and then sharpened past the ticket — which changed the fix.** The ticket said an
+unannotated `let p = scope.alloc()` is "genuinely under-determined" and belongs to E0301. It is not
+under-determined. `sections/07_trust_modules_metadata.md:284-286` writes the pointee **at the call
+site**:
+
+    let p   = scope.alloc[T]()
+    let buf = scope.alloc_n[T](n)
+
+and that spelling **does not parse as a method call**. `parser.bl:2887` accepts a `[` after a member
+name for exactly one hard-coded form, `channel.new[T]`; everything else falls through to
+FieldAccess-then-index, so the spec's own spelling resolves no method at all and the type argument is
+discarded. That is the `hgd2az` lesson verbatim — *a type the programmer wrote down, thrown away by
+the front end* — now seen twice in three tickets, and it is the reason `alloc`/`alloc_n` return
+`TYPE_UNKNOWN` here instead of a fabricated `Ptr[Int]`, or a `Ptr[α]` that would turn every allocation
+in the corpus into E0301 (the `w3v2e6` trap). Filed as **`9qmrma`**; when it closes, both arms can
+return `Ptr[T]` and the test row that pins today's `UnresolvedMethod` becomes a positive.
+
+**Ten fail-open modes, every one reproduced by *running* a program:**
+
+| | shape | observed |
+|---|---|---|
+| 1 | `let bad: Str = scope.cstr("hello")` | `blink check` ok, ran, printed `<value>` |
+| 2 | `let bad: Int = scope.cstr("hello")` | same — a pointer laundered into an `Int` |
+| 3 | cstr result passed to a **`Str` parameter`** | compiled, ran, and **printed the right answer** |
+| 4 | `let bad: Ptr[Pollfd] = scope.cstr(..)` | `cc` escape: *incompatible pointer type* `uint8_t *` |
+| 5 | `scope.cstr(42)` | `cc` escape: *expected `const char *`* |
+| 6 | `let bad: Int = scope.take(p)` | ok, ran, printed `<value>` |
+| 7 | `scope.take("not a pointer")` | accepted, ran. A `Str` freed as a `Ptr` |
+| 8 | `scope.alloc_n("four")` | **silent.** `calloc((size_t)("four"), ..)` → NULL, and every later write is a null deref at some unrelated line |
+| 9 | `ffi.scope(7)` | extra argument to a nullary intrinsic, discarded |
+| 10 | `let taken = scope.take(p)` then `.deref()` | `cc` escape: *invalid use of void expression* — **not closed here**, see below |
+
+Mode 3 is the one to remember, and it is the reason this cannot be left to `cc`: `Ptr[U8]` and `Str`
+are the same C type, so passing a scoped C string to a `Str` parameter compiles, runs and prints the
+correct text. It stays invisible right up to the first pointee that is not text.
+
+**The fix needed no new inference, and two of its three parts were already built.** `cstr` is
+monomorphic in the spec (`fn cstr(self, s: Str) -> Ptr[U8]`) and `take` is the identity on its
+argument's type, so both are signable from the spec table with nothing more than the argument's tid:
+
+- `TyKind.FfiScope` + `make_ffi_scope_type()`, **childless**. A scope is an opaque arena handle, not a
+  container — §07:265-291 gives it three operations and no element type — so it takes `TyKind.Bytes`'s
+  shape rather than `TyKind.Ptr`'s, and every structural accessor answers *no children* through arms
+  it already has.
+- `register_intrinsic_fn_sig("ffi.scope", [], make_ffi_scope_type())` — the `qjfwc6` table entry is
+  what actually **types the binder**, because `tc_bind_with_resource` (`w089a0`) binds the binder to
+  the resource expression's tid and that tid was `TYPE_UNKNOWN`. The comment in that function claiming
+  an untyped `ffi.scope()` is what keeps things working is now the thing that changed. The entry also
+  supplies the arity check of mode 9 **for free**: nullary is data in the table, not an arm.
+- the four-method receiver block in `infer_type`, next to `TyKind.Template`'s. `take` passes an
+  **unresolved** argument through unresolved on purpose — `scope.take(scope.alloc())` is the corpus's
+  own spelling (`tests/test_ffi_scope_escape.bl`) and its argument has no tid by design, per `9qmrma`.
+
+**Attribution, all movement accounted for.** Family-A rows 107 → **102** on the 874-file common basis,
+and family-A **cells 12 → 11**: the `tid=? flat=Ptr[Int]` cell is now **gone from the map** — every
+unannotated pointer binding in the corpus has a tid. The five rows are exactly the five the ticket
+listed (`tests/test_ffi.bl:60,83`, `test_ffi_scope_with.bl:28`, `test_libc_bytes.bl:26`,
+`test_yb9ytb_read_fully.bl:31`), all `at=__main__`. Four became **class B**
+(`tid=Ptr[U8] flat=Ptr[Int]`) and the fifth went to **agree**, because `taken`'s pointee happens to be
+`Int` and the flat fabrication happens to say `Int`.
+
+Total `sv_ty_or_flat_at` calls moved **+93**, which is the three new `let`s in the `FfiScope` arm × the
+31 roots that compile `typecheck.bl`, exactly: `agree` +63 = 2 `let`s × 31 + the 1 flip, `diverge` +30
+= 1 `TyKind`-typed `let` × 31 − the 1 flip. The +31 is the **documented `CT_ENUM` hazard** and not a
+regression (`tk_to_ct` maps `TyKind.Enum => CT_ENUM`, `type_enum` has zero callers, so every
+`TyKind`-typed local is class B by construction); it retires when Stage 3's `c_type_from_tid` lowers
+`TyKind.Enum` to the struct C form.
+
+**What this fix deliberately does not close, and the largest class-B population in the corpus.** Mode
+10 is a *pointee* defect, not a receiver defect: `resolve_ptr_inner_c` (`codegen_types.bl:5630`) reads
+`cg_let_target_ann` and nothing else, and the `CT_PTR` declaration branch (`codegen_stmt.bl:3852`)
+re-reads the same annotation, falling back to `void*`. So the tid is right and codegen does not read
+it — filed as **`0dtbe6`** with two live halves: `Ptr[Float].deref()` **prints `1`** (silent; `deref`
+hard-codes `expr_result_type = CT_INT`), and an unannotated take-then-deref is a `cc` error. The sweep
+measures **238 class-B rows carrying `flat=Ptr[Int]` over 20 distinct sites** — the flat pair has no
+room for a pointee, so it prints `Ptr[Int]` for `Ptr[Pollfd]`, `Ptr[U8]` and `Ptr[Void]` alike. That is
+this plan's thesis in a single field, and it is a Stage-3 `c_type_from_tid` cell, not a ticket to fix
+one arm at a time.
+
+**The untyped-receiver family is now closed: six sightings, one shape.** `w13xgb` (`Ptr[T]`),
+`jzvxav` (`self` in an impl), `w089a0` (the with-resource binder), `nrrs28` (`Template[C]`), `qjfwc6`
+(the namespace intrinsics, the same defect one level up) and this one. Every time: **a value the type
+pool cannot name makes the receiver permissive, so both halves of the gate fail open** — the declared
+type is never compared and the arguments are never checked. The family also split cleanly in two, and
+the split predicted the fix each time: `jzvxav` and `w089a0` were **declaration sites that dropped a
+type they already had** (~10 lines each, swap in the typed spelling), while `w13xgb`, `nrrs28` and
+`ps5br9` were **types the pool could not name** and each needed the same three parts — a `TyKind`
+variant, a lowering, and a method block.
+
+`task regen` + `task ci` green (652 test files, 0 failed). Test:
+`tests/test_ps5br9_ffi_scope_receiver_type.bl`, 14 rows, red before / green after, with the two
+corpus-direct rows written **directly** rather than through `compile_and_run` so the instrument can
+see a typed scope (`feedback_corpus_sweep_is_not_coverage`).
+
+### Remaining family-A causes, ranked (11 cells / ~~116~~ ~~107~~ 102 rows)
 
 Re-ranked from the post-`qjfwc6` sweep, by **rows on the 874-file common basis**, grouped by the
 innermost producer (the outermost call is usually a symptom — `.unwrap()` heads many chains, but its
@@ -3409,18 +3512,18 @@ With the `Str`, `Bytes`, `Ptr`, `self`, effect-op **and namespace-intrinsic** ca
 intrinsic-method list is spent as a leading mechanism: `qjfwc6` gave typecheck the table, and what it
 left behind is not a missing arm but an open spec question (`jr4xf7`) and a list that disagrees with
 its own arms (`n84s1p`). **The untyped-receiver family was the whole head of the list** — and
-`w089a0` has since taken the binder half of it, and `nrrs28` has since taken `Template[T]`, leaving
-`ps5br9` (the ffi scope) alone — the last member of the family, and still one that needs a `TyKind`
-rather than a binding. The two causes that are neither
-(iterator adapters, `Channel(n)`) are both already deferred to a user-visible decision.
+`w089a0` took the binder half of it, `nrrs28` took `Template[T]` and `ps5br9` took the ffi scope, so
+**the family is now closed at six sightings and is no longer a mechanism in this ranking at all**. The
+two causes that are neither (iterator adapters, `Channel(n)`) are both already deferred to a
+user-visible decision, which leaves this tail with **no** entry whose fix is a receiver.
 
 **Two shapes, and they take different fixes.** The untyped-receiver family has now split cleanly in
 two: `jzvxav` and `w089a0` were **declaration sites that dropped a type they already had**, and both
 were repaired by swapping in the typed spelling that already existed (`nr_define_typed`) — no new
 inference, no new arm, ~10 lines each. `w13xgb`, `nrrs28` and `ps5br9` are **types the pool cannot
-name**, and those need a `TyKind` variant plus a lowering plus a method block. The binder half is
-done and the pool half is down to its last member (`ps5br9`) — five of the six sightings are closed,
-and all five were closed by the same three-part recipe.
+name**, and those need a `TyKind` variant plus a lowering plus a method block. Both halves are now
+done — all six sightings closed, and each half closed by the same recipe every time, which is the
+useful part: **the split predicted the size of the fix before the fix was written.**
 
 **The old 72-row `db.*` bucket split four ways, and every one of the four is now closed or isolated —
 this is the lesson the map keeps re-teaching: a shared bucket is not a shared cause.** `jzvxav` took
@@ -3448,7 +3551,8 @@ carried exactly one family-A row after `w089a0`, that row was the `nrrs28` one, 
 | ~~`bytes.to_str()` → `Result[Str, Str]`~~ | ~~3~~ **0** | **`n84s1p`** | **CLOSED as a mis-attribution, not as a cause.** All 3 rows were `src/lsp.bl:51`, and `Bytes.to_str` has had its signature since `typecheck.bl:9495` (`make_result_type(TYPE_STR, TYPE_STR)`) — the whole time this row claimed it did not. `:51` consumes `:50`'s `io.read_bytes`, so its receiver was untyped and the rows were purely **downstream**; they retired with `n84s1p` and no `Bytes` arm was touched. This is the third attribution in this ranking derived from a line number rather than from the row's `var=` field and wrong for it |
 | ~~`Status.from_str` — the compiler-synthesized static on a str-backed enum, returning `Option[Enum]`~~ | ~~4~~ | **`nxnnxe`** | **Folded into the `@derive` row above** — same producer, same missing table, closed with it. It was listed separately only because the `flat=Option[Int]` spelling put it in a different part of the tail. The fold was correct: one `register_derive_method_sig` call closed all 4, and they were the four rows that moved to `tid=Option[Status]` |
 | ~~an immediately-invoked closure, `fn(..) -> T { .. }()`~~ | ~~10~~ | **`x3x0qj`** | **CLOSED** — −10 rows, section above. Was hidden inside the `@derive`/`Result` line, which is how a `flat=`-organized tail hides a callee-shape cause. One missing `callee_kind` branch left the result type, the arity **and** the callee body unchecked; a **silent miscompile** and two `cc` escapes. First fix whose rows moved family A → class B rather than leaving `diverge` |
-| ~~`Ptr[T]` intrinsics — `buf.offset(i)`, `p.is_null()`, `s.as_cstr()`~~ | ~~176~~ | **`w13xgb`** | **CLOSED** — −177 rows, section above. `Ptr[T]` had no `TyKind` at all. 5 rows remain, all `scope.cstr` / `scope.take` → **`ps5br9`** |
+| ~~`Ptr[T]` intrinsics — `buf.offset(i)`, `p.is_null()`, `s.as_cstr()`~~ | ~~176~~ | **`w13xgb`** | **CLOSED** — −177 rows, section above. `Ptr[T]` had no `TyKind` at all. 5 rows remained, all `scope.cstr` / `scope.take` → **`ps5br9`**, now also closed |
+| ~~the `ffi.scope()` receiver — `scope.cstr` / `take` / `alloc` / `alloc_n`~~ | ~~5~~ **0** | **`ps5br9`** | **CLOSED — −5 rows**, section above, and the family-A `tid=? flat=Ptr[Int]` **cell is gone**: every unannotated pointer binding in the corpus now has a tid. The receiver had no `TyKind` while codegen had carried `CT_FFI_SCOPE` and a four-method emitter since the FFI surface landed. **Ten** fail-open modes, of which the instructive one ran *correctly* (a `Ptr[U8]` into a `Str` parameter — same C type). This row's premise was wrong in the same way `hgd2az`'s was: `alloc`/`alloc_n` are **not** under-determined, the spec writes the pointee at the call site and `parser.bl:2887` discards it (**`9qmrma`**). What is left is a *pointee* cell, not a receiver one: **`0dtbe6`**, 238 class-B rows over 20 sites, the largest such population in the corpus |
 | ~~`Str` intrinsic aliases — `s.substr(a,b)`, `s.charAt(i)`, `n.to_string()`~~ | ~~147~~ | **`rbd0a4`** | **CLOSED** — −157 rows. `charAt` was not a missing return type; the method does not exist |
 | ~~`row.get(col)` inside `impl RowOps for Row`~~ | ~~12~~ | **`jzvxav`** | **CLOSED** — was filed under the `db.*` bucket and was not a `db.*` cause: `self` had no type in **any** impl method in **any** program. −17 rows visible, and an argument-check `cc` escape that produces no row at all |
 
@@ -3473,19 +3577,21 @@ figures:
 
 | module | family-A rows | | after `9md3r1` | after `cjtxxr` | after `rb5wvb` | after `jvy35h` | after `n84s1p` | after `cttrag` | after `nxnnxe` | after `x3x0qj` | after `w089a0` | after `qjfwc6` | after `h3q81d` | after `jzvxav` | after `w13xgb` | after `rbd0a4` |
 |---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| `__main__` (the root being compiled) | **93** | | **96** | **108** | **120** | 122 | 125 | 129 | 129 | 148 | 158 | 171 | 174 | 223 | 225 | 237 |
+| `__main__` (the root being compiled) | **88** | | **96** | **108** | **120** | 122 | 125 | 129 | 129 | 148 | 158 | 171 | 174 | 223 | 225 | 237 |
 | `std_libc` | **0** | | **0** | **0** | **0** | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 165 |
 | `std_net_tcp` | **0** | | **0** | **0** | **0** | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 40 | 40 | 40 | 40 |
 | `std_db_row` | **0** | | **0** | **0** | **0** | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 12 | 12 |
 | `cli` | **8** | | **8** | **8** | **8** | 8 | 11 | 11 | 11 | 11 | 11 | 11 | 11 | 11 | 11 | 11 |
-| `std_db_sqlite` | 9 | | 9 | 9 | 9 | 9 | 9 | 9 | 9 | 9 | 9 | 9 | 9 | 9 | 9 | 9 |
+| `std_db_sqlite` | **0** | | 9 | 9 | 9 | 9 | 9 | 9 | 9 | 9 | 9 | 9 | 9 | 9 | 9 | 9 |
 | `incremental` / `file_watcher` | **0 each** | | **0 each** | **0 each** | **0 each** | 0 each | 0 each | 0 each | 6 each | 6 each | 6 each | 6 each | 6 each | 6 each | 6 each | 6 each |
 | `lsp` | **0** | | **0** | **0** | **0** | 0 | 0 | 4 | 4 | 4 | 4 | 4 | 6 | 6 | 6 | 6 |
 | `std_testing` | **0** | | **0** | **0** | **0** | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 3 | 3 |
 | `std_http_server` / `build_stdlib` | 3 each | | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each |
 | `pkg_resolver` | **0** | | **0** | **0** | **0** | 3 | 3 | 3 | 3 | 3 | 3 | 3 | 3 | 3 | 3 | 3 |
 
-**Eight consecutive fixes have now landed their whole delta in `__main__` and nowhere else** —
+**Nine of the last ten fixes landed their whole delta in `__main__` and nowhere else** — `ps5br9`'s
+−5 (93 → 88) and, before it, `nrrs28`'s −9, the one exception, which took the last `lib/std` rows in
+the corpus (`std_db_sqlite` 9 → 0 and with it **every** stdlib module at zero) — plus
 `w089a0`'s −13 (171 → 158), `x3x0qj`'s −10 (158 → 148), `nxnnxe`'s −19 (148 → 129), `jvy35h`'s −3
 (125 → 122), `rb5wvb`'s −2 (122 → 120, its other 3 rows being `pkg_resolver`'s), `cjtxxr`'s −12
 (120 → 108), `9md3r1`'s −12 (108 → 96) and `hgd2az`'s −3 (96 → 93). That is the expected shape for a fix to a **declaration site** or to a **syntactic
@@ -3493,8 +3599,9 @@ form**: a `with ... as` clause, an `fn(..) { .. }()` call, an `@derive`d type an
 `route.callback(req)` field invocation are all written in the root under compilation, so unlike the
 stdlib causes there is no shared module for the rows to concentrate in. It is also why those
 attributions are per-root-file (three, three, seven and three files) rather than per-module, and why
-the `__main__` figure is the one to watch from here — every stdlib module but `std_db_sqlite` is
-already at zero. **`cjtxxr` is the sharpest case of that shape yet and worth reading carefully,
+the `__main__` figure is the one to watch from here — **every** stdlib module is now at zero, and the
+102 remaining family-A rows sit in `__main__` (88), `cli` (8), `std_http_server` (3) and
+`build_stdlib` (3). **`cjtxxr` is the sharpest case of that shape yet and worth reading carefully,
 because the CAUSE is in `lib/std/http_server.bl` — three closure fields on `Route`, `Hook` and
 `ErrorHandler` — while every row sits in `__main__`.** The rows land where the field is *invoked*, not
 where it is *declared*, so a stdlib cause can present as a pure-`__main__` signature. Do not read a

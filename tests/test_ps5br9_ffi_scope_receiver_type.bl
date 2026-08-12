@@ -1,0 +1,177 @@
+import compile_test_helpers.{expect_compile_error, compile_and_run}
+
+// br ps5br9 — the `ffi.scope()` object had no type, so none of its four allocator methods
+// had a return type.
+//
+// THE CAUSE, in one line: codegen has carried `CT_FFI_SCOPE` (codegen_types.bl:48) and a
+// full method block (`alloc`, `alloc_n`, `cstr`, `take` — codegen_methods.bl:4886) since the
+// FFI surface landed, while typecheck had NO TyKind for the scope object at all — `rg
+// 'ffi_scope|CT_FFI_SCOPE' src/typecheck.bl` found nothing. So `with ffi.scope() as scope`
+// bound `scope` at TYPE_UNKNOWN, and the receiver was permissive BEFORE any method arm could
+// be reached. Both halves of the gate failed open: the declared type of the result was never
+// compared and the arguments were never checked.
+//
+// This is the SIXTH and last sighting of the untyped-receiver family, and its shape is
+// w13xgb's (Ptr) exactly: a value the type pool cannot name. The other five are w13xgb
+// (Ptr[T]), nrrs28 (Template[C]), jzvxav (`self` in an impl), w089a0 (the with-resource
+// binder) and — the same defect one level up — the namespace intrinsics of qjfwc6.
+//
+// FAIL-OPEN MODES, every one reproduced by RUNNING a program:
+//
+//   1. `let bad: Str = scope.cstr("hello")`      — `blink check` ok, ran, printed `<value>`.
+//   2. `let bad: Int = scope.cstr("hello")`      — same. A pointer laundered into an Int.
+//   3. cstr result passed to a `Str` PARAMETER   — compiled AND RAN, printing the string.
+//      `Ptr[U8]` and `Str` are both `char*` in C, so this one is invisible right up to the
+//      point where the pointee is not a string.
+//   4. `let bad: Ptr[Pollfd] = scope.cstr(..)`   — cc escape: *initialization of
+//      `blink_Pollfd *` from incompatible pointer type `uint8_t *`*. No Blink span.
+//   5. `scope.cstr(42)`                          — cc escape, `expected 'const char *'`.
+//   6. `let bad: Int = scope.take(p)`            — ok, ran, printed `<value>`.
+//   7. `scope.take("not a pointer")`             — accepted, ran. A Str freed as a Ptr.
+//   8. `scope.alloc_n("four")`                   — SILENT. `calloc((size_t)("four"), ..)`
+//      returns NULL, so the program ran with a null buffer and every later write would be a
+//      null deref at some unrelated line.
+//   9. `ffi.scope(7)`                            — extra argument to a nullary intrinsic,
+//      discarded.
+//  10. `let taken = scope.take(p)` + `.deref()`  — cc escape: *invalid use of void
+//      expression*, because a pointer's POINTEE is spelled from the let annotation and only
+//      from the annotation (br 0dtbe6). The tid is right; codegen does not read it yet. This
+//      one the fix does NOT close — see the row below.
+//
+// SPEC. sections/07_trust_modules_metadata.md:280-286 gives the operation table in full, and
+// two of the four are signable from it with no inference whatsoever:
+//
+//     scope.cstr(s)     fn cstr(self, s: Str) -> Ptr[U8]
+//     scope.take(ptr)   fn take[T](self, ptr: Ptr[T]) -> Ptr[T]
+//
+// `cstr` is a fixed monomorphic signature; `take` is the identity on its argument's type, so
+// it needs the argument's tid and nothing else. Those two are also the whole of this
+// ticket's corpus divergence (4 rows of `cstr`, 1 of `take`).
+//
+// WHY alloc / alloc_n ARE DELIBERATELY LEFT UNSIGNED, and it is not the reason the ticket
+// guessed. The spec spells them `scope.alloc[T]()` and `scope.alloc_n[T](n)` — the pointee
+// IS written down at the call site — but that spelling **does not parse as a method call**:
+// parser.bl:2887 accepts a `[` after a member name for exactly ONE hard-coded form,
+// `channel.new[T]`, and everything else falls to FieldAccess + index. So `scope.alloc[U8]()`
+// silently becomes a different program (row 12 below pins what it does today), and the only
+// channel that carries the pointee is the let annotation, which codegen reads directly
+// (resolve_ptr_inner_c, codegen_types.bl:5630). Returning TYPE_UNKNOWN from these two is
+// therefore the honest answer and changes nothing; the parser gap is br 9qmrma, and minting
+// `Ptr[α]` here instead would turn every `let p = scope.alloc()` in the corpus into E0301
+// (the w3v2e6 trap: a metavar with nothing to bind it is a hard error, not an inference).
+// Their ARGUMENTS are still checked — `alloc_n` takes a count.
+//
+// DO NOT "fix" the following, all deliberate:
+//   - An unannotated `let p = scope.alloc()` still compiles, with a `void*` pointee (row 11).
+//     Whether an un-annotated allocation should be error[CannotInferType] is spec 8vcj2c's
+//     boundary, not a codegen call.
+//   - `scope.take(p)` returns the argument's tid, so `take` of an UNKNOWN Ptr is still
+//     unknown — that is what keeps `scope.take(scope.alloc())` (tests/test_ffi_scope_escape.bl)
+//     compiling.
+//   - `ffi.scope()` outside a `with` is still E0819, from codegen, unchanged.
+
+fn scope_probe_src(body: Str) -> Str {
+    "@trusted(audit: \"ps5br9-test\")\nfn go() ! FFI \{\n    with ffi.scope() as scope \{\n{body}\n    }\n}\nfn main() \{ go() }\n"
+}
+
+// ── The shapes written DIRECTLY into the corpus ──────────────────────────────────────
+//
+// These rows are compiled by the ordinary build, so they are where the tydiv divergence
+// instrument can SEE a typed scope: the five family-A rows this ticket owns are all
+// `let <x> = scope.cstr(..)` / `scope.take(..)` with no annotation, which is precisely the
+// shape whose tid was missing.
+
+test "cstr is a Ptr[U8] in the corpus, where the sweep can see it" {
+    with ffi.scope() as scope {
+        let s = scope.cstr("scoped string")
+        assert_eq(s.is_null(), false)
+        let u: Ptr[U8] = scope.cstr("declared at its own type")
+        assert_eq(u.is_null(), false)
+    }
+}
+
+test "take returns its argument's own pointer type" {
+    with ffi.scope() as scope {
+        let p: Ptr[Int] = scope.alloc()
+        p.write(3)
+        let taken: Ptr[Int] = scope.take(p)
+        assert_eq(taken.deref(), 3)
+        assert_eq(taken.is_null(), false)
+        // The same binding UNANNOTATED, which is the shape whose tid was missing and the one
+        // the sweep counts. `take`'s tid is `Ptr[Int]` here, but the DECLARATION is still
+        // `void*` because the pointee is spelled from the annotation and only the annotation
+        // (br 0dtbe6), so `bare.deref()` is a cc error — mode 10, and NOT a regression: it
+        // failed the same way before the receiver had a type. Asserted at what works today.
+        let bare = scope.take(p)
+        assert_eq(bare.is_null(), false)
+    }
+}
+
+// ── The declared-type compare (modes 1, 2, 4) ────────────────────────────────────────
+
+test "cstr declared as Str is rejected" {
+    expect_compile_error(scope_probe_src("        let bad: Str = scope.cstr(\"hello\")\n        io.println(\"\{bad}\")"), "ps5br9_cstr_str", "TypeError")
+}
+
+test "cstr declared as Int is rejected" {
+    expect_compile_error(scope_probe_src("        let bad: Int = scope.cstr(\"hello\")\n        io.println(\"\{bad}\")"), "ps5br9_cstr_int", "TypeError")
+}
+
+test "cstr declared as a Ptr to the wrong pointee is rejected" {
+    let src = "@ffi.struct(header: \"poll.h\", name: \"pollfd\")\npub type Pollfd \{ fd: I32, events: I16, revents: I16 }\n@trusted(audit: \"ps5br9-test\")\nfn go() ! FFI \{\n    with ffi.scope() as scope \{\n        let bad: Ptr[Pollfd] = scope.cstr(\"hello\")\n        let _ = bad.is_null()\n    }\n}\nfn main() \{ go() }\n"
+    expect_compile_error(src, "ps5br9_cstr_wrong_pointee", "TypeError")
+}
+
+// Mode 3, the one that RAN correctly and is the reason this cannot be left to cc: `Ptr[U8]`
+// and `Str` are the same C type, so the mistake surfaces only when the pointee is not text.
+test "a cstr result passed to a Str parameter is rejected" {
+    let src = "@trusted(audit: \"ps5br9-test\")\nfn shout(s: Str) \{\n    io.println(\"shout \{s}\")\n}\n@trusted(audit: \"ps5br9-test\")\nfn go() ! FFI \{\n    with ffi.scope() as scope \{\n        let s = scope.cstr(\"hello\")\n        shout(s)\n    }\n}\nfn main() \{ go() }\n"
+    expect_compile_error(src, "ps5br9_cstr_to_str_param", "TypeError")
+}
+
+// ── The argument checks (modes 5, 7, 8) ──────────────────────────────────────────────
+
+test "cstr of a non-Str is rejected" {
+    expect_compile_error(scope_probe_src("        let s = scope.cstr(42)\n        let _ = s.is_null()"), "ps5br9_cstr_int_arg", "TypeError")
+}
+
+test "take of a non-Ptr is rejected" {
+    expect_compile_error(scope_probe_src("        let s = scope.take(\"not a pointer\")\n        let _ = s.is_null()"), "ps5br9_take_str_arg", "TypeError")
+}
+
+test "alloc_n of a non-count is rejected" {
+    expect_compile_error(scope_probe_src("        let p: Ptr[Int] = scope.alloc_n(\"four\")\n        let _ = p.is_null()"), "ps5br9_alloc_n_str", "TypeError")
+}
+
+test "take declared at a non-pointer type is rejected" {
+    expect_compile_error(scope_probe_src("        let p: Ptr[Int] = scope.alloc()\n        p.write(1)\n        let bad: Int = scope.take(p)\n        io.println(\"\{bad}\")"), "ps5br9_take_int", "TypeError")
+}
+
+// Mode 9. The signature table gives arity for free — `ffi.scope` takes none.
+test "ffi.scope with an argument is rejected" {
+    let src = "@trusted(audit: \"ps5br9-test\")\nfn go() ! FFI \{\n    with ffi.scope(7) as scope \{\n        let s = scope.cstr(\"x\")\n        let _ = s.is_null()\n    }\n}\nfn main() \{ go() }\n"
+    expect_compile_error(src, "ps5br9_scope_arity", "TypeError")
+}
+
+// ── Regressions this fix must NOT cause ──────────────────────────────────────────────
+
+test "an unannotated scope.alloc still compiles and runs" {
+    let src = "@trusted(audit: \"ps5br9-test\")\nfn go() ! FFI \{\n    with ffi.scope() as scope \{\n        let p = scope.alloc()\n        io.println(\"null=\{p.is_null()}\")\n    }\n}\nfn main() \{ go() }\n"
+    let r = compile_and_run(src, "ps5br9_alloc_unannotated")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("null=false"))
+}
+
+// The spec's own `scope.alloc[T]()` spelling (§07:284) parses as FieldAccess-then-index, not
+// as a method call with a type argument, so it resolves no method at all. Pinned as an ERROR
+// rather than as a working program on purpose: it must not silently mean something else. br
+// 9qmrma owns making it parse; when it does, this row changes to a positive.
+test "the spec's alloc[T]() spelling does not resolve as a method call" {
+    expect_compile_error(scope_probe_src("        let p = scope.alloc[U8]()\n        let _ = p.is_null()"), "ps5br9_alloc_type_arg", "UnresolvedMethod")
+}
+
+// The new receiver kind must not fail open the other way: an unknown method on a scope stays
+// an error, as it was when the receiver had no type at all.
+test "an unknown method on a scope is still rejected" {
+    expect_compile_error(scope_probe_src("        let s = scope.bogus(\"x\")\n        io.println(\"\{s}\")"), "ps5br9_scope_bogus", "UnresolvedMethod")
+}

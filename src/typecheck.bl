@@ -1,6 +1,6 @@
 import ast.{NodeKind, node_kind_name, is_block_bearing, dbg_trace, dbg_channel_on}
 import std.str.{str_to_lower}
-import codegen_types.{is_intrinsic_method, strip_module_qualifier, c_type_tag_for_struct, escape_mono_seg, mono_slot_conflicts, mono_slot_conflicts_same_type, mono_slot_conflicts_diff_type, mono_slot_conflicts_diff_type_injective, get_var_ty, get_var_tp, tp_get_kind, tp_get_child1, tp_get_child2, tp_get_sname, tp_display, CT_INT, CT_FLOAT, CT_BOOL, CT_STRING, CT_LIST, CT_VOID, CT_OPTION, CT_RESULT, CT_ITERATOR, CT_HANDLE, CT_CHANNEL, CT_PTR, CT_MAP, CT_BYTES, CT_SET, CT_STRINGBUILDER, CT_TEMPLATE, CT_STRUCT, CT_ENUM, CT_I8, CT_I16, CT_I32, CT_U8, CT_U16, CT_U32, CT_U64, CT_CHAR}
+import codegen_types.{is_intrinsic_method, strip_module_qualifier, c_type_tag_for_struct, escape_mono_seg, mono_slot_conflicts, mono_slot_conflicts_same_type, mono_slot_conflicts_diff_type, mono_slot_conflicts_diff_type_injective, get_var_ty, get_var_tp, tp_get_kind, tp_get_child1, tp_get_child2, tp_get_sname, tp_display, CT_INT, CT_FLOAT, CT_BOOL, CT_STRING, CT_LIST, CT_VOID, CT_OPTION, CT_RESULT, CT_ITERATOR, CT_HANDLE, CT_CHANNEL, CT_PTR, CT_MAP, CT_BYTES, CT_SET, CT_STRINGBUILDER, CT_TEMPLATE, CT_FFI_SCOPE, CT_STRUCT, CT_ENUM, CT_I8, CT_I16, CT_I32, CT_U8, CT_U16, CT_U32, CT_U64, CT_CHAR}
 import parser.{
     get_annotation, has_annotation, is_literal_string_part,
     node_args, node_assoc_types, node_arms, node_body, node_captures, node_col, node_condition,
@@ -74,7 +74,7 @@ pub type TyKind {
     Int, Float, Bool, Str, Void,
     List, Option, Result, Fn, Struct, Enum,
     Typevar, Unknown, Iterator, Handle, Channel, Ptr,
-    Tuple, Map, Bytes, Set, StringBuilder, Template,
+    Tuple, Map, Bytes, Set, StringBuilder, Template, FfiScope,
     I8, I16, I32, U8, U16, U32, U64, Char
 }
 
@@ -106,6 +106,7 @@ fn tk_name(k: TyKind) -> Str {
         TyKind.Set => "Set"
         TyKind.StringBuilder => "StringBuilder"
         TyKind.Template => "Template"
+        TyKind.FfiScope => "FFIScope"
         TyKind.I8 => "I8"
         TyKind.I16 => "I16"
         TyKind.I32 => "I32"
@@ -878,6 +879,19 @@ pub fn make_ptr_type(pointee: Int) -> Int {
 // prerequisite for ever enforcing it; enforcing it is a spec question, filed separately.
 pub fn make_template_type(context: Int) -> Int {
     ty_intern_simple(TyKind.Template, "Template", context, -1)
+}
+
+// br ps5br9 — the value `ffi.scope()` produces. Codegen has carried CT_FFI_SCOPE
+// (codegen_types.bl:48) and a four-method emitter block (codegen_methods.bl:4886) since the
+// FFI surface landed; typecheck had no kind for the scope object at all, so `with ffi.scope()
+// as scope` bound the binder at TYPE_UNKNOWN and the RECEIVER was permissive before any
+// method arm could run. The sixth and last sighting of the untyped-receiver family.
+//
+// Childless: a scope is an opaque arena handle, not a container — §07:265-291 gives it three
+// operations and no element type. So it takes the same shape as TyKind.Bytes rather than
+// TyKind.Ptr, and every structural accessor answers "no children" through arms it already has.
+pub fn make_ffi_scope_type() -> Int {
+    ty_intern_simple(TyKind.FfiScope, "FFIScope", -1, -1)
 }
 
 // ── Metavariables (Hindley-Milner inference discipline) ─────────────
@@ -2245,6 +2259,13 @@ fn register_ns_intrinsic_sigs() {
     register_intrinsic_fn_sig("env.set_var", [TYPE_STR, TYPE_STR], TYPE_VOID)
     register_intrinsic_fn_sig("env.remove_var", [TYPE_STR], TYPE_VOID)
     register_intrinsic_fn_sig("env.exit", [TYPE_INT], TYPE_VOID)
+
+    // ffi.scope() — br ps5br9. The arena constructor, and the whole reason the scope object
+    // now has a type: this table entry is what makes the `with ffi.scope() as scope` binder
+    // typed, because tc_bind_with_resource binds the binder to the resource expression's tid
+    // and that tid was TYPE_UNKNOWN. Nullary, so the entry also supplies the arity check
+    // `ffi.scope(7)` never had. Codegen still rejects the form outside a `with` (E0819).
+    register_intrinsic_fn_sig("ffi.scope", [], make_ffi_scope_type())
 }
 
 // Every variant of a str-backed enum carries a string value — `Open = "open"`. Mirrors the
@@ -9786,6 +9807,50 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             }
         }
 
+        // br ps5br9 — the four ffi.scope() allocators, against the operation table at
+        // sections/07_trust_modules_metadata.md:280-286 and codegen's own emitter block
+        // (codegen_methods.bl:4886), which sets expr_result_type = CT_PTR for all four.
+        //
+        // Two of the four are fully signable and are the whole of this ticket's divergence:
+        // `cstr` is monomorphic (`fn cstr(self, s: Str) -> Ptr[U8]`, :285) and matches the
+        // `Str.as_cstr()` signature above; `take` is the IDENTITY on its argument's type
+        // (`fn take[T](self, ptr: Ptr[T]) -> Ptr[T]`, :286), so it needs the argument's tid
+        // and no inference at all.
+        //
+        // `alloc` / `alloc_n` are deliberately UNSIGNED. The spec writes the pointee at the
+        // call site — `scope.alloc[T]()`, `scope.alloc_n[T](n)` — but that spelling does not
+        // parse as a method call: parser.bl:2887 accepts a `[` after a member name for the one
+        // hard-coded `channel.new[T]` form and nothing else, so the type argument never
+        // reaches the AST (br 9qmrma). The only channel that carries the pointee today is the
+        // let annotation, which codegen reads directly (resolve_ptr_inner_c). TYPE_UNKNOWN is
+        // the honest answer and leaves that path byte-identical; minting `Ptr[metavar]` would
+        // make every unannotated `let p = scope.alloc()` in the corpus E0301 with nothing to
+        // bind it — the w3v2e6 trap. Their argument IS checked: alloc_n takes a count, and
+        // passing a Str for it silently calloc'd a garbage size and returned NULL.
+        if obj_k == TyKind.FfiScope {
+            let args_sl = node_args(node)
+            if method == "cstr" {
+                check_builtin_arg(method, 0, TYPE_STR, args_sl, "scope")
+                return make_ptr_type(TYPE_U8)
+            }
+            if method == "take" {
+                if args_sl == -1 || sublist_length(args_sl) < 1 { return TYPE_UNKNOWN }
+                let taken_t = infer_type(sublist_get(args_sl, 0))
+                let taken_k = type_kind(resolve_alias_tid(taken_t))
+                if taken_k == TyKind.Ptr { return taken_t }
+                // An unresolved argument keeps the unresolved answer — `scope.take(scope.alloc())`
+                // is the corpus's own spelling and its argument has no tid by design (above).
+                if taken_k == TyKind.Unknown || taken_k == TyKind.Typevar { return TYPE_UNKNOWN }
+                tc_error_at("argument 1 of 'scope.take' expects Ptr[T], got {type_to_str(taken_t)}", sublist_get(args_sl, 0))
+                return TYPE_UNKNOWN
+            }
+            if method == "alloc_n" {
+                check_builtin_arg(method, 0, TYPE_INT, args_sl, "scope")
+                return TYPE_UNKNOWN
+            }
+            if method == "alloc" { return TYPE_UNKNOWN }
+        }
+
         if obj_k == TyKind.Struct || obj_k == TyKind.Enum {
             let tname = ty_pool.get(obj_t).unwrap().name
             // sb3125 §3c rule-3: an unqualified call to a method defined by two
@@ -12060,6 +12125,9 @@ fn type_to_str(tid0: Int) -> Str {
         TyKind.Channel => return "Channel[{type_to_str(t.inner1)}]"
         TyKind.Ptr => return "Ptr[{type_to_str(t.inner1)}]"
         TyKind.Template => return "Template[{type_to_str(t.inner1)}]"
+        // The surface spelling of the type is the expression that makes one: §07:272 has no
+        // type name for it, and `ffi.scope()` is the only way to obtain one.
+        TyKind.FfiScope => return "ffi.scope()"
         TyKind.List => return "List[{type_to_str(t.inner1)}]"
         TyKind.Option => return "Option[{type_to_str(t.inner1)}]"
         TyKind.Result => return "Result[{type_to_str(t.inner1)}, {type_to_str(t.inner2)}]"
@@ -12415,6 +12483,7 @@ fn tk_to_ct(kind: TyKind) -> Int {
         // maps the annotation NAME to it, and the 7 emitters key on it. Only the tid side was
         // missing, so this arm makes the two universes agree rather than adding knowledge.
         TyKind.Template => CT_TEMPLATE
+        TyKind.FfiScope => CT_FFI_SCOPE
         TyKind.I8 => CT_I8
         TyKind.I16 => CT_I16
         TyKind.I32 => CT_I32
@@ -12964,6 +13033,7 @@ pub fn tc_tid_child_count(tid: Int) -> Int {
         TyKind.Ptr => 1
         // The phantom context. Carried, not checked — see make_template_type (br nrrs28).
         TyKind.Template => 1
+        TyKind.FfiScope => 0
         TyKind.I8 => 0
         TyKind.I16 => 0
         TyKind.I32 => 0
@@ -13020,6 +13090,7 @@ pub fn tc_tid_child(tid: Int, i: Int) -> Int {
         TyKind.Channel => if i == 0 { t.inner1 } else { -1 }
         TyKind.Ptr => if i == 0 { t.inner1 } else { -1 }
         TyKind.Template => if i == 0 { t.inner1 } else { -1 }
+        TyKind.FfiScope => -1
         TyKind.I8 => -1
         TyKind.I16 => -1
         TyKind.I32 => -1
@@ -13143,6 +13214,7 @@ pub fn tc_channel_elem_ct(chan_tid: Int) -> Int {
         TyKind.Channel => -1
         TyKind.Iterator => -1
         TyKind.Template => -1
+        TyKind.FfiScope => -1
         // No element type at all. `Channel[Void]` is not a thing, an unresolved metavar or a
         // typevar means the element is not known YET, and a bare `Channel(n)` reaches here
         // through TyKind.Unknown — that spelling names no element and is br w3v2e6's
