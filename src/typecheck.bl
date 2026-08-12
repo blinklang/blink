@@ -2365,6 +2365,39 @@ fn tc_check_callable_arg_bodies(args_sl: Int, skip_idx: Int) ! TypeCheck.Resolve
     }
 }
 
+// Arity- and per-argument-check a call against a structured TyKind.Fn tid, and answer its
+// return type. Shared by the two callable-callee shapes, which need identical treatment and
+// differ only in how the diagnostic names the callee:
+//
+//   * a closure VARIABLE — `let g = ..` then `g(1)` — whose Fn tid comes from local scope
+//     (label "function 'g'", the wording nz7drz/3vfae9 established);
+//   * an immediately-invoked closure LITERAL — `fn(x: Int) -> Int { .. }(1)` — whose Fn tid
+//     comes from inferring the callee node (label "closure", br x3x0qj).
+//
+// `got` drives the argument loop, not `expected`, so a wrong arity still type-checks every
+// argument it was given instead of stopping at the first report.
+fn tc_check_call_against_fn_tid(fn_tid: Int, args_sl: Int, label: Str, node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let fn_ty = ty_pool.get(fn_tid).unwrap()
+    let expected = fn_ty.params_count
+    let got = if args_sl != -1 { sublist_length(args_sl) } else { 0 }
+    if got != expected {
+        tc_error_at("{label} expects {expected} argument(s), got {got}", node)
+    }
+    let pstart = fn_ty.params_start
+    let mut li = 0
+    while li < got {
+        let arg_tid = infer_type(sublist_get(args_sl, li))
+        if li < expected {
+            let ptid = ty_param_list.get(pstart + li).unwrap()
+            if arg_tid != TYPE_UNKNOWN && ptid != TYPE_UNKNOWN && types_compatible(ptid, arg_tid) == 0 {
+                tc_error_at("{label} argument {li} expects {type_to_str(ptid)}, got {type_to_str(arg_tid)}", node)
+            }
+        }
+        li = li + 1
+    }
+    fn_ty.inner1
+}
+
 // ── Error reporting ─────────────────────────────────────────────────
 
 fn tc_error(msg: Str) ! TypeCheck.Report, Diag.Report {
@@ -8814,25 +8847,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 if local_tid != TYPE_UNKNOWN {
                     let call_args_sl = node_args(node)
                     if type_kind(local_tid) == TyKind.Fn {
-                        let fn_ty = ty_pool.get(local_tid).unwrap()
-                        let expected = fn_ty.params_count
-                        let got = if call_args_sl != -1 { sublist_length(call_args_sl) } else { 0 }
-                        if got != expected {
-                            tc_error_at("function '{fn_name}' expects {expected} argument(s), got {got}", node)
-                        }
-                        let pstart = fn_ty.params_start
-                        let mut li = 0
-                        while li < got {
-                            let arg_tid = infer_type(sublist_get(call_args_sl, li))
-                            if li < expected {
-                                let ptid = ty_param_list.get(pstart + li).unwrap()
-                                if arg_tid != TYPE_UNKNOWN && ptid != TYPE_UNKNOWN && types_compatible(ptid, arg_tid) == 0 {
-                                    tc_error_at("function '{fn_name}' argument {li} expects {type_to_str(ptid)}, got {type_to_str(arg_tid)}", node)
-                                }
-                            }
-                            li = li + 1
-                        }
-                        return fn_ty.inner1
+                        return tc_check_call_against_fn_tid(local_tid, call_args_sl, "function '{fn_name}'", node)
                     }
                     if call_args_sl != -1 {
                         let mut li = 0
@@ -8894,6 +8909,29 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                     let type_name = node_name(obj)
                     let tid = lookup_named_type(type_name)
                     if tid != -1 { return tid }
+                }
+            } else if callee_kind == NodeKind.Closure {
+                // br x3x0qj: an immediately-invoked closure literal. This arm had branches for
+                // an Ident and a FieldAccess callee only, so an IIFE fell through to the
+                // TYPE_UNKNOWN below without its arguments being inferred — and TYPE_UNKNOWN
+                // unifies with anything, which made `let bad: Str = fn() -> Int { 7 }()` a
+                // silent miscompile rather than a TypeError. The Closure arm of infer_type
+                // already answers a real TyKind.Fn tid built from the literal's own
+                // annotations, so this is dispatch, not new inference: the same checking the
+                // closure-VARIABLE path above performs, against the same kind of tid.
+                let cls_tid = infer_type(callee)
+                if type_kind(cls_tid) == TyKind.Fn {
+                    return tc_check_call_against_fn_tid(cls_tid, node_args(node), "closure", node)
+                }
+                // No structured tid (an un-annotated literal): still infer the arguments, so
+                // nested expressions in them are checked, then fall through to TYPE_UNKNOWN.
+                let cls_args = node_args(node)
+                if cls_args != -1 {
+                    let mut cai = 0
+                    while cai < sublist_length(cls_args) {
+                        infer_type(sublist_get(cls_args, cai))
+                        cai = cai + 1
+                    }
                 }
             }
         }
@@ -10938,6 +10976,15 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     // argument expression, and recursing unconditionally would surface the spurious errors the
     // ExprStmt arm's comment describes.
     if kind == NodeKind.Call {
+        // br x3x0qj: the CALLEE of an immediately-invoked closure is a body that needs
+        // walking too, and this arm reached only the arguments. Callee position is the third
+        // position of 1hg8b6's family — that ticket fixed call-argument position and still
+        // scopes struct-literal-field position. Without this, `fn() -> Int { "notint" }()`
+        // escaped to the C compiler.
+        let cb_callee = node_left(node)
+        if cb_callee != -1 && node_kind(cb_callee) == NodeKind.Closure {
+            tc_check_body(cb_callee)
+        }
         tc_check_callable_arg_bodies(node_args(node), -1)
         return
     }

@@ -211,6 +211,7 @@ not Stage 3 work:
 | `qjfwc6` | P2 | *(the ranked #1 after `h3q81d`, same shape one namespace over)* every namespace intrinsic but `time.read` / `time.sleep` had no typecheck signature, so `net.connect` / `io.read_line` / `term.width` / `env.args` all resolved to `TYPE_UNKNOWN`. **−45 rows**, `std_net_tcp` 40 → 0. The declared-type half was a **silent miscompile** — `let bad: Str = net.connect(host, port)` compiled, linked and *ran* — and arity was a **compiler panic** at `parser.bl:111` |
 | `jr4xf7` | P2 `type:spec` | *(`qjfwc6`'s held group)* what does `fs.read` return? The spec spells `fs.read(path)?` as a `Result` and names the lister `fs.list`; codegen emits a bare `const char*` from `blink_read_file` and calls it `list_dir`. 4 rows, and typecheck cannot sign `fs.*` until it is answered |
 | `n84s1p` | P3 | *(`qjfwc6`'s other residual)* `is_intrinsic_method` disagrees with the codegen arms **in both directions** — `io.debug` listed with no arm, `io.read_bytes` / `env.var` with arms and unlisted, so they resolve through `lookup_fnsig` on the **bare** method name. 9 rows |
+| `x3x0qj` | P2 | *(found by probing the un-triaged `@derive`/`Result` line, which turned out to be three causes)* an **immediately-invoked closure** was entirely unchecked: `infer_type`'s `Call` arm had branches for an `Ident` and a `FieldAccess` callee only, so a closure **literal** callee fell through to `TYPE_UNKNOWN` with its arguments un-inferred. Result type, arity **and** the callee body all unchecked at once — a **silent miscompile** (`let bad: Str = fn() -> Int { 7 }()` ran and printed `7`) plus two `cc` escapes. **−10 rows**, and the first fix whose rows moved family A → **class B** instead of leaving `diverge`. Callee position is the third position of `1hg8b6`'s family |
 
 `k9agr8` gates the *measurement*, not the code: without it Stage 3 can only demonstrate 0
 in archive-linked mode.
@@ -2097,7 +2098,103 @@ turned up a byproduct bug: **`jw2yz2`** — a `Ptr[T]` ffi-struct field read has
 `let v = p.fd.read()` emits *"variable declared void"* and `"{p.fd.read()}"` compiles, runs, and
 prints the literal text `<value>`. Third link in the same `Ptr` chain as `w13xgb` and `ps5br9`.
 
-### Remaining family-A causes, ranked (28 cells / 203 rows)
+### x3x0qj — an immediately-invoked closure was entirely unchecked (CLOSED)
+
+**Mechanism.** `infer_type`'s `NodeKind.Call` arm branched on `callee_kind` for
+`NodeKind.Ident` and `NodeKind.FieldAccess` **only**, then fell to `return TYPE_UNKNOWN`
+without inferring the arguments or looking at the callee at all. A closure **literal** in callee
+position — an immediately-invoked closure — hit that fallthrough. A closure **variable** call was
+already fine (the `Ident` branch reads the local's `TyKind.Fn` tid, arity-checks, per-arg-checks
+and answers `fn_ty.inner1`), so this was specific to the literal-callee shape.
+
+**One missing branch, three things unchecked at once** — and this is the reason the cause was
+worth taking ahead of larger row counts:
+
+1. the call's **result type**, and `TYPE_UNKNOWN` unifies with anything, so
+   `let bad: Str = fn() -> Int { 7 }()` compiled, linked, ran, exit 0, printed `7`, and
+   `blink check` said `ok` — **the third silent miscompile of this campaign**;
+2. the **arity** — `fn() -> Int { 7 }(1, 2)` escaped to `cc` (*"too many arguments"*);
+3. the callee closure's **body** — `fn() -> Int { "notint" }()` escaped to `cc`
+   (*"returning char \* from a function with return type int64\_t"*).
+
+Half 3 is the **third position** of `1hg8b6`'s family. That ticket fixed call-**argument**
+position (`tc_check_callable_arg_bodies`, commit `82a0dbd`) and still scopes
+struct-literal-**field** position; **callee** position was neither, and `tc_check_body`'s `Call`
+arm reached only the arguments.
+
+**The fix is dispatch, not inference.** `infer_type`'s `Closure` arm already answers a real
+`TyKind.Fn` tid built from the literal's own annotations (measured: `tid=Fn(Int) -> Int`), so the
+new `callee_kind == NodeKind.Closure` branch infers the callee and hands the tid to the same
+checking the closure-variable path performs. That checking was extracted verbatim out of the
+`Ident` branch into `tc_check_call_against_fn_tid(fn_tid, args_sl, label, node)` — the two shapes
+differ only in how the diagnostic names the callee (`"function 'g'"` vs `"closure"`), so the
+label is the only parameter. `tc_check_body`'s `Call` arm gained a callee walk for half 3.
+
+| | after `w089a0` | after `x3x0qj` | delta |
+|---|---:|---:|---:|
+| family A rows | 203 | **193** | **−10** |
+| family A cells | 28 | **26** | **−2** |
+| total cells | 402 | **403** | **+1** |
+| diverge rows | 4191 | 4190 | −1 |
+| agree | 365580 | 365705 | +125 |
+| missing | 1 | 1 | 0 |
+
+**Attribution is exact and the prediction was exact: the ticket named 10 rows in three files, and
+all three files went to zero.** `test_fmt_iife_with_block.bl` 5 → 0,
+`test_k4qp2c_test_body_compound_propagation.bl` 3 → 0, `test_promote_fwd_decl_ordering.bl` 2 → 0.
+Nothing else in the corpus moved by a row.
+
+**This is the first fix whose rows did not leave `diverge` — they MOVED, family A → class B, and
+that is the outcome the plan wants.** Family A lost two cells and the total gained three:
+
+```
+- bucket=diverge site=emit_let_binding.decl tid=?                      flat=Result[Int, Void]
+- bucket=diverge site=emit_let_binding.decl tid=?                      flat=Result[Void, Void]
++ bucket=diverge site=emit_let_binding.decl tid=Result[Int, IIFEErr]   flat=Result[Int, Void]
++ bucket=diverge site=emit_let_binding.decl tid=Result[Int, PgError]   flat=Result[Int, Void]
++ bucket=diverge site=emit_let_binding.decl tid=Result[UserRow, PgError] flat=Result[Void, Void]
+```
+
+Nine of the ten rows are now *"typecheck holds the right type and the flat pair cannot spell
+it"*: `Result[Int, IIFEErr]` has two children and the flat `(CT_*, sname)` pair holds one, so the
+**error type erases to `Void`** — and where both children are structs (`Result[UserRow, PgError]`)
+both erase. The tenth row (`flat=Int`) simply agrees now. Rows leaving family A for class B are
+not a regression: class B is exactly what Stage 3's `c_type_from_tid` and Stage 4's deletion of
+`sv_tp` remove wholesale, whereas family A is what has to be fixed one cause at a time. `−1`
+`diverge` with `−10` family A is that transition, measured.
+
+`agree` rose by **125** on a `−10` fix, more than any prerequisite so far, because walking the
+callee body infers every node inside it — the divergence instrument sees a body that was
+previously invisible to typecheck entirely.
+
+Verified: `task regen` EXIT=0; `task ci` EXIT=0 — **640/640** test files, `fmt` 1500 passed / 86
+skipped, gen1-vs-gen2 per-module byte-equal.
+
+Test: `tests/test_x3x0qj_iife_callee_unchecked.bl`, 20 rows — 14 red before, all green after. Four
+declared-type compares (`Int`, `Str`, `Result`, and an IIFE taking arguments); the result as a
+receiver, asserting the diagnostic reads *"on type Int"* and **not** *"on type ?"*; arity over and
+under; the argument type; three body rows (return mismatch, a bad declaration inside the body, and
+the body in **statement** position rather than initializer position); three `cc`-escape assertions
+including *"must not print 7"*, the miscompile itself; three run controls (every correct spelling,
+a `Result` return, nested IIFEs); and **three closure-variable controls that guard the
+extraction** — the arity wording `function 'g' expects 1 argument(s), got 2` and the argument
+wording `function 'g' argument 0 expects Int` asserted verbatim, plus a run.
+
+**What it did not fix, and the evidence is now sharper.** A container return through an IIFE still
+fails:
+
+```
+let m = fn() -> Map[Int, Str] { Map() }()
+let l = fn() -> List[Int] { [1, 2, 3] }()
+error[UnresolvedMethod]: unresolved method '.len' on type Map[Int, Str] in 'main'
+```
+
+Before this fix that diagnostic read *"on type ?"*. It now **names the type correctly**, which
+makes it a clean instance of `r398vj` (the closure-call return recovered by re-parsing the emitted
+C signature string, so only `Int` / `Str` / `Option` survive) — noted on that ticket, since the
+IIFE form was not in its description. Typecheck holds the right tid; codegen throws it away.
+
+### Remaining family-A causes, ranked (26 cells / 193 rows)
 
 Re-ranked from the post-`qjfwc6` sweep, by **rows on the 874-file common basis**, grouped by the
 innermost producer (the outermost call is usually a symptom — `.unwrap()` heads many chains, but its
@@ -2162,40 +2259,54 @@ and it is that last one.
 | a cross-module `pub let` container element — `symbol_index.si_file_path.get(i)` | 12 | — | `src/incremental.bl:44,75`, `src/file_watcher.bl:40,73`. Part of the `flat=Str` tail `rbd0a4` uncovered, and **the largest remaining cause inside the compiler's own source** |
 | `Response` / `Request` from the http surface | 10 | — | `tests/test_net_integration.bl`, `test_middleware.bl`, `test_http_server.bl`, all `at=__main__`. **It did not close with `net.*`** — the earlier note guessed it would. `net.request` was the one intrinsic `qjfwc6` left out for a reason of its own (its `Result[Response, NetError]` needs two stdlib struct types a consuming module need not have imported), so these need their own probe |
 | calling a closure-typed **field** (`route.callback`, `logger.log_msg`) | ~11 | — | |
-| `@derive(Deserialize)` / str-backed-enum `Result` returns | 15 | — | 8 `flat=Result[Void, Str]` + 7 `flat=Result[Int, Void]`, in `test_derive_*.bl`, `test_str_backed_enum.bl`, `test_fmt_iife_with_block.bl`. **Un-triaged**: a compiler-*synthesized* fn is the likely producer, which would make it a different mechanism from every entry above — needs its own probe before it gets a ticket |
+| **`@derive`-synthesized methods have no signature in typecheck** — `to_json`, `from_json`, `clone`, and the str-backed-enum statics | **19** | — | **Triaged, and it grew.** The old 15-row line lumped two unrelated causes and got both counts wrong: 10 of those rows were the IIFE (**`x3x0qj`**, closed above) and the rest is bigger than it looked once the IIFE rows stopped hiding it. One mechanism, four synthesized shapes: `u.to_json()` → `flat=Str` (`test_derive_serialize.bl`, `test_derive_nested.bl`, `test_derive_deserialize.bl:13`, `test_derive_list_deser.bl:30`), `T.from_json(..)` → `flat=Result[Void, Str]` (`test_derive_deserialize.bl` ×2, `test_derive_enum_deser.bl` ×2, `test_derive_list_deser.bl`, `test_str_backed_enum.bl` ×2), `x.clone()` → `flat=Point`/`Int`/`Shape` (`test_derive_clone.bl` ×3), and the str-backed statics → `flat=Option[Int]` (`test_str_backed_enum.bl` ×4). Nothing declares these — `@derive` synthesizes them in codegen, so there is no `node_type_ann` to read and no fnsig to look up. **The `qjfwc6` shape: a table, not arms** — one `FnSigEntry` per derived method per deriving type, minted where the derive is registered. Now the largest actionable cause, and it subsumes the separate `Status.from_str` line below |
 | `List.join` on a `List[Str]` | ~4 | — | `src/cli.bl:935`, `:3561`, `:3563`. From the `rbd0a4` tail; the last of the allow-list-vs-dispatch shape |
-| `Status.from_str` — the compiler-synthesized static on a str-backed enum, returning `Option[Enum]` | 4 | — | third sub-mechanism of the old top entry; also no fnsig |
+| `bytes.to_str()` → `Result[Str, Str]` | 3 | — | The third cause the `@derive`/`Result` probe split out. All 3 are `src/lsp.bl:51`, one per root that pulls `lsp` in (`lsp`, `cli`, `build_stdlib`). A `Bytes` **instance** intrinsic with no return arm — the `2r96m9` shape one method over, and `2r96m9` covered only the two statics |
+| ~~`Status.from_str` — the compiler-synthesized static on a str-backed enum, returning `Option[Enum]`~~ | ~~4~~ | — | **Folded into the `@derive` row above** — same producer, same missing table. It was listed separately only because the `flat=Option[Int]` spelling put it in a different part of the tail |
+| ~~an immediately-invoked closure, `fn(..) -> T { .. }()`~~ | ~~10~~ | **`x3x0qj`** | **CLOSED** — −10 rows, section above. Was hidden inside the `@derive`/`Result` line, which is how a `flat=`-organized tail hides a callee-shape cause. One missing `callee_kind` branch left the result type, the arity **and** the callee body unchecked; a **silent miscompile** and two `cc` escapes. First fix whose rows moved family A → class B rather than leaving `diverge` |
 | ~~`Ptr[T]` intrinsics — `buf.offset(i)`, `p.is_null()`, `s.as_cstr()`~~ | ~~176~~ | **`w13xgb`** | **CLOSED** — −177 rows, section above. `Ptr[T]` had no `TyKind` at all. 5 rows remain, all `scope.cstr` / `scope.take` → **`ps5br9`** |
 | ~~`Str` intrinsic aliases — `s.substr(a,b)`, `s.charAt(i)`, `n.to_string()`~~ | ~~147~~ | **`rbd0a4`** | **CLOSED** — −157 rows. `charAt` was not a missing return type; the method does not exist |
 | ~~`row.get(col)` inside `impl RowOps for Row`~~ | ~~12~~ | **`jzvxav`** | **CLOSED** — was filed under the `db.*` bucket and was not a `db.*` cause: `self` had no type in **any** impl method in **any** program. −17 rows visible, and an argument-check `cc` escape that produces no row at all |
 
 Note what the `db.*` and iterator entries did **not** do: they did not get bigger. They rose to the
-top because the causes above them were removed, and both were already in the map. The one genuinely
-new line is the `@derive`/`Result` group, which the earlier `flat=` tail hid behind `Str` and
-`Ptr[Int]`.
+top because the causes above them were removed, and both were already in the map.
+
+**The `@derive`/`Result` line is where the ranking method itself failed, and it is worth recording
+because it will fail the same way again.** That line was entered as one un-triaged 15-row group
+because its rows shared a `flat=` spelling. Probing it split it into **three** unrelated causes:
+the IIFE (`x3x0qj`, 10 rows, now closed), the `@derive`-synthesized methods (19 rows once the IIFE
+rows stopped masking them), and `bytes.to_str()` at `src/lsp.bl:51` (3 rows, one per root — a
+`Bytes` intrinsic returning `Result[Str, Str]`, the `2r96m9`/`rbd0a4` shape again). **Grouping by
+`flat=` spelling groups by symptom.** `flat=Result[Int, Void]` is what the flat universe prints for
+*any* `Result` whose error type it cannot spell, so it collects every producer at once — the same
+trap as ranking by cells instead of rows, one level down. Only the *producing expression* is a
+cause, and reading it means opening the source line.
 
 **Cross-check by source module** (` at=` on the post-`w089a0` sweep — note the leading space; without
 it the pattern also matches inside `flat=`), because the flat spelling and the producing module answer
 different questions and disagreeing on which is "the" count is how the Ptr entry once acquired two
 figures:
 
-| module | family-A rows | | after `qjfwc6` | after `h3q81d` | after `jzvxav` | after `w13xgb` | after `rbd0a4` |
-|---|---:|---|---:|---:|---:|---:|---:|
-| `__main__` (the root being compiled) | 158 | | 171 | 174 | 223 | 225 | 237 |
-| `std_libc` | **0** | | 0 | 0 | 0 | 0 | 165 |
-| `std_net_tcp` | **0** | | 0 | 40 | 40 | 40 | 40 |
-| `std_db_row` | **0** | | 0 | 0 | 0 | 12 | 12 |
-| `cli` | 11 | | 11 | 11 | 11 | 11 | 11 |
-| `std_db_sqlite` | 9 | | 9 | 9 | 9 | 9 | 9 |
-| `incremental` / `file_watcher` | 6 each | | 6 each | 6 each | 6 each | 6 each | 6 each |
-| `lsp` | 4 | | 4 | 6 | 6 | 6 | 6 |
-| `std_testing` | **0** | | 0 | 0 | 0 | 3 | 3 |
-| `std_http_server` / `pkg_resolver` / `build_stdlib` | 3 each | | 3 each | 3 each | 3 each | 3 each | 3 each |
+| module | family-A rows | | after `w089a0` | after `qjfwc6` | after `h3q81d` | after `jzvxav` | after `w13xgb` | after `rbd0a4` |
+|---|---:|---|---:|---:|---:|---:|---:|---:|
+| `__main__` (the root being compiled) | 148 | | 158 | 171 | 174 | 223 | 225 | 237 |
+| `std_libc` | **0** | | 0 | 0 | 0 | 0 | 0 | 165 |
+| `std_net_tcp` | **0** | | 0 | 0 | 40 | 40 | 40 | 40 |
+| `std_db_row` | **0** | | 0 | 0 | 0 | 0 | 12 | 12 |
+| `cli` | 11 | | 11 | 11 | 11 | 11 | 11 | 11 |
+| `std_db_sqlite` | 9 | | 9 | 9 | 9 | 9 | 9 | 9 |
+| `incremental` / `file_watcher` | 6 each | | 6 each | 6 each | 6 each | 6 each | 6 each | 6 each |
+| `lsp` | 4 | | 4 | 4 | 6 | 6 | 6 | 6 |
+| `std_testing` | **0** | | 0 | 0 | 0 | 0 | 3 | 3 |
+| `std_http_server` / `pkg_resolver` / `build_stdlib` | 3 each | | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each |
 
-`w089a0`'s whole −13 lands in `__main__` (171 → 158) and nowhere else, which is the expected shape for
-a fix to a **declaration site**: a `with ... as` clause is written in the root under compilation, so
-unlike the stdlib causes there is no shared module for the rows to concentrate in. That is also why
-its attribution is per-root-file (three files) rather than per-module.
+**Two consecutive fixes have now landed their whole delta in `__main__` and nowhere else** —
+`w089a0`'s −13 (171 → 158) and `x3x0qj`'s −10 (158 → 148). That is the expected shape for a fix to a
+**declaration site** or to a **syntactic form**: a `with ... as` clause and an
+`fn(..) { .. }()` call are both written in the root under compilation, so unlike the stdlib causes
+there is no shared module for the rows to concentrate in. It is also why both attributions are
+per-root-file (three files each) rather than per-module, and why the `__main__` figure is the one to
+watch from here — every stdlib module but `std_db_sqlite` is already at zero.
 
 **`std_libc` went from a third of everything left to zero**, and it was one cause; `std_db_row` and
 `std_testing` went to zero on `jzvxav`, and it was one cause covering both; **`std_net_tcp` went from

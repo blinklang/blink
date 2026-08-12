@@ -1,0 +1,208 @@
+// br x3x0qj — an immediately-invoked closure literal, `fn(..) -> T { .. }()`, was entirely
+// unchecked.
+//
+// infer_type's NodeKind.Call arm (src/typecheck.bl:8708) branched on callee_kind for
+// NodeKind.Ident and NodeKind.FieldAccess only, then fell to `return TYPE_UNKNOWN` without
+// inferring the arguments or looking at the callee. A closure LITERAL in callee position hit
+// that fallthrough, so three things went unchecked at once:
+//
+//   1. the call's RESULT TYPE — and TYPE_UNKNOWN unifies with anything, so
+//          let bad: Str = fn() -> Int { 7 }()
+//      compiled, linked, ran, exit 0, and printed `7`. A silent miscompile, `check` said ok.
+//   2. the ARITY — `fn() -> Int { 7 }(1, 2)` escaped to the C compiler.
+//   3. the callee closure's BODY — `fn() -> Int { "notint" }()` escaped to the C compiler.
+//
+// A closure VARIABLE call was already fine: the Ident branch reads the local's TyKind.Fn tid,
+// arity-checks, per-arg-checks and answers fn_ty.inner1. So the fix is dispatch, not new
+// inference — infer_type on a Closure node already answers a real Fn tid. The checking body
+// is now shared by both callable-callee shapes (tc_check_call_against_fn_tid), which is why
+// the closure-variable rows below are here too: they guard the extraction.
+//
+// Half 3 is the THIRD position of br 1hg8b6's family. 1hg8b6 fixed call-ARGUMENT position and
+// still scopes struct-literal-field position; callee position was neither.
+//
+// Found as a cause in the tid-collapse divergence map: 10 family-A rows, all
+// `let x = fn() -> R { .. }()` (tests/test_fmt_iife_with_block.bl,
+// tests/test_k4qp2c_test_body_compound_propagation.bl, tests/test_promote_fwd_decl_ordering.bl).
+
+import compile_test_helpers
+
+fn iife_program(body: Str) -> Str {
+    let mut s = "fn main() \{\n"
+    s = s.concat(body)
+    s = s.concat("}\n")
+    s
+}
+
+// ── half 1: the call's result type ───────────────────────────────────────────
+
+test "a declared type is compared against an IIFE returning Int" {
+    let s = iife_program("    let bad: Str = fn() -> Int \{ 7 }()\n    io.println(bad)\n")
+    compile_test_helpers.expect_compile_error(s, "x3x0qj_decl_int", "TypeError")
+}
+
+test "a declared type is compared against an IIFE returning Str" {
+    let s = iife_program("    let bad: Int = fn() -> Str \{ \"s\" }()\n    io.println(\"\{bad}\")\n")
+    compile_test_helpers.expect_compile_error(s, "x3x0qj_decl_str", "TypeError")
+}
+
+test "a declared type is compared against an IIFE returning Result" {
+    let s = iife_program("    let bad: Int = fn() -> Result[Int, Str] \{ Ok(1) }()\n    io.println(\"\{bad}\")\n")
+    compile_test_helpers.expect_compile_error(s, "x3x0qj_decl_result", "TypeError")
+}
+
+test "a declared type is compared against an IIFE taking arguments" {
+    let s = iife_program("    let bad: Str = fn(x: Int) -> Int \{ x + 1 }(4)\n    io.println(bad)\n")
+    compile_test_helpers.expect_compile_error(s, "x3x0qj_decl_args", "TypeError")
+}
+
+// The result of the call is a receiver in its own right: the diagnostic must NAME the type,
+// not `?`. Before the fix this read "unresolved method '.len' on type ?".
+test "the value an IIFE produces is a typed receiver" {
+    let s = iife_program("    let v = fn() -> Int \{ 7 }()\n    io.println(\"\{v.len()}\")\n")
+    let out = compile_test_helpers.compile_and_capture(s, "x3x0qj_receiver")
+    assert(out.contains("on type Int"))
+    assert(!out.contains("on type ?"))
+}
+
+// ── half 2: arity ────────────────────────────────────────────────────────────
+
+test "an IIFE with too many arguments is an arity error" {
+    let s = iife_program("    let a = fn() -> Int \{ 7 }(1, 2)\n    io.println(\"\{a}\")\n")
+    compile_test_helpers.expect_compile_error(s, "x3x0qj_arity_many", "TypeError")
+}
+
+test "an IIFE with too few arguments is an arity error" {
+    let s = iife_program("    let a = fn(x: Int) -> Int \{ x }()\n    io.println(\"\{a}\")\n")
+    compile_test_helpers.expect_compile_error(s, "x3x0qj_arity_few", "TypeError")
+}
+
+test "an IIFE argument type is checked" {
+    let s = iife_program("    let a = fn(x: Int) -> Int \{ x + 1 }(\"nope\")\n    io.println(\"\{a}\")\n")
+    compile_test_helpers.expect_compile_error(s, "x3x0qj_arg_type", "TypeError")
+}
+
+// ── half 3: the callee closure's body ────────────────────────────────────────
+
+test "the body of an IIFE callee is typecheck-walked" {
+    let s = iife_program("    let a = fn() -> Int \{ \"notint\" }()\n    io.println(\"\{a}\")\n")
+    compile_test_helpers.expect_compile_error(s, "x3x0qj_body_ret", "TypeError")
+}
+
+test "a bad declaration inside an IIFE callee body is caught" {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let a = fn() -> Int \{\n")
+    s = s.concat("        let bad: Int = \"not an int\"\n")
+    s = s.concat("        io.println(bad)\n")
+    s = s.concat("        7\n")
+    s = s.concat("    }()\n")
+    s = s.concat("    io.println(\"\{a}\")\n}\n")
+    compile_test_helpers.expect_compile_error(s, "x3x0qj_body_decl", "TypeError")
+}
+
+// An IIFE in statement position, not initializer position — the callee body must be walked
+// there too.
+test "the body of an IIFE callee in statement position is typecheck-walked" {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    fn() -> Int \{ \"notint\" }()\n")
+    s = s.concat("    io.println(\"done\")\n}\n")
+    compile_test_helpers.expect_compile_error(s, "x3x0qj_body_stmt", "TypeError")
+}
+
+// ── nothing reaches the C compiler ───────────────────────────────────────────
+
+test "an arity-wrong IIFE never reaches the C compiler" {
+    let s = iife_program("    let a = fn() -> Int \{ 7 }(1, 2)\n    io.println(\"\{a}\")\n")
+    let r = compile_test_helpers.compile_and_run(s, "x3x0qj_esc_arity")
+    let all = r.out.concat(r.err_out)
+    assert(r.exit_code != 0)
+    assert(!all.contains("too many arguments"))
+    assert(!all.contains("C compilation failed"))
+}
+
+test "an argument-wrong IIFE never reaches the C compiler" {
+    let s = iife_program("    let a = fn(x: Int) -> Int \{ x + 1 }(\"nope\")\n    io.println(\"\{a}\")\n")
+    let r = compile_test_helpers.compile_and_run(s, "x3x0qj_esc_arg")
+    let all = r.out.concat(r.err_out)
+    assert(r.exit_code != 0)
+    assert(!all.contains("argument is of type"))
+    assert(!all.contains("C compilation failed"))
+}
+
+// The silent miscompile itself: before the fix this printed `7` and exited 0.
+test "a wrongly-declared IIFE result never runs" {
+    let s = iife_program("    let bad: Str = fn() -> Int \{ 7 }()\n    io.println(bad)\n")
+    let r = compile_test_helpers.compile_and_run(s, "x3x0qj_esc_decl")
+    let all = r.out.concat(r.err_out)
+    assert(r.exit_code != 0)
+    assert(!all.contains("makes pointer from integer"))
+    assert(!all.contains("C compilation failed"))
+    assert(!all.contains("7"))
+}
+
+// ── controls: correct IIFEs still compile and RUN ─────────────────────────────
+
+test "correct IIFE spellings run" {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let a = fn() -> Int \{ 7 }()\n")
+    s = s.concat("    let b = fn(x: Int) -> Int \{ x + 1 }(4)\n")
+    s = s.concat("    let c = fn(x: Int, y: Str) -> Str \{ \"\{y}\{x}\" }(3, \"n\")\n")
+    s = s.concat("    io.println(\"\{a}|\{b}|\{c}\")\n}\n")
+    let r = compile_test_helpers.compile_and_run(s, "x3x0qj_run_basic")
+    assert(r.exit_code == 0)
+    assert(r.out.contains("7|5|n3"))
+}
+
+test "an IIFE returning Result runs and matches" {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let r = fn() -> Result[Int, Str] \{ Ok(9) }()\n")
+    s = s.concat("    match r \{\n")
+    s = s.concat("        Ok(v) => io.println(\"ok=\{v}\")\n")
+    s = s.concat("        Err(e) => io.println(\"err=\{e}\")\n")
+    s = s.concat("    }\n}\n")
+    let r = compile_test_helpers.compile_and_run(s, "x3x0qj_run_result")
+    assert(r.exit_code == 0)
+    assert(r.out.contains("ok=9"))
+}
+
+test "nested IIFEs run" {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let outer = fn() -> Int \{\n")
+    s = s.concat("        let inner = fn() -> Int \{ 4 }()\n")
+    s = s.concat("        inner + 1\n")
+    s = s.concat("    }()\n")
+    s = s.concat("    io.println(\"\{outer}\")\n}\n")
+    let r = compile_test_helpers.compile_and_run(s, "x3x0qj_run_nested")
+    assert(r.exit_code == 0)
+    assert(r.out.contains("5"))
+}
+
+// ── controls: the closure-VARIABLE path is unchanged ─────────────────────────
+// These guard the extraction of tc_check_call_against_fn_tid out of the Ident branch.
+
+test "a closure variable call is still arity-checked with the same wording" {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let g = fn(x: Int) -> Int \{ x }\n")
+    s = s.concat("    let a = g(1, 2)\n")
+    s = s.concat("    io.println(\"\{a}\")\n}\n")
+    let out = compile_test_helpers.compile_and_capture(s, "x3x0qj_var_arity")
+    assert(out.contains("function 'g' expects 1 argument(s), got 2"))
+}
+
+test "a closure variable call is still argument-checked" {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let g = fn(x: Int) -> Int \{ x }\n")
+    s = s.concat("    let a = g(\"nope\")\n")
+    s = s.concat("    io.println(\"\{a}\")\n}\n")
+    let out = compile_test_helpers.compile_and_capture(s, "x3x0qj_var_arg")
+    assert(out.contains("function 'g' argument 0 expects Int"))
+}
+
+test "a closure variable call still runs" {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let g = fn(x: Int) -> Int \{ x + 1 }\n")
+    s = s.concat("    io.println(\"\{g(4)}\")\n}\n")
+    let r = compile_test_helpers.compile_and_run(s, "x3x0qj_var_run")
+    assert(r.exit_code == 0)
+    assert(r.out.contains("5"))
+}
