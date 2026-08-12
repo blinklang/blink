@@ -1425,15 +1425,15 @@ these sweeps, tallied on the **intersection of their file sets** (874 files; the
 do not appear in all of them are listed under the `nz7drz` correction note). `scratchpad/cells.sh`
 takes that allow-list as a required argument.
 
-| | before `nz7drz` | after `nz7drz` | after `bfq7nf` | after `3c4g71` | after `zs7khh` | after `2r96m9` | after `rbd0a4` | after `w13xgb` | after `jzvxav` | after `h3q81d` | after `qjfwc6` | after `w089a0` | after `x3x0qj` | after `nxnnxe` | after `bf0jnj` + `pvhaew` | after `cttrag` | after `n84s1p` | after `jvy35h` |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| **total cells** | 423 | 421 | 409 | 407 | 405 | 404 | 404 | 405 | 404 | 402 | 402 | 402 | 403 | 406 | 406 | 406 | 404 | **404** |
-| family A (`tid=?`) cells | 84 | 61 | 47 | 45 | 35 | 34 | 34 | 33 | 32 | 28 | 28 | 28 | 26 | 23 | 23 | 23 | 21 | **21** |
-| family A rows | 1323 | 1224 | 1190 | 1050 | 1015 | 661 | 504 | 327 | 310 | 261 | 216 | 203 | 193 | 174 | 174 | 162 | 154 | **148** |
-| `Fn`-flat `tid=?` cells | 16 | 2 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | **0** |
-| agree | 362979 | 363711 | 363924 | 364187 | 364289 | 364674 | 364831 | 364883 | 364934 | 365243 | 365505 | 365580 | 365705 | 366051 | 366051 | 366125 | 366133 | **366139** |
-| diverge rows | 5008 | 5003 | 4976 | 4837 | 4828 | 4474 | 4317 | 4296 | 4279 | 4249 | 4204 | 4191 | 4190 | 4185 | 4185 | 4173 | 4165 | **4190** |
-| missing | 14 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | **1** |
+| | before `nz7drz` | after `nz7drz` | after `bfq7nf` | after `3c4g71` | after `zs7khh` | after `2r96m9` | after `rbd0a4` | after `w13xgb` | after `jzvxav` | after `h3q81d` | after `qjfwc6` | after `w089a0` | after `x3x0qj` | after `nxnnxe` | after `bf0jnj` + `pvhaew` | after `cttrag` | after `n84s1p` | after `jvy35h` | after `rb5wvb` |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| **total cells** | 423 | 421 | 409 | 407 | 405 | 404 | 404 | 405 | 404 | 402 | 402 | 402 | 403 | 406 | 406 | 406 | 404 | 404 | **403** |
+| family A (`tid=?`) cells | 84 | 61 | 47 | 45 | 35 | 34 | 34 | 33 | 32 | 28 | 28 | 28 | 26 | 23 | 23 | 23 | 21 | 21 | **20** |
+| family A rows | 1323 | 1224 | 1190 | 1050 | 1015 | 661 | 504 | 327 | 310 | 261 | 216 | 203 | 193 | 174 | 174 | 162 | 154 | 148 | **143** |
+| `Fn`-flat `tid=?` cells | 16 | 2 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | **0** |
+| agree | 362979 | 363711 | 363924 | 364187 | 364289 | 364674 | 364831 | 364883 | 364934 | 365243 | 365505 | 365580 | 365705 | 366051 | 366051 | 366125 | 366133 | 366139 | **366205** |
+| diverge rows | 5008 | 5003 | 4976 | 4837 | 4828 | 4474 | 4317 | 4296 | 4279 | 4249 | 4204 | 4191 | 4190 | 4185 | 4185 | 4173 | 4165 | 4190 | **4186** |
+| missing | 14 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | **1** |
 
 **`total cells` rose for three sweeps running (402 → 403 → 406) while `family A cells` fell
 (28 → 26 → 23), and that is the campaign turning a corner rather than losing ground.** A family-A
@@ -1481,6 +1481,28 @@ across 23. Stage 3's `c_type_from_tid` deletes that whole cell in one stroke. **
 this table: `diverge rows` is not the campaign's progress metric and never was.** Writing one more
 enum-typed `let` anywhere in the compiler raises it by 31 without a single new defect; `family A rows`
 is the number that counts causes.
+
+**`after rb5wvb` shows the third variant of the same arithmetic — the fix's own `let`s land in `agree`,
+so the total rises and `diverge` still falls.** Total 370330 → 370392 (+62): two new `let` declarations
+in `src/typecheck.bl` (`inst_args`, `inst_got`) × 31 basis roots, and both are `Int`, which the flat
+universe spells `Int` too, so all 62 agree. `Δagree = 62 + 4` and `Δdiverge = −4` against **5** retired
+family-A rows, because 4 of the 5 converted to `agree` and the fifth moved from family A into an
+*existing* class-B cell: `tests/test_time.bl:64` went `var=el tid=? flat=Duration` →
+`tid=Duration flat=Duration`. That cell was already there, which is also why `total cells` falls by one
+(the family-A cell vanished and no new cell was created) — the three arithmetic variants seen so far
+are new-`let`s-into-`diverge` (`jvy35h`), no-new-`let`s (`n84s1p`), and new-`let`s-into-`agree` (here).
+
+**And that fifth row exposes a measured Stage-3 artifact worth recording, because it is not a defect and
+must not be "fixed" by an arm: every correctly-typed `Instant`/`Duration` `let` in the corpus is already
+a class-B divergence row.** 27 `tid=Duration flat=Duration` plus 13 `tid=Instant flat=Instant` in the
+874-file basis, all reading as a disagreement between two spellings of the same name. `TyKind` has no
+`Instant` or `Duration` variant, so typecheck models both as `TyKind.Struct(name)`, and `tk_to_ct` maps
+`TyKind.Struct` to `CT_STRUCT` — while the flat universe carries dedicated `CT_INSTANT` and
+`CT_DURATION` slots. `ty_tp_same_shape`'s `ct != tp_get_kind(tp)` gate therefore fails *before* it ever
+reaches the name comparison two lines below. These 40 rows are the flat universe having a kind that the
+structured pool deliberately does not, they are counted as class B correctly, and they disappear with
+`sv_tp` in Stage 4. It is the mirror image of the `TyKind`-flat-`Int` cell from `jvy35h`: there the pool
+has a kind the flat side cannot spell, here the flat side has a kind the pool does not.
 
 **The counter is not a severity ranking, and `n84s1p` is the clearest proof so far.** The worst defect
 in that ticket — `env.var`, a *silent miscompile* that compiled, linked, ran and printed `<value>` for
@@ -2824,7 +2846,90 @@ interpolation, a struct field receiver, an inferred element, a **user trait meth
 struct receiver keeping its own `-> Int` signature, and the typevar fail-open) were green throughout.
 `task regen` + `task ci` green (646 test files, 0 failed; fmt 1512 passed, 0 failed).
 
-### Remaining family-A causes, ranked (21 cells / 148 rows)
+### rb5wvb — the two-name residue of the same audit, and the fix that named an undiagnosed ranking entry (CLOSED, −5 rows)
+
+`jvy35h` closed the last plain missing arm on a **builtin container** receiver. This is the same audit
+applied to a **nominal stdlib** receiver, and it found the two-name residue: of `Instant`'s six methods,
+four are declared in `lib/std/time.bl:16-19` and so resolve through the `{tname}_{method}` fnsig lookup
+in the Struct/Enum arm, while `elapsed` and `to_rfc3339` have **no Blink declaration anywhere** —
+`codegen_methods.bl:4695,:4716` emit `blink_Instant_elapsed` and `blink_Instant_to_rfc3339` directly. No
+declaration, no fnsig, and the block fell through to `TYPE_UNKNOWN`. Both names are in
+`is_builtin_method` (`:6429`, `:6432`), so `tc_method_resolvable_on_type` said yes and E0505 stayed
+silent on a receiver whose type was **fully known** — the third receiver-half sighting of the
+allow-list-with-nothing-behind-it class.
+
+**The audit is the same one-command diff as `jvy35h`, one namespace over**, and it is worth writing down
+as the general form: for a receiver type, diff the method names codegen's block handles against the names
+typecheck answers. Here it splits three ways rather than two:
+
+| | names |
+|---|---|
+| codegen `CT_INSTANT` block (`:4694-4731`) | `add` `elapsed` `since` `to_rfc3339` `to_unix_ms` `to_unix_secs` |
+| declared in `lib/std/time.bl` (→ fnsig) | `add` `since` `to_unix_ms` `to_unix_secs` |
+| **answered by neither** | **`elapsed` `to_rfc3339`** |
+| codegen `CT_DURATION` block (`:4733-4780`) | `add` `is_zero` `scale` `sub` `to_ms` `to_nanos` `to_seconds` — **all seven declared**, so `Duration` is complete |
+
+`Duration` being complete is the control that makes the result trustworthy: the same audit run on the
+sibling type finds nothing, so the two names are a real gap and not an artifact of how the diff is taken.
+
+**Five fail-open modes.** Two silent miscompiles — `let bad: Int = start.elapsed()` ran and printed
+`bad=<value>`, `let bad: Int = now.to_rfc3339()` ran and printed `bad=2026-08-12T04:32:00Z` — plus a cc
+escape in argument position, a *downstream* check disabled (`now.to_rfc3339().starts_with(5)` reached cc
+because the receiver of `starts_with` was untyped, so its own argument check was skipped), and **arity
+unchecked**: `now.elapsed(5)` and `now.to_rfc3339("extra")` both ran at exit 0 with the extra argument
+silently discarded. That last one is the opposite tail of `sq67xq`, where the *missing* argument ICEs the
+compiler — codegen never reads the argument list for these two, so an extra one is quiet rather than
+fatal, which is the worse of the two failures.
+
+**The spec pins both signatures** (`sections/03_types.md:566,:569` — `elapsed(self) -> Duration !
+Time.Read`, `to_rfc3339(self) -> Str`), so return types and the zero arity were not decisions taken here.
+
+**Two placement decisions, both load-bearing.** The arm sits **below** the fnsig lookup, not above it, so
+a real declaration always wins: a future `Instant_elapsed` in `lib/std/time.bl` supersedes it untouched,
+and the four declared siblings keep resolving through their own signatures (there is a control row for
+exactly that). And it is keyed on `tname == "Instant"`, not on the method name, because **`elapsed` is an
+overloaded name** — `sections/06_tooling.md:923` gives the mock clock handle its own `elapsed(self) ->
+List[Duration]`. A name-keyed arm would have answered `Duration` for that receiver too. `elapsed` returns
+`ensure_runtime_struct_type("Duration", ["nanos"], [TYPE_INT])`, which looks up before it mints, so the
+result is the **declared** tid and `.to_ms()` on it still resolves through `Duration_to_ms` — the test row
+that binds `now.elapsed().to_ms()` to a `Str` is what proves the identity, since a look-alike tid would
+leave that call untyped and the row would fail.
+
+**Attribution — exact, 5 rows, 3 lines:**
+
+| rows | site | producer |
+|---:|---|---|
+| 3 | `lib/pkg/resolver.bl:312` (`var=generated`) | `time.read().to_rfc3339()` |
+| 1 | `tests/test_time.bl:46` (`var=rfc`) | `fixed.to_rfc3339()` |
+| 1 | `tests/test_time.bl:64` (`var=el`) | `before.elapsed()` |
+
+**The `lib/pkg/resolver.bl:312` rows are the entry the ranking below carried as "not yet diagnosed" for
+ten sweeps.** It cost one `sed -n '312p'` to name, and nobody had spent it — including the audit that
+found this cause, which came at it from the allow-list side and never looked at the row. Two independent
+paths to the same defect, and the cheaper one had been sitting in the document the whole time. That is
+the third correction this ranking has taken from reading a row's own source line (`bytes.to_str()`,
+`jr4xf7`, now this), and the first where the line was never read at all rather than read wrongly.
+
+**How the allow-list stands after both halves.** Of `is_builtin_method`'s 171 names, **62** now have no
+`method == "<name>"` comparison in `typecheck.bl` (73 when the organizing note above was written, 64
+after `jvy35h`). The remaining 62 are, as far as the audit can tell, all answered elsewhere or already
+ticketed: real stdlib functions reached through the bare `{Type}_{method}` fnsig key, namespace
+intrinsics answered by `qjfwc6`'s signature table, the `io.print*` family `n84s1p` deliberately left
+listed-but-unsigned, and the open causes (iterator adapters → `qzdz2e`, `Channel.recv`/`send`,
+`Template`'s six → `nrrs28`, the Ptr names → `mwsy85`/`5efs37`, `ffi.scope` → `ps5br9`, the `fs.*` names
+→ `jr4xf7`). Sixteen of the 62 are the `Instant`/`Duration` constructors and methods that
+`lib/std/time.bl` declares, which is exactly the pattern this fix's audit was built to separate from a
+real gap. **Every remaining receiver-side name already has a ticket**, so the receiver-block diff yields
+no *new* prerequisite: the mechanism is spent as a source of them, and the tail below is what is left.
+
+**Test:** `tests/test_rb5wvb_instant_intrinsic_signatures.bl`, 14 rows, **9 red / 14 green**. The 5
+controls — spec types with a runtime assertion, the ISO-8601 *shape* (so the row also witnesses that
+codegen was left alone; a `Str` return type would be satisfied by any string), the four declared siblings
+still resolving through their fnsigs, tail-return plus interpolation, and a user trait method named
+`elapsed` keeping its own `-> Int` — were green throughout. `task regen` + `task ci` green (647 test
+files, 0 failed; fmt 1514 passed, 0 failed).
+
+### Remaining family-A causes, ranked (20 cells / 143 rows)
 
 Re-ranked from the post-`qjfwc6` sweep, by **rows on the 874-file common basis**, grouped by the
 innermost producer (the outermost call is usually a symptom — `.unwrap()` heads many chains, but its
@@ -2917,18 +3022,19 @@ it the pattern also matches inside `flat=`), because the flat spelling and the p
 different questions and disagreeing on which is "the" count is how the Ptr entry once acquired two
 figures:
 
-| module | family-A rows | | after `n84s1p` | after `cttrag` | after `nxnnxe` | after `x3x0qj` | after `w089a0` | after `qjfwc6` | after `h3q81d` | after `jzvxav` | after `w13xgb` | after `rbd0a4` |
-|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| `__main__` (the root being compiled) | **122** | | 125 | 129 | 129 | 148 | 158 | 171 | 174 | 223 | 225 | 237 |
-| `std_libc` | **0** | | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 165 |
-| `std_net_tcp` | **0** | | 0 | 0 | 0 | 0 | 0 | 0 | 40 | 40 | 40 | 40 |
-| `std_db_row` | **0** | | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 12 | 12 |
-| `cli` | **8** | | 11 | 11 | 11 | 11 | 11 | 11 | 11 | 11 | 11 | 11 |
-| `std_db_sqlite` | 9 | | 9 | 9 | 9 | 9 | 9 | 9 | 9 | 9 | 9 | 9 |
-| `incremental` / `file_watcher` | **0 each** | | 0 each | 0 each | 6 each | 6 each | 6 each | 6 each | 6 each | 6 each | 6 each | 6 each |
-| `lsp` | **0** | | 0 | 4 | 4 | 4 | 4 | 4 | 6 | 6 | 6 | 6 |
-| `std_testing` | **0** | | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 3 | 3 |
-| `std_http_server` / `pkg_resolver` / `build_stdlib` | 3 each | | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each |
+| module | family-A rows | | after `jvy35h` | after `n84s1p` | after `cttrag` | after `nxnnxe` | after `x3x0qj` | after `w089a0` | after `qjfwc6` | after `h3q81d` | after `jzvxav` | after `w13xgb` | after `rbd0a4` |
+|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `__main__` (the root being compiled) | **120** | | 122 | 125 | 129 | 129 | 148 | 158 | 171 | 174 | 223 | 225 | 237 |
+| `std_libc` | **0** | | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 165 |
+| `std_net_tcp` | **0** | | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 40 | 40 | 40 | 40 |
+| `std_db_row` | **0** | | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 12 | 12 |
+| `cli` | **8** | | 8 | 11 | 11 | 11 | 11 | 11 | 11 | 11 | 11 | 11 | 11 |
+| `std_db_sqlite` | 9 | | 9 | 9 | 9 | 9 | 9 | 9 | 9 | 9 | 9 | 9 | 9 |
+| `incremental` / `file_watcher` | **0 each** | | 0 each | 0 each | 0 each | 6 each | 6 each | 6 each | 6 each | 6 each | 6 each | 6 each | 6 each |
+| `lsp` | **0** | | 0 | 0 | 4 | 4 | 4 | 4 | 4 | 6 | 6 | 6 | 6 |
+| `std_testing` | **0** | | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 3 | 3 |
+| `std_http_server` / `build_stdlib` | 3 each | | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each |
+| `pkg_resolver` | **0** | | 3 | 3 | 3 | 3 | 3 | 3 | 3 | 3 | 3 | 3 | 3 |
 
 **Three consecutive fixes have now landed their whole delta in `__main__` and nowhere else** —
 `w089a0`'s −13 (171 → 158), `x3x0qj`'s −10 (158 → 148) and `nxnnxe`'s −19 (148 → 129). That is the
@@ -2949,9 +3055,11 @@ redistributing the same handful of mechanisms across roots — which is why the 
 producer and not by this table. `h3q81d` is the only cause so far to move `__main__` substantially
 (223 → 174), precisely because effect ops are called from roots rather than from a stdlib module.
 
-**Every stdlib module in this table is now at zero except `std_db_sqlite` (9, `nrrs28`).** What
-remains is `__main__` plus the compiler's own source (`cli` 11) — so from here the instrument
-is measuring the corpus and the compiler, not the standard library.
+**Every `lib/std` module in this table is now at zero except `std_db_sqlite` (9, `nrrs28`).** What
+remains is `__main__` plus the compiler's own source (`cli`, 11 at the time this was written and 8
+after `jvy35h`) — so from here the instrument is measuring the corpus and the compiler, not the
+standard library. (`lib/pkg`'s `pkg_resolver` stayed at 3 for ten sweeps after this and went to zero on
+`rb5wvb`.)
 
 **`n84s1p` cleared `lsp` outright** (4 → 0), the third compiler module retired in two fixes, and it
 splits the `__main__` bucket in a way worth noting: of its 8 rows, 6 are the *same two source lines*
@@ -2977,6 +3085,17 @@ populations, and a fix to the compiler's own source will always appear in both c
 only compiler file left in this table, at 8 rows across 8 distinct sites — the flattest tail the
 instrument has measured.
 
+**`rb5wvb` cleared `pkg_resolver` (3 → 0) and took `__main__` from 122 to 120, and it is the first fix
+to retire a `lib/pkg` module** — so this table's non-`__main__` tail is now `std_db_sqlite` (9,
+`nrrs28`), `cli` (8), and `std_http_server` / `build_stdlib` (3 each) and nothing else. Its 5 rows are
+three source lines: `lib/pkg/resolver.bl:312` (`let generated = time.read().to_rfc3339()`, ×3 roots) and
+`tests/test_time.bl:46,:64`. Note that `pkg_resolver` **had to be split out of the shared `3 each` row**
+to record this, which is the cost of grouping equal-valued modules on one line — they were only equal by
+coincidence, and one fix separated them. The `pkg_resolver:312` entry had been sitting in the ranking
+below as *"not yet diagnosed"*: it was `to_rfc3339`, and the audit that found the cause never looked at
+the row. Reading the line would have named it in one command, which is the same lesson the `var=`-field
+paragraph draws two paragraphs down.
+
 **With `nxnnxe` closed, the top of the ranking is no longer actionable by row count**, and that is
 worth stating plainly because it changes how the remaining prerequisites should be picked. The two
 largest causes left are both *held* rather than open: **iterator adapters** (34) is deferred to
@@ -2987,7 +3106,8 @@ belongs to `decisions/under-determined-types.md` / E0301. Below them the tail is
 this list used to claim, and now the largest single remaining cause, blocked on a spec answer)**,
 closure-typed fields (~11), `Response`/`Request` (10), `nrrs28` (9), ~~`n84s1p` (9 → 6)~~ (**closed —
 −8**), `List.join` (6), ~~`bytes.to_str()` (3)~~ (**closed as a mis-attribution — it was `n84s1p`
-downstream**), `pkg_resolver:312` (3, `var=generated`, not yet diagnosed).
+downstream**), ~~`pkg_resolver:312` (3, `var=generated`, not yet diagnosed)~~ (**closed — it was
+`Instant.to_rfc3339`, `rb5wvb`, −5 with the two `tests/test_time.bl` rows**).
 
 **Three of this ranking's entries have now been corrected by reading the row's own `var=` field, and
 two of the three were corrected *downward to zero*** — `bytes.to_str()` and the `env.var` half of

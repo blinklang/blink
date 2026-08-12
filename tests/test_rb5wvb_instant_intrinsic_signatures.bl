@@ -1,0 +1,203 @@
+// br rb5wvb — `Instant.elapsed()` and `Instant.to_rfc3339()` had no type in typecheck.
+//
+// Four of Instant's six methods are declared in Blink (lib/std/time.bl:16-19 —
+// Instant_add, Instant_since, Instant_to_unix_secs, Instant_to_unix_ms), so they register a
+// fnsig and the Struct-receiver arm (src/typecheck.bl:9638) resolves them through
+// `{tname}_{method}`. The other two are codegen-only intrinsics with no Blink declaration at
+// all: src/codegen_methods.bl:4695 emits `blink_Instant_elapsed(..)` with
+// `expr_result_type = CT_DURATION`, and :4716 emits `blink_Instant_to_rfc3339(..)` with
+// CT_STRING. No declaration means no fnsig, so both fell through to TYPE_UNKNOWN — which
+// unifies with anything.
+//
+// And nothing else stopped them. Both names sit in is_builtin_method (src/typecheck.bl:6429,
+// :6432), which is what tc_method_resolvable_on_type consults, so E0505 stayed silent on a
+// receiver whose type was fully known. That is the same allow-list-with-nothing-behind-it
+// shape as jvy35h (List.join) and n84s1p (the namespace intrinsics): the list names the
+// method, and nothing behind the list gives it a type.
+//
+// THE SPEC PINS BOTH SIGNATURES EXACTLY, sections/03_types.md:566 and :569:
+//     | elapsed    | fn(self) -> Duration ! Time.Read | Time since this instant |
+//     | to_rfc3339 | fn(self) -> Str                  | ISO 8601 string         |
+// so both the return type and the argument count are spec, not a choice made here.
+//
+// FIVE fail-open modes, each reproduced with `build/blink run` before this file existed. The
+// rows assert on distinguishing MESSAGES rather than on "some TypeError", because a program
+// that failed for an unrelated reason would satisfy the weaker assertion:
+//
+//   1. SILENT MISCOMPILE, Duration. `let bad: Int = start.elapsed()` compiled, linked, ran
+//      and printed `bad=<value>` — a Duration struct bound to an Int-declared name, with the
+//      declared-type compare skipped because the initializer was TYPE_UNKNOWN.
+//   2. SILENT MISCOMPILE, Str. `let bad: Int = now.to_rfc3339()` printed
+//      `bad=2026-08-12T04:32:00Z` at exit 0.
+//   3. CC ESCAPE. `want_int(now.to_rfc3339())` produced no diagnostic and reached the C
+//      compiler: `passing argument 1 of blink_u_want_int makes integer from pointer without a
+//      cast`. The elapsed() form said `incompatible type for argument 1 ..
+//      blink_std_time_Duration`.
+//   4. DOWNSTREAM CHECK DISABLED. `now.to_rfc3339().starts_with(5)` — the receiver of
+//      starts_with was untyped, so its OWN argument check was skipped and the mistyped Int
+//      reached cc. One missing signature disabling a check two calls away.
+//   5. ARITY UNCHECKED. `now.elapsed(5)` and `now.to_rfc3339("extra")` both ran at exit 0
+//      with the extra argument silently discarded. (This is the opposite tail of sq67xq,
+//      where the MISSING argument ICEs the compiler instead; codegen ignores the argument
+//      list for these two, so an extra one is quiet rather than fatal.)
+//
+// `elapsed` IS AN OVERLOADED NAME. sections/06_tooling.md:923 gives the mock clock handle its
+// own `fn elapsed(self) -> List[Duration]`. The new arm is keyed on the Instant receiver, and
+// the user-trait row at the bottom pins that a same-named method on another receiver keeps
+// its own signature.
+//
+// Neither name may be REMOVED from is_builtin_method as the repair. That list also gates
+// E0505 and W0501, and it must stay a superset of the typed arms (the n84s1p invariant) or a
+// valid call starts erroring.
+
+import compile_test_helpers
+
+fn entry(body: Str) -> Str {
+    let mut s = "fn main() \{\n"
+    s = s.concat(body)
+    s = s.concat("}\n")
+    s
+}
+
+fn with_now(body: Str) -> Str {
+    let mut s = "    let now = time.read()\n"
+    s = s.concat(body)
+    entry(s)
+}
+
+// ── modes 1 and 2: the declared-type compare was skipped, so these RAN ──
+
+// The teeth of the file for elapsed. Asserted on the message: "but got Duration" is what
+// proves elapsed resolved to Duration specifically, and an arm returning any other concrete
+// type would satisfy a bare TypeError assertion.
+test "an elapsed Duration cannot bind to an Int-declared name" {
+    let src = with_now("    let bad: Int = now.elapsed()\n    io.println(\"\{bad}\")\n")
+    let out = compile_test_helpers.compile_and_capture(src, "rb5wvb_elapsed_decl")
+    assert(out.contains("declared type Int but got Duration"))
+}
+
+// The teeth of the file for to_rfc3339. Before the fix this printed the timestamp.
+test "an rfc3339 Str cannot bind to an Int-declared name" {
+    let src = with_now("    let bad: Int = now.to_rfc3339()\n    io.println(\"\{bad}\")\n")
+    let out = compile_test_helpers.compile_and_capture(src, "rb5wvb_rfc_decl")
+    assert(out.contains("declared type Int but got Str"))
+}
+
+// The type must PROPAGATE, not merely exist at the call node — through an unannotated
+// intermediate let, which is the form the spec's own example uses (03_types.md:546).
+test "the elapsed type propagates through an unannotated let" {
+    let src = with_now("    let d = now.elapsed()\n    let bad: Int = d\n    io.println(\"\{bad}\")\n")
+    compile_test_helpers.expect_compile_error(src, "rb5wvb_propagate", "TypeError")
+}
+
+// ── mode 3: argument position, where the failure mode is silence rather than a wrong binding ──
+
+test "an elapsed Duration cannot pass as an Int parameter" {
+    let mut s = "fn want_int(n: Int) -> Int \{ n }\n\n"
+    s = s.concat(with_now("    io.println(\"\{want_int(now.elapsed())}\")\n"))
+    compile_test_helpers.expect_compile_error(s, "rb5wvb_elapsed_argpos", "TypeError")
+}
+
+test "an rfc3339 Str cannot pass as an Int parameter" {
+    let mut s = "fn want_int(n: Int) -> Int \{ n }\n\n"
+    s = s.concat(with_now("    io.println(\"\{want_int(now.to_rfc3339())}\")\n"))
+    compile_test_helpers.expect_compile_error(s, "rb5wvb_rfc_argpos", "TypeError")
+}
+
+// ── mode 4: the result is the receiver of the next call in a chain ──
+
+// Before the fix the receiver of starts_with was untyped, so its own argument check was
+// skipped too and the mistyped Int reached cc.
+test "an rfc3339 Str is a Str receiver for the next call in the chain" {
+    let src = with_now("    let hit = now.to_rfc3339().starts_with(5)\n    io.println(\"\{hit}\")\n")
+    compile_test_helpers.expect_compile_error(src, "rb5wvb_chain", "TypeError")
+}
+
+// elapsed must return the DECLARED Duration — the same tid lib/std/time.bl registers, not a
+// fresh struct that merely spells the name. `.to_ms()` only resolves through the
+// `Duration_to_ms` fnsig, so its Int return is what proves the identity; a look-alike tid
+// would leave this call untyped and the row would fail.
+test "an elapsed Duration is a real Duration receiver" {
+    let src = with_now("    let bad: Str = now.elapsed().to_ms()\n    io.println(\"\{bad}\")\n")
+    let out = compile_test_helpers.compile_and_capture(src, "rb5wvb_dur_recv")
+    assert(out.contains("declared type Str but got Int"))
+}
+
+// ── mode 5: arity ──
+
+// The spec's signature is `fn(self)`. Before the fix the extra argument was discarded and the
+// program ran; codegen never reads the argument list for these two, so nothing downstream
+// would ever have complained.
+test "an extra argument to elapsed is rejected" {
+    let src = with_now("    io.println(\"\{now.elapsed(5).to_ms()}\")\n")
+    let out = compile_test_helpers.compile_and_capture(src, "rb5wvb_elapsed_arity")
+    assert(out.contains("method 'Instant.elapsed' expects 0 argument(s), got 1"))
+}
+
+test "an extra argument to to_rfc3339 is rejected" {
+    let src = with_now("    io.println(now.to_rfc3339(\"extra\"))\n")
+    let out = compile_test_helpers.compile_and_capture(src, "rb5wvb_rfc_arity")
+    assert(out.contains("method 'Instant.to_rfc3339' expects 0 argument(s), got 1"))
+}
+
+// ── controls: every shape that worked must keep working ──
+
+// A fix that resolved either method to the WRONG type would satisfy every error row above and
+// fail here. The length assertion pins the RESULT and not just the type: an ISO 8601 instant
+// is exactly 20 characters (`2026-02-14T12:00:00Z`).
+test "both intrinsics compile and run with their spec types" {
+    let mut b = "    let now = time.read()\n"
+    b = b.concat("    let s: Str = now.to_rfc3339()\n")
+    b = b.concat("    let d: Duration = now.elapsed()\n")
+    b = b.concat("    io.println(\"len=\{s.len()}|nonneg=\{d.to_nanos() >= 0}\")\n")
+    let r = compile_test_helpers.compile_and_run(entry(b), "rb5wvb_good")
+    assert(r.exit_code == 0)
+    assert(r.out.contains("len=20|nonneg=true"))
+}
+
+// The rfc3339 string's SHAPE, so the row also witnesses that codegen was left alone: a Str
+// return type would be satisfied by any string, and this one has to be the timestamp.
+test "the rfc3339 string still renders as ISO 8601" {
+    let mut b = "    let s = time.read().to_rfc3339()\n"
+    b = b.concat("    io.println(\"z=\{s.ends_with(\"Z\")}|t=\{s.contains(\"T\")}|c=\{s.starts_with(\"20\")}\")\n")
+    let r = compile_test_helpers.compile_and_run(entry(b), "rb5wvb_iso")
+    assert(r.exit_code == 0)
+    assert(r.out.contains("z=true|t=true|c=true"))
+}
+
+// THE SHADOWING CONTROL. The four DECLARED Instant methods resolve through the fnsig lookup,
+// which runs before the new arm. This row fails if the arm were placed ahead of it or widened
+// past the two names it owns.
+test "the declared Instant methods still resolve through their fnsigs" {
+    let mut b = "    let a = Instant.from_epoch_secs(7)\n"
+    b = b.concat("    let b = a.add(Duration.ms(1500))\n")
+    b = b.concat("    let gap = b.since(a)\n")
+    b = b.concat("    io.println(\"s=\{a.to_unix_secs()}|m=\{a.to_unix_ms()}|gap=\{gap.to_ms()}\")\n")
+    let r = compile_test_helpers.compile_and_run(entry(b), "rb5wvb_siblings")
+    assert(r.exit_code == 0)
+    assert(r.out.contains("s=7|m=7000|gap=1500"))
+}
+
+// Tail-return position and interpolation — the two forms that are not a `let` declaration, and
+// so were never counted by the divergence instrument that found this cause.
+test "the intrinsics work as a fn tail return and inside interpolation" {
+    let mut s = "fn stamp(i: Instant) -> Str \{\n    i.to_rfc3339()\n}\n\n"
+    s = s.concat("fn age(i: Instant) -> Duration \{\n    i.elapsed()\n}\n\n")
+    s = s.concat(with_now("    io.println(\"a=\{stamp(now).len()}|b=\{age(now).to_nanos() >= 0}|c=\{now.to_rfc3339().len()}\")\n"))
+    let r = compile_test_helpers.compile_and_run(s, "rb5wvb_tail")
+    assert(r.exit_code == 0)
+    assert(r.out.contains("a=20|b=true|c=20"))
+}
+
+// THE HIJACK CONTROL. `elapsed` is an overloaded name — the mock clock handle has its own
+// (sections/06_tooling.md:923) — so a user method spelling it on another receiver must keep
+// its own signature. Asserted on the message: "but got Int" proves the call resolved to the
+// user's `-> Int` and not to the Instant arm's Duration.
+test "a user trait method named elapsed keeps its own signature" {
+    let mut s = "trait Aged \{\n    fn elapsed(self) -> Int\n}\n\n"
+    s = s.concat("type Box \{\n    n: Int\n}\n\n")
+    s = s.concat("impl Aged for Box \{\n    fn elapsed(self) -> Int \{\n        self.n\n    }\n}\n\n")
+    s = s.concat(entry("    let b = Box \{ n: 4 }\n    let bad: Str = b.elapsed()\n    io.println(\"\{bad}\")\n"))
+    let out = compile_test_helpers.compile_and_capture(s, "rb5wvb_user_elapsed")
+    assert(out.contains("declared type Str but got Int"))
+}

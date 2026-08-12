@@ -9655,6 +9655,40 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 check_arg_shapes("{tname}.{method}", sig, node_args(node), 1)
                 return fnsig_pool.get(sig).unwrap().ret
             }
+            // br rb5wvb. Instant's two CODEGEN-ONLY methods. Four of its six are declared in
+            // lib/std/time.bl:16-19 and so resolved through the fnsig lookup just above;
+            // `elapsed` and `to_rfc3339` have no Blink declaration anywhere —
+            // codegen_methods.bl:4695,:4716 emit `blink_Instant_elapsed` /
+            // `blink_Instant_to_rfc3339` directly — so there was no fnsig and the block fell
+            // through to TYPE_UNKNOWN. Both names are in is_builtin_method (:6429, :6432), so
+            // tc_method_resolvable_on_type answered yes and E0505 never fired either: the same
+            // allow-list-with-nothing-behind-it shape as jvy35h and n84s1p.
+            //
+            // sections/03_types.md:566,:569 pins both signatures — `elapsed(self) -> Duration
+            // ! Time.Read` and `to_rfc3339(self) -> Str` — so the return types and the zero
+            // arity are the spec's, not a choice made here.
+            //
+            // DELIBERATELY BELOW the fnsig lookup, not above it: a real declaration must always
+            // win, both so a future lib/std/time.bl `Instant_elapsed` supersedes this without
+            // touching the arm, and so the four declared siblings keep resolving through their
+            // own signatures. Keyed on `tname` for the same reason `elapsed` is not keyed on the
+            // name alone: sections/06_tooling.md:923 gives the mock clock handle its own
+            // `elapsed(self) -> List[Duration]`.
+            if tname == "Instant" && (method == "elapsed" || method == "to_rfc3339") {
+                let inst_args = node_args(node)
+                let inst_got = if inst_args != -1 { sublist_length(inst_args) } else { 0 }
+                // Codegen never reads the argument list for these two, so an extra argument was
+                // silently discarded and no later phase would ever have reported it.
+                if inst_got != 0 {
+                    tc_error_at("method 'Instant.{method}' expects 0 argument(s), got {inst_got}", node)
+                }
+                if method == "to_rfc3339" { return TYPE_STR }
+                // The Duration tid, minted only if lib/std/time.bl is absent from the program —
+                // lookup runs first inside ensure_runtime_struct_type, so the declared tid wins
+                // and `.to_ms()` on the result still resolves through `Duration_to_ms`. Same
+                // idempotent-mint reasoning as the Instant tid at the time.read() arm (b907wt).
+                return ensure_runtime_struct_type("Duration", ["nanos"], [TYPE_INT])
+            }
             // 4q2etk: replaced by mwxtyj — synthesized sealed Display.display()
             // has no user-written fnsig; it always returns Str.
             if method == "display" && tc_type_has_display_impl(tname) != 0 {
