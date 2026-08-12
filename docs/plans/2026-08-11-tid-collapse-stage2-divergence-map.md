@@ -212,6 +212,7 @@ not Stage 3 work:
 | `jr4xf7` | P2 `type:spec` | *(`qjfwc6`'s held group)* what does `fs.read` return? The spec spells `fs.read(path)?` as a `Result` and names the lister `fs.list`; codegen emits a bare `const char*` from `blink_read_file` and calls it `list_dir`. 4 rows, and typecheck cannot sign `fs.*` until it is answered |
 | `n84s1p` | P3 | *(`qjfwc6`'s other residual)* `is_intrinsic_method` disagrees with the codegen arms **in both directions** — `io.debug` listed with no arm, `io.read_bytes` / `env.var` with arms and unlisted, so they resolve through `lookup_fnsig` on the **bare** method name. 9 rows |
 | `x3x0qj` | P2 | *(found by probing the un-triaged `@derive`/`Result` line, which turned out to be three causes)* an **immediately-invoked closure** was entirely unchecked: `infer_type`'s `Call` arm had branches for an `Ident` and a `FieldAccess` callee only, so a closure **literal** callee fell through to `TYPE_UNKNOWN` with its arguments un-inferred. Result type, arity **and** the callee body all unchecked at once — a **silent miscompile** (`let bad: Str = fn() -> Int { 7 }()` ran and printed `7`) plus two `cc` escapes. **−10 rows**, and the first fix whose rows moved family A → **class B** instead of leaving `diverge`. Callee position is the third position of `1hg8b6`'s family |
+| `pvhaew` | P2 | *(`nxnnxe`'s byproduct, and the allow-list shape **inverted** — a fifth sighting)* `@derive(Hash)` registered, forward-declared and **emitted** `uint64_t {T}_hash`, and **neither** derive-dispatch block had an arm to call it, so `p.hash()` was a hard E0505. It survived because kops calls the same symbol internally for struct-keyed `Map`/`Set` — an emitted, exercised, load-bearing function that was never callable **by name**. Here the allow-list is right and the **dispatch table** is short; same repair, **a table not arms**. `hash` joins `register_derive_method_sigs` as `(self) -> U64`, completing that table. **Divergence-neutral, measured.** Byproduct: `173wtk` |
 | `bf0jnj` | P2 | *(`nxnnxe`'s byproduct, and the `expr_result_*`-vs-`ScopeVar` split that Stage 4 deletes)* the `from_str` emitter stamped the Option's inner type on the temp **variable** and not on the **expression** channel, so a direct `match Status.from_str(..)` scrutinee was spelled `blink_Option_void` while an intermediate `let` worked. The `try_from`/`from_json` arm **one line above** writes its channel — a two-line asymmetry inside one function. **Divergence-neutral, measured** (every figure of the after-`nxnnxe` sweep reproduced exactly). Byproduct: `qne9k3` |
 | `nxnnxe` | P2 | *(the ranked #1 after `x3x0qj`, and the allow-list-with-nothing-behind-it shape a **fourth** time)* every method `@derive` synthesizes had its **name** affirmed by `tc_method_resolvable_on_type` and **no signature anywhere** — so `to_json` / `from_json` / `clone` / `debug` / `eq` / `cmp` and the str-backed-enum statics all resolved to `TYPE_UNKNOWN`. Both halves failed open: `let bad: Int = u.to_json()` compiled, linked and **ran**, and `User.from_json(42)` escaped to `cc`. Fixed the `qjfwc6` way — **a table, not arms**. **−19 rows, exactly as predicted, and every one of the seven named files went to zero.** Three byproducts filed: `pvhaew`, `bf0jnj`, `169kjt` |
 
@@ -1423,23 +1424,30 @@ these sweeps, tallied on the **intersection of their file sets** (874 files; the
 do not appear in all of them are listed under the `nz7drz` correction note). `scratchpad/cells.sh`
 takes that allow-list as a required argument.
 
-| | before `nz7drz` | after `nz7drz` | after `bfq7nf` | after `3c4g71` | after `zs7khh` | after `2r96m9` | after `rbd0a4` | after `w13xgb` | after `jzvxav` | after `h3q81d` | after `qjfwc6` | after `w089a0` | after `x3x0qj` | after `nxnnxe` |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| **total cells** | 423 | 421 | 409 | 407 | 405 | 404 | 404 | 405 | 404 | 402 | 402 | 402 | 403 | **406** |
-| family A (`tid=?`) cells | 84 | 61 | 47 | 45 | 35 | 34 | 34 | 33 | 32 | 28 | 28 | 28 | 26 | **23** |
-| family A rows | 1323 | 1224 | 1190 | 1050 | 1015 | 661 | 504 | 327 | 310 | 261 | 216 | 203 | 193 | **174** |
-| `Fn`-flat `tid=?` cells | 16 | 2 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | **0** |
-| agree | 362979 | 363711 | 363924 | 364187 | 364289 | 364674 | 364831 | 364883 | 364934 | 365243 | 365505 | 365580 | 365705 | **366051** |
-| diverge rows | 5008 | 5003 | 4976 | 4837 | 4828 | 4474 | 4317 | 4296 | 4279 | 4249 | 4204 | 4191 | 4190 | **4185** |
-| missing | 14 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | **1** |
+| | before `nz7drz` | after `nz7drz` | after `bfq7nf` | after `3c4g71` | after `zs7khh` | after `2r96m9` | after `rbd0a4` | after `w13xgb` | after `jzvxav` | after `h3q81d` | after `qjfwc6` | after `w089a0` | after `x3x0qj` | after `nxnnxe`  after `bf0jnj` + `pvhaew` |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| **total cells** | 423 | 421 | 409 | 407 | 405 | 404 | 404 | 405 | 404 | 402 | 402 | 402 | 403 | **406** **406** |
+| family A (`tid=?`) cells | 84 | 61 | 47 | 45 | 35 | 34 | 34 | 33 | 32 | 28 | 28 | 28 | 26 | **23** **23** |
+| family A rows | 1323 | 1224 | 1190 | 1050 | 1015 | 661 | 504 | 327 | 310 | 261 | 216 | 203 | 193 | **174** **174** |
+| `Fn`-flat `tid=?` cells | 16 | 2 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | **0** **0** |
+| agree | 362979 | 363711 | 363924 | 364187 | 364289 | 364674 | 364831 | 364883 | 364934 | 365243 | 365505 | 365580 | 365705 | **366051** **366051** |
+| diverge rows | 5008 | 5003 | 4976 | 4837 | 4828 | 4474 | 4317 | 4296 | 4279 | 4249 | 4204 | 4191 | 4190 | **4185** **4185** |
+| missing | 14 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | **1** **1** |
 
-**`total cells` has now risen for three sweeps running (402 → 403 → 406) while `family A cells`
-fell (28 → 26 → 23), and that is the campaign turning a corner rather than losing ground.** A family-A
+**`total cells` rose for three sweeps running (402 → 403 → 406) while `family A cells` fell
+(28 → 26 → 23), and that is the campaign turning a corner rather than losing ground.** A family-A
 cell is one *shape* of "codegen has no type"; the cells replacing them are class B, where typecheck
 holds the right structured type and the flat `(CT_*, sname)` pair cannot spell it — so one erased cell
 splits into as many cells as there are real types behind it. Class B is deleted wholesale by Stage 3's
 `c_type_from_tid` and Stage 4's removal of `sv_tp`; family A is what has to be fixed one cause at a
 time. Cell count going **up** for that reason is the instrument working.
+
+The last column covers **two** fixes, `bf0jnj` and `pvhaew`, and reproduces the `nxnnxe` column
+**digit for digit** — both were swept independently and both are divergence-neutral by measurement
+rather than by inference. That is the expected result for this kind of fix and worth stating plainly:
+a correctness fix that adds a missing dispatch arm or writes an already-known type onto a second
+channel removes no *erasure*, so it moves no row. `ya8qyf` was called neutral by inference; these two
+have their own sweeps.
 
 The `after jzvxav` column covers **two** fixes, `jzvxav` and `ya8qyf`, because they were measured in
 one sweep; the attribution in those sections shows all 17 rows belong to `jzvxav`, so `ya8qyf` is
@@ -2403,6 +2411,78 @@ name, because that reads a third channel. **This is the enum-vs-struct confusion
 in the variable channels rather than in `sv_tp`** — the same thing the `tid=Shape flat=Shape` row
 records from the other side. Typecheck passes the program; the error is codegen-only.
 
+### pvhaew — an emitted, load-bearing C function that could not be named in Blink (CLOSED, divergence-neutral)
+
+`@derive(Hash)` generated a `hash` method, forward-declared it, emitted its body — and **no dispatch
+arm ever called it**. `p.hash()` was a hard `error[UnresolvedMethod]: unresolved method '.hash' on
+type P in 'main'`.
+
+Four places had to agree and one did not:
+
+| | |
+|---|---|
+| `codegen_derive.bl:124` | registers `DeriveMethodEntry{method_name: "hash"}` |
+| `codegen_derive.bl:199` | emits `uint64_t {T}_hash({T} self);` |
+| `codegen_derive.bl:390` / `:443` | emits the enum and struct bodies, both returning `uint64_t` |
+| `codegen_methods.bl:5183` / `:5232` | the two derive-dispatch blocks — **no `hash` arm** |
+
+so control fell out of both blocks to the E0505 backstop at `codegen_methods.bl:5390`.
+
+**Why an emitted, exercised, load-bearing function was never once callable by name.** kops calls the
+same symbol internally for struct-keyed `Map` / `Set` (`codegen_derive.bl:273`, `kops_hash_{cn}`).
+The function was emitted, depended on, and covered by tests — just never *through method dispatch*.
+The `Map` and `Set` control rows in the test are green before the fix and after it, which is the
+evidence for that reading rather than an assertion of it.
+
+**The allow-list-with-nothing-behind-it class, INVERTED — a fifth sighting.** With
+`is_builtin_method`, `is_intrinsic_method` (`qjfwc6`, `n84s1p`) and `tc_method_resolvable_on_type`
+(`nxnnxe`) the allow-list affirmed names the dispatch table had no arm for. Here the allow-list
+(`has_derive_method`) is **right** and the **dispatch table is short**. The repair is the same in
+both directions: make the table the authority.
+
+Fix — one behavior, one regen, because the compiler's own source never calls `.hash()`:
+
+1. `src/codegen_methods.bl` — a `hash` arm in **both** derive-dispatch blocks, emitting
+   `{derive_method_cname(T, "hash")}({obj})` with `expr_result_type = CT_U64`. `derive_method_cname`
+   yields `{c_type_c_name(T)}_hash`, byte-for-byte the forward declaration at `:199`.
+2. `src/typecheck.bl` — `register_derive_method_sig(tname, "hash", [ttid], TYPE_U64)` in
+   `register_derive_method_sigs`. `hash` was deliberately **held out** of `nxnnxe`'s table because a
+   signature for an uncallable method claims it works; it joins now that both arms exist. That
+   table's comment is rewritten from *"`hash` is absent"* to record the agreement.
+3. `src/codegen_derive.bl:124` — `ret_type: CT_INT` -> `CT_U64`. **Record only, not behavior:** the
+   sole reader `get_derive_method_ret` (`codegen_types.bl:1170`) has **zero callers**, and
+   `has_derive_method` gates the arm on the entry's *name*. `CT_INT` contradicted both
+   `sections/03_types.md:2352` and the `uint64_t` the body actually returns.
+
+Test: `tests/test_pvhaew_derive_hash_callable.bl`, 11 rows — **8 red before, 11 green after.** Struct
+and enum `hash` callable; `hash` over a `Str` field; the **determinism contract kops relies on**
+(`same=true diff=true`), because a callable hash that broke it would be worse than an uncallable one;
+the `U64` signature proved by `let bad: Str = p.hash()` being a `TypeError` — **without the signature
+the return is `TYPE_UNKNOWN`, which unifies with anything, and that program would compile and *run***;
+the receiver proved not to be `on type ?`; and four controls — the struct-keyed `Map`, the
+struct-keyed `Set`, a non-deriving type still reaching the E0505 backstop (the arm is gated on
+`has_derive_method`, so it must), and the sibling derived methods still dispatching from the same two
+blocks.
+
+**Divergence-neutral, measured not assumed.** The post-fix monolithic sweep reproduces the
+after-`nxnnxe` column exactly: 4384 `bucket=` rows, 406 total cells, 23 family-A cells, 174 family-A
+rows, 4185 diverge, 366051 agree, 1 missing. Expected — the fix adds a dispatch arm and a signature
+for a method the corpus barely calls; it removes no erasure. (A caveat for the next sweep: the raw
+sweep file is ~13748 lines, of which only 4384 are `bucket=` rows; the rest are per-file `summary`
+lines. Compare `grep -c 'bucket='`, not `wc -l` — the two differ by 3x and reading the wrong one
+looks like a corpus explosion.)
+
+**Byproduct — `173wtk` filed (P2): a bare `@derive(Hash)` escapes to `cc`.** It emits the kops
+equality adapter `kops_eq_blink_{T}` calling an **unemitted** `blink_{T}_eq`, and needs no `.hash()`
+call at all — merely constructing the value is enough, so it predates this fix and is independent of
+it. `Hash`'s supertrait is `Eq` (`sections/03_types.md:2352`), and `Ord`, which has the **same**
+supertrait, **already synthesizes `eq`** (`typecheck.bl:2240`, and bare `@derive(Ord)` works end to
+end: `a.eq(b)` -> `false`, `a.cmp(b) == Ordering.Less` -> `true`). So `173wtk` is an **asymmetry with
+its own fix already in the tree**, not a design question — and either way a missing supertrait is a
+compiler-diagnosable condition that must not reach `cc`. The test row was retargeted to what `pvhaew`
+owns (dispatch reads `has_derive_method`, not the derive list's shape), with a note to widen it once
+`173wtk` closes.
+
 ### Remaining family-A causes, ranked (23 cells / 174 rows)
 
 Re-ranked from the post-`qjfwc6` sweep, by **rows on the 874-file common basis**, grouped by the
@@ -2542,22 +2622,27 @@ belongs to `decisions/under-determined-types.md` / E0301. Below them the tail is
 `pub let` container element (12), closure-typed fields (~11), `Response`/`Request` (10), `nrrs28` (9),
 `n84s1p` (9), `jr4xf7` (4, blocked on a spec answer), `List.join` (~4), `bytes.to_str()` (3).
 
-So the next two prerequisites are chosen on **evidence quality and blast radius**, not size — and
-both are `nxnnxe`'s own byproducts, which is the pattern every closed cause in this document has
-produced:
+So the next two prerequisites were chosen on **evidence quality and blast radius**, not size — and
+both were `nxnnxe`'s own byproducts, which is the pattern every closed cause in this document has
+produced. **Both are now closed** (`bf0jnj`, `pvhaew`, sections above), separately tested, separately
+regenerated, and separately swept. Neither is measured in rows — both were `cc`/E0505 escapes, which
+produce no divergence row at all, the `ya8qyf` situation — and the sweeps confirm it: each reproduces
+the `nxnnxe` column digit for digit.
 
-- **`bf0jnj`** — `match Status.from_str(..)` directly emits `blink_Option_void`. The `from_str`
-  emitter (`codegen_methods.bl:2444`) stamps the Option's inner type on the temp *variable* and
-  leaves `expr_result_ok_struct` unset, so an expression consumer spells `Option_void`; the
-  `try_from`/`from_json` arm **one line above** sets it. A one-line fix with the failing shape
-  already written down. **`nxnnxe` is what exposed it** — before, typecheck rejected the program
-  first with `on type ?`, which is the second time a signature fix has uncovered a codegen bug that
-  the missing type was hiding.
-- **`pvhaew`** — a `hash` arm in both derive-dispatch blocks, after which `hash` joins
-  `register_derive_method_sigs` as `(self) -> U64` and the table is complete.
+**What closing them establishes, beyond the two bugs.** They are the fourth and fifth sightings of
+the same defect shape, and they now bracket it from both sides. `nxnnxe`, `qjfwc6` and `n84s1p` had an
+**allow-list affirming a name with no arm behind it**; `pvhaew` has the **allow-list right and the
+dispatch table short**. The repair was identical in both directions — *a table, not arms* — which is
+the same conclusion Q2 of `decisions/compiler-type-representation.md` reached about types, arrived at
+from the method side. And `bf0jnj` is the `expr_result_*`-vs-`ScopeVar` split, i.e. *one type, two
+places to write it down, and only one written*: Stage 4 deletes the side-channel outright, so that
+whole class ends structurally rather than one arm at a time.
 
-Neither is measured in rows (both are `cc`/E0505 escapes, which produce no divergence row at all —
-the `ya8qyf` situation), and they must not be combined: separate tests, separate regens.
+**A signature fix keeps uncovering the codegen bug the missing type was hiding** — three times now.
+`bf0jnj` was unreachable until `nxnnxe` taught typecheck `from_str`'s signature, because typecheck
+rejected the program first with `on type ?`. That is worth carrying into Stage 3: when a fix stops a
+program being rejected early, expect the next layer's bug to surface immediately, and budget for it
+rather than treating it as a regression.
 
 **The `db.*` mechanism, diagnosed (read-only) — kept as written, because it is the diagnosis
 `h3q81d` was fixed from and the prediction it confirms.** These are **effect operations**, declared in

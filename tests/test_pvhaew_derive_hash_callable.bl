@@ -1,0 +1,156 @@
+// br pvhaew — `@derive(Hash)` registered, forward-declared and EMITTED a hash method that could
+// not be called.
+//
+// Four places had to agree and one did not:
+//   src/codegen_derive.bl:123  registers DeriveMethodEntry{method_name: "hash"}
+//   src/codegen_derive.bl:199  emits `uint64_t {T}_hash({T} self);`
+//   src/codegen_derive.bl:390/443  emits the enum and struct bodies
+//   src/codegen_methods.bl:5183/5232  the derive-dispatch blocks — NO `hash` arm
+// so control fell out of both blocks to the E0505 backstop at codegen_methods.bl:5390:
+//   error[UnresolvedMethod]: unresolved method '.hash' on type P in 'main'
+//
+// It works INTERNALLY — kops calls {T}_hash for struct-keyed Map/Set (codegen_derive.bl:273) —
+// which is why an emitted, tested, load-bearing function was never once callable by name.
+//
+// This is the allow-list-with-nothing-behind-it class INVERTED, its fifth sighting: with
+// is_builtin_method, is_intrinsic_method (br qjfwc6) and tc_method_resolvable_on_type (br nxnnxe)
+// the allow-list affirmed names the dispatch table had no arm for. Here the allow-list is RIGHT and
+// the dispatch table is short. Same repair either way — make the table the authority.
+//
+// hash was deliberately held out of br nxnnxe's signature table for exactly this reason: a
+// signature for a method that cannot be called would claim it works. It joins the table here,
+// typed `(self) -> U64` per sections/03_types.md:2352.
+
+import compile_test_helpers
+
+fn hash_program(decls: Str, body: Str) -> Str {
+    let mut s = decls
+    s = s.concat("fn main() \{\n")
+    s = s.concat(body)
+    s = s.concat("}\n")
+    s
+}
+
+let STRUCT_DECL: Str = "@derive(Hash, Eq)\ntype P \{ x: Int, y: Int }\n\n"
+let ENUM_DECL: Str = "@derive(Hash, Eq)\ntype Color \{ Red, Green, Blue }\n\n"
+
+// ── the bug: the method exists in C and could not be named in Blink ──
+
+test "a derived struct hash is callable" {
+    let mut b = "    let p = P \{ x: 1, y: 2 }\n"
+    b = b.concat("    let h = p.hash()\n")
+    b = b.concat("    io.println(\"\{h > 0}\")\n")
+    let r = compile_test_helpers.compile_and_run(hash_program(STRUCT_DECL, b), "pvhaew_struct")
+    assert(r.exit_code == 0)
+    assert(r.out.contains("true"))
+}
+
+test "a derived enum hash is callable" {
+    let mut b = "    let c = Color.Green\n"
+    b = b.concat("    let h = c.hash()\n")
+    b = b.concat("    io.println(\"\{h > 0}\")\n")
+    let r = compile_test_helpers.compile_and_run(hash_program(ENUM_DECL, b), "pvhaew_enum")
+    assert(r.exit_code == 0)
+    assert(r.out.contains("true"))
+}
+
+// Hash's supertrait is Eq (sections/03_types.md:2352). A BARE `@derive(Hash)` is a separate bug —
+// br 173wtk: it emits the kops equality adapter `kops_eq_blink_{T}` calling an unemitted
+// `blink_{T}_eq` and fails in the C compiler, with no `.hash()` call needed. Ord, which has the
+// same supertrait, already synthesizes eq (typecheck.bl:2240), so 173wtk is an asymmetry rather
+// than a design question. Asserted here is only what pvhaew owns: the dispatch arm reads
+// has_derive_method, not the derive list's shape, so a type deriving Hash beside an UNRELATED
+// trait still dispatches. Widen this to bare `@derive(Hash)` once 173wtk closes.
+test "hash dispatches regardless of which other traits are derived" {
+    let mut s = "@derive(Hash, Eq, Debug)\ntype Solo \{ n: Int }\n\n"
+    s = s.concat("fn main() \{\n    let v = Solo \{ n: 7 }\n    io.println(\"\{v.hash() > 0}\")\n}\n")
+    let r = compile_test_helpers.compile_and_run(s, "pvhaew_bare")
+    assert(r.exit_code == 0)
+    assert(r.out.contains("true"))
+}
+
+test "a derived hash over a Str field is callable" {
+    let mut s = "@derive(Hash, Eq)\ntype Named \{ name: Str, n: Int }\n\n"
+    s = s.concat("fn main() \{\n    let v = Named \{ name: \"abc\", n: 1 }\n")
+    s = s.concat("    io.println(\"\{v.hash() > 0}\")\n}\n")
+    let r = compile_test_helpers.compile_and_run(s, "pvhaew_str_field")
+    assert(r.exit_code == 0)
+    assert(r.out.contains("true"))
+}
+
+// ── the contract, not merely the call ──
+
+// The emitted hash is deterministic over field values, which is the property kops relies on. A
+// callable hash that did not satisfy it would be worse than an uncallable one.
+test "equal values hash equal and distinct values do not" {
+    let mut b = "    let a = P \{ x: 1, y: 2 }\n"
+    b = b.concat("    let b = P \{ x: 1, y: 2 }\n")
+    b = b.concat("    let c = P \{ x: 9, y: 9 }\n")
+    b = b.concat("    io.println(\"same=\{a.hash() == b.hash()} diff=\{a.hash() != c.hash()}\")\n")
+    let r = compile_test_helpers.compile_and_run(hash_program(STRUCT_DECL, b), "pvhaew_contract")
+    assert(r.exit_code == 0)
+    assert(r.out.contains("same=true diff=true"))
+}
+
+// ── the signature, which is what makes the declared type checkable ──
+
+// nxnnxe's table gains `hash` only now that the method dispatches. Without the signature the
+// return type is TYPE_UNKNOWN, which unifies with anything, and this would compile and RUN.
+test "hash is typed U64, not unknown" {
+    let mut b = "    let p = P \{ x: 1, y: 2 }\n"
+    b = b.concat("    let bad: Str = p.hash()\n")
+    b = b.concat("    io.println(bad)\n")
+    compile_test_helpers.expect_compile_error(hash_program(STRUCT_DECL, b), "pvhaew_declared", "TypeError")
+}
+
+test "a hash receiver is not untyped" {
+    let mut b = "    let p = P \{ x: 1, y: 2 }\n"
+    b = b.concat("    io.println(\"\{p.hash().nope()}\")\n")
+    let out = compile_test_helpers.compile_and_capture(hash_program(STRUCT_DECL, b), "pvhaew_recv")
+    assert(!out.contains("on type ?"))
+}
+
+// ── controls ──
+
+// The internal path that always worked: kops calls {T}_hash for a struct-keyed Map. Adding the
+// dispatch arm must not disturb it.
+test "a struct-keyed Map still works" {
+    let mut b = "    let mut m: Map[P, Str] = Map()\n"
+    b = b.concat("    m.insert(P \{ x: 1, y: 2 }, \"first\")\n")
+    b = b.concat("    m.insert(P \{ x: 3, y: 4 }, \"second\")\n")
+    b = b.concat("    io.println(m.get(P \{ x: 1, y: 2 }) ?? \"missing\")\n")
+    b = b.concat("    io.println(\"\{m.len()}\")\n")
+    let r = compile_test_helpers.compile_and_run(hash_program(STRUCT_DECL, b), "pvhaew_map_key")
+    assert(r.exit_code == 0)
+    assert(r.out.contains("first"))
+    assert(r.out.contains("2"))
+}
+
+test "a struct-keyed Set still works" {
+    let mut b = "    let mut s: Set[P] = Set()\n"
+    b = b.concat("    s.insert(P \{ x: 1, y: 2 })\n")
+    b = b.concat("    s.insert(P \{ x: 1, y: 2 })\n")
+    b = b.concat("    io.println(\"\{s.len()}|\{s.contains(P \{ x: 1, y: 2 })}\")\n")
+    let r = compile_test_helpers.compile_and_run(hash_program(STRUCT_DECL, b), "pvhaew_set_key")
+    assert(r.exit_code == 0)
+    assert(r.out.contains("1|true"))
+}
+
+// A type that does not derive Hash gains nothing — the arm is gated on has_derive_method, so the
+// E0505 backstop must still fire for it.
+test "a non-deriving type still reports an unresolved hash" {
+    let mut s = "type Bare \{ n: Int }\n\n"
+    s = s.concat("fn main() \{\n    let b = Bare \{ n: 1 }\n    io.println(\"\{b.hash()}\")\n}\n")
+    let out = compile_test_helpers.compile_and_capture(s, "pvhaew_bare_type")
+    assert(out.contains("unresolved method '.hash'"))
+}
+
+// The other derived methods share both dispatch blocks with the new arm.
+test "the sibling derived methods still dispatch" {
+    let mut s = "@derive(Hash, Eq, Ord, Clone, Debug)\ntype Q \{ n: Int }\n\n"
+    s = s.concat("fn main() \{\n    let a = Q \{ n: 1 }\n    let b = Q \{ n: 2 }\n")
+    s = s.concat("    io.println(\"\{a.eq(b)}|\{a.clone().n}|\{a.debug().len() > 0}|\{a.hash() > 0}\")\n}\n")
+    let r = compile_test_helpers.compile_and_run(s, "pvhaew_siblings")
+    assert(r.exit_code == 0)
+    assert(r.out.contains("false|1|true|true"))
+}
