@@ -210,7 +210,7 @@ not Stage 3 work:
 | `jw2yz2` | P2 | *(byproduct of `w089a0`'s ffi-scope control)* a `Ptr[T]` ffi-struct field read has no type: `let v = p.fd.read()` emits *"variable declared void"* and `"{p.fd.read()}"` compiles, runs and prints the literal `<value>`. Third link in the `Ptr` chain after `w13xgb` / `ps5br9` |
 | `qjfwc6` | P2 | *(the ranked #1 after `h3q81d`, same shape one namespace over)* every namespace intrinsic but `time.read` / `time.sleep` had no typecheck signature, so `net.connect` / `io.read_line` / `term.width` / `env.args` all resolved to `TYPE_UNKNOWN`. **−45 rows**, `std_net_tcp` 40 → 0. The declared-type half was a **silent miscompile** — `let bad: Str = net.connect(host, port)` compiled, linked and *ran* — and arity was a **compiler panic** at `parser.bl:111` |
 | `jr4xf7` | P2 `type:spec` | *(`qjfwc6`'s held group)* what does `fs.read` return? The spec spells `fs.read(path)?` as a `Result` and names the lister `fs.list`; codegen emits a bare `const char*` from `blink_read_file` and calls it `list_dir`. 4 rows, and typecheck cannot sign `fs.*` until it is answered |
-| `n84s1p` | P3 | *(`qjfwc6`'s other residual)* `is_intrinsic_method` disagrees with the codegen arms **in both directions** — `io.debug` listed with no arm, `io.read_bytes` / `env.var` with arms and unlisted, so they resolve through `lookup_fnsig` on the **bare** method name. 9 rows |
+| `n84s1p` | P3 | *(`qjfwc6`'s other residual)* **CLOSED, −8 rows.** `is_intrinsic_method` was short of the codegen arms by **twelve** names (7 `io.*`, 5 `env.*`), not the three the ticket claimed, so each took the bare-name `lookup_fnsig` path and resolved to nothing. **Five** fail-open modes including two **silent miscompiles**, a pointer-derived **exit status**, four `cc` escapes and a **compiler panic** on a missing argument. Fix is one-directional — **list ⊇ arms** — so `io.debug` stays listed. `src/lsp.bl` → 0 |
 | `x3x0qj` | P2 | *(found by probing the un-triaged `@derive`/`Result` line, which turned out to be three causes)* an **immediately-invoked closure** was entirely unchecked: `infer_type`'s `Call` arm had branches for an `Ident` and a `FieldAccess` callee only, so a closure **literal** callee fell through to `TYPE_UNKNOWN` with its arguments un-inferred. Result type, arity **and** the callee body all unchecked at once — a **silent miscompile** (`let bad: Str = fn() -> Int { 7 }()` ran and printed `7`) plus two `cc` escapes. **−10 rows**, and the first fix whose rows moved family A → **class B** instead of leaving `diverge`. Callee position is the third position of `1hg8b6`'s family |
 | `pvhaew` | P2 | *(`nxnnxe`'s byproduct, and the allow-list shape **inverted** — a fifth sighting)* `@derive(Hash)` registered, forward-declared and **emitted** `uint64_t {T}_hash`, and **neither** derive-dispatch block had an arm to call it, so `p.hash()` was a hard E0505. It survived because kops calls the same symbol internally for struct-keyed `Map`/`Set` — an emitted, exercised, load-bearing function that was never callable **by name**. Here the allow-list is right and the **dispatch table** is short; same repair, **a table not arms**. `hash` joins `register_derive_method_sigs` as `(self) -> U64`, completing that table. **Divergence-neutral, measured.** Byproduct: `173wtk` |
 | `bf0jnj` | P2 | *(`nxnnxe`'s byproduct, and the `expr_result_*`-vs-`ScopeVar` split that Stage 4 deletes)* the `from_str` emitter stamped the Option's inner type on the temp **variable** and not on the **expression** channel, so a direct `match Status.from_str(..)` scrutinee was spelled `blink_Option_void` while an intermediate `let` worked. The `try_from`/`from_json` arm **one line above** writes its channel — a two-line asymmetry inside one function. **Divergence-neutral, measured** (every figure of the after-`nxnnxe` sweep reproduced exactly). Byproduct: `qne9k3` |
@@ -1425,15 +1425,15 @@ these sweeps, tallied on the **intersection of their file sets** (874 files; the
 do not appear in all of them are listed under the `nz7drz` correction note). `scratchpad/cells.sh`
 takes that allow-list as a required argument.
 
-| | before `nz7drz` | after `nz7drz` | after `bfq7nf` | after `3c4g71` | after `zs7khh` | after `2r96m9` | after `rbd0a4` | after `w13xgb` | after `jzvxav` | after `h3q81d` | after `qjfwc6` | after `w089a0` | after `x3x0qj` | after `nxnnxe` | after `bf0jnj` + `pvhaew` | after `cttrag` |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| **total cells** | 423 | 421 | 409 | 407 | 405 | 404 | 404 | 405 | 404 | 402 | 402 | 402 | 403 | 406 | 406 | **406** |
-| family A (`tid=?`) cells | 84 | 61 | 47 | 45 | 35 | 34 | 34 | 33 | 32 | 28 | 28 | 28 | 26 | 23 | 23 | **23** |
-| family A rows | 1323 | 1224 | 1190 | 1050 | 1015 | 661 | 504 | 327 | 310 | 261 | 216 | 203 | 193 | 174 | 174 | **162** |
-| `Fn`-flat `tid=?` cells | 16 | 2 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | **0** |
-| agree | 362979 | 363711 | 363924 | 364187 | 364289 | 364674 | 364831 | 364883 | 364934 | 365243 | 365505 | 365580 | 365705 | 366051 | 366051 | **366125** |
-| diverge rows | 5008 | 5003 | 4976 | 4837 | 4828 | 4474 | 4317 | 4296 | 4279 | 4249 | 4204 | 4191 | 4190 | 4185 | 4185 | **4173** |
-| missing | 14 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | **1** |
+| | before `nz7drz` | after `nz7drz` | after `bfq7nf` | after `3c4g71` | after `zs7khh` | after `2r96m9` | after `rbd0a4` | after `w13xgb` | after `jzvxav` | after `h3q81d` | after `qjfwc6` | after `w089a0` | after `x3x0qj` | after `nxnnxe` | after `bf0jnj` + `pvhaew` | after `cttrag` | after `n84s1p` |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| **total cells** | 423 | 421 | 409 | 407 | 405 | 404 | 404 | 405 | 404 | 402 | 402 | 402 | 403 | 406 | 406 | 406 | **404** |
+| family A (`tid=?`) cells | 84 | 61 | 47 | 45 | 35 | 34 | 34 | 33 | 32 | 28 | 28 | 28 | 26 | 23 | 23 | 23 | **21** |
+| family A rows | 1323 | 1224 | 1190 | 1050 | 1015 | 661 | 504 | 327 | 310 | 261 | 216 | 203 | 193 | 174 | 174 | 162 | **154** |
+| `Fn`-flat `tid=?` cells | 16 | 2 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | **0** |
+| agree | 362979 | 363711 | 363924 | 364187 | 364289 | 364674 | 364831 | 364883 | 364934 | 365243 | 365505 | 365580 | 365705 | 366051 | 366051 | 366125 | **366133** |
+| diverge rows | 5008 | 5003 | 4976 | 4837 | 4828 | 4474 | 4317 | 4296 | 4279 | 4249 | 4204 | 4191 | 4190 | 4185 | 4185 | 4173 | **4165** |
+| missing | 14 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | **1** |
 
 **`total cells` rose for three sweeps running (402 → 403 → 406) while `family A cells` fell
 (28 → 26 → 23), and that is the campaign turning a corner rather than losing ground.** A family-A
@@ -1463,6 +1463,20 @@ wrong:** "more comparisons after an erasure fix" invites the story that the eras
 downstream comparisons, and it was not — the instrument counts a row for an unknown type just as it
 does for a known one. Any future column whose total moves should be traced to added or removed `let`
 declarations first.
+
+The `after n84s1p` column holds the total steady at 370299 (`agree + diverge + missing`), which is the
+control for the paragraph above: that fix adds no `let` declaration to the compiler's own source, and
+the total does not move. All 8 rows it removed are conversions.
+
+**The counter is not a severity ranking, and `n84s1p` is the clearest proof so far.** The worst defect
+in that ticket — `env.var`, a *silent miscompile* that compiled, linked, ran and printed `<value>` for
+`let bad: Int = env.var("HOME")` — contributed **zero divergence rows**, because `env.var` is nearly
+always consumed as `env.var(x) ?? ""` and the coalesce handed the `let` a `Str` that codegen was
+perfectly happy to hold. The instrument watches whether codegen *has* a type, not whether typecheck's
+answer is *right*. Both silent miscompiles in that ticket were found by auditing the allow-list against
+the codegen arms; the counter noticed one of them incidentally, at one site, and only because the value
+was bound directly. Rank by rows to schedule Stage 3 — the rows are what `c_type_from_tid` has to be
+able to answer for — but never read a low row count as "this one matters less".
 
 The `after jzvxav` column covers **two** fixes, `jzvxav` and `ya8qyf`, because they were measured in
 one sweep; the attribution in those sections shows all 17 rows belong to `jzvxav`, so `ya8qyf` is
@@ -2584,7 +2598,117 @@ the fix's own two new `let`s in `typecheck.bl`; see the master table's note.
 binding of that name exists*. Same family as `8wk3xg` (a local `let at` resolving to `parser.bl`'s
 private `fn at`), and the workaround comment at `typecheck.bl:12323` already records that one.
 
-### Remaining family-A causes, ranked (23 cells / 162 rows)
+### n84s1p — an allow-list short of its own dispatch arms, and the counter's blind spot (CLOSED, −8 rows)
+
+`is_intrinsic_method` (`codegen_types.bl:8084`) decides whether `ns.method(...)` is a **namespace
+intrinsic**. It was short of the arms codegen actually emits by **twelve** names — not the three the
+ticket claimed:
+
+| namespace | arm exists, not listed |
+|---|---|
+| `io` | `eprint`, `eprint_raw`, `log`, `print_raw`, `read_bytes`, `write`, `write_bytes` |
+| `env` | `cwd`, `exit`, `remove_var`, `set_var`, `var` |
+
+An unlisted name falls out of the intrinsic gate at `typecheck.bl:9679` and into the **bare-name**
+fallthrough at `:9697`, which asks `lookup_fnsig("write")` — not `lookup_fnsig("io.write")`. Nothing
+answers, so the call is `TYPE_UNKNOWN`.
+
+**Five distinct fail-open modes, all reproduced by *running* before the test was written.** This is
+the point of the section: one missing table entry produced five different failures, and only two of
+them were the `cc` escape the ticket predicted.
+
+| # | mode | witness |
+|---|---|---|
+| 1 | **silent miscompile** | `let bad: Int = env.var("HOME")` compiled, linked, **ran**, printed `<value>` |
+| 2 | **silent miscompile** | `let bad: Int = env.cwd()` ran and printed the real working directory |
+| 3 | **garbage exit status** | `env.exit("1")` emitted `exit(<char*>)`; the process exited **86**, a pointer-derived value — address-dependent, so no test may assert on it |
+| 4 | **`cc` escape** | `io.read_bytes` / `io.write` / `io.write_bytes` / `env.remove_var` reached the C compiler |
+| 5 | **compiler panic** | `env.set_var("a")` hit `panic: unwrap called on None at src/parser.bl:111` — user input crashing the compiler |
+
+Mode 5 is worth its own note: the arity check at `:9679` was **already written**, and had no
+signature to read. A missing table entry did not merely weaken a check, it turned a diagnostic into
+an ICE.
+
+**A fourth surface, and it fired on *correct* code.** Of the twelve names exactly one made valid
+spec-blessed code warn: `env.exit(0)` emitted `warning[UnknownMethod]: unknown method 'exit'`. That
+gate (`typecheck.bl:7721`) is keyed on the **bare** method name via `is_builtin_method`, which happens
+to know `var`, `cwd`, `write` and `read_bytes` for unrelated reasons and does not know `exit`. The
+wrong repair is seductive and was available: adding `exit` to `is_builtin_method` silences the warning
+and also silences `.exit()` on **every type in the language**. A namespace intrinsic has to be
+recognized by *namespace and method*, which is what `is_intrinsic_method` answers, so that is what the
+gate now consults.
+
+**The invariant is `list ⊇ arms`, not `list == arms`** — which reverses half of the planned fix.
+`io.debug` is listed with **no arm behind it** and **stays listed**. A listed-but-unsigned name gets no
+type from either arm and falls to the loud E0505 codegen backstop; being listed is precisely what keeps
+it **off** the bare-name path, where a free fn named `debug` could answer for it. `io.println` has been
+in exactly that state all along. So *long* is harmless and *short* is the bug, and removing a name is
+never the repair. The plan of record was to delete `io.debug`; reading what the two paths actually do
+(they are mutually exclusive — `:9679` gates on `!= 0`, `:9697` on `== 0`) is what corrected it.
+
+**Spec judgment, stated because it is the kind of call that should not be silent.**
+`io.read_bytes` / `io.write` / `io.write_bytes` are **not in the spec** — the IO operations table at
+`sections/04_effects.md:193` stops at the print family, and a grep of `sections/` finds none of the
+three. They were signed anyway, on the same basis `qjfwc6` signed `io.read_line` (also unspec'd):
+unlike `fs.read` (`jr4xf7`) there is no open question about what they *are*, because the emitted C
+fixes each one completely — `blink_stdin_read_bytes(int) -> blink_bytes*`,
+`blink_stdout_write(const char*) -> void`. Signing records the arm; it decides nothing the spec left
+open. The `env.*` five are all spec-blessed, with `env.var` confirmed `Option[Str]` by
+`env.var(...) ?? "8080"` and `.is_some()` at `:705-716`. The spec gap is real and is left as a gap:
+these are unspec'd intrinsics, not new types.
+
+The fix, one regen — one behavior, and no new syntax in the compiler's own source:
+
+- `codegen_types.bl:8090`/`:8105` — the 7 `io` and 5 `env` names.
+- `register_ns_intrinsic_sigs` — 8 signatures: `io.read_bytes(Int) -> Bytes`,
+  `io.write(Str) -> Void`, `io.write_bytes(Bytes) -> Void`, `env.var(Str) -> Option[Str]`,
+  `env.cwd() -> Str`, `env.set_var(Str, Str) -> Void`, `env.remove_var(Str) -> Void`,
+  `env.exit(Int) -> Void`. The four value-typed-argument `io` statements (`print_raw`, `eprint`,
+  `eprint_raw`, `log`) are listed-but-unsigned, exactly as `io.println` already was.
+- `typecheck.bl:7721` — the `UnknownMethod` gate recognizes a namespace intrinsic.
+
+The compiler's own source calls `env.var(...) ?? ""` in about twenty places and `io.write` in
+`src/lsp.bl`, so `task regen` was a real test of all eight signatures rather than a formality.
+
+**Measured: −8 rows** (162 → 154), cells 406 → 404, `agree` +8, total comparisons **unchanged** at
+370299 — the control for the `cttrag` accounting note, since this fix adds no `let` to the compiler's
+own source. Attribution is exact and the prediction was **6**:
+
+| rows | site | cause |
+|---:|---|---|
+| 6 | `src/lsp.bl:50` (`var=bytes`) and `:51` (`var=result`), 3 roots each | `io.read_bytes`, and `:51` purely downstream of it |
+| 1 | `tests/manual_stdio_stdin.bl:10` (`var=data`) | `io.read_bytes` |
+| 1 | `tests/test_env_effect.bl:12` (`var=cwd`) | `env.cwd()` — **the unpredicted 8th** |
+
+`src/lsp.bl` → **0**. The `:51` rows also retire the ranking's separate `bytes.to_str()` entry as a
+mis-attribution: `Bytes.to_str` has had its signature since `typecheck.bl:9495` the whole time that
+entry claimed it did not, and its rows were downstream of `:50` having no type.
+
+**The counter has a blind spot, and this fix is the proof.** `env.var` — the worst defect in the
+ticket, a silent miscompile — contributed **zero divergence rows**, because it is nearly always
+consumed as `env.var(x) ?? ""` and the coalesce handed the `let` a `Str` that codegen held quite
+happily. The instrument asks whether codegen *has* a type, never whether typecheck's answer is
+*right*. Both silent miscompiles here were found by auditing the allow-list against the arms; the
+counter caught one of them incidentally, at one site, and only because the value was bound directly.
+**Rank by rows to schedule Stage 3 — they are what `c_type_from_tid` must answer for — and never read
+a low row count as "this matters less".**
+
+**Spun off.** `366d3m`: **`build/blinkc` reports compile errors and then exits 0**, for every error
+kind including a plain `let bad: Str = 5`. Found because one test row asserted
+`err_out.contains("TypeError")` through `compile_and_run` and could not pass — `compile_test_helpers.bl:438`
+gates on `cresult.exit_code != 0` to decide whether to stop before `cc`, so it always proceeds, and
+`cc` then fails on the `.c` file `blinkc` never wrote. Every `compile_and_run` row in the suite
+asserting "nonzero exit and no `cc` diagnostic" is therefore passing on `cc`'s file-not-found rather
+than on `blinkc` having stopped. Those rows still discriminate red from green — before a fix `blinkc`
+*does* emit C and `cc` chokes on it **by name** — so they are not false greens, but they are weaker
+than they read. `me77ay`: **`env.vars()` is spec-blessed `Map[Str, Str]` (`:209`, `:752`) with no
+codegen arm at all**; deliberately **not** added to the allow-list, since an unimplemented intrinsic
+must keep reaching the loud backstop, and pinned by a control row so the gap stays visible.
+
+**Tests:** `tests/test_n84s1p_intrinsic_allowlist_arms.bl`, 26 rows, **17 red / 26 green**. `task ci`
+green (645 test files, 0 failed; fmt 1510 passed).
+
+### Remaining family-A causes, ranked (21 cells / 154 rows)
 
 Re-ranked from the post-`qjfwc6` sweep, by **rows on the 874-file common basis**, grouped by the
 innermost producer (the outermost call is usually a symptom — `.unwrap()` heads many chains, but its
@@ -2639,7 +2763,7 @@ and it is that last one.
 | cause | rows | ticket | note |
 |---|---:|---|---|
 | ~~`net.*` / `io.*` — `net.connect` / `listen` / `accept` / `read_bytes` / `write_bytes`, `io.read_line`~~ | ~~49~~ | **`qjfwc6`** | **CLOSED** — −45 rows, section above. `std_net_tcp` 40 → 0. The declared-type half was a **silent miscompile**, not a `cc` escape, and arity was a **compiler panic**. Two attributions in the row this replaces were wrong: `at=lsp` was 6 rows but only 2 were `io.read_line` (the other 4 are `io.read_bytes` → `n84s1p`), and `at=std_http_server`'s 3 are `Channel(max)` at `:368`, not a `net.*` producer at all. What is left of the intrinsic list is `jr4xf7` (4 rows, spec) and `n84s1p` (~~9~~ **6** rows — see that row) |
-| `is_intrinsic_method` disagrees with its own arms — `io.read_bytes`, `env.var`, `io.debug` | ~~9~~ **6** | `n84s1p` | Split out of `qjfwc6`. `io.debug` is listed and emitted by no arm; `io.read_bytes` and `env.var` have arms and are **not** listed, so they take the `== 0` path and resolve through `lookup_fnsig` on the **bare** method name. `src/lsp.bl:50,51` (4), `tests/manual_stdio_stdin.bl:10` (2). Fix the list, then they join the `qjfwc6` table. **Count corrected while closing `cttrag`:** the 3 rows this row claimed at `src/incremental.bl:44` as `env.var` were never `env.var` — `env.var` does not appear in that file at all, `:44` is `let path = symbol_index.si_file_path.get(i).unwrap()`, and the row's own `var=path` said so. They were `cttrag`'s and are now closed. **Read the row's `var=` before believing an attribution derived from the line number** |
+| ~~`is_intrinsic_method` disagrees with its own arms — `io.read_bytes`, `env.var`, `io.debug`~~ | ~~9~~ ~~6~~ **0** | **`n84s1p`** | **CLOSED — −8 rows** (one *more* than the 6 this row predicted), section below. The list was short of the arms by **twelve** names, not three, and the repair is one-directional: **list ⊇ arms**, so `io.debug` **stays** listed. Two of its three named causes were mis-attributed: the `src/incremental.bl:44` rows were never `env.var` (they were `cttrag`'s — `env.var` does not appear in that file, `:44` is `let path = symbol_index.si_file_path.get(i).unwrap()`, and the row's own `var=path` said so), and `env.var` has **zero** rows anywhere in the corpus despite being the ticket's worst defect. **Read the row's `var=` before believing an attribution derived from the line number** |
 | `fs.read` / `write` / `list_dir` / `remove` | 4 | `jr4xf7` (`type:spec`) | Split out of `qjfwc6` and **held on purpose**: `sections/04_effects.md:73,1053` spells `fs.read(path)?` as a `Result` and `:157,215` names the lister `fs.list`, while codegen emits a bare `const char*` from `blink_read_file`. Signing it from codegen would write "an FS read cannot fail" into the type system |
 | ~~`db.*` effect operations — `db.query` / `query_one` / `execute`, `stmt.step`~~ | ~~51~~ | **`h3q81d`** | **CLOSED** — −49 rows, section above. Typecheck held **no** operation signatures, only the handle name for warning suppression; codegen held the same signatures across eight flat return fields. 9 rows survive, all `with db.prepare(..) as stmt` → **`w089a0`** |
 | ~~the with-resource `as` binder — `with db.prepare(..).unwrap() as stmt`~~ | ~~9~~ | **`w089a0`** | **CLOSED** — −13 rows, section above. The prediction held exactly: the tid *was* already in hand at the binding site, one line above the walk that computes it, and the fix was the `jzvxav` shape — bind the binder. Another **silent miscompile** (`let bad: Str = r.value()` ran and printed `7`). Attribution was three files, all with-resource; `test_db_stmt.bl` 10 → 1, and the survivor is `nrrs28` |
@@ -2651,7 +2775,7 @@ and it is that last one.
 | calling a closure-typed **field** (`route.callback`, `logger.log_msg`) | ~11 | — | |
 | ~~**`@derive`-synthesized methods have no signature in typecheck** — `to_json`, `from_json`, `clone`, and the str-backed-enum statics~~ | ~~**19**~~ | **`nxnnxe`** | **CLOSED** — −19 rows, section above. The prediction held to the row and all seven files went to zero. 14 of the 19 moved family A → **class B** (four *different* flat-universe limits: `Result`'s second child erased, an `Option`'s enum inner erased to `Int`, a bare enum erased to `Int`, and `tid=Shape flat=Shape` diverging on identical spelling); the other 5 now `agree`. `agree` +346, the largest of the campaign. **Two names held back on purpose** — `hash` is uncallable today (`pvhaew`) and a signature would claim otherwise, and `to_json`/`from_json` are signed `Str` because the spec's `JsonValue`/`JsonError` do not exist (`169kjt`). Original triage: **Triaged, and it grew.** The old 15-row line lumped two unrelated causes and got both counts wrong: 10 of those rows were the IIFE (**`x3x0qj`**, closed above) and the rest is bigger than it looked once the IIFE rows stopped hiding it. One mechanism, four synthesized shapes: `u.to_json()` → `flat=Str` (`test_derive_serialize.bl`, `test_derive_nested.bl`, `test_derive_deserialize.bl:13`, `test_derive_list_deser.bl:30`), `T.from_json(..)` → `flat=Result[Void, Str]` (`test_derive_deserialize.bl` ×2, `test_derive_enum_deser.bl` ×2, `test_derive_list_deser.bl`, `test_str_backed_enum.bl` ×2), `x.clone()` → `flat=Point`/`Int`/`Shape` (`test_derive_clone.bl` ×3), and the str-backed statics → `flat=Option[Int]` (`test_str_backed_enum.bl` ×4). Nothing declares these — `@derive` synthesizes them in codegen, so there is no `node_type_ann` to read and no fnsig to look up. **The `qjfwc6` shape: a table, not arms** — one `FnSigEntry` per derived method per deriving type, minted where the derive is registered. Now the largest actionable cause, and it subsumes the separate `Status.from_str` line below |
 | `List.join` on a `List[Str]` | ~4 | — | `src/cli.bl:935`, `:3561`, `:3563`. From the `rbd0a4` tail; the last of the allow-list-vs-dispatch shape |
-| `bytes.to_str()` → `Result[Str, Str]` | 3 | — | The third cause the `@derive`/`Result` probe split out. All 3 are `src/lsp.bl:51`, one per root that pulls `lsp` in (`lsp`, `cli`, `build_stdlib`). A `Bytes` **instance** intrinsic with no return arm — the `2r96m9` shape one method over, and `2r96m9` covered only the two statics |
+| ~~`bytes.to_str()` → `Result[Str, Str]`~~ | ~~3~~ **0** | **`n84s1p`** | **CLOSED as a mis-attribution, not as a cause.** All 3 rows were `src/lsp.bl:51`, and `Bytes.to_str` has had its signature since `typecheck.bl:9495` (`make_result_type(TYPE_STR, TYPE_STR)`) — the whole time this row claimed it did not. `:51` consumes `:50`'s `io.read_bytes`, so its receiver was untyped and the rows were purely **downstream**; they retired with `n84s1p` and no `Bytes` arm was touched. This is the third attribution in this ranking derived from a line number rather than from the row's `var=` field and wrong for it |
 | ~~`Status.from_str` — the compiler-synthesized static on a str-backed enum, returning `Option[Enum]`~~ | ~~4~~ | **`nxnnxe`** | **Folded into the `@derive` row above** — same producer, same missing table, closed with it. It was listed separately only because the `flat=Option[Int]` spelling put it in a different part of the tail. The fold was correct: one `register_derive_method_sig` call closed all 4, and they were the four rows that moved to `tid=Option[Status]` |
 | ~~an immediately-invoked closure, `fn(..) -> T { .. }()`~~ | ~~10~~ | **`x3x0qj`** | **CLOSED** — −10 rows, section above. Was hidden inside the `@derive`/`Result` line, which is how a `flat=`-organized tail hides a callee-shape cause. One missing `callee_kind` branch left the result type, the arity **and** the callee body unchecked; a **silent miscompile** and two `cc` escapes. First fix whose rows moved family A → class B rather than leaving `diverge` |
 | ~~`Ptr[T]` intrinsics — `buf.offset(i)`, `p.is_null()`, `s.as_cstr()`~~ | ~~176~~ | **`w13xgb`** | **CLOSED** — −177 rows, section above. `Ptr[T]` had no `TyKind` at all. 5 rows remain, all `scope.cstr` / `scope.take` → **`ps5br9`** |
@@ -2677,18 +2801,18 @@ it the pattern also matches inside `flat=`), because the flat spelling and the p
 different questions and disagreeing on which is "the" count is how the Ptr entry once acquired two
 figures:
 
-| module | family-A rows | | after `nxnnxe` | after `x3x0qj` | after `w089a0` | after `qjfwc6` | after `h3q81d` | after `jzvxav` | after `w13xgb` | after `rbd0a4` |
-|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| `__main__` (the root being compiled) | **129** | | 129 | 148 | 158 | 171 | 174 | 223 | 225 | 237 |
-| `std_libc` | **0** | | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 165 |
-| `std_net_tcp` | **0** | | 0 | 0 | 0 | 0 | 40 | 40 | 40 | 40 |
-| `std_db_row` | **0** | | 0 | 0 | 0 | 0 | 0 | 0 | 12 | 12 |
-| `cli` | 11 | | 11 | 11 | 11 | 11 | 11 | 11 | 11 | 11 |
-| `std_db_sqlite` | 9 | | 9 | 9 | 9 | 9 | 9 | 9 | 9 | 9 |
-| `incremental` / `file_watcher` | **0 each** | | 6 each | 6 each | 6 each | 6 each | 6 each | 6 each | 6 each | 6 each |
-| `lsp` | 4 | | 4 | 4 | 4 | 4 | 6 | 6 | 6 | 6 |
-| `std_testing` | **0** | | 0 | 0 | 0 | 0 | 0 | 0 | 3 | 3 |
-| `std_http_server` / `pkg_resolver` / `build_stdlib` | 3 each | | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each |
+| module | family-A rows | | after `cttrag` | after `nxnnxe` | after `x3x0qj` | after `w089a0` | after `qjfwc6` | after `h3q81d` | after `jzvxav` | after `w13xgb` | after `rbd0a4` |
+|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `__main__` (the root being compiled) | **125** | | 129 | 129 | 148 | 158 | 171 | 174 | 223 | 225 | 237 |
+| `std_libc` | **0** | | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 165 |
+| `std_net_tcp` | **0** | | 0 | 0 | 0 | 0 | 0 | 40 | 40 | 40 | 40 |
+| `std_db_row` | **0** | | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 12 | 12 |
+| `cli` | 11 | | 11 | 11 | 11 | 11 | 11 | 11 | 11 | 11 | 11 |
+| `std_db_sqlite` | 9 | | 9 | 9 | 9 | 9 | 9 | 9 | 9 | 9 | 9 |
+| `incremental` / `file_watcher` | **0 each** | | 0 each | 6 each | 6 each | 6 each | 6 each | 6 each | 6 each | 6 each | 6 each |
+| `lsp` | **0** | | 4 | 4 | 4 | 4 | 4 | 6 | 6 | 6 | 6 |
+| `std_testing` | **0** | | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 3 | 3 |
+| `std_http_server` / `pkg_resolver` / `build_stdlib` | 3 each | | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each |
 
 **Three consecutive fixes have now landed their whole delta in `__main__` and nowhere else** —
 `w089a0`'s −13 (171 → 158), `x3x0qj`'s −10 (158 → 148) and `nxnnxe`'s −19 (148 → 129). That is the
@@ -2710,8 +2834,16 @@ producer and not by this table. `h3q81d` is the only cause so far to move `__mai
 (223 → 174), precisely because effect ops are called from roots rather than from a stdlib module.
 
 **Every stdlib module in this table is now at zero except `std_db_sqlite` (9, `nrrs28`).** What
-remains is `__main__` plus the compiler's own source (`cli` 11, `lsp` 4) — so from here the instrument
+remains is `__main__` plus the compiler's own source (`cli` 11) — so from here the instrument
 is measuring the corpus and the compiler, not the standard library.
+
+**`n84s1p` cleared `lsp` outright** (4 → 0), the third compiler module retired in two fixes, and it
+splits the `__main__` bucket in a way worth noting: of its 8 rows, 6 are the *same two source lines*
+(`src/lsp.bl:50,51`) counted once per root that pulls `lsp` in — 4 attributed to `lsp` and 2 to
+`__main__` when `lsp` is itself the root. That is the `std_net_tcp` shape again at one quarter the
+size: **a family-A row count is a count of (site × root), not of sites**, so two lines in a
+widely-imported module outrank six lines that only one root compiles. The remaining 2 rows are
+single-site: `tests/manual_stdio_stdin.bl:10` and `tests/test_env_effect.bl:12`.
 
 **`cttrag` cleared `incremental` and `file_watcher` outright** (6 each → 0), the first fix to retire two
 whole modules since `jzvxav` took `std_db_row` and `std_testing` together. It also **shrank this table
@@ -2725,9 +2857,17 @@ largest causes left are both *held* rather than open: **iterator adapters** (34)
 `qzdz2e` by panel decision because it is user-visible, and **`Channel(n)` / `ch.recv`** (24) is
 probably not a missing rule at all — the argument is a capacity, not an element type, so it likely
 belongs to `decisions/under-determined-types.md` / E0301. Below them the tail is genuinely flat:
-~~`pub let` container element (12)~~ (**closed — `cttrag`**), closure-typed fields (~11),
-`Response`/`Request` (10), `nrrs28` (9), `n84s1p` (~~9~~ **6**, corrected while closing `cttrag`),
-`jr4xf7` (4, blocked on a spec answer), `List.join` (~4), `bytes.to_str()` (3).
+~~`pub let` container element (12)~~ (**closed — `cttrag`**), **`jr4xf7` (14 — re-measured from the 4
+this list used to claim, and now the largest single remaining cause, blocked on a spec answer)**,
+closure-typed fields (~11), `Response`/`Request` (10), `nrrs28` (9), ~~`n84s1p` (9 → 6)~~ (**closed —
+−8**), `List.join` (6), ~~`bytes.to_str()` (3)~~ (**closed as a mis-attribution — it was `n84s1p`
+downstream**), `pkg_resolver:312` (3, `var=generated`, not yet diagnosed).
+
+**Three of this ranking's entries have now been corrected by reading the row's own `var=` field, and
+two of the three were corrected *downward to zero*** — `bytes.to_str()` and the `env.var` half of
+`n84s1p` were not causes at all, while `jr4xf7` was undercounted by more than 3×. The ranking is
+generated from line numbers; the `var=` field is generated from the binding. When they disagree the
+`var=` field wins, and one `sed -n '<line>p'` settles it.
 
 **`cttrag` was picked from that flat tail on a different criterion, and it is the one to keep using:
 the rows sat in the compiler's own source.** A cause inside `src/` can be reproduced, fixed and

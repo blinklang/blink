@@ -1,0 +1,308 @@
+// br n84s1p — `is_intrinsic_method` is SHORT of the arms codegen actually emits, so twelve
+// namespace intrinsics resolve through the wrong path and acquire no type.
+//
+// src/codegen_types.bl:8084 is the allow-list. src/codegen_methods.bl:2659 (io) and :2995 (env)
+// are the arms. They disagree on TWELVE names — not the three the ticket claimed:
+//   io   arm, not listed: eprint, eprint_raw, log, print_raw, read_bytes, write, write_bytes
+//   env  arm, not listed: cwd, exit, remove_var, set_var, var
+// An unlisted name falls out of the intrinsic gate at src/typecheck.bl:9679 and into the BARE-name
+// fallthrough at :9697, which asks `lookup_fnsig(method)` — `lookup_fnsig("write")`, not
+// `lookup_fnsig("io.write")`. Nothing answers, so the call is TYPE_UNKNOWN.
+//
+// TYPE_UNKNOWN unifies with anything, and this list fails open in FIVE distinct ways. All five were
+// reproduced by running before this file was written, which is why the rows below assert on run
+// results and message text rather than on "some error appeared":
+//   1. SILENT MISCOMPILE — `let bad: Int = env.var("HOME")` compiled, linked, ran, printed `<value>`.
+//   2. SILENT MISCOMPILE — `let bad: Int = env.cwd()` ran and printed the real working directory.
+//   3. RAN WITH A GARBAGE EXIT STATUS — `env.exit("1")` emitted `exit(<char*>)` and the process
+//      exited 86, a value derived from a pointer. Address-dependent, so no row may assert on 86.
+//   4. C-COMPILER ESCAPE — io.read_bytes / io.write / io.write_bytes / env.remove_var reached cc,
+//      which reported int-conversion and incompatible-pointer errors blinkc cannot observe.
+//   5. COMPILER PANIC — `env.set_var("a")` hit `panic: unwrap called on None at src/parser.bl:111`.
+//      The arity check at :9679 needs a registered signature to read; with none, a missing argument
+//      ICEs on user input.
+//
+// THE INVARIANT IS list ⊇ arms, NOT list == arms. `io.debug` is listed with no arm behind it and
+// STAYS listed: a listed-but-unsigned name gets no type from either arm and falls to the loud E0505
+// codegen backstop, and being listed is what keeps it OFF the bare-name path where a free fn named
+// `debug` could answer for it. `io.println` has been in exactly that state all along. Removing a
+// name from the list is therefore never the repair — the list being short is the bug.
+//
+// Sixth sighting of the allow-list-with-nothing-behind-it class (is_builtin_method,
+// is_intrinsic_method/qjfwc6, tc_method_resolvable_on_type/nxnnxe, and inverted in pvhaew). Here the
+// list is short rather than long, which is the same defect from the other side.
+
+import compile_test_helpers
+
+fn prog(body: Str) -> Str {
+    let mut s = "fn main() \{\n"
+    s = s.concat(body)
+    s = s.concat("}\n")
+    s
+}
+
+// ── mode 1 and 2: the two silent miscompiles ──────────────────────────────────
+//
+// These are the teeth of the file. Both RAN before the fix. Asserting only "is a TypeError" would
+// have passed against a program that failed for an unrelated reason, so each also asserts that the
+// pipeline stopped before cc.
+
+test "env.var is Option[Str] and cannot bind to an Int-declared name" {
+    let s = prog("    let bad: Int = env.var(\"HOME\")\n    io.println(\"\{bad}\")\n")
+    compile_test_helpers.expect_compile_error(s, "n84s1p_var_decl", "TypeError")
+}
+
+test "a mistyped env.var never reaches the C compiler and never runs" {
+    let s = prog("    let bad: Int = env.var(\"HOME\")\n    io.println(\"\{bad}\")\n")
+    let r = compile_test_helpers.compile_and_run(s, "n84s1p_var_run")
+    assert(r.exit_code != 0)
+    let all = "{r.out}{r.err_out}"
+    assert(!all.contains("C compilation failed"))
+    // The pre-fix run printed the unwrapped Option as `<value>`. If that string is back, the
+    // declared-type compare is being skipped again.
+    assert(!all.contains("<value>"))
+}
+
+test "env.cwd is Str and cannot bind to an Int-declared name" {
+    let s = prog("    let bad: Int = env.cwd()\n    io.println(\"\{bad}\")\n")
+    compile_test_helpers.expect_compile_error(s, "n84s1p_cwd_decl", "TypeError")
+}
+
+// The pre-fix program printed the real working directory. A run assertion is the only thing that
+// can see that, and it must not look for a fixed path.
+test "a mistyped env.cwd does not run and print the working directory" {
+    let s = prog("    let bad: Int = env.cwd()\n    io.println(\"\{bad}\")\n")
+    let r = compile_test_helpers.compile_and_run(s, "n84s1p_cwd_run")
+    assert(r.exit_code != 0)
+    assert(!r.out.contains("/"))
+}
+
+// ── mode 3: ran, and exited with a pointer-derived status ─────────────────────
+
+test "env.exit takes an Int status, not a Str" {
+    let s = prog("    env.exit(\"1\")\n")
+    compile_test_helpers.expect_compile_error(s, "n84s1p_exit_str", "TypeError")
+}
+
+// The status was 86 for one build of one machine — derived from a pointer value, so no row may
+// assert on it. What must be shown is that blinkc stops instead of handing the program to cc, and
+// that has to be read from blinkc's own output: br 366d3m — build/blinkc reports its diagnostics and
+// then exits 0, so compile_and_run always proceeds to cc, which fails on the .c file blinkc never
+// wrote. The exit code and stderr a run row would see therefore belong to cc, not to the compiler,
+// and an `err_out.contains("TypeError")` assertion through that path can never pass. The negative
+// run assertions in the rows above still discriminate, because before the fix blinkc DID emit C and
+// cc choked on it by name.
+test "a mistyped env.exit is diagnosed by the compiler, not by cc" {
+    let out = compile_test_helpers.compile_and_capture(prog("    env.exit(\"1\")\n"), "n84s1p_exit_diag")
+    assert(out.contains("TypeError"))
+    assert(out.contains("expects Int"))
+    assert(!out.contains("makes pointer from integer"))
+    assert(!out.contains("int-conversion"))
+}
+
+// ── mode 4: the C-compiler escapes ───────────────────────────────────────────
+
+test "io.read_bytes is Bytes and cannot bind to a Str-declared name" {
+    let s = prog("    let bad: Str = io.read_bytes(4)\n    io.println(bad)\n")
+    compile_test_helpers.expect_compile_error(s, "n84s1p_rb_decl", "TypeError")
+}
+
+test "a mistyped io.read_bytes never reaches the C compiler" {
+    let s = prog("    let bad: Str = io.read_bytes(4)\n    io.println(bad)\n")
+    let r = compile_test_helpers.compile_and_run(s, "n84s1p_rb_run")
+    assert(r.exit_code != 0)
+    let all = "{r.out}{r.err_out}"
+    assert(!all.contains("C compilation failed"))
+    assert(!all.contains("incompatible pointer type"))
+}
+
+test "a Str length to io.read_bytes is rejected" {
+    let s = prog("    let b = io.read_bytes(\"4\")\n    io.println(\"\{b.len()}\")\n")
+    compile_test_helpers.expect_compile_error(s, "n84s1p_rb_arg", "TypeError")
+}
+
+// io.write takes Str and io.write_bytes takes Bytes — the pair must not be interchangeable, the
+// same contract qjfwc6 pinned for net.write / net.write_bytes.
+test "an Int payload to io.write is rejected" {
+    let s = prog("    io.write(5)\n")
+    compile_test_helpers.expect_compile_error(s, "n84s1p_write_int", "TypeError")
+}
+
+test "a mistyped io.write never reaches the C compiler" {
+    let s = prog("    io.write(5)\n")
+    let r = compile_test_helpers.compile_and_run(s, "n84s1p_write_run")
+    assert(r.exit_code != 0)
+    let all = "{r.out}{r.err_out}"
+    assert(!all.contains("C compilation failed"))
+    assert(!all.contains("makes pointer from integer"))
+}
+
+test "a Str payload to io.write_bytes is rejected" {
+    let s = prog("    io.write_bytes(\"hi\")\n")
+    compile_test_helpers.expect_compile_error(s, "n84s1p_wb_str", "TypeError")
+}
+
+test "an Int name to env.remove_var is rejected" {
+    let s = prog("    env.remove_var(5)\n")
+    compile_test_helpers.expect_compile_error(s, "n84s1p_rmvar_int", "TypeError")
+}
+
+// ── mode 5: the compiler panic ───────────────────────────────────────────────
+//
+// The most severe of the five: user input crashed the compiler rather than being diagnosed. The
+// arity check at typecheck.bl:9679 is already written; it had no signature to read.
+test "a missing argument to env.set_var is diagnosed, not a compiler panic" {
+    let s = prog("    env.set_var(\"a\")\n")
+    let out = compile_test_helpers.compile_and_capture(s, "n84s1p_setvar_arity")
+    assert(!out.contains("panic:"))
+    assert(!out.contains("unwrap called on None"))
+    assert(out.contains("TypeError") || out.contains("ArgumentCount") || out.contains("Arity"))
+}
+
+test "an Int name to env.set_var is rejected" {
+    let s = prog("    env.set_var(5, \"v\")\n")
+    compile_test_helpers.expect_compile_error(s, "n84s1p_setvar_int", "TypeError")
+}
+
+// ── the spurious warning on valid code, a fourth surface of the same cause ───
+//
+// The UnknownMethod gate at typecheck.bl:7721 is keyed on the BARE method name via
+// is_builtin_method, so it happens to know `var`, `cwd`, `write` and `read_bytes` for unrelated
+// reasons and does NOT know `exit`. Of all twelve names exactly one warned, and it warned on
+// CORRECT code: `env.exit(0)` is spelled in sections/04_effects.md:209 and :697. Fixing it by
+// adding `exit` to is_builtin_method would be the wrong key — it would silence `.exit()` on every
+// type. The gate has to consult the namespace, which is what is_intrinsic_method is for.
+test "valid env.exit does not warn that the method is unknown" {
+    let s = prog("    env.exit(0)\n")
+    let out = compile_test_helpers.compile_and_capture(s, "n84s1p_exit_warn")
+    assert(!out.contains("UnknownMethod"))
+    assert(!out.contains("unknown method 'exit'"))
+}
+
+// ── the inferred type must propagate, which is what the divergence rows are ──
+//
+// src/lsp.bl:50 is `let bytes = io.read_bytes(cl)` and :51 consumes it. Both were family-A
+// divergence rows (codegen holding no type at all), and :51 only because :50 had none — Bytes.to_str
+// has had its signature since typecheck.bl:9495. A declared-type row alone would not prove the tid
+// reaches the next call.
+test "an inferred io.read_bytes carries Bytes into a following method call" {
+    let mut b = "    let raw = io.read_bytes(4)\n"
+    b = b.concat("    let bad: Str = raw.len()\n")
+    b = b.concat("    io.println(bad)\n")
+    compile_test_helpers.expect_compile_error(prog(b), "n84s1p_rb_chain", "TypeError")
+}
+
+test "an inferred env.var carries Option[Str] into its unwrapped element" {
+    let mut b = "    let v = env.var(\"HOME\")\n"
+    b = b.concat("    let bad: Int = v ?? \"fallback\"\n")
+    b = b.concat("    io.println(\"\{bad}\")\n")
+    compile_test_helpers.expect_compile_error(prog(b), "n84s1p_var_chain", "TypeError")
+}
+
+// ── controls: every correct spelling still compiles, and the safe ones run ────
+
+// io.read_bytes blocks on stdin and env.exit terminates the process, so those two are proven by
+// compiling clean rather than by running.
+test "every io and env intrinsic compiles clean under its correct types" {
+    let mut b = "    io.print_raw(\"a\")\n"
+    b = b.concat("    io.eprint(\"b\")\n")
+    b = b.concat("    io.eprint_raw(\"c\")\n")
+    b = b.concat("    io.log(\"d\")\n")
+    b = b.concat("    io.write(\"e\")\n")
+    b = b.concat("    io.write_bytes(Bytes.new())\n")
+    b = b.concat("    let raw: Bytes = io.read_bytes(0)\n")
+    b = b.concat("    let v: Option[Str] = env.var(\"HOME\")\n")
+    b = b.concat("    let c: Str = env.cwd()\n")
+    b = b.concat("    env.set_var(\"BLINK_N84S1P\", \"1\")\n")
+    b = b.concat("    env.remove_var(\"BLINK_N84S1P\")\n")
+    b = b.concat("    io.println(\"\{raw.len()}\{v.is_some()}\{c.len() > 0}\")\n")
+    b = b.concat("    env.exit(0)\n")
+    compile_test_helpers.expect_no_error(prog(b), "n84s1p_ctl_compile", "TypeError")
+}
+
+// The runnable subset, asserting on real output — a fix that resolved these to the WRONG type would
+// satisfy every error row above and fail here.
+test "the env round trip and the io writers run correctly" {
+    let mut b = "    env.set_var(\"BLINK_N84S1P\", \"present\")\n"
+    b = b.concat("    let v = env.var(\"BLINK_N84S1P\") ?? \"absent\"\n")
+    b = b.concat("    let c: Str = env.cwd()\n")
+    b = b.concat("    io.write(\"w=\")\n")
+    b = b.concat("    io.print_raw(\"r\")\n")
+    b = b.concat("    io.println(\"|v=\{v}|cwd=\{c.len() > 0}\")\n")
+    b = b.concat("    env.remove_var(\"BLINK_N84S1P\")\n")
+    b = b.concat("    let gone = env.var(\"BLINK_N84S1P\") ?? \"absent\"\n")
+    b = b.concat("    io.println(\"gone=\{gone}\")\n")
+    let r = compile_test_helpers.compile_and_run(prog(b), "n84s1p_ctl_run")
+    assert(r.exit_code == 0)
+    assert(r.out.contains("w=r|v=present|cwd=true"))
+    assert(r.out.contains("gone=absent"))
+}
+
+// env.exit must actually still exit with the status it is given — the signature is Void, and a Void
+// intrinsic that stopped emitting its call would satisfy the compile control above.
+test "env.exit still exits with its given status" {
+    let r = compile_test_helpers.compile_and_run(prog("    io.println(\"before\")\n    env.exit(3)\n"), "n84s1p_ctl_exit")
+    assert(r.exit_code == 3)
+    assert(r.out.contains("before"))
+}
+
+// io.debug is LISTED WITH NO ARM and stays that way. It must keep reaching the loud codegen
+// backstop: if it ever silently acquires a type, it has been routed to the bare-name path, which is
+// the bug this file closes.
+test "io.debug stays listed and still reports loudly" {
+    let out = compile_test_helpers.compile_and_capture(prog("    io.debug(\"x\")\n"), "n84s1p_debug")
+    assert(out.contains("unresolved method") || out.contains("no member"))
+}
+
+// env.vars() is spelled in sections/04_effects.md:209 and typed Map[Str, Str] at :752, and NO
+// codegen arm emits it. That is a missing feature rather than this ticket's mistyping — it already
+// fails loudly, which is the correct state for an unimplemented intrinsic. Pinned here so the gap
+// stays visible and a future implementation is attributed to its own ticket.
+test "env.vars is unimplemented and says so" {
+    let out = compile_test_helpers.compile_and_capture(prog("    let m = env.vars()\n    io.println(\"\{m.len()}\")\n"), "n84s1p_vars")
+    assert(out.contains("unresolved method") || out.contains("no member"))
+}
+
+// The table is keyed on namespace AND method, so a local binding that shadows the namespace
+// spelling keeps its own type. This is the guard `nr_is_defined(obj_name) == 0` at typecheck.bl:9679
+// and it is why adding five env names cannot hijack a user type with a `cwd` method.
+test "a local shadowing the env namespace keeps its own method" {
+    let mut s = "type Cfg \{ root: Str }\n"
+    s = s.concat("trait CfgOps \{ fn cwd(self) -> Int }\n")
+    s = s.concat("impl CfgOps for Cfg \{ fn cwd(self) -> Int \{ 7 } }\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let env = Cfg \{ root: \"/\" }\n")
+    s = s.concat("    let ok: Int = env.cwd()\n")
+    s = s.concat("    io.println(\"\{ok}\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_no_error(s, "n84s1p_shadow_ok", "TypeError")
+    let r = compile_test_helpers.compile_and_run(s, "n84s1p_shadow_run")
+    assert(r.exit_code == 0)
+    assert(r.out.contains("7"))
+}
+
+// The same shadowing local must still be type-checked against ITS signature, not the intrinsic's.
+test "a shadowing local is checked against its own signature" {
+    let mut s = "type Cfg \{ root: Str }\n"
+    s = s.concat("trait CfgOps \{ fn cwd(self) -> Int }\n")
+    s = s.concat("impl CfgOps for Cfg \{ fn cwd(self) -> Int \{ 7 } }\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let env = Cfg \{ root: \"/\" }\n")
+    s = s.concat("    let bad: Str = env.cwd()\n")
+    s = s.concat("    io.println(bad)\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_compile_error(s, "n84s1p_shadow_bad", "TypeError")
+}
+
+// The intrinsics qjfwc6 already signed share both the gate and the signature table with the twelve
+// added here, so a regression in either is attributed to this file.
+test "the intrinsics signed earlier still resolve" {
+    let mut b = "    let w: Int = term.width()\n"
+    b = b.concat("    let a: List[Str] = env.args()\n")
+    b = b.concat("    io.println(\"\{w >= 0}|\{a.len() >= 1}\")\n")
+    let s = prog(b)
+    compile_test_helpers.expect_no_error(s, "n84s1p_ctl_prior", "TypeError")
+    let r = compile_test_helpers.compile_and_run(s, "n84s1p_run_prior")
+    assert(r.exit_code == 0)
+    assert(r.out.contains("true|true"))
+}
