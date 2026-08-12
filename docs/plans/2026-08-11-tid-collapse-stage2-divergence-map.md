@@ -6877,6 +6877,123 @@ Tests: `tests/test_bgenc2_forin_binder_container_elem.bl`, 11 rows — a `Map` v
 asserts a value, because two of the three failure modes are silent. `task regen` at fixed point;
 `task ci` exit 0; 684 test files, 684 passed, 0 failed.
 
+### The two seams that read the RECEIVER's name — br `a1cx6d`, br `fyat2w`
+
+`bgenc2` above fixed the `for` binder. Its cause — *flat metadata is copied from a producer that
+has no `ScopeVar`* — has two more instances, and both are reached by a plain method call:
+
+```
+bucket=diverge site=match_pattern.bind var=st tid=Set[Int]  flat=Set[?]
+bucket=diverge site=match_pattern.bind var=m  tid=Map[Str, Str]  flat=Map[Str, Int]
+bucket=diverge site=match_pattern.bind var=l  tid=List[Str] flat=List[Int]
+```
+
+**`a1cx6d` — the match-arm binder.** `bind_pattern_vars`'s Option/Result carrier fast path fills a
+container binder's element from two lossy sources: the transient `expr_option_*` / `expr_result_*`
+globals, and the **scrutinee's own flat channels, looked up by the scrutinee's C name**. A
+call-returned scrutinee is a temp (`_scrut_1`) with no `ScopeVar`, so both answer nothing and `sv_tp`
+supplies the house default. The same three kinds fail the same three ways as in `bgenc2` — Set loud
+(`SetElementTypeUnknownAtCodegen`), Map and List silent.
+
+One thing is worse here than at the `for` binder: **no producer shape works.** A `let`-bound value
+and an **annotated declaration** fail identically to a call, because the arm reads the scrutinee
+*temp*, not the declaration the temp came from. There is no coincidence to hide behind and no
+"it works if you annotate it" workaround.
+
+**`fyat2w` — `Option[Set[T]].unwrap()`, and its `Option[List[T]]` sibling.** Same read, one seam
+over: `get_var_option_inner2(obj_str)` with `obj_str` the receiver's C text. For `oset().unwrap()`
+that is a call expression, so the unwrapped set is left with **no element at all** and a later
+`for` falls through to the stale `expr_list_elem_*` globals — whatever the last emitted
+list-producing function body left behind. The element therefore depends on a declaration the
+program never calls:
+
+```blink
+fn oset() -> Option[Set[Int]] { let s: Set[Int] = Set(); s.insert(4); s.insert(5); Some(s) }
+fn olist() -> Option[List[Str]] { Some(["a", "bb"]) }   // never called
+fn main() {
+    let st = oset().unwrap()
+    let mut n = 0
+    for x in st { n = n + x }                            // cc: int64_t = const char*
+}
+```
+
+Delete the `olist` line and the same program prints `9`. Make it `Option[List[Pt]]` and the loop
+decodes a struct. Remove every list producer and the element is unset and the for-in ICEs. That is
+one declaration reaching into another's codegen through a global — the failure mode a flat side
+channel has and a tid does not.
+
+The `Option[List[T]]` arm of the same function was fabricating too, in the open:
+`set_list_elem_type(val_tmp, CT_INT)` as an explicit floor. `Option[List[Pt]].unwrap()` then handed
+`.get(0).unwrap().x` an integer and printed `<value>`.
+
+#### Fill-only, because this stamp cannot run first
+
+`bgenc2`'s stamp is a **writer**: it calls `set_var`, which rebuilds the var's `tp` from scratch, so
+it has to run *before* the flat copies that follow it. A match-arm binder cannot be served that way.
+`bind_pattern_vars` decides the head CT and emits the C declaration inside one of ~28 arms, each
+doing its own element copy afterwards, and the single place that sees **every** binder
+(`pat_measure_at`) runs last. Writing there would overrule arms that were already right.
+
+So `stamp_binder_elems_from_tid_if_unset` asks before it writes. An unset channel reads `-1` / `""`,
+and that is the only honest signal available — a *set* channel holding the erased default is
+indistinguishable from a genuine `Map[Str, Int]`, so "already set" has to mean "leave it alone". The
+head CT must agree first: a binder whose flat head says `List` while the tid says `Set` is a
+contaminated head, not a missing element, and stamping through the disagreement would write one
+container's element onto another's channel — a new silent-wrong, not a fix.
+
+#### `get_list_elem_type_raw`, and why the fill-only guard needed it
+
+The first cut of this fix silently did nothing for lists, and the reason is the thesis of this whole
+document. `get_list_elem_type` reads `tp_child1_kind`, and `sv_tp(CT_LIST, -1, ..)` answers
+`type_list(type_int())`. **A list whose element was lost and a genuine `List[Int]` are the same pool
+entry, bit for bit**, so every question asked through the pool comes back `Int` and a fill-only stamp
+declines forever. The raw flat `inner1` field, which every setter keeps alongside `tp_id`, still says
+`-1` — so it is the only place the distinction survives. `get_list_elem_type_raw` reads it, mirroring
+`get_map_key_type_raw` / `get_map_value_type_raw`, and falls back to the pool answer for a name that
+is not a scope var (a closure capture has a `tp_id` and no flat fields): there a missing answer must
+read as SET, because declining is a no-op while overwriting a capture's real element is a new bug.
+
+`Set` needed no such reader — `mv45y5` had already made `sv_tp`'s `CT_SET` arm decline instead of
+fabricate, which is exactly why that kind is the loud one.
+
+At the `.unwrap()` seam the guard is not needed at all and is not used: that branch **is** the
+position where nothing else answered, and what it replaces is the `CT_INT` floor. The tid runs
+third, after both existing channels, and the floor still stands for a tid that declines.
+
+> **Census, monolithic, 973-file common basis (the two new test files excluded):**
+> `diverge` **29423 → 29423**, cells **743 → 743**, `missing` **74 → 74**, `unknown`
+> **4660 → 4660**, `ctypediv` **276 → 276**. Nothing moved and nothing regressed, and that is the
+> expected reading: **no pre-existing corpus file has either shape.** The published
+> `match_pattern.bind` siblings do not move either, and by design — `tid=Map[Str, List[Int]]
+> flat=Map[Str, Int]` (`tests/test_option_map_list_ptr.bl:103`) has its key already set from the
+> carrier tag, and `tid=List[Str] flat=List[Int]` (`tests/test_generic_deep_nesting.bl:60`) is an arm
+> that wrote `CT_INT` on purpose. Fill-only cannot correct a channel that already answered; those are
+> authority flips, each needing its own measured shape. A zero-delta sweep is not a null result here,
+> it is the statement that this shape was never in the corpus — the same finding as `bgenc2`.
+
+Both files were attributed in **both** build modes, monolithic and archive-linked, with identical
+rows. Three residuals, all in-file and all passing:
+
+- `emit_let_binding.decl var=p tid=List[Pt] flat=List[Void]` — the `(CT_VOID, name)` pointer-boxed
+  struct element, an accounting artifact already named in the `bgenc2` section.
+- `emit_let_binding.decl var=os tid=Option[Set[Str]] flat=Option[Set[?]]` — a Set in **nested**
+  position, the family this plan defers to Stage 4 because the flat CSV has nowhere to put it.
+- `match_pattern.bind var=l tid=List[Pt] flat=List[]` — a **half-answer**: the arm recorded the
+  element's CT as a struct and its name as `""`, so `tp_display` renders the empty `sname` as
+  nothing. The fill-only stamp declines (the channel answered), and the row still passes — because
+  `for p in l` is `emit_for_in`, which consults the tid since `bgenc2`. The two fixes compose: a
+  binder the flat side half-lost is read correctly one level down. Worth keeping in view as its own
+  cell, not folded into either ticket.
+
+Tests: `tests/test_a1cx6d_match_binder_container_elem.bl`, 11 rows — a `Set[Int]`, a `Set[Str]`, a
+`Result` `Ok(st)`, a `Map[Int, Str]` read three keys deep, a `Map[Str, Str]` with `.values()`, a
+`List[Str]` read two ways, a `Result` `Ok(l)`, a `List[Pt]`, and the annotated and `let`-bound forms
+that do **not** rescue the binder, plus the `Map[Str, Int]` coincidence control.
+`tests/test_fyat2w_option_set_unwrap_elem.bl`, 4 rows — the bound and expression-position unwraps
+for two element types, and a row proving the contaminant declarations still work themselves. Every
+row asserts a value; two of the three failure modes are silent. `task regen` at fixed point; `task
+ci` exit 0; 686 test files, 686 passed, 0 failed; fmt 1590 passed, 0 failed.
+
 ## Appendix — all 428 shape cells
 
 Format: `family | occurrences | tid | flat`.

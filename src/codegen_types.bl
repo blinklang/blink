@@ -3001,6 +3001,41 @@ pub fn set_list_elem_type(name: Str, elem_type: Int) {
     push_scope_var(ScopeVar { name: name, ctype: CT_LIST, is_mut: 0, inner1: elem_type, inner2: -1, sname: "", sname2: "", extra: "", ty: -1, tp_id: sv_tp(CT_LIST, elem_type, -1, "") })
 }
 
+// br fyat2w: the list element with NO Int default — -1 when nothing ever recorded one.
+//
+// `get_list_elem_type` below cannot report that, and not by oversight: it reads
+// `tp_child1_kind`, and `sv_tp(CT_LIST, -1, ..)` answers `type_list(type_int())`. A list whose
+// element was lost and a genuine `List[Int]` are the same pool entry, bit for bit, so every
+// question asked through the pool comes back "Int" and a fill-only stamp would decline forever.
+// The raw flat `inner1` field is kept alongside `tp_id` by every setter and still says -1, which
+// makes it the only place the distinction survives. Mirrors get_map_key_type_raw.
+//
+// Falls back to the pool answer for a name that is not a scope var (a closure capture carries a
+// tp_id and no flat fields), because a missing answer must read as SET there: declining is a
+// no-op, while writing over a capture's real element would be a new silent-wrong.
+pub fn get_list_elem_type_raw(name: Str) -> Int {
+    let mut i = scope_vars.len() - 1
+    while i >= 0 {
+        let sv = scope_vars.get(i).unwrap()
+        if sv.name == name && tp_get_kind(sv.tp_id) == CT_LIST {
+            return sv.inner1
+        }
+        i = i - 1
+    }
+    let alt = c_blink_name(name)
+    if alt != name {
+        let mut j = scope_vars.len() - 1
+        while j >= 0 {
+            let sv = scope_vars.get(j).unwrap()
+            if sv.name == alt && tp_get_kind(sv.tp_id) == CT_LIST {
+                return sv.inner1
+            }
+            j = j - 1
+        }
+    }
+    get_list_elem_type(name)
+}
+
 pub fn get_list_elem_type(name: Str) -> Int {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
@@ -3733,6 +3768,57 @@ pub fn stamp_binder_from_binder_tid(mtid: Int, var_name: Str, is_mut: Int) -> Bo
     // not have. An arm for them would have been dead weight built on a probe that mis-spelled the
     // API, so the rule stays: no measured shape, no arm.
     false
+}
+
+// br a1cx6d: fill a container binder's element channels from its tid, but ONLY where the flat
+// side has no answer of its own.
+//
+// stamp_binder_from_binder_tid above is the WRITER form: it calls set_var, which rebuilds the
+// var's tp from scratch, so it has to run before whatever flat copies follow it. A match-arm
+// binder cannot be served that way. `bind_pattern_vars` decides the binder's head CT and emits
+// its C declaration inside one of ~28 arms, each doing its own element copy afterwards, and the
+// single place that sees every binder (`pat_measure_at`) runs LAST. Writing there would overrule
+// arms that were already right — the opposite of what the tid is for.
+//
+// So this form asks first. An unset element channel reads -1 / "" (get_map_*_type_raw exists for
+// exactly this reason), which is the only honest signal available: a SET channel holding the
+// erased default is indistinguishable from a genuine `Map[Str, Int]`, so "already set" has to
+// mean "leave it alone". The tid fills holes; it does not arbitrate.
+//
+// The head CT must agree before anything is written. A binder whose flat head says List while the
+// tid says Set is a different defect — a contaminated head, not a missing element — and stamping
+// an element through the disagreement would write the Set's element onto a List var's channel,
+// which is a new silent-wrong rather than a fix.
+pub fn stamp_binder_elems_from_tid_if_unset(mtid: Int, var_name: Str) -> Bool {
+    let ct = tc_tid_ct(mtid)
+    if ct != get_var_type(var_name) { return false }
+    if ct == CT_SET {
+        if get_set_elem_type(var_name) >= 0 { return false }
+        if get_set_elem_struct(var_name) != "" { return false }
+        let e_ct = tc_tid_set_elem_ct(mtid)
+        let e_sn = tc_tid_set_elem_struct(mtid)
+        if e_ct < 0 && e_sn == "" { return false }
+        if e_ct >= 0 { set_set_elem_type(var_name, e_ct) }
+        if e_sn != "" { set_set_elem_struct(var_name, e_sn) }
+        return true
+    }
+    if ct == CT_LIST {
+        if get_list_elem_type_raw(var_name) >= 0 { return false }
+        if get_list_elem_struct(var_name) != "" { return false }
+        let st = stamp_list_elem_from_list_tid(mtid, var_name)
+        return st.ct >= 0 || st.sname != ""
+    }
+    if ct == CT_MAP {
+        if get_map_key_type_raw(var_name) >= 0 { return false }
+        if get_map_value_type_raw(var_name) >= 0 { return false }
+        if get_map_value_struct(var_name) != "" { return false }
+        return stamp_map_from_map_tid(mtid, var_name)
+    }
+    false
+}
+
+pub fn stamp_binder_elems_from_node_if_unset(node: Int, var_name: Str) -> Bool {
+    stamp_binder_elems_from_tid_if_unset(tc_tid_subst_mono(tc_lookup_node_tid(node), cg_mono_tparams_sl, cg_mono_arg_tids), var_name)
 }
 
 // br dcjy17: the carrier a `Map[K, V].get(k)` must return when V is a kind the Map's three

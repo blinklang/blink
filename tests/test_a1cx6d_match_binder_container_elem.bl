@@ -1,0 +1,215 @@
+// br a1cx6d — a match-arm binder over a CONTAINER payload must get the container's real type.
+//
+// `bind_pattern_vars`'s Option/Result carrier fast path fills the binder's element channels from
+// two lossy sources: the transient `expr_option_inner_*` globals, and the SCRUTINEE's own flat
+// channels looked up by its C name. A call-returned scrutinee is a temp (`_scrut_1`) with no
+// ScopeVar, so both answer nothing and `sv_tp` fabricates:
+//
+//     bucket=diverge site=match_pattern.bind var=st tid=Set[Int]  flat=Set[?]
+//     bucket=diverge site=match_pattern.bind var=m  tid=Map[Str, Str]  flat=Map[Str, Int]
+//     bucket=diverge site=match_pattern.bind var=l  tid=List[Str] flat=List[Int]
+//
+// The tid beside each is already right. Three element kinds, three failure modes again:
+//
+//   Set  — LOUD. internal compiler error[SetElementTypeUnknownAtCodegen].
+//   Map  — SILENT. the value type comes back Int, so a Str prints as a pointer.
+//   List — SILENT. the element decodes as an integer.
+//
+// Unlike br bgenc2 (`for` binder), there is NO producer shape that works here: a call, a
+// let-bound value and an ANNOTATED declaration all fail, because the arm reads the scrutinee
+// TEMP, not the declaration it came from. The controls that pass are the ones that never enter
+// this path at all — `.unwrap()`, and `Map[Str, Int]`, which only "works" because it IS the
+// fabrication.
+
+type Pt { x: Int, y: Int }
+
+fn oset_int() -> Option[Set[Int]] {
+    let s: Set[Int] = Set()
+    s.insert(4)
+    s.insert(5)
+    Some(s)
+}
+
+fn oset_str() -> Option[Set[Str]] {
+    let s: Set[Str] = Set()
+    s.insert("q")
+    s.insert("rr")
+    Some(s)
+}
+
+fn rset_int() -> Result[Set[Int], Str] {
+    let s: Set[Int] = Set()
+    s.insert(7)
+    s.insert(8)
+    Ok(s)
+}
+
+fn omap_int_str() -> Option[Map[Int, Str]] {
+    let m: Map[Int, Str] = Map()
+    m.insert(5, "good")
+    m.insert(6, "also")
+    Some(m)
+}
+
+fn omap_str_str() -> Option[Map[Str, Str]] {
+    let m: Map[Str, Str] = Map()
+    m.insert("k", "vv")
+    Some(m)
+}
+
+fn omap_str_int() -> Option[Map[Str, Int]] {
+    let m: Map[Str, Int] = Map()
+    m.insert("k", 42)
+    Some(m)
+}
+
+fn olist_str() -> Option[List[Str]] { Some(["a", "bb"]) }
+
+fn olist_pt() -> Option[List[Pt]] { Some([Pt { x: 5, y: 1 }, Pt { x: 7, y: 2 }]) }
+
+fn rlist_str() -> Result[List[Str], Str] { Ok(["c", "ddd"]) }
+
+// ── The rows: a match binder over a call-returned container payload ───────────────
+
+test "a Set payload keeps its element through a match binder" {
+    let mut n = 0
+    match oset_int() {
+        Some(st) => {
+            assert_eq(st.len(), 2)
+            for x in st { n = n + x }
+            assert(st.contains(4))
+            assert(!st.contains(9))
+        }
+        None => { n = -1 }
+    }
+    assert_eq(n, 9)
+}
+
+test "a Set[Str] payload keeps its element through a match binder" {
+    let mut acc = 0
+    match oset_str() {
+        Some(st) => {
+            for s in st { acc = acc + s.len() }
+            assert(st.contains("q"))
+            assert(!st.contains("z"))
+        }
+        None => { acc = -1 }
+    }
+    assert_eq(acc, 3)
+}
+
+test "a Result Ok Set payload keeps its element too" {
+    let mut n = 0
+    match rset_int() {
+        Ok(st) => {
+            assert_eq(st.len(), 2)
+            for x in st { n = n + x }
+        }
+        Err(e) => { n = -1 }
+    }
+    assert_eq(n, 15)
+}
+
+test "a Map payload keeps its key and value through a match binder" {
+    let mut acc = ""
+    match omap_int_str() {
+        Some(m) => {
+            assert_eq(m.len(), 2)
+            match m.get(5) { Some(s) => { acc = "{acc}{s}" } None => { acc = "{acc}MISS" } }
+            match m.get(6) { Some(s) => { acc = "{acc}{s}" } None => { acc = "{acc}MISS" } }
+            match m.get(7) { Some(s) => { acc = "{acc}{s}" } None => { acc = "{acc}-" } }
+        }
+        None => { acc = "NONE" }
+    }
+    assert_eq(acc, "goodalso-")
+}
+
+test "a Map[Str, Str] payload is not the fabricated pair either" {
+    let mut acc = ""
+    match omap_str_str() {
+        Some(m) => {
+            match m.get("k") { Some(s) => { acc = "{acc}{s}" } None => { acc = "{acc}MISS" } }
+            for v in m.values() { acc = "{acc}{v.len()}" }
+        }
+        None => { acc = "NONE" }
+    }
+    assert_eq(acc, "vv2")
+}
+
+test "a List payload keeps its element through a match binder" {
+    let mut acc = ""
+    match olist_str() {
+        Some(l) => {
+            assert_eq(l.len(), 2)
+            for s in l { acc = "{acc}{s}" }
+            match l.get(1) { Some(s) => { acc = "{acc}{s.len()}" } None => { acc = "{acc}MISS" } }
+        }
+        None => { acc = "NONE" }
+    }
+    assert_eq(acc, "abb2")
+}
+
+test "a Result Ok List payload keeps its element too" {
+    let mut acc = ""
+    match rlist_str() {
+        Ok(l) => { for s in l { acc = "{acc}{s}" } }
+        Err(e) => { acc = "ERR" }
+    }
+    assert_eq(acc, "cddd")
+}
+
+test "a List[Pt] payload keeps its struct element" {
+    let mut xs = 0
+    match olist_pt() {
+        Some(l) => {
+            for p in l { xs = xs + p.x }
+            assert_eq(l.get(1).unwrap().y, 2)
+        }
+        None => { xs = -1 }
+    }
+    assert_eq(xs, 12)
+}
+
+test "an annotated declaration does not rescue the binder either" {
+    let os: Option[Set[Int]] = oset_int()
+    let mut n = 0
+    match os {
+        Some(st) => { for x in st { n = n + x } }
+        None => { n = -1 }
+    }
+    assert_eq(n, 9)
+
+    let om: Option[Map[Int, Str]] = omap_int_str()
+    let mut acc = ""
+    match om {
+        Some(m) => { match m.get(5) { Some(s) => { acc = s } None => { acc = "MISS" } } }
+        None => { acc = "NONE" }
+    }
+    assert_eq(acc, "good")
+}
+
+test "a let-bound scrutinee does not rescue the binder either" {
+    let os = oset_str()
+    let mut acc = 0
+    match os {
+        Some(st) => { for s in st { acc = acc + s.len() } }
+        None => { acc = -1 }
+    }
+    assert_eq(acc, 3)
+}
+
+// ── Controls: the paths that never enter the carrier binder ───────────────────────
+
+// `.unwrap()` is a DIFFERENT seam and is covered by tests/test_fyat2w_option_set_unwrap_elem.bl,
+// not by a control row here. It reads the receiver's flat channels under the receiver's C name,
+// which for a call is an expression with no ScopeVar — so it fails for its own reason, and asserting
+// it here would attribute another ticket's defect to this one.
+
+test "Map[Str, Int] is the shape that coincides with the fabrication" {
+    let mut n = 0
+    match omap_str_int() {
+        Some(m) => { match m.get("k") { Some(v) => { n = n + v } None => { n = -1 } } }
+        None => { n = -1 }
+    }
+    assert_eq(n, 42)
+}
