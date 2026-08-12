@@ -56,6 +56,7 @@
 import typecheck.{
     check_types, tc_lookup_node_tid, tc_type_str,
     make_list_type, make_map_type, make_set_type, make_option_type,
+    tc_unknown_tid,
     TyDiv, sv_ty_or_flat, reset_ty_divergence,
     ty_divergence_count, ty_divergence_total, ty_divergence_rows,
 }
@@ -79,6 +80,7 @@ fn div_name(b: TyDiv) -> Str {
         TyDiv.Agree => "Agree"
         TyDiv.Diverge => "Diverge"
         TyDiv.Missing => "Missing"
+        TyDiv.Unknown => "Unknown"
     }
 }
 
@@ -292,6 +294,42 @@ test "an erased flat slot against a known tid element is DIVERGE, not AGREE" {
     set_var_ty("ss", set_str)
     sv_ty_or_flat("ss", "unit.seterased")
     assert_bucket("unit.seterased", TyDiv.Diverge, 1)
+}
+
+// br dyd8fk. The mirror image of the test above, and the distinction the exit criterion rests on. Here
+// the tid does NOT know the element either — `Set[?]` against a flat slot that was never filled — so the
+// two representations agree, and what they agree about is that the element is under-determined. Calling
+// that DIVERGE made every site holding such a type unable to read 0; calling it AGREE would hide the
+// population. It is its own bucket.
+test "an erased flat slot against an unknown tid element is UNKNOWN, not DIVERGE" {
+    fresh()
+    let set_unknown = make_set_type(tc_unknown_tid())
+    reset_scope_state()
+    reset_ty_divergence()
+    set_var("su", CT_SET, 0)
+    set_var_ty("su", set_unknown)
+    sv_ty_or_flat("su", "unit.setunknown")
+    assert_bucket("unit.setunknown", TyDiv.Unknown, 1)
+    assert_bucket("unit.setunknown", TyDiv.Diverge, 0)
+    assert_bucket("unit.setunknown", TyDiv.Agree, 0)
+    assert_bucket("unit.setunknown", TyDiv.Missing, 0)
+}
+
+// Ignorance requires BOTH sides to be ignorant, and this is the boundary the ticket is explicit about.
+// Here the tid does not know the element but the flat side confidently claims Int — sv_tp fabricating an
+// element nobody promised. That is the largest divergence class in the corpus and it must stay a cell:
+// "I could not say" against "Int" is not agreement, it is one side making something up.
+test "an unknown tid element against a fabricated flat element is still DIVERGE" {
+    fresh()
+    let list_unknown = make_list_type(tc_unknown_tid())
+    reset_scope_state()
+    reset_ty_divergence()
+    set_var("lu", CT_LIST, 0)
+    set_list_elem_type("lu", CT_INT)
+    set_var_ty("lu", list_unknown)
+    sv_ty_or_flat("lu", "unit.listfabricated")
+    assert_bucket("unit.listfabricated", TyDiv.Diverge, 1)
+    assert_bucket("unit.listfabricated", TyDiv.Unknown, 0)
 }
 
 test "counts are keyed by call site, not pooled" {

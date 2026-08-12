@@ -6120,6 +6120,108 @@ arithmetic that criterion has to survive: writing compiler source *adds rows*, s
 progress is **cells**, per site, on a fixed basis. Rows measure how much of the corpus links the
 compiler.
 
+## The instrument could not say "clean" (br `dyd8fk`)
+
+Every cell above is a codegen defect. This one is a defect in the *measuring device*, and it is the
+reason to stop and fix it mid-stage: Stage 3's exit criterion is "the divergence counter at 0", and the
+comparison the counter is read through could not return 0 for any site holding an under-determined type,
+no matter how correct codegen became.
+
+`ty_tp_same_shape` opened with
+
+    let ct = tk_to_ct(k)
+    if ct == CT_VOID && k != TyKind.Void { return 0 }
+
+and `tk_to_ct` maps `TyKind.Unknown` onto `CT_VOID`. So a tid whose child is an unbound metavar answered
+"different" — including when the flat child was *identically* unbound. Both sides render `?`. They agree,
+and what they agree about is that the element is not yet known. There was nothing in either
+representation to repair.
+
+### The population is one cell, and it is one impl block
+
+    site=emit_fn_params.param  var=self  tid=Set[?]  flat=Set[?]     4595 rows / 919 files
+
+Every row is a `self` param of `impl SetPure for Set` and `impl Sized for Set` in `lib/std/set.bl:23-33`
+— five methods, at `std_set:24,25,26,30,31`. Those impls are written on the un-parameterized `Set`, so
+the element is genuinely unknown at emit time and the flat slot was never filled. The rows appear in any
+program that links the stdlib, which is why the test's probe is `fn main() { io.println("x") }`: it
+declares nothing at all and still produces them.
+
+### "Both unknown means agree" is the wrong fix
+
+Folding these into `agree` would answer the exit criterion by *hiding* the population, and the population
+is the thing `gqg3rk`'s metavar work is measured by. It is a fourth bucket — `TyDiv.Unknown` — visible in
+every `summary` line, conflated with nothing. The published Stage-2 basis format therefore now carries a
+fourth field, appended last so older sweeps stay diffable:
+
+    summary <site> agree=N diverge=N missing=N unknown=N
+
+And the comparison itself became tri-state, because a bucket needs three answers to feed it:
+
+    type TyShape { Same, Differ, Ignorance }
+
+Ignorance propagates upward but **loses to `Differ`**: `Set[?]` against `Set[?]` is Ignorance, while
+`Map[Str, ?]` against `Map[Int, ?]` is a divergence. A parent cannot be cleaner than its worst child, and
+one honest unknown child does not excuse a sibling that disagrees.
+
+### The guard keys on the kind, not on the ctype
+
+The tempting one-line version — treat `CT_VOID` as a wildcard — would have buried two neighbouring
+classes, and both are now pinned by controls in the tests:
+
+* `tid=Set[Int] flat=Set[?]` — the tid knows the element and the flat slot erased it. The whole class is
+  **14 rows across 9 cells** corpus-wide, and the exact shape the ticket names is a **single row**
+  (`at=__main__:55`, one test). A wildcard would silently absorb precisely the findings this census exists
+  to surface: `tid=Map[Str, Set[Int]] flat=Map[Str, Set[?]]` (4 rows) and
+  `tid=Set[Int] flat=Set[Set[?]]` (1) are in that 14.
+* `tid=Fn(Int) -> Int` — `TyKind.Fn`, `Closure`, `Tuple` and `Typevar` all collapse onto `CT_VOID` in
+  `tk_to_ct` as well, but that is not ignorance: those types are fully determined and the flat universe
+  simply cannot spell them. Still a divergence.
+
+So the test is `k == TyKind.Unknown`, placed *before* the erased-slot guard, and never
+`tk_to_ct(k) == CT_VOID`.
+
+`tc_unknown_tid()` is exported for one reason: the unit tests have to be able to *construct* an
+under-determined type to assert the bucket. The global stays private — a test that could assign it could
+invalidate the pool.
+
+### Measured result — the movement is 1:1, and the two sites that moved are named
+
+On the 960-file common basis, exactly two sites changed and the arithmetic closes with no remainder:
+
+    emit_fn_params.param   agree=229688  diverge=27856 -> 23261   unknown=0 -> 4595
+    emit_let_binding.decl  agree=416298 -> 416300  diverge=4930 -> 5035
+
+The first line is the fix: **−4595 diverge, +4595 unknown, agree untouched**. Not one row moved into or
+out of `agree`, which is the property that makes the new bucket a reclassification rather than an
+amnesty. Corpus-wide diverge goes 33348 → 28858 and cells stay at 694: one cell removed
+(`tid=Set[?] flat=Set[?]`), one added.
+
+The added cell is the fix's own source, again. `emit_let_binding.decl` gains 105 rows = **3 new
+enum-typed `let`s × 35 compiler-linking files** — `worst` at `typecheck:13121`, `c` at `:13123`, `shape`
+at `:13163` — all landing on the already-documented family-D `tid=<Enum> flat=Int` class, which is why
+the cell count did not rise by more than the one new spelling `TyShape`. The `+2 agree` is the two new
+`let`s in `tests/test_stage2_ty_divergence.bl`, which links the compiler and is in the basis. Every row
+of the delta is accounted for by name.
+
+That is the second consecutive measurement in this stage where fixing a cell *raised* the row count. It
+is not noise and it does not need suppressing: rows measure how much of the corpus links the compiler,
+cells measure the work.
+
+### Why the test runs `blinkc` instead of asserting on emitted C
+
+The rows are stdlib `self` params, so no emitted C changes at all — this fix moves an integer between two
+counters and nothing else. The witness has to be the instrument's own output, so
+`tests/test_dyd8fk_both_unknown_not_divergence.bl` runs `env BLINK_TRACE_CHANNELS=tydiv build/blinkc` over
+three probe programs and reads the rows: the ticket's row absent from `bucket=diverge`, present under
+`bucket=unknown` with `summary ... unknown=` a *number greater than zero* (a substring match would pass on
+a bucket that exists and is never reached), and the two controls still diverging. The four unit tests in
+`tests/test_stage2_ty_divergence.bl` cover the same four classes at the `sv_ty_or_flat` level, where the
+types can be built by hand instead of coaxed out of the stdlib.
+
+Stage 0's exhaustiveness net did its job here without being asked: adding the fourth `TyDiv` variant made
+the compiler name the three-arm `match` in the test file. That is the whole reason the enum came first.
+
 ## Appendix — all 428 shape cells
 
 Format: `family | occurrences | tid | flat`.

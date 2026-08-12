@@ -823,6 +823,12 @@ pub fn make_set_type(elem_type: Int) -> Int {
     ty_intern_simple(TyKind.Set, "Set", elem_type, -1)
 }
 
+// Read-only, and exported for one reason: the divergence instrument's unit tests have to be able to
+// BUILD an under-determined type to assert the Unknown bucket (br dyd8fk), and its three neighbouring
+// classes — erased-flat, known-tid, kind-mismatch — are already pinned by unit tests right beside it.
+// The global itself stays private; a test that could assign it could invalidate the pool.
+pub fn tc_unknown_tid() -> Int { TYPE_UNKNOWN }
+
 // The two one-inner runtime carriers (br vag3wc). Until these existed, `new_type` was never
 // called with TyKind.Handle or TyKind.Channel, so an annotation naming one fell through
 // resolve_type_ann to `make_typevar(name)` — a bare typevar wearing the type's name. Codegen
@@ -12912,13 +12918,22 @@ fn tk_to_ct(kind: TyKind) -> Int {
 // lowering work. Pooling them into one number would conflate the two, so they are separate
 // buckets, and both are keyed by site because Stage 3's exit criterion — the counter at 0 —
 // has to be worked through site by site.
-pub type TyDiv { Agree, Diverge, Missing }
+//
+// Unknown is the fourth answer, and it exists because the counter is an exit criterion (br dyd8fk).
+// Both representations can agree that a type is under-determined — a tid whose child is an unbound
+// metavar against a flat slot that was never filled — and there is nothing in either one to repair.
+// Counting that as Diverge made every site holding an under-determined type unable to read 0 no matter
+// how correct codegen was; counting it as Agree would answer the criterion by hiding the population.
+// It is agreement about ignorance, so it is its own bucket: visible, shrinkable by the metavar work
+// (gqg3rk), and not confused with a representation defect.
+pub type TyDiv { Agree, Diverge, Missing, Unknown }
 
 type TyDivRow {
     site: Str
     agree: Int
     diverge: Int
     missing: Int
+    unknown: Int
 }
 // Deliberately NOT reset by reset_scope_state: that runs per function, and a per-function
 // counter cannot answer a whole-corpus sweep. Reset is explicit only.
@@ -12940,7 +12955,7 @@ fn ty_div_find(site: Str) -> Int {
 fn ty_div_bump(site: Str, b: TyDiv) {
     let idx = ty_div_find(site)
     if idx < 0 {
-        ty_div_rows.push(TyDivRow { site: site, agree: 0, diverge: 0, missing: 0 })
+        ty_div_rows.push(TyDivRow { site: site, agree: 0, diverge: 0, missing: 0, unknown: 0 })
         ty_div_bump(site, b)
         return
     }
@@ -12949,6 +12964,7 @@ fn ty_div_bump(site: Str, b: TyDiv) {
         TyDiv.Agree => { ty_div_rows.set(idx, TyDivRow { agree: r.agree + 1, ..r }) }
         TyDiv.Diverge => { ty_div_rows.set(idx, TyDivRow { diverge: r.diverge + 1, ..r }) }
         TyDiv.Missing => { ty_div_rows.set(idx, TyDivRow { missing: r.missing + 1, ..r }) }
+        TyDiv.Unknown => { ty_div_rows.set(idx, TyDivRow { unknown: r.unknown + 1, ..r }) }
     }
 }
 
@@ -12962,6 +12978,7 @@ pub fn ty_divergence_count(site: Str, b: TyDiv) -> Int {
         TyDiv.Agree => return r.agree
         TyDiv.Diverge => return r.diverge
         TyDiv.Missing => return r.missing
+        TyDiv.Unknown => return r.unknown
     }
 }
 
@@ -12980,7 +12997,9 @@ pub fn ty_divergence_rows() -> List[Str] {
     let mut i = 0
     while i < ty_div_rows.len() {
         let r = ty_div_rows.get(i).unwrap()
-        out.push("{r.site} agree={r.agree} diverge={r.diverge} missing={r.missing}")
+        // `unknown=` is appended LAST so a sweep taken before br dyd8fk stays diffable against one taken
+        // after: every script that reads this line keys on `<field>=` and ignores fields it does not know.
+        out.push("{r.site} agree={r.agree} diverge={r.diverge} missing={r.missing} unknown={r.unknown}")
         i = i + 1
     }
     out
@@ -13057,32 +13076,59 @@ fn tp_cmp_child(tp: Int, i: Int) -> Int {
 //   * Struct / Enum do not recurse. The flat universe has no slot for type arguments; what
 //     it has is the mono STEM baked into sname (`Box_Int`), so the args are compared there
 //     or nowhere. Recursing would report a cell for every non-generic struct.
-fn ty_tp_same_shape(tid0: Int, tp: Int, depth: Int) -> Int {
+// The comparison's three answers (br dyd8fk). Differ is a cell to fix; Ignorance is the two
+// representations agreeing that a type is under-determined, which is not a cell and not a match.
+//
+// Ignorance propagates UPWARD but loses to Differ: `Set[?]` against `Set[?]` is Ignorance, `Map[Str, ?]`
+// against `Map[Int, ?]` is Differ. A parent cannot be cleaner than its worst child, and one honest
+// unknown child does not excuse a sibling that disagrees.
+type TyShape { Same, Differ, Ignorance }
+
+fn ty_tp_same_shape(tid0: Int, tp: Int, depth: Int) -> TyShape {
     // A cycle cannot occur in an interned acyclic pool; the cap is against a corrupted
     // slot, and it answers "same" so a defensive stop can never invent a cell.
-    if depth > 12 { return 1 }
-    if tp < 0 { return 0 }
+    if depth > 12 { return TyShape.Same }
     let tid = tc_resolve(tid0)
-    if tid < 0 || tid >= ty_pool.len() { return 0 }
+    if tid < 0 || tid >= ty_pool.len() { return TyShape.Differ }
     let t = ty_pool.get(tid).unwrap()
     let k = t.kind
+    // Ignorance is tested BEFORE the erased-slot guard below, and it is the only case in which a
+    // `tp < 0` is not a divergence. The order is the whole fix: an absent flat slot against a tid that
+    // NAMED the type stays a cell (mv45y5 made that erasure honest, not correct), while an absent flat
+    // slot against a tid that is itself unknown is two representations saying the same thing.
+    //
+    // Keyed on the KIND being Unknown, deliberately not on tk_to_ct answering CT_VOID. Tuple, Fn,
+    // Closure and Typevar collapse onto CT_VOID too, and none of them is ignorance: those types are
+    // determined and the flat universe simply cannot spell them, which is exactly the divergence this
+    // instrument exists to count.
+    if k == TyKind.Unknown {
+        if tp < 0 { return TyShape.Ignorance }
+        return TyShape.Differ
+    }
+    if tp < 0 { return TyShape.Differ }
     let ct = tk_to_ct(k)
-    if ct == CT_VOID && k != TyKind.Void { return 0 }
-    if ct != tp_get_kind(tp) { return 0 }
+    if ct == CT_VOID && k != TyKind.Void { return TyShape.Differ }
+    if ct != tp_get_kind(tp) { return TyShape.Differ }
     if k == TyKind.Struct || k == TyKind.Enum {
         let sn = tp_get_sname(tp)
-        if sn == t.name { return 1 }
+        if sn == t.name { return TyShape.Same }
         let stem = tc_tid_struct_mono_name(tid)
-        if stem != "" && sn == stem { return 1 }
-        return 0
+        if stem != "" && sn == stem { return TyShape.Same }
+        return TyShape.Differ
     }
     let n = tc_tid_child_count(tid)
     let mut i = 0
+    let mut worst = TyShape.Same
     while i < n {
-        if ty_tp_same_shape(tc_tid_child(tid, i), tp_cmp_child(tp, i), depth + 1) == 0 { return 0 }
+        let c = ty_tp_same_shape(tc_tid_child(tid, i), tp_cmp_child(tp, i), depth + 1)
+        match c {
+            TyShape.Differ => { return TyShape.Differ }
+            TyShape.Ignorance => { worst = TyShape.Ignorance }
+            TyShape.Same => { }
+        }
         i = i + 1
     }
-    1
+    worst
 }
 
 // The Stage 2 seam, and the one Stage 3 flips. Answers the authoritative tid for `name`, or
@@ -13114,12 +13160,21 @@ pub fn sv_ty_or_flat_at(name: Str, site: Str, node: Int) -> Int {
         return -1
     }
     let tp = get_var_tp(name)
-    if ty_tp_same_shape(tid, tp, 0) == 1 {
-        ty_div_bump(site, TyDiv.Agree)
-        return tid
+    let shape = ty_tp_same_shape(tid, tp, 0)
+    match shape {
+        TyShape.Same => { ty_div_bump(site, TyDiv.Agree) }
+        // Traced as well as counted. The population is meant to be attributable — which declaration is
+        // under-determined, at which site — because that is how it gets shrunk. Silence would make it
+        // an unfalsifiable claim that the remaining rows are harmless.
+        TyShape.Ignorance => {
+            ty_div_bump(site, TyDiv.Unknown)
+            ty_div_trace(site, "unknown", name, tid, tp, node)
+        }
+        TyShape.Differ => {
+            ty_div_bump(site, TyDiv.Diverge)
+            ty_div_trace(site, "diverge", name, tid, tp, node)
+        }
     }
-    ty_div_bump(site, TyDiv.Diverge)
-    ty_div_trace(site, "diverge", name, tid, tp, node)
     tid
 }
 

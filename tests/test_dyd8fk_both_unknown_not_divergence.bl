@@ -1,0 +1,137 @@
+// br dyd8fk: the tydiv comparison called an equally-unknown child a divergence, so no site holding an
+// under-determined type could ever read 0. That matters because the divergence counter is the stated
+// exit criterion for Stage 3 of the tid collapse — an instrument that cannot report "clean" cannot be
+// used to decide when the work is done.
+//
+// The mechanism, in ty_tp_same_shape:
+//
+//     let ct = tk_to_ct(k)
+//     if ct == CT_VOID && k != TyKind.Void { return 0 }
+//
+// tk_to_ct maps TyKind.Unknown onto CT_VOID, so the guard answered "different" for a tid whose child is
+// under-determined even when the flat side is identically under-determined. Both sides render `?`, they
+// agree that the element is unknown, and there was nothing in either representation to repair.
+//
+// The whole corpus population was one cell — `tid=Set[?] flat=Set[?]`, 4595 rows across 919 files — and
+// every row is a `self` param of the un-parameterized `impl SetPure for Set` / `impl Sized for Set` in
+// lib/std/set.bl. That is why the probe below is a program that declares nothing: the rows come from
+// the stdlib, so any compile produces them.
+//
+// The fix must NOT be "treat CT_VOID as a wildcard". Two neighbouring classes have to keep diverging,
+// and both are asserted here:
+//   * tid=Set[Int] flat=Set[?] — the tid knows the element and the flat slot erased it. A real cell,
+//     and one of only 14 rows corpus-wide, which is exactly the kind of finding a wildcard would bury.
+//   * tid=Fn(Int) -> Int — Fn also collapses onto CT_VOID in tk_to_ct, but that is not ignorance: the
+//     type is fully known and the flat universe simply cannot spell it. Still a divergence.
+
+import std.process.{ProcessResult}
+
+// Declares nothing. The target rows are stdlib `self` params, so this is the smallest program that
+// produces them, and it also proves the class is not something a user program has to opt into.
+let BARE_SRC: Str = #"fn main() { io.println("x") }
+"#
+
+// A generic fn instantiated at Set[Int]: the param's tid carries the element, the flat slot lost it.
+// tid knows more than flat, so the two do not agree about ignorance and this must stay a divergence.
+let ASYMMETRIC_SRC: Str = #"fn wrap[T](x: T) -> Int { 1 }
+
+fn main() {
+    let mut s: Set[Int] = Set()
+    s.insert(3)
+    io.println("{wrap(s)}")
+}
+"#
+
+// A closure param. TyKind.Fn maps to CT_VOID as well, and the flat side spells a C function pointer,
+// so the two representations genuinely disagree about a type that is fully determined.
+let CLOSURE_SRC: Str = #"fn hof(f: fn(Int) -> Int) -> Int { f(1) }
+
+fn main() {
+    let r = hof(fn(x: Int) -> Int { x + 1 })
+    io.println("{r}")
+}
+"#
+
+fn probe_path() -> Str { "build/dyd8fk_probe.bl" }
+
+fn run_tydiv(src: Str) -> ProcessResult {
+    write_file(probe_path(), src)
+    let r = process_run("sh", ["-c", "env BLINK_TRACE_CHANNELS=tydiv build/blinkc {probe_path()} build/dyd8fk_probe.c 2>&1"])
+    fs.remove(probe_path())
+    r
+}
+
+fn have_blinkc() -> Bool {
+    file_exists("build/blinkc") == 1
+}
+
+// The summary field for one site, or -1 when the site or the field is absent. Reading the count and not
+// merely the substring is what separates "the bucket exists" from "the bucket is reached".
+fn summary_field(out: Str, site: Str, field: Str) -> Int {
+    for line in out.split("\n") {
+        if line.contains("summary {site} ") {
+            for tok in line.split(" ") {
+                if tok.starts_with("{field}=") {
+                    return tok.slice(field.len() + 1, tok.len()).to_int()
+                }
+            }
+        }
+    }
+    -1
+}
+
+test "an equally-unknown child is not a divergence" {
+    if !have_blinkc() {
+        skip("build/blinkc is not present in this working tree")
+        return
+    }
+    let r = run_tydiv(BARE_SRC)
+    assert_eq(r.exit_code, 0)
+    assert(!r.out.contains("error["))
+    // The ticket's row, verbatim. Both sides spell `?`; calling that a divergence is the defect.
+    assert(!r.out.contains("bucket=diverge site=emit_fn_params.param var=self tid=Set[?] flat=Set[?]"))
+}
+
+test "agreement about ignorance is reported, not folded into agree" {
+    if !have_blinkc() {
+        skip("build/blinkc is not present in this working tree")
+        return
+    }
+    let r = run_tydiv(BARE_SRC)
+    assert_eq(r.exit_code, 0)
+    // Counting these as `agree` would answer the exit criterion by hiding the population. They are a
+    // fourth bucket: the two representations agree, but they agree only about not knowing, and the
+    // gqg3rk metavar work is measured by watching this number shrink.
+    assert(r.out.contains("bucket=unknown site=emit_fn_params.param var=self tid=Set[?] flat=Set[?]"))
+    let unk = summary_field(r.out, "emit_fn_params.param", "unknown")
+    assert(unk > 0)
+    // And the rows must have moved rather than been duplicated: the same occurrences cannot be both.
+    let dv = summary_field(r.out, "emit_fn_params.param", "diverge")
+    assert(dv >= 0)
+    assert(!r.out.contains("bucket=diverge site=emit_fn_params.param var=self tid=Set[?] flat=Set[?]"))
+}
+
+test "a flat slot that erased an element the tid knows still diverges" {
+    if !have_blinkc() {
+        skip("build/blinkc is not present in this working tree")
+        return
+    }
+    let r = run_tydiv(ASYMMETRIC_SRC)
+    assert_eq(r.exit_code, 0)
+    assert(!r.out.contains("error["))
+    // Only one side is ignorant here. Answering `unknown` would lose a real erasure.
+    assert(r.out.contains("bucket=diverge site=emit_fn_params.param var=x tid=Set[Int] flat=Set[?]"))
+}
+
+test "a closure param still diverges, because Fn is known and not unknown" {
+    if !have_blinkc() {
+        skip("build/blinkc is not present in this working tree")
+        return
+    }
+    let r = run_tydiv(CLOSURE_SRC)
+    assert_eq(r.exit_code, 0)
+    assert(!r.out.contains("error["))
+    // TyKind.Fn also collapses onto CT_VOID. The fix keys on the KIND being Unknown, not on the ctype
+    // being CT_VOID, and this is the control that pins that distinction.
+    assert(r.out.contains("bucket=diverge site=emit_fn_params.param var=f tid=Fn(Int) -> Int"))
+}
