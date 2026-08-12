@@ -4308,6 +4308,201 @@ source: the op's `node_type_ann` through `resolve_type_ann` (`typecheck.bl:2357`
 `{handle}.{op}`, walking `node_elements(effect_decl)` → `node_methods(sub_effect)` exactly as
 codegen does.
 
+## Stage 3a — `c_type_from_tid`, and the second counter
+
+Date: 2026-08-12. `task regen` green ×3; the flat fields still govern every emit decision, so
+no emitted C changes in this sub-step.
+
+**Where the function had to live, and a correction to the plan.** The plan sub-divides Stage 3
+"by file, one regen each: `codegen_types` → `codegen_stmt` → …". That first step is impossible
+as literally written: `codegen_types.bl` does **not** import typecheck (typecheck imports
+`codegen_types`), so a recursive speller over `TyKind` cannot be written there at all. It lives
+in `src/typecheck.bl`, next to the Stage 1 accessors it is built from, and codegen imports it —
+which is the correct direction anyway: the tid is typecheck's, and the point of the collapse is
+that codegen *reads* types instead of deriving them.
+
+### Why a second instrument, when Stage 2 already has one
+
+`tydiv` compares two **representations** and asks whether they have the same shape.
+`ctypediv` compares the two **C strings** an emit site could print. Those are different
+questions and neither implies the other:
+
+- A cell can agree structurally and disagree on spelling. `Result[TcpSocket, NetError]` has one
+  shape, and the two spellers produced `blink_Result_std_net_tcp_TcpSocket_std_net_error_NetError`
+  and `blink_Result_..._std_net_error_std_net_error_NetError`. tydiv calls that **agree**.
+- A cell can diverge structurally and agree on spelling — every `Map[K, V]` whose flat side
+  erased `V`, because a Map is `blink_map*` whatever it holds.
+
+Only the string comparison answers the question a flip actually turns on: *if authority moved to
+the tid at this site, would the emitted C change?* Stage 3's exit criterion is about emitted C,
+so it needs the string counter.
+
+**Implementation note (why the two counters share a table but not a gate).** `ctypediv` rows
+land in the same `ty_div_rows` table under a `ctype.` site prefix, but the *bump* is gated on
+`dbg_channel_on("ctypediv")` — unlike tydiv's unconditional bump. Without that asymmetry a
+tydiv-only sweep would silently accumulate ctype rows into its own published summary lines and
+every earlier tydiv total in this document would stop being reproducible. `ty_divergence_dump`
+now fires when *either* channel is on and routes each row to the channel matching its site
+prefix, because `dbg_trace` gates on its own channel argument.
+
+### Totals
+
+874-file corpus (`tests/` + `examples/` + `src/`), archive-linked, probing
+`emit_let_binding`'s nine declaration branches after `tc_tid_subst_mono`:
+
+```
+site                     agree     diverge  decline
+ctype.flat               350000    981      82
+ctype.struct             19262     8        141
+ctype.option             1652      0        0
+ctype.result             291       0        4
+ctype.enum               123       0        0
+ctype.ptr_ffi            169       0        0
+ctype.ptr_ann            78        0        0
+ctype.enum_mono          0         0        16
+ctype.handler            0         0        7
+ctype.void_placeholder   0         6        0
+TOTAL                    371575    995      250
+```
+
+**395,253 of 396,603 cells — 99.66% — agreed on the first draft**, and the entire remainder is
+1245 rows in ten buckets. That number is the point of the sub-step: the flat representation is
+not mostly wrong, it is *narrowly* wrong, and the narrow part is now a list.
+
+### The 1245, classified five ways
+
+The classification matters more than the count, because the five classes have five different
+dispositions and lumping them would have produced a wrong plan for four of them.
+
+| | class | rows | disposition |
+|---|---|---:|---|
+| i | **the tid is right and the flat is wrong** | 973 | fix by flipping — br `0rmamy` |
+| ii | **my speller was wrong** | 40 | already fixed, below |
+| iii | by-design declines (mono spelling is a separate seam) | 164 | keep declining |
+| iv | family-A residue (`tid=?`) | 87 | blocked on the four held causes |
+| v | known and documented | 21 | no action |
+
+**(i) 973 rows where the tid is right.** 868 `TyKind` + 96 `TokenKind` + 1 `Color`: an
+unannotated local holding a unit-only enum is declared `int64_t` when the enum has a real
+typedef (`blink_typecheck_TyKind`). Plus 7 `Ptr` rows where the tid knows the pointee
+(`uint8_t*`, `int64_t*`) and the flat path answers `void*`, and 1 `U64` declared `int64_t`.
+These are *not* miscompiles today — C's integer conversions absorb an enum-as-int64 and a
+`void*` round-trip — which is exactly why they survived: the flat path is wrong in the way
+that stays quiet until something starts depending on the type. They are the natural first
+authority flip, filed as br `0rmamy` with the enum bucket as its red/green witness.
+
+**(ii) 40 rows where my speller was wrong — and this is the sub-step's real payoff.**
+
+*37 doubly-module-prefixed carriers.* I first spelled a carrier `c_type_c_name(tag)`. That
+routes the tag through `canonical_struct_tag`, which splits `Result_<ok>_<err>` by **scanning
+backwards for an underscore** and re-applies `c_type_tag_for_struct` to each half. The grammar
+is ambiguous the moment either half carries a module prefix — prefixes contain underscores — so
+an already-prefixed half gets prefixed again:
+`Result_std_net_tcp_TcpSocket_std_net_error_NetError` came back as
+`..._std_net_error_std_net_error_NetError`. 37 rows across `std.net` / `std.db` / `std.errno`,
+**every one of them a C type that was never typedef'd**. `tc_tid_inner_tag` already emits the
+canonical, alias-hopped, module-qualified tag, so the fix is to prefix and nothing else:
+`"blink_{tag}"`. Re-measured: `ctype.result` diverge **37 → 0**, agree 254 → 291.
+The underlying `canonical_struct_tag` defect is real and still there — br `rb5hsv`, latent,
+**worked around here, not fixed**.
+
+*3 transparent-newtype rows.* `type Errno(Int)` lowers to a bare `int64_t` by panel decision
+(br `ja9jev`, 6-0, "transparent / zero-cost"). `tc_alias_underlying` has no entry for it — it is
+a real single-variant enum declaration, not an alias — so the alias hop cannot see it, and the
+speller answered `blink_Errno`: the boxed tagged struct that decision exists to avoid. Fixed by
+consulting codegen's own `is_transparent_newtype` gate rather than re-deriving the rule, so the
+two cannot drift. Re-measured: those rows gone, `ctype.flat` agree +3.
+
+**Had I flipped authority at this seam without measuring first, I would have emitted ~40
+references to never-typedef'd C types across three stdlib modules.** Both mistakes were mine,
+both were invisible to reasoning about the code, and both were caught by a counter that costs
+nothing to run because it compares strings without printing them. That is the whole argument
+for the measure-then-flip ordering, and it is now an observation rather than a claim.
+
+**(iii) 164 by-design declines.** 141 generic struct instances (`Box[Int]` → the mono registry
+owns `blink_Box_0Int`; the sweep prints the exact target spelling, which is what makes the next
+seam cheap), 16 monomorphised generic enums, 7 effect handlers (`blink_io_vtable*`). A decline
+is an *answer*: the caller keeps what it does today rather than trading one wrong C type for
+another. The same contract, for the same reason, as `tc_channel_elem_ct`'s `-1`.
+
+**(iv) 87 family-A rows** where the tid itself is `?` — 83 `flat` + 4 `result`. Not spelling
+defects; they are the four remaining family-A causes, all held on decisions
+(`qzdz2e` panel, `w3v2e6` blocked on `8vcj2c`, `jr4xf7` and `mwsy85` `type:spec`).
+
+**(v) 21 known rows, no action.** 6 Void placeholders (a *storage*-position rule: a `Void` local
+still needs a slot, so `int64_t` is right and `void` would not compile — br `hsgsbp`); 3 more
+`Void`-vs-`int64_t` at `.pop()`/`.clear()`, where typecheck and codegen genuinely disagree about
+the method's return type; 5 `ty=Int tidc=int64_t emitted=int` at `src/codegen.bl:452`, a
+`Bool + Bool` sum typed `Int` by typecheck and emitted in an `int` slot; and 8 generic-fn tuple
+returns, below.
+
+### The eight tuple rows are a convention, not a collision
+
+`(Map[Str, Int], Int)` spelled `blink_Tuple2_Map_str_int_int` from the tid and
+`blink_Tuple2_map_int` from the flat path. I read that as a stem collision with miscompile
+potential and it is not — corrected by *running* three MVCEs rather than by re-reading the code:
+
+- Every corpus site is `wrap[T](x: T) -> (T, Int)`. A generic fn's tuple return monomorphises
+  to the erased stem `Tuple2_map_int` for **every** Map key/value combination, and the tests
+  pass, because a Map is one runtime type: all those instantiations want the same C struct.
+- A **directly constructed** tuple emits the structural `blink_Tuple2_Map_str_int_int` instead.
+- The read-back failure I initially took for the collision's symptom
+  (`UnresolvedMethod … on type ?`) reproduces with a **single** tuple and no second
+  instantiation anywhere, so it is a pre-existing loud gap, not a collision.
+
+Two live conventions, both sound, and a Stage-3 flip must not quietly unify them: flipping the
+generic-fn path onto the structural spelling would fragment one C struct into N identical ones.
+Documented as a flip constraint; no ticket.
+
+### A hole the sweep could not see, found by writing the test
+
+A typevar inner is the one unspellable tag that is **not** an ICE sentinel: `tc_tid_tag_at`
+answers a bare `"<tv>"` for a `Typevar` — an unsubstituted `T` inside a generic body is normal,
+not an internal error — and the Option/Result/Tuple arms interpolate it. So
+`c_type_from_tid(Option[T])` returned **`blink_Option_<tv>`**, which is not a C identifier at
+all, and `diag_is_ice_seg` cannot catch it by construction.
+
+The corpus never produced that row, because `emit_let_binding` substitutes mono tparams before
+probing. Zero occurrences over 874 files, and the shape was still wrong — the textbook case of
+`feedback_corpus_sweep_is_not_coverage`: **a zero-hit tap is an unexercised tap, not a safety
+fact.** It was found by enumerating what the test file should assert, which is the argument for
+writing the pin test even at a seam where authority has not moved yet. Guard added, red
+demonstrated by removing it (`got 'blink_Option_<tv>', want ''`), green with it.
+
+### What pins this
+
+`tests/test_ctype_from_tid_spelling.bl` — 18 rows over the reachable spellings (scalars, sized
+ints, containers, runtime-backed kinds, carriers, depth ≥ 2 nesting, Ptr recursion, Void, bare
+struct/enum delegation) and the decline contract (metavar, generic instance, typevar, carrier
+over a typevar, carrier over a metavar), plus two rows that exist because they are
+counter-intuitive:
+
+- **decline is not contagious.** `Map[Str, T]` still spells `blink_map*`. A container's C type
+  does not depend on its element, so an unspellable element must not propagate a decline
+  outward — getting that wrong would silently drop every `Map[Str, T]` in a generic body back
+  to the flat path, and no assertion about declines could see it.
+- **a container inside a carrier erases its element; a Map does not.** `Option[List[Str]]` and
+  `Option[List[Int]]` deliberately share **one** typedef `blink_Option_list`, while
+  `Option[Map[Str,Int]]` and `Option[Map[Int,Str]]` get two byte-identical-but-for-the-name
+  typedefs. I expected the structural spelling for both; the test said otherwise and the
+  *spelling* is right. Pinned rather than "corrected".
+
+Three cells are not reachable from a `check_types`-only harness and say so in the file, with the
+sweep named as their evidence instead of an assertion loosened into a tautology: the
+module-prefixed spelling of a bare struct (`c_type_c_name` consults a registry populated during
+emit — 19,262 agreeing `ctype.struct` rows), the transparent-newtype arm
+(`is_transparent_newtype`'s shape gate reads codegen's `enum_variants`, empty there), and
+`Ptr` against a real ffi pointee (`ctype.ptr_ann` 78, `ctype.ptr_ffi` 169).
+
+### Tickets
+
+- br `0rmamy` — filed. Unannotated unit-only-enum local declared `int64_t` instead of its
+  typedef (965 rows), plus 7 `Ptr` rows losing a known pointee and 1 `U64`. The first authority
+  flip's witness.
+- br `rb5hsv` — filed. `canonical_struct_tag`'s underscore-split grammar double-prefixes a
+  module-qualified carrier half. Latent (no caller reaches it with such a tag today);
+  worked around in `c_type_from_tid`, not fixed.
+
 ## Appendix — all 428 shape cells
 
 Format: `family | occurrences | tid | flat`.

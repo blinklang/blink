@@ -109,7 +109,7 @@ import diagnostics.{
 import pkg.manifest.{manifest_header_is_declared, manifest_name}
 import compiler.{trace}
 import stdlib_native_deps.{stdlib_native_dep_name_by_ffi_symbol}
-import typecheck.{sv_ty_or_flat_at, is_builtin_fn, is_import_module_name, tc_channel_elem_ct, tc_channel_elem_struct, tc_lookup_node_tid, tc_tid_struct_mono_name, tc_tid_struct, tc_tid_is_enum, tc_tid_struct_arg_count, tc_tid_struct_arg_tid, tc_tid_struct_slot_seg, tc_struct_slot_encodable, tc_tid_result_ok_tid, tc_tid_result_err_tid, tc_tid_option_inner_tid, tc_tid_tuple_arity, tc_tid_tuple_elem_tid, tc_tid_to_c_tag}
+import typecheck.{sv_ty_or_flat_at, ctype_probe_at, tc_tid_subst_mono, is_builtin_fn, is_import_module_name, tc_channel_elem_ct, tc_channel_elem_struct, tc_lookup_node_tid, tc_tid_struct_mono_name, tc_tid_struct, tc_tid_is_enum, tc_tid_struct_arg_count, tc_tid_struct_arg_tid, tc_tid_struct_slot_seg, tc_struct_slot_encodable, tc_tid_result_ok_tid, tc_tid_result_err_tid, tc_tid_option_inner_tid, tc_tid_tuple_arity, tc_tid_tuple_elem_tid, tc_tid_to_c_tag}
 
 fn strip_outer_parens(s: Str) -> Str {
     if s.starts_with("(") && s.ends_with(")") {
@@ -3748,7 +3748,14 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
     // Without it a row identifies only the variable and the ENTRY file, and neither locates the
     // `let`: every test compile re-emits the whole stdlib, so one stdlib binding is blamed on
     // ~90 entry files at once.
-    sv_ty_or_flat_at(name, "emit_let_binding.decl", node)
+    let decl_tid = sv_ty_or_flat_at(name, "emit_let_binding.decl", node)
+    // Stage 3 measurement, the string twin of the line above. Each arm of the chain below
+    // records the C TYPE it printed and which arm printed it; the ctypediv probe after the
+    // chain compares that against c_type_from_tid's answer for the same variable. The flat
+    // fields still govern every branch — nothing here changes what is emitted — so the cell
+    // map that comes out is the enumerated list of what the authority flip would change.
+    let mut decl_c = ""
+    let mut decl_branch = ""
     // br 296hpm: a genuine Void RHS (`let x = nothing()`, a Void-typed field
     // read, a generic fn returning its Void type argument) must not decay to
     // `const void x = ...;` -- illegal C, since `()` is DECISIONS.md:342's
@@ -3798,6 +3805,12 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
         if val_str != "" && val_str != "0" {
             emit_line("(void){val_str};")
         }
+        // The placeholder, not a type: a genuine `void` local is illegal C, so this arm is a
+        // POSITION rule (c_field_type_str owns the same rule for a field). c_type_from_tid
+        // answers "void" here and that disagreement is the rule working, not a defect —
+        // which is exactly why the probe is keyed by branch.
+        decl_c = "int64_t"
+        decl_branch = "void_placeholder"
         if is_mut != 0 {
             emit_line("int64_t {cname} = 0;")
         } else {
@@ -3808,6 +3821,8 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
         let opt_inner_s = get_var_option_inner_struct(name)
         let opt_c_inner = opt_inner
         let opt_c = option_c_type_mixed(opt_c_inner, opt_inner_s)
+        decl_c = opt_c
+        decl_branch = "option"
         if val_str.ends_with("\{.tag = 0}") {
             val_str = "({opt_c})\{.tag = 0}"
         }
@@ -3822,6 +3837,8 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
         let rok_s = get_var_result_ok_struct(name)
         let rerr_s = get_var_result_err_struct(name)
         let res_c = result_c_type_mixed(rok, rerr, rok_s, rerr_s)
+        decl_c = res_c
+        decl_branch = "result"
         if is_mut != 0 {
             emit_line("{res_c} {cname} = {val_str};")
         } else {
@@ -3831,6 +3848,8 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
         // Declare with the mono instance C type (blink_Tree_Int) when the RHS was a
         // generic-enum construction; else the bare enum type (jjhnf3).
         let enum_decl = if enum_mono != "" { enum_mono } else { enum_type }
+        decl_c = c_type_c_name(enum_decl)
+        decl_branch = if enum_mono != "" { "enum_mono" } else { "enum" }
         if is_mut != 0 {
             emit_line("{c_type_c_name(enum_decl)} {cname} = {val_str};")
         } else {
@@ -3838,12 +3857,17 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
         }
     } else if val_type == CT_HANDLER {
         let h_vtt = get_var_handler_vtable_type(name)
+        decl_branch = "handler"
         if h_vtt != "" {
+            decl_c = "{h_vtt}*"
             emit_line("{h_vtt}* {cname} = ({h_vtt}*){val_str};")
         } else {
+            decl_c = "void*"
             emit_line("void* {cname} = {val_str};")
         }
     } else if struct_type != "" {
+        decl_c = c_type_c_name(struct_type)
+        decl_branch = "struct"
         if is_mut != 0 {
             emit_line("{c_type_c_name(struct_type)} {cname} = {val_str};")
         } else {
@@ -3855,17 +3879,28 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
         if pelems != -1 && sublist_length(pelems) > 0 {
             ptr_c_type = "{ptr_inner_c_type(node_name(sublist_get(pelems, 0)))}*"
         }
+        decl_c = ptr_c_type
+        decl_branch = "ptr_ann"
         emit_line("{ptr_c_type} {cname} = {val_str};")
     } else if val_type == CT_PTR && ffi_offset_pending_struct != "" {
+        decl_c = "{c_type_c_name(ffi_offset_pending_struct)}*"
+        decl_branch = "ptr_ffi"
         emit_line("{c_type_c_name(ffi_offset_pending_struct)}* {cname} = {val_str};")
     } else {
         let ts = c_type_str(val_type)
+        decl_c = ts
+        decl_branch = "flat"
         if is_mut != 0 || val_type == CT_STRING || val_type == CT_LIST || val_type == CT_MAP || val_type == CT_SET || val_type == CT_BYTES || val_type == CT_CLOSURE || val_type == CT_ITERATOR || val_type == CT_HANDLE || val_type == CT_CHANNEL || val_type == CT_PTR || val_type == CT_STRINGBUILDER || val_type == CT_FFI_SCOPE {
             emit_line("{ts} {cname} = {val_str};")
         } else {
             emit_line("const {ts} {cname} = {val_str};")
         }
     }
+    // The tid is substituted through the enclosing monomorphisation first, exactly as every
+    // other tid consumer in codegen does: inside a mono'd generic fn a local's memoized tid is
+    // still the typevar `T`, which c_type_from_tid rightly declines, and measuring that as a
+    // decline would report the mono machinery as a hole in the speller.
+    ctype_probe_at(tc_tid_subst_mono(decl_tid, cg_mono_tparams_sl, cg_mono_arg_tids), decl_branch, name, decl_c, node)
     ffi_offset_pending_struct = ""
     if name.starts_with("_") {
         emit_line("(void){cname};")

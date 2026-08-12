@@ -1,0 +1,357 @@
+// Stage 3a of the tid collapse (decisions/compiler-type-representation.md Q2, 5-0;
+// docs/plans/2026-08-11-tid-collapse-stage2-divergence-map.md): `c_type_from_tid` — one
+// recursive speller over TyKind that answers the C type of a tid.
+//
+// WHY THIS FUNCTION EXISTS. codegen's `c_type_str` is a flat `if` chain over a single CT_*
+// integer, so it can only answer types whose C spelling does not depend on their children.
+// Every type whose spelling DOES depend on its children (Option, Result, Tuple, Ptr) needs a
+// separate hand-written side channel carrying that child — which is exactly what the flat
+// `(CT_*, sname)` pair cannot hold past depth 1, and exactly what generated 100+ tickets
+// across nqq29j / ng2qd3 / 03p551. This reads children off the interned tree, so depth stops
+// being a per-cell engineering problem.
+//
+// WHAT THIS TEST IS FOR, precisely: it pins the SPELLINGS and the DECLINES. It is not a
+// coverage claim. Authority has not been flipped yet — every emit site still lets the flat
+// fields govern — so the evidence that this speller AGREES with the emitters comes from the
+// ctypediv counter over the 874-file corpus (395,253/396,603 = 99.66% agree on the first
+// draft), not from these rows. The two are complementary and neither substitutes for the
+// other: the corpus measures the corpus (feedback_corpus_sweep_is_not_coverage), and these
+// rows construct shapes the corpus does not contain and pin answers a sweep can only count.
+//
+// THE DECLINE IS PART OF THE ANSWER. "" means "I cannot spell this tid faithfully", and a
+// caller must then keep whatever it does today rather than trade one wrong C type for
+// another. Half B pins each decline class, because a decline that silently becomes a
+// spelling is precisely how a never-typedef'd C type reaches the C compiler.
+//
+// TWO ROWS HERE ARE MEASURED CORRECTIONS, not preferences — the speller was WRONG and the
+// sweep said so before any authority flip could emit the mistake:
+//   1. Result/Option carriers must be spelled "blink_{tag}" and NOT c_type_c_name(tag).
+//      c_type_c_name routes a carrier tag through canonical_struct_tag, which splits
+//      `Result_<ok>_<err>` by scanning for an underscore — an ambiguous grammar the moment
+//      either half carries a module prefix (prefixes contain underscores), so it re-applies
+//      the prefix and DOUBLES it. 37 corpus rows across std.net / std.db / std.errno, every
+//      one naming a C type that was never typedef'd. Half A's cross-module row pins the fix;
+//      the underlying canonical_struct_tag defect is br rb5hsv (latent, worked around here).
+//   2. A transparent NEWTYPE (`type Errno(Int)`, br ja9jev 6-0) lowers to a bare int64_t, so
+//      spelling it `blink_Errno` would name the boxed tagged struct the transparency decision
+//      exists to avoid. See the reachability note below — that arm is corpus-only.
+//
+// NOT REACHABLE FROM THIS HARNESS, and why (the sweep covers each; do not "fix" by loosening
+// an assertion into a tautology):
+//   - The MODULE-PREFIX spelling of a bare struct/enum. c_type_c_name consults a codegen
+//     registry populated during emit; this harness stops after check_types, so it answers the
+//     unprefixed `blink_Name`. Half A therefore pins the DELEGATION (c_type_from_tid defers to
+//     c_type_c_name rather than inventing a spelling) and the sweep pins the prefixed result
+//     — 19,262 agreeing `ctype.struct` rows, which is where the prefixed cells live.
+//   - The transparent-newtype arm. is_transparent_newtype's shape gate reads codegen's
+//     enum_variants registry, empty here, so it answers 0 for any Errno this file could build.
+//     Measured instead: the sweep reported `ty=Errno tidc=blink_Errno emitted=int64_t` before
+//     the arm existed and 0 such rows after.
+//   - Ptr[U8] against a REAL ffi pointee. Half A builds Ptr tids directly, which pins the
+//     recursion and the void* fallback; the ffi-annotation cells are `ctype.ptr_ann` (78) and
+//     `ctype.ptr_ffi` (169) in the sweep.
+//
+// SETUP HAZARDS: inherited verbatim from tests/test_tc_tid_structural_accessors.bl — the
+// whole-program merge, `pub`-for-tests ctors, and the load-bearing bare `import codegen_expr`
+// that `blink check` reports UNUSED. Read that file's header before editing this one.
+
+import typecheck.{
+    TyKind, c_type_from_tid, tc_tid_kind, tc_type_str, tc_lookup_node_tid, check_types,
+    make_list_type, make_set_type, make_option_type, make_result_type, make_map_type,
+    make_tuple_type, make_struct_instance_type, make_fn_type, make_metavar,
+    make_ptr_type, make_handle_type, make_channel_type, make_template_type,
+    make_ffi_scope_type,
+}
+import codegen_types.{c_type_c_name}
+import parser.{nodes}
+import compiler.{compile_to_program}
+import std.io
+import codegen_expr
+
+fn assert_eq_str(label: Str, got: Str, want: Str) {
+    if got != want { io.println("FAIL: {label} — got '{got}', want '{want}'") }
+    assert_eq(got, want)
+}
+
+// Base scalars are seeded into ty_pool during check_types and their tids are private
+// globals, so a probe program is the only route to them. Keyed by rendered type string.
+fn probe_src() -> Str {
+    "type Bx \{ v: Int }\ntype Col \{ Red, Green }\nfn id[T](x: T) -> T \{ x }\nfn nada() \{ let _ = 0 }\nfn probe() -> Int \{\n    let a = 1\n    let b = \"s\"\n    let c = true\n    let d = 1.5\n    let e: U8 = 3\n    let f: I32 = 4\n    let g: U64 = 5\n    let h: I8 = 6\n    let i: U16 = 7\n    let j: I16 = 8\n    let k: U32 = 9\n    let l = Bytes.from_str(\"z\")\n    let m = StringBuilder()\n    let n = Bx \{ v: 1 }\n    let o = Col.Red\n    nada()\n    a\n}\n"
+}
+
+fn harvest() -> Map[Str, Int] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let path = "build/ctype_from_tid_probe.bl"
+    write_file(path, probe_src())
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    // Removed BEFORE any row assertion, so a failing assertion never leaks the probe file.
+    fs.remove(path)
+    let mut m: Map[Str, Int] = Map()
+    let mut idx = 0
+    let n = nodes.len()
+    while idx < n {
+        let tid = tc_lookup_node_tid(idx)
+        if tid >= 0 {
+            m.insert(tc_type_str(tid), tid)
+        }
+        idx = idx + 1
+    }
+    m
+}
+
+fn expect_tid(m: Map[Str, Int], key: Str) -> Int {
+    let tid = m.get(key) ?? -1
+    if tid == -1 {
+        io.println("FAIL: harvested map has no tid for rendered type string '{key}'")
+    }
+    assert(tid != -1)
+    tid
+}
+
+// One row per spelling, so a failure names the kind rather than "some type changed".
+fn expect_c(m: Map[Str, Int], rendered: Str, want: Str) {
+    assert_eq_str("c_type_from_tid({rendered})", c_type_from_tid(expect_tid(m, rendered)), want)
+}
+
+// ════ Half A — the spellings ══════════════════════════════════════════════════
+//
+// Every value below was read out of EMITTED C for a program that declares the type, not off
+// the CT_* table — the table is the thing being replaced, so using it as the oracle would
+// prove only that the new speller copies the old one's bugs.
+
+test "the four base scalars" {
+    let m = harvest()
+    expect_c(m, "Int", "int64_t")
+    expect_c(m, "Float", "double")
+    // Bool is `int`, not `_Bool`: the runtime's tagged unions store flags in int slots.
+    expect_c(m, "Bool", "int")
+    // Str is const-qualified. Dropping the qualifier compiles but warns at every write site.
+    expect_c(m, "Str", "const char*")
+}
+
+test "the sized integer kinds" {
+    let m = harvest()
+    expect_c(m, "I8", "int8_t")
+    expect_c(m, "I16", "int16_t")
+    expect_c(m, "I32", "int32_t")
+    expect_c(m, "U8", "uint8_t")
+    expect_c(m, "U16", "uint16_t")
+    expect_c(m, "U32", "uint32_t")
+    expect_c(m, "U64", "uint64_t")
+}
+
+// Every container is ONE runtime type regardless of its element — the element lives in the
+// runtime header, not in the C type. This is why a Map with an unspellable value still has a
+// perfectly good C type (Half B's last row) and why the flat pair got away with depth 1 for
+// so long: containers hide their depth from C.
+test "the containers lower to their single runtime type" {
+    let m = harvest()
+    let int_tid = expect_tid(m, "Int")
+    let str_tid = expect_tid(m, "Str")
+    assert_eq_str("List[Int]", c_type_from_tid(make_list_type(int_tid)), "blink_list*")
+    assert_eq_str("List[List[Str]]", c_type_from_tid(make_list_type(make_list_type(str_tid))), "blink_list*")
+    assert_eq_str("Set[Int]", c_type_from_tid(make_set_type(int_tid)), "blink_set*")
+    assert_eq_str("Map[Str,Int]", c_type_from_tid(make_map_type(str_tid, int_tid)), "blink_map*")
+    expect_c(m, "Bytes", "blink_bytes*")
+    expect_c(m, "StringBuilder", "blink_sb*")
+}
+
+test "the runtime-backed kinds" {
+    let m = harvest()
+    let int_tid = expect_tid(m, "Int")
+    assert_eq_str("Handle[Int]", c_type_from_tid(make_handle_type(int_tid)), "blink_handle*")
+    assert_eq_str("Channel[Int]", c_type_from_tid(make_channel_type(int_tid)), "blink_channel*")
+    assert_eq_str("Template", c_type_from_tid(make_template_type(int_tid)), "blink_template*")
+    assert_eq_str("FFIScope", c_type_from_tid(make_ffi_scope_type()), "blink_list*")
+    assert_eq_str("Fn", c_type_from_tid(make_fn_type(int_tid, [int_tid])), "blink_closure*")
+}
+
+// The carriers are the reason this function exists: their C type is per-instantiation, so it
+// cannot be answered from a kind alone. The tag speller is already recursive, so this position
+// only adds the `blink_` prefix the emitters use.
+test "the carriers are spelled per instantiation" {
+    let m = harvest()
+    let int_tid = expect_tid(m, "Int")
+    let str_tid = expect_tid(m, "Str")
+    assert_eq_str("Option[Str]", c_type_from_tid(make_option_type(str_tid)), "blink_Option_str")
+    assert_eq_str("Option[Int]", c_type_from_tid(make_option_type(int_tid)), "blink_Option_int")
+    assert_eq_str("Result[Int,Str]", c_type_from_tid(make_result_type(int_tid, str_tid)), "blink_Result_int_str")
+    assert_eq_str("(Int,Str)", c_type_from_tid(make_tuple_type([int_tid, str_tid])), "blink_Tuple2_int_str")
+    assert_eq_str("(Int,Str,Int)", c_type_from_tid(make_tuple_type([int_tid, str_tid, int_tid])), "blink_Tuple3_int_str_int")
+}
+
+// DEPTH >= 2 — the property the flat (CT_*, sname) pair provably cannot hold. Each of these
+// would have needed its own hand-written side channel under the old representation, which is
+// the shape of most of the 100+ tickets.
+test "carriers nest to arbitrary depth" {
+    let m = harvest()
+    let int_tid = expect_tid(m, "Int")
+    let str_tid = expect_tid(m, "Str")
+    assert_eq_str("Option[Map[Str,Int]]",
+        c_type_from_tid(make_option_type(make_map_type(str_tid, int_tid))), "blink_Option_Map_str_int")
+    assert_eq_str("Result[Option[Int],Str]",
+        c_type_from_tid(make_result_type(make_option_type(int_tid), str_tid)), "blink_Result_Option_int_str")
+    assert_eq_str("(Option[Int],Int)",
+        c_type_from_tid(make_tuple_type([make_option_type(int_tid), int_tid])), "blink_Tuple2_Option_int_int")
+    assert_eq_str("Option[Option[Option[Int]]]",
+        c_type_from_tid(make_option_type(make_option_type(make_option_type(int_tid)))),
+        "blink_Option_Option_Option_int")
+}
+
+// A CONTAINER inside a carrier erases its element; a MAP inside a carrier does not. That
+// asymmetry is deliberate and it is a rule about C, not about types: a carrier typedef stores
+// its payload as the payload's C type, and every list is `blink_list*` whatever its element —
+// so `Option[List[Str]]` and `Option[List[Int]]` can and do share ONE typedef, while
+// `Option[Map[Str,Int]]` and `Option[Map[Int,Str]]` get two that are byte-identical apart from
+// the name. I expected the structural spelling for both and the test said otherwise; the
+// spelling is right and the expectation was wrong, so it is pinned here rather than
+// "corrected". A future collapse of Map onto the compact form must break THIS row (and the C
+// emitters that match on the tag) rather than pass silently.
+test "a container inside a carrier erases its element, a Map does not" {
+    let m = harvest()
+    let int_tid = expect_tid(m, "Int")
+    let str_tid = expect_tid(m, "Str")
+    assert_eq_str("Option[List[Str]]",
+        c_type_from_tid(make_option_type(make_list_type(str_tid))), "blink_Option_list")
+    assert_eq_str("Option[List[Int]] shares it",
+        c_type_from_tid(make_option_type(make_list_type(int_tid))), "blink_Option_list")
+    assert_eq_str("Option[Set[Int]]",
+        c_type_from_tid(make_option_type(make_set_type(int_tid))), "blink_Option_set")
+    assert_eq_str("Result[List[Str],Str]",
+        c_type_from_tid(make_result_type(make_list_type(str_tid), str_tid)), "blink_Result_list_str")
+    // The Map counterpart, spelled out so the two rules sit side by side.
+    assert_eq_str("Option[Map[Int,Str]]",
+        c_type_from_tid(make_option_type(make_map_type(int_tid, str_tid))), "blink_Option_Map_int_str")
+}
+
+// A Ptr's spelling is the pointee's, suffixed — the only kind whose C type is BUILT from a
+// child's C string rather than from a tag, so it is the one place the recursion is directly
+// observable in the output.
+test "Ptr is spelled from its pointee, recursively" {
+    let m = harvest()
+    let u8_tid = expect_tid(m, "U8")
+    let int_tid = expect_tid(m, "Int")
+    assert_eq_str("Ptr[U8]", c_type_from_tid(make_ptr_type(u8_tid)), "uint8_t*")
+    assert_eq_str("Ptr[Int]", c_type_from_tid(make_ptr_type(int_tid)), "int64_t*")
+    assert_eq_str("Ptr[Ptr[U8]]", c_type_from_tid(make_ptr_type(make_ptr_type(u8_tid))), "uint8_t**")
+}
+
+test "Void is spelled void, not erased to a value type" {
+    let m = harvest()
+    assert_eq_str("Void", c_type_from_tid(expect_tid(m, "Void")), "void")
+}
+
+// A bare (non-generic) struct or enum delegates to codegen's namer. Pinning the DELEGATION and
+// not a literal is deliberate: the literal spelling depends on the module registry, which this
+// harness cannot populate (see the header). What must not happen is this function inventing a
+// second naming rule — that is the drift the collapse exists to end.
+test "a bare struct and a bare enum defer to codegen's namer" {
+    let m = harvest()
+    let bx = expect_tid(m, "Bx")
+    let col = expect_tid(m, "Col")
+    assert_eq_str("Bx delegates", c_type_from_tid(bx), c_type_c_name("Bx"))
+    assert_eq_str("Col delegates", c_type_from_tid(col), c_type_c_name("Col"))
+    // ...and still answers a usable C identifier here, so a registry miss is not a decline.
+    assert(c_type_from_tid(bx).starts_with("blink_"))
+    assert(c_type_from_tid(col).starts_with("blink_"))
+}
+
+// ════ Half B — the decline contract ══════════════════════════════════════════
+//
+// Each row is a class, and each class has a caller-side consequence. A decline that leaks a
+// spelling emits a C type that was never typedef'd; a spelling that leaks a decline drops a
+// site back to the flat path it was meant to replace. Both are silent, so both get a row.
+
+// An unbound metavariable must never acquire a default (DECISIONS.md:342 / br gqg3rk 6-0:
+// under-determined types are error[CannotInferType] E0301, never a Void-or-Int default). The
+// ICE is the AUTHORITATIVE caller's decision at its emit site, not this function's — so it
+// declines rather than fabricating either a spelling or a sentinel that would be emitted as C.
+test "an unbound metavariable declines" {
+    let _ = harvest()
+    assert_eq_str("bare metavar", c_type_from_tid(make_metavar()), "")
+}
+
+// A GENERIC INSTANCE's C name is the monomorphised spelling only the mono registry can
+// produce. `blink_Box` would name a type that was never typedef'd — the exact failure the
+// carrier correction above caught by measurement.
+test "a generic struct instance declines" {
+    let m = harvest()
+    let int_tid = expect_tid(m, "Int")
+    assert_eq_str("Box[Int]", c_type_from_tid(make_struct_instance_type("Box", [int_tid])), "")
+    assert_eq_str("Pair[Int,Str]",
+        c_type_from_tid(make_struct_instance_type("Pair", [int_tid, expect_tid(m, "Str")])), "")
+    // The arity is the axis, not the name: the same base with no args is a bare struct and
+    // spells fine. This pins that the decline is structural rather than a name blacklist.
+    assert(c_type_from_tid(make_struct_instance_type("Box", [])) != "")
+}
+
+// An unsubstituted `T` has no C type. The caller must run tc_tid_subst_mono first; if that
+// left a typevar, the type is genuinely not yet known and inventing one would miscompile.
+test "a typevar declines" {
+    let m = harvest()
+    assert_eq_str("T", c_type_from_tid(expect_tid(m, "T")), "")
+}
+
+// A CARRIER OVER a typevar is the subtle one, and it is why the guard is a separate test: a
+// typevar inner is the one unspellable tag that is NOT an ICE seg (an unsubstituted T inside a
+// generic body is normal, not an internal error), so the ICE-seg collapse cannot catch it.
+// tc_tid_tag_at answers a bare "<tv>" and the Option arm interpolates it, giving `Option_<tv>`
+// — prefixed, `blink_Option_<tv>`, which is not a C identifier at all.
+test "a carrier over a typevar declines rather than spelling <tv>" {
+    let m = harvest()
+    let t = expect_tid(m, "T")
+    assert_eq_str("Option[T]", c_type_from_tid(make_option_type(t)), "")
+    assert_eq_str("Result[T,Str]", c_type_from_tid(make_result_type(t, expect_tid(m, "Str"))), "")
+    assert_eq_str("Result[Int,T]", c_type_from_tid(make_result_type(expect_tid(m, "Int"), t)), "")
+    assert_eq_str("(T,Int)", c_type_from_tid(make_tuple_type([t, expect_tid(m, "Int")])), "")
+    // Nested, because the collapse must propagate out of arbitrary depth rather than only
+    // out of the immediate child.
+    assert_eq_str("Option[Option[T]]", c_type_from_tid(make_option_type(make_option_type(t))), "")
+}
+
+test "a carrier over an unbound metavariable declines" {
+    let _ = harvest()
+    assert_eq_str("Option[?]", c_type_from_tid(make_option_type(make_metavar())), "")
+    assert_eq_str("Result[?,?]", c_type_from_tid(make_result_type(make_metavar(), make_metavar())), "")
+}
+
+// ════ Half C — decline is not contagious ═════════════════════════════════════
+//
+// The counterpart to Half B, and the reason Map is spelled from its KIND alone: a container's
+// C type does not depend on its element, so an unspellable element must NOT propagate a
+// decline outward. Getting this wrong would drop every `Map[Str, T]` in a generic body back to
+// the flat path — a silent regression that no assertion in Half B could see.
+test "a container with an unspellable element still has a C type" {
+    let m = harvest()
+    let t = expect_tid(m, "T")
+    let str_tid = expect_tid(m, "Str")
+    assert_eq_str("Map[Str,T]", c_type_from_tid(make_map_type(str_tid, t)), "blink_map*")
+    assert_eq_str("Map[T,T]", c_type_from_tid(make_map_type(t, t)), "blink_map*")
+    assert_eq_str("List[T]", c_type_from_tid(make_list_type(t)), "blink_list*")
+    assert_eq_str("Set[T]", c_type_from_tid(make_set_type(t)), "blink_set*")
+    assert_eq_str("List[?]", c_type_from_tid(make_list_type(make_metavar())), "blink_list*")
+    assert_eq_str("Handle[T]", c_type_from_tid(make_handle_type(t)), "blink_handle*")
+    assert_eq_str("Channel[T]", c_type_from_tid(make_channel_type(t)), "blink_channel*")
+}
+
+// A Ptr never declines either, but for a different reason and with a different answer: it
+// drops an unspellable pointee to `void*`, matching ptr_inner_c_type's own `_ => "void"`
+// fallback so the two paths agree instead of this one going quiet.
+test "a Ptr with an unspellable pointee falls back to void*" {
+    let m = harvest()
+    assert_eq_str("Ptr[T]", c_type_from_tid(make_ptr_type(expect_tid(m, "T"))), "void*")
+    assert_eq_str("Ptr[?]", c_type_from_tid(make_ptr_type(make_metavar())), "void*")
+}
+
+// ════ Half D — the out-of-range contract ═════════════════════════════════════
+//
+// -1 reaches this function constantly (it is what every "no type here" slot holds), so it must
+// answer a decline rather than panicking or indexing the pool. Same anti-fabrication contract
+// as tc_tid_child's -1: sv_tp answers a missing slot by INVENTING type_list(type_int()), and
+// every "erases the element to Int" ticket is that invention.
+test "an absent or out-of-range tid declines" {
+    let _ = harvest()
+    assert_eq_str("-1", c_type_from_tid(-1), "")
+    assert_eq_str("-2", c_type_from_tid(-2), "")
+    assert_eq_str("far out of range", c_type_from_tid(99999999), "")
+}

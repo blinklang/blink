@@ -1,6 +1,6 @@
 import ast.{NodeKind, node_kind_name, is_block_bearing, dbg_trace, dbg_channel_on}
 import std.str.{str_to_lower}
-import codegen_types.{is_intrinsic_method, strip_module_qualifier, c_type_tag_for_struct, escape_mono_seg, mono_slot_conflicts, mono_slot_conflicts_same_type, mono_slot_conflicts_diff_type, mono_slot_conflicts_diff_type_injective, get_var_ty, get_var_tp, tp_get_kind, tp_get_child1, tp_get_child2, tp_get_sname, tp_display, CT_INT, CT_FLOAT, CT_BOOL, CT_STRING, CT_LIST, CT_VOID, CT_OPTION, CT_RESULT, CT_ITERATOR, CT_HANDLE, CT_CHANNEL, CT_PTR, CT_MAP, CT_BYTES, CT_SET, CT_STRINGBUILDER, CT_TEMPLATE, CT_FFI_SCOPE, CT_STRUCT, CT_ENUM, CT_I8, CT_I16, CT_I32, CT_U8, CT_U16, CT_U32, CT_U64, CT_CHAR}
+import codegen_types.{is_intrinsic_method, strip_module_qualifier, c_type_tag_for_struct, c_type_c_name, is_transparent_newtype, escape_mono_seg, mono_slot_conflicts, mono_slot_conflicts_same_type, mono_slot_conflicts_diff_type, mono_slot_conflicts_diff_type_injective, get_var_ty, get_var_tp, tp_get_kind, tp_get_child1, tp_get_child2, tp_get_sname, tp_display, CT_INT, CT_FLOAT, CT_BOOL, CT_STRING, CT_LIST, CT_VOID, CT_OPTION, CT_RESULT, CT_ITERATOR, CT_HANDLE, CT_CHANNEL, CT_PTR, CT_MAP, CT_BYTES, CT_SET, CT_STRINGBUILDER, CT_TEMPLATE, CT_FFI_SCOPE, CT_STRUCT, CT_ENUM, CT_I8, CT_I16, CT_I32, CT_U8, CT_U16, CT_U32, CT_U64, CT_CHAR}
 import parser.{
     get_annotation, has_annotation, is_literal_string_part,
     node_args, node_assoc_types, node_arms, node_body, node_captures, node_col, node_condition,
@@ -12883,6 +12883,54 @@ pub fn ty_divergence_rows() -> List[Str] {
     out
 }
 
+// ── Stage 3 instrument: the C SPELLING a tid answers vs the one codegen emitted ──────
+//
+// The Stage 2 tydiv counter compares two type REPRESENTATIONS structurally. This compares
+// the two C STRINGS an emit site could print, which is the thing Stage 3 actually flips, and
+// it is a different measurement: a cell can agree structurally and still disagree on the
+// spelling (a mono stem, a Void placeholder, a Ptr pointee), and it can diverge structurally
+// while both paths happen to spell the same C (every container is one runtime pointer type).
+// Only the string comparison says whether flipping authority at a site changes the output.
+//
+// Rows land in the SAME table as tydiv, keyed by a `ctype.` site prefix, so the summary and
+// dump machinery is not duplicated. The bump is gated on the channel — unlike tydiv's, which
+// is unconditional — for one specific reason: a tydiv sweep's summary lines are the published
+// Stage 2 basis, and an unconditional bump here would add rows to it and make the two sweeps
+// no longer diffable. Gating keeps a `ctype.` row impossible unless someone is measuring
+// ctypediv, and a row still cannot exist without having been reached, which is the property
+// that lets a zero mean "clean" instead of "never ran".
+//
+// `emitted` is what the caller is ABOUT to print (or just printed) for this variable, and
+// `branch` names which arm of the caller's chain produced it — the cell map is only actionable
+// per branch, because a Void placeholder disagreeing with `void` is a position rule working
+// correctly while a struct branch disagreeing is a real defect.
+pub fn ctype_probe_at(tid: Int, branch: Str, name: Str, emitted: Str, node: Int) {
+    if dbg_channel_on("ctypediv") == 0 { return }
+    let site = "ctype.{branch}"
+    let spelled = c_type_from_tid(tid)
+    if spelled == "" {
+        ty_div_bump(site, TyDiv.Missing)
+        ctype_div_trace(site, "decline", name, tid, "-", emitted, node)
+        return
+    }
+    if spelled == emitted {
+        ty_div_bump(site, TyDiv.Agree)
+        return
+    }
+    ty_div_bump(site, TyDiv.Diverge)
+    ctype_div_trace(site, "diverge", name, tid, spelled, emitted, node)
+}
+
+// Same field discipline as ty_div_trace: `at=` LAST, because both spellings can contain a
+// space (`const char*`, `const blink_Box*`) and every sweep script gets at the cell by
+// stripping the fixed trailing tokens (` at=…` and the harness's own ` file=…`).
+fn ctype_div_trace(site: Str, bucket: Str, name: Str, tid: Int, spelled: Str, emitted: Str, node: Int) {
+    let ty = if tid >= 0 { tc_type_str(tid) } else { "-" }
+    // `at_str` not `at` — br 8wk3xg, same workaround ty_div_trace documents.
+    let at_str = if node >= 0 { "{node_source_module(node)}:{node_line(node)}" } else { "-" }
+    dbg_trace("ctypediv", "bucket={bucket} site={site} var={name} ty={ty} tidc={spelled} emitted={emitted} at={at_str}")
+}
+
 fn tp_cmp_child(tp: Int, i: Int) -> Int {
     if i == 0 { return tp_get_child1(tp) }
     if i == 1 { return tp_get_child2(tp) }
@@ -12980,11 +13028,21 @@ pub fn sv_ty_or_flat_at(name: Str, site: Str, node: Int) -> Int {
 // instrument was not exercised", which is a different claim from "zero divergences", and
 // keeping the two distinguishable is the whole reason a sweep can be trusted.
 pub fn ty_divergence_dump() {
-    if dbg_channel_on("tydiv") == 0 { return }
+    if dbg_channel_on("tydiv") == 0 && dbg_channel_on("ctypediv") == 0 { return }
     let rows = ty_divergence_rows()
     let mut i = 0
     while i < rows.len() {
-        dbg_trace("tydiv", "summary {rows.get(i).unwrap()}")
+        let row = rows.get(i).unwrap()
+        // A row goes out on the channel that produced it. dbg_trace gates on its own channel
+        // argument, so a `ctype.` row emitted as "tydiv" would be dropped by a ctypediv-only
+        // sweep — and a tydiv row emitted as "ctypediv" would silently join the other sweep's
+        // basis. The site prefix is the discriminator because the two instruments share one
+        // counter table (see ctype_probe_at).
+        if row.starts_with("ctype.") {
+            dbg_trace("ctypediv", "summary {row}")
+        } else {
+            dbg_trace("tydiv", "summary {row}")
+        }
         i = i + 1
     }
 }
@@ -13525,6 +13583,148 @@ pub fn tc_channel_elem_ct(chan_tid: Int) -> Int {
 // nameless struct.
 pub fn tc_channel_elem_struct(chan_tid: Int) -> Str {
     tc_tid_struct(tc_channel_elem_tid(chan_tid))
+}
+
+// ── Stage 3: the C type of a tid, spelled recursively ────────────────────────────────
+//
+// The one function the collapse is FOR (decisions/compiler-type-representation.md Q2 step 5,
+// 5-0; docs/plans/2026-08-11-tid-collapse-stage2-divergence-map.md Stage 3). Codegen's
+// c_type_str is a flat `if` chain over a single CT_* integer, so it can only answer types
+// whose C spelling does not depend on their children — and every type whose spelling DOES
+// depend on its children (Option, Result, Tuple, Ptr) needs a separate side channel carrying
+// the child, which is what the flat (CT_*, sname) pair cannot hold past depth 1 and what
+// generated the whole bug family. This reads the children off the interned tree instead, so
+// the depth is whatever the type actually has.
+//
+// THE DECLINE IS PART OF THE ANSWER, not an error path. "" means "this function cannot spell
+// this tid faithfully", and a caller must then keep whatever it does today rather than trade
+// one wrong C type for another — the same contract, for the same reason, as
+// tc_channel_elem_ct's -1 above. Four things decline:
+//
+//   - A GENERIC struct/enum INSTANCE (`Box[Int]`, child_count != 0). Its C name is the
+//     monomorphised spelling only the mono registry can produce; emitting `blink_Box` for it
+//     would name a type that was never typedef'd. tc_tid_struct_mono_name owns that spelling
+//     and is a separate seam.
+//   - A TYPEVAR. An unsubstituted `T` has no C type; the caller must run tc_tid_subst_mono
+//     first, and if that left a typevar the type is genuinely not yet known.
+//   - An UNKNOWN (an unbound metavariable). Per DECISIONS.md:342 / gqg3rk this must never
+//     acquire a silent default — but the ICE is the AUTHORITATIVE caller's decision (I0001 at
+//     the emit site), not this function's, so it declines rather than fabricating either a
+//     spelling or a sentinel that would then be emitted as C.
+//   - A compound whose tag speller answered an ICE_SEG_* sentinel, collapsed rather than
+//     interpolated for the reason tc_tid_tag_at documents at length.
+//
+// A Ptr NEVER declines: its pointee is dropped to `void*` exactly as ptr_inner_c_type's own
+// `_ => "void"` fallback already does, so the two agree on an unspellable pointee instead of
+// this one going quiet.
+//
+// A Map is spelled from its KIND alone, not through its tag, because every Map lowers to the
+// single runtime type blink_map* regardless of key and value (c_type_c_name_in says so
+// explicitly, br 6kqgnp). Routing it through the tag would make `Map[Str, T]` decline over an
+// unresolved T that the C type does not depend on.
+pub fn c_type_from_tid(tid: Int) -> Str {
+    let t = tc_tid_resolved(tid)
+    if t < 0 { return "" }
+    let k = tc_tid_kind(t)
+    if k == TyKind.Struct || k == TyKind.Enum {
+        if tc_tid_child_count(t) != 0 { return "" }
+        // Transparent-alias hop, mirroring tc_tid_tag_at's twin alias hop: `type Port = Int`
+        // lowers to a bare int64_t (project_type_alias_param_lowering), so the alias name must
+        // resolve to the underlying type's spelling and not to a `blink_Port` typedef that is
+        // never emitted.
+        let underlying = tc_resolve_transparent_alias_name(tc_tid_name(t))
+        if underlying != -1 { return c_type_from_tid(underlying) }
+        let nm = tc_tid_struct(t)
+        if nm == "" { return "" }
+        // A transparent NEWTYPE is a different construct from the alias above — `type
+        // Errno(Int)` is a real single-variant enum declaration that nonetheless lowers to a
+        // bare int64_t everywhere, by panel decision (br ja9jev, 6-0 "transparent / zero-cost";
+        // project_transparent_newtype_errno). tc_alias_underlying has no entry for it, so the
+        // hop above cannot see it, and spelling it `blink_Errno` would name the boxed tagged
+        // struct the transparency decision exists to avoid. is_transparent_newtype is the
+        // codegen-side gate (name AND shape) and is consulted rather than re-derived, so the
+        // two cannot drift apart. MEASURED: the ctypediv sweep reported this cell as
+        // `ty=Errno tidc=blink_Errno emitted=int64_t` before this arm existed.
+        if is_transparent_newtype(nm) != 0 { return "int64_t" }
+        return c_type_c_name(nm)
+    }
+    // The per-instantiation carrier typedefs. tc_tid_inner_tag is already the recursive
+    // structural speller for these (Option_str, Result_int_str, Tuple2_int_str), so this
+    // position needs no second spelling — only the `blink_` prefix the emitters use.
+    //
+    // NOT c_type_c_name(tag), and this is a measured correction rather than a preference:
+    // c_type_c_name routes an Option_/Result_ tag through canonical_struct_tag, which SPLITS
+    // `Result_<ok>_<err>` by scanning for an underscore separator. That grammar is ambiguous
+    // as soon as either half carries a module prefix (which itself contains underscores), so
+    // it re-applies c_type_tag_for_struct to an already-prefixed half and DOUBLES the prefix:
+    // `Result_std_net_tcp_TcpSocket_std_net_error_NetError` came back as
+    // `..._std_net_error_std_net_error_NetError`. The sweep measured 37 such rows across
+    // std.net / std.db / std.errno, every one of them a C type that was never typedef'd.
+    // tc_tid_inner_tag already emits the canonical, alias-hopped, module-qualified tag, so
+    // there is nothing left to canonicalize here — only to prefix.
+    if k == TyKind.Option || k == TyKind.Result || k == TyKind.Tuple {
+        let tag = tc_tid_inner_tag(t)
+        if tag == "" { return "" }
+        if diag_is_ice_seg(tag) { return "" }
+        // A typevar INNER is the one unspellable tag that is not an ICE seg, so
+        // diag_is_ice_seg above cannot catch it: tc_tid_tag_at answers a bare "<tv>" for a
+        // Typevar (an unsubstituted `T` inside a generic body is normal, not an internal
+        // error) and the Option/Result/Tuple arms interpolate it, giving `Option_<tv>`.
+        // Prefixed, that would be `blink_Option_<tv>` — not a C identifier at all. The
+        // answer is the same one the TyKind.Typevar arm below gives: an unsubstituted
+        // typevar has no C type, so decline and let the caller substitute first.
+        if tag.contains("<") { return "" }
+        return "blink_{tag}"
+    }
+    if k == TyKind.Ptr {
+        let pointee = c_type_from_tid(tc_tid_child(t, 0))
+        if pointee == "" { return "void*" }
+        return "{pointee}*"
+    }
+    // Exhaustive on purpose: a kind added later fails to COMPILE here rather than falling
+    // through to a plausible-wrong C type, which is the whole reason Stage 0 made TyKind a
+    // real enum. Every spelling below is the one c_type_str already answers for the
+    // corresponding CT_*, verified against emitted C rather than read off the table.
+    match k {
+        TyKind.Int => "int64_t"
+        TyKind.Float => "double"
+        TyKind.Bool => "int"
+        TyKind.Str => "const char*"
+        TyKind.Char => "int32_t"
+        TyKind.I8 => "int8_t"
+        TyKind.I16 => "int16_t"
+        TyKind.I32 => "int32_t"
+        TyKind.U8 => "uint8_t"
+        TyKind.U16 => "uint16_t"
+        TyKind.U32 => "uint32_t"
+        TyKind.U64 => "uint64_t"
+        TyKind.List => "blink_list*"
+        TyKind.Map => "blink_map*"
+        TyKind.Set => "blink_set*"
+        TyKind.Bytes => "blink_bytes*"
+        TyKind.StringBuilder => "blink_sb*"
+        TyKind.Template => "blink_template*"
+        TyKind.Handle => "blink_handle*"
+        TyKind.Channel => "blink_channel*"
+        TyKind.Iterator => "void*"
+        TyKind.FfiScope => "blink_list*"
+        // A closure travels as the runtime closure box, which is what CT_CLOSURE spells.
+        TyKind.Fn => "blink_closure*"
+        // A GENUINE Void, answered deliberately (the twin of tc_tid_tag_at's TyKind.Void
+        // arms). `void` is legal in a return position and illegal in a storage position;
+        // c_field_type_str owns that second rule, and a caller in a storage position must
+        // keep routing through it rather than expecting this to guess the position.
+        TyKind.Void => "void"
+        TyKind.Typevar => ""
+        TyKind.Unknown => ""
+        // All four handled above, ahead of the match.
+        TyKind.Ptr => ""
+        TyKind.Option => ""
+        TyKind.Result => ""
+        TyKind.Tuple => ""
+        TyKind.Struct => ""
+        TyKind.Enum => ""
+    }
 }
 
 // Monomorphized-struct-instance accessors (br kvn6w8 spike). Read the concrete
