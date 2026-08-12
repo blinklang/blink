@@ -5367,6 +5367,88 @@ invisible to 668 passing tests and to a byte-identical diff.
 
 12 rows, 12 green, `task regen` at fixed point, `task ci` 668/668 with 0 fmt failures.
 
+### The Map value kind that had no flat slot at all (br `dcjy17`)
+
+The cell `m039bn` split out, taken next. Measuring it first **widened** it by one value kind and
+established that the axis is the value's **kind**, not any route:
+
+| Map value | read back | before |
+|---|---|---|
+| `Int`, a struct, `List[Int]`, `(Int, Int)` | `.get(k).unwrap()…` | works |
+| `Option[Int]` | `.get(k).unwrap().unwrap()` | **fails** |
+| `Map[Str, Int]` | `.get(k).unwrap().get(a)` | **fails** |
+| `Result[Int, Str]` | `.get(k).unwrap().unwrap()` | **fails** |
+| `Set[Int]` | `.get(k).unwrap().contains(2)` | **fails** — not in the ticket, same cause |
+
+A plain local and a call receiver fail identically, and annotated and unannotated fail identically,
+which rules out all three neighbouring axes (`bef42x`'s annotation, `6g6g7t`'s expression receiver,
+`m039bn`'s trip through a `List` element). The Map itself survives — `m.len()`, `m.contains_key(k)` —
+and so does the **outer** `Option` from `.get`: `.is_some()` is right where `.unwrap()` is wrong. The
+value is floored *whole*, not partially, which the tap states in one row:
+
+```
+site=emit_let_binding.decl var=v tid=Option[Int] flat=Int
+```
+
+**Where it went.** `emit_map_method`'s `.get` ladder has arms for struct / `Str` / `List` / `Map` /
+`Float` and an else that answers `blink_Option_int`. A Map ScopeVar's flat value channel holds a
+scalar (`tp_child2_kind`), a struct name (`sname2`) or a `List` element (`extra`) and has **no slot
+for an Option, Result or Set**, so all three land in that else and read back as an integer. The bare
+`CT_MAP` arm is the same hole in a second flavour: it emits `blink_Option_map`, whose inner carries
+no carrier tag, so the downstream `.unwrap()` — which requires `inner == CT_MAP` **with** a name —
+falls through to the same scalar tail.
+
+The **write** side was already correct. `emit_boxed_container_store` boxes an Option value as
+`blink_Option_<tag>*` and a Result as `blink_Result_<ok>_<err>*`, exactly as it does for a `List`
+element. So the C the map holds was right all along and only the read spelled the wrong carrier —
+which is the useful diagnostic shape to recognise: a wrong *reader* over a correct store, not a
+wrong store.
+
+**The fix adds no fourth flat channel, and the reason is a small piece of design worth stating
+plainly: the value type never had to live on the Map at all.** It only has to reach the `Option`
+that `.get` returns, and the tid at the call site holds it whole. `map_val_carrier_from_tid` answers
+a carrier — `Option_<tag>` / `Result_<ok>_<err>` / `Map_<k>_<v>` spelled through `tp_carrier_tag`,
+or the Set element — and the `.get` arm consumes it **ahead of** the ladder. Nothing downstream
+changed: the existing `.unwrap()` arms already decode exactly these carrier tags, because a `List`
+element has been carrying compound values this way since `gemr3z`. Four broken value kinds, one new
+reader, zero new channels.
+
+Two details in it are load-bearing:
+
+- **The receiver's tid leads, not the call's.** A Map tid names its value *definitionally*;
+  `.get`'s own tid says `Option[V]`, and reading `V` back out of it assumes the memo is the call's
+  result rather than the value — which would silently strip one `Option` from an Option-valued Map.
+  The call node stays as the fallback for a receiver with no memo.
+- **Declining has to keep the ladder's answer.** A fabricated carrier tag names a C typedef the
+  write side never boxed into, and cc reports that with no Blink span. So the decline contract from
+  `deep_tp_from_tid` propagates unchanged: unfaithful tid → `ct = -1` → the flat ladder answers.
+
+**The census did not move, and that is the honest reading rather than a measurement failure.** On
+the 957-file intersected basis `tydiv` reads **4826 diverge rows / 411 cells before and after**, and
+`ctypediv` **23 rows / 7 cells** before and after. The counter taps ScopeVar-vs-tid disagreement at
+`sv_ty_or_flat_at` sites; this fix routes the tid to the **emitter** through a carrier instead of
+recording it on a ScopeVar, so the Map var still reads `tid=Map[Str, Option[Int]] flat=Map[Str, Int]`
+— ten such rows in the new test file itself. That residual divergence **is** the missing flat
+channel, and Stage 4 deletes it when `ScopeVar` becomes `{name, ty, is_mut}`; inventing a channel now
+so the counter could tick would be adding to what the plan is about to remove.
+
+So Stage 3's exit accounting needs one qualification it did not have before: **a cell can be closed
+without moving the counter when the repair path is a carrier rather than a stamp.** The counter
+remains the inventory of flat-field lies; it is not the inventory of user-visible defects, and the
+two only coincide where the repair happens to write a ScopeVar. Read together with `m039bn`'s
+finding — the counter is also a regression detector for the flips themselves — the instrument is
+sound in both directions, and neither direction makes it a completeness measure.
+
+**Byproduct, filed with an MVCE:** br `9qz1k6` — `for pair in m` over an Option/Result-valued Map
+declares the pair tuple's value field `void`, so **cc** fails with no Blink span. Same axis, different
+position: the map-iteration pair tuple. Scalar, struct, `List`, nested-`Map` and `Set` values all
+iterate correctly, and the same maps now read correctly through `.get`, through `m.keys()` + `.get`,
+and through `m.values()` — so the gap is one position wide, and it is the position whose failure mode
+is the loudest and least helpful of the three (wrong value < honest diagnostic < cc error).
+
+18 rows, 18 green (RED first: 19 errors across 12 rows), `task regen` at fixed point, `task ci`
+exit 0 with 669/669 test files and 1558 fmt checks passing.
+
 ## Appendix — all 428 shape cells
 
 Format: `family | occurrences | tid | flat`.

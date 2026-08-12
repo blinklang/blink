@@ -1,0 +1,191 @@
+// br dcjy17: a Map whose VALUE is an Option, a Map, a Result or a Set loses the value type, so
+// reading the value out of `.get(k).unwrap()` is a hard error — with no List anywhere and no
+// nesting route involved.
+//
+// ── THE AXIS IS THE VALUE KIND, NOT THE ROUTE ────────────────────────────────────────
+//
+// Measured before writing a line of the fix, each by running it:
+//
+//   Map[Str, Int]              m.get(k).unwrap()             WORKS
+//   Map[Str, Pt]               m.get(k).unwrap().x           WORKS
+//   Map[Str, List[Int]]        m.get(k).unwrap().len()       WORKS
+//   Map[Str, (Int, Int)]       m.get(k).unwrap().0           WORKS
+//   Map[Str, Option[Int]]      m.get(k).unwrap().unwrap()    FAILS
+//   Map[Str, Map[Str, Int]]    m.get(k).unwrap().get(a)      FAILS
+//   Map[Str, Result[Int, Str]] m.get(k).unwrap().unwrap()    FAILS
+//   Map[Str, Set[Int]]         m.get(k).unwrap().contains(2) FAILS
+//
+// A plain local and a call receiver fail identically, and an annotated and an unannotated
+// binding fail identically, so this is neither br bef42x's axis (the annotation) nor br 6g6g7t's
+// (an expression receiver) nor br m039bn's (the trip through a List element). The Map itself is
+// recovered: `m.len()` and `m.contains_key(k)` answer right, and the OUTER Option from `.get` is
+// fine — `.is_some()` is correct even where `.unwrap()` is not. Only the value's own type is gone,
+// and it is gone whole: the tydiv tap reads `tid=Option[Int] flat=Int`, i.e. floored to Int, not
+// "outer recorded, inner missing".
+//
+// ── WHERE IT WENT ────────────────────────────────────────────────────────────────────
+//
+// A Map ScopeVar's flat value channel has a slot for a scalar (`tp_child2_kind`), a struct
+// (`sname2`) and a List (`extra`). It has NO slot for an Option, Map, Result or Set value, so
+// `emit_map_method`'s `.get` ladder has arms for struct / Str / List / Map / Float and an else
+// that answers `blink_Option_int`. Every value kind above with no slot lands in that else and is
+// read back as an integer.
+//
+// The write side is already right: `emit_boxed_container_store` boxes an Option value as
+// `blink_Option_<tag>*` and a Result as `blink_Result_<ok>_<err>*`, exactly as it does for a
+// List element. So the C the map holds is correct and only the READ spells the wrong carrier.
+// The bare CT_MAP arm is a second flavour of the same hole: it emits `blink_Option_map`, whose
+// inner has no carrier tag at all, so the downstream `.unwrap()` (which requires an
+// `inner == CT_MAP` WITH a carrier name) falls through to the scalar tail.
+//
+// `emit_list_method`'s `.get` has the CT_OPTION / CT_RESULT / CT_SET arms this one lacks, and it
+// builds their carrier tags from the element's full tp via `tp_carrier_tag`. The fix reads the
+// value's type from the tid rather than adding a fourth, fifth and sixth flat slot, for the
+// reason recorded on `stamp_map_from_tid`: `sv_tp(CT_MAP, -1, -1, "")` fabricates
+// `Map[Str, Int]`, so "value never recorded" and "genuine Map[Str, Int]" are the same pool state
+// bit for bit. Only the tid can tell them apart.
+//
+// Every row reads a value back THROUGH the lost type: a row that only checked "it compiles" would
+// pass on a wrong-but-compiling value type.
+
+type Dc17Pt { x: Int }
+
+fn mopt() -> Map[Str, Option[Int]] {
+    let mut m: Map[Str, Option[Int]] = Map()
+    m.insert("k", Some(7))
+    m
+}
+
+fn mmap() -> Map[Str, Map[Str, Int]] {
+    let mut inner: Map[Str, Int] = Map()
+    inner.insert("a", 1)
+    let mut m: Map[Str, Map[Str, Int]] = Map()
+    m.insert("k", inner)
+    m
+}
+
+fn mres() -> Map[Str, Result[Int, Str]] {
+    let mut m: Map[Str, Result[Int, Str]] = Map()
+    m.insert("ok", Ok(3))
+    m.insert("bad", Err("no"))
+    m
+}
+
+// ── THE CELL ─────────────────────────────────────────────────────────────────────────
+
+test "an Option-valued Map keeps the value's Option" {
+    let mut m: Map[Str, Option[Int]] = Map()
+    m.insert("k", Some(7))
+    assert_eq(m.get("k").unwrap().unwrap(), 7)
+}
+
+test "the route is not the axis: the same off a call receiver" {
+    assert_eq(mopt().get("k").unwrap().unwrap(), 7)
+}
+
+test "the route is not the axis: the same through intermediate lets" {
+    let m = mopt()
+    let o = m.get("k").unwrap()
+    assert_eq(o.unwrap(), 7)
+    assert_eq(o.is_some(), true)
+}
+
+test "a None value in an Option-valued Map reads back as None" {
+    let n: Option[Int] = None
+    let mut m: Map[Str, Option[Int]] = Map()
+    m.insert("n", n)
+    assert_eq(m.get("n").unwrap().is_none(), true)
+}
+
+test "a nested Map value keeps its key and value" {
+    let m = mmap()
+    let inner = m.get("k").unwrap()
+    assert_eq(inner.get("a").unwrap(), 1)
+    assert_eq(inner.len(), 1)
+}
+
+test "a nested Map value, chained" {
+    assert_eq(mmap().get("k").unwrap().get("a").unwrap(), 1)
+}
+
+test "a Result-valued Map keeps the ok side" {
+    assert_eq(mres().get("ok").unwrap().unwrap(), 3)
+}
+
+test "a Result-valued Map keeps the err side" {
+    let m = mres()
+    let r = m.get("bad").unwrap()
+    assert_eq(r.is_err(), true)
+}
+
+test "an Option-of-struct value" {
+    let mut m: Map[Str, Option[Dc17Pt]] = Map()
+    m.insert("k", Some(Dc17Pt { x: 5 }))
+    assert_eq(m.get("k").unwrap().unwrap().x, 5)
+}
+
+test "an Option-of-List value" {
+    let mut m: Map[Str, Option[List[Int]]] = Map()
+    m.insert("k", Some([3, 33]))
+    let inner = m.get("k").unwrap().unwrap()
+    assert_eq(inner.len(), 2)
+    assert_eq(inner.get(1).unwrap(), 33)
+}
+
+test "a Set-valued Map keeps the set" {
+    let mut s: Set[Int] = Set()
+    s.insert(2)
+    let mut m: Map[Str, Set[Int]] = Map()
+    m.insert("k", s)
+    let got = m.get("k").unwrap()
+    assert_eq(got.contains(2), true)
+    assert_eq(got.len(), 1)
+}
+
+// ── THE BOUNDS, KEPT AS ROWS ─────────────────────────────────────────────────────────
+// All of these already passed. They stay because they are what says the axis is the value KIND
+// that has no flat slot, and not Maps, `.get`, or compound values in general.
+
+test "a scalar value already worked" {
+    let mut m: Map[Str, Int] = Map()
+    m.insert("k", 7)
+    assert_eq(m.get("k").unwrap(), 7)
+}
+
+test "a struct value already worked" {
+    let mut m: Map[Str, Dc17Pt] = Map()
+    m.insert("k", Dc17Pt { x: 5 })
+    assert_eq(m.get("k").unwrap().x, 5)
+}
+
+test "a List value already worked" {
+    let mut m: Map[Str, List[Int]] = Map()
+    m.insert("k", [3, 33])
+    assert_eq(m.get("k").unwrap().len(), 2)
+}
+
+test "a Tuple value already worked" {
+    let mut m: Map[Str, (Int, Int)] = Map()
+    m.insert("k", (1, 2))
+    let t = m.get("k").unwrap()
+    assert_eq(t.0, 1)
+    assert_eq(t.1, 2)
+}
+
+test "the Map itself, and the outer Option, always read back" {
+    let m = mopt()
+    assert_eq(m.len(), 1)
+    assert_eq(m.contains_key("k"), true)
+    assert_eq(m.get("k").is_some(), true)
+    assert_eq(m.get("nope").is_some(), false)
+}
+
+test "no Map at all: a plain nested Option was already right" {
+    let o: Option[Option[Int]] = Some(Some(7))
+    assert_eq(o.unwrap().unwrap(), 7)
+}
+
+test "no Map value: an Option element of a List was already right" {
+    let l: List[Option[Int]] = [Some(7)]
+    assert_eq(l.get(0).unwrap().unwrap(), 7)
+}

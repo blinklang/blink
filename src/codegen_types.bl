@@ -3547,6 +3547,84 @@ pub fn stamp_map_from_tid(node: Int, var_name: Str) -> Bool {
     true
 }
 
+// br dcjy17: the carrier a `Map[K, V].get(k)` must return when V is a kind the Map's three
+// flat value channels cannot hold — an Option, a Result, a Set, or a nested Map.
+//
+// This deliberately does NOT add a fourth flat channel, and the reason is the same one written
+// out on stamp_map_from_tid: the value's kind and the value's inner would have to be stored on
+// the MAP var, where `sv_tp(CT_MAP, ..)` fabricates `Map[Str, Int]` for an unknown pair, so a
+// stored-and-lost value cannot be told from a genuine one. The value type does not need to live
+// on the Map at all — it only has to reach the Option that `.get` returns, and the tid at the
+// call site holds it whole. So this reads the tid and hands the emitter a carrier, and the
+// existing `.unwrap()` arms (which already decode `Option_<inner>` / `Result_<ok>_<err>` /
+// `Map_<k>_<v>` carrier tags for LIST elements) consume it unchanged.
+//
+// DECLINES with ct = -1 rather than half-answering, on deep_tp_from_tid's -1 contract: an
+// unsubstituted typevar in a generic body, an unnameable struct, or a value whose own inner is a
+// Set/Iterator/Handle/Channel/Ptr reads that way. The flat ladder then keeps its answer, which
+// is what a decline has to mean — a fabricated carrier tag names a C typedef that the write side
+// never boxed into, and cc reports that as an unknown type in generated code with no Blink span.
+pub type MapValCarrier {
+    ct: Int,
+    tag: Str,
+    inner_tp: Int,
+    inner_ct: Int,
+    inner_sname: Str
+}
+
+pub fn no_map_val_carrier() -> MapValCarrier {
+    MapValCarrier { ct: -1, tag: "", inner_tp: -1, inner_ct: -1, inner_sname: "" }
+}
+
+pub fn map_val_carrier_from_tid(get_node: Int, obj_node: Int) -> MapValCarrier {
+    // The RECEIVER's tid leads, because a Map tid names its value definitionally — `.get`'s own
+    // tid says `Option[V]`, and reading V back out of it means assuming the memo is the call's
+    // result and not the value itself, which would silently strip one Option from an
+    // Option-valued Map. The call node is the fallback for a receiver with no memo (a synthesized
+    // or rewritten node reads -1). Both go through the mono binder for the same reason
+    // stamp_list_elem_from_tid does: a generic body's tid memo is written once, with its tparams
+    // still abstract.
+    let otid = tc_tid_subst_mono(tc_lookup_node_tid(obj_node), cg_mono_tparams_sl, cg_mono_arg_tids)
+    let mut vtid = -1
+    if tc_tid_ct(otid) == CT_MAP {
+        vtid = tc_tid_map_val_tid(otid)
+    }
+    if vtid < 0 {
+        let gtid = tc_tid_subst_mono(tc_lookup_node_tid(get_node), cg_mono_tparams_sl, cg_mono_arg_tids)
+        if tc_tid_ct(gtid) != CT_OPTION { return no_map_val_carrier() }
+        vtid = tc_tid_option_inner_tid(gtid)
+    }
+    let vct = tc_tid_ct(vtid)
+    if vct == CT_OPTION {
+        let inner_tp = deep_tp_from_tid(tc_tid_option_inner_tid(vtid))
+        if inner_tp == -1 { return no_map_val_carrier() }
+        return MapValCarrier { ct: CT_OPTION, tag: "Option_{tp_carrier_tag(inner_tp)}", inner_tp: inner_tp, inner_ct: tc_tid_option_inner_ct(vtid), inner_sname: tc_tid_option_inner_struct(vtid) }
+    }
+    if vct == CT_RESULT {
+        let ok_tp = deep_tp_from_tid(tc_tid_result_ok_tid(vtid))
+        let err_tp = deep_tp_from_tid(tc_tid_result_err_tid(vtid))
+        if ok_tp == -1 || err_tp == -1 { return no_map_val_carrier() }
+        return MapValCarrier { ct: CT_RESULT, tag: "Result_{tp_carrier_tag(ok_tp)}_{tp_carrier_tag(err_tp)}", inner_tp: -1, inner_ct: -1, inner_sname: "" }
+    }
+    if vct == CT_MAP {
+        let key_tp = deep_tp_from_tid(tc_tid_map_key_tid(vtid))
+        let val_tp = deep_tp_from_tid(tc_tid_map_val_tid(vtid))
+        if key_tp == -1 || val_tp == -1 { return no_map_val_carrier() }
+        return MapValCarrier { ct: CT_MAP, tag: "Map_{tp_carrier_tag(key_tp)}_{tp_carrier_tag(val_tp)}", inner_tp: -1, inner_ct: -1, inner_sname: "" }
+    }
+    // A Set value has no deep_tp_from_tid tree (that builder answers -1 for Set on purpose) and
+    // needs none: E1400 forecloses a container element, so the element is a flat scalar/struct
+    // and the Set rides the ordinary `blink_Option_set` carrier with its element on the option's
+    // inner2 channels — the same shape emit_list_method's CT_SET element arm uses.
+    if vct == CT_SET {
+        let ect = tc_tid_set_elem_ct(vtid)
+        let es = tc_tid_set_elem_struct(vtid)
+        if ect < 0 && es == "" { return no_map_val_carrier() }
+        return MapValCarrier { ct: CT_SET, tag: "", inner_tp: -1, inner_ct: ect, inner_sname: es }
+    }
+    no_map_val_carrier()
+}
+
 // gemr3z: the Result twin of set_list_elem_option — record
 // `type_list(type_result(ok, err))` so List[Result[T,E]].get()/for-in carry both
 // concrete inners. ok_struct/err_struct name a struct/enum inner ("" for scalars).

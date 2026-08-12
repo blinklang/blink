@@ -52,7 +52,7 @@ import codegen_types.{
     result_c_type, result_c_type_mixed,
     set_list_elem_struct, set_list_elem_type, set_list_nested_elem_type, set_list_nested_elem_struct,
     set_list_elem_option, set_list_elem_result, set_list_elem_option_tp, set_list_elem_result_tp,
-    stamp_list_elem_from_tid, stamp_map_from_tid,
+    stamp_list_elem_from_tid, stamp_map_from_tid, map_val_carrier_from_tid, MapValCarrier,
     push_scope, pop_scope,
     set_map_types, set_map_value_list_elem, set_map_value_struct, map_struct_scalar_kv, set_var, set_var_handle,
     set_var_handle_full, set_var_iterator, set_var_option,
@@ -1769,6 +1769,75 @@ fn emit_map_method(node: Int, obj_str: Str, obj_node: Int, method: Str, fb_key_c
         let vtype = base_val_ct
         let vstruct = base_val_sname
         let res = fresh_temp("_mgetopt_")
+        // br dcjy17: FIRST, because the ladder below cannot answer for these value kinds at all
+        // — a Map's flat value channels hold a scalar, a struct name or a List element, so an
+        // Option, Result or Set value falls into the ladder's else and is read back as
+        // `blink_Option_int`, and a nested Map reaches the CT_MAP arm whose `blink_Option_map`
+        // carries no inner tag for the later `.unwrap()` to decode. The write side is already
+        // right: emit_boxed_container_store boxes an Option value as `blink_Option_<tag>*` and a
+        // Result as `blink_Result_<ok>_<err>*`, so only this read spelled the wrong carrier.
+        //
+        // This is a tid-led branch and not a gated fill-in for the reason on
+        // map_val_carrier_from_tid: the value type never has to be stored on the Map var (where
+        // it could not be told from sv_tp's fabricated `Map[Str, Int]`), only carried to the
+        // Option this call returns. It declines when the tid is abstract or unfaithful, and the
+        // ladder keeps its answer for everything it can spell.
+        let mvc = map_val_carrier_from_tid(node, obj_node)
+        if mvc.ct == CT_OPTION || mvc.ct == CT_RESULT || mvc.ct == CT_MAP {
+            // Both ensures are needed and they register different typedefs: the outer
+            // struct-option (`blink_Option_Option_int`, whose member is a pointer to the
+            // carrier) and the carrier itself (`blink_Option_int`). A map read with no matching
+            // insert in this TU would otherwise name a typedef nothing emitted.
+            ensure_carrier_from_tag(mvc.tag)
+            ensure_struct_option_type(mvc.tag)
+            let opt_type = struct_option_c_type(mvc.tag)
+            let val_cast = if mvc.ct == CT_MAP { "blink_map*" } else { "{c_type_from_tag(mvc.tag)}*" }
+            emit_line("{opt_type} {res};")
+            emit_line("if (blink_map_has({obj_str}, {key_expr})) \{")
+            emit_line("    {res}.tag = 1; {res}.value = ({val_cast})blink_map_get({obj_str}, {key_expr});")
+            emit_line("} else \{ {res}.tag = 0; }")
+            set_var_option_struct(res, mvc.ct, mvc.tag)
+            if mvc.ct == CT_OPTION {
+                let use_ic = if mvc.inner_ct >= 0 { mvc.inner_ct } else { CT_INT }
+                set_var_option_inner2(res, use_ic)
+                if mvc.inner_sname != "" {
+                    set_var_option_inner2_struct(res, mvc.inner_sname)
+                }
+                // The carrier tag for a container inner is element-agnostic (`Option_list`), so
+                // the value Option's own inner travels as a deep tp instead — the channel the
+                // `.unwrap()` arm reads for exactly this case (whg65a).
+                let ik = tp_get_kind(mvc.inner_tp)
+                if ik == CT_LIST || ik == CT_MAP {
+                    set_var_option_inner_tp(res, type_option(mvc.inner_tp))
+                }
+                expr_option_inner_tp = mvc.inner_tp
+            }
+            expr_result_str = res
+            expr_result_type = CT_OPTION
+            expr_option_inner = mvc.ct
+            expr_option_inner_struct = mvc.tag
+            return 1
+        }
+        if mvc.ct == CT_SET {
+            ensure_option_type(CT_SET)
+            let opt_type = option_c_type(CT_SET)
+            emit_line("{opt_type} {res};")
+            emit_line("if (blink_map_has({obj_str}, {key_expr})) \{")
+            emit_line("    {res}.tag = 1; {res}.value = (blink_set*)blink_map_get({obj_str}, {key_expr});")
+            emit_line("} else \{ {res}.tag = 0; }")
+            set_var_option(res, CT_SET)
+            if mvc.inner_ct >= 0 {
+                set_var_option_inner2(res, mvc.inner_ct)
+            }
+            if mvc.inner_sname != "" {
+                set_var_option_inner2_struct(res, mvc.inner_sname)
+            }
+            expr_result_str = res
+            expr_result_type = CT_OPTION
+            expr_option_inner = CT_SET
+            expr_option_inner_struct = ""
+            return 1
+        }
         if vstruct != "" {
             ensure_struct_option_type(vstruct)
             let opt_type = struct_option_c_type(vstruct)
