@@ -79,7 +79,7 @@ import codegen_types.{
     struct_reg_names, struct_reg_set, struct_result_c_type, sv_tp, tp_from_ann,
     type_int, type_string, type_struct, type_list, type_option, type_result, type_map, type_set, type_iterator,
     set_list_elem_option_tp, set_list_elem_result_tp, list_elem_unspellable,
-    stamp_list_elem_from_tid,
+    stamp_list_elem_from_tid, map_val_carrier_from_recv, MapValCarrier,
     split_result_compound, CompoundSplit, map_struct_scalar_kv, MapKvCt, typedef_tag_or_empty, tp_child1_kind, tp_child1_sname, tp_child2_kind, tp_child2_sname,
     tp_get_kind, tp_get_child1, tp_get_child2, tp_get_sname, type_from_name, type_from_name_tag,
     type_name_from_ct, type_where_preds, cg_where_self_var, is_compound_tag, var_enums,
@@ -4218,8 +4218,42 @@ fn emit_for_in(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.
             // enumerate()'s (i, x) pairs already do.
             let key_ct = get_map_key_type(lookup_name)
             let key_struct = get_map_key_struct(lookup_name)
-            let val_ct = get_map_value_type(lookup_name)
-            let val_struct = get_map_value_struct(lookup_name)
+            // br 9qz1k6: the flat value channel can record an Option/Result value's HEAD
+            // (tp_child2_kind = CT_OPTION) but never a carrier NAME, and a carrier's C type is
+            // only nameable WITH its inner — c_type_str has no arm for a bare CT_OPTION, so it
+            // falls through to "void" and the pair tuple is emitted with `void _1;`: the loudest
+            // useless failure available, a cc error with no Blink span. (br dcjy17's axis, one
+            // position over: there the nameless head read back as an integer.) The tid names the
+            // value whole, so read the carrier off the receiver and put its TAG in the tuple's
+            // elem_structs slot,
+            // exactly as resolve_tuple_ann does for an annotated `(Int, Option[Int])` (qm01e7):
+            // the field is then emitted BY VALUE as `blink_Option_int _1;` and
+            // map_pair_value_read_expr's struct arm reads it back as
+            // `*(blink_Option_int*)values[i]` — which is what emit_boxed_container_store has been
+            // storing for this value all along.
+            //
+            // Only CT_OPTION / CT_RESULT are taken, because only they have no nameable field type.
+            // A Map, a Set, a List, a struct and a scalar value all name their tuple field
+            // correctly through the flat channels, and for a container that field is a POINTER
+            // (`blink_list*`), not a by-value carrier — routing them here would change a working
+            // spelling. Their INNER is a separate, still-open defect (br w224zg: a List value's
+            // element reads silently wrong and a Set value's element fails in cc), and it lives in
+            // the tuple REGISTRAR's `sv_tp(et, -1, -1, es)` field tps, not in this spelling.
+            // Declining likewise leaves the flat spelling in charge; what must never happen again
+            // is spelling the absence as `void`.
+            let mvc = map_val_carrier_from_recv(iter_node)
+            let carrier_val = mvc.ct == CT_OPTION || mvc.ct == CT_RESULT
+            // Canonicalized because resolve_tuple_ann canonicalizes too, and an annotated
+            // `(Str, Option[Int])` elsewhere in the program registers the SAME Tuple2 c_name:
+            // ensure_tuple_type keeps whichever registration arrives first, so the two callers
+            // must spell the tag and the type slot identically or one shape silently shadows the
+            // other.
+            let carrier_tag = canonical_struct_tag(mvc.tag)
+            let val_ct = if carrier_val { mvc.ct } else { get_map_value_type(lookup_name) }
+            let val_struct = if carrier_val { carrier_tag } else { get_map_value_struct(lookup_name) }
+            if carrier_val {
+                ensure_carrier_from_tag(carrier_tag)
+            }
             if val_ct == CT_LIST || val_ct == CT_SET {
                 map_val_ct = val_ct
                 map_val_nested_ct = get_map_value_list_elem(lookup_name)
@@ -4228,7 +4262,10 @@ fn emit_for_in(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.
             let val_tag = if val_struct != "" { val_struct } else { c_type_tag(val_ct) }
             let tuple_tag = "Tuple2_{key_tag}_{val_tag}"
             let key_type_csv = if key_struct != "" { "{CT_VOID}" } else { "{key_ct}" }
-            let val_type_csv = if val_struct != "" { "{CT_VOID}" } else { "{val_ct}" }
+            // A carrier keeps its real CT in the type slot (CT_OPTION / CT_RESULT), matching
+            // resolve_tuple_ann's `compound_tag_ct(carrier_tag)`; only a struct/enum element takes
+            // the CT_VOID-plus-name convention.
+            let val_type_csv = if carrier_val { "{mvc.ct}" } else if val_struct != "" { "{CT_VOID}" } else { "{val_ct}" }
             let key_struct_csv = if key_struct != "" { key_struct } else { "-" }
             let val_struct_csv = if val_struct != "" { val_struct } else { "-" }
             // The erased-recovery-failure defaults are CT_STRING (key) / CT_INT

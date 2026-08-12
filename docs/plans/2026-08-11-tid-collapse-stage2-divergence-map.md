@@ -5446,8 +5446,105 @@ iterate correctly, and the same maps now read correctly through `.get`, through 
 and through `m.values()` — so the gap is one position wide, and it is the position whose failure mode
 is the loudest and least helpful of the three (wrong value < honest diagnostic < cc error).
 
+*(Two claims in that paragraph did not survive being measured — the `Set`/`List` values iterate but
+lose their element, and `m.values()` needs an annotated receiver. Both are retracted and filed in the
+section below; the wording here is left as written so the retraction is visible.)*
+
 18 rows, 18 green (RED first: 19 errors across 12 rows), `task regen` at fixed point, `task ci`
 exit 0 with 669/669 test files and 1558 fmt checks passing.
+
+### The same missing name, one position over: the map-iteration pair tuple (br `9qz1k6`)
+
+`dcjy17`'s own byproduct, taken next, and measuring it corrected two claims in the paragraph above —
+the paragraph is left as written because being able to see which claims a later measurement retracted
+is part of what this map is for:
+
+- a **`Set` value does not fully iterate**. Its pair field is spelled right and `p.1.len()` answers,
+  but the element is gone: `p.1.contains(3)` emits `void _mkey9 = (void)(3);` and fails in cc. A
+  `List` value has the same hole and it is quieter still — `p.1.get(0).unwrap()` compiles, runs and
+  prints **nothing** for `List[Int]`, `<value>` for `List[Pt]`. Filed as br `w224zg`.
+- **`m.values()` works only on an annotated or directly-called receiver.** On an unannotated
+  `let m = mopt()` the same loop is an `UnresolvedMethod`, while `.get` and `.keys()` on that very
+  same variable are correct. Filed as br `nbf7aw`.
+
+**What the pair position actually loses.** The flat value channel records the value's **head** —
+`tp_child2_kind` is a `CT_*` and holds `CT_OPTION` happily — but never a carrier **name**, and a
+carrier's C type is only nameable *with* its inner (`blink_Option_int`). `c_type_str` therefore has
+no arm for a bare `CT_OPTION` and falls through to `"void"`, so the pair tuple is emitted as
+
+```c
+typedef struct { const char* _0; void _1; } blink_Tuple2_str_option;
+```
+
+which cc rejects (`variable or field '_1' declared void`, then `invalid initializer` at
+`blink_Option_int _o = pair._1;`) with no Blink span anywhere. This sharpens `dcjy17`'s statement
+rather than repeating it: the nameless head is not "nothing recorded", it is *a kind with no
+spelling*, and what each position does with it is what varies. `.get` read it back as an integer
+(wrong value); the pair tuple cannot even declare the field (cc).
+
+| Map value | `for p in m` reads | before |
+|---|---|---|
+| `Int`, a struct, `(Int, Int)` | `p.1`, `p.1.x`, `p.1.0` | works |
+| `List[Int]`, `Set[Int]`, `Map[Str, Int]` | `p.1.len()` | works (element lost — br `w224zg`) |
+| `Option[Int]`, `Result[Int, Str]` | `p.1.unwrap()` | **fails in cc** |
+
+Both routes fail identically — `for pair in m` and `for (k, v) in m` — and the fix repairs both,
+because both are built from the one Tuple2 registration.
+
+**The fix is `dcjy17`'s carrier reader at a second site, and nothing else.**
+`map_val_carrier_from_tid` split into a receiver-only entry point (`map_val_carrier_from_recv`) and
+the `vtid` half they share; map iteration has no `.get` call node to fall back to, so it reads the
+receiver's Map tid and takes the value whole. The carrier **tag** then goes into the pair tuple's
+`elem_structs` slot, which is a mechanism that already existed and already worked: a tuple element
+whose `elem_structs` slot holds a carrier tag is emitted BY VALUE as `blink_Option_int _1;`, its
+typedef pulled in by `emit_carrier_typedef_for_tag`, and `map_pair_value_read_expr`'s struct arm
+reads it back as `*(blink_Option_int*)values[i]` — which is exactly what
+`emit_boxed_container_store` had been storing all along. `resolve_tuple_ann` has spelled annotated
+tuples this way since `qm01e7`, which is why a plain `let t: (Int, Option[Int])` reads `t.1` back
+correctly today while map iteration could not.
+
+Three details are load-bearing:
+
+- **Only `CT_OPTION` / `CT_RESULT` are routed through the carrier.** Every other value kind names
+  its field correctly, and for a container that field is a *pointer* (`blink_list*`), not a
+  by-value carrier — routing them here would replace a working spelling. Their element loss is a
+  different repair in a different function (`w224zg`, in the registrar's field tps), and merging the
+  two would make neither measurable.
+- **The tag is canonicalized, because the other registrar canonicalizes.** An annotated
+  `(Str, Option[Int])` anywhere in the program registers the *same* `Tuple2` c_name, and
+  `ensure_tuple_type` keeps whichever registration arrives first. Two callers of one c_name that
+  disagree on the tag or the type slot mean one shape silently shadows the other — so this path
+  matches `resolve_tuple_ann` exactly, including putting the real `CT_OPTION` in the type slot
+  rather than the struct convention's `CT_VOID`.
+- **Declining keeps the flat spelling**, per `deep_tp_from_tid`'s -1 contract. What must never
+  happen again is spelling an absence as `void`: that is the one outcome with no Blink span at all.
+
+**Census, on the 958-file intersected basis:** `tydiv` **4836 diverge rows / 419 cells before and
+after**, `ctypediv` **23 / 7** before and after — unmoved, for the reason recorded under `dcjy17`
+and now confirmed twice: a carrier-based repair routes the tid to the *emitter* and never writes a
+ScopeVar, so the tap at `sv_ty_or_flat_at` sees the same flat-field lie it saw before. (The basis
+grew from 957 to 958 with `dcjy17`'s test file, and 4826 + 10 = 4836 / 411 + 8 = 419 reconciles the
+two runs exactly — a useful check that the counter is stable and the basis arithmetic is honest.)
+The new test file contributes 8 residual rows of its own, all `emit_let_binding.decl` on the Map
+var, and one of them is worth reading:
+
+```
+site=emit_let_binding.decl var=m tid=Map[Str, Option[Qz16Pt]] flat=Map[Str, Option[Int]]
+```
+
+The flat spelling keeps the Option **and** fabricates its inner as `Int` — the head survives, the
+inner is invented. That is the whole family in one row, and it is what Stage 4 removes when
+`ScopeVar` becomes `{name, ty, is_mut}`.
+
+**Byproducts, each filed with an MVCE:** br `w224zg` (pair-position `List`/`Set` element, silent
+wrong value / cc), br `nbf7aw` (`m.values()` on an unannotated let-bound call), br `gkgk1a`
+(`List[(Int, Option[Int])]` — every method on it is an `UnresolvedMethod`, while the same tuple as a
+plain local works).
+
+19 rows, 19 green (RED first: 3 codegen errors ahead of the cc failures, which never got a chance to
+print), `task regen` at fixed point, `task ci` exit 0 with 670/670 test files and fmt 1560 passed /
+0 failed.
+
 
 ## Appendix — all 428 shape cells
 

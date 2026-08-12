@@ -1,0 +1,287 @@
+// br 9qz1k6: `for pair in m` over a Map whose VALUE is an Option or a Result declares the pair
+// tuple's value field `void`, so the emitted C does not compile — a cc error with no Blink span.
+//
+// ── SAME AXIS AS br dcjy17, ONE POSITION OVER ────────────────────────────────────────
+//
+// dcjy17 was the value kinds a Map's flat value channels cannot hold (Option / Result / Map / Set),
+// read back through `.get`. This is the same missing slot read back through the (K, V) pair tuple
+// that map iteration materializes. Measured before writing a line of the fix, each by running it:
+//
+//   Map[Str, Int]              for p in m { p.1 }          WORKS
+//   Map[Str, Pt]               for p in m { p.1.x }        WORKS
+//   Map[Str, List[Int]]        for p in m { p.1.len() }    WORKS
+//   Map[Str, Map[Str, Int]]    for p in m { p.1.len() }    WORKS
+//   Map[Str, Set[Int]]         for p in m { p.1.len() }    WORKS
+//   Map[Str, (Int, Int)]       for p in m { p.1.0 }        WORKS
+//   Map[Str, Option[Int]]      for p in m { p.1.unwrap() } FAILS in cc
+//   Map[Str, Result[Int, Str]] for p in m { p.1.unwrap() } FAILS in cc
+//
+// The List and Set rows name their field correctly but lose the value's own ELEMENT — measured as
+// part of this axis and filed separately as br w224zg, because that loss is in the tuple
+// registrar's field tps (`sv_tp(et, -1, -1, es)`), not in the field's spelling. `p.1.len()` is
+// right on both; `p.1.get(0).unwrap()` reads silently wrong and `p.1.contains(3)` fails in cc.
+//
+// Both iteration routes fail, and they fail with the same shape: `for pair in m` emits
+// `void _1;` in the Tuple2 typedef plus `invalid initializer` at `blink_Option_int _o = pair._1`,
+// and `for (k, v) in m` adds `void v = _tuple._1;`. The Result rows also report
+// `request for member 'tag' in something not a structure or union`.
+//
+// The same maps read back correctly everywhere ELSE — `.get(k).unwrap()`, `m.keys()` + `.get`,
+// `m.values()` — because dcjy17 fixed those. So the gap was exactly one position wide, and it is
+// the position whose failure mode is the loudest and least useful of the three: a wrong value is
+// bad, an honest `UnresolvedMethod` at the codegen backstop is tolerable, and emitted C that a C
+// compiler rejects with no Blink span is the worst outcome available.
+//
+// ── WHERE IT WENT ────────────────────────────────────────────────────────────────────
+//
+// `emit_for_in`'s CT_MAP arm spells the pair tuple from the SAME flat channels dcjy17 indicted:
+// `get_map_value_type` / `get_map_value_struct`. For an Option value those answer
+// `(CT_OPTION, "")` — the HEAD is recorded, the carrier NAME is not, and a carrier's C type is only
+// nameable with its inner. So the tuple tag is the lossy `Tuple2_str_option` and the field type is
+// a bare `CT_OPTION`, which `c_type_str` has no arm for: it falls through to `void`. Nothing
+// downstream can recover from that, because the field does not exist in C.
+//
+// The tuple machinery itself was never the problem. A tuple element whose `elem_structs` slot
+// holds a carrier tag is emitted BY VALUE as `blink_Option_int _1;`, its carrier typedef is pulled
+// in by `emit_carrier_typedef_for_tag`, and `resolve_tuple_ann` has done exactly this for an
+// annotated tuple since qm01e7 — which is why a plain `let t: (Int, Option[Int])` reads `t.1`
+// back correctly today. Map iteration simply had no way to name the carrier, because the flat
+// channel it asked has no slot for one.
+//
+// So the fix is dcjy17's carrier reader (`map_val_carrier_from_tid`) consumed at a second site:
+// the tid names the value whole, the carrier tag goes into the pair tuple's `elem_structs` slot,
+// and the pair's value is read by value as `*(blink_Option_int*)values[i]` — which is what the
+// write side (`emit_boxed_container_store`) has been boxing all along.
+//
+// Declining is loud on purpose. When the tid cannot name the value, the flat channels stay in
+// charge and the pair tuple keeps its old spelling; what must never happen again is spelling the
+// absence as `void`, because that failure lands in cc with no Blink span.
+//
+// Every row reads the value back THROUGH the recovered type. A row that only checked "it compiles"
+// would pass on a wrong-but-compiling field type.
+
+type Qz16Pt { x: Int }
+
+fn qz_mopt() -> Map[Str, Option[Int]] {
+    let mut m: Map[Str, Option[Int]] = Map()
+    m.insert("k", Some(7))
+    m
+}
+
+fn qz_mres() -> Map[Str, Result[Int, Str]] {
+    let mut m: Map[Str, Result[Int, Str]] = Map()
+    m.insert("ok", Ok(3))
+    m
+}
+
+// ── THE CELL ─────────────────────────────────────────────────────────────────────────
+
+test "iterating an Option-valued Map keeps the value's Option" {
+    let mut m: Map[Str, Option[Int]] = Map()
+    m.insert("k", Some(7))
+    let mut seen = 0
+    for pair in m {
+        assert_eq(pair.0, "k")
+        assert_eq(pair.1.unwrap(), 7)
+        seen = seen + 1
+    }
+    assert_eq(seen, 1)
+}
+
+test "the destructuring route keeps it too" {
+    let mut m: Map[Str, Option[Int]] = Map()
+    m.insert("k", Some(7))
+    let mut sum = 0
+    for (k, v) in m {
+        assert_eq(k, "k")
+        sum = sum + v.unwrap()
+    }
+    assert_eq(sum, 7)
+}
+
+test "the route is not the axis: the same off a call receiver" {
+    let mut sum = 0
+    for pair in qz_mopt() {
+        sum = sum + pair.1.unwrap()
+    }
+    assert_eq(sum, 7)
+}
+
+test "a None value survives iteration as None, not as a zero" {
+    let mut m: Map[Str, Option[Int]] = Map()
+    m.insert("k", None)
+    let mut seen = 0
+    for pair in m {
+        assert_eq(pair.1.is_none(), true)
+        seen = seen + 1
+    }
+    assert_eq(seen, 1)
+}
+
+test "iterating a Result-valued Map keeps the value's Result" {
+    let mut m: Map[Str, Result[Int, Str]] = Map()
+    m.insert("ok", Ok(3))
+    let mut sum = 0
+    for pair in m {
+        assert_eq(pair.1.is_ok(), true)
+        sum = sum + pair.1.unwrap()
+    }
+    assert_eq(sum, 3)
+}
+
+test "the Err side of an iterated Result value is an Err, not a decoded ok" {
+    let mut m: Map[Str, Result[Int, Str]] = Map()
+    m.insert("bad", Err("no"))
+    let mut seen = 0
+    for pair in m {
+        assert_eq(pair.1.is_err(), true)
+        seen = seen + 1
+    }
+    assert_eq(seen, 1)
+}
+
+test "the destructuring route on a Result value" {
+    let mut ok = false
+    for (k, v) in qz_mres() {
+        assert_eq(k, "ok")
+        ok = v.is_ok()
+    }
+    assert_eq(ok, true)
+}
+
+test "an Option value whose inner is a struct keeps the struct" {
+    let mut m: Map[Str, Option[Qz16Pt]] = Map()
+    m.insert("k", Some(Qz16Pt { x: 5 }))
+    let mut sum = 0
+    for pair in m {
+        sum = sum + pair.1.unwrap().x
+    }
+    assert_eq(sum, 5)
+}
+
+test "an Option value whose inner is a List keeps the List" {
+    let mut m: Map[Str, Option[List[Int]]] = Map()
+    m.insert("k", Some([1, 2, 3]))
+    let mut n = 0
+    for pair in m {
+        n = n + pair.1.unwrap().len()
+    }
+    assert_eq(n, 3)
+}
+
+test "several entries all decode, not just the first slot" {
+    let mut m: Map[Str, Option[Int]] = Map()
+    m.insert("a", Some(1))
+    m.insert("b", Some(2))
+    m.insert("c", None)
+    let mut sum = 0
+    let mut nones = 0
+    for pair in m {
+        if pair.1.is_some() { sum = sum + pair.1.unwrap() } else { nones = nones + 1 }
+    }
+    assert_eq(sum, 3)
+    assert_eq(nones, 1)
+}
+
+// ── THE BOUNDS ───────────────────────────────────────────────────────────────────────
+// Every value kind that already iterated correctly, so the carrier arm cannot have stolen a
+// case that the flat channels were answering.
+
+test "a scalar value still iterates" {
+    let mut m: Map[Str, Int] = Map()
+    m.insert("a", 1)
+    let mut sum = 0
+    for pair in m {
+        assert_eq(pair.0, "a")
+        sum = sum + pair.1
+    }
+    assert_eq(sum, 1)
+}
+
+test "a struct value still iterates" {
+    let mut m: Map[Str, Qz16Pt] = Map()
+    m.insert("a", Qz16Pt { x: 5 })
+    let mut sum = 0
+    for pair in m {
+        sum = sum + pair.1.x
+    }
+    assert_eq(sum, 5)
+}
+
+test "a List value still iterates" {
+    let mut m: Map[Str, List[Int]] = Map()
+    m.insert("a", [1, 2])
+    let mut n = 0
+    for pair in m {
+        n = n + pair.1.len()
+    }
+    assert_eq(n, 2)
+}
+
+test "a nested-Map value still iterates" {
+    let mut inner: Map[Str, Int] = Map()
+    inner.insert("z", 9)
+    let mut m: Map[Str, Map[Str, Int]] = Map()
+    m.insert("a", inner)
+    let mut n = 0
+    for pair in m {
+        n = n + pair.1.len()
+    }
+    assert_eq(n, 1)
+}
+
+test "a Set value still iterates" {
+    let mut s: Set[Int] = Set()
+    s.insert(3)
+    let mut m: Map[Str, Set[Int]] = Map()
+    m.insert("a", s)
+    let mut n = 0
+    for pair in m {
+        n = n + pair.1.len()
+    }
+    assert_eq(n, 1)
+}
+
+test "a tuple value still iterates" {
+    let mut m: Map[Str, (Int, Int)] = Map()
+    m.insert("a", (4, 5))
+    let mut sum = 0
+    for pair in m {
+        let t = pair.1
+        sum = sum + t.0 + t.1
+    }
+    assert_eq(sum, 9)
+}
+
+test "the dcjy17 routes on the same maps are unchanged" {
+    let m = qz_mopt()
+    assert_eq(m.get("k").unwrap().unwrap(), 7)
+    for k in m.keys() {
+        assert_eq(m.get(k).unwrap().unwrap(), 7)
+    }
+    assert_eq(qz_mres().get("ok").unwrap().unwrap(), 3)
+}
+
+// `m.values()` needs the binding ANNOTATED here. On an unannotated `let m = qz_mopt()` the same
+// loop is an `UnresolvedMethod` on `.unwrap()` — measured, and filed as its own cell: `.values()`
+// reads the Map var's flat value channel, which an unannotated let-from-call never stamped, while
+// `.get` and `.keys()` on that very same var are correct. Different position, so not this fix.
+test "the values() route on the same map is unchanged" {
+    let m: Map[Str, Option[Int]] = qz_mopt()
+    let mut sum = 0
+    for v in m.values() {
+        sum = sum + v.unwrap()
+    }
+    assert_eq(sum, 7)
+}
+
+test "the Map and the pair's key are recovered independently of the value" {
+    let m = qz_mopt()
+    assert_eq(m.len(), 1)
+    assert_eq(m.contains_key("k"), true)
+    let mut keys = 0
+    for pair in m {
+        if pair.0 == "k" { keys = keys + 1 }
+    }
+    assert_eq(keys, 1)
+}
