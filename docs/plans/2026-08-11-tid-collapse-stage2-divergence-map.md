@@ -6789,6 +6789,94 @@ inner *coincides* with the erased default, which is why the bug reads as intermi
 `for`-in straight over the outer list. `task regen` at fixed point; `task ci` exit 0, 683 test files,
 0 failed.
 
+### A `for` binder over a list of containers, and the producer that has no `ScopeVar` — br `bgenc2`
+
+`emit_for_in`'s binder arm builds the loop variable's type from the **iterable's** `ScopeVar`: it reads
+the flat list-element channels of the variable being iterated and copies them onto the binder. A
+`let`-bound or annotated iterable has those channels filled, so the binder is right. A **call**, a
+**method result** or a **struct field** has no `ScopeVar` at all, every read answers `-1`, and `sv_tp`
+supplies the house default:
+
+```
+bucket=diverge site=emit_for_in.var var=m tid=Map[Int, Str] flat=Map[Str, Int]
+bucket=diverge site=emit_for_in.var var=m tid=Map[Str, Str] flat=Map[Str, Int]
+```
+
+`Map[Str, Int]` is not a reading of the program. It is `sv_tp(CT_MAP, -1, -1, "")`, the same
+fabrication this document has named at every other erasure site in it. The tid beside it was already correct,
+which is the whole argument of Stage 3: the answer was in hand at the site that guessed.
+
+**Three element kinds, three different failure modes.** A `Map` element is **silent** — the value type
+comes back `Int`, so `m.get(5)` on a `Map[Int, Str]` yields a pointer printed as `94115272205922`. A
+`List` element is **silent** — the inner element is erased the same way, and in combination with a
+struct inner it segfaults. A `Set` element is **loud**: `internal compiler
+error[SetElementTypeUnknownAtCodegen]`. One cause, so one ticket and one test; but only the third
+kind would ever have been reported by a user as a compiler bug.
+
+The controls are the diagnosis, not decoration. The **index** path (`lm.get(0).unwrap()`), the
+**fn-parameter** path, a binder **passed on** to a typed parameter, a **`let`-bound** iterable and an
+**annotated** declaration were all already correct — each has a `ScopeVar` or a declaration to copy
+from. And `Map[Str, Int]` "works" only because it *is* the fabrication.
+
+#### The fix splits each stamp into a node front and a tid core
+
+`stamp_list_elem_from_tid`, `stamp_map_from_tid` and `stamp_binder_from_tid` all begin by turning a
+node into a tid (`tc_lookup_node_tid` + `tc_tid_subst_mono`) and then act on the tid. A `for` **binder
+is not an expression**, so it has no memoized tid of its own to look up — the tid has to come from the
+iterable's element. Each of the three therefore keeps its node-taking name as a one-line front over a
+new tid-taking core (`stamp_list_elem_from_list_tid`, `stamp_map_from_map_tid`,
+`stamp_binder_from_binder_tid`), and `emit_for_in` calls the core with the element tid it derives
+itself:
+
+```blink
+let binder_tid = tc_tid_subst_mono(tc_tid_resolved(tc_tid_iter_elem(tc_tid_resolved(tc_lookup_node_tid(iter_node)))), cg_mono_tparams_sl, cg_mono_arg_tids)
+if elem_type == CT_MAP || elem_type == CT_LIST || elem_type == CT_SET {
+    stamp_binder_from_binder_tid(binder_tid, var_name, 0)
+}
+```
+
+Two orderings are load-bearing and are the reason this change moves nothing that already worked. The
+call runs **after** `set_var`, which rebuilds the variable's `tp` from scratch and would discard an
+earlier write. And it runs **before** the flat nested-element copies, so a `ScopeVar` that *does* have
+an answer still gets the last word — the tid fills a hole, it does not overrule a working channel.
+That is the opposite precedence from `86kqrf`, where the flat side had no answer to defend and the tid
+had to be the final writer.
+
+`stamp_binder_from_binder_tid` also gains the **CT_SET arm** that the `v71vxv` retraction declined to
+write for want of a measured shape. There is a measured shape now, and the arm keeps the same
+fail-quiet contract as the others: if the tid carries neither a set-element ct nor a struct name it
+returns `false` and leaves the flat channels their answer.
+
+> **Census, monolithic, 972-file common basis (the new test file excluded):**
+> `diverge` rows **29401 → 29398**, cells **744 → 742**, `missing` **73 → 73**, `unknown`
+> **4655 → 4655**, `ctypediv` **276 → 276 rows, identical line for line**. The three rows that moved
+> are all `tuple_destructure.elem`, and they moved to `agree` 1:1 — a **byproduct**, not this
+> ticket's own cell: `tid=Set[Int] flat=Set[?]` and `tid=Set[Str] flat=Set[?]`, from
+> `tests/test_v71vxv_tuple_binder_element_kinds.bl`, `tests/test_ksx1q7_tuple_binder_map_element.bl`
+> and `tests/test_w224zg_map_forin_pair_container_element.bl`. The new CT_SET arm closes the hole
+> those three tickets left open, because tuple binders route through the same core.
+
+`emit_for_in.var` itself stays at 36 cells and 76 rows on that basis, and that is the expected
+result: **the corpus contains no file with this shape**, which is exactly why the cell was never
+published and the bug outlived every ticket this project has closed so far. It took a hand-built program to make the
+tap fire. A zero-hit sweep is an unexercised tap, not coverage.
+
+`agree` rose **672324 → 672576**, and the arithmetic closes exactly: 3 rows are the moved
+`tuple_destructure` Set rows, and the other 249 are `emit_fn_params.param` rows in the 35 corpus files
+that **import the compiler** — 32 files at +7, three at +6 — counting the parameters of the three new
+tid-taking helpers, which are compiler source and therefore part of the corpus they measure.
+
+The new file was attributed in **both** build modes, monolithic and archive-linked, and both leave the
+same single residual row: `site=emit_for_in.var var=inner tid=List[Pt] flat=List[Void]`. That is the
+`(CT_VOID, name)` pointer-boxed struct element — the name travels out of band and the flat *spelling*
+drops it — not a lost inner. The rows that read it (`p.x` summed to 12, `.get(1).unwrap().y`) pass.
+
+Tests: `tests/test_bgenc2_forin_binder_container_elem.bl`, 11 rows — a `Map` value, a `Map` key and
+`.values()`, a `Map[Str, Str]`, a `List` element read two ways, a `List[Pt]`, a `Set[Str]` and a
+`Set[Int]`, and a **struct field** as the iterable, plus four controls that must not move. Every row
+asserts a value, because two of the three failure modes are silent. `task regen` at fixed point;
+`task ci` exit 0; 684 test files, 684 passed, 0 failed.
+
 ## Appendix — all 428 shape cells
 
 Format: `family | occurrences | tid | flat`.

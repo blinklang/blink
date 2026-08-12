@@ -3447,7 +3447,14 @@ pub fn stamp_list_elem_from_tid(node: Int, var_name: Str) -> ListElemStamp {
     // typevar unless it is rewritten through THIS call's binder, exactly what
     // tc_tid_subst_mono exists for. No-op outside a mono body or when node's tid
     // is already concrete.
-    let etid = tc_tid_subst_mono(tc_lookup_node_tid(node), cg_mono_tparams_sl, cg_mono_arg_tids)
+    stamp_list_elem_from_list_tid(tc_tid_subst_mono(tc_lookup_node_tid(node), cg_mono_tparams_sl, cg_mono_arg_tids), var_name)
+}
+
+// br bgenc2: the same stamp for a var that has no node of its own. A `for` BINDER is not an
+// expression, so there is no memoized tid to look up for it — its type is the ITERABLE's element,
+// which the caller already has in hand. Splitting the tid out of the lookup is what lets the binder
+// reuse this instead of growing a second, weaker copy of the ladder.
+pub fn stamp_list_elem_from_list_tid(etid: Int, var_name: Str) -> ListElemStamp {
     let ect = tc_tid_list_elem_ct(etid)
     let tracing = dbg_channel_on("listelem")
     if ect < 0 {
@@ -3597,7 +3604,12 @@ pub fn stamp_list_elem_from_tid(node: Int, var_name: Str) -> ListElemStamp {
 //     channel.
 // Answers whether it stamped, so a caller can keep its own fallback for the decline.
 pub fn stamp_map_from_tid(node: Int, var_name: Str) -> Bool {
-    let mtid = tc_tid_subst_mono(tc_lookup_node_tid(node), cg_mono_tparams_sl, cg_mono_arg_tids)
+    stamp_map_from_map_tid(tc_tid_subst_mono(tc_lookup_node_tid(node), cg_mono_tparams_sl, cg_mono_arg_tids), var_name)
+}
+
+// br bgenc2: the tid-taking core, for a var with no node of its own — see
+// stamp_list_elem_from_list_tid for why a `for` binder needs one.
+pub fn stamp_map_from_map_tid(mtid: Int, var_name: Str) -> Bool {
     if tc_tid_ct(mtid) != CT_MAP { return false }
     let key_tp = deep_tp_from_tid(tc_tid_map_key_tid(mtid))
     let val_tp = deep_tp_from_tid(tc_tid_map_val_tid(mtid))
@@ -3665,12 +3677,21 @@ pub fn stamp_map_from_tid(node: Int, var_name: Str) -> Bool {
 // path exactly — key stamped, value at its existing floor — leaves br dcjy17 one behaviour to fix
 // instead of two.
 pub fn stamp_binder_from_tid(node: Int, var_name: Str, is_mut: Int) -> Bool ! Codegen.Scope {
-    let mtid = tc_tid_subst_mono(tc_lookup_node_tid(node), cg_mono_tparams_sl, cg_mono_arg_tids)
+    stamp_binder_from_binder_tid(tc_tid_subst_mono(tc_lookup_node_tid(node), cg_mono_tparams_sl, cg_mono_arg_tids), var_name, is_mut)
+}
+
+// br bgenc2: the tid-taking core. A `for` binder over a list of CONTAINERS reaches here with the
+// iterable's ELEMENT tid, because the binder has no node whose tid could be looked up. The three
+// kinds it covers fail three different ways without it — a Map value silently fabricated to Int, a
+// List element silently erased, a Set element loud as SetElementTypeUnknownAtCodegen — all from the
+// same cause: the flat channels are copied off the iterable's ScopeVar, and a call, a method result
+// or a struct field has none.
+pub fn stamp_binder_from_binder_tid(mtid: Int, var_name: Str, is_mut: Int) -> Bool ! Codegen.Scope {
     let ct = tc_tid_ct(mtid)
     if dbg_channel_on("binder") != 0 { dbg_trace("binder", "stamp var={var_name} tid={mtid} ct={ct} mut={is_mut}") }
     if ct == CT_MAP {
         set_var(var_name, CT_MAP, is_mut)
-        if stamp_map_from_tid(node, var_name) { return true }
+        if stamp_map_from_map_tid(mtid, var_name) { return true }
         // The value is a kind the three channels cannot hold. Stamp the key on its own: the key
         // is what selects the kops vtable, and leaving it unset is not a floor but a
         // BLINK_COMPILER_BUG_kops_unsupported at the first insert.
@@ -3687,15 +3708,30 @@ pub fn stamp_binder_from_tid(node: Int, var_name: Str, is_mut: Int) -> Bool ! Co
         // would be discarded. stamp_list_elem_from_tid then declines on its own terms for an
         // element it cannot spell faithfully, leaving the element erased rather than fabricated.
         set_var(var_name, CT_LIST, is_mut)
-        stamp_list_elem_from_tid(node, var_name)
+        stamp_list_elem_from_list_tid(mtid, var_name)
+        return true
+    }
+    // br bgenc2: the Set arm the v71vxv retraction below declined to write, now that a shape has
+    // been measured. A `for st in <List[Set[T]]>` binder is NOT the case that retraction covers: it
+    // does not arrive carrying the CT the tid names, it arrives with the CT and NOTHING else, and
+    // reading through it hits mv45y5's loud SetElementTypeUnknownAtCodegen. No deep tree is needed
+    // (E1400 forecloses a container element), so the two flat channels ARE the faithful answer here
+    // — the same pair stamp_list_elem_from_list_tid's CT_SET arm writes one level up.
+    if ct == CT_SET {
+        set_var(var_name, CT_SET, is_mut)
+        let set_ct = tc_tid_set_elem_ct(mtid)
+        let set_struct = tc_tid_set_elem_struct(mtid)
+        if set_ct < 0 && set_struct == "" { return false }
+        if set_ct >= 0 { set_set_elem_type(var_name, set_ct) }
+        if set_struct != "" { set_set_elem_struct(var_name, set_struct) }
         return true
     }
     // NO arm for the remaining kinds, and the reason is a retraction worth keeping. A
-    // StringBuilder / Bytes / Set / Channel binder was reported as losing its CT here (br
-    // v71vxv's first draft) and does not: those reach the binder through the scalar branch
-    // carrying the CT the tid names, and the "failure" behind that report was `sb.append(...)` —
-    // a method StringBuilder does not have. An arm for them would have been dead weight built on
-    // a probe that mis-spelled the API, so the rule stays: no measured shape, no arm.
+    // StringBuilder / Bytes / Channel binder was reported as losing its CT here (br v71vxv's first
+    // draft) and does not: those reach the binder through the scalar branch carrying the CT the tid
+    // names, and the "failure" behind that report was `sb.append(...)` — a method StringBuilder does
+    // not have. An arm for them would have been dead weight built on a probe that mis-spelled the
+    // API, so the rule stays: no measured shape, no arm.
     false
 }
 

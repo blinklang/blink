@@ -1,0 +1,191 @@
+// br bgenc2 — a `for` binder over a list of CONTAINERS must get the container's real type, not
+// sv_tp's fabrication.
+//
+// The binder's metadata is copied from the ITERABLE's ScopeVar. A call, a method result or a
+// struct field has no ScopeVar, so every flat channel reads -1 and `sv_tp` guesses:
+// `sv_tp(CT_MAP, -1, -1, "")` is `Map[Str, Int]`. The census names it exactly, and the tid beside
+// it is already right:
+//
+//     bucket=diverge site=emit_for_in.var var=m tid=Map[Int, Str] flat=Map[Str, Int]
+//     bucket=diverge site=emit_for_in.var var=m tid=Map[Str, Str] flat=Map[Str, Int]
+//
+// No corpus file had this shape, so the cell was never published — it took a hand-built program to
+// make the tap fire. The three element kinds fail three different ways, which is why they are one
+// ticket and one test:
+//
+//   Map  — SILENT. `m.get(k)` returns the fabricated value type, so a Str prints as a pointer.
+//   List — SILENT. The inner list's element is erased the same way.
+//   Set  — LOUD. internal compiler error[SetElementTypeUnknownAtCodegen].
+//
+// The controls are the point of the diagnosis: the same shapes through a LET-BOUND iterable, an
+// ANNOTATED declaration, or a typed fn PARAMETER all worked already, because each of those has a
+// ScopeVar (or a declaration) to copy from. And `Map[Str, Int]` "works" only because it IS the
+// fabrication.
+
+type Pt { x: Int, y: Int }
+
+type Holder { rows: List[Map[Int, Str]] }
+
+fn maps() -> List[Map[Int, Str]] {
+    let m: Map[Int, Str] = Map()
+    m.insert(5, "good")
+    m.insert(6, "also")
+    [m]
+}
+
+fn str_maps() -> List[Map[Str, Str]] {
+    let m: Map[Str, Str] = Map()
+    m.insert("k", "vv")
+    [m]
+}
+
+fn int_maps() -> List[Map[Str, Int]] {
+    let m: Map[Str, Int] = Map()
+    m.insert("k", 42)
+    [m]
+}
+
+fn lists() -> List[List[Str]] { [["a", "bb"], ["c"]] }
+
+fn pt_lists() -> List[List[Pt]] { [[Pt { x: 5, y: 1 }, Pt { x: 7, y: 2 }]] }
+
+fn sets() -> List[Set[Str]] {
+    let s: Set[Str] = Set()
+    s.insert("q")
+    s.insert("r")
+    [s]
+}
+
+fn int_sets() -> List[Set[Int]] {
+    let s: Set[Int] = Set()
+    s.insert(4)
+    s.insert(5)
+    [s]
+}
+
+fn take_map(m: Map[Int, Str]) -> Str {
+    match m.get(5) { Some(s) => { s } None => { "MISS" } }
+}
+
+// ── The rows: a binder over a call-returned list of containers ────────────────────
+
+test "a Map element's value type survives a for-in binder" {
+    let mut acc = ""
+    for m in maps() {
+        match m.get(5) { Some(s) => { acc = "{acc}{s}" } None => { acc = "{acc}MISS" } }
+        match m.get(6) { Some(s) => { acc = "{acc}{s}" } None => { acc = "{acc}MISS" } }
+        match m.get(7) { Some(s) => { acc = "{acc}{s}" } None => { acc = "{acc}-" } }
+    }
+    assert_eq(acc, "goodalso-")
+}
+
+test "a Map element's key type survives a for-in binder" {
+    let mut keysum = 0
+    let mut vlen = 0
+    for m in maps() {
+        assert_eq(m.len(), 2)
+        for k in m.keys() { keysum = keysum + k }
+        for v in m.values() { vlen = vlen + v.len() }
+    }
+    assert_eq(keysum, 11)
+    assert_eq(vlen, 8)
+}
+
+test "a Map[Str, Str] element is not the fabricated pair either" {
+    let mut acc = ""
+    for m in str_maps() {
+        match m.get("k") { Some(s) => { acc = "{acc}{s}" } None => { acc = "{acc}MISS" } }
+    }
+    assert_eq(acc, "vv")
+}
+
+test "a List element's own element survives a for-in binder" {
+    let mut acc = ""
+    for inner in lists() {
+        for s in inner { acc = "{acc}{s}" }
+    }
+    assert_eq(acc, "abbc")
+
+    let mut second = ""
+    for inner in lists() {
+        match inner.get(0) { Some(s) => { second = "{second}{s}" } None => { second = "{second}MISS" } }
+    }
+    assert_eq(second, "ac")
+}
+
+test "a List[Pt] element's struct element survives a for-in binder" {
+    let mut xs = 0
+    for inner in pt_lists() {
+        for p in inner { xs = xs + p.x }
+        assert_eq(inner.get(1).unwrap().y, 2)
+    }
+    assert_eq(xs, 12)
+}
+
+test "a Set element's own element survives a for-in binder" {
+    let mut acc = 0
+    for st in sets() {
+        assert_eq(st.len(), 2)
+        assert(st.contains("q"))
+        assert(!st.contains("z"))
+        for s in st { acc = acc + s.len() }
+    }
+    assert_eq(acc, 2)
+
+    let mut n = 0
+    for st in int_sets() {
+        for x in st { n = n + x }
+        assert(st.contains(4))
+    }
+    assert_eq(n, 9)
+}
+
+test "a struct field is a producer with no ScopeVar either" {
+    let h = Holder { rows: maps() }
+    let mut acc = ""
+    for m in h.rows {
+        match m.get(6) { Some(s) => { acc = "{acc}{s}" } None => { acc = "{acc}MISS" } }
+    }
+    assert_eq(acc, "also")
+}
+
+// ── Controls: the producers that already had somewhere to copy from ───────────────
+
+test "a let-bound iterable is unchanged" {
+    let lm = maps()
+    let mut acc = ""
+    for m in lm {
+        match m.get(5) { Some(s) => { acc = "{acc}{s}" } None => { acc = "{acc}MISS" } }
+    }
+    assert_eq(acc, "good")
+
+    let ll = lists()
+    let mut sacc = ""
+    for inner in ll {
+        for s in inner { sacc = "{sacc}{s}" }
+    }
+    assert_eq(sacc, "abbc")
+}
+
+test "an annotated declaration is unchanged" {
+    let lm: List[Map[Int, Str]] = maps()
+    let mut acc = ""
+    for m in lm {
+        match m.get(6) { Some(s) => { acc = "{acc}{s}" } None => { acc = "{acc}MISS" } }
+    }
+    assert_eq(acc, "also")
+}
+
+test "a binder handed to a typed parameter was never broken" {
+    let mut acc = ""
+    for m in maps() { acc = "{acc}{take_map(m)}" }
+    assert_eq(acc, "good")
+}
+
+test "Map[Str, Int] is the shape that coincides with the fabrication" {
+    let mut n = 0
+    for m in int_maps() {
+        match m.get("k") { Some(v) => { n = n + v } None => { n = -1 } }
+    }
+    assert_eq(n, 42)
+}
