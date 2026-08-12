@@ -4595,6 +4595,139 @@ Six files carried them, and every one calls only `.is_null()` or `.to_str()` on 
 the four regression pins are the annotated forms plus `is_null`/`to_str`/`addr`, i.e. exactly
 what the corpus *was* covering.
 
+## Stage 3c — the enum bucket, and the census collapses (br `0rmamy`)
+
+Date: 2026-08-12. `task regen` green after the gen1 promotion; `task ci` green (661/661 tests,
+1542 fmt rows). **`ctype.flat` diverge 974 → 9. Total diverge on the 874-file basis: 988 → 23.**
+
+### The cause was `infer_enum_from_node`, and the axis is not the producer
+
+`emit_let_binding` gets its enum name from `infer_enum_from_node(val_node)` — an inference over
+the RHS **syntax**. It goes blank the moment the value arrives through a plain call or an
+anonymous C temporary, and the declaration then falls through to `c_type_str(CT_ENUM)`, which is
+`int64_t`.
+
+Measured by emitting C for one probe per position rather than by reading the code. Six positions
+lose the enum name and five keep it:
+
+| lost | kept |
+|---|---|
+| a plain call return, `pick()` | variant construction, `Col.Green` |
+| a `match` expression's value | a field read, `bx.k` |
+| an `if` expression's value | a trait-method return |
+| a `mut` local bound to a call | a generic fn's return, `idc(Col.Green)` |
+| `list.get(0).unwrap()` | `.unwrap()` on an **annotated** `Option[Col]` local |
+| `map.get(k) ?? Col.Green` | |
+
+The axis is not *which producer* but **whether the value passes through an anonymous C temporary
+(`_match_4`, `_if_11`, `_ounw_8`, `__opt10`) or a bare call** — the flat fields carry an enum's
+name in `sname`, and nothing stamps `sname` on a temp. The right-hand column is exactly the set
+of positions where some earlier ticket hand-wired the name through. That is the
+(position × shape) cartesian product from the plan's root-cause section, visible in one probe.
+
+This also **corrected an earlier note on the ticket**, which had recorded `Option.unwrap()` as a
+wrong producer. `.unwrap()` on an annotated `Option[Col]` local is right; `.unwrap()` reached
+through an anonymous Option temp is wrong. Same method, different position — which is the point
+above, and the reason the earlier note read as "two wrong producers" instead of one rule.
+
+### The arm's placement is the load-bearing decision
+
+`enum_tid` sits **after** every branch that already spells an enum. The `enum`/`enum_mono` arm
+keeps the bindings whose flat `enum_type` survived; the new arm only catches the ones where it
+went blank. Placing it earlier would take bindings away from arms that already spell them
+correctly — a regression that **no failing row would reveal**, since both arms print a
+`blink_*` name. The five "was already right" rows in the test exist to hold that ordering, and
+they are the reason the test has eleven positions rather than six.
+
+Two declines in `enum_c_from_tid`, both deliberate: a **generic enum instance** has children so
+`c_type_from_tid` returns `""` and the `enum_mono` arm keeps ownership of per-instantiation
+spelling (br `jjhnf3`); a **transparent newtype** spells `int64_t` (br `ja9jev`), which is what
+the flat path already prints, so declining on equality leaves that decision untouched. Same
+decline-on-no-improvement contract as `ptr_c_from_tid` in Stage 3b.
+
+### The bootstrap needed the two-regen promotion, and its diff is the verification
+
+Unlike Stage 3b (whose nine rows were all in `tests/`), this flip changes the **compiler's own**
+emitted C, so the first bootstrap fails `gen1.c != gen2.c` **by construction**: gen1.c is
+produced by the old binary from new source, gen2.c by the new binary
+(`project_codegen_emit_string_bootstrap`). `cp build/blinkc_gen1 build/blinkc`, re-run, fixed
+point restored.
+
+The failing diff is the best evidence this sub-step produced — **31 lines, and every one of them
+this shape**:
+
+```
+-        const int64_t assert_kind = blink_parser_peek_kind();
++        const blink_tokens_TokenKind assert_kind = blink_parser_peek_kind();
+```
+
+28 `blink_typecheck_TyKind` + 3 `blink_tokens_TokenKind`, nothing else. A change to the
+compiler's own output that can be read in full and matched line-for-line against the census is a
+stronger statement than a green test suite, and it is only available because the bootstrap
+diffs gen1 against gen2 instead of trusting either.
+
+### Why the test asserts on emitted C
+
+Every other cell closed in this project got a test that runs a program and reads a value back.
+This one cannot, and the test file says so at length instead of pretending otherwise: C converts
+enum↔int implicitly, so `int64_t c = blink_u_pick();` followed by
+`blink_u_score(c)` — declared `int64_t blink_u_score(blink_Col c)` — is well-formed and computes
+the right answer on every mainstream target. **The emitted C is the observable for this cell.**
+A runtime test would have passed before the fix, which is precisely why 966 rows survived this
+long: nothing observable depended on them.
+
+What still matters is that a declaration reading `int64_t` has thrown away the fact that the
+local holds a `Col`, so everything downstream — a debugger, a narrower target where the widths
+differ, and above all the next codegen change that reads a declaration back — must re-derive it
+from a side channel. That re-derivation is the bug family the collapse exists to end.
+
+One harness fact worth reusing: `generate` opens with `debug_assert(cg_lines.len() == 0)` and
+does not clear the buffer on exit, so **it may be called exactly once per process**. The test
+caches its emitted C in a module global; without that, `task ci` (which runs tests in debug
+mode) trips the assert on the second row — and `build/blink run` without `--debug` does not,
+which is a good reason to run a new test both ways before believing it.
+
+### Census after Stage 3c
+
+| | before 3b | after 3c |
+|---|---:|---:|
+| `ctype.flat` diverge | 981 | **9** |
+| `ctype.struct` diverge | 8 | 8 |
+| `ctype.void_placeholder` diverge | 6 | 6 |
+| declines (all sites) | 250 | 250 |
+| **total residual** | **1245** | **273** |
+
+The 23 remaining diverge rows are the documented class-(v) set plus one new ticket:
+
+- 6 `Void` placeholders — a *storage*-position rule (br `hsgsbp`), not a spelling defect
+- 5 `ty=Int tidc=int64_t emitted=int` at `src/codegen.bl:452` — a `Bool + Bool` sum in an `int` slot
+- 3 `Void`-vs-`int64_t` at with-ptr bindings, where typecheck and codegen disagree about the type
+- 8 generic-fn tuple returns erasing a Map — a deliberate mono convention; unifying it would
+  fragment one C struct into N identical ones
+- **1 `U64` row → br `tm1vbv`**, filed: a mono'd typevar local of an unsigned type declared
+  `int64_t`. The last class-(i) row. Split out rather than folded in because signedness changes
+  what `<`, `>>` and `/` **mean** for the same bits — the correct meaning for a `U64`, but a
+  behaviour change rather than a representational one, so it needs a test that runs comparison
+  and division above 2^63 and not just a declaration pin.
+
+The 250 declines are unchanged and stay that way: 164 by design (mono spelling is a separate
+seam) and 87 family-A rows whose tid is itself `?`, held on the four undecided causes
+(`qzdz2e` panel, `w3v2e6` blocked on `8vcj2c`, `jr4xf7` and `mwsy85` `type:spec`).
+
+**So Stage 3's exit criterion is now within reach of decisions rather than of work**: of 1245
+residual rows, 273 remain, 250 of those are declines-by-contract or blocked on panel questions,
+and the 23 diverge rows are five documented conventions and one filed ticket.
+
+### The anonymous temporaries are still `int64_t`, and that is stated, not hidden
+
+`_match_4`, `_if_11`, `_ounw_8` and `__opt10` keep their erased declarations after this fix.
+They are a different emit seam (`codegen_expr`), they are **not** in the ctypediv census — which
+probes `emit_let_binding`'s declaration chain and nothing else — and `int64_t` → enum assignment
+is a legal implicit conversion, so the declarations this sub-step fixed are correct regardless.
+A future sub-step that adds a ctypediv probe at the temp emit sites would enumerate them the
+same way this one enumerated the locals. Naming the uncovered seam is the point: a census is
+only trustworthy if its boundary is written down (`feedback_corpus_sweep_is_not_coverage`).
+
 ## Appendix — all 428 shape cells
 
 Format: `family | occurrences | tid | flat`.

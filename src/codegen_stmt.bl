@@ -3200,6 +3200,27 @@ fn let_binding_tid(node: Int, type_ann: Int, val_node: Int) -> Int {
 // authority away from them. Only a tid that carries a real pointee (`uint8_t*`, `int64_t*`,
 // `blink_Pollfd*`) changes a declaration, which is what makes the emitted-C diff for this
 // sub-step exactly the set of rows the ctypediv sweep named.
+// br 0rmamy. The C typedef of a unit-only enum local, spelled from the tid — "" when the tid
+// cannot improve on what the flat path already prints.
+//
+// `infer_enum_from_node` recognises an enum by looking at the RHS *syntax* (a variant
+// construction, a field read), so it goes blank the moment the value arrives through a plain
+// call or an anonymous C temporary — and the declaration then falls to `c_type_str(CT_ENUM)`,
+// which is `int64_t`. The tid knows the type in every one of those positions.
+//
+// Two declines, both load-bearing:
+//   - a GENERIC enum instance has children, so `c_type_from_tid` returns "" and the existing
+//     `enum_mono` arm above keeps ownership of the per-instantiation spelling (br jjhnf3);
+//   - a TRANSPARENT NEWTYPE spells `int64_t` (br ja9jev), which is what the flat path already
+//     prints, so declining on equality leaves that decision exactly where it is.
+fn enum_c_from_tid(tid: Int) -> Str {
+    if tid < 0 { return "" }
+    if tc_tid_kind(tc_tid_resolved(tid)) != TyKind.Enum { return "" }
+    let c = c_type_from_tid(tid)
+    if c == "int64_t" { return "" }
+    c
+}
+
 fn ptr_c_from_tid(tid: Int) -> Str {
     if tid < 0 { return "" }
     if tc_tid_kind(tc_tid_resolved(tid)) != TyKind.Ptr { return "" }
@@ -3902,6 +3923,22 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
         decl_c = "{c_type_c_name(ffi_offset_pending_struct)}*"
         decl_branch = "ptr_ffi"
         emit_line("{c_type_c_name(ffi_offset_pending_struct)}* {cname} = {val_str};")
+    } else if enum_c_from_tid(decl_tid) != "" {
+        // br 0rmamy, the second authority flip. Deliberately placed AFTER every branch that
+        // already spells an enum — the `enum`/`enum_mono` arm above owns the bindings whose
+        // flat `enum_type` survived, and this arm only catches the ones where it went blank.
+        // Ordering it earlier would take those bindings away from arms some earlier ticket
+        // wired correctly, which is a regression no failing row would reveal; the five
+        // "was already right" pins in tests/test_0rmamy_enum_local_decl_typedef.bl exist to
+        // hold this ordering.
+        let enum_c = enum_c_from_tid(decl_tid)
+        decl_c = enum_c
+        decl_branch = "enum_tid"
+        if is_mut != 0 {
+            emit_line("{enum_c} {cname} = {val_str};")
+        } else {
+            emit_line("const {enum_c} {cname} = {val_str};")
+        }
     } else if val_type == CT_PTR && ptr_c_from_tid(decl_tid) != "" {
         // br q3ssqw, and the first site where the tid GOVERNS rather than being measured.
         // The two branches above read a pointee out of the binding's own annotation and out of

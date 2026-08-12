@@ -1,0 +1,259 @@
+// br 0rmamy — an unannotated local holding a unit-only enum is declared `int64_t` in C, even
+// though the enum has a real typedef (`typedef enum { blink_Col_Red, ... } blink_Col;`) that
+// codegen emits two hundred lines earlier and uses correctly for other bindings.
+//
+// THIS TEST ASSERTS ON EMITTED C, DELIBERATELY, AND THAT IS THE HONEST SHAPE FOR THIS CELL.
+// Every other cell closed in this project got a test that RUNS a program and reads a value
+// back, because the defect changed behaviour. This one does not, and pretending otherwise
+// would produce a test that passes before the fix:
+//
+//   C converts enum <-> int implicitly, so `int64_t c = blink_u_pick();` followed by
+//   `blink_u_score(c)` (declared `int64_t blink_u_score(blink_Col c)`) is well-formed and
+//   computes the right answer on every mainstream target.
+//
+// So the emitted C *is* the observable here. The 966 rows in the Stage 3a ctypediv census
+// (docs/plans/2026-08-11-tid-collapse-stage2-divergence-map.md) are a divergence between two
+// type authorities, not a miscompile, and the test that pins the fix has to look where the
+// divergence lives. Stating that plainly is worth more than a runtime assertion that cannot
+// fail: the reason this cell survived at all is that nothing observable depended on it.
+//
+// WHY IT STILL MATTERS. A local whose C type says `int64_t` has thrown away the fact that it
+// holds a `Col`. Everything downstream that wants that fact — a debugger, a `_Generic`
+// dispatch, a narrower target where enum and int64_t differ in width, and above all the next
+// codegen change that reads a declaration back — has to re-derive it from a side channel. That
+// re-derivation is the bug family this whole collapse exists to end.
+//
+// ── THE MEASURED AXIS ────────────────────────────────────────────────────────────────
+//
+// Measured by emitting C for one probe per position (.tmp/0rmamy/enum_prod.bl), not by reading
+// the code and guessing. Six positions LOSE the enum name and five KEEP it:
+//
+//   lost                                     kept
+//   ----                                     ----
+//   a plain call return, `pick()`             variant construction, `Col.Green`
+//   a `match` expression's value              a field read, `bx.k`
+//   an `if` expression's value                a trait-method return
+//   a `mut` local bound to a call             a generic fn's return, `idc(Col.Green)`
+//   `list.get(0).unwrap()`                    `.unwrap()` on an ANNOTATED Option[Col] local
+//   `map.get(k) ?? Col.Green`
+//
+// The pattern is not "which producer" but WHETHER THE VALUE PASSES THROUGH AN ANONYMOUS C
+// TEMPORARY (`_match_4`, `_if_11`, `_ounw_8`, `__opt10`) OR A BARE CALL. The flat ScopeVar
+// fields carry an enum's NAME in `sname`, and nothing stamps `sname` on a temp — so the
+// declaration falls through to `c_type_str(CT_ENUM)`. The right-hand column is exactly the set
+// of positions where some earlier ticket hand-wired the name through. That is the
+// (position x shape) cartesian product the plan's root-cause section describes, in miniature.
+//
+// A CORRECTION TO AN EARLIER NOTE ON THIS TICKET: it recorded `Option.unwrap()` as a wrong
+// producer alongside the call return. Re-measured here, `.unwrap()` on an annotated
+// `Option[Col]` local is CORRECT (`const blink_Col col_from_unwrap = _ounv_2;`); what fails is
+// `.unwrap()` reached through an anonymous Option temp, as in `list.get(0).unwrap()`. Same
+// method, different position — which is the point above.
+//
+// ── SCOPE ────────────────────────────────────────────────────────────────────────────
+//
+// The anonymous temporaries THEMSELVES are still declared `int64_t` after this fix. They are a
+// different emit seam (codegen_expr), they are not in the ctypediv census (which probes
+// `emit_let_binding`'s declaration chain), and int64_t -> enum assignment is a legal implicit
+// conversion, so the declarations this test pins are correct regardless. Not silently left out:
+// see the doc section for the seam and why it is not folded in here.
+
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import codegen.{generate}
+import std.io
+// codegen_types resolves globals out of the MERGED program that it cannot import; a bare
+// `import codegen_expr` closes those back-references. `blink check` reports it UNUSED — it is
+// not. See tests/test_tc_tid_structural_accessors.bl's header.
+import codegen_expr
+
+// One probe program for every row, so the whole (position x kept/lost) table above is a single
+// compile and the rows cannot drift apart. `score` exists to consume each binding: an unused
+// local is not declared at all, so without it there would be nothing to assert against.
+fn probe_src() -> Str {
+    let mut s = "type Col \{ Red, Green }\n"
+    s = s.concat("type Bx \{ k: Col }\n")
+    s = s.concat("trait Pick \{\n    fn pick_it(self) -> Col\n}\n")
+    s = s.concat("impl Pick for Bx \{\n    fn pick_it(self) -> Col \{ self.k }\n}\n")
+    s = s.concat("fn pick() -> Col \{ Col.Red }\n")
+    s = s.concat("fn idc[T](x: T) -> T \{ x }\n")
+    s = s.concat("fn score(c: Col) -> Int \{\n    match c \{\n        Col.Red => 1\n        Col.Green => 2\n    }\n}\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let from_call = pick()\n")
+    s = s.concat("    let from_variant = Col.Green\n")
+    s = s.concat("    let opt: Option[Col] = Some(Col.Red)\n")
+    s = s.concat("    let from_unwrap = opt.unwrap()\n")
+    s = s.concat("    let bx = Bx \{ k: Col.Green }\n")
+    s = s.concat("    let from_field = bx.k\n")
+    s = s.concat("    let from_method = Bx \{ k: Col.Red }.pick_it()\n")
+    s = s.concat("    let from_generic = idc(Col.Green)\n")
+    s = s.concat("    let from_match = match 1 \{\n        1 => Col.Red\n        _ => Col.Green\n    }\n")
+    s = s.concat("    let mut from_mut = pick()\n")
+    s = s.concat("    from_mut = Col.Green\n")
+    s = s.concat("    let l: List[Col] = [Col.Red]\n")
+    s = s.concat("    let from_list = l.get(0).unwrap()\n")
+    s = s.concat("    let mp: Map[Str, Col] = Map()\n")
+    s = s.concat("    let from_map = mp.get(\"x\") ?? Col.Green\n")
+    s = s.concat("    let from_if = if true \{ Col.Red } else \{ Col.Green }\n")
+    s = s.concat("    let total = score(from_call) + score(from_variant) + score(from_unwrap) + score(from_field)\n")
+    s = s.concat("    let more = score(from_method) + score(from_generic) + score(from_match) + score(from_mut)\n")
+    s = s.concat("    let rest = score(from_list) + score(from_map) + score(from_if)\n")
+    s = s.concat("    io.println(\"\{total} \{more} \{rest}\")\n")
+    s = s.concat("}\n")
+    s
+}
+
+// `generate` opens with `debug_assert(cg_lines.len() == 0, "cg_lines not reset")`
+// (src/codegen.bl:431) and does not clear that buffer on the way out, so it may be called
+// exactly ONCE per process — a second call trips the assert under `task test`, which runs in
+// debug mode. Hence the cache: the alternative is folding all twelve rows into one test, and
+// then the first failing position aborts the row and the other ten go unreported.
+let mut probe_c = ""
+
+fn emitted_c() -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Codegen {
+    if probe_c != "" { return probe_c }
+    let path = "build/enum_local_decl_probe.bl"
+    write_file(path, probe_src())
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let c = generate(program)
+    // Removed BEFORE any row assertion, so a failing row never leaks the probe file.
+    fs.remove(path)
+    probe_c = c
+    c
+}
+
+// The enum typedef must exist for any of this to mean anything: if codegen stopped emitting it,
+// every row below would fail for the wrong reason and the message would not say so.
+fn assert_typedef(c: Str) {
+    if !c.contains("} blink_Col;") {
+        io.println("FAIL: emitted C has no `blink_Col` typedef — the rows below cannot be read")
+    }
+    assert(c.contains("} blink_Col;"))
+}
+
+// A declaration is pinned from BOTH sides: the enum spelling must appear AND the erased
+// spelling must not. One side alone is not enough — `contains("blink_Col x")` would also pass
+// if codegen emitted two declarations for `x`, and `!contains("int64_t x")` would pass if it
+// emitted none at all.
+fn assert_decl_enum(c: Str, name: Str) {
+    let want = "blink_Col {name} ="
+    let bad = "int64_t {name} ="
+    if !c.contains(want) { io.println("FAIL: `{want}` not in emitted C (still erased?)") }
+    if c.contains(bad) { io.println("FAIL: `{bad}` still in emitted C") }
+    assert(c.contains(want))
+    assert(!c.contains(bad))
+}
+
+// ════ The six positions that lost the enum name ═══════════════════════════════
+//
+// One test per position rather than one test with six rows: these are six independent cells of
+// the same census, and a failure should name which position regressed.
+
+test "a local bound to a plain call return is declared with the enum typedef" {
+    let c = emitted_c()
+    assert_typedef(c)
+    assert_decl_enum(c, "from_call")
+}
+
+test "a local bound to a match expression is declared with the enum typedef" {
+    assert_decl_enum(emitted_c(), "from_match")
+}
+
+test "a local bound to an if expression is declared with the enum typedef" {
+    assert_decl_enum(emitted_c(), "from_if")
+}
+
+// The mut row is separate because it takes a different arm of the declaration chain (no
+// `const`), so a fix that only handled immutable bindings would pass every row but this one.
+test "a mut local bound to a call return is declared with the enum typedef" {
+    assert_decl_enum(emitted_c(), "from_mut")
+}
+
+test "a local bound to unwrap through an anonymous Option temp is declared with the enum typedef" {
+    assert_decl_enum(emitted_c(), "from_list")
+}
+
+test "a local bound to ?? over an Option temp is declared with the enum typedef" {
+    assert_decl_enum(emitted_c(), "from_map")
+}
+
+// ════ Regression pins — the five positions that were already right ════════════
+//
+// These passed before the fix. They are here because the fix adds an arm to a chain that all
+// eleven positions walk, and an arm placed too early would capture a binding some earlier
+// ticket had already wired correctly — a silent regression that no failing row would reveal.
+
+test "variant construction was already right" {
+    assert_decl_enum(emitted_c(), "from_variant")
+}
+
+test "a field read was already right" {
+    assert_decl_enum(emitted_c(), "from_field")
+}
+
+test "a trait method return was already right" {
+    assert_decl_enum(emitted_c(), "from_method")
+}
+
+test "a generic fn return was already right" {
+    assert_decl_enum(emitted_c(), "from_generic")
+}
+
+test "unwrap on an annotated Option local was already right" {
+    assert_decl_enum(emitted_c(), "from_unwrap")
+}
+
+// ════ The probe program must still be a correct program ═══════════════════════
+//
+// Emitted C is what the rows above read, so on its own this file could pass while emitting C
+// that does not compile or computes the wrong answer. This row closes that hole by RUNNING the
+// same eleven bindings: 1+2+1+2 / 2+2+1+2 / 1+2+1 = 6 / 7 / 4.
+test "all eleven enum bindings still compute the right values" {
+    let from_call = probe_pick()
+    let from_variant = Col.Green
+    let opt: Option[Col] = Some(Col.Red)
+    let from_unwrap = opt.unwrap()
+    let bx = Bx { k: Col.Green }
+    let from_field = bx.k
+    let from_method = Bx { k: Col.Red }.pick_it()
+    let from_generic = probe_idc(Col.Green)
+    let from_match = match 1 {
+        1 => Col.Red
+        _ => Col.Green
+    }
+    let mut from_mut = probe_pick()
+    from_mut = Col.Green
+    let l: List[Col] = [Col.Red]
+    let from_list = l.get(0).unwrap()
+    let mp: Map[Str, Col] = Map()
+    let from_map = mp.get("x") ?? Col.Green
+    let from_if = if true { Col.Red } else { Col.Green }
+    assert_eq(probe_score(from_call) + probe_score(from_variant), 3)
+    assert_eq(probe_score(from_unwrap) + probe_score(from_field), 3)
+    assert_eq(probe_score(from_method) + probe_score(from_generic), 3)
+    assert_eq(probe_score(from_match) + probe_score(from_mut), 3)
+    assert_eq(probe_score(from_list) + probe_score(from_map) + probe_score(from_if), 4)
+    assert_eq(probe_score(from_if), 1)
+}
+
+type Col { Red, Green }
+type Bx { k: Col }
+
+trait Pick {
+    fn pick_it(self) -> Col
+}
+
+impl Pick for Bx {
+    fn pick_it(self) -> Col { self.k }
+}
+
+fn probe_pick() -> Col { Col.Red }
+fn probe_idc[T](x: T) -> T { x }
+
+fn probe_score(c: Col) -> Int {
+    match c {
+        Col.Red => 1
+        Col.Green => 2
+    }
+}
