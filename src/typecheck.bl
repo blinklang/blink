@@ -2077,6 +2077,75 @@ fn check_builtin_arg(method: Str, arg_idx: Int, expected_t: Int, args_sl: Int, c
     check_arg_value("{container_label}.{method}", arg_idx, expected_t, sublist_get(args_sl, arg_idx))
 }
 
+// A signature typecheck holds for a namespace intrinsic — a method codegen emits directly
+// rather than resolving to a Blink function. Registered into fnsig_pool under the qualified
+// key `{namespace}.{method}`, which no user function can spell (register_fn_sig separates a
+// module qualifier with a COLON), so the whole existing fnsig machinery applies: lookup_fnsig
+// finds it, check_arg_shapes reports "argument 2 of 'net.listen' expects Int, got Str", and
+// `.ret` is the return tid.
+fn register_intrinsic_fn_sig(key: Str, params: List[Int], ret: Int) {
+    let start = fnsig_param_list.len()
+    let mut i = 0
+    while i < params.len() {
+        fnsig_param_list.push(params.get(i).unwrap())
+        i = i + 1
+    }
+    fnsig_map.insert(key, fnsig_pool.len())
+    fnsig_pool.push(FnSigEntry { name: key, ret: ret, params_start: start, params_count: params.len(), type_params_start: fnsig_type_param_names.len(), type_params_count: 0, effects_start: fnsig_effect_names.len(), effects_count: 0 })
+}
+
+// br qjfwc6. The signature of every namespace intrinsic typecheck is allowed to know.
+//
+// Codegen has always known all of them: each emitter at codegen_methods.bl:2651-3640 sets
+// `expr_result_type` for its own method, and that is where the C types come from. Typecheck
+// knew two — `time.read` and `time.sleep`, both spelled as inline arms — so every other
+// intrinsic call fell out of the gate with no type at all. TYPE_UNKNOWN unifies with
+// anything, so both halves failed open: the declared type was never compared and the
+// arguments were never checked, and each escaped to the C compiler or to a silent
+// miscompile (`let bad: Str = net.connect(host, port)` compiled AND RAN).
+//
+// This is a table, not one arm per method, because the arms are the disease: codegen already
+// carries one per intrinsic and typecheck reading a table keeps the two from drifting apart
+// method by method. The parameter tids are the reason the table has to exist at all — the
+// return tid alone would leave `net.listen(4242, "localhost")` for cc.
+//
+// Deliberately absent, each because what its signature IS is an open question, not where it
+// lives (see the ticket):
+//   - `fs.read/write/list_dir/remove` — sections/04_effects.md:73,157 spells `fs.read(path)?`
+//     as a Result and names the lister `fs.list`, while codegen emits a bare `const char*`
+//     from `blink_read_file`. A spec answer has to come first.
+//   - `net.request` — its `Result[Response, NetError]` needs two stdlib struct types that a
+//     consuming module need not have imported.
+//   - `io.println/print/eprintln` — Void statements with a value-typed argument; no divergence
+//     to fix, and an arity or parameter claim here could only be wrong.
+//   - `io.debug` — listed by is_intrinsic_method (codegen_types.bl:8091), emitted by no arm.
+//   - `io.read_bytes`, `env.var` — emitted by an arm but NOT listed by is_intrinsic_method, so
+//     they take the `== 0` path and resolve through lookup_fnsig on the BARE method name.
+fn register_ns_intrinsic_sigs() {
+    let bytes_t = new_type(TyKind.Bytes, "Bytes")
+
+    // net.* — fds are bare Int, per lib/std/net_tcp.bl which wraps them.
+    register_intrinsic_fn_sig("net.connect", [TYPE_STR, TYPE_INT], TYPE_INT)
+    register_intrinsic_fn_sig("net.listen", [TYPE_STR, TYPE_INT], TYPE_INT)
+    register_intrinsic_fn_sig("net.accept", [TYPE_INT], TYPE_INT)
+    register_intrinsic_fn_sig("net.read", [TYPE_INT, TYPE_INT], TYPE_STR)
+    register_intrinsic_fn_sig("net.read_all", [TYPE_INT], TYPE_STR)
+    register_intrinsic_fn_sig("net.read_line", [TYPE_INT], TYPE_STR)
+    register_intrinsic_fn_sig("net.read_bytes", [TYPE_INT, TYPE_INT], bytes_t)
+    register_intrinsic_fn_sig("net.write", [TYPE_INT, TYPE_STR], TYPE_VOID)
+    register_intrinsic_fn_sig("net.write_bytes", [TYPE_INT, bytes_t], TYPE_INT)
+    register_intrinsic_fn_sig("net.set_timeout", [TYPE_INT, TYPE_INT], TYPE_VOID)
+    register_intrinsic_fn_sig("net.close", [TYPE_INT], TYPE_VOID)
+
+    register_intrinsic_fn_sig("io.read_line", [], TYPE_STR)
+
+    register_intrinsic_fn_sig("term.isatty", [TYPE_INT], TYPE_INT)
+    register_intrinsic_fn_sig("term.width", [], TYPE_INT)
+    register_intrinsic_fn_sig("term.height", [], TYPE_INT)
+
+    register_intrinsic_fn_sig("env.args", [], make_list_type(TYPE_STR))
+}
+
 // The closure argument at `idx`, or -1 if absent. The closure validators below
 // tolerate -1 (they no-op on a non-Closure node), so call sites need no guard.
 fn closure_arg_at(args_sl: Int, idx: Int) -> Int {
@@ -5202,6 +5271,9 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
 
     // Validate trait impl contracts
     validate_trait_impls(program)
+
+    // The signatures of the namespace intrinsics codegen emits directly (br qjfwc6).
+    register_ns_intrinsic_sigs()
 
     // Register user-defined effect handle names, and the SIGNATURE of every operation
     // they declare (br h3q81d). The handle name alone only suppresses the UnknownMethod
@@ -9430,6 +9502,30 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                     return ensure_runtime_struct_type("Instant", ["nanos"], [TYPE_INT])
                 }
                 if obj_name == "time" && method == "sleep" { return TYPE_VOID }
+            }
+            // br qjfwc6. Every other namespace intrinsic, from the table
+            // register_ns_intrinsic_sigs put in fnsig_pool under `{namespace}.{method}`.
+            // Not gated on is_import_module_name, unlike the time.* arms above: an
+            // intrinsic needs no import (that is what makes it an intrinsic), and
+            // is_intrinsic_method already restricts the namespace. nr_is_defined keeps a
+            // local that shadows the namespace spelling on its own receiver-typed arm.
+            if nr_is_defined(obj_name) == 0 && is_intrinsic_method(obj_name, method) != 0 {
+                let nsi = lookup_fnsig("{obj_name}.{method}")
+                if nsi != -1 {
+                    let nsi_fs = fnsig_pool.get(nsi).unwrap()
+                    let nsi_args = node_args(node)
+                    let mut nsi_got = 0
+                    if nsi_args != -1 { nsi_got = sublist_length(nsi_args) }
+                    // The arity check is not a nicety: codegen indexes the argument list
+                    // positionally and unconditionally, so `net.listen("localhost")`
+                    // panics the compiler at parser.bl:111 (unwrap on the missing node)
+                    // instead of reporting anything.
+                    if nsi_got != nsi_fs.params_count {
+                        tc_error_at("function '{obj_name}.{method}' expects {nsi_fs.params_count} argument(s), got {nsi_got}", node)
+                    }
+                    check_arg_shapes("{obj_name}.{method}", nsi, nsi_args, 0)
+                    return nsi_fs.ret
+                }
             }
             if is_import_module_name(obj_name) != 0 && nr_is_defined(obj_name) == 0 && is_intrinsic_method(obj_name, method) == 0 {
                 let sig = lookup_fnsig(method)

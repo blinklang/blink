@@ -1,0 +1,229 @@
+// br qjfwc6 — a namespace intrinsic has no typecheck-side signature, so every call to one
+// resolves to TYPE_UNKNOWN.
+//
+// Codegen knows the full signature of each: src/codegen_methods.bl:2651-3640 emits
+// blink_tcp_connect / blink_stdin_read_line / blink_term_width / the argv loop, and sets
+// expr_result_type for every one. Typecheck knows two of them — src/typecheck.bl:9424-9433
+// gates on `is_intrinsic_method(obj_name, method) != 0` and the entire body is `time.read`
+// and `time.sleep`. Every other intrinsic falls out of that gate with no return type.
+//
+// TYPE_UNKNOWN unifies with anything, so both halves fail open: the declared type is not
+// compared, and the arguments are not checked. Each escapes to the C compiler instead of to a
+// diagnostic.
+//
+// Excluded on purpose, each its own question (see the ticket): fs.read/write/list_dir/remove,
+// where sections/04_effects.md:73 spells `fs.read(path)?` as a Result and names the lister
+// `fs.list` while codegen emits a bare `const char*` from `blink_read_file`; io.debug, which
+// `is_intrinsic_method` lists but no codegen arm emits; io.read_bytes and env.var, which have
+// codegen arms but are not listed, so they resolve through `lookup_fnsig` on the BARE name.
+
+import compile_test_helpers
+
+fn prog(body: Str) -> Str {
+    let mut s = "fn main() \{\n"
+    s = s.concat(body)
+    s = s.concat("}\n")
+    s
+}
+
+// ── the declared type must be compared against an intrinsic's return type ─────
+
+test "a declared type is compared against net.connect returning Int" {
+    let s = prog("    let bad: Str = net.connect(\"localhost\", 8080)\n    io.println(bad)\n")
+    compile_test_helpers.expect_compile_error(s, "qjfwc6_decl_connect", "TypeError")
+}
+
+test "a declared type is compared against net.listen returning Int" {
+    let s = prog("    let bad: Str = net.listen(\"localhost\", 8080)\n    io.println(bad)\n")
+    compile_test_helpers.expect_compile_error(s, "qjfwc6_decl_listen", "TypeError")
+}
+
+test "a declared type is compared against net.accept returning Int" {
+    let s = prog("    let bad: Str = net.accept(3)\n    io.println(bad)\n")
+    compile_test_helpers.expect_compile_error(s, "qjfwc6_decl_accept", "TypeError")
+}
+
+test "a declared type is compared against net.read returning Str" {
+    let s = prog("    let bad: Int = net.read(3, 64)\n    io.println(\"\{bad}\")\n")
+    compile_test_helpers.expect_compile_error(s, "qjfwc6_decl_read", "TypeError")
+}
+
+test "a declared type is compared against net.read_all returning Str" {
+    let s = prog("    let bad: Int = net.read_all(3)\n    io.println(\"\{bad}\")\n")
+    compile_test_helpers.expect_compile_error(s, "qjfwc6_decl_read_all", "TypeError")
+}
+
+test "a declared type is compared against net.read_line returning Str" {
+    let s = prog("    let bad: Int = net.read_line(3)\n    io.println(\"\{bad}\")\n")
+    compile_test_helpers.expect_compile_error(s, "qjfwc6_decl_net_read_line", "TypeError")
+}
+
+test "a declared type is compared against net.read_bytes returning Bytes" {
+    let s = prog("    let bad: Int = net.read_bytes(3, 64)\n    io.println(\"\{bad}\")\n")
+    compile_test_helpers.expect_compile_error(s, "qjfwc6_decl_read_bytes", "TypeError")
+}
+
+test "a declared type is compared against net.write_bytes returning Int" {
+    let s = prog("    let bad: Str = net.write_bytes(3, Bytes.new())\n    io.println(bad)\n")
+    compile_test_helpers.expect_compile_error(s, "qjfwc6_decl_write_bytes", "TypeError")
+}
+
+// A Void intrinsic has no value to bind, and must not silently answer with one.
+test "a declared type is compared against net.write returning Void" {
+    let s = prog("    let bad: Int = net.write(3, \"hi\")\n    io.println(\"\{bad}\")\n")
+    compile_test_helpers.expect_compile_error(s, "qjfwc6_decl_write_void", "TypeError")
+}
+
+test "a declared type is compared against net.close returning Void" {
+    let s = prog("    let bad: Int = net.close(3)\n    io.println(\"\{bad}\")\n")
+    compile_test_helpers.expect_compile_error(s, "qjfwc6_decl_close_void", "TypeError")
+}
+
+test "a declared type is compared against io.read_line returning Str" {
+    let s = prog("    let bad: Int = io.read_line()\n    io.println(\"\{bad}\")\n")
+    compile_test_helpers.expect_compile_error(s, "qjfwc6_decl_io_read_line", "TypeError")
+}
+
+test "a declared type is compared against term.width returning Int" {
+    let s = prog("    let bad: Str = term.width()\n    io.println(bad)\n")
+    compile_test_helpers.expect_compile_error(s, "qjfwc6_decl_term_width", "TypeError")
+}
+
+test "a declared type is compared against env.args returning List[Str]" {
+    let s = prog("    let bad: List[Int] = env.args()\n    io.println(\"\{bad.len()}\")\n")
+    compile_test_helpers.expect_compile_error(s, "qjfwc6_decl_env_args", "TypeError")
+}
+
+// ── the argument check ────────────────────────────────────────────────────────
+
+test "reversed arguments to net.listen are rejected" {
+    let s = prog("    let fd = net.listen(4242, \"localhost\")\n    io.println(\"\{fd}\")\n")
+    compile_test_helpers.expect_compile_error(s, "qjfwc6_arg_listen_reversed", "TypeError")
+}
+
+test "a Str port to net.connect is rejected" {
+    let s = prog("    let fd = net.connect(\"localhost\", \"8080\")\n    io.println(\"\{fd}\")\n")
+    compile_test_helpers.expect_compile_error(s, "qjfwc6_arg_connect_str_port", "TypeError")
+}
+
+test "a Str fd to net.read_bytes is rejected" {
+    let s = prog("    let b = net.read_bytes(\"3\", 64)\n    io.println(\"\{b.len()}\")\n")
+    compile_test_helpers.expect_compile_error(s, "qjfwc6_arg_read_bytes_str_fd", "TypeError")
+}
+
+// net.write takes Str, net.write_bytes takes Bytes — the pair must not be interchangeable.
+test "a Bytes payload to net.write is rejected" {
+    let s = prog("    net.write(3, Bytes.new())\n")
+    compile_test_helpers.expect_compile_error(s, "qjfwc6_arg_write_bytes_payload", "TypeError")
+}
+
+test "a Str payload to net.write_bytes is rejected" {
+    let s = prog("    let rc = net.write_bytes(3, \"hi\")\n    io.println(\"\{rc}\")\n")
+    compile_test_helpers.expect_compile_error(s, "qjfwc6_arg_write_bytes_str_payload", "TypeError")
+}
+
+test "a Str fd to term.isatty is rejected" {
+    let s = prog("    let t = term.isatty(\"1\")\n    io.println(\"\{t}\")\n")
+    compile_test_helpers.expect_compile_error(s, "qjfwc6_arg_isatty_str", "TypeError")
+}
+
+// ── the C-compiler escape both halves were hiding ─────────────────────────────
+//
+// The rows above pass as soon as SOME TypeError is reported, so on their own they would keep
+// passing while the escape below reopened.
+
+test "a mistyped declaration over an intrinsic never reaches the C compiler" {
+    let s = prog("    let bad: Str = net.connect(\"localhost\", 8080)\n    io.println(bad)\n")
+    let r = compile_test_helpers.compile_and_run(s, "qjfwc6_run_decl_escape")
+    assert(r.exit_code != 0)
+    let all = "{r.out}{r.err_out}"
+    assert(!all.contains("C compilation failed"))
+    assert(!all.contains("makes pointer from integer"))
+    assert(!all.contains("initialization of"))
+}
+
+test "reversed arguments to an intrinsic never reach the C compiler" {
+    let s = prog("    let fd = net.listen(4242, \"localhost\")\n    io.println(\"\{fd}\")\n")
+    let r = compile_test_helpers.compile_and_run(s, "qjfwc6_run_arg_escape")
+    assert(r.exit_code != 0)
+    let all = "{r.out}{r.err_out}"
+    assert(!all.contains("C compilation failed"))
+    assert(!all.contains("argument is of type"))
+}
+
+// ── controls: every correct spelling still compiles, and the pure ones run ─────
+
+test "every net intrinsic binds under its own declared type" {
+    let mut b = "    let fd: Int = net.connect(\"localhost\", 8080)\n"
+    b = b.concat("    let lfd: Int = net.listen(\"localhost\", 8080)\n")
+    b = b.concat("    let conn: Int = net.accept(lfd)\n")
+    b = b.concat("    let data: Str = net.read(fd, 64)\n")
+    b = b.concat("    let all: Str = net.read_all(fd)\n")
+    b = b.concat("    let line: Str = net.read_line(fd)\n")
+    b = b.concat("    let raw: Bytes = net.read_bytes(fd, 64)\n")
+    b = b.concat("    let rc: Int = net.write_bytes(fd, raw)\n")
+    b = b.concat("    net.write(fd, data)\n")
+    b = b.concat("    net.set_timeout(fd, 100)\n")
+    b = b.concat("    net.close(fd)\n")
+    b = b.concat("    io.println(\"\{conn}\{all}\{line}\{rc}\")\n")
+    compile_test_helpers.expect_no_error(prog(b), "qjfwc6_ctl_net", "TypeError")
+}
+
+test "the pure intrinsics bind under their declared types and run" {
+    let mut b = "    let w: Int = term.width()\n"
+    b = b.concat("    let h: Int = term.height()\n")
+    b = b.concat("    let t: Int = term.isatty(1)\n")
+    b = b.concat("    let a: List[Str] = env.args()\n")
+    b = b.concat("    io.println(\"\{w >= 0}|\{h >= 0}|\{t >= 0}|\{a.len() >= 1}\")\n")
+    let s = prog(b)
+    compile_test_helpers.expect_no_error(s, "qjfwc6_ctl_pure", "TypeError")
+    let r = compile_test_helpers.compile_and_run(s, "qjfwc6_run_pure")
+    assert(r.exit_code == 0)
+    assert(r.out.contains("true|true|true|true"))
+}
+
+// An intrinsic used with no declared type must still infer, and that inferred type must carry
+// into a following method call — otherwise the fix answers the compare and nothing else.
+test "an inferred intrinsic result carries its type into a following method call" {
+    let mut b = "    let raw = net.read_bytes(3, 64)\n"
+    b = b.concat("    let bad: Str = raw.len()\n")
+    b = b.concat("    io.println(bad)\n")
+    compile_test_helpers.expect_compile_error(prog(b), "qjfwc6_infer_chain", "TypeError")
+}
+
+test "an inferred env.args carries List[Str] into its element type" {
+    let mut b = "    let a = env.args()\n"
+    b = b.concat("    let bad: Int = a.get(0).unwrap()\n")
+    b = b.concat("    io.println(\"\{bad}\")\n")
+    compile_test_helpers.expect_compile_error(prog(b), "qjfwc6_infer_args_elem", "TypeError")
+}
+
+// The intrinsic table is keyed by namespace AND method: a local binding that shadows the
+// namespace spelling keeps its own type, and a same-named method elsewhere keeps its own.
+test "a local shadowing a namespace name keeps its own type" {
+    let mut s = "type Sock \{ fd: Int }\n"
+    s = s.concat("trait SockOps \{ fn connect(self) -> Str }\n")
+    s = s.concat("impl SockOps for Sock \{ fn connect(self) -> Str \{ \"up\" } }\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let net = Sock \{ fd: 3 }\n")
+    s = s.concat("    let ok: Str = net.connect()\n")
+    s = s.concat("    let bad: Int = net.connect()\n")
+    s = s.concat("    io.println(\"\{ok}\{bad}\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_compile_error(s, "qjfwc6_shadowed_ns", "TypeError")
+}
+
+test "a shadowing local resolves to its own method and runs" {
+    let mut s = "type Sock \{ fd: Int }\n"
+    s = s.concat("trait SockOps \{ fn connect(self) -> Str }\n")
+    s = s.concat("impl SockOps for Sock \{ fn connect(self) -> Str \{ \"up\" } }\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let net = Sock \{ fd: 3 }\n")
+    s = s.concat("    let ok: Str = net.connect()\n")
+    s = s.concat("    io.println(ok)\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_no_error(s, "qjfwc6_shadowed_ns_ok", "TypeError")
+    let r = compile_test_helpers.compile_and_run(s, "qjfwc6_run_shadowed_ns")
+    assert(r.exit_code == 0)
+    assert(r.out.contains("up"))
+}

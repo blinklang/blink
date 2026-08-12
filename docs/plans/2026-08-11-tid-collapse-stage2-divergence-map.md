@@ -207,6 +207,9 @@ not Stage 3 work:
 | `ya8qyf` | P1 | *(found as the one row that stayed red under `jzvxav`; `zd1tz3` closed as its duplicate)* an impl method's declared **return** type was never checked — `tc_mangle_impl_fnsig` registers `{type}_{trait}_{method}` and the check side looked up `{type}_{method}`, so `lookup_fnsig` always missed and `tc_current_fn_ret` was never installed. Divergence-neutral; a pure diagnostic/escape fix |
 | `h3q81d` | P2 | *(the ranked #1 after `jzvxav`)* an effect **operation** had no typecheck-side signature anywhere — only the handle name, for warning suppression — while codegen carried the same signatures across **eight flat return fields**, the last pair existing only because `Result[Option[Row], DBError]` is depth 2. **−49 rows**, and both halves were escaping to `cc` |
 | `w089a0` | P2 | *(`h3q81d`'s residual, and the untyped-receiver shape a **fifth** time)* the with-resource `as` binder carries no type, so `with db.prepare(..).unwrap() as stmt` leaves `stmt.step()` with an untyped receiver even though `db.prepare` now resolves. `let bad: Str = r.value()` compiles clean and prints `7` |
+| `qjfwc6` | P2 | *(the ranked #1 after `h3q81d`, same shape one namespace over)* every namespace intrinsic but `time.read` / `time.sleep` had no typecheck signature, so `net.connect` / `io.read_line` / `term.width` / `env.args` all resolved to `TYPE_UNKNOWN`. **−45 rows**, `std_net_tcp` 40 → 0. The declared-type half was a **silent miscompile** — `let bad: Str = net.connect(host, port)` compiled, linked and *ran* — and arity was a **compiler panic** at `parser.bl:111` |
+| `jr4xf7` | P2 `type:spec` | *(`qjfwc6`'s held group)* what does `fs.read` return? The spec spells `fs.read(path)?` as a `Result` and names the lister `fs.list`; codegen emits a bare `const char*` from `blink_read_file` and calls it `list_dir`. 4 rows, and typecheck cannot sign `fs.*` until it is answered |
+| `n84s1p` | P3 | *(`qjfwc6`'s other residual)* `is_intrinsic_method` disagrees with the codegen arms **in both directions** — `io.debug` listed with no arm, `io.read_bytes` / `env.var` with arms and unlisted, so they resolve through `lookup_fnsig` on the **bare** method name. 9 rows |
 
 `k9agr8` gates the *measurement*, not the code: without it Stage 3 can only demonstrate 0
 in archive-linked mode.
@@ -1416,15 +1419,15 @@ these sweeps, tallied on the **intersection of their file sets** (874 files; the
 do not appear in all of them are listed under the `nz7drz` correction note). `scratchpad/cells.sh`
 takes that allow-list as a required argument.
 
-| | before `nz7drz` | after `nz7drz` | after `bfq7nf` | after `3c4g71` | after `zs7khh` | after `2r96m9` | after `rbd0a4` | after `w13xgb` | after `jzvxav` | after `h3q81d` |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| **total cells** | 423 | 421 | 409 | 407 | 405 | 404 | 404 | 405 | 404 | **402** |
-| family A (`tid=?`) cells | 84 | 61 | 47 | 45 | 35 | 34 | 34 | 33 | 32 | **28** |
-| family A rows | 1323 | 1224 | 1190 | 1050 | 1015 | 661 | 504 | 327 | 310 | **261** |
-| `Fn`-flat `tid=?` cells | 16 | 2 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | **0** |
-| agree | 362979 | 363711 | 363924 | 364187 | 364289 | 364674 | 364831 | 364883 | 364934 | **365243** |
-| diverge rows | 5008 | 5003 | 4976 | 4837 | 4828 | 4474 | 4317 | 4296 | 4279 | **4249** |
-| missing | 14 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | **1** |
+| | before `nz7drz` | after `nz7drz` | after `bfq7nf` | after `3c4g71` | after `zs7khh` | after `2r96m9` | after `rbd0a4` | after `w13xgb` | after `jzvxav` | after `h3q81d` | after `qjfwc6` |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| **total cells** | 423 | 421 | 409 | 407 | 405 | 404 | 404 | 405 | 404 | 402 | **402** |
+| family A (`tid=?`) cells | 84 | 61 | 47 | 45 | 35 | 34 | 34 | 33 | 32 | 28 | **28** |
+| family A rows | 1323 | 1224 | 1190 | 1050 | 1015 | 661 | 504 | 327 | 310 | 261 | **216** |
+| `Fn`-flat `tid=?` cells | 16 | 2 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | **0** |
+| agree | 362979 | 363711 | 363924 | 364187 | 364289 | 364674 | 364831 | 364883 | 364934 | 365243 | **365505** |
+| diverge rows | 5008 | 5003 | 4976 | 4837 | 4828 | 4474 | 4317 | 4296 | 4279 | 4249 | **4204** |
+| missing | 14 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | **1** |
 
 The `after jzvxav` column covers **two** fixes, `jzvxav` and `ya8qyf`, because they were measured in
 one sweep; the attribution in those sections shows all 17 rows belong to `jzvxav`, so `ya8qyf` is
@@ -1917,9 +1920,96 @@ method on an unrelated type keeps its own signature), and two effects sharing an
 different return types. **Helper trap:** `expect_no_error(src, tag, "")` asserts
 `!output.contains("")`, which is always false — pass the code you expect *not* to appear.
 
-### Remaining family-A causes, ranked (28 cells / 261 rows)
+### `qjfwc6` — every namespace intrinsic but two had no signature in typecheck (CLOSED)
 
-Re-ranked from the post-`h3q81d` sweep, by **rows on the 874-file common basis**, grouped by the
+The #1 remaining cause after `h3q81d`, and the same shape one namespace over: codegen holds the
+table, typecheck holds two entries. Each emitter at `codegen_methods.bl:2651-3640` sets
+`expr_result_type` for its own method — `blink_tcp_connect` is `CT_INT`, `blink_stdin_read_line` is
+`CT_STRING`, the `env.args` argv loop is `CT_LIST`/`CT_STRING` — and that is where the C types come
+from. Typecheck's side of the gate (`typecheck.bl:9424`, `is_intrinsic_method(obj_name, method) != 0`)
+had a body of exactly two arms, `time.read` and `time.sleep`, so every other intrinsic fell out of it
+with no type at all. `TYPE_UNKNOWN` unifies with anything, so both halves failed open.
+
+**The declared-type half was not escaping to `cc` — it was a silent miscompile.** That is new; the
+four earlier causes at least reached the C compiler.
+
+```
+let bad: Str = net.connect("localhost", 8080)   ->  compiles, links, RUNS, exit 0
+```
+
+An `Int` reinterpreted as a `char*` and printed. **And arity was a compiler panic**: codegen indexes
+the argument list positionally and unconditionally, so `net.listen("localhost")` died at
+`unwrap called on None at src/parser.bl:111` rather than reporting anything.
+
+**One regen**, because it is one behavior: typecheck learns the signatures.
+`register_ns_intrinsic_sigs` registers **one `FnSigEntry` per intrinsic** into `fnsig_pool` under the
+qualified key `{namespace}.{method}` — a key no user function can spell, since `register_fn_sig`
+separates a module qualifier with a **colon**. So the whole existing fnsig machinery applies with no
+new data structure: `lookup_fnsig` finds it, `check_arg_shapes` reports *"argument 2 of 'net.listen'
+expects Int, got Str"*, and `.ret` is the return tid. It is called from the register pass beside
+`register_ue_op_sigs`, because both are the same act. The call site is one arm after the `time.*`
+arms, gated `nr_is_defined(obj_name) == 0 && is_intrinsic_method(obj_name, method) != 0` —
+deliberately **not** on `is_import_module_name` like the arms above it, since an intrinsic needs no
+import (that is what makes it intrinsic) and `is_intrinsic_method` already restricts the namespace.
+The arity check reuses the ordinary fn-call wording verbatim.
+
+Registered: `net.connect/listen/accept/read/read_all/read_line/read_bytes/write/write_bytes/`
+`set_timeout/close`, `io.read_line`, `term.isatty/width/height`, `env.args`.
+
+**A table, not an arm per method, and that is the point.** Codegen already carries one arm per
+intrinsic; a second set of arms in typecheck would drift from it method by method, which is exactly
+how the two representations came apart in the first place.
+
+**Blast radius zero**: 638/638 test files green, `fmt` 1496, gen1-vs-gen2 per-module byte-equal. Every
+intrinsic call in the corpus was already correctly typed *and* correctly ordered — merely unchecked.
+
+| | after `h3q81d` | after `qjfwc6` | delta |
+|---|---:|---:|---:|
+| family A rows | 261 | **216** | **−45** |
+| family A cells | 28 | 28 | **0** |
+| total cells | 402 | 402 | 0 |
+| diverge rows | 4249 | 4204 | −45 |
+| agree | 365243 | 365505 | +262 |
+| missing | 1 | 1 | 0 |
+
+**`std_net_tcp` 40 → 0**, `lsp` 6 → 4, `__main__` 174 → 171. Nothing rose. The five `net.*` bindings
+at `lib/std/net_tcp.bl:68,83,92,128,137` were 40 of the 45 on their own, because every net-using root
+re-derives them — the mirror image of the flat-40 reading that stood across five sweeps.
+
+**The cell count did not move at all, and the cell set is byte-identical.** This is the clearest case
+yet that **cells are a lower bound on causes, not a count of them**: all 45 rows sat on
+`(site, tid=?, flat)` triples — `flat=Int`, `flat=Str`, `flat=Bytes` at `emit_let_binding.decl` —
+that other still-open causes also produce. Stage 3's exit gate is the counter at 0, so this costs
+nothing there, but a cause-by-cause phase must be ranked on rows.
+
+**Three groups deliberately left out**, each because *what its signature is* is an open question, not
+where it lives:
+
+- **`fs.read/write/list_dir/remove` → `jr4xf7` (`type:spec`).** `sections/04_effects.md:73,1053`
+  spells `fs.read(path)?` as a `Result` and `:157,215` names the lister `fs.list`, while codegen emits
+  a bare `const char*` from `blink_read_file` and calls it `list_dir`. Giving it the codegen signature
+  would write *"an FS read cannot fail"* into the type system by accident. 4 rows, held.
+- **`io.debug`, `io.read_bytes`, `env.var` → `n84s1p` (P3).** `is_intrinsic_method` disagrees with the
+  arms **in both directions** — `io.debug` is listed and emitted by no arm (it fails closed at the
+  codegen backstop), while `io.read_bytes` and `env.var` have arms and are not listed, so they take
+  the `== 0` path and resolve through `lookup_fnsig` on the **bare** method name. 5 rows.
+- **`net.request`** — its `Result[Response, NetError]` needs two stdlib struct types a consuming
+  module need not have imported. 0 rows.
+
+A speculated collision was **tested and does not reproduce**: `import std.libc` (which has
+`read_bytes -> Result[Bytes, Errno]`) plus `let bad: Str = io.read_bytes(4)` passes `blink check`, so
+the bare-name lookup misses there and the call stays untyped. The hazard in `n84s1p` is structural,
+not observed — recorded that way on purpose.
+
+Test: `tests/test_qjfwc6_ns_intrinsic_signatures.bl`, 27 rows — 23 red before, all green after. Rows
+cover a declared-type compare over every return shape (`Int`, `Str`, `Bytes`, `Void`, `List[Str]`),
+the argument check including the reversed-argument and the `write`/`write_bytes` `Str`-vs-`Bytes`
+pair, two escape assertions, an inferred result carried into a following method call, and the
+shadowing control (`let net = Sock { .. }` keeps its own `connect`, both directions).
+
+### Remaining family-A causes, ranked (28 cells / 216 rows)
+
+Re-ranked from the post-`qjfwc6` sweep, by **rows on the 874-file common basis**, grouped by the
 innermost producer (the outermost call is usually a symptom — `.unwrap()` heads many chains, but its
 receiver is already unknown). Rows, not sites: the earlier site-count ranking is what let one entry
 hide three unrelated mechanisms.
@@ -1936,11 +2026,23 @@ every one that is a pure codegen intrinsic is a family-A cause by construction. 
 defect class as `mjsbwm`, `7cq6w2` and `2r96m9` — `project_is_intrinsic_method_must_match_handlers`,
 now measured rather than met one instance at a time.
 
+**`is_intrinsic_method` is the same defect in the namespace half, and `qjfwc6` closed it the way the
+decoupling asks to be closed: with a table, not with arms.** Typecheck now registers one real
+`FnSigEntry` per namespace intrinsic under `{namespace}.{method}` — return type *and* parameter types
+— so the second list is no longer a suppression list with nothing behind it. Two of the three
+questions the suppression list was hiding survive as their own tickets (`jr4xf7`, `n84s1p`), and both
+are about the *list*, not about a missing return type. `is_builtin_method`'s 73 unanswered names are
+the remaining half of the same defect and want the same treatment.
+
 **The entries left are now one shape: a namespace or handle whose operations codegen dispatches and
 typecheck has no signature table for — or, more often than not, a RECEIVER with no type at all.**
-With the `Str`, `Bytes`, `Ptr`, `self` and effect-op causes closed, the intrinsic-method list is no
-longer the leading mechanism. `net.*`/`io.*` is now #1 and needs a *table*; the untyped-receiver
-family (`nrrs28`, `ps5br9`, `w089a0`) needs a `TyKind` or a binding, not an arm.
+With the `Str`, `Bytes`, `Ptr`, `self`, effect-op **and namespace-intrinsic** causes closed, the
+intrinsic-method list is spent as a leading mechanism: `qjfwc6` gave typecheck the table, and what it
+left behind is not a missing arm but an open spec question (`jr4xf7`) and a list that disagrees with
+its own arms (`n84s1p`). **The untyped-receiver family is now the whole head of the list** —
+`nrrs28`, `ps5br9`, `w089a0` — and each needs a `TyKind` or a binding, never an arm. The two causes
+that are neither (iterator adapters, `Channel(n)`) are both already deferred to a user-visible
+decision.
 
 **The old 72-row `db.*` bucket split four ways, and this is the lesson the map keeps re-teaching: a
 shared bucket is not a shared cause.** `jzvxav` took the 12 `at=std_db_row:35` rows (`row.get`, never
@@ -1950,14 +2052,16 @@ effect-op rows, and the 9 that survived are the with-resource `as` binder (`w089
 
 | cause | rows | ticket | note |
 |---|---:|---|---|
-| `net.*` / `io.*` — `net.connect` / `listen` / `accept` / `read_bytes` / `write_bytes`, `io.read_line` | 49 | — | **Now the outright #1, 19% of what is left.** `lib/std/net_tcp.bl:68,83,92,128,137`, `src/lsp.bl:32`. The seam is `is_intrinsic_method(namespace, method)` — `pub` in **`src/codegen_types.bl:8084`** and called from `typecheck.bl:9227`, where the *only* two answers are `time.read` (→ `Instant`) and `time.sleep` (→ Void). Typecheck asks codegen's intrinsic list whether the method exists and then has no table of return types behind it. Counted by **producer**: `at=std_net_tcp` 40 (`fd` / `conn` / `rc` as `flat=Int`), `at=lsp` 6, `at=std_http_server` 3. The earlier figure of 55 folded in the `Response`/`Request` rows counted separately below. **`h3q81d` is the template for the fix** — this is the same "codegen has the signatures, typecheck has none" shape, one namespace over |
+| ~~`net.*` / `io.*` — `net.connect` / `listen` / `accept` / `read_bytes` / `write_bytes`, `io.read_line`~~ | ~~49~~ | **`qjfwc6`** | **CLOSED** — −45 rows, section above. `std_net_tcp` 40 → 0. The declared-type half was a **silent miscompile**, not a `cc` escape, and arity was a **compiler panic**. Two attributions in the row this replaces were wrong: `at=lsp` was 6 rows but only 2 were `io.read_line` (the other 4 are `io.read_bytes` → `n84s1p`), and `at=std_http_server`'s 3 are `Channel(max)` at `:368`, not a `net.*` producer at all. What is left of the intrinsic list is `jr4xf7` (4 rows, spec) and `n84s1p` (9 rows) |
+| `is_intrinsic_method` disagrees with its own arms — `io.read_bytes`, `env.var`, `io.debug` | 9 | `n84s1p` | Split out of `qjfwc6`. `io.debug` is listed and emitted by no arm; `io.read_bytes` and `env.var` have arms and are **not** listed, so they take the `== 0` path and resolve through `lookup_fnsig` on the **bare** method name. `src/lsp.bl:50,51` (4), `tests/manual_stdio_stdin.bl:10` (2), `src/incremental.bl:44` (3, `env.var`). Fix the list, then they join the `qjfwc6` table |
+| `fs.read` / `write` / `list_dir` / `remove` | 4 | `jr4xf7` (`type:spec`) | Split out of `qjfwc6` and **held on purpose**: `sections/04_effects.md:73,1053` spells `fs.read(path)?` as a `Result` and `:157,215` names the lister `fs.list`, while codegen emits a bare `const char*` from `blink_read_file`. Signing it from codegen would write "an FS read cannot fail" into the type system |
 | ~~`db.*` effect operations — `db.query` / `query_one` / `execute`, `stmt.step`~~ | ~~51~~ | **`h3q81d`** | **CLOSED** — −49 rows, section above. Typecheck held **no** operation signatures, only the handle name for warning suppression; codegen held the same signatures across eight flat return fields. 9 rows survive, all `with db.prepare(..) as stmt` → **`w089a0`** |
 | the with-resource `as` binder — `with db.prepare(..).unwrap() as stmt` | 9 | `w089a0` | Split out of `h3q81d`'s residual. `db.prepare` now resolves to `Result[Stmt, DBError]` and the binder drops it, so `stmt.step()` has an untyped receiver. **Untyped-receiver shape, fifth instance**; the tid is already in hand at the binding site, so the fix is the `jzvxav` shape — bind the binder |
 | `Template[T]` introspection — `tpl.type_tag` / `count` / `get_int` / `get_float` / `get_str` | 9 | `nrrs28` | Split out of the old `db.*` bucket. All 9 are `at=std_db_sqlite:140`, one per db-flavoured root. **The untyped-receiver shape again**, for the fifth time: `Template` is not a `TyKind`, so the receiver is as permissive as `TYPE_UNKNOWN` before any method arm can run — `w13xgb` / `ps5br9` / `jzvxav` in a fourth costume, and it should be fixed the way `w13xgb` was (variant first, then the lowering, then the method block) |
 | `Iterator` adapters — `.zip`, `.chain`, `.enumerate`, `.collect` | 34 | `qzdz2e` | **deferred** (panel decision, user-visible). Was invisible in the previous ranking and is now #3: `tests/test_combining_iterators.bl` (16) and `tests/test_44xww4_enumerate_zip_compound.bl` (18), showing as `flat=List[Void]` and `flat=Tuple2_int_int` — the adapter loses the element type *and* the pair shape |
 | `Channel(n)` / `ch.recv` | 24 | — | **likely genuinely under-determined** — the arg is a capacity, not an element type, so this may be `decisions/under-determined-types.md` / E0301, not a missing rule. `tests/test_channels.bl` (11), `tests/test_async_cancel.bl` (7), `src/cli.bl:2162` |
 | a cross-module `pub let` container element — `symbol_index.si_file_path.get(i)` | 12 | — | `src/incremental.bl:44,75`, `src/file_watcher.bl:40,73`. Part of the `flat=Str` tail `rbd0a4` uncovered, and **the largest remaining cause inside the compiler's own source** |
-| `Response` / `Request` from the http surface | 10 | — | `tests/test_net_integration.bl`, `test_middleware.bl`, `test_http_server.bl`, all `at=__main__`. Same shape as the `net.*` entry and may close with it |
+| `Response` / `Request` from the http surface | 10 | — | `tests/test_net_integration.bl`, `test_middleware.bl`, `test_http_server.bl`, all `at=__main__`. **It did not close with `net.*`** — the earlier note guessed it would. `net.request` was the one intrinsic `qjfwc6` left out for a reason of its own (its `Result[Response, NetError]` needs two stdlib struct types a consuming module need not have imported), so these need their own probe |
 | calling a closure-typed **field** (`route.callback`, `logger.log_msg`) | ~11 | — | |
 | `@derive(Deserialize)` / str-backed-enum `Result` returns | 15 | — | 8 `flat=Result[Void, Str]` + 7 `flat=Result[Int, Void]`, in `test_derive_*.bl`, `test_str_backed_enum.bl`, `test_fmt_iife_with_block.bl`. **Un-triaged**: a compiler-*synthesized* fn is the likely producer, which would make it a different mechanism from every entry above — needs its own probe before it gets a ticket |
 | `List.join` on a `List[Str]` | ~4 | — | `src/cli.bl:935`, `:3561`, `:3563`. From the `rbd0a4` tail; the last of the allow-list-vs-dispatch shape |
@@ -1971,31 +2075,37 @@ top because the causes above them were removed, and both were already in the map
 new line is the `@derive`/`Result` group, which the earlier `flat=` tail hid behind `Str` and
 `Ptr[Int]`.
 
-**Cross-check by source module** (` at=` on the post-`h3q81d` sweep — note the leading space; without
+**Cross-check by source module** (` at=` on the post-`qjfwc6` sweep — note the leading space; without
 it the pattern also matches inside `flat=`), because the flat spelling and the producing module answer
 different questions and disagreeing on which is "the" count is how the Ptr entry once acquired two
 figures:
 
-| module | family-A rows | | after `jzvxav` | after `w13xgb` | after `rbd0a4` |
-|---|---:|---|---:|---:|---:|
-| `__main__` (the root being compiled) | 174 | | 223 | 225 | 237 |
-| `std_libc` | **0** | | 0 | 0 | 165 |
-| `std_net_tcp` | 40 | | 40 | 40 | 40 |
-| `std_db_row` | **0** | | 0 | 12 | 12 |
-| `cli` | 11 | | 11 | 11 | 11 |
-| `std_db_sqlite` | 9 | | 9 | 9 | 9 |
-| `lsp` / `incremental` / `file_watcher` | 6 each | | 6 each | 6 each | 6 each |
-| `std_testing` | **0** | | 0 | 3 | 3 |
-| `std_http_server` / `pkg_resolver` / `build_stdlib` | 3 each | | 3 each | 3 each | 3 each |
+| module | family-A rows | | after `h3q81d` | after `jzvxav` | after `w13xgb` | after `rbd0a4` |
+|---|---:|---|---:|---:|---:|---:|
+| `__main__` (the root being compiled) | 171 | | 174 | 223 | 225 | 237 |
+| `std_libc` | **0** | | 0 | 0 | 0 | 165 |
+| `std_net_tcp` | **0** | | 40 | 40 | 40 | 40 |
+| `std_db_row` | **0** | | 0 | 0 | 12 | 12 |
+| `cli` | 11 | | 11 | 11 | 11 | 11 |
+| `std_db_sqlite` | 9 | | 9 | 9 | 9 | 9 |
+| `incremental` / `file_watcher` | 6 each | | 6 each | 6 each | 6 each | 6 each |
+| `lsp` | 4 | | 6 | 6 | 6 | 6 |
+| `std_testing` | **0** | | 0 | 0 | 3 | 3 |
+| `std_http_server` / `pkg_resolver` / `build_stdlib` | 3 each | | 3 each | 3 each | 3 each | 3 each |
 
 **`std_libc` went from a third of everything left to zero**, and it was one cause; `std_db_row` and
-`std_testing` went to zero on `jzvxav`, and it was one cause covering both. The `__main__` bucket is
-not a residual cause of its own: `__main__` is whatever root is under compilation, so it is the
-*corpus* redistributing the same handful of mechanisms across roots — which is why the ranking is
-organized by producer and not by this table. `h3q81d` is the first cause to move `__main__`
-substantially (223 → 174) precisely because effect ops are called from roots rather than from a
-stdlib module, and `std_net_tcp`'s flat 40 across five sweeps is the mirror image: one cause, one
-module, untouched until someone builds it a table.
+`std_testing` went to zero on `jzvxav`, and it was one cause covering both; **`std_net_tcp` went from
+a flat 40 across five sweeps to zero on `qjfwc6`**, and it was one cause — five `let` bindings in
+`lib/std/net_tcp.bl` that every net-using root re-derives. The `__main__` bucket is not a residual
+cause of its own: `__main__` is whatever root is under compilation, so it is the *corpus*
+redistributing the same handful of mechanisms across roots — which is why the ranking is organized by
+producer and not by this table. `h3q81d` is the only cause so far to move `__main__` substantially
+(223 → 174), precisely because effect ops are called from roots rather than from a stdlib module.
+
+**Every stdlib module in this table is now at zero except `std_db_sqlite` (9, `nrrs28`).** What
+remains is `__main__` plus the compiler's own source (`cli` 11, `incremental`/`file_watcher` 6 each,
+`lsp` 4) — so from here the instrument is measuring the corpus and the compiler, not the standard
+library.
 
 **The `db.*` mechanism, diagnosed (read-only) — kept as written, because it is the diagnosis
 `h3q81d` was fixed from and the prediction it confirms.** These are **effect operations**, declared in
