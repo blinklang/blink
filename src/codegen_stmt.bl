@@ -80,6 +80,7 @@ import codegen_types.{
     type_int, type_string, type_struct, type_list, type_option, type_result, type_map, type_set, type_iterator,
     set_list_elem_option_tp, set_list_elem_result_tp, list_elem_unspellable,
     stamp_list_elem_from_tid, map_val_carrier_from_recv, MapValCarrier,
+    map_pair_from_recv, MapPairTid,
     split_result_compound, CompoundSplit, map_struct_scalar_kv, MapKvCt, typedef_tag_or_empty, tp_child1_kind, tp_child1_sname, tp_child2_kind, tp_child2_sname,
     tp_get_kind, tp_get_child1, tp_get_child2, tp_get_sname, type_from_name, type_from_name_tag,
     type_name_from_ct, type_where_preds, cg_where_self_var, is_compound_tag, var_enums,
@@ -4082,11 +4083,14 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
         emit_line("{cell_type}* {cname}_cell = ({cell_type}*)blink_alloc(sizeof({cell_type}));")
         emit_line("*{cname}_cell = {cname};")
     }
-    let destr_pat_sl = node_elements(node)
-    if destr_pat_sl != -1 {
+    // A pattern NODE, not a sublist — node_elements answers a sublist id for some node kinds and a
+    // child node id for others, and nothing in the types distinguishes them. Naming it `_sl` here
+    // is how w224zg's element carry came to measure a two-element pattern's arity as 1.
+    let destr_pat_node = node_elements(node)
+    if destr_pat_node != -1 {
         let tup_struct = get_var_struct(cname)
         if tup_struct != "" {
-            emit_tuple_destructure(destr_pat_sl, cname, tup_struct, is_mut)
+            emit_tuple_destructure(destr_pat_node, cname, tup_struct, is_mut)
         }
     }
 }
@@ -4165,6 +4169,10 @@ fn emit_for_in(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.
         // anymore.
         let mut map_val_ct = -1
         let mut map_val_nested_ct = -1
+        // br w224zg: the element's STRUCT name, which the flat `extra` channel cannot hold (it is
+        // one integer). Without it `for (k, v) in (Map[Str, List[Pt]])` bound `v` with an element
+        // ct and no name, and `v.get(0).unwrap().x` rendered as the `<value>` placeholder.
+        let mut map_val_nested_struct = ""
         if iter_type == CT_SET {
             // blink_set_to_list normalizes the set into a blink_list* up front so
             // the loop below reuses the CT_LIST arm verbatim, rather than a second
@@ -4216,8 +4224,19 @@ fn emit_for_in(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.
             // CT_LIST arm's existing elem_struct sub-arm gives `for (k, v) in m`
             // tuple destructuring for free (emit_tuple_destructure), the same way
             // enumerate()'s (i, x) pairs already do.
-            let key_ct = get_map_key_type(lookup_name)
-            let key_struct = get_map_key_struct(lookup_name)
+            // br w224zg: the receiver's tid names both halves and the value's element; see
+            // map_pair_from_recv (codegen_types.bl) for why the heads and the element are gated
+            // differently. `flat_silent` is the honest signal — NEITHER half has a ScopeVar under
+            // this name, which for a call/method-chain receiver is always true, and which the
+            // fabricating accessors below cannot report because they answer CT_STRING/CT_INT
+            // instead. When the flat pool does have an answer it keeps it: those spellings work
+            // today and this cell is not the place to re-decide them.
+            let mpt = map_pair_from_recv(iter_node)
+            let flat_silent = get_map_key_type_raw(lookup_name) < 0 && get_map_value_type_raw(lookup_name) < 0
+            let tid_heads = mpt.ok != 0 && flat_silent
+            dbg_trace("mappair", "forin name={lookup_name} mpt_ok={mpt.ok} flat_silent={flat_silent} tid_heads={tid_heads}")
+            let key_ct = if tid_heads { mpt.key_ct } else { get_map_key_type(lookup_name) }
+            let key_struct = if tid_heads { mpt.key_struct } else { get_map_key_struct(lookup_name) }
             // br 9qz1k6: the flat value channel can record an Option/Result value's HEAD
             // (tp_child2_kind = CT_OPTION) but never a carrier NAME, and a carrier's C type is
             // only nameable WITH its inner — c_type_str has no arm for a bare CT_OPTION, so it
@@ -4232,15 +4251,14 @@ fn emit_for_in(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.
             // `*(blink_Option_int*)values[i]` — which is what emit_boxed_container_store has been
             // storing for this value all along.
             //
-            // Only CT_OPTION / CT_RESULT are taken, because only they have no nameable field type.
-            // A Map, a Set, a List, a struct and a scalar value all name their tuple field
-            // correctly through the flat channels, and for a container that field is a POINTER
-            // (`blink_list*`), not a by-value carrier — routing them here would change a working
-            // spelling. Their INNER is a separate, still-open defect (br w224zg: a List value's
-            // element reads silently wrong and a Set value's element fails in cc), and it lives in
-            // the tuple REGISTRAR's `sv_tp(et, -1, -1, es)` field tps, not in this spelling.
-            // Declining likewise leaves the flat spelling in charge; what must never happen again
-            // is spelling the absence as `void`.
+            // Only CT_OPTION / CT_RESULT are taken here, because only they have no nameable field
+            // type. A Map, a Set, a List, a struct and a scalar value all name their tuple field
+            // correctly, and for a container that field is a POINTER (`blink_list*`), not a
+            // by-value carrier — routing them through the carrier arm would change a working
+            // spelling. Their INNER is w224zg's axis and is handled by mpt above instead: the head
+            // spelling stays exactly as it was, and only the element — which no flat channel can
+            // hold — comes from the tid. Declining likewise leaves the flat spelling in charge;
+            // what must never happen again is spelling the absence as `void`.
             let mvc = map_val_carrier_from_recv(iter_node)
             let carrier_val = mvc.ct == CT_OPTION || mvc.ct == CT_RESULT
             // Canonicalized because resolve_tuple_ann canonicalizes too, and an annotated
@@ -4249,14 +4267,26 @@ fn emit_for_in(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.
             // must spell the tag and the type slot identically or one shape silently shadows the
             // other.
             let carrier_tag = canonical_struct_tag(mvc.tag)
-            let val_ct = if carrier_val { mvc.ct } else { get_map_value_type(lookup_name) }
-            let val_struct = if carrier_val { carrier_tag } else { get_map_value_struct(lookup_name) }
+            // The carrier arm keeps first refusal: it is the only one that spells an
+            // Option/Result value at all (both its ct AND a nameable tag), and it reads the same
+            // receiver tid, so agreeing with it costs nothing and overriding it would undo 9qz1k6.
+            let val_ct = if carrier_val { mvc.ct } else if tid_heads { mpt.val_ct } else { get_map_value_type(lookup_name) }
+            let val_struct = if carrier_val { carrier_tag } else if tid_heads { mpt.val_struct } else { get_map_value_struct(lookup_name) }
             if carrier_val {
                 ensure_carrier_from_tag(carrier_tag)
             }
             if val_ct == CT_LIST || val_ct == CT_SET {
                 map_val_ct = val_ct
-                map_val_nested_ct = get_map_value_list_elem(lookup_name)
+                // Unconditionally tid-led, unlike the heads: `extra` is a single integer, so the
+                // flat pool can spell this element's ct and never its struct name. It stays as the
+                // fallback for a receiver with no tid memo, where a ct alone still beats nothing.
+                if mpt.ok != 0 && (mpt.val_elem_ct >= 0 || mpt.val_elem_struct != "") {
+                    map_val_nested_ct = mpt.val_elem_ct
+                    map_val_nested_struct = mpt.val_elem_struct
+                } else {
+                    map_val_nested_ct = get_map_value_list_elem(lookup_name)
+                }
+                dbg_trace("mappair", "forin nested val_ct={val_ct} nested_ct={map_val_nested_ct} nested_struct={map_val_nested_struct}")
             }
             let key_tag = if key_struct != "" { key_struct } else { c_type_tag(key_ct) }
             let val_tag = if val_struct != "" { val_struct } else { c_type_tag(val_ct) }
@@ -4449,22 +4479,43 @@ fn emit_for_in(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.
                 if is_enum_type(elem_struct) != 0 {
                     var_enums.push(VarEnumEntry { name: var_name, enum_type: elem_struct })
                 }
-                let for_pat_sl = node_elements(node)
-                if for_pat_sl != -1 {
-                    emit_tuple_destructure(for_pat_sl, c_var_name, elem_struct, 0)
+                let for_pat_node = node_elements(node)
+                if for_pat_node != -1 {
+                    emit_tuple_destructure(for_pat_node, c_var_name, elem_struct, 0)
                     // `for (k, v) in <Map[K, List[V]] or Map[K, Set[V]]>`: emit_tuple_destructure
                     // binds `v` as a bare CT_LIST/CT_SET with no nested-element channel of its
                     // own, so propagate the Map's own tracked nested type here -- otherwise a
                     // body `for x in v` would fall back to get_list_elem_type/get_set_elem_type's
                     // weak default instead of the Map's real value element type.
-                    if map_val_nested_ct >= 0 && sublist_length(for_pat_sl) > 1 {
-                        let val_pat = sublist_get(for_pat_sl, 1)
+                    // br w224zg, two corrections to the propagation above:
+                    //
+                    //  1. node_elements(<ForIn>) answers the tuple-pattern NODE, not that node's
+                    //     element sublist — emit_tuple_destructure re-derives the sublist itself,
+                    //     which is why passing the node to it is right and why the old name
+                    //     `for_pat_sl` was a lie. sublist_length/sublist_get read a node id as a
+                    //     sublist id here, so the arity of `for (k, v) in m` measured 1 (and 0 for
+                    //     the next loop in the same program): the `> 1` guard rejected every
+                    //     two-element pattern and this block has propagated nothing since it was
+                    //     written. It looked like it worked because the element it failed to write
+                    //     was replaced downstream by the CT_INT default — right for List[Int],
+                    //     silently wrong for every other element type.
+                    //  2. A struct/enum element carries its ct in the CT_VOID-plus-name
+                    //     convention, so the ct alone reads as -1 and the name is the whole answer
+                    //     — hence the `|| map_val_nested_struct != ""` half of the guard. Writing
+                    //     the name is what turns `v.get(0).unwrap().x` from the `<value>`
+                    //     placeholder into a field read.
+                    let pat_elems_sl = node_elements(for_pat_node)
+                    let have_nested = map_val_nested_ct >= 0 || map_val_nested_struct != ""
+                    if have_nested && pat_elems_sl != -1 && sublist_length(pat_elems_sl) > 1 {
+                        let val_pat = sublist_get(pat_elems_sl, 1)
                         if node_kind(val_pat) != NodeKind.WildcardPattern {
                             let val_name = node_name(val_pat)
                             if map_val_ct == CT_LIST {
-                                set_list_elem_type(val_name, map_val_nested_ct)
+                                if map_val_nested_ct >= 0 { set_list_elem_type(val_name, map_val_nested_ct) }
+                                if map_val_nested_struct != "" { set_list_elem_struct(val_name, map_val_nested_struct) }
                             } else if map_val_ct == CT_SET {
-                                set_set_elem_type(val_name, map_val_nested_ct)
+                                if map_val_nested_ct >= 0 { set_set_elem_type(val_name, map_val_nested_ct) }
+                                if map_val_nested_struct != "" { set_set_elem_struct(val_name, map_val_nested_struct) }
                             }
                         }
                     }

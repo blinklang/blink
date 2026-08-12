@@ -3639,6 +3639,74 @@ pub fn map_val_carrier_from_vtid(vtid: Int) -> MapValCarrier {
     no_map_val_carrier()
 }
 
+// br w224zg: both halves of a Map's (K, V) pair, read off the RECEIVER's tid, for map
+// iteration's pair-tuple materialization (emit_for_in). Two distinct holes need it, and they
+// need it for opposite reasons:
+//
+//   1. A call/expression receiver (`for pair in mkm()`) has no ScopeVar to key the flat
+//      channels on, so get_map_key_type / get_map_value_type answer their FABRICATED defaults
+//      (CT_STRING / CT_INT — sv_tp's CT_MAP arm) instead of declining. The pair for a
+//      `Map[Str, List[Int]]` was therefore built as `Tuple2_str_int`, and `pair.1.get(0)` hit
+//      codegen's UnresolvedMethod backstop — whose message prints the TID-derived type name, so
+//      it read `'.get' on type List[Int]`, naming the type it was not using.
+//   2. The value's ELEMENT (`Map[K, List[E]]`), on EVERY receiver including a plain Ident. The
+//      flat pool has no channel for it: `extra` holds one integer, so it can spell the
+//      element's ct and never its struct name. `for (k, v) in m` over a `Map[Str, List[Pt]]`
+//      read `<value>` and over `Map[Str, List[Str]]` read a raw pointer as an int.
+//
+// So the two answers are gated differently at the call site: the key/value HEADS only stand in
+// where the flat channels have no answer at all (raw < 0 — the one honest signal the flat pool
+// has), while the element is taken whenever the tid names it, because nothing else can.
+pub type MapPairTid {
+    ok: Int,
+    key_ct: Int,
+    key_struct: Str,
+    val_ct: Int,
+    val_struct: Str,
+    val_elem_ct: Int,
+    val_elem_struct: Str
+}
+
+pub fn no_map_pair_tid() -> MapPairTid {
+    MapPairTid { ok: 0, key_ct: -1, key_struct: "", val_ct: -1, val_struct: "", val_elem_ct: -1, val_elem_struct: "" }
+}
+
+pub fn map_pair_from_recv(obj_node: Int) -> MapPairTid {
+    // Same mono binder and same decline-whole contract as map_val_carrier_from_recv above: a
+    // receiver whose tid is not a Map, or a Map that cannot name a half, answers ok=0 and leaves
+    // the flat spelling in charge rather than half-overriding it.
+    let raw_tid = tc_lookup_node_tid(obj_node)
+    let otid = tc_tid_subst_mono(raw_tid, cg_mono_tparams_sl, cg_mono_arg_tids)
+    if tc_tid_ct(otid) != CT_MAP {
+        dbg_trace("mappair", "recv bail=not_map raw_tid={raw_tid} otid={otid} ct={tc_tid_ct(otid)}")
+        return no_map_pair_tid()
+    }
+    let kct = tc_tid_map_key_ct_resolved(otid)
+    let ks = tc_tid_map_key_struct_resolved(otid)
+    let vct = tc_tid_map_val_ct_resolved(otid)
+    let vs = tc_tid_map_val_struct_resolved(otid)
+    if kct < 0 && ks == "" {
+        dbg_trace("mappair", "recv bail=unnameable_key otid={otid}")
+        return no_map_pair_tid()
+    }
+    if vct < 0 && vs == "" {
+        dbg_trace("mappair", "recv bail=unnameable_val otid={otid} kct={kct}")
+        return no_map_pair_tid()
+    }
+    let vtid = tc_tid_resolved(tc_tid_map_val_tid(otid))
+    let mut ect = -1
+    let mut es = ""
+    if vct == CT_LIST {
+        ect = tc_tid_list_elem_ct(vtid)
+        es = tc_tid_list_elem_struct(vtid)
+    } else if vct == CT_SET {
+        ect = tc_tid_set_elem_ct(vtid)
+        es = tc_tid_set_elem_struct(vtid)
+    }
+    dbg_trace("mappair", "recv ok kct={kct} ks={ks} vct={vct} vs={vs} ect={ect} es={es}")
+    MapPairTid { ok: 1, key_ct: kct, key_struct: ks, val_ct: vct, val_struct: vs, val_elem_ct: ect, val_elem_struct: es }
+}
+
 // gemr3z: the Result twin of set_list_elem_option — record
 // `type_list(type_result(ok, err))` so List[Result[T,E]].get()/for-in carry both
 // concrete inners. ok_struct/err_struct name a struct/enum inner ("" for scalars).

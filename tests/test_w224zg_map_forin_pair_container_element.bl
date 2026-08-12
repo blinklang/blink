@@ -1,0 +1,371 @@
+// br w224zg: `for pair in m` over a Map whose VALUE is a container gives the pair's value the
+// right HEAD but no element, so reading an element off `pair.1` is wrong three different ways.
+//
+// ── THE CAUSE IS IN TYPECHECK, NOT IN THE TUPLE REGISTRAR ─────────────────────────────
+//
+// The ticket blamed the tuple registrar's field tps (`sv_tp(et, -1, -1, es)`), because those
+// fabricate `List[Int]` for any List field. They do — but that lossiness is survivable, and an
+// annotated tuple proves it: `let t: (Str, List[Pt]) = ("a", [Pt { x: 7 }])` registers the SAME
+// lossy `Tuple2_str_list` c_name (the tag carries no element either) and `t.1.get(0).unwrap().x`
+// reads back correctly today. It works because `codegen_methods.bl`'s list-method entry stamps a
+// receiver with no recorded element straight from the tid at `t.1` — the shared registry entry is
+// never consulted for the element at all.
+//
+// The map pair had no tid to stamp from. `typecheck.bl`'s ForIn arm gave the loop variable an
+// element type for a List or a Set iterable and TYPE_UNKNOWN for every other legal iterable,
+// including a Map. So `pair` was `?`, `pair.1` was `?`, and `stamp_list_elem_from_tid` declined
+// (`arm=bail_unnameable`) — after which the element came from whatever ambient
+// `expr_list_elem_struct` happened to hold, which during map iteration is the pair tuple's own
+// tag. `pair.1.get(0)` then read a `blink_Tuple2_str_list*` out of a list of boxed ints.
+//
+// This is also why `for (k, v) in m` needed a hand-written patch (`map_val_nested_ct` in
+// emit_for_in) to carry the value's element onto `v`: nothing in typecheck ever said what the
+// pair's type was, so codegen had to reconstruct it per route. The fix says it once — a Map
+// iterable's element is the interned tuple `(K, V)` — and every route reads it from the tid.
+//
+// ── MEASURED BEFORE THE FIX, each by running it ───────────────────────────────────────
+//
+// All three rungs of the loudness ladder appear on one axis, which is why this cell is worth a
+// test per rung rather than one representative row:
+//
+//   let l = pair.1; l.get(0)     error[UnresolvedMethod] '.get' on type ?   (honest — the best)
+//   pair.1.get(0).unwrap()       SEGFAULT for List[Int]/List[Str],
+//                                prints `<value>` for List[Pt]              (silent wrong value)
+//   for x in pair.1              cc: `blink_Option_void`, `void x = ...`    (no Blink span — worst)
+//
+// And what already worked, so the fix cannot have bought these:
+//
+//   pair.1.len()                          right (the head was never lost)
+//   for (k, v) in m { v.get(0) }          right (the hand-written map_val_nested_ct patch)
+//   Map[Str, Map[Str, Int]] deep read     right
+//   Map[Str, Set[Int]] / Set[Str] contains  right, both polarities
+//
+// The Set rows are recorded here as bounds because the ticket claimed they failed in cc. They
+// did not, at the time this was written — re-measured, `contains` discriminates correctly on
+// both `Set[Int]` and `Set[Str]`. The ticket's `void _mkey9` was a different program.
+//
+// Every row reads an ELEMENT back through the recovered type. A row that only checked `.len()`
+// or "it compiles" passes on a pair whose element is completely wrong.
+
+type W22Pt { x: Int }
+
+fn w22_mkl() -> Map[Str, List[Int]] {
+    let mut m: Map[Str, List[Int]] = Map()
+    m.insert("a", [5, 6])
+    m
+}
+
+fn w22_mkl_int_str() -> Map[Int, List[Str]] {
+    let mut m: Map[Int, List[Str]] = Map()
+    m.insert(4, ["hi"])
+    m
+}
+
+fn w22_mks() -> Map[Str, Set[Int]] {
+    let mut s: Set[Int] = Set()
+    s.insert(3)
+    let mut m: Map[Str, Set[Int]] = Map()
+    m.insert("a", s)
+    m
+}
+
+// ── THE CELL ─────────────────────────────────────────────────────────────────────────
+
+test "an Int-List value's element survives the pair" {
+    let mut m: Map[Str, List[Int]] = Map()
+    m.insert("a", [5, 6])
+    let mut sum = 0
+    for pair in m {
+        assert_eq(pair.0, "a")
+        sum = sum + pair.1.get(0).unwrap()
+    }
+    assert_eq(sum, 5)
+}
+
+test "a Str-List value's element survives as a Str, not as an int-shaped read" {
+    let mut m: Map[Str, List[Str]] = Map()
+    m.insert("a", ["hi"])
+    let mut seen = ""
+    for pair in m {
+        seen = pair.1.get(0).unwrap()
+    }
+    assert_eq(seen, "hi")
+}
+
+test "a struct-List value's element is the struct, not the pair tuple" {
+    let mut m: Map[Str, List[W22Pt]] = Map()
+    m.insert("a", [W22Pt { x: 7 }])
+    let mut sum = 0
+    for pair in m {
+        sum = sum + pair.1.get(0).unwrap().x
+    }
+    assert_eq(sum, 7)
+}
+
+// The rung that used to reach cc with no Blink span: iterating the value itself needs the
+// element to name a ListIterator, and a nameless element named `blink_ListIterator_void`.
+test "iterating a List value's own elements" {
+    let mut m: Map[Str, List[Int]] = Map()
+    m.insert("a", [5, 6])
+    let mut sum = 0
+    for pair in m {
+        for x in pair.1 { sum = sum + x }
+    }
+    assert_eq(sum, 11)
+}
+
+// The rung that used to be an honest diagnostic: binding the value gave a variable of `type ?`,
+// so every method on it was an UnresolvedMethod. That the SAME axis produced a clean error here
+// and a segfault one line up is the whole argument for reading the type from one place.
+test "binding the pair's value first, then reading its element" {
+    let mut m: Map[Str, List[Int]] = Map()
+    m.insert("a", [5, 6])
+    let mut sum = 0
+    for pair in m {
+        let l = pair.1
+        sum = sum + l.get(0).unwrap()
+    }
+    assert_eq(sum, 5)
+}
+
+test "the route is not the axis: the same off a call receiver" {
+    let mut sum = 0
+    for pair in w22_mkl() {
+        sum = sum + pair.1.get(0).unwrap()
+    }
+    assert_eq(sum, 5)
+}
+
+// A call receiver has no ScopeVar to key the flat channels on, so BOTH halves of the pair come from
+// the tid there — the key too, not just the value. A non-Str key and a non-Int element make that
+// visible: the flat channels' fabricated defaults are exactly CT_STRING for the key and CT_INT for
+// the value, so a `Map[Str, List[Int]]` off a call is the one shape whose fabrication is right by
+// accident. This row is the shape where every slot is wrong if the tid is not consulted.
+test "a call receiver's pair takes BOTH halves from the tid" {
+    let mut ksum = 0
+    let mut seen = ""
+    for pair in w22_mkl_int_str() {
+        ksum = ksum + pair.0
+        seen = pair.1.get(0).unwrap()
+    }
+    assert_eq(ksum, 4)
+    assert_eq(seen, "hi")
+}
+
+test "a call receiver's Set value keeps its element" {
+    let mut n = 0
+    for pair in w22_mks() {
+        assert_eq(pair.0, "a")
+        assert_eq(pair.1.contains(3), true)
+        assert_eq(pair.1.contains(4), false)
+        n = n + pair.1.len()
+    }
+    assert_eq(n, 1)
+}
+
+test "every entry decodes its own element, not the first slot's" {
+    let mut m: Map[Str, List[Int]] = Map()
+    m.insert("a", [1])
+    m.insert("b", [2])
+    m.insert("c", [3])
+    let mut sum = 0
+    for pair in m {
+        sum = sum + pair.1.get(0).unwrap()
+    }
+    assert_eq(sum, 6)
+}
+
+test "a List value keeps its length as well as its element" {
+    let mut m: Map[Str, List[Int]] = Map()
+    m.insert("a", [5, 6])
+    let mut n = 0
+    let mut last = 0
+    for pair in m {
+        n = n + pair.1.len()
+        last = pair.1.get(1).unwrap()
+    }
+    assert_eq(n, 2)
+    assert_eq(last, 6)
+}
+
+// ── THE BOUNDS ───────────────────────────────────────────────────────────────────────
+
+test "the destructuring route still carries the value's element" {
+    let mut m: Map[Str, List[Int]] = Map()
+    m.insert("a", [5, 6])
+    let mut sum = 0
+    for (k, v) in m {
+        assert_eq(k, "a")
+        sum = sum + v.get(0).unwrap()
+    }
+    assert_eq(sum, 5)
+}
+
+// The row above passed before the fix for a reason that had nothing to do with the propagation it
+// appears to test: emit_for_in's `for (k, v)` element carry measured the pattern's arity with
+// sublist_length on a NODE id, so its `> 1` guard rejected every two-element pattern and the carry
+// never ran. An Int element then arrived anyway, from the CT_INT default one layer down. So the
+// two rows below are the ones that actually exercise it — a Str element read a raw pointer as an
+// integer, and a struct element rendered as the `<value>` placeholder.
+test "a Str element survives the destructuring route" {
+    let mut m: Map[Str, List[Str]] = Map()
+    m.insert("a", ["hi"])
+    let mut seen = ""
+    for (k, v) in m {
+        assert_eq(k, "a")
+        seen = v.get(0).unwrap()
+    }
+    assert_eq(seen, "hi")
+}
+
+test "a struct element survives the destructuring route" {
+    let mut m: Map[Str, List[W22Pt]] = Map()
+    m.insert("a", [W22Pt { x: 7 }])
+    let mut sum = 0
+    for (k, v) in m {
+        assert_eq(k, "a")
+        sum = sum + v.get(0).unwrap().x
+    }
+    assert_eq(sum, 7)
+}
+
+// The destructured value's element has to be recorded on the VARIABLE, not just readable at one
+// call site: a nested for-in over `v` names its iterator from what `v` carries.
+test "the destructured value iterates its own Str elements" {
+    let mut m: Map[Str, List[Str]] = Map()
+    m.insert("a", ["hi", "there"])
+    let mut joined = ""
+    for (_k, v) in m {
+        for s in v { joined = "{joined}{s}|" }
+    }
+    assert_eq(joined, "hi|there|")
+}
+
+test "a Set-valued map's destructured element still discriminates" {
+    let mut s: Set[Str] = Set()
+    s.insert("q")
+    let mut m: Map[Str, Set[Str]] = Map()
+    m.insert("a", s)
+    for (k, v) in m {
+        assert_eq(k, "a")
+        assert_eq(v.contains("q"), true)
+        assert_eq(v.contains("r"), false)
+    }
+}
+
+test "a Set value's element still discriminates, both polarities" {
+    let mut s: Set[Int] = Set()
+    s.insert(3)
+    let mut m: Map[Str, Set[Int]] = Map()
+    m.insert("a", s)
+    let mut seen = 0
+    for pair in m {
+        assert_eq(pair.1.contains(3), true)
+        assert_eq(pair.1.contains(4), false)
+        assert_eq(pair.1.len(), 1)
+        seen = seen + 1
+    }
+    assert_eq(seen, 1)
+}
+
+test "a Str-Set value's element still discriminates" {
+    let mut s: Set[Str] = Set()
+    s.insert("q")
+    let mut m: Map[Str, Set[Str]] = Map()
+    m.insert("a", s)
+    for pair in m {
+        assert_eq(pair.1.contains("q"), true)
+        assert_eq(pair.1.contains("r"), false)
+    }
+}
+
+test "a nested-Map value still reads deeply" {
+    let mut inner: Map[Str, Int] = Map()
+    inner.insert("z", 9)
+    let mut m: Map[Str, Map[Str, Int]] = Map()
+    m.insert("a", inner)
+    let mut d = 0
+    for pair in m {
+        d = pair.1.get("z").unwrap()
+    }
+    assert_eq(d, 9)
+}
+
+test "a scalar value still iterates" {
+    let mut m: Map[Str, Int] = Map()
+    m.insert("a", 1)
+    let mut sum = 0
+    for pair in m {
+        sum = sum + pair.1
+    }
+    assert_eq(sum, 1)
+}
+
+test "a struct value still iterates" {
+    let mut m: Map[Str, W22Pt] = Map()
+    m.insert("a", W22Pt { x: 5 })
+    let mut sum = 0
+    for pair in m {
+        sum = sum + pair.1.x
+    }
+    assert_eq(sum, 5)
+}
+
+test "a tuple value still iterates" {
+    let mut m: Map[Str, (Int, Int)] = Map()
+    m.insert("a", (4, 5))
+    let mut sum = 0
+    for pair in m {
+        let t = pair.1
+        sum = sum + t.0 + t.1
+    }
+    assert_eq(sum, 9)
+}
+
+// br 9qz1k6's carrier rows, on the route this cell changes: the pair's value type now arrives
+// from the tid for every kind, so the carrier arm must still win where it applies.
+test "an Option value still keeps its carrier" {
+    let mut m: Map[Str, Option[Int]] = Map()
+    m.insert("k", Some(7))
+    let mut sum = 0
+    for pair in m {
+        sum = sum + pair.1.unwrap()
+    }
+    assert_eq(sum, 7)
+}
+
+test "a Result value still keeps its carrier" {
+    let mut m: Map[Str, Result[Int, Str]] = Map()
+    m.insert("ok", Ok(3))
+    let mut sum = 0
+    for pair in m {
+        assert_eq(pair.1.is_ok(), true)
+        sum = sum + pair.1.unwrap()
+    }
+    assert_eq(sum, 3)
+}
+
+// An Int-keyed map: the pair's KEY is the other half of the interned tuple, and a non-Str key
+// exercises it independently of the value.
+test "an Int-keyed map's pair keeps both halves" {
+    let mut m: Map[Int, List[Str]] = Map()
+    m.insert(4, ["hi"])
+    let mut ksum = 0
+    let mut seen = ""
+    for pair in m {
+        ksum = ksum + pair.0
+        seen = pair.1.get(0).unwrap()
+    }
+    assert_eq(ksum, 4)
+    assert_eq(seen, "hi")
+}
+
+// A plain annotated tuple with a List element reads correctly today and must keep doing so: it
+// is the row that proved the shared, element-less `Tuple2_str_list` registration is survivable,
+// and therefore that the registrar was not the cause.
+test "a plain annotated tuple with a List element is unchanged" {
+    let t: (Str, List[W22Pt]) = ("a", [W22Pt { x: 7 }])
+    assert_eq(t.1.get(0).unwrap().x, 7)
+    let ti: (Str, List[Int]) = ("a", [5])
+    assert_eq(ti.1.get(0).unwrap(), 5)
+}

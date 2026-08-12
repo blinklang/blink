@@ -5546,6 +5546,163 @@ print), `task regen` at fixed point, `task ci` exit 0 with 670/670 test files an
 0 failed.
 
 
+### The pair's element, and the two levels the ticket was away from it (br `w224zg`)
+
+`9qz1k6`'s byproduct, and the first cell in this project whose repair **writes ScopeVar channels**
+rather than routing a tid to one emitter — which is why it was expected to be the first to move the
+census, and why the census not moving turned out to say something about the instrument rather than
+about the fix (below).
+
+**The ticket named the tuple registrar, and the registrar is not the cause.** The indictment was
+`ensure_tuple_type`'s field tps:
+
+```blink
+reg_sf_entry(c_name, fname, et, "", sv_tp(et, -1, -1, ""))     // codegen_types.bl
+```
+
+`sv_tp(CT_LIST, -1, -1, "")` does fabricate `List[Int]`, and that is a real lie. But it is a
+*survivable* one, and one row proves it: an annotated
+
+```blink
+let t: (Str, List[W22Pt]) = ("a", [W22Pt { x: 7 }])
+```
+
+registers the **same** element-less `Tuple2_str_list` c_name — the tag names no element either — and
+`t.1.get(0).unwrap().x` reads back correctly today. It works because `codegen_methods.bl`'s
+list-method entry stamps a receiver with no recorded element straight from the tid at `t.1`; the
+shared registry entry is never consulted for the element at all. So the registrar's lossiness is
+already routed around, and the question is only ever *whether a tid is there to route to*.
+
+**It was not, and the reason was in typecheck.** `typecheck.bl`'s `ForIn` arm gave the loop variable
+an element type for a `List` or a `Set` iterable and `TYPE_UNKNOWN` for every other legal iterable —
+including a `Map`. So `pair` was `?`, `pair.1` was `?`, `stamp_list_elem_from_tid` declined
+(`arm=bail_unnameable`), and the element then came from whatever ambient `expr_list_elem_struct`
+happened to hold, which during map iteration is the pair tuple's own tag: `pair.1.get(0)` read a
+`blink_Tuple2_str_list*` out of a list of boxed ints.
+
+The fix is one branch, and it says the thing once — a Map's iteration element **is** the interned
+`(K, V)` tuple, per `sections/03c_protocols.md`'s `IntoIterator` table:
+
+```blink
+} else if iter_tk == TyKind.Map {
+    let mt = ty_pool.get(iter_t).unwrap()
+    elem_t = make_tuple_type([mt.inner1, mt.inner2])
+}
+```
+
+**All three rungs of the loudness ladder on one axis.** This is why the cell is worth a row per rung
+rather than one representative row — the same lost element, read three ways, produced the best and
+the worst diagnostic the compiler has:
+
+| written | before |
+|---|---|
+| `let l = pair.1; l.get(0)` | `error[UnresolvedMethod] '.get' on type ?` — honest, the best |
+| `pair.1.get(0).unwrap()` | **segfault** for `List[Int]`/`List[Str]`, `<value>` for `List[Pt]` |
+| `for x in pair.1` | cc: `blink_Option_void`, `void x = …` — **no Blink span**, the worst |
+
+Re-measuring also retracted one of the ticket's two MVCEs: `Set[Int]`'s `contains(3)` does **not**
+fail in cc, and neither does `Set[Str]`'s — both polarities discriminate correctly. The ticket's
+`void _mkey9` was a different program. Its `List[Int]` MVCE was worse than recorded (segfault, not
+"prints nothing"). Both re-measurements are recorded in the test file, because a ticket's stated
+symptom is evidence about the past, not about the build in front of you.
+
+**Three edits, and each one is a different kind of gap.**
+
+1. **typecheck's `ForIn`** — above. A missing fact, stated once, and every route reads it.
+2. **`codegen_expr.bl`'s tuple-positional read** needed the `CT_LIST` arm next to the `CT_SET` and
+   `CT_MAP` arms `jkdywb` had already added. Unlike those two, `List` carries a **global** channel
+   (`expr_list_elem_type` / `_struct`) that the let-ladder and the for-loop lowering read, so the
+   recovery has to go through `recover_list_elem_from_tid` — the wrapper that writes the globals —
+   and not the bare stamp. That is what turns `let l = pair.1` and `for x in pair.1` from the first
+   and third rungs into reads.
+3. **`emit_for_in`'s `CT_MAP` arm** needed the receiver's tid for two *differently gated* answers,
+   which is the whole finding of this cell:
+
+   - The **heads**, for a call receiver only. `for pair in mkm()` has no ScopeVar to key the flat
+     channels on, so `get_map_key_type` / `get_map_value_type` answer their **fabricated** defaults
+     (`CT_STRING` / `CT_INT` — `sv_tp`'s `CT_MAP` arm) instead of declining, and the pair for a
+     `Map[Str, List[Int]]` was built as `Tuple2_str_int`. The gate is the one honest signal the flat
+     pool has: `get_map_key_type_raw` / `get_map_value_type_raw` reading **-1**, i.e. no ScopeVar
+     under this name at all, so there is no correct answer to override. Where the flat pool *does*
+     answer it keeps its spelling — those spellings work, and this cell is not the place to
+     re-decide them.
+   - The **element**, on every receiver including a plain `Ident`, because the flat pool has no
+     channel for it at all: `extra` holds one integer, so it can spell the element's ct and never
+     its struct name. That asymmetry is why one answer is gated on the flat pool's silence and the
+     other is not.
+
+   This one also produced the cell's most instructive error message. `pair.1.get(0)` off a call
+   receiver reported
+
+   ```
+   error[UnresolvedMethod]: unresolved method '.get' on type List[Int] in 'main'
+   ```
+
+   from codegen's backstop — which prints the **tid-derived** type name. The compiler named the
+   right type in the diagnostic while emitting against the wrong one. A diagnostic that reads the
+   tid and an emitter that reads the flat fields is the divergence this project exists to remove,
+   and here it was visible in one line of output.
+
+**And a fourth thing, found by tracing rather than reasoning.** The `for (k, v) in m` element carry
+that both the ticket and the surrounding comment describe as the working hand-written patch has
+never run:
+
+```blink
+let for_pat_sl = node_elements(node)          // NOT a sublist — it is the pattern NODE
+if map_val_nested_ct >= 0 && sublist_length(for_pat_sl) > 1 {
+```
+
+`node_elements(<ForIn>)` answers the tuple-pattern node; `emit_tuple_destructure` re-derives the
+element sublist from it, which is why passing the node *to it* is correct and why the name was a
+lie. `sublist_length` / `sublist_get` were reading a node id as a sublist id, so the measured arity
+of `for (k, v) in m` was **1** — and **0** for the next such loop in the same program — and the
+`> 1` guard rejected every two-element pattern there is. It looked like it worked because the
+element it failed to write was supplied downstream by the `CT_INT` default: right for `List[Int]`,
+silently wrong for every other element type. `for (k, v) in (Map[Str, List[Str]])` read a pointer as
+an integer and `Map[Str, List[W22Pt]]` rendered as `<value>`, both of which the ticket's own bounds
+list recorded and neither of which its cause explained.
+
+Two mutually reinforcing failures produced that: a name that misdescribed a value, and a guard whose
+false branch was indistinguishable from success. The `> 1` guard silently skipping is the same
+failure mode as `sv_tp` fabricating — a decline that reads as an answer — one level up, in control
+flow instead of in data. Filed as br `tdb6en`: `node_elements()` answers a sublist id for some node
+kinds and a child node id for others, and nothing in the `Int` return type separates them — the same
+argument Stage 0 made for `TyKind`, one level down.
+
+**Census, on the 958-file intersected basis:** `tydiv` **4836 diverge rows / 419 cells before and
+after**, `ctypediv` **23 / 7** before and after — the same pair of figures `9qz1k6` published, to the
+row.
+
+The prediction at the top of this section — that a repair which *writes ScopeVar channels* would be
+the first to move the counter — was wrong, and measuring why is worth more than the prediction was.
+It is not the carrier-vs-stamp reason the previous two sections gave. **The counter has exactly one
+tap.** Every diverge row in the sweep reports the same site:
+
+```
+$ grep -a bucket=diverge sweep.txt | sed 's|.*site=||;s| .*||' | sort | uniq -c
+   4860 emit_let_binding.decl
+```
+
+`sv_ty_or_flat_at` is called from `src/codegen_stmt.bl:3888` and nowhere else in codegen (the only
+other tap, `copy_list_compound_elem.src`, has produced nothing but agree rows). A for-in loop
+variable is never compared against its tid, so a cell whose whole repair lives in the for-in
+lowering cannot move this number no matter how wrong it was — and `w224zg` was wrong in three
+distinct ways, one of them a segfault.
+
+Two things follow. The first is that the figure staying **exactly** equal is itself the regression
+evidence this cell can offer: 4836/419 before and after means no let declaration's spelling changed,
+which is what you want from a fix aimed at a different site. The second is that Stage 3's stated exit
+criterion — *drive the divergence counter to 0* — currently reads as **"no let declaration disagrees
+with its tid"**, which is a genuine subset of "the tid is authoritative" and not a synonym for it.
+Filed as br `7xgbh6`: add a tap per ScopeVar-declaring site (for-in loop and destructured bindings,
+fn parameters, match-arm patterns, `with`/`catch` bindings), each with its own site key, and expect
+the row count to **rise** when they land. That is the instrument getting honest. Stage 3's exit
+should then be stated as zero at every tapped site, with the sites named.
+
+25 rows, 25 green (RED first, and each rung failed in its own way), `task regen` at fixed point,
+`task ci` exit 0 with 671/671 test files and fmt 1562 passed / 0 failed.
+
+
 ## Appendix — all 428 shape cells
 
 Format: `family | occurrences | tid | flat`.

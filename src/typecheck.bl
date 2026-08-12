@@ -11549,6 +11549,19 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         let mut elem_t = TYPE_UNKNOWN
         if iter_tk == TyKind.List || iter_tk == TyKind.Set {
             elem_t = ty_pool.get(iter_t).unwrap().inner1
+        } else if iter_tk == TyKind.Map {
+            // A Map's iteration element is the (K, V) pair (sections/03c_protocols.md's
+            // IntoIterator table), and saying so HERE is the whole of br w224zg. Left as
+            // TYPE_UNKNOWN, `pair` was `?`, so `pair.1` was `?`, so codegen had no tid to stamp
+            // the value's element from -- and a container value's element then came from whatever
+            // ambient channel codegen happened to be carrying, which during map iteration is the
+            // pair tuple's own tag. That produced all three failure rungs on one axis: an honest
+            // `UnresolvedMethod` on `let l = pair.1`, a silent wrong value on
+            // `pair.1.get(0).unwrap()`, and a cc error with no Blink span on `for x in pair.1`.
+            // It is also why `for (k, v) in m` needed its own hand-written element carry in
+            // emit_for_in: with no pair type in the memo, every route had to reconstruct one.
+            let mt = ty_pool.get(iter_t).unwrap()
+            elem_t = make_tuple_type([mt.inner1, mt.inner2])
         } else {
             // TyKind.Unknown here means iter_t is still an unbound metavar (e.g. a lazy-adapter
             // chain like `.enumerate()`/`.zip()` not yet pinned at this point in checking) --
@@ -11559,15 +11572,18 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             // plus the Channel receive extension) so they pass through even where codegen's
             // emit_for_in has no arm yet -- that gap is I0002, an internal compiler error,
             // never a user-facing NotIterable.
-            let is_deferred_iterable = iter_tk == TyKind.Unknown || iter_tk == TyKind.Map || iter_tk == TyKind.Str || iter_tk == TyKind.Bytes || iter_tk == TyKind.Iterator || iter_tk == TyKind.Channel
+            // TyKind.Map is no longer listed: the branch above answers it, so naming it here
+            // would be an unreachable claim that a Map still has no element type.
+            let is_deferred_iterable = iter_tk == TyKind.Unknown || iter_tk == TyKind.Str || iter_tk == TyKind.Bytes || iter_tk == TyKind.Iterator || iter_tk == TyKind.Channel
             if is_deferred_iterable == 0 {
                 diag_error_at("NotIterable", NOT_ITERABLE, "cannot iterate over type '{type_to_str(iter_t)}' with a `for` loop -- only List, Set, Map, Range, Str, Bytes, Channel, and Iterator implement iteration", node_iterable(node), "iterate a List, Set, Map, Range, Str, Bytes, Channel, or Iterator instead")
             }
         }
         nr_define_typed(node_var_name(node), 0, elem_t)
-        let tc_for_pat_sl = node_elements(node)
-        if tc_for_pat_sl != -1 {
-            tc_check_pattern_types(tc_for_pat_sl)
+        // A pattern NODE, not a sublist (tc_check_pattern_types takes a node) — br tdb6en.
+        let tc_for_pat_node = node_elements(node)
+        if tc_for_pat_node != -1 {
+            tc_check_pattern_types(tc_for_pat_node)
         }
         tc_check_body(node_body(node))
         nr_pop_scope()
