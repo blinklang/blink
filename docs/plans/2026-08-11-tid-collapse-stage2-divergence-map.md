@@ -5683,8 +5683,10 @@ $ grep -a bucket=diverge sweep.txt | sed 's|.*site=||;s| .*||' | sort | uniq -c
    4860 emit_let_binding.decl
 ```
 
-`sv_ty_or_flat_at` is called from `src/codegen_stmt.bl:3888` and nowhere else in codegen (the only
-other tap, `copy_list_compound_elem.src`, has produced nothing but agree rows). A for-in loop
+`sv_ty_or_flat_at` is called from `src/codegen_stmt.bl:3888` and nowhere else in codegen. The only
+other tap in the tree, `copy_list_compound_elem.src`, is reached by six corpus files and answers
+`missing` on every one of its 24 occurrences — the source variable has no stamped tid at all — so it
+has never been in a position to report a divergence either. A for-in loop
 variable is never compared against its tid, so a cell whose whole repair lives in the for-in
 lowering cannot move this number no matter how wrong it was — and `w224zg` was wrong in three
 distinct ways, one of them a segfault.
@@ -5701,6 +5703,283 @@ should then be stated as zero at every tapped site, with the sites named.
 
 25 rows, 25 green (RED first, and each rung failed in its own way), `task regen` at fixed point,
 `task ci` exit 0 with 671/671 test files and fmt 1562 passed / 0 failed.
+
+
+### The instrument had one tap, and four more declaration sites (br `7xgbh6`)
+
+`w224zg` ended by measuring the instrument instead of the fix, and what it measured is that Stage 3's
+exit criterion was reading a single site. This section makes the counter see the other declarations.
+It is measurement work, not a repair: no cell is closed here, and the expected direction of the row
+count is **up**.
+
+**What a "tap" has to be.** `sv_ty_or_flat_at(name, site, node)` (`typecheck.bl:13007`) compares the
+ScopeVar's stamped tid against `sv_tp`'s reconstruction from the flat fields and buckets the answer as
+agree / diverge / missing. A declaration that never calls it is invisible: not "agreeing", not
+"missing" — absent. Before this sub-step the only codegen caller was `emit_let_binding.decl`
+(`codegen_stmt.bl:3888`), so the census answered one question — *does a `let` disagree with its tid* —
+and Stage 3's "counter at 0" inherited that scope silently.
+
+Five sites landed, one regen each:
+
+| site key | where | what it measures |
+| --- | --- | --- |
+| `emit_for_in.var` | `forin_measure_var`, before each of the 8 `emit_block(node_body(node))` in `emit_for_in` | the loop variable |
+| `emit_fn_params.param` | `params_measure`, after each of the 4 param registration loops | every parameter of every emitted function |
+| `with_resource.bind` | `emit_with_block_core`, after the `w089a0` stamp | the `with X as r` binder |
+| `match_pattern.bind` | `pat_measure`, at `bind_pattern_vars`' generic `IdentPattern` arm + its 3 inline carrier fast paths | match-arm pattern binders |
+| `tuple_destructure.elem` | `pat_measure_at`, at the end of `emit_tuple_destructure`'s loop | `let (a, b) = t` **and** `for (k, v) in <iterable>` leaves |
+
+Four of the five needed more than a call inserted.
+
+**A parameter carried no tid at all, and the reason names the memo's one writer.** The first probe
+reported `summary emit_fn_params.param agree=0 diverge=0 missing=142` — 142 out of 142. `tc_node_tid`
+has exactly one writer, `infer_type` (`typecheck.bl:8941`), and `infer_type` is only ever called on
+**expressions**. A parameter is a declaration, so nothing ever published its resolved type, and a tap
+on it could only ever say `missing`. Fixed on the typecheck side with a publish at the point where
+typecheck already knows the answer:
+
+```blink
+pub fn tc_publish_node_tid(node: Int, tid: Int)      // typecheck.bl, beside tc_lookup_node_tid
+```
+
+called in `tc_check_fn`'s param loop immediately after `nr_define_typed(pname, 0, ptid_final)`. The
+tap then read `agree=132 diverge=30 missing=0` — a real comparison at a new position, and the largest
+declaring population in the tree, since every mono instance and poly impl re-registers its params.
+
+**The measurement has to substitute through the instance's binds.** Inside a monomorphized body a
+`List[T]` parameter or `for x in xs` publishes `T`, and comparing a typevar against a concrete flat
+spelling reports a divergence that is only the tap failing to look up what `T` is bound to. Both new
+taps therefore run `tc_tid_subst_mono(...)` — and the param tap must use the mono loops' **own local**
+`tparams_sl`/`arg_tids`, not the `cg_fn_mono_*` globals (`codegen_types.bl:1428`), because those are
+set at `codegen_stmt.bl:8410`/`8770`, *after* the param loops run.
+
+**`with`/`catch` is one site, not two.** The ticket's wording implies a second binder. There is no
+catch clause in Blink — `rg Catch src/ast.bl src/parser.bl src/codegen*.bl` finds nothing, because
+effects and `Result` carry failure — so the resource binder is the whole family. `w089a0` had already
+stamped its tid; stamping is not measuring, which is exactly the blind spot the for-in variable had.
+
+**The pattern family has no binding primitive, but it does have a binding chokepoint.**
+`bind_pattern_vars` (`codegen_stmt.bl:1850`) stamps through ~28 `set_var` calls spread over its arms,
+which is what makes a tap-per-arm look unavoidable. It is not: every recursed sub-pattern **re-enters
+the function** and lands in the generic `NodeKind.IdentPattern` arm, so that arm plus the three
+carrier fast paths that handle an IdentPattern inline without recursing are the complete set of
+places a binder's name is decided — four insertions, and the tuple/list/variant arms are covered by
+the recursion rather than by copies. A tap per arm would measure the same set today and rot tomorrow,
+since an arm added later would be silently unmeasured.
+
+The tid again comes from typecheck rather than a second walk. `tc_check_pattern_types` already
+decomposes the binding hint one level per arm — Option/Result unwrap, tuple element, list element,
+variant field — and now publishes each leaf's answer on the leaf node. Codegen reads that instead of
+re-deriving the decomposition, which is precisely the two-copies-of-one-answer mistake `w224zg` was
+made of.
+
+One binder family stays unmeasured, and it is unmeasurable rather than skipped: a struct-pattern
+shorthand field (`match p { SPt { xs } => ... }`) has no IdentPattern node, and typecheck's
+StructPattern arm binds it with a bare `nr_define` — no type at all, unlike every other arm. There is
+nothing to compare against. Probing it turned up a live miscompile rather than just a gap:
+
+```blink
+type SPt { xs: List[Str] }
+match p { SPt { xs } => io.println("{xs.len()} {xs.get(0).unwrap()}") }   // prints: 2 94088795907670
+```
+
+Filed as br `1zqq7g`, with both coupled causes named — typecheck binding the field untyped, and
+codegen's StructPattern arm setting `ftype`/`fstype` but never the element channels, so `get()` falls
+to the `CT_INT` floor.
+
+**A destructured binder is a fifth site, and the ticket said so.** `7xgbh6`'s first bullet reads
+"`emit_for_in` loop variable (**and the destructured `k`/`v` bindings**)", and the second half is not
+covered by either of the taps that look like it would cover it. A `for (k, v)` head does not route
+through `bind_pattern_vars` at all: both it and `let (a, b) = t` go to `emit_tuple_destructure`
+(`codegen_stmt.bl:3072`), which is therefore one function holding an entire declaration family. Hence
+`pat_measure` split into `pat_measure_at(bind_name, pat, site)` with the site as a parameter — the two
+callers share a mechanism but are different declaration families, and collapsing them under one key
+would lose the attribution the cell map is read through.
+
+The two callers of that one function do **not** report the same thing, and the asymmetry is the
+finding:
+
+| head | leaves carry a tid | bucket |
+| --- | --- | --- |
+| `for (k, v) in m` | yes — typecheck's ForIn arm knows the element type | real comparison |
+| `let (a, b) = t` | no — typecheck never decomposes a LetBinding tuple pattern (br `ksx1q7`) | `missing` |
+
+The tap deliberately does not re-derive the element from the tuple's `struct_name` to close that gap.
+A tap that manufactures the answer measures itself, and the `missing` rows are the evidence that
+`ksx1q7` is a real hole rather than a cosmetic one.
+
+The for-in half needed a typecheck change to be measurable at all. The ForIn arm called
+`tc_check_pattern_types(pat)` without setting a binding hint, so the walk ran with whatever
+`tc_pattern_binding_type` happened to hold from the last pattern checked anywhere — in practice
+nothing, so the TuplePattern arm took its `tup_start = -1` path and typed both leaves as untyped. The
+arm now sets the hint to the element type around the call and restores it after:
+
+```blink
+let tc_saved_pat_hint = tc_pattern_binding_type
+tc_pattern_binding_type = elem_t
+tc_check_pattern_types(tc_for_pat_node)
+tc_pattern_binding_type = tc_saved_pat_hint
+```
+
+That is not measurement-only: it gives previously-untyped `for (k, v)` binders a type, so the probe is
+asserted by **running** it, and `task ci` is what clears the risk that a newly-typed binder turns a
+fail-open into a hard `UnresolvedMethod` on some shape inside `ksx1q7`'s resolver gap.
+
+**The `sv_tp` fabrication hides its own cell, and one element type reveals it.** The param test first
+probed `deep(m: Map[Str, List[Int]])` and the row came back `agree`. `sv_tp`'s Map arm fabricates a
+missing value element as `Int`, so `Map[Str, List[Int]]` makes the flat side accidentally **right**.
+One element over:
+
+```
+bucket=diverge site=emit_fn_params.param var=m tid=Map[Str, List[Str]] flat=Map[Str, List[Int]]
+```
+
+This is the same coincidence that let `w224zg`'s pair element look like it worked, and it is a
+standing hazard for every cell in this census: a fabricated default that happens to match is
+indistinguishable from a correct answer. Any probe meant to expose the fabrication must avoid the
+fabricated value. The tests carry the note so the next reader does not spend the round rediscovering
+it.
+
+**A diverge is not automatically a defect.** The two `emit_for_in.var` diverge rows were checked by
+*running* the probe, and its output is correct: the tid names the shape, the flat pair is structurally
+incapable of spelling it, and the emitters that matter read the tid. A row where the tid is right and
+the flat side cannot represent the answer is **evidence for Stage 4's deletion**, not a cell to
+repair. Stage 3's exit therefore has to be stated per site, and this is the restatement it needs:
+
+> Stage 3 exits when the divergence counter reads zero at every tapped site — `emit_let_binding.decl`,
+> `emit_for_in.var`, `emit_fn_params.param`, `with_resource.bind`, `match_pattern.bind`,
+> `tuple_destructure.elem` — with each remaining diverge row either fixed or recorded as
+> flat-side-unrepresentable and scheduled for Stage 4.
+
+The one declaration family still outside that list is the struct-pattern shorthand field, and it is
+excluded for a stated reason rather than an oversight: no phase has a type for it (br `1zqq7g`). When
+that ticket lands it becomes the sixth site.
+
+**Byproduct: the with-resource binder is stamped with the resource's tid** (br `2cp4qn`), the census
+finding above, and the only place in this census where the tid — not the flat pair — is the wrong side.
+Latent while the flat fields govern; a field read against the wrong layout the moment Stage 3 flips
+authority. The whole site (26 rows / 8 cells) goes to 0 when the stamp reads the impl's `type Context`.
+
+**Byproduct: the comparison calls an equally-unknown child a divergence** (br `dyd8fk`).
+`ty_tp_same_shape` rejects on `ct == CT_VOID && k != TyKind.Void`, and `tk_to_ct(Unknown)` *is*
+`CT_VOID`, so `tid=Set[?] flat=Set[?]` — both sides equally ignorant, no defect present — counts as a
+divergence, 4595 rows of it at the param site alone. This matters to the plan's exit criterion, not
+just to the number: **no site whose corpus shapes include an unresolved typevar can reach 0 until the
+comparison can say "equally unknown"**, so Stage 3's "counter at 0" needs this fixed first or needs to
+be stated as "0 excluding both-unknown". It is an instrument defect, filed rather than fixed here
+because changing the comparison mid-census would invalidate every figure in this section.
+
+**Byproduct: `build/blinkc` exits 0 after reporting errors** (br `83ywd6`). MVCE:
+`fn main() { let x: Int = "s" }` prints `1 error(s) found` and exits **0**; `build/blink build` and
+`build/blink check` both exit 1 on the same file. `src/cli.bl` gets it right, `src/blinkc_main.bl`
+does not. It bit this work directly — the first draft of the param test passed `assert_eq(r.exit_code,
+0)` on a probe that had a parse error and never reached codegen — so both tap tests now assert
+`!out.contains("error[")` instead of trusting the status.
+
+**Byproduct: a Map method does not resolve on a tuple-pattern binder** (br `ksx1q7`), found while
+writing the tuple assertion. `match t { (a, b) => a.len() }` over `(Map[Str, Int], Int)` reports
+`unresolved method '.len' on type Map[Str, Int]` — the diagnostic names the type correctly, so the
+TuplePattern decomposition works and the *method resolver* is what declines; the same call on a plain
+local or a `Some(m)` binder resolves. The ticket carries a second, sharper shape: a LetBinding
+destructure (`let (a, b) = t`) reports `on type ?` — that path does not decompose the tuple at all.
+Reproduced on `build/blinkc.bak`, the generation before the pattern publish, so the tap did not
+introduce it.
+
+**Byproduct: `node_elements()` is two functions under one name** (br `tdb6en`), carried over from
+`w224zg`: it answers a sublist id for some node kinds and a child node id for others, with nothing in
+the `Int` return type to separate them.
+
+**A methodology hazard, recorded because it produced a wrong reading before it was caught.** A corpus
+sweep must not overlap a source edit. Compiler-linking test files compile `src/*.bl` from disk, so a
+sweep that is running while `src/` changes hits `undefined function` on the files it reaches
+afterwards — and because `build/blinkc` exits 0 on error (br `83ywd6`), the sweep records a
+*truncated* row set with no failure signal anywhere in it. The intermediate sweep taken that way read
+1066 fewer let-site rows and two fewer cells, which looked like a real improvement and was pure
+artifact: the affected file's rows had been replaced by two `error[UndefinedFunction]` lines. Both of
+this section's control facts — that `83ywd6` matters and that a zero-hit measurement is not evidence
+— fired on the same mistake.
+
+**Census, on a 960-file intersected basis** (the only files the two sweeps differ by are this
+section's five new test files; `comm -12` on the ` file=` prefixes). The instrument went from one tap
+to six, and the count went up by 6.9x:
+
+| site | diverge rows | cells | missing |
+| --- | --- | --- | --- |
+| `emit_fn_params.param` | 27856 | 167 | 19 |
+| `emit_let_binding.decl` | 4895 | 427 | 1 |
+| `match_pattern.bind` | 488 | 68 | 20 |
+| `emit_for_in.var` | 58 | 27 | 11 |
+| `with_resource.bind` | 26 | 8 | 0 |
+| `tuple_destructure.elem` | 5 | 4 | 87 |
+| **total** | **33328** | **701** | **138** |
+
+Before: 4860 rows / 427 cells, all at `emit_let_binding.decl`.
+
+**The let site did not move, and the +35 rows are one line of my own.** Diffed row-by-row with `at=`
+line numbers normalised (my edits shifted every `at=typecheck:NNNNN`, which naively reads as 1143 new
+and 1108 gone), the let site gained exactly 35 rows and lost none — all of them
+`var=tk tid=TyKind flat=Int` at `typecheck.bl:13565`, i.e. the `let tk = type_kind(iter_t)` in the new
+`tc_tid_iter_elem`, once per compiler-linking corpus file. It lands in an existing cell, which is why
+cells stayed at **427 exactly**. The contamination guard also passed: the sweep's `error[` population
+is identical to the baseline's, 1158 lines with the same 15 kinds in the same counts, so no file was
+compiled against a half-edited `src/`.
+
+**The param site's 27856 rows are four classes, and only one of them is a repair list.** Publishing
+the number without the split would misread the instrument, since two classes are not defects at all:
+
+| class | rows | example | what it is |
+| --- | --- | --- | --- |
+| A — codegen special-cases a stdlib struct | 13785 | `tid=Duration flat=Duration` (9190), `tid=Instant flat=Instant` (4595) | `CT_DURATION`/`CT_INSTANT` are dedicated flat ctypes for what typecheck correctly models as an ordinary struct (`pub type Duration { nanos: Int }`). The spellings match; the *representations* do not. Dies with `CT_*` in Stage 4. |
+| B — both sides equally unknown | 4595 | `tid=Set[?] flat=Set[?]` | The comparison cannot say "equally ignorant" — br `dyd8fk`. |
+| C — fabricated default vs under-determined tid | 8390 | `tid=Map[?, ?] flat=Map[Str, Int]` (5514), `tid=List[?] flat=List[Int]` (2757), `tid=Handle[?] flat=Handle[Int]` (119) | `sv_tp` invents a concrete element the tid does not claim. Both sides wrong; ties to E0301 (`gqg3rk`). |
+| D — genuine flat-side loss | ~1086 | enum→`Int` (`TyKind` 286, `TokenKind` 181, `TyDiv` 107, `NodeKind` 35, …), `List[Pollfd] flat=List[Void]` (62), `Map[Str, List[Str]] flat=Map[Str, List[Int]]` (36), `tid=Template[DB] flat=Unknown` (72), `Fn(Request) -> Response flat=Fn(blink_std_http_types_Response(*)(const blink_closure*, …))` | The tid is right and the flat pair cannot hold the answer. |
+
+Class A is worth stating plainly because it is the plan's thesis in miniature: codegen holds a
+hard-coded ctype for a stdlib struct, so the same type has two representations and the counter can
+see it. Class B is the one that blocks the exit criterion arithmetically rather than by any codegen
+defect, which is why it went to a ticket instead of into this list.
+
+**`match_pattern.bind`'s 488 rows are dominated by the fail-open floor**, which is the same shape
+`1zqq7g` names one arm over: `tid=Pollfd flat=Int` (124), `tid=AstNode flat=Int` (70),
+`tid=Box[Int] flat=Int` (12), `tid=UserRow flat=Int` (8) — a variant-payload binder whose flat ctype
+is `CT_INT` while the tid names the struct. Those are Stage 3 repair cells, and the tid is the correct
+side of each. A smaller group is unsubstituted typevars (`tid=T flat=Int`, `tid=P flat=Int`,
+`tid=L`/`tid=R`), which belong with class B.
+
+**`with_resource.bind` turned out to be a bug, and the only one in this census where the TID is the
+wrong side.** All 26 rows / 8 cells are one defect: `emit_with_block_core` stamps
+`tc_lookup_node_tid(item)` — the *resource* expression — but a `BlockHandler`'s binder is what
+`enter()` returns, i.e. the impl's `type Context`. Minimal repro:
+
+```blink
+type Conn { id: Int }
+type Tx { tag: Str }
+impl BlockHandler for Conn {
+    type Context = Tx
+    fn enter(self) -> Tx { Tx { tag: "t" } }
+    fn exit(self, _ok: Bool) { }
+}
+fn main() { with Conn { id: 1 } as ctx { io.println(ctx.tag) } }   // prints `t`
+```
+```
+bucket=diverge site=with_resource.bind var=ctx tid=Conn flat=Tx
+```
+
+The binder really is a `Tx` — it runs, and `ctx.tag` resolves — so the flat side is right and the tid
+is wrong. Harmless while the flat fields govern; a miscompile the moment Stage 3 flips authority,
+because a field read would be resolved against the resource's layout. Filed as br `2cp4qn`, and the
+whole site goes to 0 when the stamp reads the Context. Finding this is the clearest argument for the
+ticket: a tap that only counted rows would have reported 26 harmless divergences.
+
+**`tuple_destructure.elem` reports 5 diverge and 87 missing**, and the ratio is the point rather than
+a shortfall: the diverge rows are for-in leaves the tid can spell and the flat pair cannot
+(`tid=List[Str] flat=List[Int]`, `tid=Set[Str] flat=Set[?]`, `tid=List[W22Pt] flat=List[Int]`,
+`tid=(Int, Str) flat=Tuple2_int_str`), and the 87 missing rows are `let (a, b) = t` binders that carry
+no tid because typecheck does not decompose a LetBinding tuple pattern at all (br `ksx1q7`). The
+missing bucket is that ticket's corpus-wide size.
+
+21 rows, 21 green across five test files, `task regen` at fixed point for each sub-step, `task ci`
+exit 0 with 676/676 test files and fmt 1572 passed / 0 failed.
 
 
 ## Appendix — all 428 shape cells

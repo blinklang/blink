@@ -1,0 +1,132 @@
+// br 7xgbh6 sub-step 5: a tuple-destructure binder is a ScopeVar declaration, and the divergence
+// counter must tap it. This is the "and the destructured k/v bindings" half of the ticket's first
+// bullet, and it is a separate site from the match-arm tap even though both measure pattern binders:
+// `emit_tuple_destructure` (codegen_stmt.bl:3072) is reached by BOTH `let (a, b) = t` and
+// `for (k, v) in <iterable>`, and neither routes through `bind_pattern_vars`.
+//
+// The two callers differ in what they can report, and the difference is the finding:
+//
+//   - `for (k, v) in m` — typecheck's ForIn arm knows the element type, so the walk decomposes the
+//     tuple and both leaves carry a published tid. This file asserts a real comparison there.
+//   - `let (a, b) = t` — typecheck does not decompose a LetBinding tuple pattern at all (br ksx1q7:
+//     the binder reports `on type ?`), so those leaves land in the `missing` bucket. Recorded, not
+//     papered over: the tap deliberately does not re-derive the element from the tuple's struct name,
+//     because a tap that manufactures the answer measures itself instead of the compiler.
+//
+// Advisory, like every Stage 2 dual-write: the answer is discarded and the flat fields still govern
+// every branch.
+
+import std.process.{ProcessResult}
+
+// The map value is `List[Str]` and NOT `List[Int]` because `sv_tp`'s Map arm fabricates a missing
+// value element as `Int`, which would make the flat side accidentally right and hide the cell — the
+// same coincidence that cost br w224zg a round.
+let PROBE_SRC: Str = #"fn main() {
+    let mut m: Map[Str, List[Str]] = Map()
+    m.insert("a", ["x", "y"])
+    let mut n = 0
+    for (k, v) in m { n = n + k.len() + v.len() }
+    let t = ("s", 3)
+    let (p, q) = t
+    io.println("{n} {p} {q}")
+}
+"#
+
+fn probe_path() -> Str { "build/7xgbh6_td_probe.bl" }
+
+fn run_tydiv() -> ProcessResult {
+    process_run("sh", ["-c", "env BLINK_TRACE_CHANNELS=tydiv build/blinkc {probe_path()} build/7xgbh6_td_probe.c 2>&1"])
+}
+
+// br 83ywd6: `build/blinkc` exits 0 even when it reports errors, so `assert_eq(r.exit_code, 0)` does
+// not establish that the probe compiled. Assert on the absence of a diagnostic instead.
+fn compiled_clean(out: Str) -> Bool {
+    !out.contains("error[")
+}
+
+fn have_blinkc() -> Bool {
+    file_exists("build/blinkc") == 1
+}
+
+test "a tuple-destructure binder is a tapped declaration site" {
+    if !have_blinkc() {
+        skip("build/blinkc is not present in this working tree")
+        return
+    }
+    write_file(probe_path(), PROBE_SRC)
+    let r = run_tydiv()
+    fs.remove(probe_path())
+    assert_eq(r.exit_code, 0)
+    assert(compiled_clean(r.out))
+    assert(r.out.contains("tuple_destructure.elem"))
+}
+
+test "the for-in destructured value reports the tid the flat fields cannot spell" {
+    if !have_blinkc() {
+        skip("build/blinkc is not present in this working tree")
+        return
+    }
+    write_file(probe_path(), PROBE_SRC)
+    let r = run_tydiv()
+    fs.remove(probe_path())
+    assert_eq(r.exit_code, 0)
+    assert(compiled_clean(r.out))
+    // `v` is the map's value, `List[Str]`, whose element has no flat slot to live in. This row is the
+    // evidence that typecheck now hands the ForIn pattern walk its element type — without that hint
+    // the leaf carries no tid and the row reads `missing` instead.
+    let mut saw_value = false
+    for line in r.out.split("\n") {
+        if line.contains("site=tuple_destructure.elem") && line.contains("var=v ") {
+            if line.contains("tid=List[Str]") { saw_value = true }
+        }
+    }
+    assert(saw_value)
+}
+
+test "the tap compares rather than only answering missing" {
+    if !have_blinkc() {
+        skip("build/blinkc is not present in this working tree")
+        return
+    }
+    write_file(probe_path(), PROBE_SRC)
+    let r = run_tydiv()
+    fs.remove(probe_path())
+    assert_eq(r.exit_code, 0)
+    assert(compiled_clean(r.out))
+    let mut saw_comparable = false
+    for line in r.out.split("\n") {
+        if line.contains("tuple_destructure.elem") && line.contains("agree=") {
+            if !line.contains("agree=0 diverge=0") { saw_comparable = true }
+        }
+    }
+    assert(saw_comparable)
+}
+
+test "the destructured map iteration still runs correctly" {
+    if !have_blinkc() {
+        skip("build/blinkc is not present in this working tree")
+        return
+    }
+    write_file(probe_path(), PROBE_SRC)
+    // The tap stamps `set_var_ty` on binders that previously had none, and typecheck now types the
+    // ForIn leaves. Neither is measurement-only, so the probe has to RUN: one key of length 1 plus a
+    // 2-element value, then the let-destructured pair.
+    let r = process_run("sh", ["-c", "build/blink run {probe_path()} 2>&1"])
+    fs.remove(probe_path())
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("3 s 3"))
+}
+
+test "the let site is still tapped" {
+    if !have_blinkc() {
+        skip("build/blinkc is not present in this working tree")
+        return
+    }
+    write_file(probe_path(), PROBE_SRC)
+    let r = run_tydiv()
+    fs.remove(probe_path())
+    // Control: a new tap must not displace the one the published census is measured with.
+    assert_eq(r.exit_code, 0)
+    assert(compiled_clean(r.out))
+    assert(r.out.contains("emit_let_binding.decl"))
+}

@@ -1,0 +1,137 @@
+// br 7xgbh6 sub-step 2: a function parameter is a ScopeVar declaration, and the divergence
+// counter must tap it.
+//
+// The for-in tap (test_7xgbh6_forin_var_divergence_tap.bl) established the shape. A parameter is
+// the larger population: every generic-fn and poly-impl body re-registers its params per instance,
+// and a param's ScopeVar is built from `node_type_name(p)` — a NAME, resolved through
+// `resolve_tparam_via_tid` and `type_from_name` — so it is exactly the depth-1 flat spelling the
+// collapse is replacing, while `tc_lookup_node_tid(node_type_ann(p))` holds the whole tree.
+//
+// The tap goes AFTER the whole param loop rather than inside its branches: the four registration
+// loops (fn def, prototype, monomorphized fn, poly impl) each stamp through several arms with an
+// early `continue`, and what has to be measured is the type the BODY will read, which is the state
+// after every arm has run.
+//
+// Advisory, like every Stage 2 dual-write: the answer is discarded and the flat fields still
+// govern every branch.
+
+import std.process.{ProcessResult}
+
+// `deep` is the point: a param whose declared type is two levels deep cannot be spelled by
+// (ctype, sname) at all, so the flat side must disagree while the tid is right. `mono` is a
+// generic param, which the tap has to substitute through cg_fn_mono_* to compare honestly rather
+// than reporting a typevar against a concrete flat spelling.
+//
+// The map value is `List[Str]` and NOT `List[Int]` on purpose, and the first draft of this file
+// used `List[Int]` and failed for exactly that reason. `sv_tp`'s Map arm fabricates a missing
+// value element as `Int`, so `Map[Str, List[Int]]` makes the flat side accidentally RIGHT and the
+// row reports `agree` — the same coincidence that made the `for (k, v)` element carry look like it
+// worked (br w224zg). One element type over, the fabrication shows itself:
+// `tid=Map[Str, List[Str]] flat=Map[Str, List[Int]]`.
+let PROBE_SRC: Str = #"fn deep(m: Map[Str, List[Str]]) -> Int {
+    let mut n = 0
+    for (_k, v) in m { n = n + v.len() }
+    n
+}
+
+fn mono[T](xs: List[T], f: fn(T) -> Int) -> Int {
+    let mut n = 0
+    for x in xs { n = n + f(x) }
+    n
+}
+
+fn main() {
+    let mut m: Map[Str, List[Str]] = Map()
+    m.insert("a", ["x", "y"])
+    let d = deep(m)
+    let g = mono([1, 2, 3], fn(v) { v })
+    io.println("{d} {g}")
+}
+"#
+
+fn probe_path() -> Str { "build/7xgbh6_param_probe.bl" }
+
+fn run_tydiv() -> ProcessResult {
+    process_run("sh", ["-c", "env BLINK_TRACE_CHANNELS=tydiv build/blinkc {probe_path()} build/7xgbh6_param_probe.c 2>&1"])
+}
+
+// br 83ywd6: `build/blinkc` exits 0 even when it reports errors, so `assert_eq(r.exit_code, 0)`
+// does not establish that the probe compiled — this file's first draft passed that assertion on a
+// probe with a parse error and no codegen at all. Assert on the absence of a diagnostic instead.
+fn compiled_clean(out: Str) -> Bool {
+    !out.contains("error[")
+}
+
+fn have_blinkc() -> Bool {
+    file_exists("build/blinkc") == 1
+}
+
+test "a function parameter is a tapped declaration site" {
+    if !have_blinkc() {
+        skip("build/blinkc is not present in this working tree")
+        return
+    }
+    write_file(probe_path(), PROBE_SRC)
+    let r = run_tydiv()
+    fs.remove(probe_path())
+    assert_eq(r.exit_code, 0)
+    assert(compiled_clean(r.out))
+    assert(r.out.contains("emit_fn_params.param"))
+}
+
+test "the param tap compares rather than only answering missing" {
+    if !have_blinkc() {
+        skip("build/blinkc is not present in this working tree")
+        return
+    }
+    write_file(probe_path(), PROBE_SRC)
+    let r = run_tydiv()
+    fs.remove(probe_path())
+    assert_eq(r.exit_code, 0)
+    assert(compiled_clean(r.out))
+    // A tap that can only ever answer `missing` measures nothing: it says "no tid was stamped"
+    // and never "the two representations disagree". The summary line must therefore carry a
+    // nonzero agree-or-diverge count.
+    let mut saw_comparable = false
+    for line in r.out.split("\n") {
+        if line.contains("emit_fn_params.param") && line.contains("agree=") {
+            if !line.contains("agree=0 diverge=0") { saw_comparable = true }
+        }
+    }
+    assert(saw_comparable)
+}
+
+test "the depth-2 param reports the tid the flat fields cannot spell" {
+    if !have_blinkc() {
+        skip("build/blinkc is not present in this working tree")
+        return
+    }
+    write_file(probe_path(), PROBE_SRC)
+    let r = run_tydiv()
+    fs.remove(probe_path())
+    assert_eq(r.exit_code, 0)
+    assert(compiled_clean(r.out))
+    // `m: Map[Str, List[Str]]` — the value's element has no flat slot, so it is fabricated as
+    // `Int` and the row must name the tid side in full.
+    let mut saw_deep = false
+    for line in r.out.split("\n") {
+        if line.contains("site=emit_fn_params.param") && line.contains("var=m ") {
+            if line.contains("tid=Map[Str, List[Str]]") { saw_deep = true }
+        }
+    }
+    assert(saw_deep)
+}
+
+test "the let site is still tapped" {
+    if !have_blinkc() {
+        skip("build/blinkc is not present in this working tree")
+        return
+    }
+    write_file(probe_path(), PROBE_SRC)
+    let r = run_tydiv()
+    fs.remove(probe_path())
+    // Control: a new tap must not displace the one the published census is measured with.
+    assert_eq(r.exit_code, 0)
+    assert(compiled_clean(r.out))
+    assert(r.out.contains("emit_let_binding.decl"))
+}

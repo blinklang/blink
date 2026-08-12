@@ -1,0 +1,161 @@
+// br 7xgbh6 sub-step 4: a match-arm pattern binder is a ScopeVar declaration, and the divergence
+// counter must tap it.
+//
+// This is the last of the four declaration families the ticket names, and the only one with no single
+// binding primitive: `bind_pattern_vars` (codegen_stmt.bl:1850) stamps through ~28 `set_var` calls
+// spread over its arms. It does have a single binding CHOKEPOINT, which is a different thing and is
+// what the tap uses — every recursed sub-pattern re-enters the function and lands in the generic
+// `NodeKind.IdentPattern` arm, so that arm plus the three carrier fast paths that handle an
+// IdentPattern inline are the complete set of places a binder's name is decided.
+//
+// The tid comes from typecheck, not from a second walk of the pattern shape. `tc_check_pattern_types`
+// already decomposes a pattern and types each leaf against its own element type; it now publishes that
+// answer on the leaf node (tc_publish_node_tid), so codegen reads one authority instead of
+// re-deriving the decomposition — the mistake w224zg was made of.
+//
+// Advisory, like every Stage 2 dual-write: the answer is discarded and the flat fields still govern
+// every branch.
+
+import std.process.{ProcessResult}
+
+// `Some(m)` over `Option[Map[Str, List[Str]]]` is the point: the binder's type is two levels deep, so
+// the flat `(ctype, sname)` pair cannot spell it. The map value is `List[Str]` and NOT `List[Int]`
+// because `sv_tp`'s Map arm fabricates a missing value element as `Int` and would make the flat side
+// accidentally right. `(a, b)` covers the tuple arm, whose binders reach the same chokepoint by
+// recursion; its first element is a `List[Str]` for the same fabrication reason.
+//
+// The tuple element is a List and not a Map because `.len()` on a Map bound by a tuple pattern does
+// not resolve (br ksx1q7) — an independent typecheck gap, not something this tap can or should work
+// around.
+let PROBE_SRC: Str = #"fn pick(o: Option[Map[Str, List[Str]]]) -> Int {
+    match o {
+        Some(m) => m.len()
+        None => 0
+    }
+}
+
+fn split(t: (List[Str], Int)) -> Int {
+    match t {
+        (a, b) => a.len() + b
+    }
+}
+
+fn main() {
+    let mut m: Map[Str, List[Str]] = Map()
+    m.insert("a", ["x", "y"])
+    let p = pick(Some(m))
+    let s = split((["x", "y"], 4))
+    io.println("{p} {s}")
+}
+"#
+
+fn probe_path() -> Str { "build/7xgbh6_mp_probe.bl" }
+
+fn run_tydiv() -> ProcessResult {
+    process_run("sh", ["-c", "env BLINK_TRACE_CHANNELS=tydiv build/blinkc {probe_path()} build/7xgbh6_mp_probe.c 2>&1"])
+}
+
+// br 83ywd6: `build/blinkc` exits 0 even when it reports errors, so `assert_eq(r.exit_code, 0)` does
+// not establish that the probe compiled. Assert on the absence of a diagnostic instead.
+fn compiled_clean(out: Str) -> Bool {
+    !out.contains("error[")
+}
+
+fn have_blinkc() -> Bool {
+    file_exists("build/blinkc") == 1
+}
+
+test "a match-arm pattern binder is a tapped declaration site" {
+    if !have_blinkc() {
+        skip("build/blinkc is not present in this working tree")
+        return
+    }
+    write_file(probe_path(), PROBE_SRC)
+    let r = run_tydiv()
+    fs.remove(probe_path())
+    assert_eq(r.exit_code, 0)
+    assert(compiled_clean(r.out))
+    assert(r.out.contains("match_pattern.bind"))
+}
+
+test "the match-pattern tap compares rather than only answering missing" {
+    if !have_blinkc() {
+        skip("build/blinkc is not present in this working tree")
+        return
+    }
+    write_file(probe_path(), PROBE_SRC)
+    let r = run_tydiv()
+    fs.remove(probe_path())
+    assert_eq(r.exit_code, 0)
+    assert(compiled_clean(r.out))
+    // A tap that can only answer `missing` measures nothing: it says "no tid was stamped" and never
+    // "the two representations disagree".
+    let mut saw_comparable = false
+    for line in r.out.split("\n") {
+        if line.contains("match_pattern.bind") && line.contains("agree=") {
+            if !line.contains("agree=0 diverge=0") { saw_comparable = true }
+        }
+    }
+    assert(saw_comparable)
+}
+
+test "the carrier binder reports the depth-2 tid the flat fields cannot spell" {
+    if !have_blinkc() {
+        skip("build/blinkc is not present in this working tree")
+        return
+    }
+    write_file(probe_path(), PROBE_SRC)
+    let r = run_tydiv()
+    fs.remove(probe_path())
+    assert_eq(r.exit_code, 0)
+    assert(compiled_clean(r.out))
+    // `Some(m)` unwraps `Option[Map[Str, List[Str]]]`, so the binder's own tid must name the whole
+    // map — including the value's element, which has no flat slot to live in.
+    let mut saw_deep = false
+    for line in r.out.split("\n") {
+        if line.contains("site=match_pattern.bind") && line.contains("var=m ") {
+            if line.contains("tid=Map[Str, List[Str]]") { saw_deep = true }
+        }
+    }
+    assert(saw_deep)
+}
+
+test "a tuple-pattern binder reaches the same chokepoint" {
+    if !have_blinkc() {
+        skip("build/blinkc is not present in this working tree")
+        return
+    }
+    write_file(probe_path(), PROBE_SRC)
+    let r = run_tydiv()
+    fs.remove(probe_path())
+    assert_eq(r.exit_code, 0)
+    assert(compiled_clean(r.out))
+    // `(a, b)` binds through the TuplePattern arm, which recurses into the generic IdentPattern arm
+    // — so this row existing is the evidence that the tap sits at the chokepoint and not only on
+    // bare arms.
+    //
+    // `a`'s element is a non-default `Str` ON PURPOSE. Per-occurrence rows are written for the `missing`
+    // and `diverge` buckets only, so a binder that AGREES is invisible except in the summary count:
+    // the first draft of this test used `(Str, Int)`, both binders agreed, and the assertion failed
+    // on a tap that was working. A shape the flat pair cannot spell is the only way to name a
+    // specific binder in the output.
+    let mut saw_tuple_bind = false
+    for line in r.out.split("\n") {
+        if line.contains("site=match_pattern.bind") && line.contains("var=a ") { saw_tuple_bind = true }
+    }
+    assert(saw_tuple_bind)
+}
+
+test "the let site is still tapped" {
+    if !have_blinkc() {
+        skip("build/blinkc is not present in this working tree")
+        return
+    }
+    write_file(probe_path(), PROBE_SRC)
+    let r = run_tydiv()
+    fs.remove(probe_path())
+    // Control: a new tap must not displace the one the published census is measured with.
+    assert_eq(r.exit_code, 0)
+    assert(compiled_clean(r.out))
+    assert(r.out.contains("emit_let_binding.decl"))
+}

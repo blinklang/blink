@@ -8966,6 +8966,24 @@ pub fn tc_lookup_node_tid(node: Int) -> Int {
     tc_node_tid.get(node).unwrap()
 }
 
+// Publish a tid for a node that is a DECLARATION rather than an expression, so codegen can read
+// it from the same memo it reads every inferred type from (br 7xgbh6).
+//
+// `infer_type` is the only other writer, and it is only ever called on expressions. A parameter's
+// type therefore never lands in the memo: it comes from its annotation through
+// `resolve_param_type`, is bound into scope by name, and the node keeps `-1` — which is why a
+// divergence tap on a param answered `missing` 142 times out of 142 on its first probe and could
+// not compare anything at all. The same argument covers any future non-expression binder.
+//
+// Writes nothing for an unknown or absent type, so the memo's "-1 means nobody has typed this"
+// contract holds and a caller cannot mistake a published UNKNOWN for an answer.
+pub fn tc_publish_node_tid(node: Int, tid: Int) {
+    if node == -1 { return }
+    if node >= tc_node_tid.len() { return }
+    if tid < 0 || tid == TYPE_UNKNOWN { return }
+    tc_node_tid.set(node, tid)
+}
+
 fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     if node == -1 { return TYPE_UNKNOWN }
     let kind = node_kind(node)
@@ -11028,6 +11046,12 @@ fn tc_check_fn(fn_node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report 
                 ptid_final = tc_current_self_tid
             }
             nr_define_typed(pname, 0, ptid_final)
+            // The same type, on the node, for codegen's dual-write (br 7xgbh6). `ptid_final` is
+            // the answer every check below uses; publishing it here is what lets the param's
+            // ScopeVar be compared against it instead of only against a name put through
+            // type_from_name. A typevar for a generic fn — codegen substitutes with the
+            // instance's binds.
+            tc_publish_node_tid(p, ptid_final)
             i = i + 1
         }
     }
@@ -11546,23 +11570,14 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         nr_push_scope()
         let iter_t = tc_resolve(infer_type(node_iterable(node)))
         let iter_tk = type_kind(iter_t)
-        let mut elem_t = TYPE_UNKNOWN
-        if iter_tk == TyKind.List || iter_tk == TyKind.Set {
-            elem_t = ty_pool.get(iter_t).unwrap().inner1
-        } else if iter_tk == TyKind.Map {
-            // A Map's iteration element is the (K, V) pair (sections/03c_protocols.md's
-            // IntoIterator table), and saying so HERE is the whole of br w224zg. Left as
-            // TYPE_UNKNOWN, `pair` was `?`, so `pair.1` was `?`, so codegen had no tid to stamp
-            // the value's element from -- and a container value's element then came from whatever
-            // ambient channel codegen happened to be carrying, which during map iteration is the
-            // pair tuple's own tag. That produced all three failure rungs on one axis: an honest
-            // `UnresolvedMethod` on `let l = pair.1`, a silent wrong value on
-            // `pair.1.get(0).unwrap()`, and a cc error with no Blink span on `for x in pair.1`.
-            // It is also why `for (k, v) in m` needed its own hand-written element carry in
-            // emit_for_in: with no pair type in the memo, every route had to reconstruct one.
-            let mt = ty_pool.get(iter_t).unwrap()
-            elem_t = make_tuple_type([mt.inner1, mt.inner2])
-        } else {
+        let elem_t = tc_tid_iter_elem(iter_t)
+        // Gated on the KIND, not on `elem_t == TYPE_UNKNOWN`. A List/Set/Map is iterable whatever
+        // its element turns out to be, and `List[?]` — an element that is still an unbound
+        // metavar — must not be diagnosed here: only E0301's region boundary decides whether an
+        // under-determined type is an error. Testing the element instead of the kind would put a
+        // NotIterable on a list, which is the one thing this arm must never say.
+        let has_elem_rule = iter_tk == TyKind.List || iter_tk == TyKind.Set || iter_tk == TyKind.Map
+        if has_elem_rule == 0 {
             // TyKind.Unknown here means iter_t is still an unbound metavar (e.g. a lazy-adapter
             // chain like `.enumerate()`/`.zip()` not yet pinned at this point in checking) --
             // under-determined, not known to be non-iterable. Leave it to E0301's
@@ -11572,7 +11587,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             // plus the Channel receive extension) so they pass through even where codegen's
             // emit_for_in has no arm yet -- that gap is I0002, an internal compiler error,
             // never a user-facing NotIterable.
-            // TyKind.Map is no longer listed: the branch above answers it, so naming it here
+            // TyKind.Map is no longer listed: the kind gate above answers it, so naming it here
             // would be an unreachable claim that a Map still has no element type.
             let is_deferred_iterable = iter_tk == TyKind.Unknown || iter_tk == TyKind.Str || iter_tk == TyKind.Bytes || iter_tk == TyKind.Iterator || iter_tk == TyKind.Channel
             if is_deferred_iterable == 0 {
@@ -11583,7 +11598,16 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         // A pattern NODE, not a sublist (tc_check_pattern_types takes a node) — br tdb6en.
         let tc_for_pat_node = node_elements(node)
         if tc_for_pat_node != -1 {
+            // Hand the walk the ELEMENT type as its binding hint. Without this the destructured
+            // `for (k, v) in m` binders were typed against whatever `tc_pattern_binding_type` held
+            // from the last pattern checked anywhere — in practice nothing, so the TuplePattern arm
+            // took its `tup_start = -1` path and typed both leaves as untyped. The element type is
+            // right here, and the same decomposition the match path gets is what these binders need
+            // (br 7xgbh6: the tap on this family could not compare anything until they had a type).
+            let tc_saved_pat_hint = tc_pattern_binding_type
+            tc_pattern_binding_type = elem_t
             tc_check_pattern_types(tc_for_pat_node)
+            tc_pattern_binding_type = tc_saved_pat_hint
         }
         tc_check_body(node_body(node))
         nr_pop_scope()
@@ -11846,6 +11870,14 @@ fn tc_check_pattern_types(node: Int) ! TypeCheck.Resolve {
         if name != "_" && is_variant_name(name) == 0 {
             if tc_pattern_binding_type >= 0 {
                 nr_define_typed(name, 0, tc_pattern_binding_type)
+                // Publish on the LEAF node as well as into scope (br 7xgbh6). Every arm above
+                // decomposes the binding hint one level — Option/Result unwrap, tuple element,
+                // list element, enum variant field — so by the time control reaches here the
+                // right answer for this one binder is already computed. Handing codegen the
+                // node's tid lets it read that decomposition instead of walking the pattern a
+                // second time to re-derive it, which is the two-copies-of-one-answer mistake
+                // the map-iteration pair element was made of (br w224zg).
+                tc_publish_node_tid(node, tc_pattern_binding_type)
             } else {
                 nr_define(name)
             }
@@ -13514,6 +13546,32 @@ pub fn tc_tid_struct(tid: Int) -> Str {
     let t = ty_pool.get(tid).unwrap()
     if t.kind == TyKind.Struct || t.kind == TyKind.Enum { return strip_module_qualifier(t.name) }
     ""
+}
+
+// What a `for` loop binds when it iterates `iter_t` — the one definition of an iterable's
+// element type, read by BOTH typecheck's ForIn arm (which names the loop variable) and
+// codegen's emit_for_in (which stamps that variable's ScopeVar and measures it). Two copies
+// of this answer is how the pair-position element got lost in the first place: typecheck knew
+// only List and Set, so a Map's element had to be reconstructed per codegen route (br w224zg).
+//
+// TYPE_UNKNOWN means "no element is published for this kind yet", which is a different claim
+// from "not iterable" — Str, Bytes, Iterator, Channel and Range are all spec-legal iterables
+// (sections/03c_protocols.md's IntoIterator table) whose element this does not yet answer, and
+// the ForIn arm's deferred-iterable list is what keeps them from being diagnosed. A caller that
+// stamps a ScopeVar must therefore gate on a KNOWN element and leave the slot unstamped
+// otherwise: stamping TYPE_UNKNOWN would make the divergence counter report a cell where the
+// flat field is in fact right and only the tid is absent.
+pub fn tc_tid_iter_elem(iter_t: Int) -> Int {
+    let tk = type_kind(iter_t)
+    if tk == TyKind.List || tk == TyKind.Set { return ty_pool.get(iter_t).unwrap().inner1 }
+    if tk == TyKind.Map {
+        // A Map's iteration element is the (K, V) pair. make_tuple_type interns, so this is the
+        // same tid the pair tuple already has everywhere else — including at codegen, where the
+        // pool outlives checking.
+        let mt = ty_pool.get(iter_t).unwrap()
+        return make_tuple_type([mt.inner1, mt.inner2])
+    }
+    TYPE_UNKNOWN
 }
 
 // Whether `tid` is a TyKind.Enum (bare or instance). Lets codegen distinguish a
