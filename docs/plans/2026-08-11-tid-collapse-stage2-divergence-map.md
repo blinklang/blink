@@ -4728,6 +4728,100 @@ A future sub-step that adds a ctypediv probe at the temp emit sites would enumer
 same way this one enumerated the locals. Naming the uncovered seam is the point: a census is
 only trustworthy if its boundary is written down (`feedback_corpus_sweep_is_not_coverage`).
 
+## Stage 3d — the uncensused seam, entered on purpose (br `9ce8nr`)
+
+Stage 3c closed with a written-down boundary: the ctypediv census probes `emit_let_binding`'s
+declaration chain **and nothing else**, so the anonymous temporaries `codegen_expr` and
+`codegen_methods` emit were named as uncovered. This sub-step is the first walk into that seam,
+and it starts with the temp the 3c probe kept running into: `_ounw_N`, the Option-unwrap
+temporary.
+
+It is not a census row. It is a compile failure.
+
+```blink
+let x: U64 = 7
+let o: Option[U64] = Some(x)
+let v = o.unwrap()
+```
+
+```
+build/optu64.c:128:32: error: invalid initializer
+  128 |     blink_Option_int _ounw_0 = o;
+```
+
+**The construct side was never wrong.** The same emitted file carries all fourteen carrier
+typedefs it needs, `blink_Option_u64` and `blink_Option_bool` among them, so `Some(x)` had always
+ensured and spelled the right carrier. Only the unwrap temp disagreed. The scalar tail of the
+`unwrap` dispatch named `CT_FLOAT` and `CT_CHAR` explicitly and sent everything else to
+`option_c_type(CT_INT)`:
+
+```blink
+} else if inner == CT_CHAR {
+    ...
+} else {
+    let opt_c = option_c_type(CT_INT)   // every remaining inner type, right or wrong
+```
+
+so **eight** inner types escaped to cc: `U8`, `U16`, `U32`, `U64`, `I8`, `I16`, `I32` and `Bool`.
+`Bool` was not in the original filing; measuring one type at a time rather than reading the
+ladder is what added it.
+
+The three-way ladder collapses to one arm that names the carrier from the operand's own inner CT.
+The interesting part is what the arm refuses to do:
+
+```blink
+pub fn unwrap_scalar_ct(ct: Int) -> Int {
+    if ct == CT_FLOAT || ct == CT_CHAR || ct == CT_BOOL { return ct }
+    if is_sized_int_ct(ct) != 0 { return ct }
+    CT_INT
+}
+```
+
+An **allowlist, not a pass-through.** A `CT_ENUM` inner is `int64_t` by representation and has no
+carrier of its own; `CT_VOID` and an unresolved `-1` have none either. Passing `inner` through
+unguarded would spell `blink_Option_enum` — a name nothing emits — and trade eight escapes for a
+ninth. This is the same shape as the `enum_c_from_tid` / `ptr_c_from_tid` decline-on-no-
+improvement contract from 3b and 3c: the richer authority governs only where it is genuinely
+richer.
+
+One regen, fixed point first try — no two-regen promotion, because no compiler source unwraps an
+Option over a sized integer. That is the same fact as *why the corpus never caught it*: an
+unexercised tap (`feedback_corpus_sweep_is_not_coverage`), and one that fails **loudly** the
+moment it is exercised. Unlike a census cell, this needed no divergence count to justify — a
+red/green test pins it directly. RED was 9 cc errors; GREEN is 13/13; `task ci` 662/662.
+
+### Probing the siblings, because a hardcoded carrier is a pattern
+
+A defect that reads "this arm names one carrier for every type" is worth spending three MVCEs on
+before believing it is confined to one method:
+
+| sibling seam | verdict |
+|---|---|
+| `??` on `Option[U64]` | **correct** — prints `18446744073709551615` |
+| `.unwrap_or` | **not a language feature.** `blink llms --topic option` lists `unwrap`/`is_some`/`is_none` and names `??` as the with-default idiom. My probe was wrong, not the compiler |
+| `Result[U64, Str]` | **broken, and worse** → br `3xd320` |
+
+The `Result` finding is a different and more serious defect than the one this sub-step fixed:
+
+```
+build/res_local.c:316:11: error: unknown type name 'blink_Result_u64_str';
+                                did you mean 'blink_Result_int_str'?
+```
+
+No unwrap is involved — **declaring** the local is enough, and the compiler's own hint names the
+carrier that *was* emitted. `ensure_result_type` keys its registry by the **decimal string** of
+the two CT integers (`"{ok_t}_{err_t}"`) and `emit_all_option_result_types` decodes it back with
+`ct_from_str`, a hand-written string→CT ladder that ends at `"20"` (`CT_SET`) and answers
+`CT_INT` for anything past it. `CT_I8`..`CT_U64` are 25..31 and `CT_CHAR` is 32, so all eight
+round-trip as `CT_INT`: the ensure registers the right pair, the emitter prints
+`blink_Result_int_str`, and the name the declaration actually uses is never declared.
+
+`Option` is immune for one reason worth recording: `emitted_option_types` is a `List[Int]` and
+never stringifies. Only the `Result` registry round-trips a type through a string, and only it
+loses types. That asymmetry — same defect class, one registry away — is the plan's thesis in
+miniature: the loss is not in the type system, it is in a representation that cannot hold what
+the type system already knew.
+
 ## Appendix — all 428 shape cells
 
 Format: `family | occurrences | tid | flat`.

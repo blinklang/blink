@@ -1,0 +1,133 @@
+import std.io
+
+// br 9ce8nr — `Option[T].unwrap()` emits its temporary as `blink_Option_int` for EVERY T that
+// is not plain Int, so unwrapping an Option over any sized integer type (or Bool) is a
+// C-compiler error with no Blink span:
+//
+//     fn main() {
+//         let big: U64 = 7
+//         let o: Option[U64] = Some(big)
+//         let v = o.unwrap()
+//     }
+//
+//     build/optu64.c:128:32: error: invalid initializer
+//       128 |     blink_Option_int _ounw_0 = o;
+//
+// THE CARRIER TYPEDEF IS ALREADY CORRECT. Both of these are emitted into the same file:
+//
+//     typedef struct { int tag; int64_t  value; } blink_Option_int;
+//     typedef struct { int tag; uint64_t value; } blink_Option_u64;
+//
+// and `o` really is a `blink_Option_u64`. Only the unwrap TEMPORARY is misspelled: the scalar
+// fallback arm of the unwrap emitter (codegen_methods.bl, the final `else` under
+// `obj_type == CT_OPTION && method == "unwrap"`) hardcodes `option_c_type(CT_INT)` and
+// `expr_result_type = CT_INT` for every inner type it does not name explicitly. CT_FLOAT and
+// CT_CHAR are named just above it and work; the seven sized integers and Bool are not, and fall
+// into the Int default.
+//
+// EIGHT TYPES REPRODUCE, measured one at a time rather than assumed from the code: U8, U16,
+// U32, U64, I8, I16, I32 and Bool. Only Int, Float, Char, Str and the compound inners (List,
+// Map, Set, Bytes, struct, Option, Result) have arms of their own.
+//
+// WHY THE CORPUS NEVER CAUGHT IT: no file in the 874-file corpus constructs an Option over a
+// sized integer and unwraps it. Unlike most gaps found that way, this one fails LOUDLY the
+// moment it is exercised — so it needs no divergence census to justify, only a test that
+// exercises it (feedback_corpus_sweep_is_not_coverage).
+//
+// SCOPE. These rows assert the value ROUND-TRIPS; they deliberately do not do arithmetic on the
+// unwrapped value. The declaration of the receiving local is a SEPARATE defect (br tm1vbv: an
+// unannotated local fed from an anonymous temp loses its type, so `v / 2` on a U64 above 2^63
+// is a signed division and answers 0). Round-tripping is bit-exact through either declaration,
+// so these rows isolate this seam and stay green whichever way that one lands.
+
+// ── The eight broken inner types ─────────────────────────────────────────────────────
+//
+// One test per type: these are eight independent arms of one dispatch, and a partial fix must
+// name which type it missed rather than reporting "the file fails".
+
+test "Option[U8] unwraps" {
+    let x: U8 = 200
+    let o: Option[U8] = Some(x)
+    assert_eq(o.unwrap(), x)
+}
+
+test "Option[U16] unwraps" {
+    let x: U16 = 65000
+    let o: Option[U16] = Some(x)
+    assert_eq(o.unwrap(), x)
+}
+
+test "Option[U32] unwraps" {
+    let x: U32 = 4000000000
+    let o: Option[U32] = Some(x)
+    assert_eq(o.unwrap(), x)
+}
+
+// The row that matters most: a value above 2^63, where the bit pattern is negative read as
+// signed. Equality still holds through the erased declaration (same bits), which is what makes
+// this a clean test of THIS seam and not of br tm1vbv.
+test "Option[U64] unwraps a value above 2^63" {
+    let x: U64 = 18446744073709551615
+    let o: Option[U64] = Some(x)
+    assert_eq(o.unwrap(), x)
+}
+
+test "Option[I8] unwraps a negative value" {
+    let x: I8 = -128
+    let o: Option[I8] = Some(x)
+    assert_eq(o.unwrap(), x)
+}
+
+test "Option[I16] unwraps a negative value" {
+    let x: I16 = -32768
+    let o: Option[I16] = Some(x)
+    assert_eq(o.unwrap(), x)
+}
+
+test "Option[I32] unwraps a negative value" {
+    let x: I32 = -2147483648
+    let o: Option[I32] = Some(x)
+    assert_eq(o.unwrap(), x)
+}
+
+test "Option[Bool] unwraps both values" {
+    let t: Option[Bool] = Some(true)
+    let f: Option[Bool] = Some(false)
+    assert_eq(t.unwrap(), true)
+    assert_eq(f.unwrap(), false)
+}
+
+// ── Regression pins — the inner types that already had arms ──────────────────────────
+//
+// The fix widens a fallback that these five do not use, so they cannot break by construction —
+// which is exactly why they belong here: if a later refactor collapses the named arms INTO the
+// fallback, these rows are what notice.
+
+test "Option[Int] still unwraps" {
+    let o: Option[Int] = Some(-7)
+    assert_eq(o.unwrap(), -7)
+}
+
+test "Option[Float] still unwraps" {
+    let o: Option[Float] = Some(1.5)
+    assert_eq(o.unwrap(), 1.5)
+}
+
+test "Option[Str] still unwraps" {
+    let o: Option[Str] = Some("hi")
+    assert_eq(o.unwrap(), "hi")
+}
+
+test "Option[List[Int]] still unwraps" {
+    let l: List[Int] = [1, 2]
+    let o: Option[List[Int]] = Some(l)
+    assert_eq(o.unwrap().len(), 2)
+}
+
+test "None still panics rather than unwrapping" {
+    let o: Option[U64] = None
+    assert_panics {
+        let v = o.unwrap()
+        io.println("unreachable {v}")
+    }
+}
