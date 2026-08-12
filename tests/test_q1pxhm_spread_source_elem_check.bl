@@ -1,0 +1,169 @@
+import compile_test_helpers.{expect_compile_error}
+
+// br q1pxhm — the spread source's element type is never compared against the list being
+// constructed, so §2.16's own rule is unenforced and one shape SIGSEGVs.
+//
+// THE RULE, normative and voted 5-0 (sections/02_syntax.md:863, §2.16 List Literal Spread):
+//
+//     "The spread source must be a `List[T]` with the same element type as the list being
+//      constructed. Type mismatches are compile errors."
+//
+// Both halves of that sentence were unenforced: the element type was never compared, and a
+// source that is not a `List` at all reached `cc`.
+//
+// FAIL-OPEN MODES, each reproduced by RUNNING a program (after br 08a267, which made the
+// contribution computable — this check is the comparison over the same contributions):
+//
+//   1. `let a: List[Int] = [7]  let b = ["q", ..a]` then reading b.get(1) — **SIGSEGV**,
+//      exit 139, no diagnostic of any kind. The literal is List[Str] from element 0, the
+//      spliced value is the raw integer 7, and interpolation dereferences 7 as a char*.
+//   2. `let a: List[Str] = ["x"]  let b = [1, ..a]` — SILENT, ran and printed
+//      `b1=94419670083158`: the Str pointer as an Int.
+//   3. Two spreads of different types, `[..a, ..c]` — SILENT, ran and printed `b0=x`.
+//   4. A non-List source, `let n = 7  let b = [..n]` — reaches cc with no Blink span:
+//      *expected 'blink_list *' but argument is of type 'int64_t'*.
+//
+// DELIBERATELY OUT OF SCOPE, and this is a scope line the ticket draws rather than an
+// oversight: general list homogeneity. `let b = [1, "x"]` compiles today with no spread
+// anywhere, and so does `[..a, 1]` where the *plain* element is the odd one out — in that
+// second shape the spread source and the literal DO agree, so §2.16's clause is satisfied and
+// the offending element is a plain one. §2.16 says nothing about plain elements. Enforcing
+// homogeneity is a separate decision (the compiler's own source may rely on today's
+// permissiveness), so no row here pins either shape in place: they are documented, not frozen.
+
+// ── The mismatch, which is what §2.16 makes an error ─────────────────────────────────
+
+test "a spread source with a different element type is rejected" {
+    let src = "fn go() -> Int \{\n    let a: List[Int] = [7]\n    let b = [\"q\", ..a]\n    io.println(\"b1=\{b.get(1).unwrap()}\")\n    0\n}\nfn main() \{ let _ = go() }\n"
+    expect_compile_error(src, "q1pxhm_spread_int_into_str", "TypeError")
+}
+
+test "the same mismatch with the spread second and an Int literal first is rejected" {
+    let src = "fn go() -> Int \{\n    let a: List[Str] = [\"x\"]\n    let b = [1, ..a]\n    io.println(\"b1=\{b.get(1).unwrap()}\")\n    0\n}\nfn main() \{ let _ = go() }\n"
+    expect_compile_error(src, "q1pxhm_spread_str_into_int", "TypeError")
+}
+
+test "two spreads of different element types are rejected" {
+    let src = "fn go() -> Int \{\n    let a: List[Str] = [\"x\"]\n    let c: List[Int] = [1]\n    let b = [..a, ..c]\n    io.println(\"b0=\{b.get(0).unwrap()}\")\n    0\n}\nfn main() \{ let _ = go() }\n"
+    expect_compile_error(src, "q1pxhm_spread_two_kinds", "TypeError")
+}
+
+test "a spread whose element type differs one level down is rejected" {
+    let src = "fn go() -> Int \{\n    let a: List[List[Int]] = [[7]]\n    let b = [[\"q\"], ..a]\n    io.println(\"n=\{b.len()}\")\n    0\n}\nfn main() \{ let _ = go() }\n"
+    expect_compile_error(src, "q1pxhm_spread_nested_elem", "TypeError")
+}
+
+// ── The other half of the same sentence: the source must BE a List ───────────────────
+
+test "a non-List spread source is rejected with a Blink diagnostic" {
+    let src = "fn go() -> Int \{\n    let n = 7\n    let b = [..n]\n    io.println(\"len=\{b.len()}\")\n    0\n}\nfn main() \{ let _ = go() }\n"
+    expect_compile_error(src, "q1pxhm_spread_non_list", "TypeError")
+}
+
+test "a Str spread source is rejected rather than iterated as characters" {
+    let src = "fn go() -> Int \{\n    let s = \"ab\"\n    let b = [..s]\n    io.println(\"len=\{b.len()}\")\n    0\n}\nfn main() \{ let _ = go() }\n"
+    expect_compile_error(src, "q1pxhm_spread_str_source", "TypeError")
+}
+
+// ── Everything §2.16 allows, written DIRECTLY into the corpus ───────────────────────
+//
+// Written directly rather than through compile_and_run so the tydiv divergence instrument can
+// see them (feedback_corpus_sweep_is_not_coverage), and because a check this shape is only as
+// good as the set of legal programs it leaves alone.
+
+test "a matching spread still compiles and copies" {
+    let a: List[Str] = ["ab", "cd"]
+    let b = [..a]
+    assert_eq(b.len(), 2)
+    assert_eq(b.get(0).unwrap().to_upper(), "AB")
+}
+
+test "a matching spread in any position still compiles" {
+    let a: List[Int] = [2, 3]
+    let b = [1, ..a, 4]
+    assert_eq(b.len(), 4)
+    assert_eq(b.get(3).unwrap(), 4)
+}
+
+test "two matching spreads still compile" {
+    let a: List[Str] = ["ab"]
+    let c: List[Str] = ["cd"]
+    let b = [..a, ..c]
+    assert_eq(b.len(), 2)
+    assert_eq(b.get(1).unwrap().to_upper(), "CD")
+}
+
+test "a nested matching spread still compiles" {
+    let a: List[List[Int]] = [[7]]
+    let b = [[1], ..a]
+    assert_eq(b.len(), 2)
+    assert_eq(b.get(1).unwrap().get(0).unwrap(), 7)
+}
+
+test "a spread of an empty list still compiles" {
+    let a: List[Str] = []
+    let b = [..a, "cd"]
+    assert_eq(b.len(), 1)
+    assert_eq(b.get(0).unwrap().to_upper(), "CD")
+}
+
+// An Option element, so the check runs over a compound element type and not just a scalar
+// one. A carrier is where a too-eager compare would bite first: `Some("x")` and a declared
+// `List[Option[Str]]` reach the comparison from different producers.
+//
+// The result is ANNOTATED deliberately, and not to make the row pass: an *unannotated*
+// carrier-element list literal erases the carrier's inner type in codegen with no spread
+// involved at all — `let b = [Some("cd"), Some("ef")]` then reading `b.get(0).unwrap()
+// .unwrap()` prints the Str pointer as an integer. That is the depth-2 cell recorded on br
+// f9hgt9, a different axis from this ticket, so this row annotates past it rather than
+// asserting a weaker thing about it.
+test "a spread of a carrier-element list still compiles" {
+    let a: List[Option[Str]] = [Some("ab")]
+    let b: List[Option[Str]] = [Some("cd"), ..a]
+    assert_eq(b.len(), 2)
+    assert_eq(b.get(1).unwrap().unwrap().to_upper(), "AB")
+}
+
+// A struct element type, which is nominal: the compare must accept the SAME struct rather
+// than merely the same TyKind.
+type Box { v: Int }
+
+test "a spread of a struct-element list still compiles" {
+    let a: List[Box] = [Box { v: 7 }]
+    let b = [Box { v: 1 }, ..a]
+    assert_eq(b.len(), 2)
+    assert_eq(b.get(1).unwrap().v, 7)
+}
+
+// A spread whose source is a CALL, so the compare reads the callee's return tid rather than a
+// variable's. Codegen still erases this element (br ehn3s9), so the row asserts the copy only.
+test "a matching spread of a call result still compiles" {
+    let b = [..mk_strs()]
+    assert_eq(b.len(), 2)
+}
+
+fn mk_strs() -> List[Str] {
+    ["ab", "cd"]
+}
+
+// ── The permissive positions the compare must NOT report ─────────────────────────────
+//
+// A spread of a list whose element type is not yet known must stay silent: reporting an
+// unresolved metavar here would double-report what the region-boundary check reports as
+// E0301, and pinning it from the literal is the lossy direction sskpk8 refuses.
+
+test "a spread of a generic function's list result still compiles" {
+    let b = [..first_two([5, 6, 7])]
+    assert_eq(b.len(), 2)
+    assert_eq(b.get(0).unwrap(), 5)
+}
+
+fn first_two[T](xs: List[T]) -> List[T] {
+    let mut out: List[T] = []
+    let mut i = 0
+    while i < 2 {
+        out.push(xs.get(i).unwrap())
+        i = i + 1
+    }
+    out
+}

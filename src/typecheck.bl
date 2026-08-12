@@ -8889,6 +8889,55 @@ fn tc_list_elem_contribution(elem: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Re
     TYPE_UNKNOWN
 }
 
+// br q1pxhm — §2.16's own rule, which nothing enforced: *"The spread source must be a
+// `List[T]` with the same element type as the list being constructed. Type mismatches are
+// compile errors"* (sections/02_syntax.md:863, panel vote 5-0). Both halves of that sentence
+// were open: `["q", ..a]` with `a: List[Int]` SIGSEGV'd with no diagnostic, `[1, ..a]` with
+// `a: List[Str]` ran and printed the Str pointer as an Int, and `[..7]` reached cc with no
+// Blink span.
+//
+// The operand tid is read from the MEMO, not re-inferred: infer_type has no memo
+// short-circuit (see the comment on it below), so a second call re-walks the operand and
+// double-reports every diagnostic inside it. tc_list_elem_contribution already inferred
+// every operand exactly once, spread or not.
+//
+// SCOPE, and this is a line the spec draws rather than an omission: only spread elements are
+// checked. `[..a, 1]` where the *plain* element is the odd one out satisfies §2.16 — the
+// spread source and the literal agree there — and §2.16 says nothing about plain elements, so
+// `[1, "x"]` stays legal. General list homogeneity is a separate decision.
+//
+// Silence on Unknown / Typevar operands is load-bearing, not laxity: an unbound metavar here
+// is what the region-boundary check reports as E0301 (gqg3rk), and reporting it twice — or
+// pinning it from the literal — is the lossy direction sskpk8 refuses. types_compatible is
+// already permissive the same way for the element compare.
+fn tc_check_spread_sources(elems_sl: Int, elem_t: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let n = sublist_length(elems_sl)
+    let mut i = 0
+    while i < n {
+        let elem = sublist_get(elems_sl, i)
+        if node_kind(elem) == NodeKind.SpreadExpr {
+            let memo = tc_lookup_node_tid(node_value(elem))
+            if memo >= 0 {
+                let src_t = tc_resolve(memo)
+                let k = tc_tid_kind(src_t)
+                if k != TyKind.List {
+                    if k != TyKind.Unknown && k != TyKind.Typevar {
+                        tc_error_at("cannot spread {tc_type_str(src_t)} into a list literal: a spread source must be a List", elem)
+                    }
+                } else {
+                    let contrib = tc_tid_child(src_t, 0)
+                    if contrib >= 0 && elem_t >= 0 {
+                        if types_compatible(contrib, elem_t) == 0 {
+                            tc_error_at("list spread source has element type {tc_type_str(contrib)} but the list is built from {tc_type_str(elem_t)}", elem)
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+}
+
 fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let tid = infer_type_uncached(node)
     if node != -1 && node < tc_node_tid.len() {
@@ -10512,6 +10561,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 let _c = tc_list_elem_contribution(sublist_get(elems_sl, ei))
                 ei = ei + 1
             }
+            tc_check_spread_sources(elems_sl, first_t)
             return make_list_type(first_t)
         }
         // Empty `[]`: mint a fresh element metavar α (gqg3rk) so a later

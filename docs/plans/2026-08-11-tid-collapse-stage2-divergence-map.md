@@ -225,7 +225,7 @@ not Stage 3 work:
 | `wnbsen` | P2 | *(the last unblocked family-A cause)* `tc_scoped_value_memo` had no `IfExpr` arm, so a block-`let` whose initializer ends in an `if`/`else` built from a block-local had **no type at all** — **−1 row, family A 101 → 100**, section below |
 | `gmb211` | P2 | *(`wnbsen`'s byproduct, one line above it)* the recovery is gated on `inferred_tid == TYPE_UNKNOWN`, so a **partially** erased `List[?]` counted as an answer and the memo was never read. Every carrier erased; three silent miscompiles and a `cc` escape. Class B, so family A holds at **100**; fixed with a hole-only predicate plus a **position-wise** fill that cannot overwrite a concrete position or pin a metavar |
 | `08a267` | P2 | *(the four `tid=List[?]` rows `gmb211` did **not** move)* **CLOSED, −4 rows.** A list literal whose **first** element is a spread — `[..a]` — inferred `List[?]`, because `infer_type`'s ListLit arm takes the element type from element 0 only and has **no `SpreadExpr` arm**. Position is the axis: `["q", ..a]` was already correct. A **silent wrong value**, not just a laundered declaration. Fixed by naming the right concept — what an element *contributes*, which for a spread is its operand's element — in one function; the signature diff is those four rows and nothing else. Byproducts: `q1pxhm`, `ehn3s9` |
-| `q1pxhm` | P2 | *(the check §2.16 mandates and neither phase performs, blocked on `08a267`)* the spread source's element type is never compared against the literal's — `sections/02_syntax.md:863`, panel vote 5-0 — so `["q", ..a]` with `a: List[Int]` **SIGSEGVs** (exit 139) with no diagnostic at all. Depends on `08a267`: a contribution cannot be compared until it can be computed |
+| `q1pxhm` | P2 | *(the check §2.16 mandates and neither phase performed)* **CLOSED, divergence-neutral (+31 rows into family D, from the fix's own `let k: TyKind`).** the spread source's element type is never compared against the literal's — `sections/02_syntax.md:863`, panel vote 5-0 — so `["q", ..a]` with `a: List[Int]` **SIGSEGVs** (exit 139) with no diagnostic at all. Depends on `08a267`: a contribution cannot be compared until it can be computed |
 | `ehn3s9` | P2 | *(`08a267`'s codegen half, and **not** a prerequisite)* `emit_list_lit` recovers a leading spread's element with `get_list_elem_type(src_str)`, keyed on the **emitted C expression string** — the `hgd2az` hazard shape — so a variable source hits and a **call** source misses and defaults to `Int`. `let b = [..mk_strs()]` prints the `Str` pointer as an integer, and a `Str`-declared read of that element makes `.len()` a codegen `error[UnresolvedMethod]`. The tid already holds `List[Str]`, so the authority flip **fixes** this rather than breaking it; the shape is pinned in the corpus and the counter names it |
 | `f9hgt9` | P2 | *(the level `gmb211` stops short of)* an unannotated **nested** list literal — `let ys = [["ab"]]`, no block-`let` anywhere — fabricates an `Int` element at depth 2; the tid is now `List[List[Str]]` and codegen's flat side is `List[List[Int]]`. A class-B cell Stage 3's lowering subsumes |
 
@@ -3833,6 +3833,82 @@ pin. That last row is also the one authoring slip worth recording: the shared
 `spread_src(decl, tail, read)` helper hardcodes `let bad: Int = <read>`, so as first written the
 `List[Int]`-source row asserted Int-declared-Int and could never fail. It is rewritten with an explicit
 source declaring `Str`.
+
+### q1pxhm — the spec's own sentence, enforced by neither half of it (CLOSED, divergence-neutral)
+
+**§2.16 already said this, and nothing did it.** `sections/02_syntax.md:863`, panel vote 5-0:
+*"The spread source must be a `List[T]` with the same element type as the list being constructed.
+Type mismatches are compile errors."* **Both** halves were open — the element type was never compared,
+and a source that is not a `List` at all reached `cc`. This was `08a267`'s byproduct and it depended on
+it: a contribution cannot be compared until it can be computed.
+
+**Fail-open modes, each re-measured by running a program *after* `08a267` and with true exit codes:**
+
+| shape | before |
+|---|---|
+| `let a: List[Int] = [7]` `let b = ["q", ..a]`, read `b.get(1)` | **exit 139, SIGSEGV, no diagnostic** — the literal is `List[Str]`, the spliced value is the integer `7`, and interpolation dereferences `7` as a `char*` |
+| `let a: List[Str] = ["x"]` `let b = [1, ..a]` | **silent**, ran and printed `b1=94419670083158` — the `Str` pointer as an `Int` |
+| `[..a, ..c]`, two spreads of different types | **silent**, ran and printed `b0=x` |
+| `let n = 7` `let b = [..n]` | **cc escape**, no Blink span: *expected `blink_list *` but argument is of type `int64_t`* |
+
+All four now report with a span on the offending spread:
+
+    error[TypeError]: list spread source has element type Int but the list is built from Str
+      --> m1.bl:3:19
+    3 |     let b = ["q", ..a]
+      |                   ^
+
+    error[TypeError]: cannot spread Int into a list literal: a spread source must be a List
+
+**The check reads the memo; it does not re-infer.** `infer_type` has **no memo short-circuit** — it calls
+`infer_type_uncached` unconditionally and writes the memo *after* — so a second call on the same node
+re-walks the operand and **double-reports every diagnostic inside it**. `tc_list_elem_contribution`
+(`08a267`) already inferred every operand exactly once, spread or not, so the check reads
+`tc_lookup_node_tid(node_value(elem))` and resolves that. This is the one design decision in the fix, and
+it is the reason the check is a separate pass over the elements rather than folded into the contribution
+helper: the contribution of element 0 *is* the literal's element type, so there is nothing to compare it
+against until the whole element list has been walked.
+
+**Silence on `Unknown` and `Typevar` operands is load-bearing, not laxity.** An unbound metavar here is
+what the region-boundary check reports as `E0301` (`gqg3rk`); reporting it a second time from the literal —
+or pinning the metavar *from* the literal — is exactly the lossy direction `sskpk8` refuses.
+`types_compatible` is already permissive the same way for the element compare, which is what keeps
+`[..first_two([5, 6, 7])]` — a spread of a **generic** function's result — green.
+
+**The scope line is the spec's, not a shortcut.** Only *spread* elements are checked. `[..a, 1]` where
+the **plain** element is the odd one out satisfies §2.16 — source and literal agree there, and §2.16 says
+nothing about plain elements — so `[1, "x"]` stays legal, as it is today with no spread anywhere.
+General list homogeneity is a separate decision, and the compiler's own source may rely on today's
+permissiveness. Both shapes are **documented, not frozen**: no row in the test pins either in place.
+
+**Attribution, exact, and the +31 is my own code.** Cells **394 → 394**, family A **100 / 11 cells**
+unchanged, `diverge` **4279 → 4310**, `agree` **+186**. The signature diff on the 874-file common basis is
+**one line**:
+
+    var=k tid=TyKind flat=Int    279 → 310    (+31)
+
+That is one new declaration × the 31 roots that compile `typecheck.bl` — `let k = tc_tid_kind(src_t)`
+landing in **family D**, the documented cell where an enum-typed local is stored as `CT_INT` because the
+flat universe cannot spell an enum. `agree` **+186 = 6 × 31**: the fix's other six declarations. No new
+cell, no new shape, and the binding stays because `k` is read three times and Stage 3's recursive lowering
+retires the whole `tid=TyKind flat=Int` family by construction — writing worse code to hold a counter
+down would be the wrong trade.
+
+`task regen` + `task ci` green (657 test files, 1534 fmt). Test:
+`tests/test_q1pxhm_spread_source_elem_check.bl`, 15 rows — six `expect_compile_error` rows (Int-into-Str,
+Str-into-Int, two spreads of different types, a mismatch **one level down** in `List[List[T]]`, a non-`List`
+source, and a `Str` source that is *not* iterated as characters), and **nine legal programs written
+directly into the corpus** (`feedback_corpus_sweep_is_not_coverage`), because a check this shape is only as
+good as the set of programs it leaves alone: a matching spread, a spread in the middle (`[1, ..a, 4]`), two
+matching spreads, a nested match, an empty source, an `Option`-element carrier, a **struct** element (which
+is nominal — the compare must accept the *same* struct, not merely the same `TyKind`), a call result, and
+the generic-fn result above.
+
+The carrier row is annotated `let b: List[Option[Str]] = ...` **deliberately, and not to make it pass**:
+an *unannotated* `let b = [Some("cd"), Some("ef")]` — **no spread anywhere** — erases the carrier's inner
+type in codegen and prints the `Str` pointer as an integer, while the annotated form is correct. The axis
+is the **annotation**, not the spread, and that is `f9hgt9`'s depth-2 cell with a second carrier spelling;
+noted there. When it closes, drop the annotation and assert the element again.
 
 ### Remaining family-A causes, ranked (11 cells / ~~116~~ ~~107~~ ~~102~~ ~~101~~ 100 rows)
 
