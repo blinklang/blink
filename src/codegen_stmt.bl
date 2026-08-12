@@ -109,7 +109,7 @@ import diagnostics.{
 import pkg.manifest.{manifest_header_is_declared, manifest_name}
 import compiler.{trace}
 import stdlib_native_deps.{stdlib_native_dep_name_by_ffi_symbol}
-import typecheck.{sv_ty_or_flat_at, ctype_probe_at, tc_tid_subst_mono, is_builtin_fn, is_import_module_name, tc_channel_elem_ct, tc_channel_elem_struct, tc_lookup_node_tid, tc_tid_struct_mono_name, tc_tid_struct, tc_tid_is_enum, tc_tid_struct_arg_count, tc_tid_struct_arg_tid, tc_tid_struct_slot_seg, tc_struct_slot_encodable, tc_tid_result_ok_tid, tc_tid_result_err_tid, tc_tid_option_inner_tid, tc_tid_tuple_arity, tc_tid_tuple_elem_tid, tc_tid_to_c_tag}
+import typecheck.{sv_ty_or_flat_at, ctype_probe_at, tc_tid_subst_mono, c_type_from_tid, tc_tid_kind, tc_tid_resolved, TyKind, is_builtin_fn, is_import_module_name, tc_channel_elem_ct, tc_channel_elem_struct, tc_lookup_node_tid, tc_tid_struct_mono_name, tc_tid_struct, tc_tid_is_enum, tc_tid_struct_arg_count, tc_tid_struct_arg_tid, tc_tid_struct_slot_seg, tc_struct_slot_encodable, tc_tid_result_ok_tid, tc_tid_result_err_tid, tc_tid_option_inner_tid, tc_tid_tuple_arity, tc_tid_tuple_elem_tid, tc_tid_to_c_tag}
 
 fn strip_outer_parens(s: Str) -> Str {
     if s.starts_with("(") && s.ends_with(")") {
@@ -3192,6 +3192,22 @@ fn let_binding_tid(node: Int, type_ann: Int, val_node: Int) -> Int {
     -1
 }
 
+// br q3ssqw. The pointee of a `Ptr` local, spelled from the tid — "" when the tid cannot
+// improve on what the flat path already prints.
+//
+// The decline on `void*` is deliberate and keeps this flip minimal: `void*` is exactly what
+// `c_type_str(CT_PTR)` answers, so a tid that knows no more than the flat fields must not take
+// authority away from them. Only a tid that carries a real pointee (`uint8_t*`, `int64_t*`,
+// `blink_Pollfd*`) changes a declaration, which is what makes the emitted-C diff for this
+// sub-step exactly the set of rows the ctypediv sweep named.
+fn ptr_c_from_tid(tid: Int) -> Str {
+    if tid < 0 { return "" }
+    if tc_tid_kind(tc_tid_resolved(tid)) != TyKind.Ptr { return "" }
+    let c = c_type_from_tid(tid)
+    if c == "void*" { return "" }
+    c
+}
+
 @allow(UnrestoredMutation, IncompleteStateRestore)
 fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.Report {
     let val_node = node_value(node)
@@ -3748,7 +3764,7 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
     // Without it a row identifies only the variable and the ENTRY file, and neither locates the
     // `let`: every test compile re-emits the whole stdlib, so one stdlib binding is blamed on
     // ~90 entry files at once.
-    let decl_tid = sv_ty_or_flat_at(name, "emit_let_binding.decl", node)
+    let decl_tid = tc_tid_subst_mono(sv_ty_or_flat_at(name, "emit_let_binding.decl", node), cg_mono_tparams_sl, cg_mono_arg_tids)
     // Stage 3 measurement, the string twin of the line above. Each arm of the chain below
     // records the C TYPE it printed and which arm printed it; the ctypediv probe after the
     // chain compares that against c_type_from_tid's answer for the same variable. The flat
@@ -3886,6 +3902,18 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
         decl_c = "{c_type_c_name(ffi_offset_pending_struct)}*"
         decl_branch = "ptr_ffi"
         emit_line("{c_type_c_name(ffi_offset_pending_struct)}* {cname} = {val_str};")
+    } else if val_type == CT_PTR && ptr_c_from_tid(decl_tid) != "" {
+        // br q3ssqw, and the first site where the tid GOVERNS rather than being measured.
+        // The two branches above read a pointee out of the binding's own annotation and out of
+        // `ffi_offset_pending_struct`; neither can see the pointee of an UNANNOTATED binding
+        // whose RHS is a call (`let p = s.as_cstr()`). That fell through to the flat `else`
+        // below and printed `c_type_str(CT_PTR)` = `void*`, which makes every later `deref()`
+        // a C-compiler error with no Blink span to report it against. The tid has held the
+        // pointee all along, so ask it. The flat fields keep governing every other branch.
+        let ptr_c = ptr_c_from_tid(decl_tid)
+        decl_c = ptr_c
+        decl_branch = "ptr_tid"
+        emit_line("{ptr_c} {cname} = {val_str};")
     } else {
         let ts = c_type_str(val_type)
         decl_c = ts
@@ -3900,7 +3928,7 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
     // other tid consumer in codegen does: inside a mono'd generic fn a local's memoized tid is
     // still the typevar `T`, which c_type_from_tid rightly declines, and measuring that as a
     // decline would report the mono machinery as a hole in the speller.
-    ctype_probe_at(tc_tid_subst_mono(decl_tid, cg_mono_tparams_sl, cg_mono_arg_tids), decl_branch, name, decl_c, node)
+    ctype_probe_at(decl_tid, decl_branch, name, decl_c, node)
     ffi_offset_pending_struct = ""
     if name.starts_with("_") {
         emit_line("(void){cname};")

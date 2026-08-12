@@ -4503,6 +4503,98 @@ emit — 19,262 agreeing `ctype.struct` rows), the transparent-newtype arm
   module-qualified carrier half. Latent (no caller reaches it with such a tag today);
   worked around in `c_type_from_tid`, not fixed.
 
+## Stage 3b — the first authority flip: `Ptr` locals (br `q3ssqw`)
+
+Date: 2026-08-12. `task regen` green; `task ci` green (660/660 tests, 1540 fmt rows).
+**This is the first site in the collapse where the tid governs an emit decision** rather than
+being measured beside one.
+
+### Why this cell went first
+
+Of the 973 class-(i) rows — the ones where the tid is right and the flat path is wrong — the
+enum bucket is 966 and the `Ptr` bucket is 7. The small bucket went first, on purpose, because
+it is the only one with an **observable failure**. An enum-as-`int64_t` is quiet: C converts
+enum↔int implicitly, so flipping it can only be verified by diffing emitted C against a counter.
+An erased pointee is not quiet:
+
+```
+let s = "hi"
+let p = s.as_cstr()      //  void* p = ...;      <- pointee lost here
+let v = p.deref()        //  const int64_t v = (*(p));
+                         //  error: void value not ignored as it ought to be
+```
+
+Four lines, no `ffi` import, and the diagnostic is a **cc escape** — the worst class this
+compiler can produce, because there is no Blink span to point at. A red/green test can therefore
+prove the flip, which is the property that makes it the right first step.
+
+Note the *second* erasure on that emitted line: `const int64_t v`, where the Blink type of
+`p.deref()` is `U8`. Both halves come from the same missing channel, and fixing the
+**declaration** fixed both — once `p` is `uint8_t*` the dereference has a real type and storing
+it in an `int64_t` slot is an ordinary C widening. One branch, two erasures.
+
+### The branch, and why it declines on `void*`
+
+`emit_let_binding`'s declaration chain had a `ptr_ann` arm (pointee from the binding's own
+annotation) and a `ptr_ffi` arm (pointee from `ffi_offset_pending_struct`) and nothing for a
+`Ptr` whose pointee is known only to typecheck — so it fell to the final `else` and printed
+`c_type_str(CT_PTR)` = `void*`. The new `ptr_tid` arm sits after those two and asks the tid.
+
+The helper declines when `c_type_from_tid` answers `void*`, and that decline is what **bounds**
+the flip: `void*` is precisely what the flat path already prints, so a tid that knows no more
+than the flat fields must not take authority away from them. Only a tid carrying a real pointee
+changes a declaration — so the emitted-C diff for this sub-step is exactly the rows the ctypediv
+census named, and nothing else. That is a much stronger statement than "the tests still pass".
+
+Folded in with it: `decl_tid` is now substituted through `tc_tid_subst_mono` **at the point of
+capture** instead of at the probe call. The probe was already substituting; the governing branch
+needs the same tid, and computing it in two places would have let the governing value and the
+measured value drift — the exact failure mode this whole plan exists to remove.
+
+### Measured result
+
+Re-swept the 874-file basis with the identical script. `ty=Ptr[...]` diverge rows: **9 → 0**
+(7 on the `common.lst` basis; the two extra live in `test_ps5br9_ffi_scope_receiver_type.bl`,
+which the basis filter drops). `ctype.flat` diverge **981 → 974**; every other site unchanged to
+the row. Residual **1245 → 1238**.
+
+| | before | after |
+|---|---:|---:|
+| `ctype.flat` diverge | 981 | **974** |
+| all other sites | 264 | 264 |
+| total residual | 1245 | 1238 |
+
+**All 9 changed declarations are in `tests/`; none in `src/` or `examples/`.** So the first
+authority flip in the collapse changed nine lines of emitted C for corpus programs and *not one
+line* of the compiler's own output — which is why the bootstrap fixed point held without a
+byte-identity argument being needed.
+
+### Two rows that could not be written, and why that is a finding
+
+Both were established by *running* the shapes, not by reading the code, and both are recorded in
+the test file so the next person does not re-derive them:
+
+- **There is no user-fn producer of a `Ptr[T]`.** `error[PtrOutsideFFI]` (typecheck.bl:4253)
+  restricts the type to `@ffi` fns and `@trusted` **blocks**; `@trusted(audit:ID)` on the fn does
+  *not* satisfy it, and `@ffi` then demands declared effects. Every `Ptr` value in the language
+  comes from a builtin, an intrinsic, or a scope method — so the three call paths the test uses
+  (`Str.as_cstr`, `ffi scope.take`, `ffi scope.cstr`) are not a sample of the producers, they are
+  the producers.
+- **An erased pointee cannot silently miscompute a stride.** `Ptr.offset()` on a scalar pointee
+  is gated by `error[FfiOffsetUnknownStride]` whether or not the binding is annotated, so a
+  byte-walk row cannot be written at all. That path fails **closed**, which is the correct shape
+  for a stride the compiler genuinely does not know — worth stating explicitly, because "the
+  pointee is erased" invites assuming the arithmetic is wrong too, and it is not.
+
+### The corpus had all 9 rows and never failed
+
+Six files carried them, and every one calls only `.is_null()` or `.to_str()` on the erased local
+— neither dereferences. The tap existed, was hit 9 times, and could not fire
+(`feedback_corpus_sweep_is_not_coverage`). The four cc-escape rows in
+`tests/test_q3ssqw_ptr_call_return_pointee.bl` are that tap being exercised for the first time;
+the four regression pins are the annotated forms plus `is_null`/`to_str`/`addr`, i.e. exactly
+what the corpus *was* covering.
+
 ## Appendix — all 428 shape cells
 
 Format: `family | occurrences | tid | flat`.

@@ -1,0 +1,141 @@
+import blink.ffi
+
+// br q3ssqw — an UNANNOTATED `let` bound to a CALL returning `Ptr[T]` loses the pointee, so
+// the local is declared `void*` and every dereference through it is a C-compiler error with no
+// Blink span at all.
+//
+// THE CAUSE, in one line: `emit_let_binding`'s declaration chain has a `ptr_ann` branch (which
+// reads the pointee out of the binding's own type annotation) and a `ptr_ffi` branch (which
+// reads it out of `ffi_offset_pending_struct`), and NOTHING for a `Ptr` whose pointee is known
+// only to typecheck — so it falls through to the final `else` and spells `c_type_str(CT_PTR)`,
+// which is `void*`. The tid already holds the pointee: `c_type_from_tid` answers `uint8_t*` /
+// `int64_t*` for every one of these rows, which is how the Stage 3a ctypediv sweep found them.
+//
+// THE AXIS IS THE MISSING ANNOTATION, not `as_cstr` / `take` / `deref`. The annotated form of
+// each row below already worked and is pinned at the bottom, which is what makes the branch and
+// not the pointer machinery the defect.
+//
+// THE FAILURE MODE IS A CC ESCAPE — the worst diagnostic class, because there is no Blink line
+// to point at:
+//
+//     fn main() {
+//         let s = "hi"
+//         let p = s.as_cstr()
+//         let v = p.deref()
+//         let n: Int = v
+//         io.println("n={n}")
+//     }
+//
+//     build/as_cstr.c:123:23: error: void value not ignored as it ought to be
+//       123 |     const int64_t v = (*(p));
+//
+// Note the SECOND erasure on that same emitted line: `const int64_t v`, where the Blink type of
+// `p.deref()` is `U8`. The deref's own result type is derived from the receiver's flat pointee
+// too, so both halves of the line come from the same missing channel — which is why these rows
+// assert the VALUE and not merely that the program compiles.
+//
+// WHY THE CORPUS NEVER CAUGHT IT. Six corpus files carry these seven rows (tests/test_ffi.bl
+// ×2, test_ptr_string.bl, test_libc_bytes.bl, test_yb9ytb_read_fully.bl, test_ffi_scope_with.bl,
+// test_ps5br9_ffi_scope_receiver_type.bl) and every one of them calls only `.is_null()` or
+// `.to_str()` on the erased local — neither dereferences. A zero-failure corpus at a live
+// divergence is an unexercised tap, not coverage (feedback_corpus_sweep_is_not_coverage); these
+// rows are the tap being exercised.
+//
+// NOT this ticket, checked rather than assumed: `Ptr.offset()` through an erased pointee does
+// NOT silently miscompute a stride. It is gated by `error[FfiOffsetUnknownStride]` ("requires a
+// Ptr to an @ffi.struct typedef so the stride is known"), which fires on a scalar pointee
+// whether or not the binding is annotated — so a byte-walk row (`p.offset(1).deref()`) cannot be
+// written here at all, and there is no silent wrong-address shape to pin. That path fails closed,
+// which is the right shape for a stride the compiler genuinely does not know.
+
+// ── The cc-escape rows ───────────────────────────────────────────────────────────────
+
+// The smallest shape in the language that reaches this: no ffi import, no scope, one builtin
+// method. `Str.as_cstr()` is also the exact producer in tests/test_ptr_string.bl, so this is a
+// corpus shape with one line added, not a synthetic one.
+test "a Str.as_cstr() result derefs through an unannotated binding" {
+    let s = "hi"
+    let p = s.as_cstr()
+    let v = p.deref()
+    // Widened deliberately: `deref()` on a Ptr[U8] is a U8, and the erasure gets the RESULT
+    // type wrong too, so reading the value back through an Int-declared binding checks both.
+    let n: Int = v
+    assert_eq(n, 104)
+}
+
+// A scope-allocated Int cell handed back out of the scope by `take`, which is the shape the
+// corpus rows in tests/test_ffi.bl carry.
+test "a scope.take() result derefs through an unannotated binding" {
+    with ffi.scope() as scope {
+        let p: Ptr[Int] = scope.alloc()
+        p.write(7)
+        let taken = scope.take(p)
+        assert_eq(taken.deref(), 7)
+    }
+}
+
+// `scope.cstr()` is the other Ptr[U8] producer, and it goes through the scope rather than
+// through a Str method — a different call path to the same erased binding.
+test "a scope.cstr() result derefs through an unannotated binding" {
+    with ffi.scope() as scope {
+        let s = scope.cstr("hi")
+        let n: Int = s.deref()
+        assert_eq(n, 104)
+    }
+}
+
+// NO user-fn row, and that is a language fact rather than a gap in this test: an ordinary Blink
+// fn cannot return `Ptr[T]` at all. `error[PtrOutsideFFI]` (typecheck.bl:4253) restricts the type
+// to `@ffi` functions and `@trusted` blocks, `@trusted(audit:ID)` on the fn does not satisfy it
+// (it wants `@ffi` or a trusted BLOCK), and `@ffi` in turn demands declared effects and a
+// foreign body. So every producer of a `Ptr[T]` value is a builtin, an intrinsic, or a scope
+// method — which is exactly what the rows above cover, by three different call paths.
+
+// Two hops, because the pointee must survive being re-bound as well as being produced. The
+// intermediate `let` is itself an erased binding under the defect, so this row fails even if
+// the producing call is fixed but the rebind is not.
+test "the pointee survives a rebind of an unannotated binding" {
+    let s = "hi"
+    let p = s.as_cstr()
+    let q = p
+    let n: Int = q.deref()
+    assert_eq(n, 104)
+}
+
+// ── Regression pins ─────────────────────────────────────────────────────────────────
+
+// The annotated control. This is the row that proves the axis: identical code, one annotation,
+// and it worked before the fix — so the fix must not change it.
+test "an ANNOTATED binding was never affected" {
+    with ffi.scope() as scope {
+        let q: Ptr[Int] = scope.alloc()
+        q.write(9)
+        let t2: Ptr[Int] = scope.take(q)
+        assert_eq(t2.deref(), 9)
+    }
+}
+
+test "an ANNOTATED Ptr[U8] was never affected" {
+    let s = "hi"
+    let p: Ptr[U8] = s.as_cstr()
+    let n: Int = p.deref()
+    assert_eq(n, 104)
+}
+
+// The two methods every corpus row actually calls. They worked on a `void*`-declared local
+// (neither dereferences), so they are the pins that a fix must not disturb.
+test "is_null and to_str on an unannotated binding still work" {
+    let s = "hello world"
+    let p = s.as_cstr()
+    assert_eq(p.is_null(), false)
+    match p.to_str() {
+        Some(val) => assert_eq(val, "hello world")
+        None => assert(false)
+    }
+}
+
+test "addr on an unannotated binding still works" {
+    let s = "hi"
+    let p = s.as_cstr()
+    assert(p.addr() != 0)
+}
