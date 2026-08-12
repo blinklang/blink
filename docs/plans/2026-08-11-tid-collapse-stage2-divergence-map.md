@@ -226,7 +226,7 @@ not Stage 3 work:
 | `gmb211` | P2 | *(`wnbsen`'s byproduct, one line above it)* the recovery is gated on `inferred_tid == TYPE_UNKNOWN`, so a **partially** erased `List[?]` counted as an answer and the memo was never read. Every carrier erased; three silent miscompiles and a `cc` escape. Class B, so family A holds at **100**; fixed with a hole-only predicate plus a **position-wise** fill that cannot overwrite a concrete position or pin a metavar |
 | `08a267` | P2 | *(the four `tid=List[?]` rows `gmb211` did **not** move)* **CLOSED, −4 rows.** A list literal whose **first** element is a spread — `[..a]` — inferred `List[?]`, because `infer_type`'s ListLit arm takes the element type from element 0 only and has **no `SpreadExpr` arm**. Position is the axis: `["q", ..a]` was already correct. A **silent wrong value**, not just a laundered declaration. Fixed by naming the right concept — what an element *contributes*, which for a spread is its operand's element — in one function; the signature diff is those four rows and nothing else. Byproducts: `q1pxhm`, `ehn3s9` |
 | `q1pxhm` | P2 | *(the check §2.16 mandates and neither phase performed)* **CLOSED, divergence-neutral (+31 rows into family D, from the fix's own `let k: TyKind`).** the spread source's element type is never compared against the literal's — `sections/02_syntax.md:863`, panel vote 5-0 — so `["q", ..a]` with `a: List[Int]` **SIGSEGVs** (exit 139) with no diagnostic at all. Depends on `08a267`: a contribution cannot be compared until it can be computed |
-| `ehn3s9` | P2 | *(`08a267`'s codegen half, and **not** a prerequisite)* `emit_list_lit` recovers a leading spread's element with `get_list_elem_type(src_str)`, keyed on the **emitted C expression string** — the `hgd2az` hazard shape — so a variable source hits and a **call** source misses and defaults to `Int`. `let b = [..mk_strs()]` prints the `Str` pointer as an integer, and a `Str`-declared read of that element makes `.len()` a codegen `error[UnresolvedMethod]`. The tid already holds `List[Str]`, so the authority flip **fixes** this rather than breaking it; the shape is pinned in the corpus and the counter names it |
+| `ehn3s9` | P2 | **CLOSED, −2 rows (the shape flipped to `agree` in BOTH files carrying it).** *(`08a267`'s codegen half, and **not** a prerequisite — the first Stage-3 authority flip, at one seam.)* `emit_list_lit` recovers a leading spread's element with `get_list_elem_type(src_str)`, keyed on the **emitted C expression string** — the `hgd2az` hazard shape — so a variable source hits and a **call** source misses and defaults to `Int`. `let b = [..mk_strs()]` prints the `Str` pointer as an integer, and a `Str`-declared read of that element makes `.len()` a codegen `error[UnresolvedMethod]`. The tid already holds `List[Str]`, so the authority flip **fixes** this rather than breaking it; the shape is pinned in the corpus and the counter names it |
 | `f9hgt9` | P2 | *(the level `gmb211` stops short of)* an unannotated **nested** list literal — `let ys = [["ab"]]`, no block-`let` anywhere — fabricates an `Int` element at depth 2; the tid is now `List[List[Str]]` and codegen's flat side is `List[List[Int]]`. A class-B cell Stage 3's lowering subsumes |
 
 `k9agr8` gates the *measurement*, not the code: without it Stage 3 can only demonstrate 0
@@ -3909,6 +3909,105 @@ an *unannotated* `let b = [Some("cd"), Some("ef")]` — **no spread anywhere** �
 type in codegen and prints the `Str` pointer as an integer, while the annotated form is correct. The axis
 is the **annotation**, not the spread, and that is `f9hgt9`'s depth-2 cell with a second carrier spelling;
 noted there. When it closes, drop the annotation and assert the element again.
+
+### ehn3s9 — the first Stage-3 authority flip, at one seam (CLOSED, −2 rows)
+
+**This is the collapse's thesis reduced to five lines of code, and it landed the direction the plan
+predicts.** `emit_list_lit` recovered a leading spread's element with
+
+    first_elem_type   = get_list_elem_type(src_str)
+    first_elem_struct = get_list_elem_struct(src_str)
+
+a flat lookup **keyed on the emitted C expression string**. That string is a variable *name* for a
+variable source — the flat table has an entry, so it worked — and a fresh **temp** for a call, which
+misses, reads `-1`, and lets the element default to `Int`. The axis is **call-vs-variable in codegen**,
+not the spread, and it is the `hgd2az` / `twq9kz` string-keyed hazard shape for the **third** time.
+
+**Fail-open modes, each reproduced by running a program:**
+
+| shape | before |
+|---|---|
+| `let a = [..mk_strs()]`, read `a.get(0).unwrap()` | **silent**, printed `a0=94902105437782` — the `Str` pointer as an integer |
+| a struct element, `d.get(0).unwrap().v` | **silent**, printed `d0=<value>` — the field read lowered against an `Int`-erased element |
+| a **builtin** method source, `[.."x,y".split(",")]` | **silent**, same pointer-as-integer |
+| `let s: Str = a.get(0).unwrap()` then `s.len()` | `error[UnresolvedMethod]: unresolved method '.len' on type Str` — the codegen backstop firing on a *correctly typed* `Str`, because the receiver's name is `Str` and its flat ctype is not `CT_STRING` |
+| an `Option`/nested-`List`/`Map` element | **`error[UnresolvedMethod]` on `.unwrap` / `.get`** — loud, because a `(ct, sname)` pair cannot carry a carrier's inner at all |
+
+**An `Int` element is the one shape that accidentally worked**, because `Int` *is* the default the
+erasure falls back to. It gets its own regression row so a future change cannot "fix" this family by
+moving the default.
+
+**The fix reuses `recover_list_elem_from_tid` rather than adding a fourth spelling of the same walk.**
+That function (`codegen_expr.bl:552`, `jw1pmb`/`jcr0zz`/`nprhy8`) already resolves a `List`'s element
+from a node's tid memo — through `tc_tid_subst_mono` for a mono body, through `deep_tp_from_tid` for
+`CT_OPTION`/`CT_RESULT`/`CT_MAP`, straight off `tc_tid_set_elem_ct` for `CT_SET`, and it **declines with
+no stamp** when a child cannot be spelled faithfully. So the seam becomes: stamp the element onto the
+literal's own temp from the **operand node's** tid, read it back, and fall through to the string-keyed
+lookup only when the tid declined:
+
+    recover_list_elem_from_tid(node_value(elem_node), tmp)
+    first_elem_type   = get_list_elem_type(tmp)
+    first_elem_struct = get_list_elem_struct(tmp)
+    if first_elem_type < 0 && first_elem_struct == "" { ...the old flat read... }
+
+Two things about that shape are deliberate. It stamps **`tmp`, not `src_str`** — the literal and the
+operand have the same element type, and stamping the literal is what carries the `set_list_elem_option_tp`
+/ `_result_tp` / `set_list_nested_elem_*` deep-carrier writes to the consumer; stamping the *source* temp
+would leave them on a value nothing reads. And the flat read stays as the **fallback**, not the
+authority — this is Stage 3's flip at **one** seam, and the honest decline arms
+(`CT_ITERATOR`/`CT_HANDLE`/`CT_CHANNEL`/`CT_BYTES` have no parity target) must keep falling through to
+whatever works today rather than becoming a regression.
+
+**Attribution, exact.** On the 874-file `common.lst` basis: cells **394 → 394**, family A **100 / 11
+cells**, `diverge` **4310 → 4310**, `agree` unchanged — a **zero** signature diff. That is the right
+answer and not a null result: the three test files added since the basis was fixed are not in it, and
+**no `src/` or `lib/std/` file contains a leading-spread list literal at all** (every `[..` hit in
+`rg src/*.bl lib/std/*.bl` is inside a comment), so the compiler's own emitted C cannot change. Over the
+**full** corpus the diff is five rows and nothing else:
+
+    − diverge  emit_let_binding.decl  var=b  tid=List[Str]  flat=List[Int]   tests/test_08a267_spread_list_elem_type.bl
+    − diverge  emit_let_binding.decl  var=b  tid=List[Str]  flat=List[Int]   tests/test_q1pxhm_spread_source_elem_check.bl
+    + diverge  emit_let_binding.decl  var=d  tid=List[Box]  flat=List[Void]  tests/test_ehn3s9_spread_call_elem_codegen.bl
+    + missing  copy_list_compound_elem.src  var=_l77   tests/test_ehn3s9_spread_call_elem_codegen.bl
+    + missing  copy_list_compound_elem.src  var=_l103  tests/test_ehn3s9_spread_call_elem_codegen.bl
+
+The two removals are the ticket's shape flipping to `agree` in **both** files that carry it — the second
+one is `q1pxhm`'s generic-fn-result row, which was the same defect and was never separately filed.
+
+**The `+1 diverge` row is the House convention, not a new defect, and it is worth naming precisely.** A
+struct element is stored as the pair `(CT_VOID, "Box")` — the List house convention that
+`recover_list_elem_from_tid`'s own header documents and that the declared-`List[T]` path at
+`codegen_stmt.bl:3312` uses identically. The instrument's flat side has no way to render that pair, so it
+prints `flat=List[Void]` against `tid=List[Box]`. The element itself is **right**: the row's own test
+asserts `d.get(0).unwrap().v == 5` and passes. It is a class-B *spelling* divergence that Stage 3 retires
+by construction, because `c_type_from_tid` will spell `List[Box]` from the tid and the `(CT_VOID, sname)`
+pair stops existing.
+
+**The `+2 missing` rows are free evidence for a Stage-3 item.** The `Option`-carrier and `Map` rows now
+reach `copy_list_compound_elem` with a **temp** source that carries no tid — `site=copy_list_compound_elem.src
+var=_l77 tid=- flat=-`. `twq9kz` closed that site's *arm coverage* question; this is its **source** question,
+which is exactly Stage 3's item 3 (*replace `copy_list_compound_elem` with a node-tid-sourced copy, not
+`get_var_ty(src)` — that copies `-1`*). Those shapes pass today on the flat path, so this is a pinned
+exercise of the tap rather than a bug: the site now has three exercised rows instead of one, and the
+replacement has something to be verified against.
+
+`task regen` + `task ci` green (**658** test files, 1536 fmt). Test:
+`tests/test_ehn3s9_spread_call_elem_codegen.bl`, 14 rows, **RED as a whole file before the fix** — it did
+not compile at all, 7 `UnresolvedMethod` backstop errors — and 14/14 green after. Five rows for the
+silent-wrong-value modes (`Str` element, method **dispatch** on the recovered element rather than only
+printing it, a struct element's field, a **builtin** method source, a **trait** method source), three for
+the compound elements one level deeper (`Option` carrier, nested `List`, `Map`), and six regression pins:
+the `Int` default, a variable source, a **field-access** source (which already worked — `h.xs` is not a
+variable name either, but the field's type is known per-def and stamped onto the temp; a call has no such
+per-def stamp, which is the whole difference), a non-leading call spread, two call spreads in a row, and
+`for`-in over a call-spread literal.
+
+Two authoring notes, both language facts rather than defects: Blink has **no inherent `impl Type { }`** —
+only `impl Trait for Type` — so the method-source row declares a one-method trait, and `Map` insertion is
+`.insert(k, v)`, not `.set`.
+
+`tests/test_08a267_spread_list_elem_type.bl`'s call-source row is strengthened from a length-only assert
+to the element assert the ticket reserved for this one.
 
 ### Remaining family-A causes, ranked (11 cells / ~~116~~ ~~107~~ ~~102~~ ~~101~~ 100 rows)
 
