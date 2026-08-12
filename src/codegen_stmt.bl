@@ -79,6 +79,7 @@ import codegen_types.{
     struct_reg_names, struct_reg_set, struct_result_c_type, sv_tp, tp_from_ann,
     type_int, type_string, type_struct, type_list, type_option, type_result, type_map, type_set, type_iterator,
     set_list_elem_option_tp, set_list_elem_result_tp, list_elem_unspellable,
+    stamp_list_elem_from_tid,
     split_result_compound, CompoundSplit, map_struct_scalar_kv, MapKvCt, typedef_tag_or_empty, tp_child1_kind, tp_child1_sname, tp_child2_kind, tp_child2_sname,
     tp_get_kind, tp_get_child1, tp_get_child2, tp_get_sname, type_from_name, type_from_name_tag,
     type_name_from_ct, type_where_preds, cg_where_self_var, is_compound_tag, var_enums,
@@ -3799,6 +3800,32 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
         // without this the deep inner dies with val_str when `name` re-binds it.
         if expr_list_elem_type == CT_OPTION || expr_list_elem_type == CT_RESULT || expr_list_elem_type == CT_MAP {
             copy_list_compound_elem(val_str, name)
+            // br bef42x: the copy reads its source by variable NAME, so an RHS that is a CALL --
+            // `let e = loptmap()`, val_str = `blink_u_f_loptmap()` -- has no ScopeVar to read and
+            // every arm of the copy sees elem_ct = -1 and writes nothing:
+            //
+            //   bucket=missing site=copy_list_compound_elem.src var=blink_u_f_loptmap() tid=- flat=-
+            //
+            // So the compound element keeps only the shallow CT stamped two lines above, and the
+            // Map inside the Option is gone. The 85j3j8 tid last resort below cannot cover it: that
+            // one is gated on list_elem_unspellable and this element IS spellable — only its inner
+            // is missing.
+            //
+            // AND NO GATE ON THE POOL CAN SEE THAT STATE, which is why the tid leads here instead of
+            // filling in behind. set_list_elem_type routes through sv_tp, and sv_tp FABRICATES:
+            // `sv_tp(CT_OPTION, -1, ..)` returns `type_option(type_int())` (codegen_types.bl:1564).
+            // A lost inner and a genuine `List[Option[Int]]` are therefore the *same* pool state,
+            // bit for bit — the plan's confirmation #1, met head-on. A predicate over the flat
+            // fields cannot separate them, so the only authority that can is the tid.
+            //
+            // Precedence, stated: the copy runs first and the tid stamp runs second, so the tid
+            // wins when it has an answer and the copy's answer survives when it does not.
+            // stamp_list_elem_from_tid declines by itself for anything it cannot spell faithfully
+            // (deep_tp_from_tid's -1 contract, and an abstract typevar in a generic body reads as
+            // unspellable), so an unrepresentable inner stays honestly erased rather than being
+            // traded for a different fabrication. This is Stage 3's authority flip, scoped to this
+            // one branch.
+            stamp_list_elem_from_tid(val_node, name)
         }
         expr_list_elem_type = -1
         let src_struct = get_list_elem_struct(val_str)
@@ -9363,6 +9390,8 @@ pub fn emit_top_level_let(node: Int, extern_only: Int) ! Codegen.Emit, Codegen.R
         // without this the deep inner dies with val_str when `name` re-binds it.
         if expr_list_elem_type == CT_OPTION || expr_list_elem_type == CT_RESULT || expr_list_elem_type == CT_MAP {
             copy_list_compound_elem(val_str, name)
+            // br bef42x, same hole as emit_let_binding's ladder — see the full note there.
+            stamp_list_elem_from_tid(node_value(node), name)
         }
         expr_list_elem_type = -1
         let src_struct = get_list_elem_struct(val_str)

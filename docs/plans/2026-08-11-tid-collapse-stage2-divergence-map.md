@@ -5124,6 +5124,75 @@ expression); their metadata lives in different slots with no `stamp_*` twin yet.
 family — `List[Option[Map[Str, Int]]]` read through unannotated intermediates — is br `f9hgt9`,
 verified still failing identically after this fix, so the two are independent.
 
+### `copy_list_compound_elem`, and the state the pool cannot represent (br `bef42x`)
+
+The plan's one-line prescription for this function is `set_var_ty(dst, get_var_ty(src))`, and
+Stage 3d's measurement already showed why that cannot work: `src` is an emitted C expression, not a
+name. Building the shape by hand to fix it properly produced a second finding that is worth more than
+the first.
+
+**The cell.** An unannotated `let` bound to a **call** returning a List whose element is a compound:
+
+```blink
+fn loptmap() -> List[Option[Map[Str, Int]]] { .. }
+
+loptmap().get(0).unwrap().unwrap().get("a")   // WORKS
+let e = loptmap()                             // ...and now the same chain does not
+e.get(0).unwrap().unwrap().get("a")
+```
+
+Adding the `let` is a **regression relative to not binding at all** — the inversion is the fingerprint.
+The unbound form works because `6g6g7t`'s receiver stamp reads the object node's tid; the bound form
+goes through `emit_let_binding`'s unannotated `CT_LIST` ladder, which stamps the shallow element CT
+and then asks `copy_list_compound_elem(val_str, name)` to carry the inner across. `val_str` is
+`blink_u_f_loptmap()`, no `ScopeVar` has ever had that name, so every arm sees `elem_ct = -1` and
+writes nothing. `List[Result[Map, E]]` and `List[Option[List]]` fail identically; annotating fixes all
+three; depth 2 (`List[Map[Str, Int]]`) was already right. So the axis is the compound element's
+**inner**, reached through a let.
+
+**And the obvious fix does not fire, which is the finding.** The first attempt gated the tid recovery
+on a new `list_elem_compound_inner_missing(name)`. It answered false, and the `listelem` tap said why:
+
+```
+letladder var=e val_type=4 ann=-1 expr_elem=7 sv_elem=0
+```
+
+`set_list_elem_type` routes through `sv_tp`, and **`sv_tp` fabricates**: `sv_tp(CT_OPTION, -1, ..)`
+returns `type_option(type_int())` (`codegen_types.bl:1564`), with the `Result` and `Map` arms
+defaulting likewise. A lost inner and a genuine `List[Option[Int]]` are therefore the *same pool
+state, bit for bit*. **"Outer recorded, inner missing" is not an observable state of codegen's type
+representation** — so no predicate over the flat fields can separate the two, and the only authority
+that can is the tid. This is the plan's confirmation #1 met head-on rather than quoted: the erasure
+factory does not merely guess, it *destroys the evidence that it guessed*.
+
+**So the tid leads at that branch.** The copy runs first, `stamp_list_elem_from_tid(val_node, name)`
+runs second: the tid wins when it has an answer, the copy's answer survives when it does not. The
+stamper declines by itself for anything it cannot spell faithfully (`deep_tp_from_tid`'s `-1`
+sentinel contract; an abstract typevar in a generic body reads as unspellable), so an unrepresentable
+inner stays honestly erased rather than being traded for a different fabrication. Both ladder sites —
+`emit_let_binding` and `emit_top_level_let` — take it. **This is Stage 3's authority flip, scoped to
+one branch**, and the first unit where the flip was not optional: the gated version was not a more
+conservative variant of the fix, it was a no-op. The predicate that cannot exist is left as a comment
+in `codegen_types` where it would have gone, so it does not get written again.
+
+**Scope split, one row asserting less on purpose.** A `List[Map[Str, List[Int]]]` now recovers its Map
+element (`m.len()`, `m.contains_key()` answer right), but reading the map **value** out still fails —
+identically with the list annotated, identically with the chain unbroken, and for an `Option` value
+too, while a **scalar** map value works. Different axis: the step that reads the element out into a
+Map receiver gets the Map's flat key/value pair, and a flat value slot cannot hold the value's own
+element (`project_list_of_map_value_type_threading`). Filed as br `m039bn` with those bounds; the test
+row asserts what this fix delivers and points there. One red test standing for two causes would have
+hidden whichever was fixed second.
+
+**Census: unchanged, again, and again that is a statement about the instrument.** `tydiv` 4823 diverge
+rows / 409 cells; `ctypediv` 23 / 7. Both maps diff empty on a 955-file intersected basis. The corpus
+contains no unannotated let bound to a call returning a List of compounds, and this ladder branch
+carries no `sv_ty_or_flat` tap, so the counter could not have moved in either direction. Two units in
+a row have now been found by hand in places the census is blind to — which bounds what "divergence
+counter == 0" can mean as a Stage 3 exit criterion: it is zero *over the tapped sites on the corpus we
+have*, and the plan's own `feedback_corpus_sweep_is_not_coverage` warning is the reason that is not
+the same as done.
+
 ## Appendix — all 428 shape cells
 
 Format: `family | occurrences | tid | flat`.

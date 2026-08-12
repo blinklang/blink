@@ -1,0 +1,134 @@
+// br bef42x: an unannotated `let` bound to a CALL returning a List whose element is a COMPOUND
+// (Option/Result/Map) records the element's outer kind and loses what is inside it.
+//
+// ── THE AXIS IS THE LET, AND THE INVERSION IS THE PROOF ──────────────────────────────
+//
+// The chain written straight off the call works. Binding it to a let first breaks it:
+//
+//     loptmap().get(0).unwrap().unwrap().get("a")   // WORKS
+//     let e = loptmap()                            // ...and now the same chain does not
+//     e.get(0).unwrap().unwrap().get("a")
+//
+// So this is not a depth limit and not a chain-length limit — the binding is a REGRESSION
+// relative to not binding at all. The "no let" form works because br 6g6g7t's receiver stamp
+// reads the object NODE's tid, which carries the whole tree; the let goes through
+// codegen_stmt's unannotated CT_LIST ladder instead, which stamps the shallow element CT and
+// then asks copy_list_compound_elem to carry the deep inner across. That function reads its
+// source by variable NAME, and the source here is the emitted C call text:
+//
+//     bucket=missing site=copy_list_compound_elem.src var=blink_u_f_loptmap() tid=- flat=-
+//
+// `flat=-` again: the flat universe is keyed by name, and a call expression has none. The tid
+// last resort twelve lines below the copy (added for br 85j3j8) cannot cover it either,
+// because it is gated on the element being UNSPELLABLE and this element is spellable — a
+// CT_OPTION was recorded. Only its inner is missing. That gap is what these rows pin.
+//
+// ── WHY THE ROWS ASSERT VALUES ───────────────────────────────────────────────────────
+//
+// The symptom presents as `error[UnresolvedMethod]: unresolved method '.get' on type
+// Map[Str, Int] in '<fn>'` — the message NAMES the type it will not dispatch on, and the
+// ` in '<fn>'` suffix places it at the codegen backstop, so typecheck is right and codegen has
+// no receiver. A row that only checked "it compiles" would pass on a wrong-but-compiling
+// element, so every row reads a value back through the lost inner.
+
+fn loptmap() -> List[Option[Map[Str, Int]]] {
+    let mut m: Map[Str, Int] = Map()
+    m.insert("a", 1)
+    let mut out: List[Option[Map[Str, Int]]] = []
+    out.push(Some(m))
+    out
+}
+
+fn lresmap() -> List[Result[Map[Str, Int], Str]] {
+    let mut m: Map[Str, Int] = Map()
+    m.insert("b", 2)
+    let mut out: List[Result[Map[Str, Int], Str]] = []
+    out.push(Ok(m))
+    out
+}
+
+fn lmapoflist() -> List[Map[Str, List[Int]]] {
+    let mut m: Map[Str, List[Int]] = Map()
+    m.insert("c", [3, 33])
+    let mut out: List[Map[Str, List[Int]]] = []
+    out.push(m)
+    out
+}
+
+fn loptlist() -> List[Option[List[Int]]] {
+    let mut out: List[Option[List[Int]]] = []
+    out.push(Some([4, 44]))
+    out
+}
+
+fn lmap() -> List[Map[Str, Int]] {
+    let mut m: Map[Str, Int] = Map()
+    m.insert("d", 5)
+    let mut out: List[Map[Str, Int]] = []
+    out.push(m)
+    out
+}
+
+// ── THE CELL ─────────────────────────────────────────────────────────────────────────
+
+test "a let bound to a call returning List[Option[Map]] keeps the Map" {
+    let e = loptmap()
+    assert_eq(e.get(0).unwrap().unwrap().get("a").unwrap(), 1)
+}
+
+test "the same, read through intermediate lets at every step" {
+    let e = loptmap()
+    let o = e.get(0).unwrap()
+    let m = o.unwrap()
+    assert_eq(m.get("a").unwrap(), 1)
+}
+
+test "a let bound to a call returning List[Result[Map, E]] keeps the Map" {
+    let e = lresmap()
+    let m = e.get(0).unwrap().unwrap()
+    assert_eq(m.get("b").unwrap(), 2)
+}
+
+// The Map element is recovered here, and its VALUE's own element is a separate cell: br m039bn.
+// This row asserts what this fix delivers and stops there deliberately. Reading the value out —
+// `m.get("c").unwrap().len()` — still fails, and it fails identically with the list ANNOTATED and
+// with the chain unbroken, so it is neither this ticket's axis (the annotation) nor br 6g6g7t's
+// (an expression receiver). A scalar map value out of the same shape already works. Asserting the
+// broken form here would tie one red test to two causes and hide whichever was fixed second.
+test "a let bound to a call returning List[Map[Str, List]] recovers the Map element" {
+    let e = lmapoflist()
+    let m = e.get(0).unwrap()
+    assert_eq(m.len(), 1)
+    assert_eq(m.contains_key("c"), true)
+}
+
+test "a let bound to a call returning List[Option[List]] keeps the List" {
+    let e = loptlist()
+    let inner = e.get(0).unwrap().unwrap()
+    assert_eq(inner.len(), 2)
+    assert_eq(inner.get(0).unwrap(), 4)
+}
+
+// ── THE BOUNDS, KEPT AS ROWS ─────────────────────────────────────────────────────────
+// Each of these already passed before the fix. They stay because they are what says the axis
+// is the compound element's INNER reached through a let, and not something broader.
+
+test "no let at all: the identical chain straight off the call" {
+    assert_eq(loptmap().get(0).unwrap().unwrap().get("a").unwrap(), 1)
+}
+
+test "an annotated let carries the whole tree" {
+    let e: List[Option[Map[Str, Int]]] = loptmap()
+    assert_eq(e.get(0).unwrap().unwrap().get("a").unwrap(), 1)
+}
+
+test "depth 2: a let bound to a call returning List[Map] was already right" {
+    let e = lmap()
+    assert_eq(e.get(0).unwrap().get("d").unwrap(), 5)
+}
+
+test "the element itself, not its inner, still reads back" {
+    let e = loptmap()
+    assert_eq(e.len(), 1)
+    assert_eq(e.get(0).unwrap().is_some(), true)
+}
