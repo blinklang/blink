@@ -212,6 +212,7 @@ not Stage 3 work:
 | `jr4xf7` | P2 `type:spec` | *(`qjfwc6`'s held group)* what does `fs.read` return? The spec spells `fs.read(path)?` as a `Result` and names the lister `fs.list`; codegen emits a bare `const char*` from `blink_read_file` and calls it `list_dir`. 4 rows, and typecheck cannot sign `fs.*` until it is answered |
 | `n84s1p` | P3 | *(`qjfwc6`'s other residual)* `is_intrinsic_method` disagrees with the codegen arms **in both directions** — `io.debug` listed with no arm, `io.read_bytes` / `env.var` with arms and unlisted, so they resolve through `lookup_fnsig` on the **bare** method name. 9 rows |
 | `x3x0qj` | P2 | *(found by probing the un-triaged `@derive`/`Result` line, which turned out to be three causes)* an **immediately-invoked closure** was entirely unchecked: `infer_type`'s `Call` arm had branches for an `Ident` and a `FieldAccess` callee only, so a closure **literal** callee fell through to `TYPE_UNKNOWN` with its arguments un-inferred. Result type, arity **and** the callee body all unchecked at once — a **silent miscompile** (`let bad: Str = fn() -> Int { 7 }()` ran and printed `7`) plus two `cc` escapes. **−10 rows**, and the first fix whose rows moved family A → **class B** instead of leaving `diverge`. Callee position is the third position of `1hg8b6`'s family |
+| `nxnnxe` | P2 | *(the ranked #1 after `x3x0qj`, and the allow-list-with-nothing-behind-it shape a **fourth** time)* every method `@derive` synthesizes had its **name** affirmed by `tc_method_resolvable_on_type` and **no signature anywhere** — so `to_json` / `from_json` / `clone` / `debug` / `eq` / `cmp` and the str-backed-enum statics all resolved to `TYPE_UNKNOWN`. Both halves failed open: `let bad: Int = u.to_json()` compiled, linked and **ran**, and `User.from_json(42)` escaped to `cc`. Fixed the `qjfwc6` way — **a table, not arms**. **−19 rows, exactly as predicted, and every one of the seven named files went to zero.** Three byproducts filed: `pvhaew`, `bf0jnj`, `169kjt` |
 
 `k9agr8` gates the *measurement*, not the code: without it Stage 3 can only demonstrate 0
 in archive-linked mode.
@@ -1421,15 +1422,23 @@ these sweeps, tallied on the **intersection of their file sets** (874 files; the
 do not appear in all of them are listed under the `nz7drz` correction note). `scratchpad/cells.sh`
 takes that allow-list as a required argument.
 
-| | before `nz7drz` | after `nz7drz` | after `bfq7nf` | after `3c4g71` | after `zs7khh` | after `2r96m9` | after `rbd0a4` | after `w13xgb` | after `jzvxav` | after `h3q81d` | after `qjfwc6` | after `w089a0` |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| **total cells** | 423 | 421 | 409 | 407 | 405 | 404 | 404 | 405 | 404 | 402 | 402 | **402** |
-| family A (`tid=?`) cells | 84 | 61 | 47 | 45 | 35 | 34 | 34 | 33 | 32 | 28 | 28 | **28** |
-| family A rows | 1323 | 1224 | 1190 | 1050 | 1015 | 661 | 504 | 327 | 310 | 261 | 216 | **203** |
-| `Fn`-flat `tid=?` cells | 16 | 2 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | **0** |
-| agree | 362979 | 363711 | 363924 | 364187 | 364289 | 364674 | 364831 | 364883 | 364934 | 365243 | 365505 | **365580** |
-| diverge rows | 5008 | 5003 | 4976 | 4837 | 4828 | 4474 | 4317 | 4296 | 4279 | 4249 | 4204 | **4191** |
-| missing | 14 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | **1** |
+| | before `nz7drz` | after `nz7drz` | after `bfq7nf` | after `3c4g71` | after `zs7khh` | after `2r96m9` | after `rbd0a4` | after `w13xgb` | after `jzvxav` | after `h3q81d` | after `qjfwc6` | after `w089a0` | after `x3x0qj` | after `nxnnxe` |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| **total cells** | 423 | 421 | 409 | 407 | 405 | 404 | 404 | 405 | 404 | 402 | 402 | 402 | 403 | **406** |
+| family A (`tid=?`) cells | 84 | 61 | 47 | 45 | 35 | 34 | 34 | 33 | 32 | 28 | 28 | 28 | 26 | **23** |
+| family A rows | 1323 | 1224 | 1190 | 1050 | 1015 | 661 | 504 | 327 | 310 | 261 | 216 | 203 | 193 | **174** |
+| `Fn`-flat `tid=?` cells | 16 | 2 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | **0** |
+| agree | 362979 | 363711 | 363924 | 364187 | 364289 | 364674 | 364831 | 364883 | 364934 | 365243 | 365505 | 365580 | 365705 | **366051** |
+| diverge rows | 5008 | 5003 | 4976 | 4837 | 4828 | 4474 | 4317 | 4296 | 4279 | 4249 | 4204 | 4191 | 4190 | **4185** |
+| missing | 14 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | **1** |
+
+**`total cells` has now risen for three sweeps running (402 → 403 → 406) while `family A cells`
+fell (28 → 26 → 23), and that is the campaign turning a corner rather than losing ground.** A family-A
+cell is one *shape* of "codegen has no type"; the cells replacing them are class B, where typecheck
+holds the right structured type and the flat `(CT_*, sname)` pair cannot spell it — so one erased cell
+splits into as many cells as there are real types behind it. Class B is deleted wholesale by Stage 3's
+`c_type_from_tid` and Stage 4's removal of `sv_tp`; family A is what has to be fixed one cause at a
+time. Cell count going **up** for that reason is the instrument working.
 
 The `after jzvxav` column covers **two** fixes, `jzvxav` and `ya8qyf`, because they were measured in
 one sweep; the attribution in those sections shows all 17 rows belong to `jzvxav`, so `ya8qyf` is
@@ -2194,7 +2203,136 @@ makes it a clean instance of `r398vj` (the closure-call return recovered by re-p
 C signature string, so only `Int` / `Str` / `Option` survive) — noted on that ticket, since the
 IIFE form was not in its description. Typecheck holds the right tid; codegen throws it away.
 
-### Remaining family-A causes, ranked (26 cells / 193 rows)
+### nxnnxe — `@derive`-synthesized methods had no signature in typecheck (CLOSED)
+
+**Mechanism.** `tc_method_resolvable_on_type` (`typecheck.bl:346-380`) affirms the *names*: clause
+(c) reads the `@derive` annotation off the type declaration and passes `to_json`, `from_json`,
+`clone`, `debug`, `eq`, `cmp`; clause (c') fail-opens the str-backed-enum statics
+(`if obj_k == TyKind.Enum && (method == "to_str" || method == "from_str") { return 1 }`).
+**Nothing was behind either clause.** No `FnSigEntry` carried a return type or parameter types for
+any of them, because `@derive` synthesizes the method in *codegen* — there is no `node_type_ann` to
+read and no user-written fn to register.
+
+`TYPE_UNKNOWN` unifies with anything, so both halves failed open at once:
+
+1. the **declared-type compare** — `let bad: Int = u.to_json()` compiled, linked, **ran**, exit 0,
+   and `blink check` said `ok`. For the five-method MVCE it printed
+   `{"name":"a","age":1}<value><User><value>open`. **The fourth silent miscompile of this campaign.**
+2. the **argument check** — `User.from_json(42)` escaped to `cc`. A missing tid produces *no
+   divergence row at all* for this half, which is why the ticket's row count only measured half 1.
+3. a **cascade**: `from_str` answering UNKNOWN made the `Some(v)` binder Unknown too, so the *next*
+   method call on `v` read `on type ?` as well. One missing signature poisons a chain.
+
+**This is the allow-list-with-nothing-behind-it shape for the fourth time** — after
+`is_builtin_method` (172 names, 73 with no arm), `is_intrinsic_method` (`qjfwc6`, `n84s1p`), and now
+`tc_method_resolvable_on_type`. **And the fix is the same one every time: a table, not arms.**
+`register_derive_method_sigs(program)` walks the type declarations once and mints one signature per
+derived method per deriving type, under the bare `{Type}_{method}` key that *both* resolution paths
+already spell — the instance path at `:9461` and the static path at `:9647`. It runs **last** in
+`check_types`, after every user-fn and impl-method registration, and `register_derive_method_sig`
+skips a key a program has taken for itself (`fnsig_map` hit, or `tc_method_trait_count >= 1`), so a
+hand-written method of the same name always wins. The instance path's `check_arg_shapes` then comes
+free — which is the whole reason `u.eq(42)` and `u.cmp("nope")` now error.
+
+Two names are **deliberately absent** from the table, and each is a filed ticket:
+
+- **`hash`** — `p.hash()` is a hard `E0505` today (`pvhaew`, filed as a byproduct). Four places
+  should agree and one does not: `codegen_derive.bl:123` registers the entry, `:199` emits
+  `uint64_t {T}_hash({T} self)`, typecheck's clause (c) passes it, and the derive-dispatch blocks at
+  `codegen_methods.bl:5176` (structs) / `:5225` (enums) have **no `hash` arm**, so control falls to
+  the E0505 backstop at `:5382`. It works *internally* — kops calls `{T}_hash` for struct-keyed
+  `Map`/`Set` — which is why it went unnoticed. **A signature for an uncallable method would claim
+  it works**, so `hash` waits for `pvhaew`. This is the same defect class **inverted**, the fifth
+  sighting: here the allow-list is right and the *dispatch table* is short.
+- **`JsonValue` / `JsonError`** — `sections/03_types.md:2352` declares
+  `to_json(self) -> JsonValue` and `from_json(JsonValue) -> Result[Self, JsonError]`, and
+  `rg JsonValue src/ lib/` reads **0**. Codegen emits `const char*` and
+  `blink_Result_{tag}_str`. I registered `Str`, matching the emitted C, because the spec spelling
+  would reject every program that compiles today — filed as `169kjt` (`type:spec`) with the two ways
+  out named, and `register_derive_method_sigs` is the one place the return types change if a real
+  `JsonValue` wins. Recorded alongside it: the str-backed-enum feature has **no spec section at
+  all**; `tests/test_str_backed_enum.bl` is its only definition.
+
+`tc_is_str_backed_enum_decl` deliberately duplicates codegen's detection rule
+(`codegen_stmt.bl:8749-8765`: **all** variants carry a string value, and there is at least one)
+rather than sharing it, because codegen imports typecheck and not the reverse.
+
+| | after `x3x0qj` | after `nxnnxe` | delta |
+|---|---:|---:|---:|
+| family A rows | 193 | **174** | **−19** |
+| family A cells | 26 | **23** | **−3** |
+| total cells | 403 | **406** | **+3** |
+| diverge rows | 4190 | 4185 | −5 |
+| agree | 365705 | **366051** | **+346** |
+| missing | 1 | 1 | 0 |
+
+**The prediction was exact and the attribution is exact: the ticket named 19 rows in seven files,
+and all seven went to zero.** `test_str_backed_enum.bl` 6 → 0, `test_derive_clone.bl` 3 → 0,
+`test_derive_deserialize.bl` 3 → 0, `test_derive_list_deser.bl` 3 → 0, `test_derive_enum_deser.bl`
+2 → 0, `test_derive_nested.bl` 1 → 0, `test_derive_serialize.bl` 1 → 0. Nothing else in the corpus
+moved by a row.
+
+**14 of the 19 moved family A → class B; the other 5 now `agree`.** The whole corpus `diverge` delta
+is `−5` and it is entirely these five, so the accounting closes exactly:
+
+```
+- tid=?  flat=Str            (×4)  →  agree          u.to_json()          — Str is depth 1, the flat pair spells it
+- tid=?  flat=Point          (×1)  →  agree          p.clone()            — a struct name is depth 1 too
+- tid=?  flat=Result[Void, Str] (×8) → tid=Result[User, Str] / [Color, Str] / [Config, Str] / [Priority, Str] / [Shape, Str]
+- tid=?  flat=Option[Int]    (×4)  →  tid=Option[Status]
+- tid=?  flat=Int            (×1)  →  tid=Color
+- tid=?  flat=Shape          (×1)  →  tid=Shape      ← same spelling, still diverging
+```
+
+The four class-B groups are four *different* limits of the flat universe, which makes this fix a
+compact demonstration of why Stage 3 exists at all:
+
+- `Result[User, Str]` has **two** children and `(CT_*, sname)` holds one, so the **ok type erases to
+  `Void`** — the `x3x0qj` erasure one position over;
+- `Option[Status]` erases its **enum inner to `Int`**, because the flat universe has no way to say
+  "an `Option` of a *named* enum";
+- `tid=Color flat=Int` is the same erasure without the container;
+- **`tid=Shape flat=Shape` diverges on identical spelling** — the D+E bucket, where the flat pair
+  cannot tell an enum from a struct even when it has the right name.
+
+Rows leaving family A for class B is progress, not a regression: class B is what Stage 3's
+`c_type_from_tid` and Stage 4's deletion of `sv_tp` remove **wholesale**, whereas family A must be
+fixed one cause at a time.
+
+**`agree` rose by 346 — the largest of any prerequisite so far, on a −19 fix.** Same reason as
+`x3x0qj`'s +125, one level up: a signature does not merely type the call, it types everything
+downstream of it. The cascade in half 3 ran in reverse once the sigs existed — every binder that
+took its type from a derived method's return, and every node under *those*, became visible to the
+instrument at once.
+
+Verified: `task regen` EXIT=0; `task ci` EXIT=0 — **641/641** test files, `fmt` 1502 passed /
+86 skipped, gen1-vs-gen2 per-module byte-equal, all `ci-per-module-checks` ok.
+
+Test: `tests/test_nxnnxe_derive_method_signatures.bl`, 25 rows — 18 red before, all green after.
+Eight declared-type compares, one per registered method; two structured-shape assertions
+(`Result[User, Str]`, `Option[Status]`) that a depth-1 answer would fail; two receiver rows
+(`to_json` must not read `on type ?`, `clone` must read `on type User`); two argument-check rows
+that exist only because the sig buys `check_arg_shapes`; three `cc`-escape rows asserting a
+diagnostic instead of `C compilation failed`; **two binder-cascade rows** for half 3; and six
+controls — every method run for real (`j=20 e=true d=true`), `from_json` matched as a `Result`,
+`cmp` matched against a real `Ordering`, the str-enum round-trip, a non-deriving type still
+reporting `unresolved method '.clone'`, and **a hand-written `impl` keeping its own signature
+alongside `@derive`**, which is the collision guard.
+
+**Note on arity, unchanged and still open.** `check_arg_shapes` is *"type only, no arity"*
+(`typecheck.bl:1987`, the comment is explicit), so registering a signature buys per-argument type
+checks and **not** arity. And the static path (`:9647`) calls no argument check at all, for **any**
+static method in the language. `User.from_json(1, 2, 3)` is still a `cc` escape. That is a separate
+gap from this ticket and wants its own.
+
+**Latent defect recorded, not changed.** The derive registration loop at `typecheck.bl:7018-7031`
+pushes onto `nr_impl_method_names` without pushing onto the parallel `nr_impl_type_names`. It is
+benign only by luck: `method_names` ends up the *longer* list, so `nr_has_impl_method` (`:6738`)
+iterating `type_names.len()` never indexes out of range, and derived names stay invisible to it
+while still suppressing the name-only W0501 scan at `:7594`. **Do not add the missing push without
+checking both readers** — it would change what `nr_has_impl_method` answers.
+
+### Remaining family-A causes, ranked (23 cells / 174 rows)
 
 Re-ranked from the post-`qjfwc6` sweep, by **rows on the 874-file common basis**, grouped by the
 innermost producer (the outermost call is usually a symptom — `.unwrap()` heads many chains, but its
@@ -2259,10 +2397,10 @@ and it is that last one.
 | a cross-module `pub let` container element — `symbol_index.si_file_path.get(i)` | 12 | — | `src/incremental.bl:44,75`, `src/file_watcher.bl:40,73`. Part of the `flat=Str` tail `rbd0a4` uncovered, and **the largest remaining cause inside the compiler's own source** |
 | `Response` / `Request` from the http surface | 10 | — | `tests/test_net_integration.bl`, `test_middleware.bl`, `test_http_server.bl`, all `at=__main__`. **It did not close with `net.*`** — the earlier note guessed it would. `net.request` was the one intrinsic `qjfwc6` left out for a reason of its own (its `Result[Response, NetError]` needs two stdlib struct types a consuming module need not have imported), so these need their own probe |
 | calling a closure-typed **field** (`route.callback`, `logger.log_msg`) | ~11 | — | |
-| **`@derive`-synthesized methods have no signature in typecheck** — `to_json`, `from_json`, `clone`, and the str-backed-enum statics | **19** | — | **Triaged, and it grew.** The old 15-row line lumped two unrelated causes and got both counts wrong: 10 of those rows were the IIFE (**`x3x0qj`**, closed above) and the rest is bigger than it looked once the IIFE rows stopped hiding it. One mechanism, four synthesized shapes: `u.to_json()` → `flat=Str` (`test_derive_serialize.bl`, `test_derive_nested.bl`, `test_derive_deserialize.bl:13`, `test_derive_list_deser.bl:30`), `T.from_json(..)` → `flat=Result[Void, Str]` (`test_derive_deserialize.bl` ×2, `test_derive_enum_deser.bl` ×2, `test_derive_list_deser.bl`, `test_str_backed_enum.bl` ×2), `x.clone()` → `flat=Point`/`Int`/`Shape` (`test_derive_clone.bl` ×3), and the str-backed statics → `flat=Option[Int]` (`test_str_backed_enum.bl` ×4). Nothing declares these — `@derive` synthesizes them in codegen, so there is no `node_type_ann` to read and no fnsig to look up. **The `qjfwc6` shape: a table, not arms** — one `FnSigEntry` per derived method per deriving type, minted where the derive is registered. Now the largest actionable cause, and it subsumes the separate `Status.from_str` line below |
+| ~~**`@derive`-synthesized methods have no signature in typecheck** — `to_json`, `from_json`, `clone`, and the str-backed-enum statics~~ | ~~**19**~~ | **`nxnnxe`** | **CLOSED** — −19 rows, section above. The prediction held to the row and all seven files went to zero. 14 of the 19 moved family A → **class B** (four *different* flat-universe limits: `Result`'s second child erased, an `Option`'s enum inner erased to `Int`, a bare enum erased to `Int`, and `tid=Shape flat=Shape` diverging on identical spelling); the other 5 now `agree`. `agree` +346, the largest of the campaign. **Two names held back on purpose** — `hash` is uncallable today (`pvhaew`) and a signature would claim otherwise, and `to_json`/`from_json` are signed `Str` because the spec's `JsonValue`/`JsonError` do not exist (`169kjt`). Original triage: **Triaged, and it grew.** The old 15-row line lumped two unrelated causes and got both counts wrong: 10 of those rows were the IIFE (**`x3x0qj`**, closed above) and the rest is bigger than it looked once the IIFE rows stopped hiding it. One mechanism, four synthesized shapes: `u.to_json()` → `flat=Str` (`test_derive_serialize.bl`, `test_derive_nested.bl`, `test_derive_deserialize.bl:13`, `test_derive_list_deser.bl:30`), `T.from_json(..)` → `flat=Result[Void, Str]` (`test_derive_deserialize.bl` ×2, `test_derive_enum_deser.bl` ×2, `test_derive_list_deser.bl`, `test_str_backed_enum.bl` ×2), `x.clone()` → `flat=Point`/`Int`/`Shape` (`test_derive_clone.bl` ×3), and the str-backed statics → `flat=Option[Int]` (`test_str_backed_enum.bl` ×4). Nothing declares these — `@derive` synthesizes them in codegen, so there is no `node_type_ann` to read and no fnsig to look up. **The `qjfwc6` shape: a table, not arms** — one `FnSigEntry` per derived method per deriving type, minted where the derive is registered. Now the largest actionable cause, and it subsumes the separate `Status.from_str` line below |
 | `List.join` on a `List[Str]` | ~4 | — | `src/cli.bl:935`, `:3561`, `:3563`. From the `rbd0a4` tail; the last of the allow-list-vs-dispatch shape |
 | `bytes.to_str()` → `Result[Str, Str]` | 3 | — | The third cause the `@derive`/`Result` probe split out. All 3 are `src/lsp.bl:51`, one per root that pulls `lsp` in (`lsp`, `cli`, `build_stdlib`). A `Bytes` **instance** intrinsic with no return arm — the `2r96m9` shape one method over, and `2r96m9` covered only the two statics |
-| ~~`Status.from_str` — the compiler-synthesized static on a str-backed enum, returning `Option[Enum]`~~ | ~~4~~ | — | **Folded into the `@derive` row above** — same producer, same missing table. It was listed separately only because the `flat=Option[Int]` spelling put it in a different part of the tail |
+| ~~`Status.from_str` — the compiler-synthesized static on a str-backed enum, returning `Option[Enum]`~~ | ~~4~~ | **`nxnnxe`** | **Folded into the `@derive` row above** — same producer, same missing table, closed with it. It was listed separately only because the `flat=Option[Int]` spelling put it in a different part of the tail. The fold was correct: one `register_derive_method_sig` call closed all 4, and they were the four rows that moved to `tid=Option[Status]` |
 | ~~an immediately-invoked closure, `fn(..) -> T { .. }()`~~ | ~~10~~ | **`x3x0qj`** | **CLOSED** — −10 rows, section above. Was hidden inside the `@derive`/`Result` line, which is how a `flat=`-organized tail hides a callee-shape cause. One missing `callee_kind` branch left the result type, the arity **and** the callee body unchecked; a **silent miscompile** and two `cc` escapes. First fix whose rows moved family A → class B rather than leaving `diverge` |
 | ~~`Ptr[T]` intrinsics — `buf.offset(i)`, `p.is_null()`, `s.as_cstr()`~~ | ~~176~~ | **`w13xgb`** | **CLOSED** — −177 rows, section above. `Ptr[T]` had no `TyKind` at all. 5 rows remain, all `scope.cstr` / `scope.take` → **`ps5br9`** |
 | ~~`Str` intrinsic aliases — `s.substr(a,b)`, `s.charAt(i)`, `n.to_string()`~~ | ~~147~~ | **`rbd0a4`** | **CLOSED** — −157 rows. `charAt` was not a missing return type; the method does not exist |
@@ -2287,26 +2425,28 @@ it the pattern also matches inside `flat=`), because the flat spelling and the p
 different questions and disagreeing on which is "the" count is how the Ptr entry once acquired two
 figures:
 
-| module | family-A rows | | after `w089a0` | after `qjfwc6` | after `h3q81d` | after `jzvxav` | after `w13xgb` | after `rbd0a4` |
-|---|---:|---|---:|---:|---:|---:|---:|---:|
-| `__main__` (the root being compiled) | 148 | | 158 | 171 | 174 | 223 | 225 | 237 |
-| `std_libc` | **0** | | 0 | 0 | 0 | 0 | 0 | 165 |
-| `std_net_tcp` | **0** | | 0 | 0 | 40 | 40 | 40 | 40 |
-| `std_db_row` | **0** | | 0 | 0 | 0 | 0 | 12 | 12 |
-| `cli` | 11 | | 11 | 11 | 11 | 11 | 11 | 11 |
-| `std_db_sqlite` | 9 | | 9 | 9 | 9 | 9 | 9 | 9 |
-| `incremental` / `file_watcher` | 6 each | | 6 each | 6 each | 6 each | 6 each | 6 each | 6 each |
-| `lsp` | 4 | | 4 | 4 | 6 | 6 | 6 | 6 |
-| `std_testing` | **0** | | 0 | 0 | 0 | 0 | 3 | 3 |
-| `std_http_server` / `pkg_resolver` / `build_stdlib` | 3 each | | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each |
+| module | family-A rows | | after `x3x0qj` | after `w089a0` | after `qjfwc6` | after `h3q81d` | after `jzvxav` | after `w13xgb` | after `rbd0a4` |
+|---|---:|---|---:|---:|---:|---:|---:|---:|---:|
+| `__main__` (the root being compiled) | **129** | | 148 | 158 | 171 | 174 | 223 | 225 | 237 |
+| `std_libc` | **0** | | 0 | 0 | 0 | 0 | 0 | 0 | 165 |
+| `std_net_tcp` | **0** | | 0 | 0 | 0 | 40 | 40 | 40 | 40 |
+| `std_db_row` | **0** | | 0 | 0 | 0 | 0 | 0 | 12 | 12 |
+| `cli` | 11 | | 11 | 11 | 11 | 11 | 11 | 11 | 11 |
+| `std_db_sqlite` | 9 | | 9 | 9 | 9 | 9 | 9 | 9 | 9 |
+| `incremental` / `file_watcher` | 6 each | | 6 each | 6 each | 6 each | 6 each | 6 each | 6 each | 6 each |
+| `lsp` | 4 | | 4 | 4 | 4 | 6 | 6 | 6 | 6 |
+| `std_testing` | **0** | | 0 | 0 | 0 | 0 | 0 | 3 | 3 |
+| `std_http_server` / `pkg_resolver` / `build_stdlib` | 3 each | | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each |
 
-**Two consecutive fixes have now landed their whole delta in `__main__` and nowhere else** —
-`w089a0`'s −13 (171 → 158) and `x3x0qj`'s −10 (158 → 148). That is the expected shape for a fix to a
-**declaration site** or to a **syntactic form**: a `with ... as` clause and an
-`fn(..) { .. }()` call are both written in the root under compilation, so unlike the stdlib causes
-there is no shared module for the rows to concentrate in. It is also why both attributions are
-per-root-file (three files each) rather than per-module, and why the `__main__` figure is the one to
-watch from here — every stdlib module but `std_db_sqlite` is already at zero.
+**Three consecutive fixes have now landed their whole delta in `__main__` and nowhere else** —
+`w089a0`'s −13 (171 → 158), `x3x0qj`'s −10 (158 → 148) and `nxnnxe`'s −19 (148 → 129). That is the
+expected shape for a fix to a **declaration site** or to a **syntactic form**: a `with ... as`
+clause, an `fn(..) { .. }()` call and an `@derive`d type are all written in the root under
+compilation, so unlike the stdlib causes there is no shared module for the rows to concentrate in. It
+is also why all three attributions are per-root-file (three, three and seven files) rather than
+per-module, and why the `__main__` figure is the one to watch from here — every stdlib module but
+`std_db_sqlite` is already at zero. **Every non-`__main__` figure is now unchanged for three
+sweeps**, so the tail is `__main__` plus the compiler's own source and nothing else.
 
 **`std_libc` went from a third of everything left to zero**, and it was one cause; `std_db_row` and
 `std_testing` went to zero on `jzvxav`, and it was one cause covering both; **`std_net_tcp` went from
@@ -2321,6 +2461,32 @@ producer and not by this table. `h3q81d` is the only cause so far to move `__mai
 remains is `__main__` plus the compiler's own source (`cli` 11, `incremental`/`file_watcher` 6 each,
 `lsp` 4) — so from here the instrument is measuring the corpus and the compiler, not the standard
 library.
+
+**With `nxnnxe` closed, the top of the ranking is no longer actionable by row count**, and that is
+worth stating plainly because it changes how the remaining prerequisites should be picked. The two
+largest causes left are both *held* rather than open: **iterator adapters** (34) is deferred to
+`qzdz2e` by panel decision because it is user-visible, and **`Channel(n)` / `ch.recv`** (24) is
+probably not a missing rule at all — the argument is a capacity, not an element type, so it likely
+belongs to `decisions/under-determined-types.md` / E0301. Below them the tail is genuinely flat:
+`pub let` container element (12), closure-typed fields (~11), `Response`/`Request` (10), `nrrs28` (9),
+`n84s1p` (9), `jr4xf7` (4, blocked on a spec answer), `List.join` (~4), `bytes.to_str()` (3).
+
+So the next two prerequisites are chosen on **evidence quality and blast radius**, not size — and
+both are `nxnnxe`'s own byproducts, which is the pattern every closed cause in this document has
+produced:
+
+- **`bf0jnj`** — `match Status.from_str(..)` directly emits `blink_Option_void`. The `from_str`
+  emitter (`codegen_methods.bl:2444`) stamps the Option's inner type on the temp *variable* and
+  leaves `expr_result_ok_struct` unset, so an expression consumer spells `Option_void`; the
+  `try_from`/`from_json` arm **one line above** sets it. A one-line fix with the failing shape
+  already written down. **`nxnnxe` is what exposed it** — before, typecheck rejected the program
+  first with `on type ?`, which is the second time a signature fix has uncovered a codegen bug that
+  the missing type was hiding.
+- **`pvhaew`** — a `hash` arm in both derive-dispatch blocks, after which `hash` joins
+  `register_derive_method_sigs` as `(self) -> U64` and the table is complete.
+
+Neither is measured in rows (both are `cc`/E0505 escapes, which produce no divergence row at all —
+the `ya8qyf` situation), and they must not be combined: separate tests, separate regens.
 
 **The `db.*` mechanism, diagnosed (read-only) — kept as written, because it is the diagnosis
 `h3q81d` was fixed from and the prediction it confirms.** These are **effect operations**, declared in

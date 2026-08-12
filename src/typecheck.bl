@@ -2146,6 +2146,112 @@ fn register_ns_intrinsic_sigs() {
     register_intrinsic_fn_sig("env.args", [], make_list_type(TYPE_STR))
 }
 
+// Every variant of a str-backed enum carries a string value — `Open = "open"`. Mirrors the
+// same test codegen makes when it decides to synthesize to_str/from_str
+// (src/codegen_stmt.bl:8749-8765): ALL variants, not merely one, and at least one.
+// Duplicated rather than shared because codegen imports typecheck, not the other way round.
+fn tc_is_str_backed_enum_decl(td: Int) -> Int {
+    let flds_sl = node_fields(td)
+    if flds_sl == -1 { return 0 }
+    let n = sublist_length(flds_sl)
+    if n == 0 { return 0 }
+    let mut i = 0
+    while i < n {
+        let v = sublist_get(flds_sl, i)
+        if node_kind(v) != NodeKind.TypeVariant { return 0 }
+        if node_str_val(v) == "" { return 0 }
+        i = i + 1
+    }
+    1
+}
+
+// One synthesized-method signature, under the bare `{Type}_{method}` key both resolution
+// paths already spell — the instance path at the struct/enum receiver arm, and the static
+// path at the type-name receiver arm.
+//
+// Registered LAST, so anything a program says for itself wins: a key already taken by a user
+// fn (register_fn_sig inserts the bare name as well as the module-qualified one) or by a
+// trait impl (which keys `{Type}_{trait}_{method}` and is found through the method→traits
+// index) is left alone. A type that both derives and hand-writes a same-named method is a
+// duplicate-impl question, not this function's to answer.
+fn register_derive_method_sig(tname: Str, method: Str, params: List[Int], ret: Int) {
+    let key = "{tname}_{method}"
+    if (fnsig_map.get(key) ?? -1) != -1 { return }
+    if tc_method_trait_count(tname, method) >= 1 { return }
+    register_intrinsic_fn_sig(key, params, ret)
+}
+
+// br nxnnxe. The signature of every method `@derive` synthesizes.
+//
+// tc_method_resolvable_on_type's clause (c) has always affirmed these NAMES — it reads the
+// derive annotation straight off the type decl — and clause (c') fail-opened the str-backed
+// enum statics. Nothing behind either clause carried a return type or parameter types, and a
+// resolvability list with nothing behind it fails open twice over: TYPE_UNKNOWN unifies with
+// anything, so the declared type was never compared AND the arguments were never checked.
+// `let bad: Int = u.to_json()` compiled, linked and RAN. The fourth instance of this exact
+// shape, after is_builtin_method and is_intrinsic_method (br qjfwc6).
+//
+// A table, not one arm per method, for qjfwc6's reason: codegen already carries one arm per
+// derived method (codegen_methods.bl:5176 for structs, :5225 for enums) and typecheck reading
+// a table is what keeps the two from drifting apart method by method. The two inline arms that
+// predate it — 4q2etk's synthesized `display`, vfgp72's `eq`/`cmp` — are subsumed by these
+// entries and answer identically; they stay for now.
+//
+// The types are the spec table (sections/03_types.md:2352) crossed with what codegen actually
+// emits, and where those two disagree the emitted C wins, because registering anything else
+// would reject programs that compile today:
+//
+//   * `to_json`/`from_json` are Str-typed. The spec spells `-> JsonValue` and
+//     `(JsonValue) -> Result[Self, JsonError]`, but NEITHER type exists anywhere in src/ or
+//     lib/ — codegen emits `const char* {T}_to_json` and
+//     `blink_Result_{tag}_str {T}_from_json(const char*)` (codegen_derive.bl:159,169).
+//     The divergence is br 169kjt; if it resolves toward JsonValue, this is the one place the
+//     return types change.
+//   * `hash` is absent. `@derive(Hash)` registers it and emits `uint64_t {T}_hash`
+//     (codegen_derive.bl:199), but neither derive-dispatch block in codegen_methods.bl has a
+//     `hash` arm, so `p.hash()` is a hard E0505 today (br pvhaew). A signature for a method
+//     that cannot be called would claim it works; add `(self) -> U64` with the arm.
+//
+// `Ordering` comes from lib/std/traits.bl, so a program that never pulls it in has no tid for
+// it; `cmp` is then left unregistered and falls to vfgp72's arm, which asks the same question.
+fn register_derive_method_sigs(program: Int) {
+    let types_sl = node_fields(program)
+    if types_sl == -1 { return }
+    let ordering_t = lookup_named_type("Ordering")
+    let mut i = 0
+    while i < sublist_length(types_sl) {
+        let td = sublist_get(types_sl, i)
+        let tname = node_name(td)
+        let ttid = lookup_named_type(tname)
+        if ttid != -1 {
+            if type_has_derive(td, "Serialize") != 0 {
+                register_derive_method_sig(tname, "to_json", [ttid], TYPE_STR)
+            }
+            if type_has_derive(td, "Deserialize") != 0 {
+                register_derive_method_sig(tname, "from_json", [TYPE_STR], make_result_type(ttid, TYPE_STR))
+            }
+            if type_has_derive(td, "Clone") != 0 {
+                register_derive_method_sig(tname, "clone", [ttid], ttid)
+            }
+            if type_has_derive(td, "Debug") != 0 {
+                register_derive_method_sig(tname, "debug", [ttid], TYPE_STR)
+            }
+            // Ord: Eq (spec §3.6) — deriving Ord synthesizes eq as well as cmp.
+            if type_has_derive(td, "Eq") != 0 || type_has_derive(td, "Ord") != 0 {
+                register_derive_method_sig(tname, "eq", [ttid, ttid], TYPE_BOOL)
+            }
+            if type_has_derive(td, "Ord") != 0 && ordering_t != -1 {
+                register_derive_method_sig(tname, "cmp", [ttid, ttid], ordering_t)
+            }
+            if tc_is_str_backed_enum_decl(td) != 0 {
+                register_derive_method_sig(tname, "to_str", [ttid], TYPE_STR)
+                register_derive_method_sig(tname, "from_str", [TYPE_STR], make_option_type(ttid))
+            }
+        }
+        i = i + 1
+    }
+}
+
 // The closure argument at `idx`, or -1 if absent. The closure validators below
 // tolerate -1 (they no-op on a non-Closure node), so call sites need no guard.
 fn closure_arg_at(args_sl: Int, idx: Int) -> Int {
@@ -5307,6 +5413,11 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
 
     // The signatures of the namespace intrinsics codegen emits directly (br qjfwc6).
     register_ns_intrinsic_sigs()
+
+    // The signatures of the methods @derive synthesizes (br nxnnxe). AFTER the user fn and
+    // impl-method registrations above, so a key a program spells for itself is never taken
+    // over — see register_derive_method_sig.
+    register_derive_method_sigs(program)
 
     // Register user-defined effect handle names, and the SIGNATURE of every operation
     // they declare (br h3q81d). The handle name alone only suppresses the UnknownMethod

@@ -1,0 +1,279 @@
+// br nxnnxe — every method `@derive` synthesizes was resolvable but UNTYPED.
+//
+// tc_method_resolvable_on_type (src/typecheck.bl:346) affirms the NAME: clause (c) reads the
+// derive annotation off the type decl, clause (c') fail-opens the str-backed-enum statics.
+// Nothing behind either clause carried a return type or parameter types. TYPE_UNKNOWN unifies
+// with anything, so both halves failed open at once — the declared type was never compared
+// (silent miscompile) and the arguments were never checked (escaped to the C compiler).
+//
+// Fourth instance of the allow-list-with-nothing-behind-it defect class, after
+// is_builtin_method (172 names, 73 with no arm) and is_intrinsic_method (closed by br qjfwc6).
+// Fixed the same way qjfwc6 was: a TABLE of fnsigs, not one arm per method. Registering into
+// fnsig_pool under the key the resolution path already spells buys the argument check for
+// free — check_arg_shapes runs on any sig the instance path finds.
+//
+// The signatures are the spec table (sections/03_types.md:2352) crossed with what codegen
+// actually emits (src/codegen_derive.bl, src/codegen_stmt.bl:8906,8927):
+//
+//   to_json    Serialize     instance  (self) -> Str
+//   from_json  Deserialize   STATIC    (Str) -> Result[T, Str]
+//   eq         Eq | Ord      instance  (self, T) -> Bool
+//   cmp        Ord           instance  (self, T) -> Ordering
+//   clone      Clone         instance  (self) -> T
+//   hash       Hash          instance  (self) -> U64   — NOT registered, see br pvhaew below
+//   debug      Debug         instance  (self) -> Str
+//   to_str     str-backed    instance  (self) -> Str
+//   from_str   str-backed    STATIC    (Str) -> Option[T]
+//
+// to_json/from_json are Str-typed, NOT the spec's JsonValue/JsonError — neither of those types
+// exists in src/ or lib/. That divergence is br 169kjt; registering the spec spelling would
+// reject every correct program that exists today.
+//
+// Found as a cause in the tid-collapse divergence map: 19 family-A rows.
+
+import compile_test_helpers
+
+// A program deriving everything derivable, plus a str-backed enum. `import std.json` is
+// required for @derive(Deserialize) to LINK (br vfg2k5 — the compiler wrongly reports it
+// unused), so every fixture carries it.
+fn derive_program(body: Str) -> Str {
+    let mut s = "import std.json\n\n"
+    s = s.concat("@derive(Serialize, Deserialize, Clone, Ord, Hash, Debug)\n")
+    s = s.concat("type User \{\n    name: Str\n    age: Int\n}\n\n")
+    s = s.concat("type Status \{\n    Open = \"open\"\n    Done = \"done\"\n}\n\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let u = User \{ name: \"a\", age: 1 }\n")
+    s = s.concat(body)
+    s = s.concat("}\n")
+    s
+}
+
+// ── the return type of each synthesized method is compared against a declaration ──
+
+test "to_json is typed Str, not unknown" {
+    let s = derive_program("    let bad: Int = u.to_json()\n    io.println(\"\{bad}\")\n")
+    compile_test_helpers.expect_compile_error(s, "nxnnxe_to_json", "TypeError")
+}
+
+test "from_json is typed Result, not unknown" {
+    let s = derive_program("    let bad: Int = User.from_json(u.to_json())\n    io.println(\"\{bad}\")\n")
+    compile_test_helpers.expect_compile_error(s, "nxnnxe_from_json", "TypeError")
+}
+
+test "clone is typed as the deriving type, not unknown" {
+    let s = derive_program("    let bad: Int = u.clone()\n    io.println(\"\{bad}\")\n")
+    compile_test_helpers.expect_compile_error(s, "nxnnxe_clone", "TypeError")
+}
+
+// `hash` is deliberately absent from this file. It is the one derived method with no signature
+// AND no way to call it: codegen registers it (codegen_derive.bl:123) and emits the C function
+// (:199), but neither derive-dispatch block in codegen_methods.bl has a `hash` arm, so `p.hash()`
+// falls through to the E0505 backstop and is a hard error today (br pvhaew). A signature for an
+// uncallable method would claim it works; add both together.
+
+test "debug is typed Str, not unknown" {
+    let s = derive_program("    let bad: Int = u.debug()\n    io.println(\"\{bad}\")\n")
+    compile_test_helpers.expect_compile_error(s, "nxnnxe_debug", "TypeError")
+}
+
+test "eq is typed Bool, not unknown" {
+    let s = derive_program("    let bad: Str = u.eq(u)\n    io.println(bad)\n")
+    compile_test_helpers.expect_compile_error(s, "nxnnxe_eq", "TypeError")
+}
+
+test "cmp is typed Ordering, not unknown" {
+    let s = derive_program("    let bad: Int = u.cmp(u)\n    io.println(\"\{bad}\")\n")
+    compile_test_helpers.expect_compile_error(s, "nxnnxe_cmp", "TypeError")
+}
+
+test "a str-backed enum to_str is typed Str, not unknown" {
+    let s = derive_program("    let bad: Int = Status.Open.to_str()\n    io.println(\"\{bad}\")\n")
+    compile_test_helpers.expect_compile_error(s, "nxnnxe_to_str", "TypeError")
+}
+
+test "a str-backed enum from_str is typed Option, not unknown" {
+    let s = derive_program("    let bad: Int = Status.from_str(\"open\")\n    io.println(\"\{bad}\")\n")
+    compile_test_helpers.expect_compile_error(s, "nxnnxe_from_str", "TypeError")
+}
+
+// The types are STRUCTURED, not just non-unknown: the error must name the real shape, so a
+// reader can see which of Result's two children is which.
+test "from_json names its Result shape in the diagnostic" {
+    let s = derive_program("    let bad: Int = User.from_json(u.to_json())\n    io.println(\"\{bad}\")\n")
+    let out = compile_test_helpers.compile_and_capture(s, "nxnnxe_from_json_shape")
+    assert(out.contains("Result[User, Str]"))
+}
+
+test "from_str names its Option shape in the diagnostic" {
+    let s = derive_program("    let bad: Int = Status.from_str(\"open\")\n    io.println(\"\{bad}\")\n")
+    let out = compile_test_helpers.compile_and_capture(s, "nxnnxe_from_str_shape")
+    assert(out.contains("Option[Status]"))
+}
+
+// ── the value a synthesized method produces is a typed receiver in its own right ──
+
+test "the result of to_json is a Str receiver" {
+    let s = derive_program("    io.println(\"\{u.to_json().nope()}\")\n")
+    let out = compile_test_helpers.compile_and_capture(s, "nxnnxe_recv_to_json")
+    assert(!out.contains("on type ?"))
+}
+
+test "the result of clone is a receiver of the deriving type" {
+    let s = derive_program("    io.println(\"\{u.clone().nope()}\")\n")
+    let out = compile_test_helpers.compile_and_capture(s, "nxnnxe_recv_clone")
+    assert(out.contains("on type User"))
+}
+
+// ── arguments are checked, because a real fnsig reaches check_arg_shapes ──
+
+test "an eq argument of the wrong type is an error" {
+    let s = derive_program("    let b = u.eq(42)\n    io.println(\"\{b}\")\n")
+    compile_test_helpers.expect_compile_error(s, "nxnnxe_arg_eq", "TypeError")
+}
+
+test "a cmp argument of the wrong type is an error" {
+    let s = derive_program("    let c = u.cmp(\"nope\")\n    io.println(\"\{c}\")\n")
+    compile_test_helpers.expect_compile_error(s, "nxnnxe_arg_cmp", "TypeError")
+}
+
+// ── nothing reaches the C compiler ──
+
+test "a wrongly-declared to_json result never runs" {
+    let s = derive_program("    let bad: Int = u.to_json()\n    io.println(\"\{bad}\")\n")
+    let r = compile_test_helpers.compile_and_run(s, "nxnnxe_esc_to_json")
+    let all = r.out.concat(r.err_out)
+    assert(r.exit_code != 0)
+    assert(!all.contains("C compilation failed"))
+    assert(!all.contains("name"))
+}
+
+test "a wrongly-declared clone result never runs" {
+    let s = derive_program("    let bad: Int = u.clone()\n    io.println(\"\{bad}\")\n")
+    let r = compile_test_helpers.compile_and_run(s, "nxnnxe_esc_clone")
+    let all = r.out.concat(r.err_out)
+    assert(r.exit_code != 0)
+    assert(!all.contains("C compilation failed"))
+}
+
+test "a wrongly-declared from_str result never runs" {
+    let s = derive_program("    let bad: Int = Status.from_str(\"open\")\n    io.println(\"\{bad}\")\n")
+    let r = compile_test_helpers.compile_and_run(s, "nxnnxe_esc_from_str")
+    let all = r.out.concat(r.err_out)
+    assert(r.exit_code != 0)
+    assert(!all.contains("C compilation failed"))
+}
+
+// ── controls: every correct use still compiles and RUNS ──
+
+test "correct uses of every synthesized method run" {
+    let mut b = "    let j = u.to_json()\n"
+    b = b.concat("    let c = u.clone()\n")
+    b = b.concat("    let e = u.eq(c)\n")
+    b = b.concat("    let d = u.debug()\n")
+    b = b.concat("    io.println(\"j=\{j.len()} e=\{e} d=\{d.len() > 0}\")\n")
+    let s = derive_program(b)
+    let r = compile_test_helpers.compile_and_run(s, "nxnnxe_run_all")
+    assert(r.exit_code == 0)
+    assert(r.out.contains("j=20 e=true d=true"))
+}
+
+test "from_json still matches as a Result" {
+    let mut b = "    let parsed = User.from_json(u.to_json())\n"
+    b = b.concat("    match parsed \{\n")
+    b = b.concat("        Ok(v) => io.println(\"ok=\{v.age}\")\n")
+    b = b.concat("        Err(msg) => io.println(\"err=\{msg}\")\n")
+    b = b.concat("    }\n")
+    let s = derive_program(b)
+    let r = compile_test_helpers.compile_and_run(s, "nxnnxe_run_from_json")
+    assert(r.exit_code == 0)
+    assert(r.out.contains("ok=1"))
+}
+
+// The untyped return CASCADES: from_str answered TYPE_UNKNOWN, so `Some(v)` bound v as Unknown,
+// and the next method call on the binder had no receiver type either —
+// "unresolved method '.to_str' on type ?". This row is the family-A shape end to end.
+test "a from_str match binder carries the enum type" {
+    let mut b = "    match Status.from_str(\"done\") \{\n"
+    b = b.concat("        Some(v) => io.println(v.to_str())\n")
+    b = b.concat("        None => io.println(\"none\")\n")
+    b = b.concat("    }\n")
+    let s = derive_program(b)
+    let out = compile_test_helpers.compile_and_capture(s, "nxnnxe_binder")
+    assert(!out.contains("on type ?"))
+}
+
+// The same cascade on the Result side: Ok(v) must bind v as the deriving type.
+test "a from_json match binder carries the deriving type" {
+    let mut b = "    match User.from_json(u.to_json()) \{\n"
+    b = b.concat("        Ok(v) => io.println(\"\{v.nope()}\")\n")
+    b = b.concat("        Err(e) => io.println(e)\n")
+    b = b.concat("    }\n")
+    let s = derive_program(b)
+    let out = compile_test_helpers.compile_and_capture(s, "nxnnxe_binder_ok")
+    assert(out.contains("on type User"))
+}
+
+// The binder is bound through an intermediate let, not matched straight off the call. Both forms
+// now type-check, but the DIRECT form still miscompiles: the from_str emitter stamps the Option's
+// inner type on the temp variable and not on the expression side-channel, so a scrutinee copied
+// out of it is spelled blink_Option_void (br bf0jnj — one line in codegen_methods.bl:2444).
+// nxnnxe is what exposed that: before it, typecheck rejected the program first.
+test "the str-backed enum statics still round-trip" {
+    let mut b = "    io.println(Status.Open.to_str())\n"
+    b = b.concat("    let found = Status.from_str(\"done\")\n")
+    b = b.concat("    match found \{\n")
+    b = b.concat("        Some(v) => io.println(\"some=\{v.to_str()}\")\n")
+    b = b.concat("        None => io.println(\"none\")\n")
+    b = b.concat("    }\n")
+    b = b.concat("    let missing = Status.from_str(\"nope\")\n")
+    b = b.concat("    match missing \{\n")
+    b = b.concat("        Some(v) => io.println(\"some=\{v.to_str()}\")\n")
+    b = b.concat("        None => io.println(\"none\")\n")
+    b = b.concat("    }\n")
+    let s = derive_program(b)
+    let r = compile_test_helpers.compile_and_run(s, "nxnnxe_run_str_enum")
+    assert(r.exit_code == 0)
+    assert(r.out.contains("open"))
+    assert(r.out.contains("some=done"))
+    assert(r.out.contains("none"))
+}
+
+test "cmp still returns a matchable Ordering" {
+    let mut b = "    let older = User \{ name: \"a\", age: 9 }\n"
+    b = b.concat("    match u.cmp(older) \{\n")
+    b = b.concat("        Ordering.Less => io.println(\"less\")\n")
+    b = b.concat("        Ordering.Equal => io.println(\"equal\")\n")
+    b = b.concat("        Ordering.Greater => io.println(\"greater\")\n")
+    b = b.concat("    }\n")
+    let s = derive_program(b)
+    let r = compile_test_helpers.compile_and_run(s, "nxnnxe_run_cmp")
+    assert(r.exit_code == 0)
+    assert(r.out.contains("less"))
+}
+
+// ── control: a hand-written impl still wins over the derive table ──
+// The derive sigs are registered AFTER user + impl-method sigs and skip a key already taken,
+// so a type that both derives and hand-writes a same-named method keeps the hand-written
+// signature. `Countable.clone` here returns Int, not Countable.
+test "a hand-written trait method of the same name keeps its own signature" {
+    let mut s = "trait Sizey \{\n    fn tally(self) -> Int\n}\n\n"
+    s = s.concat("@derive(Clone, Debug)\ntype Countable \{ n: Int }\n\n")
+    s = s.concat("impl Sizey for Countable \{\n    fn tally(self) -> Int \{ self.n }\n}\n\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let c = Countable \{ n: 3 }\n")
+    s = s.concat("    let d = c.clone()\n")
+    s = s.concat("    io.println(\"\{d.tally()}|\{c.debug().len() > 0}\")\n}\n")
+    let r = compile_test_helpers.compile_and_run(s, "nxnnxe_run_impl_wins")
+    assert(r.exit_code == 0)
+    assert(r.out.contains("3|true"))
+}
+
+// ── control: a type that derives nothing gains no signatures ──
+test "a non-deriving type still reports an unresolved method" {
+    let mut s = "type Bare \{ n: Int }\n\n"
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let b = Bare \{ n: 1 }\n")
+    s = s.concat("    io.println(\"\{b.clone().n}\")\n}\n")
+    let out = compile_test_helpers.compile_and_capture(s, "nxnnxe_bare")
+    assert(out.contains("unresolved method '.clone'"))
+}
