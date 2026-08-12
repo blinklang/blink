@@ -3197,6 +3197,69 @@ pub fn set_list_elem_option(name: Str, inner_ct: Int, inner_struct: Str) {
     set_list_elem_option_tp(name, sv_tp(inner_ct, -1, -1, inner_struct))
 }
 
+// 1n9fhg: what a List's element is, when that element is a NAMED BY-VALUE type — a struct, a
+// tuple, or an enum. `iter_from_source` needs this because the flat element pair cannot answer
+// it: a struct/tuple element reads `(CT_VOID, sname)` and a PLAIN (payload-less) enum element
+// reads `(CT_VOID, "")`, and `c_type_tag(CT_VOID)` is "void", so the iterator family keys itself
+// on `blink_ListIterator_void`.
+//
+// The two answers are not one answer, because the two are not stored the same way in a list slot.
+// A struct, a tuple, and a DATA enum are POINTER-boxed (`blink_alloc` + `(void*)box`), so they
+// need a pointer carrier tag exactly like an Option or a Result element. A plain enum is
+// VALUE-boxed like an Int — `blink_list_push(l, (void*)(intptr_t)blink_Col_Red)` — because the
+// variant expression itself evaluates as CT_INT with no struct name, and `.get()` reads it back
+// through `blink_Option_int`. Giving it a pointer carrier would deref an ordinal.
+// `tag` is the POINTER carrier tag and is "" for a plain enum, so a caller that reads only the
+// tag takes the scalar path by default rather than dereferencing an ordinal. `name` is the raw
+// type name either way, for the var_enums registration a bare match variant needs.
+pub type ListNamedElem { tag: Str, name: Str, plain_enum: Bool }
+
+fn no_named_elem() -> ListNamedElem {
+    ListNamedElem { tag: "", name: "", plain_enum: false }
+}
+
+pub fn list_named_elem_of(name: Str) -> ListNamedElem {
+    if name == "" { return no_named_elem() }
+    // Tid first, flat pair second. The tid is the only one of the two that can name a plain-enum
+    // element at all, and it is also the one that survives an unannotated `let`.
+    let mut es = ""
+    let tid = get_var_ty(name)
+    if tid >= 0 {
+        let ect = tc_tid_list_elem_ct(tid)
+        // CT_STRUCT / CT_ENUM name themselves; a tuple element answers ct < 0 (no CT names a
+        // tuple) and carries its whole type in the tag.
+        if ect == CT_STRUCT || ect == CT_ENUM || ect < 0 {
+            es = tc_tid_list_elem_struct(tid)
+        }
+    }
+    if es == "" { es = get_list_elem_struct(name) }
+    named_elem_from_name(es)
+}
+
+// 1n9fhg: the same classification asked of the ELEMENT's own tid, for an iterable that is not a
+// variable — a struct FIELD (`for c in h.cols`), a call result, an index. Those receivers have no
+// ScopeVar, so list_named_elem_of has no name to look up and answers nothing; the tid is the only
+// authority that reaches them.
+//
+// The input is the ELEMENT tid, not the container's, because the container is not always a List:
+// a Set normalizes into a temp list (blink_set_to_list) whose element the flat pair erases the
+// same way, and tc_tid_iter_elem answers for both. tc_tid_struct is the whole gate — it names
+// only a Struct or an Enum, and named_elem_from_name declines everything else.
+pub fn named_elem_of_elem_tid(elem_tid: Int) -> ListNamedElem {
+    if elem_tid < 0 { return no_named_elem() }
+    named_elem_from_name(tc_tid_struct(elem_tid))
+}
+
+fn named_elem_from_name(es: Str) -> ListNamedElem {
+    if es == "" { return no_named_elem() }
+    // A compound tag is the pre-existing carrier path's business, not this one.
+    if is_compound_tag(es) != 0 { return no_named_elem() }
+    if is_enum_type(es) != 0 && is_data_enum(es) == 0 {
+        return ListNamedElem { tag: "", name: es, plain_enum: true }
+    }
+    ListNamedElem { tag: c_type_tag_for_struct(es), name: es, plain_enum: false }
+}
+
 // z9gkt3: re-stamp a destination list's COMPOUND element from a carrier tag alone
 // (the iterator-source analogue of copy_list_compound_elem, which reads LIST
 // metadata a var-iterator doesn't have). Used by `collect` after a lazy adapter
@@ -3226,6 +3289,16 @@ pub fn set_list_elem_compound_from_tag(name: Str, carrier: Str) {
             let err_struct = if is_struct_type(parts.second) != 0 || is_enum_type(parts.second) != 0 { parts.second } else { "" }
             set_list_elem_result(name, ok_ct, ok_struct, err_ct, err_struct)
         }
+    } else if is_compound_tag(carrier) == 0 && is_named_typedef_tag(carrier) != 0 {
+        // 1n9fhg: a NAMED BY-VALUE carrier — a struct, a tuple's generated struct tag, or a
+        // DATA enum. Those are pointer-boxed into a list slot, and (CT_VOID, tag) is the pair
+        // that records it: exactly what emit_boxed_container_store writes on the push side and
+        // what `.get()` and for-in read back with a deref. Nothing here is lossy, unlike the
+        // Option/Result arms above — the tag IS the element's whole type. The is_compound_tag
+        // guard keeps a `Map_` carrier out: is_named_typedef_tag admits it, but a Map element
+        // is a pointer type whose key/value channels this pair cannot spell.
+        set_list_elem_type(name, CT_VOID)
+        set_list_elem_struct(name, carrier)
     }
 }
 
@@ -3464,6 +3537,18 @@ pub fn stamp_list_elem_from_tid(node: Int, var_name: Str) -> ListElemStamp {
     if ect == CT_STRUCT || ect == CT_ENUM {
         let es = tc_tid_list_elem_struct(etid)
         if es == "" { return no_list_elem_stamp() }
+        // 1n9fhg: a PLAIN (payload-less) enum element is not stored the way the (CT_VOID, name)
+        // pair says it is. The variant expression evaluates as CT_INT with no struct name, so the
+        // push side value-boxes the ordinal — `(void*)(intptr_t)blink_Col_Red` — exactly like an
+        // Int. Naming it here made every read deref that ordinal as a pointer
+        // (`blink_Option_Col` and `*_ounw.value`). CT_INT with no name is the faithful stamp, and
+        // it is what the annotated path already produces; `match`/`==` on the bound value both
+        // work through it, because a plain enum IS its ordinal.
+        if is_enum_type(es) != 0 && is_data_enum(es) == 0 {
+            if tracing != 0 { dbg_trace("listelem", "stamp ect={ect} var={var_name} arm=plain_enum es={es}") }
+            set_list_elem_type(var_name, CT_INT)
+            return ListElemStamp { ct: CT_INT, sname: "" }
+        }
         set_list_elem_type(var_name, CT_VOID)
         set_list_elem_struct(var_name, es)
         return ListElemStamp { ct: CT_VOID, sname: es }
@@ -3972,7 +4057,34 @@ pub fn get_list_elem_result_err_struct(name: Str) -> Str {
     ""
 }
 
+// A payload-less enum element is VALUE-boxed in a list, exactly like an Int:
+// `blink_list_push(l, (void*)(intptr_t)blink_Col_Red)`, because the variant
+// expression is an ordinal with no struct behind it. A name in this slot asserts
+// the OPPOSITE -- every consumer reads a named element as pointer-boxed and emits
+// `*(blink_Col*)(intptr_t)value`, a deref of an ordinal. So the one place a name
+// enters the flat pair is the one place to reject it: record the boxing that
+// actually happens. A DATA enum keeps its name (propagate_enum_struct gives it a
+// real struct and it is genuinely pointer-boxed), and so does a str-backed one's
+// C enum -- that is still an ordinal.
 pub fn set_list_elem_struct(name: Str, struct_name: Str) {
+    if struct_name != "" && is_enum_type(struct_name) != 0 && is_data_enum(struct_name) == 0 {
+        set_list_elem_type(name, CT_INT)
+        return
+    }
+    set_list_elem_struct_raw(name, struct_name)
+}
+
+// The reject above is a fact about the lists the COMPILER builds by push, .set and literal, not
+// about every `blink_list*`. blink_set_to_list hands back a list of the set's KEYS, and a set key
+// is always pointer-boxed (blink_alloc + kops), a plain enum included. A caller that knows its
+// slots hold pointers records the pair through here, so (CT_VOID, name) keeps meaning exactly one
+// thing — "deref this" — on both kinds of list.
+pub fn set_list_elem_named_boxed(name: Str, struct_name: Str) {
+    set_list_elem_type(name, CT_VOID)
+    set_list_elem_struct_raw(name, struct_name)
+}
+
+fn set_list_elem_struct_raw(name: Str, struct_name: Str) {
     let mut i = scope_vars.len() - 1
     while i >= 0 {
         let sv = scope_vars.get(i).unwrap()

@@ -1073,6 +1073,18 @@ pub fn finish_enum_zip_result(result_list: Str, tuple_tag: Str) {
     expr_list_elem_struct = tuple_tag
 }
 
+// 1n9fhg: publish the expr_* element channels for a result whose element is the pointer-boxed
+// carrier `carrier`. A COMPOUND carrier (Option_/Result_/Map_) is named by its CT alone, which is
+// why every adapter used to set only expr_list_elem_type; a NAMED BY-VALUE carrier (a struct, a
+// tuple, a data enum) has CT_VOID for a CT and carries its whole identity in the name, so the
+// name channel has to travel with it or the receiving `let` re-erases the element to Void.
+pub fn publish_carrier_elem(carrier: Str) {
+    expr_list_elem_type = compound_tag_ct(carrier)
+    if is_compound_tag(carrier) == 0 {
+        expr_list_elem_struct = carrier
+    }
+}
+
 // j0cdey: copy a source List's COMPOUND element type onto a destination list
 // (a HOF that produces a new List[Option[T]]/List[Result[T,E]], e.g. collect over
 // a compound source). Reuses the source's stored deep inner tp so a nested
@@ -4219,7 +4231,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                 expr_result_str = adapter_var
                 expr_result_type = CT_ITERATOR
                 expr_iter_next_fn = "blink_FilterIterator_{carrier}_next"
-                expr_list_elem_type = compound_tag_ct(carrier)
+                publish_carrier_elem(carrier)
                 return
             }
             let tag = c_type_tag(elem_type)
@@ -4254,7 +4266,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                 expr_result_str = adapter_var
                 expr_result_type = CT_ITERATOR
                 expr_iter_next_fn = "blink_TakeIterator_{carrier}_next"
-                expr_list_elem_type = compound_tag_ct(carrier)
+                publish_carrier_elem(carrier)
                 return
             }
             let tag = c_type_tag(elem_type)
@@ -4286,7 +4298,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                 expr_result_str = adapter_var
                 expr_result_type = CT_ITERATOR
                 expr_iter_next_fn = "blink_SkipIterator_{carrier}_next"
-                expr_list_elem_type = compound_tag_ct(carrier)
+                publish_carrier_elem(carrier)
                 return
             }
             let tag = c_type_tag(elem_type)
@@ -4328,7 +4340,7 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                 expr_result_str = adapter_var
                 expr_result_type = CT_ITERATOR
                 expr_iter_next_fn = "blink_ChainIterator_{carrier}_next"
-                expr_list_elem_type = compound_tag_ct(carrier)
+                publish_carrier_elem(carrier)
                 return
             }
             ensure_chain_iter(elem_type)
@@ -4484,14 +4496,19 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
                 // z9gkt3: a direct List source has full element metadata to copy; a
                 // var-iterator source (a chained lazy adapter — filter().collect())
                 // carries only the carrier tag on its sname, so re-stamp from the tag.
-                if obj_type == CT_LIST {
+                // 1n9fhg: copy_list_compound_elem only has arms for the compound element kinds,
+                // so a NAMED BY-VALUE element (struct/tuple/data enum) reaching it from a direct
+                // List source fell through its no_arm tail and left the result element erased.
+                // Its tag is the whole answer for those, so take the tag route regardless of the
+                // source shape.
+                if obj_type == CT_LIST && is_compound_tag(carrier) != 0 {
                     copy_list_compound_elem(obj_str, result_list)
                 } else {
                     set_list_elem_compound_from_tag(result_list, carrier)
                 }
                 expr_result_str = result_list
                 expr_result_type = CT_LIST
-                expr_list_elem_type = compound_tag_ct(carrier)
+                publish_carrier_elem(carrier)
                 return
             }
             set_list_elem_type(result_list, elem_type)
@@ -5423,7 +5440,20 @@ pub fn emit_method_call(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Sco
             return
         }
     }
-    let derive_enum = get_var_enum(obj_str)
+    let mut derive_enum = get_var_enum(obj_str)
+    if derive_enum == "" {
+        // 1n9fhg: a plain (payload-less) enum value is an ordinal, so it can reach a method call
+        // with no name anywhere in the flat universe — `l.get(0).unwrap()` over a list of them is
+        // VALUE-boxed on purpose (set_list_elem_struct), and the unwrap's temp is an int64_t. The
+        // identity is still in typecheck's tid for the receiver, which is the one authority the
+        // boxing cannot erase; reading it here beats threading an option-inner-enum-name channel
+        // through get/unwrap. A data enum keeps arriving named, and declines the same as before.
+        let recv_tid = tc_lookup_node_tid(node_obj(node))
+        let recv_enum = tc_tid_struct(recv_tid)
+        if recv_enum != "" && is_enum_type(recv_enum) != 0 && is_data_enum(recv_enum) == 0 {
+            derive_enum = recv_enum
+        }
+    }
     if derive_enum != "" && has_derive_method(derive_enum, method) != 0 {
         if method == "to_json" {
             expr_result_str = "{derive_method_cname(derive_enum, "to_json")}({obj_str})"

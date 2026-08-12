@@ -62,7 +62,7 @@ import codegen_types.{
     reg_sf_entry, ensure_struct_derive_kops_key, register_var_compound_from_tag, register_var_compound_inner_from_str, resolve_effect_field, resolve_effect_is_ue, resolve_effect_vtable,
     resolve_import_alias, resolve_option_inner_from_ann, resolve_ret_type_from_ann,
     resolve_self_type, resolve_tuple_ann, resolve_variant, result_c_type,
-    result_c_type_mixed, tuple_struct_arity, tuple_elem_name, set_list_elem_struct, set_list_elem_type,
+    result_c_type_mixed, tuple_struct_arity, tuple_elem_name, set_list_elem_struct, set_list_elem_named_boxed, set_list_elem_type,
     set_list_nested_elem_struct, set_list_nested_elem_type, set_list_elem_map_types, set_list_elem_option, set_list_elem_result, get_list_elem_option_inner, get_list_elem_option_inner_struct, get_list_elem_result_ok, get_list_elem_result_err, get_list_elem_result_ok_struct, get_list_elem_result_err_struct, get_list_elem_option_inner_tp, get_list_elem_result_ok_tp, get_list_elem_result_err_tp, tp_carrier_tag, set_var_option_inner_tp, set_map_types, set_map_key_struct, key_struct_sname_from_ann, set_map_value_list_elem, set_map_value_struct, copy_map_value_meta, set_set_elem_type, set_set_elem_struct,
     find_type_def_node, set_var_ffi_ptr_struct, set_var_ffi_ptr_array, set_var_ffi_ptr_extra,
     ffi_alloc_n_pending, ffi_offset_pending_struct,
@@ -84,6 +84,8 @@ import codegen_types.{
     split_result_compound, CompoundSplit, map_struct_scalar_kv, MapKvCt, typedef_tag_or_empty, tp_child1_kind, tp_child1_sname, tp_child2_kind, tp_child2_sname,
     tp_get_kind, tp_get_child1, tp_get_child2, tp_get_sname, type_from_name, type_from_name_tag,
     type_name_from_ct, type_where_preds, cg_where_self_var, is_compound_tag, var_enums,
+    list_named_elem_of, named_elem_of_elem_tid, ListNamedElem,
+    get_var_iter_carrier,
     CaptureEntry, ClosureCapInfo,
     closure_captures, closure_cap_infos, lookup_closure_lit_cap_idx,
     closure_sig_hash
@@ -3938,6 +3940,15 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
         expr_list_elem_type = -1
         expr_list_elem_struct = ""
     }
+    // Last, because it has to win over the ladder above: a key list's named element is
+    // pointer-boxed, and every stamp above routes through set_list_elem_struct, whose plain-enum
+    // reject is a fact about push-built lists only. See map_keys_boxed_elem.
+    if val_type == CT_LIST {
+        let keys_elem = map_keys_boxed_elem(val_node)
+        if keys_elem != "" {
+            set_list_elem_named_boxed(name, keys_elem)
+        }
+    }
     if val_type == CT_ITERATOR {
         set_var_alias(name, val_str)
         let iter_inner = get_var_iterator_inner(val_str)
@@ -4185,6 +4196,25 @@ fn map_pair_value_read_expr(value_expr: Str, val_ct: Int, val_struct: Str) -> St
     "(int64_t)(intptr_t){value_expr}"
 }
 
+// 1n9fhg: `m.keys()` does not hand back a push-built list. It hands back the map's KEYS, and a
+// user struct or enum key is stored kops-POINTER-boxed (the emitted kops sets inline_key = 0), so
+// blink_map_keys pushes the pointer as-is and those slots mean "deref this" — even for a plain
+// (payload-less) enum, whose push-built list slots hold a bare ordinal instead. One producer, two
+// boxings for the same element type, which is the one distinction the flat pair cannot carry: so
+// the producer has to be recognized where it is still visible, at the node.
+//
+// The receiver's tid saying Map is the gate a user method named `keys` cannot forge. Answers the
+// key type's name, or "" when the slots are NOT pointer-boxed after all — a Str, an Int or a sized
+// int is inline_key = 1 and the runtime packs it straight into the list slot (see blink_map_keys),
+// which is what a nameless element already means here.
+fn map_keys_boxed_elem(n: Int) -> Str {
+    if node_kind(n) != NodeKind.MethodCall { return "" }
+    if node_method(n) != "keys" { return "" }
+    if tc_tid_kind(tc_tid_resolved(tc_lookup_node_tid(node_obj(n)))) != TyKind.Map { return "" }
+    let ktid = tc_tid_subst_mono(tc_tid_resolved(tc_tid_iter_elem(tc_tid_resolved(tc_lookup_node_tid(n)))), cg_mono_tparams_sl, cg_mono_arg_tids)
+    named_elem_of_elem_tid(ktid).name
+}
+
 // Stage 2's dual-write for a for-in loop variable, and the tap that measures it (br 7xgbh6).
 // Called from every arm of emit_for_in once the loop variable's ScopeVar exists and before the
 // body is emitted, i.e. with exactly the type the body will read.
@@ -4343,10 +4373,21 @@ fn emit_for_in(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.
             emit_line("blink_list* {lst} = blink_set_to_list({iter_str});")
             set_var(lst, CT_LIST, 0)
             set_list_elem_type(lst, set_elem_ct)
+            let mut set_elem_ct_eff = set_elem_ct
             if set_elem_struct != "" {
-                set_list_elem_struct(lst, set_elem_struct)
+                // 1n9fhg: a set KEY is pointer-boxed whatever it is — blink_alloc + kops — so the
+                // key list is one of the lists whose named element genuinely means "deref this",
+                // including for a plain (payload-less) enum, which in a push-built list would be
+                // a bare ordinal. Record that directly rather than through set_list_elem_struct,
+                // whose value-boxing reject is a fact about push-built lists only.
+                if is_enum_type(set_elem_struct) != 0 && is_data_enum(set_elem_struct) == 0 {
+                    set_list_elem_named_boxed(lst, set_elem_struct)
+                    set_elem_ct_eff = CT_VOID
+                } else {
+                    set_list_elem_struct(lst, set_elem_struct)
+                }
             }
-            expr_list_elem_type = set_elem_ct
+            expr_list_elem_type = set_elem_ct_eff
             expr_list_elem_struct = set_elem_struct
             iter_str = lst
             iter_type = CT_LIST
@@ -4475,7 +4516,44 @@ fn emit_for_in(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.
             let mut elem_type = expr_list_elem_type
             if elem_type == -1 { elem_type = get_list_elem_type(iter_str) }
             if elem_type == -1 { elem_type = CT_INT }
-            let elem_struct = get_list_elem_struct(iter_str)
+            let mut elem_struct = get_list_elem_struct(iter_str)
+            // `for k in m.keys()` iterates the producer directly, with no ScopeVar in between; the
+            // let-bound spelling is stamped in emit_let_binding. Both read the same predicate.
+            let keys_elem = map_keys_boxed_elem(iter_node)
+            if keys_elem != "" {
+                elem_type = CT_VOID
+                elem_struct = keys_elem
+            }
+            // 1n9fhg: a PLAIN (payload-less) enum element is the one named element kind the flat
+            // pair cannot spell honestly. A list slot holds it VALUE-boxed, exactly like an Int
+            // (`blink_list_push(l, (void*)(intptr_t)blink_Col_Red)`), because the variant
+            // expression evaluates as CT_INT with no struct name. set_list_elem_struct now
+            // records that boxing (CT_INT, no name) rather than the pointer-boxing a name
+            // asserts, so the flat pair alone can no longer separate this element from an Int —
+            // and the loop variable's ENUM IDENTITY still has to reach method dispatch, since
+            // `.to_str()` on a str-backed variant reads it off var_enums. Only the tid holds
+            // both facts at once, so ask it, and register the name without moving the storage.
+            let mut plain_enum_name = ""
+            // `elem_struct == ""` is the whole gate on the value-boxing repair: after the
+            // set_list_elem_struct reject, a plain enum can only carry a name here when a caller
+            // recorded genuine pointer boxing on purpose (set_list_elem_named_boxed, for a set's
+            // key list), and that record has to win.
+            if elem_struct == "" && (elem_type == CT_INT || elem_type == CT_VOID || elem_type == CT_ENUM || elem_type == CT_STRUCT) {
+                let mut ne = list_named_elem_of(iter_str)
+                if ne.name == "" {
+                    // A struct FIELD (`for c in h.cols`) is not a variable, so iter_str is a C
+                    // expression with no ScopeVar behind it and the name probe answers nothing.
+                    // A Set arrives here as a temp list too (blink_set_to_list, above), and that
+                    // temp has no tid either. The iterable's element tid reaches both.
+                    let etid = tc_tid_subst_mono(tc_tid_resolved(tc_tid_iter_elem(tc_tid_resolved(tc_lookup_node_tid(iter_node)))), cg_mono_tparams_sl, cg_mono_arg_tids)
+                    ne = named_elem_of_elem_tid(etid)
+                }
+                if ne.plain_enum {
+                    elem_type = CT_INT
+                    elem_struct = ""
+                    plain_enum_name = ne.name
+                }
+            }
             // gemr3z: a COMPOUND element (`for item in (List[Option[T]])`) is boxed by
             // POINTER on the list. Iterate via the generic pointer iterator
             // (blink_list_into_iter_int, values = intptr_t) and materialize each `item`
@@ -4681,6 +4759,12 @@ fn emit_for_in(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.
                 emit_line("{c_type_str(elem_type)} {c_var_name} = {next_var}.value;")
                 push_scope()
                 set_var(var_name, elem_type, 0)
+                // 1n9fhg: the loop var of a plain-enum element is an ordinal, but it still needs
+                // its enum recorded so a body's BARE match variant (`Red =>`) resolves — the
+                // struct branch above does the same for a data enum.
+                if plain_enum_name != "" {
+                    var_enums.push(VarEnumEntry { name: var_name, enum_type: plain_enum_name })
+                }
                 if elem_type == CT_LIST {
                     let nested_et = get_list_nested_elem_type(iter_str)
                     if nested_et != -1 {
@@ -4721,9 +4805,26 @@ fn emit_for_in(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.
             cg_indent = cg_indent + 1
             emit_line("{opt_type} {next_var} = (({opt_type} (*)(void*)){next_fn})(&{iter_str});")
             emit_line("if ({next_var}.tag == 0) break;")
-            emit_line("{c_type_str(elem_type)} {c_var_name} = {next_var}.value;")
-            push_scope()
-            set_var(var_name, elem_type, 0)
+            // 1n9fhg: a lazy adapter over a List of a NAMED BY-VALUE element (`for p in
+            // l.filter(..)`) yields the pointer-boxed element through a CT_INT iterator and
+            // carries the element's identity on the iterator var's carrier tag. Without the
+            // deref the loop var binds as int64_t and the body's `p.x` reaches cc as a member
+            // read on a non-struct. Scoped to a named tag: a COMPOUND carrier here is rejected
+            // earlier by typecheck (`.unwrap()` on the loop var reports unresolved), so wiring
+            // it would be unexercised surface.
+            let iter_carrier = get_var_iter_carrier(iter_str)
+            let named_carrier = if iter_carrier != "" && is_compound_tag(iter_carrier) == 0 { iter_carrier } else { "" }
+            if named_carrier != "" {
+                let carrier_c = c_type_from_tag(named_carrier)
+                emit_line("{carrier_c} {c_var_name} = *({carrier_c}*)(intptr_t){next_var}.value;")
+                push_scope()
+                set_var(var_name, CT_VOID, 0)
+                set_var_struct(var_name, named_carrier)
+            } else {
+                emit_line("{c_type_str(elem_type)} {c_var_name} = {next_var}.value;")
+                push_scope()
+                set_var(var_name, elem_type, 0)
+            }
             forin_measure_var(var_name, iter_node, node)
             emit_block(node_body(node))
             pop_scope()

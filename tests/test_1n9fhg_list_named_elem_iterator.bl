@@ -1,0 +1,329 @@
+// br 1n9fhg: a List whose element is a NAMED BY-VALUE type — a struct, a tuple (a struct here) or
+// a plain enum — loses that name in the iterator family, and every iterator-driven List method
+// emits `blink_ListIterator_void` / `blink_Option_void` and escapes to cc with no Blink span.
+//
+// THE SEAM is one function. `iter_from_source` (codegen_expr.bl:195) is the single entry every
+// adapter and consumer below goes through, and it has exactly one non-scalar branch:
+// `list_compound_carrier_tag` answers a pointer-boxed carrier tag for a CT_OPTION or CT_RESULT
+// element and "" for everything else. A "" carrier means "key the iterator on the element's CT",
+// so a struct/tuple/enum element — recorded as (CT_VOID, sname), or (CT_VOID, "") for a plain
+// enum — keys it on `c_type_tag(CT_VOID)` = "void".
+//
+// MEASURED, 4 element kinds x 17 methods, one program per cell, every cell RUN:
+//
+//     struct           14/17 broken     for-in FINE
+//     tuple (Int, Str) 14/17 broken     for-in FINE
+//     plain enum       17/17 broken     for-in BROKEN TOO
+//     Int (control)     0/17
+//
+// The enum row is worse for a reason worth keeping. STORAGE for a named element is not uniform: a
+// struct, a tuple and a DATA enum are pointer-boxed in a list slot, but a PLAIN (payload-less)
+// enum is VALUE-boxed like an Int, because the variant expression is an ordinal with nothing
+// behind it. The flat pair spells that element two different, both-wrong, ways — an annotated
+// `List[Col1n]` as (CT_VOID, "") (no name, so it misses emit_for_in's `elem_struct != ""` branch
+// that carries the struct and tuple rows) and an unannotated `let l = f()` as (CT_STRUCT,
+// "Col1n") from the call's return channel, which asserts pointer boxing and SEGFAULTS on the
+// deref. A name in that slot means pointer-boxed, so the fix refuses it there (the only place a
+// name enters) and lets the ordinal travel as one.
+//
+// That splits STORAGE from IDENTITY, and both rows below hold the split: storage comes from the
+// flat pair, and the enum's name — which `.to_str()` on a str-backed variant dispatches off —
+// comes from the tid, at the loop variable and at any nameless receiver.
+//
+// And "value-boxed" is a fact about the lists the compiler BUILDS, not about every `blink_list*`.
+// A set's elements and a map's keys are kops-boxed — the emitted kops sets `inline_key = 0` for a
+// user struct or enum, so blink_set_to_list and blink_map_keys hand back POINTERS, a plain enum
+// included. The same element type therefore boxes two ways depending on which producer made the
+// list, so the two key-list producers record the pointer boxing explicitly and the rows below pin
+// both directions against each other.
+//
+// NOT IN THIS FILE, and both already loud: `.enumerate()` and `.zip()` over a struct or enum
+// element report a real diagnostic (br msm1k3, "not yet supported"). A loud decline is a
+// different state from an unspellable type, and it is not this ticket's to change.
+//
+// Every row RUNS and asserts a value. `task regen` proves self-host, not codegen, and the whole
+// point of this class is that it never reaches a Blink diagnostic.
+
+import std.io
+
+type Pt1n { x: Int }
+type Col1n { Red, Green }
+
+fn assert_eq_str(got: Str, want: Str, label: Str) {
+    if got != want { io.println("FAIL: {label} — got '{got}', want '{want}'") }
+    assert(got == want)
+}
+
+// ── A struct element ───────────────────────────────────────────────────────────
+
+test "a List[Pt1n] drives count, any, all, fold, for_each and find" {
+    let l: List[Pt1n] = [Pt1n { x: 9 }, Pt1n { x: 2 }]
+    assert_eq(l.count(), 2)
+    assert(l.any(fn(p: Pt1n) -> Bool { p.x > 5 }))
+    assert(l.all(fn(p: Pt1n) -> Bool { p.x > 1 }))
+    assert_eq(l.fold(0, fn(a: Int, p: Pt1n) -> Int { a + p.x }), 11)
+    let mut n = 0
+    l.for_each(fn(p: Pt1n) { n = n + p.x })
+    assert_eq(n, 11)
+    assert_eq(l.find(fn(p: Pt1n) -> Bool { p.x > 5 }).unwrap().x, 9)
+}
+
+test "a List[Pt1n] collects, takes, skips and chains" {
+    let l: List[Pt1n] = [Pt1n { x: 9 }, Pt1n { x: 2 }]
+    assert_eq(l.collect().get(0).unwrap().x, 9)
+    assert_eq(l.take(1).collect().len(), 1)
+    assert_eq(l.take(1).collect().get(0).unwrap().x, 9)
+    assert_eq(l.skip(1).collect().get(0).unwrap().x, 2)
+    assert_eq(l.chain(l).collect().len(), 4)
+}
+
+test "a List[Pt1n] survives the filter, map and flat_map adapters" {
+    let l: List[Pt1n] = [Pt1n { x: 9 }, Pt1n { x: 2 }]
+    let kept = l.filter(fn(p: Pt1n) -> Bool { p.x > 5 }).collect()
+    assert_eq(kept.len(), 1)
+    assert_eq(kept.get(0).unwrap().x, 9)
+    assert_eq(l.map(fn(p: Pt1n) -> Int { p.x }).collect().get(0).unwrap(), 9)
+    assert_eq(l.flat_map(fn(p: Pt1n) -> List[Int] { [p.x] }).collect().len(), 2)
+    let mut n = 0
+    for p in l.filter(fn(p: Pt1n) -> Bool { p.x > 5 }) { n = n + p.x }
+    assert_eq(n, 9)
+}
+
+fn build_pts() -> List[Pt1n] {
+    let ls: List[Pt1n] = []
+    ls.push(Pt1n { x: 7 })
+    ls
+}
+
+test "an unannotated let from a List[Pt1n]-returning call behaves the same" {
+    // The ticket's original MVCE. Its for-in half passes today (85j3j8 taught the binding to
+    // recover (CT_VOID, "Pt1n") from the tid, and emit_for_in reads that name); its
+    // `.filter(..).collect()` half is the half that still reached cc.
+    let g = build_pts()
+    let mut t = 0
+    for p in g { t = t + p.x }
+    assert_eq(t, 7)
+    assert_eq(g.filter(fn(p: Pt1n) -> Bool { p.x > 0 }).collect().len(), 1)
+    assert_eq(g.collect().get(0).unwrap().x, 7)
+}
+
+// ── A tuple element — a struct in this representation, and the same cell ────────
+
+test "a List[(Int, Str)] element keeps its fields through the iterator family" {
+    let l: List[(Int, Str)] = [(1, "a"), (2, "b")]
+    assert_eq(l.count(), 2)
+    assert_eq(l.fold(0, fn(a: Int, t: (Int, Str)) -> Int { a + t._0 }), 3)
+    assert(l.any(fn(t: (Int, Str)) -> Bool { t._1 == "b" }))
+    assert_eq_str(l.collect().get(1).unwrap()._1, "b", "collect keeps the tuple's Str field")
+    assert_eq_str(l.find(fn(t: (Int, Str)) -> Bool { t._0 == 2 }).unwrap()._1, "b", "find keeps it")
+    assert_eq_str(l.take(1).collect().get(0).unwrap()._1, "a", "take keeps it")
+    assert_eq_str(l.skip(1).collect().get(0).unwrap()._1, "b", "skip keeps it")
+    let kept = l.filter(fn(t: (Int, Str)) -> Bool { t._0 > 1 }).collect()
+    assert_eq_str(kept.get(0).unwrap()._1, "b", "filter keeps it")
+    assert_eq(l.map(fn(t: (Int, Str)) -> Int { t._0 }).collect().get(0).unwrap(), 1)
+}
+
+// ── A plain-enum element — the kind the flat pair cannot name at all ────────────
+
+test "a List[Col1n] plain-enum element is spellable by for-in" {
+    // The row that separates the enum cell from the struct cell: (CT_VOID, "") carries no name,
+    // so even emit_for_in's own struct branch cannot help it.
+    let l: List[Col1n] = [Col1n.Red, Col1n.Green]
+    let mut reds = 0
+    for c in l { if c == Col1n.Red { reds = reds + 1 } }
+    assert_eq(reds, 1)
+}
+
+test "a List[Col1n] drives the iterator family" {
+    let l: List[Col1n] = [Col1n.Red, Col1n.Green]
+    assert_eq(l.count(), 2)
+    assert(l.any(fn(c: Col1n) -> Bool { c == Col1n.Green }))
+    assert_eq(l.fold(0, fn(a: Int, c: Col1n) -> Int { if c == Col1n.Red { a + 1 } else { a } }), 1)
+    assert(l.collect().get(0).unwrap() == Col1n.Red)
+    assert(l.find(fn(c: Col1n) -> Bool { c == Col1n.Green }).unwrap() == Col1n.Green)
+    assert(l.take(1).collect().get(0).unwrap() == Col1n.Red)
+    assert(l.skip(1).collect().get(0).unwrap() == Col1n.Green)
+    assert_eq(l.chain(l).collect().len(), 4)
+    let kept = l.filter(fn(c: Col1n) -> Bool { c == Col1n.Green }).collect()
+    assert_eq(kept.len(), 1)
+    assert(kept.get(0).unwrap() == Col1n.Green)
+    let mut n = 0
+    l.for_each(fn(c: Col1n) { n = n + 1 })
+    assert_eq(n, 2)
+}
+
+fn build_cols() -> List[Col1n] {
+    let ls: List[Col1n] = []
+    ls.push(Col1n.Red)
+    ls.push(Col1n.Green)
+    ls
+}
+
+test "an unannotated let from a List[Col1n]-returning call is value-boxed everywhere" {
+    // The row that SEGFAULTED. A plain-enum element is recorded two different, both-wrong, ways:
+    // an annotated `List[Col1n]` as (CT_VOID, "") — no name, misses every branch — and this
+    // unannotated binding as (CT_STRUCT, "Col1n") from the call's return channel, which asserts
+    // POINTER boxing for a slot that holds an ordinal. `.get()` and for-in both read the name and
+    // deref it: `*(blink_Col1n*)(intptr_t)value`. push and set were always value-boxed, so the
+    // two halves of the same list disagreed. The fix records the boxing that happens.
+    let l = build_cols()
+    assert_eq(l.len(), 2)
+    assert(l.get(0).unwrap() == Col1n.Red)
+    assert(l.get(1).unwrap() == Col1n.Green)
+    let mut reds = 0
+    for c in l { if c == Col1n.Red { reds = reds + 1 } }
+    assert_eq(reds, 1)
+    let m = build_cols()
+    m.push(Col1n.Red)
+    assert(m.get(2).unwrap() == Col1n.Red)
+    m.set(0, Col1n.Green)
+    assert(m.get(0).unwrap() == Col1n.Green)
+}
+
+type Lv1n { Low = "low", High = "high" }
+
+fn build_lvs() -> List[Lv1n] {
+    let ls: List[Lv1n] = []
+    ls.push(Lv1n.Low)
+    ls.push(Lv1n.High)
+    ls
+}
+
+test "a str-backed enum element keeps its identity through get, unwrap and for-in" {
+    // Dropping the name from the flat pair is the correct call for STORAGE and the wrong one for
+    // IDENTITY: `.to_str()` on a str-backed variant dispatches off the receiver's enum name, and
+    // an ordinal carries none. So identity comes from the tid at both places it is needed — the
+    // loop variable (var_enums, in emit_for_in) and any nameless receiver (the derive-enum
+    // dispatch). Without either, this row is a hard UnresolvedMethod rather than a wrong answer.
+    let l = build_lvs()
+    assert_eq_str(l.get(0).unwrap().to_str(), "low", "get + unwrap keeps the enum")
+    let kept = l.filter(fn(v: Lv1n) -> Bool { v == Lv1n.High }).collect()
+    assert_eq(kept.len(), 1)
+    assert_eq_str(kept.get(0).unwrap().to_str(), "high", "filter + collect keeps it")
+    let mut seen = ""
+    for v in l { seen = seen.concat(v.to_str()) }
+    assert_eq_str(seen, "lowhigh", "the loop variable keeps it")
+}
+
+type Holder1n { cols: List[Col1n], pts: List[Pt1n] }
+
+test "a plain-enum list held in a struct FIELD iterates and reads back" {
+    // A field read is not a variable: there is no ScopeVar to look an element up by, so the
+    // name-keyed probe answers nothing and the flat pair alone leaves the element `void` —
+    // `blink_ListIterator_void_next`, which does not exist, so this row was a C compile error
+    // rather than a wrong answer. The iterable's own tid reaches a field, a call result and an
+    // index alike, which is why the fallback is keyed on the node, not on a second name channel.
+    let h = Holder1n { cols: [], pts: [] }
+    h.cols.push(Col1n.Red)
+    h.cols.push(Col1n.Green)
+    h.cols.push(Col1n.Red)
+    h.pts.push(Pt1n { x: 7 })
+    let mut reds = 0
+    for c in h.cols { if c == Col1n.Red { reds = reds + 1 } }
+    assert_eq(reds, 2)
+    assert(h.cols.get(1).unwrap() == Col1n.Green)
+    // The struct-element twin shares the fallback and must stay pointer-boxed.
+    let mut xs = 0
+    for p in h.pts { xs = xs + p.x }
+    assert_eq(xs, 7)
+}
+
+// ── The other direction: a key list, whose named element IS pointer-boxed ───────
+
+@derive(Hash, Eq)
+type HCol1n { Red, Green }
+
+@derive(Hash, Eq)
+type HLv1n { Low = "low", High = "high" }
+
+@derive(Hash, Eq)
+type HPt1n { x: Int }
+
+test "a Set of plain enums iterates as the pointers the set actually stores" {
+    // for-in over a Set lowers through blink_set_to_list, and a set element is stored
+    // blink_alloc'd behind a kops pointer whatever it is. Reading these slots as ordinals — the
+    // repair the push-built list needs — compares pointer values against variant ordinals, which
+    // is silent and wrong: this row read 0 Reds out of 1 before the two boxings were separated.
+    let s: Set[HCol1n] = Set()
+    s.insert(HCol1n.Red)
+    s.insert(HCol1n.Green)
+    s.insert(HCol1n.Red)
+    assert_eq(s.len(), 2)
+    assert(s.contains(HCol1n.Red))
+    let mut reds = 0
+    let mut total = 0
+    for c in s {
+        total = total + 1
+        if c == HCol1n.Red { reds = reds + 1 }
+    }
+    assert_eq(total, 2)
+    assert_eq(reds, 1)
+}
+
+test "a Set of str-backed enums keeps its identity through the loop variable" {
+    let s: Set[HLv1n] = Set()
+    s.insert(HLv1n.Low)
+    s.insert(HLv1n.High)
+    let mut n = 0
+    for v in s { n = n + v.to_str().len() }
+    assert_eq(n, 7)
+}
+
+test "map keys of a named type read back as keys, iterated directly and let-bound" {
+    // A plain-enum key list is the shape where the two boxings collide head-on: the same
+    // `List[HLv1n]` type is value-boxed when built by push and pointer-boxed when built by
+    // blink_map_keys, so the producer — not the element type — decides. The struct-key row is the
+    // control that the pointer side was ALWAYS the intent: it rendered as the `<value>`
+    // placeholder and reached cc as `void k` before the producer was recognized.
+    let ml: Map[HLv1n, Int] = Map()
+    ml.insert(HLv1n.High, 1)
+    ml.insert(HLv1n.Low, 2)
+    let mut direct = 0
+    for k in ml.keys() { direct = direct + k.to_str().len() }
+    assert_eq(direct, 7)
+    let ks = ml.keys()
+    assert_eq(ks.len(), 2)
+    let mut bound = 0
+    for k in ks { bound = bound + k.to_str().len() }
+    assert_eq(bound, 7)
+
+    let mp: Map[HPt1n, Int] = Map()
+    mp.insert(HPt1n { x: 5 }, 1)
+    let mut xs = 0
+    for k in mp.keys() { xs = xs + k.x }
+    assert_eq(xs, 5)
+
+    // A map VALUE is not kops-boxed — `blink_map_set(m, k, (void*)(intptr_t)ordinal)` — so the
+    // values list stays on the value-boxed side and must not follow the keys.
+    let mv: Map[Str, HLv1n] = Map()
+    mv.insert("a", HLv1n.Low)
+    let mut vs = 0
+    for v in mv.values() { vs = vs + v.to_str().len() }
+    assert_eq(vs, 3)
+}
+
+// ── Controls — the element kinds that already worked must not change ────────────
+
+test "Int, Str, List and Option elements are unaffected" {
+    // Four different routes through iter_from_source: Int/Str key the iterator on their own CT,
+    // a List element keys on CT_LIST (a pointer type, so the outer read works), and an Option
+    // element is the pointer-boxed carrier path this ticket's fix generalizes. Each is here so a
+    // named-element carrier that over-claims breaks a row instead of a user's program.
+    let li: List[Int] = [1, 2]
+    assert_eq(li.collect().get(0).unwrap(), 1)
+    assert_eq(li.fold(0, fn(a: Int, v: Int) -> Int { a + v }), 3)
+    assert_eq(li.filter(fn(v: Int) -> Bool { v > 1 }).collect().len(), 1)
+
+    let ls: List[Str] = ["a", "b"]
+    assert_eq_str(ls.collect().get(1).unwrap(), "b", "a Str element still collects")
+    assert_eq(ls.count(), 2)
+
+    let ll: List[List[Str]] = [["a", "b"], ["c"]]
+    assert_eq(ll.count(), 2)
+    assert_eq(ll.fold(0, fn(a: Int, v: List[Str]) -> Int { a + v.len() }), 3)
+
+    let lo: List[Option[Int]] = [Some(1), None]
+    assert_eq(lo.count(), 2)
+    assert_eq(lo.collect().get(0).unwrap().unwrap(), 1)
+    assert_eq(lo.filter(fn(o: Option[Int]) -> Bool { o.is_some() }).collect().len(), 1)
+}

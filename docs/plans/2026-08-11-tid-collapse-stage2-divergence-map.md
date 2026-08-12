@@ -6541,6 +6541,118 @@ asserting a **value** — a compiles-only test passes the two silent rows while 
 integer for a `Str`. Red on the pre-fix compiler (9 compile errors, plus the two silent probes),
 green after; `task ci` exit 0, 680 test files.
 
+### Boxing is a property of the producer, not of the type — br `1n9fhg`
+
+`blink_ListIterator_void` was the visible symptom. The cause is that codegen's flat element pair
+records **one** fact — a CT and a companion name — for a slot whose meaning depends on **who filled
+it**. Measured from emitted C, not inferred:
+
+```
+producer                      struct   tuple    data enum   PLAIN (payload-less) enum
+push / literal list           pointer  pointer  pointer     VALUE  (intptr_t ordinal)
+set element, map KEY          pointer  pointer  pointer     pointer (kops, inline_key = 0)
+map VALUE                     pointer  pointer  pointer     VALUE  (intptr_t ordinal)
+```
+
+A plain enum is an ordinal in a push-built list — `blink_list_push(l, (void*)(intptr_t)blink_Col_Red)`
+— and a **pointer** in a key list, because the emitted kops for a user enum is
+`{ hash, eq, sizeof(blink_Col), 0 }`: `inline_key = 0`, so `blink_set_to_list` and `blink_map_keys`
+push the slot as-is. `blink_map_keys` packs a value into the slot only under
+`k->inline_key && k->key_size <= sizeof(void*)` (`bootstrap/runtime_core.h:856`, `:1192`), which is
+Int / Char / Bool / the sized ints.
+
+So the pair got a stated convention: **`(CT_VOID, name)` means "pointer-boxed — deref this"**, and a
+nameless element means value-boxed. `set_list_elem_struct` (`codegen_types.bl:4069`) now *rejects* a
+plain-enum name and records `CT_INT`, which defends the 45 push-built call sites in one place;
+`set_list_elem_named_boxed` beside it is the deliberate escape hatch for a slot that genuinely holds
+a pointer.
+
+That leaves the enum's **identity** homeless, because an ordinal carries no name and `.to_str()` on a
+str-backed variant dispatches off one. The split is the load-bearing part of this cell:
+
+> **Storage comes from the flat pair. Identity comes from the tid.**
+
+Identity is read at the for-in loop variable (`var_enums`) and at any nameless receiver
+(`codegen_methods.bl:5443`, the derive-enum dispatch — `l.get(0).unwrap().to_str()` reaches a method
+call on an `int64_t` temp with no name anywhere in the flat universe).
+
+Three producers needed the tid, one after another:
+
+1. **The push-built list** — storage from the pair, identity from the tid, as above.
+2. **An iterable that is not a variable** — a struct FIELD (`for c in h.cols`), a call result, an
+   index. Those have no `ScopeVar`, so the name probe has nothing to look up:
+   `named_elem_of_elem_tid(tc_tid_iter_elem(...))` answers from the element's own tid. It takes the
+   **element** tid, not the container's, because a Set normalizes into a temp list
+   (`blink_set_to_list`) that has no tid of its own and whose element the pair erases the same way.
+3. **The key lists, which box the other way.** `for c in s` over a `Set[Col]` compiled cleanly after
+   step 2 and read the pointers as ordinals — `iter_reds = 0` instead of 1. Fixed with
+   `set_list_elem_named_boxed` at the Set producer plus a node predicate, `map_keys_boxed_elem`
+   (`codegen_stmt.bl:4210`), at the two node-visible `m.keys()` producers — the direct `for k in
+   m.keys()` and the let-bound `let ks = m.keys()`. Its gate is the **receiver's tid saying `Map`**,
+   which a user method named `keys` cannot forge.
+
+Step 3 also repaired a defect that predates this cell: a **struct**-keyed `m.keys()` rendered the
+`<value>` placeholder and reached cc as `void k`, because `emit_map_method`'s `keys` arm publishes
+`expr_list_elem_type` and no name at all (`codegen_methods.bl:1714-1990`; `key_sname` is in scope
+there and unused). And it caught a regression of my own making: normalizing the chokepoint in step 1
+had turned a plain-enum `m.keys()` from a loud C error into a **silent wrong answer**, which is not a
+trade this project makes.
+
+> **The census does not move, and that is the correct outcome — not a measurement failure.**
+>
+> Off the unit's own test file the tydiv cell map is identical before and after: **29256 diverge
+> rows, 717 cells** on a 969-file common basis, and ctypediv row-level diverge **23 → 23**. This unit
+> routes *around* the flat pair instead of repairing its fidelity, so `tid=List[Lv1n] flat=List[Int]`
+> stays a diverge cell while the emitted code becomes correct. Those cells clear with `sv_tp` in
+> Stage 4 deletion group 1 — the same conclusion the `v71vxv` residual reached from the other end.
+> The `+19` rows / `+18` cells in the raw before/after diff are entirely the new shapes the unit's own
+> test rows exercise (`HCol1n` / `HLv1n` / `Lv1n`), which is why the comparison has to be read on a
+> file basis that accounts for **content** growth and not only for new files.
+>
+> Both build modes were checked: the unit's rows are identical archive-linked and monolithic, and the
+> only mode difference is the stdlib rows the monolith re-emits into every TU.
+
+Three of the new rows are worth keeping in view because they look like a contradiction:
+
+```
+bucket=diverge site=emit_for_in.var       tid=HCol1n         flat=HCol1n
+bucket=diverge site=emit_let_binding.decl tid=Set[HCol1n]    flat=Set[HCol1n]
+bucket=diverge site=emit_let_binding.decl tid=Map[HLv1n,Int] flat=Map[HLv1n, Int]
+```
+
+The spellings agree and the bucket is still `diverge`. `ty_tp_same_shape` compares **kinds** before
+names, and the flat side files a named enum under a struct-shaped `tp` — an accounting artifact of the
+two representations, not a miscompile.
+
+**What is left is not a missing arm; it is a type with two ABIs — br `k4thkq`.** A key list reached
+through any *other* producer is still wrong, and two of the three forms are silent:
+
+```
+f(m.keys())                     -> total 0, want 7        SILENT
+m.keys().get(0).unwrap()        -> "", want "low"         SILENT
+m.keys().filter(...).len()      -> error[UnresolvedMethod] '.len' on type List[Lv]
+```
+
+A producer-blind consumer cannot be patched per producer, because for a payload-less enum `List[Col]`
+genuinely has two physical representations. The fix is to remove the split: emit the kops for a
+payload-less enum with `inline_key = 1` and `key_size = sizeof(blink_<Enum>)` so the runtime packs
+the ordinal into the slot exactly as it does for an Int, which makes every producer agree and retires
+both `map_keys_boxed_elem` and the plain-enum arm of `set_list_elem_named_boxed`. (Ordinal 0 is a
+valid key, so the empty/tombstone marking has to be read first.) The alternative — threading a
+per-list "pointer-boxed" bit through the 38 `expr_list_elem_struct` publication sites, which carry
+mixed conventions today — was rejected: it is leaky *and* it keeps both ABIs. A **struct** key has no
+split at all, since a push-built `List[Struct]` is pointer-boxed too.
+
+Byproduct, unrelated cause, filed as br `bp9qp1`: an inferred `Map()` with an enum key emits a correct
+key box for the first `insert` and `void _mkey` for every one after it, because the insert arm stores
+the recovered key CT (`set_map_types`) and not the recovered key **name**, and the next call's
+`base_key_sname0` gate reads a name only for `CT_VOID` / `CT_STRUCT`. Annotating the declaration hides
+it. Loud, and it may be retired outright by `k4thkq`.
+
+Tests: `tests/test_1n9fhg_list_named_elem_iterator.bl`, 14 rows, every one asserting a **value** —
+a compiles-only test passes an ordinal read out of a pointer slot. `task regen` at fixed point after
+each of the three sub-steps; `task ci` exit 0, 681 test files, fmt 1580 passed / 0 failed.
+
 ## Appendix — all 428 shape cells
 
 Format: `family | occurrences | tid | flat`.
