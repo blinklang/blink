@@ -4870,6 +4870,84 @@ shape and running it (`feedback_corpus_sweep_is_not_coverage`). Three MVCEs spen
 seams turned one filed ticket into two fixed ones and one language fact (`.unwrap_or` does not
 exist; `??` is the idiom), which is a better return than any of them would have had alone.
 
+### The last class-(i) row, and why it is not shaped like 3b or 3c (br `tm1vbv`)
+
+This is the one census row Stage 3c left open, and closing it empties class-(i) — the class where
+the tid is right and the flat path is wrong. It is also the sub-step where the *kind* of fix
+changed, which is the part worth writing down.
+
+**The axis is the anonymous temporary, not monomorphisation.** The ticket was filed as "a mono'd
+typevar local of an unsigned type declared `int64_t`", because the single census row sits inside a
+mono'd generic fn. That was a coincidence of the corpus. Measured one shape per position, by
+running programs:
+
+| lost — the value arrives through an anonymous temp | kept |
+|---|---|
+| `l.get(0).unwrap()` → `_ounw_N` | an annotated binding |
+| `m.get(k).unwrap()` → `_ounw_N` | a generic fn's return, `ident(big)` |
+| `r.unwrap()` → `_runw_N` | a field read, `b.v` |
+| | an `if` expression's value |
+| | a `match` expression's value |
+| | `o.unwrap()` on an `Option[U64]` local |
+
+No generics are required anywhere — the same axis br `0rmamy`'s enum bucket had. The last "kept"
+row was *lost* until br `9ce8nr` earlier in this stage: naming the Option-unwrap temp from the
+operand's own inner type repaired this declaration downstream as a side effect, which is the shape
+of the whole family — one seam repaired, several positions fixed.
+
+**Spelling vs recorded CT — the distinction this sub-step establishes.** Stages 3b and 3c each
+added a declaration-chain arm: those change the emitted C string and nothing else, so a
+declaration pin is a sufficient test. A sized integer's type governs three further things, and all
+three read the **recorded** `ScopeVar` CT rather than the emitted spelling:
+
+1. whether `/`, `<` and `>` are the signed or the unsigned operator;
+2. whether `+` emits the overflow **trap** the spec promises ("Arithmetic on sized ints
+   (`+`, `-`, `*`, `/`, `%`, unary `-`) traps on overflow") or plain 64-bit arithmetic;
+3. whether `.wrapping_add` and the other modular escape hatches resolve at all.
+
+So the fix feeds the answer into `val_type` **upstream of `set_var`** — it is the tid twin of an
+annotation rule that already sat two lines above it — instead of into the declaration chain below.
+One change, all three symptoms. Had it gone into the declaration chain, a declaration pin would
+have passed while the program still answered `0` for `18446744073709551615 / 2`.
+
+That is not a hypothetical: the first note on this ticket called the row "representational", from
+reading a declaration. Running it says otherwise, three ways — `/ 2` answers **0** and `> 5`
+answers **false** with no diagnostic; an erased `U8` answers **256** for `255 + 1` where the
+annotated form panics `U8 overflow in +`, so a spec safety guarantee is silently withdrawn; and
+`.wrapping_add` fails to resolve with a message that names the correct type
+(`unresolved method '.wrapping_add' on type U8`) while dispatching on the wrong recorded CT. The
+compiler names the right type in the very sentence where it fails to find that type's method.
+
+The read is substituted through the enclosing monomorphisation (`tc_tid_subst_mono`) like every
+other tid consumer in codegen — not because mono is the cause, but because the census row does sit
+inside a mono'd fn, and an unsubstituted read would see the typevar `K` and decline exactly there.
+
+### Census after Stage 3d — class-(i) is empty
+
+On the 874-file common basis (`feedback_corpus_sweep_is_not_coverage`: intersect, do not exclude
+new test roots):
+
+| | after 3c | after 3d |
+|---|---:|---:|
+| `ctype.*` diverge | 23 | **22** |
+| declines (all sites) | 250 | 250 |
+| **total residual** | **273** | **272** |
+
+The single cell removed is exactly `bucket=diverge site=ctype.flat ty=U64 tidc=uint64_t
+emitted=int64_t`, and the whole-corpus `U64` diverge count is now 0. The 22 that remain are
+6 + 5 + 3 + 8 — the six `Void` placeholders (br `hsgsbp`), the five `Bool + Bool` sums in an `int`
+slot at `src/codegen.bl:452`, the three `Void`-vs-`int64_t` with-ptr bindings, and the eight
+generic-fn tuple returns erasing a `Map` by deliberate mono convention. That is the five documented
+conventions with **nothing left over**.
+
+So the residual census is now decisions and one convention, not work: `hsgsbp`, `qzdz2e` (panel),
+`w3v2e6` (blocked on `8vcj2c`), `jr4xf7` and `mwsy85` (`type:spec`). Three rows sit outside the
+common basis, in test files added during this stage, and all three are pre-documented classes (one
+`codegen:452` sum, two declines) — stated rather than quietly excluded.
+
+Stage 3's remaining work is therefore not census-driven: collapse the five spellers into one, and
+replace `copy_list_compound_elem` with a node-tid-sourced copy.
+
 ## Appendix — all 428 shape cells
 
 Format: `family | occurrences | tid | flat`.

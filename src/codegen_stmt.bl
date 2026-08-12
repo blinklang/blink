@@ -3192,14 +3192,6 @@ fn let_binding_tid(node: Int, type_ann: Int, val_node: Int) -> Int {
     -1
 }
 
-// br q3ssqw. The pointee of a `Ptr` local, spelled from the tid — "" when the tid cannot
-// improve on what the flat path already prints.
-//
-// The decline on `void*` is deliberate and keeps this flip minimal: `void*` is exactly what
-// `c_type_str(CT_PTR)` answers, so a tid that knows no more than the flat fields must not take
-// authority away from them. Only a tid that carries a real pointee (`uint8_t*`, `int64_t*`,
-// `blink_Pollfd*`) changes a declaration, which is what makes the emitted-C diff for this
-// sub-step exactly the set of rows the ctypediv sweep named.
 // br 0rmamy. The C typedef of a unit-only enum local, spelled from the tid — "" when the tid
 // cannot improve on what the flat path already prints.
 //
@@ -3221,12 +3213,48 @@ fn enum_c_from_tid(tid: Int) -> Str {
     c
 }
 
+// br q3ssqw. The pointee of a `Ptr` local, spelled from the tid — "" when the tid cannot
+// improve on what the flat path already prints.
+//
+// The decline on `void*` is deliberate and keeps this flip minimal: `void*` is exactly what
+// `c_type_str(CT_PTR)` answers, so a tid that knows no more than the flat fields must not take
+// authority away from them. Only a tid that carries a real pointee (`uint8_t*`, `int64_t*`,
+// `blink_Pollfd*`) changes a declaration, which is what makes the emitted-C diff for this
+// sub-step exactly the set of rows the ctypediv sweep named.
 fn ptr_c_from_tid(tid: Int) -> Str {
     if tid < 0 { return "" }
     if tc_tid_kind(tc_tid_resolved(tid)) != TyKind.Ptr { return "" }
     let c = c_type_from_tid(tid)
     if c == "void*" { return "" }
     c
+}
+
+// br tm1vbv. The CT of a sized-integer local, read from the tid — `-1` when the tid does not name
+// one of the seven.
+//
+// This one returns a CT and not a C string, and that difference is the whole point. The other two
+// helpers here correct a DECLARATION; a sized integer's type governs three more things that read
+// the recorded CT instead of the emitted spelling:
+//
+//   - whether `/`, `<` and `>` are the signed or the unsigned operator;
+//   - whether `+` emits the overflow TRAP the spec promises for sized ints
+//     ("Arithmetic on sized ints traps on overflow") or plain 64-bit arithmetic;
+//   - whether `.wrapping_add` and the other modular escape hatches resolve at all.
+//
+// So the answer is fed back into `val_type` before `set_var`, upstream of every one of them,
+// rather than into the declaration chain below.
+fn sized_int_ct_from_tid(tid: Int) -> Int {
+    if tid < 0 { return -1 }
+    match tc_tid_kind(tc_tid_resolved(tid)) {
+        TyKind.I8 => CT_I8
+        TyKind.I16 => CT_I16
+        TyKind.I32 => CT_I32
+        TyKind.U8 => CT_U8
+        TyKind.U16 => CT_U16
+        TyKind.U32 => CT_U32
+        TyKind.U64 => CT_U64
+        _ => -1
+    }
 }
 
 @allow(UnrestoredMutation, IncompleteStateRestore)
@@ -3301,6 +3329,24 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
     if val_type == CT_INT && (ann_ct == CT_I8 || ann_ct == CT_I16 || ann_ct == CT_I32 || ann_ct == CT_U8 || ann_ct == CT_U16 || ann_ct == CT_U32 || ann_ct == CT_U64) {
         val_type = ann_ct
     }
+    // br tm1vbv — the tid twin of the annotation rule directly above, for the case that rule
+    // cannot reach: a binding with NO annotation. `expr_result_type` is CT_INT whenever the value
+    // arrives through an anonymous carrier temp (`l.get(0).unwrap()`, `m.get(k).unwrap()`,
+    // `r.unwrap()`), because those carriers are spelled with the Int member and nothing stamps the
+    // sized type back onto the temp. The local then loses signedness, the overflow trap and its
+    // modular methods all at once — `255 + 1` on an erased U8 answers 256 where the annotated
+    // form panics, which is a promise of the spec silently withdrawn.
+    //
+    // Substituted through the enclosing monomorphisation first, like every other tid consumer in
+    // codegen: the census row that opened this ticket was a `U64` bound to a typevar `K` inside a
+    // mono'd generic fn, so an unsubstituted read would see `K` and decline exactly there.
+    let binding_tid = let_binding_tid(node, type_ann, val_node)
+    if val_type == CT_INT && type_ann == -1 {
+        let sized_ct = sized_int_ct_from_tid(tc_tid_subst_mono(binding_tid, cg_mono_tparams_sl, cg_mono_arg_tids))
+        if sized_ct != -1 {
+            val_type = sized_ct
+        }
+    }
     let mut name = node_name(node)
     if name == "_destructure" {
         name = fresh_temp("_destr")
@@ -3315,7 +3361,7 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
     // refinements would be measured against an unstamped var, so every read would report
     // Missing and the instrument would measure its own late arrival. The refinements carry
     // `ty` across untouched by design (src/codegen_types.bl ScopeVar.ty).
-    set_var_ty(name, let_binding_tid(node, type_ann, val_node))
+    set_var_ty(name, binding_tid)
     if enum_type != "" {
         var_enums.push(VarEnumEntry { name: name, enum_type: enum_type })
     }

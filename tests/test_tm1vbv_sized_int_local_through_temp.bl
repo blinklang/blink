@@ -1,0 +1,206 @@
+import std.io
+
+// br tm1vbv — an UNANNOTATED `let` whose value arrives through an anonymous C temporary loses
+// its sized-integer type and is recorded as plain `Int`. Adding one type annotation is the whole
+// difference, and three separate guarantees break without it.
+//
+// This is the last class-(i) row of the Stage 3a ctypediv census — the one cell where the tid is
+// right and the flat path is wrong (docs/plans/2026-08-11-tid-collapse-stage2-divergence-map.md).
+// The census counted it as ONE row because the corpus contains almost no sized-integer locals.
+// The count is not the severity: what that single row costs is below.
+//
+// ── 1. SIGNED ARITHMETIC ON AN UNSIGNED VALUE ────────────────────────────────────────
+//
+//     let big: U64 = 18446744073709551615
+//     let l: List[U64] = [big]
+//     let erased = l.get(0).unwrap()
+//     let annotated: U64 = l.get(0).unwrap()
+//     io.println("erased={erased / 2} annotated={annotated / 2}")
+//
+//     erased=0                     annotated=9223372036854775807
+//     erased_gt=false              annotated_gt=true
+//
+// Two wrong answers and no diagnostic of any kind. Signedness is not representational: the bits
+// are identical, but `/`, `<` and `>` MEAN something different for them, and the emitted C drags
+// the signed operator temp along with the erased declaration (`int64_t __iov_l16`, where the
+// annotated row gets `uint64_t __sov_l19`).
+//
+// ── 2. THE OVERFLOW TRAP DISAPPEARS ──────────────────────────────────────────────────
+//
+// sections/ is explicit: "Arithmetic on sized ints (+, -, *, /, %, unary -) TRAPS on overflow."
+// An annotated `U8` honours that; the erased local silently does 64-bit arithmetic:
+//
+//     let m: U8 = 255
+//     let annotated: U8 = m
+//     io.println("sum={annotated + 1}")     // panic: U8 overflow in + (255 + 1)
+//
+//     let erased = l.get(0).unwrap()        // same value, from List[U8]
+//     io.println("sum={erased + 1}")        // sum=256      <- the trap is GONE
+//
+// A safety guarantee the language promises, lost to a missing annotation. This is the row that
+// makes the ticket a miscompile rather than a cosmetic census cell.
+//
+// ── 3. METHOD RESOLUTION FAILS ───────────────────────────────────────────────────────
+//
+//     erased.wrapping_add(1)
+//     error[UnresolvedMethod]: unresolved method '.wrapping_add' on type U8 in 'main'
+//
+// Note what the diagnostic says: **on type U8**. Typecheck knows the type. The message is built
+// from the node, and the dispatch is keyed off the flat CT recorded for the local — so the
+// compiler names the right type in the very sentence where it fails to find that type's method.
+// The annotated form answers 0, the correct 8-bit wrap.
+//
+// ── THE AXIS IS THE ANONYMOUS TEMPORARY, NOT THE PRODUCER ────────────────────────────
+//
+// Measured one shape per position rather than inferred, the same axis br 0rmamy's enum bucket
+// had. Nothing about generics or monomorphisation is required — the first note on this ticket
+// said "a mono'd typevar local of an unsigned type" because the single census row happened to sit
+// inside a generic fn, and that was the coincidence, not the cause:
+//
+//   lost (value passes through an anonymous temp)   kept
+//   --------------------------------------------   ----
+//   l.get(0).unwrap()      -> _ounw_N              an annotated binding
+//   m.get(k).unwrap()      -> _ounw_N              a generic fn's return, ident(big)
+//   r.unwrap()             -> _runw_N              a field read, b.v
+//                                                  an `if` expression's value
+//                                                  a `match` expression's value
+//                                                  o.unwrap() on an Option[U64] local
+//
+// The last "kept" row was LOST until br 9ce8nr: naming the Option-unwrap temp from the operand's
+// own inner type fixed the declaration downstream of it as a side effect. That is the shape of
+// this whole family — one seam repaired, several positions fixed — and it is why the rows below
+// name the producer they go through.
+
+// ── 1. Signedness ────────────────────────────────────────────────────────────────────
+//
+// Division and comparison, not a declaration pin: a pin would have passed while the program
+// still answered 0 (the first note on this ticket drew exactly that wrong conclusion from
+// reading a declaration).
+
+test "a U64 through List.get().unwrap() divides unsigned" {
+    let big: U64 = 18446744073709551615
+    let l: List[U64] = [big]
+    let erased = l.get(0).unwrap()
+    assert_eq(erased / 2, 9223372036854775807)
+    assert(erased > 5)
+}
+
+test "a U64 through Map.get().unwrap() divides unsigned" {
+    let big: U64 = 18446744073709551615
+    let mut m: Map[Str, U64] = Map()
+    m.insert("k", big)
+    let erased = m.get("k").unwrap()
+    assert_eq(erased / 2, 9223372036854775807)
+    assert(erased > 5)
+}
+
+test "a U64 through Result.unwrap() divides unsigned" {
+    let big: U64 = 18446744073709551615
+    let r: Result[U64, Str] = Ok(big)
+    let erased = r.unwrap()
+    assert_eq(erased / 2, 9223372036854775807)
+    assert(erased > 5)
+}
+
+// ── 2. The overflow trap ─────────────────────────────────────────────────────────────
+
+test "the U8 overflow trap survives an anonymous temp" {
+    let m: U8 = 255
+    let l: List[U8] = [m]
+    let erased = l.get(0).unwrap()
+    assert_panics {
+        let sum = erased + 1
+        io.println("no trap: {sum}")
+    }
+}
+
+test "the I8 overflow trap survives an anonymous temp" {
+    let m: I8 = -128
+    let l: List[I8] = [m]
+    let erased = l.get(0).unwrap()
+    assert_panics {
+        let d = erased - 1
+        io.println("no trap: {d}")
+    }
+}
+
+// ── 3. Method resolution ─────────────────────────────────────────────────────────────
+
+test "wrapping_add resolves on a U8 through an anonymous temp and wraps at 8 bits" {
+    let m: U8 = 255
+    let l: List[U8] = [m]
+    let erased = l.get(0).unwrap()
+    assert_eq(erased.wrapping_add(1), 0)
+}
+
+test "wrapping_add resolves on a U32 through an anonymous temp and wraps at 32 bits" {
+    let m: U32 = 4294967295
+    let l: List[U32] = [m]
+    let erased = l.get(0).unwrap()
+    assert_eq(erased.wrapping_add(1), 0)
+}
+
+// ── Pins on the positions that were already right ────────────────────────────────────
+//
+// These hold the ORDERING and the SCOPE of the fix: an arm that governs too eagerly would take
+// bindings away from paths that already spell them correctly, a regression no failing row above
+// would reveal.
+
+fn ident(x: U64) -> U64 {
+    x
+}
+
+type Box {
+    v: U64
+}
+
+test "an annotated binding was never affected" {
+    let big: U64 = 18446744073709551615
+    let l: List[U64] = [big]
+    let annotated: U64 = l.get(0).unwrap()
+    assert_eq(annotated / 2, 9223372036854775807)
+}
+
+test "a generic fn return was never affected" {
+    let big: U64 = 18446744073709551615
+    let v = ident(big)
+    assert_eq(v / 2, 9223372036854775807)
+}
+
+test "a field read was never affected" {
+    let big: U64 = 18446744073709551615
+    let b = Box { v: big }
+    let v = b.v
+    assert_eq(v / 2, 9223372036854775807)
+}
+
+test "an if-expression value was never affected" {
+    let big: U64 = 18446744073709551615
+    let v = if true { big } else { big }
+    assert_eq(v / 2, 9223372036854775807)
+}
+
+test "a match-expression value was never affected" {
+    let big: U64 = 18446744073709551615
+    let v = match 1 {
+        1 => big
+        _ => big
+    }
+    assert_eq(v / 2, 9223372036854775807)
+}
+
+test "Option.unwrap() on an annotated Option local stays right" {
+    let big: U64 = 18446744073709551615
+    let o: Option[U64] = Some(big)
+    let v = o.unwrap()
+    assert_eq(v / 2, 9223372036854775807)
+}
+
+// A plain Int must NOT start behaving like an unsigned value: the fix reads the tid, and a tid
+// that says Int has to keep signed division.
+test "a plain Int local still divides signed" {
+    let l: List[Int] = [-8]
+    let v = l.get(0).unwrap()
+    assert_eq(v / 2, -4)
+    assert(v < 0)
+}
