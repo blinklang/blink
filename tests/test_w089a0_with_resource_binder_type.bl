@@ -1,0 +1,272 @@
+// br w089a0 — a `with <expr> as x { .. }` resource binding carries no type, so every method
+// call on `x` has an untyped receiver.
+//
+// tc_check_body's WithBlock branch binds the resource name with `nr_define(node_name(wh_item2))`
+// (src/typecheck.bl:10727) — the untyped spelling, which pushes a scope entry with
+// TYPE_UNKNOWN. The resource expression is walked on the very next line, so its type IS in
+// hand at the binding site and is thrown away there. TYPE_UNKNOWN unifies with anything, so
+// both halves fail open: the declared type over a call on the binder is never compared, and
+// the arguments to that call are never checked.
+//
+// Same untyped-receiver shape as w13xgb (Ptr), ps5br9 (the ffi scope), jzvxav (self) and
+// nrrs28 (Template) — the fifth instance, and the reason the fix is a binding rather than an
+// arm: nr_define_typed already exists, and `let` has always used it.
+//
+// The declared-type half is not an escape to the C compiler. It is a silent miscompile:
+//
+//     with make() as r { let bad: Str = r.value() ; io.println(bad) }
+//
+// compiled, linked, ran, exit 0, and printed `7` — an Int reinterpreted as a char pointer.
+// The argument half is silent too: `r.scaled("2")` reported nothing at all.
+//
+// Found as the residual of h3q81d's db bucket: after effect-op signatures landed, the 9
+// family-A divergence rows left in tests/test_db_stmt.bl were all
+// `with db.prepare(..).unwrap() as stmt` bindings, whose `stmt.step()` / `stmt.column_text(0)`
+// have an untyped receiver even though db.prepare now resolves to Result[Stmt, DBError].
+// That `.unwrap()` chain is a row here.
+
+import compile_test_helpers
+
+// A Closeable resource with one method per interesting return shape, plus one that takes an
+// argument, so the receiver being typed is observable in both halves.
+fn res_decl() -> Str {
+    let mut s = "import std.traits.\{Closeable}\n"
+    s = s.concat("type Res \{ n: Int }\n")
+    s = s.concat("trait ResOps \{\n")
+    s = s.concat("    fn value(self) -> Int\n")
+    s = s.concat("    fn label(self) -> Str\n")
+    s = s.concat("    fn scaled(self, k: Int) -> Int\n")
+    s = s.concat("    fn names(self) -> List[Str]\n")
+    s = s.concat("}\n")
+    s = s.concat("impl ResOps for Res \{\n")
+    s = s.concat("    fn value(self) -> Int \{ self.n }\n")
+    s = s.concat("    fn label(self) -> Str \{ \"res\" }\n")
+    s = s.concat("    fn scaled(self, k: Int) -> Int \{ self.n * k }\n")
+    s = s.concat("    fn names(self) -> List[Str] \{ [\"a\", \"b\"] }\n")
+    s = s.concat("}\n")
+    s = s.concat("impl Closeable for Res \{ fn close(_self) \{ } }\n")
+    s = s.concat("fn make() -> Res \{ Res \{ n: 7 } }\n")
+    // The db.prepare shape: the resource arrives through a Result chain.
+    s = s.concat("fn try_make() -> Result[Res, Str] \{ Ok(Res \{ n: 7 }) }\n")
+    s
+}
+
+// `body` runs inside `with make() as r { .. }`.
+fn res_program(body: Str) -> Str {
+    let mut s = res_decl()
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    with make() as r \{\n")
+    s = s.concat(body)
+    s = s.concat("    }\n}\n")
+    s
+}
+
+// ── the declared type must be compared against a call on the binder ──────────
+
+test "a declared type is compared against a with-binder method returning Int" {
+    let s = res_program("        let bad: Str = r.value()\n        io.println(bad)\n")
+    compile_test_helpers.expect_compile_error(s, "w089a0_decl_int", "TypeError")
+}
+
+test "a declared type is compared against a with-binder method returning Str" {
+    let s = res_program("        let bad: Int = r.label()\n        io.println(\"\{bad}\")\n")
+    compile_test_helpers.expect_compile_error(s, "w089a0_decl_str", "TypeError")
+}
+
+test "a declared type is compared against a with-binder method returning List[Str]" {
+    let s = res_program("        let bad: Int = r.names()\n        io.println(\"\{bad}\")\n")
+    compile_test_helpers.expect_compile_error(s, "w089a0_decl_list", "TypeError")
+}
+
+// A field read on the binder, not a method call — the receiver is the same binding.
+test "a declared type is compared against a field of the with-binder" {
+    let s = res_program("        let bad: Str = r.n\n        io.println(bad)\n")
+    compile_test_helpers.expect_compile_error(s, "w089a0_decl_field", "TypeError")
+}
+
+// The motivating shape: the resource arrives through `.unwrap()`, exactly as
+// `with db.prepare(..).unwrap() as stmt` does.
+test "a with-binder bound through a Result unwrap chain carries its type" {
+    let mut s = res_decl()
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    with try_make().unwrap() as r \{\n")
+    s = s.concat("        let bad: Str = r.value()\n")
+    s = s.concat("        io.println(bad)\n")
+    s = s.concat("    }\n}\n")
+    compile_test_helpers.expect_compile_error(s, "w089a0_decl_unwrap", "TypeError")
+}
+
+// The second parser spelling of a resource: `with <name> = <expr> as <name>`
+// (src/parser.bl:2150-2170). Same node, so it must bind the same way.
+test "the `name = expr as name` with-resource spelling carries its type" {
+    let mut s = res_decl()
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    with r = make() as r \{\n")
+    s = s.concat("        let bad: Str = r.value()\n")
+    s = s.concat("        io.println(bad)\n")
+    s = s.concat("    }\n}\n")
+    compile_test_helpers.expect_compile_error(s, "w089a0_decl_eq_as", "TypeError")
+}
+
+// Every resource in a comma-separated with-list is its own binding.
+test "the second resource of a with-list carries its type" {
+    let mut s = res_decl()
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    with make() as a, make() as b \{\n")
+    s = s.concat("        let ok: Int = a.value()\n")
+    s = s.concat("        let bad: Str = b.value()\n")
+    s = s.concat("        io.println(\"\{ok}\{bad}\")\n")
+    s = s.concat("    }\n}\n")
+    compile_test_helpers.expect_compile_error(s, "w089a0_decl_second", "TypeError")
+}
+
+// A nested with must not lose the outer binder either.
+test "an outer with-binder keeps its type inside a nested with" {
+    let mut s = res_decl()
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    with make() as outer \{\n")
+    s = s.concat("        with make() as inner \{\n")
+    s = s.concat("            let ok: Int = inner.value()\n")
+    s = s.concat("            let bad: Str = outer.value()\n")
+    s = s.concat("            io.println(\"\{ok}\{bad}\")\n")
+    s = s.concat("        }\n")
+    s = s.concat("    }\n}\n")
+    compile_test_helpers.expect_compile_error(s, "w089a0_decl_nested_outer", "TypeError")
+}
+
+// ── the argument check, which an untyped receiver disabled entirely ───────────
+
+test "an argument to a with-binder method is checked against the signature" {
+    let s = res_program("        let v = r.scaled(\"2\")\n        io.println(\"\{v}\")\n")
+    compile_test_helpers.expect_compile_error(s, "w089a0_arg", "TypeError")
+}
+
+// ── neither half may reach the C compiler ─────────────────────────────────────
+//
+// The rows above pass as soon as SOME TypeError is reported, so on their own they would keep
+// passing while the escape below reopened. NOT "\{..}" in this file's own interpolations —
+// `\{` is an escape producing a literal brace, which would make the haystack the text
+// `{r.out}` and the row vacuous.
+
+test "a mistyped declaration over a with-binder never reaches the C compiler" {
+    let s = res_program("        let bad: Str = r.value()\n        io.println(bad)\n")
+    let r = compile_test_helpers.compile_and_run(s, "w089a0_run_decl_escape")
+    assert(r.exit_code != 0)
+    let all = "{r.out}{r.err_out}"
+    assert(!all.contains("makes pointer from integer"))
+    assert(!all.contains("C compilation failed"))
+    // The silent miscompile this ticket names: it used to print the Int as a Str and exit 0.
+    assert(!all.contains("7"))
+}
+
+test "a wrong argument to a with-binder method never reaches the C compiler" {
+    let s = res_program("        let v = r.scaled(\"2\")\n        io.println(\"\{v}\")\n")
+    let r = compile_test_helpers.compile_and_run(s, "w089a0_run_arg_escape")
+    assert(r.exit_code != 0)
+    let all = "{r.out}{r.err_out}"
+    assert(!all.contains("argument is of type"))
+    assert(!all.contains("C compilation failed"))
+}
+
+// ── the inferred type must carry, not just the compare ────────────────────────
+
+test "an inferred binding off a with-binder carries its type onward" {
+    let mut b = "        let v = r.value()\n"
+    b = b.concat("        let bad: Str = v\n")
+    b = b.concat("        io.println(bad)\n")
+    let s = res_program(b)
+    compile_test_helpers.expect_compile_error(s, "w089a0_infer_chain", "TypeError")
+}
+
+test "an inferred container off a with-binder carries its element type" {
+    let mut b = "        let ns = r.names()\n"
+    b = b.concat("        let bad: Int = ns.get(0).unwrap()\n")
+    b = b.concat("        io.println(\"\{bad}\")\n")
+    let s = res_program(b)
+    compile_test_helpers.expect_compile_error(s, "w089a0_infer_elem", "TypeError")
+}
+
+// ── controls: every correct spelling still compiles AND runs ───────────────────
+
+test "every with-binder shape binds and runs under a matching declared type" {
+    let mut b = "        let n: Int = r.value()\n"
+    b = b.concat("        let l: Str = r.label()\n")
+    b = b.concat("        let k: Int = r.scaled(3)\n")
+    b = b.concat("        let ns: List[Str] = r.names()\n")
+    b = b.concat("        let f: Int = r.n\n")
+    b = b.concat("        io.println(\"\{n}|\{l}|\{k}|\{ns.len()}|\{f}\")\n")
+    let s = res_program(b)
+    compile_test_helpers.expect_no_error(s, "w089a0_ctl_shapes", "TypeError")
+    let r = compile_test_helpers.compile_and_run(s, "w089a0_run_ctl_shapes")
+    assert(r.exit_code == 0)
+    assert(r.out.contains("7|res|21|2|7"))
+}
+
+test "the unwrap-chain and `= .. as` spellings run under matching declared types" {
+    let mut s = res_decl()
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    with try_make().unwrap() as a \{\n")
+    s = s.concat("        let x: Int = a.value()\n")
+    s = s.concat("        io.println(\"\{x}\")\n")
+    s = s.concat("    }\n")
+    s = s.concat("    with b = make() as b \{\n")
+    s = s.concat("        let y: Str = b.label()\n")
+    s = s.concat("        io.println(y)\n")
+    s = s.concat("    }\n}\n")
+    compile_test_helpers.expect_no_error(s, "w089a0_ctl_spellings", "TypeError")
+    let r = compile_test_helpers.compile_and_run(s, "w089a0_run_ctl_spellings")
+    assert(r.exit_code == 0)
+    assert(r.out.contains("7"))
+    assert(r.out.contains("res"))
+}
+
+// The ffi scope is a with-resource whose receiver is deliberately still untyped (ps5br9): it
+// is not a Blink type at all, and its methods are codegen intrinsics. Binding the resource
+// name must not break it — an unresolvable resource type binds nothing, as before.
+test "the ffi scope with-resource is unaffected" {
+    let mut s = "@ffi.struct(header: \"poll.h\", name: \"pollfd\")\n"
+    s = s.concat("pub type Pollfd \{ fd: I32, events: I16, revents: I16 }\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    with ffi.scope() as scope \{\n")
+    s = s.concat("        let p: Ptr[Pollfd] = scope.alloc()\n")
+    s = s.concat("        p.fd.write(9)\n")
+    // NOT `io.println("\{p.fd.read()}")` — an ffi field read carries no type, so that
+    // interpolation prints the literal text `<value>` and a `let` off it declares a void
+    // variable (br jw2yz2). A comparison needs no type, so it is the sound spelling here.
+    s = s.concat("        if p.fd.read() == 9 \{ io.println(\"ffi-ok\") }\n")
+    s = s.concat("    }\n}\n")
+    compile_test_helpers.expect_no_error(s, "w089a0_ctl_ffi_scope", "TypeError")
+    let r = compile_test_helpers.compile_and_run(s, "w089a0_run_ffi_scope")
+    assert(r.exit_code == 0)
+    assert(r.out.contains("ffi-ok"))
+}
+
+// `with arena` has no binder at all — the branch must keep skipping it rather than binding
+// the bare ident.
+test "a with-arena block has no resource binding and still runs" {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    with arena \{\n")
+    s = s.concat("        let xs = [1, 2, 3]\n")
+    s = s.concat("        io.println(\"\{xs.len()}\")\n")
+    s = s.concat("    }\n}\n")
+    compile_test_helpers.expect_no_error(s, "w089a0_ctl_arena", "TypeError")
+    let r = compile_test_helpers.compile_and_run(s, "w089a0_run_arena")
+    assert(r.exit_code == 0)
+    assert(r.out.contains("3"))
+}
+
+// A resource binding shadowing an outer name of a different type must win on its own scope,
+// and the outer binding must come back after the block.
+test "a with-binder shadows an outer name only inside its block" {
+    let mut s = res_decl()
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let r: Str = \"outer\"\n")
+    s = s.concat("    with make() as r \{\n")
+    s = s.concat("        let inner: Int = r.value()\n")
+    s = s.concat("        io.println(\"\{inner}\")\n")
+    s = s.concat("    }\n")
+    s = s.concat("    let bad: Int = r\n")
+    s = s.concat("    io.println(\"\{bad}\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_compile_error(s, "w089a0_shadow_restore", "TypeError")
+}

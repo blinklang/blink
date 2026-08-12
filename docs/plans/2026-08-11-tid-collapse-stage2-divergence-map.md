@@ -206,7 +206,8 @@ not Stage 3 work:
 | `jzvxav` | P1 | *(the untyped-receiver shape a fourth time, after `w13xgb` / `ps5br9` / `nrrs28`)* `self` was bound as `TYPE_UNKNOWN` in **every impl method body in every Blink program** — `resolve_param_type` answers UNKNOWN for an un-annotated param and `self` is the one param that never carries one. It was hiding a raw `cc` error: `self.get(42)` against `fn get(self, k: Str)` passes `blink check` |
 | `ya8qyf` | P1 | *(found as the one row that stayed red under `jzvxav`; `zd1tz3` closed as its duplicate)* an impl method's declared **return** type was never checked — `tc_mangle_impl_fnsig` registers `{type}_{trait}_{method}` and the check side looked up `{type}_{method}`, so `lookup_fnsig` always missed and `tc_current_fn_ret` was never installed. Divergence-neutral; a pure diagnostic/escape fix |
 | `h3q81d` | P2 | *(the ranked #1 after `jzvxav`)* an effect **operation** had no typecheck-side signature anywhere — only the handle name, for warning suppression — while codegen carried the same signatures across **eight flat return fields**, the last pair existing only because `Result[Option[Row], DBError]` is depth 2. **−49 rows**, and both halves were escaping to `cc` |
-| `w089a0` | P2 | *(`h3q81d`'s residual, and the untyped-receiver shape a **fifth** time)* the with-resource `as` binder carries no type, so `with db.prepare(..).unwrap() as stmt` leaves `stmt.step()` with an untyped receiver even though `db.prepare` now resolves. `let bad: Str = r.value()` compiles clean and prints `7` |
+| `w089a0` | P2 | *(`h3q81d`'s residual, and the untyped-receiver shape a **fifth** time)* the with-resource `as` binder carried no type, so `with db.prepare(..).unwrap() as stmt` left `stmt.step()` with an untyped receiver even though `db.prepare` now resolves. **−13 rows**; another **silent miscompile** — `let bad: Str = r.value()` compiled clean and printed `7`. The type was dropped one line above the walk that computes it, so the whole fix was `nr_define` → `nr_define_typed`. Blast radius one fixture, which gained a **correct** E0514 |
+| `jw2yz2` | P2 | *(byproduct of `w089a0`'s ffi-scope control)* a `Ptr[T]` ffi-struct field read has no type: `let v = p.fd.read()` emits *"variable declared void"* and `"{p.fd.read()}"` compiles, runs and prints the literal `<value>`. Third link in the `Ptr` chain after `w13xgb` / `ps5br9` |
 | `qjfwc6` | P2 | *(the ranked #1 after `h3q81d`, same shape one namespace over)* every namespace intrinsic but `time.read` / `time.sleep` had no typecheck signature, so `net.connect` / `io.read_line` / `term.width` / `env.args` all resolved to `TYPE_UNKNOWN`. **−45 rows**, `std_net_tcp` 40 → 0. The declared-type half was a **silent miscompile** — `let bad: Str = net.connect(host, port)` compiled, linked and *ran* — and arity was a **compiler panic** at `parser.bl:111` |
 | `jr4xf7` | P2 `type:spec` | *(`qjfwc6`'s held group)* what does `fs.read` return? The spec spells `fs.read(path)?` as a `Result` and names the lister `fs.list`; codegen emits a bare `const char*` from `blink_read_file` and calls it `list_dir`. 4 rows, and typecheck cannot sign `fs.*` until it is answered |
 | `n84s1p` | P3 | *(`qjfwc6`'s other residual)* `is_intrinsic_method` disagrees with the codegen arms **in both directions** — `io.debug` listed with no arm, `io.read_bytes` / `env.var` with arms and unlisted, so they resolve through `lookup_fnsig` on the **bare** method name. 9 rows |
@@ -1419,15 +1420,15 @@ these sweeps, tallied on the **intersection of their file sets** (874 files; the
 do not appear in all of them are listed under the `nz7drz` correction note). `scratchpad/cells.sh`
 takes that allow-list as a required argument.
 
-| | before `nz7drz` | after `nz7drz` | after `bfq7nf` | after `3c4g71` | after `zs7khh` | after `2r96m9` | after `rbd0a4` | after `w13xgb` | after `jzvxav` | after `h3q81d` | after `qjfwc6` |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| **total cells** | 423 | 421 | 409 | 407 | 405 | 404 | 404 | 405 | 404 | 402 | **402** |
-| family A (`tid=?`) cells | 84 | 61 | 47 | 45 | 35 | 34 | 34 | 33 | 32 | 28 | **28** |
-| family A rows | 1323 | 1224 | 1190 | 1050 | 1015 | 661 | 504 | 327 | 310 | 261 | **216** |
-| `Fn`-flat `tid=?` cells | 16 | 2 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | **0** |
-| agree | 362979 | 363711 | 363924 | 364187 | 364289 | 364674 | 364831 | 364883 | 364934 | 365243 | **365505** |
-| diverge rows | 5008 | 5003 | 4976 | 4837 | 4828 | 4474 | 4317 | 4296 | 4279 | 4249 | **4204** |
-| missing | 14 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | **1** |
+| | before `nz7drz` | after `nz7drz` | after `bfq7nf` | after `3c4g71` | after `zs7khh` | after `2r96m9` | after `rbd0a4` | after `w13xgb` | after `jzvxav` | after `h3q81d` | after `qjfwc6` | after `w089a0` |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| **total cells** | 423 | 421 | 409 | 407 | 405 | 404 | 404 | 405 | 404 | 402 | 402 | **402** |
+| family A (`tid=?`) cells | 84 | 61 | 47 | 45 | 35 | 34 | 34 | 33 | 32 | 28 | 28 | **28** |
+| family A rows | 1323 | 1224 | 1190 | 1050 | 1015 | 661 | 504 | 327 | 310 | 261 | 216 | **203** |
+| `Fn`-flat `tid=?` cells | 16 | 2 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | **0** |
+| agree | 362979 | 363711 | 363924 | 364187 | 364289 | 364674 | 364831 | 364883 | 364934 | 365243 | 365505 | **365580** |
+| diverge rows | 5008 | 5003 | 4976 | 4837 | 4828 | 4474 | 4317 | 4296 | 4279 | 4249 | 4204 | **4191** |
+| missing | 14 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | **1** |
 
 The `after jzvxav` column covers **two** fixes, `jzvxav` and `ya8qyf`, because they were measured in
 one sweep; the attribution in those sections shows all 17 rows belong to `jzvxav`, so `ya8qyf` is
@@ -1910,6 +1911,9 @@ compiles clean and prints `7`. That is **the untyped-receiver shape for the fift
 binder. The pattern is now the most productive prior in this campaign: when a bucket resists, ask
 what the receiver is before asking which method arm is missing.
 
+*(Confirmed: `w089a0` retired exactly those 9, and `tests/test_db_stmt.bl` is down to the single
+`nrrs28` row. The 6-vs-9 split predicted here is the one the closing sweep measured.)*
+
 Test: `tests/test_h3q81d_effect_op_signatures.bl`, 14 rows — 11 red before, all green after. It uses
 a plain user-declared effect rather than `std.db`, because the registry is shared and a sidecar adds
 nothing to the mechanism; the depth-2 `Result[Option[Str], Str]` row is the `db.query_one` shape in
@@ -2007,7 +2011,93 @@ the argument check including the reversed-argument and the `write`/`write_bytes`
 pair, two escape assertions, an inferred result carried into a following method call, and the
 shadowing control (`let net = Sock { .. }` keeps its own `connect`, both directions).
 
-### Remaining family-A causes, ranked (28 cells / 216 rows)
+### w089a0 — the with-resource `as` binder carried no type (CLOSED)
+
+**Mechanism.** `tc_check_body`'s `WithBlock` branch bound the resource name with the **untyped**
+spelling, `nr_define(node_name(wh_item2))`, and walked the resource expression on the very next
+line. So the type was never missing — it was **dropped at the binding site**, one line above the
+walk that computes it. The entry carried `TYPE_UNKNOWN`, which unifies with anything, so both
+halves failed open: a declared type over `x.method()` was never compared, and the arguments to
+that call were never checked.
+
+**The declared-type half was a silent miscompile, the second one this campaign has found.**
+
+```blink
+with make() as r {
+    let bad: Str = r.value()   // Res.value() -> Int
+    io.println(bad)
+}
+```
+
+compiled, linked, ran, exit 0, and printed `7`. `blink check` reported `ok`. The argument half
+(`r.scaled("2")`) reported **nothing at all** from `check` but did escape to `cc`
+(*"argument is of type"*), so it was a `cc` escape rather than a third miscompile.
+
+**The fix is a binding, not an arm** — the second cause in a row whose whole repair is to use a
+typed spelling that already existed. `tc_bind_with_resource` walks the resource, infers it,
+publishes the tid **on the `WithResource` node** (exactly as the `LetBinding` arm publishes a
+`let`'s tid — `infer_type` memoizes expression nodes only, so a resource clause carried no tid
+at all), and binds the name with `nr_define_typed`. Codegen's `WithResource` emit gained the
+matching Stage-2 stamp, `set_var_ty(binding, tc_lookup_node_tid(item))`, placed after all four
+resource paths (`BlockHandler`, `Closeable`, `CT_FFI_SCOPE`, plain) and advisory only — no emit
+decision changed. **An unresolvable resource binds `TYPE_UNKNOWN`, i.e. exactly what it bound
+before**, which is what keeps the `ffi.scope()` receiver (`ps5br9`, not a Blink type at all)
+working untouched.
+
+The standalone `NodeKind.WithResource` arm in `tc_check_body` is deliberately left a value-walk:
+it is a fallthrough route with no `nr_push_scope` around it, so binding a name there would leak
+the binder into the enclosing scope.
+
+| | after `qjfwc6` | after `w089a0` | delta |
+|---|---:|---:|---:|
+| family A rows | 216 | **203** | **−13** |
+| family A cells | 28 | 28 | **0** |
+| total cells | 402 | 402 | 0 |
+| diverge rows | 4204 | 4191 | −13 |
+| agree | 365505 | 365580 | +75 |
+| missing | 1 | 1 | 0 |
+
+**Attribution is exact, and it is three files — all three with-resource.** `test_db_stmt.bl`
+10 → 1, `test_schfpd_with_qmark_binding.bl` 2 → 0, `test_arena_clause6_resource.bl` 2 → 0.
+Nothing else in the corpus moved by a row, and nothing rose. The ticket predicted 9 rows in
+`test_db_stmt.bl` and exactly 9 retired; **the one survivor there is `nrrs28`** —
+`site=emit_let_binding.decl var=tag flat=Int at=std_db_sqlite:140`, the `tpl.type_tag(i)` row.
+That closes the decomposition of the original 72-row `db.*` bucket into its four causes:
+`h3q81d` (~51), `jzvxav` (12), `w089a0` (9), `nrrs28` (9, the last one standing).
+
+**The cell set is byte-identical for the second sweep in a row** — not just the count, the set,
+family A and total alike. Two consecutive fixes retiring 58 rows between them without moving one
+cell is now the settled reading of the instrument, not a surprise: a cell is a
+`(site, tid=?, flat)` triple, and `emit_let_binding.decl` × `flat=Int` is produced by most of the
+remaining causes at once.
+
+**Blast radius: one test file, and the diagnostic it gained is correct.**
+`tests/test_schfpd_with_qmark_binding.bl` uses `with connect_handle(url)? as conn` directly in two
+test bodies over `Result[Connection, PgError]`, and `PgError` had no `Display` impl — which
+`sections/02_syntax.md` §2.20 / §3c.2 require for `?` in a test body (E0514, `fmj80a`). **Three**
+rows fired, and the third is the interesting one: besides the two with-resource `?` operators,
+`conn.query("SELECT 1")?` **inside** the block also fired, because its return type is only
+knowable once the receiver is typed. That is the fix demonstrating itself through an unrelated
+gate. The fixture got `impl Display for PgError`; no test was changed or removed.
+
+Verified: `task regen` EXIT=0; `task ci` EXIT=0 — **639/639** test files, `fmt` 1498 passed / 86
+skipped, gen1-vs-gen2 per-module byte-equal.
+
+Test: `tests/test_w089a0_with_resource_binder_type.bl`, 18 rows — 13 red before, all green after.
+Rows cover the declared-type compare over `Int` / `Str` / `List[Str]` returns and a plain field
+read; both parser spellings of a resource (`expr as x` and `x = expr as x`); the `.unwrap()` chain
+that is the `db.prepare` shape; the second resource of a comma-list; an outer binder read from
+inside a nested `with`; the argument check; two escape assertions (including *"must not print
+7"*, the miscompile itself); two inference-carry rows; and four controls that **run** — every
+correct spelling, both spellings again, the `ffi.scope()` shape, and `with arena` (no binder at
+all).
+
+The `ffi.scope()` control had to be written as a comparison rather than an interpolation, which
+turned up a byproduct bug: **`jw2yz2`** — a `Ptr[T]` ffi-struct field read has no type, so
+`let v = p.fd.read()` emits *"variable declared void"* and `"{p.fd.read()}"` compiles, runs, and
+prints the literal text `<value>`. Third link in the same `Ptr` chain as `w13xgb` and `ps5br9`.
+
+### Remaining family-A causes, ranked (28 cells / 203 rows)
 
 Re-ranked from the post-`qjfwc6` sweep, by **rows on the 874-file common basis**, grouped by the
 innermost producer (the outermost call is usually a symptom — `.unwrap()` heads many chains, but its
@@ -2039,16 +2129,25 @@ typecheck has no signature table for — or, more often than not, a RECEIVER wit
 With the `Str`, `Bytes`, `Ptr`, `self`, effect-op **and namespace-intrinsic** causes closed, the
 intrinsic-method list is spent as a leading mechanism: `qjfwc6` gave typecheck the table, and what it
 left behind is not a missing arm but an open spec question (`jr4xf7`) and a list that disagrees with
-its own arms (`n84s1p`). **The untyped-receiver family is now the whole head of the list** —
-`nrrs28`, `ps5br9`, `w089a0` — and each needs a `TyKind` or a binding, never an arm. The two causes
-that are neither (iterator adapters, `Channel(n)`) are both already deferred to a user-visible
-decision.
+its own arms (`n84s1p`). **The untyped-receiver family was the whole head of the list** — and
+`w089a0` has since taken the binder half of it, leaving `nrrs28` (`Template[T]`) and `ps5br9` (the
+ffi scope), both of which need a `TyKind` rather than a binding. The two causes that are neither
+(iterator adapters, `Channel(n)`) are both already deferred to a user-visible decision.
 
-**The old 72-row `db.*` bucket split four ways, and this is the lesson the map keeps re-teaching: a
-shared bucket is not a shared cause.** `jzvxav` took the 12 `at=std_db_row:35` rows (`row.get`, never
-a `db.*` signature problem at all — it is `self` inside `impl RowOps for Row`), `nrrs28` owns the 9
-`at=std_db_sqlite:140` rows (`tpl.type_tag` — `Template[T]`, not `db`), `h3q81d` took the ~42 genuine
-effect-op rows, and the 9 that survived are the with-resource `as` binder (`w089a0`).
+**Two shapes, and they take different fixes.** The untyped-receiver family has now split cleanly in
+two: `jzvxav` and `w089a0` were **declaration sites that dropped a type they already had**, and both
+were repaired by swapping in the typed spelling that already existed (`nr_define_typed`) — no new
+inference, no new arm, ~10 lines each. `w13xgb`, `ps5br9` and `nrrs28` are **types the pool cannot
+name**, and those need a `TyKind` variant plus a lowering plus a method block. The binder half is
+now done; what is left of the family is the pool half.
+
+**The old 72-row `db.*` bucket split four ways, and every one of the four is now closed or isolated —
+this is the lesson the map keeps re-teaching: a shared bucket is not a shared cause.** `jzvxav` took
+the 12 `at=std_db_row:35` rows (`row.get`, never a `db.*` signature problem at all — it is `self`
+inside `impl RowOps for Row`), `h3q81d` took the ~42 genuine effect-op rows, `w089a0` took the 9
+with-resource binder rows, and `nrrs28` owns the 9 `at=std_db_sqlite:140` rows that remain
+(`tpl.type_tag` — `Template[T]`, not `db`). `tests/test_db_stmt.bl` now carries **one** family-A row,
+and it is that last one.
 
 | cause | rows | ticket | note |
 |---|---:|---|---|
@@ -2056,7 +2155,7 @@ effect-op rows, and the 9 that survived are the with-resource `as` binder (`w089
 | `is_intrinsic_method` disagrees with its own arms — `io.read_bytes`, `env.var`, `io.debug` | 9 | `n84s1p` | Split out of `qjfwc6`. `io.debug` is listed and emitted by no arm; `io.read_bytes` and `env.var` have arms and are **not** listed, so they take the `== 0` path and resolve through `lookup_fnsig` on the **bare** method name. `src/lsp.bl:50,51` (4), `tests/manual_stdio_stdin.bl:10` (2), `src/incremental.bl:44` (3, `env.var`). Fix the list, then they join the `qjfwc6` table |
 | `fs.read` / `write` / `list_dir` / `remove` | 4 | `jr4xf7` (`type:spec`) | Split out of `qjfwc6` and **held on purpose**: `sections/04_effects.md:73,1053` spells `fs.read(path)?` as a `Result` and `:157,215` names the lister `fs.list`, while codegen emits a bare `const char*` from `blink_read_file`. Signing it from codegen would write "an FS read cannot fail" into the type system |
 | ~~`db.*` effect operations — `db.query` / `query_one` / `execute`, `stmt.step`~~ | ~~51~~ | **`h3q81d`** | **CLOSED** — −49 rows, section above. Typecheck held **no** operation signatures, only the handle name for warning suppression; codegen held the same signatures across eight flat return fields. 9 rows survive, all `with db.prepare(..) as stmt` → **`w089a0`** |
-| the with-resource `as` binder — `with db.prepare(..).unwrap() as stmt` | 9 | `w089a0` | Split out of `h3q81d`'s residual. `db.prepare` now resolves to `Result[Stmt, DBError]` and the binder drops it, so `stmt.step()` has an untyped receiver. **Untyped-receiver shape, fifth instance**; the tid is already in hand at the binding site, so the fix is the `jzvxav` shape — bind the binder |
+| ~~the with-resource `as` binder — `with db.prepare(..).unwrap() as stmt`~~ | ~~9~~ | **`w089a0`** | **CLOSED** — −13 rows, section above. The prediction held exactly: the tid *was* already in hand at the binding site, one line above the walk that computes it, and the fix was the `jzvxav` shape — bind the binder. Another **silent miscompile** (`let bad: Str = r.value()` ran and printed `7`). Attribution was three files, all with-resource; `test_db_stmt.bl` 10 → 1, and the survivor is `nrrs28` |
 | `Template[T]` introspection — `tpl.type_tag` / `count` / `get_int` / `get_float` / `get_str` | 9 | `nrrs28` | Split out of the old `db.*` bucket. All 9 are `at=std_db_sqlite:140`, one per db-flavoured root. **The untyped-receiver shape again**, for the fifth time: `Template` is not a `TyKind`, so the receiver is as permissive as `TYPE_UNKNOWN` before any method arm can run — `w13xgb` / `ps5br9` / `jzvxav` in a fourth costume, and it should be fixed the way `w13xgb` was (variant first, then the lowering, then the method block) |
 | `Iterator` adapters — `.zip`, `.chain`, `.enumerate`, `.collect` | 34 | `qzdz2e` | **deferred** (panel decision, user-visible). Was invisible in the previous ranking and is now #3: `tests/test_combining_iterators.bl` (16) and `tests/test_44xww4_enumerate_zip_compound.bl` (18), showing as `flat=List[Void]` and `flat=Tuple2_int_int` — the adapter loses the element type *and* the pair shape |
 | `Channel(n)` / `ch.recv` | 24 | — | **likely genuinely under-determined** — the arg is a capacity, not an element type, so this may be `decisions/under-determined-types.md` / E0301, not a missing rule. `tests/test_channels.bl` (11), `tests/test_async_cancel.bl` (7), `src/cli.bl:2162` |
@@ -2075,23 +2174,28 @@ top because the causes above them were removed, and both were already in the map
 new line is the `@derive`/`Result` group, which the earlier `flat=` tail hid behind `Str` and
 `Ptr[Int]`.
 
-**Cross-check by source module** (` at=` on the post-`qjfwc6` sweep — note the leading space; without
+**Cross-check by source module** (` at=` on the post-`w089a0` sweep — note the leading space; without
 it the pattern also matches inside `flat=`), because the flat spelling and the producing module answer
 different questions and disagreeing on which is "the" count is how the Ptr entry once acquired two
 figures:
 
-| module | family-A rows | | after `h3q81d` | after `jzvxav` | after `w13xgb` | after `rbd0a4` |
-|---|---:|---|---:|---:|---:|---:|
-| `__main__` (the root being compiled) | 171 | | 174 | 223 | 225 | 237 |
-| `std_libc` | **0** | | 0 | 0 | 0 | 165 |
-| `std_net_tcp` | **0** | | 40 | 40 | 40 | 40 |
-| `std_db_row` | **0** | | 0 | 0 | 12 | 12 |
-| `cli` | 11 | | 11 | 11 | 11 | 11 |
-| `std_db_sqlite` | 9 | | 9 | 9 | 9 | 9 |
-| `incremental` / `file_watcher` | 6 each | | 6 each | 6 each | 6 each | 6 each |
-| `lsp` | 4 | | 6 | 6 | 6 | 6 |
-| `std_testing` | **0** | | 0 | 0 | 3 | 3 |
-| `std_http_server` / `pkg_resolver` / `build_stdlib` | 3 each | | 3 each | 3 each | 3 each | 3 each |
+| module | family-A rows | | after `qjfwc6` | after `h3q81d` | after `jzvxav` | after `w13xgb` | after `rbd0a4` |
+|---|---:|---|---:|---:|---:|---:|---:|
+| `__main__` (the root being compiled) | 158 | | 171 | 174 | 223 | 225 | 237 |
+| `std_libc` | **0** | | 0 | 0 | 0 | 0 | 165 |
+| `std_net_tcp` | **0** | | 0 | 40 | 40 | 40 | 40 |
+| `std_db_row` | **0** | | 0 | 0 | 0 | 12 | 12 |
+| `cli` | 11 | | 11 | 11 | 11 | 11 | 11 |
+| `std_db_sqlite` | 9 | | 9 | 9 | 9 | 9 | 9 |
+| `incremental` / `file_watcher` | 6 each | | 6 each | 6 each | 6 each | 6 each | 6 each |
+| `lsp` | 4 | | 4 | 6 | 6 | 6 | 6 |
+| `std_testing` | **0** | | 0 | 0 | 0 | 3 | 3 |
+| `std_http_server` / `pkg_resolver` / `build_stdlib` | 3 each | | 3 each | 3 each | 3 each | 3 each | 3 each |
+
+`w089a0`'s whole −13 lands in `__main__` (171 → 158) and nowhere else, which is the expected shape for
+a fix to a **declaration site**: a `with ... as` clause is written in the root under compilation, so
+unlike the stdlib causes there is no shared module for the rows to concentrate in. That is also why
+its attribution is per-root-file (three files) rather than per-module.
 
 **`std_libc` went from a third of everything left to zero**, and it was one cause; `std_db_row` and
 `std_testing` went to zero on `jzvxav`, and it was one cause covering both; **`std_net_tcp` went from

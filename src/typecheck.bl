@@ -10381,6 +10381,36 @@ fn tc_check_match_exhaustive(node: Int, scrut_tid: Int, arms_sl: Int) ! TypeChec
         "add an arm for {list_str}, or a `_ => ...` catch-all arm to absorb the rest of {ename}")
 }
 
+// Bind a `with <expr> as x { .. }` resource name WITH its type (br w089a0).
+//
+// A resource clause is a declaration site, exactly like a `let`: the binder names the value
+// of the resource expression. It was bound with the untyped `nr_define`, so the entry carried
+// TYPE_UNKNOWN — which unifies with anything, so a declared type over `x.method()` was never
+// compared and the arguments to that call were never checked. `with make() as r { let bad:
+// Str = r.value() }` compiled, linked, ran and printed the Int.
+//
+// The type was never missing, only dropped: the resource expression is walked on the line
+// below, and `with db.prepare(..).unwrap() as stmt` types all the way through the Result
+// chain. So this is a binding, not a new inference path — the fifth instance of the
+// untyped-receiver family (w13xgb Ptr, ps5br9 ffi scope, jzvxav self, nrrs28 Template), and
+// the second one whose whole fix is to use the typed spelling that already exists.
+//
+// The tid is also published on the WithResource node itself, the way the LetBinding arm
+// publishes a let's tid: infer_type memoizes expression nodes only, so a resource clause
+// carried no tid at all and codegen's ScopeVar for the binder had nothing to read.
+//
+// An unresolvable resource binds TYPE_UNKNOWN, i.e. exactly what it bound before — which is
+// what keeps `ffi.scope()` (not a Blink type at all) working unchanged.
+fn tc_bind_with_resource(item: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let res_expr = node_value(item)
+    tc_check_body(res_expr)
+    let res_tid = infer_type(res_expr)
+    if item < tc_node_tid.len() && res_tid != TYPE_UNKNOWN {
+        tc_node_tid.set(item, res_tid)
+    }
+    nr_define_typed(node_name(item), 0, res_tid)
+}
+
 // Block branch genuinely save/restores scope via nr_push_scope/nr_pop_scope;
 // the recursive tc_check_body and other nr_* writes fall outside that pattern,
 // which the analyzer correctly flags.
@@ -10725,8 +10755,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                 let wh_item2 = sublist_get(wh_sl2, wi2)
                 let wh_kind2 = node_kind(wh_item2)
                 if wh_kind2 == NodeKind.WithResource {
-                    nr_define(node_name(wh_item2))
-                    tc_check_body(node_value(wh_item2))
+                    tc_bind_with_resource(wh_item2)
                 } else if wh_kind2 == NodeKind.Ident && node_name(wh_item2) == "arena" {
                 } else {
                     tc_check_body(wh_item2)
