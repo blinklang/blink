@@ -1,0 +1,180 @@
+// br qy9ssr — a GENERIC fn returning an Option must carry its own inner type to the caller, not
+// the inner type of whatever compound-Option producer was emitted last.
+//
+// `emit_generic_fn_call_tail`'s CT_OPTION branch sets `expr_option_inner` from the return
+// annotation and then sets `expr_option_inner_struct` only when the inner is a struct/enum. There
+// is no `else`, so on every other inner the previous value SURVIVES. Its CT_RESULT sibling ten
+// lines down does have that `else` — which is exactly why the Result spelling of every row here
+// works and the Option spelling did not.
+//
+// A match scrutinee reads those two globals to spell the carrier temp, so the leak lands as a hard
+// cc failure with an unrelated producer's carrier:
+//
+//     blink_Option_Option_int _scrut_1 = blink_first_1or_1none_0Str(_l0);   <- c_oopt's carrier
+//     cc: error: invalid initializer
+//     cc: error: initialization of 'blink_list *' from incompatible pointer type 'blink_Option_int *'
+//
+// The callee is declared correctly (`blink_Option_list blink_first_1or_1none_0Str(blink_list*)`),
+// and the borrowed carrier tag is often not even typedef'd in that TU. It is last-writer-wins:
+// reordering the producer declarations changes which carrier gets borrowed. Every contaminant below
+// is therefore declared AFTER the generic producers, which is the arrangement that poisons them.
+//
+// Nothing here needs a container: `opt_of(5)` alone reproduces, because CT_INT is not a struct
+// either. The bug is the missing reset, not the shape of the inner.
+
+type Pt { x: Int, y: Int }
+
+fn opt_of[T](v: T) -> Option[T] { Some(v) }
+
+fn first_or_none[T](l: List[T]) -> Option[List[T]] {
+    if l.len() == 0 { return None }
+    Some(l)
+}
+
+fn res_of[T](v: T) -> Result[T, Str] { Ok(v) }
+
+// The contaminants. None is called by the rows that must not depend on them; each one's only job
+// is to leave a compound inner tag in `expr_option_inner_struct` for the next Option-returning
+// generic call to inherit.
+fn a_omap() -> Option[Map[Str, Str]] {
+    let m: Map[Str, Str] = Map()
+    m.insert("k", "v")
+    Some(m)
+}
+
+fn b_ores() -> Option[Result[Int, Str]] { Some(Ok(1)) }
+
+fn c_oopt() -> Option[Option[Int]] { Some(Some(3)) }
+
+// ── The rows: a generic Option return read through a match ─────────────────────────
+
+test "a generic fn returning Option of a scalar keeps its own inner" {
+    let mut n = 0
+    match opt_of(5) {
+        Some(v) => { n = v }
+        None => { n = -1 }
+    }
+    assert_eq(n, 5)
+}
+
+test "a generic fn returning Option of a Str keeps its own inner" {
+    let mut s = ""
+    match opt_of("hi") {
+        Some(v) => { s = v }
+        None => { s = "NONE" }
+    }
+    assert_eq(s, "hi")
+}
+
+test "a generic fn returning Option of a List keeps its element" {
+    let mut acc = ""
+    match first_or_none(["alice", "bob"]) {
+        Some(l) => {
+            assert_eq(l.len(), 2)
+            for s in l { acc = "{acc}{s}" }
+        }
+        None => { acc = "NONE" }
+    }
+    assert_eq(acc, "alicebob")
+}
+
+test "the same generic fn at a second element type is not the first one's carrier either" {
+    let mut n = 0
+    match first_or_none([1, 2, 3]) {
+        Some(l) => { for x in l { n = n + x } }
+        None => { n = -1 }
+    }
+    assert_eq(n, 6)
+}
+
+test "a generic fn returning Option of a List of structs keeps its struct element" {
+    let mut y = 0
+    match first_or_none([Pt { x: 3, y: 4 }, Pt { x: 5, y: 6 }]) {
+        Some(l) => {
+            y = l.get(0).unwrap().y
+            assert_eq(l.get(1).unwrap().x, 5)
+        }
+        None => { y = -1 }
+    }
+    assert_eq(y, 4)
+}
+
+test "a bare typevar return bound to a container is the same seam" {
+    let ll: List[Str] = ["z", "yy"]
+    let mut acc = 0
+    match opt_of(ll) {
+        Some(l) => { for s in l { acc = acc + s.len() } }
+        None => { acc = -1 }
+    }
+    assert_eq(acc, 3)
+}
+
+test "a bare typevar return bound to a struct still resolves its struct inner" {
+    let mut x = 0
+    match opt_of(Pt { x: 9, y: 2 }) {
+        Some(p) => { x = p.x }
+        None => { x = -1 }
+    }
+    assert_eq(x, 9)
+}
+
+test "an empty list takes the None arm without borrowing a carrier" {
+    let empty: List[Str] = []
+    let mut took = ""
+    match first_or_none(empty) {
+        Some(l) => { took = "some{l.len()}" }
+        None => { took = "none" }
+    }
+    assert_eq(took, "none")
+}
+
+test "a generic Option scrutinee inside a tuple match is the same read" {
+    let mut acc = ""
+    match (opt_of("q"), 1) {
+        (Some(v), 1) => { acc = "{v}one" }
+        (Some(v), _) => { acc = "{v}other" }
+        (None, _) => { acc = "none" }
+    }
+    assert_eq(acc, "qone")
+}
+
+// ── Controls ──────────────────────────────────────────────────────────────────────
+
+test "the Result spelling of the same shape was never broken" {
+    let mut acc = ""
+    match res_of(["c", "ddd"]) {
+        Ok(l) => { for s in l { acc = "{acc}{s}" } }
+        Err(_e) => { acc = "ERR" }
+    }
+    assert_eq(acc, "cddd")
+
+    let mut n = 0
+    match res_of(7) {
+        Ok(v) => { n = v }
+        Err(_e) => { n = -1 }
+    }
+    assert_eq(n, 7)
+}
+
+test "the contaminant producers still work themselves" {
+    let mut f = ""
+    match a_omap() {
+        Some(m) => { f = m.get("k").unwrap() }
+        None => { f = "NONE" }
+    }
+    assert_eq(f, "v")
+
+    let mut g = 0
+    match b_ores() {
+        Some(r) => { g = r.unwrap() }
+        None => { g = -1 }
+    }
+    assert_eq(g, 1)
+
+    let mut h = 0
+    match c_oopt() {
+        Some(o) => { h = o.unwrap() }
+        None => { h = -1 }
+    }
+    assert_eq(h, 3)
+}

@@ -6994,6 +6994,113 @@ for two element types, and a row proving the contaminant declarations still work
 row asserts a value; two of the three failure modes are silent. `task regen` at fixed point; `task
 ci` exit 0; 686 test files, 686 passed, 0 failed; fmt 1590 passed, 0 failed.
 
+### The seam with no reader at all — br `qy9ssr`
+
+The three seams above lose an answer. This one **inherits somebody else's**, and it is the first of
+this family that fails loudly at `cc` rather than silently at runtime:
+
+```
+blink_Option_Option_int _scrut_1 = blink_first_1or_1none_0Str(_l0);
+cc: error: invalid initializer
+cc: error: initialization of 'blink_list *' from incompatible pointer type 'blink_Option_int *'
+```
+
+`blink_first_1or_1none_0Str` is declared correctly one screen up — `blink_Option_list
+blink_first_1or_1none_0Str(blink_list* l)`. The carrier on the left belongs to a **different
+function**, `c_oopt() -> Option[Option[Int]]`, which the program does call but never in this
+statement. Reorder the declarations and the borrowed carrier changes with them; often the tag on the
+left is not even typedef'd in that TU.
+
+#### The cause is a missing `else`, and its sibling ten lines down has one
+
+`emit_match_expr` spells the scrutinee's carrier temp from the pair `expr_option_inner` /
+`expr_option_inner_struct` (`codegen_stmt.bl` ~:904, and ~:801 for a tuple element). Those are
+transient globals with **84 assignment sites** across `src/*.bl`. `emit_generic_fn_call_tail`'s
+`CT_OPTION` branch is one of them (`codegen_expr.bl` :3778):
+
+```blink
+expr_option_inner = inner_ct
+if inner_ct == CT_VOID && (is_struct_or_enum_type(inner_name) != 0 || is_mono_struct_instance(inner_name) != 0) {
+    ensure_struct_option_type(inner_name)
+    expr_option_inner_struct = inner_name
+}
+// ← no else
+```
+
+The `CT_RESULT` branch immediately below it does have that `else`, and clears both of its own
+channels. That asymmetry **is** the bug, and it is why every Result spelling of every row in the
+regression test always worked while the Option spelling did not. On a non-struct inner the `if` does
+not fire, and leaving the global alone does not mean "no answer" — it means the last compound-Option
+producer's answer survives into a caller that has nothing to do with it.
+
+So the honest shape of this defect is not "a container's element was erased". No container is
+required: `opt_of(5)` reproduces it, because `CT_INT` is not a struct either. Within the regression
+test the leak even crosses rows of the *same* file — row 7's `Option[Pt]` poisons rows 8 and 9:
+
+```
+blink_Option_Pt _scrut_66 = blink_first_1or_1none_0Str(empty);
+blink_Option_Pt _tup_71  = blink_opt_1of_0Str("q");
+```
+
+#### Fixed at the producer, not at the reader
+
+The plan's Stage 3 says make the tid authoritative, and the scrutinee site does have the node in
+hand — `tc_lookup_node_tid(scrut)` would have answered `Option[List[Str]]` correctly. That fix was
+**not** taken, for a reason worth recording: it would have made the reader immune while leaving the
+leak in place for the other 83 assignment sites and every other consumer of the pair. Clearing at the
+source fixes all of them at once, and it is the change that makes the two sibling branches say the
+same thing.
+
+Clearing cannot regress the shapes that look most at risk from it — a generic fn returning
+`Option[Option[T]]` or `Option[Result[T, E]]`. Those were checked and are **already** broken
+independently: the mono'd signature erases the inner's type args (`blink_Option_Option_void`,
+`blink_Option_Result_void_str`) while the caller drops them entirely (`blink_Option_option`). Three
+disagreeing spellings of one type in one TU, filed as br `705b70` with `Option[Map[K,V]]` as its
+primary shape. They are deliberately absent from this ticket's test file: asserting them here would
+attribute that defect to this one.
+
+> **Census, monolithic, 973-file common basis:** `diverge` **29423 → 29423**, cells **743 → 743**,
+> `missing` **74 → 74**, `agree` **673418 → 673418**, family-A cells **11 → 11**, `ctypediv` diverge
+> **24 → 24**. Identical in every bucket.
+
+That null result means something different here than it did for `bgenc2` / `a1cx6d`, and the
+difference matters. There, zero delta meant *the shape was not in the corpus*. Here the shape's
+**site is not measured at all**: the tydiv channel taps `emit_fn_params.param`,
+`emit_let_binding.decl`, `match_pattern.bind`, `emit_for_in.var`, `tuple_destructure.elem`,
+`with_resource.bind` and `copy_list_compound_elem.src` — and not the carrier temp `emit_match_expr`
+materializes. A hard `cc` failure lived at that site and the census could not have seen it either
+way. The 11-row test is the whole of the coverage. Filed as br `359pt5`: tap `match.scrut` and
+`match.scrut_tuple_elem`, then re-sweep — and only then is there a measurement that could justify
+the authority flip declined above.
+
+Attributed in **both** build modes. All four user-file rows are identical; monolithic adds nine
+stdlib rows (`Duration`, `Instant`, `self tid=Map[?, ?]`) that archive mode does not recompile, the
+same mode difference the previous two sections recorded. Residuals, all in-file and all passing:
+
+- `emit_fn_params.param var=v tid=List[Str] flat=List[Int]` — the mono'd `opt_of[T]`'s own parameter
+  when `T` is bound to `List[Str]`. The row passes because `emit_for_in` reads the tid since
+  `bgenc2`; the flat param spelling is still the erased default.
+- `match_pattern.bind var=p tid=Pt flat=Int` — a pointer-boxed struct binder booked as `CT_INT`. The
+  emitted C is right (`blink_Pt p = *_scrut_60.value;`); this is the same accounting artifact as
+  `flat=List[Void]`, one position over.
+- `emit_fn_params.param var=l tid=List[Pt] flat=List[Void]` and `match_pattern.bind var=l
+  tid=List[Pt] flat=List[]` — both already named in the sections above.
+
+Tests: `tests/test_qy9ssr_generic_option_carrier.bl`, 11 rows — a generic `Option[T]` at `Int`, at
+`Str`, at a bare typevar bound to a `List` and to a struct; a generic `Option[List[T]]` at `Str`,
+`Int` and `Pt`; the `None` arm; a tuple-position scrutinee (the second, separate reader at ~:801);
+and two controls — the Result spelling that was never broken, and the three contaminant producers
+proving they still work themselves. `task regen` at fixed point; `task ci` exit 0; 687 test files,
+687 passed, 0 failed; fmt 1592 passed, 0 failed.
+
+Two byproducts filed while probing this one, both loud, neither touched: br `705b70` above, and br
+`ht0bxj` — a typevar does not bind from a bare `Set[T]` **parameter**, so *every* generic fn taking
+one is uncallable (`I0001`, mono args `BLINK_I0001_erased_slot`). `zpspke` made the other compound
+params bind; `Set` was missed. It is a missing arm rather than an erasure, and it reports rather than
+guesses — the same asymmetry `mv45y5` created when it made `sv_tp`'s `CT_SET` arm decline, and the
+reason `Set` keeps turning up as the kind that tells you it is broken.
+
+
 ## Appendix — all 428 shape cells
 
 Format: `family | occurrences | tid | flat`.
