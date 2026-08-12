@@ -5193,6 +5193,58 @@ counter == 0" can mean as a Stage 3 exit criterion: it is zero *over the tapped 
 have*, and the plan's own `feedback_corpus_sweep_is_not_coverage` warning is the reason that is not
 the same as done.
 
+### The speller collapse the plan still lists as pending was already delivered (br `qerbc7`)
+
+Stage 3's third bullet reads *"collapse the 5 spellers (`tc_tid_to_c_tag`, `tc_seg_from_tid`,
+`tc_tid_inner_tag`, `tc_tid_struct_mono_name`, `tc_tid_tuple_tag`) into one recursive speller. Closes
+the open `qerbc7`/`3fc3pn` intent properly."` **Both tickets are `done`, and reading the five
+functions confirms the collapse landed — the plan text is stale, not the code.** Recorded here rather
+than acted on, because the only way to make the bullet literally true is to undo a distinction two
+closed tickets made on purpose.
+
+What the five are today:
+
+| function | line | refs | what it is now |
+|---|---:|---:|---|
+| `tc_tid_tag_at(tid0, tagpos)` | `typecheck.bl:12501` | 30 | **the one recursive encoder**, `TAGPOS_TOP=0` / `TAGPOS_INNER=1` |
+| `tc_tid_to_c_tag(tid)` | `:14182` | 73 | `tag_at(tid, TAGPOS_TOP)` — a positional wrapper |
+| `tc_tid_inner_tag(tid)` | `:12701` | 68 | `tag_at(tid, TAGPOS_INNER)` — a positional wrapper |
+| `tc_tid_tuple_tag(t)` | `:12705` | 9 | **private**, reached from inside `tag_at` — an arm, not a speller |
+| `tc_seg_from_tid(tid)` | `:14565` | 39 | two lines: the `tc_tid_encodable` gate, then `tc_tid_to_c_tag`. Not a grammar — the gate-lift, with an `Option[Str]` contract the encoder cannot express |
+| `tc_tid_struct_mono_name(tid)` | `:13819` | 75 | the one genuinely separate **grammar**, and its leaves already route through the encoder |
+
+So three of the five are one function with a position parameter, and a fourth is a two-line
+composition of that function with the surviving gate. **Every leaf tag in the compiler is produced by
+exactly one place.** That was the whole point of the bullet.
+
+**The fifth is separate on purpose, and the reason is recorded in two places.** `tc_tid_struct_mono_name`
+escapes each segment through `escape_mono_seg` and joins with `_0`, not a bare `_` (br `cr4gqk`), and
+it answers on **two channels** — `""` meaning *defer to the caller's other path*, and a bare
+`BLINK_I0001_*` sentinel it must return **whole** rather than concatenate, because burying it
+mid-identifier (`Box_int_BLINK_I0001_…`) puts it past where `diag_is_ice_seg`'s prefix test can see it
+(br `vbcw1e`). A position parameter cannot express either. `qerbc7`'s own triage says so verbatim —
+*"`tc_tid_struct_mono_name` stays separate (28 call sites, `''` + ICE-sentinel dual return channel a
+position param can't express)"* — and br `bwyfy1` had already paid for the general lesson: one shared
+**rule** across two positions broke 296 fixtures. One encoder, two positions; never one rule. Its
+leaves are not duplicated either: `tc_tid_struct_slot_seg` (`:13867`) recurses for a nested instance
+and otherwise calls `tc_tid_encodable` + `tc_tid_to_c_tag`, i.e. the same encoder every other caller
+reaches.
+
+**The duplication that does remain is not among the spellers, and it is Stage 4's, not Stage 3's.**
+`tc_tid_struct_mono_name`'s own comment names itself *"a NINTH, independent producer of a struct/enum
+mono instance's C name"* — the use side — against `mangle_generic_name(base: Str, args: Str)`
+(`codegen_types.bl:4889`) on the def side, the two kept byte-matched by hand because a disagreement is
+a hard `cc` failure the moment an input contains an underscore (the `bee854` class,
+`codegen_types.bl:4668-4675`). They cannot be collapsed into each other while one of them takes its
+arguments as a **comma-separated string**: that signature *is* Stage 4 deletion group 4 (`args: Str` /
+`ta_str`, exit criterion `rg ta_str src/` reads 0). Collapsing the producers is therefore downstream
+of that deletion, and attempting it here would mean writing a second tid-keyed name builder next to
+the one that already exists.
+
+Net: the plan's speller bullet is **done**, one item on it is **deliberately excluded** with the
+excluding argument on the record, and the residue is re-scoped to Stage 4 group 4 where the blocking
+representation actually lives.
+
 ## Appendix — all 428 shape cells
 
 Format: `family | occurrences | tid | flat`.
