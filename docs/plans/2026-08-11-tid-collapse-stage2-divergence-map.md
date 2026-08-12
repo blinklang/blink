@@ -1425,15 +1425,15 @@ these sweeps, tallied on the **intersection of their file sets** (874 files; the
 do not appear in all of them are listed under the `nz7drz` correction note). `scratchpad/cells.sh`
 takes that allow-list as a required argument.
 
-| | before `nz7drz` | after `nz7drz` | after `bfq7nf` | after `3c4g71` | after `zs7khh` | after `2r96m9` | after `rbd0a4` | after `w13xgb` | after `jzvxav` | after `h3q81d` | after `qjfwc6` | after `w089a0` | after `x3x0qj` | after `nxnnxe` | after `bf0jnj` + `pvhaew` | after `cttrag` | after `n84s1p` |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| **total cells** | 423 | 421 | 409 | 407 | 405 | 404 | 404 | 405 | 404 | 402 | 402 | 402 | 403 | 406 | 406 | 406 | **404** |
-| family A (`tid=?`) cells | 84 | 61 | 47 | 45 | 35 | 34 | 34 | 33 | 32 | 28 | 28 | 28 | 26 | 23 | 23 | 23 | **21** |
-| family A rows | 1323 | 1224 | 1190 | 1050 | 1015 | 661 | 504 | 327 | 310 | 261 | 216 | 203 | 193 | 174 | 174 | 162 | **154** |
-| `Fn`-flat `tid=?` cells | 16 | 2 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | **0** |
-| agree | 362979 | 363711 | 363924 | 364187 | 364289 | 364674 | 364831 | 364883 | 364934 | 365243 | 365505 | 365580 | 365705 | 366051 | 366051 | 366125 | **366133** |
-| diverge rows | 5008 | 5003 | 4976 | 4837 | 4828 | 4474 | 4317 | 4296 | 4279 | 4249 | 4204 | 4191 | 4190 | 4185 | 4185 | 4173 | **4165** |
-| missing | 14 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | **1** |
+| | before `nz7drz` | after `nz7drz` | after `bfq7nf` | after `3c4g71` | after `zs7khh` | after `2r96m9` | after `rbd0a4` | after `w13xgb` | after `jzvxav` | after `h3q81d` | after `qjfwc6` | after `w089a0` | after `x3x0qj` | after `nxnnxe` | after `bf0jnj` + `pvhaew` | after `cttrag` | after `n84s1p` | after `jvy35h` |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| **total cells** | 423 | 421 | 409 | 407 | 405 | 404 | 404 | 405 | 404 | 402 | 402 | 402 | 403 | 406 | 406 | 406 | 404 | **404** |
+| family A (`tid=?`) cells | 84 | 61 | 47 | 45 | 35 | 34 | 34 | 33 | 32 | 28 | 28 | 28 | 26 | 23 | 23 | 23 | 21 | **21** |
+| family A rows | 1323 | 1224 | 1190 | 1050 | 1015 | 661 | 504 | 327 | 310 | 261 | 216 | 203 | 193 | 174 | 174 | 162 | 154 | **148** |
+| `Fn`-flat `tid=?` cells | 16 | 2 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | **0** |
+| agree | 362979 | 363711 | 363924 | 364187 | 364289 | 364674 | 364831 | 364883 | 364934 | 365243 | 365505 | 365580 | 365705 | 366051 | 366051 | 366125 | 366133 | **366139** |
+| diverge rows | 5008 | 5003 | 4976 | 4837 | 4828 | 4474 | 4317 | 4296 | 4279 | 4249 | 4204 | 4191 | 4190 | 4185 | 4185 | 4173 | 4165 | **4190** |
+| missing | 14 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | **1** |
 
 **`total cells` rose for three sweeps running (402 → 403 → 406) while `family A cells` fell
 (28 → 26 → 23), and that is the campaign turning a corner rather than losing ground.** A family-A
@@ -1467,6 +1467,20 @@ declarations first.
 The `after n84s1p` column holds the total steady at 370299 (`agree + diverge + missing`), which is the
 control for the paragraph above: that fix adds no `let` declaration to the compiler's own source, and
 the total does not move. All 8 rows it removed are conversions.
+
+**`after jvy35h` is the cleanest instance of that arithmetic yet, and it goes the other way: `diverge`
+went UP by 25 in a sweep that removed 6 family-A rows.** Total 370299 → 370330 (+31), and every figure
+resolves without a residue. The fix adds **one** `let` declaration to `src/typecheck.bl` (`let ek =
+type_kind(elem)`), 31 of the 874 basis roots compile that file, and all 31 new comparisons land in
+`diverge` rather than `agree`: `var=ek tid=TyKind flat=Int at=typecheck:9285`. The flat universe cannot
+spell an enum, so it says `Int`. So `Δdiverge = 31 − 6 = +25` and `Δagree = +6`, the 6 being exactly the
+conversions. **The 31 new rows are class B, not family A** — both sides have a type and they disagree —
+which is why `family A rows` falls while `diverge rows` rises, and why neither cell count moves: the
+`(emit_let_binding.decl, TyKind, Int)` cell already held 682 rows across 22 sites and now holds 713
+across 23. Stage 3's `c_type_from_tid` deletes that whole cell in one stroke. **The lesson for reading
+this table: `diverge rows` is not the campaign's progress metric and never was.** Writing one more
+enum-typed `let` anywhere in the compiler raises it by 31 without a single new defect; `family A rows`
+is the number that counts causes.
 
 **The counter is not a severity ranking, and `n84s1p` is the clearest proof so far.** The worst defect
 in that ticket — `env.var`, a *silent miscompile* that compiled, linked, ran and printed `<value>` for
@@ -2708,7 +2722,109 @@ must keep reaching the loud backstop, and pinned by a control row so the gap sta
 **Tests:** `tests/test_n84s1p_intrinsic_allowlist_arms.bl`, 26 rows, **17 red / 26 green**. `task ci`
 green (645 test files, 0 failed; fmt 1510 passed).
 
-### Remaining family-A causes, ranked (21 cells / 154 rows)
+### jvy35h — the other half of the allow-list defect, and the first one with a crash behind it (CLOSED, −6 rows)
+
+`n84s1p` closed the **namespace** half of the allow-list-with-nothing-behind-it class
+(`is_intrinsic_method`). This is the **receiver** half: `is_builtin_method`
+(`src/typecheck.bl:6259`), a flat 171-name list whose only job is to suppress `UnknownMethod` and to
+gate `E0505`/`W0501`. `join` is name #41 in it. Return types live in a separate per-receiver dispatch
+in `infer_type_uncached`, whose builtin `List` block (`:9220`) had arms for
+`len`/`get`/`push`/`set`/`pop`/`clear`/`slice`/`concat`/`contains` and **no `join`** — while codegen
+has had exactly one arm for it since forever (`codegen_methods.bl:1620`, `str_join(obj, delim)` with
+`expr_result_type = CT_STRING`). So the C was correct and the call had no type.
+
+**The audit that found the shape is the useful part, and it is mechanical.** Diff the method names
+`emit_list_method` handles against the names the builtin `List` block types:
+
+| | names |
+|---|---|
+| codegen `emit_list_method` (`:1126-1657`) | `concat` `contains` `get` **`join`** `pop` `push` `set` `slice` |
+| typecheck builtin `List` arm (`:9220-9309`) | `all` `any` `clear` `collect` `concat` `contains` `count` `filter` `find` `fold` `for_each` `get` `is_empty` `len` `map` `pop` `push` `set` `skip` `slice` `take` |
+
+`join` is the **only** name on the emitting side with no arm on the typing side, which is why this
+cause was 6 rows and not 60 — the two lists had drifted by exactly one name. (Typecheck's side is
+much longer because the eager adapters are typed here and emitted elsewhere, in the shared
+list-or-iterator block at `codegen_methods.bl:3973` — the `qzdz2e` territory.)
+
+**Four fail-open modes, and two of them are worse than anything the campaign has hit so far.** All
+four were reproduced by *running* the programs before the test was written:
+
+| # | program | before |
+|---|---|---|
+| 1 | `let bad: Int = parts.join(",")` | compiled, linked, ran, **printed `a,b`** — a Str bound to an Int-declared name |
+| 2 | `[1, 2].join(",")` | **SEGFAULT**, exit 139, core dumped — `str_join` reads `int64_t` elements as `const char*` |
+| 3 | `[["a"], ["b"]].join(",")` | **exit 0 and binary noise on stdout** — the same cause one shape up, and it does not even crash |
+| 4 | `parts.join(5)` | no diagnostic; `cc`: *passing argument 2 of `blink_std_str_str_join` makes pointer from integer without a cast* |
+
+Modes 2 and 3 are new to this campaign: every earlier missing signature produced a silent
+*miscompile* or a `cc` *escape*, and this one produces **memory unsafety in a compiled program from
+type-correct-looking source**. Mode 3 is the worse of the pair — a segfault is loud, garbage on
+stdout is not — and it is why the receiver check reads the element **kind** rather than enumerating
+the scalar kinds the probes happened to cover.
+
+**The spec pins both halves, so unlike `jr4xf7` there was nothing to decide.**
+`sections/03_types.md:227-238` spells the impl header verbatim — `trait Joinable { fn join(self,
+separator: Str) -> Str }`, `impl Joinable for List[Str]` — and the sealed-builtin-trait table at
+`:521` reads `Joinable | List[Str] | join`. The receiver constraint is in the impl header, which is
+why "nothing checked the receiver" is a bug against the spec and not a gap in it.
+
+**The fix** is one arm beside `concat`: `check_builtin_arg(method, 0, TYPE_STR, ...)` for the
+separator, an element-kind check against `TyKind.Str` for the receiver, `return TYPE_STR`. `join`
+**stays** in `is_builtin_method` — the `n84s1p` invariant (**list ⊇ arms**) applies unchanged in this
+half of the defect, and a name removed from that list starts erroring on a valid call.
+
+**The element check fails open on `Unknown` and `Typevar`, deliberately.** `type_kind` resolves a
+bound metavar, so an inferred `List[Str]` (`let mut xs = []` then `push("a")`) reads as `Str` and is
+judged normally; what is left is a genuinely unresolved element. `fn f[T](xs: List[T]) -> Str {
+xs.join(",") }` cannot be judged at its definition site, and whether that shape should require a
+`T: Joinable` bound is a spec question about generic bounds. A control row pins the current answer so
+a future decision is a deliberate change rather than a silent one.
+
+**Attribution — exact, 6 rows, 3 lines:**
+
+| rows | site | producer |
+|---:|---|---|
+| 2 | `src/cli.bl:935` (`var=cflags`) | `flags.join(" ")` |
+| 2 | `src/cli.bl:3561` (`var=srcs`) | `stdlib_native_dep_source_paths(n).join(",")` |
+| 2 | `src/cli.bl:3563` (`var=defs`) | `stdlib_native_dep_compile_defs(n).join(",")` |
+
+Each line is counted twice — once as `at=cli:` and once as `at=__main__:` — so `cli` went 11 → 8 and
+`__main__` 125 → 122 off the **same** three lines. The other 16 `.join(` call sites in the tree are
+tail-position or interpolated, and the instrument only counts `let` declarations.
+
+**The sweep's `diverge` count went UP by 25, and the fix's own source is the whole reason** — see the
+master-table note. One new `let ek` in `typecheck.bl` × 31 basis roots, every one landing in
+`diverge` as `tid=TyKind flat=Int`, because the flat universe cannot spell an enum. Class B, into a
+cell that already held 682 rows.
+
+**Spun off.** `sq67xq`: **omitting the arguments of a builtin container or `Str` method ICEs the
+compiler** — `parts.join()`, `parts.push()`, `parts.get()`, `parts.contains()` and `"ab".contains()`
+all panic with `unwrap called on None at src/parser.bl:111`. `check_builtin_arg` (`:2087`) returns
+**silently** when the argument is absent, so typecheck reports nothing and codegen then `sublist_get`s
+a short list, gets `-1`, and unwraps a `None` node accessor. One shared repair in the one place that
+knows the expected arity; not part of this fix because it is not join-specific and it is loud rather
+than silent.
+
+**How this half of the defect stands now.** Of the 171 names in `is_builtin_method`, **64** still have
+no `method == "<name>"` comparison anywhere in `typecheck.bl` (was 73 when the organizing note below
+was written; `join` is one of the nine that have since been answered). But that metric is a **proxy
+and it over-counts**: 11 of the 64 are namespace intrinsics now answered by `qjfwc6`/`n84s1p`'s
+signature *table* rather than by an arm, and most of the remaining 53 are real stdlib functions
+reached through the bare `{Type}_{method}` fnsig key (`Duration.to_ms`, the `Row.get_*` family) or are
+already-open causes (the iterator adapters, `Channel.recv`/`send`, `Template.type_tag`, the
+`io.print*` family that `n84s1p` deliberately left listed-but-unsigned). `join` was the last one that
+was a plain missing arm on a **builtin container receiver**. What the audit did surface as genuinely
+new: **`Instant.elapsed()` and `Instant.to_rfc3339()` have no type**, while every other method on
+`Instant`/`Duration` does — `let bad: Int = t.elapsed()` runs and prints `<value>`, and
+`let bad: Int = t.to_rfc3339()` runs and prints the timestamp.
+
+**Test:** `tests/test_jvy35h_list_join_signature.bl`, 15 rows, **8 red / 15 green**. The 7 controls
+(correct join with a length assertion, the empty and single-element edges, tail position and
+interpolation, a struct field receiver, an inferred element, a **user trait method named `join`** on a
+struct receiver keeping its own `-> Int` signature, and the typevar fail-open) were green throughout.
+`task regen` + `task ci` green (646 test files, 0 failed; fmt 1512 passed, 0 failed).
+
+### Remaining family-A causes, ranked (21 cells / 148 rows)
 
 Re-ranked from the post-`qjfwc6` sweep, by **rows on the 874-file common basis**, grouped by the
 innermost producer (the outermost call is usually a symptom — `.unwrap()` heads many chains, but its
@@ -2774,7 +2890,7 @@ and it is that last one.
 | `Response` / `Request` from the http surface | 10 | — | `tests/test_net_integration.bl`, `test_middleware.bl`, `test_http_server.bl`, all `at=__main__`. **It did not close with `net.*`** — the earlier note guessed it would. `net.request` was the one intrinsic `qjfwc6` left out for a reason of its own (its `Result[Response, NetError]` needs two stdlib struct types a consuming module need not have imported), so these need their own probe |
 | calling a closure-typed **field** (`route.callback`, `logger.log_msg`) | ~11 | — | |
 | ~~**`@derive`-synthesized methods have no signature in typecheck** — `to_json`, `from_json`, `clone`, and the str-backed-enum statics~~ | ~~**19**~~ | **`nxnnxe`** | **CLOSED** — −19 rows, section above. The prediction held to the row and all seven files went to zero. 14 of the 19 moved family A → **class B** (four *different* flat-universe limits: `Result`'s second child erased, an `Option`'s enum inner erased to `Int`, a bare enum erased to `Int`, and `tid=Shape flat=Shape` diverging on identical spelling); the other 5 now `agree`. `agree` +346, the largest of the campaign. **Two names held back on purpose** — `hash` is uncallable today (`pvhaew`) and a signature would claim otherwise, and `to_json`/`from_json` are signed `Str` because the spec's `JsonValue`/`JsonError` do not exist (`169kjt`). Original triage: **Triaged, and it grew.** The old 15-row line lumped two unrelated causes and got both counts wrong: 10 of those rows were the IIFE (**`x3x0qj`**, closed above) and the rest is bigger than it looked once the IIFE rows stopped hiding it. One mechanism, four synthesized shapes: `u.to_json()` → `flat=Str` (`test_derive_serialize.bl`, `test_derive_nested.bl`, `test_derive_deserialize.bl:13`, `test_derive_list_deser.bl:30`), `T.from_json(..)` → `flat=Result[Void, Str]` (`test_derive_deserialize.bl` ×2, `test_derive_enum_deser.bl` ×2, `test_derive_list_deser.bl`, `test_str_backed_enum.bl` ×2), `x.clone()` → `flat=Point`/`Int`/`Shape` (`test_derive_clone.bl` ×3), and the str-backed statics → `flat=Option[Int]` (`test_str_backed_enum.bl` ×4). Nothing declares these — `@derive` synthesizes them in codegen, so there is no `node_type_ann` to read and no fnsig to look up. **The `qjfwc6` shape: a table, not arms** — one `FnSigEntry` per derived method per deriving type, minted where the derive is registered. Now the largest actionable cause, and it subsumes the separate `Status.from_str` line below |
-| `List.join` on a `List[Str]` | ~4 | — | `src/cli.bl:935`, `:3561`, `:3563`. From the `rbd0a4` tail; the last of the allow-list-vs-dispatch shape |
+| ~~`List.join` on a `List[Str]`~~ | ~~4~~ **0** | **`jvy35h`** | **CLOSED — −6 rows**, section below, and the row's estimate was low for the usual reason: 3 sites × 2 roots. It was the last allow-list-vs-dispatch entry in the tail and it turned out to be the **worst-consequence** one so far — nothing checked the RECEIVER, so `[1, 2].join(",")` segfaulted inside `str_join` and `[["a"], ["b"]].join(",")` printed binary noise at exit 0. The spec pins both halves (`impl Joinable for List[Str]`, `fn join(self, separator: Str) -> Str`), so unlike `jr4xf7` there was no question to answer |
 | ~~`bytes.to_str()` → `Result[Str, Str]`~~ | ~~3~~ **0** | **`n84s1p`** | **CLOSED as a mis-attribution, not as a cause.** All 3 rows were `src/lsp.bl:51`, and `Bytes.to_str` has had its signature since `typecheck.bl:9495` (`make_result_type(TYPE_STR, TYPE_STR)`) — the whole time this row claimed it did not. `:51` consumes `:50`'s `io.read_bytes`, so its receiver was untyped and the rows were purely **downstream**; they retired with `n84s1p` and no `Bytes` arm was touched. This is the third attribution in this ranking derived from a line number rather than from the row's `var=` field and wrong for it |
 | ~~`Status.from_str` — the compiler-synthesized static on a str-backed enum, returning `Option[Enum]`~~ | ~~4~~ | **`nxnnxe`** | **Folded into the `@derive` row above** — same producer, same missing table, closed with it. It was listed separately only because the `flat=Option[Int]` spelling put it in a different part of the tail. The fold was correct: one `register_derive_method_sig` call closed all 4, and they were the four rows that moved to `tid=Option[Status]` |
 | ~~an immediately-invoked closure, `fn(..) -> T { .. }()`~~ | ~~10~~ | **`x3x0qj`** | **CLOSED** — −10 rows, section above. Was hidden inside the `@derive`/`Result` line, which is how a `flat=`-organized tail hides a callee-shape cause. One missing `callee_kind` branch left the result type, the arity **and** the callee body unchecked; a **silent miscompile** and two `cc` escapes. First fix whose rows moved family A → class B rather than leaving `diverge` |
@@ -2801,18 +2917,18 @@ it the pattern also matches inside `flat=`), because the flat spelling and the p
 different questions and disagreeing on which is "the" count is how the Ptr entry once acquired two
 figures:
 
-| module | family-A rows | | after `cttrag` | after `nxnnxe` | after `x3x0qj` | after `w089a0` | after `qjfwc6` | after `h3q81d` | after `jzvxav` | after `w13xgb` | after `rbd0a4` |
-|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| `__main__` (the root being compiled) | **125** | | 129 | 129 | 148 | 158 | 171 | 174 | 223 | 225 | 237 |
-| `std_libc` | **0** | | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 165 |
-| `std_net_tcp` | **0** | | 0 | 0 | 0 | 0 | 0 | 40 | 40 | 40 | 40 |
-| `std_db_row` | **0** | | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 12 | 12 |
-| `cli` | 11 | | 11 | 11 | 11 | 11 | 11 | 11 | 11 | 11 | 11 |
-| `std_db_sqlite` | 9 | | 9 | 9 | 9 | 9 | 9 | 9 | 9 | 9 | 9 |
-| `incremental` / `file_watcher` | **0 each** | | 0 each | 6 each | 6 each | 6 each | 6 each | 6 each | 6 each | 6 each | 6 each |
-| `lsp` | **0** | | 4 | 4 | 4 | 4 | 4 | 6 | 6 | 6 | 6 |
-| `std_testing` | **0** | | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 3 | 3 |
-| `std_http_server` / `pkg_resolver` / `build_stdlib` | 3 each | | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each |
+| module | family-A rows | | after `n84s1p` | after `cttrag` | after `nxnnxe` | after `x3x0qj` | after `w089a0` | after `qjfwc6` | after `h3q81d` | after `jzvxav` | after `w13xgb` | after `rbd0a4` |
+|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `__main__` (the root being compiled) | **122** | | 125 | 129 | 129 | 148 | 158 | 171 | 174 | 223 | 225 | 237 |
+| `std_libc` | **0** | | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 165 |
+| `std_net_tcp` | **0** | | 0 | 0 | 0 | 0 | 0 | 0 | 40 | 40 | 40 | 40 |
+| `std_db_row` | **0** | | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 12 | 12 |
+| `cli` | **8** | | 11 | 11 | 11 | 11 | 11 | 11 | 11 | 11 | 11 | 11 |
+| `std_db_sqlite` | 9 | | 9 | 9 | 9 | 9 | 9 | 9 | 9 | 9 | 9 | 9 |
+| `incremental` / `file_watcher` | **0 each** | | 0 each | 0 each | 6 each | 6 each | 6 each | 6 each | 6 each | 6 each | 6 each | 6 each |
+| `lsp` | **0** | | 0 | 4 | 4 | 4 | 4 | 4 | 6 | 6 | 6 | 6 |
+| `std_testing` | **0** | | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 3 | 3 |
+| `std_http_server` / `pkg_resolver` / `build_stdlib` | 3 each | | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each |
 
 **Three consecutive fixes have now landed their whole delta in `__main__` and nowhere else** —
 `w089a0`'s −13 (171 → 158), `x3x0qj`'s −10 (158 → 148) and `nxnnxe`'s −19 (148 → 129). That is the
@@ -2850,6 +2966,16 @@ whole modules since `jzvxav` took `std_db_row` and `std_testing` together. It al
 by two rows**, which is the useful reading of a per-module view: a module reaching zero means every
 producer written in it is accounted for, and only three of the compiler's own files still appear
 (`cli`, `lsp`, and `__main__` when the compiler compiles itself).
+
+**`jvy35h` took `cli` from 11 to 8, and it is the first fix whose delta splits evenly between a named
+module and `__main__` for a mechanical reason worth recording.** Its 6 rows are *three* source lines —
+`src/cli.bl:935`, `:3561`, `:3563`, all `List[Str].join(sep)` — counted **twice each**, once with
+`at=cli:` when a root imports `cli` and once with `at=__main__:` when `cli.bl` is itself the root under
+compilation. Every earlier per-module attribution had the two buckets holding different lines; this one
+has the same three lines in both. So a module's figure and the `__main__` figure are not disjoint
+populations, and a fix to the compiler's own source will always appear in both columns. `cli` is now the
+only compiler file left in this table, at 8 rows across 8 distinct sites — the flattest tail the
+instrument has measured.
 
 **With `nxnnxe` closed, the top of the ranking is no longer actionable by row count**, and that is
 worth stating plainly because it changes how the remaining prerequisites should be picked. The two

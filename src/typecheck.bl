@@ -9257,6 +9257,37 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 check_builtin_arg(method, 0, obj_t, args_sl, "List")
                 return obj_t
             }
+            // br jvy35h: `join` reached here as a NAME with no type. It is in
+            // is_builtin_method (:6299) — which is what lets it past the E0505
+            // and W0501 gates — and codegen has always emitted
+            // `str_join(obj, delim) -> CT_STRING` (codegen_methods.bl:1620), so
+            // the C was right and typecheck said TYPE_UNKNOWN. That unified with
+            // anything four ways: `let bad: Int = parts.join(",")` ran and
+            // printed `a,b`; a non-Str separator reached cc; and, because
+            // nothing checked the RECEIVER, `[1, 2].join(",")` segfaulted inside
+            // str_join reading int64 as `const char*` while
+            // `[["a"], ["b"]].join(",")` printed binary noise at exit 0.
+            //
+            // sections/03_types.md:227-238 spells the impl header exactly —
+            // `impl Joinable for List[Str]`, `fn join(self, separator: Str) ->
+            // Str` — and the sealed-trait table at :521 reads
+            // `Joinable | List[Str] | join`. So BOTH the separator and the
+            // element type are pinned by the spec, not chosen here.
+            //
+            // The element check fails open on Unknown and Typevar. type_kind
+            // resolves a bound metavar, so a pinned α reads as its solution;
+            // what is left is a genuinely unresolved element — a typevar in a
+            // generic fn body (`fn f[T](xs: List[T]) -> Str { xs.join(",") }`)
+            // cannot be judged at the definition site, and whether that shape
+            // should require a bound is a spec question about generic bounds.
+            if method == "join" {
+                check_builtin_arg(method, 0, TYPE_STR, args_sl, "List")
+                let ek = type_kind(elem)
+                if ek != TyKind.Str && ek != TyKind.Unknown && ek != TyKind.Typevar {
+                    tc_error_at("List.join requires List[Str], got {type_to_str(obj_t)}", node)
+                }
+                return TYPE_STR
+            }
             if method == "map" {
                 let cls = closure_arg_at(args_sl, 0)
                 check_closure_param(cls, 0, elem, method, "List")

@@ -1,0 +1,215 @@
+// br jvy35h — `List.join` had no signature in typecheck, so the call had no type at all.
+//
+// Codegen has always had exactly one arm for it (src/codegen_methods.bl:1620), emitting
+// `str_join(obj, delim)` with `expr_result_type = CT_STRING`. Typecheck knew only the NAME:
+// `join` sits in is_builtin_method (src/typecheck.bl:6299) as a bare string returning 1, with
+// no type behind it, and the builtin List block in infer_type (src/typecheck.bl:9220) had arms
+// for len/get/push/set/pop/clear/slice/concat/contains and none for join. So the method-call
+// node inferred TYPE_UNKNOWN, which unifies with anything.
+//
+// THE SPEC IS EXACT, so none of this was an open question. sections/03_types.md:227-238 spells
+//     trait Joinable { fn join(self, separator: Str) -> Str }
+//     impl Joinable for List[Str]
+// and the sealed-builtin-trait table at :521 reads `Joinable | List[Str] | join`. Both the
+// separator type and the RECEIVER's element type are pinned by that impl header.
+//
+// FOUR fail-open modes, each reproduced with `build/blink run` before this file existed. They
+// are listed here because the differences are what the rows below have to assert on — a bare
+// "is a TypeError" would have passed against a program that failed for an unrelated reason:
+//
+//   1. SILENT MISCOMPILE. `let bad: Int = parts.join(",")` compiled, linked, ran and printed
+//      `a,b` — a Str bound to an Int-declared name. The declared-type compare is skipped when
+//      the initializer is TYPE_UNKNOWN.
+//   2. SEGFAULT. `[1, 2].join(",")` — nothing checked the receiver, so str_join read int64
+//      elements as `const char*`. Exit 139, core dumped.
+//   3. GARBAGE. `[["a"], ["b"]].join(",")` — same cause one shape up, and it did not even
+//      crash: exit 0, and it printed binary noise. Worse than the segfault, because a crash is
+//      at least loud.
+//   4. CC ESCAPE. `parts.join(5)` produced no diagnostic and reached the C compiler:
+//      `passing argument 2 of blink_std_str_str_join makes pointer from integer without a cast`.
+//
+// This is the same shape as qjfwc6 and n84s1p: an allow-list that names a method with nothing
+// behind it. `is_builtin_method` is the ORIGINAL sighting of that class — forty-odd names
+// returning 1, no types anywhere. The repair is not to remove `join` from it (that list also
+// gates E0505 and W0501, and removing a name there would make a valid call error); it is to
+// give typecheck the signature codegen already implements.
+//
+// THE ELEMENT CHECK FAILS OPEN FOR AN UNRESOLVED ELEMENT, deliberately. A typevar element in a
+// generic fn body (`fn f[T](xs: List[T]) -> Str { xs.join(",") }`) cannot be judged at the
+// definition site, and whether that shape should require a `T: Joinable` bound is a spec
+// question about generic bounds, not this ticket. The control row at the bottom pins the
+// current answer so a future decision is a deliberate change and not a silent one.
+//
+// NOT COVERED HERE: `parts.join()` with the argument omitted ICEs the compiler
+// (`panic: unwrap called on None at src/parser.bl:111`). That is sq67xq, and it is not
+// join-specific — `parts.push()`, `parts.get()`, `parts.contains()` and `"ab".contains()` all
+// ICE identically, because check_builtin_arg (src/typecheck.bl:2087) returns silently when the
+// argument is absent. One shared repair, its own ticket, its own test.
+
+import compile_test_helpers
+
+fn entry(body: Str) -> Str {
+    let mut s = "fn main() \{\n"
+    s = s.concat(body)
+    s = s.concat("}\n")
+    s
+}
+
+fn with_parts(body: Str) -> Str {
+    let mut s = "    let parts: List[Str] = [\"a\", \"b\"]\n"
+    s = s.concat(body)
+    entry(s)
+}
+
+// ── mode 1: the declared-type compare was skipped, so this RAN ──
+
+// The teeth of the file. Before the fix this compiled, linked and printed `a,b`. Asserted on
+// the MESSAGE and not just the code, because "declared type Int but got Str" is what proves
+// join resolved to Str specifically — an arm returning any other concrete type would satisfy
+// a bare TypeError assertion.
+test "a joined Str cannot bind to an Int-declared name" {
+    let src = with_parts("    let bad: Int = parts.join(\",\")\n    io.println(\"\{bad}\")\n")
+    let out = compile_test_helpers.compile_and_capture(src, "jvy35h_decl")
+    assert(out.contains("declared type Int but got Str"))
+}
+
+// The type must PROPAGATE, not merely exist at the call node: through an unannotated
+// intermediate let, which is the form the compiler's own source uses at src/cli.bl:935.
+test "the joined type propagates through an unannotated let" {
+    let src = with_parts("    let s = parts.join(\",\")\n    let bad: Int = s\n    io.println(\"\{bad}\")\n")
+    compile_test_helpers.expect_compile_error(src, "jvy35h_propagate", "TypeError")
+}
+
+// ...and into argument position, where the failure mode is different again: a skipped argument
+// check produces no diagnostic at all rather than a wrong-but-quiet binding.
+test "a joined Str cannot pass as an Int parameter" {
+    let mut s = "fn want_int(n: Int) -> Int \{ n }\n\n"
+    s = s.concat(with_parts("    io.println(\"\{want_int(parts.join(\",\"))}\")\n"))
+    compile_test_helpers.expect_compile_error(s, "jvy35h_argpos", "TypeError")
+}
+
+// ...and into the RECEIVER of the next method in a chain. Before the fix the receiver of
+// starts_with was untyped, so its own argument check was skipped too and the mistyped Int
+// reached cc — one missing signature disabling a check two calls downstream.
+test "a joined Str is a Str receiver for the next call in the chain" {
+    let src = with_parts("    let hit = parts.join(\",\").starts_with(5)\n    io.println(\"\{hit}\")\n")
+    compile_test_helpers.expect_compile_error(src, "jvy35h_chain", "TypeError")
+}
+
+// ── modes 2 and 3: the receiver was never checked ──
+
+// `impl Joinable for List[Str]` is the whole surface; a List[Int] receiver has no join. Before
+// the fix this compiled and segfaulted, so the row asserts a compile-time diagnostic — the
+// only outcome that is neither a crash nor garbage.
+test "join on a List[Int] receiver is rejected" {
+    let src = entry("    let nums: List[Int] = [1, 2]\n    io.println(nums.join(\",\"))\n")
+    let out = compile_test_helpers.compile_and_capture(src, "jvy35h_int_elem")
+    assert(out.contains("List.join requires List[Str]"))
+}
+
+// The nested shape, which did not crash: exit 0 and binary noise on stdout. Same cause, and it
+// is here as its own row because "it segfaults" is not the general symptom — "the element type
+// is not Str" is.
+test "join on a List[List[Str]] receiver is rejected" {
+    let src = entry("    let nested: List[List[Str]] = [[\"a\"], [\"b\"]]\n    io.println(nested.join(\",\"))\n")
+    let out = compile_test_helpers.compile_and_capture(src, "jvy35h_nested_elem")
+    assert(out.contains("List.join requires List[Str]"))
+}
+
+// A struct element type, to prove the check reads the element KIND and does not merely
+// enumerate the scalar kinds it was tested against.
+test "join on a List of structs is rejected" {
+    let mut s = "type Pt \{\n    x: Int\n}\n\n"
+    s = s.concat(entry("    let pts: List[Pt] = [Pt \{ x: 1 }]\n    io.println(pts.join(\",\"))\n"))
+    let out = compile_test_helpers.compile_and_capture(s, "jvy35h_struct_elem")
+    assert(out.contains("List.join requires List[Str]"))
+}
+
+// ── mode 4: the separator was never checked ──
+
+// Asserted on the message: "argument 1 of 'List.join' expects Str" proves the separator is
+// checked against the signature's parameter and not, say, against the element type.
+test "a non-Str separator is rejected at typecheck, not by the C compiler" {
+    let src = with_parts("    io.println(parts.join(5))\n")
+    let out = compile_test_helpers.compile_and_capture(src, "jvy35h_sep")
+    assert(out.contains("argument 1 of 'List.join' expects Str"))
+}
+
+// ── controls: every shape that worked must keep working ──
+
+// A fix that resolved join to the WRONG type would satisfy every error row above and fail
+// here. The len() assertion is what pins the RESULT and not just the type: a wrong separator
+// or a dropped element gives a different length.
+test "a correctly typed join compiles and runs" {
+    let src = with_parts("    let s: Str = parts.join(\"-\")\n    io.println(\"s=\{s}|len=\{s.len()}\")\n")
+    let r = compile_test_helpers.compile_and_run(src, "jvy35h_good")
+    assert(r.exit_code == 0)
+    assert(r.out.contains("s=a-b|len=3"))
+}
+
+// The empty and single-element cases, where str_join returns early — these go through the same
+// new arm and must not acquire a diagnostic.
+test "join on empty and single-element lists still runs" {
+    let mut b = "    let none: List[Str] = []\n"
+    b = b.concat("    let one: List[Str] = [\"solo\"]\n")
+    b = b.concat("    io.println(\"e=[\{none.join(\",\")}]|o=[\{one.join(\",\")}]\")\n")
+    let r = compile_test_helpers.compile_and_run(entry(b), "jvy35h_edges")
+    assert(r.exit_code == 0)
+    assert(r.out.contains("e=[]|o=[solo]"))
+}
+
+// Tail position (the src/formatter.bl:64 and src/docgen.bl:452 shape) and interpolation (the
+// examples/json_validator.bl:48 shape) — the two forms in the tree that are NOT a `let`
+// declaration, and so were never counted by the divergence instrument.
+test "join as a fn tail return and inside interpolation still runs" {
+    let mut s = "fn render(xs: List[Str]) -> Str \{\n    xs.join(\"/\")\n}\n\n"
+    s = s.concat(entry("    let xs: List[Str] = [\"usr\", \"bin\"]\n    io.println(\"p=\{render(xs)}|i=\{xs.join(\"+\")}\")\n"))
+    let r = compile_test_helpers.compile_and_run(s, "jvy35h_tail")
+    assert(r.exit_code == 0)
+    assert(r.out.contains("p=usr/bin|i=usr+bin"))
+}
+
+// A List[Str] reached through a struct field rather than a local, so the element type comes
+// from the field's declared type and not from a list literal in the same scope.
+test "join on a List[Str] struct field still runs" {
+    let mut s = "type Rec \{\n    parts: List[Str]\n}\n\n"
+    s = s.concat(entry("    let r = Rec \{ parts: [\"usr\", \"bin\"] }\n    io.println(r.parts.join(\"/\"))\n"))
+    let r = compile_test_helpers.compile_and_run(s, "jvy35h_field")
+    assert(r.exit_code == 0)
+    assert(r.out.contains("usr/bin"))
+}
+
+// A list whose element type is pinned by inference rather than annotated — the metavar path
+// (gqg3rk). The new arm resolves the element before judging it, so a pinned α reads as Str.
+test "join on an inferred List[Str] still runs" {
+    let mut b = "    let mut xs = []\n    xs.push(\"a\")\n    xs.push(\"b\")\n"
+    b = b.concat("    io.println(xs.join(\"-\"))\n")
+    let r = compile_test_helpers.compile_and_run(entry(b), "jvy35h_metavar")
+    assert(r.exit_code == 0)
+    assert(r.out.contains("a-b"))
+}
+
+// THE HIJACK CONTROL. The new arm lives inside the `obj_k == TyKind.List` block, so a user
+// method named `join` on a struct receiver must still resolve to its own signature. Asserted on
+// the message — "declared type Str but got Int" proves the call resolved to the user's
+// `-> Int` and not to the builtin's `-> Str`. (Joinable itself is sealed, E0907, so a user
+// impl has to be of a differently-named trait.)
+test "a user trait method named join keeps its own signature" {
+    let mut s = "trait Mergeable \{\n    fn join(self, sep: Str) -> Int\n}\n\n"
+    s = s.concat("type Box \{\n    n: Int\n}\n\n")
+    s = s.concat("impl Mergeable for Box \{\n    fn join(self, sep: Str) -> Int \{\n        self.n + sep.len()\n    }\n}\n\n")
+    s = s.concat(entry("    let b = Box \{ n: 4 }\n    let bad: Str = b.join(\"xy\")\n    io.println(\"\{bad}\")\n"))
+    let out = compile_test_helpers.compile_and_capture(s, "jvy35h_user_join")
+    assert(out.contains("declared type Str but got Int"))
+}
+
+// THE DELIBERATE FAIL-OPEN, pinned. A typevar element is unjudgeable at the definition site,
+// so join on List[T] compiles — and at T = Str it is correct. Whether List[T].join should
+// require a bound is a spec question; this row makes any future answer a deliberate change.
+test "join on a typevar element compiles and runs at T = Str" {
+    let mut s = "fn joiner[T](xs: List[T]) -> Str \{\n    xs.join(\",\")\n}\n\n"
+    s = s.concat(with_parts("    io.println(joiner(parts))\n"))
+    let r = compile_test_helpers.compile_and_run(s, "jvy35h_typevar")
+    assert(r.exit_code == 0)
+    assert(r.out.contains("a,b"))
+}
