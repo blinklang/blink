@@ -224,7 +224,9 @@ not Stage 3 work:
 | `ta51an` | P2 | *(the spec's own disambiguation form)* `Trait.method(receiver, args)` — §3c's **only** way to disambiguate a method two traits both define — was unchecked in typecheck and mis-resolved in codegen, so a **wrong trait qualifier silently called the other trait's method**. **−1 row**; byproduct `td3yx5` (`type:spec`: `Bool`/`Int` interchange contradicts the 5-0 no-truthiness vote) |
 | `wnbsen` | P2 | *(the last unblocked family-A cause)* `tc_scoped_value_memo` had no `IfExpr` arm, so a block-`let` whose initializer ends in an `if`/`else` built from a block-local had **no type at all** — **−1 row, family A 101 → 100**, section below |
 | `gmb211` | P2 | *(`wnbsen`'s byproduct, one line above it)* the recovery is gated on `inferred_tid == TYPE_UNKNOWN`, so a **partially** erased `List[?]` counted as an answer and the memo was never read. Every carrier erased; three silent miscompiles and a `cc` escape. Class B, so family A holds at **100**; fixed with a hole-only predicate plus a **position-wise** fill that cannot overwrite a concrete position or pin a metavar |
-| `08a267` | P2 | *(the four `tid=List[?]` rows `gmb211` did **not** move)* a list literal whose **first** element is a spread — `[..a]` — infers `List[?]`, because `infer_type`'s ListLit arm takes the element type from element 0 only and has **no `SpreadExpr` arm**. Position is the axis: `["q", ..a]` is correct. A **silent wrong value**, not just a laundered declaration. Flat is right and the tid is wrong, so the authority flip converts it into a hard miscompile |
+| `08a267` | P2 | *(the four `tid=List[?]` rows `gmb211` did **not** move)* **CLOSED, −4 rows.** A list literal whose **first** element is a spread — `[..a]` — inferred `List[?]`, because `infer_type`'s ListLit arm takes the element type from element 0 only and has **no `SpreadExpr` arm**. Position is the axis: `["q", ..a]` was already correct. A **silent wrong value**, not just a laundered declaration. Fixed by naming the right concept — what an element *contributes*, which for a spread is its operand's element — in one function; the signature diff is those four rows and nothing else. Byproducts: `q1pxhm`, `ehn3s9` |
+| `q1pxhm` | P2 | *(the check §2.16 mandates and neither phase performs, blocked on `08a267`)* the spread source's element type is never compared against the literal's — `sections/02_syntax.md:863`, panel vote 5-0 — so `["q", ..a]` with `a: List[Int]` **SIGSEGVs** (exit 139) with no diagnostic at all. Depends on `08a267`: a contribution cannot be compared until it can be computed |
+| `ehn3s9` | P2 | *(`08a267`'s codegen half, and **not** a prerequisite)* `emit_list_lit` recovers a leading spread's element with `get_list_elem_type(src_str)`, keyed on the **emitted C expression string** — the `hgd2az` hazard shape — so a variable source hits and a **call** source misses and defaults to `Int`. `let b = [..mk_strs()]` prints the `Str` pointer as an integer, and a `Str`-declared read of that element makes `.len()` a codegen `error[UnresolvedMethod]`. The tid already holds `List[Str]`, so the authority flip **fixes** this rather than breaking it; the shape is pinned in the corpus and the counter names it |
 | `f9hgt9` | P2 | *(the level `gmb211` stops short of)* an unannotated **nested** list literal — `let ys = [["ab"]]`, no block-`let` anywhere — fabricates an `Int` element at depth 2; the tid is now `List[List[Str]]` and codegen's flat side is `List[List[Int]]`. A class-B cell Stage 3's lowering subsumes |
 
 `k9agr8` gates the *measurement*, not the code: without it Stage 3 can only demonstrate 0
@@ -3739,7 +3741,7 @@ is a spread. `infer_type`'s ListLit arm takes the element type from element 0 on
 and prints `bad=94036413253206`. It is **not** a homogeneity gap — `let b = [1, "x"]` compiles today with
 no spread anywhere. Like `gmb211` it is a Stage 3 **prerequisite** rather than a subsumed cell: the flat
 side is *right* and the tid is *wrong*, so the authority flip converts it from a fail-open into a hard
-miscompile.
+miscompile. **Now CLOSED — see the section below**, where all four rows flipped and nothing else moved.
 
 **The nested case reached the tid and stopped one level short of the value.** `[[p]]` now recovers
 `List[List[Str]]`, and codegen still fabricates an `Int` element at depth 2 — reading the inner element
@@ -3754,6 +3756,83 @@ errors**. Test: `tests/test_gmb211_partial_erasure_recovery.bl`, 15 rows, with t
 (`feedback_corpus_sweep_is_not_coverage`), three pins for what already worked (no block-local, a scalar
 tail, a `match` tail) and a **monotonicity** pin — an `Int` element declared `Str` must still be rejected,
 because the widened gate now runs the recovery over shapes that already had a complete answer.
+
+### 08a267 — the element type an element *contributes*, which a spread does not have (CLOSED, −4 rows)
+
+**`gmb211`'s four leftovers, and the narrowest fix in this document.** `infer_type`'s ListLit arm
+(`typecheck.bl:10493`) took the literal's element type from element 0 with `infer_type(elem)`, and
+`infer_type` has **no `SpreadExpr` arm** — so `[..a]` read `TYPE_UNKNOWN` and the literal came out
+`List[?]`. **Position is the axis, not the presence of a spread**, which is what proves the arm and not
+the spread machinery is at fault:
+
+| literal | before | after |
+|---|---|---|
+| `[..a]` | `tid=List[?]` | `List[Str]` — **agree** |
+| `[..a, "q"]` | `tid=List[?]` | `List[Str]` — **agree** |
+| `[..a, ..c]` | `tid=List[?]` | `List[Str]` — **agree** |
+| `[..x, 99, ..y]` | `tid=List[?]` | `List[Int]` — **agree** |
+| `["q", ..a]` | `List[Str]` | `List[Str]` — already right, pinned |
+
+**Fail-open modes, each reproduced by running a program:** `let bad: Int = b.get(0).unwrap()` **silent**,
+ran and printed `bad=x` — an `Int`-declared binding holding a `char*`; through `Option`
+(`let a: List[Option[Str]] = [Some("x")]`) **silent and the printed value is wrong**,
+`bad=94036413253206`, the `Str` pointer as an integer; and the element passed to an `Int` **parameter**
+escapes to `cc` with no Blink span — *makes integer from pointer without a cast*.
+
+**Not a homogeneity gap, measured rather than assumed.** `let b = [1, "x"]` compiles today with no
+spread anywhere. §2.16 says nothing about a heterogeneous plain literal, so the fix stops at the spread.
+
+**The fix names the right concept, and that is why it is one function.** What an element needs to
+answer is not "what is my type" but **what element type do I contribute**: a spread contributes its
+operand's *element*, everything else contributes itself.
+
+    fn tc_list_elem_contribution(elem: Int) -> Int {
+        if node_kind(elem) != NodeKind.SpreadExpr { return infer_type(elem) }
+        let src_t = tc_resolve(infer_type(node_value(elem)))
+        if tc_tid_kind(src_t) == TyKind.List { .. tc_tid_child(src_t, 0) .. }
+        TYPE_UNKNOWN
+    }
+
+Three details are load-bearing:
+
+- **`tc_resolve` is required, not defensive.** `tc_tid_child` indexes `ty_pool` directly and answers
+  `-1` for an unresolved metavar; a `-1` child folds back to `TYPE_UNKNOWN` so no caller ever sees a
+  non-tid in a tid slot. This is the same Stage-1 contract `tc_tid_child`'s own header records.
+- **A non-`List` operand contributes `TYPE_UNKNOWN` rather than a guess.** `[..7]` is a spec violation
+  (§2.16), not a shape to invent an element for; reporting it belongs with the rest of the spread-source
+  check (`q1pxhm`) where the diagnostic can name the real rule.
+- **The helper is called for elements 1..N too**, inside the `tydqe6` visit loop. A spread operand had
+  never been inferred **at all** — `infer_type` has no arm for the node — so `..some_call()` wrote no
+  per-node tid memo. It does now, on every path.
+
+**Attribution, exact, and this fix is surgical.** `diverge` **4283 → 4279**, cells **395 → 394**,
+family A holds at **100** / 11 cells (these rows are `List[?]`, partially erased, so class B and family A
+was never expected to move). The signature diff on the 874-file common basis is **four lines and nothing
+else** — `site=emit_let_binding.decl var=b/d/w/z tid=List[?] flat=List[Int]`, all four in
+`tests/test_spread_list.bl`, which now reports **zero** diverge rows. `agree` **+97 = 3 × 31 + 4**: three
+new declarations × the 31 roots that compile `typecheck.bl`, plus the four flipped rows.
+
+**The call-source shape is now a *pin* rather than a hole, and that is the measurement worth keeping.**
+`let b = [..mk_strs()]` reads `tid=List[Str] flat=List[Int]` — tid right, flat wrong. `emit_list_lit`
+(`codegen_expr.bl:5912`) recovers a leading spread's element with `get_list_elem_type(src_str)`, keyed on
+the **emitted C expression string**: a variable name hits the flat table, a call temp misses and the
+element defaults to `Int`. So `io.println("{b.get(0).unwrap()}")` prints `0=94540132406870`, and a
+`Str`-declared read of the same element makes `.len()` an `error[UnresolvedMethod]` from
+`codegen_methods.bl:5465` — the receiver's *name* is `Str` but its flat ctype is not `CT_STRING`. Filed as
+**`ehn3s9`**. It is the `hgd2az` string-keyed hazard shape again, it is **not** a Stage-3 prerequisite —
+the tid already holds the right answer, so the authority flip fixes it — and the test row keeps the shape
+in the corpus so the counter names it. §2.16's "v1 does not support function call spread"
+(`02_syntax.md:875`) is about `f(..args)`, not about spreading a call's result; the shape is legal.
+
+`task regen` + `task ci` green. Test: `tests/test_08a267_spread_list_elem_type.bl`, 14 rows — six shapes
+written **directly** into the corpus so the instrument can see them
+(`feedback_corpus_sweep_is_not_coverage`), two pins for what already worked (`["q", ..a]` and a plain
+literal), four `expect_compile_error` rows for the declared-type compare **including the call source**
+(which passes today, because typecheck's half is complete independent of codegen), and a **monotonicity**
+pin. That last row is also the one authoring slip worth recording: the shared
+`spread_src(decl, tail, read)` helper hardcodes `let bad: Int = <read>`, so as first written the
+`List[Int]`-source row asserted Int-declared-Int and could never fail. It is rewritten with an explicit
+source declaring `Str`.
 
 ### Remaining family-A causes, ranked (11 cells / ~~116~~ ~~107~~ ~~102~~ ~~101~~ 100 rows)
 

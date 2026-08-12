@@ -8862,6 +8862,33 @@ fn infer_carrier_arg(arg_node: Int, carrier: Str) -> Int ! TypeCheck.Resolve, Ty
     inner
 }
 
+// The element type one list-literal element CONTRIBUTES, which is not the same as its own
+// type: a spread contributes its operand's ELEMENT (`[..a]` where `a: List[Str]` contributes
+// `Str`, not `List[Str]`), while every other element contributes itself. `infer_type` has no
+// `SpreadExpr` arm, so before this the ListLit arm read `TYPE_UNKNOWN` from `..a` and the whole
+// literal came out `List[?]` — erased, and a `?` element is compatible with every declared
+// type, so all four gates failed open at once (br 08a267).
+//
+// The operand is still inferred on every path, spread or not, because that call is what
+// memoizes the per-node tid a CALL-style generic constructor's mono recovery reads (the tydqe6
+// reason below). `..some_call()` had never been inferred at all.
+//
+// A non-List operand contributes TYPE_UNKNOWN rather than a guess: `[..7]` is a spec violation
+// (§2.16), not a shape to invent an element for, and reporting it belongs with the rest of the
+// spread-source check (br q1pxhm) where the diagnostic can name the real rule.
+fn tc_list_elem_contribution(elem: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    if node_kind(elem) != NodeKind.SpreadExpr { return infer_type(elem) }
+    let src_t = tc_resolve(infer_type(node_value(elem)))
+    // `tc_resolve` above is required, not defensive: tc_tid_child indexes ty_pool directly
+    // and answers -1 for an unresolved metavar. A -1 child is still folded back to
+    // TYPE_UNKNOWN so no caller ever sees a non-tid in a tid slot.
+    if tc_tid_kind(src_t) == TyKind.List {
+        let e = tc_tid_child(src_t, 0)
+        if e >= 0 { return e }
+    }
+    TYPE_UNKNOWN
+}
+
 fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let tid = infer_type_uncached(node)
     if node != -1 && node < tc_node_tid.len() {
@@ -10469,7 +10496,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
     if kind == NodeKind.ListLit {
         let elems_sl = node_elements(node)
         if elems_sl != -1 && sublist_length(elems_sl) > 0 {
-            let first_t = infer_type(sublist_get(elems_sl, 0))
+            let first_t = tc_list_elem_contribution(sublist_get(elems_sl, 0))
             // Every element beyond the first must still be visited: infer_type is
             // what memoizes a per-node tid (tc_node_tid), and a CALL-style
             // generic-enum/struct constructor's mono-name recovery
@@ -10482,7 +10509,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             // matching pre-existing homogeneity assumptions and diagnostics.
             let mut ei = 1
             while ei < sublist_length(elems_sl) {
-                infer_type(sublist_get(elems_sl, ei))
+                let _c = tc_list_elem_contribution(sublist_get(elems_sl, ei))
                 ei = ei + 1
             }
             return make_list_type(first_t)

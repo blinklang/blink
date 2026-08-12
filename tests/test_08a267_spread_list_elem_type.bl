@@ -1,0 +1,161 @@
+import compile_test_helpers.{expect_compile_error}
+
+// br 08a267 — a list literal whose FIRST element is a spread infers `List[?]`, so the element
+// type is erased and every gate that reads it fails open.
+//
+// THE CAUSE, in one line: `infer_type`'s ListLit arm (src/typecheck.bl:10472) takes the
+// literal's element type from element 0 with `infer_type(sublist_get(elems_sl, 0))`, and
+// `infer_type` has NO `SpreadExpr` arm — so `..a` reads `TYPE_UNKNOWN` and the literal becomes
+// `List[?]`.
+//
+// POSITION is the axis, not the presence of a spread. A leading literal element already gives
+// the right answer, which is what proves the arm and not the spread machinery is at fault:
+//
+//     let a: List[Str] = ["x"]
+//     let b = [..a]          // tid=List[?]     <- erased
+//     let c = ["q", ..a]     // tid=List[Str]   <- correct today
+//     let d = [..a, "q"]     // tid=List[?]     <- erased
+//
+// The element type a spread contributes is the element type of its OPERAND, which typecheck
+// already holds: `tc_tid_child(operand_tid, 0)`.
+//
+// FAIL-OPEN MODES, each reproduced by RUNNING a program:
+//
+//   1. `let bad: Int = b.get(0).unwrap()` — SILENT. Ran, printed `bad=x`: an Int-declared
+//      binding holding a `char*`, displayed from the flat codegen type.
+//   2. A `List[Option[Str]]` source, `let bad: Int = b.get(0).unwrap().unwrap()` — SILENT and
+//      the printed VALUE is wrong: `bad=94036413253206`, the Str pointer as an integer.
+//   3. The element passed to an `Int` PARAMETER — cc escape, no Blink span:
+//      *makes integer from pointer without a cast*.
+//
+// NOT this ticket, verified rather than assumed:
+//   - A heterogeneous PLAIN literal is unchecked too (`let b = [1, "x"]` compiles today, no
+//     spread anywhere). §2.16 says nothing about it; do not widen this into that.
+//   - The spec's own spread-source rule — sections/02_syntax.md:863, *"The spread source must be
+//     a `List[T]` with the same element type as the list being constructed. Type mismatches are
+//     compile errors"* — is a SEPARATE missing check (br q1pxhm, which segfaults on
+//     `["q", ..a]` with `a: List[Int]`). It depends on this ticket: a contribution cannot be
+//     compared until it can be computed.
+//   - A non-list spread source (`let b = [..7]`) is caught only by cc, with no Blink span. Also
+//     q1pxhm; `expect_compile_error` runs blinkc alone and cannot pin a cc escape.
+
+// ── The shapes written DIRECTLY into the corpus ──────────────────────────────────────
+//
+// Written directly rather than through compile_and_run so the tydiv divergence instrument can
+// see them (feedback_corpus_sweep_is_not_coverage).
+
+test "a leading spread carries the source's element type" {
+    let a: List[Str] = ["ab", "cd"]
+    let b = [..a]
+    assert_eq(b.len(), 2)
+    // A Str-only method on the ELEMENT, so the contributed type has to be right.
+    assert_eq(b.get(0).unwrap().to_upper(), "AB")
+    assert_eq(b.get(1).unwrap().len(), 2)
+}
+
+test "a leading spread followed by a literal element" {
+    let a: List[Str] = ["ab"]
+    let b = [..a, "cd"]
+    assert_eq(b.len(), 2)
+    assert_eq(b.get(0).unwrap().to_upper(), "AB")
+}
+
+test "two spreads contribute the same element type" {
+    let a: List[Str] = ["ab"]
+    let c: List[Str] = ["cd"]
+    let b = [..a, ..c]
+    assert_eq(b.len(), 2)
+    assert_eq(b.get(1).unwrap().to_upper(), "CD")
+}
+
+test "a spread interleaved with literal elements" {
+    let x: List[Int] = [10, 20]
+    let y: List[Int] = [30]
+    let w = [..x, 99, ..y]
+    assert_eq(w.len(), 4)
+    assert_eq(w.get(2).unwrap() + 1, 100)
+}
+
+test "a spread of an empty source still contributes its element type" {
+    let empty: List[Int] = []
+    let d = [..empty, 1, 2]
+    assert_eq(d.len(), 2)
+    assert_eq(d.get(0).unwrap() + 1, 2)
+}
+
+// A CALL source, which is legal: §2.16 spreads `..expr`, and the "v1 does not support
+// function call spread" line at sections/02_syntax.md:875 is about `f(..args)`, not about
+// spreading a call's RESULT.
+//
+// Typecheck now gets this right — the declared-type row below proves it — but CODEGEN still
+// erases the element here, because emit_list_lit recovers a leading spread's element with
+// `get_list_elem_type(src_str)`, keyed on the EMITTED C STRING (codegen_expr.bl:5912). That
+// string is a variable name for a variable source and a temp for a call, so the call misses
+// and the element defaults to Int: `io.println("{b.get(0).unwrap()}")` prints the pointer as
+// an integer. That is br ehn3s9, a Stage-3 cell of the tid collapse — the element assert
+// lives there. What holds today is the copy itself.
+test "a spread of a call result copies the source's elements" {
+    let b = [..mk_strs()]
+    assert_eq(b.len(), 2)
+}
+
+fn mk_strs() -> List[Str] {
+    ["ab", "cd"]
+}
+
+// ── Regression pins ──────────────────────────────────────────────────────────────────
+
+test "a leading literal element was never affected" {
+    let a: List[Str] = ["ab"]
+    let c = ["q", ..a]
+    assert_eq(c.len(), 2)
+    assert_eq(c.get(1).unwrap().to_upper(), "AB")
+}
+
+test "a plain literal with no spread is unchanged" {
+    let b = [1, 2, 3]
+    assert_eq(b.len(), 3)
+    assert_eq(b.get(2).unwrap() + 1, 4)
+}
+
+// ── The declared-type compare (modes 1 and 2) ───────────────────────────────────────
+
+fn spread_src(decl: Str, tail: Str, read: Str) -> Str {
+    "fn go() -> Int \{\n    let a: {decl} = {tail}\n    let b = [..a]\n    let bad: Int = {read}\n    io.println(\"bad=\{bad}\")\n    0\n}\nfn main() \{ let _ = go() }\n"
+}
+
+test "a Str element from a leading spread declared Int is rejected" {
+    expect_compile_error(spread_src("List[Str]", "[\"x\"]", "b.get(0).unwrap()"), "08a267_spread_elem_int", "TypeError")
+}
+
+test "a Str element from a spread with a trailing literal declared Int is rejected" {
+    let src = "fn go() -> Int \{\n    let a: List[Str] = [\"x\"]\n    let b = [..a, \"q\"]\n    let bad: Int = b.get(0).unwrap()\n    io.println(\"bad=\{bad}\")\n    0\n}\nfn main() \{ let _ = go() }\n"
+    expect_compile_error(src, "08a267_spread_trailing_int", "TypeError")
+}
+
+// The typecheck half of the call-source shape, which does NOT depend on codegen: the
+// contribution is computed from the callee's return tid, so the declared-type compare fires.
+test "a Str element from a spread of a call declared Int is rejected" {
+    let src = "fn mk_strs() -> List[Str] \{ [\"ab\", \"cd\"] }\nfn go() -> Int \{\n    let b = [..mk_strs()]\n    let bad: Int = b.get(0).unwrap()\n    io.println(\"bad=\{bad}\")\n    0\n}\nfn main() \{ let _ = go() }\n"
+    expect_compile_error(src, "08a267_spread_call_elem_int", "TypeError")
+}
+
+test "an Option inner from a leading spread declared Int is rejected" {
+    expect_compile_error(spread_src("List[Option[Str]]", "[Some(\"x\")]", "b.get(0).unwrap().unwrap()"), "08a267_spread_option_int", "TypeError")
+}
+
+// ── The argument check (mode 3) ──────────────────────────────────────────────────────
+
+test "a Str element from a leading spread passed to an Int parameter is rejected" {
+    let src = "fn takes_int(n: Int) -> Int \{ n + 1 }\nfn go() -> Int \{\n    let a: List[Str] = [\"x\"]\n    let b = [..a]\n    let r = takes_int(b.get(0).unwrap())\n    io.println(\"r=\{r}\")\n    0\n}\nfn main() \{ let _ = go() }\n"
+    expect_compile_error(src, "08a267_spread_elem_int_param", "TypeError")
+}
+
+// ── The monotonicity pin ─────────────────────────────────────────────────────────────
+//
+// An Int element must still be an Int element: the fix makes a previously-erased position
+// concrete, and it must land on the right type rather than merely on some type.
+test "an Int element from a leading spread declared Str is rejected" {
+    let src = "fn go() -> Int \{\n    let a: List[Int] = [7]\n    let b = [..a]\n    let bad: Str = b.get(0).unwrap()\n    io.println(\"bad=\{bad}\")\n    0\n}\nfn main() \{ let _ = go() }\n"
+    expect_compile_error(src, "08a267_spread_int_elem_str", "TypeError")
+}
