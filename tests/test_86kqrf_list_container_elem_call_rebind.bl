@@ -1,0 +1,154 @@
+// br 86kqrf — an unannotated `let` bound to a CALL returning `List[Set[T]]` or `List[List[T]]` must
+// keep the element's INNER, not just its head.
+//
+// emit_let_binding's list ladder gated its tid stamp on `CT_OPTION || CT_RESULT || CT_MAP`
+// (br bef42x's three kinds), so a CT_SET or CT_LIST element never reached
+// stamp_list_elem_from_tid — and `copy_list_compound_elem` has no arm for either, nor a ScopeVar to
+// read when the RHS is a call. The element kept its head and lost its inner:
+//
+//     bucket=diverge site=emit_let_binding.decl var=g tid=Set[Int] flat=Set[Set[?]]
+//
+// A `Set[Int]` called a `Set[Set[?]]`. One symptom is loud (`for x in g` binds x as `blink_set*`),
+// the other is silent (a `List[Str]` inner iterates as raw pointers), so every row here asserts a
+// VALUE — the loud shape would pass a compiles-only test the moment cc stopped caring.
+//
+// The controls matter as much as the rows: an ANNOTATED declaration and a LOCAL literal already
+// worked, and so did `List[List[Int]]`, because an Int inner and the erased default coincide. That
+// coincidence is why the bug reads as intermittent from the outside.
+
+type Pt { x: Int, y: Int }
+
+fn set_of_ints() -> List[Set[Int]] {
+    let a: Set[Int] = Set()
+    a.insert(1)
+    a.insert(2)
+    let b: Set[Int] = Set()
+    b.insert(3)
+    [a, b]
+}
+
+fn set_of_strs() -> List[Set[Str]] {
+    let a: Set[Str] = Set()
+    a.insert("x")
+    a.insert("y")
+    [a]
+}
+
+fn list_of_strs() -> List[List[Str]] { [["a", "bb"], ["c"]] }
+
+fn list_of_ints() -> List[List[Int]] { [[1, 2], [3]] }
+
+fn list_of_pts() -> List[List[Pt]] { [[Pt { x: 5, y: 1 }, Pt { x: 7, y: 2 }]] }
+
+fn join_strs(l: List[Str]) -> Str {
+    let mut acc = ""
+    for s in l { acc = "{acc}{s}" }
+    acc
+}
+
+// ── The rows: element inner through an unannotated call rebind ───────────────────
+
+test "a Set element's own element survives a call rebind" {
+    let r = set_of_ints()
+    let g = r.get(0).unwrap()
+    let mut n = 0
+    for x in g { n = n + x }
+    assert_eq(n, 3)
+    assert(g.contains(2))
+    assert(!g.contains(9))
+    assert_eq(g.len(), 2)
+
+    let g2 = r.get(1).unwrap()
+    let mut n2 = 0
+    for x in g2 { n2 = n2 + x }
+    assert_eq(n2, 3)
+}
+
+test "a Set[Str] element's own element survives a call rebind" {
+    let r = set_of_strs()
+    let g = r.get(0).unwrap()
+    let mut acc = 0
+    for s in g { acc = acc + s.len() }
+    assert_eq(acc, 2)
+    assert(g.contains("x"))
+    assert(!g.contains("z"))
+}
+
+test "a List[Str] element's own element survives a call rebind" {
+    let q = list_of_strs()
+    let inner = q.get(0).unwrap()
+    assert_eq(join_strs(inner), "abb")
+    let mut acc = ""
+    for s in inner { acc = "{acc}{s}" }
+    assert_eq(acc, "abb")
+    assert_eq(join_strs(q.get(1).unwrap()), "c")
+}
+
+test "a List[Pt] element's struct element survives a call rebind" {
+    let q = list_of_pts()
+    let inner = q.get(0).unwrap()
+    let mut xs = 0
+    for p in inner { xs = xs + p.x }
+    assert_eq(xs, 12)
+    assert_eq(inner.get(1).unwrap().y, 2)
+}
+
+test "a Set element survives collect over a lazy adapter" {
+    let s1 = set_of_ints().filter(fn(s: Set[Int]) -> Bool { s.len() > 1 }).collect()
+    assert_eq(s1.len(), 1)
+    let g = s1.get(0).unwrap()
+    let mut n = 0
+    for x in g { n = n + x }
+    assert_eq(n, 3)
+}
+
+// ── Controls: the shapes that already worked must not move ───────────────────────
+
+test "an annotated declaration is unchanged" {
+    let r: List[Set[Int]] = set_of_ints()
+    let g = r.get(0).unwrap()
+    let mut n = 0
+    for x in g { n = n + x }
+    assert_eq(n, 3)
+
+    let q: List[List[Str]] = list_of_strs()
+    assert_eq(join_strs(q.get(0).unwrap()), "abb")
+}
+
+test "a locally built literal is unchanged" {
+    let s: Set[Int] = Set()
+    s.insert(4)
+    s.insert(5)
+    let loc = [s]
+    let g = loc.get(0).unwrap()
+    let mut n = 0
+    for x in g { n = n + x }
+    assert_eq(n, 9)
+
+    let inner = ["a", "bb"]
+    let loc2 = [inner]
+    assert_eq(join_strs(loc2.get(0).unwrap()), "abb")
+}
+
+test "an Int inner, where the erased default coincided with the truth" {
+    let z = list_of_ints()
+    let zi = z.get(0).unwrap()
+    let mut m = 0
+    for v in zi { m = m + v }
+    assert_eq(m, 3)
+    assert_eq(zi.get(1).unwrap(), 2)
+}
+
+test "a for-in straight over the outer list still sees each container" {
+    let r = set_of_ints()
+    let mut total = 0
+    for s in r {
+        for x in s { total = total + x }
+    }
+    assert_eq(total, 6)
+
+    let q = list_of_strs()
+    let mut acc = ""
+    for inner in q { acc = "{acc}{join_strs(inner)}" }
+    assert_eq(acc, "abbc")
+}

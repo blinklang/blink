@@ -6727,6 +6727,68 @@ producer-blind consumer — a fn parameter, an index, an adapter — plus contro
 scalar keys, the ordinal-zero key and the map *value* of enum type. `task regen` at fixed point;
 `task ci` exit 0, 682 test files, 0 failed.
 
+### A gate that named three kinds, when the stamp already spelled five — br `86kqrf`
+
+The `bef42x` unit flipped authority to the tid inside `emit_let_binding`'s list ladder, but it did so
+behind a gate that lists kinds by hand:
+
+```blink
+if expr_list_elem_type == CT_OPTION || expr_list_elem_type == CT_RESULT || expr_list_elem_type == CT_MAP {
+    copy_list_compound_elem(val_str, name)
+    stamp_list_elem_from_tid(val_node, name)
+}
+```
+
+`stamp_list_elem_from_tid` (`codegen_types.bl:3443`) has **five** faithful arms — CT_OPTION,
+CT_RESULT, CT_MAP, CT_SET (`mv45y5`'s) and CT_LIST (the tail). The gate named three. So an
+unannotated `let` bound to a **call** returning `List[Set[T]]` or `List[List[T]]` never reached the
+stamp, and `copy_list_compound_elem` cannot serve it either: it has no CT_SET or CT_LIST arm, and a
+call RHS has no `ScopeVar` to copy from. The element kept its head and lost its inner:
+
+```
+bucket=diverge site=emit_let_binding.decl var=g tid=Set[Int] flat=Set[Set[?]]
+bucket=diverge site=emit_let_binding.decl var=r tid=List[Set[Int]] flat=List[Set[?]]
+```
+
+A `Set[Int]` called a `Set[Set[?]]`. This is the same erasure family as every other cell in this
+document, and again it is invisible to any predicate over the flat fields, because `sv_tp(CT_SET, -1,
+..)` fabricates an inner rather than reporting that it has none.
+
+**Both failure modes matter, and only one of them is loud.** For a `Set` element the ICE fires
+(`internal compiler error[SetElementTypeUnknownAtCodegen]: for-in over Set variable 's' has no
+element type recorded at codegen`) or `cc` refuses the binder (`assignment to 'int64_t' from
+'blink_set *'`). For a `List[Str]` element **nothing** complains — the inner iterates as raw
+pointers and prints as addresses. Every row of the test therefore asserts a **value**; the loud shape
+would pass a compiles-only test the moment `cc` stopped caring.
+
+The fix is the gate, not a new recovery path: capture the entry CT and stamp for CT_SET / CT_LIST at
+the **end** of the branch, after the flat nested-element channels, so for exactly those two kinds the
+tid is the last writer and the flat pair cannot overwrite a faithful inner with an erased one. The
+Option/Result/Map precedence is unchanged: copy first, tid second.
+
+The ladder exists **twice**, byte-identical, at `codegen_stmt.bl:3870` and `:9740`, so the fix had to
+be written twice — the standing argument for the de-duplication that Stage 4 will make possible.
+
+> **Census, monolithic, 971-file common basis (the new test file excluded):**
+> `diverge` rows **29378 → 29375**, cells **745 → 743**, `agree` **671998 → 672067**, `missing`
+> **73 → 73**, `ctypediv` **276 → 276 rows, identical line for line**. The two cells above cleared;
+> none appeared. Their corpus sources were `tests/test_twq9kz_list_compound_elem_rebind.bl` and
+> `tests/test_85j3j8_list_tuple_elem_through_call.bl` — files written for *other* cells, which is
+> how this one stayed open: neither test asserted the inner container's contents.
+
+The new file was attributed in **both** build modes, monolithic and archive-linked, with the same two
+residual `emit_let_binding.decl` rows in each: `tid=List[Pt] flat=List[Void]` and
+`tid=List[List[Pt]] flat=List[List[Void]]`. Those are the `(CT_VOID, name)` pointer-boxed struct
+element — the name travels out of band and the flat *spelling* drops it — not a lost inner. The rows
+that read them (`p.x` summed to 12, `.get(1).unwrap().y`) pass.
+
+Tests: `tests/test_86kqrf_list_container_elem_call_rebind.bl`, 9 rows — a `Set[Int]`, a `Set[Str]`, a
+`List[Str]`, a `List[Pt]` and a `Set` through `.filter().collect()`, plus four controls that already
+worked and must not move: an annotated declaration, a local literal, a `List[List[Int]]` (an `Int`
+inner *coincides* with the erased default, which is why the bug reads as intermittent), and a
+`for`-in straight over the outer list. `task regen` at fixed point; `task ci` exit 0, 683 test files,
+0 failed.
+
 ## Appendix — all 428 shape cells
 
 Format: `family | occurrences | tid | flat`.
