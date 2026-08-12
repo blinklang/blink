@@ -3592,11 +3592,80 @@ instrument can see them (`feedback_corpus_sweep_is_not_coverage`), and 6 regress
 single-trait call, multi-argument call, trait-bound generic receiver, sealed ops, the still-ambiguous
 *unqualified* call, and an unknown method on a trait name).
 
-### Remaining family-A causes, ranked (11 cells / ~~116~~ ~~107~~ ~~102~~ 101 rows)
+### wnbsen — the `if` tail the recovery forgot, and the gate one line above it (CLOSED, −1 row)
 
-**The tail is now fully enumerated and it is five causes, not a list.** Re-resolved row by row against
+**The last unblocked family-A cause, and it was one missing arm.** `tc_scoped_value_memo`
+(`typecheck.bl:10734`) is the `bfq7nf` recovery for *"a value that names a binding introduced by the
+very construct being inferred"*: `tc_check_body`'s LetBinding arm infers the initializer **before**
+walking it, so at that moment `nr` has no frame for the initializer block and its locals are unknown.
+The recovery reads the tid the in-scope walk memoized one step later. It recurses `WithBlock`,
+`AsyncScope`, `Block` and `MatchExpr` — and had **no `IfExpr` arm**, so
+
+    let s = {
+        let p = "v"
+        if n == 0 { p.concat("-a") } else { p.concat("-b") }
+    }
+
+fell through to `tc_lookup_node_tid(ifexpr)` = `TYPE_UNKNOWN`. A `match` tail spelling the same
+program was typed; the `if` tail was not. Two spellings, two answers.
+
+**Why the mistake is invisible exactly where it is.** `infer_type`'s IfExpr arm (`:10498`) skips the
+branch compare when either side is UNKNOWN and returns *the other branch*. In the speculative pass
+`p` is unknown, so a `Str` branch built from `p` reads UNKNOWN and the arm answers with whatever the
+other branch happens to be. That is why `{ let p = 5  if c { p + 1 } else { p + 2 } }` was never
+affected — an `Int` from an unknown `p` still infers `Int` — and why the family is narrower than "a
+block-`let` with an `if` tail": it needs a branch value whose type comes from the block-local
+**itself**.
+
+**Fail-open modes, each reproduced by running a program:**
+
+| | shape | observed |
+|---|---|---|
+| 1 | `let bad: Int = { let p = "v"  if c { p.concat("-a") } else { .. } }` | **silent.** `blink check` clean, ran, printed `bad=v-a` — an `Int`-declared binding holding a `char*`, displayed from the flat codegen type rather than the declared one |
+| 2 | the same value passed to an `Int` **parameter** | `cc` escape, no Blink span: *makes integer from pointer without a cast* |
+| 3 | an else-if chain, `let bad: Int = ..` | **silent**, printed `bad=v-b` |
+
+**The arm, and the one case it deliberately declines.** Both branch bodies are Blocks the walk did
+memoize, so the answer is there to be read: recurse `node_then_body` / `node_else_body`, return the
+other side when one is UNKNOWN, and `type_merge` when both are known. When the two are known and
+**incompatible** it returns `-1` and declines, for two independent reasons. Merging would return the
+then-branch (`type_merge` returns `a` when the kinds differ), which would make
+`if c { p.concat("-a") } else { 7 }` — **rejected today** — compile. And reporting the mismatch here
+would double-report every ordinary `if`, because `infer_type` reports as a side effect; reading memos
+and never re-inferring is the whole design of this recovery.
+
+`loop { break v }` needed no arm: `let s = loop { .. }` is `error[KeywordAsIdentifier]` — a `loop` is
+not a value expression in Blink at all, so a `loop` block tail is `Void` and today's *"return value
+type Void does not match Str"* is the right answer.
+
+**The byproduct is the gate one line above the recovery, and it is a separate defect.** The recovery
+runs only `if inferred_tid == TYPE_UNKNOWN` (`:11186`). A compound tail value whose **element** names
+a block-local infers as `List[?]` — which is not `TYPE_UNKNOWN` — so the gate is false, the recovery
+never runs, and the erased element stands. Filed as **`gmb211`**, with the contrast that isolates it:
+`let xs = if n == 0 { ["a"] } else { ["b"] }` followed by `let bad: Int = xs.get(0).unwrap()` is
+correctly **rejected**, while wrapping the same `if` in a block-`let` makes it compile and print
+`bad=v-a`. It is not the missing arm — a plain block tail and a `match` tail erase `[p]` identically,
+so the axis is the element, not the tail kind — and it wants a `tc_tid_has_unknown` predicate on the
+`tc_tid_has_bare_typevar` model plus a "take the memo only if strictly better" rule. The row is
+pinned **live** in the test (`var=xs tid=List[?] flat=List[Str]`) so it flips to `agree` when
+`gmb211` closes; it is a class-B cell, and Stage 3 turns it from a fail-open into a miscompile.
+
+**Attribution, exact.** Family-A rows **101 → 100**, cells 11, and the row that left is
+`tests/test_p9ddps_block_let_str_tail.bl:4` — `var=s tid=? flat=Str`, the one the ranked table listed
+as the last unblocked cause. The row-count multiset diff is a single line, nothing else moved. Total
+`agree` moved **+94** = 3 new `let`s × 31 compiler roots + the one row that changed bucket. Family-A
+cells stay 11 because the departing row shared its `(site, tid=?, flat=Str)` shape with `fs.*` rows.
+
+`task regen` + `task ci` green. Test: `tests/test_wnbsen_block_let_if_tail.bl`, 13 rows, 9 passed /
+4 failed before → 13/13 after, with the corpus-direct shapes written **directly** rather than through
+`compile_and_run` so the instrument can see them, and pins for the two neighbours that already worked
+(a `match` tail, `Int`-valued branches) plus the mismatch that must stay rejected.
+
+### Remaining family-A causes, ranked (11 cells / ~~116~~ ~~107~~ ~~102~~ ~~101~~ 100 rows)
+
+**The tail is now fully enumerated and it is four causes, not a list.** Re-resolved row by row against
 the source line each row points at (`var=` first, then the line — the discipline three wrong
-attributions in this map were bought with), the 101 remaining family-A rows are exactly:
+attributions in this map were bought with), the 100 remaining family-A rows are exactly:
 
 | cause | rows | ticket | state |
 |---|---:|---|---|
@@ -3604,11 +3673,12 @@ attributions in this map were bought with), the 101 remaining family-A rows are 
 | channels — `Channel(n)` and `ch.recv()` | **38** | `w3v2e6` | blocked on `8vcj2c` (is the capacity argument's element type under-determined?) |
 | `fs.*` — `fs.read` (3) and `fs.list_dir` (6), plus 9 downstream rows (`entries.get(i).unwrap()`, `entry.substring(..)`) | **18** | `jr4xf7` | `type:spec` — codegen's bare `const char*` vs the spec's `Result` |
 | `p.deref()` / `p.addr()` | **5** | `mwsy85` | `type:spec` |
-| a block-`let` whose initializer is a block — `let s = { .. }` | **1** | — | **unblocked**, no ticket, `tests/test_p9ddps_block_let_str_tail.bl:4` |
+| ~~a block-`let` whose initializer is a block — `let s = { .. }`~~ | ~~1~~ **0** | `wnbsen` | **CLOSED** — the last unblocked one; `tc_scoped_value_memo` had no `IfExpr` arm |
 
-Two consequences worth stating plainly. **Four of the five are held on a decision, not on work** —
+Two consequences worth stating plainly. **All four that remain are held on a decision, not on work** —
 three `type:spec`/panel and one blocked — so the family-A counter cannot reach 0 by fixing code alone,
-and Stage 3's exit gate depends on those decisions landing. And **the `fs.*` figure in the older table
+and Stage 3's exit gate depends on those decisions landing. `wnbsen` was the fifth and the only
+unblocked one, and it is closed. And **the `fs.*` figure in the older table
 below (4) was wrong twice over**: it counted sites, not rows, and it omitted the 9 rows *downstream* of
 the untyped `fs.list_dir` result, which are the same cause one hop out. The `Response`/`Request` row
 below is **stale**: the corpus has **zero** family-A rows naming either type today.
@@ -3732,7 +3802,7 @@ form**: a `with ... as` clause, an `fn(..) { .. }()` call, an `@derive`d type an
 stdlib causes there is no shared module for the rows to concentrate in. It is also why those
 attributions are per-root-file (three, three, seven and three files) rather than per-module, and why
 the `__main__` figure is the one to watch from here — **every** stdlib module is now at zero, and the
-101 remaining family-A rows sit in `__main__` (87), `cli` (8), `std_http_server` (3) and
+100 remaining family-A rows sit in `__main__` (86), `cli` (8), `std_http_server` (3) and
 `build_stdlib` (3). **`cjtxxr` is the sharpest case of that shape yet and worth reading carefully,
 because the CAUSE is in `lib/std/http_server.bl` — three closure fields on `Route`, `Hook` and
 `ErrorHandler` — while every row sits in `__main__`.** The rows land where the field is *invoked*, not

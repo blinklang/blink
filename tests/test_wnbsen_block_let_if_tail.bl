@@ -1,0 +1,179 @@
+import compile_test_helpers.{expect_compile_error}
+
+// br wnbsen — a block-`let` whose initializer block ENDS IN AN `if`/`else` had no type, so
+// the declared type was never compared and the value was laundered into whatever the
+// annotation said.
+//
+// THE CAUSE, in one line: `tc_scoped_value_memo` (src/typecheck.bl:10734) is the bfq7nf
+// recovery for "a value that names a binding introduced by the very construct being
+// inferred" — it recurses `WithBlock`, `AsyncScope`, `Block` and `MatchExpr`, and has NO
+// `IfExpr` arm, so it falls through to `tc_lookup_node_tid(ifexpr)` = TYPE_UNKNOWN.
+//
+// Why the recovery is needed at all: tc_check_body's LetBinding arm infers the initializer
+// BEFORE walking it, so at that moment `nr` has no frame for the initializer block and the
+// block-local `p` is unknown. infer_type's IfExpr arm (typecheck.bl:10498) therefore reads
+// `then_t` = UNKNOWN and returns the OTHER branch — which is why the mistake is invisible
+// exactly when both branches produce a `Str` from a block-local, and why h1 below
+// (`p + 1`, Int from an unknown `p`) was never affected.
+//
+// FAIL-OPEN MODES, each reproduced by RUNNING a program:
+//
+//   1. `let bad: Int = { let p = "v"  if c { p.concat("-a") } else { .. } }` — SILENT.
+//      `blink check` clean, ran, printed `bad=v-a`. An `Int`-declared binding holding a
+//      `char*`, displayed from the flat codegen type rather than the declared one.
+//   2. The same value passed to an `Int` PARAMETER — cc escape, no Blink span:
+//      *passing argument 1 of blink_u_takes_int makes integer from pointer without a cast*.
+//   3. An else-if chain, `let bad: Int = ..` — SILENT, printed `bad=v-b`.
+//
+// BOUNDS, each measured rather than assumed:
+//   - A `match` tail is FINE — `MatchExpr` IS recursed. Pinned below.
+//   - A binding declared OUTSIDE the initializer block is fine: `nr` has its frame.
+//   - Int-valued branches are fine (`p + 1` on an unknown `p` still infers Int), so the
+//     family is narrower than "block-let with an if tail" — it needs a branch value whose
+//     type comes from the block-local ITSELF. Pinned below.
+//   - An annotated `let s: Str = ..` is fine; the annotation is the type.
+//   - `loop { break v }` is NOT a value expression in Blink (`let s = loop { .. }` is
+//     error[KeywordAsIdentifier]), so no `LoopExpr` arm is implied.
+//
+// DELIBERATELY NOT CHANGED, and the reason is that the recovery must not INVENT an answer:
+// when the two branch types are present and incompatible the arm returns -1 and declines,
+// leaving today's diagnostic in place (the last row). Reporting the mismatch here instead
+// would double-report every ordinary `if` — infer_type REPORTS as a side effect, which is
+// the whole reason this recovery reads memos and never re-infers.
+//
+// This is also the last unblocked family-A row of the tid collapse
+// (docs/plans/2026-08-11-tid-collapse-stage2-divergence-map.md): the instrument reads
+// `tests/test_p9ddps_block_let_str_tail.bl:4`, `var=s tid=? flat=Str`.
+
+// ── The shapes written DIRECTLY into the corpus ──────────────────────────────────────
+//
+// Written directly, not through compile_and_run, so the tydiv divergence instrument can see
+// them (feedback_corpus_sweep_is_not_coverage): a generated program is compiled by a
+// separate process the sweep does not tally.
+
+test "a block-let whose if/else tail is built from a block-local is a Str" {
+    let n = 0
+    let s = {
+        let p = "v"
+        if n == 0 { p.concat("-a") } else { p.concat("-b") }
+    }
+    assert_eq(s, "v-a")
+    // A method that exists only on Str, so the tid has to be right for this to compile.
+    assert_eq(s.len(), 3)
+    assert(s.starts_with("v-"))
+}
+
+test "an else-if chain in the tail position types the same way" {
+    let n = 1
+    let s = {
+        let p = "v"
+        if n == 0 { p.concat("-a") } else if n == 1 { p.concat("-b") } else { p.concat("-c") }
+    }
+    assert_eq(s, "v-b")
+    assert_eq(s.len(), 3)
+}
+
+test "a branch that opens its own block still reaches the tail value" {
+    let n = 0
+    let s = {
+        let p = "v"
+        if n == 0 {
+            let q = p.concat("-in")
+            q.concat("-a")
+        } else { p.concat("-b") }
+    }
+    assert_eq(s, "v-in-a")
+    assert_eq(s.len(), 6)
+}
+
+test "an if tail with no else keeps the then-branch type" {
+    let n = 0
+    let s = {
+        let p = "v"
+        if n == 0 { p.concat("-a") }
+    }
+    assert_eq(s, "v-a")
+    assert_eq(s.len(), 3)
+}
+
+// A compound branch value, so the recovery has to carry more than a scalar kind. Pinned at
+// what works today: the LIST is recovered, its ELEMENT is not — `tid=List[?]` against
+// `flat=List[Str]` — because the recovery is gated on `inferred_tid == TYPE_UNKNOWN` and a
+// partially-erased `List[?]` is not UNKNOWN, so it never runs. That gate is br gmb211 and it
+// is not this arm: a plain block tail and a match tail erase `[p]` identically. Its own
+// fail-open (`let bad: Int = xs.get(0).unwrap()`, accepted, prints `bad=v-a`) is the MVCE
+// there. This row is the live divergence pin; it flips to `agree` when gmb211 closes.
+test "a List-valued if tail carries its element type" {
+    let n = 0
+    let xs = {
+        let p = "v"
+        if n == 0 { [p.concat("-a")] } else { [p.concat("-b")] }
+    }
+    assert_eq(xs.len(), 1)
+    assert_eq(xs.get(0).unwrap(), "v-a")
+}
+
+// ── Regression pins: the two neighbours that already worked ──────────────────────────
+
+test "a match tail was never affected" {
+    let n = 0
+    let s = {
+        let p = "v"
+        match n {
+            0 => p.concat("-a")
+            _ => p.concat("-b")
+        }
+    }
+    assert_eq(s, "v-a")
+    assert_eq(s.len(), 3)
+}
+
+test "Int-valued branches from a block-local were never affected" {
+    let n = 0
+    let v = {
+        let p = 5
+        if n == 0 { p + 1 } else { p + 2 }
+    }
+    assert_eq(v, 6)
+}
+
+// ── The declared-type compare (modes 1 and 3) ───────────────────────────────────────
+
+fn if_tail_src(annot: Str) -> Str {
+    "fn label(n: Int) -> Int \{\n    let bad{annot} = \{\n        let p = \"v\"\n        if n == 0 \{ p.concat(\"-a\") } else \{ p.concat(\"-b\") }\n    }\n    io.println(\"bad=\{bad}\")\n    0\n}\nfn main() \{ let _ = label(0) }\n"
+}
+
+test "a Str-valued if tail declared Int is rejected" {
+    expect_compile_error(if_tail_src(": Int"), "wnbsen_if_tail_int", "TypeError")
+}
+
+test "a Str-valued if tail declared Bool is rejected" {
+    expect_compile_error(if_tail_src(": Bool"), "wnbsen_if_tail_bool", "TypeError")
+}
+
+test "a Str-valued else-if chain declared Int is rejected" {
+    let src = "fn label(n: Int) -> Int \{\n    let bad: Int = \{\n        let p = \"v\"\n        if n == 0 \{ p.concat(\"-a\") } else if n == 1 \{ p.concat(\"-b\") } else \{ p.concat(\"-c\") }\n    }\n    io.println(\"bad=\{bad}\")\n    0\n}\nfn main() \{ let _ = label(1) }\n"
+    expect_compile_error(src, "wnbsen_elseif_int", "TypeError")
+}
+
+test "an Int-valued if tail declared Str is still rejected" {
+    let src = "fn label(n: Int) -> Str \{\n    let bad: Str = \{\n        let p = 5\n        if n == 0 \{ p + 1 } else \{ p + 2 }\n    }\n    bad\n}\nfn main() \{ io.println(label(0)) }\n"
+    expect_compile_error(src, "wnbsen_if_tail_str", "TypeError")
+}
+
+// ── The argument check (mode 2) ──────────────────────────────────────────────────────
+
+test "a Str-valued if tail passed to an Int parameter is rejected" {
+    let src = "fn takes_int(n: Int) -> Int \{ n + 1 }\nfn label(n: Int) -> Str \{\n    let s = \{\n        let p = \"v\"\n        if n == 0 \{ p.concat(\"-a\") } else \{ p.concat(\"-b\") }\n    }\n    let r = takes_int(s)\n    io.println(\"r=\{r}\")\n    s\n}\nfn main() \{ io.println(label(0)) }\n"
+    expect_compile_error(src, "wnbsen_if_tail_int_param", "TypeError")
+}
+
+// ── The mismatch the recovery declines to answer ─────────────────────────────────────
+//
+// Branches of genuinely different types stay an error. The recovery returns -1 here rather
+// than merging to the then-branch, so the program is still rejected — by the diagnostic it
+// already had, not a new one.
+test "if branches of different types are still rejected" {
+    let src = "fn label(n: Int) -> Str \{\n    let s = \{\n        let p = \"v\"\n        if n == 0 \{ p.concat(\"-a\") } else \{ 7 }\n    }\n    s\n}\nfn main() \{ io.println(label(0)) }\n"
+    expect_compile_error(src, "wnbsen_if_tail_mismatch", "TypeError")
+}
