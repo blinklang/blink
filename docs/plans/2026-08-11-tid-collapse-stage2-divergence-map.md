@@ -3479,7 +3479,139 @@ variant, a lowering, and a method block.
 corpus-direct rows written **directly** rather than through `compile_and_run` so the instrument can
 see a typed scope (`feedback_corpus_sweep_is_not_coverage`).
 
-### Remaining family-A causes, ranked (11 cells / ~~116~~ ~~107~~ 102 rows)
+### ta51an — the spec's own disambiguation form, unchecked in typecheck and mis-resolved in codegen (CLOSED, −1 row)
+
+**The cause, in two halves, because there were two.** `sections/03c_protocols.md:697-712` makes
+`Trait.method(receiver, args)` a first-class call form and the resolution table at `:773` makes it the
+**only** way to disambiguate a method that two traits both define (§3c rule 3). Neither phase
+implemented it:
+
+- **typecheck had no arm for a trait-NAME receiver.** The MethodCall path tests `nr_has_binding(obj)`
+  for a value and then falls through, so `Describe.describe(p)` returned `TYPE_UNKNOWN` and all four
+  gates failed open at once — the declared type was never compared, arity was never checked, argument
+  types were never checked, and the trait actually **named** was never verified.
+- **codegen resolved the symbol right and the return type wrong.** `impl_type_implements_trait_method`
+  picks the correct `blink_Point_A_go`, but the type came from
+  `get_impl_method_ret(type_name, method)`, whose `impl_method_idx` is keyed `(type, method)` with **no
+  trait** (`codegen_types.bl:1033`). With two traits defining `go` on one type, the last registration
+  won — so the escape hatch the spec provides for exactly that collision was itself decided by
+  registration order.
+
+**Nine fail-open modes, each reproduced by *running* a program** (and the two that looked like silent
+wrong output on the first pass were my own probe bug — a literal `{` in Blink escapes as `\{`, so a
+generated `\{v}` prints `{v}` and interpolation was never involved):
+
+| | shape | observed |
+|---|---|---|
+| 1 | `let bad: Str = Sizer.size(p)` | `cc` escape: `int64_t` into `const char*` |
+| 2 | `let bad: Int = Describe.describe(p)` | `cc` escape, the mirror image |
+| 3 | `let bad: Bool = Sizer.size(p)` | ran, printed `bad=5`, and `if bad` was taken |
+| 4 | two traits sharing `go`, `let a: Bool = Flag.go(p)` | **silent.** printed `a=1`, and the C read `const int64_t sa = blink_Point_A_go(p)` from a `const char*` function in the `Str` variant |
+| 5 | `B.go(p)` where `B` does **not** define `go` | **silent.** emitted `blink_Point_A_go` — the other trait's method |
+| 6 | `Describe.describe(p, 42)` | extra argument discarded |
+| 7 | `Describe.describe()` | no receiver at all, accepted |
+| 8 | `Adder.add2(acc, "two", 9)` | arguments transposed against the signature, accepted |
+| 9 | `Display.display(p)` | `Display` emitted as a bare C identifier — `cc`: undeclared |
+
+Mode 5 is the one that matters: the qualifier is the disambiguation mechanism, so a wrong qualifier
+silently calling the *other* trait's method is the precise failure the form exists to prevent.
+
+**The fix, and why it needs no carve-out list.** typecheck gets one arm in `infer_type`'s MethodCall
+path, placed immediately after `obj_is_value = nr_has_binding(obj_name)` so a **value** named like a
+trait still wins (`mjsbwm`'s gate). It infers the first argument as the receiver, looks up the
+trait-qualified fnsig `{recv_type}_{trait}_{method}` — the key `tc_mangle_impl_fnsig` has always
+written — checks arity and `check_arg_shapes`, and returns the impl's declared return type. codegen's
+`reg_impl_entry` now writes a second, trait-qualified `impl_method_idx` key
+(`type\ttrait\tmethod`), and `get_impl_method_ret_q` consults it before falling back to the bare one;
+all three qualified call sites (`codegen_methods.bl:3293`, `:3328`, `codegen_expr.bl:5449`) pass the
+`owner_trait` they had already computed for the symbol.
+
+Mode 5's rejection is gated on `tc_trait_declares_method` — an exact-name membership test against the
+**trait's own declaration list** — and deliberately *not* on "no impl fnsig exists". That is the whole
+reason the change carries no exemption table: trait **default** methods (`mwxtyj`), `Iterator`
+adapters, and `From`/`TryFrom`'s source-typed keys all still resolve to today's answer, because their
+trait does declare the method. Only a genuinely wrong trait name errors.
+
+`Display.display(x)` (mode 9) is included rather than filed, because it is the same call site and the
+same behavior statement — §3c:706 writes it out as the headline example. A `Display` impl declares
+`fmt`, not `display`, so the impl-method registry has no entry to resolve; the route goes through
+`synthesized_display_call`, already the sole resolution point for "call this type's `Display`", which
+returns `""` when a real user `display` method owns the symbol so the ordinary impl path still wins
+there.
+
+**Deliberately out of scope, each verified rather than assumed.** The **sealed builtin ops traits**
+(`StrOps`/`ListOps`/`BytesOps`/`StringBuildOps`) keep today's behavior and are **`9kgj76`**: their
+qualified form dispatches to codegen intrinsics with no fnsig to read, so typing them needs a
+per-method signature table, not another resolution arm. The new arm is gated on
+`is_sealed_builtin_trait == 0`, and codegen's sealed-ops check still runs **first** (`sb3125`'s
+ordering). Typevar and unknown receivers pass through untouched, which is what keeps the spec's
+`fn show[T: Describe](v: T) -> Str { Describe.describe(v) }` compiling — pinned as a row. Trait default
+methods stay broken for **both** spellings (`mwxtyj`).
+
+**One mode did not close, and the reason is a 5-0 spec vote the compiler contradicts.** Mode 3 —
+`let bad: Bool = Sizer.size(p)` — is *still accepted*, and not because the fix missed it:
+`types_compatible` (`typecheck.bl:8402`) carries an explicit arm, *"Int and Bool are interchangeable in
+Blink (C-style truthiness)"*. `sections/02_syntax.md` is the opposite and normative: *"No truthiness.
+The condition must be `Bool`. `if 0 { }` and `if items { }` are compile errors"* — vote 5-0, on the
+stated ground that requiring an explicit `Bool` eliminates a bug class. Today `if 0 { }`,
+`while 1 { }`, `let n: Int = true` (which **prints `n=true`**), `takes_bool(7)`, `flag = 3` and
+`List[Bool] = [1, 0]` all compile, and the sharpest one holds a non-canonical Bool:
+
+    let b: Bool = 2
+    if b == true { .. } else { .. }   // takes the ELSE branch
+    io.println("b={b}")               // prints b=2
+
+so a `Bool` can hold `2`, compare unequal to `true`, and display as `2` — while `let n: Int = true`
+displays from the *declared* type instead. Filed as **`td3yx5`** and typed `type:spec`, not `type:bug`:
+Blink lowers `Bool` to `int64_t` and the compiler's own source trades on the interchange at every
+`-> Int` predicate, so removing the arm is a corpus-wide language decision, and it has to answer
+whether the enum precedent (`dhggkg` — nominally distinct, `.to_int()`/`.from_int`, comparison
+unaffected) applies verbatim. The test row is pinned at today's accepting answer with a pointer; it
+becomes a positive when `td3yx5` closes.
+
+**Attribution, all movement accounted for.** Family-A rows **102 → 101** on the 874-file common basis,
+and the single row is `tests/trait_test.bl:34`, `let s2 = Describe.describe(p)` (`tid=? flat=Str`) —
+the corpus's *only* real unannotated qualified trait call, now `agree`. Family-A cells stay 11. Total
+`sv_ty_or_flat_at` calls moved **+400** = 13 new declaration rows × 31 compiler roots − 3, the three
+being `src/compiler.bl`, `src/lsp.bl` and `src/embedded_stdlib_registry.bl`, which compile one fewer of
+the four modified modules (the fix adds 14 `let`s, 13 of which reach `emit_let_binding`). The only new
+diverge **signature** is `var=qt_k tid=TyKind flat=Int` ×31 — the documented `TyKind`-local hazard
+(`tk_to_ct` maps `TyKind.Enum => CT_ENUM`, so a `TyKind`-typed local is class B by construction), which
+retires with Stage 3's `c_type_from_tid`.
+
+**The blast radius was measured before the arm was written, and it is why this was safe.** `src/` and
+`lib/` contain **zero** real qualified trait calls — the `Display.display` and `BlockHandler.exit`
+grep hits are inside `diag_explain` documentation strings — so no amount of new strictness here can
+break self-host through this surface. `tests/test_trait_qualified.bl` is entirely sealed-ops, which the
+arm excludes by construction.
+
+`task regen` + `task ci` green (653 test files, 0 failed; fmt 1526 passed). Test:
+`tests/test_ta51an_qualified_trait_call_type.bl`, 15 rows, 6 passed / 9 failed before → 15/15 after,
+with the corpus-direct rows written **directly** rather than through `compile_and_run` so the
+instrument can see them (`feedback_corpus_sweep_is_not_coverage`), and 6 regression pins (unannotated
+single-trait call, multi-argument call, trait-bound generic receiver, sealed ops, the still-ambiguous
+*unqualified* call, and an unknown method on a trait name).
+
+### Remaining family-A causes, ranked (11 cells / ~~116~~ ~~107~~ ~~102~~ 101 rows)
+
+**The tail is now fully enumerated and it is five causes, not a list.** Re-resolved row by row against
+the source line each row points at (`var=` first, then the line — the discipline three wrong
+attributions in this map were bought with), the 101 remaining family-A rows are exactly:
+
+| cause | rows | ticket | state |
+|---|---:|---|---|
+| `Iterator` adapters — `zip` / `chain` / `enumerate` / `flat_map` / `collect` / `count` / `fold`, and the `.get(i).unwrap()` reads downstream of them | **39** | `qzdz2e` | deferred, panel (user-visible) |
+| channels — `Channel(n)` and `ch.recv()` | **38** | `w3v2e6` | blocked on `8vcj2c` (is the capacity argument's element type under-determined?) |
+| `fs.*` — `fs.read` (3) and `fs.list_dir` (6), plus 9 downstream rows (`entries.get(i).unwrap()`, `entry.substring(..)`) | **18** | `jr4xf7` | `type:spec` — codegen's bare `const char*` vs the spec's `Result` |
+| `p.deref()` / `p.addr()` | **5** | `mwsy85` | `type:spec` |
+| a block-`let` whose initializer is a block — `let s = { .. }` | **1** | — | **unblocked**, no ticket, `tests/test_p9ddps_block_let_str_tail.bl:4` |
+
+Two consequences worth stating plainly. **Four of the five are held on a decision, not on work** —
+three `type:spec`/panel and one blocked — so the family-A counter cannot reach 0 by fixing code alone,
+and Stage 3's exit gate depends on those decisions landing. And **the `fs.*` figure in the older table
+below (4) was wrong twice over**: it counted sites, not rows, and it omitted the 9 rows *downstream* of
+the untyped `fs.list_dir` result, which are the same cause one hop out. The `Response`/`Request` row
+below is **stale**: the corpus has **zero** family-A rows naming either type today.
 
 Re-ranked from the post-`qjfwc6` sweep, by **rows on the 874-file common basis**, grouped by the
 innermost producer (the outermost call is usually a symptom — `.unwrap()` heads many chains, but its
@@ -3537,15 +3669,15 @@ carried exactly one family-A row after `w089a0`, that row was the `nrrs28` one, 
 |---|---:|---|---|
 | ~~`net.*` / `io.*` — `net.connect` / `listen` / `accept` / `read_bytes` / `write_bytes`, `io.read_line`~~ | ~~49~~ | **`qjfwc6`** | **CLOSED** — −45 rows, section above. `std_net_tcp` 40 → 0. The declared-type half was a **silent miscompile**, not a `cc` escape, and arity was a **compiler panic**. Two attributions in the row this replaces were wrong: `at=lsp` was 6 rows but only 2 were `io.read_line` (the other 4 are `io.read_bytes` → `n84s1p`), and `at=std_http_server`'s 3 are `Channel(max)` at `:368`, not a `net.*` producer at all. What is left of the intrinsic list is `jr4xf7` (4 rows, spec) and `n84s1p` (~~9~~ **6** rows — see that row) |
 | ~~`is_intrinsic_method` disagrees with its own arms — `io.read_bytes`, `env.var`, `io.debug`~~ | ~~9~~ ~~6~~ **0** | **`n84s1p`** | **CLOSED — −8 rows** (one *more* than the 6 this row predicted), section below. The list was short of the arms by **twelve** names, not three, and the repair is one-directional: **list ⊇ arms**, so `io.debug` **stays** listed. Two of its three named causes were mis-attributed: the `src/incremental.bl:44` rows were never `env.var` (they were `cttrag`'s — `env.var` does not appear in that file, `:44` is `let path = symbol_index.si_file_path.get(i).unwrap()`, and the row's own `var=path` said so), and `env.var` has **zero** rows anywhere in the corpus despite being the ticket's worst defect. **Read the row's `var=` before believing an attribution derived from the line number** |
-| `fs.read` / `write` / `list_dir` / `remove` | 4 | `jr4xf7` (`type:spec`) | Split out of `qjfwc6` and **held on purpose**: `sections/04_effects.md:73,1053` spells `fs.read(path)?` as a `Result` and `:157,215` names the lister `fs.list`, while codegen emits a bare `const char*` from `blink_read_file`. Signing it from codegen would write "an FS read cannot fail" into the type system |
+| `fs.read` / `write` / `list_dir` / `remove` | ~~4~~ **18** (9 direct + 9 downstream) | `jr4xf7` (`type:spec`) | The `4` was sites, not rows, and it missed every row *downstream* of the untyped `fs.list_dir` result — see the corrected table above. Split out of `qjfwc6` and **held on purpose**: `sections/04_effects.md:73,1053` spells `fs.read(path)?` as a `Result` and `:157,215` names the lister `fs.list`, while codegen emits a bare `const char*` from `blink_read_file`. Signing it from codegen would write "an FS read cannot fail" into the type system |
 | ~~`db.*` effect operations — `db.query` / `query_one` / `execute`, `stmt.step`~~ | ~~51~~ | **`h3q81d`** | **CLOSED** — −49 rows, section above. Typecheck held **no** operation signatures, only the handle name for warning suppression; codegen held the same signatures across eight flat return fields. 9 rows survive, all `with db.prepare(..) as stmt` → **`w089a0`** |
 | ~~the with-resource `as` binder — `with db.prepare(..).unwrap() as stmt`~~ | ~~9~~ | **`w089a0`** | **CLOSED** — −13 rows, section above. The prediction held exactly: the tid *was* already in hand at the binding site, one line above the walk that computes it, and the fix was the `jzvxav` shape — bind the binder. Another **silent miscompile** (`let bad: Str = r.value()` ran and printed `7`). Attribution was three files, all with-resource; `test_db_stmt.bl` 10 → 1, and the survivor is `nrrs28` |
 | ~~`Template[T]` introspection — `tpl.type_tag` / `count` / `get_int` / `get_float` / `get_str`~~ | ~~9~~ **0** | **`nrrs28`** | **CLOSED — −9 rows**, section above, and the prediction in this row held to the row and to the recipe: it *was* the untyped-receiver shape (`Template` was claimed by `is_primitive_type` and had no `resolve_type_parts` arm, so the receiver was `make_typevar("Template")`), and it *was* fixed the way `w13xgb` was — variant, lowering, method block. `std_db_sqlite` 9 → **0**, which puts **every** `lib/std` module at zero. What the row did not predict: making the receiver a real type is **stricter** than a typevar, so the literal-decomposition coercion had to be added in the same change or every legitimate `db.query("…")` in the corpus became an error — and the `Str`-variable rejection the spec writes out in full (E0310) moved from **codegen** to typecheck, which widened it from the effect-op path to every call shape |
-| `Iterator` adapters — `.zip`, `.chain`, `.enumerate`, `.collect` | 34 | `qzdz2e` | **deferred** (panel decision, user-visible). Was invisible in the previous ranking and is now #3: `tests/test_combining_iterators.bl` (16) and `tests/test_44xww4_enumerate_zip_compound.bl` (18), showing as `flat=List[Void]` and `flat=Tuple2_int_int` — the adapter loses the element type *and* the pair shape |
-| `Channel(n)` / `ch.recv` | 24 | — | **likely genuinely under-determined** — the arg is a capacity, not an element type, so this may be `decisions/under-determined-types.md` / E0301, not a missing rule. `tests/test_channels.bl` (11), `tests/test_async_cancel.bl` (7), `src/cli.bl:2162` |
+| `Iterator` adapters — `.zip`, `.chain`, `.enumerate`, `.collect` | ~~34~~ **39** | `qzdz2e` | **deferred** (panel decision, user-visible). Was invisible in the previous ranking and is now #3: `tests/test_combining_iterators.bl` (16) and `tests/test_44xww4_enumerate_zip_compound.bl` (18), showing as `flat=List[Void]` and `flat=Tuple2_int_int` — the adapter loses the element type *and* the pair shape |
+| `Channel(n)` / `ch.recv` | ~~24~~ **38** | `w3v2e6` | **likely genuinely under-determined** — the arg is a capacity, not an element type, so this may be `decisions/under-determined-types.md` / E0301, not a missing rule. `tests/test_channels.bl` (11), `tests/test_async_cancel.bl` (7), `src/cli.bl:2162` |
 | ~~a cross-module `pub let` container element — `symbol_index.si_file_path.get(i)`~~ | ~~12~~ **0** | `cttrag` | **CLOSED, and two of this row's three axes were wrong** — not container-specific, not about `pub` or crossing a module boundary. It is any **module-qualified** top-level `let`. See the `cttrag` section |
-| `Response` / `Request` from the http surface | 10 | — | `tests/test_net_integration.bl`, `test_middleware.bl`, `test_http_server.bl`, all `at=__main__`. **It did not close with `net.*`** — the earlier note guessed it would. `net.request` was the one intrinsic `qjfwc6` left out for a reason of its own (its `Result[Response, NetError]` needs two stdlib struct types a consuming module need not have imported), so these need their own probe |
-| calling a closure-typed **field** (`route.callback`, `logger.log_msg`) | ~11 | — | |
+| ~~`Response` / `Request` from the http surface~~ | ~~10~~ **0** | — | **STALE — no such rows exist.** Re-resolving the tail row by row finds **zero** family-A rows naming `Response` or `Request`; the 3 rows this line was reading at `at=std_http_server` are `let sem = Channel(max)` (`http_server.bl:368`), which belong to the channel cause. A third attribution taken from a file name instead of from the row's `var=`. Original note: `tests/test_net_integration.bl`, `test_middleware.bl`, `test_http_server.bl`, all `at=__main__`. **It did not close with `net.*`** — the earlier note guessed it would. `net.request` was the one intrinsic `qjfwc6` left out for a reason of its own (its `Result[Response, NetError]` needs two stdlib struct types a consuming module need not have imported), so these need their own probe |
+| ~~calling a closure-typed **field** (`route.callback`, `logger.log_msg`)~~ | ~~~11~~ **0** | `cjtxxr` | **CLOSED** — this row was `cjtxxr`, closed above (−12 rows); the line was never struck through |
 | ~~**`@derive`-synthesized methods have no signature in typecheck** — `to_json`, `from_json`, `clone`, and the str-backed-enum statics~~ | ~~**19**~~ | **`nxnnxe`** | **CLOSED** — −19 rows, section above. The prediction held to the row and all seven files went to zero. 14 of the 19 moved family A → **class B** (four *different* flat-universe limits: `Result`'s second child erased, an `Option`'s enum inner erased to `Int`, a bare enum erased to `Int`, and `tid=Shape flat=Shape` diverging on identical spelling); the other 5 now `agree`. `agree` +346, the largest of the campaign. **Two names held back on purpose** — `hash` is uncallable today (`pvhaew`) and a signature would claim otherwise, and `to_json`/`from_json` are signed `Str` because the spec's `JsonValue`/`JsonError` do not exist (`169kjt`). Original triage: **Triaged, and it grew.** The old 15-row line lumped two unrelated causes and got both counts wrong: 10 of those rows were the IIFE (**`x3x0qj`**, closed above) and the rest is bigger than it looked once the IIFE rows stopped hiding it. One mechanism, four synthesized shapes: `u.to_json()` → `flat=Str` (`test_derive_serialize.bl`, `test_derive_nested.bl`, `test_derive_deserialize.bl:13`, `test_derive_list_deser.bl:30`), `T.from_json(..)` → `flat=Result[Void, Str]` (`test_derive_deserialize.bl` ×2, `test_derive_enum_deser.bl` ×2, `test_derive_list_deser.bl`, `test_str_backed_enum.bl` ×2), `x.clone()` → `flat=Point`/`Int`/`Shape` (`test_derive_clone.bl` ×3), and the str-backed statics → `flat=Option[Int]` (`test_str_backed_enum.bl` ×4). Nothing declares these — `@derive` synthesizes them in codegen, so there is no `node_type_ann` to read and no fnsig to look up. **The `qjfwc6` shape: a table, not arms** — one `FnSigEntry` per derived method per deriving type, minted where the derive is registered. Now the largest actionable cause, and it subsumes the separate `Status.from_str` line below |
 | ~~`List.join` on a `List[Str]`~~ | ~~4~~ **0** | **`jvy35h`** | **CLOSED — −6 rows**, section below, and the row's estimate was low for the usual reason: 3 sites × 2 roots. It was the last allow-list-vs-dispatch entry in the tail and it turned out to be the **worst-consequence** one so far — nothing checked the RECEIVER, so `[1, 2].join(",")` segfaulted inside `str_join` and `[["a"], ["b"]].join(",")` printed binary noise at exit 0. The spec pins both halves (`impl Joinable for List[Str]`, `fn join(self, separator: Str) -> Str`), so unlike `jr4xf7` there was no question to answer |
 | ~~`bytes.to_str()` → `Result[Str, Str]`~~ | ~~3~~ **0** | **`n84s1p`** | **CLOSED as a mis-attribution, not as a cause.** All 3 rows were `src/lsp.bl:51`, and `Bytes.to_str` has had its signature since `typecheck.bl:9495` (`make_result_type(TYPE_STR, TYPE_STR)`) — the whole time this row claimed it did not. `:51` consumes `:50`'s `io.read_bytes`, so its receiver was untyped and the rows were purely **downstream**; they retired with `n84s1p` and no `Bytes` arm was touched. This is the third attribution in this ranking derived from a line number rather than from the row's `var=` field and wrong for it |
@@ -3589,8 +3721,8 @@ figures:
 | `std_http_server` / `build_stdlib` | 3 each | | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each |
 | `pkg_resolver` | **0** | | **0** | **0** | **0** | 3 | 3 | 3 | 3 | 3 | 3 | 3 | 3 | 3 | 3 | 3 |
 
-**Nine of the last ten fixes landed their whole delta in `__main__` and nowhere else** — `ps5br9`'s
-−5 (93 → 88) and, before it, `nrrs28`'s −9, the one exception, which took the last `lib/std` rows in
+**Ten of the last eleven fixes landed their whole delta in `__main__` and nowhere else** — `ta51an`'s
+−1 (88 → 87), `ps5br9`'s −5 (93 → 88) and, before it, `nrrs28`'s −9, the one exception, which took the last `lib/std` rows in
 the corpus (`std_db_sqlite` 9 → 0 and with it **every** stdlib module at zero) — plus
 `w089a0`'s −13 (171 → 158), `x3x0qj`'s −10 (158 → 148), `nxnnxe`'s −19 (148 → 129), `jvy35h`'s −3
 (125 → 122), `rb5wvb`'s −2 (122 → 120, its other 3 rows being `pkg_resolver`'s), `cjtxxr`'s −12
@@ -3600,7 +3732,7 @@ form**: a `with ... as` clause, an `fn(..) { .. }()` call, an `@derive`d type an
 stdlib causes there is no shared module for the rows to concentrate in. It is also why those
 attributions are per-root-file (three, three, seven and three files) rather than per-module, and why
 the `__main__` figure is the one to watch from here — **every** stdlib module is now at zero, and the
-102 remaining family-A rows sit in `__main__` (88), `cli` (8), `std_http_server` (3) and
+101 remaining family-A rows sit in `__main__` (87), `cli` (8), `std_http_server` (3) and
 `build_stdlib` (3). **`cjtxxr` is the sharpest case of that shape yet and worth reading carefully,
 because the CAUSE is in `lib/std/http_server.bl` — three closure fields on `Route`, `Hook` and
 `ErrorHandler` — while every row sits in `__main__`.** The rows land where the field is *invoked*, not

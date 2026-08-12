@@ -6952,6 +6952,27 @@ fn is_trait_name(name: Str) -> Int {
     0
 }
 
+// br ta51an. Does the trait's own DECLARATION list a method of this name? register_trait
+// pushes "{trait}.{method}" per declared method, so this is an exact-name membership test —
+// deliberately not a substring probe of tc_method_trait_names, whose values are " and
+// "-joined and would make trait `A` look like an owner inside "AB and C".
+//
+// This is the gate for the qualified call `Trait.method(x)` naming a trait that does not
+// define `method` AT ALL, which is a different question from "no impl fnsig exists for this
+// receiver type": a declared method with no fnsig (an open default, an Iterator adapter,
+// From/TryFrom's source-typed keys) must keep its existing answer rather than be rejected.
+fn tc_trait_declares_method(trait_name: Str, method: Str) -> Int {
+    let key = "{trait_name}.{method}"
+    let mut i = 0
+    while i < tc_trait_method_names.len() {
+        if tc_trait_method_names.get(i).unwrap() == key {
+            return 1
+        }
+        i = i + 1
+    }
+    0
+}
+
 fn is_primitive_type(name: Str) -> Int {
     if name == "Int" || name == "Float" || name == "F32" || name == "F64" || name == "Bool" || name == "Str" { return 1 }
     if name == "Void" || name == "List" || name == "Option" || name == "Result" { return 1 }
@@ -10093,6 +10114,80 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             // tc_method_resolvable_on_type, and a scalar one falls through to Unknown and
             // the codegen E0505 backstop. The wrong ANSWER is what this removes.
             let obj_is_value = nr_has_binding(obj_name)
+            // br ta51an. The qualified trait call `Trait.method(receiver, args)` — parsed as
+            // MethodCall(obj = Ident(Trait)), and the spec's ONLY way to name one of two
+            // traits that define the same method (sections/03c_protocols.md:697-712,
+            // resolution table :773 "Explicit trait + method"). There was no arm for a
+            // trait-name receiver, so the call answered TYPE_UNKNOWN and BOTH halves of the
+            // gate failed open: the declared type of the result was never compared
+            // (`let bad: Bool = Sizer.size(p)` printed 5 and tested truthy) and neither
+            // arity nor argument types were checked (an extra argument reached cc as "too
+            // many arguments to a C function").
+            //
+            // Everything answered here comes from the impl's own signature, which
+            // tc_mangle_impl_fnsig keys TRAIT-QUALIFIED as `{T}_{Trait}_{m}` precisely so
+            // two traits sharing a method name do not overwrite each other. That makes the
+            // trait half of the key the "does this trait own this method for this type"
+            // gate as well as the answer — the same gate-and-answer-in-one-lookup shape as
+            // tc_channel_elem_ct — so no separate ownership index is needed.
+            //
+            // The sealed builtin ops traits are EXCLUDED. They carry no such fnsig by design
+            // (they are the sole codegen-dispatched surface, project_ops_traits_sole_dispatch_surface)
+            // and their qualified form already emits correct C through the intrinsics;
+            // their own missing declared-type compare is br 9kgj76, a signature table rather
+            // than another resolution arm.
+            if obj_is_value == 0 && is_trait_name(obj_name) != 0 && is_sealed_builtin_trait(obj_name) == 0 {
+                let qt_args = node_args(node)
+                let qt_n = if qt_args != -1 { sublist_length(qt_args) } else { 0 }
+                if qt_n == 0 {
+                    tc_error_at("qualified trait call '{obj_name}.{method}' expects the receiver as its first argument, got none", node)
+                    return TYPE_UNKNOWN
+                }
+                let qt_recv = infer_type(sublist_get(qt_args, 0))
+                let qt_k = type_kind(qt_recv)
+                // A typevar or unknown receiver keeps today's answer: that is the spec's
+                // `fn show[T: Describe](v: T) { Describe.describe(v) }` form (:706), where
+                // the bound guarantees the method exists, the impl is chosen per
+                // instantiation, and there is no single fnsig to read.
+                if qt_k == TyKind.Struct || qt_k == TyKind.Enum {
+                    let qt_tname = ty_pool.get(qt_recv).unwrap().name
+                    let qt_sig = lookup_fnsig("{qt_tname}_{obj_name}_{method}")
+                    if qt_sig != -1 {
+                        let qt_fs = fnsig_pool.get(qt_sig).unwrap()
+                        // The receiver IS param 0 (`self`), so the qualified form's arity is
+                        // the declared param count exactly and check_arg_shapes runs at
+                        // self_offset 0, where the instance path uses 1. `self` itself has no
+                        // annotation, so its param tid is Unknown and check_arg_shapes skips
+                        // it — the receiver's own type was already established by the
+                        // fnsig key.
+                        if qt_n != qt_fs.params_count {
+                            tc_error_at("qualified trait call '{obj_name}.{method}' expects {qt_fs.params_count} argument(s) including the receiver, got {qt_n}", node)
+                        }
+                        check_arg_shapes("{obj_name}.{method}", qt_sig, qt_args, 0)
+                        return qt_fs.ret
+                    }
+                    // The synthesized sealed `Display.display` (4q2etk/mwxtyj) has no user
+                    // fnsig anywhere — and §3c:712 names it as THE qualified call to write.
+                    // Same answer as the instance arm at the Struct/Enum receiver block.
+                    if obj_name == "Display" && method == "display" && tc_type_has_display_impl(qt_tname) != 0 {
+                        if qt_n != 1 {
+                            tc_error_at("qualified trait call 'Display.display' expects 1 argument(s) including the receiver, got {qt_n}", node)
+                        }
+                        return TYPE_STR
+                    }
+                    // The named trait does not define this method at all. Without this,
+                    // `B.go(p)` where only `A` defines `go` silently dispatched to
+                    // `blink_Point_A_go` and printed A's answer: the qualifier was ignored.
+                    // Gated on the TRAIT's declaration rather than on the missing fnsig, so
+                    // a declared-but-unregistered method keeps its existing answer.
+                    if tc_trait_declares_method(obj_name, method) == 0 {
+                        let qt_owner = tc_method_trait_names(qt_tname, method)
+                        let qt_help = if qt_owner != "" { "'{method}' on {qt_tname} is defined by {qt_owner}" } else { "" }
+                        diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "trait '{obj_name}' does not define method '{method}'", node, qt_help)
+                        return TYPE_UNKNOWN
+                    }
+                }
+            }
             // Static constructor on a sealed builtin type: Bytes.new/from_str/zeroed,
             // Map.new(), Set.new() mirror the bare-call forms in get_builtin_fn_ret. Keyed on
             // the type AND the method — see tc_builtin_static_ret for why the method half

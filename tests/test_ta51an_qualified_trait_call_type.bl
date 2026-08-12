@@ -1,0 +1,251 @@
+import compile_test_helpers.{expect_compile_error, compile_and_run}
+
+// br ta51an — the qualified trait call `Trait.method(receiver, args)` had no type, and the
+// trait it names was never consulted.
+//
+// THE CAUSE, in two halves:
+//
+//   typecheck has NO arm for a trait-name receiver in the method-call path, so the call
+//   answers TYPE_UNKNOWN: the declared type of the result is never compared, and neither
+//   arity nor argument types are checked.
+//
+//   codegen resolves the SYMBOL correctly — codegen_expr.bl:5435 asks
+//   impl_type_implements_trait_method and mangles `{T}_{Trait}_{m}` — but takes the RETURN
+//   TYPE from get_impl_method_ret(type_name, method), and that index (`impl_method_idx`,
+//   codegen_types.bl:1033) is keyed (type, method) with NO trait. Two traits defining the
+//   same method name on one type therefore collide and the last impl registered wins, for
+//   every call site of both.
+//
+// This is not a corner: `Trait.method(receiver)` is the spec's ONLY way to disambiguate a
+// method two traits both define (sections/03c_protocols.md:664-682, rule 3), so the trait
+// being dropped breaks the exact program the feature exists to make writable.
+//
+// SPEC. sections/03c_protocols.md:697-712 — "Any trait method can be called using qualified
+// syntax: `TraitName.method(receiver, args)`. The receiver is passed explicitly as the first
+// argument (the `self` parameter)." The resolution table at :773 spells the resolver:
+// `Trait.foo(x, args)` is resolved by "Explicit trait + method". :712 names `Display.display`
+// as the canonical use, and :706 writes the generic form
+// `fn show[T: Display](val: T) -> Str { Display.display(val) }`.
+//
+// FAIL-OPEN MODES, every one reproduced by RUNNING a program:
+//
+//   1. `let bad: Bool = Sizer.size(p)`     — SILENT. Printed `bad=5`, and `if bad` was
+//      taken. A 5 living in a Bool.
+//   2. `let bad: Int = Describe.describe(p)` — compiled and ran.
+//   3. `let bad: Str = Sizer.size(p)`      — compiled, ran, printed `3`.
+//   4. two traits, one method name, both
+//      spellings disambiguated per §3c    — SILENT when the two return types share a C
+//      representation: `let a: Bool = A.go(p)` rendered as `1`, not `true`, because the
+//      trait-blind index handed back B's `Int`. With `Str` on one side the same shape
+//      escapes to cc instead: *initialization of int64_t from const char\**.
+//   5. `B.go(p)` where trait B has no `go` — SILENT. Dispatched to `blink_Point_A_go` and
+//      printed A's answer. The named trait was ignored entirely.
+//   6. `Describe.describe(p, 42)`          — cc escape: too many arguments to a C function.
+//   7. `Adder.add2(acc, "two", 9)`         — cc escape: two int/pointer conversions.
+//   8. `Describe.describe()`               — reported UnresolvedMethod "on type ?" — the one
+//      mode that did fail, and with a useless receiver.
+//   9. `Display.display(p)`                — cc escape: *'Display' undeclared*. The spec's
+//      own headline example did not compile at all, because the synthesized sealed
+//      `display` is not in the impl-method registry the qualified path gates on.
+//
+// Mode 4 is the one to remember. Every other mode is a mistake the programmer made; mode 4
+// is a correct program, written exactly as the spec prescribes, being miscompiled.
+//
+// DO NOT "fix" the following, all deliberate:
+//   - The sealed builtin ops traits (StrOps, ListOps, MapOps, SetOps, BytesOps,
+//     StringBuildOps, Sized, Contains, Joinable) are EXCLUDED from the new resolution arm.
+//     They carry no `{T}_{Trait}_{m}` fnsig by design — they are the sole
+//     codegen-dispatched surface — so their qualified form keeps resolving through the
+//     codegen intrinsics, correct C and all (row "sealed ops" below). Their own missing
+//     declared-type compare is br 9kgj76, a signature table, not another arm.
+//   - A receiver whose type is a typevar or is unknown keeps today's answer. That is the
+//     spec's `fn show[T: Describe](v: T)` form (:706): the bound guarantees the method
+//     exists, the impl is picked per instantiation, and there is no single fnsig to read.
+//   - A trait that DECLARES the method but has no impl fnsig for this type (an open
+//     default, an Iterator adapter, From/TryFrom's source-typed keys) also keeps today's
+//     answer. Only a trait that does not declare the method at all is an error, which is
+//     the precise statement of mode 5 and needs no carve-out list.
+//   - Trait default methods are still unimplemented — `Describe.loud(p)` for a `loud` with
+//     a body in the trait reports E0900 TraitContractMissingMethod, exactly as the
+//     unqualified `p.loud()` does. That is br mwxtyj (344dnd), not this.
+
+type Point { x: Int, y: Int }
+type Acc { n: Int }
+
+trait Describe {
+    fn describe(self) -> Str
+}
+
+trait Sizer {
+    fn size(self) -> Int
+}
+
+// The §3c rule-3 shape: one method name, two traits, two DIFFERENT return types. `p.go()` is
+// E0522; the qualified spellings are the way out, and each must get its own trait's type.
+trait Flag {
+    fn go(self) -> Bool
+}
+
+trait Count {
+    fn go(self) -> Int
+}
+
+trait Adder {
+    fn add2(self, a: Int, b: Str) -> Int
+}
+
+impl Describe for Point {
+    fn describe(self) -> Str { "a point" }
+}
+
+impl Sizer for Point {
+    fn size(self) -> Int { self.x + self.y }
+}
+
+impl Flag for Point {
+    fn go(self) -> Bool { true }
+}
+
+impl Count for Point {
+    fn go(self) -> Int { 42 }
+}
+
+impl Adder for Acc {
+    fn add2(self, a: Int, b: Str) -> Int { self.n + a + b.len() }
+}
+
+impl Display for Point {
+    fn fmt(self, sb: StringBuilder) { sb.write("P({self.x},{self.y})") }
+}
+
+fn show[T: Describe](v: T) -> Str {
+    Describe.describe(v)
+}
+
+// ── The shapes written DIRECTLY into the corpus ──────────────────────────────────────
+//
+// Compiled by the ordinary build, so this is where the tydiv divergence instrument can see
+// the call's tid. The unannotated `let` is the shape the sweep counts (the map's last
+// unblocked family-A row was `var=s2 tid=? flat=Str` at tests/trait_test.bl:34).
+
+test "an unannotated qualified trait call carries its method's type" {
+    let p = Point { x: 3, y: 7 }
+    let s = Describe.describe(p)
+    assert_eq(s, "a point")
+    assert_eq(s.len(), 7)
+    let n = Sizer.size(p)
+    assert_eq(n, 10)
+}
+
+// Mode 4, and the reason this cannot be left to cc: `Flag.go` and `Count.go` differ only in
+// their trait, and `Bool` and `Int` are the same width in C. Asserted through interpolation
+// because that is what the wrong type actually corrupts — a Bool typed as Int renders `1`,
+// not `true`, with no diagnostic anywhere.
+test "two traits sharing a method name each keep their own return type" {
+    let p = Point { x: 3, y: 7 }
+    let a: Bool = Flag.go(p)
+    let b: Int = Count.go(p)
+    assert_eq("{a}", "true")
+    assert_eq(b, 42)
+    let bare_a = Flag.go(p)
+    let bare_b = Count.go(p)
+    assert_eq("{bare_a}", "true")
+    assert_eq(bare_b, 42)
+}
+
+test "a multi-argument qualified trait call checks and keeps its type" {
+    let acc = Acc { n: 1 }
+    let v = Adder.add2(acc, 2, "xy")
+    assert_eq(v, 5)
+}
+
+// §3c:706 verbatim. The receiver's type is a typevar here, so there is no impl fnsig to
+// read; this row exists to pin that the new arm passes it through instead of rejecting it.
+test "a qualified call on a trait-bound generic receiver still resolves" {
+    let p = Point { x: 1, y: 2 }
+    assert_eq(show(p), "a point")
+}
+
+// The sealed builtin ops traits keep their codegen-intrinsic path untouched.
+test "the sealed ops-trait qualified form is unchanged" {
+    let s = "hello"
+    assert_eq(StrOps.len(s), 5)
+    assert_eq(StrOps.to_upper(s), "HELLO")
+    let xs: List[Int] = []
+    ListOps.push(xs, 10)
+    assert_eq(ListOps.len(xs), 1)
+}
+
+// ── The declared-type compare (modes 1, 2, 3) ────────────────────────────────────────
+
+fn qtc_src(body: Str) -> Str {
+    "type Point \{ x: Int, y: Int }\ntrait Describe \{ fn describe(self) -> Str }\ntrait Sizer \{ fn size(self) -> Int }\nimpl Describe for Point \{ fn describe(self) -> Str \{ \"a point\" } }\nimpl Sizer for Point \{ fn size(self) -> Int \{ 5 } }\nfn main() \{\n    let p = Point \{ x: 3, y: 7 }\n{body}\n}\n"
+}
+
+// Pinned at today's ACCEPTING answer, not at an error, and the reason is not this ticket.
+// `types_compatible` (typecheck.bl:8402) carries an explicit `Int and Bool are
+// interchangeable in Blink (C-style truthiness)` arm, so a Bool target accepts an Int source
+// EVERYWHERE — `let n: Int = true` and even `if 0 { }` compile today, which contradicts
+// sections/02_syntax.md's normative 5-0 "No truthiness" vote. That is br td3yx5 (type:spec:
+// removing the arm is a language decision with a corpus-wide migration, since Blink lowers
+// Bool to int64_t and the compiler's own source trades on the interchange). ta51an's job is
+// only to make the qualified call CARRY Sizer.size's Int; the two rows below prove the
+// declared-type compare now runs on it. When td3yx5 closes, this row becomes a positive.
+test "an Int-returning qualified call declared as Bool is accepted today (br td3yx5)" {
+    let r = compile_and_run(qtc_src("    let bad: Bool = Sizer.size(p)\n    io.println(\"bad=\{bad}\")"), "ta51an_size_bool")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("bad="))
+}
+
+test "an Int-returning qualified call declared as Str is rejected" {
+    expect_compile_error(qtc_src("    let bad: Str = Sizer.size(p)\n    io.println(bad)"), "ta51an_size_str", "TypeError")
+}
+
+test "a Str-returning qualified call declared as Int is rejected" {
+    expect_compile_error(qtc_src("    let bad: Int = Describe.describe(p)\n    io.println(\"bad=\{bad}\")"), "ta51an_describe_int", "TypeError")
+}
+
+// ── The trait actually named (mode 5) ────────────────────────────────────────────────
+
+test "a trait that does not define the method is rejected" {
+    let src = "type Point \{ x: Int, y: Int }\ntrait A \{ fn go(self) -> Str }\ntrait B \{ fn stop(self) -> Str }\nimpl A for Point \{ fn go(self) -> Str \{ \"a\" } }\nimpl B for Point \{ fn stop(self) -> Str \{ \"b\" } }\nfn main() \{\n    let p = Point \{ x: 1, y: 2 }\n    let s = B.go(p)\n    io.println(\"s=\{s}\")\n}\n"
+    expect_compile_error(src, "ta51an_wrong_trait", "UnresolvedMethod")
+}
+
+// ── Arity and argument types (modes 6, 7, 8) ─────────────────────────────────────────
+
+test "an extra argument to a qualified trait call is rejected" {
+    expect_compile_error(qtc_src("    let s = Describe.describe(p, 42)\n    io.println(s)"), "ta51an_extra_arg", "TypeError")
+}
+
+test "a missing receiver on a qualified trait call is rejected" {
+    expect_compile_error(qtc_src("    let s = Describe.describe()\n    io.println(s)"), "ta51an_no_receiver", "TypeError")
+}
+
+test "wrong argument types in a qualified trait call are rejected" {
+    let src = "type Acc \{ n: Int }\ntrait Adder \{ fn add2(self, a: Int, b: Str) -> Int }\nimpl Adder for Acc \{ fn add2(self, a: Int, b: Str) -> Int \{ self.n + a + b.len() } }\nfn main() \{\n    let acc = Acc \{ n: 1 }\n    let v = Adder.add2(acc, \"two\", 9)\n    io.println(\"v=\{v}\")\n}\n"
+    expect_compile_error(src, "ta51an_arg_types", "TypeError")
+}
+
+// ── Mode 9: the spec's own headline example ──────────────────────────────────────────
+//
+// Through compile_and_run rather than in the corpus, because before the fix this shape did
+// not reach a Blink diagnostic at all — it emitted `Display` as a bare C identifier.
+
+test "the spec's Display.display(x) qualified form compiles and runs" {
+    let src = "type Point \{ x: Int, y: Int }\nimpl Display for Point \{\n    fn fmt(self, sb: StringBuilder) \{ sb.write(\"P\") }\n}\nfn main() \{\n    let p = Point \{ x: 1, y: 2 }\n    let s = Display.display(p)\n    io.println(\"s=\{s}\")\n}\n"
+    let r = compile_and_run(src, "ta51an_display_display")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("s=P"))
+}
+
+// ── Regressions this fix must NOT cause ──────────────────────────────────────────────
+
+test "an unqualified call to a method two traits define is still ambiguous" {
+    let src = "type Point \{ x: Int, y: Int }\ntrait A \{ fn go(self) -> Bool }\ntrait B \{ fn go(self) -> Int }\nimpl A for Point \{ fn go(self) -> Bool \{ true } }\nimpl B for Point \{ fn go(self) -> Int \{ 42 } }\nfn main() \{\n    let p = Point \{ x: 1, y: 2 }\n    let g = p.go()\n    io.println(\"g=\{g}\")\n}\n"
+    expect_compile_error(src, "ta51an_still_ambiguous", "AmbiguousMethodCall")
+}
+
+test "an unknown method on a trait name is still rejected" {
+    expect_compile_error(qtc_src("    let s = Describe.bogus(p)\n    io.println(\"\{s}\")"), "ta51an_bogus", "UnresolvedMethod")
+}
