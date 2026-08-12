@@ -96,6 +96,7 @@ import codegen_expr.{
     expr_result_type, mono_instance_arg_tids_from_tid, panic_file_for, panic_file_for_fmt,
     panic_line_str, emit_panic_site, segs_from_arg_tids,
     tparams_sl_contains, recover_set_elem_from_tid, recover_option_set_elem_from_tid,
+    recover_list_elem_from_tid,
     register_map_elem_struct_mono_from_tid
 }
 import codegen_methods.{resolve_tparam_via_tid, copy_list_compound_elem, emit_boxed_container_store, finish_enum_zip_result, mono_csv_from_arg_tids}
@@ -110,6 +111,22 @@ import pkg.manifest.{manifest_header_is_declared, manifest_name}
 import compiler.{trace}
 import stdlib_native_deps.{stdlib_native_dep_name_by_ffi_symbol}
 import typecheck.{sv_ty_or_flat_at, ctype_probe_at, tc_tid_subst_mono, c_type_from_tid, tc_tid_kind, tc_tid_resolved, TyKind, is_builtin_fn, is_import_module_name, tc_channel_elem_ct, tc_channel_elem_struct, tc_lookup_node_tid, tc_tid_struct_mono_name, tc_tid_struct, tc_tid_is_enum, tc_tid_struct_arg_count, tc_tid_struct_arg_tid, tc_tid_struct_slot_seg, tc_struct_slot_encodable, tc_tid_result_ok_tid, tc_tid_result_err_tid, tc_tid_option_inner_tid, tc_tid_tuple_arity, tc_tid_tuple_elem_tid, tc_tid_to_c_tag}
+
+// br 85j3j8: "the recorded element cannot be spelled in C". Two shapes, both of which reach cc as
+// an erasure rather than as a Blink diagnostic: no element at all, or a marker whose C name lives
+// in the companion struct slot (CT_STRUCT, CT_ENUM, and the List house convention's CT_VOID pair)
+// with that slot empty. Anything else -- CT_INT, CT_OPTION, a named struct -- is spellable and must
+// be left exactly as the flat path recorded it.
+fn list_elem_unspellable(name: Str) -> Bool {
+    let ect = get_list_elem_type(name)
+    if ect < 0 {
+        return true
+    }
+    if ect == CT_STRUCT || ect == CT_ENUM || ect == CT_VOID {
+        return get_list_elem_struct(name) == ""
+    }
+    false
+}
 
 fn strip_outer_parens(s: Str) -> Str {
     if s.starts_with("(") && s.ends_with(")") {
@@ -3783,6 +3800,13 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
         let val_orig_name = if node_kind(val_node) == NodeKind.Ident { node_name(val_node) } else { "" }
         carry_map_binding_meta(val_str, val_orig_name, name, type_ann)
     }
+    // The three inputs that decide which arm of the list ladder below fires. Worth a permanent tap:
+    // br 85j3j8 was mis-diagnosed twice from the outside, because a lost element looks identical
+    // whether the RHS carried no element (expr_elem=-1) or carried a nameless one (expr_elem=23,
+    // CT_STRUCT, with no sname) -- and only the second was what actually happened.
+    if dbg_channel_on("listelem") != 0 {
+        dbg_trace("listelem", "letladder var={name} val_type={val_type} ann={type_ann} expr_elem={expr_list_elem_type} sv_elem={get_list_elem_type(name)}")
+    }
     if val_type == CT_LIST && expr_list_elem_type >= 0 && type_ann == -1 {
         set_list_elem_type(name, expr_list_elem_type)
         // jcr0zz: a compound element (Option/Result/Map) recovered onto val_str by
@@ -3809,6 +3833,24 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
             set_list_nested_elem_struct(name, src_nested_struct)
         }
     } else if val_type == CT_LIST && expr_list_elem_type >= 0 {
+        expr_list_elem_type = -1
+        expr_list_elem_struct = ""
+    }
+    // br 85j3j8: the ladder above can leave the element UNSPELLABLE -- either absent, or a
+    // CT_STRUCT/CT_ENUM/CT_VOID marker with no struct name to go with it, which is the shape an
+    // unannotated `let` bound to a CALL returning `List[(A, B)]` produces: the RHS carries
+    // expr_list_elem_type = CT_STRUCT (a tuple IS a struct here) but no sname, and val_str is a C
+    // call expression, so neither get_list_elem_struct(val_str) nor expr_list_elem_struct can
+    // supply one. The result is a list whose element is a nameless struct, i.e. Void:
+    // `const void x = f._0;` and `blink_Option_void` reach cc with no Blink span, and `f.0 + f.1`
+    // renders as the `<value>` placeholder.
+    //
+    // The last resort is typecheck's own tid for the RHS, exactly as the CT_SET branch above
+    // already does for a set element (mv45y5). Guarded on the element being unspellable, so this
+    // fires only where the code above left nothing usable; recover_list_elem_from_tid itself
+    // declines when the tid has no nameable element either.
+    if val_type == CT_LIST && type_ann == -1 && list_elem_unspellable(name) {
+        recover_list_elem_from_tid(val_node, name)
         expr_list_elem_type = -1
         expr_list_elem_struct = ""
     }
@@ -9355,6 +9397,24 @@ pub fn emit_top_level_let(node: Int, extern_only: Int) ! Codegen.Emit, Codegen.R
             set_list_nested_elem_struct(name, src_nested_struct)
         }
     } else if val_type == CT_LIST && expr_list_elem_type >= 0 {
+        expr_list_elem_type = -1
+        expr_list_elem_struct = ""
+    }
+    // br 85j3j8: the ladder above can leave the element UNSPELLABLE -- either absent, or a
+    // CT_STRUCT/CT_ENUM/CT_VOID marker with no struct name to go with it, which is the shape an
+    // unannotated `let` bound to a CALL returning `List[(A, B)]` produces: the RHS carries
+    // expr_list_elem_type = CT_STRUCT (a tuple IS a struct here) but no sname, and val_str is a C
+    // call expression, so neither get_list_elem_struct(val_str) nor expr_list_elem_struct can
+    // supply one. The result is a list whose element is a nameless struct, i.e. Void:
+    // `const void x = f._0;` and `blink_Option_void` reach cc with no Blink span, and `f.0 + f.1`
+    // renders as the `<value>` placeholder.
+    //
+    // The last resort is typecheck's own tid for the RHS, exactly as the CT_SET branch above
+    // already does for a set element (mv45y5). Guarded on the element being unspellable, so this
+    // fires only where the code above left nothing usable; recover_list_elem_from_tid itself
+    // declines when the tid has no nameable element either.
+    if val_type == CT_LIST && type_ann == -1 && list_elem_unspellable(name) {
+        recover_list_elem_from_tid(node_value(node), name)
         expr_list_elem_type = -1
         expr_list_elem_struct = ""
     }

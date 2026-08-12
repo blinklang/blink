@@ -1,0 +1,247 @@
+// br 85j3j8 — an UNANNOTATED `let` bound to a CALL returning `List[(A, B)]` erases the tuple
+// element to Void. Adding the annotation is the whole difference, and the tuple is the only
+// element kind that loses.
+//
+// This is a class-(i) row of the Stage 3a ctypediv census — the tid is right and the flat path is
+// wrong — but one the 874-file corpus does not contain, so it was found by constructing the shape
+// rather than by reading a counter (`feedback_corpus_sweep_is_not_coverage`). With
+// BLINK_TRACE_CHANNELS=ctypediv,tydiv on the MVCE:
+//
+//   bucket=diverge site=emit_let_binding.decl var=g tid=List[(Int, Int)] flat=List[]
+//   bucket=diverge site=emit_let_binding.decl var=f tid=(Int, Int)      flat=Int
+//   bucket=diverge site=ctype.flat var=f ty=(Int, Int) tidc=blink_Tuple2_int_int emitted=int64_t
+//
+// Typecheck names the type exactly at both bindings. The flat pair holds `List[]` — the element
+// simply absent — and then `Int`.
+//
+// ── WHY THE ROWS BELOW LOOK ORDINARY ─────────────────────────────────────────────────
+//
+// Two of the three symptoms are escapes to cc with NO Blink span, so before the fix this file does
+// not compile at all rather than failing an assertion:
+//
+//   1. `let x: Int = f.0`  ->  `const void x = f._0;`
+//      error: variable or field 'x' declared void
+//      error: request for member '_0' in something not a structure or union
+//
+//   2. `f.0 + f.1` in an interpolation prints `<value>` — the fmj80a fail-safe placeholder
+//      (codegen_expr.bl:5682). It does not crash; it prints a placeholder where a number belongs,
+//      which is the worst of the three because nothing anywhere says so.
+//
+//   3. `for p in g` -> `static blink_Option_void blink_ListIterator_void_next(...)`
+//      error: unknown type name 'blink_Option_void'
+//      The same name appears for `.filter(..).collect()` over a `List[(Int, Str)]`.
+//
+// Symptom 3 turned out to be a DIFFERENT bug on the same axis and is NOT covered here — it is br
+// 1n9fhg. Measured: it reproduces with a plain `List[Pt]` and no tuple anywhere, and it reproduces
+// identically with this file's source changes stashed, so it is neither caused nor cured by the
+// binding fix. The iterator emitters (`list_iter_c_type` / `emit_list_iter_typedef`,
+// codegen_types.bl:7502) take a bare `inner: Int` CT and spell it with `c_type_tag(inner)`, so an
+// element whose C name lives in the companion sname slot loses the name however the binding got
+// it. Its rows live in 1n9fhg's MVCE; putting them here would have made one red test stand for two
+// causes and hidden whichever was fixed second.
+//
+// ── THE AXIS IS THE MISSING ANNOTATION, NOT GENERICS ─────────────────────────────────
+//
+// Measured one shape at a time. A NON-generic fn return is enough — the first filing reached for a
+// generic fn because the neighbouring tickets are about typevars, and that would have pointed the
+// fix at monomorphisation instead of at the binding:
+//
+//   broken                                fine
+//   ----------------------------------    ----
+//   let g = build()      (no ann)         let g: List[(Int, Int)] = build()
+//   a non-generic fn return               let g: List[(Int, Int)] = [(7, 8)]   (literal)
+//   a generic fn return                   List[List[T]], List[Set[T]], List[Struct],
+//                                         List[Map[K, V]] — all correct even at depth
+//
+// The sibling container elements ride a different channel in the same branch
+// (`get_list_elem_struct` / `get_list_nested_elem_type`); a tuple reaches neither it nor the
+// compound path, because `copy_list_compound_elem` is called only under
+// `expr_list_elem_type == CT_OPTION || CT_RESULT || CT_MAP` and there is no CT_TUPLE at all — a
+// tuple is CT_STRUCT plus an sname.
+
+fn build_int_pairs() -> List[(Int, Int)] {
+    let ls: List[(Int, Int)] = []
+    ls.push((7, 8))
+    ls
+}
+
+fn build_mixed_pairs() -> List[(Int, Str)] {
+    let ls: List[(Int, Str)] = []
+    ls.push((7, "hi"))
+    ls
+}
+
+fn build_generic_pairs[T](v: T) -> List[(T, T)] {
+    let ls: List[(T, T)] = []
+    ls.push((v, v))
+    ls
+}
+
+// ── 1. Declaring a field read ────────────────────────────────────────────────────────
+//
+// The annotation on `x` is what forces the element's own type to be spelled; before the fix this
+// is `const void x = f._0;`.
+
+test "an element field read can be bound to a typed local" {
+    let g = build_int_pairs()
+    let f = g.get(0).unwrap()
+    let x: Int = f.0
+    let y: Int = f.1
+    assert_eq(x, 7)
+    assert_eq(y, 8)
+}
+
+test "both positions of a mixed-type element keep their own types" {
+    let g = build_mixed_pairs()
+    let f = g.get(0).unwrap()
+    let n: Int = f.0
+    let s: Str = f.1
+    assert_eq(n, 7)
+    assert_eq(s, "hi")
+}
+
+// ── 2. Arithmetic on the element ─────────────────────────────────────────────────────
+//
+// Asserting on the VALUE, not on a declaration: a declaration pin would pass while the program
+// still printed `<value>`. `assert_eq` on the sum is what distinguishes "the element is declared"
+// from "the element holds an Int".
+
+test "arithmetic on element fields answers the number, not a placeholder" {
+    let g = build_int_pairs()
+    let f = g.get(0).unwrap()
+    assert_eq(f.0 + f.1, 15)
+}
+
+// Interpolation is the path that produces the `<value>` placeholder, so it is worth its own row:
+// the fail-safe means a wrong answer arrives as text rather than as a crash.
+test "interpolating an element field renders the value" {
+    let g = build_int_pairs()
+    let f = g.get(0).unwrap()
+    assert_eq("{f.0}", "7")
+}
+
+test "interpolating a Str element field renders the string" {
+    let g = build_mixed_pairs()
+    let f = g.get(0).unwrap()
+    assert_eq("{f.1}", "hi")
+}
+
+// ── 3. Indexing it ───────────────────────────────────────────────────────────────────
+//
+// `for p in g` and `.filter(..).collect()` belong to br 1n9fhg (see the header) and are held
+// there. `.get(i)` is the reader this axis owns, so it is exercised past element 0 to prove the
+// element type is a property of the list and not of one lucky temp.
+
+test "every element of the list reads its own fields" {
+    let g = build_int_pairs()
+    g.push((1, 2))
+    let a = g.get(0).unwrap()
+    let b = g.get(1).unwrap()
+    assert_eq(a.0 + a.1, 15)
+    assert_eq(b.0 + b.1, 3)
+}
+
+// A generic fn return reaches the same binding by a longer road. Held separately so that a fix
+// aimed only at monomorphisation cannot pass, and neither can one that only handles the concrete
+// return type.
+test "a generic fn returning List[(T, T)] keeps the element type" {
+    let g = build_generic_pairs(7)
+    let f = g.get(0).unwrap()
+    assert_eq(f.0 + f.1, 14)
+}
+
+// ── Pins on the paths that were already right ────────────────────────────────────────
+//
+// These hold the SCOPE of the fix. The four sibling element kinds are carried by a different
+// channel in the same branch, and each is read at depth rather than through `.len()` — `.len()`
+// answers correctly even when the element type is gone, so a length pin would prove nothing.
+
+type Pt {
+    x: Int
+}
+
+fn build_lists() -> List[List[Int]] {
+    let ls: List[List[Int]] = []
+    ls.push([7, 8])
+    ls
+}
+
+fn build_sets() -> List[Set[Int]] {
+    let ls: List[Set[Int]] = []
+    let s: Set[Int] = Set()
+    s.insert(7)
+    ls.push(s)
+    ls
+}
+
+fn build_structs() -> List[Pt] {
+    let ls: List[Pt] = []
+    ls.push(Pt { x: 7 })
+    ls
+}
+
+fn build_maps() -> List[Map[Str, Int]] {
+    let ls: List[Map[Str, Int]] = []
+    let m: Map[Str, Int] = Map()
+    m.insert("k", 7)
+    ls.push(m)
+    ls
+}
+
+test "an annotated binding was never affected" {
+    let g: List[(Int, Int)] = build_int_pairs()
+    let f = g.get(0).unwrap()
+    assert_eq(f.0 + f.1, 15)
+}
+
+test "a list literal was never affected" {
+    let g: List[(Int, Int)] = [(7, 8)]
+    let f = g.get(0).unwrap()
+    assert_eq(f.0 + f.1, 15)
+}
+
+test "a List[List[Int]] element still reads at depth" {
+    let g = build_lists()
+    assert_eq(g.get(0).unwrap().get(0).unwrap(), 7)
+}
+
+test "a List[Set[Int]] element still reads at depth" {
+    let g = build_sets()
+    assert(g.get(0).unwrap().contains(7))
+}
+
+test "a List[Struct] element still reads its field" {
+    let g = build_structs()
+    assert_eq(g.get(0).unwrap().x, 7)
+}
+
+test "a List[Map[Str, Int]] element still reads at depth" {
+    let g = build_maps()
+    assert_eq(g.get(0).unwrap().get("k").unwrap(), 7)
+}
+
+// The compound elements that DO route through copy_list_compound_elem. Any change to that
+// function or to the guard above it must leave these three working — they are the only shapes the
+// corpus exercises there, so nothing else would catch a regression.
+
+fn build_options() -> List[Option[Int]] {
+    let ls: List[Option[Int]] = []
+    ls.push(Some(7))
+    ls
+}
+
+fn build_results() -> List[Result[Int, Str]] {
+    let ls: List[Result[Int, Str]] = []
+    ls.push(Ok(7))
+    ls
+}
+
+test "a List[Option[Int]] element still unwraps" {
+    let g = build_options()
+    assert_eq(g.get(0).unwrap().unwrap(), 7)
+}
+
+test "a List[Result[Int, Str]] element still unwraps" {
+    let g = build_results()
+    assert_eq(g.get(0).unwrap().unwrap(), 7)
+}

@@ -4922,7 +4922,7 @@ The read is substituted through the enclosing monomorphisation (`tc_tid_subst_mo
 other tid consumer in codegen — not because mono is the cause, but because the census row does sit
 inside a mono'd fn, and an unsubstituted read would see the typevar `K` and decline exactly there.
 
-### Census after Stage 3d — class-(i) is empty
+### Census after Stage 3d — class-(i) is empty *on the corpus*
 
 On the 874-file common basis (`feedback_corpus_sweep_is_not_coverage`: intersect, do not exclude
 new test roots):
@@ -4947,6 +4947,90 @@ common basis, in test files added during this stage, and all three are pre-docum
 
 Stage 3's remaining work is therefore not census-driven: collapse the five spellers into one, and
 replace `copy_list_compound_elem` with a node-tid-sourced copy.
+
+**The qualifier in that heading is load-bearing, and the very next sub-step proved it.** "Class-(i)
+is empty" is a statement about the 874 files, not about the language. Walking into
+`copy_list_compound_elem` immediately produced a hand-constructed class-(i) row the corpus does not
+contain (br `85j3j8`, below) — tid `List[(Int, Int)]`, flat `List[]`. A census bounds what has been
+*measured*; it never bounds what exists (`feedback_corpus_sweep_is_not_coverage`). An earlier
+revision of this section wrote the heading without the qualifier, which is the exact
+task-count-as-done failure mode 03p551 was opened over.
+
+### The class-(i) row the corpus lacks, and the two rounds it took to see it (br `85j3j8`)
+
+Measuring `copy_list_compound_elem` before touching it — the plan's one-line prescription for it is
+`set_var_ty(dst, get_var_ty(src))` — produced three findings, and the third became a bug fix.
+
+**(i) The plan's literal prescription cannot work.** The whole 874-file corpus reaches that function
+**once**, from `test_yvq32w_compound_inner_in_mono_body.bl`, and its `src` there is the emitted C
+expression `blink_build_1list_1of_1maps_0Str_0Int("x", 5)` — not a variable name — so
+`get_var_ty(src)` returns `-1`. The copy must be sourced from the *node's* tid, not from a name
+lookup on a C string.
+
+**(ii) The "MISSING ARMS" are not the hole.** The `copy_list_compound_elem.no_arm` tap has **zero**
+hits in every sweep, and the arm is unreachable from all three call sites: `codegen_stmt.bl` (both
+copies) gates the call on `expr_list_elem_type == CT_OPTION || CT_RESULT || CT_MAP`, and
+`codegen_methods.bl:4380` gates on a `carrier` whose recogniser (`compound_tag_ct`) only knows
+`Option_` / `Result_` / `Map_`. The hardcoded triple in the *callers' guard* is the hole; the
+function's missing `CT_SET`/`CT_LIST` arms are downstream of a door that never opens.
+
+**(iii) The element kind that actually loses is the one no arm and no guard mentions — `Tuple`.**
+Measured one shape at a time by running programs: `List[List[T]]`, `List[Set[T]]`, `List[Struct]`
+and `List[Map[K, V]]` are all correct read at depth, while an unannotated `let` bound to a **call**
+returning `List[(A, B)]` erases the element. Three symptoms, and the worst is the quiet one:
+
+| | emitted | how it presents |
+|---|---|---|
+| `let x: Int = f.0` | `const void x = f._0;` | cc error, **no Blink span** |
+| `f.0 + f.1` in `"{...}"` | the fmj80a placeholder | prints `<value>` where a number belongs |
+| `for p in g`, `.filter().collect()` | `blink_Option_void` | cc error, no span — **and a different bug** |
+
+`tid=List[(Int, Int)] flat=List[]`, `tid=(Int, Int) flat=Int`, `tidc=blink_Tuple2_int_int
+emitted=int64_t`. Class-(i) — the tid is right, the flat path is wrong — and the plan's thesis in
+one screen. Generics are not required; a non-generic fn return reproduces it, and annotating fixes
+it. The axis is the missing annotation.
+
+**Three coupled gaps, in the order they block each other.** `tk_to_ct(TyKind.Tuple)` is `CT_VOID` so
+`tid_inner_ct` answers `-1` — correct, and it stays: a tuple has no CT. But it has a generated tag,
+and codegen's List house convention already spells a tuple element the way it spells a struct
+element, as the pair `(CT_VOID, sname)`. What was broken was that (1) `tid_inner_struct` answered
+`""` for a Tuple, so the tid side could not name it; (2) `recover_list_elem_from_tid` bailed at
+`if ect < 0 { return }` *before* consulting the struct slot, so even a nameable element died there —
+its own header comment claimed a tuple element was "a safe no-op", which the measurement disproves,
+and the comment is corrected in place; and (3) `emit_let_binding`'s `CT_LIST` ladder had no tid last
+resort where the `CT_SET` branch twelve lines above has had one since `mv45y5`.
+
+**The guard took two rounds, and that is the lesson worth keeping.** The first attempt gated the new
+arm on *"no element recorded"* — and it never fired. A new `listelem` `letladder` tap showed why: the
+RHS of `let g = build_int_pairs()` carries `expr_list_elem_type = CT_STRUCT` — a tuple *is* a struct
+here — with **no sname**, and `val_str` is a C call expression, so neither
+`get_list_elem_struct(val_str)` nor `expr_list_elem_struct` can supply one. The element was present
+and nameless, not absent. So the predicate is `list_elem_unspellable`: absent, **or** a
+`CT_STRUCT`/`CT_ENUM`/`CT_VOID` marker with an empty struct slot. The tap is kept permanently,
+because from the outside the two failure modes are indistinguishable and only the second was real.
+
+**Census, same intersected basis.** `ctype.*` unchanged at 22 diverge / 250 declines, cell map
+byte-identical. The `tydiv` map holds at 394 cells (familyA 11 cells / 100 rows) with exactly two
+changes, both improvements:
+
+- **removed** `site=emit_let_binding.decl tid=List[Int] flat=List[]` — `let result = list_concat([1,
+  2], [3, 4])` in `test_list_hof_stdlib.bl`. An `Int` element, no tuple in sight: the recovery is not
+  tuple-specific.
+- **corrected** `var=k tid=K flat=Int` → `flat=U64` — `let k = ks.get(i).unwrap()` in `count_inc[K]`,
+  U64 instance. Same nine diverge rows for that file before and after; the flat answer went from
+  *wrong* to *right*, and stays booked as diverge only because the tid side spells the abstract
+  typevar `K` inside a generic body, which is the known class-(ii) convention. A latent U64-key
+  erasure in a generic body, fixed as a side effect.
+
+**Symptom 3 is a different bug, and splitting it was the point.** `for`-in and
+`.filter().collect()` emit `blink_ListIterator_void` because the iterator emitters
+(`list_iter_c_type` / `emit_list_iter_typedef`, `codegen_types.bl:7502`) take a bare `inner: Int` CT
+and spell it with `c_type_tag(inner)` — so an element whose C name lives in the companion sname slot
+loses the name *however the binding got it*. It reproduces with a plain `List[Pt]` and no tuple
+anywhere, and reproduces identically with `85j3j8`'s source changes stashed: neither caused nor cured
+by the binding fix. Filed as br `1n9fhg` with those two rows as its MVCE. One red test standing for
+two causes would have hidden whichever was fixed second — and `1n9fhg` is itself a cell the collapse
+removes structurally, since a tid-sourced element carries its own name and there is nothing to lose.
 
 ## Appendix — all 428 shape cells
 

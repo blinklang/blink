@@ -549,7 +549,7 @@ fn deep_tp_from_tid(tid: Int) -> Int {
 // set_list_nested_elem_type/_struct, mirroring the declared-path shape at
 // codegen_stmt.bl:3320-3330; a second nested List level, or a typevar/
 // tuple/fn element, is a safe no-op (the -1/"" sentinel already stands).
-fn recover_list_elem_from_tid(node: Int, var_name: Str) ! Codegen.Register, Codegen.Scope {
+pub fn recover_list_elem_from_tid(node: Int, var_name: Str) ! Codegen.Register, Codegen.Scope {
     // A generic FUNCTION body's own tid memo is written once at typecheck with
     // its tparams abstract (typecheck never re-runs per instantiation) -- inside
     // a mono instance's body, `List[Set[T]]` still reads back with T a bare
@@ -558,8 +558,32 @@ fn recover_list_elem_from_tid(node: Int, var_name: Str) ! Codegen.Register, Code
     // outside a mono body or when node's tid is already concrete.
     let etid = tc_tid_subst_mono(tc_lookup_node_tid(node), cg_mono_tparams_sl, cg_mono_arg_tids)
     let ect = tc_tid_list_elem_ct(etid)
-    if ect < 0 { return }
     let tracing = dbg_channel_on("listelem")
+    if ect < 0 {
+        // br 85j3j8: a TUPLE element has no CT to name it — tk_to_ct answers CT_VOID for
+        // TyKind.Tuple and tid_inner_ct turns that into -1 — but it does have a generated tag,
+        // and the comment above ("a typevar/tuple/fn element is a safe no-op") was wrong about
+        // the tuple third of that list. Leaving it erased is only safe when there is no parity
+        // target to name; a tuple HAS one, is emitted, and is what the ANNOTATED path already
+        // spells here as the same `(CT_VOID, sname)` pair the struct arm below writes. Bailing
+        // made an unannotated `let` over a `List[(A, B)]`-returning call lose the element, which
+        // reaches cc as `const void x = f._0;` and `blink_Option_void`, and reaches the user as
+        // the `<value>` placeholder where a number belongs.
+        //
+        // Still gated on a nameable tag, so a Fn, typevar or genuinely-unknown element keeps
+        // bailing exactly as before: tid_inner_struct answers "" for all three.
+        let tuple_tag = tc_tid_list_elem_struct(etid)
+        if tuple_tag == "" {
+            if tracing != 0 { dbg_trace("listelem", "recover ect={ect} var={var_name} arm=bail_unnameable") }
+            return
+        }
+        if tracing != 0 { dbg_trace("listelem", "recover ect={ect} var={var_name} arm=tuple tag={tuple_tag}") }
+        expr_list_elem_type = CT_VOID
+        expr_list_elem_struct = tuple_tag
+        set_list_elem_type(var_name, CT_VOID)
+        set_list_elem_struct(var_name, tuple_tag)
+        return
+    }
     if ect == CT_OPTION {
         let elem_tid = tc_tid_list_elem(etid)
         let inner_tp = deep_tp_from_tid(tc_tid_option_inner_tid(elem_tid))
