@@ -3267,7 +3267,116 @@ sent zero value; four candidate answers are enumerated on the ticket. A document
 primitive's end-of-stream contract is not a codegen decision, so the boxing fix deliberately preserved
 today's behavior.
 
-### Remaining family-A causes, ranked (12 cells / 116 rows)
+### nrrs28 — `Template[C]` was not a type, so the phantom and all seven methods were unenforceable (CLOSED, −9 rows)
+
+**The cause was one level above the ticket's title.** The ticket says the introspection intrinsics
+resolve no return type. They *could not* have. `Template` is claimed by `is_primitive_type`
+(`typecheck.bl:6865`), so no user type can take the name — but `resolve_type_parts` had **no arm for
+it**, so a `tpl: Template[DB]` parameter fell through `resolve_type_name` to
+`make_typevar("Template")`. The receiver was a typevar, i.e. exactly as permissive as `TYPE_UNKNOWN`,
+so **no method arm could have helped**: both halves of the gate fail open at the receiver, before any
+`method ==` comparison runs. The ticket's own open question — *"whether `Template[T]` should be a
+`TyKind` at all"* — was the fix, and the answer is **yes** on the spec's own words
+(`sections/03b_contracts.md:424`: "a compiler-known structural type"). Sixth sighting of the
+untyped-receiver family and `w13xgb`'s (Ptr) shape verbatim.
+
+**Blast radius measured before writing anything.** Only **6** matches are exhaustive over the whole
+`TyKind` set (`tk_name`, `type_to_str`, `tk_to_ct`, `tc_tid_child_count`, `tc_tid_child`,
+`tc_channel_elem_ct`) — plus **4 in `tests/`**, which each carry their own independent enumeration of
+the kind set on purpose. Stage 0's net named all ten and the build stayed red until each was answered:
+that is the exhaustiveness net doing precisely the job the plan added it for, including in test files
+the plan never anticipated.
+
+**Codegen needed no new knowledge, and the list ⊇ arms invariant came back CLEAN — the first time in
+this campaign.** `CT_TEMPLATE` and the 7 emitters (`codegen_methods.bl:2108`) have always existed, and
+`is_builtin_method` lists exactly the same 7 names. Ten previous causes were an allow-list disagreeing
+with its own arms; this one was purely the tid side missing, so the new `tk_to_ct` arm makes the two
+universes *agree* rather than adding knowledge to either.
+
+**Six fail-open modes, every one reproduced by RUNNING a program:**
+
+| | shape | observed |
+|---|---|---|
+| 1 | `let s: Str = tpl.count()` | printed `1` — an Int through a `Str` binding. Exit 0, **silent** |
+| 2 | that same `s` passed to a `Str` parameter | `cc` escape, `-Wint-conversion`, no Blink span |
+| 3 | `let f: Int = tpl.get_float(0)` | printed `1.5` from an `Int` binding |
+| 4 | `let b: Str = tpl.get_bool(0)` | printed `false` from a `Str` binding |
+| 5 | `tpl.count(1, 2, 3)` | three arguments to a nullary method, discarded, returned `1` |
+| 6 | `tpl.type_tag("zero")` | a `Str` index, unchecked |
+
+Mode 5 is **not** this cause — arity is unchecked for *every* builtin method block (`xs.len(1,2,3)`
+compiles too), filed as `drnf86` and deliberately not asserted.
+
+**A real type is STRICTER than a typevar, and that is the part the ranking row did not predict.** The
+moment `Template[C]` became a type, every legitimate `db.query("SELECT …")` in the corpus became an
+argument-type error — a `Str` where a `Template[DB]` is expected. Accepting the interpolated string
+**literal** is not an extra; it *is* the feature (spec `:424`), so `tc_template_arg_ok` had to land in
+the same change, on the same footing as the `is_int_literal_node` coercion beside it: a coercion at an
+**argument position** granted to a literal, not a claim that `Str` and `Template[C]` are compatible
+types. `types_compatible` must keep answering 0 for them — that is what makes the variable case an
+error.
+
+**And the rejection the whole feature exists to produce moved a phase earlier.** Spec `:465`/`:470`
+writes it out in full: a pre-built `Str` variable is opaque, `E0310`, *"pass the string literal
+directly, or wrap values in `Raw()`"*. That check lived in **codegen** (`codegen_methods.bl:3151`),
+which means it only ever fired on the **effect-operation** path and only after typecheck had passed
+the program. Reporting it from `check_arg_shapes` covers every call shape and stops at the phase that
+knows the parameter's type. `tests/test_template.bl` pins `E0310` for exactly that program and stays
+green — the code is unchanged, only the reporter is.
+
+**The phantom is now carried AND compared, and the limit on the comparison is worth recording.**
+`sections/03b_contracts.md:566` is normative: *"`Template[DB]` and `Template[Shell]` are distinct
+types. You cannot pass a `Template[Shell]` to a function expecting `Template[DB]`."* One arm in
+`types_compatible` recursing into the phantom — the `Ptr` arm's shape, for a third distinct reason —
+enforces it. It is **vacuous for the spelling the spec itself uses**: `DB` and `Shell` there are
+**effect** names, effect names are not in the type namespace, so each phantom resolves to a typevar
+and typevars unify with anything by design. The arm bites only when the context is a real type. That
+gap is `kfefsy` (`type:spec`) and it is a namespace question, not something a compatibility relation
+can decide.
+
+**Attribution, and all movement accounted for.** Family-A rows **116 → 107** on the 874-file common
+basis. All 9 are `lib/std/db_sqlite.bl:140` (`let tag = tpl.type_tag(i)`), one per db-flavoured root —
+exactly the rows this cause was predicted to own, and with them **`std_db_sqlite` goes 9 → 0**, which
+puts **every `lib/std` module at zero**. The per-module tail is now `__main__` 93, `cli` 8,
+`std_http_server` 3, `build_stdlib` 3. Totals: `diverge` 4202 → 4193 (**−9**), `agree` +40 = the 9
+flipped rows plus **one** new `let args_sl` in `typecheck.bl` × the 31 roots that compile it — the
+per-file multiplier again, and the whole delta is explained.
+
+`task regen` + `task ci` green. Test: `tests/test_nrrs28_template_introspection_types.bl`, 15 rows,
+9 red of 13 → 15 green. Three rows write the shape **directly** into the corpus (own effect, own
+handler, every getter consumed at its own declared type) because `db_sqlite` reaches this API only
+through a live SQLite connection and `compile_and_run`'s link line has no `-lsqlite3`.
+
+**Five byproducts filed, none fixed inline, and the first is the worst thing found this session.**
+
+- **`zhxq5p`** — a handler method body is **never typechecked at all** when the handler is a
+  function's **return value**, which is the spelling all of `lib/std` uses
+  (`pub fn sqlite_handler() -> Handler[DB]`). `let bad: Int = "not an int"` inside such a body passes
+  `blink check` clean. `pgc3d9` wired `tc_check_handler_method` in at the **call-argument** position
+  only, so the tail position was never reached. **This defect ate the first draft of this ticket's
+  test**: the negative rows used a `-> Handler[Tpl]` helper and every one of them was asserting
+  nothing. They were rewritten to the inline `with handler` form, and the file says so, so the
+  workaround can be reverted when `zhxq5p` closes. *A test that asserts a compile error is only as
+  trustworthy as the phase that would report it.*
+- **`k7mng9`** — a **free** fn with a `Template[C]` param does not decompose its literal, because the
+  decomposition gate sits inside the effect-op emitter; the program reaches `cc` with a
+  `const char*` where a `blink_template*` is declared. Pre-existing, and the choice between
+  "decompose at every Template param" and "restrict `Template[C]` to effect signatures" is a real
+  one the spec does not make.
+- **`drnf86`** — builtin-method **arity** is unchecked everywhere (mode 5 above), ~10 instances of
+  one defect; wants arity attached to the arm as data, not a count check per arm.
+- **`fqy7bz`** (`type:spec`) — the spec spells `Template[C]`'s surface as two **fields**
+  (`parts: List[Str]`, `values: List[Any]`) while the compiler implements a **7-method** API.
+  `values` is **inexpressible**: Blink has no `Any`, which is why the tag-plus-four-getters shape
+  exists at all — and that shape also silently limits a template to four scalar types.
+- **`kfefsy`** (`type:spec`) — the phantom is vacuous for effect-name contexts, above.
+
+`k0dfjj` stays open and is why this test has **no** `std.db` row: declaring any user effect in a
+program that imports `std.db` makes `db_sqlite.bl` itself fail to compile. Its diagnostic is a
+tid-vs-flat divergence witness — the message names the receiver from the **tid**, correctly, while
+dispatch reads the **flat** ctype — so it is a likely Stage-3 structural fix.
+
+### Remaining family-A causes, ranked (12 cells / ~~116~~ 107 rows)
 
 Re-ranked from the post-`qjfwc6` sweep, by **rows on the 874-file common basis**, grouped by the
 innermost producer (the outermost call is usually a symptom — `.unwrap()` heads many chains, but its
@@ -3300,24 +3409,26 @@ With the `Str`, `Bytes`, `Ptr`, `self`, effect-op **and namespace-intrinsic** ca
 intrinsic-method list is spent as a leading mechanism: `qjfwc6` gave typecheck the table, and what it
 left behind is not a missing arm but an open spec question (`jr4xf7`) and a list that disagrees with
 its own arms (`n84s1p`). **The untyped-receiver family was the whole head of the list** — and
-`w089a0` has since taken the binder half of it, leaving `nrrs28` (`Template[T]`) and `ps5br9` (the
-ffi scope), both of which need a `TyKind` rather than a binding. The two causes that are neither
+`w089a0` has since taken the binder half of it, and `nrrs28` has since taken `Template[T]`, leaving
+`ps5br9` (the ffi scope) alone — the last member of the family, and still one that needs a `TyKind`
+rather than a binding. The two causes that are neither
 (iterator adapters, `Channel(n)`) are both already deferred to a user-visible decision.
 
 **Two shapes, and they take different fixes.** The untyped-receiver family has now split cleanly in
 two: `jzvxav` and `w089a0` were **declaration sites that dropped a type they already had**, and both
 were repaired by swapping in the typed spelling that already existed (`nr_define_typed`) — no new
-inference, no new arm, ~10 lines each. `w13xgb`, `ps5br9` and `nrrs28` are **types the pool cannot
+inference, no new arm, ~10 lines each. `w13xgb`, `nrrs28` and `ps5br9` are **types the pool cannot
 name**, and those need a `TyKind` variant plus a lowering plus a method block. The binder half is
-now done; what is left of the family is the pool half.
+done and the pool half is down to its last member (`ps5br9`) — five of the six sightings are closed,
+and all five were closed by the same three-part recipe.
 
 **The old 72-row `db.*` bucket split four ways, and every one of the four is now closed or isolated —
 this is the lesson the map keeps re-teaching: a shared bucket is not a shared cause.** `jzvxav` took
 the 12 `at=std_db_row:35` rows (`row.get`, never a `db.*` signature problem at all — it is `self`
 inside `impl RowOps for Row`), `h3q81d` took the ~42 genuine effect-op rows, `w089a0` took the 9
-with-resource binder rows, and `nrrs28` owns the 9 `at=std_db_sqlite:140` rows that remain
-(`tpl.type_tag` — `Template[T]`, not `db`). `tests/test_db_stmt.bl` now carries **one** family-A row,
-and it is that last one.
+with-resource binder rows, and `nrrs28` took the last 9, the `at=std_db_sqlite:140` rows
+(`tpl.type_tag` — `Template[T]`, not `db`). All four are now **closed**: `tests/test_db_stmt.bl`
+carried exactly one family-A row after `w089a0`, that row was the `nrrs28` one, and it is gone.
 
 | cause | rows | ticket | note |
 |---|---:|---|---|
@@ -3326,7 +3437,7 @@ and it is that last one.
 | `fs.read` / `write` / `list_dir` / `remove` | 4 | `jr4xf7` (`type:spec`) | Split out of `qjfwc6` and **held on purpose**: `sections/04_effects.md:73,1053` spells `fs.read(path)?` as a `Result` and `:157,215` names the lister `fs.list`, while codegen emits a bare `const char*` from `blink_read_file`. Signing it from codegen would write "an FS read cannot fail" into the type system |
 | ~~`db.*` effect operations — `db.query` / `query_one` / `execute`, `stmt.step`~~ | ~~51~~ | **`h3q81d`** | **CLOSED** — −49 rows, section above. Typecheck held **no** operation signatures, only the handle name for warning suppression; codegen held the same signatures across eight flat return fields. 9 rows survive, all `with db.prepare(..) as stmt` → **`w089a0`** |
 | ~~the with-resource `as` binder — `with db.prepare(..).unwrap() as stmt`~~ | ~~9~~ | **`w089a0`** | **CLOSED** — −13 rows, section above. The prediction held exactly: the tid *was* already in hand at the binding site, one line above the walk that computes it, and the fix was the `jzvxav` shape — bind the binder. Another **silent miscompile** (`let bad: Str = r.value()` ran and printed `7`). Attribution was three files, all with-resource; `test_db_stmt.bl` 10 → 1, and the survivor is `nrrs28` |
-| `Template[T]` introspection — `tpl.type_tag` / `count` / `get_int` / `get_float` / `get_str` | 9 | `nrrs28` | Split out of the old `db.*` bucket. All 9 are `at=std_db_sqlite:140`, one per db-flavoured root. **The untyped-receiver shape again**, for the fifth time: `Template` is not a `TyKind`, so the receiver is as permissive as `TYPE_UNKNOWN` before any method arm can run — `w13xgb` / `ps5br9` / `jzvxav` in a fourth costume, and it should be fixed the way `w13xgb` was (variant first, then the lowering, then the method block) |
+| ~~`Template[T]` introspection — `tpl.type_tag` / `count` / `get_int` / `get_float` / `get_str`~~ | ~~9~~ **0** | **`nrrs28`** | **CLOSED — −9 rows**, section above, and the prediction in this row held to the row and to the recipe: it *was* the untyped-receiver shape (`Template` was claimed by `is_primitive_type` and had no `resolve_type_parts` arm, so the receiver was `make_typevar("Template")`), and it *was* fixed the way `w13xgb` was — variant, lowering, method block. `std_db_sqlite` 9 → **0**, which puts **every** `lib/std` module at zero. What the row did not predict: making the receiver a real type is **stricter** than a typevar, so the literal-decomposition coercion had to be added in the same change or every legitimate `db.query("…")` in the corpus became an error — and the `Str`-variable rejection the spec writes out in full (E0310) moved from **codegen** to typecheck, which widened it from the effect-op path to every call shape |
 | `Iterator` adapters — `.zip`, `.chain`, `.enumerate`, `.collect` | 34 | `qzdz2e` | **deferred** (panel decision, user-visible). Was invisible in the previous ranking and is now #3: `tests/test_combining_iterators.bl` (16) and `tests/test_44xww4_enumerate_zip_compound.bl` (18), showing as `flat=List[Void]` and `flat=Tuple2_int_int` — the adapter loses the element type *and* the pair shape |
 | `Channel(n)` / `ch.recv` | 24 | — | **likely genuinely under-determined** — the arg is a capacity, not an element type, so this may be `decisions/under-determined-types.md` / E0301, not a missing rule. `tests/test_channels.bl` (11), `tests/test_async_cancel.bl` (7), `src/cli.bl:2162` |
 | ~~a cross-module `pub let` container element — `symbol_index.si_file_path.get(i)`~~ | ~~12~~ **0** | `cttrag` | **CLOSED, and two of this row's three axes were wrong** — not container-specific, not about `pub` or crossing a module boundary. It is any **module-qualified** top-level `let`. See the `cttrag` section |
@@ -3398,7 +3509,9 @@ redistributing the same handful of mechanisms across roots — which is why the 
 producer and not by this table. `h3q81d` is the only cause so far to move `__main__` substantially
 (223 → 174), precisely because effect ops are called from roots rather than from a stdlib module.
 
-**Every `lib/std` module in this table is now at zero except `std_db_sqlite` (9, `nrrs28`).** What
+**Every `lib/std` module in this table is now at zero except `std_db_sqlite` (9, `nrrs28`)** — and
+with `nrrs28` closed, *`std_db_sqlite` is at zero too, so the qualifier is spent: every `lib/std`
+module reads zero, and the only stdlib rows left anywhere are `std_http_server`'s 3.* What
 remains is `__main__` plus the compiler's own source (`cli`, 11 at the time this was written and 8
 after `jvy35h`) — so from here the instrument is measuring the corpus and the compiler, not the
 standard library. (`lib/pkg`'s `pkg_resolver` stayed at 3 for ten sweeps after this and went to zero on
@@ -3430,7 +3543,8 @@ instrument has measured.
 
 **`rb5wvb` cleared `pkg_resolver` (3 → 0) and took `__main__` from 122 to 120, and it is the first fix
 to retire a `lib/pkg` module** — so this table's non-`__main__` tail is now `std_db_sqlite` (9,
-`nrrs28`), `cli` (8), and `std_http_server` / `build_stdlib` (3 each) and nothing else. Its 5 rows are
+`nrrs28`), `cli` (8), and `std_http_server` / `build_stdlib` (3 each) and nothing else. *(`nrrs28`
+later cleared `std_db_sqlite`, leaving `cli` 8 and `std_http_server` / `build_stdlib` 3 each.)* Its 5 rows are
 three source lines: `lib/pkg/resolver.bl:312` (`let generated = time.read().to_rfc3339()`, ×3 roots) and
 `tests/test_time.bl:46,:64`. Note that `pkg_resolver` **had to be split out of the shared `3 each` row**
 to record this, which is the cost of grouping equal-valued modules on one line — they were only equal by
@@ -3443,7 +3557,7 @@ paragraph draws two paragraphs down.
 `lib/std/http_server.bl`.** That combination is the one to keep in mind when reading this column: the rows
 land where a closure field is *invoked* — three test roots — not where it is *declared*, so a stdlib cause
 can present as a pure-`__main__` delta. The non-`__main__` tail is unchanged: `std_db_sqlite` (9,
-`nrrs28`), `cli` (8), `std_http_server` / `build_stdlib` (3 each). And `std_http_server`'s own 3 rows are
+`nrrs28` — **cleared since**), `cli` (8), `std_http_server` / `build_stdlib` (3 each). And `std_http_server`'s own 3 rows are
 **not** this cause — they are `var=sem tid=? flat=Channel[Int]` at `:368`, which belongs to the held
 `Channel` group.
 
@@ -3456,7 +3570,8 @@ belongs to `decisions/under-determined-types.md` / E0301. Below them the tail is
 ~~`pub let` container element (12)~~ (**closed — `cttrag`**), **`jr4xf7` (14 — re-measured from the 4
 this list used to claim, and now the largest single remaining cause, blocked on a spec answer)**,
 ~~closure-typed fields (~11)~~ + ~~`Response`/`Request` (10)~~ (**one cause, not two — closed as
-`cjtxxr`, −12**), `nrrs28` (9), ~~`n84s1p` (9 → 6)~~ (**closed — −8**), `List.join` (6),
+`cjtxxr`, −12**), ~~`nrrs28` (9)~~ (**closed — −9, and it took the last stdlib module to zero**),
+~~`n84s1p` (9 → 6)~~ (**closed — −8**), `List.join` (6),
 ~~`bytes.to_str()` (3)~~ (**closed as a mis-attribution — it was `n84s1p` downstream**),
 ~~`pkg_resolver:312` (3, `var=generated`, not yet diagnosed)~~ (**closed — it was
 `Instant.to_rfc3339`, `rb5wvb`, −5 with the two `tests/test_time.bl` rows**).

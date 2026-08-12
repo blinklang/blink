@@ -1,6 +1,6 @@
 import ast.{NodeKind, node_kind_name, is_block_bearing, dbg_trace, dbg_channel_on}
 import std.str.{str_to_lower}
-import codegen_types.{is_intrinsic_method, strip_module_qualifier, c_type_tag_for_struct, escape_mono_seg, mono_slot_conflicts, mono_slot_conflicts_same_type, mono_slot_conflicts_diff_type, mono_slot_conflicts_diff_type_injective, get_var_ty, get_var_tp, tp_get_kind, tp_get_child1, tp_get_child2, tp_get_sname, tp_display, CT_INT, CT_FLOAT, CT_BOOL, CT_STRING, CT_LIST, CT_VOID, CT_OPTION, CT_RESULT, CT_ITERATOR, CT_HANDLE, CT_CHANNEL, CT_PTR, CT_MAP, CT_BYTES, CT_SET, CT_STRINGBUILDER, CT_STRUCT, CT_ENUM, CT_I8, CT_I16, CT_I32, CT_U8, CT_U16, CT_U32, CT_U64, CT_CHAR}
+import codegen_types.{is_intrinsic_method, strip_module_qualifier, c_type_tag_for_struct, escape_mono_seg, mono_slot_conflicts, mono_slot_conflicts_same_type, mono_slot_conflicts_diff_type, mono_slot_conflicts_diff_type_injective, get_var_ty, get_var_tp, tp_get_kind, tp_get_child1, tp_get_child2, tp_get_sname, tp_display, CT_INT, CT_FLOAT, CT_BOOL, CT_STRING, CT_LIST, CT_VOID, CT_OPTION, CT_RESULT, CT_ITERATOR, CT_HANDLE, CT_CHANNEL, CT_PTR, CT_MAP, CT_BYTES, CT_SET, CT_STRINGBUILDER, CT_TEMPLATE, CT_STRUCT, CT_ENUM, CT_I8, CT_I16, CT_I32, CT_U8, CT_U16, CT_U32, CT_U64, CT_CHAR}
 import parser.{
     get_annotation, has_annotation, is_literal_string_part,
     node_args, node_assoc_types, node_arms, node_body, node_captures, node_col, node_condition,
@@ -21,7 +21,7 @@ import diagnostics.{
     ICE_SEG_UNSOLVED_TYPEVAR, ICE_SEG_UNHANDLED_KIND, ICE_SEG_TID_OUT_OF_RANGE,
     ICE_SEG_ERASED_SLOT, diag_is_ice_seg,
     NON_EXHAUSTIVE_MATCH,
-    TYPE_ERROR, CANNOT_INFER_TYPE, NOT_ITERABLE, CAPABILITY_BUDGET, QM_INVALID_OPERAND, UNDEFINED_FUNCTION,
+    TYPE_ERROR, TEMPLATE_MISMATCH, CANNOT_INFER_TYPE, NOT_ITERABLE, CAPABILITY_BUDGET, QM_INVALID_OPERAND, UNDEFINED_FUNCTION,
     UNRESOLVED_METHOD, AMBIGUOUS_METHOD_CALL, MISSING_DISPLAY_IMPL,
     UNDEFINED_VARIABLE, UNKNOWN_TYPE, QM_RESULT_IN_NON_RESULT,
     QM_OPTION_IN_NON_OPTION, QM_ERROR_MISMATCH,
@@ -74,7 +74,7 @@ pub type TyKind {
     Int, Float, Bool, Str, Void,
     List, Option, Result, Fn, Struct, Enum,
     Typevar, Unknown, Iterator, Handle, Channel, Ptr,
-    Tuple, Map, Bytes, Set, StringBuilder,
+    Tuple, Map, Bytes, Set, StringBuilder, Template,
     I8, I16, I32, U8, U16, U32, U64, Char
 }
 
@@ -105,6 +105,7 @@ fn tk_name(k: TyKind) -> Str {
         TyKind.Bytes => "Bytes"
         TyKind.Set => "Set"
         TyKind.StringBuilder => "StringBuilder"
+        TyKind.Template => "Template"
         TyKind.I8 => "I8"
         TyKind.I16 => "I16"
         TyKind.I32 => "I32"
@@ -859,6 +860,24 @@ pub fn make_channel_type(elem_type: Int) -> Int {
 // mentions in a signature and its call site are integer-equal.
 pub fn make_ptr_type(pointee: Int) -> Int {
     ty_intern_simple(TyKind.Ptr, "Ptr", pointee, -1)
+}
+
+// br nrrs28, and the sixth case of the same shape as make_ptr_type above. `Template` is
+// claimed by is_primitive_type (:6866) so no user type could have taken the name, and
+// resolve_type_parts had no arm for it — so every `tpl: Template[DB]` resolved to
+// make_typevar("Template"), permissive at the RECEIVER, which is why the seven introspection
+// methods codegen has always emitted could have no return type no matter what arm was added.
+//
+// One inner = the phantom context (`DB` in `Template[DB]`), shaped like make_ptr_type so
+// tc_tid_child / tc_tid_child_count / the spellers / tk_to_ct reach it through arms they
+// already have. The phantom is CARRIED, not yet CHECKED: sections/03b_contracts.md:563 states
+// that `Template[Shell]` may not be passed where `Template[DB]` is expected, and today it can
+// be. That check needs the contexts to be comparable, and the spec's own contexts (`DB`,
+// `Shell`) are EFFECT names, which are not in the type namespace — so each resolves to a
+// typevar, and typevars unify with anything by design. Carrying the phantom is the
+// prerequisite for ever enforcing it; enforcing it is a spec question, filed separately.
+pub fn make_template_type(context: Int) -> Int {
+    ty_intern_simple(TyKind.Template, "Template", context, -1)
 }
 
 // ── Metavariables (Hindley-Milner inference discipline) ─────────────
@@ -1981,6 +2000,35 @@ fn str_to_tuple_index(name: Str) -> Int {
     acc
 }
 
+// br nrrs28 + sections/03b_contracts.md:424. A `Template[C]` parameter accepts an
+// interpolated string LITERAL at the call site and nothing else. The compiler decomposes the
+// literal into parts and values instead of concatenating it — codegen does exactly that at
+// codegen_methods.bl:3148, keyed on this same node kind — while a pre-built `Str` VARIABLE is
+// opaque and must be rejected (:465), because accepting it is how tainted data would be
+// laundered past parameterization. Every string literal parses as InterpString whether or not
+// it interpolates (parser.bl:3413), so this is one kind, not two.
+//
+// This is the same shape as is_int_literal_node below and it lives in the same place for the
+// same reason: it is a coercion at an ARGUMENT POSITION granted to a literal, not a statement
+// that `Str` and `Template[C]` are compatible types. types_compatible must keep answering 0
+// for them, which is what makes the variable case an error.
+fn tc_template_arg_ok(ptid: Int, arg_node: Int) -> Int {
+    if type_kind(resolve_alias_tid(ptid)) != TyKind.Template { return 0 }
+    if node_kind(arg_node) == NodeKind.InterpString { return 1 }
+    0
+}
+
+// The laundering case, and the reason it is its own predicate rather than folded into the
+// mismatch: `Str` -> `Template[C]` is the one rejection the spec writes out in full
+// (sections/03b_contracts.md:470, E0310, with the hint naming the literal and Raw()), because
+// it is the mistake the feature exists to catch. A Template-to-Template mismatch is an
+// ordinary type error about the phantom context (br kfefsy) and keeps the generic wording.
+fn tc_template_launders_str(ptid: Int, arg_t: Int) -> Int {
+    if type_kind(resolve_alias_tid(ptid)) != TyKind.Template { return 0 }
+    if type_kind(resolve_alias_tid(arg_t)) == TyKind.Str { return 1 }
+    0
+}
+
 fn is_int_literal_node(node: Int) -> Int {
     if node_kind(node) == NodeKind.IntLit { return 1 }
     if node_kind(node) == NodeKind.UnaryOp && node_op(node) == "-" {
@@ -2027,6 +2075,23 @@ fn check_arg_shapes(fn_name: Str, sig: Int, args_sl: Int, self_offset: Int) ! Ty
                 } else {
                     let mut lit_to_int = 0
                     if is_int_literal_node(arg_node) != 0 && is_integer_type(resolve_alias_tid(ptid)) != 0 {
+                        lit_to_int = 1
+                    }
+                    // br nrrs28 — the template-literal coercion, on the same footing as the
+                    // int-literal one above. See tc_template_arg_ok.
+                    if tc_template_arg_ok(ptid, arg_node) != 0 {
+                        lit_to_int = 1
+                    } else if tc_template_launders_str(ptid, arg_t) != 0 {
+                        // The laundering case gets the spec's OWN diagnostic
+                        // (sections/03b_contracts.md:470) rather than the generic mismatch
+                        // below: E0310 with the hint that names the two ways out. This is the
+                        // error the whole feature exists to produce, and it used to come from
+                        // codegen (codegen_methods.bl:3151) — which meant it only fired on the
+                        // effect-op path and only after typecheck had let the program through.
+                        // Reporting it here covers every call shape and stops at the phase that
+                        // knows the param's type. Setting the flag suppresses the generic report,
+                        // so one mistake stays one error.
+                        diag_error_at("TemplateMismatch", TEMPLATE_MISMATCH, "expected {type_to_str(ptid)}, found {type_to_str(arg_t)} — string variables cannot be implicitly converted to Template", arg_node, "pass the string literal directly, or wrap values in Raw() for dynamic SQL")
                         lit_to_int = 1
                     }
                     if lit_to_int == 0 && types_compatible(arg_t, ptid) == 0 {
@@ -2741,6 +2806,17 @@ fn resolve_type_parts(name: Str, elems_sl: Int, ann_node: Int) -> Int ! TypeChec
             return make_ptr_type(resolve_type_ann(sublist_get(elems_sl, 0)))
         }
         return make_ptr_type(TYPE_UNKNOWN)
+    }
+    // br nrrs28, the fifth carrier and the same reason again — see make_template_type. The
+    // phantom recurses through resolve_type_ann like every other carrier's child, so a
+    // context that IS a real type resolves to it; the spec's own contexts are effect names,
+    // which are not types, so those land on a typevar named for the effect. Either way the
+    // context is kept rather than discarded with the whole type.
+    if name == "Template" {
+        if elems_sl != -1 && sublist_length(elems_sl) >= 1 {
+            return make_template_type(resolve_type_ann(sublist_get(elems_sl, 0)))
+        }
+        return make_template_type(TYPE_UNKNOWN)
     }
     // `fn(A, B) -> R` (br nz7drz). Placed here for the same reason as the three carriers
     // above: "Fn" is a reserved type name (is_primitive_type claims it), so no user type
@@ -8311,6 +8387,20 @@ fn types_compatible(a0: Int, b0: Int) -> Int {
         if ka == TyKind.Ptr {
             return types_compatible(ta.inner1, tb.inner1)
         }
+        // br nrrs28. The phantom injection context, and the same one-inner recursion for a third
+        // distinct reason: sections/03b_contracts.md:566 is normative — "`Template[DB]` and
+        // `Template[Shell]` are distinct types. You cannot pass a `Template[Shell]` to a function
+        // expecting `Template[DB]`." Without this arm two Templates matched on kind alone, which
+        // is the cross-context confusion the phantom exists to prevent.
+        //
+        // It is VACUOUS for the spec's own examples, deliberately and unavoidably: `DB` and
+        // `Shell` there are EFFECT names, effect names are not in the type namespace, so each
+        // phantom resolves to a typevar and the typevar arm above already returned 1. So this
+        // arm bites only when the context is a real type. Making the effect spelling bite is a
+        // spec question (filed) and not something a compatibility arm can decide.
+        if ka == TyKind.Template {
+            return types_compatible(ta.inner1, tb.inner1)
+        }
         if ka == TyKind.Map {
             if types_compatible(ta.inner1, tb.inner1) == 0 { return 0 }
             return types_compatible(ta.inner2, tb.inner2)
@@ -9653,6 +9743,47 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 return obj_t
             }
             if method == "to_str" { return make_option_type(TYPE_STR) }
+        }
+
+        // br nrrs28. Enumerated against codegen's emit_template_method
+        // (src/codegen_methods.bl:2108) method-for-method rather than added a name at a
+        // time — codegen has exactly these seven arms, is_builtin_method lists exactly the
+        // same seven, and the list and the arms AGREE, which is the first cause in this
+        // campaign where that enumeration came back clean. A method typed here that
+        // codegen cannot emit would trade a missing type for a link error.
+        //
+        // The spec (sections/03b_contracts.md:428) spells the surface as two FIELDS —
+        // `parts: List[Str]` and `values: List[Any]` — while the compiler implements a
+        // method API, because Blink has no `Any` and so cannot express `values`. `parts()`
+        // is the one member both agree on, and it is `List[Str]` in both. The four typed
+        // getters plus `type_tag` are how the compiler answers what `values` would have,
+        // and their types come from codegen's own emission: `type_tag` reads the tag list
+        // as an Int, `get_float` memcpys a double, `get_str` yields the interned Str.
+        // Reconciling the two surfaces is a spec question, filed separately.
+        if obj_k == TyKind.Template {
+            let args_sl = node_args(node)
+            if method == "parts" { return make_list_type(TYPE_STR) }
+            if method == "count" { return TYPE_INT }
+            if method == "type_tag" {
+                check_builtin_arg(method, 0, TYPE_INT, args_sl, "Template")
+                return TYPE_INT
+            }
+            if method == "get_int" {
+                check_builtin_arg(method, 0, TYPE_INT, args_sl, "Template")
+                return TYPE_INT
+            }
+            if method == "get_float" {
+                check_builtin_arg(method, 0, TYPE_INT, args_sl, "Template")
+                return TYPE_FLOAT
+            }
+            if method == "get_bool" {
+                check_builtin_arg(method, 0, TYPE_INT, args_sl, "Template")
+                return TYPE_BOOL
+            }
+            if method == "get_str" {
+                check_builtin_arg(method, 0, TYPE_INT, args_sl, "Template")
+                return TYPE_STR
+            }
         }
 
         if obj_k == TyKind.Struct || obj_k == TyKind.Enum {
@@ -11928,6 +12059,7 @@ fn type_to_str(tid0: Int) -> Str {
         TyKind.Handle => return "Handle[{type_to_str(t.inner1)}]"
         TyKind.Channel => return "Channel[{type_to_str(t.inner1)}]"
         TyKind.Ptr => return "Ptr[{type_to_str(t.inner1)}]"
+        TyKind.Template => return "Template[{type_to_str(t.inner1)}]"
         TyKind.List => return "List[{type_to_str(t.inner1)}]"
         TyKind.Option => return "Option[{type_to_str(t.inner1)}]"
         TyKind.Result => return "Result[{type_to_str(t.inner1)}, {type_to_str(t.inner2)}]"
@@ -12279,6 +12411,10 @@ fn tk_to_ct(kind: TyKind) -> Int {
         TyKind.Bytes => CT_BYTES
         TyKind.Set => CT_SET
         TyKind.StringBuilder => CT_STRINGBUILDER
+        // Codegen has always known this one: `"Template" => CT_TEMPLATE` (codegen_types.bl:5709)
+        // maps the annotation NAME to it, and the 7 emitters key on it. Only the tid side was
+        // missing, so this arm makes the two universes agree rather than adding knowledge.
+        TyKind.Template => CT_TEMPLATE
         TyKind.I8 => CT_I8
         TyKind.I16 => CT_I16
         TyKind.I32 => CT_I32
@@ -12826,6 +12962,8 @@ pub fn tc_tid_child_count(tid: Int) -> Int {
         // (sections/07_trust_modules_metadata.md:193,:197), so this child is a real recursion
         // point, not a formality.
         TyKind.Ptr => 1
+        // The phantom context. Carried, not checked — see make_template_type (br nrrs28).
+        TyKind.Template => 1
         TyKind.I8 => 0
         TyKind.I16 => 0
         TyKind.I32 => 0
@@ -12881,6 +13019,7 @@ pub fn tc_tid_child(tid: Int, i: Int) -> Int {
         TyKind.Handle => if i == 0 { t.inner1 } else { -1 }
         TyKind.Channel => if i == 0 { t.inner1 } else { -1 }
         TyKind.Ptr => if i == 0 { t.inner1 } else { -1 }
+        TyKind.Template => if i == 0 { t.inner1 } else { -1 }
         TyKind.I8 => -1
         TyKind.I16 => -1
         TyKind.I32 => -1
@@ -13003,6 +13142,7 @@ pub fn tc_channel_elem_ct(chan_tid: Int) -> Int {
         TyKind.Handle => -1
         TyKind.Channel => -1
         TyKind.Iterator => -1
+        TyKind.Template => -1
         // No element type at all. `Channel[Void]` is not a thing, an unresolved metavar or a
         // typevar means the element is not known YET, and a bare `Channel(n)` reaches here
         // through TyKind.Unknown — that spelling names no element and is br w3v2e6's

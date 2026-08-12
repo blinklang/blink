@@ -1,0 +1,265 @@
+import compile_test_helpers.{expect_compile_error, compile_and_run}
+import std.template.{TPL_INT, TPL_FLOAT, TPL_BOOL, TPL_STR}
+
+// br nrrs28 — `Template[C]` was not a type, so none of its introspection methods had a
+// return type.
+//
+// THE CAUSE, in one line: `Template` is claimed by is_primitive_type (typecheck.bl:6865) so
+// no user type can take the name, but resolve_type_parts had no arm for it — so a
+// `tpl: Template[DB]` parameter fell through resolve_type_name to `make_typevar("Template")`.
+// A typevar is as permissive as TYPE_UNKNOWN, and it is permissive AT THE RECEIVER, which is
+// why no method arm could have helped: the 7 methods codegen emits (parts, count, type_tag,
+// get_int, get_float, get_bool, get_str — codegen_methods.bl:2108) each set expr_result_type
+// for C, and typecheck answered TYPE_UNKNOWN for all of them.
+//
+// This is the SIXTH case of the untyped-receiver family and its shape is w13xgb's (Ptr)
+// verbatim: a reserved type name with no resolve_type_parts arm, a typevar receiver, and
+// both halves of the gate failing open — the declared type is never compared and the
+// arguments are never checked. See also ps5br9 (ffi scope), jzvxav (self), w089a0 (with
+// resource binder).
+//
+// SPEC. sections/03b_contracts.md:424 calls `Template[C]` "a compiler-known structural type
+// parameterized by a phantom type C". Compiler-known is exactly what it was not. The spec
+// spells the surface as two FIELDS (`parts: List[Str]`, `values: List[Any]`) while the
+// compiler implements a method API — `parts()` plus a type tag and four typed getters —
+// because Blink has no `Any` and so cannot express `values`. That divergence is real and is
+// br fqy7bz; it is not this ticket, which types the API that exists.
+//
+// FAIL-OPEN MODES, every one reproduced by RUNNING a program:
+//
+//   1. `let s: Str = tpl.count()` — accepted, and SILENT: the program printed `1`, an Int
+//      through a binding declared Str, exit 0.
+//   2. The same `s` passed to a `Str` parameter — `cc` escape,
+//      `-Wint-conversion: makes pointer from integer without a cast`, no Blink span.
+//   3. `let f: Int = tpl.get_float(0)` — accepted, printed `1.5` from an Int binding.
+//   4. `let b: Str = tpl.get_bool(0)` — accepted, printed `false` from a Str binding.
+//   5. `tpl.count(1, 2, 3)` — three arguments to a nullary method, silently discarded,
+//      returned 1. Arity is unchecked for EVERY builtin method block, not just this one —
+//      br drnf86 — so it is deliberately NOT asserted below.
+//   6. `tpl.type_tag("zero")` — a Str index, unchecked.
+//   7. `Template[Shell]` accepted where `Template[DB]` is expected — the cross-context
+//      confusion the phantom exists to prevent. sections/03b_contracts.md:566 is normative
+//      on this ("you cannot pass a `Template[Shell]` to a function expecting
+//      `Template[DB]`"), so it is fixed here, by ONE arm in types_compatible that recurses
+//      into the phantom exactly as the Ptr arm above it recurses into the pointee.
+//
+//      It bites only when the context is a REAL TYPE, and that limit is not a shortcut: the
+//      contexts in the spec's own examples (`DB`, `Shell`) are EFFECT names, effect names
+//      are not in the type namespace, so each resolves to a typevar and typevars unify with
+//      anything by design. Making the effect spelling bite is br kfefsy (type:spec) — it
+//      needs effect names to be nameable in a type position, which is not a decision a
+//      compatibility arm gets to make.
+//
+// THE FIX: `TyKind.Template` with one child, the phantom context — shaped like
+// make_ptr_type / make_handle_type so tc_tid_child / tc_tid_child_count / tk_to_ct / the
+// spellers reach it through arms they already have — plus one `obj_k == TyKind.Template`
+// method block giving the 7 methods their return types and checking their index arguments.
+// Codegen needs no new knowledge: it has always had CT_TEMPLATE and the 7 emitters.
+//
+// One thing the new type had to be GIVEN, because a real type is stricter than a typevar:
+// tc_template_arg_ok (typecheck.bl, next to is_int_literal_node). An interpolated string
+// LITERAL is accepted at a `Template[C]` argument — that is the decomposition the whole
+// feature is (spec :424, and codegen_methods.bl:3148 keys on the same node kind) — while a
+// pre-built `Str` VARIABLE is rejected, which is spec :465 and the reason the feature is a
+// safety feature at all. It is a coercion at an argument position, like the int-literal one
+// beside it; `Str` and `Template[C]` remain incompatible TYPES.
+//
+// The Str rejection is reported in the spec's own words — E0310 TemplateMismatch with the
+// literal/Raw() hint (spec :470) — and reporting it from typecheck rather than from codegen
+// (codegen_methods.bl:3151, where it lived) is a widening: codegen only reaches that gate on
+// the effect-operation path, so the laundering check now covers every call shape and stops the
+// program at the phase that knows the parameter's type. tests/test_template.bl pins E0310 for
+// exactly this program and keeps passing.
+
+pub effect Tpl {
+    effect Run {
+        fn run(t: Template[Tpl]) -> Int
+        fn tags(t: Template[Tpl]) -> Str
+    }
+}
+
+// ── The shapes written DIRECTLY, where the build and the tydiv sweep can both see them ──
+//
+// db_sqlite.bl is the whole corpus's only consumer of this API (9 family-A divergence rows,
+// all of them lib/std/db_sqlite.bl:140) and it reaches the methods only through a live
+// SQLite connection. These rows put the shape in an ordinary test file: an own effect, an
+// own handler, and the introspection API used for its values AND for its types.
+//
+// The handler is written INLINE in each `with`, not returned from a `-> Handler[Tpl]`
+// helper, and that is load-bearing: br zhxq5p — a handler method body is never typechecked
+// at all when the handler is a function's RETURN VALUE, because br pgc3d9 wired
+// tc_check_handler_method in at the call-argument position only. The first draft of this
+// file used a helper and every negative row below passed a program that does not compile —
+// the rows were asserting nothing. When zhxq5p is fixed, the helper is the nicer spelling
+// and these can move back to it.
+test "count() and type_tag() are Ints in the corpus" {
+    with handler Tpl {
+        fn run(t: Template[Tpl]) -> Int {
+            // count() is an Int: it drives a `while` bound and ordinary arithmetic.
+            let mut sum = 0
+            let mut i = 0
+            while i < t.count() {
+                sum = sum + t.type_tag(i)
+                i = i + 1
+            }
+            sum + t.count()
+        }
+        fn tags(t: Template[Tpl]) -> Str {
+            "{t.count()}"
+        }
+    } {
+        let n = 7
+        let s = "hi"
+        // Two values: tags TPL_INT (0) and TPL_STR (3), so sum == 3, plus count == 2.
+        assert_eq(tpl.run("n={n} s={s}"), 5)
+    }
+}
+
+test "every getter is consumed at its own declared type in the corpus" {
+    with handler Tpl {
+        fn run(t: Template[Tpl]) -> Int {
+            t.count()
+        }
+        fn tags(t: Template[Tpl]) -> Str {
+            // Each getter's value is consumed AT ITS OWN TYPE — an Int in arithmetic, a
+            // Float in float arithmetic, a Bool in a condition, a Str through a Str method.
+            // parts() is a List[Str], so `.get(i)` yields an Option[Str] and the element
+            // has Str methods (the spec's invariant is parts.len() == count() + 1).
+            let parts: List[Str] = t.parts()
+            let mut out = "{parts.len()}|"
+            let mut i = 0
+            while i < t.count() {
+                let tag = t.type_tag(i)
+                if tag == TPL_INT {
+                    let v: Int = t.get_int(i)
+                    out = "{out}i{v + 1};"
+                } else if tag == TPL_FLOAT {
+                    let v: Float = t.get_float(i)
+                    out = "{out}f{v + 0.5};"
+                } else if tag == TPL_BOOL {
+                    let v: Bool = t.get_bool(i)
+                    let shown = if v { "T" } else { "F" }
+                    out = "{out}b{shown};"
+                } else if tag == TPL_STR {
+                    let v: Str = t.get_str(i)
+                    out = "{out}s{v.len()};"
+                }
+                i = i + 1
+            }
+            out
+        }
+    } {
+        let n = 7
+        let f = 2.5
+        let b = true
+        let s = "hi"
+        assert_eq(tpl.tags("n={n} f={f} b={b} s={s} end"), "5|i8;f3;bT;s2;")
+    }
+}
+
+// ── Runtime rows: the values still round-trip once the types are real ────────────────────
+
+test "the whole introspection API round-trips its values" {
+    let src = "import std.template.\{TPL_INT, TPL_FLOAT, TPL_BOOL, TPL_STR}\n\npub effect P \{\n    effect Run \{\n        fn run(t: Template[P]) -> Int\n    }\n}\n\nfn main() \{\n    with handler P \{\n        fn run(t: Template[P]) -> Int \{\n            let parts = t.parts()\n            io.println(\"nparts=\{parts.len()} p0=\{parts.get(0) ?? \\\"-\\\"}\")\n            io.println(\"count=\{t.count()}\")\n            let mut i = 0\n            while i < t.count() \{\n                let tag = t.type_tag(i)\n                if tag == TPL_INT \{ io.println(\"\{i} int \{t.get_int(i)}\") }\n                else if tag == TPL_FLOAT \{ io.println(\"\{i} float \{t.get_float(i)}\") }\n                else if tag == TPL_BOOL \{ io.println(\"\{i} bool \{t.get_bool(i)}\") }\n                else if tag == TPL_STR \{ io.println(\"\{i} str \{t.get_str(i)}\") }\n                i = i + 1\n            }\n            t.count()\n        }\n    } \{\n        let n = 7\n        let f = 2.5\n        let b = true\n        let s = \"hi\"\n        io.println(\"ret=\{p.run(\"n=\{n} f=\{f} b=\{b} s=\{s} end\")}\")\n    }\n}\n"
+    let r = compile_and_run(src, "nrrs28_roundtrip")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("nparts=5"))
+    assert(r.out.contains("count=4"))
+    assert(r.out.contains("0 int 7"))
+    assert(r.out.contains("1 float 2.5"))
+    assert(r.out.contains("2 bool true"))
+    assert(r.out.contains("3 str hi"))
+    assert(r.out.contains("ret=4"))
+}
+
+// ── The gate: a declared type over each method must now be COMPARED ─────────────────────
+//
+// Each of these compiled clean before the fix, and modes 1/3/4 above are what they ran as.
+
+fn tpl_probe_src(body: Str) -> Str {
+    "pub effect P \{\n    effect Run \{\n        fn run(t: Template[P]) -> Int\n    }\n}\n\nfn main() \{\n    with handler P \{\n        fn run(t: Template[P]) -> Int \{\n{body}\n            0\n        }\n    } \{\n        let n = 1\n        io.println(\"\{p.run(\"n=\{n}\")}\")\n    }\n}\n"
+}
+
+test "count() declared as Str is rejected" {
+    expect_compile_error(tpl_probe_src("            let s: Str = t.count()\n            io.println(\"\{s}\")"), "nrrs28_count_str", "TypeError")
+}
+
+test "type_tag() declared as Str is rejected" {
+    expect_compile_error(tpl_probe_src("            let s: Str = t.type_tag(0)\n            io.println(\"\{s}\")"), "nrrs28_tag_str", "TypeError")
+}
+
+test "get_float() declared as Int is rejected" {
+    expect_compile_error(tpl_probe_src("            let f: Int = t.get_float(0)\n            io.println(\"\{f}\")"), "nrrs28_float_int", "TypeError")
+}
+
+test "get_bool() declared as Str is rejected" {
+    expect_compile_error(tpl_probe_src("            let b: Str = t.get_bool(0)\n            io.println(\"\{b}\")"), "nrrs28_bool_str", "TypeError")
+}
+
+test "get_str() declared as Int is rejected" {
+    expect_compile_error(tpl_probe_src("            let v: Int = t.get_str(0)\n            io.println(\"\{v}\")"), "nrrs28_str_int", "TypeError")
+}
+
+test "get_int() declared as Float is rejected" {
+    expect_compile_error(tpl_probe_src("            let v: Float = t.get_int(0)\n            io.println(\"\{v}\")"), "nrrs28_int_float", "TypeError")
+}
+
+test "parts() declared as List[Int] is rejected" {
+    expect_compile_error(tpl_probe_src("            let p: List[Int] = t.parts()\n            io.println(\"\{p.len()}\")"), "nrrs28_parts_int", "TypeError")
+}
+
+// The index argument is checked, the same way List.get's is.
+test "a Str index into type_tag() is rejected" {
+    expect_compile_error(tpl_probe_src("            let v = t.type_tag(\\\"zero\\\")\n            io.println(\"\{v}\")"), "nrrs28_idx_str", "TypeError")
+}
+
+test "a Str index into get_int() is rejected" {
+    expect_compile_error(tpl_probe_src("            let v = t.get_int(\\\"zero\\\")\n            io.println(\"\{v}\")"), "nrrs28_getidx_str", "TypeError")
+}
+
+// ── The phantom context: carried, and compared where comparison is possible ─────────────
+
+test "a Template of one context is rejected where another context is expected" {
+    let src = "type DB \{}\ntype Shell \{}\n\nfn sink(t: Template[DB]) -> Int \{\n    t.count()\n}\n\nfn cross(t: Template[Shell]) -> Int \{\n    sink(t)\n}\n\nfn main() \{\n    io.println(\"probe\")\n}\n"
+    expect_compile_error(src, "nrrs28_cross_context", "TypeError")
+}
+
+// ── What must KEEP working: the literal coercion, and the Str variable that must not ─────
+
+test "an interpolated string literal is accepted at a Template param" {
+    with handler Tpl {
+        fn run(t: Template[Tpl]) -> Int {
+            t.count()
+        }
+        fn tags(t: Template[Tpl]) -> Str {
+            "{t.count()}"
+        }
+    } {
+        let n = 1
+        // A literal with no interpolations at all is the same node kind (parser.bl:3413),
+        // so it must be accepted too — 0 values, and parts.len() == 1.
+        assert_eq(tpl.run("plain"), 0)
+        assert_eq(tpl.tags("n={n}"), "1")
+    }
+}
+
+// spec sections/03b_contracts.md:465 — the laundering path. A pre-built Str is opaque, so
+// accepting it would defeat the whole feature. Before this fix the PARAM accepted it (it was
+// a typevar) and the rejection came from codegen (codegen_methods.bl:3151), which meant it
+// fired only on the effect-op path; now typecheck reports it, in the spec's own words, for
+// every call shape. The code E0310 is what tests/test_template.bl pins, so it stays E0310.
+test "a pre-built Str variable is rejected at a Template param" {
+    let src = "pub effect P \{\n    effect Run \{\n        fn run(t: Template[P]) -> Int\n    }\n}\n\nfn main() \{\n    with handler P \{\n        fn run(t: Template[P]) -> Int \{ t.count() }\n    } \{\n        let n = 1\n        let q: Str = \"n=\{n}\"\n        io.println(\"\{p.run(q)}\")\n    }\n}\n"
+    expect_compile_error(src, "nrrs28_str_var", "TemplateMismatch")
+}
+
+// NO std.db ROW HERE, and that absence is deliberate — see br k0dfjj. lib/std/db_sqlite.bl
+// is the corpus's only consumer of this API (all 9 family-A rows are its line 140), so the
+// obvious row to write is a real SQLite round-trip. It cannot be written in THIS file: a
+// Template producer needs a user effect, and declaring ANY user effect in a program that
+// imports std.db makes db_sqlite.bl itself fail to compile with three UnresolvedMethod
+// errors in reassemble_sql. That is a separate pre-existing defect (a lost flat ctype on a
+// stdlib-module local — the diagnostic names the receiver from the TID, correctly, while
+// dispatch reads the flat ctype), it is not caused by this ticket, and it must not be
+// papered over here. The db path stays covered by tests/test_db_*.bl, none of which declare
+// a user effect.
