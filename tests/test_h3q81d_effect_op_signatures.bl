@@ -1,0 +1,212 @@
+// br h3q81d — a user-effect operation has no typecheck-side signature, so every effect-op call
+// resolves to TYPE_UNKNOWN.
+//
+// Typecheck registers only the lowercased effect NAME — `register_ue_handle(str_to_lower(eff_name))`
+// at src/typecheck.bl:5214 — and reads it back for exactly one purpose: suppressing the
+// UnknownMethod warning (`is_user_effect_handle_name`, :7301 and :7451). The registry holds NO
+// operation signatures, so `storage.get_names()` has no return type and its arguments are compared
+// against nothing.
+//
+// Codegen holds the same signatures in the UeMethod registry (src/codegen_types.bl:1817, populated
+// at src/codegen.bl:751-909) with EIGHT flat return fields — ret, ret_ct, ret_inner_ct,
+// ret_inner_struct, ret_inner_ct2, ret_inner_struct2, ret_ok_elem_ct, ret_ok_elem_struct — the last
+// pair existing solely because `Result[Option[Row], DBError]` is depth 2 and the flat (CT_*, sname)
+// pair stops at depth 1. The op node carries its whole annotation tree at `node_type_ann(op)`, so
+// typecheck can hold ONE tid where codegen holds eight fields.
+//
+// Both halves escape to the C compiler, not to a diagnostic:
+//   let bad: Int = storage.get_names()   ->  "returning 'blink_list *' ... makes integer from pointer"
+//   storage.find_name(42)                ->  "expected 'const char *' but argument is of type 'int'"
+//
+// These rows use a plain user-declared effect rather than `std.db`, because the registry is shared:
+// `db.query` / `query_one` / `execute` are the same code path with a sidecar attached. The depth-2
+// `Result[Option[..], ..]` row is the `db.query_one` shape in miniature.
+
+import compile_test_helpers
+
+// One effect, two sub-effects, one op per interesting return shape.
+fn eff_decl() -> Str {
+    let mut s = "effect Storage \{\n"
+    s = s.concat("    effect Read \{\n")
+    s = s.concat("        fn get_names() -> List[Str]\n")
+    s = s.concat("        fn find_name(prefix: Str) -> Option[Str]\n")
+    s = s.concat("        fn count_names() -> Int\n")
+    s = s.concat("        fn query_names() -> Result[List[Str], Str]\n")
+    s = s.concat("        fn query_one_name() -> Result[Option[Str], Str]\n")
+    s = s.concat("    }\n")
+    s = s.concat("    effect Write \{\n")
+    s = s.concat("        fn add_name(name: Str) -> Int\n")
+    s = s.concat("        fn wipe()\n")
+    s = s.concat("    }\n")
+    s = s.concat("}\n")
+    s
+}
+
+// A handler covering every op, so a row that is meant to compile also RUNS.
+fn eff_handler_head() -> Str {
+    let mut s = "    with handler Storage \{\n"
+    s = s.concat("        fn get_names() -> List[Str] \{ [\"alice\", \"bob\"] }\n")
+    s = s.concat("        fn find_name(prefix: Str) -> Option[Str] \{\n")
+    s = s.concat("            if prefix == \"al\" \{ Some(\"alice\") } else \{ None }\n")
+    s = s.concat("        }\n")
+    s = s.concat("        fn count_names() -> Int \{ 2 }\n")
+    s = s.concat("        fn query_names() -> Result[List[Str], Str] \{ Ok([\"alice\"]) }\n")
+    s = s.concat("        fn query_one_name() -> Result[Option[Str], Str] \{ Ok(Some(\"alice\")) }\n")
+    s = s.concat("        fn add_name(_name: Str) -> Int \{ 1 }\n")
+    s = s.concat("        fn wipe() \{ }\n")
+    s = s.concat("    } \{\n")
+    s
+}
+
+// `body` runs inside the handler, inside a fn that declares the effect.
+fn eff_program(body: Str) -> Str {
+    let mut s = eff_decl()
+    s = s.concat("fn probe() ! Storage \{\n")
+    s = s.concat(eff_handler_head())
+    s = s.concat(body)
+    s = s.concat("    }\n}\n")
+    s = s.concat("fn main() \{\n    probe()\n}\n")
+    s
+}
+
+// ── the declared type must be compared against an effect-op call ─────────────
+
+test "a declared type is compared against an op returning List[Str]" {
+    let s = eff_program("        let bad: Int = storage.get_names()\n        io.println(\"\{bad}\")\n")
+    compile_test_helpers.expect_compile_error(s, "h3q81d_decl_list", "TypeError")
+}
+
+test "a declared type is compared against an op returning Option[Str]" {
+    let s = eff_program("        let bad: Str = storage.find_name(\"al\")\n        io.println(bad)\n")
+    compile_test_helpers.expect_compile_error(s, "h3q81d_decl_option", "TypeError")
+}
+
+test "a declared type is compared against an op returning Int" {
+    let s = eff_program("        let bad: Str = storage.count_names()\n        io.println(bad)\n")
+    compile_test_helpers.expect_compile_error(s, "h3q81d_decl_int", "TypeError")
+}
+
+// The db.query shape: Result[List[..], ..].
+test "a declared type is compared against an op returning Result[List[Str], Str]" {
+    let s = eff_program("        let bad: List[Str] = storage.query_names()\n        io.println(\"\{bad.len()}\")\n")
+    compile_test_helpers.expect_compile_error(s, "h3q81d_decl_result_list", "TypeError")
+}
+
+// The db.query_one shape, and the reason codegen needs a seventh and eighth flat field: the Ok
+// payload is itself a container, so the type is depth 2.
+test "a declared type is compared against an op returning Result[Option[Str], Str]" {
+    let s = eff_program("        let bad: Option[Int] = storage.query_one_name()\n        io.println(\"\{bad.is_some()}\")\n")
+    compile_test_helpers.expect_compile_error(s, "h3q81d_decl_result_option", "TypeError")
+}
+
+// A Void op has no value to bind, and must not silently answer with one.
+test "a declared type is compared against a Void op" {
+    let s = eff_program("        let bad: Int = storage.wipe()\n        io.println(\"\{bad}\")\n")
+    compile_test_helpers.expect_compile_error(s, "h3q81d_decl_void", "TypeError")
+}
+
+// ── the argument check, and the C-compiler escape both halves were hiding ─────
+
+test "an argument to an effect op is checked against the signature" {
+    let s = eff_program("        let r = storage.find_name(42)\n        io.println(\"\{r.is_some()}\")\n")
+    compile_test_helpers.expect_compile_error(s, "h3q81d_arg", "TypeError")
+}
+
+// The row above passes as soon as SOME TypeError is reported, so on its own it would keep passing
+// while the escape below reopened. NOT "\{...}" in this file's own interpolations — `\{` is an
+// escape producing a literal brace, which makes the haystack the text `{r.out}` and the row vacuous.
+test "a wrong argument to an effect op never reaches the C compiler" {
+    let s = eff_program("        let r = storage.find_name(42)\n        io.println(\"\{r.is_some()}\")\n")
+    let r = compile_test_helpers.compile_and_run(s, "h3q81d_run_arg_escape")
+    assert(r.exit_code != 0)
+    let all = "{r.out}{r.err_out}"
+    assert(!all.contains("argument is of type"))
+    assert(!all.contains("C compilation failed"))
+}
+
+test "a mistyped declaration over an effect op never reaches the C compiler" {
+    let s = eff_program("        let bad: Int = storage.get_names()\n        io.println(\"\{bad}\")\n")
+    let r = compile_test_helpers.compile_and_run(s, "h3q81d_run_decl_escape")
+    assert(r.exit_code != 0)
+    let all = "{r.out}{r.err_out}"
+    assert(!all.contains("makes integer from pointer"))
+    assert(!all.contains("makes pointer from integer"))
+    assert(!all.contains("C compilation failed"))
+}
+
+// ── controls: every correct spelling still compiles and RUNS ──────────────────
+
+test "every op return shape binds and runs under a matching declared type" {
+    let mut b = "        let names: List[Str] = storage.get_names()\n"
+    b = b.concat("        let found: Option[Str] = storage.find_name(\"al\")\n")
+    b = b.concat("        let n: Int = storage.count_names()\n")
+    b = b.concat("        let qr: Result[List[Str], Str] = storage.query_names()\n")
+    b = b.concat("        let qo: Result[Option[Str], Str] = storage.query_one_name()\n")
+    b = b.concat("        let added: Int = storage.add_name(\"carol\")\n")
+    b = b.concat("        storage.wipe()\n")
+    b = b.concat("        io.println(\"\{names.len()}|\{found.is_some()}|\{n}|\{added}\")\n")
+    b = b.concat("        io.println(\"\{qr.is_ok()}|\{qo.is_ok()}\")\n")
+    let s = eff_program(b)
+    compile_test_helpers.expect_no_error(s, "h3q81d_ctl_all_shapes", "TypeError")
+    let r = compile_test_helpers.compile_and_run(s, "h3q81d_run_all_shapes")
+    assert(r.exit_code == 0)
+    assert(r.out.contains("2|true|2|1"))
+    assert(r.out.contains("true|true"))
+}
+
+// An op used with no declared type at all must still infer, and the inferred type must carry
+// through a method call on the result — otherwise the fix answers the compare and nothing else.
+test "an inferred op result carries its type into a following method call" {
+    let mut b = "        let names = storage.get_names()\n"
+    b = b.concat("        let first: Str = names.get(0).unwrap()\n")
+    b = b.concat("        let bad: Int = names.get(0).unwrap()\n")
+    b = b.concat("        io.println(\"\{first}\{bad}\")\n")
+    let s = eff_program(b)
+    compile_test_helpers.expect_compile_error(s, "h3q81d_infer_chain", "TypeError")
+}
+
+// Keyed by handle AND op, not by op name alone: a same-named method on an unrelated type must not
+// pick up the effect's signature, and must keep its own.
+test "a same-named method on an unrelated type keeps its own signature" {
+    let mut s = eff_decl()
+    s = s.concat("type Bag \{ n: Int }\n")
+    s = s.concat("trait BagOps \{ fn count_names(self) -> Str }\n")
+    s = s.concat("impl BagOps for Bag \{ fn count_names(self) -> Str \{ \"two\" } }\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let g = Bag \{ n: 2 }\n")
+    s = s.concat("    let bad: Int = g.count_names()\n")
+    s = s.concat("    io.println(\"\{bad}\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_compile_error(s, "h3q81d_key_not_op_name", "TypeError")
+}
+
+// The handle namespace is per-effect: two effects may share an op name with different types.
+test "two effects sharing an op name resolve to their own return types" {
+    let mut s = "effect Alpha \{\n    effect Read \{\n        fn fetch() -> Int\n    }\n}\n"
+    s = s.concat("effect Beta \{\n    effect Read \{\n        fn fetch() -> Str\n    }\n}\n")
+    s = s.concat("fn probe() ! Alpha, Beta \{\n")
+    s = s.concat("    with handler Alpha \{\n        fn fetch() -> Int \{ 7 }\n    } \{\n")
+    s = s.concat("        with handler Beta \{\n            fn fetch() -> Str \{ \"seven\" }\n        } \{\n")
+    s = s.concat("            let a: Int = alpha.fetch()\n")
+    s = s.concat("            let b: Str = beta.fetch()\n")
+    s = s.concat("            io.println(\"\{a}|\{b}\")\n")
+    s = s.concat("        }\n    }\n}\n")
+    s = s.concat("fn main() \{\n    probe()\n}\n")
+    compile_test_helpers.expect_no_error(s, "h3q81d_two_effects_ok", "TypeError")
+    let r = compile_test_helpers.compile_and_run(s, "h3q81d_run_two_effects")
+    assert(r.exit_code == 0)
+    assert(r.out.contains("7|seven"))
+}
+
+test "an op name shared by two effects is not resolved from the wrong effect" {
+    let mut s = "effect Alpha \{\n    effect Read \{\n        fn fetch() -> Int\n    }\n}\n"
+    s = s.concat("effect Beta \{\n    effect Read \{\n        fn fetch() -> Str\n    }\n}\n")
+    s = s.concat("fn probe() ! Alpha, Beta \{\n")
+    s = s.concat("    with handler Alpha \{\n        fn fetch() -> Int \{ 7 }\n    } \{\n")
+    s = s.concat("        with handler Beta \{\n            fn fetch() -> Str \{ \"seven\" }\n        } \{\n")
+    s = s.concat("            let bad: Str = alpha.fetch()\n")
+    s = s.concat("            io.println(bad)\n")
+    s = s.concat("        }\n    }\n}\n")
+    s = s.concat("fn main() \{\n    probe()\n}\n")
+    compile_test_helpers.expect_compile_error(s, "h3q81d_wrong_effect", "TypeError")
+}

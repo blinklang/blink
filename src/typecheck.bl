@@ -5203,7 +5203,10 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
     // Validate trait impl contracts
     validate_trait_impls(program)
 
-    // Register user-defined effect handle names
+    // Register user-defined effect handle names, and the SIGNATURE of every operation
+    // they declare (br h3q81d). The handle name alone only suppresses the UnknownMethod
+    // warning; without the signatures `db.query(..)` has no return type and its
+    // arguments are compared against nothing.
     tc_ue_handles = []
     let effects_decl_sl = node_args(program)
     if effects_decl_sl != -1 {
@@ -5212,6 +5215,7 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
             let ed = sublist_get(effects_decl_sl, ei)
             let eff_name = node_name(ed)
             register_ue_handle(str_to_lower(eff_name))
+            register_ue_op_sigs(ed)
             ei = ei + 1
         }
     }
@@ -5283,6 +5287,49 @@ let mut tc_ue_handles: List[Str] = []
 
 fn register_ue_handle(name: Str) {
     tc_ue_handles.push(name)
+}
+
+// br h3q81d. Register one fnsig per effect operation, keyed `{handle}.{op}` — the same
+// key the call site spells, and the same handle (`str_to_lower(effect name)`) both sides
+// already agree on. Ops live only under a sub-effect: `parse_effect_decl` (parser.bl:1554)
+// demands `effect` for every member of the outer body, so `node_elements(ed)` ->
+// `node_methods(child)` is the whole set, exactly the walk codegen makes at
+// codegen.bl:750-760 to fill its UeMethod registry.
+//
+// An op node is a real `NodeKind.FnDef` (`parse_effect_op_sig`, parser.bl:1516) carrying
+// params, `return_type` and the whole `type_ann` tree, so `register_fn_sig` types it with
+// no special case — which is the point: codegen needs EIGHT flat return fields for the
+// same information because `Result[Option[Row], DBError]` is depth 2, and one tid holds it.
+//
+// The name is swapped for the qualified key and restored, as the impl-method path does at
+// tc_infer_program; registering under the bare op name would collide with any free function
+// of that name. Annotation validation is suppressed: the op's types are validated where the
+// effect is DECLARED, and a consuming module that never selectively imported `Row` must not
+// be told about it here (the same reason tc_impl_self_tid suppresses it).
+@allow(UnrestoredMutation)
+fn register_ue_op_sigs(ed: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Report {
+    let handle = str_to_lower(node_name(ed))
+    let children_sl = node_elements(ed)
+    if children_sl == -1 { return }
+    let saved_suppress = tc_suppress_ann_validation
+    tc_suppress_ann_validation = 1
+    let mut ci = 0
+    while ci < sublist_length(children_sl) {
+        let ops_sl = node_methods(sublist_get(children_sl, ci))
+        if ops_sl != -1 {
+            let mut oi = 0
+            while oi < sublist_length(ops_sl) {
+                let op = sublist_get(ops_sl, oi)
+                let op_name = node_name(op)
+                node_set_name(op, "{handle}.{op_name}")
+                register_fn_sig(op)
+                node_set_name(op, op_name)
+                oi = oi + 1
+            }
+        }
+        ci = ci + 1
+    }
+    tc_suppress_ann_validation = saved_suppress
 }
 
 fn is_user_effect_handle_name(name: Str) -> Int {
@@ -9350,6 +9397,23 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             if obj_name == "Char" {
                 if method == "from_code_point" {
                     return make_result_type(TYPE_CHAR, lookup_named_type("ConversionError"))
+                }
+            }
+            // br h3q81d. A user-effect operation call — `db.query(..)`, `storage.get_names()`.
+            // The handle is not a value, so it never had a type and the receiver-typed arms
+            // above cannot reach it; register_ue_op_sigs put the op's own signature under
+            // `{handle}.{op}`. Both halves come from it: the return tid, and the argument
+            // check, which without a signature compared against nothing and let a wrong
+            // argument reach the C compiler.
+            //
+            // `nr_is_defined` gates it so a local binding that happens to share the handle's
+            // spelling keeps its own type — that variable's receiver arm has already run and
+            // fallen through only because the method was genuinely unresolved on it.
+            if nr_is_defined(obj_name) == 0 && is_user_effect_handle_name(obj_name) != 0 {
+                let ue_sig = lookup_fnsig("{obj_name}.{method}")
+                if ue_sig != -1 {
+                    check_arg_shapes("{obj_name}.{method}", ue_sig, node_args(node), 0)
+                    return fnsig_pool.get(ue_sig).unwrap().ret
                 }
             }
             // vfgp72: intrinsic time.* methods type even without `import std.time`

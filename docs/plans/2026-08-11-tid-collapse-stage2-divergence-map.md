@@ -205,6 +205,8 @@ not Stage 3 work:
 | `xfrd4j` | P2 | *(exposed while scoping `rbd0a4`)* typecheck's allow-list affirms `Int.to_str()`, `Str.to_float()` and `to_string()` on a `Bool` or sized int, which codegen does not implement — the error lands at codegen, so `blink check` is untrustworthy for them |
 | `jzvxav` | P1 | *(the untyped-receiver shape a fourth time, after `w13xgb` / `ps5br9` / `nrrs28`)* `self` was bound as `TYPE_UNKNOWN` in **every impl method body in every Blink program** — `resolve_param_type` answers UNKNOWN for an un-annotated param and `self` is the one param that never carries one. It was hiding a raw `cc` error: `self.get(42)` against `fn get(self, k: Str)` passes `blink check` |
 | `ya8qyf` | P1 | *(found as the one row that stayed red under `jzvxav`; `zd1tz3` closed as its duplicate)* an impl method's declared **return** type was never checked — `tc_mangle_impl_fnsig` registers `{type}_{trait}_{method}` and the check side looked up `{type}_{method}`, so `lookup_fnsig` always missed and `tc_current_fn_ret` was never installed. Divergence-neutral; a pure diagnostic/escape fix |
+| `h3q81d` | P2 | *(the ranked #1 after `jzvxav`)* an effect **operation** had no typecheck-side signature anywhere — only the handle name, for warning suppression — while codegen carried the same signatures across **eight flat return fields**, the last pair existing only because `Result[Option[Row], DBError]` is depth 2. **−49 rows**, and both halves were escaping to `cc` |
+| `w089a0` | P2 | *(`h3q81d`'s residual, and the untyped-receiver shape a **fifth** time)* the with-resource `as` binder carries no type, so `with db.prepare(..).unwrap() as stmt` leaves `stmt.step()` with an untyped receiver even though `db.prepare` now resolves. `let bad: Str = r.value()` compiles clean and prints `7` |
 
 `k9agr8` gates the *measurement*, not the code: without it Stage 3 can only demonstrate 0
 in archive-linked mode.
@@ -1414,15 +1416,15 @@ these sweeps, tallied on the **intersection of their file sets** (874 files; the
 do not appear in all of them are listed under the `nz7drz` correction note). `scratchpad/cells.sh`
 takes that allow-list as a required argument.
 
-| | before `nz7drz` | after `nz7drz` | after `bfq7nf` | after `3c4g71` | after `zs7khh` | after `2r96m9` | after `rbd0a4` | after `w13xgb` | after `jzvxav` |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| **total cells** | 423 | 421 | 409 | 407 | 405 | 404 | 404 | 405 | **404** |
-| family A (`tid=?`) cells | 84 | 61 | 47 | 45 | 35 | 34 | 34 | 33 | **32** |
-| family A rows | 1323 | 1224 | 1190 | 1050 | 1015 | 661 | 504 | 327 | **310** |
-| `Fn`-flat `tid=?` cells | 16 | 2 | 0 | 0 | 0 | 0 | 0 | 0 | **0** |
-| agree | 362979 | 363711 | 363924 | 364187 | 364289 | 364674 | 364831 | 364883 | **364934** |
-| diverge rows | 5008 | 5003 | 4976 | 4837 | 4828 | 4474 | 4317 | 4296 | **4279** |
-| missing | 14 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | **1** |
+| | before `nz7drz` | after `nz7drz` | after `bfq7nf` | after `3c4g71` | after `zs7khh` | after `2r96m9` | after `rbd0a4` | after `w13xgb` | after `jzvxav` | after `h3q81d` |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| **total cells** | 423 | 421 | 409 | 407 | 405 | 404 | 404 | 405 | 404 | **402** |
+| family A (`tid=?`) cells | 84 | 61 | 47 | 45 | 35 | 34 | 34 | 33 | 32 | **28** |
+| family A rows | 1323 | 1224 | 1190 | 1050 | 1015 | 661 | 504 | 327 | 310 | **261** |
+| `Fn`-flat `tid=?` cells | 16 | 2 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | **0** |
+| agree | 362979 | 363711 | 363924 | 364187 | 364289 | 364674 | 364831 | 364883 | 364934 | **365243** |
+| diverge rows | 5008 | 5003 | 4976 | 4837 | 4828 | 4474 | 4317 | 4296 | 4279 | **4249** |
+| missing | 14 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | **1** |
 
 The `after jzvxav` column covers **two** fixes, `jzvxav` and `ya8qyf`, because they were measured in
 one sweep; the attribution in those sections shows all 17 rows belong to `jzvxav`, so `ya8qyf` is
@@ -1843,9 +1845,81 @@ regens; `task ci` **EXIT=0, 636/636 test files**. The missing-tail row was confi
 `build/blinkc.bak` and green against the new `build/blinkc`, which is how "was this actually red
 before?" gets answered without a second checkout.
 
-### Remaining family-A causes, ranked (32 cells / 310 rows)
+### `h3q81d` — an effect operation had no signature anywhere in typecheck (CLOSED)
 
-Re-ranked from the post-`jzvxav` sweep, by **rows on the 874-file common basis**, grouped by the
+The #1 remaining cause, and the cleanest illustration of this plan's thesis in the whole campaign.
+Typecheck registered the lowercased effect **name** and nothing else — `register_ue_handle`,
+`typecheck.bl:5214` — read back for exactly one purpose: suppressing the `UnknownMethod` warning.
+No operation signatures at all. Codegen holds the same signatures in `UeMethod`
+(`codegen_types.bl:1817`, filled at `codegen.bl:751-909`) across **eight flat return fields** —
+`ret`, `ret_ct`, `ret_inner_ct`, `ret_inner_struct`, `ret_inner_ct2`, `ret_inner_struct2`,
+`ret_ok_elem_ct`, `ret_ok_elem_struct` — the last pair existing *solely* because
+`Result[Option[Row], DBError]` is depth 2 and the flat `(CT_*, sname)` pair stops at depth 1. The op
+node is a real `NodeKind.FnDef` carrying its whole annotation tree, so **one tid holds what eight
+fields approximate**.
+
+**Both halves escaped to the C compiler**, which makes this the fourth such cause after `dvzt90`,
+`2r96m9`, `w13xgb` and `jzvxav`:
+
+```
+let bad: Int = storage.get_names()   ->  "returning 'blink_list *' ... makes integer from pointer"
+storage.find_name(42)                ->  "expected 'const char *' but argument is of type 'int'"
+```
+
+**Two regens.** Regen 1 is additive: `register_ue_op_sigs(ed)` registers one fnsig per op, keyed
+`{handle}.{op}` — the key the call site already spells, with the handle (`str_to_lower(effect name)`)
+both sides already agreed on — walking `node_elements(ed)` → `node_methods(child)` exactly as
+codegen does. Ops live **only** under a sub-effect: `parse_effect_decl` (`parser.bl:1554`) demands
+`effect` for every member of the outer body, so a flat `effect Foo { fn op() }` is a parse error and
+the two-level walk is complete. `register_fn_sig` needs no special case; the op name is swapped for
+the qualified key and restored, the `tc_infer_program` impl-method precedent, because registering
+under the bare op name would collide with any free function of that name. `tc_suppress_ann_validation`
+is raised, for the same reason `tc_impl_self_tid` raises it: the op's types are validated where the
+effect is *declared*, and a consuming module that never selectively imported `Row` must not be told
+about it at registration. Regen 2 is one arm in the `MethodCall` Ident block —
+`lookup_fnsig("{handle}.{method}")` → `check_arg_shapes` → `fs.ret` — gated on
+`nr_is_defined(obj_name) == 0` so a local binding sharing the handle's spelling keeps its own type.
+
+**Blast radius zero**: 637/637 test files green on the first run, so every `db.*` declared type in
+the corpus was already correct — merely unchecked.
+
+| | after `jzvxav` | after `h3q81d` | delta |
+|---|---:|---:|---:|
+| family A rows | 310 | **261** | **−49** |
+| family A cells | 32 | **28** | −4 |
+| total cells | 404 | **402** | −2 |
+| diverge rows | 4279 | 4249 | −30 |
+| agree | 364934 | 365243 | +309 |
+| missing | 1 | 1 | 0 |
+
+Four family-A cells retired and **none appeared**: `tid=? flat=Row`, `flat=Option[Row]`,
+`flat=Option[Str]`, `flat=Result[List[Int], Void]`. Rows in db/sqlite/template-named files fell
+**57 → 15**. `agree` rose by 309 against a 30-row `diverge` fall because more comparisons now happen
+at all — `db.prepare` resolving to `Result[Stmt, DBError]` changes which instances get emitted — so
+the row *totals* are not conserved here the way they were for `dvzt90`.
+
+**Residual, filed as `w089a0`.** Of the 15 rows left in those files, 6 are `nrrs28`'s `Template`
+site and the other 9 are every one of `tests/test_db_stmt.bl`'s
+`with db.prepare(..).unwrap() as stmt` bindings. `db.prepare` now resolves correctly and the
+with-resource **`as` binder drops it**: `let bad: Str = r.value()` inside a `with .. as r` block
+compiles clean and prints `7`. That is **the untyped-receiver shape for the fifth time** — `w13xgb`
+(`Ptr`), `ps5br9` (the ffi scope), `jzvxav` (`self`), `nrrs28` (`Template`), and now the `as`
+binder. The pattern is now the most productive prior in this campaign: when a bucket resists, ask
+what the receiver is before asking which method arm is missing.
+
+Test: `tests/test_h3q81d_effect_op_signatures.bl`, 14 rows — 11 red before, all green after. It uses
+a plain user-declared effect rather than `std.db`, because the registry is shared and a sidecar adds
+nothing to the mechanism; the depth-2 `Result[Option[Str], Str]` row is the `db.query_one` shape in
+miniature, and it is the shape that forces codegen's seventh and eighth flat fields. Rows cover
+`List`/`Option`/`Int`/`Result[List]`/`Result[Option]`/`Void` returns, the argument check, two
+cc-escape assertions, an inferred-result method chain, keying by handle **and** op (a same-named
+method on an unrelated type keeps its own signature), and two effects sharing an op name with
+different return types. **Helper trap:** `expect_no_error(src, tag, "")` asserts
+`!output.contains("")`, which is always false — pass the code you expect *not* to appear.
+
+### Remaining family-A causes, ranked (28 cells / 261 rows)
+
+Re-ranked from the post-`h3q81d` sweep, by **rows on the 874-file common basis**, grouped by the
 innermost producer (the outermost call is usually a symptom — `.unwrap()` heads many chains, but its
 receiver is already unknown). Rows, not sites: the earlier site-count ranking is what let one entry
 hide three unrelated mechanisms.
@@ -1862,28 +1936,28 @@ every one that is a pure codegen intrinsic is a family-A cause by construction. 
 defect class as `mjsbwm`, `7cq6w2` and `2r96m9` — `project_is_intrinsic_method_must_match_handlers`,
 now measured rather than met one instance at a time.
 
-**Four of the five entries left are now one shape: a namespace or handle whose operations codegen
-dispatches and typecheck has no signature table for.** With the `Str`, `Bytes`, `Ptr` and `self`
-*receiver* causes closed, the intrinsic-method list is no longer the leading mechanism — `db.*`,
-`net.*`/`io.*`, the iterator adapters and `Channel` are **an even larger share of the 310 rows**, and
-each needs a *table*, not an arm.
+**The entries left are now one shape: a namespace or handle whose operations codegen dispatches and
+typecheck has no signature table for — or, more often than not, a RECEIVER with no type at all.**
+With the `Str`, `Bytes`, `Ptr`, `self` and effect-op causes closed, the intrinsic-method list is no
+longer the leading mechanism. `net.*`/`io.*` is now #1 and needs a *table*; the untyped-receiver
+family (`nrrs28`, `ps5br9`, `w089a0`) needs a `TyKind` or a binding, not an arm.
 
-**The old 72-row `db.*` bucket is re-split three ways, and this is the same lesson as before: a
-shared bucket is not a shared cause.** `jzvxav` took the 12 `at=std_db_row:35` rows (`row.get`, which
-was never a `db.*` signature problem at all — it is `self` inside `impl RowOps for Row`), `nrrs28`
-owns the 9 `at=std_db_sqlite:140` rows (`tpl.type_tag` — `Template[T]`, not `db`), and the residual
-**51** is `h3q81d`'s genuine effect-op mechanism, now attributed entirely to `at=__main__` in the
-db-flavoured roots.
+**The old 72-row `db.*` bucket split four ways, and this is the lesson the map keeps re-teaching: a
+shared bucket is not a shared cause.** `jzvxav` took the 12 `at=std_db_row:35` rows (`row.get`, never
+a `db.*` signature problem at all — it is `self` inside `impl RowOps for Row`), `nrrs28` owns the 9
+`at=std_db_sqlite:140` rows (`tpl.type_tag` — `Template[T]`, not `db`), `h3q81d` took the ~42 genuine
+effect-op rows, and the 9 that survived are the with-resource `as` binder (`w089a0`).
 
 | cause | rows | ticket | note |
 |---|---:|---|---|
-| `db.*` effect operations — `db.query` / `query_one` / `execute`, `stmt.step` | 51 | `h3q81d` | Still the #1, **16% of what is left**, and the residue after the re-split above. Mechanism diagnosed below: **no typecheck-side signature source at all**. All 51 are `at=__main__` in `test_sqlite.bl` (26), `test_db_stmt.bl` (9), `test_template_introspection.bl` (8), `test_db_connect.bl` (4), `test_db_query_one_lifetime.bl` / `test_db_import_order.bl` (2 each) plus the other db roots, spelled `flat=Int` (13), `flat=List[Void]` (11, `db.query` → `List[Row]`), `flat=Str` (9), `flat=Row` / `flat=Option[Row]` (10) |
-| `net.*` / `io.*` — `net.connect` / `listen` / `accept` / `read_bytes` / `write_bytes`, `io.read_line` | 49 | — | `lib/std/net_tcp.bl:68,83,92,128,137`, `src/lsp.bl:32`. The seam is `is_intrinsic_method(namespace, method)` — `pub` in **`src/codegen_types.bl:8084`** and called from `typecheck.bl:9227`, where the *only* two answers are `time.read` (→ `Instant`) and `time.sleep` (→ Void). Typecheck asks codegen's intrinsic list whether the method exists and then has no table of return types behind it. Counted by **producer** here: `at=std_net_tcp` 40 (`fd` / `conn` / `rc` as `flat=Int`), `at=lsp` 6, `at=std_http_server` 3. The earlier figure of 55 folded in the `Response`/`Request` rows that the row below counts separately |
+| `net.*` / `io.*` — `net.connect` / `listen` / `accept` / `read_bytes` / `write_bytes`, `io.read_line` | 49 | — | **Now the outright #1, 19% of what is left.** `lib/std/net_tcp.bl:68,83,92,128,137`, `src/lsp.bl:32`. The seam is `is_intrinsic_method(namespace, method)` — `pub` in **`src/codegen_types.bl:8084`** and called from `typecheck.bl:9227`, where the *only* two answers are `time.read` (→ `Instant`) and `time.sleep` (→ Void). Typecheck asks codegen's intrinsic list whether the method exists and then has no table of return types behind it. Counted by **producer**: `at=std_net_tcp` 40 (`fd` / `conn` / `rc` as `flat=Int`), `at=lsp` 6, `at=std_http_server` 3. The earlier figure of 55 folded in the `Response`/`Request` rows counted separately below. **`h3q81d` is the template for the fix** — this is the same "codegen has the signatures, typecheck has none" shape, one namespace over |
+| ~~`db.*` effect operations — `db.query` / `query_one` / `execute`, `stmt.step`~~ | ~~51~~ | **`h3q81d`** | **CLOSED** — −49 rows, section above. Typecheck held **no** operation signatures, only the handle name for warning suppression; codegen held the same signatures across eight flat return fields. 9 rows survive, all `with db.prepare(..) as stmt` → **`w089a0`** |
+| the with-resource `as` binder — `with db.prepare(..).unwrap() as stmt` | 9 | `w089a0` | Split out of `h3q81d`'s residual. `db.prepare` now resolves to `Result[Stmt, DBError]` and the binder drops it, so `stmt.step()` has an untyped receiver. **Untyped-receiver shape, fifth instance**; the tid is already in hand at the binding site, so the fix is the `jzvxav` shape — bind the binder |
 | `Template[T]` introspection — `tpl.type_tag` / `count` / `get_int` / `get_float` / `get_str` | 9 | `nrrs28` | Split out of the old `db.*` bucket. All 9 are `at=std_db_sqlite:140`, one per db-flavoured root. **The untyped-receiver shape again**, for the fifth time: `Template` is not a `TyKind`, so the receiver is as permissive as `TYPE_UNKNOWN` before any method arm can run — `w13xgb` / `ps5br9` / `jzvxav` in a fourth costume, and it should be fixed the way `w13xgb` was (variant first, then the lowering, then the method block) |
 | `Iterator` adapters — `.zip`, `.chain`, `.enumerate`, `.collect` | 34 | `qzdz2e` | **deferred** (panel decision, user-visible). Was invisible in the previous ranking and is now #3: `tests/test_combining_iterators.bl` (16) and `tests/test_44xww4_enumerate_zip_compound.bl` (18), showing as `flat=List[Void]` and `flat=Tuple2_int_int` — the adapter loses the element type *and* the pair shape |
 | `Channel(n)` / `ch.recv` | 24 | — | **likely genuinely under-determined** — the arg is a capacity, not an element type, so this may be `decisions/under-determined-types.md` / E0301, not a missing rule. `tests/test_channels.bl` (11), `tests/test_async_cancel.bl` (7), `src/cli.bl:2162` |
 | a cross-module `pub let` container element — `symbol_index.si_file_path.get(i)` | 12 | — | `src/incremental.bl:44,75`, `src/file_watcher.bl:40,73`. Part of the `flat=Str` tail `rbd0a4` uncovered, and **the largest remaining cause inside the compiler's own source** |
-| `Response` / `Request` from the http surface | 11 | — | `tests/test_net_integration.bl`, `test_middleware.bl`, `test_http_server.bl`, all `at=__main__`. Same shape as the `net.*` entry and may close with it |
+| `Response` / `Request` from the http surface | 10 | — | `tests/test_net_integration.bl`, `test_middleware.bl`, `test_http_server.bl`, all `at=__main__`. Same shape as the `net.*` entry and may close with it |
 | calling a closure-typed **field** (`route.callback`, `logger.log_msg`) | ~11 | — | |
 | `@derive(Deserialize)` / str-backed-enum `Result` returns | 15 | — | 8 `flat=Result[Void, Str]` + 7 `flat=Result[Int, Void]`, in `test_derive_*.bl`, `test_str_backed_enum.bl`, `test_fmt_iife_with_block.bl`. **Un-triaged**: a compiler-*synthesized* fn is the likely producer, which would make it a different mechanism from every entry above — needs its own probe before it gets a ticket |
 | `List.join` on a `List[Str]` | ~4 | — | `src/cli.bl:935`, `:3561`, `:3563`. From the `rbd0a4` tail; the last of the allow-list-vs-dispatch shape |
@@ -1897,31 +1971,34 @@ top because the causes above them were removed, and both were already in the map
 new line is the `@derive`/`Result` group, which the earlier `flat=` tail hid behind `Str` and
 `Ptr[Int]`.
 
-**Cross-check by source module** (` at=` on the post-`jzvxav` sweep — note the leading space; without
+**Cross-check by source module** (` at=` on the post-`h3q81d` sweep — note the leading space; without
 it the pattern also matches inside `flat=`), because the flat spelling and the producing module answer
 different questions and disagreeing on which is "the" count is how the Ptr entry once acquired two
 figures:
 
-| module | family-A rows | | after `w13xgb` | after `rbd0a4` |
-|---|---:|---|---:|---:|
-| `__main__` (the root being compiled) | 223 | | 225 | 237 |
-| `std_libc` | **0** | | 0 | 165 |
-| `std_net_tcp` | 40 | | 40 | 40 |
-| `std_db_row` | **0** | | 12 | 12 |
-| `cli` | 11 | | 11 | 11 |
-| `std_db_sqlite` | 9 | | 9 | 9 |
-| `lsp` / `incremental` / `file_watcher` | 6 each | | 6 each | 6 each |
-| `std_testing` | **0** | | 3 | 3 |
-| `std_http_server` / `pkg_resolver` / `build_stdlib` | 3 each | | 3 each | 3 each |
+| module | family-A rows | | after `jzvxav` | after `w13xgb` | after `rbd0a4` |
+|---|---:|---|---:|---:|---:|
+| `__main__` (the root being compiled) | 174 | | 223 | 225 | 237 |
+| `std_libc` | **0** | | 0 | 0 | 165 |
+| `std_net_tcp` | 40 | | 40 | 40 | 40 |
+| `std_db_row` | **0** | | 0 | 12 | 12 |
+| `cli` | 11 | | 11 | 11 | 11 |
+| `std_db_sqlite` | 9 | | 9 | 9 | 9 |
+| `lsp` / `incremental` / `file_watcher` | 6 each | | 6 each | 6 each | 6 each |
+| `std_testing` | **0** | | 0 | 3 | 3 |
+| `std_http_server` / `pkg_resolver` / `build_stdlib` | 3 each | | 3 each | 3 each | 3 each |
 
 **`std_libc` went from a third of everything left to zero**, and it was one cause; `std_db_row` and
-`std_testing` went to zero on `jzvxav`, and it was one cause covering both. The 223 in `__main__` are
-not a 224th cause: `__main__` is whatever root is under compilation, so that bucket is the *corpus*
-redistributing the same handful of mechanisms across roots — which is why the ranking is organized by
-producer and not by this table. It is also why the `__main__` figure barely moves while the totals
-fall: the named-stdlib buckets are where a single cause shows up as a clean zero.
+`std_testing` went to zero on `jzvxav`, and it was one cause covering both. The `__main__` bucket is
+not a residual cause of its own: `__main__` is whatever root is under compilation, so it is the
+*corpus* redistributing the same handful of mechanisms across roots — which is why the ranking is
+organized by producer and not by this table. `h3q81d` is the first cause to move `__main__`
+substantially (223 → 174) precisely because effect ops are called from roots rather than from a
+stdlib module, and `std_net_tcp`'s flat 40 across five sweeps is the mirror image: one cause, one
+module, untouched until someone builds it a table.
 
-**The `db.*` mechanism, diagnosed (read-only).** These are **effect operations**, declared in
+**The `db.*` mechanism, diagnosed (read-only) — kept as written, because it is the diagnosis
+`h3q81d` was fixed from and the prediction it confirms.** These are **effect operations**, declared in
 `lib/std/db.bl` as `pub effect DB { effect Read { fn query(..) -> Result[List[Row], DBError] } .. }`.
 Typecheck registers only the lowercased effect **name** — `register_ue_handle(str_to_lower(eff_name))`
 at `src/typecheck.bl:5126` — and reads it back at `:7358` for one purpose only: suppressing the
