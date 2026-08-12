@@ -1,0 +1,259 @@
+// br w13xgb — `Ptr[T]` was never interned, so no pointer value carried a type.
+//
+// This is not the `rbd0a4` shape (a name in `is_builtin_method` with no arm in the return
+// dispatch). It is the `vag3wc` shape one step worse: **typecheck had no `TyKind.Ptr` variant at
+// all**, while codegen has had `CT_PTR` since the beginning. `Ptr[T]` was only ever validated
+// SYNTACTICALLY in typecheck — `PtrOutsideFFI` at `:3733`/`:3757`/`:4324`, `InvalidPtrType` at
+// `:3740`, `is_valid_ptr_inner` — so the annotation `Ptr[Pollfd]` lowered to a bare typevar wearing
+// the name `Ptr`, and a typevar is as permissive as `TYPE_UNKNOWN`. The receiver was untyped before
+// `offset`/`is_null` were ever reached, which is why answering those alone would have fixed nothing.
+//
+// 176 of the 504 remaining family-A divergence rows are this one cause — 35% of what is left, and
+// 165 of them in `lib/std/libc.bl` alone (`poll()`'s `buf.offset(i)`).
+//
+// The worst outcome it produced is not a missing diagnostic, it is a C compiler error: assigning a
+// `Ptr[Pollfd]` to a declared `Ptr[Int]` passed typecheck and then failed as
+//   build/d.c:142: error: initialization of 'int64_t *' from incompatible pointer type 'blink_Pollfd *'
+// with no Blink diagnostic, no source span, and a path into build/. Two rows below pin that closed.
+//
+// Deliberately NOT covered here, each with its own ticket:
+//   • `.deref()` and `.addr()` — sections/07_trust_modules_metadata.md:217,:220 specifies
+//     `Option[T]` and `Ptr[Ptr[T]]`; codegen implements a bare `Int` for both, and
+//     `lib/std/libc.bl` depends on the bare form at five sites. Which side moves is br mwsy85
+//     (type:spec), and no return type can be asserted until it is decided.
+//   • `let v = cell.fd.read()` emits `const void v = (cell->fd)`, a raw C error, and interpolating
+//     it inline prints the literal string `<value>`. That is br 5efs37.
+
+import compile_test_helpers
+
+// Every program here needs an @ffi.struct pointee: `Ptr.offset()` requires one so the stride is
+// known (E0822 FfiOffsetUnknownStride), and `scope.alloc_n` is what makes offset legal at all
+// (E0813 FfiOffsetOnSingleton). The MissingCanonicalHeader warning is expected — these single-file
+// programs have no blink.toml native-dependencies entry — and is a warning, not an error.
+fn pollfd_decl() -> Str {
+    let mut s = "@ffi.struct(header: \"poll.h\", name: \"pollfd\")\n"
+    s = s.concat("pub type Pollfd \{ fd: I32, events: I16, revents: I16 }\n")
+    s
+}
+
+// ── the receiver itself had no type ──────────────────────────────────────────
+
+test "a declared Str is compared against a Ptr binding" {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    with ffi.scope() as scope \{\n")
+    s = s.concat("        let p: Ptr[Int] = scope.alloc()\n")
+    s = s.concat("        let q: Str = p\n")
+    s = s.concat("        io.println(\"\{q}\")\n")
+    s = s.concat("    }\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_compile_error(s, "w13xgb_decl_recv", "TypeError")
+}
+
+// The pointee, not just the carrier: `Ptr[Pollfd]` and `Ptr[Int]` are different types. This is the
+// row that was reaching the C compiler.
+test "the pointee is compared, not only the Ptr carrier" {
+    let mut s = pollfd_decl()
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    with ffi.scope() as scope \{\n")
+    s = s.concat("        let buf: Ptr[Pollfd] = scope.alloc_n(2)\n")
+    s = s.concat("        let r: Ptr[Int] = buf\n")
+    s = s.concat("        io.println(\"\{r.is_null()}\")\n")
+    s = s.concat("    }\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_compile_error(s, "w13xgb_decl_pointee", "TypeError")
+}
+
+// And it must be REJECTED, not merely reported: the diagnostic exists to stop the program before
+// the C compiler sees it. `compile_and_run` returns the C toolchain's own output on failure, so
+// this row fails if the escape reopens even while the row above still passes.
+test "a mismatched pointee never reaches the C compiler" {
+    let mut s = pollfd_decl()
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    with ffi.scope() as scope \{\n")
+    s = s.concat("        let buf: Ptr[Pollfd] = scope.alloc_n(2)\n")
+    s = s.concat("        let r: Ptr[Int] = buf\n")
+    s = s.concat("        io.println(\"\{r.is_null()}\")\n")
+    s = s.concat("    }\n")
+    s = s.concat("}\n")
+    let r = compile_test_helpers.compile_and_run(s, "w13xgb_run_pointee")
+    assert(r.exit_code != 0)
+    // NOT "\{r.err_out}": inside this file's own code the braces must be bare. Escaped, the
+    // haystack is the literal text `{r.err_out}` and the row goes vacuously green.
+    let all = "{r.out}{r.err_out}"
+    assert(!all.contains("incompatible pointer type"))
+}
+
+// ── the two methods where the spec and codegen agree ─────────────────────────
+
+// `offset(i)` keeps the receiver's pointee — it is pointer arithmetic, not a projection. Absent
+// from the spec's operations table (br mwsy85) but defined by codegen, described by the E0813 /
+// E0822 diagnostics, and load-bearing in `lib/std/libc.bl:52,:68`.
+test "a declared Str is compared against Ptr.offset" {
+    let mut s = pollfd_decl()
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    with ffi.scope() as scope \{\n")
+    s = s.concat("        let buf: Ptr[Pollfd] = scope.alloc_n(2)\n")
+    s = s.concat("        let c: Str = buf.offset(1)\n")
+    s = s.concat("        io.println(\"\{c}\")\n")
+    s = s.concat("    }\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_compile_error(s, "w13xgb_decl_offset", "TypeError")
+}
+
+// NOT `let b: Int = ...`: types_compatible:7914 makes Int and Bool deliberately interchangeable
+// (C-style truthiness), so an Int target accepts a Bool by design and the row would pin nothing.
+// Str is the nearest declaration that actually discriminates.
+test "a declared Str is compared against Ptr.is_null" {
+    let mut s = pollfd_decl()
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    with ffi.scope() as scope \{\n")
+    s = s.concat("        let buf: Ptr[Pollfd] = scope.alloc_n(2)\n")
+    s = s.concat("        let b: Str = buf.is_null()\n")
+    s = s.concat("        io.println(\"\{b}\")\n")
+    s = s.concat("    }\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_compile_error(s, "w13xgb_decl_isnull", "TypeError")
+}
+
+// ── as_cstr: the name rbd0a4 deferred to this ticket ────────────────────────
+// `Str.as_cstr()` is the one Ptr-producing method the spec states outright and codegen agrees
+// with: `fn as_cstr(self: Str) -> Ptr[U8]` at sections/07_trust_modules_metadata.md:221,
+// `blink_strdup(s)` with expr_result_type = CT_PTR at codegen_methods.bl:857. It had no arm only
+// because there was no TyKind.Ptr to name.
+
+test "a declared Str is compared against Str.as_cstr" {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let x: Str = \"hi\".as_cstr()\n")
+    s = s.concat("    io.println(\"\{x.is_null()}\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_compile_error(s, "w13xgb_decl_ascstr", "TypeError")
+}
+
+// The declared pointee has to match too, so the arm cannot answer a bare `Ptr[?]`.
+test "as_cstr produces Ptr[U8], not a pointer to anything" {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let x: Ptr[Int] = \"hi\".as_cstr()\n")
+    s = s.concat("    io.println(\"\{x.is_null()}\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_compile_error(s, "w13xgb_decl_ascstr_pointee", "TypeError")
+}
+
+// And the spec's round trip: as_cstr -> Ptr[U8] -> to_str -> Option[Str] (:222).
+test "the as_cstr / to_str round trip stays clean and runs" {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let p: Ptr[U8] = \"hello\".as_cstr()\n")
+    s = s.concat("    let back: Option[Str] = p.to_str()\n")
+    s = s.concat("    io.println(\"\{back.unwrap()}\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_no_error(s, "w13xgb_clean_ascstr", "TypeError")
+    let r = compile_test_helpers.compile_and_run(s, "w13xgb_run_ascstr")
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out.trim(), "hello")
+}
+
+// ── no false positives, and every runtime answer is unchanged ───────────────
+
+test "offset keeps the receiver's pointee and runs" {
+    let mut s = pollfd_decl()
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    with ffi.scope() as scope \{\n")
+    s = s.concat("        let buf: Ptr[Pollfd] = scope.alloc_n(2)\n")
+    s = s.concat("        let cell: Ptr[Pollfd] = buf.offset(1)\n")
+    s = s.concat("        io.println(\"\{cell.is_null()}\")\n")
+    s = s.concat("    }\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_no_error(s, "w13xgb_clean_offset", "TypeError")
+    let r = compile_test_helpers.compile_and_run(s, "w13xgb_run_offset")
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out.trim(), "false")
+}
+
+test "a declared Bool over is_null stays clean and runs" {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    with ffi.scope() as scope \{\n")
+    s = s.concat("        let p: Ptr[Int] = scope.alloc()\n")
+    s = s.concat("        let b: Bool = p.is_null()\n")
+    s = s.concat("        io.println(\"\{b}\")\n")
+    s = s.concat("    }\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_no_error(s, "w13xgb_clean_isnull", "TypeError")
+    let r = compile_test_helpers.compile_and_run(s, "w13xgb_run_isnull")
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out.trim(), "false")
+}
+
+// `lib/std/libc.bl:47-72` in miniature: alloc_n, offset, a field write, and a field read inside a
+// struct literal. The whole point of the campaign is that a tid arrives without one runtime answer
+// moving, and `poll()` is the only real consumer of this surface in the tree.
+test "the libc poll shape still compiles and runs" {
+    let mut s = pollfd_decl()
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    with ffi.scope() as scope \{\n")
+    s = s.concat("        let buf: Ptr[Pollfd] = scope.alloc_n(2)\n")
+    s = s.concat("        let cell = buf.offset(1)\n")
+    s = s.concat("        cell.fd.write(9)\n")
+    s = s.concat("        cell.events.write(1)\n")
+    s = s.concat("        cell.revents.write(0)\n")
+    s = s.concat("        let out = Pollfd \{ fd: cell.fd.read(), events: cell.events.read(), revents: cell.revents.read() }\n")
+    s = s.concat("        io.println(\"\{out.fd}|\{out.events}\")\n")
+    s = s.concat("    }\n")
+    s = s.concat("}\n")
+    let r = compile_test_helpers.compile_and_run(s, "w13xgb_run_pollshape")
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out.trim(), "9|1")
+}
+
+// The pointee set the spec allows (`:197`) includes `Void` and `Ptr[T]` itself, so a nested `Ptr`
+// annotation must still lower. `Void` is legal ONLY as a Ptr argument (`:195`), which is why this
+// row exists next to the interning change rather than after it.
+// Diagnostics only, deliberately: the row is about the ANNOTATION lowering, and an @ffi
+// declaration that is never called still has to link, which drags in a real libc symbol and its
+// mangling. That is a different subject.
+test "Ptr[Void] and Ptr[Ptr[Void]] still lower in an @ffi signature" {
+    let mut s = "@ffi(\"free\", header: \"stdlib.h\")\n"
+    s = s.concat("@trusted(audit: \"test row: annotation lowering only\")\n")
+    s = s.concat("fn c_free_probe(a: Ptr[Void]) -> Void ! FFI \{}\n")
+    s = s.concat("@ffi(\"free\", header: \"stdlib.h\")\n")
+    s = s.concat("@trusted(audit: \"test row: annotation lowering only\")\n")
+    s = s.concat("fn c_free_probe2(a: Ptr[Ptr[Void]]) -> Void ! FFI \{}\n")
+    s = s.concat("fn main() \{ io.println(\"ok\") }\n")
+    compile_test_helpers.expect_no_error(s, "w13xgb_clean_void", "TypeError")
+    compile_test_helpers.expect_no_error(s, "w13xgb_clean_void2", "InvalidPtrType")
+}
+
+// Interning `Ptr[T]` must not disturb the SYNTACTIC gate that was the only thing typecheck did with
+// it before. A `Ptr[T]` parameter outside an @ffi/@trusted context is E0811, and that check runs on
+// the annotation node, not on a tid.
+test "PtrOutsideFFI still fires for a Ptr parameter with no @ffi" {
+    let mut s = "fn takes(p: Ptr[Int]) -> Int \{ 0 }\n"
+    s = s.concat("fn main() \{ io.println(\"x\") }\n")
+    compile_test_helpers.expect_compile_error(s, "w13xgb_ctl_outside", "PtrOutsideFFI")
+}
+
+// A Ptr passed straight into a Ptr parameter: the tid has to reach the call-arg check, and the two
+// `Ptr[Pollfd]` tids have to compare EQUAL. `make_ptr_type` interns, so this row is what catches a
+// constructor that mints a fresh entry per mention.
+test "two Ptr[Pollfd] tids compare equal across a call boundary" {
+    let mut s = pollfd_decl()
+    s = s.concat("@ffi(\"poll\", header: \"poll.h\")\n")
+    s = s.concat("@trusted(audit: \"test row: wraps poll(2) with a zero timeout\")\n")
+    // NOT named `c_poll`: a user fn by that name mangles to `blink_c_poll`, which lib/std/libc.bl
+    // already exports from the archive header, and the two Pollfd structs then collide as
+    // conflicting C declarations (project_namespace_builtin_vs_free_fn_collision, the physical
+    // half). Unrelated to the tid, but it turns this row's verdict into noise.
+    s = s.concat("fn my_poll(fds: Ptr[Pollfd], nfds: U64, timeout_ms: I32) -> I32 ! FFI \{}\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    with ffi.scope() as scope \{\n")
+    s = s.concat("        let buf: Ptr[Pollfd] = scope.alloc_n(1)\n")
+    s = s.concat("        let cell = buf.offset(0)\n")
+    s = s.concat("        cell.fd.write(0)\n")
+    s = s.concat("        cell.events.write(0)\n")
+    s = s.concat("        let rc = my_poll(buf, 1.to_u64(), 0.to_i32())\n")
+    s = s.concat("        io.println(\"rc=\{rc >= 0}\")\n")
+    s = s.concat("    }\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_no_error(s, "w13xgb_clean_call", "TypeError")
+    let r = compile_test_helpers.compile_and_run(s, "w13xgb_run_call")
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out.trim(), "rc=true")
+}
