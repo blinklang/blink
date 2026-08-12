@@ -448,6 +448,17 @@ let mut tc_trait_tparam_names: List[Str] = []
 
 let mut tc_current_fn_ret: Int = -1
 let mut tc_current_fn_name: Str = ""
+// The receiver type of the impl block whose method body is being checked, or -1 outside one
+// (free functions, trait default bodies, test blocks). `self` is the only parameter with no
+// annotation to resolve, so this is where its type comes from — see tc_impl_self_tid. Set and
+// restored by tc_infer_program's impl loop, which is the only place the impl node is in hand.
+let mut tc_current_self_tid: Int = -1
+// The fnsig KEY of the impl method being checked, or "" outside one. An impl method registers its
+// signature under the trait-mangled spelling (tc_mangle_impl_fnsig) but is checked under
+// "{impl_type}_{method}", so tc_check_fn's `lookup_fnsig(fn_name)` missed and NO impl method ever
+// had its declared return type installed — every wrong return escaped to the C compiler (br
+// zd1tz3). The node name stays the display spelling; only the lookup uses this.
+let mut tc_current_method_sig_key: Str = ""
 // Depth of closure bodies the type-inference pass is currently inside. tc_current_fn_ret
 // is saved/restored by tc_check_fn (and the test-body elaborator) only, so within a
 // closure body it still names the ENCLOSING fn's declared return — the closure's own is
@@ -2373,9 +2384,21 @@ fn resolve_type_ann(ann_node: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
     if ann_node == -1 {
         return TYPE_UNKNOWN
     }
-    let name = node_name(ann_node)
-    let elems_sl = node_elements(ann_node)
+    resolve_type_parts(node_name(ann_node), node_elements(ann_node), ann_node)
+}
 
+// resolve_type_ann's whole body, reached by its (name, type-args) PARTS instead of by an
+// annotation node — because one caller has the parts and no node. An impl header
+// (`impl[T] Firstish[T] for List[T]`) stores its receiver as `name` plus a `recv_type_args`
+// sublist of annotation nodes (parser.bl:2088-2091); that pair is exactly the shape this
+// function already destructures out of an annotation node, so `self` gets its type from the
+// same implementation every other type position uses, rather than a second dispatch that
+// would drift (br jzvxav).
+//
+// `ann_node` is the node to memoize onto and may be -1 when the caller has no node. Every
+// use of it below is either already -1-guarded (tc_memo_carrier_over_instance:2337) or
+// guarded here; nothing may pass -1 to a node accessor, which node_or_die crashes on.
+fn resolve_type_parts(name: Str, elems_sl: Int, ann_node: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
     if name == "List" {
         if elems_sl != -1 && sublist_length(elems_sl) >= 1 {
             let inner = resolve_type_ann(sublist_get(elems_sl, 0))
@@ -2483,7 +2506,7 @@ fn resolve_type_ann(ann_node: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
     // named-fn default, and Void is an ordinary inhabited type, not an unsolved one
     // (decisions/under-determined-types.md).
     if name == "Fn" {
-        let ret_ann = node_type_ann(ann_node)
+        let ret_ann = if ann_node == -1 { -1 } else { node_type_ann(ann_node) }
         let ret_t = if ret_ann == -1 { TYPE_VOID } else { resolve_type_ann(ret_ann) }
         let mut param_types: List[Int] = []
         if elems_sl != -1 {
@@ -2533,6 +2556,38 @@ fn resolve_type_ann(ann_node: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
     make_typevar(name)
 }
 
+// The receiver type of an impl block, as a tid — i.e. what `self` is (br jzvxav).
+//
+// `self` is the one parameter in the language that carries no type annotation, so
+// resolve_param_type (:9786) answers TYPE_UNKNOWN for it and tc_check_fn binds it that way in
+// EVERY impl method body. TYPE_UNKNOWN unifies with anything, so that made both the declared-type
+// compare AND the argument check vacuous for every `self.method(...)` call in every Blink
+// program: `self.get(42)` against `fn get(self, k: Str)` passed typecheck and landed as a C
+// compiler error with no Blink span. The impl node has had the answer all along — tc_infer_program
+// reads `node_name(im)` for the qualified method name three lines before checking the body.
+//
+// Structural, not the erased base: a poly impl's receiver (`for List[T]`, `for Box[T]`) must carry
+// its type-arg slots, exactly as tc_fnsig_param_instance_tid does for an annotated generic param,
+// or substitute_typevar_tid has nothing to rewrite at the call site. Going through
+// resolve_type_parts gets that for free and keeps one implementation of "name + args is a type".
+//
+// Validation is suppressed over the arg resolution: these annotation nodes are resolved again
+// here, and the Map/Set branches emit non-deduped E1400 hashability diagnostics that
+// check_impl_type_arg_names (:4643) has already reported against the same header.
+@allow(UnrestoredMutation)
+pub fn tc_impl_self_tid(im: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
+    if im == -1 { return TYPE_UNKNOWN }
+    let name = node_name(im)
+    // A trait's own default-method bodies have no receiver type to speak of, and the parser
+    // leaves `name` empty for a header with no `for` clause.
+    if name == "" { return TYPE_UNKNOWN }
+    let saved_suppress = tc_suppress_ann_validation
+    tc_suppress_ann_validation = 1
+    let t = resolve_type_parts(name, node_recv_type_args(im), -1)
+    tc_suppress_ann_validation = saved_suppress
+    t
+}
+
 // OFF-PATH monomorphized-struct-instance producer (br kvn6w8 spike). Called only
 // when resolve_type_ann sees a user struct named with concrete type-args
 // (`Box[Int]`). resolve_type_ann's live return stays the bare generic tid; this
@@ -2569,7 +2624,7 @@ fn tc_produce_struct_instance_tid(ann_node: Int, name: Str, elems_sl: Int) -> In
     tc_structural_nested_instances = saved_nested
     if has_concrete != 0 || saved_nested != 0 {
         let inst = make_struct_instance_type(name, arg_tids)
-        if ann_node < tc_node_tid.len() {
+        if ann_node >= 0 && ann_node < tc_node_tid.len() {
             tc_node_tid.set(ann_node, inst)
         }
         return inst
@@ -2596,7 +2651,7 @@ fn tc_produce_enum_instance_tid(ann_node: Int, name: Str, elems_sl: Int) -> Int 
     tc_suppress_ann_validation = saved_suppress
     if has_concrete != 0 {
         let inst = make_enum_instance_type(name, arg_tids)
-        if ann_node < tc_node_tid.len() {
+        if ann_node >= 0 && ann_node < tc_node_tid.len() {
             tc_node_tid.set(ann_node, inst)
         }
         return inst
@@ -4863,6 +4918,8 @@ fn init_types() ! TypeCheck.Register {
     tc_trait_tparam_count_idx.clear()
     tc_current_fn_ret = -1
     tc_current_fn_name = ""
+    tc_current_self_tid = -1
+    tc_current_method_sig_key = ""
     tc_in_closure_depth = 0
     tc_fn_body_block = 0
     tc_suppress_ann_validation = 0
@@ -9925,7 +9982,9 @@ fn tc_check_fn(fn_node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report 
     let prev_fn_name = tc_current_fn_name
     let prev_fn_ret = tc_current_fn_ret
     tc_current_fn_name = fn_name
-    let sig = lookup_fnsig(fn_name)
+    // An impl method's signature lives under the trait-mangled key, not under the display name the
+    // caller installed on the node (br zd1tz3).
+    let sig = if tc_current_method_sig_key != "" { lookup_fnsig(tc_current_method_sig_key) } else { lookup_fnsig(fn_name) }
     if sig != -1 {
         tc_current_fn_ret = fnsig_pool.get(sig).unwrap().ret
     }
@@ -9955,6 +10014,18 @@ fn tc_check_fn(fn_node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report 
             if ann != -1 {
                 let inst = tc_fnsig_param_instance_tid(ann, ptid)
                 if inst != -1 { ptid_final = inst }
+            }
+            // `self` is the one parameter that can carry no annotation, so the branch above can
+            // never type it and resolve_param_type answers TYPE_UNKNOWN — which unifies with
+            // anything, silently disabling both the declared-type compare and the ARGUMENT check
+            // on every `self.method(...)` in the language (br jzvxav). The impl block's receiver
+            // type is the answer, and tc_infer_program has it in hand at the call site.
+            //
+            // Guarded on the resolved type still being UNKNOWN so an explicitly annotated `self`
+            // (and any future typed receiver form) keeps its own annotation: the annotation is
+            // more specific than the header, and this must not overwrite it.
+            if pname == "self" && ptid_final == TYPE_UNKNOWN && tc_current_self_tid != -1 {
+                ptid_final = tc_current_self_tid
             }
             nr_define_typed(pname, 0, ptid_final)
             i = i + 1
@@ -11186,6 +11257,10 @@ fn tc_infer_program(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Re
             let im = sublist_get(impls_sl, i)
             nr_current_module = node_module(im)
             let impl_type = node_name(im)
+            // What `self` is inside these bodies (br jzvxav). Resolved once per impl block, not
+            // per method: the receiver is a property of the header, and resolve_type_parts interns
+            // through the pool so a repeat would only churn it.
+            tc_current_self_tid = tc_impl_self_tid(im)
             let methods_sl = node_methods(im)
             if methods_sl != -1 {
                 let mut j = 0
@@ -11194,13 +11269,18 @@ fn tc_infer_program(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Re
                     let orig_name = node_name(m)
                     let qualified = "{impl_type}_{orig_name}"
                     if tc_should_check_fn(qualified) != 0 {
+                        // Same spelling the registration loop (:5183) wrote, so tc_check_fn can
+                        // find the signature and install the declared return (br zd1tz3).
+                        tc_current_method_sig_key = tc_mangle_impl_fnsig(impl_type, node_trait_name(im), orig_name, im)
                         node_set_name(m, qualified)
                         tc_check_fn(m)
                         node_set_name(m, orig_name)
+                        tc_current_method_sig_key = ""
                     }
                     j = j + 1
                 }
             }
+            tc_current_self_tid = -1
             i = i + 1
         }
     }

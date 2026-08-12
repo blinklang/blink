@@ -1,0 +1,285 @@
+// br jzvxav — `self` has no type inside an impl method body.
+//
+// `resolve_param_type` (src/typecheck.bl:9786) answers TYPE_UNKNOWN for a param with no type
+// annotation, and `self` never carries one. `tc_check_fn` therefore binds `self` into scope as
+// UNKNOWN for EVERY impl method, in every program — `tc_infer_program` (:11182-11206) has
+// `impl_type` in hand at the call site and does not pass it. So a method call on `self` has an
+// untyped RECEIVER, which is the same shape as w13xgb (`Ptr`) and ps5br9 (the ffi scope): no
+// per-method arm could have helped, because the dispatch never learns what it is dispatching on.
+//
+// TYPE_UNKNOWN unifies with anything, so the declared-type compare is silently disabled — that is
+// the first observable half. The second is worse and has no divergence row at all: the ARGUMENT
+// check is disabled too, and a wrong argument type escapes typecheck to land as a C compiler error
+// inside build/, with no Blink diagnostic and no source span. Second cause in this campaign shown
+// to escape to `cc` rather than merely lose a type.
+//
+// The identical call through a local binding resolves correctly, and renaming the method to a
+// spelling no builtin claims reproduces the failure — so this is the `self` receiver, not a
+// builtin-name collision and not the method.
+
+import compile_test_helpers
+
+// A trait whose methods call each other on `self`. `probe` is what every row below reads.
+fn box_decl() -> Str {
+    let mut s = "type Box \{ data: List[Str] }\n"
+    s = s.concat("trait BoxOps \{\n")
+    s = s.concat("    fn get(self, k: Str) -> Option[Str]\n")
+    s = s.concat("    fn fetch(self, k: Str) -> Option[Str]\n")
+    s = s.concat("    fn probe(self) -> Int\n")
+    s = s.concat("}\n")
+    s
+}
+
+fn box_impl_head() -> Str {
+    let mut s = "impl BoxOps for Box \{\n"
+    s = s.concat("    fn get(self, k: Str) -> Option[Str] \{\n")
+    s = s.concat("        if k == \"\" \{ return None }\n")
+    s = s.concat("        self.data.get(0)\n")
+    s = s.concat("    }\n")
+    s = s.concat("    fn fetch(self, k: Str) -> Option[Str] \{ self.get(k) }\n")
+    s
+}
+
+fn box_main() -> Str {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let items = [\"a\"]\n")
+    s = s.concat("    let b = Box \{ data: items }\n")
+    s = s.concat("    io.println(\"\{b.probe()}\")\n")
+    s = s.concat("}\n")
+    s
+}
+
+// ── the declared type must be compared against a call on `self` ──────────────
+
+test "a declared type is compared against a method call on self" {
+    let mut s = box_decl()
+    s = s.concat(box_impl_head())
+    s = s.concat("    fn probe(self) -> Int \{\n")
+    s = s.concat("        let bad: Int = self.get(\"x\")\n")
+    s = s.concat("        if bad == 0 \{ 1 } else \{ 2 }\n")
+    s = s.concat("    }\n}\n")
+    s = s.concat(box_main())
+    compile_test_helpers.expect_compile_error(s, "jzvxav_decl_self_get", "TypeError")
+}
+
+// Not a builtin-name collision: `fetch` is claimed by nothing, and it fails identically.
+test "a declared type is compared against a self call whose name no builtin claims" {
+    let mut s = box_decl()
+    s = s.concat(box_impl_head())
+    s = s.concat("    fn probe(self) -> Int \{\n")
+    s = s.concat("        let bad: Int = self.fetch(\"x\")\n")
+    s = s.concat("        if bad == 0 \{ 1 } else \{ 2 }\n")
+    s = s.concat("    }\n}\n")
+    s = s.concat(box_main())
+    compile_test_helpers.expect_compile_error(s, "jzvxav_decl_self_fetch", "TypeError")
+}
+
+// `self` itself, with no method call in the way.
+test "a declared type is compared against self" {
+    let mut s = box_decl()
+    s = s.concat(box_impl_head())
+    s = s.concat("    fn probe(self) -> Int \{\n")
+    s = s.concat("        let bad: Int = self\n")
+    s = s.concat("        if bad == 0 \{ 1 } else \{ 2 }\n")
+    s = s.concat("    }\n}\n")
+    s = s.concat(box_main())
+    compile_test_helpers.expect_compile_error(s, "jzvxav_decl_self_value", "TypeError")
+}
+
+// The declared RETURN of the enclosing method looks like the same compare one position over, and
+// it is not: it stayed silent after this fix because NO impl method had a declared return type
+// installed at all — a separate cause with a separate key mismatch, split out to
+// tests/test_zd1tz3_impl_method_declared_return.bl. `self` being typed is a precondition for that
+// row, not the fix for it.
+
+// ── the argument check, and the C-compiler escape it was hiding ──────────────
+
+test "an argument to a self call is checked against the signature" {
+    let mut s = box_decl()
+    s = s.concat(box_impl_head())
+    s = s.concat("    fn probe(self) -> Int \{\n")
+    s = s.concat("        let v = self.get(42)\n")
+    s = s.concat("        if v.is_some() \{ 1 } else \{ 0 }\n")
+    s = s.concat("    }\n}\n")
+    s = s.concat(box_main())
+    compile_test_helpers.expect_compile_error(s, "jzvxav_arg_self", "TypeError")
+}
+
+// The row above passes as soon as SOME TypeError is reported, so on its own it would keep passing
+// while the escape below reopened. This one pins the escape itself: a wrong argument must never
+// reach the C compiler. NOT "\{...}" in this file's own interpolations — `\{` is an escape
+// producing a literal brace, which makes the haystack the text `{r.out}` and the row vacuous.
+test "a wrong argument to a self call never reaches the C compiler" {
+    let mut s = box_decl()
+    s = s.concat(box_impl_head())
+    s = s.concat("    fn probe(self) -> Int \{\n")
+    s = s.concat("        let v = self.get(42)\n")
+    s = s.concat("        if v.is_some() \{ 1 } else \{ 0 }\n")
+    s = s.concat("    }\n}\n")
+    s = s.concat(box_main())
+    let r = compile_test_helpers.compile_and_run(s, "jzvxav_run_arg_escape")
+    assert(r.exit_code != 0)
+    let all = "{r.out}{r.err_out}"
+    assert(!all.contains("argument is of type"))
+    assert(!all.contains("C compilation failed"))
+}
+
+// ── controls: the same call through a local binding, and every green path ─────
+
+// This one was green throughout and is the reference answer the self path must reproduce:
+// `error[TypeError]: argument 1 of 'Box.get' expects Str, got Int`.
+test "an argument through a local receiver was always checked" {
+    let mut s = box_decl()
+    s = s.concat(box_impl_head())
+    s = s.concat("    fn probe(self) -> Int \{ 0 }\n}\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let items = [\"a\"]\n")
+    s = s.concat("    let b = Box \{ data: items }\n")
+    s = s.concat("    let v = b.get(42)\n")
+    s = s.concat("    io.println(\"\{v.is_some()}\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_compile_error(s, "jzvxav_ctl_local_arg", "TypeError")
+}
+
+test "a declared type through a local receiver was always compared" {
+    let mut s = box_decl()
+    s = s.concat(box_impl_head())
+    s = s.concat("    fn probe(self) -> Int \{ 0 }\n}\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let items = [\"a\"]\n")
+    s = s.concat("    let b = Box \{ data: items }\n")
+    s = s.concat("    let bad: Int = b.get(\"x\")\n")
+    s = s.concat("    io.println(\"\{bad}\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_compile_error(s, "jzvxav_ctl_local_decl", "TypeError")
+}
+
+// ── no false positives, and every runtime answer is unchanged ───────────────
+
+test "a matching declared type over a self call stays clean and runs" {
+    let mut s = box_decl()
+    s = s.concat(box_impl_head())
+    s = s.concat("    fn probe(self) -> Int \{\n")
+    s = s.concat("        let ok: Option[Str] = self.get(\"a\")\n")
+    s = s.concat("        if ok.is_some() \{ 1 } else \{ 0 }\n")
+    s = s.concat("    }\n}\n")
+    s = s.concat(box_main())
+    compile_test_helpers.expect_no_error(s, "jzvxav_clean_self_get", "TypeError")
+    let r = compile_test_helpers.compile_and_run(s, "jzvxav_run_self_get")
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out.trim(), "1")
+}
+
+// A self call that goes through a SECOND self call (`fetch` -> `get`) — the receiver has to be
+// typed at both hops, not just the outermost one.
+test "a self call chained through another self call runs" {
+    let mut s = box_decl()
+    s = s.concat(box_impl_head())
+    s = s.concat("    fn probe(self) -> Int \{\n")
+    s = s.concat("        let v = self.fetch(\"a\")\n")
+    s = s.concat("        if v.unwrap() == \"a\" \{ 7 } else \{ 0 }\n")
+    s = s.concat("    }\n}\n")
+    s = s.concat(box_main())
+    compile_test_helpers.expect_no_error(s, "jzvxav_clean_chain", "TypeError")
+    let r = compile_test_helpers.compile_and_run(s, "jzvxav_run_chain")
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out.trim(), "7")
+}
+
+// Field access through `self` already resolved (it does not go through the receiver's tid), so it
+// must keep resolving — and a wrong declared type over a FIELD must keep being caught.
+test "field access through self still resolves both ways" {
+    let mut s = box_decl()
+    s = s.concat(box_impl_head())
+    s = s.concat("    fn probe(self) -> Int \{ self.data.len() }\n}\n")
+    s = s.concat(box_main())
+    compile_test_helpers.expect_no_error(s, "jzvxav_clean_field", "TypeError")
+    let r = compile_test_helpers.compile_and_run(s, "jzvxav_run_field")
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out.trim(), "1")
+
+    let mut b = box_decl()
+    b = b.concat(box_impl_head())
+    b = b.concat("    fn probe(self) -> Int \{\n")
+    b = b.concat("        let bad: Int = self.data\n")
+    b = b.concat("        if bad == 0 \{ 1 } else \{ 2 }\n")
+    b = b.concat("    }\n}\n")
+    b = b.concat(box_main())
+    compile_test_helpers.expect_compile_error(b, "jzvxav_decl_field", "TypeError")
+}
+
+// `self` passed as a VALUE, the shape sections/03c_protocols.md:32 uses
+// (`ListIterator { items: self, index: 0 }`). Typing `self` must not break it.
+test "self passed as a value into a struct literal runs" {
+    let mut s = "type Box \{ data: List[Str] }\n"
+    s = s.concat("type Holder \{ inner: Box }\n")
+    s = s.concat("trait BoxOps \{ fn wrap(self) -> Int }\n")
+    s = s.concat("impl BoxOps for Box \{\n")
+    s = s.concat("    fn wrap(self) -> Int \{\n")
+    s = s.concat("        let h = Holder \{ inner: self }\n")
+    s = s.concat("        h.inner.data.len()\n")
+    s = s.concat("    }\n}\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let items = [\"a\", \"b\"]\n")
+    s = s.concat("    let b = Box \{ data: items }\n")
+    s = s.concat("    io.println(\"\{b.wrap()}\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_no_error(s, "jzvxav_clean_self_value", "TypeError")
+    let r = compile_test_helpers.compile_and_run(s, "jzvxav_run_self_value")
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out.trim(), "2")
+}
+
+// A GENERIC impl. `self` here is `List[T]`, not a bare struct head, so binding it to the erased
+// base is what would break — the impl type has to arrive structurally, the way
+// tc_fnsig_param_instance_tid already treats an annotated generic param.
+test "a generic impl over List[T] still resolves self and runs" {
+    let mut s = "trait Firstish[T] \{ fn firstish(self) -> Option[T] }\n"
+    s = s.concat("impl[T] Firstish[T] for List[T] \{\n")
+    s = s.concat("    fn firstish(self) -> Option[T] \{ self.get(0) }\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let xs = [4, 5]\n")
+    s = s.concat("    io.println(\"\{xs.firstish().unwrap()}\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_no_error(s, "jzvxav_clean_generic", "TypeError")
+    let r = compile_test_helpers.compile_and_run(s, "jzvxav_run_generic")
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out.trim(), "4")
+}
+
+// The corpus shape this cause was found in: lib/std/db_row.bl:35, `let val = self.get(col)`
+// inside `impl RowOps for Row`, 12 of the ~17 divergence rows. Reproduced without the db import
+// so it holds even if db_row changes.
+test "the db_row shape in miniature runs and is checked" {
+    let mut s = "type Row2 \{ data: List[Str], columns: List[Str] }\n"
+    s = s.concat("trait Row2Ops \{\n")
+    s = s.concat("    fn get(self, col: Str) -> Option[Str]\n")
+    s = s.concat("    fn get_int(self, col: Str) -> Option[Int]\n")
+    s = s.concat("}\n")
+    s = s.concat("impl Row2Ops for Row2 \{\n")
+    s = s.concat("    fn get(self, col: Str) -> Option[Str] \{\n")
+    s = s.concat("        let mut i = 0\n")
+    s = s.concat("        while i < self.columns.len() \{\n")
+    s = s.concat("            if self.columns.get(i).unwrap() == col \{\n")
+    s = s.concat("                return Some(self.data.get(i).unwrap())\n")
+    s = s.concat("            }\n")
+    s = s.concat("            i = i + 1\n")
+    s = s.concat("        }\n")
+    s = s.concat("        None\n")
+    s = s.concat("    }\n")
+    s = s.concat("    fn get_int(self, col: Str) -> Option[Int] \{\n")
+    s = s.concat("        let val = self.get(col)\n")
+    s = s.concat("        if val.is_some() \{ Some(val.unwrap().parse_int()) } else \{ None }\n")
+    s = s.concat("    }\n}\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let cols = [\"n\"]\n")
+    s = s.concat("    let vals = [\"42\"]\n")
+    s = s.concat("    let r = Row2 \{ data: vals, columns: cols }\n")
+    s = s.concat("    io.println(\"\{r.get_int(\"n\").unwrap()}\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_no_error(s, "jzvxav_clean_dbrow", "TypeError")
+    let r = compile_test_helpers.compile_and_run(s, "jzvxav_run_dbrow")
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out.trim(), "42")
+}

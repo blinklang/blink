@@ -1,0 +1,285 @@
+// br ya8qyf — an impl method's declared return type was never checked, in any Blink program.
+//
+// Filed twice: ya8qyf found it in 2026-07 while reviewing the r9krgr/skdxkv fix and left two red
+// rows in test_skdxkv_implicit_tail_ret_compare.bl pinning the wrong behavior on purpose; zd1tz3
+// re-found it from the other end, as the row that stayed red after br jzvxav typed `self`. Same
+// cause, same fix shape ya8qyf already prescribed. zd1tz3 closed as the duplicate.
+//
+// Two spellings of one key. The REGISTER side (typecheck.bl:5183) stores an impl method's
+// signature under `tc_mangle_impl_fnsig` — `"{impl_type}_{trait_name}_{method}"`. The CHECK side
+// (tc_infer_program:11195) installs `"{impl_type}_{method}"` on the node before calling
+// tc_check_fn, whose `lookup_fnsig(fn_name)` therefore always missed. tc_check_fn installs
+// `tc_current_fn_ret` only when the lookup succeeds, so it kept its previous value (-1 at program
+// level) and EVERY declared-return compare in the body was skipped: the explicit-return one, the
+// implicit-tail one, and tc_check_missing_tail_value.
+//
+// The consequence is not a lost type but an escape: a wrong return passed `blink check` clean and
+// died in the C compiler, with no Blink diagnostic and no source span. `fn r(self) -> Str { 42 }`
+// — a bare literal, no `self` involved — reached `cc` as "returning int from a function with
+// return type const char *". So the run rows below are the load-bearing ones; a row that only
+// asserts a diagnostic keeps passing while the cc path reopens.
+//
+// Distinct from br jzvxav (`self` bound as TYPE_UNKNOWN). jzvxav is a precondition for the rows
+// whose returned value comes from `self`, and fixes none of these: the literal row proves the
+// cause is the key, not the receiver. The identical body in a FREE function always reported
+// correctly, which is the control proving the compare itself works.
+
+import compile_test_helpers
+
+fn box_decl() -> Str {
+    let mut s = "type Box \{ data: List[Str] }\n"
+    s = s.concat("trait BoxOps \{\n")
+    s = s.concat("    fn get(self, k: Str) -> Option[Str]\n")
+    s = s.concat("    fn probe(self) -> Int\n")
+    s = s.concat("}\n")
+    s
+}
+
+fn box_impl_head() -> Str {
+    let mut s = "impl BoxOps for Box \{\n"
+    s = s.concat("    fn get(self, _k: Str) -> Option[Str] \{ self.data.get(0) }\n")
+    s
+}
+
+fn box_main() -> Str {
+    let mut s = "fn main() \{\n"
+    s = s.concat("    let items = [\"a\"]\n")
+    s = s.concat("    let b = Box \{ data: items }\n")
+    s = s.concat("    io.println(\"\{b.probe()}\")\n")
+    s = s.concat("}\n")
+    s
+}
+
+// ── the compare itself, in each of the three positions that were skipped ──────
+
+// A literal against the declared return. Nothing here reads `self`, which is what makes this row
+// the one that identifies the cause as the fnsig key and not the receiver type.
+test "a literal is compared against an impl method's declared return" {
+    let mut s = box_decl()
+    s = s.concat(box_impl_head())
+    s = s.concat("    fn probe(self) -> Int \{ \"nope\" }\n}\n")
+    s = s.concat(box_main())
+    compile_test_helpers.expect_compile_error(s, "zd1tz3_literal_tail", "TypeError")
+}
+
+test "an explicit return is compared against an impl method's declared return" {
+    let mut s = box_decl()
+    s = s.concat(box_impl_head())
+    s = s.concat("    fn probe(self) -> Int \{ return self.data }\n}\n")
+    s = s.concat(box_main())
+    compile_test_helpers.expect_compile_error(s, "zd1tz3_explicit_return", "TypeError")
+}
+
+test "an implicit tail is compared against an impl method's declared return" {
+    let mut s = box_decl()
+    s = s.concat(box_impl_head())
+    s = s.concat("    fn probe(self) -> Int \{ self.get(\"x\") }\n}\n")
+    s = s.concat(box_main())
+    compile_test_helpers.expect_compile_error(s, "zd1tz3_implicit_tail", "TypeError")
+}
+
+// tc_check_missing_tail_value — a non-Void declared return with no tail value at all. It reports
+// against the whole function rather than a statement, and it reads tc_current_fn_ret directly, so
+// it was skipped for the same reason.
+test "an impl method with a non-Void return and no tail value is reported" {
+    let mut s = box_decl()
+    s = s.concat(box_impl_head())
+    s = s.concat("    fn probe(self) -> Int \{ let _x = 1 }\n}\n")
+    s = s.concat(box_main())
+    compile_test_helpers.expect_compile_error(s, "zd1tz3_missing_tail", "TypeError")
+}
+
+// ── the escape ───────────────────────────────────────────────────────────────
+
+// The rows above pass as soon as SOME TypeError is reported. This one pins what was actually
+// broken: a wrong return must never reach the C compiler. NOT "\{...}" in this file's own
+// interpolation — `\{` is an escape producing a literal brace, which would make the haystack the
+// text `{r.out}` and the row vacuous.
+test "a wrong impl method return never reaches the C compiler" {
+    let mut s = box_decl()
+    s = s.concat(box_impl_head())
+    s = s.concat("    fn probe(self) -> Int \{ \"nope\" }\n}\n")
+    s = s.concat(box_main())
+    let r = compile_test_helpers.compile_and_run(s, "zd1tz3_run_escape")
+    assert(r.exit_code != 0)
+    let all = "{r.out}{r.err_out}"
+    assert(!all.contains("makes pointer from integer"))
+    assert(!all.contains("makes integer from pointer"))
+    assert(!all.contains("C compilation failed"))
+}
+
+// ── the ticket's own two MVCEs, verbatim ─────────────────────────────────────
+// A generic-struct declared/actual arg mismatch — the shape ya8qyf was filed on. The mismatch is
+// invisible in the flat C types until the return statement, which is why it landed as
+// "incompatible types when returning type blink_GKV_Str_Int" rather than a wrong value.
+
+fn gkv_preamble() -> Str {
+    let mut s = "type GKV[K, V] \{ m: Map[K, V] }\n"
+    s = s.concat("type Holder \{ n: Int }\n")
+    s = s.concat("trait Maker \{ fn make(self) -> GKV[Int, Str] }\n")
+    s
+}
+
+test "a generic-struct arg mismatch in an impl method return is diagnosed" {
+    let mut s = gkv_preamble()
+    s = s.concat("impl Maker for Holder \{\n")
+    s = s.concat("    fn make(self) -> GKV[Int, Str] \{\n")
+    s = s.concat("        let g: GKV[Str, Int] = GKV \{ m: Map() }\n")
+    s = s.concat("        g\n")
+    s = s.concat("    }\n}\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let h = Holder \{ n: 1 }\n")
+    s = s.concat("    let _x = h.make()\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_compile_error(s, "ya8qyf_mvce1", "TypeError")
+    let r = compile_test_helpers.compile_and_run(s, "ya8qyf_mvce1_run")
+    assert(r.exit_code != 0)
+    let all = "{r.out}{r.err_out}"
+    assert(!all.contains("incompatible types when returning"))
+}
+
+// MVCE 2: the declared return determines the instance an intermediate let cannot determine on its
+// own, so installing it also makes the r9krgr pin reach methods — the program stops being
+// under-determined (E0301) and compiles, matching the free-function spelling.
+test "an intermediate let in an impl method is pinned by the declared return" {
+    let mut s = gkv_preamble()
+    s = s.concat("impl Maker for Holder \{\n")
+    s = s.concat("    fn make(self) -> GKV[Int, Str] \{\n")
+    s = s.concat("        let x = GKV \{ m: Map() }\n")
+    s = s.concat("        x\n")
+    s = s.concat("    }\n}\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let h = Holder \{ n: 1 }\n")
+    s = s.concat("    let g = h.make()\n")
+    s = s.concat("    io.println(\"\{g.m.len()}\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_no_error(s, "ya8qyf_mvce2", "E0301")
+    let r = compile_test_helpers.compile_and_run(s, "ya8qyf_mvce2_run")
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out.trim(), "0")
+}
+
+// ── the control that proves only the lookup was broken ───────────────────────
+
+test "the same body in a free function was always compared" {
+    let mut s = box_decl()
+    s = s.concat(box_impl_head())
+    s = s.concat("    fn probe(self) -> Int \{ 0 }\n}\n")
+    s = s.concat("fn tailfree(b: Box) -> Int \{ b.get(\"x\") }\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let items = [\"a\"]\n")
+    s = s.concat("    let b = Box \{ data: items }\n")
+    s = s.concat("    io.println(\"\{tailfree(b)}\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_compile_error(s, "zd1tz3_ctl_free_fn", "TypeError")
+}
+
+// ── no false positives: the shapes the key mismatch was hiding correct answers for ──
+
+test "a matching impl method return stays clean and runs" {
+    let mut s = box_decl()
+    s = s.concat(box_impl_head())
+    s = s.concat("    fn probe(self) -> Int \{ self.data.len() }\n}\n")
+    s = s.concat(box_main())
+    compile_test_helpers.expect_no_error(s, "zd1tz3_clean_match", "TypeError")
+    let r = compile_test_helpers.compile_and_run(s, "zd1tz3_run_match")
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out.trim(), "1")
+}
+
+// A Void method has no declared return to compare and must not acquire one.
+test "a Void impl method stays clean and runs" {
+    let mut s = "type Box \{ data: List[Str] }\n"
+    s = s.concat("trait BoxOps \{ fn shout(self) }\n")
+    s = s.concat("impl BoxOps for Box \{\n")
+    s = s.concat("    fn shout(self) \{ io.println(self.data.get(0).unwrap()) }\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let items = [\"hi\"]\n")
+    s = s.concat("    let b = Box \{ data: items }\n")
+    s = s.concat("    b.shout()\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_no_error(s, "zd1tz3_clean_void", "TypeError")
+    let r = compile_test_helpers.compile_and_run(s, "zd1tz3_run_void")
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out.trim(), "hi")
+}
+
+// Two traits implemented for one type sharing a method NAME is exactly why the register side
+// mangles with the trait name. The check side now recomputes that mangling, so a shared name must
+// still find its OWN signature — the wrong one would compare against the other trait's return.
+test "two traits sharing a method name each compare against their own return" {
+    let mut s = "type Box \{ n: Int }\n"
+    s = s.concat("trait Alpha \{ fn val(self) -> Int }\n")
+    s = s.concat("trait Beta \{ fn tag(self) -> Str }\n")
+    s = s.concat("impl Alpha for Box \{ fn val(self) -> Int \{ self.n } }\n")
+    s = s.concat("impl Beta for Box \{ fn tag(self) -> Str \{ \"b\" } }\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let b = Box \{ n: 5 }\n")
+    s = s.concat("    io.println(\"\{b.val()}\{b.tag()}\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_no_error(s, "zd1tz3_clean_two_traits", "TypeError")
+    let r = compile_test_helpers.compile_and_run(s, "zd1tz3_run_two_traits")
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out.trim(), "5b")
+}
+
+// `From` and `TryFrom` are the register side's special case — they mangle as
+// "{impl_type}_{method}_{src}" instead of by trait name (tc_mangle_impl_fnsig:297). The check side
+// recomputes the mangling, so it has to reproduce that carve-out or these lose their return type
+// again while every other trait gains one.
+test "a From impl compares against its own declared return and runs" {
+    let mut s = "type Celsius \{ deg: Int }\n"
+    s = s.concat("impl From[Int] for Celsius \{\n")
+    s = s.concat("    fn from(v: Int) -> Celsius \{ Celsius \{ deg: v } }\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let c = Celsius.from(21)\n")
+    s = s.concat("    io.println(\"\{c.deg}\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_no_error(s, "zd1tz3_clean_from", "TypeError")
+    let r = compile_test_helpers.compile_and_run(s, "zd1tz3_run_from")
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out.trim(), "21")
+}
+
+// A generic impl's declared return is a typevar (`-> Option[T]`), which must stay compatible with
+// the concrete value the body produces rather than becoming a fresh mismatch.
+test "a generic impl's typevar return stays clean and runs" {
+    let mut s = "trait Firstish[T] \{ fn firstish(self) -> Option[T] }\n"
+    s = s.concat("impl[T] Firstish[T] for List[T] \{\n")
+    s = s.concat("    fn firstish(self) -> Option[T] \{ self.get(0) }\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let xs = [4, 5]\n")
+    s = s.concat("    io.println(\"\{xs.firstish().unwrap()}\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_no_error(s, "zd1tz3_clean_generic", "TypeError")
+    let r = compile_test_helpers.compile_and_run(s, "zd1tz3_run_generic")
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out.trim(), "4")
+}
+
+// A Result-returning method with `?` in the body: the declared return is what `?` propagates
+// against, so installing it must not turn a correct propagation into an error.
+test "a Result-returning impl method with ? stays clean and runs" {
+    let mut s = "type Parser \{ src: Str }\n"
+    s = s.concat("trait ParserOps \{ fn twice(self) -> Result[Int, Str] }\n")
+    s = s.concat("fn half(s: Str) -> Result[Int, Str] \{\n")
+    s = s.concat("    if s == \"\" \{ return Err(\"empty\") }\n")
+    s = s.concat("    Ok(s.len())\n")
+    s = s.concat("}\n")
+    s = s.concat("impl ParserOps for Parser \{\n")
+    s = s.concat("    fn twice(self) -> Result[Int, Str] \{\n")
+    s = s.concat("        let n = half(self.src)?\n")
+    s = s.concat("        Ok(n * 2)\n")
+    s = s.concat("    }\n}\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let p = Parser \{ src: \"abc\" }\n")
+    s = s.concat("    io.println(\"\{p.twice().unwrap()}\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_no_error(s, "zd1tz3_clean_result", "TypeError")
+    let r = compile_test_helpers.compile_and_run(s, "zd1tz3_run_result")
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out.trim(), "6")
+}
