@@ -522,6 +522,19 @@ pub let mut tc_hints: List[HintEntry] = []
 let mut tc_symbol_module: Map[Str, Str] = Map()
 let mut tc_used_modules: Map[Str, Int] = Map()
 
+// br cttrag: the type of every top-level `let`, keyed "{module}.{name}", so a
+// module-QUALIFIED access can be resolved. Top-level lets are also defined by
+// bare name (nr_define_typed, below), which is why the bare form inside the
+// declaring module was always typed; the qualified form had nothing to read.
+//
+// A separate table rather than nr_get_type(name), because the bare-name scope is
+// shadowable: with `let count = "s"` in scope, nr_get_type("count") answers the
+// LOCAL, and `prov.count` would silently acquire the wrong type. Keying on the
+// module makes the lookup immune to that, and the key is the module the QUALIFIER
+// resolves to (tc_qualifier_to_module_or_self), not the bare qualifier, so an
+// aliased or dotted import resolves the same way.
+let mut tc_module_let_tid: Map[Str, Int] = Map()
+
 // Prelude modules (underscore form, e.g. "std_num") and the set of *free
 // function* names they export. The prelude provides compiler-known
 // types/traits/impls unconditionally (§10.6), but its free functions
@@ -5145,6 +5158,7 @@ fn init_types() ! TypeCheck.Register {
     tc_collision_reported.clear()
     ffi_struct_type_set.clear()
     tc_symbol_module.clear()
+    tc_module_let_tid.clear()
     tc_prelude_free_fn.clear()
     tc_used_modules.clear()
     tc_hints.clear()
@@ -9823,6 +9837,25 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             if tid != -1 && type_kind(tid) == TyKind.Enum {
                 return tid
             }
+            // br cttrag: a MODULE qualifier. This arm had three cases — an enum
+            // type qualifier, a struct field, a tuple index — and no fourth for
+            // `module.name`, so a qualified top-level `let` fell off the tail as
+            // TYPE_UNKNOWN. That unifies with anything, so both halves failed
+            // open and failed open differently: `let bad: Str = prov.count`
+            // compiled, linked and RAN, while `want_str(prov.count)` escaped to
+            // cc with no diagnostic at all.
+            //
+            // Same gate name resolution uses for the form (:7764): an Ident that
+            // names an import and is not shadowed by a binding. Fails CLOSED —
+            // an unregistered key falls through to the existing behaviour rather
+            // than guessing a type.
+            if is_import_module_name(obj_name) != 0 && nr_is_defined(obj_name) == 0 {
+                let qual_mod = tc_qualifier_to_module_or_self(obj_name)
+                match tc_module_let_tid.get("{qual_mod}.{fname}") {
+                    Some(let_tid) => return let_tid
+                    None => {}
+                }
+            }
         }
 
         let obj_t = infer_type(obj_node)
@@ -11573,6 +11606,14 @@ fn tc_infer_program(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Re
                 }
             }
             nr_define_typed(node_name(l), node_is_mut(l), l_tid)
+            // br cttrag: the same tid, keyed by module, for the qualified form.
+            // Registered here and not in a pass of its own so the two spellings
+            // of one binding cannot drift — a `let` reachable as `m.x` gets its
+            // type from the same resolve_type_ann call as the bare `x`.
+            let l_mod_key = node_module(l)
+            if l_mod_key != "" && l_tid != TYPE_UNKNOWN {
+                tc_module_let_tid.insert("{l_mod_key}.{node_name(l)}", l_tid)
+            }
             i = i + 1
         }
     }

@@ -1,0 +1,152 @@
+// br cttrag — `module.name`, where `name` is a top-level `let`, had no type in typecheck.
+//
+// infer_type's NodeKind.FieldAccess arm (src/typecheck.bl:9815) had arms for an enum type
+// qualifier, a struct field and a tuple index, and NONE for a module qualifier. For `prov.count`
+// the object Ident `prov` is not a type, so lookup_named_type returns -1, infer_type on the module
+// Ident gives TYPE_UNKNOWN, neither the Struct nor the Tuple branch is entered, and the arm falls
+// off its tail returning TYPE_UNKNOWN.
+//
+// The type was ALREADY THERE. src/typecheck.bl:11582 registers every top-level let with
+// nr_define_typed(name, is_mut, l_tid), resolving the annotation through resolve_type_ann — which
+// is exactly why the BARE form inside the declaring module always worked. The qualified form just
+// never consulted it.
+//
+// TYPE_UNKNOWN unifies with anything, so both halves failed open, and they fail open DIFFERENTLY:
+// the declared-type compare is skipped and the program compiles, links and RUNS (a silent
+// miscompile); the argument check is skipped and produces no diagnostic at all, so the mistyped
+// value reaches the C compiler. That asymmetry is why the rows below assert on a RUN result and on
+// an error code, and never on the absence of one alone.
+//
+// THE AXES ARE NARROWER THAN THE SYMPTOM. The divergence map ranked this as a "cross-module pub let
+// container element" cause, from the four sites in the compiler's own source that happen to read a
+// List[Str] (src/incremental.bl:44,75, src/file_watcher.bl:40,73, all
+// `symbol_index.si_file_path.get(i).unwrap()`). Two of those three axes are wrong, and the controls
+// here pin all three: it is not container-specific (a scalar Int loses its type identically), not
+// about `pub` or about crossing a module boundary (the bare form inside the declaring module is
+// typed, for a private `let` as much as a `pub let`), and not the function-call path (a qualified
+// user fn call is typed). It is the QUALIFIED FORM.
+
+import compile_test_helpers
+
+// One provider module for every row. `count`/`label` are scalars, `names`/`lookup` are containers,
+// `privcount` is private — so a single helper covers the shape axis and the visibility axis, and
+// `bare_here` proves the declaring module's own view is unaffected.
+let PROV: Str = "pub let mut names: List[Str] = []\npub let mut lookup: Map[Str, Int] = Map()\npub let mut count: Int = 3\npub let mut label: Str = \"lbl\"\nlet privcount: Int = 9\n\npub fn seed() \{\n    names.push(\"alpha\")\n    lookup.insert(\"alpha\", 7)\n}\n\npub fn bare_here() -> Str \{\n    let a = names.get(0).unwrap()\n    let b = privcount\n    let c = count\n    \"\{a}|\{b}|\{c}\"\n}\n"
+
+fn entry(body: Str) -> Str {
+    let mut s = "import prov\n\nfn main() \{\n    prov.seed()\n"
+    s = s.concat(body)
+    s = s.concat("}\n")
+    s
+}
+
+// ── the bug: the declared-type compare was skipped, so this RAN ──
+
+// The teeth of the whole file. Before the fix this compiled, linked and printed `3` — an Int bound
+// to a Str-declared name. Asserting only "is a TypeError" would have passed against a program that
+// failed for some unrelated reason, so the pre-fix behaviour is recorded here in full: it ran, and
+// it printed the Int.
+test "an Int-typed qualified let cannot bind to a Str-declared name" {
+    let src = entry("    let bad: Str = prov.count\n    io.println(bad)\n")
+    compile_test_helpers.expect_compile_error_xmod(src, "prov", PROV, "cttrag_scalar_decl", "TypeError")
+}
+
+test "a Str-typed qualified let cannot bind to an Int-declared name" {
+    let src = entry("    let bad: Int = prov.label\n    io.println(\"\{bad}\")\n")
+    compile_test_helpers.expect_compile_error_xmod(src, "prov", PROV, "cttrag_str_decl", "TypeError")
+}
+
+// The container axis, which is the shape the compiler's own source reads. Same cause, and the
+// erasure PROPAGATES: the element type of a qualified List[Str] was unknown too, so a mistyped
+// binding one level down the chain also ran (it printed `alpha` for an Int-declared name).
+test "a qualified List element keeps its element type through get().unwrap()" {
+    let src = entry("    let elem = prov.names.get(0).unwrap()\n    let bad: Int = elem\n    io.println(\"\{bad}\")\n")
+    compile_test_helpers.expect_compile_error_xmod(src, "prov", PROV, "cttrag_list_elem", "TypeError")
+}
+
+test "a qualified Map value keeps its value type" {
+    let src = entry("    let v = prov.lookup.get(\"alpha\").unwrap()\n    let bad: Str = v\n    io.println(bad)\n")
+    compile_test_helpers.expect_compile_error_xmod(src, "prov", PROV, "cttrag_map_val", "TypeError")
+}
+
+// The whole container, bound without indexing — the tid must be the container type itself, not just
+// recoverable from its elements.
+test "a qualified container binds as the container type" {
+    let src = entry("    let bad: Int = prov.names\n    io.println(\"\{bad}\")\n")
+    compile_test_helpers.expect_compile_error_xmod(src, "prov", PROV, "cttrag_whole_list", "TypeError")
+}
+
+// ── the other half, which failed open with NO diagnostic at all ──
+
+// A skipped argument check produces no row and no error — the mistyped value reaches cc, whose
+// failure blinkc cannot observe. So this row must go through the full pipeline: compile_and_capture
+// stops after blinkc and would read green forever.
+test "a qualified let passed to a mismatched parameter never reaches the C compiler" {
+    let mut s = "import prov\n\nfn want_str(s: Str) -> Str \{ s.concat(\"!\") }\n\n"
+    s = s.concat("fn main() \{\n    prov.seed()\n    io.println(want_str(prov.count))\n}\n")
+    let r = compile_test_helpers.run_xmod(s, ".", "prov", PROV, "cttrag_argpos")
+    assert(r.exit_code != 0)
+    assert(!r.err_out.contains("C compilation failed"))
+    assert(r.err_out.contains("TypeError") || r.out.contains("TypeError"))
+}
+
+// ── controls: the three axes the ticket's original framing got wrong ──
+
+// Inside the declaring module the bare form was ALWAYS typed — for the private `let` as much as the
+// two `pub let`s. This is what proves the cause is the qualified form and not visibility, and it
+// must keep working: the fix adds a branch for the qualified form, it does not touch this one.
+test "bare access inside the declaring module still works" {
+    let src = entry("    io.println(prov.bare_here())\n")
+    let r = compile_test_helpers.run_xmod(src, ".", "prov", PROV, "cttrag_bare")
+    assert(r.exit_code == 0)
+    assert(r.out.contains("alpha|9|3"))
+}
+
+// A module-qualified user fn call resolves its return type through the fnsig table, never through
+// the FieldAccess arm. Untouched by the fix, asserted so a regression there is attributed here.
+test "a qualified fn call still resolves its return type" {
+    let mut s = "import prov\n\nfn main() \{\n    prov.seed()\n"
+    s = s.concat("    let bad: Int = prov.bare_here()\n    io.println(\"\{bad}\")\n}\n")
+    compile_test_helpers.expect_compile_error_xmod(s, "prov", PROV, "cttrag_qual_fncall", "TypeError")
+}
+
+// The correctly-typed program must still compile and run — every shape, through both the direct and
+// the indexed form. A fix that resolved the qualified let to the WRONG type would satisfy every
+// error row above and fail here.
+test "correctly typed qualified access of every shape compiles and runs" {
+    let mut b = "    let n: Int = prov.count\n"
+    b = b.concat("    let l: Str = prov.label\n")
+    b = b.concat("    let all: List[Str] = prov.names\n")
+    b = b.concat("    let e: Str = prov.names.get(0).unwrap()\n")
+    b = b.concat("    let v: Int = prov.lookup.get(\"alpha\").unwrap()\n")
+    b = b.concat("    io.println(\"\{n}|\{l}|\{all.len()}|\{e}|\{v}\")\n")
+    let r = compile_test_helpers.run_xmod(entry(b), ".", "prov", PROV, "cttrag_good")
+    assert(r.exit_code == 0)
+    assert(r.out.contains("3|lbl|1|alpha|7"))
+}
+
+// THE SHADOWING HAZARD, which is why the fix keys its table on the module instead of reading the
+// bare-name scope. Top-level lets are ALSO defined by bare name (nr_define_typed), so a `nr_get_type
+// (fname)` lookup would answer the innermost binding: with a local `count: Str` in scope,
+// `prov.count` would silently acquire `Str` — a wrong type, which is worse than no type, because no
+// type at least fails open loudly at cc. Asserted on the MESSAGE, not just the code: `declared type
+// Str but got Int` proves the qualified access resolved to prov's Int and not to the local Str.
+//
+// The program also earns an unrelated ImportNotSelected on the bare `count` reference (a name
+// importable from prov cannot be used bare), which is pre-existing and not this ticket's; the
+// message assertion is what makes this row specific despite it.
+test "a qualified let is not captured by a same-named local binding" {
+    let prov = "pub let mut count: Int = 3\n"
+    let mut s = "import prov\n\nfn main() \{\n    let count = \"local-shadow\"\n"
+    s = s.concat("    let bad: Str = prov.count\n    io.println(\"\{count}|\{bad}\")\n}\n")
+    let out = compile_test_helpers.compile_xmod_capture(s, "prov", prov, "cttrag_shadow")
+    assert(out.contains("declared type Str but got Int"))
+}
+
+// A second provider module, to prove the lookup is keyed on the qualifier's own module rather than
+// happening to work for the one module the other rows use.
+test "a qualified let in a second module resolves to that module's type" {
+    let other = "pub let mut tally: Str = \"from-other\"\n"
+    let mut s = "import other\n\nfn main() \{\n    let bad: Int = other.tally\n    io.println(\"\{bad}\")\n}\n"
+    compile_test_helpers.expect_compile_error_xmod(s, "other", other, "cttrag_own_module", "TypeError")
+}
