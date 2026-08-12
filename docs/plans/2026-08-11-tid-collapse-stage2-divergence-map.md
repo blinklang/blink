@@ -4822,6 +4822,54 @@ loses types. That asymmetry — same defect class, one registry away — is the 
 miniature: the loss is not in the type system, it is in a representation that cannot hold what
 the type system already knew.
 
+### And the fix for it is a deletion (br `3xd320`)
+
+```blink
+fn ct_from_str(s: Str) -> Int {
+    s.to_int()
+}
+```
+
+That is the whole repair. **The ladder was not extended**, deliberately: adding eight entries
+turns the test green and leaves the trap one entry longer, so the next `CT_*` added to the file
+reopens the defect silently, for whichever type it happens to be. The same key decode appears
+**twice** in `codegen_types.bl` — the whole-program emit loop and the incremental per-module one —
+and repairing the shared helper fixed both; extending a ladder in two places is the version of
+this fix that rots.
+
+An exact decode newly reaches the CTs past the old end (`CT_STRUCT` 23, `CT_ENUM` 24, and the
+handful whose `c_type_tag` is `"void"`), so that end was checked before the change rather than
+after:
+
+- `emit_result_typedef` already dedups by the typedef **name** (`result_typedef_emitted`), so two
+  keys that share a name emit once. No redefinition hazard — and `c_type_tag` answers `"void"` for
+  eight different CTs, so the hazard was real enough to check.
+- Where such a key exists, the exact decode makes the emitted name **agree** with what the
+  declaration site spells through `result_c_type`. Strictly more consistent than printing
+  `int_str` for it.
+
+RED was 10 `unknown type name` errors: the 8 ok-side types, the **Err arm** of a sized-int
+`Result` (a separate emit path, `emit_err_result`), and a sized int in the **Err position** (the
+other half of the key, same ladder). GREEN is 15/15, `task ci` 663/663 with fmt 1546/1546. Every
+row declares the `Result` — where the escape happened — and then unwraps it, so a typedef emitted
+with the wrong member width still fails: the `U64` row round-trips a value above 2^63 and would
+answer wrong through an `int64_t` member.
+
+`CT_STRUCT` and `CT_ENUM` sit past the ladder's end too, but they route through the separate
+struct-carrier registry, keyed by tag rather than by CT, so they were never affected. A struct row
+in the test pins that separation, so a later change cannot quietly reroute them into the scalar
+registry.
+
+### What these two sub-steps say about the seam Stage 3c left uncovered
+
+Both defects were found by *entering* the uncensused seam and probing it by hand, not by reading
+a counter — and both were louder than anything the census contains: a census row is a spelling
+that could be better, while these were programs that do not compile at all. The census measures
+`emit_let_binding`; the carriers, temps and registries around it are measured by constructing the
+shape and running it (`feedback_corpus_sweep_is_not_coverage`). Three MVCEs spent on sibling
+seams turned one filed ticket into two fixed ones and one language fact (`.unwrap_or` does not
+exist; `??` is the idiom), which is a better return than any of them would have had alone.
+
 ## Appendix — all 428 shape cells
 
 Format: `family | occurrences | tid | flat`.

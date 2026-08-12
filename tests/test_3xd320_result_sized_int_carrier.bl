@@ -1,0 +1,145 @@
+import std.io
+
+// br 3xd320 — the `Result[T, E]` carrier typedef is never emitted when T is a sized integer or
+// Char, so merely DECLARING such a local is a C-compiler error with no Blink span:
+//
+//     fn main() {
+//         let x: U64 = 7
+//         let r: Result[U64, Str] = Ok(x)
+//         io.println("ok={r.is_ok()}")
+//     }
+//
+//     build/res_local.c:316:11: error: unknown type name 'blink_Result_u64_str';
+//                                     did you mean 'blink_Result_int_str'?
+//
+// No unwrap is involved: the declaration alone fails. Note the compiler's own hint naming the
+// carrier that WAS emitted — that is the defect in one line.
+//
+// CAUSE. `ensure_result_type` stores its registration key as the DECIMAL STRING of the two CT
+// integers — `"{ok_t}_{err_t}"` — and `emit_all_option_result_types` decodes it back with
+// `ct_from_str`, a hand-written string->CT ladder that ends at `"20"` (CT_SET) and returns
+// CT_INT for anything past it. CT_I8..CT_U64 are 25..31 and CT_CHAR is 32, so all eight
+// round-trip as CT_INT: the ensure registers the right pair, the emitter prints
+// `blink_Result_int_str`, and the name the declaration actually uses is never declared at all.
+//
+// The fix does not extend the ladder — extending it is the same lossy pattern one entry longer,
+// and the next CT_* added would reopen this. It parses the integer, which is exact for every
+// CT_* that exists now or later.
+//
+// WHY Option IS IMMUNE, and why that asymmetry is the whole story: `emitted_option_types` is a
+// `List[Int]` and never stringifies, so `Option[U64]` has always declared and unwrapped fine.
+// Only the Result registry round-trips through a string, and only it loses types.
+//
+// SCOPE, measured one type at a time rather than read off the ladder: the seven sized integers
+// and Char fail; Int, Bool and Float sit below the ladder's end and work. CT_STRUCT (23) and
+// CT_ENUM (24) are past the end too, but they reach the emitter through the separate
+// struct-carrier registry (`emitted_struct_result_types`, keyed by tag, not by CT), so they are
+// unaffected — which is why this file pins a struct row as well.
+
+// ── The eight lost ok types ──────────────────────────────────────────────────────────
+//
+// Each row DECLARES the Result (that is where the escape happens), then unwraps it, so a fix
+// that emits the typedef but mismatches its member type cannot pass.
+
+test "Result[U8, Str] declares and unwraps" {
+    let x: U8 = 200
+    let r: Result[U8, Str] = Ok(x)
+    assert(r.is_ok())
+    assert_eq(r.unwrap(), x)
+}
+
+test "Result[U16, Str] declares and unwraps" {
+    let x: U16 = 65000
+    let r: Result[U16, Str] = Ok(x)
+    assert_eq(r.unwrap(), x)
+}
+
+test "Result[U32, Str] declares and unwraps" {
+    let x: U32 = 4000000000
+    let r: Result[U32, Str] = Ok(x)
+    assert_eq(r.unwrap(), x)
+}
+
+// Above 2^63: the carrier member must be `uint64_t`, not the `int64_t` the wrongly-named
+// `blink_Result_int_str` carries. Round-tripping this value is what distinguishes "the typedef
+// now exists" from "the typedef now exists and holds the right width".
+test "Result[U64, Str] round-trips a value above 2^63" {
+    let x: U64 = 18446744073709551615
+    let r: Result[U64, Str] = Ok(x)
+    assert_eq(r.unwrap(), x)
+}
+
+test "Result[I8, Str] declares and unwraps a negative value" {
+    let x: I8 = -128
+    let r: Result[I8, Str] = Ok(x)
+    assert_eq(r.unwrap(), x)
+}
+
+test "Result[I16, Str] declares and unwraps a negative value" {
+    let x: I16 = -32768
+    let r: Result[I16, Str] = Ok(x)
+    assert_eq(r.unwrap(), x)
+}
+
+test "Result[I32, Str] declares and unwraps a negative value" {
+    let x: I32 = -2147483648
+    let r: Result[I32, Str] = Ok(x)
+    assert_eq(r.unwrap(), x)
+}
+
+test "Result[Char, Str] declares and unwraps" {
+    let x: Char = 'q'
+    let r: Result[Char, Str] = Ok(x)
+    assert_eq(r.unwrap(), x)
+}
+
+// The Err side of a lost ok type: the carrier is one typedef, so the Err arm needs it too, and
+// it is a separate emit path (`emit_err_result`) from the Ok arm.
+test "the Err arm of a sized-int Result works too" {
+    let r: Result[U64, Str] = Err("nope")
+    assert(r.is_err())
+    assert_eq(r.unwrap_err(), "nope")
+}
+
+// A sized int in the ERR position, which is the other half of the key and decodes through the
+// same ladder.
+test "a sized int in the Err position works" {
+    let e: U32 = 404
+    let r: Result[Str, U32] = Err(e)
+    assert_eq(r.unwrap_err(), e)
+}
+
+// ── Regression pins ──────────────────────────────────────────────────────────────────
+
+test "Result[Int, Str] still works" {
+    let r: Result[Int, Str] = Ok(-7)
+    assert_eq(r.unwrap(), -7)
+}
+
+test "Result[Bool, Str] still works" {
+    let r: Result[Bool, Str] = Ok(true)
+    assert_eq(r.unwrap(), true)
+}
+
+test "Result[Float, Str] still works" {
+    let r: Result[Float, Str] = Ok(1.5)
+    assert_eq(r.unwrap(), 1.5)
+}
+
+// CT_STRUCT is past the ladder's end but routes through the struct-carrier registry instead.
+// This row holds that separation: a fix that redirects struct oks into the scalar registry
+// would spell `blink_Result_struct_str` and fail here.
+type Pt {
+    x: Int
+}
+
+test "a struct ok type still routes through the struct carrier" {
+    let r: Result[Pt, Str] = Ok(Pt { x: 3 })
+    assert_eq(r.unwrap().x, 3)
+}
+
+test "Result[List[Int], Str] still works" {
+    let l: List[Int] = [1, 2]
+    let r: Result[List[Int], Str] = Ok(l)
+    assert_eq(r.unwrap().len(), 2)
+}
