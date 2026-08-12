@@ -7084,6 +7084,14 @@ let mut nr_impl_type_names: List[Str] = []
 let mut nr_impl_method_names: List[Str] = []
 let mut nr_callable_field_names: List[Str] = []
 
+// br 2cp4qn. `with X as ctx` does not always bind X: for a BlockHandler the binder is what
+// `enter()` returns, i.e. the impl's `type Context`. Resource type name -> Context type name,
+// filled from the same impl walk that fills the method registry below, since that loop already
+// holds both the impl node and its trait name. The Context is kept as a NAME and resolved to a
+// tid on demand — this registry is written in Phase 1, and a struct declared after the impl is
+// not interned yet.
+let mut nr_bh_context: Map[Str, Str] = Map()
+
 fn is_callable_field_name(name: Str) -> Int {
     let mut i = 0
     while i < nr_callable_field_names.len() {
@@ -7124,6 +7132,7 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repor
     nr_warn_unused = 1
     nr_impl_type_names = []
     nr_impl_method_names = []
+    nr_bh_context = Map()
     nr_private_imports = Map()
     nr_name_source_module = Map()
     nr_push_scope()
@@ -7364,6 +7373,19 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repor
             if node_trait_name(im) == "Display" {
                 nr_impl_type_names.push(impl_type)
                 nr_impl_method_names.push("display")
+            }
+            if node_trait_name(im) == "BlockHandler" {
+                let ctx_sl = node_assoc_types(im)
+                if ctx_sl != -1 {
+                    let mut ai = 0
+                    while ai < sublist_length(ctx_sl) {
+                        let at_node = sublist_get(ctx_sl, ai)
+                        if node_name(at_node) == "Context" {
+                            nr_bh_context.insert(impl_type, node_type_name(at_node))
+                        }
+                        ai = ai + 1
+                    }
+                }
             }
             i = i + 1
         }
@@ -11265,14 +11287,47 @@ fn tc_check_match_exhaustive(node: Int, scrut_tid: Int, arms_sl: Int) ! TypeChec
 //
 // An unresolvable resource binds TYPE_UNKNOWN, i.e. exactly what it bound before — which is
 // what keeps `ffi.scope()` (not a Blink type at all) working unchanged.
+// What `with <resource> as name` actually binds — br 2cp4qn. Usually the resource itself, but a
+// BlockHandler rebinds: the block sees `enter()`'s result, whose type the impl declares as
+// `type Context`. Both phases used to bind the resource unconditionally, and because the two types
+// share nothing but a position, a field read resolved against the wrong one — including silently,
+// when both types spell the same field name at different types.
+//
+// Conservative by construction: anything this cannot answer — a non-nominal resource, an impl with
+// no Context, a Context naming a type that does not resolve (a typevar on a generic handler) — falls
+// back to the resource tid, which is exactly what every caller got before.
+fn tc_with_binder_tid(res_tid: Int) -> Int ! TypeCheck.Resolve {
+    let rname = tc_tid_struct(res_tid)
+    if rname == "" { return res_tid }
+    let ctx_name = nr_bh_context.get(rname) ?? ""
+    if ctx_name == "" { return res_tid }
+    // `type Context = Void` is the shape both stdlib handlers use (db_sqlite's Transaction,
+    // testing's Cleanup): enter() returns nothing, so the handler does not rebind and the form is
+    // `with sqlite_transaction(h) { ... }` with no `as` at all. Nothing to swap in.
+    if ctx_name == "Void" { return res_tid }
+    let ctx_tid = resolve_type_name(ctx_name)
+    if ctx_tid < 0 { return res_tid }
+    // A generic handler's `type Context = T` resolves to a typevar outside the binding instance.
+    // Swapping a concrete resource tid for an unbound one trades a wrong answer for no answer, which
+    // is worse for every downstream consumer. No generic BlockHandler impl exists in-tree yet, so
+    // this guards the shape rather than a live case.
+    let ctx_kind = tc_tid_kind(ctx_tid)
+    if ctx_kind == TyKind.Typevar || ctx_kind == TyKind.Unknown { return res_tid }
+    ctx_tid
+}
+
 fn tc_bind_with_resource(item: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let res_expr = node_value(item)
     tc_check_body(res_expr)
     let res_tid = infer_type(res_expr)
-    if item < tc_node_tid.len() && res_tid != TYPE_UNKNOWN {
-        tc_node_tid.set(item, res_tid)
+    let bind_tid = tc_with_binder_tid(res_tid)
+    // The node's tid is the BINDER's type, not the resource expression's: codegen's only consumer
+    // reads it to stamp the binder's ScopeVar, so keeping the resource type here would just move
+    // the same wrong answer one phase later.
+    if item < tc_node_tid.len() && bind_tid != TYPE_UNKNOWN {
+        tc_node_tid.set(item, bind_tid)
     }
-    nr_define_typed(node_name(item), 0, res_tid)
+    nr_define_typed(node_name(item), 0, bind_tid)
 }
 
 // Block branch genuinely save/restores scope via nr_push_scope/nr_pop_scope;

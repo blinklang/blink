@@ -1,0 +1,167 @@
+// br 2cp4qn: the `with X as ctx` binder was typed as the RESOURCE, not as what the block actually
+// binds. For a `Closeable` resource those are the same type and everything agreed; for a
+// `BlockHandler` they are different — the binder is whatever `enter()` returns, i.e. the impl's
+// `type Context` — and both phases got it wrong in the same direction:
+//
+//   typecheck.bl  tc_bind_with_resource  nr_define_typed(node_name(item), 0, res_tid)
+//   codegen_stmt  emit_with_block_core   set_var_ty(binding, tc_lookup_node_tid(item))
+//
+// The census for br 7xgbh6 surfaced this as 26 diverge rows reading `tid=Conn flat=Tx`, and it is the
+// only site in that census where the TID is the wrong side: codegen's flat fields carry the Context
+// (emit_bh_setup registers it at codegen_stmt.bl:4856), so the emitted C is right and the tid is not.
+//
+// It is NOT latent. The ticket called it harmless-until-Stage-3 and measuring it proved otherwise:
+// when the two types share a field name with different types, typecheck resolves the field against
+// the resource and accepts an annotation the value does not satisfy, so a variable annotated `Int`
+// holds a `Str` and prints it with no diagnostic and no cc error.
+
+import std.process.{ProcessResult}
+
+// The resource and the Context share the field NAME and disagree on its TYPE. That is what turns a
+// wrong binder type from a wrong spelling into a wrong value: any pair of distinct field names would
+// merely fail open into a cc escape, which `Tx { tag }` + `t.id` already does on a plain struct with
+// no with-block involved (a separate pre-existing gap, not this ticket's).
+let MISCOMPILE_SRC: Str = #"type Conn { tag: Int }
+type Tx { tag: Str }
+
+impl BlockHandler for Conn {
+    type Context = Tx
+    fn enter(self) -> Tx { Tx { tag: "ctx" } }
+    fn exit(self, _ok: Bool) { }
+}
+
+fn main() {
+    with Conn { tag: 7 } as ctx {
+        let v: Int = ctx.tag
+        io.println("{v}")
+    }
+}
+"#
+
+// Same impl, read the way the spec intends: the Context's own field, at the Context's own type.
+let CORRECT_SRC: Str = #"type Conn { id: Int }
+type Tx { tag: Str }
+
+impl BlockHandler for Conn {
+    type Context = Tx
+    fn enter(self) -> Tx { Tx { tag: "t" } }
+    fn exit(self, _ok: Bool) { }
+}
+
+fn main() {
+    with Conn { id: 1 } as ctx {
+        let s: Str = ctx.tag
+        io.println("{s}")
+    }
+}
+"#
+
+// Control for the other with-block shape. A Closeable binder IS the resource, so this one must keep
+// reporting the resource's type — the fix must not swap the type for every with-block, only for the
+// handlers that rebind.
+let CLOSEABLE_SRC: Str = #"type Res { tag: Str }
+
+impl Closeable for Res {
+    fn close(self) { io.println("close {self.tag}") }
+}
+
+fn main() {
+    with Res { tag: "A" } as r {
+        io.println("open {r.tag}")
+    }
+}
+"#
+
+fn probe_path() -> Str { "build/2cp4qn_probe.bl" }
+
+fn run_tydiv(src: Str) -> ProcessResult {
+    write_file(probe_path(), src)
+    let r = process_run("sh", ["-c", "env BLINK_TRACE_CHANNELS=tydiv build/blinkc {probe_path()} build/2cp4qn_probe.c 2>&1"])
+    fs.remove(probe_path())
+    r
+}
+
+fn have_blinkc() -> Bool {
+    file_exists("build/blinkc") == 1
+}
+
+fn have_cli() -> Bool {
+    file_exists("build/blink") == 1
+}
+
+test "a wrong-typed read through the with-binder is rejected" {
+    if !have_blinkc() {
+        skip("build/blinkc is not present in this working tree")
+        return
+    }
+    let r = run_tydiv(MISCOMPILE_SRC)
+    assert_eq(r.exit_code, 0)
+    // `ctx` is a Tx, so `ctx.tag` is a Str and the `Int` annotation cannot hold it. Before the fix
+    // typecheck resolved `tag` on Conn, called it an Int, and let the program through.
+    assert(r.out.contains("error[TypeError]"))
+    assert(r.out.contains("declared type Int but got Str"))
+}
+
+test "the wrong-typed read does not reach a running binary" {
+    if !have_cli() {
+        skip("build/blink is not present in this working tree")
+        return
+    }
+    write_file(probe_path(), MISCOMPILE_SRC)
+    let r = process_run("sh", ["-c", "build/blink run {probe_path()} 2>&1"])
+    fs.remove(probe_path())
+    // The pre-fix behaviour was not a diagnostic and not a cc failure: it printed `ctx`, the Str
+    // value, out of a variable annotated Int. Asserting on the absence of that output is what
+    // separates this from a merely-noisier compiler.
+    assert(!r.out.contains("ctx\n"))
+    assert(r.out.contains("error"))
+}
+
+test "the with-binder carries the BlockHandler Context tid, not the resource tid" {
+    if !have_blinkc() {
+        skip("build/blinkc is not present in this working tree")
+        return
+    }
+    let r = run_tydiv(CORRECT_SRC)
+    assert_eq(r.exit_code, 0)
+    assert(!r.out.contains("error["))
+    // The census row this ticket was filed from, verbatim. Its absence is the fix.
+    assert(!r.out.contains("var=ctx tid=Conn flat=Tx"))
+    // And the site must still be measured — a tap silenced by never stamping would also drop the row.
+    let mut saw_site = false
+    for line in r.out.split("\n") {
+        if line.contains("summary with_resource.bind") { saw_site = true }
+    }
+    assert(saw_site)
+}
+
+test "the Context-typed read compiles and runs" {
+    if !have_cli() {
+        skip("build/blink is not present in this working tree")
+        return
+    }
+    write_file(probe_path(), CORRECT_SRC)
+    let r = process_run("sh", ["-c", "build/blink run {probe_path()} 2>&1"])
+    fs.remove(probe_path())
+    assert(!r.out.contains("error"))
+    assert(r.out.contains("t"))
+}
+
+test "a Closeable binder still reports the resource type" {
+    if !have_blinkc() {
+        skip("build/blinkc is not present in this working tree")
+        return
+    }
+    let r = run_tydiv(CLOSEABLE_SRC)
+    assert_eq(r.exit_code, 0)
+    assert(!r.out.contains("error["))
+    // Nothing rebinds here, so the two representations agree and no per-occurrence row is written.
+    // Rows are emitted for `missing` and `diverge` only, so this asserts on the summary.
+    let mut saw_clean = false
+    for line in r.out.split("\n") {
+        if line.contains("summary with_resource.bind") {
+            if line.contains("diverge=0") && line.contains("missing=0") { saw_clean = true }
+        }
+    }
+    assert(saw_clean)
+}

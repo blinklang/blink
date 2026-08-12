@@ -5982,6 +5982,144 @@ missing bucket is that ticket's corpus-wide size.
 exit 0 with 676/676 test files and fmt 1572 passed / 0 failed.
 
 
+## The one cell where the tid was the wrong side (br `2cp4qn`)
+
+Taken next because the census found it, which is the whole argument for having built the census: the
+row was not remarkable — 26 of 33328 — and reading it was.
+
+`with <resource> as name` does not always bind the resource. For a `Closeable` it does, which is why
+this held for as long as it did. For a `BlockHandler` the block sees what `enter()` returns, whose type
+the impl declares as `type Context`. Both phases bound the resource unconditionally:
+
+| phase | site | what it bound |
+| --- | --- | --- |
+| typecheck | `tc_bind_with_resource` | `nr_define_typed(node_name(item), 0, res_tid)` |
+| codegen | `emit_with_block_core` | `set_var_ty(binding, tc_lookup_node_tid(item))` |
+
+**The severity in the ticket was wrong, and probing is what corrected it.** The ticket said harmless
+today because the flat fields govern. The flat fields *are* right — `emit_bh_setup` registers the
+binder with the Context type — so the emitted C is correct and nothing looked broken. But typecheck
+resolves field reads against the type bound to the *name*, and that was the resource:
+
+| probe | result | what it establishes |
+| --- | --- | --- |
+| `ctx.id` in an interpolation (resource-only field) | prints `<value>` | **not** decisive — `ctx.nope`, absent from *both* types, also prints `<value>`. That is the generic interpolation fail-open, not this defect. |
+| `let bad: Int = ctx.id` | escapes to `cc`: `'blink_Tx' has no member named 'id'` | typecheck admitted a resource-only field |
+| `let bad: Str = ctx.id` | `error[TypeError]: declared type Str but got Int` | **decisive** — not fail-open. Typecheck *positively believed* `ctx` was a `Conn` and resolved `Conn.id` to `Int`. |
+| `Conn { tag: Int }` + `Tx { tag: Str }`, `let v: Int = ctx.tag` | prints `ctx` | **silent miscompile.** A variable annotated `Int` holds a `Str`. |
+
+The last row is the ticket's real severity and it needed the field *name* to collide: distinct names
+only ever produce a `cc` escape, a shared name at differing types produces a wrong **value**, with no
+diagnostic and no `cc` error. So the fix belongs on the typecheck side — fixing only codegen's stamp
+would have left every one of those four rows exactly as it was.
+
+**The comment above the stamp was also wrong**, and it is worth recording because it is the kind of
+error that hides a defect for a release. It read *"a no-op on the BlockHandler path, where `set_var_ty`
+finds no scope var to stamp."* `emit_bh_setup` registers the binder fifteen lines earlier
+(`codegen_stmt.bl:4856`, `set_var` + `set_var_struct` with the Context type), so the stamp landed and
+overwrote the correct Context with the resource. A comment asserting a no-op is a claim, and this one
+was never measured.
+
+**The fix names one concept once.** `nr_bh_context` maps resource type name → Context type name, filled
+in the same Phase-1 impl walk that already fills the method registry (that loop holds both the impl node
+and its trait name). The Context is stored as a *name* and resolved to a tid on demand, because Phase 1
+runs before a struct declared after the impl is interned. `tc_with_binder_tid(res_tid)` answers "what
+does `with <resource> as name` bind", and is conservative by construction: a non-nominal resource, an
+impl with no Context, or a Context naming a type that does not resolve all fall back to the resource
+tid — exactly what every caller got before. `tc_bind_with_resource` then publishes the **binder's** tid
+on the node rather than the resource's, and codegen needed no change at all beyond the corrected
+comment, because its one consumer reads that node.
+
+**The staleness guard caught the new registry, which is worth recording as a working net.**
+`tests/test_reset_staleness.bl` asserts every mutable global in `typecheck.bl` is either reset in
+`init_types()` or explicitly allowlisted, and `task ci` failed on exactly that — `1 variable(s) not in
+init_types() or allowlist: nr_bh_context` — with 676/677 otherwise green. `nr_bh_context` belongs in the
+allowlist beside `nr_impl_type_names` and `nr_impl_method_names` for the same reason they are there: all
+three are filled by one Phase-1 impl walk and cleared together at the top of `resolve_names`, so they
+are per-pass by construction. A cross-compilation leak here would have been a real defect (one file's
+handler Contexts visible to the next), and the guard is what makes that a caught error rather than a
+future ticket.
+
+**`Context = Void` is a fall-back, not a carve-out.** Both stdlib `BlockHandler` impls declare it —
+`db_sqlite`'s `Transaction` and `testing`'s `Cleanup` — because `enter()` returns nothing and the form
+is `with sqlite_transaction(h) { … }` with no `as` clause at all. A `Void` Context rebinds nothing, so
+`tc_with_binder_tid` returns the resource tid for it and every existing stdlib user is bit-identical.
+That the *other* spelling is broken is a separate defect, filed rather than papered over: `with X as
+name` on a `Void` Context emits `void name = enter(…)`, which is not valid C, and `emit_bh_setup`'s
+guard admits it because it tests whether the assoc type is *named* and `"Void"` is a name (br `ybw41a`).
+
+**Two witnesses were already in the tree and both passed for the wrong reason.**
+`tests/test_block_handler.bl` runs `with make_timer(..) as elapsed { assert_eq(elapsed, 0) }` where
+`Timer`'s Context is `Int`, and `with make_conn(2) as tx { tx.conn_id }` where `Connection`'s Context is
+`Transaction`. Before the fix `elapsed` was typed `Timer`, so `assert_eq(elapsed, 0)` compared a struct
+against `0` and passed anyway. Those tests pass either way, which is exactly why the defect survived —
+a test that passes for the wrong reason is not coverage, and `feedback_self_host_doesnt_catch_user_
+codegen_bugs` is the same lesson one level up.
+
+Byproducts: `ybw41a` above, and `25e2wr` — a **false positive** found writing `ybw41a`'s MVCE: a bare
+`fn enter(self)` is rejected against a trait method declared `-> Void`, because the contract check
+compares return-type *spellings* and `''` is not `'Void'`. Asymmetric inside a single impl: `exit`'s
+trait signature is bare, so only `enter` fails.
+
+`tests/test_2cp4qn_with_resource_context_tid.bl`, 5 tests, RED first in three distinct ways — no
+`TypeError`, the miscompiled `ctx` output, and the census row `var=ctx tid=Conn flat=Tx` — with two
+controls green from the start: a Context-typed read already worked, and a `Closeable` binder already
+agreed. The `Closeable` control is the one that bounds the change, asserting the type is swapped only
+for handlers that actually rebind. `task regen` at fixed point, `task ci` exit 0.
+
+**One guard is forward-looking and says so.** A generic handler's `type Context = T` resolves to a
+typevar outside the binding instance, and swapping a concrete resource tid for an unbound one trades a
+wrong answer for *no* answer, which is worse for every downstream consumer. `tc_with_binder_tid` therefore
+falls back to the resource tid on `TyKind.Typevar` and `TyKind.Unknown`. No generic `BlockHandler` impl
+exists in the tree, so this guards a shape rather than a live case — recorded here so it is not later
+read as a fix for something that was measured.
+
+### The site did not reach 0, and the survivor is the *other* side
+
+On the 960-file intersected basis, `with_resource.bind` went **26 rows / 8 cells → 11 rows / 1 cell**,
+with **zero new cells anywhere in the corpus**. The seven that closed are every cell where the tid was
+wrong: `tid=Timer flat=Int`, `tid=Connection flat=Transaction`, `tid=ApTx`/`CtxTx`/`Inner`/`Outer`/`Probe`
+`flat=Int`. The prediction that the site would reach 0 was wrong, and the survivor is worth more than the
+seven:
+
+    site=with_resource.bind  tid=Connection flat=Int   × 11
+
+Here the **tid is right and the flat is wrong** — the inverse of the ticket. All 11 rows are the
+`with <expr>? as name` form, and probing found the flat pair internally inconsistent: `ctype=CT_INT`
+alongside `sname=Conn`. The struct *name* being right is why it hid — field reads, method calls, passing
+the binder as an argument, a plain copy and the Display gate all behave, and the emitted declaration is
+correct because `c_decl` comes from `c_type_c_name(res_struct)`. Only a consumer that dispatches on the
+**ctype** breaks, and then it breaks hard:
+
+    let l: List[Conn] = [c]
+    →  error: aggregate value used where an integer was expected
+           blink_list_push(_l1, (void*)(intptr_t)c);
+
+**And it is not a `with` bug at all.** The same list literal fails identically after a plain
+`let c = connect()?`, and passes with the `?` removed in both shapes. So the cause is whatever publishes
+`expr_result_type` for the Try expression; the with-resource binder merely inherits it at
+`set_var(binding, res_type, 0)`. The census names both binding sites with one signature, third row
+included:
+
+    site=emit_let_binding.decl  var=c  tid=Conn        flat=Int
+    site=with_resource.bind     var=c  tid=Conn        flat=Int
+    site=emit_let_binding.decl  var=l  tid=List[Conn]  flat=List[Void]   ← the erasure cascading
+
+The third row *is* the `cc` error: the list erased its element because its source variable claimed to be
+an `Int`. Filed as br `8nqdx4` with the plain-`let` MVCE, since that is the smaller reproduction and
+fixing the publisher covers both sites. The three tests that carry those 11 rows
+(`test_schfpd_with_qmark_binding.bl`, `test_fmt_iife_with_block.bl`,
+`test_promote_fwd_decl_ordering.bl`) pass today only because none of them puts the binder in a container.
+
+**The counter is not monotone under its own fixes.** Corpus diverge rows went 33328 → **33348**, up 20,
+while the defect was being removed: −15 from the fix and **+35 from the fix's own source**. Every one of
+those 35 is `var=ctx_kind tid=TyKind flat=Int at=typecheck:11314`, the new guard's own `let`, counted once
+per compiler-linking file in the corpus, landing on the already-documented family-D enum-let cell — which
+is why cells did not move. Stage 3's exit criterion is stated as "the counter at 0", and this is the
+arithmetic that criterion has to survive: writing compiler source *adds rows*, so the honest reading of
+progress is **cells**, per site, on a fixed basis. Rows measure how much of the corpus links the
+compiler.
+
 ## Appendix — all 428 shape cells
 
 Format: `family | occurrences | tid | flat`.
