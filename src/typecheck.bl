@@ -1025,6 +1025,95 @@ fn tc_tid_has_unbound_metavar(tid0: Int) -> Int {
     0
 }
 
+// Does `tid` carry the shared TYPE_UNKNOWN HOLE anywhere in its structure? The third member
+// of this family, and the one a gate written `tid == TYPE_UNKNOWN` cannot express: `List[?]`
+// is not TYPE_UNKNOWN, so a partially erased answer counted as an answer and the bfq7nf
+// recovery below never ran on it (br gmb211).
+//
+// An unbound metavar is deliberately NOT a hole here. α and `?` are both "not concrete yet",
+// but α is solvable — by a later use, an argument unify, or monomorphization — so replacing
+// `List[α]` with a concrete memo would PIN it, which is the lossy direction sskpk8's pin gates
+// refuse. tc_is_unbound_metavar already excludes the TYPE_UNKNOWN singleton, so the two
+// predicates partition the two kinds of emptiness rather than overlapping.
+pub fn tc_tid_has_unknown(tid0: Int) -> Int {
+    let tid = tc_resolve(tid0)
+    if tid == TYPE_UNKNOWN { return 1 }
+    if tid < 0 || tid >= ty_pool.len() { return 0 }
+    let e = ty_pool.get(tid).unwrap()
+    let k = e.kind
+    if k == TyKind.List || k == TyKind.Option || k == TyKind.Set {
+        return tc_tid_has_unknown(e.inner1)
+    }
+    if k == TyKind.Result || k == TyKind.Map {
+        if tc_tid_has_unknown(e.inner1) != 0 { return 1 }
+        return tc_tid_has_unknown(e.inner2)
+    }
+    if k == TyKind.Tuple || k == TyKind.Struct || k == TyKind.Enum {
+        let mut i = 0
+        while i < e.params_count {
+            let c = ty_param_list.get(e.params_start + i).unwrap()
+            if tc_tid_has_unknown(c) != 0 { return 1 }
+            i = i + 1
+        }
+        return 0
+    }
+    0
+}
+
+// Fill the HOLES in `base` from the same positions in `src`, position by position, and change
+// nothing else. The recovery's take rule (br gmb211): `Result[?, ?]` recovered against a memo
+// of `Result[Str, ?]` must become `Result[Str, ?]` — an all-or-nothing "take the memo only if
+// it has no hole" rule would refuse it and leave BOTH sides erased, and `Ok(p)` genuinely
+// cannot know its error type, so a residual hole is the correct answer there, not a reason to
+// decline. Parity with the ordinary path is the bar: `let a = Ok("v")` outside a block infers
+// `Result[Str, ?]`, so the same value inside one must not do worse.
+//
+// Three invariants, each load-bearing:
+//   • A concrete position is NEVER overwritten — only a `?` is filled, so this can only add
+//     information. That is what makes it safe to run after a compare-free inference.
+//   • An unbound metavar is never pinned. tc_tid_has_unknown answers 0 for α, so `Map[α, ?]`
+//     against `Map[Str, Int]` yields `Map[α, Int]` and α stays solvable (sskpk8).
+//   • Differing kinds return `base` untouched: this is a recovery, not a unifier, and it must
+//     never turn a mismatch into agreement.
+// Struct/enum instance params are deliberately left alone — their tids are built by the
+// generic-instance machinery (tc_*_instance_tid) and reconstructing one here would duplicate
+// that path rather than read it.
+fn tc_tid_fill_unknowns(base0: Int, src0: Int) -> Int {
+    let base = tc_resolve(base0)
+    let src = tc_resolve(src0)
+    if base == src { return base }
+    if src == TYPE_UNKNOWN { return base }
+    if base == TYPE_UNKNOWN { return src }
+    if base < 0 || base >= ty_pool.len() { return base }
+    if src < 0 || src >= ty_pool.len() { return base }
+    if tc_tid_has_unknown(base) == 0 { return base }
+    let eb = ty_pool.get(base).unwrap()
+    let es = ty_pool.get(src).unwrap()
+    if eb.kind != es.kind { return base }
+    if eb.kind == TyKind.List { return make_list_type(tc_tid_fill_unknowns(eb.inner1, es.inner1)) }
+    if eb.kind == TyKind.Option { return make_option_type(tc_tid_fill_unknowns(eb.inner1, es.inner1)) }
+    if eb.kind == TyKind.Set { return make_set_type(tc_tid_fill_unknowns(eb.inner1, es.inner1)) }
+    if eb.kind == TyKind.Result {
+        return make_result_type(tc_tid_fill_unknowns(eb.inner1, es.inner1), tc_tid_fill_unknowns(eb.inner2, es.inner2))
+    }
+    if eb.kind == TyKind.Map {
+        return make_map_type(tc_tid_fill_unknowns(eb.inner1, es.inner1), tc_tid_fill_unknowns(eb.inner2, es.inner2))
+    }
+    if eb.kind == TyKind.Tuple {
+        if eb.params_count != es.params_count { return base }
+        let mut filled: List[Int] = []
+        let mut i = 0
+        while i < eb.params_count {
+            let bc = ty_param_list.get(eb.params_start + i).unwrap()
+            let sc = ty_param_list.get(es.params_start + i).unwrap()
+            filled.push(tc_tid_fill_unknowns(bc, sc))
+            i = i + 1
+        }
+        return make_tuple_type(filled)
+    }
+    base
+}
+
 // Does `tid` carry a BARE TYPEVAR anywhere in its structure? The structural twin of
 // tc_tid_has_unbound_metavar above, and deliberately a separate predicate: α and T are both
 // "not concrete yet" but they are not interchangeable, and only one of them is solvable.
@@ -11184,9 +11273,24 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             //
             // Recovery only — it can never overwrite an answer infer_type already gave, so no
             // shape that resolved before now takes a different tid.
-            if inferred_tid == TYPE_UNKNOWN {
+            //
+            // The gate reads "carries a hole", not "IS a hole" (br gmb211). A carrier whose
+            // ELEMENT names the block-local infers as `List[?]` / `Option[?]` / `(?, Int)` —
+            // none of them TYPE_UNKNOWN — so an `== TYPE_UNKNOWN` gate treated a partially
+            // erased answer as an answer and left the element erased, which is a SILENT
+            // miscompile one level down (`let bad: Int = xs.get(0).unwrap()` ran and printed a
+            // Str). The take stays monotone in both cases: a bare UNKNOWN accepts the memo
+            // whole, exactly as before, and a partially erased answer takes only the memo's
+            // answers for the positions it has no answer of its own for.
+            if inferred_tid == TYPE_UNKNOWN || tc_tid_has_unknown(inferred_tid) != 0 {
                 let memo = tc_scoped_value_memo(val, 0)
-                if memo >= 0 && memo != TYPE_UNKNOWN { inferred_tid = memo }
+                if memo >= 0 && memo != TYPE_UNKNOWN {
+                    if inferred_tid == TYPE_UNKNOWN {
+                        inferred_tid = memo
+                    } else {
+                        inferred_tid = tc_tid_fill_unknowns(inferred_tid, memo)
+                    }
+                }
             }
         }
 

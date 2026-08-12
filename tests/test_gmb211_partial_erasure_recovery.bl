@@ -1,0 +1,183 @@
+import compile_test_helpers.{expect_compile_error}
+
+// br gmb211 — the scoped-value recovery is gated on "the inferred type is UNKNOWN", so a
+// PARTIALLY erased answer counted as an answer and the recovery never ran.
+//
+// THE CAUSE, in one line: tc_check_body's LetBinding arm (src/typecheck.bl:11186) reads
+// `if inferred_tid == TYPE_UNKNOWN { .. tc_scoped_value_memo .. }`, and a compound tail value
+// whose ELEMENT names a block-local infers as `List[?]` — which is not `TYPE_UNKNOWN` — so
+// the gate is false, the memo the in-scope walk already wrote is never read, and the erased
+// element stands.
+//
+// It is the same recovery wnbsen extended and a DIFFERENT defect: wnbsen was a missing
+// `IfExpr` arm inside the walk, this is the gate one line above the call. The tail kind is
+// not the axis — a plain block tail, a `match` tail and an `if` tail erase `[p]` identically
+// — the ELEMENT is.
+//
+// Every carrier erases, measured rather than assumed:
+//
+//     { let p = "v"  [p] }          tid=List[?]         flat=List[Str]
+//     { let p = "v"  Some(p) }      tid=Option[?]       flat=Option[Str]
+//     { let p = "v"  Ok(p) }        tid=Result[?, ?]    flat=Result[Str, Str]
+//     { let p = "v"  (p, 1) }       tid=(?, Int)        flat=Tuple2_str_int
+//     { let p = "v"  [[p]] }        tid=List[List[?]]   flat=List[List[Int]]
+//
+// FAIL-OPEN MODES, each reproduced by RUNNING a program:
+//
+//   1. List, `let bad: Int = xs.get(0).unwrap()` — SILENT. Ran, printed `bad=v-a`.
+//   2. Option, `let bad: Int = xs.unwrap()` — SILENT. Ran, printed `bad=v-a`.
+//   3. Tuple, `let bad: Int = t.0` — SILENT. Ran, printed `bad=v-a`.
+//   4. The list element passed to an `Int` PARAMETER — cc escape, no Blink span:
+//      *makes integer from pointer without a cast*.
+//
+// The contrast that isolates the GATE rather than the walk: the same `if` NOT wrapped in a
+// block-`let` is correctly rejected, because there is no block-local for the speculative
+// pass to miss and the ordinary inference answers `List[Str]` on the first try.
+//
+//     let xs = if n == 0 { ["a"] } else { ["b"] }
+//     let bad: Int = xs.get(0).unwrap()      // error[TypeError]: declared Int but got Str
+//
+// THE RULE THE FIX USES, and why it is not "always prefer the memo": the recovery must stay
+// monotone. When the inferred answer is a bare `TYPE_UNKNOWN` any memo is an improvement, as
+// before. When it is PARTIALLY erased the memo is taken only if it carries no hole at all,
+// so a `List[?]` can never be replaced by another `List[?]`. Unbound metavars are
+// deliberately NOT holes for this purpose: `α` is solvable and pinning `List[α]` to a
+// concrete memo is the lossy direction sskpk8 refuses, so `tc_tid_has_unknown` matches the
+// shared `TYPE_UNKNOWN` singleton only — it is the third member of the family beside
+// `tc_tid_has_unbound_metavar` and `tc_tid_has_bare_typevar`, and it recurses the same shape.
+
+// ── The shapes written DIRECTLY into the corpus ──────────────────────────────────────
+//
+// Written directly rather than through compile_and_run so the tydiv divergence instrument
+// can see them (feedback_corpus_sweep_is_not_coverage).
+
+test "a List tail built from a block-local carries its element type" {
+    let n = 0
+    let xs = {
+        let p = "v"
+        if n == 0 { [p.concat("-a")] } else { [p.concat("-b")] }
+    }
+    assert_eq(xs.len(), 1)
+    let first = xs.get(0).unwrap()
+    assert_eq(first, "v-a")
+    // A Str-only method on the ELEMENT, so the element type has to survive the recovery.
+    assert_eq(first.len(), 3)
+}
+
+test "a plain block tail erases the same way and is fixed the same way" {
+    let xs = {
+        let p = "v"
+        [p.concat("-a"), p.concat("-b")]
+    }
+    assert_eq(xs.len(), 2)
+    assert_eq(xs.get(1).unwrap().to_upper(), "V-B")
+}
+
+test "a match tail erases the same way" {
+    let n = 1
+    let xs = {
+        let p = "v"
+        match n {
+            0 => [p.concat("-a")]
+            _ => [p.concat("-b")]
+        }
+    }
+    assert_eq(xs.get(0).unwrap().len(), 3)
+}
+
+test "an Option tail carries its inner type" {
+    let opt = {
+        let p = "v"
+        Some(p.concat("-a"))
+    }
+    assert_eq(opt.is_some(), true)
+    assert_eq(opt.unwrap().len(), 3)
+}
+
+test "a Tuple tail carries its element types" {
+    let t = {
+        let p = "v"
+        (p.concat("-a"), 1)
+    }
+    assert_eq(t.0.len(), 3)
+    assert_eq(t.1, 1)
+}
+
+// Pinned at what the fix reaches, which stops one level short of the value: the recovered tid
+// IS `List[List[Str]]` (the instrument reads it against `flat=List[List[Int]]`), but codegen
+// still fabricates an Int element at depth 2, so reading the inner element out prints the
+// pointer as a number and a Str method on it is error[UnresolvedMethod]. That is br f9hgt9 and
+// it is NOT this ticket: the same defect reproduces on a plain `let ys = [["ab"]]` with no
+// block-`let` anywhere, and it is a class-B cell Stage 3's authority flip subsumes. Asserted on
+// the OUTER list only, so this row is a live pin for the tid half.
+test "a nested List tail recovers the inner element type" {
+    let xs = {
+        let p = "v"
+        [[p.concat("-a")]]
+    }
+    assert_eq(xs.len(), 1)
+    assert_eq(xs.get(0).unwrap().len(), 1)
+}
+
+// ── Regression pins ──────────────────────────────────────────────────────────────────
+
+test "a tail with no block-local was never affected" {
+    let xs = {
+        let _n = 2
+        [1, 2]
+    }
+    assert_eq(xs.len(), 2)
+    assert_eq(xs.get(0).unwrap() + 1, 2)
+}
+
+test "a scalar tail keeps the answer the recovery already gave" {
+    let s = {
+        let p = "v"
+        p.concat("-a")
+    }
+    assert_eq(s.len(), 3)
+}
+
+// ── The declared-type compare (modes 1, 2, 3) ───────────────────────────────────────
+
+fn carrier_src(tail: Str, read: Str) -> Str {
+    "fn go(n: Int) -> Int \{\n    let xs = \{\n        let p = \"v\"\n        {tail}\n    }\n    let bad: Int = {read}\n    io.println(\"bad=\{bad}\")\n    0\n}\nfn main() \{ let _ = go(0) }\n"
+}
+
+test "a Str list element declared Int is rejected" {
+    expect_compile_error(carrier_src("[p.concat(\"-a\")]", "xs.get(0).unwrap()"), "gmb211_list_elem_int", "TypeError")
+}
+
+test "a Str list element from a match tail declared Int is rejected" {
+    let tail = "match n \{\n            0 => [p.concat(\"-a\")]\n            _ => [p.concat(\"-b\")]\n        }"
+    expect_compile_error(carrier_src(tail, "xs.get(0).unwrap()"), "gmb211_match_elem_int", "TypeError")
+}
+
+test "a Str list element from an if tail declared Int is rejected" {
+    let tail = "if n == 0 \{ [p.concat(\"-a\")] } else \{ [p.concat(\"-b\")] }"
+    expect_compile_error(carrier_src(tail, "xs.get(0).unwrap()"), "gmb211_if_elem_int", "TypeError")
+}
+
+test "a Str Option inner declared Int is rejected" {
+    expect_compile_error(carrier_src("Some(p.concat(\"-a\"))", "xs.unwrap()"), "gmb211_option_inner_int", "TypeError")
+}
+
+test "a Str tuple element declared Int is rejected" {
+    expect_compile_error(carrier_src("(p.concat(\"-a\"), 1)", "xs.0"), "gmb211_tuple_elem_int", "TypeError")
+}
+
+// ── The argument check (mode 4) ──────────────────────────────────────────────────────
+
+test "a Str list element passed to an Int parameter is rejected" {
+    let src = "fn takes_int(n: Int) -> Int \{ n + 1 }\nfn go(n: Int) -> Int \{\n    let xs = \{\n        let p = \"v\"\n        [p.concat(\"-a\")]\n    }\n    let r = takes_int(xs.get(0).unwrap())\n    io.println(\"r=\{r}\")\n    0\n}\nfn main() \{ let _ = go(0) }\n"
+    expect_compile_error(src, "gmb211_elem_int_param", "TypeError")
+}
+
+// ── The monotonicity pin ─────────────────────────────────────────────────────────────
+//
+// An Int element must still be an Int element: the widened gate now runs the recovery on
+// shapes that already had a correct-but-complete answer, and it must not disturb them.
+test "an Int list element declared Str is still rejected" {
+    let src = "fn go(n: Int) -> Int \{\n    let xs = \{\n        let q = 5\n        [q + 1]\n    }\n    let bad: Str = xs.get(0).unwrap()\n    io.println(\"bad=\{bad}\")\n    0\n}\nfn main() \{ let _ = go(0) }\n"
+    expect_compile_error(src, "gmb211_int_elem_str", "TypeError")
+}

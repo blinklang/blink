@@ -219,6 +219,13 @@ not Stage 3 work:
 | `cjtxxr` | P2 | *(the largest actionable entry left, and the allow-list shape a **tenth** time)* calling a **closure-typed struct field** — `route.callback(req)`, `srv.error_handler.on_error(req, msg)`, the `handler: fn(Request) -> Response` the spec puts inside `type Route` — was the **last unchecked callable shape in the language**: return type, arity and every argument type failed open together. The closure *variable*, the IIFE, a fn-typed *parameter* and even the same field **hoisted through a `let`** were all already checked, which proved the field's tid was a real `TyKind.Fn` and only the dispatch was missing. `tc_method_resolvable_on_type` clause (d) fail-opened on `is_callable_field_name`, a **global** name list, on the strength of a comment that `nz7drz` had falsified. **Three silent miscompiles** (one propagating into the returned struct's own field access) plus five `cc` escapes. **−12 rows against 11 predicted**, the twelfth being a downstream `let` two lines below a cured producer |
 | `9md3r1` | P2 | *(the six flat-tail enum spellings that were one cause)* a **qualified** struct-style variant literal — `Enum.Variant { field: v }`, the spelling `error[AmbiguousConstruction]` itself tells the user to write — resolved to `TYPE_UNKNOWN`, because `lookup_named_type` strips a dotted name to its **suffix** and the suffix of `Enum.Variant` is the variant, never a type. **Both phases had a mirror-image half**: codegen preferred a **global** variant-name→enum map over the explicit prefix, so `Right.Item { v: 2 }` emitted a `blink_Left` even after typecheck was fixed. **Seven fail-open modes**, including three silent miscompiles (one passing a wrong-nominal-type value to a typed parameter) and one **false positive** — correct code *rejected* with `expects Left, got Item` when an unrelated enum happened to be named like the variant. **−12 rows, exactly as predicted, all `__main__`**; all 12 landed in class B, and root-causing that landing found the Stage-3 hazard below (`tk_to_ct`'s Enum arm targets a dead `CT_ENUM`). Three byproducts filed: `x056sx`, `krwywm`, `5fn53v` |
 | `hgd2az` | P2 | *(the spec's own concurrency primitive, and the fix the divergence counter could not see)* every seam that consumes a `Channel[T]` element — `send`, `recv`, the `for v in ch` drain — read the **flat** `get_var_channel_inner`, and that field was stamped by looking the initializer's emitted **C expression** up as a variable name, which never hits, so **every channel in every program** was `CT_INT`. The `CT_STRING` arms in both consumers were **dead by keying**. **Seven fail-open modes**, including two `cc` escapes, a `Bool` printing as `1`, and **silent data loss**: `(void*)(intptr_t)0` *is* `NULL`, `NULL` is the end-of-stream sentinel, so a drain over a channel whose first value is `0` printed nothing and dropped every value behind it. Fixed by **boxing** — one rule, no per-type cast — with the element type read from the node's tid: codegen's **first consumer of the Stage-1 structural accessors**. Only **−3 rows** (the corpus's three `channel.new[T]` sites), because the corpus had **zero** class-B Channel rows *before* the fix while all seven modes were live — see the caveat below |
+| `nrrs28` | P2 | *(the untyped-receiver shape a **sixth** time)* `Template[C]` was not a type, so the phantom context parameter and all seven methods were unenforceable — **−9 rows**, section below |
+| `ps5br9` | P2 | *(the **last** untyped receiver in the language)* the `ffi.scope()` receiver had no `TyKind` while codegen had carried `CT_FFI_SCOPE` and a four-method emitter since the FFI surface landed — **−5 rows**, and the family-A `tid=? flat=Ptr[Int]` cell is gone. Its residual is a *pointee* cell: **`0dtbe6`**, 238 class-B rows over 20 sites, the largest such population in the corpus |
+| `ta51an` | P2 | *(the spec's own disambiguation form)* `Trait.method(receiver, args)` — §3c's **only** way to disambiguate a method two traits both define — was unchecked in typecheck and mis-resolved in codegen, so a **wrong trait qualifier silently called the other trait's method**. **−1 row**; byproduct `td3yx5` (`type:spec`: `Bool`/`Int` interchange contradicts the 5-0 no-truthiness vote) |
+| `wnbsen` | P2 | *(the last unblocked family-A cause)* `tc_scoped_value_memo` had no `IfExpr` arm, so a block-`let` whose initializer ends in an `if`/`else` built from a block-local had **no type at all** — **−1 row, family A 101 → 100**, section below |
+| `gmb211` | P2 | *(`wnbsen`'s byproduct, one line above it)* the recovery is gated on `inferred_tid == TYPE_UNKNOWN`, so a **partially** erased `List[?]` counted as an answer and the memo was never read. Every carrier erased; three silent miscompiles and a `cc` escape. Class B, so family A holds at **100**; fixed with a hole-only predicate plus a **position-wise** fill that cannot overwrite a concrete position or pin a metavar |
+| `08a267` | P2 | *(the four `tid=List[?]` rows `gmb211` did **not** move)* a list literal whose **first** element is a spread — `[..a]` — infers `List[?]`, because `infer_type`'s ListLit arm takes the element type from element 0 only and has **no `SpreadExpr` arm**. Position is the axis: `["q", ..a]` is correct. A **silent wrong value**, not just a laundered declaration. Flat is right and the tid is wrong, so the authority flip converts it into a hard miscompile |
+| `f9hgt9` | P2 | *(the level `gmb211` stops short of)* an unannotated **nested** list literal — `let ys = [["ab"]]`, no block-`let` anywhere — fabricates an `Int` element at depth 2; the tid is now `List[List[Str]]` and codegen's flat side is `List[List[Int]]`. A class-B cell Stage 3's lowering subsumes |
 
 `k9agr8` gates the *measurement*, not the code: without it Stage 3 can only demonstrate 0
 in archive-linked mode.
@@ -3645,10 +3652,11 @@ never runs, and the erased element stands. Filed as **`gmb211`**, with the contr
 `let xs = if n == 0 { ["a"] } else { ["b"] }` followed by `let bad: Int = xs.get(0).unwrap()` is
 correctly **rejected**, while wrapping the same `if` in a block-`let` makes it compile and print
 `bad=v-a`. It is not the missing arm — a plain block tail and a `match` tail erase `[p]` identically,
-so the axis is the element, not the tail kind — and it wants a `tc_tid_has_unknown` predicate on the
-`tc_tid_has_bare_typevar` model plus a "take the memo only if strictly better" rule. The row is
-pinned **live** in the test (`var=xs tid=List[?] flat=List[Str]`) so it flips to `agree` when
-`gmb211` closes; it is a class-B cell, and Stage 3 turns it from a fail-open into a miscompile.
+so the axis is the element, not the tail kind — and it wanted a `tc_tid_has_unknown` predicate on the
+`tc_tid_has_bare_typevar` model plus a "take the memo only if strictly better" rule. The row was
+pinned **live** in the test (`var=xs tid=List[?] flat=List[Str]`); it is now `agree` — **`gmb211` is
+closed in the section below**, with the "strictly better" rule replaced by a position-wise fill after
+the all-or-nothing form was measured against the ordinary inference path and found to over-decline.
 
 **Attribution, exact.** Family-A rows **101 → 100**, cells 11, and the row that left is
 `tests/test_p9ddps_block_let_str_tail.bl:4` — `var=s tid=? flat=Str`, the one the ranked table listed
@@ -3660,6 +3668,92 @@ cells stay 11 because the departing row shared its `(site, tid=?, flat=Str)` sha
 4 failed before → 13/13 after, with the corpus-direct shapes written **directly** rather than through
 `compile_and_run` so the instrument can see them, and pins for the two neighbours that already worked
 (a `match` tail, `Int`-valued branches) plus the mismatch that must stay rejected.
+
+### gmb211 — the gate one line above the recovery, which read a partial answer as an answer (CLOSED, class B)
+
+**`wnbsen`'s byproduct, and a different defect at a different line.** `wnbsen` was a missing `IfExpr`
+arm *inside* `tc_scoped_value_memo`; this is the **gate on the call to it** (`typecheck.bl:11186`):
+
+    if inferred_tid == TYPE_UNKNOWN { .. tc_scoped_value_memo .. }
+
+A compound tail value whose **element** names a block-local infers as `List[?]` — which is not
+`TYPE_UNKNOWN` — so the gate is false, the memo the in-scope walk already wrote is never read, and the
+erased element stands. **The tail kind is not the axis**: a plain block tail, a `match` tail and an
+`if` tail erase `[p]` identically. The element is.
+
+Every carrier erased, measured rather than assumed:
+
+| tail | before | after |
+|---|---|---|
+| `{ let p = "v"  [p] }` | `tid=List[?]` | `List[Str]` — **agree** |
+| `{ let p = "v"  Some(p) }` | `tid=Option[?]` | `Option[Str]` — **agree** |
+| `{ let p = "v"  Ok(p) }` | `tid=Result[?, ?]` | `Result[Str, ?]` — parity with the ordinary path |
+| `{ let p = "v"  (p, 1) }` | `tid=(?, Int)` | `(Str, Int)`, flat still `Tuple2_str_int` |
+| `{ let p = "v"  [[p]] }` | `tid=List[List[?]]` | `List[List[Str]]`, flat still `List[List[Int]]` |
+
+`Result[Str, ?]` is the **right** answer, not a residual: the ordinary path gives `let a = Ok("v")` the
+same `Result[Str, ?]`, because nothing constrains the error side. Measuring the ordinary path first is
+what stopped the fix from over-reaching here.
+
+**Fail-open modes, each reproduced by running a program:** `let bad: Int = xs.get(0).unwrap()` **silent**,
+ran and printed `bad=v-a`; the same through `Option` (`xs.unwrap()`) and `Tuple` (`t.0`) **silent**, same
+output; and the element passed to an `Int` **parameter** escapes to `cc` with no Blink span —
+*makes integer from pointer without a cast*.
+
+**The contrast that isolates the gate rather than the walk.** The same `if` **not** wrapped in a
+block-`let` is correctly rejected, because there is no block-local for the speculative pass to miss and
+ordinary inference answers `List[Str]` on the first try:
+
+    let xs = if n == 0 { ["a"] } else { ["b"] }
+    let bad: Int = xs.get(0).unwrap()      // error[TypeError]: declared Int but got Str
+
+**The fix is position-wise, and the first version of it was wrong.** An all-or-nothing "take the memo if
+it has no hole" rule left `Ok(p)` at `Result[?, ?]` — the memo has a hole on the error side forever, so
+the rule declined a strictly better answer. The shipped rule is `tc_tid_fill_unknowns(base, src)`: walk
+the two tids together and substitute `src`'s child **only where `base` has a hole**. Three invariants,
+each load-bearing:
+
+- **A concrete position is never overwritten.** So the recovery can only add information.
+- **An unbound metavar is never pinned.** `tc_tid_has_unknown` matches the shared `TYPE_UNKNOWN`
+  singleton and *not* `tc_is_unbound_metavar`, so `List[α]` reports no hole and is left for unification.
+  Pinning α from a memo is the lossy direction `sskpk8` refuses.
+- **Differing kinds return `base` untouched**, so nothing is invented when the two disagree.
+
+`tc_tid_has_unknown` is the third member of the predicate family beside `tc_tid_has_unbound_metavar` and
+`tc_tid_has_bare_typevar`, recursing the same shape. Struct and enum instance params are deliberately
+left alone — their tids belong to the `tc_*_instance_tid` machinery, not to this recovery.
+
+**Attribution, exact, and this is a class-B fix so family A does not move.** Family-A rows hold at
+**100**, cells at **11**; `diverge` 4252 → 4283 and `agree` +372 on the 874-file common basis. The
+**only** signature that changed is `var=k tid=TyKind flat=TyKind` **+31** — one new declaration
+(`let k = e.kind` in `tc_tid_has_unknown`) × the 31 roots that compile `typecheck.bl`, landing in the
+documented `TyKind`-local hazard that `ta51an` recorded and Stage 3's `c_type_from_tid` retires. The
+other 12 new declarations agree: `+372 = 12 × 31`. Nothing else in the corpus moved by one row.
+
+**The four `tid=List[?]` rows that did *not* move are a different cause, now filed.** They are
+`tests/test_spread_list.bl` `var=b/z/w/d`, and they are `[..a]` — a list literal whose **first** element
+is a spread. `infer_type`'s ListLit arm takes the element type from element 0 only and has **no
+`SpreadExpr` arm**, so `..a` reads `TYPE_UNKNOWN`. Filed as **`08a267`**, with the position axis pinned
+(`["q", ..a]` is correct, `[..a, "q"]` is erased) and a **silent wrong value** as the MVCE:
+`let a: List[Option[Str]] = [Some("x")]  let b = [..a]  let bad: Int = b.get(0).unwrap().unwrap()` runs
+and prints `bad=94036413253206`. It is **not** a homogeneity gap — `let b = [1, "x"]` compiles today with
+no spread anywhere. Like `gmb211` it is a Stage 3 **prerequisite** rather than a subsumed cell: the flat
+side is *right* and the tid is *wrong*, so the authority flip converts it from a fail-open into a hard
+miscompile.
+
+**The nested case reached the tid and stopped one level short of the value.** `[[p]]` now recovers
+`List[List[Str]]`, and codegen still fabricates an `Int` element at depth 2 — reading the inner element
+prints the pointer as a number and a `Str` method on it is `error[UnresolvedMethod]`. That is **`f9hgt9`**,
+it reproduces on a plain `let ys = [["ab"]]` with no block-`let` anywhere, and it is a class-B cell Stage
+3's lowering subsumes. The test row asserts the **outer** list only, so it stays a live pin for the tid
+half.
+
+`task regen` + `task ci` green; `task test --force` **676 test files, 676 passed, 0 failed, 0 build
+errors**. Test: `tests/test_gmb211_partial_erasure_recovery.bl`, 15 rows, with the carrier shapes written
+**directly** into the corpus rather than through `compile_and_run` so the instrument can see them
+(`feedback_corpus_sweep_is_not_coverage`), three pins for what already worked (no block-local, a scalar
+tail, a `match` tail) and a **monotonicity** pin — an `Int` element declared `Str` must still be rejected,
+because the widened gate now runs the recovery over shapes that already had a complete answer.
 
 ### Remaining family-A causes, ranked (11 cells / ~~116~~ ~~107~~ ~~102~~ ~~101~~ 100 rows)
 
