@@ -217,6 +217,7 @@ not Stage 3 work:
 | `cttrag` | P2 | *(the ranked top cause inside the compiler's own source, and the entry whose axes were wrong)* a **module-qualified** top-level `let` had no type: `infer_type`'s `FieldAccess` arm had cases for an enum type qualifier, a struct field and a tuple index, and **no fourth for a module qualifier**, so `prov.count` fell off its tail as `TYPE_UNKNOWN` — while the *bare* form inside the declaring module was always typed, because `:11582` had already registered the type the qualified form never read. **Not** container-specific, **not** about `pub`, **not** about crossing a module boundary: two of the ranking row's three axes were wrong. Both halves failed open differently — `let bad: Str = prov.count` compiled, linked and **ran** printing `3`; `want_str(prov.count)` reached `cc` with **no diagnostic at all**. Fixed with a table keyed `"{module}.{name}"` rather than a bare-name `nr_get_type`, because the bare scope is **shadowable** and a wrong type is worse than no type. **−12 rows, exactly as predicted; `incremental` and `file_watcher` both to zero and nothing else moved** |
 | `nxnnxe` | P2 | *(the ranked #1 after `x3x0qj`, and the allow-list-with-nothing-behind-it shape a **fourth** time)* every method `@derive` synthesizes had its **name** affirmed by `tc_method_resolvable_on_type` and **no signature anywhere** — so `to_json` / `from_json` / `clone` / `debug` / `eq` / `cmp` and the str-backed-enum statics all resolved to `TYPE_UNKNOWN`. Both halves failed open: `let bad: Int = u.to_json()` compiled, linked and **ran**, and `User.from_json(42)` escaped to `cc`. Fixed the `qjfwc6` way — **a table, not arms**. **−19 rows, exactly as predicted, and every one of the seven named files went to zero.** Three byproducts filed: `pvhaew`, `bf0jnj`, `169kjt` |
 | `cjtxxr` | P2 | *(the largest actionable entry left, and the allow-list shape a **tenth** time)* calling a **closure-typed struct field** — `route.callback(req)`, `srv.error_handler.on_error(req, msg)`, the `handler: fn(Request) -> Response` the spec puts inside `type Route` — was the **last unchecked callable shape in the language**: return type, arity and every argument type failed open together. The closure *variable*, the IIFE, a fn-typed *parameter* and even the same field **hoisted through a `let`** were all already checked, which proved the field's tid was a real `TyKind.Fn` and only the dispatch was missing. `tc_method_resolvable_on_type` clause (d) fail-opened on `is_callable_field_name`, a **global** name list, on the strength of a comment that `nz7drz` had falsified. **Three silent miscompiles** (one propagating into the returned struct's own field access) plus five `cc` escapes. **−12 rows against 11 predicted**, the twelfth being a downstream `let` two lines below a cured producer |
+| `9md3r1` | P2 | *(the six flat-tail enum spellings that were one cause)* a **qualified** struct-style variant literal — `Enum.Variant { field: v }`, the spelling `error[AmbiguousConstruction]` itself tells the user to write — resolved to `TYPE_UNKNOWN`, because `lookup_named_type` strips a dotted name to its **suffix** and the suffix of `Enum.Variant` is the variant, never a type. **Both phases had a mirror-image half**: codegen preferred a **global** variant-name→enum map over the explicit prefix, so `Right.Item { v: 2 }` emitted a `blink_Left` even after typecheck was fixed. **Seven fail-open modes**, including three silent miscompiles (one passing a wrong-nominal-type value to a typed parameter) and one **false positive** — correct code *rejected* with `expects Left, got Item` when an unrelated enum happened to be named like the variant. **−12 rows, exactly as predicted, all `__main__`**; all 12 landed in class B, and root-causing that landing found the Stage-3 hazard below (`tk_to_ct`'s Enum arm targets a dead `CT_ENUM`). Three byproducts filed: `x056sx`, `krwywm`, `5fn53v` |
 
 `k9agr8` gates the *measurement*, not the code: without it Stage 3 can only demonstrate 0
 in archive-linked mode.
@@ -1426,15 +1427,15 @@ these sweeps, tallied on the **intersection of their file sets** (874 files; the
 do not appear in all of them are listed under the `nz7drz` correction note). `scratchpad/cells.sh`
 takes that allow-list as a required argument.
 
-| | before `nz7drz` | after `nz7drz` | after `bfq7nf` | after `3c4g71` | after `zs7khh` | after `2r96m9` | after `rbd0a4` | after `w13xgb` | after `jzvxav` | after `h3q81d` | after `qjfwc6` | after `w089a0` | after `x3x0qj` | after `nxnnxe` | after `bf0jnj` + `pvhaew` | after `cttrag` | after `n84s1p` | after `jvy35h` | after `rb5wvb` | after `cjtxxr` |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| **total cells** | 423 | 421 | 409 | 407 | 405 | 404 | 404 | 405 | 404 | 402 | 402 | 402 | 403 | 406 | 406 | 406 | 404 | 404 | **403** | **401** |
-| family A (`tid=?`) cells | 84 | 61 | 47 | 45 | 35 | 34 | 34 | 33 | 32 | 28 | 28 | 28 | 26 | 23 | 23 | 23 | 21 | 21 | **20** | **18** |
-| family A rows | 1323 | 1224 | 1190 | 1050 | 1015 | 661 | 504 | 327 | 310 | 261 | 216 | 203 | 193 | 174 | 174 | 162 | 154 | 148 | **143** | **131** |
-| `Fn`-flat `tid=?` cells | 16 | 2 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | **0** | **0** |
-| agree | 362979 | 363711 | 363924 | 364187 | 364289 | 364674 | 364831 | 364883 | 364934 | 365243 | 365505 | 365580 | 365705 | 366051 | 366051 | 366125 | 366133 | 366139 | **366205** | **366248** |
-| diverge rows | 5008 | 5003 | 4976 | 4837 | 4828 | 4474 | 4317 | 4296 | 4279 | 4249 | 4204 | 4191 | 4190 | 4185 | 4185 | 4173 | 4165 | 4190 | **4186** | **4174** |
-| missing | 14 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | **1** | **1** |
+| | before `nz7drz` | after `nz7drz` | after `bfq7nf` | after `3c4g71` | after `zs7khh` | after `2r96m9` | after `rbd0a4` | after `w13xgb` | after `jzvxav` | after `h3q81d` | after `qjfwc6` | after `w089a0` | after `x3x0qj` | after `nxnnxe` | after `bf0jnj` + `pvhaew` | after `cttrag` | after `n84s1p` | after `jvy35h` | after `rb5wvb` | after `cjtxxr` | after `9md3r1` |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| **total cells** | 423 | 421 | 409 | 407 | 405 | 404 | 404 | 405 | 404 | 402 | 402 | 402 | 403 | 406 | 406 | 406 | 404 | 404 | **403** | **401** | **396** |
+| family A (`tid=?`) cells | 84 | 61 | 47 | 45 | 35 | 34 | 34 | 33 | 32 | 28 | 28 | 28 | 26 | 23 | 23 | 23 | 21 | 21 | **20** | **18** | **12** |
+| family A rows | 1323 | 1224 | 1190 | 1050 | 1015 | 661 | 504 | 327 | 310 | 261 | 216 | 203 | 193 | 174 | 174 | 162 | 154 | 148 | **143** | **131** | **119** |
+| `Fn`-flat `tid=?` cells | 16 | 2 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | **0** | **0** | **0** |
+| agree | 362979 | 363711 | 363924 | 364187 | 364289 | 364674 | 364831 | 364883 | 364934 | 365243 | 365505 | 365580 | 365705 | 366051 | 366051 | 366125 | 366133 | 366139 | **366205** | **366248** | **366400** |
+| diverge rows | 5008 | 5003 | 4976 | 4837 | 4828 | 4474 | 4317 | 4296 | 4279 | 4249 | 4204 | 4191 | 4190 | 4185 | 4185 | 4173 | 4165 | 4190 | **4186** | **4174** | **4174** |
+| missing | 14 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | **1** | **1** | **1** |
 
 **`total cells` rose for three sweeps running (402 → 403 → 406) while `family A cells` fell
 (28 → 26 → 23), and that is the campaign turning a corner rather than losing ground.** A family-A
@@ -3035,7 +3036,106 @@ one witnesses `tc_check_call_against_fn_tid`'s argument loop rather than a one-a
 needed changing**, which also says no existing `fn(A) -> B` field declaration in `tests/`, `examples/`,
 `src/` or `lib/` disagreed with how it is called.
 
-### Remaining family-A causes, ranked (18 cells / 131 rows)
+### 9md3r1 — the qualifier was discarded in both phases (CLOSED, −12 rows)
+
+**One line, two phases, six ranking entries.** The flat tail carried six separate family-A entries
+named after their `flat=` spelling — `QueryError` (4 rows), `PgError` (2), `Event` (2), `DbError` (2),
+`Msg` and `Shape` — 12 rows over five files. Six `sed -n '<line>p'` calls, one per entry, showed every
+site to be the same expression: `let x = Enum.Variant { field: v }`, a **qualified struct-style variant
+literal**. Not six causes. One.
+
+**Typecheck's half.** `infer_type_uncached`'s `NodeKind.StructLit` arm reached
+`lookup_named_type(sname)` for a dotted name (`typecheck.bl:1225-1244`), and that function strips a
+dotted name to its **suffix**. For `mod.Type { .. }` — the module-qualified struct literal it was
+written for — the suffix *is* the type name, so it is right. For `Enum.Variant { .. }` the suffix is
+the **variant** name, which is never a type: `E0518` makes a struct named like a variant a
+declaration-time collision, precisely so the two namespaces cannot overlap. So the site inferred
+`TYPE_UNKNOWN`, which unifies with anything.
+
+**Codegen's half, which had to be found separately.** `emit_struct_lit` chose the enum with
+`if resolved_variant != "" { resolved_variant } else { <prefix> }` under the comment *"Prefer the
+resolved enum."* `resolve_variant` is a **global** variant-name → enum map
+(`codegen_types.bl:3868`), first-declared-wins, so for a variant name two enums share it answers the
+wrong one. Fixing typecheck alone left correct code still emitting the wrong C. **Check both phases
+for a mirror-image half** — the two spellings of "discard the qualifier" were written independently
+and neither knew about the other.
+
+**The spec is unambiguous and names the resolution order.** `sections/03_types.md:1040` rule 1: *"if
+the site is already written `Enum.Variant { ... }`, that names the variant directly"*; `:1036` requires
+the bare and qualified spellings to *"emit identical code"*; `:1063`: *"No path ever silently picks a
+winner."* Both halves violated `:1063` in opposite directions — typecheck picked no winner at all,
+codegen picked the wrong one silently.
+
+**Seven fail-open modes, every one reproduced by *running* a program**, and every bare-form control
+erroring correctly — the asymmetry that dated the bug to the lookup rather than to a missing check:
+
+1. **Silent miscompile, cross-enum argument.** `want_left(Right.Item { v: 2 })` compiled, linked and
+   ran, passing a `blink_Right` to a `Left` parameter. The bare `Item { v: 2 }` is correctly rejected.
+2. **Silent miscompile, return position.** `fn f() -> Left { Right.Item { v: 2 } }` likewise.
+3. **Silent miscompile, declared type.** `let e: Other = DbError.Timeout { ms: 5 }` compiled clean;
+   the bare form reports *"declared type Other but got DbError"*.
+4. **False positive — correct code rejected.** With an unrelated enum named like the variant in
+   scope, `Left.Item { v: 9 }` was rejected with *"expects Left, got Item"*. The same discarded
+   qualifier that silently built the wrong enum also **refuses** the right one. A fail-open cause can
+   present as a spurious error, and that direction is often the sharpest MVCE.
+5. **The diagnostic's own remedy was the broken path.** `error[AmbiguousConstruction]` tells the user
+   to *"qualify it (e.g. `SomeEnum.Item { ... }`)"* — and qualifying produced mode 1.
+6. **Wrong C emitted for correct code** (codegen's half): `Right.Item { v: 2 }` emitted a
+   `blink_Left` initializer.
+7. **`cc` escapes** in the generic-enum spellings, where no diagnostic fired at all.
+
+**The fix is one behavior in one regen.** Typecheck resolves the **prefix** as an enum *before*
+falling through to `lookup_named_type(sname)` — which stays, because the module-qualified struct
+literal still needs it — and routes through `tc_enum_structlit_instance_tid` exactly as the bare path
+does, so a generic enum reverse-infers its instance (`Tree[Int]`) and the two spellings stay
+code-identical per `:1036`. The decl node comes from `tc_type_decl_nodes` keyed by the **enum**, not
+from `tc_variant_enum_decl_nodes`, which is first-declared-wins per *variant* name and would have
+reproduced the very confusion being fixed. Codegen makes the **qualifier win**, falling back to the
+global map only when the prefix names no enum carrying the variant — which keeps `mod.Type { .. }`
+falling through to the plain-struct path untouched. A prefix enum that lacks the named variant still
+falls through to `TYPE_UNKNOWN`; that wants an unknown-variant diagnostic which does not exist for
+any of the three variant spellings (`krwywm`).
+
+**Attribution, checked twice.** Family-A rows 131 → 119: −12, exactly the 12 predicted sites, none
+added, all `__main__` (108 → 96), and family-A cells 18 → 12 as all six spellings retired together.
+Total cells 401 → 396. `diverge` was **unchanged** at 4174 and `agree` rose by **152**, and neither
+figure was accepted at face value. A per-cell row-count diff showed all 12 rows converting in place
+to class-B `tid=X flat=X` cells — the rows did not leave `diverge`, they changed family. A per-root
+delta histogram accounted for the +152 exactly: **28 roots × 5 + 3 roots × 4**. The multiplier is
+**per file, not per compiler** — 28 roots compile both `typecheck.bl` and `codegen_expr.bl` and gained
+5 `let`s each, while 3 compile only `typecheck.bl` and gained 4. Earlier sections in this document
+used a single "31 roots compile `typecheck.bl`" figure; measure the histogram instead of assuming one
+multiplier. Zero residue.
+
+**A verified Stage-3 hazard, found by root-causing the class-B landing instead of assuming it.**
+`ty_tp_same_shape` (`typecheck.bl:12392`) compares `tk_to_ct(kind)` against `tp_get_kind(tp)` **before**
+it compares names, and `tk_to_ct` maps `TyKind.Enum => CT_ENUM` (`:12253`). But `type_enum`
+(`codegen_types.bl:166`) is `CT_ENUM`'s **only** tp producer and has **zero callers** — a data enum's
+flat value is always `CT_STRUCT`, stamped by `set_var_struct` at `codegen_expr.bl:6750`. So **every
+enum-typed variable reports class-B divergence by construction**, verified by hand: `let w = Wrap { n: 1 }`
+agrees, `let p = Pay.Item { v: 2 }` diverges `tid=Pay flat=Pay`. Two consequences. Stage 3's
+`c_type_from_tid` **must lower a `TyKind.Enum` tid to the same C form as a struct**, or every enum in
+the corpus changes type. And the dead `CT_ENUM` plus the dead `tk_to_ct` Enum arm are fresh evidence
+for Stage 4's deletion group 1.
+
+**Test.** `tests/test_9md3r1_qualified_variant_structlit.bl`, 11 rows, 8 red before / 11 green after:
+the cross-enum argument and return miscompiles, the declared-type and argument-position mismatches,
+the unrelated-enum-named-like-the-variant row asserted as a **running** program (it was a false
+positive, so the assertion is `left:9` at exit 0), the generic-enum equivalence proved by both
+spellings emitting the identical `(blink_Tree_0Int){.tag = 0, .data.Leaf = {.value = 5}}`, the generic
+wrong-slot rejection, bare/qualified interchangeability, the qualifier selecting between two enums
+sharing a variant name, and two controls: the module-qualified struct literal
+(`testing.Cleanup { action: .. }`) still resolving, and a struct named like a variant staying an
+`E0518` declaration-time collision — which is *why* prefix-first resolution is unambiguous.
+`task regen` + `task ci` green (649 test files, 0 failed; fmt 1518 passed, 0 failed).
+
+**Three byproducts filed, all found while probing and none fixed inline.** `x056sx` — an enum-variant
+struct-lit's field **names and types** are unchecked in *both* spellings. `krwywm` — an unknown
+qualified variant in the unit and tuple spellings silently builds **another enum's** variant. `5fn53v`
+— a generic enum's struct-style variant **pattern** erases its payload binding to `void`, found by
+probing the bare control of the generic row and therefore not caused by this fix.
+
+### Remaining family-A causes, ranked (12 cells / 119 rows)
 
 Re-ranked from the post-`qjfwc6` sweep, by **rows on the 874-file common basis**, grouped by the
 innermost producer (the outermost call is usually a symptom — `.unwrap()` heads many chains, but its
@@ -3128,24 +3228,24 @@ it the pattern also matches inside `flat=`), because the flat spelling and the p
 different questions and disagreeing on which is "the" count is how the Ptr entry once acquired two
 figures:
 
-| module | family-A rows | | after `rb5wvb` | after `jvy35h` | after `n84s1p` | after `cttrag` | after `nxnnxe` | after `x3x0qj` | after `w089a0` | after `qjfwc6` | after `h3q81d` | after `jzvxav` | after `w13xgb` | after `rbd0a4` |
-|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| `__main__` (the root being compiled) | **108** | | **120** | 122 | 125 | 129 | 129 | 148 | 158 | 171 | 174 | 223 | 225 | 237 |
-| `std_libc` | **0** | | **0** | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 165 |
-| `std_net_tcp` | **0** | | **0** | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 40 | 40 | 40 | 40 |
-| `std_db_row` | **0** | | **0** | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 12 | 12 |
-| `cli` | **8** | | **8** | 8 | 11 | 11 | 11 | 11 | 11 | 11 | 11 | 11 | 11 | 11 |
-| `std_db_sqlite` | 9 | | 9 | 9 | 9 | 9 | 9 | 9 | 9 | 9 | 9 | 9 | 9 | 9 |
-| `incremental` / `file_watcher` | **0 each** | | **0 each** | 0 each | 0 each | 0 each | 6 each | 6 each | 6 each | 6 each | 6 each | 6 each | 6 each | 6 each |
-| `lsp` | **0** | | **0** | 0 | 0 | 4 | 4 | 4 | 4 | 4 | 6 | 6 | 6 | 6 |
-| `std_testing` | **0** | | **0** | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 3 | 3 |
-| `std_http_server` / `build_stdlib` | 3 each | | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each |
-| `pkg_resolver` | **0** | | **0** | 3 | 3 | 3 | 3 | 3 | 3 | 3 | 3 | 3 | 3 | 3 |
+| module | family-A rows | | after `cjtxxr` | after `rb5wvb` | after `jvy35h` | after `n84s1p` | after `cttrag` | after `nxnnxe` | after `x3x0qj` | after `w089a0` | after `qjfwc6` | after `h3q81d` | after `jzvxav` | after `w13xgb` | after `rbd0a4` |
+|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `__main__` (the root being compiled) | **96** | | **108** | **120** | 122 | 125 | 129 | 129 | 148 | 158 | 171 | 174 | 223 | 225 | 237 |
+| `std_libc` | **0** | | **0** | **0** | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 165 |
+| `std_net_tcp` | **0** | | **0** | **0** | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 40 | 40 | 40 | 40 |
+| `std_db_row` | **0** | | **0** | **0** | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 12 | 12 |
+| `cli` | **8** | | **8** | **8** | 8 | 11 | 11 | 11 | 11 | 11 | 11 | 11 | 11 | 11 | 11 |
+| `std_db_sqlite` | 9 | | 9 | 9 | 9 | 9 | 9 | 9 | 9 | 9 | 9 | 9 | 9 | 9 | 9 |
+| `incremental` / `file_watcher` | **0 each** | | **0 each** | **0 each** | 0 each | 0 each | 0 each | 6 each | 6 each | 6 each | 6 each | 6 each | 6 each | 6 each | 6 each |
+| `lsp` | **0** | | **0** | **0** | 0 | 0 | 4 | 4 | 4 | 4 | 4 | 6 | 6 | 6 | 6 |
+| `std_testing` | **0** | | **0** | **0** | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 3 | 3 |
+| `std_http_server` / `build_stdlib` | 3 each | | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each |
+| `pkg_resolver` | **0** | | **0** | **0** | 3 | 3 | 3 | 3 | 3 | 3 | 3 | 3 | 3 | 3 | 3 |
 
-**Six consecutive fixes have now landed their whole delta in `__main__` and nowhere else** —
+**Seven consecutive fixes have now landed their whole delta in `__main__` and nowhere else** —
 `w089a0`'s −13 (171 → 158), `x3x0qj`'s −10 (158 → 148), `nxnnxe`'s −19 (148 → 129), `jvy35h`'s −3
-(125 → 122), `rb5wvb`'s −2 (122 → 120, its other 3 rows being `pkg_resolver`'s) and `cjtxxr`'s −12
-(120 → 108). That is the expected shape for a fix to a **declaration site** or to a **syntactic
+(125 → 122), `rb5wvb`'s −2 (122 → 120, its other 3 rows being `pkg_resolver`'s), `cjtxxr`'s −12
+(120 → 108) and `9md3r1`'s −12 (108 → 96). That is the expected shape for a fix to a **declaration site** or to a **syntactic
 form**: a `with ... as` clause, an `fn(..) { .. }()` call, an `@derive`d type and a
 `route.callback(req)` field invocation are all written in the root under compilation, so unlike the
 stdlib causes there is no shared module for the rows to concentrate in. It is also why those
@@ -3245,6 +3345,17 @@ it would have if the group had been larger. Mixing grouping keys in one ranking 
 group every entry by the **producing expression**, and an entry named after a type spelling
 (`flat=QueryError`, `flat=PgError`, `flat=Event`) should be treated as un-triaged until its source line
 has been read.
+
+**That warning was cashed in immediately, and the multiplicity was 6×.** Those three spellings plus
+`flat=DbError`, `flat=Msg` and `flat=Shape` — six separate entries in the flat tail, 12 rows between
+them, spread over five test files — are **one** cause: qualified struct-style variant construction,
+`Enum.Variant { field: v }`. Six `sed -n '<line>p'` calls, one per entry, settled it before any
+probing began; every one of the 12 sites is a `let x = Enum.Variant { .. }`. `9md3r1` closed all
+six at once. **A type spelling is not a cause, and neither is a count of type spellings** — the
+ranking's cell count over-states the amount of work left whenever one producing expression can be
+reached with several different result types, which is exactly what an enum constructor is. Treat the
+remaining flat-tail singletons (`flat=Int` ~35, `flat=Str` ~14, `flat=List[Int]` 6) the same way:
+read the producing line first, and expect fewer causes than entries.
 
 **`cttrag` was picked from that flat tail on a different criterion, and it is the one to keep using:
 the rows sat in the compiler's own source.** A cause inside `src/` can be reproduced, fixed and

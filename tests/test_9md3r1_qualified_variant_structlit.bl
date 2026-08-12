@@ -1,0 +1,270 @@
+// br 9md3r1 — a QUALIFIED struct-style variant construction `Enum.Variant { .. }` threw
+// away the enum qualifier, so the compiler picked a winner by variant name alone.
+//
+// THE CAUSE is one line in infer_type_uncached's StructLit arm (src/typecheck.bl:10100).
+// The qualified branch resolved the site with `lookup_named_type(sname)` passing the WHOLE
+// dotted name, and lookup_named_type (:1225) strips the qualifier and looks up the SUFFIX:
+//
+//     lookup_named_type("Left.Item")  ->  named_type_map.get("Item")
+//
+// For `mod.Type { .. }` — the module-qualified struct literal that lookup was written for —
+// the suffix IS the type, so it works. For `Enum.Variant { .. }` the suffix is the VARIANT
+// name, which is never a type (E0518 makes struct-vs-variant a declaration-time error), so
+// the lookup returns -1, the branch falls through, and the site infers TYPE_UNKNOWN. The
+// prefix — the only thing the spec says names the variant — was never read.
+//
+// THE SPEC IS EXPLICIT, and the failure is exactly what it forbids:
+//   03_types.md:1040 rule 1 — "Qualified — if the site is already written
+//     `Enum.Variant { ... }`, that names the variant directly."
+//   03_types.md:1046 — "The same variant name in two different enums is legal."
+//   03_types.md:1063 — "No path ever silently picks a winner: every collision is either a
+//     declaration-time error (struct vs variant) or a use-site error requiring
+//     qualification."
+//   03_types.md:1036 — bare and qualified "construct the same value and emit identical
+//     code", so the qualified form must be checked as tightly as the bare one.
+//
+// The bare form IS checked, because it returns a real tid (:10131). Every bare control in
+// this file errors correctly today. That asymmetry is what dates the bug to the lookup and
+// not to a missing check: no new inference is added by the fix, only the correct tid.
+//
+// WORST FRAMING: the AmbiguousConstruction diagnostic's own remedy was the broken form.
+// `let b = Item { v: 7 }` correctly reports E0519 "qualify it (e.g. SomeEnum.Item { ... })";
+// doing what it says produced a value of the wrong nominal type, silently.
+//
+// SEVEN fail-open modes, each reproduced with `build/blink run` before this file existed.
+// Three compiled, linked and RAN with the wrong enum; four escaped to cc:
+//
+//   1. `let b = Right.Item { v: 7 }` then `which_left(b)` printed `left:7`. Emitted C:
+//      `const blink_Left b = (blink_Left){.tag = 0, .data.Item = {.v = 7}};`
+//   2. `fn make() -> Left { Right.Item { v: 3 } }` printed `got:3`.
+//   3. `DbError.Nope { x: 1 }`, a variant DbError does not have, built a `blink_Other`.
+//   4. `let x = Left.Item { v: 9 }` with an unrelated enum ALSO named `Item` in scope was
+//      REJECTED — "argument 1 of 'which' expects Left, got Item". The same root cause
+//      pointing the other way: correct code refused because the stripped suffix `Item`
+//      resolved to that enum. This row is the sharpest single proof and stays green after.
+//   5. `let e: Other = DbError.QueryError { .. }` -> cc `invalid initializer`.
+//   6. `takes_other(DbError.QueryError { .. })` -> cc `incompatible type for argument 1`.
+//   7. A generic enum got no instance tid: `let t = Tree.Leaf { value: 5 }` emitted the
+//      unmonomorphized `blink_Tree` -> cc `unknown type name 'blink_Tree'`.
+//
+// Mode 3 is NOT fixed here and must not be: the fix requires the prefix enum to actually
+// HAVE the named variant, so `DbError.Nope { x: 1 }` falls through to TYPE_UNKNOWN exactly
+// as before. Naming a variant the qualified enum does not have needs a diagnostic that does
+// not exist yet (br krwywm) and covers the unit and tuple spellings too.
+//
+// ALSO OUT OF SCOPE (br x056sx): enum-variant struct-lit field NAMES and field TYPES are
+// unchecked in BOTH spellings — `QueryError { sqlstate: 42 }` and `QueryError { bogus: "b" }`
+// both reach cc with a real tid already present. Do not expect this file's fix to catch
+// them, and do not "fix" a red row here by tightening fields.
+//
+// THE EXISTING lookup_named_type(sname) CALL MUST STAY. It is the module-qualified struct
+// literal path. The prefix-as-enum resolution goes BEFORE it, guarded on the prefix being a
+// TyKind.Enum that has the variant, so a module qualifier still falls through untouched —
+// the last two rows pin both directions of that ordering.
+
+import compile_test_helpers
+
+// Two enums sharing a variant name — legal per 03_types.md:1046, and the only shape where
+// the qualifier is load-bearing. `which_left` accepts Left only.
+fn two_enums(body: Str) -> Str {
+    let mut s = "type Left \{ Item \{ v: Int } }\n\n"
+    s = s.concat("type Right \{ Item \{ v: Int } }\n\n")
+    s = s.concat("fn which_left(l: Left) -> Str \{\n")
+    s = s.concat("    match l \{ Left.Item \{ v } => \"left:\{v}\" }\n")
+    s = s.concat("}\n\n")
+    s = s.concat(body)
+    s
+}
+
+// ── modes 1-2: the wrong enum was constructed and the program RAN ──
+
+// The teeth of the file. Before the fix this compiled, linked and printed `left:7`: a Right
+// was requested and a blink_Left was emitted. Asserted on the enum names in the message so
+// an arm answering some other concrete type cannot satisfy it.
+test "a qualified variant of one enum does not pass as another sharing the variant name" {
+    let mut b = "fn main() \{\n"
+    b = b.concat("    let x = Right.Item \{ v: 7 }\n")
+    b = b.concat("    io.println(which_left(x))\n")
+    b = b.concat("}\n")
+    let out = compile_test_helpers.compile_and_capture(two_enums(b), "9md3r1_cross")
+    assert(out.contains("expects Left, got Right"))
+}
+
+// Return position. Printed `got:3` before the fix.
+test "a qualified variant cannot be returned as a different enum" {
+    let mut b = "fn make() -> Left \{\n"
+    b = b.concat("    Right.Item \{ v: 3 }\n")
+    b = b.concat("}\n\n")
+    b = b.concat("fn main() \{\n")
+    b = b.concat("    match make() \{ Left.Item \{ v } => io.println(\"got:\{v}\") }\n")
+    b = b.concat("}\n")
+    compile_test_helpers.expect_compile_error(two_enums(b), "9md3r1_ret", "TypeError")
+}
+
+// ── mode 4: the same cause pointing the other way — correct code REJECTED ──
+
+// An enum named like the variant hijacked the site: lookup_named_type stripped `Left.` and
+// found the enum `Item`, so a correct construction was reported as the wrong type. This is
+// the one row that was a false POSITIVE before the fix, which is why it pins the lookup
+// order rather than any check.
+test "an unrelated enum named like the variant does not hijack a qualified site" {
+    let mut s = "type Item \{ A, B }\n\n"
+    s = s.concat("type Left \{ Item \{ v: Int } }\n\n")
+    s = s.concat("fn which(l: Left) -> Str \{\n")
+    s = s.concat("    match l \{ Left.Item \{ v } => \"left:\{v}\" }\n")
+    s = s.concat("}\n\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let x = Left.Item \{ v: 9 }\n")
+    s = s.concat("    io.println(which(x))\n")
+    s = s.concat("}\n")
+    let r = compile_test_helpers.compile_and_run(s, "9md3r1_hijack")
+    assert_eq(r.out.trim(), "left:9")
+    assert_eq(r.exit_code, 0)
+}
+
+// ── modes 5-6: the value flows on and nothing compared its type ──
+
+test "a qualified variant cannot bind to a name declared as a different enum" {
+    let mut s = "type DbError \{ QueryError \{ sqlstate: Str, message: Str } }\n\n"
+    s = s.concat("type Other \{ Nope \{ x: Int } }\n\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let e: Other = DbError.QueryError \{ sqlstate: \"a\", message: \"b\" }\n")
+    s = s.concat("    io.println(\"built\")\n")
+    s = s.concat("}\n")
+    let out = compile_test_helpers.compile_and_capture(s, "9md3r1_annot")
+    assert(out.contains("declared type Other but got DbError"))
+}
+
+test "a qualified variant cannot pass as a mismatched parameter" {
+    let mut s = "type DbError \{ QueryError \{ sqlstate: Str, message: Str } }\n\n"
+    s = s.concat("type Other \{ Nope \{ x: Int } }\n\n")
+    s = s.concat("fn takes_other(o: Other) -> Str \{ \"ok\" }\n\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    io.println(takes_other(DbError.QueryError \{ sqlstate: \"a\", message: \"b\" }))\n")
+    s = s.concat("}\n")
+    let out = compile_test_helpers.compile_and_capture(s, "9md3r1_argpos")
+    assert(out.contains("expects Other, got DbError"))
+}
+
+// ── mode 7: a generic enum needs the instance tid, not the bare decl tid ──
+
+// The bare path reverse-infers `Tree[Int]` through tc_enum_structlit_instance_tid (:10131);
+// the qualified path never reached it, so codegen emitted the unmonomorphized `blink_Tree`
+// and cc reported `unknown type name 'blink_Tree'`. It now emits `blink_Tree_0Int` like the
+// bare spelling.
+//
+// This row cannot assert the program RUNS: destructuring a generic enum's struct-style
+// variant erases the payload binding to `void value = ...` for BOTH spellings (br 5fn53v), a
+// pattern-side defect this fix does not touch. So it asserts what this fix does guarantee and
+// what 03_types.md:1036 actually demands — the two spellings emit the SAME construction. That
+// stays meaningful after 5fn53v is fixed. Do not weaken it to a plain compile check.
+test "a qualified generic-enum variant emits identical code to the bare spelling" {
+    let mut body = "type Tree[T] \{\n"
+    body = body.concat("    Leaf \{ value: T }\n")
+    body = body.concat("    Empty\n")
+    body = body.concat("}\n\n")
+    body = body.concat("fn show(t: Tree[Int]) -> Str \{\n")
+    body = body.concat("    match t \{\n")
+    body = body.concat("        Tree.Leaf \{ value } => \"leaf:\{value}\"\n")
+    body = body.concat("        Tree.Empty => \"empty\"\n")
+    body = body.concat("    }\n")
+    body = body.concat("}\n\n")
+    let qual = body.concat("fn main() \{\n    io.println(show(Tree.Leaf \{ value: 5 }))\n}\n")
+    let bare = body.concat("fn main() \{\n    io.println(show(Leaf \{ value: 5 }))\n}\n")
+    let cq = compile_test_helpers.compile_and_emit_c(qual, "9md3r1_generic_q")
+    let cb = compile_test_helpers.compile_and_emit_c(bare, "9md3r1_generic_b")
+    // Before the fix cq carried the bare `blink_Tree`, undeclared for a generic enum.
+    assert_eq(compile_test_helpers.has_mono_instance(cq, "Tree"), 1)
+    let ctor = "(blink_Tree_0Int)\{.tag = 0, .data.Leaf = \{.value = 5}}"
+    assert(cq.contains(ctor))
+    assert(cb.contains(ctor))
+}
+
+// A mistyped slot on the same generic enum must be caught, which only happens once the site
+// carries `Tree[Str]` rather than the bare `Tree`.
+test "a qualified generic-enum variant with the wrong slot type is rejected" {
+    let mut s = "type Tree[T] \{\n"
+    s = s.concat("    Leaf \{ value: T }\n")
+    s = s.concat("    Empty\n")
+    s = s.concat("}\n\n")
+    s = s.concat("fn sum_int(t: Tree[Int]) -> Int \{\n")
+    s = s.concat("    match t \{\n")
+    s = s.concat("        Tree.Leaf \{ value } => value\n")
+    s = s.concat("        Tree.Empty => 0\n")
+    s = s.concat("    }\n")
+    s = s.concat("}\n\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    io.println(\"\{sum_int(Tree.Leaf \{ value: \\\"hello\\\" })}\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_compile_error(s, "9md3r1_generic_bad", "TypeError")
+}
+
+// ── controls: the correct forms keep working, and each spelling stays equivalent ──
+
+// 03_types.md:1036 — the two spellings "construct the same value and emit identical code".
+test "the qualified and bare spellings of the same variant are interchangeable" {
+    let mut s = "type Shape \{\n"
+    s = s.concat("    Circle(radius: Float)\n")
+    s = s.concat("    Rect \{ width: Float, height: Float }\n")
+    s = s.concat("    Point\n")
+    s = s.concat("}\n\n")
+    s = s.concat("fn describe(sh: Shape) -> Str \{\n")
+    s = s.concat("    match sh \{\n")
+    s = s.concat("        Shape.Circle(r) => \"circle:\{r}\"\n")
+    s = s.concat("        Shape.Rect \{ width, height } => \"rect:\{width}x\{height}\"\n")
+    s = s.concat("        Shape.Point => \"point\"\n")
+    s = s.concat("    }\n")
+    s = s.concat("}\n\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let q = Shape.Rect \{ width: 3.0, height: 4.0 }\n")
+    s = s.concat("    let b = Rect \{ width: 3.0, height: 4.0 }\n")
+    s = s.concat("    io.println(\"\{describe(q)}|\{describe(b)}\")\n")
+    s = s.concat("}\n")
+    let r = compile_test_helpers.compile_and_run(s, "9md3r1_equiv")
+    assert_eq(r.out.trim(), "rect:3x4|rect:3x4")
+    assert_eq(r.exit_code, 0)
+}
+
+// The qualifier must select, not merely be tolerated: two enums share `Item`, and each
+// qualified spelling has to reach its own matcher.
+test "the qualifier selects which of two same-named variants is built" {
+    let mut s = "type Left \{ Item \{ v: Int } }\n\n"
+    s = s.concat("type Right \{ Item \{ v: Int } }\n\n")
+    s = s.concat("fn l(x: Left) -> Str \{ match x \{ Left.Item \{ v } => \"L\{v}\" } }\n\n")
+    s = s.concat("fn r(x: Right) -> Str \{ match x \{ Right.Item \{ v } => \"R\{v}\" } }\n\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    io.println(\"\{l(Left.Item \{ v: 1 })}|\{r(Right.Item \{ v: 2 })}\")\n")
+    s = s.concat("}\n")
+    let r = compile_test_helpers.compile_and_run(s, "9md3r1_select")
+    assert_eq(r.out.trim(), "L1|R2")
+    assert_eq(r.exit_code, 0)
+}
+
+// The prefix-as-enum resolution must not shadow the path it was inserted in front of: a
+// module-qualified STRUCT literal still resolves through lookup_named_type on the full
+// dotted name. std.testing's `Cleanup` is a real cross-module struct with a field.
+test "a module-qualified struct literal still resolves" {
+    let mut s = "import std.testing\n\n"
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let c = testing.Cleanup \{ action: fn() -> Void \{ } }\n")
+    s = s.concat("    io.println(\"ok\")\n")
+    s = s.concat("}\n")
+    let r = compile_test_helpers.compile_and_run(s, "9md3r1_modqual")
+    assert_eq(r.out.trim(), "ok")
+    assert_eq(r.exit_code, 0)
+}
+
+// The prefix-first ordering is only unambiguous because E0518 makes a struct name equal to
+// an enum variant name a DECLARATION-time error (03_types.md:1044, typecheck.bl:3855). This
+// row pins that guarantee: without it, `Holder.Wrap { .. }` could mean either the variant or
+// a module-style path to the struct, and the prefix guard would have to choose.
+test "a struct named like a variant stays a declaration-time collision" {
+    let mut s = "type Wrap \{ n: Int }\n\n"
+    s = s.concat("type Holder \{ Wrap \{ n: Int } }\n\n")
+    s = s.concat("fn take(h: Holder) -> Str \{ match h \{ Holder.Wrap \{ n } => \"h\{n}\" } }\n\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    io.println(take(Holder.Wrap \{ n: 4 }))\n")
+    s = s.concat("}\n")
+    let out = compile_test_helpers.compile_and_capture(s, "9md3r1_structprefix")
+    assert(out.contains("NameCollision"))
+}

@@ -10098,8 +10098,39 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         if sname != "" {
             let dot = sname.index_of(".")
             if dot >= 0 {
-                // Qualified `E.V { .. }`: resolve the enum from the prefix (lookup_named_type
-                // strips the qualifier itself).
+                // br 9md3r1. A qualified struct-style variant `E.V { .. }` is named by its
+                // PREFIX — 03_types.md:1040 rule 1: "if the site is already written
+                // `Enum.Variant { ... }`, that names the variant directly". This must be
+                // tried BEFORE lookup_named_type(sname) below, which strips the qualifier
+                // and looks up the SUFFIX. That is right for the module-qualified struct
+                // literal it was written for (`mod.Type { .. }`, suffix IS the type) and
+                // wrong here: the suffix is the variant name, never a type (E0518 makes
+                // struct-vs-variant a declaration-time error). So the site used to infer
+                // TYPE_UNKNOWN, which unifies with anything — and worse, an unrelated enum
+                // that happened to be NAMED like the variant hijacked the lookup and
+                // rejected correct code.
+                //
+                // Mirrors the bare path (:10131) exactly rather than returning the bare
+                // enum tid, so a generic enum reverse-infers its instance (`Tree[Int]`);
+                // the two spellings must "emit identical code" (03_types.md:1036). The decl
+                // node comes from tc_type_decl_nodes keyed by the ENUM — NOT from
+                // tc_variant_enum_decl_nodes, which is first-declared-wins per variant name
+                // and would hand back the other enum's decl for a shared name, the very
+                // confusion this block exists to end.
+                //
+                // Guarded on the prefix being a TyKind.Enum that HAS the variant, so a
+                // module qualifier still falls through untouched. A prefix enum without the
+                // named variant also falls through, staying TYPE_UNKNOWN as before — that
+                // needs an unknown-variant diagnostic which does not exist yet (br krwywm)
+                // and covers the unit and tuple spellings too.
+                let qual = sname.slice(0, dot)
+                let vname = sname.slice(dot + 1, sname.len())
+                let qtid = lookup_named_type(qual)
+                if qtid != -1 && type_kind(qtid) == TyKind.Enum && get_variant_by_name(qtid, vname) != -1 {
+                    check_deprecated_type(qual, node)
+                    let edecl = tc_type_decl_nodes.get(strip_module_qualifier(type_to_str(qtid))) ?? -1
+                    return tc_enum_structlit_instance_tid(qtid, edecl, vname, node_fields(node))
+                }
                 let etid = lookup_named_type(sname)
                 if etid != -1 {
                     check_deprecated_type(sname, node)
