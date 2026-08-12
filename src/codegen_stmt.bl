@@ -3940,9 +3940,9 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
         expr_list_elem_type = -1
         expr_list_elem_struct = ""
     }
-    // Last, because it has to win over the ladder above: a key list's named element is
-    // pointer-boxed, and every stamp above routes through set_list_elem_struct, whose plain-enum
-    // reject is a fact about push-built lists only. See map_keys_boxed_elem.
+    // Last, because it has to win over the ladder above: a STRUCT key list's element is
+    // pointer-boxed, and the ladder above can leave it named but scalar-tagged. See
+    // map_keys_boxed_elem, which declines every inline key including a payload-less enum.
     if val_type == CT_LIST {
         let keys_elem = map_keys_boxed_elem(val_node)
         if keys_elem != "" {
@@ -4197,22 +4197,23 @@ fn map_pair_value_read_expr(value_expr: Str, val_ct: Int, val_struct: Str) -> St
 }
 
 // 1n9fhg: `m.keys()` does not hand back a push-built list. It hands back the map's KEYS, and a
-// user struct or enum key is stored kops-POINTER-boxed (the emitted kops sets inline_key = 0), so
-// blink_map_keys pushes the pointer as-is and those slots mean "deref this" — even for a plain
-// (payload-less) enum, whose push-built list slots hold a bare ordinal instead. One producer, two
-// boxings for the same element type, which is the one distinction the flat pair cannot carry: so
-// the producer has to be recognized where it is still visible, at the node.
+// user STRUCT key is stored kops-POINTER-boxed (its kops sets inline_key = 0), so blink_map_keys
+// pushes the pointer as-is and those slots mean "deref this". The name is not published anywhere
+// else — emit_map_method's `keys` arm records the element's CT but no sname — so it has to be
+// recovered here, at the node, where the producer is still visible.
 //
 // The receiver's tid saying Map is the gate a user method named `keys` cannot forge. Answers the
-// key type's name, or "" when the slots are NOT pointer-boxed after all — a Str, an Int or a sized
-// int is inline_key = 1 and the runtime packs it straight into the list slot (see blink_map_keys),
-// which is what a nameless element already means here.
+// key type's name, or "" when the slots are NOT pointer-boxed — a Str, an Int, a sized int and
+// (since k4thkq) a payload-less enum are all inline_key = 1, and the runtime packs the value
+// straight into the list slot (see blink_map_keys), which is what a nameless element means here.
 fn map_keys_boxed_elem(n: Int) -> Str {
     if node_kind(n) != NodeKind.MethodCall { return "" }
     if node_method(n) != "keys" { return "" }
     if tc_tid_kind(tc_tid_resolved(tc_lookup_node_tid(node_obj(n)))) != TyKind.Map { return "" }
     let ktid = tc_tid_subst_mono(tc_tid_resolved(tc_tid_iter_elem(tc_tid_resolved(tc_lookup_node_tid(n)))), cg_mono_tparams_sl, cg_mono_arg_tids)
-    named_elem_of_elem_tid(ktid).name
+    let elem = named_elem_of_elem_tid(ktid)
+    if elem.plain_enum { return "" }
+    elem.name
 }
 
 // Stage 2's dual-write for a for-in loop variable, and the tap that measures it (br 7xgbh6).
@@ -4373,21 +4374,14 @@ fn emit_for_in(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.
             emit_line("blink_list* {lst} = blink_set_to_list({iter_str});")
             set_var(lst, CT_LIST, 0)
             set_list_elem_type(lst, set_elem_ct)
-            let mut set_elem_ct_eff = set_elem_ct
             if set_elem_struct != "" {
-                // 1n9fhg: a set KEY is pointer-boxed whatever it is — blink_alloc + kops — so the
-                // key list is one of the lists whose named element genuinely means "deref this",
-                // including for a plain (payload-less) enum, which in a push-built list would be
-                // a bare ordinal. Record that directly rather than through set_list_elem_struct,
-                // whose value-boxing reject is a fact about push-built lists only.
-                if is_enum_type(set_elem_struct) != 0 && is_data_enum(set_elem_struct) == 0 {
-                    set_list_elem_named_boxed(lst, set_elem_struct)
-                    set_elem_ct_eff = CT_VOID
-                } else {
-                    set_list_elem_struct(lst, set_elem_struct)
-                }
+                // k4thkq: one call, because a set element is now boxed the same way a push-built
+                // list boxes it — a struct or a data enum by pointer, a payload-less enum as the
+                // ordinal it is (its kops sets inline_key = 1, so blink_set_to_list packs it into
+                // the slot). set_list_elem_struct's plain-enum reject is therefore right here too.
+                set_list_elem_struct(lst, set_elem_struct)
             }
-            expr_list_elem_type = set_elem_ct_eff
+            expr_list_elem_type = set_elem_ct
             expr_list_elem_struct = set_elem_struct
             iter_str = lst
             iter_type = CT_LIST
@@ -4536,8 +4530,9 @@ fn emit_for_in(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.
             let mut plain_enum_name = ""
             // `elem_struct == ""` is the whole gate on the value-boxing repair: after the
             // set_list_elem_struct reject, a plain enum can only carry a name here when a caller
-            // recorded genuine pointer boxing on purpose (set_list_elem_named_boxed, for a set's
-            // key list), and that record has to win.
+            // recorded genuine pointer boxing on purpose (set_list_elem_named_boxed), and that
+            // record has to win. Since k4thkq no producer does that for a plain enum, but the gate
+            // stays because it is the reject's own invariant, not a statement about producers.
             if elem_struct == "" && (elem_type == CT_INT || elem_type == CT_VOID || elem_type == CT_ENUM || elem_type == CT_STRUCT) {
                 let mut ne = list_named_elem_of(iter_str)
                 if ne.name == "" {
@@ -4824,6 +4819,15 @@ fn emit_for_in(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.
                 emit_line("{c_type_str(elem_type)} {c_var_name} = {next_var}.value;")
                 push_scope()
                 set_var(var_name, elem_type, 0)
+                // k4thkq: the STORAGE of a plain-enum element is an ordinal and the iterator
+                // yields it correctly here, but its IDENTITY reaches the body only through
+                // var_enums — that is what `.to_str()` on a str-backed variant and a bare match
+                // variant read. Same split, and the same fix, as the direct list arm above; only
+                // the tid holds the name once the element is boxed like an Int.
+                let adapter_elem = named_elem_of_elem_tid(tc_tid_subst_mono(tc_tid_resolved(tc_tid_iter_elem(tc_tid_resolved(tc_lookup_node_tid(iter_node)))), cg_mono_tparams_sl, cg_mono_arg_tids))
+                if adapter_elem.plain_enum {
+                    var_enums.push(VarEnumEntry { name: var_name, enum_type: adapter_elem.name })
+                }
             }
             forin_measure_var(var_name, iter_node, node)
             emit_block(node_body(node))

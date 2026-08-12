@@ -6653,6 +6653,80 @@ Tests: `tests/test_1n9fhg_list_named_elem_iterator.bl`, 14 rows, every one asser
 a compiles-only test passes an ordinal read out of a pointer slot. `task regen` at fixed point after
 each of the three sub-steps; `task ci` exit 0, 681 test files, fmt 1580 passed / 0 failed.
 
+### One type, one ABI: a payload-less enum key is an inline key — br `k4thkq`
+
+`1n9fhg` fixed the two producers a consumer can see. `k4thkq` removes the reason there were two.
+
+A payload-less enum's kops now emits `inline_key = 1` with `key_size = sizeof(blink_<Enum>)`, so
+`blink_map_keys` and `blink_set_to_list` pack the ordinal straight into the list slot — the same
+layout `blink_list_push(l, (void*)(intptr_t)blink_Col_Red)` already produced. `List[Col]` has one
+physical representation again, and a consumer that cannot see the producer no longer has to guess:
+
+```
+                              before                    after
+f(m.keys())                   0     (want 7)  SILENT    7
+m.keys().get(0).unwrap()      ""    (want "low") SILENT  "low"
+for c in m.keys().filter(..)  identity lost            "low"
+```
+
+Four edits, one semantic change, one regen — the kops and its readers cannot land apart or the
+emitted C claims two layouts at once:
+
+| where | change |
+| --- | --- |
+| `codegen_types.bl` | `kops_is_inline_enum_key(sname)` — a registered kops key that is an enum and not a data enum |
+| `codegen_derive.bl` | the kops table's fourth field is computed, not the literal `0` |
+| `codegen_methods.bl` | `map_key_expr_inner` takes an inline enum FIRST: a stack temp, no `blink_alloc` — the runtime memcpy's `key_size` bytes out of the pointer it is handed |
+| `codegen_stmt.bl` | the three read sites stop claiming pointer boxing: `map_keys_boxed_elem` declines a plain enum, and the Set for-in arm is one `set_list_elem_struct` call again |
+
+A **data** enum is untouched and still pointer-boxed: its C struct carries a payload, which is also
+how a push-built list holds it. Same rule, opposite answer. A **struct** key is untouched for the
+same reason, and `set_list_elem_named_boxed` stays for it — `emit_map_method`'s `keys` arm publishes
+the element's CT but never its name, so a struct key list's identity still has to be recovered at the
+node.
+
+Ordinal 0 is a real key, not an empty slot: the runtime tracks occupancy in a separate `states` array
+(`0=empty, 1=occupied, 2=tombstone`), never by a zero sentinel in the slot. The test asserts this
+directly rather than trusting the reading.
+
+The **identity** half of the storage/identity split had one more hole, found by running the tests
+rather than reading: a lazy adapter's loop variable (`for c in m.keys().filter(..)`) binds through
+`emit_for_in`'s `CT_ITERATOR` arm, which had no plain-enum `var_enums` registration, so `.to_str()`
+answered `""` even once the ordinal was correct. Fixed from the iterable's element tid, the same way
+the direct list arm does it.
+
+Census, on a **970-file common basis** in monolithic mode, the new test file excluded:
+
+> `diverge` rows **29324 → 29324**, cells **735 → 734**, `agree` **671574 → 671742**, `ctypediv`
+> **24 → 24**. One cell cleared. Three cells changed spelling, and all three got *more honest*:
+> `emit_let_binding.decl tid=List[HLv1n]` moved from `flat=List[Void]` (the erasure spelling, and a
+> lie about the boxing) to `flat=List[Int]`, and the two `emit_for_in.var` cells that read
+> `tid=HCol1n flat=HCol1n` — the `ty_tp_same_shape` kind-before-name artifact — now read
+> `flat=Int`, which is what the slot actually holds.
+
+The unit's own file was attributed in **both** build modes: archive-linked (30 diverge rows) and
+monolithic (54, the difference being stdlib the monolith compiles), with **identical** rows for every
+`Lv` / `Col` / `Pt` shape. `tid=List[Lv] flat=List[Int]` and `tid=Lv flat=Int` are the new
+storage-truthful spellings; `tid=List[Pt] flat=List[Void]` at a fn parameter is the struct key still
+pointer-boxed, as intended.
+
+Byproducts, both pre-existing, neither caused by this unit:
+
+- br `r6r5v6` — a `.filter()` / `.map()` result rejects `.len()`
+  (`error[UnresolvedMethod]: unresolved method '.len' on type List[Int]`) and escapes to `cc` in a
+  `List[T]` argument position (`expected 'blink_list *' but argument is of type
+  'blink_FilterIterator_int'`). The reference calls these adapters eager `List[T]` and the diagnostic
+  agrees; codegen makes them lazy iterators. `List[Int]` reproduces both, so it is not about enums.
+  The adapter rows here use `.count()` and a `for`-in as the workaround, marked in the test.
+- br `bp9qp1` — **not** retired by this change, re-probed after it landed: an inferred `Map()` still
+  emits `void _mkey` for every `insert` after the first, for an enum key *and* a struct key. Its
+  cause is the insert arm storing the key CT without the key name, which is independent of boxing.
+
+Tests: `tests/test_k4thkq_enum_key_one_abi.bl`, 10 rows, each asserting a **value** through a
+producer-blind consumer — a fn parameter, an index, an adapter — plus controls for the struct key, the
+scalar keys, the ordinal-zero key and the map *value* of enum type. `task regen` at fixed point;
+`task ci` exit 0, 682 test files, 0 failed.
+
 ## Appendix — all 428 shape cells
 
 Format: `family | occurrences | tid | flat`.

@@ -1,0 +1,230 @@
+// br k4thkq — a payload-less enum must have ONE physical representation in a list slot.
+//
+// A push-built `List[Col]` for a payload-less (plain) enum holds bare ordinals:
+// `blink_list_push(l, (void*)(intptr_t)blink_Col_Red)`. The kops table for a user enum key used
+// to set `inline_key = 0`, so `blink_map_keys` and `blink_set_to_list` handed back a list whose
+// slots were POINTERS to allocated ordinals. The same `List[Col]` then had two incompatible
+// layouts depending on which producer made it, and every consumer that cannot see the producer
+// read the wrong one — a fn parameter, `.get(i).unwrap()`, a lazy adapter.
+//
+// br 1n9fhg patched the two producers a consumer CAN see (the direct `for k in m.keys()` and the
+// let-bound `let ks = m.keys()`). That is not a fix of a split, it is a fix per producer, so the
+// rows below are written from the consumer's side: the same `List[Lv]` value goes through a fn
+// parameter, an index, and an adapter, and every row asserts a VALUE. A compiles-only test passes
+// an ordinal read out of a pointer slot.
+//
+// The fix is one ABI: a payload-less enum's kops sets `inline_key = 1` with
+// `key_size = sizeof(blink_<Enum>)`, so the runtime packs the ordinal straight into the slot
+// exactly as it does for an Int (`blink_map_keys` / `blink_set_to_list`, the
+// `k->inline_key && k->key_size <= sizeof(void*)` arms). A STRUCT key has no split to fix — a
+// push-built `List[Struct]` is pointer-boxed too — so the struct rows here are controls that the
+// pointer side did not move.
+
+import std.io
+
+@derive(Hash, Eq)
+type Lv { Low = "low", High = "high" }
+
+@derive(Hash, Eq)
+type Col { Red, Green, Blue }
+
+@derive(Hash, Eq)
+type Pt { x: Int, y: Int }
+
+fn eq_str(got: Str, want: Str) {
+    if got != want { io.println("  got '${got}' want '${want}'") }
+    assert(got == want)
+}
+
+// The consumers. Each takes the list BY TYPE and cannot see which producer built it, which is the
+// whole point: `List[Lv]` has to mean one layout.
+fn total_len(cs: List[Lv]) -> Int {
+    let mut n = 0
+    for c in cs { n = n + c.to_str().len() }
+    n
+}
+
+fn count_reds(cs: List[Col]) -> Int {
+    let mut n = 0
+    for c in cs {
+        match c {
+            Col.Red => { n = n + 1 }
+            _ => {}
+        }
+    }
+    n
+}
+
+fn sum_x(ps: List[Pt]) -> Int {
+    let mut n = 0
+    for p in ps { n = n + p.x }
+    n
+}
+
+// ── The three producer-blind consumers ──────────────────────────────────────────
+
+test "a key list read through a fn parameter agrees with a push-built one" {
+    let m: Map[Lv, Int] = Map()
+    m.insert(Lv.Low, 1)
+    m.insert(Lv.High, 2)
+    assert_eq(total_len(m.keys()), 7)
+
+    // Same consumer, same type, push-built source. Both must be 7 or the type has two layouts.
+    let pushed = [Lv.Low, Lv.High]
+    assert_eq(total_len(pushed), 7)
+
+    let mc: Map[Col, Int] = Map()
+    mc.insert(Col.Red, 1)
+    mc.insert(Col.Green, 2)
+    assert_eq(count_reds(mc.keys()), 1)
+    assert_eq(count_reds([Col.Red, Col.Green]), 1)
+}
+
+test "a key list read by index agrees with a push-built one" {
+    let m: Map[Lv, Int] = Map()
+    m.insert(Lv.Low, 1)
+    eq_str(m.keys().get(0).unwrap().to_str(), "low")
+
+    let ks = m.keys()
+    eq_str(ks.get(0).unwrap().to_str(), "low")
+
+    let pushed = [Lv.Low]
+    eq_str(pushed.get(0).unwrap().to_str(), "low")
+}
+
+test "a key list through a lazy adapter agrees with a push-built one" {
+    let m: Map[Lv, Int] = Map()
+    m.insert(Lv.Low, 1)
+    m.insert(Lv.High, 2)
+    // `.count()` and a for-in, not `.len()` and not total_len(kept): br r6r5v6 makes a
+    // filter/map result reject `.len()` and escape to cc in a `List[T]` argument position, for
+    // `List[Int]` too. The adapter still has to read the KEY LIST's slots, which is what these
+    // rows are for — swap in `.len()` / total_len when that ticket closes.
+    //
+    // One adapter per consumer: `.count()` DRIVES the iterator (see the List[T] method table), so
+    // a second read of the same value legitimately sees nothing left.
+    assert_eq(m.keys().filter(fn(c: Lv) -> Bool { c.to_str() == "low" }).count(), 1)
+    let kept = m.keys().filter(fn(c: Lv) -> Bool { c.to_str() == "low" })
+    let mut kept_len = 0
+    for c in kept { kept_len = kept_len + c.to_str().len() }
+    assert_eq(kept_len, 3)
+
+    assert_eq(m.keys().map(fn(c: Lv) -> Int { c.to_str().len() }).count(), 2)
+    let mapped = m.keys().map(fn(c: Lv) -> Int { c.to_str().len() })
+    let mut mapped_sum = 0
+    for n in mapped { mapped_sum = mapped_sum + n }
+    assert_eq(mapped_sum, 7)
+}
+
+// ── A Set's element is the same list, from the other producer ────────────────────
+
+test "a set's elements read through a fn parameter and by index" {
+    let s: Set[Col] = Set()
+    s.insert(Col.Red)
+    s.insert(Col.Green)
+    s.insert(Col.Red)
+    assert_eq(s.len(), 2)
+    assert(s.contains(Col.Red))
+    assert(!s.contains(Col.Blue))
+
+    // The already-repaired producer: iterating the Set directly.
+    let mut reds = 0
+    for c in s {
+        match c {
+            Col.Red => { reds = reds + 1 }
+            _ => {}
+        }
+    }
+    assert_eq(reds, 1)
+}
+
+test "a str-backed set keeps its identity through every consumer" {
+    let s: Set[Lv] = Set()
+    s.insert(Lv.Low)
+    s.insert(Lv.High)
+    let mut acc = 0
+    for v in s { acc = acc + v.to_str().len() }
+    assert_eq(acc, 7)
+    assert(s.remove(Lv.Low))
+    assert_eq(s.len(), 1)
+}
+
+// ── Controls — the shapes that already worked must not move ──────────────────────
+
+test "a struct key stays pointer-boxed" {
+    let m: Map[Pt, Int] = Map()
+    m.insert(Pt { x: 5, y: 1 }, 1)
+    m.insert(Pt { x: 7, y: 2 }, 2)
+    assert_eq(m.len(), 2)
+    assert_eq(sum_x(m.keys()), 12)
+    assert_eq(m.keys().get(0).unwrap().y + m.keys().get(1).unwrap().y, 3)
+
+    let sp: Set[Pt] = Set()
+    sp.insert(Pt { x: 5, y: 1 })
+    assert(sp.contains(Pt { x: 5, y: 1 }))
+    assert(!sp.contains(Pt { x: 6, y: 1 }))
+    let mut xs = 0
+    for p in sp { xs = xs + p.x }
+    assert_eq(xs, 5)
+}
+
+test "scalar keys are untouched" {
+    let mi: Map[Int, Str] = Map()
+    mi.insert(7, "a")
+    mi.insert(9, "b")
+    assert_eq(mi.keys().get(0).unwrap() + mi.keys().get(1).unwrap(), 16)
+
+    let ms: Map[Str, Int] = Map()
+    ms.insert("k", 3)
+    eq_str(ms.keys().get(0).unwrap(), "k")
+
+    let sc: Set[Char] = Set()
+    sc.insert('a')
+    assert(sc.contains('a'))
+    assert_eq(sc.len(), 1)
+}
+
+test "an enum-keyed map still looks up, counts and removes" {
+    let m: Map[Col, Int] = Map()
+    m.insert(Col.Red, 10)
+    m.insert(Col.Green, 20)
+    m.insert(Col.Red, 30)
+    assert_eq(m.len(), 2)
+    assert_eq(m.get(Col.Red).unwrap(), 30)
+    assert(m.contains_key(Col.Green))
+    assert(!m.contains_key(Col.Blue))
+    assert(m.remove(Col.Green))
+    assert_eq(m.len(), 1)
+    match m.get(Col.Green) {
+        Some(v) => { assert_eq(v, -1) }
+        None => { assert(true) }
+    }
+}
+
+test "an enum-keyed map's ordinal-zero variant is a real key, not an empty slot" {
+    // Col.Red is ordinal 0. An inline key is stored in the slot itself, so a zero ordinal is
+    // indistinguishable from zeroed memory unless the occupancy is tracked separately — the
+    // runtime's `states` array is what makes the inline layout safe here.
+    let m: Map[Col, Int] = Map()
+    m.insert(Col.Red, 1)
+    assert_eq(m.len(), 1)
+    assert(m.contains_key(Col.Red))
+    assert_eq(m.get(Col.Red).unwrap(), 1)
+    assert_eq(m.keys().len(), 1)
+
+    let s: Set[Col] = Set()
+    s.insert(Col.Red)
+    assert_eq(s.len(), 1)
+    assert(s.contains(Col.Red))
+    assert(!s.contains(Col.Green))
+}
+
+test "a map VALUE of enum type stays value-boxed" {
+    let mv: Map[Str, Lv] = Map()
+    mv.insert("a", Lv.Low)
+    mv.insert("b", Lv.High)
+    let mut vs = 0
+    for v in mv.values() { vs = vs + v.to_str().len() }
+    assert_eq(vs, 7)
+    eq_str(mv.get("a").unwrap().to_str(), "low")
+}
