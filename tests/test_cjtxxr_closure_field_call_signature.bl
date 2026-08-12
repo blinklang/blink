@@ -1,0 +1,240 @@
+// br cjtxxr — calling a closure-typed struct field was entirely unchecked.
+//
+// `obj.field(args)` where the struct declares `field: fn(A) -> B` got no type from
+// typecheck and no check of any kind: return type, arity, and every argument type all
+// failed open. It was the only callable shape in the language that was not checked.
+//
+// TWO HALVES TO THE CAUSE, both in src/typecheck.bl:
+//
+//   1. The `obj_k == TyKind.Struct || obj_k == TyKind.Enum` receiver block in
+//      infer_type_uncached (:9638) had no arm that read the field's type. It tries the
+//      trait-qualified/bare fnsig `{tname}_{method}`, the Instant intrinsics, then the
+//      display/eq/cmp derive arms, then the E0505 gate — a closure FIELD is none of
+//      those, so the call fell through to TYPE_UNKNOWN, which unifies with anything.
+//
+//   2. E0505 did not catch it either. tc_method_resolvable_on_type clause (d) (:372)
+//      fail-opens on is_callable_field_name(method) — a GLOBAL list of every field name
+//      declared `Fn` anywhere in the program, not a per-type check. The name is in the
+//      list, so the gate answered "resolvable" on a receiver whose type was fully known.
+//      The same allow-list-with-nothing-behind-it shape as jvy35h (List.join) and rb5wvb
+//      (Instant.elapsed): the list names the method, and nothing behind the list gives
+//      it a type.
+//
+// NOTHING NEW IS INFERRED BY THE FIX. resolve_type_ann's `Fn` arm (:2756, br nz7drz)
+// already builds a real structured TyKind.Fn tid for every `fn(A) -> B` annotation, and
+// register_struct_type stores it as the field's sf.type_id (:3462), reachable via
+// get_struct_field_tid. And tc_check_call_against_fn_tid (:2525) already arity-checks,
+// per-argument-checks and answers the return type of such a tid — it had two callers, the
+// closure VARIABLE and the immediately-invoked closure literal. The fix is a third
+// dispatch to the same function against the same kind of tid.
+//
+// THREE REFERENCE IMPLEMENTATIONS were already correct, which is what made the gap
+// precise rather than a design question: a closure variable, a fn-typed parameter, and —
+// decisively — the SAME field hoisted through a `let` (`let g = h.cb` then `g(3)` errors
+// correctly). Only the direct `h.cb(3)` form was unchecked. The "hoisted" row below pins
+// that reference so a future change cannot regress the two paths in opposite directions.
+//
+// EIGHT fail-open modes, each reproduced with `build/blink run` before this file existed.
+// Three were silent miscompiles that compiled, linked and RAN; five escaped to cc:
+//
+//   1. `let bad: Int = h.cb(3)` printed `bad=n=3` at exit 0.
+//   2. A NESTED field receiver — `o.inner.on_error(1, "x")` — printed `bad=1:x`.
+//   3. A struct-returning field propagated the hole: `let b = h.cb(3)` left `b` untyped,
+//      so `let bad: Str = b.n` was accepted too and printed `bad=3`.
+//   4. Argument position: `want_int(h.cb(3))` → cc `passing argument 1 of
+//      'blink_u_want_int' makes integer from pointer without a cast`.
+//   5. Chained receiver: `h.cb(3).starts_with(5)` — starts_with's OWN argument check was
+//      skipped because its receiver had no type, so the mistyped Int reached cc. One
+//      missing signature disabling a check two calls away.
+//   6. `h.cb(3, 4)` → cc `too many arguments to function ...; expected 2, have 3`.
+//   7. `h.cb()` → cc `too few arguments to function ...; expected 2, have 1`.
+//   8. `h.cb("wrong")` → cc `passing argument 2 ... makes integer from pointer`.
+//
+// THE SPEC SHIPS THIS SHAPE AS ITS OWN SERVER DESIGN — sections/04_effects.md:453 puts
+// `handler: fn(Request) -> Response` inside `type Route`, and :407-408 add a middleware
+// list plus `error_handler: fn(Request, ServerError) -> Response`. lib/std/testing.bl's
+// `type Cleanup { action: fn() -> Void }` is the same shape in the stdlib. So the field's
+// declared annotation IS its signature, and checking against it invents nothing.
+//
+// A TRAIT-IMPL METHOD OF THE SAME NAME MUST STILL WIN. codegen_methods.bl dispatches
+// synthesized display, then lookup_impl_method (:5323), then the closure field (:5333).
+// The new arm therefore sits AFTER the fnsig lookup and immediately before the E0505 gate,
+// so both phases agree; the shadowing row at the bottom is what pins that ordering.
+//
+// Names may NOT be removed from nr_callable_field_names as the repair. That registry also
+// suppresses W0501, and it must stay a superset of the typed arms (the n84s1p invariant)
+// or a valid call starts erroring.
+
+import compile_test_helpers
+
+// `type Handler { cb: fn(Int) -> Str }` plus a main that binds one.
+fn one_field(body: Str) -> Str {
+    let mut s = "type Handler \{ cb: fn(Int) -> Str }\n\n"
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let h = Handler \{ cb: fn(n: Int) -> Str \{ \"n=\{n}\" } }\n")
+    s = s.concat(body)
+    s = s.concat("}\n")
+    s
+}
+
+// ── modes 1-3: the declared-type compare was skipped, so these RAN ──
+
+// The teeth of the file. Asserted on the message rather than on "some TypeError": "but got
+// Str" is what proves the call resolved to the field's declared return type specifically,
+// and an arm answering any other concrete type would satisfy a bare TypeError assertion.
+test "a closure field's Str return cannot bind to an Int-declared name" {
+    let src = one_field("    let bad: Int = h.cb(3)\n    io.println(\"bad=\{bad}\")\n")
+    let out = compile_test_helpers.compile_and_capture(src, "cjtxxr_ret")
+    assert(out.contains("declared type Int but got Str"))
+}
+
+// A NESTED field receiver: the outer field access has to answer the inner struct's type
+// before the inner field's Fn tid can be found at all. Before the fix this printed 1:x.
+test "a closure field on a nested struct receiver is checked" {
+    let mut s = "type Inner \{ on_error: fn(Int, Str) -> Str }\n\n"
+    s = s.concat("type Outer \{ inner: Inner }\n\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let o = Outer \{ inner: Inner \{ on_error: fn(n: Int, m: Str) -> Str \{ \"\{n}:\{m}\" } } }\n")
+    s = s.concat("    let bad: Int = o.inner.on_error(1, \"x\")\n")
+    s = s.concat("    io.println(\"bad=\{bad}\")\n")
+    s = s.concat("}\n")
+    let out = compile_test_helpers.compile_and_capture(s, "cjtxxr_nested")
+    assert(out.contains("declared type Int but got Str"))
+}
+
+// The type must PROPAGATE into the returned value, not merely exist at the call node. A
+// struct-returning field left the whole result untyped, so a field access ON that result
+// fell open too — a second miscompile one hop downstream of the first.
+test "a closure field's struct return is a typed struct receiver" {
+    let mut s = "type Box \{ n: Int }\n\n"
+    s = s.concat("type Handler \{ cb: fn(Int) -> Box }\n\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let h = Handler \{ cb: fn(n: Int) -> Box \{ Box \{ n: n } } }\n")
+    s = s.concat("    let b = h.cb(3)\n")
+    s = s.concat("    let bad: Str = b.n\n")
+    s = s.concat("    io.println(\"bad=\{bad}\")\n")
+    s = s.concat("}\n")
+    let out = compile_test_helpers.compile_and_capture(s, "cjtxxr_struct_ret")
+    assert(out.contains("declared type Str but got Int"))
+}
+
+// ── modes 4-5: the result flows on, and the failure mode is silence rather than a binding ──
+
+test "a closure field's return cannot pass as a mismatched parameter" {
+    let mut s = "type Handler \{ cb: fn(Int) -> Str }\n\n"
+    s = s.concat("fn want_int(n: Int) -> Int \{ n }\n\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let h = Handler \{ cb: fn(n: Int) -> Str \{ \"n=\{n}\" } }\n")
+    s = s.concat("    io.println(\"\{want_int(h.cb(3))}\")\n")
+    s = s.concat("}\n")
+    compile_test_helpers.expect_compile_error(s, "cjtxxr_argpos", "TypeError")
+}
+
+// Before the fix the receiver of starts_with was untyped, so starts_with's own argument
+// check was skipped as well and the mistyped Int reached cc.
+test "a closure field's Str return is a Str receiver for the next call in the chain" {
+    let src = one_field("    let hit = h.cb(3).starts_with(5)\n    io.println(\"\{hit}\")\n")
+    compile_test_helpers.expect_compile_error(src, "cjtxxr_chain", "TypeError")
+}
+
+// ── modes 6-8: the call's own arity and argument types ──
+
+// The declared field type is `fn(Int) -> Str`, so one argument. Asserted on the exact
+// wording so the row also witnesses which callee the diagnostic names — a message that
+// blamed the enclosing fn or an anonymous "closure" would be unactionable on a struct with
+// several callable fields.
+test "too many arguments to a closure field is rejected" {
+    let src = one_field("    io.println(h.cb(3, 4))\n")
+    let out = compile_test_helpers.compile_and_capture(src, "cjtxxr_arity_over")
+    assert(out.contains("closure field 'Handler.cb' expects 1 argument(s), got 2"))
+}
+
+test "too few arguments to a closure field is rejected" {
+    let src = one_field("    io.println(h.cb())\n")
+    let out = compile_test_helpers.compile_and_capture(src, "cjtxxr_arity_under")
+    assert(out.contains("closure field 'Handler.cb' expects 1 argument(s), got 0"))
+}
+
+test "a wrong argument type to a closure field is rejected" {
+    let src = one_field("    io.println(h.cb(\"wrong\"))\n")
+    let out = compile_test_helpers.compile_and_capture(src, "cjtxxr_argtype")
+    assert(out.contains("closure field 'Handler.cb' argument 0 expects Int, got Str"))
+}
+
+// ── controls: every shape that worked must keep working ──
+
+// A fix that resolved the field to the WRONG type would satisfy every error row above and
+// fail here. The assertion pins the RESULT, not just the type: the closure body actually
+// runs and its value comes back.
+test "a closure field call compiles and runs with its declared types" {
+    let src = one_field("    let s: Str = h.cb(3)\n    io.println(\"got=\{s}|len=\{s.len()}\")\n")
+    let r = compile_test_helpers.compile_and_run(src, "cjtxxr_good")
+    assert(r.exit_code == 0)
+    assert(r.out.contains("got=n=3|len=3"))
+}
+
+// THE SHADOWING CONTROL, and the reason the new arm sits after the fnsig lookup. Codegen
+// dispatches lookup_impl_method BEFORE the closure field, so a trait method of the same
+// name wins there; typecheck must agree or the fix just moves the miscompile. Asserted on
+// the RUN output — 99 is the impl's value, "n=3" would be the field's.
+test "a trait-impl method shadows a same-named closure field in both phases" {
+    let mut s = "trait Runner \{\n    fn cb(self) -> Int\n}\n\n"
+    s = s.concat("type Handler \{ cb: fn(Int) -> Str }\n\n")
+    s = s.concat("impl Runner for Handler \{\n    fn cb(_self) -> Int \{\n        99\n    }\n}\n\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let h = Handler \{ cb: fn(n: Int) -> Str \{ \"n=\{n}\" } }\n")
+    s = s.concat("    io.println(\"\{h.cb()}\")\n")
+    s = s.concat("}\n")
+    let r = compile_test_helpers.compile_and_run(s, "cjtxxr_shadow")
+    assert(r.exit_code == 0)
+    assert(r.out.contains("99"))
+}
+
+// THE REFERENCE-IMPLEMENTATION ROW. Hoisting the field into a local already went through
+// the closure-VARIABLE path (typecheck.bl:9012) and was checked. It is what proved the
+// field's tid is a real TyKind.Fn, so it must stay checked — the two paths are now two
+// dispatches to one function and may not diverge again.
+test "a closure field hoisted through a let is still checked" {
+    let src = one_field("    let g = h.cb\n    let bad: Int = g(3)\n    io.println(\"bad=\{bad}\")\n")
+    let out = compile_test_helpers.compile_and_capture(src, "cjtxxr_hoisted")
+    assert(out.contains("declared type Int but got Str"))
+}
+
+// A zero-parameter Void-returning field — the `type Cleanup { action: fn() -> Void }`
+// shape from lib/std/testing.bl. `fn()` with no arrow lowers its return to TYPE_VOID, not
+// TYPE_UNKNOWN (resolve_type_ann:2756), so an arity error here has to report 0 expected
+// rather than fall back open.
+test "a zero-arg closure field checks its arity and its Void return" {
+    let mut good = "type Cleanup \{ action: fn() -> Void }\n\n"
+    good = good.concat("fn main() \{\n")
+    good = good.concat("    let c = Cleanup \{ action: fn() -> Void \{ io.println(\"ran\") } }\n")
+    good = good.concat("    c.action()\n")
+    good = good.concat("}\n")
+    let r = compile_test_helpers.compile_and_run(good, "cjtxxr_void_good")
+    assert(r.exit_code == 0)
+    assert(r.out.contains("ran"))
+
+    let mut bad = "type Cleanup \{ action: fn() -> Void }\n\n"
+    bad = bad.concat("fn main() \{\n")
+    bad = bad.concat("    let c = Cleanup \{ action: fn() -> Void \{ io.println(\"ran\") } }\n")
+    bad = bad.concat("    c.action(1)\n")
+    bad = bad.concat("}\n")
+    let out = compile_test_helpers.compile_and_capture(bad, "cjtxxr_void_arity")
+    assert(out.contains("closure field 'Cleanup.action' expects 0 argument(s), got 1"))
+}
+
+// The stdlib shape this cause was actually found in: a two-parameter handler field reached
+// through an intermediate struct field, as lib/std/http_server.bl's
+// `srv.error_handler.on_error(req, msg)` does. Both arguments must be checked, not just
+// the first — tc_check_call_against_fn_tid loops on `got`, so a row with two arguments is
+// what witnesses the loop rather than a single-argument special case.
+test "a two-parameter handler field checks both arguments" {
+    let mut s = "type ErrorHandler \{ on_error: fn(Int, Str) -> Str }\n\n"
+    s = s.concat("type Server \{ error_handler: ErrorHandler }\n\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let srv = Server \{ error_handler: ErrorHandler \{ on_error: fn(code: Int, msg: Str) -> Str \{ \"\{code}: \{msg}\" } } }\n")
+    s = s.concat("    io.println(srv.error_handler.on_error(500, true))\n")
+    s = s.concat("}\n")
+    let out = compile_test_helpers.compile_and_capture(s, "cjtxxr_two_params")
+    assert(out.contains("closure field 'ErrorHandler.on_error' argument 1 expects Str, got Bool"))
+}

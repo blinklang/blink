@@ -216,6 +216,7 @@ not Stage 3 work:
 | `bf0jnj` | P2 | *(`nxnnxe`'s byproduct, and the `expr_result_*`-vs-`ScopeVar` split that Stage 4 deletes)* the `from_str` emitter stamped the Option's inner type on the temp **variable** and not on the **expression** channel, so a direct `match Status.from_str(..)` scrutinee was spelled `blink_Option_void` while an intermediate `let` worked. The `try_from`/`from_json` arm **one line above** writes its channel — a two-line asymmetry inside one function. **Divergence-neutral, measured** (every figure of the after-`nxnnxe` sweep reproduced exactly). Byproduct: `qne9k3` |
 | `cttrag` | P2 | *(the ranked top cause inside the compiler's own source, and the entry whose axes were wrong)* a **module-qualified** top-level `let` had no type: `infer_type`'s `FieldAccess` arm had cases for an enum type qualifier, a struct field and a tuple index, and **no fourth for a module qualifier**, so `prov.count` fell off its tail as `TYPE_UNKNOWN` — while the *bare* form inside the declaring module was always typed, because `:11582` had already registered the type the qualified form never read. **Not** container-specific, **not** about `pub`, **not** about crossing a module boundary: two of the ranking row's three axes were wrong. Both halves failed open differently — `let bad: Str = prov.count` compiled, linked and **ran** printing `3`; `want_str(prov.count)` reached `cc` with **no diagnostic at all**. Fixed with a table keyed `"{module}.{name}"` rather than a bare-name `nr_get_type`, because the bare scope is **shadowable** and a wrong type is worse than no type. **−12 rows, exactly as predicted; `incremental` and `file_watcher` both to zero and nothing else moved** |
 | `nxnnxe` | P2 | *(the ranked #1 after `x3x0qj`, and the allow-list-with-nothing-behind-it shape a **fourth** time)* every method `@derive` synthesizes had its **name** affirmed by `tc_method_resolvable_on_type` and **no signature anywhere** — so `to_json` / `from_json` / `clone` / `debug` / `eq` / `cmp` and the str-backed-enum statics all resolved to `TYPE_UNKNOWN`. Both halves failed open: `let bad: Int = u.to_json()` compiled, linked and **ran**, and `User.from_json(42)` escaped to `cc`. Fixed the `qjfwc6` way — **a table, not arms**. **−19 rows, exactly as predicted, and every one of the seven named files went to zero.** Three byproducts filed: `pvhaew`, `bf0jnj`, `169kjt` |
+| `cjtxxr` | P2 | *(the largest actionable entry left, and the allow-list shape a **tenth** time)* calling a **closure-typed struct field** — `route.callback(req)`, `srv.error_handler.on_error(req, msg)`, the `handler: fn(Request) -> Response` the spec puts inside `type Route` — was the **last unchecked callable shape in the language**: return type, arity and every argument type failed open together. The closure *variable*, the IIFE, a fn-typed *parameter* and even the same field **hoisted through a `let`** were all already checked, which proved the field's tid was a real `TyKind.Fn` and only the dispatch was missing. `tc_method_resolvable_on_type` clause (d) fail-opened on `is_callable_field_name`, a **global** name list, on the strength of a comment that `nz7drz` had falsified. **Three silent miscompiles** (one propagating into the returned struct's own field access) plus five `cc` escapes. **−12 rows against 11 predicted**, the twelfth being a downstream `let` two lines below a cured producer |
 
 `k9agr8` gates the *measurement*, not the code: without it Stage 3 can only demonstrate 0
 in archive-linked mode.
@@ -1425,15 +1426,15 @@ these sweeps, tallied on the **intersection of their file sets** (874 files; the
 do not appear in all of them are listed under the `nz7drz` correction note). `scratchpad/cells.sh`
 takes that allow-list as a required argument.
 
-| | before `nz7drz` | after `nz7drz` | after `bfq7nf` | after `3c4g71` | after `zs7khh` | after `2r96m9` | after `rbd0a4` | after `w13xgb` | after `jzvxav` | after `h3q81d` | after `qjfwc6` | after `w089a0` | after `x3x0qj` | after `nxnnxe` | after `bf0jnj` + `pvhaew` | after `cttrag` | after `n84s1p` | after `jvy35h` | after `rb5wvb` |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| **total cells** | 423 | 421 | 409 | 407 | 405 | 404 | 404 | 405 | 404 | 402 | 402 | 402 | 403 | 406 | 406 | 406 | 404 | 404 | **403** |
-| family A (`tid=?`) cells | 84 | 61 | 47 | 45 | 35 | 34 | 34 | 33 | 32 | 28 | 28 | 28 | 26 | 23 | 23 | 23 | 21 | 21 | **20** |
-| family A rows | 1323 | 1224 | 1190 | 1050 | 1015 | 661 | 504 | 327 | 310 | 261 | 216 | 203 | 193 | 174 | 174 | 162 | 154 | 148 | **143** |
-| `Fn`-flat `tid=?` cells | 16 | 2 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | **0** |
-| agree | 362979 | 363711 | 363924 | 364187 | 364289 | 364674 | 364831 | 364883 | 364934 | 365243 | 365505 | 365580 | 365705 | 366051 | 366051 | 366125 | 366133 | 366139 | **366205** |
-| diverge rows | 5008 | 5003 | 4976 | 4837 | 4828 | 4474 | 4317 | 4296 | 4279 | 4249 | 4204 | 4191 | 4190 | 4185 | 4185 | 4173 | 4165 | 4190 | **4186** |
-| missing | 14 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | **1** |
+| | before `nz7drz` | after `nz7drz` | after `bfq7nf` | after `3c4g71` | after `zs7khh` | after `2r96m9` | after `rbd0a4` | after `w13xgb` | after `jzvxav` | after `h3q81d` | after `qjfwc6` | after `w089a0` | after `x3x0qj` | after `nxnnxe` | after `bf0jnj` + `pvhaew` | after `cttrag` | after `n84s1p` | after `jvy35h` | after `rb5wvb` | after `cjtxxr` |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| **total cells** | 423 | 421 | 409 | 407 | 405 | 404 | 404 | 405 | 404 | 402 | 402 | 402 | 403 | 406 | 406 | 406 | 404 | 404 | **403** | **401** |
+| family A (`tid=?`) cells | 84 | 61 | 47 | 45 | 35 | 34 | 34 | 33 | 32 | 28 | 28 | 28 | 26 | 23 | 23 | 23 | 21 | 21 | **20** | **18** |
+| family A rows | 1323 | 1224 | 1190 | 1050 | 1015 | 661 | 504 | 327 | 310 | 261 | 216 | 203 | 193 | 174 | 174 | 162 | 154 | 148 | **143** | **131** |
+| `Fn`-flat `tid=?` cells | 16 | 2 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | **0** | **0** |
+| agree | 362979 | 363711 | 363924 | 364187 | 364289 | 364674 | 364831 | 364883 | 364934 | 365243 | 365505 | 365580 | 365705 | 366051 | 366051 | 366125 | 366133 | 366139 | **366205** | **366248** |
+| diverge rows | 5008 | 5003 | 4976 | 4837 | 4828 | 4474 | 4317 | 4296 | 4279 | 4249 | 4204 | 4191 | 4190 | 4185 | 4185 | 4173 | 4165 | 4190 | **4186** | **4174** |
+| missing | 14 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | **1** | **1** |
 
 **`total cells` rose for three sweeps running (402 → 403 → 406) while `family A cells` fell
 (28 → 26 → 23), and that is the campaign turning a corner rather than losing ground.** A family-A
@@ -1503,6 +1504,23 @@ reaches the name comparison two lines below. These 40 rows are the flat universe
 structured pool deliberately does not, they are counted as class B correctly, and they disappear with
 `sv_tp` in Stage 4. It is the mirror image of the `TyKind`-flat-`Int` cell from `jvy35h`: there the pool
 has a kind the flat side cannot spell, here the flat side has a kind the pool does not.
+
+**`after cjtxxr` is the arithmetic closing with no residue at all, and it is the column to point at when
+someone doubts the instrument.** One `let` added to `src/typecheck.bl` (`fld_tid`) × 31 basis roots =
++31 total (370392 → 370423), all 31 into `agree` because both sides spell it `Int`; 12 family-A rows
+retired, all 12 converting rather than moving to another cell; so `Δagree = 31 + 12 = +43` and
+`Δdiverge = −12`, and `total cells` falls by 2 with no new cell created. Every figure in the column is
+predicted by those two facts.
+
+**And its twelfth row is the argument for why a family-A row count is a floor on the damage, not a
+measure of it.** Eleven rows were predicted from the ranking — the ten `var=resp` and the one `var=req`.
+The twelfth, `var=hdr_val tid=? flat=Str at=__main__:155`, is `let hdr_val =
+req.headers.get("X-Test").unwrap()` **two lines after** the `req` the fix cured: with `req` untyped its
+`headers` field, the `Map` lookup and the `unwrap` were all untyped too, and typing the producer typed
+the consumer for free. One missing signature was costing more counter rows than the site that lacked it,
+and the ranking cannot show that in advance because the downstream row's `var=` and `flat=` name a
+different shape entirely. Expect a fix's measured reduction to exceed its predicted one, and treat the
+excess as a hint about what else the same hole was suppressing.
 
 **The counter is not a severity ranking, and `n84s1p` is the clearest proof so far.** The worst defect
 in that ticket — `env.var`, a *silent miscompile* that compiled, linked, ran and printed `<value>` for
@@ -2929,7 +2947,95 @@ still resolving through their fnsigs, tail-return plus interpolation, and a user
 `elapsed` keeping its own `-> Int` — were green throughout. `task regen` + `task ci` green (647 test
 files, 0 failed; fmt 1514 passed, 0 failed).
 
-### Remaining family-A causes, ranked (20 cells / 143 rows)
+### cjtxxr — the last unchecked callable shape in the language (CLOSED, −12 rows)
+
+`obj.field(args)` where the struct declares `field: fn(A) -> B` got **no type and no check of any
+kind**: return type, arity, and every argument type all failed open at once. Every other callable shape
+was already correct, which is what made this a gap rather than a design question — and the deciding
+evidence was the *same field hoisted through a `let`*:
+
+| form | checked before this fix? |
+|---|---|
+| a closure **variable** — `let f = fn(n: Int) -> Str {..}` then `f(3)` | yes (`nz7drz`, `typecheck.bl:9012`) |
+| an **immediately-invoked** literal — `fn() -> Int { 7 }()` | yes (`x3x0qj`, `:9086`) |
+| a **fn-typed parameter** — `fn take(cb: fn(Int) -> Str)` then `cb(1)` | yes |
+| the field **hoisted** — `let g = h.cb` then `g(3)` | yes — it takes the closure-variable path |
+| the field **called directly** — `h.cb(3)` | **no** |
+
+The hoisted row is the whole diagnosis in one line: since `let g = h.cb; g(3)` errors correctly, the
+field's tid is already a real structured `TyKind.Fn`, so nothing was missing from the *type* — only from
+the *dispatch*.
+
+**Two halves to the cause, and the second is the tenth sighting of the allow-list class.** The
+`TyKind.Struct || TyKind.Enum` receiver block in `infer_type_uncached` (`:9638`) tries the
+trait-qualified/bare fnsig, the `rb5wvb` Instant intrinsics, then the `display`/`eq`/`cmp` derive arms — a
+closure **field** is none of those, so the call fell to `TYPE_UNKNOWN`. And E0505 did not catch it either:
+`tc_method_resolvable_on_type` clause (d) (`:372-375`) fail-opens on `is_callable_field_name(method)`, a
+**global** list of every field name declared `Fn` anywhere in the program, not a per-type check.
+
+**Clause (d)'s comment is what kept the hole open, and it had been false since `nz7drz`.** It reads
+*"closure fields lower to `TyKind.Typevar("Fn")`, not a closure kind, so reuse the callable-field name
+registry"* — true when written, and `nz7drz` gave `resolve_type_ann` a real `Fn` arm (`:2756`) that builds
+a structured tid via `make_fn_type`, which `register_struct_type` stores as the field's `sf.type_id`
+(`:3462`). A **name registry standing in for a type** is exactly what a stale premise leaves behind, and
+that premise is contradicted twice in the same file by comments written *for* `nz7drz` (`:753`, `:9005`).
+Worth generalizing: when a comment justifies an allow-list by "the structured form does not exist yet",
+that justification has an expiry date and nothing checks it.
+
+**The fix is a third dispatch, not new inference** —
+`tc_check_call_against_fn_tid(fld_tid, node_args(node), "closure field '{tname}.{method}'", node)`,
+guarded on `obj_k == TyKind.Struct` (an enum has variants, not fields) and on the field tid actually being
+a `Fn`, so a non-callable field sharing a name with some *other* struct's callable field still reaches
+E0505 as before. One `let`, one call.
+
+**Placement is fixed by codegen, and getting it wrong would have moved the miscompile rather than removed
+it.** `codegen_methods.bl` dispatches synthesized `display`, then `lookup_impl_method` (`:5323`), then the
+closure field (`:5333`) — so a trait-impl method of the same name wins there. The arm therefore sits
+**after** the fnsig lookup and immediately **before** the E0505 gate, and the shadowing control row *runs*
+the program and asserts on `99` (the impl's value) rather than `n=3` (the field's).
+
+**Eight fail-open modes, three of them silent miscompiles** that compiled, linked and ran:
+`let bad: Int = h.cb(3)` printed `bad=n=3`; a nested field receiver `o.inner.on_error(1, "x")` printed
+`bad=1:x`; and a struct-returning field left the whole result untyped, so `let b = h.cb(3)` followed by
+`let bad: Str = b.n` was accepted too — the hole propagating one hop past the call. The other five reached
+`cc`: argument position, a chained receiver (`h.cb(3).starts_with(5)` — `starts_with`'s *own* argument
+check was skipped because its receiver had no type), too many arguments, too few, and a wrong argument
+type. Arity **and** argument types **and** the return type, all in one shape.
+
+**The spec ships this shape as its own server design**, so the check invents nothing: `type Route` with
+`handler: fn(Request) -> Response` (`sections/04_effects.md:453`), plus a middleware list and
+`error_handler: fn(Request, ServerError) -> Response` (`:407-408`). `lib/std/testing.bl`'s
+`type Cleanup { action: fn() -> Void }` is the same shape in the stdlib. The field's declared annotation
+**is** its signature — the argument `nz7drz` made for the closure variable, one position over.
+
+**Attribution — exact, 12 rows, 3 root files, one stdlib cause:**
+
+| rows | invocation site | field declared in `lib/std/http_server.bl` |
+|---:|---|---|
+| 7 | `tests/test_net_integration.bl:58,69,80,107,120,162` (`var=resp`) and `:153` (`var=req`) | `Route.callback: fn(Request) -> Response`, `Hook.process: fn(Request) -> Request` |
+| 2 | `tests/test_middleware.bl:34,43` (`var=resp`) | `ErrorHandler.on_error: fn(Request, Str) -> Response` |
+| 2 | `tests/test_http_server.bl:39,89` (`var=resp`) | `Route.callback` |
+| 1 | `tests/test_net_integration.bl:155` (`var=hdr_val`) | **downstream** — see below |
+
+**Eleven rows were predicted and twelve moved, and the twelfth is the useful one.**
+`var=hdr_val tid=? flat=Str` at `:155` is `let hdr_val = req.headers.get("X-Test").unwrap()`, two lines
+after the `req` at `:153`: with `req` untyped, its `headers` field, the `Map` lookup and the `unwrap` were
+untyped as well. Typing the producer typed the consumer for free. The ranking could not have shown that in
+advance, because the downstream row's `var=` and `flat=` name an entirely different shape — so a family-A
+row count is a **floor** on what a cause costs, not a measure of it, and a fix beating its prediction is a
+hint about what else the same hole was suppressing.
+
+**Test:** `tests/test_cjtxxr_closure_field_call_signature.bl`, 13 rows, **10 red / 13 green**. Eight error
+rows and five controls: the correct call *running* and returning the closure's value, trait-impl
+shadowing, the hoisted-through-a-`let` reference implementation (pinned so the two paths cannot diverge
+again now that they are two dispatches to one function), a zero-arg `fn() -> Void` field of the `Cleanup`
+shape in both directions, and a two-parameter handler field checking its **second** argument — that last
+one witnesses `tc_check_call_against_fn_tid`'s argument loop rather than a one-argument special case.
+`task regen` + `task ci` green (648 test files, 0 failed; fmt 1516 passed, 0 failed). **No corpus test
+needed changing**, which also says no existing `fn(A) -> B` field declaration in `tests/`, `examples/`,
+`src/` or `lib/` disagreed with how it is called.
+
+### Remaining family-A causes, ranked (18 cells / 131 rows)
 
 Re-ranked from the post-`qjfwc6` sweep, by **rows on the 874-file common basis**, grouped by the
 innermost producer (the outermost call is usually a symptom — `.unwrap()` heads many chains, but its
@@ -3022,29 +3128,34 @@ it the pattern also matches inside `flat=`), because the flat spelling and the p
 different questions and disagreeing on which is "the" count is how the Ptr entry once acquired two
 figures:
 
-| module | family-A rows | | after `jvy35h` | after `n84s1p` | after `cttrag` | after `nxnnxe` | after `x3x0qj` | after `w089a0` | after `qjfwc6` | after `h3q81d` | after `jzvxav` | after `w13xgb` | after `rbd0a4` |
-|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| `__main__` (the root being compiled) | **120** | | 122 | 125 | 129 | 129 | 148 | 158 | 171 | 174 | 223 | 225 | 237 |
-| `std_libc` | **0** | | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 165 |
-| `std_net_tcp` | **0** | | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 40 | 40 | 40 | 40 |
-| `std_db_row` | **0** | | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 12 | 12 |
-| `cli` | **8** | | 8 | 11 | 11 | 11 | 11 | 11 | 11 | 11 | 11 | 11 | 11 |
-| `std_db_sqlite` | 9 | | 9 | 9 | 9 | 9 | 9 | 9 | 9 | 9 | 9 | 9 | 9 |
-| `incremental` / `file_watcher` | **0 each** | | 0 each | 0 each | 0 each | 6 each | 6 each | 6 each | 6 each | 6 each | 6 each | 6 each | 6 each |
-| `lsp` | **0** | | 0 | 0 | 4 | 4 | 4 | 4 | 4 | 6 | 6 | 6 | 6 |
-| `std_testing` | **0** | | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 3 | 3 |
-| `std_http_server` / `build_stdlib` | 3 each | | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each |
-| `pkg_resolver` | **0** | | 3 | 3 | 3 | 3 | 3 | 3 | 3 | 3 | 3 | 3 | 3 |
+| module | family-A rows | | after `rb5wvb` | after `jvy35h` | after `n84s1p` | after `cttrag` | after `nxnnxe` | after `x3x0qj` | after `w089a0` | after `qjfwc6` | after `h3q81d` | after `jzvxav` | after `w13xgb` | after `rbd0a4` |
+|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `__main__` (the root being compiled) | **108** | | **120** | 122 | 125 | 129 | 129 | 148 | 158 | 171 | 174 | 223 | 225 | 237 |
+| `std_libc` | **0** | | **0** | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 165 |
+| `std_net_tcp` | **0** | | **0** | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 40 | 40 | 40 | 40 |
+| `std_db_row` | **0** | | **0** | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 12 | 12 |
+| `cli` | **8** | | **8** | 8 | 11 | 11 | 11 | 11 | 11 | 11 | 11 | 11 | 11 | 11 |
+| `std_db_sqlite` | 9 | | 9 | 9 | 9 | 9 | 9 | 9 | 9 | 9 | 9 | 9 | 9 | 9 |
+| `incremental` / `file_watcher` | **0 each** | | **0 each** | 0 each | 0 each | 0 each | 6 each | 6 each | 6 each | 6 each | 6 each | 6 each | 6 each | 6 each |
+| `lsp` | **0** | | **0** | 0 | 0 | 4 | 4 | 4 | 4 | 4 | 6 | 6 | 6 | 6 |
+| `std_testing` | **0** | | **0** | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 3 | 3 |
+| `std_http_server` / `build_stdlib` | 3 each | | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each | 3 each |
+| `pkg_resolver` | **0** | | **0** | 3 | 3 | 3 | 3 | 3 | 3 | 3 | 3 | 3 | 3 | 3 |
 
-**Three consecutive fixes have now landed their whole delta in `__main__` and nowhere else** —
-`w089a0`'s −13 (171 → 158), `x3x0qj`'s −10 (158 → 148) and `nxnnxe`'s −19 (148 → 129). That is the
-expected shape for a fix to a **declaration site** or to a **syntactic form**: a `with ... as`
-clause, an `fn(..) { .. }()` call and an `@derive`d type are all written in the root under
-compilation, so unlike the stdlib causes there is no shared module for the rows to concentrate in. It
-is also why all three attributions are per-root-file (three, three and seven files) rather than
-per-module, and why the `__main__` figure is the one to watch from here — every stdlib module but
-`std_db_sqlite` is already at zero. **Every non-`__main__` figure is now unchanged for three
-sweeps**, so the tail is `__main__` plus the compiler's own source and nothing else.
+**Six consecutive fixes have now landed their whole delta in `__main__` and nowhere else** —
+`w089a0`'s −13 (171 → 158), `x3x0qj`'s −10 (158 → 148), `nxnnxe`'s −19 (148 → 129), `jvy35h`'s −3
+(125 → 122), `rb5wvb`'s −2 (122 → 120, its other 3 rows being `pkg_resolver`'s) and `cjtxxr`'s −12
+(120 → 108). That is the expected shape for a fix to a **declaration site** or to a **syntactic
+form**: a `with ... as` clause, an `fn(..) { .. }()` call, an `@derive`d type and a
+`route.callback(req)` field invocation are all written in the root under compilation, so unlike the
+stdlib causes there is no shared module for the rows to concentrate in. It is also why those
+attributions are per-root-file (three, three, seven and three files) rather than per-module, and why
+the `__main__` figure is the one to watch from here — every stdlib module but `std_db_sqlite` is
+already at zero. **`cjtxxr` is the sharpest case of that shape yet and worth reading carefully,
+because the CAUSE is in `lib/std/http_server.bl` — three closure fields on `Route`, `Hook` and
+`ErrorHandler` — while every row sits in `__main__`.** The rows land where the field is *invoked*, not
+where it is *declared*, so a stdlib cause can present as a pure-`__main__` signature. Do not read a
+`__main__`-only delta as "the defect was in the corpus".
 
 **`std_libc` went from a third of everything left to zero**, and it was one cause; `std_db_row` and
 `std_testing` went to zero on `jzvxav`, and it was one cause covering both; **`std_net_tcp` went from
@@ -3096,6 +3207,14 @@ below as *"not yet diagnosed"*: it was `to_rfc3339`, and the audit that found th
 the row. Reading the line would have named it in one command, which is the same lesson the `var=`-field
 paragraph draws two paragraphs down.
 
+**`cjtxxr` then took `__main__` 120 → 108 without moving any other row in this table, and its cause is in
+`lib/std/http_server.bl`.** That combination is the one to keep in mind when reading this column: the rows
+land where a closure field is *invoked* — three test roots — not where it is *declared*, so a stdlib cause
+can present as a pure-`__main__` delta. The non-`__main__` tail is unchanged: `std_db_sqlite` (9,
+`nrrs28`), `cli` (8), `std_http_server` / `build_stdlib` (3 each). And `std_http_server`'s own 3 rows are
+**not** this cause — they are `var=sem tid=? flat=Channel[Int]` at `:368`, which belongs to the held
+`Channel` group.
+
 **With `nxnnxe` closed, the top of the ranking is no longer actionable by row count**, and that is
 worth stating plainly because it changes how the remaining prerequisites should be picked. The two
 largest causes left are both *held* rather than open: **iterator adapters** (34) is deferred to
@@ -3104,16 +3223,28 @@ probably not a missing rule at all — the argument is a capacity, not an elemen
 belongs to `decisions/under-determined-types.md` / E0301. Below them the tail is genuinely flat:
 ~~`pub let` container element (12)~~ (**closed — `cttrag`**), **`jr4xf7` (14 — re-measured from the 4
 this list used to claim, and now the largest single remaining cause, blocked on a spec answer)**,
-closure-typed fields (~11), `Response`/`Request` (10), `nrrs28` (9), ~~`n84s1p` (9 → 6)~~ (**closed —
-−8**), `List.join` (6), ~~`bytes.to_str()` (3)~~ (**closed as a mis-attribution — it was `n84s1p`
-downstream**), ~~`pkg_resolver:312` (3, `var=generated`, not yet diagnosed)~~ (**closed — it was
+~~closure-typed fields (~11)~~ + ~~`Response`/`Request` (10)~~ (**one cause, not two — closed as
+`cjtxxr`, −12**), `nrrs28` (9), ~~`n84s1p` (9 → 6)~~ (**closed — −8**), `List.join` (6),
+~~`bytes.to_str()` (3)~~ (**closed as a mis-attribution — it was `n84s1p` downstream**),
+~~`pkg_resolver:312` (3, `var=generated`, not yet diagnosed)~~ (**closed — it was
 `Instant.to_rfc3339`, `rb5wvb`, −5 with the two `tests/test_time.bl` rows**).
 
-**Three of this ranking's entries have now been corrected by reading the row's own `var=` field, and
-two of the three were corrected *downward to zero*** — `bytes.to_str()` and the `env.var` half of
+**Four of this ranking's entries have now been corrected by reading the row's own `var=` field, and
+two of the four were corrected *downward to zero*** — `bytes.to_str()` and the `env.var` half of
 `n84s1p` were not causes at all, while `jr4xf7` was undercounted by more than 3×. The ranking is
 generated from line numbers; the `var=` field is generated from the binding. When they disagree the
 `var=` field wins, and one `sed -n '<line>p'` settles it.
+
+**`cjtxxr` is a new kind of ranking error and the one most likely to recur: two adjacent entries were
+the same cause.** "closure-typed fields (~11)" was grouped by a guess at the *mechanism*;
+"`Response`/`Request` (10)" was grouped by the `flat=` *spelling*; both name `route.callback(req)` /
+`hook.process(req)` / `srv.error_handler.on_error(req, msg)`, and the `~11`/`10` were the same rows
+counted twice under two labels. It also made the entry look like two ~10-row items rather than one
+12-row item — below `jr4xf7` (14, spec-blocked) either way, so the double-count cost nothing here, but
+it would have if the group had been larger. Mixing grouping keys in one ranking is what allows it:
+group every entry by the **producing expression**, and an entry named after a type spelling
+(`flat=QueryError`, `flat=PgError`, `flat=Event`) should be treated as un-triaged until its source line
+has been read.
 
 **`cttrag` was picked from that flat tail on a different criterion, and it is the one to keep using:
 the rows sat in the compiler's own source.** A cause inside `src/` can be reproduced, fixed and

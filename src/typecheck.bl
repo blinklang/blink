@@ -9705,6 +9705,38 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 if ot != -1 { return ot }
                 return TYPE_UNKNOWN
             }
+            // br cjtxxr. A closure-typed struct field invoked like a method —
+            // `route.callback(req)`, `srv.error_handler.on_error(req, msg)`, the
+            // `handler: fn(Request) -> Response` field the spec puts inside `type Route`
+            // (sections/04_effects.md:453). This block had no arm for it, so the call fell
+            // through to TYPE_UNKNOWN — and tc_method_resolvable_on_type clause (d)
+            // fail-opens on is_callable_field_name, a GLOBAL name list, so E0505 stayed
+            // silent too. Return type, arity and every argument type were all unchecked:
+            // the only callable shape in the language that was not.
+            //
+            // Nothing new is inferred here. resolve_type_ann's Fn arm (:2756, nz7drz)
+            // already gives every `fn(A) -> B` annotation a structured TyKind.Fn tid, and
+            // register_struct_type stores it as the field's sf.type_id — so this is the
+            // THIRD dispatch to tc_check_call_against_fn_tid, alongside the closure
+            // VARIABLE (:9012) and the immediately-invoked closure literal (:9086),
+            // against the same kind of tid. (Clause (d)'s comment claiming closure fields
+            // lower to TyKind.Typevar("Fn") predates nz7drz and is stale.)
+            //
+            // DELIBERATELY BELOW the fnsig lookup and above the E0505 gate, which mirrors
+            // codegen exactly: codegen_methods.bl tries synthesized display, then
+            // lookup_impl_method (:5323), then the closure field (:5333). A trait-impl
+            // method of the same name therefore wins in BOTH phases; typechecking the
+            // field instead would only move the miscompile.
+            //
+            // Guarded on TyKind.Struct — an enum has variants, not fields — and on the
+            // field tid actually being a Fn, so a non-callable field of the same name as
+            // some other struct's callable field still falls to E0505 as before.
+            if obj_k == TyKind.Struct {
+                let fld_tid = get_struct_field_tid(obj_t, method)
+                if fld_tid != -1 && type_kind(fld_tid) == TyKind.Fn {
+                    return tc_check_call_against_fn_tid(fld_tid, node_args(node), "closure field '{tname}.{method}'", node)
+                }
+            }
             // mrwgz4: the receiver type is KNOWN, but no resolution path matched.
             // Emit E0505 here (typecheck) instead of deferring to the codegen
             // backstop — name resolution belongs with E0504/E0506/E0507. Display
