@@ -3490,6 +3490,63 @@ pub fn stamp_list_elem_from_tid(node: Int, var_name: Str) -> ListElemStamp {
     ListElemStamp { ct: ect, sname: "" }
 }
 
+// br m039bn: stamp a Map var's key and value from `node`'s tid. The Map twin of
+// stamp_list_elem_from_tid, and it exists for the same reason that one does: the
+// state it repairs is not observable in this pool. A map ScopeVar spells its value
+// across exactly three flat channels — tp_child2_kind (the value's CT), sname2 (a
+// struct value's name) and extra (a LIST value's element ct) — and set_var(name,
+// CT_MAP) builds the tp through sv_tp, whose CT_MAP arm answers
+// `type_map(type_string(), type_int())` for an unknown pair (line 1573). So a Map
+// whose value was never recorded and a genuine `Map[Str, Int]` read back
+// identically, and no predicate over the flat fields can tell a caller which one it
+// holds. The tid can, so the tid leads — same argument as the bef42x note above.
+//
+// DECLINES rather than half-answers, on the same contract as its list sibling:
+//   - not a Map tid at all, or either side unfaithful under deep_tp_from_tid's -1
+//     sentinel (an unsubstituted typevar in a generic body reads that way);
+//   - a value kind the three channels cannot hold — an Option, Map or Result value.
+//     That gap is real and is br dcjy17, but it is a MISSING CHANNEL, not a missing
+//     authority: writing the value's CT with nowhere to put its inner would trade a
+//     value floored to Int for a value claimed to be an Option of Int, which is a
+//     different wrong answer and a louder one. Leave it to the ticket that adds the
+//     channel.
+// Answers whether it stamped, so a caller can keep its own fallback for the decline.
+pub fn stamp_map_from_tid(node: Int, var_name: Str) -> Bool {
+    let mtid = tc_tid_subst_mono(tc_lookup_node_tid(node), cg_mono_tparams_sl, cg_mono_arg_tids)
+    if tc_tid_ct(mtid) != CT_MAP { return false }
+    let key_tp = deep_tp_from_tid(tc_tid_map_key_tid(mtid))
+    let val_tp = deep_tp_from_tid(tc_tid_map_val_tid(mtid))
+    if key_tp == -1 || val_tp == -1 { return false }
+    let key_ct = tp_get_kind(key_tp)
+    let val_ct = tp_get_kind(val_tp)
+    let val_sname = tc_tid_map_val_struct(mtid)
+    let val_holdable = is_map_scalar_ct(val_ct) != 0 || val_sname != "" || val_ct == CT_LIST
+    if !val_holdable { return false }
+    let tracing = dbg_channel_on("listelem")
+    if tracing != 0 { dbg_trace("listelem", "stampmap var={var_name} key_ct={key_ct} val_ct={val_ct} val_sname={val_sname}") }
+    // A struct/enum value goes in as (CT_VOID, name): set_map_types routes exactly
+    // that pair to set_map_value_struct, and CT_VOID is the by-pointer convention
+    // the value carrier already uses for a named type.
+    let decl_val_ct = if val_sname != "" { CT_VOID } else { val_ct }
+    // Clear BEFORE writing, and clear even though this stamp is about to write the same
+    // three channels itself: two of them are only written CONDITIONALLY below (a struct
+    // name, a list element), so an unconditional write is not enough to displace an
+    // earlier guess. `Option[Map[Str, Str]].unwrap()` is the measured case — the branch
+    // above it reads the option's inner2 slot, gets a stray 0, and files it as "the value
+    // is a List of Int". Nothing here writes `extra` for a Str value, so without the
+    // clear, get_map_value_type_raw keeps answering CT_LIST off the stale field and this
+    // stamp's correct answer is never reached. See clear_map_value_meta for the ordering.
+    clear_map_value_meta(var_name)
+    set_map_types(var_name, key_ct, decl_val_ct, val_sname)
+    let key_sname = tc_tid_map_key_struct(mtid)
+    if key_sname != "" { set_map_key_struct(var_name, key_sname) }
+    if val_ct == CT_LIST && val_sname == "" {
+        let ve = tp_child1_kind(val_tp)
+        if ve >= 0 { set_map_value_list_elem(var_name, ve) }
+    }
+    true
+}
+
 // gemr3z: the Result twin of set_list_elem_option — record
 // `type_list(type_result(ok, err))` so List[Result[T,E]].get()/for-in carry both
 // concrete inners. ok_struct/err_struct name a struct/enum inner ("" for scalars).
@@ -4043,6 +4100,27 @@ pub fn get_map_value_list_elem(name: Str) -> Int {
         i = i - 1
     }
     -1
+}
+
+// br m039bn: empty BOTH value side-channels on a Map var, so a caller that knows the
+// whole value type can state it without an older, narrower write masking the answer.
+// The masking is not hypothetical and it is not symmetric: get_map_value_type_raw reads
+// `extra` FIRST and answers CT_LIST for any non-empty string, and sname2 SECOND for
+// CT_VOID, so tp_child2_kind — the only channel that can spell a scalar — is reached
+// only when both are empty. A recovery that writes `extra` on a guess therefore
+// outranks the tid permanently. set_map_types deliberately preserves both fields
+// (37h7n3's re-registration guard), which is right for a re-registration and wrong for
+// an authoritative restatement, so the restatement clears them first.
+pub fn clear_map_value_meta(name: Str) {
+    let mut i = scope_vars.len() - 1
+    while i >= 0 {
+        let sv = scope_vars.get(i).unwrap()
+        if sv.name == name && tp_get_kind(sv.tp_id) == CT_MAP {
+            scope_vars.set(i, ScopeVar { name: sv.name, ctype: sv.ctype, is_mut: sv.is_mut, inner1: sv.inner1, inner2: sv.inner2, sname: sv.sname, sname2: "", extra: "", ty: sv.ty, tp_id: sv.tp_id })
+            return
+        }
+        i = i - 1
+    }
 }
 
 pub fn copy_map_value_meta(src: Str, dst: Str) {

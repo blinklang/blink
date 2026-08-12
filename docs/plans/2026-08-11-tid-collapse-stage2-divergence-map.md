@@ -5245,6 +5245,128 @@ Net: the plan's speller bullet is **done**, one item on it is **deliberately exc
 excluding argument on the record, and the residue is re-scoped to Stage 4 group 4 where the blocking
 representation actually lives.
 
+### The Map value the trip through a List element could not carry (br `m039bn`)
+
+The scope split that `bef42x` left as a pointer, taken next. Measuring it first changed the
+ticket: **half of what the ticket claimed was a different cell**, and the half that was real is a
+missing *channel*, not a missing authority.
+
+**The axis is the route, and it is one route.** Each row run, not reasoned about:
+
+```blink
+Map[Str, List[Int]] as a plain local     m.get("c").unwrap().len()   WORKS
+the same Map out of a List element       m.get("c").unwrap().len()   FAILS
+a scalar value out of a List element     m.get("c").unwrap()         WORKS
+```
+
+Bound and chained fail identically (so not `6g6g7t`'s axis), annotated and unannotated fail
+identically (so not `bef42x`'s), and the Map **element** itself is recovered either way — `m.len()`
+and `m.contains_key("c")` answer right. Only the value's own element is gone.
+
+**The ticket's other bound was wrong, and splitting it was the point.** m039bn claimed an
+`Option`-valued Map *"FAILS the same way, so it is List and Option alike"*. It does fail — with **no
+List anywhere**: a plain local `Map[Str, Option[Int]]` loses its value type, and so does
+`Map[Str, Map[Str, Int]]`. A map `ScopeVar` spells its value across **exactly three** flat channels —
+`tp_child2_kind` (a scalar value's CT), `sname2` (a struct value's name), `extra` (a **List** value's
+element ct), read in that order by `get_map_value_type_raw` (`codegen_types.bl:3876`) — and there is
+**no slot for an Option, Map or Result value at all**. That is a value-**kind** cell, not a route
+cell, and it is now br `dcjy17`. Asserting it in this test would have tied one red test to two
+causes and hidden whichever was fixed second — the same discipline `bef42x` applied when it filed
+this ticket.
+
+**Where the route loses it.** `emit_list_method`'s `.get` `CT_MAP` branch spells the Option carrier
+`Map_{ktag}_{vtag}`, and `c_type_tag(CT_LIST)` is the element-agnostic `list`. Its `CT_LIST`,
+`CT_SET` and `CT_OPTION` siblings each thread the nested element onward **past** that lossy tag
+(`set_var_option_inner2`, or `set_var_option_inner_tp` for a deep one). The `CT_MAP` branch threads
+the value's **struct** name only (br `mvfd3m`) and has no line for the value's element. The
+downstream `.unwrap()` then reads `get_var_option_inner2` — precisely the channel nobody wrote —
+and falls back.
+
+**The erasure-factory argument, third sighting, now on the Map value channel.** The fallback is not
+"unknown": `set_var(name, CT_MAP)` builds the tp through `sv_tp`, and
+`sv_tp(CT_MAP, -1, -1, "")` returns `type_map(type_string(), type_int())`
+(`codegen_types.bl:1573`). **A value that was never recorded and a genuine `Map[Str, Int]` are the
+same pool state bit for bit** — so, exactly as in `bef42x`, no predicate over the flat fields can
+gate a recovery on "the value is missing", and the tid is the only authority that can tell them
+apart. Two units apart, on two different channels, the same structural fact.
+
+**So the fix is an authority flip at one branch, plus one thing that is easy to miss.**
+`stamp_map_from_tid(node, var_name)` (`codegen_types.bl`, next to its list sibling
+`stamp_list_elem_from_tid`) reads the `.unwrap()` node's tid — which holds `Map[Str, List[Int]]`
+whole — and writes key, value and, for a List value, the value's element. It is called **last** in
+the unwrap `CT_MAP` branch, so the tid wins over all three name-keyed recoveries above it rather
+than being clobbered by them.
+
+The part that is load-bearing and not obvious: the four `expr_map_*` globals are **republished from
+what the stamp actually wrote**. `emit_map_method`'s head (`codegen_methods.bl:1702`) computes
+`let base_val_ct = if !is_named_map_var && fb_val_ct >= 0 { fb_val_ct } else { base_val_ct0 }` — a
+**chained** receiver's caller-captured globals *override* the name-keyed lookup. Stamp the var and
+leave the globals holding the older answer, and the bound and chained spellings of one shape
+disagree. The first draft of this fix put the call at the **top** of the branch and skipped the
+republish; both halves of that were wrong for the same reason, and the chained rows are what say so.
+
+**It declines for an Option/Map/Result value, and that is not conservatism.** Those value kinds have
+nowhere to be written — the three channels above are the whole vocabulary. Writing the value's CT
+with no home for its inner would trade *"a value floored to `Int`"* for *"a value claimed to be an
+`Option` of `Int`"*: a different wrong answer, and a louder one. The decline leaves the recoveries
+above in charge of what the stamp will not claim, and br `dcjy17` owns the channel.
+
+**Attributed, not assumed.** Each row was compiled with `build/blinkc.bak` — the pre-regen compiler
+`task regen` leaves behind — as well as the new one. Non-`Str` keys (`Map[Int, List[Int]]`, which
+would otherwise read its key back as `sv_tp`'s fabricated `Str`) and a `List[List[Int]]` value both
+failed before and pass now; the **struct** value passed before, on the one channel the `CT_MAP`
+branch did thread. That row stays as the bound saying the missing channel was the value's
+**element** specifically, not the value. The `List`-of-`List` row also does not claim depth 3 is
+solved — `.get(0).unwrap().len()` needs the value's element to be a List, not that element's own
+element type; br `f9hgt9` owns the deeper cell.
+
+**And this time the census earned its keep — by flagging a fix that made a second cell worse.**
+On the intersected 956-file basis the first version of this fix read 4824 -> 4822 rows and 409 -> 409
+cells, with the diff showing one cell **gone** and one cell **arrived**:
+
+```
+- site=emit_let_binding.decl  tid=Map[Str, List[Int]]  flat=Map[Str, Int]        (the fixed shape)
++ site=emit_let_binding.decl  tid=Map[Str, Str]        flat=Map[Str, List[Int]]  (new, and not mine to want)
+```
+
+The arrival is `let m = o.unwrap()` on an `Option[Map[Str, Str]]` in
+`tests/test_option_map_list_ptr.bl` — a shape with **no `List` in it at all**. `task ci` was green and the emitted C for that
+file was **byte-identical** between the two compilers, so nothing in the test suite could have
+reported it; the counter was the only instrument that saw it.
+
+**The cause is channel priority, and it makes the stamp's correct answer unreachable.**
+`get_map_value_type_raw` reads `extra` **first** and answers `CT_LIST` for any non-empty string,
+`sname2` second, and `tp_child2_kind` — the only channel that can spell a scalar value — **last**.
+Ten lines above the stamp, the branch reads the option's `inner2` slot, gets a stray `0`, and files
+it as *"the value is a List whose element is Int"* — `CT_INT` **is** `0`, and it is also that slot's
+spelling for *"nothing recorded"* (`codegen_methods.bl:1302`), so the `map_nested >= 0` gate cannot
+tell a recorded `Int` element from an absent one. Filed as br `199132`, since the bad write outlives
+this fix wherever the stamp declines. The stamp then wrote `(Str, Str)` correctly into
+`tp_child2_kind` — the `listelem` tap confirms `val_ct=3` — and `set_map_types` **preserves** `extra`
+(37h7n3's re-registration guard, right for a re-registration and wrong for an authoritative
+restatement), so every reader still got `CT_LIST` off the stale field. My republish of
+`expr_map_val_type` then propagated that answer onto the bound name, which is why a latent wrong
+field became a visible wrong shape.
+
+**So an authoritative restatement has to clear what it is not going to write.** `clear_map_value_meta`
+empties both side-channels before the stamp writes, because two of the three writes are
+**conditional** — a struct name, a list element — and an unconditional write of only one field
+cannot displace an earlier guess in the other. With the clear in place **both** rows in that file
+disappear: the `Map[Str, List[Int]]` one this unit set out to fix, and the `Map[Str, Str]` one whose
+flat state had been wrong since before it. Final census on the same intersected basis: **`tydiv`
+4824 -> 4821 rows / 409 -> 408 cells, one cell removed and none added; `ctypediv` 23 rows / 7 cells
+unchanged.** The first census movement of
+Stage 3 that is not a rounding of the instrument.
+
+Two things worth keeping from that detour. The narrow one: *a channel that is read first can only be
+overruled by being cleared*, and the three-channel Map value carrier reads in the order `extra`,
+`sname2`, `tp_child2_kind` — so any future tid-led write into that carrier has the same obligation.
+The general one: the divergence counter is not only an inventory of work remaining, it is a
+**regression detector for the authority flips themselves**, and the thing it caught here was
+invisible to 668 passing tests and to a byte-identical diff.
+
+12 rows, 12 green, `task regen` at fixed point, `task ci` 668/668 with 0 fmt failures.
+
 ## Appendix — all 428 shape cells
 
 Format: `family | occurrences | tid | flat`.

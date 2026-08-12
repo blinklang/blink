@@ -1,0 +1,181 @@
+// br m039bn: a Map read OUT OF a List element loses its LIST value's element type, so reading the
+// value out is a hard error — while the identical Map declared as a plain local is fine.
+//
+// ── THE AXIS IS THE ROUTE, AND FINDING THAT MEANT CORRECTING THE TICKET ───────────────
+//
+// Measured before writing a line of the fix, each by running it:
+//
+//   Map[Str, List[Int]] as a plain local        m.get("c").unwrap().len()    WORKS
+//   the same Map out of a List element          m.get("c").unwrap().len()    FAILS
+//   scalar value out of a List element          m.get("c").unwrap()          WORKS
+//
+// So the axis is the trip through the List element, taken by a value kind whose flat slot the
+// trip does not carry. The annotation is irrelevant (both spellings fail identically), which
+// separates this from br bef42x where the annotation WAS the axis; chained and bound fail
+// identically, which separates it from br 6g6g7t where an expression receiver was the axis.
+// The Map ELEMENT is recovered correctly either way — `m.len()` and `m.contains_key("c")`
+// answer right. Only the value's own element is gone.
+//
+// The ticket also claimed an Option-valued Map failed "the same way, so it is List and Option
+// alike". It does fail — but it fails with NO List anywhere (`let mut m: Map[Str, Option[Int]]`,
+// then `m.get("c").unwrap().unwrap()`), so it was never this axis. A Map's flat value channel has
+// a slot for a scalar (tp_child2_kind), a struct (sname2) and a List (extra) and NO slot for an
+// Option, Map or Result value at all. That is br dcjy17, and it is a value-KIND cell, not a route
+// cell. Rows for it live there; asserting it here would tie one red test to two causes.
+//
+// ── WHERE IT WENT ────────────────────────────────────────────────────────────────────
+//
+// `emit_list_method`'s `.get` CT_MAP branch spells the Option carrier `Map_{ktag}_{vtag}` with
+// `vtag = c_type_tag(map_v)`, which for a List value is the element-agnostic `list`. Its CT_LIST,
+// CT_SET and CT_OPTION siblings all thread the nested element onward past that lossy tag
+// (`set_var_option_inner2`, or `set_var_option_inner_tp` for a deep one); the CT_MAP branch
+// threads only the value's STRUCT name and has no line for the value's element at all. The
+// downstream `.unwrap()` reads exactly the channel that was never written
+// (`project_list_of_map_value_type_threading`, one hop further out).
+//
+// The fix does not add a fifth flat channel, and not because a channel would be ugly: the state
+// it would have to test for cannot be seen. `set_var(name, CT_MAP)` builds the tp through
+// `sv_tp`, and `sv_tp(CT_MAP, -1, -1, "")` returns `type_map(type_string(), type_int())`, so a
+// lost value and a genuine `Map[Str, Int]` are the same pool state bit for bit — the erasure-
+// factory argument already recorded at `codegen_types.bl:3357`. The tid holds
+// `Map[Str, List[Int]]` whole, so the tid leads.
+//
+// Every row reads a value back THROUGH the lost element: a row that only checked "it compiles"
+// would pass on a wrong-but-compiling value type.
+
+fn lmapoflist() -> List[Map[Str, List[Int]]] {
+    let mut m: Map[Str, List[Int]] = Map()
+    m.insert("c", [3, 33])
+    let mut out: List[Map[Str, List[Int]]] = []
+    out.push(m)
+    out
+}
+
+fn limaplist() -> List[Map[Int, List[Int]]] {
+    let mut m: Map[Int, List[Int]] = Map()
+    m.insert(9, [3, 33])
+    let mut out: List[Map[Int, List[Int]]] = []
+    out.push(m)
+    out
+}
+
+fn lmapofll() -> List[Map[Str, List[List[Int]]]] {
+    let mut m: Map[Str, List[List[Int]]] = Map()
+    m.insert("c", [[1, 2], [3]])
+    let mut out: List[Map[Str, List[List[Int]]]] = []
+    out.push(m)
+    out
+}
+
+fn lmapofstr() -> List[Map[Str, Str]] {
+    let mut m: Map[Str, Str] = Map()
+    m.insert("c", "hi")
+    let mut out: List[Map[Str, Str]] = []
+    out.push(m)
+    out
+}
+
+// ── THE CELL ─────────────────────────────────────────────────────────────────────────
+
+test "an annotated List[Map[Str, List]] element keeps the value's element" {
+    let e: List[Map[Str, List[Int]]] = lmapoflist()
+    let m = e.get(0).unwrap()
+    let inner = m.get("c").unwrap()
+    assert_eq(inner.len(), 2)
+    assert_eq(inner.get(0).unwrap(), 3)
+    assert_eq(inner.get(1).unwrap(), 33)
+}
+
+test "the annotation is not the axis: unannotated keeps it too" {
+    let e = lmapoflist()
+    let m = e.get(0).unwrap()
+    assert_eq(m.get("c").unwrap().len(), 2)
+}
+
+test "the let is not the axis: the same chain with no binding" {
+    assert_eq(lmapoflist().get(0).unwrap().get("c").unwrap().len(), 2)
+    assert_eq(lmapoflist().get(0).unwrap().get("c").unwrap().get(1).unwrap(), 33)
+}
+
+test "the recovered value is a real List, not just a dispatchable one" {
+    let e = lmapoflist()
+    let m = e.get(0).unwrap()
+    let inner = m.get("c").unwrap()
+    let mut total = 0
+    for v in inner {
+        total = total + v
+    }
+    assert_eq(total, 36)
+}
+
+// The KEY survives the trip too, and it does not survive by luck: `Map[Int, ..]` would read its
+// key back as the fabricated Str default if nothing recovered it. Both rows failed before the fix
+// (attributed against the pre-regen compiler, not assumed).
+test "a non-Str key on a List-valued Map out of a list element" {
+    let e = limaplist()
+    let m = e.get(0).unwrap()
+    assert_eq(m.get(9).unwrap().len(), 2)
+}
+
+test "a non-Str key, chained" {
+    assert_eq(limaplist().get(0).unwrap().get(9).unwrap().get(0).unwrap(), 3)
+}
+
+// A List-of-List value: also broken before the fix, for the same reason. This reaches one level
+// further than the rows above but does NOT say depth 3 is solved — `.get(0).unwrap().len()`
+// needs only the value's element to be a List, not that element's own element type. That deeper
+// cell is br f9hgt9.
+test "a List-of-List value out of a list element" {
+    let e = lmapofll()
+    let m = e.get(0).unwrap()
+    assert_eq(m.get("c").unwrap().len(), 2)
+    assert_eq(m.get("c").unwrap().get(0).unwrap().len(), 2)
+}
+
+// ── THE BOUNDS, KEPT AS ROWS ─────────────────────────────────────────────────────────
+// All four already passed. They stay because they are what says the axis is a List-valued Map
+// reached through a List element, and not something broader.
+
+test "a scalar map value out of a list element already worked" {
+    let e = lmapofstr()
+    let m = e.get(0).unwrap()
+    assert_eq(m.get("c").unwrap(), "hi")
+}
+
+test "no list at all: the Map's own List value channel is fine" {
+    let mut m: Map[Str, List[Int]] = Map()
+    m.insert("c", [3, 33])
+    assert_eq(m.get("c").unwrap().len(), 2)
+}
+
+test "the Map element itself, not its value, always read back" {
+    let e = lmapoflist()
+    let m = e.get(0).unwrap()
+    assert_eq(m.len(), 1)
+    assert_eq(m.contains_key("c"), true)
+}
+
+test "a missing key still answers None through the recovered value type" {
+    let e = lmapoflist()
+    let m = e.get(0).unwrap()
+    assert_eq(m.get("nope").is_some(), false)
+}
+
+// A STRUCT map value already made this trip: set_var_option_inner2_struct is the one channel the
+// CT_MAP branch did thread (br mvfd3m). It is the bound that says the missing channel was the
+// value's ELEMENT specifically, not the value.
+type M039Pt { x: Int }
+
+fn lmapofpt() -> List[Map[Str, M039Pt]] {
+    let mut m: Map[Str, M039Pt] = Map()
+    m.insert("c", M039Pt { x: 5 })
+    let mut out: List[Map[Str, M039Pt]] = []
+    out.push(m)
+    out
+}
+
+test "a struct map value out of a list element already worked" {
+    let e = lmapofpt()
+    let m = e.get(0).unwrap()
+    assert_eq(m.get("c").unwrap().x, 5)
+}
