@@ -3547,6 +3547,46 @@ pub fn stamp_map_from_tid(node: Int, var_name: Str) -> Bool {
     true
 }
 
+// br ksx1q7: register a tuple-pattern binder whose element is a Map, reading the element's
+// own tid off the pattern node.
+//
+// The flat side cannot express this element at all. emit_tuple_typedef registers any tuple
+// field with a compound tag as `(CT_VOID, "Map_str_int")` — the tag goes in the STRUCT NAME
+// slot — so both binder sites file the variable as "a struct called Map_str_int", and
+// lookup_impl_method misses because Map's impls register under the bare head `Map`. The
+// emitted C was already right (c_type_c_name("Map_str_int") is `blink_map*`); only the
+// ScopeVar registration was wrong, which is why the symptom was an internal
+// `unresolved method '.len' on type Map[Str, Int]` rather than bad C.
+//
+// Reads the tid instead of adding a third `Map_` arm beside the binders' `Option_`/`Result_`
+// tag arms. A tag arm would have to parse a key and a value back out of a string that does
+// not carry them — `Map[Str, Map[Int, Bool]]` tags as `Map_str_map` — and the tag chain is
+// flat-universe machinery Stage 4 deletes.
+//
+// Differs from stamp_map_from_tid on ONE point, deliberately: an unholdable VALUE does not
+// abandon the KEY. stamp_map_from_tid answers a single question ("are both channels mine?")
+// for a caller that keeps its own recoveries for the value; a binder has no recoveries, so a
+// wholesale decline would leave `let (m, n) = t` erroring on `m.len()` where the same map
+// bound by `let m: Map[Str, Option[Int]] = ...` compiles and runs today. Matching the
+// declaration path exactly — key stamped, value at its existing floor — leaves br dcjy17 one
+// behaviour to fix instead of two.
+pub fn stamp_map_binder_from_tid(node: Int, var_name: Str, is_mut: Int) -> Bool ! Codegen.Scope {
+    let mtid = tc_tid_subst_mono(tc_lookup_node_tid(node), cg_mono_tparams_sl, cg_mono_arg_tids)
+    if tc_tid_ct(mtid) != CT_MAP { return false }
+    set_var(var_name, CT_MAP, is_mut)
+    if stamp_map_from_tid(node, var_name) { return true }
+    // The value is a kind the three channels cannot hold. Stamp the key on its own: the key
+    // is what selects the kops vtable, and leaving it unset is not a floor but a
+    // BLINK_COMPILER_BUG_kops_unsupported at the first insert.
+    let key_tp = deep_tp_from_tid(tc_tid_map_key_tid(mtid))
+    if key_tp != -1 {
+        set_map_types(var_name, tp_get_kind(key_tp), get_map_value_type_raw(var_name), get_map_value_struct(var_name))
+        let key_sname = tc_tid_map_key_struct(mtid)
+        if key_sname != "" { set_map_key_struct(var_name, key_sname) }
+    }
+    true
+}
+
 // br dcjy17: the carrier a `Map[K, V].get(k)` must return when V is a kind the Map's three
 // flat value channels cannot hold — an Option, a Result, a Set, or a nested Map.
 //

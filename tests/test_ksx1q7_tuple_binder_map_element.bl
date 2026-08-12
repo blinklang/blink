@@ -1,0 +1,266 @@
+// br ksx1q7: a Map-typed tuple-pattern binder is unusable. Both spellings fail, for two
+// different reasons, and the divergence census names each one at its own site:
+//
+//     match t { (a, b) => a.len() }
+//       bucket=diverge site=match_pattern.bind var=a tid=Map[Str, Int] flat=Map_str_int
+//
+//     let (a, b) = t
+//       bucket=missing site=tuple_destructure.elem var=a tid=- flat=-
+//
+// The DIVERGE half is a flat-universe erasure. A tuple element that has a compound tag is
+// registered as a struct field of CT_VOID carrying the tag as a struct NAME
+// (codegen_types.bl, emit_tuple_typedef's reg_sf_entry), so the binder comes out as "a
+// struct called Map_str_int". Both binder sites then decode only two tags — `Option_` and
+// `Result_` — and a `Map_` tag falls to the generic struct branch. codegen therefore NAMES
+// the receiver correctly off the tid and still has no dispatchable method for it:
+//
+//     error[UnresolvedMethod]: unresolved method '.len' on type Map[Str, Int] in 'main'
+//
+// The MISSING half is typecheck's. The LetBinding arm defined every tuple leaf as
+// TYPE_UNKNOWN outright:
+//
+//     nr_define_typed(node_name(tsp), is_mut, TYPE_UNKNOWN)
+//
+// so a `let` destructure never carried a leaf type at all — hence `on type ?`, and hence a
+// tap at that site that could report nothing but `missing`. The for-in and match paths run
+// through tc_check_pattern_types, which DOES decompose the tuple hint; only `let` did not.
+//
+// The fix must be tid-led, not tag-led. Adding a `Map_` arm beside `Option_`/`Result_` would
+// spell a third hand-written channel into a universe Stage 4 deletes, and it cannot answer
+// for a nested value (`Map[Str, Map[Int, Bool]]` has no scalar tag). The tid holds the whole
+// shape, so the binder reads it.
+//
+// A value kind the Map's three flat channels cannot hold (an Option, Result, Set or nested
+// Map value — br dcjy17) does NOT make the binder decline wholesale. The target is parity with
+// the DECLARATION path, and `let m: Map[Str, Option[Int]] = Map()` compiles and runs today —
+// so declining would leave `let (m, n) = t` erroring on `m.len()` for a map the very same
+// program can already hold under a plain name. That is an inconsistency, not caution. The key
+// is stamped either way (it selects the kops vtable, and an unstamped key is a
+// BLINK_COMPILER_BUG_kops_unsupported, not a floor); the value keeps whatever the flat channels
+// already had. The last test in this file is therefore DIFFERENTIAL: it asserts the two
+// spellings agree, so when dcjy17 gives the value somewhere to live, both move together and
+// neither can be fixed alone.
+
+import std.io
+import std.process.{ProcessResult}
+import compiler.{compile_to_program}
+import typecheck.{check_types, tc_lookup_node_tid, tc_type_str}
+import parser.{nodes, node_kind, node_name}
+import ast.{NodeKind}
+// Bare and LOAD-BEARING despite `warning[UnusedImport]` (br xrhq1c): codegen_types resolves
+// several globals it cannot import out of the MERGED program, and codegen_expr is the
+// smallest root whose transitive closure closes those back-references.
+import codegen_expr
+
+fn assert_eq_str(got: Str, want: Str, label: Str) {
+    if got != want { io.println("FAIL: {label} — got '{got}', want '{want}'") }
+    assert(got == want)
+}
+
+fn assert_true(got: Bool, label: Str) {
+    if !got { io.println("FAIL: {label} — expected true") }
+    assert(got)
+}
+
+// The published type of the tuple-pattern LEAF named `pname`, which is the node this
+// ticket's MISSING half is about. "NO-PAT" when no such pattern node exists, "NONE" when the
+// node exists and carries no tid — the two failures a bare "" would confuse.
+fn pat_ty(pname: Str) -> Str {
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.IdentPattern && node_name(i) == pname {
+            let tid = tc_lookup_node_tid(i)
+            if tid < 0 { return "NONE" }
+            return tc_type_str(tid)
+        }
+        i = i + 1
+    }
+    "NO-PAT"
+}
+
+fn typecheck_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    write_file(path, src)
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    fs.remove(path)
+}
+
+// ── Half A — typecheck decomposes a LetBinding tuple pattern ───────────────────
+
+fn let_leaf_src() -> Str {
+    #"fn main() {
+    let mut m: Map[Str, Int] = Map()
+    m.insert("k", 5)
+    let (mp, n) = (m, 2)
+    assert(mp.len() + n == 3)
+}
+"#
+}
+
+test "a let-destructured leaf carries its element type" {
+    typecheck_probe("build/ksx1q7_a1.bl", let_leaf_src())
+    // Was TYPE_UNKNOWN, written unconditionally. `on type ?` in the user-visible error is
+    // this line, and a tap at tuple_destructure.elem could only ever say `missing`.
+    assert_eq_str(pat_ty("mp"), "Map[Str, Int]", "the Map leaf of a let destructure is typed")
+    assert_eq_str(pat_ty("n"), "Int", "the scalar leaf of a let destructure is typed")
+}
+
+// ── Half B — the binder is usable, in all three spellings ─────────────────────
+//
+// One shape per path into a binder, because they are three different code paths that only
+// look alike: `let` and `for-in` share emit_tuple_destructure, `match` goes through
+// bind_pattern_vars, and the match scrutinee itself splits again (an Ident scrutinee routes
+// through the tuple-struct field registry, a literal one does not).
+
+test "a Map let-destructured out of a tuple is usable" {
+    let mut m: Map[Str, Int] = Map()
+    m.insert("k", 41)
+    let (mp, n) = (m, 1)
+    assert(mp.len() + n == 2)
+    // `.get` and not only `.len`: len needs no K/V at all, so it would pass on a CT_MAP with
+    // fabricated params. Reading a value back is what proves the key and value survived.
+    assert(mp.get("k").unwrap() + n == 42)
+}
+
+test "a Map bound by a match arm over an Ident scrutinee is usable" {
+    let mut m: Map[Str, Int] = Map()
+    m.insert("k", 41)
+    let t = (m, 1)
+    // An Ident scrutinee materializes the tuple and reads its elements out of the field
+    // registry (the erasing path). A tuple LITERAL scrutinee already worked, which is what
+    // made this look like a match bug rather than a tuple-element bug.
+    match t {
+        (mp, n) => {
+            assert(mp.len() + n == 2)
+            assert(mp.get("k").unwrap() + n == 42)
+        }
+    }
+}
+
+test "a Map bound by a for-in tuple pattern is usable" {
+    let mut m: Map[Str, Int] = Map()
+    m.insert("k", 41)
+    let mut total = 0
+    for (mp, n) in [(m, 1)] {
+        total = total + mp.len() + n
+        total = total + mp.get("k").unwrap()
+    }
+    assert(total == 43)
+}
+
+test "a mutable Map binder is still mutable" {
+    let mut m: Map[Str, Int] = Map()
+    m.insert("k", 1)
+    // The leaf type must not arrive at the cost of `mut`: the LetBinding arm threads its own
+    // is_mut into every leaf, and tc_check_pattern_types' IdentPattern hard-codes 0.
+    let mut (mp, n) = (m, 2)
+    mp.insert("j", 7)
+    assert(mp.len() + n == 4)
+}
+
+test "a nested Map value survives the binder" {
+    let mut inner: Map[Int, Bool] = Map()
+    inner.insert(1, true)
+    let mut outer: Map[Str, Map[Int, Bool]] = Map()
+    outer.insert("k", inner)
+    // Depth 2 is why the fix reads the tid: `Map[Str, Map[Int, Bool]]` has no scalar tag for
+    // a tag-decoding arm to parse. Only the outer level is exercised here — reading THROUGH
+    // to the inner map is br tavvwj and is not this ticket.
+    let (mp, n) = (outer, 2)
+    assert(mp.len() + n == 3)
+    assert_true(mp.contains_key("k"), "the depth-2 map keeps its key through the binder")
+}
+
+// ── Half C — controls: shapes that already worked must not change ──────────────
+
+test "List, Set, Str and Option elements are unaffected" {
+    // These elements carry their real CT in the tuple entry (no struct tag), so they never
+    // took the erasing branch. If the tid-led stamp starts claiming them too, one of these
+    // breaks — that is what they are here for.
+    let (xs, a) = ([1, 2, 3], 1)
+    assert(xs.len() + a == 4)
+
+    let mut s: Set[Int] = Set()
+    s.insert(7)
+    let (st, b) = (s, 1)
+    assert(st.len() + b == 2)
+    assert_true(st.contains(7), "the Set element keeps its member")
+
+    let (txt, c) = ("hello", 1)
+    assert(txt.len() + c == 6)
+
+    let o: Option[Int] = Some(5)
+    let (opt, d) = (o, 1)
+    assert(opt.unwrap() + d == 6)
+}
+
+test "a wildcard beside a Map binder still binds nothing" {
+    let mut m: Map[Str, Int] = Map()
+    m.insert("k", 5)
+    // The `_` leaf is skipped by codegen and must stay skipped; the Map beside it is the one
+    // that gets the stamp.
+    let (mp, _) = (m, 2)
+    assert(mp.len() == 1)
+}
+
+// ── Half D — the binder does not diverge from the declaration ─────────────────
+
+fn probe_path(tag: Str) -> Str { "build/ksx1q7_{tag}.bl" }
+
+fn run_probe(tag: Str, src: Str) -> ProcessResult {
+    let p = probe_path(tag)
+    write_file(p, src)
+    let r = process_run("sh", ["-c", "build/blink run {p} 2>/dev/null"])
+    fs.remove(p)
+    r
+}
+
+fn have_blink() -> Bool {
+    file_exists("build/blink") == 1
+}
+
+// The same Map[Str, Option[Int]] reached two ways. Its value is a kind the three flat channels
+// cannot hold (br dcjy17), so this is the shape where the fix had the most room to invent an
+// answer of its own.
+let DECLARED_SRC: Str = #"fn main() {
+    let mut m: Map[Str, Option[Int]] = Map()
+    m.insert("k", Some(7))
+    io.println("len={m.len()}")
+    io.println("has={m.contains_key("k")}")
+    match m.get("k") {
+        Some(v) => { io.println("get=some") }
+        None => { io.println("get=none") }
+    }
+}
+"#
+
+let BOUND_SRC: Str = #"fn main() {
+    let mut m: Map[Str, Option[Int]] = Map()
+    m.insert("k", Some(7))
+    let (mp, _n) = (m, 2)
+    io.println("len={mp.len()}")
+    io.println("has={mp.contains_key("k")}")
+    match mp.get("k") {
+        Some(v) => { io.println("get=some") }
+        None => { io.println("get=none") }
+    }
+}
+"#
+
+test "a binder agrees with the declaration for a value the flat channels cannot hold" {
+    if !have_blink() {
+        skip("build/blink is not present in this working tree")
+        return
+    }
+    let declared = run_probe("declared", DECLARED_SRC)
+    let bound = run_probe("bound", BOUND_SRC)
+    // Both spellings, not one: asserting the bound program's output alone would freeze
+    // whatever dcjy17 currently answers into a second place. Equality is the contract, so a
+    // later fix to the value channel drags the binder along and cannot be applied to only one.
+    assert_eq(declared.exit_code, 0)
+    assert_eq(bound.exit_code, 0)
+    assert_eq_str(bound.out, declared.out, "the binder and the declaration answer alike")
+    // And the answers must be the real ones, or two identically-broken programs would pass.
+    assert(declared.out.contains("len=1"))
+    assert(declared.out.contains("has=true"))
+}

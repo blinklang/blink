@@ -79,7 +79,7 @@ import codegen_types.{
     struct_reg_names, struct_reg_set, struct_result_c_type, sv_tp, tp_from_ann,
     type_int, type_string, type_struct, type_list, type_option, type_result, type_map, type_set, type_iterator,
     set_list_elem_option_tp, set_list_elem_result_tp, list_elem_unspellable,
-    stamp_list_elem_from_tid, map_val_carrier_from_recv, MapValCarrier,
+    stamp_list_elem_from_tid, stamp_map_binder_from_tid, map_val_carrier_from_recv, MapValCarrier,
     map_pair_from_recv, MapPairTid,
     split_result_compound, CompoundSplit, map_struct_scalar_kv, MapKvCt, typedef_tag_or_empty, tp_child1_kind, tp_child1_sname, tp_child2_kind, tp_child2_sname,
     tp_get_kind, tp_get_child1, tp_get_child2, tp_get_sname, type_from_name, type_from_name_tag,
@@ -2311,17 +2311,23 @@ fn bind_pattern_vars(pat: Int, scrut_off: Int, scrut_len: Int) ! Codegen.Emit, C
             let sn = entry.scrut_sname
             if sn != "" {
                 emit_line("{c_type_c_name(sn)} {c_bind} = {entry.str_val};")
-                if sn.starts_with("Option_") {
-                    set_var(bind_name, CT_OPTION, 1)
-                    set_var_option_from_struct_tag(bind_name, sn)
-                } else if sn.starts_with("Result_") {
-                    set_var(bind_name, CT_RESULT, 1)
-                    set_var_result_from_struct_tag(bind_name, sn)
-                } else {
-                    set_var(bind_name, CT_VOID, 1)
-                    set_var_struct(c_bind, sn)
-                    if is_data_enum(sn) != 0 {
-                        var_enums.push(VarEnumEntry { name: bind_name, enum_type: sn })
+                // Tid first, tag second. `sn` is the tuple field's struct-name slot, which
+                // emit_tuple_typedef also uses as a dumping ground for compound tags, so a
+                // Map element arrives here indistinguishable from a struct (br ksx1q7). The
+                // chain below decodes only two tags and would file it as a struct.
+                if !stamp_map_binder_from_tid(pat, bind_name, 1) {
+                    if sn.starts_with("Option_") {
+                        set_var(bind_name, CT_OPTION, 1)
+                        set_var_option_from_struct_tag(bind_name, sn)
+                    } else if sn.starts_with("Result_") {
+                        set_var(bind_name, CT_RESULT, 1)
+                        set_var_result_from_struct_tag(bind_name, sn)
+                    } else {
+                        set_var(bind_name, CT_VOID, 1)
+                        set_var_struct(c_bind, sn)
+                        if is_data_enum(sn) != 0 {
+                            var_enums.push(VarEnumEntry { name: bind_name, enum_type: sn })
+                        }
                     }
                 }
             } else {
@@ -3128,15 +3134,20 @@ fn emit_tuple_destructure(pat_node: Int, source_var: Str, struct_name: Str, is_m
         let c_elem = c_safe_name(elem_name)
         if fs != "" {
             emit_line("{c_type_c_name(fs)} {c_elem} = {source_var}.{field_name};")
-            if fs.starts_with("Option_") {
-                set_var(elem_name, CT_OPTION, is_mut)
-                set_var_option_from_struct_tag(elem_name, fs)
-            } else if fs.starts_with("Result_") {
-                set_var(elem_name, CT_RESULT, is_mut)
-                set_var_result_from_struct_tag(elem_name, fs)
-            } else {
-                set_var(elem_name, CT_VOID, is_mut)
-                set_var_struct(c_elem, fs)
+            // Tid first, tag second — same argument as the match-arm binder above: `fs` holds
+            // a COMPOUND TAG for a Map element, not a struct name, and the two-tag chain below
+            // would register the binder as a struct of that name (br ksx1q7).
+            if !stamp_map_binder_from_tid(sub_pat, elem_name, is_mut) {
+                if fs.starts_with("Option_") {
+                    set_var(elem_name, CT_OPTION, is_mut)
+                    set_var_option_from_struct_tag(elem_name, fs)
+                } else if fs.starts_with("Result_") {
+                    set_var(elem_name, CT_RESULT, is_mut)
+                    set_var_result_from_struct_tag(elem_name, fs)
+                } else {
+                    set_var(elem_name, CT_VOID, is_mut)
+                    set_var_struct(c_elem, fs)
+                }
             }
         } else {
             // /cr 296hpm follow-up: mirror emit_tuple_typedef's own scalar

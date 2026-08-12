@@ -49,10 +49,24 @@ the compiler modules):
 | A | `tid=?` — typecheck says Unknown, codegen has a concrete type | 94 | 2103 | **blocks Stage 3** |
 | B | `tid=Void` — typecheck erases to Void | 7 | 3154 | **blocks Stage 3** |
 | M | no tid at all | 1 | 39 | **blocks Stage 3** |
-| C | flat side erased (`List[Void]`, `List[]`, `Result[X, ]`, `Map[K, Void]`) | 100 | 731 | killed structurally by Stage 3 |
+| C | flat side erased (`List[Void]`, `List[]`, `Result[X, ]`, `Map[K, Void]`) | 100 | 731 | killed structurally by **Stage 4** (see correction below) |
 | D | enum stored as `Int` in codegen | 18 | 639 | resolved by construction |
 | E | same spelling both sides, differing `CT_*` (enum-vs-struct) | 28 | 864 | resolved by construction |
 | F | spelling / mono-stem / typevar-vs-concrete / fabricated payload | 180 | 579 | per-cell triage in Stage 3 |
+
+**Correction, made while working family C in Stage 3.** Family C is not killed by Stage 3. Every one of
+its rows is a `sv_tp` fabrication read through a flat slot that holds `-1`, so it survives as long as
+`sv_tp` exists — and `sv_tp` is deletion group 1 of **Stage 4**. Stage 3 can only stop *consulting* it
+per site, which is what each closed cell in this document does; the family clears wholesale when the
+factory goes. Stage 3's exit gate is therefore not "428 cells at zero" but "no site still asks `sv_tp`
+for an answer it can get from the tid".
+
+**Instrument limitation, on the same gate.** The tap compares *rendered shapes* (`tc_type_str` against
+the flat speller), so it cannot see a wrong `CT_*` hiding under an identical spelling. A tuple binder
+that loses `CT_STRINGBUILDER` reports `agree` for a program that does not compile — measured, br
+`v71vxv`. A zero counter is not a proof of agreement, and any class in that blind spot has to arrive as
+a hand-constructed shape rather than as a scheduled cell. Read with
+`feedback_corpus_sweep_is_not_coverage`.
 
 ### A + B + M — 102 cells, 5296 occurrences (65% of all divergence)
 
@@ -5808,6 +5822,10 @@ The tap deliberately does not re-derive the element from the tuple's `struct_nam
 A tap that manufactures the answer measures itself, and the `missing` rows are the evidence that
 `ksx1q7` is a real hole rather than a cosmetic one.
 
+> Since fixed — the LetBinding arm now decomposes the tuple tid, so the `let` row is a real comparison
+> like the for-in one. See *A tuple-pattern binder could not hold a Map* below; the 87 `missing` rows
+> this table predicted are 6, and those 6 have a different cause.
+
 The for-in half needed a typecheck change to be measurable at all. The ForIn arm called
 `tc_check_pattern_types(pat)` without setting a binding hint, so the walk ran with whatever
 `tc_pattern_binding_type` happened to hold from the last pattern checked anywhere — in practice
@@ -5884,6 +5902,11 @@ local or a `Some(m)` binder resolves. The ticket carries a second, sharper shape
 destructure (`let (a, b) = t`) reports `on type ?` — that path does not decompose the tuple at all.
 Reproduced on `build/blinkc.bak`, the generation before the pattern publish, so the tap did not
 introduce it.
+
+> Since fixed, and the reading above is wrong on the attribution: the method resolver was never at
+> fault. `receiver_type_name_for_diag` spells the receiver off `tc_lookup_node_tid`, which is why the
+> diagnostic could name `Map[Str, Int]` while the `ScopeVar` behind it was registered as a struct named
+> `Map_str_int`. Two defects in two phases, one symptom — see the ksx1q7 section below.
 
 **Byproduct: `node_elements()` is two functions under one name** (br `tdb6en`), carried over from
 `w224zg`: it answers a sublist id for some node kinds and a child node id for others, with nothing in
@@ -5977,6 +6000,9 @@ a shortfall: the diverge rows are for-in leaves the tid can spell and the flat p
 `tid=(Int, Str) flat=Tuple2_int_str`), and the 87 missing rows are `let (a, b) = t` binders that carry
 no tid because typecheck does not decompose a LetBinding tuple pattern at all (br `ksx1q7`). The
 missing bucket is that ticket's corpus-wide size.
+
+> That prediction held: closing `ksx1q7` took the site to 97 agree / 18 diverge / 6 missing, and the 6
+> that remain are `.enumerate()` / `.zip()` heads with no return type at all, not `let` binders.
 
 21 rows, 21 green across five test files, `task regen` at fixed point for each sub-step, `task ci`
 exit 0 with 676/676 test files and fmt 1572 passed / 0 failed.
@@ -6221,6 +6247,238 @@ types can be built by hand instead of coaxed out of the stdlib.
 
 Stage 0's exhaustiveness net did its job here without being asked: adding the fourth `TyDiv` variant made
 the compiler name the three-arm `match` in the test file. That is the whole reason the enum came first.
+
+## A tuple-pattern binder could not hold a Map (br `ksx1q7`)
+
+Taken next because it is the only remaining ticket that closes two census cell families with one
+change, and because both families were the *large* remainder at their sites: 87 of 121 rows at
+`tuple_destructure.elem` and 20 at `match_pattern.bind`. It also turned out to be two defects in two
+phases wearing one symptom, which is why the ticket had sat as "the diagnostic names the type, so the
+*method resolver* declines" — a reading that was wrong about which component was at fault.
+
+### The symptom named the type it could not dispatch
+
+```
+error[UnresolvedMethod]: unresolved method '.len' on type Map[Str, Int] in 'main'    ← match / for-in
+error[UnresolvedMethod]: unresolved method '.len' on type ?      in 'main'           ← let
+```
+
+Two different messages for what looks like one program shape, and the pair is the whole diagnosis.
+The trailing `in '<fn>'` is the tell: there are two `UNRESOLVED_METHOD` emitters and only the
+**codegen** one (`src/codegen_methods.bl:5590`) appends the enclosing function name; typecheck's
+(`src/typecheck.bl:10199`) does not. So typecheck was content with both programs and codegen refused
+both — and `receiver_type_name_for_diag` reads `tc_lookup_node_tid(obj_node)`, which is why the
+message could spell `Map[Str, Int]` correctly *while dispatch failed*. The type was in hand at the
+moment of the error. Nothing was missing except codegen's willingness to read it.
+
+**`blink check` said `ok` for both MVCEs, exit 0.** That is not a mistake in the probe, it is the
+localization: `cmd_check` (`src/cli.bl:2327`) runs `compile_to_program` + `check_types` +
+`check_unused_imports` + `analyze_escapes` and never enters codegen, so every codegen-emitted
+diagnostic is invisible to it. Filed as br `dcchwn` — a green `check` followed by a red `build` is
+worse than no check, and this is the second time in this project that a status code meant something
+other than what it looked like (br `83ywd6` is the first).
+
+### Half one: typecheck defined every `let` tuple leaf as Unknown
+
+`src/typecheck.bl`, the LetBinding arm of `tc_check_body`, three lines below where it computes and
+publishes the tuple's own tid:
+
+```blink
+nr_define_typed(node_name(tsp), is_mut, TYPE_UNKNOWN)
+```
+
+Unconditional, for every leaf. So `let (m, n) = t` bound two variables of no type at all, and the
+`on type ?` message is that line rendered. The for-in and match spellings of the same destructure go
+through `tc_check_pattern_types`, whose `TuplePattern` arm **does** decompose the hint — so only
+`let` was uncovered, and `tests/test_7xgbh6_tuple_destructure_divergence_tap.bl`'s asymmetry table
+had already recorded exactly that without naming it a typecheck bug.
+
+The fix decomposes `final_tid` in place, through the Stage-1 accessors:
+
+```blink
+let tc_let_tup = tc_tid_resolved(final_tid)
+let mut tc_let_arity = -1
+if tc_tid_kind(tc_let_tup) == TyKind.Tuple { tc_let_arity = tc_tid_child_count(tc_let_tup) }
+```
+
+then `tc_tid_child(tc_let_tup, tpi)` per leaf, with `nr_define_typed` **and**
+`tc_publish_node_tid(tsp, …)` so codegen reads it from the same memo it reads inferred types from.
+
+Two details are load-bearing:
+
+* **Not delegated to `tc_check_pattern_types`.** Its `IdentPattern` arm hard-codes
+  `nr_define_typed(name, 0, tc_pattern_binding_type)` — the `0` is `is_mut`. Reusing it would have
+  taken `mut` away from every destructured binder, and `let mut (m, n) = t` followed by `m.insert(…)`
+  works today. That row is in the test.
+* **A leaf past the tuple's arity stays Unknown.** Not clamped to the last child, not borrowed from a
+  neighbour. Wrong-arity destructuring is diagnosed elsewhere; shifting a type into it would convert
+  that error into a miscompile — the same argument written on `tc_tid_child` for why it answers `-1`
+  rather than a plausible default.
+
+### Half two: codegen's binders decode two tags, and a Map is not one of them
+
+The flat side cannot express this element *at all*, and the erasure is at
+`src/codegen_types.bl:6425`, in the tuple typedef's field registration:
+
+```blink
+if es != "" {
+    reg_sf_entry(c_name, fname, CT_VOID, es, sv_tp(CT_VOID, -1, -1, es))
+} else {
+    reg_sf_entry(c_name, fname, et, "", sv_tp(et, -1, -1, ""))
+}
+```
+
+Any element with a compound tag has its real `CT_*` replaced by `CT_VOID` and its tag moved into the
+**struct-name** slot. Both binder sites then sniff that slot for a prefix — `Option_`, `Result_`, and
+nothing else (`bind_pattern_vars`' IdentPattern arm and `emit_tuple_destructure`, byte-identical
+chains) — so a `Map_str_int` tag falls to the generic branch and the variable is registered as a
+struct of that name. `lookup_impl_method("Map_str_int", "len")` then misses, because Map's impls
+register under the bare head `Map`.
+
+**The emitted C was already correct**, which is worth stating because it bounds the fix:
+
+```c
+blink_map* mp = _scrut_1._0;
+int64_t     n = _scrut_1._1;
+```
+
+`c_type_c_name("Map_str_int")` is `blink_map*`. Only the `ScopeVar` registration was wrong. So the
+change is `set_var` and the Map channels, and not one byte of emission.
+
+`stamp_map_binder_from_tid` (`src/codegen_types.bl`) leads at both sites, ahead of the tag chain
+rather than beside it:
+
+```blink
+if !stamp_map_binder_from_tid(pat, bind_name, 1) {
+    …the existing Option_/Result_/struct chain, unchanged…
+}
+```
+
+**No `Map_` arm was added, deliberately.** A third `starts_with` arm would have to parse a key and a
+value back out of a string that does not carry them — `Map[Str, Map[Int, Bool]]` tags as
+`Map_str_map` — and the chain is flat-universe machinery Stage 4 deletes. The tid holds the whole
+shape at depth, so the tid is read.
+
+### Where the new helper deliberately differs from `stamp_map_from_tid`
+
+On one point: **an unholdable value does not abandon the key.**
+
+`stamp_map_from_tid` answers a single yes/no — "are both channels mine?" — and declines wholesale
+when the value is a kind the Map's three flat channels cannot hold (an Option, Result, Set or nested
+Map value; br `dcjy17`). That contract is right for its one caller, which keeps its own recoveries
+for the value. A binder has no recoveries, and declining there would have produced this:
+
+```blink
+let m: Map[Str, Option[Int]] = Map()      // compiles and runs today
+let (m2, n) = (m, 2)                      // …would still error on m2.len()
+```
+
+The same map, held under a plain name and under a destructured one, with two different answers. That
+is an inconsistency, not caution. So the binder stamps the key unconditionally — the key selects the
+kops vtable, and an unstamped key is a `BLINK_COMPILER_BUG_kops_unsupported` at the first insert,
+not a floor — and leaves the value at whatever the flat channels already held. Measured parity, both
+spellings, including `.get`:
+
+```
+declared: len=1  has=true  get=some
+bound:    len=1  has=true  get=some
+```
+
+The test asserts that as **equality between the two programs**, not as the literal expected output.
+Asserting the bound program's output alone would freeze whatever `dcjy17` currently answers into a
+second place; equality means a later fix to the value channel drags the binder along and cannot be
+applied to one spelling only.
+
+### Measured result — 89 rows cleared, 13 rows became *visible*, and the arithmetic closes
+
+Monolithic sweep, 967-file common basis (`comm -12` of both sweeps' file sets):
+
+| site | agree | diverge | missing |
+| --- | --- | --- | --- |
+| `tuple_destructure.elem` before | 29 | 5 | 87 |
+| `tuple_destructure.elem` after | **97** | **18** | **6** |
+| `match_pattern.bind` before | 9622 | 488 | 20 |
+| `match_pattern.bind` after | **9630** | **488** | **12** |
+
+−81 missing at `tuple_destructure.elem` = +68 agree +13 diverge, exactly. All **5** pre-existing
+diverge rows survive unchanged (`comm -23` of the two row sets is empty), so nothing was masked to
+buy the improvement. At `match_pattern.bind`, −8 missing / +8 agree with diverge untouched. Every
+other site in the corpus is unchanged except two that gained `agree` rows only
+(`emit_fn_params.param` +105, `emit_let_binding.decl` +210, no new diverge or missing anywhere).
+
+**The +13 diverge rows are the instrument gaining sight, not the fix losing ground.** They were
+`missing` because the leaf had no tid; there was nothing to compare. Now there is, and they
+disagree — but codegen's treatment of those shapes did not change (the stamp fires only for
+`CT_MAP`) and all of them run green in `task ci`. Their attribution:
+
+* **12 rows, family E** — same spelling on both sides, differing `CT_*`: `tid=Option[Cmd]
+  flat=Option[Cmd]`, `tid=Cmd flat=Cmd` (`test_tuple_bare_none.bl`,
+  `test_tuple_option_user_enum.bl`, `test_8vnjrm_tuple_enum_element_carrier.bl`,
+  `test_295z9x_generic_tuple_option_enum_return.bl`). A user enum registered through the
+  struct-name slot, so the flat CT is struct-shaped where the tid says `Enum`. Family E's published
+  disposition is *resolved by construction* — they clear when Stage 4 deletes the CT split.
+* **1 row, family F** — `tid=Option[Cmd] flat=Option[test_295z9x_generic_tuple_option_body_helper_Cmd]`:
+  the flat side carries the mono-mangled *physical* name where the tid carries the logical one. Same
+  type, two namespaces (`feedback_module_vs_c_prefix`). Family F is per-cell triage in Stage 3.
+
+### The residual is 18 rows, and none of them are this ticket
+
+Attributed individually rather than left as a remainder:
+
+* **6 rows, `tuple_destructure.elem`, all `test_44xww4_enumerate_zip_compound.bl`** — `for (i, x) in
+  a.enumerate()` / `for (a, b) in x.zip(y)`. Typecheck has **no return type for either adapter**:
+  `enumerate` and `zip` appear in `is_builtin_method`'s name list (`src/typecheck.bl:6507`) and
+  nowhere else in the file, so `infer_type` answers Unknown, the ForIn hint is `-1`, and
+  `tc_check_pattern_types`' TuplePattern arm takes its `tup_start = -1` path. Reproduced standalone:
+  the loop *runs correctly* (the flat side handles it) while the loop variable itself reports
+  `bucket=missing site=emit_for_in.var var=_tuple`. Same root as the 11 open `emit_for_in.var` rows,
+  and it is upstream of any binder — br `44xww4` is closed and was about the codegen materializer,
+  not about typing the pair.
+* **8 rows, `match_pattern.bind`, `test_j0cdey_hof_list_compound.bl`** — `Some(v)` / `Err(_e)`
+  payload binders inside a closure passed as a method argument (`c.map(fn(x: Option[Int]) -> Int {
+  match x { … } })`). The closure body is never typecheck-walked in that position, so nothing inside
+  it carries a tid: br `1hg8b6`, already open with this exact cause.
+* **4 rows, `match_pattern.bind`, `test_yb3a4z_tuple_lit_option_element.bl`** — `var=e` only, never
+  `var=v`, from `match (Ok(3), 9) { (a, n) => … match a { Ok(v) => v  Err(e) => 0 } }`. A bare
+  `Ok(3)` leaves the error type under-determined, so the `Err` binder has genuinely nothing to be
+  typed as. That is br `8vcj2c`/`gqg3rk`'s E0301 population, and the fact that `v` cleared while `e`
+  did not is the confirmation.
+
+### A second-order confirmation nobody asked for
+
+The 8 rows that cleared at `match_pattern.bind` are not tuple leaves at all — they are `v`, `e`,
+`_v`, `_e` in `tests/test_tuple_result_destructure.bl`: `let (a, b) = t` where `a` is a `Result`,
+followed by `match a { Ok(v) => …  Err(e) => … }`. Typing the *leaf* gave the inner match a
+scrutinee type, which gave its payload binders theirs. One typecheck line, two sites.
+
+### The instrument cannot see the rest of this defect class, and that is the finding to carry forward
+
+Two sibling shapes were found by hand after the fix, and **both report `agree`**:
+
+```
+$ BLINK_TRACE_CHANNELS=tydiv build/blinkc sb.bl out.c
+summary tuple_destructure.elem agree=2 diverge=0 missing=0 unknown=0
+$ build/blink build sb.bl
+error[UnresolvedMethod]: unresolved method '.append' on type StringBuilder in 'main'
+```
+
+The tap compares *rendered shapes*. `Map_str_int` ≠ `Map[Str, Int]` as text, which is the only reason
+the Map cell was ever visible; `StringBuilder` is spelled identically on both sides, so a `CT_VOID`
+where `CT_STRINGBUILDER` belongs reads as agreement. A nested container element
+(`List[List[Int]]`, `List[Map[Str, Int]]`) fails the same way for a different reason — the outer CT
+is right and no binder site calls `stamp_list_elem_from_tid`, so the inner read decodes against
+`sv_tp`'s fabrication.
+
+Filed as br `v71vxv` with all three MVCEs and the controls that bound the class (Bytes, Set, plain
+List, Channel, Tuple, Str, `Option[List[Int]]` all work). **Stage 3's exit gate would not have
+scheduled any of them**, so the ticket is the schedule. Read alongside
+`feedback_corpus_sweep_is_not_coverage`: a zero-hit sweep is an unexercised tap, and this is the
+sharper version — an `agree` row is not a proof of agreement when both sides render the same string
+for different types.
+
+Test: `tests/test_ksx1q7_tuple_binder_map_element.bl`, 9 rows — 8 red before (the file did not
+compile, which is the honest red for this ticket), 9 green after. `task regen` at fixed point;
+`task ci` exit 0, 679/679 test files, fmt 1578 passed / 0 failed.
 
 ## Appendix — all 428 shape cells
 
