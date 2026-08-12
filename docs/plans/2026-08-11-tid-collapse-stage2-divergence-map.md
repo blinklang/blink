@@ -62,11 +62,20 @@ factory goes. Stage 3's exit gate is therefore not "428 cells at zero" but "no s
 for an answer it can get from the tid".
 
 **Instrument limitation, on the same gate.** The tap compares *rendered shapes* (`tc_type_str` against
-the flat speller), so it cannot see a wrong `CT_*` hiding under an identical spelling. A tuple binder
-that loses `CT_STRINGBUILDER` reports `agree` for a program that does not compile — measured, br
-`v71vxv`. A zero counter is not a proof of agreement, and any class in that blind spot has to arrive as
-a hand-constructed shape rather than as a scheduled cell. Read with
+the flat speller), so in principle it cannot see a wrong `CT_*` hiding under an identical spelling: a
+zero counter is not a proof of agreement, and a class in that blind spot would have to arrive as a
+hand-constructed shape rather than as a scheduled cell. Read with
 `feedback_corpus_sweep_is_not_coverage`.
+
+> **Retraction.** An earlier version of this note cited a tuple binder losing `CT_STRINGBUILDER` as a
+> measured instance, from br `v71vxv`. That instance is not real — the probe behind it called
+> `sb.append(...)`, which `StringBuilder` does not have, and the shape binds correctly on the pre-fix
+> compiler. Every real row of that ticket's class was a **visible** `bucket=diverge` row. The general
+> caution above stands and does have a measured instance — `Map[Str, List[Int]]` reads `agree` at the
+> `emit_fn_params.param` cell because `sv_tp` fabricates the missing element as `Int` — but that is a
+> fabrication matching by luck, not two spellings colliding, and it is a narrower hole than the note
+> originally claimed. What is *not* narrow: the count of rows in a class says nothing about its size.
+> `v71vxv` is six shapes wide and the whole corpus contained two rows of it.
 
 ### A + B + M — 102 cells, 5296 occurrences (65% of all divergence)
 
@@ -6248,7 +6257,7 @@ types can be built by hand instead of coaxed out of the stdlib.
 Stage 0's exhaustiveness net did its job here without being asked: adding the fourth `TyDiv` variant made
 the compiler name the three-arm `match` in the test file. That is the whole reason the enum came first.
 
-## A tuple-pattern binder could not hold a Map (br `ksx1q7`)
+## A tuple-pattern binder could not hold a Map, or a container element (br `ksx1q7`, br `v71vxv`)
 
 Taken next because it is the only remaining ticket that closes two census cell families with one
 change, and because both families were the *large* remainder at their sites: 87 of 121 rows at
@@ -6451,34 +6460,86 @@ The 8 rows that cleared at `match_pattern.bind` are not tuple leaves at all — 
 followed by `match a { Ok(v) => …  Err(e) => … }`. Typing the *leaf* gave the inner match a
 scrutinee type, which gave its payload binders theirs. One typecheck line, two sites.
 
-### The instrument cannot see the rest of this defect class, and that is the finding to carry forward
+### The rest of this defect class — br `v71vxv`, and a retraction of what this section first said
 
-Two sibling shapes were found by hand after the fix, and **both report `agree`**:
+The Map arm fixed one shape. Sibling shapes found by hand after the fix, all through the same
+binders, in the let / match-arm / for-in forms alike:
 
 ```
-$ BLINK_TRACE_CHANNELS=tydiv build/blinkc sb.bl out.c
-summary tuple_destructure.elem agree=2 diverge=0 missing=0 unknown=0
-$ build/blink build sb.bl
-error[UnresolvedMethod]: unresolved method '.append' on type StringBuilder in 'main'
+List[Str]           -> 943501557530581   (correct: a1)   SILENT
+List[(Int, Str)]    -> <value>1          (correct: a1)   SILENT
+List[List[Int]]     -> error[UnresolvedMethod] .len/.get on type List[Int]
+List[Map[Str,Int]]  -> error[UnresolvedMethod] .len/.get on type Map[Str, Int]
+List[Option[Int]]   -> error[UnresolvedMethod] .unwrap on type Option[Int]
+List[Set[Int]]      -> error[UnresolvedMethod] .len/.contains on type Set[Int]
 ```
 
-The tap compares *rendered shapes*. `Map_str_int` ≠ `Map[Str, Int]` as text, which is the only reason
-the Map cell was ever visible; `StringBuilder` is spelled identically on both sides, so a `CT_VOID`
-where `CT_STRINGBUILDER` belongs reads as agreement. A nested container element
-(`List[List[Int]]`, `List[Map[Str, Int]]`) fails the same way for a different reason — the outer CT
-is right and no binder site calls `stamp_list_elem_from_tid`, so the inner read decodes against
-`sv_tp`'s fabrication.
+The outer CT is right and no binder site called `stamp_list_elem_from_tid`, so the inner read
+decoded against `sv_tp`'s fabrication. The two silent rows are the severe half: `List[Int]` passes
+only because the fabrication happens to be right, and `List[Str]` is the same cell one element over,
+where the emitted C reads a `const char*` slot as `int64_t`.
 
-Filed as br `v71vxv` with all three MVCEs and the controls that bound the class (Bytes, Set, plain
-List, Channel, Tuple, Str, `Option[List[Int]]` all work). **Stage 3's exit gate would not have
-scheduled any of them**, so the ticket is the schedule. Read alongside
-`feedback_corpus_sweep_is_not_coverage`: a zero-hit sweep is an unexercised tap, and this is the
-sharper version — an `agree` row is not a proof of agreement when both sides render the same string
-for different types.
+> **Retraction — this section originally claimed the instrument could not see any of it, and that
+> claim was wrong twice over.**
+>
+> It cited a `StringBuilder` element losing `CT_STRINGBUILDER` while the tap read
+> `summary tuple_destructure.elem agree=2 diverge=0 missing=0`, and concluded *"Stage 3's exit gate
+> would not have scheduled any of them, so the ticket is the schedule."*
+>
+> The probe was invalid: it called `sb.append(...)` and `sb.build()`, and `StringBuilder` has
+> neither — the API is `.write` / `.write_char` / `.write_int` / `.write_float` / `.write_bool` /
+> `.to_str` / `.len` / `.capacity` / `.clear` / `.is_empty`. The compile error was `unknown method
+> 'append'` on a *correctly bound* StringBuilder, and the `agree=2` was the tap telling the truth.
+> Re-probed with the real API against the pre-fix compiler: the binder prints `x1`. There is no
+> StringBuilder defect, so the fix has no arm for it.
+>
+> And every real row above **was** visible. Measured on the pre-fix compiler, each of the six
+> shapes emitted a per-occurrence row:
+>
+> ```
+> bucket=diverge site=tuple_destructure.elem var=b tid=List[Str] flat=List[Int] at=__main__:3
+> summary tuple_destructure.elem agree=1 diverge=1 missing=0 unknown=0
+> ```
+>
+> Stage 3's counter gate would have scheduled the whole class. The lesson the section was reaching
+> for survives in a different form: the corpus contained exactly **two** rows of this six-shape
+> class, both `List[Str]` in `tests/test_w224zg_map_forin_pair_container_element.bl`. A low row
+> count is not a small defect — which is `feedback_corpus_sweep_is_not_coverage`, not a blind spot
+> in the comparator.
 
-Test: `tests/test_ksx1q7_tuple_binder_map_element.bl`, 9 rows — 8 red before (the file did not
+Fixed by generalizing the arm: `stamp_map_binder_from_tid` becomes `stamp_binder_from_tid`
+(`codegen_types.bl:3584`) with a `CT_LIST` arm beside the `CT_MAP` one, at all four binder positions.
+Census on the 968-file common basis: `tuple_destructure.elem` agree 112 → 114, diverge 20 → 18,
+missing 6 → 6; corpus diverge 29200 → 29198.
+
+**The one residual row is not an erasure.** The third `w224zg` row moved from `flat=List[Int]` to
+`flat=List[Void]` against `tid=List[W22Pt]` — still `diverge`, and correct anyway.
+`set_list_elem_struct` (`codegen_types.bl:3980`) files the element's struct name in `sname2` and does
+not recompute `tp_id`; `sv_tp` takes **one** `sname`, so the tp the tap compares has no slot for an
+element struct name even though the `ScopeVar` does. This is the depth-≥2 unrepresentability the plan
+names, and it clears with `sv_tp` in Stage 4 deletion group 1 — the same conclusion as the family-C
+correction at the top of this document, arrived at from the opposite end.
+
+**A tap test that asserts a divergence is a hostage of the defect.** Both `7xgbh6` tap tests named a
+specific binder in the row stream, and per-occurrence rows are written for the diverge / missing /
+unknown buckets **only** — so fixing this cell made a working tap fail its own tests. Rewritten to
+count rather than to name: the tuple test asserts all four leaves are comparable
+(`missing=0 unknown=0 agree+diverge=4`), the match test asserts a differential against a
+wildcard-arm probe. That differential is **4, not 2**, and the factor is worth carrying: this site
+counts *registrations*, not binders — every match arm is bound twice, once by the discarded pre-pass
+at `codegen_stmt.bl:1073` that discovers the arm's value type and once by the real emit at
+`codegen_stmt.bl:1238`. Read every `match_pattern.bind` figure in this document with that doubling in
+mind. The one remaining named-row assertion (`var=m`, `tid=Map[Str, List[Str]]`) is labelled in place
+with the count-based form to convert it to when `dcjy17` closes.
+
+Tests: `tests/test_ksx1q7_tuple_binder_map_element.bl`, 9 rows — 8 red before (the file did not
 compile, which is the honest red for this ticket), 9 green after. `task regen` at fixed point;
 `task ci` exit 0, 679/679 test files, fmt 1578 passed / 0 failed.
+
+For the `v71vxv` half: `tests/test_v71vxv_tuple_binder_element_kinds.bl`, 15 rows, every one
+asserting a **value** — a compiles-only test passes the two silent rows while still printing an
+integer for a `Str`. Red on the pre-fix compiler (9 compile errors, plus the two silent probes),
+green after; `task ci` exit 0, 680 test files.
 
 ## Appendix — all 428 shape cells
 

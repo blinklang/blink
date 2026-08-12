@@ -8,10 +8,12 @@
 //
 //   - `for (k, v) in m` — typecheck's ForIn arm knows the element type, so the walk decomposes the
 //     tuple and both leaves carry a published tid. This file asserts a real comparison there.
-//   - `let (a, b) = t` — typecheck does not decompose a LetBinding tuple pattern at all (br ksx1q7:
-//     the binder reports `on type ?`), so those leaves land in the `missing` bucket. Recorded, not
-//     papered over: the tap deliberately does not re-derive the element from the tuple's struct name,
-//     because a tap that manufactures the answer measures itself instead of the compiler.
+//   - `let (a, b) = t` — typecheck did not decompose a LetBinding tuple pattern at all when this tap
+//     was built (br ksx1q7: the binder reported `on type ?`), so those leaves landed in the `missing`
+//     bucket. Recorded, not papered over: the tap deliberately does not re-derive the element from
+//     the tuple's struct name, because a tap that manufactures the answer measures itself instead of
+//     the compiler. ksx1q7 has since taught the LetBinding arm to decompose, so all four leaves in
+//     the probe below are now comparable.
 //
 // Advisory, like every Stage 2 dual-write: the answer is discarded and the flat fields still govern
 // every branch.
@@ -48,6 +50,23 @@ fn have_blinkc() -> Bool {
     file_exists("build/blinkc") == 1
 }
 
+// Read one count out of a `summary <site> agree=N diverge=N missing=N unknown=N` line. Per-occurrence
+// rows are written for the diverge/missing/unknown buckets ONLY, so a cell that has been fixed goes
+// invisible in the row stream and can be measured only here. -1 for a site that did not report.
+fn summary_field(out: Str, site: Str, field: Str) -> Int {
+    for line in out.split("\n") {
+        if line.contains("summary {site} ") {
+            for tok in line.split(" ") {
+                let parts = tok.split("=")
+                if parts.len() == 2 {
+                    if parts.get(0).unwrap() == field { return parts.get(1).unwrap().to_int() }
+                }
+            }
+        }
+    }
+    -1
+}
+
 test "a tuple-destructure binder is a tapped declaration site" {
     if !have_blinkc() {
         skip("build/blinkc is not present in this working tree")
@@ -61,7 +80,7 @@ test "a tuple-destructure binder is a tapped declaration site" {
     assert(r.out.contains("tuple_destructure.elem"))
 }
 
-test "the for-in destructured value reports the tid the flat fields cannot spell" {
+test "every destructured leaf carries a published tid" {
     if !have_blinkc() {
         skip("build/blinkc is not present in this working tree")
         return
@@ -71,16 +90,19 @@ test "the for-in destructured value reports the tid the flat fields cannot spell
     fs.remove(probe_path())
     assert_eq(r.exit_code, 0)
     assert(compiled_clean(r.out))
-    // `v` is the map's value, `List[Str]`, whose element has no flat slot to live in. This row is the
-    // evidence that typecheck now hands the ForIn pattern walk its element type — without that hint
-    // the leaf carries no tid and the row reads `missing` instead.
-    let mut saw_value = false
-    for line in r.out.split("\n") {
-        if line.contains("site=tuple_destructure.elem") && line.contains("var=v ") {
-            if line.contains("tid=List[Str]") { saw_value = true }
-        }
-    }
-    assert(saw_value)
+    // Originally this asserted a per-occurrence `var=v tid=List[Str]` DIVERGE row, `v` being the map
+    // value whose element has no flat slot to live in. Stage 3 stamped that element from the tid, so
+    // the cell now agrees and per-occurrence rows are not written for agreement — the assertion was
+    // measuring the defect, not the property.
+    //
+    // The surviving property is the one the tap was built to establish: typecheck hands both walks
+    // their leaf types, so no leaf lands in `missing`. Four leaves — `k`/`v` from the for-in, `p`/`q`
+    // from the let (br ksx1q7 taught the LetBinding arm to decompose) — and all four comparable.
+    assert_eq(summary_field(r.out, "tuple_destructure.elem", "missing"), 0)
+    assert_eq(summary_field(r.out, "tuple_destructure.elem", "unknown"), 0)
+    let agree = summary_field(r.out, "tuple_destructure.elem", "agree")
+    let diverge = summary_field(r.out, "tuple_destructure.elem", "diverge")
+    assert_eq(agree + diverge, 4)
 }
 
 test "the tap compares rather than only answering missing" {

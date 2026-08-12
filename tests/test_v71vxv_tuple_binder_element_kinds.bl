@@ -1,0 +1,206 @@
+// br v71vxv: a tuple-pattern binder records its element's outer kind and drops what is INSIDE it.
+// The sibling class of br ksx1q7, which fixed exactly one shape (Map) and left the mechanism in
+// place for List.
+//
+// THE MECHANISM. A List element keeps its outer CT_LIST — `b.len()` resolves — but nothing at
+// either binder site stamps the element channel, so every read THROUGH the binder decodes against
+// sv_tp's fabrication (`type_list(type_int())`).
+//
+// Two of its rows are SILENT WRONG ANSWERS, not diagnostics:
+//
+//        let l: List[Str] = ["a"]
+//        let (b, n) = (l, 1)
+//        b.get(0).unwrap()        // emitted as `int64_t`, printed with %lld
+//
+// `List[Int]` passing today is not the element channel working — it is sv_tp fabricating Int and
+// being accidentally right. `List[Str]` is the same cell one element over, which is why it is the
+// row that shows the wrong answer rather than a missing method. That trap is on record at the
+// emit_fn_params.param cell, where `Map[Str, List[Int]]` read `agree` for the same reason.
+//
+// WHAT THIS TICKET IS NOT. Its first draft also claimed a missing CT for named-tag elements —
+// a StringBuilder element filed as "a struct called StringBuilder" so StringBuildOps never
+// dispatches. That is refuted: the probe behind it called `sb.append(...)`, which StringBuilder
+// does not have, and the same program on the pre-fix compiler binds and writes fine. The
+// StringBuilder / Bytes / Set / Channel rows below are therefore CONTROLS, not fixes.
+//
+// The draft also claimed the Stage-2 divergence census was blind to this class because the tap
+// compares rendered shapes. Also refuted, and measured: on the pre-fix compiler every row here
+// emitted `bucket=diverge site=tuple_destructure.elem tid=List[...] flat=List[Int]`. The census
+// scheduled the whole class. A zero counter is still not a proof of agreement — the
+// emit_fn_params.param `Map[Str, List[Int]]` cell shows sv_tp's fabrication reading `agree` — but
+// that is not what happened here.
+//
+// THE FIX IS ONE ARM OFF THE TID, not a third `starts_with` arm. A tag cannot carry what these
+// shapes need — `List[Map[Str, Int]]` tags as `list`, with the element gone — and the tag chain is
+// flat-universe machinery Stage 4 deletes.
+//
+// Every row below RUNS and asserts a value. `task regen` proves self-host, not codegen, and the
+// two silent rows would pass a compiles-only test while still printing an integer for a Str.
+
+import std.io
+
+fn assert_eq_str(got: Str, want: Str, label: Str) {
+    if got != want { io.println("FAIL: {label} — got '{got}', want '{want}'") }
+    assert(got == want)
+}
+
+// ── The defect — the element channel must survive the binder ───────────────────
+//
+// One test per binder form where it matters. They are different code paths that only look alike:
+// `let` and `for-in` share emit_tuple_destructure, a match arm goes through bind_pattern_vars.
+
+test "a List[Str] element is read as a Str and not as an integer" {
+    let l: List[Str] = ["a"]
+    let (b, n) = (l, 1)
+    // The wrong answer this row is here for is not an error but an integer: with no element
+    // recorded, sv_tp fabricates List[Int] and the emitted C reads the slot as int64_t. Asserting
+    // the VALUE is the only thing that catches it.
+    assert_eq_str("{b.get(0).unwrap()}{n}", "a1", "the Str element survives the binder")
+}
+
+test "a List[(Int, Str)] element keeps its field types" {
+    let l: List[(Int, Str)] = [(1, "a")]
+    let (b, n) = (l, 1)
+    // Silent too, and differently: the element is materialized but its fields are not, so the
+    // read prints the `<value>` placeholder rather than a wrong integer.
+    assert_eq_str("{b.get(0).unwrap()._1}{n}", "a1", "the tuple element's Str field survives")
+}
+
+test "a List[List[Int]] element can be read through" {
+    let l: List[List[Int]] = [[1, 2]]
+    let (b, n) = (l, 1)
+    assert(b.get(0).unwrap().len() + n == 3)
+    assert(b.get(0).unwrap().get(1).unwrap() == 2)
+}
+
+test "a List[Map[Str, Int]] element can be read through" {
+    let mut m: Map[Str, Int] = Map()
+    m.insert("k", 7)
+    let l: List[Map[Str, Int]] = [m]
+    let (b, n) = (l, 1)
+    assert(b.get(0).unwrap().len() + n == 2)
+    assert(b.get(0).unwrap().get("k").unwrap() == 7)
+}
+
+test "a List[Option[Int]] element can be read through" {
+    let l: List[Option[Int]] = [Some(3)]
+    let (b, n) = (l, 1)
+    assert(b.get(0).unwrap().unwrap() + n == 4)
+}
+
+test "a List[Set[Int]] element can be read through" {
+    let mut s: Set[Int] = Set()
+    s.insert(4)
+    let l: List[Set[Int]] = [s]
+    let (b, n) = (l, 1)
+    assert(b.get(0).unwrap().len() + n == 2)
+    assert(b.get(0).unwrap().contains(4))
+}
+
+type V71Pt { x: Int }
+
+test "a List[V71Pt] element keeps its struct name" {
+    let l: List[V71Pt] = [V71Pt { x: 7 }]
+    let (b, n) = (l, 1)
+    // The struct element is the one arm whose stamp the divergence tap still reports as a diverge
+    // — `flat=List[Void]`, where it used to read `flat=List[Int]`. That is not a regression and not
+    // an erasure: set_list_elem_struct (codegen_types.bl:3980) files the element's struct name in
+    // `sname2` and leaves `tp_id` alone, and `sv_tp` takes ONE sname, so the tp the tap compares
+    // has no slot for it while the ScopeVar does. The read below is the evidence that the answer
+    // is right anyway; the row goes away when Stage 4 deletes sv_tp.
+    assert_eq(b.get(0).unwrap().x + n, 8)
+}
+
+test "a List element survives a match arm and a for-in binder too" {
+    let l: List[Str] = ["a"]
+    let t = (l, 1)
+    match t {
+        (b, n) => { assert_eq_str("{b.get(0).unwrap()}{n}", "a1", "match-arm List[Str] element") }
+    }
+    for (b, n) in [(l, 2)] {
+        assert_eq_str("{b.get(0).unwrap()}{n}", "a2", "for-in List[Str] element")
+    }
+}
+
+// ── Controls — the kinds that already worked must not change ───────────────────
+
+test "a mutable List binder keeps both its element and its mut" {
+    let l: List[Str] = ["a"]
+    // A control, and the reason it is one is worth stating: this row passes on the pre-fix
+    // compiler too — `let mut (b, n)` reaches the element by a route the immutable form does not.
+    // It is here because the element must not arrive at the cost of `mut`: both binder sites
+    // thread their own is_mut, and a stamp that hardcoded one would take it away from every
+    // destructured binder.
+    let mut (b, n) = (l, 1)
+    b.push("b")
+    assert_eq_str("{b.get(1).unwrap()}{n}", "b1", "a mut List binder pushes a Str")
+}
+
+test "a StringBuilder let-destructured out of a tuple is usable" {
+    // The refuted half of this ticket, kept as a control. StringBuilder reaches the binder through
+    // the scalar branch carrying the CT the tid names; there is no arm for it, by intent.
+    let sb = StringBuilder()
+    let (b, n) = (sb, 1)
+    b.write("x")
+    assert_eq_str("{b.to_str()}{n}", "x1", "the StringBuilder binder writes and renders")
+}
+
+test "a StringBuilder bound by a match arm is usable" {
+    let sb = StringBuilder()
+    let t = (sb, 1)
+    match t {
+        (b, n) => {
+            b.write("y")
+            assert_eq_str("{b.to_str()}{n}", "y1", "the match-arm StringBuilder binder works")
+        }
+    }
+}
+
+test "a StringBuilder bound by a for-in tuple pattern is usable" {
+    let sb = StringBuilder()
+    for (b, n) in [(sb, 1)] {
+        b.write("z")
+        assert_eq_str("{b.to_str()}{n}", "z1", "the for-in StringBuilder binder works")
+    }
+}
+
+test "Bytes, Set, Channel, List[Int] and a nested tuple are unaffected" {
+    // These already work, by three different routes: Bytes/Set/Channel carry their real CT
+    // through the scalar branch, a nested tuple is registered as a genuine struct, and List[Int]
+    // works only because sv_tp's fabrication happens to be right. Each is here so a tid-led stamp
+    // that over-claims breaks a row instead of a user's program.
+    let by = Bytes()
+    let (b1, n1) = (by, 1)
+    assert(b1.len() + n1 == 1)
+
+    let mut s: Set[Int] = Set()
+    s.insert(3)
+    let (b2, n2) = (s, 1)
+    assert(b2.len() + n2 == 2)
+    assert(b2.contains(3))
+
+    let l: List[Int] = [5]
+    let (b3, n3) = (l, 1)
+    assert(b3.get(0).unwrap() + n3 == 6)
+
+    let nested = ((1, "a"), 2)
+    let (b4, n4) = nested
+    assert_eq_str("{b4._1}{n4}", "a2", "a nested tuple element keeps its fields")
+}
+
+test "an Option element still decodes through its carrier tag" {
+    // The `Option_` tag arm is the one path the binder sites already got right. A tid-led stamp
+    // must either match it or leave it alone — this row fails if it half-replaces it.
+    let o: Option[List[Int]] = Some([1, 2])
+    let (b, n) = (o, 1)
+    assert(b.unwrap().len() + n == 3)
+}
+
+test "a Map element still works after the generalization" {
+    // br ksx1q7's row, kept here as the regression guard for the arm this ticket generalizes.
+    let mut m: Map[Str, Int] = Map()
+    m.insert("k", 41)
+    let (b, n) = (m, 1)
+    assert(b.len() + n == 2)
+    assert(b.get("k").unwrap() + n == 42)
+}

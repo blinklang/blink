@@ -3547,44 +3547,71 @@ pub fn stamp_map_from_tid(node: Int, var_name: Str) -> Bool {
     true
 }
 
-// br ksx1q7: register a tuple-pattern binder whose element is a Map, reading the element's
-// own tid off the pattern node.
+// br ksx1q7 + v71vxv: register a tuple-pattern binder from the element's own tid, one arm per
+// kind. Both binder sites (bind_pattern_vars' IdentPattern arm and emit_tuple_destructure) call
+// this ahead of their flat ladders, in both of their branches.
 //
-// The flat side cannot express this element at all. emit_tuple_typedef registers any tuple
-// field with a compound tag as `(CT_VOID, "Map_str_int")` — the tag goes in the STRUCT NAME
-// slot — so both binder sites file the variable as "a struct called Map_str_int", and
-// lookup_impl_method misses because Map's impls register under the bare head `Map`. The
-// emitted C was already right (c_type_c_name("Map_str_int") is `blink_map*`); only the
-// ScopeVar registration was wrong, which is why the symptom was an internal
-// `unresolved method '.len' on type Map[Str, Int]` rather than bad C.
+// TWO erasures live between a tuple element and its binder, and they need different arms.
 //
-// Reads the tid instead of adding a third `Map_` arm beside the binders' `Option_`/`Result_`
-// tag arms. A tag arm would have to parse a key and a value back out of a string that does
-// not carry them — `Map[Str, Map[Int, Bool]]` tags as `Map_str_map` — and the tag chain is
-// flat-universe machinery Stage 4 deletes.
+// A COMPOUND-TAG element loses its CT outright. emit_tuple_typedef registers any tuple field
+// carrying a tag as `(CT_VOID, <tag>)` — the tag goes in the STRUCT NAME slot — and both binder
+// sites decode only `Option_` and `Result_` out of it. A Map element was therefore filed as "a
+// struct called Map_str_int" and lookup_impl_method missed, because Map's impls register under
+// the bare head `Map`. Note what was NOT wrong: the emitted C was already right (`c_type_c_name`
+// answers `blink_map*` for that tag), so the symptom is an internal `unresolved method` naming
+// the type correctly rather than bad C. Only the ScopeVar registration was ever wrong.
 //
-// Differs from stamp_map_from_tid on ONE point, deliberately: an unholdable VALUE does not
-// abandon the KEY. stamp_map_from_tid answers a single question ("are both channels mine?")
-// for a caller that keeps its own recoveries for the value; a binder has no recoveries, so a
-// wholesale decline would leave `let (m, n) = t` erroring on `m.len()` where the same map
-// bound by `let m: Map[Str, Option[Int]] = ...` compiles and runs today. Matching the
-// declaration path exactly — key stamped, value at its existing floor — leaves br dcjy17 one
-// behaviour to fix instead of two.
-pub fn stamp_map_binder_from_tid(node: Int, var_name: Str, is_mut: Int) -> Bool ! Codegen.Scope {
+// A CONTAINER element keeps its outer CT and loses its ELEMENT. `List[Str]` binds as a list —
+// `.len()` resolves — with nothing recorded for the element, so every read through the binder
+// decodes against `sv_tp`'s fabrication and the emitted C reads a `const char*` slot as
+// `int64_t`. That one is a silent wrong answer, not a diagnostic: `List[Int]` "works" only
+// because the fabrication happens to be right.
+//
+// READS THE TID rather than growing the tag chain two more arms. A tag cannot carry
+// what either erasure needs: `Map[Str, Map[Int, Bool]]` tags as `Map_str_map` and
+// `List[Map[Str, Int]]` tags as plain `list`, element gone. The chain is flat-universe machinery
+// Stage 4 deletes; adding to it now is work done twice.
+//
+// The CT_MAP arm differs from stamp_map_from_tid on ONE point, deliberately: an unholdable VALUE
+// does not abandon the KEY. stamp_map_from_tid answers a single question ("are both channels
+// mine?") for a caller that keeps its own recoveries for the value; a binder has no recoveries,
+// so a wholesale decline would leave `let (m, n) = t` erroring on `m.len()` where the same map
+// bound by `let m: Map[Str, Option[Int]] = ...` compiles and runs today. Matching the declaration
+// path exactly — key stamped, value at its existing floor — leaves br dcjy17 one behaviour to fix
+// instead of two.
+pub fn stamp_binder_from_tid(node: Int, var_name: Str, is_mut: Int) -> Bool ! Codegen.Scope {
     let mtid = tc_tid_subst_mono(tc_lookup_node_tid(node), cg_mono_tparams_sl, cg_mono_arg_tids)
-    if tc_tid_ct(mtid) != CT_MAP { return false }
-    set_var(var_name, CT_MAP, is_mut)
-    if stamp_map_from_tid(node, var_name) { return true }
-    // The value is a kind the three channels cannot hold. Stamp the key on its own: the key
-    // is what selects the kops vtable, and leaving it unset is not a floor but a
-    // BLINK_COMPILER_BUG_kops_unsupported at the first insert.
-    let key_tp = deep_tp_from_tid(tc_tid_map_key_tid(mtid))
-    if key_tp != -1 {
-        set_map_types(var_name, tp_get_kind(key_tp), get_map_value_type_raw(var_name), get_map_value_struct(var_name))
-        let key_sname = tc_tid_map_key_struct(mtid)
-        if key_sname != "" { set_map_key_struct(var_name, key_sname) }
+    let ct = tc_tid_ct(mtid)
+    if dbg_channel_on("binder") != 0 { dbg_trace("binder", "stamp var={var_name} tid={mtid} ct={ct} mut={is_mut}") }
+    if ct == CT_MAP {
+        set_var(var_name, CT_MAP, is_mut)
+        if stamp_map_from_tid(node, var_name) { return true }
+        // The value is a kind the three channels cannot hold. Stamp the key on its own: the key
+        // is what selects the kops vtable, and leaving it unset is not a floor but a
+        // BLINK_COMPILER_BUG_kops_unsupported at the first insert.
+        let key_tp = deep_tp_from_tid(tc_tid_map_key_tid(mtid))
+        if key_tp != -1 {
+            set_map_types(var_name, tp_get_kind(key_tp), get_map_value_type_raw(var_name), get_map_value_struct(var_name))
+            let key_sname = tc_tid_map_key_struct(mtid)
+            if key_sname != "" { set_map_key_struct(var_name, key_sname) }
+        }
+        return true
     }
-    true
+    if ct == CT_LIST {
+        // set_var first: it rebuilds the var's tp through sv_tp, so a stamp written before it
+        // would be discarded. stamp_list_elem_from_tid then declines on its own terms for an
+        // element it cannot spell faithfully, leaving the element erased rather than fabricated.
+        set_var(var_name, CT_LIST, is_mut)
+        stamp_list_elem_from_tid(node, var_name)
+        return true
+    }
+    // NO arm for the remaining kinds, and the reason is a retraction worth keeping. A
+    // StringBuilder / Bytes / Set / Channel binder was reported as losing its CT here (br
+    // v71vxv's first draft) and does not: those reach the binder through the scalar branch
+    // carrying the CT the tid names, and the "failure" behind that report was `sb.append(...)` —
+    // a method StringBuilder does not have. An arm for them would have been dead weight built on
+    // a probe that mis-spelled the API, so the rule stays: no measured shape, no arm.
+    false
 }
 
 // br dcjy17: the carrier a `Map[K, V].get(k)` must return when V is a kind the Map's three
