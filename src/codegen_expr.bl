@@ -69,6 +69,7 @@ import codegen_types.{
     result_c_type, result_c_type_mixed,
     scope_vars, set_list_elem_struct, set_list_elem_type, set_list_nested_elem_type, set_list_nested_elem_struct,
     set_list_elem_option_tp, set_list_elem_result_tp, set_list_elem_map_tp,
+    stamp_list_elem_from_tid,
     type_option, type_result, type_map, type_list, type_struct, sv_tp,
     kops_table_name, kops_elem_is_concrete, kops_is_struct_key, key_struct_sname_from_ann, ensure_tuple_kops_key,
     ensure_struct_derive_kops_key, ensure_struct_derive_kops_key_for_base,
@@ -462,62 +463,6 @@ fn recover_map_kv_from_tid(node: Int, var_name: Str) ! Codegen.Register, Codegen
     if ks != "" { set_map_key_struct(var_name, ks) }
 }
 
-// jcr0zz: build a fully-recursive tp node from a tid (typecheck's ty_pool tree),
-// the tid-side twin of deep_tp_from_ann (codegen_stmt.bl:166). That one walks an
-// annotation AST and resolves mono typevars via cg_mono_*; this one walks a tid
-// already substituted by typecheck (tc_lookup_node_tid at a concrete use site),
-// so it does NOT call tc_tid_resolved at entry or in any recursive step — see
-// typecheck.bl:10441-10453 for why composing a resolver into a non-resolving
-// reader is a standing trap, and codegen_stmt.bl's own analogous warning.
-//
-// Sentinel contract (load-bearing): returns -1 — NOT a tp id — for any tid naming
-// no faithfully representable type (an unencodable struct/enum slot, or a
-// container this builder can't descend into: Set/Iterator/Handle/Channel/Ptr).
-// Every caller MUST bail on -1 and leave the element erased. Fabricating a
-// default here would be the exact re-erasure this ticket exists to avoid: a
-// fabricated tp is a confident wrong claim about the element's shape; an erased
-// element is a visible unknown that surfaces as an honest diagnostic later.
-fn deep_tp_from_tid(tid: Int) -> Int {
-    let ct = tc_tid_ct(tid)
-    if ct == CT_OPTION {
-        let inner = deep_tp_from_tid(tc_tid_option_inner_tid(tid))
-        if inner == -1 { return -1 }
-        return type_option(inner)
-    }
-    if ct == CT_RESULT {
-        let ok = deep_tp_from_tid(tc_tid_result_ok_tid(tid))
-        let err = deep_tp_from_tid(tc_tid_result_err_tid(tid))
-        if ok == -1 || err == -1 { return -1 }
-        return type_result(ok, err)
-    }
-    if ct == CT_MAP {
-        let key = deep_tp_from_tid(tc_tid_map_key_tid(tid))
-        let val = deep_tp_from_tid(tc_tid_map_val_tid(tid))
-        if key == -1 || val == -1 { return -1 }
-        return type_map(key, val)
-    }
-    if ct == CT_LIST {
-        let inner = deep_tp_from_tid(tc_tid_list_elem(tid))
-        if inner == -1 { return -1 }
-        return type_list(inner)
-    }
-    // No raw-tid accessor exists to descend into these, so there is nothing
-    // for a flat sv_tp write to recurse into faithfully (sv_tp's own CT_SET
-    // arm passes -1 through rather than fabricate, mv45y5) — erasing here is
-    // the honest answer, not a workaround for a defaulting sibling.
-    if ct == CT_SET || ct == CT_ITERATOR || ct == CT_HANDLE || ct == CT_CHANNEL || ct == CT_PTR {
-        return -1
-    }
-    if ct == CT_STRUCT || ct == CT_ENUM {
-        let stem = tc_tid_struct_mono_name(tid)
-        let name = if stem != "" { stem } else { tc_tid_struct(tid) }
-        if name == "" { return -1 }
-        return type_struct(name)
-    }
-    if ct < 0 { return -1 }
-    sv_tp(ct, -1, -1, "")
-}
-
 // br jw1pmb: the List twin of recover_set_elem_from_tid above, for the same
 // reason — a generic struct's List[T] field erases identically for every T
 // (one sf_entry per (struct,field): reg_sf_entry is keyed on name, not
@@ -527,14 +472,21 @@ fn deep_tp_from_tid(tid: Int) -> Int {
 //   - it ALSO writes the global expr_list_elem_type/expr_list_elem_struct
 //     channel. The Set twin has no such global; List does, and the
 //     for-loop lowering (codegen_stmt.bl:3570) reads the global BEFORE the
-//     scope var.
+//     scope var. That global mirror is now ALL this function does — the
+//     scope-var writes and the tid case analysis moved to
+//     stamp_list_elem_from_tid (codegen_types.bl), because codegen_methods
+//     needs the same rule for a list that is an EXPRESSION with no ScopeVar
+//     to key (br 6g6g7t) and cannot import from this file: codegen_expr sits
+//     DOWNSTREAM of codegen_methods. Two spellings of one rule is what the
+//     tid-collapse plan exists to delete, so there is one body and two
+//     entry points, not two bodies.
 //   - a struct/enum element writes (CT_VOID, sname), not the Set twin's
 //     bare CT_STRUCT/CT_ENUM — the List house convention (emit_list_lit's
 //     tail; the declared-List[T] LetBinding path at codegen_stmt.bl:3312
 //     uses the identical (CT_VOID, sname) shape for a struct elem, and
 //     :3327 for a nested one).
 //   - br jcr0zz: CT_OPTION/CT_RESULT/CT_MAP elements recover their own inner
-//     via deep_tp_from_tid (below) instead of re-erasing to Int — a flat
+//     via deep_tp_from_tid instead of re-erasing to Int — a flat
 //     set_list_elem_type(CT_OPTION) would lose that inner, which is exactly
 //     what deep_tp_from_tid's tp_id tree exists to preserve. nprhy8: CT_SET
 //     now has a parity target too (emit_list_method's `get`/`pop` CT_SET
@@ -547,156 +499,18 @@ fn deep_tp_from_tid(tid: Int) -> Int {
 //     the honest answer, not a wrong-but-quiet one.
 // A nested List[List[T]] recurses exactly one level into
 // set_list_nested_elem_type/_struct, mirroring the declared-path shape at
-// codegen_stmt.bl:3320-3330; a second nested List level, or a typevar/
-// tuple/fn element, is a safe no-op (the -1/"" sentinel already stands).
+// codegen_stmt.bl:3320-3330; a second nested List level, or a typevar or fn
+// element, is a safe no-op (the -1/"" sentinel already stands).
+//
+// A DECLINED stamp (ct == -1) must leave the globals alone rather than clear
+// them: the caller's existing channel may hold a correct answer from another
+// source, and every arm that declines does so precisely because it has nothing
+// better to offer.
 pub fn recover_list_elem_from_tid(node: Int, var_name: Str) ! Codegen.Register, Codegen.Scope {
-    // A generic FUNCTION body's own tid memo is written once at typecheck with
-    // its tparams abstract (typecheck never re-runs per instantiation) -- inside
-    // a mono instance's body, `List[Set[T]]` still reads back with T a bare
-    // typevar unless it is rewritten through THIS call's binder, exactly what
-    // tc_tid_subst_mono exists for (mirrors the raw/sub retry at :6160). No-op
-    // outside a mono body or when node's tid is already concrete.
-    let etid = tc_tid_subst_mono(tc_lookup_node_tid(node), cg_mono_tparams_sl, cg_mono_arg_tids)
-    let ect = tc_tid_list_elem_ct(etid)
-    let tracing = dbg_channel_on("listelem")
-    if ect < 0 {
-        // br 85j3j8: a TUPLE element has no CT to name it — tk_to_ct answers CT_VOID for
-        // TyKind.Tuple and tid_inner_ct turns that into -1 — but it does have a generated tag,
-        // and the comment above ("a typevar/tuple/fn element is a safe no-op") was wrong about
-        // the tuple third of that list. Leaving it erased is only safe when there is no parity
-        // target to name; a tuple HAS one, is emitted, and is what the ANNOTATED path already
-        // spells here as the same `(CT_VOID, sname)` pair the struct arm below writes. Bailing
-        // made an unannotated `let` over a `List[(A, B)]`-returning call lose the element, which
-        // reaches cc as `const void x = f._0;` and `blink_Option_void`, and reaches the user as
-        // the `<value>` placeholder where a number belongs.
-        //
-        // Still gated on a nameable tag, so a Fn, typevar or genuinely-unknown element keeps
-        // bailing exactly as before: tid_inner_struct answers "" for all three.
-        let tuple_tag = tc_tid_list_elem_struct(etid)
-        if tuple_tag == "" {
-            if tracing != 0 { dbg_trace("listelem", "recover ect={ect} var={var_name} arm=bail_unnameable") }
-            return
-        }
-        if tracing != 0 { dbg_trace("listelem", "recover ect={ect} var={var_name} arm=tuple tag={tuple_tag}") }
-        expr_list_elem_type = CT_VOID
-        expr_list_elem_struct = tuple_tag
-        set_list_elem_type(var_name, CT_VOID)
-        set_list_elem_struct(var_name, tuple_tag)
-        return
-    }
-    if ect == CT_OPTION {
-        let elem_tid = tc_tid_list_elem(etid)
-        let inner_tp = deep_tp_from_tid(tc_tid_option_inner_tid(elem_tid))
-        if inner_tp == -1 {
-            if tracing != 0 { dbg_trace("listelem", "recover ect={ect} var={var_name} arm=bail_unfaithful") }
-            return
-        }
-        if tracing != 0 { dbg_trace("listelem", "recover ect={ect} var={var_name} arm=option inner_tp={inner_tp}") }
-        expr_list_elem_type = ect
-        expr_list_elem_struct = ""
-        set_list_elem_type(var_name, ect)
-        set_list_elem_option_tp(var_name, inner_tp)
-        return
-    }
-    if ect == CT_RESULT {
-        let elem_tid = tc_tid_list_elem(etid)
-        let ok_tp = deep_tp_from_tid(tc_tid_result_ok_tid(elem_tid))
-        let err_tp = deep_tp_from_tid(tc_tid_result_err_tid(elem_tid))
-        if ok_tp == -1 || err_tp == -1 {
-            if tracing != 0 { dbg_trace("listelem", "recover ect={ect} var={var_name} arm=bail_unfaithful") }
-            return
-        }
-        if tracing != 0 { dbg_trace("listelem", "recover ect={ect} var={var_name} arm=result inner_tp={ok_tp}") }
-        expr_list_elem_type = ect
-        expr_list_elem_struct = ""
-        set_list_elem_type(var_name, ect)
-        set_list_elem_result_tp(var_name, ok_tp, err_tp)
-        return
-    }
-    if ect == CT_MAP {
-        let elem_tid = tc_tid_list_elem(etid)
-        let key_tp = deep_tp_from_tid(tc_tid_map_key_tid(elem_tid))
-        let val_tp = deep_tp_from_tid(tc_tid_map_val_tid(elem_tid))
-        if key_tp == -1 || val_tp == -1 {
-            if tracing != 0 { dbg_trace("listelem", "recover ect={ect} var={var_name} arm=bail_unfaithful") }
-            return
-        }
-        if tracing != 0 { dbg_trace("listelem", "recover ect={ect} var={var_name} arm=map inner_tp={val_tp}") }
-        expr_list_elem_type = ect
-        expr_list_elem_struct = ""
-        set_list_elem_type(var_name, ect)
-        set_list_elem_map_tp(var_name, key_tp, val_tp)
-        return
-    }
-    // nprhy8: Set element is always a flat hashable scalar/struct/tuple
-    // (E1400 forecloses a container element), so no deep_tp_from_tid tree is
-    // needed — tc_tid_set_elem_ct/_struct read straight off the Set's own
-    // tid. Gate on the element being nameable so a genuinely-unresolved
-    // typevar keeps bailing loudly instead of committing to a partial
-    // (elem-type-known, nested-elem-unknown) answer.
-    if ect == CT_SET {
-        let elem_tid = tc_tid_list_elem(etid)
-        let set_ct = tc_tid_set_elem_ct(elem_tid)
-        let set_struct = tc_tid_set_elem_struct(elem_tid)
-        if set_ct < 0 && set_struct == "" {
-            if tracing != 0 { dbg_trace("listelem", "recover ect={ect} var={var_name} arm=set_bail_unfaithful") }
-            return
-        }
-        if tracing != 0 { dbg_trace("listelem", "recover ect={ect} var={var_name} arm=set set_ct={set_ct} set_struct={set_struct}") }
-        expr_list_elem_type = ect
-        expr_list_elem_struct = ""
-        set_list_elem_type(var_name, ect)
-        if set_ct >= 0 {
-            set_list_nested_elem_type(var_name, set_ct)
-        }
-        if set_struct != "" {
-            set_list_nested_elem_struct(var_name, set_struct)
-        }
-        return
-    }
-    // br jcr0zz §2: Iterator/Handle/Channel/Bytes elements have no parity
-    // target — emit_list_method's `get` branch has no arm for these kinds
-    // (codegen_methods.bl's else falls to int64_t boxing), and the DECLARED
-    // path erases identically. Flipping expr_list_elem_type to one of these
-    // would redirect for-in to a never-emitted iterator type, trading a loud
-    // `.get()` error for a link error in a different construct. Stay erased.
-    if ect == CT_ITERATOR || ect == CT_HANDLE || ect == CT_CHANNEL || ect == CT_BYTES {
-        if tracing != 0 { dbg_trace("listelem", "recover ect={ect} var={var_name} arm=no_parity_target") }
-        return
-    }
-    if ect == CT_STRUCT || ect == CT_ENUM {
-        let es = tc_tid_list_elem_struct(etid)
-        if es == "" { return }
-        expr_list_elem_type = CT_VOID
-        expr_list_elem_struct = es
-        set_list_elem_type(var_name, CT_VOID)
-        set_list_elem_struct(var_name, es)
-        return
-    }
-    expr_list_elem_type = ect
-    expr_list_elem_struct = ""
-    set_list_elem_type(var_name, ect)
-    if ect != CT_LIST { return }
-    let inner_tid = tc_tid_list_elem(etid)
-    let nect = tc_tid_list_elem_ct(inner_tid)
-    // nprhy8: CT_SET dropped from this exclusion — List[List[Set[T]]]'s outer
-    // var can now record that its nested (2-deep) element is itself a Set via
-    // the same flat set_list_nested_elem_type fallback below as any other
-    // scalar kind. This carries only the KIND at 2 levels deep, not the Set's
-    // OWN element at 3 levels deep (no deep-carrier family exists for that,
-    // per plan) — a for-in 2 levels down still needs its own recovery.
-    if nect < 0 || nect == CT_OPTION || nect == CT_RESULT || nect == CT_MAP || nect == CT_ITERATOR || nect == CT_HANDLE || nect == CT_CHANNEL || nect == CT_BYTES || nect == CT_LIST {
-        return
-    }
-    if nect == CT_STRUCT || nect == CT_ENUM {
-        let nes = tc_tid_list_elem_struct(inner_tid)
-        if nes != "" {
-            set_list_nested_elem_type(var_name, CT_VOID)
-            set_list_nested_elem_struct(var_name, nes)
-        }
-        return
-    }
-    set_list_nested_elem_type(var_name, nect)
+    let stamp = stamp_list_elem_from_tid(node, var_name)
+    if stamp.ct < 0 { return }
+    expr_list_elem_type = stamp.ct
+    expr_list_elem_struct = stamp.sname
 }
 
 @allow(UnrestoredMutation, IncompleteStateRestore)

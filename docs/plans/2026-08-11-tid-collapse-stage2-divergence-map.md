@@ -5032,6 +5032,98 @@ by the binding fix. Filed as br `1n9fhg` with those two rows as its MVCE. One re
 two causes would have hidden whichever was fixed second — and `1n9fhg` is itself a cell the collapse
 removes structurally, since a tid-sourced element carries its own name and there is nothing to lose.
 
+### The same shape one axis over, and the axis is not the tuple (br `6g6g7t`)
+
+`85j3j8` fixed `List[(A, B)]` reached through a **binding** — `let g = make_tups()` then `g.get(0)`.
+The chained form `make_tups().get(0)` still failed, and the reason is the plan's thesis stated as
+plainly as it gets:
+
+```
+let g = make_tups()    ->  g is a ScopeVar; the element can be stored on it
+make_tups().get(0)     ->  the receiver is the C string `blink_u_f_make_tups()`
+```
+
+Every reader in `emit_list_method` derives the element with `get_list_elem_type(obj_str)` /
+`get_list_elem_struct(obj_str)`, which look `obj_str` up as a variable **name**. A call expression has
+never had a `ScopeVar` under that name, so every reader gets the not-found sentinel and degrades to
+boxed `int64`. Measured on the `copy_list_compound_elem` analogue of the identical hole:
+
+```
+bucket=missing site=copy_list_compound_elem.src var=blink_u_f_loptmap() tid=- flat=-
+```
+
+`flat=-` is the whole finding. **The flat universe is keyed by variable NAME; the tid is keyed by
+NODE.** A list that never had a name is not merely mis-spelled in the flat universe, it is
+*unrepresentable* in it — while the tid is present and exactly right at the same place. No amount of
+per-cell repair reaches this class; only a node-sourced type does.
+
+**Broader than the ticket title.** The rows written as *pins* — expected-passing siblings, there to
+bound the tuple claim — failed too: a chained `List[List[Int]]`, `List[Map[Str, Int]]` and
+`List[Option[Int]]` all lost their element identically. So the tuple is not the axis, the missing
+`ScopeVar` is, and it loses **every** element kind. Those rows stayed in the test file as the record.
+
+**The fix is one gate, because stamping serves every reader at once.** In `emit_builtin_trait_method`,
+before the ListOps dispatch: when the receiver is a `CT_LIST` and nothing is recorded under
+`obj_str`, stamp the element from the object node's tid. `set_list_elem_type` **pushes** a scope var
+when the name is absent (`codegen_types.bl:2991`) — the same mechanism `fresh_temp` names already
+rely on — so one write registers a synthetic entry that all ~20 readers below then find, instead of
+each reader growing its own tid path.
+
+**Getting there needed a move, and the module direction dictated where.** `codegen_expr` imports
+`codegen_methods` (`codegen_expr.bl:87`), so `codegen_methods` can never import
+`recover_list_elem_from_tid` back. Duplicating the rule is exactly what this plan exists to delete,
+so `recover_list_elem_from_tid`'s body and `deep_tp_from_tid` moved down into `codegen_types` — which
+both files already import — as `stamp_list_elem_from_tid(node, var_name) -> ListElemStamp{ct, sname}`,
+effect-free, returning the pair instead of writing globals. The `codegen_expr` function is now a
+four-line wrapper that mirrors the pair onto the `expr_list_elem_*` globals. One body, two entry
+points. Done as its own regen: pure move, fixed point held, emitted C unchanged.
+
+**The trap, found by a segfault: `(CT_VOID, "")` is a REAL spelling, not only an erasure.** The first
+gate reused `list_elem_unspellable` — `85j3j8`'s predicate, which counts a nameless `CT_VOID` as lost.
+But that pair is how a **by-value plain-enum** element is recorded, and the *declared* path stamps
+exactly that for an annotated `let l: List[Col]`. Re-stamping it from the tid promoted the element to
+the `(CT_VOID, sname)` struct-pointer convention, so `.get()` emitted
+`(blink_Col*)blink_list_get(..)` and the reader dereferenced an integer:
+
+```c
+_lget_2.value = (blink_Col*)blink_list_get(l, _lgi_1);   /* after  — wrong */
+blink_Col _ounv_4 = *_ounw_3.value;                      /* deref of a by-value enum */
+```
+
+`test_0rmamy` **segfaulted with all eleven of its printed rows still reading `ok`** — the crash was
+in the twelfth row's probe program, not in an assertion, so `task test`'s summary line was the only
+thing that reported it, and running the test binary alone showed `EXIT=139` with no `passed/failed`
+line at all. `build/blinkc.bak` attributed it to the right regen in one compile: `task regen` copies
+the previous compiler there before rebuilding, so diffing its emitted C against the new one localises
+a regression with no stash-and-rebuild cycle.
+
+The narrowed gate is `get_list_elem_type(obj_str) < 0 && get_list_elem_struct(obj_str) == ""` —
+literally the measured `flat=-` condition, i.e. *no element recorded at all*. That also means it
+cannot override any flat answer, right or wrong; Stage 3's authority flip is what reverses precedence,
+and until then each cell stays one measurable shape. `list_elem_unspellable` moved to `codegen_types`
+with a header comment recording that it is only valid at the unannotated let-ladder it was measured
+against, and the call site carries the same warning.
+
+**Census, on a 954-file intersected basis — and the interesting number is zero.** `tydiv` 4811
+diverge rows and 409 cells before and after; `ctypediv` 23 diverge rows and 7 cells before and after.
+Both cell maps diff empty. **The corpus census could not see this cell**, because the ~20 readers in
+`emit_list_method` carry no `sv_ty_or_flat` tap — they call `get_list_elem_*` directly. A silent
+counter here is `feedback_corpus_sweep_is_not_coverage` in its sharpest form: the instrument's
+stability is evidence about the *instrument*, not about the code, and the only thing that found this
+was writing the shape by hand and running it. Class-(i) being "empty on the corpus" after Stage 3d
+holds only for the sites that are tapped.
+
+The new test file adds 12 diverge rows of its own, all the known class-(ii) convention artifact
+already described under Stage 3a — `tid=(Int, Str) flat=Tuple2_int_str` and `tid=List[(Int, Str)]
+flat=List[Void]`, the printer dropping the companion sname — plus `tid=List[Pt] flat=List[Void]` for
+the struct pin, which is the same printer, not a loss.
+
+**Not fixed here, deliberately.** Map and Set receivers have the identical expression-vs-variable hole
+on their own key/value channels (a chained `make_maps().get("k")` where the Map itself is the
+expression); their metadata lives in different slots with no `stamp_*` twin yet. And the depth-3
+family — `List[Option[Map[Str, Int]]]` read through unannotated intermediates — is br `f9hgt9`,
+verified still failing identically after this fix, so the two are independent.
+
 ## Appendix — all 428 shape cells
 
 Format: `family | occurrences | tid | flat`.

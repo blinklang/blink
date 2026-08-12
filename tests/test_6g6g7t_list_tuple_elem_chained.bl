@@ -1,0 +1,170 @@
+// br 6g6g7t — a List whose element is a TUPLE loses the element type when the list is a
+// CHAINED EXPRESSION rather than a named variable: `make_tups().get(0).unwrap()`.
+//
+// This is br 85j3j8's twin on the other side of one axis, and the axis is NOT the tuple.
+// 85j3j8 was the same shape reached through a BINDING (`let g = make_tups()` then
+// `g.get(0)`); it was fixed at the let ladder in emit_let_binding, and this file still
+// failed afterwards. The difference is the whole bug:
+//
+//   let g = make_tups()          -> g is a ScopeVar; the element can be stored on it
+//   make_tups().get(0)           -> the receiver is the C string `blink_u_f_make_tups()`
+//
+// Every reader in emit_list_method derives the element with `get_list_elem_type(obj_str)` /
+// `get_list_elem_struct(obj_str)`, which look the string up as a variable NAME. A call
+// expression has no ScopeVar under that name, so both answer the not-found sentinel and the
+// element degrades to the boxed-int64 default. Measured on the copy_list_compound_elem
+// analogue of the same hole:
+//
+//   bucket=missing site=copy_list_compound_elem.src var=blink_u_f_loptmap() tid=- flat=-
+//
+// "flat=-" is the point: there is nothing to read, because the flat universe is keyed by
+// variable name and this list never had one. The tid is keyed by NODE, so it is present and
+// correct at exactly the same place — which is why the fix reads the object node's tid
+// instead of the object string's ScopeVar.
+//
+// ── WHY THE ROWS BELOW ASSERT VALUES, NOT DECLARATIONS ───────────────────────────────
+//
+// The two faces of this bug fail in opposite ways, and only one of them is loud:
+//
+//   1. `let n: Int = first.0`  ->  `const void n = first._0;`
+//      error: variable or field 'n' declared void
+//      error: request for member '_0' in something not a structure or union
+//      A cc error with no Blink span — the file does not compile at all.
+//
+//   2. `"n={first.0}"`  ->  `blink_str_format("n=%s", "<value>")`
+//      Compiles, runs, and prints the literal text `<value>` where the number belongs.
+//      This is the fmj80a fail-safe (codegen_expr.bl:5682): an aggregate with no Display
+//      reaching interpolation prints a placeholder rather than crashing. It is the worse
+//      face, because nothing anywhere reports it — so the interpolation rows assert on the
+//      rendered STRING, and the arithmetic rows assert on the SUM. A declaration-only pin
+//      would pass while the program still printed a placeholder.
+
+fn make_tups() -> List[(Int, Str)] {
+    let l: List[(Int, Str)] = []
+    l.push((7, "seven"))
+    l
+}
+
+fn make_pairs() -> List[(Int, Int)] {
+    let l: List[(Int, Int)] = []
+    l.push((7, 8))
+    l.push((1, 2))
+    l
+}
+
+// ── 1. The declaration face ──────────────────────────────────────────────────────────
+
+test "a chained tuple element field can be bound to a typed local" {
+    let first = make_tups().get(0).unwrap()
+    let n: Int = first.0
+    let s: Str = first.1
+    assert_eq(n, 7)
+    assert_eq(s, "seven")
+}
+
+// ── 2. The silent face ───────────────────────────────────────────────────────────────
+
+test "interpolating a chained tuple element renders values, not <value>" {
+    let first = make_tups().get(0).unwrap()
+    assert_eq("{first.0}", "7")
+    assert_eq("{first.1}", "seven")
+}
+
+test "arithmetic on a chained tuple element answers the number" {
+    let first = make_pairs().get(0).unwrap()
+    assert_eq(first.0 + first.1, 15)
+}
+
+// ── 3. The other readers on the same seam ────────────────────────────────────────────
+//
+// `get` is the reader in the ticket's MVCE, but every reader in emit_list_method derives the
+// element the same way, so each one that can be reached through a chain is held here. If a
+// fix is aimed only at `get`, these fail.
+
+test "pop off a chained list keeps the tuple element" {
+    let last = make_pairs().pop().unwrap()
+    assert_eq(last.0 + last.1, 3)
+}
+
+test "a chained get past element 0 keeps the tuple element" {
+    let second = make_pairs().get(1).unwrap()
+    assert_eq(second.0 + second.1, 3)
+}
+
+// A chain one link longer: the list expression is itself the result of a method, so nothing
+// in it is ever a variable at any point.
+test "a doubly chained list keeps the tuple element" {
+    let all = make_pairs().slice(0, 1)
+    let f = all.get(0).unwrap()
+    assert_eq(f.0 + f.1, 15)
+}
+
+// ── Pins: the sibling element kinds reached through the same chain ────────────────────
+//
+// These hold the SCOPE of the fix. Each is read AT DEPTH — `.len()` answers correctly even
+// when the element type is gone, so a length pin would prove nothing.
+
+type Pt {
+    x: Int
+}
+
+fn make_structs() -> List[Pt] {
+    let l: List[Pt] = []
+    l.push(Pt { x: 7 })
+    l
+}
+
+fn make_lists() -> List[List[Int]] {
+    let l: List[List[Int]] = []
+    l.push([7, 8])
+    l
+}
+
+fn make_maps() -> List[Map[Str, Int]] {
+    let l: List[Map[Str, Int]] = []
+    let m: Map[Str, Int] = Map()
+    m.insert("k", 7)
+    l.push(m)
+    l
+}
+
+fn make_opts() -> List[Option[Int]] {
+    let l: List[Option[Int]] = []
+    l.push(Some(7))
+    l
+}
+
+fn make_strs() -> List[Str] {
+    let l: List[Str] = []
+    l.push("seven")
+    l
+}
+
+test "a chained List[Struct] element reads its field" {
+    assert_eq(make_structs().get(0).unwrap().x, 7)
+}
+
+test "a chained List[List[Int]] element reads at depth" {
+    assert_eq(make_lists().get(0).unwrap().get(0).unwrap(), 7)
+}
+
+test "a chained List[Map[Str, Int]] element reads at depth" {
+    assert_eq(make_maps().get(0).unwrap().get("k").unwrap(), 7)
+}
+
+test "a chained List[Option[Int]] element unwraps" {
+    assert_eq(make_opts().get(0).unwrap().unwrap(), 7)
+}
+
+test "a chained List[Str] element is still a Str" {
+    let s: Str = make_strs().get(0).unwrap()
+    assert_eq(s, "seven")
+}
+
+// The binding form 85j3j8 fixed, kept here so a regression in either direction is caught by
+// whichever file is run.
+test "the bound form still works" {
+    let g = make_tups()
+    let first = g.get(0).unwrap()
+    assert_eq("{first.0}", "7")
+}

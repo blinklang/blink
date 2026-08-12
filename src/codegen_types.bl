@@ -3248,6 +3248,238 @@ pub fn set_list_elem_map_tp(name: Str, key_tp: Int, val_tp: Int) {
     set_list_elem_compound_tp(name, type_list(type_map(key_tp, val_tp)), CT_MAP)
 }
 
+// What a List element's flat (CT, sname) pair is, according to typecheck's tid for the node
+// that produced the list — and the scope-var writes that record it. Moved here from
+// codegen_expr (where it was recover_list_elem_from_tid's body) because it is a ScopeVar
+// writer over the tp pool, and both live in THIS file: codegen_expr sits downstream of
+// codegen_methods, so nothing in codegen_methods could reach it there. codegen_methods needs
+// it for a list that is an EXPRESSION rather than a variable (br 6g6g7t).
+//
+// The returned pair is what the caller should mirror onto its own channel; ct == -1 means
+// this declined to answer and the caller must leave the element erased. Do not fabricate a
+// default from a -1: an erased element surfaces later as an honest diagnostic, a guessed one
+// is a confident wrong claim (the same sentinel contract deep_tp_from_tid states below).
+pub type ListElemStamp {
+    ct: Int,
+    sname: Str
+}
+
+fn no_list_elem_stamp() -> ListElemStamp {
+    ListElemStamp { ct: -1, sname: "" }
+}
+
+// br 85j3j8: "the recorded element cannot be spelled in C". Two shapes, both of which reach cc as
+// an erasure rather than as a Blink diagnostic: no element at all, or a marker whose C name lives
+// in the companion struct slot (CT_STRUCT, CT_ENUM, and the List house convention's CT_VOID pair)
+// with that slot empty. Anything else -- CT_INT, CT_OPTION, a named struct -- is spellable and must
+// be left exactly as the flat path recorded it.
+//
+// NOT a general "the flat path lost the element" test, and the CT_VOID arm is why. (CT_VOID, "")
+// is a REAL spelling as well as an erasure: it is how a by-value plain-enum element is recorded,
+// which is what the declared path stamps for an annotated `let l: List[Col]`. This function is
+// only correct where a nameless CT_VOID cannot mean that -- at the unannotated let-binding ladder
+// it was measured against, whose declared-path sibling never reaches it. A caller that might see
+// an annotated list must gate on "no element recorded at all" instead
+// (`get_list_elem_type(name) < 0 && get_list_elem_struct(name) == ""`); re-stamping a by-value
+// enum promotes it to the struct-pointer convention and the reader dereferences an integer.
+//
+// Where it does apply it gates stamp_list_elem_from_tid above, so the tid is consulted only where
+// the flat path left nothing usable and a spellable flat answer still wins. Stage 3's authority
+// flip is what reverses that precedence; until then this keeps each cell measurable one shape at
+// a time.
+pub fn list_elem_unspellable(name: Str) -> Bool {
+    let ect = get_list_elem_type(name)
+    if ect < 0 {
+        return true
+    }
+    if ect == CT_STRUCT || ect == CT_ENUM || ect == CT_VOID {
+        return get_list_elem_struct(name) == ""
+    }
+    false
+}
+
+// jcr0zz: build a fully-recursive tp node from a tid (typecheck's ty_pool tree),
+// the tid-side twin of deep_tp_from_ann (codegen_stmt.bl:166). That one walks an
+// annotation AST and resolves mono typevars via cg_mono_*; this one walks a tid
+// already substituted by typecheck (tc_lookup_node_tid at a concrete use site),
+// so it does NOT call tc_tid_resolved at entry or in any recursive step — see
+// typecheck.bl:10441-10453 for why composing a resolver into a non-resolving
+// reader is a standing trap, and codegen_stmt.bl's own analogous warning.
+//
+// Sentinel contract (load-bearing): returns -1 — NOT a tp id — for any tid naming
+// no faithfully representable type (an unencodable struct/enum slot, or a
+// container this builder can't descend into: Set/Iterator/Handle/Channel/Ptr).
+// Every caller MUST bail on -1 and leave the element erased. Fabricating a
+// default here would be the exact re-erasure this ticket exists to avoid: a
+// fabricated tp is a confident wrong claim about the element's shape; an erased
+// element is a visible unknown that surfaces as an honest diagnostic later.
+fn deep_tp_from_tid(tid: Int) -> Int {
+    let ct = tc_tid_ct(tid)
+    if ct == CT_OPTION {
+        let inner = deep_tp_from_tid(tc_tid_option_inner_tid(tid))
+        if inner == -1 { return -1 }
+        return type_option(inner)
+    }
+    if ct == CT_RESULT {
+        let ok = deep_tp_from_tid(tc_tid_result_ok_tid(tid))
+        let err = deep_tp_from_tid(tc_tid_result_err_tid(tid))
+        if ok == -1 || err == -1 { return -1 }
+        return type_result(ok, err)
+    }
+    if ct == CT_MAP {
+        let key = deep_tp_from_tid(tc_tid_map_key_tid(tid))
+        let val = deep_tp_from_tid(tc_tid_map_val_tid(tid))
+        if key == -1 || val == -1 { return -1 }
+        return type_map(key, val)
+    }
+    if ct == CT_LIST {
+        let inner = deep_tp_from_tid(tc_tid_list_elem(tid))
+        if inner == -1 { return -1 }
+        return type_list(inner)
+    }
+    // No raw-tid accessor exists to descend into these, so there is nothing
+    // for a flat sv_tp write to recurse into faithfully (sv_tp's own CT_SET
+    // arm passes -1 through rather than fabricate, mv45y5) — erasing here is
+    // the honest answer, not a workaround for a defaulting sibling.
+    if ct == CT_SET || ct == CT_ITERATOR || ct == CT_HANDLE || ct == CT_CHANNEL || ct == CT_PTR {
+        return -1
+    }
+    if ct == CT_STRUCT || ct == CT_ENUM {
+        let stem = tc_tid_struct_mono_name(tid)
+        let name = if stem != "" { stem } else { tc_tid_struct(tid) }
+        if name == "" { return -1 }
+        return type_struct(name)
+    }
+    if ct < 0 { return -1 }
+    sv_tp(ct, -1, -1, "")
+}
+
+// The full comment for this rule, including why a struct/enum element writes (CT_VOID, sname)
+// rather than a bare CT_STRUCT and why Iterator/Handle/Channel/Bytes stay erased on purpose,
+// is on the codegen_expr wrapper that used to own the body (recover_list_elem_from_tid).
+pub fn stamp_list_elem_from_tid(node: Int, var_name: Str) -> ListElemStamp {
+    // A generic FUNCTION body's own tid memo is written once at typecheck with
+    // its tparams abstract (typecheck never re-runs per instantiation) -- inside
+    // a mono instance's body, `List[Set[T]]` still reads back with T a bare
+    // typevar unless it is rewritten through THIS call's binder, exactly what
+    // tc_tid_subst_mono exists for. No-op outside a mono body or when node's tid
+    // is already concrete.
+    let etid = tc_tid_subst_mono(tc_lookup_node_tid(node), cg_mono_tparams_sl, cg_mono_arg_tids)
+    let ect = tc_tid_list_elem_ct(etid)
+    let tracing = dbg_channel_on("listelem")
+    if ect < 0 {
+        // br 85j3j8: a TUPLE element has no CT to name it — tk_to_ct answers CT_VOID for
+        // TyKind.Tuple and tid_inner_ct turns that into -1 — but it does have a generated
+        // tag, and it is what the ANNOTATED path already spells here as the same
+        // (CT_VOID, sname) pair the struct arm below writes. Still gated on a nameable tag,
+        // so a Fn, typevar or genuinely-unknown element keeps declining: tid_inner_struct
+        // answers "" for all three.
+        let tuple_tag = tc_tid_list_elem_struct(etid)
+        if tuple_tag == "" {
+            if tracing != 0 { dbg_trace("listelem", "stamp ect={ect} var={var_name} arm=bail_unnameable") }
+            return no_list_elem_stamp()
+        }
+        if tracing != 0 { dbg_trace("listelem", "stamp ect={ect} var={var_name} arm=tuple tag={tuple_tag}") }
+        set_list_elem_type(var_name, CT_VOID)
+        set_list_elem_struct(var_name, tuple_tag)
+        return ListElemStamp { ct: CT_VOID, sname: tuple_tag }
+    }
+    if ect == CT_OPTION {
+        let elem_tid = tc_tid_list_elem(etid)
+        let inner_tp = deep_tp_from_tid(tc_tid_option_inner_tid(elem_tid))
+        if inner_tp == -1 {
+            if tracing != 0 { dbg_trace("listelem", "stamp ect={ect} var={var_name} arm=bail_unfaithful") }
+            return no_list_elem_stamp()
+        }
+        if tracing != 0 { dbg_trace("listelem", "stamp ect={ect} var={var_name} arm=option inner_tp={inner_tp}") }
+        set_list_elem_type(var_name, ect)
+        set_list_elem_option_tp(var_name, inner_tp)
+        return ListElemStamp { ct: ect, sname: "" }
+    }
+    if ect == CT_RESULT {
+        let elem_tid = tc_tid_list_elem(etid)
+        let ok_tp = deep_tp_from_tid(tc_tid_result_ok_tid(elem_tid))
+        let err_tp = deep_tp_from_tid(tc_tid_result_err_tid(elem_tid))
+        if ok_tp == -1 || err_tp == -1 {
+            if tracing != 0 { dbg_trace("listelem", "stamp ect={ect} var={var_name} arm=bail_unfaithful") }
+            return no_list_elem_stamp()
+        }
+        if tracing != 0 { dbg_trace("listelem", "stamp ect={ect} var={var_name} arm=result inner_tp={ok_tp}") }
+        set_list_elem_type(var_name, ect)
+        set_list_elem_result_tp(var_name, ok_tp, err_tp)
+        return ListElemStamp { ct: ect, sname: "" }
+    }
+    if ect == CT_MAP {
+        let elem_tid = tc_tid_list_elem(etid)
+        let key_tp = deep_tp_from_tid(tc_tid_map_key_tid(elem_tid))
+        let val_tp = deep_tp_from_tid(tc_tid_map_val_tid(elem_tid))
+        if key_tp == -1 || val_tp == -1 {
+            if tracing != 0 { dbg_trace("listelem", "stamp ect={ect} var={var_name} arm=bail_unfaithful") }
+            return no_list_elem_stamp()
+        }
+        if tracing != 0 { dbg_trace("listelem", "stamp ect={ect} var={var_name} arm=map inner_tp={val_tp}") }
+        set_list_elem_type(var_name, ect)
+        set_list_elem_map_tp(var_name, key_tp, val_tp)
+        return ListElemStamp { ct: ect, sname: "" }
+    }
+    // nprhy8: a Set element is always a flat hashable scalar/struct/tuple (E1400 forecloses a
+    // container element), so no deep_tp_from_tid tree is needed. Gate on the element being
+    // nameable so a genuinely-unresolved typevar keeps declining loudly instead of committing
+    // to a partial (elem-type-known, nested-elem-unknown) answer.
+    if ect == CT_SET {
+        let elem_tid = tc_tid_list_elem(etid)
+        let set_ct = tc_tid_set_elem_ct(elem_tid)
+        let set_struct = tc_tid_set_elem_struct(elem_tid)
+        if set_ct < 0 && set_struct == "" {
+            if tracing != 0 { dbg_trace("listelem", "stamp ect={ect} var={var_name} arm=set_bail_unfaithful") }
+            return no_list_elem_stamp()
+        }
+        if tracing != 0 { dbg_trace("listelem", "stamp ect={ect} var={var_name} arm=set set_ct={set_ct} set_struct={set_struct}") }
+        set_list_elem_type(var_name, ect)
+        if set_ct >= 0 {
+            set_list_nested_elem_type(var_name, set_ct)
+        }
+        if set_struct != "" {
+            set_list_nested_elem_struct(var_name, set_struct)
+        }
+        return ListElemStamp { ct: ect, sname: "" }
+    }
+    // br jcr0zz §2: Iterator/Handle/Channel/Bytes elements have no parity target — flipping
+    // the element to one of these would redirect for-in to a never-emitted iterator type,
+    // trading a loud `.get()` error for a link error in a different construct. Stay erased.
+    if ect == CT_ITERATOR || ect == CT_HANDLE || ect == CT_CHANNEL || ect == CT_BYTES {
+        if tracing != 0 { dbg_trace("listelem", "stamp ect={ect} var={var_name} arm=no_parity_target") }
+        return no_list_elem_stamp()
+    }
+    if ect == CT_STRUCT || ect == CT_ENUM {
+        let es = tc_tid_list_elem_struct(etid)
+        if es == "" { return no_list_elem_stamp() }
+        set_list_elem_type(var_name, CT_VOID)
+        set_list_elem_struct(var_name, es)
+        return ListElemStamp { ct: CT_VOID, sname: es }
+    }
+    set_list_elem_type(var_name, ect)
+    if ect != CT_LIST { return ListElemStamp { ct: ect, sname: "" } }
+    let inner_tid = tc_tid_list_elem(etid)
+    let nect = tc_tid_list_elem_ct(inner_tid)
+    // nprhy8: this carries only the KIND at 2 levels deep, not the inner container's OWN
+    // element at 3 levels deep (no deep-carrier family exists for that) — a for-in 2 levels
+    // down still needs its own recovery. br f9hgt9 is that depth-3 cell.
+    if nect < 0 || nect == CT_OPTION || nect == CT_RESULT || nect == CT_MAP || nect == CT_ITERATOR || nect == CT_HANDLE || nect == CT_CHANNEL || nect == CT_BYTES || nect == CT_LIST {
+        return ListElemStamp { ct: ect, sname: "" }
+    }
+    if nect == CT_STRUCT || nect == CT_ENUM {
+        let nes = tc_tid_list_elem_struct(inner_tid)
+        if nes != "" {
+            set_list_nested_elem_type(var_name, CT_VOID)
+            set_list_nested_elem_struct(var_name, nes)
+        }
+        return ListElemStamp { ct: ect, sname: "" }
+    }
+    set_list_nested_elem_type(var_name, nect)
+    ListElemStamp { ct: ect, sname: "" }
+}
+
 // gemr3z: the Result twin of set_list_elem_option — record
 // `type_list(type_result(ok, err))` so List[Result[T,E]].get()/for-in carry both
 // concrete inners. ok_struct/err_struct name a struct/enum inner ("" for scalars).
