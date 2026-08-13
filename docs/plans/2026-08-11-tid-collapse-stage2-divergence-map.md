@@ -8011,6 +8011,15 @@ handler's C type is the **vtable struct of its effect** and the effect→vtable 
 `typecheck` would mean duplicating the grouping rule, which is how a cell grows a second speller that
 disagrees with the first.
 
+> **Correction, added when br `t7xf9y` closed the cell.** The paragraph above is wrong, and it is left
+> standing because it is the most instructive error in this document. "`typecheck` imports
+> `codegen_types`, not the reverse" is the import direction that makes the call **legal** — it is the
+> premise of the fix, read as if it were the obstacle. `c_type_from_tid` already reaches
+> `c_type_c_name` and `is_transparent_newtype` across that same edge (`typecheck.bl:3`), so there was
+> never a grouping rule to duplicate: `resolve_effect_vtable` gets **consulted**, exactly as the
+> transparent-newtype arm consults its predicate. The forward pointer to br `22zk5f` below inherited
+> the error and sent the flip to the wrong file. See *"The handler that came out of a list"*.
+
 What *did* move is the evidence that the identity landed:
 
 ```
@@ -8032,6 +8041,162 @@ def-side slot resolved to `T` at codegen site `mono_fn_signature_ret`*. That is 
 backstop working, so a handler simply cannot travel through a generic yet. Pinning an ICE as an
 expected outcome would make it load-bearing, so the corpus says so in a comment and the ticket
 carries the detail.
+
+## The handler that came out of a list (br `t7xf9y`)
+
+A handler stored in a container and read back out could not be used:
+
+```blink
+let hs = [mk_io()]
+let h = hs.get(0).unwrap()
+with h { io.println("via list") }
+```
+
+```
+error: assignment to 'blink_io_vtable *' from 'int64_t' makes pointer from integer without a cast
+```
+
+A C compiler error with no Blink span to report it against. The census had already flagged the cell —
+`bucket=decline site=ctype.flat var=h ty=Handler[IO] tidc=- emitted=int64_t` — the tid knew
+`Handler[IO]`, the emitted declaration said `int64_t`, and `tidc=-` said the speller had no answer.
+
+### One erasure, three surfaces
+
+The cause is a single fact: **a container element's `CT_*` is erased to `CT_INT`.** So `val_type` for
+`h` is not `CT_HANDLER`, the declaration chain's `CT_HANDLER` arm is skipped, the `ScopeVar` handler
+registration at `codegen_stmt.bl:3513` is skipped, and the binding falls all the way to the final
+`flat` else, which prints `c_type_str(CT_INT)`.
+
+The ticket named the declaration. Writing the corpus found that the declaration was **one of three**
+surfaces on that fact, and that fixing only it produces programs which compile and are still wrong:
+
+1. **The declaration** printed `int64_t` — the reported error.
+2. **The `with` install slot** came from a stale global, and installed the *wrong vtable*.
+3. **The effect** could not be recovered from either flat channel, so the second operand of a
+   two-handler `with` was discarded as a bare statement.
+
+### Surface 2 is br `88sfaz`'s crash shape with no annotation lie
+
+`cg_handler_vtable_field` is written by `emit_expr` only for a handler **construction**
+(`codegen_expr.bl:1618`) or a call whose return is registered (`codegen_expr.bl:5312`) — **never by a
+bare `Ident`**. The with-operand loop read it *before* clearing it, and the `let` clears it only on
+its `CT_HANDLER` path. Measured:
+
+```blink
+let ios = [mk_io()]       // emit_expr leaves field="io"
+let ms  = [mk_metrics()]   // ...then field="metrics", is_ue=1 — and nothing clears it,
+                           //    because both of these bindings are CT_LIST, not CT_HANDLER
+let hi = ios.get(0).unwrap()
+let hm = ms.get(0).unwrap()
+with hi, hm { io.println("both"); metrics.counter("both", 1) }
+```
+
+The **IO** handler was installed into the `ue_metrics` slot, and `hm` was then emitted as a bare
+`hm;` statement and dropped. `metrics.counter` dispatches by slot index through an IO vtable — which
+is precisely the wrong-vtable-in-a-slot shape that made br `88sfaz` a P0, reached here with **no
+`@trusted`, no `@ffi`, and no annotation lie anywhere in the program.** Two things stopped it being a
+crash rather than a diagnostic: the `handler_type == CT_HANDLER` gate, and `-Wint-conversion` being
+an error in the generated build. Neither is a Blink diagnostic, and neither would have held if the
+two effects had happened to share a root.
+
+The fix is to clear the globals **before** `emit_expr`, so the channel means "what *this* operand
+set" rather than "the last thing that set it". Filed br `td3mrg` for the identical read on
+`cg_handler_cleanup_var` / `cleanup_fn` rather than moving those speculatively — no MVCE for them
+yet, and that ticket says so.
+
+### Surface 3 is where `sv.ty` stops being a cross-check
+
+Recovering the slot needs the *effect*, and neither flat channel can name it for an erased binding.
+My first attempt asked the operand node for its tid and did not fire. The reason is measured, not a
+preference: typecheck's `WithBlock` arm routes each operand through `tc_check_body`
+(`typecheck.bl:11900`), and for a bare `Ident` that walker has nothing to do — it never calls
+`infer_type`, so no tid is ever memoized against the node and `tc_lookup_node_tid(item)` answers
+`-1`.
+
+The tid stamped on the **binding** at its `let` — whose node *is* inferred — is the only channel that
+has it:
+
+```blink
+let h_eff = tc_tid_handler_effect(tc_tid_resolved(tc_tid_subst_mono(get_var_ty(handler_str), ...)))
+```
+
+Every Stage-3 unit so far has used `sv.ty` as a *better* answer than the flat fields. This is the
+first one where it is the **only** answer, and where the flat channel is not merely lossy but absent.
+
+### The spelling belongs in typecheck, and the earlier note said otherwise
+
+The new arm is in `c_type_from_tid`:
+
+```blink
+if k == TyKind.Handler {
+    let vt = resolve_effect_vtable(tc_tid_handler_effect(t))
+    if vt == "" { return "" }
+    return "{vt}*"
+}
+```
+
+This is the correction described in the box under *"The census did not move, on purpose"*. Both the
+88sfaz note and br `22zk5f` argued this could not live in typecheck because `resolve_effect_vtable`
+reads codegen's `ue_effects` registry and "typecheck imports codegen_types, not the reverse" — the
+import direction that makes the call legal, mistaken for the one that forbids it. The registry
+filling *during* codegen is not a hazard either, for the same reason it is not one for
+`is_transparent_newtype`: every caller of `c_type_from_tid` is a codegen emit site or the `ctypediv`
+probe that runs beside them, so no caller can observe the empty registry — and if one ever did, the
+effect resolves to no vtable and the arm declines, which is the right answer for *"I cannot spell
+this yet"* rather than a wrong C type. br `22zk5f` closed as subsumed.
+
+The declaration branch is ordered **after** every arm the flat channel already governs, per br
+`0rmamy` / br `q3ssqw`. `handler_c_from_tid` deliberately carries **no equality decline**, unlike
+`ptr_c_from_tid`'s `void*` and `enum_c_from_tid`'s `int64_t`: those guard against a tid that knows no
+more than the flat fields, but the flat path cannot spell a vtable type *at all* unless it already
+took the `CT_HANDLER` arm — which is ordered first. So every non-`""` answer here is a binding that
+would otherwise have been declared from an erased CT. The cast is load-bearing, not cosmetic: a
+container round-trips the handler pointer through an `(int64_t)(intptr_t)` slot, so at the
+declaration the initializer really is an integer expression.
+
+### One row compiled, ran, exited 0, and was silently wrong
+
+```blink
+let h2 = h
+with h2 { io.println("via copy") }
+```
+
+This built and ran clean, and printed `via copy` where a correct dispatch prints `[H] via copy` — the
+handler was never installed and the call went to the ambient default stub, which returns without
+doing anything. Same cause as surface 3: a bare `Ident` sets no global, so the copy's
+`set_var_handler` recorded an empty field.
+
+I nearly recorded this as a regression of my own change, because the *pre-fix* probe had printed
+`via copy` and I read that as working. It was not. **A user effect's default stub returning silently
+means `assert(true)`-style rows cannot tell a correct dispatch from no dispatch at all** — so every
+row in the corpus that claims a handler ran asserts on its *output*, and the five "already right"
+pins were each verified by running them pre-fix and reading the prefix, rather than assumed.
+
+### What is deliberately not pinned
+
+`for h in hs` and `Some(mk_io())` still fail, on a different cause: the Option carrier erases its
+inner to `void`, emits an undeclared `blink_Option_void`, and disagrees with the `blink_Option_int`
+unwrap temp, so the pointer is built with `blink_u_mk()` and discarded. That is br `rh7rhf`, one cell,
+noted in the corpus rather than pinned.
+
+### Measured
+
+Over `tests` + `examples` + `src`, **identical in both build modes** (monolithic and
+`--link-archive`):
+
+```
+ctype.handler      agree=0  diverge=0 missing=12   ->  agree=16 diverge=0 missing=0
+ctype.handler_tid  (new cell: the declaration branch)  agree=6  diverge=0 missing=0
+TOTAL              diverge=42 missing=116          ->  diverge=42 missing=109
+```
+
+**The first Stage-3 cell to close completely rather than shrink.** `diverge` is unchanged, as it
+should be: nothing here touched a shape the flat channel was already spelling.
+
+`tests/test_t7xf9y_handler_from_container.bl`, 14 rows: five for shapes that did not compile (List,
+Map, user-effect List, two effects in one program, non-zero index), four run-mode rows asserting the
+handler body actually ran, five regression pins. `task ci` green — 695 test files, 695 passed, 0
+failed; `fmt` 1608 passed, 0 failed.
 
 ## Appendix — all 428 shape cells
 

@@ -1,6 +1,6 @@
 import ast.{NodeKind, node_kind_name, is_block_bearing, dbg_trace, dbg_channel_on}
 import std.str.{str_to_lower}
-import codegen_types.{is_intrinsic_method, strip_module_qualifier, c_type_tag_for_struct, c_type_c_name, is_transparent_newtype, escape_mono_seg, mono_slot_conflicts, mono_slot_conflicts_same_type, mono_slot_conflicts_diff_type, mono_slot_conflicts_diff_type_injective, get_var_ty, get_var_tp, tp_get_kind, tp_get_child1, tp_get_child2, tp_get_sname, tp_display, CT_INT, CT_FLOAT, CT_BOOL, CT_STRING, CT_LIST, CT_VOID, CT_OPTION, CT_RESULT, CT_ITERATOR, CT_HANDLE, CT_HANDLER, CT_CHANNEL, CT_PTR, CT_MAP, CT_BYTES, CT_SET, CT_STRINGBUILDER, CT_TEMPLATE, CT_FFI_SCOPE, CT_STRUCT, CT_ENUM, CT_I8, CT_I16, CT_I32, CT_U8, CT_U16, CT_U32, CT_U64, CT_CHAR}
+import codegen_types.{is_intrinsic_method, strip_module_qualifier, c_type_tag_for_struct, c_type_c_name, is_transparent_newtype, resolve_effect_vtable, escape_mono_seg, mono_slot_conflicts, mono_slot_conflicts_same_type, mono_slot_conflicts_diff_type, mono_slot_conflicts_diff_type_injective, get_var_ty, get_var_tp, tp_get_kind, tp_get_child1, tp_get_child2, tp_get_sname, tp_display, CT_INT, CT_FLOAT, CT_BOOL, CT_STRING, CT_LIST, CT_VOID, CT_OPTION, CT_RESULT, CT_ITERATOR, CT_HANDLE, CT_HANDLER, CT_CHANNEL, CT_PTR, CT_MAP, CT_BYTES, CT_SET, CT_STRINGBUILDER, CT_TEMPLATE, CT_FFI_SCOPE, CT_STRUCT, CT_ENUM, CT_I8, CT_I16, CT_I32, CT_U8, CT_U16, CT_U32, CT_U64, CT_CHAR}
 import parser.{
     get_annotation, has_annotation, is_literal_string_part,
     node_args, node_assoc_types, node_arms, node_body, node_captures, node_col, node_condition,
@@ -14176,6 +14176,25 @@ pub fn c_type_from_tid(tid: Int) -> Str {
         if pointee == "" { return "void*" }
         return "{pointee}*"
     }
+    // br t7xf9y. A handler's C type is the VTABLE STRUCT of its effect, and this arm is a
+    // CORRECTION of the reasoning the decline below used to carry. That comment argued the
+    // spelling could not live here because resolve_effect_vtable reads codegen's `ue_effects`
+    // registry and "typecheck imports codegen_types, not the reverse" — which is the import
+    // direction that makes the call LEGAL, not the one that forbids it. This function already
+    // reaches c_type_c_name and is_transparent_newtype across the same edge (typecheck.bl:3), so
+    // there was never a second grouping rule to duplicate: resolve_effect_vtable is consulted, not
+    // reimplemented, which is the same discipline the transparent-newtype arm above follows.
+    //
+    // The registry being populated DURING codegen is not a hazard either, for the reason it is not
+    // one for is_transparent_newtype: every caller of this function is a codegen emit site or the
+    // ctypediv probe that runs alongside them, so no caller can observe the empty registry. If one
+    // ever did, the effect would resolve to no vtable and this declines — which is the correct
+    // answer for "I cannot spell this yet" rather than a wrong C type.
+    if k == TyKind.Handler {
+        let vt = resolve_effect_vtable(tc_tid_handler_effect(t))
+        if vt == "" { return "" }
+        return "{vt}*"
+    }
     // Exhaustive on purpose: a kind added later fails to COMPILE here rather than falling
     // through to a plausible-wrong C type, which is the whole reason Stage 0 made TyKind a
     // real enum. Every spelling below is the one c_type_str already answers for the
@@ -14212,17 +14231,8 @@ pub fn c_type_from_tid(tid: Int) -> Str {
         TyKind.Void => "void"
         TyKind.Typevar => ""
         TyKind.Unknown => ""
-        // DECLINES, and this is a boundary fact rather than a gap: a handler's C type is the
-        // VTABLE STRUCT of its effect (`blink_io_vtable*`, `blink_ue_metrics_vtable*`), and the
-        // effect→vtable map is resolve_effect_vtable (codegen_types.bl:1455), which reads
-        // codegen's `ue_effects` registry to get the handle segment. typecheck imports
-        // codegen_types, not the reverse, and that registry is populated during codegen — so this
-        // file can say WHICH effect (tc_tid_handler_effect) but not what C calls it. Spelling it
-        // here would mean duplicating the grouping rule, which is precisely how a cell grows a
-        // second speller that disagrees with the first. Making this an agree is its own step (br
-        // 88sfaz gives the type an identity; the census flip is downstream).
+        // All five handled above, ahead of the match.
         TyKind.Handler => ""
-        // All four handled above, ahead of the match.
         TyKind.Ptr => ""
         TyKind.Option => ""
         TyKind.Result => ""

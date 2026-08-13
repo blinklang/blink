@@ -1,0 +1,266 @@
+import compile_test_helpers.{compile_and_run}
+
+// br t7xf9y — a `Handler[E]` read back out of a container declares as `int64_t`, so the `with`
+// that uses it does not compile. `blink check` reports nothing; the C compiler does:
+//
+//     error: assignment to 'blink_io_vtable *' from 'int64_t' {aka 'long int'} makes pointer
+//     from integer without a cast [-Wint-conversion]
+//         __ev_with_4.io = h;
+//
+// THE CAUSE, in one line: BOTH channels the declaration chain consults are flat. The chain tests
+// `val_type == CT_HANDLER` and then reads the vtable name off the binding's own ScopeVar
+// (`get_var_handler_vtable_type`, codegen_types.bl:4848, which returns `sv.sname`) — but a
+// container element's CT is erased to CT_INT, so `val_type` is not CT_HANDLER, the handler arm is
+// skipped entirely, and the binding falls through to the final `flat` else which prints
+// `c_type_str(CT_INT)`.
+//
+// THE TID KNEW ALL ALONG. From the Stage 3 ctypediv sweep, before the fix:
+//
+//     bucket=decline site=ctype.flat var=h ty=Handler[IO] tidc=- emitted=int64_t
+//
+// `ty=Handler[IO]` is the tid — correct and complete since br 88sfaz gave `Handler[E]` a type
+// identity. `tidc=-` is `c_type_from_tid` declining, and that decline was the only missing piece:
+// the C type of a handler is the vtable struct of its effect. The 88sfaz note claimed typecheck
+// could not spell it because `resolve_effect_vtable` needs codegen's `ue_effects` registry — that
+// was wrong about the layering. `c_type_from_tid` already imports `c_type_c_name` and
+// `is_transparent_newtype` from codegen_types (typecheck.bl:3), so the seam was open.
+//
+// THE SHAPE IS LEGITIMATE, checked rather than assumed: a handler is GC-heap allocated at
+// construction (`__handler_ptr_0 = (blink_io_vtable*)blink_alloc(sizeof(blink_io_vtable))`), so it
+// outlives the function that built it and storing one is not a dangling-pointer hazard.
+// tests/test_handler_return.bl already depends on that lifetime.
+//
+// THE DECLARATION WAS ONLY THE FIRST OF THREE. Writing the rows below turned up two more surfaces
+// on the same root cause, both of which had to move for any of these programs to be correct:
+//
+//   * THE SLOT, from a STALE GLOBAL. `cg_handler_vtable_field` is set by emit_expr only for a
+//     handler CONSTRUCTION, and the `with` read it BEFORE clearing it — so an operand that set
+//     nothing inherited the last handler expression's field. In the two-effect row below, the IO
+//     handler was installed into the `ue_metrics` slot and the second operand was then discarded as
+//     a bare `hm;` statement. That is the wrong-vtable-in-a-slot shape of br 88sfaz reached with no
+//     annotation lie anywhere in the program.
+//
+//   * THE EFFECT, from `sv.ty`. Neither flat channel can name the effect of an erased binding, and
+//     the operand NODE has no tid either: typecheck's WithBlock arm routes each operand through
+//     tc_check_body, which for a bare Ident never calls infer_type, so nothing is memoized against
+//     the node. The tid stamped on the BINDING at its `let` is the only channel that has it — the
+//     first place in this collapse where `sv.ty` is the sole answer rather than a cross-check.
+//
+// AND ONE ROW WAS SILENTLY WRONG RATHER THAN BROKEN: `let h2 = h` compiled, ran, exited 0 and
+// dispatched to the ambient default. See the section on it below; it is the reason the pins in this
+// file assert output and not just compilation.
+
+effect Metrics {
+    effect Emit {
+        fn counter(name: Str, value: Int)
+    }
+}
+
+fn mk_io() -> Handler[IO] {
+    handler IO {
+        fn print(msg: Str) {
+            io.println("[IO] {msg}")
+        }
+    }
+}
+
+fn mk_metrics() -> Handler[Metrics] {
+    handler Metrics {
+        fn counter(name: Str, value: Int) {
+            io.println("[METRICS] {name}={value}")
+        }
+    }
+}
+
+// ── The rows that did not compile ────────────────────────────────────────────────────
+
+test "a handler read out of a List can be used" {
+    let hs = [mk_io()]
+    let h = hs.get(0).unwrap()
+    with h {
+        io.println("via list")
+    }
+    assert(true)
+}
+
+// The same defect through a second container, which is the row that says the cause is the ELEMENT
+// ERASURE and not something about `List` — `Map.get` returns the same `Option[Handler[IO]]` and
+// the declaration fell to the same `flat` else.
+test "a handler read out of a Map can be used" {
+    let mut m: Map[Str, Handler[IO]] = Map()
+    m.insert("a", mk_io())
+    let h = m.get("a").unwrap()
+    with h {
+        io.println("via map")
+    }
+    assert(true)
+}
+
+// A USER effect, so the `blink_ue_*_vtable` half of the spelling is exercised and not only the
+// builtin `blink_io_vtable` half. These are two different arms of `resolve_effect_vtable` (a fixed
+// name table vs a scan of codegen's `ue_effects` registry), so one passing does not imply the other.
+test "a user-effect handler read out of a List can be used" {
+    let hs = [mk_metrics()]
+    let h = hs.get(0).unwrap()
+    with h {
+        metrics.counter("from-list", 5)
+    }
+    assert(true)
+}
+
+// Two containers of DIFFERENT effects in one program, which is the row that would catch a fix that
+// spelled one vtable for every handler binding — the 88sfaz crash was exactly a handler reaching a
+// slot-index dispatch through the wrong vtable, so a single-vtable fix would be a regression of it.
+test "handlers of different effects come out of their own containers" {
+    let ios = [mk_io()]
+    let ms = [mk_metrics()]
+    let hi = ios.get(0).unwrap()
+    let hm = ms.get(0).unwrap()
+    with hi, hm {
+        io.println("both")
+        metrics.counter("both", 1)
+    }
+    assert(true)
+}
+
+// A second element, so the binding is not the degenerate one-element case where a fix could read
+// the list's construction site instead of the element's type.
+test "a handler at a non-zero List index can be used" {
+    let hs = [mk_io(), mk_metrics()]
+    assert_eq(hs.len(), 2)
+    let h = hs.get(1).unwrap()
+    with h {
+        metrics.counter("second", 2)
+    }
+    assert(true)
+}
+
+// ── Dispatch actually reaching the handler body ──────────────────────────────────────
+//
+// A run-mode row. The declaration being spelled `blink_io_vtable*` is necessary but not
+// sufficient: the pointer round-trips through the list's `(int64_t)(intptr_t)` slot, so this is
+// the row that says the value survives the trip and the `with` dispatches into the handler body
+// rather than into the ambient default.
+test "a handler from a container dispatches to the handler body" {
+    let src = "fn mk() -> Handler[IO] \{\n    handler IO \{\n        fn print(msg: Str) \{\n            io.println(\"[H] \{msg}\")\n        }\n    }\n}\nfn main() \{\n    let hs = [mk()]\n    let h = hs.get(0).unwrap()\n    with h \{\n        io.println(\"via list\")\n    }\n}\n"
+    let r = compile_and_run(src, "t7xf9y_list_dispatch")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("[H] via list"))
+}
+
+// The user-effect twin of the row above, run and checked for output. A user effect's default
+// vtable stub returns without doing anything, so "the handler body ran" is the only observable
+// difference between a correct dispatch and a silently wrong one — the exact failure mode br
+// 88sfaz found in the annotation channel.
+test "a user-effect handler from a container dispatches to the handler body" {
+    let src = "effect Metrics \{\n    effect Emit \{\n        fn counter(name: Str, value: Int)\n    }\n}\nfn mk() -> Handler[Metrics] \{\n    handler Metrics \{\n        fn counter(name: Str, value: Int) \{\n            io.println(\"[M] \{name}=\{value}\")\n        }\n    }\n}\nfn main() \{\n    let hs = [mk()]\n    let h = hs.get(0).unwrap()\n    with h \{\n        metrics.counter(\"ok\", 42)\n    }\n}\n"
+    let r = compile_and_run(src, "t7xf9y_ue_list_dispatch")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("[M] ok=42"))
+}
+
+// ── The row that compiled and dispatched to the WRONG place ─────────────────────────
+
+// NOT a pin — this row was SILENTLY WRONG before the fix, and finding that out is why the pins
+// below carry run-mode output assertions instead of `assert(true)`.
+//
+// `let h2 = h` compiled and ran and exited 0, and printed `via copy` where a correct dispatch
+// prints `[H] via copy`: the handler was never installed, so `io.println` inside the `with` went to
+// the AMBIENT default. The mechanism is the third channel in the same family — the global is set
+// only by a handler CONSTRUCTION (codegen_expr.bl:1618) or a call whose return is registered
+// (codegen_expr.bl:5312), and a bare Ident sets neither, so the copy's `set_var_handler` recorded an
+// empty vtable field and the `with` fell to the discard arm. `sv.ty` is what answers for it.
+//
+// I first mistook this for a regression of my own change, because the pre-fix probe printed
+// `via copy` and I read it as working. It was not. The lesson is in the assertion style: a row that
+// only checks compilation cannot tell a correct dispatch from the ambient default.
+test "a handler copied to a second binding dispatches to the handler body" {
+    let src = "fn mk() -> Handler[IO] \{\n    handler IO \{\n        fn print(msg: Str) \{\n            io.println(\"[H] \{msg}\")\n        }\n    }\n}\nfn main() \{\n    let h = mk()\n    let h2 = h\n    with h2 \{\n        io.println(\"copied\")\n    }\n}\n"
+    let r = compile_and_run(src, "t7xf9y_copy_dispatch")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("[H] copied"))
+}
+
+// ── Regression pins: the rows the FLAT channel already governed ──────────────────────
+//
+// These are the `ctype.handler` census rows — the site where the tid answered for zero rows before
+// this fix (agree=0 diverge=0 missing=12). The new branch is ordered AFTER every arm the flat
+// channel already governs, following br 0rmamy and br q3ssqw, so that it can only catch bindings
+// whose flat CT went blank. These pins hold that ordering: if the tid branch were moved earlier it
+// would take these bindings away from the arm that already spells them correctly, which is a
+// regression no failing row above would reveal.
+//
+// Each was verified to dispatch correctly BEFORE the fix by running it and reading the prefix, so
+// "already right" is a measurement here and not an assumption — the copy row in the section above is
+// what happens when it is an assumption. The in-corpus rows check the emit path (and feed the ctypediv sweep);
+// the run-mode row after them is what makes a silent fall-through to the ambient default fail.
+
+fn use_io(h: Handler[IO]) {
+    with h {
+        io.println("through a param")
+    }
+}
+
+test "a plain handler local was already right and stays right" {
+    let h = mk_io()
+    with h {
+        io.println("direct")
+    }
+    assert(true)
+}
+
+test "an annotated handler local was already right and stays right" {
+    let h: Handler[IO] = mk_io()
+    with h {
+        io.println("annotated")
+    }
+    assert(true)
+}
+
+test "a handler through a parameter was already right and stays right" {
+    use_io(mk_io())
+    assert(true)
+}
+
+// A handler out of an `if` tail and a `match` arm — both already worked, and both reach the
+// declaration through a temp rather than directly from the `handler` expression, so they are the
+// pins closest to the branch this fix adds.
+test "a handler from an if tail was already right and stays right" {
+    let pick = if 1 > 0 { mk_io() } else { mk_io() }
+    with pick {
+        io.println("if tail")
+    }
+    assert(true)
+}
+
+test "a handler from a match arm was already right and stays right" {
+    let sel = 0
+    let pick = match sel {
+        0 => mk_io()
+        _ => mk_io()
+    }
+    with pick {
+        io.println("match arm")
+    }
+    assert(true)
+}
+
+// The run-mode counterpart to the five pins above, all in one program: every already-working shape
+// must still reach its own handler body. Without this row the pins would pass on a fix that
+// installed nothing at all, which is precisely how the copy row stayed broken.
+test "the already-working shapes all still dispatch to the handler body" {
+    let src = "fn mk() -> Handler[IO] \{\n    handler IO \{\n        fn print(msg: Str) \{\n            io.println(\"[H] \{msg}\")\n        }\n    }\n}\nfn use_io(h: Handler[IO]) \{\n    with h \{\n        io.println(\"param\")\n    }\n}\nfn main() \{\n    let a = mk()\n    with a \{\n        io.println(\"direct\")\n    }\n    let b: Handler[IO] = mk()\n    with b \{\n        io.println(\"annotated\")\n    }\n    use_io(mk())\n    let pick = if 1 > 0 \{ mk() } else \{ mk() }\n    with pick \{\n        io.println(\"if tail\")\n    }\n}\n"
+    let r = compile_and_run(src, "t7xf9y_pins_dispatch")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("[H] direct"))
+    assert(r.out.contains("[H] annotated"))
+    assert(r.out.contains("[H] param"))
+    assert(r.out.contains("[H] if tail"))
+}
+
+// NOT PINNED, and for a cause that is not this one: `for h in hs` over a `List[Handler[IO]]`, and
+// `Some(mk_io())`, both fail on the OPTION CARRIER rather than on the binder — the inner is erased
+// to `void`, so `blink_Option_void` is emitted and never typedef'd while the unwrap temp is spelled
+// `blink_Option_int`. Two disagreeing carrier names for one Option is a different defect from a
+// binding that read the wrong CT, and it is br rh7rhf. Pinning it here would make this fix look
+// incomplete for a reason it does not own.

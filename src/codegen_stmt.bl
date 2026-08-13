@@ -114,7 +114,7 @@ import diagnostics.{
 import pkg.manifest.{manifest_header_is_declared, manifest_name}
 import compiler.{trace}
 import stdlib_native_deps.{stdlib_native_dep_name_by_ffi_symbol}
-import typecheck.{sv_ty_or_flat_at, ctype_probe_at, enum_instance_c_from_tid, tc_tid_subst_mono, c_type_from_tid, tc_tid_kind, tc_tid_resolved, tc_tid_iter_elem, TyKind, is_builtin_fn, is_import_module_name, tc_channel_elem_ct, tc_channel_elem_struct, tc_lookup_node_tid, tc_tid_struct_mono_name, tc_tid_struct, tc_tid_is_enum, tc_tid_struct_arg_count, tc_tid_struct_arg_tid, tc_tid_struct_slot_seg, tc_struct_slot_encodable, tc_tid_result_ok_tid, tc_tid_result_err_tid, tc_tid_option_inner_tid, tc_tid_tuple_arity, tc_tid_tuple_elem_tid, tc_tid_to_c_tag}
+import typecheck.{sv_ty_or_flat_at, ctype_probe_at, enum_instance_c_from_tid, tc_tid_handler_effect, tc_tid_subst_mono, c_type_from_tid, tc_tid_kind, tc_tid_resolved, tc_tid_iter_elem, TyKind, is_builtin_fn, is_import_module_name, tc_channel_elem_ct, tc_channel_elem_struct, tc_lookup_node_tid, tc_tid_struct_mono_name, tc_tid_struct, tc_tid_is_enum, tc_tid_struct_arg_count, tc_tid_struct_arg_tid, tc_tid_struct_slot_seg, tc_struct_slot_encodable, tc_tid_result_ok_tid, tc_tid_result_err_tid, tc_tid_option_inner_tid, tc_tid_tuple_arity, tc_tid_tuple_elem_tid, tc_tid_to_c_tag}
 
 fn strip_outer_parens(s: Str) -> Str {
     if s.starts_with("(") && s.ends_with(")") {
@@ -3339,6 +3339,22 @@ fn ptr_c_from_tid(tid: Int) -> Str {
     c
 }
 
+// br t7xf9y. The vtable type of a handler binding, spelled from the tid — "" when the tid does not
+// name a handler, or names an effect that resolves to no vtable.
+//
+// There is no equality decline here, unlike ptr_c_from_tid's `void*` and enum_c_from_tid's
+// `int64_t`, and the difference is what this helper is for: those two guard against a tid that
+// knows no more than the flat fields, but the flat path cannot spell a vtable type AT ALL unless it
+// already took the CT_HANDLER arm — and that arm is ordered before this one, so a binding reaching
+// here has no flat answer to protect. Every non-"" answer is a binding that would otherwise have
+// been declared from an ERASED CT (`int64_t`, from a container element), which is br t7xf9y.
+fn handler_c_from_tid(tid: Int) -> Str {
+    if tid < 0 { return "" }
+    let r = tc_tid_resolved(tid)
+    if tc_tid_kind(r) != TyKind.Handler { return "" }
+    c_type_from_tid(r)
+}
+
 // br tm1vbv. The CT of a sized-integer local, read from the tid — `-1` when the tid does not name
 // one of the seven.
 //
@@ -4227,6 +4243,23 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
         decl_c = ptr_c
         decl_branch = "ptr_tid"
         emit_line("{ptr_c} {cname} = {val_str};")
+    } else if handler_c_from_tid(decl_tid) != "" {
+        // br t7xf9y, and ordered here for br 0rmamy's reason: the CT_HANDLER arm far above owns
+        // every binding whose flat `val_type` survived, and this arm only catches the ones where it
+        // was ERASED — a handler read out of a container (`hs.get(0).unwrap()`, `m.get(k).unwrap()`)
+        // arrives as CT_INT, skips that arm, and fell through to the `flat` else below, which
+        // printed `int64_t`. The `with` that then used the binding failed in the C compiler
+        // ("assignment to 'blink_io_vtable *' from 'int64_t' … makes pointer from integer without a
+        // cast") with no Blink span to report it against.
+        //
+        // The CAST is not optional and not cosmetic: a container stores the handler pointer through
+        // an `(int64_t)(intptr_t)` slot, so the initializer really is an integer expression at this
+        // point and the declaration is where it comes back to a vtable pointer. This mirrors the
+        // CT_HANDLER arm, which casts for the same reason.
+        let h_tid_c = handler_c_from_tid(decl_tid)
+        decl_c = h_tid_c
+        decl_branch = "handler_tid"
+        emit_line("{h_tid_c} {cname} = ({h_tid_c}){val_str};")
     } else {
         let ts = c_type_str(val_type)
         decl_c = ts
@@ -5268,6 +5301,33 @@ fn emit_with_block_core(node: Int, is_expr: Int, result_sink: Str) -> Str ! Code
             // the ticket's "with/catch bindings" is this one site.
             let _measured = sv_ty_or_flat_at(binding, "with_resource.bind", item)
         } else {
+            // br t7xf9y, and this clear is a BUG FIX rather than tidying. cg_handler_vtable_field is
+            // set by emit_expr when the operand is a handler CONSTRUCTION, and it was read below
+            // before being cleared — so an operand that sets nothing inherited whatever the last
+            // handler expression anywhere earlier in the function had left behind. Measured: in
+            //
+            //     let ios = [mk_io()]      // emit_expr leaves field="io"
+            //     let ms = [mk_metrics()]  // …then field="metrics", is_ue=1, and nothing clears it:
+            //                              //   the `let` only clears on the CT_HANDLER path, and
+            //                              //   these two bindings are CT_LIST
+            //     let hi = ios.get(0).unwrap()
+            //     let hm = ms.get(0).unwrap()
+            //     with hi, hm { … }
+            //
+            // `hi` — the IO handler — read the stale "metrics" and was installed into the
+            // `ue_metrics` SLOT, then the clear below emptied the channel so `hm` fell to the
+            // `emit_line("{handler_str};")` arm and was discarded as a bare statement. That is
+            // exactly the wrong-vtable-in-a-slot shape br 88sfaz found, reached with no annotation
+            // lie anywhere in the program: `metrics.counter` would dispatch by slot index through an
+            // IO vtable. Two things stopped it being a crash today — the CT_HANDLER gate below, and
+            // `-Wint-conversion` being an error — and neither is a Blink diagnostic.
+            //
+            // Clearing BEFORE the call is what makes the channel mean "what this operand set". Only
+            // the two fields read here are cleared: cg_handler_cleanup_var / cleanup_fn have the
+            // same leak shape but govern resource cleanup, and moving them with no failing row to
+            // measure against would be speculative. Filed as its own ticket.
+            cg_handler_vtable_field = ""
+            cg_handler_is_user_effect = 0
             emit_expr(item)
             let handler_str = expr_result_str
             let handler_type = expr_result_type
@@ -5283,6 +5343,32 @@ fn emit_with_block_core(node: Int, is_expr: Int, result_sink: Str) -> Str ! Code
             if vtable_field == "" && handler_type == CT_HANDLER {
                 vtable_field = get_var_handler_vtable_field(handler_str)
                 is_ue = get_var_handler_is_ue(handler_str)
+            }
+            // br t7xf9y. The two channels above are both flat and both fail on the same shape: the
+            // global is only set by a handler CONSTRUCTION, and the name-keyed recovery is gated on
+            // `handler_type == CT_HANDLER`, which a container element's erased CT is not. So a
+            // handler read out of a `List` or a `Map` reached neither, fell to the
+            // `emit_line("{handler_str};")` arm below and was DISCARDED — its effect never installed,
+            // and the `with` body then dispatched through whatever the ambient vtable was.
+            //
+            // Ordered last, per br 0rmamy: the tid is asked only where both flat channels went
+            // blank, so it cannot take an operand away from an arm that already resolved it. The
+            // effect comes from the tid rather than from `handler_str`, which is why it survives the
+            // erasure — br 88sfaz put it there.
+            // The tid comes from the BINDING and not from the operand node, which is a measured
+            // detail rather than a preference: typecheck's WithBlock arm routes each operand through
+            // tc_check_body (typecheck.bl:11900), and for a bare Ident that walker has nothing to do
+            // — it never calls infer_type, so no tid is ever memoized against the node and
+            // tc_lookup_node_tid(item) answers -1. `sv.ty` is stamped at the `let`, whose node IS
+            // inferred, so the binding carries what the operand node does not. That is the channel
+            // this collapse is building, used here for the first time as the ONLY available answer
+            // rather than as a cross-check.
+            if vtable_field == "" {
+                let h_eff = tc_tid_handler_effect(tc_tid_resolved(tc_tid_subst_mono(get_var_ty(handler_str), cg_mono_tparams_sl, cg_mono_arg_tids)))
+                if h_eff != "" {
+                    vtable_field = resolve_effect_field(h_eff)
+                    is_ue = resolve_effect_is_ue(h_eff)
+                }
             }
             if vtable_field != "" {
                 let field_c = if is_ue != 0 { "ue_{vtable_field}" } else { vtable_field }
