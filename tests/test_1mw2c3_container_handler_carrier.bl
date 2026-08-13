@@ -1,0 +1,176 @@
+import compile_test_helpers.{compile_and_run}
+
+// br 1mw2c3 — `List[Handler[E]].get(i)` and `Map[K, Handler[E]].get(k)` spelled the retrieved
+// Option as `blink_Option_int` whatever the element was, so installing the handler assigned an
+// int64_t to a vtable pointer and cc rejected the program:
+//
+//     build/listget.c:154:24: error: assignment to 'blink_io_vtable *' from 'int64_t' makes pointer
+//         from integer without a cast [-Wint-conversion]
+//       154 |         __ev_with_1.io = _ounw_4.value;
+//
+// THE CAUSE was a missing arm, not a missing type. Both `.get` emitters end their element-CT ladder
+// in an `else` that hardcodes CT_INT — the int-shaped carrier every scalar element rides — and
+// CT_HANDLER had no arm of its own, so it landed there. The carrier it needed already existed and is
+// already emitted for `Some(mk())`: `blink_Option_handler`, whose member is a `void*`, so it stores
+// and yields a vtable pointer with no cast on either side and needs no per-effect variant. The
+// element's effect is not in the carrier and does not have to be — the `with` operand recovers it
+// from the tid (br t7xf9y), which is why these rows can assert the RIGHT handler ran.
+//
+// WHY THE VALUE SURVIVED ANYWAY, and why that made this easy to under-fix: an int64_t holds a
+// pointer on every target Blink builds for, so the numbers were never wrong — only the spelling was.
+// A cast at the assignment would have silenced cc and left the element erased for everything
+// downstream. The fix gives the site the element's carrier tag instead.
+//
+// EVERY ROW RUNS AND ASSERTS ON OUTPUT. `-Wint-conversion` being an error is what has been standing
+// in for a type check here (`codegen_stmt.bl:5322` names it as one of two accidental guards), so
+// "cc accepted it" is the weakest possible evidence on this shape: it is the guard being removed. A
+// row has to show the handler was installed AND that it was the right one.
+
+effect Metrics {
+    effect Emit {
+        fn counter(name: Str)
+    }
+}
+
+// ── The two MVCEs ────────────────────────────────────────────────────────────────────
+
+test "a handler read out of a List installs" {
+    let src = "fn mk() -> Handler[IO] \{\n    handler IO \{ fn print(msg: Str) \{ io.println(\"[H] \{msg}\") } }\n}\nfn main() \{\n    let hs = [mk()]\n    with hs.get(0).unwrap() \{ io.println(\"from list\") }\n}\n"
+    let r = compile_and_run(src, "1mw2c3_list")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("[H] from list"))
+}
+
+test "a handler read out of a Map installs" {
+    let src = "fn mk() -> Handler[IO] \{\n    handler IO \{ fn print(msg: Str) \{ io.println(\"[H] \{msg}\") } }\n}\nfn main() \{\n    let mut m: Map[Str, Handler[IO]] = Map()\n    m.insert(\"k\", mk())\n    with m.get(\"k\").unwrap() \{ io.println(\"from map\") }\n}\n"
+    let r = compile_and_run(src, "1mw2c3_map")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("[H] from map"))
+}
+
+// ── The receiver shapes ──────────────────────────────────────────────────────────────
+//
+// An EXPRESSION receiver is here because the two `.get` emitters read their element from the flat
+// channels keyed on the receiver's C text, and a call has no ScopeVar of its own. Measured before the
+// fix: the listelem tap reports `stamp ect=21 var=blink_u_mk_list() arm=tail`, so a pseudo-var IS
+// stamped and the element does arrive — this row proves the arm sees it, and would catch a fix that
+// only worked for a named variable.
+
+test "a handler read out of a List returned by a call installs" {
+    let src = "fn mk() -> Handler[IO] \{\n    handler IO \{ fn print(msg: Str) \{ io.println(\"[H] \{msg}\") } }\n}\nfn mk_list() -> List[Handler[IO]] \{ [mk()] }\nfn main() \{\n    with mk_list().get(0).unwrap() \{ io.println(\"call recv\") }\n}\n"
+    let r = compile_and_run(src, "1mw2c3_callrecv")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("[H] call recv"))
+}
+
+// The let-bound form PASSED before the fix, and the reason is worth recording rather than treating
+// this as a redundant row: the `let` re-spells its own declared C type from the tid
+// (`blink_io_vtable* hi = (blink_io_vtable*)_ounw_4.value;`), so its explicit cast hid the wrong
+// carrier. That means it is the one shape in this file that cannot regress from a missing arm — and
+// the one that would catch a fix that changed the carrier without keeping the `let` cast consistent.
+test "a handler read out of a List through an intermediate let installs" {
+    let src = "fn mk() -> Handler[IO] \{\n    handler IO \{ fn print(msg: Str) \{ io.println(\"[H] \{msg}\") } }\n}\nfn main() \{\n    let hs = [mk()]\n    let h = hs.get(0).unwrap()\n    with h \{ io.println(\"via let\") }\n}\n"
+    let r = compile_and_run(src, "1mw2c3_via_let")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("[H] via let"))
+}
+
+// ── The user-effect twin ─────────────────────────────────────────────────────────────
+//
+// A user effect installs into `ue_<field>` rather than `<field>` and its vtable is codegen-emitted
+// rather than hand-written, so it is a second install path — not a second copy of this row.
+
+test "a user-effect handler read out of a List installs" {
+    let src = "effect Metrics \{\n    effect Emit \{\n        fn counter(name: Str)\n    }\n}\nfn mk() -> Handler[Metrics] \{\n    handler Metrics \{ fn counter(name: Str) \{ io.println(\"[M] \{name}\") } }\n}\nfn main() \{\n    let hs = [mk()]\n    with hs.get(0).unwrap() \{ metrics.counter(\"hits\") }\n}\n"
+    let r = compile_and_run(src, "1mw2c3_ue_list")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("[M] hits"))
+}
+
+test "a user-effect handler read out of a Map installs" {
+    let src = "effect Metrics \{\n    effect Emit \{\n        fn counter(name: Str)\n    }\n}\nfn mk() -> Handler[Metrics] \{\n    handler Metrics \{ fn counter(name: Str) \{ io.println(\"[M] \{name}\") } }\n}\nfn main() \{\n    let mut m: Map[Str, Handler[Metrics]] = Map()\n    m.insert(\"k\", mk())\n    with m.get(\"k\").unwrap() \{ metrics.counter(\"hits\") }\n}\n"
+    let r = compile_and_run(src, "1mw2c3_ue_map")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("[M] hits"))
+}
+
+// ── The row the ticket demanded before this could close ──────────────────────────────
+//
+// READ THE NOTE ON THE TICKET BEFORE TOUCHING THIS. Two things kept a container-retrieved handler
+// from reaching br 88sfaz's wrong-vtable-in-a-slot shape, and NEITHER was a Blink diagnostic: the
+// `handler_type == CT_HANDLER` gate at `codegen_stmt.bl:5343`, and `-Wint-conversion` being an
+// error. Fixing the carrier removes the second one. So this row exists to prove the first is not
+// carrying the load alone: two single-element Lists over DIFFERENT effects, each `.get(0).unwrap()`d,
+// both operands on one `with`. Each handler must land in ITS OWN slot.
+//
+// It passes today because the tid recovery answers where both flat channels went blank, and because
+// the stale-global leak that used to send the IO handler into the `ue_metrics` slot was closed by the
+// clear ordered before `emit_expr` (br t7xf9y). Asserting BOTH lines is the whole point — the failure
+// mode this guards is not a crash, it is one handler installed into the other's slot and the second
+// operand silently discarded, which exits 0.
+test "two Lists over different effects install into their own slots" {
+    let src = "effect Metrics \{\n    effect Emit \{\n        fn counter(name: Str)\n    }\n}\nfn mk_io() -> Handler[IO] \{\n    handler IO \{ fn print(msg: Str) \{ io.println(\"[IO] \{msg}\") } }\n}\nfn mk_metrics() -> Handler[Metrics] \{\n    handler Metrics \{ fn counter(name: Str) \{ io.println(\"[M] \{name}\") } }\n}\nfn main() \{\n    let ios = [mk_io()]\n    let ms = [mk_metrics()]\n    with ios.get(0).unwrap(), ms.get(0).unwrap() \{\n        io.println(\"body\")\n        metrics.counter(\"hits\")\n    }\n}\n"
+    let r = compile_and_run(src, "1mw2c3_two_effects")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("[IO] body"))
+    assert(r.out.contains("[M] hits"))
+}
+
+// The same two effects through INTERMEDIATE LETS, and this row is not a duplicate of the one above
+// — it is the row that caught the regression this ticket's own first fix introduced, and it caught
+// it from the census rather than from a test, which is why it is written down here.
+//
+// Giving `.get` an honest CT_HANDLER carrier moved the binding from one authority to another. The
+// declaration used to be spelled by handler_c_from_tid (br t7xf9y) because a container read arrived
+// as CT_INT; with the carrier fixed it arrives as CT_HANDLER and takes the arm ordered far above
+// that, which reads the `cg_handler_*` construction globals. Nothing clears those before a let RHS,
+// so `hi` inherited what `[mk_metrics()]` on the previous line had left: it was declared
+// `blink_ue_metrics_vtable*` and installed into `ue_metrics`, meaning `io.println` in the body
+// dispatched through the ambient vtable and `metrics.counter` went through an IO vtable by slot
+// index. The br 88sfaz shape, reached from a program with no annotation lie in it.
+//
+// tests/test_t7xf9y_handler_from_container.bl has this exact shape and did NOT catch it, because its
+// rows end in `assert(true)` — a handler installed into the wrong slot still exits 0. Assert the
+// output.
+test "two Lists over different effects install into their own slots through lets" {
+    let src = "effect Metrics \{\n    effect Emit \{\n        fn counter(name: Str)\n    }\n}\nfn mk_io() -> Handler[IO] \{\n    handler IO \{ fn print(msg: Str) \{ io.println(\"[IO] \{msg}\") } }\n}\nfn mk_metrics() -> Handler[Metrics] \{\n    handler Metrics \{ fn counter(name: Str) \{ io.println(\"[M] \{name}\") } }\n}\nfn main() \{\n    let ios = [mk_io()]\n    let ms = [mk_metrics()]\n    let hi = ios.get(0).unwrap()\n    let hm = ms.get(0).unwrap()\n    with hi, hm \{\n        io.println(\"body\")\n        metrics.counter(\"hits\")\n    }\n}\n"
+    let r = compile_and_run(src, "1mw2c3_two_lets")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("[IO] body"))
+    assert(r.out.contains("[M] hits"))
+}
+
+// ── The None side of the carrier ─────────────────────────────────────────────────────
+//
+// The tag half of the Option has to keep working across the carrier change. An out-of-bounds `.get`
+// on a handler List never reached a handler at all before this ticket — it read `tag == 0` out of a
+// `blink_Option_int` — and it has to read the same 0 out of `blink_Option_handler`. Two rows because
+// the Map miss goes through `blink_map_has` rather than `blink_list_in_bounds`.
+
+test "an out-of-bounds get on a handler List is None" {
+    let src = "fn mk() -> Handler[IO] \{\n    handler IO \{ fn print(msg: Str) \{ io.println(\"[H] \{msg}\") } }\n}\nfn main() \{\n    let hs = [mk()]\n    if hs.get(3).is_none() \{ io.println(\"none\") } else \{ io.println(\"some\") }\n}\n"
+    let r = compile_and_run(src, "1mw2c3_list_none")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("none"))
+}
+
+test "a missing key on a handler Map is None" {
+    let src = "fn mk() -> Handler[IO] \{\n    handler IO \{ fn print(msg: Str) \{ io.println(\"[H] \{msg}\") } }\n}\nfn main() \{\n    let mut m: Map[Str, Handler[IO]] = Map()\n    m.insert(\"k\", mk())\n    if m.get(\"absent\").is_none() \{ io.println(\"none\") } else \{ io.println(\"some\") }\n}\n"
+    let r = compile_and_run(src, "1mw2c3_map_none")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("none"))
+}
+
+// ── Two handlers of ONE effect, distinguished ────────────────────────────────────────
+//
+// The carrier drops the effect, so a List whose two elements handle the SAME effect is where an
+// element-agnostic carrier could plausibly hand back the wrong element. Distinct output per element
+// is what makes that visible; indices alone would not.
+
+test "two handlers of one effect in one List stay distinct" {
+    let src = "fn mk(tag: Str) -> Handler[IO] \{\n    handler IO \{ fn print(msg: Str) \{ io.println(\"[\{tag}] \{msg}\") } }\n}\nfn main() \{\n    let hs = [mk(\"A\"), mk(\"B\")]\n    with hs.get(0).unwrap() \{ io.println(\"one\") }\n    with hs.get(1).unwrap() \{ io.println(\"two\") }\n}\n"
+    let r = compile_and_run(src, "1mw2c3_two_elems")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("[A] one"))
+    assert(r.out.contains("[B] two"))
+}

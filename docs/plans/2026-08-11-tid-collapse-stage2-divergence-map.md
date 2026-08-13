@@ -8669,6 +8669,72 @@ matters in a project whose exit criterion is a counter reaching zero.
 That second one is the reason this test's "second builtin effect" row is `handler Env` and not
 `handler FS`: FS was the first draft, and FS cannot carry the row.
 
+## Fixing the type moved the binding to a worse authority (br `1mw2c3`)
+
+`List[Handler[E]].get(i)` and `Map[K, Handler[E]].get(k)` spelled the retrieved Option as
+`blink_Option_int` whatever the element was, so the `with` operand assigned an `int64_t` to a vtable
+pointer and cc rejected the program. A missing arm, not a missing type: both `.get` emitters end
+their element-CT ladder in an `else` that hardcodes CT_INT, and CT_HANDLER had no arm of its own. The
+carrier it needed already existed and is already emitted for `Some(mk())` — `blink_Option_handler`,
+member `void*`, which stores and yields a vtable pointer with no cast at either end and therefore
+needs no per-effect variant.
+
+**The premise held on the axis that mattered.** The elem/value CT reaching those ladders really is
+CT_HANDLER in both receiver shapes — the `listelem` tap reads `expr_elem=21` for a named list and
+`stamp ect=21 var=blink_u_mk_list() arm=tail` for a call receiver — so no tid-led branch was needed
+here. The flat channel had the answer; only the arm was missing. That is worth recording because it
+is the *opposite* of most cells in this document, where the flat channel is the thing that cannot
+answer.
+
+**Then the fix broke something else, and the census caught it rather than a test.** Two new rows:
+
+```
+bucket=diverge site=ctype.handler var=hi ty=Handler[IO] tidc=blink_io_vtable* emitted=blink_ue_metrics_vtable*
+bucket=diverge site=ctype.handler var=hm ty=Handler[Metrics] tidc=blink_ue_metrics_vtable* emitted=void*
+```
+
+An honest carrier **moves a binding from one authority to another**, and the authority it moves to
+can be the weaker one. `let hi = ios.get(0).unwrap()` used to arrive as CT_INT, skip
+`emit_let_binding`'s `val_type == CT_HANDLER` block entirely, and be spelled by
+`handler_c_from_tid` — the arm br `t7xf9y` added for exactly this erased case. With the carrier
+fixed it arrives as CT_HANDLER and takes the block ordered *far above* that one, which reads the
+`cg_handler_*` construction globals. Nothing cleared those before a let RHS, so `hi` inherited what
+`[mk_metrics()]` on the previous line had left behind: declared `blink_ue_metrics_vtable*` and
+installed into `ue_metrics`, so `io.println` in the body dispatched through the ambient vtable while
+`metrics.counter` went through an IO vtable by slot index. The br `88sfaz` shape, from a program with
+no annotation lie in it.
+
+This is a general hazard of the collapse and not a quirk of handlers. Every arm ordered on `val_type`
+was ordered against the CTs that *actually arrive there*, and several of the tid-led arms in this
+document are explicitly placed last so they only catch what the flat path erased (br `0rmamy`'s
+rule). Making an erased CT honest is therefore not a monotone improvement: it hands the binding back
+to an earlier arm that was never exercised on that shape. **Re-measure the census after a carrier
+change even when the change looks purely additive** — a new arm in one file can silently re-route a
+decision in another.
+
+So the fix is three parts:
+
+1. the two CT_HANDLER carrier arms in `emit_list_method` / `emit_map_method`;
+2. clearing `cg_handler_vtable_type` / `_field` / `_is_user_effect` **before** `emit_expr(val_node)`
+   in `emit_let_binding` — the same clear `t7xf9y` made on the `with` operand, one statement kind
+   later, so the channel means "what THIS RHS set";
+3. a tid fill-in ordered **last** in that block (construction global → annotation →
+   `tc_tid_handler_effect`), because after the clear a container read has no flat answer at all and
+   would register an *empty* vtable field. That is not a spelling problem but a dispatch one:
+   `get_var_handler_vtable_field` is the first thing the `with` operand asks.
+
+**The existing test had the shape and could not fail.**
+`tests/test_t7xf9y_handler_from_container.bl`'s "handlers of different effects come out of their own
+containers" row is this exact program, and it ends in `assert(true)` — a handler installed into the
+wrong slot still exits 0. It was left alone rather than rewritten, because asserting output in-process
+would mean nesting an IO capture handler inside the row's own handler, which is br `saf1hh` territory.
+The covering row lives in the new file and asserts both output lines. Same lesson as the
+`wxxg4f` file's: on this shape, exit 0 is not evidence.
+
+Divergence-neutral once part 3 landed: `diverge=43 decline=109` in both build modes, mono per-cell
+identical to the pre-ticket baseline, the two `ctype.handler` rows gone, and `agree` up 313 (mono) /
+232 (arc) — all of it the new test file's own sites.
+
 ## Appendix — all 428 shape cells
 
 Format: `family | occurrences | tid | flat`.
