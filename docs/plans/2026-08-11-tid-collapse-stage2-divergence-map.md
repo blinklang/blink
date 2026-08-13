@@ -9556,6 +9556,81 @@ source. The tydiv instrument does not move at all (30223 diverge rows, 196 closu
 every closure row still diverges on the signature-as-C-string cause, and this cell removes the
 string from the RESULT type, not from the signature. Stage 4 retires the rest.
 
+## The two spellers that agreed everywhere the tid answered (br `hp1emh`)
+
+A closure whose declared return is a generic-struct instance needs its mono typedef name in three
+places at once — the definition line, the call-site fn-ptr cast and the `_sr` return temp — and
+`codegen_closures.bl` built that name by WALKING THE ANNOTATION:
+
+    mono_name_from_ann(strip_module_qualifier(ret_str), node_type_ann(node), -1, [])
+
+The plain-fn seam already spells the same stem from the tid (`src/codegen.bl`). This cell routes the
+closure seam through the tid too, via one helper in `codegen_types.bl`:
+
+    pub fn closure_ret_mono_stem(node: Int) -> Str {
+        tc_tid_struct_mono_name(tc_lookup_node_tid(node_type_ann(node)))
+    }
+
+The empty-stem fallback to `ret_str` is kept on both sides: a non-generic head (`-> Plain`) yields
+`""` from BOTH spellers, so `blink_Plain` still comes out of `c_type_c_name(ret_str)`.
+
+### Dual-read before flipping, and the zero-hit trap it walked into
+
+Both spellers were run side by side under a trace channel before either was removed: **27 rows in
+each build mode, 0 disagreements.** Getting those rows required abandoning the corpus. The first
+sweep printed NOTHING, and reading that as "agreement" would have been wrong — the pinned fixture
+`tests/test_vmf1k0_closure_generic_struct_ret.bl` is a SUBPROCESS harness. It writes source strings
+to `.tmp/` and compiles them with `build/blink build` at test RUN time, so compiling the harness
+never reaches a closure with a generic-struct return. The tap was forced unconditional to prove it
+could fire at all, then the shapes were built by hand:
+
+| shape | ann walker | tid speller |
+| --- | --- | --- |
+| `-> GKV[Int, Str]` | `GKV_0Int_0Str` | `GKV_0Int_0Str` |
+| `-> Plain` (control) | `""` | `""` |
+| cross-module `-> gmod.GKV[Int, Str]` | `GKV_0Int_0Str` | `GKV_0Int_0Str` |
+
+The stem comes back UNQUALIFIED in the cross-module case and `c_type_c_name` reapplies the module
+prefix through `mod_type_prefix`, giving `blink_gmod_1GKV_0Int_0Str` at the typedef, the definition
+line, the cast and the `_cls_ret_0` temp alike. A multi-module fixture needs a real project root
+(`blink.toml` + `src/<mod>.bl`) and `@module("gmod")` with a QUOTED name; `@module(gmod)` draws
+`error[InvalidModuleAnnotation]`.
+
+### The one disagreement is a third place, and pre-existing
+
+A closure inside a GENERIC fn — `fn wrap[T](x: T) -> Box[T]` containing `fn() -> Box[T]` — is the
+only shape where the two answers differ, and neither is right:
+
+- typecheck memoizes NO tid on that annotation (`tc_lookup_node_tid(...) == -1`), so the tid
+  declines and the fallback emits the bare `blink_Box`;
+- the annotation walker passed the declared binder through as a mono segment: `blink_Box_0T`.
+
+Both names are undeclared C types and both fail `cc` loudly, so this is not a silent miscompile in
+either direction. It is filed as br `axvwed` and needs typecheck to memoize inside a mono body — the
+mono-context twin of `n8mmry` — not a different speller. `tc_tid_subst_mono` cannot help while the
+raw tid is `-1`, which is why the arm that would have called it was written, measured, and REMOVED
+rather than left unexercised (the `pdvrsj` lesson).
+
+### Census
+
+The ctype instrument is neutral in both build modes: `diverge=43 missing=109` unchanged, 0 new cells
+(2028 mono / 1829 archive-linked summary lines). The tydiv instrument does not move either — 30223
+diverge rows, distributed `emit_fn_params` 29057, `emit_let_binding` 5346, `match_pattern` 524,
+`emit_for_in` 94, `copy_list_compound_elem` 31, `tuple_destructure` 25, `with_resource` 11. Neither
+instrument taps the closure signature speller, so neutrality is the expected reading, and the
+coverage that matters is the four pinned fixtures: `test_vmf1k0` 8/8, `test_5htahp` 22/22,
+`test_pdvrsj` 24/24, `test_kvjfqt` 12/12.
+
+### The comment debt this cell also paid
+
+The call site carried a ~25-line comment naming six br tickets and narrating the measurement. That
+class of comment is now out of the source entirely: `br` is a local-only tracker, so an ID in a
+comment is dead weight to every other reader, and this codebase is training data for the language.
+The two files this cell touched went from 114 ticket references to 0, and `codegen_types.bl` from
+1953 comment lines to 1730 with no block over 22 lines. Reasoning goes here and to `br note`; the
+source keeps 1-4 lines naming the constraint. Every file touched from here gets the same treatment
+in the same commit.
+
 ## Appendix — all 428 shape cells
 
 Format: `family | occurrences | tid | flat`.

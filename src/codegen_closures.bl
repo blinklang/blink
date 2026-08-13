@@ -21,8 +21,7 @@ import codegen_types.{
     is_emitted_fn, is_enum_type, is_struct_type, list_contains_str, resolve_variant,
     reg_fn_struct_ret, reg_fn_ret_from_ann,
     resolve_ret_type_from_ann, resolve_option_inner_from_ann, build_closure_sig_from_type_ann,
-    closure_lit_ret_c,
-    mono_name_from_ann, strip_module_qualifier,
+    closure_lit_ret_c, closure_ret_mono_stem,
     resolve_tuple_ann, tuple_c_name_from_ann,
     append_ev_arg, fn_node_has_effects,
     cg_closure_counter, cg_closure_defs, cg_closure_promoter_defs, cg_closure_param_type_hint,
@@ -843,11 +842,9 @@ pub fn emit_closure(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
             } else if ptype == "Tuple" {
                 params_c = params_c.concat("{tuple_c_name_from_ann(node_type_ann(p), \"void\")} {pname}")
             } else if type_from_name(ptype) == CT_OPTION || type_from_name(ptype) == CT_RESULT {
-                // j0cdey: a closure param typed `Option[T]` / `Result[T,E]` (a HOF
-                // over List[Option[T]]) must lower to the parameterized carrier
-                // (blink_Option_int, …), not the bare `void` that c_type_str(CT_OPTION)
-                // yields with no inner. compound_name_from_ann builds the carrier tag
-                // from the annotation (nested inners kept — composes with whg65a).
+                // A closure param typed `Option[T]` / `Result[T,E]` must lower to the
+                // parameterized carrier (blink_Option_int, …), not the bare `void` that
+                // c_type_str(CT_OPTION) yields with no inner.
                 let carrier = compound_name_from_ann(node_type_ann(p))
                 ensure_carrier_from_tag(carrier)
                 params_c = params_c.concat("{c_type_c_name(carrier)} {pname}")
@@ -897,10 +894,8 @@ pub fn emit_closure(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
             } else if ptype == "" && saved_param_hint >= 0 && saved_param_hint != CT_VOID {
                 set_var(pname, saved_param_hint, 1)
             } else if type_from_name(ptype) == CT_OPTION {
-                // j0cdey: a closure param `x: Option[T]` binds as an Option carrying
-                // its inner from the annotation, so a body `match x { Some(v) => ... }`
-                // decodes v. set_var_option_from_struct_tag also recovers a nested
-                // Map value (whg65a), so `List[Option[Map]].for_each` composes.
+                // The param binds as an Option carrying its inner from the annotation, so
+                // a body `match x { Some(v) => ... }` decodes v.
                 set_var(pname, CT_OPTION, 1)
                 set_var_option_from_struct_tag(pname, compound_name_from_ann(node_type_ann(p)))
             } else if type_from_name(ptype) == CT_RESULT {
@@ -959,43 +954,15 @@ pub fn emit_closure(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
     let mut closure_ret_struct = ""
     if ret_type == CT_VOID && ret_str != "Void" && ret_str != "" {
         if is_struct_type(ret_str) != 0 {
-            // br vmf1k0 — the closure twin of ns7qdm (src/codegen.bl:1378). ret_str is
-            // node_return_type, i.e. the BARE head: for `fn() -> GKV[Int, Str]` the
-            // arguments live in the annotation's element sublist, never in the name. So
-            // this binding spelled `blink_GKV`, and because it feeds BOTH the definition
-            // line below and — via closure_ret_struct → :1052 → expr_closure_sig — the
-            // call-site cast, one bare name produced two C errors on a type whose
-            // blink_GKV_Int_Str typedef was already emitted right above it.
-            //
-            // NOT the tid route the plain-fn path uses. `node_type_ann(node)` IS the
-            // return annotation (parser.bl attaches it as `type_ann: ret_ann`), but the
-            // typechecker memoizes instance tids onto fn-DECL return annotations only —
-            // tc_lookup_node_tid on a closure's comes back -1, so
-            // tc_tid_struct_mono_name(...) returns "" and the bare head survives. That
-            // gap is br n8mmry (tc_check_body's Closure arm resolves param types but
-            // never reads node_type_ann(closure)). Read the annotation's own element
-            // sublist instead, exactly as the Option-inner case does
-            // (src/codegen_types.bl:2350). When n8mmry lands, this should move onto the
-            // tid — that is the better end state, but it is a typecheck change, not a
-            // codegen one, so it is not folded in here.
-            //
-            // An empty stem keeps ret_str, which is the correct answer for a NON-generic
-            // struct (`-> Plain` must stay blink_Plain, not gain an empty suffix) and for
-            // a bare/typevar head.
-            //
-            // A CROSS-MODULE generic return is NOT that case and must not be read as one.
-            // strip_module_qualifier is what every other mono_name_from_ann caller passes
-            // (20 sites), and the stem comes back UNQUALIFIED — `GKV_Int_Str`. The module
-            // prefix is then reapplied by c_type_c_name, which resolves through
-            // mod_type_prefix, so the emitted type is blink_gmod_GKV_Int_Str at the
-            // definition, the cast and the `_sr` temp alike. Verified on a two-module
-            // program; the pre-qnpb2d compiler ICEd (I0001) on that same shape.
-            let ret_stem = mono_name_from_ann(strip_module_qualifier(ret_str), node_type_ann(node), -1, [])
-            let stem = if ret_stem != "" { ret_stem } else { ret_str }
+            // ret_str is the bare head (`GKV`), but this feeds both the definition line
+            // below and the call-site cast, so it must name the mono typedef. An empty stem
+            // means a non-generic or typevar head, which keeps its declared name. The stem is
+            // unqualified; c_type_c_name reapplies the module prefix for a cross-module type.
+            let stem_tid = closure_ret_mono_stem(node)
+            let stem = if stem_tid != "" { stem_tid } else { ret_str }
             ret_c_str = c_type_c_name(stem)
-            // The mono stem, not the declared name: reg_fn_struct_ret's contract is the
-            // mono CARRIER (see the ns7qdm comment at its plain-fn caller), so the
-            // call-site `_sr` temp names the typedef'd type.
+            // reg_fn_struct_ret's contract is the mono carrier, so the call-site `_sr`
+            // temp names the typedef'd type.
             closure_ret_struct = stem
         } else if is_enum_type(ret_str) != 0 {
             ret_c_str = c_type_c_name(ret_str)
@@ -1092,10 +1059,8 @@ pub fn emit_closure(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
             } else if sptype == "Tuple" {
                 sig_params = sig_params.concat(tuple_c_name_from_ann(node_type_ann(sp), "void"))
             } else if type_from_name(sptype) == CT_OPTION || type_from_name(sptype) == CT_RESULT {
-                // j0cdey: the call-site fn-ptr cast must match the closure body's
-                // parameterized carrier param (blink_Option_int, …) — see the param
-                // list above. Without this the cast keeps `void` and gcc rejects the
-                // 2-arg call.
+                // The call-site fn-ptr cast must match the closure body's parameterized
+                // carrier param, or the cast keeps `void` and gcc rejects the call.
                 sig_params = sig_params.concat(c_type_c_name(compound_name_from_ann(node_type_ann(sp))))
             } else {
                 sig_params = sig_params.concat(c_type_str(type_from_name(sptype)))
@@ -1104,10 +1069,9 @@ pub fn emit_closure(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
         }
     }
     let mut sig_ret_str = if closure_ret_struct != "" { c_type_c_name(closure_ret_struct) } else if resolved_ret != "" { resolved_ret } else { c_type_str(ret_type) }
-    // br pdvrsj, ordered LAST for br 0rmamy's reason: the three string arms above own every return
-    // they can spell, and the tid only fills in where they answered `void` — which c_type_str gives
-    // for every kind it has no spelling for, not just for a genuine Void. A genuine Void return
-    // reaches this too and the tid answers `void` again, so the override is a no-op there.
+    // Ordered last: the string arms above own every return they can spell, and the tid fills in
+    // only where they answered `void` — which c_type_str gives for every kind it cannot spell, not
+    // just for a genuine Void. A genuine Void return reaches this and the tid answers `void` too.
     if sig_ret_str == "void" {
         let tid_ret = closure_lit_ret_c(node)
         if tid_ret != "" {
