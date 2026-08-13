@@ -7333,7 +7333,103 @@ element from the callee's **return** type, not from that channel. Not folded in.
 
 The `copy_list_compound_elem` position the Stage 3 unit needs — an abstract generic body whose list
 element is a compound over a typevar — is now **reachable by a compiling program**. That measurement
-can proceed.
+is the next section, and it did not find the position: inside a mono body every copy is superseded by
+an identical tid stamp, and outside one the fn is never emitted.
+
+## `copy_list_compound_elem`: the plan's archetype, measured (br `zaq1np`)
+
+The plan names this function as confirmation #3 — *"26 lines of hand case analysis to copy a type from
+one variable to another, with no `CT_SET`, `CT_LIST`, or `CT_TUPLE` arm — three of the open tickets,
+verbatim. It should be `set_var_ty(dst, get_var_ty(src))`."* Measuring it changed two of those three
+claims and produced a real bug that none of them named.
+
+### The missing arms are unreachable
+
+All three call sites gate on the element being a **compound tag**, and `is_compound_tag` is exactly
+Option/Result/Map:
+
+| call site | gate |
+| --- | --- |
+| `codegen_stmt.bl:3885` (`emit_let_binding`) | `expr_list_elem_type == CT_OPTION \|\| == CT_RESULT \|\| == CT_MAP` |
+| `codegen_stmt.bl:9819` (the second let ladder) | same |
+| `codegen_methods.bl:4525` (`collect`) | `obj_type == CT_LIST && is_compound_tag(carrier) != 0` |
+
+So the `CT_SET \|\| CT_LIST \|\| CT_STRUCT` tail — the arm the plan reads as three open cells — is
+**dead code at every caller**. Probed directly, `List[List[Int]]`, `List[Set[Int]]` and `List[Pt]`
+through a `let` re-bind never reach the copy at all; they go straight to
+`stamp_list_elem_from_list_tid`, which has an arm for each:
+
+```
+[dbg:listelem] letladder var=g  val_type=4 ann=-1 expr_elem=4  sv_elem=0
+[dbg:listelem] stamp ect=4  var=g  arm=tail
+[dbg:listelem] letladder var=g2 val_type=4 ann=-1 expr_elem=20 sv_elem=0
+[dbg:listelem] stamp ect=20 var=g2 arm=set set_ct=0 set_struct=
+[dbg:listelem] letladder var=g3 val_type=4 ann=-1 expr_elem=5  sv_elem=-1
+```
+
+Adding those arms would have fixed nothing. **Confirmation #3 does not hold as written**, and the
+three tickets it points at are not this function's.
+
+### The real defect was the missing *stamp*, not the missing arms
+
+The copy reads its source by **variable NAME**. Two of the three sites run
+`stamp_list_elem_from_tid` on the next line, so their answer is the tid's regardless. The `collect`
+site was the one with no stamp after it — and there a source that is not a variable has no `ScopeVar`
+under that spelling, so every arm reads a fabricated flat default. `sv_tp` turns a missing inner into
+`type_int()` (the plan's confirmation #1, which **does** hold), and the collect temp is left holding
+`Option[Int]`:
+
+```blink
+type Box7 { items: List[Option[Map[Str, Int]]] }
+let b = Box7 { items: [Some(m), None] }
+let got = b.items.collect().get(0).unwrap().unwrap().get("k").unwrap()
+```
+
+```
+[dbg:listelem] copy var=__collect_5 arm=option elem_ct=7 deep_tp=0
+error[UnresolvedMethod]: unresolved method '.get' on type Map[Str, Int] in 'main'
+error[UnresolvedMethod]: unresolved method '.unwrap' on type Option[Int] in 'main'
+```
+
+`deep_tp=0` is the fabrication, and `Option[Int]` in the second message is it surfacing. An
+intervening `let` **hides** the whole thing — that ladder re-stamps from the tid one statement later
+— which is why a corpus that collects into a `let` everywhere never caught it. A field source, a call
+source, and consumption in the same chain are all required at once.
+
+The fix is one call: let the tid lead at the collect site the way the let-ladders already do
+(`bef42x` ordering). `stamp_list_elem_from_tid` reads the source **node**, so it is indifferent to
+whether the source is spelled as a variable, a field or a call.
+
+### The load-bearing set is now empty
+
+Joining every `copy var=V arm=A` against a following `stamp ... var=V`, over
+`tests/ examples/ src/ lib/std/`, in **both** build modes:
+
+| | monolithic | archive-linked |
+| --- | --- | --- |
+| copy events | 3 → 9 | 3 → 9 |
+| covered by a following stamp | 2 → 9 | 2 → 9 |
+| **LOADBEARING (no stamp after)** | **1 → 0** | **1 → 0** |
+
+(The event count rises because the new test contributes six.) Every arm agrees with the stamp that
+supersedes it, and the one pre-existing LOADBEARING row — `test_1n9fhg`'s `__collect_481`, copied with
+`deep_tp=0`, i.e. already carrying the fabricated `Int` — is now stamped `option` from the tid. That
+row was a latent erasure in a passing test, the same class as the `list_1fold_0List_0Int` finding
+above.
+
+### What the one-line cure actually needs
+
+`set_var_ty(dst, get_var_ty(src))` still does not work today, for the reason the whole plan exists:
+`set_var_ty` writes a channel nothing reads yet. What is now true is weaker and more useful — **the
+tid leads at all three call sites, and the flat case analysis survives only as the decline fallback.**
+Deleting the body is Stage 4 work, gated on `sv.ty` governing, because a shape whose inner the tid
+cannot spell still declines and those arms are then the only answer. Zero corpus events is not the
+same claim as zero possible events (`feedback_corpus_sweep_is_not_coverage`).
+
+Byproduct, unrelated to types and filed separately: a **named** function passed to a HOF emits the
+unmangled Blink identifier (`.fn = keep` against a definition emitted as `blink_u_keep`), so the C
+compiler sees an undeclared identifier — br `zpth5r`. Hidden because the corpus passes closure
+literals, never a named fn.
 
 ## Appendix — all 428 shape cells
 

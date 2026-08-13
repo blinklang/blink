@@ -1,0 +1,67 @@
+// br zaq1np: `collect()` over a List of COMPOUND elements copied the source's element
+// metadata with copy_list_compound_elem, which reads its source by VARIABLE NAME. A source
+// that is not a variable — a struct field, a call — has no ScopeVar under that spelling, so
+// every arm read a fabricated flat default (sv_tp turns a missing inner into type_int()) and
+// the collect temp was left holding `Option[Int]`.
+//
+// An intervening `let` HIDES it: the let-ladder re-stamps the element from the tid, so the
+// rows below deliberately consume the collect result in the same chain. That is also why the
+// bug survived a corpus that collects into a `let` everywhere.
+
+type Box { items: List[Option[Map[Str, Int]]] }
+type ROk { rows: List[Result[List[Int], Str]] }
+type MBox { pairs: List[Map[Str, Int]] }
+
+fn mk_map(k: Str, v: Int) -> Map[Str, Int] {
+    let m: Map[Str, Int] = Map()
+    m.insert(k, v)
+    m
+}
+
+fn make_opts() -> List[Option[Map[Str, Int]]] {
+    [Some(mk_map("k", 5)), None]
+}
+
+test "a field-sourced collect keeps an Option[Map] element" {
+    let b = Box { items: [Some(mk_map("k", 5)), None] }
+    assert(b.items.collect().get(0).unwrap().unwrap().get("k").unwrap() == 5)
+}
+
+test "a field-sourced collect keeps a Result[List[Int], Str] element" {
+    let r = ROk { rows: [Ok([1, 2, 3])] }
+    assert(r.rows.collect().get(0).unwrap().unwrap().len() == 3)
+}
+
+test "a field-sourced collect keeps a bare Map element" {
+    let mb = MBox { pairs: [mk_map("a", 7)] }
+    assert(mb.pairs.collect().get(0).unwrap().get("a").unwrap() == 7)
+}
+
+// A call source has no ScopeVar either — the same hole, reached a different way.
+test "a call-sourced collect keeps an Option[Map] element" {
+    assert(make_opts().collect().get(0).unwrap().unwrap().get("k").unwrap() == 5)
+}
+
+// Controls. A VARIABLE source already worked (the copy could read it by name) and an
+// intervening `let` already worked (the let-ladder re-stamps from the tid). Both stay green.
+test "a var-sourced collect still keeps the element" {
+    let xs: List[Option[Map[Str, Int]]] = [Some(mk_map("k", 9)), None]
+    assert(xs.collect().get(0).unwrap().unwrap().get("k").unwrap() == 9)
+}
+
+test "collecting into a let still keeps the element" {
+    let b = Box { items: [Some(mk_map("k", 5)), None] }
+    let c = b.items.collect()
+    let mut total = 0
+    for o in c {
+        if o.is_some() { total = total + o.unwrap().get("k").unwrap() }
+    }
+    assert(total == 5)
+}
+
+// A named by-value element (struct/tuple/plain enum) takes the tag route at the same site,
+// not the copy — br 1n9fhg. It must not regress now that the tid leads.
+test "a tuple element still collects" {
+    let ts: List[(Int, Str)] = [(1, "a"), (2, "b")]
+    assert(ts.collect().get(1).unwrap()._1 == "b")
+}
