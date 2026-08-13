@@ -14422,6 +14422,47 @@ pub fn c_type_from_tid(tid: Int) -> Str {
     }
 }
 
+// br ndgx84. The C function-pointer cast a closure CALL needs, spelled from the tid — "" when the
+// tid does not name a Fn, or names one whose return or a parameter has no C spelling.
+//
+// c_type_from_tid answers `blink_closure*` for a Fn, which is the type of the closure BOX and is
+// all a declaration needs. A call needs one thing more: the callee's own signature, because a
+// closure is invoked as `((sig)cls->fn_ptr)(cls, args...)`. Codegen had two builders for that
+// string and both read an AST TYPE ANNOTATION — the `fn(Int) -> Int` node on the literal or on the
+// binding. A binding whose initializer is a method call carries no such node
+// (`let h = fs.get(0).unwrap()`), so the sig came back "" and the call fell through to codegen's
+// UndefinedFunction backstop: a closure the type checker had fully typed was reported as an
+// undefined FUNCTION, naming the variable.
+//
+// The `const blink_closure*` leading parameter is the closure's own self pointer and is part of
+// the ABI, not of the Blink type — every emitter of a closure body writes it, so it is prepended
+// here rather than derived, exactly as both annotation-driven builders do.
+//
+// DECLINES rather than half-spelling, and the decline is the safety property: this string is a
+// CAST through which the call is made, so a parameter spelled `void` (or an unsubstituted typevar,
+// which c_type_from_tid answers "" for) would produce a cast that either fails to compile or —
+// worse — compiles against the wrong ABI. "" leaves the caller on whatever it did before.
+pub fn closure_sig_from_tid(tid: Int) -> Str {
+    if tid < 0 { return "" }
+    let t = tc_tid_resolved(tid)
+    if tc_tid_kind(t) != TyKind.Fn { return "" }
+    // Child 0 is the return and the params follow it (tc_tid_child's Fn arm).
+    let ret_c = c_type_from_tid(tc_tid_child(t, 0))
+    if ret_c == "" { return "" }
+    let mut sig_params = "const blink_closure*"
+    let n = tc_tid_child_count(t)
+    let mut i = 1
+    while i < n {
+        let p_c = c_type_from_tid(tc_tid_child(t, i))
+        if p_c == "" { return "" }
+        // Legal in the return position above, never in a parameter position.
+        if p_c == "void" { return "" }
+        sig_params = sig_params.concat(", ").concat(p_c)
+        i = i + 1
+    }
+    "{ret_c}(*)({sig_params})"
+}
+
 // br tk8s0y. The mono-INSTANCE spelling of a generic-ENUM tid, or "".
 //
 // Narrower than c_type_from_tid on purpose, and the narrowness is the safety property: it

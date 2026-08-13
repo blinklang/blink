@@ -114,7 +114,7 @@ import diagnostics.{
 import pkg.manifest.{manifest_header_is_declared, manifest_name}
 import compiler.{trace}
 import stdlib_native_deps.{stdlib_native_dep_name_by_ffi_symbol}
-import typecheck.{sv_ty_or_flat_at, ctype_probe_at, enum_instance_c_from_tid, tc_tid_handler_effect, tc_tid_subst_mono, c_type_from_tid, tc_tid_kind, tc_tid_resolved, tc_tid_iter_elem, TyKind, is_builtin_fn, is_import_module_name, tc_channel_elem_ct, tc_channel_elem_struct, tc_lookup_node_tid, tc_tid_struct_mono_name, tc_tid_struct, tc_tid_is_enum, tc_tid_struct_arg_count, tc_tid_struct_arg_tid, tc_tid_struct_slot_seg, tc_struct_slot_encodable, tc_tid_result_ok_tid, tc_tid_result_err_tid, tc_tid_option_inner_tid, tc_tid_tuple_arity, tc_tid_tuple_elem_tid, tc_tid_to_c_tag}
+import typecheck.{sv_ty_or_flat_at, ctype_probe_at, closure_sig_from_tid, enum_instance_c_from_tid, tc_tid_handler_effect, tc_tid_subst_mono, c_type_from_tid, tc_tid_kind, tc_tid_resolved, tc_tid_iter_elem, TyKind, is_builtin_fn, is_import_module_name, tc_channel_elem_ct, tc_channel_elem_struct, tc_lookup_node_tid, tc_tid_struct_mono_name, tc_tid_struct, tc_tid_is_enum, tc_tid_struct_arg_count, tc_tid_struct_arg_tid, tc_tid_struct_slot_seg, tc_struct_slot_encodable, tc_tid_result_ok_tid, tc_tid_result_err_tid, tc_tid_option_inner_tid, tc_tid_tuple_arity, tc_tid_tuple_elem_tid, tc_tid_to_c_tag}
 
 fn strip_outer_parens(s: Str) -> Str {
     if s.starts_with("(") && s.ends_with(")") {
@@ -3572,7 +3572,20 @@ fn emit_let_binding(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, 
         cg_handler_is_user_effect = 0
     }
     if val_type == CT_CLOSURE {
-        set_var_closure(name, expr_closure_sig)
+        // br ndgx84, and ordered the same way as the handler arm above: `expr_closure_sig` owns
+        // every binding whose RHS or annotation spelled a `fn(..) -> ..` node, and the tid only
+        // fills in where both left it blank — a closure read out of a container
+        // (`fs.get(0).unwrap()`), returned from a plain fn (`let h = mk()`), or unwrapped from an
+        // Option. Those bindings were DECLARED correctly (`blink_closure* h = ..`) and registered
+        // with an EMPTY sig, which is not a spelling problem but a dispatch one: an empty sig is
+        // exactly what `get_var_closure_sig` returns for a name that is not a closure at all, so
+        // the call site read the binding as an unknown FUNCTION and reported UndefinedFunction
+        // against a variable the type checker had fully typed.
+        let mut cls_sig = expr_closure_sig
+        if cls_sig == "" {
+            cls_sig = closure_sig_from_tid(tc_tid_subst_mono(binding_tid, cg_mono_tparams_sl, cg_mono_arg_tids))
+        }
+        set_var_closure(name, cls_sig)
     }
     if val_type == CT_OPTION {
         let mut opt_inner_ct = expr_option_inner

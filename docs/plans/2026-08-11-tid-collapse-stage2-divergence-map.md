@@ -9128,6 +9128,99 @@ the publication half, and they stay until it is decided.
 
 `w3v2e6` stays **open**. Its data-loss half is dead; its publication half is a spec question.
 
+## The one string that made a typed variable "an undefined function" (br `ndgx84`)
+
+    let f = fn(x: Int) -> Int { x + 1 }
+    let o: Option[fn(Int) -> Int] = Some(f)
+    let h = o.unwrap()
+    h(41)                       // error[UndefinedFunction]: undefined function 'h' in 'main'
+
+`h` is a fully typed local. The diagnostic calls it an **undefined function** because of one empty
+string. A bare-Ident callee is emitted as a closure invocation only if `get_var_closure_sig(fn_name)`
+is non-empty (`src/codegen_expr.bl:5119`); on empty it falls through to the `UndefinedFunction`
+backstop at `:5225`. That sig is the C function-pointer cast the call is made *through* —
+`((sig)cls->fn_ptr)(cls, args...)` — so an empty sig is **indistinguishable from "not a closure at
+all."** That is the whole reason a variable got a diagnostic about functions.
+
+**Both pre-existing sig builders read an AST annotation.** `build_closure_sig_from_type_ann(ta)`
+(`codegen_types.bl:4957`) and `build_closure_sig_resolved_mono(ta, tparams_sl, arg_tids)`
+(`codegen_stmt.bl:8337`) are handed a `fn(..) -> ..` type node. A binding whose initializer is a
+*method call* has no such node anywhere in reach, so every non-literal arrival of a closure — out of
+a `List`, `Option`, `Result`, `Map`, out of a function return, out of a match binder — came back `""`.
+
+**The tid always knew.** `BLINK_TRACE_CHANNELS=tydiv` on the failing programs reads
+`site=emit_let_binding.decl var=h tid=Fn(Int) -> Int flat=Int` (List, Map, Result) and the same tid
+against `flat=Fn()` (Option, match binder). A textbook Stage-3 cell: the authority holds the answer
+and the decision is taken from the flat channel that lost it.
+
+**The defect has three structurally different halves, and only one of them was the sig.** Option and
+fn-return already *declared* `blink_closure*` — br `597kj0` widened `c_type_tag` for exactly that —
+and lacked only the signature. List and Map `.get` had **no `CT_CLOSURE` arm at all**, so they built
+a `blink_Option_int` and declared `const int64_t h = _ounw_3.value;`, the closure pointer squeezed
+through an integer. `Result` was a third shape: the *carrier* was right (`Ok(f)` really does build
+`blink_Result_closure_str`) and only `emit_result_unwrap_inner`'s decode ladder had no `CT_CLOSURE`
+arm, so the value fell to the trailing `else` that defaults to `CT_INT`.
+
+**The fix is the `1mw2c3`/`t7xf9y` handler precedent, applied verbatim.** There, `.get` got a
+`CT_HANDLER` carrier arm so the binding stops arriving as `CT_INT`, and the *effect* is deliberately
+dropped at the carrier and recovered from the tid downstream, because a list's flat element channel
+can only ever say `List[Handler]`. A closure is the same shape one level over: the carrier can only
+say `List[Fn()]`, so the three container arms make the binding arrive as `CT_CLOSURE`, and the
+**signature** — which no `CT_*` tag can hold — is spelled from the binding's own tid by a new
+`closure_sig_from_tid` (`src/typecheck.bl`, next to `c_type_from_tid`). `TyKind.Fn` stores the return
+in child 0 and the params after it, so the walk is direct; the leading `const blink_closure*` is
+prepended as ABI (it is the closure's self pointer, not a Blink parameter) exactly as both older
+builders do. It declines to `""` on any child `c_type_from_tid` cannot spell, and on a `void`
+parameter — legal in the return position, never in a parameter position — because the string is a
+cast, and a half-spelled cast is a miscompile rather than a diagnostic.
+
+**Two rows in the test exist only to prove the cast is right and not merely present.** A `Str -> Str`
+closure and a two-parameter `Int, Int -> Int` closure: a `Str` signature emitted as `int64_t` would
+compile clean and lie. The ABI was additionally hand-checked past the test rows for a `Float`
+parameter and return, a by-value struct parameter and return, a `void` return, and a `Bool` return.
+Two green controls stay in the file — the direct rebind `let g = f` and the struct-field read
+`let h = b.f` — because those are the two shapes that *did* reach a sig writer, so a fix that
+replaced the annotation path instead of extending it would show up there.
+
+**`tk_to_ct` forced one deliberate deviation from the `0rmamy` ordering rule.** The rule is that a
+tid-led arm goes *after* the flat arms, so it only ever catches a binding the flat channel erased.
+The match-binder arm in `stamp_binder_elems_from_tid_if_unset` is instead placed **above** that
+function's head-CT agreement guard, and asks `tc_tid_kind(mtid) == TyKind.Fn` directly rather than
+going through `tc_tid_ct`. The reason is a false comment: `tk_to_ct` (`typecheck.bl:13283`) maps
+`TyKind.Fn => CT_VOID` under *"No CT exists for these"*, which is untrue — `CT_CLOSURE = 6` has
+existed since closures landed and the flat side uses it. `tc_tid_ct` therefore answers `-1` for every
+closure and the guard rejected the binder before the arm could see it. Filed as br `rndevw` rather
+than fixed here, because it has its own blast radius **and its own consequence for this plan**: while
+that arm stands, every closure binding is a permanent `diverge` row, so **Stage 3's `counter == 0`
+exit cannot be reached** until it is corrected. The `tydiv` `flat=Fn()` rows do not move on this
+ticket for that reason.
+
+**Census after — divergence-neutral in both build modes, and the delta is fully attributed.**
+`diverge=43 missing=109` in monolithic (`lines=2015 agree=438685`) and archive-linked
+(`lines=1816 agree=362609`) alike, against a `diverge=43 missing=109` baseline; the per-cell diff of
+the normalized `(site, tid, flat)` triples on a common-file basis (994- and 925-file intersections,
+17 distinct cells in each mode) is identical in both. `agree` rose by **exactly 351 in each mode**,
+and all 351 are `ctype.flat` — every other site's `agree`/`diverge`/`missing` triple is unchanged to
+the row. Per-file, the increase appears **only** in files that link the compiler (`src/*.bl` and the
+compiler-importing tests), at `+10` or `+7` each: it is this fix's own new declarations being
+measured while the compiler compiles itself, not a corpus behaviour change. Which is the reading to
+expect — the fix adds `CT_CLOSURE` where the flat channel previously said `CT_INT`, but `tk_to_ct`
+answers `CT_VOID` for `TyKind.Fn`, so the instrument cannot yet see those cells agree. They move when
+`rndevw` lands.
+
+**Three byproducts filed, none of them regressions.** `311nk2`: calling a call-expression result
+inline (`mk()(41)`, `fs.get(0).unwrap()(41)`) emits no call at all and silently prints the literal
+`"<value>"`, exit 0, no diagnostic — the callee *shape*, not the callee *resolution*, and silent
+where `ndgx84` was loud. `rndevw`: the `tk_to_ct` arm above. `pdvrsj`: a closure whose return type is
+a **container** types the call result `Void`, because the return is recovered by re-parsing the
+emitted C signature string — `closure_ret_ct` (`codegen_types.bl:4652`) knows exactly four spellings
+and `reseat_from_closure_ret_tag` rescues only the compounds whose C name happens to name their Blink
+type. So `Int`/`Float`/`Str`/`Bool`/`void`/struct/`Option`/`Result` returns are right and the
+containers are wrong, and `.len()` on the result draws codegen's `UnresolvedMethod` backstop while
+that backstop's message prints `List[Int]` **from the tid**. Pre-existing — it reproduces from a
+directly-annotated closure variable — but only reachable in its container-sourced spelling once this
+fix made the call happen at all.
+
 ## Appendix — all 428 shape cells
 
 Format: `family | occurrences | tid | flat`.

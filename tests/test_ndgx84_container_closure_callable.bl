@@ -1,0 +1,98 @@
+// br ndgx84: a closure that arrives from anywhere other than a literal is not callable.
+//
+//     let f = fn(x: Int) -> Int { x + 1 }
+//     let o: Option[fn(Int) -> Int] = Some(f)
+//     let h = o.unwrap()
+//     h(41)                       // error[UndefinedFunction]: undefined function 'h'
+//
+// The type is known. `BLINK_TRACE_CHANNELS=tydiv` reads `var=h tid=Fn(Int) -> Int` while the
+// flat field says `Fn()` (the Option path) or `Int` (the List path) — a Stage-3 "the tid knows,
+// the flat does not" cell.
+//
+// The gate is one string: a bare-Ident callee is emitted as a closure invocation only if
+// `get_var_closure_sig(name)` is non-empty, and the only writers were fed by the INITIALIZER's
+// AST annotation (`build_closure_sig_from_type_ann`) or by a struct field's recorded sig. An
+// initializer that is a method call carries no such annotation, so the sig was empty and the
+// call fell through to the UndefinedFunction backstop. The fix keys on the binding's TYPE:
+// spell the sig from the tid (TyKind.Fn = return in inner1, params after it).
+//
+// The two green rows are controls: they worked before this ticket and must keep working. They
+// are the two shapes that DID reach a writer, so a fix that replaced rather than extended the
+// annotation path would show up here.
+
+import std.process.{ProcessResult}
+
+fn run_src(tag: Str, src: Str) -> ProcessResult {
+    let bl_path = ".tmp/_ndgx84_{tag}.bl"
+    let bin = ".tmp/_ndgx84_{tag}"
+    write_file(bl_path, src)
+    let build = process_run("build/blink", ["build", bl_path, "-o", bin])
+    if build.exit_code != 0 {
+        shell_exec("rm -f {bl_path}")
+        return build
+    }
+    let r = process_run(bin, [])
+    shell_exec("rm -f {bl_path} {bin}")
+    r
+}
+
+fn expect_out(tag: Str, src: Str, want: Str) {
+    let r = run_src(tag, src)
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains(want))
+}
+
+test "a closure taken out of a List is callable" {
+    let src = "fn main() \{\n    let f = fn(x: Int) -> Int \{ x + 1 \}\n    let mut fs: List[fn(Int) -> Int] = []\n    fs.push(f)\n    let h = fs.get(0).unwrap()\n    io.println(\"r=\{h(41)\}\")\n\}\n"
+    expect_out("list", src, "r=42")
+}
+
+test "a closure taken out of an Option is callable" {
+    let src = "fn main() \{\n    let f = fn(x: Int) -> Int \{ x + 1 \}\n    let o: Option[fn(Int) -> Int] = Some(f)\n    let h = o.unwrap()\n    io.println(\"r=\{h(41)\}\")\n\}\n"
+    expect_out("opt", src, "r=42")
+}
+
+test "a closure taken out of a Result is callable" {
+    let src = "fn main() \{\n    let f = fn(x: Int) -> Int \{ x + 1 \}\n    let r: Result[fn(Int) -> Int, Str] = Ok(f)\n    let h = r.unwrap()\n    io.println(\"r=\{h(41)\}\")\n\}\n"
+    expect_out("res", src, "r=42")
+}
+
+test "a closure taken out of a Map is callable" {
+    let src = "fn main() \{\n    let f = fn(x: Int) -> Int \{ x + 1 \}\n    let mut m: Map[Str, fn(Int) -> Int] = Map()\n    m.insert(\"a\", f)\n    let h = m.get(\"a\").unwrap()\n    io.println(\"r=\{h(41)\}\")\n\}\n"
+    expect_out("map", src, "r=42")
+}
+
+// The container is not the cause: a plain function RETURNING a closure has the same empty sig.
+test "a closure returned from a function is callable" {
+    let src = "fn mk() -> fn(Int) -> Int \{ fn(x: Int) -> Int \{ x + 1 \} \}\nfn main() \{\n    let h = mk()\n    io.println(\"r=\{h(41)\}\")\n\}\n"
+    expect_out("mk", src, "r=42")
+}
+
+// A pattern binder is a second binding site, distinct from `let`.
+test "a closure bound by a match pattern is callable" {
+    let src = "fn main() \{\n    let f = fn(x: Int) -> Int \{ x + 1 \}\n    let o: Option[fn(Int) -> Int] = Some(f)\n    match o \{\n        Some(h) => io.println(\"r=\{h(41)\}\")\n        None => io.println(\"none\")\n    \}\n\}\n"
+    expect_out("mb", src, "r=42")
+}
+
+// The sig is a C function-pointer cast, so the spelled parameter and return types have to be
+// right and not merely present: a Str signature emitted as int64_t would compile and lie.
+test "a non-Int closure signature is spelled from the tid" {
+    let src = "fn main() \{\n    let f = fn(s: Str) -> Str \{ \"<\{s\}>\" \}\n    let o: Option[fn(Str) -> Str] = Some(f)\n    let h = o.unwrap()\n    io.println(\"r=\{h(\\\"hi\\\")\}\")\n\}\n"
+    expect_out("str2", src, "r=<hi>")
+}
+
+test "a multi-parameter closure signature is spelled from the tid" {
+    let src = "fn main() \{\n    let f = fn(a: Int, b: Int) -> Int \{ a + b \}\n    let o: Option[fn(Int, Int) -> Int] = Some(f)\n    let h = o.unwrap()\n    io.println(\"r=\{h(40, 2)\}\")\n\}\n"
+    expect_out("two", src, "r=42")
+}
+
+// Controls — green before ndgx84, and the two shapes that already reached a sig writer.
+test "control: a closure rebound from another variable stays callable" {
+    let src = "fn main() \{\n    let f = fn(x: Int) -> Int \{ x + 1 \}\n    let g = f\n    io.println(\"r=\{g(41)\}\")\n\}\n"
+    expect_out("g1", src, "r=42")
+}
+
+test "control: a closure read from a struct field stays callable" {
+    let src = "type Box \{ f: fn(Int) -> Int \}\nfn main() \{\n    let b = Box \{ f: fn(x: Int) -> Int \{ x + 1 \} \}\n    let h = b.f\n    io.println(\"r=\{h(41)\}\")\n\}\n"
+    expect_out("g2", src, "r=42")
+}
