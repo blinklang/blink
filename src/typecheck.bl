@@ -1685,7 +1685,34 @@ fn substitute_typevar_tid(t: Int, binds: Map[Str, Int]) -> Int {
         if changed == 0 { return t }
         return make_enum_instance_type(e.name, elems)
     }
-    // TyKind.Fn and every scalar/nominal kind: no embedded typevar to rewrite.
+    if k == TyKind.Fn {
+        // br kvjfqt. A Fn holds its RETURN in inner1 and its params variadically, so
+        // `fn(T) -> T` embeds a typevar in exactly the way `List[T]` does — this arm was
+        // missing under a comment claiming otherwise, and while it was missing
+        // tc_tid_subst_mono handed back `Fn(T) -> T` unchanged inside a mono'd body. That is
+        // not merely a measurement gap: closure_sig_from_tid then declines on the typevar
+        // child, the binding keeps an empty closure sig, and an empty sig is
+        // indistinguishable from "not a closure", so a closure read out of a container inside
+        // a generic fn reported UndefinedFunction (br ndgx84's backstop, one level up).
+        //
+        // Same aliasing guard as the Tuple/Struct/Enum arms: read every param out of
+        // ty_param_list BEFORE make_fn_type appends to it. The return is substituted first
+        // and is NOT part of that read, so its order does not matter.
+        let ret = substitute_typevar_tid(e.inner1, binds)
+        let mut params: List[Int] = []
+        let mut changed = if ret == e.inner1 { 0 } else { 1 }
+        let mut i = 0
+        while i < e.params_count {
+            let orig = ty_param_list.get(e.params_start + i).unwrap()
+            let sub = substitute_typevar_tid(orig, binds)
+            if sub != orig { changed = 1 }
+            params.push(sub)
+            i = i + 1
+        }
+        if changed == 0 { return t }
+        return make_fn_type(ret, params)
+    }
+    // Every scalar/nominal kind: no embedded typevar to rewrite.
     t
 }
 
@@ -1796,6 +1823,27 @@ fn unify_typevar_binds(ptid: Int, atid: Int, binds: Map[Str, Int]) {
     }
     if pk == TyKind.Tuple {
         if pe.params_count != ae.params_count { return }
+        let mut i = 0
+        while i < pe.params_count {
+            let pc = ty_param_list.get(pe.params_start + i).unwrap()
+            let ac = ty_param_list.get(ae.params_start + i).unwrap()
+            unify_typevar_binds(pc, ac, binds)
+            i = i + 1
+        }
+        return
+    }
+    if pk == TyKind.Fn {
+        // br kvjfqt, the DISCOVERY twin of substitute_typevar_tid's Fn arm. A typevar reachable
+        // only through a closure's signature — `fs: List[fn(Int) -> T]` with no second param
+        // mentioning T — has no other way to be inferred, and without this arm it reached
+        // monomorphization unsolved: I0001 UnsolvedTypeVarAtCodegen, mono args
+        // 'BLINK_I0001_erased_slot'. The tripwire fired correctly; the hole was here.
+        //
+        // Structural like the Tuple arm above, not nominal: a Fn has no name to match, so the
+        // arity check is the whole admission test. The return lives in inner1 and the params
+        // follow variadically, so both have to be walked — a typevar can sit in either.
+        if pe.params_count != ae.params_count { return }
+        unify_typevar_binds(pe.inner1, ae.inner1, binds)
         let mut i = 0
         while i < pe.params_count {
             let pc = ty_param_list.get(pe.params_start + i).unwrap()

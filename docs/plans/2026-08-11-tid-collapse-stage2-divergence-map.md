@@ -9355,6 +9355,92 @@ as `T`. A directly annotated param (`fn apply_it[T](f: fn(T) -> T, ..)`) works, 
 resolves typevars by name off the AST annotation and never asks the tid — so this is the tid path
 specifically, which is the path Stage 3 is making authoritative.
 
+## The kind that was treated as having no children, twice (br `kvjfqt`)
+
+The `rndevw` census asked one question of its own data — *why is the tid ever **less** concrete than
+the flat spelling at a post-mono site?* — and 28 of the 61 closure cells answered it:
+`tid=Fn(K, V) -> Bool` measured against `flat=Fn(int(*)(const blink_closure*, int64_t, int64_t))`.
+That ordering should be impossible. `substitute_typevar_tid` ended with
+
+    // TyKind.Fn and every scalar/nominal kind: no embedded typevar to rewrite.
+    t
+
+which is the same species of false comment as the `tk_to_ct` arm one section up, and false in the
+same way: a `Fn` holds its return in `inner1` and its params variadically, so `fn(T) -> T` embeds a
+typevar exactly as `List[T]` does — and `List`, `Option`, `Set`, `Result`, `Map`, `Tuple`, `Struct`
+and `Enum` all have recursing arms *directly above that line*.
+
+**It was live, on safe Blink, and it was `ndgx84`'s error message one level up.**
+`tc_tid_subst_mono` handed back `Fn(T) -> T` unsubstituted inside a mono'd body,
+`closure_sig_from_tid` declined on the unspellable typevar child, the binding kept an empty closure
+sig — and an empty sig is indistinguishable from "not a closure":
+
+    fn apply_first[T](fs: List[fn(T) -> T], x: T) -> T {
+        let h = fs.get(0).unwrap()
+        h(x)
+    }
+    // error[UndefinedFunction]: undefined function 'h' called in 'apply_1first_0Int'
+
+The mangled name is the proof that the mono machinery was innocent: the instance really was emitted
+for `T=Int`. Only the `Fn` tid's children were left as `T`.
+
+### The second arm, and why it is in the tree
+
+The discovery twin `unify_typevar_binds` — which walks a param tid against an arg tid in lockstep to
+*find* the binds that the function above then *applies* — had no `Fn` arm either. Added on symmetry,
+it changed **no test outcome**: every row passed without it, because `gqg3rk`'s metavar inference
+already covers the call-argument routes.
+
+An unexercised arm in an inference path is exactly the "unexercised tap" this project has been
+burned by, so it was **deleted, regenerated, and probed for a shape that needs it** rather than kept
+on the strength of the symmetry argument. That shape is a closure-typed *field* of a generic struct,
+whose typevar has no other route to a bind — `build_typevar_binds` is called from the struct-literal
+path as well as the call path:
+
+    type Holder[T] { f: fn(Int) -> T }
+    let h = Holder { f: fn(n: Int) -> Str { "v{n}" } }
+    let g = h.f
+    g(7)                    // I0001 + UndefinedFunction without the arm; `v7` with it
+
+The arm was then restored with that program as a test row. Its sibling
+`Pair[T] { g: fn(T) -> T, seed: T }` is kept as the control that already worked, because `seed: T`
+binds `T` without ever consulting the closure.
+
+### A third hole, in a third function, deliberately left alone
+
+If a typevar is reachable **only** through a closure nested inside a container param, it is not
+inferred at the call site at all — neither arm helps, and the program still ICEs:
+
+    fn make_it[T](fs: List[fn(Int) -> T], n: Int) -> T { fs.get(0).unwrap()(n) }
+    make_it(fs, 7)          // I0001, mono args BLINK_I0001_erased_slot
+
+That is `tc_resolve_tparam_tid`, the one walker of the three driven by the param annotation's **name**
+rather than by the tid: its `"List"` branch knows the bare element and the `List[(.., T, ..)]` tuple
+slot, its `"Fn"` branch only reads a closure *literal*'s own annotations, and a `List[fn(..) -> T]`
+arg matches neither. The arg tid is fully concrete — `tid=List[Fn(Int) -> Str]` on the tydiv channel
+— so the information is present and only the walker cannot reach it. Its own source comment already
+documents the narrowness and names the ticket (`3ejrqa`), whose proposed fix — walk the arg's tid now
+that a closure literal memoizes a real `TyKind.Fn` — covers this shape for free. So the MVCE went
+there, and this ticket's return-position test row gives its typevar an independent binding route so
+that it measures the new arm instead of that gap.
+
+**Three functions, one root shape.** `Fn` treated as a leaf by every walker that had learned to
+recurse into every other compound kind. That is the plan's thesis restated at a smaller scale: the
+representation was never the problem, the hand-written per-kind case analysis was.
+
+### Census
+
+The tydiv instrument moved exactly where predicted and nowhere else. The 28 tid-less-concrete-than-
+flat cells are **zero**; distinct closure cells go 61 → 55 as the `K, V` family folds into its
+concrete instances. Rows stay at 196 — correctly, because every closure row still diverges on the
+signature-as-C-string cause that only Stage 4 retires, which is what `rndevw`'s pin exists to say.
+
+The ctype instrument is neutral in both build modes: `diverge=43 missing=109` unchanged, 17 distinct
+cells identical on a common-file basis (996 mono / 927 archive-linked common files). `agree` rose by
+`+324` in each mode, attributed to the row — 37 compiler-linking files at exactly `+9` each, less the
+`9` from the excluded `test_rndevw` root. Nine is the number of new `let` bindings the two arms
+introduce: this fix's own declarations, measured while the compiler compiles itself.
+
 ## Appendix — all 428 shape cells
 
 Format: `family | occurrences | tid | flat`.

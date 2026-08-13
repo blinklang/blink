@@ -1,0 +1,165 @@
+// br kvjfqt: `substitute_typevar_tid` (src/typecheck.bl) ends with
+//
+//     // TyKind.Fn and every scalar/nominal kind: no embedded typevar to rewrite.
+//     t
+//
+// which is false for `Fn` in exactly the way br rndevw's `tk_to_ct` comment was false for it. A
+// `Fn` pool entry holds the return in child 0 and the params after it, so `fn(T) -> T` embeds a
+// typevar the same way `List[T]` does — and `List`, `Option`, `Set`, `Result`, `Map`, `Tuple`,
+// `Struct` and `Enum` all have recursing arms directly above that line.
+//
+// So `tc_tid_subst_mono` hands back `Fn(T) -> T` UNSUBSTITUTED inside a monomorphized body,
+// `closure_sig_from_tid` declines on the unspellable typevar child, the binding keeps an empty
+// closure sig — and an empty sig is indistinguishable from "not a closure", so br ndgx84's
+// backstop fires one level up:
+//
+//     error[UndefinedFunction]: undefined function 'h' called in 'apply_1first_0Int'
+//
+// The mangled name is the proof that this is the Fn arm and not the mono machinery: the instance
+// really was emitted for T=Int. Only the Fn tid's children were left as `T`.
+//
+// FOUND BY MEASUREMENT, not by a user: 28 of the 61 distinct closure cells on the tydiv instrument
+// read `tid=Fn(K, V) -> Bool` against a fully concrete `flat=Fn(int(*)(const blink_closure*,
+// int64_t, int64_t))` — the tid LESS concrete than the flat spelling, which at a post-mono site
+// should be impossible. All 28 come from the `map_for_each`/`map_filter`/`map_map_values` free
+// generics in lib/std/map.bl. The emitted C is right today because the flat spelling governs
+// there; it becomes a miscompile when Stage 3 flips authority onto the tid.
+//
+// Each row must BUILD in a subprocess: the failure is a compile error, so an in-file row could not
+// be red — the whole test file would fail to compile.
+//
+// The controls are load-bearing. A directly annotated param already worked, because that path
+// resolves typevars by NAME off the AST annotation and never asks the tid, so a fix that rerouted
+// the annotation path instead of adding the missing arm would show up there.
+//
+// SCOPE BOUNDARY — a third hole, in a third function, deliberately NOT fixed here. If a typevar is
+// reachable ONLY through a closure nested inside a container param, it is not inferred at the call
+// site at all:
+//
+//     fn make_it[T](fs: List[fn(Int) -> T], n: Int) -> T { fs.get(0).unwrap()(n) }
+//     make_it(fs, 7)   // I0001 UnsolvedTypeVarAtCodegen, mono args BLINK_I0001_erased_slot
+//
+// That is `tc_resolve_tparam_tid`, which is driven by the param annotation's NAME rather than by
+// the tid: its "List" branch handles the bare element and the `List[(.., T, ..)]` tuple slot, and
+// its "Fn" branch only reads a closure LITERAL's own annotations. A `List[fn(..) -> T]` arg matches
+// neither and falls through to -1. Its own comment already documents the narrowness and names the
+// ticket (br 3ejrqa), so the MVCE goes there rather than widening this one. Every row below gives
+// its typevar an independent way to be bound, which is what keeps them measuring the two arms this
+// ticket is about.
+
+import std.process.{ProcessResult}
+
+fn run_src(tag: Str, src: Str) -> ProcessResult {
+    let bl_path = ".tmp/_kvjfqt_{tag}.bl"
+    let bin = ".tmp/_kvjfqt_{tag}"
+    write_file(bl_path, src)
+    let build = process_run("build/blink", ["build", bl_path, "-o", bin])
+    if build.exit_code != 0 {
+        shell_exec("rm -f {bl_path}")
+        return build
+    }
+    let r = process_run(bin, [])
+    shell_exec("rm -f {bl_path} {bin}")
+    r
+}
+
+fn expect_out(tag: Str, src: Str, want: Str) {
+    let r = run_src(tag, src)
+    if r.exit_code != 0 { io.println("FAIL[{tag}] exit={r.exit_code}\n{r.err}{r.out}") }
+    assert_eq(r.exit_code, 0)
+    if !r.out.contains(want) { io.println("FAIL[{tag}] want '{want}' in output, got: {r.out}") }
+    assert(r.out.contains(want))
+}
+
+// ── The bug: a closure whose type mentions the enclosing generic's typevar ───────
+
+test "a closure read out of a List inside a generic fn is callable" {
+    let src = "fn apply_first[T](fs: List[fn(T) -> T], x: T) -> T \{\n    let h = fs.get(0).unwrap()\n    h(x)\n\}\nfn main() \{\n    let fs: List[fn(Int) -> Int] = [fn(x: Int) -> Int \{ x + 1 \}]\n    io.println(\"r=\{apply_first(fs, 41)\}\")\n\}\n"
+    expect_out("list", src, "r=42")
+}
+
+test "a closure bound by a match arm inside a generic fn is callable" {
+    let src = "fn apply_opt[T](o: Option[fn(T) -> T], x: T) -> T \{\n    match o \{\n        Some(h) => h(x)\n        None => x\n    \}\n\}\nfn main() \{\n    let o: Option[fn(Int) -> Int] = Some(fn(x: Int) -> Int \{ x + 1 \})\n    io.println(\"r=\{apply_opt(o, 41)\}\")\n\}\n"
+    expect_out("optbinder", src, "r=42")
+}
+
+test "a closure read out of a Map value inside a generic fn is callable" {
+    let src = "fn apply_keyed[T](m: Map[Str, fn(T) -> T], k: Str, x: T) -> T \{\n    let h = m.get(k).unwrap()\n    h(x)\n\}\nfn main() \{\n    let mut m: Map[Str, fn(Int) -> Int] = Map()\n    m.insert(\"inc\", fn(x: Int) -> Int \{ x + 1 \})\n    io.println(\"r=\{apply_keyed(m, \"inc\", 41)\}\")\n\}\n"
+    expect_out("mapval", src, "r=42")
+}
+
+// The shape all 28 measured cells actually have: TWO typevars, both in parameter position, which
+// is what lib/std/map.bl's `fn(K, V) -> Bool` predicates are. A fix that substituted only child 0
+// (the return) would pass every row above and fail this one.
+test "a two-typevar predicate closure substitutes both parameters" {
+    let src = "fn count_if[K, V](ps: List[fn(K, V) -> Bool], k: K, v: V) -> Int \{\n    let p = ps.get(0).unwrap()\n    if p(k, v) \{ 1 \} else \{ 0 \}\n\}\nfn main() \{\n    let ps: List[fn(Str, Int) -> Bool] = [fn(k: Str, v: Int) -> Bool \{ v > 0 \}]\n    io.println(\"n=\{count_if(ps, \"a\", 7)\}\")\n\}\n"
+    expect_out("twotv", src, "n=1")
+}
+
+// The mirror of the row above: the typevar is ONLY in the Fn's return, so a fix that substituted
+// only the parameters would pass that one and fail this.
+//
+// `seed: T` is here to bind T and is otherwise unused, which is deliberate — see the SCOPE
+// BOUNDARY note in the header. Without it, T is reachable only THROUGH the closure nested in the
+// List, and inferring it at the call site is a different walker's job (br 3ejrqa), so the row
+// would be measuring that gap instead of this arm.
+test "a typevar in the return position alone substitutes" {
+    let src = "fn make_it[T](fs: List[fn(Int) -> T], seed: T) -> T \{\n    let h = fs.get(0).unwrap()\n    let _ = seed\n    h(7)\n\}\nfn main() \{\n    let fs: List[fn(Int) -> Str] = [fn(n: Int) -> Str \{ \"v\{n\}\" \}]\n    io.println(\"s=\{make_it(fs, \\\"\\\")\}\")\n\}\n"
+    expect_out("rettv", src, "s=v7")
+}
+
+// ── The discovery twin: unify_typevar_binds ─────────────────────────────────────
+
+// Substituting a known Fn tid is half the job; the other half is DISCOVERING the bind in the
+// first place. `unify_typevar_binds` walks a param tid against the arg's tid in lockstep and had
+// no Fn arm either, so a typevar reachable only through a closure-typed FIELD of a generic struct
+// was never bound: the struct reached monomorphization with mono args
+// 'BLINK_I0001_erased_slot' (I0001), and the field read that followed drew UndefinedFunction.
+//
+// This row is why that arm is in the tree at all. It was added on symmetry with the substitution
+// arm, then REMOVED and regenerated to check whether anything actually needed it — every other
+// row here passed without it, because the metavar inference from br gqg3rk already covers the
+// call-argument routes. This shape is the one that does not survive its absence.
+test "a generic struct's closure-typed field binds the struct's typevar" {
+    let src = "type Holder[T] \{ f: fn(Int) -> T \}\nfn main() \{\n    let h = Holder \{ f: fn(n: Int) -> Str \{ \"v\{n\}\" \} \}\n    let g = h.f\n    io.println(\"s=\{g(7)\}\")\n\}\n"
+    expect_out("holderfield", src, "s=v7")
+}
+
+test "control: a closure field beside a plain typevar field still works" {
+    let src = "type Pair[T] \{ g: fn(T) -> T, seed: T \}\nfn main() \{\n    let p = Pair \{ g: fn(x: Int) -> Int \{ x + 1 \}, seed: 41 \}\n    let h = p.g\n    io.println(\"r=\{h(p.seed)\}\")\n\}\n"
+    expect_out("pairfield", src, "r=42")
+}
+
+// A typevar nested inside a COMPOUND return: substitution has to recurse through the Fn's child
+// into the Option, not just swap a bare typevar child.
+test "a typevar nested in a compound return substitutes" {
+    let src = "fn first_opt[T](fs: List[fn(T) -> Option[T]], x: T) -> T \{\n    let h = fs.get(0).unwrap()\n    h(x) ?? x\n\}\nfn main() \{\n    let fs: List[fn(Int) -> Option[Int]] = [fn(x: Int) -> Option[Int] \{ Some(x + 1) \}]\n    io.println(\"r=\{first_opt(fs, 41)\}\")\n\}\n"
+    expect_out("cmpret", src, "r=42")
+}
+
+// Two instances of the SAME generic must not share a sig. The pool interns one `Fn(T) -> T` entry,
+// so a fix that rewrote it in place rather than minting a substituted entry would emit one
+// instance's cast into the other.
+test "two instantiations of one generic get their own signatures" {
+    let src = "fn apply_first[T](fs: List[fn(T) -> T], x: T) -> T \{\n    let h = fs.get(0).unwrap()\n    h(x)\n\}\nfn main() \{\n    let ints: List[fn(Int) -> Int] = [fn(x: Int) -> Int \{ x + 1 \}]\n    let strs: List[fn(Str) -> Str] = [fn(s: Str) -> Str \{ s.concat(\"!\") \}]\n    io.println(\"a=\{apply_first(ints, 41)\} b=\{apply_first(strs, \"hi\")\}\")\n\}\n"
+    expect_out("twoinst", src, "a=42 b=hi!")
+}
+
+// ── Controls: the paths that already worked ─────────────────────────────────────
+
+test "control: a directly annotated closure param in a generic fn still works" {
+    let src = "fn apply_it[T](f: fn(T) -> T, x: T) -> T \{ f(x) \}\nfn main() \{\n    io.println(\"r=\{apply_it(fn(x: Int) -> Int \{ x + 1 \}, 41)\}\")\n\}\n"
+    expect_out("annparam", src, "r=42")
+}
+
+test "control: the non-generic container closure still works" {
+    let src = "fn main() \{\n    let fs: List[fn(Int) -> Int] = [fn(x: Int) -> Int \{ x + 1 \}]\n    let h = fs.get(0).unwrap()\n    io.println(\"r=\{h(41)\}\")\n\}\n"
+    expect_out("nongeneric", src, "r=42")
+}
+
+// The stdlib generics whose cells put this ticket on the map. They pass today because the flat
+// spelling governs the emit; the row keeps them passing once the tid does.
+test "control: the lib/std/map.bl predicate generics still work" {
+    let src = "import std.map.\{map_filter\}\nfn main() \{\n    let mut m: Map[Str, Int] = Map()\n    m.insert(\"a\", 1)\n    m.insert(\"b\", 9)\n    let hi = map_filter(m, fn(k: Str, v: Int) -> Bool \{ v > 5 \})\n    io.println(\"n=\{hi.len()\}\")\n\}\n"
+    expect_out("stdmap", src, "n=1")
+}
