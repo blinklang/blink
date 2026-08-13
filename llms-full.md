@@ -309,7 +309,7 @@ let nested = ##"contains #"inner"#"##   // depth-2 nesting
 
 | Op | Types | Notes |
 |----|-------|-------|
-| `+` `-` `*` `/` `%` | Int, Float | Arithmetic (NO `+` on Str) |
+| `+` `-` `*` `/` `%` | Int, Float | Arithmetic (NO `+` on Str). A `Bool` operand is rejected (`E0300`) — Blink has no truthiness, so count with `if c { 1 } else { 0 }`. |
 | `==` `!=` `<` `>` `<=` `>=` | Int, Float, Str, `Instant`/`Duration`, `Bytes`, and any struct/enum with `@derive(Eq)` (for `==`/`!=`) or `@derive(Ord)` (for ordering) | Comparison. Operands are type-checked (`E0300` on mismatched/unordered types); struct/enum comparisons desugar to derived `eq`/`cmp`. |
 | `&&` `\|\|` `!` | Bool | Logical |
 | `?` | Result[T,E] | Propagate error — enclosing fn must return Result |

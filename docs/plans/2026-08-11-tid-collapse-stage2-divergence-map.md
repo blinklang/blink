@@ -9698,16 +9698,137 @@ Red 13/10 → 16/7 after the two cell declarations → **23/0** after the receiv
 ### Census
 
 The ctype instrument is neutral in both build modes: `diverge=43 missing=109`, 0 new cells (2030
-mono / 1831 archive-linked summary lines). The tydiv instrument MOVES for the first time in this
-stage — 30223 → **29932** diverge rows (−291), unknown 4785 → 4780, missing 80 unchanged — because
-the identity written onto the cell expression is exactly what that instrument was measuring as
-absent.
+mono / 1831 archive-linked summary lines).
+
+**The tydiv figure first recorded here (−291) is withdrawn.** That sweep was captured while
+`src/codegen_stmt.bl` still called `capture_cell_c_type` without importing it, so every corpus file
+that compiles the compiler's own sources stopped at `error[ImportNotSelected]` and emitted no trace
+rows at all. Two files went dark that way — `tests/test_0rmamy_enum_local_decl_typedef.bl` and
+`tests/test_1b7ggq_await_operand_resolved.bl` — and they carry 165 and 149 diverge rows when the
+tree compiles. The 314 rows they did not emit are the whole of the apparent drop. Re-measured on a
+compiling tree and on a like-for-like root basis, tydiv is neutral across this cell too.
+
+**A sweep whose corpus does not compile reads as an improvement.** Every row the instrument emits
+comes from a file that reached the phase being measured, so a file that fails earlier contributes
+zero to `diverge` and looks identical to a file with nothing left to fix. Before comparing two
+sweeps, count `ImportNotSelected` / `error[` rows in both and confirm the SAME set of files reached
+the instrument; a mid-edit tree is not a baseline.
 
 ### The byproduct
 
 A transitive mut-capture through a NESTED closure emits an undeclared name and a non-lvalue
 assignment. It reproduces for `Int` and `Str` alike, so it is not on the struct axis and not this
 cell; filed as br `063qcp` with both controls recorded (one nesting level, and read-only nesting).
+
+## The cell that was closed by deleting the language feature under it (br `4vrmqe`)
+
+`Bool + Bool` was accepted, and the sum then DISPLAYED as `true`/`false` while comparing equal to
+its integer value. Typecheck did that on purpose:
+
+    if lt == TYPE_BOOL && rt == TYPE_BOOL { return TYPE_INT }
+    if lt == TYPE_BOOL && rt != TYPE_UNKNOWN { return rt }
+    if rt == TYPE_BOOL && lt != TYPE_UNKNOWN { return lt }
+
+so the arithmetic node was typed `Int` while codegen's flat side still read the operand's `Bool`.
+That disagreement was the whole of the ctype `var=__emit_modes` divergence population — six rows,
+one per corpus file that compiles `src/codegen.bl`.
+
+### The cited rationale did not cover the behaviour
+
+The comment above those lines justified them with a ticket ID. Reading that ticket: it is about
+`time.read()` without an import. It covers the RELATIONAL side effect the lines also had (a `sum <= 1`
+downstream of a Bool sum), not any decision that Bool is an arithmetic operand. So no prior ruling
+protected the behaviour, and the spec is unambiguous against it: arithmetic traits are sealed to the
+built-in numeric types (`sections/03_types.md:1936`), bitwise already excludes Bool (`:801`),
+operands must be the same type (`:1970`), and there is no truthiness (`DECISIONS.md:106`, 5-0).
+
+**Check what a comment's citation actually says before treating it as a decision.** An ID in a
+comment is an assertion that a decision exists, not the decision. This one had been load-bearing for
+a user-visible language rule that was never voted.
+
+### The fix is a rejection, so it is user-visible and was the user's call
+
+Rejecting is a breaking change for any user code doing `(a != 0) + (b != 0)`. The user ruled: reject.
+That makes this the one cell in the collapse closed by removing the construct rather than by
+teaching codegen to spell it — the divergence population disappears with the feature.
+
+`reject_bool_arith_operand` is shared by two arms, not inlined in one:
+
+    fn reject_bool_arith_operand(op: Str, tid: Int, node: Int) ! TypeCheck.Report, Diag.Report {
+        if type_kind(resolve_alias_tid(tid)) == TyKind.Bool {
+            tc_error_at("arithmetic '{op}' requires numeric operand, got {type_to_str(tid)}", node)
+        }
+    }
+
+`resolve_alias_tid` so `type Flag = Bool` cannot walk past it, and `type_kind` rather than a
+`== TYPE_BOOL` identity test so a metavar bound to Bool resolves first.
+
+### The BinOp arm is not the only place an operator's operands are checked
+
+`a += true` was still accepted after the BinOp arm rejected `a + true`. The `CompoundAssign` arm
+checks only assignment compatibility between target and value, and Bool = Bool is compatible — it
+never reaches the operator's operand rules at all. Rejecting only in BinOp would have left the ban
+bypassable by spelling, so the compound arm calls the same helper on both sides (the parser stores
+the bare operator, `+` not `+=`, so the message is identical).
+
+Probing the same arm with a non-Bool operand found the general hole: `s += "b"` on a `Str` passes
+typecheck and fails in the C compiler, where `let x = s + "b"` is a clean `E0521`. Filed as br
+`5vy9v7` — the real fix routes `CompoundAssign` through the binary-operator operand checks so every
+operator rule applies to both spellings from one place. Not done here: that is a wider change than
+this cell, and the Bool face is closed either way.
+
+### The one in-tree caller
+
+`src/codegen.bl:452` summed three mode flags directly:
+
+    let __emit_modes = (cg_archive_header_mode != 0) + (cg_archive_build_mode != 0) + (cg_user_tu_mode != 0)
+
+rewritten to an explicit `(if flag != 0 { 1 } else { 0 })` sum. Nothing else in `src/`, `lib/` or
+`tests/` used Bool arithmetic — 711 test files pass unchanged, which is the real measure of how much
+this "feature" was used.
+
+### Coverage
+
+`tests/test_4vrmqe_bool_arith_rejected.bl`, 19 rows, subprocess harness (the rows are compile
+errors). 13 rejection rows: `+ - * / %` on two Bools, a Bool literal, `(a != 0) + (b != 0)`, Bool/Int
+on either side, and `+= -= *= /=`. 6 controls: `&&`/`||`/`!`, a comparison still yielding Bool, Int
+arithmetic, Int compound assignment, Float arithmetic, and the explicit `if c { 1 } else { 0 }` sum
+that is now the way to count. Red 13/6 → green 19/0.
+
+Each rejection row asserts three things — nonzero exit, `E0300`, and that the message names both the
+rule and `Bool`. Asserting only on the code would pass on any unrelated type error in the fixture.
+
+### Two test-harness defects this row hit, both filed
+
+- A field name that does not exist is accepted everywhere and interpolates as the literal
+  `<value>`: `blink check` says `ok`, `blink run` prints `bogus=<value>`. Found because
+  `tests/test_0e7dek_mut_captured_struct_cell.bl:41` read `r.err` on a `ProcessResult` whose field is
+  `err_out`, so the diagnostic that row was built to print came out empty. Filed as br `d1md7y`;
+  the `0e7dek` row is corrected here. A typo in a field name is a silent test weakener.
+- Two test names that differ only in punctuation mangle to the same C symbol, and the file stops
+  compiling with a `redefinition` error pointing at C rather than at the source. `test "Bool + Bool
+  is rejected"` and `test "Bool - Bool is rejected"` collide. Filed as br `3nsztp`; the rows here
+  spell the operators as words to get around it.
+
+### Census
+
+Taken at base `b0c9397`. Both sides of the table were swept at that base, so the delta is sound, but
+the absolute numbers are not comparable to a sweep taken after the closure/`TyKind.Fn` batch landed —
+re-baseline before quoting them against a later row.
+
+Like-for-like (the four roots that are new or were dark in an earlier sweep excluded from both sides;
+identical summary-line counts on both sides confirm the same corpus reached the instrument):
+
+| instrument | before | after |
+|---|---|---|
+| ctype, monolithic | 42 diverge / 429666 agree / 109 missing, 2014 lines | **37** / 429671 / 109 |
+| ctype, archive-linked | 42 / 353511 / 109, 1815 lines | **37** / 353516 / 109 |
+| tydiv | 29908 diverge / 4775 unknown / 80 missing, 3056 lines | **29903** / 4775 / 80 |
+
+−5 on every instrument in both build modes, and the `var=__emit_modes` population reads 0. The five
+are one row per corpus file that compiles `src/codegen.bl`; the sixth raw row belongs to an excluded
+root. The compound-assignment step is separately census-neutral (byte-identical sweep totals before
+and after), as it adds a diagnostic and no type.
 
 ## Appendix — all 428 shape cells
 

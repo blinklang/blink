@@ -1946,6 +1946,12 @@ error[SealedTraitImpl]: sealed trait
   = help: define a named method instead: `fn add(self, other: Vector2) -> Vector2`
 ```
 
+`Bool` is not a numeric type, so `+ - * / %` reject a `Bool` operand -- the same rule the bitwise operators follow. Blink has no truthiness, so a `Bool` never reads as 0 or 1. Count with an explicit conditional:
+
+```blink
+let hits = (if a { 1 } else { 0 }) + (if b { 1 } else { 0 })
+```
+
 If you need vector/matrix math, use named methods: `v1.add(v2)` -- clear and grep-able.
 
 #### Operator Desugaring
