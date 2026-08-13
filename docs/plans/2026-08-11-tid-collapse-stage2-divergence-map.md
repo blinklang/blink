@@ -7431,6 +7431,95 @@ unmangled Blink identifier (`.fn = keep` against a definition emitted as `blink_
 compiler sees an undeclared identifier — br `zpth5r`. Hidden because the corpus passes closure
 literals, never a named fn.
 
+## The first flip: the `for` binder's C declaration (br `bn3e6j`)
+
+`copy_list_compound_elem` was a fix at a site where the tid was *added*. This is the first place the
+tid was made to **govern an emitted C declaration**, which is what Stage 3's "flip authority" line
+actually asks for, and it is worth recording because the flip turned out to be a *normalization*
+rather than a bug fix — a distinction the census could not make on its own.
+
+### The census, and the fact that it is one cell
+
+Both build modes, `tests/` + `examples/` + `src/`, 291 rows each and identical:
+
+```
+ctype.forin.binder           agree=110 diverge=14 missing=0 unknown=0
+ctype.forin.adapter_binder   agree=4   diverge=1  missing=0 unknown=0
+```
+
+129 events, **zero declines**, and all 15 divergences are the same shape — a plain, payload-less
+enum element:
+
+```
+bucket=diverge site=ctype.forin.binder var=c ty=Col1n tidc=blink_Col1n emitted=int64_t
+```
+
+`missing=0` is the load-bearing number here, not `diverge`. It says the flat spelling contributed
+nothing at these two sites that the tid could not also spell, which is the precondition Stage 4 needs
+before deleting the flat arm.
+
+### Codegen was disagreeing with itself, and the binder was the outlier
+
+The reflex reading of a diverge row is "the tid is wrong here." It is not, and the way to tell is to
+ask what codegen emits for the *same type in a different position*. From `.tmp/enum1.bl`:
+
+```
+338:    const blink_Col c = blink_Col_Red;      <- a let of that enum
+347:        int64_t x = __next_2.value;          <- the for binder over List of it
+```
+
+A closure parameter of the same type is also declared `blink_Col1n`, and `blink_Col1n` is a real
+emitted typedef. So two of three positions already spelled the enum and only the binder spelled the
+ordinal. The tid agreed with the majority; flipping the binder makes codegen speak one language for
+one type.
+
+### Why this needed a characterization test rather than a red one
+
+A plain enum **is** its ordinal, so the C conversion is implicit and free, and `int64_t` was not
+producing a wrong program — it was producing an inconsistent one. Every way of consuming such a
+binder was verified to work *before* the flip: passing it to a fn that expects the enum, storing it
+in a struct-literal field of that type, using it as a `Map` key (with `@derive(Hash, Eq)`), matching
+a **bare** variant, pushing it onto a `List` of the enum and reading back, and comparing against a
+variant. `tests/test_bn3e6j_forin_binder_ctype_from_tid.bl` is those seven rows, and it passes on
+both sides of the change by design. Red/green does not apply to a normalization; the guard does.
+
+The bare-variant row is the one that could have broken and did not. A plain-enum binder's *identity*
+reaches the body through `var_enums`, not through its C type (br `1n9fhg` / `k4thkq`), so changing
+the declaration cannot disturb it — but that is an argument, and the test is the evidence.
+
+### Reading the census after a flip
+
+The probe's `emitted` column is documented as "what the caller is about to print." Once the tid
+governs, that is no longer true at a flipped site, and the counter's meaning shifts with it:
+
+- `diverge` now counts **corrections the tid applied**, not defects. It does *not* go to zero. After
+  the flip the corpus reads `binder agree=112 diverge=19`, `adapter_binder agree=4 diverge=2` —
+  *higher*, because `test_bn3e6j` adds six more plain-enum loops of exactly the diverging shape.
+- `missing` is the number that must reach zero before the flat arm can be deleted.
+
+This matters for how the plan's Stage 3 exit line — *"Drive the Stage 2 divergence counter to 0"* —
+is read. It cannot mean "every flipped site reports `diverge=0`", which is what a first pass at this
+unit assumed. The counter measures two *derivations* agreeing; a flip decides which derivation
+reaches the *output*. Where the flat derivation is simply wrong about a spelling, those two pull in
+opposite directions, and the counter goes to zero only when the flat derivation is **deleted**
+(Stage 4), not when it is overruled. At a flipped site, `diverge` becomes a record of overruling and
+only `missing` still carries information.
+
+### The storage-position guard
+
+`c_type_from_tid` answers a genuine `TyKind.Void` with `void` deliberately, and leaves the
+position rule to its caller — legal in a return position, illegal in a storage one. A binder is a
+storage position, so `forin_binder_ctype` declines a `void` spelling back to the flat answer. The
+corpus contains no such row (`missing=0`, and all 21 post-flip divergences are the enum cell), so
+this is a guard against a shape the sweep did not contain, not an observed cell — the same reason
+`copy_list_compound_elem`'s body survives with zero corpus events
+(`feedback_corpus_sweep_is_not_coverage`).
+
+One tap that *was* unexercised is now covered: `ctype.forin.adapter_binder` had a single corpus
+event before this, so the test's `filter` row over a plain-enum list exists to prove the lazy-adapter
+declaration is genuinely reached rather than assumed — it shows up as the second `adapter_binder`
+diverge row (`ty=KCol`).
+
 ## Appendix — all 428 shape cells
 
 Format: `family | occurrences | tid | flat`.

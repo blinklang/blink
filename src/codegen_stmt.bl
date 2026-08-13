@@ -4269,6 +4269,39 @@ fn forin_measure_var(var_name: Str, iter_node: Int, node: Int) {
     let _measured = sv_ty_or_flat_at(var_name, "emit_for_in.var", node)
 }
 
+// The ctype half of the same measurement, and — since br bn3e6j — the DECIDER for the two for-in
+// binder declarations. forin_measure_var compares the two type REPRESENTATIONS; this compares the
+// two C SPELLINGS, which is what Stage 3's flip actually changes: a binder declared from the flat
+// `elem_type` alone can only ever be spelled at depth 1, and the erasures that bite here
+// (`blink_Option_int` for an `Option[Map[Str, Int]]` element) are invisible to a
+// representation-level comparison that both sides answer CT_OPTION for.
+//
+// Ordering is br bef42x's: the tid LEADS and the flat spelling survives only where the tid
+// declines. `flat` is passed in rather than re-derived because the two declaration sites reach
+// c_type_str through different locals, and a decider that recomputed the spelling would be
+// choosing against its own idea of the flat answer instead of against the line the site would
+// otherwise have printed.
+//
+// READING THE CENSUS AFTER A FLIP. The probe's `emitted` column is documented as "what the caller
+// is about to print", and at a flipped site that is no longer the flat candidate — so `diverge`
+// here now counts CORRECTIONS the tid applied, not defects, and it does not go to zero. The
+// number that must reach zero before Stage 4 can delete the flat arm is `missing`: a decline is
+// the only remaining case in which the flat spelling still governs the output.
+fn forin_binder_ctype(var_name: Str, iter_node: Int, node: Int, site: Str, flat: Str) -> Str {
+    if var_name == "" { return flat }
+    let elem_tid = tc_tid_subst_mono(tc_tid_resolved(tc_tid_iter_elem(tc_tid_resolved(tc_lookup_node_tid(iter_node)))), cg_mono_tparams_sl, cg_mono_arg_tids)
+    ctype_probe_at(elem_tid, site, var_name, flat, node)
+    let spelled = c_type_from_tid(elem_tid)
+    if spelled == "" { return flat }
+    // A binder is a STORAGE position and `void` is legal only in a return one — c_type_from_tid
+    // answers a genuine Void deliberately and leaves the position rule to its caller. The corpus
+    // has no such row (missing=0, and all 15 divergences were the plain-enum cell), so this is a
+    // guard against a shape the sweep did not contain rather than an observed cell: declining
+    // keeps the pre-flip output instead of emitting a `void x = …` that would not compile.
+    if spelled == "void" { return flat }
+    spelled
+}
+
 // The same dual-write for a function parameter (br 7xgbh6), which is the larger population: four
 // registration loops — plain fn, prototype, monomorphized fn, poly impl — build a param's ScopeVar
 // from `node_type_name(p)`, a NAME put through type_from_name, while the annotation node carries
@@ -4775,7 +4808,8 @@ fn emit_for_in(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.
                 cg_indent = cg_indent + 1
                 emit_line("{opt_type} {next_var} = {li_type}_next(&{iter_var});")
                 emit_line("if ({next_var}.tag == 0) break;")
-                emit_line("{c_type_str(elem_type)} {c_var_name} = {next_var}.value;")
+                let binder_c = forin_binder_ctype(var_name, iter_node, node, "forin.binder", c_type_str(elem_type))
+                emit_line("{binder_c} {c_var_name} = {next_var}.value;")
                 push_scope()
                 set_var(var_name, elem_type, 0)
                 // 1n9fhg: the loop var of a plain-enum element is an ordinal, but it still needs
@@ -4851,7 +4885,8 @@ fn emit_for_in(node: Int) ! Codegen.Emit, Codegen.Register, Codegen.Scope, Diag.
                 set_var(var_name, CT_VOID, 0)
                 set_var_struct(var_name, named_carrier)
             } else {
-                emit_line("{c_type_str(elem_type)} {c_var_name} = {next_var}.value;")
+                let adapter_binder_c = forin_binder_ctype(var_name, iter_node, node, "forin.adapter_binder", c_type_str(elem_type))
+                emit_line("{adapter_binder_c} {c_var_name} = {next_var}.value;")
                 push_scope()
                 set_var(var_name, elem_type, 0)
                 // k4thkq: the STORAGE of a plain-enum element is an ordinal and the iterator

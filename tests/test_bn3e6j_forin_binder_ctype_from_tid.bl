@@ -1,0 +1,98 @@
+// The for-in binder's C declaration is spelled from the tid, not from the flat element CT.
+//
+// The census that motivated the flip: over tests/ examples/ src/, in both build modes, the
+// binder-declaration probe reported 129 events, 0 declines, and every one of the 15 divergences
+// was the same cell — a PLAIN (payload-less) enum element, which the binder declared as `int64_t`
+// while every other position in codegen declares a variable of that type as `blink_<Enum>`. A `let`
+// of the same type already emits `const blink_Col c = blink_Col_Red;`; only the binder disagreed.
+//
+// The rows below are the ways a plain-enum binder is consumed. All of them worked through the
+// `int64_t` spelling too — a plain enum IS its ordinal, so the C conversion is implicit and free —
+// which is why this file is a guard for the normalization rather than a reproduction of a defect.
+@derive(Hash, Eq)
+type KCol { Red, Green }
+
+type KHold { c: KCol, n: Int }
+
+fn kcol_name(c: KCol) -> Str {
+    if c == KCol.Red { return "red" }
+    "green"
+}
+
+test "a plain-enum binder passes to a fn that expects the enum" {
+    let cs: List[KCol] = [KCol.Red, KCol.Green]
+    let mut seen = ""
+    for x in cs { seen = "{seen}{kcol_name(x)}," }
+    assert(seen == "red,green,")
+}
+
+test "a plain-enum binder stores into a struct field of that enum type" {
+    let cs: List[KCol] = [KCol.Red, KCol.Green]
+    let mut seen = ""
+    for x in cs {
+        let h = KHold { c: x, n: 1 }
+        seen = "{seen}{kcol_name(h.c)},"
+    }
+    assert(seen == "red,green,")
+}
+
+test "a plain-enum binder is a usable Map key" {
+    let cs: List[KCol] = [KCol.Red, KCol.Green]
+    let m: Map[KCol, Int] = Map()
+    for x in cs { m.insert(x, 7) }
+    assert(m.len() == 2)
+    assert(m.get(KCol.Green).unwrap() == 7)
+}
+
+// The identity a plain-enum binder carries reaches the body through var_enums, not through its C
+// type — br 1n9fhg / k4thkq. A bare variant pattern is what reads it.
+test "a plain-enum binder matches a bare variant" {
+    let cs: List[KCol] = [KCol.Red, KCol.Green]
+    let mut seen = ""
+    for x in cs {
+        match x {
+            Red => { seen = "{seen}r" }
+            Green => { seen = "{seen}g" }
+        }
+    }
+    assert(seen == "rg")
+}
+
+test "a plain-enum binder pushes onto a List of the enum and reads back" {
+    let cs: List[KCol] = [KCol.Red, KCol.Green]
+    let out: List[KCol] = []
+    for x in cs { out.push(x) }
+    assert(kcol_name(out.get(1).unwrap()) == "green")
+    assert(out.get(0).unwrap() == KCol.Red)
+}
+
+// The lazy-adapter arm declares its binder at a second site with the same flat spelling, so it
+// takes the same flip. A filter over a plain-enum List is the shape that reaches it.
+test "a plain-enum binder from a lazy adapter still compares and names" {
+    let cs: List[KCol] = [KCol.Red, KCol.Green, KCol.Red]
+    let mut n = 0
+    for x in cs.filter(fn(c: KCol) -> Bool { c == KCol.Red }) {
+        assert(kcol_name(x) == "red")
+        n = n + 1
+    }
+    assert(n == 2)
+}
+
+// A non-enum element must keep the spelling it already had: 110 of the 129 census events agreed
+// between the two sides, and the flip must be a no-op for every one of them.
+test "scalar and struct binders are unchanged" {
+    let xs: List[Int] = [1, 2, 3]
+    let mut sum = 0
+    for x in xs { sum = sum + x }
+    assert(sum == 6)
+
+    let hs: List[KHold] = [KHold { c: KCol.Red, n: 4 }, KHold { c: KCol.Green, n: 5 }]
+    let mut ns = 0
+    for h in hs { ns = ns + h.n }
+    assert(ns == 9)
+
+    let ss: List[Str] = ["a", "b"]
+    let mut cat = ""
+    for s in ss { cat = "{cat}{s}" }
+    assert(cat == "ab")
+}
