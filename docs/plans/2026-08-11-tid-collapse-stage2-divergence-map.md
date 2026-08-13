@@ -8367,6 +8367,115 @@ reproduction; the Handle row omits `.await()` for that reason, so it does not go
 unit does not own. br kxe0s2 — `Some(Duration)` / `Some(Instant)` emit the undeclared
 `blink_Option_void`; same missing-arm mechanism as rh7rhf, no handler involved.
 
+### rh7rhf — a `Handler[E]` in a carrier named a C type that did not exist
+
+**Two arms, one on each side of the collapse.** The ticket read as three defects and the census read as
+one; both were wrong, and the census was the one that settled it. From br 3nf9fr's sweep:
+
+```
+bucket=decline site=ctype.option var=o  ty=Option[Handler[IO]]      tidc=- emitted=blink_Option_void
+bucket=decline site=ctype.option var=om ty=Option[Handler[Metrics]] tidc=- emitted=blink_Option_void
+```
+
+`tidc=-` is the part no amount of reading the ticket would have given me. **Both** spellers were
+missing an arm: `c_type_tag` had no `CT_HANDLER` case and fell to its `else { "void" }` default, and
+`tc_tid_tag_at` had no `TyKind.Handler` case and answered `ICE_SEG_UNHANDLED_KIND`. Fixing only the
+flat side would have produced a compiling program with the tid channel still silent — i.e. a cell the
+collapse could never take authority over, which is the actual Stage-3 deliverable.
+
+The flat default is what turned one missing arm into an undeclared type: naming the carrier
+`blink_Option_void` made `emit_option_typedef` return early on its `tag == "void"` test, so the name was
+**referenced and never typedef'd**. That also explains the ticket's first two claims — the `Some(h)`
+failure and the `blink_ListIterator_void_next` failure — as one line, because `tp_carrier_tag` funnels
+into `c_type_tag` for every non-container kind.
+
+**The asymmetry between the two spellers is the reusable finding.** `tc_tid_tag_at` fails **closed** on
+an unhandled kind, deliberately, so that a missing arm cannot be mistaken for a genuine Void.
+`c_type_tag` has no such split — its default *is* `"void"`. Same omission, one loud and one silent, and
+the silent one is the one that shipped a broken program. Worth carrying into Stage 4: the flat speller's
+default is not merely less precise than its tid twin, it is *differently failing*.
+
+Tag: `handler`, **effect dropped**, on precedent rather than preference. Every parameterized non-struct
+kind already drops its parameter (`Handle[T]`→`handle`, `Channel[T]`→`channel`, `Iterator[T]`→`iter`,
+`Ptr[T]`→`ptr`, whose own comment says so). For Handler the drop is not even a choice: `TyKind.Handler`
+carries the effect in the entry's **name** slot, not as a child tid (br 88sfaz), so `tc_tid_child_count`
+is 0 and there is no inner tid to recurse into. Precision is recovered from the tid by
+`c_type_from_tid`'s Handler arm (br t7xf9y), and `c_type_str(CT_HANDLER)` is already `"void*"`, so C's
+implicit `void*`↔object-pointer conversions carry the vtable without a cast.
+
+**Two of the ticket's own claims were false, and each pointed somewhere worse.** Claim: "the value is
+built with `blink_u_mk()` (the unit maker), so the handler pointer is DISCARDED at construction — this
+is not only a spelling problem." `blink_u_mk` **is** the user function `mk`; `blink_u_` is the
+reserved-name escape (`codegen_types.bl:884`) and the forward declaration reads
+`static blink_io_vtable* blink_u_mk(void);`. Nothing was discarded, which is why one arm closed it.
+Claim: the unwrap-temp mismatch is part of this defect — it reproduces with no handler and no effect
+anywhere, and came out as br 3nf9fr.
+
+The ticket also asked whether a handler should be storable in a container at all, reasoning that "the
+vtable pointer's lifetime is the enclosing `with`". **The spec answers both halves.**
+`sections/04_effects.md:1306` "#### First-class values" — handlers "can be stored in variables, struct
+fields, collections, closures, passed as arguments, and returned from functions", with
+`let handlers: List[Handler[DB]] = [mock_db(d1), mock_db(d2)]` at :1319 — and :1288 says each
+`Handler[E]` vtable is "managed by the GC", so there is no scope-bound allocation to dangle. A carrier
+tag, not a diagnostic. *Verifying the premise against the spec first would have saved the analysis.*
+
+`tests/test_rh7rhf_handler_option_carrier.bl`, 9 rows, 9/9 green. Red was the whole file failing to
+build. `task ci` green — 698 test files, 698 passed, 0 failed; `fmt` 1614 passed, 0 failed.
+
+**No fixture churn, which was not the expected outcome.** `c_type_tag` is not Option-local — its output
+is a segment in Result, Map, Tuple and mono-instance names — and br bwyfy1's precedent is that
+"collapsing it to one RULE broke 296 fixtures and was reverted". Nothing broke here. The distinction
+worth keeping: bwyfy1 *changed* what existing kinds spell, this *adds* a kind that previously spelled
+nothing valid. Adding an arm is safe in a way collapsing arms is not.
+
+**Census, both modes — and the counter went UP, from 42 to 43.** Saying that first, because the target
+was also met:
+
+```
+                            mono                        arc
+ctype.option    agree=1910 diverge=0 missing=0   agree=1867 diverge=0 missing=0   ← was 2 declines
+ctype.forin.binder  agree=112 diverge=20         agree=112 diverge=20             ← was 19
+TOTAL           agree=436725 diverge=43 missing=109   agree=361184 diverge=43 missing=109
+```
+
+The two `ctype.option` declines are gone in both modes. The 43rd row is **one row from this ticket's own
+new test file**, and it is attributable exactly: the pre-existing 19 `forin.binder` rows are unchanged
+(9 in `test_1n9fhg`, 5 in `test_bn3e6j`, 5 in `test_k4thkq` — all br qzdz2e, spec-blocked), and the new
+one is
+
+```
+bucket=diverge site=ctype.forin.binder var=h ty=Handler[IO] tidc=blink_io_vtable* emitted=void*
+```
+
+**This is newly-observed divergence, not new divergence.** The corpus contained no for-in over a
+`List[Handler[E]]`, so the cell existed and had never fired — `feedback_corpus_sweep_is_not_coverage`
+running in the positive direction for once: writing the shape by hand lit a tap the 698-file corpus does
+not reach. It is also the *benign* direction, where the tid is MORE precise than the flat channel
+(`blink_io_vtable*` vs `void*`), both spellings are valid C, and the program runs correctly — so Stage
+3's authority flip resolves it by making the binder more precise, with no separate fix needed. A cell to
+count, not a bug to file.
+
+**Three byproduct tickets, and the test file is where two of them were found.** Writing the rows
+honestly is what produced them — every one came from a row that went red for the wrong reason.
+
+- **br f5k3jk (P0)** — the in-corpus row built `[mk_io(), mk_metrics()]` to show the carrier worked,
+  and it **compiled**. List-literal elements are not type-checked at all: `let xs: List[Int] = [1, "a"]`
+  runs, and an explicit `List[Handler[IO]]` annotation does not help. For handlers that is the 88sfaz
+  cross-effect laundering reached by a new route — `io.println("loop")` dispatches by slot index through
+  a Metrics vtable and calls `counter(Str, Int)` with one argument. `types_compatible` is intact (the
+  direct `take(mk_m())` is correctly rejected) and `push` checks; the **literal** is the hole. Sibling
+  br x231pe reports the same gap for struct literals.
+- **br wxxg4f (P1)** — a for-in row used a captured `tag` to tell its two elements apart and hit
+  `error: 'tag' undeclared`. A **builtin**-effect handler body cannot reference any enclosing binding;
+  the identical shape through a **user** effect compiles and runs. A divergence between two emit paths,
+  not a missing feature.
+- **br 1mw2c3 (P2)** — `hs.get(0).unwrap()` and `m.get("k").unwrap()` still fail, and *not* for this
+  ticket's reason: `List.get`'s element-CT arm chain re-derives the carrier from a flat element CT and
+  its final `else` hardcodes `CT_INT`, so the site never consults a tag speller at all. Both shapes are
+  **parked as a commented block** in the test file with that explanation, not deleted. The for-in row is
+  the control that makes the distinction checkable — it also goes through a `List[Handler[IO]]`, and it
+  passes.
+
 ## Appendix — all 428 shape cells
 
 Format: `family | occurrences | tid | flat`.

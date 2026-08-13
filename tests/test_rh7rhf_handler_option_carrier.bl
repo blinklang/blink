@@ -1,0 +1,229 @@
+import compile_test_helpers.{compile_and_run}
+
+// br rh7rhf — a `Handler[E]` inside an `Option` names a C type that does not exist. `Some(mk())` emits
+// `blink_Option_void`, which is REFERENCED but never TYPEDEF'D:
+//
+//     build/inopt.c:142:11: error: unknown type name 'blink_Option_void';
+//         did you mean 'blink_Option_char'?
+//       142 |     const blink_Option_void o = (blink_Option_void){.tag = 1, .value = blink_u_mk()};
+//
+// ONE MISSING ARM, TWO SURFACES. `c_type_tag` (codegen_types.bl:6931) has no CT_HANDLER arm, so a
+// handler inner falls to its `else { "void" }` default. That default names the carrier
+// `blink_Option_void`, and `emit_option_typedef` (:7847) then returns early on exactly `tag == "void"`
+// — which is why the name is referenced and never declared. The original ticket read the two as
+// separate faults; they are one line.
+//
+// The for-in shape is the same cell one seam further out, because the iterator monomorphizes on the
+// same tag:
+//
+//     static blink_Option_void blink_ListIterator_void_next(blink_ListIterator_void* self) {
+//
+// TWO CLAIMS ON THE TICKET WERE WRONG, and both are worth recording because each pointed the fix in a
+// worse direction:
+//
+//  - "the value is built with blink_u_mk() (the unit maker), so the handler pointer is DISCARDED at
+//    construction — this is not only a spelling problem." `blink_u_mk` IS the user function `mk`.
+//    `blink_u_` is the reserved-name escape (codegen_types.bl:884), and the forward declaration reads
+//    `static blink_io_vtable* blink_u_mk(void);`. Nothing is discarded. It is only a spelling problem,
+//    which is why one arm closes it.
+//
+//  - "the unwrap temp is blink_Option_int, which does not match the value's own declared type." True,
+//    but NOT handler-specific — it reproduces with `Option[Handle]` and `Option[StringBuilder]`, no
+//    effect anywhere. Split out as br 3nf9fr and fixed there; this ticket blocks on it, because
+//    passing an inner CT through the unwrap tail cannot help until `c_type_tag` names that inner.
+//
+// THE SPEC SETTLES THE TICKET'S OWN OPEN QUESTION — "should a Handler even be storable in a container?
+// The vtable pointer's lifetime is the enclosing `with`, so a handler that outlives its scope is a
+// dangling pointer. If the answer is no, the fix for both tickets is a diagnostic and not a carrier
+// tag." The answer is yes, so a carrier tag it is. sections/04_effects.md:1306 "#### First-class
+// values": "Handlers are full first-class values. They can be stored in variables, struct fields,
+// collections, closures, passed as arguments, and returned from functions", with
+// `let handlers: List[Handler[DB]] = [mock_db(data1), mock_db(data2)]` at :1319. The lifetime fear is
+// answered at :1288 — each `Handler[E]` compiles to an effect-specific vtable struct "managed by the
+// GC" — so there is no scope-bound allocation to dangle.
+//
+// TAG CONVENTION: `handler`, WITH THE EFFECT DROPPED. Chosen from precedent, not invented.
+// tc_tid_tag_at's INNER position already drops the parameter for every parameterized non-struct kind
+// — Handle[T] → "handle", Channel[T] → "channel", Iterator[T] → "iter", Ptr[T] → "ptr", whose comment
+// says it outright: "Both DROP the pointee, which is what makes Ptr non-injective as a segment."
+// Handler[E] belongs to that family, not the struct family, so a per-effect `Option_Handler_io` would
+// be the odd one out. The Handle control is the witness that the family works — it already produces
+// `typedef struct { int tag; blink_handle* value; } blink_Option_handle;` today.
+//
+// Dropping the effect costs nothing observable because the PRECISION LIVES IN THE TID: the unwrapped
+// binding re-spells as `blink_io_vtable*` from c_type_from_tid's Handler arm (br t7xf9y), and C's
+// implicit void*↔object-pointer conversions let the carrier store and yield it without a cast. That
+// is the direction this collapse is going — one carrier name, and the type recovered from the tid.
+
+effect Metrics {
+    effect Emit {
+        fn counter(name: Str, value: Int)
+    }
+}
+
+fn mk_io() -> Handler[IO] {
+    handler IO {
+        fn print(msg: Str) {
+            io.println("[H] {msg}")
+        }
+    }
+}
+
+fn mk_metrics() -> Handler[Metrics] {
+    handler Metrics {
+        fn counter(name: Str, value: Int) {
+            io.println("[M] {name}={value}")
+        }
+    }
+}
+
+// ── The Option carrier ──────────────────────────────────────────────────────────────
+//
+// Every row asserts on OUTPUT. A carrier that compiles but yields the wrong pointer would still exit
+// 0, and a user effect's default vtable stub returns silently, so the printed prefix is the only thing
+// that separates a real dispatch from no dispatch at all.
+
+test "a handler unwrapped from an Option dispatches" {
+    let src = "fn mk() -> Handler[IO] \{\n    handler IO \{\n        fn print(msg: Str) \{\n            io.println(\"[H] \{msg}\")\n        }\n    }\n}\nfn main() \{\n    let o = Some(mk())\n    let h = o.unwrap()\n    with h \{\n        io.println(\"via option\")\n    }\n}\n"
+    let r = compile_and_run(src, "rh7rhf_option")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("[H] via option"))
+}
+
+test "a user-effect handler unwrapped from an Option dispatches" {
+    let src = "effect Metrics \{\n    effect Emit \{\n        fn counter(name: Str, value: Int)\n    }\n}\nfn mk() -> Handler[Metrics] \{\n    handler Metrics \{\n        fn counter(name: Str, value: Int) \{\n            io.println(\"[M] \{name}=\{value}\")\n        }\n    }\n}\nfn main() \{\n    let o = Some(mk())\n    let h = o.unwrap()\n    with h \{\n        metrics.counter(\"opt\", 3)\n    }\n}\n"
+    let r = compile_and_run(src, "rh7rhf_option_ue")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("[M] opt=3"))
+}
+
+// Two DIFFERENT effects through two Options, so the carrier cannot be right by accident: if one tag
+// served both, the second unwrap would read the first's vtable and `metrics.counter` would dispatch
+// by slot index through the IO table.
+test "two Options over different effects each carry their own handler" {
+    let src = "effect Metrics \{\n    effect Emit \{\n        fn counter(name: Str, value: Int)\n    }\n}\nfn mk_io() -> Handler[IO] \{\n    handler IO \{\n        fn print(msg: Str) \{\n            io.println(\"[H] \{msg}\")\n        }\n    }\n}\nfn mk_m() -> Handler[Metrics] \{\n    handler Metrics \{\n        fn counter(name: Str, value: Int) \{\n            io.println(\"[M] \{name}=\{value}\")\n        }\n    }\n}\nfn main() \{\n    let oi = Some(mk_io())\n    let om = Some(mk_m())\n    with oi.unwrap(), om.unwrap() \{\n        io.println(\"pair\")\n        metrics.counter(\"pair\", 2)\n    }\n}\n"
+    let r = compile_and_run(src, "rh7rhf_option_pair")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("[H] pair"))
+    assert(r.out.contains("[M] pair=2"))
+}
+
+// `None` must decode too. Nothing here exercises the vtable, so this row is only about the carrier
+// being a real type with a readable tag — but it is the one row that would still pass if the value
+// member were dropped entirely, which is why it is not the only Option row.
+test "a None over a handler inner decodes" {
+    let src = "fn mk() -> Handler[IO] \{\n    handler IO \{\n        fn print(msg: Str) \{\n            io.println(\"[H] \{msg}\")\n        }\n    }\n}\nfn pick(yes: Bool) -> Option[Handler[IO]] \{\n    if yes \{ Some(mk()) } else \{ None }\n}\nfn main() \{\n    let n = pick(false)\n    if n.is_none() \{\n        io.println(\"none ok\")\n    }\n    let s = pick(true)\n    with s.unwrap() \{\n        io.println(\"some ok\")\n    }\n}\n"
+    let r = compile_and_run(src, "rh7rhf_option_none")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("none ok"))
+    assert(r.out.contains("[H] some ok"))
+}
+
+// ── The iterator carrier — the same cell one seam further out ────────────────────────
+//
+// `for h in hs` monomorphizes the list iterator on the element tag, so the undeclared carrier appears
+// a second time in the iterator's own signature and return statements, not just at the use site. Two
+// spellers, one missing arm.
+
+// NO CAPTURED `tag` IN THESE ROWS, and the omission is forced. My first version distinguished the
+// two elements with a captured `tag` parameter and went red for a defect this ticket does not own:
+// a BUILTIN-effect handler body cannot reference any enclosing binding at all, emitting
+// `error: 'tag' undeclared` (br wxxg4f, P1 — the same shape through a USER effect compiles and runs,
+// so it is a divergence between the two handler emit paths). The elements are told apart by the
+// count instead.
+test "for-in over a List[Handler[E]] dispatches each element" {
+    let src = "fn mk() -> Handler[IO] \{\n    handler IO \{\n        fn print(msg: Str) \{\n            io.println(\"[H] \{msg}\")\n        }\n    }\n}\nfn main() \{\n    let hs = [mk(), mk()]\n    for h in hs \{\n        with h \{\n            io.println(\"loop\")\n        }\n    }\n}\n"
+    let r = compile_and_run(src, "rh7rhf_forin")
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out.split("[H] loop").len(), 3)
+}
+
+// The spec's own example: a DECLARED `List[Handler[E]]` built from two makers
+// (sections/04_effects.md:1319). Worth its own row because the annotation drives a different
+// element-type path than the inferred literal above.
+test "the spec's annotated List[Handler[E]] compiles and each element dispatches" {
+    let src = "fn mock() -> Handler[IO] \{\n    handler IO \{\n        fn print(msg: Str) \{\n            io.println(\"[H] \{msg}\")\n        }\n    }\n}\nfn main() \{\n    let handlers: List[Handler[IO]] = [mock(), mock()]\n    for h in handlers \{\n        with h \{\n            io.println(\"spec\")\n        }\n    }\n}\n"
+    let r = compile_and_run(src, "rh7rhf_spec_list")
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out.split("[H] spec").len(), 3)
+}
+
+// In-corpus, so `task test` compiles both shapes on every run rather than only inside a helper.
+test "handler Option and for-in shapes compile in the corpus" {
+    let o = Some(mk_io())
+    with o.unwrap() {
+        io.println("[corpus] via option")
+    }
+    // HOMOGENEOUS deliberately. This row first read `[mk_io(), mk_metrics()]` — two DIFFERENT
+    // effects in one list literal — and it compiled, ran, and dispatched `io.println` through the
+    // Metrics vtable by slot index. That is br f5k3jk (P0): list-literal elements are not
+    // type-checked at all, so the literal launders a handler across effects the way br 88sfaz's
+    // typevar did. Not this ticket's cell, and not a shape to leave in a passing test.
+    let hs = [mk_io(), mk_io()]
+    assert_eq(hs.len(), 2)
+    for h in hs {
+        with h {
+            io.println("[corpus] loop")
+        }
+    }
+    let om = Some(mk_metrics())
+    with om.unwrap() {
+        metrics.counter("corpus", 9)
+    }
+}
+
+// ── Regression pins ─────────────────────────────────────────────────────────────────
+//
+// The container shapes that br t7xf9y and br resqj9 already fixed. Pinned here because this ticket
+// changes the tag those paths ALSO spell their carriers from — a wrong arm would break them, and they
+// are the closest working neighbours to the rows above.
+
+test "the operand forms fixed by the sibling tickets still dispatch" {
+    let src = "type Env \{ h: Handler[IO] }\nfn mk() -> Handler[IO] \{\n    handler IO \{\n        fn print(msg: Str) \{\n            io.println(\"[H] \{msg}\")\n        }\n    }\n}\nfn take(h: Handler[IO]) \{\n    with h \{\n        io.println(\"param\")\n    }\n}\nfn main() \{\n    let e = Env\{h: mk()}\n    with e.h \{\n        io.println(\"from field\")\n    }\n    with mk() \{\n        io.println(\"direct\")\n    }\n    take(e.h)\n}\n"
+    let r = compile_and_run(src, "rh7rhf_pins")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("[H] from field"))
+    assert(r.out.contains("[H] direct"))
+    assert(r.out.contains("[H] param"))
+}
+
+// `c_type_tag` is NOT Option-local: its output is a segment in Result, Map, Tuple and mono-instance
+// names too, so adding an arm changes spellings wherever a handler appears as a type argument. br
+// bwyfy1 is the precedent for taking that seriously — "collapsing it to one RULE broke 296 fixtures
+// and was reverted". This row exercises the neighbouring Result carrier so the churn is measured by
+// a test rather than assumed away.
+test "a handler in a Result carrier unwraps and dispatches" {
+    let src = "fn mk() -> Handler[IO] \{\n    handler IO \{\n        fn print(msg: Str) \{\n            io.println(\"[H] \{msg}\")\n        }\n    }\n}\nfn get() -> Result[Handler[IO], Str] \{\n    Ok(mk())\n}\nfn main() \{\n    let r = get()\n    with r.unwrap() \{\n        io.println(\"from result\")\n    }\n}\n"
+    let r = compile_and_run(src, "rh7rhf_result")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("[H] from result"))
+}
+
+// ── Parked: a container-RETRIEVED handler element, br 1mw2c3 ─────────────────────────
+//
+// PARKED, NOT DELETED. Both shapes below still fail, and they fail for a mechanism this ticket does
+// not touch, so they belong to br 1mw2c3 and come back into the corpus when it closes:
+//
+//     fn main() {
+//         let hs = [mk()]
+//         with hs.get(0).unwrap() { io.println("from list") }     // List
+//         let m: Map[Str, Handler[IO]] = Map()
+//         m.insert("k", mk())
+//         with m.get("k").unwrap() { io.println("from map") }     // Map, identical failure
+//     }
+//
+//     error: assignment to 'blink_io_vtable *' from 'int64_t' makes pointer from integer without a cast
+//         __ev_with_1.io = _ounw_4.value;
+//
+// THE DISTINCTION IS THE WHOLE POINT of splitting them out, and it is worth stating because
+// `hs.get(0).unwrap()` LOOKS like the Option rows at the top of this file. It is not: the retrieval
+// site never asks a tag speller at all. `List.get`'s element-CT arm chain
+// (codegen_methods.bl:1436-1634) re-derives the carrier from a flat element CT and its final `else`
+// hardcodes CT_INT, so the Option is spelled `blink_Option_int` before any unwrap happens. Giving
+// `c_type_tag` its CT_HANDLER arm cannot reach a site that does not consult it — which is exactly
+// why `Some(mk())` and `for h in hs` now work while these two do not. Same visible symptom, two
+// unrelated causes, and the for-in row above is the control that proves it: it also goes through a
+// `List[Handler[IO]]`, and it passes.
+//
+// Note the value SURVIVES numerically here (an int64_t holds the pointer), so a cast would silence
+// cc while leaving the element type erased downstream. 1mw2c3 says to fix the tag, not the cast.
