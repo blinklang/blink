@@ -79,10 +79,10 @@ import codegen_types.{
     struct_reg_names, struct_reg_set, struct_result_c_type, sv_tp, tp_from_ann,
     type_int, type_string, type_struct, type_list, type_option, type_result, type_map, type_set, type_iterator,
     set_list_elem_option_tp, set_list_elem_result_tp, list_elem_unspellable,
-    stamp_list_elem_from_tid, stamp_binder_from_tid, stamp_binder_from_binder_tid, stamp_binder_elems_from_tid_if_unset, map_val_carrier_from_recv, MapValCarrier,
+    stamp_list_elem_from_tid, stamp_list_elem_from_list_tid, stamp_binder_from_tid, stamp_binder_from_binder_tid, stamp_binder_elems_from_tid_if_unset, map_val_carrier_from_recv, MapValCarrier,
     map_pair_from_recv, MapPairTid,
     split_result_compound, CompoundSplit, map_struct_scalar_kv, MapKvCt, typedef_tag_or_empty, tp_child1_kind, tp_child1_sname, tp_child2_kind, tp_child2_sname,
-    tp_get_kind, tp_get_child1, tp_get_child2, tp_get_sname, type_from_name, type_from_name_tag,
+    tp_get_kind, tp_get_child1, tp_get_child2, tp_get_sname, tp_display, get_var_tp, type_from_name, type_from_name_tag,
     type_name_from_ct, type_where_preds, cg_where_self_var, is_compound_tag, var_enums,
     list_named_elem_of, named_elem_of_elem_tid, ListNamedElem,
     get_var_iter_carrier,
@@ -8483,6 +8483,43 @@ fn emit_mono_fn_def(fn_node: Int, concrete_args: Str, arg_tids: List[Int]) ! Cod
                                 set_list_elem_map_ann(pname, elem_ann)
                             }
                             let _ = set_list_elem_compound_ann(pname, elem_ann, elem_ct)
+                            // br ee99gs: every branch above spells the element from the
+                            // ANNOTATION, and only its OUTER name goes through
+                            // resolve_tparam_via_tid — a COMPOUND element's inner is read raw
+                            // (set_list_elem_compound_ann → deep_tp_from_ann on the `T` node). So a
+                            // mono instance of `xs: List[Option[T]]` bound its element as an Option
+                            // over nothing and every read of it emitted the undefined
+                            // `blink_Option_void`; `List[Result[T, Str]]` emitted
+                            // `blink_Result_void_str` and returned it where a `Result_int_str` was
+                            // expected. The tid does carry T substituted once it is rewritten
+                            // through THIS instance's binder, and the ladder spells every element
+                            // kind faithfully or declines whole — so it LEADS here and the
+                            // annotation's answer survives only where it declines, the same
+                            // ordering the let-binding ladders use (br bef42x). tparams_sl/arg_tids
+                            // are passed explicitly because cg_mono_* is not switched to this
+                            // instance until emit_fn_body, further down.
+                            //
+                            // The PARAM node, not its annotation, is where typecheck publishes the
+                            // resolved type; the annotation carries a tid only for the shapes that
+                            // walk it, so it is the fallback. Same rule params_measure states.
+                            let mut praw = tc_lookup_node_tid(p)
+                            if praw < 0 { praw = tc_lookup_node_tid(ta) }
+                            // Records what the annotation had already written, so a corpus sweep can
+                            // tell the three outcomes apart: the stamp declined (the annotation still
+                            // governs), it agreed, or it OVERRODE. Only the third is a behavior
+                            // change, and it is the one that has to be attributed shape by shape.
+                            //
+                            // tp_display of the WHOLE var type, not the (ct, sname) pair the stamp
+                            // returns: a compound element's inner lives in tp_id, so `List[Option[T]]`
+                            // and `List[Option[Int]]` both read back as ct=CT_OPTION with an empty
+                            // sname and the pair cannot tell them apart — which is the exact defect
+                            // being measured.
+                            let mono_tracing = dbg_channel_on("monoparam")
+                            let pre_tp = if mono_tracing != 0 { tp_display(get_var_tp(pname)) } else { "" }
+                            let st = stamp_list_elem_from_list_tid(tc_tid_subst_mono(tc_tid_resolved(praw), tparams_sl, arg_tids), pname)
+                            if mono_tracing != 0 {
+                                dbg_trace("monoparam", "fn={mangled} param={pname} declined={st.ct} pre={pre_tp} post={tp_display(get_var_tp(pname))}")
+                            }
                         }
                     }
                 }

@@ -15206,6 +15206,99 @@ fn tc_scalar_tid_from_name(name: Str) -> Int {
     -1
 }
 
+// br ee99gs: bind a type param that sits at ANY DEPTH in a parameter's annotation, by walking
+// the annotation tree and the argument's tid in lockstep.
+//
+// Every arm of the ladder below reads exactly ONE level — `List[T]` off inner1, `Map[K, _]` /
+// `Result[_, E]` off inner1/inner2, one bespoke case for `List[(.., T, ..)]`. So a param named
+// two levels down bound nothing and reached monomorphization as BLINK_I0001_erased_slot, making
+// every such signature uncallable: `List[Set[T]]` (the ticket's shape), and equally
+// `List[Option[T]]`, `List[Result[T, E]]`, `List[List[T]]`, `List[Map[K, V]]`, `Map[K, List[V]]`,
+// `Option[List[T]]`. This is the plan's thesis on the INFERENCE side: a fixed set of one-level
+// readers cannot express depth >= 2, and the cure is the same one — walk the structured tid
+// rather than hand-write a cell per (head x slot). tc_tid_child indexes inner1 / inner2 / the
+// params slice uniformly, in the same order the parser puts an annotation's `elements` in, which
+// is what makes the lockstep walk a dozen lines instead of a ladder.
+//
+// It runs as the LAST resort, after every arm has declined, so it only ADDS answers: no slot an
+// arm already resolved is re-decided, the struct/enum arms' deliberate hard -1 still fires first,
+// and the Fn arm's own hard -1 (br 3ejrqa) is never reached from here.
+//
+// Three guards, each load-bearing:
+//   - descend only into a child annotation that actually NAMES the param, so an unrelated
+//     sibling slot cannot supply a binding;
+//   - descend only when the annotation's head agrees with the tid's KIND, or an `Option[T]`
+//     annotation against a `List[Int]` argument would bind T to the list's element;
+//   - return only an ENCODABLE tid (tc_struct_slot_encodable), which is what keeps a typevar or
+//     unknown from being spelled into a mono name — the same gate the struct and tuple arms use.
+// Last-match-wins for a param named in several slots, matching tc_struct_param_binds' rule.
+fn tc_tparam_tid_from_ann(ann: Int, tid: Int, param_name: Str) -> Int {
+    if ann == -1 || tid < 0 { return -1 }
+    if node_name(ann) == param_name {
+        if tc_struct_slot_encodable(tid) { return tid }
+        return -1
+    }
+    let elems_sl = node_elements(ann)
+    if elems_sl == -1 { return -1 }
+    if tc_ann_head_matches_tid(ann, tid) == false { return -1 }
+    let n = sublist_length(elems_sl)
+    let mut found = -1
+    let mut i = 0
+    while i < n {
+        let child_ann = sublist_get(elems_sl, i)
+        if tc_ann_mentions_param(child_ann, param_name) {
+            let r = tc_tparam_tid_from_ann(child_ann, tc_tid_child(tid, i), param_name)
+            if r >= 0 { found = r }
+        }
+        i = i + 1
+    }
+    found
+}
+
+// Whether a type annotation's head names the same constructor the tid's kind does.
+//
+// TyKind.Fn is deliberately `false`: an Fn annotation stores its params in `elements` and its
+// RETURN in `type_ann`, so the element-index-to-child-index alignment tc_tparam_tid_from_ann
+// relies on does not hold there, and that shape has its own arm. Enumerated rather than closed
+// with a wildcard so a kind that gains an annotation spelling has to be decided here.
+fn tc_ann_head_matches_tid(ann: Int, tid: Int) -> Bool {
+    let nm = node_name(ann)
+    match tc_tid_kind(tid) {
+        TyKind.List => nm == "List"
+        TyKind.Set => nm == "Set"
+        TyKind.Map => nm == "Map"
+        TyKind.Option => nm == "Option"
+        TyKind.Result => nm == "Result"
+        TyKind.Tuple => nm == "Tuple"
+        TyKind.Struct => strip_module_qualifier(tc_tid_name(tid)) == nm
+        TyKind.Enum => strip_module_qualifier(tc_tid_name(tid)) == nm
+        TyKind.Fn => false
+        TyKind.Int => false
+        TyKind.Float => false
+        TyKind.Bool => false
+        TyKind.Str => false
+        TyKind.Void => false
+        TyKind.Bytes => false
+        TyKind.StringBuilder => false
+        TyKind.Typevar => false
+        TyKind.Unknown => false
+        TyKind.Iterator => false
+        TyKind.Handle => false
+        TyKind.Channel => false
+        TyKind.Ptr => false
+        TyKind.Template => false
+        TyKind.FfiScope => false
+        TyKind.I8 => false
+        TyKind.I16 => false
+        TyKind.I32 => false
+        TyKind.U8 => false
+        TyKind.U16 => false
+        TyKind.U32 => false
+        TyKind.U64 => false
+        TyKind.Char => false
+    }
+}
+
 // Return the concrete arg tid this type-param resolves to, or -1 when no argument
 // position can supply it. Since br 3fc3pn this is the SOLE resolver: the whole mono CSV
 // is rendered from the tids it produces, so "the segment" is by definition
@@ -15383,6 +15476,9 @@ fn tc_resolve_tparam_tid(param_name: Str, fn_params_sl: Int, args_sl: Int, binds
                 return -1
             }
         }
+        // br ee99gs: the arms above all read one level. Anything deeper falls to here.
+        let deep = tc_tparam_tid_from_ann(node_type_ann(p), arg_tid, param_name)
+        if deep >= 0 { return deep }
         fi = fi + 1
     }
     -1

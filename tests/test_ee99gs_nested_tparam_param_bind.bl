@@ -1,0 +1,150 @@
+// br ee99gs — a type param must bind from an argument no matter how DEEP it sits in the
+// parameter's annotation.
+//
+// `tc_resolve_tparam_tid` is a hand-written arm per (annotation head x slot the param occupies),
+// and every arm reads exactly ONE level: `List[T]` (inner1), `Map[K, _]` / `Map[_, V]`,
+// `Option[T]`, `Result[T, _]` / `Result[_, E]`, plus one special case for `List[(.., T, ..)]`.
+// Nothing recurses. So the param binds at depth 1 and is unsolved at depth 2 — the plan's thesis
+// ("the flat pair represents depth 1") showing up on the INFERENCE side rather than in codegen:
+//
+//     internal compiler error[UnsolvedTypeVarAtCodegen]: type parameter of fn 'f' reached
+//     monomorphization unsolved (mono args 'BLINK_I0001_erased_slot')
+//
+// It is loud, and it is loud twice: the mangled call site literally contains the placeholder
+// (`blink_f_BLINK_I0001_erased_slot(d)`), and a Set element then ICEs again at the for-in because
+// the erased instance never stamped one. So this is fail-closed, not a miscompile — but it makes
+// every one of these signatures uncallable.
+//
+// The ticket named `List[Set[T]]`. It is not Set-specific and not List-specific: EVERY depth-2
+// nesting fails the same way, including `List[Option[T]]` whose two arms both exist and both read
+// one level. Set is only the kind that ICEs a second time on the way out.
+//
+// The controls at the bottom are the depth-1 shapes that already bind, plus the one depth-2 shape
+// that already had a bespoke arm (`List[(Str, T)]`). They must keep working: this fix adds
+// answers where there were none, it does not re-decide a slot some arm already resolved.
+
+type Pt { x: Int, y: Int }
+
+// ── Depth 2 ───────────────────────────────────────────────────────────────────────
+
+fn first_set[T](xs: List[Set[T]]) -> Set[T] { xs.get(0).unwrap() }
+
+fn first_opt[T](xs: List[Option[T]]) -> Option[T] { xs.get(0).unwrap() }
+
+fn first_res[T](xs: List[Result[T, Str]]) -> Result[T, Str] { xs.get(0).unwrap() }
+
+fn first_list[T](xs: List[List[T]]) -> List[T] { xs.get(0).unwrap() }
+
+fn map_count[K, V](xs: List[Map[K, V]]) -> Int { xs.get(0).unwrap().len() }
+
+fn val_count[K, V](m: Map[K, List[V]], k: K) -> Int { m.get(k).unwrap().len() }
+
+fn opt_list_len[T](o: Option[List[T]]) -> Int { o.unwrap().len() }
+
+// ── Depth 3 ───────────────────────────────────────────────────────────────────────
+
+fn deep_set[T](xs: List[List[Set[T]]]) -> Set[T] { xs.get(0).unwrap().get(0).unwrap() }
+
+// ── Controls: the shapes that already bind ─────────────────────────────────────────
+
+fn d1_list[T](xs: List[T]) -> Int { xs.len() }
+
+fn d1_map[K, V](m: Map[K, V]) -> Int { m.len() }
+
+fn d1_opt[T](o: Option[T]) -> Int { if o.is_some() { 1 } else { 0 } }
+
+fn tuple_slot[T](cases: List[(Str, T)]) -> Int { cases.len() }
+
+// ── The rows ──────────────────────────────────────────────────────────────────────
+
+test "a type param under List[Set[T]] binds from the argument" {
+    let s: Set[Int] = Set()
+    s.insert(3)
+    s.insert(4)
+    let d: List[Set[Int]] = [s]
+    let mut total = 0
+    for x in first_set(d) { total = total + x }
+    assert_eq(total, 7)
+}
+
+test "a type param under List[Set[T]] binds at a second element type too" {
+    let s: Set[Str] = Set()
+    s.insert("aa")
+    s.insert("b")
+    let d: List[Set[Str]] = [s]
+    let mut total = 0
+    for x in first_set(d) { total = total + x.len() }
+    assert_eq(total, 3)
+}
+
+test "a type param under List[Option[T]] binds from the argument" {
+    let d: List[Option[Str]] = [Some("hello")]
+    assert_eq(first_opt(d).unwrap(), "hello")
+
+    let dp: List[Option[Pt]] = [Some(Pt { x: 1, y: 9 })]
+    assert_eq(first_opt(dp).unwrap().y, 9)
+}
+
+test "a type param under List[Result[T, E]] binds from the argument" {
+    let d: List[Result[Int, Str]] = [Ok(12)]
+    assert_eq(first_res(d).unwrap(), 12)
+}
+
+test "a type param under List[List[T]] binds from the argument" {
+    let inner: List[Str] = ["aa", "b"]
+    let d: List[List[Str]] = [inner]
+    let mut n = 0
+    for s in first_list(d) { n = n + s.len() }
+    assert_eq(n, 3)
+}
+
+test "both type params under List[Map[K, V]] bind from the argument" {
+    let m: Map[Str, Int] = Map()
+    m.insert("k", 5)
+    m.insert("j", 6)
+    let d: List[Map[Str, Int]] = [m]
+    assert_eq(map_count(d), 2)
+}
+
+test "a type param under Map[K, List[V]] binds from the argument" {
+    let m: Map[Str, List[Int]] = Map()
+    let v: List[Int] = [1, 2, 3]
+    m.insert("k", v)
+    assert_eq(val_count(m, "k"), 3)
+}
+
+test "a type param under Option[List[T]] binds from the argument" {
+    let l: List[Str] = ["a", "b", "c"]
+    let o: Option[List[Str]] = Some(l)
+    assert_eq(opt_list_len(o), 3)
+}
+
+test "a type param three levels down binds from the argument" {
+    let s: Set[Int] = Set()
+    s.insert(10)
+    s.insert(11)
+    let mid: List[Set[Int]] = [s]
+    let d: List[List[Set[Int]]] = [mid]
+    let mut total = 0
+    for x in deep_set(d) { total = total + x }
+    assert_eq(total, 21)
+}
+
+// ── Controls ──────────────────────────────────────────────────────────────────────
+
+test "the depth-1 shapes that already bound still bind" {
+    let l: List[Int] = [1, 2, 3]
+    assert_eq(d1_list(l), 3)
+
+    let m: Map[Str, Int] = Map()
+    m.insert("k", 1)
+    assert_eq(d1_map(m), 1)
+
+    let o: Option[Str] = Some("q")
+    assert_eq(d1_opt(o), 1)
+}
+
+test "the bespoke List of tuple slot arm still binds" {
+    let cases: List[(Str, Int)] = [("a", 1), ("b", 2)]
+    assert_eq(tuple_slot(cases), 2)
+}

@@ -72,7 +72,7 @@ import diagnostics.{
     WITH_PTR_BODY_TOO_COMPLEX, FFI_SCOPE_NOT_WITH_RESOURCE,
     ICE_SEG_ERASED_SLOT,
 }
-import ast.{NodeKind, is_block_bearing}
+import ast.{NodeKind, is_block_bearing, dbg_trace, dbg_channel_on}
 import typecheck.{sv_ty_or_flat, tc_channel_elem_ct, tc_channel_elem_struct, tc_lookup_node_tid, tc_tid_ct, tc_tid_struct, tc_tid_struct_mono_name, tc_tid_tuple_sname, tc_tid_list_elem, tc_seg_from_tid, tc_type_str, is_import_module_name, tc_qualifier_to_module_or_self, suggest_module_member}
 
 // Arg offset for trait-qualified builtin calls: MapOps.contains_key(m, k) has receiver at args[0]
@@ -1102,8 +1102,15 @@ pub fn copy_list_compound_elem(src: Str, dst: Str) {
     // the source even carries a tid to copy.
     sv_ty_or_flat(src, "copy_list_compound_elem.src")
     let elem_ct = get_list_elem_type(src)
+    // Stage 3 question, and the only one that decides whether the body can go: this copy is
+    // load-bearing ONLY where it writes an element that stamp_list_elem_from_tid then declines to
+    // overwrite. Both codegen_stmt callers run the stamp immediately after, and the stamp spells
+    // every element kind faithfully or not at all — so `arm=` here with no `stamp ... var={dst}`
+    // line after it is the whole load-bearing set. Keyed on dst so the two lines join by name.
+    let tracing = dbg_channel_on("listelem")
     if elem_ct == CT_OPTION {
         let oi_tp = get_list_elem_option_inner_tp(src)
+        if tracing != 0 { dbg_trace("listelem", "copy var={dst} arm=option elem_ct={elem_ct} deep_tp={oi_tp}") }
         if oi_tp >= 0 {
             set_list_elem_option_tp(dst, oi_tp)
         } else {
@@ -1112,6 +1119,7 @@ pub fn copy_list_compound_elem(src: Str, dst: Str) {
     } else if elem_ct == CT_RESULT {
         let rok_tp = get_list_elem_result_ok_tp(src)
         let rerr_tp = get_list_elem_result_err_tp(src)
+        if tracing != 0 { dbg_trace("listelem", "copy var={dst} arm=result elem_ct={elem_ct} deep_tp={rok_tp}") }
         if rok_tp >= 0 && rerr_tp >= 0 {
             set_list_elem_result_tp(dst, rok_tp, rerr_tp)
         } else {
@@ -1120,12 +1128,14 @@ pub fn copy_list_compound_elem(src: Str, dst: Str) {
     } else if elem_ct == CT_MAP {
         let mk_tp = get_list_elem_map_key_tp(src)
         let mv_tp = get_list_elem_map_val_tp(src)
+        if tracing != 0 { dbg_trace("listelem", "copy var={dst} arm=map elem_ct={elem_ct} deep_tp={mv_tp}") }
         if mk_tp >= 0 && mv_tp >= 0 {
             set_list_elem_map_tp(dst, mk_tp, mv_tp)
         } else {
             set_list_elem_map_types(dst, get_list_elem_map_key_type(src), get_list_elem_map_val_type(src), get_list_elem_map_val_struct(src))
         }
     } else if elem_ct == CT_SET || elem_ct == CT_LIST || elem_ct == CT_STRUCT {
+        if tracing != 0 { dbg_trace("listelem", "copy var={dst} arm=no_arm elem_ct={elem_ct} deep_tp=-1") }
         // THE MISSING ARMS — three of the open 03p551 cells, verbatim. A List[Set[..]],
         // List[List[..]] or List[(..)] element type is silently NOT copied here, so the deep
         // element dies with the source variable. Counting the reaches (behaviour unchanged:

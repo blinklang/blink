@@ -7101,6 +7101,240 @@ guesses — the same asymmetry `mv45y5` created when it made `sv_tp`'s `CT_SET` 
 reason `Set` keeps turning up as the kind that tells you it is broken.
 
 
+## A type param two levels down bound nothing, in three places (br `ee99gs`)
+
+Entered not from the census but from the Stage 3 unit above it. The plan's line *"Replace
+`copy_list_compound_elem` with `set_var_ty(dst, get_var_ty(src))`"* has one position where the copy is
+genuinely load-bearing — an **abstract generic body**, where `deep_tp_from_tid` declines by contract
+because the element's inner is a typevar. Constructing that position to measure it is what turned up
+this ticket: **every** signature that puts a type param two levels down was uncallable, so the
+position could not be reached by any compiling program. The blocker had to go first.
+
+### The ticket was Set-shaped. The defect was not.
+
+`ee99gs` reads *"Generic fn param `List[Set[T]]` fails to solve T at call site"*, and both the title
+and the MVCE point at Set. An isolation matrix says otherwise — every row is `fn f[T](p: <shape>)`
+with a real call site, because an **uncalled** generic fn never monomorphizes and answers "ok" no
+matter how broken its binder is:
+
+| parameter shape | before | after |
+|---|---|---|
+| `List[T]`, `Map[K, V]`, `Option[T]` | binds | binds |
+| `List[(Str, T)]` | binds (bespoke arm) | binds |
+| `List[Set[T]]` | **`BLINK_I0001_erased_slot`** | binds |
+| `List[Option[T]]` | **`BLINK_I0001_erased_slot`** | binds |
+| `List[Result[T, Str]]` | **`BLINK_I0001_erased_slot`** | binds |
+| `List[List[T]]` | **`BLINK_I0001_erased_slot`** | binds |
+| `List[Map[K, V]]` | **`BLINK_I0001_erased_slot`** | binds |
+| `Map[K, List[V]]` | **`BLINK_I0001_erased_slot`** | binds |
+| `Option[List[T]]` | **`BLINK_I0001_erased_slot`** | binds |
+| `List[List[Set[T]]]` (depth 3) | **`BLINK_I0001_erased_slot`** | binds |
+
+Depth 1 binds. Depth 2 binds nothing, for every head, in every slot. Set is only the kind that ICEs a
+*second* time on the way out, which is what made the ticket look kind-specific. A second parameter
+mentioning the same param at depth 1 rescues the whole signature — which is the giveaway that this is
+about how far the reader descends, not about what it finds there.
+
+This is the plan's thesis on the **inference** side rather than in codegen: a fixed set of one-level
+readers cannot express depth >= 2, and the cure is the same one — walk the structured tid instead of
+hand-writing a cell per (head x slot).
+
+### Half one: `tc_resolve_tparam_tid` is a cell per (head x slot), and every cell reads one level
+
+`src/typecheck.bl:15325`. The body is an arm per annotation head crossed with the slot the param
+occupies: `List[T]` off `inner1`; `Map[K, _]` / `Map[_, V]` off `inner1` / `inner2`; `Option[T]`;
+`Result[T, _]` / `Result[_, E]`; a bespoke case for `List[(.., T, ..)]`; hard `-1` for struct, enum and
+`Fn` heads. **Nothing recurses.** A param one level further in matched no arm, so the slot arrived at
+monomorphization as `BLINK_I0001_erased_slot` and the mangled symbol carried the placeholder
+verbatim: `blink_first_1set_BLINK_I0001_erased_slot(d)`.
+
+The replacement is a lockstep walk of the annotation tree and the argument's tid:
+
+```blink
+fn tc_tparam_tid_from_ann(ann: Int, tid: Int, param_name: Str) -> Int {
+    if ann == -1 || tid < 0 { return -1 }
+    if node_name(ann) == param_name {
+        if tc_struct_slot_encodable(tid) { return tid }
+        return -1
+    }
+    let elems_sl = node_elements(ann)
+    if elems_sl == -1 { return -1 }
+    if tc_ann_head_matches_tid(ann, tid) == false { return -1 }
+    ...
+        if tc_ann_mentions_param(child_ann, param_name) {
+            let r = tc_tparam_tid_from_ann(child_ann, tc_tid_child(tid, i), param_name)
+            if r >= 0 { found = r }
+        }
+    ...
+}
+```
+
+It is a dozen lines only because `tc_tid_child(tid, i)` indexes `inner1` / `inner2` / the params
+slice **in the same order the parser puts an annotation's `elements` in**. That alignment is the whole
+reason the ladder was never needed. `TyKind.Fn` is the one exception — an `Fn` annotation stores its
+params in `elements` and its return in `type_ann` — so `tc_ann_head_matches_tid` answers `false` for
+it and the existing arm keeps that shape. The match enumerates all 29 kinds rather than closing with a
+wildcard, so a kind that later gains an annotation spelling has to be decided here.
+
+Three guards, each load-bearing:
+
+* **Descend only into a child that actually names the param** (`tc_ann_mentions_param`), so an
+  unrelated sibling slot cannot supply a binding.
+* **Descend only when the annotation's head agrees with the tid's kind.** Without it an
+  `Option[T]` annotation against a `List[Int]` argument would bind `T` to the list's element — the
+  positional walk has no other way to notice that the two trees have diverged.
+* **Return only an encodable tid** (`tc_struct_slot_encodable`), which is what keeps a typevar or an
+  unknown from being spelled into a mono name. The same gate the struct and tuple arms already use.
+
+Wired as the **last** resort, after every arm has declined, so it only *adds* answers: no slot an arm
+already resolved is re-decided, the struct/enum arms' deliberate hard `-1` still fires first, and the
+`Fn` arm's own hard `-1` (br `3ejrqa`) is never reached from here. Last-match-wins for a param named in
+several slots, matching `tc_struct_param_binds`.
+
+That took the test from 13 ICEs to 3.
+
+### Half two: the generic-fn return ladder had no `CT_SET` arm
+
+The remaining 3 were one shape, and the ticket had predicted it: *"which then ICEs a second time at
+the for-in (`SetElementTypeUnknownAtCodegen`)"*.
+
+```
+internal compiler error[SetElementTypeUnknownAtCodegen]: for-in over Set variable
+  'blink_first_1set_0Int(d)' has no element type recorded at codegen
+```
+
+The mangled name in that message is itself the proof half one landed — `_0Int`, not
+`_0BLINK_1I0001_1erased_1slot`. What remained was `emit_generic_fn_call_tail`
+(`src/codegen_expr.bl:3630`), whose return ladder has an arm for `CT_OPTION`, `CT_RESULT`, `CT_LIST`,
+`CT_MAP`, a rerouted `CT_STRUCT`, and `CT_VOID`-as-tuple-or-struct — and **none for `CT_SET`**. A
+generic fn returning `-> Set[T]` published no element to its caller at all.
+
+The arm reads the **call node's memoized tid**, not the return annotation the way its `CT_LIST` and
+`CT_MAP` siblings read theirs, because the annotation names the type *param* (`Set[T]`) while
+typecheck has already substituted `T` on the call node:
+
+```blink
+} else if ret_type == CT_SET {
+    recover_set_elem_from_tid(node, "{c_fn_name(mangled)}({call_args})")
+}
+```
+
+Keyed on the call string because that is what `expr_result_str` becomes a few lines below, and what the
+for-in lowering looks the element up by. `recover_set_elem_from_tid` declines whole on a tid that
+cannot name the element, so the arm only ever adds an answer, and it uses the `_resolved` accessors —
+an unannotated `Set()` inside the callee has a metavar element bound in place by a later `.insert`
+(br `mv45y5`).
+
+Deliberately *not* widened: a **bare-typevar** return `-> T` bound to a Set does not reroute
+(`rerouted` covers Option/Result/Map/struct only), so it is still unhandled. That is a different cell
+and it is not this ticket's MVCE.
+
+### Half three: what the ICEs were hiding
+
+An ICE means `blinkc` exits 101 **without writing any C**. So the moment the two halves above stopped
+firing, a third defect appeared that had been invisible the whole time — not a regression, an
+uncovering:
+
+```c
+blink_Option_Option_void _lget_1;                       /* in blink_first_1opt_0Pt */
+_lget_1.value = (blink_Option_void*)blink_list_get(xs, _lgi_0);
+blink_Option_void _ounv_3 = *_ounw_2.value;             /* undefined type */
+...
+return _ounv_3;   /* returning blink_Result_void_str where blink_Result_int_str expected */
+```
+
+`emit_mono_fn_def` binds a `List` param's element from the **annotation** (`src/codegen_stmt.bl:8430`),
+and only the element's *outer* name goes through `resolve_tparam_via_tid`. A compound element's inner
+is read raw: `set_list_elem_compound_ann` calls `deep_tp_from_ann` on the `T` node, which knows nothing
+about this instance's binder. So the mono instance of `xs: List[Option[T]]` bound its element as an
+Option over nothing, and every read of it spelled the undefined `blink_Option_void`; `List[Result[T,
+Str]]` spelled `blink_Result_void_str` and returned it where a `blink_Result_int_str` was expected.
+
+The tid does carry `T` substituted, once rewritten through this instance's binder, and
+`stamp_list_elem_from_list_tid` is the complete ladder — it spells every element kind faithfully or
+declines whole. So it **leads** and the annotation's answer survives only where it declines, the same
+ordering the let-binding ladders use (br `bef42x`):
+
+```blink
+let mut praw = tc_lookup_node_tid(p)
+if praw < 0 { praw = tc_lookup_node_tid(ta) }
+stamp_list_elem_from_list_tid(tc_tid_subst_mono(tc_tid_resolved(praw), tparams_sl, arg_tids), pname)
+```
+
+Two details cost a regen each to find:
+
+* **`tparams_sl` / `arg_tids` are passed explicitly.** The `cg_mono_*` globals that
+  `stamp_list_elem_from_tid` reads are not switched to this instance until `emit_fn_body`, ~150 lines
+  further down. Using the node-taking wrapper here substitutes against the *enclosing* context.
+* **The tid lives on the PARAM node, not on its annotation.** The annotation carries a tid only for
+  the struct-instance shapes that walk it; the first attempt read `node_type_ann(p)` and every event
+  traced `ect=-1 arm=bail_unnameable`. `params_measure` states the rule five thousand lines away and
+  it is now stated here too.
+
+### Measurement
+
+The new mono-param stamp is an authority flip in miniature, so it is instrumented rather than asserted.
+A `monoparam` channel records what the annotation had already written next to what the stamp decided,
+which separates the three outcomes that matter: **DECLINED** (the annotation still governs), **AGREED**,
+and **OVERRODE** — only the third is a behavior change.
+
+Corpus (`tests/` + `examples/` + `src/` + `lib/std/` + `lib/pkg/`), **both build modes**, archive-linked
+via `blink build --emit c` and monolithic via `blinkc`:
+
+| verdict | archive-linked | monolithic |
+|---|---|---|
+| DECLINED (annotation still governs) | 0 | 0 |
+| AGREED | 44 | 44 |
+| **OVERRODE** | **6** | **6** |
+| total events | 50 | 50 |
+
+**The two modes agree row for row** — same 50 events, same verdicts, same types. Five of the six
+overrides are the new test. The sixth is the interesting one, and it is **pre-existing**:
+
+```
+tests/test_1n9fhg_list_named_elem_iterator.bl  list_1fold_0List_0Int
+    List[List[Int]]  ->  List[List[Str]]
+```
+
+`ll: List[List[Str]]` through the stdlib's `list_fold[T, A]`, T bound to a List. The annotation path
+had the nested element as **`Int`** — not "unknown", `Int` — because `set_list_elem_compound_ann` never
+reached it and `sv_tp(CT_LIST, -1, -1, "")` answers `type_list(type_int())`. That is confirmation #1 of
+the plan (*"`sv_tp` fabricates types when a flat slot is `-1`"*) caught live, in a passing test, on a
+shape nobody filed: the row asserts `a + v.len()`, and a list's `.len()` does not depend on its element
+type, so the fabricated `Int` was never observed. It is corrected now, and it is the reason this stamp
+is instrumented rather than asserted — a sweep that only counted "did it fire" would have called this
+seam clean.
+
+One measurement note worth keeping, because the first sweep got it wrong: comparing the
+`ListElemStamp{ct, sname}` pair the stamp *returns* reports **all 50 events as AGREED**. A compound
+element's inner lives in `tp_id`, so `List[Option[Void]]` and `List[Option[Str]]` are both
+`ct=CT_OPTION, sname=""` — the pair cannot distinguish the defect from the fix. The tap has to render
+the whole var type (`tp_display(get_var_tp(pname))`) or it measures nothing. Same failure mode as
+`list_elem_unspellable`'s missing companion (br `bef42x`): a predicate written over the flat pool
+answers identically for a lost inner and a real one.
+
+`task ci` green unpiped, exit 0: **688 test files, 688 passed, 0 failed, 0 build errors**; fmt 1594
+passed, 0 failed, 88 skipped; per-module gen1-vs-gen2 byte-equal.
+
+`tests/test_ee99gs_nested_tparam_param_bind.bl` — 11 rows, written red first (13 ICEs), all green. It
+asserts **runtime values**, not just that the program compiles, because `task regen` proves self-host
+and not codegen (`feedback_self_host_doesnt_catch_user_codegen_bugs`) and two of the three halves here
+were wrong C that `cc` would have accepted in a slightly different shape. Verified green in **both**
+build modes: `build/blink` (archive-linked) and `build/blinkc` + `cc -Ibootstrap -lgc` (monolithic),
+11/11 each.
+
+One residual, and it is an existing cell rather than a new one. The depth-3 row stamps
+`List[List[Set[?]]]` — the innermost element is still unnamed, which is br `f9hgt9` (*"this carries only
+the KIND at 2 levels deep, not the inner container's OWN element at 3 levels deep"*, written on
+`stamp_list_elem_from_list_tid`'s own tail arm). The test row passes because the for-in recovers its
+element from the callee's **return** type, not from that channel. Not folded in.
+
+### What this unblocks
+
+The `copy_list_compound_elem` position the Stage 3 unit needs — an abstract generic body whose list
+element is a compound over a typevar — is now **reachable by a compiling program**. That measurement
+can proceed.
+
 ## Appendix — all 428 shape cells
 
 Format: `family | occurrences | tid | flat`.
