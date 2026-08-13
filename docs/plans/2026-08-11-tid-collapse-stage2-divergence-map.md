@@ -9626,10 +9626,88 @@ coverage that matters is the four pinned fixtures: `test_vmf1k0` 8/8, `test_5hta
 The call site carried a ~25-line comment naming six br tickets and narrating the measurement. That
 class of comment is now out of the source entirely: `br` is a local-only tracker, so an ID in a
 comment is dead weight to every other reader, and this codebase is training data for the language.
-The two files this cell touched went from 114 ticket references to 0, and `codegen_types.bl` from
-1953 comment lines to 1730 with no block over 22 lines. Reasoning goes here and to `br note`; the
+`codegen_types.bl` went from 1953 comment lines to 1730 with no block over 22 lines. Its ticket
+references were NOT driven to 0, contrary to what this section first claimed: the harvest regex
+required a digit in the token, so every all-letters ID (`htxpmh`, `hsgsbp`, `yavhwc`, `pdvrsj`, …)
+was invisible to it and 50 lines survived the sweep. Validate the candidate set against `br show`,
+not against a pattern. Reasoning goes here and to `br note`; the
 source keeps 1-4 lines naming the constraint. Every file touched from here gets the same treatment
 in the same commit.
+
+## The heap cell that was typed from the CT alone (br `0e7dek`)
+
+A local that a closure mut-captures is moved to a heap cell, and the cell holds a COPY of the
+variable — so the cell's C type is the variable's own declared C type, nothing else. Both seams that
+declare it derived it from the CT alone:
+
+    // codegen_stmt, enclosing scope
+    let cell_type = c_field_type_str(val_type, ...)
+    // codegen_closures, rehydration at the top of the closure body
+    let mc_ts = c_type_str(tp_get_kind(mc_e.tp_id))
+
+A CT cannot spell any kind whose C name needs a struct NAME or a carrier typedef. For a struct local
+both seams therefore answered `void`:
+
+    void* e_cell = (void*)blink_alloc(sizeof(void));   // sizeof(void)
+    *e_cell = e;                                       // invalid use of void expression
+
+### The predicate is wider than the report, and probing adjacent kinds is what found it
+
+The ticket named structs. Option, Result and Tuple fail through the identical derivation: all four
+need more than a CT to be spelled. An enum passes only because it is `int64_t`-backed, and the
+containers pass because `blink_list*` / `blink_map*` / `blink_set*` ARE the CT's whole answer. A
+whitelist of the reported shape would have left three live kinds behind — the same lesson as
+`pdvrsj`, applied before the fix rather than after it.
+
+One helper in `codegen_types.bl` now answers for both seams, so they cannot disagree:
+
+    pub fn capture_cell_c_type(tp_id: Int, tname: Str) -> Str
+
+Struct reads `tp_get_sname`; Option and Result go through `option_c_type_mixed` /
+`result_c_type_mixed`; everything else falls through to `c_field_type_str`, which carries the
+Void-position rule for the one caller that has the name. Tuples need no arm — a tuple is `CT_STRUCT`
+with the tuple typedef already in `sname`.
+
+### The third seam reads the cell by its emitted C string
+
+Fixing the two declarations still left 7 of 10 defect rows failing, with `let v = e.n` drawing
+`error: variable or field 'v' declared void`. The FieldAccess arm in `codegen_expr.bl` resolves its
+receiver's struct with `get_var_struct(obj_str)` — and `obj_str` is `(*e_cell)`, which is no scope
+var. Both ident rewrites now push the struct identity onto that exact string with
+`set_var_struct(expr_result_str, ...)`, the established idiom for attaching identity to an emitted
+expression.
+
+### The failure has two faces, and the second one names the type it cannot spell
+
+A direct field read fails at `cc`. A CONTAINER field instead fails earlier, as a spurious
+`error[UnresolvedMethod]` at typecheck time — and the diagnostic names the receiver `Set[Int]`
+correctly. The element type was known throughout; only the receiver spelling through the cell was
+broken. Both faces are in the row set.
+
+### Coverage
+
+`tests/test_0e7dek_mut_captured_struct_cell.bl`, 23 rows, subprocess harness — the failures are
+compile errors, so an in-file row could not be red without the whole test file failing to compile.
+10 defect rows (struct scalar / read inside the body / field assign / container field / nested /
+generic instance, tuple, Option, Option of struct, Result) and 13 controls (Int, Float, Str, U8,
+Char, Bool, List, Map, Set, Bytes, StringBuilder, enum, and a struct reassigned with NO closure at
+all, which pins that the `mut` reassignment was never the axis).
+
+Red 13/10 → 16/7 after the two cell declarations → **23/0** after the receiver identity.
+
+### Census
+
+The ctype instrument is neutral in both build modes: `diverge=43 missing=109`, 0 new cells (2030
+mono / 1831 archive-linked summary lines). The tydiv instrument MOVES for the first time in this
+stage — 30223 → **29932** diverge rows (−291), unknown 4785 → 4780, missing 80 unchanged — because
+the identity written onto the cell expression is exactly what that instrument was measuring as
+absent.
+
+### The byproduct
+
+A transitive mut-capture through a NESTED closure emits an undeclared name and a non-lvalue
+assignment. It reproduces for `Int` and `Str` alike, so it is not on the struct axis and not this
+cell; filed as br `063qcp` with both controls recorded (one nesting level, and read-only nesting).
 
 ## Appendix — all 428 shape cells
 

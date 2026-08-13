@@ -1,0 +1,307 @@
+// A local that a closure mut-captures is moved to a heap cell, and the cell's C type must be the
+// variable's OWN declared C type. It was derived from the CT alone, which cannot spell a kind whose
+// C name needs a struct NAME or a carrier typedef, so a struct / tuple / Option / Result cell came
+// out as `void*`:
+//
+//     void* e_cell = (void*)blink_alloc(sizeof(void));   // sizeof(void)
+//     *e_cell = e;                                       // invalid use of void expression
+//     int64_t _left = (int64_t)((*e_cell).n);            // member of something not a structure
+//
+// Every use of the variable then breaks in BOTH scopes — inside the closure and in the enclosing
+// function — and the failure surfaces two different ways: as a C-compiler error when a field is read
+// directly, and as a spurious UnresolvedMethod when the field is a container, because the receiver
+// spelling goes through the same cell. The scalar and container kinds were unaffected, which is why
+// the controls below pass on either compiler.
+//
+// Two seams spell the cell and they must agree: the declaration in the enclosing scope
+// (codegen_stmt) and the rehydration at the top of the closure body (codegen_closures). Fixing one
+// leaves the other emitting `void*` for the same object.
+//
+// Every row runs in a SUBPROCESS: the failures are compile errors, so an in-file row could not be
+// red — the whole test file would fail to compile.
+
+import std.process.{ProcessResult}
+
+fn run_src(tag: Str, src: Str) -> ProcessResult {
+    let bl_path = ".tmp/_0e7dek_{tag}.bl"
+    let bin = ".tmp/_0e7dek_{tag}"
+    write_file(bl_path, src)
+    let build = process_run("build/blink", ["build", bl_path, "-o", bin])
+    if build.exit_code != 0 {
+        shell_exec("rm -f {bl_path}")
+        return build
+    }
+    let r = process_run(bin, [])
+    shell_exec("rm -f {bl_path} {bin}")
+    r
+}
+
+fn expect_out(tag: Str, src: Str, want: Str) {
+    let r = run_src(tag, src)
+    if r.exit_code != 0 { io.println("FAIL[{tag}] exit={r.exit_code}\n{r.err}{r.out}") }
+    assert_eq(r.exit_code, 0)
+    if !r.out.contains(want) { io.println("FAIL[{tag}] want '{want}' in output, got: {r.out}") }
+    assert(r.out.contains(want))
+}
+
+// ── The struct-typed mut capture, in both scopes ─────────────────────────────
+
+test "a mut-captured struct reassigned in the closure is readable outside it" {
+    expect_out("struct_scalar", #"type Wrap { n: Int }
+fn wrap1() -> Wrap { Wrap { n: 1 } }
+fn wrap2() -> Wrap { Wrap { n: 2 } }
+fn main() {
+    let mut e = wrap1()
+    let apply = fn() { e = wrap2() }
+    apply()
+    io.println("n={e.n}")
+}
+"#, "n=2")
+}
+
+// The cell is read inside the closure body too, by the second seam.
+test "a mut-captured struct's field is readable inside the closure body" {
+    expect_out("struct_read_in", #"type Wrap { n: Int }
+fn main() {
+    let mut e = Wrap { n: 4 }
+    let f = fn() { io.println("n={e.n}") }
+    f()
+}
+"#, "n=4")
+}
+
+test "a mut-captured struct's field can be assigned through the closure" {
+    expect_out("struct_field_assign", #"type Wrap { n: Int }
+fn main() {
+    let mut e = Wrap { n: 1 }
+    let f = fn() { e.n = 9 }
+    f()
+    io.println("n={e.n}")
+}
+"#, "n=9")
+}
+
+// A container field surfaces as a spurious UnresolvedMethod at typecheck time instead of a C error:
+// the diagnostic even NAMES the receiver `Set[Int]` correctly, so the element type was known and the
+// receiver spelling through the cell was what broke.
+test "a mut-captured struct with a container field keeps its field methods" {
+    expect_out("struct_container_field", #"type Wrap { s: Set[Int] }
+fn main() {
+    let mut e = Wrap { s: Set() }
+    let f = fn() { e = Wrap { s: Set() } }
+    f()
+    e.s.insert(256)
+    io.println("n={e.s.len()}")
+}
+"#, "n=1")
+}
+
+test "a mut-captured nested struct keeps both levels" {
+    expect_out("struct_nested", #"type Inner { k: Int }
+type Outer { i: Inner }
+fn main() {
+    let mut o = Outer { i: Inner { k: 1 } }
+    let f = fn() { o = Outer { i: Inner { k: 5 } } }
+    f()
+    io.println("n={o.i.k}")
+}
+"#, "n=5")
+}
+
+// The mono instance, not the bare base: the cell must name the same typedef the declaration does.
+test "a mut-captured generic-struct instance names its mono typedef" {
+    expect_out("struct_generic", #"type Box[T] { v: T }
+fn main() {
+    let mut b = Box { v: 1 }
+    let f = fn() { b = Box { v: 2 } }
+    f()
+    io.println("n={b.v}")
+}
+"#, "n=2")
+}
+
+// ── The three other kinds that need a name or a carrier typedef ──────────────
+//
+// Not in the original report, found by probing the kinds ADJACENT to the struct: a whitelist of the
+// reported shape would have left these, since they fail through the same CT-only derivation.
+
+test "a mut-captured tuple keeps its typedef" {
+    expect_out("tuple", #"fn main() {
+    let mut t = (1, 2)
+    let f = fn() { t = (3, 4) }
+    f()
+    io.println("n={t.0}")
+}
+"#, "n=3")
+}
+
+test "a mut-captured Option keeps its carrier typedef" {
+    expect_out("option", #"fn main() {
+    let mut o: Option[Int] = None
+    let f = fn() { o = Some(3) }
+    f()
+    io.println("n={o.unwrap()}")
+}
+"#, "n=3")
+}
+
+test "a mut-captured Option of a struct keeps the struct-tagged carrier" {
+    expect_out("option_struct", #"type W { n: Int }
+fn main() {
+    let mut o: Option[W] = None
+    let f = fn() { o = Some(W { n: 3 }) }
+    f()
+    io.println("n={o.unwrap().n}")
+}
+"#, "n=3")
+}
+
+test "a mut-captured Result keeps its carrier typedef" {
+    expect_out("result", #"fn main() {
+    let mut r: Result[Int, Str] = Ok(1)
+    let f = fn() { r = Ok(5) }
+    f()
+    io.println("n={r.unwrap()}")
+}
+"#, "n=5")
+}
+
+// ── Controls: the kinds the CT alone already spells ──────────────────────────
+//
+// These pass on either compiler and isolate the axis to "the C name needs more than a CT".
+
+test "a mut-captured Int is unaffected" {
+    expect_out("c_int", #"fn main() {
+    let mut n = 1
+    let f = fn() { n = 7 }
+    f()
+    io.println("n={n}")
+}
+"#, "n=7")
+}
+
+test "a mut-captured Float is unaffected" {
+    expect_out("c_float", #"fn main() {
+    let mut d = 1.5
+    let f = fn() { d = 2.5 }
+    f()
+    io.println("n={d}")
+}
+"#, "n=2.5")
+}
+
+test "a mut-captured Str is unaffected" {
+    expect_out("c_str", #"fn main() {
+    let mut s = "a"
+    let f = fn() { s = "b" }
+    f()
+    io.println("n={s}")
+}
+"#, "n=b")
+}
+
+test "a mut-captured narrow int keeps its width" {
+    expect_out("c_u8", #"fn main() {
+    let mut x: U8 = 1
+    let f = fn() { x = 2 }
+    f()
+    io.println("n={x}")
+}
+"#, "n=2")
+}
+
+test "a mut-captured Char is unaffected" {
+    expect_out("c_char", #"fn main() {
+    let mut c = "a".char_at(0).unwrap()
+    let f = fn() { c = "b".char_at(0).unwrap() }
+    f()
+    io.println("n={c}")
+}
+"#, "n=b")
+}
+
+test "a mut-captured Bool is unaffected" {
+    expect_out("c_bool", #"fn main() {
+    let mut b = false
+    let f = fn() { b = true }
+    f()
+    io.println("n={b}")
+}
+"#, "n=true")
+}
+
+test "a mut-captured List is unaffected" {
+    expect_out("c_list", #"fn main() {
+    let mut l = [1]
+    let f = fn() { l = [1, 2] }
+    f()
+    io.println("n={l.len()}")
+}
+"#, "n=2")
+}
+
+test "a mut-captured Map is unaffected" {
+    expect_out("c_map", #"fn main() {
+    let mut m: Map[Str, Int] = Map()
+    let f = fn() { m = Map() }
+    f()
+    io.println("n={m.len()}")
+}
+"#, "n=0")
+}
+
+test "a mut-captured Set is unaffected" {
+    expect_out("c_set", #"fn main() {
+    let mut s: Set[Int] = Set()
+    let f = fn() { s = Set() }
+    f()
+    s.insert(1)
+    io.println("n={s.len()}")
+}
+"#, "n=1")
+}
+
+test "a mut-captured Bytes is unaffected" {
+    expect_out("c_bytes", #"fn main() {
+    let mut b = Bytes.from_str("ab")
+    let f = fn() { b = Bytes.from_str("cde") }
+    f()
+    io.println("n={b.len()}")
+}
+"#, "n=3")
+}
+
+test "a mut-captured StringBuilder is unaffected" {
+    expect_out("c_sb", #"fn main() {
+    let mut sb = StringBuilder()
+    let f = fn() { sb = StringBuilder() }
+    f()
+    sb.write("x")
+    io.println("n={sb.to_str()}")
+}
+"#, "n=x")
+}
+
+// An enum is int64_t-backed, so the CT-only derivation already agreed with the declaration.
+test "a mut-captured enum is unaffected" {
+    expect_out("c_enum", #"type E { A, B }
+fn main() {
+    let mut e = E.A
+    let f = fn() { e = E.B }
+    f()
+    io.println("n={e == E.B}")
+}
+"#, "n=true")
+}
+
+// No closure, so no cell: this pins that the mut reassignment itself was never the axis.
+test "a struct local reassigned without a closure is unaffected" {
+    expect_out("c_no_closure", #"type Wrap { s: Set[Int] }
+fn main() {
+    let mut e = Wrap { s: Set() }
+    e = Wrap { s: Set() }
+    e.s.insert(256)
+    io.println("n={e.s.len()}")
+}
+"#, "n=1")
+}
